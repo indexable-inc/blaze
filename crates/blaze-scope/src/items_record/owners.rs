@@ -7,11 +7,11 @@
 //!
 //! The section starts at the offset in header field [`F_OWNED_AT`] and has the count of rows in
 //! header field [`F_OWNED_COUNT`], after everything the record held before it (no existing
-//! field or row changes: [`append`] writes after the last byte, 16-aligned). One 40-byte row
+//! field or row changes: [`append`] writes after the last byte, 16-aligned). One 8-byte row
 //! per NAMED member (a member with no name, a macro call in a trait or impl body, has no row:
-//! nothing asks its owner), sorted by (member key, owner row, member row): the member's key
-//! 32; its owner's row in the owner table u32; its own row in the member table u32. The name
-//! is read from the member row, the owner's key from the owner row: nothing is stored twice.
+//! nothing asks its owner), sorted by (member key, owner row, member row): its owner's row in
+//! the owner table u32; its own row in the member table u32. The member's key and name are read
+//! from the member row, the owner's key from the owner row: nothing is stored twice.
 //!
 //! One member key under two owners is kept as two rows; [`ItemsRecord::member_owner`] answers
 //! the LAST of them (the owner with the greatest key: the owner rows are sorted by key),
@@ -26,8 +26,9 @@ use super::{ItemsRecord, ItemsRecordError, LoadItems, RecordItems, T_MEMBERS, T_
 pub(crate) const F_OWNED_COUNT: usize = 35;
 /// The header field holding the section's offset.
 pub(crate) const F_OWNED_AT: usize = 36;
-/// A row: member key 32, owner row u32, member row u32.
-pub(crate) const OWNED_ROW: usize = 40;
+/// A row: owner row u32, member row u32 (8 bytes; sorted by the member row's key in `T_MEMBERS`
+/// so the 32-byte member key is never duplicated — 5× smaller than the 40-byte form).
+pub(crate) const OWNED_ROW: usize = 8;
 
 /// Appends the section for `owned` (each named member's key, its owner's row in the owner
 /// table and its own row in the member table, in any order: sorted here) to `out`, a record
@@ -37,8 +38,7 @@ pub(super) fn append(out: &mut RecordBytes<'_>, owned: &mut [(ItemKey, u32, u32)
     pad(out);
     let at = u32_of(out.len(), "the member owners section")?;
     let count = u32_of(owned.len(), "the member owners section's rows")?;
-    for (member, owner, row) in owned.iter() {
-        out.extend_from_slice(&member.0.0);
+    for (_, owner, row) in owned.iter() {
         put32(out, *owner);
         put32(out, *row);
     }
@@ -67,7 +67,11 @@ impl<'a> ItemsRecord<'a> {
         if i >= count {
             return Ok(None);
         }
-        Ok(Some(key_at(self.bytes, base + i * OWNED_ROW)))
+        let row = usize::try_from(le32(self.bytes, base + i * OWNED_ROW + 4)).unwrap_or(usize::MAX);
+        if row >= self.counts.get(T_MEMBERS).copied().unwrap_or(0) {
+            return Err(ItemsRecordError::Short { what: "a member owner's member row", at: i });
+        }
+        Ok(Some(self.member_key(row)))
     }
 
     /// The trait or impl that owns the named member `member`, and the member's name: one
@@ -75,17 +79,24 @@ impl<'a> ItemsRecord<'a> {
     /// member list is decoded, no text is opened). `Ok(None)`: no named member of the crate
     /// has that key.
     pub fn member_owner(&self, member: ItemKey) -> Result<Option<(ItemKey, &'a str)>, ItemsRecordError> {
+        if member.0.0[..8] != self.key.prefix() {
+            return Ok(None);
+        }
         let (base, count) = (self.field(F_OWNED_AT) as usize, self.owned_members());
         if count.checked_mul(OWNED_ROW).and_then(|len| base.checked_add(len)).is_none_or(|end| end > self.bytes.len()) {
             return Err(ItemsRecordError::Short { what: "the member owners section", at: base });
         }
+        let tail = &member.0.0[8..];
         // The first row whose key is greater than `member`: the row before it is the last
         // row of `member`'s run, if it has one.
         let (mut lo, mut hi) = (0usize, count);
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            let r = base + mid * OWNED_ROW;
-            if self.bytes[r..r + 32] <= member.0.0[..] {
+            let row = usize::try_from(le32(self.bytes, base + mid * OWNED_ROW + 4)).unwrap_or(usize::MAX);
+            if row >= self.counts.get(T_MEMBERS).copied().unwrap_or(0) {
+                return Err(ItemsRecordError::Short { what: "a member owner's member row", at: mid });
+            }
+            if self.member_key_tail(row) <= tail {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -93,17 +104,13 @@ impl<'a> ItemsRecord<'a> {
         }
         let Some(last) = lo.checked_sub(1) else { return Ok(None) };
         let r = base + last * OWNED_ROW;
-        if self.bytes[r..r + 32] != member.0.0[..] {
-            return Ok(None);
-        }
-        let (owner, row) = (le32(self.bytes, r + 32) as usize, le32(self.bytes, r + 36) as usize);
-        if owner >= self.counts[T_OWNERS] || row >= self.counts[T_MEMBERS] {
+        let owner = usize::try_from(le32(self.bytes, r)).unwrap_or(usize::MAX);
+        let row = usize::try_from(le32(self.bytes, r + 4)).unwrap_or(usize::MAX);
+        if owner >= self.counts.get(T_OWNERS).copied().unwrap_or(0) || row >= self.counts.get(T_MEMBERS).copied().unwrap_or(0) {
             return Err(ItemsRecordError::Short { what: "a member owner's rows", at: last });
         }
-        if self.member_key(row) != member {
-            // The row the section names is another member's: the section and the member
-            // table disagree (a writer's bug, never answered as an owner).
-            return Err(ItemsRecordError::Short { what: "a member owner's member row (it holds another key)", at: last });
+        if self.member_key_tail(row) != tail {
+            return Ok(None);
         }
         let name = self.member_name(row)?;
         Ok(Some((key_at(self.bytes, self.row(T_OWNERS, owner)), name)))

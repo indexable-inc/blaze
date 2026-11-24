@@ -125,7 +125,7 @@ pub(crate) fn write_refused<'a>(
     alloc: Alloc<'a>,
 ) {
     let mut refused: AVec<'a, (ItemKey, Refused<'a>)> = AVec::new_in(alloc);
-    refused.extend(expansions.iter().filter_map(|(call, e)| e.refused.map(|r| (*call, r))));
+    refused.extend(expansions.iter().filter_map(|(call, e)| e.refused().map(|r| (*call, r))));
     refused.sort_unstable_by_key(|(call, _)| *call);
     for (call, r) in refused.iter() {
         let Some(module) = r.module else { continue };

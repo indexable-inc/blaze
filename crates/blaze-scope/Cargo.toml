@@ -23,6 +23,8 @@ doctest = false
 blaze-id.workspace = true
 # `enc::{IntView, IdView}`: columnar encoding for `ItemsRecord` tables (rule 30, rule 51).
 blaze-columns.workspace = true
+# `ZstdEncoder` / `decompress_in`: pure no_std zstd compression for cold `ExpansionRecord` payloads.
+blaze-zstd.workspace = true
 # `HashMap`: the machine's single-owner indexes, in the allocator it is made in.
 blaze-hash.workspace = true
 # The words of the item layer (`Namespace`, `Def`, `Binding`, `Visibility`, ...), the working

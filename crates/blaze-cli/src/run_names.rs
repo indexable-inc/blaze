@@ -275,7 +275,7 @@ pub(crate) fn names_records_envs<'n>(
         frame,
     ));
     let storage = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(blaze_own::Erased::new(frame), frame));
-    let load: &'n StoreLoad<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(StoreLoad::from_crates(from, packages, texts, snapshot, expansion_keys, files.1, storage.handle()), frame));
+    let load: &'n StoreLoad<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(StoreLoad::from_crates(from, packages, texts, snapshot, expansion_keys, files.1, storage.bump(), storage.handle()), frame));
     let log: &'n Log<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(Log::new(crate_names, g), frame));
     let keys = load.keys(frame);
     let records: &'n Records<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(Records::new(keys, load, log, frame, g), frame));

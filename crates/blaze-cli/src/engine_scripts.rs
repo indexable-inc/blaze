@@ -397,8 +397,30 @@ impl<'s> ScriptQueue<'s> {
         self.order.first_key_value().map(|(_, task)| *task)
     }
 
+    pub(crate) fn first_ready(&self) -> Option<EngineTask> {
+        self.order
+            .iter()
+            .find(|((_, name), _)| self.answered.contains_key(name))
+            .map(|(_, task)| *task)
+    }
+
+    pub(crate) fn next_ready_in_phase(&self, phase: blaze_engine::Phase) -> Option<EngineTask> {
+        self.order
+            .iter()
+            .find(|((_, name), task)| task.planned.phase == phase && self.answered.contains_key(name))
+            .map(|(_, task)| *task)
+    }
+
+    pub(crate) fn active_scripts(&self) -> usize {
+        self.waiting.len() + self.running.len()
+    }
+
     pub(crate) fn urgent(&self) -> bool {
         self.order.first_key_value().is_some_and(|((leaf, _), _)| !leaf)
+    }
+
+    pub(crate) fn urgent_ready(&self) -> bool {
+        self.order.iter().any(|((leaf, name), _)| !*leaf && self.answered.contains_key(name))
     }
 
     #[cfg(test)]
@@ -1470,8 +1492,9 @@ impl<'s, 'a: 's> Pipeline<'s, 'a> {
         if runner_clock().is_some_and(|clock| clock.global_names_barrier()) && (!self.scripts.is_empty() || engine.has_pending_stage(Stage::Scripts)) {
             return Ok(());
         }
-        let scripts_pending = !self.scripts.is_empty() || engine.has_pending_stage(Stage::Scripts);
-        self.names.set_width(self.scripts.scope, handles, scripts_pending);
+        let runnable_scripts = self.scripts.active_scripts()
+            + usize::from(engine.has_pending_stage(Stage::Scripts) && self.scripts.active_scripts() == 0);
+        self.names.set_width(self.scripts.scope, handles, runnable_scripts);
         loop {
             self.name_reads.clear();
             self.script_reads.clear();
@@ -1488,7 +1511,7 @@ impl<'s, 'a: 's> Pipeline<'s, 'a> {
             let mark = handles.board.phase_began(Stage::Names, engine.tasks().len() as u64, handles.board.now(&handles.env.clock));
             let view = engine.view();
             for &task in engine.tasks() {
-                self.names.submit(self.scripts.scope, cx, names, store, read, view, handles, task, alloc, frame, self.scripts.waiter(), scripts_pending)?;
+                self.names.submit(self.scripts.scope, cx, names, store, read, view, handles, task, alloc, frame, self.scripts.waiter(), runnable_scripts)?;
             }
             handles.board.phase_ended(mark, 0, handles.board.now(&handles.env.clock));
         }
@@ -1508,57 +1531,105 @@ impl<'s, 'a: 's> Pipeline<'s, 'a> {
         }
     }
 
+    /// Highest-priority ALREADY-FINISHED task across Scripts and Names.
+    fn first_ready(&self, names: &NamesStage<'_>) -> Option<EngineTask> {
+        let script = self.scripts.first_ready();
+        let scope = self.names.first_ready();
+        if self.scripts.urgent_ready() || !scope.is_some_and(|task| names.feeds_names(task.planned.name)) {
+            script.or(scope)
+        } else {
+            scope
+        }
+    }
+
+    /// Waits for ANY ready completion (never head-of-line blocking on a hash-first or wave-wide
+    /// straggler), drains all currently finished workers so freed slots dispatch immediately,
+    /// files the highest-priority ready task along with any other ALREADY-FINISHED siblings in its
+    /// `Phase`, and returns that `Phase` so downstream dependents admit immediately.
     pub(crate) fn collect<'f: 's>(
         &mut self, cx: &Cx, scripts: &mut ScriptsStage<'f>, names: &mut NamesStage<'f>,
-        store: &mut dyn crate::store::Store<'_>, handles: &Handles<'s, 'f>, first: EngineTask,
+        store: &mut dyn crate::store::Store<'_>, handles: &Handles<'s, 'f>,
         entered: &mut SVec<'_, EngineTask>, buffer: &mut Buffer<'a>, times: &mut crate::engine_times::Times,
         alloc: SharedAlloc<'a>, frame: &'f Frame,
-    ) -> Result<(), CliError> {
-        let mut task = first;
-        loop {
+    ) -> Result<blaze_engine::Phase, CliError> {
+        scripts.dispatch(cx, store, handles, names, &mut self.scripts, frame)?;
+        self.names.dispatch();
+        while self.first_ready(names).is_none() {
+            let observed_name = || self.names.has_completion();
+            #[cfg(test)]
+            let virtual_order = match (self.names.next_tick(), self.scripts.next_tick()) {
+                (Some(n), Some(s)) => Some(n < s),
+                (Some(_), None) => Some(true),
+                (None, Some(_)) if !self.names.has_completion() => Some(false),
+                _ => None,
+            };
+            #[cfg(not(test))]
+            let virtual_order: Option<bool> = None;
+            let take_name = if let Some(take_name) = virtual_order {
+                take_name
+            } else {
+                wait_finished(
+                    cx,
+                    &handles.env.clock,
+                    self.scripts.waiter(),
+                    || observed_name() || self.scripts.has_completion(),
+                    "a Names or Scripts worker to finish",
+                    self.scripts.running.len() + usize::from(!self.names.is_empty()),
+                )?;
+                observed_name()
+            };
+            if take_name {
+                self.names.observe_next(cx)?;
+            } else {
+                scripts.observe_next(cx, store, handles, names, &mut self.scripts, frame)?;
+            }
             scripts.dispatch(cx, store, handles, names, &mut self.scripts, frame)?;
             self.names.dispatch();
-            let name = task.planned.name;
-            let script = task.planned.phase.stage == Stage::Scripts;
-            while !(if script { self.scripts.is_finished(name) } else { self.names.is_finished(name) }) {
-                let observed_name = || self.names.has_completion();
-                #[cfg(test)]
-                let virtual_order = match (self.names.next_tick(), self.scripts.next_tick()) {
-                    (Some(n), Some(s)) => Some(n < s),
-                    (Some(_), None) => Some(true),
-                    (None, Some(_)) if !self.names.has_completion() => Some(false),
-                    _ => None,
-                };
-                #[cfg(not(test))]
-                let virtual_order: Option<bool> = None;
-                let take_name = if let Some(take_name) = virtual_order { take_name } else {
-                    wait_finished(cx, &handles.env.clock, self.scripts.waiter(), || observed_name() || self.scripts.has_completion(),
-                        "a Names or Scripts worker to finish", self.scripts.running.len() + usize::from(!self.names.is_empty()))?;
-                    observed_name()
-                };
-                if take_name {
-                    self.names.observe_next(cx)?;
-                } else {
-                    scripts.observe_next(cx, store, handles, names, &mut self.scripts, frame)?;
-                }
-                scripts.dispatch(cx, store, handles, names, &mut self.scripts, frame)?;
-                self.names.dispatch();
+        }
+        // Drain any other already-finished workers (real clock only; simulated tests advance
+        // one virtual tick at a time via `virtual_order`) so freed pool slots dispatch immediately.
+        #[cfg(test)]
+        let simulated = runner_clock().is_some();
+        #[cfg(not(test))]
+        let simulated = false;
+        if !simulated {
+            while self.names.has_completion() {
+                self.names.observe_next(cx)?;
             }
-            if script {
+            while self.scripts.has_completion() {
+                scripts.observe_next(cx, store, handles, names, &mut self.scripts, frame)?;
+            }
+            scripts.dispatch(cx, store, handles, names, &mut self.scripts, frame)?;
+            self.names.dispatch();
+        }
+        let chosen = self.first_ready(names).ok_or(CliError::Text {
+            what: "the pipeline observed a completion yet no task is ready to file (engine_scripts.rs)",
+        })?;
+        let phase = chosen.planned.phase;
+        let is_script_phase = phase.stage == Stage::Scripts;
+        let mut task = chosen;
+        loop {
+            let name = task.planned.name;
+            let feeds = !is_script_phase && names.feeds_names(name);
+            if is_script_phase {
                 scripts.finish(cx, store, handles, names, &mut self.scripts, name, buffer, times, alloc, frame)?;
             } else {
                 self.names.finish(cx, name, names, buffer, times, frame)?;
             }
             entered.push(task);
-            // A script may immediately release a reader, including one in this
-            // same Names wave. Non-leaf Names tasks break before leaf tasks so
-            // downstream waves can be admitted without waiting on leaves.
-            if name.kind == Kind::Script { break; }
-            let Some(next) = self.first(names) else { break };
-            if next.planned.phase != first.planned.phase || (!script && names.feeds_names(name) && !names.feeds_names(next.planned.name)) { break; }
+            // A script may immediately release a reader, including one in the same Names wave.
+            if name.kind == Kind::Script {
+                break;
+            }
+            let next = if is_script_phase {
+                self.scripts.next_ready_in_phase(phase)
+            } else {
+                self.names.next_ready_in_phase(phase, feeds)
+            };
+            let Some(next) = next else { break };
             task = next;
         }
-        Ok(())
+        Ok(phase)
     }
 
     pub(crate) fn drain(&mut self, cx: &Cx) -> Result<(), CliError> {

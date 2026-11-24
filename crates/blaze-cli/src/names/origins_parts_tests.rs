@@ -41,7 +41,7 @@ fn a_store_loads_origins_are_two_parts_and_no_copy() {
     let mut packages: AVec<'_, &str> = AVec::with_capacity_in(read.len(), alloc);
     packages.resize(read.len(), "/");
     let counting = Erased::new(Counting::new(&frame));
-    let load = StoreLoad::from_parts(&read[..], &packages[..], &Files, Some(&snapshot), None, None, counting.handle());
+    let load = StoreLoad::from_parts(&read[..], &packages[..], &Files, Some(&snapshot), None, None, bump, counting.handle());
 
     // Control: a block made in the counter is counted.
     let before = counting.inner().allocations();

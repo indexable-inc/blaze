@@ -292,6 +292,10 @@ pub fn show_message<P: Put + ?Sized>(rules: &RuleSet, item: &str, findings: &Fin
         Template::HeapLeak => {
             out.str("`").str(range).str("` leaks allocations: for bump arenas use `.into_bump_slice()` / `.into_bump_str()` / `frame.alloc_str()`, or `ProgramArena` for intentional `'static` state");
         }
+        Template::ParallelVecs => {
+            out.str("3+ adjacent `Vec`/`AVec` columns in `").str(range)
+                .str("`: prefer `blaze_own::Soa` / `blaze_own::soa!` so all columns share one length, capacity and backing allocation");
+        }
         Template::VariantCount | Template::VariantCountMany => {
             let names = || {
                 args.iter().filter_map(|arg| match arg {

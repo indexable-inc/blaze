@@ -1176,4 +1176,275 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
             i += 1;
         }
     }
+
+    /// Rule [`Rule::ParallelVecs`]: flags 3+ adjacent `Vec`/`AVec`/`StdVec` local bindings or
+    /// struct fields where a single-allocation `blaze_own::Soa` / `blaze_own::soa!` should share
+    /// one length, capacity and backing block.
+    pub(crate) fn parallel_vecs_pass(&mut self) {
+        const MIN_RUN: u32 = 3;
+
+        let is_vec_name = |text: &str, tok: Tok| -> bool {
+            is_ident(text, tok, "Vec") || is_ident(text, tok, "AVec") || is_ident(text, tok, "StdVec")
+        };
+        // Returns `true` if the path starting at `at` (e.g. `AVec`, `blaze_own::Vec`, `std::vec::Vec`)
+        // ends in a `Vec`/`AVec`/`StdVec` type identifier.
+        let path_is_vec = |toks: &[Tok], text: &str, mut at: usize| -> bool {
+            let mut last: Option<Tok> = None;
+            if toks.get(at).is_some_and(|t| is_punct(*t, b':')) && is_double_colon(toks, at) {
+                at += 2;
+            }
+            while let Some(&t) = toks.get(at) {
+                if t.k != K::Ident {
+                    break;
+                }
+                last = Some(t);
+                at += 1;
+                if is_double_colon(toks, at) {
+                    // Stop before `::new` / `::with_capacity` when checking value paths: if `last`
+                    // is already a Vec type name and the next segment starts lowercase, it's a method.
+                    if toks.get(at + 2).is_some_and(|n| {
+                        n.k == K::Ident && text_slice(text, Span::new(n.start, n.end)).bytes().next().is_some_and(|b| b.is_ascii_lowercase())
+                    }) {
+                        break;
+                    }
+                    at += 2;
+                } else {
+                    break;
+                }
+            }
+            last.is_some_and(|t| is_vec_name(text, t))
+        };
+        let skip_attrs = |toks: &[Tok], mut at: usize| -> usize {
+            while toks.get(at).is_some_and(|t| is_punct(*t, b'#')) {
+                let mut j = at + 1;
+                if toks.get(j).is_some_and(|t| is_punct(*t, b'!')) {
+                    j += 1;
+                }
+                if toks.get(j).is_some_and(|t| is_punct(*t, b'[')) {
+                    let mut depth = 1u32;
+                    j += 1;
+                    while depth > 0 {
+                        let Some(&tj) = toks.get(j) else { break };
+                        if is_punct(tj, b'[') {
+                            depth += 1;
+                        } else if is_punct(tj, b']') {
+                            depth -= 1;
+                        }
+                        j += 1;
+                    }
+                    at = j;
+                } else {
+                    break;
+                }
+            }
+            at
+        };
+
+        let len = self.toks.len();
+        let mut i = 0usize;
+        // Pass 1: struct definitions with 3+ consecutive Vec/AVec/StdVec fields.
+        while i < len {
+            let Some(tok) = self.toks.get(i).copied() else { break };
+            if is_ident(self.text, tok, "struct") && self.toks.get(i + 1).is_some_and(|t| t.k == K::Ident) {
+                // Find the opening `{` of a braced struct (stop on `;` or `(` at angle-depth 0).
+                let mut j = i + 2;
+                let mut angle = 0u32;
+                let mut brace = None;
+                while let Some(&t) = self.toks.get(j) {
+                    if is_punct(t, b'<') {
+                        angle += 1;
+                    } else if is_punct(t, b'>') && angle > 0 {
+                        angle -= 1;
+                    } else if angle == 0 {
+                        if is_punct(t, b'{') {
+                            brace = Some(j);
+                            break;
+                        }
+                        if is_punct(t, b';') || is_punct(t, b'(') {
+                            break;
+                        }
+                    }
+                    j += 1;
+                }
+                if let Some(open) = brace {
+                    let mut p = open + 1;
+                    let mut run_count = 0u32;
+                    let mut run_start = 0u32;
+                    let mut run_end = 0u32;
+                    while self.toks.get(p).is_some_and(|t| !is_punct(*t, b'}')) {
+                        p = skip_attrs(self.toks, p);
+                        let Some(&tp) = self.toks.get(p) else { break };
+                        if is_punct(tp, b'}') {
+                            break;
+                        }
+                        let field_start = tp.start;
+                        // Skip optional `pub` / `pub(...)`.
+                        if is_ident(self.text, tp, "pub") {
+                            p += 1;
+                            if self.toks.get(p).is_some_and(|t| is_punct(*t, b'(')) {
+                                let mut d = 1u32;
+                                p += 1;
+                                while d > 0 {
+                                    let Some(&td) = self.toks.get(p) else { break };
+                                    if is_punct(td, b'(') { d += 1; } else if is_punct(td, b')') { d -= 1; }
+                                    p += 1;
+                                }
+                            }
+                        }
+                        // Expect `<ident> : <type>`.
+                        let is_vec_field = if self.toks.get(p).is_some_and(|t| t.k == K::Ident)
+                            && self.toks.get(p + 1).is_some_and(|t| is_punct(*t, b':'))
+                            && !is_double_colon(self.toks, p + 1)
+                        {
+                            path_is_vec(self.toks, self.text, p + 2)
+                        } else {
+                            false
+                        };
+                        // Advance to `,` or `}` at nested depth 0.
+                        let mut depth = 0u32;
+                        let mut angle_d = 0u32;
+                        let mut field_end = field_start;
+                        while let Some(&t) = self.toks.get(p) {
+                            if depth == 0 && angle_d == 0 && (is_punct(t, b',') || is_punct(t, b'}')) {
+                                if is_punct(t, b',') {
+                                    field_end = t.end;
+                                    p += 1;
+                                }
+                                break;
+                            }
+                            field_end = t.end;
+                            if is_punct(t, b'(') || is_punct(t, b'[') || is_punct(t, b'{') {
+                                depth += 1;
+                            } else if (is_punct(t, b')') || is_punct(t, b']') || is_punct(t, b'}')) && depth > 0 {
+                                depth -= 1;
+                            } else if depth == 0 && is_punct(t, b'<') {
+                                angle_d += 1;
+                            } else if depth == 0 && is_punct(t, b'>') && angle_d > 0 {
+                                angle_d -= 1;
+                            }
+                            p += 1;
+                        }
+                        if is_vec_field {
+                            if run_count == 0 {
+                                run_start = field_start;
+                            }
+                            run_end = field_end;
+                            run_count += 1;
+                        } else {
+                            if run_count >= MIN_RUN {
+                                self.cost.add(Rule::ParallelVecs);
+                                self.cands.push(Cand {
+                                    template: Template::ParallelVecs,
+                                    range: Span::new(run_start, run_end),
+                                    arg: Some(Arg::Int(run_count)),
+                                    plan: Plan::None,
+                                });
+                            }
+                            run_count = 0;
+                        }
+                    }
+                    if run_count >= MIN_RUN {
+                        self.cost.add(Rule::ParallelVecs);
+                        self.cands.push(Cand {
+                            template: Template::ParallelVecs,
+                            range: Span::new(run_start, run_end),
+                            arg: Some(Arg::Int(run_count)),
+                            plan: Plan::None,
+                        });
+                    }
+                    i = p.max(i + 1);
+                    continue;
+                }
+            }
+            i += 1;
+        }
+
+        // Pass 2: consecutive `let` bindings declaring `Vec`/`AVec`/`StdVec` locals.
+        let mut k = 0usize;
+        while k < len {
+            let start_k = skip_attrs(self.toks, k);
+            if self.toks.get(start_k).is_some_and(|t| is_ident(self.text, *t, "let")) {
+                let mut run_count = 0u32;
+                let mut run_start = 0u32;
+                let mut run_end = 0u32;
+                let mut p = start_k;
+                while p < len {
+                    let stmt_at = skip_attrs(self.toks, p);
+                    let Some(&stmt_tok) = self.toks.get(stmt_at) else { break };
+                    if !is_ident(self.text, stmt_tok, "let") {
+                        break;
+                    }
+                    let stmt_start = stmt_tok.start;
+                    let mut q = stmt_at + 1;
+                    if self.toks.get(q).is_some_and(|t| is_ident(self.text, *t, "mut")) {
+                        q += 1;
+                    }
+                    // Scan the `let` header to `:`, `=`, or `;` at depth 0.
+                    let mut is_vec_let = false;
+                    let mut depth = 0u32;
+                    let mut saw_semi = false;
+                    let mut stmt_end = stmt_start;
+                    while let Some(&t) = self.toks.get(q) {
+                        if depth == 0 && is_punct(t, b';') {
+                            stmt_end = t.end;
+                            q += 1;
+                            saw_semi = true;
+                            break;
+                        }
+                        if depth == 0 && is_punct(t, b':') && !is_double_colon(self.toks, q) {
+                            if path_is_vec(self.toks, self.text, q + 1) {
+                                is_vec_let = true;
+                            }
+                        } else if depth == 0 && is_punct(t, b'=') && !self.toks.get(q + 1).is_some_and(|n| is_punct(*n, b'=') || is_punct(*n, b'>')) {
+                            if path_is_vec(self.toks, self.text, q + 1) {
+                                is_vec_let = true;
+                            }
+                        }
+                        if is_punct(t, b'(') || is_punct(t, b'[') || is_punct(t, b'{') {
+                            depth += 1;
+                        } else if (is_punct(t, b')') || is_punct(t, b']') || is_punct(t, b'}')) && depth > 0 {
+                            depth -= 1;
+                        }
+                        q += 1;
+                    }
+                    if !saw_semi {
+                        break;
+                    }
+                    if is_vec_let {
+                        if run_count == 0 {
+                            run_start = stmt_start;
+                        }
+                        run_end = stmt_end;
+                        run_count += 1;
+                        p = q;
+                    } else {
+                        if run_count >= MIN_RUN {
+                            self.cost.add(Rule::ParallelVecs);
+                            self.cands.push(Cand {
+                                template: Template::ParallelVecs,
+                                range: Span::new(run_start, run_end),
+                                arg: Some(Arg::Int(run_count)),
+                                plan: Plan::None,
+                            });
+                        }
+                        run_count = 0;
+                        p = q;
+                        break;
+                    }
+                }
+                if run_count >= MIN_RUN {
+                    self.cost.add(Rule::ParallelVecs);
+                    self.cands.push(Cand {
+                        template: Template::ParallelVecs,
+                        range: Span::new(run_start, run_end),
+                        arg: Some(Arg::Int(run_count)),
+                        plan: Plan::None,
+                    });
+                }
+                k = p.max(k + 1);
+                continue;
+            }
+            k += 1;
+        }
+    }
 }

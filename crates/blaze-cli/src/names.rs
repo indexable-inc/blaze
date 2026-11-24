@@ -410,7 +410,7 @@ impl core::fmt::Display for Unwritten {
 /// payload. `kept` holds findings that leave the worker with the crate's record.
 /// `waits`: what in the crate waits on a failed dependency (names/scope.rs `resolve_metered`,
 /// blaze-scope waits_on.rs); such a path is counted, not found (plan row A8).
-fn scope_record<'a>(done: &blaze_scope::crate_scope::CrateScope<'a>, crate_name: &str, member: bool, waits: &blaze_scope::waits_on::WaitsOn<'_, 'a>, metered: &metered::Metered<'_>, kept: blaze_own::SharedAlloc<'static>) -> Result<ScopeRecord, Unwritten> {
+fn scope_record<'a>(cx: &Cx, workers: core::num::NonZeroU32, done: &blaze_scope::crate_scope::CrateScope<'a>, crate_name: &str, member: bool, has_surface: bool, waits: &blaze_scope::waits_on::WaitsOn<'_, 'a>, metered: &metered::Metered<'_>, kept: blaze_own::SharedAlloc<'static>) -> Result<ScopeRecord, Unwritten> {
     let unwritten = |section: &'static str, why: std::string::String| Unwritten { crate_name: crate_name.into(), section, why };
     let copy_global = |bytes: &[u8]| {
         let mut out = blaze_own::Vec::with_capacity_in(bytes.len(), Global);
@@ -428,7 +428,7 @@ fn scope_record<'a>(done: &blaze_scope::crate_scope::CrateScope<'a>, crate_name:
         Ok(copy_global(&bytes))
     })?;
     let items_record = metered.with_scratch(|scratch| {
-        let bytes = blaze_scope::items_record::encode(done.names, scratch.alloc())
+        let bytes = blaze_scope::items_record::encode_for(done.names, has_surface, scratch.alloc())
             .map_err(|error| unwritten("items", std::format!("{error:?}")))?;
         Ok(copy_global(&bytes))
     })?;
@@ -458,18 +458,67 @@ fn scope_record<'a>(done: &blaze_scope::crate_scope::CrateScope<'a>, crate_name:
         };
         (tests, tests_refused, test_marks)
     });
-    // The crate's expansions (runtime.md plan row B3): its directory is the record's section, a
-    // row a call that made a text, beside the items rows that name them; each distinct text
-    // with its origin column is its own record, keyed by its bytes, put after this one
-    // ([`expansion_texts`]): a text many calls made is held once, however many crates made it.
+    // The crate's expansions (runtime.md plan row B3): deduplicated on canonical uncompressed
+    // content first, then compressed (5-stream delta+varint + zstd) in parallel across worker
+    // cores directly into exact-sized Global buffers so `core`'s ~14k unique expansions fan out
+    // across idle cores with zero scratch-to-Global double copy.
     let (expansions, extras, expansions_out) = metered.with_scratch(|scratch| {
         let alloc = scratch.alloc();
-        let split = blaze_scope::expansion_records::write(done.names, alloc)
-            .map_err(|error| unwritten("expansions", std::format!("{error}")))?;
-        let expansions = copy_global(&split.directory[..]);
-        let mut records = blaze_own::Vec::with_capacity_in(split.records.len(), Global);
-        for record in split.records.iter() {
-            records.push((record.key, copy_global(&record.bytes)));
+        let g = Global;
+        let prepared = blaze_scope::expansion_records::prepare(done.names, alloc)
+            .map_err(|error| unwritten("expansions", blaze_own::format_in!(alloc, "{error}").as_str().into()))?;
+        let unique = prepared.unique();
+        let n_rec = unique.len();
+        let compress_chunk = |chunk: &[(&str, &[u8])]| -> Result<blaze_own::Vec<(ContentId, blaze_own::Vec<u8, _>), _>, Unwritten> {
+            let local = Frame::with_reserve(32 << 20, blaze_mem::Tag::Nameres)
+                .map_err(|error| unwritten("expansions", blaze_own::format_in!(g, "scratch frame: {error:?}").as_str().into()))?;
+            let erased = blaze_own::Erased::new(&local);
+            let local_alloc = erased.bump().alloc();
+            blaze_scope::expansion_records::compress_chunk(chunk, local_alloc, g)
+                .map_err(|error| unwritten("expansions", blaze_own::format_in!(local_alloc, "{error}").as_str().into()))
+        };
+        let mut flat = blaze_own::Vec::with_capacity_in(n_rec, g);
+        let par_workers = usize::try_from(workers.get().min(cx.workers())).unwrap_or(6).min(6);
+        if par_workers > 1 && n_rec >= 128 {
+            let chunk_size = n_rec.div_ceil(par_workers).max(32);
+            let scope = cx.scope();
+            scope.narrow_workers(workers, bstd::task::Class::Foreground);
+            let mut jobs = blaze_own::AVec::new_in(alloc);
+            for chunk in unique.chunks(chunk_size) {
+                jobs.push(scope.may_overlap("names: compress expansion chunk", 256 << 10, move |_| {
+                    Ok::<_, core::convert::Infallible>(compress_chunk(chunk))
+                }));
+            }
+            let mut first_err: Option<Unwritten> = None;
+            for job in jobs {
+                match job.join(cx) {
+                    Ok(Ok(part)) => flat.extend(part),
+                    Ok(Err(err)) => { first_err.get_or_insert(err); }
+                    Err(why) => { first_err.get_or_insert(unwritten("expansions", blaze_own::format_in!(alloc, "{why}").as_str().into())); }
+                }
+            }
+            if let Err(why) = scope.join(cx) {
+                first_err.get_or_insert(unwritten("expansions", blaze_own::format_in!(alloc, "{why}").as_str().into()));
+            }
+            if let Some(err) = first_err {
+                return Err(err);
+            }
+        } else {
+            flat = compress_chunk(unique)?;
+        }
+        let mut stored_keys = blaze_own::AVec::with_capacity_in(n_rec, alloc);
+        for (k, _) in flat.iter() {
+            stored_keys.push(*k);
+        }
+        let (dir_bytes, order) = prepared.finish_directory(&stored_keys, alloc)
+            .map_err(|error| unwritten("expansions", blaze_own::format_in!(alloc, "{error}").as_str().into()))?;
+        let expansions = copy_global(&dir_bytes[..]);
+        let mut records = blaze_own::Vec::with_capacity_in(n_rec, g);
+        for &u in order.iter() {
+            if let Some(slot) = flat.get_mut(u) {
+                let (key, bytes) = core::mem::replace(slot, (ContentId::default(), blaze_own::Vec::new_in(g)));
+                records.push((key, bytes));
+            }
         }
         let dir = blaze_scope::expansion_records::Directory::open(&expansions)
             .map_err(|error| unwritten("expansions", blaze_own::format_in!(alloc, "{error}").as_str().into()))?;
@@ -506,11 +555,15 @@ fn scope_record<'a>(done: &blaze_scope::crate_scope::CrateScope<'a>, crate_name:
         (blaze_scope::names_cells::Section::Items, &items_record[..]),
         (blaze_scope::names_cells::Section::Expansions, &expansions[..]),
     ];
-    let cells = metered.with_scratch(|scratch| {
-        let bytes = blaze_scope::names_cells::crate_table(done.names, &names_record, &items_record, &wholes, scratch)
-            .map_err(|error| unwritten("cell table", std::format!("{error:?}")))?;
-        Ok(copy_global(&bytes))
-    })?;
+    let cells = if has_surface {
+        metered.with_scratch(|scratch| {
+            let bytes = blaze_scope::names_cells::crate_table(done.names, &names_record, &items_record, &wholes, scratch)
+                .map_err(|error| unwritten("cell table", blaze_own::format_in!(scratch.alloc(), "{error:?}").as_str().into()))?;
+            Ok(copy_global(&bytes))
+        })?
+    } else {
+        copy_global(&[])
+    };
     metered.trim_scratch();
     // Section::Inner is omitted (&[]) on disk: no reader consumes it (only `names/scope.rs`
     // hashes `done.inner` in memory into the task's `out` digest). Keeping the 8-section wire

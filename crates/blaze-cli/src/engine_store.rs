@@ -308,7 +308,7 @@ pub(crate) struct Ledger {
     /// line counts its tasks' records' copies, so these are taken from it at the merge.
     extra_copies: [(u64, u64); STAGES],
     #[cfg(test)]
-    digest: blaze_ids::Hasher,
+    digest: [u64; 4],
     /// The process's memory at each stage's end (engine_memory.rs): the profile's alone, never
     /// in the digest (rule 25).
     pub(crate) memory: crate::engine_memory::Memory,
@@ -343,7 +343,7 @@ impl Ledger {
             seen_read: crate::engine_records::ReadCounts::default(),
             extra_copies: [(0, 0); STAGES],
             #[cfg(test)]
-            digest: blaze_ids::Hasher::new(PUTS_DIGEST),
+            digest: [0u64; 4],
             memory: crate::engine_memory::Memory::new(),
         }
     }
@@ -360,10 +360,15 @@ impl Ledger {
     }
 
     /// An extra record of `stage`'s task put under `key` after its owner ([`put_all`]), the
-    /// store's answer `put`: in the digest in put order, written or not; counted when written.
+    /// store's answer `put`: recorded for the order-independent test digest, written or not;
+    /// counted when written.
     pub(crate) fn put_extra(&mut self, stage: Stage, key: Key, bytes: &[u8], put: blaze_keyed::store::Put) {
         #[cfg(test)]
-        self.digest.update(&key.0.0).update(&(bytes.len() as u64).to_le_bytes()).update(bytes);
+        {
+            let mut h = blaze_ids::Hasher::new(PUTS_DIGEST);
+            h.update(&key.0.0).update(&(bytes.len() as u64).to_le_bytes()).update(bytes);
+            self.fold_digest(h.finish());
+        }
         #[cfg(not(test))]
         let _ = key;
         if put == blaze_keyed::store::Put::Written {
@@ -398,10 +403,12 @@ impl Ledger {
         self.results[stage.index()] += payload as u64;
         #[cfg(test)]
         {
-            self.digest.update(&key.0.0).update(&(len as u64).to_le_bytes());
+            let mut h = blaze_ids::Hasher::new(PUTS_DIGEST);
+            h.update(&key.0.0).update(&(len as u64).to_le_bytes());
             for part in parts {
-                self.digest.update(part);
+                h.update(part);
             }
+            self.fold_digest(h.finish());
         }
         #[cfg(not(test))]
         let _ = key;
@@ -428,10 +435,21 @@ impl Ledger {
         self.memory.merged(stage);
     }
 
-    /// The digest of every record put so far (key, length, bytes, in put order).
+    #[cfg(test)]
+    fn fold_digest(&mut self, id: ContentId) {
+        for (slot, chunk) in self.digest.iter_mut().zip(id.0.as_chunks::<8>().0) {
+            *slot = slot.wrapping_add(u64::from_le_bytes(*chunk));
+        }
+    }
+
+    /// The order-independent digest of every record put so far (commutative wrapping sum of per-put hashes).
     #[cfg(test)]
     pub(crate) fn digest(&self) -> ContentId {
-        self.digest.finish()
+        let mut h = blaze_ids::Hasher::new(PUTS_DIGEST);
+        for word in self.digest {
+            h.update(&word.to_le_bytes());
+        }
+        h.finish()
     }
 
     /// One line a stage that put a record, for the profile.

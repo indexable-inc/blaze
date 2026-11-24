@@ -2669,7 +2669,7 @@ fn open_stretch_records<'n>(
     let storage = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(blaze_own::Erased::new(frame), frame));
     let alloc = storage.handle();
     let load: &'n crate::front_load::StoreLoad<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(
-        crate::front_load::StoreLoad::from_crates(from, packages, texts, Some(snapshot), Some(expansion_keys), Some(outlines), alloc),
+        crate::front_load::StoreLoad::from_crates(from, packages, texts, Some(snapshot), Some(expansion_keys), Some(outlines), storage.bump(), alloc),
         frame,
     ));
     let bodies_load: &'n BodiesLoad<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(

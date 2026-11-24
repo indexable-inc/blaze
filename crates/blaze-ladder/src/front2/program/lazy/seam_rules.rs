@@ -813,8 +813,8 @@ impl<'n> crate::front2::source::Records<'n> {
                     let entry = self.text_of(row.key).ok_or(Unmapped::NoText { call })?;
                     let current = blaze_file_items::outline_item(entry.text, edition, alloc);
                     let item = current.items().first().ok_or(Unmapped::Input { call })?;
-                    let pieces = record.pieces_at(i).map_err(|_| Unmapped::Input { call })?;
-                    if item.hash != pieces.body {
+                    let body_hash = record.file_body_hash(file, row.outline).map_err(|_| Unmapped::Input { call })?;
+                    if item.hash != body_hash {
                         return Err(Unmapped::Input { call });
                     }
                     // The item hash proves its tokens. Trivia can still change

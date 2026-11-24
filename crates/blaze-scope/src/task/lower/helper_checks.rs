@@ -23,10 +23,13 @@ use super::{AttrOrder, Attrs, CallSrc, Lower, LowerNoteKind, Walked, parse_path,
 /// `Cells::item_fate`), only written, so it names what the call stands for.
 const KEEP_PATH: &str = "derive";
 
-impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
+impl<'o, 's, 't, 'a: 't, W: Walked + ?Sized> Lower<'_, 'o, 's, 't, 'a, W> {
     /// The derive calls `derives` of item `idx` (written at `at`), in order; `input` is the
     /// item's text (blaze-expand's `ItemAttrs::derives` takes the derives out of it).
     pub(super) fn derive_calls(&mut self, idx: ItemIndex, item: &Item, at: u32, derives: &[&'t str], input: &'t str) {
+        if derives.is_empty() {
+            return;
+        }
         let place = self.call_in_text(idx, item, input);
         let tokens = self.call_tokens(input, crate::nested_input::InputCut::Whole);
         // The item the derives are on: the self type of the impls they write (`CallSrc::on`).
@@ -54,12 +57,12 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
     /// one-segment attribute that is no built-in takes the item (`Cfg::attr`), and a variant's or
     /// a field's is not sent (a stated limit: such an attribute with no derive on its item is not
     /// checked). A name written on the item itself is answered there, never again.
-    pub(super) fn helper_checks(&mut self, idx: ItemIndex, item: &Item, attrs: &Attrs<'t, 'a>, run: usize) {
+    pub(super) fn helper_checks(&mut self, idx: ItemIndex, item: &Item, attrs: &Attrs<'t, '_>, run: usize) {
         if attrs.derives.len() <= run || !matches!(item.detail, ItemDetail::Struct | ItemDetail::Enum | ItemDetail::Union) {
             return;
         }
         // (name, the offset of the entry it is first written on): few per item, so a list.
-        let mut uses: AVec<'a, (&'t str, u32)> = AVec::new_in(self.alloc);
+        let mut uses: AVec<'s, (&'t str, u32)> = AVec::new_in(self.scratch);
         self.member_uses(idx, item, &attrs.others, &mut uses);
         self.send_checks(idx, &uses);
     }
@@ -89,7 +92,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
     /// The item's own text is not lowered here, as for any item an attribute macro may take.
     /// Under [`AttrOrder::DerivesAtOnce`] (the planted bug) the first stage sends every derive
     /// and every name.
-    pub(super) fn after_derive_takers(&mut self, idx: ItemIndex, item: &Item, attrs: &Attrs<'t, 'a>, whole: &'t str, answered: usize) {
+    pub(super) fn after_derive_takers(&mut self, idx: ItemIndex, item: &Item, attrs: &Attrs<'t, '_>, whole: &'t str, answered: usize) {
         let at = item.range.start;
         let at_once = self.order == AttrOrder::DerivesAtOnce;
         let run = ran_before(attrs, answered);
@@ -103,7 +106,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
         self.derive_calls(idx, item, at, &attrs.derives[run..upto], whole);
         let place = self.call_in_text(idx, item, whole);
         let tokens = self.call_tokens(whole, crate::nested_input::InputCut::Whole);
-        let mut takers: AVec<'a, &'t str> = AVec::new_in(self.alloc);
+        let mut takers: AVec<'s, &'t str> = AVec::new_in(self.scratch);
         for (&name, &derives_before) in attrs.others[answered..end].iter().zip(attrs.derives_before[answered..end].iter()) {
             if takers.contains(&name) {
                 continue;
@@ -134,7 +137,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
         let src = CallSrc { module: self.module, owner: None, name: KEEP_PATH, input: whole, kind: CallShape::Attr, loc: self.loc(at), written: self.written, depth: self.depth, implicit: false, place, tokens, answered: answered_here, on: None };
         self.out.calls.push((call, src));
         if upto == attrs.derives.len() {
-            let mut uses: AVec<'a, (&'t str, u32)> = AVec::new_in(self.alloc);
+            let mut uses: AVec<'s, (&'t str, u32)> = AVec::new_in(self.scratch);
             self.member_uses(idx, item, &attrs.others, &mut uses);
             self.send_checks(idx, &uses);
         }
@@ -144,7 +147,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
     /// end) that are neither built in nor a tool's and not in `sent`, each once at its first
     /// place. A variant or a field a false `cfg` removes is passed over with what it holds (rustc
     /// strips it before the derive sees the item).
-    fn member_uses(&mut self, idx: ItemIndex, item: &Item, sent: &[&'t str], uses: &mut AVec<'a, (&'t str, u32)>) {
+    fn member_uses(&mut self, idx: ItemIndex, item: &Item, sent: &[&'t str], uses: &mut AVec<'s, (&'t str, u32)>) {
         let outline = self.outline;
         let end = item.end.at();
         let mut at = idx.at() + 1;

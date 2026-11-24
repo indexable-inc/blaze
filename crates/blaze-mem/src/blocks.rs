@@ -450,6 +450,12 @@ impl Class {
     #[cold]
     #[inline(never)]
     fn trim(&self) -> Trimmed {
+        self.trim_to(i64::try_from(KEEP / 2).unwrap_or(i64::MAX))
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn trim_to(&self, goal: i64) -> Trimmed {
         if self.counts.trimming.swap(true, Ordering::Acquire) {
             return Trimmed { busy: true, ..Trimmed::default() };
         }
@@ -459,7 +465,6 @@ impl Class {
         let held = unsafe {
             core::slice::from_raw_parts_mut(self.scratch.base().cast::<u32>().as_ptr(), TRIM_MOST)
         };
-        let goal = (KEEP / 2) as i64;
         let mut taken = 0;
         let mut warm = self.counts.warm.load(Ordering::Relaxed);
         while taken < TRIM_MOST && warm > goal {
@@ -625,6 +630,26 @@ pub fn snapshot() -> Snapshot {
         }
     }
     snapshot
+}
+
+/// Gives back whole pages held by warm free blocks across every initialized size class (for
+/// phase boundaries after a burst, alongside [`crate::chunks::trim`]). Returns bytes given back.
+pub fn trim_all() -> usize {
+    let _ = tag::gathered(fold_thread);
+    let mut given = 0usize;
+    for class in &CLASS {
+        if let Some(Ok(class)) = class.get() {
+            if class.counts.warm.load(Ordering::Relaxed) > 0 {
+                let trimmed = class.trim_to(0);
+                if !trimmed.busy {
+                    class.counts.trims.fetch_add(1, Ordering::Relaxed);
+                    class.counts.given_back.fetch_add(u64::try_from(trimmed.given_back).unwrap_or(u64::MAX), Ordering::Relaxed);
+                    given += trimmed.given_back;
+                }
+            }
+        }
+    }
+    given
 }
 
 /// The class of the smallest block that holds `bytes` aligned to `align`.

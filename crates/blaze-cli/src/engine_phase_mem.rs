@@ -220,11 +220,15 @@ impl PhaseMem<'_> {
             kept_on_heap: signed(heap).saturating_sub(signed(self.heap_at_start)),
         };
         drop(self);
-        if committed >= PHASE_TRIM_THRESHOLD {
+        // Trigger trim when either the phase arena or the warm chunk cache crossed the threshold:
+        // worker tasks run inside `bstd::mem::Frame` (Tag::Chunks) rather than `PhaseMem::root`,
+        // so heavy cold `Names`/`Heads` phases accumulate warm chunks even when `root` stays small.
+        if committed >= PHASE_TRIM_THRESHOLD || blaze_mem::chunks::cached().warm >= PHASE_TRIM_THRESHOLD {
             blaze_mem::frame::ask_spare_trim();
             let _ = blaze_mem::frame::trim_spare(0);
             let _ = blaze_mem::frame::trim_span_pool();
             let _ = blaze_mem::chunks::trim();
+            let _ = blaze_mem::blocks::trim_all();
         }
         row
     }

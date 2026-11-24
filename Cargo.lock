@@ -1963,6 +1963,7 @@ dependencies = [
  "blaze-surface",
  "blaze-toolchain",
  "blaze-unit-graph",
+ "blaze-zstd",
  "edition",
  "target-features",
 ]

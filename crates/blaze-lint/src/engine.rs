@@ -335,6 +335,9 @@ pub(crate) fn run_with<'a>(
     if rules.runs(Rule::HeapLeak) {
         pass.heap_leak_pass();
     }
+    if rules.runs(Rule::ParallelVecs) {
+        pass.parallel_vecs_pass();
+    }
     let test_at_end = pass.test_at(unit.text.len().saturating_sub(1) as u32);
     let from = count(out.list.len())?;
     pass.emit(out)?;

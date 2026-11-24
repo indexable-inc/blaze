@@ -59,7 +59,7 @@ use crate::task::{
     CallSrc, Cfg, Fill, FillEnv, FillReport, Files, First, Fragment, FragmentTokens, Held, ImplSrc,
     ItemText, LangSrc, Loc, LowerCx, LowerNote, Lowered, MacroBody, MacroSrc, Member, ModMade, Par,
     PreludeImport, RootInput, RootNote, RootPlan, TaskError, Tree, Variant, Where,
-    crate_root, crate_tools, file_attrs, lower, walk,
+    crate_root, crate_tools, file_attrs, lower, lower_in, walk,
 };
 use crate::task::{joined, pop_dir};
 use crate::task::ExpandPart;
@@ -332,6 +332,8 @@ pub struct Tables<'a> {
     pub texts: HashMap<ItemKey, (ItemText<'a>, At), Alloc<'a>>,
     /// The other way: the item at an entry of a text's outline.
     pub by_place: HashMap<(At, ItemIndex), ItemKey, Alloc<'a>>,
+    /// Whether `by_place` is populated (false for record-only CLI solves, true for in-memory `Names`).
+    track_by_place: bool,
     /// Each trait's and impl's members on under the cfg, in declaration order.
     pub members: HashMap<ItemKey, AVec<'a, Member<'a>>, Alloc<'a>>,
     /// The tuple and unit structs, each its own constructor.
@@ -343,6 +345,10 @@ pub struct Tables<'a> {
 
 impl<'a> Tables<'a> {
     fn new_in(alloc: Alloc<'a>) -> Tables<'a> {
+        Self::with_by_place_in(alloc, true)
+    }
+
+    fn with_by_place_in(alloc: Alloc<'a>, track_by_place: bool) -> Tables<'a> {
         Tables {
             values: AVec::new_in(alloc),
             macros: HashMap::new_in(alloc),
@@ -353,6 +359,7 @@ impl<'a> Tables<'a> {
             use_locs: HashMap::new_in(alloc),
             texts: HashMap::new_in(alloc),
             by_place: HashMap::new_in(alloc),
+            track_by_place,
             members: HashMap::new_in(alloc),
             ctors: HashMap::new_in(alloc),
         }
@@ -376,7 +383,7 @@ impl<'a> Tables<'a> {
 
     /// A fragment's tables (not its declarations, nor the modules it made) added; `owner` is
     /// the fragment's key, `at` the text it is.
-    fn add(&mut self, owner: ItemKey, at: At, part: Lowered<'a, 'a>) -> AVec<'a, LowerNote<'a>> {
+    fn add<'s>(&mut self, owner: ItemKey, at: At, part: Lowered<'a, 'a, 's>) -> AVec<'s, LowerNote<'a>> {
         let Lowered { macros, calls, enums, impls, langs, use_locs, texts, members, ctors, notes, values, .. } = part;
         for (owner, list) in members {
             self.join_members(owner, list);
@@ -395,9 +402,13 @@ impl<'a> Tables<'a> {
         self.enums.extend(enums);
         self.impls.extend(impls);
         self.langs.extend(langs);
-        self.use_locs.insert(owner, use_locs);
+        if !use_locs.is_empty() {
+            self.use_locs.insert(owner, use_locs);
+        }
         for t in texts.into_iter() {
-            self.by_place.insert((at, t.item), t.key);
+            if self.track_by_place {
+                self.by_place.insert((at, t.item), t.key);
+            }
             self.texts.insert(t.key, (t, at));
         }
         notes
@@ -424,8 +435,10 @@ impl<'a> Tables<'a> {
                 }
             }
         }
-        let Tables { macros, calls, enums, impls, langs, use_locs, texts, by_place, members, ctors, values } = other;
-        merge_map(&mut self.by_place, by_place);
+        let Tables { macros, calls, enums, impls, langs, use_locs, texts, by_place, track_by_place: _, members, ctors, values } = other;
+        if self.track_by_place {
+            merge_map(&mut self.by_place, by_place);
+        }
         self.values.reserve(values.len());
         self.values.extend(values);
         if members.len() > self.members.len() {
@@ -508,23 +521,64 @@ impl<'a> core::ops::Deref for ExpansionText<'a> {
     fn deref(&self) -> &Self::Target { &self.contents }
 }
 
-/// A macro call's expansion: what it adds to its module.
+/// Cold refusal metadata for a macro call whose expansion was refused, boxed in the crate bump
+/// arena so normal expansions pay zero bytes for refusal fields (`size_of::<Expansion>()` = 24 B).
 #[derive(Debug)]
-pub struct Expansion<'a> {
-    /// Empty when the call is not expanded: then `refused` says why (a refused call), or the
-    /// call wrote nothing (a derive of a cfg-off item, a statement call that declares nothing).
-    pub decls: DeclsBuilder<'a, &'a str>,
-    /// `None` when no text was made.
-    pub made: Option<&'a ExpansionText<'a>>,
+pub struct ExpansionRefusal<'a> {
     /// The call's expansion was refused ([`crate::refused`]): its module's scope says so, and
     /// a name looked up behind it is unknown, never absent.
-    pub refused: Option<crate::refused::Refused<'a>>,
-    /// For a refused call, the note that refused it (the last the solve noted for the call
-    /// before it returned nothing) and the first `env!` variable the host refused during it:
-    /// the reason the names record's failed-call row keeps ([`crate::call_refusal`]). `None`
-    /// for a call that expanded, and for a refused call whose driver noted nothing (a bug,
-    /// kept as [`crate::call_refusal::RefusalKind::Unnoted`]).
-    pub refused_by: Option<(ExpandNote<'a>, Option<&'a str>)>,
+    pub refused: crate::refused::Refused<'a>,
+    /// The note that refused the call (the last the solve noted for the call before it returned
+    /// nothing) and the first `env!` variable the host refused during it.
+    pub by: Option<(ExpandNote<'a>, Option<&'a str>)>,
+}
+
+/// A macro call's expansion: what it adds to its module. Stored compactly (24 bytes: three
+/// arena-backed pointers) so `CrateNames::expansions` does not bloat to 320 B/slot.
+#[derive(Debug)]
+pub struct Expansion<'a> {
+    /// `None` when the call wrote no declarations (a refused call, a block module's outer shell,
+    /// a derive of a cfg-off item, a statement call that declares nothing).
+    decls: Option<&'a DeclsBuilder<'a, &'a str>>,
+    /// `None` when no text was made.
+    pub made: Option<&'a ExpansionText<'a>>,
+    /// `Some` only when the call's expansion was refused.
+    pub refusal: Option<&'a ExpansionRefusal<'a>>,
+}
+
+impl<'a> Expansion<'a> {
+    fn from_decls(decls: DeclsBuilder<'a, &'a str>, made: Option<&'a ExpansionText<'a>>, bump: Bump<'a>) -> Expansion<'a> {
+        let empty = decls.items.is_empty()
+            && decls.mods.is_empty()
+            && decls.uses.is_empty()
+            && decls.extern_crates.is_empty()
+            && decls.macro_rules.is_empty()
+            && decls.calls.is_empty();
+        Expansion { decls: (!empty).then(|| &*bump.alloc_val(decls)), made, refusal: None }
+    }
+
+    fn empty_with(made: Option<&'a ExpansionText<'a>>) -> Expansion<'a> {
+        Expansion { decls: None, made, refusal: None }
+    }
+
+    fn from_refusal(refused: crate::refused::Refused<'a>, by: Option<(ExpandNote<'a>, Option<&'a str>)>, bump: Bump<'a>) -> Expansion<'a> {
+        Expansion { decls: None, made: None, refusal: Some(bump.alloc_val(ExpansionRefusal { refused, by })) }
+    }
+
+    #[inline]
+    pub fn decls(&self) -> Option<&'a DeclsBuilder<'a, &'a str>> {
+        self.decls
+    }
+
+    #[inline]
+    pub fn refused(&self) -> Option<crate::refused::Refused<'a>> {
+        self.refusal.map(|r| r.refused)
+    }
+
+    #[inline]
+    pub fn refused_by(&self) -> Option<(ExpandNote<'a>, Option<&'a str>)> {
+        self.refusal.and_then(|r| r.by)
+    }
 }
 
 /// Which text of a call did not lex.
@@ -1555,8 +1609,10 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
         chains.insert(m.key, chain);
     }
 
-    // The names.
-    let run = Run::new_in(set, prepares, alloc);
+    // The names. Move `low.tables` straight into `run.tables` so Stage::Publish never rehashes
+    // and merges two large tables (saves ~40 MB on `core`).
+    let empty_tables = Tables::new_in(alloc);
+    let run = Run::with_tables_in(set, prepares, low.tables, alloc);
     let mut fill: Fill<'a, &'a str> = Fill::new_in(alloc);
     fill.first = first;
     let added_externs: AVec<'a, (&'a str, ItemKey)>;
@@ -1571,7 +1627,7 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
             script: input.script,
             cfg: &cfg,
             tree: &tree,
-            tables: &low.tables,
+            tables: &empty_tables,
             decls: &decls,
             root: &crate_root_record,
             chains: &chains,
@@ -1598,21 +1654,24 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
         let scratch = |work: &mut dyn FnMut(Alloc<'_>)| par.call_scratch(work);
         let cx = FillCx { base: &base, run: &run, facts: Facts { base: &base, run: &run }, mark: &mark, part: &part, seen: &seen, scratch: &scratch };
         // The cell core solves and writes the scopes. The files' blocks that hold impls are
-        // modules before it starts: it is told of them as of any made module.
+        // modules before it starts: it is told of them as of any made module. Run `blocks_of`
+        // inside `par.call_scratch` so nested scans and block lowering scratch never leak into
+        // the crate's frame.
         par.stage(crate::task::Stage::Solve);
         par.names_part(crate::task::NamesPart::Blocks);
-        blocks_of(&base, &run, &low.bodies, None, alloc, None);
+        crate::task::Scratch::run(&scratch, alloc, |block_scratch| {
+            blocks_of(&base, &run, &low.bodies, None, block_scratch, None);
+        });
         let places = |m: ItemKey| held(run.block_places.lock(), "block places").get(&m).copied();
         let expand = |call: ItemKey, def: Def| {
             let _ = crate::task::Expand::expand(&cx, ExpandRequest { call, def });
         };
-        let made = |out: &mut AVec<'a, ItemKey>| out.extend(held(run.made.read(), "made modules").keys().copied());
+        let made = |out: &mut AVec<'_, ItemKey>| out.extend(held(run.made.read(), "made modules").keys().copied());
         let names_part = |p: crate::task::NamesPart| par.names_part(p);
         // The places counted: each held body's, and each attribute value's written as a call
         // (crate::attr_values: its macros are looked up at its item's place).
-        let held_places = |out: &mut AVec<'a, (ItemKey, u32)>| {
+        let held_places = |out: &mut AVec<'_, (ItemKey, u32)>| {
             out.extend(held(run.held.lock(), "held bodies").iter().map(|b| b.0.place));
-            out.extend(low.tables.values.iter().map(|v| v.place));
             out.extend(held(run.tables.read(), "tables").values.iter().map(|v| v.place));
         };
         let solve_scratch = |work: &mut dyn FnMut(Alloc<'_>)| par.solve_scratch(work);
@@ -1666,8 +1725,7 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
     }));
     bodies.sort_unstable_by_key(|b| b.src.key);
     let files = held(files.into_inner(), "files").into_files();
-    let mut tables_all = low.tables;
-    tables_all.merge(held(tables.into_inner(), "tables"));
+    let tables_all = held(tables.into_inner(), "tables");
     let made = held(made.into_inner(), "made modules");
     chains.reserve(made.len());
     for (&m, module) in made.iter() {
@@ -2466,67 +2524,115 @@ fn lower_modules<'a, P: Par>(
     let alloc = bump.alloc();
     // The modules lowered, ascending: every one, or a one-group solve's members.
     let at: AVec<'a, usize> = only.unwrap_or_else(|| AVec::from_iter_in(0..tree.modules.len(), alloc));
-    let mut parts = AVec::with_capacity_in(at.len(), alloc);
-    par.map(
-        at.len(),
-        |j| {
-            let i = at[j];
-            let m = &tree.modules[i];
-            let file = set.at(m.file as usize);
-            let fragment = Fragment {
-                // A file: no expansion wrote it.
-                marks: None,
-                tokens: FragmentTokens::None,
-                module: m.key,
-                owner: m.key,
-                text: file.text,
-                outline: &file.outline,
-                items: m.item,
-                at: Where::File(m.file),
-                depth: 0,
-                made: false,
-                members_of: None,
-                written: file.path,
-                kept: None,
-            };
-            // The root's fragment (the walk's first module) declares the module's list.
-            let procs = match listed {
-                None => ProcDecls::Text,
-                Some(list) => ProcDecls::Module { here: if i == 0 { list } else { &[] } },
-            };
-            lower(LowerCx { krate, tools, edition, cfg, walked: tree, procs, entry: entry && i == 0, harness: harness && i == 0, order }, fragment, bump)
-        },
-        &mut parts,
-    );
-    let mut out = Lowering {
-        decls: AVec::with_capacity_in(parts.len(), alloc),
-        at: AVec::new_in(alloc),
-        tables: Tables::new_in(alloc),
-        prelude: None,
-        macro_use: AVec::new_in(alloc),
-        macro_exports: AVec::new_in(alloc),
-        bodies: AVec::new_in(alloc),
-    };
-    for (&i, mut part) in at.iter().zip(parts) {
-        let m = &tree.modules[i];
-        out.bodies.extend(part.bodies.iter().copied());
-        for rules in part.decls.macro_rules.iter() {
-            if rules.export {
-                out.macro_exports.push((rules.name, rules.def, rules.shapes));
+    let mut run_in = |s_alloc: Alloc<'_>| -> Lowering<'a> {
+        let mut parts = AVec::with_capacity_in(at.len(), s_alloc);
+        par.map(
+            at.len(),
+            |j| {
+                let i = at[j];
+                let m = &tree.modules[i];
+                let file = set.at(usize::try_from(m.file).unwrap_or(0));
+                let fragment = Fragment {
+                    // A file: no expansion wrote it.
+                    marks: None,
+                    tokens: FragmentTokens::None,
+                    module: m.key,
+                    owner: m.key,
+                    text: file.text,
+                    outline: &file.outline,
+                    items: m.item,
+                    at: Where::File(m.file),
+                    depth: 0,
+                    made: false,
+                    members_of: None,
+                    written: file.path,
+                    kept: None,
+                };
+                // The root's fragment (the walk's first module) declares the module's list.
+                let procs = match listed {
+                    None => ProcDecls::Text,
+                    Some(list) => ProcDecls::Module { here: if i == 0 { list } else { &[] } },
+                };
+                let mut lowered = None;
+                let _ = par.call_scratch(&mut |scratch| {
+                    lowered = Some(crate::task::lower_in_out(
+                        LowerCx { krate, tools, edition, cfg, walked: tree, procs, entry: entry && i == 0, harness: harness && i == 0, order },
+                        fragment,
+                        s_alloc,
+                        scratch,
+                        bump,
+                    ));
+                });
+                lowered.unwrap_or_else(|| crate::task::lower_in_out(LowerCx { krate, tools, edition, cfg, walked: tree, procs, entry: entry && i == 0, harness: harness && i == 0, order }, fragment, s_alloc, s_alloc, bump))
+            },
+            &mut parts,
+        );
+        let mut tables = Tables::with_by_place_in(alloc, par.track_by_place());
+        let (mut n_macros, mut n_calls, mut n_enums, mut n_impls, mut n_langs, mut n_use_locs, mut n_texts, mut n_members, mut n_ctors, mut n_values, mut n_bodies) = (0usize, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        for p in parts.iter() {
+            n_macros += p.macros.len();
+            n_calls += p.calls.len();
+            n_enums += p.enums.len();
+            n_impls += p.impls.len();
+            n_langs += p.langs.len();
+            if !p.use_locs.is_empty() {
+                n_use_locs += 1;
             }
+            n_texts += p.texts.len();
+            n_members += p.members.len();
+            n_ctors += p.ctors.len();
+            n_values += p.values.len();
+            n_bodies += p.bodies.len();
         }
-        let prelude = part.prelude.take();
-        if i == 0 {
-            out.prelude = prelude;
-            out.macro_use = core::mem::replace(&mut part.macro_use, AVec::new_in(alloc));
-        } else if prelude.is_some() {
-            notes.push(NamesNote::PreludeImportOutsideRoot { module: m.key });
+        tables.macros.reserve(n_macros);
+        tables.calls.reserve(n_calls);
+        tables.enums.reserve(n_enums);
+        tables.impls.reserve(n_impls);
+        tables.langs.reserve(n_langs);
+        tables.use_locs.reserve(n_use_locs);
+        tables.texts.reserve(n_texts);
+        if tables.track_by_place {
+            tables.by_place.reserve(n_texts);
         }
-        let decls = core::mem::replace(&mut part.decls, DeclsBuilder::new_in(alloc));
-        let lowered = out.tables.add(m.key, At::File(m.file), part);
-        notes.extend(lowered.into_iter().map(NamesNote::Lower));
-        out.decls.push(decls);
-    }
+        tables.members.reserve(n_members);
+        tables.ctors.reserve(n_ctors);
+        tables.values.reserve(n_values);
+        let mut out = Lowering {
+            decls: AVec::with_capacity_in(parts.len(), alloc),
+            at: AVec::new_in(alloc),
+            tables,
+            prelude: None,
+            macro_use: AVec::new_in(alloc),
+            macro_exports: AVec::new_in(alloc),
+            bodies: AVec::with_capacity_in(n_bodies, alloc),
+        };
+        for (&i, mut part) in at.iter().zip(parts) {
+            let m = &tree.modules[i];
+            out.bodies.extend(part.bodies.iter().copied());
+            for rules in part.decls.macro_rules.iter() {
+                if rules.export {
+                    out.macro_exports.push((rules.name, rules.def, rules.shapes));
+                }
+            }
+            let prelude = part.prelude.take();
+            if i == 0 {
+                out.prelude = prelude;
+                out.macro_use = core::mem::replace(&mut part.macro_use, AVec::new_in(alloc));
+            } else if prelude.is_some() {
+                notes.push(NamesNote::PreludeImportOutsideRoot { module: m.key });
+            }
+            let decls = core::mem::replace(&mut part.decls, DeclsBuilder::new_in(alloc));
+            let lowered = out.tables.add(m.key, At::File(m.file), part);
+            notes.extend(lowered.into_iter().map(NamesNote::Lower));
+            out.decls.push(decls);
+        }
+        out
+    };
+    let mut out = None;
+    let _ = par.solve_scratch(&mut |s_alloc| {
+        out = Some(run_in(s_alloc));
+    });
+    let mut out = out.unwrap_or_else(|| run_in(alloc));
     out.at = at;
     out
 }
@@ -2741,10 +2847,14 @@ struct Run<'a> {
 
 impl<'a> Run<'a> {
     fn new_in(files: FileSet<'a>, prepares: &'a Prepares<'a>, alloc: Alloc<'a>) -> Run<'a> {
+        Self::with_tables_in(files, prepares, Tables::new_in(alloc), alloc)
+    }
+
+    fn with_tables_in(files: FileSet<'a>, prepares: &'a Prepares<'a>, tables: Tables<'a>, alloc: Alloc<'a>) -> Run<'a> {
         Run {
             prepares,
             files: Mutex::new(files),
-            tables: RwLock::new(Tables::new_in(alloc)),
+            tables: RwLock::new(tables),
             expansions: Mutex::new(HashMap::new_in(alloc)),
             made: RwLock::new(HashMap::new_in(alloc)),
             notes: Mutex::new(AVec::new_in(alloc)),
@@ -2839,7 +2949,43 @@ impl<'a, S> ScopeFacts for Facts<'_, 'a, S> {
     }
 
     fn expansion(&self, call: ItemKey) -> Result<Option<DeclsBuilder<'_, &'a str>>, SurfaceError> {
-        Ok(held(self.run.expansions.lock(), "expansions").get(&call).map(|e| e.decls.clone()))
+        Ok(held(self.run.expansions.lock(), "expansions").get(&call).map(|e| {
+            e.decls().map_or_else(|| DeclsBuilder::new_in(self.base.alloc), |d| d.clone())
+        }))
+    }
+
+    fn with_decls<R>(&self, module: ItemKey, f: impl FnOnce(&DeclsBuilder<'_, Self::Name>) -> R) -> Result<R, SurfaceError> {
+        if let Some(it) = self.base.decls.get(&module) {
+            return Ok(f(&it.1));
+        }
+        if let Some(it) = self.base.made_before.and_then(|m| m.get(&module)) {
+            return Ok(f(&it.decls));
+        }
+        let guard = held(self.run.made.read(), "made modules");
+        let it = guard.get(&module).ok_or(SurfaceError::NoRecord { fact: "ModuleDecls", item: module })?;
+        Ok(f(&it.decls))
+    }
+
+    fn with_crate_root<R>(&self, krate: CrateItemKey, f: impl FnOnce(&CrateRootBuilder<'_, Self::Name>) -> R) -> Result<R, SurfaceError> {
+        if krate == self.base.key {
+            Ok(f(self.base.root))
+        } else {
+            Err(SurfaceError::NoCrateRecord { fact: "CrateRoot", krate })
+        }
+    }
+
+    fn with_expansion<R>(&self, call: ItemKey, f: impl FnOnce(Option<&DeclsBuilder<'_, Self::Name>>) -> R) -> Result<R, SurfaceError> {
+        let guard = held(self.run.expansions.lock(), "expansions");
+        match guard.get(&call) {
+            Some(e) => match e.decls() {
+                Some(d) => Ok(f(Some(d))),
+                None => {
+                    let empty = DeclsBuilder::new_in(self.base.alloc);
+                    Ok(f(Some(&empty)))
+                }
+            },
+            None => Ok(f(None)),
+        }
     }
 
     /// A derive's helpers from its `attributes(..)`, as written: a proc derive's
@@ -2848,7 +2994,12 @@ impl<'a, S> ScopeFacts for Facts<'_, 'a, S> {
     /// attributes(default))]`), kept in its record (names-attr-4). A macro that is no derive
     /// declares none.
     fn derive_helpers(&self, derive: ItemKey, out: &mut AVec<'_, &'a str>) -> Result<(), SurfaceError> {
-        let Some(src) = self.base.macro_src(derive) else {
+        let src = held(self.run.tables.read(), "tables")
+            .macros
+            .get(&derive)
+            .copied()
+            .or_else(|| self.base.macro_src(derive));
+        let Some(src) = src else {
             return Err(SurfaceError::NoRecord { fact: "MacroSrc", item: derive });
         };
         match src.body {
@@ -2908,7 +3059,7 @@ impl<'a, S: SourceTexts<'a>> crate::task::Expand for FillCx<'_, 'a, S> {
         // nothing (every way it does notes why first), kept for the names record's row.
         let last = core::cell::Cell::new(None);
         let expansion = match expand_decls(self.base, self.run, request, self.part, self.seen, self.scratch, &env, &last) {
-            Some((decls, made)) => Expansion { decls, made, refused: None, refused_by: None },
+            Some((decls, made)) => Expansion::from_decls(decls, made, self.base.bump),
             None => {
                 let src = self.base.tables.calls.get(&request.call).copied().or_else(|| held(self.run.tables.read(), "tables").calls.get(&request.call).copied());
                 // `OUT_DIR` is set for the package (it has a build script) but not known: no
@@ -2916,7 +3067,7 @@ impl<'a, S: SourceTexts<'a>> crate::task::Expand for FillCx<'_, 'a, S> {
                 let out_dir_unknown = self.base.script.is_none()
                     && self.base.sources.crate_env(self.base.index).is_some_and(|e| e.get("OUT_DIR") == Err(crate::crate_env::EnvUnknown));
                 let refused = crate::refused::Refused::of(src.map(|s| (s.module, s.name)), env.first(), out_dir_unknown);
-                Expansion { decls: DeclsBuilder::new_in(self.base.alloc), made: None, refused: Some(refused), refused_by: last.get().map(|note| (note, env.first())) }
+                Expansion::from_refusal(refused, last.get().map(|note| (note, env.first())), self.base.bump)
             }
         };
         (self.part)(ExpandPart::Store, "", 0);
@@ -2987,7 +3138,11 @@ impl<'r, 'a, S: SourceTexts<'a>> FillEnv<&'a str> for FillCx<'r, 'a, S> {
     }
 
     fn derive_helpers(&self, derive: ItemKey) -> Option<&str> {
-        let src = self.base.macro_src(derive)?;
+        let src = held(self.run.tables.read(), "tables")
+            .macros
+            .get(&derive)
+            .copied()
+            .or_else(|| self.base.macro_src(derive))?;
         match src.body {
             MacroBody::Proc { kind: ProcKind::Derive, helpers } | MacroBody::BuiltinDerive { helpers } => Some(helpers),
             _ => None,
@@ -3731,7 +3886,10 @@ fn expand_call<'a, S: SourceTexts<'a>>(
     // A nested call of an eager builtin names a library builtin unless this crate defines a
     // macro of that name (then the name may be the crate's: refused, never guessed); the
     // library's own `#[rustc_builtin_macro]` definition (core's) is that builtin.
-    let shadowed = |name: &str| base.tables.macros.values().any(|m| m.name == name && !matches!(m.body, MacroBody::BuiltinFn(b) if b == name));
+    let shadowed = |name: &str| {
+        base.tables.macros.values().any(|m| m.name == name && !matches!(m.body, MacroBody::BuiltinFn(b) if b == name))
+            || held(run.tables.read(), "tables").macros.values().any(|m| m.name == name && !matches!(m.body, MacroBody::BuiltinFn(b) if b == name))
+    };
     let nested_at = DefAt { site: DefSite { krate: def_krate, module: None }, edition: def_edition, export: Export::Exported, local_inner: LocalInner::No, transparency: None };
     let eager = EagerDriver { macro_name: mac.name, def_at: nested_at, shadowed: &shadowed, keep: home_bump, alloc };
     let run_part = match mac.body {
@@ -3872,8 +4030,31 @@ fn expand_call<'a, S: SourceTexts<'a>>(
     // How many `crate`s the text writes for another crate's `$crate`: such a text is read only
     // with its marks (crate::crate_roots).
     let roots_written = roots.iter().filter(|(_, k)| *k != here).count();
-    // Rendered in the call's work (the text grows as it is written), kept at its exact size.
-    let rendered_text: &'a str = keep(rendered.as_str(), home_bump);
+    let in_block = held(run.made.read(), "made modules")
+        .get(&src.module)
+        .is_some_and(|m| m.info.name.is_some_and(crate::blocks::is_block_module));
+    // Fast-path statement-position calls (`assert!`, `debug_assert!`, `panic!`, etc.) in
+    // resettable `call_scratch`: if outlining fails and `statements_as_items` yields no items (or
+    // refuses), return without ever building `origin_column` or copying `rendered`/`Outline` into
+    // `home_bump` (saves ~15% of all expansion renders & outlines on `core`).
+    let mut pre_block_items: Option<(AString<'_>, AVec<'_, crate::crate_roots::Copied>)> = None;
+    if in_block {
+        part(ExpandPart::Outline, mac.name, rendered.len());
+        let probe = outline(rendered.as_str(), edition, alloc);
+        if probe.errors().first().is_some() {
+            part(ExpandPart::Lower, mac.name, rendered.len());
+            match crate::expanded_blocks::statements_as_items(rendered.as_str(), call, alloc) {
+                Ok(None) => return Some((DeclsBuilder::new_in(home), None)),
+                Ok(Some((items, copies))) => {
+                    pre_block_items = Some((items, copies));
+                }
+                Err(refused) => {
+                    note(ExpandNote::NotItems { macro_name: mac.name, message: refused.message() });
+                    return Some((DeclsBuilder::new_in(home), None));
+                }
+            }
+        }
+    }
     let input_index = match written_input.as_deref() {
         Some(map) => blaze_expand::origin_column::InputIndex::Aligned(map),
         None => blaze_expand::origin_column::InputIndex::AsWritten,
@@ -3883,100 +4064,72 @@ fn expand_call<'a, S: SourceTexts<'a>>(
         CallShape::Attr | CallShape::Derive => blaze_expand::origin_column::InputShape::Whole,
     };
     let mark_of = |at: usize| expansion.hygiene(at).mark.map(blaze_expand::origin_column::TextMark::of);
-    // The column and its bytes are made in the call's work; the bytes are kept at their size.
     let origin_column = crate::expansion_origins::column_of(call, &placed, &roots, &expansion.origins, input_index, &mark_of, alloc);
-    let origins: Result<&'a [u8], crate::expansion_origins::OriginsError> = origin_column
-        .and_then(|column| crate::expansion_origins::write_bytes(call, src.place, shape, src.name, src.implicit, &column, alloc))
-        .map(|bytes| &*home_bump.alloc_slice_copy(&bytes));
-    part(ExpandPart::Outline, mac.name, rendered_text.len());
-    let made: &'a ExpansionText<'a> = home_bump.alloc_val(ExpansionText::new(rendered_text, outline(rendered_text, edition, home), origins));
-    part(ExpandPart::Lower, mac.name, rendered_text.len());
-    // The marks a lowered path's first segment resolves by (token-mark-2): the text's column,
-    // opened once in `ExpansionText::new`.
-    let column = match made.column {
-        Ok(column) => Some(column),
-        Err(lost) if roots_written > 0 => {
-            note(ExpandNote::RootsLost { macro_name: mac.name, lost });
-            return None;
-        }
-        // No root of another crate: every `crate` in it is this crate's (or a `macro` item's
-        // own, read as before this piece).
-        Err(_) => None,
-    };
-    // With the tokens that place the text lowered: the rendered text's own, or, for statements
-    // read as items, the same tokens moved with the slices that text copied
-    // ([`crate::nested_input::ExpansionTokens::moved`]), so a call there takes its input as the
-    // expansion's tokens, never as its text lexed again.
-    #[allow(clippy::type_complexity)]
-    let (text, made, column, moved_copies): (&'a str, &'a ExpansionText<'a>, Option<blaze_expand::origin_column::OriginsRef<'a>>, Option<AVec<'_, crate::crate_roots::Copied>>) = match made.outline.errors().first() {
-        None => (rendered_text, made, column, None),
-        Some(error) => {
-            // A call a block's module holds ([`crate::blocks`]) stands in STATEMENT position:
-            // the Reference, "Macro invocation", "Statements": its expansion is statements of
-            // the calling block. One that is an expression or a `let` (`assert!(..)`,
-            // `println!(..)`) declares nothing: nothing is lowered from it. One whose
-            // statements hold items or statement calls beside what is not an item, or that is
-            // a block expression declaring items (`tokio::select!`), is read as statements
-            // (crate::expanded_blocks `statements_as_items`): its top-level items and calls,
-            // and a module per block inside it that holds one, are the call's fragment, lowered
-            // below like any expansion's items (one key, the call's; one record, its
-            // expansion). An expansion nested in it is a call of that fragment: the same step
-            // again, driven by the solve, `src.depth + 1` deep.
-            let in_block = held(run.made.read(), "made modules")
-                .get(&src.module)
-                .is_some_and(|m| m.info.name.is_some_and(crate::blocks::is_block_module));
-            if !in_block {
-                note(ExpandNote::NotItems { macro_name: mac.name, message: made.outline.message(error) });
-                (rendered_text, made, column, None)
-            } else {
-                match crate::expanded_blocks::statements_as_items(rendered_text, call, alloc) {
-                    Ok(None) => return Some((DeclsBuilder::new_in(home), None)),
-                    Ok(Some((items, copies))) => {
-                        let items: &'a str = keep(items.as_str(), home_bump);
-                        // The column moved with the slices the items text copied, written with
-                        // the call's own part (its call, place, shape and macro, as the
-                        // rendered text's): an item of the items text walks from its place to
-                        // the call that wrote it (blaze-cli body_types/covered.rs
-                        // `written_path`), as an item of any expansion does. The rows are those
-                        // `remapped` carried before (one remap, read back in place).
-                        let origins: Result<&'a [u8], crate::expansion_origins::OriginsError> = match made.column {
-                            Ok(column) => match crate::crate_roots::remap(column, &copies, alloc) {
-                                Ok(moved) => crate::expansion_origins::write_bytes(call, src.place, shape, src.name, src.implicit, &moved, alloc)
-                                    .map(|bytes| &*home_bump.alloc_slice_copy(&bytes)),
-                                Err(error) if roots_written > 0 => {
-                                    note(ExpandNote::RootsLost { macro_name: mac.name, lost: crate::crate_roots::RootsLost::Column { error } });
-                                    return None;
-                                }
-                                Err(_) => Err(crate::expansion_origins::OriginsError::Rewritten { what: "a call's statements read as items" }),
-                            },
-                            Err(_) => Err(crate::expansion_origins::OriginsError::Rewritten { what: "a call's statements read as items" }),
-                        };
-                        let again: &'a ExpansionText<'a> = home_bump.alloc_val(ExpansionText::new(items, outline(items, edition, home), origins));
-                        // The marks a lowered path reads: the moved column, as before; none
-                        // when the rendered text had none (refused above when it wrote
-                        // another crate's root).
-                        let column = match (column, again.column) {
-                            (Some(_), Ok(moved)) => Some(moved),
-                            (Some(_), Err(lost)) if roots_written > 0 => {
-                                note(ExpandNote::RootsLost { macro_name: mac.name, lost });
-                                return None;
-                            }
-                            _ => None,
-                        };
-                        if let Some(error) = again.outline.errors().first() {
-                            note(ExpandNote::NotItems { macro_name: mac.name, message: again.outline.message(error) });
-                            return Some((DeclsBuilder::new_in(home), None));
-                        }
-                        (items, again, column, Some(copies))
-                    }
-                    Err(refused) => {
-                        note(ExpandNote::NotItems { macro_name: mac.name, message: refused.message() });
-                        return Some((DeclsBuilder::new_in(home), None));
-                    }
+    let (rendered_text, text, made, column, moved_copies): (&'a str, &'a str, &'a ExpansionText<'a>, Option<blaze_expand::origin_column::OriginsRef<'a>>, Option<AVec<'_, crate::crate_roots::Copied>>) =
+        if let Some((items_str, copies)) = pre_block_items {
+            let rendered_text: &'a str = keep(rendered.as_str(), home_bump);
+            let items: &'a str = keep(items_str.as_str(), home_bump);
+            let raw_origins = origin_column
+                .and_then(|column| crate::expansion_origins::write_bytes(call, src.place, shape, src.name, src.implicit, &column, alloc));
+            let raw_origins_ref: Result<&[u8], crate::expansion_origins::OriginsError> = raw_origins.as_deref().map_err(|&e| e);
+            let raw_col = match crate::crate_roots::column_in(&raw_origins_ref) {
+                Ok(col) => Some(col),
+                Err(lost) if roots_written > 0 => {
+                    note(ExpandNote::RootsLost { macro_name: mac.name, lost });
+                    return None;
                 }
+                Err(_) => None,
+            };
+            let origins: Result<&'a [u8], crate::expansion_origins::OriginsError> = match raw_col {
+                Some(column) => match crate::crate_roots::remap(column, &copies, alloc) {
+                    Ok(moved) => crate::expansion_origins::write_bytes(call, src.place, shape, src.name, src.implicit, &moved, alloc)
+                        .map(|bytes| &*home_bump.alloc_slice_copy(&bytes)),
+                    Err(error) if roots_written > 0 => {
+                        note(ExpandNote::RootsLost { macro_name: mac.name, lost: crate::crate_roots::RootsLost::Column { error } });
+                        return None;
+                    }
+                    Err(_) => Err(crate::expansion_origins::OriginsError::Rewritten { what: "a call's statements read as items" }),
+                },
+                None => Err(crate::expansion_origins::OriginsError::Rewritten { what: "a call's statements read as items" }),
+            };
+            let again: &'a ExpansionText<'a> = home_bump.alloc_val(ExpansionText::new(items, outline(items, edition, home), origins));
+            let column = match (raw_col, again.column) {
+                (Some(_), Ok(moved)) => Some(moved),
+                (Some(_), Err(lost)) if roots_written > 0 => {
+                    note(ExpandNote::RootsLost { macro_name: mac.name, lost });
+                    return None;
+                }
+                _ => None,
+            };
+            if let Some(error) = again.outline.errors().first() {
+                note(ExpandNote::NotItems { macro_name: mac.name, message: again.outline.message(error) });
+                return Some((DeclsBuilder::new_in(home), None));
             }
-        }
-    };
+            (rendered_text, items, again, column, Some(copies))
+        } else {
+            // Rendered in the call's work (the text grows as it is written), kept at its exact size.
+            let rendered_text: &'a str = keep(rendered.as_str(), home_bump);
+            let origins: Result<&'a [u8], crate::expansion_origins::OriginsError> = origin_column
+                .and_then(|column| crate::expansion_origins::write_bytes(call, src.place, shape, src.name, src.implicit, &column, alloc))
+                .map(|bytes| &*home_bump.alloc_slice_copy(&bytes));
+            if !in_block {
+                part(ExpandPart::Outline, mac.name, rendered_text.len());
+            }
+            let made: &'a ExpansionText<'a> = home_bump.alloc_val(ExpansionText::new(rendered_text, outline(rendered_text, edition, home), origins));
+            part(ExpandPart::Lower, mac.name, rendered_text.len());
+            let column = match made.column {
+                Ok(column) => Some(column),
+                Err(lost) if roots_written > 0 => {
+                    note(ExpandNote::RootsLost { macro_name: mac.name, lost });
+                    return None;
+                }
+                Err(_) => None,
+            };
+            if let Some(error) = made.outline.errors().first() {
+                note(ExpandNote::NotItems { macro_name: mac.name, message: made.outline.message(error) });
+            }
+            (rendered_text, rendered_text, made, column, None)
+        };
     // An `include!`'s file is the current file of what it writes ([`crate::included`]): the
     // calls in it read from it, and a `mod x;` at its top is found from its folder. A file
     // outside the package (a build script's output) has no such path: the calling file stays.
@@ -4019,8 +4172,9 @@ fn expand_call<'a, S: SourceTexts<'a>>(
         kept: None,
         marks: column.map(|column| crate::crate_roots::TextMarks { text, column }),
     };
-    // The lowering is kept (the call's declarations and modules): in `home`.
-    let mut out = lower(LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false, harness: false, order: base.sources.attr_order() }, fragment, home_bump);
+    // The lowering is kept (the call's declarations and modules): output in `home`, scratch in
+    // resettable `call_scratch` (`alloc`).
+    let mut out = lower_in(LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false, harness: false, order: base.sources.attr_order() }, fragment, alloc, home_bump);
     // Entered only by a call that makes modules: one that makes none stays in `Lower` for the
     // few moves below (what the part costs is what `make_modules` does: a module's file read,
     // outlined and lowered).
@@ -4043,9 +4197,9 @@ fn expand_call<'a, S: SourceTexts<'a>>(
             dir: included_dir,
             written,
             marks: column.map(|column| crate::crate_roots::TextMarks { text, column }),
-            tokens: Some(get_tokens()),
+            tokens: FragmentTokens::LazyDeferBody(&get_tokens),
         };
-        make_modules(base, run, src.module, &mods, place, src.depth + 1, &mut bodies);
+        make_modules(base, run, src.module, &mods, place, src.depth + 1, &mut bodies, alloc);
     }
     let decls = core::mem::replace(&mut out.decls, DeclsBuilder::new_in(home));
     part(ExpandPart::Tables, mac.name, 0);
@@ -4150,17 +4304,18 @@ fn keep_item<'a, S: SourceTexts<'a>>(
         // from that expansion's tokens, placed in the same text.
         tokens: FragmentTokens::from_option(kept_tokens),
     };
-    let mut out = lower(
+    let mut out = lower_in(
         LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false, harness: false, order: base.sources.attr_order() },
         fragment,
+        alloc,
         bump,
     );
     // A struct, an enum or a union makes no module; moved as `expand_decls` moves them so a
     // change there stays one shape.
     let mods = core::mem::replace(&mut out.mods_made, AVec::new_in(alloc));
-    let place = Made { text, outline: &made.outline, at: Where::Expansion(src.loc), place: At::Expansion(call), dir: None, written: src.written, marks: None, tokens: kept_tokens };
+    let place = Made { text, outline: &made.outline, at: Where::Expansion(src.loc), place: At::Expansion(call), dir: None, written: src.written, marks: None, tokens: FragmentTokens::from_option(kept_tokens) };
     let mut bodies = core::mem::replace(&mut out.bodies, AVec::new_in(alloc));
-    make_modules(base, run, src.module, &mods, place, src.depth + 1, &mut bodies);
+    make_modules(base, run, src.module, &mods, place, src.depth + 1, &mut bodies, alloc);
     let decls = core::mem::replace(&mut out.decls, DeclsBuilder::new_in(alloc));
     // The harness declares no name: rustc writes `_DECLS` def-site, so no path of the crate
     // reaches it. Its text, key and body are the call's (`add_lowered` below), named by its
@@ -4262,13 +4417,23 @@ fn make_blocks<'a, S: SourceTexts<'a>>(
         // call in the block's module takes its input as the expansion's tokens (bitflags'
         // `fn all() { .. $crate::__bitflags_expr_safe_attrs!(..) .. }`, written through
         // `__impl_bitflags!`'s argument). A body outside the text they place is no
-        // expansion's: none.
-        let tokens = body.tokens.or_else(|| deferred_tokens.map(|f| f())).and_then(|of| {
-            let at = crate::expansion_origins::offset_in(of.text, body.text)?;
-            let mut shifted: AVec<'_, crate::crate_roots::Copied> = AVec::with_capacity_in(copies.len(), scratch);
-            shifted.extend(copies.iter().map(|c| crate::crate_roots::Copied { from: c.from + at, ..*c }));
-            Some(of.moved(text, &shifted, bump))
-        });
+        // expansion's: none. Materialized lazily on first nested call or inner body inside the
+        // block so blocks with only items/impls allocate zero token streams in `home_bump` (rule 11).
+        let moved_tokens: core::cell::OnceCell<Option<crate::nested_input::ExpansionTokens<'a>>> = core::cell::OnceCell::new();
+        let make_moved_tokens = || {
+            *moved_tokens.get_or_init(|| {
+                let of = body.tokens.or_else(|| deferred_tokens.map(|f| f()))?;
+                let at = crate::expansion_origins::offset_in(of.text, body.text)?;
+                let mut shifted: AVec<'_, crate::crate_roots::Copied> = AVec::with_capacity_in(copies.len(), scratch);
+                shifted.extend(copies.iter().map(|c| crate::crate_roots::Copied { from: c.from + at, ..*c }));
+                Some(of.moved(text, &shifted, bump))
+            })
+        };
+        let frag_tokens = if body.tokens.is_some() || deferred_tokens.is_some() {
+            FragmentTokens::LazyOpt(&make_moved_tokens)
+        } else {
+            FragmentTokens::None
+        };
         let fragment = Fragment {
             module: body.module,
             owner: call,
@@ -4282,22 +4447,22 @@ fn make_blocks<'a, S: SourceTexts<'a>>(
             written: body.written,
             kept: None,
             marks,
-            tokens: FragmentTokens::from_option(tokens),
+            tokens: frag_tokens,
         };
-        let mut out = lower(LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false, harness: false, order: base.sources.attr_order() }, fragment, bump);
-        let mods = core::mem::replace(&mut out.mods_made, AVec::new_in(alloc));
-        let place = Made { text, outline: &made.outline, at: Where::Expansion(body.loc), place: At::Expansion(call), dir: None, written: body.written, marks, tokens };
+        let mut out = lower_in(LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false, harness: false, order: base.sources.attr_order() }, fragment, scratch, bump);
+        let mods = core::mem::replace(&mut out.mods_made, AVec::new_in(scratch));
+        let place = Made { text, outline: &made.outline, at: Where::Expansion(body.loc), place: At::Expansion(call), dir: None, written: body.written, marks, tokens: frag_tokens };
         {
             let mut places = held(run.block_places.lock(), "block places");
             for m in mods.iter() {
                 places.insert(m.key, body.place);
             }
         }
-        make_modules(base, run, body.module, &mods, place, body.depth + 1, &mut work);
+        make_modules(base, run, body.module, &mods, place, body.depth + 1, &mut work, scratch);
         // The outermost block's `mod` declaration: dropped, so the body's module binds nothing.
         out.decls = DeclsBuilder::new_in(alloc);
         add_lowered(run, call, At::Expansion(call), out);
-        held(run.expansions.lock(), "expansions").insert(call, Expansion { decls: DeclsBuilder::new_in(alloc), made: Some(made), refused: None, refused_by: None });
+        held(run.expansions.lock(), "expansions").insert(call, Expansion::empty_with(Some(made)));
     }
 }
 
@@ -4531,7 +4696,7 @@ fn base_files<'r, 'a>(run: &'r Run<'a>) -> LockResult<std::sync::MutexGuard<'r, 
 }
 
 /// A fragment's tables added to the run's.
-fn add_lowered<'a>(run: &Run<'a>, owner: ItemKey, at: At, out: Lowered<'a, 'a>) {
+fn add_lowered<'a, 's>(run: &Run<'a>, owner: ItemKey, at: At, out: Lowered<'a, 'a, 's>) {
     let notes = held(run.tables.write(), "tables").add(owner, at, out);
     let mut held_notes = held(run.notes.lock(), "notes");
     held_notes.extend(notes.into_iter().map(NamesNote::Lower));
@@ -4540,7 +4705,7 @@ fn add_lowered<'a>(run: &Run<'a>, owner: ItemKey, at: At, out: Lowered<'a, 'a>) 
 /// The text a fragment that writes modules is: its text and outline, the lowering's `Where`
 /// and the place its items are given.
 #[derive(Clone, Copy)]
-struct Made<'a> {
+struct Made<'c, 'a> {
     text: &'a str,
     outline: &'a Outline<'a>,
     at: Where,
@@ -4553,25 +4718,24 @@ struct Made<'a> {
     written: &'a str,
     /// [`Fragment::marks`] of this text.
     marks: Option<crate::crate_roots::TextMarks<'a>>,
-    /// [`Fragment::tokens`] of this text.
-    tokens: Option<crate::nested_input::ExpansionTokens<'a>>,
+    /// [`Fragment::tokens`] of this text (kept lazy until an inline module lowers a nested call).
+    tokens: FragmentTokens<'c, 'a>,
 }
 
 /// Where a module of this crate is: its children's directory, what their `#[path]` is relative
-/// to, its chain up to the root, and its path; walked or made by a macro.
-fn place_of<'a, S>(base: &Base<'_, 'a, S>, run: &Run<'a>, module: ItemKey) -> Option<(&'a str, &'a str, AVec<'a, ItemKey>, &'a str)> {
-    let alloc = base.alloc;
-    let bump = base.bump;
+/// to, its chain up to the root, and its path; walked or made by a macro. Temporary copies live
+/// in `scratch` so `home_bump` never retains throwaway parent chains or paths (rule 11).
+fn place_of<'s, 'a, S>(base: &Base<'_, 'a, S>, run: &Run<'a>, module: ItemKey, scratch: Alloc<'s>) -> Option<(AString<'s>, AString<'s>, AVec<'s, ItemKey>, AString<'s>)> {
     if let Some(&i) = base.tree.by_key.get(&module) {
         let m = &base.tree.modules[i];
-        let chain = AVec::from_slice_in(base.chains.get(&module)?, alloc);
-        return Some((keep(&m.dir, bump), keep(&m.path_dir, bump), chain, keep(&m.path, bump)));
+        let chain = AVec::from_slice_in(base.chains.get(&module)?, scratch);
+        return Some((AString::from_str_in(&m.dir, scratch), AString::from_str_in(&m.path_dir, scratch), chain, AString::from_str_in(&m.path, scratch)));
     }
     if let Some(it) = base.made_before.and_then(|m| m.get(&module)) {
-        return Some((it.dir, it.path_dir, it.chain.clone_in(alloc), it.path));
+        return Some((AString::from_str_in(it.dir, scratch), AString::from_str_in(it.path_dir, scratch), AVec::from_slice_in(&it.chain, scratch), AString::from_str_in(it.path, scratch)));
     }
     let made = held(run.made.read(), "made modules");
-    made.get(&module).map(|it| (it.dir, it.path_dir, it.chain.clone_in(alloc), it.path))
+    made.get(&module).map(|it| (AString::from_str_in(it.dir, scratch), AString::from_str_in(it.path_dir, scratch), AVec::from_slice_in(&it.chain, scratch), AString::from_str_in(it.path, scratch)))
 }
 
 /// The file at `path`, read and outlined the first time a module names it.
@@ -4591,20 +4755,21 @@ fn file_at<'a, S: SourceTexts<'a>>(base: &Base<'_, 'a, S>, run: &Run<'a>, path: 
 /// body, a `mod x;` one's from its file, found as the walk finds one), its place recorded in
 /// `run.made`, and its key queued for the fill. A worklist, not recursion: a module inside a
 /// made one is pushed once its parent is recorded.
-fn make_modules<'a, S: SourceTexts<'a>>(
+fn make_modules<'c, 'a, S: SourceTexts<'a>>(
     base: &Base<'_, 'a, S>,
     run: &Run<'a>,
     parent: ItemKey,
     mods: &[ModMade<'a>],
-    made: Made<'a>,
+    made: Made<'c, 'a>,
     depth: u16,
     // The bodies lowered in the made modules that may write an impl in a block, added.
     bodies: &mut AVec<'_, crate::task::BodySrc<'a>>,
+    scratch: Alloc<'_>,
 ) {
     let alloc = base.alloc;
     let bump = base.bump;
     let top = parent;
-    let mut work: AVec<'a, (ItemKey, ModMade<'a>, Made<'a>)> = AVec::with_capacity_in(mods.len(), alloc);
+    let mut work: AVec<'_, (ItemKey, ModMade<'a>, Made<'c, 'a>)> = AVec::with_capacity_in(mods.len(), scratch);
     work.extend(mods.iter().map(|m| (parent, *m, made)));
     while let Some((parent, m, made)) = work.pop() {
         let note = |note: MadeNote<'a>| run.note(NamesNote::Made { name: m.name, at: m.loc, note });
@@ -4619,7 +4784,7 @@ fn make_modules<'a, S: SourceTexts<'a>>(
                 continue;
             }
         }
-        let Some((dir, path_dir, parent_chain, parent_path)) = place_of(base, run, parent) else {
+        let Some((dir, path_dir, parent_chain, parent_path)) = place_of(base, run, parent, scratch) else {
             note(MadeNote::NoPlace);
             continue;
         };
@@ -4628,16 +4793,16 @@ fn make_modules<'a, S: SourceTexts<'a>>(
         // that module as its parent, whose folder was made from this one.
         let (dir, path_dir) = match made.dir {
             Some(included) if parent == top => (included, included),
-            _ => (dir, path_dir),
+            _ => (dir.as_str(), path_dir.as_str()),
         };
-        let (fragment_of, item, mdir, mpdir): (Made<'a>, Option<ItemIndex>, &'a str, &'a str) = if m.inline {
-            let d = keep(&joined(dir, &[m.path_attr.unwrap_or(m.name)], alloc), bump);
+        let (fragment_of, item, mdir, mpdir): (Made<'c, 'a>, Option<ItemIndex>, &'a str, &'a str) = if m.inline {
+            let d = keep(&joined(dir, &[m.path_attr.unwrap_or(m.name)], scratch), bump);
             (made, Some(m.item), d, d)
         } else {
-            let sub = keep(&joined(dir, &[m.name], alloc), bump);
+            let sub = keep(&joined(dir, &[m.name], scratch), bump);
             let (file, mdir, mpdir) = if let Some(p) = m.path_attr {
-                let target = joined(path_dir, &[p], alloc);
-                let mut parent_dir = target.clone_in(alloc);
+                let target = joined(path_dir, &[p], scratch);
+                let mut parent_dir = target.clone_in(scratch);
                 pop_dir(&mut parent_dir);
                 let parent_dir = keep(&parent_dir, bump);
                 let Some(file) = file_at(base, run, &target) else {
@@ -4646,14 +4811,14 @@ fn make_modules<'a, S: SourceTexts<'a>>(
                 };
                 (file, parent_dir, parent_dir)
             } else {
-                let mut file_name = AString::new_in(alloc);
+                let mut file_name = AString::new_in(scratch);
                 file_name.push_str(m.name);
                 file_name.push_str(".rs");
-                let a = joined(dir, &[&*file_name], alloc);
+                let a = joined(dir, &[&*file_name], scratch);
                 match file_at(base, run, &a) {
-                    Some(file) => (file, sub, dir),
+                    Some(file) => (file, sub, keep(dir, bump)),
                     None => {
-                        let b = joined(dir, &[m.name, "mod.rs"], alloc);
+                        let b = joined(dir, &[m.name, "mod.rs"], scratch);
                         let Some(file) = file_at(base, run, &b) else {
                             note(MadeNote::FileNotFound { path: keep(&b, bump) });
                             continue;
@@ -4663,11 +4828,11 @@ fn make_modules<'a, S: SourceTexts<'a>>(
                 }
             };
             let (at, file) = file;
-            if !file_attrs(base.cfg, &file.outline, file.text, alloc).cfg_ok {
+            if !file_attrs(base.cfg, &file.outline, file.text, scratch).cfg_ok {
                 note(MadeNote::CfgOff);
                 continue;
             }
-            (Made { text: file.text, outline: &file.outline, at: Where::File(at), place: At::File(at), dir: None, written: file.path, marks: None, tokens: None }, None, mdir, mpdir)
+            (Made { text: file.text, outline: &file.outline, at: Where::File(at), place: At::File(at), dir: None, written: file.path, marks: None, tokens: FragmentTokens::None }, None, mdir, mpdir)
         };
         let fragment = Fragment {
             module: m.key,
@@ -4682,14 +4847,15 @@ fn make_modules<'a, S: SourceTexts<'a>>(
             written: fragment_of.written,
             kept: None,
             marks: fragment_of.marks,
-            tokens: FragmentTokens::from_option(fragment_of.tokens),
+            tokens: fragment_of.tokens,
         };
-        let mut out = lower(LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false, harness: false, order: base.sources.attr_order() }, fragment, bump);
+        let mut out = lower_in(LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false, harness: false, order: base.sources.attr_order() }, fragment, scratch, bump);
         bodies.extend(out.bodies.iter().copied());
         let mut chain = AVec::with_capacity_in(parent_chain.len() + 1, alloc);
         chain.push(m.key);
         chain.extend_from_slice(&parent_chain);
-        let mut path = BString::from_str_in(parent_path, bump);
+        let mut path = BString::with_capacity_in(parent_path.len() + 2 + m.name.len(), bump);
+        path.push_str(&parent_path);
         path.push_str("::");
         path.push_str(m.name);
         let module = MadeModule {

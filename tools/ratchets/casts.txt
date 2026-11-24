@@ -85,7 +85,7 @@ blaze-lower	303
 blaze-malloc	48
 blaze-manifest	6
 blaze-math	15
-blaze-mem	171
+blaze-mem	170
 blaze-memo	62
 blaze-meter	35
 blaze-names-source	8
@@ -105,7 +105,7 @@ blaze-remote	238
 blaze-report	137
 blaze-rng	3
 blaze-run	110
-blaze-scope	1015
+blaze-scope	1006
 blaze-screen	13
 blaze-script	11
 blaze-sha256	1
