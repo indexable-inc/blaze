@@ -91,6 +91,10 @@ fn write_source(path: &Path, text: &str, what: &str) {
     std::fs::write(path, text).unwrap_or_else(|error| panic!("writing {what}: {error}"));
 }
 
+fn read_file_bytes(path: &Path, what: &str) -> impl AsRef<[u8]> + use<> {
+    std::fs::read(path).unwrap_or_else(|error| panic!("reading {what}: {error}"))
+}
+
 fn pause_poll() {
     std::thread::sleep(Duration::from_millis(10));
 }
@@ -258,16 +262,17 @@ fn a_pass_and_a_failure() {
         // The shared runner decodes stdout before returning. Preserve the file evidence
         // even if a malformed byte stops that decode.
         let result = std::panic::catch_unwind(|| run(dir, home, &["--", "--deadline", "20s"]));
-        let stderr = std::fs::read(home.join("test.stderr")).expect("read the command's stderr bytes");
-        let stdout = std::fs::read(home.join("test.stdout")).expect("read the command's stdout bytes");
+        let stderr = read_file_bytes(&home.join("test.stderr"), "the command's stderr bytes");
+        let stdout = read_file_bytes(&home.join("test.stdout"), "the command's stdout bytes");
+        let (stderr, stdout) = (stderr.as_ref(), stdout.as_ref());
         let said = match result {
             Ok(said) => said,
             Err(payload) => {
-                eprintln!("{}", byte_evidence("the command runner did not return a status", None, &stderr, &stdout));
+                eprintln!("{}", byte_evidence("the command runner did not return a status", None, stderr, stdout));
                 std::panic::resume_unwind(payload);
             }
         };
-        (said, stderr, stdout)
+        (said, stderr.to_vec(), stdout.to_vec())
     });
     let report = |why: &str| byte_evidence(why, said.code, &stderr, &stdout);
     let diagnostic = std::str::from_utf8(&stderr)
@@ -777,5 +782,174 @@ fn scoped_test_checks_only_selected_member_and_its_deps() {
         let after_whole = run(dir, home, &["a", "--", "--deadline", "20s"]);
         assert_eq!(after_whole.code, Some(0), "{}", evidence("blaze test a stays clean after whole check", &after_whole));
         assert_eq!(after_whole.stdout, expect_warm, "{}", evidence(expect_warm, &after_whole));
+    });
+}
+
+/// Scans CAS segment files under `store_root` for `BZTH` suite head records (zeroing only the
+/// per-row 8-byte `micros` wall-time field so every `TestId`, outcome tag, `NotKept` reason,
+/// 32-byte `BZTR` address, asks table, and read table are compared byte-for-byte) and counts
+/// kept `BZTR` pass records (`kept == 0`).
+#[cfg(target_os = "macos")]
+fn collect_bzth_and_bztr(store_root: &Path) -> (blaze_own::AVec<'static, blaze_own::AVec<'static, u8>>, usize) {
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut heads = blaze_own::AVec::new_in(alloc);
+    let mut bztr_kept_passes = 0usize;
+    let listed = Command::new("/usr/bin/find").arg(store_root).args(["-type", "f"]).output().expect("list store files");
+    assert!(listed.status.success(), "find store files failed");
+    let paths = core::str::from_utf8(&listed.stdout).expect("utf8 store paths");
+    for file in paths.lines() {
+        let raw = read_file_bytes(Path::new(file), file);
+        let bytes = raw.as_ref();
+        let mut i = 0usize;
+        while i + 24 <= bytes.len() {
+            if &bytes[i..i + 4] == b"BZTH" {
+                let ver = u32::from_le_bytes(bytes[i + 4..i + 8].try_into().unwrap());
+                let rows = u32::from_le_bytes(bytes[i + 8..i + 12].try_into().unwrap()) as usize;
+                let asks = u32::from_le_bytes(bytes[i + 12..i + 16].try_into().unwrap()) as usize;
+                let reads = u32::from_le_bytes(bytes[i + 16..i + 20].try_into().unwrap()) as usize;
+                let pad = u32::from_le_bytes(bytes[i + 20..i + 24].try_into().unwrap());
+                if ver == 1 && pad == 0 && rows <= 1024 && asks <= 65536 && reads <= 65536 {
+                    let total = 24 + rows * 88 + asks * 40 + reads * 64;
+                    if i + total <= bytes.len() {
+                        let mut rec = blaze_own::AVec::with_capacity_in(total, alloc);
+                        rec.extend_from_slice(&bytes[i..i + total]);
+                        for r in 0..rows {
+                            // Each 88-byte row stores `micros: u64` at offset 72..80.
+                            let off = 24 + r * 88 + 72;
+                            rec[off..off + 8].fill(0);
+                        }
+                        heads.push(rec);
+                        i += total;
+                        continue;
+                    }
+                }
+            } else if i + 64 <= bytes.len()
+                && &bytes[i..i + 4] == b"BZTR"
+                && bytes[i + 4] == 1
+                && bytes[i + 5] == 0
+                && bytes[i + 6..i + 16] == [0u8; 10]
+                && bytes[i + 56..i + 64] == [0u8; 8]
+            {
+                bztr_kept_passes += 1;
+                i += 64;
+                continue;
+            }
+            i += 1;
+        }
+    }
+    heads.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+    (heads, bztr_kept_passes)
+}
+
+#[cfg(target_os = "macos")]
+fn copy_dir_files(src: &Path, dst: &Path) {
+    let status = Command::new("/bin/cp").arg("-R").arg(src).arg(dst).status().expect("cp -R store");
+    assert!(status.success(), "cp -R store failed");
+}
+
+/// Regression for parallel `Codes::Pooled` + `SuiteCache` + lock-free `SyncTypedFrom`:
+/// - compiles cold workspace functions, transitive statics (`BASE -> TABLE`), and body-local items
+///   across 4 parallel code workers via `FromRecord` (`SnapshotTyped`);
+/// - preserves pure vs impure (`NotKept::Clock`) classification and warm cache reuse;
+/// - produces byte-for-byte identical `BZTR` test-result records as `--workers 1` (`Codes::Serial`),
+///   and cross-reuses kept results in both directions (`Pooled -> Serial` and `Serial -> Pooled`).
+#[test]
+#[cfg(target_os = "macos")]
+fn pooled_workers_match_serial_bztr_and_purity() {
+    let lib = r#"
+static BASE: u64 = 17;
+static TABLE: [&u64; 2] = [&BASE, &BASE];
+
+#[inline(never)]
+fn shared_compute(x: u64) -> u64 {
+    fn local_step(v: u64) -> u64 {
+        v.wrapping_mul(3).wrapping_add(1)
+    }
+    let p: *const u64 = TABLE[0];
+    assert!(!p.is_null());
+    local_step(x + *TABLE[0] + *TABLE[1])
+}
+
+#[test]
+fn pure_one() {
+    assert_eq!(shared_compute(1), 106);
+}
+
+#[test]
+fn pure_two() {
+    assert_eq!(shared_compute(2), 109);
+}
+
+#[test]
+fn pure_three() {
+    assert_eq!(shared_compute(3), 112);
+}
+
+#[test]
+fn pure_four() {
+    assert_eq!(shared_compute(4), 115);
+}
+
+#[test]
+fn impure_clock() {
+    let t = std::time::Instant::now();
+    assert_eq!(shared_compute(5), 118);
+    let _ = t.elapsed();
+}
+"#;
+    fixture("test_command_pooled_vs_serial", &[("Cargo.toml", MANIFEST), ("src/lib.rs", lib)], |dir, home| {
+        let expect_cold = "test result: ok. ran 5: 5 passed, 0 failed; 0 reused from kept results; 1 not kept (1 read the real clock); 0 ignored; 0 benches not run; 0 filtered out; 0 flaky\n";
+        let expect_warm = "test result: ok. ran 1: 1 passed, 0 failed; 4 reused from kept results; 1 not kept (1 read the real clock); 0 ignored; 0 benches not run; 0 filtered out; 0 flaky\n";
+
+        // 0. Warm `blaze check` once via `--list` and snapshot the checked store (empty code store)
+        //    so both `--workers 1` (`Codes::Serial`) and `--workers 4` (`Codes::Pooled`) compile
+        //    cold code records over the exact same check records.
+        let listed = run(dir, home, &["--", "--list"]);
+        assert_eq!(listed.code, Some(0), "{}", evidence("warm check via --list", &listed));
+        let store_dir = home.join(".blaze/v2/store");
+        let checked_snapshot = home.join("store_checked_snapshot");
+        copy_dir_files(&store_dir, &checked_snapshot);
+
+        // 1. Cold serial (`--workers 1`).
+        let serial_cold = run(dir, home, &["--workers", "1", "--", "--deadline", "20s"]);
+        assert_eq!(serial_cold.code, Some(0), "{}", evidence("serial cold passes", &serial_cold));
+        assert!(serial_cold.stdout.ends_with(expect_cold), "{}", evidence(expect_cold, &serial_cold));
+        let (serial_heads, serial_passes) = collect_bzth_and_bztr(&store_dir);
+        assert_eq!(serial_passes, 4, "serial run must keep exactly the 4 pure tests (got {serial_passes})");
+        assert_eq!(serial_heads.len(), 1, "expected 1 BZTH head record in serial store");
+
+        // 2. Cross-mode reuse (Serial -> Pooled): `--workers 4` reuses all 4 serial-kept passes.
+        let pooled_on_serial = run(dir, home, &["--workers", "4", "--", "--deadline", "20s"]);
+        assert_eq!(pooled_on_serial.code, Some(0), "{}", evidence("pooled reuses serial cache", &pooled_on_serial));
+        assert!(pooled_on_serial.stdout.ends_with(expect_warm), "{}", evidence(expect_warm, &pooled_on_serial));
+
+        // 3. Restore the warm-checked / empty-code-store snapshot and run cold pooled (`--workers 4`).
+        let rm_ok = Command::new("/bin/rm").arg("-rf").arg(&store_dir).status().expect("rm -rf store");
+        assert!(rm_ok.success(), "rm -rf store failed");
+        copy_dir_files(&checked_snapshot, &store_dir);
+        let pooled_cold = run(dir, home, &["--workers", "4", "--", "--deadline", "20s"]);
+        assert_eq!(pooled_cold.code, Some(0), "{}", evidence("pooled cold passes", &pooled_cold));
+        assert!(pooled_cold.stdout.ends_with(expect_cold), "{}", evidence(expect_cold, &pooled_cold));
+
+        // 4. Rule 25 determinism: `BZTH` head records (every TestId, outcome, NotKept reason,
+        //    32-byte `BZTR` address, asks table, and read table) and kept `BZTR` pass count must
+        //    be byte-for-byte identical between `--workers 1` (`Codes::Serial`) and `--workers 4`
+        //    (`Codes::Pooled`).
+        let (pooled_heads, pooled_passes) = collect_bzth_and_bztr(&store_dir);
+        assert_eq!(pooled_passes, 4, "pooled run must keep exactly the 4 pure tests (got {pooled_passes})");
+        assert_eq!(
+            serial_heads, pooled_heads,
+            "BZTH head & BZTR addresses under --workers 4 (Codes::Pooled) must match --workers 1 (Codes::Serial) byte-for-byte"
+        );
+
+        // 5. Warm pooled (`--workers 4`): reuses all 4 pure tests, reruns only impure_clock.
+        let pooled_warm = run(dir, home, &["--workers", "4", "--", "--deadline", "20s"]);
+        assert_eq!(pooled_warm.code, Some(0), "{}", evidence("pooled warm passes", &pooled_warm));
+        assert!(pooled_warm.stdout.ends_with(expect_warm), "{}", evidence(expect_warm, &pooled_warm));
+
+        // 6. Cross-mode reuse (Pooled -> Serial): `--workers 1` reuses all 4 pooled-kept passes.
+        let serial_on_pooled = run(dir, home, &["--workers", "1", "--", "--deadline", "20s"]);
+        assert_eq!(serial_on_pooled.code, Some(0), "{}", evidence("serial reuses pooled cache", &serial_on_pooled));
+        assert!(serial_on_pooled.stdout.ends_with(expect_warm), "{}", evidence(expect_warm, &serial_on_pooled));
     });
 }

@@ -1228,6 +1228,14 @@ pub(crate) struct RunCrates<'n> {
     heap: &'static blaze_own::Heap,
 }
 
+impl<'n> RunCrates<'n> {
+    /// The read-only `Send + Sync` store snapshot taken after check finished, covering both
+    /// committed segments and uncommitted check puts (`Visibility::InArena`).
+    pub(crate) fn snapshot(&self) -> &'n StoreSnapshot {
+        self.snapshot
+    }
+}
+
 /// The [`RunCrates`] of `program`, in `frame`: each crate's records read IN PLACE from the
 /// store's mapping through `read` (engine_records.rs, the one reader of `blaze check` too).
 #[expect(clippy::too_many_arguments, reason = "the StartProgram site's edge: each argument one thing it holds")]

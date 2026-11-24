@@ -1651,6 +1651,7 @@ fn toy_job_start(item: u128, entry: u128, start: blaze_ladder::run::special::Mak
         proof: Checked::Clean.runs(ItemKey(item)).expect("a clean body runs"),
         entry: Some(ItemKey(entry)),
         start,
+        enclosers: crate::test_drive::suite_cache::LocalEnclosers::default(),
     }
 }
 
@@ -1695,6 +1696,7 @@ fn resolve_pooled(
             proof: ask.proof,
             entry: Some(ItemKey(MAIN)),
             start: blaze_ladder::run::special::MakerStart::ByRule,
+            enclosers: crate::test_drive::suite_cache::LocalEnclosers::default(),
         };
         code.ask(child, ask.key, job).expect("the relay takes the ask");
         assert!(lane.step(cx, clock, makers, &mut scratch, heap).expect("the worker's turn"), "the relay handed the worker no make");
@@ -1810,7 +1812,7 @@ fn a_maker_of_another_start_is_refused() {
 
 /// All `MakerStart::Direct(_)` tests in one suite share ONE persistent maker per worker
 /// (retargeted cleanly via `set_direct_entry`), never allocating one maker per test and never
-/// evicting at `MOST_MAKERS = 64`; a `ByRule` job in the same suite gets its own maker.
+/// evicting at `MOST_MAKERS`; a `ByRule` job in the same suite gets its own maker.
 #[test]
 fn direct_tests_in_one_suite_share_one_persistent_maker() {
     use blaze_ladder::run::special::MakerStart;
@@ -1834,6 +1836,27 @@ fn direct_tests_in_one_suite_share_one_persistent_maker() {
     // A `ByRule` job in the same suite must NOT reuse the `Direct` maker.
     make_one(&mut makers, &toy_job(MAIN, MAIN), &mut scratch, heap.shared()).expect("by-rule make");
     assert_eq!(makers.created.get(), 2, "ByRule in the same suite must get its own maker");
+
+    // LRU eviction: fill the worker's `MOST_MAKERS = 4` table (suite 0 Direct + suite 0 ByRule +
+    // suite 1 Direct + suite 2 Direct), touch suite 0 Direct so suite 0 ByRule is the LRU entry,
+    // then add suite 3 Direct and confirm suite 0 ByRule is evicted while suite 0 Direct stays hot.
+    let s0 = MakerStart::Direct(blaze_id::ItemKey(blaze_ids::ContentId::of("direct test", &1u128.to_be_bytes())));
+    let hot_s0 = toy_job_start(A, 1, s0);
+    for suite_id in 1u32..=2u32 {
+        let mut job = toy_job_start(A, 100 + u128::from(suite_id), s0);
+        job.suite = crate::test_loop::SuiteId(suite_id);
+        make_one(&mut makers, &job, &mut scratch, heap.shared()).expect("fill worker makers");
+    }
+    assert_eq!(makers.created.get(), 4, "4 distinct (suite, kind) makers created");
+    make_one(&mut makers, &hot_s0, &mut scratch, heap.shared()).expect("touch suite 0 direct maker");
+    assert_eq!(makers.created.get(), 4, "touching suite 0 reuses its direct maker");
+
+    let mut suite3 = toy_job_start(A, 103, s0);
+    suite3.suite = crate::test_loop::SuiteId(3);
+    make_one(&mut makers, &suite3, &mut scratch, heap.shared()).expect("suite 3 direct make");
+    assert_eq!(makers.created.get(), 5, "suite 3 gets its own direct maker");
+    assert!(makers.kept.kept(&hot_s0).is_some(), "hot suite 0 direct maker stays resident across boundary");
+    assert!(makers.kept.kept(&toy_job(MAIN, MAIN)).is_none(), "cold LRU ByRule maker was evicted");
 }
 
 /// Rule 20 on a code worker: a make that panics fails alone, typed, naming that it panicked;

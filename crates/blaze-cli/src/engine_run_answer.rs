@@ -35,7 +35,7 @@ use crate::store::Store;
 const REFUSED: &str = "a page of the stored answer is refused";
 
 /// Where the record of a row is: the key the driver put it under.
-pub(crate) trait Records {
+pub(crate) trait Records: Sync {
     /// `name`'s record key; `Ok(None)`: the row has none (or there is no row). `Err`: the stored
     /// answer refused the page that holds it.
     fn record(&self, name: Name) -> Result<Option<Key>, &'static str>;

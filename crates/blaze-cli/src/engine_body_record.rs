@@ -145,6 +145,8 @@ pub(crate) fn typed_key(bytes: &[u8]) -> Key {
 pub(crate) enum TypedReadError {
     /// The command's store refused the get of `key` (its facts record or its typed record).
     Store { body: Name, key: Key, why: blaze_cas::plain::LentError },
+    /// The read-only store snapshot refused the get of `key` on a code worker.
+    Snapshot { body: Name, key: Key, why: blaze_cas::plain::SnapshotError },
     /// The body's run facts record, which names the typed record, did not read: what refused it.
     Facts { body: Name, what: &'static str },
     /// The facts name a typed record the store does not hold: a record lost, never a cue to
@@ -156,6 +158,7 @@ impl fmt::Display for TypedReadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TypedReadError::Store { body, key, why } => write!(f, "{body:?}: its record {key:?} could not be read: {why} (rule: engine_body_record.rs)"),
+            TypedReadError::Snapshot { body, key, why } => write!(f, "{body:?}: its record {key:?} could not be read from the store snapshot: {why} (rule: engine_body_record.rs)"),
             TypedReadError::Facts { body, what } => write!(f, "{body:?}: its run facts record, which names its typed record, could not be read: {what} (engine_body_facts.rs, engine_body_record.rs)"),
             TypedReadError::Missing { body, key } => write!(f, "{body:?}: its run facts name the typed record {key:?}, which the store does not hold (rule 3: engine_body_record.rs)"),
         }
@@ -185,6 +188,53 @@ impl<'h> TypedFrom<'h> {
     pub(crate) fn over(self, ids: crate::run_ids::RunIds<'h>) -> StoreTyped<'h> {
         StoreTyped { from: self, ids }
     }
+
+    /// `Send + Sync` worker-side handle over the standing answer's `Records` and immutable
+    /// [`IdsLookup`](crate::run_ids::IdsLookup), paired per-worker with the suite's
+    /// [`StoreSnapshot`](crate::store::StoreSnapshot) (zero lock contention on reads).
+    pub(crate) fn sync_over(self, ids: crate::run_ids::RunIds<'h>) -> SyncTypedFrom<'h> {
+        SyncTypedFrom { records: self.records, ids: ids.lookup() }
+    }
+}
+
+/// `Send + Sync` typed-record lookup inputs shared read-only across all `CodePool` workers.
+#[derive(Clone, Copy)]
+pub(crate) struct SyncTypedFrom<'h> {
+    pub(crate) records: &'h dyn crate::engine_run_answer::Records,
+    pub(crate) ids: crate::run_ids::IdsLookup<'h>,
+}
+
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<SyncTypedFrom<'static>>();
+};
+
+impl<'h> SyncTypedFrom<'h> {
+    /// Constructs a lock-free [`SnapshotTyped`] reader on a code worker over its `cx`, the
+    /// suite's post-check [`StoreSnapshot`](crate::store::StoreSnapshot), and its table allocator.
+    pub(crate) fn reader<'w>(
+        self,
+        cx: &'w Cx,
+        snapshot: &'w crate::store::StoreSnapshot,
+        alloc: blaze_own::Alloc<'static>,
+    ) -> SnapshotTyped<'w>
+    where
+        'h: 'w,
+    {
+        SnapshotTyped { cx, snapshot, records: self.records, ids: self.ids, alloc }
+    }
+}
+
+/// Lock-free read-only [`KeptBodies`](blaze_ladder::front2::program::lazy::typed::KeptBodies)
+/// reader for parallel `CodePool` workers: reads both committed segments and uncommitted check
+/// puts (`Visibility::InArena`) straight from [`StoreSnapshot`](crate::store::StoreSnapshot) with
+/// zero locks, avoiding redundant workspace re-typechecking on worker threads.
+pub(crate) struct SnapshotTyped<'h> {
+    cx: &'h Cx,
+    snapshot: &'h crate::store::StoreSnapshot,
+    records: &'h dyn crate::engine_run_answer::Records,
+    ids: crate::run_ids::IdsLookup<'h>,
+    alloc: blaze_own::Alloc<'static>,
 }
 
 /// THE READER of the typed records, kind by kind (blaze-ladder lazy/typed.rs `KeptBodies`), what
@@ -210,49 +260,66 @@ pub(crate) struct StoreTyped<'h> {
     ids: crate::run_ids::RunIds<'h>,
 }
 
-impl StoreTyped<'_> {
-    /// The record at `at` from the store, for body `check`'s read.
-    fn get(&self, check: Name, at: Key) -> Result<Option<&[u8]>, TypedReadError> {
-        match self.from.lent.get(&blaze_cas::Key(at.0)) {
-            Ok(found) => Ok(found.map(|lend| lend.bytes)),
-            Err(why) => Err(TypedReadError::Store { body: check, key: at, why }),
-        }
+/// Single shared decode path for [`StoreTyped`] and [`SnapshotTyped`] (rule 30).
+fn decode_body_source<'s>(
+    cx: &Cx,
+    ids: crate::run_ids::IdsLookup<'_>,
+    records: &dyn crate::engine_run_answer::Records,
+    alloc: blaze_own::Alloc<'static>,
+    key: blaze_typeck::ItemKey,
+    mut get: impl FnMut(Name, Key) -> Result<Option<&'s [u8]>, TypedReadError>,
+) -> Result<blaze_ladder::front2::program::lazy::typed::BodySource, blaze_ladder::front2::program::lazy::typed::TypedGap> {
+    use blaze_ladder::front2::program::lazy::typed::{BodySource, RunChecked, TypedGap, is_local};
+    use crate::run_ids::Grain;
+    match ids.grain(key) {
+        Some(Grain::Toolchain) => return Ok(BodySource::Run(RunChecked::Toolchain)),
+        Some(Grain::Dependency) => return Ok(BodySource::Run(RunChecked::Dependency)),
+        Some(Grain::Workspace) => {}
+        // No crate row: the run gate refused it before any make (run_ids.rs `runnable`).
+        None => return Err(TypedGap::NoRecord { key }),
     }
+    if is_local(key) {
+        return Ok(BodySource::Run(RunChecked::Local));
+    }
+    let read = |why: TypedReadError| TypedGap::Read { key, why: Box::new(why) };
+    let facts_refused = |check: Name, what: &'static str| read(TypedReadError::Facts { body: check, what });
+    let Some(check) = ids.check_of(key) else { return Err(TypedGap::NoRecord { key }) };
+    let Some(facts_at) = records.record(check).map_err(|what| facts_refused(check, what))? else { return Err(TypedGap::NoRecord { key }) };
+    let _cx = cx.span("engine: a body's typed record read");
+    // The facts record: a plain drive record whose payload is the run facts (engine_check.rs,
+    // the Bodies put), which name the typed record by its key.
+    let Some(facts) = get(check, facts_at).map_err(read)? else { return Err(facts_refused(check, "the answer names a facts record the store does not hold")) };
+    let whole = match blaze_drive::record::open(facts) {
+        Ok(blaze_drive::record::Stored::Whole(whole)) => whole,
+        Ok(blaze_drive::record::Stored::Shape(_)) => return Err(facts_refused(check, "its facts record is a shape record, which holds no payload")),
+        Err(_) => return Err(facts_refused(check, "its facts record is not a drive record")),
+    };
+    let facts = crate::engine_run_answer::facts_of(check, whole.payload).map_err(|what| facts_refused(check, what))?;
+    let typed = crate::engine_body_facts::read(facts).map_err(|_| facts_refused(check, "its facts payload does not read (engine_body_facts.rs `read`)"))?.typed;
+    // `check` ran and kept no record of it: the run's one check, counted.
+    let Some(at) = typed else { return Ok(BodySource::Run(RunChecked::Unrecorded)) };
+    let Some(bytes) = get(check, at).map_err(read)? else { return Err(read(TypedReadError::Missing { body: check, key: at })) };
+    blaze_typeck::checked_record::decode(bytes, alloc).map(BodySource::Read).map_err(|why| TypedGap::Record { key, why })
 }
 
 impl blaze_ladder::front2::program::lazy::typed::KeptBodies for StoreTyped<'_> {
     fn source(&mut self, key: blaze_typeck::ItemKey) -> Result<blaze_ladder::front2::program::lazy::typed::BodySource, blaze_ladder::front2::program::lazy::typed::TypedGap> {
-        use blaze_ladder::front2::program::lazy::typed::{BodySource, RunChecked, TypedGap, is_local};
-        use crate::run_ids::Grain;
-        match self.ids.grain(key) {
-            Some(Grain::Toolchain) => return Ok(BodySource::Run(RunChecked::Toolchain)),
-            Some(Grain::Dependency) => return Ok(BodySource::Run(RunChecked::Dependency)),
-            Some(Grain::Workspace) => {}
-            // No crate row: the run gate refused it before any make (run_ids.rs `runnable`).
-            None => return Err(TypedGap::NoRecord { key }),
-        }
-        if is_local(key) {
-            return Ok(BodySource::Run(RunChecked::Local));
-        }
-        let read = |why: TypedReadError| TypedGap::Read { key, why: Box::new(why) };
-        let facts_refused = |check: Name, what: &'static str| read(TypedReadError::Facts { body: check, what });
-        let Some(check) = self.ids.check_of(key) else { return Err(TypedGap::NoRecord { key }) };
-        let Some(facts_at) = self.from.records.record(check).map_err(|what| facts_refused(check, what))? else { return Err(TypedGap::NoRecord { key }) };
-        let _cx = self.from.cx.span("engine: a body's typed record read");
-        // The facts record: a plain drive record whose payload is the run facts (engine_check.rs,
-        // the Bodies put), which name the typed record by its key.
-        let Some(facts) = self.get(check, facts_at).map_err(read)? else { return Err(facts_refused(check, "the answer names a facts record the store does not hold")) };
-        let whole = match blaze_drive::record::open(facts) {
-            Ok(blaze_drive::record::Stored::Whole(whole)) => whole,
-            Ok(blaze_drive::record::Stored::Shape(_)) => return Err(facts_refused(check, "its facts record is a shape record, which holds no payload")),
-            Err(_) => return Err(facts_refused(check, "its facts record is not a drive record")),
-        };
-        let facts = crate::engine_run_answer::facts_of(check, whole.payload).map_err(|what| facts_refused(check, what))?;
-        let typed = crate::engine_body_facts::read(facts).map_err(|_| facts_refused(check, "its facts payload does not read (engine_body_facts.rs `read`)"))?.typed;
-        // `check` ran and kept no record of it: the run's one check, counted.
-        let Some(at) = typed else { return Ok(BodySource::Run(RunChecked::Unrecorded)) };
-        let Some(bytes) = self.get(check, at).map_err(read)? else { return Err(read(TypedReadError::Missing { body: check, key: at })) };
-        blaze_typeck::checked_record::decode(bytes, self.from.alloc).map(BodySource::Read).map_err(|why| TypedGap::Record { key, why })
+        let lent = self.from.lent;
+        decode_body_source(self.from.cx, self.ids.lookup(), self.from.records, self.from.alloc, key, |check, at| {
+            match lent.get(&blaze_cas::Key(at.0)) {
+                Ok(found) => Ok(found.map(|lend| lend.bytes)),
+                Err(why) => Err(TypedReadError::Store { body: check, key: at, why }),
+            }
+        })
+    }
+}
+
+impl blaze_ladder::front2::program::lazy::typed::KeptBodies for SnapshotTyped<'_> {
+    fn source(&mut self, key: blaze_typeck::ItemKey) -> Result<blaze_ladder::front2::program::lazy::typed::BodySource, blaze_ladder::front2::program::lazy::typed::TypedGap> {
+        let snapshot = self.snapshot;
+        decode_body_source(self.cx, self.ids, self.records, self.alloc, key, |check, at| {
+            snapshot.get(at).map_err(|why| TypedReadError::Snapshot { body: check, key: at, why })
+        })
     }
 }
 
