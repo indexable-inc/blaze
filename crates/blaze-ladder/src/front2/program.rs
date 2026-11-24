@@ -547,6 +547,43 @@ fn dyn_principals<'v>(views: impl Iterator<Item = PTys<'v>>) -> Vec<ItemKey, Glo
 }
 
 /// Each trait of `asked` not yet in `tables`, with every supertrait under it, made into
+/// Why ensuring a trait's head or members for [`object_tables`] failed.
+enum TraitWantError {
+    Const { key: LibKey, error: super::consts::ConstFail },
+    Head(super::heads::HeadError),
+}
+
+impl core::fmt::Display for TraitWantError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            TraitWantError::Const { key, error } => write!(f, "the constant {key:x} its head names: {error:?}"),
+            TraitWantError::Head(e) => write!(f, "{e:?}"),
+        }
+    }
+}
+
+/// Ensures a trait head or member table (`Want::Head` or `Want::Members`), evaluating any
+/// constants its signature types name (`Why::NeedConst`, e.g. array lengths or const generic
+/// arguments in method signatures such as `BlobStore::get_cells`) up to [`MOST_ADT_LENS`] times.
+fn ensure_trait_want<'n, S: super::source::NamesSource<'n>>(
+    r: &mut Records<'_, 'n, S>,
+    want: super::heads::Want,
+) -> Result<(), TraitWantError> {
+    let mut lens = 0;
+    loop {
+        match r.store.ensure(r.names, r.keys, want) {
+            Err(super::heads::HeadError::Item(_, Why::NeedConst(c, _))) if lens < MOST_ADT_LENS => {
+                lens += 1;
+                if let Err(error) = super::check::eval_len(r, c) {
+                    return Err(TraitWantError::Const { key: c, error });
+                }
+            }
+            Err(e) => return Err(TraitWantError::Head(e)),
+            Ok(()) => return Ok(()),
+        }
+    }
+}
+
 /// `tables` (the whole program passes an empty map once; the lazy program its own map, per
 /// body, so a trait is made once per command).
 fn object_tables<'n, S: super::source::NamesSource<'n>>(
@@ -568,8 +605,8 @@ fn object_tables<'n, S: super::source::NamesSource<'n>>(
                 return Err(String::from("more traits under its objects than the most one program's objects reach"));
             }
             let lib = r.keys.library_in(r.names, k).ok_or_else(|| String::from("no library key"))?;
-            r.store.ensure(r.names, r.keys, super::heads::Want::Head(lib)).map_err(|e| format!("its head: {e:?}"))?;
-            r.store.ensure(r.names, r.keys, super::heads::Want::Members(lib)).map_err(|e| format!("its members: {e:?}"))?;
+            ensure_trait_want(r, super::heads::Want::Head(lib)).map_err(|e| format!("its head: {e}"))?;
+            ensure_trait_want(r, super::heads::Want::Members(lib)).map_err(|e| format!("its members: {e}"))?;
             let head = r.store.maps.traits.get(&lib).ok_or_else(|| String::from("made, but no head filed under its key"))?;
             let supers_written = r.store.maps.supers.get(&lib).ok_or_else(|| String::from("made, but no supertraits filed under its key"))?;
             let view = r.store.tys.view();
@@ -2322,5 +2359,69 @@ impl blaze_build::type_name::TypeNames for Front2Program<'_> {
 
     fn variant_name(&self, adt: ItemKey, variant: u32, out: &mut dyn FnMut(&str)) -> bool {
         super::type_name::variant_name(self.front.names, &self.front.keys, adt, variant, out)
+    }
+}
+
+#[cfg(test)]
+mod object_const_tests {
+    use super::lazy::LazyProgram;
+    use crate::crates::{Inputs, UserCrate};
+    use crate::front2::keys::checker_of;
+    use crate::front2::stalled_goals::tests::fixture_toolchain;
+    use crate::refusal::SourceFile;
+    use crate::seam::FrontEnd;
+
+    /// `object_tables` must evaluate const expressions inside trait member signatures (such as
+    /// `BlobStore::get_cells` returning a fixed-size `[u8; BYTES_PER_CELL]` alias) instead of
+    /// refusing with `NeedConst`.
+    #[test]
+    fn object_trait_evaluates_const_lengths_in_trait_members() {
+        const SOURCE: &str = r#"
+const BYTES: usize = 32;
+type Cell = [u8; BYTES];
+
+pub trait BlobLike {
+    fn get_cell(&self) -> Cell;
+}
+
+struct Dummy;
+impl BlobLike for Dummy {
+    fn get_cell(&self) -> Cell {
+        [0u8; BYTES]
+    }
+}
+
+fn read(store: &dyn BlobLike) -> usize {
+    store.get_cell().len()
+}
+
+fn main() {
+    let d = Dummy;
+    let _ = read(&d);
+}
+"#;
+        let alloc = blaze_own::testing::heap().alloc();
+        let tc = fixture_toolchain();
+        let files = [("/obj_const/src/main.rs".to_owned(), SOURCE.to_owned())];
+        let user = UserCrate {
+            name: "obj_const", dir: "/obj_const/", root: "/obj_const/src/main.rs", files: &files,
+            edition: edition::PackageEdition::of_manifest("2024").expect("Rust 2024"), panic: blaze_build::Panic::Unwind,
+        };
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("fixture frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let inputs = Inputs::new(&user, &tc).expect("fixture crate");
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, erased.bump()).expect("fixture names");
+        let sources = [SourceFile { path: "src/main.rs", text: SOURCE }];
+        let trait_key = names
+            .items(0)
+            .find_map(|(item, _, _)| (names.item_text(item).and_then(|t| t.name) == Some("BlobLike")).then_some(checker_of(item)))
+            .expect("fixture `BlobLike`");
+        let mut lazy = LazyProgram::new(&names, &frame, &sources, None, alloc).expect("lazy program");
+        assert!(
+            lazy.object_table(trait_key).expect("trait object with const-sized member signature must build cleanly"),
+            "object_table must build and cache BlobLike"
+        );
+        assert!(lazy.object_trait(trait_key).is_some(), "BlobLike object trait must be available");
     }
 }

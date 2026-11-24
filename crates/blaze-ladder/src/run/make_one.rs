@@ -979,12 +979,11 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>>(
     // projection paths passed). The same ask-again as the build's: the program makes what the
     // worlds asked (`FrontEnd::make_asked`) and the constants are pulled again; bounded by the
     // same count (rule 18), and nothing made is the `Missing` itself.
-    let mut pulled = 0u32;
+    let mut pulled = AskProgress::new_in(alloc);
     loop {
         match pull_constants(program, state, build_i, build_instance) {
             Ok(()) => break,
-            Err(e) if asks_again(&e) && pulled < crate::front2::check::MOST_ROUNDS => {
-                pulled += 1;
+            Err(e) if asks_again(&e) && pulled.allow(&e) => {
                 if !program.make_asked(build_i)? {
                     return Err(e);
                 }
@@ -999,7 +998,7 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>>(
     // An instance-time question that met an answer no check made (`Missing`): the program
     // makes what its worlds asked (`FrontEnd::make_asked`) and the instance is built again,
     // as build_from's step is; bounded (rule 18), and nothing made is the `Missing` itself.
-    let mut asked = 0u32;
+    let mut asked = AskProgress::new_in(alloc);
     loop {
         let MakerState { checked, tables, work, .. } = &mut *state;
         let t = tables.take().ok_or_else(|| tables_gone(tabled))?;
@@ -1007,8 +1006,7 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>>(
         let step = build_one(&*program, &bodies, work, build_i, build_instance, sink);
         *tables = Some(Tables { closures: bodies.closures, coroutines: bodies.coroutines, const_at: bodies.const_at });
         let step = match step {
-            Err(e) if asks_again(&e) && asked < crate::front2::check::MOST_ROUNDS => {
-                asked += 1;
+            Err(e) if asks_again(&e) && asked.allow(&e) => {
                 if program.make_asked(build_i)? {
                     continue;
                 }
@@ -1049,8 +1047,7 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>>(
             // (`FrontEnd::object_table`) and the instance built again, so its bytes never
             // depend on which body was checked before it (D194); bounded by the same count,
             // and nothing made is the `NoTrait` itself.
-            Err(e) if let Some(t) = object_missing(&e) && asked < crate::front2::check::MOST_ROUNDS => {
-                asked += 1;
+            Err(e) if let Some(t) = object_missing(&e) && asked.allow(&e) => {
                 if program.object_table(t)? {
                     continue;
                 }
@@ -1087,6 +1084,65 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>>(
     // body is checked once a run (the lazy program refuses a second `check_one`). The body is
     // held for the run beside its checked result (`MakerState::checked`, held for the run too).
     Ok(())
+}
+
+/// What an `asks_again` / `object_missing` retry round stopped on, for [`AskProgress`].
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum AskKey {
+    Question(blaze_typeck::Question),
+    Adt(ItemKey),
+    Object(ItemKey),
+    Row(ReadKind, ItemKey),
+}
+
+fn ask_key(e: &RunError) -> Option<AskKey> {
+    match e {
+        RunError::Build { error: BuildError::Select(blaze_typeck::ResolveError::Missing(q)), .. }
+        | RunError::Resolve { error: blaze_typeck::ResolveError::Missing(q), .. } => Some(AskKey::Question(*q)),
+        RunError::Build { error: BuildError::NoAdt { adt }, .. } | RunError::NoAdt { adt, .. } => Some(AskKey::Adt(*adt)),
+        _ => object_missing(e).map(AskKey::Object),
+    }
+}
+
+/// Consecutive rounds without a new distinct missing fact before stopping once past `MOST_ROUNDS`.
+const MOST_ASK_STALLED: u32 = 64;
+
+/// Progress-gated round bound for instance-level `make_asked` / `object_table` retry loops
+/// (rule 18, matching `front2/check.rs`'s `MOST_PROGRESS_ROUNDS`): cold lazy builds of large
+/// bodies read from typed records can legitimately fill >`MOST_ROUNDS` distinct `ImplsOf` /
+/// `Adt` / `ObjectTrait` records across retries, while a stuck loop repeating the same missing
+/// fact still stops at `MOST_ROUNDS`.
+struct AskProgress<'a> {
+    rounds: u32,
+    stalled: u32,
+    seen: blaze_hash::HashSet<AskKey, Alloc<'a>>,
+}
+
+impl<'a> AskProgress<'a> {
+    fn new_in(alloc: Alloc<'a>) -> Self {
+        Self { rounds: 0, stalled: 0, seen: blaze_hash::HashSet::new_in(alloc) }
+    }
+
+    fn allow(&mut self, e: &RunError) -> bool {
+        self.allow_key(ask_key(e))
+    }
+
+    fn allow_key(&mut self, key: Option<AskKey>) -> bool {
+        if self.rounds >= crate::front2::check::MOST_PROGRESS_ROUNDS {
+            return false;
+        }
+        let fresh = key.is_some_and(|k| self.seen.insert(k));
+        if fresh {
+            self.stalled = 0;
+        } else {
+            self.stalled += 1;
+        }
+        if self.rounds >= crate::front2::check::MOST_ROUNDS && self.stalled >= MOST_ASK_STALLED {
+            return false;
+        }
+        self.rounds += 1;
+        true
+    }
 }
 
 /// The trait a refused build found no object table for: the walk's own (blaze-build
@@ -1540,7 +1596,7 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
 /// what the rows noted unmade.
 fn verify_rows<'n>(program: &mut RecordsProgram<'n>, state: &mut MakerState, i: usize, tabled: ItemKey, view: &EntryView<'_>, relaid: &[(blaze_build::CoroutineOf, ContentId)]) -> Result<Verdict, RunError> {
     let refused = |program: &RecordsProgram<'n>, error| RunError::CodeRecord { function: program.function(i).named(), error };
-    let mut rounds = 0u32;
+    let mut rounds = AskProgress::new_in(state.work.alloc);
     loop {
         let MakerState { checked, tables, work, .. } = &mut *state;
         let t = tables.take().ok_or_else(|| tables_gone(tabled))?;
@@ -1560,8 +1616,7 @@ fn verify_rows<'n>(program: &mut RecordsProgram<'n>, state: &mut MakerState, i: 
             // item is gone today), the entry is stale and the make that follows meets the
             // question itself.
             Verdict::Needs { kind, item, .. } => {
-                if rounds < crate::front2::check::MOST_ROUNDS && matches!(program.make_asked(i), Ok(true)) {
-                    rounds += 1;
+                if rounds.allow_key(Some(AskKey::Row(kind, item))) && matches!(program.make_asked(i), Ok(true)) {
                     continue;
                 }
                 return Ok(Verdict::Stale { kind, item });
@@ -1569,9 +1624,8 @@ fn verify_rows<'n>(program: &mut RecordsProgram<'n>, state: &mut MakerState, i: 
             // A row answered otherwise: what the rows asked is made (a row may differ only for
             // a fact asked of another, unmade record) and they are asked again; nothing made,
             // the entry is stale.
-            stale @ Verdict::Stale { .. } => {
-                if rounds < crate::front2::check::MOST_ROUNDS && matches!(program.make_asked(i), Ok(true)) {
-                    rounds += 1;
+            stale @ Verdict::Stale { kind, item } => {
+                if rounds.allow_key(Some(AskKey::Row(kind, item))) && matches!(program.make_asked(i), Ok(true)) {
                     continue;
                 }
                 return Ok(stale);
@@ -2762,7 +2816,7 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
         let mut reach = Reach::new_in(alloc);
         let mut vtable_data: AVec<'_, (blaze_code::record::Symbol, AVec<'static, u8>)> = blaze_own::Vec::new_in(alloc);
         if !resolved.is_empty() && program.fn_count() > 0 {
-            let mut asked = 0u32;
+            let mut asked = AskProgress::new_in(alloc);
             let mut owners = 0usize;
             loop {
                 reach = Reach::new_in(alloc);
@@ -2802,15 +2856,13 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
                     res
                 };
                 match step {
-                    Err(e) if asks_again(&e) && asked < crate::front2::check::MOST_ROUNDS => {
-                        asked += 1;
+                    Err(e) if asks_again(&e) && asked.allow(&e) => {
                         if program.make_asked(0)? {
                             continue;
                         }
                         return Err(e);
                     }
-                    Err(e) if let Some(t) = object_missing(&e) && asked < crate::front2::check::MOST_ROUNDS => {
-                        asked += 1;
+                    Err(e) if let Some(t) = object_missing(&e) && asked.allow(&e) => {
                         if program.object_table(t)? {
                             continue;
                         }
@@ -3067,4 +3119,37 @@ pub fn walk_records<M: Make<Error = RunError, Grant = Fixture>>(
     walk.run((entry, &name), ids, store, builder, producer, maker, &EntryForm, MOST_WALKED).map_err(RecordWalkError::Walk)?;
     let counts = walk.counts();
     Ok((walk, counts))
+}
+
+#[cfg(test)]
+mod ask_progress_tests {
+    use super::{AskKey, AskProgress};
+    use crate::front2::check::{MOST_PROGRESS_ROUNDS, MOST_ROUNDS};
+    use blaze_typeck::{ItemKey, Question, Shape};
+
+    #[test]
+    fn ask_progress_allows_forward_progress_and_caps_stuck_loops() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut progressing = AskProgress::new_in(alloc);
+        for r in 0..400u128 {
+            let key = AskKey::Question(Question::ImplsOf(ItemKey(1), Shape::Adt(ItemKey(r + 1))));
+            assert!(progressing.allow_key(Some(key)), "distinct ImplsOf round {r} must be allowed past MOST_ROUNDS");
+        }
+        assert!(400 > MOST_ROUNDS && 400 < MOST_PROGRESS_ROUNDS);
+
+        let mut stuck = AskProgress::new_in(alloc);
+        let repeated = AskKey::Question(Question::ImplsOf(ItemKey(1), Shape::Adt(ItemKey(42))));
+        let mut allowed = 0u32;
+        while stuck.allow_key(Some(repeated)) {
+            allowed += 1;
+        }
+        assert_eq!(allowed, MOST_ROUNDS, "a stuck loop repeating one ImplsOf stops at MOST_ROUNDS");
+
+        let mut ceiling = AskProgress::new_in(alloc);
+        let mut total = 0u32;
+        while ceiling.allow_key(Some(AskKey::Adt(ItemKey(u128::from(total) + 1)))) {
+            total += 1;
+        }
+        assert_eq!(total, MOST_PROGRESS_ROUNDS, "even distinct keys stop at MOST_PROGRESS_ROUNDS");
+    }
 }

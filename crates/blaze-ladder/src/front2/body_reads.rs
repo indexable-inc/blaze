@@ -29,7 +29,7 @@ use blaze_typeck as tc;
 use blaze_typeck::{ItemKey, ReadList};
 
 use super::body::Body;
-use super::check::{BodyScope, CheckFail, Records, check_rounds};
+use super::check::{BodyScope, CheckFail, Records};
 use super::source::NamesSource;
 
 const READS_DOMAIN: &str = "blaze-ladder checked body read list 1";
@@ -425,7 +425,12 @@ pub(crate) fn check_body_keyed<'n, S: NamesSource<'n>>(
     root_keys: Option<&mut std::vec::Vec<u64, Global>>,
 ) -> Result<tc::Checked<'static>, CheckFail> {
     r.store.provisional_used.borrow_mut().clear();
-    let mut done = check_rounds(r, body, scope, count, asked, root_keys)?;
+    // Defer auto-trait goals on async futures whose superset interior fails, then decide them on
+    // each async block's exact witness interior (stalled_goals.rs, borrows.rs `witness_and_decide`),
+    // matching `ProjectWorld::check` and `ProjectWorld::check_borrows`. `check_counted` has no
+    // deferring entry and keeps `Stalls::Gap`.
+    let stalls = if count.is_none() { super::stalled_goals::Stalls::Decide } else { super::stalled_goals::Stalls::Gap };
+    let mut done = super::check::check_rounds_as(r, body, scope, count, asked, stalls, root_keys)?;
     let scratch = r.store.tys.alloc();
     let owner = body.typeck.owner;
     let mut used_provisional = false;
@@ -441,6 +446,46 @@ pub(crate) fn check_body_keyed<'n, S: NamesSource<'n>>(
     }
     // Its opaques' hidden types, for an auto trait asked by another body (front2 opaque_auto.rs).
     super::opaque_auto::file(r, body, &done)?;
+    if !done.stalled.is_empty() {
+        let mut decision_reads: AVec<'_, super::reads::Read> = AVec::new_in(scratch);
+        let at = body.typeck.expr_ranges.get(body.typeck.root.ix()).copied().unwrap_or(tc::Range { start: 0, end: 0 });
+        match super::borrows::witness_and_decide(r, body, &done, &mut decision_reads, scratch) {
+            super::stalled_goals::Decision::Nothing | super::stalled_goals::Decision::Proved => {
+                done.stalled.clear();
+            }
+            super::stalled_goals::Decision::Findings(found) => {
+                let diags = found
+                    .into_iter()
+                    .map(|d| (tc::DiagCode::Unsatisfied, tc::Range { start: d.start, end: d.end }, d.text.as_str().into()))
+                    .collect();
+                return Err(super::check::said(r, owner, diags, scratch));
+            }
+            super::stalled_goals::Decision::Gaps(gaps) => {
+                return Err(CheckFail::Gap { owner, gaps });
+            }
+            super::stalled_goals::Decision::Refused(super::project::Refused::Check(fail)) => {
+                return Err(fail);
+            }
+            super::stalled_goals::Decision::Refused(_) => {
+                return Err(CheckFail::Check {
+                    owner,
+                    error: tc::CheckError::FutureWitness {
+                        reason: "deciding the stalled auto-trait goals of an async body refused",
+                        at,
+                    },
+                });
+            }
+            super::stalled_goals::Decision::Reads(_) => {
+                return Err(CheckFail::Check {
+                    owner,
+                    error: tc::CheckError::FutureWitness {
+                        reason: "deciding the stalled auto-trait goals of an async body failed to record its read list",
+                        at,
+                    },
+                });
+            }
+        }
+    }
     let filed = done.file_out();
     // A check that read a provisional impl header during constant evaluation does not file its
     // read-list digest: once the impl's associated types finish, subsequent checks read the

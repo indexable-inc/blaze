@@ -210,23 +210,6 @@ pub fn check_body_metered<'n, S: NamesSource<'n>>(
     super::body_reads::check_body_keyed(r, body, scope, Some((tally, clock)), None, Some(root_keys))
 }
 
-/// The check loop itself: `body` checked round by round, leaving in `asked` what a check that
-/// did NOT end in a clean `Checked` asked of the world (front2 reads.rs: every body has a read
-/// list): the read list of a run that finished but is returned as a failure (diagnostics, or a
-/// gap answered as missing), and the questions of the last round that ended in a need. A clean
-/// check's list is still in its `Checked`: only [`check_body_asked`] and [`check_body_filed`]
-/// (front2 body_reads.rs) call this, and each files the list out before the `Checked` is kept.
-pub(crate) fn check_rounds<'n, S: NamesSource<'n>>(
-    r: &mut Records<'_, 'n, S>,
-    body: &Body<'_>,
-    scope: &BodyScope<'_>,
-    count: Option<(&mut tc::Tally, &dyn tc::Clock)>,
-    asked: Option<&mut super::reads::Asked<'_>>,
-    root_keys: Option<&mut Vec<u64, Global>>,
-) -> Result<tc::Checked<'static>, CheckFail> {
-    check_rounds_as(r, body, scope, count, asked, super::stalled_goals::Stalls::Gap, root_keys)
-}
-
 /// The E0412s and E0405s of `owner`'s OWN signature (its head's [`super::type_miss::HeadMiss`]es, in the
 /// store the head was made in or one filed from its record), as findings of its body's check:
 /// item-relative in the fn's text, as its body's own misses are. A caller's check never asks
@@ -238,7 +221,7 @@ fn signature_misses<'r, 'n, S: NamesSource<'n>>(r: &'r Records<'_, 'n, S>, owner
 
 /// The body `owner` finished with the findings `diags`: each filed where its tokens came from,
 /// before it leaves the task that made it (drive.md, ruled 20:57), in `alloc` (the store's).
-fn said<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, owner: ItemKey, diags: Vec<(tc::DiagCode, tc::Range, Box<str>), Global>, alloc: blaze_own::Alloc<'_>) -> CheckFail {
+pub(super) fn said<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, owner: ItemKey, diags: Vec<(tc::DiagCode, tc::Range, Box<str>), Global>, alloc: blaze_own::Alloc<'_>) -> CheckFail {
     let lib = r.keys.library_in(r.names, owner);
     // A member of a trait or an impl has no library key (keys.rs `library_in`): it is placed by
     // its container's, its text found in the container's (expansion_origin.rs
