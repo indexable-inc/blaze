@@ -358,7 +358,15 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 continue;
             }
             let outer = self.slots.get(p.ix()).copied().flatten().is_some();
-            if outer && !caps.iter().any(|c| c.0 == p) {
+            let in_record = caps.iter().any(|c| c.0 == p)
+                || self
+                    .checked
+                    .captures
+                    .column::<0>()
+                    .iter()
+                    .zip(self.checked.captures.column::<1>().iter())
+                    .any(|(&owner, &pat)| owner == e && pat == p);
+            if outer && !in_record {
                 return Err(unsupported(e, "an async block that names a binding of the enclosing body with no capture row in the record (`Checked::captures`)"));
             }
         }
@@ -388,7 +396,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         // place's address or value (walk/moves/env_places.rs `store_env_place`), as a closure's.
         let mut fields: Vec<EnvField, A> = Vec::new_in(self.alloc);
         let mut caps = Vec::new_in(self.alloc);
-        for f in self.checked.env_fields(e) {
+        for f in self.checked.env_fields_by::<crate::layout::BuildEnv>(e) {
             fields.push(f);
             caps.push((f.base, f.how));
         }
@@ -446,7 +454,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         // an `async fn`'s root so, capture_places.rs `places_of`); one holding a place below
         // its binding is a record this build cannot read.
         let mut caps = 0usize;
-        for f in self.checked.env_fields(root) {
+        for f in self.checked.env_fields_by::<crate::layout::BuildEnv>(root) {
             if !f.is_whole() {
                 return Err(malformed("an `async fn`'s root block with a field holding a place below its binding (every parameter is moved in whole)"));
             }
@@ -524,7 +532,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         // for `cover`. A drop flag (a move under a branch) is no saved local: read after a
         // suspension it is refused by name (`UNNAMED_ACROSS`), as a whole binding's field word.
         let mut fields: Vec<EnvField, A> = Vec::new_in(self.alloc);
-        for f in self.checked.env_fields(block) {
+        for f in self.checked.env_fields_by::<crate::layout::BuildEnv>(block) {
             fields.push(f);
         }
         if !fields.is_empty() {

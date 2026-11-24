@@ -169,15 +169,15 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         let g = self.ground_ty(t).map_err(|error| Self::ty_err(e, error))?;
         let repr = self.repr(g).map_err(|error| Self::ty_err(e, error))?;
         let mut fields: Vec<EnvField, A> = Vec::new_in(self.alloc);
-        for f in self.checked.env_fields(e) {
+        for f in self.checked.env_fields_by::<crate::layout::BuildEnv>(e) {
             fields.push(f);
         }
         if let Repr::None = repr {
-            if fields.iter().any(|f| !f.is_whole()) {
-                return Err(BuildError::Unsupported {
-                    expr: e,
-                    what: "not lowered: a zero-sized closure environment holding a captured place below its binding",
-                });
+            for &f in fields.iter() {
+                if !f.is_whole() {
+                    let zst = self.temp(Repr::None);
+                    self.store_env_place(e, f, zst)?;
+                }
             }
             self.push_val(V::None, None);
             return Ok(());
@@ -390,7 +390,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             V::Unsized(..) => return Err(malformed("a closure's environment as an unsized place")),
         };
         let mut fields: Vec<EnvField, A> = Vec::new_in(self.alloc);
-        for f in self.checked.env_fields(closure) {
+        for f in self.checked.env_fields_by::<crate::layout::BuildEnv>(closure) {
             fields.push(f);
         }
         let mut offs = Vec::new_in(self.alloc);

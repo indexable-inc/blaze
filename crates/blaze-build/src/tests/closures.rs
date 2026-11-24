@@ -1128,7 +1128,6 @@ fn move_reads_first(b: &mut Bb, x: PatId) -> ExprId {
 /// of `D`: `x.0` with `c` and `x.1` with `x`, each once. NEGATIVE: under `WholeBindings` `c`
 /// moves `x` whole and `x.1.x` is a use after the move (E0382).
 #[test]
-#[ignore = "stage 2: needs blaze-typeck `ActiveEnv = Places` (the switch removes this)"]
 fn a_move_closure_takes_one_field_and_the_owner_keeps_using_the_other() {
     let w = world();
     let mut b = Bb::new();
@@ -1155,7 +1154,6 @@ fn a_move_closure_takes_one_field_and_the_owner_keeps_using_the_other() {
 /// drops, and the host's check of a live `D` would see a dead one). NEGATIVE: a closure moving
 /// `x` whole drops both at `c`'s end: 205.
 #[test]
-#[ignore = "stage 2: needs blaze-typeck `ActiveEnv = Places` (the switch removes this)"]
 fn a_captured_field_drops_with_the_closure_and_the_rest_with_its_variable() {
     let w = world();
     let mut b = Bb::new();
@@ -1190,7 +1188,6 @@ fn a_captured_field_drops_with_the_closure_and_the_rest_with_its_variable() {
 /// 212). NEGATIVE: under `WholeBindings` the closure borrows all of `x` mutably and `let k =
 /// x.1` while it lives is E0503.
 #[test]
-#[ignore = "stage 2: needs blaze-typeck `ActiveEnv = Places` (the switch removes this)"]
 fn a_closure_borrowing_one_field_mutably_writes_through_to_its_variable() {
     let w = world();
     let mut b = Bb::new();
@@ -1265,7 +1262,6 @@ fn let_drops(b: &mut Bb, name: &str) -> (StmtId, PatId) {
 /// moved one). NEGATIVE twin: under `WholeBindings` the closure takes `x` whole and `x.1.x` is a
 /// use after the move (E0382); a body that also dropped its env field at its end would count 3.
 #[test]
-#[ignore = "stage 2: needs blaze-typeck `ActiveEnv = Places` (the switch removes this)"]
 fn an_fn_once_closure_consumes_a_captured_field_and_the_owner_drops_the_rest() {
     let w = world();
     let mut b = Bb::new();
@@ -1302,7 +1298,6 @@ fn an_fn_once_closure_consumes_a_captured_field_and_the_owner_drops_the_rest() {
 /// fails on the second drop of `x.0`; a closure that took `x` whole drops both at `f`'s end
 /// (205).
 #[test]
-#[ignore = "stage 2: needs blaze-typeck `ActiveEnv = Places` (the switch removes this)"]
 fn an_fn_once_closure_dropped_uncalled_drops_its_captured_field_once() {
     let w = world();
     let mut b = Bb::new();

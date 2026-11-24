@@ -217,8 +217,6 @@ pub(crate) enum CaptureWiden {
     EnumField,
     /// A captured place through a `Box`'s contents.
     BoxDeref,
-    /// A captured place through a pointer to an unsized value (a wide pointer).
-    WideDeref,
 }
 
 /// The walk's stop: the checker's, or a gap of this owner.
@@ -1604,9 +1602,6 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                         && Some(k) == cp.owned_box
                     {
                         return Ok(Some(CaptureWiden::BoxDeref));
-                    }
-                    if matches!(self.view(p.ty), TyView::Str | TyView::Slice(_) | TyView::Dynamic(_)) {
-                        return Ok(Some(CaptureWiden::WideDeref));
                     }
                 }
                 ProjKind::Index => {}

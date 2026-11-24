@@ -971,7 +971,6 @@ fn place_moving_owner(b: &mut Bb, lits: &mut StdVec<(ExprId, u128)>, late: bool)
 /// moved into the block and dropped again with `p`, or `e` dropped by both the body and the
 /// state, counts 3 (and the host's check of a live `D` fails on the second drop).
 #[test]
-#[ignore = "stage 2: needs blaze-typeck `ActiveEnv = Places` (the switch removes this)"]
 fn a_nested_async_block_moves_one_field_and_the_owner_keeps_the_other() {
     let mut w = open_world();
     let owner = async_fn(&mut w, "owner", "owner_future");
@@ -994,7 +993,6 @@ fn a_nested_async_block_moves_one_field_and_the_owner_keeps_the_other() {
 /// TWO drops in all, as on completion (12). NEGATIVE twin: the unresumed-or-suspended state's
 /// drop dropping the environment whole AND the body's held field would count 3.
 #[test]
-#[ignore = "stage 2: needs blaze-typeck `ActiveEnv = Places` (the switch removes this)"]
 fn a_future_dropped_at_a_suspension_drops_its_captured_field_once() {
     let mut w = open_world();
     let owner = async_fn(&mut w, "owner", "owner_future");
