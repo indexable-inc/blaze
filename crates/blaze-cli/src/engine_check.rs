@@ -3495,6 +3495,10 @@ where
         && ![Stage::Units, Stage::Outlines, Stage::Scripts, Stage::Names].into_iter().any(|stage| engine.has_pending_stage(stage))
     {
         serve_found(rq, engine, store, read, records)?;
+        // Flush any remaining uncommitted Names/Outlines arena (< 64 MiB) before Heads/Bodies
+        // begin, so the final Names arena frees immediately and all downstream `CrateScope`
+        // reads hit committed file-backed segment mappings with zero `kept_arenas` pinning.
+        store.flush_puts()?;
     }
     let phase = match prior.or_else(|| mixed.map(|task| task.planned.phase)) {
         Some(phase) => phase,
@@ -5380,7 +5384,7 @@ fn put_phase<'m>(
         // `record_key`) is found by its key, never put again (rule 77). Only asked of a command
         // that started from a stored answer: a fresh one holds none. Neither stage's mark is
         // read by a later phase (the `marks` loop below), so nothing else is skipped.
-        if matches!(phase.stage, Stage::Bodies | Stage::Lints) && !fresh && crate::store::Store::get(&mut *store, cx, key)?.is_some() {
+        if matches!(phase.stage, Stage::Bodies | Stage::Lints) && !fresh && crate::store::Store::contains(&mut *store, cx, key)? {
             continue;
         }
         marks.push((name, Some((key, out))));
@@ -5404,11 +5408,18 @@ fn put_phase<'m>(
     }
     rq.puts += put_now;
     // Written now, so the store's arena frees them: the next phase reads them in place from the
-    // segment's mapping (rule 51; store.rs `commit_puts`).
-    if put_now > 0 {
+    // segment's mapping (rule 51; store.rs `commit_puts`). Flush at the end of `Stage::Heads`
+    // so `Heads`'s final arena frees before `Bodies` allocates and `Bodies` reads committed
+    // segment mappings with zero `kept_arenas` pinning.
+    let flush_stage_end = phase.stage == Stage::Heads && !engine.has_pending_stage(Stage::Heads);
+    if put_now > 0 || flush_stage_end {
         {
             let _cx = cx.span("store: a phase's commit on the command thread (batch copy, layout copy, segment digest, flip, map)");
-            store.commit_puts()?;
+            if flush_stage_end {
+                store.flush_puts()?;
+            } else {
+                store.commit_puts()?;
+            }
         }
         if phase.stage == Stage::Heads
             && let Some(once) = rq.heads.once.as_mut()

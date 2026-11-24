@@ -3494,11 +3494,33 @@ impl<'n> Store<'n> {
                         // Its item bounds (form 11), under its key as `Store::trait_members`
                         // files them (the decoder refuses bounds with no members row).
                         if let Some(b) = side.bounds {
-                            let item = extra.as_ref().and_then(|x| x.assoc.iter().find(|a| a.name == side.name)).map(|a| a.item);
                             let Some(item) = item else {
                                 return Err(HeadError::Filed { want, at, what: "an associated type's item bounds with no members row" });
                             };
                             self.preds.insert(item, blaze_own::Box::into_inner(b));
+                        }
+                        // Its item-bound regions state (form 37), under its key as
+                        // `Store::trait_members` files it.
+                        match side.regions {
+                            super::head_record::AssocRegions::None => {}
+                            super::head_record::AssocRegions::Laid(r) => {
+                                let Some(item) = item else {
+                                    return Err(HeadError::Filed { want, at, what: "an associated type's regions with no members row" });
+                                };
+                                self.regions.file(item, r);
+                            }
+                            super::head_record::AssocRegions::Unlaid(u) => {
+                                let Some(item) = item else {
+                                    return Err(HeadError::Filed { want, at, what: "an associated type's unlaid regions with no members row" });
+                                };
+                                self.regions.file_unlaid(item, u, u.name());
+                            }
+                            super::head_record::AssocRegions::HeadRefused => {
+                                let Some(item) = item else {
+                                    return Err(HeadError::Filed { want, at, what: "an associated type's refused regions with no members row" });
+                                };
+                                self.regions.file_refused(item);
+                            }
                         }
                     }
                     // Filed with its members (`Store::trait_members`), as `trait_defs` is.

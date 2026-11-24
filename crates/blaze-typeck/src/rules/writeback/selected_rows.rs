@@ -91,7 +91,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// notes the clause: there the instance still holds inference variables (`need(&n)`'s `T`
     /// is a variable until the argument is typed), here it is resolved, and the notes are a
     /// tuple each while the export and the selection are the cost.
-    pub(super) fn selected_rows(&mut self, ex: &mut Export<'a>, closures: &Closures<'a>) -> Result<Vec<Projected, Alloc<'a>>, CheckError> {
+    pub(super) fn selected_rows(&mut self, ex: &mut Export<'a>, closures: &Closures<'a>, expr_ty: &[PTy]) -> Result<Vec<Projected, Alloc<'a>>, CheckError> {
         let alloc = self.alloc;
         if self.projected.len() > MOST_PROJECTED {
             return Err(CheckError::Limit(Limit::Solver));
@@ -108,6 +108,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             kinds: closures.column::<1>(),
             sigs: closures.column::<2>(),
             upvars: closures.column::<3>(),
+            expr_ty,
         };
         let inert = self.inert()?;
         let env = self.call_env(inert)?;

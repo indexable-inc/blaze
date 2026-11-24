@@ -73,6 +73,16 @@ pub(crate) mod publish_command;
 /// developer's blaze puts every record `LOCAL`, and nothing it makes is ever published.
 pub(crate) const TRUSTED_BUILDER: bool = cfg!(feature = "publish");
 
+/// Answer of [`Store::get_committed`]: a committed segment borrow (`'m`), an uncommitted put
+/// currently in this command's arena (to be read through a [`SharedSnapshot`] so the arena frees
+/// on commit), or absent.
+#[derive(Clone, Copy)]
+pub enum Committed<'m> {
+    Found(Held<'m>),
+    InArena,
+    Absent,
+}
+
 /// The seam the request reads and writes records through. `'m` is the borrow of the command's
 /// [`Lent`]: a [`Held<'m>`] outlives every later get and put (blaze-cas plain/lent.rs).
 pub trait Store<'m> {
@@ -90,6 +100,22 @@ pub trait Store<'m> {
 
     /// The record at `key`, in place; `None` when there is none.
     fn get(&mut self, cx: &Cx, key: Key) -> Result<Option<Held<'m>>, CliError>;
+    /// Committed-only in-place lookup: borrows a committed segment for `'m` without pinning any
+    /// uncommitted arena. Returns [`Committed::InArena`] when `key` is an uncommitted put.
+    fn get_committed(&mut self, cx: &Cx, key: Key) -> Result<Committed<'m>, CliError> {
+        match self.get(cx, key)? {
+            Some(held) => Ok(Committed::Found(held)),
+            None => Ok(Committed::Absent),
+        }
+    }
+    /// Non-lending existence check (uncommitted puts or committed segments).
+    fn contains(&mut self, cx: &Cx, key: Key) -> Result<bool, CliError> {
+        Ok(self.get(cx, key)?.is_some())
+    }
+    /// Number of commits completed through this store so far (used to drop stale snapshots).
+    fn commits(&self) -> u32 {
+        0
+    }
     /// The record at `key` copied into `into`, for a reader whose bytes must live in its own
     /// frame (a pool job's); `false` when there is none.
     fn get_into(&mut self, cx: &Cx, key: Key, into: &mut Bytes) -> Result<bool, CliError> {
@@ -1021,6 +1047,67 @@ impl<'m, D: Driver, S: Sharing> CommandStore<'m, '_, D, S> {
         Ok(())
     }
 
+    /// Commits any uncommitted puts immediately (even below `COMMIT_BYTES`) so the current shared
+    /// arena is freed before the next stage reads from committed file-backed segment mappings.
+    pub fn flush_puts(&mut self) -> Result<(), CliError> {
+        self.place.flush_puts()?;
+        Ok(())
+    }
+
+    /// Number of shared arenas pinned past commit on this command's `Lent`.
+    #[cfg(test)]
+    pub fn kept_arenas(&self) -> usize {
+        self.place.kept_arenas()
+    }
+
+    /// Fetches `key` from `self.remote` (if configured), writes it into `self.place`, and
+    /// optionally copies the fetched bytes into `into` without lending from the arena.
+    fn fetch_remote(&mut self, cx: &Cx, key: Key, into: Option<&mut Bytes>) -> Result<bool, CliError> {
+        let Some(remote) = &mut self.remote else { return Ok(false) };
+        let began = remote.now_ns();
+        let clock = remote.clock.clone();
+        let mut now = || u64::try_from(clock.now().since_start().as_nanos()).unwrap_or(u64::MAX);
+        // A batch of one key: the request asks one record at a time (blaze-drive's `Get`).
+        // `BatchError` is only a batch past `keys_most` or one begun mid-batch: neither can be.
+        let fetched = match &remote.named.at {
+            OriginAt::Folder(folder) => fetch(&mut remote.reader, &mut FolderOrigin { cx, folder }, &mut now, core::slice::from_ref(&key.0), remote.alloc),
+            OriginAt::Http(at) => fetch(&mut remote.reader, &mut HttpOrigin::new(cx, at, &clock), &mut now, core::slice::from_ref(&key.0), remote.alloc),
+        };
+        fetched.map_err(|error| CliError::Remote(RemoteError::Batch(error)))?;
+        let found = match remote.reader.answer(0) {
+            Answer::Found { tag, .. } => {
+                let bytes = remote.reader.found(0).unwrap_or(&[]);
+                if let Some(into) = into {
+                    into.try_extend(bytes).map_err(|stopped| CliError::Store(StoreFailure::Copy(stopped)))?;
+                }
+                // Verified once, by the read machine, up from the signed head; then kept as this
+                // home's own record (`LOCAL`, its own tag), so the next lookup is a local hit
+                // that checks nothing again.
+                self.place.put_record(key, false, tag, bytes)?;
+                remote.kept += 1;
+                remote.kept_bytes += u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                // The set's floor rises to the head just taken, once a command (the rollback
+                // rule: blaze-remote published/set.rs).
+                if let (Some(set), Some(head), false) = (remote.named.check.set, remote.reader.head(), remote.floored)
+                    && head.generation > set.seen
+                {
+                    published::keep_floor(&mut self.place, &set.id, head.generation, clock.wall().as_ns())?;
+                    remote.floored = true;
+                }
+                true
+            }
+            Answer::Absent | Answer::Pending => false,
+            Answer::Unfetched(why) => {
+                remote.say(cx, key, &why)?;
+                false
+            }
+        };
+        if let Some(remote) = &mut self.remote {
+            remote.spent_ns += remote.now_ns().saturating_sub(began);
+        }
+        Ok(found)
+    }
+
     /// A `Send + Sync` read-only snapshot of the records committed now (blaze-cas
     /// plain/snapshot.rs), its list of segments in `alloc`: the engine's phase loop takes one
     /// after [`CommandStore::commit_puts`], hands `&Snapshot` to the stage's pool workers (who
@@ -1132,47 +1219,43 @@ impl<'m, D: Driver, S: Sharing> Store<'m> for CommandStore<'m, '_, D, S> {
         if let Some(held) = self.place.get(key)? {
             return Ok(Some(held));
         }
-        let Some(remote) = &mut self.remote else { return Ok(None) };
-        let began = remote.now_ns();
-        let clock = remote.clock.clone();
-        let mut now = || u64::try_from(clock.now().since_start().as_nanos()).unwrap_or(u64::MAX);
-        // A batch of one key: the request asks one record at a time (blaze-drive's `Get`).
-        // `BatchError` is only a batch past `keys_most` or one begun mid-batch: neither can be.
-        let fetched = match &remote.named.at {
-            OriginAt::Folder(folder) => fetch(&mut remote.reader, &mut FolderOrigin { cx, folder }, &mut now, core::slice::from_ref(&key.0), remote.alloc),
-            OriginAt::Http(at) => fetch(&mut remote.reader, &mut HttpOrigin::new(cx, at, &clock), &mut now, core::slice::from_ref(&key.0), remote.alloc),
-        };
-        fetched.map_err(|error| CliError::Remote(RemoteError::Batch(error)))?;
-        let found = match remote.reader.answer(0) {
-            Answer::Found { tag, .. } => {
-                let bytes = remote.reader.found(0).unwrap_or(&[]);
-                // Verified once, by the read machine, up from the signed head; then kept as this
-                // home's own record (`LOCAL`, its own tag), so the next lookup is a local hit
-                // that checks nothing again. Put before it is answered, and answered from the
-                // arena: lent for `'m`.
-                self.place.put_record(key, false, tag, bytes)?;
-                remote.kept += 1;
-                remote.kept_bytes += bytes.len() as u64;
-                // The set's floor rises to the head just taken, once a command (the rollback
-                // rule: blaze-remote published/set.rs).
-                if let (Some(set), Some(head), false) = (remote.named.check.set, remote.reader.head(), remote.floored)
-                    && head.generation > set.seen
-                {
-                    published::keep_floor(&mut self.place, &set.id, head.generation, clock.wall().as_ns())?;
-                    remote.floored = true;
-                }
-                self.place.get(key)?
-            }
-            Answer::Absent | Answer::Pending => None,
-            Answer::Unfetched(why) => {
-                remote.say(cx, key, &why)?;
-                None
-            }
-        };
-        if let Some(remote) = &mut self.remote {
-            remote.spent_ns += remote.now_ns().saturating_sub(began);
+        if self.fetch_remote(cx, key, None)? {
+            return Ok(self.place.get(key)?);
         }
-        Ok(found)
+        Ok(None)
+    }
+
+    fn get_committed(&mut self, cx: &Cx, key: Key) -> Result<Committed<'m>, CliError> {
+        match self.place.get_committed(key)? {
+            Committed::Found(held) => Ok(Committed::Found(held)),
+            Committed::InArena => Ok(Committed::InArena),
+            Committed::Absent => {
+                if self.fetch_remote(cx, key, None)? {
+                    Ok(Committed::InArena)
+                } else {
+                    Ok(Committed::Absent)
+                }
+            }
+        }
+    }
+
+    fn contains(&mut self, cx: &Cx, key: Key) -> Result<bool, CliError> {
+        if self.place.contains(key)? {
+            return Ok(true);
+        }
+        self.fetch_remote(cx, key, None)
+    }
+
+    fn commits(&self) -> u32 {
+        self.place.commits()
+    }
+
+    fn get_into(&mut self, cx: &Cx, key: Key, into: &mut Bytes) -> Result<bool, CliError> {
+        if let Some(copied) = self.place.with_bytes(key, |bytes| into.try_extend(bytes))? {
+            copied.map_err(|stopped| CliError::Store(StoreFailure::Copy(stopped)))?;
+            return Ok(true);
+        }
+        self.fetch_remote(cx, key, Some(into))
     }
 
     fn put(&mut self, cx: &Cx, key: Key, bytes: &[u8]) -> Result<(), CliError> {

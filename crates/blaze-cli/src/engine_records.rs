@@ -259,6 +259,62 @@ impl<'r> EngineRecords<'r> {
         Ok(records)
     }
 
+    /// Committed-only in-place lookup of a dependency's exports section: borrows a committed
+    /// segment for `'r` without pinning any uncommitted arena, returning `Ok(None)` when the
+    /// record lives in this command's uncommitted arena (caller reads through a snapshot).
+    pub(crate) fn exports_committed<'j, R: Route>(&mut self, cx: &Cx, store: &mut dyn Store<'r>, input: &Input, alloc: Alloc<'j>) -> Result<Option<Exports<'j>>, ReadError>
+    where
+        'r: 'j,
+    {
+        if let Some(cached) = self.exports_cache.get(&(input.name, input.at)) {
+            self.counts.hits += 1;
+            return Ok(Some(*cached));
+        }
+        let cx = cx.span("engine: a dependency's exports read in place");
+        let held = match store.get_committed(&cx, input.at).map_err(LoadError::Store)? {
+            crate::store::Committed::Found(held) => held,
+            crate::store::Committed::InArena => return Ok(None),
+            crate::store::Committed::Absent => return Err(LoadError::NotInStore { name: input.name, at: input.at }.into()),
+        };
+        let record = held.place.map_err(|why| ReadError::NotInPlace { name: input.name, why })?;
+        let (payload, parts) = payload_of(input.name, record)?;
+        self.counts.records += 1;
+        self.counts.bytes += u64::try_from(record.len()).unwrap_or(u64::MAX);
+        store_read(record.len());
+        self.counts.sections += u64::try_from(parts.exports.len()).unwrap_or(u64::MAX);
+        let exports = R::exports(input.name, parts.exports, &mut self.counts, alloc)?;
+        if let Ok(aligned) = Aligned16::new(parts.exports) {
+            self.exports_cache.insert((input.name, input.at), Exports { payload: payload.bytes(), exports: aligned.bytes() });
+        }
+        Ok(Some(Exports { payload: payload.bytes(), exports }))
+    }
+
+    /// Reads an uncommitted dependency's exports section in place from `snap` (a short-lived
+    /// `StoreSnapshot` holding the shared arena), returning the exports slice and its byte
+    /// `(offset, len)` inside the record bytes so workers can re-slice from `snap` without
+    /// setting `shared_lent = true` on `Lent`.
+    pub(crate) fn exports_from_snapshot<'j, R: Route>(
+        &mut self,
+        snap: &'j crate::store::StoreSnapshot,
+        input: &Input,
+        alloc: Alloc<'j>,
+    ) -> Result<(Exports<'j>, usize, usize), ReadError> {
+        let bytes = snap
+            .get(input.at)
+            .map_err(|why| LoadError::Store(crate::CliError::Store(crate::store::StoreFailure::Place(crate::store::plain_place::PlaceError::Snapshot(why)))))?
+            .ok_or(LoadError::NotInStore { name: input.name, at: input.at })?;
+        let record = Aligned16::new(bytes).map_err(|why| ReadError::NotInPlace { name: input.name, why: blaze_cas::plain::NotInPlace::Misaligned(why) })?;
+        let (payload, parts) = payload_of(input.name, record)?;
+        let offset = parts.exports.as_ptr().addr().saturating_sub(bytes.as_ptr().addr());
+        let len = parts.exports.len();
+        self.counts.records += 1;
+        self.counts.bytes += u64::try_from(record.len()).unwrap_or(u64::MAX);
+        store_read(record.len());
+        self.counts.sections += u64::try_from(len).unwrap_or(u64::MAX);
+        let exports = R::exports(input.name, parts.exports, &mut self.counts, alloc)?;
+        Ok((Exports { payload: payload.bytes(), exports }, offset, len))
+    }
+
     /// The exports section of the dependency record `input` names, for a names task (names/
     /// scope.rs `prepare`, engine_names.rs): opened once where it lies in the store's mapping and
     /// borrowed for `'r`, never copied (route [`InPlace`]), cached in memory across waves so

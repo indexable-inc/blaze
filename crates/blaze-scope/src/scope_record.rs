@@ -615,6 +615,35 @@ impl<'a> Verified<'a> {
     }
 }
 
+/// A checked exports record header tied to the immutable address and length of the bytes that
+/// passed [`CheckedHead::check`] (such as a record inside a shared `AppendVec` store arena).
+/// Re-lends [`Verified`] in O(1) without re-checking while the owning snapshot stays alive, and
+/// refuses any mismatched slice by returning `None`.
+#[derive(Clone, Copy, Debug)]
+pub struct CheckedHead {
+    head: Head,
+    addr: usize,
+    len: usize,
+}
+
+impl CheckedHead {
+    /// Checks `bytes` whole once as a crate's exports record and records its checked header and
+    /// slice identity `(addr, len)`.
+    pub fn check(bytes: &[u8]) -> Result<CheckedHead, RecordRead> {
+        let head = check(bytes, Holds::Exports)?;
+        Ok(CheckedHead { head, addr: bytes.as_ptr().addr(), len: bytes.len() })
+    }
+
+    /// Re-lends [`Verified<'a>`] in O(1) if `bytes` is the exact slice previously checked.
+    pub fn rebind<'a>(self, bytes: &'a [u8]) -> Option<Verified<'a>> {
+        if bytes.as_ptr().addr() == self.addr && bytes.len() == self.len {
+            Some(Verified { bytes, head: self.head })
+        } else {
+            None
+        }
+    }
+}
+
 /// Whether `module`, in the crate whose INNER record is `inner` (16-aligned), binds `name` in
 /// any namespace: the record checked whole (an inner record's scopes may hold textual scopes),
 /// then one module row found and its scope searched in place. No allocation.

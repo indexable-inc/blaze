@@ -1714,7 +1714,8 @@ mod std_readiness_tests {
 
     #[test]
     fn sota_mem_uxtw_idx_folding() {
-        let alloc = Alloc::global();
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
 
         // 1. Unscaled `ptr_add(base, zext(u32 -> u64, idx))` -> `ldr xt, [xn, wm, uxtw]`.
         let unscaled_fn = {
@@ -1739,12 +1740,10 @@ mod std_readiness_tests {
         let em_unscaled = Sota::standalone()
             .emit(verify(unscaled_fn.view()).unwrap(), &NoNames, MAC_ARM64, alloc)
             .expect("Sota emits unscaled MemUxtwIdx load");
-        let words_unscaled: std::vec::Vec<u32> = em_unscaled
-            .code
-            .as_slice()
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
+        let mut words_unscaled = blaze_own::Vec::new_in(alloc);
+        for c in em_unscaled.code.as_slice().chunks_exact(4) {
+            words_unscaled.push(u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+        }
         assert!(
             words_unscaled.iter().any(|&w| (w & 0x3fe0_fc00) == 0x3860_4800),
             "expected folded `ldr [rn, wm, uxtw]` instruction, got: {words_unscaled:#x?}"
@@ -1785,12 +1784,10 @@ mod std_readiness_tests {
         let em_scaled = Sota::standalone()
             .emit(verify(scaled_fn.view()).unwrap(), &NoNames, MAC_ARM64, alloc)
             .expect("Sota emits scaled MemUxtwIdx load");
-        let words_scaled: std::vec::Vec<u32> = em_scaled
-            .code
-            .as_slice()
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
+        let mut words_scaled = blaze_own::Vec::new_in(alloc);
+        for c in em_scaled.code.as_slice().chunks_exact(4) {
+            words_scaled.push(u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+        }
         assert!(
             words_scaled.iter().any(|&w| (w & 0x3fe0_fc00) == 0x3860_5800),
             "expected folded `ldr wt, [rn, wm, uxtw #2]` instruction, got: {words_scaled:#x?}"
@@ -1807,7 +1804,14 @@ mod std_readiness_tests {
 
     #[test]
     fn sota_ubfx_and_loop_align() {
-        let alloc = Alloc::global();
+        let alloc = blaze_own::testing::heap().alloc();
+        let decode_words = |bytes: &[u8]| -> AVec<'static, u32> {
+            let mut out = Vec::with_capacity_in(bytes.len() / 4, alloc);
+            for c in bytes.chunks_exact(4) {
+                out.push(u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+            }
+            out
+        };
 
         // 1. `UBFX` fusion: `(x >> 10) & 0x3FF` -> single `ubfx xd, xn, #10, #10` (`0xd34a_4c00`).
         let ubfx_fn = {
@@ -1827,12 +1831,7 @@ mod std_readiness_tests {
         let em_ubfx = Sota::standalone()
             .emit(verify(ubfx_fn.view()).unwrap(), &NoNames, MAC_ARM64, alloc)
             .expect("Sota emits UBFX fused bitfield extract");
-        let words_ubfx: std::vec::Vec<u32> = em_ubfx
-            .code
-            .as_slice()
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
+        let words_ubfx = decode_words(em_ubfx.code.as_slice());
         // `ubfx xd, xn, #10, #10` = `ubfm xd, xn, #10, #19` = `0xd340_0000 | (10 << 16) | (19 << 10) = 0xd34a_4c00`.
         assert!(
             words_ubfx.iter().any(|&w| (w & 0xffff_fc00) == 0xd34a_4c00),
@@ -1869,12 +1868,7 @@ mod std_readiness_tests {
         let em_bfxil = Sota::standalone()
             .emit(verify(bfxil_fn.view()).unwrap(), &NoNames, MAC_ARM64, alloc)
             .expect("Sota emits BFXIL fused bitfield insert");
-        let words_bfxil: std::vec::Vec<u32> = em_bfxil
-            .code
-            .as_slice()
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
+        let words_bfxil = decode_words(em_bfxil.code.as_slice());
         // `bfxil xd, xn, #0, #8` = `bfm xd, xn, #0, #7` = `0xb340_0000 | (0 << 16) | (7 << 10) = 0xb340_1c00`.
         assert!(
             words_bfxil.iter().any(|&w| (w & 0xffff_fc00) == 0xb340_1c00),
@@ -1926,12 +1920,7 @@ mod std_readiness_tests {
         let em_loop = Sota::standalone()
             .emit(verify(loop_fn.view()).unwrap(), &NoNames, MAC_ARM64, alloc)
             .expect("Sota emits aligned loop");
-        let words_loop: std::vec::Vec<u32> = em_loop
-            .code
-            .as_slice()
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
+        let words_loop = decode_words(em_loop.code.as_slice());
         let mut saw_back_branch = false;
         for (idx, &w) in words_loop.iter().enumerate() {
             let delta = if (w & 0xfc00_0000) == 0x1400_0000 {

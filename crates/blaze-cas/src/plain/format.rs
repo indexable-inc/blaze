@@ -469,6 +469,46 @@ pub(crate) fn seal_parts<'p>(namespace: Namespace, run: &[u8], index_at: u64, pa
     Sealed { header, footer, described: Described { namespace, count, index_at, digest }, len }
 }
 
+/// Zero-allocation twin of [`seal_parts`] for streamed commits: hashes the segment header,
+/// each `(payload, zero_pad_len)` in place, each sorted [`Entry`] through a stack `[u8; ENTRY]`,
+/// and the footer head, producing the exact same [`Sealed`] digest and header/footer without
+/// materializing either payload pieces or the encoded index run upfront.
+pub(crate) fn seal_entries<'p>(
+    namespace: Namespace,
+    entries: &[Entry],
+    index_at: u64,
+    payloads: impl IntoIterator<Item = (&'p [u8], u8)>,
+) -> Sealed {
+    let count = u32::try_from(entries.len()).unwrap_or(u32::MAX);
+    let lowest = entries.first().map_or(ContentId([0; 32]), |it| it.key);
+    let highest = entries.last().map_or(ContentId([0; 32]), |it| it.key);
+    let header = header_of(namespace, count, lowest, highest, index_at);
+    let foot = footer_head(count, index_at);
+    let mut hasher = blaze_ids::Hasher::new(SEGMENT_DIGEST);
+    hasher.update(&header);
+    let mut at = u64::try_from(HEADER).unwrap_or(0);
+    for (bytes, pad_len) in payloads {
+        hasher.update(bytes);
+        let pad = usize::from(pad_len);
+        if let Some(z) = ZEROS.get(..pad) {
+            hasher.update(z);
+        }
+        at = at.saturating_add(u64::try_from(bytes.len()).unwrap_or(0)).saturating_add(u64::from(pad_len));
+    }
+    debug_assert_eq!(at, index_at, "the index follows the payloads");
+    for entry in entries {
+        hasher.update(&entry.encode_array());
+    }
+    hasher.update(&foot);
+    let digest: ContentId = hasher.finish();
+    let mut footer = [0u8; FOOTER];
+    footer[..16].copy_from_slice(&foot);
+    footer[16..].copy_from_slice(&digest.0);
+    let entry_bytes = u64::from(count).saturating_mul(u64::try_from(ENTRY).unwrap_or(48));
+    let len = index_at.saturating_add(entry_bytes).saturating_add(u64::try_from(FOOTER).unwrap_or(48));
+    Sealed { header, footer, described: Described { namespace, count, index_at, digest }, len }
+}
+
 /// A whole segment of `namespace` holding `records` (each its key and tag, and its payload):
 /// the payloads and the index in key order, the first given of a duplicate key kept (the rest
 /// dropped unread: one key names one value, rule 21, which the store's put and a push's
@@ -1151,13 +1191,19 @@ pub struct Entry {
 }
 
 impl Entry {
-    pub fn encode_into<A: core::alloc::Allocator>(&self, out: &mut Vec<u8, A>) {
+    pub fn encode_array(&self) -> [u8; ENTRY] {
         debug_assert!(self.at.is_multiple_of(ALIGN) && self.at < OFFSET_MOST);
         let place = (self.at / ALIGN) | (u64::from(self.tag.0) << 40);
-        out.extend_from_slice(&self.key.0);
-        out.extend_from_slice(&place.to_le_bytes());
-        out.extend_from_slice(&self.len.to_le_bytes());
-        out.extend_from_slice(&self.crc.to_le_bytes());
+        let mut out = [0u8; ENTRY];
+        out[0..32].copy_from_slice(&self.key.0);
+        out[32..40].copy_from_slice(&place.to_le_bytes());
+        out[40..44].copy_from_slice(&self.len.to_le_bytes());
+        out[44..48].copy_from_slice(&self.crc.to_le_bytes());
+        out
+    }
+
+    pub fn encode_into<A: core::alloc::Allocator>(&self, out: &mut Vec<u8, A>) {
+        out.extend_from_slice(&self.encode_array());
     }
 
     /// The entry at `bytes[..ENTRY]`, its reserved bits checked (bits 56..64 of its place): what

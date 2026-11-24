@@ -269,80 +269,147 @@ fn decompose_usub_sat_const(view: &View<'_>, val: u32) -> Option<(u32, u128)> {
     None
 }
 
-/// Returns `Some(max_val)` if `val` is statically proven to lie in `0..=max_val` (unsigned)
+/// Returns `Some(max_val)` if `root` is statically proven to lie in `0..=max_val` (unsigned)
 /// purely from its defining operation (`Lshr` by constant, `And` with mask, or `Zext`),
 /// independent of control-flow facts.
-fn proven_unsigned_max(view: &View<'_>, val: u32, depth: u8) -> Option<u128> {
-    if depth >= 8 {
-        return None;
+fn proven_unsigned_max(view: &View<'_>, root: u32) -> Option<u128> {
+    const MAX_DEPTH: u8 = 8;
+    const MAX_STEPS: usize = 256;
+
+    #[inline]
+    fn shr_u128(val: u128, shift: u32) -> u128 {
+        if shift >= 128 { 0 } else { val >> shift }
     }
-    let vi = to_idx(val);
-    if vi >= view.len() {
-        return None;
+
+    #[inline]
+    fn tighten(best: &mut Option<u128>, bound: u128) {
+        *best = Some(best.map_or(bound, |cur| cur.min(bound)));
     }
-    let ty = Ty(*view.tys.get(vi)?);
-    if !ty.is_scalar() || !ty.is_int() {
-        return None;
+
+    // Explicit DFS worklist of `(val, depth, pending_rshift)`: because `x -> x >> s` and
+    // `min(x, m)` are monotone and distribute over `min`, every bound discovered along a branch
+    // contributes `bound >> pending_rshift` to the root's minimum unsigned upper bound.
+    let mut stack = [(0u32, 0u8, 0u32); 16];
+    let mut sp: usize = 0;
+    if let Some(slot) = stack.get_mut(sp) {
+        *slot = (root, 0, 0);
+        sp += 1;
     }
-    let bits = ty.bits(view.head.ptr_bits);
-    if bits == 0 || bits > 128 {
-        return None;
-    }
-    match view.op(vi) {
-        Op::Lshr => {
-            let at = to_idx(*view.data.get(vi)?);
-            let l = *view.extra.get(at)?;
-            let r = *view.extra.get(at + 1)?;
-            let (c, _) = const_int(view, to_idx(r))?;
-            if c < 1 || c >= u128::from(bits) {
-                return None;
-            }
-            let c_u32 = u32::try_from(c).ok()?;
-            let rem = bits - c_u32;
-            let shift_max = u128::MAX >> (128 - rem);
-            let refined = proven_unsigned_max(view, l, depth + 1)
-                .map_or(shift_max, |lm| (lm >> c_u32).min(shift_max));
-            Some(refined)
+
+    let mut best: Option<u128> = None;
+    let mut steps: usize = 0;
+
+    while sp > 0 && steps < MAX_STEPS {
+        sp -= 1;
+        steps += 1;
+        let Some(&(val, depth, shift_acc)) = stack.get(sp) else {
+            break;
+        };
+        if depth >= MAX_DEPTH {
+            continue;
         }
-        Op::And => {
-            let at = to_idx(*view.data.get(vi)?);
-            let l = *view.extra.get(at)?;
-            let r = *view.extra.get(at + 1)?;
-            let lm = const_int(view, to_idx(l))
-                .map(|(c, _)| c)
-                .or_else(|| proven_unsigned_max(view, l, depth + 1));
-            let rm = const_int(view, to_idx(r))
-                .map(|(c, _)| c)
-                .or_else(|| proven_unsigned_max(view, r, depth + 1));
-            match (lm, rm) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (Some(a), None) | (None, Some(a)) => Some(a),
-                (None, None) => None,
-            }
+        let vi = to_idx(val);
+        if vi >= view.len() {
+            continue;
         }
-        Op::Zext => {
-            let src = *view.data.get(vi)?;
-            let src_idx = to_idx(src);
-            if src_idx >= view.len() {
-                return None;
-            }
-            let src_ty = Ty(*view.tys.get(src_idx)?);
-            if !src_ty.is_scalar() || !src_ty.is_int() {
-                return None;
-            }
-            let src_bits = src_ty.bits(view.head.ptr_bits);
-            if src_bits == 0 || src_bits > 128 {
-                return None;
-            }
-            let src_type_max = u128::MAX >> (128 - src_bits);
-            let refined = const_int(view, src_idx)
-                .map(|(c, _)| c)
-                .or_else(|| proven_unsigned_max(view, src, depth + 1))
-                .map_or(src_type_max, |sm| sm.min(src_type_max));
-            Some(refined)
+        let Some(&ty_raw) = view.tys.get(vi) else {
+            continue;
+        };
+        let ty = Ty(ty_raw);
+        if !ty.is_scalar() || !ty.is_int() {
+            continue;
         }
-        _ => None,
+        let bits = ty.bits(view.head.ptr_bits);
+        if bits == 0 || bits > 128 {
+            continue;
+        }
+        match view.op(vi) {
+            Op::Lshr => {
+                let Some(&at_raw) = view.data.get(vi) else {
+                    continue;
+                };
+                let at = to_idx(at_raw);
+                let (Some(&l), Some(&r)) = (view.extra.get(at), view.extra.get(at + 1)) else {
+                    continue;
+                };
+                let Some((c, _)) = const_int(view, to_idx(r)) else {
+                    continue;
+                };
+                if c < 1 || c >= u128::from(bits) {
+                    continue;
+                }
+                let Ok(c_u32) = u32::try_from(c) else {
+                    continue;
+                };
+                let rem = bits - c_u32;
+                let shift_max = u128::MAX >> (128 - rem);
+                tighten(&mut best, shr_u128(shift_max, shift_acc));
+                if depth + 1 < MAX_DEPTH
+                    && let Some(slot) = stack.get_mut(sp)
+                {
+                    *slot = (l, depth + 1, shift_acc.saturating_add(c_u32));
+                    sp += 1;
+                }
+            }
+            Op::And => {
+                let Some(&at_raw) = view.data.get(vi) else {
+                    continue;
+                };
+                let at = to_idx(at_raw);
+                let (Some(&l), Some(&r)) = (view.extra.get(at), view.extra.get(at + 1)) else {
+                    continue;
+                };
+                if let Some((c, _)) = const_int(view, to_idx(l)) {
+                    tighten(&mut best, shr_u128(c, shift_acc));
+                } else if depth + 1 < MAX_DEPTH
+                    && let Some(slot) = stack.get_mut(sp)
+                {
+                    *slot = (l, depth + 1, shift_acc);
+                    sp += 1;
+                }
+                if let Some((c, _)) = const_int(view, to_idx(r)) {
+                    tighten(&mut best, shr_u128(c, shift_acc));
+                } else if depth + 1 < MAX_DEPTH
+                    && let Some(slot) = stack.get_mut(sp)
+                {
+                    *slot = (r, depth + 1, shift_acc);
+                    sp += 1;
+                }
+            }
+            Op::Zext => {
+                let Some(&src) = view.data.get(vi) else {
+                    continue;
+                };
+                let src_idx = to_idx(src);
+                if src_idx >= view.len() {
+                    continue;
+                }
+                let Some(&src_ty_raw) = view.tys.get(src_idx) else {
+                    continue;
+                };
+                let src_ty = Ty(src_ty_raw);
+                if !src_ty.is_scalar() || !src_ty.is_int() {
+                    continue;
+                }
+                let src_bits = src_ty.bits(view.head.ptr_bits);
+                if src_bits == 0 || src_bits > 128 {
+                    continue;
+                }
+                let src_type_max = u128::MAX >> (128 - src_bits);
+                tighten(&mut best, shr_u128(src_type_max, shift_acc));
+                if let Some((c, _)) = const_int(view, src_idx) {
+                    tighten(&mut best, shr_u128(c, shift_acc));
+                } else if depth + 1 < MAX_DEPTH
+                    && let Some(slot) = stack.get_mut(sp)
+                {
+                    *slot = (src, depth + 1, shift_acc);
+                    sp += 1;
+                }
+            }
+            _ => {}
+        }
     }
+    best
 }
 
 fn eval_fact(view: &View<'_>, facts: &[RelFact], q_cond: IntCond, q_a: u32, q_b: u32) -> Option<bool> {
@@ -368,7 +435,7 @@ fn eval_fact(view: &View<'_>, facts: &[RelFact], q_cond: IntCond, q_a: u32, q_b:
     };
     if let Some((qx, qc_cond, qc, qw)) = q_const {
         // 2a. Range-proven unsigned upper bounds from `Lshr`, `And`, and `Zext`.
-        if let Some(max_val) = proven_unsigned_max(view, qx, 0) {
+        if let Some(max_val) = proven_unsigned_max(view, qx) {
             if let Some(res) = eval_const_range(IntCond::Ule, max_val, qc_cond, qc, qw) {
                 return Some(res);
             }
