@@ -1670,7 +1670,9 @@ impl<'w, P: FrontEnd> Asking<'w, P> {
     /// `called` with its fn item self resolved (fn_item_resolve.rs), that resolution logged.
     fn shim_self(&self, called: Instance, ground: &mut PortableTys<'static>, scratch: Alloc<'_>) -> Result<Instance, blaze_typeck::ResolveError> {
         let world = self.world();
-        crate::fn_item_resolve::shim_self_resolved_by(&world, called, ground, |item, args, ground| self.resolve(Instance { item, args }, ground, scratch))
+        crate::fn_item_resolve::shim_self_resolved_by(self.front.front.0, &world, self.front.front.1, called, ground, |item, args, ground| {
+            self.resolve(Instance { item, args }, ground, scratch)
+        })
     }
 
     /// Static `s`'s C symbol (`None`: a record of its own), logged.
@@ -2053,10 +2055,22 @@ fn build_lir_phase<P: FrontEnd>(
         _ => None,
     };
     let is_vtable_shim = instance.item != function.key && blaze_build::vtable_shim_of(instance, work.ground.view()).is_some();
+    let is_reify_shim = instance.item != function.key && blaze_build::reify_shim_of(instance, work.ground.view()).is_some();
     let is_test_report_shim = instance.item != function.key && blaze_build::test_report_shim_of(instance, work.ground.view()).is_some();
+    let is_fn_shim = instance.item != function.key
+        && crate::fn_shim::fn_shim_of(&FrontAdts(program, i, &[], &work.langs, bodies), instance, &work.ground).is_some();
     let checked = match (function.body, bodies.checked.get(i).and_then(Option::as_ref)) {
         (Some((body, _)), Some(done)) => Some((body, done)),
-        _ if ctor_row.is_some() || builtin_clone.is_some() || builtin_from.is_some() || is_vtable_shim || is_test_report_shim => None,
+        _ if ctor_row.is_some()
+            || builtin_clone.is_some()
+            || builtin_from.is_some()
+            || is_vtable_shim
+            || is_reify_shim
+            || is_test_report_shim
+            || is_fn_shim =>
+        {
+            None
+        }
         _ => return Err(callee_refusal(program, name(), instance.args, instance, crate::callee_shown::CalleeGap::NoBody, work.ground.view())),
     };
     let malformed = |_| RunError::Build { function: name(), error: BuildError::Malformed { what: "an instance's arguments past the ground table" }, range: None };

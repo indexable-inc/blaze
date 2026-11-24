@@ -134,24 +134,87 @@ pub(super) fn first_token(text: &str, byte: u32) -> Option<u32> {
     None
 }
 
+/// Collects every written local declaration inside `top`'s `text` into `out`, marking a key
+/// `None` on collision so [`in_source`] preserves exact ambiguity refusal.
+fn collect_all<'n>(
+    krate: CrateItemKey,
+    top: LibKey,
+    text: &str,
+    edition: Edition,
+    out: &mut blaze_hash::HashMap<ItemKey, Option<(LibKey, u32)>, Alloc<'n>>,
+    alloc: Alloc<'_>,
+) -> Result<(), PositionGap> {
+    let mut bodies = AVec::new_in(alloc);
+    bodies.push((top, 0u32, text));
+    while let Some((parent, base, body)) = bodies.pop() {
+        let nested = blaze_file_items::nested::scan(body, alloc);
+        if nested.end != NestedEnd::Whole {
+            return Err(PositionGap::NoItem);
+        }
+        let mut ranks = blaze_hash::HashMap::new_in(alloc);
+        for entry in nested.items.iter() {
+            let tag = match entry.kind {
+                NestedKind::Fn => "written local fn",
+                NestedKind::Const => "written local const",
+                NestedKind::Static => "written local static",
+                _ => continue,
+            };
+            let at = base.checked_add(entry.range.start).ok_or(PositionGap::PastText)?;
+            let start = usize::try_from(entry.range.start).map_err(|_| PositionGap::PastText)?;
+            let end = usize::try_from(entry.range.end).map_err(|_| PositionGap::PastText)?;
+            let part = body.get(start..end).ok_or(PositionGap::PastText)?;
+            let declaration = blaze_file_items::outline_item(part, edition, alloc);
+            let item = declaration.items().first().ok_or(PositionGap::NoItem)?;
+            let name = item.name.map(|r| item.text(part, r)).unwrap_or("_");
+            let ordinal = ranks.entry((tag, name)).or_insert(0u32);
+            let mut key = blaze_scope::task::key_of(krate, parent, tag, name, *ordinal);
+            key.0.0[8] |= LibKey::INNER;
+            *ordinal = ordinal.checked_add(1).ok_or(PositionGap::NoItem)?;
+            let id = checker_of(key);
+            out.entry(id).and_modify(|slot| *slot = None).or_insert(Some((top, at)));
+            if part.len() >= body.len() {
+                return Err(PositionGap::PastText);
+            }
+            bodies.push((key, at, part));
+        }
+    }
+    Ok(())
+}
+
 /// A written local's key can arrive before its enclosing body is checked.
 pub(super) fn in_source<'n, S: PositionSource<'n>>(
     names: S, krate: usize, wanted: ItemKey, site: u32, alloc: Alloc<'_>,
 ) -> Result<(u32, u32), PositionGap> {
     let key = names.crate_key(krate).ok_or(PositionGap::NoItem)?;
     let edition = names.edition_of(krate).ok_or(PositionGap::NoItem)?;
-    let mut found = None;
-    names.enclosing_keys(krate, |lib| {
-        let anchor = Anchor::from_lib(names, lib).ok_or(PositionGap::NoItem)?;
-        let text = anchor.text(names).ok_or(PositionGap::NoItem)?;
-        if let Some((_, start)) = find(key, lib, text, edition, Find::Key(wanted), alloc)? {
-            if found.replace((anchor, start)).is_some() {
-                return Err(PositionGap::NoItem);
-            }
+    let (top, old_start) = match names.cached_local_start(krate, wanted, |map_alloc| {
+        let mut out = blaze_hash::HashMap::new_in(map_alloc);
+        names.enclosing_keys(krate, |lib| {
+            let anchor = Anchor::from_lib(names, lib).ok_or(PositionGap::NoItem)?;
+            let text = anchor.text(names).ok_or(PositionGap::NoItem)?;
+            collect_all(key, lib, text, edition, &mut out, alloc)
+        })?;
+        Ok(out)
+    }) {
+        Some(hit) => {
+            let (lib, start) = hit?;
+            (Anchor::from_lib(names, lib).ok_or(PositionGap::NoItem)?, start)
         }
-        Ok(())
-    })?;
-    let (top, old_start) = found.ok_or(PositionGap::NoItem)?;
+        None => {
+            let mut found = None;
+            names.enclosing_keys(krate, |lib| {
+                let anchor = Anchor::from_lib(names, lib).ok_or(PositionGap::NoItem)?;
+                let text = anchor.text(names).ok_or(PositionGap::NoItem)?;
+                if let Some((_, start)) = find(key, lib, text, edition, Find::Key(wanted), alloc)? {
+                    if found.replace((anchor, start)).is_some() {
+                        return Err(PositionGap::NoItem);
+                    }
+                }
+                Ok(())
+            })?;
+            found.ok_or(PositionGap::NoItem)?
+        }
+    };
     let place = top.placement(names, alloc)?;
     let start = match place.2 {
         Start::Copied(_, body) => find(key, top.lib(), body, edition, Find::Key(wanted), alloc)?.ok_or(PositionGap::NoItem)?.1,

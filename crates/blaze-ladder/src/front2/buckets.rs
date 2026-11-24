@@ -382,7 +382,12 @@ fn written_shape<'n, S: NamesSource<'n>>(names: S, module: LibKey, params: &[(Na
 }
 
 /// A self type that is a builtin the checker has no type for.
+#[derive(Clone, Copy)]
 struct NoCheckerType;
+
+/// Cache of resolved type-alias shapes (`LibKey -> Shape`), shared across all crates and rows
+/// filed in one [`BucketIndex`] so shared aliases like `U256`/`B256` are lowered at most once.
+type AliasShapes = HashMap<LibKey, Result<Option<Shape>, NoCheckerType>, blaze_own::Alloc<'static>>;
 
 /// The most aliases one chain is followed through (`type A = B; type B = C;`); past it the
 /// impl is filed for every shape, which is never a wrong answer.
@@ -400,6 +405,16 @@ fn alias_shape<'n, S: NamesSource<'n>>(names: S, mut alias: LibKey) -> Result<Op
         }
     }
     Ok(None)
+}
+
+/// [`alias_shape`] backed by a reusable cache across rows and crates.
+fn alias_shape_cached<'n, S: NamesSource<'n>>(names: S, alias: LibKey, cache: &mut AliasShapes) -> Result<Option<Shape>, NoCheckerType> {
+    if let Some(&hit) = cache.get(&alias) {
+        return hit;
+    }
+    let got = alias_shape(names, alias);
+    cache.insert(alias, got);
+    got
 }
 
 /// What the type alias `alias` stands for, one step.
@@ -659,7 +674,7 @@ enum SelfAt {
 /// (the rows are sorted by trait path, then module, so each run of equal (trait path, module)
 /// is resolved once) and each self path met, by the module it is written in. One per crate
 /// filed; dropped when its rows are.
-struct RowNames<'n> {
+struct RowNames<'n, 'a> {
     /// The run's trait path, its module, the crate the path's root names (token-mark-2 R2: two
     /// rows of one text and module may name two crates' `crate`), and the trait it names
     /// (`None`: not a trait as written: each impl of the run is filed from its header's text,
@@ -667,6 +682,7 @@ struct RowNames<'n> {
     /// The trait is kept with the crate it is defined in ([`PathSelf::Trait`]).
     run: Option<(&'n str, LibKey, Option<blaze_id::CrateItemKey>, Result<(ItemKey, Option<usize>), RowMiss>)>,
     selves: HashMap<(LibKey, &'n str, Option<blaze_id::CrateItemKey>), SelfAt, Global>,
+    aliases: Option<&'a mut AliasShapes>,
 }
 
 /// Files an impl by its ROW of the items record ([`ImplRow`]: its trait's path and its self
@@ -690,7 +706,7 @@ struct RowNames<'n> {
 ///
 /// The third answer is what bounds an impl whose self path was read to no constructor
 /// ([`PathSelf`], as `file` gives it).
-fn file_row<'n, S: NamesSource<'n>>(names: S, row: &ImplRow<'n>, kept: &mut RowNames<'n>) -> Result<(Filed, bool, Option<PathSelf>), RowMiss> {
+fn file_row<'n, S: NamesSource<'n>>(names: S, row: &ImplRow<'n>, kept: &mut RowNames<'n, '_>) -> Result<(Filed, bool, Option<PathSelf>), RowMiss> {
     if row.header_unread {
         return Err(RowMiss::HeaderUnread);
     }
@@ -737,7 +753,7 @@ enum RowSelf {
 /// `Err` where the row does not name it ([`SelfHead::Other`], a path segment that is no plain
 /// identifier). [`file_row`]'s first step, and what files an impl whose text did not read by
 /// the head its row read ([`textless`]).
-fn row_self<'n, S: NamesSource<'n>>(names: S, row: &ImplRow<'n>, kept: &mut RowNames<'n>) -> Result<RowSelf, RowMiss> {
+fn row_self<'n, S: NamesSource<'n>>(names: S, row: &ImplRow<'n>, kept: &mut RowNames<'n, '_>) -> Result<RowSelf, RowMiss> {
     let paths = crate::resolve::Paths { names };
     let mut path_self = false;
     let shape = match row.head {
@@ -764,11 +780,17 @@ fn row_self<'n, S: NamesSource<'n>>(names: S, row: &ImplRow<'n>, kept: &mut RowN
                             Ok(f) if f.consumed as usize == texts.len() => match f.kind {
                                 Kind::Struct | Kind::Enum | Kind::Union => SelfAt::Shape(Some(Shape::Adt(checker_of(f.key)))),
                                 Kind::Builtin(name) => SelfAt::Shape(prim_shape(name)),
-                                Kind::TypeAlias => match alias_shape(names, f.key) {
-                                    Ok(Some(shape)) => SelfAt::Shape(Some(shape)),
-                                    Ok(None) => SelfAt::Unread,
-                                    Err(NoCheckerType) => SelfAt::NoCheckerType,
-                                },
+                                Kind::TypeAlias => {
+                                    let resolved = match kept.aliases.as_deref_mut() {
+                                        Some(cache) => alias_shape_cached(names, f.key, cache),
+                                        None => alias_shape(names, f.key),
+                                    };
+                                    match resolved {
+                                        Ok(Some(shape)) => SelfAt::Shape(Some(shape)),
+                                        Ok(None) => SelfAt::Unread,
+                                        Err(NoCheckerType) => SelfAt::NoCheckerType,
+                                    }
+                                }
                                 Kind::WideInt { .. } => SelfAt::NoCheckerType,
                                 _ => SelfAt::Unread,
                             },
@@ -850,8 +872,18 @@ pub struct FileCounts {
 /// `file_row` resolves each run of equal (trait path, module) once, and the impls read from
 /// text are filed by key. Every impl of `rows` is handed over exactly once.
 pub(crate) fn file_rows<'n, S: NamesSource<'n>>(names: S, krate: usize, rows: &[ImplRow<'n>], each: &mut dyn FnMut(Filing)) -> FileCounts {
+    file_rows_with_aliases(names, krate, rows, None, each)
+}
+
+fn file_rows_with_aliases<'n, S: NamesSource<'n>>(
+    names: S,
+    krate: usize,
+    rows: &[ImplRow<'n>],
+    aliases: Option<&mut AliasShapes>,
+    each: &mut dyn FnMut(Filing),
+) -> FileCounts {
     let mut counts = FileCounts::default();
-    let mut kept = RowNames { run: None, selves: HashMap::new_in(Global) };
+    let mut kept = RowNames { run: None, selves: HashMap::new_in(Global), aliases };
     let mut impls: Vec<super::index::ImplAt<'n>, Global> = Vec::new_in(Global);
     for row in rows.iter() {
         // A refused derive's gap (D193 point 5, blaze-scope `ImplRow::refused_call`): no impl
@@ -913,7 +945,7 @@ fn file_text<'n, S: NamesSource<'n>>(names: S, at: &super::index::ImplAt<'n>) ->
 /// constructor: a header whose tokens did not read, an inherent impl, and a self head the row
 /// does not name (`SelfHead::Other`, a path of no plain identifiers) stay candidates of every
 /// question, as `file` files an impl with no text.
-fn textless<'n, S: NamesSource<'n>>(names: S, row: &ImplRow<'n>, kept: &mut RowNames<'n>) -> Filing {
+fn textless<'n, S: NamesSource<'n>>(names: S, row: &ImplRow<'n>, kept: &mut RowNames<'n, '_>) -> Filing {
     let filing = |filed: Filed, unread_bare: bool| Filing { key: row.key, filed, blanket: false, by_text: false, unread_bare, path_self: None };
     if row.header_unread || !row.has_trait {
         return filing(Filed::Unread(Unread::NoText, None), false);
@@ -1375,6 +1407,8 @@ pub struct BucketIndex {
     /// Cached `Home::Any` `NoImplsOf` precheck results per trait, allocated in the body's
     /// scratch allocator on the first `Home::Any` trait lookup.
     tables_cache: Option<records::TablesCache>,
+    /// Resolved type-alias shapes reused across all crates filed in this index.
+    alias_shapes: Option<AliasShapes>,
 }
 
 impl Buckets {
@@ -1390,6 +1424,17 @@ impl Buckets {
             inherent_done: Rows::new_in(Global),
             index: RefCell::new(index),
         }
+    }
+
+    /// Wraps an already-populated [`BucketIndex`] with fresh empty per-store answer tables.
+    pub(crate) fn from_index(index: BucketIndex) -> Buckets {
+        Buckets::of(index)
+    }
+
+    /// Consumes these buckets and returns the underlying [`BucketIndex`] so its crate-level
+    /// impl filing work can be reused across stores over the same [`NamesSource`].
+    pub(crate) fn into_index(self) -> BucketIndex {
+        self.index.into_inner()
     }
 
     /// The impl index the names source `names` is answered from: over the solved names every
@@ -1499,6 +1544,7 @@ impl Buckets {
         match names.impl_tables() {
             Some(tables) => ix.admit_tables(names, keys, home, ask, tables, alloc),
             None => {
+                ix.ensure_alias_cache(alloc);
                 let whole = ix.admit(names, home);
                 Ok(whole + ix.admit_asked(names, keys, home, ask)?)
             }
@@ -1653,7 +1699,27 @@ impl BucketIndex {
             table_reads: None,
             tables_cache: None,
             indexed: asked::Indexed::new(),
+            alias_shapes: None,
         }
+    }
+
+    fn ensure_alias_cache(&mut self, alloc: blaze_own::Alloc<'static>) {
+        if self.alias_shapes.is_none() {
+            self.alias_shapes = Some(HashMap::new_in(alloc));
+        }
+    }
+
+    /// Resets per-store bookkeeping so this index can back a fresh [`Buckets`] over another
+    /// [`Store`] while keeping all crate-level impl filings and bucket lookups intact.
+    pub(crate) fn clear_for_store(&mut self) {
+        self.failed.clear();
+        self.lowered = 0;
+        self.table_reads = None;
+    }
+
+    /// Number of crates whose unfiled impl list has already been filed in this index.
+    pub(crate) fn unfiled_crates_len(&self) -> usize {
+        self.indexed.unfiled.len()
     }
 
     /// THE CAUSE REMOVED, for tests/front2_records.rs only (rule 23): from now on
@@ -1709,7 +1775,9 @@ impl BucketIndex {
             }
             let mut rows: Vec<ImplRow<'n>, Global> = Vec::new_in(Global);
             if !self.no_rows && names.each_impl_row(krate, &mut |row| rows.push(row)) {
-                let counts = file_rows(names, krate, &rows, &mut |f| self.take(names, krate, f));
+                let mut aliases = self.alias_shapes.take();
+                let counts = file_rows_with_aliases(names, krate, &rows, aliases.as_mut(), &mut |f| self.take(names, krate, f));
+                self.alias_shapes = aliases;
                 self.count(counts);
             } else {
                 // Every impl of a source with no impl rows is read from its header's text.

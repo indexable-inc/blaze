@@ -2647,9 +2647,21 @@ fn build_from<P: FrontEnd>(
             _ => None,
         };
         let is_test_report = blaze_build::test_report_shim_of(instance, ground.view()).is_some();
+        let is_vtable_shim = !is_own_instance && blaze_build::vtable_shim_of(instance, ground.view()).is_some();
+        let is_reify_shim = !is_own_instance && blaze_build::reify_shim_of(instance, ground.view()).is_some();
+        let is_fn_shim = !is_own_instance && crate::fn_shim::fn_shim_of(&keyer, instance, &ground).is_some();
         let (body, done) = match (function.body, checked[i].as_ref()) {
             (Some((body, _)), Some(done)) => (Some(body), Some(done)),
-            _ if ctor_row.is_some() || clone_row.is_some() || from_row.is_some() || is_test_report => (None, None),
+            _ if ctor_row.is_some()
+                || clone_row.is_some()
+                || from_row.is_some()
+                || is_test_report
+                || is_vtable_shim
+                || is_reify_shim
+                || is_fn_shim =>
+            {
+                (None, None)
+            }
             _ => {
             let refusal = callee_refusal(&*program, name(), instance.args, instance, crate::callee_shown::CalleeGap::NoBody, ground.view());
             // A survey files it (by the fn and the callee) and goes on, as its doc promises; a
@@ -2759,8 +2771,10 @@ fn build_from<P: FrontEnd>(
             && ctor_row.is_none()
             && clone_row.is_none()
             && from_row.is_none()
-            && blaze_build::vtable_shim_of(instance, ground.view()).is_none()
-            && blaze_build::test_report_shim_of(instance, ground.view()).is_none()
+            && !is_vtable_shim
+            && !is_reify_shim
+            && !is_test_report
+            && !is_fn_shim
         {
             return Err(callee_refusal(&*program, named, instance.args, instance, crate::callee_shown::CalleeGap::NoBody, ground.view()));
         }
