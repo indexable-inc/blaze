@@ -42,6 +42,11 @@ pub(crate) fn clause_goal(cx: &mut InferCtx<'_>, types: PTys<'_>, c: PClause, su
             term: import(cx, &mut NoClosures, types, term, subst, 0)?,
         },
         PClause::Const { cond, args } => Goal::ConstHolds { cond, args: import_list(cx, &mut NoClosures, types, args, subst, 0)? },
+        PClause::ForFields { container, trait_, args } => Goal::ForFields {
+            container: import(cx, &mut NoClosures, types, container, subst, 0)?,
+            trait_,
+            args: import_list(cx, &mut NoClosures, types, args, subst, 0)?,
+        },
         PClause::TypeOutlives { .. } | PClause::RegionOutlives { .. } => return Ok(None),
     }))
 }

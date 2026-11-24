@@ -511,7 +511,7 @@ fn supertrait_closure(r: &mut Records<'_, '_>, principals: &[ItemKey], out: &mut
         for c in def.supertraits.iter() {
             match c {
                 tc::PClause::Trait { trait_, .. } | tc::PClause::Projection { trait_, .. } => stack.push(*trait_),
-                tc::PClause::Const { .. } | tc::PClause::TypeOutlives { .. } | tc::PClause::RegionOutlives { .. } => {}
+                tc::PClause::Const { .. } | tc::PClause::ForFields { .. } | tc::PClause::TypeOutlives { .. } | tc::PClause::RegionOutlives { .. } => {}
             }
         }
     }

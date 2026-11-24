@@ -48,6 +48,11 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 }
                 // The body's own `where const` condition is assumed, as its other clauses are.
                 PClause::Const { cond, args } => Goal::ConstHolds { cond, args: self.lower_body_list(preds.types, args)? },
+                PClause::ForFields { container, trait_, args } => Goal::ForFields {
+                    container: self.lower(preds.types, container, Lower::Assumed, Cause::Body)?,
+                    trait_,
+                    args: self.lower_body_list(preds.types, args)?,
+                },
                 // Outlives clauses are the borrow checker's (D148); the checker takes them as true.
                 PClause::TypeOutlives { .. } | PClause::RegionOutlives { .. } => continue,
             };

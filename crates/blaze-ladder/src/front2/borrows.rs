@@ -2038,7 +2038,7 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             let Some(p) = r.store.preds.get(&tc::ItemKey(k)) else { continue };
             for cl in p.clauses.iter() {
                 match *cl {
-                    tc::PClause::Trait { trait_, .. } => g.trait_counts.push((trait_.0, None)),
+                    tc::PClause::Trait { trait_, .. } | tc::PClause::ForFields { trait_, .. } => g.trait_counts.push((trait_.0, None)),
                     tc::PClause::Projection { trait_, name, .. } => {
                         g.alias_counts.push((trait_.0, name, None));
                         g.trait_counts.push((trait_.0, None));

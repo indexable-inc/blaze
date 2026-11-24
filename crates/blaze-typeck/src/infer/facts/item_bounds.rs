@@ -206,6 +206,14 @@ impl<'a> FactCache<'a> {
                 let site = crate::error::ParamSite::Supertrait { of, super_: cond };
                 Pred::ConstHolds { cond: SDef(cond.0), args: self.instance_list(c, args, with, put, site)? }
             }
+            PClause::ForFields { container, trait_, args } => {
+                let site = crate::error::ParamSite::Supertrait { of, super_: trait_ };
+                Pred::ForFields {
+                    container: self.instance_ty(c, container, with, put, site)?,
+                    trait_: SDef(trait_.0),
+                    args_after_self: self.instance_list(c, args, with, put, site)?,
+                }
+            }
             // Outlives clauses are the borrow checker's (D148); the checker takes them as true.
             PClause::TypeOutlives { .. } | PClause::RegionOutlives { .. } => return Ok(None),
         };

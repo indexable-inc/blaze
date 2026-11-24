@@ -127,6 +127,12 @@ impl<'a, S: Strategy> Fulfill<'a, S> {
                     each(tys.list_get(args, i), &mut self.vars, &mut self.work)?;
                 }
             }
+            Pred::ForFields { container, args_after_self, .. } => {
+                each(container, &mut self.vars, &mut self.work)?;
+                for i in 0..args_after_self.len {
+                    each(tys.list_get(args_after_self, i), &mut self.vars, &mut self.work)?;
+                }
+            }
             Pred::Projection { alias: a, term: b }
             | Pred::NormalizesTo { alias: a, term: b }
             | Pred::TypeOutlives { ty: a, region: b }

@@ -271,6 +271,21 @@ pub(crate) fn check_rounds_probe<'n, S: NamesSource<'n>>(
     out
 }
 
+/// Strict type-checking pass for definition-time checking of `ForFields`-bounded generic
+/// `inline for` bodies: temporarily forces `inline_for_probe = false` so any missing method
+/// or unsatisfied bound fails immediately with diagnostics.
+pub(crate) fn check_rounds_strict<'n, S: NamesSource<'n>>(
+    r: &mut Records<'_, 'n, S>,
+    body: &Body<'_>,
+    scope: &BodyScope<'_>,
+) -> Result<tc::Checked<'static>, CheckFail> {
+    let prev = r.store.inline_for_probe;
+    r.store.inline_for_probe = false;
+    let out = check_rounds_as(r, body, scope, None, None, super::stalled_goals::Stalls::Gap, None);
+    r.store.inline_for_probe = prev;
+    out
+}
+
 /// [`check_rounds`] with the check's entry for an auto-trait goal of an async block's future
 /// that fails only on the superset interior named (front2 stalled_goals.rs `Stalls`): only
 /// `ProjectWorld::check_borrows` passes `Stalls::Decide`, and it decides every stalled row.
@@ -1803,6 +1818,76 @@ pub fn callee_target<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,scope: &
     let mut last = Vec::new_in(Global);
     last.extend(hole);
     Err(rounds_fail(r, owner, &format!("instance resolution of the call of {}", key_shown(r, item)), made, last))
+}
+
+/// Resolves a trait method `item` at concrete ground `args` (interned in `r.store.tys`) to its
+/// selected impl method `(impl_item, impl_args)` (with `impl_args` copied into `r.store.tys`).
+/// Returns `Ok(None)` when `item` is not a trait method or resolves to no distinct impl body.
+pub(crate) fn resolve_instance_full<'n, S: NamesSource<'n>>(
+    r: &mut Records<'_, 'n, S>,
+    item: ItemKey,
+    args: &[tc::PTy],
+) -> Result<Option<(ItemKey, blaze_own::Vec<tc::PTy, blaze_own::Alloc<'static>>)>, CheckFail> {
+    let container = match r.keys.origin(item) {
+        Some(Origin::Member { container, .. }) if !r.store.impls.contains_key(container) => *container,
+        _ => return Ok(None),
+    };
+    let Some(module) = r.keys.library_in(r.names, container) else { return Ok(None) };
+    let alloc = r.store.tys.alloc();
+    let mut ground = tc::PortableTys::new_in(alloc);
+    let mut g_args: blaze_own::Vec<tc::PTy, blaze_own::Alloc<'static>> =
+        blaze_own::Vec::with_capacity_in(args.len(), alloc);
+    for &t in args {
+        let Some(copied) = super::inline_for::copy_ty_into(r.store.tys.view(), t, &mut ground, None, alloc) else {
+            return Ok(None);
+        };
+        g_args.push(copied);
+    }
+    let Ok(args_list) = ground.intern_list(&g_args) else { return Ok(None) };
+    let spell = Spelling::fixed();
+    let blocks = super::block_traits::BlockTraits::module(alloc);
+    let self_ = SelfTy::None;
+    let scope = BodyScope {
+        owner: item,
+        module,
+        params: &[],
+        self_: &self_,
+        spell: &spell,
+        traits: &[],
+        blocks: &blocks,
+        path_marks: &[],
+        path_ns: &[],
+    };
+    for _ in 0..MOST_ROUNDS {
+        let world = BodyWorld { reveal: super::opaque_auto::Reveal::All, ..world_at(r, &scope) };
+        let out = tc::resolve_instance(&world, item, args_list, &mut ground, alloc);
+        let mut fills = world.fills.into_inner();
+        if r.order == BuildOrder::Reversed {
+            fills.reverse();
+        }
+        match out {
+            Ok(res) => {
+                if res.item == item {
+                    return Ok(None);
+                }
+                let Ok(raw_list) = ground.view().list(res.args) else { return Ok(None) };
+                let mut resolved_args: blaze_own::Vec<tc::PTy, blaze_own::Alloc<'static>> =
+                    blaze_own::Vec::with_capacity_in(raw_list.len(), alloc);
+                for &t in raw_list {
+                    let Some(copied) = super::inline_for::copy_ty_into(ground.view(), t, &mut r.store.tys, None, alloc) else {
+                        return Ok(None);
+                    };
+                    resolved_args.push(copied);
+                }
+                return Ok(Some((res.item, resolved_args)));
+            }
+            Err(tc::ResolveError::Missing(_)) if !fills.is_empty() => {
+                make_all(r, fills, item)?;
+            }
+            Err(_) => return Ok(None),
+        }
+    }
+    Ok(None)
 }
 
 /// The program's `Copy` trait, its key filed in the key map (no body need name the trait for

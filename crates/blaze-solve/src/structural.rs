@@ -514,6 +514,7 @@ fn step_wf<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> Result<S
 fn is_item_bound<T: Tys, F: Facts>(cx: &Cx<'_, '_, T, F>, p: Pred, alias: Ty) -> Result<bool, Stop> {
     let first = match p {
         Pred::Trait { args, .. } | Pred::HostEffect { args, .. } if args.len > 0 => Some(cx.arg(args, 0)),
+        Pred::ForFields { container, .. } => Some(container),
         Pred::Projection { alias: a, .. } => match cx.kind(a) {
             TyKind::Alias(_, _, _, l) if l.len > 0 => Some(cx.arg(l, 0)),
             _ => None,

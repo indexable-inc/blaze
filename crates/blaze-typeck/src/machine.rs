@@ -1317,6 +1317,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                                 self.errors += 1;
                                 self.diags.push(PendingDiag::because(code, at, Because::Generic(cond), found, None));
                             }
+                            crate::ty::Goal::ForFields { container, .. } => self.diag(code, at, About::found(container)),
                         }
                     }
                 }
@@ -1328,6 +1329,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                             crate::ty::Goal::Trait { args, .. } if self.ty.list_len(args) > 0 => {
                                 Some(self.ty.list_get(args, 0))
                             }
+                            crate::ty::Goal::ForFields { container, .. } => Some(container),
                             _ => None,
                         };
                         self.errors += 1;
@@ -1367,6 +1369,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                             self.errors += 1;
                             self.diags.push(PendingDiag::because(DiagCode::Unsatisfied, at, Because::False(cond), found, None));
                         }
+                        crate::ty::Goal::ForFields { container, .. } => self.diag(DiagCode::Unsatisfied, at, About::found(container)),
                     },
                 },
             }
@@ -2425,6 +2428,11 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                 term: self.lower(types, term, Lower::Args(args), cause)?,
             },
             PClause::Const { cond, args: l } => Goal::ConstHolds { cond, args: self.lower_list(types, l, args, cause)? },
+            PClause::ForFields { container, trait_, args: l } => Goal::ForFields {
+                container: self.lower(types, container, Lower::Args(args), cause)?,
+                trait_,
+                args: self.lower_list(types, l, args, cause)?,
+            },
             PClause::TypeOutlives { .. } | PClause::RegionOutlives { .. } => return Ok(None),
         }))
     }

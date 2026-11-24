@@ -188,7 +188,8 @@ const MAGIC: [u8; 4] = *b"BZHD";
 /// what method and path lookup's `World::member_unstable` reads).
 /// 35: `T_RECORD` terms carry their canonical sorted field names so cross-item signatures keep
 /// `RecordSchema -> &[Name]` mappings.
-pub const VERSION: u32 = 35;
+/// 36: `PClause::ForFields` (tag 5) for field-quantified bounds `for<F in fields(T)> F: Trait<args...>`.
+pub const VERSION: u32 = 36;
 /// The digest domains: the record's out digest, a fn text's check, the regions digest.
 const DIGEST_DOMAIN: &str = "blaze.head-record.v1";
 const TEXT_DOMAIN: &str = "blaze.head-record.text.v1";
@@ -1583,6 +1584,12 @@ impl Out<'_, '_, '_> {
                         self.rregion(short);
                     }
                 }
+                PClause::ForFields { container, trait_, args } => {
+                    self.byte(5);
+                    self.ty(container)?;
+                    self.key(trait_);
+                    self.list(args, "a for-fields clause's arguments")?;
+                }
             }
         }
         Ok(())
@@ -2672,6 +2679,11 @@ impl<'r> In<'r, '_, '_> {
                 let long = self.rregion()?;
                 PClause::RegionOutlives { long, short: self.rregion()? }
             }
+            5 => {
+                let container = self.ty("a for-fields clause's container")?;
+                let trait_ = self.key("a for-fields clause's trait")?;
+                PClause::ForFields { container, trait_, args: self.list("a for-fields clause's arguments")? }
+            }
             byte => return Err(E::Byte { what: "a clause's tag", byte }),
         })
     }
@@ -3289,6 +3301,10 @@ pub fn same(a: HeadRef<'_, '_>, b: HeadRef<'_, '_>, tys: PTys<'_>) -> Option<&'s
                 (PClause::Const { cond: c1, args: a1 }, PClause::Const { cond: c2, args: a2 }) => c1 == c2 && l(a1, a2),
                 (PClause::TypeOutlives { ty: t1, region: r1 }, PClause::TypeOutlives { ty: t2, region: r2 }) => t1 == t2 && r1 == r2,
                 (PClause::RegionOutlives { long: l1, short: s1 }, PClause::RegionOutlives { long: l2, short: s2 }) => l1 == l2 && s1 == s2,
+                (
+                    PClause::ForFields { container: c1, trait_: t1, args: a1 },
+                    PClause::ForFields { container: c2, trait_: t2, args: a2 },
+                ) => c1 == c2 && t1 == t2 && l(a1, a2),
                 _ => false,
             })
     };

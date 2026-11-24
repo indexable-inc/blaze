@@ -1060,11 +1060,11 @@ pub fn fill_clauses(cx: &Cx<'_, '_>, tys: &mut PortableTys<'_>, preds: &Preds, c
                 head.outlives.push(Outlives::Region { long, short });
                 head.params.add_outlives(long, short)?;
             }
-            PClause::Trait { .. } | PClause::Projection { .. } | PClause::Const { .. } => {}
+            PClause::Trait { .. } | PClause::Projection { .. } | PClause::Const { .. } | PClause::ForFields { .. } => {}
         }
         let mut part = None;
         let laid = match (c, src) {
-            (PClause::Const { .. } | PClause::RegionOutlives { .. }, _) => None,
+            (PClause::Const { .. } | PClause::RegionOutlives { .. } | PClause::ForFields { .. }, _) => None,
             (_, Src::Inherited { nth: k }) => {
                 // The container's columns were filled by this same function (or
                 // `trait_inherited`): a trait, projection or type-outlives clause there with no

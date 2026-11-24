@@ -451,6 +451,10 @@ fn const_params<'a>(s: &mut Scratch<'_>, h: &ImplHeader<'_>, alloc: Alloc<'a>) -
     for c in h.where_clauses {
         match *c {
             Pred::Trait { args, .. } | Pred::HostEffect { args, .. } | Pred::ConstHolds { args, .. } => list(args, roots)?,
+            Pred::ForFields { container, args_after_self, .. } => {
+                roots.push(container);
+                list(args_after_self, roots)?;
+            }
             Pred::Projection { alias: a, term: b }
             | Pred::NormalizesTo { alias: a, term: b }
             | Pred::TypeOutlives { ty: a, region: b }
@@ -497,6 +501,11 @@ fn import_pred<T: Tys>(tys: &mut T, s: &mut Scratch<'_>, p: Portable<'_>, pred: 
         Pred::ConstHolds { cond, args: a } => {
             Pred::ConstHolds { cond, args: fold::import_list_at(tys, s, p, a, inst, site)? }
         }
+        Pred::ForFields { container, trait_, args_after_self } => Pred::ForFields {
+            container: fold::import_at(tys, s, p, container, inst, site)?,
+            trait_,
+            args_after_self: fold::import_list_at(tys, s, p, args_after_self, inst, site)?,
+        },
         Pred::WellFormed(x) => Pred::WellFormed(fold::import_at(tys, s, p, x, inst, site)?),
         Pred::ConstEvaluatable(x) => Pred::ConstEvaluatable(fold::import_at(tys, s, p, x, inst, site)?),
         Pred::Projection { alias: a, term: b }

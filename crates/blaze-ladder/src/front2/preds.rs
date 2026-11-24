@@ -700,6 +700,7 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
                 // `T: 'a` on the alias itself is a clause on the alias as much as a trait bound.
                 PClause::TypeOutlives { ty, .. } => Some(ty),
                 PClause::RegionOutlives { .. } => None,
+                PClause::ForFields { container, .. } => Some(container),
                 PClause::Const { .. } => return Err(Why::Unsupported("a `where const` condition on an associated type", Range::new(0, 0))),
             };
             if let Some(s) = first
@@ -839,6 +840,9 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
                         }
                     }
                 }
+                lf::WherePred::ForFields { param, container, subject, bounds } => {
+                    self.for_fields_pred(tys, env, v, param, container, subject, bounds, self_bounds, out, implied)?;
+                }
             }
         }
         dropped.sort_unstable();
@@ -882,6 +886,90 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
                 // A name no scope declares stays the program's error (E0261).
                 (Err(why @ heads_regions::RegionsRefusal::Undeclared { .. }), _) | (_, Err(why @ heads_regions::RegionsRefusal::Undeclared { .. })) => return Err(Why::Regions(why)),
                 (Err(why), _) | (_, Err(why)) => out.refuse_regions(why),
+            }
+        }
+        Ok(())
+    }
+
+    /// `where for<F in fields(T)> F: Bound1 + Bound2<Arg>`: verifies `subject` names `param`,
+    /// lowers `container`, and emits one [`PClause::ForFields`] per trait bound.
+    #[expect(clippy::too_many_arguments, reason = "mirrors predicates_implying parameters")]
+    fn for_fields_pred(
+        &self,
+        tys: &mut PortableTys<'_>,
+        env: &Env<'_>,
+        v: &View<'n>,
+        param: lf::NameIdx,
+        container: lf::TypeId,
+        subject: lf::TypeId,
+        bounds: lf::List,
+        self_bounds: Option<PTy>,
+        out: &mut Preds,
+        implied: &mut dyn FnMut(PClause),
+    ) -> Result<(), Why> {
+        let container_ty = self.ty(tys, env, v, container)?;
+        let sr = place(v, v.type_range(subject))?;
+        let param_text = v.name_text(param)?;
+        let ok_subject = match v.ty(subject)? {
+            lf::TypeRef::Path(p) => {
+                let (abs, texts, segs, _) = path_texts_of(v, p, false)?;
+                !abs
+                    && texts.len() == 1
+                    && texts.first().copied() == Some(param_text)
+                    && segs.first().is_some_and(|s| s.kind == lf::SegKind::Ident && !s.has_args && !s.parenthesized)
+            }
+            _ => false,
+        };
+        if !ok_subject {
+            return Err(Why::Unsupported("a `for<F in fields(..)>` bound whose subject is not the bound field parameter", sr));
+        }
+        let on_self = self_bounds == Some(container_ty);
+        for &row in v.rows(bounds)? {
+            let b = lf::Bound::decode(row)?;
+            let lf::Bound::Trait { ty, binder, mods } = b else {
+                return Err(Why::Unsupported("a non-trait bound in `for<F in fields(..)>`", sr));
+            };
+            let br = place(v, v.type_range(ty))?;
+            lifetimes_only(v, binder, br)?;
+            if mods.negative {
+                return Err(Why::Unsupported("a negative bound (`!Trait`) in `for<F in fields(..)>`", br));
+            }
+            if mods.asyncness {
+                return Err(Why::Unsupported("an async bound (`async Fn`) in `for<F in fields(..)>`", br));
+            }
+            if mods.maybe {
+                return Err(Why::Unsupported("`?Trait` in `for<F in fields(..)>`", br));
+            }
+            let lf::TypeRef::Path(p) = v.ty(ty)? else {
+                return Err(Why::Unsupported("a non-path bound in `for<F in fields(..)>`", br));
+            };
+            let (abs, texts, segs, pr) = path_texts_of(v, p, true)?;
+            let target = match (self.bound_target(env, v, p, abs, &texts, pr), out.trait_misses.as_mut()) {
+                (Err(Why::Resolve(crate::resolve::ResolveError::Path(e), at)), Some(misses)) if super::type_miss::decided(e) => {
+                    misses.push((e, at));
+                    continue;
+                }
+                (target, _) => target?,
+            };
+            let key = match target {
+                Bounded::Trait(key) => key,
+                Bounded::Alias(_) => {
+                    return Err(Why::Unsupported("a trait alias in `for<F in fields(..)>`", pr));
+                }
+            };
+            let args = if let Some(last) = segs.last() {
+                let (given, binds, nested) = self.bound_segment_args(tys, env, v, target, last, pr)?;
+                if !binds.is_empty() || !nested.is_empty() {
+                    return Err(Why::Unsupported("an associated type constraint in `for<F in fields(..)>`", pr));
+                }
+                self.trait_args_after_self(tys, key, pr, &given)?
+            } else {
+                self.trait_args_after_self(tys, key, pr, &[])?
+            };
+            let clause = PClause::ForFields { container: container_ty, trait_: self.heads.checker(key), args };
+            out.push(clause, Src::Derived);
+            if on_self {
+                implied(clause);
             }
         }
         Ok(())

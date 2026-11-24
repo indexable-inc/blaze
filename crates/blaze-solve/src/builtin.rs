@@ -302,6 +302,7 @@ fn elaborate_supertraits<T: Tys, F: Facts>(
 fn on_self<T: Tys, F: Facts>(cx: &Cx<'_, '_, T, F>, p: Pred, self_ty: Ty) -> bool {
     let args = match p {
         Pred::Trait { args, .. } | Pred::HostEffect { args, .. } => args,
+        Pred::ForFields { container, .. } => return container == self_ty,
         Pred::Projection { alias, .. } => match cx.kind(alias) {
             TyKind::Alias(_, _, _, al) => al,
             _ => return false,

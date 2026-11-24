@@ -333,6 +333,10 @@ impl<'n> WalkHooks<'n> for HisMain<'n> {
                         }
                         blaze_typeck::PClause::Const { .. } | blaze_typeck::PClause::RegionOutlives { .. } => {}
                         blaze_typeck::PClause::TypeOutlives { ty, .. } => roots.push(ty),
+                        blaze_typeck::PClause::ForFields { container, args, .. } => {
+                            roots.push(container);
+                            roots.extend_from_slice(tys.list(args).unwrap_or(&[]));
+                        }
                     }
                 }
                 s

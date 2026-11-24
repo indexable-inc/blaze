@@ -21,9 +21,9 @@ use blaze_typeck::{
 };
 
 use super::body::{Body, lower_body_with_text};
-use super::check::{CheckFail, Records, check_body, check_rounds_probe};
+use super::check::{CheckFail, Records, check_body, check_rounds_probe, check_rounds_strict, resolve_instance_full};
 use super::heads::{FnHead, Want};
-use super::heads_regions::Scope as RegionScope;
+use super::heads_regions::{Scope as RegionScope, Src};
 use super::preds::Preds;
 use super::reach::{Census, First, reach};
 use super::source::NamesSource;
@@ -989,6 +989,7 @@ pub fn expand_concrete_body<'n, S: NamesSource<'n>>(
         }
         if rewrites.is_empty() {
             if any_generic {
+                check_for_fields_generic_bodies(r, prepared, body, &probe, &top_sites)?;
                 break;
             }
             break;
@@ -1059,6 +1060,389 @@ pub fn unroll_concrete_body<'n, S: NamesSource<'n>>(
     })?;
     let scope = body.scope(&spell);
     check_body(r, body, &scope)
+}
+
+/// Peels one optional `&` / `&mut` reference layer from `ty`.
+fn peel_ref_ty(tys: PTys<'_>, ty: PTy) -> (Option<Mutbl>, PTy) {
+    match tys.node(ty) {
+        Ok(PNode::Ref(m, inner)) => (Some(m), inner),
+        _ => (None, ty),
+    }
+}
+
+/// Reference prefix for a synthetic `ForFields` field binding type annotation.
+const fn ref_prefix(mutbl: Option<Mutbl>) -> &'static str {
+    match mutbl {
+        None => "",
+        Some(Mutbl::Not) => "&",
+        Some(Mutbl::Mut) => "&mut ",
+    }
+}
+
+/// Formats a single-iterable `inline for` as a strict definition-time type-check block binding
+/// the field pattern to a rigid synthetic field type parameter `__BlazeForField{synth_idx}`.
+fn render_for_fields_single<'a>(
+    view: &blaze_lower::View<'_>,
+    site: InlineForSite,
+    ref_mutbl: Option<Mutbl>,
+    synth_idx: usize,
+    alloc: Alloc<'a>,
+) -> Option<AString<'a>> {
+    let iter_src = view.text_at(view.expr_range(site.iter).ok()?).ok()?;
+    let body_src = view.text_at(view.expr_range(site.body).ok()?).ok()?;
+    let two_tuple = match view.pat(site.pat).ok()? {
+        blaze_lower::Pat::Tuple { elems, rest: None } if elems.len == 2 => {
+            let ids = view.ids(elems).ok()?;
+            let p0 = tc::PatId(*ids.first()?);
+            let p1 = tc::PatId(*ids.get(1)?);
+            let k_src = view.text_at(view.pat_range(p0).ok()?).ok()?;
+            let v_src = view.text_at(view.pat_range(p1).ok()?).ok()?;
+            Some((k_src, v_src))
+        }
+        _ => None,
+    };
+    let pat_src = view.text_at(view.pat_range(site.pat).ok()?).ok()?;
+    let prefix = ref_prefix(ref_mutbl);
+    let mut out = OwnString::new_in(alloc);
+    let _ = write!(out, "{{ let _ = ({iter_src}); while false {{ ");
+    match two_tuple {
+        Some((k_src, v_src)) => {
+            let _ = write!(
+                out,
+                "let {k_src}: &'static str = \"\"; let {v_src}: {prefix}__BlazeForField{synth_idx} = loop {{}}; "
+            );
+        }
+        None => {
+            let _ = write!(
+                out,
+                "let {pat_src}: {prefix}__BlazeForField{synth_idx} = loop {{}}; "
+            );
+        }
+    }
+    let _ = write!(out, "{body_src} }} }}");
+    Some(out)
+}
+
+/// Formats a `zip_fields(lhs, rhs)` `inline for` as a strict definition-time type-check block
+/// binding both field patterns to the SAME rigid synthetic field type parameter
+/// `__BlazeForField{synth_idx}` (with their respective `&` / `&mut` / by-value wrappers).
+#[expect(clippy::too_many_arguments, reason = "mirrors render_zip_unrolled parameters")]
+fn render_for_fields_zip<'a>(
+    view: &blaze_lower::View<'_>,
+    site: InlineForSite,
+    lhs: tc::ExprId,
+    rhs: tc::ExprId,
+    lhs_mutbl: Option<Mutbl>,
+    rhs_mutbl: Option<Mutbl>,
+    synth_idx: usize,
+    alloc: Alloc<'a>,
+) -> Result<AString<'a>, ZipRenderError> {
+    let zip_pat = parse_zip_pat(view, site.pat)?;
+    let lhs_src = view
+        .expr_range(lhs)
+        .ok()
+        .and_then(|r| view.text_at(r).ok())
+        .ok_or(ZipRenderError::SliceLhs)?;
+    let rhs_src = view
+        .expr_range(rhs)
+        .ok()
+        .and_then(|r| view.text_at(r).ok())
+        .ok_or(ZipRenderError::SliceRhs)?;
+    let body_src = view
+        .expr_range(site.body)
+        .ok()
+        .and_then(|r| view.text_at(r).ok())
+        .ok_or(ZipRenderError::SliceBody)?;
+    let lpre = ref_prefix(lhs_mutbl);
+    let rpre = ref_prefix(rhs_mutbl);
+    let mut out = OwnString::new_in(alloc);
+    let _ = write!(out, "{{ let _ = ({lhs_src}); let _ = ({rhs_src}); while false {{ ");
+    match zip_pat {
+        ZipPat::Pair(a_src, b_src) => {
+            let _ = write!(
+                out,
+                "let {a_src}: {lpre}__BlazeForField{synth_idx} = loop {{}}; let {b_src}: {rpre}__BlazeForField{synth_idx} = loop {{}}; "
+            );
+        }
+        ZipPat::Named(name_src, a_src, b_src) => {
+            let _ = write!(
+                out,
+                "let {name_src}: &'static str = \"\"; let {a_src}: {lpre}__BlazeForField{synth_idx} = loop {{}}; let {b_src}: {rpre}__BlazeForField{synth_idx} = loop {{}}; "
+            );
+        }
+    }
+    let _ = write!(out, "{body_src} }} }}");
+    Ok(out)
+}
+
+/// Checks generic `inline for` bodies strictly at definition time whenever their container type
+/// has one or more `where for<F in fields(T)> F: Bound` clauses in the enclosing `ParamEnv`.
+/// Unbounded generic `inline for` loops are skipped so existing monomorphization-time checking
+/// behavior is preserved.
+fn check_for_fields_generic_bodies<'n, S: NamesSource<'n>>(
+    r: &mut Records<'_, 'n, S>,
+    prepared: &Prepares<'n>,
+    body: &Body<'n>,
+    probe: &Checked<'static>,
+    top_sites: &[(InlineForSite, usize, usize)],
+) -> Result<(), CheckFail> {
+    let alloc = r.store.tys.alloc();
+    let owner = body.owner;
+    let mut ff_clauses: AVec<'_, (PTy, ItemKey, List)> = OwnVec::new_in(alloc);
+    let mut sized_for_container: AVec<'_, (PTy, ItemKey)> = OwnVec::new_in(alloc);
+    let sized_trait = super::langs::find(r.index, crate::resolve::Paths { names: r.names }, tc::LangItem::Sized)
+        .ok()
+        .flatten()
+        .and_then(|lib| r.keys.item(lib).ok());
+    if let Some(preds) = r.store.preds.get(&owner) {
+        let store_tys = r.store.tys.view();
+        for &c in preds.clauses.iter() {
+            match c {
+                tc::PClause::ForFields { container, trait_, args } => {
+                    ff_clauses.push((container, trait_, args));
+                }
+                tc::PClause::Trait { trait_, args } => {
+                    if sized_trait == Some(trait_)
+                        && let Ok([only]) = store_tys.list(args)
+                    {
+                        sized_for_container.push((*only, trait_));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if ff_clauses.is_empty() {
+        return Ok(());
+    }
+
+    struct SynthField<'a> {
+        param_idx: u32,
+        bounds: AVec<'a, (ItemKey, List)>,
+        sized: Option<ItemKey>,
+    }
+
+    let Some(base_generics) = r.store.fns.get(&owner).map(|h| h.parent.saturating_add(h.own)) else {
+        return Ok(());
+    };
+    let probe_tys = probe.types.view();
+    let store_tys = r.store.tys.view();
+    let mut synth_fields: AVec<'_, SynthField<'_>> = OwnVec::new_in(alloc);
+    let mut rewrites: AVec<'_, Rewrite<'static>> = OwnVec::new_in(alloc);
+    let view = body.lowered.view();
+
+    for &(site, start, end) in top_sites.iter() {
+        let collect_bounds = |inner_ty: PTy| -> Option<(AVec<'_, (ItemKey, List)>, Option<ItemKey>)> {
+            let mut matched: AVec<'_, (ItemKey, List)> = OwnVec::new_in(alloc);
+            let mut sized = None;
+            for &(container, trait_, args) in ff_clauses.iter() {
+                if args_equal(store_tys, &[container], probe_tys, &[inner_ty], alloc) {
+                    matched.push((trait_, args));
+                    if sized.is_none() {
+                        for &(sc, st) in sized_for_container.iter() {
+                            if sc == container {
+                                sized = Some(st);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if matched.is_empty() { None } else { Some((matched, sized)) }
+        };
+
+        match site.kind {
+            InlineForKind::Single { iter } => {
+                let Some(&iter_ty) = probe.expr_ty.get(iter.ix()) else { continue };
+                let (ref_mutbl, inner_ty) = peel_ref_ty(probe_tys, iter_ty);
+                let Some((bounds, sized)) = collect_bounds(inner_ty) else { continue };
+                let synth_idx = synth_fields.len();
+                let Ok(offset) = u32::try_from(synth_idx) else { continue };
+                let Some(replacement) = render_for_fields_single(&view, site, ref_mutbl, synth_idx, alloc) else {
+                    let at = body.typeck.expr_ranges.get(site.expr.ix()).copied().unwrap_or_default();
+                    return Err(CheckFail::InlineFor {
+                        owner,
+                        at,
+                        why: "could not slice source text for for-fields body check",
+                    });
+                };
+                synth_fields.push(SynthField {
+                    param_idx: base_generics.saturating_add(offset),
+                    bounds,
+                    sized,
+                });
+                rewrites.push(Rewrite { start, end, replacement });
+            }
+            InlineForKind::Zip { lhs, rhs } => {
+                let Some(&lhs_ty) = probe.expr_ty.get(lhs.ix()) else { continue };
+                let Some(&rhs_ty) = probe.expr_ty.get(rhs.ix()) else { continue };
+                let (lhs_mutbl, lhs_inner) = peel_ref_ty(probe_tys, lhs_ty);
+                let (rhs_mutbl, rhs_inner) = peel_ref_ty(probe_tys, rhs_ty);
+                if !args_equal(probe_tys, &[lhs_inner], probe_tys, &[rhs_inner], alloc) {
+                    continue;
+                }
+                let Some((bounds, sized)) = collect_bounds(lhs_inner) else { continue };
+                let synth_idx = synth_fields.len();
+                let Ok(offset) = u32::try_from(synth_idx) else { continue };
+                let replacement =
+                    render_for_fields_zip(&view, site, lhs, rhs, lhs_mutbl, rhs_mutbl, synth_idx, alloc).map_err(
+                        |why| CheckFail::InlineFor {
+                            owner,
+                            at: body.typeck.expr_ranges.get(site.expr.ix()).copied().unwrap_or_default(),
+                            why: why.message(),
+                        },
+                    )?;
+                synth_fields.push(SynthField {
+                    param_idx: base_generics.saturating_add(offset),
+                    bounds,
+                    sized,
+                });
+                rewrites.push(Rewrite { start, end, replacement });
+            }
+        }
+    }
+
+    if synth_fields.is_empty() {
+        return Ok(());
+    }
+
+    rewrites.sort_unstable_by_key(|rw| rw.start);
+    let check_text: &'n str = {
+        let orig_text = view.item();
+        let mut buf = OwnString::with_capacity_in(orig_text.len() + 128, alloc);
+        let mut cursor = 0usize;
+        for rw in rewrites.iter() {
+            if rw.start >= cursor && rw.start <= rw.end && rw.end <= orig_text.len() {
+                if let Some(prefix) = orig_text.get(cursor..rw.start) {
+                    buf.push_str(prefix);
+                }
+                buf.push_str(rw.replacement.as_str());
+                cursor = rw.end;
+            }
+        }
+        if let Some(tail) = orig_text.get(cursor..) {
+            buf.push_str(tail);
+        }
+        r.store.locals.keep_text(buf.as_str())
+    };
+
+    let Ok(synth_count) = u32::try_from(synth_fields.len()) else {
+        return Ok(());
+    };
+    let (lib, head) = {
+        let Some(orig_head) = r.store.fns.get(&owner) else {
+            return Ok(());
+        };
+        let lib = orig_head.lib;
+        let mut head = FnHead {
+            lib,
+            text: check_text,
+            text_prefix: orig_head.text_prefix,
+            container: orig_head.container,
+            parent: orig_head.parent,
+            own: orig_head.own.saturating_add(synth_count),
+            declared: orig_head.declared,
+            self_param: orig_head.self_param,
+            header: orig_head.header,
+            c_variadic: orig_head.c_variadic,
+            qualifiers: orig_head.qualifiers,
+            legacy_const_generics: Default::default(),
+            inputs: Default::default(),
+            output: orig_head.output,
+            has_body: true,
+            module: orig_head.module,
+            params: Default::default(),
+            consts: Default::default(),
+            bounds: Default::default(),
+            self_: orig_head.self_,
+            self_assoc: Default::default(),
+        };
+        head.legacy_const_generics.extend_from_slice(&orig_head.legacy_const_generics);
+        head.inputs.extend_from_slice(&orig_head.inputs);
+        head.params.extend_from_slice(&orig_head.params);
+        head.consts.extend_from_slice(&orig_head.consts);
+        head.bounds.extend_from_slice(&orig_head.bounds);
+        head.self_assoc.extend_from_slice(&orig_head.self_assoc);
+        let mut name_buf = OwnString::new_in(alloc);
+        for (idx, sf) in synth_fields.iter().enumerate() {
+            name_buf.clear();
+            let _ = write!(name_buf, "__BlazeForField{idx}");
+            head.params.push((tc::Name::of(name_buf.as_str()), sf.param_idx));
+        }
+        (lib, head)
+    };
+
+    let mut shadow_preds = Preds::new_in(RegionScope::new_in(alloc));
+    if let Some(op) = r.store.preds.get(&owner) {
+        for &c in op.clauses.iter() {
+            shadow_preds.push(c, Src::Derived);
+        }
+    }
+    let mut arg_buf: AVec<'_, PTy> = OwnVec::new_in(alloc);
+    for sf in synth_fields.iter() {
+        let Ok(field_param) = r.store.tys.intern(PNode::Param(sf.param_idx)) else {
+            return Ok(());
+        };
+        for &(trait_, args_after_self) in sf.bounds.iter() {
+            arg_buf.clear();
+            arg_buf.push(field_param);
+            if let Ok(rest) = r.store.tys.view().list(args_after_self) {
+                arg_buf.extend_from_slice(rest);
+            }
+            if let Ok(full_args) = r.store.tys.intern_list(&arg_buf) {
+                shadow_preds.push(tc::PClause::Trait { trait_, args: full_args }, Src::Derived);
+            }
+        }
+        if let Some(sized_key) = sf.sized
+            && let Ok(sized_args) = r.store.tys.intern_list(&[field_param])
+        {
+            shadow_preds.push(tc::PClause::Trait { trait_: sized_key, args: sized_args }, Src::Derived);
+        }
+    }
+    let prev_fn = r.store.fns.push_override(owner, head);
+    let prev_preds = r.store.preds.push_override(owner, shadow_preds);
+
+    let shadow_lower = lower_body_with_text(
+        r.names,
+        prepared,
+        r.keys,
+        r.store,
+        lib,
+        owner,
+        check_text,
+        None,
+        None,
+    );
+    let res = match shadow_lower {
+        Ok(shadow_body) => {
+            let shadow_view = shadow_body.lowered.view();
+            match Spelling::of(&shadow_view) {
+                Ok(spell) => {
+                    let shadow_scope = shadow_body.scope(&spell);
+                    check_rounds_strict(r, &shadow_body, &shadow_scope).map(|_| ())
+                }
+                Err(_) => Err(CheckFail::InlineFor {
+                    owner,
+                    at: tc::Range { start: 0, end: 0 },
+                    why: "could not spell names in for-fields checked body",
+                }),
+            }
+        }
+        Err(_) => Err(CheckFail::InlineFor {
+            owner,
+            at: tc::Range { start: 0, end: 0 },
+            why: "lowering for-fields definition-checked body failed",
+        }),
+    };
+
+    r.store.fns.restore_override(owner, prev_fn);
+    r.store.preds.restore_override(owner, prev_preds);
+
+    match res {
+        Ok(()) => Ok(()),
+        Err(CheckFail::Diags { diags, filed, .. }) => Err(CheckFail::Diags { owner, diags, filed }),
+        Err(other) => Err(other),
+    }
 }
 
 /// Deterministic synthetic checker key for a monomorphized `inline for` specialization.
@@ -1572,6 +1956,13 @@ pub fn specialize_generic_inline_fors<'n>(
                     checked: spec_checked,
                 });
             } else {
+                // If `callee` is a trait method at concrete ground args, resolve it to its
+                // selected impl method so blanket impls with `inline for` specialize cleanly.
+                if let Some((impl_item, impl_args)) = resolve_instance_full(r, callee, &args_copy)? {
+                    if !impl_args.is_empty() {
+                        add_call(&mut concrete_calls, r.store.tys.view(), impl_item, impl_args);
+                    }
+                }
                 // Propagate concrete args through generic wrapper functions (e.g. `wrapper<U>` -> `score_all<U>`).
                 let found_checked = census
                     .bodies

@@ -203,6 +203,8 @@ pub(crate) enum V {
     Guard,
     /// `node.a`/`node.b` the statements, `node.c` the tail, `node.d` the scope.
     StmtList,
+    /// `for<F in fields(T)>`: `id` the bound parameter's `NameIdx`, `node.a` the container's `TypeId`.
+    ForFields,
 }
 
 /// What a placed list holds.
@@ -1767,7 +1769,23 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 self.push_list(L::Names, l, r);
             }
             // Read through: their children's values are their parent's.
-            FOR_BINDER | VISIBILITY_INNER => {}
+            VISIBILITY_INNER => {}
+            FOR_BINDER => {
+                if self.has_tok(f, IN_KW) {
+                    let param = self.first(f, V::Name);
+                    let kind = self.first(f, V::Tok(IDENT));
+                    let container = self.first(f, V::Type);
+                    let is_fields = kind.is_some_and(|k| k.range.of(self.text()) == "fields");
+                    self.done(f);
+                    if is_fields && let (Some(param), Some(container)) = (param, container) {
+                        let mut node = Node::of(0);
+                        node.a = container.id;
+                        self.vals.push(Val { v: V::ForFields, id: param.id, node, range: r });
+                    } else {
+                        self.diag(DiagKind::Syntax, r);
+                    }
+                }
+            }
             GENERIC_PARAM_LIST => {
                 let l = self.put_rows(f, ROW_GENERIC_PARAM);
                 self.done(f);
@@ -1821,19 +1839,27 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 self.push_list(L::Where, l, r);
             }
             WHERE_PRED => {
+                let for_fields = self.first(f, V::ForFields);
                 let binder = self.list_of(f, L::GParams).map_or(List { start: 0, len: 0 }, |l| l.0);
                 let ty = self.first(f, V::Type);
                 let lifetime = self.first(f, V::Lifetime);
                 let bounds = self.list_of(f, L::Bounds).map_or(List { start: 0, len: 0 }, |l| l.0);
                 let cond = self.first(f, V::Skipped(BLOCK_EXPR));
                 self.done(f);
-                let p = match (ty, lifetime) {
-                    (Some(t), _) => WherePred::Type { binder, ty: TypeId(t.id), bounds },
-                    (None, Some(l)) => WherePred::Lifetime { name: NameIdx(l.id), bounds },
-                    (None, None) => match cond {
+                let p = match (for_fields, ty, lifetime) {
+                    (Some(ff), Some(t), _) => WherePred::ForFields {
+                        param: NameIdx(ff.id),
+                        container: TypeId(ff.node.a),
+                        subject: TypeId(t.id),
+                        bounds,
+                    },
+                    (None, Some(t), _) => WherePred::Type { binder, ty: TypeId(t.id), bounds },
+                    (None, None, Some(l)) => WherePred::Lifetime { name: NameIdx(l.id), bounds },
+                    (None, None, None) => match cond {
                         Some(c) => WherePred::Const { cond: self.put_const(c.range) },
                         None => return,
                     },
+                    (Some(_), None, _) => return,
                 };
                 self.push_node(V::Row(ROW_WHERE), p.encode(), r);
             }

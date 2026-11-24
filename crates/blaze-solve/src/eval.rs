@@ -65,6 +65,12 @@ pub enum Rule {
     HostEffect,
     /// `where const { COND }` (`Pred::ConstHolds`): see [`const_holds`].
     ConstHolds,
+    /// `for<F in fields(container)> F: Trait<args...>` matched against a param-env assumption
+    /// at index `Cand::n`.
+    ForFieldsEnv,
+    /// `for<F in fields(container)> F: Trait<args...>` proved structurally over the fields of
+    /// `Cand::a` (normalized container).
+    ForFieldsStructural,
     /// Two terms equal (an equation goal of the tests and of coherence).
     Eq,
 }
@@ -97,6 +103,7 @@ enum Kind {
     Trait,
     Alias,
     WellFormed,
+    ForFields,
     Other,
 }
 
@@ -105,6 +112,7 @@ fn kind_of(p: Pred) -> Kind {
         Pred::Trait { .. } => Kind::Trait,
         Pred::Projection { .. } | Pred::NormalizesTo { .. } => Kind::Alias,
         Pred::WellFormed(_) => Kind::WellFormed,
+        Pred::ForFields { .. } => Kind::ForFields,
         _ => Kind::Other,
     }
 }
@@ -945,6 +953,7 @@ impl<'a, E: Emit> Solver<'a, E> {
         let child = self.input_of(&*tys, f.mode, Goal { env: f.goal.env, pred: g.pred, bound: g.bound })?;
         let above = match f.goal.pred {
             Pred::Trait { args, .. } if args.len > 0 => Some(tys.kind(tys.shallow_resolve(tys.list_get(args, 0)))),
+            Pred::ForFields { container, .. } => Some(tys.kind(tys.shallow_resolve(container))),
             _ => None,
         };
         let reached = Reached::of(Some(Choice::of(&f.cand)), g.source, g.reach, above);
@@ -1723,7 +1732,7 @@ impl<'a, E: Emit> Solver<'a, E> {
         // `step_kind_for_source` through `CurrentGoalKind`: a coinductive trait's nested goals
         // are coinductive steps, a projection's unknown, any other goal's forced ambiguity.
         let to_nested = match goal.pred {
-            Pred::Trait { trait_, .. } => {
+            Pred::Trait { trait_, .. } | Pred::ForFields { trait_, .. } => {
                 let d = cx.trait_def(trait_)?;
                 if d.flags.has(TraitFlags::AUTO) || d.flags.has(TraitFlags::COINDUCTIVE) {
                     PathKind::Coinductive
@@ -1767,6 +1776,7 @@ impl<'a, E: Emit> Solver<'a, E> {
                     crate::structural::assemble_wf(&mut cx, t, &mut out)?;
                     AStep::Done
                 }
+                Kind::ForFields => assemble_for_fields(&mut cx, stage, &mut st, &mut out)?,
                 Kind::Other => {
                     let rule = match f.goal.pred {
                         Pred::TypeOutlives { .. } | Pred::RegionOutlives { .. } => Rule::Outlives,
@@ -1881,7 +1891,7 @@ impl<'a, E: Emit> Solver<'a, E> {
                 CandRule::Structural(r) => crate::structural::step(&mut cx, &mut cand, r, stage)?,
                 CandRule::Alias(r) => crate::alias::step(&mut cx, &mut cand, r, stage)?,
                 CandRule::Coherence(r) => crate::coherence::step(&mut cx, &mut cand, r, stage)?,
-                CandRule::Other(r) => step_other(&mut cx, r)?,
+                CandRule::Other(r) => step_other(&mut cx, &cand, r)?,
             };
             Ok((r, cand))
         })?;
@@ -2030,6 +2040,7 @@ impl<'a, E: Emit> Solver<'a, E> {
             };
             let above = match f.goal.pred {
                 Pred::Trait { args, .. } if args.len > 0 => Some(tys.kind(tys.shallow_resolve(tys.list_get(args, 0)))),
+                Pred::ForFields { container, .. } => Some(tys.kind(tys.shallow_resolve(container))),
                 _ => None,
             };
             let reached = Reached::of(cand, g.source, g.reach, above);
@@ -2320,7 +2331,7 @@ impl<'a, E: Emit> Solver<'a, E> {
                 Err(e) => Err(e),
             },
             Kind::Alias => crate::alias::merge(&mut m, f.mode, f.goal.pred, dones, &mut specializes),
-            Kind::WellFormed | Kind::Other => m.merge_responses(dones).map_err(Stop::Error),
+            Kind::WellFormed | Kind::ForFields | Kind::Other => m.merge_responses(dones).map_err(Stop::Error),
         };
         self.scratch.stats.pulls += u64::from(pulls);
         let ans = merged?;
@@ -2559,6 +2570,10 @@ fn pred_terms<T: Tys>(tys: &T, p: Pred, f: &mut impl FnMut(Ty) -> Result<(), Sol
     };
     match p {
         Pred::Trait { args, .. } | Pred::HostEffect { args, .. } | Pred::ConstHolds { args, .. } => list(args, f),
+        Pred::ForFields { container, args_after_self, .. } => {
+            f(container)?;
+            list(args_after_self, f)
+        }
         Pred::Projection { alias: a, term: b }
         | Pred::NormalizesTo { alias: a, term: b }
         | Pred::TypeOutlives { ty: a, region: b }
@@ -2597,6 +2612,11 @@ fn import_pred<T: Tys>(
         Pred::ConstHolds { cond, args: a } => {
             Pred::ConstHolds { cond, args: fold::import_list_at(tys, s, p, a, inst, at)? }
         }
+        Pred::ForFields { container, trait_, args_after_self } => Pred::ForFields {
+            container: fold::import_at(tys, s, p, container, inst, at)?,
+            trait_,
+            args_after_self: fold::import_list_at(tys, s, p, args_after_self, inst, at)?,
+        },
         Pred::Projection { alias: a, term: b }
         | Pred::TypeOutlives { ty: a, region: b }
         | Pred::RegionOutlives { a, b } => {
@@ -2617,7 +2637,7 @@ fn import_pred<T: Tys>(
 }
 
 /// The steps of [`Rule`].
-fn step_other<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, rule: Rule) -> Result<Step, Stop> {
+fn step_other<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand, rule: Rule) -> Result<Step, Stop> {
     let bad = || Stop::Error(SolveError::Malformed(crate::error::bad_pred()));
     let is_var = |k: TyKind| matches!(k, TyKind::Infer(v) if v.kind == VarKind::Ty);
     Ok(match rule {
@@ -2657,12 +2677,138 @@ fn step_other<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, rule: Rule) -> Result
             let Pred::ConstHolds { cond, args } = cx.goal.pred else { return Err(bad()) };
             const_holds(cx, cond, args)?
         }
+        Rule::ForFieldsEnv => step_for_fields_env(cx, cand.n)?,
+        Rule::ForFieldsStructural => step_for_fields_structural(cx, cand.a)?,
         Rule::HostEffect => {
             let Pred::HostEffect { trait_, args, .. } = cx.goal.pred else { return Err(bad()) };
             cx.add(GoalSource::Misc, Pred::Trait { trait_, args, polarity: Polarity::Positive });
             Step::Done(Certainty::Yes)
         }
     })
+}
+
+/// Assembles candidates for `Pred::ForFields { container, trait_, args_after_self }`:
+/// stage 0 normalizes a non-rigid alias container via `Projection`; stage 1 emits one
+/// `ParamEnv` candidate per matching `ForFields` assumption plus one structural candidate.
+fn assemble_for_fields<T: Tys, F: Facts>(
+    cx: &mut Cx<'_, '_, T, F>,
+    stage: u8,
+    st: &mut trait_goals::State,
+    out: &mut Vec<Cand, Alloc<'_>>,
+) -> Result<AStep, Stop> {
+    let Pred::ForFields { container, trait_, .. } = cx.goal.pred else {
+        return Err(Stop::Error(SolveError::Malformed(crate::error::bad_pred())));
+    };
+    if stage == 0 {
+        let container = cx.resolve(container);
+        st.self_ty = container;
+        if crate::alias::needs_normalizing(cx, container)? {
+            let v = cx.fresh_ty()?;
+            cx.add(GoalSource::NormalizeGoal, Pred::Projection { alias: container, term: v });
+            st.self_ty = v;
+            return Ok(AStep::Then(1));
+        }
+    }
+    let container = cx.resolve(st.self_ty);
+    // Step A: ParamEnv assumptions for the same trait.
+    for (i, c) in (0u32..).zip(cx.env.iter()) {
+        if let Pred::ForFields { trait_: env_tr, .. } = c.pred
+            && env_tr == trait_
+        {
+            let mut cand = Cand::new(Source::ParamEnv { global: false }, CandRule::Other(Rule::ForFieldsEnv));
+            cand.d = trait_;
+            cand.n = i;
+            out.push(cand);
+        }
+    }
+    // Steps B, C, D: structural decomposition of `container`.
+    let mut cand = Cand::new(Source::Builtin(crate::assembly::BuiltinSource::Misc), CandRule::Other(Rule::ForFieldsStructural));
+    cand.a = container;
+    cand.d = trait_;
+    out.push(cand);
+    Ok(AStep::Done)
+}
+
+/// Step A: match `Pred::ForFields` against param-env clause `idx`.
+fn step_for_fields_env<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, idx: u32) -> Result<Step, Stop> {
+    let bad = || Stop::Error(SolveError::Malformed(crate::error::bad_pred()));
+    let Pred::ForFields { container, trait_, args_after_self } = cx.goal.pred else { return Err(bad()) };
+    let Some(&clause) = usize::try_from(idx).ok().and_then(|i| cx.env.get(i)) else { return Err(bad()) };
+    let Pred::ForFields { container: env_c, trait_: env_tr, args_after_self: env_args } = clause.pred else {
+        return Err(bad());
+    };
+    if env_tr != trait_ {
+        return Ok(Step::No);
+    }
+    let (env_c, env_args) = if clause.bound > 0 {
+        let with = cx.fresh_args(clause.bound)?;
+        let env_c = cx.instantiate_bound(env_c, with)?;
+        let mut f = |cx: &mut Cx<'_, '_, T, F>, t: Ty| cx.instantiate_bound(t, with);
+        let env_args = cx.map_list(env_args, &mut f)?;
+        (env_c, env_args)
+    } else {
+        (env_c, env_args)
+    };
+    if !cx.eq(container, env_c)? || !cx.eq_lists(args_after_self, env_args)? {
+        return Ok(Step::No);
+    }
+    Ok(Step::Done(Certainty::Yes))
+}
+
+/// Steps B, C, D: structurally prove `Pred::ForFields` over a concrete product type
+/// (struct ADT, structural record, or tuple), stall on `TyKind::Infer`, and reject all
+/// other types (including primitives, enums, unions, and unassumed generic params).
+fn step_for_fields_structural<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, container: Ty) -> Result<Step, Stop> {
+    let Pred::ForFields { trait_, args_after_self, .. } = cx.goal.pred else {
+        return Err(Stop::Error(SolveError::Malformed(crate::error::bad_pred())));
+    };
+    let container = cx.resolve(container);
+    match cx.tys.kind(container) {
+        TyKind::Infer(_) => Ok(Step::Done(Certainty::Ambiguous)),
+        TyKind::Error => Ok(Step::Done(Certainty::Yes)),
+        TyKind::Adt(adt_def, adt_args) => {
+            let adt = cx.adt(adt_def)?;
+            if !adt.flags.has(crate::facts::AdtFlags::STRUCT) {
+                return Ok(Step::No);
+            }
+            let mut fields: Vec<Ty, Alloc<'_>> = Vec::new_in(cx.alloc);
+            crate::builtin::adt_fields(cx, adt_def, adt_args, &mut fields)?;
+            add_for_fields_goals(cx, trait_, args_after_self, &fields, true)?;
+            Ok(Step::Done(Certainty::Yes))
+        }
+        TyKind::Record(_, fields_list) => {
+            let fields = cx.list_small(fields_list);
+            add_for_fields_goals(cx, trait_, args_after_self, &fields, false)?;
+            Ok(Step::Done(Certainty::Yes))
+        }
+        TyKind::Tuple(elems_list) => {
+            let elems = cx.list_small(elems_list);
+            add_for_fields_goals(cx, trait_, args_after_self, &elems, false)?;
+            Ok(Step::Done(Certainty::Yes))
+        }
+        _ => Ok(Step::No),
+    }
+}
+
+/// Adds `F_i: trait_<args_after_self...>` as an `ImplWhereBound` nested goal for every field `F_i`.
+fn add_for_fields_goals<T: Tys, F: Facts>(
+    cx: &mut Cx<'_, '_, T, F>,
+    trait_: Def,
+    args_after_self: crate::term::List,
+    fields: &[Ty],
+    is_adt: bool,
+) -> Result<(), Stop> {
+    let rest = cx.list_small(args_after_self);
+    let mut args = crate::assembly::SmallTys::new_with_len(1 + rest.len(), cx.alloc);
+    args[1..].copy_from_slice(&rest);
+    for (i, &field_ty) in (0u32..).zip(fields.iter()) {
+        args[0] = field_ty;
+        let list = cx.mk_list(&args)?;
+        let pred = Pred::Trait { trait_, args: list, polarity: Polarity::Positive };
+        let reach = if is_adt { Reach::Field(i) } else { Reach::Element(i) };
+        cx.add_from(GoalSource::ImplWhereBound, pred, reach);
+    }
+    Ok(())
 }
 
 /// `where const { COND }` at `args` (extensions.md, `where const`). The clause is a nested goal
@@ -2750,6 +2896,18 @@ fn bad_pred_of<T: Tys>(tys: &T, p: Pred) -> crate::error::BadPred {
             out.n_args = args.len;
             for i in 0..args.len.min(4) {
                 out.args[i as usize] = Some(arg_shape(tys, tys.list_get(args, i)));
+            }
+        }
+        Pred::ForFields { container, trait_, args_after_self } => {
+            out.kind = PredKind::ForFields;
+            out.def = trait_;
+            out.n_args = args_after_self.len.saturating_add(1);
+            out.args[0] = Some(arg_shape(tys, container));
+            for (i, slot) in (0u32..).zip(out.args[1..].iter_mut()) {
+                if i >= args_after_self.len {
+                    break;
+                }
+                *slot = Some(arg_shape(tys, tys.list_get(args_after_self, i)));
             }
         }
         Pred::Projection { alias, term } => {

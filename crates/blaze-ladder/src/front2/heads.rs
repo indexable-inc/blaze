@@ -2016,7 +2016,7 @@ fn bounded_lifetimes(v: &View<'_>, own: &[(Name, &str)], alloc: Alloc<'static>) 
                     }
                 }
             }
-            lf::WherePred::Type { .. } => by_text(v.text_at(v.row_range(wheres.start + k as u32)?)?, &mut out),
+            lf::WherePred::Type { .. } | lf::WherePred::ForFields { .. } => by_text(v.text_at(v.row_range(wheres.start + k as u32)?)?, &mut out),
             lf::WherePred::Const { .. } => {}
         }
     }

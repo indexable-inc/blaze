@@ -1746,6 +1746,60 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         }
         Ok((key, intern_list(tys, &args)?))
     }
+
+    /// The trait `key`'s arguments AFTER `Self` for a `for<F in fields(..)> F: Trait<args...>`
+    /// bound, filling any defaulted trait parameters that do not reference `Self`.
+    pub(super) fn trait_args_after_self(&self, tys: &mut PortableTys<'_>, key: LibKey, r: Range, given: &[PTy]) -> Result<List, Why> {
+        let (g, defaults) = self.heads.trait_head(key).ok_or(Why::Need(key))?;
+        let want = usize::try_from(g).unwrap_or(0).saturating_sub(1);
+        if given.len() > want {
+            return Err(Why::Unsupported("too many type arguments on a `for<F in fields(..)>` trait bound", r));
+        }
+        if want == 0 {
+            return Ok(List::EMPTY);
+        }
+        let alloc = tys.alloc();
+        let mut args: blaze_own::Vec<PTy, Alloc<'_>> = blaze_own::Vec::with_capacity_in(want + 1, alloc);
+        let dummy_self = intern(tys, PNode::Error)?;
+        args.push(dummy_self);
+        args.extend_from_slice(given);
+        for i in given.len()..want {
+            let Some(d) = defaults.get(i).copied().flatten() else {
+                return Err(Why::Unsupported("missing required type argument on a `for<F in fields(..)>` trait bound", r));
+            };
+            if mentions_param0(tys.view(), d, alloc) {
+                return Err(Why::Unsupported("a defaulted trait argument referring to `Self` in a `for<F in fields(..)>` bound", r));
+            }
+            let d = subst(tys, d, &args)?;
+            args.push(d);
+        }
+        intern_list(tys, args.get(1..).unwrap_or(&[]))
+    }
+}
+
+/// Whether `root` references `PNode::Param(0)` (used to detect `Self`-dependent defaults).
+fn mentions_param0(tys: tc::PTys<'_>, root: PTy, alloc: Alloc<'_>) -> bool {
+    let mut stack: blaze_own::Vec<PTy, Alloc<'_>> = blaze_own::Vec::new_in(alloc);
+    let mut kids: blaze_own::Vec<PTy, Alloc<'_>> = blaze_own::Vec::new_in(alloc);
+    stack.push(root);
+    let mut steps = 0usize;
+    while let Some(t) = stack.pop() {
+        steps += 1;
+        if steps > 4096 {
+            return true;
+        }
+        let Ok(node) = tys.node(t) else { return true };
+        if matches!(node, PNode::Param(0)) {
+            return true;
+        }
+        kids.clear();
+        if tys.children_of(node, &mut kids).is_ok() {
+            for &c in kids.iter() {
+                stack.push(c);
+            }
+        }
+    }
+    false
 }
 
 /// What a bound's path names ([`Builder::bound_target`]).
@@ -1772,6 +1826,10 @@ pub fn subst_clause(tys: &mut PortableTys<'_>, c: PClause, args: &[PTy]) -> Resu
             PClause::Projection { trait_, args: l, name, term: subst(tys, term, args)? }
         }
         PClause::Const { cond, args: l } => PClause::Const { cond, args: list(tys, l)? },
+        PClause::ForFields { container, trait_, args: l } => {
+            let container = subst(tys, container, args)?;
+            PClause::ForFields { container, trait_, args: list(tys, l)? }
+        }
         PClause::TypeOutlives { ty, region } => PClause::TypeOutlives { ty: subst(tys, ty, args)?, region },
         c @ PClause::RegionOutlives { .. } => c,
     })

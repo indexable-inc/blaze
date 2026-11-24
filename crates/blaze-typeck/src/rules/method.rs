@@ -500,8 +500,8 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 return Ok(match goal {
                     Goal::Trait { trait_, args } => Some(PendingGoal::Trait { trait_, args }),
                     Goal::Projection { trait_, args, name, term } => Some(PendingGoal::Projection { trait_, args, name, term }),
-                    // A well-formedness or `where const` clause: no trait goal to name.
-                    Goal::WellFormed(_) | Goal::ConstHolds { .. } => None,
+                    // A well-formedness, `where const`, or `for<F in fields(..)>` clause: no trait goal to name.
+                    Goal::WellFormed(_) | Goal::ConstHolds { .. } | Goal::ForFields { .. } => None,
                 });
             }
         }

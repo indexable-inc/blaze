@@ -830,6 +830,11 @@ fn try_impl<W: World>(
                     term: import(cx, &mut NoClosures, wc.types,term, &fresh, 0)?,
                 },
                 PClause::Const { cond, args } => Goal::ConstHolds { cond, args: import_list(cx, &mut NoClosures, wc.types,args, &fresh, 0)? },
+                PClause::ForFields { container, trait_, args } => Goal::ForFields {
+                    container: import(cx, &mut NoClosures, wc.types, container, &fresh, 0)?,
+                    trait_,
+                    args: import_list(cx, &mut NoClosures, wc.types, args, &fresh, 0)?,
+                },
                 // Outlives clauses are the borrow checker's (D148); the checker takes them as true.
                 PClause::TypeOutlives { .. } | PClause::RegionOutlives { .. } => continue,
             };

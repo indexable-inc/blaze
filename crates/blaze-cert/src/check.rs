@@ -882,6 +882,11 @@ fn import_pred<T: Tys>(
     let inst = Inst { args, bound: &[] };
     Ok(match pred {
         Pred::Trait { trait_, args: a, polarity } => Pred::Trait { trait_, args: import_list(tys, s, p, a, args, out)?, polarity },
+        Pred::ForFields { container, trait_, args_after_self: a } => Pred::ForFields {
+            container: fold::import(tys, s, p, container, inst)?,
+            trait_,
+            args_after_self: import_list(tys, s, p, a, args, out)?,
+        },
         Pred::HostEffect { trait_, args: a, constness } => Pred::HostEffect { trait_, args: import_list(tys, s, p, a, args, out)?, constness },
         Pred::ConstHolds { cond, args: a } => Pred::ConstHolds { cond, args: import_list(tys, s, p, a, args, out)? },
         Pred::Projection { alias, term } => Pred::Projection { alias: fold::import(tys, s, p, alias, inst)?, term: fold::import(tys, s, p, term, inst)? },

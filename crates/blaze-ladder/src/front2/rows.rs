@@ -107,6 +107,26 @@ impl<K: Copy + Eq + Hash, V, A: Allocator + Copy> Rows<K, V, A> {
         self.row(old).map(|(_, v)| v)
     }
 
+    /// Temporarily overrides `k`'s live row with `v`, returning the previous row index so
+    /// [`Self::restore_override`] can restore `k` to its original row without copying it.
+    pub fn push_override(&self, k: K, v: V) -> Option<u32> {
+        let prev = self.at.borrow().get(&k).copied();
+        let _ = self.insert(k, v);
+        prev
+    }
+
+    /// Restores `k`'s live index to `prev` (removing `k` if `prev` is `None`).
+    pub fn restore_override(&self, k: K, prev: Option<u32>) {
+        match prev {
+            Some(i) => {
+                let _ = self.at.borrow_mut().insert(k, i);
+            }
+            None => {
+                let _ = self.at.borrow_mut().remove(&k);
+            }
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.at.borrow().len()
     }
