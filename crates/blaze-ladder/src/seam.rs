@@ -289,6 +289,10 @@ pub trait FrontEnd {
     fn nounwind(&self, _key: ItemKey) -> Option<bool> {
         None
     }
+    /// Function code-generation attributes (`#[inline]`, `#[inline(always)]`, `#[inline(never)]`, `#[cold]`).
+    fn fn_attrs(&self, _key: ItemKey) -> blaze_lir::func::FnAttrs {
+        blaze_lir::func::FnAttrs::default()
+    }
     /// Whether fn `key` is `#[track_caller]`: its own signature says so, or it is a trait
     /// impl's method whose trait declares the method so (the Reference, "The `track_caller`
     /// attribute": an impl's method inherits it). `None`: not tabled, the trait's declaration

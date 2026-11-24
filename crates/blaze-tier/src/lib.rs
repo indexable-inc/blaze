@@ -35,7 +35,7 @@ pub use names::{Named, Names, Outside};
 pub use route::{first_tier, optimizing_tier};
 pub use routines::RoutinePlaces;
 pub use record::{Emitted, InlineFrame, Live, LoopHeader, OUTERMOST, Place, Poll, Position, Reloc, RelocKind};
-pub use regs::{ARM64, Arch, Machine, Os, Reg, RegClass, RegDesc, RegSet};
+pub use regs::{ARM64, Arch, CallClobbers, Machine, Os, Reg, RegClass, RegDesc, RegSet};
 pub use regs::x86_64::X86_64_SYSV;
 pub use seam::{Tier, TierError, TierName};
 pub use table::{Field, FieldKind, Form, ImmClass, Inner, Pattern, Source, Table, TableError, TableHead, Template};

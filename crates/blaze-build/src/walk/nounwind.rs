@@ -86,8 +86,12 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             }
         };
         self.nounwind = nounwind;
+        let mut attrs = if body { self.adts.fn_attrs(owner) } else { FnAttrs::default() };
         if nounwind {
-            self.b.set_attrs(FnAttrs(FnAttrs::NOUNWIND));
+            attrs.0 |= FnAttrs::NOUNWIND;
+        }
+        if attrs.0 != 0 {
+            self.b.set_attrs(attrs);
         }
         Ok(())
     }

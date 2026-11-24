@@ -290,8 +290,8 @@ pub fn rank_findings<'a>(
     out
 }
 
-/// Targeted automatic optimization suggestion triggered by combining static token patterns with
-/// PGO hot-function profiles.
+/// Targeted automatic optimization suggestion triggered by combining static token patterns or
+/// live JIT/LIR telemetry with PGO hot-function profiles.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 pub enum AdviceKind {
@@ -303,6 +303,18 @@ pub enum AdviceKind {
     UseCachePadded = 3,
     /// `.binary_search*` in a hot function: on uniform/digest keys, `bstd::mem::interp_search_by_prefix` is O(log log N).
     UseInterpSearch = 4,
+    /// Hot loop accesses `< 40%` of a large `AoS` struct (`>= 32 B` stride): switch to `SoA` for unit-stride SIMD.
+    UseSoaLayout = 5,
+    /// Hot branch with `>= 99%` JIT skew: mark the cold path `#[cold]` or use `Conv::BlazeResult` carry-flag `?`.
+    UseColdErrorPath = 6,
+    /// Non-escaping heap allocation inside a hot loop: promote to stack, `SmallVec`, or task frame.
+    PromoteHotHeapAlloc = 7,
+    /// Hot async coroutine with large disjoint cross-suspend locals: split/graph-color frame slots.
+    ShrinkAsyncFrame = 8,
+    /// Hot integer division with a JIT-skewed or loop-invariant divisor: specialize into shift-multiply.
+    SpecializeHotDivisor = 9,
+    /// Hot indirect gather loop with high cache miss pressure: insert software prefetch (`blaze.prefetch.r1`).
+    PrefetchHotGather = 10,
 }
 
 impl AdviceKind {
@@ -320,8 +332,199 @@ impl AdviceKind {
             AdviceKind::UseInterpSearch => {
                 "`.binary_search` in a hot function: for uniform hash/digest keys, `bstd::mem::interp_search_by_prefix` runs in O(log log N)"
             }
+            AdviceKind::UseSoaLayout => {
+                "hot loop touches <40% of a large struct's cache line (`AoS`): convert to Struct-of-Arrays (`SoA`) for unit-stride NEON/AVX SIMD"
+            }
+            AdviceKind::UseColdErrorPath => {
+                "hot branch is >=99% predictable in JIT profile: mark cold path `#[cold]` or use `Conv::BlazeResult` carry-flag `?`"
+            }
+            AdviceKind::PromoteHotHeapAlloc => {
+                "non-escaping heap allocation inside a hot loop: promote to stack, `bstd::mem::SmallVec`, or task frame"
+            }
+            AdviceKind::ShrinkAsyncFrame => {
+                "hot async state machine holds reducible cross-suspend locals: split/graph-color state slots to shrink future size"
+            }
+            AdviceKind::SpecializeHotDivisor => {
+                "hot integer division has a dominant runtime divisor in JIT profile: specialize into magic shift-multiply"
+            }
+            AdviceKind::PrefetchHotGather => {
+                "hot indirect gather loop has high cache-miss pressure: insert software prefetch (`blaze.prefetch.r1`)"
+            }
         }
     }
+}
+
+/// Live JIT / LIR-analysis observation fed into Blaze's profiler-driven linter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum JitTelemetryKind {
+    /// Hot strided loop over an Array-of-Structs (`stride_bytes >= 32`) touching only `accessed_bytes`.
+    AosStrideLoop { stride_bytes: u32, accessed_bytes: u32, trip_count: u64 },
+    /// Hot branch whose JIT profile shows extreme skew (`taken_ppm` in `0..=1_000_000`).
+    SkewedBranch { taken_ppm: u32, executions: u64 },
+    /// Non-escaping heap allocation detected inside a hot loop by escape analysis.
+    NonEscapingHeapAlloc { alloc_bytes: u32, executions: u64 },
+    /// Hot async coroutine whose raw frame (`frame_bytes`) can be graph-colored down to `colored_bytes`.
+    OversizedAsyncFrame { frame_bytes: u32, colored_bytes: u32, polls: u64 },
+    /// Hot integer division whose runtime divisor equals `dominant_divisor` for `dominant_ppm` of calls.
+    SkewedDivisor { dominant_divisor: u64, dominant_ppm: u32, executions: u64 },
+    /// Hot indirect gather loop (`data[idx[i]]`) with elevated L1/L2 miss rate (`miss_rate_ppm`).
+    IndirectGatherLoop { miss_rate_ppm: u32, trip_count: u64 },
+}
+
+/// One source-located JIT telemetry record for an item/function.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct JitObservation {
+    pub symbol_hash: u64,
+    pub range: Span,
+    pub kind: JitTelemetryKind,
+}
+
+impl JitObservation {
+    #[inline]
+    pub fn for_symbol(symbol: &str, range: Span, kind: JitTelemetryKind) -> JitObservation {
+        JitObservation { symbol_hash: symbol_hash(symbol), range, kind }
+    }
+}
+
+/// Actionable, impact-ranked performance lint derived from live JIT telemetry + PGO heat.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct JitAdvice {
+    pub kind: AdviceKind,
+    pub range: Span,
+    pub heat: Heat,
+    pub share_ppm: u32,
+    /// Priority score combining PGO share, execution frequency, and wasted work.
+    pub impact_score: u64,
+    /// Estimated resource waste percentage (`0..=100`, e.g. cache-line waste for `AoS`, frame bloat for async).
+    pub waste_pct: u8,
+    /// Estimated speedup in tenths (`10 = 1.0x`, `40 = 4.0x`, `80 = 8.0x`).
+    pub est_speedup_x10: u16,
+}
+
+/// Evaluates live JIT & LIR-analysis observations against PGO heat hints to produce deterministic,
+/// impact-ranked performance lints (e.g., `AoS -> SoA`, cold error splitting, heap promotion,
+/// async frame coloring, divisor specialization, and gather prefetching).
+pub fn suggest_from_jit<'a>(
+    observations: &[JitObservation],
+    hints: &PgoHints<'_>,
+    min_heat: Heat,
+    alloc: Alloc<'a>,
+) -> AVec<'a, JitAdvice> {
+    let mut out = AVec::new_in(alloc);
+    for &obs in observations {
+        let HeatInfo { heat, share_ppm } = hints.heat_of(obs.symbol_hash);
+        if heat < min_heat {
+            continue;
+        }
+        let heat_mult = (u64::from(share_ppm)).max(1);
+        let emitted = match obs.kind {
+            JitTelemetryKind::AosStrideLoop { stride_bytes, accessed_bytes, trip_count } => {
+                if stride_bytes >= 32
+                    && accessed_bytes > 0
+                    && accessed_bytes < stride_bytes
+                    && u64::from(accessed_bytes) * 100 < u64::from(stride_bytes) * 40
+                    && trip_count >= 128
+                {
+                    let wasted = stride_bytes - accessed_bytes;
+                    let waste_pct = u8::try_from(((u64::from(wasted) * 100) / u64::from(stride_bytes)).min(99)).unwrap_or(99);
+                    let est_speedup_x10 = u16::try_from(
+                        ((u64::from(stride_bytes) * 10) / u64::from(accessed_bytes)).clamp(15, 80),
+                    )
+                    .unwrap_or(80);
+                    let impact_score = heat_mult
+                        .saturating_mul(trip_count.min(1_000_000))
+                        .saturating_mul(u64::from(wasted));
+                    Some((AdviceKind::UseSoaLayout, impact_score, waste_pct, est_speedup_x10))
+                } else {
+                    None
+                }
+            }
+            JitTelemetryKind::SkewedBranch { taken_ppm, executions } => {
+                let skewed = taken_ppm >= 990_000 || taken_ppm <= 10_000;
+                if skewed && executions >= 1_000 {
+                    let skew_pct = if taken_ppm >= 500_000 {
+                        u8::try_from((taken_ppm / 10_000).min(100)).unwrap_or(100)
+                    } else {
+                        u8::try_from(((1_000_000u32.saturating_sub(taken_ppm)) / 10_000).min(100)).unwrap_or(100)
+                    };
+                    let impact_score = heat_mult.saturating_mul(executions.min(1_000_000));
+                    Some((AdviceKind::UseColdErrorPath, impact_score, skew_pct, 15))
+                } else {
+                    None
+                }
+            }
+            JitTelemetryKind::NonEscapingHeapAlloc { alloc_bytes, executions } => {
+                if alloc_bytes > 0 && executions >= 100 {
+                    let impact_score = heat_mult
+                        .saturating_mul(executions.min(1_000_000))
+                        .saturating_mul(u64::from(alloc_bytes).max(16));
+                    Some((AdviceKind::PromoteHotHeapAlloc, impact_score, 100, 30))
+                } else {
+                    None
+                }
+            }
+            JitTelemetryKind::OversizedAsyncFrame { frame_bytes, colored_bytes, polls } => {
+                if frame_bytes >= 128
+                    && colored_bytes < frame_bytes
+                    && u64::from(colored_bytes) * 100 <= u64::from(frame_bytes) * 75
+                    && polls >= 100
+                {
+                    let saved = frame_bytes - colored_bytes;
+                    let waste_pct = u8::try_from(((u64::from(saved) * 100) / u64::from(frame_bytes)).min(99)).unwrap_or(99);
+                    let est_speedup_x10 = u16::try_from(
+                        ((u64::from(frame_bytes) * 10) / u64::from(colored_bytes.max(1))).clamp(12, 40),
+                    )
+                    .unwrap_or(40);
+                    let impact_score = heat_mult
+                        .saturating_mul(polls.min(1_000_000))
+                        .saturating_mul(u64::from(saved));
+                    Some((AdviceKind::ShrinkAsyncFrame, impact_score, waste_pct, est_speedup_x10))
+                } else {
+                    None
+                }
+            }
+            JitTelemetryKind::SkewedDivisor { dominant_divisor, dominant_ppm, executions } => {
+                if dominant_divisor > 1 && dominant_ppm >= 800_000 && executions >= 1_000 {
+                    let dom_pct = u8::try_from((dominant_ppm / 10_000).min(100)).unwrap_or(100);
+                    let impact_score = heat_mult.saturating_mul(executions.min(1_000_000));
+                    Some((AdviceKind::SpecializeHotDivisor, impact_score, dom_pct, 35))
+                } else {
+                    None
+                }
+            }
+            JitTelemetryKind::IndirectGatherLoop { miss_rate_ppm, trip_count } => {
+                if miss_rate_ppm >= 50_000 && trip_count >= 1_000 {
+                    let miss_pct = u8::try_from((miss_rate_ppm / 10_000).min(100)).unwrap_or(100);
+                    let impact_score = heat_mult
+                        .saturating_mul(trip_count.min(1_000_000))
+                        .saturating_mul(u64::from(miss_rate_ppm) / 1_000);
+                    Some((AdviceKind::PrefetchHotGather, impact_score, miss_pct, 25))
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some((kind, impact_score, waste_pct, est_speedup_x10)) = emitted {
+            out.push(JitAdvice {
+                kind,
+                range: obs.range,
+                heat,
+                share_ppm,
+                impact_score,
+                waste_pct,
+                est_speedup_x10,
+            });
+        }
+    }
+    out.sort_unstable_by(|a, b| {
+        b.heat
+            .cmp(&a.heat)
+            .then_with(|| b.impact_score.cmp(&a.impact_score))
+            .then_with(|| b.share_ppm.cmp(&a.share_ppm))
+            .then_with(|| a.range.start.cmp(&b.range.start))
+            .then_with(|| a.kind.cmp(&b.kind))
+    });
+    out
 }
 
 /// One PGO-triggered automatic optimization recommendation.

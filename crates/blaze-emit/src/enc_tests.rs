@@ -5,11 +5,40 @@
 //! binary, one `_`-separated group per field of the diagram, named in the comment beside it;
 //! none came from an assembler.
 
-use crate::enc::{self, Barrier, Lse, Size};
+use crate::enc::{self, Barrier, Cond, Lse, Size};
 
 #[test]
 fn new_encodings() {
     let cases: &[(u32, u32, &str)] = &[
+        // C6.2 BL: 1 00101 imm26.
+        (enc::bl(0), 0b1_00101_00000000000000000000000000, "bl #0"),
+        (enc::bl(4), 0b1_00101_00000000000000000000000100, "bl #+16"),
+        // C6.2 BIC / ORN / EON (shifted register, N=1): sf opc 01010 shift N=1 Rm imm6 Rn Rd.
+        (enc::bic(0, 1, 2), 0b1_00_01010_00_1_00010_000000_00001_00000, "bic x0, x1, x2"),
+        (enc::orn(0, 1, 2), 0b1_01_01010_00_1_00010_000000_00001_00000, "orn x0, x1, x2"),
+        (enc::eon(0, 1, 2), 0b1_10_01010_00_1_00010_000000_00001_00000, "eon x0, x1, x2"),
+        // C6.2 EOR (immediate): sf=1 opc=10 100100 N:immr:imms Rn Rd.
+        (enc::eor_imm_nrs(0, 1, (1 << 12) | 0), 0b1_10_100100_1_000000_000000_00001_00000, "eor x0, x1, #1"),
+        // C6.2 EXTR: sf 00 100111 N 0 Rm imms Rn Rd.
+        (enc::extr(0, 1, 1, 7), 0b1_00_100111_1_0_00001_000111_00001_00000, "ror x0, x1, #7"),
+        (enc::extr_w(0, 1, 1, 5), 0b0_00_100111_0_0_00001_000101_00001_00000, "ror w0, w1, #5"),
+        // C6.2 CSINC / CSINV / CSNEG: sf op 0 11010100 Rm cond 0 o2 Rn Rd.
+        (enc::csinc(0, 1, 2, Cond::Eq), 0b1_0_0_11010100_00010_0000_0_1_00001_00000, "csinc x0, x1, x2, eq"),
+        (enc::csinv(0, 1, 2, Cond::Ne), 0b1_1_0_11010100_00010_0001_0_0_00001_00000, "csinv x0, x1, x2, ne"),
+        (enc::csneg(0, 1, 2, Cond::Ge), 0b1_1_0_11010100_00010_1010_0_1_00001_00000, "csneg x0, x1, x2, ge"),
+        // C6.2 STP / LDP (signed offset): 10 101 0 010 L imm7 Rt2 Rn Rt.
+        (enc::stp_off(0, 1, 2, 16), 0b10_101_0_010_0_0000010_00001_00010_00000, "stp x0, x1, [x2, #16]"),
+        (enc::ldp_off(0, 1, 2, 16), 0b10_101_0_010_1_0000010_00001_00010_00000, "ldp x0, x1, [x2, #16]"),
+        // C6.2 LDR/STR/LDRSW (register, scaled): size 111 0 00 opc 1 Rm 011 1 10 Rn Rt.
+        (enc::ldr_reg_scaled(Size::X, 0, 1, 2), 0b11_111_0_00_01_1_00010_011_1_10_00001_00000, "ldr x0, [x1, x2, lsl #3]"),
+        (enc::str_reg_scaled(Size::W, 0, 1, 2), 0b10_111_0_00_00_1_00010_011_1_10_00001_00000, "str w0, [x1, x2, lsl #2]"),
+        (enc::ldrsw_reg_scaled(0, 1, 2), 0b10_111_0_00_10_1_00010_011_1_10_00001_00000, "ldrsw x0, [x1, x2, lsl #2]"),
+        // C6.2 TBZ / TBNZ: b5 011011 op b40 imm14 Rt.
+        (enc::tbz(0, 3, 2), 0b0_011011_0_00011_00000000000010_00000, "tbz w0, #3, #+8"),
+        (enc::tbnz(1, 35, 4), 0b1_011011_1_00011_00000000000100_00001, "tbnz x1, #35, #+16"),
+        // C6.2 UMULL / SMULL.
+        (enc::umull(0, 1, 2), 0b1_00_11011_1_01_00010_0_11111_00001_00000, "umull x0, w1, w2"),
+        (enc::smull(0, 1, 2), 0b1_00_11011_0_01_00010_0_11111_00001_00000, "smull x0, w1, w2"),
         // C6.2 ADDS (shifted register): sf op S 01011 shift 0 Rm imm6 Rn Rd.
         (enc::adds(0, 1, 2), 0b1_0_1_01011_00_0_00010_000000_00001_00000, "adds x0, x1, x2"),
         // C6.2 SUBS (shifted register): op = 1.
@@ -83,6 +112,39 @@ fn new_encodings() {
         // C6.2 MRS: 1101010100 L=1 1 o0 op1 CRn CRm op2 Rt; TPIDRRO_EL0 is op0=11 (o0 = 1),
         // op1=011, CRn=1101, CRm=0000, op2=011.
         (enc::mrs_tpidrro_el0(11), 0b1101010100_1_1_1_011_1101_0000_011_01011, "mrs x11, tpidrro_el0"),
+        // C7.2 128-bit NEON SIMD encoders.
+        (enc::ldp_q_off(0, 1, 2, 0), 0xad40_0440, "ldp q0, q1, [x2]"),
+        (enc::stp_q_off(0, 1, 2, 1), 0xad00_8440, "stp q0, q1, [x2, #16]"),
+        (enc::ldr_q_reg(0, 1, 2, true), 0x3ce2_7820, "ldr q0, [x1, x2, lsl #4]"),
+        (enc::str_q_reg(0, 1, 2, false), 0x3ca2_6820, "str q0, [x1, x2]"),
+        (enc::movi_zero_v(3), 0x6f00_e403, "movi v3.2d, #0"),
+        (enc::dup_gen_v(3, 0, 1), 0x4e08_0c20, "dup v0.2d, x1"),
+        (enc::dup_gen_v(2, 0, 1), 0x4e04_0c20, "dup v0.4s, w1"),
+        (enc::dup_elem0_v(3, 0, 1), 0x4e08_0420, "dup v0.2d, v1.d[0]"),
+        (enc::add_v(3, 0, 1, 2), 0x4ee2_8420, "add v0.2d, v1.2d, v2.2d"),
+        (enc::add_v(2, 0, 1, 2), 0x4ea2_8420, "add v0.4s, v1.4s, v2.4s"),
+        (enc::sub_v(3, 0, 1, 2), 0x6ee2_8420, "sub v0.2d, v1.2d, v2.2d"),
+        (enc::mul_v(2, 0, 1, 2), 0x4ea2_9c20, "mul v0.4s, v1.4s, v2.4s"),
+        (enc::mla_v(2, 0, 1, 2), 0x4ea2_9420, "mla v0.4s, v1.4s, v2.4s"),
+        (enc::orr_v(0, 1, 2), 0x4ea2_1c20, "orr v0.16b, v1.16b, v2.16b"),
+        (enc::eor_v(0, 1, 2), 0x6e22_1c20, "eor v0.16b, v1.16b, v2.16b"),
+        (enc::fadd_v(true, 0, 1, 2), 0x4e62_d420, "fadd v0.2d, v1.2d, v2.2d"),
+        (enc::fmul_v(false, 0, 1, 2), 0x6e22_dc20, "fmul v0.4s, v1.4s, v2.4s"),
+        (enc::fmla_v(true, 0, 1, 2), 0x4e62_cc20, "fmla v0.2d, v1.2d, v2.2d"),
+        (enc::addv_v(2, 0, 1), 0x4eb1_b820, "addv s0, v1.4s"),
+        (enc::addp_d(0, 1), 0x5ef1_b820, "addp d0, v1.2d"),
+        (enc::faddp_scalar(true, 0, 1), 0x7e70_d820, "faddp d0, v1.2d"),
+        (enc::umov_lane(3, 0, 0, 1), 0x4e08_3c20, "umov x0, v1.d[0]"),
+        (enc::umov_lane(3, 1, 0, 1), 0x4e18_3c20, "umov x0, v1.d[1]"),
+        (enc::umov_lane(2, 0, 0, 1), 0x0e04_3c20, "umov w0, v1.s[0]"),
+        (enc::ext_v(0, 1, 2, 8), 0x6e02_4020, "ext v0.16b, v1.16b, v2.16b, #8"),
+        // ARMv8.9/v9.4 CSSC 1-instruction scalar intrinsics.
+        (enc::cssc_minmax(false, false, 0, 1, 2), 0x9ac2_6020, "smax x0, x1, x2"),
+        (enc::cssc_minmax(true, false, 0, 1, 2), 0x9ac2_6420, "umax x0, x1, x2"),
+        (enc::cssc_minmax(false, true, 0, 1, 2), 0x9ac2_6820, "smin x0, x1, x2"),
+        (enc::cssc_minmax(true, true, 0, 1, 2), 0x9ac2_6c20, "umin x0, x1, x2"),
+        (enc::cssc_cnt(0, 1), 0xdac0_1c20, "cnt x0, x1"),
+        (enc::cssc_abs(0, 1), 0xdac0_2020, "abs x0, x1"),
     ];
     for &(got, want, text) in cases {
         assert_eq!(got, want, "{text}: {got:#010x}, the manual's is {want:#010x}");

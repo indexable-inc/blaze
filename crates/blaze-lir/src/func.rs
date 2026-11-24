@@ -212,11 +212,22 @@ pub enum Conv {
     Wasm,
     /// `extern "rust-cold"`: LLVM's `preserve_mostcc`.
     PreserveMost,
+    /// Blaze zero-branch `Result`/`?` ABI: returns `(val, is_err)` with `val` in `X0` and
+    /// `is_err` in the CPU Carry flag (`C = 0` on `Ok`, `C = 1` on `Err`), preserving the
+    /// Return Address Stack (RAS) with zero tag register and single-instruction `b.cs` error branch.
+    BlazeResult,
 }
 
 impl Conv {
-    pub const ALL: [Conv; 6] =
-        [Conv::C, Conv::SysV64, Conv::Win64, Conv::Aapcs, Conv::Wasm, Conv::PreserveMost];
+    pub const ALL: [Conv; 7] = [
+        Conv::C,
+        Conv::SysV64,
+        Conv::Win64,
+        Conv::Aapcs,
+        Conv::Wasm,
+        Conv::PreserveMost,
+        Conv::BlazeResult,
+    ];
 
     pub const fn from_byte(byte: u8) -> Option<Conv> {
         match (byte as usize) < Conv::ALL.len() {
@@ -233,6 +244,7 @@ impl Conv {
             Conv::Aapcs => "aapcs",
             Conv::Wasm => "wasm",
             Conv::PreserveMost => "preserve_most",
+            Conv::BlazeResult => "blaze_result",
         }
     }
 

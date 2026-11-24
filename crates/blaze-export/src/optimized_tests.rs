@@ -11,7 +11,7 @@ use blaze_tier::record::{Declare, DeclaredKind, Declares, Emitted, LoopHeader, P
 
 use crate::check;
 use crate::export::export;
-use crate::input::{Data, DataPlace, DataWord, Entry, Function, Panic, Platform, ProgramIn, Tier, TlsRuntime};
+use crate::input::{Data, DataPlace, DataWord, Entry, Function, Panic, Platform, Profile, ProgramIn, Tier, TlsRuntime};
 use crate::macho;
 use crate::optimized::{Function02, Member02, ProgramIn02, export_optimized, lay_out_records, v1_to_v2};
 
@@ -78,8 +78,9 @@ impl Declares for BySpace {
 
 /// `v1`'s record in `bzcode03`, encoded.
 fn v2(v1: &[u8]) -> AVec<'static, u8> {
-    let mut out = Vec::new_in(Alloc::global());
-    v1_to_v2(CodeView::read(v1).unwrap(), &BySpace, &mut out, Alloc::global()).unwrap();
+    let alloc = Alloc::global();
+    let mut out = Vec::new_in(alloc);
+    v1_to_v2(CodeView::read(v1).unwrap(), &BySpace, &mut out, alloc).unwrap();
     out
 }
 
@@ -326,4 +327,103 @@ fn optimized_equals_export_with_rust_tls() {
             Platform::Wasm64 => {}
         }
     }
+}
+
+/// PGO C3 call-chain clustering + hot/cold partitioning + tail-call `b` (`Branch26`) patching:
+/// given hot profile `[hot_a, hot_b, hot_c]` where `hot_a` tail-calls `hot_c` directly via `b`
+/// (`0x1400_0000`, `Branch26`), `lay_out_records` clusters `hot_c` immediately after `hot_a`
+/// (before unrelated `hot_b`), partitions all hot functions before cold `main`/`cold_err`, and
+/// patches the `b` tail-call displacement to `hot_c`'s exact address in valid Mach-O & ELF outputs.
+#[test]
+fn pgo_c3_hot_chain_clustering_and_tail_call_branch26() {
+    const B_0: u32 = 0x1400_0000;
+    const MOV_W0_1: u32 = 0x5280_0020;
+    const MOV_W0_2: u32 = 0x5280_0040;
+    const MOV_W0_3: u32 = 0x5280_0060;
+    let alloc = Alloc::global();
+
+    // `main` (cold entry) calls `hot_a` and `cold_err`.
+    let mut main_e = Emitted::new_in(alloc);
+    code_of(&mut main_e, &[STP, MOV_FP, BL_0, BL_0, LDP, RET]);
+    main_e.targets.push(func("hot_a"));
+    main_e.targets.push(func("cold_err"));
+    main_e.relocs.push(Reloc { at: 8, in_relro: false, kind: RelocKind::Branch26, target: 0, addend: 0 });
+    main_e.relocs.push(Reloc { at: 12, in_relro: false, kind: RelocKind::Branch26, target: 1, addend: 0 });
+    let main = sealed(main_e);
+
+    // `hot_a` tail-calls `hot_c` via direct `b` (`Branch26`).
+    let mut hot_a_e = Emitted::new_in(alloc);
+    code_of(&mut hot_a_e, &[B_0]);
+    hot_a_e.targets.push(func("hot_c"));
+    hot_a_e.relocs.push(Reloc { at: 0, in_relro: false, kind: RelocKind::Branch26, target: 0, addend: 0 });
+    let hot_a = sealed(hot_a_e);
+
+    let mut hot_b_e = Emitted::new_in(alloc);
+    code_of(&mut hot_b_e, &[MOV_W0_1, RET]);
+    let hot_b = sealed(hot_b_e);
+
+    let mut hot_c_e = Emitted::new_in(alloc);
+    code_of(&mut hot_c_e, &[MOV_W0_2, RET]);
+    let hot_c = sealed(hot_c_e);
+
+    let mut cold_e = Emitted::new_in(alloc);
+    code_of(&mut cold_e, &[MOV_W0_3, RET]);
+    let cold_err = sealed(cold_e);
+
+    let members = [
+        Member02 { symbol: sym("main"), record: read(&main).unwrap(), tier: Some(Tier::Optimized) },
+        Member02 { symbol: sym("hot_a"), record: read(&hot_a).unwrap(), tier: Some(Tier::Optimized) },
+        Member02 { symbol: sym("hot_b"), record: read(&hot_b).unwrap(), tier: Some(Tier::Optimized) },
+        Member02 { symbol: sym("hot_c"), record: read(&hot_c).unwrap(), tier: Some(Tier::Optimized) },
+        Member02 { symbol: sym("cold_err"), record: read(&cold_err).unwrap(), tier: Some(Tier::Optimized) },
+    ];
+    let hot = [sym("hot_a"), sym("hot_b"), sym("hot_c")];
+    let profile = Profile { digest: [0x5A; 32], hot: &hot };
+    let laid = lay_out_records(&members, &[], sym("main"), Some(profile), macho::plan(), 0, alloc).unwrap();
+    let syms: Vec<Symbol, _> = {
+        let mut v = Vec::new_in(alloc);
+        for p in laid.placed.iter() {
+            v.push(p.symbol);
+        }
+        v
+    };
+    // C3 clusters `hot_a -> hot_c` tightly before unrelated `hot_b`, and all hot before cold!
+    assert_eq!(syms[0], sym("hot_a"));
+    assert_eq!(syms[1], sym("hot_c"));
+    assert_eq!(syms[2], sym("hot_b"));
+    assert!(syms[3] == sym("main") || syms[3] == sym("cold_err"));
+    assert!(syms[4] == sym("main") || syms[4] == sym("cold_err"));
+
+    // Verify the `b` tail-call instruction in `hot_a` reaches `hot_c` directly!
+    let ha_at = laid.placed[0].at;
+    let hc_at = laid.placed[1].at;
+    let b_word = read32(&laid.text, ha_at - laid.text_at);
+    assert_eq!(b_word >> 26, 0b000101, "tail call must remain an unconditional `b` (not `bl`)");
+    let imm26 = (((b_word & 0x03FF_FFFF) as i32) << 6) >> 6;
+    assert_eq!((ha_at as i64 + i64::from(imm26) * 4) as u64, hc_at);
+
+    // Export both Mach-O and ELF images with this PGO profile and check both!
+    let fs = [
+        Function02 { symbol: sym("main"), record: read(&main).unwrap(), tier: Tier::Optimized },
+        Function02 { symbol: sym("hot_a"), record: read(&hot_a).unwrap(), tier: Tier::Optimized },
+        Function02 { symbol: sym("hot_b"), record: read(&hot_b).unwrap(), tier: Tier::Optimized },
+        Function02 { symbol: sym("hot_c"), record: read(&hot_c).unwrap(), tier: Tier::Optimized },
+        Function02 { symbol: sym("cold_err"), record: read(&cold_err).unwrap(), tier: Tier::Optimized },
+    ];
+    let program = ProgramIn02 {
+        name: "pgo_c3",
+        functions: &fs,
+        data: &[],
+        entry: Entry::CMain { main: sym("main") },
+        panic: Panic::Abort,
+        personality: None,
+        tls: None,
+        profile: Some(profile),
+    };
+    let mut macho_out = Vec::new_in(alloc);
+    export_optimized(&program, Platform::MacosArm64, &mut macho_out, alloc).unwrap();
+    check::macho(&macho_out).unwrap();
+    let mut elf_out = Vec::new_in(alloc);
+    export_optimized(&program, Platform::LinuxArm64, &mut elf_out, alloc).unwrap();
+    check::elf(&elf_out).unwrap();
 }

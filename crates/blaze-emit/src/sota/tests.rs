@@ -58,10 +58,14 @@ impl Words for LeafWords {
 
 const MAC_ARM64: Machine = Machine { arch: Arch::Arm64, os: Os::MacOs, features: Machine::LSE };
 
+fn test_alloc() -> Alloc<'static> {
+    Alloc::global()
+}
+
 /// Places an `Emitted` record into executable memory on this Apple Silicon host.
 fn load_exec(emitted: Emitted<'static>) -> (Executable, usize) {
     let sealed = seal(emitted).expect("emitted record must seal cleanly");
-    let mut bytes: AVec<'static, u8> = Vec::new_in(Alloc::global());
+    let mut bytes: AVec<'static, u8> = Vec::new_in(test_alloc());
     encode(&sealed, &mut bytes);
     let view = read(&bytes).expect("encoded record must read back");
     let code_bytes = view.code().len();
@@ -934,7 +938,7 @@ fn sota_data_addr_func_addr_call_indirect_and_code_record_seal_on_hardware() {
 
     // 1. Verify `emitted_to_code_record` converts Load (Static + FuncAddr), Relro, and Call sites and seals cleanly!
     let emitted_copy = Sota::standalone().emit(v, &ExtNames, MAC_ARM64, Alloc::global()).unwrap();
-    let (code_rec, _insts) = super::emitted_to_code_record(emitted_copy, Alloc::global())
+    let (code_rec, _insts) = super::emitted_to_code_record(emitted_copy, &[], Alloc::global())
         .expect("DataAddr (Static + Relro), FuncAddr, and Call must convert to CodeRecord cleanly");
     assert_eq!(code_rec.sites.len(), 4, "expected 2 Load sites + 1 Relro site + 1 Call site");
     let has_load = code_rec.sites.iter().any(|s| s.kind == blaze_code::record::SiteKind::Load);
@@ -1023,4 +1027,485 @@ fn sota_data_addr_func_addr_call_indirect_and_code_record_seal_on_hardware() {
     let want_c = add_triple(add_triple(123, 100), 100) ^ TEST_STATIC_VAL ^ fn_addr;
     assert_eq!(run_fn_c(123, add_triple), want_c);
     drop(emitted);
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+mod std_readiness_tests {
+    use super::*;
+    use blaze_code::record::{CodeView, PositionField, PositionPart};
+    use blaze_code::unwind::{self, Action};
+    use blaze_lir::builder::{DataPosition, DataReloc, Facts};
+    use blaze_lir::func::ParamKind;
+
+    unsafe extern "C" {
+        fn memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut u8;
+        fn memmove(dst: *mut u8, src: *const u8, n: usize) -> *mut u8;
+        fn memset(dst: *mut u8, c: i32, n: usize) -> *mut u8;
+        fn memcmp(a: *const u8, b: *const u8, n: usize) -> i32;
+        fn fmod(x: f64, y: f64) -> f64;
+        fn fmodf(x: f32, y: f32) -> f32;
+    }
+
+    extern "C" fn rt_udivti3(a: u128, b: u128) -> u128 {
+        a / b
+    }
+    extern "C" fn rt_divti3(a: i128, b: i128) -> i128 {
+        a / b
+    }
+    extern "C" fn rt_umodti3(a: u128, b: u128) -> u128 {
+        a % b
+    }
+    extern "C" fn rt_modti3(a: i128, b: i128) -> i128 {
+        a % b
+    }
+
+    struct SymWords<'a> {
+        got: &'a mut [u64],
+        next_slot: usize,
+        extra: &'a [(Symbol, u64)],
+        page: u64,
+    }
+
+    impl<'a> SymWords<'a> {
+        fn new(got: &'a mut [u64], extra: &'a [(Symbol, u64)], page: u64) -> Self {
+            Self { got, next_slot: 0, extra, page }
+        }
+
+        fn lookup(&self, target: Target) -> Option<u64> {
+            for &(s, addr) in self.extra {
+                if s == target.symbol {
+                    return Some(addr);
+                }
+            }
+            if target.space == Space::Outside {
+                let s = target.symbol;
+                if s == Symbol::of_name(POLL_PAGE) {
+                    return Some(self.page);
+                }
+                if s == Symbol::of_name("memcpy") {
+                    return Some(memcpy as *const () as usize as u64);
+                }
+                if s == Symbol::of_name("memmove") {
+                    return Some(memmove as *const () as usize as u64);
+                }
+                if s == Symbol::of_name("memset") {
+                    return Some(memset as *const () as usize as u64);
+                }
+                if s == Symbol::of_name("memcmp") {
+                    return Some(memcmp as *const () as usize as u64);
+                }
+                if s == Symbol::of_name("fmod") {
+                    return Some(fmod as *const () as usize as u64);
+                }
+                if s == Symbol::of_name("fmodf") {
+                    return Some(fmodf as *const () as usize as u64);
+                }
+                if s == Symbol::of_name("__udivti3") {
+                    return Some(rt_udivti3 as *const () as usize as u64);
+                }
+                if s == Symbol::of_name("__divti3") {
+                    return Some(rt_divti3 as *const () as usize as u64);
+                }
+                if s == Symbol::of_name("__umodti3") {
+                    return Some(rt_umodti3 as *const () as usize as u64);
+                }
+                if s == Symbol::of_name("__modti3") {
+                    return Some(rt_modti3 as *const () as usize as u64);
+                }
+            }
+            None
+        }
+    }
+
+    impl Words for SymWords<'_> {
+        fn word(&mut self, target: Target, _call: bool) -> Result<u64, ImageError> {
+            let addr = self.lookup(target).ok_or(ImageError::Unbound { target })?;
+            let idx = self.next_slot;
+            self.next_slot += 1;
+            self.got[idx] = addr;
+            Ok(core::ptr::addr_of!(self.got[idx]) as u64)
+        }
+
+        fn value(&mut self, target: Target) -> Result<u64, ImageError> {
+            self.lookup(target).ok_or(ImageError::Unbound { target })
+        }
+    }
+
+    fn load_exec_with_syms(mut emitted: Emitted<'static>, extra: &[(Symbol, u64)]) -> (Executable, ()) {
+        struct BoundDeclares;
+        impl blaze_tier::record::Declares for BoundDeclares {
+            fn declared(&self, t: Target) -> Option<blaze_tier::record::Declare<'_>> {
+                (t.space == Space::Func).then_some(blaze_tier::record::Declare {
+                    kind: blaze_tier::record::DeclaredKind::Bound,
+                    item: 0,
+                    name: &[],
+                })
+            }
+        }
+        blaze_tier::record::declare(&mut emitted, &BoundDeclares).expect("declare");
+        let sealed = seal(emitted).expect("seal");
+        let mut bytes: AVec<'static, u8> = Vec::new_in(test_alloc());
+        encode(&sealed, &mut bytes);
+        let view = read(&bytes).expect("read");
+        let code_bytes = view.code().len();
+        let relro_len = view.relro().len();
+        let align = 8usize.max(1usize << view.relro_align());
+        let got_bytes = 64 * 8;
+        let sym = Symbol::of_name("sota_std_test");
+        let mut done: Result<(), PlaceError> = Ok(());
+        let exec = Executable::written(code_bytes, 8192 + relro_len + align + got_bytes + 8, |code, data| {
+            let poll_skip = (4096 - data.as_ptr() as usize % 4096) % 4096;
+            let (poll_and_pad, after_poll) = data.split_at_mut(poll_skip + 4096);
+            let poll = &mut poll_and_pad[poll_skip..];
+            poll.fill(0);
+            let skip = (align - after_poll.as_ptr() as usize % align) % align;
+            let (relro, rest) = after_poll[skip..].split_at_mut(relro_len);
+            let got_skip = (8 - rest.as_ptr() as usize % 8) % 8;
+            let got_slice = &mut rest[got_skip..got_skip + got_bytes];
+            // SAFETY: `got_slice` is 8-byte aligned and `64 * 8` bytes long inside `Executable`'s data region
+            // adjacent to `code` (guaranteed within ARM64 `adrp` ±4 GiB reach under any ASLR).
+            let got_u64 = unsafe { core::slice::from_raw_parts_mut(got_slice.as_mut_ptr() as *mut u64, 64) };
+            let at = At { code: code.as_ptr() as u64, relro: relro.as_ptr() as u64 };
+            let mut words = SymWords::new(got_u64, extra, poll.as_ptr() as u64);
+            done = place(&view, sym, at, &mut words, code, relro);
+        })
+        .expect("exec");
+        done.expect("place");
+        (exec, ())
+    }
+
+    #[test]
+    fn sota_std_bulk_mem_and_frem_on_hardware() {
+        let alloc = test_alloc();
+        // 1. Dynamic `memcpy`, overlapping `memmove`, `> 256 B` `memset`, dynamic `memcmp`.
+        let bulk_fn = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::I64)],
+                &[Param::of(Ty::I32)],
+            );
+            b.set_signature(sig);
+            let e = b.create_block(BlockKind::Normal);
+            b.begin(e);
+            let dst = b.param(Ty::PTR);
+            let src = b.param(Ty::PTR);
+            let n = b.param(Ty::I64);
+            b.bulk(Op::Memcpy, Flags::NONE, dst, src, n, MemAttrs::default());
+            let k4 = b.iconst(Ty::I64, 4);
+            let dst4 = b.ptr_add(Flags::NONE, dst, k4);
+            let nm4 = b.binary(Op::Sub, Flags::NONE, n, k4);
+            b.bulk(Op::Memmove, Flags::NONE, dst4, dst, nm4, MemAttrs::default());
+            let cmp = b.memcmp(dst4, src, nm4, MemAttrs::default());
+            b.ret(&[cmp]);
+            b.finish_checked().unwrap()
+        };
+        let em = Sota::standalone().emit(verify(bulk_fn.view()).unwrap(), &NoNames, MAC_ARM64, alloc).unwrap();
+        let (ex, _slots) = load_exec_with_syms(em, &[]);
+        let f_bulk: extern "C" fn(*mut u8, *const u8, u64) -> i32 = unsafe { ex.as_fn() };
+        let src: [u8; 400] = core::array::from_fn(|i| ((i * 37 + 11) & 0xff) as u8);
+        let mut dst = [0u8; 400];
+        let cmp = f_bulk(dst.as_mut_ptr(), src.as_ptr(), 400);
+        assert_eq!(cmp, 0, "dynamic memcpy + overlapping memmove + memcmp mismatch!");
+        assert_eq!(&dst[4..400], &src[0..396]);
+
+        // 2. `> 256 B` (400 B) `memset`
+        let memset_fn = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR), Param::of(Ty::I8)], &[]);
+            b.set_signature(sig);
+            let e = b.create_block(BlockKind::Normal);
+            b.begin(e);
+            let dst = b.param(Ty::PTR);
+            let byte = b.param(Ty::I8);
+            let n = b.iconst(Ty::I64, 400);
+            b.bulk(Op::Memset, Flags::NONE, dst, byte, n, MemAttrs::default());
+            b.ret(&[]);
+            b.finish_checked().unwrap()
+        };
+        let em_ms = Sota::standalone().emit(verify(memset_fn.view()).unwrap(), &NoNames, MAC_ARM64, alloc).unwrap();
+        let (ex_ms, _s2) = load_exec_with_syms(em_ms, &[]);
+        let f_ms: extern "C" fn(*mut u8, u8) = unsafe { ex_ms.as_fn() };
+        let mut buf = [0u8; 400];
+        f_ms(buf.as_mut_ptr(), 0xab);
+        assert!(buf.iter().all(|&x| x == 0xab), "400-byte runtime memset mismatch!");
+
+        // 3. `f64` `Op::Frem` (`fmod`)
+        let frem_fn = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::F64), Param::of(Ty::F64)], &[Param::of(Ty::F64)]);
+            b.set_signature(sig);
+            let e = b.create_block(BlockKind::Normal);
+            b.begin(e);
+            let x = b.param(Ty::F64);
+            let y = b.param(Ty::F64);
+            let r = b.binary(Op::Frem, Flags::NONE, x, y);
+            b.ret(&[r]);
+            b.finish_checked().unwrap()
+        };
+        let em_fr = Sota::standalone().emit(verify(frem_fn.view()).unwrap(), &NoNames, MAC_ARM64, alloc).unwrap();
+        let (ex_fr, _s3) = load_exec_with_syms(em_fr, &[]);
+        let f_fr: extern "C" fn(f64, f64) -> f64 = unsafe { ex_fr.as_fn() };
+        assert!((f_fr(17.5, 4.0) - 1.5).abs() < 1e-12, "f64 frem mismatch!");
+    }
+
+    #[test]
+    fn sota_std_stacked_args_byval_and_i128_div_on_hardware() {
+        let alloc = test_alloc();
+        let mut byval_param = Param::of(Ty::PTR);
+        byval_param.kind = ParamKind::Byval;
+        byval_param.facts = Facts { size: 48, align: 3, ..Facts::default() };
+
+        let mut callee_params: AVec<'static, Param> = Vec::new_in(alloc);
+        for _ in 0..10 {
+            callee_params.push(Param::of(Ty::I64));
+        }
+        callee_params.push(byval_param);
+        for _ in 0..10 {
+            callee_params.push(Param::of(Ty::F64));
+        }
+
+        let callee_fn = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &callee_params, &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let e = b.create_block(BlockKind::Normal);
+            b.begin(e);
+            let mut gprs: AVec<'static, blaze_lir::Val> = Vec::new_in(alloc);
+            for _ in 0..10 {
+                gprs.push(b.param(Ty::I64));
+            }
+            let bv_ptr = b.param(Ty::PTR);
+            let mut fps: AVec<'static, blaze_lir::Val> = Vec::new_in(alloc);
+            for _ in 0..10 {
+                fps.push(b.param(Ty::F64));
+            }
+            let mut sum = gprs[0];
+            for &g in &gprs[1..] {
+                sum = b.binary(Op::Add, Flags::NONE, sum, g);
+            }
+            for k in 0..6i32 {
+                let field = b.load(Ty::I64, Flags::NONE, bv_ptr, k * 8, MemAttrs::default());
+                sum = b.binary(Op::Add, Flags::NONE, sum, field);
+            }
+            let poison = b.iconst(Ty::I64, 0xdead);
+            b.store(Flags::NONE, poison, bv_ptr, 0, MemAttrs::default());
+            let mut fsum = fps[0];
+            for &fv in &fps[1..] {
+                fsum = b.binary(Op::Fadd, Flags::NONE, fsum, fv);
+            }
+            let fi = b.convert(Op::FptoSi, Flags::NONE, Ty::I64, fsum);
+            let total = b.binary(Op::Add, Flags::NONE, sum, fi);
+            b.ret(&[total]);
+            b.finish_checked().unwrap()
+        };
+
+        let callee_em = Sota::standalone().emit(verify(callee_fn.view()).unwrap(), &NoNames, MAC_ARM64, alloc).unwrap();
+        let (callee_ex, _cs) = load_exec_with_syms(callee_em, &[]);
+        let callee_addr = unsafe { callee_ex.as_fn::<extern "C" fn()>() as usize as u64 };
+        let callee_sym = Symbol::of_name("stacked_byval_callee");
+
+        struct CalleeName(Symbol);
+        impl Names for CalleeName {
+            fn name(&self, of: Outside) -> Option<blaze_tier::Named<'_>> {
+                match of {
+                    Outside::Func(0) => Some(blaze_tier::Named::Symbol(self.0)),
+                    _ => None,
+                }
+            }
+            fn routines(&self) -> RoutinePlaces {
+                RoutinePlaces::NONE
+            }
+        }
+
+        let caller_fn = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let csig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR)], &[Param::of(Ty::I64)]);
+            b.set_signature(csig);
+            let target_sig = b.sig(Conv::C, Variadic::No, &callee_params, &[Param::of(Ty::I64)]);
+            let target_ref = b.reference(RefKind::Func, 0);
+            let e = b.create_block(BlockKind::Normal);
+            b.begin(e);
+            let src_struct = b.param(Ty::PTR);
+            let mut args: AVec<'static, blaze_lir::Val> = Vec::new_in(alloc);
+            for k in 1u64..=10 {
+                args.push(b.iconst(Ty::I64, u128::from(k * 10)));
+            }
+            args.push(src_struct);
+            for k in 1u64..=10 {
+                args.push(b.fconst(Ty::F64, u128::from(((k as f64) * 2.0).to_bits())));
+            }
+            let r = b.call(Flags::NONE, target_ref, target_sig, &args);
+            b.ret(&[r]);
+            b.finish_checked().unwrap()
+        };
+        let caller_em = Sota::standalone()
+            .emit(verify(caller_fn.view()).unwrap(), &CalleeName(callee_sym), MAC_ARM64, alloc)
+            .unwrap();
+        let (caller_ex, _ks) = load_exec_with_syms(caller_em, &[(callee_sym, callee_addr)]);
+        let f_caller: extern "C" fn(*const u64) -> i64 = unsafe { caller_ex.as_fn() };
+        let orig_struct: [u64; 6] = [100, 200, 300, 400, 500, 600];
+        let got = f_caller(orig_struct.as_ptr());
+        assert_eq!(got, 2760, "stacked GPR + stacked FP + stacked byval sum mismatch!");
+        assert_eq!(orig_struct[0], 100, "byval callee mutation leaked into caller struct!");
+
+        let i128_fn = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I128), Param::of(Ty::I128)],
+                &[Param::of(Ty::I128)],
+            );
+            b.set_signature(sig);
+            let e = b.create_block(BlockKind::Normal);
+            b.begin(e);
+            let a = b.param(Ty::I128);
+            let d = b.param(Ty::I128);
+            let q = b.binary(Op::Sdiv, Flags::NONE, a, d);
+            let r = b.binary(Op::Srem, Flags::NONE, a, d);
+            let sum = b.binary(Op::Add, Flags::NONE, q, r);
+            b.ret(&[sum]);
+            b.finish_checked().unwrap()
+        };
+        let em_128 = Sota::standalone().emit(verify(i128_fn.view()).unwrap(), &NoNames, MAC_ARM64, alloc).unwrap();
+        let (ex_128, _s128) = load_exec_with_syms(em_128, &[]);
+        let f_128: extern "C" fn(i128, i128) -> i128 = unsafe { ex_128.as_fn() };
+        let a: i128 = -100_000_000_000_000_000_000_000_007;
+        let d: i128 = 97;
+        assert_eq!(f_128(a, d), (a / d) + (a % d), "i128 sdiv/srem mismatch on hardware!");
+    }
+
+    #[test]
+    fn sota_std_tls_and_data_relocs_and_positions_record() {
+        let alloc = test_alloc();
+        struct TlsStaticNames;
+        impl Names for TlsStaticNames {
+            fn name(&self, of: Outside) -> Option<blaze_tier::Named<'_>> {
+                match of {
+                    Outside::Static(0) => Some(blaze_tier::Named::Symbol(Symbol::of_name("sym_static_0"))),
+                    Outside::Tls(0) => Some(blaze_tier::Named::Symbol(Symbol::of_name("sym_tls_0"))),
+                    _ => None,
+                }
+            }
+            fn routines(&self) -> RoutinePlaces {
+                RoutinePlaces::NONE
+            }
+        }
+
+        let func = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[], &[Param::of(Ty::PTR)]);
+            b.set_signature(sig);
+            let st_ref = b.reference(RefKind::Static, 0);
+            let tls_ref = b.reference(RefKind::Tls, 0);
+            let bytes = [0u8; 16];
+            let relocs = [DataReloc { offset: 0, target: st_ref, addend: 8 }];
+            let pos = [DataPosition {
+                offset: 8,
+                item: 0x1122_3344_5566_7788_99aa_bbcc_ddee_ff00u128,
+                site: 42,
+                field: blaze_lir::PositionField::Line,
+            }];
+            let data_ref = b.data_with_positions(&bytes, 3, &relocs, &pos);
+            let e = b.create_block(BlockKind::Normal);
+            b.begin(e);
+            let p_data = b.data_addr(data_ref);
+            let p_tls = b.tls_addr(tls_ref);
+            let _v = b.load(Ty::I64, Flags::VOLATILE, p_tls, 0, MemAttrs::default());
+            b.ret(&[p_data]);
+            b.finish_checked().unwrap()
+        };
+
+        let isa = crate::Isa { os: crate::Os::MacOs, lse: true };
+        let (rec, _insts, _called) = crate::emit_sota_record_measured(
+            verify(func.view()).unwrap(),
+            &TlsStaticNames,
+            &RoutinePlaces::NONE,
+            isa,
+            &[],
+            alloc,
+        )
+        .expect("Sota must emit DataAddr relocs + PositionRow + TlsAddr cleanly");
+        assert_eq!(rec.words.len(), 1, "expected 1 relro Word relocation");
+        assert_eq!(rec.words[0].addend, 8);
+        assert_eq!(rec.positions.len(), 1, "expected 1 PositionRow slot");
+        assert_eq!(rec.positions[0].part, PositionPart::Relro);
+        assert_eq!(rec.positions[0].field, PositionField::Line);
+        assert_eq!(rec.positions[0].site, 42);
+        let sealed = rec.seal().expect("Sota CodeRecord with words+positions+TLS must seal cleanly");
+        let mut enc_bytes: AVec<'static, u8> = Vec::new_in(alloc);
+        sealed.encode(&mut enc_bytes);
+        let view = CodeView::read(&enc_bytes).expect("encoded CodeRecord must read back");
+        assert_eq!(view.words(), 1);
+        assert_eq!(view.positions(), 1);
+    }
+
+    #[test]
+    fn sota_std_invoke_resume_and_unwind_table() {
+        let alloc = test_alloc();
+        struct UnwNames;
+        impl Names for UnwNames {
+            fn name(&self, of: Outside) -> Option<blaze_tier::Named<'_>> {
+                match of {
+                    Outside::Func(0) => Some(blaze_tier::Named::Symbol(Symbol::of_name("unw_may_panic"))),
+                    Outside::Func(1) => Some(blaze_tier::Named::Symbol(Symbol::of_name("unw_dropper"))),
+                    Outside::Func(2) => Some(blaze_tier::Named::Symbol(Symbol::of_name("unw_plain"))),
+                    _ => None,
+                }
+            }
+            fn routines(&self) -> RoutinePlaces {
+                RoutinePlaces::NONE
+            }
+        }
+
+        let func = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[], &[]);
+            b.set_signature(sig);
+            let none = b.sig(Conv::C, Variadic::No, &[], &[]);
+            let one_ptr = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR)], &[]);
+            let may_panic = b.reference(RefKind::Func, 0);
+            let dropper = b.reference(RefKind::Func, 1);
+            let plain = b.reference(RefKind::Func, 2);
+            let entry = b.create_block(BlockKind::Normal);
+            let normal = b.create_block(BlockKind::Normal);
+            let pad = b.create_block(BlockKind::Cleanup);
+            b.begin(entry);
+            b.call(Flags::NONE, plain, none, &[]);
+            b.invoke(Flags::NONE, may_panic, none, &[], normal, pad);
+            b.begin(normal);
+            b.ret(&[]);
+            b.begin(pad);
+            let exception = b.param(Ty::PTR);
+            b.call(Flags::NONE, dropper, one_ptr, &[exception]);
+            b.resume(exception);
+            b.finish_checked().unwrap()
+        };
+
+        let isa = crate::Isa { os: crate::Os::MacOs, lse: true };
+        let (rec, _insts, _called) = crate::emit_sota_record_measured(
+            verify(func.view()).unwrap(),
+            &UnwNames,
+            &RoutinePlaces::NONE,
+            isa,
+            &[],
+            alloc,
+        )
+        .expect("Sota must emit Invoke/Resume/Cleanup cleanly");
+        let sealed = rec.seal().expect("Sota unwind CodeRecord must seal cleanly");
+        let mut bytes: AVec<'static, u8> = Vec::new_in(alloc);
+        sealed.encode(&mut bytes);
+        let view = CodeView::read(&bytes).expect("read back");
+        assert_eq!(view.name(Symbol::of_name("_Unwind_Resume")), Some("_Unwind_Resume"));
+        let rows = unwind::read(view).expect("Sota unwind rows must be well formed");
+        assert_eq!(rows.rows(), 3, "plain(Continue), may_panic(Cleanup), _Unwind_Resume(Continue); dropper inside cleanup has NONE!");
+        assert_eq!(rows.row(0).action, Action::Continue);
+        assert_eq!(rows.row(0).landing, 0);
+        assert_eq!(rows.row(1).action, Action::Cleanup);
+        assert!(rows.row(1).landing > 0 && rows.row(1).landing < view.code().len() as u32);
+        assert_eq!(rows.row(2).action, Action::Continue);
+        assert_eq!(rows.row(2).landing, 0);
+    }
 }
