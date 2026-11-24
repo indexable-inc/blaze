@@ -598,6 +598,224 @@ fn compute_dom_tree<A: Allocator + Copy>(
     (idom, children)
 }
 
+#[inline]
+fn inst_writes_mem(op: Op, flags: Flags) -> bool {
+    match op {
+        Op::Load => flags.contains(Flags::VOLATILE),
+        Op::Store
+        | Op::Call
+        | Op::CallIndirect
+        | Op::Invoke
+        | Op::InvokeIndirect
+        | Op::Memcpy
+        | Op::Memmove
+        | Op::Memset
+        | Op::MaskedStore
+        | Op::Scatter
+        | Op::AtomicLoad
+        | Op::AtomicStore
+        | Op::AtomicRmw
+        | Op::Cmpxchg
+        | Op::Fence
+        | Op::Asm
+        | Op::AsmBr
+        | Op::TargetIntrinsic
+        | Op::Suspend
+        | Op::SlotLive
+        | Op::SlotDead => true,
+        _ => false,
+    }
+}
+
+/// Computes, for every block `b`, whether `b` can soundly inherit `idom[b]`'s end-of-block
+/// `mem_known` table.
+///
+/// A reachable non-entry block `b` with `d = idom[b]` can inherit `d`'s `mem_known` iff no path
+/// from the end of `d` to the start of `b` (without revisiting `d`) passes through a block that
+/// writes memory or synchronizes. Direct single-predecessor edges pass in O(1); multi-predecessor
+/// blocks (read-only loops with cold trap exits, write-free diamonds) use a bounded backward walk
+/// over a flat CSR predecessor table.
+fn compute_can_inherit_idom_mem<A: Allocator + Copy>(
+    view: &View<'_>,
+    reached: &[bool],
+    idom: &[u32],
+    alloc: &A,
+) -> Vec<bool, A> {
+    const MAX_MEM_PATH_VISITS: usize = 64;
+
+    let blocks = view.blocks();
+    let mut pred_deg: Vec<u32, A> = filled(blocks, 0, alloc);
+    let mut only_idom_pred = filled(blocks, true, alloc);
+    if let Some(slot) = only_idom_pred.first_mut() {
+        *slot = false;
+    }
+
+    // Pass 1: count reachable predecessor edges per block and detect the single-idom fast path.
+    let mut total_edges: usize = 0;
+    for pred in 0..blocks {
+        if !reached.get(pred).copied().unwrap_or(false) {
+            continue;
+        }
+        let pred_u32 = usize_u32(pred);
+        let term = view.terminator(Block(pred_u32));
+        each(view, term, |item| {
+            if let Item::Edge(edge) = item {
+                let to = u32_ix(edge.block);
+                if to < blocks && reached.get(to).copied().unwrap_or(false) {
+                    if let Some(deg) = pred_deg.get_mut(to) {
+                        *deg = deg.saturating_add(1);
+                    }
+                    total_edges = total_edges.saturating_add(1);
+                    if idom.get(to).copied() != Some(pred_u32) {
+                        set_at(&mut only_idom_pred, to, false);
+                    }
+                }
+            }
+        });
+    }
+
+    // Pass 2: populate flat CSR predecessor table (`pred_offsets` + `pred_list`) in `alloc`.
+    let mut pred_offsets: Vec<u32, A> = Vec::with_capacity_in(blocks.saturating_add(1), *alloc);
+    let mut pred_cursor: Vec<u32, A> = Vec::with_capacity_in(blocks, *alloc);
+    let mut acc: u32 = 0;
+    pred_offsets.push(0);
+    for b in 0..blocks {
+        pred_cursor.push(acc);
+        acc = acc.saturating_add(get_u32(&pred_deg, b).unwrap_or(0));
+        pred_offsets.push(acc);
+    }
+    let mut pred_list: Vec<u32, A> = filled(total_edges, NONE, alloc);
+    for pred in 0..blocks {
+        if !reached.get(pred).copied().unwrap_or(false) {
+            continue;
+        }
+        let pred_u32 = usize_u32(pred);
+        let term = view.terminator(Block(pred_u32));
+        each(view, term, |item| {
+            if let Item::Edge(edge) = item {
+                let to = u32_ix(edge.block);
+                if to < blocks
+                    && reached.get(to).copied().unwrap_or(false)
+                    && let Some(cur) = pred_cursor.get_mut(to)
+                {
+                    let pos = u32_ix(*cur);
+                    *cur = cur.saturating_add(1);
+                    set_at(&mut pred_list, pos, pred_u32);
+                }
+            }
+        });
+    }
+
+    // Classify reachable blocks that may write memory or synchronize.
+    // Dead-end trap/unreachable blocks have no outgoing CFG edges and can never appear on any
+    // path from `idom[b]` to `b`.
+    let mut writes_mem = filled(blocks, false, alloc);
+    for blk in 0..blocks {
+        if !reached.get(blk).copied().unwrap_or(false) {
+            continue;
+        }
+        let blk_u32 = usize_u32(blk);
+        let term_op = view.op(view.terminator(Block(blk_u32)));
+        if matches!(term_op, Op::Trap | Op::Unreachable) {
+            continue;
+        }
+        for inst in view.block(Block(blk_u32)) {
+            let op = view.op(inst);
+            let flags = Flags(get_u8(view.flags, inst).unwrap_or(0));
+            if inst_writes_mem(op, flags) {
+                set_at(&mut writes_mem, blk, true);
+                break;
+            }
+        }
+    }
+
+    // Determine `can_inherit_idom_mem[b]` for every reachable non-entry block `b`.
+    let mut can_inherit = filled(blocks, false, alloc);
+    let mut seen_stamp: Vec<u32, A> = filled(blocks, 0, alloc);
+    let mut work: Vec<u32, A> = Vec::with_capacity_in(MAX_MEM_PATH_VISITS, *alloc);
+    let mut stamp: u32 = 0;
+
+    for b in 1..blocks {
+        if !reached.get(b).copied().unwrap_or(false) {
+            continue;
+        }
+        let d = get_u32(idom, b).unwrap_or(NONE);
+        if get_u32(&pred_deg, b).unwrap_or(0) == 0 || d == NONE {
+            continue;
+        }
+        if only_idom_pred.get(b).copied().unwrap_or(false) {
+            set_at(&mut can_inherit, b, true);
+            continue;
+        }
+
+        stamp = stamp.wrapping_add(1);
+        if stamp == 0 {
+            for s in seen_stamp.iter_mut() {
+                *s = 0;
+            }
+            stamp = 1;
+        }
+        work.clear();
+
+        let mut visited: usize = 0;
+        let mut write_free = true;
+
+        let b_start = get_u32(&pred_offsets, b).map(u32_ix).unwrap_or(0);
+        let b_end = get_u32(&pred_offsets, b.saturating_add(1)).map(u32_ix).unwrap_or(b_start);
+        for &p in pred_list.get(b_start..b_end).unwrap_or(&[]) {
+            if p == d {
+                continue;
+            }
+            let pi = u32_ix(p);
+            if get_u32(&seen_stamp, pi) == Some(stamp) {
+                continue;
+            }
+            visited = visited.saturating_add(1);
+            if visited > MAX_MEM_PATH_VISITS {
+                write_free = false;
+                break;
+            }
+            set_at(&mut seen_stamp, pi, stamp);
+            work.push(p);
+        }
+
+        if write_free {
+            'walk: while let Some(u) = work.pop() {
+                let ui = u32_ix(u);
+                if writes_mem.get(ui).copied().unwrap_or(true) {
+                    write_free = false;
+                    break;
+                }
+                let u_start = get_u32(&pred_offsets, ui).map(u32_ix).unwrap_or(0);
+                let u_end =
+                    get_u32(&pred_offsets, ui.saturating_add(1)).map(u32_ix).unwrap_or(u_start);
+                for &q in pred_list.get(u_start..u_end).unwrap_or(&[]) {
+                    if q == d {
+                        continue;
+                    }
+                    let qi = u32_ix(q);
+                    if get_u32(&seen_stamp, qi) == Some(stamp) {
+                        continue;
+                    }
+                    visited = visited.saturating_add(1);
+                    if visited > MAX_MEM_PATH_VISITS {
+                        write_free = false;
+                        break 'walk;
+                    }
+                    set_at(&mut seen_stamp, qi, stamp);
+                    work.push(q);
+                }
+            }
+        }
+
+        if write_free {
+            set_at(&mut can_inherit, b, true);
+        }
+    }
+
+    can_inherit
+}
+
 /// Runs the single-pass dominator-scoped Acyclic E-Graph (`aegraph`) optimizer over `view`,
 /// followed by dead-code elimination, returning a verified [`Func`] and optimization telemetry.
 pub fn aegraph_optimize<A: Allocator + Copy>(
@@ -642,37 +860,7 @@ fn aegraph_optimize_inner<A: Allocator + Copy>(
     let mut mem_known: Vec<(u32, i32, u16, u8, u32), A> = Vec::new_in(alloc);
     let mut mem_saved: Vec<(u32, i32, u16, u8, u32), A> = Vec::new_in(alloc);
 
-    // A reachable non-entry block `b` soundly inherits `idom[b]`'s end-of-block `mem_known` iff
-    // `b` has at least one reachable predecessor and EVERY reachable predecessor edge into `b`
-    // comes directly from `idom[b]` (so no other path, merge, or back-edge can clobber memory).
-    let mut has_pred = filled(blocks, false, &alloc);
-    let mut only_idom_pred = filled(blocks, true, &alloc);
-    if let Some(slot) = only_idom_pred.first_mut() {
-        *slot = false;
-    }
-    for pred in 0..blocks {
-        if !reached.get(pred).copied().unwrap_or(false) {
-            continue;
-        }
-        let pred_u32 = usize_u32(pred);
-        let term = view.terminator(Block(pred_u32));
-        each(&view, term, |item| {
-            if let Item::Edge(edge) = item {
-                let to = u32_ix(edge.block);
-                if to < blocks && reached.get(to).copied().unwrap_or(false) {
-                    set_at(&mut has_pred, to, true);
-                    if idom.get(to).copied() != Some(pred_u32) {
-                        set_at(&mut only_idom_pred, to, false);
-                    }
-                }
-            }
-        });
-    }
-    for b in 0..blocks {
-        if !has_pred.get(b).copied().unwrap_or(false) || idom.get(b).copied().unwrap_or(NONE) == NONE {
-            set_at(&mut only_idom_pred, b, false);
-        }
-    }
+    let can_inherit_idom_mem = compute_can_inherit_idom_mem(&view, &reached, &idom, &alloc);
 
     // Explicit DFS over the dominator tree with scoped hash-consing and memory-state rollback.
     enum Frame {
@@ -704,7 +892,7 @@ fn aegraph_optimize_inner<A: Allocator + Copy>(
                     dfs.push(Frame::Enter(child));
                 }
 
-                if !only_idom_pred.get(u32_ix(b)).copied().unwrap_or(false) {
+                if !can_inherit_idom_mem.get(u32_ix(b)).copied().unwrap_or(false) {
                     mem_known.clear();
                 }
                 let range = view.block(Block(b));
@@ -714,7 +902,8 @@ fn aegraph_optimize_inner<A: Allocator + Copy>(
                     let ty = Ty(view.tys[inst]);
 
                     // Sound store-to-load forwarding & redundant non-volatile load GVN across
-                    // local and single-predecessor dominated edges.
+                    // local and write-free dominated CFG paths (single-pred edges, read-only loops
+                    // and write-free diamonds).
                     match op {
                         Op::Load if !flags.contains(Flags::VOLATILE) => {
                             let Some(at) = get_u32(view.data, inst).map(u32_ix) else { continue };
@@ -3959,6 +4148,213 @@ mod tests {
             assert_eq!(before, after, "diamond join mismatch on ({xv}, {fv})");
             match after {
                 Outcome::Returned(vals) => assert_eq!(vals.as_slice(), &[Val::Int(u128::from(expected))]),
+                other => panic!("expected Returned, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn aegraph_forwards_load_across_read_only_loop() {
+        use crate::{builder::MemAttrs, func::SlotKind};
+
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut b = Builder::<_, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let s_src = b.slot(8, 3, SlotKind::Temp);
+        let s_a = b.slot(8, 3, SlotKind::Temp);
+        let s_b = b.slot(32, 3, SlotKind::Temp);
+        let [b0, b_hdr, b_trap, b_check, b_latch, b_after] =
+            [(); 6].map(|_| b.create_block(BlockKind::Normal));
+
+        b.begin(b0);
+        let x = b.param(Ty::I64);
+        let k = b.param(Ty::I64);
+        let p_src = b.slot_addr(s_src);
+        let p_a = b.slot_addr(s_a);
+        let p_b = b.slot_addr(s_b);
+        let c10 = b.iconst(Ty::I64, 10);
+        let c20 = b.iconst(Ty::I64, 20);
+        let c30 = b.iconst(Ty::I64, 30);
+        let c40 = b.iconst(Ty::I64, 40);
+        b.store(Flags::NONE, c10, p_b, 0, MemAttrs::aligned(3));
+        b.store(Flags::NONE, c20, p_b, 8, MemAttrs::aligned(3));
+        b.store(Flags::NONE, c30, p_b, 16, MemAttrs::aligned(3));
+        b.store(Flags::NONE, c40, p_b, 24, MemAttrs::aligned(3));
+        let c8 = b.iconst(Ty::I64, 8);
+        b.store(Flags::NONE, x, p_src, 0, MemAttrs::aligned(3));
+        // `Memmove` clears `mem_known` so `v = load(p_a, 0)` is a genuine load, not store-forwarded.
+        b.bulk(Op::Memmove, Flags::NONE, p_a, p_src, c8, MemAttrs::aligned(3));
+        let v = b.load(Ty::I64, Flags::NONE, p_a, 0, MemAttrs::aligned(3));
+        let j0 = b.iconst(Ty::I64, 3);
+        b.jump((b_hdr, &[j0]));
+
+        // Read-only loop `while load(p_b[j]) > k { j -= 1 }` with a cold trap side-exit.
+        b.begin(b_hdr);
+        let j = b.param(Ty::I64);
+        let c4 = b.iconst(Ty::I64, 4);
+        let in_bounds = b.icmp(IntCond::Ult, j, c4);
+        b.br(Flags::NONE, in_bounds, (b_check, &[]), (b_trap, &[]));
+
+        // Cold dead-end trap block: even a write here can never reach the loop or `b_after`.
+        b.begin(b_trap);
+        let c_bad = b.iconst(Ty::I64, 777);
+        b.store(Flags::NONE, c_bad, p_a, 0, MemAttrs::aligned(3));
+        b.trap(1);
+
+        b.begin(b_check);
+        let c8_loop = b.iconst(Ty::I64, 8);
+        let off = b.binary(Op::Mul, Flags::NONE, j, c8_loop);
+        let elem_p = b.ptr_add(Flags::NONE, p_b, off);
+        let elem = b.load(Ty::I64, Flags::NONE, elem_p, 0, MemAttrs::aligned(3));
+        let gt = b.icmp(IntCond::Ugt, elem, k);
+        b.br(Flags::NONE, gt, (b_latch, &[]), (b_after, &[elem]));
+
+        b.begin(b_latch);
+        let c1 = b.iconst(Ty::I64, 1);
+        let j_next = b.binary(Op::Sub, Flags::NONE, j, c1);
+        b.jump((b_hdr, &[j_next]));
+
+        // After the read-only loop, `load(p_a, 0)` must forward to `v` and be eliminated!
+        b.begin(b_after);
+        let stopped = b.param(Ty::I64);
+        let v2 = b.load(Ty::I64, Flags::NONE, p_a, 0, MemAttrs::aligned(3));
+        let sum1 = b.binary(Op::Add, Flags::NONE, v, v2);
+        let sum2 = b.binary(Op::Add, Flags::NONE, sum1, stopped);
+        b.ret(&[sum2]);
+
+        let func = b.finish_checked().unwrap();
+        let loads_before =
+            (0..func.view().len()).filter(|&i| func.view().op(i) == Op::Load).count();
+        assert_eq!(loads_before, 3);
+
+        let opt = aegraph_optimize(func.view(), alloc).unwrap();
+        verify(opt.func.view()).unwrap();
+        let loads_after =
+            (0..opt.func.view().len()).filter(|&i| opt.func.view().op(i) == Op::Load).count();
+        assert_eq!(
+            loads_after, 2,
+            "expected reload of `p_a` after read-only loop (with cold trap exit) to be eliminated"
+        );
+
+        for &(xv, kv, expected) in
+            &[(42u64, 25u64, 104u64), (42, 10, 94), (42, 40, 124), (7, 15, 24)]
+        {
+            let args = [Val::Int(u128::from(xv)), Val::Int(u128::from(kv))];
+            let before = eval::run_in(func.view(), &args, 10_000, alloc).unwrap();
+            let after = eval::run_in(opt.func.view(), &args, 10_000, alloc).unwrap();
+            assert_eq!(before, after, "read-only loop forwarding mismatch on ({xv}, {kv})");
+            match after {
+                Outcome::Returned(vals) => {
+                    assert_eq!(vals.as_slice(), &[Val::Int(u128::from(expected))]);
+                }
+                other => panic!("expected Returned, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn aegraph_clears_mem_known_across_writing_loop() {
+        use crate::{builder::MemAttrs, func::SlotKind};
+
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut b = Builder::<_, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let s_src = b.slot(8, 3, SlotKind::Temp);
+        let s_a = b.slot(8, 3, SlotKind::Temp);
+        let s_b = b.slot(32, 3, SlotKind::Temp);
+        let [b0, b_hdr, b_trap, b_check, b_latch, b_after] =
+            [(); 6].map(|_| b.create_block(BlockKind::Normal));
+
+        b.begin(b0);
+        let x = b.param(Ty::I64);
+        let k = b.param(Ty::I64);
+        let p_src = b.slot_addr(s_src);
+        let p_a = b.slot_addr(s_a);
+        let p_b = b.slot_addr(s_b);
+        let c10 = b.iconst(Ty::I64, 10);
+        let c20 = b.iconst(Ty::I64, 20);
+        let c30 = b.iconst(Ty::I64, 30);
+        let c40 = b.iconst(Ty::I64, 40);
+        b.store(Flags::NONE, c10, p_b, 0, MemAttrs::aligned(3));
+        b.store(Flags::NONE, c20, p_b, 8, MemAttrs::aligned(3));
+        b.store(Flags::NONE, c30, p_b, 16, MemAttrs::aligned(3));
+        b.store(Flags::NONE, c40, p_b, 24, MemAttrs::aligned(3));
+        let c8 = b.iconst(Ty::I64, 8);
+        b.store(Flags::NONE, x, p_src, 0, MemAttrs::aligned(3));
+        b.bulk(Op::Memmove, Flags::NONE, p_a, p_src, c8, MemAttrs::aligned(3));
+        let v = b.load(Ty::I64, Flags::NONE, p_a, 0, MemAttrs::aligned(3));
+        let j0 = b.iconst(Ty::I64, 3);
+        b.jump((b_hdr, &[j0]));
+
+        b.begin(b_hdr);
+        let j = b.param(Ty::I64);
+        let c4 = b.iconst(Ty::I64, 4);
+        let in_bounds = b.icmp(IntCond::Ult, j, c4);
+        b.br(Flags::NONE, in_bounds, (b_check, &[]), (b_trap, &[]));
+
+        b.begin(b_trap);
+        b.trap(1);
+
+        b.begin(b_check);
+        let c8_loop = b.iconst(Ty::I64, 8);
+        let off = b.binary(Op::Mul, Flags::NONE, j, c8_loop);
+        let elem_p = b.ptr_add(Flags::NONE, p_b, off);
+        let elem = b.load(Ty::I64, Flags::NONE, elem_p, 0, MemAttrs::aligned(3));
+        let gt = b.icmp(IntCond::Ugt, elem, k);
+        b.br(Flags::NONE, gt, (b_latch, &[]), (b_after, &[elem]));
+
+        // Loop body writes to `p_a`, so `mem_known` MUST be cleared at `b_hdr`!
+        b.begin(b_latch);
+        let c99 = b.iconst(Ty::I64, 99);
+        b.store(Flags::NONE, c99, p_a, 0, MemAttrs::aligned(3));
+        let c1 = b.iconst(Ty::I64, 1);
+        let j_next = b.binary(Op::Sub, Flags::NONE, j, c1);
+        b.jump((b_hdr, &[j_next]));
+
+        b.begin(b_after);
+        let stopped = b.param(Ty::I64);
+        let v2 = b.load(Ty::I64, Flags::NONE, p_a, 0, MemAttrs::aligned(3));
+        let sum1 = b.binary(Op::Add, Flags::NONE, v, v2);
+        let sum2 = b.binary(Op::Add, Flags::NONE, sum1, stopped);
+        b.ret(&[sum2]);
+
+        let func = b.finish_checked().unwrap();
+        let loads_before =
+            (0..func.view().len()).filter(|&i| func.view().op(i) == Op::Load).count();
+        assert_eq!(loads_before, 3);
+
+        let opt = aegraph_optimize(func.view(), alloc).unwrap();
+        verify(opt.func.view()).unwrap();
+        let loads_after =
+            (0..opt.func.view().len()).filter(|&i| opt.func.view().op(i) == Op::Load).count();
+        assert_eq!(
+            loads_after, 3,
+            "reload after a memory-writing loop MUST NOT be forwarded or eliminated"
+        );
+
+        for &(xv, kv, expected) in
+            &[(42u64, 25u64, 161u64), (42, 10, 151), (42, 40, 124), (7, 15, 116)]
+        {
+            let args = [Val::Int(u128::from(xv)), Val::Int(u128::from(kv))];
+            let before = eval::run_in(func.view(), &args, 10_000, alloc).unwrap();
+            let after = eval::run_in(opt.func.view(), &args, 10_000, alloc).unwrap();
+            assert_eq!(before, after, "writing loop mismatch on ({xv}, {kv})");
+            match after {
+                Outcome::Returned(vals) => {
+                    assert_eq!(vals.as_slice(), &[Val::Int(u128::from(expected))]);
+                }
                 other => panic!("expected Returned, got {other:?}"),
             }
         }

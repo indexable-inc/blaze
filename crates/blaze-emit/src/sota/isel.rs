@@ -486,6 +486,21 @@ enum CopyLoc<const FP: bool> {
 type GprCopyLoc = CopyLoc<false>;
 type FpCopyLoc = CopyLoc<true>;
 
+/// Deferred constant or global-address materialization emitted after parallel register moves.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RematWrite {
+    Const(u64),
+    Global(u32),
+}
+
+/// Pre-resolved relocation plan for a rematerialized `Op::DataAddr` / `Op::FuncAddr`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RematGlobalPlan {
+    None,
+    Got { target: u32 },
+    OwnRelro { off: u32 },
+}
+
 #[inline]
 fn is_supported_scalar(ty: Ty) -> bool {
     if ty == Ty::NONE {
@@ -2173,18 +2188,21 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
     let mut skip_emit: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(len, alloc);
     let mut slot_addr_folded_uses: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(len, alloc);
     let mut ptr_off_foldable_uses: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(len, alloc);
+    let mut ptr_scaled_foldable_uses: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(len, alloc);
     let mut blaze_result_br_fused: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(len, alloc);
     for _ in 0..len {
         fusion.push(Fusion::None);
         skip_emit.push(false);
         slot_addr_folded_uses.push(0);
         ptr_off_foldable_uses.push(0);
+        ptr_scaled_foldable_uses.push(0);
         blaze_result_br_fused.push(false);
     }
 
-    // Pre-pass: count foldable Load/Store pointer uses of same-block `PtrAdd(base, const)` and
-    // 64-bit `Add(base, const)` so multi-use pointer offsets (e.g. `saxpy` load + store at
-    // `[py + 16]`) fold cleanly into `MemBaseOff` whenever ALL uses fold!
+    // Pre-pass: count foldable Load/Store pointer uses of:
+    // - same-block `PtrAdd(base, const)` and 64-bit `Add(base, const)` (`MemBaseOff`)
+    // - cross-block multi-use (1..=4 uses) non-volatile offset-0 `PtrAdd(base, Shl(idx, scale))`
+    //   and byte `PtrAdd(base, idx)` (`MemScaledIdx` / `MemUxtwIdx` / `MemRegIdx`) whenever ALL uses fold!
     for inst in 0..len {
         let op = view.op(inst);
         if !matches!(op, Op::Load | Op::Store) {
@@ -2216,10 +2234,35 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
             }
         };
         let pi = to_idx(ptr);
+        let pop = view.op(pi);
+        let is_volatile = Flags(at_u8(view.flags, inst)).contains(Flags::VOLATILE);
+        if !is_volatile && off == 0 && pop == Op::PtrAdd {
+            let pi_uses = at_u32(&use_count, pi);
+            if (1..=4).contains(&pi_uses)
+                && let Some(sz) = mem_sz
+            {
+                let size_shift = mem_shift(sz);
+                let pat = to_idx(at_u32(view.data, pi));
+                let by = at_u32(view.extra, pat + 1);
+                if ty_at(view.tys, to_idx(by)).bits(64) == 64 {
+                    let bi = to_idx(by);
+                    if size_shift == 0 {
+                        if at_opt(&const_u64, bi).is_none() {
+                            inc_u32(&mut ptr_scaled_foldable_uses, pi);
+                        }
+                    } else if at_u32(&use_count, bi) == 1 && view.op(bi) == Op::Shl {
+                        let sat = to_idx(at_u32(view.data, bi));
+                        let sh_v = at_u32(view.extra, sat + 1);
+                        if at_opt(&const_u64, to_idx(sh_v)) == Some(u64::from(size_shift)) {
+                            inc_u32(&mut ptr_scaled_foldable_uses, pi);
+                        }
+                    }
+                }
+            }
+        }
         if at_u32(&inst_block, pi) != at_u32(&inst_block, inst) {
             continue;
         }
-        let pop = view.op(pi);
         if pop == Op::PtrAdd {
             let pat = to_idx(at_u32(view.data, pi));
             let by = at_u32(view.extra, pat + 1);
@@ -3047,11 +3090,11 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
             }
             Op::Load | Op::Store => {
                 let at = to_idx(at_u32(view.data, inst));
-                let (ptr, off, access_ty) = if op == Op::Load {
-                    (at_u32(view.extra, at), i64::from(at_u32(view.extra, at + 1).cast_signed()), ty)
+                let (ptr, off, access_ty, store_val) = if op == Op::Load {
+                    (at_u32(view.extra, at), i64::from(at_u32(view.extra, at + 1).cast_signed()), ty, u32::MAX)
                 } else {
                     let val = at_u32(view.extra, at);
-                    (at_u32(view.extra, at + 1), i64::from(at_u32(view.extra, at + 2).cast_signed()), ty_at(view.tys, to_idx(val)))
+                    (at_u32(view.extra, at + 1), i64::from(at_u32(view.extra, at + 2).cast_signed()), ty_at(view.tys, to_idx(val)), val)
                 };
                 if access_ty == Ty::I128 {
                     continue;
@@ -3084,8 +3127,115 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                         continue;
                     }
                 }
-                // Pattern B: `load`/`store` on same-block `add`/`ptr_add` -> `[base, #imm]` or `[base, idx, lsl #size]`!
+                // Pattern B0: Multi-use (1..=4 uses, even cross-block!) non-volatile offset-0
+                // `ptr_add(base, shl(idx, scale))` or byte `ptr_add(base, idx)` -> `[base, idx, lsl #scale]`!
                 let pi_uses = at_u32(&use_count, pi);
+                let is_volatile = Flags(at_u8(view.flags, inst)).contains(Flags::VOLATILE);
+                if !is_volatile
+                    && store_val != ptr
+                    && off == 0
+                    && pop == Op::PtrAdd
+                    && mem_sz.is_some()
+                    && (1..=4).contains(&pi_uses)
+                    && at_u32(&ptr_scaled_foldable_uses, pi) == pi_uses
+                    && at_fusion(&fusion, pi) == Fusion::None
+                {
+                    let pat = to_idx(at_u32(view.data, pi));
+                    let base = at_u32(view.extra, pat);
+                    let by = at_u32(view.extra, pat + 1);
+                    if ty_at(view.tys, to_idx(by)).bits(64) == 64 {
+                        let bi = to_idx(by);
+                        let first_fold = !at_bool(&skip_emit, pi);
+                        if size_shift > 0
+                            && at_u32(&use_count, bi) == 1
+                            && view.op(bi) == Op::Shl
+                            && (!at_bool(&skip_emit, bi) || !first_fold)
+                        {
+                            let sat = to_idx(at_u32(view.data, bi));
+                            let idx_v = at_u32(view.extra, sat);
+                            let sh_v = at_u32(view.extra, sat + 1);
+                            if at_opt(&const_u64, to_idx(sh_v)) == Some(u64::from(size_shift)) {
+                                let shift_imm = if first_fold { sh_v } else { u32::MAX };
+                                let zi = to_idx(idx_v);
+                                if at_u32(&use_count, zi) == 1
+                                    && view.op(zi) == Op::Zext
+                                    && (!at_bool(&skip_emit, zi) || !first_fold)
+                                {
+                                    let src_v = at_u32(view.data, zi);
+                                    if ty_at(view.tys, to_idx(src_v)).bits(64) == 32 {
+                                        set_at(
+                                            &mut fusion,
+                                            inst,
+                                            Fusion::MemUxtwIdx {
+                                                base,
+                                                idx: src_v,
+                                                scaled: true,
+                                                shift_imm,
+                                            },
+                                        );
+                                        set_at(&mut skip_emit, pi, true);
+                                        set_at(&mut skip_emit, bi, true);
+                                        set_at(&mut skip_emit, zi, true);
+                                        continue;
+                                    }
+                                }
+                                set_at(
+                                    &mut fusion,
+                                    inst,
+                                    Fusion::MemScaledIdx { base, idx: idx_v, shift_imm },
+                                );
+                                set_at(&mut skip_emit, pi, true);
+                                set_at(&mut skip_emit, bi, true);
+                                continue;
+                            }
+                        } else if size_shift == 0 && at_opt(&const_u64, bi).is_none() {
+                            if at_u32(&use_count, bi) == 1
+                                && view.op(bi) == Op::Shl
+                                && (!at_bool(&skip_emit, bi) || !first_fold)
+                            {
+                                let sat = to_idx(at_u32(view.data, bi));
+                                let idx_v = at_u32(view.extra, sat);
+                                let sh_v = at_u32(view.extra, sat + 1);
+                                if at_opt(&const_u64, to_idx(sh_v)) == Some(0) {
+                                    let shift_imm = if first_fold { sh_v } else { u32::MAX };
+                                    set_at(
+                                        &mut fusion,
+                                        inst,
+                                        Fusion::MemScaledIdx { base, idx: idx_v, shift_imm },
+                                    );
+                                    set_at(&mut skip_emit, pi, true);
+                                    set_at(&mut skip_emit, bi, true);
+                                    continue;
+                                }
+                            }
+                            if at_u32(&use_count, bi) == 1
+                                && view.op(bi) == Op::Zext
+                                && (!at_bool(&skip_emit, bi) || !first_fold)
+                            {
+                                let src_v = at_u32(view.data, bi);
+                                if ty_at(view.tys, to_idx(src_v)).bits(64) == 32 {
+                                    set_at(
+                                        &mut fusion,
+                                        inst,
+                                        Fusion::MemUxtwIdx {
+                                            base,
+                                            idx: src_v,
+                                            scaled: false,
+                                            shift_imm: u32::MAX,
+                                        },
+                                    );
+                                    set_at(&mut skip_emit, pi, true);
+                                    set_at(&mut skip_emit, bi, true);
+                                    continue;
+                                }
+                            }
+                            set_at(&mut fusion, inst, Fusion::MemRegIdx { base, idx: by });
+                            set_at(&mut skip_emit, pi, true);
+                            continue;
+                        }
+                    }
+                }
+                // Pattern B: `load`/`store` on same-block `add`/`ptr_add` -> `[base, #imm]` or `[base, idx, lsl #size]`!
                 let pi_same_blk = at_u32(&inst_block, pi) == b;
                 let pi_all_fold_off = pi_uses > 1
                     && pi_same_blk
@@ -4034,7 +4184,9 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                 }
             }
             Fusion::MemScaledIdx { shift_imm, .. } => {
-                inc_u32(&mut imm_uses, to_idx(shift_imm));
+                if shift_imm != u32::MAX {
+                    inc_u32(&mut imm_uses, to_idx(shift_imm));
+                }
             }
             Fusion::MemUxtwIdx { shift_imm, .. } => {
                 if shift_imm != u32::MAX {
@@ -4270,6 +4422,83 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
     }
     let frame_size = u32_of(frame_size_u64);
     let internal_err: core::cell::Cell<Option<TierError>> = core::cell::Cell::new(None);
+    let mut data_relro_off: Vec<Option<u32>, Alloc<'a>> = Vec::with_capacity_in(view.datas.len(), alloc);
+    for _ in 0..view.datas.len() {
+        data_relro_off.push(None);
+    }
+    let mut out = Emitted::new_in(alloc);
+
+    // Pre-resolve every rematerialized `Op::DataAddr` / `Op::FuncAddr` once so cold remat sites
+    // only emit `adrp` + `add`/`ldr` and push their relocations without touching `names` or `data_relro_off`.
+    let mut remat_global_plan: Vec<RematGlobalPlan, Alloc<'a>> = Vec::with_capacity_in(len, alloc);
+    for _ in 0..len {
+        remat_global_plan.push(RematGlobalPlan::None);
+    }
+    for g_inst in 0..len {
+        if let AllocLoc::RematGlobal(_) = at_loc(&reg_alloc.loc_of, g_inst) {
+            let plan = match view.op(g_inst) {
+                Op::DataAddr => {
+                    let rec = view.reference(RefId(at_u32(view.data, g_inst)));
+                    match RefKind::from_word(rec.kind) {
+                        Some(RefKind::Static) => {
+                            let target = resolve_outside(names, Outside::Static(rec.place), Space::Static, true, &mut out, g_inst)?;
+                            RematGlobalPlan::Got { target }
+                        }
+                        Some(RefKind::Vtable) => {
+                            let target = resolve_outside(names, Outside::Vtable(rec.place), Space::Vtable, false, &mut out, g_inst)?;
+                            RematGlobalPlan::Got { target }
+                        }
+                        Some(RefKind::Data) => {
+                            let off = place_data_row(rec.place, &view, names, &mut data_relro_off, &mut out, g_inst, alloc)?;
+                            RematGlobalPlan::OwnRelro { off }
+                        }
+                        _ => {
+                            return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(g_inst)), what: "unsupported remat data_addr" });
+                        }
+                    }
+                }
+                Op::FuncAddr => {
+                    let rec = view.reference(RefId(at_u32(view.data, g_inst)));
+                    let target = resolve_outside(names, Outside::Func(rec.place), Space::Func, true, &mut out, g_inst)?;
+                    RematGlobalPlan::Got { target }
+                }
+                _ => {
+                    return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(g_inst)), what: "unexpected remat global op" });
+                }
+            };
+            set_at(&mut remat_global_plan, g_inst, plan);
+        }
+    }
+    let remat_relocs: core::cell::RefCell<Vec<Reloc, Alloc<'a>>> = core::cell::RefCell::new(Vec::new_in(alloc));
+    let emit_remat_global = |words: &mut Vec<u32, Alloc<'a>>, rd: Reg, g_inst: u32| {
+        match remat_global_plan.get(to_idx(g_inst)).copied().unwrap_or(RematGlobalPlan::None) {
+            RematGlobalPlan::Got { target } => {
+                let adrp_at = u32_of(words.len() * 4);
+                words.push(enc::adrp(rd, 0));
+                words.push(enc::ldr(Size::X, rd, rd, 0));
+                let mut rels = remat_relocs.borrow_mut();
+                rels.push(Reloc { at: adrp_at, in_relro: false, kind: RelocKind::GotPage21, target, addend: 0 });
+                rels.push(Reloc { at: adrp_at + 4, in_relro: false, kind: RelocKind::GotPageOff12, target, addend: 0 });
+            }
+            RematGlobalPlan::OwnRelro { off } => {
+                let adrp_at = u32_of(words.len() * 4);
+                words.push(enc::adrp(rd, 0));
+                words.push(enc::add_imm(rd, rd, 0, false));
+                let mut rels = remat_relocs.borrow_mut();
+                rels.push(Reloc { at: adrp_at, in_relro: false, kind: RelocKind::Page21, target: OWN_RELRO, addend: i64::from(off) });
+                rels.push(Reloc { at: adrp_at + 4, in_relro: false, kind: RelocKind::PageOff12 { scale: 0 }, target: OWN_RELRO, addend: i64::from(off) });
+            }
+            RematGlobalPlan::None => {
+                internal_err.set(Some(TierError::Refused { tier: TIER, inst: Some(g_inst), what: "missing remat global plan" }));
+            }
+        }
+    };
+    let emit_remat_write_reg = |words: &mut Vec<u32, Alloc<'a>>, rd: Reg, w: RematWrite| {
+        match w {
+            RematWrite::Const(cval) => emit_const_u64(words, rd, cval),
+            RematWrite::Global(g_inst) => emit_remat_global(words, rd, g_inst),
+        }
+    };
 
     // Helper closures for register / spill / remat access.
     let load_gpr = |words: &mut Vec<u32, Alloc<'a>>, v: u32, scratch: Reg| -> Reg {
@@ -4281,6 +4510,10 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
             }
             AllocLoc::RematConst(cval) => {
                 emit_const_u64(words, scratch, cval);
+                scratch
+            }
+            AllocLoc::RematGlobal(g_inst) => {
+                emit_remat_global(words, scratch, g_inst);
                 scratch
             }
             AllocLoc::None => {
@@ -4372,12 +4605,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
     }
     let mut gpr_moves: Vec<(GprCopyLoc, GprCopyLoc), Alloc<'a>> = Vec::with_capacity_in(16, alloc);
     let mut fp_moves: Vec<(FpCopyLoc, FpCopyLoc), Alloc<'a>> = Vec::with_capacity_in(16, alloc);
-    let mut const_edge_writes: Vec<(GprCopyLoc, u64), Alloc<'a>> = Vec::with_capacity_in(8, alloc);
-    let mut data_relro_off: Vec<Option<u32>, Alloc<'a>> = Vec::with_capacity_in(view.datas.len(), alloc);
-    for _ in 0..view.datas.len() {
-        data_relro_off.push(None);
-    }
-    let mut out = Emitted::new_in(alloc);
+    let mut const_edge_writes: Vec<(GprCopyLoc, RematWrite), Alloc<'a>> = Vec::with_capacity_in(8, alloc);
 
     // Precompute cleanup blocks (reachable from `Cleanup`/`Terminate` landing blocks via ordinary edges)
     // and collect `(call_byte_off, Option<unwind_block>)` so unwind rows resolve once all blocks are placed.
@@ -4747,7 +4975,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
     let emit_edge_moves = |words: &mut Vec<u32, Alloc<'a>>,
                            gpr_moves: &mut Vec<(GprCopyLoc, GprCopyLoc), Alloc<'a>>,
                            fp_moves: &mut Vec<(FpCopyLoc, FpCopyLoc), Alloc<'a>>,
-                           const_writes: &mut Vec<(GprCopyLoc, u64), Alloc<'a>>,
+                           const_writes: &mut Vec<(GprCopyLoc, RematWrite), Alloc<'a>>,
                            target_block: u32,
                            args_start: usize,
                            args_len: usize| {
@@ -4768,10 +4996,11 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     match at_loc(&reg_alloc.loc_of, to_idx(src_v)) {
                         AllocLoc::Gpr(s) => gpr_moves.push((dst, GprCopyLoc::Reg(u32::from(s)))),
                         AllocLoc::GprSpill(s) => gpr_moves.push((dst, GprCopyLoc::Spill(s))),
-                        AllocLoc::RematConst(cval) => const_writes.push((dst, cval)),
+                        AllocLoc::RematConst(cval) => const_writes.push((dst, RematWrite::Const(cval))),
+                        AllocLoc::RematGlobal(g_inst) => const_writes.push((dst, RematWrite::Global(g_inst))),
                         AllocLoc::None => {
                             if let Some(cval) = at_opt(&const_u64, to_idx(src_v)) {
-                                const_writes.push((dst, cval));
+                                const_writes.push((dst, RematWrite::Const(cval)));
                             } else {
                                 internal_err.set(Some(TierError::Refused { tier: TIER, inst: Some(src_v), what: "unallocated non-const edge arg" }));
                             }
@@ -4784,10 +5013,11 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     match at_loc(&reg_alloc.loc_of, to_idx(src_v)) {
                         AllocLoc::Gpr(s) => gpr_moves.push((dst, GprCopyLoc::Reg(u32::from(s)))),
                         AllocLoc::GprSpill(s) => gpr_moves.push((dst, GprCopyLoc::Spill(s))),
-                        AllocLoc::RematConst(cval) => const_writes.push((dst, cval)),
+                        AllocLoc::RematConst(cval) => const_writes.push((dst, RematWrite::Const(cval))),
+                        AllocLoc::RematGlobal(g_inst) => const_writes.push((dst, RematWrite::Global(g_inst))),
                         AllocLoc::None => {
                             if let Some(cval) = at_opt(&const_u64, to_idx(src_v)) {
-                                const_writes.push((dst, cval));
+                                const_writes.push((dst, RematWrite::Const(cval)));
                             } else {
                                 internal_err.set(Some(TierError::Refused { tier: TIER, inst: Some(src_v), what: "unallocated non-const spill edge arg" }));
                             }
@@ -4857,7 +5087,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                         _ => internal_err.set(Some(TierError::Refused { tier: TIER, inst: Some(src_v), what: "unexpected GprPairSpill edge arg loc" })),
                     }
                 }
-                AllocLoc::None | AllocLoc::RematConst(_) => {}
+                AllocLoc::None | AllocLoc::RematConst(_) | AllocLoc::RematGlobal(_) => {}
             }
         }
         if let Err(err) = emit_parallel_moves(words, gpr_moves, spill_base) {
@@ -4868,12 +5098,12 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
             internal_err.set(Some(err));
             return;
         }
-        // Materialize skipped constant edge arguments AFTER parallel moves so they never clobber any source!
-        for &(dst, cval) in const_writes.iter() {
+        // Materialize skipped constant / remat global edge arguments AFTER parallel moves so they never clobber any source!
+        for &(dst, write) in const_writes.iter() {
             match dst {
-                GprCopyLoc::Reg(r) => emit_const_u64(words, r, cval),
+                GprCopyLoc::Reg(r) => emit_remat_write_reg(words, r, write),
                 GprCopyLoc::Spill(s) => {
-                    emit_const_u64(words, X16, cval);
+                    emit_remat_write_reg(words, X16, write);
                     emit_st_spill_gpr(words, X16, spill_base, s);
                 }
                 GprCopyLoc::VecSpill(_) => {
@@ -4889,7 +5119,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
         for k in 0..args_len {
             let param_inst = target_params.start + k;
             let dst_loc = at_loc(&reg_alloc.loc_of, param_inst);
-            if matches!(dst_loc, AllocLoc::None | AllocLoc::RematConst(_)) {
+            if matches!(dst_loc, AllocLoc::None | AllocLoc::RematConst(_) | AllocLoc::RematGlobal(_)) {
                 continue;
             }
             let src_v = at_u32(view.extra, args_start + k);
@@ -5120,7 +5350,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
             if matches!(kop, Op::Param | Op::SlotLive | Op::SlotDead | Op::Assume) {
                 return true;
             }
-            if !matches!(at_loc(&reg_alloc.loc_of, k), AllocLoc::None | AllocLoc::RematConst(_)) {
+            if !matches!(at_loc(&reg_alloc.loc_of, k), AllocLoc::None | AllocLoc::RematConst(_) | AllocLoc::RematGlobal(_)) {
                 return false;
             }
             let side_eff = kop.is_terminator()
@@ -5896,7 +6126,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                         | Op::Srem
                 );
             if !has_side_effect
-                && matches!(loc, AllocLoc::None | AllocLoc::RematConst(_))
+                && matches!(loc, AllocLoc::None | AllocLoc::RematConst(_) | AllocLoc::RematGlobal(_))
                 && at_fusion(&fusion, inst) != Fusion::SubsFlags
             {
                 inst += 1;
@@ -7414,7 +7644,11 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                         Fusion::MemScaledIdx { base, idx, .. } => {
                             let rbase = load_gpr(&mut words, base, X16);
                             let ridx = load_gpr(&mut words, idx, X17);
-                            let raw = enc::ldr_reg_scaled(size, dst, rbase, ridx);
+                            let raw = if size == Size::B {
+                                enc::ldr_reg(size, dst, rbase, ridx)
+                            } else {
+                                enc::ldr_reg_scaled(size, dst, rbase, ridx)
+                            };
                             words.push(if is_fp { enc::fp_access(raw) } else { raw });
                         }
                         Fusion::MemUxtwIdx { base, idx, scaled, .. } => {
@@ -7504,7 +7738,11 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                                     let rval = grab(&mut words, val);
                                     let rbase = grab(&mut words, base);
                                     let ridx = grab(&mut words, idx);
-                                    words.push(enc::str_reg_scaled(size, rval, rbase, ridx));
+                                    words.push(if size == Size::B {
+                                        enc::str_reg(size, rval, rbase, ridx)
+                                    } else {
+                                        enc::str_reg_scaled(size, rval, rbase, ridx)
+                                    });
                                 } else {
                                     let rbase = load_gpr(&mut words, base, X16);
                                     let ridx = load_gpr(&mut words, idx, X17);
@@ -7641,22 +7879,23 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                             match at_loc(&reg_alloc.loc_of, to_idx(arg_v)) {
                                 AllocLoc::Gpr(s) => gpr_moves.push((dst, GprCopyLoc::Reg(u32::from(s)))),
                                 AllocLoc::GprSpill(s) => gpr_moves.push((dst, GprCopyLoc::Spill(s))),
-                                AllocLoc::RematConst(cval) => const_edge_writes.push((dst, cval)),
+                                AllocLoc::RematConst(cval) => const_edge_writes.push((dst, RematWrite::Const(cval))),
+                                AllocLoc::RematGlobal(g_inst) => const_edge_writes.push((dst, RematWrite::Global(g_inst))),
                                 AllocLoc::None => {
                                     let cval = at_opt(&const_u64, to_idx(arg_v)).ok_or(TierError::Refused {
                                         tier: TIER,
                                         inst: Some(u32_of(inst)),
                                         what: "unallocated memcpy arg",
                                     })?;
-                                    const_edge_writes.push((dst, cval));
+                                    const_edge_writes.push((dst, RematWrite::Const(cval)));
                                 }
                                 _ => return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "unexpected memcpy arg loc" }),
                             }
                         }
                         emit_parallel_gpr_moves(&mut words, &mut gpr_moves, spill_base)?;
-                        for &(dst, cval) in const_edge_writes.iter() {
+                        for &(dst, write) in const_edge_writes.iter() {
                             if let GprCopyLoc::Reg(r) = dst {
-                                emit_const_u64(&mut words, r, cval);
+                                emit_remat_write_reg(&mut words, r, write);
                             }
                         }
                         let target = resolve_c_routine("memcpy", &mut out);
@@ -7828,22 +8067,23 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                         match at_loc(&reg_alloc.loc_of, to_idx(arg_v)) {
                             AllocLoc::Gpr(s) => gpr_moves.push((dst, GprCopyLoc::Reg(u32::from(s)))),
                             AllocLoc::GprSpill(s) => gpr_moves.push((dst, GprCopyLoc::Spill(s))),
-                            AllocLoc::RematConst(cval) => const_edge_writes.push((dst, cval)),
+                            AllocLoc::RematConst(cval) => const_edge_writes.push((dst, RematWrite::Const(cval))),
+                            AllocLoc::RematGlobal(g_inst) => const_edge_writes.push((dst, RematWrite::Global(g_inst))),
                             AllocLoc::None => {
                                 let cval = at_opt(&const_u64, to_idx(arg_v)).ok_or(TierError::Refused {
                                     tier: TIER,
                                     inst: Some(u32_of(inst)),
                                     what: "unallocated memmove arg",
                                 })?;
-                                const_edge_writes.push((dst, cval));
+                                const_edge_writes.push((dst, RematWrite::Const(cval)));
                             }
                             _ => return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "unexpected memmove arg loc" }),
                         }
                     }
                     emit_parallel_gpr_moves(&mut words, &mut gpr_moves, spill_base)?;
-                    for &(dst, cval) in const_edge_writes.iter() {
+                    for &(dst, write) in const_edge_writes.iter() {
                         if let GprCopyLoc::Reg(r) = dst {
-                            emit_const_u64(&mut words, r, cval);
+                            emit_remat_write_reg(&mut words, r, write);
                         }
                     }
                     let target = resolve_c_routine("memmove", &mut out);
@@ -7864,22 +8104,23 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                             match at_loc(&reg_alloc.loc_of, to_idx(arg_v)) {
                                 AllocLoc::Gpr(s) => gpr_moves.push((dst, GprCopyLoc::Reg(u32::from(s)))),
                                 AllocLoc::GprSpill(s) => gpr_moves.push((dst, GprCopyLoc::Spill(s))),
-                                AllocLoc::RematConst(cval) => const_edge_writes.push((dst, cval)),
+                                AllocLoc::RematConst(cval) => const_edge_writes.push((dst, RematWrite::Const(cval))),
+                                AllocLoc::RematGlobal(g_inst) => const_edge_writes.push((dst, RematWrite::Global(g_inst))),
                                 AllocLoc::None => {
                                     let cval = at_opt(&const_u64, to_idx(arg_v)).ok_or(TierError::Refused {
                                         tier: TIER,
                                         inst: Some(u32_of(inst)),
                                         what: "unallocated memset arg",
                                     })?;
-                                    const_edge_writes.push((dst, cval));
+                                    const_edge_writes.push((dst, RematWrite::Const(cval)));
                                 }
                                 _ => return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "unexpected memset arg loc" }),
                             }
                         }
                         emit_parallel_gpr_moves(&mut words, &mut gpr_moves, spill_base)?;
-                        for &(dst, cval) in const_edge_writes.iter() {
+                        for &(dst, write) in const_edge_writes.iter() {
                             if let GprCopyLoc::Reg(r) = dst {
-                                emit_const_u64(&mut words, r, cval);
+                                emit_remat_write_reg(&mut words, r, write);
                             }
                         }
                         let target = resolve_c_routine("memset", &mut out);
@@ -7981,22 +8222,23 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                             match at_loc(&reg_alloc.loc_of, to_idx(arg_v)) {
                                 AllocLoc::Gpr(s) => gpr_moves.push((dst, GprCopyLoc::Reg(u32::from(s)))),
                                 AllocLoc::GprSpill(s) => gpr_moves.push((dst, GprCopyLoc::Spill(s))),
-                                AllocLoc::RematConst(cval) => const_edge_writes.push((dst, cval)),
+                                AllocLoc::RematConst(cval) => const_edge_writes.push((dst, RematWrite::Const(cval))),
+                                AllocLoc::RematGlobal(g_inst) => const_edge_writes.push((dst, RematWrite::Global(g_inst))),
                                 AllocLoc::None => {
                                     let cval = at_opt(&const_u64, to_idx(arg_v)).ok_or(TierError::Refused {
                                         tier: TIER,
                                         inst: Some(u32_of(inst)),
                                         what: "unallocated memcmp arg",
                                     })?;
-                                    const_edge_writes.push((dst, cval));
+                                    const_edge_writes.push((dst, RematWrite::Const(cval)));
                                 }
                                 _ => return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "unexpected memcmp arg loc" }),
                             }
                         }
                         emit_parallel_gpr_moves(&mut words, &mut gpr_moves, spill_base)?;
-                        for &(dst, cval) in const_edge_writes.iter() {
+                        for &(dst, write) in const_edge_writes.iter() {
                             if let GprCopyLoc::Reg(r) = dst {
-                                emit_const_u64(&mut words, r, cval);
+                                emit_remat_write_reg(&mut words, r, write);
                             }
                         }
                         let target = resolve_c_routine("memcmp", &mut out);
@@ -8133,7 +8375,10 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                                 AllocLoc::Gpr(r) => gpr_moves.push((dst, GprCopyLoc::Reg(u32::from(r)))),
                                 AllocLoc::GprSpill(s) => gpr_moves.push((dst, GprCopyLoc::Spill(s))),
                                 AllocLoc::RematConst(imm) => {
-                                    const_edge_writes.push((dst, imm));
+                                    const_edge_writes.push((dst, RematWrite::Const(imm)));
+                                }
+                                AllocLoc::RematGlobal(g_inst) => {
+                                    const_edge_writes.push((dst, RematWrite::Global(g_inst)));
                                 }
                                 _ => {
                                     let r = load_gpr(&mut words, arg_v, X16);
@@ -8142,9 +8387,9 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                             }
                         }
                         emit_parallel_gpr_moves(&mut words, &mut gpr_moves, spill_base)?;
-                        for &(dst, imm) in &const_edge_writes {
+                        for &(dst, write) in &const_edge_writes {
                             if let GprCopyLoc::Reg(r) = dst {
-                                emit_const_u64(&mut words, r, imm);
+                                emit_remat_write_reg(&mut words, r, write);
                             }
                         }
                         let bl_w = words.len();
@@ -10287,14 +10532,15 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                                     match at_loc(&reg_alloc.loc_of, to_idx(arg_v)) {
                                         AllocLoc::Gpr(s) => gpr_moves.push((dst, GprCopyLoc::Reg(u32::from(s)))),
                                         AllocLoc::GprSpill(s) => gpr_moves.push((dst, GprCopyLoc::Spill(s))),
-                                        AllocLoc::RematConst(cval) => const_edge_writes.push((dst, cval)),
+                                        AllocLoc::RematConst(cval) => const_edge_writes.push((dst, RematWrite::Const(cval))),
+                                        AllocLoc::RematGlobal(g_inst) => const_edge_writes.push((dst, RematWrite::Global(g_inst))),
                                         AllocLoc::None => {
                                             let cval = at_opt(&const_u64, to_idx(arg_v)).ok_or(TierError::Refused {
                                                 tier: TIER,
                                                 inst: Some(u32_of(inst)),
                                                 what: "unallocated non-const call arg",
                                             })?;
-                                            const_edge_writes.push((dst, cval));
+                                            const_edge_writes.push((dst, RematWrite::Const(cval)));
                                         }
                                         _ => return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "unexpected GPR call arg loc" }),
                                     }
@@ -10344,9 +10590,9 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     }
                     emit_parallel_moves(&mut words, &mut gpr_moves, spill_base)?;
                     emit_parallel_moves(&mut words, &mut fp_moves, spill_base)?;
-                    for &(dst, cval) in const_edge_writes.iter() {
+                    for &(dst, write) in const_edge_writes.iter() {
                         if let GprCopyLoc::Reg(r) = dst {
-                            emit_const_u64(&mut words, r, cval);
+                            emit_remat_write_reg(&mut words, r, write);
                         }
                     }
                     for &(reg, copy_off) in byval_reg_writes.iter().take(byval_reg_n) {
@@ -11108,6 +11354,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                             }
                             AllocLoc::GprSpill(s) => emit_ld_spill_gpr(&mut words, X0, spill_base, s),
                             AllocLoc::RematConst(cval) => emit_const_u64(&mut words, X0, cval),
+                            AllocLoc::RematGlobal(g_inst) => emit_remat_global(&mut words, X0, g_inst),
                             AllocLoc::None => {
                                 let cval = at_opt(&const_u64, to_idx(val_v)).ok_or(TierError::Refused {
                                     tier: TIER,
@@ -11139,22 +11386,23 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                             match at_loc(&reg_alloc.loc_of, to_idx(rv)) {
                                 AllocLoc::Gpr(s) => gpr_moves.push((dst, GprCopyLoc::Reg(u32::from(s)))),
                                 AllocLoc::GprSpill(s) => gpr_moves.push((dst, GprCopyLoc::Spill(s))),
-                                AllocLoc::RematConst(cval) => const_edge_writes.push((dst, cval)),
+                                AllocLoc::RematConst(cval) => const_edge_writes.push((dst, RematWrite::Const(cval))),
+                                AllocLoc::RematGlobal(g_inst) => const_edge_writes.push((dst, RematWrite::Global(g_inst))),
                                 AllocLoc::None => {
                                     let cval = at_opt(&const_u64, to_idx(rv)).ok_or(TierError::Refused {
                                         tier: TIER,
                                         inst: Some(u32_of(inst)),
                                         what: "unallocated non-const 2-word return",
                                     })?;
-                                    const_edge_writes.push((dst, cval));
+                                    const_edge_writes.push((dst, RematWrite::Const(cval)));
                                 }
                                 _ => return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "unexpected 2-word return loc" }),
                             }
                         }
                         emit_parallel_gpr_moves(&mut words, &mut gpr_moves, spill_base)?;
-                        for &(dst, cval) in const_edge_writes.iter() {
+                        for &(dst, write) in const_edge_writes.iter() {
                             if let GprCopyLoc::Reg(r) = dst {
-                                emit_const_u64(&mut words, r, cval);
+                                emit_remat_write_reg(&mut words, r, write);
                             }
                         }
                         for (ridx, ret) in func_sig.rets.iter().take(2).enumerate() {
@@ -11203,6 +11451,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                                 }
                                 AllocLoc::GprSpill(s) => emit_ld_spill_gpr(&mut words, X0, spill_base, s),
                                 AllocLoc::RematConst(cval) => emit_const_u64(&mut words, X0, cval),
+                                AllocLoc::RematGlobal(g_inst) => emit_remat_global(&mut words, X0, g_inst),
                                 AllocLoc::None => {
                                     let cval = at_opt(&const_u64, to_idx(rv)).ok_or(TierError::Refused {
                                         tier: TIER,
@@ -11444,7 +11693,10 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
         out.pads.push(row.pad());
     }
 
-    // 6. Encode AArch64 words little-endian into `Emitted.code`.
+    // 6. Drain deferred remat-global relocations and encode AArch64 words little-endian into `Emitted.code`.
+    for rel in remat_relocs.into_inner() {
+        out.relocs.push(rel);
+    }
     out.code.reserve(words.len() * 4);
     for &w in &words {
         out.code.extend_from_slice(&w.to_le_bytes());
@@ -12587,6 +12839,97 @@ mod tests {
             let want_ret = ((av.wrapping_add(bv)) ^ cv).wrapping_add(av).wrapping_add(bv).wrapping_add(cv);
             assert_eq!(got_ret, want_ret);
             assert_eq!(buf, [1, 2, 1, 2, 3, 4, 5, 6, 7, 8, 11, 12]);
+        }
+    }
+
+    #[test]
+    fn multi_use_ptr_add_folds_scaled_load_and_store_cross_block() {
+        let alloc = test_alloc();
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[
+                Param::of(Ty::PTR),
+                Param::of(Ty::I64),
+                Param::of(Ty::I64),
+                Param::of(Ty::I64),
+            ],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+
+        let entry = b.create_block(BlockKind::Normal);
+        let store_blk = b.create_block(BlockKind::Normal);
+        let done_blk = b.create_block(BlockKind::Normal);
+
+        // Block A: `PtrAdd(base, Shl(idx, 3))` used by an offset-0 `I64` `Load`.
+        b.begin(entry);
+        let base = b.param(Ty::PTR);
+        let idx = b.param(Ty::I64);
+        let pivot = b.param(Ty::I64);
+        let new_val = b.param(Ty::I64);
+        let c3 = b.iconst(Ty::I64, 3);
+        let off = b.binary(Op::Shl, Flags::NONE, idx, c3);
+        let elem_ptr = b.ptr_add(Flags::NONE, base, off);
+        let cur = b.load(Ty::I64, Flags::NONE, elem_ptr, 0, MemAttrs::aligned(8));
+        let cond = b.icmp(IntCond::Ult, cur, pivot);
+        b.br(Flags::NONE, cond, (store_blk, &[]), (done_blk, &[cur]));
+
+        // Block B: SECOND use of the SAME `elem_ptr` in a different block by an offset-0 `I64` `Store`!
+        b.begin(store_blk);
+        b.store(Flags::NONE, new_val, elem_ptr, 0, MemAttrs::aligned(8));
+        b.jump((done_blk, &[cur]));
+
+        b.begin(done_blk);
+        let res = b.param(Ty::I64);
+        b.ret(&[res]);
+
+        let func = b.finish_checked().expect("cross-block multi-use ptr_add LIR builds");
+        let emitted = emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+            .expect("cross-block multi-use ptr_add emits");
+        let words = decode_words(&emitted.code, alloc);
+
+        // 1. ZERO `lsl` (`ubfm` 64-bit: `0xd340_0000` mask `0xffc0_0000`) and ZERO register `add` (`0x8b00_0000` mask `0xff20_0000`)!
+        let lsl_count = words
+            .iter()
+            .filter(|&&w| (w & 0xffc0_0000) == 0xd340_0000)
+            .count();
+        let add_reg_count = words
+            .iter()
+            .filter(|&&w| (w & 0xff20_0000) == 0x8b00_0000)
+            .count();
+        assert_eq!(lsl_count, 0, "multi-use ptr_add must emit ZERO lsl instructions, got {lsl_count}");
+        assert_eq!(add_reg_count, 0, "multi-use ptr_add must emit ZERO add instructions, got {add_reg_count}");
+
+        // 2. Exactly 1 scaled 64-bit `ldr xt, [xn, xm, lsl #3]` AND 1 scaled 64-bit `str xt, [xn, xm, lsl #3]`!
+        let ldr_scaled_count = words
+            .iter()
+            .filter(|&&w| (w & 0xffe0_fc00) == 0xf860_7800)
+            .count();
+        let str_scaled_count = words
+            .iter()
+            .filter(|&&w| (w & 0xffe0_fc00) == 0xf820_7800)
+            .count();
+        assert_eq!(ldr_scaled_count, 1, "expected 1 scaled ldr [base, idx, lsl #3], got {ldr_scaled_count}");
+        assert_eq!(str_scaled_count, 1, "expected 1 scaled str [base, idx, lsl #3], got {str_scaled_count}");
+
+        // 3. Hardware execution bit-exact on Apple Silicon!
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let ex = exec_leaf(emitted);
+            let f: extern "C" fn(*mut u64, u64, u64, u64) -> u64 = unsafe { ex.as_fn() };
+            let mut arr = [10u64, 20, 30, 40, 50, 60, 70, 80];
+
+            // Branch taken (`arr[3] == 40 < 55`): returns old 40 and writes 999 into arr[3].
+            let r1 = f(arr.as_mut_ptr(), 3, 55, 999);
+            assert_eq!(r1, 40);
+            assert_eq!(arr, [10, 20, 30, 999, 50, 60, 70, 80]);
+
+            // Branch not taken (`arr[5] == 60 >= 55`): returns 60 and leaves arr untouched.
+            let r2 = f(arr.as_mut_ptr(), 5, 55, 777);
+            assert_eq!(r2, 60);
+            assert_eq!(arr, [10, 20, 30, 999, 50, 60, 70, 80]);
         }
     }
 }

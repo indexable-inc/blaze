@@ -1,21 +1,24 @@
 //! Spill-Capable, Loop-Weighted, Coalescing Chordal-SSA Register Allocator (GPR + Pair + Scalar FP)
 //! for the non-LLVM `Sota` AArch64 tier.
 //!
-//! Because `blaze-lir` is in strict SSA form with block parameters, its interference graph is
-//! chordal. This allocator:
-//! 1. Computes exact `[def, last_use]` intervals (extended to a fixed point across backward loop edges)
-//!    and per-block loop nesting depth so hot-loop values get priority over cold outer values.
-//! 2. Propagates **coalescing hints** for:
-//!    - Entry parameters (`X0..X7`, `X8` for `sret`, `V0..V7`)
-//!    - Block-parameter (`phi`) back-edges so loop induction variables & accumulators stay in the
-//!      same physical register across iterations (zero back-edge `mov`s!)
-//!    - Return values (`X0`/`X1`, `V0`) and call arguments (`X0..X7`, `V0..V7`)
-//! 3. Supports **2-word GPR pairs** (`AllocLoc::GprPair` / `AllocLoc::GprPairSpill`) for
-//!    `{i64, i1}` overflow ops and 2-register returns (`Option<u64>`, `Result<T, E>`, `&[T]`).
-//! 4. Performs **loop-depth-weighted spill eviction**: when physical registers saturate inside a
-//!    hot loop, evicts the lowest-weight (coldest) active interval to a reusable 8-byte stack
-//!    spill slot so the inner loop stays register-resident.
-//! 5. Keeps pure leaf functions completely frameless (`X0..X15`, `V0..V7`/`V16..V28`, zero stack).
+//! Hybrid architecture combining exact CFG precision with guaranteed O(N log K) scaling:
+//! - **Exact-CFG mode** (`num_vals <= EXACT_CFG_MAX_VALS && blocks <= EXACT_CFG_MAX_BLOCKS`, covering
+//!   99.9% of functions): exact backward CFG liveness + symmetric SSA interference bitmatrix +
+//!   exact `crosses_call` + pre-rematerialization of call-crossing 1-inst constants and cold-only
+//!   `DataAddr`/`FuncAddr` (`AllocLoc::RematGlobal`) + aggressive non-interfering coalescing.
+//! - **Mega-function RPO linear-scan mode** (functions exceeding the exact-CFG budget, e.g. 600k-inst
+//!   generated parsers): O(N log K) RPO-ordered `[def, last_use]` intervals (extended to fixed point
+//!   across deduplicated RPO back-edges) + `BusySet` + binary-searched RPO `call_positions` +
+//!   `RematConst`/`RematGlobal` on pressure overflow.
+//!
+//! Both modes share:
+//! 1. **Coalescing hints** for entry parameters (`X0..X7`, `X8` `sret`, `V0..V7`), block-parameter
+//!    (`phi`) edges, return values (`X0`/`X1`, `V0`), and 2-address in-place accumulators.
+//! 2. **2-word GPR pairs** (`AllocLoc::GprPair` / `AllocLoc::GprPairSpill`) for `{i64, i1}` overflow
+//!    ops, `i128`, and 2-register returns (`Option<u64>`, `Result<T, E>`, `&[T]`).
+//! 3. **Two-phase coloring** (Phase 1 minimal-register chordal order; Phase 2 loop-weighted greedy
+//!    priority order when pressure overflows so inner loops stay register-resident).
+//! 4. **Frameless leaf functions** (`X0..X15`, `V0..V7`/`V16..V28`, zero stack).
 
 use core::alloc::Allocator;
 
@@ -47,6 +50,14 @@ const X28: Reg = 28;
 
 /// Unassigned hint sentinel.
 pub(crate) const NO_REG: u8 = u8::MAX;
+
+/// Maximum allocated SSA values for exact-CFG interference bitmatrix mode
+/// (`6144 * 6144 / 8 = 4.5 MiB` worst-case bitmatrix).
+const EXACT_CFG_MAX_VALS: usize = 6144;
+
+/// Maximum basic blocks for exact-CFG backward liveness mode
+/// (`3072 * 6144 / 8 = 2.25 MiB` worst-case `live_in` table).
+const EXACT_CFG_MAX_BLOCKS: usize = 3072;
 
 #[inline]
 fn idx(n: u32) -> usize {
@@ -201,6 +212,9 @@ pub(crate) enum AllocLoc {
     VecSpill(u32),
     /// Rematerialized 64-bit integer constant: re-emitted on use via `movz`/`movk` with ZERO stack spill!
     RematConst(u64),
+    /// Rematerialized global/data/func address (`Op::DataAddr` / `Op::FuncAddr` instruction index):
+    /// re-emitted at cold use sites via `adrp` + `add`/`ldr` with ZERO callee-saved GPRs!
+    RematGlobal(u32),
 }
 
 /// Whether `ty` is a supported scalar float (`Some(false)` for `f32`, `Some(true)` for `f64`).
@@ -689,7 +703,8 @@ fn is_rbw(view: &View<'_>, inst: usize) -> bool {
     )
 }
 
-/// Returns the preferred same-bank operand `src < inst` that `inst` should coalesce into:
+/// Returns the preferred same-bank operand `src` (ordered before `inst` by `is_before`) that
+/// `inst` should coalesce into:
 /// - Destructive 2-address NEON accumulators (`Fma`/`Fmuladd` operand `c`, `Fadd`/`Fsub` fused with
 ///   `Fmul`, `Add`/`Sub` fused with `Mul` or `VecUadalp`, reduction/IV chains)
 /// - In-place lane insertion (`Insert` base vector)
@@ -698,7 +713,8 @@ fn is_rbw(view: &View<'_>, inst: usize) -> bool {
 fn preferred_inplace_operand(
     view: &View<'_>,
     skip_alloc: &[bool],
-    last_use: &[usize],
+    is_before: impl Fn(usize) -> bool,
+    is_dying: impl Fn(usize) -> bool,
     inst: usize,
 ) -> Option<usize> {
     let ty = view.tys.get(inst).copied().map_or(Ty::NONE, Ty);
@@ -706,15 +722,16 @@ fn preferred_inplace_operand(
     if bank == 0 {
         return None;
     }
+    let len = view.len();
     let valid_src = |v: u32| -> Option<usize> {
         let vi = idx(v);
-        if vi >= inst || skip_alloc.get(vi).copied().unwrap_or(false) {
+        if vi >= len || !is_before(vi) || skip_alloc.get(vi).copied().unwrap_or(false) {
             return None;
         }
         let sty = view.tys.get(vi).copied().map_or(Ty::NONE, Ty);
         if reg_bank(view, sty) == bank { Some(vi) } else { None }
     };
-    let op_of = |i: usize| -> Option<Op> { (i < inst).then(|| view.op(i)) };
+    let op_of = |i: usize| -> Option<Op> { (i < len && is_before(i)).then(|| view.op(i)) };
     match view.op(inst) {
         Op::Fma | Op::Fmuladd => {
             let at = idx(*view.data.get(inst)?);
@@ -803,7 +820,13 @@ fn preferred_inplace_operand(
             let at = idx(*view.data.get(inst)?);
             let a = *view.extra.get(at)?;
             let b = *view.extra.get(at + 1)?;
-            if op_of(idx(b)) == Some(Op::Mul) && op_of(idx(a)) != Some(Op::Mul) {
+            let (ai, bi) = (idx(a), idx(b));
+            let (oa, ob) = (op_of(ai), op_of(bi));
+            if ob == Some(Op::Mul) && oa != Some(Op::Mul) {
+                valid_src(a)
+            } else if oa == Some(Op::Param) {
+                valid_src(a)
+            } else if oa == Some(Op::Sub) {
                 valid_src(a)
             } else {
                 None
@@ -821,7 +844,7 @@ fn preferred_inplace_operand(
             let fv = *view.extra.get(at + 2)?;
             for cand in [cv, fv, tv] {
                 if let Some(ci) = valid_src(cand) {
-                    if last_use.get(ci).copied() == Some(inst) {
+                    if is_dying(ci) {
                         return Some(ci);
                     }
                 }
@@ -842,9 +865,10 @@ fn vec_fma_avoid_regs(
     loc_try: &[AllocLoc],
     inst: usize,
 ) -> (u8, u8) {
+    let len = view.len();
     let vec_reg_of = |v: u32| -> u8 {
         let vi = idx(v);
-        if skip_alloc.get(vi).copied().unwrap_or(false) && view.op(vi) == Op::Splat {
+        if vi < len && skip_alloc.get(vi).copied().unwrap_or(false) && view.op(vi) == Op::Splat {
             if let Some(&sv) = view.data.get(vi) {
                 return match loc_try.get(idx(sv)).copied() {
                     Some(AllocLoc::Fp(r)) => r,
@@ -886,9 +910,9 @@ fn vec_fma_avoid_regs(
                 return (NO_REG, NO_REG);
             };
             let (ai, bi) = (idx(a), idx(b));
-            if ai < inst && skip_alloc.get(ai).copied().unwrap_or(false) && view.op(ai) == Op::Fmul {
+            if ai < len && skip_alloc.get(ai).copied().unwrap_or(false) && view.op(ai) == Op::Fmul {
                 mul_operands(ai)
-            } else if bi < inst && skip_alloc.get(bi).copied().unwrap_or(false) && view.op(bi) == Op::Fmul {
+            } else if bi < len && skip_alloc.get(bi).copied().unwrap_or(false) && view.op(bi) == Op::Fmul {
                 mul_operands(bi)
             } else {
                 (NO_REG, NO_REG)
@@ -899,7 +923,7 @@ fn vec_fma_avoid_regs(
                 return (NO_REG, NO_REG);
             };
             let bi = idx(b);
-            if bi < inst && skip_alloc.get(bi).copied().unwrap_or(false) && view.op(bi) == Op::Fmul {
+            if bi < len && skip_alloc.get(bi).copied().unwrap_or(false) && view.op(bi) == Op::Fmul {
                 mul_operands(bi)
             } else {
                 (NO_REG, NO_REG)
@@ -910,9 +934,9 @@ fn vec_fma_avoid_regs(
                 return (NO_REG, NO_REG);
             };
             let (ai, bi) = (idx(a), idx(b));
-            if ai < inst && skip_alloc.get(ai).copied().unwrap_or(false) && view.op(ai) == Op::Mul {
+            if ai < len && skip_alloc.get(ai).copied().unwrap_or(false) && view.op(ai) == Op::Mul {
                 mul_operands(ai)
-            } else if bi < inst && skip_alloc.get(bi).copied().unwrap_or(false) && view.op(bi) == Op::Mul {
+            } else if bi < len && skip_alloc.get(bi).copied().unwrap_or(false) && view.op(bi) == Op::Mul {
                 mul_operands(bi)
             } else {
                 (NO_REG, NO_REG)
@@ -923,7 +947,7 @@ fn vec_fma_avoid_regs(
                 return (NO_REG, NO_REG);
             };
             let bi = idx(b);
-            if bi < inst && skip_alloc.get(bi).copied().unwrap_or(false) && view.op(bi) == Op::Mul {
+            if bi < len && skip_alloc.get(bi).copied().unwrap_or(false) && view.op(bi) == Op::Mul {
                 mul_operands(bi)
             } else {
                 (NO_REG, NO_REG)
@@ -931,6 +955,475 @@ fn vec_fma_avoid_regs(
         }
         _ => (NO_REG, NO_REG),
     }
+}
+
+/// Sentinel for instructions without a dense liveness value id.
+const NO_VAL: u32 = u32::MAX;
+
+/// Visits every non-skipped transitive operand `(direct_user, val_inst)` read by `inst`,
+/// expanding iteratively (zero recursion) through `skip_alloc` so fused producers (e.g.
+/// cross-block `PtrAdd(base, Shl(idx, k))`, `CmpBr`, `MemBaseOff`) keep their true operands
+/// live at every emitted consumer site.
+fn for_each_expanded_use<A: Allocator>(
+    view: &View<'_>,
+    skip_alloc: &[bool],
+    inst: usize,
+    work: &mut Vec<(usize, u32), A>,
+    mut f: impl FnMut(usize, usize),
+) {
+    let len = view.len();
+    let max_steps = len.saturating_mul(2).max(64);
+    work.clear();
+    for_each_use(view, inst, |v| work.push((inst, v)));
+    let mut steps = 0usize;
+    while let Some((user, v)) = work.pop() {
+        let vi = idx(v);
+        if vi >= len {
+            continue;
+        }
+        if skip_alloc.get(vi).copied().unwrap_or(false) {
+            if steps < max_steps {
+                steps += 1;
+                for_each_use(view, vi, |u| work.push((vi, u)));
+            }
+        } else {
+            f(user, vi);
+        }
+    }
+}
+
+/// Visits every non-skipped transitive operand of a single value `root` (e.g. a branch
+/// condition or a specific edge argument), expanding iteratively through `skip_alloc`.
+fn for_each_expanded_val<A: Allocator>(
+    view: &View<'_>,
+    skip_alloc: &[bool],
+    user: usize,
+    root: u32,
+    work: &mut Vec<(usize, u32), A>,
+    mut f: impl FnMut(usize, usize),
+) {
+    let len = view.len();
+    let max_steps = len.saturating_mul(2).max(64);
+    work.clear();
+    work.push((user, root));
+    let mut steps = 0usize;
+    while let Some((cur_user, v)) = work.pop() {
+        let vi = idx(v);
+        if vi >= len {
+            continue;
+        }
+        if skip_alloc.get(vi).copied().unwrap_or(false) {
+            if steps < max_steps {
+                steps += 1;
+                for_each_use(view, vi, |u| work.push((vi, u)));
+            }
+        } else {
+            f(cur_user, vi);
+        }
+    }
+}
+
+/// Clears bits in `[lo, hi)` from bitset word `word_idx`.
+#[inline]
+fn mask_out_range(word_idx: usize, word: u64, lo: usize, hi: usize) -> u64 {
+    let bit_lo = word_idx.saturating_mul(64);
+    let bit_hi = bit_lo.saturating_add(64);
+    if hi <= bit_lo || lo >= bit_hi || lo >= hi {
+        return word;
+    }
+    let start = lo.saturating_sub(bit_lo);
+    let end = hi.min(bit_hi) - bit_lo;
+    let count = end - start;
+    let mask = if count >= 64 {
+        u64::MAX
+    } else {
+        ((1u64 << count) - 1) << start
+    };
+    word & !mask
+}
+
+/// True iff `isel.rs` consumes constant operand `vi` (`cval`) purely as an inline instruction
+/// immediate at `user` without ever loading `vi` into a GPR.
+fn is_folded_imm_use(view: &View<'_>, user: usize, vi: usize, cval: u64) -> bool {
+    let op = view.op(user);
+    let u_ty = view.tys.get(user).copied().map_or(Ty::NONE, Ty);
+    let bits = if u_ty.is_scalar() && u_ty.is_int() { u_ty.bits(64) } else { 0 };
+    let Some(&at_raw) = view.data.get(user) else {
+        return false;
+    };
+    let at = idx(at_raw);
+    match op {
+        Op::Add if bits == 64 || bits == 32 => {
+            if cval > 4095 {
+                return false;
+            }
+            let (Some(&a), Some(&b)) = (view.extra.get(at), view.extra.get(at + 1)) else {
+                return false;
+            };
+            let (ai, bi) = (idx(a), idx(b));
+            ai != bi && (ai == vi || bi == vi)
+        }
+        Op::Sub if bits == 64 || bits == 32 => {
+            if cval > 4095 {
+                return false;
+            }
+            let (Some(&a), Some(&b)) = (view.extra.get(at), view.extra.get(at + 1)) else {
+                return false;
+            };
+            idx(b) == vi && idx(a) != vi
+        }
+        Op::Icmp => {
+            if cval > 4095 {
+                return false;
+            }
+            let (Some(&a), Some(&b)) = (view.extra.get(at + 1), view.extra.get(at + 2)) else {
+                return false;
+            };
+            let a_ty = view.tys.get(idx(a)).copied().map_or(Ty::NONE, Ty);
+            let abits = if a_ty.is_scalar() && a_ty.is_int() { a_ty.bits(64) } else { 0 };
+            (abits == 64 || abits == 32) && idx(b) == vi && idx(a) != vi
+        }
+        Op::PtrAdd => {
+            let Some(&b) = view.extra.get(at + 1) else {
+                return false;
+            };
+            if idx(b) != vi {
+                return false;
+            }
+            let b_ty = view.tys.get(vi).copied().map_or(Ty::NONE, Ty);
+            let bbits = b_ty.bits(64);
+            let delta = if bbits >= 64 {
+                cval.cast_signed()
+            } else {
+                let shift = 64 - bbits;
+                (cval << shift).cast_signed() >> shift
+            };
+            (-4095..=4095).contains(&delta)
+        }
+        Op::Shl | Op::Lshr | Op::Ashr | Op::Rotl | Op::Rotr if bits == 64 || bits == 32 => {
+            let (Some(&a), Some(&b)) = (view.extra.get(at), view.extra.get(at + 1)) else {
+                return false;
+            };
+            idx(b) == vi && idx(a) != vi
+        }
+        _ => false,
+    }
+}
+
+/// True iff `inst` lowers to a non-tail call or runtime helper call that clobbers caller-saved registers.
+fn is_clobbering_call_inst(view: &View<'_>, tail_calls: &[bool], inst: usize) -> bool {
+    if tail_calls.get(inst).copied().unwrap_or(false) {
+        return false;
+    }
+    let op = view.op(inst);
+    let is_runtime_bulk = matches!(op, Op::Memcpy | Op::Memset | Op::Memcmp) && {
+        let const_ok = view
+            .data
+            .get(inst)
+            .and_then(|&d| view.extra.get(idx(d) + 2))
+            .map(|&v| idx(v))
+            .is_some_and(|len_v| match view.op(len_v) {
+                Op::Iconst => view.data.get(len_v).is_some_and(|&w| sext32_u64(w) <= 256),
+                Op::IconstWide => view.data.get(len_v).is_some_and(|&d| {
+                    let at = idx(d);
+                    match (view.extra.get(at), view.extra.get(at + 1)) {
+                        (Some(&lo), Some(&hi)) => (u64::from(lo) | (u64::from(hi) << 32)) <= 256,
+                        _ => false,
+                    }
+                }),
+                _ => false,
+            });
+        !const_ok
+    };
+    let is_i128_div = view.tys.get(inst).copied().map(Ty) == Some(Ty::I128)
+        && matches!(op, Op::Udiv | Op::Sdiv | Op::Urem | Op::Srem);
+    let is_sme2_call = op == Op::TargetIntrinsic
+        && view
+            .data
+            .get(inst)
+            .and_then(|&d| view.extra.get(idx(d)))
+            .is_some_and(|&id| {
+                let name = view.intrinsic_name(blaze_lir::func::IntrinsicId(id));
+                name == b"blaze.sme2.gemm_f32"
+                    || name == b"blaze.sme2.gemm_f64"
+                    || name == b"blaze.sme2.gemm_i8_i32"
+                    || name == b"blaze.sme2.gemm_u8_u32"
+            });
+    matches!(
+        op,
+        Op::Call
+            | Op::CallIndirect
+            | Op::Invoke
+            | Op::InvokeIndirect
+            | Op::Resume
+            | Op::TlsAddr
+            | Op::Memmove
+            | Op::Frem
+    ) || is_runtime_bulk
+        || is_i128_div
+        || is_sme2_call
+}
+
+/// Extracts the rematerializable 64-bit scalar integer constant for `inst`, if any.
+fn extract_remat_const(view: &View<'_>, inst: usize) -> Option<u64> {
+    let ty = view.tys.get(inst).copied().map_or(Ty::NONE, Ty);
+    if !(ty.is_scalar() && ty.is_int() && ty.bits(64) <= 64) {
+        return None;
+    }
+    let bits = ty.bits(64);
+    let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+    match view.op(inst) {
+        Op::Iconst => view.data.get(inst).map(|&w| {
+            let v = if bits <= 32 { u64::from(w) } else { sext32_u64(w) };
+            v & mask
+        }),
+        Op::IconstWide => view.data.get(inst).and_then(|&d| {
+            let at = idx(d);
+            let lo = u64::from(*view.extra.get(at)?);
+            let hi = if ty.const_words() >= 2 {
+                u64::from(*view.extra.get(at + 1)?)
+            } else {
+                0
+            };
+            Some((lo | (hi << 32)) & mask)
+        }),
+        _ => None,
+    }
+}
+
+/// Seeds ABI register hints for entry parameters (including `sret` in `X8`), landing-pad
+/// exception parameters (`X0`), and `Op::Return` values (`X0`/`X1`/`V0`/`V1`).
+fn seed_abi_and_return_hints(view: &View<'_>, os: crate::Os, hint: &mut [u8]) {
+    let func_sig = view.sig(SigId(view.head.sig));
+    let entry_params = view.params(Block(0));
+    let mut regs = Regs::new(os);
+    for (k, p) in (entry_params.start..entry_params.end).enumerate() {
+        let pkind = func_sig
+            .params
+            .get(k)
+            .and_then(|sp| ParamKind::from_byte(sp.kind))
+            .unwrap_or(ParamKind::Value);
+        if pkind == ParamKind::Sret {
+            if let Some(slot) = hint.get_mut(p) {
+                *slot = reg_u8(X8);
+            }
+            continue;
+        }
+        let ty = view.tys.get(p).copied().map_or(Ty::NONE, Ty);
+        match regs.next(ty) {
+            Some(Loc::V(reg, _)) | Some(Loc::X(reg)) => {
+                if let Some(slot) = hint.get_mut(p) {
+                    *slot = reg_u8(reg);
+                }
+            }
+            Some(Loc::Pair(_)) | None => {}
+        }
+    }
+    let blocks = view.blocks();
+    for b in 0..blocks {
+        if view.block_kind(Block(u32_of(b))).is_landing() {
+            let params = view.params(Block(u32_of(b)));
+            if params.start < params.end {
+                if let Some(slot) = hint.get_mut(params.start) {
+                    *slot = reg_u8(X0);
+                }
+            }
+        }
+        let term = view.terminator(Block(u32_of(b)));
+        if view.op(term) == Op::Return {
+            if let Some(&at_raw) = view.data.get(term) {
+                let at = idx(at_raw);
+                if let Some(&retc_raw) = view.extra.get(at) {
+                    let retc = idx(retc_raw);
+                    if retc >= 1 {
+                        if let Some(&rv0_raw) = view.extra.get(at + 1) {
+                            let rv0 = idx(rv0_raw);
+                            if let Some(slot) = hint.get_mut(rv0) {
+                                if *slot == NO_REG {
+                                    let is_fp_or_vec = view.tys.get(rv0).copied().is_some_and(|t| {
+                                        let ty = Ty(t);
+                                        is_fp_ty(ty).is_some() || is_vec128_ty(ty).is_some()
+                                    });
+                                    *slot = if is_fp_or_vec { 0 } else { reg_u8(X0) };
+                                }
+                            }
+                        }
+                    }
+                    if retc == 2 {
+                        if let Some(&rv1_raw) = view.extra.get(at + 2) {
+                            let rv1 = idx(rv1_raw);
+                            if let Some(slot) = hint.get_mut(rv1) {
+                                if *slot == NO_REG {
+                                    let is_fp_or_vec = view.tys.get(rv1).copied().is_some_and(|t| {
+                                        let ty = Ty(t);
+                                        is_fp_ty(ty).is_some() || is_vec128_ty(ty).is_some()
+                                    });
+                                    *slot = if is_fp_or_vec { 1 } else { reg_u8(X1) };
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Propagates scalar FP return hints backward through lane-0 `Op::Extract` into the source vector
+/// so `v -> extract(v, 0) -> ret` stays in the same FP register with zero `fmov` instructions.
+fn propagate_extract_lane0_hints(view: &View<'_>, hint: &mut [u8], rev_insts: impl Iterator<Item = usize>) {
+    for inst in rev_insts {
+        if view.op(inst) == Op::Extract {
+            let ty = view.tys.get(inst).copied().map_or(Ty::NONE, Ty);
+            if is_fp_ty(ty).is_some() {
+                let ih = hint.get(inst).copied().unwrap_or(NO_REG);
+                if ih != NO_REG {
+                    if let Some(&d) = view.data.get(inst) {
+                        let at = idx(d);
+                        if view.extra.get(at + 1).copied() == Some(0) {
+                            if let Some(&vec_v) = view.extra.get(at) {
+                                let vi = idx(vec_v);
+                                if let Some(vh) = hint.get_mut(vi) {
+                                    if *vh == NO_REG {
+                                        *vh = ih;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Builds the final [`Allocation`] with exact ARM64 unwind pair masks and IPRA clobber summary.
+fn finalize_allocation<A: Allocator>(
+    view: &View<'_>,
+    loc_of: Vec<AllocLoc, A>,
+    used_callee_gpr: [bool; 32],
+    used_callee_fp: [bool; 32],
+    num_spill_slots: u32,
+    remat_count: u32,
+    call_positions: &[usize],
+    call_clobbers: impl Fn(usize) -> CallClobbers,
+) -> Allocation<A> {
+    let mut x_pairs = 0u8;
+    for k in 0..5usize {
+        let lo = 19 + 2 * k;
+        let hi = lo + 1;
+        if used_callee_gpr.get(lo).copied().unwrap_or(false)
+            || used_callee_gpr.get(hi).copied().unwrap_or(false)
+        {
+            x_pairs |= 1 << k;
+        }
+    }
+    let mut d_pairs = 0u8;
+    for k in 0..4usize {
+        let lo = 8 + 2 * k;
+        let hi = lo + 1;
+        if used_callee_fp.get(lo).copied().unwrap_or(false)
+            || used_callee_fp.get(hi).copied().unwrap_or(false)
+        {
+            d_pairs |= 1 << k;
+        }
+    }
+
+    let func_sig = view.sig(SigId(view.head.sig));
+    let mut clob = RegSet::EMPTY
+        .with(TierReg(16))
+        .with(TierReg(17));
+    for &loc in &loc_of {
+        match loc {
+            AllocLoc::Gpr(r) if !(19..=28).contains(&r) => clob = clob.with(TierReg(r)),
+            AllocLoc::GprPair(lo, hi) => {
+                if !(19..=28).contains(&lo) {
+                    clob = clob.with(TierReg(lo));
+                }
+                if !(19..=28).contains(&hi) {
+                    clob = clob.with(TierReg(hi));
+                }
+            }
+            AllocLoc::Fp(r) | AllocLoc::Vec(r) => {
+                if !(8..=15).contains(&r) {
+                    clob = clob.with(TierReg(32 + r));
+                }
+                clob = clob.with(TierReg(32 + 29)).with(TierReg(32 + 30)).with(TierReg(32 + 31));
+            }
+            _ => {}
+        }
+    }
+    if let Some(first_ret) = func_sig.rets.first() {
+        let r0 = Ty(first_ret.ty);
+        if is_fp_ty(r0).is_some() || is_vec128_ty(r0).is_some() {
+            clob = clob.with(TierReg(32));
+        } else {
+            clob = clob.with(TierReg(0));
+            if func_sig.rets.len() >= 2 {
+                clob = clob.with(TierReg(1));
+            }
+        }
+    }
+    for &c in call_positions {
+        clob = clob.with(TierReg(30));
+        clob = clob.union(call_clobbers(c).clobbered);
+    }
+
+    Allocation {
+        loc_of,
+        x_pairs,
+        d_pairs,
+        num_spill_slots,
+        has_calls: !call_positions.is_empty(),
+        clobbers: CallClobbers { clobbered: clob },
+        remat_count,
+    }
+}
+
+/// Returns `true` iff `view` fits within the bounded exact-CFG interference bitmatrix budget
+/// (`blocks <= EXACT_CFG_MAX_BLOCKS` and allocated SSA values `<= EXACT_CFG_MAX_VALS`).
+fn fits_exact_cfg<A: Allocator + Copy>(
+    view: &View<'_>,
+    skip_alloc: &[bool],
+    alloc: A,
+) -> bool {
+    if view.blocks() > EXACT_CFG_MAX_BLOCKS {
+        return false;
+    }
+    let len = view.len();
+    let mut typed_count = 0usize;
+    for inst in 0..len {
+        if !skip_alloc.get(inst).copied().unwrap_or(false)
+            && view.tys.get(inst).copied().map_or(Ty::NONE, Ty) != Ty::NONE
+        {
+            typed_count += 1;
+        }
+    }
+    if typed_count <= EXACT_CFG_MAX_VALS {
+        return true;
+    }
+    let mut used: Vec<bool, A> = Vec::with_capacity_in(len, alloc);
+    for _ in 0..len {
+        used.push(false);
+    }
+    for inst in 0..len {
+        for_each_use(view, inst, |v| {
+            let vi = idx(v);
+            if let Some(u) = used.get_mut(vi) {
+                *u = true;
+            }
+        });
+    }
+    let mut num_vals = 0usize;
+    for inst in 0..len {
+        if !skip_alloc.get(inst).copied().unwrap_or(false)
+            && view.tys.get(inst).copied().map_or(Ty::NONE, Ty) != Ty::NONE
+            && used.get(inst).copied().unwrap_or(false)
+        {
+            num_vals += 1;
+        }
+    }
+    num_vals <= EXACT_CFG_MAX_VALS
 }
 
 /// Active register-allocated interval entry for loop-weighted eviction.
@@ -979,6 +1472,11 @@ pub(crate) fn allocate_with_ipra<A: Allocator + Copy>(
 
 /// IPRA-aware register allocation with optional interprocedural register-avoidance scratch order
 /// (`scratch_order`): callees allocate caller-untouched GPR/FP registers before caller-hot ones.
+///
+/// Dispatches to exact-CFG backward liveness + symmetric SSA interference bitmatrix coloring
+/// whenever `blocks <= EXACT_CFG_MAX_BLOCKS` and allocated SSA values `<= EXACT_CFG_MAX_VALS`
+/// (`<= 6.75 MiB` worst-case), and falls back to the O(N log K) RPO-ordered `BusySet` linear-scan
+/// allocator for mega-functions (e.g. 600k-inst / 130k-block generated parsers).
 pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
     view: &View<'_>,
     skip_alloc: &[bool],
@@ -991,28 +1489,78 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
 ) -> Result<Allocation<A>, RegAllocError> {
     let caller_gpr_order = build_caller_gpr_order(scratch_order);
     let caller_fp_order = build_caller_fp_order(scratch_order);
+    if fits_exact_cfg(view, skip_alloc, alloc) {
+        allocate_exact_cfg(
+            view,
+            skip_alloc,
+            tail_calls,
+            max_spill_slots,
+            os,
+            call_clobbers,
+            &caller_gpr_order,
+            &caller_fp_order,
+            alloc,
+        )
+    } else {
+        allocate_linear_scan_rpo(
+            view,
+            skip_alloc,
+            tail_calls,
+            max_spill_slots,
+            os,
+            call_clobbers,
+            &caller_gpr_order,
+            &caller_fp_order,
+            alloc,
+        )
+    }
+}
+
+/// Exact-CFG backward liveness + symmetric SSA interference bitmatrix allocator with
+/// call-crossing 1-inst constant rematerialization (`AllocLoc::RematConst`), cold-only
+/// global/func address rematerialization (`AllocLoc::RematGlobal`), and aggressive
+/// non-interfering coalescing.
+#[allow(clippy::too_many_arguments)]
+fn allocate_exact_cfg<A: Allocator + Copy>(
+    view: &View<'_>,
+    skip_alloc: &[bool],
+    tail_calls: &[bool],
+    max_spill_slots: u32,
+    os: crate::Os,
+    call_clobbers: impl Fn(usize) -> CallClobbers,
+    caller_gpr_order: &[Reg; 16],
+    caller_fp_order: &[Reg; 21],
+    alloc: A,
+) -> Result<Allocation<A>, RegAllocError> {
     let len = view.len();
     let blocks = view.blocks();
-    let mut last_use: Vec<usize, A> = Vec::with_capacity_in(len, alloc);
     let mut has_any_use: Vec<bool, A> = Vec::with_capacity_in(len, alloc);
     let mut use_weight: Vec<u32, A> = Vec::with_capacity_in(len, alloc);
-    let mut inst_block: Vec<u32, A> = Vec::with_capacity_in(len, alloc);
+    let mut max_use_depth: Vec<u32, A> = Vec::with_capacity_in(len, alloc);
+    let mut has_hot_use: Vec<bool, A> = Vec::with_capacity_in(len, alloc);
+    let mut is_clobbering_call: Vec<bool, A> = Vec::with_capacity_in(len, alloc);
     let mut call_positions: Vec<usize, A> = Vec::new_in(alloc);
+    let mut remat_val: Vec<Option<u64>, A> = Vec::with_capacity_in(len, alloc);
     for i in 0..len {
-        last_use.push(i);
         has_any_use.push(false);
         use_weight.push(0);
-        inst_block.push(0);
+        max_use_depth.push(0);
+        has_hot_use.push(false);
+        is_clobbering_call.push(false);
+        remat_val.push(extract_remat_const(view, i));
     }
 
-    // 0. Compute per-block loop nesting depth from backward CFG edges (`target <= b`) in O(B) via
-    //    a difference array.
+    // 0. Compute per-block loop nesting depth in O(B) via a difference array and identify cold
+    //    dead-end blocks (blocks that can never reach `Op::Return` and are not in a loop,
+    //    e.g. panic/bounds-check/trap/unwind blocks).
     let mut depth_diff: Vec<i32, A> = Vec::with_capacity_in(blocks + 1, alloc);
+    let mut can_return: Vec<bool, A> = Vec::with_capacity_in(blocks, alloc);
     for _ in 0..=blocks {
         depth_diff.push(0);
     }
     for b in 0..blocks {
         let term = view.terminator(Block(u32_of(b)));
+        can_return.push(view.op(term) == Op::Return);
         for_each_edge(view, term, |target_block, _, _| {
             let tb = idx(target_block);
             if tb <= b {
@@ -1031,185 +1579,398 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
         cur_depth = cur_depth.saturating_add(depth_diff.get(b).copied().unwrap_or(0));
         block_depth.push(u32::try_from(cur_depth.max(0)).unwrap_or(u32::MAX));
     }
-
-    // 1. Compute live intervals `[def, last_use]`, call sites, and loop-weighted spill priorities.
+    loop {
+        let mut changed = false;
+        for b in (0..blocks).rev() {
+            if can_return.get(b).copied().unwrap_or(false) {
+                continue;
+            }
+            let term = view.terminator(Block(u32_of(b)));
+            let mut reaches_ret = false;
+            for_each_edge(view, term, |target_block, _, _| {
+                if can_return.get(idx(target_block)).copied().unwrap_or(false) {
+                    reaches_ret = true;
+                }
+            });
+            if reaches_ret {
+                if let Some(slot) = can_return.get_mut(b) {
+                    *slot = true;
+                }
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut is_cold_block: Vec<bool, A> = Vec::with_capacity_in(blocks, alloc);
     for b in 0..blocks {
-        let depth = block_depth.get(b).copied().unwrap_or(0).min(5);
+        let cold = !can_return.get(b).copied().unwrap_or(false)
+            && block_depth.get(b).copied().unwrap_or(0) == 0;
+        is_cold_block.push(cold);
+    }
+
+    // 1. Scan emitted instructions: record clobbering call sites, loop-weighted use priorities,
+    //    exact non-immediate use depths, and hot-vs-cold use status (expanding through `skip_alloc`).
+    let mut work: Vec<(usize, u32), A> = Vec::with_capacity_in(16, alloc);
+    for b in 0..blocks {
+        let raw_depth = block_depth.get(b).copied().unwrap_or(0);
+        let depth = raw_depth.min(5);
         let b_weight = 1u32 << (depth * 4); // 1x outer, 16x depth-1, 256x depth-2, 4096x depth-3, ...
+        let b_is_cold = is_cold_block.get(b).copied().unwrap_or(false);
         let range = view.block(Block(u32_of(b)));
         for inst in range {
-            if let Some(slot) = inst_block.get_mut(inst) {
-                *slot = u32_of(b);
+            if skip_alloc.get(inst).copied().unwrap_or(false) {
+                continue;
             }
             let op = view.op(inst);
-            let is_runtime_bulk = matches!(op, Op::Memcpy | Op::Memset | Op::Memcmp) && {
-                let const_ok = view
-                    .data
-                    .get(inst)
-                    .and_then(|&d| view.extra.get(idx(d) + 2))
-                    .map(|&v| idx(v))
-                    .is_some_and(|len_v| match view.op(len_v) {
-                        Op::Iconst => view.data.get(len_v).is_some_and(|&w| sext32_u64(w) <= 256),
-                        Op::IconstWide => view.data.get(len_v).is_some_and(|&d| {
-                            let at = idx(d);
-                            match (view.extra.get(at), view.extra.get(at + 1)) {
-                                (Some(&lo), Some(&hi)) => (u64::from(lo) | (u64::from(hi) << 32)) <= 256,
-                                _ => false,
-                            }
-                        }),
-                        _ => false,
-                    });
-                !const_ok
-            };
-            let is_i128_div = view.tys.get(inst).copied().map(Ty) == Some(Ty::I128)
-                && matches!(op, Op::Udiv | Op::Sdiv | Op::Urem | Op::Srem);
-            let is_sme2_call = op == Op::TargetIntrinsic
-                && view
-                    .data
-                    .get(inst)
-                    .and_then(|&d| view.extra.get(idx(d)))
-                    .is_some_and(|&id| {
-                        let name = view.intrinsic_name(blaze_lir::func::IntrinsicId(id));
-                        name == b"blaze.sme2.gemm_f32"
-                            || name == b"blaze.sme2.gemm_f64"
-                            || name == b"blaze.sme2.gemm_i8_i32"
-                            || name == b"blaze.sme2.gemm_u8_u32"
-                    });
-            let is_non_tail_call = (matches!(
-                op,
-                Op::Call
-                    | Op::CallIndirect
-                    | Op::Invoke
-                    | Op::InvokeIndirect
-                    | Op::Resume
-                    | Op::TlsAddr
-                    | Op::Memmove
-                    | Op::Frem
-            ) || is_runtime_bulk
-                || is_i128_div
-                || is_sme2_call)
-                && !tail_calls.get(inst).copied().unwrap_or(false);
-            if is_non_tail_call {
+            if is_clobbering_call_inst(view, tail_calls, inst) {
                 call_positions.push(inst);
+                if let Some(slot) = is_clobbering_call.get_mut(inst) {
+                    *slot = true;
+                }
             }
             // Value defined inside a hot loop carries that loop's weight.
             if let Some(w) = use_weight.get_mut(inst) {
                 *w = w.saturating_add(b_weight);
             }
-            for_each_use(view, inst, |v| {
-                let vi = idx(v);
-                if vi < len {
-                    if let Some(u) = has_any_use.get_mut(vi) {
-                        *u = true;
-                    }
-                    if let Some(w) = use_weight.get_mut(vi) {
-                        *w = w.saturating_add(b_weight);
-                    }
-                    if let Some(lu) = last_use.get_mut(vi) {
-                        if inst > *lu {
-                            *lu = inst;
+            for_each_expanded_use(view, skip_alloc, inst, &mut work, |user, vi| {
+                if let Some(u) = has_any_use.get_mut(vi) {
+                    *u = true;
+                }
+                if let Some(w) = use_weight.get_mut(vi) {
+                    *w = w.saturating_add(b_weight);
+                }
+                let imm_folded = remat_val
+                    .get(vi)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|cval| is_folded_imm_use(view, user, vi, cval));
+                if !imm_folded {
+                    if let Some(md) = max_use_depth.get_mut(vi) {
+                        if raw_depth > *md {
+                            *md = raw_depth;
                         }
                     }
                 }
             });
-        }
-    }
-
-    // Propagate fused producers' operand lifetimes and loop weights to their consumer's position (reverse scan).
-    for inst in (0..len).rev() {
-        if skip_alloc.get(inst).copied().unwrap_or(false) {
-            let consumer_end = last_use.get(inst).copied().unwrap_or(0);
-            let consumer_w = use_weight.get(inst).copied().unwrap_or(0);
-            for_each_use(view, inst, |v| {
-                let vi = idx(v);
-                if let Some(lu) = last_use.get_mut(vi) {
-                    if consumer_end > *lu {
-                        *lu = consumer_end;
+            // Track whether any non-cold path reads each operand (edge args belong to their target block
+            // so `br(oob, (panic_blk, &[loc]), (ok_blk, &[]))` keeps `loc` cold-only!).
+            if matches!(op, Op::Jump | Op::Br | Op::Switch) {
+                if !b_is_cold && matches!(op, Op::Br | Op::Switch) {
+                    if let Some(&d) = view.data.get(inst) {
+                        if let Some(&cond_or_scrut) = view.extra.get(idx(d)) {
+                            for_each_expanded_val(view, skip_alloc, inst, cond_or_scrut, &mut work, |_, vi| {
+                                if let Some(h) = has_hot_use.get_mut(vi) {
+                                    *h = true;
+                                }
+                            });
+                        }
                     }
                 }
-                if let Some(w) = use_weight.get_mut(vi) {
-                    if consumer_w > *w {
-                        *w = consumer_w;
-                    }
-                }
-            });
-        }
-    }
-
-    // Extend live intervals across backward CFG edges (loops and backward unwind edges) to a fixed point.
-    // Deduplicate back-edges by `target_start` (keeping max `ext_end`), and only scan values whose
-    // live interval crosses a block boundary (block-local values can never span a block start).
-    let mut back_edges: Vec<(usize, usize), A> = Vec::new_in(alloc);
-    for b in 0..blocks {
-        let term = view.terminator(Block(u32_of(b)));
-        let term_is_invoke = matches!(view.op(term), Op::Invoke | Op::InvokeIndirect);
-        for_each_edge(view, term, |target_block, _, _| {
-            let target_start = view.block(Block(target_block)).start;
-            if target_start <= term {
-                let ext_end = if term_is_invoke { term.saturating_add(1) } else { term };
-                back_edges.push((target_start, ext_end));
-            }
-        });
-    }
-    if !back_edges.is_empty() {
-        back_edges.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
-        let mut unique_edges: Vec<(usize, usize), A> = Vec::with_capacity_in(back_edges.len(), alloc);
-        for &(ts, ee) in &back_edges {
-            if unique_edges.last().is_none_or(|&(prev_ts, _)| prev_ts != ts) {
-                unique_edges.push((ts, ee));
-            }
-        }
-        let mut cross_vals: Vec<usize, A> = Vec::new_in(alloc);
-        let mut skip_list: Vec<usize, A> = Vec::new_in(alloc);
-        for inst in 0..len {
-            if skip_alloc.get(inst).copied().unwrap_or(false) {
-                skip_list.push(inst);
-            }
-            if has_any_use.get(inst).copied().unwrap_or(false) {
-                let b = inst_block.get(inst).copied().unwrap_or(0);
-                let b_end = view.block(Block(b)).end;
-                let lu = last_use.get(inst).copied().unwrap_or(0);
-                if lu >= b_end {
-                    cross_vals.push(inst);
-                }
-            }
-        }
-        loop {
-            let mut changed = false;
-            for &(target_start, ext_end) in &unique_edges {
-                let hi_idx = cross_vals.partition_point(|&v| v < target_start);
-                if let Some(slice) = cross_vals.get(..hi_idx) {
-                    for &v in slice {
-                        if let Some(lu) = last_use.get_mut(v) {
-                            if *lu >= target_start && *lu < ext_end {
-                                *lu = ext_end;
-                                changed = true;
+                for_each_edge(view, inst, |target_block, args_start, args_len| {
+                    if !is_cold_block.get(idx(target_block)).copied().unwrap_or(false) {
+                        if let Some(args) = view.extra.get(args_start..args_start + args_len) {
+                            for &arg_raw in args {
+                                for_each_expanded_val(view, skip_alloc, inst, arg_raw, &mut work, |_, vi| {
+                                    if let Some(h) = has_hot_use.get_mut(vi) {
+                                        *h = true;
+                                    }
+                                });
                             }
                         }
                     }
-                }
-            }
-            if !changed {
-                break;
-            }
-            for &inst in skip_list.iter().rev() {
-                let consumer_end = last_use.get(inst).copied().unwrap_or(0);
-                for_each_use(view, inst, |v| {
-                    let vi = idx(v);
-                    if let Some(lu) = last_use.get_mut(vi) {
-                        if consumer_end > *lu {
-                            *lu = consumer_end;
-                        }
+                });
+            } else if !b_is_cold {
+                for_each_expanded_use(view, skip_alloc, inst, &mut work, |_, vi| {
+                    if let Some(h) = has_hot_use.get_mut(vi) {
+                        *h = true;
                     }
                 });
             }
         }
     }
 
+    // 1b. Exact CFG backward liveness + exact `crosses_call` + exact symmetric interference matrix!
+    // Assign dense value IDs `0..num_vals` to every used, non-skipped SSA value in block/program order.
+    let mut val_id: Vec<u32, A> = Vec::with_capacity_in(len, alloc);
+    let mut val_inst: Vec<usize, A> = Vec::with_capacity_in(len / 2 + 1, alloc);
+    let mut blk_val_start: Vec<usize, A> = Vec::with_capacity_in(blocks, alloc);
+    let mut blk_val_end: Vec<usize, A> = Vec::with_capacity_in(blocks, alloc);
+    for _ in 0..len {
+        val_id.push(NO_VAL);
+    }
+    for b in 0..blocks {
+        let start_id = val_inst.len();
+        let range = view.block(Block(u32_of(b)));
+        for inst in range {
+            if skip_alloc.get(inst).copied().unwrap_or(false) {
+                continue;
+            }
+            let ty = view.tys.get(inst).copied().map_or(Ty::NONE, Ty);
+            if ty != Ty::NONE && has_any_use.get(inst).copied().unwrap_or(false) {
+                let id = u32_of(val_inst.len());
+                val_inst.push(inst);
+                if let Some(slot) = val_id.get_mut(inst) {
+                    *slot = id;
+                }
+            }
+        }
+        blk_val_start.push(start_id);
+        blk_val_end.push(val_inst.len());
+    }
+    let num_vals = val_inst.len();
+    let val_words = num_vals.div_ceil(64);
+
+    // Initialize `live_in[b]` with the upward-exposed uses of block `b`, then iterate to fixed point:
+    // `live_in[b] = upward_use[b] | U_{s in succ(b)} (live_in[s] \ defs(b))`.
+    let mut live_in: Vec<u64, A> = Vec::with_capacity_in(blocks.saturating_mul(val_words), alloc);
+    for _ in 0..blocks.saturating_mul(val_words) {
+        live_in.push(0);
+    }
+    if val_words > 0 {
+        for b in 0..blocks {
+            let b_base = b.saturating_mul(val_words);
+            let range = view.block(Block(u32_of(b)));
+            for inst in range.rev() {
+                if skip_alloc.get(inst).copied().unwrap_or(false) {
+                    continue;
+                }
+                let def_vid = val_id.get(inst).copied().unwrap_or(NO_VAL);
+                if def_vid != NO_VAL {
+                    let d = idx(def_vid);
+                    if let Some(slot) = live_in.get_mut(b_base + (d >> 6)) {
+                        *slot &= !(1u64 << (d & 63));
+                    }
+                }
+                for_each_expanded_use(view, skip_alloc, inst, &mut work, |_, vi| {
+                    let u_vid = val_id.get(vi).copied().unwrap_or(NO_VAL);
+                    if u_vid != NO_VAL {
+                        let u = idx(u_vid);
+                        if let Some(slot) = live_in.get_mut(b_base + (u >> 6)) {
+                            *slot |= 1u64 << (u & 63);
+                        }
+                    }
+                });
+            }
+        }
+        loop {
+            let mut changed = false;
+            for b in (0..blocks).rev() {
+                let lo = blk_val_start.get(b).copied().unwrap_or(0);
+                let hi = blk_val_end.get(b).copied().unwrap_or(0);
+                let b_base = b.saturating_mul(val_words);
+                let term = view.terminator(Block(u32_of(b)));
+                for_each_edge(view, term, |target_block, _, _| {
+                    let s_base = idx(target_block).saturating_mul(val_words);
+                    for w in 0..val_words {
+                        let sw = live_in.get(s_base + w).copied().unwrap_or(0);
+                        let filtered = mask_out_range(w, sw, lo, hi);
+                        if let Some(bw) = live_in.get_mut(b_base + w) {
+                            let next = *bw | filtered;
+                            if next != *bw {
+                                *bw = next;
+                                changed = true;
+                            }
+                        }
+                    }
+                });
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    // Exact per-block backward walk computing exact `val_crosses_call`, `val_crossed_clobbers`,
+    // and symmetric SSA interference bitmatrix `interf` (`num_vals x val_words`).
+    let mut val_crosses_call: Vec<bool, A> = Vec::with_capacity_in(len, alloc);
+    let mut val_crossed_clobbers: Vec<CallClobbers, A> = Vec::with_capacity_in(len, alloc);
+    for _ in 0..len {
+        val_crosses_call.push(false);
+        val_crossed_clobbers.push(CallClobbers::EMPTY);
+    }
+    let mut interf: Vec<u64, A> = Vec::with_capacity_in(num_vals.saturating_mul(val_words), alloc);
+    for _ in 0..num_vals.saturating_mul(val_words) {
+        interf.push(0);
+    }
+    let mut live: Vec<u64, A> = Vec::with_capacity_in(val_words, alloc);
+    for _ in 0..val_words {
+        live.push(0);
+    }
+    if val_words > 0 {
+        for b in 0..blocks {
+            for slot in live.iter_mut() {
+                *slot = 0;
+            }
+            let term = view.terminator(Block(u32_of(b)));
+            for_each_edge(view, term, |target_block, _, _| {
+                let s_base = idx(target_block).saturating_mul(val_words);
+                for w in 0..val_words {
+                    let sw = live_in.get(s_base + w).copied().unwrap_or(0);
+                    if let Some(lw) = live.get_mut(w) {
+                        *lw |= sw;
+                    }
+                }
+            });
+            let range = view.block(Block(u32_of(b)));
+            for inst in range.rev() {
+                if skip_alloc.get(inst).copied().unwrap_or(false) {
+                    continue;
+                }
+                let def_vid = val_id.get(inst).copied().unwrap_or(NO_VAL);
+                if def_vid != NO_VAL {
+                    let d = idx(def_vid);
+                    let d_word = d >> 6;
+                    let d_bit = 1u64 << (d & 63);
+                    if let Some(lw) = live.get_mut(d_word) {
+                        *lw &= !d_bit;
+                    }
+                    let d_base = d.saturating_mul(val_words);
+                    for w in 0..val_words {
+                        let mut lw = live.get(w).copied().unwrap_or(0);
+                        if lw == 0 {
+                            continue;
+                        }
+                        if let Some(slot) = interf.get_mut(d_base + w) {
+                            *slot |= lw;
+                        }
+                        while lw != 0 {
+                            let tz = idx(lw.trailing_zeros());
+                            let u = w.saturating_mul(64) + tz;
+                            if let Some(uslot) = interf.get_mut(u.saturating_mul(val_words) + d_word) {
+                                *uslot |= d_bit;
+                            }
+                            lw &= lw - 1;
+                        }
+                    }
+                    // Non-read-before-write ops cannot reuse a dying operand's register.
+                    if view.op(inst) != Op::Param && !is_rbw(view, inst) {
+                        for_each_expanded_use(view, skip_alloc, inst, &mut work, |_, vi| {
+                            let u_vid = val_id.get(vi).copied().unwrap_or(NO_VAL);
+                            if u_vid != NO_VAL && u_vid != def_vid {
+                                let u = idx(u_vid);
+                                if let Some(slot) = interf.get_mut(d_base + (u >> 6)) {
+                                    *slot |= 1u64 << (u & 63);
+                                }
+                                if let Some(uslot) = interf.get_mut(u.saturating_mul(val_words) + d_word) {
+                                    *uslot |= d_bit;
+                                }
+                            }
+                        });
+                    }
+                }
+                // Only values genuinely live AFTER this clobbering call in the CFG cross it!
+                if is_clobbering_call.get(inst).copied().unwrap_or(false) {
+                    let clob = if matches!(view.op(inst), Op::Invoke | Op::InvokeIndirect) {
+                        CallClobbers::C_ABI_ARM64
+                    } else {
+                        call_clobbers(inst)
+                    };
+                    for w in 0..val_words {
+                        let mut lw = live.get(w).copied().unwrap_or(0);
+                        while lw != 0 {
+                            let tz = idx(lw.trailing_zeros());
+                            let u = w.saturating_mul(64) + tz;
+                            if let Some(&u_inst) = val_inst.get(u) {
+                                if let Some(cc) = val_crosses_call.get_mut(u_inst) {
+                                    *cc = true;
+                                }
+                                if let Some(cb) = val_crossed_clobbers.get_mut(u_inst) {
+                                    cb.clobbered = cb.clobbered.union(clob.clobbered);
+                                }
+                            }
+                            lw &= lw - 1;
+                        }
+                    }
+                }
+                for_each_expanded_use(view, skip_alloc, inst, &mut work, |_, vi| {
+                    let u_vid = val_id.get(vi).copied().unwrap_or(NO_VAL);
+                    if u_vid != NO_VAL {
+                        let u = idx(u_vid);
+                        if let Some(lw) = live.get_mut(u >> 6) {
+                            *lw |= 1u64 << (u & 63);
+                        }
+                    }
+                });
+            }
+            // All live `Op::Param`s of the same block are defined simultaneously on block entry.
+            let params = view.params(Block(u32_of(b)));
+            for p1 in params.start..params.end {
+                let v1 = val_id.get(p1).copied().unwrap_or(NO_VAL);
+                if v1 == NO_VAL {
+                    continue;
+                }
+                let u1 = idx(v1);
+                for p2 in (p1 + 1)..params.end {
+                    let v2 = val_id.get(p2).copied().unwrap_or(NO_VAL);
+                    if v2 == NO_VAL {
+                        continue;
+                    }
+                    let u2 = idx(v2);
+                    if let Some(slot) = interf.get_mut(u1.saturating_mul(val_words) + (u2 >> 6)) {
+                        *slot |= 1u64 << (u2 & 63);
+                    }
+                    if let Some(slot) = interf.get_mut(u2.saturating_mul(val_words) + (u1 >> 6)) {
+                        *slot |= 1u64 << (u1 & 63);
+                    }
+                }
+            }
+        }
+    }
+
+    // 1c. Pre-rematerialize cheap call-crossing 1-inst constants and cold-only `DataAddr`/`FuncAddr`
+    //     so they NEVER burn callee-saved GPRs (`x19..x28`) or execute dead `adrp + add` in hot prologues!
+    let mut pre_remat: Vec<AllocLoc, A> = Vec::with_capacity_in(len, alloc);
+    let mut pre_remat_count = 0u32;
+    for inst in 0..len {
+        if skip_alloc.get(inst).copied().unwrap_or(false)
+            || !has_any_use.get(inst).copied().unwrap_or(false)
+        {
+            pre_remat.push(AllocLoc::None);
+            continue;
+        }
+        if let Some(cval) = remat_val.get(inst).copied().flatten() {
+            let one_inst = cval <= 0xffff || (!cval) <= 0xffff;
+            let crosses = val_crosses_call.get(inst).copied().unwrap_or(false);
+            let depth = max_use_depth.get(inst).copied().unwrap_or(0);
+            if crosses && one_inst && (depth == 0 || cval == 0) {
+                pre_remat.push(AllocLoc::RematConst(cval));
+                pre_remat_count += 1;
+                continue;
+            }
+        }
+        if matches!(view.op(inst), Op::DataAddr | Op::FuncAddr)
+            && !has_hot_use.get(inst).copied().unwrap_or(true)
+        {
+            pre_remat.push(AllocLoc::RematGlobal(u32_of(inst)));
+            pre_remat_count += 1;
+            continue;
+        }
+        pre_remat.push(AllocLoc::None);
+    }
+
+    let vals_interfere = |u: usize, v: usize| -> bool {
+        if u == v || val_words == 0 {
+            return false;
+        }
+        let (Some(&uid), Some(&vid)) = (val_id.get(u), val_id.get(v)) else {
+            return false;
+        };
+        if uid == NO_VAL || vid == NO_VAL {
+            return false;
+        }
+        let ui = idx(uid);
+        let vi = idx(vid);
+        interf
+            .get(ui.saturating_mul(val_words) + (vi >> 6))
+            .is_some_and(|&w| (w & (1u64 << (vi & 63))) != 0)
+    };
+
     // 2. Coalescing hints: entry params (incl. `sret` in X8), return value (`X0`/`V0`),
-    //    block-param (`phi`) back-edges, and in-place 2-address accumulators (`fmla`/`mla`/`ins`).
+    //    block-param (`phi`) back-edges & non-interfering forward edges, and in-place 2-address
+    //    accumulators (`fmla`/`mla`/`ins`/`add`/`sub`).
     let mut hint: Vec<u8, A> = Vec::with_capacity_in(len, alloc);
-    // `phi_partner[arg]` = partner index `p < arg` whose physical register `arg` should inherit.
     let mut phi_partner: Vec<u32, A> = Vec::with_capacity_in(len, alloc);
     let mut phi_prio: Vec<u32, A> = Vec::with_capacity_in(len, alloc);
     for _ in 0..len {
@@ -1218,122 +1979,76 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
         phi_prio.push(0);
     }
 
-    let func_sig = view.sig(SigId(view.head.sig));
-    let entry_params = view.params(Block(0));
-    let mut regs = Regs::new(os);
-    for (k, p) in entry_params.clone().enumerate() {
-        let pkind = func_sig
-            .params
-            .get(k)
-            .and_then(|sp| ParamKind::from_byte(sp.kind))
-            .unwrap_or(ParamKind::Value);
-        if pkind == ParamKind::Sret {
-            if let Some(slot) = hint.get_mut(p) {
-                *slot = reg_u8(X8);
-            }
-            continue;
-        }
-        let ty = view.tys.get(p).copied().map_or(Ty::NONE, Ty);
-        match regs.next(ty) {
-            Some(Loc::V(reg, _)) | Some(Loc::X(reg)) => {
-                if let Some(slot) = hint.get_mut(p) {
-                    *slot = reg_u8(reg);
-                }
-            }
-            Some(Loc::Pair(_)) | None => {}
-        }
-    }
-    // Landing-block exception parameters enter in `X0` from the unwinder.
-    for b in 0..blocks {
-        if view.block_kind(Block(u32_of(b))).is_landing() {
-            let params = view.params(Block(u32_of(b)));
-            if params.start < params.end {
-                if let Some(slot) = hint.get_mut(params.start) {
-                    *slot = reg_u8(X0);
-                }
-            }
-        }
-    }
+    seed_abi_and_return_hints(view, os, &mut hint);
 
-    // Record return-value hints (`X0`/`V0`) and block-param edge coalescing links.
     for b in 0..blocks {
         let term = view.terminator(Block(u32_of(b)));
-        match view.op(term) {
-            Op::Return => {
-                if let Some(&at_raw) = view.data.get(term) {
-                    let at = idx(at_raw);
-                    if let Some(&retc_raw) = view.extra.get(at) {
-                        let retc = idx(retc_raw);
-                        if retc >= 1 {
-                            if let Some(&rv0_raw) = view.extra.get(at + 1) {
-                                let rv0 = idx(rv0_raw);
-                                if let Some(slot) = hint.get_mut(rv0) {
-                                    if *slot == NO_REG {
-                                        let is_fp_or_vec = view.tys.get(rv0).copied().is_some_and(|t| {
-                                            let ty = Ty(t);
-                                            is_fp_ty(ty).is_some() || is_vec128_ty(ty).is_some()
-                                        });
-                                        *slot = if is_fp_or_vec { 0 } else { reg_u8(X0) };
-                                    }
-                                }
+        if view.op(term) == Op::Return {
+            continue;
+        }
+        let b_depth = block_depth.get(b).copied().unwrap_or(0);
+        for_each_edge(view, term, |target_block, args_start, args_len| {
+            let target_params = view.params(Block(target_block));
+            let n = args_len.min(target_params.len());
+            let is_back = idx(target_block) <= b;
+            let edge_prio = if is_back { b_depth.saturating_add(2) } else { 1 };
+            if let Some(args) = view.extra.get(args_start..args_start + n) {
+                for (k, &arg_raw) in args.iter().enumerate() {
+                    let p = target_params.start + k;
+                    let arg = idx(arg_raw);
+                    if arg >= len
+                        || p >= len
+                        || arg == p
+                        || pre_remat.get(arg).copied().unwrap_or(AllocLoc::None) != AllocLoc::None
+                        || pre_remat.get(p).copied().unwrap_or(AllocLoc::None) != AllocLoc::None
+                    {
+                        continue;
+                    }
+                    let p_ty = view.tys.get(p).copied().map_or(Ty::NONE, Ty);
+                    let arg_ty = view.tys.get(arg).copied().map_or(Ty::NONE, Ty);
+                    let bank = reg_bank(view, arg_ty);
+                    if bank == 0 || bank != reg_bank(view, p_ty) {
+                        continue;
+                    }
+                    if vals_interfere(arg, p) {
+                        continue;
+                    }
+                    if arg > p {
+                        let cur = phi_partner.get(arg).copied().unwrap_or(u32::MAX);
+                        let cur_prio = phi_prio.get(arg).copied().unwrap_or(0);
+                        if cur == u32::MAX || edge_prio > cur_prio {
+                            if let Some(slot) = phi_partner.get_mut(arg) {
+                                *slot = u32_of(p);
+                            }
+                            if let Some(pslot) = phi_prio.get_mut(arg) {
+                                *pslot = edge_prio;
                             }
                         }
-                        if retc == 2 {
-                            if let Some(&rv1_raw) = view.extra.get(at + 2) {
-                                let rv1 = idx(rv1_raw);
-                                if let Some(slot) = hint.get_mut(rv1) {
-                                    if *slot == NO_REG {
-                                        let is_fp_or_vec = view.tys.get(rv1).copied().is_some_and(|t| {
-                                            let ty = Ty(t);
-                                            is_fp_ty(ty).is_some() || is_vec128_ty(ty).is_some()
-                                        });
-                                        *slot = if is_fp_or_vec { 1 } else { reg_u8(X1) };
-                                    }
-                                }
+                    } else if remat_val.get(arg).copied().flatten().is_none()
+                        && (!val_crosses_call.get(p).copied().unwrap_or(false)
+                            || val_crosses_call.get(arg).copied().unwrap_or(false))
+                    {
+                        let cur = phi_partner.get(p).copied().unwrap_or(u32::MAX);
+                        let cur_prio = phi_prio.get(p).copied().unwrap_or(0);
+                        if cur == u32::MAX || edge_prio > cur_prio {
+                            if let Some(slot) = phi_partner.get_mut(p) {
+                                *slot = u32_of(arg);
+                            }
+                            if let Some(pslot) = phi_prio.get_mut(p) {
+                                *pslot = edge_prio;
                             }
                         }
                     }
                 }
             }
-            _ => {
-                let b_depth = block_depth.get(b).copied().unwrap_or(0);
-                for_each_edge(view, term, |target_block, args_start, args_len| {
-                    let target_params = view.params(Block(target_block));
-                    let n = args_len.min(target_params.len());
-                    let is_back = idx(target_block) <= b;
-                    let edge_prio = if is_back { b_depth.saturating_add(1) } else { 0 };
-                    if let Some(args) = view.extra.get(args_start..args_start + n) {
-                        for (k, &arg_raw) in args.iter().enumerate() {
-                            let p = target_params.start + k;
-                            let arg = idx(arg_raw);
-                            if arg < len && arg > p {
-                                let p_ty = view.tys.get(p).copied().map_or(Ty::NONE, Ty);
-                                let arg_ty = view.tys.get(arg).copied().map_or(Ty::NONE, Ty);
-                                let bank = reg_bank(view, arg_ty);
-                                if bank != 0 && bank == reg_bank(view, p_ty) {
-                                    let cur = phi_partner.get(arg).copied().unwrap_or(u32::MAX);
-                                    let cur_prio = phi_prio.get(arg).copied().unwrap_or(0);
-                                    if cur == u32::MAX || edge_prio > cur_prio {
-                                        if let Some(slot) = phi_partner.get_mut(arg) {
-                                            *slot = u32_of(p);
-                                        }
-                                        if let Some(pslot) = phi_prio.get_mut(arg) {
-                                            *pslot = edge_prio;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                });
-            }
-        }
+        });
     }
 
-    // Propagate loop back-edge `phi_partner` backward through in-place accumulator chains
-    // (e.g. `p -> fma_0 -> fma_1 -> back_edge(p)` so every step stays in `p`'s register).
+    // Propagate loop back-edge `phi_partner` backward through in-place accumulator chains.
     for inst in (0..len).rev() {
-        if skip_alloc.get(inst).copied().unwrap_or(false) {
+        if skip_alloc.get(inst).copied().unwrap_or(false)
+            || pre_remat.get(inst).copied().unwrap_or(AllocLoc::None) != AllocLoc::None
+        {
             continue;
         }
         let partner = phi_partner.get(inst).copied().unwrap_or(u32::MAX);
@@ -1341,9 +2056,12 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
             continue;
         }
         let pi = idx(partner);
-        if let Some(acc) = preferred_inplace_operand(view, skip_alloc, &last_use, inst) {
+        if let Some(acc) =
+            preferred_inplace_operand(view, skip_alloc, |vi| vi < inst, |ci| !vals_interfere(inst, ci), inst)
+        {
             if acc > pi
-                && last_use.get(acc).copied() == Some(inst)
+                && pre_remat.get(acc).copied().unwrap_or(AllocLoc::None) == AllocLoc::None
+                && !vals_interfere(inst, acc)
                 && phi_partner.get(acc).copied() == Some(u32::MAX)
             {
                 if let Some(slot) = phi_partner.get_mut(acc) {
@@ -1353,18 +2071,22 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
         }
     }
 
-    // Coalesce destructive 2-address accumulators & zero-copy ops (`Fma`/`Fmuladd`, `Fadd`+`Fmul`,
-    // `Add`+`Mul`/`VecUadalp`, `Insert`, same-bank `Bitcast`/`Freeze`, dying vector `Select`)
-    // directly into their dying source operand (eliminating `mov` in `saxpy`/`matmul`/`dot`!).
+    // Coalesce destructive 2-address accumulators & zero-copy ops into non-interfering source operands.
     for inst in 0..len {
-        if skip_alloc.get(inst).copied().unwrap_or(false) {
+        if skip_alloc.get(inst).copied().unwrap_or(false)
+            || pre_remat.get(inst).copied().unwrap_or(AllocLoc::None) != AllocLoc::None
+        {
             continue;
         }
         if phi_partner.get(inst).copied() != Some(u32::MAX) || !is_rbw(view, inst) {
             continue;
         }
-        if let Some(src) = preferred_inplace_operand(view, skip_alloc, &last_use, inst) {
-            if last_use.get(src).copied() == Some(inst) {
+        if let Some(src) =
+            preferred_inplace_operand(view, skip_alloc, |vi| vi < inst, |ci| !vals_interfere(inst, ci), inst)
+        {
+            if pre_remat.get(src).copied().unwrap_or(AllocLoc::None) == AllocLoc::None
+                && !vals_interfere(inst, src)
+            {
                 if let Some(slot) = phi_partner.get_mut(inst) {
                     *slot = u32_of(src);
                 }
@@ -1372,70 +2094,9 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
         }
     }
 
-    // 3. Two-Phase Chordal-SSA + Greedy Priority-Weighted Coloring + IPRA + True Constant Remat!
-    //
-    // By Hack–Grund–Goos (CC 2006), SSA interference graphs are chordal: coloring in program
-    // order achieves the exact minimum chromatic number (keeping every <=26-live function frameless
-    // with zero callee-saved saves!). If program order encounters any pressure overflow (spill or
-    // remat), we automatically re-color in descending loop-weighted priority order so hot inner
-    // loops stay 100% register-resident while cold constants rematerialize (`AllocLoc::RematConst`)!
-    let mut remat_val: Vec<Option<u64>, A> = Vec::with_capacity_in(len, alloc);
-    for i in 0..len {
-        let ty = view.tys.get(i).copied().map_or(Ty::NONE, Ty);
-        let cv = if ty.is_scalar() && ty.is_int() && ty.bits(64) <= 64 {
-            let bits = ty.bits(64);
-            let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
-            match view.op(i) {
-                Op::Iconst => view.data.get(i).map(|&w| {
-                    let v = if bits <= 32 { u64::from(w) } else { sext32_u64(w) };
-                    v & mask
-                }),
-                Op::IconstWide => view.data.get(i).and_then(|&d| {
-                    let at = idx(d);
-                    let lo = u64::from(*view.extra.get(at)?);
-                    let hi = if ty.const_words() >= 2 {
-                        u64::from(*view.extra.get(at + 1)?)
-                    } else {
-                        0
-                    };
-                    Some((lo | (hi << 32)) & mask)
-                }),
-                _ => None,
-            }
-        } else {
-            None
-        };
-        remat_val.push(cv);
-    }
+    propagate_extract_lane0_hints(view, &mut hint, (0..len).rev());
 
-    // Propagate scalar FP return hints backward through lane-0 `Op::Extract` into the source vector
-    // so `v -> extract(v, 0) -> ret` stays in the same FP register with zero `fmov` instructions.
-    for inst in (0..len).rev() {
-        if view.op(inst) == Op::Extract {
-            let ty = view.tys.get(inst).copied().map_or(Ty::NONE, Ty);
-            if is_fp_ty(ty).is_some() {
-                let ih = hint.get(inst).copied().unwrap_or(NO_REG);
-                if ih != NO_REG {
-                    if let Some(&d) = view.data.get(inst) {
-                        let at = idx(d);
-                        if view.extra.get(at + 1).copied() == Some(0) {
-                            if let Some(&vec_v) = view.extra.get(at) {
-                                let vi = idx(vec_v);
-                                if let Some(vh) = hint.get_mut(vi) {
-                                    if *vh == NO_REG {
-                                        *vh = ih;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Propagate priority weights and return-value hints backward along `phi_partner` chains so
-    // chain heads color first in Phase 2 greedy order and avoid unnecessary return copies.
+    // Propagate priority weights and return-value hints backward along `phi_partner` chains.
     for arg in (0..len).rev() {
         let p = phi_partner.get(arg).copied().unwrap_or(u32::MAX);
         if p != u32::MAX {
@@ -1460,12 +2121,807 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
     #[derive(Clone, Copy)]
     struct Candidate {
         inst: usize,
-        end: usize,
+        vid: usize,
         weight: u32,
         is_remat: bool,
     }
     let mut prog_order: Vec<Candidate, A> = Vec::with_capacity_in(len, alloc);
     for inst in 0..len {
+        if skip_alloc.get(inst).copied().unwrap_or(false)
+            || pre_remat.get(inst).copied().unwrap_or(AllocLoc::None) != AllocLoc::None
+        {
+            continue;
+        }
+        let vid_raw = val_id.get(inst).copied().unwrap_or(NO_VAL);
+        if vid_raw == NO_VAL {
+            continue;
+        }
+        let is_remat = remat_val.get(inst).copied().flatten().is_some()
+            || matches!(view.op(inst), Op::SlotAddr | Op::FuncAddr | Op::DataAddr);
+        let uw = use_weight.get(inst).copied().unwrap_or(0);
+        let weight = if is_remat { (uw >> 2).max(1) } else { uw };
+        prog_order.push(Candidate { inst, vid: idx(vid_raw), weight, is_remat });
+    }
+
+    let run_coloring = |order: &[Candidate]| -> Result<(Vec<AllocLoc, A>, [bool; 32], [bool; 32], u32, u32, u64), RegAllocError> {
+        let mut loc_try: Vec<AllocLoc, A> = Vec::with_capacity_in(len, alloc);
+        for &loc in &pre_remat {
+            loc_try.push(loc);
+        }
+        let busy_len = 32usize.saturating_mul(val_words);
+        let mut gpr_busy: Vec<u64, A> = Vec::with_capacity_in(busy_len, alloc);
+        let mut fp_busy: Vec<u64, A> = Vec::with_capacity_in(busy_len, alloc);
+        for _ in 0..busy_len {
+            gpr_busy.push(0);
+            fp_busy.push(0);
+        }
+        let is_reg_free = |busy: &[u64], reg: usize, vid: usize| -> bool {
+            let r_base = reg.saturating_mul(val_words);
+            let v_base = vid.saturating_mul(val_words);
+            for w in 0..val_words {
+                let bw = busy.get(r_base + w).copied().unwrap_or(0);
+                let iw = interf.get(v_base + w).copied().unwrap_or(0);
+                if (bw & iw) != 0 {
+                    return false;
+                }
+            }
+            true
+        };
+        let mark_reg_busy = |busy: &mut [u64], reg: usize, vid: usize| {
+            let off = reg.saturating_mul(val_words) + (vid >> 6);
+            if let Some(slot) = busy.get_mut(off) {
+                *slot |= 1u64 << (vid & 63);
+            }
+        };
+        let mut spill_busy: Vec<u64, A> = Vec::new_in(alloc);
+        let mut used_callee_gpr = [false; 32];
+        let mut used_callee_fp = [false; 32];
+        let mut num_spill_slots = 0u32;
+        let mut remat_count = 0u32;
+        let mut spill_cost = 0u64;
+
+        let mut alloc_spill_n = |slots: usize, vid: usize| -> Result<u32, RegAllocError> {
+            let slots_u32 = u32_of(slots);
+            let existing = if val_words == 0 { 0 } else { spill_busy.len() / val_words };
+            if existing >= slots {
+                for slot_idx in 0..=(existing - slots) {
+                    if (0..slots).all(|k| is_reg_free(&spill_busy, slot_idx + k, vid)) {
+                        for k in 0..slots {
+                            mark_reg_busy(&mut spill_busy, slot_idx + k, vid);
+                        }
+                        return Ok(u32_of(slot_idx));
+                    }
+                }
+            }
+            if num_spill_slots.saturating_add(slots_u32) > max_spill_slots {
+                return Err(RegAllocError::OutOfSpillSlots);
+            }
+            let slot = num_spill_slots;
+            num_spill_slots += slots_u32;
+            for _ in 0..slots.saturating_mul(val_words) {
+                spill_busy.push(0);
+            }
+            let base_slot = idx(slot);
+            for k in 0..slots {
+                mark_reg_busy(&mut spill_busy, base_slot + k, vid);
+            }
+            Ok(slot)
+        };
+
+        for cand in order {
+            let inst = cand.inst;
+            let vid = cand.vid;
+            let ty = view.tys.get(inst).copied().map_or(Ty::NONE, Ty);
+            let bank = reg_bank(view, ty);
+
+            let partner = phi_partner.get(inst).copied().unwrap_or(u32::MAX);
+            let primary_hint = if partner != u32::MAX {
+                match (bank, loc_try.get(idx(partner)).copied()) {
+                    (1, Some(AllocLoc::Vec(r)))
+                    | (2, Some(AllocLoc::Fp(r)))
+                    | (3, Some(AllocLoc::Gpr(r))) => r,
+                    _ => NO_REG,
+                }
+            } else {
+                NO_REG
+            };
+            let secondary_hint = hint.get(inst).copied().unwrap_or(NO_REG);
+
+            let crosses_call = val_crosses_call.get(inst).copied().unwrap_or(false);
+            let crossed_clobbers = val_crossed_clobbers
+                .get(inst)
+                .copied()
+                .unwrap_or(CallClobbers::EMPTY);
+            let gpr_safe = |r: Reg| -> bool {
+                !crosses_call || (X19..=X28).contains(&r) || !crossed_clobbers.clobbers_gpr(reg_u8(r))
+            };
+            let fp_safe = |r: Reg| -> bool {
+                !crosses_call || (8..=15).contains(&r) || !crossed_clobbers.clobbers_fp(reg_u8(r))
+            };
+
+            if is_gpr_pair_ty(view, ty) {
+                let pool_pick = |busy: &[u64], skip: Option<Reg>| -> Option<Reg> {
+                    caller_gpr_order
+                        .iter()
+                        .copied()
+                        .chain(CALLEE_SAVED_GPR.iter().copied())
+                        .find(|&r| Some(r) != skip && gpr_safe(r) && is_reg_free(busy, idx(r), vid))
+                };
+                let r0 = pool_pick(&gpr_busy, None);
+                let r1 = r0.and_then(|first| pool_pick(&gpr_busy, Some(first)));
+                if let (Some(lo), Some(hi)) = (r0, r1) {
+                    if let Some(slot) = loc_try.get_mut(inst) {
+                        *slot = AllocLoc::GprPair(reg_u8(lo), reg_u8(hi));
+                    }
+                    mark_reg_busy(&mut gpr_busy, idx(lo), vid);
+                    mark_reg_busy(&mut gpr_busy, idx(hi), vid);
+                    if (X19..=X28).contains(&lo) {
+                        if let Some(u) = used_callee_gpr.get_mut(idx(lo)) {
+                            *u = true;
+                        }
+                    }
+                    if (X19..=X28).contains(&hi) {
+                        if let Some(u) = used_callee_gpr.get_mut(idx(hi)) {
+                            *u = true;
+                        }
+                    }
+                } else {
+                    let s0 = alloc_spill_n(1, vid)?;
+                    let s1 = alloc_spill_n(1, vid)?;
+                    if let Some(slot) = loc_try.get_mut(inst) {
+                        *slot = AllocLoc::GprPairSpill(s0, s1);
+                    }
+                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight).saturating_mul(8));
+                }
+            } else if is_vec128_ty(ty).is_some() || is_vec_mask_ty(ty).is_some() {
+                let vec_safe = |r: Reg| -> bool {
+                    if (8..=15).contains(&r) {
+                        !crosses_call
+                    } else {
+                        !crosses_call || !crossed_clobbers.clobbers_fp(reg_u8(r))
+                    }
+                };
+                let try_vec = |h: u8| -> Option<Reg> {
+                    if h != NO_REG {
+                        let r = u32::from(h);
+                        if (CALLER_SAVED_FP.contains(&r) || CALLEE_SAVED_FP.contains(&r))
+                            && vec_safe(r)
+                            && is_reg_free(&fp_busy, usize::from(h), vid)
+                        {
+                            return Some(r);
+                        }
+                    }
+                    None
+                };
+                let chosen = try_vec(primary_hint)
+                    .or_else(|| try_vec(secondary_hint))
+                    .or_else(|| {
+                        let (avoid0, avoid1) = vec_fma_avoid_regs(view, skip_alloc, &loc_try, inst);
+                        if avoid0 != NO_REG || avoid1 != NO_REG {
+                            caller_fp_order
+                                .iter()
+                                .copied()
+                                .chain(CALLEE_SAVED_FP.iter().copied())
+                                .find(|&r| {
+                                    let ru = reg_u8(r);
+                                    ru != avoid0
+                                        && ru != avoid1
+                                        && vec_safe(r)
+                                        && is_reg_free(&fp_busy, idx(r), vid)
+                                })
+                        } else {
+                            None
+                        }
+                    })
+                    .or_else(|| {
+                        caller_fp_order
+                            .iter()
+                            .copied()
+                            .chain(CALLEE_SAVED_FP.iter().copied())
+                            .find(|&r| vec_safe(r) && is_reg_free(&fp_busy, idx(r), vid))
+                    });
+                if let Some(reg) = chosen {
+                    if let Some(slot) = loc_try.get_mut(inst) {
+                        *slot = AllocLoc::Vec(reg_u8(reg));
+                    }
+                    mark_reg_busy(&mut fp_busy, idx(reg), vid);
+                    if (8..=15).contains(&reg) {
+                        if let Some(u) = used_callee_fp.get_mut(idx(reg)) {
+                            *u = true;
+                        }
+                    }
+                } else {
+                    let slot = alloc_spill_n(2, vid)?;
+                    if let Some(loc_slot) = loc_try.get_mut(inst) {
+                        *loc_slot = AllocLoc::VecSpill(slot);
+                    }
+                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight).saturating_mul(8));
+                }
+            } else if is_fp_ty(ty).is_some() {
+                let extract_lane0_hint = if view.op(inst) == Op::Extract {
+                    view.data.get(inst).and_then(|&d| {
+                        let at = idx(d);
+                        let vec_v = *view.extra.get(at)?;
+                        let lane = *view.extra.get(at + 1)?;
+                        if lane == 0 {
+                            match loc_try.get(idx(vec_v)).copied() {
+                                Some(AllocLoc::Vec(r)) => Some(r),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                } else {
+                    None
+                }
+                .unwrap_or(NO_REG);
+                let try_fp = |h: u8| -> Option<Reg> {
+                    if h != NO_REG && fp_safe(u32::from(h)) && is_reg_free(&fp_busy, usize::from(h), vid) {
+                        Some(u32::from(h))
+                    } else {
+                        None
+                    }
+                };
+                let chosen = try_fp(primary_hint)
+                    .or_else(|| try_fp(secondary_hint))
+                    .or_else(|| try_fp(extract_lane0_hint))
+                    .or_else(|| {
+                        caller_fp_order
+                            .iter()
+                            .copied()
+                            .chain(CALLEE_SAVED_FP.iter().copied())
+                            .find(|&r| fp_safe(r) && is_reg_free(&fp_busy, idx(r), vid))
+                    });
+                if let Some(reg) = chosen {
+                    if let Some(slot) = loc_try.get_mut(inst) {
+                        *slot = AllocLoc::Fp(reg_u8(reg));
+                    }
+                    mark_reg_busy(&mut fp_busy, idx(reg), vid);
+                    if (8..=15).contains(&reg) {
+                        if let Some(u) = used_callee_fp.get_mut(idx(reg)) {
+                            *u = true;
+                        }
+                    }
+                } else {
+                    let slot = alloc_spill_n(1, vid)?;
+                    if let Some(loc_slot) = loc_try.get_mut(inst) {
+                        *loc_slot = AllocLoc::FpSpill(slot);
+                    }
+                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight).saturating_mul(4));
+                }
+            } else {
+                let pair_trunc_hint = if view.op(inst) == Op::Trunc {
+                    view.data.get(inst).map(|&raw| idx(raw)).and_then(|si| {
+                        if view.tys.get(si).copied().map(Ty) != Some(Ty::I128) {
+                            return None;
+                        }
+                        if !skip_alloc.get(si).copied().unwrap_or(false) {
+                            match loc_try.get(si).copied() {
+                                Some(AllocLoc::GprPair(lo, _)) => Some(lo),
+                                _ => None,
+                            }
+                        } else if matches!(view.op(si), Op::Lshr | Op::Ashr) {
+                            let x = view.data.get(si).and_then(|&d| view.extra.get(idx(d))).copied()?;
+                            match loc_try.get(idx(x)).copied() {
+                                Some(AllocLoc::GprPair(_, hi)) => Some(hi),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                } else {
+                    None
+                }
+                .unwrap_or(NO_REG);
+                let try_gpr = |h: u8| -> Option<Reg> {
+                    if h != NO_REG && gpr_safe(u32::from(h)) && is_reg_free(&gpr_busy, usize::from(h), vid) {
+                        Some(u32::from(h))
+                    } else {
+                        None
+                    }
+                };
+                let chosen = try_gpr(primary_hint)
+                    .or_else(|| try_gpr(secondary_hint))
+                    .or_else(|| try_gpr(pair_trunc_hint))
+                    .or_else(|| {
+                        caller_gpr_order
+                            .iter()
+                            .copied()
+                            .chain(CALLEE_SAVED_GPR.iter().copied())
+                            .find(|&r| gpr_safe(r) && is_reg_free(&gpr_busy, idx(r), vid))
+                    });
+                if let Some(reg) = chosen {
+                    if let Some(slot) = loc_try.get_mut(inst) {
+                        *slot = AllocLoc::Gpr(reg_u8(reg));
+                    }
+                    mark_reg_busy(&mut gpr_busy, idx(reg), vid);
+                    if (X19..=X28).contains(&reg) {
+                        if let Some(u) = used_callee_gpr.get_mut(idx(reg)) {
+                            *u = true;
+                        }
+                    }
+                } else if let Some(cval) = remat_val.get(inst).copied().flatten() {
+                    if let Some(slot) = loc_try.get_mut(inst) {
+                        *slot = AllocLoc::RematConst(cval);
+                    }
+                    remat_count += 1;
+                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight));
+                } else if matches!(view.op(inst), Op::DataAddr | Op::FuncAddr) {
+                    if let Some(slot) = loc_try.get_mut(inst) {
+                        *slot = AllocLoc::RematGlobal(u32_of(inst));
+                    }
+                    remat_count += 1;
+                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight).saturating_mul(2));
+                } else {
+                    let slot = alloc_spill_n(1, vid)?;
+                    if let Some(loc_slot) = loc_try.get_mut(inst) {
+                        *loc_slot = AllocLoc::GprSpill(slot);
+                    }
+                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight).saturating_mul(4));
+                }
+            }
+        }
+        Ok((loc_try, used_callee_gpr, used_callee_fp, num_spill_slots, remat_count, spill_cost))
+    };
+
+    // Phase 1: exact chordal-SSA program-order coloring (provably minimal register count!).
+    let (mut final_loc, mut used_callee_gpr, mut used_callee_fp, mut num_spill_slots, mut remat_count, spill_cost) =
+        run_coloring(&prog_order)?;
+
+    // Phase 2: if register pressure overflowed (spills > 0 or remat > 0), run loop-weighted
+    // Greedy Priority Coloring so hot inner loops stay register-resident while cold outer
+    // values/constants yield & rematerialize.
+    if num_spill_slots > 0 || remat_count > 0 {
+        let mut greedy_order: Vec<Candidate, A> = Vec::with_capacity_in(prog_order.len(), alloc);
+        for &c in &prog_order {
+            greedy_order.push(c);
+        }
+        greedy_order.sort_unstable_by(|a, b| {
+            b.weight
+                .cmp(&a.weight)
+                .then_with(|| a.is_remat.cmp(&b.is_remat))
+                .then_with(|| a.inst.cmp(&b.inst))
+        });
+        if let Ok((g_loc, g_cgpr, g_cfp, g_spills, g_remat, g_cost)) = run_coloring(&greedy_order) {
+            if g_cost < spill_cost || (g_cost == spill_cost && g_spills <= num_spill_slots) {
+                final_loc = g_loc;
+                used_callee_gpr = g_cgpr;
+                used_callee_fp = g_cfp;
+                num_spill_slots = g_spills;
+                remat_count = g_remat;
+            }
+        }
+    }
+    remat_count = remat_count.saturating_add(pre_remat_count);
+
+    Ok(finalize_allocation(
+        view,
+        final_loc,
+        used_callee_gpr,
+        used_callee_fp,
+        num_spill_slots,
+        remat_count,
+        &call_positions,
+        call_clobbers,
+    ))
+}
+
+/// O(N log K) RPO-ordered linear-scan register allocator for mega-functions exceeding the
+/// exact-CFG bitmatrix budget (`num_vals > EXACT_CFG_MAX_VALS || blocks > EXACT_CFG_MAX_BLOCKS`).
+///
+/// All intervals `[start, end]`, back-edges, and call positions live in a single consistent
+/// Reverse Post-Order (RPO) instruction coordinate space so SSA dominance (`rpo_pos[def] < rpo_pos[use]`)
+/// and call-crossing across loops hold even when LIR blocks are not in RPO order.
+#[allow(clippy::too_many_arguments)]
+fn allocate_linear_scan_rpo<A: Allocator + Copy>(
+    view: &View<'_>,
+    skip_alloc: &[bool],
+    tail_calls: &[bool],
+    max_spill_slots: u32,
+    os: crate::Os,
+    call_clobbers: impl Fn(usize) -> CallClobbers,
+    caller_gpr_order: &[Reg; 16],
+    caller_fp_order: &[Reg; 21],
+    alloc: A,
+) -> Result<Allocation<A>, RegAllocError> {
+    let len = view.len();
+    let blocks = view.blocks();
+
+    // 0a. Compute iterative-DFS Reverse Post-Order (RPO) over blocks in O(B + E).
+    let mut dfs_state: Vec<u8, A> = Vec::with_capacity_in(blocks, alloc);
+    for _ in 0..blocks {
+        dfs_state.push(0);
+    }
+    let mut rpo_blocks: Vec<usize, A> = Vec::with_capacity_in(blocks, alloc);
+    let mut dfs_stack: Vec<usize, A> = Vec::with_capacity_in(blocks.min(1024), alloc);
+    if blocks > 0 {
+        dfs_stack.push(0);
+        while let Some(b) = dfs_stack.pop() {
+            let st = dfs_state.get(b).copied().unwrap_or(2);
+            if st == 0 {
+                if let Some(s) = dfs_state.get_mut(b) {
+                    *s = 1;
+                }
+                dfs_stack.push(b);
+                let term = view.terminator(Block(u32_of(b)));
+                for_each_edge(view, term, |target_block, _, _| {
+                    let t = idx(target_block);
+                    if dfs_state.get(t).copied() == Some(0) {
+                        dfs_stack.push(t);
+                    }
+                });
+            } else if st == 1 {
+                if let Some(s) = dfs_state.get_mut(b) {
+                    *s = 2;
+                }
+                rpo_blocks.push(b);
+            }
+        }
+        rpo_blocks.reverse();
+        for b in 0..blocks {
+            if dfs_state.get(b).copied() == Some(0) {
+                rpo_blocks.push(b);
+            }
+        }
+    }
+
+    let mut rpo_idx: Vec<usize, A> = Vec::with_capacity_in(blocks, alloc);
+    let mut rpo_block_start: Vec<usize, A> = Vec::with_capacity_in(blocks, alloc);
+    let mut rpo_block_end: Vec<usize, A> = Vec::with_capacity_in(blocks, alloc);
+    for _ in 0..blocks {
+        rpo_idx.push(0);
+        rpo_block_start.push(0);
+        rpo_block_end.push(0);
+    }
+    let mut rpo_pos: Vec<usize, A> = Vec::with_capacity_in(len, alloc);
+    let mut rpo_to_inst: Vec<usize, A> = Vec::with_capacity_in(len, alloc);
+    let mut inst_block: Vec<u32, A> = Vec::with_capacity_in(len, alloc);
+    for _ in 0..len {
+        rpo_pos.push(0);
+        inst_block.push(0);
+    }
+    for (rank, &b) in rpo_blocks.iter().enumerate() {
+        if let Some(slot) = rpo_idx.get_mut(b) {
+            *slot = rank;
+        }
+        let b_start = rpo_to_inst.len();
+        let range = view.block(Block(u32_of(b)));
+        for inst in range {
+            let p = rpo_to_inst.len();
+            rpo_to_inst.push(inst);
+            if let Some(slot) = rpo_pos.get_mut(inst) {
+                *slot = p;
+            }
+            if let Some(slot) = inst_block.get_mut(inst) {
+                *slot = u32_of(b);
+            }
+        }
+        let b_end = rpo_to_inst.len();
+        if let Some(slot) = rpo_block_start.get_mut(b) {
+            *slot = b_start;
+        }
+        if let Some(slot) = rpo_block_end.get_mut(b) {
+            *slot = b_end;
+        }
+    }
+
+    // 0b. Compute per-block loop nesting depth from backward RPO edges (`target_rank <= rank`)
+    //     in O(B) via a difference array.
+    let mut depth_diff: Vec<i32, A> = Vec::with_capacity_in(blocks + 1, alloc);
+    for _ in 0..=blocks {
+        depth_diff.push(0);
+    }
+    for (rank, &b) in rpo_blocks.iter().enumerate() {
+        let term = view.terminator(Block(u32_of(b)));
+        for_each_edge(view, term, |target_block, _, _| {
+            let tr = rpo_idx.get(idx(target_block)).copied().unwrap_or(blocks);
+            if tr <= rank {
+                if let Some(s) = depth_diff.get_mut(tr) {
+                    *s = s.saturating_add(1);
+                }
+                if let Some(e) = depth_diff.get_mut(rank + 1) {
+                    *e = e.saturating_sub(1);
+                }
+            }
+        });
+    }
+    let mut block_depth: Vec<u32, A> = Vec::with_capacity_in(blocks, alloc);
+    for _ in 0..blocks {
+        block_depth.push(0);
+    }
+    let mut cur_depth: i32 = 0;
+    for (rank, &b) in rpo_blocks.iter().enumerate() {
+        cur_depth = cur_depth.saturating_add(depth_diff.get(rank).copied().unwrap_or(0));
+        if let Some(slot) = block_depth.get_mut(b) {
+            *slot = u32::try_from(cur_depth.max(0)).unwrap_or(u32::MAX);
+        }
+    }
+
+    // 1. Compute RPO live intervals `[rpo_pos[def], last_use_pos[def]]`, sorted RPO call sites,
+    //    and loop-weighted spill priorities.
+    let mut last_use_pos: Vec<usize, A> = Vec::with_capacity_in(len, alloc);
+    let mut has_any_use: Vec<bool, A> = Vec::with_capacity_in(len, alloc);
+    let mut use_weight: Vec<u32, A> = Vec::with_capacity_in(len, alloc);
+    let mut remat_val: Vec<Option<u64>, A> = Vec::with_capacity_in(len, alloc);
+    let mut call_rpo_positions: Vec<(usize, usize), A> = Vec::new_in(alloc);
+    let mut call_positions: Vec<usize, A> = Vec::new_in(alloc);
+    for i in 0..len {
+        last_use_pos.push(rpo_pos.get(i).copied().unwrap_or(0));
+        has_any_use.push(false);
+        use_weight.push(0);
+        remat_val.push(extract_remat_const(view, i));
+    }
+
+    for &b in &rpo_blocks {
+        let depth = block_depth.get(b).copied().unwrap_or(0).min(5);
+        let b_weight = 1u32 << (depth * 4);
+        let range = view.block(Block(u32_of(b)));
+        for inst in range {
+            let inst_pos = rpo_pos.get(inst).copied().unwrap_or(0);
+            if !skip_alloc.get(inst).copied().unwrap_or(false)
+                && is_clobbering_call_inst(view, tail_calls, inst)
+            {
+                call_rpo_positions.push((inst_pos, inst));
+                call_positions.push(inst);
+            }
+            if let Some(w) = use_weight.get_mut(inst) {
+                *w = w.saturating_add(b_weight);
+            }
+            for_each_use(view, inst, |v| {
+                let vi = idx(v);
+                if vi < len {
+                    if let Some(u) = has_any_use.get_mut(vi) {
+                        *u = true;
+                    }
+                    if let Some(w) = use_weight.get_mut(vi) {
+                        *w = w.saturating_add(b_weight);
+                    }
+                    if let Some(lu) = last_use_pos.get_mut(vi) {
+                        if inst_pos > *lu {
+                            *lu = inst_pos;
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    // Propagate fused producers' operand lifetimes and loop weights in reverse RPO order.
+    for &inst in rpo_to_inst.iter().rev() {
+        if skip_alloc.get(inst).copied().unwrap_or(false) {
+            let consumer_end = last_use_pos.get(inst).copied().unwrap_or(0);
+            let consumer_w = use_weight.get(inst).copied().unwrap_or(0);
+            for_each_use(view, inst, |v| {
+                let vi = idx(v);
+                if let Some(lu) = last_use_pos.get_mut(vi) {
+                    if consumer_end > *lu {
+                        *lu = consumer_end;
+                    }
+                }
+                if let Some(w) = use_weight.get_mut(vi) {
+                    if consumer_w > *w {
+                        *w = consumer_w;
+                    }
+                }
+            });
+        }
+    }
+
+    // Extend RPO live intervals across backward RPO edges (loops & backward unwind edges) to a
+    // fixed point. Deduplicate by `target_start` (keeping max `ext_end`), and only scan values
+    // whose live interval crosses a block boundary.
+    let mut back_edges: Vec<(usize, usize), A> = Vec::new_in(alloc);
+    for &b in &rpo_blocks {
+        let term = view.terminator(Block(u32_of(b)));
+        let term_pos = rpo_pos.get(term).copied().unwrap_or(0);
+        let term_is_invoke = matches!(view.op(term), Op::Invoke | Op::InvokeIndirect);
+        for_each_edge(view, term, |target_block, _, _| {
+            let target_start = rpo_block_start.get(idx(target_block)).copied().unwrap_or(usize::MAX);
+            if target_start <= term_pos {
+                let ext_end = if term_is_invoke { term_pos.saturating_add(1) } else { term_pos };
+                back_edges.push((target_start, ext_end));
+            }
+        });
+    }
+    if !back_edges.is_empty() {
+        back_edges.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+        let mut unique_edges: Vec<(usize, usize), A> = Vec::with_capacity_in(back_edges.len(), alloc);
+        for &(ts, ee) in &back_edges {
+            if unique_edges.last().is_none_or(|&(prev_ts, _)| prev_ts != ts) {
+                unique_edges.push((ts, ee));
+            }
+        }
+        let mut cross_vals: Vec<(usize, usize), A> = Vec::new_in(alloc);
+        let mut skip_list: Vec<usize, A> = Vec::new_in(alloc);
+        for (pos, &inst) in rpo_to_inst.iter().enumerate() {
+            if skip_alloc.get(inst).copied().unwrap_or(false) {
+                skip_list.push(inst);
+            }
+            if has_any_use.get(inst).copied().unwrap_or(false) {
+                let b = idx(inst_block.get(inst).copied().unwrap_or(0));
+                let b_end = rpo_block_end.get(b).copied().unwrap_or(0);
+                let lu = last_use_pos.get(inst).copied().unwrap_or(0);
+                if lu >= b_end {
+                    cross_vals.push((pos, inst));
+                }
+            }
+        }
+        loop {
+            let mut changed = false;
+            for &(target_start, ext_end) in &unique_edges {
+                let hi_idx = cross_vals.partition_point(|&(v_pos, _)| v_pos < target_start);
+                if let Some(slice) = cross_vals.get(..hi_idx) {
+                    for &(_, v) in slice {
+                        if let Some(lu) = last_use_pos.get_mut(v) {
+                            if *lu >= target_start && *lu < ext_end {
+                                *lu = ext_end;
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+            for &inst in skip_list.iter().rev() {
+                let consumer_end = last_use_pos.get(inst).copied().unwrap_or(0);
+                for_each_use(view, inst, |v| {
+                    let vi = idx(v);
+                    if let Some(lu) = last_use_pos.get_mut(vi) {
+                        if consumer_end > *lu {
+                            *lu = consumer_end;
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    // 2. Coalescing hints in RPO order: entry params, return values, block-param back-edges,
+    //    and in-place 2-address accumulators.
+    let mut hint: Vec<u8, A> = Vec::with_capacity_in(len, alloc);
+    let mut phi_partner: Vec<u32, A> = Vec::with_capacity_in(len, alloc);
+    let mut phi_prio: Vec<u32, A> = Vec::with_capacity_in(len, alloc);
+    for _ in 0..len {
+        hint.push(NO_REG);
+        phi_partner.push(u32::MAX);
+        phi_prio.push(0);
+    }
+
+    seed_abi_and_return_hints(view, os, &mut hint);
+
+    for (rank, &b) in rpo_blocks.iter().enumerate() {
+        let term = view.terminator(Block(u32_of(b)));
+        if view.op(term) == Op::Return {
+            continue;
+        }
+        let b_depth = block_depth.get(b).copied().unwrap_or(0);
+        for_each_edge(view, term, |target_block, args_start, args_len| {
+            let target_params = view.params(Block(target_block));
+            let n = args_len.min(target_params.len());
+            let is_back = rpo_idx.get(idx(target_block)).copied().unwrap_or(blocks) <= rank;
+            let edge_prio = if is_back { b_depth.saturating_add(1) } else { 0 };
+            if let Some(args) = view.extra.get(args_start..args_start + n) {
+                for (k, &arg_raw) in args.iter().enumerate() {
+                    let p = target_params.start + k;
+                    let arg = idx(arg_raw);
+                    if arg < len
+                        && p < len
+                        && rpo_pos.get(arg).copied().unwrap_or(0) > rpo_pos.get(p).copied().unwrap_or(usize::MAX)
+                    {
+                        let p_ty = view.tys.get(p).copied().map_or(Ty::NONE, Ty);
+                        let arg_ty = view.tys.get(arg).copied().map_or(Ty::NONE, Ty);
+                        let bank = reg_bank(view, arg_ty);
+                        if bank != 0 && bank == reg_bank(view, p_ty) {
+                            let cur = phi_partner.get(arg).copied().unwrap_or(u32::MAX);
+                            let cur_prio = phi_prio.get(arg).copied().unwrap_or(0);
+                            if cur == u32::MAX || edge_prio > cur_prio {
+                                if let Some(slot) = phi_partner.get_mut(arg) {
+                                    *slot = u32_of(p);
+                                }
+                                if let Some(pslot) = phi_prio.get_mut(arg) {
+                                    *pslot = edge_prio;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // Propagate loop back-edge `phi_partner` backward through in-place accumulator chains (reverse RPO).
+    for &inst in rpo_to_inst.iter().rev() {
+        if skip_alloc.get(inst).copied().unwrap_or(false) {
+            continue;
+        }
+        let partner = phi_partner.get(inst).copied().unwrap_or(u32::MAX);
+        if partner == u32::MAX {
+            continue;
+        }
+        let pi = idx(partner);
+        let inst_pos = rpo_pos.get(inst).copied().unwrap_or(0);
+        let pi_pos = rpo_pos.get(pi).copied().unwrap_or(usize::MAX);
+        if let Some(acc) = preferred_inplace_operand(
+            view,
+            skip_alloc,
+            |vi| rpo_pos.get(vi).copied().unwrap_or(usize::MAX) < inst_pos,
+            |ci| last_use_pos.get(ci).copied() == Some(inst_pos),
+            inst,
+        ) {
+            if rpo_pos.get(acc).copied().unwrap_or(0) > pi_pos
+                && last_use_pos.get(acc).copied() == Some(inst_pos)
+                && phi_partner.get(acc).copied() == Some(u32::MAX)
+            {
+                if let Some(slot) = phi_partner.get_mut(acc) {
+                    *slot = partner;
+                }
+            }
+        }
+    }
+
+    // Coalesce destructive 2-address accumulators & zero-copy ops into dying source operands (RPO).
+    for &inst in &rpo_to_inst {
+        if skip_alloc.get(inst).copied().unwrap_or(false) {
+            continue;
+        }
+        if phi_partner.get(inst).copied() != Some(u32::MAX) || !is_rbw(view, inst) {
+            continue;
+        }
+        let inst_pos = rpo_pos.get(inst).copied().unwrap_or(0);
+        if let Some(src) = preferred_inplace_operand(
+            view,
+            skip_alloc,
+            |vi| rpo_pos.get(vi).copied().unwrap_or(usize::MAX) < inst_pos,
+            |ci| last_use_pos.get(ci).copied() == Some(inst_pos),
+            inst,
+        ) {
+            if last_use_pos.get(src).copied() == Some(inst_pos) {
+                if let Some(slot) = phi_partner.get_mut(inst) {
+                    *slot = u32_of(src);
+                }
+            }
+        }
+    }
+
+    propagate_extract_lane0_hints(view, &mut hint, rpo_to_inst.iter().copied().rev());
+
+    // Propagate priority weights and return-value hints backward along `phi_partner` chains (reverse RPO).
+    for &arg in rpo_to_inst.iter().rev() {
+        let p = phi_partner.get(arg).copied().unwrap_or(u32::MAX);
+        if p != u32::MAX {
+            let pi = idx(p);
+            let aw = use_weight.get(arg).copied().unwrap_or(0).saturating_add(1);
+            if let Some(pw) = use_weight.get_mut(pi) {
+                if aw > *pw {
+                    *pw = aw;
+                }
+            }
+            let ah = hint.get(arg).copied().unwrap_or(NO_REG);
+            if ah != NO_REG {
+                if let Some(ph) = hint.get_mut(pi) {
+                    if *ph == NO_REG {
+                        *ph = ah;
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Two-Phase O(N log K) RPO Linear-Scan + Greedy Priority-Weighted Coloring + IPRA + Remat!
+    #[derive(Clone, Copy)]
+    struct Candidate {
+        inst: usize,
+        start: usize,
+        end: usize,
+        weight: u32,
+        is_remat: bool,
+    }
+    let mut prog_order: Vec<Candidate, A> = Vec::with_capacity_in(len, alloc);
+    for (pos, &inst) in rpo_to_inst.iter().enumerate() {
         if skip_alloc.get(inst).copied().unwrap_or(false) {
             continue;
         }
@@ -1477,8 +2933,8 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
             || matches!(view.op(inst), Op::SlotAddr | Op::FuncAddr | Op::DataAddr);
         let uw = use_weight.get(inst).copied().unwrap_or(0);
         let weight = if is_remat { (uw >> 2).max(1) } else { uw };
-        let end = last_use.get(inst).copied().unwrap_or(inst);
-        prog_order.push(Candidate { inst, end, weight, is_remat });
+        let end = last_use_pos.get(inst).copied().unwrap_or(pos).max(pos);
+        prog_order.push(Candidate { inst, start: pos, end, weight, is_remat });
     }
 
     const BUSY_BUCKET_SHIFT: u32 = 10;
@@ -1606,6 +3062,7 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
 
         for cand in order {
             let inst = cand.inst;
+            let start = cand.start;
             let end = cand.end;
             let ty = view.tys.get(inst).copied().map_or(Ty::NONE, Ty);
             let bank = reg_bank(view, ty);
@@ -1625,18 +3082,18 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
 
             let mut crossed_clobbers = CallClobbers::EMPTY;
             let mut crosses_call = false;
-            let first_call = call_positions.partition_point(|&c| c <= inst);
-            if let Some(calls) = call_positions.get(first_call..) {
-                for &c in calls {
-                    if c >= end {
+            let first_call = call_rpo_positions.partition_point(|&(c_pos, _)| c_pos <= start);
+            if let Some(calls) = call_rpo_positions.get(first_call..) {
+                for &(c_pos, c_inst) in calls {
+                    if c_pos >= end {
                         break;
                     }
                     crosses_call = true;
                     // Unwinding out of an `Invoke` clobbers all caller-saved regs regardless of IPRA.
-                    let clob = if matches!(view.op(c), Op::Invoke | Op::InvokeIndirect) {
+                    let clob = if matches!(view.op(c_inst), Op::Invoke | Op::InvokeIndirect) {
                         CallClobbers::C_ABI_ARM64
                     } else {
-                        call_clobbers(c)
+                        call_clobbers(c_inst)
                     };
                     crossed_clobbers.clobbered = crossed_clobbers.clobbered.union(clob.clobbered);
                     if crossed_clobbers.clobbered.union(CallClobbers::C_ABI_ARM64.clobbered)
@@ -1663,7 +3120,7 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
                         .find(|&r| {
                             Some(r) != skip
                                 && gpr_safe(r)
-                                && busy.get(idx(r)).is_some_and(|b| is_reg_free(b, inst, end, cur_rbw))
+                                && busy.get(idx(r)).is_some_and(|b| is_reg_free(b, start, end, cur_rbw))
                         })
                 };
                 let r0 = pool_pick(&gpr_busy, None);
@@ -1673,10 +3130,10 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
                         *slot = AllocLoc::GprPair(reg_u8(lo), reg_u8(hi));
                     }
                     if let Some(b) = gpr_busy.get_mut(idx(lo)) {
-                        b.insert(inst, end, cur_rbw);
+                        b.insert(start, end, cur_rbw);
                     }
                     if let Some(b) = gpr_busy.get_mut(idx(hi)) {
-                        b.insert(inst, end, cur_rbw);
+                        b.insert(start, end, cur_rbw);
                     }
                     if (X19..=X28).contains(&lo) {
                         if let Some(u) = used_callee_gpr.get_mut(idx(lo)) {
@@ -1689,8 +3146,8 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
                         }
                     }
                 } else {
-                    let s0 = alloc_spill_n(1, inst, end)?;
-                    let s1 = alloc_spill_n(1, inst, end)?;
+                    let s0 = alloc_spill_n(1, start, end)?;
+                    let s1 = alloc_spill_n(1, start, end)?;
                     if let Some(slot) = loc_try.get_mut(inst) {
                         *slot = AllocLoc::GprPairSpill(s0, s1);
                     }
@@ -1713,7 +3170,7 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
                         let r = u32::from(h);
                         if (CALLER_SAVED_FP.contains(&r) || CALLEE_SAVED_FP.contains(&r))
                             && vec_safe(r)
-                            && fp_busy.get(usize::from(h)).is_some_and(|b| is_reg_free(b, inst, end, cur_rbw))
+                            && fp_busy.get(usize::from(h)).is_some_and(|b| is_reg_free(b, start, end, cur_rbw))
                         {
                             return Some(r);
                         }
@@ -1734,7 +3191,7 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
                                     ru != avoid0
                                         && ru != avoid1
                                         && vec_safe(r)
-                                        && fp_busy.get(idx(r)).is_some_and(|b| is_reg_free(b, inst, end, cur_rbw))
+                                        && fp_busy.get(idx(r)).is_some_and(|b| is_reg_free(b, start, end, cur_rbw))
                                 })
                         } else {
                             None
@@ -1747,7 +3204,7 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
                             .chain(CALLEE_SAVED_FP.iter().copied())
                             .find(|&r| {
                                 vec_safe(r)
-                                    && fp_busy.get(idx(r)).is_some_and(|b| is_reg_free(b, inst, end, cur_rbw))
+                                    && fp_busy.get(idx(r)).is_some_and(|b| is_reg_free(b, start, end, cur_rbw))
                             })
                     });
                 if let Some(reg) = chosen {
@@ -1755,7 +3212,7 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
                         *slot = AllocLoc::Vec(reg_u8(reg));
                     }
                     if let Some(b) = fp_busy.get_mut(idx(reg)) {
-                        b.insert(inst, end, cur_rbw);
+                        b.insert(start, end, cur_rbw);
                     }
                     if (8..=15).contains(&reg) {
                         if let Some(u) = used_callee_fp.get_mut(idx(reg)) {
@@ -1763,7 +3220,7 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
                         }
                     }
                 } else {
-                    let slot = alloc_spill_n(2, inst, end)?;
+                    let slot = alloc_spill_n(2, start, end)?;
                     if let Some(loc_slot) = loc_try.get_mut(inst) {
                         *loc_slot = AllocLoc::VecSpill(slot);
                     }
@@ -1791,7 +3248,7 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
                 let try_fp = |h: u8| -> Option<Reg> {
                     if h != NO_REG
                         && fp_safe(u32::from(h))
-                        && fp_busy.get(usize::from(h)).is_some_and(|b| is_reg_free(b, inst, end, cur_rbw))
+                        && fp_busy.get(usize::from(h)).is_some_and(|b| is_reg_free(b, start, end, cur_rbw))
                     {
                         Some(u32::from(h))
                     } else {
@@ -1808,7 +3265,7 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
                             .chain(CALLEE_SAVED_FP.iter().copied())
                             .find(|&r| {
                                 fp_safe(r)
-                                    && fp_busy.get(idx(r)).is_some_and(|b| is_reg_free(b, inst, end, cur_rbw))
+                                    && fp_busy.get(idx(r)).is_some_and(|b| is_reg_free(b, start, end, cur_rbw))
                             })
                     });
                 if let Some(reg) = chosen {
@@ -1816,7 +3273,7 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
                         *slot = AllocLoc::Fp(reg_u8(reg));
                     }
                     if let Some(b) = fp_busy.get_mut(idx(reg)) {
-                        b.insert(inst, end, cur_rbw);
+                        b.insert(start, end, cur_rbw);
                     }
                     if (8..=15).contains(&reg) {
                         if let Some(u) = used_callee_fp.get_mut(idx(reg)) {
@@ -1824,7 +3281,7 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
                         }
                     }
                 } else {
-                    let slot = alloc_spill_n(1, inst, end)?;
+                    let slot = alloc_spill_n(1, start, end)?;
                     if let Some(loc_slot) = loc_try.get_mut(inst) {
                         *loc_slot = AllocLoc::FpSpill(slot);
                     }
@@ -1858,7 +3315,7 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
                 let try_gpr = |h: u8| -> Option<Reg> {
                     if h != NO_REG
                         && gpr_safe(u32::from(h))
-                        && gpr_busy.get(usize::from(h)).is_some_and(|b| is_reg_free(b, inst, end, cur_rbw))
+                        && gpr_busy.get(usize::from(h)).is_some_and(|b| is_reg_free(b, start, end, cur_rbw))
                     {
                         Some(u32::from(h))
                     } else {
@@ -1875,7 +3332,7 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
                             .chain(CALLEE_SAVED_GPR.iter().copied())
                             .find(|&r| {
                                 gpr_safe(r)
-                                    && gpr_busy.get(idx(r)).is_some_and(|b| is_reg_free(b, inst, end, cur_rbw))
+                                    && gpr_busy.get(idx(r)).is_some_and(|b| is_reg_free(b, start, end, cur_rbw))
                             })
                     });
                 if let Some(reg) = chosen {
@@ -1883,7 +3340,7 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
                         *slot = AllocLoc::Gpr(reg_u8(reg));
                     }
                     if let Some(b) = gpr_busy.get_mut(idx(reg)) {
-                        b.insert(inst, end, cur_rbw);
+                        b.insert(start, end, cur_rbw);
                     }
                     if (X19..=X28).contains(&reg) {
                         if let Some(u) = used_callee_gpr.get_mut(idx(reg)) {
@@ -1896,8 +3353,14 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
                     }
                     remat_count += 1;
                     spill_cost = spill_cost.saturating_add(u64::from(cand.weight));
+                } else if matches!(view.op(inst), Op::DataAddr | Op::FuncAddr) {
+                    if let Some(slot) = loc_try.get_mut(inst) {
+                        *slot = AllocLoc::RematGlobal(u32_of(inst));
+                    }
+                    remat_count += 1;
+                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight).saturating_mul(2));
                 } else {
-                    let slot = alloc_spill_n(1, inst, end)?;
+                    let slot = alloc_spill_n(1, start, end)?;
                     if let Some(loc_slot) = loc_try.get_mut(inst) {
                         *loc_slot = AllocLoc::GprSpill(slot);
                     }
@@ -1908,14 +3371,13 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
         Ok((loc_try, used_callee_gpr, used_callee_fp, num_spill_slots, remat_count, spill_cost))
     };
 
-    // Phase 1: exact chordal-SSA program-order coloring (provably minimal register count!).
+    // Phase 1: monotonic RPO chordal-SSA coloring.
     let (mut final_loc, mut used_callee_gpr, mut used_callee_fp, mut num_spill_slots, mut remat_count, spill_cost) =
         run_coloring(&prog_order, true)?;
 
     // Phase 2: if register pressure overflowed (spills > 0 or remat > 0), run loop-weighted
-    // Greedy Priority Coloring so hot inner loops NEVER spill while cold outer values/constants
-    // yield & rematerialize! Compare by loop-weighted `spill_cost` (never raw unweighted slot
-    // count) so spilling outer depth-0/1 values ALWAYS beats spilling even one inner-loop value.
+    // Greedy Priority Coloring so hot inner loops stay register-resident while cold outer
+    // values/constants yield & rematerialize.
     if num_spill_slots > 0 || remat_count > 0 {
         let mut greedy_order: Vec<Candidate, A> = Vec::with_capacity_in(prog_order.len(), alloc);
         for &c in &prog_order {
@@ -1925,7 +3387,7 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
             b.weight
                 .cmp(&a.weight)
                 .then_with(|| a.is_remat.cmp(&b.is_remat))
-                .then_with(|| a.inst.cmp(&b.inst))
+                .then_with(|| a.start.cmp(&b.start))
         });
         if let Ok((g_loc, g_cgpr, g_cfp, g_spills, g_remat, g_cost)) = run_coloring(&greedy_order, false) {
             if g_cost < spill_cost || (g_cost == spill_cost && g_spills <= num_spill_slots) {
@@ -1937,79 +3399,17 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
             }
         }
     }
-    let loc_of = final_loc;
 
-    // Build exact ARM64 unwind pair masks (`blaze_code::unwind::Frame`).
-    let mut x_pairs = 0u8;
-    for k in 0..5usize {
-        let lo = 19 + 2 * k;
-        let hi = lo + 1;
-        if used_callee_gpr.get(lo).copied().unwrap_or(false)
-            || used_callee_gpr.get(hi).copied().unwrap_or(false)
-        {
-            x_pairs |= 1 << k;
-        }
-    }
-    let mut d_pairs = 0u8;
-    for k in 0..4usize {
-        let lo = 8 + 2 * k;
-        let hi = lo + 1;
-        if used_callee_fp.get(lo).copied().unwrap_or(false)
-            || used_callee_fp.get(hi).copied().unwrap_or(false)
-        {
-            d_pairs |= 1 << k;
-        }
-    }
-
-    // Compute exact IPRA physical clobber summary for callers of this function!
-    let mut clob = RegSet::EMPTY
-        .with(TierReg(16))
-        .with(TierReg(17));
-    for &loc in &loc_of {
-        match loc {
-            AllocLoc::Gpr(r) if !(19..=28).contains(&r) => clob = clob.with(TierReg(r)),
-            AllocLoc::GprPair(lo, hi) => {
-                if !(19..=28).contains(&lo) {
-                    clob = clob.with(TierReg(lo));
-                }
-                if !(19..=28).contains(&hi) {
-                    clob = clob.with(TierReg(hi));
-                }
-            }
-            AllocLoc::Fp(r) | AllocLoc::Vec(r) => {
-                if !(8..=15).contains(&r) {
-                    clob = clob.with(TierReg(32 + r));
-                }
-                clob = clob.with(TierReg(32 + 29)).with(TierReg(32 + 30)).with(TierReg(32 + 31));
-            }
-            _ => {}
-        }
-    }
-    if let Some(first_ret) = func_sig.rets.first() {
-        let r0 = Ty(first_ret.ty);
-        if is_fp_ty(r0).is_some() || is_vec128_ty(r0).is_some() {
-            clob = clob.with(TierReg(32));
-        } else {
-            clob = clob.with(TierReg(0));
-            if func_sig.rets.len() >= 2 {
-                clob = clob.with(TierReg(1));
-            }
-        }
-    }
-    for &c in &call_positions {
-        clob = clob.with(TierReg(30));
-        clob = clob.union(call_clobbers(c).clobbered);
-    }
-
-    Ok(Allocation {
-        loc_of,
-        x_pairs,
-        d_pairs,
+    Ok(finalize_allocation(
+        view,
+        final_loc,
+        used_callee_gpr,
+        used_callee_fp,
         num_spill_slots,
-        has_calls: !call_positions.is_empty(),
-        clobbers: CallClobbers { clobbered: clob },
         remat_count,
-    })
+        &call_positions,
+        call_clobbers,
+    ))
 }
 
 #[cfg(test)]
@@ -2017,14 +3417,15 @@ mod tests {
     use blaze_lir::{
         Flags, IntCond, Op, Scalar, Ty,
         builder::{Builder, Full, MemAttrs, Param, Variadic},
-        func::{BlockKind, Conv},
+        func::{BlockKind, Conv, RefKind},
     };
     use blaze_own::{Alloc, Vec};
-    use blaze_tier::{CallClobbers, Machine, Names, Outside, RoutinePlaces};
+    use blaze_tier::{CallClobbers, Machine, Named, Names, Outside, RoutinePlaces};
 
     use super::{
         AllocLoc, CALLER_SAVED_FP, CALLER_SAVED_GPR, ScratchOrder, allocate,
-        allocate_with_ipra_and_order, build_caller_fp_order, build_caller_gpr_order,
+        allocate_linear_scan_rpo, allocate_with_ipra_and_order, build_caller_fp_order,
+        build_caller_gpr_order, u32_of,
     };
 
     struct NoNames;
@@ -2552,5 +3953,352 @@ mod tests {
             0,
             "emitted unwind frame must record saved d_pairs for v8..v15"
         );
+    }
+
+    struct ExtFuncNames;
+    impl Names for ExtFuncNames {
+        fn name(&self, of: Outside) -> Option<Named<'_>> {
+            match of {
+                Outside::Func(_) => Some(Named::C("ext_fn")),
+                _ => None,
+            }
+        }
+
+        fn routines(&self) -> RoutinePlaces {
+            RoutinePlaces::NONE
+        }
+    }
+
+    #[test]
+    fn exact_crosses_call_ignores_linear_straddling() {
+        let alloc = test_alloc();
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::PTR), Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let callee_sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR)], &[Param::of(Ty::I64)]);
+        let callee_ref = b.reference(RefKind::Func, 0);
+
+        let entry = b.create_block(BlockKind::Normal);
+        let loop_hdr = b.create_block(BlockKind::Normal);
+        // Laid out linearly BETWEEN `loop_hdr` and `loop_body`!
+        let exit_call = b.create_block(BlockKind::Normal);
+        let loop_body = b.create_block(BlockKind::Normal);
+        let inc_blk = b.create_block(BlockKind::Normal);
+        // Uses `p_i` linearly AFTER `inc_blk` so linear intervals would falsely block coalescing!
+        let exit_ret = b.create_block(BlockKind::Normal);
+
+        b.begin(entry);
+        let ptr = b.param(Ty::PTR);
+        let n = b.param(Ty::I64);
+        let live_x = b.param(Ty::I64);
+        let z0 = b.iconst(Ty::I64, 0);
+        b.jump((loop_hdr, &[z0]));
+
+        b.begin(loop_hdr);
+        let p_i = b.param(Ty::I64);
+        let cond = b.icmp(IntCond::Ult, p_i, n);
+        b.br(Flags::NONE, cond, (loop_body, &[]), (exit_call, &[]));
+
+        b.begin(exit_call);
+        let call_res = b.call(Flags::NONE, callee_ref, callee_sig, &[ptr]);
+        let call_out = b.binary(Op::Add, Flags::NONE, call_res, live_x);
+        b.ret(&[call_out]);
+
+        b.begin(loop_body);
+        let c3 = b.iconst(Ty::I64, 3);
+        let off = b.binary(Op::Shl, Flags::NONE, p_i, c3);
+        let elem_ptr = b.ptr_add(Flags::NONE, ptr, off);
+        let val = b.load(Ty::I64, Flags::NONE, elem_ptr, 0, MemAttrs::aligned(8));
+        let keep_going = b.icmp(IntCond::Ult, val, n);
+        b.br(Flags::NONE, keep_going, (inc_blk, &[]), (exit_ret, &[]));
+
+        b.begin(inc_blk);
+        let c1 = b.iconst(Ty::I64, 1);
+        let i_next = b.binary(Op::Add, Flags::NONE, p_i, c1);
+        b.jump((loop_hdr, &[i_next]));
+
+        b.begin(exit_ret);
+        b.ret(&[p_i]);
+
+        let func = b.finish_checked().expect("straddling call loop LIR builds");
+        let view = func.view();
+        let n_inst = view.len();
+        let mut skip: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+        let mut tail: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+        for _ in 0..n_inst {
+            skip.push(false);
+            tail.push(false);
+        }
+
+        // Verify linear layout genuinely straddles `call_res`.
+        assert!(p_i.index() < call_res.index() && call_res.index() < i_next.index());
+
+        let ra = allocate(&view, &skip, &tail, 32, crate::Os::MacOs, alloc)
+            .expect("regalloc succeeds for straddling call loop");
+
+        // 1. `p_i` does NOT cross `call_res` in the CFG -> must stay in a caller-saved GPR!
+        match ra.loc_of[p_i.index()] {
+            AllocLoc::Gpr(r) => {
+                assert!(
+                    !(19..=28).contains(&r),
+                    "loop IV p_i must stay in caller-saved GPR, got x{r}"
+                );
+            }
+            other => panic!("expected caller-saved GPR for p_i, got {other:?}"),
+        }
+
+        // 2. `i_next = add(p_i, 1)` must coalesce in-place with `p_i` even though `exit_ret` uses `p_i`!
+        assert_eq!(
+            ra.loc_of[i_next.index()],
+            ra.loc_of[p_i.index()],
+            "loop IV update i_next must coalesce into p_i's physical register"
+        );
+
+        // 3. Positive control: `live_x` genuinely crosses `call_res` -> must use a callee-saved GPR!
+        match ra.loc_of[live_x.index()] {
+            AllocLoc::Gpr(r) => {
+                assert!(
+                    (19..=28).contains(&r),
+                    "live_x genuinely crosses call and must use callee-saved x19..x28, got x{r}"
+                );
+            }
+            other => panic!("expected callee-saved GPR for live_x, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn call_crossing_small_const_and_cold_global_remat() {
+        let alloc = test_alloc();
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+        b.set_signature(sig);
+        let callee_sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+        let panic_sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR)], &[]);
+        let callee_ref = b.reference(RefKind::Func, 0);
+        let panic_ref = b.reference(RefKind::Func, 1);
+        let panic_data = b.data(b"panic_location_str", 1, &[]);
+
+        let entry = b.create_block(BlockKind::Normal);
+        let cold_panic = b.create_block(BlockKind::Normal);
+        let ok_ret = b.create_block(BlockKind::Normal);
+
+        b.begin(entry);
+        let flag = b.param(Ty::I64);
+        let c0 = b.iconst(Ty::I64, 0);
+        let c1 = b.iconst(Ty::I64, 1);
+        let panic_loc = b.data_addr(panic_data);
+        let res = b.call(Flags::NONE, callee_ref, callee_sig, &[flag]);
+        let is_zero = b.icmp(IntCond::Eq, res, c0);
+        b.br(Flags::NONE, is_zero, (cold_panic, &[]), (ok_ret, &[res]));
+
+        b.begin(cold_panic);
+        b.call(Flags::NONE, panic_ref, panic_sig, &[panic_loc]);
+        b.unreachable();
+
+        b.begin(ok_ret);
+        let r = b.param(Ty::I64);
+        let is_one = b.icmp(IntCond::Eq, r, c1);
+        let chosen = b.select(Flags::NONE, is_one, c0, c1);
+        b.ret(&[chosen]);
+
+        let func = b.finish_checked().expect("remat const + cold global LIR builds");
+        let view = func.view();
+        let n_inst = view.len();
+        let mut skip: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+        let mut tail: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+        for _ in 0..n_inst {
+            skip.push(false);
+            tail.push(false);
+        }
+
+        let ra = allocate(&view, &skip, &tail, 32, crate::Os::MacOs, alloc)
+            .expect("regalloc succeeds for remat const + cold global");
+
+        assert_eq!(ra.loc_of[c0.index()], AllocLoc::RematConst(0));
+        assert_eq!(ra.loc_of[c1.index()], AllocLoc::RematConst(1));
+        assert_eq!(
+            ra.loc_of[panic_loc.index()],
+            AllocLoc::RematGlobal(u32_of(panic_loc.index()))
+        );
+        assert_eq!(
+            ra.x_pairs, 0,
+            "Iconst(0), Iconst(1), and cold-only DataAddr must consume ZERO callee-saved x19..x28 pairs"
+        );
+
+        let emitted = super::super::isel::emit_sota_a64(
+            view,
+            &ExtFuncNames,
+            super::super::CallMode::DirectBl,
+            Machine::LSE,
+            true,
+            alloc,
+        )
+        .expect("emit_sota_a64 succeeds with RematConst + RematGlobal");
+        assert_eq!(
+            emitted.unwind_frame.map_or(0, |f| f.x_pairs),
+            0,
+            "emitted function must save ZERO callee-saved x19..x28 pairs"
+        );
+        assert!(
+            emitted.relocs.iter().any(|r| r.target == blaze_code::record::OWN_RELRO),
+            "rematerialized cold DataAddr must still emit OWN_RELRO relocations at the cold panic site"
+        );
+    }
+
+    #[test]
+    fn linear_scan_rpo_protects_call_crossing_loop_values() {
+        let alloc = test_alloc();
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::PTR), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let callee_sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR)], &[Param::of(Ty::I64)]);
+        let callee_ref = b.reference(RefKind::Func, 0);
+
+        let entry = b.create_block(BlockKind::Normal);
+        let loop_hdr = b.create_block(BlockKind::Normal);
+        let exit = b.create_block(BlockKind::Normal);
+        let loop_body = b.create_block(BlockKind::Normal);
+
+        b.begin(entry);
+        let ptr = b.param(Ty::PTR);
+        let n = b.param(Ty::I64);
+        let z0 = b.iconst(Ty::I64, 0);
+        b.jump((loop_hdr, &[z0]));
+
+        // `n` is ONLY read here (via fused `cond = icmp(Ult, p_i, n)`), BEFORE `loop_body`'s call,
+        // yet stays live across the back-edge `loop_body -> loop_hdr`!
+        b.begin(loop_hdr);
+        let p_i = b.param(Ty::I64);
+        let i_next = b.binary(Op::Add, Flags::NONE, p_i, z0);
+        let cond = b.icmp(IntCond::Ult, p_i, n);
+        b.br(Flags::NONE, cond, (loop_body, &[]), (exit, &[p_i]));
+
+        b.begin(exit);
+        let ret_v = b.param(Ty::I64);
+        b.ret(&[ret_v]);
+
+        // `call` executes AFTER `i_next` is defined and BEFORE the back-edge passing `i_next`!
+        b.begin(loop_body);
+        let call_res = b.call(Flags::NONE, callee_ref, callee_sig, &[ptr]);
+        let bumped = b.binary(Op::Add, Flags::NONE, i_next, call_res);
+        b.jump((loop_hdr, &[bumped]));
+
+        let func = b.finish_checked().expect("call-in-loop LIR builds");
+        let view = func.view();
+        let n_inst = view.len();
+        let mut skip: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+        let mut tail: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+        for _ in 0..n_inst {
+            skip.push(false);
+            tail.push(false);
+        }
+        // Fuse `cond = icmp(Ult, p_i, n)` into `br` just like `isel.rs` does!
+        skip[cond.index()] = true;
+
+        let gpr_ord = build_caller_gpr_order(None);
+        let fp_ord = build_caller_fp_order(None);
+        let ra_rpo = allocate_linear_scan_rpo(
+            &view,
+            &skip,
+            &tail,
+            32,
+            crate::Os::MacOs,
+            |_| CallClobbers::C_ABI_ARM64,
+            &gpr_ord,
+            &fp_ord,
+            alloc,
+        )
+        .expect("RPO linear-scan regalloc succeeds");
+        let ra_exact = allocate(&view, &skip, &tail, 32, crate::Os::MacOs, alloc)
+            .expect("exact-CFG regalloc succeeds");
+
+        for (label, ra) in [("linear_scan_rpo", &ra_rpo), ("exact_cfg", &ra_exact)] {
+            for (vname, val) in [("n", n), ("i_next", i_next), ("ptr", ptr)] {
+                match ra.loc_of[val.index()] {
+                    AllocLoc::Gpr(r) => {
+                        assert!(
+                            (19..=28).contains(&r),
+                            "{label}: {vname} crosses call in loop back-edge and must use callee-saved x19..x28, got x{r}"
+                        );
+                    }
+                    other => panic!("{label}: expected callee-saved GPR for {vname}, got {other:?}"),
+                }
+            }
+            assert_ne!(ra.x_pairs, 0, "{label}: must save callee-saved GPR pairs");
+        }
+    }
+
+    #[test]
+    fn linear_scan_rpo_rematerializes_consts_and_globals_under_pressure() {
+        let alloc = test_alloc();
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+        b.set_signature(sig);
+        let gdata = b.data(b"mega_fn_global_str", 8, &[]);
+
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let x = b.param(Ty::I64);
+        // 28 simultaneously live values (> 26 allocatable GPRs) so pressure overflows into remat!
+        let big_const = b.iconst(Ty::I64, 0x1234_5678);
+        let gaddr = b.data_addr(gdata);
+        let mut live = Vec::with_capacity_in(28, alloc);
+        let c1 = b.iconst(Ty::I64, 1);
+        let mut cur = x;
+        for _ in 0..27usize {
+            cur = b.binary(Op::Add, Flags::NONE, cur, c1);
+            live.push(cur);
+        }
+        let mut acc = big_const;
+        for &v in &live {
+            acc = b.binary(Op::Xor, Flags::NONE, acc, v);
+        }
+        let g_val = b.load(Ty::I64, Flags::NONE, gaddr, 0, MemAttrs::aligned(8));
+        let out = b.binary(Op::Xor, Flags::NONE, acc, g_val);
+        b.ret(&[out]);
+
+        let func = b.finish_checked().expect("high-pressure LIR builds");
+        let view = func.view();
+        let n_inst = view.len();
+        let mut skip: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+        let mut tail: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+        for _ in 0..n_inst {
+            skip.push(false);
+            tail.push(false);
+        }
+
+        let gpr_ord = build_caller_gpr_order(None);
+        let fp_ord = build_caller_fp_order(None);
+        let ra = allocate_linear_scan_rpo(
+            &view,
+            &skip,
+            &tail,
+            32,
+            crate::Os::MacOs,
+            |_| CallClobbers::C_ABI_ARM64,
+            &gpr_ord,
+            &fp_ord,
+            alloc,
+        )
+        .expect("RPO linear-scan regalloc succeeds under pressure");
+
+        assert!(
+            matches!(ra.loc_of[big_const.index()], AllocLoc::RematConst(0x1234_5678))
+                || matches!(ra.loc_of[gaddr.index()], AllocLoc::RematGlobal(_)),
+            "expected RPO linear-scan to rematerialize constants/globals under >26 GPR pressure, got const={:?}, global={:?}",
+            ra.loc_of[big_const.index()],
+            ra.loc_of[gaddr.index()],
+        );
+        assert!(ra.remat_count > 0, "expected remat_count > 0 under >26 GPR pressure");
     }
 }
