@@ -4458,3 +4458,69 @@ fn the_commit_meter_catches_an_unbounded_window() {
     }
     assert!(caught.is_some(), "no seed of 8 caught an unbounded commit window");
 }
+
+#[test]
+fn reused_semi_join_tracks_dead_resurrection_without_touching_live_roots() {
+    let root = test_root();
+    let mut c = cfg(1, 1, false, &root);
+    c.liveness = super::core::Liveness::Reached;
+    let sim = Sim::new(77, Faults::default());
+    let mut store = Driven::with(sim, Path::new("/sim"), c, &root).expect("open store");
+    store.disable_auto_merge();
+
+    // 1. Commit an unrooted (dead) record in its own segment.
+    let dead_k = key(90_001);
+    store.put(dead_k, Namespace::LOCAL, TAG, b"dead-record").expect("put dead");
+    let dead_commit = store.commit_with(&[]).expect("commit dead");
+    let dead_seg_id = dead_commit.segments[0];
+
+    // 2. Commit 16 unrelated indexed roots (`other-0`..`other-15`) + one `checkout` root with
+    //    two page indexes (`idx_a`, `idx_b`).
+    let mut other_sample = key(0);
+    for r in 0..16u32 {
+        let mut keys = [key(0); 8];
+        for (j, slot) in keys.iter_mut().enumerate() {
+            let k = key(1_000 + r * 100 + j as u32);
+            if r == 7 && j == 3 {
+                other_sample = k;
+            }
+            store.put(k, Namespace::LOCAL, TAG, &[r as u8, j as u8, 42]).expect("put other");
+            *slot = k;
+        }
+        let idx = store.index(&keys).expect("other index");
+        store.root_through(&format!("other-{r}"), &[idx], super::core::ROOT_LIFE_NS).expect("other root");
+    }
+    let ka1 = key(50_001);
+    let ka2 = key(50_002);
+    let kb1 = key(50_003);
+    let kb2 = key(50_004);
+    for (k, v) in [(ka1, b"a1"), (ka2, b"a2"), (kb1, b"b1"), (kb2, b"b2")] {
+        store.put(k, Namespace::LOCAL, TAG, v).expect("put checkout");
+    }
+    let idx_a = store.index(&[ka1, ka2]).expect("idx_a");
+    let idx_b = store.index(&[kb1, kb2]).expect("idx_b");
+    store.root_through("checkout", &[idx_a, idx_b], super::core::ROOT_LIFE_NS).expect("checkout root");
+    let live_commit = store.commit_with(&[]).expect("commit live");
+    let live_seg_id = live_commit.segments[0];
+
+    // 3. Incremental edit on `checkout`: replace `idx_b` with `idx_b2` reusing live `kb1` (from
+    //    replaced `idx_b`), live `other_sample` (from `other-7`), and one brand-new record.
+    //    Every reused key is already live, so ZERO committed segments should be marked touched.
+    let kb3 = key(50_005);
+    store.put(kb3, Namespace::LOCAL, TAG, b"b3").expect("put kb3");
+    let idx_b2 = store.index(&[kb1, other_sample, kb3]).expect("idx_b2");
+    store.root_through("checkout", &[idx_a, idx_b2], super::core::ROOT_LIFE_NS).expect("update checkout");
+    let inc = store.commit_with(&[]).expect("commit incremental");
+    let live_touched = store.core().segment_touched(live_seg_id).expect("live seg");
+    assert_ne!(live_touched, inc.generation, "already-live keys must not touch their segment");
+    let dead_touched = store.core().segment_touched(dead_seg_id).expect("dead seg");
+    assert_ne!(dead_touched, inc.generation, "unreferenced dead segment must not be touched");
+
+    // 4. Resurrect `dead_k` via a new index on `checkout`: `dead_seg_id` MUST be marked touched
+    //    at this generation so any concurrent sweep slice on it aborts.
+    let idx_resurrect = store.index(&[dead_k, kb3]).expect("idx_resurrect");
+    store.root_through("checkout", &[idx_a, idx_resurrect], super::core::ROOT_LIFE_NS).expect("resurrect root");
+    let res = store.commit_with(&[]).expect("commit resurrection");
+    let dead_touched = store.core().segment_touched(dead_seg_id).expect("dead seg after");
+    assert_eq!(dead_touched, res.generation, "resurrected dead key must mark its segment touched");
+}

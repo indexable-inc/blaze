@@ -156,3 +156,30 @@ fn the_helper_place_is_asked_from_only_with_its_pair() {
 fn detached_helper_args_use_cwd_not_absolute_path() {
     assert_eq!(HELPER_ARGS, ["journal-helper"]);
 }
+
+/// `Stored::has_checkout_cursor` distinguishes a real checkout cursor from `Stored::NONE` or
+/// `Cursor::None`, and `Taken::refused_with_helper_place` records `Refused::NoCursor` while
+/// persisting the helper's paired `(cursor, place)`.
+#[test]
+fn refused_with_helper_place_pairs_cursor_without_replay() {
+    let frame = test_frame();
+    assert!(!Stored::NONE.has_checkout_cursor());
+    let cursor = Cursor::Sim { journal: 7, next: 42 };
+    let place = Place { instance: 0xbeef, seq: 5 };
+    let mut none_bytes = Vec::new_in(&frame);
+    Stored::encode_units([(crate::journal_sweep::Where::Checkout as u8, "", Cursor::None)].into_iter(), Some(1), &mut none_bytes);
+    assert!(!Stored::of(&none_bytes).expect("whole").has_checkout_cursor());
+
+    let io = bstd::io::Io::simulated(bstd::io::SimWorld::new(11, bstd::io::Limits::USUAL));
+    let cx = io.cx(bstd::test::BUDGET, 4 << 20).expect("a root context");
+    let root = io.need_fs().expect("fs").root();
+    let clock = io.need_clock().expect("clock");
+    let mut taken = Taken::begin(&cx, &root, &clock, &frame).expect("begin");
+    taken.refused_with_helper_place(cursor, place.encode());
+    assert!(matches!(taken.journal, crate::journal_sweep::JournalUse::Refused(crate::journal_sweep::Refused::NoCursor)));
+    let mut out = Vec::new_in(&frame);
+    taken.encode(&mut out);
+    let stored = Stored::of(&out).expect("encoded");
+    assert!(stored.has_checkout_cursor());
+    assert_eq!(paired_place(stored), Some(place));
+}

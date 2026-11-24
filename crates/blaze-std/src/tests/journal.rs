@@ -154,3 +154,28 @@ fn the_root_is_journaled_with_its_own_level() {
     }
     assert_eq!(heard.lost().count(), 0, "nothing lost: {heard:?}");
 }
+
+/// A `Cursor::None` call (cold run with no prior place) returns as soon as the driver delivers a
+/// valid cursor without writing a flush cookie barrier, while still reporting subsequent writes.
+#[test]
+fn cursor_none_skips_flush_barrier_and_preserves_subsequent_writes() {
+    let io = Io::sim(48);
+    io.with_sim(|sim| sim.set_journal(Journal::FsEvents)).expect("a simulated world");
+    let cx = root(&io);
+    let fs = io.need_fs().expect("a file tree");
+    let ws = fs.open_dir(&cx, &path("ws")).expect("the folder ws");
+    write_synced(&cx, &ws, &path("src/lib.rs"), b"pub fn a() {}").expect("ws/src/lib.rs is written");
+
+    io.record();
+    io.asked();
+    let first = ws.changes_since(&cx, Cursor::None).expect("the journal's place");
+    let asked = io.asked();
+    assert_ne!(first.cursor, Cursor::None, "valid cursor returned");
+    assert!(asked.iter().any(|it| matches!(it, Effect::Journal { .. })), "opened journal: {asked:?}");
+    assert!(asked.iter().any(|it| matches!(it, Effect::Unwatch { .. })), "unwatched cleanly: {asked:?}");
+    assert!(!asked.iter().any(|it| matches!(it, Effect::Flush { .. })), "Cursor::None skips flush barrier: {asked:?}");
+
+    write_synced(&cx, &ws, &path("src/b.rs"), b"pub fn b() {}").expect("ws/src/b.rs is written");
+    let next = ws.changes_since(&cx, first.cursor).expect("replay from fast-path cursor");
+    assert!(next.files().any(|it| it == "src/b.rs"), "write after fast-path cursor must be reported");
+}

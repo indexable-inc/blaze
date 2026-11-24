@@ -253,6 +253,8 @@ impl<P: Rights> Dir<P> {
             events: 0,
             times,
         };
+        let cursor_only = since == Cursor::None;
+        let mut skip_flush = false;
         let history = cx.span("journal: the history told, to HistoryDone");
         loop {
             match history.wait(&self.io, tag, Ends::Watch) {
@@ -264,8 +266,17 @@ impl<P: Rights> Dir<P> {
                     }
                     changes.times.history_batches = changes.times.history_batches.saturating_add(1);
                     take(&mut changes, *batch);
-                    if caught_up {
+                    // When the caller has no prior place (`Cursor::None`) or the entire folder is
+                    // already lost (`whole.is_some()`), the caller will unconditionally sweep the
+                    // whole folder. As soon as the driver supplies a valid cursor (e.g. macOS
+                    // FSEvents' synchronous initial batch carrying `FSEventsGetCurrentEventId()`),
+                    // waiting for `HistoryDone` (~150-170 ms) and a flush cookie barrier adds zero
+                    // soundness: any edit after `cursor` has a strictly greater event ID and is
+                    // reported on the next replay, while any edit before it is seen by the sweep.
+                    let whole_sweep = (cursor_only || changes.whole.is_some()) && changes.cursor != Cursor::None;
+                    if caught_up || whole_sweep {
                         changes.times.history_ns = at;
+                        skip_flush = whole_sweep;
                         break;
                     }
                 }
@@ -281,25 +292,27 @@ impl<P: Rights> Dir<P> {
                 }
             }
         }
-        // The barrier (the module's doc, "Why the flush"): every change queued for the watch
-        // by now is told before `Flushed`, kept as the history was.
-        let writing = self.io.now();
-        let flush = {
-            let _writing = cx.span("journal: the flush's cookie written (the effect handed over)");
-            self.io.submit(|fresh| Effect::Flush { watch: tag, tag: fresh })
-        };
-        let written = self.io.now();
-        changes.times.cookie_write_ns = ns_between(writing, written);
-        let barrier = cx.span("journal: the flush's cookie heard (the barrier)");
-        match barrier.wait(&self.io, flush, Ends::Once) {
-            Ok(Done::Flushed) => changes.times.cookie_heard_ns = ns_between(written, self.io.now()),
-            Ok(done) => {
-                self.abandon(tag);
-                return Err(JournalError::Failed(unexpected(FsOp::Journal, &self.base, done)));
-            }
-            Err(stopped) => {
-                self.abandon(tag);
-                return Err(failed(FsKind::Stopped(stopped)));
+        if !skip_flush {
+            // The barrier (the module's doc, "Why the flush"): every change queued for the watch
+            // by now is told before `Flushed`, kept as the history was.
+            let writing = self.io.now();
+            let flush = {
+                let _writing = cx.span("journal: the flush's cookie written (the effect handed over)");
+                self.io.submit(|fresh| Effect::Flush { watch: tag, tag: fresh })
+            };
+            let written = self.io.now();
+            changes.times.cookie_write_ns = ns_between(writing, written);
+            let barrier = cx.span("journal: the flush's cookie heard (the barrier)");
+            match barrier.wait(&self.io, flush, Ends::Once) {
+                Ok(Done::Flushed) => changes.times.cookie_heard_ns = ns_between(written, self.io.now()),
+                Ok(done) => {
+                    self.abandon(tag);
+                    return Err(JournalError::Failed(unexpected(FsOp::Journal, &self.base, done)));
+                }
+                Err(stopped) => {
+                    self.abandon(tag);
+                    return Err(failed(FsKind::Stopped(stopped)));
+                }
             }
         }
         // The watch ended: an Unwatch of the same tag, its `Unwatched` the stream's last. The

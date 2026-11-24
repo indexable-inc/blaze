@@ -1512,13 +1512,24 @@ fn save<'m, D: Driver, S: Sharing>(
     writer: Writer,
     rows: &Rows<'_>,
     journal: &crate::journal_sweep::Taken<'_>,
-    alloc: SharedAlloc<'_>,
+    _request_alloc: SharedAlloc<'_>,
     frame: &Frame,
     row_keys: &[Key],
     (last_root, rekey): (Option<Key>, Rekey),
     workers: core::num::NonZeroU32,
     save_base: SaveBase,
 ) -> Result<Saved, CliError> {
+    // Scoped arena for all serialization buffers (encoded pages, header shards, reach/direct
+    // indexes, toolchain base merge): none outlives `save()`, so keeping them out of `RequestMem`
+    // (`Tag::Api`) returns 100% of their pages to the OS before `after_answer` commit.
+    let save_mem = blaze_mem::Root::new(blaze_mem::RootOpts {
+        reserve: crate::engine_phase_mem::PHASE_RESERVE,
+        tag: blaze_mem::Tag::Query,
+        live_at_drop: blaze_mem::LiveAtDrop::Refused,
+    })
+    .map_err(|error| crate::engine_phase_mem::PhaseMemError::Request { error })?;
+    let alloc = save_mem.shared();
+    let result = (|| -> Result<Saved, CliError> {
     let mut encoded = match last {
         Some(stored) => {
             let mut pool_err: Option<CliError> = None;
@@ -1605,7 +1616,9 @@ fn save<'m, D: Driver, S: Sharing>(
     {
         saved.pages_digest = Some(test_pages_digest(lent, &encoded, alloc, frame)?);
     }
-    encoded.puts.clear();
+    // Every encoded page and radix sub-record is now in `store`; release their buffers back to
+    // `save_mem`'s free lists before allocating producer header shards or reach indexes.
+    encoded.puts = blaze_own::Vec::new_in(alloc);
     let mut header_pool_err: Option<CliError> = None;
     let (headers, writes) = Headers::after_with(last.map(|base| base.headers), kept, writer, kept.answer.serial, HeadersPlant::None, |index| match last {
         Some(base) => base.headers_at(index),
@@ -1655,6 +1668,7 @@ fn save<'m, D: Driver, S: Sharing>(
         store.put(cx, *key, bytes)?;
         saved.puts += 1;
     }
+    drop(writes);
     // The printed lines, under the key of their bytes: equal lines are one record.
     // Empty bytes signal that `ViewSlot::render` already proved `lines.0` is held in the store
     // and skipped re-encoding it; `direct` below still pins `lines.0` under `{name}.answer`.
@@ -1798,6 +1812,9 @@ fn save<'m, D: Driver, S: Sharing>(
     }
     saved.base = keep_base(cx, store, rows, key, frame)?;
     Ok(saved)
+    })();
+    drop(save_mem);
+    result
 }
 
 /// The bases with `pointer` as its workspace's newest ([`with_base`]), rewritten and pinned

@@ -465,9 +465,9 @@ struct BodyFinding<'f> {
 }
 
 /// Still private to the body. Its findings borrow its scratch until the run appends them.
-struct BodyResult<'a, 's> {
+struct BodyResult<'a, 'b, 's> {
     done: Done<'a>,
-    note: Option<(Said<blaze_own::Box<TaskError, SharedAlloc<'a>>>, Option<crate::engine_seeds::FirstFailure>)>,
+    note: Option<(Said<blaze_own::Box<TaskError, SharedAlloc<'b>>>, Option<crate::engine_seeds::FirstFailure>)>,
     found: Vec<BodyFinding<'s>, &'s Frame>,
     /// The fns declared in the entry's bodies that its check reached (front2 tables/task.rs
     /// `BodyReads::locals`): in its scratch until the run appends them to [`RunOut::locals`].
@@ -2910,7 +2910,7 @@ impl<'v, 'f, 'r> BodyRunner<'v, 'f, 'r> {
         let shared = self.over(reads);
         let mut run = BodyRun { out: Buffer::new_in(alloc), ran: SVec::new_in(alloc), findings: RunOut::new(alloc), tally: crate::engine_seeds::SeedTally::default(), span: (0, 0) };
         let began = crate::engine_times::ns(self.clock.now().since_start());
-        run_bodies(cx, &shared, core::slice::from_ref(one), self.clock, &mut run.out, &mut run.ran, &mut run.findings, &mut run.tally, alloc);
+        run_bodies(cx, &shared, core::slice::from_ref(one), self.clock, &mut run.out, &mut run.ran, &mut run.findings, &mut run.tally, alloc, alloc);
         run.span = (began, crate::engine_times::ns(self.clock.now().since_start()));
         Ok(run)
     }
@@ -3823,9 +3823,9 @@ impl<'f> BodiesStage<'f> {
         // it alone is a slice alone), each its own run ([`Part`]); the entry itself is kept whole
         // in `wholes` for the join, its slices in `parts`, `slice_of` naming each whole's slices.
         // Phase arena: dropped with the phase.
-        let mut wholes: SVec<'a, One<'f>> = SVec::new_in(alloc);
-        let mut parts: SVec<'a, One<'f>> = SVec::new_in(alloc);
-        let mut slice_of: SVec<'a, (usize, usize)> = SVec::new_in(alloc);
+        let mut wholes: SVec<'p, One<'f>> = SVec::new_in(at_phase);
+        let mut parts: SVec<'p, One<'f>> = SVec::new_in(at_phase);
+        let mut slice_of: SVec<'p, (usize, usize)> = SVec::new_in(at_phase);
         ones.retain(|one| {
             if one.items.len() <= 1 || predicted(one.costs, 0, one.items.len()) <= SLICE_BYTES {
                 return true;
@@ -3881,11 +3881,11 @@ impl<'f> BodiesStage<'f> {
             from = to;
         }
         self.runs = u32::try_from(runs.len()).unwrap_or(u32::MAX);
-        // Each run's results in the phase's arena: its `Done`s, its bodies' rows and their
-        // findings ([`RunOut`]); merged below, never kept on the process heap.
-        let mut buffers: SVec<'a, (Buffer<'a>, SVec<'a, Ran<'f>>, RunOut<'a>)> = SVec::with_capacity_in(runs.len(), alloc);
+        // Each run's results in the phase's arena: its `Done`s (in `alloc` for engine merge),
+        // its bodies' rows and their findings ([`RunOut`]) in `at_phase`, dropped with the phase.
+        let mut buffers: SVec<'p, (Buffer<'a>, SVec<'p, Ran<'f>>, RunOut<'p>)> = SVec::with_capacity_in(runs.len(), at_phase);
         for _ in 0..runs.len() {
-            buffers.push((Buffer::new_in(alloc), SVec::new_in(alloc), RunOut::new(alloc)));
+            buffers.push((Buffer::new_in(alloc), SVec::new_in(at_phase), RunOut::new(at_phase)));
         }
         let Some(found) = prepared.found.as_ref() else {
             // Nothing to run: every task's result is in `buffer` above.
@@ -3899,7 +3899,7 @@ impl<'f> BodiesStage<'f> {
         tallies.resize(runs.len(), crate::engine_seeds::SeedTally::default());
         // Each run's thread stretch (start, end), for the stage's floor (engine_times.rs
         // `Times::job`): what bounds the stage is how many ran at once, measured, not the workers.
-        let mut spans: SVec<'a, (u64, u64)> = SVec::with_capacity_in(runs.len(), alloc);
+        let mut spans: SVec<'p, (u64, u64)> = SVec::with_capacity_in(runs.len(), at_phase);
         spans.resize(runs.len(), (0, 0));
         // The phase's scope records opened by need, one for all its runs (each crate opened
         // once whichever run asks it first); its counts read after the runs end.
@@ -3932,7 +3932,7 @@ impl<'f> BodiesStage<'f> {
                         return Ok::<(), Infallible>(());
                     }
                     let began = crate::engine_times::ns(clock.now().since_start());
-                    run_bodies(cx, shared, run, &clock, out, ran, run_out, tally, alloc);
+                    run_bodies(cx, shared, run, &clock, out, ran, run_out, tally, alloc, at_phase);
                     *span = (began, crate::engine_times::ns(clock.now().since_start()));
                     Ok::<(), Infallible>(())
                 }));
@@ -3976,8 +3976,8 @@ impl<'f> BodiesStage<'f> {
         // first body ([`BodiesStage::task_label`]); a joined row's time is not pushed again.
         let joined_runs = wholes.len();
         let mut slices_done = buffers.into_iter();
-        let mut buffers: SVec<'a, (Buffer<'a>, SVec<'a, Ran<'f>>, RunOut<'a>)> = SVec::with_capacity_in(runs.len() - parts.len() + wholes.len(), alloc);
-        let mut group: SVec<'a, (Buffer<'a>, SVec<'a, Ran<'f>>, RunOut<'a>)> = SVec::new_in(alloc);
+        let mut buffers: SVec<'p, (Buffer<'a>, SVec<'p, Ran<'f>>, RunOut<'p>)> = SVec::with_capacity_in(runs.len() - parts.len() + wholes.len(), at_phase);
+        let mut group: SVec<'p, (Buffer<'a>, SVec<'p, Ran<'f>>, RunOut<'p>)> = SVec::new_in(at_phase);
         for (whole, &(first, end)) in wholes.iter().zip(slice_of.iter()) {
             group.clear();
             group.extend(slices_done.by_ref().take(end - first));
@@ -3990,10 +3990,10 @@ impl<'f> BodiesStage<'f> {
                 let label = SliceLabel { name, entry: whole.label, from, to: from + part.items.len() as u32, whole: whole.items.len() as u32 };
                 self.slices.get_or_insert_with(|| Vec::new_in(frame)).push(label);
             }
-            buffers.push(join_slices(whole, &mut group, heap.alloc(), alloc)?);
+            buffers.push(join_slices(whole, &mut group, heap.alloc(), alloc, at_phase)?);
         }
         buffers.extend(slices_done);
-        let mut entry_runs: SVec<'a, &[One<'f>]> = SVec::with_capacity_in(buffers.len(), alloc);
+        let mut entry_runs: SVec<'p, &[One<'f>]> = SVec::with_capacity_in(buffers.len(), at_phase);
         entry_runs.extend(wholes.iter().map(core::slice::from_ref));
         entry_runs.extend(runs[parts.len()..].iter().copied());
         let made = self.join_runs(&cx, store, buffer, times, &entry_runs, buffers, joined_runs, heap, frame, at_phase)?;
@@ -4012,14 +4012,14 @@ impl<'f> BodiesStage<'f> {
     /// ([`BodiesStage::run_phase`]); the `Ready` driver after its drive over the runs its
     /// `BodyCheck` kind sank ([`Prepared::join_ready`]).
     #[expect(clippy::too_many_arguments, reason = "the join's edge: each argument one handle of it")]
-    fn join_runs<'a, 'r, 'p>(
+    fn join_runs<'a, 'b, 'r, 'p>(
         &mut self,
         cx: &Cx,
         store: &mut dyn crate::store::Store<'r>,
         buffer: &mut Buffer<'a>,
         times: &mut crate::engine_times::Times,
         runs: &[&[One<'f>]],
-        buffers: SVec<'a, (Buffer<'a>, SVec<'a, Ran<'f>>, RunOut<'a>)>,
+        buffers: SVec<'b, (Buffer<'a>, SVec<'b, Ran<'f>>, RunOut<'b>)>,
         joined_runs: usize,
         heap: &'static blaze_own::Heap,
         frame: &'f Frame,
@@ -4043,7 +4043,7 @@ impl<'f> BodiesStage<'f> {
         let mut covers: SVec<'p, [u8; 16]> = SVec::new_in(at_phase);
         // A run's typed records' keys by check, sorted: what each body's run facts name.
         let mut typed_keys: SVec<'p, (Name, Key)> = SVec::new_in(at_phase);
-        for (run_at, (mut out, mut ran, mut run_out)) in buffers.into_iter().enumerate() {
+        for (run_at, (mut out, mut ran, run_out)) in buffers.into_iter().enumerate() {
             buffer.done.append(&mut out.done);
             buffer.made.append(&mut out.made);
             buffer.owed.append(&mut out.owed);
@@ -6008,7 +6008,7 @@ const STRETCH_FULL: usize = BODIES_FRAME / 2;
 /// One run: its bodies checked in stretches, each over a frame of its own that ends with it
 /// ([`STRETCH_FULL`]), so no run uses up a frame however many bodies it holds.
 #[expect(clippy::too_many_arguments, reason = "a run's edge: each argument one handle of it")]
-fn run_bodies<'a, 'f, R: ?Sized + CellDigests>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_, R>, run: &[One<'f>], clock: &Clock, out: &mut Buffer<'a>, ran: &mut SVec<'a, Ran<'f>>, run_out: &mut RunOut<'a>, tally: &mut crate::engine_seeds::SeedTally, alloc: SharedAlloc<'a>) {
+fn run_bodies<'a, 'b, 'f, R: ?Sized + CellDigests>(cx: &Cx, shared: &Shared<'_, 'a, '_, '_, R>, run: &[One<'f>], clock: &Clock, out: &mut Buffer<'a>, ran: &mut SVec<'b, Ran<'f>>, run_out: &mut RunOut<'b>, tally: &mut crate::engine_seeds::SeedTally, alloc: SharedAlloc<'a>, at_phase: SharedAlloc<'b>) {
     #[cfg(test)]
     crate::engine_check::stack_probe::at("run_bodies");
     // Filing a refusal must work even when the allocation for the successful row failed.
@@ -6035,7 +6035,7 @@ fn run_bodies<'a, 'f, R: ?Sized + CellDigests>(cx: &Cx, shared: &Shared<'_, 'a, 
         }
         let took = match Frame::with_reserve(BODIES_FRAME, bstd::mem::Tag::Infer) {
             Ok(stretch) => {
-                let took = run_stretch(cx, shared, rest, &stretch, &mut scratch, clock, out, ran, run_out, tally, alloc);
+                let took = run_stretch(cx, shared, rest, &stretch, &mut scratch, clock, out, ran, run_out, tally, alloc, at_phase);
                 // Its records' pages go as the stretch ends, not the run (the frame's drop: what
                 // its thread's shelf has no room for goes back, blaze-mem frame.rs `give_span`).
                 run_out.frames.stretch_committed_most = run_out.frames.stretch_committed_most.max(stretch.committed() as u64);
@@ -6048,7 +6048,7 @@ fn run_bodies<'a, 'f, R: ?Sized + CellDigests>(cx: &Cx, shared: &Shared<'_, 'a, 
 }
 
 /// Every body of `rest` refused for one reason, each named (rule 3): how many it took (all).
-fn refuse<'a, 'f, R: ?Sized + CellDigests>(rest: &[One<'f>], why: &'static str, scope: Option<(&Shared<'_, 'a, '_, '_, R>, &Group<'_, '_>)>, out: &mut Buffer<'a>, ran: &mut SVec<'a, Ran<'f>>, run_out: &mut RunOut<'a>, alloc: SharedAlloc<'a>) -> usize {
+fn refuse<'a, 'b, 'f, R: ?Sized + CellDigests>(rest: &[One<'f>], why: &'static str, scope: Option<(&Shared<'_, 'a, '_, '_, R>, &Group<'_, '_>)>, out: &mut Buffer<'a>, ran: &mut SVec<'b, Ran<'f>>, run_out: &mut RunOut<'b>, alloc: SharedAlloc<'a>) -> usize {
     for one in rest {
         if let Some((shared, group)) = scope {
             let done = shared.refused_scope(one, group, core::iter::empty(), alloc);
@@ -6078,15 +6078,16 @@ fn refuse<'a, 'f, R: ?Sized + CellDigests>(rest: &[One<'f>], why: &'static str, 
 /// entry's are). The first slice that was not checked (a refusal, a panic, a frame used up)
 /// decides as the first body that stopped decides an entry: its result and note, the reads of
 /// the slices before it beside its own, none of their findings.
-fn join_slices<'a, 'f>(
+fn join_slices<'a, 'b, 'f>(
     entry: &One<'f>,
-    slices: &mut SVec<'a, (Buffer<'a>, SVec<'a, Ran<'f>>, RunOut<'a>)>,
+    slices: &mut SVec<'b, (Buffer<'a>, SVec<'b, Ran<'f>>, RunOut<'b>)>,
     g: blaze_own::Alloc<'static>,
     alloc: SharedAlloc<'a>,
-) -> Result<(Buffer<'a>, SVec<'a, Ran<'f>>, RunOut<'a>), EngineCheckError> {
+    at_phase: SharedAlloc<'b>,
+) -> Result<(Buffer<'a>, SVec<'b, Ran<'f>>, RunOut<'b>), EngineCheckError> {
     let name = entry.task.planned.name;
     let mut buffer = Buffer::new_in(alloc);
-    let mut joined = RunOut::new(alloc);
+    let mut joined = RunOut::new(at_phase);
     let mut reads: SVec<'a, (CellId, ContentId)> = SVec::new_in(alloc);
     let (mut ns, mut bytes, mut stretch) = (0u64, 0u64, InStretch::No);
     let mut stopped = None;
@@ -6128,7 +6129,7 @@ fn join_slices<'a, 'f>(
     }
     reads.sort_unstable_by_key(|read| read.0);
     reads.dedup_by_key(|read| read.0);
-    let mut ran: SVec<'a, Ran<'f>> = SVec::with_capacity_in(1, alloc);
+    let mut ran: SVec<'b, Ran<'f>> = SVec::with_capacity_in(1, at_phase);
     ran.push(Ran { name, label: entry.label, ns, bytes, chain: entry.place.chain, note: None, found: FindingRange::default(), file: entry.file, stretch });
     if let Some(at) = stopped {
         let (out, _, run_out) = &mut slices[at];
@@ -6200,7 +6201,7 @@ fn join_slices<'a, 'f>(
     }
     joined.item_tasks = 1;
     // Rule 25: one entry's findings in one order, whatever its slices' were.
-    let mut found: SVec<'a, (FoundAt, u16, &[u8])> = SVec::new_in(alloc);
+    let mut found: SVec<'b, (FoundAt, u16, &[u8])> = SVec::new_in(at_phase);
     for (_, _, run_out) in slices.iter() {
         let mut from = 0;
         for &(_, rule, at, end) in run_out.found.iter() {
@@ -6335,7 +6336,7 @@ impl<'n> HeadSeed<'n> for LazyBodySeed<'_, 'n, '_> {
 /// One stretch of a run: its member's records opened once into `frame`, each body checked over
 /// one view until the frame is past [`STRETCH_FULL`]. How many bodies it took (at least one).
 #[expect(clippy::too_many_arguments, reason = "a stretch's edge: each argument one handle of it")]
-fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
+fn run_stretch<'a, 'b, 'f, R: ?Sized + CellDigests>(
     cx: &Cx,
     shared: &Shared<'_, 'a, '_, '_, R>,
     run: &[One<'f>],
@@ -6343,10 +6344,11 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
     scratch: &mut Frame,
     clock: &Clock,
     out: &mut Buffer<'a>,
-    ran: &mut SVec<'a, Ran<'f>>,
-    run_out: &mut RunOut<'a>,
+    ran: &mut SVec<'b, Ran<'f>>,
+    run_out: &mut RunOut<'b>,
     tally: &mut crate::engine_seeds::SeedTally,
     alloc: SharedAlloc<'a>,
+    at_phase: SharedAlloc<'b>,
 ) -> usize {
     #[cfg(test)]
     crate::engine_check::stack_probe::at("run_stretch");
@@ -6852,7 +6854,7 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
                         if mem.fault == Some(BodyFault::DropDataLeaf) {
                             continue;
                         }
-                        run_out.data_files.push((blaze_own::String::from_str_in(path, alloc), read.seen));
+                        run_out.data_files.push((blaze_own::String::from_str_in(path, at_phase), read.seen));
                     }
                     DataCell::Unnamed => data_unnamed = true,
                 }
@@ -7002,7 +7004,7 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
                     }
                     _ => (done, stands),
                 };
-                let note = Some((said.map_task(|error| blaze_own::Box::new_in(error, alloc)), head_failed));
+                let note = Some((said.map_task(|error| blaze_own::Box::new_in(error, at_phase)), head_failed));
                 // Its locals keep the entry's class: a call of one is refused naming it, not
                 // as a fn the table holds nothing for.
                 // Not checked whole: no typed record of it is put.
@@ -7134,7 +7136,7 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
                                 let read = data_read(shared.reads, path, bytes);
                                 match read.cell {
                                     DataCell::Planned => {}
-                                    DataCell::Followed => run_out.data_files.push((blaze_own::String::from_str_in(path, alloc), read.seen)),
+                                    DataCell::Followed => run_out.data_files.push((blaze_own::String::from_str_in(path, at_phase), read.seen)),
                                     DataCell::Unnamed => {
                                         if matches!(said, Said::FrameUsedUp { .. }) && let Some(words) = shared.missing_data(one.label, path, read.id) {
                                             said = Said::Refused(words);
@@ -7183,7 +7185,7 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
             run_out.untyped_clean = run_out.untyped_clean.saturating_add(result.untyped_clean);
             run_out.typed.reserve(result.typed.len());
             for &(check, bytes) in result.typed.iter() {
-                let mut kept = SVec::with_capacity_in(bytes.len(), alloc);
+                let mut kept = SVec::with_capacity_in(bytes.len(), at_phase);
                 kept.extend_from_slice(bytes);
                 run_out.typed.push(TypedPut { check, bytes: kept });
             }

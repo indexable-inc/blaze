@@ -2758,6 +2758,11 @@ impl<A: Allocator + Clone> Plain<A> {
         out
     }
 
+    #[cfg(test)]
+    pub(crate) fn segment_touched(&self, id: u64) -> Option<u64> {
+        self.manifest.segments.iter().find(|it| it.id == id).map(|it| it.touched)
+    }
+
     /// The roots this generation names: `(name, record key)`.
     pub fn roots(&self) -> Vec<(String, Key), A> {
         let mut out = Vec::with_capacity_in(self.manifest.roots.len(), self.alloc.clone());
@@ -4792,49 +4797,96 @@ impl<A: Allocator + Clone> Plain<A> {
         self.manifest.leases.iter().any(|it| seg.generation >= it.since && (it.expires_ns > now_ns || self.plant() == Plant::LeaseNeverExpires))
     }
 
-    /// O(total unique reached keys) sets of all keys reached by unexpired roots in this view
-    /// (`keys`) and all index records followed by unexpired indexed roots (`followed`), built in a
-    /// single pass with O(1) index deduplication so [`Plain::reused`] probes in O(1) per key
-    /// instead of scanning every root/index linearly.
-    fn live_key_sets(&self, now_ns: u64) -> Result<(Map<[u8; 32], (), BuildKeyHasher, &A>, Map<[u8; 32], (), BuildKeyHasher, &A>), StoreError> {
-        let mut keys: Map<[u8; 32], (), BuildKeyHasher, &A> = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: &self.alloc, capacity: None });
-        let mut followed: Map<[u8; 32], (), BuildKeyHasher, &A> = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: &self.alloc, capacity: None });
-        for (i, root) in self.manifest.roots.iter().enumerate() {
-            if root.expires_ns <= now_ns || (i == 0 && self.plant() == Plant::ReachSkipsRoot) {
-                continue;
-            }
+    /// Collects the top-level index keys directly listed by unexpired `TagReach::Indexes` roots
+    /// at `indices` into `followed` (without reading any index payloads).
+    fn collect_followed_indexes(&self, indices: &[usize], followed: &mut Map<[u8; 32], (), BuildKeyHasher, &A>) -> Result<(), StoreError> {
+        if self.plant() == Plant::IndexNotFollowed {
+            return Ok(());
+        }
+        for &i in indices {
+            let Some(root) = self.manifest.roots.get(i) else { continue };
             let Some((at, entry)) = self.find_in(&[Namespace::LOCAL], &Key(root.key)) else {
                 return Err(StoreError::RootGone { generation: self.manifest.generation, key: root.key });
             };
-            keys.insert(root.key.0, ());
+            if reach_of(entry.tag) != TagReach::Indexes {
+                continue;
+            }
             let Some(map) = self.maps.get(at) else { continue };
-            let payload = map.payload(&entry);
+            for chunk in map.payload(&entry).chunks_exact(32) {
+                let Ok(raw) = <[u8; 32]>::try_from(chunk) else { continue };
+                followed.insert(raw, ());
+            }
+        }
+        Ok(())
+    }
+
+    /// Semi-join probe of one unexpired root at manifest index `idx`, removing every key it
+    /// reaches from `pending` and returning early as soon as `pending` empties. When
+    /// `prioritize_diff` is true, index records absent from `sets_indexes` (the replaced page
+    /// indexes of the root being updated) are scanned before unchanged indexes.
+    fn probe_live_root(
+        &self,
+        idx: usize,
+        prioritize_diff: bool,
+        sets_indexes: &Map<[u8; 32], (), BuildKeyHasher, &A>,
+        visited_indexes: &mut Map<[u8; 32], (), BuildKeyHasher, &A>,
+        pending: &mut Map<[u8; 32], u64, BuildKeyHasher, &A>,
+    ) -> Result<(), StoreError> {
+        let Some(root) = self.manifest.roots.get(idx) else { return Ok(()) };
+        let Some((at, entry)) = self.find_in(&[Namespace::LOCAL], &Key(root.key)) else {
+            return Err(StoreError::RootGone { generation: self.manifest.generation, key: root.key });
+        };
+        pending.remove(&root.key.0);
+        let Some(map) = self.maps.get(at) else { return Ok(()) };
+        let payload = map.payload(&entry);
+        for chunk in payload.chunks_exact(32) {
+            let Ok(raw) = <[u8; 32]>::try_from(chunk) else { continue };
+            pending.remove(&raw);
+        }
+        if pending.is_empty() || reach_of(entry.tag) != TagReach::Indexes || self.plant() == Plant::IndexNotFollowed {
+            return Ok(());
+        }
+        let mut probe_index = |raw: [u8; 32]| -> Result<bool, StoreError> {
+            if visited_indexes.insert(raw, ()).is_some() {
+                return Ok(false);
+            }
+            let index = ContentId(raw);
+            let Some((idx_at, idx_entry)) = self.find_in(&[Namespace::LOCAL], &Key(index)) else {
+                return Err(StoreError::IndexGone { generation: self.manifest.generation, root: root.key, index });
+            };
+            if reach_of(idx_entry.tag) != TagReach::IndexKeys {
+                return Err(StoreError::NotAnIndex { root: root.key, key: index, tag: idx_entry.tag });
+            }
+            if let Some(idx_map) = self.maps.get(idx_at) {
+                for key_chunk in idx_map.payload(&idx_entry).chunks_exact(32) {
+                    let Ok(key_raw) = <[u8; 32]>::try_from(key_chunk) else { continue };
+                    pending.remove(&key_raw);
+                }
+            }
+            Ok(pending.is_empty())
+        };
+        if prioritize_diff {
             for chunk in payload.chunks_exact(32) {
                 let Ok(raw) = <[u8; 32]>::try_from(chunk) else { continue };
-                keys.insert(raw, ());
+                if !sets_indexes.contains_key(&raw) && probe_index(raw)? {
+                    return Ok(());
+                }
             }
-            if reach_of(entry.tag) == TagReach::Indexes && self.plant() != Plant::IndexNotFollowed {
-                for chunk in payload.chunks_exact(32) {
-                    let Ok(raw) = <[u8; 32]>::try_from(chunk) else { continue };
-                    if followed.insert(raw, ()).is_some() {
-                        continue;
-                    }
-                    let index = ContentId(raw);
-                    let Some((idx_at, idx_entry)) = self.find_in(&[Namespace::LOCAL], &Key(index)) else {
-                        return Err(StoreError::IndexGone { generation: self.manifest.generation, root: root.key, index });
-                    };
-                    if reach_of(idx_entry.tag) != TagReach::IndexKeys {
-                        return Err(StoreError::NotAnIndex { root: root.key, key: index, tag: idx_entry.tag });
-                    }
-                    let Some(idx_map) = self.maps.get(idx_at) else { continue };
-                    for key_chunk in idx_map.payload(&idx_entry).chunks_exact(32) {
-                        let Ok(key_raw) = <[u8; 32]>::try_from(key_chunk) else { continue };
-                        keys.insert(key_raw, ());
-                    }
+            for chunk in payload.chunks_exact(32) {
+                let Ok(raw) = <[u8; 32]>::try_from(chunk) else { continue };
+                if sets_indexes.contains_key(&raw) && probe_index(raw)? {
+                    return Ok(());
+                }
+            }
+        } else {
+            for chunk in payload.chunks_exact(32) {
+                let Ok(raw) = <[u8; 32]>::try_from(chunk) else { continue };
+                if probe_index(raw)? {
+                    return Ok(());
                 }
             }
         }
-        Ok((keys, followed))
+        Ok(())
     }
 
     /// Whether this generation names a segment an earlier boot wrote and never sealed: the
@@ -4906,71 +4958,131 @@ impl<A: Allocator + Clone> Plain<A> {
     /// touched ([`Segment::touched`]) and a slice that replaces it aborts. Sorted, each once.
     fn reused(&self, edits: &[RootEdit], now_ns: u64) -> Result<Vec<(u64, ContentId), A>, StoreError> {
         let mut out = Vec::new_in(self.alloc.clone());
-        let sets: Vec<Key, A> = {
-            let mut it = Vec::new_in(self.alloc.clone());
-            it.extend(edits.iter().filter_map(|it| match it {
-                RootEdit::Set { key, renew_only: false, .. } => Some(*key),
-                _ => None,
-            }));
-            it
-        };
+        let mut sets: blaze_own::Vec<Key, &A> = blaze_own::Vec::new_in(&self.alloc);
+        let mut edited_names: blaze_own::Vec<&str, &A> = blaze_own::Vec::new_in(&self.alloc);
+        for edit in edits {
+            if let RootEdit::Set { name, key, renew_only: false, .. } = edit {
+                sets.push(*key);
+                edited_names.push(name.as_str());
+            }
+        }
         if sets.is_empty() {
             return Ok(out);
         }
-        let mut live = None;
-        let mut checked_indexes: Map<[u8; 32], (), BuildKeyHasher, &A> = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: &self.alloc, capacity: None });
-        macro_rules! look_key {
-            ($key:expr) => {{
-                let key: &ContentId = $key;
-                let skip = live.as_ref().is_some_and(|(keys, _): &(Map<[u8; 32], (), BuildKeyHasher, &A>, Map<[u8; 32], (), BuildKeyHasher, &A>)| keys.contains_key(&key.0));
-                if !skip && let Some((at, _)) = self.find_in(&[Namespace::LOCAL], &Key(*key)) {
-                    let already = if live.is_none() {
-                        let loaded = self.live_key_sets(now_ns)?;
-                        let hit = loaded.0.contains_key(&key.0);
-                        live = Some(loaded);
-                        hit
-                    } else {
-                        false
-                    };
-                    if !already && let Some(map) = self.maps.get(at) {
-                        out.push((map.seg().id, *key));
-                    }
-                }
-            }};
+        edited_names.sort_unstable();
+        edited_names.dedup();
+        // Partition unexpired manifest roots into the roots being replaced by this commit
+        // (probed first, because incremental edits almost always reuse keys from their own prior
+        // root) and all other unexpired roots in the store.
+        let mut prior_roots: blaze_own::Vec<usize, &A> = blaze_own::Vec::new_in(&self.alloc);
+        let mut other_roots: blaze_own::Vec<usize, &A> = blaze_own::Vec::new_in(&self.alloc);
+        let skip_first = self.plant() == Plant::ReachSkipsRoot;
+        for (i, root) in self.manifest.roots.iter().enumerate() {
+            if root.expires_ns <= now_ns || (i == 0 && skip_first) {
+                continue;
+            }
+            if edited_names.binary_search(&root.name.as_str()).is_ok() {
+                prior_roots.push(i);
+            } else {
+                other_roots.push(i);
+            }
         }
+        // Candidate-driven semi-join: collect ONLY the keys named by `edits` that already live in
+        // a committed `LOCAL` segment and are not inside an already-followed index record. This
+        // avoids materializing a global hash set of all keys across all roots in the store.
+        let mut pending: Map<[u8; 32], u64, BuildKeyHasher, &A> = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: &self.alloc, capacity: None });
+        let mut followed: Map<[u8; 32], (), BuildKeyHasher, &A> = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: &self.alloc, capacity: None });
+        let mut sets_indexes: Map<[u8; 32], (), BuildKeyHasher, &A> = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: &self.alloc, capacity: None });
+        let mut checked_indexes: Map<[u8; 32], (), BuildKeyHasher, &A> = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: &self.alloc, capacity: None });
+        let mut prior_followed_loaded = false;
+        let mut other_followed_loaded = false;
+        let follow_indexes = self.plant() != Plant::IndexNotFollowed;
+
         for root in &sets {
-            look_key!(&root.0);
+            if let Some((at, _)) = self.find_in(&[Namespace::LOCAL], root)
+                && let Some(map) = self.maps.get(at)
+            {
+                pending.insert(root.0.0, map.seg().id);
+            }
             let Some(got) = self.get_in(&[Namespace::LOCAL], root) else {
                 return Err(StoreError::RootGone { generation: self.manifest.generation, key: root.0 });
             };
-            for key in got.bytes.chunks_exact(32) {
-                let Ok(bytes) = key.try_into() else { continue };
-                look_key!(&ContentId(bytes));
-            }
-            if reach_of(got.tag) != TagReach::Indexes || self.plant() == Plant::IndexNotFollowed {
-                continue;
-            }
-            // An indexed root: what each index holds is named too, one level. An index this
-            // view follows already (`live.1`, built by `live_key_sets`) keeps what it holds here;
-            // only another's keys are looked at, each unique index at most once. (A plain root
-            // naming an index keeps its record, not what it holds: not followed, so looked at.)
-            for index in got.bytes.chunks_exact(32) {
-                let Ok(bytes) = index.try_into() else { continue };
-                if live.as_ref().is_some_and(|(_, followed)| followed.contains_key(&bytes)) || checked_indexes.insert(bytes, ()).is_some() {
-                    continue;
+            if reach_of(got.tag) == TagReach::Indexes && follow_indexes {
+                if !prior_followed_loaded {
+                    self.collect_followed_indexes(&prior_roots, &mut followed)?;
+                    prior_followed_loaded = true;
                 }
-                let index = ContentId(bytes);
-                let Some(held) = self.get_in(&[Namespace::LOCAL], &Key(index)) else {
-                    return Err(StoreError::IndexGone { generation: self.manifest.generation, root: root.0, index });
-                };
-                if reach_of(held.tag) != TagReach::IndexKeys {
-                    return Err(StoreError::NotAnIndex { root: root.0, key: index, tag: held.tag });
+                for index_chunk in got.bytes.chunks_exact(32) {
+                    let Ok(bytes) = <[u8; 32]>::try_from(index_chunk) else { continue };
+                    sets_indexes.insert(bytes, ());
+                    if followed.contains_key(&bytes) {
+                        // Already followed by an unexpired indexed root in this view: both the
+                        // index record and every key it lists are already live.
+                        pending.remove(&bytes);
+                        continue;
+                    }
+                    if let Some((at, _)) = self.find_in(&[Namespace::LOCAL], &Key(ContentId(bytes))) {
+                        if !other_followed_loaded {
+                            self.collect_followed_indexes(&other_roots, &mut followed)?;
+                            other_followed_loaded = true;
+                        }
+                        if followed.contains_key(&bytes) {
+                            pending.remove(&bytes);
+                            continue;
+                        }
+                        if let Some(map) = self.maps.get(at) {
+                            pending.insert(bytes, map.seg().id);
+                        }
+                    }
+                    if checked_indexes.insert(bytes, ()).is_some() {
+                        continue;
+                    }
+                    let index = ContentId(bytes);
+                    let Some(held) = self.get_in(&[Namespace::LOCAL], &Key(index)) else {
+                        return Err(StoreError::IndexGone { generation: self.manifest.generation, root: root.0, index });
+                    };
+                    if reach_of(held.tag) != TagReach::IndexKeys {
+                        return Err(StoreError::NotAnIndex { root: root.0, key: index, tag: held.tag });
+                    }
+                    for key_chunk in held.bytes.chunks_exact(32) {
+                        let Ok(key_bytes) = <[u8; 32]>::try_from(key_chunk) else { continue };
+                        if let Some((at, _)) = self.find_in(&[Namespace::LOCAL], &Key(ContentId(key_bytes)))
+                            && let Some(map) = self.maps.get(at)
+                        {
+                            pending.insert(key_bytes, map.seg().id);
+                        }
+                    }
                 }
-                for key in held.bytes.chunks_exact(32) {
-                    let Ok(bytes) = key.try_into() else { continue };
-                    look_key!(&ContentId(bytes));
+            } else {
+                for key_chunk in got.bytes.chunks_exact(32) {
+                    let Ok(bytes) = <[u8; 32]>::try_from(key_chunk) else { continue };
+                    if let Some((at, _)) = self.find_in(&[Namespace::LOCAL], &Key(ContentId(bytes)))
+                        && let Some(map) = self.maps.get(at)
+                    {
+                        pending.insert(bytes, map.seg().id);
+                    }
                 }
             }
+        }
+        if pending.is_empty() {
+            return Ok(out);
+        }
+        let mut visited_indexes: Map<[u8; 32], (), BuildKeyHasher, &A> = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: &self.alloc, capacity: None });
+        for &idx in &prior_roots {
+            self.probe_live_root(idx, true, &sets_indexes, &mut visited_indexes, &mut pending)?;
+            if pending.is_empty() {
+                return Ok(out);
+            }
+        }
+        for &idx in &other_roots {
+            self.probe_live_root(idx, false, &sets_indexes, &mut visited_indexes, &mut pending)?;
+            if pending.is_empty() {
+                return Ok(out);
+            }
+        }
+        out.reserve(pending.len());
+        for (raw, seg_id) in pending.iter() {
+            out.push((*seg_id, ContentId(*raw)));
         }
         out.sort_unstable();
         out.dedup();

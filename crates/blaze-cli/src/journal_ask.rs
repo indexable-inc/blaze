@@ -289,6 +289,9 @@ impl ChangedSince for Asked<'_> {
         let cx = cx.until(clock.after(JOURNAL_WAIT));
         let mut taken = Taken::begin(&cx, root, clock, frame)?;
         let asked = ask(&cx, home, clock, self.me, paired_place(stored), frame)?;
+        // Spawn a detached helper before any fallback replay so helper startup overlaps with the
+        // replay instead of running serially after it.
+        let started = self.start.maybe_start(&cx, &asked.outcome);
         let names = match asked.outcome {
             Outcome::Answered { answer: AskAnswer::Vouched { place, journal, .. }, names } => match Cursor::decode(journal.as_bytes()) {
                 Some(cursor) => {
@@ -303,8 +306,17 @@ impl ChangedSince for Asked<'_> {
                 }
             },
             Outcome::Answered { answer: AskAnswer::CannotVouch { place, journal, .. }, .. } => {
-                taken.replay_checkout(&cx, clock, root, stored);
-                pair_refused(&mut taken, place, journal);
+                // When no checkout cursor was stored and the helper already flushed its stream to a
+                // valid `(place, cursor)` pair, replaying from `Cursor::None` would unconditionally
+                // refuse with `NoCursor` and immediately overwrite the cursor with `pair_refused`.
+                if !stored.has_checkout_cursor()
+                    && let (Some(place), Some(cursor)) = (place, Cursor::decode(journal.as_bytes()))
+                {
+                    taken.refused_with_helper_place(cursor, place.encode());
+                } else {
+                    taken.replay_checkout(&cx, clock, root, stored);
+                    pair_refused(&mut taken, place, journal);
+                }
                 None
             }
             Outcome::NotAsked { .. } | Outcome::NotPrivate(_) | Outcome::TooLong(_) => {
@@ -312,7 +324,6 @@ impl ChangedSince for Asked<'_> {
                 None
             }
         };
-        let started = self.start.maybe_start(&cx, &asked.outcome);
         let counted = names.map(|names| u32::try_from(names.len()).unwrap_or(u32::MAX));
         taken.said(HelperRow { by: Self::NAME, ask_ns: asked.ns, names: counted, differ: None, said: said_of(&asked, &started, None) });
         Ok(taken)
