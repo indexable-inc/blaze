@@ -30,12 +30,15 @@ pub struct Access {
     pub place: Place,
     pub write: bool,
     pub deep: bool,
+    /// `StmtKind::Drop`: does not reach behind a reference `Proj::Deref` unless an enclosing
+    /// ancestor implements `Drop` (`of_drop_type`).
+    pub drop: bool,
     /// An activation does not conflict with its own loan.
     pub except: Option<Loan>,
 }
 
 fn access(place: Place, write: bool, deep: bool) -> Access {
-    Access { place, write, deep, except: None }
+    Access { place, write, deep, drop: false, except: None }
 }
 
 /// Calls `f` on every access statement `s` makes, at its Start.
@@ -64,9 +67,9 @@ pub fn for_each_access<A: Allocator>(flow: &Flow<A>, s: Stmt, mut f: impl FnMut(
             f(access(dest, true, false));
         }
         StmtKind::StorageDead(l) => f(access(flow.local_place(l), true, false)),
-        StmtKind::Drop(p) => f(access(p, true, true)),
+        StmtKind::Drop(p) => f(Access { place: p, write: true, deep: true, drop: true, except: None }),
         StmtKind::Activate(l) => {
-            f(Access { place: flow.loan(l).place, write: true, deep: true, except: Some(l) })
+            f(Access { place: flow.loan(l).place, write: true, deep: true, drop: false, except: Some(l) })
         }
         StmtKind::Switch { on, .. } => f(access(on, false, false)),
         // A `Mention` reads nothing (the Reference, "Wildcard pattern"): no access, so no loan
@@ -129,6 +132,46 @@ pub fn conflicts<A: Allocator>(flow: &Flow<A>, l: Loan, a: Access, activated: bo
     if !a.write && !(row.kind == BorrowKind::Mut || row.kind == BorrowKind::TwoPhase && activated) {
         return false;
     }
+    // Prefix checks when the access is a strict prefix of the borrowed place (`a.place` above
+    // `row.place`):
+    // 1. A loan behind a `Proj::Deref` of a shared reference (`&T`) or raw pointer
+    //    (`of_shared_ref`) does not lock prefixes above that deref: `&T` is `Copy` and mutating,
+    //    borrowing or dropping an ancestor holding `&T` cannot invalidate its referent (rustc
+    //    `places_conflict`: supporting prefixes stop at a shared-ref / raw-ptr deref).
+    // 2. Dropping a value without a `Drop` impl (and whose intermediate fields up to the deref
+    //    have no `Drop` impl) never accesses behind a `&`/`&mut` `Proj::Deref` (`Proj::DerefBox`
+    //    still conflicts because dropping `Box` frees its referent).
+    {
+        let (ra, rb) = (flow.place(row.place), flow.place(a.place));
+        if ra.local == rb.local && rb.depth < ra.depth {
+            let mut prefix = true;
+            for d in 1..=rb.depth {
+                if flow.ancestor(row.place, d) != flow.ancestor(a.place, d) {
+                    prefix = false;
+                    break;
+                }
+            }
+            if prefix {
+                for d in (rb.depth + 1)..=ra.depth {
+                    let step = flow.place(flow.ancestor(row.place, d));
+                    if step.of_shared_ref {
+                        return false;
+                    }
+                }
+                if a.drop {
+                    for d in (rb.depth + 1)..=ra.depth {
+                        let step = flow.place(flow.ancestor(row.place, d));
+                        if step.of_drop_type {
+                            break;
+                        }
+                        if step.proj == Some(Proj::Deref) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+    }
     overlap(flow, row.place, row.kind == BorrowKind::Shallow, a.place, !a.deep)
 }
 
@@ -143,7 +186,7 @@ pub fn kills<A: Allocator>(flow: &Flow<A>, s: Stmt, l: Loan) -> bool {
     }
 }
 
-fn uses_and_def<A: Allocator>(flow: &Flow<A>, init: &Inits<A>, s: Stmt, mut used: impl FnMut(Local)) -> Option<Local> {
+fn uses_and_def<A: Allocator>(flow: &Flow<A>, init: &Inits<A>, s: Stmt, include_drops: bool, mut used: impl FnMut(Local)) -> Option<Local> {
     let local = |p: Place| flow.place(p).local;
     let dest_def =|dest: Place, used: &mut dyn FnMut(Local)| {
         if flow.place(dest).depth == 0 {
@@ -174,13 +217,12 @@ fn uses_and_def<A: Allocator>(flow: &Flow<A>, init: &Inits<A>, s: Stmt, mut used
             dest_def(dest, &mut used)
         }
         StmtKind::StorageLive(l) | StmtKind::StorageDead(l) => Some(l),
-        // Drop-liveness: every origin of a dropped local is taken as drop-live (no `may_dangle`),
-        // where the drop may run (`Inits::drop_may_run`, as suspend.rs's liveness has it). A
-        // drop of a local moved out on every path is no use: `w.into_inner()` then the scope's
-        // `drop w` kept `w`'s `&mut out` loan live to the move of `out` (tempo
-        // consensus-config tests.rs:29, a false E0505).
+        // Drop-liveness: origins in dropping positions of a dropped local are drop-live where
+        // the drop may run (`Inits::drop_may_run`, as suspend.rs's liveness has it). Non-dropping
+        // positions (`flow.local_no_drop_origins`, e.g. `&mut U` in `Result<&mut U, E>`) are
+        // excluded when `include_drops` is false.
         StmtKind::Drop(p) => {
-            if init.drop_may_run(flow, s, p) {
+            if include_drops && init.drop_may_run(flow, s, p) {
                 used(local(p));
             }
             None
@@ -280,9 +322,11 @@ pub fn facts<A: Allocator + Copy>(flow: &Flow<A>, alloc: A) -> Result<Facts<A>, 
     }
 
     // Precompute per-statement `(def, uses)` and whether any `Activate` exists once.
+    let split_drop = !flow.local_no_drop_origins.is_empty();
     let mut defs = Vec::with_capacity_in(n, alloc);
     let mut uses_off = Vec::with_capacity_in(n + 1, alloc);
     let mut uses_data = Vec::with_capacity_in(n, alloc);
+    let mut drop_uses: Vec<(usize, Local), A> = Vec::new_in(alloc);
     let mut has_activate = false;
     uses_off.push(0u32);
     for s in 0..n {
@@ -290,7 +334,13 @@ pub fn facts<A: Allocator + Copy>(flow: &Flow<A>, alloc: A) -> Result<Facts<A>, 
         if matches!(flow.stmt(stmt).kind, StmtKind::Activate(_)) {
             has_activate = true;
         }
-        let def = uses_and_def(flow, &init, stmt, |l| uses_data.push(l));
+        if split_drop
+            && let StmtKind::Drop(p) = flow.stmt(stmt).kind
+            && init.drop_may_run(flow, stmt, p)
+        {
+            drop_uses.push((s, flow.place(p).local));
+        }
+        let def = uses_and_def(flow, &init, stmt, !split_drop, |l| uses_data.push(l));
         defs.push(def);
         uses_off.push(uses_data.len() as u32);
     }
@@ -407,6 +457,43 @@ pub fn facts<A: Allocator + Copy>(flow: &Flow<A>, alloc: A) -> Result<Facts<A>, 
             }
         }
     }
+    // Optional second backward liveness pass for drop-only uses when some local origins are
+    // non-dropping (`flow.local_no_drop_origins`): only drop-live origins of `local(p)` become
+    // live along paths reaching `StmtKind::Drop(p)`.
+    let mut drop_in = if split_drop && !drop_uses.is_empty() && o > 0 { Some(Bits::new_in(n, locals, alloc)) } else { None };
+    let mut drop_out = if drop_in.is_some() { Some(Bits::new_in(n, locals, alloc)) } else { None };
+    if let (Some(d_in), Some(d_out)) = (&mut drop_in, &mut drop_out) {
+        for &(s, l) in &drop_uses {
+            d_in.set(s, l.index());
+            for &pred in preds.row(s) {
+                let p = pred as usize;
+                if bits::union_into(d_out.row_mut(p), d_in.row(s)) {
+                    worklist.push(post_rank[p] as usize);
+                }
+            }
+        }
+        let mut dpops = 0u64;
+        while let Some(rank) = worklist.pop_min() {
+            dpops += 1;
+            if dpops > limit {
+                return Err(Bound::Passes { what: "drop liveness passes", limit });
+            }
+            let s = postorder[rank] as usize;
+            scratch_l.copy_from_slice(d_out.row(s));
+            if let Some(d) = defs[s] {
+                bits::put(&mut scratch_l, d.index(), false);
+            }
+            if bits::union_into(d_in.row_mut(s), &scratch_l) {
+                for &pred in preds.row(s) {
+                    let p = pred as usize;
+                    if bits::union_into(d_out.row_mut(p), d_in.row(s)) {
+                        worklist.push(post_rank[p] as usize);
+                    }
+                }
+            }
+        }
+    }
+    drop(drop_uses);
     drop(scratch_l);
     drop(preds);
     drop(defs);
@@ -475,7 +562,57 @@ pub fn facts<A: Allocator + Copy>(flow: &Flow<A>, alloc: A) -> Result<Facts<A>, 
                 }
             }
         }
+        if let (Some(d_in), Some(d_out)) = (&drop_in, &drop_out) {
+            let mut drop_pairs: Vec<(usize, Origin), A> = Vec::new_in(alloc);
+            for &(l, origin) in &flow.local_origins {
+                if flow.local_no_drop_origins.binary_search(&(l, origin)).is_err() {
+                    drop_pairs.push((l.index(), origin));
+                }
+            }
+            let drop_origins_by_local = Csr::from_iter(locals, drop_pairs.iter().copied(), alloc);
+            let mut local_has_drop_origin = Vec::with_capacity_in(lw, alloc);
+            local_has_drop_origin.resize(lw, 0u64);
+            for l in 0..locals {
+                if !drop_origins_by_local.row(l).is_empty() {
+                    bits::put(&mut local_has_drop_origin, l, true);
+                }
+            }
+            for s in 0..n {
+                let start_p = 2 * s;
+                let mid_p = 2 * s + 1;
+                let in_row = d_in.row(s);
+                let out_row = d_out.row(s);
+                for w in 0..lw {
+                    let mask = local_has_drop_origin[w];
+                    if mask == 0 {
+                        continue;
+                    }
+                    let in_w = in_row[w];
+                    let base = w * 64;
+                    let mut b = in_w & mask;
+                    while b != 0 {
+                        let local = base + b.trailing_zeros() as usize;
+                        b &= b - 1;
+                        for &origin in drop_origins_by_local.row(local) {
+                            let oi = origin.index();
+                            live.set(start_p, oi);
+                            live.set(mid_p, oi);
+                        }
+                    }
+                    let mut b = (out_row[w] & !in_w) & mask;
+                    while b != 0 {
+                        let local = base + b.trailing_zeros() as usize;
+                        b &= b - 1;
+                        for &origin in drop_origins_by_local.row(local) {
+                            live.set(mid_p, origin.index());
+                        }
+                    }
+                }
+            }
+        }
     }
+    drop(drop_in);
+    drop(drop_out);
     drop(live_in);
     drop(live_out);
 
@@ -658,7 +795,8 @@ pub fn loan_parts<A: Allocator + Copy>(
                     break;
                 }
                 let mut used = false;
-                let def = uses_and_def(flow, &facts.init, t, |l| used |= l == local);
+                let drop_live = flow.local_no_drop_origins.binary_search(&(local, origin)).is_err();
+                let def = uses_and_def(flow, &facts.init, t, drop_live, |l| used |= l == local);
                 if used {
                     if best.is_none_or(|(bd, bs, _)| (d, t) < (bd, bs)) {
                         best = Some((d, t, local));

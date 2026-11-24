@@ -427,6 +427,9 @@ pub struct BodyView<'b> {
     /// Canonical lexicographically-sorted [`crate::ids::RecordSchema`] for each anonymous
     /// `Expr::Record` literal, ascending by [`ExprId`].
     pub record_expr_schemas: &'b [(ExprId, crate::ids::RecordSchema)],
+    /// Closure parameter annotations whose outer reference explicitly writes `'static`
+    /// (`|lock: &'static str|`): `(closure_expr, param_index)`, ascending.
+    pub closure_static_params: &'b [(ExprId, u32)],
 }
 
 /// The edition at `id` in the runs `runs` (rows `(first, edition)`, ascending), `body`

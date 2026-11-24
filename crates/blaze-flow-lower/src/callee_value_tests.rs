@@ -354,21 +354,19 @@ fn a_closure_result_holds_its_capture() {
         let mutate = call_ref(&mut b, "m", Mutbl::Mut, s);
         let st_mut = b.semi(mutate);
         let root = if late { b.block(&[st1, st2, st_mut, st_use], None) } else { b.block(&[st1, st2, st_use, st_mut], None) };
-        let got = findings_laid(&w.fx, &b, f, root, &Lane::of(&w), Plant::None);
+        const REQ: [crate::Requirement; 1] = [crate::Requirement { from: crate::closure::Need::Capture(0), into: crate::closure::Need::Sig(0) }];
+        let mut lane = Lane::of(&w);
+        lane.wide.add(f, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[w.st], output: w.unit, slots: &[] });
+        lane.closure = Some(cl);
+        lane.reqs = &REQ;
+        let got = findings_laid(&w.fx, &b, f, root, &lane, Plant::None);
         std::println!("closure result {}: {got:?}", if late { "late" } else { "early" });
         if late {
-            // The call relates the closure's value positions to the result's all ways
-            // (callee_value.rs, noted `ClosureValueCall`: stricter than the closure's own
-            // signature); the E0502 it finds cannot be told from that relation's artifact, so
-            // the body is refused by the relation's name: never reported, never a pass (the
-            // coarse-relations rule, `Lowered::coarse`).
-            assert!(matches!(got, Err(Refusal { form: Form::Unified { why: crate::Unified::ClosureValueCall }, .. })), "{got:?}");
-            let planted = findings_laid(&w.fx, &b, f, root, &Lane::of(&w), Plant::ClosureCallUnrelated);
-            std::println!("closure result late, planted ClosureCallUnrelated: {planted:?}");
+            assert!(got.as_ref().is_ok_and(|l| l.iter().any(|s| s.starts_with("borrow Invalidated"))), "{got:?}");
+            let planted = findings_laid(&w.fx, &b, f, root, &lane, Plant::NoRequirements);
+            std::println!("closure result late, planted NoRequirements: {planted:?}");
             assert!(planted.as_ref().is_ok_and(|p| p.is_empty()), "{planted:?}");
         } else {
-            // THE CLEAN TWIN: `g(r)` before `m(&mut s)`: no finding under the stricter
-            // relation, so none under Rust's: checked clean, never refused up front.
             assert_eq!(got, Ok(std::vec::Vec::new()), "{got:?}");
         }
     }

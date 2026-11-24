@@ -26,7 +26,6 @@
 
 use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate};
 use blaze_ladder::front2::borrows::BorrowRefused;
-use blaze_ladder::front2::call_census::{CODES, CallCensusTotals};
 use blaze_ladder::front2::project::{BodyRef, ProjectWorld};
 use blaze_ladder::refusal::SourceFile;
 
@@ -72,58 +71,27 @@ fn a_borrow_returned_through_self_name_is_found_by_the_borrow_check() {
     let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("body checker");
     let key_of = |name: &str| names.items(0).find_map(|(key, _, _)| (names.item_text(key)?.name == Some(name)).then_some(key)).expect("fixture body");
 
-    // Under the old call paths (production): every verdict printed first.
-    let mut old: Vec<(&str, Vec<&str>, Option<BorrowRefused>)> = Vec::new();
+    // Under the one call rule (production): every verdict printed first.
+    let mut got: Vec<(&str, Vec<&str>, Option<BorrowRefused>)> = Vec::new();
     for name in BODIES {
         let (types, borrows) = world.check_borrows(BodyRef::Free(key_of(name)), alloc);
         assert!(types.is_clean(), "{name}'s types: {types:?}");
         let codes: Vec<&str> = borrows.findings.iter().map(|d| d.code).collect();
-        std::println!("old paths: {name}: codes {codes:?}, refused {:?}", borrows.refused.as_ref().map(|r| std::format!("{r}")));
-        old.push((name, codes, borrows.refused));
+        std::println!("one rule: {name}: codes {codes:?}, refused {:?}", borrows.refused.as_ref().map(|r| std::format!("{r}")));
+        got.push((name, codes, borrows.refused));
     }
-    // Under both rules (the census), each body alone.
-    let mut census: Vec<(&str, CallCensusTotals)> = Vec::new();
-    for name in BODIES {
-        let mut t = CallCensusTotals::new(heap.shared());
-        world.call_census(BodyRef::Free(key_of(name)), &mut t, alloc);
-        let mut report = String::new();
-        t.summary(&mut report).expect("the summary writes");
-        std::println!("census: {name}: whole old {} one {}\n{report}", t.whole_old, t.whole_one);
-        census.push((name, t));
-    }
-    let of = |n: &str| old.iter().find(|r| r.0 == n).expect("checked above");
-    let tally = |n: &str| census.iter().find(|r| r.0 == n).map(|r| &r.1).expect("censused above");
-    let e0515 = CODES.iter().position(|c| *c == "E0515").expect("E0515 is counted");
+    let of = |n: &str| got.iter().find(|r| r.0 == n).expect("checked above");
 
-    // The oracle: rustc's E0515, under the old paths.
-    let (_, codes, refused) = of("escapes");
-    assert_eq!(codes.as_slice(), ["E0515"], "`escapes`: the borrow of `n` returned through `Self::Value` (rustc E0515); refused {refused:?}");
-    // TWINS: the same call on a `&'static u8`, and a `'de`-borrowed value returned as itself.
-    for n in ["stays", "passes"] {
+    // The oracle: rustc's E0515, checked whole.
+    for n in ["escapes", "escapes_ref"] {
+        let (_, codes, refused) = of(n);
+        assert_eq!(codes.as_slice(), ["E0515"], "`{n}`: the borrow of `n` returned through `Self::Value` (rustc E0515); refused {refused:?}");
+        assert!(refused.is_none(), "`{n}` checked whole: {refused:?}");
+    }
+    // TWINS: the same call on a `&'static u8`, a `'de`-borrowed value returned as itself, and
+    // `&self` receiver with local receiver + borrowed argument: all clean and checked whole.
+    for n in ["stays", "passes", "passes_ref"] {
         let (_, codes, refused) = of(n);
         assert!(codes.is_empty() && refused.is_none(), "TWIN `{n}`: rustc accepts it; checked clean: {codes:?} {refused:?}");
-    }
-    // `&self`: the output's region is the argument's, never the receiver's alone.
-    let (_, codes, refused) = of("escapes_ref");
-    assert!(codes.as_slice() == ["E0515"] || (codes.is_empty() && refused.is_some()), "`escapes_ref`: never clean (E0515, or refused by name): {codes:?} {refused:?}");
-    let (_, codes, refused) = of("passes_ref");
-    assert!(codes.is_empty(), "TWIN `passes_ref`: rustc accepts it; no finding (a refusal by name is honest): {codes:?} {refused:?}");
-
-    // The one rule: where it checked a body whole, the same answer.
-    let t = tally("escapes");
-    if t.whole_one == 1 {
-        assert_eq!(t.findings_one[e0515], 1, "`escapes` under the one rule: E0515: {:?}", t.findings_one);
-    }
-    for n in ["stays", "passes", "passes_ref"] {
-        let t = tally(n);
-        assert_eq!(t.findings_one.iter().sum::<u64>(), 0, "TWIN `{n}` under the one rule: no finding: {:?}", t.findings_one);
-    }
-    let t = tally("escapes_ref");
-    if t.whole_one == 1 {
-        assert_eq!(t.findings_one[e0515], 1, "`escapes_ref` under the one rule: E0515: {:?}", t.findings_one);
-    }
-    // No (b): the one rule derives every pair the old paths relate at these calls.
-    for (n, t) in census.iter() {
-        assert_eq!(t.fewer_total, 0, "`{n}`: a (b) call (the one rule misses an old pair)");
     }
 }

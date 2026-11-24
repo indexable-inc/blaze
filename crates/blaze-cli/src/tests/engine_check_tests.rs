@@ -862,7 +862,9 @@ fn engine_check_checks_a_callsite_static_with_line_in_eager_input() {
         write(&io, "Cargo.toml", MANIFEST);
         write(&io, "src/lib.rs", text);
         let before = stdout(&io).len();
-        let (_, checked) = engine(&io, 1);
+        let mut o = opts(&io, 1, true);
+        o.toolchain = lang_shelf(&io);
+        let (_, checked) = engine_opts(&io, o);
         let said = stdout(&io).split_off(before);
         let (notes, clean) = &checked.bodies;
         println!("engine-check of {case}: {clean} clean, notes {notes:?}\n{said}");
@@ -911,7 +913,9 @@ fn engine_check_places_line_in_a_fn_a_macro_wrote_at_its_call() {
         write(&io, "Cargo.toml", MANIFEST);
         write(&io, "src/lib.rs", text);
         let before = stdout(&io).len();
-        let (_, checked) = engine(&io, 1);
+        let mut o = opts(&io, 1, true);
+        o.toolchain = lang_shelf(&io);
+        let (_, checked) = engine_opts(&io, o);
         let said = stdout(&io).split_off(before);
         let (notes, clean) = &checked.bodies;
         println!("engine-check of {case}: {clean} clean, notes {notes:?}\n{said}");
@@ -1272,7 +1276,9 @@ fn engine_check_checks_a_tracing_event_in_a_method() {
         write(&io, "crates/consensus/Cargo.toml", "[package]\nname = \"consensus\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\ntracing = { path = \"../../tracing\" }\n");
         write(&io, "crates/consensus/src/lib.rs", &CONSENSUS_LIB.replace("TARGET", target));
         let before = stdout(&io).len();
-        let (_, checked) = engine(&io, 1);
+        let mut o = opts(&io, 1, true);
+        o.toolchain = lang_shelf(&io);
+        let (_, checked) = engine_opts(&io, o);
         let said = stdout(&io).split_off(before);
         let (notes, clean) = &checked.bodies;
         println!("engine-check of {case}: {clean} clean, notes {notes:?}\n{said}");
@@ -1314,7 +1320,9 @@ fn engine_check_reads_a_block_import_in_a_method() {
         write(&io, "Cargo.toml", MANIFEST);
         write(&io, "src/lib.rs", text);
         let before = stdout(&io).len();
-        let (_, checked) = engine(&io, 1);
+        let mut o = opts(&io, 1, true);
+        o.toolchain = lang_shelf(&io);
+        let (_, checked) = engine_opts(&io, o);
         let said = stdout(&io).split_off(before);
         let (notes, clean) = &checked.bodies;
         println!("engine-check of {case}: {clean} clean, notes {notes:?}\n{said}");
@@ -1355,7 +1363,9 @@ fn engine_check_reads_an_include_in_a_member() {
         write(&io, "a/src/lib.rs", text);
         write(&io, "a/assets/g.json", "{\"n\":1}\n");
         let before = stdout(&io).len();
-        let (_, checked) = engine(&io, 1);
+        let mut o = opts(&io, 1, true);
+        o.toolchain = lang_shelf(&io);
+        let (_, checked) = engine_opts(&io, o);
         let said = stdout(&io).split_off(before);
         let (notes, clean) = &checked.bodies;
         println!("engine-check of {case}: {clean} clean, notes {notes:?}\n{said}");

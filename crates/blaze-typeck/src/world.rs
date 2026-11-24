@@ -228,6 +228,9 @@ impl TraitFlags {
     pub const CONST: u32 = 1 << 5;
     /// The trait has early-bound lifetime arguments erased from its portable trait reference.
     pub const LIFETIME_PARAMS: u32 = 1 << 6;
+    /// The trait declares a `Self: 'static` supertrait bound (e.g. `pub trait Any: 'static`):
+    /// a trait object `dyn Trait` with no written lifetime defaults to `'static` even behind `&`.
+    pub const SELF_STATIC: u32 = 1 << 7;
 
     pub const fn has(self, bits: u32) -> bool {
         self.0 & bits != 0

@@ -1232,6 +1232,7 @@ fn encode_with<'b>(
                             o.u32(binder);
                             o.u32(var);
                         }
+                        AliasSlot::ObjectDefault => o.byte(3),
                     }
                 }
                 Ok(())
@@ -2272,6 +2273,7 @@ impl<'r> In<'r, '_, '_> {
                 },
                 1 => Ok(AliasSlot::Static),
                 2 => Ok(AliasSlot::Late { binder: r.u32("an alias's bound lifetime's binder")?, var: r.u32("an alias's bound lifetime's variable")? }),
+                3 => Ok(AliasSlot::ObjectDefault),
                 _ => Err(E::Shape { what: "an alias's region slot of no known kind" }),
             })?;
             Ok(AliasRegions { lifetimes, slots })
@@ -3967,27 +3969,27 @@ impl RegionTable {
     }
 
     /// The reader over this table; `alloc` holds the clause views it hands out.
-    pub fn reader(&self, alloc: Mem) -> RegionReader<'_> {
+    pub fn reader<A: core::alloc::Allocator + Copy>(&self, alloc: A) -> RegionReader<'_, A> {
         RegionReader { table: self, views: Rows::new_in(alloc), alloc }
     }
 }
 
 /// [`RegionFacts`] over a [`RegionTable`]: what the flow lowering's `Facts` hands its readers
 /// (pieces L3, L4, L5). Each item's clause views are made once, when first asked, and kept.
-pub struct RegionReader<'s> {
+pub struct RegionReader<'s, A: core::alloc::Allocator + Copy = Mem> {
     table: &'s RegionTable,
-    views: Rows<ItemKey, Vec<ClauseView<'s>, Mem>, Mem>,
-    alloc: Mem,
+    views: Rows<ItemKey, Vec<ClauseView<'s>, A>, A>,
+    alloc: A,
 }
 
-impl<'s> RegionReader<'s> {
+impl<'s, A: core::alloc::Allocator + Copy> RegionReader<'s, A> {
     fn made(&self, item: ItemKey) -> Result<&'s FiledRegions, RegionsUnread> {
         let table: &'s RegionTable = self.table;
         table.made(item).ok_or_else(|| table.unread(item))
     }
 }
 
-impl RegionFacts for RegionReader<'_> {
+impl<A: core::alloc::Allocator + Copy> RegionFacts for RegionReader<'_, A> {
     fn sig(&self, item: ItemKey) -> Result<SigRegions<'_>, RegionsUnread> {
         self.made(item)?.regions().sig_view().ok_or(RegionsUnread { item, why: UnreadWhy::NoHead })
     }

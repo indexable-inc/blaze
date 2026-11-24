@@ -108,10 +108,13 @@ pub struct PlaceRow {
     /// slice"), where the same projection of an array `[T; N]` is. Its own fact, never read
     /// from [`Self::of_drop_type`] (lane B12 item 6).
     pub of_slice: bool,
+    /// A `Proj::Deref` of a shared reference (`&T`) or raw pointer (`*const T` / `*mut T`):
+    /// a loan behind this deref does not lock prefixes above it (rustc `places_conflict`:
+    /// supporting prefixes stop at a shared-ref or raw-ptr deref).
+    pub of_shared_ref: bool,
 }
 
-/// What a place made by [`FlowBuilder::project_in`] is marked as: one fact per row, the
-/// reason a move out of it is refused (moves.rs `move_out`).
+/// What a place made by [`FlowBuilder::project_in`] is marked as: one fact per row.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PlaceMark {
     None,
@@ -119,6 +122,8 @@ pub enum PlaceMark {
     DropField,
     /// [`PlaceRow::of_slice`].
     SliceElement,
+    /// [`PlaceRow::of_shared_ref`].
+    SharedDeref,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -268,6 +273,9 @@ pub struct Flow<A: Allocator> {
     pub placeholder: Vec<bool, A>,
     /// `(local, origin)`: the local's type mentions the origin. Sorted.
     pub local_origins: Vec<(Local, Origin), A>,
+    /// Subset of `local_origins` whose positions do NOT run a destructor on `StmtKind::Drop`
+    /// (RFC 1327 / dropck: e.g. `&'a mut U` inside `Result<&'a mut U, E>`). Sorted.
+    pub local_no_drop_origins: Vec<(Local, Origin), A>,
     /// Known `from: into` between placeholders (the signature's bounds).
     pub known: Vec<(Origin, Origin), A>,
     /// Each local's own place: `Place(l)` for the locals the builder was made with, a later row
@@ -525,6 +533,7 @@ impl<A: Allocator + Copy> FlowBuilder<A> {
                 depth: 0,
                 of_drop_type: false,
                 of_slice: false,
+                of_shared_ref: false,
             });
             first_child.push(NO_CHILD);
             next_sibling.push(NO_CHILD);
@@ -544,6 +553,7 @@ impl<A: Allocator + Copy> FlowBuilder<A> {
                 origins: 0,
                 placeholder: Vec::new_in(alloc),
                 local_origins: Vec::new_in(alloc),
+                local_no_drop_origins: Vec::new_in(alloc),
                 known: Vec::new_in(alloc),
                 local_places,
             },
@@ -570,7 +580,7 @@ impl<A: Allocator + Copy> FlowBuilder<A> {
     pub fn add_local(&mut self) -> Local {
         let l = Local(self.flow.locals);
         self.flow.locals += 1;
-        self.flow.places.push(PlaceRow { local: l, parent: None, proj: None, depth: 0, of_drop_type: false, of_slice: false });
+        self.flow.places.push(PlaceRow { local: l, parent: None, proj: None, depth: 0, of_drop_type: false, of_slice: false, of_shared_ref: false });
         self.first_child.push(NO_CHILD);
         self.next_sibling.push(NO_CHILD);
         self.flow.local_places.push(Place(self.flow.places.len() as u32 - 1));
@@ -607,6 +617,7 @@ impl<A: Allocator + Copy> FlowBuilder<A> {
             depth: up.depth + 1,
             of_drop_type: mark == PlaceMark::DropField,
             of_slice: mark == PlaceMark::SliceElement,
+            of_shared_ref: mark == PlaceMark::SharedDeref,
         });
         self.first_child.push(NO_CHILD);
         self.next_sibling.push(self.first_child[p_idx]);
@@ -620,7 +631,7 @@ impl<A: Allocator + Copy> FlowBuilder<A> {
         Origin(self.flow.origins - 1)
     }
 
-    /// The type of `local` mentions `origin`.
+    /// The type of `local` mentions `origin`, which is drop-live at `StmtKind::Drop`.
     pub fn mentions(&mut self, local: u32, origin: Origin) {
         let row = (Local(local), origin);
         if let Some(&last) = self.flow.local_origins.last() {
@@ -632,6 +643,13 @@ impl<A: Allocator + Copy> FlowBuilder<A> {
             }
         }
         self.flow.local_origins.push(row);
+    }
+
+    /// The type of `local` mentions `origin`, but dropping `local` cannot touch `origin`
+    /// (trivial-drop position such as `&mut U` inside `Result<&mut U, E>`).
+    pub fn mentions_no_drop(&mut self, local: u32, origin: Origin) {
+        self.mentions(local, origin);
+        self.flow.local_no_drop_origins.push((Local(local), origin));
     }
 
     /// The signature says `from: into` between two placeholders.
@@ -763,6 +781,10 @@ impl<A: Allocator + Copy> FlowBuilder<A> {
         if self.local_origins_dirty {
             self.flow.local_origins.sort_unstable();
             self.flow.local_origins.dedup();
+        }
+        if !self.flow.local_no_drop_origins.is_empty() {
+            self.flow.local_no_drop_origins.sort_unstable();
+            self.flow.local_no_drop_origins.dedup();
         }
         Ok(self.flow)
     }

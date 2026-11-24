@@ -30,7 +30,7 @@ use blaze_flow::Origin;
 use blaze_own::Vec;
 use blaze_typeck::region_facts::{ClauseView, ColView, Outlives, ParamsView};
 use blaze_typeck::regions::Region;
-use blaze_typeck::{ItemKey, Name, PTy};
+use blaze_typeck::{ItemKey, Mutbl, Name, PTy};
 
 use crate::types::{RegionTypes, SlotCount, SlotRange};
 use crate::{Bad, Refused, Reg};
@@ -157,8 +157,11 @@ pub struct EnvId(u32);
 pub enum Slots<'c> {
     /// The caller's slots.
     Caller(SlotRange),
-    /// A declared column, its regions read through environment `env`.
+    /// A declared column (in `sig_types`), its regions read through environment `env`.
     Sig { col: &'c [Region], env: EnvId },
+    /// A caller-table type (in `types`, e.g. a closure's `FnPtr` signature), its regions read
+    /// through environment `env`.
+    CallerEnv { col: &'c [Region], env: EnvId },
 }
 
 impl<'c> Slots<'c> {
@@ -166,7 +169,7 @@ impl<'c> Slots<'c> {
     pub fn len(self) -> Option<SlotCount> {
         match self {
             Slots::Caller(r) => Some(r.count()),
-            Slots::Sig { col, .. } => SlotCount::of_len(col.len()),
+            Slots::Sig { col, .. } | Slots::CallerEnv { col, .. } => SlotCount::of_len(col.len()),
         }
     }
 
@@ -180,6 +183,13 @@ impl<'c> Slots<'c> {
                 }
                 let (a, b) = col.split_at(n.len());
                 Some((Slots::Sig { col: a, env }, Slots::Sig { col: b, env }))
+            }
+            Slots::CallerEnv { col, env } => {
+                if n.len() > col.len() {
+                    return None;
+                }
+                let (a, b) = col.split_at(n.len());
+                Some((Slots::CallerEnv { col: a, env }, Slots::CallerEnv { col: b, env }))
             }
         }
     }
@@ -218,8 +228,9 @@ pub enum Clause<'c> {
 #[derive(Clone, Copy, Debug)]
 enum Mode {
     /// A callee's or an impl's own numbering: `Param(i)` is `regs[i]`; `bindable` for an
-    /// impl's, whose parameters a header walk binds.
-    Item { bindable: bool },
+    /// impl's, whose parameters a header walk binds; `gat_base` is where a GAT's own
+    /// lifetimes (`Region::Late { binder: u32::MAX, var }`) start inside `regs`.
+    Item { bindable: bool, gat_base: u32 },
     /// The caller's numbering: `Param(i)` is the caller's own; `binder`'s variables are
     /// instantiated (`late`).
     Owner { binder: Option<u32> },
@@ -257,8 +268,9 @@ pub struct Envs<'c, A: Allocator> {
     alloc: A,
 }
 
-/// The most environments one call makes (rule 18).
-pub const MOST_ENVS: usize = 256;
+/// The most environments one call makes (rule 18; deeply chained iterator adaptors like
+/// `a.flatten().chain(b.flatten()).chain(c.flatten())` open several hundred environments).
+pub const MOST_ENVS: usize = 4096;
 
 impl<'c, A: Allocator + Copy> Envs<'c, A> {
     pub fn new_in(alloc: A) -> Envs<'c, A> {
@@ -279,7 +291,16 @@ impl<'c, A: Allocator + Copy> Envs<'c, A> {
     pub(crate) fn impl_env(&mut self, lifetimes: u32, types: u32) -> Option<EnvId> {
         let regs = Vec::from_elem_in(None, lifetimes as usize, self.alloc);
         let tys = Vec::from_elem_in(None, types as usize, self.alloc);
-        self.push(Mode::Item { bindable: true }, regs, tys)
+        self.push(Mode::Item { bindable: true, gat_base: lifetimes }, regs, tys)
+    }
+
+    /// A fresh environment for an impl of `impl_lifetimes` + `gat_lifetimes` lifetime parameters
+    /// and `types` type parameters: `Region::Late { binder: u32::MAX, var }` reads `regs[impl_lifetimes + var]`.
+    pub(crate) fn impl_env_gat(&mut self, impl_lifetimes: u32, gat_lifetimes: u32, types: u32) -> Option<EnvId> {
+        let total = impl_lifetimes.checked_add(gat_lifetimes)?;
+        let regs = Vec::from_elem_in(None, total as usize, self.alloc);
+        let tys = Vec::from_elem_in(None, types as usize, self.alloc);
+        self.push(Mode::Item { bindable: true, gat_base: impl_lifetimes }, regs, tys)
     }
 
     /// An environment in the caller's numbering (a bound of the caller's read for a tie).
@@ -303,6 +324,16 @@ impl<'c, A: Allocator + Copy> Envs<'c, A> {
                 Some(None) => RegAt::Unbound { env: e, param: i },
                 None => return Err(Bad::LifetimePast { index: i }),
             },
+            (Mode::Item { gat_base, .. }, Region::Late { binder: u32::MAX, var }) => {
+                let Some(idx) = gat_base.checked_add(var) else {
+                    return Err(Bad::LifetimePast { index: u32::MAX });
+                };
+                match env.regs.get(idx as usize) {
+                    Some(Some(reg)) => RegAt::Known(*reg),
+                    Some(None) => RegAt::Unbound { env: e, param: idx },
+                    None => return Err(Bad::LifetimePast { index: idx }),
+                }
+            }
             (Mode::Item { .. }, Region::Late { binder, var }) => RegAt::Known(Reg::Bound { binder, var }),
             (Mode::Owner { .. }, Region::Param(i)) => RegAt::Known(Reg::Owner(Region::Param(i))),
             (Mode::Owner { binder: Some(b) }, Region::Late { binder, var }) if binder == b => {
@@ -320,7 +351,7 @@ impl<'c, A: Allocator + Copy> Envs<'c, A> {
         let env = self.env(e)?;
         Ok(match env.mode {
             Mode::Owner { .. } => TypeAt::Rigid,
-            Mode::Item { bindable } => match env.types.get(t as usize) {
+            Mode::Item { bindable, .. } => match env.types.get(t as usize) {
                 Some(Some(side)) => TypeAt::Bound(*side),
                 Some(None) if bindable => TypeAt::Unbound { env: e, param: t },
                 _ => return Err(Bad::TypeArg { index: t }),
@@ -419,7 +450,7 @@ pub fn instantiate<'c, A: Allocator + Copy>(
             for a in generics.types {
                 types.push(Some(Side::caller(*a)));
             }
-            envs.push(Mode::Item { bindable: false }, regs, types).ok_or(malformed(output.ty, Bad::StepBound))?
+            envs.push(Mode::Item { bindable: false, gat_base: count }, regs, types).ok_or(malformed(output.ty, Bad::StepBound))?
         }
         None => {
             let binder = match callee {
@@ -619,6 +650,15 @@ pub enum Keyed {
     Unknown,
 }
 
+/// The outer constructor shape of a trait impl's `Self` type (used to match projections on
+/// the caller's own enclosing trait impl `Self`, e.g. `Zip<A, B>::Item` or `(&T0, &T1)::Item`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelfShape {
+    Adt(ItemKey),
+    Ref(Mutbl),
+    Tuple(u32),
+}
+
 /// The asked alias's or bound's arguments `[Self, trait args..]` at the call, as the walk reads
 /// them (relate.rs `Keyer`): what a selection row is keyed against.
 pub trait AskArgs {
@@ -626,6 +666,10 @@ pub trait AskArgs {
     fn count(&self) -> Option<u32>;
     /// The `k`-th argument against `ty`, a type of the CALLER's table (a row's argument).
     fn compare(&self, k: u32, ty: PTy) -> Keyed;
+    /// If argument 0 (`Self`) resolves to an `Adt`, `Ref`, or `Tuple`, its outer shape.
+    fn self_shape(&self) -> Option<SelfShape> {
+        None
+    }
 }
 
 /// An ask with no arguments to key by: every comparison [`Keyed::Unknown`].
@@ -680,5 +724,40 @@ pub trait Selected {
     fn relates_nothing(&self, trait_: ItemKey) -> bool {
         let _ = trait_;
         false
+    }
+    /// Whether `<T as trait_>::name` is a compiler-builtin associated type whose normalized value
+    /// always carries zero lifetimes (`DiscriminantKind::Discriminant`, `Pointee::Metadata`).
+    fn is_zero_slot_builtin_assoc(&self, trait_: ItemKey, name: Name) -> bool {
+        let _ = (trait_, name);
+        false
+    }
+    /// Whether `trait_` is one of the `Fn` / `FnMut` / `FnOnce` language traits.
+    fn is_fn_trait(&self, trait_: ItemKey) -> bool {
+        let _ = trait_;
+        false
+    }
+    /// The signature column and where-clauses of a `FnDef` item (a fn, method, or tuple
+    /// constructor), for proving builtin `Fn` / `FnMut` / `FnOnce` bounds and `Output`.
+    fn fn_def_sig(&self, item: ItemKey) -> Result<(ParamsView<'_>, ColView<'_>, ImplWhere<'_>), NotSelected> {
+        let _ = item;
+        Err(NotSelected::Builtin)
+    }
+    /// The declared supertrait and associated-type bound clauses of `trait_` (`regions.clauses(trait_)`),
+    /// along with `trait_`'s declared lifetime parameter count (`ParamsView::count()`).
+    fn trait_clauses(&self, trait_: ItemKey) -> Option<(u32, &[ClauseView<'_>])> {
+        let _ = trait_;
+        None
+    }
+    /// The declared item-bound clauses of associated type `trait_::name` (filed under
+    /// `AssocTyDef::item`), along with its total lifetime parameter count (trait + GAT lifetimes).
+    fn assoc_clauses(&self, trait_: ItemKey, name: Name) -> Option<(u32, &[ClauseView<'_>])> {
+        let _ = (trait_, name);
+        None
+    }
+    /// The declared bound clauses of an opaque type `opaque` (`regions.clauses(opaque)`),
+    /// along with its defining item's lifetime parameter count (`regions.lifetime_params(opaque).count()`).
+    fn opaque_clauses(&self, opaque: ItemKey) -> Option<(u32, &[ClauseView<'_>])> {
+        let _ = opaque;
+        None
     }
 }

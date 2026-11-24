@@ -238,6 +238,7 @@ impl Owner for Own<'_> {
 struct Rec {
     subsets: SVec<(u32, u32)>,
     statics: SVec<u32>,
+    placeholders: SVec<u32>,
     next: u32,
 }
 
@@ -249,8 +250,10 @@ impl Constraints for Rec {
         self.statics.push(a.0);
     }
     fn fresh(&mut self, kind: Kind) -> Origin {
-        assert_eq!(kind, Kind::Existential, "the call rule makes existential origins only");
         let o = Origin(self.next);
+        if kind == Kind::Placeholder {
+            self.placeholders.push(self.next);
+        }
         self.next += 1;
         o
     }
@@ -342,7 +345,7 @@ fn run_in(
     dest: Arg,
 ) -> (Result<(), Refused>, Rec) {
     let origins: SVec<Origin> = (0..slots).map(Origin).collect();
-    let mut rec = Rec { subsets: SVec::new(), statics: SVec::new(), next: 100 };
+    let mut rec = Rec { subsets: SVec::new(), statics: SVec::new(), placeholders: SVec::new(), next: 100 };
     let res = {
         let mut cx = Cx { types, sig_types, selected: sel, owner: own, origins: &origins, out: &mut rec };
         call(&mut cx, callee, generics, args, dest, alloc())
@@ -552,11 +555,23 @@ fn fn_pointer_accepts_and_refuses_a_nested_binder() {
     assert_eq!(set(&rec), pairs(&[(0, 100), (100, 1)]));
     assert!(!rejects(&rec, &[0], &[]));
 
-    // `fn(fn(&u8))`: the inner binder (1) is not this call's.
+    // `fn(for<'r> fn(&'r u8))`: higher-ranked subtyping Skolemizes `'r` to a Placeholder (100)
+    // and emits `100: '0` (contravariant in the inner fn's argument).
     let inputs = [ty(inner, L10)];
     let callee = Callee::Value { kind: ValueKind::FnPtr, owner: OWNER, binder: 0, inputs: &inputs, output: ty(unit, NONE) };
-    let (res, _) = run(&cols, &Sel::default(), &Own::default(), 1, callee, no_generics(), &[arg(inner, 0, 1)], arg(unit, 1, 0));
-    assert_eq!(res, Err(Refused::HigherRanked { item: OWNER, node: r, binder: 1 }));
+    let (res, rec) = run(&cols, &Sel::default(), &Own::default(), 1, callee, no_generics(), &[arg(inner, 0, 1)], arg(unit, 1, 0));
+    assert_eq!(res, Ok(()));
+    assert_eq!(set(&rec), pairs(&[(100, 0)]));
+    assert!(rec.placeholders.contains(&100));
+
+    // Invariant position (`&mut (for<'r> fn(&'r u8))`): still refused as `HigherRanked`.
+    let rmut_inner = t.rm(inner);
+    let cols2 = Columns::new(t.t.view(), &facts, &facts);
+    const L00_L10: &[Region] = &[Region::Late { binder: 0, var: 0 }, Region::Late { binder: 1, var: 0 }];
+    let inputs2 = [ty(rmut_inner, L00_L10)];
+    let callee2 = Callee::Value { kind: ValueKind::FnPtr, owner: OWNER, binder: 0, inputs: &inputs2, output: ty(unit, NONE) };
+    let (res2, _) = run(&cols2, &Sel::default(), &Own::default(), 2, callee2, no_generics(), &[arg(rmut_inner, 0, 2)], arg(unit, 2, 0));
+    assert_eq!(res2, Err(Refused::HigherRanked { item: OWNER, node: r, binder: 1 }));
 }
 
 /// `Box<dyn Fn() -> &'a u8>` and `Box<dyn Fn(&'a u8)>` of the caller (its `'a` is Origin 10).
@@ -1328,7 +1343,7 @@ fn a_projection_clause_naming_a_region_is_never_skipped() {
         run(&cols, &Sel::default(), &Own::default(), n, Callee::Fn(sig), generics, &[arg(plain, 0, 0), arg(u, 0, n)], arg(unit, n, 0))
     };
     let (res, _) = call(r, 1, &with);
-    assert_eq!(res, Err(Refused::Unselected { item: METHOD, node: proj, trait_: T_TR, name: Some(OUTPUT), why: NotSelected::WhereProjection }));
+    assert_eq!(res, Err(Refused::Unselected { item: METHOD, node: proj, trait_: T_TR, name: Some(OUTPUT), why: NotSelected::Unanswered }));
     let (res, rec) = call(u8_, 0, &with);
     assert_eq!(res, Ok(()), "TWIN: `U = u8` names no region");
     assert!(rec.subsets.is_empty() && rec.statics.is_empty());
@@ -1445,7 +1460,7 @@ fn a_const_argument_relates_nothing() {
     let cols = Columns::new(t.t.view(), &facts, &facts);
     let origins: SVec<Origin> = (0..2).map(Origin).collect();
     let go = |b: PTy| {
-        let mut rec = Rec { subsets: SVec::new(), statics: SVec::new(), next: 100 };
+        let mut rec = Rec { subsets: SVec::new(), statics: SVec::new(), placeholders: SVec::new(), next: 100 };
         let res = {
             let own = Own::default();
             let sel = Sel::default();
@@ -1462,4 +1477,214 @@ fn a_const_argument_relates_nothing() {
     }
     let (res, _) = go(b_type);
     assert_eq!(res, Err(Refused::Shape { item: OWNER, a: c32, b: u8_, why: crate::ShapeWhy::Heads { a: crate::Head::ConstValue, b: crate::Head::Uint } }), "TWIN: a const against a type");
+}
+
+/// `same_alias` requires erased-equal subjects (the `Iterator::chain` shape): `<Wrap<'0> as
+/// Tr>::Ok` against `<Wrap<'1> as Tr>::Ok` relates `'0` and `'1` directly, while `<Wrap<'0> as
+/// Tr>::Ok` against `<Plain as Tr>::Ok` (distinct subjects) is NOT treated as the same alias and
+/// must normalize through the selected impls instead (refusing `Unselected` when none is given).
+#[test]
+fn same_alias_requires_erased_equal_subjects() {
+    let mut t = Tys::new();
+    let wrap = t.adt(K_WRAP, &[]);
+    let plain = t.adt(K_PLAIN, &[]);
+    let a_wrap = t.alias(T_TR, OK, &[wrap]);
+    let a_plain = t.alias(T_TR, OK, &[plain]);
+    let facts = Facts::default()
+        .trait_(T_TR, 0)
+        .alias(T_TR, OK, 0)
+        .adt(K_WRAP, 1, &[Variance::Co])
+        .adt(K_PLAIN, 0, &[]);
+    let cols = Columns::new(t.t.view(), &facts, &facts);
+    let origins: SVec<Origin> = (0..2).map(Origin).collect();
+    let go = |lhs: Arg, rhs: Arg| {
+        let mut rec = Rec { subsets: SVec::new(), statics: SVec::new(), placeholders: SVec::new(), next: 100 };
+        let res = {
+            let own = Own::default();
+            let sel = Sel::default();
+            let mut cx = Cx { types: &cols, sig_types: &cols, selected: &sel, owner: &own, origins: &origins, out: &mut rec };
+            crate::relate::relate(&mut cx, lhs, rhs, Variance::Co, OWNER, alloc())
+        };
+        (res, rec)
+    };
+
+    let (res, rec) = go(arg(a_wrap, 0, 1), arg(a_wrap, 1, 1));
+    assert_eq!(res, Ok(()), "identical alias subjects relate directly");
+    assert_eq!(set(&rec), pairs(&[(0, 1), (1, 0)]), "alias args are invariant");
+
+    let (res, _) = go(arg(a_wrap, 0, 1), arg(a_plain, 1, 0));
+    assert!(
+        matches!(res, Err(Refused::Unselected { .. })),
+        "CONTROL: distinct subjects must NOT be conflated by same_alias: {res:?}"
+    );
+}
+
+/// Associated-type item bounds (`trait Pattern { type Searcher<'a>: Searcher<'a>; }`) supplied via
+/// `Selected::assoc_clauses` prove a trait clause on an alias `<P as Pattern>::Searcher<'a>` and
+/// tie the trait's lifetime parameter `'a`.
+/// NEGATIVE CONTROL (rule 23): without `assoc_clauses`, the alias has no proof and is refused
+/// `Unselected`.
+#[test]
+fn assoc_item_bounds_prove_alias_trait_clauses() {
+    use blaze_typeck::region_facts::{ClauseView, ColView};
+
+    const T_PAT: ItemKey = ItemKey(0x0501);
+    const T_SEARCH: ItemKey = ItemKey(0x0502);
+    const SEARCHER: Name = Name::of("Searcher");
+
+    let mut t = Tys::new();
+    let u8_ = t.u8();
+    let r = t.r(u8_);
+    let p0 = t.param(0);
+    let searcher_alias = t.alias(T_PAT, SEARCHER, &[p0]);
+    let callee_clause = t.extrait(T_SEARCH, &[searcher_alias]);
+    // Inside `trait Pattern { type Searcher<'a>: Searcher<'a>; }`, the item bound's subject is
+    // `<Self as Pattern>::Searcher<'a>` (with `Self = Param(0)`, `'a = Region::Param(0)`).
+    let item_bound_ty = callee_clause;
+    let facts = Facts::default()
+        .trait_(T_PAT, 0)
+        .trait_(T_SEARCH, 1)
+        .alias(T_PAT, SEARCHER, 1);
+    let cols = Columns::new(t.t.view(), &facts, &facts);
+
+    struct AssocSel<'s> {
+        bound: Option<(u32, [ClauseView<'s>; 1])>,
+    }
+    impl Selected for AssocSel<'_> {
+        fn select(&self, _: Ask) -> Selection<'_> {
+            Selection::Not(NotSelected::GenericSelf(crate::inst::SelfHead::Alias))
+        }
+        fn assoc_clauses(&self, trait_: ItemKey, name: Name) -> Option<(u32, &[ClauseView<'_>])> {
+            if trait_ == T_PAT && name == SEARCHER {
+                self.bound.as_ref().map(|(n, c)| (*n, &c[..]))
+            } else {
+                None
+            }
+        }
+    }
+
+    // `fn run<'a, P: Pattern>(s: P::Searcher<'a>, x: &'a u8) where P::Searcher<'a>: Searcher<'a>`
+    // Called with `P = Param(0)`, `'a = slot 0`, `s: P::Searcher<'1>`, `x: &'2 u8`.
+    let p = params(1, &[]);
+    let inputs = [ty(searcher_alias, P0), ty(r, P0)];
+    let clauses = [ClauseIn::TraitOf { trait_ref: ty(callee_clause, P00) }];
+    let sig = Sig { item: METHOD, params: ParamsView::of(&p), inputs: &inputs, output: ty(r, P0), clauses: &clauses };
+    let types = [arg(p0, 0, 0)];
+    let generics = GenericArgs { lifetimes: range(0, 1), types: &types };
+    let args = [arg(searcher_alias, 1, 1), arg(r, 2, 1)];
+    let dest = arg(r, 3, 1);
+
+    let item_col = blaze_typeck::regions::RegionCol::lay(t.t.view(), item_bound_ty, &facts, P00, alloc()).expect("item bound laid");
+    let cv = ClauseView { nth: 0, binders: 0, col: ColView::of(&item_col) };
+    let sel_with = AssocSel { bound: Some((1, [cv])) };
+    let (res, rec) = run(&cols, &sel_with, &Own::default(), 4, Callee::Fn(sig), generics, &args, dest);
+    assert_eq!(res, Ok(()), "assoc item bound proves P::Searcher<'a>: Searcher<'a>: {res:?}");
+    assert!(reach(&rec, 1).contains(&0) && reach(&rec, 0).contains(&1), "slot 1 tied to 'a (slot 0): {:?}", rec.subsets);
+
+    let sel_without = AssocSel { bound: None };
+    let (res, _) = run(&cols, &sel_without, &Own::default(), 4, Callee::Fn(sig), generics, &args, dest);
+    assert!(matches!(res, Err(Refused::Unselected { trait_: T_SEARCH, .. })), "CONTROL: without assoc_clauses, refused Unselected: {res:?}");
+}
+
+/// Higher-ranked clause instantiation (`BinderCtx::Clause`):
+/// - Positive: a caller with `T: for<'a> Tr<&'a u8>` proves a callee's `T: Tr<&'x u8>` by
+///   instantiating the caller's `for<'a>` binder with a fresh existential tied to `'x`.
+/// - Negative control (rule 23): a caller with `T: Tr<&'y u8>` (a fixed universal `'y`, no binder)
+///   proves `T: for<'b> Tr<&'b u8>` ONLY by forcing a fresh placeholder `'b` to relate to `'y`,
+///   which the caller rejects (`rejects` is true: placeholder reaches universal `'y`).
+#[test]
+fn higher_ranked_clause_instantiation_and_negative_control() {
+    use blaze_typeck::region_facts::{ClauseView, ColView};
+
+    let mut t = Tys::new();
+    let u8_ = t.u8();
+    let r = t.r(u8_);
+    let unit = t.unit();
+    let p0 = t.param(0);
+    let tr_r = t.extrait(T_TR, &[p0, r]);
+    let facts = Facts::default().trait_(T_TR, 0);
+    let cols = Columns::new(t.t.view(), &facts, &facts);
+
+    const L00: &[Region] = &[Region::Late { binder: 0, var: 0 }];
+
+    struct OwnClauses<'s> {
+        views: [ClauseView<'s>; 1],
+    }
+    impl Owner for OwnClauses<'_> {
+        fn item(&self) -> ItemKey { OWNER }
+        fn universal(&self, r: Region) -> Option<Origin> {
+            match r { Region::Param(i) => Some(Origin(10 + i)), _ => None }
+        }
+        fn param(&self, p: u32) -> Option<Origin> { Some(Origin(20 + p)) }
+        fn bound(&self, _: u32, _: ItemKey) -> Option<Typed<'_>> { None }
+        fn clauses(&self) -> &[ClauseView<'_>] { &self.views }
+        fn body_params(&self, _: PTy) -> Option<&[u32]> { None }
+    }
+
+    // Positive: caller has `Param(0): for<'a> Tr<&'a u8>`, callee demands `Param(0): Tr<&'x u8>`
+    // where `'x` is slot 0 (instantiated by caller's local `arg(r, 1, 1)`).
+    let p = params(1, &[]);
+    let inputs = [ty(p0, NONE), ty(r, P0)];
+    let callee_clauses = [ClauseIn::TraitOf { trait_ref: ty(tr_r, P0) }];
+    let sig = Sig { item: METHOD, params: ParamsView::of(&p), inputs: &inputs, output: ty(unit, NONE), clauses: &callee_clauses };
+    let types = [arg(p0, 0, 0)];
+    let generics = GenericArgs { lifetimes: range(0, 1), types: &types };
+    let args = [arg(p0, 0, 0), arg(r, 1, 1)];
+    let hrtb_col = blaze_typeck::regions::RegionCol::lay(t.t.view(), tr_r, &facts, L00, alloc()).expect("hrtb clause laid");
+    let own_hrtb = OwnClauses { views: [ClauseView { nth: 0, binders: 1, col: ColView::of(&hrtb_col) }] };
+    let (res, rec) = run(&cols, &Sel::default(), &own_hrtb, 2, Callee::Fn(sig), generics, &args, arg(unit, 2, 0));
+    assert_eq!(res, Ok(()), "for<'a> Tr<&'a u8> proves Tr<&'x u8>: {res:?}");
+    assert!(!rejects(&rec, &[1], &[10]), "local slot 1 does not reach any universal: {:?}", rec.subsets);
+
+    // Negative control: caller only has `Param(0): Tr<&'y u8>` (`P0` -> universal `Origin(10)`),
+    // while callee demands `Param(0): for<'b> Tr<&'b u8>` (`L00` -> rigid placeholder!).
+    let p0_none = params(0, &[]);
+    let inputs_hr = [ty(p0, NONE)];
+    let clauses_hr = [ClauseIn::TraitOf { trait_ref: ty(tr_r, L00) }];
+    let sig_hr = Sig { item: METHOD, params: ParamsView::of(&p0_none), inputs: &inputs_hr, output: ty(unit, NONE), clauses: &clauses_hr };
+    let generics_hr = GenericArgs { lifetimes: SlotRange::EMPTY, types: &types };
+    let args_hr = [arg(p0, 0, 0)];
+    let fixed_col = blaze_typeck::regions::RegionCol::lay(t.t.view(), tr_r, &facts, P0, alloc()).expect("fixed clause laid");
+    let own_fixed = OwnClauses { views: [ClauseView { nth: 0, binders: 0, col: ColView::of(&fixed_col) }] };
+    let (res, rec) = run(&cols, &Sel::default(), &own_fixed, 1, Callee::Fn(sig_hr), generics_hr, &args_hr, arg(unit, 1, 0));
+    assert_eq!(res, Ok(()), "clause Skolemization emits placeholder constraint: {res:?}");
+    assert!(!rec.placeholders.is_empty(), "callee's for<'b> must create a rigid placeholder");
+    let ph = rec.placeholders[0];
+    assert!(rejects(&rec, &[], &[ph, 10]), "CONTROL: fixed `'y` (Origin(10)) cannot satisfy `for<'b>` (placeholder {ph}): {:?}", rec.subsets);
+}
+
+/// `BinderCtx::Dynamic(In)` Skolemization: a `dyn for<'a> Tr<'a>` in an invariant position
+/// (`&mut dyn for<'a> Tr<'a>`) Skolemizes the signature's higher-ranked binder to a rigid
+/// placeholder when matched against a caller's `dyn Tr<'?0>` slot:
+/// - Positive: an unconstrained existential slot on the caller side is accepted (no universal reached).
+/// - Negative control (rule 23): a caller universal `'x` (`Origin(10)`) matched against the
+///   Skolemized placeholder is rejected (universal reaches placeholder).
+#[test]
+fn dynamic_in_binder_skolemizes_rigidly_against_caller() {
+    let mut t = Tys::new();
+    let ex = t.extrait(T_TR, &[]);
+    let preds = t.list(&[ex]);
+    let dyn_ty = t.n(PNode::Dynamic(preds));
+    let mut_dyn = t.n(PNode::Ref(Mutbl::Mut, dyn_ty));
+    let unit = t.unit();
+    let facts = Facts::default().trait_(T_TR, 1);
+    let cols = Columns::new(t.t.view(), &facts, &facts);
+
+    // Callee: `fn f<'r>(x: &'r mut (dyn for<'a> Tr<'a> + 'r))`
+    // Slots on `mut_dyn`: `[outer_ref, dyn_lifetime, ex_trait_lifetime]`.
+    const COL: &[Region] = &[Region::Param(0), Region::Param(0), Region::Late { binder: 1, var: 0 }];
+    let p = params(1, &[]);
+    let inputs = [ty(mut_dyn, COL)];
+    let sig = Sig { item: METHOD, params: ParamsView::of(&p), inputs: &inputs, output: ty(unit, NONE), clauses: &[] };
+    let generics = GenericArgs { lifetimes: range(0, 1), types: &[] };
+
+    // Caller passes `&mut dyn Tr<'?2>` with slots `[1, 2, 3]` (all local existentials).
+    let (res, rec) = run(&cols, &Sel::default(), &Own::default(), 4, Callee::Fn(sig), generics, &[arg(mut_dyn, 1, 3)], arg(unit, 4, 0));
+    assert_eq!(res, Ok(()), "dyn for<'a> Tr<'a> under In variance lowers cleanly: {res:?}");
+    assert!(!rec.placeholders.is_empty(), "Dynamic(In) must Skolemize Sig binder to a rigid placeholder");
+    let ph = rec.placeholders[0];
+    // Slot 3 (caller's predicate slot) is equated with the rigid placeholder `ph`:
+    // if slot 3 were a caller universal (not existential), `rejects` catches it!
+    assert!(reach(&rec, 3).contains(&ph) && reach(&rec, ph).contains(&3), "slot 3 must equate with placeholder {ph}: {:?}", rec.subsets);
+    assert!(rejects(&rec, &[], &[3, ph]), "CONTROL: a caller universal at slot 3 cannot equal rigid placeholder {ph}");
 }

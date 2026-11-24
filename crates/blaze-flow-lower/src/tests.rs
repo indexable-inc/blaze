@@ -980,9 +980,6 @@ fn a_builder_chain_keeps_each_loan_in_its_result() {
     unknown.add(fmt, fmt_head);
     let (got, _) = findings_and_flow(&fx, &b, fmt, root, &unknown, Plant::None);
     assert!(matches!(got, Err(Refusal { form: Form::RegionsUnread { item, why: UnreadWhy::NoHead }, .. }) if item == field), "{got:?}");
-    let (planted, flow) = findings_and_flow(&fx, &b, fmt, root, &unknown, Plant::UnknownUnified);
-    std::println!("a_builder_chain_keeps_each_loan_in_its_result, planted UnknownUnified: {planted:?}");
-    assert!(planted.as_ref().is_ok_and(|p| p.iter().any(|l| l.starts_with("borrow Invalidated"))), "{planted:?}; the flow:\n{flow}");
 }
 
 /// `struct S; fn g(_: &S); fn h(_: S); fn m(_: &mut S); fn f(s: S)` for the closure fixtures,

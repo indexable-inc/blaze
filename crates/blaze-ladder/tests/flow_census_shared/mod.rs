@@ -217,7 +217,16 @@ fn first_word(debug: &str) -> &str {
 fn form_name(r: &BorrowRefused, a: Alloc<'static>) -> AString<'static> {
     let word = |debug: AString<'static>| format_in!(a, "{}", first_word(debug.as_str()));
     match r {
-        BorrowRefused::Lower(x) => word(format_in!(a, "{:?}", x.form)),
+        BorrowRefused::Lower(x) => match x.form {
+            blaze_flow_lower::Form::OneRule { why, .. } => match why {
+                blaze_flow_lower::OneRuleWhy::Unselected { why: u, .. } => format_in!(a, "OneRule Unselected/{u:?}"),
+                blaze_flow_lower::OneRuleWhy::Count { why: c, at, .. } => format_in!(a, "OneRule Count/{at:?}/{c:?}"),
+                blaze_flow_lower::OneRuleWhy::Malformed { why: m, .. } => format_in!(a, "OneRule Malformed/{m:?}"),
+                blaze_flow_lower::OneRuleWhy::Shape { why: s, .. } => format_in!(a, "OneRule Shape/{}", first_word(format_in!(a, "{s:?}").as_str())),
+                other => format_in!(a, "OneRule {}", word(format_in!(a, "{other:?}"))),
+            },
+            _ => word(format_in!(a, "{:?}", x.form)),
+        },
         BorrowRefused::Stricter(x) => format_in!(a, "Stricter {}", word(format_in!(a, "{:?}", x.form))),
         BorrowRefused::CallUnrelated { lacks, .. } => format_in!(a, "CallUnrelated {}", word(format_in!(a, "{lacks:?}"))),
         BorrowRefused::RegionsUnread { why, .. } => format_in!(a, "RegionsUnread {}", word(format_in!(a, "{why:?}"))),
