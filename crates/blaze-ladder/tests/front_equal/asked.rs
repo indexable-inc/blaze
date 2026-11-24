@@ -177,6 +177,14 @@ impl<'a, P: FrontEnd> FrontEnd for Asked<'a, P> {
         self.inner.fn_index(key)
     }
 
+    fn specialized_row(&self, i: usize, args: &[PTy], ground: PTys<'_>) -> Option<usize> {
+        self.inner.specialized_row(i, args, ground)
+    }
+
+    fn specialize_inline_for(&mut self, i: usize, args: &[PTy], ground: PTys<'_>) -> Result<Option<(usize, Option<Checked<'static>>)>, RunError> {
+        self.inner.specialize_inline_for(i, args, ground)
+    }
+
     fn soft_float_routines(&self, alloc: Alloc<'_>) -> Builtins {
         let r = self.inner.soft_float_routines(alloc);
         self.note(format_args!("soft_float_routines"), |o| write!(o, "{r:?}"));

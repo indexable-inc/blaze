@@ -1873,6 +1873,13 @@ impl FrontEnd for Front2Program<'_> {
         None
     }
 
+    fn specialize_inline_for(&mut self, i: usize, args: &[PTy], ground: PTys<'_>) -> Result<Option<(usize, Option<Checked<'static>>)>, crate::run::RunError> {
+        let Some(row) = self.specialized_row(i, args, ground) else {
+            return Ok(None);
+        };
+        Ok(Some((row, self.fns.get_mut(row).and_then(|f| f.checked.take()))))
+    }
+
     /// The digest filed in the store when fn `i`'s body was checked: its `Checked` holds no
     /// list (front2 body_reads.rs).
     fn body_reads(&self, i: usize, _checked: &Checked<'static>) -> Option<super::body_reads::ReadsDigest> {
@@ -2156,12 +2163,19 @@ impl FrontEnd for Front2Program<'_> {
     fn caller_site(&self, owner: ItemKey, expr: ExprId) -> Result<blaze_build::CallerSite<'_>, blaze_build::SiteGap> {
         let not_live = blaze_build::SiteGap::NotLive { owner };
         let row = self.by_key.get(&owner).and_then(|&i| self.fns.get(i)).ok_or(not_live)?;
-        lazy::seam_rules::caller_site(self.front.names, &self.front.keys, &self.store, owner, row.body.as_ref().ok_or(not_live)?, expr)
+        let body = row.body.as_ref().ok_or(not_live)?;
+        let anchor_owner = body.param_subst.as_ref().map_or(owner, |(orig, _)| *orig);
+        lazy::seam_rules::caller_site(self.front.names, &self.front.keys, &self.store, anchor_owner, body, expr)
     }
 
     /// By seam_rules.rs `def_site`, from the item's head and the names source.
     fn def_site(&self, item: ItemKey) -> Result<blaze_build::CallerSite<'_>, blaze_build::SiteGap> {
-        lazy::seam_rules::def_site(self.front.names, &self.front.keys, &self.store, item)
+        let anchor = self
+            .inline_for_specs
+            .iter()
+            .find(|s| self.fns.get(s.row).is_some_and(|r| r.key == item))
+            .map_or(item, |s| s.orig);
+        lazy::seam_rules::def_site(self.front.names, &self.front.keys, &self.store, anchor)
     }
 
     fn expr_site(&self, owner: ItemKey, expr: ExprId) -> Option<u32> {

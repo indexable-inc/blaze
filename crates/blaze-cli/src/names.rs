@@ -73,15 +73,21 @@ pub(crate) mod sections;
 // The subject's domain is blaze-drive key.rs `CRATE_SCOPE_DOMAIN` (the name's one home,
 // `crate_scope_name`): it names the crate's task, not its record's form, so a form change
 // moves this source domain alone (every key moves; the name a reader reads by stays). Bump it
-// there only when what a name stands for changes.
-const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 17";
-/// The out: the names record AND the checkout files the crate holds ([`crate_out`]). "1" was
-/// the names record alone, but a body's check reads its crate's items record to find which
-/// crate owns its file (body_types.rs `prepare`): a module file created gave a new record at
-/// an EQUAL out, so a reader handed the old record (settled standing, then made again: the
-/// drive does not re-enter readers of an equal out) kept "no crate's names record lists this
-/// file" while a fresh home did not (rule 21; main.rs `edits_of_module_files_answer_as_a_fresh_home`).
-const OUT_DOMAIN: &str = "blaze-cli crate scope out 2";
+// there only when what a name stands for changes. Source 18: D104 implicit `fn main` reads on
+// blaze-edition binary roots (engine_names.rs `finish`, rule 21) and expansion record keys in
+// `OUT_DOMAIN` 3.
+const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 18";
+/// The out: the names record, the crate's expansion record keys (`EXPANSIONS_OUT_DOMAIN`), AND
+/// the checkout files the crate holds ([`crate_out`]). "1" was the names record alone, but a
+/// body's check reads its crate's items record to find which crate owns its file (body_types.rs
+/// `prepare`): a module file created gave a new record at an EQUAL out, so a reader handed the
+/// old record (settled standing, then made again: the drive does not re-enter readers of an
+/// equal out) kept "no crate's names record lists this file" while a fresh home did not (rule 21;
+/// main.rs `edits_of_module_files_answer_as_a_fresh_home`). "3" adds each macro expansion call's
+/// content record key so editing inside a macro-expanded item (such as D104's implicit `fn main`)
+/// moves `CrateScope`'s `WHOLE` out too.
+const OUT_DOMAIN: &str = "blaze-cli crate scope out 3";
+const EXPANSIONS_OUT_DOMAIN: &str = "blaze-cli crate scope expansions out 1";
 /// The rule named by resolver refusals from both check drivers.
 pub(crate) const RULE: &str = "names.rs";
 
@@ -380,6 +386,9 @@ struct ScopeRecord {
     /// Each distinct expansion record the payload's directory names, copied out of the task's
     /// frame into `Global` with the payload.
     expansions: crate::work::Extras,
+    /// Position-independent digest of `(call, record_key)` over the expansions directory, folded
+    /// into `CrateScope`'s `out` (`OUT_DOMAIN` 3) so expansion body edits move `WHOLE` (rule 21).
+    expansions_out: ContentId,
 }
 
 /// A section of a resolved crate's record that could not be written: the crate's failure.
@@ -446,8 +455,19 @@ fn scope_record<'a>(done: &blaze_scope::crate_scope::CrateScope<'a>, crate_name:
         bytes.extend_from_slice(&record.bytes);
         records.push((record.key, bytes));
     }
-    let calls = u32::try_from(blaze_scope::expansion_records::Directory::open(expansions).map_err(|error| unwritten("expansions", std::format!("{error}")))?.len())
+    let dir = blaze_scope::expansion_records::Directory::open(expansions)
+        .map_err(|error| unwritten("expansions", blaze_own::format_in!(alloc, "{error}").as_str().into()))?;
+    let calls = u32::try_from(dir.len())
         .map_err(|_| unwritten("expansions", "more than a u32 of macro calls".into()))?;
+    let mut expansions_hash = blaze_ids::Hasher::new(EXPANSIONS_OUT_DOMAIN);
+    expansions_hash.update(&u64::from(calls).to_le_bytes());
+    for i in 0..dir.len() {
+        let entry = dir
+            .entry_at(i)
+            .map_err(|error| unwritten("expansions", blaze_own::format_in!(alloc, "{error}").as_str().into()))?;
+        expansions_hash.id(&entry.call.0).id(&entry.record);
+    }
+    let expansions_out = expansions_hash.finish();
     let extras = crate::work::Extras { records, calls, released: None };
     // The crate's link table, from the names resolved here (run.md, "the native image as a
     // task"): a refused table is written as its refusal (state 1), so only a program that links
@@ -471,7 +491,7 @@ fn scope_record<'a>(done: &blaze_scope::crate_scope::CrateScope<'a>, crate_name:
     let payload = sections::write(unresolved, [&done.record[..], &[], &names_record[..], &items_record[..], tests, expansions, &links[..], &cells[..]]);
     #[cfg(test)]
     sections::watch_tests(crate_name, &payload, tests);
-    Ok(ScopeRecord { payload, findings, unresolved, tests_refused, test_marks, expansions: extras })
+    Ok(ScopeRecord { payload, findings, unresolved, tests_refused, test_marks, expansions: extras, expansions_out })
 }
 
 /// No binding was found for this segment of a `use` or macro path.

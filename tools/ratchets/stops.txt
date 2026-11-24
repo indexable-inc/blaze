@@ -73,7 +73,7 @@ blaze-int	41
 blaze-json	32
 blaze-keyed	588
 blaze-kit	167
-blaze-ladder	1162
+blaze-ladder	1159
 blaze-launch	83
 blaze-launch-rt	219
 blaze-launcher	2

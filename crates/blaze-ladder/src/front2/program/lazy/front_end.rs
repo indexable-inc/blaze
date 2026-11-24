@@ -343,13 +343,15 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
     /// source (over records, the items record's file row).
     fn caller_site(&self, owner: ItemKey, expr: ExprId) -> Result<blaze_build::CallerSite<'_>, blaze_build::SiteGap> {
         let live = self.live_by_key(owner).ok_or(blaze_build::SiteGap::NotLive { owner })?;
-        super::seam_rules::caller_site(self.front.names, &self.front.keys, &self.store, owner, &live.made, expr)
+        let anchor_owner = live.made.param_subst.as_ref().map_or(owner, |(orig, _)| *orig);
+        super::seam_rules::caller_site(self.front.names, &self.front.keys, &self.store, anchor_owner, &live.made, expr)
     }
 
     /// By program/seam_rules.rs `def_site`, from `item`'s head and the names source: no body
     /// is read (a `Fn*` method has none).
     fn def_site(&self, item: ItemKey) -> Result<blaze_build::CallerSite<'_>, blaze_build::SiteGap> {
-        super::seam_rules::def_site(self.front.names, &self.front.keys, &self.store, item)
+        let anchor = self.spec_orig(item).unwrap_or(item);
+        super::seam_rules::def_site(self.front.names, &self.front.keys, &self.store, anchor)
     }
 
     /// From `owner`'s live body by program/seam_rules.rs `expr_offset`: no file asked, so a
@@ -382,6 +384,40 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
     /// Only rows already made: a row is added by `check_one` alone (module docs).
     fn fn_index(&self, key: ItemKey) -> Option<usize> {
         self.rows.by_key.get(&key).map(|&i| i as usize)
+    }
+
+    fn specialized_row(&self, i: usize, args: &[PTy], ground: PTys<'_>) -> Option<usize> {
+        if self.inline_for_specs.is_empty() {
+            return None;
+        }
+        let orig = *self.rows.key.get(i)?;
+        let alloc = self.store.tys.alloc();
+        for s in self.inline_for_specs.iter() {
+            if s.orig == orig && crate::front2::inline_for::args_equal(ground, args, self.store.tys.view(), &s.args, alloc) {
+                return Some(s.row);
+            }
+        }
+        None
+    }
+
+    fn specialize_inline_for(&mut self, i: usize, args: &[PTy], ground: PTys<'_>) -> Result<Option<(usize, Option<Checked<'static>>)>, crate::run::RunError> {
+        if let Some(existing) = self.specialized_row(i, args, ground) {
+            return Ok(Some((existing, None)));
+        }
+        let Some((spec_row, orig_key, checked)) = self
+            .specialize_inline_for_row(i, args, ground)
+            .map_err(|e| crate::run::RunError::Front2(Front2Refusal::Lazy(e)))?
+        else {
+            return Ok(None);
+        };
+        let values = checked.expr_defs.column::<1>().iter().filter_map(|d| match *d {
+            tc::Def::Fn(k) => Some(k),
+            _ => None,
+        });
+        for callee in checked.callees.column::<1>().iter().copied().chain(values) {
+            self.bind_internal(orig_key, callee).map_err(crate::run::RunError::Front2)?;
+        }
+        Ok(Some((spec_row, Some(checked))))
     }
 
     /// Over the source's questions: compiler_builtins' item rows, then the signatures of the
