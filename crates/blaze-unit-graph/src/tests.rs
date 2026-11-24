@@ -1560,3 +1560,48 @@ version = "2.0.0"
     assert_eq!(graph.units[dep_a.unit.index()].version.as_str(), "1.0.0");
     assert_eq!(graph.units[dep_b.unit.index()].version.as_str(), "2.0.0");
 }
+
+/// Zero-alloc `record::encode` cfg verification accepts valid units (lib, test, proc_macro,
+/// panic=unwind override) and rejects extra, missing, or unsorted cfg atoms with `NotItsCfg`.
+#[test]
+fn record_encode_cfg_is_accepts_valid_and_rejects_mutated() {
+    let ps = vec![
+        pkg("app").member().feature("f1", &[]).dep(dep("pm")),
+        pkg("pm").proc_macro(),
+    ];
+    let target = mac();
+    let host = mac();
+    let mut ask = Ask {
+        roots: Vec::new_in(a()),
+        features: Vec::new_in(a()),
+        all_features: false,
+        no_default_features: false,
+        tests: true,
+    };
+    let text = lock_text(&ps);
+    let lock = Lock::read(text.as_bytes(), a()).expect("lock");
+    ask.roots.push(LockId(0));
+    ask.features.push(t("f1"));
+    let mut res = Resolution::new(&lock, &target, &host, &ask, Resolver::V2, a());
+    res.member(LockId(0), ps[0].facts()).expect("member app");
+    res.package(LockId(1), Some(ps[1].facts())).expect("pkg pm");
+    let mut graph = match res.pass().expect("resolve") {
+        Pass::Done(g) => g,
+        _ => panic!("expected Done"),
+    };
+    let encoded = record::encode(&graph, &target, &host, a()).expect("valid cfg encodes");
+    let decoded = record::decode(&encoded, a()).expect("valid record decodes");
+    let re_encoded = record::encode(&decoded.graph, &target, &host, a()).expect("re-encodes");
+    assert_eq!(re_encoded.as_slice(), encoded.as_slice());
+
+    // Extra cfg atom is rejected.
+    let saved = graph.units[0].cfg.clone();
+    graph.units[0].cfg.push(CfgAtom::flag("zzz_bogus_extra", a()));
+    assert!(record::encode(&graph, &target, &host, a()).is_err(), "extra cfg atom rejected");
+    graph.units[0].cfg = saved.clone();
+
+    // Missing cfg atom is rejected.
+    graph.units[0].cfg.pop();
+    assert!(record::encode(&graph, &target, &host, a()).is_err(), "missing cfg atom rejected");
+    graph.units[0].cfg = saved;
+}

@@ -128,7 +128,7 @@ blaze-toolchain	24
 blaze-trace	53
 blaze-ty	2
 blaze-typeck	495
-blaze-unit-graph	65
+blaze-unit-graph	63
 blaze-units	2
 blaze-url	3
 blaze-v2-proof	5

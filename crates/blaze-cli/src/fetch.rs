@@ -111,6 +111,21 @@ impl<'f> Lockfile<'f> {
         Ok(dir.map_read(cx, &record_path(key)?)?)
     }
 
+    /// Maps the fetched source record `key` if present as a regular file in the sources store,
+    /// returning `Ok(None)` when absent (or a directory). Combines the existence check and mmap
+    /// into a single open+fstat+mmap instead of statting and then re-opening.
+    pub(crate) fn try_map_source(&mut self, cx: &Cx, env: &FetchEnv<'_>, key: &ContentId) -> Result<Option<blaze_core::Mapping>, CliError> {
+        let dir = match &mut self.sources {
+            Some(dir) => dir,
+            slot => slot.insert(sources_dir(cx, env)?),
+        };
+        match dir.map_read(cx, &record_path(key)?) {
+            Ok(mapping) => Ok(Some(mapping)),
+            Err(error) if matches!(error.kind, FsKind::NotFound | FsKind::IsADirectory) => Ok(None),
+            Err(error) => Err(CliError::Fs(error)),
+        }
+    }
+
     /// The lock's text planned. A refusal is `Err` with its words, which the caller makes a
     /// [`LOCK_UNREAD`] finding.
     ///
@@ -375,6 +390,14 @@ pub(crate) fn run<'b>(
         }
     }
     Ok(Did::Done(record))
+}
+
+/// Holds a mapped fetched source record alive on the process heap for the duration of the command
+/// so both unit-graph discovery (`graph.rs`) and world construction (`names.rs`) read the same
+/// single `mmap` without re-opening or re-mapping the file.
+pub(crate) fn hold_mapping(mapping: blaze_core::Mapping, heap: Alloc<'static>) -> &'static [u8] {
+    let mapping: &'static blaze_core::Mapping = blaze_own::Box::leak_static(blaze_own::Box::new_in(mapping, heap));
+    mapping.bytes()
 }
 
 /// The record file's name at `key`: its 64 hex digits.

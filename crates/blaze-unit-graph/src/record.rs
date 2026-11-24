@@ -52,8 +52,8 @@ impl fmt::Display for NotItsCfg {
 /// The graph's bytes. Each unit's cfg set is not written: it is its platform's atoms (the two
 /// platforms are written once), its features and its kind's flags, remade on decode; a unit
 /// whose cfg is other than that is [`NotItsCfg`].
-pub fn encode<'a>(graph: &UnitGraph<'a>, target: &TargetDesc<'a>, host: &TargetDesc<'a>, alloc: Alloc<'a>) -> Result<AVec<'a, u8>, NotItsCfg> {
-    let mut w = Writer(Vec::new_in(alloc));
+pub fn encode<'g, 'r>(graph: &UnitGraph<'g>, target: &TargetDesc<'g>, host: &TargetDesc<'g>, alloc: Alloc<'r>) -> Result<AVec<'r, u8>, NotItsCfg> {
+    let mut w = Writer(Vec::with_capacity_in(graph.units.len().saturating_mul(256).max(1024), alloc));
     w.0.extend_from_slice(MAGIC);
     w.u8(match graph.resolver {
         Resolver::V1 => 1,
@@ -68,9 +68,11 @@ pub fn encode<'a>(graph: &UnitGraph<'a>, target: &TargetDesc<'a>, host: &TargetD
         }
     }
     w.u32(graph.units.len() as u32);
+    let target_sorted = target.cfg.windows(2).all(|p| p[0] <= p[1]);
+    let host_sorted = host.cfg.windows(2).all(|p| p[0] <= p[1]);
     for (at, unit) in graph.units.iter().enumerate() {
-        let desc = if unit.for_host { host } else { target };
-        if !cfg_is(unit, desc, alloc) {
+        let (desc, desc_sorted) = if unit.for_host { (host, host_sorted) } else { (target, target_sorted) };
+        if !cfg_is(unit, desc, desc_sorted) {
             return Err(NotItsCfg { unit: UnitId(at as u32) });
         }
         w.u32(unit.package.0);
@@ -168,9 +170,77 @@ fn is_test(kind: &UnitKind<'_>) -> bool {
     crate::extra::has_test_cfg(kind)
 }
 
-/// Whether `unit`'s cfg is the set [`crate::resolve::unit_cfg`] makes on `desc`.
-fn cfg_is<'a>(unit: &Unit<'a>, desc: &TargetDesc<'a>, alloc: Alloc<'a>) -> bool {
-    unit.cfg == unit_cfg(desc, &unit.features, is_test(&unit.kind), crate::resolve::ignores_profile_panic(&unit.kind), unit.kind == UnitKind::ProcMacro, alloc)
+/// Whether `unit`'s cfg is the exact sorted, deduplicated set [`crate::resolve::unit_cfg`] makes
+/// on `desc`, verified in-place with zero heap allocations.
+fn cfg_is<'a>(unit: &Unit<'a>, desc: &TargetDesc<'a>, desc_sorted: bool) -> bool {
+    // `unit_cfg` always produces strictly sorted, deduplicated atoms.
+    if !unit.cfg.windows(2).all(|pair| pair[0] < pair[1]) {
+        return false;
+    }
+    let test = is_test(&unit.kind);
+    let unwinds = crate::resolve::ignores_profile_panic(&unit.kind);
+    let proc_macro = unit.kind == UnitKind::ProcMacro;
+    let has_unit_atom = |name: &str, value: Option<&str>| {
+        unit.cfg
+            .binary_search_by(|atom| atom.name.as_str().cmp(name).then_with(|| atom.value.as_deref().cmp(&value)))
+            .is_ok()
+    };
+    let has_desc_atom = |atom: &CfgAtom<'_>| {
+        if desc_sorted {
+            desc.cfg.binary_search(atom).is_ok()
+        } else {
+            desc.cfg.iter().any(|candidate| candidate == atom)
+        }
+    };
+    // 1. Every atom `unit_cfg` emits must be present in `unit.cfg`.
+    for atom in desc.cfg.iter() {
+        if unwinds && atom.name.as_str() == crate::resolve::PANIC_KEY {
+            continue;
+        }
+        if !has_unit_atom(atom.name.as_str(), atom.value.as_deref()) {
+            return false;
+        }
+    }
+    if unwinds && !has_unit_atom(crate::resolve::PANIC_KEY, Some("unwind")) {
+        return false;
+    }
+    for feature in unit.features.iter() {
+        if !has_unit_atom("feature", Some(feature.as_str())) {
+            return false;
+        }
+    }
+    if !has_unit_atom("debug_assertions", None) {
+        return false;
+    }
+    if test && !has_unit_atom("test", None) {
+        return false;
+    }
+    if proc_macro && !has_unit_atom("proc_macro", None) {
+        return false;
+    }
+    // 2. Every atom present in `unit.cfg` must be justified by one of the sources above.
+    let features_sorted = unit.features.windows(2).all(|pair| pair[0] <= pair[1]);
+    for atom in unit.cfg.iter() {
+        let name = atom.name.as_str();
+        let val = atom.value.as_deref();
+        let expected = (name == "debug_assertions" && val.is_none())
+            || (test && name == "test" && val.is_none())
+            || (proc_macro && name == "proc_macro" && val.is_none())
+            || (unwinds && name == crate::resolve::PANIC_KEY && val == Some("unwind"))
+            || (name == "feature"
+                && val.is_some_and(|f| {
+                    if features_sorted {
+                        unit.features.binary_search_by(|feat| feat.as_str().cmp(f)).is_ok()
+                    } else {
+                        unit.features.iter().any(|feat| feat.as_str() == f)
+                    }
+                }))
+            || (!(unwinds && name == crate::resolve::PANIC_KEY) && has_desc_atom(atom));
+        if !expected {
+            return false;
+        }
+    }
+    true
 }
 
 /// Bytes that are not a unit graph's record: where, and what is wrong there.

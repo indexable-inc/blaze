@@ -91,7 +91,7 @@ blaze-test-reach	13
 blaze-toml	19
 blaze-trace	2
 blaze-typeck	20
-blaze-unit-graph	61
+blaze-unit-graph	52
 blaze-url	1
 blaze-watch	22
 blaze-world	18

@@ -279,12 +279,15 @@ impl Tree for ReadTree {
 /// not made, and the units stage discovers in full (engine_units.rs `UnitsCause::World`), where
 /// the fetch's own stat (`fetch_stands`) finds it gone and fetches it again. No other stat of
 /// the sources store is made on a read back.
-struct Folder {
+struct Folder<'m> {
     cx: &'static Cx,
     store: Dir<ReadOnly>,
     /// Where each mapping is held to the end of the command.
     heap: Alloc<'static>,
     opened: &'static Opened,
+    /// Fetched source records already mapped during unit-graph discovery, sorted by key,
+    /// reused in place without a second `open` + `fstat` + `mmap`.
+    pre_mapped: &'m [(ContentId, &'static [u8])],
 }
 
 /// What making this world did, for the profile's `plan:` line (engine_units.rs `PlanRows`): each
@@ -299,24 +302,32 @@ pub(crate) struct Opened {
     pub(crate) mapped_bytes: core::cell::Cell<u64>,
 }
 
-impl Folder {
-    /// The sources store opened read only, with `checkout`'s context.
-    fn of(checkout: &'static Reader, env: &FetchEnv<'_>, opened: &'static Opened) -> Result<Folder, NamesError> {
+impl<'m> Folder<'m> {
+    /// The sources store opened read only, with `checkout`'s context and any already-mapped
+    /// source records from unit-graph discovery.
+    fn of(checkout: &'static Reader, env: &FetchEnv<'_>, opened: &'static Opened, pre_mapped: &'m [(ContentId, &'static [u8])]) -> Result<Folder<'m>, NamesError> {
         let sources = crate::fetch::sources_dir(checkout.cx, env).map_err(|error| NamesError::Sources(error.to_string()))?;
-        Ok(Folder { cx: checkout.cx, store: sources.read_only(), heap: env.heap.alloc(), opened })
+        Ok(Folder { cx: checkout.cx, store: sources.read_only(), heap: env.heap.alloc(), opened, pre_mapped })
     }
 }
 
-impl<'b> Records<'b> for Folder {
-    fn record(&mut self, source: &SourceId<'_>) -> Option<&'b [u8]> {
-        let hex = crate::fetch::key_hex(&source.key());
+impl Records<'static> for Folder<'_> {
+    fn record(&mut self, source: &SourceId<'_>) -> Option<&'static [u8]> {
+        let key = source.key();
+        if let Ok(at) = self.pre_mapped.binary_search_by(|(held, _)| held.cmp(&key))
+            && let Some(&(_, bytes)) = self.pre_mapped.get(at)
+        {
+            self.opened.records_mapped.set(self.opened.records_mapped.get().saturating_add(1));
+            self.opened.mapped_bytes.set(self.opened.mapped_bytes.get().saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX)));
+            return Some(bytes);
+        }
+        let hex = crate::fetch::key_hex(&key);
         let path = Path::new(core::str::from_utf8(&hex).ok()?).ok()?;
         // None is the package's `NotFetched` (blaze-unit-graph `SourceError`), named by its
         // package and key: no world is made, and the units stage says why (engine_units.rs).
         let mapping = self.store.map_read(self.cx, &path).ok()?;
         // Held to the end of the command: the world and every reader of its packs borrow it.
-        let mapping: &'static blaze_core::Mapping = blaze_own::Box::leak_static(blaze_own::Box::new_in(mapping, self.heap));
-        let bytes: &'static [u8] = mapping.bytes();
+        let bytes = crate::fetch::hold_mapping(mapping, self.heap);
         self.opened.records_mapped.set(self.opened.records_mapped.get().saturating_add(1));
         self.opened.mapped_bytes.set(self.opened.mapped_bytes.get().saturating_add(bytes.len() as u64));
         Some(bytes)
@@ -1142,7 +1153,7 @@ impl<'f> Names<'f> {
         if view.out != maker.out {
             return refused(WorldWhy::Back(crate::engine_units::BackRefused::Out { key: maker.record }));
         }
-        let made = match make_world(&cx, root, sections.graph, maker.lock, maker.members, env, Some(self.list)) {
+        let made = match make_world(&cx, root, sections.graph, maker.lock, maker.members, &[], &[], env, Some(self.list)) {
             Ok(made) => made,
             Err(why) => return refused(WorldWhy::Make(why)),
         };
@@ -1419,12 +1430,29 @@ pub(crate) fn world<'f>(
     members: Option<&[crate::graph::CheckoutDir]>,
     env: &FetchEnv<'_>,
 ) -> Result<Names<'f>, NamesError> {
+    world_with_mapped(cx, root, graph_record, lock, members, &[], &[], env)
+}
+
+/// As [`world`], reusing fetched source records already mapped during unit-graph discovery
+/// (`pre_mapped`, sorted by key) and pre-located git package directories (`pre_dirs`) so no
+/// source pack is mapped or laid out a second time.
+#[expect(clippy::too_many_arguments, reason = "world builder taking pre-mapped sources and git dirs from discovery")]
+pub(crate) fn world_with_mapped<'f>(
+    cx: &Cx,
+    root: &Dir<ReadWrite>,
+    graph_record: &[u8],
+    lock: Option<&'f Lock<'static>>,
+    members: Option<&[crate::graph::CheckoutDir]>,
+    pre_mapped: &[(ContentId, &'static [u8])],
+    pre_dirs: &[(LockId, &str)],
+    env: &FetchEnv<'_>,
+) -> Result<Names<'f>, NamesError> {
     let lock = lock.ok_or(NamesError::NoLock)?;
     let members = members.ok_or(NamesError::NoMembers)?;
     let heap: Alloc<'static> = env.heap.alloc();
     let mut dirs: blaze_own::Vec<blaze_world::CheckoutPath<'_>, Alloc<'static>> = blaze_own::Vec::with_capacity_in(members.len(), heap);
     dirs.extend(members.iter().map(|entry| blaze_world::CheckoutPath { id: entry.id, dir: entry.dir.as_str(), kind: entry.kind }));
-    let made = make_world(cx, root, graph_record, lock, &dirs, env, None)?;
+    let made = make_world(cx, root, graph_record, lock, &dirs, pre_mapped, pre_dirs, env, None)?;
     let list: &'static [u8] = {
         let _cx = cx.span("names: the crate list written");
         blaze_world::crate_list::encode_with(&made.world, &made, heap).map_err(NamesError::List)?.leak_static()
@@ -1466,28 +1494,32 @@ impl<'w> blaze_world::Packages<'w> for CheckoutOnly<'_, 'w> {
 /// packages' directories, anchor-relative ([`world`], [`Names::made_or_make`]). When `stored_list`
 /// is `Some`, builds lazily via `open_list_light` + `world_from_list` + `SyncLazyTrees` without
 /// opening any toolchain or fetched package pack up front.
+#[expect(clippy::too_many_arguments, reason = "world builder taking pre-mapped sources, git dirs, and optional lazy list")]
 fn make_world<'f>(
     cx: &Cx,
     root: &Dir<ReadWrite>,
     graph_record: &[u8],
     lock_whole: &'f Lock<'static>,
     members: &[blaze_world::CheckoutPath<'_>],
+    pre_mapped: &[(ContentId, &'static [u8])],
+    pre_dirs: &[(LockId, &str)],
     env: &FetchEnv<'_>,
     stored_list: Option<CrateList<'static>>,
 ) -> Result<NamesWorld<'f>, NamesError> {
     let lock: &'f Lock<'f> = lock_whole;
     let heap: Alloc<'static> = env.heap.alloc();
     let Some(home) = env.home else { return Err(NamesError::NoHome) };
+    let frame: &'static Frame = std::boxed::Box::leak(std::boxed::Box::new(Frame::with_reserve(NAMES_FRAME, bstd::mem::Tag::Other).map_err(|_| NamesError::Frame)?));
+    let frame_alloc: Alloc<'static> = frame.alloc(blaze_own::Erased::new(frame)).handle();
     let opened: &'static Opened = blaze_own::Box::leak_static(blaze_own::Box::new_in(Opened::default(), heap));
     let decoded = {
         let _cx = cx.span("names: the unit graph decoded");
         opened.graph_decodes.set(opened.graph_decodes.get().saturating_add(1));
-        blaze_unit_graph::record::decode(graph_record, heap).map_err(NamesError::Graph)?
+        blaze_unit_graph::record::decode(graph_record, frame_alloc).map_err(NamesError::Graph)?
     };
-    let decoded: &'static blaze_unit_graph::record::Decoded<'static> = std::boxed::Box::leak(std::boxed::Box::new(decoded));
+    let decoded: &'static blaze_unit_graph::record::Decoded<'static> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(decoded, frame));
     let graph = &decoded.graph;
     let cx: &'static Cx = std::boxed::Box::leak(std::boxed::Box::new(cx.until(cx.deadline())));
-    let frame: &'static Frame = std::boxed::Box::leak(std::boxed::Box::new(Frame::with_reserve(NAMES_FRAME, bstd::mem::Tag::Other).map_err(|_| NamesError::Frame)?));
     let mut shelf = {
         let _cx = cx.span("names: the toolchain's shelf opened");
         crate::toolchain::HomeShelf::open(cx, &env.fs, home, frame).map_err(NamesError::Shelf)?
@@ -1543,12 +1575,15 @@ fn make_world<'f>(
         let lazy_trees = crate::body_types::SyncLazyTrees::new_in_heap(Some(home), env.heap, stored).map_err(|why| NamesError::World(String::from(why)))?;
         (world, &[][..], Some(lazy_trees))
     } else {
-        let sources = {
+        let mut sources = {
             let _cx = cx.span("names: the lock's fetch plan and the sources store opened");
-            StoreSources::new(lock_whole, Folder::of(reader, env, opened)?, PackView::open_source_put, heap).map_err(|e| NamesError::Sources(std::format!("{e}")))?
+            StoreSources::new(lock_whole, Folder::of(reader, env, opened, pre_mapped)?, PackView::open_source_put, frame_alloc)
+                .map_err(|e| NamesError::Sources(std::format!("{e}")))?
         };
-        let sources = std::boxed::Box::leak(std::boxed::Box::new(sources));
-        let mut fetched = Fetched { store: sources, paths, lock: lock_whole, alloc: bump };
+        for &(id, dir) in pre_dirs {
+            sources.seed_dir(id, dir);
+        }
+        let mut fetched = Fetched { store: &mut sources, paths, lock: lock_whole, alloc: bump };
         let mut packages = crate::proc_callers::Placing::new(&mut fetched, heap);
         let listed = {
             let _cx = cx.span("names: the crate list and the toolchain's packs opened");

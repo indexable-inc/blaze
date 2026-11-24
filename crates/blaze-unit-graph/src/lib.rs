@@ -146,7 +146,7 @@ pub use extra::{Extra, ExtraUnit};
 pub use implicit::{Implicit, Prelude, StdIs, Sysroot, ToolchainUnit, implicit};
 pub use input::{Ask, Bin, CfgAtom, Dep, DepSource, FeatureDef, FeatureValue, Lib, NoResolver, Package, Platform, Resolver, TargetDesc};
 pub use resolve::{Resolution, ignores_profile_panic};
-pub use sources::{Open, Records, SourceError, StoreSources};
+pub use sources::{ExternalRecords, Open, Records, SourceError, StoreSources};
 
 /// Text in the caller's allocator.
 pub type Text<'a> = String<Alloc<'a>>;

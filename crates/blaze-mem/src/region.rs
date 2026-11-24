@@ -47,6 +47,8 @@ fn huge_unit() -> usize {
 /// writable. Any thread may commit more ([`Region::ensure`]); giving pages back takes `&mut`.
 pub struct Region {
     base: NonNull<u8>,
+    raw_base: NonNull<u8>,
+    raw_len: usize,
     reserved: usize,
     committed: AtomicUsize,
     /// The unit of commits below [`huge_unit`], and of all of them on base pages.
@@ -122,7 +124,7 @@ impl Region {
         let granule = os::page_size().max(64 << 10);
         let reserved = crate::align::checked_align_up(bytes.max(1), granule)
             .ok_or(MemError::TooLarge { tag, what: "a reservation", wanted: bytes })?;
-        let base = os::reserve_sparse(reserved).map_err(|os| MemError::Reserve {
+        let res = os::reserve_sparse(reserved).map_err(|os| MemError::Reserve {
             tag,
             bytes: reserved,
             os,
@@ -130,7 +132,9 @@ impl Region {
         tag::reserved(tag, reserved);
         tag::base_pages(reserved);
         let region = Region {
-            base,
+            base: res.base,
+            raw_base: res.raw_base,
+            raw_len: res.raw_len,
             reserved,
             committed: AtomicUsize::new(0),
             granule,
@@ -156,7 +160,7 @@ impl Region {
         let reserved = crate::align::checked_align_up(bytes.max(1), whole)
             .ok_or(MemError::TooLarge { tag, what: "a reservation", wanted: bytes })?;
         let transparent = pages == Pages::Transparent;
-        let base = match node {
+        let res = match node {
             Some(node) => os::reserve_on(reserved, transparent, node),
             None => os::reserve(reserved, transparent),
         }
@@ -166,7 +170,9 @@ impl Region {
             tag::base_pages(reserved);
         }
         Ok(Region {
-            base,
+            base: res.base,
+            raw_base: res.raw_base,
+            raw_len: res.raw_len,
             reserved,
             committed: AtomicUsize::new(0),
             granule,
@@ -716,9 +722,15 @@ impl Drop for Region {
         let committed = *self.committed.get_mut();
         tag::sub(self.tag, committed);
         tag::decommitted(committed);
-        // SAFETY: `base` and `reserved` are this reservation's own, and the region is gone, so
+        // SAFETY: `raw_base` and `raw_len` are this reservation's own, and the region is gone, so
         // nothing reaches its memory.
-        unsafe { os::release(self.base, self.reserved) };
+        unsafe {
+            os::release(os::Reservation {
+                base: self.base,
+                raw_base: self.raw_base,
+                raw_len: self.raw_len,
+            })
+        };
         tag::released(self.tag, self.reserved);
         if self.pages == Pages::Base {
             tag::base_pages_released(self.reserved);

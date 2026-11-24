@@ -102,3 +102,33 @@ fn spans_past_a_shelf_go_to_the_bounded_pool() {
     .join()
     .expect("the spans' thread");
 }
+
+/// Non-task frames (`Frame::new`) reuse spans through the process's span pool, and cooling the
+/// span pool sheds committed pages down to one granule per span without issuing `munmap`.
+#[test]
+fn non_task_frames_reuse_pooled_spans_and_cool_without_munmap() {
+    use super::{Frame, cool_span_pool, trim_span_pool};
+
+    // Warm one 3 MiB span via a non-task frame and release it into the pool.
+    {
+        let frame = Frame::new(Tag::Other).expect("non-task frame");
+        let big = frame.alloc_slice_fill_with(3 << 20, |i| i as u8);
+        assert_eq!(big[(3 << 20) - 1], ((3 << 20) - 1) as u8);
+    }
+    assert!(pooled_span_bytes() > 0, "non-task frame returned its span to the pool");
+    assert!(pooled_span_bytes() <= SPAN_POOL * SPAN_WARM);
+
+    // Cooling sheds committed bytes to one granule per span without unmapping.
+    let before_cool = pooled_span_bytes();
+    cool_span_pool();
+    let after_cool = pooled_span_bytes();
+    assert!(after_cool > 0 && after_cool < before_cool, "cool reduced {before_cool} -> {after_cool}");
+
+    // A second non-task frame reuses the cooled span cleanly.
+    {
+        let frame = Frame::new(Tag::Other).expect("second non-task frame");
+        let big = frame.alloc_slice_fill_with(3 << 20, |i| (i.wrapping_mul(3)) as u8);
+        assert_eq!(big[(3 << 20) - 1], (((3usize << 20) - 1).wrapping_mul(3)) as u8);
+    }
+    trim_span_pool();
+}

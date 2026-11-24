@@ -430,6 +430,49 @@ impl Root {
         self.region.tag()
     }
 
+    /// Checks [`LiveAtDrop::Refused`] when the root ends or resets.
+    fn check_live_at_end(&mut self, doing: &str) {
+        let live = *self.live_blocks.get_mut();
+        // A test's (debug) build: a block still live is a leak, the test's failure. Not while a
+        // panic unwinds, which leaves blocks live by design and would abort on a second panic.
+        if cfg!(debug_assertions) && self.live_at_drop == LiveAtDrop::Refused && live != 0 && !std::thread::panicking() {
+            let bytes = *self.live_bytes.get_mut();
+            panic!(
+                "blaze_mem::Root ({}, {} bytes reserved) {doing} with {live} blocks ({bytes} bytes) still live: their \
+                 owners leaked them (`mem::forget`, `Vec::leak`, `Box::leak`, a cycle of counted pointers)",
+                self.region.tag(),
+                self.region.reserved()
+            );
+        }
+    }
+
+    /// Resets the root for reuse, returning every committed page to the kernel while keeping the
+    /// virtual reservation mapped (avoiding an `munmap` + `mmap` pair between phases).
+    ///
+    /// Taking `&mut self` guarantees no [`Alloc`] or [`SharedAlloc`] handle borrowed from this
+    /// root is alive. In debug builds with [`LiveAtDrop::Refused`], panics if any block was
+    /// leaked, matching [`Drop`]. Returns the committed bytes given back.
+    pub fn reset(&mut self) -> usize {
+        self.check_live_at_end("reset");
+        let committed = self.region.committed();
+        *self.carved.get_mut() = 0;
+        *self.live_blocks.get_mut() = 0;
+        *self.live_bytes.get_mut() = 0;
+        *self.allocations.get_mut() = 0;
+        *self.refused.get_mut() = Refused::NONE;
+        *self.refused_wanted.get_mut() = 0;
+        *self.refused_errno.get_mut() = 0;
+        for list in self.lists.iter_mut() {
+            *list.held.get_mut() = false;
+            *list.top.get_mut() = 0;
+        }
+        if committed != 0 {
+            // A refused decommit leaves the pages committed: memory held, nothing broken.
+            let _ = self.region.decommit_after(0);
+        }
+        committed
+    }
+
     /// Why its last take was refused ([`MemError::Exhausted`] naming the reservation, a commit
     /// the kernel refused, a size or alignment past what a root gives); `None` if none was.
     /// The allocator's error, `AllocError`, carries nothing, so this is where it is named.
@@ -651,18 +694,7 @@ unsafe impl Headed for Root {}
 
 impl Drop for Root {
     fn drop(&mut self) {
-        let live = *self.live_blocks.get_mut();
-        // A test's (debug) build: a block still live is a leak, the test's failure. Not while a
-        // panic unwinds, which leaves blocks live by design and would abort on a second panic.
-        if cfg!(debug_assertions) && self.live_at_drop == LiveAtDrop::Refused && live != 0 && !std::thread::panicking() {
-            let bytes = *self.live_bytes.get_mut();
-            panic!(
-                "blaze_mem::Root ({}, {} bytes reserved) dropped with {live} blocks ({bytes} bytes) still live: their \
-                 owners leaked them (`mem::forget`, `Vec::leak`, `Box::leak`, a cycle of counted pointers)",
-                self.region.tag(),
-                self.region.reserved()
-            );
-        }
+        self.check_live_at_end("dropped");
         // The region, dropped after this, gives every page back to the kernel.
     }
 }

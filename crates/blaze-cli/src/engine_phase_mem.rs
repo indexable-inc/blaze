@@ -126,6 +126,11 @@ pub(crate) fn heap_now() -> u64 {
 /// returns; each phase's arena is made from it.
 pub(crate) struct RequestMem {
     root: Root,
+    /// A single reusable phase arena reservation, reset (every committed page returned to the
+    /// kernel via `Root::reset`) at each phase's end so hundreds of sequential phases reuse one
+    /// virtual reservation instead of issuing `mmap` + `munmap` per phase. `RequestMem::phase`
+    /// runs sequentially on the coordinator thread, so a `RefCell` avoids constructing a lock.
+    phase_spare: core::cell::RefCell<Option<Root>>,
     /// Phases made, phases dropped (ended or not), and the bytes their drops gave back.
     made: AtomicU32,
     dropped: AtomicU32,
@@ -146,7 +151,13 @@ impl RequestMem {
     /// handle keep values to its end by design (`Vec::leak` into the handed allocator).
     pub(crate) fn new() -> Result<RequestMem, PhaseMemError> {
         let root = Root::new(RootOpts { reserve: REQUEST_RESERVE, tag: REQUEST_TAG, live_at_drop: LiveAtDrop::Freed }).map_err(|error| PhaseMemError::Request { error })?;
-        Ok(RequestMem { root, made: AtomicU32::new(0), dropped: AtomicU32::new(0), returned: AtomicU64::new(0) })
+        Ok(RequestMem {
+            root,
+            phase_spare: core::cell::RefCell::new(None),
+            made: AtomicU32::new(0),
+            dropped: AtomicU32::new(0),
+            returned: AtomicU64::new(0),
+        })
     }
 
     /// The request's handle that may cross threads (the workers fill its buffers).
@@ -156,9 +167,13 @@ impl RequestMem {
 
     /// The arena of a phase of `stage` beginning now, the process heap read as it begins.
     pub(crate) fn phase(&self, stage: Stage) -> Result<PhaseMem<'_>, PhaseMemError> {
-        let root = Root::new(RootOpts { reserve: PHASE_RESERVE, tag: PHASE_TAG, live_at_drop: LiveAtDrop::Refused }).map_err(|error| PhaseMemError::Phase { stage, error })?;
+        let reused = self.phase_spare.try_borrow_mut().ok().and_then(|mut slot| slot.take());
+        let root = match reused {
+            Some(root) => root,
+            None => Root::new(RootOpts { reserve: PHASE_RESERVE, tag: PHASE_TAG, live_at_drop: LiveAtDrop::Refused }).map_err(|error| PhaseMemError::Phase { stage, error })?,
+        };
         self.made.fetch_add(1, Ordering::AcqRel);
-        Ok(PhaseMem { request: self, stage, root, heap_at_start: heap_now() })
+        Ok(PhaseMem { request: self, stage, root: Some(root), heap_at_start: heap_now() })
     }
 
     /// Its phases' arenas made and dropped so far, and what their drops gave back.
@@ -182,26 +197,36 @@ impl Drop for RequestMem {
 /// this threshold and pay zero trim overhead.
 const PHASE_TRIM_THRESHOLD: u64 = 16 << 20;
 
+/// Warm-chunk threshold for triggering inter-phase cooling when the phase arena itself is small:
+/// 64 MiB avoids cooling/re-committing spans across hundreds of small `Scripts`/`Names` phases
+/// while still shedding memory before heavy `Heads`/`Bodies` peaks.
+const CHUNK_TRIM_THRESHOLD: u64 = 64 << 20;
+
 /// One phase's arena (the module's doc).
 pub(crate) struct PhaseMem<'r> {
     request: &'r RequestMem,
     stage: Stage,
-    root: Root,
+    /// Always `Some` until `Drop` takes it to reset and return to `request.phase_spare`.
+    root: Option<Root>,
     /// The process heap as the phase began ([`heap_now`]).
     heap_at_start: u64,
 }
 
 impl PhaseMem<'_> {
+    fn root(&self) -> &Root {
+        self.root.as_ref().unwrap_or(&self.request.root)
+    }
+
     /// The phase's handle that may cross threads: for what must live to the phase's END (results
     /// gathered from workers, the rows before they are put). Borrowed from the arena, so nothing
     /// made over it outlives the phase (the module's doc).
     pub(crate) fn shared(&self) -> SharedAlloc<'_> {
-        self.root.shared()
+        self.root().shared()
     }
 
     /// The phase's handle, as [`PhaseMem::shared`].
     pub(crate) fn alloc(&self) -> Alloc<'_> {
-        self.root.alloc()
+        self.root().alloc()
     }
 
     /// The phase is over, its records committed: what its arena held and gave back, and what the
@@ -209,7 +234,7 @@ impl PhaseMem<'_> {
     /// Taken by value: a value made over the arena's handle and still alive is a compile error
     /// here (the module's doc).
     pub(crate) fn end(self) -> PhaseRow {
-        let used = self.root.used();
+        let used = self.root().used();
         let heap = heap_now();
         let committed = u64::try_from(used.committed).unwrap_or(u64::MAX);
         let row = PhaseRow {
@@ -220,13 +245,15 @@ impl PhaseMem<'_> {
             kept_on_heap: signed(heap).saturating_sub(signed(self.heap_at_start)),
         };
         drop(self);
-        // Trigger trim when either the phase arena or the warm chunk cache crossed the threshold:
+        // Trigger trim when either the phase arena or the warm chunk cache crossed its threshold:
         // worker tasks run inside `bstd::mem::Frame` (Tag::Chunks) rather than `PhaseMem::root`,
         // so heavy cold `Names`/`Heads` phases accumulate warm chunks even when `root` stays small.
-        if committed >= PHASE_TRIM_THRESHOLD || blaze_mem::chunks::cached().warm >= PHASE_TRIM_THRESHOLD {
-            blaze_mem::frame::ask_spare_trim();
-            let _ = blaze_mem::frame::trim_spare(0);
-            let _ = blaze_mem::frame::trim_span_pool();
+        // Cool spans (decommit pages to one granule without `munmap`) so virtual reservations stay
+        // reusable across phases without cross-core TLB shootdowns.
+        if committed >= PHASE_TRIM_THRESHOLD || blaze_mem::chunks::cached().warm >= CHUNK_TRIM_THRESHOLD {
+            blaze_mem::frame::ask_spare_cool();
+            blaze_mem::frame::cool_spare();
+            blaze_mem::frame::cool_span_pool();
             let _ = blaze_mem::chunks::trim();
             let _ = blaze_mem::blocks::trim_all();
         }
@@ -235,12 +262,19 @@ impl PhaseMem<'_> {
 }
 
 impl Drop for PhaseMem<'_> {
-    /// Ended, stopped or unwound: counted on the request; the root, dropped after this, unmaps
-    /// every page it committed.
+    /// Ended, stopped or unwound: counted on the request; the root is reset (every committed page
+    /// returned to the kernel) and returned to the request's single spare slot for reuse.
     fn drop(&mut self) {
-        let committed = u64::try_from(self.root.used().committed).unwrap_or(u64::MAX);
-        self.request.dropped.fetch_add(1, Ordering::AcqRel);
-        self.request.returned.fetch_add(committed, Ordering::AcqRel);
+        if let Some(mut root) = self.root.take() {
+            let committed = u64::try_from(root.reset()).unwrap_or(u64::MAX);
+            self.request.dropped.fetch_add(1, Ordering::AcqRel);
+            self.request.returned.fetch_add(committed, Ordering::AcqRel);
+            if let Ok(mut slot) = self.request.phase_spare.try_borrow_mut()
+                && slot.is_none()
+            {
+                *slot = Some(root);
+            }
+        }
     }
 }
 
