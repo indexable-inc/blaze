@@ -133,10 +133,14 @@ fn names_param(text: &str, params: &[(Name, u32)]) -> bool {
 /// (a parameter named; `Self` in a trait, where it is a parameter; a `Self` with generic
 /// arguments, whose identity is not one key), which the caller refuses by name.
 pub(super) fn ground_self(tys: PTys<'_>, env: &Env<'_>, text: &str) -> Option<(PTy, PNode)> {
-    if !super::anon::mentions(text, &[]) || names_param(text, env.params) {
+    ground_self_in(tys, env.self_, env.params, text)
+}
+
+pub(super) fn ground_self_in(tys: PTys<'_>, self_: SelfTy, params: &[(Name, u32)], text: &str) -> Option<(PTy, PNode)> {
+    if !super::anon::mentions(text, &[]) || names_param(text, params) {
         return None;
     }
-    let SelfTy::Ty(t, _) = env.self_ else { return None };
+    let SelfTy::Ty(t, _) = self_ else { return None };
     let node = tys.get(t).copied()?;
     match node {
         PNode::Bool | PNode::Char | PNode::Int(_) | PNode::Uint(_) | PNode::Float(_) | PNode::Str => Some((t, node)),

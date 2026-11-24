@@ -1088,28 +1088,130 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         intern(tys, PNode::ConstValue { ty, bits })
     }
 
-    /// The declared type of the const parameter that argument `index` of the path `texts`
-    /// fills (its item's head, [`Heads::const_params`]; a trait's arguments follow `Self`).
-    /// `texts` (a prefix of the written path `p` of `v`, or the whole trait path of a qualified
-    /// path) resolves where the path's first token's mark says, exactly as [`Builder::path_ty`]
-    /// and [`Builder::trait_at`] resolve that same path ([`super::item_site::resolve_written`]):
-    /// never again at `env.module` alone. alloy-rlp's `impl_max_encoded_len!` writes
-    /// `unsafe impl $crate::MaxEncodedLen<{ $len }> for $t {}`, whose `$crate` an expansion's
-    /// text spells `crate` with alloy-rlp's mark; resolved at alloy-primitives' module, the
-    /// parameter's type was `NotFound` and the impl a candidate "unread as written" (tempo
-    /// census r16, `check gap: UnreadImpl`, 41 of 53).
-    #[expect(clippy::too_many_arguments, reason = "one path's resolution: the path, its view and the argument's place")]
-    fn const_want(&self, env: &Env<'_>, v: &View<'_>, p: PathIdx, abs: bool, texts: &[&str], index: u32, r: Range) -> Result<PTy, Why> {
-        let found = self.resolve_at(env, v, p, abs, texts, Ns::Type, r)?;
-        if found.consumed as usize != texts.len() {
-            return Err(Why::Unsupported("a const argument on an associated item's path", r));
+    /// The declared type of the const parameter that argument `index` of `target` fills:
+    /// - a regular item path (`Foo<A>`, `Trait<A>`): its head's [`Heads::const_params`] (a
+    ///   trait's arguments follow `Self`), resolved where the path's first token's mark says
+    ///   ([`super::item_site::resolve_written`]);
+    /// - a generic associated type on a type parameter (`F::Config<A>`, `<F>::Config<A>`), on
+    ///   `Self` (`Self::Config<A>`, `<Self>::Config<A>`), or on a qualified trait path
+    ///   (`<T as Tr>::Config<A>`): the declaring trait's [`Heads::assoc_const_params`]
+    ///   ([`Builder::gat_const_want`]).
+    #[expect(clippy::too_many_arguments, reason = "one const parameter lookup: the table, env, view, target and site")]
+    fn const_want(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, target: ConstTarget<'_>, index: u32, r: Range) -> Result<PTy, Why> {
+        match target {
+            ConstTarget::Path { p, abs, texts } => {
+                let found = self.resolve_at(env, v, p, abs, texts, Ns::Type, r)?;
+                if usize::try_from(found.consumed).ok() != Some(texts.len()) {
+                    return Err(Why::Unsupported("a const argument on an associated item's path", r));
+                }
+                let at = if found.kind == Kind::Trait { index + 1 } else { index };
+                let consts = self.heads.const_params(found.key).ok_or(Why::Need(found.key))?;
+                match consts.iter().find(|(i, _)| *i == at) {
+                    Some(&(_, t)) => Ok(t),
+                    None => Err(program(format!("argument {} of `{}` is a constant; that parameter is not a const parameter", index + 1, texts.join("::")), r)),
+                }
+            }
+            ConstTarget::ParamAssoc { param, name, shown } => {
+                let (bounds, done) = match env.bounds {
+                    Bounds::Building(b) => (b, false),
+                    Bounds::Done(b) => (b, true),
+                };
+                let mut found: blaze_own::AVec<'_, (LibKey, List)> = blaze_own::AVec::new_in(tys.alloc());
+                for b in bounds.iter().filter(|b| b.param == param) {
+                    if let Some(owner) = self.assoc_owner(tys, b.trait_, b.args, name, r, shown)? {
+                        if !found.iter().any(|x| *x == owner) {
+                            found.push(owner);
+                        }
+                    }
+                }
+                match found.as_slice() {
+                    &[(owner, _)] => self.gat_const_want(owner, name, index, r, shown),
+                    [] if !done => Err(Why::Unsupported("`T::X` in a bound written before the bound of `T` that declares `X`", r)),
+                    [] => Err(Why::AssocNotFound(shown.into(), r)),
+                    many => {
+                        let traits = many.iter().map(|&(t, _)| t).collect();
+                        Err(Why::AssocAmbiguous(shown.into(), traits, r))
+                    }
+                }
+            }
+            ConstTarget::SelfAssoc { name, shown } => match env.self_ {
+                SelfTy::Trait(tr) => {
+                    let (g, _) = self.heads.trait_head(tr).ok_or(Why::Need(tr))?;
+                    let mut args: blaze_own::AVec<'_, PTy> = blaze_own::AVec::with_capacity_in(usize::try_from(g).unwrap_or(0), tys.alloc());
+                    for i in 0..g {
+                        args.push(intern(tys, PNode::Param(i))?);
+                    }
+                    let args = intern_list(tys, &args)?;
+                    let mut found: blaze_own::AVec<'_, (LibKey, List)> = blaze_own::AVec::new_in(tys.alloc());
+                    if let Some(owner) = self.assoc_owner(tys, tr, args, name, r, shown)? {
+                        found.push(owner);
+                    }
+                    let (Bounds::Building(bounds) | Bounds::Done(bounds)) = env.bounds;
+                    for b in bounds.iter().filter(|b| b.param == 0) {
+                        if let Some(owner) = self.assoc_owner(tys, b.trait_, b.args, name, r, shown)? {
+                            if !found.iter().any(|x| *x == owner) {
+                                found.push(owner);
+                            }
+                        }
+                    }
+                    match found.as_slice() {
+                        &[(owner, _)] => self.gat_const_want(owner, name, index, r, shown),
+                        [] => Err(Why::Program(blaze_own::format_in!(tys.alloc(), "`{shown}` names no associated type of the trait, its supertraits or a bound on `Self` in scope").as_str().into(), r)),
+                        many => {
+                            let traits = many.iter().map(|&(t, _)| t).collect();
+                            Err(Why::AssocAmbiguous(shown.into(), traits, r))
+                        }
+                    }
+                }
+                SelfTy::Ty(_, Some((tr, args))) => match self.assoc_owner(tys, tr, args, name, r, shown)? {
+                    Some((owner, _)) => self.gat_const_want(owner, name, index, r, shown),
+                    None => Err(Why::Program(blaze_own::format_in!(tys.alloc(), "`{shown}` names no associated type of the trait or its supertraits").as_str().into(), r)),
+                },
+                SelfTy::Ty(_, None) => Err(Why::Unsupported("type or const arguments on an inherent associated type", r)),
+                SelfTy::None => Err(Why::Unsupported(SELF_HERE, r)),
+            },
+            ConstTarget::TraitAssoc { trait_path, name, shown } => {
+                let (tabs, ttexts, _, tr_r) = path_texts(v, trait_path)?;
+                let Bounded::Trait(tr) = self.bound_target(env, v, trait_path, tabs, &ttexts, tr_r)? else {
+                    return Err(Why::Program(blaze_own::format_in!(tys.alloc(), "`{shown}`: trait alias stands for bounds, not one trait").as_str().into(), tr_r));
+                };
+                let Some(owner) = self.assoc_owner_key(tr, name, r, shown, tys.alloc())? else {
+                    return Err(Why::Program(blaze_own::format_in!(tys.alloc(), "`{shown}` names no associated type of the trait").as_str().into(), r));
+                };
+                self.gat_const_want(owner, name, index, r, shown)
+            }
         }
-        let at = if found.kind == Kind::Trait { index + 1 } else { index };
-        let consts = self.heads.const_params(found.key).ok_or(Why::Need(found.key))?;
-        match consts.iter().find(|(i, _)| *i == at) {
-            Some(&(_, t)) => Ok(t),
-            None => Err(program(format!("argument {} of `{}` is a constant; that parameter is not a const parameter", index + 1, texts.join("::")), r)),
+    }
+
+    /// The trait declaring associated type `name` among `tr` and its supertraits (by key only,
+    /// without substituting arguments): used by [`Builder::const_want`] for `<T as Tr>::X<..>`.
+    fn assoc_owner_key(&self, tr: LibKey, name: Name, r: Range, shown: &str, alloc: Alloc<'_>) -> Result<Option<LibKey>, Why> {
+        const MOST_SUPERS: usize = 256;
+        let mut todo: blaze_own::AVec<'_, LibKey> = blaze_own::AVec::new_in(alloc);
+        todo.push(tr);
+        let mut found: Option<LibKey> = None;
+        let mut seen: blaze_own::AVec<'_, LibKey> = blaze_own::AVec::new_in(alloc);
+        for _ in 0..MOST_SUPERS {
+            let Some(t) = todo.pop() else { break };
+            if seen.iter().any(|x| *x == t) {
+                continue;
+            }
+            seen.push(t);
+            if self.heads.trait_has_assoc(t, name).ok_or(Why::Need(t))? {
+                match found {
+                    Some(prev) if prev != t => return Err(Why::Program(blaze_own::format_in!(alloc, "`{shown}` is ambiguous: two supertraits declare it").as_str().into(), r)),
+                    _ => found = Some(t),
+                }
+                continue;
+            }
+            for &(st, _) in self.heads.trait_supers(t).ok_or(Why::Need(t))? {
+                todo.push(st);
+            }
         }
+        if !todo.is_empty() {
+            return Err(Why::Unsupported("a supertrait tree past 256 traits", r));
+        }
+        Ok(found)
     }
 
     /// A path's generic arguments in written order: each type argument from `kids` (as
@@ -1118,6 +1220,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
     /// the type namespace, else a constant; the Reference, "Generic parameters") made here.
     pub(super) fn path_args(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, p: PathIdx, kids: &[PTy]) -> Result<SmallPath<PTy, 8>, Why> {
         let r = place(v, v.path_range(p))?;
+        let shown = v.text_at(v.path_range(p)?)?;
         let mut out: SmallPath<PTy, 8> = SmallPath::new(PTy(0));
         let mut next = kids.iter().copied();
         let (abs, texts, segs, _) = path_texts_of(v, p, true)?;
@@ -1125,9 +1228,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                           out: &mut SmallPath<PTy, 8>,
                           next: &mut core::iter::Copied<core::slice::Iter<'_, PTy>>,
                           s: lf::Segment,
-                          spath: PathIdx,
-                          sabs: bool,
-                          stexts: &[&str]|
+                          target: ConstTarget<'_>|
          -> Result<(), Why> {
             if !s.has_args {
                 return Ok(());
@@ -1175,7 +1276,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                                 // constant's are (`const_term`). A scalar parameter only: a
                                 // fieldless enum's value is its variant under the enum's key
                                 // (const_enum.rs), which a body's constant's bits are not.
-                                let ty = self.const_want(env, v, spath, sabs, stexts, index, ar)?;
+                                let ty = self.const_want(tys, env, v, target, index, ar)?;
                                 if !matches!(tys.view().get(ty), Some(PNode::Bool | PNode::Char | PNode::Int(_) | PNode::Uint(_) | PNode::Infer | PNode::Error)) {
                                     return Err(Why::Unsupported("a const argument naming a `const` the body declares, for a parameter whose type is no integer, `bool` or `char`", ar));
                                 }
@@ -1195,7 +1296,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                                 if param.is_none() && name != "true" && name != "false" {
                                     at_mark(Ns::Value)?;
                                 }
-                                let want = |_: &mut PortableTys<'_>| self.const_want(env, v, spath, sabs, stexts, index, ar);
+                                let want = |tys: &mut PortableTys<'_>| self.const_want(tys, env, v, target, index, ar);
                                 self.const_term(tys, env, name, ar, &want)?
                             }
                         }
@@ -1204,7 +1305,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                         let at = v.const_range(c)?;
                         let ar = v.site(at)?;
                         let text = v.text_at(at)?;
-                        let want = |_: &mut PortableTys<'_>| self.const_want(env, v, spath, sabs, stexts, index, ar);
+                        let want = |tys: &mut PortableTys<'_>| self.const_want(tys, env, v, target, index, ar);
                         self.const_term(tys, env, text, ar, &want)?
                     }
                     _ => continue,
@@ -1222,13 +1323,65 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                     let lf::TypeRef::Path(tp) = v.ty(tr)? else { return Err(program(format!("a trait that is no path"), r)) };
                     let (tabs, ttexts, tsegs, _) = path_texts(v, tp)?;
                     for &ts in tsegs.iter() {
-                        handle_seg(tys, &mut out, &mut next, ts, tp, tabs, &ttexts)?;
+                        handle_seg(tys, &mut out, &mut next, ts, ConstTarget::Path { p: tp, abs: tabs, texts: &ttexts })?;
                     }
                 }
             } else if s.has_args
                 && let Some(upto) = texts.get(..=k)
             {
-                handle_seg(tys, &mut out, &mut next, s, p, abs, upto)?;
+                let first_seg = segs.first().copied();
+                let target = if k == 1
+                    && let Some(first) = first_seg
+                    && first.kind == lf::SegKind::Anchor
+                {
+                    if let Some(n) = s.name {
+                        let name = Name(v.name(n)?);
+                        if let Some(tr) = first.trait_
+                            && let lf::TypeRef::Path(tp) = v.ty(tr)?
+                        {
+                            ConstTarget::TraitAssoc { trait_path: tp, name, shown }
+                        } else if first.trait_.is_none() {
+                            let is_self = match first.ty {
+                                Some(written) => match v.ty(written)? {
+                                    lf::TypeRef::Path(sp) => {
+                                        let (sabs, stexts, _, _) = path_texts(v, sp)?;
+                                        !sabs && stexts.as_slice() == ["Self"]
+                                    }
+                                    _ => false,
+                                },
+                                None => false,
+                            };
+                            if is_self {
+                                ConstTarget::SelfAssoc { name, shown }
+                            } else if let Some(PNode::Param(param)) = out.first().and_then(|&t| tys.view().get(t).copied()) {
+                                ConstTarget::ParamAssoc { param, name, shown }
+                            } else {
+                                ConstTarget::Path { p, abs, texts: upto }
+                            }
+                        } else {
+                            ConstTarget::Path { p, abs, texts: upto }
+                        }
+                    } else {
+                        ConstTarget::Path { p, abs, texts: upto }
+                    }
+                } else if k == 1
+                    && !abs
+                    && let [first_text, second_text] = texts.as_slice()
+                    && *first_text == "Self"
+                {
+                    ConstTarget::SelfAssoc { name: Name::of(second_text), shown }
+                } else if k == 1
+                    && !abs
+                    && let [first_text, second_text] = texts.as_slice()
+                    && first_seg.is_some_and(|first| !first.has_args)
+                    && let Some(&(_, param)) = env.params.iter().find(|(n, _)| *n == Name::of(first_text))
+                    && !env.consts.iter().any(|(c, _)| *c == param)
+                {
+                    ConstTarget::ParamAssoc { param, name: Name::of(second_text), shown }
+                } else {
+                    ConstTarget::Path { p, abs, texts: upto }
+                };
+                handle_seg(tys, &mut out, &mut next, s, target)?;
             }
         }
         if next.next().is_some() {
@@ -1907,6 +2060,20 @@ fn mentions_param0(tys: tc::PTys<'_>, root: PTy, alloc: Alloc<'_>) -> bool {
         }
     }
     false
+}
+
+/// What item or generic associated type a segment's const arguments belong to
+/// ([`Builder::const_want`]).
+#[derive(Clone, Copy)]
+enum ConstTarget<'a> {
+    /// A regular path segment (`Foo<A>`, `Trait<A>`): resolve `texts` in `Ns::Type`.
+    Path { p: PathIdx, abs: bool, texts: &'a [&'a str] },
+    /// A generic associated type on a type parameter (`F::Config<A>` or `<F>::Config<A>`).
+    ParamAssoc { param: u32, name: Name, shown: &'a str },
+    /// A generic associated type on `Self` (`Self::Config<A>` or `<Self>::Config<A>`).
+    SelfAssoc { name: Name, shown: &'a str },
+    /// A generic associated type on a qualified trait path (`<T as Tr>::Config<A>`).
+    TraitAssoc { trait_path: PathIdx, name: Name, shown: &'a str },
 }
 
 /// What a bound's path names ([`Builder::bound_target`]).

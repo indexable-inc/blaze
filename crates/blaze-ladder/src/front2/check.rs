@@ -317,14 +317,22 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
     let mut holes = RoundHoles::new();
     let mut stalled_rounds = 0u32;
     let mut rounds_run = 0u32;
+    let mut patched: Option<super::body_const_gaps::PatchedConsts> = None;
     for round in 0..MOST_PROGRESS_ROUNDS {
         rounds_run = round + 1;
         r.store.hidden.set_leaking(&leaks);
         // Facts made on the spot this round (world_items.rs `BodyWorld::store_want`; under the
         // one ask, what it made: `Store::imports`).
         let imported_at = r.store.imports();
-        let tys = body.tys.view(&r.store.tys).map_err(|error| CheckFail::Check { owner, error })?;
-        let view: BodyView<'_> = body.typeck.view(tys);
+        let tys = match &patched {
+            Some(p) => p.tys.view(&r.store.tys),
+            None => body.tys.view(&r.store.tys),
+        }
+        .map_err(|error| CheckFail::Check { owner, error })?;
+        let mut view: BodyView<'_> = body.typeck.view(tys);
+        if let Some(p) = &patched {
+            view.type_lists = &p.type_lists;
+        }
         let trace_ask = r.store.trace;
         let world = world_at(r, scope);
         // Boxed, made in a frame of its own: this frame stays on the stack under the whole
@@ -379,7 +387,12 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
         if trace_ask.is_some() {
             r.store.traced = cx.take_trace();
         }
-        gaps.extend(body.typeck.const_gaps.iter().map(|&gap| Gap::BodyConst { owner, gap }));
+        for (idx, &gap) in body.typeck.const_gaps.iter().enumerate() {
+            if patched.as_ref().is_some_and(|p| p.resolved.get(idx).copied().unwrap_or(false)) {
+                continue;
+            }
+            gaps.push(Gap::BodyConst { owner, gap });
+        }
         let round_gaps = !gaps.is_empty();
         if round_gaps {
             merge_gaps(&mut all_gaps, gaps);
@@ -391,8 +404,15 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
             // one of the fn's own signature (its head's, `Store::type_misses`): a body whose
             // head holds the error type is never a clean check, even where the walk read none.
             Outcome::Done(done) if !round_gaps && !allow_diags && (!done.diags.is_empty() || !body.type_misses.is_empty() || r.store.type_misses.contains_key(&owner)) => {
-                let tys = body.tys.view(&r.store.tys).map_err(|error| CheckFail::Check { owner, error })?;
-                let view: BodyView<'_> = body.typeck.view(tys);
+                let tys = match &patched {
+                    Some(p) => p.tys.view(&r.store.tys),
+                    None => body.tys.view(&r.store.tys),
+                }
+                .map_err(|error| CheckFail::Check { owner, error })?;
+                let mut view: BodyView<'_> = body.typeck.view(tys);
+                if let Some(p) = &patched {
+                    view.type_lists = &p.type_lists;
+                }
                 return Err(collect_done_diags(r, body, scope, &view, owner, done, asked.as_deref_mut(), alloc));
             }
             Outcome::Done(done) if !round_gaps => {
@@ -409,6 +429,13 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
                 return Ok(done);
             }
             Outcome::Done(done) => {
+                // A finished check with unresolved BodyConst argument gaps whose callee and
+                // declared const parameter type are now known: evaluate and re-check.
+                if super::body_const_gaps::resolve(r, body, &done, &mut patched, alloc)? {
+                    all_gaps.clear();
+                    stalled_rounds = 0;
+                    continue;
+                }
                 if !r.store.inferring_output_stack.is_empty() {
                     for g in all_gaps.iter() {
                         if let Gap::InferredOutputCycle { owner: a, callee: b } = *g {
@@ -2084,6 +2111,11 @@ const MOST_CONSTS: u32 = 1024;
 /// Builds a [`CheckFail::Const`] carrying [`ConstFail::Nested`] for `key` on `owner`.
 pub(super) fn const_nested_fail<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, owner: ItemKey, key: LibKey) -> CheckFail {
     MakeFail::Const(key, ConstFail::Nested { item: checker_of(key), shown: lib_shown(r, key) }).at(r, owner)
+}
+
+/// Builds a [`CheckFail::Const`] carrying `error` for `key` on `owner`.
+pub(super) fn const_eval_fail<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, owner: ItemKey, key: LibKey, error: ConstFail) -> CheckFail {
+    MakeFail::Const(key, error).at(r, owner)
 }
 
 /// [`make`] for front2/const_qpath.rs (the trait's members and the impl candidates a

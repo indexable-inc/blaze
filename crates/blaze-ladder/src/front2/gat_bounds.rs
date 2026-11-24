@@ -111,12 +111,12 @@ impl<'b, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> {
     /// `name` of `owner` ([`Heads::assoc_const_params`]). Not on record while the trait's
     /// members are not made: their need. Not on record after they are (its head was refused, or
     /// the bound is inside the trait's own members): refused by name, never guessed.
-    fn gat_const_want(&self, owner: LibKey, name: Name, index: u32, r: Range, shown: &str) -> Result<PTy, Why> {
+    pub(super) fn gat_const_want(&self, owner: LibKey, name: Name, index: u32, r: Range, shown: &str) -> Result<PTy, Why> {
         match self.heads.assoc_const_params(owner, name) {
             Some(consts) => match consts.iter().find(|(i, _)| *i == index) {
                 Some(&(_, t)) => Ok(t),
                 None => Err(Why::Program(
-                    format!("`{shown}`: argument {} of an associated type bound is a constant; that parameter of the associated type is not a const parameter", index + 1).into_boxed_str(),
+                    format!("`{shown}`: argument {} of a generic associated type is a constant; that parameter of the associated type is not a const parameter", index + 1).into_boxed_str(),
                     r,
                 )),
             },
