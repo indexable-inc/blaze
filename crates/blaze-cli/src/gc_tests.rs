@@ -379,7 +379,7 @@ fn gc_sweeps_native_work_caches_and_superseded_toolchain_packs_preserving_active
     let active_pack = [0xabu8; 32];
     let stale_pack = [0xcdu8; 32];
     let heap = blaze_own::testing::heap();
-    let krate = blaze_toolchain::CrateIn {
+    let krate = blaze_toolchain::record::CrateIn {
         name: "core",
         version: "0.0.0",
         edition: "2024",
