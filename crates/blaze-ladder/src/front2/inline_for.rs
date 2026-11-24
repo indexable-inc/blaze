@@ -623,7 +623,7 @@ impl EnumRenderError {
             EnumRenderError::SliceTyArg => "could not slice type argument for variants::<E>() expansion",
             EnumRenderError::SliceBody => "could not slice body source text for enum inline for expansion",
             EnumRenderError::VariantsValueNeedsUnitEnum => {
-                "variants::<E>() value binding requires a fieldless enum (use a metadata-only pattern like `{ name, index }` or `(name, _, _)` for enums with fields)"
+                "variants::<E>() value binding requires a fieldless enum (use a metadata-only pattern like { name, index } or (name, _, _) for enums with fields)"
             }
         }
     }

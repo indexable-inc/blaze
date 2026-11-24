@@ -138,7 +138,7 @@ fn a_clean_run_prints_only_its_program() {
         let stdout = expected.strip_prefix(b"status 0\nstdout\n".as_slice()).expect("expected: status 0, then stdout");
         let mut cmd = blaze_cmd(&dir, &home);
         cmd.arg("run");
-        let output = run_with_deadline(cmd, rung, secs(60));
+        let output = run_with_deadline(cmd, rung, secs(120));
         assert_eq!(output.status.code(), Some(0), "{rung}: {}", utf8(&output.stderr));
         assert_eq!(utf8(&output.stdout), utf8(stdout), "{rung}: standard output");
         assert_eq!(utf8(&output.stderr), "", "{rung}: a clean run says nothing");
@@ -166,7 +166,7 @@ fn a_landing_record_with_no_routine_is_refused_naming_its_fn() {
     copy_file(&from.join("src/main.rs"), &dir.join("src/main.rs"));
     let mut cmd = blaze_cmd(&dir, &home);
     cmd.arg("run");
-    let output = run_with_deadline(cmd, "no-routine", secs(60));
+    let output = run_with_deadline(cmd, "no-routine", secs(120));
     let said = utf8(&output.stderr);
     assert_eq!(output.status.code(), Some(125), "{said}");
     assert!(said.contains("::main`") && said.contains("eh_personality"), "the refusal does not name `main` and the missing routine: {said}");

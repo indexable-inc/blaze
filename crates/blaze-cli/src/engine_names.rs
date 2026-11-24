@@ -1815,18 +1815,18 @@ impl Job<'_> {
                 Some(ExportRef::InSnapshot { head, offset, len, .. }) => {
                     let dep_krate = self.crates.get(dep.index).map_or("", |c| c.input.name);
                     let Some(snap) = self.uncommitted_snap.as_ref() else {
-                        return Ok(refuse("a dependency's record", blaze_own::format_in!(alloc, "crate `{}`: missing snapshot for uncommitted dependency `{dep_krate}`", input.name)));
+                        return Ok(refuse("a dependency's record", blaze_own::format_in!(alloc, "crate {}: missing snapshot for uncommitted dependency {dep_krate}", input.name)));
                     };
                     let record = match snap.get(dep.input.at) {
                         Ok(Some(bytes)) => bytes,
-                        Ok(None) => return Ok(refuse("a dependency's record", blaze_own::format_in!(alloc, "crate `{}`: uncommitted dependency `{dep_krate}` absent from snapshot", input.name))),
-                        Err(why) => return Ok(refuse("a dependency's record", blaze_own::format_in!(alloc, "crate `{}`: uncommitted dependency `{dep_krate}` snapshot error: {why}", input.name))),
+                        Ok(None) => return Ok(refuse("a dependency's record", blaze_own::format_in!(alloc, "crate {}: uncommitted dependency {dep_krate} absent from snapshot", input.name))),
+                        Err(why) => return Ok(refuse("a dependency's record", blaze_own::format_in!(alloc, "crate {}: uncommitted dependency {dep_krate} snapshot error: {why}", input.name))),
                     };
                     let Some(slice) = offset.checked_add(len).and_then(|end| record.get(offset..end)) else {
-                        return Ok(refuse("a dependency's record", blaze_own::format_in!(alloc, "crate `{}`: uncommitted dependency `{dep_krate}` exports slice out of bounds", input.name)));
+                        return Ok(refuse("a dependency's record", blaze_own::format_in!(alloc, "crate {}: uncommitted dependency {dep_krate} exports slice out of bounds", input.name)));
                     };
                     let Some(proof) = head.rebind(slice) else {
-                        return Ok(refuse("a dependency's record", blaze_own::format_in!(alloc, "crate `{}`: uncommitted dependency `{dep_krate}` exports identity mismatch", input.name)));
+                        return Ok(refuse("a dependency's record", blaze_own::format_in!(alloc, "crate {}: uncommitted dependency {dep_krate} exports identity mismatch", input.name)));
                     };
                     proof
                 }

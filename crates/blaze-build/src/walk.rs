@@ -3655,18 +3655,23 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             Task::Let(p, init) => {
                 let v = self.pop()?;
                 // The same answer `stmt` had: `v` is the initializer's place (walk/matches/ref_bind.rs).
-                let borrows = match init {
+                let borrows_place = match init {
                     Some(e) => self.let_borrows_place(p, e)?,
                     None => false,
                 };
+                let borrows_value = !borrows_place && init.is_some() && self.pat_has_ref_bind(p)?;
                 let fresh = match (init, v, self.pat(p)?) {
-                    _ if borrows => None,
+                    _ if borrows_place || borrows_value => None,
                     (Some(e), V::Place(at, off), Pat::Bind { .. }) if self.live && self.is_fresh(e)? => Some((at, off)),
                     _ => None,
                 };
                 match fresh {
                     Some(at) => self.bind_at(p, at)?,
-                    None if borrows => self.bind_let_place(p, v)?,
+                    None if borrows_place => self.bind_let_place(p, v)?,
+                    None if borrows_value => {
+                        let e = init.ok_or(malformed("a `let` value ref binding without an initializer"))?;
+                        self.bind_let_value_ref(p, e, v)?;
+                    }
                     // The initializer's own type: a pattern that peels a reference is recorded
                     // at the peeled one (`bind_value_of`).
                     None => match init {

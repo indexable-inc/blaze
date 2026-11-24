@@ -174,6 +174,35 @@ blaze-native.opt-level = 2
 blaze-manifest.opt-level = 2
 blaze-unit-graph.opt-level = 2
 blaze-build-script.opt-level = 2
+# Launcher runtime and wire (keeps `on_signal` stack frames small on Linux AArch64's 16 KiB
+# SIGSTKSZ alternate stack), CAD mesh/field/math/sim (prevents `simplify_plants_are_caught`
+# 600s timeouts in dev), and hot base crates underneath `blaze-scope`/`blaze-ladder`/`front2_*`
+# (prevents 600s timeouts in `front2_*` integration tests on Linux ARM64 CI).
+blaze-launch.opt-level = 2
+blaze-launch-rt.opt-level = 2
+blaze-launcher.opt-level = 2
+blaze-cad-mesh.opt-level = 2
+blaze-cad-field.opt-level = 2
+blaze-math.opt-level = 2
+blaze-sim.opt-level = 2
+blaze-columns.opt-level = 2
+blaze-swiss.opt-level = 2
+blaze-kit.opt-level = 2
+blaze-sort.opt-level = 2
+blaze-cond.opt-level = 2
+blaze-format-core.opt-level = 2
+blaze-id.opt-level = 2
+blaze-int.opt-level = 2
+blaze-core.opt-level = 2
+blaze-tier.opt-level = 2
+blaze-run.opt-level = 2
+blaze-ask.opt-level = 2
+blaze-cbor.opt-level = 2
+blaze-unicode.opt-level = 2
+blaze-radix.opt-level = 2
+blaze-hashcons.opt-level = 2
+blaze-bitflags.opt-level = 2
+blaze-sys.opt-level = 2
 
 [profile.release]
 # Set this to 1 or 2 to get more useful backtraces in debugger.
