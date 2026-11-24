@@ -69,6 +69,8 @@ pub enum ExportCliError {
     NotChecked { function: ItemKey, symbol: [u8; 32], why: NotRunnable },
     /// Stepping an instance/static/TLS row in the reachability walk failed.
     Walk { symbol: [u8; 32], shown: AString<'static> },
+    /// Whole-program cross-function LIR inlining and LTO emission failed.
+    Lto { shown: AString<'static> },
     /// Making a special record (TLS getter or ender) failed.
     Special { what: &'static str, shown: AString<'static> },
     /// Reading a code or datum entry from the store failed.
@@ -122,6 +124,7 @@ impl fmt::Display for ExportCliError {
                 Hex(symbol)
             ),
             ExportCliError::Walk { symbol, shown } => write!(f, "blaze export: compiling symbol {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
+            ExportCliError::Lto { shown } => write!(f, "blaze export: {} (engine_export.rs)", shown.as_str()),
             ExportCliError::Special { what, shown } => write!(f, "blaze export: building {what}: {} (engine_export.rs)", shown.as_str()),
             ExportCliError::Store { symbol, shown } => write!(f, "blaze export: reading code entry {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
             ExportCliError::MissingEntry { symbol } => write!(f, "blaze export: code entry {} missing from store after step (engine_export.rs)", Hex(symbol)),
@@ -239,12 +242,21 @@ struct ExportSummary<'f> {
     cached: usize,
     unkeyed: usize,
     stubs: usize,
+    lto_bodies: usize,
+    lto_inlined: usize,
 }
 
 /// How one walked row's entry bytes are held until assembly.
 enum RowOutcome<'a> {
     Keyed(CodeKey),
     Unkeyed(AVec<'a, u8>),
+    /// Whole-program cross-function LTO-optimized `CodeRecord` emitted for the host CPU
+    /// (`Machine::SME2 | Machine::CSSC | Machine::SHA3`), kept ephemeral in `export_bump` so
+    /// host-specific code never enters portable `HomeCodeStore` (Rule 25).
+    Lto {
+        record: AVec<'a, u8>,
+        vtable_data: AVec<'a, (CodeSymbol, AVec<'a, u8>)>,
+    },
     /// A non-root library/cold function that `blaze-build` cannot lower to LIR yet: replaced by a
     /// deterministic trap stub (`write(2, msg, len); _exit(125); brk #0`) that reports the exact
     /// refusal if ever called at runtime (same contract as `blaze-ladder/src/run.rs` `Stubs`).
@@ -573,11 +585,11 @@ fn export_program<'f>(
     let ids_ns = phases.since(began_ids);
     let ids_line = ids.line(&asked, ids_ns);
 
-    // `blaze export` produces a release native executable: disable dev overflow checks so
-    // hot arithmetic loops compile without per-add/sub panic branches (matching release builds)
-    // and small helpers become pure 0-call leaves eligible for bottom-up LTO inlining.
-    let overflow = blaze_ladder::run::OverflowChecks::Off;
-    let panic_profile = program::dev_profile_panic(cx, root, frame)?;
+    // `blaze export` produces a release native executable: use `[profile.release]` overflow and
+    // panic settings (`OverflowChecks::Off` by default) so hot arithmetic loops compile without
+    // per-add/sub panic branches and small helpers become pure leaves for bottom-up LTO inlining.
+    let overflow = program::release_overflow(cx, root, frame)?;
+    let panic_profile = program::release_profile_panic(cx, root, frame)?;
     let panic_ladder = blaze_ladder::panic_strategy::of_profile(panic_profile);
     let export_panic = match panic_profile {
         blaze_manifest::layout::panic::ProfilePanic::Unwind => Panic::Unwind,
@@ -679,6 +691,88 @@ fn export_program<'f>(
             }
         }
     }
+
+    // Whole-program demand-driven cross-function LIR inlining + host-ISA SOTA emission over
+    // workspace functions and their small inlineable callees (kept ephemeral in `export_bump`,
+    // never written into portable `HomeCodeStore`).
+    let mut lto_seeds: AVec<'_, usize> = Vec::new_in(alloc);
+    for (row, outcome) in outcomes.iter().enumerate() {
+        if walk.kind(row) == RowKind::Instance
+            && !matches!(outcome, RowOutcome::UnbuiltStub(_))
+            && ids.grain(walk.tabled(row)) == Some(crate::run_ids::Grain::Workspace)
+        {
+            lto_seeds.push(row);
+        }
+    }
+    let lto_opts = blaze_ladder::run::make_one::export_lto::ExportLtoOpts::for_export(isa);
+    let lto_out = blaze_ladder::run::make_one::export_lto::optimize_export_workspace(
+        &walk,
+        lto_seeds.as_slice(),
+        |row| walk.kind(row) == RowKind::Instance && !matches!(outcomes.get(row), Some(RowOutcome::UnbuiltStub(_))),
+        |tabled| ids.runnable(tabled).ok(),
+        &mut maker,
+        lto_opts,
+        alloc,
+    )
+    .map_err(|why| {
+        box_err(
+            ExportCliError::Lto { shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+            heap,
+        )
+    })?;
+    let lto_bodies = lto_out.bodies.len();
+    let lto_inlined = lto_out.total_inlined;
+    let mut extra_roots: AVec<'_, (ItemKey, AVec<'_, u8>)> = Vec::new_in(alloc);
+    for body in lto_out.bodies {
+        if let Some(slot) = outcomes.get_mut(body.row) {
+            *slot = RowOutcome::Lto {
+                record: body.record,
+                vtable_data: body.vtable_data,
+            };
+        }
+        for decl in body.extra_declared {
+            extra_roots.push(decl);
+        }
+    }
+    for (tabled, name_bytes) in extra_roots {
+        walk.root::<RunError>((tabled, name_bytes.as_slice()), MOST_WALKED).map_err(|why| {
+            box_err(
+                ExportCliError::Walk { symbol: roots.entry.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+                heap,
+            )
+        })?;
+    }
+    while next_row < walk.len() {
+        let row = next_row;
+        next_row += 1;
+        let tabled = walk.tabled(row);
+        let symbol = walk.symbol(row);
+        let proof = ids.runnable(tabled).map_err(|why| box_err(ExportCliError::NotChecked { function: tabled, symbol: symbol.0, why }, heap))?;
+        match walk.one(row, &ids, &mut codes, &builder, &builder.producer, &mut maker, &proof, &body_ids::EntryForm, MOST_WALKED, &mut scratch) {
+            Ok(one) => match one.stepped {
+                Stepped::Found(key) => {
+                    cached += 1;
+                    outcomes.push(RowOutcome::Keyed(key));
+                }
+                Stepped::Made(key) => {
+                    compiled += 1;
+                    outcomes.push(RowOutcome::Keyed(key));
+                }
+                Stepped::Unkeyed(_) => {
+                    unkeyed += 1;
+                    let mut copied: AVec<'_, u8> = Vec::with_capacity_in(scratch.made().len(), alloc);
+                    copied.extend_from_slice(scratch.made());
+                    outcomes.push(RowOutcome::Unkeyed(copied));
+                }
+            },
+            Err(why) => {
+                return Err(box_err(
+                    ExportCliError::Walk { symbol: symbol.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+                    heap,
+                ));
+            }
+        }
+    }
     end_procs(cx, &maker_procs, standing.err, "export")?;
 
     let ids_line = crate::run_ids::IdsLine { read: asked.bodies(), folded: asked.reads(), ..ids_line };
@@ -740,6 +834,7 @@ fn export_program<'f>(
                     }
                     RowOutcome::Unkeyed(bytes) => statics::entry_record(bytes.as_slice())
                         .map_err(|why| box_err(ExportCliError::Decode { symbol: symbol.0, what: "code entry", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?,
+                    RowOutcome::Lto { record, .. } => record.as_slice(),
                     RowOutcome::UnbuiltStub(bytes) => bytes.as_slice(),
                 };
                 let view = CodeView::read(rec_bytes)
@@ -780,6 +875,33 @@ fn export_program<'f>(
 
     for (row, outcome) in outcomes.iter().enumerate() {
         let symbol = walk.symbol(row);
+        if let RowOutcome::Lto { record, vtable_data } = outcome {
+            let raw_view = CodeView::read(record.as_slice())
+                .map_err(|why| box_err(ExportCliError::Decode { symbol: symbol.0, what: "LTO code record", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?;
+            let view = materialize_positionless(
+                symbol,
+                raw_view,
+                |item, site| names.records.source_position(item, site, alloc),
+                frame,
+                export_bump,
+                heap,
+            )
+            .map_err(|e| box_err(e, heap))?;
+            functions.push(Function { symbol, record: view, tier: Tier::Optimized });
+            for (vtable_sym, datum_bytes) in vtable_data.iter() {
+                push_datum(
+                    &mut data,
+                    &mut seen_data,
+                    &mut tls_count,
+                    Target { space: Space::Vtable, symbol: *vtable_sym },
+                    datum_bytes.as_slice(),
+                    frame,
+                    export_bump,
+                    heap,
+                )?;
+            }
+            continue;
+        }
         if let RowOutcome::UnbuiltStub(stub_bytes) = outcome {
             let view = CodeView::read(stub_bytes.as_slice())
                 .map_err(|why| box_err(ExportCliError::Decode { symbol: symbol.0, what: "stub code record", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?;
@@ -791,7 +913,7 @@ fn export_program<'f>(
                 .map_err(|why| box_err(ExportCliError::Store { symbol: symbol.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?
                 .ok_or_else(|| box_err(ExportCliError::MissingEntry { symbol: symbol.0 }, heap))?,
             RowOutcome::Unkeyed(bytes) => bytes.as_slice(),
-            RowOutcome::UnbuiltStub(_) => continue,
+            RowOutcome::Lto { .. } | RowOutcome::UnbuiltStub(_) => continue,
         };
         let rec_bytes = statics::entry_record(entry_bytes)
             .map_err(|why| box_err(ExportCliError::Decode { symbol: symbol.0, what: "code entry", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?;
@@ -939,6 +1061,8 @@ fn export_program<'f>(
         cached,
         unkeyed,
         stubs,
+        lto_bodies,
+        lto_inlined,
     })
 }
 
@@ -1137,7 +1261,7 @@ fn print_summary(
         err.line(
             cx,
             format_args!(
-                "export stats: functions={} folded={} stubs={} data={} tls={} compiled={} cached={} unkeyed={} bytes={} wall={}ms",
+                "export stats: functions={} folded={} stubs={} data={} tls={} compiled={} cached={} unkeyed={} lto={} inlined={} bytes={} wall={}ms",
                 summary.exported.functions,
                 summary.exported.folded,
                 summary.stubs,
@@ -1146,6 +1270,8 @@ fn print_summary(
                 summary.compiled,
                 summary.cached,
                 summary.unkeyed,
+                summary.lto_bodies,
+                summary.lto_inlined,
                 summary.exported.len,
                 wall_ms
             ),

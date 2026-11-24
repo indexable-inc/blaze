@@ -30,7 +30,7 @@ blaze-cbor	27
 blaze-cc	8
 blaze-cert	108
 blaze-check	196
-blaze-cli	1368
+blaze-cli	1376
 blaze-code	94
 blaze-columns	193
 blaze-comptime	68
@@ -48,7 +48,7 @@ blaze-ed25519	58
 blaze-emit	443
 blaze-engine	259
 blaze-expand	469
-blaze-export	239
+blaze-export	224
 blaze-fetch	170
 blaze-file-items	277
 blaze-flow	282
@@ -80,7 +80,7 @@ blaze-launcher	2
 blaze-lex	63
 blaze-lint	270
 blaze-lint-defs	109
-blaze-lir	1541
+blaze-lir	1517
 blaze-lower	320
 blaze-macro-run	4
 blaze-malloc	65

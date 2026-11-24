@@ -58,12 +58,35 @@ enum LoopShape {
     SingleBlock { header: u32, exit: u32 },
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum IvKind {
+    /// Integer induction variable `i` (`Ty::I64` or `Ty::I32`), stepped by `Add(i, 1)`.
+    Counted { iv_ty: Ty },
+    /// Pointer induction variable `p: Ty::PTR`, stepped by `PtrAdd(p, elem_bytes)`, stopping at `plan.bound`.
+    Pointer,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SecPtrIv {
+    /// Position of this secondary lockstep pointer IV in `header`'s block parameter list.
+    param_pos: usize,
+    /// The `header` block param instruction index (`Ty::PTR`).
+    param_inst: u32,
+    /// Initial pointer value passed from `preheader`.
+    init_val: u32,
+    /// Step instruction `PtrAdd(param_inst, elem_bytes)` in the body.
+    step_inst: u32,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum ReductionInput {
     /// Standard binary reduction `acc_next = op(acc, elem)`.
     Elem(u32),
     /// Fused multiply-add reduction `acc_next = fma_op(a, b, acc)` (`Op::Fma` or `Op::Fmuladd`).
     Fma { fma_op: Op, a: u32, b: u32 },
+    /// Conditional-count reduction `acc_next = acc + (icmp(cond, a, b) ? 1 : 0)`.
+    /// Vectorized as `vacc_u = Sub(vacc_u, Select(vec_icmp(cond, a, b), splat(-1), splat(0)))`.
+    CountCond { cond: IntCond, a: u32, b: u32 },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -72,6 +95,8 @@ struct ReductionSpec {
     param_pos: usize,
     /// The `header` block param instruction index.
     param_inst: u32,
+    /// Scalar accumulator type (usually `elem_ty`, or wider `I64`/`I32` for `CountCond`).
+    acc_ty: Ty,
     /// Initial value passed from `preheader`.
     init_val: u32,
     /// Associative combine op (`Add`, `Xor`, `Or`, `And`, `Smin`, `Smax`, `Umin`, `Umax`, `Fadd`).
@@ -104,16 +129,18 @@ struct UnitStrideMem {
 struct VecLoopPlan<A: Allocator> {
     preheader: u32,
     shape: LoopShape,
-    /// Position of the induction variable `i` in `header`'s block parameters.
+    /// Primary induction variable kind (counted integer or running pointer).
+    iv_kind: IvKind,
+    /// Position of the primary induction variable in `header`'s block parameters.
     iv_pos: usize,
     /// Induction variable instruction (`header` param).
     iv_inst: u32,
-    /// Induction variable type (`Ty::I64` or `Ty::I32`).
-    iv_ty: Ty,
-    /// Initial value of `i` passed from `preheader`.
+    /// Initial value of the primary IV passed from `preheader`.
     iv_init: u32,
-    /// Loop-invariant upper bound `n` (`i < n` unsigned).
+    /// Loop-invariant upper bound (`n` for counted IV, `end_ptr` for pointer IV).
     bound: u32,
+    /// Secondary lockstep pointer IVs stepping by `elem_bytes` in sync with primary pointer IV.
+    sec_ptr_ivs: Vec<SecPtrIv, A>,
     /// Scalar element type (`I8`, `I16`, `I32`, `I64`, `F32`, `F64`).
     elem_ty: Ty,
     /// 128-bit vector type (`<lanes x elem_ty>`).
@@ -236,6 +263,262 @@ fn supported_elem(ty: Ty, vec_bytes: u32) -> Option<(Ty, u32, u32)> {
     };
     let lanes = vec_bytes >> elem_shift;
     Some((Ty::vector(ty.elem(), lanes)?, elem_shift, lanes))
+}
+
+#[inline]
+const fn invert_int_cond(c: IntCond) -> IntCond {
+    match c {
+        IntCond::Eq => IntCond::Ne,
+        IntCond::Ne => IntCond::Eq,
+        IntCond::Ult => IntCond::Uge,
+        IntCond::Ule => IntCond::Ugt,
+        IntCond::Ugt => IntCond::Ule,
+        IntCond::Uge => IntCond::Ult,
+        IntCond::Slt => IntCond::Sge,
+        IntCond::Sle => IntCond::Sgt,
+        IntCond::Sgt => IntCond::Sle,
+        IntCond::Sge => IntCond::Slt,
+    }
+}
+
+/// Unwraps up to 4 boolean negation/zext wrappers (`Not`, `Xor(_, 1)`, `Icmp(Eq|Ne, i1|zext(i1), 0|1)`).
+fn unwrap_bool_cond(view: &View<'_>, mut cond_val: u32) -> (u32, bool) {
+    let mut flipped = false;
+    for _ in 0..4 {
+        let ci = to_idx(cond_val);
+        if ci >= view.len() {
+            break;
+        }
+        match view.op(ci) {
+            Op::Not => {
+                cond_val = at(view.data, ci);
+                flipped = !flipped;
+            }
+            Op::Xor => {
+                let pos = to_idx(at(view.data, ci));
+                let (l, r) = (at(view.extra, pos), at(view.extra, pos + 1));
+                if const_u64(view, to_idx(r)) == Some(1) {
+                    cond_val = l;
+                    flipped = !flipped;
+                } else if const_u64(view, to_idx(l)) == Some(1) {
+                    cond_val = r;
+                    flipped = !flipped;
+                } else {
+                    break;
+                }
+            }
+            Op::Icmp => {
+                let cat = to_idx(at(view.data, ci));
+                let Some(ic) = IntCond::from_word(at(view.extra, cat)) else {
+                    break;
+                };
+                if ic != IntCond::Eq && ic != IntCond::Ne {
+                    break;
+                }
+                let (lhs, rhs) = (at(view.extra, cat + 1), at(view.extra, cat + 2));
+                let (val, c) = if let Some(k) = const_u64(view, to_idx(rhs)).filter(|&k| k <= 1) {
+                    (lhs, k)
+                } else if let Some(k) = const_u64(view, to_idx(lhs)).filter(|&k| k <= 1) {
+                    (rhs, k)
+                } else {
+                    break;
+                };
+                let vi = to_idx(val);
+                let inner_i1 = if Ty(at(view.tys, vi)) == Ty::I1 {
+                    val
+                } else if view.op(vi) == Op::Zext {
+                    let src = at(view.data, vi);
+                    if Ty(at(view.tys, to_idx(src))) == Ty::I1 {
+                        src
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                };
+                let is_inv = (c == 0 && ic == IntCond::Eq) || (c == 1 && ic == IntCond::Ne);
+                cond_val = inner_i1;
+                if is_inv {
+                    flipped = !flipped;
+                }
+            }
+            _ => break,
+        }
+    }
+    (cond_val, flipped)
+}
+
+#[inline]
+fn unwrap_ptr_addr(view: &View<'_>, v: u32) -> u32 {
+    let vi = to_idx(v);
+    if view.op(vi) == Op::PtrAddr {
+        at(view.data, vi)
+    } else {
+        v
+    }
+}
+
+/// Checks whether `step_v` is `PtrAdd(ptr_iv, elem_bytes)`.
+#[inline]
+fn is_ptr_step(view: &View<'_>, step_v: u32, ptr_iv: u32, elem_bytes: u64) -> bool {
+    let si = to_idx(step_v);
+    if view.op(si) != Op::PtrAdd {
+        return false;
+    }
+    let idx = to_idx(at(view.data, si));
+    at(view.extra, idx) == ptr_iv && const_u64(view, to_idx(at(view.extra, idx + 1))) == Some(elem_bytes)
+}
+
+/// Matches a conditional-count reduction update on `acc` (`p_inst`) of type `acc_ty` (`I8..I64`)
+/// over integer elements of type `elem_ty` (`elem_ty.bits <= acc_ty.bits`):
+/// - `acc + Select(cond, 1, 0)` or `acc + Select(cond, 0, 1)`
+/// - `acc + Zext(cond)` or `acc + Zext(Select(cond, 1, 0))`
+/// - `Select(cond, acc + 1, acc)` or `Select(cond, acc, acc + 1)`
+/// Returns `(effective_cond, cmp_a, cmp_b, optional_extra_acc_use_inst)`.
+fn match_count_cond_update(
+    view: &View<'_>,
+    body_block: u32,
+    inst_block: &[u32],
+    p_inst: u32,
+    back_v: u32,
+    elem_ty: Ty,
+) -> Option<(IntCond, u32, u32, Option<u32>)> {
+    if elem_ty.is_float() || !elem_ty.is_int() {
+        return None;
+    }
+    let bi = to_idx(back_v);
+    let bop = view.op(bi);
+    let (raw_cond, mut invert, extra_acc_use) = if bop == Op::Add {
+        let bat = to_idx(at(view.data, bi));
+        let (l, r) = (at(view.extra, bat), at(view.extra, bat + 1));
+        let inc = if l == p_inst && r != p_inst {
+            r
+        } else if r == p_inst && l != p_inst {
+            l
+        } else {
+            return None;
+        };
+        let mut cur = to_idx(inc);
+        if at(inst_block, cur) != body_block {
+            return None;
+        }
+        // Strip up to 2 `Op::Zext` wrappers (e.g. `Zext(i1 -> i64)` or `Zext(Select(i1, 1i32, 0i32) -> i64)`).
+        for _ in 0..2 {
+            if at(inst_block, cur) == body_block && view.op(cur) == Op::Zext {
+                let src = at(view.data, cur);
+                let src_i = to_idx(src);
+                if Ty(at(view.tys, src_i)) == Ty::I1 {
+                    cur = src_i;
+                    break;
+                }
+                cur = src_i;
+            } else {
+                break;
+            }
+        }
+        if at(inst_block, cur) != body_block {
+            return None;
+        }
+        if Ty(at(view.tys, cur)) == Ty::I1 {
+            (to_u32(cur), false, None)
+        } else if view.op(cur) == Op::Select {
+            let sat = to_idx(at(view.data, cur));
+            let (cv, tv, fv) = (
+                at(view.extra, sat),
+                at(view.extra, sat + 1),
+                at(view.extra, sat + 2),
+            );
+            let tc = const_u64(view, to_idx(tv));
+            let fc = const_u64(view, to_idx(fv));
+            if tc == Some(1) && fc == Some(0) {
+                (cv, false, None)
+            } else if tc == Some(0) && fc == Some(1) {
+                (cv, true, None)
+            } else {
+                return None;
+            }
+        } else {
+            return None;
+        }
+    } else if bop == Op::Select {
+        let sat = to_idx(at(view.data, bi));
+        let (cv, tv, fv) = (
+            at(view.extra, sat),
+            at(view.extra, sat + 1),
+            at(view.extra, sat + 2),
+        );
+        let is_acc_plus_1 = |v: u32| -> bool {
+            let vi = to_idx(v);
+            if at(inst_block, vi) != body_block || view.op(vi) != Op::Add {
+                return false;
+            }
+            let aat = to_idx(at(view.data, vi));
+            let (al, ar) = (at(view.extra, aat), at(view.extra, aat + 1));
+            (al == p_inst && const_u64(view, to_idx(ar)) == Some(1))
+                || (ar == p_inst && const_u64(view, to_idx(al)) == Some(1))
+        };
+        if fv == p_inst && is_acc_plus_1(tv) {
+            (cv, false, Some(tv))
+        } else if tv == p_inst && is_acc_plus_1(fv) {
+            (cv, true, Some(fv))
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    };
+
+    let (inner_c, flipped) = unwrap_bool_cond(view, raw_cond);
+    invert ^= flipped;
+    let ci = to_idx(inner_c);
+    if at(inst_block, ci) != body_block || view.op(ci) != Op::Icmp {
+        return None;
+    }
+    let cat = to_idx(at(view.data, ci));
+    let raw_ic = IntCond::from_word(at(view.extra, cat))?;
+    let (a, b) = (at(view.extra, cat + 1), at(view.extra, cat + 2));
+    if Ty(at(view.tys, to_idx(a))) != elem_ty || Ty(at(view.tys, to_idx(b))) != elem_ty {
+        return None;
+    }
+    let eff_cond = if invert { invert_int_cond(raw_ic) } else { raw_ic };
+    Some((eff_cond, a, b, extra_acc_use))
+}
+
+/// Checks whether `ptr_val` is a unit-stride address for a pointer-IV loop (`p + const_off` or
+/// `PtrAdd(p, const_off)` where `p` is the primary or a secondary pointer IV).
+fn match_ptr_iv_addr(
+    view: &View<'_>,
+    ptr_val: u32,
+    extra_off: i32,
+    iv_inst: u32,
+    iv_init: u32,
+    sec_ptr_ivs: &[SecPtrIv],
+) -> Option<(u32, i32, Option<u32>)> {
+    let mut cur = ptr_val;
+    let mut total_off = extra_off;
+    for _ in 0..2 {
+        if cur == iv_inst {
+            return Some((iv_init, total_off, None));
+        }
+        if let Some(sec) = sec_ptr_ivs.iter().find(|s| s.param_inst == cur) {
+            return Some((sec.init_val, total_off, None));
+        }
+        let ci = to_idx(cur);
+        if view.op(ci) == Op::PtrAdd {
+            let pos = to_idx(at(view.data, ci));
+            let (base, by) = (at(view.extra, pos), at(view.extra, pos + 1));
+            if let Some(c) = const_u64(view, to_idx(by))
+                && let Ok(c32) = i32::try_from(c.cast_signed())
+                && let Some(sum) = total_off.checked_add(c32)
+            {
+                cur = base;
+                total_off = sum;
+                continue;
+            }
+        }
+        break;
+    }
+    None
 }
 
 /// Checks whether `ptr_val` computes `base + (row_off + iv) * elem_bytes + delta` where `base`
@@ -443,9 +726,9 @@ fn find_vectorizable_loop<A: Allocator + Copy>(
             pre_args.push(at(view.extra, pre_at + 2 + k));
         }
 
-        // Determine loop shape (SingleBlock or HeaderBody).
-        let (shape, body_block, back_args_start, cond_val, single_exit_args) = if latch == header {
-            // Single-block loop: `header` ends in `Br(cond, (header, back_args), (exit, exit_args))`.
+        // Determine loop shape (SingleBlock or HeaderBody), accepting either branch polarity.
+        let (shape, body_block, back_args_start, cond_val, stay_is_then, single_exit_args) = if latch == header {
+            // Single-block loop: `header` ends in `Br(cond, stay_arm, exit_arm)`.
             let h_term = view.terminator(Block(header));
             if view.op(h_term) != Op::Br {
                 continue;
@@ -457,16 +740,24 @@ fn find_vectorizable_loop<A: Allocator + Copy>(
             let e_at = idx + 3 + t_argc;
             let e_blk = at(view.extra, e_at);
             let e_argc = to_idx(at(view.extra, e_at + 1));
-            if t_blk != header || e_blk == header || t_argc != h_params.len() {
+            if t_blk == header && e_blk != header && t_argc == h_params.len() {
+                let mut ex_args = Vec::with_capacity_in(e_argc, alloc);
+                for k in 0..e_argc {
+                    ex_args.push(at(view.extra, e_at + 2 + k));
+                }
+                (LoopShape::SingleBlock { header, exit: e_blk }, header, idx + 3, cv, true, ex_args)
+            } else if e_blk == header && t_blk != header && e_argc == h_params.len() {
+                let mut ex_args = Vec::with_capacity_in(t_argc, alloc);
+                for k in 0..t_argc {
+                    ex_args.push(at(view.extra, idx + 3 + k));
+                }
+                (LoopShape::SingleBlock { header, exit: t_blk }, header, e_at + 2, cv, false, ex_args)
+            } else {
                 continue;
             }
-            let mut ex_args = Vec::with_capacity_in(e_argc, alloc);
-            for k in 0..e_argc {
-                ex_args.push(at(view.extra, e_at + 2 + k));
-            }
-            (LoopShape::SingleBlock { header, exit: e_blk }, header, idx + 3, cv, ex_args)
         } else {
-            // Two-block loop: `header` ends in `Br(cond, (body, []), (exit, ...))`, `body` has 1 pred (`header`) and ends in `Jump(header, back_args)`.
+            // Two-block loop: `header` ends in `Br(cond, body_arm, exit_arm)`, `body` has 1 pred (`header`)
+            // and ends in `Jump(header, back_args)`.
             if preds.get(to_idx(latch)).map(Vec::as_slice) != Some(&[header]) {
                 continue;
             }
@@ -484,18 +775,28 @@ fn find_vectorizable_loop<A: Allocator + Copy>(
             let t_argc = to_idx(at(view.extra, hat + 2));
             let e_at = hat + 3 + t_argc;
             let e_blk = at(view.extra, e_at);
+            let e_argc = to_idx(at(view.extra, e_at + 1));
             let bat = to_idx(at(view.data, b_term));
-            if t_blk != latch || t_argc != 0 || e_blk == header || e_blk == latch {
+            let (exit_blk, stay_then) = if t_blk == latch && t_argc == 0 && e_blk != header && e_blk != latch {
+                (e_blk, true)
+            } else if e_blk == latch && e_argc == 0 && t_blk != header && t_blk != latch {
+                (t_blk, false)
+            } else {
                 continue;
-            }
+            };
             if at(view.extra, bat) != header || to_idx(at(view.extra, bat + 1)) != h_params.len() {
                 continue;
             }
-            // Header must only compute the exit compare before `Br`.
+            // Header must only compute pure compare/ptr_addr/bool helpers before `Br`.
             let h_range = view.block(Block(header));
             let mut header_simple = true;
             for inst in h_params.end..(h_range.end - 1) {
-                if inst != to_idx(cv) {
+                if inst != to_idx(cv)
+                    && !matches!(
+                        view.op(inst),
+                        Op::Icmp | Op::PtrAddr | Op::Not | Op::Xor | Op::Zext | Op::Iconst | Op::IconstWide
+                    )
+                {
                     header_simple = false;
                     break;
                 }
@@ -504,10 +805,11 @@ fn find_vectorizable_loop<A: Allocator + Copy>(
                 continue;
             }
             (
-                LoopShape::HeaderBody { header, body: latch, exit: e_blk },
+                LoopShape::HeaderBody { header, body: latch, exit: exit_blk },
                 latch,
                 bat + 2,
                 cv,
+                stay_then,
                 Vec::new_in(alloc),
             )
         };
@@ -519,55 +821,6 @@ fn find_vectorizable_loop<A: Allocator + Copy>(
         if !pre_args.iter().all(|&a| !is_not_inv_blk(at(&inst_block, to_idx(a)))) {
             continue;
         }
-
-        // Parse exit condition `icmp(Ult, lhs, bound)` where `bound` is loop-invariant.
-        let ci = to_idx(cond_val);
-        if view.op(ci) != Op::Icmp {
-            continue;
-        }
-        let cat = to_idx(at(view.data, ci));
-        if IntCond::from_word(at(view.extra, cat)) != Some(IntCond::Ult) {
-            continue;
-        }
-        let cmp_lhs = at(view.extra, cat + 1);
-        let bound = at(view.extra, cat + 2);
-        if is_not_inv_blk(at(&inst_block, to_idx(bound))) {
-            continue;
-        }
-
-        // Identify the unit-step induction variable `i` (`i_next = add(i, 1)`).
-        let mut found_iv = None;
-        for pos in 0..h_params.len() {
-            let p_idx = h_params.start + pos;
-            let p_inst = to_u32(p_idx);
-            let back_v = at(view.extra, back_args_start + pos);
-            let back_i = to_idx(back_v);
-            let p_ty = Ty(at(view.tys, p_idx));
-            if p_ty != Ty::I64 && p_ty != Ty::I32 {
-                continue;
-            }
-            if view.op(back_i) != Op::Add {
-                continue;
-            }
-            let aat = to_idx(at(view.data, back_i));
-            let (al, ar) = (at(view.extra, aat), at(view.extra, aat + 1));
-            let is_step1 = (al == p_inst && const_u64(view, to_idx(ar)) == Some(1))
-                || (ar == p_inst && const_u64(view, to_idx(al)) == Some(1));
-            if !is_step1 {
-                continue;
-            }
-            let matches_cmp = match shape {
-                LoopShape::HeaderBody { .. } => cmp_lhs == p_inst,
-                LoopShape::SingleBlock { .. } => cmp_lhs == back_v,
-            };
-            if matches_cmp {
-                found_iv = Some((pos, p_inst, back_v, p_ty));
-                break;
-            }
-        }
-        let Some((iv_pos, iv_inst, iv_next_inst, iv_ty)) = found_iv else {
-            continue;
-        };
 
         // Ensure no loop-body instruction escapes to outside blocks except via exit edge arguments.
         let mut used_outside = filled(len, false, &alloc);
@@ -599,7 +852,7 @@ fn find_vectorizable_loop<A: Allocator + Copy>(
             continue;
         }
 
-        // Scan body instructions: collect loads, optional single store, reductions, and check purity.
+        // First body pass: determine common `elem_ty` from loads/stores and reject side effects.
         let body_range = view.block(Block(body_block));
         let body_start = if body_block == header { h_params.end } else { body_range.start };
         let body_end = body_range.end - 1; // exclude terminator
@@ -610,7 +863,6 @@ fn find_vectorizable_loop<A: Allocator + Copy>(
         let mut store: Option<UnitStrideMem> = None;
         let mut bad_body = false;
 
-        // First pass: determine common `elem_ty` from loads/stores/reductions and reject side effects.
         for inst in body_start..body_end {
             let op = view.op(inst);
             let flags = Flags(at(view.flags, inst));
@@ -683,9 +935,108 @@ fn find_vectorizable_loop<A: Allocator + Copy>(
         let (Some(elem_ty), Some((vec_ty, elem_shift, lanes))) = (elem_ty, vec_ty_info) else {
             continue;
         };
+        let elem_bytes = 1u64 << elem_shift;
 
-        // Match every non-IV header parameter as an associative reduction accumulator
-        // (including contracted FMA reductions `acc_next = Fma/Fmuladd(a, b, acc)` with `REASSOC`).
+        // Parse exit condition (`Ult`/`Ugt`/`Uge`/`Ule`, plus `Ne`/`Eq` for pointer IV or 0-based counted IV).
+        let (inner_cond, cond_flipped) = unwrap_bool_cond(view, cond_val);
+        let stay_on_cmp = stay_is_then ^ cond_flipped;
+        let ci = to_idx(inner_cond);
+        if view.op(ci) != Op::Icmp {
+            continue;
+        }
+        let cat = to_idx(at(view.data, ci));
+        let Some(exit_ic) = IntCond::from_word(at(view.extra, cat)) else {
+            continue;
+        };
+        let raw_lhs = at(view.extra, cat + 1);
+        let raw_rhs = at(view.extra, cat + 2);
+
+        // Identify the primary induction variable: either counted (`i += 1`) or pointer (`p += elem_bytes`).
+        let mut found_iv: Option<(usize, u32, u32, u32, IvKind)> = None;
+        for pos in 0..h_params.len() {
+            let p_idx = h_params.start + pos;
+            let p_inst = to_u32(p_idx);
+            let back_v = at(view.extra, back_args_start + pos);
+            let back_i = to_idx(back_v);
+            let p_ty = Ty(at(view.tys, p_idx));
+            let cmp_target = match shape {
+                LoopShape::HeaderBody { .. } => p_inst,
+                LoopShape::SingleBlock { .. } => back_v,
+            };
+
+            if p_ty == Ty::I64 || p_ty == Ty::I32 {
+                if view.op(back_i) != Op::Add {
+                    continue;
+                }
+                let aat = to_idx(at(view.data, back_i));
+                let (al, ar) = (at(view.extra, aat), at(view.extra, aat + 1));
+                let is_step1 = (al == p_inst && const_u64(view, to_idx(ar)) == Some(1))
+                    || (ar == p_inst && const_u64(view, to_idx(al)) == Some(1));
+                if !is_step1 {
+                    continue;
+                }
+                let start_is_zero = const_u64(view, to_idx(at(&pre_args, pos))) == Some(0);
+                let bound_opt = if stay_on_cmp {
+                    if raw_lhs == cmp_target && (exit_ic == IntCond::Ult || (start_is_zero && exit_ic == IntCond::Ne)) {
+                        Some(raw_rhs)
+                    } else if raw_rhs == cmp_target && (exit_ic == IntCond::Ugt || (start_is_zero && exit_ic == IntCond::Ne)) {
+                        Some(raw_lhs)
+                    } else {
+                        None
+                    }
+                } else if raw_lhs == cmp_target && (exit_ic == IntCond::Uge || (start_is_zero && exit_ic == IntCond::Eq)) {
+                    Some(raw_rhs)
+                } else if raw_rhs == cmp_target && (exit_ic == IntCond::Ule || (start_is_zero && exit_ic == IntCond::Eq)) {
+                    Some(raw_lhs)
+                } else {
+                    None
+                };
+                if let Some(bnd) = bound_opt
+                    && !is_not_inv_blk(at(&inst_block, to_idx(bnd)))
+                    && Ty(at(view.tys, to_idx(bnd))) == p_ty
+                {
+                    found_iv = Some((pos, p_inst, back_v, bnd, IvKind::Counted { iv_ty: p_ty }));
+                    break;
+                }
+            } else if p_ty == Ty::PTR {
+                if !is_ptr_step(view, back_v, p_inst, elem_bytes) {
+                    continue;
+                }
+                let u_lhs = unwrap_ptr_addr(view, raw_lhs);
+                let u_rhs = unwrap_ptr_addr(view, raw_rhs);
+                let end_opt = if stay_on_cmp {
+                    if u_lhs == cmp_target && matches!(exit_ic, IntCond::Ult | IntCond::Ne) {
+                        Some(u_rhs)
+                    } else if u_rhs == cmp_target && matches!(exit_ic, IntCond::Ugt | IntCond::Ne) {
+                        Some(u_lhs)
+                    } else {
+                        None
+                    }
+                } else if u_lhs == cmp_target && matches!(exit_ic, IntCond::Uge | IntCond::Eq) {
+                    Some(u_rhs)
+                } else if u_rhs == cmp_target && matches!(exit_ic, IntCond::Ule | IntCond::Eq) {
+                    Some(u_lhs)
+                } else {
+                    None
+                };
+                if let Some(end_ptr) = end_opt
+                    && !is_not_inv_blk(at(&inst_block, to_idx(end_ptr)))
+                    && Ty(at(view.tys, to_idx(end_ptr))) == Ty::PTR
+                {
+                    found_iv = Some((pos, p_inst, back_v, end_ptr, IvKind::Pointer));
+                    break;
+                }
+            }
+        }
+        let Some((iv_pos, iv_inst, iv_next_inst, bound, iv_kind)) = found_iv else {
+            continue;
+        };
+        let iv_init = at(&pre_args, iv_pos);
+
+        // Match every non-IV header parameter as either a secondary lockstep pointer IV (for
+        // `IvKind::Pointer` zip loops), a conditional-count reduction (`CountCond`, including
+        // widening `u32 -> u64`!), or an associative reduction accumulator (`Add`/`Fma`/etc.).
+        let mut sec_ptr_ivs: Vec<SecPtrIv, A> = Vec::new_in(alloc);
         let mut reductions: Vec<ReductionSpec, A> = Vec::new_in(alloc);
         let mut is_reduction_update = filled(len, false, &alloc);
         let mut bad_params = false;
@@ -696,18 +1047,76 @@ fn find_vectorizable_loop<A: Allocator + Copy>(
             let p_idx = h_params.start + pos;
             let p_inst = to_u32(p_idx);
             let p_ty = Ty(at(view.tys, p_idx));
-            if p_ty != elem_ty {
-                bad_params = true;
-                break;
-            }
             let back_v = at(view.extra, back_args_start + pos);
             let bi = to_idx(back_v);
-            let bop = view.op(bi);
-            let bflags = Flags(at(view.flags, bi));
             if at(&inst_block, bi) != body_block {
                 bad_params = true;
                 break;
             }
+
+            if matches!(iv_kind, IvKind::Pointer)
+                && p_ty == Ty::PTR
+                && is_ptr_step(view, back_v, p_inst, elem_bytes)
+            {
+                sec_ptr_ivs.push(SecPtrIv {
+                    param_pos: pos,
+                    param_inst: p_inst,
+                    init_val: at(&pre_args, pos),
+                    step_inst: back_v,
+                });
+                continue;
+            }
+
+            // Check conditional-count reduction first (both same-width and widening `i8/i16/i32 -> i32/i64`).
+            let can_widen_count = !elem_ty.is_float()
+                && p_ty.is_scalar()
+                && p_ty.is_int()
+                && p_ty.bits(64) <= 64
+                && (p_ty == elem_ty
+                    || (p_ty.bits(64) > elem_ty.bits(64)
+                        && (matches!(elem_ty, Ty::I16 | Ty::I32) || (elem_ty == Ty::I8 && vec_bytes <= 32))));
+            if can_widen_count
+                && let Some((eff_cond, ca, cb, extra_acc_use)) =
+                    match_count_cond_update(view, body_block, &inst_block, p_inst, back_v, elem_ty)
+            {
+                let extra_idx = extra_acc_use.map(to_idx);
+                let mut other_use = false;
+                for inst in body_start..body_end {
+                    if inst == bi || Some(inst) == extra_idx {
+                        continue;
+                    }
+                    each(view, inst, |item| {
+                        if let Item::Value(v) = item
+                            && (v == p_inst || extra_acc_use == Some(v))
+                        {
+                            other_use = true;
+                        }
+                    });
+                }
+                if other_use {
+                    bad_params = true;
+                    break;
+                }
+                set_at(&mut is_reduction_update, bi, true);
+                reductions.push(ReductionSpec {
+                    param_pos: pos,
+                    param_inst: p_inst,
+                    acc_ty: p_ty,
+                    init_val: at(&pre_args, pos),
+                    op: Op::Add,
+                    flags: Flags::NONE,
+                    update_inst: back_v,
+                    input: ReductionInput::CountCond { cond: eff_cond, a: ca, b: cb },
+                });
+                continue;
+            }
+
+            if p_ty != elem_ty {
+                bad_params = true;
+                break;
+            }
+            let bop = view.op(bi);
+            let bflags = Flags(at(view.flags, bi));
             let (red_op, red_input) = if elem_ty.is_float()
                 && matches!(bop, Op::Fma | Op::Fmuladd)
                 && bflags.contains(Flags::REASSOC)
@@ -760,6 +1169,7 @@ fn find_vectorizable_loop<A: Allocator + Copy>(
             reductions.push(ReductionSpec {
                 param_pos: pos,
                 param_inst: p_inst,
+                acc_ty: p_ty,
                 init_val: at(&pre_args, pos),
                 op: red_op,
                 flags: bflags,
@@ -771,7 +1181,8 @@ fn find_vectorizable_loop<A: Allocator + Copy>(
             continue;
         }
 
-        // Match every load/store address as unit-stride `base + (row_off + i) * elem_bytes + const_off`.
+        // Match every load/store address as unit-stride (counted `base + (row_off + i) * elem_bytes`
+        // or pointer-IV `p + const_off`).
         let mut is_mem_inst = filled(len, false, &alloc);
         for inst in body_start..body_end {
             let op = view.op(inst);
@@ -779,9 +1190,15 @@ fn find_vectorizable_loop<A: Allocator + Copy>(
                 let idx = to_idx(at(view.data, inst));
                 let ptr = at(view.extra, idx);
                 let off = at(view.extra, idx + 1).cast_signed();
-                let Some((base, const_off, row_idx_off)) =
-                    match_unit_stride_addr(view, ptr, off, iv_inst, elem_shift, is_not_inv_blk, &inst_block)
-                else {
+                let addr_match = match iv_kind {
+                    IvKind::Counted { .. } => {
+                        match_unit_stride_addr(view, ptr, off, iv_inst, elem_shift, is_not_inv_blk, &inst_block)
+                    }
+                    IvKind::Pointer => {
+                        match_ptr_iv_addr(view, ptr, off, iv_inst, iv_init, sec_ptr_ivs.as_slice())
+                    }
+                };
+                let Some((base, const_off, row_idx_off)) = addr_match else {
                     bad_body = true;
                     break;
                 };
@@ -799,9 +1216,15 @@ fn find_vectorizable_loop<A: Allocator + Copy>(
                 let sv = at(view.extra, idx);
                 let ptr = at(view.extra, idx + 1);
                 let off = at(view.extra, idx + 2).cast_signed();
-                let Some((base, const_off, row_idx_off)) =
-                    match_unit_stride_addr(view, ptr, off, iv_inst, elem_shift, is_not_inv_blk, &inst_block)
-                else {
+                let addr_match = match iv_kind {
+                    IvKind::Counted { .. } => {
+                        match_unit_stride_addr(view, ptr, off, iv_inst, elem_shift, is_not_inv_blk, &inst_block)
+                    }
+                    IvKind::Pointer => {
+                        match_ptr_iv_addr(view, ptr, off, iv_inst, iv_init, sec_ptr_ivs.as_slice())
+                    }
+                };
+                let Some((base, const_off, row_idx_off)) = addr_match else {
                     bad_body = true;
                     break;
                 };
@@ -847,7 +1270,7 @@ fn find_vectorizable_loop<A: Allocator + Copy>(
         for red in &reductions {
             match red.input {
                 ReductionInput::Elem(ev) => stack.push(ev),
-                ReductionInput::Fma { a, b, .. } => {
+                ReductionInput::Fma { a, b, .. } | ReductionInput::CountCond { a, b, .. } => {
                     stack.push(a);
                     stack.push(b);
                 }
@@ -878,7 +1301,10 @@ fn find_vectorizable_loop<A: Allocator + Copy>(
                 set_at(&mut needed, vi, true);
                 continue;
             }
-            if v == iv_inst || v == iv_next_inst {
+            if v == iv_inst
+                || v == iv_next_inst
+                || sec_ptr_ivs.iter().any(|s| s.param_inst == v || s.step_inst == v)
+            {
                 // Direct use of IV in data expression (not just address): skip for now.
                 expr_bad = true;
                 break;
@@ -985,15 +1411,15 @@ fn find_vectorizable_loop<A: Allocator + Copy>(
             }
         }
 
-        let iv_init = at(&pre_args, iv_pos);
         return Some(VecLoopPlan {
             preheader,
             shape,
+            iv_kind,
             iv_pos,
             iv_inst,
-            iv_ty,
             iv_init,
             bound,
+            sec_ptr_ivs,
             elem_ty,
             vec_ty,
             elem_shift,
@@ -1317,17 +1743,56 @@ pub fn auto_vectorize_loops_with_width<A: Allocator + Copy>(
             2
         };
     let unroll_step = u64::from(plan.lanes) * u64::try_from(unroll).unwrap_or(2);
-    let iv_starts_zero = const_u64(&view, to_idx(plan.iv_init)) == Some(0);
+    let step_bytes = u64::from(vec_bytes) * u64::try_from(unroll).unwrap_or(2);
+    let iv_starts_zero = match plan.iv_kind {
+        IvKind::Counted { .. } => const_u64(&view, to_idx(plan.iv_init)) == Some(0),
+        IvKind::Pointer => true,
+    };
+    let has_count_cond = plan
+        .reductions
+        .iter()
+        .any(|r| matches!(r.input, ReductionInput::CountCond { .. }));
+    let needs_chunk = plan.reductions.iter().any(|r| r.acc_ty != plan.elem_ty);
+    let is_single = matches!(plan.shape, LoopShape::SingleBlock { .. });
+    let chunk_elems: u64 = if plan.elem_ty == Ty::I32 {
+        1u64 << 28
+    } else if plan.elem_ty == Ty::I16 {
+        1u64 << 15
+    } else if plan.elem_ty == Ty::I8 {
+        (255u64 / unroll_step) * unroll_step
+    } else {
+        1u64 << 28
+    };
+    if needs_chunk && chunk_elems < unroll_step {
+        return Ok(VectorizeOutput {
+            func: view.to_func_in(alloc),
+            stats: VectorizeStats::default(),
+        });
+    }
 
-    // Insert 3 new blocks (`vec_pre`, `vec_loop`, `vec_reduce`) immediately after `plan.preheader`!
+    // Insert 3 blocks (`vec_pre`, `vec_loop`, `vec_reduce`) for normal loops, or 4/5 blocks
+    // (`vec_pre`, `vec_chunk`, `vec_loop`, `vec_reduce` [, `vec_tail`]) for overflow-free widening reductions.
     let insert_at = to_idx(plan.preheader) + 1;
+    let extra_blocks: usize = if needs_chunk {
+        if is_single { 5 } else { 4 }
+    } else {
+        3
+    };
     let vec_pre_blk = to_u32(insert_at);
-    let vec_loop_blk = to_u32(insert_at + 1);
-    let vec_reduce_blk = to_u32(insert_at + 2);
+    let (vec_chunk_blk, vec_loop_blk, vec_reduce_blk, vec_tail_blk) = if needs_chunk {
+        (
+            to_u32(insert_at + 1),
+            to_u32(insert_at + 2),
+            to_u32(insert_at + 3),
+            if is_single { to_u32(insert_at + 4) } else { NONE },
+        )
+    } else {
+        (NONE, to_u32(insert_at + 1), to_u32(insert_at + 2), NONE)
+    };
 
     let mut blk_map: Vec<u32, A> = Vec::with_capacity_in(blocks, alloc);
     for b in 0..blocks {
-        blk_map.push(if b < insert_at { to_u32(b) } else { to_u32(b + 3) });
+        blk_map.push(if b < insert_at { to_u32(b) } else { to_u32(b + extra_blocks) });
     }
     let orig_header_new = match plan.shape {
         LoopShape::HeaderBody { header, .. } | LoopShape::SingleBlock { header, .. } => {
@@ -1385,16 +1850,30 @@ pub fn auto_vectorize_loops_with_width<A: Allocator + Copy>(
             // Emit vectorization guard at end of `preheader`.
             let iv_init_new = at(&val_map, to_idx(plan.iv_init));
             let bound_new = at(&val_map, to_idx(plan.bound));
-            let k_step = push_iconst(&mut func, plan.iv_ty, unroll_step);
-            let (rem_val, mut go_vec) = if iv_starts_zero {
-                let enough = push_icmp(&mut func, IntCond::Uge, bound_new, k_step);
-                (bound_new, enough)
-            } else {
-                let has_rem = push_icmp(&mut func, IntCond::Ult, iv_init_new, bound_new);
-                let rem = push_bin(&mut func, Op::Sub, Flags::NONE, plan.iv_ty, bound_new, iv_init_new);
-                let enough = push_icmp(&mut func, IntCond::Uge, rem, k_step);
-                let g = push_bin(&mut func, Op::And, Flags::NONE, Ty::I1, has_rem, enough);
-                (rem, g)
+            let (rem_val, mut go_vec) = match plan.iv_kind {
+                IvKind::Counted { iv_ty } => {
+                    let k_step = push_iconst(&mut func, iv_ty, unroll_step);
+                    if iv_starts_zero {
+                        let enough = push_icmp(&mut func, IntCond::Uge, bound_new, k_step);
+                        (bound_new, enough)
+                    } else {
+                        let has_rem = push_icmp(&mut func, IntCond::Ult, iv_init_new, bound_new);
+                        let rem = push_bin(&mut func, Op::Sub, Flags::NONE, iv_ty, bound_new, iv_init_new);
+                        let enough = push_icmp(&mut func, IntCond::Uge, rem, k_step);
+                        let g = push_bin(&mut func, Op::And, Flags::NONE, Ty::I1, has_rem, enough);
+                        (rem, g)
+                    }
+                }
+                IvKind::Pointer => {
+                    let p_addr = push_inst(&mut func, Op::PtrAddr, Flags::NONE, Ty::I64, iv_init_new, 0);
+                    let end_addr = push_inst(&mut func, Op::PtrAddr, Flags::NONE, Ty::I64, bound_new, 0);
+                    let has_rem = push_icmp(&mut func, IntCond::Ult, p_addr, end_addr);
+                    let byte_rem = push_bin(&mut func, Op::Sub, Flags::NONE, Ty::I64, end_addr, p_addr);
+                    let k_sbytes = push_iconst(&mut func, Ty::I64, step_bytes);
+                    let enough = push_icmp(&mut func, IntCond::Uge, byte_rem, k_sbytes);
+                    let g = push_bin(&mut func, Op::And, Flags::NONE, Ty::I1, has_rem, enough);
+                    (byte_rem, g)
+                }
             };
 
             // For map/store loops, emit compact wraparound-safe runtime non-overlap alias check:
@@ -1410,16 +1889,21 @@ pub fn auto_vectorize_loops_with_width<A: Allocator + Copy>(
                         && !provably_noalias_bases(&view, st.base, ld.base)
                 });
                 let (dst_base_off, byte_len, zero64) = if needs_alias_check {
-                    let rem64 = if plan.iv_ty == Ty::I32 {
-                        push_inst(&mut func, Op::Zext, Flags::NONE, Ty::I64, rem_val, 0)
-                    } else {
-                        rem_val
-                    };
-                    let blen = if plan.elem_shift == 0 {
-                        rem64
-                    } else {
-                        let ks = push_iconst(&mut func, Ty::I64, u64::from(plan.elem_shift));
-                        push_bin(&mut func, Op::Shl, Flags::NONE, Ty::I64, rem64, ks)
+                    let blen = match plan.iv_kind {
+                        IvKind::Pointer => rem_val,
+                        IvKind::Counted { iv_ty } => {
+                            let rem64 = if iv_ty == Ty::I32 {
+                                push_inst(&mut func, Op::Zext, Flags::NONE, Ty::I64, rem_val, 0)
+                            } else {
+                                rem_val
+                            };
+                            if plan.elem_shift == 0 {
+                                rem64
+                            } else {
+                                let ks = push_iconst(&mut func, Ty::I64, u64::from(plan.elem_shift));
+                                push_bin(&mut func, Op::Shl, Flags::NONE, Ty::I64, rem64, ks)
+                            }
+                        }
                     };
                     let dst_addr = push_inst(&mut func, Op::PtrAddr, Flags::NONE, Ty::I64, store_eff_base, 0);
                     let d_off = if st.const_off != 0 {
@@ -1471,13 +1955,23 @@ pub fn auto_vectorize_loops_with_width<A: Allocator + Copy>(
             // --- Emit `vec_pre` block ---
             func.block_starts.push(to_u32(func.ops.len()));
             func.block_kinds.push(block_kind_byte(BlockKind::Normal));
-            let mask_val = !(unroll_step - 1);
-            let k_mask = push_iconst(&mut func, plan.iv_ty, mask_val);
-            let vec_count = push_bin(&mut func, Op::And, Flags::NONE, plan.iv_ty, rem_val, k_mask);
-            let vec_end = if iv_starts_zero {
-                vec_count
-            } else {
-                push_bin(&mut func, Op::Add, Flags::NONE, plan.iv_ty, iv_init_new, vec_count)
+            let (vec_count, vec_end_counted, ptr_vec_bytes_total) = match plan.iv_kind {
+                IvKind::Counted { iv_ty } => {
+                    let mask_val = !(unroll_step - 1);
+                    let k_mask = push_iconst(&mut func, iv_ty, mask_val);
+                    let vc = push_bin(&mut func, Op::And, Flags::NONE, iv_ty, rem_val, k_mask);
+                    let ve = if iv_starts_zero {
+                        vc
+                    } else {
+                        push_bin(&mut func, Op::Add, Flags::NONE, iv_ty, iv_init_new, vc)
+                    };
+                    (vc, ve, NONE)
+                }
+                IvKind::Pointer => {
+                    let k_bmask = push_iconst(&mut func, Ty::I64, !(step_bytes - 1));
+                    let vb = push_bin(&mut func, Op::And, Flags::NONE, Ty::I64, rem_val, k_bmask);
+                    (NONE, NONE, vb)
+                }
             };
 
             // Build deduplicated running pointer streams `(base, row_idx_off)` across loads & store
@@ -1491,19 +1985,24 @@ pub fn auto_vectorize_loops_with_width<A: Allocator + Copy>(
                 has_store: bool,
             }
             let has_mem_streams = !plan.loads.is_empty() || plan.store.is_some();
-            let iv_init_bytes = if iv_starts_zero || !has_mem_streams {
-                NONE
-            } else {
-                let iv0_64 = if plan.iv_ty == Ty::I32 {
-                    push_inst(&mut func, Op::Zext, Flags::NONE, Ty::I64, iv_init_new, 0)
-                } else {
-                    iv_init_new
-                };
-                if plan.elem_shift == 0 {
-                    iv0_64
-                } else {
-                    let ks = push_iconst(&mut func, Ty::I64, u64::from(plan.elem_shift));
-                    push_bin(&mut func, Op::Shl, Flags::NONE, Ty::I64, iv0_64, ks)
+            let iv_init_bytes = match plan.iv_kind {
+                IvKind::Pointer => NONE,
+                IvKind::Counted { iv_ty } => {
+                    if iv_starts_zero || !has_mem_streams {
+                        NONE
+                    } else {
+                        let iv0_64 = if iv_ty == Ty::I32 {
+                            push_inst(&mut func, Op::Zext, Flags::NONE, Ty::I64, iv_init_new, 0)
+                        } else {
+                            iv_init_new
+                        };
+                        if plan.elem_shift == 0 {
+                            iv0_64
+                        } else {
+                            let ks = push_iconst(&mut func, Ty::I64, u64::from(plan.elem_shift));
+                            push_bin(&mut func, Op::Shl, Flags::NONE, Ty::I64, iv0_64, ks)
+                        }
+                    }
                 }
             };
             let mut streams: Vec<PtrStream, A> = Vec::with_capacity_in(plan.loads.len() + 1, alloc);
@@ -1556,32 +2055,53 @@ pub fn auto_vectorize_loops_with_width<A: Allocator + Copy>(
                 }
             }
             let use_ptr_iv = !streams.is_empty();
+            let vec_bytes_total = match plan.iv_kind {
+                IvKind::Pointer => ptr_vec_bytes_total,
+                IvKind::Counted { iv_ty } => {
+                    if use_ptr_iv {
+                        let vec_count64 = if iv_ty == Ty::I32 {
+                            push_inst(&mut func, Op::Zext, Flags::NONE, Ty::I64, vec_count, 0)
+                        } else {
+                            vec_count
+                        };
+                        if plan.elem_shift == 0 {
+                            vec_count64
+                        } else {
+                            let ks = push_iconst(&mut func, Ty::I64, u64::from(plan.elem_shift));
+                            push_bin(&mut func, Op::Shl, Flags::NONE, Ty::I64, vec_count64, ks)
+                        }
+                    } else {
+                        NONE
+                    }
+                }
+            };
             let p0_end = if let Some(s0) = streams.first() {
-                let vec_count64 = if plan.iv_ty == Ty::I32 {
-                    push_inst(&mut func, Op::Zext, Flags::NONE, Ty::I64, vec_count, 0)
-                } else {
-                    vec_count
-                };
-                let vec_bytes_total = if plan.elem_shift == 0 {
-                    vec_count64
-                } else {
-                    let ks = push_iconst(&mut func, Ty::I64, u64::from(plan.elem_shift));
-                    push_bin(&mut func, Op::Shl, Flags::NONE, Ty::I64, vec_count64, ks)
-                };
                 push_bin(&mut func, Op::PtrAdd, Flags::NONE, Ty::PTR, s0.init_ptr, vec_bytes_total)
             } else {
                 NONE
             };
-
-            let n_iv_params = if use_ptr_iv { streams.len() } else { 1 };
-            let mut vec_init_args: Vec<u32, A> = Vec::with_capacity_in(n_iv_params + plan.reductions.len() * unroll, alloc);
-            if use_ptr_iv {
-                for s in &streams {
-                    vec_init_args.push(s.init_ptr);
+            let vec_end = match plan.iv_kind {
+                IvKind::Counted { .. } => vec_end_counted,
+                IvKind::Pointer => {
+                    if streams.first().is_some_and(|s0| s0.init_ptr == iv_init_new) {
+                        p0_end
+                    } else {
+                        push_bin(&mut func, Op::PtrAdd, Flags::NONE, Ty::PTR, iv_init_new, vec_bytes_total)
+                    }
                 }
-            } else {
-                vec_init_args.push(iv_init_new);
+            };
+            let mut sec_ptr_ends: Vec<u32, A> = Vec::with_capacity_in(plan.sec_ptr_ivs.len(), alloc);
+            for sec in &plan.sec_ptr_ivs {
+                let si_init = at(&val_map, to_idx(sec.init_val));
+                let se = if streams.first().is_some_and(|s0| s0.init_ptr == si_init) {
+                    p0_end
+                } else {
+                    push_bin(&mut func, Op::PtrAdd, Flags::NONE, Ty::PTR, si_init, vec_bytes_total)
+                };
+                sec_ptr_ends.push(se);
             }
+
+            let mut red_id_splats: Vec<u32, A> = Vec::with_capacity_in(plan.reductions.len(), alloc);
             for red in &plan.reductions {
                 let id_scalar = if is_minmax_op(red.op) {
                     at(&val_map, to_idx(red.init_val))
@@ -1592,11 +2112,19 @@ pub fn auto_vectorize_loops_with_width<A: Allocator + Copy>(
                 } else {
                     push_iconst(&mut func, plan.elem_ty, 0)
                 };
-                for _ in 0..unroll {
-                    let vacc = push_inst(&mut func, Op::Splat, Flags::NONE, plan.vec_ty, id_scalar, 0);
-                    vec_init_args.push(vacc);
-                }
+                let sp = push_inst(&mut func, Op::Splat, Flags::NONE, plan.vec_ty, id_scalar, 0);
+                red_id_splats.push(sp);
             }
+            let (v_neg1_mask, v_zero_mask) = if has_count_cond {
+                let c_neg1 = push_iconst(&mut func, plan.elem_ty, u64::MAX);
+                let c_zero = push_iconst(&mut func, plan.elem_ty, 0);
+                (
+                    push_inst(&mut func, Op::Splat, Flags::NONE, plan.vec_ty, c_neg1, 0),
+                    push_inst(&mut func, Op::Splat, Flags::NONE, plan.vec_ty, c_zero, 0),
+                )
+            } else {
+                (NONE, NONE)
+            };
             // Hoist invariant scalar splats and body constant splats once into `vec_pre`!
             let mut inv_splat_map: Vec<(u32, u32), A> = Vec::with_capacity_in(plan.inv_scalars.len(), alloc);
             for &sv in &plan.inv_scalars {
@@ -1612,7 +2140,68 @@ pub fn auto_vectorize_loops_with_width<A: Allocator + Copy>(
                     body_const_splats.push((e, sp));
                 }
             }
-            push_jump(&mut func, vec_loop_blk, &vec_init_args);
+
+            let n_iv_params = if use_ptr_iv { streams.len() } else { 1 };
+            let (loop_p0_end, chunk_acc_params) = if needs_chunk {
+                let mut chunk_init_args: Vec<u32, A> =
+                    Vec::with_capacity_in(streams.len() + plan.reductions.len(), alloc);
+                for s in &streams {
+                    chunk_init_args.push(s.init_ptr);
+                }
+                for red in &plan.reductions {
+                    chunk_init_args.push(at(&val_map, to_idx(red.init_val)));
+                }
+                push_jump(&mut func, vec_chunk_blk, &chunk_init_args);
+
+                // --- Emit `vec_chunk` block (overflow-free chunking for widening `CountCond` reductions) ---
+                func.block_starts.push(to_u32(func.ops.len()));
+                func.block_kinds.push(block_kind_byte(BlockKind::Normal));
+                let mut chunk_ptrs: Vec<u32, A> = Vec::with_capacity_in(streams.len(), alloc);
+                for _ in 0..streams.len() {
+                    chunk_ptrs.push(push_inst(&mut func, Op::Param, Flags::NONE, Ty::PTR, 0, 0));
+                }
+                let mut chunk_accs: Vec<u32, A> = Vec::with_capacity_in(plan.reductions.len(), alloc);
+                for red in &plan.reductions {
+                    chunk_accs.push(push_inst(&mut func, Op::Param, Flags::NONE, red.acc_ty, 0, 0));
+                }
+                let cur_p0 = at(&chunk_ptrs, 0);
+                let cur_addr = push_inst(&mut func, Op::PtrAddr, Flags::NONE, Ty::I64, cur_p0, 0);
+                let end_addr = push_inst(&mut func, Op::PtrAddr, Flags::NONE, Ty::I64, p0_end, 0);
+                let rem_c = push_bin(&mut func, Op::Sub, Flags::NONE, Ty::I64, end_addr, cur_addr);
+                let k_cbytes = push_iconst(&mut func, Ty::I64, chunk_elems << plan.elem_shift);
+                let step_c = push_bin(&mut func, Op::Umin, Flags::NONE, Ty::I64, rem_c, k_cbytes);
+                let c_end = push_bin(&mut func, Op::PtrAdd, Flags::NONE, Ty::PTR, cur_p0, step_c);
+
+                let mut vloop_args: Vec<u32, A> =
+                    Vec::with_capacity_in(streams.len() + plan.reductions.len() * unroll, alloc);
+                for &cp in &chunk_ptrs {
+                    vloop_args.push(cp);
+                }
+                for &sp in &red_id_splats {
+                    for _ in 0..unroll {
+                        vloop_args.push(sp);
+                    }
+                }
+                push_jump(&mut func, vec_loop_blk, &vloop_args);
+                (c_end, chunk_accs)
+            } else {
+                let mut vec_init_args: Vec<u32, A> =
+                    Vec::with_capacity_in(n_iv_params + plan.reductions.len() * unroll, alloc);
+                if use_ptr_iv {
+                    for s in &streams {
+                        vec_init_args.push(s.init_ptr);
+                    }
+                } else {
+                    vec_init_args.push(iv_init_new);
+                }
+                for &sp in &red_id_splats {
+                    for _ in 0..unroll {
+                        vec_init_args.push(sp);
+                    }
+                }
+                push_jump(&mut func, vec_loop_blk, &vec_init_args);
+                (p0_end, Vec::new_in(alloc))
+            };
 
             // --- Emit `vec_loop` block (4x = 64B/iter or 2x = 32B/iter 128-bit SIMD!) ---
             func.block_starts.push(to_u32(func.ops.len()));
@@ -1624,7 +2213,11 @@ pub fn auto_vectorize_loops_with_width<A: Allocator + Copy>(
                 }
                 NONE
             } else {
-                push_inst(&mut func, Op::Param, Flags::NONE, plan.iv_ty, 0, 0)
+                let iv_ty = match plan.iv_kind {
+                    IvKind::Counted { iv_ty } => iv_ty,
+                    IvKind::Pointer => Ty::I64,
+                };
+                push_inst(&mut func, Op::Param, Flags::NONE, iv_ty, 0, 0)
             };
             let mut vacc_params: Vec<[u32; 4], A> = Vec::with_capacity_in(plan.reductions.len(), alloc);
             for _ in 0..plan.reductions.len() {
@@ -1651,7 +2244,6 @@ pub fn auto_vectorize_loops_with_width<A: Allocator + Copy>(
                     set_at(vm, e, sp);
                 }
             }
-            let step_bytes = u64::from(vec_bytes) * u64::try_from(unroll).unwrap_or(2);
             let mut ptr_nexts = filled(streams.len(), NONE, &alloc);
             let vec_bytes_i32 = vec_bytes.cast_signed();
             for (lidx, ld) in plan.loads.iter().enumerate() {
@@ -1751,18 +2343,28 @@ pub fn auto_vectorize_loops_with_width<A: Allocator + Copy>(
                 set_at(&mut ptr_nexts, si, p_next);
             }
 
-            // Update `unroll` independent vector accumulators and test `p0_next < p0_end`!
+            // Update `unroll` independent vector accumulators and test `p0_next < loop_p0_end`!
             let mut vec_back_args: Vec<u32, A> =
                 Vec::with_capacity_in(n_iv_params + plan.reductions.len() * unroll, alloc);
-            let mut vec_red_args: Vec<u32, A> = Vec::with_capacity_in(plan.reductions.len() * unroll, alloc);
+            let mut vec_red_args: Vec<u32, A> = Vec::with_capacity_in(
+                (if needs_chunk { streams.len() } else { 0 }) + plan.reductions.len() * unroll,
+                alloc,
+            );
             let iv_v_next = if use_ptr_iv {
                 for &pn in &ptr_nexts {
                     vec_back_args.push(pn);
+                    if needs_chunk {
+                        vec_red_args.push(pn);
+                    }
                 }
                 NONE
             } else {
-                let k_ustep = push_iconst(&mut func, plan.iv_ty, unroll_step);
-                let next = push_bin(&mut func, Op::Add, Flags::NONE, plan.iv_ty, iv_v, k_ustep);
+                let iv_ty = match plan.iv_kind {
+                    IvKind::Counted { iv_ty } => iv_ty,
+                    IvKind::Pointer => Ty::I64,
+                };
+                let k_ustep = push_iconst(&mut func, iv_ty, unroll_step);
+                let next = push_bin(&mut func, Op::Add, Flags::NONE, iv_ty, iv_v, k_ustep);
                 vec_back_args.push(next);
                 next
             };
@@ -1787,13 +2389,26 @@ pub fn auto_vectorize_loops_with_width<A: Allocator + Copy>(
                             at(vm, to_idx(b)),
                             acc_u,
                         ),
+                        ReductionInput::CountCond { cond, a, b } => {
+                            let dst = to_u32(func.extra.len());
+                            func.extra.push(int_cond_word(cond));
+                            func.extra.push(at(vm, to_idx(a)));
+                            func.extra.push(at(vm, to_idx(b)));
+                            let vmask = push_inst(&mut func, Op::Icmp, Flags::NONE, mask_ty, dst, 0);
+                            let sdst = to_u32(func.extra.len());
+                            func.extra.push(vmask);
+                            func.extra.push(v_neg1_mask);
+                            func.extra.push(v_zero_mask);
+                            let mvec = push_inst(&mut func, Op::Select, Flags::NONE, plan.vec_ty, sdst, 0);
+                            push_bin(&mut func, Op::Sub, Flags::NONE, plan.vec_ty, acc_u, mvec)
+                        }
                     };
                     vec_back_args.push(n_acc);
                     vec_red_args.push(n_acc);
                 }
             }
             let keep_vec = if use_ptr_iv {
-                push_icmp(&mut func, IntCond::Ult, at(&ptr_nexts, 0), p0_end)
+                push_icmp(&mut func, IntCond::Ult, at(&ptr_nexts, 0), loop_p0_end)
             } else {
                 push_icmp(&mut func, IntCond::Ult, iv_v_next, vec_end)
             };
@@ -1802,8 +2417,14 @@ pub fn auto_vectorize_loops_with_width<A: Allocator + Copy>(
             // --- Emit `vec_reduce` block (tree-reduces all accumulators; uses `vec_end` from `vec_pre`!) ---
             func.block_starts.push(to_u32(func.ops.len()));
             func.block_kinds.push(block_kind_byte(BlockKind::Normal));
+            let mut done_ptr_params: Vec<u32, A> = Vec::with_capacity_in(if needs_chunk { streams.len() } else { 0 }, alloc);
+            if needs_chunk {
+                for _ in 0..streams.len() {
+                    done_ptr_params.push(push_inst(&mut func, Op::Param, Flags::NONE, Ty::PTR, 0, 0));
+                }
+            }
             let mut red_scalar_vals: Vec<u32, A> = Vec::with_capacity_in(plan.reductions.len(), alloc);
-            for red in &plan.reductions {
+            for (ridx, red) in plan.reductions.iter().enumerate() {
                 let d0 = push_inst(&mut func, Op::Param, Flags::NONE, plan.vec_ty, 0, 0);
                 let d1 = push_inst(&mut func, Op::Param, Flags::NONE, plan.vec_ty, 0, 0);
                 let comb = if unroll == 4 {
@@ -1815,7 +2436,11 @@ pub fn auto_vectorize_loops_with_width<A: Allocator + Copy>(
                 } else {
                     push_bin(&mut func, red.op, red.flags, plan.vec_ty, d0, d1)
                 };
-                let init_new = at(&val_map, to_idx(red.init_val));
+                let init_new = if needs_chunk {
+                    at(&chunk_acc_params, ridx)
+                } else {
+                    at(&val_map, to_idx(red.init_val))
+                };
                 let final_s = if red.op == Op::Fadd {
                     push_bin(&mut func, Op::ReduceFadd, red.flags, plan.elem_ty, init_new, comb)
                 } else {
@@ -1836,40 +2461,88 @@ pub fn auto_vectorize_loops_with_width<A: Allocator + Copy>(
                         }
                     };
                     let r_lane = push_inst(&mut func, red_op, Flags::NONE, plan.elem_ty, comb, 0);
-                    if is_minmax_op(red.op) {
+                    let r_wide = if red.acc_ty == plan.elem_ty {
                         r_lane
                     } else {
-                        push_bin(&mut func, red.op, Flags::NONE, plan.elem_ty, init_new, r_lane)
+                        push_inst(&mut func, Op::Zext, Flags::NONE, red.acc_ty, r_lane, 0)
+                    };
+                    if is_minmax_op(red.op) {
+                        r_wide
+                    } else {
+                        push_bin(&mut func, red.op, Flags::NONE, red.acc_ty, init_new, r_wide)
                     }
                 };
                 red_scalar_vals.push(final_s);
             }
 
-            let mut tail_args: Vec<u32, A> = Vec::with_capacity_in(plan.pre_args.len(), alloc);
-            for (pos, &pre_arg) in plan.pre_args.iter().enumerate() {
-                if pos == plan.iv_pos {
-                    tail_args.push(vec_end);
-                } else if let Some(ridx) = plan.reductions.iter().position(|r| r.param_pos == pos) {
-                    tail_args.push(at(&red_scalar_vals, ridx));
-                } else {
-                    tail_args.push(at(&val_map, to_idx(pre_arg)));
+            let build_tail_args = |accs: &[u32]| -> Vec<u32, A> {
+                let mut targs: Vec<u32, A> = Vec::with_capacity_in(plan.pre_args.len(), alloc);
+                for (pos, &pre_arg) in plan.pre_args.iter().enumerate() {
+                    if pos == plan.iv_pos {
+                        targs.push(vec_end);
+                    } else if let Some(sidx) = plan.sec_ptr_ivs.iter().position(|s| s.param_pos == pos) {
+                        targs.push(at(&sec_ptr_ends, sidx));
+                    } else if let Some(ridx) = plan.reductions.iter().position(|r| r.param_pos == pos) {
+                        targs.push(at(accs, ridx));
+                    } else {
+                        targs.push(at(&val_map, to_idx(pre_arg)));
+                    }
                 }
-            }
-            match plan.shape {
-                LoopShape::HeaderBody { .. } => {
-                    push_jump(&mut func, orig_header_new, &tail_args);
+                targs
+            };
+
+            if needs_chunk {
+                let more_chunks = push_icmp(&mut func, IntCond::Ult, at(&done_ptr_params, 0), p0_end);
+                let mut chunk_back_args: Vec<u32, A> =
+                    Vec::with_capacity_in(streams.len() + plan.reductions.len(), alloc);
+                for &dp in &done_ptr_params {
+                    chunk_back_args.push(dp);
                 }
-                LoopShape::SingleBlock { .. } => {
+                for &rs in &red_scalar_vals {
+                    chunk_back_args.push(rs);
+                }
+                if is_single {
+                    push_br(&mut func, more_chunks, vec_chunk_blk, &chunk_back_args, vec_tail_blk, &red_scalar_vals);
+                    // --- Emit `vec_tail` block for `SingleBlock` chunked reductions ---
+                    func.block_starts.push(to_u32(func.ops.len()));
+                    func.block_kinds.push(block_kind_byte(BlockKind::Normal));
+                    let mut final_accs: Vec<u32, A> = Vec::with_capacity_in(plan.reductions.len(), alloc);
+                    for red in &plan.reductions {
+                        final_accs.push(push_inst(&mut func, Op::Param, Flags::NONE, red.acc_ty, 0, 0));
+                    }
+                    let tail_args = build_tail_args(&final_accs);
                     let has_tail = push_icmp(&mut func, IntCond::Ult, vec_end, bound_new);
                     let mut direct_exit_args: Vec<u32, A> = Vec::with_capacity_in(plan.single_exit_args.len(), alloc);
                     for &ea in &plan.single_exit_args {
                         if let Some(ridx) = plan.reductions.iter().position(|r| r.update_inst == ea) {
-                            direct_exit_args.push(at(&red_scalar_vals, ridx));
+                            direct_exit_args.push(at(&final_accs, ridx));
                         } else {
                             direct_exit_args.push(at(&val_map, to_idx(ea)));
                         }
                     }
                     push_br(&mut func, has_tail, orig_header_new, &tail_args, orig_exit_new, &direct_exit_args);
+                } else {
+                    let tail_args = build_tail_args(&red_scalar_vals);
+                    push_br(&mut func, more_chunks, vec_chunk_blk, &chunk_back_args, orig_header_new, &tail_args);
+                }
+            } else {
+                let tail_args = build_tail_args(&red_scalar_vals);
+                match plan.shape {
+                    LoopShape::HeaderBody { .. } => {
+                        push_jump(&mut func, orig_header_new, &tail_args);
+                    }
+                    LoopShape::SingleBlock { .. } => {
+                        let has_tail = push_icmp(&mut func, IntCond::Ult, vec_end, bound_new);
+                        let mut direct_exit_args: Vec<u32, A> = Vec::with_capacity_in(plan.single_exit_args.len(), alloc);
+                        for &ea in &plan.single_exit_args {
+                            if let Some(ridx) = plan.reductions.iter().position(|r| r.update_inst == ea) {
+                                direct_exit_args.push(at(&red_scalar_vals, ridx));
+                            } else {
+                                direct_exit_args.push(at(&val_map, to_idx(ea)));
+                            }
+                        }
+                        push_br(&mut func, has_tail, orig_header_new, &tail_args, orig_exit_new, &direct_exit_args);
+                    }
                 }
             }
         } else {
@@ -2141,6 +2814,7 @@ pub fn vectorize_iv_div_loops<A: Allocator + Copy>(
             reductions.push(ReductionSpec {
                 param_pos: pos,
                 param_inst: p_inst,
+                acc_ty: Ty::I64,
                 init_val: at(&pre_args, pos),
                 op: bop,
                 flags: Flags::NONE,
@@ -2651,7 +3325,7 @@ pub fn vectorize_iv_div_loops<A: Allocator + Copy>(
                         // Canonical `uadalp.2d` pattern: zero-extend & pairwise add `<4 x i32>` into `<2 x i64>`!
                         let elem_val = match red.input {
                             ReductionInput::Elem(ev) => ev,
-                            ReductionInput::Fma { .. } => NONE,
+                            ReductionInput::Fma { .. } | ReductionInput::CountCond { .. } => NONE,
                         };
                         let e_vec = at(&vmap, to_idx(elem_val));
                         let bc = push_inst(&mut func, Op::Bitcast, Flags::NONE, vec_ty, e_vec, 0);
@@ -2840,7 +3514,7 @@ pub fn vectorize_iv_div_loops<A: Allocator + Copy>(
                     for (ridx, red) in plan.reductions.iter().enumerate() {
                         let elem_val = match red.input {
                             ReductionInput::Elem(ev) => ev,
-                            ReductionInput::Fma { .. } => NONE,
+                            ReductionInput::Fma { .. } | ReductionInput::CountCond { .. } => NONE,
                         };
                         let acc_u = vacc_params.get(ridx).and_then(|row| row.get(u)).copied().unwrap_or(NONE);
                         let nv = push_bin(
@@ -3632,5 +4306,178 @@ mod tests {
         assert_eq!(v.block(Block(2)).filter(|&k| v.op(k) == Op::PtrAdd).count(), 2);
         // `vec_reduce` (block 3) needs 0 params (uses `vec_end` from `vec_pre`).
         assert_eq!(v.params(Block(3)).len(), 0);
+    }
+
+    #[test]
+    fn auto_vectorizes_count_lt_u32_pointer_iv_and_counted_iv_widening_u64() {
+        use crate::ty::Scalar;
+        let v4i32 = Ty::vector(Scalar::I32, 4).unwrap();
+        let v4i1 = Ty::vector(Scalar::I1, 4).unwrap();
+
+        // 1. Pointer-IV `count_lt_u32`: `for &x in xs { if x < thresh { c += 1; } }` with `Select(cond, 1u64, 0u64)`.
+        let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::I32)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let [entry, header, body, exit] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+        b.begin(entry);
+        let ptr = b.param(Ty::PTR);
+        let end = b.param(Ty::PTR);
+        let thresh = b.param(Ty::I32);
+        let z64 = b.iconst(Ty::I64, 0);
+        let one64 = b.iconst(Ty::I64, 1);
+        let four = b.iconst(Ty::I64, 4);
+        b.jump((header, &[ptr, z64]));
+
+        b.begin(header);
+        let p = b.param(Ty::PTR);
+        let acc = b.param(Ty::I64);
+        let keep = b.icmp(IntCond::Ne, p, end);
+        b.br(Flags::NONE, keep, (body, &[]), (exit, &[acc]));
+
+        b.begin(body);
+        let x = b.load(Ty::I32, Flags::NONE, p, 0, MemAttrs::aligned(2));
+        let cond = b.icmp(IntCond::Ult, x, thresh);
+        let inc = b.select(Flags::NONE, cond, one64, z64);
+        let acc2 = b.binary(Op::Add, Flags::NONE, acc, inc);
+        let p2 = b.ptr_add(Flags::NONE, p, four);
+        b.jump((header, &[p2, acc2]));
+
+        b.begin(exit);
+        let res = b.param(Ty::I64);
+        b.ret(&[res]);
+        let func_ptr = b.finish_checked().unwrap();
+
+        let out_ptr = auto_vectorize_loops(func_ptr.view(), TestHeap).unwrap();
+        verify(out_ptr.func.view()).unwrap();
+        assert_eq!(out_ptr.stats.loops_vectorized, 1);
+        let vp = out_ptr.func.view();
+        assert_eq!(
+            (0..vp.len()).filter(|&k| vp.op(k) == Op::Load && Ty(vp.tys[k]) == v4i32).count(),
+            4,
+            "expected 4x-unrolled <4 x i32> loads (16 u32s / iter)"
+        );
+        assert_eq!(
+            (0..vp.len()).filter(|&k| vp.op(k) == Op::Icmp && Ty(vp.tys[k]) == v4i1).count(),
+            4,
+            "expected 4x-unrolled <4 x i1> NEON cmhi masks"
+        );
+        assert_eq!(
+            (0..vp.len()).filter(|&k| vp.op(k) == Op::Select && Ty(vp.tys[k]) == v4i32).count(),
+            4,
+            "expected 4x-unrolled zero-cost Select(mask, -1, 0)"
+        );
+        assert_eq!(
+            (0..vp.len()).filter(|&k| vp.op(k) == Op::Sub && Ty(vp.tys[k]) == v4i32).count(),
+            4,
+            "expected 4x-unrolled sub.4s mask accumulators"
+        );
+        assert!((0..vp.len()).any(|k| vp.op(k) == Op::ReduceAdd && Ty(vp.tys[k]) == Ty::I32));
+        assert!((0..vp.len()).any(|k| vp.op(k) == Op::Zext && Ty(vp.tys[k]) == Ty::I64));
+
+        // 2. Counted-IV `count_lt_u32`: `for i in 0..n` with `Zext(Icmp(Ult, x, thresh) -> i64)`.
+        let mut c = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+        let csig = c.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::PTR), Param::of(Ty::I64), Param::of(Ty::I32)],
+            &[Param::of(Ty::I64)],
+        );
+        c.set_signature(csig);
+        let [centry, cheader, cbody, cexit] = [(); 4].map(|_| c.create_block(BlockKind::Normal));
+        c.begin(centry);
+        let cptr = c.param(Ty::PTR);
+        let cn = c.param(Ty::I64);
+        let cthresh = c.param(Ty::I32);
+        let cz = c.iconst(Ty::I64, 0);
+        let cone = c.iconst(Ty::I64, 1);
+        let ctwo = c.iconst(Ty::I64, 2);
+        c.jump((cheader, &[cz, cz]));
+
+        c.begin(cheader);
+        let ci = c.param(Ty::I64);
+        let cacc = c.param(Ty::I64);
+        let ckeep = c.icmp(IntCond::Ult, ci, cn);
+        c.br(Flags::NONE, ckeep, (cbody, &[]), (cexit, &[cacc]));
+
+        c.begin(cbody);
+        let coff = c.binary(Op::Shl, Flags::NONE, ci, ctwo);
+        let cp = c.ptr_add(Flags::NONE, cptr, coff);
+        let cx = c.load(Ty::I32, Flags::NONE, cp, 0, MemAttrs::aligned(2));
+        let ccond = c.icmp(IntCond::Ult, cx, cthresh);
+        let cinc = c.convert(Op::Zext, Flags::NONE, Ty::I64, ccond);
+        let cacc2 = c.binary(Op::Add, Flags::NONE, cacc, cinc);
+        let ci2 = c.binary(Op::Add, Flags::NONE, ci, cone);
+        c.jump((cheader, &[ci2, cacc2]));
+
+        c.begin(cexit);
+        let cres = c.param(Ty::I64);
+        c.ret(&[cres]);
+        let func_cnt = c.finish_checked().unwrap();
+
+        let out_cnt = auto_vectorize_loops(func_cnt.view(), TestHeap).unwrap();
+        verify(out_cnt.func.view()).unwrap();
+        assert_eq!(out_cnt.stats.loops_vectorized, 1);
+        let vc = out_cnt.func.view();
+        assert_eq!((0..vc.len()).filter(|&k| vc.op(k) == Op::Sub && Ty(vc.tys[k]) == v4i32).count(), 4);
+    }
+
+    #[test]
+    fn auto_vectorizes_sum_u64_pointer_iv_4x_unrolled_and_verifies() {
+        use crate::ty::Scalar;
+        let v2i64 = Ty::vector(Scalar::I64, 2).unwrap();
+
+        // Pointer-IV `sum_u64` with `Eq` swapped exit (`if p == end { break }`), `p += 8`.
+        let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::PTR), Param::of(Ty::PTR)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let [entry, header, body, exit] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+        b.begin(entry);
+        let ptr = b.param(Ty::PTR);
+        let end = b.param(Ty::PTR);
+        let z64 = b.iconst(Ty::I64, 0);
+        let eight = b.iconst(Ty::I64, 8);
+        b.jump((header, &[ptr, z64]));
+
+        b.begin(header);
+        let p = b.param(Ty::PTR);
+        let acc = b.param(Ty::I64);
+        let done = b.icmp(IntCond::Eq, p, end);
+        b.br(Flags::NONE, done, (exit, &[acc]), (body, &[]));
+
+        b.begin(body);
+        let x = b.load(Ty::I64, Flags::NONE, p, 0, MemAttrs::aligned(3));
+        let acc2 = b.binary(Op::Add, Flags::NONE, acc, x);
+        let p2 = b.ptr_add(Flags::NONE, p, eight);
+        b.jump((header, &[p2, acc2]));
+
+        b.begin(exit);
+        let res = b.param(Ty::I64);
+        b.ret(&[res]);
+        let func = b.finish_checked().unwrap();
+
+        let out = auto_vectorize_loops(func.view(), TestHeap).unwrap();
+        verify(out.func.view()).unwrap();
+        assert_eq!(out.stats.loops_vectorized, 1);
+        let v = out.func.view();
+        assert_eq!(
+            (0..v.len()).filter(|&k| v.op(k) == Op::Load && Ty(v.tys[k]) == v2i64).count(),
+            4,
+            "expected 4x-unrolled <2 x i64> loads (8 u64s / iter = 64B/iter)"
+        );
+        assert!(
+            (0..v.len()).filter(|&k| v.op(k) == Op::Add && Ty(v.tys[k]) == v2i64).count() >= 4,
+            "expected 4 independent <2 x i64> accumulators"
+        );
+        assert!((0..v.len()).any(|k| v.op(k) == Op::ReduceAdd && Ty(v.tys[k]) == Ty::I64));
     }
 }

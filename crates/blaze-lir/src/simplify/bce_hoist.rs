@@ -67,8 +67,8 @@ impl BceHoistOpts {
     /// SOTA default budgets for 1D vectorizable loops and 2D/3D matrix nests.
     pub const fn default_sota() -> Self {
         Self {
-            max_loop_blocks: 32,
-            max_loop_insts: 256,
+            max_loop_blocks: 64,
+            max_loop_insts: 512,
             max_checks: 16,
         }
     }
@@ -470,8 +470,10 @@ fn dom_intersect(idom: &[u32], order: &[u32], mut a: u32, mut b: u32) -> u32 {
 ///
 /// - `b` is NOT in `in_loop` (cannot reach `header`), and
 /// - `b` terminates directly in `Op::Trap` or `Op::Unreachable` (optionally after a `#[cold]` /
-///   `#[noreturn]` panic `Op::Call`), OR follows a short chain (<= `MAX_SINK_HOPS`) of
-///   non-loop `Op::Jump` trampolines to a block terminating in `Op::Trap` or `Op::Unreachable`.
+///   `#[noreturn]` panic `Op::Call`), OR terminates in an unwinding panic `Op::Invoke` /
+///   `Op::InvokeIndirect` whose normal continuation leads to `Op::Trap`/`Op::Unreachable` and whose
+///   unwind pad is outside `in_loop`, OR follows a short chain (<= `MAX_SINK_HOPS`) of non-loop
+///   `Op::Jump` trampolines to a block terminating in `Op::Trap` or `Op::Unreachable`.
 fn is_panic_sink_block(view: &View<'_>, mut b: u32, in_loop: &[bool]) -> bool {
     let mut visited = [NONE; MAX_SINK_HOPS];
     for hop in 0..MAX_SINK_HOPS {
@@ -490,10 +492,88 @@ fn is_panic_sink_block(view: &View<'_>, mut b: u32, in_loop: &[bool]) -> bool {
                 let pos = to_idx(at(view.data, term));
                 b = at(view.extra, pos);
             }
+            Op::Invoke | Op::InvokeIndirect => {
+                // Layout: `[Ref|Value, Sig, Block(normal), Block(unwind), Values]`.
+                let pos = to_idx(at(view.data, term));
+                let normal_blk = at(view.extra, pos + 2);
+                let unwind_blk = at(view.extra, pos + 3);
+                if to_idx(unwind_blk) >= view.blocks() || at(in_loop, to_idx(unwind_blk)) {
+                    return false;
+                }
+                b = normal_blk;
+            }
             _ => return false,
         }
     }
     false
+}
+
+/// Unwraps up to 4 layers of boolean wrappers (`Op::Not`, `Op::Xor(_, 1)`, or `Op::Icmp(Eq|Ne,
+/// bool_or_zext_bool, 0|1)`) around an `i1` condition, returning `(inner_cond, flipped)`.
+fn unwrap_bool_cond(view: &View<'_>, mut cond_val: u32) -> (u32, bool) {
+    let mut flipped = false;
+    for _ in 0..4 {
+        let ci = to_idx(cond_val);
+        if ci >= view.len() {
+            break;
+        }
+        match view.op(ci) {
+            Op::Not => {
+                cond_val = at(view.data, ci);
+                flipped = !flipped;
+            }
+            Op::Xor => {
+                let pos = to_idx(at(view.data, ci));
+                let (l, r) = (at(view.extra, pos), at(view.extra, pos + 1));
+                if const_u64(view, to_idx(r)) == Some(1) {
+                    cond_val = l;
+                    flipped = !flipped;
+                } else if const_u64(view, to_idx(l)) == Some(1) {
+                    cond_val = r;
+                    flipped = !flipped;
+                } else {
+                    break;
+                }
+            }
+            Op::Icmp => {
+                let cat = to_idx(at(view.data, ci));
+                let Some(ic) = IntCond::from_word(at(view.extra, cat)) else {
+                    break;
+                };
+                if ic != IntCond::Eq && ic != IntCond::Ne {
+                    break;
+                }
+                let (lhs, rhs) = (at(view.extra, cat + 1), at(view.extra, cat + 2));
+                let (val, c) = if let Some(k) = const_u64(view, to_idx(rhs)).filter(|&k| k <= 1) {
+                    (lhs, k)
+                } else if let Some(k) = const_u64(view, to_idx(lhs)).filter(|&k| k <= 1) {
+                    (rhs, k)
+                } else {
+                    break;
+                };
+                let vi = to_idx(val);
+                let inner_i1 = if Ty(at(view.tys, vi)) == Ty::I1 {
+                    val
+                } else if view.op(vi) == Op::Zext {
+                    let src = at(view.data, vi);
+                    if Ty(at(view.tys, to_idx(src))) == Ty::I1 {
+                        src
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                };
+                let is_inverted = (c == 0 && ic == IntCond::Eq) || (c == 1 && ic == IntCond::Ne);
+                cond_val = inner_i1;
+                if is_inverted {
+                    flipped = !flipped;
+                }
+            }
+            _ => break,
+        }
+    }
+    (cond_val, flipped)
 }
 
 // ---------------------------------------------------------------------------
@@ -556,17 +636,26 @@ fn is_step_one(view: &View<'_>, inst: u32, iv: u32) -> bool {
         || (b == iv && const_u64(view, to_idx(a)) == Some(1))
 }
 
-/// Parses `cond` testing `iv < bound` (true -> stay, false -> exit) or swapped/inverted equivalents.
+/// Parses `cond` testing `iv < bound` (true -> stay, false -> exit) or swapped/inverted equivalents
+/// (including `iv != bound` / `!(iv == bound)` when `start_is_zero`).
 /// Returns `(bound, is_signed)`.
-fn parse_lt_cond(view: &View<'_>, cond_val: u32, iv_val: u32, stay_is_then: bool) -> Option<(u32, bool)> {
-    let ci = to_idx(cond_val);
+fn parse_lt_cond(
+    view: &View<'_>,
+    cond_val: u32,
+    iv_val: u32,
+    start_is_zero: bool,
+    stay_is_then: bool,
+) -> Option<(u32, bool)> {
+    let (inner_cond, flipped) = unwrap_bool_cond(view, cond_val);
+    let stay = stay_is_then ^ flipped;
+    let ci = to_idx(inner_cond);
     if view.op(ci) != Op::Icmp {
         return None;
     }
     let cat = to_idx(at(view.data, ci));
     let cond = IntCond::from_word(at(view.extra, cat))?;
     let (lhs, rhs) = (at(view.extra, cat + 1), at(view.extra, cat + 2));
-    if stay_is_then {
+    if stay {
         if lhs == iv_val && cond == IntCond::Ult {
             Some((rhs, false))
         } else if lhs == iv_val && cond == IntCond::Slt {
@@ -575,6 +664,10 @@ fn parse_lt_cond(view: &View<'_>, cond_val: u32, iv_val: u32, stay_is_then: bool
             Some((lhs, false))
         } else if rhs == iv_val && cond == IntCond::Sgt {
             Some((lhs, true))
+        } else if start_is_zero && cond == IntCond::Ne && lhs == iv_val {
+            Some((rhs, false))
+        } else if start_is_zero && cond == IntCond::Ne && rhs == iv_val {
+            Some((lhs, false))
         } else {
             None
         }
@@ -586,6 +679,10 @@ fn parse_lt_cond(view: &View<'_>, cond_val: u32, iv_val: u32, stay_is_then: bool
         Some((lhs, false))
     } else if rhs == iv_val && cond == IntCond::Sle {
         Some((lhs, true))
+    } else if start_is_zero && cond == IntCond::Eq && lhs == iv_val {
+        Some((rhs, false))
+    } else if start_is_zero && cond == IntCond::Eq && rhs == iv_val {
+        Some((lhs, false))
     } else {
         None
     }
@@ -600,7 +697,9 @@ fn preheader_guards_entry(
     is_signed: bool,
     enter_is_then: bool,
 ) -> bool {
-    let ci = to_idx(cond_val);
+    let (inner_cond, flipped) = unwrap_bool_cond(view, cond_val);
+    let enter = enter_is_then ^ flipped;
+    let ci = to_idx(inner_cond);
     if view.op(ci) != Op::Icmp {
         return false;
     }
@@ -615,7 +714,7 @@ fn preheader_guards_entry(
     let lhs_bound = same_val_or_const(view, lhs, bound);
     let rhs_bound = same_val_or_const(view, rhs, bound);
 
-    if enter_is_then {
+    if enter {
         if is_signed {
             (lhs_start && rhs_bound && cond == IntCond::Slt)
                 || (lhs_bound && rhs_start && cond == IntCond::Sgt)
@@ -674,23 +773,31 @@ fn discover_counted_loops<A: Allocator + Copy>(
         if back_latches.is_empty() {
             continue;
         }
-        set_at(&mut loop_header_or_exit_br, h, true);
+        // Mark back-latch `Op::Br` blocks as loop exits immediately; mark `header` too unless
+        // this turns out to be a multi-block post-tested/rotated loop (where `header` is the
+        // start of the body and may itself end in a hoistable bounds-check branch!).
         for &bl in &back_latches {
             if view.op(view.terminator(Block(bl))) == Op::Br {
                 set_at(&mut loop_header_or_exit_br, to_idx(bl), true);
             }
         }
+        let mark_header_as_exit = |mask: &mut [bool]| {
+            set_at(mask, h, true);
+        };
 
         // Only consider `BlockKind::Normal` loops (skips already-versioned `BlockKind::Cold` fallbacks).
         if view.block_kind(Block(header)) != BlockKind::Normal {
+            mark_header_as_exit(&mut loop_header_or_exit_br);
             continue;
         }
         if back_latches.len() != 1 || outside_preds.len() != 1 {
+            mark_header_as_exit(&mut loop_header_or_exit_br);
             continue;
         }
         let latch = at(&back_latches, 0);
         let preheader = at(&outside_preds, 0);
         if view.block_kind(Block(preheader)) != BlockKind::Normal || !cfg.dominates(preheader, header) {
+            mark_header_as_exit(&mut loop_header_or_exit_br);
             continue;
         }
 
@@ -729,17 +836,20 @@ fn discover_counted_loops<A: Allocator + Copy>(
             }
         }
         if malformed {
+            mark_header_as_exit(&mut loop_header_or_exit_br);
             continue;
         }
         loop_blocks.sort_unstable();
 
         // Reject loops containing landing blocks.
         if loop_blocks.iter().any(|&bb| view.block_kind(Block(bb)).is_landing()) {
+            mark_header_as_exit(&mut loop_header_or_exit_br);
             continue;
         }
 
         let h_params = view.params(Block(header));
         if h_params.is_empty() {
+            mark_header_as_exit(&mut loop_header_or_exit_br);
             continue;
         }
 
@@ -748,6 +858,7 @@ fn discover_counted_loops<A: Allocator + Copy>(
         let (pre_args, preheader_is_jump, pre_br_skip) =
             if let Some((tgt, args)) = read_jump(view, pre_term, alloc) {
                 if tgt != header || args.len() != h_params.len() {
+                    mark_header_as_exit(&mut loop_header_or_exit_br);
                     continue;
                 }
                 (args, true, None)
@@ -757,14 +868,17 @@ fn discover_counted_loops<A: Allocator + Copy>(
                 } else if br.e_blk == header && br.t_blk != header && br.e_args.len() == h_params.len() {
                     (br.e_args, false, Some((br.cond, false, br.t_blk)))
                 } else {
+                    mark_header_as_exit(&mut loop_header_or_exit_br);
                     continue;
                 }
             } else {
+                mark_header_as_exit(&mut loop_header_or_exit_br);
                 continue;
             };
 
         let latch_term = view.terminator(Block(latch));
         if let Some((back_tgt, back_args)) = read_jump(view, latch_term, alloc) {
+            mark_header_as_exit(&mut loop_header_or_exit_br);
             // Pre-tested loop (`HeaderBody` / multi-block).
             if back_tgt != header || back_args.len() != h_params.len() || latch == header {
                 continue;
@@ -796,7 +910,9 @@ fn discover_counted_loops<A: Allocator + Copy>(
                 if !is_step_one(view, back_v, p_inst) {
                     continue;
                 }
-                if let Some((bound, is_signed)) = parse_lt_cond(view, h_br.cond, p_inst, stay_is_then)
+                let start_is_zero = const_u64(view, to_idx(start_v)) == Some(0);
+                if let Some((bound, is_signed)) =
+                    parse_lt_cond(view, h_br.cond, p_inst, start_is_zero, stay_is_then)
                     && !at(&in_loop, to_idx(at(&cfg.inst_block, to_idx(bound))))
                 {
                     found = Some((p_inst, p_ty, start_v, bound, is_signed));
@@ -830,6 +946,7 @@ fn discover_counted_loops<A: Allocator + Copy>(
                 {
                     (false, l_br.e_args, l_br.t_blk)
                 } else {
+                    mark_header_as_exit(&mut loop_header_or_exit_br);
                     continue;
                 };
 
@@ -846,7 +963,9 @@ fn discover_counted_loops<A: Allocator + Copy>(
                 if !is_step_one(view, back_v, p_inst) {
                     continue;
                 }
-                if let Some((bound, is_signed)) = parse_lt_cond(view, l_br.cond, back_v, stay_is_then)
+                let start_is_zero = const_u64(view, to_idx(start_v)) == Some(0);
+                if let Some((bound, is_signed)) =
+                    parse_lt_cond(view, l_br.cond, back_v, start_is_zero, stay_is_then)
                     && !at(&in_loop, to_idx(at(&cfg.inst_block, to_idx(bound))))
                 {
                     found = Some((p_inst, p_ty, start_v, bound, is_signed));
@@ -854,6 +973,7 @@ fn discover_counted_loops<A: Allocator + Copy>(
                 }
             }
             let Some((iv_inst, iv_ty, start, bound, is_signed)) = found else {
+                mark_header_as_exit(&mut loop_header_or_exit_br);
                 continue;
             };
 
@@ -870,7 +990,11 @@ fn discover_counted_loops<A: Allocator + Copy>(
                 }
             };
             if !entry_guarded {
+                mark_header_as_exit(&mut loop_header_or_exit_br);
                 continue;
+            }
+            if latch == header {
+                mark_header_as_exit(&mut loop_header_or_exit_br);
             }
 
             counted.push(CountedLoop {
@@ -886,6 +1010,8 @@ fn discover_counted_loops<A: Allocator + Copy>(
                 in_loop,
                 loop_blocks,
             });
+        } else {
+            mark_header_as_exit(&mut loop_header_or_exit_br);
         }
     }
 
@@ -953,6 +1079,10 @@ enum IdxExpr {
         stride: TermVal,
         inner_active: usize,
         offset: u64,
+    },
+    /// Statically upper-bounded unsigned index (e.g. `(inp[i] & 15) as usize` -> `max_val = 15`).
+    Bounded {
+        max_val: u64,
     },
     Unknown,
 }
@@ -1160,6 +1290,132 @@ fn eval_idx_expr<A: Allocator + Copy>(
     IdxExpr::Unknown
 }
 
+/// Returns `Some(max_val)` if `root` is statically upper-bounded in `0..=max_val` (unsigned)
+/// via bitmask (`And(_, mask)`), unsigned shift of a narrow integer (`Lshr(i8, k)`), or `Zext` of
+/// a narrow integer (`i8` -> `255`, `i16` -> `65535`). Iterative, zero recursion.
+fn proven_bounded_max(view: &View<'_>, mut cur: u32) -> Option<u64> {
+    let mut best: Option<u64> = None;
+    for _ in 0..4 {
+        let ci = to_idx(cur);
+        if ci >= view.len() {
+            break;
+        }
+        let ty = Ty(at(view.tys, ci));
+        if ty == Ty::I8 {
+            best = Some(best.map_or(255u64, |b| b.min(255u64)));
+        } else if ty == Ty::I16 {
+            best = Some(best.map_or(65_535u64, |b| b.min(65_535u64)));
+        }
+        match view.op(ci) {
+            Op::Zext => {
+                cur = at(view.data, ci);
+            }
+            Op::And => {
+                let pos = to_idx(at(view.data, ci));
+                let (l, r) = (at(view.extra, pos), at(view.extra, pos + 1));
+                if let Some(m) = const_u64(view, to_idx(r)) {
+                    return Some(best.map_or(m, |b| b.min(m)));
+                }
+                if let Some(m) = const_u64(view, to_idx(l)) {
+                    return Some(best.map_or(m, |b| b.min(m)));
+                }
+                break;
+            }
+            Op::Lshr => {
+                let pos = to_idx(at(view.data, ci));
+                let (l, r) = (at(view.extra, pos), at(view.extra, pos + 1));
+                let lty = Ty(at(view.tys, to_idx(l)));
+                if let Some(k) = const_u64(view, to_idx(r))
+                    && lty.is_scalar()
+                    && lty.is_int()
+                {
+                    let bits = u64::from(lty.bits(view.head.ptr_bits));
+                    if bits > 0 && bits <= 64 && k < bits {
+                        let type_max = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+                        let shifted = type_max >> k;
+                        return Some(best.map_or(shifted, |b| b.min(shifted)));
+                    }
+                }
+                break;
+            }
+            _ => break,
+        }
+    }
+    best
+}
+
+/// Returns `true` if `lhs <=u rhs` is statically guaranteed by equality, constants, `Op::Umin`,
+/// or min-shaped `Op::Select` (e.g. `n = y.len().min(x.len())`). Iterative, zero recursion.
+fn proves_ule(view: &View<'_>, lhs: u32, rhs: u32) -> bool {
+    let mut stack = [NONE; 8];
+    let mut sp = 1usize;
+    set_at(&mut stack, 0, lhs);
+    for _ in 0..16 {
+        if sp == 0 {
+            return false;
+        }
+        sp -= 1;
+        let cur = at(&stack, sp);
+        if same_val_or_const(view, cur, rhs) {
+            return true;
+        }
+        let ci = to_idx(cur);
+        if ci >= view.len() {
+            continue;
+        }
+        if let (Some(a), Some(b)) = (const_u64(view, ci), const_u64(view, to_idx(rhs)))
+            && a <= b
+        {
+            return true;
+        }
+        match view.op(ci) {
+            Op::Umin => {
+                let pos = to_idx(at(view.data, ci));
+                let (a, b) = (at(view.extra, pos), at(view.extra, pos + 1));
+                if sp < stack.len() {
+                    set_at(&mut stack, sp, a);
+                    sp += 1;
+                }
+                if sp < stack.len() {
+                    set_at(&mut stack, sp, b);
+                    sp += 1;
+                }
+            }
+            Op::Select => {
+                let pos = to_idx(at(view.data, ci));
+                let (cv, tv, fv) = (
+                    at(view.extra, pos),
+                    at(view.extra, pos + 1),
+                    at(view.extra, pos + 2),
+                );
+                let (inner_c, flipped) = unwrap_bool_cond(view, cv);
+                let ii = to_idx(inner_c);
+                if view.op(ii) == Op::Icmp {
+                    let cat = to_idx(at(view.data, ii));
+                    if let Some(ic) = IntCond::from_word(at(view.extra, cat)) {
+                        let (x, y) = (at(view.extra, cat + 1), at(view.extra, cat + 2));
+                        let (t_eff, f_eff) = if flipped { (fv, tv) } else { (tv, fv) };
+                        let is_umin = (matches!(ic, IntCond::Ult | IntCond::Ule) && t_eff == x && f_eff == y)
+                            || (matches!(ic, IntCond::Ugt | IntCond::Uge) && t_eff == y && f_eff == x);
+                        if is_umin {
+                            if sp < stack.len() {
+                                set_at(&mut stack, sp, x);
+                                sp += 1;
+                            }
+                            if sp < stack.len() {
+                                set_at(&mut stack, sp, y);
+                                sp += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Deduplicatable overflow-free preheader guard condition.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum GuardCond {
@@ -1185,6 +1441,42 @@ enum GuardCond {
         offset: u64,
         len: TermVal,
     },
+    /// Statically upper-bounded index (e.g. `lut[(inp[i] & 15) as usize]`):
+    /// `(bound_outer == 0) || (max_val <u len)`.
+    BoundMax {
+        ty: Ty,
+        bound_outer: TermVal,
+        max_val: u64,
+        len: TermVal,
+    },
+}
+
+fn is_guard_trivially_true(view: &View<'_>, guard: GuardCond) -> bool {
+    match guard {
+        GuardCond::Bound1D { start: TermVal::Const(0), offset: 0, bound, len, .. } => {
+            if bound == len || bound == TermVal::Const(0) {
+                return true;
+            }
+            match (bound, len) {
+                (TermVal::Const(b), TermVal::Const(l)) => b <= l,
+                (TermVal::Inv(bv), TermVal::Inv(lv)) => proves_ule(view, bv, lv),
+                (TermVal::Inv(bv), TermVal::Const(l)) => {
+                    const_u64(view, to_idx(bv)).is_some_and(|b| b <= l)
+                }
+                _ => false,
+            }
+        }
+        GuardCond::BoundMax { bound_outer, max_val, len, .. } => {
+            if bound_outer == TermVal::Const(0) {
+                return true;
+            }
+            match len {
+                TermVal::Const(l) => max_val < l,
+                TermVal::Inv(lv) => const_u64(view, to_idx(lv)).is_some_and(|l| max_val < l),
+            }
+        }
+        _ => false,
+    }
 }
 
 /// One in-loop bounds-check `Op::Br` to replace with `Op::Jump(ok_blk, ok_args)` in `L_fast`.
@@ -1195,8 +1487,9 @@ struct HoistedBranch {
     trap_blk: u32,
 }
 
-/// Normalizes an in-loop bounds-check `Op::Br` (`Ult`, `Ugt`, `Uge`, `Ule`) with one panic-sink
-/// target into `(ok_is_then, trap_blk, idx, len, ty)`.
+/// Normalizes an in-loop bounds-check `Op::Br` (`Ult`, `Ugt`, `Uge`, `Ule`, including boolean
+/// negations via `Not`/`Xor(_, 1)`/`Icmp(Eq|Ne, zext(i1), 0|1)`) with one panic-sink target into
+/// `(ok_is_then, trap_blk, idx, len, ty)`.
 fn parse_bounds_check_br(
     view: &View<'_>,
     term: usize,
@@ -1220,7 +1513,8 @@ fn parse_bounds_check_br(
         return None;
     };
 
-    let ci = to_idx(cond_val);
+    let (inner_cond, flipped) = unwrap_bool_cond(view, cond_val);
+    let ci = to_idx(inner_cond);
     if view.op(ci) != Op::Icmp || at(view.flags, ci) != 0 {
         return None;
     }
@@ -1232,7 +1526,8 @@ fn parse_bounds_check_br(
         return None;
     }
 
-    let (idx, len) = if ok_is_then {
+    let check_ok_is_then = ok_is_then ^ flipped;
+    let (idx, len) = if check_ok_is_then {
         match cond {
             IntCond::Ult => (lhs, rhs),
             IntCond::Ugt => (rhs, lhs),
@@ -1280,6 +1575,21 @@ fn build_guard_cond(expr: IdxExpr, active_loops: &[ActiveLoop], len: TermVal, ty
                 bound_inner: inner.bound,
                 stride,
                 offset,
+                len,
+            })
+        }
+        IdxExpr::Bounded { max_val } => {
+            if !fits_in_ty(max_val, ty) {
+                return None;
+            }
+            let outer = active_loops.first().copied()?;
+            if outer.start != TermVal::Const(0) {
+                return None;
+            }
+            Some(GuardCond::BoundMax {
+                ty,
+                bound_outer: outer.bound,
+                max_val,
                 len,
             })
         }
@@ -1423,7 +1733,7 @@ fn find_version_plan<A: Allocator + Copy>(
                 continue;
             }
 
-            let expr = eval_idx_expr(
+            let expr = match eval_idx_expr(
                 view,
                 idx_val,
                 ty,
@@ -1431,7 +1741,13 @@ fn find_version_plan<A: Allocator + Copy>(
                 &outer.in_loop,
                 outer.preheader,
                 &cfg,
-            );
+            ) {
+                IdxExpr::Unknown => match proven_bounded_max(view, idx_val) {
+                    Some(max_val) => IdxExpr::Bounded { max_val },
+                    None => IdxExpr::Unknown,
+                },
+                other => other,
+            };
             let Some(guard) = build_guard_cond(expr, active_at_blk.as_slice(), len_tv, ty) else {
                 continue;
             };
@@ -1440,12 +1756,12 @@ fn find_version_plan<A: Allocator + Copy>(
                 break;
             }
             checks.push(HoistedBranch { br_inst: term, ok_is_then, trap_blk });
-            if unique_guards.scan_for(&guard).is_none() {
+            if !is_guard_trivially_true(view, guard) && unique_guards.scan_for(&guard).is_none() {
                 unique_guards.push(guard);
             }
         }
 
-        if checks.is_empty() || unique_guards.is_empty() {
+        if checks.is_empty() {
             continue;
         }
 
@@ -1547,11 +1863,16 @@ fn find_version_plan<A: Allocator + Copy>(
 
         let mut shared_exits: Vec<u32, A> = Vec::new_in(alloc);
         for b in 0..blocks {
+            let b32 = to_u32(b);
+            let is_trap_only = at(&trap_targets, b)
+                && !at(&fast_reaches_outside, b)
+                && escape_use_blocks.scan_for(&b32).is_none();
             if !at(&outer.in_loop, b)
                 && !at(&slow_only_sinks, b)
+                && !is_trap_only
                 && (at(&fast_reaches_outside, b) || at(&slow_reaches_outside, b))
             {
-                shared_exits.push(to_u32(b));
+                shared_exits.push(b32);
             }
         }
 
@@ -1694,6 +2015,15 @@ fn emit_guard_cond<A: Allocator>(
             }
 
             push_bin(func, Op::Or, Ty::I1, empty, in_bounds, loc)
+        }
+        GuardCond::BoundMax { ty, bound_outer, max_val, len } => {
+            let bo_v = emit_term_val(func, ty, bound_outer, val_map_out, loc);
+            let len_v = emit_term_val(func, ty, len, val_map_out, loc);
+            let zero_v = push_iconst(func, ty, 0, loc);
+            let empty = push_icmp(func, IntCond::Eq, bo_v, zero_v, loc);
+            let max_v = push_iconst(func, ty, max_val, loc);
+            let ok = push_icmp(func, IntCond::Ult, max_v, len_v, loc);
+            push_bin(func, Op::Or, Ty::I1, empty, ok, loc)
         }
     }
 }
@@ -2850,5 +3180,301 @@ mod tests {
             let actual = eval::run_in(hoisted.func.view(), &args, 50_000, TestHeap).unwrap();
             assert_eq!(expected, actual, "shifted mismatch for n={n_v}, la={la}, lb={lb}");
         }
+    }
+
+    #[test]
+    fn hoists_panic_bounds_check_call_invoke_and_shared_sink_in_3d_matmul() {
+        use crate::func::RefKind;
+
+        let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[
+                Param::of(Ty::PTR), // c
+                Param::of(Ty::PTR), // a
+                Param::of(Ty::PTR), // b
+                Param::of(Ty::I64), // n
+                Param::of(Ty::I64), // len_a
+                Param::of(Ty::I64), // len_b
+                Param::of(Ty::I64), // len_c
+            ],
+            &[],
+        );
+        b.set_signature(sig);
+        let panic_sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[],
+        );
+        let panic_fn = b.reference(RefKind::Func, 0);
+
+        let [
+            entry,
+            i_hdr,
+            i_body,
+            k_hdr,
+            k_body,
+            k_after_a,
+            j_hdr,
+            j_body,
+            j_after_b,
+            j_after_c,
+            k_latch,
+            i_latch,
+            panic_call_a,
+            shared_panic_invoke,
+            invoke_normal_unreach,
+            exit,
+        ] = [(); 16].map(|_| b.create_block(BlockKind::Normal));
+        let cleanup_pad = b.create_block(BlockKind::Cleanup);
+
+        b.begin(entry);
+        let pc = b.param(Ty::PTR);
+        let pa = b.param(Ty::PTR);
+        let pb = b.param(Ty::PTR);
+        let n = b.param(Ty::I64);
+        let len_a = b.param(Ty::I64);
+        let len_b = b.param(Ty::I64);
+        let len_c = b.param(Ty::I64);
+        let zero = b.iconst(Ty::I64, 0);
+        let one = b.iconst(Ty::I64, 1);
+        let four = b.iconst(Ty::I64, 4);
+        b.jump((i_hdr, &[zero]));
+
+        b.begin(i_hdr);
+        let i = b.param(Ty::I64);
+        let keep_i = b.icmp(IntCond::Ult, i, n);
+        b.br(Flags::NONE, keep_i, (i_body, &[]), (exit, &[]));
+
+        b.begin(i_body);
+        let i_n = b.binary(Op::Mul, Flags::NONE, i, n);
+        b.jump((k_hdr, &[zero]));
+
+        b.begin(k_hdr);
+        let k = b.param(Ty::I64);
+        let keep_k = b.icmp(IntCond::Ult, k, n);
+        b.br(Flags::NONE, keep_k, (k_body, &[]), (i_latch, &[]));
+
+        // Bounds check 1 (`Call` + `Op::Unreachable` panic sink, `Mul(idx, 4)` addressing).
+        b.begin(k_body);
+        let a_idx = b.binary(Op::Add, Flags::NONE, i_n, k);
+        let ok_a = b.icmp(IntCond::Ult, a_idx, len_a);
+        b.br(Flags::NONE, ok_a, (k_after_a, &[]), (panic_call_a, &[]));
+
+        b.begin(k_after_a);
+        let a_off = b.binary(Op::Mul, Flags::NONE, a_idx, four);
+        let a_ptr = b.ptr_add(Flags::NONE, pa, a_off);
+        let a_val = b.load(Ty::F32, Flags::NONE, a_ptr, 0, MemAttrs::aligned(2));
+        let k_n = b.binary(Op::Mul, Flags::NONE, k, n);
+        b.jump((j_hdr, &[zero]));
+
+        b.begin(j_hdr);
+        let j = b.param(Ty::I64);
+        let keep_j = b.icmp(IntCond::Ult, j, n);
+        b.br(Flags::NONE, keep_j, (j_body, &[]), (k_latch, &[]));
+
+        // Bounds check 2 (`Uge` -> shared `Op::Invoke` panic sink!).
+        b.begin(j_body);
+        let b_idx = b.binary(Op::Add, Flags::NONE, k_n, j);
+        let oob_b = b.icmp(IntCond::Uge, b_idx, len_b);
+        b.br(Flags::NONE, oob_b, (shared_panic_invoke, &[b_idx, len_b]), (j_after_b, &[]));
+
+        // Bounds check 3 (`Uge` -> same shared `Op::Invoke` panic sink!).
+        b.begin(j_after_b);
+        let b_off = b.binary(Op::Mul, Flags::NONE, b_idx, four);
+        let b_ptr = b.ptr_add(Flags::NONE, pb, b_off);
+        let b_val = b.load(Ty::F32, Flags::NONE, b_ptr, 0, MemAttrs::aligned(2));
+        let c_idx = b.binary(Op::Add, Flags::NONE, i_n, j);
+        let oob_c = b.icmp(IntCond::Uge, c_idx, len_c);
+        b.br(Flags::NONE, oob_c, (shared_panic_invoke, &[c_idx, len_c]), (j_after_c, &[]));
+
+        b.begin(j_after_c);
+        let c_off = b.binary(Op::Mul, Flags::NONE, c_idx, four);
+        let c_ptr = b.ptr_add(Flags::NONE, pc, c_off);
+        let c_val = b.load(Ty::F32, Flags::NONE, c_ptr, 0, MemAttrs::aligned(2));
+        let c_new = b.ternary(Op::Fmuladd, Flags::NONE, a_val, b_val, c_val);
+        b.store(Flags::NONE, c_new, c_ptr, 0, MemAttrs::aligned(2));
+        let j2 = b.binary(Op::Add, Flags::NONE, j, one);
+        b.jump((j_hdr, &[j2]));
+
+        b.begin(k_latch);
+        let k2 = b.binary(Op::Add, Flags::NONE, k, one);
+        b.jump((k_hdr, &[k2]));
+
+        b.begin(i_latch);
+        let i2 = b.binary(Op::Add, Flags::NONE, i, one);
+        b.jump((i_hdr, &[i2]));
+
+        b.begin(panic_call_a);
+        b.call(Flags::NONE, panic_fn, panic_sig, &[a_idx, len_a]);
+        b.unreachable();
+
+        b.begin(shared_panic_invoke);
+        let p_idx = b.param(Ty::I64);
+        let p_len = b.param(Ty::I64);
+        b.invoke(Flags::NONE, panic_fn, panic_sig, &[p_idx, p_len], invoke_normal_unreach, cleanup_pad);
+
+        b.begin(invoke_normal_unreach);
+        b.unreachable();
+
+        b.begin(cleanup_pad);
+        let exc = b.param(Ty::PTR);
+        b.resume(exc);
+
+        b.begin(exit);
+        b.ret(&[]);
+        let func = b.finish_checked().unwrap();
+
+        let hoisted = hoist_loop_bounds_checks(func.view(), BceHoistOpts::default_sota(), TestHeap).unwrap();
+        verify(hoisted.func.view()).unwrap();
+        assert_eq!(hoisted.stats.loops_versioned, 1);
+        assert_eq!(hoisted.stats.checks_hoisted, 3);
+
+        // Collapsed fast 3D nest immediately unlocks Auto-SME2 GEMM lowering!
+        let sme2_out = optimize_gemm_loops(hoisted.func.view(), GemmOpts::sme2(), TestHeap).unwrap();
+        verify(sme2_out.func.view()).unwrap();
+        assert_eq!(sme2_out.stats.gemms_detected, 1);
+        assert_eq!(sme2_out.stats.sme2_lowered, 1);
+        assert!(find_intrinsic_call(sme2_out.func.view(), SME2_GEMM_F32_INTRINSIC).is_some());
+    }
+
+    #[test]
+    fn eliminates_min_len_bounds_checks_without_slow_clone_and_hoists_rotated_header_check() {
+        use crate::func::RefKind;
+
+        // 1. `n = y.len().min(x.len())` via `Select(Ult(len_y, len_x), len_y, len_x)` with
+        // `Call(panic_bounds_check)` + `Unreachable`: statically proven in-bounds -> zero slow clone!
+        let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[
+                Param::of(Ty::PTR), // y
+                Param::of(Ty::I64), // len_y
+                Param::of(Ty::PTR), // x
+                Param::of(Ty::I64), // len_x
+                Param::of(Ty::F32), // a
+            ],
+            &[],
+        );
+        b.set_signature(sig);
+        let panic_sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64), Param::of(Ty::I64)], &[]);
+        let panic_fn = b.reference(RefKind::Func, 0);
+
+        let [entry, header, body, after_x, after_y, oob_x, oob_y, exit] =
+            [(); 8].map(|_| b.create_block(BlockKind::Normal));
+
+        b.begin(entry);
+        let py = b.param(Ty::PTR);
+        let len_y = b.param(Ty::I64);
+        let px = b.param(Ty::PTR);
+        let len_x = b.param(Ty::I64);
+        let alpha = b.param(Ty::F32);
+        let y_lt_x = b.icmp(IntCond::Ult, len_y, len_x);
+        let n = b.select(Flags::NONE, y_lt_x, len_y, len_x);
+        let zero = b.iconst(Ty::I64, 0);
+        let one = b.iconst(Ty::I64, 1);
+        let four = b.iconst(Ty::I64, 4);
+        b.jump((header, &[zero]));
+
+        b.begin(header);
+        let i = b.param(Ty::I64);
+        let keep = b.icmp(IntCond::Ult, i, n);
+        b.br(Flags::NONE, keep, (body, &[]), (exit, &[]));
+
+        b.begin(body);
+        let oob1 = b.icmp(IntCond::Uge, i, len_x);
+        b.br(Flags::NONE, oob1, (oob_x, &[]), (after_x, &[]));
+
+        b.begin(after_x);
+        let oob2 = b.icmp(IntCond::Uge, i, len_y);
+        b.br(Flags::NONE, oob2, (oob_y, &[]), (after_y, &[]));
+
+        b.begin(after_y);
+        let off = b.binary(Op::Mul, Flags::NONE, i, four);
+        let p_x = b.ptr_add(Flags::NONE, px, off);
+        let p_y = b.ptr_add(Flags::NONE, py, off);
+        let vx = b.load(Ty::F32, Flags::NONE, p_x, 0, MemAttrs::aligned(2));
+        let vy = b.load(Ty::F32, Flags::NONE, p_y, 0, MemAttrs::aligned(2));
+        let res = b.ternary(Op::Fma, Flags::REASSOC, alpha, vx, vy);
+        b.store(Flags::NONE, res, p_y, 0, MemAttrs::aligned(2));
+        let i2 = b.binary(Op::Add, Flags::NONE, i, one);
+        b.jump((header, &[i2]));
+
+        b.begin(oob_x);
+        b.call(Flags::NONE, panic_fn, panic_sig, &[i, len_x]);
+        b.unreachable();
+
+        b.begin(oob_y);
+        b.call(Flags::NONE, panic_fn, panic_sig, &[i, len_y]);
+        b.unreachable();
+
+        b.begin(exit);
+        b.ret(&[]);
+        let saxpy_min = b.finish_checked().unwrap();
+
+        let hoisted = hoist_loop_bounds_checks(saxpy_min.view(), BceHoistOpts::default_sota(), TestHeap).unwrap();
+        verify(hoisted.func.view()).unwrap();
+        assert_eq!(hoisted.stats.loops_versioned, 1);
+        assert_eq!(hoisted.stats.checks_hoisted, 2);
+        let hv = hoisted.func.view();
+        assert_eq!((0..hv.len()).filter(|&k| hv.op(k) == Op::Call).count(), 0, "slow panic calls must be dead-eliminated");
+        assert_eq!((0..hv.len()).filter(|&k| hv.op(k) == Op::Unreachable).count(), 0);
+        let vec_out = auto_vectorize_loops(hv, TestHeap).unwrap();
+        verify(vec_out.func.view()).unwrap();
+        assert_eq!(vec_out.stats.loops_vectorized, 1);
+
+        // 2. Rotated post-tested loop whose `header` itself terminates in a bounds-check `Br`.
+        let mut r = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+        let rsig = r.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::PTR), Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        r.set_signature(rsig);
+        let r_psig = r.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64), Param::of(Ty::I64)], &[]);
+        let r_pfn = r.reference(RefKind::Func, 0);
+        let [rentry, rhdr, rlatch, roob, rexit] = [(); 5].map(|_| r.create_block(BlockKind::Normal));
+        r.begin(rentry);
+        let rp = r.param(Ty::PTR);
+        let rn = r.param(Ty::I64);
+        let rlen = r.param(Ty::I64);
+        let rz = r.iconst(Ty::I64, 0);
+        let rone = r.iconst(Ty::I64, 1);
+        let r3 = r.iconst(Ty::I64, 3);
+        let has_any = r.icmp(IntCond::Ult, rz, rn);
+        r.br(Flags::NONE, has_any, (rhdr, &[rz, rz]), (rexit, &[rz]));
+
+        r.begin(rhdr);
+        let ri = r.param(Ty::I64);
+        let racc = r.param(Ty::I64);
+        let oob = r.icmp(IntCond::Uge, ri, rlen);
+        r.br(Flags::NONE, oob, (roob, &[]), (rlatch, &[]));
+
+        r.begin(rlatch);
+        let roff = r.binary(Op::Shl, Flags::NONE, ri, r3);
+        let rptr = r.ptr_add(Flags::NONE, rp, roff);
+        let rv = r.load(Ty::I64, Flags::NONE, rptr, 0, MemAttrs::aligned(3));
+        let racc2 = r.binary(Op::Add, Flags::NONE, racc, rv);
+        let ri2 = r.binary(Op::Add, Flags::NONE, ri, rone);
+        let rkeep = r.icmp(IntCond::Ult, ri2, rn);
+        r.br(Flags::NONE, rkeep, (rhdr, &[ri2, racc2]), (rexit, &[racc2]));
+
+        r.begin(roob);
+        r.call(Flags::NONE, r_pfn, r_psig, &[ri, rlen]);
+        r.unreachable();
+
+        r.begin(rexit);
+        let rres = r.param(Ty::I64);
+        r.ret(&[rres]);
+        let rot = r.finish_checked().unwrap();
+
+        let rot_hoisted = hoist_loop_bounds_checks(rot.view(), BceHoistOpts::default_sota(), TestHeap).unwrap();
+        verify(rot_hoisted.func.view()).unwrap();
+        assert_eq!(rot_hoisted.stats.loops_versioned, 1);
+        assert_eq!(rot_hoisted.stats.checks_hoisted, 1);
     }
 }

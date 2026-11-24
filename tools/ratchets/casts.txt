@@ -35,7 +35,7 @@ blaze-cast	40
 blaze-cc	17
 blaze-cert	14
 blaze-check	108
-blaze-cli	670
+blaze-cli	674
 blaze-code	139
 blaze-columns	2
 blaze-comptime-sys	150
@@ -51,7 +51,7 @@ blaze-ed25519	5
 blaze-emit	568
 blaze-engine	119
 blaze-expand	284
-blaze-export	425
+blaze-export	411
 blaze-facts	12
 blaze-fetch	185
 blaze-file-items	94
@@ -80,7 +80,7 @@ blaze-launch-rt	458
 blaze-launcher	6
 blaze-lint	187
 blaze-lint-defs	21
-blaze-lir	1444
+blaze-lir	1423
 blaze-lower	304
 blaze-malloc	48
 blaze-manifest	6

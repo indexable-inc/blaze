@@ -25,6 +25,7 @@ pub mod egraph;
 pub mod escape;
 pub mod gemm;
 pub mod ifconv;
+pub mod jump_thread;
 pub mod loopnest;
 pub mod mach_egraph;
 pub mod memopt;
@@ -65,9 +66,11 @@ pub use egraph::{
 };
 pub use escape::{AllocRole, EscapeOutput, EscapeStats, EscapeSummary, promote_heap_to_stack, summarize_escape};
 pub use gemm::{
-    GemmOpts, GemmOutput, GemmStats, SME2_GEMM_F32_INTRINSIC, SME2_GEMM_F64_INTRINSIC, optimize_gemm_loops,
+    GemmOpts, GemmOutput, GemmStats, SME2_GEMM_F32_INTRINSIC, SME2_GEMM_F64_INTRINSIC,
+    SME2_GEMM_I8_I32_INTRINSIC, SME2_GEMM_U8_U32_INTRINSIC, optimize_gemm_loops,
 };
 pub use ifconv::{IfConvOutput, IfConvStats, if_convert};
+pub use jump_thread::thread_jumps;
 pub use loopnest::{LoopNestOutput, LoopNestStats, fuse_adjacent_loops, interchange_and_tile_loops};
 pub use mach_egraph::{
     AppleM5PortModel, CacheDecodeError, CachedRewrite, MachEGraphOpts, MachEGraphOutput, MachEGraphStats,

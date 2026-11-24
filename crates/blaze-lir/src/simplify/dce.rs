@@ -946,9 +946,21 @@ pub fn coalesce_cfg<A: Allocator + Copy>(view: View<'_>, alloc: A) -> Result<Fun
     for value in 0..len as u32 {
         stands.push(value);
     }
+    let mut inst_kept = filled(len, false, &alloc);
+    for b in 0..blocks {
+        if reached.get(b).copied().unwrap_or(false)
+            && let Ok(b_u32) = u32::try_from(b)
+        {
+            for inst in view.block(Block(b_u32)) {
+                if let Some(slot) = inst_kept.get_mut(inst) {
+                    *slot = true;
+                }
+            }
+        }
+    }
     let edit = Edit {
         block_kept: reached,
-        inst_kept: filled(len, true, &alloc),
+        inst_kept,
         stands,
         constant: filled(len, None, &alloc),
         jump: no_jumps,

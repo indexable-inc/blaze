@@ -30,7 +30,7 @@ use crate::{
     simplify::{
         RegBudget, SimplifyError, SuperoptOpts, auto_vectorize_loops, dead, eliminate_redundant_checks, if_convert,
         optimize_memory, propagate, scalar_replace, schedule_dag, slp_vectorize, sota_optimize_fixpoint,
-        speculative_devirt, superopt_a64, tail_duplicate_dispatch, unroll_scalar_loops, unswitch_loops,
+        speculative_devirt, superopt_a64, tail_duplicate_dispatch, thread_jumps, unroll_scalar_loops, unswitch_loops,
         vectorize_memchr_loops, IndirectTarget,
     },
     summary::FnSummary,
@@ -232,15 +232,18 @@ impl<A: Allocator> Bodies for ModuleBodies<'_, A> {
     }
 }
 
-/// Runs `scalar_replace -> propagate -> dead -> coalesce_cfg` on `view` in `alloc`.
+/// Runs `scalar_replace -> propagate -> thread_jumps -> propagate -> dead -> coalesce_cfg` on `view` in `alloc`.
 ///
-/// Coalescing single-predecessor `Jump` chains after inlining restores 2-block
-/// `HeaderBody` loop shapes so downstream loop passes (vectorization, unrolling,
-/// LICM) see the inlined loop body as a single block.
+/// Threading phi-discriminant `Option` checks and coalescing single-predecessor `Jump` chains
+/// after inlining restores 2-block `HeaderBody` loop shapes so downstream loop passes
+/// (bounds-check hoisting, GEMM, vectorization, unrolling, LICM) see the inlined loop body as
+/// a single block.
 fn simplify_body<A: Allocator + Copy>(view: View<'_>, alloc: A) -> Result<Func<A>, SimplifyError> {
     let sroa = scalar_replace(view, alloc)?;
-    let prop = propagate(sroa.view(), alloc)?;
-    let dce = dead(prop.view(), alloc)?;
+    let prop1 = propagate(sroa.view(), alloc)?;
+    let threaded = thread_jumps(prop1.view(), alloc)?;
+    let prop2 = propagate(threaded.view(), alloc)?;
+    let dce = dead(prop2.view(), alloc)?;
     crate::simplify::coalesce_cfg(dce.view(), alloc)
 }
 
@@ -484,13 +487,17 @@ impl Default for SotaLtoOpts {
 }
 
 /// Runs the full cross-function post-inline SOTA pipeline on one body:
-/// `SROA -> aegraph fixpoint -> BCE -> Loop Unswitching -> Memory LICM/DSE -> 4x SIMD Auto-Vectorization -> 4x Scalar Unrolling -> Bounded E-Graph Superopt`.
+/// `SROA -> prop -> thread_jumps -> prop -> DCE -> aegraph fixpoint -> BCE -> Loop Unswitching -> Memory LICM/DSE -> 4x SIMD Auto-Vectorization -> 4x Scalar Unrolling -> Bounded E-Graph Superopt`.
 fn sota_optimize_body<A: Allocator + Copy>(
     view: View<'_>,
     opts: SotaLtoOpts,
     alloc: A,
 ) -> Result<Func<A>, SimplifyError> {
     let mut cur = scalar_replace(view, alloc)?;
+    cur = propagate(cur.view(), alloc)?;
+    cur = thread_jumps(cur.view(), alloc)?;
+    cur = propagate(cur.view(), alloc)?;
+    cur = dead(cur.view(), alloc)?;
     cur = sota_optimize_fixpoint(cur.view(), opts.reg_budget, opts.max_aegraph_rounds, |_| 1, alloc)?.func;
     let bce = eliminate_redundant_checks(cur.view(), alloc)?;
     cur = bce.func;

@@ -12,9 +12,15 @@
 //! | const | `plan.const_head` bytes the writer fills (ELF's dynamic section), the GOT, the records' relro parts, read-only data | read only |
 //! | data | writable statics, then zeroed ones (no file bytes) | read, write |
 //!
-//! The order of functions: a profile's hot functions first, in its order; then a depth-first
-//! walk from the entry over each record's sites in code order and its words, so a caller sits
-//! just before its first callee; then whatever is left (reached only through data) by symbol.
+//! The order of functions: 16 KB Apple Silicon page-aware 3-tier BOLT / Ext-TSP / C³ layout
+//! ([`bolt_order_members`], shared with `optimized.rs`):
+//! 1. **Hot tier** (profile-weighted functions when a [`Profile`] is supplied, or direct-call
+//!    reachable non-trap functions from `entry` when none is supplied), merged into <= 16 KB
+//!    call-affinity chains and ranked by execution density (`weight / bytes`).
+//! 2. **Warm tier** (remaining direct-call reachable non-trap functions when a profile is supplied,
+//!    or code-loaded non-trap callbacks when none is), merged by 16 KB Ext-TSP call affinity.
+//! 3. **Cold tail** (noreturn trap/panic stubs, their exclusive callees, and relro/vtable/data-only
+//!    targets never reached by direct calls), packed after all hot and warm code.
 //! Equal records (equal bytes: code, relro part, targets, names) are placed once.
 //!
 //! Every address here is an image offset: the distance from the image's first byte (Mach-O's
@@ -150,15 +156,30 @@ impl Laid<'_, '_> {
 /// the layout stages shared by [`lay_out`] and [`crate::optimized::lay_out_records`].
 pub(crate) trait LayoutMember {
     fn symbol(&self) -> Symbol;
+    fn code(&self) -> &[u8];
     fn relro(&self) -> &[u8];
     fn words(&self) -> usize;
     fn word(&self, i: usize) -> Word;
     fn target(&self, i: usize) -> Target;
+    fn traps(&self) -> usize;
+    fn is_made_start(&self) -> bool;
+    /// Invokes `f` once per direct call/tail-call site targeting an in-program `Space::Func`,
+    /// in code offset order (preserving callsite multiplicity).
+    fn for_each_direct_call(&self, f: impl FnMut(Symbol));
+    /// Invokes `f` once per code-site address load targeting an in-program `Space::Func`,
+    /// in code offset order.
+    fn for_each_code_func_load(&self, f: impl FnMut(Symbol));
+    /// Invokes `f` once per relro word / `Abs64` targeting an in-program `Space::Func`,
+    /// in deterministic record order.
+    fn for_each_relro_func_ref(&self, f: impl FnMut(Symbol));
 }
 
 impl LayoutMember for Member<'_> {
     fn symbol(&self) -> Symbol {
         self.symbol
+    }
+    fn code(&self) -> &[u8] {
+        self.record.code()
     }
     fn relro(&self) -> &[u8] {
         self.record.relro()
@@ -171,6 +192,54 @@ impl LayoutMember for Member<'_> {
     }
     fn target(&self, i: usize) -> Target {
         self.record.target(i)
+    }
+    fn traps(&self) -> usize {
+        self.record.traps()
+    }
+    fn is_made_start(&self) -> bool {
+        self.tier.is_none()
+    }
+    fn for_each_direct_call(&self, mut f: impl FnMut(Symbol)) {
+        for s in 0..self.record.sites() {
+            let site = self.record.site(s);
+            if site.kind == SiteKind::Call
+                && site.target != NO_TARGET
+                && let Ok(idx) = usize::try_from(site.target)
+            {
+                let t = self.record.target(idx);
+                if t.space == Space::Func {
+                    f(t.symbol);
+                }
+            }
+        }
+    }
+    fn for_each_code_func_load(&self, mut f: impl FnMut(Symbol)) {
+        for s in 0..self.record.sites() {
+            let site = self.record.site(s);
+            if site.kind == SiteKind::Load
+                && site.target != NO_TARGET
+                && let Ok(idx) = usize::try_from(site.target)
+            {
+                let t = self.record.target(idx);
+                if t.space == Space::Func {
+                    f(t.symbol);
+                }
+            }
+        }
+    }
+    fn for_each_relro_func_ref(&self, mut f: impl FnMut(Symbol)) {
+        for w in 0..self.record.words() {
+            let word = self.record.word(w);
+            if word.target != OWN_CODE
+                && word.target != OWN_RELRO
+                && let Ok(idx) = usize::try_from(word.target)
+            {
+                let t = self.record.target(idx);
+                if t.space == Space::Func {
+                    f(t.symbol);
+                }
+            }
+        }
     }
 }
 
@@ -669,68 +738,742 @@ pub(crate) fn check_data<'a>(data: &[Data<'_>], tls_desc: Option<Symbol>, page: 
     Ok(by_target)
 }
 
-/// The placement order: profile first, then a depth-first walk from the entry, then the rest by
-/// symbol. A work list, no recursion.
-fn order<'a>(members: &[Member<'_>], by_symbol: &[u32], entry: usize, profile: Option<Profile<'_>>, alloc: Alloc<'a>) -> AVec<'a, u32> {
-    let n = members.len();
-    // `placed`: in `order`; `walked`: its callees pushed. A profile's function is placed before
-    // any walk and walked when the walk meets it.
-    let mut placed: AVec<'_, bool> = Vec::from_elem_in(false, n, alloc);
-    let mut walked: AVec<'_, bool> = Vec::from_elem_in(false, n, alloc);
-    let mut order: AVec<'a, u32> = Vec::with_capacity_in(n, alloc);
-    let hot = profile.map_or(&[][..], |p| p.hot);
-    for &symbol in hot {
-        if let Some(i) = find_member(members, by_symbol, symbol)
-            && !placed[i]
+/// Apple Silicon virtual-memory / iTLB page size (`hw.pagesize == 16384`).
+const APPLE_PAGE_BYTES: u64 = 16_384;
+/// Minimum cluster budget for 16 KB-page-aware Ext-TSP / C³ chain merging.
+const MIN_CLUSTER_PAGE_BYTES: u64 = 4_096;
+/// Code alignment between placed functions in `__text` (16-byte AArch64 fetch-group alignment).
+const CODE_ALIGN_BYTES: u64 = 16;
+
+#[inline]
+fn to_idx(v: u32) -> usize {
+    usize::try_from(v).unwrap_or(usize::MAX)
+}
+
+#[inline]
+fn to_u32(v: usize) -> u32 {
+    u32::try_from(v).unwrap_or(u32::MAX)
+}
+
+#[inline]
+fn at_bool(s: &[bool], i: usize) -> bool {
+    s.get(i).copied().unwrap_or(false)
+}
+
+#[inline]
+fn at_u32(s: &[u32], i: usize) -> u32 {
+    s.get(i).copied().unwrap_or(0)
+}
+
+#[inline]
+fn at_u64(s: &[u64], i: usize) -> u64 {
+    s.get(i).copied().unwrap_or(0)
+}
+
+#[inline]
+fn at_usize(s: &[usize], i: usize) -> usize {
+    s.get(i).copied().unwrap_or(0)
+}
+
+#[inline]
+fn set_at<T>(s: &mut [T], i: usize, v: T) {
+    if let Some(slot) = s.get_mut(i) {
+        *slot = v;
+    }
+}
+
+#[inline]
+fn align_up_u64(offset: u64, align: u64) -> u64 {
+    let a = align.max(1);
+    let rem = offset % a;
+    if rem == 0 { offset } else { offset.saturating_add(a - rem) }
+}
+
+/// Finds `symbol`'s canonical index in `0..by_symbol.len()` (invariant under permutations of
+/// `members`, Rule 25).
+fn find_sym_id<M: LayoutMember>(members: &[M], by_symbol: &[u32], symbol: Symbol) -> Option<usize> {
+    by_symbol
+        .binary_search_by(|&raw| {
+            members
+                .get(to_idx(raw))
+                .map_or(core::cmp::Ordering::Greater, |m| m.symbol().cmp(&symbol))
+        })
+        .ok()
+}
+
+/// Returns `true` when `m` contains a trap (`traps() > 0` or an AArch64 `brk` instruction) and has
+/// no normal return (`ret`/`retaa`/`retab`) or tail-call branch (`b`/`br`), identifying noreturn
+/// panic/trap stubs that belong in the cold tail.
+fn is_trap_stub<M: LayoutMember>(m: &M) -> bool {
+    let code = m.code();
+    if code.len() < 4 || code.len() % 4 != 0 {
+        return false;
+    }
+    let mut has_brk = m.traps() > 0;
+    let mut has_return_or_tail = false;
+    for chunk in code.chunks_exact(4) {
+        let Ok(bytes) = <[u8; 4]>::try_from(chunk) else {
+            continue;
+        };
+        let inst = u32::from_le_bytes(bytes);
+        // `ret` / `ret xN` (`0xD65F_0000` mask `0xFFFF_FC1F`), `retaa` / `retab`
+        // (`0xD65F_0BFF` / `0xD65F_0FFF`), unconditional tail branch `b imm26`
+        // (`0x1400_0000` mask `0xFC00_0000`), indirect tail branch `br xN`
+        // (`0xD61F_0000` mask `0xFFFF_FC1F`).
+        if (inst & 0xFFFF_FC1F) == 0xD65F_0000
+            || (inst & 0xFFFF_FBFF) == 0xD65F_0BFF
+            || (inst & 0xFC00_0000) == 0x1400_0000
+            || (inst & 0xFFFF_FC1F) == 0xD61F_0000
         {
-            placed[i] = true;
-            order.push(i as u32);
+            has_return_or_tail = true;
+        }
+        // `brk #imm16` (`0xD420_0000` mask `0xFFE0_001F`).
+        if (inst & 0xFFE0_001F) == 0xD420_0000 {
+            has_brk = true;
         }
     }
-    let mut stack: AVec<'_, u32> = Vec::new_in(alloc);
-    let from_profile = hot.iter().filter_map(|&symbol| find_member(members, by_symbol, symbol));
-    let roots = core::iter::once(entry).chain(from_profile).chain(by_symbol.iter().map(|&i| i as usize));
-    for root in roots {
-        stack.push(root as u32);
-        while let Some(i) = stack.pop() {
-            let i = i as usize;
-            if walked[i] {
+    has_brk && !has_return_or_tail
+}
+
+#[derive(Clone, Copy)]
+struct RawCallEdge {
+    to: u32,
+    mult: u32,
+    first_site: u32,
+}
+
+struct BoltChain<'a> {
+    nodes: AVec<'a, usize>,
+    total_bytes: u64,
+    total_weight: u64,
+    min_rank: u32,
+    alive: bool,
+}
+
+#[derive(Clone, Copy)]
+struct TierEdge {
+    u_slot: usize,
+    v_slot: usize,
+    u_sym: usize,
+    v_sym: usize,
+    weight: u64,
+    callee_dfs: u32,
+    caller_dfs: u32,
+    first_site: u32,
+}
+
+/// 16 KB-page-aware Ext-TSP / C³ greedy chain merging over one tier (`tier_nodes`), running in
+/// `O(E log E)` with a hard `page_cap` (`<= 16384` bytes) merge budget so callers and their hottest
+/// callees pack into the fewest Apple Silicon 16 KB iTLB pages. All tie-breakers use canonical
+/// symbol order (Rule 25).
+#[allow(clippy::too_many_arguments)]
+fn pack_tier_ext_tsp<'a>(
+    tier_nodes: &[usize],
+    fn_bytes: &[u64],
+    node_weight: &[u64],
+    node_rank: &[u32],
+    dfs_pre: &[u32],
+    call_head: &[usize],
+    call_edges: &[RawCallEdge],
+    use_profile_edge_weight: bool,
+    page_cap: u64,
+    out: &mut AVec<'a, usize>,
+    alloc: Alloc<'a>,
+) {
+    let t_len = tier_nodes.len();
+    if t_len == 0 {
+        return;
+    }
+    if t_len == 1 {
+        if let Some(&sym_id) = tier_nodes.first() {
+            out.push(sym_id);
+        }
+        return;
+    }
+
+    let n = fn_bytes.len();
+    let mut slot_of: AVec<'_, usize> = Vec::from_elem_in(usize::MAX, n, alloc);
+    let mut chains: AVec<'_, BoltChain<'a>> = Vec::with_capacity_in(t_len, alloc);
+    let mut chain_of: AVec<'_, usize> = Vec::with_capacity_in(t_len, alloc);
+    let mut offset_in_chain: AVec<'_, u64> = Vec::from_elem_in(0, t_len, alloc);
+
+    for (slot, &sym_id) in tier_nodes.iter().enumerate() {
+        set_at(&mut slot_of, sym_id, slot);
+        let bytes = at_u64(fn_bytes, sym_id).max(CODE_ALIGN_BYTES);
+        let weight = at_u64(node_weight, sym_id).max(1);
+        let rank = at_u32(node_rank, sym_id);
+        let mut nodes: AVec<'a, usize> = Vec::with_capacity_in(1, alloc);
+        nodes.push(slot);
+        chains.push(BoltChain { nodes, total_bytes: bytes, total_weight: weight, min_rank: rank, alive: true });
+        chain_of.push(slot);
+    }
+
+    // Gather directed edges whose endpoints both live in this tier.
+    let mut edges: AVec<'_, TierEdge> = Vec::new_in(alloc);
+    for (u_slot, &u_sym) in tier_nodes.iter().enumerate() {
+        let start = at_usize(call_head, u_sym);
+        let end = at_usize(call_head, u_sym.saturating_add(1));
+        let Some(slice) = call_edges.get(start..end) else {
+            continue;
+        };
+        let u_rank_w = u64::try_from(t_len.saturating_sub(usize::try_from(at_u32(node_rank, u_sym)).unwrap_or(t_len))).unwrap_or(1).max(1);
+        let caller_dfs = at_u32(dfs_pre, u_sym);
+        for edge in slice {
+            let v_sym = to_idx(edge.to);
+            if v_sym == u_sym {
                 continue;
             }
-            walked[i] = true;
-            if !placed[i] {
-                placed[i] = true;
-                order.push(i as u32);
+            let v_slot = at_usize(&slot_of, v_sym);
+            if v_slot >= t_len {
+                continue;
             }
-            let r = members[i].record;
-            // Words first, so they pop after the sites; sites in reverse, so the first call in
-            // the code is walked first.
-            for w in (0..r.words()).rev() {
-                let word = r.word(w);
-                if word.target == OWN_CODE || word.target == OWN_RELRO {
+            let mult = u64::from(edge.mult).max(1);
+            let weight = if use_profile_edge_weight {
+                let v_rank_w = u64::try_from(t_len.saturating_sub(usize::try_from(at_u32(node_rank, v_sym)).unwrap_or(t_len))).unwrap_or(1).max(1);
+                u_rank_w.saturating_mul(mult).saturating_mul(64).saturating_add(v_rank_w)
+            } else {
+                let v_bonus = at_u64(node_weight, v_sym).min(63);
+                mult.saturating_mul(64).saturating_add(v_bonus)
+            };
+            edges.push(TierEdge {
+                u_slot,
+                v_slot,
+                u_sym,
+                v_sym,
+                weight,
+                callee_dfs: at_u32(dfs_pre, v_sym),
+                caller_dfs,
+                first_site: edge.first_site,
+            });
+        }
+    }
+
+    // Sort edges once in `O(E log E)`: heaviest call edges first; equal-weight ties follow DFS
+    // callee preorder (preserving caller-before-first-callee on simple trees) and canonical symbol
+    // ids (Rule 25).
+    edges.sort_unstable_by(|a, b| {
+        b.weight
+            .cmp(&a.weight)
+            .then_with(|| a.callee_dfs.cmp(&b.callee_dfs))
+            .then_with(|| a.caller_dfs.cmp(&b.caller_dfs))
+            .then_with(|| a.first_site.cmp(&b.first_site))
+            .then_with(|| a.u_sym.cmp(&b.u_sym))
+            .then_with(|| a.v_sym.cmp(&b.v_sym))
+    });
+
+    // Single-pass C³ / Ext-TSP greedy chain merge bounded by `page_cap` (16 KB on Apple Silicon).
+    let max_merges = t_len.saturating_sub(1);
+    let mut merges = 0usize;
+    for e in edges.iter() {
+        if merges >= max_merges {
+            break;
+        }
+        let ca = at_usize(&chain_of, e.u_slot);
+        let cb = at_usize(&chain_of, e.v_slot);
+        if ca == cb {
+            continue;
+        }
+        let (Some(chain_a), Some(chain_b)) = (chains.get(ca), chains.get(cb)) else {
+            continue;
+        };
+        if !chain_a.alive || !chain_b.alive {
+            continue;
+        }
+        if chain_a.total_bytes.saturating_add(chain_b.total_bytes) > page_cap {
+            continue;
+        }
+
+        // Choose concatenation order:
+        // - When `v` is the head of `cb` (`off_v == 0`), append `cb` after `ca` (`ca ++ cb`),
+        //   keeping callers before their primary callees for sequential L1i prefetch.
+        // - When `v` is already inside `cb` behind a hotter caller (`off_v > 0`), append `ca`
+        //   after `cb` (`cb ++ ca`) so the hotter chain stays intact at the front of the 16 KB
+        //   page while `u` still lands adjacent to `v` on the same page.
+        let off_v = at_u64(&offset_in_chain, e.v_slot);
+        let (dst_c, src_c) = if off_v == 0 { (ca, cb) } else { (cb, ca) };
+
+        let (src_nodes, src_bytes, src_weight, src_min_rank) = if let Some(sc) = chains.get_mut(src_c) {
+            sc.alive = false;
+            let moved = core::mem::replace(&mut sc.nodes, Vec::new_in(alloc));
+            (moved, sc.total_bytes, sc.total_weight, sc.min_rank)
+        } else {
+            continue;
+        };
+        if let Some(dc) = chains.get_mut(dst_c) {
+            let base_off = dc.total_bytes;
+            for &node_slot in src_nodes.iter() {
+                set_at(&mut chain_of, node_slot, dst_c);
+                let prev_off = at_u64(&offset_in_chain, node_slot);
+                set_at(&mut offset_in_chain, node_slot, base_off.saturating_add(prev_off));
+                dc.nodes.push(node_slot);
+            }
+            dc.total_bytes = dc.total_bytes.saturating_add(src_bytes);
+            dc.total_weight = dc.total_weight.saturating_add(src_weight);
+            dc.min_rank = dc.min_rank.min(src_min_rank);
+            merges = merges.saturating_add(1);
+        }
+    }
+
+    // Order surviving chains by descending execution density (`total_weight / total_bytes`, exact
+    // `u128` cross-multiplication), then descending `total_weight`, then ascending `min_rank`,
+    // then ascending first node's canonical symbol id (Rule 25).
+    let mut alive_chains: AVec<'_, usize> = Vec::with_capacity_in(t_len, alloc);
+    for (ci, ch) in chains.iter().enumerate() {
+        if ch.alive && !ch.nodes.is_empty() {
+            alive_chains.push(ci);
+        }
+    }
+    alive_chains.sort_unstable_by(|&a, &b| {
+        let (Some(ca), Some(cb)) = (chains.get(a), chains.get(b)) else {
+            return a.cmp(&b);
+        };
+        let lhs = u128::from(cb.total_weight).saturating_mul(u128::from(ca.total_bytes.max(1)));
+        let rhs = u128::from(ca.total_weight).saturating_mul(u128::from(cb.total_bytes.max(1)));
+        lhs.cmp(&rhs)
+            .then_with(|| cb.total_weight.cmp(&ca.total_weight))
+            .then_with(|| ca.min_rank.cmp(&cb.min_rank))
+            .then_with(|| {
+                let fa = ca.nodes.first().copied().and_then(|s| tier_nodes.get(s).copied()).unwrap_or(usize::MAX);
+                let fb = cb.nodes.first().copied().and_then(|s| tier_nodes.get(s).copied()).unwrap_or(usize::MAX);
+                fa.cmp(&fb)
+            })
+    });
+
+    for &ci in alive_chains.iter() {
+        let Some(ch) = chains.get(ci) else {
+            continue;
+        };
+        for &slot in ch.nodes.iter() {
+            if let Some(&sym_id) = tier_nodes.get(slot) {
+                out.push(sym_id);
+            }
+        }
+    }
+}
+
+/// 16 KB Apple Silicon BOLT / Ext-TSP / C³ function ordering shared by [`lay_out`] (`bzcode01`)
+/// and [`crate::optimized::lay_out_records`] (`bzcode02`).
+///
+/// Partitions functions into three tiers — **Hot**, **Warm**, and **Cold tail** — applies
+/// 16 KB-page-aware Ext-TSP / C³ greedy chain merging inside Hot and Warm, and packs cold trap
+/// stubs and indirect/relro/vtable-only targets into the cold tail. Every internal index is in
+/// canonical symbol space (`0..by_symbol.len()`), guaranteeing identical placement regardless of
+/// input `members` permutation (Rule 25).
+pub(crate) fn bolt_order_members<'a, M: LayoutMember>(
+    members: &[M],
+    by_symbol: &[u32],
+    entry: usize,
+    profile: Option<Profile<'_>>,
+    page: u64,
+    alloc: Alloc<'a>,
+) -> AVec<'a, u32> {
+    let n = members.len();
+    if n == 0 {
+        return Vec::new_in(alloc);
+    }
+    let page_cap = page.clamp(MIN_CLUSTER_PAGE_BYTES, APPLE_PAGE_BYTES);
+    let entry_sym_id = members
+        .get(entry)
+        .and_then(|m| find_sym_id(members, by_symbol, m.symbol()))
+        .unwrap_or(0);
+
+    // 1. Build per-function canonical metadata and flat CSR direct call graph in `0..n` symbol
+    //    order so nothing below ever observes the raw input slice permutation.
+    let mut fn_bytes: AVec<'_, u64> = Vec::with_capacity_in(n, alloc);
+    let mut trap_stub: AVec<'_, bool> = Vec::with_capacity_in(n, alloc);
+    let mut is_start: AVec<'_, bool> = Vec::with_capacity_in(n, alloc);
+    let mut call_head: AVec<'_, usize> = Vec::with_capacity_in(n.saturating_add(1), alloc);
+    let mut call_edges: AVec<'_, RawCallEdge> = Vec::new_in(alloc);
+    let mut in_calls: AVec<'_, u64> = Vec::from_elem_in(0, n, alloc);
+
+    for sym_id in 0..n {
+        call_head.push(call_edges.len());
+        let Some(m) = members.get(to_idx(at_u32(by_symbol, sym_id))) else {
+            fn_bytes.push(CODE_ALIGN_BYTES);
+            trap_stub.push(false);
+            is_start.push(false);
+            continue;
+        };
+        let code_len = u64::try_from(m.code().len()).unwrap_or(u64::MAX);
+        fn_bytes.push(align_up_u64(code_len, CODE_ALIGN_BYTES).max(CODE_ALIGN_BYTES));
+        let start_flag = m.is_made_start();
+        is_start.push(start_flag);
+        let stub_flag = sym_id != entry_sym_id && !start_flag && is_trap_stub(m);
+        trap_stub.push(stub_flag);
+
+        let edge_start = call_edges.len();
+        let mut site_ord = 0u32;
+        m.for_each_direct_call(|target_sym| {
+            if let Some(to_id) = find_sym_id(members, by_symbol, target_sym)
+                && to_id != sym_id
+            {
+                call_edges.push(RawCallEdge { to: to_u32(to_id), mult: 1, first_site: site_ord });
+            }
+            site_ord = site_ord.saturating_add(1);
+        });
+        // Coalesce duplicate edges `(sym_id -> to)` while preserving callsite multiplicity and
+        // earliest callsite index, then restore code order (`first_site`).
+        if let Some(slice) = call_edges.get_mut(edge_start..) {
+            slice.sort_unstable_by(|a, b| a.to.cmp(&b.to).then_with(|| a.first_site.cmp(&b.first_site)));
+            let mut w = 0usize;
+            for r in 0..slice.len() {
+                let Some(cur) = slice.get(r).copied() else {
+                    break;
+                };
+                let merged = if w > 0
+                    && let Some(prev) = slice.get_mut(w - 1)
+                    && prev.to == cur.to
+                {
+                    prev.mult = prev.mult.saturating_add(cur.mult);
+                    true
+                } else {
+                    false
+                };
+                if !merged {
+                    set_at(slice, w, cur);
+                    w = w.saturating_add(1);
+                }
+            }
+            if let Some(dedup) = slice.get_mut(..w) {
+                dedup.sort_unstable_by(|a, b| a.first_site.cmp(&b.first_site).then_with(|| a.to.cmp(&b.to)));
+            }
+            call_edges.truncate(edge_start.saturating_add(w));
+        }
+        if !stub_flag
+            && let Some(slice) = call_edges.get(edge_start..)
+        {
+            for edge in slice {
+                let dst = to_idx(edge.to);
+                let prev = at_u64(&in_calls, dst);
+                set_at(&mut in_calls, dst, prev.saturating_add(u64::from(edge.mult)));
+            }
+        }
+    }
+    call_head.push(call_edges.len());
+
+    // 2. Gather profile hot symbols (deduplicated, preserving hottest-first rank).
+    let hot = profile.map_or(&[][..], |p| p.hot);
+    let mut hot_rank: AVec<'_, u32> = Vec::from_elem_in(u32::MAX, n, alloc);
+    let mut profile_hot_nodes: AVec<'_, usize> = Vec::with_capacity_in(hot.len().min(n), alloc);
+    for (rank, &sym) in hot.iter().enumerate() {
+        if let Some(sym_id) = find_sym_id(members, by_symbol, sym)
+            && at_u32(&hot_rank, sym_id) == u32::MAX
+        {
+            set_at(&mut hot_rank, sym_id, to_u32(rank));
+            profile_hot_nodes.push(sym_id);
+        }
+    }
+    let has_profile_hot = !profile_hot_nodes.is_empty();
+
+    // 3. Direct-call reachability from `entry` (and profile hot roots when present), never
+    //    propagating through noreturn trap/panic stubs so panic formatting callees sink to Cold.
+    let mut direct_reach: AVec<'_, bool> = Vec::from_elem_in(false, n, alloc);
+    let mut bfs_queue: AVec<'_, usize> = Vec::with_capacity_in(n, alloc);
+    let enqueue_direct = |sym_id: usize, direct_reach: &mut [bool], bfs_queue: &mut AVec<'a, usize>| {
+        if sym_id < n && !at_bool(direct_reach, sym_id) {
+            set_at(direct_reach, sym_id, true);
+            bfs_queue.push(sym_id);
+        }
+    };
+    enqueue_direct(entry_sym_id, &mut direct_reach, &mut bfs_queue);
+    for &u in profile_hot_nodes.iter() {
+        enqueue_direct(u, &mut direct_reach, &mut bfs_queue);
+    }
+    let mut head = 0usize;
+    while head < bfs_queue.len() {
+        let u = at_usize(&bfs_queue, head);
+        head = head.saturating_add(1);
+        let start = at_usize(&call_head, u);
+        let end = at_usize(&call_head, u.saturating_add(1));
+        if let Some(slice) = call_edges.get(start..end) {
+            for edge in slice {
+                let v = to_idx(edge.to);
+                if !at_bool(&trap_stub, v) || at_u32(&hot_rank, v) != u32::MAX {
+                    enqueue_direct(v, &mut direct_reach, &mut bfs_queue);
+                }
+            }
+        }
+        // Start records (`_start` on Linux, `LangStart` wrapper) pass `main` via code-site `Load`.
+        if (u == entry_sym_id || at_bool(&is_start, u))
+            && let Some(m) = members.get(to_idx(at_u32(by_symbol, u)))
+        {
+            m.for_each_code_func_load(|target_sym| {
+                if let Some(v) = find_sym_id(members, by_symbol, target_sym)
+                    && !at_bool(&trap_stub, v)
+                {
+                    enqueue_direct(v, &mut direct_reach, &mut bfs_queue);
+                }
+            });
+        }
+    }
+
+    // 4. Secondary code-load reachability (non-trap callbacks taken by address in direct-reachable
+    //    code, plus their non-trap direct callees) for the Warm tier when no profile is present.
+    let mut code_load_reach: AVec<'_, bool> = Vec::from_elem_in(false, n, alloc);
+    if !has_profile_hot {
+        let mut warm_q: AVec<'_, usize> = Vec::new_in(alloc);
+        for &u in bfs_queue.iter() {
+            if let Some(m) = members.get(to_idx(at_u32(by_symbol, u))) {
+                m.for_each_code_func_load(|target_sym| {
+                    if let Some(v) = find_sym_id(members, by_symbol, target_sym)
+                        && !at_bool(&direct_reach, v)
+                        && !at_bool(&trap_stub, v)
+                        && !at_bool(&code_load_reach, v)
+                    {
+                        set_at(&mut code_load_reach, v, true);
+                        warm_q.push(v);
+                    }
+                });
+            }
+        }
+        let mut wh = 0usize;
+        while wh < warm_q.len() {
+            let u = at_usize(&warm_q, wh);
+            wh = wh.saturating_add(1);
+            let start = at_usize(&call_head, u);
+            let end = at_usize(&call_head, u.saturating_add(1));
+            if let Some(slice) = call_edges.get(start..end) {
+                for edge in slice {
+                    let v = to_idx(edge.to);
+                    if !at_bool(&direct_reach, v) && !at_bool(&trap_stub, v) && !at_bool(&code_load_reach, v) {
+                        set_at(&mut code_load_reach, v, true);
+                        warm_q.push(v);
+                    }
+                }
+            }
+        }
+    }
+
+    // 5. Canonical iterative DFS preorder (`dfs_pre`) over direct calls so equal-weight tie-breaks
+    //    in Ext-TSP preserve caller-before-first-callee locality on simple trees.
+    let mut dfs_pre: AVec<'_, u32> = Vec::from_elem_in(u32::MAX, n, alloc);
+    let mut dfs_stack: AVec<'_, usize> = Vec::with_capacity_in(n, alloc);
+    let mut next_pre = 0u32;
+    let mut dfs_seeds: AVec<'_, usize> = Vec::with_capacity_in(n.saturating_add(1), alloc);
+    dfs_seeds.push(entry_sym_id);
+    for &u in profile_hot_nodes.iter() {
+        dfs_seeds.push(u);
+    }
+    for u in 0..n {
+        dfs_seeds.push(u);
+    }
+    for &seed in dfs_seeds.iter() {
+        if at_u32(&dfs_pre, seed) != u32::MAX {
+            continue;
+        }
+        dfs_stack.push(seed);
+        while let Some(u) = dfs_stack.pop() {
+            if at_u32(&dfs_pre, u) != u32::MAX {
+                continue;
+            }
+            set_at(&mut dfs_pre, u, next_pre);
+            next_pre = next_pre.saturating_add(1);
+            // Push start-wrapper loads first (so direct calls pop ahead of them), then direct calls
+            // in reverse code order so the first callee in code pops first.
+            if (u == entry_sym_id || at_bool(&is_start, u))
+                && let Some(m) = members.get(to_idx(at_u32(by_symbol, u)))
+            {
+                let mut loaded: AVec<'_, usize> = Vec::new_in(alloc);
+                m.for_each_code_func_load(|target_sym| {
+                    if let Some(v) = find_sym_id(members, by_symbol, target_sym)
+                        && at_u32(&dfs_pre, v) == u32::MAX
+                    {
+                        loaded.push(v);
+                    }
+                });
+                for &v in loaded.iter().rev() {
+                    dfs_stack.push(v);
+                }
+            }
+            let start = at_usize(&call_head, u);
+            let end = at_usize(&call_head, u.saturating_add(1));
+            if let Some(slice) = call_edges.get(start..end) {
+                for edge in slice.iter().rev() {
+                    let v = to_idx(edge.to);
+                    if at_u32(&dfs_pre, v) == u32::MAX {
+                        dfs_stack.push(v);
+                    }
+                }
+            }
+        }
+    }
+
+    // 6. Partition every canonical node into Hot / Warm / Cold and assign per-node weights & ranks.
+    let mut hot_tier: AVec<'_, usize> = Vec::new_in(alloc);
+    let mut warm_tier: AVec<'_, usize> = Vec::new_in(alloc);
+    let mut cold_tier: AVec<'_, usize> = Vec::new_in(alloc);
+    let mut node_weight: AVec<'_, u64> = Vec::from_elem_in(1, n, alloc);
+    let mut node_rank: AVec<'_, u32> = Vec::from_elem_in(u32::MAX, n, alloc);
+
+    if has_profile_hot {
+        let h_len = profile_hot_nodes.len();
+        for (pos, &u) in profile_hot_nodes.iter().enumerate() {
+            hot_tier.push(u);
+            let w = u64::try_from(h_len.saturating_sub(pos)).unwrap_or(1).max(1);
+            set_at(&mut node_weight, u, w.saturating_mul(w));
+            set_at(&mut node_rank, u, to_u32(pos));
+        }
+        for u in 0..n {
+            if at_u32(&hot_rank, u) != u32::MAX {
+                continue;
+            }
+            if at_bool(&direct_reach, u) && !at_bool(&trap_stub, u) {
+                warm_tier.push(u);
+                let w = 1u64.saturating_add(at_u64(&in_calls, u).saturating_mul(4));
+                set_at(&mut node_weight, u, w);
+                set_at(&mut node_rank, u, at_u32(&dfs_pre, u));
+            } else {
+                cold_tier.push(u);
+                set_at(&mut node_rank, u, at_u32(&dfs_pre, u));
+            }
+        }
+    } else {
+        for u in 0..n {
+            if at_bool(&direct_reach, u) && !at_bool(&trap_stub, u) {
+                hot_tier.push(u);
+                let w = 1u64.saturating_add(at_u64(&in_calls, u).saturating_mul(4));
+                set_at(&mut node_weight, u, w);
+                set_at(&mut node_rank, u, at_u32(&dfs_pre, u));
+            } else if at_bool(&code_load_reach, u) && !at_bool(&trap_stub, u) {
+                warm_tier.push(u);
+                let w = 1u64.saturating_add(at_u64(&in_calls, u).saturating_mul(4));
+                set_at(&mut node_weight, u, w);
+                set_at(&mut node_rank, u, at_u32(&dfs_pre, u));
+            } else {
+                cold_tier.push(u);
+                set_at(&mut node_rank, u, at_u32(&dfs_pre, u));
+            }
+        }
+        hot_tier.sort_unstable_by(|&a, &b| at_u32(&dfs_pre, a).cmp(&at_u32(&dfs_pre, b)).then_with(|| a.cmp(&b)));
+    }
+    warm_tier.sort_unstable_by(|&a, &b| at_u32(&dfs_pre, a).cmp(&at_u32(&dfs_pre, b)).then_with(|| a.cmp(&b)));
+
+    // 7. Pack Hot and Warm tiers via 16 KB-page-aware Ext-TSP / C³ greedy chain merging.
+    let mut canonical_order: AVec<'_, usize> = Vec::with_capacity_in(n, alloc);
+    pack_tier_ext_tsp(
+        &hot_tier,
+        &fn_bytes,
+        &node_weight,
+        &node_rank,
+        &dfs_pre,
+        &call_head,
+        &call_edges,
+        has_profile_hot,
+        page_cap,
+        &mut canonical_order,
+        alloc,
+    );
+    pack_tier_ext_tsp(
+        &warm_tier,
+        &fn_bytes,
+        &node_weight,
+        &node_rank,
+        &dfs_pre,
+        &call_head,
+        &call_edges,
+        false,
+        page_cap,
+        &mut canonical_order,
+        alloc,
+    );
+
+    // 8. Emit Cold tail deterministically: first cold functions referenced by Hot/Warm (in
+    //    iterative DFS affinity order over calls/loads/relro refs), then any remaining cold
+    //    functions (e.g., data/vtable-only targets) in canonical symbol order.
+    if !cold_tier.is_empty() {
+        let mut emitted: AVec<'_, bool> = Vec::from_elem_in(false, n, alloc);
+        for &u in canonical_order.iter() {
+            set_at(&mut emitted, u, true);
+        }
+        let mut cold_roots: AVec<'_, usize> = Vec::with_capacity_in(cold_tier.len(), alloc);
+        let placed_hot_warm = canonical_order.len();
+        for idx in 0..placed_hot_warm {
+            let u = at_usize(&canonical_order, idx);
+            let start = at_usize(&call_head, u);
+            let end = at_usize(&call_head, u.saturating_add(1));
+            if let Some(slice) = call_edges.get(start..end) {
+                for edge in slice {
+                    let v = to_idx(edge.to);
+                    if !at_bool(&emitted, v) {
+                        cold_roots.push(v);
+                    }
+                }
+            }
+            if let Some(m) = members.get(to_idx(at_u32(by_symbol, u))) {
+                m.for_each_code_func_load(|target_sym| {
+                    if let Some(v) = find_sym_id(members, by_symbol, target_sym)
+                        && !at_bool(&emitted, v)
+                    {
+                        cold_roots.push(v);
+                    }
+                });
+                m.for_each_relro_func_ref(|target_sym| {
+                    if let Some(v) = find_sym_id(members, by_symbol, target_sym)
+                        && !at_bool(&emitted, v)
+                    {
+                        cold_roots.push(v);
+                    }
+                });
+            }
+        }
+        for &u in cold_tier.iter() {
+            cold_roots.push(u);
+        }
+
+        let mut cold_stack: AVec<'_, usize> = Vec::with_capacity_in(cold_tier.len(), alloc);
+        let mut scratch_refs: AVec<'_, usize> = Vec::new_in(alloc);
+        for &root in cold_roots.iter() {
+            if at_bool(&emitted, root) {
+                continue;
+            }
+            cold_stack.push(root);
+            while let Some(u) = cold_stack.pop() {
+                if at_bool(&emitted, u) {
                     continue;
                 }
-                let t = r.target(word.target as usize);
-                if t.space == Space::Func
-                    && let Some(j) = find_member(members, by_symbol, t.symbol)
-                    && !walked[j]
-                {
-                    stack.push(j as u32);
+                set_at(&mut emitted, u, true);
+                canonical_order.push(u);
+                // Push relro refs and code loads first, then direct calls in reverse so direct
+                // callees pop first.
+                scratch_refs.clear();
+                if let Some(m) = members.get(to_idx(at_u32(by_symbol, u))) {
+                    m.for_each_relro_func_ref(|target_sym| {
+                        if let Some(v) = find_sym_id(members, by_symbol, target_sym)
+                            && !at_bool(&emitted, v)
+                        {
+                            scratch_refs.push(v);
+                        }
+                    });
+                    m.for_each_code_func_load(|target_sym| {
+                        if let Some(v) = find_sym_id(members, by_symbol, target_sym)
+                            && !at_bool(&emitted, v)
+                        {
+                            scratch_refs.push(v);
+                        }
+                    });
+                }
+                for &v in scratch_refs.iter().rev() {
+                    cold_stack.push(v);
+                }
+                let start = at_usize(&call_head, u);
+                let end = at_usize(&call_head, u.saturating_add(1));
+                if let Some(slice) = call_edges.get(start..end) {
+                    for edge in slice.iter().rev() {
+                        let v = to_idx(edge.to);
+                        if !at_bool(&emitted, v) {
+                            cold_stack.push(v);
+                        }
+                    }
                 }
             }
-            for s in (0..r.sites()).rev() {
-                let site = r.site(s);
-                if site.target == NO_TARGET {
-                    continue;
-                }
-                let t = r.target(site.target as usize);
-                if t.space == Space::Func
-                    && let Some(j) = find_member(members, by_symbol, t.symbol)
-                    && !walked[j]
-                {
-                    stack.push(j as u32);
-                }
-            }
+        }
+    }
+
+    // 9. Translate canonical symbol indices back into original `members` indices.
+    let mut order: AVec<'a, u32> = Vec::with_capacity_in(n, alloc);
+    for &sym_id in canonical_order.iter() {
+        if let Some(&raw_idx) = by_symbol.get(sym_id) {
+            order.push(raw_idx);
         }
     }
     order
@@ -784,7 +1527,7 @@ pub(crate) fn lay_out_with_tls<'a, 'r>(
     let Some(entry_member) = find_member(members, &by_symbol, entry) else {
         return Err(ExportError::NoEntry { symbol: entry });
     };
-    let order = order(members, &by_symbol, entry_member, profile, alloc);
+    let order = bolt_order_members(members, &by_symbol, entry_member, profile, page, alloc);
 
     // Folding: each position's representative is the first position with equal bytes.
     let mut digests: AVec<'_, ([u8; 32], u32)> = Vec::with_capacity_in(n, alloc);
@@ -949,4 +1692,385 @@ pub(crate) fn lay_out_with_tls<'a, 'r>(
         fixups.push(Fixup { at: regions.got_at + 8 * k as u64, to: FixTo::Bind { import: k as u32 } });
     }
     regions.finish(members, &by_symbol, &order, &rep, &home, data, &by_target, entry_member, plan, tail, text, imports, fixups, placed)
+}
+
+#[cfg(test)]
+mod bolt_tests {
+    use blaze_code::record::{CodeRecord, CodeView, Site, SiteKind, Space, Symbol, Target, Word};
+    use blaze_own::{AVec, Alloc, Vec};
+    use blaze_tier::record::{Declare, DeclaredKind, Declares, read as read_v2};
+
+    use super::{APPLE_PAGE_BYTES, Member, lay_out};
+    use crate::input::{Profile, Tier};
+    use crate::optimized::{Member02, lay_out_records, v1_to_v2};
+    use crate::{elf, macho};
+
+    const STP_FP_LR: u32 = 0xA9BF_7BFD;
+    const MOV_FP_SP: u32 = 0x9100_03FD;
+    const LDP_FP_LR: u32 = 0xA8C1_7BFD;
+    const RET: u32 = 0xD65F_03C0;
+    const ADRP_X16: u32 = 0x9000_0010;
+    const LDR_X16: u32 = 0xF940_0210;
+    const BLR_X16: u32 = 0xD63F_0200;
+    const ADRP_X0: u32 = 0x9000_0000;
+    const LDR_X0: u32 = 0xF940_0000;
+    const BRK_1: u32 = 0xD420_0020;
+    const NOP: u32 = 0xD503_201F;
+
+    fn sym(name: &str) -> Symbol {
+        Symbol::of_name(name)
+    }
+
+    fn func(name: &str) -> Target {
+        Target { space: Space::Func, symbol: sym(name) }
+    }
+
+    fn mov_w0(imm: u16) -> u32 {
+        0x5280_0000 | (u32::from(imm) << 5)
+    }
+
+    struct TestDeclares;
+
+    impl Declares for TestDeclares {
+        fn declared(&self, t: Target) -> Option<Declare<'_>> {
+            match t.space {
+                Space::Func => Some(Declare { kind: DeclaredKind::Instance, item: 1, name: b"fn" }),
+                Space::Static => Some(Declare { kind: DeclaredKind::Static, item: 1, name: b"" }),
+                Space::Vtable => Some(Declare { kind: DeclaredKind::Vtable, item: 1, name: b"vt" }),
+                Space::Tls => Some(Declare { kind: DeclaredKind::ThreadLocal, item: 1, name: b"" }),
+                Space::Outside => None,
+            }
+        }
+    }
+
+    /// Builds a distinct sealed `bzcode01` record with direct calls, code loads, relro function
+    /// pointer words, optional noreturn `brk` trap epilogue, and `NOP` padding to `target_bytes`.
+    #[allow(clippy::too_many_arguments)]
+    fn make_fn<'a>(
+        tag: u16,
+        calls: &[&str],
+        loads: &[&str],
+        relro_refs: &[&str],
+        trap_stub: bool,
+        target_bytes: usize,
+        alloc: Alloc<'a>,
+    ) -> AVec<'a, u8> {
+        let mut r = CodeRecord::new_in(alloc);
+        let push_inst = |code: &mut AVec<'a, u8>, inst: u32| {
+            code.extend_from_slice(&inst.to_le_bytes());
+        };
+        push_inst(&mut r.code, STP_FP_LR);
+        push_inst(&mut r.code, MOV_FP_SP);
+        push_inst(&mut r.code, mov_w0(tag));
+        for &callee in calls {
+            let at = u32::try_from(r.code.len()).unwrap();
+            push_inst(&mut r.code, ADRP_X16);
+            push_inst(&mut r.code, LDR_X16);
+            push_inst(&mut r.code, BLR_X16);
+            let target = r.target(func(callee));
+            r.sites.push(Site { at, kind: SiteKind::Call, target, addend: 0 });
+        }
+        for &loaded in loads {
+            let at = u32::try_from(r.code.len()).unwrap();
+            push_inst(&mut r.code, ADRP_X0);
+            push_inst(&mut r.code, LDR_X0);
+            let target = r.target(func(loaded));
+            r.sites.push(Site { at, kind: SiteKind::Load, target, addend: 0 });
+        }
+        let epilogue_bytes = if trap_stub { 4 } else { 8 };
+        while r.code.len() + epilogue_bytes < target_bytes {
+            push_inst(&mut r.code, NOP);
+        }
+        if trap_stub {
+            push_inst(&mut r.code, BRK_1);
+        } else {
+            push_inst(&mut r.code, LDP_FP_LR);
+            push_inst(&mut r.code, RET);
+        }
+        if !relro_refs.is_empty() {
+            r.relro.resize(relro_refs.len() * 8, 0);
+            for (k, &name) in relro_refs.iter().enumerate() {
+                let target = r.target(func(name));
+                r.words.push(Word { at: u32::try_from(k * 8).unwrap(), target, addend: 0 });
+            }
+        }
+        let mut out = Vec::new_in(alloc);
+        r.seal().unwrap().encode(&mut out);
+        out
+    }
+
+    struct SynthGraph<'a> {
+        names: AVec<'a, &'static str>,
+        records: AVec<'a, AVec<'a, u8>>,
+    }
+
+    /// Builds a 20-function synthetic call graph:
+    /// - `entry` (128 B): calls `cold_panic_0` FIRST, then `hot_loop`.
+    /// - 6 hot functions (`hot_loop`, `hot_a..hot_e`, 1_536 B each -> 9 KiB total <= 16 KB page):
+    ///   `hot_loop` calls `cold_panic_1` FIRST, references 4 cold vtable fns in relro, then calls
+    ///   `hot_a` (3x), `hot_b` (3x), `hot_c` (2x); `hot_a` calls `cold_panic_2` FIRST then `hot_d`
+    ///   (3x); `hot_b` calls `hot_e` (2x).
+    /// - 3 noreturn panic trap stubs (`cold_panic_0`, `cold_panic_1`, `cold_panic_2`) calling
+    ///   `cold_fmt_0 -> cold_fmt_1 -> cold_fmt_2`, `cold_err_0 -> cold_err_1`, and `cold_err_2`
+    ///   (16 KiB per cold chain, scattering naive DFS hot functions across 3 distinct 16 KB pages).
+    /// - 4 relro/vtable-only cold functions (`cold_vtable_0..3`, 4_096 B each).
+    fn synth_20_graph<'a>(alloc: Alloc<'a>) -> SynthGraph<'a> {
+        let mut names: AVec<'a, &'static str> = Vec::with_capacity_in(20, alloc);
+        let mut records: AVec<'a, AVec<'a, u8>> = Vec::with_capacity_in(20, alloc);
+        let mut add = |name: &'static str, tag: u16, calls: &[&str], loads: &[&str], relro: &[&str], trap: bool, bytes: usize| {
+            names.push(name);
+            records.push(make_fn(tag, calls, loads, relro, trap, bytes, alloc));
+        };
+
+        // Interleave hot and cold definitions in the input slice.
+        add("entry", 1, &["cold_panic_0", "hot_loop"], &[], &[], false, 128);
+        add("cold_panic_0", 2, &["cold_fmt_0"], &[], &[], true, 4_096);
+        add("cold_fmt_0", 3, &["cold_fmt_1"], &[], &[], false, 4_096);
+        add("cold_vtable_0", 4, &[], &[], &[], false, 4_096);
+        add(
+            "hot_loop",
+            5,
+            &["cold_panic_1", "hot_a", "hot_a", "hot_a", "hot_b", "hot_b", "hot_b", "hot_c", "hot_c"],
+            &[],
+            &["cold_vtable_0", "cold_vtable_1", "cold_vtable_2", "cold_vtable_3"],
+            false,
+            1_536,
+        );
+        add("cold_fmt_1", 6, &["cold_fmt_2"], &[], &[], false, 4_096);
+        add("cold_vtable_1", 7, &[], &[], &[], false, 4_096);
+        add("hot_a", 8, &["cold_panic_2", "hot_d", "hot_d", "hot_d"], &[], &[], false, 1_536);
+        add("cold_fmt_2", 9, &[], &[], &[], false, 4_096);
+        add("cold_panic_1", 10, &["cold_err_0"], &[], &[], true, 4_096);
+        add("cold_vtable_2", 11, &[], &[], &[], false, 4_096);
+        add("hot_b", 12, &["hot_e", "hot_e"], &[], &[], false, 1_536);
+        add("cold_err_0", 13, &["cold_err_1"], &[], &[], false, 6_144);
+        add("cold_vtable_3", 14, &[], &[], &[], false, 4_096);
+        add("hot_c", 15, &[], &[], &[], false, 1_536);
+        add("cold_err_1", 16, &[], &[], &[], false, 6_144);
+        add("hot_d", 17, &[], &[], &[], false, 1_536);
+        add("cold_panic_2", 18, &["cold_err_2"], &[], &[], true, 8_192);
+        add("cold_err_2", 19, &[], &[], &[], false, 8_192);
+        add("hot_e", 20, &[], &[], &[], false, 1_536);
+
+        assert_eq!(names.len(), 20);
+        SynthGraph { names, records }
+    }
+
+    fn members_of<'a, 'r>(graph: &'r SynthGraph<'a>, perm: &[usize], alloc: Alloc<'a>) -> AVec<'a, Member<'r>> {
+        let mut out: AVec<'a, Member<'r>> = Vec::with_capacity_in(perm.len(), alloc);
+        for &i in perm {
+            out.push(Member {
+                symbol: sym(graph.names[i]),
+                record: CodeView::read(&graph.records[i]).unwrap(),
+                tier: Some(Tier::Fast),
+            });
+        }
+        out
+    }
+
+    /// Naive DFS walk from `entry` (pre-BOLT baseline) to measure how many 16 KB pages the hot
+    /// call graph would span without 16 KB page packing.
+    fn naive_dfs_pages(members: &[Member<'_>], entry: Symbol, hot_syms: &[Symbol], text_at: u64, alloc: Alloc<'_>) -> usize {
+        let n = members.len();
+        let find = |s: Symbol| members.iter().position(|m| m.symbol == s);
+        let mut visited: AVec<'_, bool> = Vec::from_elem_in(false, n, alloc);
+        let mut order: AVec<'_, usize> = Vec::with_capacity_in(n, alloc);
+        let mut stack: AVec<'_, usize> = Vec::new_in(alloc);
+        let entry_idx = find(entry).unwrap();
+        for root in core::iter::once(entry_idx).chain(0..n) {
+            if visited[root] {
+                continue;
+            }
+            stack.push(root);
+            while let Some(i) = stack.pop() {
+                if visited[i] {
+                    continue;
+                }
+                visited[i] = true;
+                order.push(i);
+                let r = members[i].record;
+                for w in (0..r.words()).rev() {
+                    let word = r.word(w);
+                    if word.target != super::OWN_CODE && word.target != super::OWN_RELRO {
+                        let t = r.target(usize::try_from(word.target).unwrap());
+                        if t.space == Space::Func
+                            && let Some(j) = find(t.symbol)
+                            && !visited[j]
+                        {
+                            stack.push(j);
+                        }
+                    }
+                }
+                for s in (0..r.sites()).rev() {
+                    let site = r.site(s);
+                    if site.target != super::NO_TARGET {
+                        let t = r.target(usize::try_from(site.target).unwrap());
+                        if t.space == Space::Func
+                            && let Some(j) = find(t.symbol)
+                            && !visited[j]
+                        {
+                            stack.push(j);
+                        }
+                    }
+                }
+            }
+        }
+        let mut cur = text_at;
+        let mut pages: AVec<'_, u64> = Vec::new_in(alloc);
+        for &i in order.iter() {
+            cur = super::align_up_u64(cur, 16);
+            let start = cur;
+            let len = u64::try_from(members[i].record.code().len()).unwrap();
+            let end = start + len.saturating_sub(1);
+            if hot_syms.contains(&members[i].symbol) {
+                for pg in (start / APPLE_PAGE_BYTES)..=(end / APPLE_PAGE_BYTES) {
+                    if !pages.contains(&pg) {
+                        pages.push(pg);
+                    }
+                }
+            }
+            cur = start + len;
+        }
+        pages.len()
+    }
+
+    fn hot_pages_of(placed: &[super::Placed], hot_syms: &[Symbol], alloc: Alloc<'_>) -> usize {
+        let mut pages: AVec<'_, u64> = Vec::new_in(alloc);
+        for p in placed {
+            if hot_syms.contains(&p.symbol) {
+                let end = p.at + p.len.saturating_sub(1);
+                for pg in (p.at / APPLE_PAGE_BYTES)..=(end / APPLE_PAGE_BYTES) {
+                    if !pages.contains(&pg) {
+                        pages.push(pg);
+                    }
+                }
+            }
+        }
+        pages.len()
+    }
+
+    #[test]
+    fn bolt_order_is_deterministic_across_input_permutations() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let graph = synth_20_graph(alloc);
+        let id_perm: [usize; 20] = core::array::from_fn(|i| i);
+        let rev_perm: [usize; 20] = core::array::from_fn(|i| 19 - i);
+        let rot_perm: [usize; 20] = core::array::from_fn(|i| (i * 7 + 3) % 20);
+        let hot = [sym("hot_loop"), sym("hot_a"), sym("hot_b"), sym("hot_c"), sym("hot_d"), sym("hot_e")];
+        let profile = Profile { digest: [0x42; 32], hot: &hot };
+
+        for prof in [None, Some(profile)] {
+            let m0 = members_of(&graph, &id_perm, alloc);
+            let m1 = members_of(&graph, &rev_perm, alloc);
+            let m2 = members_of(&graph, &rot_perm, alloc);
+            let l0 = lay_out(&m0, &[], sym("entry"), prof, macho::plan(), 0, alloc).unwrap();
+            let l1 = lay_out(&m1, &[], sym("entry"), prof, macho::plan(), 0, alloc).unwrap();
+            let l2 = lay_out(&m2, &[], sym("entry"), prof, macho::plan(), 0, alloc).unwrap();
+            assert_eq!(l0.placed.as_slice(), l1.placed.as_slice(), "reversed input permutation must yield identical placement");
+            assert_eq!(l0.placed.as_slice(), l2.placed.as_slice(), "rotated input permutation must yield identical placement");
+            assert_eq!(l0.text.as_slice(), l1.text.as_slice(), "reversed input permutation must yield identical text bytes");
+            assert_eq!(l0.text.as_slice(), l2.text.as_slice(), "rotated input permutation must yield identical text bytes");
+            assert_eq!(l0.konst.as_slice(), l1.konst.as_slice());
+            assert_eq!(l0.fixups.as_slice(), l2.fixups.as_slice());
+        }
+    }
+
+    #[test]
+    fn bolt_packs_hot_call_graph_into_fewer_16kb_pages_and_sinks_cold_tail() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let graph = synth_20_graph(alloc);
+        let perm: [usize; 20] = core::array::from_fn(|i| i);
+        let members = members_of(&graph, &perm, alloc);
+        let plan = macho::plan();
+
+        let hot_syms = [sym("hot_loop"), sym("hot_a"), sym("hot_b"), sym("hot_c"), sym("hot_d"), sym("hot_e")];
+        let cold_syms = [
+            sym("cold_panic_0"),
+            sym("cold_fmt_0"),
+            sym("cold_fmt_1"),
+            sym("cold_fmt_2"),
+            sym("cold_panic_1"),
+            sym("cold_err_0"),
+            sym("cold_err_1"),
+            sym("cold_panic_2"),
+            sym("cold_err_2"),
+            sym("cold_vtable_0"),
+            sym("cold_vtable_1"),
+            sym("cold_vtable_2"),
+            sym("cold_vtable_3"),
+        ];
+
+        let baseline_pages = naive_dfs_pages(&members, sym("entry"), &hot_syms, plan.text_at, alloc);
+        assert!(baseline_pages >= 3, "naive DFS scatters hot call graph across >= 3 16KB pages (got {baseline_pages})");
+
+        let profile = Profile { digest: [0x99; 32], hot: &hot_syms };
+        for prof in [None, Some(profile)] {
+            let laid = lay_out(&members, &[], sym("entry"), prof, plan, 0, alloc).unwrap();
+            assert_eq!(laid.placed.len(), 20);
+            let packed_pages = hot_pages_of(&laid.placed, &hot_syms, alloc);
+            assert_eq!(packed_pages, 1, "BOLT 16KB packing must fit all 6 hot functions onto 1 single 16KB page");
+            assert!(
+                packed_pages < baseline_pages,
+                "BOLT packing ({packed_pages} pages) must strictly beat naive DFS ({baseline_pages} pages)"
+            );
+
+            // Every hot function ends strictly before every cold function begins.
+            let max_hot_end = laid
+                .placed
+                .iter()
+                .filter(|p| hot_syms.contains(&p.symbol))
+                .map(|p| p.at + p.len)
+                .max()
+                .unwrap();
+            let min_cold_start = laid
+                .placed
+                .iter()
+                .filter(|p| cold_syms.contains(&p.symbol))
+                .map(|p| p.at)
+                .min()
+                .unwrap();
+            assert!(
+                max_hot_end <= min_cold_start,
+                "every cold function ({min_cold_start:#x}) must sink to the cold tail after all hot functions ({max_hot_end:#x})"
+            );
+        }
+    }
+
+    #[test]
+    fn bolt_layout_and_optimized_agree_byte_for_byte() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let graph = synth_20_graph(alloc);
+        let perm: [usize; 20] = core::array::from_fn(|i| i);
+        let v1_members = members_of(&graph, &perm, alloc);
+
+        let mut v2_bytes: AVec<'_, AVec<'_, u8>> = Vec::with_capacity_in(v1_members.len(), alloc);
+        for m in v1_members.iter() {
+            let mut buf = Vec::new_in(alloc);
+            v1_to_v2(m.record, &TestDeclares, &mut buf, alloc).unwrap();
+            v2_bytes.push(buf);
+        }
+        let mut v2_members: AVec<'_, Member02<'_>> = Vec::with_capacity_in(v1_members.len(), alloc);
+        for (k, m) in v1_members.iter().enumerate() {
+            v2_members.push(Member02 { symbol: m.symbol, record: read_v2(&v2_bytes[k]).unwrap(), tier: m.tier });
+        }
+
+        let hot = [sym("hot_loop"), sym("hot_a"), sym("hot_b"), sym("hot_c"), sym("hot_d"), sym("hot_e")];
+        let profile = Profile { digest: [0xAB; 32], hot: &hot };
+
+        for plan in [macho::plan(), elf::plan()] {
+            for prof in [None, Some(profile)] {
+                let laid_v1 = lay_out(&v1_members, &[], sym("entry"), prof, plan, 0, alloc).unwrap();
+                let laid_v2 = lay_out_records(&v2_members, &[], sym("entry"), prof, plan, 0, alloc).unwrap();
+                assert_eq!(laid_v1.placed.as_slice(), laid_v2.placed.as_slice());
+                assert_eq!(laid_v1.text.as_slice(), laid_v2.text.as_slice());
+                assert_eq!(laid_v1.konst.as_slice(), laid_v2.konst.as_slice());
+                assert_eq!(laid_v1.data.as_slice(), laid_v2.data.as_slice());
+                assert_eq!(laid_v1.fixups.as_slice(), laid_v2.fixups.as_slice());
+                assert_eq!(laid_v1.entry, laid_v2.entry);
+                assert_eq!(laid_v1.const_at, laid_v2.const_at);
+                assert_eq!(laid_v1.data_at, laid_v2.data_at);
+                assert_eq!(laid_v1.end, laid_v2.end);
+            }
+        }
+    }
 }

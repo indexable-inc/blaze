@@ -22,10 +22,12 @@ use blaze_lir::{
     func::{Conv, DataId, Ext, IntrinsicId, ParamKind, RefId, RefKind, SigId},
 };
 use blaze_own::{Alloc, Vec};
-use blaze_tier::{CallClobbers, Emitted, Named, Names, Outside, Reloc, RelocKind, TierError, TierName};
+use blaze_tier::{
+    CallClobbers, Emitted, Named, Names, Outside, Reg as TierReg, RegSet, Reloc, RelocKind, TierError, TierName,
+};
 
 use super::CallMode;
-use super::regalloc::{self, AllocLoc, is_fp_ty, is_gpr_pair_ty, is_vec128_ty, is_vec_mask_ty};
+use super::regalloc::{self, AllocLoc, ScratchOrder, is_fp_ty, is_gpr_pair_ty, is_vec128_ty, is_vec_mask_ty};
 use super::release_opts::{
     MagicUdiv64, compute_block_order, compute_magic_udiv64, dense_switch_plan, detect_tail_calls,
 };
@@ -1505,7 +1507,10 @@ fn check_subset(view: &View<'_>, has_lse: bool, os: crate::Os) -> Result<(), Tie
                 let name = view.intrinsic_name(IntrinsicId(at_u32(view.extra, at)));
                 let argc = to_idx(at_u32(view.extra, at + 1));
                 let ok = (name == b"blaze.prefetch.r1" && argc == 1 && ty == Ty::NONE)
-                    || ((name == b"blaze.sme2.gemm_f32" || name == b"blaze.sme2.gemm_f64")
+                    || ((name == b"blaze.sme2.gemm_f32"
+                        || name == b"blaze.sme2.gemm_f64"
+                        || name == b"blaze.sme2.gemm_i8_i32"
+                        || name == b"blaze.sme2.gemm_u8_u32")
                         && argc == 7
                         && ty == Ty::NONE)
                     || (name == b"blaze.neon.tbl16" && argc == 2 && is_vec128_ty(ty).is_some())
@@ -1895,6 +1900,34 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
     call_clobbers: impl Fn(usize) -> CallClobbers,
     alloc: Alloc<'a>,
 ) -> Result<(Emitted<'a>, CallClobbers), TierError> {
+    emit_sota_a64_with_abi(
+        view,
+        names,
+        call_mode,
+        features,
+        is_macos,
+        call_clobbers,
+        None,
+        false,
+        alloc,
+    )
+}
+
+/// Zero-ABI & IPRA-enabled SOTA AArch64 emitter: accepts optional interprocedural register-avoidance
+/// [`ScratchOrder`] and `preserve_all_cold` (`CallConvKind::ColdPreserveAll`) so cold callees save
+/// and restore every modified caller-saved GPR/FP outside their return slots and expose an empty
+/// scratch clobber mask to hot callers.
+pub(crate) fn emit_sota_a64_with_abi<'a>(
+    view: View<'_>,
+    names: &dyn Names,
+    call_mode: CallMode,
+    features: u64,
+    is_macos: bool,
+    call_clobbers: impl Fn(usize) -> CallClobbers,
+    scratch_order: Option<&ScratchOrder>,
+    preserve_all_cold: bool,
+    alloc: Alloc<'a>,
+) -> Result<(Emitted<'a>, CallClobbers), TierError> {
     let has_lse = features & blaze_tier::Machine::LSE != 0;
     let has_cssc = features & blaze_tier::Machine::CSSC != 0;
     let has_sha3 = features & blaze_tier::Machine::SHA3 != 0;
@@ -1903,7 +1936,15 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
 
     let len = view.len();
     let blocks = view.blocks();
-    let tail_calls = detect_tail_calls(&view, call_mode == CallMode::DirectBl, os, alloc);
+    let tail_calls = if preserve_all_cold {
+        let mut tc: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(len, alloc);
+        for _ in 0..len {
+            tc.push(false);
+        }
+        tc
+    } else {
+        detect_tail_calls(&view, call_mode == CallMode::DirectBl, os, alloc)
+    };
     let block_order = compute_block_order(&view, alloc);
 
     // 0. Compute outgoing stacked-arg area (`[sp, #0..out_area]`), outgoing `byval` scratch area
@@ -3800,13 +3841,14 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
     }
 
     // 3. IPRA-aware Greedy Priority-Weighted Graph-Coloring Regalloc + True Constant Rematerialization!
-    let reg_alloc = regalloc::allocate_with_ipra(
+    let reg_alloc = regalloc::allocate_with_ipra_and_order(
         &view,
         &skip_emit,
         &tail_calls,
         max_spill_slots,
         os,
         call_clobbers,
+        scratch_order,
         alloc,
     )
     .map_err(|_| TierError::Refused {
@@ -3973,12 +4015,104 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
     let mut pending_unwind: Vec<(u32, Option<u32>), Alloc<'a>> = Vec::new_in(alloc);
 
     // Frameless leaf prologue when no calls, callee-saved regs, stack slots, spills, or unwinding!
+    let has_sme2_int_call = (0..len).any(|i| {
+        if view.op(i) != Op::TargetIntrinsic {
+            return false;
+        }
+        let at = to_idx(at_u32(view.data, i));
+        let name = view.intrinsic_name(IntrinsicId(at_u32(view.extra, at)));
+        name == b"blaze.sme2.gemm_i8_i32" || name == b"blaze.sme2.gemm_u8_u32"
+    });
+    let raw_clobbers = if has_sme2_int_call {
+        reg_alloc.clobbers.clobbered.union(CallClobbers::C_ABI_ARM64.clobbered)
+    } else {
+        reg_alloc.clobbers.clobbered
+    };
+    let mut out_clobbers = CallClobbers { clobbered: raw_clobbers };
+    let mut cold_gpr_pairs: Vec<(Reg, Reg), Alloc<'a>> = Vec::new_in(alloc);
+    let mut cold_fp_pairs: Vec<(Reg, Reg), Alloc<'a>> = Vec::new_in(alloc);
+
+    if preserve_all_cold {
+        let sig_rec = view.sig(SigId(view.head.sig));
+        let is_blaze_res = view
+            .sigs
+            .get(SigId(view.head.sig).index())
+            .and_then(|r| Conv::from_byte(r.conv))
+            == Some(Conv::BlazeResult);
+        let mut ret_regs = RegSet::EMPTY;
+        if sig_rec.rets.len() == 1 {
+            if let Some(first_ret) = sig_rec.rets.first() {
+                let r0 = Ty(first_ret.ty);
+                if is_fp_ty(r0).is_some() || is_vec128_ty(r0).is_some() {
+                    ret_regs = ret_regs.with(TierReg(32));
+                } else if is_gpr_pair_ty(&view, r0) {
+                    ret_regs = ret_regs.with(TierReg(0)).with(TierReg(1));
+                } else {
+                    ret_regs = ret_regs.with(TierReg(0));
+                }
+            }
+        } else if sig_rec.rets.len() >= 2 {
+            ret_regs = ret_regs.with(TierReg(0));
+            if !is_blaze_res {
+                ret_regs = ret_regs.with(TierReg(1));
+            }
+        }
+
+        let has_any_call = reg_alloc.has_calls || has_sme2_int_call;
+        let mut save_gprs: Vec<Reg, Alloc<'a>> = Vec::with_capacity_in(16, alloc);
+        for r in 0..=15u8 {
+            let tr = TierReg(r);
+            if ret_regs.contains(tr) {
+                continue;
+            }
+            if raw_clobbers.contains(tr) || (has_any_call && r <= 8) {
+                save_gprs.push(u32::from(r));
+                out_clobbers.clobbered = out_clobbers.clobbered.without(tr);
+            }
+        }
+        let mut gi = 0usize;
+        while gi < save_gprs.len() {
+            let r0 = save_gprs.get(gi).copied().unwrap_or(X16);
+            let r1 = save_gprs.get(gi + 1).copied().unwrap_or(X16);
+            cold_gpr_pairs.push((r0, r1));
+            gi += 2;
+        }
+
+        let mut save_fps: Vec<Reg, Alloc<'a>> = Vec::with_capacity_in(21, alloc);
+        for v in 0..=28u8 {
+            if (8..=15).contains(&v) {
+                continue;
+            }
+            let tr = TierReg(32 + v);
+            if ret_regs.contains(tr) {
+                continue;
+            }
+            if raw_clobbers.contains(tr) || (has_any_call && v <= 7) {
+                save_fps.push(u32::from(v));
+                out_clobbers.clobbered = out_clobbers.clobbered.without(tr);
+            }
+        }
+        let mut fi = 0usize;
+        while fi < save_fps.len() {
+            let v0 = save_fps.get(fi).copied().unwrap_or(V31);
+            let v1 = save_fps.get(fi + 1).copied().unwrap_or(V31);
+            cold_fp_pairs.push((v0, v1));
+            fi += 2;
+        }
+    }
+
     let x_pairs = reg_alloc.x_pairs;
     let d_pairs = reg_alloc.d_pairs;
     let cs_bytes = (x_pairs.count_ones() + d_pairs.count_ones()) * 16;
+    let cold_gpr_bytes = u32_of(cold_gpr_pairs.len()) * 16;
+    let cold_fp_bytes = u32_of(cold_fp_pairs.len()) * 32;
+    let total_saved_bytes = cs_bytes + cold_gpr_bytes + cold_fp_bytes;
     let needs_frame = reg_alloc.has_calls
+        || has_sme2_int_call
         || x_pairs != 0
         || d_pairs != 0
+        || cold_gpr_bytes != 0
+        || cold_fp_bytes != 0
         || frame_size > 0
         || most_align > 16
         || has_stacked_in
@@ -4007,8 +4141,20 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
         out.frame = unwind_frame.word().unwrap_or(0);
         out.unwind_frame = Some(unwind_frame);
 
+        // ColdPreserveAll: save modified caller-saved GPRs and 128-bit FP/NEON registers below
+        // canonical unwind pairs so hot callers keep all loop registers live with zero spills.
+        for &(r0, r1) in &cold_gpr_pairs {
+            words.push(enc::stp_pre(r0, r1, SP, -16));
+        }
+        if cold_fp_bytes > 0 {
+            words.push(enc::sub_imm(SP, SP, cold_fp_bytes, false));
+            for (p, &(v0, v1)) in cold_fp_pairs.iter().enumerate() {
+                words.push(enc::stp_q_off(v0, v1, SP, i32_of(p * 2)));
+            }
+        }
+
         if frame_size > 0 {
-            let drop = 16u64 + u64::from(frame_size) + (most_align - 16);
+            let drop = 16u64 + u64::from(total_saved_bytes) + u64::from(frame_size) + (most_align - 16);
             if drop <= u64::from(PROBE_STEP) {
                 let hi = frame_size >> 12;
                 let lo = frame_size & 0xfff;
@@ -4375,6 +4521,8 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
     let mut shared_jump_tables: Vec<SharedJumpTable<'a>, Alloc<'a>> = Vec::new_in(alloc);
     let mut sme2_f32_bl_sites: Vec<usize, Alloc<'a>> = Vec::new_in(alloc);
     let mut sme2_f64_bl_sites: Vec<usize, Alloc<'a>> = Vec::new_in(alloc);
+    let mut sme2_i8_i32_bl_sites: Vec<usize, Alloc<'a>> = Vec::new_in(alloc);
+    let mut sme2_u8_u32_bl_sites: Vec<usize, Alloc<'a>> = Vec::new_in(alloc);
     let mut post_pairs: Vec<PostIndexPlan, Alloc<'a>> = Vec::with_capacity_in(8, alloc);
     let mut ptr_accesses: Vec<(usize, bool, PostAccessKind, i64), Alloc<'a>> = Vec::with_capacity_in(16, alloc);
     let mut skip_p_nexts: Vec<usize, Alloc<'a>> = Vec::with_capacity_in(8, alloc);
@@ -4484,11 +4632,20 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
     let emit_epilogue = |words: &mut Vec<u32, Alloc<'a>>| {
         if needs_frame {
             if frame_size > 0 || most_align > 16 {
-                if cs_bytes == 0 {
+                if total_saved_bytes == 0 {
                     words.push(enc::add_imm(SP, FP, 0, false));
                 } else {
-                    words.push(enc::sub_imm(SP, FP, cs_bytes, false));
+                    words.push(enc::sub_imm(SP, FP, total_saved_bytes, false));
                 }
+            }
+            if cold_fp_bytes > 0 {
+                for (p, &(v0, v1)) in cold_fp_pairs.iter().enumerate() {
+                    words.push(enc::ldp_q_off(v0, v1, SP, i32_of(p * 2)));
+                }
+                words.push(enc::add_imm(SP, SP, cold_fp_bytes, false));
+            }
+            for &(r0, r1) in cold_gpr_pairs.iter().rev() {
+                words.push(enc::ldp_post(r0, r1, SP, 16));
             }
             for k in (0..4u32).rev() {
                 if d_pairs & (1 << k) != 0 {
@@ -7350,7 +7507,11 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                         let ptr_v = at_u32(view.extra, at + 2);
                         let rptr = load_gpr(&mut words, ptr_v, X16);
                         words.push(enc::prfm_pldl1keep(rptr, 0));
-                    } else if name == b"blaze.sme2.gemm_f32" || name == b"blaze.sme2.gemm_f64" {
+                    } else if name == b"blaze.sme2.gemm_f32"
+                        || name == b"blaze.sme2.gemm_f64"
+                        || name == b"blaze.sme2.gemm_i8_i32"
+                        || name == b"blaze.sme2.gemm_u8_u32"
+                    {
                         gpr_moves.clear();
                         const_edge_writes.clear();
                         for k in 0..7usize {
@@ -7378,8 +7539,12 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                         words.push(enc::bl(0));
                         if name == b"blaze.sme2.gemm_f32" {
                             sme2_f32_bl_sites.push(bl_w);
-                        } else {
+                        } else if name == b"blaze.sme2.gemm_f64" {
                             sme2_f64_bl_sites.push(bl_w);
+                        } else if name == b"blaze.sme2.gemm_i8_i32" {
+                            sme2_i8_i32_bl_sites.push(bl_w);
+                        } else {
+                            sme2_u8_u32_bl_sites.push(bl_w);
                         }
                     }
                 }
@@ -10564,6 +10729,28 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
             set_at(&mut words, bl_w, enc::bl(word_delta(stub_w, bl_w)));
         }
     }
+    if !sme2_i8_i32_bl_sites.is_empty() {
+        while words.len() % 4 != 0 {
+            words.push(enc::nop());
+        }
+        let stub_w = words.len();
+        let stub_words = super::sme2::emit_sme2_gemm_i8_i32_words(alloc);
+        words.extend_from_slice(&stub_words);
+        for &bl_w in &sme2_i8_i32_bl_sites {
+            set_at(&mut words, bl_w, enc::bl(word_delta(stub_w, bl_w)));
+        }
+    }
+    if !sme2_u8_u32_bl_sites.is_empty() {
+        while words.len() % 4 != 0 {
+            words.push(enc::nop());
+        }
+        let stub_w = words.len();
+        let stub_words = super::sme2::emit_sme2_gemm_u8_u32_words(alloc);
+        words.extend_from_slice(&stub_words);
+        for &bl_w in &sme2_u8_u32_bl_sites {
+            set_at(&mut words, bl_w, enc::bl(word_delta(stub_w, bl_w)));
+        }
+    }
 
     // 5. Patch all intra-function branch displacements & jump table entries.
     for p in &patches {
@@ -10621,7 +10808,7 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
     for &w in &words {
         out.code.extend_from_slice(&w.to_le_bytes());
     }
-    Ok((out, reg_alloc.clobbers))
+    Ok((out, out_clobbers))
 }
 
 #[inline]
