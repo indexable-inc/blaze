@@ -28,7 +28,7 @@ use bstd::out::Out;
 use bstd::Cx;
 use core::fmt;
 
-use crate::body_types::TreesSeen;
+use crate::body_types::{SyncPackDirs, TreesSeen};
 use crate::engine_check::{Standing, check_for_start};
 use crate::engine_records::EngineRecords;
 use crate::phases::Phases;
@@ -329,6 +329,7 @@ pub(crate) fn run_program(
     watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Crates));
     let mut read = EngineRecords::new(heap.alloc());
     let seen = TreesSeen::default();
+    let pack_dirs = SyncPackDirs::default();
     let root = standing.checkout;
     let lints = crate::lints::of_root(cx, root, frame)?;
     // The names world's facts, made only on the unit map's miss (run_names.rs `unit_map`):
@@ -376,9 +377,9 @@ pub(crate) fn run_program(
     let maker = crate::job_texts::MadeOnce::new(|| inputs.make());
     let procs = crate::job_texts::Procs::ByNeed(&maker);
     let store = &mut *standing.store;
-    let (bodies, reads, seen_ref) = (&mut facts.bodies, &mut read, &seen);
+    let (bodies, reads, seen_ref, dirs_ref) = (&mut facts.bodies, &mut read, &seen, &pack_dirs);
     let mut names = || {
-        run_names::names_of(cx, root, &found, owner, &mut *store, &mut *bodies, &mut *reads, env, procs, seen_ref, frame, heap)
+        run_names::names_of(cx, root, &found, owner, &mut *store, &mut *bodies, &mut *reads, env, dirs_ref, procs, seen_ref, frame, heap)
             .map_err(|error| crate::run_parent::ParentError::Names { shown: std::boxed::Box::from(bstd::mem::format_in!(frame, "{error}").as_str()) })
     };
     let mut ids = || made.take().ok_or_else(|| crate::run_parent::ParentError::BodyIds { shown: std::boxed::Box::from("the body ids were asked a second time (run_parent.rs `CommandFront` asks once)") });
@@ -458,6 +459,7 @@ pub(crate) fn run_tests_status(
     watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Crates));
     let mut read = EngineRecords::new(heap.alloc());
     let seen = TreesSeen::default();
+    let pack_dirs = SyncPackDirs::default();
     let root = standing.checkout;
     let lints = crate::lints::of_root(cx, root, frame)?;
     let workers = standing.workers.get();
@@ -556,7 +558,7 @@ pub(crate) fn run_tests_status(
             // What the suite's names records are made of, kept for the command's code workers
             // (test_drive.rs `pooled`, D194), then the command thread's own names records of it.
             let named = cx.span("run names: open the names records");
-            let crates = run_names::crates_of(&named, found, run_names::Owner::At(unit.at), &mut *standing.store, &mut facts.bodies, &mut read, &facts.fetch_env, frame, heap)
+            let crates = run_names::crates_of(&named, found, run_names::Owner::At(unit.at), &mut *standing.store, &mut facts.bodies, &mut read, &facts.fetch_env, &pack_dirs, frame, heap)
                 .map_err(CliError::RunNames)?;
             drop(named);
             let names = run_names::names_in(cx, root, crates, procs, &seen, frame).map_err(CliError::RunNames)?;

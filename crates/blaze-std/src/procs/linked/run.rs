@@ -95,8 +95,8 @@ pub enum RunStep {
 /// How a step on a run child failed.
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: an error
 pub enum RunFault {
-    /// blaze-core refused or failed it, saying this.
-    Host(&'static str),
+    /// blaze-core refused or failed it, saying `what`, with raw OS errno `os` (0 when none).
+    Host { what: &'static str, os: i32 },
     /// The channel: torn, too long, hung up, a write past its deadline, a system error.
     Channel(ChannelError),
     /// The task's deadline passed first, or the task was cancelled.
@@ -118,7 +118,8 @@ impl fmt::Display for RunError {
             None => write!(f, "bstd::procs run child, {:?}: ", self.step)?,
         }
         match &self.fault {
-            RunFault::Host(said) => write!(f, "the host refused: {said}"),
+            RunFault::Host { what, os: 0 } => write!(f, "the host refused: {what}"),
+            RunFault::Host { what, os } => write!(f, "the host refused: {what}: {}", blaze_core::linked::OsError(*os)),
             RunFault::Channel(error) => write!(f, "{error}"),
             RunFault::Stopped(stopped) => write!(f, "{stopped}"),
         }
@@ -259,7 +260,7 @@ impl Spawner {
             return Err(refuse(RunFault::Stopped(Stopped::Deadline { span: RUN_SPAN, at: task.get() })));
         }
         let command = make_command(spec.program, spec.args, spec.env, spec.dir);
-        let pid = blaze_core::linked::run::start_detached(&command).map_err(|error: LinkError| refuse(RunFault::Host(error.op.what())))?;
+        let pid = blaze_core::linked::run::start_detached(&command).map_err(|error: LinkError| refuse(RunFault::Host { what: error.op.what(), os: error.os }))?;
         Ok(ProcId(pid))
     }
 
@@ -310,14 +311,17 @@ impl Spawner {
             parent_death: spec.parent_death,
             confine,
         };
-        let started = start_run(&command, &link).map_err(|error: LinkError| refuse(RunFault::Host(error.op.what())))?;
+        let started = start_run(&command, &link).map_err(|error: LinkError| refuse(RunFault::Host { what: error.op.what(), os: error.os }))?;
         let proc = ProcId(started.child.pid());
         let pipe = |fd, what| match DeadlineFd::new(fd, what) {
             Ok(fd) => Ok(OutPipe { fd, proc, io: self.io.clone(), task }),
-            Err(_) => Err(RunError {
+            Err(error) => Err(RunError {
                 step: RunStep::ReadOutput,
                 proc: Some(proc),
-                fault: RunFault::Host("making the pipe non-blocking (fcntl O_NONBLOCK)"),
+                fault: RunFault::Host {
+                    what: "making the pipe non-blocking (fcntl O_NONBLOCK)",
+                    os: error.raw_os_error().unwrap_or(0),
+                },
             }),
         };
         // A pipe refused here drops the child: killed and reaped.
@@ -380,7 +384,7 @@ impl Run {
 
     /// `SIGTERM` to it (its group where it leads one). See [`RunChild::terminate`].
     pub fn terminate(&mut self) -> Result<(), RunError> {
-        self.child.terminate().map_err(|error| self.rest.error(RunStep::Terminate, RunFault::Host(error.op.what())))
+        self.child.terminate().map_err(|error| self.rest.error(RunStep::Terminate, RunFault::Host { what: error.op.what(), os: error.os }))
     }
 
     fn wait_rest(self, deadline: Deadline) -> Result<Waited<Run, (Exit, Rest)>, RunError> {
@@ -391,7 +395,7 @@ impl Run {
             Ok(Waited::Running(_)) if task_first => Err(rest.stopped(RunStep::Wait, until)),
             Ok(Waited::Running(child)) => Ok(Waited::Running(Run { child, own_group, rest })),
             Ok(Waited::Ended(exit)) => Ok(Waited::Ended((exit, rest))),
-            Err(error) => Err(rest.error(RunStep::Wait, RunFault::Host(error.op.what()))),
+            Err(error) => Err(rest.error(RunStep::Wait, RunFault::Host { what: error.op.what(), os: error.os })),
         }
     }
 
@@ -403,7 +407,7 @@ impl Run {
         };
         match killed {
             Ok(exit) => Ok((exit, rest)),
-            Err(error) => Err(rest.error(RunStep::Kill, RunFault::Host(error.op.what()))),
+            Err(error) => Err(rest.error(RunStep::Kill, RunFault::Host { what: error.op.what(), os: error.os })),
         }
     }
 }

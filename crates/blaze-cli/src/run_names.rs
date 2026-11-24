@@ -39,7 +39,7 @@ use core::cell::RefCell;
 use std::alloc::Global;
 
 use crate::CliError;
-use crate::body_types::{Kept, LazyTrees, ListTrees, PackDirs, PackHome, TreesSeen};
+use crate::body_types::{Kept, PackHome, SharedTrees, SyncLazyTrees, SyncPackDirs, TreesSeen};
 use crate::engine_records::{EngineRecords, ReadCounts, ReadError};
 use crate::front_load::{CrateRecords, StoreLoad};
 use crate::job_texts::{JobTexts, Packs};
@@ -1049,13 +1049,14 @@ pub(crate) fn names_of<'n, 'm: 'n>(
     kept: &mut Kept,
     read: &mut EngineRecords<'m>,
     env: &'n crate::fetch::FetchEnv<'_>,
+    dirs: &'n SyncPackDirs,
     procs: crate::job_texts::Procs<'n>,
     seen: &'n TreesSeen,
     frame: &'n Frame,
     heap: &'static blaze_own::Heap,
 ) -> Result<NamesRecords<'n>, RunNamesError> {
     let _cx = cx.span("run names: open the names records");
-    let crates = crates_of(cx, found, owner, store, kept, read, env, frame, heap)?;
+    let crates = crates_of(cx, found, owner, store, kept, read, env, dirs, frame, heap)?;
     names_in(cx, root, crates, procs, seen, frame)
 }
 
@@ -1070,14 +1071,15 @@ pub(crate) fn crates_of<'n, 'm: 'n>(
     kept: &mut Kept,
     read: &mut EngineRecords<'m>,
     env: &'n crate::fetch::FetchEnv<'_>,
+    dirs: &'n SyncPackDirs,
     frame: &'n Frame,
     heap: &'static blaze_own::Heap,
 ) -> Result<RunCrates<'n>, RunNamesError> {
     match found {
-        Found::Walked(program, snapshot) => read_crates(cx, program, snapshot, store, read, env, frame, heap),
+        Found::Walked(program, snapshot) => read_crates(cx, program, snapshot, store, kept, read, env, dirs, frame, heap),
         Found::Stood(rows, snapshot) => {
             let program = program_of(cx, rows, owner, store, kept, read, heap, frame)?;
-            read_crates(cx, &program, snapshot, store, read, env, frame, heap)
+            read_crates(cx, &program, snapshot, store, kept, read, env, dirs, frame, heap)
         }
     }
 }
@@ -1197,11 +1199,11 @@ impl<'n> crate::job_texts::EnvsByNeed<'n> for RunEnvs<'n> {
 /// records of it ([`names_in`]), and the command thread makes its own the same way ([`names_of`]).
 ///
 /// WHAT IS SHARED, AND WHAT IS NOT (D194 piece 2): shared read only are the crates' records
-/// (views of the store's mapping), the list, the snapshot, the corrected texts and the packs'
-/// home; per maker of names records ([`names_in`], one a worker a suite) are the trees opened by
-/// need ([`LazyTrees`], [`ListTrees`]: `Cell` and `RefCell`), their count ([`TreesSeen`]), the
-/// environments made by need ([`RunEnvs`]: `OnceCell`) and the records' own memo (`Records`, the
-/// `Log`, the job texts), all in that maker's frame.
+/// (views of the store's mapping), the list, the snapshot, the corrected texts, the command-wide
+/// lazy pack cache ([`SyncLazyTrees`]), the command-scoped pack directories ([`SyncPackDirs`]),
+/// and the packs' home; per maker of names records ([`names_in`], one a worker a suite) are its
+/// open/refusal counter ([`TreesSeen`]), the environments made by need ([`RunEnvs`]: `OnceCell`),
+/// and the records' own memo (`Records`, the `Log`, the job texts), all in that maker's frame.
 #[derive(Clone, Copy)]
 pub(crate) struct RunCrates<'n> {
     list: &'n CrateList<'static>,
@@ -1212,6 +1214,12 @@ pub(crate) struct RunCrates<'n> {
     scripts: &'n [(usize, Input)],
     lang: &'n [usize],
     corrected: &'static [(u32, &'static str, &'static str)],
+    /// Command-wide lazy pack opener (`Kept::lazy_trees`), shared across every suite and worker
+    /// so each pack is verified and mapped at most once.
+    packs: &'static SyncLazyTrees<'static>,
+    /// Command-scoped pack directory cache (`shelf` and `sources`), dropped cleanly when the
+    /// command returns instead of leaking one secondary driver per suite.
+    dirs: &'n SyncPackDirs,
     snapshot: &'n StoreSnapshot,
     /// Where the list's packs are opened from (the home, its file tree, the heap a mapping is
     /// kept on); its `home` is also where a native script's stored `OUT_DIR` files are.
@@ -1228,8 +1236,10 @@ pub(crate) fn read_crates<'n, 'm: 'n>(
     program: &Program,
     snapshot: &'n StoreSnapshot,
     store: &mut dyn Store<'m>,
+    kept: &mut Kept,
     read: &mut EngineRecords<'m>,
     env: &'n crate::fetch::FetchEnv<'_>,
+    dirs: &'n SyncPackDirs,
     frame: &'n Frame,
     heap: &'static blaze_own::Heap,
 ) -> Result<RunCrates<'n>, RunNamesError> {
@@ -1240,14 +1250,14 @@ pub(crate) fn read_crates<'n, 'm: 'n>(
         let records: CrateRecords<'m> = read.records(cx, store, input, list.key(*at), heap.alloc()).map_err(|error| RunNamesError::Records { crate_name, error: std::boxed::Box::new_in(error, Global) })?;
         crates.push(Crate { records, name: crate_name, package: list.shown_from(*at), world_at: *at });
     }
-    let corrected = crate::body_types::corrected_of(list, heap).map_err(|why| RunNamesError::Trees { why })?;
+    let (packs, corrected) = kept.lazy_trees(env, program.graph.out, program.list).map_err(|why| RunNamesError::Trees { why })?;
     let mut rows: Vec<usize, &'n Frame> = Vec::with_capacity_in(program.crates.len(), frame);
     rows.extend(program.crates.iter().map(|(at, _)| *at));
     let mut scripts: Vec<(usize, Input), &'n Frame> = Vec::with_capacity_in(program.scripts.len(), frame);
     scripts.extend_from_slice(&program.scripts);
     let mut lang: Vec<usize, &'n Frame> = Vec::with_capacity_in(program.lang.len(), frame);
     lang.extend_from_slice(&program.lang);
-    Ok(RunCrates { list, crates: crates.into_bump_slice(), rows: rows.into_bump_slice(), scripts: scripts.into_bump_slice(), lang: lang.into_bump_slice(), corrected, snapshot, from: PackHome::of(env), heap })
+    Ok(RunCrates { list, crates: crates.into_bump_slice(), rows: rows.into_bump_slice(), scripts: scripts.into_bump_slice(), lang: lang.into_bump_slice(), corrected, packs, dirs, snapshot, from: PackHome::of(env), heap })
 }
 
 /// The names records over `crates`, in `frame`, on the calling thread (`cx`'s): the list's trees
@@ -1263,14 +1273,10 @@ pub(crate) fn names_in<'n>(
     seen: &'n TreesSeen,
     frame: &'n Frame,
 ) -> Result<NamesRecords<'n>, RunNamesError> {
-    let RunCrates { list, crates: opened, rows, scripts, lang, corrected, snapshot, from, heap } = crates;
-    // The trees: none opened here; each at the first read of a text from it, at most once. The
-    // read of them all is the `UnitGraph`'s (the doc of body_types.rs `Kept::trees`).
-    let opener: &'n ListTrees<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(
-        ListTrees { cx, from, list, scratch: frame, dirs: RefCell::new(PackDirs::default()) },
-        frame,
-    ));
-    let trees: &'n LazyTrees<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(LazyTrees::new(opener, list.trees(), seen, frame), frame));
+    let RunCrates { list, crates: opened, rows, scripts, lang, corrected, packs, dirs, snapshot, from, heap } = crates;
+    // The trees: shared command-wide mapping cache and command-scoped pack directories, so
+    // multi-suite `blaze test` never leaks per-suite drivers/FDs or duplicate pack mappings.
+    let trees = SharedTrees::new(packs, from.fs, dirs, seen);
     // Every crate's environment, each made at its first ask ([`RunEnvs`]): a body lowered by
     // need reads its own crate's, as `blaze check` gives a body its owner's.
     let envs: &'n RunEnvs<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(RunEnvs::new(list, rows, scripts, snapshot, from.home, frame), frame));
