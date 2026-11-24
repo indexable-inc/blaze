@@ -25,11 +25,14 @@
 //! 4. **Seamless Fallback (`Sota::with_fallback`)**: delegates exotic ops outside `Sota`'s subset
 //!    (e.g. `asm!`, `f128`) already SOTA-optimized to the configured fallback tier.
 
+pub mod abi;
+pub mod bolt;
 mod enc_x64;
 mod isel;
 pub mod module;
 mod regalloc;
 mod release_opts;
+pub mod sme2;
 mod x86_64;
 
 pub use module::{CompiledModuleFn, ModuleFn, SotaModuleOpts, SotaModuleOut, compile_module_a64};
@@ -40,13 +43,19 @@ mod tests;
 use blaze_code::record::{CodeRecord, NO_TARGET, OWN_CODE, OWN_RELRO, Site, SiteKind, TrapRow, TrapSource, Word};
 use blaze_lir::{
     Op, Verified,
+    amac::{AmacOpts, interleave_amac_loops},
     bce::eliminate_redundant_checks,
     coldsplit::partition_cold_blocks,
     egraph::{RegBudget, sota_optimize_fixpoint},
+    gemm::{GemmOpts, optimize_gemm_loops},
     ifconv::if_convert,
     loopnest::{fuse_adjacent_loops, interchange_and_tile_loops},
+    mach_egraph::{MachEGraphOpts, optimize_mach_egraph},
     memopt::optimize_memory,
+    modulo_sched::{ModuloSchedOpts, swing_modulo_schedule},
+    prefetch::insert_software_prefetch,
     sched::schedule_dag,
+    simd_idioms::{SimdIdiomOpts, lower_simd_idioms},
     simplify::scalar_replace,
     slp::{slp_vectorize, vectorize_memchr_loops},
     superopt::{SuperoptOpts, superopt_a64},
@@ -191,11 +200,35 @@ fn run_sota_loop_and_late_passes<'a>(
         Arch::X86_64 => blaze_lir::superopt::AArch64MicroArch::X86_64Zen5,
     };
 
+    // Stage 1b-0: Triple-nested GEMM recognition (Auto-SME2 FMOPA / 4x16 NEON register blocking)
+    // runs BEFORE `unswitch_loops` so inner `0 < n` unswitching guards don't split the 3D nest.
+    let mut did_gemm = false;
+    let gemm_func = if auto_vectorize && machine.arch == Arch::Arm64 {
+        let gemm_opts = if (machine.features & Machine::SME2) != 0 {
+            GemmOpts::sme2()
+        } else {
+            GemmOpts::neon()
+        };
+        optimize_gemm_loops(input, gemm_opts, alloc)
+            .ok()
+            .filter(|o| o.stats.sme2_lowered > 0 || o.stats.neon_blocked > 0)
+            .map(|o| {
+                did_gemm = true;
+                o.func
+            })
+    } else {
+        None
+    };
+    let post_gemm_in = match &gemm_func {
+        Some(f) => f.view(),
+        None => input,
+    };
+
     // Stage 1b: Dominating Bounds-Check Elimination + Loop Unswitching + If-Conversion.
-    let bce_out = eliminate_redundant_checks(input, alloc).ok();
+    let bce_out = eliminate_redundant_checks(post_gemm_in, alloc).ok();
     let post_bce = match &bce_out {
         Some(o) => o.func.view(),
-        None => input,
+        None => post_gemm_in,
     };
     let unsw_out = unswitch_loops(post_bce, 2, alloc).ok();
     let post_unsw = match &unsw_out {
@@ -248,9 +281,11 @@ fn run_sota_loop_and_late_passes<'a>(
         None => post_fuse,
     };
 
-    // Stage 1d: 4x-unrolled SIMD Loop Auto-Vectorization, SIMD `memchr`, SLP, IV-div NEON,
-    // 4x Scalar Multi-Accumulator Unrolling, and Loop Rotation (turns `HeaderBody` loops like
-    // `wyhash_mix`, if-converted `bsearch`, and scalar epilogues into `SingleBlock` do-while loops).
+    // Stage 1d: Crazy-SOTA GEMM (Auto-SME2 FMOPA / 4x16 NEON register blocking), SIMD Idioms
+    // (NEON TBL 16B/64B byte-LUTs, SDOT/UDOT, branchless sorting networks), AMAC 4-way
+    // interleaved pointer-chasing coroutine prefetching, 4x-unrolled SIMD Auto-Vectorization,
+    // SIMD `memchr`, SLP, IV-div NEON, 4x Scalar Unrolling, Loop Rotation, Indirect Prefetch,
+    // and Swing Modulo Scheduling.
     let vec_bytes = if machine.arch == Arch::X86_64 && (machine.features & Machine::AVX512 != 0) {
         64
     } else if machine.arch == Arch::X86_64 && (machine.features & Machine::AVX2 != 0) {
@@ -259,20 +294,64 @@ fn run_sota_loop_and_late_passes<'a>(
         16
     };
     let mut loop_cur: Option<blaze_lir::Func<Alloc<'a>>> = None;
+    let mut did_simd_idiom = false;
+    let mut did_amac = false;
     let mut did_vectorize = false;
     let mut did_unroll = false;
+    let mut did_modulo = false;
     if auto_vectorize {
-        for _ in 0..8 {
-            let v = loop_cur.as_ref().map_or(post_nest, |f| f.view());
-            match auto_vectorize_loops_with_width(v, vec_bytes, alloc) {
-                Ok(o) if o.stats.loops_vectorized > 0 => {
-                    did_vectorize = true;
+        if machine.arch == Arch::Arm64 {
+            if !did_gemm {
+                let gemm_opts = if (machine.features & Machine::SME2) != 0 {
+                    GemmOpts::sme2()
+                } else {
+                    GemmOpts::neon()
+                };
+                let v = loop_cur.as_ref().map_or(post_nest, |f| f.view());
+                if let Ok(o) = optimize_gemm_loops(v, gemm_opts, alloc)
+                    && (o.stats.sme2_lowered > 0 || o.stats.neon_blocked > 0)
+                {
+                    did_gemm = true;
                     loop_cur = Some(o.func);
                 }
-                _ => break,
+            }
+
+            let idiom_opts = SimdIdiomOpts {
+                enable_tbl: true,
+                enable_dotprod: (machine.features & Machine::DOTPROD) != 0,
+                enable_sort_net: true,
+            };
+            let v = loop_cur.as_ref().map_or(post_nest, |f| f.view());
+            if let Ok(o) = lower_simd_idioms(v, idiom_opts, alloc)
+                && (o.stats.tbl_loops > 0
+                    || o.stats.dotprod_loops > 0
+                    || o.stats.sort_swaps_canonicalized > 0)
+            {
+                did_simd_idiom = o.stats.tbl_loops > 0 || o.stats.dotprod_loops > 0;
+                loop_cur = Some(o.func);
+            }
+
+            let v = loop_cur.as_ref().map_or(post_nest, |f| f.view());
+            if let Ok(o) = interleave_amac_loops(v, AmacOpts::apple_silicon(), alloc)
+                && o.stats.nests_interleaved > 0
+            {
+                did_amac = true;
+                loop_cur = Some(o.func);
             }
         }
-        if did_vectorize {
+        if !did_gemm {
+            for _ in 0..8 {
+                let v = loop_cur.as_ref().map_or(post_nest, |f| f.view());
+                match auto_vectorize_loops_with_width(v, vec_bytes, alloc) {
+                    Ok(o) if o.stats.loops_vectorized > 0 => {
+                        did_vectorize = true;
+                        loop_cur = Some(o.func);
+                    }
+                    _ => break,
+                }
+            }
+        }
+        if did_vectorize || did_gemm || did_simd_idiom {
             let v = loop_cur.as_ref().map_or(post_nest, |f| f.view());
             if let Ok(o) = sota_optimize_fixpoint(v, reg_budget, 2, |_| 1, alloc) {
                 loop_cur = Some(o.func);
@@ -307,14 +386,16 @@ fn run_sota_loop_and_late_passes<'a>(
                 }
             }
         }
-        for _ in 0..8 {
-            let v = loop_cur.as_ref().map_or(post_nest, |f| f.view());
-            match unroll_scalar_loops(v, alloc) {
-                Ok(o) if o.stats.loops_unrolled > 0 => {
-                    did_unroll = true;
-                    loop_cur = Some(o.func);
+        if !did_amac && !did_gemm {
+            for _ in 0..8 {
+                let v = loop_cur.as_ref().map_or(post_nest, |f| f.view());
+                match unroll_scalar_loops(v, alloc) {
+                    Ok(o) if o.stats.loops_unrolled > 0 => {
+                        did_unroll = true;
+                        loop_cur = Some(o.func);
+                    }
+                    _ => break,
                 }
-                _ => break,
             }
         }
         for _ in 0..8 {
@@ -324,6 +405,29 @@ fn run_sota_loop_and_late_passes<'a>(
                     loop_cur = Some(o.func);
                 }
                 _ => break,
+            }
+        }
+        if machine.arch == Arch::Arm64 && !did_amac {
+            let v = loop_cur.as_ref().map_or(post_nest, |f| f.view());
+            if let Ok(o) = insert_software_prefetch(v, 8, alloc)
+                && o.stats.prefetches_inserted > 0
+            {
+                loop_cur = Some(o.func);
+            }
+        }
+        if machine.arch == Arch::Arm64
+            && !did_gemm
+            && !did_simd_idiom
+            && !did_amac
+            && !did_vectorize
+            && !did_unroll
+        {
+            let v = loop_cur.as_ref().map_or(post_nest, |f| f.view());
+            if let Ok(o) = swing_modulo_schedule(v, ModuloSchedOpts::apple_m5(), alloc)
+                && o.stats.loops_pipelined > 0
+            {
+                did_modulo = true;
+                loop_cur = Some(o.func);
             }
         }
     }
@@ -342,25 +446,37 @@ fn run_sota_loop_and_late_passes<'a>(
         None => post_loop,
     };
 
-    // Stage 1e: Bounded multi-round e-graph superoptimization (local arithmetic rewrites only;
-    // preserves vectorization and tail-duplicated CFG structure).
+    // Stage 1e: Joint Apple-M5 Machine-Op E-Graph + Bounded Multi-Round Superoptimization.
+    let mach_func = if superopt.is_some() && machine.arch == Arch::Arm64 {
+        let mut mopts = MachEGraphOpts::apple_m5();
+        mopts.enable_synth = false; // Fast deterministic saturation in hot path; synth available via explicit cache.
+        optimize_mach_egraph(post_td, mopts, None, alloc)
+            .ok()
+            .filter(|o| o.stats.rewrites_applied > 0)
+            .map(|o| o.func)
+    } else {
+        None
+    };
+    let post_mach = match &mach_func {
+        Some(f) => f.view(),
+        None => post_td,
+    };
     let super_func = if let Some(mut sopts) = superopt {
         if machine.arch == Arch::X86_64 {
             sopts.microarch = default_super_arch;
         }
-        superopt_a64(post_td, sopts, |_| true, alloc).ok().map(|o| o.func)
+        superopt_a64(post_mach, sopts, |_| true, alloc).ok().map(|o| o.func)
     } else {
         None
     };
     let post_super = match &super_func {
         Some(f) => f.view(),
-        None => post_td,
+        None => post_mach,
     };
 
     // Stage 1f: Intra-block critical-path latency-aware DAG list scheduler (skipped after
-    // vectorization, unrolling, or dispatch tail-duplication so contiguous `ldp`/`stp` pairing and
-    // per-arm `CmpBr`/coalescing order stay intact).
-    let sched_func = if !did_vectorize && !did_unroll && !did_taildup {
+    // vectorization, unrolling, GEMM, AMAC, SIMD idioms, modulo pipelining, or dispatch tail-dup).
+    let sched_func = if !did_vectorize && !did_unroll && !did_taildup && !did_gemm && !did_amac && !did_simd_idiom && !did_modulo {
         schedule_dag(post_super, alloc).ok().filter(|o| o.stats.insts_reordered > 0).map(|o| o.func)
     } else {
         None
