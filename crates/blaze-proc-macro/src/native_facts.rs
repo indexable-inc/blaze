@@ -91,27 +91,41 @@ fn files(path: &str) -> impl FnOnce(std::io::Error) -> NativeFactsError + '_ {
     move |e| NativeFactsError::Files { path: path.to_owned(), why: e.to_string() }
 }
 
-/// Copies the shim binary `from` into `<work>/fact-shim/blaze-fact-shim` (unless the bytes
-/// there are already equal: written to a side file, then renamed), executable; returns the
-/// placed file's real path. Called once per command at its edge.
+/// Copies the shim binary `from` into `<work>/fact-shim/<digest-hex>/blaze-fact-shim` (content-addressed
+/// and immutable once renamed, written to a unique side file first), executable; returns the
+/// placed file's real path. Called once per command at its edge so concurrent or upgraded `blaze`
+/// commands never overwrite one another's shim image mid-run.
 pub fn place_shim(work: &str, from: &str) -> Result<std::string::String, NativeFactsError> {
     let bytes = std::fs::read(from).map_err(|e| NativeFactsError::NoShim { path: from.to_owned(), why: e.to_string() })?;
-    let folder = format!("{work}/{SHIM_IN_WORK}");
+    let digest = file_answer(&bytes);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut hex_buf = [0u8; 64];
+    for (pair, byte) in hex_buf.chunks_exact_mut(2).zip(digest.0) {
+        if let ([hi, lo], Some(&h), Some(&l)) = (pair, HEX.get(usize::from(byte >> 4)), HEX.get(usize::from(byte & 0x0f))) {
+            *hi = h;
+            *lo = l;
+        }
+    }
+    let hex = core::str::from_utf8(&hex_buf).unwrap_or("");
+    let folder = format!("{work}/{SHIM_IN_WORK}/{hex}");
     std::fs::create_dir_all(&folder).map_err(files(&folder))?;
     let path = format!("{folder}/{SHIM_NAME}");
     if std::fs::read(&path).ok().as_deref() != Some(&bytes[..]) {
-        let side = format!("{path}.new");
+        let side = format!("{path}.new.{:p}", bytes.as_ptr());
         std::fs::write(&side, &bytes).map_err(files(&side))?;
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&side, std::fs::Permissions::from_mode(0o755)).map_err(files(&side))?;
         std::fs::rename(&side, &path).map_err(files(&path))?;
     }
-    placed_shim(work)
+    placed_shim(work, Some(hex))
 }
 
-/// The shim [`place_shim`] put under `work`, by its real path (Seatbelt grants resolved paths).
-pub fn placed_shim(work: &str) -> Result<std::string::String, NativeFactsError> {
-    let path = format!("{work}/{SHIM_IN_WORK}/{SHIM_NAME}");
+/// The shim [`place_shim`] put under `work` (at its content-addressed `digest_hex`, or directly
+/// under `fact-shim` when `None`), by its real path (Seatbelt grants resolved paths).
+pub fn placed_shim(work: &str, digest_hex: Option<&str>) -> Result<std::string::String, NativeFactsError> {
+    let mid = if digest_hex.is_some() { "/" } else { "" };
+    let hex = digest_hex.unwrap_or("");
+    let path = format!("{work}/{SHIM_IN_WORK}{mid}{hex}/{SHIM_NAME}");
     let real = std::fs::canonicalize(&path).map_err(|e| NativeFactsError::NoShim { path: path.clone(), why: e.to_string() })?;
     real.to_str().map(str::to_owned).ok_or(NativeFactsError::NoShim { path, why: "its real path is not UTF-8".to_owned() })
 }

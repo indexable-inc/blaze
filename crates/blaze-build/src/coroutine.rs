@@ -378,6 +378,9 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         let mut fields: Vec<EnvField, A> = Vec::new_in(self.alloc);
         let mut caps = Vec::new_in(self.alloc);
         for f in self.checked.env_fields_by::<crate::layout::BuildEnv>(e) {
+            if let Some(cnt) = self.uses_left.get_mut(f.base.ix()) {
+                *cnt = cnt.saturating_sub(1);
+            }
             fields.push(f);
             caps.push((f.base, f.how));
         }
@@ -594,7 +597,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         self.b.call(Flags::NONE, reference, resume, &[result, state, cx]);
         let mut returned = Vec::with_capacity_in(2, self.alloc);
         if self.ret_pass != Pass::Ref {
-            self.pass_arg(V::Place(result, 0), self.ret, self.ret_pass, &mut returned)?;
+            let _ = self.pass_arg(V::Place(result, 0), self.ret, self.ret_pass, &mut returned)?;
         }
         self.b.ret(&returned);
         if let Some(error) = self.b.error() {
@@ -829,7 +832,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
 
         // Step 6: the value, then `tmp` is dropped.
         self.begin(ready);
-        self.reload_waiting(&spilled);
+        self.reload_waiting(&spilled)?;
         self.plant_after(planted);
         let (ff, fl, _) = self.variant_rows(row, items.ready)?;
         let value = match (fl, orepr) {

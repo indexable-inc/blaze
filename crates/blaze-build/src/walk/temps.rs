@@ -528,10 +528,18 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
 
     /// Whether any value currently on the walk's value stack addresses `slot`.
     fn vals_use_slot(&self, slot: SlotId) -> bool {
-        self.vals.iter().any(|&v| match v {
-            V::Place(p, _) | V::Unsized(p, _) | V::Scalar(p) => self.value_slot(p) == Some(slot),
-            V::None => false,
-        })
+        self.vals_slot_count(slot) > 0
+    }
+
+    /// How many entries currently on the walk's value stack address `slot`.
+    pub(super) fn vals_slot_count(&self, slot: SlotId) -> usize {
+        self.vals
+            .iter()
+            .filter(|&&v| match v {
+                V::Place(p, _) | V::Unsized(p, _) | V::Scalar(p) => self.value_slot(p) == Some(slot),
+                V::None => false,
+            })
+            .count()
     }
 
     /// Whether `slot` is owned by an entry currently in `scope_pats`.
@@ -585,13 +593,19 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         self.release_dead_slot(slot);
     }
 
-    /// Before an `.await`'s suspension loop: ends the storage of any statically moved-out local
-    /// binding (either unflagged with `!self.init[p]`, or flagged with `self.definitely_uninit[p]`
-    /// after an unconditional move in its declaring expression) whose home is a slot of this body
-    /// not currently on the value stack. A moved-out binding cannot be read without being
-    /// re-initialized (which emits a fresh `slot_addr` via `Home::Slot`), and cannot be borrowed
-    /// (borrowck E0505), so ending its slot before the suspend prevents an `sret`-escaped local
-    /// moved before `.await` from falsely staying live across it.
+    /// Before an `.await`'s suspension loop: ends the storage of:
+    /// 1. any statically moved-out dropping local binding (either unflagged with `!self.init[p]`,
+    ///    or flagged with `self.definitely_uninit[p]` after an unconditional move in its declaring
+    ///    expression), and
+    /// 2. in a laid coroutine state (`self.names.is_some()`), any non-dropping (`LocalOwn::None`)
+    ///    local binding whose `Identity::Binding(p)` is NOT saved by `blaze-flow::saved()` (so it
+    ///    is neither live by use nor maybe borrowed across any suspension, and is not dropped on
+    ///    the cancel path).
+    ///
+    /// Ending such a slot before the suspend prevents an `sret`- or call-escaped local (such as a
+    /// `Copy` struct returned via `sret` and dead before `.await`) from falsely remaining live
+    /// across the suspension; if the binding is re-assigned after resume, `Home::Slot(slot)` emits
+    /// a fresh `slot_addr` that re-opens its stack storage.
     pub(super) fn end_moved_locals_before_await(&mut self) {
         if !self.live {
             return;
@@ -617,6 +631,32 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             {
                 self.b.slot_dead(slot);
                 self.release_dead_slot(slot);
+            }
+        }
+        if self.names.is_some() {
+            for ix in 0..self.slots.len() {
+                let Some((Home::Slot(slot), _)) = self.slots.get(ix).copied().flatten() else {
+                    continue;
+                };
+                if !matches!(self.owned.get(ix), Some(LocalOwn::None | LocalOwn::Kept)) {
+                    continue;
+                }
+                if self.uses_left.get(ix).copied().unwrap_or(1) != 0 {
+                    continue;
+                }
+                let Ok(ix_u32) = u32::try_from(ix) else {
+                    continue;
+                };
+                let p = blaze_typeck::PatId(ix_u32);
+                if self.captured_whole(p)
+                    || self.binding_is_saved(p)
+                    || self.slot_is_named(slot)
+                    || self.vals_use_slot(slot)
+                    || self.slot_held(slot)
+                {
+                    continue;
+                }
+                self.b.slot_dead(slot);
             }
         }
     }

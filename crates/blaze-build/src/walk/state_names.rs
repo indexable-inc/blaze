@@ -39,12 +39,21 @@ use super::{Task, Walk, malformed};
 use crate::BuildError;
 use crate::coroutine_state::{StateName, StateNames, StatePlant, UNNAMED_ACROSS};
 
+/// Which sub-slot of a saved local a named LIR slot holds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SlotRole {
+    Value,
+    Flag,
+    Rest,
+}
+
 /// The table, what the walk named, and where each slot and stack value came from.
 pub(super) struct Names<'n, A: Allocator> {
     table: StateNames<'n>,
-    /// Each slot named: the slot, the identity, whether it is that local's drop flag, its offset,
-    /// and the coroutine suspend counter (`Co::points`) when it was named.
-    named: Vec<(SlotId, Identity, bool, u32, u32), A>,
+    /// Each slot named: the slot, the identity, its sub-slot role (value, drop flag, or
+    /// partial-move `rest` word), its offset, and the coroutine suspend counter (`Co::points`)
+    /// when it was named.
+    named: Vec<(SlotId, Identity, SlotRole, u32, u32), A>,
     /// Beside the walk's value stack: the expression whose task pushed each value.
     val_at: Vec<ExprId, A>,
     /// The expression of the task being run.
@@ -200,28 +209,35 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         self.names.as_ref().and_then(|n| n.val_at.get(at).copied())
     }
 
-    /// Names `slot` as the field of saved local `id` (or its drop flag, `flag`) when the flow
-    /// saves `id` and no other slot holds it yet. A slot named before by another identity is
-    /// renamed (a later, sharper key: `hold_temp`'s expression over `temp`'s task).
-    fn name(&mut self, slot: SlotId, id: Identity, flag: bool) {
+    /// Names `slot` as the field of saved local `id` (or its drop flag / partial-move `rest` word)
+    /// when the flow saves `id` and no other slot holds that role yet. A slot named before by
+    /// another identity is renamed (a later, sharper key: `hold_temp`'s expression over `temp`'s
+    /// task).
+    fn name(&mut self, slot: SlotId, id: Identity, role: SlotRole) {
         let point = self.co.map_or(0, |c| c.points);
         let Some(n) = self.names.as_mut() else { return };
         let Some(row) = n.table.get(id) else { return };
-        let offset = match (flag, row.flag) {
-            (false, _) => row.offset,
-            (true, Some(f)) => f,
-            (true, None) => return,
+        let offset = match role {
+            SlotRole::Value => row.offset,
+            SlotRole::Flag => match row.flag {
+                Some(f) => f,
+                None => return,
+            },
+            SlotRole::Rest => match row.rest {
+                Some(w) => w,
+                None => return,
+            },
         };
         if let Some(i) = n.named.iter().position(|r| r.0 == slot) {
-            if n.named[i].1 == id && n.named[i].2 == flag {
+            if n.named.get(i).is_some_and(|r| r.1 == id && r.2 == role) {
                 return;
             }
             n.named.remove_shift(i);
         }
-        if n.named.iter().any(|r| r.1 == id && r.2 == flag) {
+        if n.named.iter().any(|r| r.1 == id && r.2 == role) {
             return;
         }
-        n.named.push((slot, id, flag, offset, point));
+        n.named.push((slot, id, role, offset, point));
     }
 
     /// Releases `slot`'s name when `slot` is ended (`slot_dead`) without any suspension point
@@ -239,12 +255,28 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
 
     /// Names `slot` as saved local `id`'s field (bind, `.await`'s future).
     pub(super) fn name_slot(&mut self, slot: SlotId, id: Identity) {
-        self.name(slot, id, false);
+        self.name(slot, id, SlotRole::Value);
+    }
+
+    /// Names `slot` as saved local `id`'s 8-byte partial-move field-flags word (`rest`).
+    pub(super) fn name_rest(&mut self, slot: SlotId, id: Identity) {
+        self.name(slot, id, SlotRole::Rest);
+    }
+
+    /// Whether `slot` is currently named in the laid coroutine state.
+    pub(super) fn slot_is_named(&self, slot: SlotId) -> bool {
+        self.names.as_ref().is_some_and(|n| n.named.iter().any(|r| r.0 == slot))
+    }
+
+    /// Whether binding `p` is saved in the laid coroutine state (`StateNames`). Returns `true`
+    /// outside a laid coroutine state so callers only end slots proven unsaved by the flow.
+    pub(super) fn binding_is_saved(&self, p: blaze_typeck::PatId) -> bool {
+        self.names.as_ref().is_none_or(|n| n.table.get(Identity::Binding(p)).is_some())
     }
 
     /// Names `slot` as saved local `id`'s drop flag byte (`own`).
     pub(super) fn name_flag(&mut self, slot: SlotId, id: Identity) {
-        self.name(slot, id, true);
+        self.name(slot, id, SlotRole::Flag);
     }
 
     /// Names the slot whose whole storage `at` is, if it is one, as saved local `id`'s field.
@@ -286,7 +318,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 found = Some((id, row));
             }
         }
-        let (id, row) = found.ok_or(refused(x))?;
+        let (id, row) = found.ok_or_else(|| refused(x))?;
         if row.size < bytes {
             return Err(BuildError::Unsupported { expr: x, what: "a value waiting across an `.await` wider than the saved local the flow holds it in" });
         }
@@ -302,7 +334,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         if let Some(&(_, slot)) = n.spills.iter().find(|s| s.0 == id) {
             return Ok(Some(slot));
         }
-        if n.named.iter().any(|r| r.1 == id && !r.2) {
+        if n.named.iter().any(|r| r.1 == id && r.2 == SlotRole::Value) {
             return Err(BuildError::Unsupported {
                 expr: id.expr().unwrap_or(e),
                 what: "a value waiting across an `.await` whose saved local already has a slot of the walk: two homes for one flow local",

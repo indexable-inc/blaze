@@ -26,7 +26,7 @@ use blaze_typeck::{BinOp, Capture, ExprId, PatId};
 use super::{Prog, Ran, Script, async_body, async_fn, bin, call_await, let_u64, lit, open_world, run, run_laid};
 use crate::BuildError;
 use crate::coroutine_state::{
-    LaidState, StateName, StateNames, StatePlan, StatePlant, UNNAMED_ACROSS, lay_state, lay_state_with_upvar_flags,
+    LaidState, StateName, StateNames, StatePlan, StatePlant, UNNAMED_ACROSS, lay_state, lay_state_with_flags, lay_state_with_upvar_flags,
 };
 
 /// A state laid from a written table: each saved local's identity, layout and whether it needs
@@ -46,7 +46,7 @@ impl Laid {
         let mut rows: StdVec<StateName> = saved
             .iter()
             .enumerate()
-            .map(|(i, s)| StateName { identity: s.0, offset: l.field[i], size: s.1.0 as u32, flag: l.flag[i] })
+            .map(|(i, s)| StateName { identity: s.0, offset: l.field[i], size: s.1.0 as u32, flag: l.flag[i], rest: l.rest[i] })
             .collect();
         rows.sort_unstable_by_key(|r| r.identity);
         Laid { laid: l.state, rows, plant }
@@ -132,6 +132,7 @@ fn lay_state_with_upvar_flags_places_flags_inside_region() {
             offset: flag_off,
             size: 0,
             flag: Some(flag_off),
+            rest: None,
         });
     }
     for (i, &(size, _)) in saved_sizes.iter().enumerate() {
@@ -140,6 +141,7 @@ fn lay_state_with_upvar_flags_places_flags_inside_region() {
             offset: laid.field[i],
             size: size as u32,
             flag: laid.flag[i],
+            rest: laid.rest[i],
         });
     }
     rows.sort_unstable_by_key(|r| r.identity);
@@ -279,4 +281,123 @@ fn aggregate_literal_around_await_and_if_join_before_await() {
     let ran = run_laid(&w, &progs, Script::Complete, Some(&laid))
         .unwrap_or_else(|e| panic!("agg literal / if join around await failed in laid state: {e}"));
     assert_eq!(ran, Ran { value: 42, polls: 3, drops: 0, made: 1 });
+}
+
+/// A dead `Copy` (`LocalOwn::Kept`) aggregate binding whose address escaped to an `sret` call
+/// (`mk_big`) and a by-address call (`sum_big`) before `.await` must end its slot before
+/// suspension when not saved in `StateNames` and never read again.
+#[test]
+fn dead_copy_sret_local_before_await_ends_its_slot() {
+    let mut w = open_world();
+    let item = async_fn(&mut w, "dead_copy_sret", "dead_copy_sret_future");
+    w.fx.finish();
+    let mut b = async_body();
+    let lits = StdVec::new();
+    // let big = mk_big();
+    let big = b.bind("big");
+    let mk_p = b.path(&["mk_big"]);
+    let mk_c = b.call(mk_p, &[]);
+    let s0 = b.let_(big, None, mk_c);
+    // let base = sum_big(big);
+    let sum_p = b.path(&["sum_big"]);
+    let big_l = b.local(big);
+    let sum_c = b.call(sum_p, &[big_l]);
+    let (s1, base) = let_u64(&mut b, "base", sum_c);
+    // let r = twice().await; base + r
+    let awaited = call_await(&mut b, "twice");
+    let (s2, r) = let_u64(&mut b, "r", awaited);
+    let base_l = b.local(base);
+    let r_l = b.local(r);
+    let total = bin(&mut b, BinOp::Add, base_l, r_l);
+    let body = b.block(&[s0, s1, s2], Some(total));
+    let root = b.async_block(body, Capture::Move);
+    let progs = [Prog { item, b: &b, root, lits: &lits }];
+    // Only `base` and `awaited` cross the suspension — `big` is dead before `.await`!
+    let saved = [
+        (Identity::Binding(base), (8, 3), false),
+        (Identity::Temp(awaited, Role::Awaitee), (16, 3), false),
+    ];
+    let laid = Laid::new((0, 0), &saved, 1, StatePlant::None);
+    let ran = run_laid(&w, &progs, Script::Complete, Some(&laid))
+        .unwrap_or_else(|e| panic!("dead Copy sret local before await failed in laid state: {e}"));
+    assert_eq!(ran, Ran { value: 42, polls: 3, drops: 0, made: 1 });
+}
+
+/// A unit enum variant (`Tag::B`, lowered as `At::Const` with no flow local) evaluated as an
+/// argument before `.await` (`tag_plus(Tag::B, twice().await)`) must end its pre-await scratch
+/// slot and re-materialize on the Ready edge without requiring a state slot.
+#[test]
+fn unit_enum_variant_across_await_rematerializes_without_state_slot() {
+    let mut w = open_world();
+    let item = async_fn(&mut w, "unit_enum_across", "unit_enum_across_future");
+    w.fx.finish();
+    let mut b = async_body();
+    let lits = StdVec::new();
+    // tag_plus(Tag::B, twice().await)
+    let callee = b.path(&["tag_plus"]);
+    let tag_b = b.path(&["Tag", "B"]);
+    let awaited = call_await(&mut b, "twice");
+    let call = b.call(callee, &[tag_b, awaited]);
+    let body = b.block(&[], Some(call));
+    let root = b.async_block(body, Capture::Move);
+    let progs = [Prog { item, b: &b, root, lits: &lits }];
+    // Only the `.await`'s future is in `StateNames`; `Tag::B` has no flow local.
+    let saved = [(Identity::Temp(awaited, Role::Awaitee), (16, 3), false)];
+    let laid = Laid::new((0, 0), &saved, 1, StatePlant::None);
+    let ran = run_laid(&w, &progs, Script::Complete, Some(&laid))
+        .unwrap_or_else(|e| panic!("unit enum variant across await failed in laid state: {e}"));
+    assert_eq!(ran, Ran { value: 12, polls: 3, drops: 0, made: 1 });
+}
+
+/// A partially-moved `Drop` binding across `.await` (`let pair = (mk_d(), mk_d()); consume_d(pair.0);
+/// twice().await`) places its 8-byte `rest` field-flags word inside the laid state region so both
+/// normal completion and cancellation drop only the remaining unmoved field (`pair.1`).
+#[test]
+fn partially_moved_local_across_await_keeps_rest_word_in_state() {
+    let mut w = open_world();
+    let item = async_fn(&mut w, "partial_move_across", "partial_move_across_future");
+    w.fx.finish();
+    let mut b = async_body();
+    let lits = StdVec::new();
+    // let pair = (mk_d(), mk_d());
+    let mk0 = b.path(&["mk_d"]);
+    let d0 = b.call(mk0, &[]);
+    let mk1 = b.path(&["mk_d"]);
+    let d1 = b.call(mk1, &[]);
+    let tup = b.tuple(&[d0, d1]);
+    let pair = b.bind("pair");
+    let s0 = b.let_(pair, None, tup);
+    // consume_d(pair.0);
+    let consume = b.path(&["consume_d"]);
+    let pair_l = b.local(pair);
+    let f0 = tuple_field(&mut b, pair_l, 0);
+    let call_c = b.call(consume, &[f0]);
+    let s1 = b.semi(call_c);
+    // twice().await
+    let awaited = call_await(&mut b, "twice");
+    let body = b.block(&[s0, s1], Some(awaited));
+    let root = b.async_block(body, Capture::Move);
+    let progs = [Prog { item, b: &b, root, lits: &lits }];
+    let saved_sizes = [(16u64, 3u8), (16u64, 3u8)];
+    let needs_flag = [true, false];
+    let needs_rest = [true, false];
+    let heap = blaze_own::testing::heap();
+    let a = heap.alloc();
+    let l = lay_state_with_flags((0, 0), &saved_sizes, &needs_flag, &needs_rest, &[], &[], 1, a, a)
+        .unwrap_or_else(|e| panic!("lay_state_with_flags: {e}"));
+    assert!(l.rest[0].is_some_and(|w| w % 8 == 0 && w >= l.state.region.start && w + 8 <= l.state.region.end));
+    let mut rows = StdVec::from([
+        StateName { identity: Identity::Binding(pair), offset: l.field[0], size: 16, flag: l.flag[0], rest: l.rest[0] },
+        StateName { identity: Identity::Temp(awaited, Role::Awaitee), offset: l.field[1], size: 16, flag: l.flag[1], rest: l.rest[1] },
+    ]);
+    rows.sort_unstable_by_key(|r| r.identity);
+    let laid = Laid { laid: l.state, rows, plant: StatePlant::None };
+
+    let done = run_laid(&w, &progs, Script::Complete, Some(&laid))
+        .unwrap_or_else(|e| panic!("partially moved local across await failed on completion: {e}"));
+    assert_eq!(done, Ran { value: 2, polls: 3, drops: 2, made: 1 });
+
+    let cancelled = run_laid(&w, &progs, Script::CancelAfter(1), Some(&laid))
+        .unwrap_or_else(|e| panic!("partially moved local across await failed on cancel: {e}"));
+    assert_eq!(cancelled, Ran { value: u64::MAX, polls: 1, drops: 2, made: 1 });
 }

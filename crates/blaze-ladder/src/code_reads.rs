@@ -699,7 +699,7 @@ pub fn laid_answer(laid: &LaidState, names: &[StateName]) -> ContentId {
     niche_parts(laid.niche).hash(f);
     names.len().hash(f);
     for n in names {
-        (n.identity, n.offset, n.size, n.flag).hash(f);
+        (n.identity, n.offset, n.size, n.flag, n.rest).hash(f);
     }
     h.finish()
 }

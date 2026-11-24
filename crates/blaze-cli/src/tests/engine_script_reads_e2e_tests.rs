@@ -906,3 +906,84 @@ mod status_after {
         assert!(why.contains("NoPrevious") && why.contains("NoRoot"), "the next command has no previous answer, and says why: {why}");
     }
 }
+
+/// Two scripts in the same `Scripts` wave observing two different digests for the same newly-made
+/// `Given` cell (for instance a file changed mid-wave) must stop with `CliError::Changed`, never
+/// emit two conflicting `Made` records into `blaze-engine` (`EngineError::TwoValues`).
+/// Conversely, two scripts observing the same digest for that newly-made `Given` cell succeed.
+mod same_wave_given_conflict {
+    use super::*;
+
+    struct SharedCellRunner {
+        call: AtomicU32,
+        diverge: bool,
+    }
+
+    impl crate::engine_scripts::ScriptRunner for SharedCellRunner {
+        fn run(&self, cx: &Cx, _root: &bstd::fs::Dir<bstd::fs::ReadWrite>, name: blaze_drive::Name, kept: Option<crate::engine_scripts::KeptReads>, _: &[(blaze_drive::Input, &[u8])]) -> crate::scripts::PooledScript {
+            let n = self.call.fetch_add(1, Ordering::SeqCst);
+            let answer = if self.diverge && n > 0 {
+                blaze_proc_macro::script_sandbox::file_answer(b"mutated-mid-wave\n")
+            } else {
+                blaze_proc_macro::script_sandbox::file_answer(b"initial\n")
+            };
+            let (plant, _) = kept.expect("kept reads");
+            let cells = reads::cells_of(core::iter::once(("file:pkg/data/in.txt", Some(answer))), plant).expect("cell");
+            let read_rows: std::vec::Vec<_> = cells.iter().map(|read| (read.name(), read.answer)).collect();
+            let erased = blaze_own::Erased::new(cx.frame());
+            let outputs = blaze_build_script::outputs::Outputs::read(b"cargo::rustc-cfg=pkg_flag\n", "/out", blaze_build_script::instr::OutputLimits::DEFAULT, erased.handle()).expect("outputs");
+            let did = crate::scripts::outputs_record(name, &read_rows[..], crate::scripts::RanAs::Wasm, &outputs, "pkg");
+            crate::scripts::PooledScript { did: Ok(did), used: 0, ns: 0, checkout: cells, unkept: None }
+        }
+    }
+
+    fn two_script_world(seed: u64) -> Io {
+        let io = Io::simulated(SimWorld::new(seed, Limits::USUAL));
+        write(&io, "Cargo.toml", "[workspace]\nmembers = [\"pkg\", \"app\"]\nresolver = \"2\"\n");
+        write(&io, "pkg/Cargo.toml", "[package]\nname = \"pkg\"\nversion = \"0.1.0\"\nedition = \"2024\"\nbuild = \"build.rs\"\n");
+        write(&io, "pkg/build.rs", "fn main() {}\n");
+        write(&io, "pkg/data/in.txt", "initial\n");
+        write(&io, "pkg/src/lib.rs", "#[cfg(pkg_flag)]\npub fn f() -> u8 { 1 }\n");
+        write(&io, "app/Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\nbuild = \"build.rs\"\n\n[dependencies]\npkg = { path = \"../pkg\" }\n");
+        write(&io, "app/build.rs", "fn main() {}\n");
+        write(&io, "app/src/lib.rs", "pub fn g() -> u8 { pkg::f() }\n");
+        io
+    }
+
+    fn run_check(io: &Io, runner: &'static SharedCellRunner) -> Result<engine_check::Checked, crate::CliError> {
+        crate::engine_scripts::with_runner(runner, || {
+            let cx = io.cx(BUDGET, TASK_FRAME).expect("cx");
+            let frame = cx.frame();
+            let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("ws").expect("ws")).expect("open");
+            let out = io.need_out().expect("out");
+            let err = io.need_err().expect("err");
+            let fs = io.need_fs().expect("files");
+            let host = io.need_host().expect("host");
+            let mut rng = io.need_rng().expect("rng");
+            let args = io.args();
+            let net = io.net();
+            let mut phases = super::super::engine_check_tests::boxed(|| Phases::new(io.need_clock().expect("clock")));
+            let mut shown = print::Shown::new(blaze_report::frame::Caps::LINES, View::Person, "/ws", frame);
+            let opts = super::super::engine_check_tests::opts(io, 1, false);
+            engine_check::check(&cx, &fs, &host, &mut rng, args.as_ref(), net.as_ref(), &root, opts, &mut shown, &mut phases, &out, &err)
+        })
+    }
+
+    #[test]
+    fn diverging_same_wave_given_reports_changed_instead_of_engine_two_values() {
+        static RUNNER: SharedCellRunner = SharedCellRunner { call: AtomicU32::new(0), diverge: true };
+        let io = two_script_world(91);
+        let Err(err) = run_check(&io, &RUNNER) else {
+            panic!("diverging same-wave Given must fail with Changed");
+        };
+        assert!(matches!(err, crate::CliError::Changed { .. }), "expected CliError::Changed, got: {err:?}");
+    }
+
+    #[test]
+    fn matching_same_wave_given_deduplicates_cleanly() {
+        static RUNNER: SharedCellRunner = SharedCellRunner { call: AtomicU32::new(0), diverge: false };
+        let io = two_script_world(92);
+        run_check(&io, &RUNNER).expect("matching same-wave Given across two scripts must succeed");
+        assert_eq!(RUNNER.call.load(Ordering::SeqCst), 2, "both scripts ran in the wave");
+    }
+}

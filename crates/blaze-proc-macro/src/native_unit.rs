@@ -120,6 +120,9 @@ pub struct NativeSetting<'s> {
     /// The command's jobserver ([`crate::jobserver`]): each run's children share the command's
     /// workers through it. Never in a key (`blaze_build_script::env::Jobs`).
     pub jobs: &'s crate::jobserver::Jobserver,
+    /// The canonical path of the content-addressed fact shim placed by this command
+    /// ([`crate::native_facts::place_shim`]); `None` falls back to `placed_shim(work)`.
+    pub shim: Option<&'s str>,
 }
 
 /// The native part of a run key, known before the run.
@@ -499,8 +502,15 @@ pub fn native_outputs<'a>(
     // asked become reads in the wasm path's fact form (native_facts::reads).
     let pins = setting.spawn_setting.pins.as_ref();
     let facts_error = |e: native_facts::NativeFactsError| NativeUnitError::Facts { package: pkg(), why: e.to_string() };
-    let shim = native_facts::placed_shim(native.work).map_err(facts_error)?;
-    let facts = native_facts::prepare(&shim, native.work, run_key.as_str(), pins, alloc).map_err(facts_error)?;
+    let fallback_shim;
+    let shim: &str = match native.shim {
+        Some(path) => path,
+        None => {
+            fallback_shim = native_facts::placed_shim(native.work, None).map_err(facts_error)?;
+            fallback_shim.as_str()
+        }
+    };
+    let facts = native_facts::prepare(shim, native.work, run_key.as_str(), pins, alloc).map_err(facts_error)?;
     work_guard.push_dir(blaze_own::format_in!(alloc, "facts/{}", run_key.as_str()));
     work_guard.push_file(blaze_own::format_in!(alloc, "facts/{}.lock", run_key.as_str()));
     // The home's file area: each file the script leaves goes there by digest, renamed, never
@@ -571,7 +581,7 @@ pub fn native_outputs<'a>(
                 package_label: name,
                 run: &run,
                 laid_folders: &laid_folders,
-                shim: Some(shim.as_str()),
+                shim: Some(shim),
                 pins,
                 ran: &ran,
                 asked: &asked,

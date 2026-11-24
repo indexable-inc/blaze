@@ -15,7 +15,7 @@ blaze-base64	24
 blaze-bench	7
 blaze-blake3	413
 blaze-bstd-convert	109
-blaze-build	525
+blaze-build	518
 blaze-build-script	246
 blaze-bytes	3
 blaze-c	325
@@ -30,7 +30,7 @@ blaze-cbor	27
 blaze-cc	8
 blaze-cert	108
 blaze-check	196
-blaze-cli	1349
+blaze-cli	1347
 blaze-code	94
 blaze-columns	193
 blaze-comptime	68
@@ -73,7 +73,7 @@ blaze-int	41
 blaze-json	32
 blaze-keyed	588
 blaze-kit	167
-blaze-ladder	1135
+blaze-ladder	1132
 blaze-launch	83
 blaze-launch-rt	215
 blaze-launcher	2

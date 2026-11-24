@@ -21,7 +21,7 @@ blaze-body-flow	24
 blaze-body-lower	24
 blaze-borrow	21
 blaze-bstd-convert	9
-blaze-build	742
+blaze-build	739
 blaze-build-script	109
 blaze-c	4
 blaze-cad	101
@@ -74,7 +74,7 @@ blaze-inproc	70
 blaze-int	7
 blaze-keyed	677
 blaze-kit	2
-blaze-ladder	1217
+blaze-ladder	1216
 blaze-launch	174
 blaze-launch-rt	457
 blaze-launcher	6
