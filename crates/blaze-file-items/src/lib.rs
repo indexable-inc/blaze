@@ -206,7 +206,7 @@ use blaze_surface::{
 
 pub use blaze_ids::ContentId;
 pub use chain::{CHAIN_DOMAIN, chain_at, head_of, item_chain};
-pub use header::{GenericsError, HeaderError, ImplHeader, declared_lifetimes, impl_header};
+pub use header::{GenericsError, HeaderError, ImplHeader, declared_lifetimes, impl_header, impl_may_dangle_params};
 pub use walk::Bodies;
 pub use parser::{Extensions, SyntaxKind};
 

@@ -138,8 +138,14 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 self.diags.truncate(n);
                 continue;
             }
-            if name.is_none() && !may_relate(ex.out.view(), &ps, alloc)? {
+            if name.is_none() && !may_relate(ex.out.view(), &ps, alloc)? && !self.trait_has_lifetimes(trait_)? {
+                if self.reads.stopped() {
+                    return Ok(out);
+                }
                 continue;
+            }
+            if self.reads.stopped() {
+                return Ok(out);
             }
             let list = ex.out.intern_list(&ps)?;
             if seen.insert((e, trait_, name, list), ()).is_some() && name.is_none() {
@@ -290,8 +296,14 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     }
                     ps.push(norm);
                 }
-                if cname.is_none() && !may_relate(ex.out.view(), &ps, alloc)? {
+                if cname.is_none() && !may_relate(ex.out.view(), &ps, alloc)? && !self.trait_has_lifetimes(trait_)? {
+                    if self.reads.stopped() {
+                        return Ok(())
+                    }
                     continue;
+                }
+                if self.reads.stopped() {
+                    return Ok(());
                 }
                 let list = ex.out.intern_list(&ps)?;
                 if seen.insert((e, trait_, cname, list), ()).is_some() {
@@ -529,6 +541,19 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         };
         rows.memo.insert(key, selected);
         Ok(selected)
+    }
+
+    /// Whether `trait_` declares lifetime parameters (`TraitFlags::LIFETIME_PARAMS`): a trait
+    /// like `Deserialize<'de>` or `Arbitrary<'a>` carries region slots even when `Self` is a
+    /// primitive (`usize`, `bool`, `u64`) whose erased type holds no region.
+    fn trait_has_lifetimes(&mut self, trait_: ItemKey) -> Result<bool, CheckError> {
+        match self.reads.trait_def(trait_) {
+            Ok(Some(def)) => Ok(def.flags.has(crate::world::TraitFlags::LIFETIME_PARAMS)),
+            Ok(None) => Ok(false),
+            Err(Stop::Need(_)) if self.reads.stopped() => Ok(false),
+            Err(Stop::Need(_)) => Ok(true),
+            Err(Stop::Error(err)) => Err(err),
+        }
     }
 
     /// The four relates-nothing traits of this world ([`Inert`]).

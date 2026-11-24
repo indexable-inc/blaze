@@ -232,6 +232,19 @@ pub struct OwnerTraitImpl {
     pub self_shape: SelfShape,
 }
 
+/// Metadata for a trait fn's RPITIT opaque (`-> impl Trait` or `async fn` in a trait, RFC 3425):
+/// maps the opaque back to its trait, synthetic associated type name, trait fn, method name,
+/// trait generic count (including `Self`), and optional default `Twin` opaque key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RpititOpaque {
+    pub trait_: ItemKey,
+    pub name: Name,
+    pub trait_fn: ItemKey,
+    pub fn_name: Name,
+    pub trait_types: u32,
+    pub default_twin: Option<ItemKey>,
+}
+
 /// What the lowering needs to know about a callee's signature (flow.md section 7, heads).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CalleeFacts {
@@ -404,6 +417,17 @@ pub trait Facts {
         let _ = (trait_, name);
         false
     }
+    /// If `opaque` is an RPITIT opaque of a trait fn, returns its [`RpititOpaque`] metadata so
+    /// `blaze-borrow` can normalize concrete RPITIT calls through the selected impl's method.
+    fn rpitit_opaque(&self, opaque: ItemKey) -> Option<RpititOpaque> {
+        let _ = opaque;
+        None
+    }
+    /// The impl method key overriding `fn_name` in trait impl `imp`, if overridden.
+    fn impl_fn(&self, imp: ItemKey, fn_name: Name) -> Option<ItemKey> {
+        let _ = (imp, fn_name);
+        None
+    }
     /// The trait bounds with lifetime arguments of fn `item` ([`Ties`]): a callee's tie its
     /// trait lifetimes to what the call's arguments answer them with, the body's own say what
     /// its type parameters answer them with (trait_ties.rs). Whoever answers files the read of
@@ -450,6 +474,15 @@ pub trait Facts {
     /// `PhantomData<&'a T>`), `[true]` for `Option<T>`. Read only when
     /// [`AdtFacts::needs_drop`] is `false`. `None`: every argument may be dropped.
     fn drop_args(&self, _adt: ItemKey) -> Option<&[bool]> {
+        None
+    }
+    /// For each generic argument of `adt`, whether dropping `adt` may directly inspect arbitrary
+    /// lifetimes inside that argument via a non-`#[may_dangle]` `Drop` impl (RFC 1327):
+    /// `[true]` for `BufWriter<W>` (and `struct Outer<W>(BufWriter<W>)`), `[false, true]` for
+    /// `Arc<T, A>` / `Vec<T, A>` / `Box<T, A>` (`#[may_dangle] T`), `[false, false]` for
+    /// `Map<S, F>` (holds `Arc<F>`). `None`: conservative (`true` when `drop_impl`, `false` when
+    /// structural).
+    fn drop_strict(&self, _adt: ItemKey) -> Option<&[bool]> {
         None
     }
     /// The number of fields of `variant`.
@@ -1933,6 +1966,10 @@ struct Lower<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule = one_
     place_field_source: Vec<(Place, ItemKey, u32, u32), A>,
     /// Pattern-bound `FnPtr` locals traced back to their source ADT field (`(pat, adt, variant, field)`).
     local_fn_field: Vec<(PatId, ItemKey, u32, u32), A>,
+    /// Whether this body is a `const` or `static` item initializer (`Facts::constant_initializer`,
+    /// or a parameterless body with no fn head): shared borrows of local-free `Freeze` non-drop
+    /// temporaries in a constant initializer are implicitly promoted to `'static` (RFC 3027).
+    const_init: bool,
 }
 
 /// Every type walk visits each node at most once per position: bounded by the table's size.
@@ -2031,6 +2068,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             local_field_source: Vec::new_in(alloc),
             place_field_source: Vec::new_in(alloc),
             local_fn_field: Vec::new_in(alloc),
+            const_init: false,
         };
         blaze_own::Box::new_in(l, alloc)
     }
@@ -2584,18 +2622,29 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         if n == 0 {
             return Ok(());
         }
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum DropMode {
+            /// Behind `&`/`&mut`/`*const`/`fn(..)`/union/non-dropping field: no drop runs.
+            None,
+            /// Structural drop glue or `#[may_dangle]` `Drop` parameter: only inner `Drop` impls
+            /// keep origins live; references and by-ref closure captures are `OriginLive::NoDrop`.
+            Glue,
+            /// Inside a non-`#[may_dangle]` parameter of a `Drop` impl (e.g. `BufWriter<W>`):
+            /// `Drop::drop` may dereference any lifetime inside `W`, so every origin is `Full`.
+            Strict,
+        }
         enum Step {
-            Ty(PTy, bool),
+            Ty(PTy, DropMode),
             Pos(OriginLive),
         }
         let mut todo: Vec<Step, A> = Vec::new_in(self.alloc);
         if t.wrap.is_some() {
             // A reference itself never runs a destructor on its referent, while inner opaques
             // still respect their item outlives bounds.
-            todo.push(Step::Ty(t.ty, false));
+            todo.push(Step::Ty(t.ty, DropMode::None));
             todo.push(Step::Pos(OriginLive::NoDrop));
         } else {
-            todo.push(Step::Ty(t.ty, true));
+            todo.push(Step::Ty(t.ty, DropMode::Glue));
         }
         let mut steps = 0u32;
         while let Some(step) = todo.pop() {
@@ -2603,62 +2652,95 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             if steps > MOST_POSITIONS || out.len() as u32 > MOST_POSITIONS {
                 return self.refuse(Form::Bound, e);
             }
-            let (ty, active) = match step {
+            let (ty, mode) = match step {
                 Step::Pos(m) => {
                     out.push(m);
                     continue;
                 }
-                Step::Ty(ty, active) => (ty, active),
+                Step::Ty(ty, mode) => (ty, mode),
             };
-            let live = if active { OriginLive::Full } else { OriginLive::NoDrop };
+            let live = match mode {
+                DropMode::None => OriginLive::NoDrop,
+                DropMode::Glue | DropMode::Strict => OriginLive::Full,
+            };
             match self.node(ty, e)? {
                 PNode::Ref(_, i) => {
-                    todo.push(Step::Ty(i, false));
-                    todo.push(Step::Pos(OriginLive::NoDrop));
-                }
-                PNode::Ptr(_, i) => todo.push(Step::Ty(i, false)),
-                PNode::FnPtr(l, _) => {
-                    let xs = self.list(l, e)?;
-                    for &x in xs.iter().rev() {
-                        todo.push(Step::Ty(x, false));
+                    if mode == DropMode::Strict {
+                        todo.push(Step::Ty(i, DropMode::Strict));
+                        todo.push(Step::Pos(OriginLive::Full));
+                    } else {
+                        todo.push(Step::Ty(i, DropMode::None));
+                        todo.push(Step::Pos(OriginLive::NoDrop));
                     }
                 }
-                PNode::Slice(i) | PNode::Pat(i, _) | PNode::Array(i, _) => todo.push(Step::Ty(i, active)),
+                PNode::Ptr(_, i) => {
+                    todo.push(Step::Ty(i, if mode == DropMode::Strict { DropMode::Strict } else { DropMode::None }));
+                }
+                PNode::FnPtr(l, _) => {
+                    let next = if mode == DropMode::Strict { DropMode::Strict } else { DropMode::None };
+                    let xs = self.list(l, e)?;
+                    for &x in xs.iter().rev() {
+                        todo.push(Step::Ty(x, next));
+                    }
+                }
+                PNode::Slice(i) | PNode::Pat(i, _) | PNode::Array(i, _) => todo.push(Step::Ty(i, mode)),
                 PNode::Tuple(l) | PNode::Record(_, l) => {
                     for &x in self.list(l, e)?.iter().rev() {
-                        todo.push(Step::Ty(x, active));
+                        todo.push(Step::Ty(x, mode));
                     }
                 }
                 PNode::Union(l) => {
+                    let next = if mode == DropMode::Strict { DropMode::Strict } else { DropMode::None };
                     for &x in self.list(l, e)?.iter().rev() {
-                        todo.push(Step::Ty(x, false));
+                        todo.push(Step::Ty(x, next));
                     }
                 }
                 PNode::Adt(k, l) => {
                     let af = self.adt_facts(k, e)?;
                     let args = self.list(l, e)?;
-                    if af.drop_impl || af.needs_drop {
+                    if mode == DropMode::Strict {
                         for &x in args.iter().rev() {
-                            todo.push(Step::Ty(x, active));
+                            todo.push(Step::Ty(x, DropMode::Strict));
                         }
                         for _ in 0..af.lifetimes {
-                            todo.push(Step::Pos(live));
+                            todo.push(Step::Pos(OriginLive::Full));
                         }
-                    } else if af.union {
+                    } else if mode == DropMode::None || af.union {
                         for &x in args.iter().rev() {
-                            todo.push(Step::Ty(x, false));
+                            todo.push(Step::Ty(x, DropMode::None));
                         }
                         for _ in 0..af.lifetimes {
                             todo.push(Step::Pos(OriginLive::NoDrop));
                         }
+                    } else if af.drop_impl || af.needs_drop {
+                        let strict = self.facts.drop_strict(k);
+                        for (j, &x) in args.iter().enumerate().rev() {
+                            let is_strict = match strict {
+                                Some(s) if s.len() == args.len() => s.get(j).copied().unwrap_or(true),
+                                _ => af.drop_impl && !(af.is_box && j == 0),
+                            };
+                            todo.push(Step::Ty(x, if is_strict { DropMode::Strict } else { DropMode::Glue }));
+                        }
+                        for _ in 0..af.lifetimes {
+                            todo.push(Step::Pos(OriginLive::Full));
+                        }
                     } else {
                         let drop_args = self.facts.drop_args(k);
+                        let strict = self.facts.drop_strict(k);
                         for (j, &x) in args.iter().enumerate().rev() {
-                            let arg_drops = active && match drop_args {
-                                Some(d) if d.len() == args.len() => d[j],
+                            let arg_drops = match drop_args {
+                                Some(d) if d.len() == args.len() => d.get(j).copied().unwrap_or(true),
                                 _ => true,
                             };
-                            todo.push(Step::Ty(x, arg_drops));
+                            let arg_strict = strict.is_some_and(|s| s.len() == args.len() && s.get(j).copied().unwrap_or(false));
+                            let next = if !arg_drops {
+                                DropMode::None
+                            } else if arg_strict {
+                                DropMode::Strict
+                            } else {
+                                DropMode::Glue
+                            };
+                            todo.push(Step::Ty(x, next));
                         }
                         for _ in 0..af.lifetimes {
                             todo.push(Step::Pos(OriginLive::NoDrop));
@@ -2670,22 +2752,57 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                         let ol = self.opaque_live(k);
                         let args = self.list(l, e)?;
                         for &x in args.iter().rev() {
-                            todo.push(Step::Ty(x, active));
+                            todo.push(Step::Ty(x, mode));
                         }
                         for j in (0..caps).rev() {
-                            let mode = match ol {
+                            let m = match ol {
                                 OpaqueLive::Nothing => OriginLive::None,
                                 OpaqueLive::Only(Region::Param(p)) if p < caps => {
                                     if j == p { live } else { OriginLive::None }
                                 }
                                 _ => live,
                             };
-                            todo.push(Step::Pos(mode));
+                            todo.push(Step::Pos(m));
                         }
                     } else {
                         let cnt = self.npos(ty, e)?;
                         for _ in 0..cnt {
                             out.push(live);
+                        }
+                    }
+                }
+                PNode::Closure { owner, ordinal, .. } if owner == self.body.owner => {
+                    let Some(&ce) = self.ck.closures.column::<0>().get(usize::try_from(ordinal).unwrap_or(usize::MAX)) else {
+                        return self.refuse(Form::Malformed, e);
+                    };
+                    // Matches `npos` and `closure_value` pre-order: capture fields first, then
+                    // owner-bound signature positions. Under `DropMode::Strict` (non-`#[may_dangle]`
+                    // `Drop` impl), every origin is `Full`; under `DropMode::Glue`, only by-value
+                    // captures drop; reference captures and signature slots are `OriginLive::NoDrop`.
+                    let nsig = self.owner_sig_count(usize::try_from(ordinal).unwrap_or(usize::MAX), e)?;
+                    let sig_live = if mode == DropMode::Strict { OriginLive::Full } else { OriginLive::NoDrop };
+                    for _ in 0..nsig {
+                        todo.push(Step::Pos(sig_live));
+                    }
+                    let mut fields: Vec<blaze_typeck::EnvField, A> = Vec::new_in(self.alloc);
+                    for f in self.ck.env_fields_by::<blaze_typeck::Places>(ce) {
+                        fields.push(f);
+                    }
+                    for f in fields.iter().rev() {
+                        let Some(ft) = f.place_ty(self.ck) else {
+                            return self.refuse(Form::Malformed, e);
+                        };
+                        match f.how {
+                            blaze_typeck::CaptureKind::ByValue => todo.push(Step::Ty(ft, mode)),
+                            blaze_typeck::CaptureKind::ByRef | blaze_typeck::CaptureKind::ByMutRef => {
+                                if mode == DropMode::Strict {
+                                    todo.push(Step::Ty(ft, DropMode::Strict));
+                                    todo.push(Step::Pos(OriginLive::Full));
+                                } else {
+                                    todo.push(Step::Ty(ft, DropMode::None));
+                                    todo.push(Step::Pos(OriginLive::NoDrop));
+                                }
+                            }
                         }
                     }
                 }
@@ -3335,6 +3452,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         // tip20/mod.rs:147, tip403_registry/mod.rs:42, xtask check_abi.rs:43,
         // zones/check_abi.rs:147). A borrow that is no extending one (`g(&f())`) still dies at
         // the body's end, as rustc's does.
+        self.const_init = const_init;
         if const_init {
             self.mark_extended(root, STATIC_EXTENDED)?;
         }
@@ -5147,16 +5265,6 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 self.b.assign(tp, Operand::Const, self.span(e));
                 self.push_place(tp, ty);
             }
-            // The Reference, "Constant promotion": a borrow the checker promoted
-            // (`Checked::promoted`) is of a `'static` slot: no loan of the body's, and the
-            // operand's code does not run here (the builder reads the evaluator's value).
-            Expr::Ref { mutbl: Mutbl::Not, .. } if self.ck.promoted.binary_search_by_key(&e.0, |x| x.0).is_ok() => {
-                let ty = TyD::of(self.expr_ty(e)?);
-                let t = self.temp(ty, e)?;
-                let tp = self.place_of(t);
-                self.b.assign(tp, Operand::Const, self.span(e));
-                self.push_place(tp, ty);
-            }
             Expr::Ref { mutbl, operand } => {
                 self.tasks.push(Task::RefDone(e, mutbl));
                 self.tasks.push(Task::Eval(operand, mutbl == Mutbl::Mut));
@@ -5462,6 +5570,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                     if kind == BorrowKind::TwoPhase {
                         self.two_phase.push(loan);
                     }
+                    if self.const_init && mutbl == Mutbl::Not && i == lo {
+                        self.promote_const_init_temp(p, e, e)?;
+                    }
                     Val { at: At::Place(self.place_of(t)), ty: out }
                 }
                 AdjustKind::ReifyFnPointer
@@ -5503,7 +5614,6 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
     /// `Box`, or `Deref::deref(&v)` / `DerefMut::deref_mut(&mut v)` then the builtin deref of
     /// its result (whose lifetime is the receiver's, by elision).
     fn deref(&mut self, v: Val, out: TyD, m: bool, overloaded: Option<Mutbl>, e: ExprId) -> Result<Place, Refusal> {
-        let p = self.as_place(v, e)?;
         // `*b` of a `Box` is builtin whatever the type check recorded (it records the operand's
         // deref as overloaded, `Deref for Box`): the Reference, "Dereference expressions":
         // "On non-pointer types `*x` is equivalent to `*std::ops::Deref::deref(&x)`" except for
@@ -5513,26 +5623,42 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             && let PNode::Adt(k, _) = self.node(v.ty.ty, e)?
             && self.adt_facts(k, e)?.is_box
         {
+            let p = self.as_place(v, e)?;
             return self.project(p, v.ty, Proj::DerefBox, out, false, e);
         }
         if overloaded.is_none() {
             if v.ty.wrap.is_some() {
+                let p = self.as_place(v, e)?;
                 return self.project(p, v.ty, Proj::Deref, out, false, e);
             }
             match self.node(v.ty.ty, e)? {
-                PNode::Ref(..) | PNode::Ptr(..) => return self.project(p, v.ty, Proj::Deref, out, false, e),
-                PNode::Adt(k, _) if self.adt_facts(k, e)?.is_box => return self.project(p, v.ty, Proj::DerefBox, out, false, e),
+                PNode::Ref(..) | PNode::Ptr(..) => {
+                    let p = self.as_place(v, e)?;
+                    return self.project(p, v.ty, Proj::Deref, out, false, e);
+                }
+                PNode::Adt(k, _) if self.adt_facts(k, e)?.is_box => {
+                    let p = self.as_place(v, e)?;
+                    return self.project(p, v.ty, Proj::DerefBox, out, false, e);
+                }
                 _ => {}
             }
         }
-        // `*ET` of an extending borrow's operand: the overloaded deref borrows the temporary
-        // (`&mut *cell.borrow_mut()`'s `RefMut`), so it lives as the borrow's result does.
-        self.extend_root(p, e)?;
         let mutbl = if m { Mutbl::Mut } else { Mutbl::Not };
         let bt = self.temp(TyD { wrap: Some(mutbl), ty: v.ty.ty }, e)?;
         self.name_local(bt, Identity::Temp(e, Role::Borrow));
-        let kind = if m { BorrowKind::Mut } else { BorrowKind::Shared };
-        self.borrow(p, v.ty, kind, bt, e)?;
+        // An immutable `static` item (`static S: LazyLock<Mutex<T>>`) lives in `'static` storage
+        // directly: `Deref::deref(&S)` borrows the static item itself rather than materializing
+        // a stack temporary that would drop at statement end.
+        if matches!(v.at, At::Const) && !m && self.is_immutable_static(e)? {
+            self.b.assign(self.place_of(bt), Operand::Const, self.span(e));
+        } else {
+            let p = self.as_place(v, e)?;
+            // `*ET` of an extending borrow's operand: the overloaded deref borrows the temporary
+            // (`&mut *cell.borrow_mut()`'s `RefMut`), so it lives as the borrow's result does.
+            self.extend_root(p, e)?;
+            let kind = if m { BorrowKind::Mut } else { BorrowKind::Shared };
+            self.borrow(p, v.ty, kind, bt, e)?;
+        }
         let rt = self.temp(TyD { wrap: Some(mutbl), ty: out.ty }, e)?;
         self.name_local(rt, Identity::Temp(e, Role::Result));
         let (bp, rp) = (self.place_of(bt), self.place_of(rt));
@@ -5764,6 +5890,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 // &mk().f;` extends `mk()`; an arm's `&mk().f` died at the arm's end otherwise).
                 if let Expr::Ref { operand, .. } = self.expr(e)? {
                     self.extend_root(p, operand)?;
+                    if self.const_init && m == Mutbl::Not {
+                        self.promote_const_init_temp(p, operand, e)?;
+                    }
                 }
             }
         }
@@ -5829,6 +5958,278 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             None => self.vars.push(l),
         }
         Ok(())
+    }
+
+    /// Whether `e` (unwrapping parens and explicit `*` derefs) names an immutable `static` item.
+    fn is_immutable_static(&self, e: ExprId) -> Result<bool, Refusal> {
+        let mut cur = e;
+        let mut steps = 0usize;
+        loop {
+            steps += 1;
+            if steps > self.body.exprs.len() + 1 {
+                return self.refuse(Form::Bound, e);
+            }
+            match self.expr(cur)? {
+                Expr::Paren(inner) => cur = inner,
+                Expr::Unary { op: UnOp::Deref, operand } => cur = operand,
+                Expr::Path(_) => return Ok(matches!(self.expr_def(cur), Some(Def::Static(_, Mutbl::Not)))),
+                _ => return Ok(false),
+            }
+        }
+    }
+
+    /// Implicit promotion in a `const` or `static` initializer (RFC 3027): promotes a shared
+    /// borrow's temporary `p` to `'static` (`STATIC_EXTENDED`) when the temporary's type is
+    /// `Freeze` with no drop glue and `operand` contains no free outer locals or disallowed
+    /// runtime/mutable constructs. Because `operand` was already lowered, any invalid inner
+    /// borrow (e.g. `&{ let y = 1; &y }`) is still caught.
+    fn promote_const_init_temp(&mut self, p: Place, operand: ExprId, e: ExprId) -> Result<(), Refusal> {
+        let pi = self.info(p);
+        let Some(at) = self.temps.iter().rposition(|l| l.0 == pi.local) else {
+            return Ok(());
+        };
+        let Ok(local_ix) = usize::try_from(pi.local) else {
+            return Ok(());
+        };
+        let Some(&root_ty) = self.local_ty.get(local_ix) else {
+            return Ok(());
+        };
+        if !self.const_init_freeze_no_drop(root_ty, e)? {
+            return Ok(());
+        }
+        if !self.no_free_locals(operand, e)? {
+            return Ok(());
+        }
+        self.extend_temp(at, STATIC_EXTENDED, e)
+    }
+
+    /// Whether a value of `ty` has no drop glue and is guaranteed `Freeze` (no interior
+    /// mutability). Conservative `false` for non-`Copy` ADTs and unresolved/opaque types.
+    fn const_init_freeze_no_drop(&self, ty: TyD, e: ExprId) -> Result<bool, Refusal> {
+        if self.needs_drop(ty, e)? {
+            return Ok(false);
+        }
+        if let Some(m) = ty.wrap {
+            return Ok(m == Mutbl::Not);
+        }
+        let mut stack = TyStack::new(ty.ty, self.alloc);
+        let mut steps = 0u32;
+        while let Some(t) = stack.pop() {
+            steps += 1;
+            if steps > MOST_POSITIONS {
+                return self.refuse(Form::Bound, e);
+            }
+            match self.node(t, e)? {
+                PNode::Bool
+                | PNode::Char
+                | PNode::Int(_)
+                | PNode::Uint(_)
+                | PNode::Float(_)
+                | PNode::Str
+                | PNode::Never
+                | PNode::FnDef(..)
+                | PNode::FnPtr(..)
+                | PNode::Ptr(..)
+                | PNode::Ref(Mutbl::Not, _)
+                | PNode::ConstValue { .. }
+                | PNode::ConstParam(_) => {}
+                PNode::Tuple(l) | PNode::Record(_, l) => stack.extend_from_slice(self.list(l, e)?),
+                PNode::Array(elem, _) | PNode::Slice(elem) | PNode::Pat(elem, _) => stack.push(elem),
+                // In Rust, `Copy` structurally requires every field to be `Copy` (E0204), and
+                // `UnsafeCell<T>` is `!Copy`, so any `Copy` ADT is guaranteed `Freeze` + no-drop.
+                PNode::Adt(..) => {
+                    if !self.is_copy_pty(t, e)? {
+                        return Ok(false);
+                    }
+                }
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+
+    /// Whether `root` contains no free local variables (locals bound outside `root`) and no
+    /// mutable borrows / `static mut` / runtime-only constructs.
+    fn no_free_locals(&self, root: ExprId, e: ExprId) -> Result<bool, Refusal> {
+        let bound = self.body.exprs.len() + self.body.stmts.len() + self.body.pats.len() + 1;
+        let mut exprs: Vec<ExprId, A> = Vec::new_in(self.alloc);
+        let mut pats: Vec<PatId, A> = Vec::new_in(self.alloc);
+        let mut bound_pats: Vec<PatId, A> = Vec::new_in(self.alloc);
+        let mut used_locals: Vec<PatId, A> = Vec::new_in(self.alloc);
+        exprs.push(root);
+        let mut steps = 0usize;
+        while let Some(cur) = exprs.pop() {
+            steps += 1;
+            if steps > bound {
+                return self.refuse(Form::Bound, e);
+            }
+            match self.expr(cur)? {
+                Expr::Lit(_) | Expr::OffsetOf { .. } | Expr::ConstBlock { .. } => {}
+                Expr::Local(p) => used_locals.push(p),
+                Expr::Path(_) => {
+                    if matches!(self.expr_def(cur), Some(Def::Static(_, Mutbl::Mut))) {
+                        return Ok(false);
+                    }
+                }
+                Expr::Paren(i)
+                | Expr::Field { base: i, .. }
+                | Expr::TupleField { base: i, .. }
+                | Expr::Unary { operand: i, .. }
+                | Expr::Cast { operand: i, .. }
+                | Expr::Loop { body: i } => exprs.push(i),
+                Expr::Ref { mutbl: Mutbl::Not, operand } | Expr::RawRef { mutbl: Mutbl::Not, operand } => {
+                    exprs.push(operand);
+                }
+                Expr::Binary { lhs, rhs, .. } | Expr::Index { base: lhs, index: rhs } => {
+                    exprs.push(lhs);
+                    exprs.push(rhs);
+                }
+                Expr::Repeat { elem, count, .. } => {
+                    exprs.push(elem);
+                    if let Some(c) = count {
+                        exprs.push(c);
+                    }
+                }
+                Expr::Tuple { elems } | Expr::Array { elems } => {
+                    let Some(es) = self.body.expr_lists.get(elems.range()) else {
+                        return self.refuse(Form::Malformed, cur);
+                    };
+                    exprs.extend_from_slice(es);
+                }
+                Expr::Struct { fields, base, .. } | Expr::Record { fields, base } => {
+                    let Some(fs) = self.body.field_inits.get(fields.range()) else {
+                        return self.refuse(Form::Malformed, cur);
+                    };
+                    for f in fs {
+                        exprs.push(f.expr);
+                    }
+                    if let Some(b) = base.expr() {
+                        exprs.push(b);
+                    }
+                }
+                Expr::Call { callee, args } => {
+                    exprs.push(callee);
+                    let Some(es) = self.body.expr_lists.get(args.range()) else {
+                        return self.refuse(Form::Malformed, cur);
+                    };
+                    exprs.extend_from_slice(es);
+                }
+                Expr::MethodCall { receiver, args, .. } => {
+                    exprs.push(receiver);
+                    let Some(es) = self.body.expr_lists.get(args.range()) else {
+                        return self.refuse(Form::Malformed, cur);
+                    };
+                    exprs.extend_from_slice(es);
+                }
+                Expr::FormatArgs { args, .. } => {
+                    let Some(es) = self.body.expr_lists.get(args.range()) else {
+                        return self.refuse(Form::Malformed, cur);
+                    };
+                    exprs.extend_from_slice(es);
+                }
+                Expr::If { cond, then, else_ } => {
+                    exprs.push(cond);
+                    exprs.push(then);
+                    if let Some(el) = else_ {
+                        exprs.push(el);
+                    }
+                }
+                Expr::Let { pat, init } => {
+                    pats.push(pat);
+                    exprs.push(init);
+                }
+                Expr::Match { scrutinee, arms } => {
+                    exprs.push(scrutinee);
+                    let Some(as_) = self.body.arms.get(arms.range()) else {
+                        return self.refuse(Form::Malformed, cur);
+                    };
+                    for arm in as_ {
+                        pats.push(arm.pat);
+                        if let Some(g) = arm.guard {
+                            exprs.push(g);
+                        }
+                        exprs.push(arm.body);
+                    }
+                }
+                Expr::Block { stmts, tail, .. } => {
+                    let Some(ss) = self.body.stmt_lists.get(stmts.range()) else {
+                        return self.refuse(Form::Malformed, cur);
+                    };
+                    for &s in ss {
+                        let Some(st) = self.body.stmts.get(s.ix()) else {
+                            return self.refuse(Form::Malformed, cur);
+                        };
+                        match *st {
+                            TStmt::Let { pat, init, else_, .. } => {
+                                pats.push(pat);
+                                if let Some(i) = init {
+                                    exprs.push(i);
+                                }
+                                if let Some(el) = else_ {
+                                    exprs.push(el);
+                                }
+                            }
+                            TStmt::Expr { expr, .. } => exprs.push(expr),
+                            TStmt::Item => {}
+                        }
+                    }
+                    if let Some(t) = tail {
+                        exprs.push(t);
+                    }
+                }
+                Expr::Missing
+                | Expr::Ref { mutbl: Mutbl::Mut, .. }
+                | Expr::RawRef { mutbl: Mutbl::Mut, .. }
+                | Expr::Assign { .. }
+                | Expr::AssignOp { .. }
+                | Expr::Break { .. }
+                | Expr::Continue { .. }
+                | Expr::Return { .. }
+                | Expr::Closure { .. }
+                | Expr::Await(_)
+                | Expr::AsyncBlock { .. }
+                | Expr::Underscore
+                | Expr::Asm { .. } => return Ok(false),
+            }
+        }
+        let mut psteps = 0usize;
+        while let Some(p) = pats.pop() {
+            psteps += 1;
+            if psteps > bound {
+                return self.refuse(Form::Bound, e);
+            }
+            let Some(pat) = self.body.pats.get(p.ix()) else {
+                return self.refuse_pat(Form::Malformed, p);
+            };
+            match *pat {
+                Pat::Bind { sub, .. } => {
+                    bound_pats.push(p);
+                    if let Some(s) = sub {
+                        pats.push(s);
+                    }
+                }
+                Pat::Ref { inner, .. } => pats.push(inner),
+                Pat::Tuple { elems, .. }
+                | Pat::TupleStruct { elems, .. }
+                | Pat::Slice { elems, .. }
+                | Pat::Or { alts: elems } => {
+                    let Some(ps) = self.body.pat_lists.get(elems.range()) else {
+                        return self.refuse_pat(Form::Malformed, p);
+                    };
+                    pats.extend_from_slice(ps);
+                }
+                Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
+                    let Some(fs) = self.body.field_pats.get(fields.range()) else {
+                        return self.refuse_pat(Form::Malformed, p);
+                    };
+                    for f in fs {
+                        pats.push(f.pat);
+                    }
+                }
+                Pat::Missing | Pat::Wild | Pat::Lit(_) | Pat::NegLit(_) | Pat::Path(_) | Pat::Range { .. } => {}
+            }
+        }
+        Ok(used_locals.iter().all(|p| bound_pats.scan_for(p).is_some()))
     }
 
     fn field_done(&mut self, e: ExprId) -> Result<(), Refusal> {

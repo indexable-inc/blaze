@@ -55,6 +55,10 @@ impl Machine {
     pub const SHA2: u64 = 1 << 10;
     /// x86-64 AVX-512F/BW/DQ/VL (512-bit `zmm` vectors + opmask `k1..k7`).
     pub const AVX512: u64 = 1 << 11;
+    /// AArch64 Scalable Matrix Extension (`smstart`, `zero {za}`, `fmopa`/`smopa`/`umopa`, 512-bit streaming SVE on Apple M4/M5).
+    pub const SME: u64 = 1 << 12;
+    /// AArch64 Scalable Matrix Extension 2 (`FEAT_SME2`: multi-vector `ld1w`/`st1w`, `mova` tiles, `fmopa` 2x/4x groups on Apple M4/M5).
+    pub const SME2: u64 = 1 << 13;
 }
 
 /// Interprocedural Register Allocation (IPRA) clobber summary for a compiled callee:

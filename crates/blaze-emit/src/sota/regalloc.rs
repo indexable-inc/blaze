@@ -602,6 +602,16 @@ fn preferred_inplace_operand(
             let at = idx(*view.data.get(inst)?);
             valid_src(*view.extra.get(at + 2)?)
         }
+        Op::TargetIntrinsic => {
+            let at = idx(*view.data.get(inst)?);
+            let id = blaze_lir::func::IntrinsicId(*view.extra.get(at)?);
+            let name = view.intrinsic_name(id);
+            if name == b"blaze.neon.sdot" || name == b"blaze.neon.udot" {
+                valid_src(*view.extra.get(at + 2)?)
+            } else {
+                None
+            }
+        }
         Op::Fadd => {
             let at = idx(*view.data.get(inst)?);
             let a = *view.extra.get(at)?;
@@ -893,6 +903,15 @@ pub(crate) fn allocate_with_ipra<A: Allocator + Copy>(
             };
             let is_i128_div = view.tys.get(inst).copied().map(Ty) == Some(Ty::I128)
                 && matches!(op, Op::Udiv | Op::Sdiv | Op::Urem | Op::Srem);
+            let is_sme2_call = op == Op::TargetIntrinsic
+                && view
+                    .data
+                    .get(inst)
+                    .and_then(|&d| view.extra.get(idx(d)))
+                    .is_some_and(|&id| {
+                        let name = view.intrinsic_name(blaze_lir::func::IntrinsicId(id));
+                        name == b"blaze.sme2.gemm_f32" || name == b"blaze.sme2.gemm_f64"
+                    });
             let is_non_tail_call = (matches!(
                 op,
                 Op::Call
@@ -904,7 +923,8 @@ pub(crate) fn allocate_with_ipra<A: Allocator + Copy>(
                     | Op::Memmove
                     | Op::Frem
             ) || is_runtime_bulk
-                || is_i128_div)
+                || is_i128_div
+                || is_sme2_call)
                 && !tail_calls.get(inst).copied().unwrap_or(false);
             if is_non_tail_call {
                 call_positions.push(inst);

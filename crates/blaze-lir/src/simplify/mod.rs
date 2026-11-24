@@ -14,6 +14,7 @@ use core::fmt;
 
 use crate::{BuildError, VerifyError};
 
+pub mod amac;
 pub mod bce;
 pub mod coldsplit;
 pub mod coro_opt;
@@ -21,14 +22,18 @@ mod dce;
 pub mod devirt;
 pub mod egraph;
 pub mod escape;
+pub mod gemm;
 pub mod ifconv;
 pub mod loopnest;
+pub mod mach_egraph;
 pub mod memopt;
+pub mod modulo_sched;
 pub mod prefetch;
 mod prop;
 pub mod rvsdg;
 pub mod sched;
 pub mod semproof;
+pub mod simd_idioms;
 pub mod slp;
 pub mod soa;
 pub mod speculate;
@@ -42,6 +47,7 @@ pub mod unswitch;
 pub mod validate;
 pub mod vectorize;
 
+pub use amac::{AmacOpts, AmacOutput, AmacStats, interleave_amac_loops};
 pub use bce::{BceOutput, BceStats, eliminate_redundant_checks};
 pub use coldsplit::{ColdSplitOutput, ColdSplitStats, partition_cold_blocks};
 pub use coro_opt::{
@@ -56,9 +62,17 @@ pub use egraph::{
     plan_ssa_regalloc, sota_optimize_fixpoint,
 };
 pub use escape::{AllocRole, EscapeOutput, EscapeStats, EscapeSummary, promote_heap_to_stack, summarize_escape};
+pub use gemm::{
+    GemmOpts, GemmOutput, GemmStats, SME2_GEMM_F32_INTRINSIC, SME2_GEMM_F64_INTRINSIC, optimize_gemm_loops,
+};
 pub use ifconv::{IfConvOutput, IfConvStats, if_convert};
 pub use loopnest::{LoopNestOutput, LoopNestStats, fuse_adjacent_loops, interchange_and_tile_loops};
+pub use mach_egraph::{
+    AppleM5PortModel, CacheDecodeError, CachedRewrite, MachEGraphOpts, MachEGraphOutput, MachEGraphStats,
+    SuperoptCache, optimize_mach_egraph,
+};
 pub use memopt::{MemOptOutput, MemOptStats, optimize_memory};
+pub use modulo_sched::{ModuloSchedOpts, ModuloSchedOutput, ModuloSchedStats, swing_modulo_schedule};
 pub use prefetch::{
     PREFETCH_READ_L1_INTRINSIC, PrefetchOutput, PrefetchStats, build_fast_utoa_u64, build_swisstable_probe_16b,
     insert_software_prefetch,
@@ -67,6 +81,11 @@ pub use prop::{Plant, propagate, propagate_planted};
 pub use rvsdg::{PortCostModel, RegionCost, RvsdgOutput, RvsdgStats, co_optimize_regions, estimate_function_cost};
 pub use sched::{SchedOutput, SchedStats, schedule_dag};
 pub use semproof::{ParamProof, SemProofOutput, SemProofStats, apply_semantic_proofs};
+pub use simd_idioms::{
+    NEON_SDOT_INTRINSIC, NEON_TBL16_INTRINSIC, NEON_TBL64_INTRINSIC, NEON_UDOT_INTRINSIC, SimdIdiomOpts,
+    SimdIdiomOutput, SimdIdiomStats, emit_sort4_network, emit_sort4_values, emit_sort8_network, emit_sort8_values,
+    lower_byte_lut_loops, lower_dotprod_loops, lower_simd_idioms, lower_sorting_networks,
+};
 pub use slp::{MemchrOutput, MemchrStats, SlpOutput, SlpStats, slp_vectorize, vectorize_memchr_loops};
 pub use soa::{SoaAnalysis, SoaOutput, SoaStats, StructField, analyze_aos_loop, rewrite_aos_to_soa};
 pub use speculate::{

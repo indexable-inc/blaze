@@ -160,6 +160,36 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             names.push(s.name);
         }
         let last = segs.last().map(|s| s.name);
+        // Anchored struct pattern `<T>::Variant { .. }`: resolve `T` directly as an enum type.
+        if let Some(anchor) = bp.anchor {
+            if anchor.trait_.is_some() {
+                self.diag(DiagCode::NotAStruct, at, About::path(last));
+                return Ok(None);
+            }
+            let [v] = segs else {
+                self.diag(DiagCode::NotAStruct, at, About::path(last));
+                return Ok(None);
+            };
+            let self_ty = self.lower_body_ty(anchor.ty, at)?;
+            let self_ty = self.try_structurally_resolve(self_ty)?;
+            let TyView::Adt(k, args) = self.view(self_ty) else {
+                self.diag(DiagCode::NotAStruct, at, About::path(last));
+                return Ok(None);
+            };
+            let Some(adt) = self.reads.adt(k)? else {
+                self.diag(DiagCode::NotAStruct, at, About::path(last));
+                return Ok(None);
+            };
+            if adt.kind != AdtKind::Enum {
+                self.diag(DiagCode::NotAStruct, at, About::path(last));
+                return Ok(None);
+            }
+            let Some((variant, def)) = self.struct_variant(at, k, *v)? else {
+                return Ok(None);
+            };
+            self.defs.push((at, def));
+            return Ok(Some((k, variant, args)));
+        }
         let res = self.path_res(bp, path, &names, at)?;
         // The segments the world consumed: the last of them names the type.
         let consumed = match &res {
