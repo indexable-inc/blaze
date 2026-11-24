@@ -312,7 +312,7 @@ mod tests {
             let over = if own.is_empty() { p0 } else { tys.intern(tc::PNode::Ref(tc::Mutbl::Not, p0)).unwrap() };
             RegionCol::lay(tys.view(), over, &NoNominal, own, a()).unwrap()
         });
-        let views: std::vec::Vec<ClauseView<'_>> = laid.iter().map(|col| ClauseView { nth: 0, binders: 0, col: ColView::of(col) }).collect();
+        let views: std::vec::Vec<ClauseView<'_>> = laid.iter().map(|col| ClauseView { nth: 0, binders: 0, col: ColView::of(col), outlives: None }).collect();
         let params = tr_count.map(|n| LifetimeParams::new_in(n, a()));
         let facts = Facts { clauses: &views, tr: params.as_ref() };
         let mut table = TiesTable::new_in(a());

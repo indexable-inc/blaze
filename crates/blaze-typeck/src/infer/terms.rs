@@ -406,6 +406,7 @@ impl<'a> Terms<'a> {
 
 impl<'a> blaze_solve::Tys for Terms<'a> {
     type Snapshot = blaze_ty::Snapshot;
+    const REGIONS_BIND: bool = false;
 
     fn kind(&self, t: STy) -> K {
         let Some(n) = self.cx.tys.node_at(t.0) else { panic!("blaze-typeck: term {} is not in the arena", t.0) };

@@ -530,6 +530,11 @@ unsafe fn clone_on(stack: *mut u8, plan: &Plan, fds: [RawFd; 3], ask: &ChildAsk<
     if let (CONFINE_STEP, Some((step, errno))) = (step, refused) {
         return Ok(Cloned::ConfineRefused { step, errno });
     }
+    if step == 4 && failed != 0 {
+        // Preserve `raw_os_error()` (e.g. ENOENT, ETXTBSY) for `while_busy` and `LinkError.os`,
+        // matching macOS `posix_spawn`.
+        return Err(io::Error::from_raw_os_error(failed));
+    }
     let what = match step {
         1 => "giving it its input and output",
         2 => "putting it in its cgroup",

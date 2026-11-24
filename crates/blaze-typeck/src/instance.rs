@@ -164,6 +164,7 @@ pub(crate) struct OwnClosures<'s> {
     pub kinds: &'s [crate::ty::ClosureKind],
     pub sigs: &'s [PTy],
     pub upvars: &'s [Option<PTy>],
+    pub expr_ty: &'s [PTy],
 }
 
 /// A closure of `own.owner` from `own` (its signature in `types`); any other from the world.
@@ -208,7 +209,41 @@ impl<W: World> ClosureSource for OwnFirst<'_, '_, '_, '_, '_, W> {
     }
 
     fn coroutine_of(&mut self, cx: &mut InferCtx<'_>, owner: ItemKey, ordinal: u32, args: crate::ty::TyList, depth: u32) -> Result<Ty, Stop> {
-        self.asked.coroutine_of(cx, owner, ordinal, args, depth)
+        let Some(own) = self.own.filter(|o| o.owner == owner) else {
+            return self.asked.coroutine_of(cx, owner, ordinal, args, depth);
+        };
+        let types = self.types;
+        let ty = if ordinal < crate::coroutine_id::CLOSURE_BASE {
+            let mut seen = 0u32;
+            let mut found = None;
+            for (idx, expr) in own.body.exprs.iter().enumerate() {
+                if matches!(expr, crate::body::Expr::AsyncBlock { .. }) {
+                    if seen == ordinal {
+                        found = own.expr_ty.get(idx).copied();
+                        break;
+                    }
+                    seen = seen.saturating_add(1);
+                }
+            }
+            found
+        } else {
+            let row = usize::try_from(ordinal - crate::coroutine_id::CLOSURE_BASE).ok();
+            row.and_then(|r| own.sigs.get(r).copied()).and_then(|sig| match types.node(sig).ok()? {
+                PNode::FnPtr(io, _) => types.list(io).ok()?.last().copied(),
+                _ => None,
+            })
+        };
+        let Some(PNode::Future(_, output, interior)) = ty.and_then(|t| types.node(t).ok()) else {
+            return self.asked.coroutine_of(cx, owner, ordinal, args, depth);
+        };
+        let n = cx.list_len(args);
+        let mut subst: Vec<Ty, Alloc<'_>> = Vec::with_capacity_in(usize::try_from(n).unwrap_or(0), cx.alloc());
+        for i in 0..n {
+            subst.push(cx.list_get(args, i));
+        }
+        let output = import(cx, self, types, output, &subst, depth)?;
+        let interior = import(cx, self, types, interior, &subst, depth)?;
+        Ok(cx.imported_coroutine(owner, ordinal, args, output, interior)?)
     }
 }
 

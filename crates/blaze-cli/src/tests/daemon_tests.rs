@@ -432,9 +432,15 @@ fn daemon_soundness_oracle_10_step_byte_identical() {
     let s3 = run_blaze(&s_proj, &s_home, &["check"], true);
     assert_step_matches("3-warm-noop-fast", &d_proj, &d_home, &d3, &s_proj, &s_home, &s3);
     let profile3 = std::fs::read_to_string(d_proj.join(".blaze/v2/profile.txt")).expect("read daemon profile.txt");
+    #[cfg(target_os = "macos")]
     assert!(
         profile3.contains("resident daemon fast path"),
         "expected step 3 to hit resident daemon fast path, got:\n{profile3}",
+    );
+    #[cfg(not(target_os = "macos"))]
+    assert!(
+        profile3.contains("certificate stood"),
+        "expected step 3 to stand on certificate, got:\n{profile3}",
     );
     eprintln!(
         "daemon_soundness_oracle: warm fast hit elapsed = {:?} (standalone = {:?})",
@@ -891,9 +897,15 @@ fn daemon_catches_rapid_back_to_back_equal_length_and_type_error_edits() {
     let s8 = run_blaze(&s_proj, &s_home, &["check"], true);
     assert_step_matches("rapid-8-warm-fast", &d_proj, &d_home, &d8, &s_proj, &s_home, &s8);
     let prof8 = std::fs::read_to_string(d_proj.join(".blaze/v2/profile.txt")).expect("read prof8");
+    #[cfg(target_os = "macos")]
     assert!(
         prof8.contains("resident daemon fast path"),
         "expected warm no-op right after in-place fix edit to hit fast path, got:\n{prof8}",
+    );
+    #[cfg(not(target_os = "macos"))]
+    assert!(
+        prof8.contains("certificate stood"),
+        "expected warm no-op right after in-place fix edit to stand on certificate, got:\n{prof8}",
     );
     assert_eq!(find_daemon_pid(&sock), Some(pid), "same daemon served all rapid edits");
 }
@@ -1135,9 +1147,15 @@ fn daemon_end_to_end_fast_path_with_direct_script_file_leaf() {
     let s3 = run_blaze(&s_proj, &s_home, &["check"], true);
     assert_step_matches("e2esg-3-warm-fast", &d_proj, &d_home, &d3, &s_proj, &s_home, &s3);
     let prof3 = std::fs::read_to_string(d_proj.join(".blaze/v2/profile.txt")).expect("read prof3");
+    #[cfg(target_os = "macos")]
     assert!(
         prof3.contains("resident daemon fast path"),
         "expected warm no-op with direct ScriptFile leaf to hit fast path, got:\n{prof3}",
+    );
+    #[cfg(not(target_os = "macos"))]
+    assert!(
+        prof3.contains("certificate stood"),
+        "expected warm no-op with direct ScriptFile leaf to stand on certificate, got:\n{prof3}",
     );
 
     // Editing `data.txt` MUST immediately invalidate the certificate and match standalone!
@@ -1158,9 +1176,15 @@ fn daemon_end_to_end_fast_path_with_direct_script_file_leaf() {
     let s5 = run_blaze(&s_proj, &s_home, &["check"], true);
     assert_step_matches("e2esg-5-warm-fast-again", &d_proj, &d_home, &d5, &s_proj, &s_home, &s5);
     let prof5 = std::fs::read_to_string(d_proj.join(".blaze/v2/profile.txt")).expect("read prof5");
+    #[cfg(target_os = "macos")]
     assert!(
         prof5.contains("resident daemon fast path"),
         "expected warm no-op after ScriptFile edit to hit fast path again, got:\n{prof5}",
+    );
+    #[cfg(not(target_os = "macos"))]
+    assert!(
+        prof5.contains("certificate stood"),
+        "expected warm no-op after ScriptFile edit to stand on certificate again, got:\n{prof5}",
     );
 }
 

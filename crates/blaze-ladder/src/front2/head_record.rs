@@ -189,7 +189,10 @@ const MAGIC: [u8; 4] = *b"BZHD";
 /// 35: `T_RECORD` terms carry their canonical sorted field names so cross-item signatures keep
 /// `RecordSchema -> &[Name]` mappings.
 /// 36: `PClause::ForFields` (tag 5) for field-quantified bounds `for<F in fields(T)> F: Trait<args...>`.
-pub const VERSION: u32 = 36;
+/// 37: a trait's record holds each associated type's regions state (laid, softly refused, or
+/// head refused, filed under the associated type's key by `Store::trait_members`) in
+/// `Parts::WithRegions`, left out of the erased digest.
+pub const VERSION: u32 = 37;
 /// The digest domains: the record's out digest, a fn text's check, the regions digest.
 const DIGEST_DOMAIN: &str = "blaze.head-record.v1";
 const TEXT_DOMAIN: &str = "blaze.head-record.text.v1";
@@ -451,6 +454,35 @@ pub enum HeadRef<'h, 'n> {
     Opaque { key: ItemKey, fn_: ItemKey, index: u32, preds: Option<&'h Preds>, regions: Option<&'h FiledRegions> },
 }
 
+/// One associated type's regions state in a trait record (form 37): absent until the trait's
+/// members are made, else laid, softly refused, or its item head refused.
+pub enum AssocRegions {
+    None,
+    Laid(FiledRegions),
+    Unlaid(Unlaid),
+    HeadRefused,
+}
+
+impl AssocRegions {
+    pub fn as_ref(&self) -> AssocRegionsRef<'_> {
+        match self {
+            AssocRegions::None => AssocRegionsRef::None,
+            AssocRegions::Laid(r) => AssocRegionsRef::Laid(r),
+            AssocRegions::Unlaid(u) => AssocRegionsRef::Unlaid(*u),
+            AssocRegions::HeadRefused => AssocRegionsRef::HeadRefused,
+        }
+    }
+}
+
+/// Borrowed form of [`AssocRegions`].
+#[derive(Clone, Copy)]
+pub enum AssocRegionsRef<'h> {
+    None,
+    Laid(&'h FiledRegions),
+    Unlaid(Unlaid),
+    HeadRefused,
+}
+
 /// One associated type's side rows of a trait (form 9): what the store files beside the trait's
 /// members, by the trait and the name.
 pub struct AssocSide {
@@ -465,6 +497,9 @@ pub struct AssocSide {
     /// by the trait's members under the associated type's own key (`Store::preds`); none until
     /// the members are made.
     pub bounds: Option<HeadPreds>,
+    /// Its item-bound regions state (form 37), filed under the associated type's own key
+    /// (`Store::regions`); `AssocRegions::None` until the members are made.
+    pub regions: AssocRegions,
 }
 
 /// Where a trait's [`AssocSide`] rows are read from: the store's maps, or a decoded head's own.
@@ -496,6 +531,30 @@ impl AssocSides<'_, '_> {
         match *self {
             AssocSides::Store { store, .. } => item.and_then(|k| store.preds.get(&k)),
             AssocSides::Rows(rows) => rows.iter().find(|r| r.name == name).and_then(|r| r.bounds.as_deref()),
+        }
+    }
+
+    /// `name`'s item-bound regions state (form 37), filed under its key (`item`).
+    pub fn regions(&self, name: Name, item: Option<ItemKey>) -> AssocRegionsRef<'_> {
+        match *self {
+            AssocSides::Store { store, .. } => match item {
+                None => AssocRegionsRef::None,
+                Some(k) => {
+                    if let Some(r) = store.regions.made(k) {
+                        AssocRegionsRef::Laid(r)
+                    } else if let Some(u) = store.regions.unlaid_of(k) {
+                        AssocRegionsRef::Unlaid(u)
+                    } else if store.regions.is_refused(k) {
+                        AssocRegionsRef::HeadRefused
+                    } else {
+                        AssocRegionsRef::None
+                    }
+                }
+            },
+            AssocSides::Rows(rows) => match rows.iter().find(|r| r.name == name) {
+                Some(r) => r.regions.as_ref(),
+                None => AssocRegionsRef::None,
+            },
         }
     }
 }
@@ -1163,6 +1222,22 @@ fn encode_with<'b>(
                 // Form 11: its item bounds, by its key in the members part.
                 let item = extra.and_then(|x| x.assoc.iter().find(|a| a.name == n)).map(|a| a.item);
                 o.opt(assoc_side.bounds(n, item), |o, p| o.preds(p))?;
+                // Form 37: its item-bound regions state (left out of the erased digest).
+                if o.parts == Parts::WithRegions {
+                    match assoc_side.regions(n, item) {
+                        AssocRegionsRef::None => o.byte(0),
+                        AssocRegionsRef::Laid(r) => {
+                            o.byte(1);
+                            o.regions_section(r)?;
+                        }
+                        AssocRegionsRef::Unlaid(u) => {
+                            o.byte(2);
+                            o.byte(u.byte());
+                            o.body.extend_from_slice(&u.detail());
+                        }
+                        AssocRegionsRef::HeadRefused => o.byte(3),
+                    }
+                }
             }
             o.container_life(life, slot)?;
             K_TRAIT
@@ -3164,7 +3239,22 @@ impl<'r> In<'r, '_, '_> {
             if bounds.is_some() && !extra.as_ref().is_some_and(|x| x.assoc.iter().any(|a| a.name == name)) {
                 return Err(E::Shape { what: "an associated type's item bounds with no row in the trait's members part" });
             }
-            assoc_side.push(AssocSide { name, generics, where_, consts, bounds });
+            let regions = match self.u8("an associated type's regions")? {
+                0 => AssocRegions::None,
+                1 => AssocRegions::Laid(self.regions_section()?),
+                2 => {
+                    let byte = self.u8("an associated type's unlaid kind")?;
+                    let detail = self.array::<{ Unlaid::DETAIL }>("an associated type's unlaid detail")?;
+                    let u = Unlaid::of_bytes(byte, detail).ok_or(E::Byte { what: "an associated type's unlaid kind", byte })?;
+                    AssocRegions::Unlaid(u)
+                }
+                3 => AssocRegions::HeadRefused,
+                byte => return Err(E::Byte { what: "an associated type's regions", byte }),
+            };
+            if !matches!(regions, AssocRegions::None) && !extra.as_ref().is_some_and(|x| x.assoc.iter().any(|a| a.name == name)) {
+                return Err(E::Shape { what: "an associated type's regions with no row in the trait's members part" });
+            }
+            assoc_side.push(AssocSide { name, generics, where_, consts, bounds, regions });
         }
         let life = self.container_life()?;
         Ok(self.box_head(Head::Trait { key, head, extra, supers, const_params, preds, assoc_side, life, regions: None }))
@@ -3394,6 +3484,15 @@ pub fn same(a: HeadRef<'_, '_>, b: HeadRef<'_, '_>, tys: PTys<'_>) -> Option<&'s
             need!(
                 h1.assoc.iter().all(|&n| preds(s1.bounds(n, item_of(x1, n)), s2.bounds(n, item_of(x2, n)))),
                 "a trait's associated types' item bounds"
+            );
+            need!(
+                h1.assoc.iter().all(|&n| match (s1.regions(n, item_of(x1, n)), s2.regions(n, item_of(x2, n))) {
+                    (AssocRegionsRef::None, AssocRegionsRef::None) | (AssocRegionsRef::HeadRefused, AssocRegionsRef::HeadRefused) => true,
+                    (AssocRegionsRef::Laid(a), AssocRegionsRef::Laid(b)) => regions_same(Some(a), Some(b)),
+                    (AssocRegionsRef::Unlaid(a), AssocRegionsRef::Unlaid(b)) => a == b,
+                    _ => false,
+                }),
+                "a trait's associated types' regions"
             );
             need!(k1 == k2 && h1.generics == h2.generics, "a trait's key or generics");
             need!(h1.defaults[..] == h2.defaults[..], "a trait's parameter defaults");
@@ -3960,6 +4059,11 @@ impl RegionTable {
         self.refused.insert(item, ());
     }
 
+    /// Whether `item`'s head was filed as refused.
+    pub fn is_refused(&self, item: ItemKey) -> bool {
+        self.refused.contains_key(&item)
+    }
+
     /// Files that `item`'s record was of form `found`: reported and rebuilt, never migrated.
     pub fn file_form(&self, item: ItemKey, found: u32) {
         self.forms.insert(item, found);
@@ -4015,9 +4119,10 @@ impl<A: core::alloc::Allocator + Copy> RegionFacts for RegionReader<'_, A> {
             return Ok(&v[..]);
         }
         let r = self.made(item)?;
+        let outlives = &r.regions().outlives[..];
         let mut v = Vec::with_capacity_in(r.regions().clauses.len(), self.alloc);
         for c in r.regions().clauses.iter() {
-            v.push(ClauseView::of(c));
+            v.push(ClauseView::of_in(c, outlives));
         }
         self.views.insert(item, v);
         self.views.get(&item).map(|v| &v[..]).ok_or(RegionsUnread { item, why: UnreadWhy::NoHead })

@@ -1212,10 +1212,72 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                     PNode::Alias { trait_, name, .. } => {
                         let selected: &'c dyn Selected = self.selected;
                         let key = Keyer { walk: &*self, at: AskAt::Kids(cur), budget: Cell::new(MOST_WALK_STEPS) };
-                        if let Selection::Impl { value: Some(_), .. } = selected.select_keyed(Ask { trait_, name: Some(name), written: cur.ty }, &key) {
-                            let value = self.normalize(cur, n, d)?;
-                            enter = Some((value, d + 1));
-                            continue;
+                        match selected.select_keyed(Ask { trait_, name: Some(name), written: cur.ty }, &key) {
+                            Selection::Impl { value: Some(_), .. } => {
+                                let value = self.normalize(cur, n, d)?;
+                                enter = Some((value, d + 1));
+                                continue;
+                            }
+                            Selection::Not(_) => {
+                                // Caller's own `where <Alias>: 'rhs` clause (e.g. `forward_output`:
+                                // `fn f<F: Future>(f: F) where F::Output: 'static { output_only(f); }`):
+                                // if the caller already assumes `cur: 'rhs` and `'rhs` satisfies
+                                // `region`, no further outlives requirement on `cur`'s arguments is needed.
+                                let owner: &'c dyn Owner = self.owner;
+                                let clauses = owner.clauses();
+                                if !clauses.is_empty()
+                                    && let Some(oenv) = self.envs.owner_env()
+                                {
+                                    let mut satisfied = false;
+                                    for cv in clauses {
+                                        let Some(rhs) = cv.outlives else { continue };
+                                        if cv.binders != 0 {
+                                            continue;
+                                        }
+                                        let rhs_reg = if rhs == Region::Static { Reg::Static } else { Reg::Owner(rhs) };
+                                        if rhs_reg != Reg::Static && rhs_reg != region {
+                                            continue;
+                                        }
+                                        let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: oenv } };
+                                        if let Some(n) = c.slots.len()
+                                            && cur.slots.len() == Some(n)
+                                            && self.erased_sides(c, cur)
+                                            && (0..n.get()).all(|k| {
+                                                matches!(
+                                                    (self.slot(c, k), self.slot(cur, k)),
+                                                    (Ok(RegAt::Known(a)), Ok(RegAt::Known(b))) if a == b
+                                                )
+                                            })
+                                        {
+                                            self.outlives(cur.ty, rhs_reg, region)?;
+                                            satisfied = true;
+                                            break;
+                                        }
+                                    }
+                                    if satisfied {
+                                        continue;
+                                    }
+                                }
+                                // Builtin `<async { .. } as Future>::Output`: when the future's
+                                // output type carries zero lifetime slots (e.g. `()` or a bare
+                                // type parameter `T`), normalize straight to `output` so its
+                                // outlives bound does not constrain the future's own captures.
+                                let kids = self.kids_of(cur)?;
+                                if kids.len() == 1
+                                    && let Ok(own) = self.own(cur)
+                                    && let Some((_, rest)) = cur.slots.split(own)
+                                    && let Ok((subj, _)) = self.kid(cur, &kids, rest, 0)
+                                    && let Ok(Resolved::Side(subj)) = self.resolve(subj)
+                                    && let Ok(PNode::Future(_, output, _)) = self.node(subj)
+                                {
+                                    let out_side = Side { ty: output, slots: Slots::Caller(crate::SlotRange::EMPTY) };
+                                    if self.fits(out_side).is_ok() {
+                                        enter = Some((out_side, d + 1));
+                                        continue;
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                         // Not selected: the alias outlives `'r` if its arguments do (RFC 1214's
                         // projection rule, its sufficient half).
@@ -2539,6 +2601,16 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             let (args_tuple, _) = self.kid(want, &kids, rest, 1)?;
             if let Some(out) = self.builtin_fn_trait(subject, args_tuple, None, trait_, want.ty)? {
                 return Ok(Some(out));
+            }
+        }
+        // 1b. Builtin `<async { .. } as Future>::Output`: when the future's output carries zero
+        // lifetime slots (e.g. `()` or a bare type parameter `T`), normalize directly to `output`.
+        if want_arg_count == 1
+            && let PNode::Future(_, output, _) = self.node(subject)?
+        {
+            let out_side = Side { ty: output, slots: Slots::Caller(crate::SlotRange::EMPTY) };
+            if self.fits(out_side).is_ok() {
+                return Ok(Some(out_side));
             }
         }
         let owner: &'c dyn Owner = self.owner;
