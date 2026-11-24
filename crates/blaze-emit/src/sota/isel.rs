@@ -274,6 +274,11 @@ enum Fusion {
     /// `<2 x i64>` widening pairwise accumulate `add(add(acc, and(bitcast(e: <4 x i32>), 0xffff_ffff)), lshr(bitcast(e), 32))`
     /// -> 1-instruction `uadalp.2d vacc, vsrc.4s`!
     VecUadalp { acc: u32, src_4s: u32 },
+    /// Widening `I128` multiply whose single-use `Zext(<=64 -> I128)` operand(s) read directly from
+    /// their scalar source GPRs with zero `mov hi, xzr` and zero `madd`.
+    I128WideMul { lhs_src: Option<u32>, rhs_src: Option<u32> },
+    /// `Trunc(Lshr/Ashr(x: I128, 64) -> <=64)` reading `x`'s upper 64-bit register directly with zero shift.
+    I128HiTrunc { src: u32, shift_imm: u32 },
 }
 
 /// Branch patch site resolved once every block's word offset is known.
@@ -323,16 +328,17 @@ enum PostIndexPlan {
         second_inst: usize,
         word: u32,
     },
-    /// Two zero-dependency pairs emitted together at `i0`:
-    /// `hi_word` (`[rp, #half]`, no writeback) followed by `lo_word` (`[rp], #full`, full post-index).
-    /// Eliminates the RAW stall on `rp` between consecutive post-index `ldp`/`stp` pairs.
+    /// Two zero-dependency pairs emitted in strictly ascending address order at `i0`:
+    /// `lo_word` (`[rp, #0]`) followed by `hi_word` (`[rp, #half]`), leaving `PtrAdd(p, step)`
+    /// intact (`add rp, rp, #step`) so cache-line loads/stores stay strictly ascending with zero
+    /// address-dependency chain.
     Quad {
         i0: usize,
         i1: usize,
         i2: usize,
         i3: usize,
-        hi_word: u32,
         lo_word: u32,
+        hi_word: u32,
     },
 }
 
@@ -359,8 +365,8 @@ impl PostIndexPlan {
 enum PairAddrMode {
     /// Post-index writeback by 1 pair width: `[rp], #32` (Vec128) or `[rp], #16` (Gpr64/Fp64).
     PostHalf,
-    /// Post-index writeback by 2 pair widths: `[rp], #64` (Vec128) or `[rp], #32` (Gpr64/Fp64).
-    PostFull,
+    /// Signed offset 0 without writeback: `[rp, #0]`.
+    OffZero,
     /// Signed offset without writeback at 1 pair width: `[rp, #32]` (Vec128) or `[rp, #16]` (Gpr64/Fp64).
     OffHalf,
 }
@@ -531,6 +537,27 @@ fn extract_const_u64(view: &View<'_>, inst: usize) -> Option<u64> {
             Some((lo | (hi << 32)) & mask)
         }
         _ => None,
+    }
+}
+
+/// True iff an `I128` SSA value is provably zero in its upper 64 bits (`bits 64..128 == 0`).
+#[inline]
+fn i128_hi_is_zero(view: &View<'_>, v: u32) -> bool {
+    let vi = to_idx(v);
+    if ty_at(view.tys, vi) != Ty::I128 {
+        return false;
+    }
+    match view.op(vi) {
+        Op::Zext => {
+            let src_ty = ty_at(view.tys, to_idx(at_u32(view.data, vi)));
+            src_ty.is_scalar() && src_ty.is_int() && src_ty.bits(64) <= 64
+        }
+        Op::Iconst => at_u32(view.data, vi).cast_signed() >= 0,
+        Op::IconstWide => {
+            let at = to_idx(at_u32(view.data, vi));
+            at_u32(view.extra, at + 2) == 0 && at_u32(view.extra, at + 3) == 0
+        }
+        _ => false,
     }
 }
 
@@ -3421,6 +3448,70 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     }
                 }
             }
+            Op::Mul if ty == Ty::I128 => {
+                let at = to_idx(at_u32(view.data, inst));
+                let lhs = at_u32(view.extra, at);
+                let rhs = at_u32(view.extra, at + 1);
+                let try_zext_src = |v: u32, other: u32| -> Option<u32> {
+                    if v == other {
+                        return None;
+                    }
+                    let vi = to_idx(v);
+                    if at_u32(&use_count, vi) == 1
+                        && at_u32(&inst_block, vi) == b
+                        && view.op(vi) == Op::Zext
+                        && !at_bool(&skip_emit, vi)
+                        && at_fusion(&fusion, vi) == Fusion::None
+                    {
+                        let src_v = at_u32(view.data, vi);
+                        let src_ty = ty_at(view.tys, to_idx(src_v));
+                        if src_ty.is_scalar() && src_ty.is_int() && src_ty.bits(64) <= 64 {
+                            return Some(src_v);
+                        }
+                    }
+                    None
+                };
+                let lhs_src = try_zext_src(lhs, rhs);
+                let rhs_src = try_zext_src(rhs, lhs);
+                if lhs_src.is_some() || rhs_src.is_some() {
+                    set_at(&mut fusion, inst, Fusion::I128WideMul { lhs_src, rhs_src });
+                    if lhs_src.is_some() {
+                        set_at(&mut skip_emit, to_idx(lhs), true);
+                    }
+                    if rhs_src.is_some() {
+                        set_at(&mut skip_emit, to_idx(rhs), true);
+                    }
+                }
+            }
+            Op::Trunc if bits > 0 => {
+                let src_v = at_u32(view.data, inst);
+                let si = to_idx(src_v);
+                if ty_at(view.tys, si) == Ty::I128
+                    && at_u32(&use_count, si) == 1
+                    && at_u32(&inst_block, si) == b
+                    && matches!(view.op(si), Op::Lshr | Op::Ashr)
+                    && !at_bool(&skip_emit, si)
+                    && at_fusion(&fusion, si) == Fusion::None
+                {
+                    let sat = to_idx(at_u32(view.data, si));
+                    let x = at_u32(view.extra, sat);
+                    let bv = at_u32(view.extra, sat + 1);
+                    let bvi = to_idx(bv);
+                    let const_sh: Option<u32> = if let Some(c) = at_opt(&const_u64, bvi) {
+                        Some(trunc_u32(c & 127))
+                    } else if view.op(bvi) == Op::Iconst {
+                        Some(at_u32(view.data, bvi) & 127)
+                    } else if view.op(bvi) == Op::IconstWide {
+                        Some(at_u32(view.extra, to_idx(at_u32(view.data, bvi))) & 127)
+                    } else {
+                        None
+                    };
+                    if const_sh == Some(64) {
+                        set_at(&mut fusion, inst, Fusion::I128HiTrunc { src: x, shift_imm: bv });
+                        set_at(&mut skip_emit, si, true);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -3714,6 +3805,9 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     inc_u32(&mut imm_uses, rhs);
                 }
             }
+            Fusion::I128HiTrunc { shift_imm, .. } => {
+                inc_u32(&mut imm_uses, to_idx(shift_imm));
+            }
             Fusion::Madd { .. }
             | Fusion::Msub { .. }
             | Fusion::Fmadd { .. }
@@ -3733,7 +3827,8 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
             | Fusion::Eon { .. }
             | Fusion::TstBr { imm_nrs: None, .. }
             | Fusion::BlazeResultCallBr
-            | Fusion::VecUadalp { .. } => {}
+            | Fusion::VecUadalp { .. }
+            | Fusion::I128WideMul { .. } => {}
             Fusion::None => match op {
                 Op::Add => {
                     let at = to_idx(at_u32(view.data, inst));
@@ -3835,7 +3930,9 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
         }
     }
     for inst in 0..len {
-        if at_opt(&const_u64, inst).is_some() && at_u32(&use_count, inst) > 0 && at_u32(&imm_uses, inst) == at_u32(&use_count, inst) {
+        let is_foldable_const = at_opt(&const_u64, inst).is_some()
+            || (ty_at(view.tys, inst) == Ty::I128 && matches!(view.op(inst), Op::Iconst | Op::IconstWide));
+        if is_foldable_const && at_u32(&use_count, inst) > 0 && at_u32(&imm_uses, inst) == at_u32(&use_count, inst) {
             set_at(&mut skip_emit, inst, true);
         }
     }
@@ -4885,12 +4982,14 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
             false
         };
         let range = view.block(Block(u32_of(b)));
-        // Post-Index Pair Advance Fusion: fold `p_next = PtrAdd(p, 64|32|16)` (allocated to the
-        // SAME physical GPR `rp` as `p`) directly into post-index `ldp`/`stp` pairs on the LAST
-        // contiguous access group of `p` in block `b`, skipping `p_next`!
-        // For 2-pair groups (`step == 64` Vec128 or `step == 32` Gpr64/Fp64), prefer zero-dependency
-        // `PostIndexPlan::Quad`: `[rp, #half]` (no writeback) followed by `[rp], #full` (full writeback)
-        // so both `ldp`/`stp` issue in the same cycle with zero RAW stall on `rp`.
+        // Post-Index Pair Advance Fusion:
+        // - For single-pair groups (`step == 32` Vec128 or `step == 16` Gpr64/Fp64), fold
+        //   `p_next = PtrAdd(p, step)` (allocated to the SAME physical GPR `rp` as `p`) directly
+        //   into a single post-index `ldp`/`stp` (`[rp], #step`) and skip `p_next`.
+        // - For multi-pair groups (`step == 64` Vec128 or `step == 32` Gpr64/Fp64), emit
+        //   `PostIndexPlan::Quad` in STRICTLY ASCENDING address order (`[rp, #0]` then `[rp, #half]`)
+        //   and leave `PtrAdd(p, step)` (`add rp, rp, #step`) intact — zero cache-line descending
+        //   reordering, zero hardware prefetcher/store-queue stalls, and zero address-dep chain!
         post_pairs.clear();
         skip_p_nexts.clear();
         let blk_u32 = u32_of(b);
@@ -4914,7 +5013,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     let (rt1, rt2) = (u32::from(v_lo), u32::from(v_hi));
                     Some(match mode {
                         PairAddrMode::PostHalf => enc::ldp_q_post(rt1, rt2, rp, 2),
-                        PairAddrMode::PostFull => enc::ldp_q_post(rt1, rt2, rp, 4),
+                        PairAddrMode::OffZero => enc::ldp_q_off(rt1, rt2, rp, 0),
                         PairAddrMode::OffHalf => enc::ldp_q_off(rt1, rt2, rp, 2),
                     })
                 }
@@ -4929,7 +5028,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     let (rt1, rt2) = (u32::from(r_lo), u32::from(r_hi));
                     Some(match mode {
                         PairAddrMode::PostHalf => enc::stp_q_post(rt1, rt2, rp, 2),
-                        PairAddrMode::PostFull => enc::stp_q_post(rt1, rt2, rp, 4),
+                        PairAddrMode::OffZero => enc::stp_q_off(rt1, rt2, rp, 0),
                         PairAddrMode::OffHalf => enc::stp_q_off(rt1, rt2, rp, 2),
                     })
                 }
@@ -4945,7 +5044,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     }
                     Some(match mode {
                         PairAddrMode::PostHalf => enc::ldp_post(rt_lo, rt_hi, rp, 16),
-                        PairAddrMode::PostFull => enc::ldp_post(rt_lo, rt_hi, rp, 32),
+                        PairAddrMode::OffZero => enc::ldp_off(rt_lo, rt_hi, rp, 0),
                         PairAddrMode::OffHalf => enc::ldp_off(rt_lo, rt_hi, rp, 16),
                     })
                 }
@@ -4963,7 +5062,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     }
                     Some(match mode {
                         PairAddrMode::PostHalf => enc::stp_post(rt_lo, rt_hi, rp, 16),
-                        PairAddrMode::PostFull => enc::stp_post(rt_lo, rt_hi, rp, 32),
+                        PairAddrMode::OffZero => enc::stp_off(rt_lo, rt_hi, rp, 0),
                         PairAddrMode::OffHalf => enc::stp_off(rt_lo, rt_hi, rp, 16),
                     })
                 }
@@ -4979,7 +5078,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     }
                     Some(match mode {
                         PairAddrMode::PostHalf => enc::ldp_post_d(dt_lo, dt_hi, rp, 16),
-                        PairAddrMode::PostFull => enc::ldp_post_d(dt_lo, dt_hi, rp, 32),
+                        PairAddrMode::OffZero => enc::ldp_d_off(dt_lo, dt_hi, rp, 0),
                         PairAddrMode::OffHalf => enc::ldp_d_off(dt_lo, dt_hi, rp, 16),
                     })
                 }
@@ -4994,7 +5093,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     let (dt_lo, dt_hi) = (u32::from(r_lo), u32::from(r_hi));
                     Some(match mode {
                         PairAddrMode::PostHalf => enc::stp_post_d(dt_lo, dt_hi, rp, 16),
-                        PairAddrMode::PostFull => enc::stp_post_d(dt_lo, dt_hi, rp, 32),
+                        PairAddrMode::OffZero => enc::stp_d_off(dt_lo, dt_hi, rp, 0),
                         PairAddrMode::OffHalf => enc::stp_d_off(dt_lo, dt_hi, rp, 16),
                     })
                 }
@@ -5115,9 +5214,9 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     return None;
                 }
             }
+            let lo_word = encode_pair_word(lo0_i, lo1_i, is_load, kind, PairAddrMode::OffZero, rp)?;
             let hi_word = encode_pair_word(hi0_i, hi1_i, is_load, kind, PairAddrMode::OffHalf, rp)?;
-            let lo_word = encode_pair_word(lo0_i, lo1_i, is_load, kind, PairAddrMode::PostFull, rp)?;
-            Some(PostIndexPlan::Quad { i0: a0.0, i1: a1.0, i2: a2.0, i3: a3.0, hi_word, lo_word })
+            Some(PostIndexPlan::Quad { i0: a0.0, i1: a1.0, i2: a2.0, i3: a3.0, lo_word, hi_word })
         };
         let range_preserves_rp = |start_i: usize, cand_i: usize, rp: Reg| -> bool {
             for k in start_i..=cand_i {
@@ -5319,15 +5418,6 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     let elem_bytes = if a0.2 == PostAccessKind::Vec128 { 16 } else { 8 };
                     if let Some(quad) = build_post_quad(a0, a1, a2, a3, elem_bytes, rp, &skip_p_nexts) {
                         post_pairs.push(quad);
-                        skip_p_nexts.push(cand);
-                        matched = true;
-                    } else if let (Some(p1), Some(p2)) = (
-                        build_post_pair(a0.0, a0.3, a1.0, a1.3, a0.1, a0.2, 0, elem_bytes, rp),
-                        build_post_pair(a2.0, a2.3, a3.0, a3.3, a0.1, a0.2, 2 * elem_bytes, elem_bytes, rp),
-                    ) {
-                        post_pairs.push(p1);
-                        post_pairs.push(p2);
-                        skip_p_nexts.push(cand);
                         matched = true;
                     }
                 }
@@ -5371,9 +5461,9 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                         words.push(word);
                         set_at(&mut skip_emit, second_inst, true);
                     }
-                    PostIndexPlan::Quad { i1, i2, i3, hi_word, lo_word, .. } => {
-                        words.push(hi_word);
+                    PostIndexPlan::Quad { i1, i2, i3, lo_word, hi_word, .. } => {
                         words.push(lo_word);
+                        words.push(hi_word);
                         set_at(&mut skip_emit, i1, true);
                         set_at(&mut skip_emit, i2, true);
                         set_at(&mut skip_emit, i3, true);
@@ -6195,37 +6285,78 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     Op::Mul => {
                         let at = to_idx(at_u32(view.data, inst));
                         let (a, bv) = (at_u32(view.extra, at), at_u32(view.extra, at + 1));
+                        let (lhs_src, rhs_src) = match at_fusion(&fusion, inst) {
+                            Fusion::I128WideMul { lhs_src, rhs_src } => (lhs_src, rhs_src),
+                            _ => (None, None),
+                        };
+                        let a_hi_zero = lhs_src.is_some() || i128_hi_is_zero(&view, a);
+                        let b_hi_zero = rhs_src.is_some() || i128_hi_is_zero(&view, bv);
                         if let Some((s0, s1)) = sp_pair {
-                            let a0 = load_half(&mut words, a, false, X16);
-                            let b0 = load_half(&mut words, bv, false, X17);
+                            let a0 = match lhs_src {
+                                Some(src) => load_gpr(&mut words, src, X16),
+                                None => load_half(&mut words, a, false, X16),
+                            };
+                            let b0 = match rhs_src {
+                                Some(src) => load_gpr(&mut words, src, X17),
+                                None => load_half(&mut words, bv, false, X17),
+                            };
                             words.push(enc::mul(X16, a0, b0));
                             emit_st_spill_gpr(&mut words, X16, spill_base, s0);
-                            let a0 = load_half(&mut words, a, false, X16);
-                            let b0 = load_half(&mut words, bv, false, X17);
+                            let a0 = match lhs_src {
+                                Some(src) => load_gpr(&mut words, src, X16),
+                                None => load_half(&mut words, a, false, X16),
+                            };
+                            let b0 = match rhs_src {
+                                Some(src) => load_gpr(&mut words, src, X17),
+                                None => load_half(&mut words, bv, false, X17),
+                            };
                             words.push(enc::umulh(X16, a0, b0));
                             emit_st_spill_gpr(&mut words, X16, spill_base, s1);
-                            let a0 = load_half(&mut words, a, false, X16);
-                            let b1 = load_half(&mut words, bv, true, X17);
-                            words.push(enc::mul(X16, a0, b1));
-                            emit_ld_spill_gpr(&mut words, X17, spill_base, s1);
-                            words.push(enc::add(X16, X17, X16));
-                            emit_st_spill_gpr(&mut words, X16, spill_base, s1);
-                            let a1 = load_half(&mut words, a, true, X16);
-                            let b0 = load_half(&mut words, bv, false, X17);
-                            words.push(enc::mul(X16, a1, b0));
-                            emit_ld_spill_gpr(&mut words, X17, spill_base, s1);
-                            words.push(enc::add(X16, X17, X16));
-                            emit_st_spill_gpr(&mut words, X16, spill_base, s1);
+                            if !b_hi_zero {
+                                let a0 = match lhs_src {
+                                    Some(src) => load_gpr(&mut words, src, X16),
+                                    None => load_half(&mut words, a, false, X16),
+                                };
+                                let b1 = load_half(&mut words, bv, true, X17);
+                                words.push(enc::mul(X16, a0, b1));
+                                emit_ld_spill_gpr(&mut words, X17, spill_base, s1);
+                                words.push(enc::add(X16, X17, X16));
+                                emit_st_spill_gpr(&mut words, X16, spill_base, s1);
+                            }
+                            if !a_hi_zero {
+                                let a1 = load_half(&mut words, a, true, X16);
+                                let b0 = match rhs_src {
+                                    Some(src) => load_gpr(&mut words, src, X17),
+                                    None => load_half(&mut words, bv, false, X17),
+                                };
+                                words.push(enc::mul(X16, a1, b0));
+                                emit_ld_spill_gpr(&mut words, X17, spill_base, s1);
+                                words.push(enc::add(X16, X17, X16));
+                                emit_st_spill_gpr(&mut words, X16, spill_base, s1);
+                            }
                         } else {
-                            let a0 = load_half(&mut words, a, false, X16);
-                            let b0 = load_half(&mut words, bv, false, X17);
+                            let a0 = match lhs_src {
+                                Some(src) => load_gpr(&mut words, src, X16),
+                                None => load_half(&mut words, a, false, X16),
+                            };
+                            let b0 = match rhs_src {
+                                Some(src) => load_gpr(&mut words, src, X17),
+                                None => load_half(&mut words, bv, false, X17),
+                            };
                             words.push(enc::umulh(dhi, a0, b0));
                             words.push(enc::mul(dlo, a0, b0));
-                            let b1 = load_half(&mut words, bv, true, X17);
-                            words.push(enc::madd(dhi, a0, b1, dhi));
-                            let a1 = load_half(&mut words, a, true, X16);
-                            let b0 = load_half(&mut words, bv, false, X17);
-                            words.push(enc::madd(dhi, a1, b0, dhi));
+                            if !b_hi_zero {
+                                let b1 = load_half(&mut words, bv, true, X17);
+                                words.push(enc::madd(dhi, a0, b1, dhi));
+                            }
+                            if !a_hi_zero {
+                                let a1 = load_half(&mut words, a, true, X16);
+                                let b0 = match rhs_src {
+                                    Some(src) => load_gpr(&mut words, src, X17),
+                                    None => load_half(&mut words, bv, false, X17),
+                                };
+                                words.push(enc::madd(dhi, a1, b0, dhi));
+                            }
                         }
                     }
                     Op::Udiv | Op::Sdiv | Op::Urem | Op::Srem => {
@@ -9474,18 +9605,29 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                 }
                 Op::Trunc => {
                     let (rd, sp) = dst_gpr(inst);
-                    let src_v = at_u32(view.data, inst);
-                    let src = if ty_at(view.tys, to_idx(src_v)) == Ty::I128 {
-                        match at_loc(&reg_alloc.loc_of, to_idx(src_v)) {
-                            AllocLoc::GprPair(lo, _) => u32::from(lo),
-                            AllocLoc::GprPairSpill(s0, _) => {
-                                emit_ld_spill_gpr(&mut words, X16, spill_base, s0);
+                    let src = if let Fusion::I128HiTrunc { src: x, .. } = at_fusion(&fusion, inst) {
+                        match at_loc(&reg_alloc.loc_of, to_idx(x)) {
+                            AllocLoc::GprPair(_, hi) => u32::from(hi),
+                            AllocLoc::GprPairSpill(_, s1) => {
+                                emit_ld_spill_gpr(&mut words, X16, spill_base, s1);
                                 X16
                             }
-                            _ => return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "unexpected i128 trunc src loc" }),
+                            _ => return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "unexpected i128 hi trunc src loc" }),
                         }
                     } else {
-                        load_gpr(&mut words, src_v, X16)
+                        let src_v = at_u32(view.data, inst);
+                        if ty_at(view.tys, to_idx(src_v)) == Ty::I128 {
+                            match at_loc(&reg_alloc.loc_of, to_idx(src_v)) {
+                                AllocLoc::GprPair(lo, _) => u32::from(lo),
+                                AllocLoc::GprPairSpill(s0, _) => {
+                                    emit_ld_spill_gpr(&mut words, X16, spill_base, s0);
+                                    X16
+                                }
+                                _ => return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "unexpected i128 trunc src loc" }),
+                            }
+                        } else {
+                            load_gpr(&mut words, src_v, X16)
+                        }
                     };
                     if bits < 64 {
                         words.push(enc::zext(rd, src, bits));
@@ -10836,5 +10978,389 @@ fn emit_cond_branch_pair<'a>(
         let w2 = words.len();
         words.push(enc::b(0));
         patches.push(BranchPatch { word_idx: w2, kind: PatchKind::B, target_block: else_block });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use blaze_lir::{
+        Flags, IntCond, Op, Scalar, Ty,
+        builder::{Builder, Full, MemAttrs, Param, Variadic},
+        func::{BlockKind, Conv},
+    };
+    use blaze_own::{Alloc, Vec};
+    use blaze_tier::{Emitted, Machine, Names, Outside, RoutinePlaces};
+
+    use super::{CallMode, emit_sota_a64};
+
+    struct NoNames;
+    impl Names for NoNames {
+        fn name(&self, _of: Outside) -> Option<blaze_tier::Named<'_>> {
+            None
+        }
+
+        fn routines(&self) -> RoutinePlaces {
+            RoutinePlaces::NONE
+        }
+    }
+
+    fn test_alloc() -> Alloc<'static> {
+        blaze_own::testing::heap().alloc()
+    }
+
+    fn decode_words(code: &[u8], alloc: Alloc<'static>) -> Vec<u32, Alloc<'static>> {
+        assert_eq!(code.len() % 4, 0, "AArch64 code must be 4-byte aligned");
+        let mut words: Vec<u32, Alloc<'static>> = Vec::with_capacity_in(code.len() / 4, alloc);
+        for chunk in code.chunks_exact(4) {
+            words.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+        words
+    }
+
+    #[inline]
+    fn is_mul_x(w: u32) -> bool {
+        (w & 0xffe0_fc00) == 0x9b00_7c00
+    }
+
+    #[inline]
+    fn is_madd_x(w: u32) -> bool {
+        (w & 0xffe0_8000) == 0x9b00_0000 && ((w >> 10) & 0x1f) != 31
+    }
+
+    #[inline]
+    fn is_umulh(w: u32) -> bool {
+        (w & 0xffe0_fc00) == 0x9bc0_7c00
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    fn exec_leaf(emitted: Emitted<'static>) -> blaze_inproc::exec::Executable {
+        use blaze_code::image::ImageError;
+        use blaze_code::place::{At, PlaceError, Words};
+        use blaze_code::record::{Symbol, Target};
+        use blaze_tier::record::{encode, place, read, seal};
+
+        struct NoWords;
+        impl Words for NoWords {
+            fn word(&mut self, target: Target, _call: bool) -> Result<u64, ImageError> {
+                Err(ImageError::Unbound { target })
+            }
+
+            fn value(&mut self, target: Target) -> Result<u64, ImageError> {
+                Err(ImageError::Unbound { target })
+            }
+        }
+
+        let sealed = seal(emitted).expect("emitted record must seal cleanly");
+        let mut bytes: Vec<u8, Alloc<'static>> = Vec::new_in(test_alloc());
+        encode(&sealed, &mut bytes);
+        let view = read(&bytes).expect("encoded record must read back");
+        let code_bytes = view.code().len();
+        let sym = Symbol::of_name("blaze-emit sota isel unit test");
+        let mut done: Result<(), PlaceError> = Ok(());
+        let exec = blaze_inproc::exec::Executable::written(code_bytes, 64, |code, data| {
+            let at = At { code: code.as_ptr() as u64, relro: data.as_ptr() as u64 };
+            done = place(&view, sym, at, &mut NoWords, code, &mut []);
+        })
+        .expect("W^X exec mapping must succeed");
+        done.expect("place must succeed");
+        exec
+    }
+
+    #[test]
+    fn widening_u128_mul_from_zext_u64_emits_no_madd() {
+        let alloc = test_alloc();
+
+        // 1. wyhash mix kernel: `let p = (a as u128).wrapping_mul(b as u128); (p as u64) ^ ((p >> 64) as u64)`
+        let wymix_emitted = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let a = b.param(Ty::I64);
+            let bv = b.param(Ty::I64);
+            let za = b.convert(Op::Zext, Flags::NONE, Ty::I128, a);
+            let zb = b.convert(Op::Zext, Flags::NONE, Ty::I128, bv);
+            let prod = b.binary(Op::Mul, Flags::NONE, za, zb);
+            let lo = b.convert(Op::Trunc, Flags::NONE, Ty::I64, prod);
+            let c64 = b.iconst(Ty::I128, 64);
+            let sh = b.binary(Op::Lshr, Flags::NONE, prod, c64);
+            let hi = b.convert(Op::Trunc, Flags::NONE, Ty::I64, sh);
+            let mixed = b.binary(Op::Xor, Flags::NONE, lo, hi);
+            b.ret(&[mixed]);
+            let func = b.finish_checked().expect("wymix LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("wymix emits")
+        };
+        let wymix_words = decode_words(&wymix_emitted.code, alloc);
+        assert_eq!(wymix_words.iter().filter(|&&w| is_mul_x(w)).count(), 1, "expected 1 mul");
+        assert_eq!(wymix_words.iter().filter(|&&w| is_umulh(w)).count(), 1, "expected 1 umulh");
+        assert_eq!(
+            wymix_words.iter().filter(|&&w| is_madd_x(w)).count(),
+            0,
+            "widening Zext(u64 -> u128) * Zext(u64 -> u128) must emit ZERO madd"
+        );
+        let shift_count = wymix_words
+            .iter()
+            .filter(|&&w| {
+                (w & 0x7f80_0000) == 0x5300_0000
+                    || (w & 0xffe0_fc00) == 0x9ac0_2000
+                    || (w & 0xffe0_fc00) == 0x9ac0_2400
+            })
+            .count();
+        assert_eq!(shift_count, 0, "(prod >> 64) as u64 must read prod_hi directly with ZERO shifts");
+
+        // 2. Direct widening `(a as u128).wrapping_mul(b as u128) -> u128`.
+        let wide_emitted = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I128)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let a = b.param(Ty::I64);
+            let bv = b.param(Ty::I64);
+            let za = b.convert(Op::Zext, Flags::NONE, Ty::I128, a);
+            let zb = b.convert(Op::Zext, Flags::NONE, Ty::I128, bv);
+            let prod = b.binary(Op::Mul, Flags::NONE, za, zb);
+            b.ret(&[prod]);
+            let func = b.finish_checked().expect("wide u128 mul LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("wide u128 mul emits")
+        };
+        let wide_words = decode_words(&wide_emitted.code, alloc);
+        assert_eq!(wide_words.iter().filter(|&&w| is_mul_x(w)).count(), 1);
+        assert_eq!(wide_words.iter().filter(|&&w| is_umulh(w)).count(), 1);
+        assert_eq!(wide_words.iter().filter(|&&w| is_madd_x(w)).count(), 0);
+
+        // 3. One-sided widening `a_u128.wrapping_mul(b as u128)` -> exactly 1 madd (skips lhs_lo * rhs_hi).
+        let half_emitted = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I128), Param::of(Ty::I64)],
+                &[Param::of(Ty::I128)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let a = b.param(Ty::I128);
+            let bv = b.param(Ty::I64);
+            let zb = b.convert(Op::Zext, Flags::NONE, Ty::I128, bv);
+            let prod = b.binary(Op::Mul, Flags::NONE, a, zb);
+            b.ret(&[prod]);
+            let func = b.finish_checked().expect("half-wide u128 mul LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("half-wide u128 mul emits")
+        };
+        let half_words = decode_words(&half_emitted.code, alloc);
+        assert_eq!(half_words.iter().filter(|&&w| is_mul_x(w)).count(), 1);
+        assert_eq!(half_words.iter().filter(|&&w| is_umulh(w)).count(), 1);
+        assert_eq!(
+            half_words.iter().filter(|&&w| is_madd_x(w)).count(),
+            1,
+            "one-sided zero-high u128 mul must emit exactly 1 madd"
+        );
+
+        // 4. `Zext(u64 -> u128) * IconstWide(hi == 0)` -> ZERO madd.
+        let const_emitted = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I128)]);
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let a = b.param(Ty::I64);
+            let za = b.convert(Op::Zext, Flags::NONE, Ty::I128, a);
+            let k = b.iconst(Ty::I128, 0xa076_1d64_78bd_642fu128);
+            let prod = b.binary(Op::Mul, Flags::NONE, za, k);
+            b.ret(&[prod]);
+            let func = b.finish_checked().expect("const-wide u128 mul LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("const-wide u128 mul emits")
+        };
+        let const_words = decode_words(&const_emitted.code, alloc);
+        assert_eq!(const_words.iter().filter(|&&w| is_mul_x(w)).count(), 1);
+        assert_eq!(const_words.iter().filter(|&&w| is_umulh(w)).count(), 1);
+        assert_eq!(const_words.iter().filter(|&&w| is_madd_x(w)).count(), 0);
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let ex_mix = exec_leaf(wymix_emitted);
+            let f_mix: extern "C" fn(u64, u64) -> u64 = unsafe { ex_mix.as_fn() };
+            let ex_wide = exec_leaf(wide_emitted);
+            let f_wide: extern "C" fn(u64, u64) -> u128 = unsafe { ex_wide.as_fn() };
+            let ex_half = exec_leaf(half_emitted);
+            let f_half: extern "C" fn(u128, u64) -> u128 = unsafe { ex_half.as_fn() };
+            let ex_const = exec_leaf(const_emitted);
+            let f_const: extern "C" fn(u64) -> u128 = unsafe { ex_const.as_fn() };
+
+            let cases: &[(u64, u64)] = &[
+                (0, 0),
+                (1, 0),
+                (1, 1),
+                (u64::MAX, u64::MAX),
+                (u64::MAX, 2),
+                (0xa076_1d64_78bd_642f, 0xe703_7ed1_a0b4_28db),
+                (0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210),
+            ];
+            for &(a, bv) in cases {
+                let want_p = u128::from(a).wrapping_mul(u128::from(bv));
+                let want_mix = (want_p as u64) ^ ((want_p >> 64) as u64);
+                assert_eq!(f_mix(a, bv), want_mix, "wymix({a:#x}, {bv:#x}) mismatch");
+                assert_eq!(f_wide(a, bv), want_p, "wide_mul({a:#x}, {bv:#x}) mismatch");
+                let a128 = (u128::from(a ^ 0xdead_beef_cafe_babe) << 64) | u128::from(a);
+                assert_eq!(
+                    f_half(a128, bv),
+                    a128.wrapping_mul(u128::from(bv)),
+                    "half_mul({a128:#x}, {bv:#x}) mismatch"
+                );
+                assert_eq!(
+                    f_const(a),
+                    u128::from(a).wrapping_mul(0xa076_1d64_78bd_642fu128),
+                    "const_mul({a:#x}) mismatch"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn multi_pair_ldp_stp_preserves_ascending_offset_order() {
+        let alloc = test_alloc();
+        let v4f32 = Ty::vector(Scalar::F32, 4).expect("v4f32");
+
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::I64), Param::of(Ty::F32)],
+            &[],
+        );
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        let loop_hdr = b.create_block(BlockKind::Normal);
+        let exit = b.create_block(BlockKind::Normal);
+
+        b.begin(entry);
+        let x_ptr = b.param(Ty::PTR);
+        let y_ptr = b.param(Ty::PTR);
+        let n = b.param(Ty::I64);
+        let a_scalar = b.param(Ty::F32);
+        let va = b.convert(Op::Splat, Flags::NONE, v4f32, a_scalar);
+        let zero = b.iconst(Ty::I64, 0);
+        b.jump((loop_hdr, &[x_ptr, y_ptr, zero]));
+
+        b.begin(loop_hdr);
+        let px = b.param(Ty::PTR);
+        let py = b.param(Ty::PTR);
+        let i = b.param(Ty::I64);
+        let x0 = b.load(v4f32, Flags::NONE, px, 0, MemAttrs::aligned(4));
+        let x1 = b.load(v4f32, Flags::NONE, px, 16, MemAttrs::aligned(4));
+        let x2 = b.load(v4f32, Flags::NONE, px, 32, MemAttrs::aligned(4));
+        let x3 = b.load(v4f32, Flags::NONE, px, 48, MemAttrs::aligned(4));
+        let y0 = b.load(v4f32, Flags::NONE, py, 0, MemAttrs::aligned(4));
+        let y1 = b.load(v4f32, Flags::NONE, py, 16, MemAttrs::aligned(4));
+        let y2 = b.load(v4f32, Flags::NONE, py, 32, MemAttrs::aligned(4));
+        let y3 = b.load(v4f32, Flags::NONE, py, 48, MemAttrs::aligned(4));
+        let r0 = b.ternary(Op::Fma, Flags::NONE, va, x0, y0);
+        let r1 = b.ternary(Op::Fma, Flags::NONE, va, x1, y1);
+        let r2 = b.ternary(Op::Fma, Flags::NONE, va, x2, y2);
+        let r3 = b.ternary(Op::Fma, Flags::NONE, va, x3, y3);
+        b.store(Flags::NONE, r0, py, 0, MemAttrs::aligned(4));
+        b.store(Flags::NONE, r1, py, 16, MemAttrs::aligned(4));
+        b.store(Flags::NONE, r2, py, 32, MemAttrs::aligned(4));
+        b.store(Flags::NONE, r3, py, 48, MemAttrs::aligned(4));
+        let c64 = b.iconst(Ty::I64, 64);
+        let c16 = b.iconst(Ty::I64, 16);
+        let px_next = b.ptr_add(Flags::NONE, px, c64);
+        let py_next = b.ptr_add(Flags::NONE, py, c64);
+        let i_next = b.binary(Op::Add, Flags::NONE, i, c16);
+        let cond = b.icmp(IntCond::Ult, i_next, n);
+        b.br(Flags::NONE, cond, (loop_hdr, &[px_next, py_next, i_next]), (exit, &[]));
+
+        b.begin(exit);
+        b.ret(&[]);
+
+        let func = b.finish_checked().expect("4x saxpy LIR builds");
+        let emitted = emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+            .expect("4x saxpy emits");
+        let words = decode_words(&emitted.code, alloc);
+
+        let post_q_count = words
+            .iter()
+            .filter(|&&w| (w & 0xffc0_0000) == 0xacc0_0000 || (w & 0xffc0_0000) == 0xac80_0000)
+            .count();
+        assert_eq!(
+            post_q_count, 0,
+            "multi-pair 4x vector loop must not reorder into post-index ldp/stp"
+        );
+
+        let mut ldps: Vec<(usize, u32, u32), Alloc<'static>> = Vec::new_in(alloc);
+        let mut stps: Vec<(usize, u32, u32), Alloc<'static>> = Vec::new_in(alloc);
+        for (pos, &w) in words.iter().enumerate() {
+            let rn = (w >> 5) & 0x1f;
+            let imm7 = (w >> 15) & 0x7f;
+            if (w & 0xffc0_0000) == 0xad40_0000 {
+                ldps.push((pos, rn, imm7));
+            } else if (w & 0xffc0_0000) == 0xad00_0000 {
+                stps.push((pos, rn, imm7));
+            }
+        }
+        assert_eq!(ldps.len(), 4, "expected 4 ldp q (2 for x, 2 for y)");
+        assert_eq!(stps.len(), 2, "expected 2 stp q for y");
+
+        // Verify strictly ascending offset order (`[base, #0]` strictly before `[base, #0x20]`) for stores.
+        assert_eq!(stps[0].1, stps[1].1, "both stp q must share y base register");
+        assert_eq!(stps[0].2, 0, "first stp q must be [base, #0]");
+        assert_eq!(stps[1].2, 2, "second stp q must be [base, #0x20]");
+        assert!(stps[0].0 < stps[1].0, "stp [base, #0] must precede stp [base, #0x20]");
+
+        // Verify strictly ascending offset order for BOTH load base registers (`x` and `y`).
+        let base_a = ldps[0].1;
+        let base_b = ldps.iter().find(|x| x.1 != base_a).expect("expected 2 distinct load bases").1;
+        for base in [base_a, base_b] {
+            let off0 = ldps
+                .iter()
+                .find(|x| x.1 == base && x.2 == 0)
+                .expect("expected ldp [base, #0]")
+                .0;
+            let off2 = ldps
+                .iter()
+                .find(|x| x.1 == base && x.2 == 2)
+                .expect("expected ldp [base, #0x20]")
+                .0;
+            assert!(
+                off0 < off2,
+                "ldp [x{base}, #0] (word {off0}) must precede ldp [x{base}, #0x20] (word {off2})"
+            );
+        }
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let ex = exec_leaf(emitted);
+            let f: extern "C" fn(*const f32, *mut f32, u64, f32) = unsafe { ex.as_fn() };
+            let mut x = [0.0f32; 32];
+            let mut y = [0.0f32; 32];
+            let mut want = [0.0f32; 32];
+            let a = 2.5f32;
+            for k in 0..32 {
+                x[k] = (k as f32) * 0.5 + 1.0;
+                y[k] = (k as f32) * -0.25 + 3.0;
+                want[k] = a.mul_add(x[k], y[k]);
+            }
+            f(x.as_ptr(), y.as_mut_ptr(), 32, a);
+            for k in 0..32 {
+                assert_eq!(y[k].to_bits(), want[k].to_bits(), "saxpy lane {k} mismatch");
+            }
+        }
     }
 }

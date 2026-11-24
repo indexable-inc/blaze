@@ -59,6 +59,10 @@ const MAX_OUTER_BODY_INSTS: usize = 32;
 const MAX_INNER_INSTS: usize = 64;
 /// Maximum non-param instructions allowed in `outer_latch`.
 const MAX_OUTER_LATCH_INSTS: usize = 32;
+/// Maximum pure speculable instructions allowed per arm of a branching inner loop.
+const MAX_INNER_BRANCH_ARM_INSTS: usize = 12;
+/// Maximum constant byte stride supported for pointer-IV outer loops.
+const MAX_PTR_STRIDE: u64 = 4096;
 /// Maximum associative outer reductions supported in a single AMAC nest.
 const MAX_OUTER_REDUCTIONS: usize = 8;
 
@@ -768,9 +772,94 @@ fn dominates(idom: &[u32], a: u32, mut b: u32) -> bool {
     false
 }
 
-/// Matches a strict less-than loop continuation condition `iv < bound` (unsigned or signed) across
-/// all 8 comparison/polarity encodings. Returns `(bound, is_signed)`.
-fn match_strict_lt_guard(
+/// Unwraps up to 4 boolean negation/zext wrappers (`Not`, `Xor(_, 1)`, `Icmp(Eq|Ne, i1|zext(i1), 0|1)`).
+fn unwrap_bool_cond(view: &View<'_>, mut cond_val: u32) -> (u32, bool) {
+    let mut flipped = false;
+    for _ in 0..4 {
+        let ci = to_idx(cond_val);
+        if ci >= view.len() {
+            break;
+        }
+        match view.op(ci) {
+            Op::Not => {
+                cond_val = at_u32(view.data, ci);
+                flipped = !flipped;
+            }
+            Op::Xor => {
+                let pos = to_idx(at_u32(view.data, ci));
+                let (l, r) = (at_u32(view.extra, pos), at_u32(view.extra, pos + 1));
+                if const_u64(view, to_idx(r)) == Some(1) {
+                    cond_val = l;
+                    flipped = !flipped;
+                } else if const_u64(view, to_idx(l)) == Some(1) {
+                    cond_val = r;
+                    flipped = !flipped;
+                } else {
+                    break;
+                }
+            }
+            Op::Icmp => {
+                let cat = to_idx(at_u32(view.data, ci));
+                let Some(ic) = IntCond::from_word(at_u32(view.extra, cat)) else {
+                    break;
+                };
+                if ic != IntCond::Eq && ic != IntCond::Ne {
+                    break;
+                }
+                let (lhs, rhs) = (at_u32(view.extra, cat + 1), at_u32(view.extra, cat + 2));
+                let (val, c) = if let Some(k) = const_u64(view, to_idx(rhs)).filter(|&k| k <= 1) {
+                    (lhs, k)
+                } else if let Some(k) = const_u64(view, to_idx(lhs)).filter(|&k| k <= 1) {
+                    (rhs, k)
+                } else {
+                    break;
+                };
+                let vi = to_idx(val);
+                let inner_i1 = if Ty(at_u16(view.tys, vi)) == Ty::I1 {
+                    val
+                } else if view.op(vi) == Op::Zext {
+                    let src = at_u32(view.data, vi);
+                    if Ty(at_u16(view.tys, to_idx(src))) == Ty::I1 {
+                        src
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                };
+                let is_inv = (c == 0 && ic == IntCond::Eq) || (c == 1 && ic == IntCond::Ne);
+                cond_val = inner_i1;
+                if is_inv {
+                    flipped = !flipped;
+                }
+            }
+            _ => break,
+        }
+    }
+    (cond_val, flipped)
+}
+
+#[inline]
+fn unwrap_ptr_addr(view: &View<'_>, v: u32) -> u32 {
+    let vi = to_idx(v);
+    if view.op(vi) == Op::PtrAddr {
+        at_u32(view.data, vi)
+    } else {
+        v
+    }
+}
+
+#[inline]
+fn is_pure_outer_hdr_helper(op: Op) -> bool {
+    matches!(
+        op,
+        Op::Icmp | Op::PtrAddr | Op::Not | Op::Xor | Op::Zext | Op::Iconst | Op::IconstWide
+    )
+}
+
+/// Matches a counted integer loop continuation condition `iv < bound` (unsigned/signed) or
+/// `iv != bound` across all comparison/polarity encodings. Returns `(bound, is_signed)`.
+fn match_int_iv_guard(
     view: &View<'_>,
     cond_inst: usize,
     iv_val: u32,
@@ -785,18 +874,48 @@ fn match_strict_lt_guard(
     let rhs = at_u32(view.extra, iat + 2);
     if continue_on_then {
         match icond {
-            IntCond::Ult if lhs == iv_val => Some((rhs, false)),
+            IntCond::Ult | IntCond::Ne if lhs == iv_val => Some((rhs, false)),
             IntCond::Slt if lhs == iv_val => Some((rhs, true)),
-            IntCond::Ugt if rhs == iv_val => Some((lhs, false)),
+            IntCond::Ugt | IntCond::Ne if rhs == iv_val => Some((lhs, false)),
             IntCond::Sgt if rhs == iv_val => Some((lhs, true)),
             _ => None,
         }
     } else {
         match icond {
-            IntCond::Uge if lhs == iv_val => Some((rhs, false)),
+            IntCond::Uge | IntCond::Eq if lhs == iv_val => Some((rhs, false)),
             IntCond::Sge if lhs == iv_val => Some((rhs, true)),
-            IntCond::Ule if rhs == iv_val => Some((lhs, false)),
+            IntCond::Ule | IntCond::Eq if rhs == iv_val => Some((lhs, false)),
             IntCond::Sle if rhs == iv_val => Some((lhs, true)),
+            _ => None,
+        }
+    }
+}
+
+/// Matches a pointer-IV loop continuation condition `p != end` / `p < end` (comparing either raw
+/// `Ty::PTR` values or `Op::PtrAddr` integers). Returns `end_ptr`.
+fn match_ptr_iv_guard(
+    view: &View<'_>,
+    cond_inst: usize,
+    ptr_val: u32,
+    continue_on_then: bool,
+) -> Option<u32> {
+    if view.op(cond_inst) != Op::Icmp {
+        return None;
+    }
+    let iat = to_idx(at_u32(view.data, cond_inst));
+    let icond = IntCond::from_word(at_u32(view.extra, iat))?;
+    let ua = unwrap_ptr_addr(view, at_u32(view.extra, iat + 1));
+    let ub = unwrap_ptr_addr(view, at_u32(view.extra, iat + 2));
+    if continue_on_then {
+        match icond {
+            IntCond::Ult | IntCond::Ne if ua == ptr_val => Some(ub),
+            IntCond::Ugt | IntCond::Ne if ub == ptr_val => Some(ua),
+            _ => None,
+        }
+    } else {
+        match icond {
+            IntCond::Uge | IntCond::Eq if ua == ptr_val => Some(ub),
+            IntCond::Ule | IntCond::Eq if ub == ptr_val => Some(ua),
             _ => None,
         }
     }
@@ -812,6 +931,22 @@ fn is_add_one(view: &View<'_>, val: u32, base: u32) -> bool {
     let (al, ar) = (at_u32(view.extra, aat), at_u32(view.extra, aat + 1));
     (al == base && const_u64(view, to_idx(ar)) == Some(1))
         || (ar == base && const_u64(view, to_idx(al)) == Some(1))
+}
+
+/// Matches `val == ptr_add(base, stride)` for a constant byte stride `1..=MAX_PTR_STRIDE`.
+fn match_ptr_step(view: &View<'_>, val: u32, base: u32) -> Option<u64> {
+    let vi = to_idx(val);
+    if view.op(vi) != Op::PtrAdd {
+        return None;
+    }
+    let pat = to_idx(at_u32(view.data, vi));
+    let ptr = at_u32(view.extra, pat);
+    let off = at_u32(view.extra, pat + 1);
+    if ptr != base {
+        return None;
+    }
+    let stride = const_u64(view, to_idx(off))?;
+    (1..=MAX_PTR_STRIDE).contains(&stride).then_some(stride)
 }
 
 // ---------------------------------------------------------------------------
@@ -865,7 +1000,27 @@ impl<A: Allocator> OuterShape<A> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum InnerShape {
+enum OuterIvKind {
+    /// Counted integer IV (`Ty::I64` or `Ty::I32`, unit step `+1`).
+    Counted { ty: Ty, signed: bool },
+    /// Running pointer IV (`Ty::PTR`, constant positive byte stride `1..=MAX_PTR_STRIDE`).
+    Pointer { stride: u64 },
+}
+
+struct InnerBranch<A: Allocator> {
+    inner_hdr: u32,
+    inner_body: u32,
+    inner_cond: u32,
+    inner_cond_inverted: bool,
+    branch_cond: u32,
+    then_arm: Option<u32>,
+    else_arm: Option<u32>,
+    merge_blk: Option<u32>,
+    then_join_args: Vec<u32, A>,
+    else_join_args: Vec<u32, A>,
+}
+
+enum InnerShape<A: Allocator> {
     /// Post-`if_convert` / post-`rotate_loops` 1-block do-while inner loop.
     SingleBlock {
         inner_hdr: u32,
@@ -879,21 +1034,50 @@ enum InnerShape {
         inner_cond: u32,
         inner_cond_inverted: bool,
     },
+    /// Branching inner loop: `inner_hdr -> inner_body -> (then_arm / else_arm) -> [merge_blk ->] inner_hdr`.
+    HeaderBranch(InnerBranch<A>),
 }
 
-impl InnerShape {
+impl<A: Allocator> InnerShape<A> {
     #[inline]
-    fn inner_hdr(self) -> u32 {
+    fn inner_hdr(&self) -> u32 {
         match self {
-            InnerShape::SingleBlock { inner_hdr, .. } | InnerShape::HeaderBody { inner_hdr, .. } => inner_hdr,
+            InnerShape::SingleBlock { inner_hdr, .. }
+            | InnerShape::HeaderBody { inner_hdr, .. }
+            | InnerShape::HeaderBranch(InnerBranch { inner_hdr, .. }) => *inner_hdr,
         }
     }
 
     #[inline]
-    fn inner_body(self) -> u32 {
+    fn inner_body(&self) -> u32 {
         match self {
-            InnerShape::SingleBlock { inner_hdr, .. } => inner_hdr,
-            InnerShape::HeaderBody { inner_body, .. } => inner_body,
+            InnerShape::SingleBlock { inner_hdr, .. } => *inner_hdr,
+            InnerShape::HeaderBody { inner_body, .. }
+            | InnerShape::HeaderBranch(InnerBranch { inner_body, .. }) => *inner_body,
+        }
+    }
+
+    #[inline]
+    fn inner_cond(&self) -> u32 {
+        match self {
+            InnerShape::SingleBlock { inner_cond, .. }
+            | InnerShape::HeaderBody { inner_cond, .. }
+            | InnerShape::HeaderBranch(InnerBranch { inner_cond, .. }) => *inner_cond,
+        }
+    }
+
+    #[inline]
+    fn contains_block(&self, b: u32) -> bool {
+        match self {
+            InnerShape::SingleBlock { inner_hdr, .. } => b == *inner_hdr,
+            InnerShape::HeaderBody { inner_hdr, inner_body, .. } => b == *inner_hdr || b == *inner_body,
+            InnerShape::HeaderBranch(br) => {
+                b == br.inner_hdr
+                    || b == br.inner_body
+                    || br.then_arm == Some(b)
+                    || br.else_arm == Some(b)
+                    || br.merge_blk == Some(b)
+            }
         }
     }
 }
@@ -922,14 +1106,14 @@ struct AmacPlan<A: Allocator> {
     iv_pos: usize,
     iv_inst: u32,
     iv_next_inst: u32,
-    iv_ty: Ty,
+    iv_kind: OuterIvKind,
     bound: u32,
-    signed_iv: bool,
+    skip_iv_next_in_ob: bool,
     outer_reductions: Vec<OuterReduction, A>,
     outer_body_insts: Vec<u32, A>,
     outer_body_inv: Vec<bool, A>,
     outer_guard: Option<OuterGuard<A>>,
-    inner_shape: InnerShape,
+    inner_shape: InnerShape<A>,
     inner_init_args: Vec<u32, A>,
     inner_next_args: Vec<u32, A>,
     inner_exit_args: Vec<u32, A>,
@@ -1064,8 +1248,8 @@ fn detect_amac_nest<A: Allocator + Copy>(
                 let e_blk = at_u32(view.extra, e_at);
                 let e_argc = to_idx(at_u32(view.extra, e_at + 1));
 
-                // `outer_hdr` must contain only `cond_v` between its params and terminator.
-                if (oh_params.end..oh_term).any(|i| i != cond_v) {
+                // `outer_hdr` may contain only pure guard helpers between its params and terminator.
+                if (oh_params.end..oh_term).any(|i| !is_pure_outer_hdr_helper(view.op(i))) {
                     continue;
                 }
 
@@ -1138,34 +1322,65 @@ fn detect_amac_nest<A: Allocator + Copy>(
 
         let outer_body = outer_shape.outer_body();
 
-        // Match outer unit-step counted IV `q` (`q_next = q + 1`, `q < bound`).
+        // Match outer IV: either unit-step counted integer (`q_next = q + 1`, `q < bound` / `q != bound`)
+        // or constant-stride pointer IV (`p_next = ptr_add(p, stride)`, `p != end` / `p < end`).
+        let (outer_cmp_val, outer_cond_flipped) = unwrap_bool_cond(view, to_u32(outer_cond_inst));
+        let outer_cmp_idx = to_idx(outer_cmp_val);
+        let eff_outer_cont = outer_continue_on_then ^ outer_cond_flipped;
         let mut found_iv = None;
         for pos in 0..oh_params.len() {
             let p_idx = oh_params.start + pos;
             let p_inst = to_u32(p_idx);
             let p_ty = Ty(at_u16(view.tys, p_idx));
-            if p_ty != Ty::I64 && p_ty != Ty::I32 {
-                continue;
-            }
             let back_v = at_u32(view.extra, outer_back_args_at + pos);
-            if at_u32(&inst_block, to_idx(back_v)) != outer_latch || !is_add_one(view, back_v, p_inst) {
+            let back_b = at_u32(&inst_block, to_idx(back_v));
+            if back_b != outer_latch && back_b != outer_body {
                 continue;
             }
             let cmp_val = match outer_shape {
                 OuterShape::HeaderBody { .. } => p_inst,
                 OuterShape::Rotated { .. } => back_v,
             };
-            if let Some((bound, signed_iv)) =
-                match_strict_lt_guard(view, outer_cond_inst, cmp_val, outer_continue_on_then)
+            if (p_ty == Ty::I64 || p_ty == Ty::I32) && is_add_one(view, back_v, p_inst) {
+                if let Some((bound, signed_iv)) =
+                    match_int_iv_guard(view, outer_cmp_idx, cmp_val, eff_outer_cont)
+                {
+                    let bound_b = at_u32(&inst_block, to_idx(bound));
+                    if Ty(at_u16(view.tys, to_idx(bound))) == p_ty
+                        && bound_b < outer_hdr
+                        && dominates(&idom, bound_b, outer_hdr)
+                    {
+                        found_iv = Some((
+                            pos,
+                            p_inst,
+                            back_v,
+                            OuterIvKind::Counted { ty: p_ty, signed: signed_iv },
+                            bound,
+                        ));
+                        break;
+                    }
+                }
+            } else if p_ty == Ty::PTR
+                && let Some(stride) = match_ptr_step(view, back_v, p_inst)
+                && let Some(end_ptr) = match_ptr_iv_guard(view, outer_cmp_idx, cmp_val, eff_outer_cont)
             {
-                let bound_b = at_u32(&inst_block, to_idx(bound));
-                if bound_b < outer_hdr && dominates(&idom, bound_b, outer_hdr) {
-                    found_iv = Some((pos, p_inst, back_v, p_ty, bound, signed_iv));
+                let end_b = at_u32(&inst_block, to_idx(end_ptr));
+                if Ty(at_u16(view.tys, to_idx(end_ptr))) == Ty::PTR
+                    && end_b < outer_hdr
+                    && dominates(&idom, end_b, outer_hdr)
+                {
+                    found_iv = Some((
+                        pos,
+                        p_inst,
+                        back_v,
+                        OuterIvKind::Pointer { stride },
+                        end_ptr,
+                    ));
                     break;
                 }
             }
         }
-        let Some((iv_pos, iv_inst, iv_next_inst, iv_ty, bound, signed_iv)) = found_iv else {
+        let Some((iv_pos, iv_inst, iv_next_inst, iv_kind, bound)) = found_iv else {
             continue;
         };
 
@@ -1229,22 +1444,20 @@ fn detect_amac_nest<A: Allocator + Copy>(
         if ih_params.is_empty() || inner_init_args.len() != ih_params.len() {
             continue;
         }
-        // Require `inner_hdr` to have exactly 2 predecessors: `outer_body` and `inner_latch`.
-        let (ip0, ip1) = match preds.get(to_idx(inner_hdr)).map(Vec::as_slice) {
-            Some(&[a, b]) => (a, b),
+        // `inner_hdr` must have 2 predecessors (`[outer_body, inner_latch]`) or 3 predecessors
+        // (`[outer_body, back0, back1]` for a branching inner loop jumping back to `inner_hdr`).
+        let (inner_back0, inner_back1) = match preds.get(to_idx(inner_hdr)).map(Vec::as_slice) {
+            Some(&[a, b]) if a == outer_body => (b, NONE),
+            Some(&[a, b]) if b == outer_body => (a, NONE),
+            Some(&[a, b, c]) if a == outer_body => (b, c),
+            Some(&[a, b, c]) if b == outer_body => (a, c),
+            Some(&[a, b, c]) if c == outer_body => (a, b),
             _ => continue,
         };
-        let inner_latch = if ip0 == outer_body {
-            ip1
-        } else if ip1 == outer_body {
-            ip0
-        } else {
-            continue;
-        };
 
-        // Match `SingleBlock` or `HeaderBody` inner loop shape.
+        // Match `SingleBlock`, `HeaderBody`, or `HeaderBranch` inner loop shape.
         let ol_params = view.params(Block(outer_latch));
-        let (inner_shape, inner_next_args, inner_exit_args) = if inner_latch == inner_hdr {
+        let (inner_shape, inner_next_args, inner_exit_args) = if inner_back1 == NONE && inner_back0 == inner_hdr {
             let ih_term = view.terminator(Block(inner_hdr));
             if view.op(ih_term) != Op::Br {
                 continue;
@@ -1285,19 +1498,8 @@ fn detect_amac_nest<A: Allocator + Copy>(
                 exit_a,
             )
         } else {
-            let inner_body = inner_latch;
-            if inner_body == outer_hdr
-                || inner_body == outer_body
-                || inner_body == outer_latch
-                || view.block_kind(Block(inner_body)) != BlockKind::Normal
-                || preds.get(to_idx(inner_body)).map(Vec::as_slice) != Some(&[inner_hdr])
-                || !view.params(Block(inner_body)).is_empty()
-            {
-                continue;
-            }
             let ih_term = view.terminator(Block(inner_hdr));
-            let ib_term = view.terminator(Block(inner_body));
-            if view.op(ih_term) != Op::Br || view.op(ib_term) != Op::Jump {
+            if view.op(ih_term) != Op::Br {
                 continue;
             }
             let bat = to_idx(at_u32(view.data, ih_term));
@@ -1307,38 +1509,191 @@ fn detect_amac_nest<A: Allocator + Copy>(
             let e_at = bat + 3 + t_argc;
             let e_blk = at_u32(view.extra, e_at);
             let e_argc = to_idx(at_u32(view.extra, e_at + 1));
-            let (x_at, inverted) = if t_blk == inner_body
-                && e_blk == outer_latch
+            let (inner_body, x_at, inverted) = if e_blk == outer_latch
+                && t_blk != outer_latch
                 && t_argc == 0
                 && e_argc == ol_params.len()
             {
-                (e_at + 2, false)
-            } else if e_blk == inner_body
-                && t_blk == outer_latch
+                (t_blk, e_at + 2, false)
+            } else if t_blk == outer_latch
+                && e_blk != outer_latch
                 && e_argc == 0
                 && t_argc == ol_params.len()
             {
-                (bat + 3, true)
+                (e_blk, bat + 3, true)
             } else {
                 continue;
             };
-            let jat = to_idx(at_u32(view.data, ib_term));
-            if at_u32(view.extra, jat) != inner_hdr || to_idx(at_u32(view.extra, jat + 1)) != ih_params.len() {
+            if inner_body == outer_hdr
+                || inner_body == outer_body
+                || inner_body == outer_latch
+                || inner_body == inner_hdr
+                || view.block_kind(Block(inner_body)) != BlockKind::Normal
+                || preds.get(to_idx(inner_body)).map(Vec::as_slice) != Some(&[inner_hdr])
+                || !view.params(Block(inner_body)).is_empty()
+            {
                 continue;
-            }
-            let mut next_a: Vec<u32, A> = Vec::with_capacity_in(ih_params.len(), alloc);
-            for k in 0..ih_params.len() {
-                next_a.push(at_u32(view.extra, jat + 2 + k));
             }
             let mut exit_a: Vec<u32, A> = Vec::with_capacity_in(ol_params.len(), alloc);
             for k in 0..ol_params.len() {
                 exit_a.push(at_u32(view.extra, x_at + k));
             }
-            (
-                InnerShape::HeaderBody { inner_hdr, inner_body, inner_cond: ic, inner_cond_inverted: inverted },
-                next_a,
-                exit_a,
-            )
+
+            let ib_term = view.terminator(Block(inner_body));
+            if inner_back1 == NONE && inner_back0 == inner_body && view.op(ib_term) == Op::Jump {
+                let jat = to_idx(at_u32(view.data, ib_term));
+                if at_u32(view.extra, jat) != inner_hdr
+                    || to_idx(at_u32(view.extra, jat + 1)) != ih_params.len()
+                {
+                    continue;
+                }
+                let mut next_a: Vec<u32, A> = Vec::with_capacity_in(ih_params.len(), alloc);
+                for k in 0..ih_params.len() {
+                    next_a.push(at_u32(view.extra, jat + 2 + k));
+                }
+                (
+                    InnerShape::HeaderBody { inner_hdr, inner_body, inner_cond: ic, inner_cond_inverted: inverted },
+                    next_a,
+                    exit_a,
+                )
+            } else if view.op(ib_term) == Op::Br {
+                // Branching inner loop: `inner_body` branches on `branch_cond` to two pure arms
+                // (or directly) joining at either `merge_blk` or `inner_hdr`.
+                let (merge_blk, next_a) = if inner_back1 == NONE && inner_back0 != inner_body {
+                    let mb = inner_back0;
+                    if mb == outer_hdr
+                        || mb == outer_body
+                        || mb == outer_latch
+                        || mb == inner_hdr
+                        || mb == inner_body
+                        || view.block_kind(Block(mb)) != BlockKind::Normal
+                    {
+                        continue;
+                    }
+                    let mb_term = view.terminator(Block(mb));
+                    if view.op(mb_term) != Op::Jump {
+                        continue;
+                    }
+                    let mjat = to_idx(at_u32(view.data, mb_term));
+                    if at_u32(view.extra, mjat) != inner_hdr
+                        || to_idx(at_u32(view.extra, mjat + 1)) != ih_params.len()
+                    {
+                        continue;
+                    }
+                    let mut na: Vec<u32, A> = Vec::with_capacity_in(ih_params.len(), alloc);
+                    for k in 0..ih_params.len() {
+                        na.push(at_u32(view.extra, mjat + 2 + k));
+                    }
+                    (Some(mb), na)
+                } else {
+                    (None, Vec::new_in(alloc))
+                };
+
+                let join_blk = merge_blk.unwrap_or(inner_hdr);
+                let join_argc = view.params(Block(join_blk)).len();
+
+                let resolve_side = |target_blk: u32,
+                                    target_argc: usize,
+                                    target_args_at: usize|
+                 -> Option<(Option<u32>, u32, Vec<u32, A>)> {
+                    if target_blk == join_blk {
+                        if target_argc != join_argc {
+                            return None;
+                        }
+                        let mut args: Vec<u32, A> = Vec::with_capacity_in(join_argc, alloc);
+                        for k in 0..join_argc {
+                            args.push(at_u32(view.extra, target_args_at + k));
+                        }
+                        Some((None, inner_body, args))
+                    } else {
+                        let arm = target_blk;
+                        if target_argc != 0
+                            || arm == outer_hdr
+                            || arm == outer_body
+                            || arm == outer_latch
+                            || arm == inner_hdr
+                            || arm == inner_body
+                            || arm == join_blk
+                            || view.block_kind(Block(arm)) != BlockKind::Normal
+                            || preds.get(to_idx(arm)).map(Vec::as_slice) != Some(&[inner_body])
+                            || !view.params(Block(arm)).is_empty()
+                        {
+                            return None;
+                        }
+                        let a_term = view.terminator(Block(arm));
+                        if view.op(a_term) != Op::Jump {
+                            return None;
+                        }
+                        let ajat = to_idx(at_u32(view.data, a_term));
+                        if at_u32(view.extra, ajat) != join_blk
+                            || to_idx(at_u32(view.extra, ajat + 1)) != join_argc
+                        {
+                            return None;
+                        }
+                        let mut args: Vec<u32, A> = Vec::with_capacity_in(join_argc, alloc);
+                        for k in 0..join_argc {
+                            args.push(at_u32(view.extra, ajat + 2 + k));
+                        }
+                        Some((Some(arm), arm, args))
+                    }
+                };
+
+                let b_at = to_idx(at_u32(view.data, ib_term));
+                let branch_cond = at_u32(view.extra, b_at);
+                let bt_blk = at_u32(view.extra, b_at + 1);
+                let bt_argc = to_idx(at_u32(view.extra, b_at + 2));
+                let be_at = b_at + 3 + bt_argc;
+                let be_blk = at_u32(view.extra, be_at);
+                let be_argc = to_idx(at_u32(view.extra, be_at + 1));
+
+                let Some((then_arm, t_pred, then_join_args)) = resolve_side(bt_blk, bt_argc, b_at + 3) else {
+                    continue;
+                };
+                let Some((else_arm, e_pred, else_join_args)) = resolve_side(be_blk, be_argc, be_at + 2) else {
+                    continue;
+                };
+                if then_arm.is_some() && then_arm == else_arm {
+                    continue;
+                }
+
+                let back_preds_ok = if let Some(mb) = merge_blk {
+                    if t_pred == e_pred {
+                        preds.get(to_idx(mb)).map(Vec::as_slice) == Some(&[t_pred])
+                    } else {
+                        match preds.get(to_idx(mb)).map(Vec::as_slice) {
+                            Some(&[a, b]) => (a == t_pred && b == e_pred) || (a == e_pred && b == t_pred),
+                            _ => false,
+                        }
+                    }
+                } else if inner_back1 == NONE {
+                    t_pred == inner_body && e_pred == inner_body
+                } else {
+                    (t_pred == inner_back0 && e_pred == inner_back1)
+                        || (t_pred == inner_back1 && e_pred == inner_back0)
+                };
+                if !back_preds_ok {
+                    continue;
+                }
+
+                (
+                    InnerShape::HeaderBranch(InnerBranch {
+                        inner_hdr,
+                        inner_body,
+                        inner_cond: ic,
+                        inner_cond_inverted: inverted,
+                        branch_cond,
+                        then_arm,
+                        else_arm,
+                        merge_blk,
+                        then_join_args,
+                        else_join_args,
+                    }),
+                    next_a,
+                    exit_a,
+                )
+            } else {
+                continue;
+            }
         };
 
         // Verify `outer_latch` predecessors are exclusively `{inner_hdr}` (or `{inner_hdr, outer_body}` with guard).
@@ -1355,7 +1710,7 @@ fn detect_amac_nest<A: Allocator + Copy>(
 
         // Mark exact block membership of the outer loop nest.
         let inner_body_blk = inner_shape.inner_body();
-        let is_inner_blk = |b: u32| b == inner_hdr || b == inner_body_blk;
+        let is_inner_blk = |b: u32| inner_shape.contains_block(b);
         let is_outer_blk = |b: u32| b == outer_hdr || b == outer_body || is_inner_blk(b) || b == outer_latch;
 
         // Validate non-IV outer header parameters are pure associative integer reductions.
@@ -1458,6 +1813,9 @@ fn detect_amac_nest<A: Allocator + Copy>(
         let mut all_load_ptrs: Vec<u32, A> = Vec::new_in(alloc);
         let mut ob_ok = true;
         for inst in ob_start..ob_term {
+            if view.op(inst) == Op::Assume {
+                continue;
+            }
             let is_load = is_nonvolatile_scalar_load(view, inst);
             if !is_load && !is_pure_speculable_op(view, inst) {
                 ob_ok = false;
@@ -1504,7 +1862,7 @@ fn detect_amac_nest<A: Allocator + Copy>(
             }
         }
 
-        // Validate `inner_hdr` and `inner_body` instructions.
+        // Validate `inner_hdr`, `inner_body`, and (for `HeaderBranch`) pure branch arms & merge block.
         let ih_term = view.terminator(Block(inner_hdr));
         let ih_body_start = ih_params.end;
         let ib_range = if inner_body_blk != inner_hdr {
@@ -1513,7 +1871,19 @@ fn detect_amac_nest<A: Allocator + Copy>(
         } else {
             0..0
         };
-        let total_inner_insts = (ih_term - ih_body_start) + (ib_range.end - ib_range.start);
+        let mut extra_branch_insts = 0usize;
+        if let InnerShape::HeaderBranch(ref br) = inner_shape {
+            let ta_len = br.then_arm.map_or(0, |b| view.block(Block(b)).len().saturating_sub(1));
+            let ea_len = br.else_arm.map_or(0, |b| view.block(Block(b)).len().saturating_sub(1));
+            let mb_len = br.merge_blk.map_or(0, |b| {
+                view.terminator(Block(b)).saturating_sub(view.params(Block(b)).end)
+            });
+            if ta_len > MAX_INNER_BRANCH_ARM_INSTS || ea_len > MAX_INNER_BRANCH_ARM_INSTS {
+                continue;
+            }
+            extra_branch_insts = ta_len + ea_len + mb_len;
+        }
+        let total_inner_insts = (ih_term - ih_body_start) + (ib_range.end - ib_range.start) + extra_branch_insts;
         if total_inner_insts == 0 || total_inner_insts > MAX_INNER_INSTS {
             continue;
         }
@@ -1539,6 +1909,9 @@ fn detect_amac_nest<A: Allocator + Copy>(
                                 load_ptrs: &mut Vec<u32, A>,
                                 dep_loads: &mut u32|
          -> bool {
+            if view.op(inst) == Op::Assume {
+                return true;
+            }
             let is_load = is_nonvolatile_scalar_load(view, inst);
             if is_load {
                 if !allow_load {
@@ -1573,7 +1946,7 @@ fn detect_amac_nest<A: Allocator + Copy>(
             ok
         };
 
-        // For `HeaderBody`, `inner_hdr` MUST be 100% pure (zero loads); `inner_body` has the loads.
+        // For `HeaderBody`/`HeaderBranch`, `inner_hdr` MUST be 100% pure (zero loads); `inner_body` has the loads.
         // For `SingleBlock`, `inner_hdr` IS the body and allows loads.
         let hdr_allows_load = matches!(inner_shape, InnerShape::SingleBlock { .. });
         for inst in ih_body_start..ih_term {
@@ -1602,6 +1975,76 @@ fn detect_amac_nest<A: Allocator + Copy>(
                 }
             }
         }
+        if inner_ok
+            && let InnerShape::HeaderBranch(ref br) = inner_shape
+        {
+            let check_arm_val = |v: u32, own_blk: Option<u32>| -> bool {
+                if outer_reductions.iter().any(|r| r.param_inst == v) {
+                    return false;
+                }
+                let vb = at_u32(&inst_block, to_idx(v));
+                is_pre_outer_inv(v)
+                    || vb == outer_body
+                    || vb == inner_hdr
+                    || vb == inner_body_blk
+                    || own_blk == Some(vb)
+                    || v == iv_inst
+            };
+            if !check_arm_val(br.branch_cond, None) {
+                inner_ok = false;
+            }
+            let check_pure_blk = |blk: u32| -> bool {
+                let start = view.params(Block(blk)).end;
+                let end = view.terminator(Block(blk));
+                for inst in start..end {
+                    if view.op(inst) == Op::Assume {
+                        continue;
+                    }
+                    if !is_pure_speculable_op(view, inst) {
+                        return false;
+                    }
+                    let mut ok = true;
+                    for_each_value_use(view, inst, |v| {
+                        if !check_arm_val(v, Some(blk)) {
+                            ok = false;
+                        }
+                    });
+                    if !ok {
+                        return false;
+                    }
+                }
+                true
+            };
+            if inner_ok && let Some(ta) = br.then_arm && !check_pure_blk(ta) {
+                inner_ok = false;
+            }
+            if inner_ok && let Some(ea) = br.else_arm && !check_pure_blk(ea) {
+                inner_ok = false;
+            }
+            if inner_ok
+                && (!br.then_join_args.iter().all(|&v| check_arm_val(v, br.then_arm))
+                    || !br.else_join_args.iter().all(|&v| check_arm_val(v, br.else_arm)))
+            {
+                inner_ok = false;
+            }
+            if inner_ok {
+                let join_params = view.params(Block(br.merge_blk.unwrap_or(inner_hdr)));
+                for k in 0..join_params.len() {
+                    if at_u32(&br.then_join_args, k) != at_u32(&br.else_join_args, k)
+                        && !is_latchable_scalar_ty(Ty(at_u16(view.tys, join_params.start + k)))
+                    {
+                        inner_ok = false;
+                        break;
+                    }
+                }
+            }
+            if inner_ok
+                && let Some(mb) = br.merge_blk
+                && (!check_pure_blk(mb) || !inner_next_args.iter().all(|&v| check_arm_val(v, Some(mb))))
+            {
+                inner_ok = false;
+            }
+        }
         // Require at least one inner-loop-dependent `Op::Load` (pointer-chasing / indexed lookup!).
         if !inner_ok || inner_dependent_loads == 0 {
             continue;
@@ -1619,7 +2062,7 @@ fn detect_amac_nest<A: Allocator + Copy>(
         let mut ol_ok = true;
         for inst in ol_start..ol_term {
             let inst32 = to_u32(inst);
-            if inst32 == iv_next_inst {
+            if view.op(inst) == Op::Assume || inst32 == iv_next_inst {
                 continue;
             }
             if matches!(outer_shape, OuterShape::Rotated { .. }) && inst == outer_cond_inst {
@@ -1735,37 +2178,76 @@ fn detect_amac_nest<A: Allocator + Copy>(
                 set_at(&mut inner_inst_uniform, i, true);
             }
         }
-        for _ in 0..(n_ip + 2) {
+        let propagate_uniform = |param_u: &[bool], inst_u: &mut [bool]| {
             for p in 0..n_ip {
-                set_at(&mut inner_inst_uniform, ih_params.start + p, at_bool(&inner_param_uniform, p));
+                set_at(inst_u, ih_params.start + p, at_bool(param_u, p));
             }
-            for inst in ih_body_start..ih_term {
-                let mut u = view.op(inst) != Op::Load;
-                for_each_value_use(view, inst, |v| {
-                    if !at_bool(&inner_inst_uniform, to_idx(v)) {
-                        u = false;
+            let prop_range = |start: usize, end: usize, iu: &mut [bool]| {
+                for inst in start..end {
+                    if view.op(inst) == Op::Assume {
+                        continue;
                     }
-                });
-                set_at(&mut inner_inst_uniform, inst, u);
-            }
-            if inner_body_blk != inner_hdr {
-                for inst in ib_range.start..ib_range.end {
                     let mut u = view.op(inst) != Op::Load;
                     for_each_value_use(view, inst, |v| {
-                        if !at_bool(&inner_inst_uniform, to_idx(v)) {
+                        if !at_bool(iu, to_idx(v)) {
                             u = false;
                         }
                     });
-                    set_at(&mut inner_inst_uniform, inst, u);
+                    set_at(iu, inst, u);
+                }
+            };
+            prop_range(ih_body_start, ih_term, inst_u);
+            if inner_body_blk != inner_hdr {
+                prop_range(ib_range.start, ib_range.end, inst_u);
+            }
+            if let InnerShape::HeaderBranch(ref br) = inner_shape {
+                if let Some(ta) = br.then_arm {
+                    let r = view.block(Block(ta));
+                    prop_range(r.start, r.end.saturating_sub(1), inst_u);
+                }
+                if let Some(ea) = br.else_arm {
+                    let r = view.block(Block(ea));
+                    prop_range(r.start, r.end.saturating_sub(1), inst_u);
+                }
+                if let Some(mb) = br.merge_blk {
+                    let mb_params = view.params(Block(mb));
+                    let bc_u = at_bool(inst_u, to_idx(br.branch_cond));
+                    for k in 0..mb_params.len() {
+                        let ta_v = at_u32(&br.then_join_args, k);
+                        let ea_v = at_u32(&br.else_join_args, k);
+                        let u = if ta_v == ea_v {
+                            at_bool(inst_u, to_idx(ta_v))
+                        } else {
+                            bc_u && at_bool(inst_u, to_idx(ta_v)) && at_bool(inst_u, to_idx(ea_v))
+                        };
+                        set_at(inst_u, mb_params.start + k, u);
+                    }
+                    prop_range(mb_params.end, view.terminator(Block(mb)), inst_u);
                 }
             }
+        };
+        for _ in 0..(n_ip + 2) {
+            propagate_uniform(&inner_param_uniform, &mut inner_inst_uniform);
             let mut changed = false;
             for p in 0..n_ip {
                 if !at_bool(&inner_param_uniform, p) {
                     continue;
                 }
                 let init_u = at_bool(&inner_inst_uniform, to_idx(at_u32(&inner_init_args, p)));
-                let next_u = at_bool(&inner_inst_uniform, to_idx(at_u32(&inner_next_args, p)));
+                let next_u = match &inner_shape {
+                    InnerShape::HeaderBranch(br) if br.merge_blk.is_none() => {
+                        let ta_v = at_u32(&br.then_join_args, p);
+                        let ea_v = at_u32(&br.else_join_args, p);
+                        if ta_v == ea_v {
+                            at_bool(&inner_inst_uniform, to_idx(ta_v))
+                        } else {
+                            at_bool(&inner_inst_uniform, to_idx(br.branch_cond))
+                                && at_bool(&inner_inst_uniform, to_idx(ta_v))
+                                && at_bool(&inner_inst_uniform, to_idx(ea_v))
+                        }
+                    }
+                    _ => at_bool(&inner_inst_uniform, to_idx(at_u32(&inner_next_args, p))),
+                };
                 if !(init_u && next_u) {
                     set_at(&mut inner_param_uniform, p, false);
                     changed = true;
@@ -1776,33 +2258,9 @@ fn detect_amac_nest<A: Allocator + Copy>(
             }
         }
         // Final propagation pass so `inner_inst_uniform` matches final `inner_param_uniform`.
-        for p in 0..n_ip {
-            set_at(&mut inner_inst_uniform, ih_params.start + p, at_bool(&inner_param_uniform, p));
-        }
-        for inst in ih_body_start..ih_term {
-            let mut u = view.op(inst) != Op::Load;
-            for_each_value_use(view, inst, |v| {
-                if !at_bool(&inner_inst_uniform, to_idx(v)) {
-                    u = false;
-                }
-            });
-            set_at(&mut inner_inst_uniform, inst, u);
-        }
-        if inner_body_blk != inner_hdr {
-            for inst in ib_range.start..ib_range.end {
-                let mut u = view.op(inst) != Op::Load;
-                for_each_value_use(view, inst, |v| {
-                    if !at_bool(&inner_inst_uniform, to_idx(v)) {
-                        u = false;
-                    }
-                });
-                set_at(&mut inner_inst_uniform, inst, u);
-            }
-        }
+        propagate_uniform(&inner_param_uniform, &mut inner_inst_uniform);
 
-        let inner_cond = match inner_shape {
-            InnerShape::SingleBlock { inner_cond, .. } | InnerShape::HeaderBody { inner_cond, .. } => inner_cond,
-        };
+        let inner_cond = inner_shape.inner_cond();
         let inner_is_uniform = at_bool(&inner_inst_uniform, to_idx(inner_cond));
 
         // For non-uniform `SingleBlock` inner loops, collect any exit values that need latching.
@@ -1851,11 +2309,38 @@ fn detect_amac_nest<A: Allocator + Copy>(
             }
         };
         for inst in ih_body_start..ih_term {
-            for_each_value_use(view, inst, &mut note_live);
+            if view.op(inst) != Op::Assume {
+                for_each_value_use(view, inst, &mut note_live);
+            }
         }
         if inner_body_blk != inner_hdr {
             for inst in ib_range.start..ib_range.end {
-                for_each_value_use(view, inst, &mut note_live);
+                if view.op(inst) != Op::Assume {
+                    for_each_value_use(view, inst, &mut note_live);
+                }
+            }
+        }
+        if let InnerShape::HeaderBranch(ref br) = inner_shape {
+            note_live(br.branch_cond);
+            for opt_b in [br.then_arm, br.else_arm, br.merge_blk] {
+                if let Some(blk) = opt_b {
+                    let start = view.params(Block(blk)).end;
+                    let end = view.terminator(Block(blk));
+                    for inst in start..end {
+                        if view.op(inst) != Op::Assume {
+                            for_each_value_use(view, inst, &mut note_live);
+                        }
+                    }
+                }
+            }
+            for &v in &br.then_join_args {
+                note_live(v);
+            }
+            for &v in &br.else_join_args {
+                note_live(v);
+            }
+            for &v in &inner_next_args {
+                note_live(v);
             }
         }
         let n_uniform_params = (0..n_ip).filter(|&p| at_bool(&inner_param_uniform, p)).count();
@@ -1880,6 +2365,65 @@ fn detect_amac_nest<A: Allocator + Copy>(
             continue;
         }
 
+        // If `iv_next_inst` lives in `outer_body` and is unused before `outer_latch`, skip emitting
+        // K redundant step instructions in `b_amac_outer_body` (it is mapped in `b_amac_outer_latch`).
+        let mut skip_iv_next_in_ob = at_u32(&inst_block, to_idx(iv_next_inst)) == outer_body;
+        if skip_iv_next_in_ob {
+            for &oi in &outer_body_insts {
+                if oi == iv_next_inst {
+                    continue;
+                }
+                for_each_value_use(view, to_idx(oi), |v| {
+                    if v == iv_next_inst {
+                        skip_iv_next_in_ob = false;
+                    }
+                });
+            }
+            for_each_value_use(view, ob_term, |v| {
+                if v == iv_next_inst {
+                    skip_iv_next_in_ob = false;
+                }
+            });
+            for inst in ih_body_start..=ih_term {
+                if view.op(inst) == Op::Assume {
+                    continue;
+                }
+                for_each_value_use(view, inst, |v| {
+                    if v == iv_next_inst {
+                        skip_iv_next_in_ob = false;
+                    }
+                });
+            }
+            if inner_body_blk != inner_hdr {
+                for inst in view.block(Block(inner_body_blk)) {
+                    if view.op(inst) == Op::Assume {
+                        continue;
+                    }
+                    for_each_value_use(view, inst, |v| {
+                        if v == iv_next_inst {
+                            skip_iv_next_in_ob = false;
+                        }
+                    });
+                }
+            }
+            if let InnerShape::HeaderBranch(ref br) = inner_shape {
+                for opt_b in [br.then_arm, br.else_arm, br.merge_blk] {
+                    if let Some(blk) = opt_b {
+                        for inst in view.block(Block(blk)) {
+                            if view.op(inst) == Op::Assume {
+                                continue;
+                            }
+                            for_each_value_use(view, inst, |v| {
+                                if v == iv_next_inst {
+                                    skip_iv_next_in_ob = false;
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
         return Some(AmacPlan {
             preheader,
             pre_edge,
@@ -1888,9 +2432,9 @@ fn detect_amac_nest<A: Allocator + Copy>(
             iv_pos,
             iv_inst,
             iv_next_inst,
-            iv_ty,
+            iv_kind,
             bound,
-            signed_iv,
+            skip_iv_next_in_ob,
             outer_reductions,
             outer_body_insts,
             outer_body_inv,
@@ -2191,6 +2735,7 @@ fn emit_lockstep_inner_waves<A: Allocator + Copy>(
     lane_maps: &mut [Vec<u32, A>],
     func: &mut Func<A>,
     alloc: A,
+    mut on_lane_post: impl FnMut(usize, &mut Vec<u32, A>, &mut Func<A>),
 ) -> u32 {
     let count = inst_end.saturating_sub(inst_start);
     let mut wave_of = filled(count, 0u32, &alloc);
@@ -2199,6 +2744,9 @@ fn emit_lockstep_inner_waves<A: Allocator + Copy>(
 
     for idx in 0..count {
         let inst = inst_start + idx;
+        if view.op(inst) == Op::Assume {
+            continue;
+        }
         let mut w = 0u32;
         for_each_value_use(view, inst, |v| {
             let vi = to_idx(v);
@@ -2228,6 +2776,9 @@ fn emit_lockstep_inner_waves<A: Allocator + Copy>(
     for rev in 0..count {
         let idx = count - 1 - rev;
         let inst = inst_start + idx;
+        if view.op(inst) == Op::Assume {
+            continue;
+        }
         let my_w = if view.op(inst) == Op::Load {
             let lw = at_u32(&wave_of, idx);
             set_at(&mut feeds_wave, idx, lw);
@@ -2251,6 +2802,11 @@ fn emit_lockstep_inner_waves<A: Allocator + Copy>(
 
     let mut prefetches_emitted = 0u32;
     let mut emitted = filled(count, false, &alloc);
+    for idx in 0..count {
+        if view.op(inst_start + idx) == Op::Assume {
+            set_at(&mut emitted, idx, true);
+        }
+    }
 
     if has_load {
         for w in 0..=max_load_wave {
@@ -2375,15 +2931,16 @@ fn emit_lockstep_inner_waves<A: Allocator + Copy>(
         set_at(&mut emitted, idx, true);
     }
     for lane in 0..k_width {
-        for idx in 0..count {
-            let inst = inst_start + idx;
-            if at_bool(&emitted, idx) {
-                continue;
-            }
-            if let Some(lm) = lane_maps.get_mut(lane) {
+        if let Some(lm) = lane_maps.get_mut(lane) {
+            for idx in 0..count {
+                let inst = inst_start + idx;
+                if at_bool(&emitted, idx) {
+                    continue;
+                }
                 let mapped = emit_lane_inst(view, inst, lm, val_map, func);
                 set_at(lm, inst, mapped);
             }
+            on_lane_post(lane, lm, func);
         }
     }
 
@@ -2449,7 +3006,8 @@ fn rewrite_amac_nest<A: Allocator + Copy>(
     let ol_params = view.params(Block(plan.outer_latch));
     let n_olp = ol_params.len();
 
-    let has_inner_body_blk = matches!(plan.inner_shape, InnerShape::HeaderBody { .. });
+    let has_inner_body_blk =
+        matches!(plan.inner_shape, InnerShape::HeaderBody { .. } | InnerShape::HeaderBranch(_));
     let has_tail_check_blk = matches!(plan.outer_shape, OuterShape::Rotated { .. });
     let num_new_blocks: u32 = 4 + u32::from(has_inner_body_blk) + u32::from(has_tail_check_blk);
 
@@ -2515,12 +3073,34 @@ fn rewrite_amac_nest<A: Allocator + Copy>(
         entry_params_new.push(push_param(&mut func, ty));
     }
     let q0 = at_u32(&entry_params_new, plan.iv_pos);
-    let lt_cond = if plan.signed_iv { IntCond::Slt } else { IntCond::Ult };
-    let is_lt = push_icmp(&mut func, lt_cond, q0, bound_new);
-    let diff = push_bin(&mut func, Op::Sub, Flags::NONE, plan.iv_ty, bound_new, q0);
-    let k_c_entry = push_iconst(&mut func, plan.iv_ty, u64::from(to_u32(k_width)));
-    let ge_k = push_icmp(&mut func, IntCond::Uge, diff, k_c_entry);
-    let mut has_k = push_bin(&mut func, Op::And, Flags::NONE, Ty::I1, is_lt, ge_k);
+    let mut ptr_end_minus_k = NONE;
+    let mut has_k = match plan.iv_kind {
+        OuterIvKind::Counted { ty, signed } => {
+            let lt_cond = if signed { IntCond::Slt } else { IntCond::Ult };
+            let is_lt = push_icmp(&mut func, lt_cond, q0, bound_new);
+            let diff = push_bin(&mut func, Op::Sub, Flags::NONE, ty, bound_new, q0);
+            let kc = push_iconst(&mut func, ty, u64::from(to_u32(k_width)));
+            let ge_k = push_icmp(&mut func, IntCond::Uge, diff, kc);
+            push_bin(&mut func, Op::And, Flags::NONE, Ty::I1, is_lt, ge_k)
+        }
+        OuterIvKind::Pointer { stride } => {
+            // Check `q0 + k_width * stride <= bound_new` without `Op::PtrAddr` and without ever
+            // comparing an out-of-bounds pointer: step at most `k_width` times while `p < bound_new`.
+            let k_bytes = u64::from(to_u32(k_width)).saturating_mul(stride);
+            let neg_k_bytes = push_iconst(&mut func, Ty::I64, (0u64).wrapping_sub(k_bytes));
+            ptr_end_minus_k = push_bin(&mut func, Op::PtrAdd, Flags::NONE, Ty::PTR, bound_new, neg_k_bytes);
+            let step_c = push_iconst(&mut func, Ty::I64, stride);
+            let mut p = q0;
+            let mut ok = push_iconst(&mut func, Ty::I1, 1);
+            for _ in 0..k_width {
+                let lt = push_icmp(&mut func, IntCond::Ult, p, bound_new);
+                ok = push_bin(&mut func, Op::And, Flags::NONE, Ty::I1, ok, lt);
+                let p_step = push_bin(&mut func, Op::PtrAdd, Flags::NONE, Ty::PTR, p, step_c);
+                p = push_select(&mut func, Ty::PTR, ok, p_step, p);
+            }
+            ok
+        }
+    };
     // For variable-trip masked AMAC (e.g. `while lo < hi` binary search), skip AMAC overhead when
     // the searched table fits inside L1/L2 cache (guided by `opts.min_var_trip_bound`).
     if !plan.inner_is_uniform && opts.min_var_trip_bound > 0 {
@@ -2559,8 +3139,17 @@ fn rewrite_amac_nest<A: Allocator + Copy>(
     let mut q_lanes: Vec<u32, A> = Vec::with_capacity_in(k_width, alloc);
     q_lanes.push(q_cur);
     for lane in 1..k_width {
-        let off_c = push_iconst(&mut func, plan.iv_ty, u64::from(to_u32(lane)));
-        q_lanes.push(push_bin(&mut func, Op::Add, Flags::NONE, plan.iv_ty, q_cur, off_c));
+        match plan.iv_kind {
+            OuterIvKind::Counted { ty, .. } => {
+                let off_c = push_iconst(&mut func, ty, u64::from(to_u32(lane)));
+                q_lanes.push(push_bin(&mut func, Op::Add, Flags::NONE, ty, q_cur, off_c));
+            }
+            OuterIvKind::Pointer { stride } => {
+                let off_bytes = u64::from(to_u32(lane)).saturating_mul(stride);
+                let off_c = push_iconst(&mut func, Ty::I64, off_bytes);
+                q_lanes.push(push_bin(&mut func, Op::PtrAdd, Flags::NONE, Ty::PTR, q_cur, off_c));
+            }
+        }
     }
 
     let mut lane_maps: Vec<Vec<u32, A>, A> = Vec::with_capacity_in(k_width, alloc);
@@ -2571,6 +3160,9 @@ fn rewrite_amac_nest<A: Allocator + Copy>(
     }
 
     for (oi, &inst32) in plan.outer_body_insts.iter().enumerate() {
+        if plan.skip_iv_next_in_ob && inst32 == plan.iv_next_inst {
+            continue;
+        }
         let inst = to_idx(inst32);
         if at_bool(&plan.outer_body_inv, oi) {
             let mapped = match lane_maps.first() {
@@ -2581,9 +3173,39 @@ fn rewrite_amac_nest<A: Allocator + Copy>(
                 set_at(lm, inst, mapped);
             }
         } else {
-            for lm in lane_maps.iter_mut() {
-                let mapped = emit_lane_inst(view, inst, lm, &val_map, &mut func);
-                set_at(lm, inst, mapped);
+            // For pointer-IV outer loops loading directly from `[p + off]`, emit contiguous
+            // `[q_cur + off + lane * stride]` loads so ARM64 `isel` pairs them into `ldp`.
+            let mut emitted_direct_ptr_loads = false;
+            if let OuterIvKind::Pointer { stride } = plan.iv_kind
+                && view.op(inst) == Op::Load
+            {
+                let lat = to_idx(at_u32(view.data, inst));
+                let orig_ptr = at_u32(view.extra, lat);
+                let orig_off = at_u32(view.extra, lat + 1).cast_signed();
+                if orig_ptr == plan.iv_inst {
+                    let all_fit = (0..k_width).all(|lane| {
+                        let off_bytes = u64::from(to_u32(lane)).saturating_mul(stride);
+                        i32::try_from(off_bytes).ok().and_then(|d| orig_off.checked_add(d)).is_some()
+                    });
+                    if all_fit {
+                        let ty = Ty(at_u16(view.tys, inst));
+                        let attr = at_u32(view.attrs, inst);
+                        for (lane, lm) in lane_maps.iter_mut().enumerate() {
+                            let off_bytes = u64::from(to_u32(lane)).saturating_mul(stride);
+                            let delta = i32::try_from(off_bytes).unwrap_or(0);
+                            let total_off = orig_off.wrapping_add(delta);
+                            let ld = push_load(&mut func, ty, q_cur, total_off, attr);
+                            set_at(lm, inst, ld);
+                        }
+                        emitted_direct_ptr_loads = true;
+                    }
+                }
+            }
+            if !emitted_direct_ptr_loads {
+                for lm in lane_maps.iter_mut() {
+                    let mapped = emit_lane_inst(view, inst, lm, &val_map, &mut func);
+                    set_at(lm, inst, mapped);
+                }
             }
         }
     }
@@ -2641,12 +3263,20 @@ fn rewrite_amac_nest<A: Allocator + Copy>(
         push_jump(&mut func, b_amac_inner_hdr, &inner_init_packed);
     }
 
-    // 4. Emit K-way inner loop (`HeaderBody` or `SingleBlock`).
+    // 4. Emit K-way inner loop (`HeaderBody`, `HeaderBranch`, or `SingleBlock`).
     let mut prefetches_inserted = 0u32;
     let ih_term = view.terminator(Block(inner_hdr));
 
-    match plan.inner_shape {
-        InnerShape::HeaderBody { inner_body, inner_cond, inner_cond_inverted, .. } => {
+    match &plan.inner_shape {
+        InnerShape::HeaderBody { inner_body, inner_cond, inner_cond_inverted, .. }
+        | InnerShape::HeaderBranch(InnerBranch { inner_body, inner_cond, inner_cond_inverted, .. }) => {
+            let inner_body = *inner_body;
+            let inner_cond = *inner_cond;
+            let inner_cond_inverted = *inner_cond_inverted;
+            let branch_opt = match &plan.inner_shape {
+                InnerShape::HeaderBranch(br) => Some(br),
+                _ => None,
+            };
             // `b_amac_inner_hdr`: ZERO `active` block params!
             let _ = begin_block(&mut func, BlockKind::Normal);
             let mut inner_nu_params: Vec<Vec<u32, A>, A> = Vec::with_capacity_in(n_ip, alloc);
@@ -2672,6 +3302,9 @@ fn rewrite_amac_nest<A: Allocator + Copy>(
 
             // Evaluate pure `inner_hdr` instructions (uniform once, non-uniform across `K` lanes).
             for inst in ih_params.end..ih_term {
+                if view.op(inst) == Op::Assume {
+                    continue;
+                }
                 if at_bool(&plan.inner_inst_uniform, inst) {
                     let mapped = match lane_maps.first() {
                         Some(lm) => emit_lane_inst(view, inst, lm, &val_map, &mut func),
@@ -2735,9 +3368,16 @@ fn rewrite_amac_nest<A: Allocator + Copy>(
             }
             push_br(&mut func, any_active, b_amac_inner_body, &[], b_amac_outer_latch, &latch_exit_packed);
 
-            // `b_amac_inner_body`: lockstep load-wave execution + masked state freeze!
+            // `b_amac_inner_body`: lockstep load-wave execution + branch-to-select + masked state freeze!
             let _ = begin_block(&mut func, BlockKind::Normal);
             let ib_range = view.block(Block(inner_body));
+            let direct_branch_to_hdr = branch_opt.is_some_and(|br| br.merge_blk.is_none());
+            let mut branch_next: Vec<Vec<u32, A>, A> = Vec::with_capacity_in(if direct_branch_to_hdr { n_ip } else { 0 }, alloc);
+            if direct_branch_to_hdr {
+                for _ in 0..n_ip {
+                    branch_next.push(filled(k_width, 0u32, &alloc));
+                }
+            }
             prefetches_inserted += emit_lockstep_inner_waves(
                 view,
                 ib_range.start,
@@ -2751,29 +3391,86 @@ fn rewrite_amac_nest<A: Allocator + Copy>(
                 &mut lane_maps,
                 &mut func,
                 alloc,
+                |lane, lm, f| {
+                    let Some(br) = branch_opt else {
+                        return;
+                    };
+                    for opt_arm in [br.then_arm, br.else_arm] {
+                        if let Some(arm) = opt_arm {
+                            let r = view.block(Block(arm));
+                            for inst in r.start..r.end.saturating_sub(1) {
+                                if view.op(inst) == Op::Assume {
+                                    continue;
+                                }
+                                let mapped = emit_lane_inst(view, inst, lm, &val_map, f);
+                                set_at(lm, inst, mapped);
+                            }
+                        }
+                    }
+                    let bcond = resolve_lane_val(br.branch_cond, lm, &val_map);
+                    if let Some(mb) = br.merge_blk {
+                        let mb_params = view.params(Block(mb));
+                        for k in 0..mb_params.len() {
+                            let tv = resolve_lane_val(at_u32(&br.then_join_args, k), lm, &val_map);
+                            let ev = resolve_lane_val(at_u32(&br.else_join_args, k), lm, &val_map);
+                            let sel = if tv == ev {
+                                tv
+                            } else {
+                                let ty = Ty(at_u16(view.tys, mb_params.start + k));
+                                push_select(f, ty, bcond, tv, ev)
+                            };
+                            set_at(lm, mb_params.start + k, sel);
+                        }
+                        let mb_term = view.terminator(Block(mb));
+                        for inst in mb_params.end..mb_term {
+                            if view.op(inst) == Op::Assume {
+                                continue;
+                            }
+                            let mapped = emit_lane_inst(view, inst, lm, &val_map, f);
+                            set_at(lm, inst, mapped);
+                        }
+                    } else {
+                        for p in 0..n_ip {
+                            let tv = resolve_lane_val(at_u32(&br.then_join_args, p), lm, &val_map);
+                            let ev = resolve_lane_val(at_u32(&br.else_join_args, p), lm, &val_map);
+                            let nv = if tv == ev {
+                                tv
+                            } else {
+                                let ty = Ty(at_u16(view.tys, ih_params.start + p));
+                                push_select(f, ty, bcond, tv, ev)
+                            };
+                            if let Some(row) = branch_next.get_mut(p) {
+                                set_at(row, lane, nv);
+                            }
+                        }
+                    }
+                },
             );
 
             // Pack back-edge state updates (freeze inactive lanes with `select(keep[k], next, cur)`).
-            let mut back_packed: Vec<u32, A> = Vec::new_in(alloc);
-            for p in 0..n_ip {
-                let orig_next = at_u32(&plan.inner_next_args, p);
-                let ty = Ty(at_u16(view.tys, ih_params.start + p));
-                if at_bool(&plan.inner_param_uniform, p) {
-                    let nv = match lane_maps.first() {
+            let resolve_next = |p: usize, lane: usize| -> u32 {
+                if direct_branch_to_hdr {
+                    branch_next.get(p).map_or(0, |row| at_u32(row, lane))
+                } else {
+                    let orig_next = at_u32(&plan.inner_next_args, p);
+                    match lane_maps.get(lane) {
                         Some(lm) => resolve_lane_val(orig_next, lm, &val_map),
                         None => 0,
-                    };
-                    back_packed.push(nv);
+                    }
+                }
+            };
+            let mut back_packed: Vec<u32, A> = Vec::new_in(alloc);
+            for p in 0..n_ip {
+                let ty = Ty(at_u16(view.tys, ih_params.start + p));
+                if at_bool(&plan.inner_param_uniform, p) {
+                    back_packed.push(resolve_next(p, 0));
                 } else if plan.inner_is_uniform {
-                    for lm in lane_maps.iter() {
-                        back_packed.push(resolve_lane_val(orig_next, lm, &val_map));
+                    for lane in 0..k_width {
+                        back_packed.push(resolve_next(p, lane));
                     }
                 } else {
                     for lane in 0..k_width {
-                        let nv = match lane_maps.get(lane) {
-                            Some(lm) => resolve_lane_val(orig_next, lm, &val_map),
-                            None => 0,
-                        };
+                        let nv = resolve_next(p, lane);
                         let cur_v = inner_nu_params.get(p).map_or(0, |v| at_u32(v, lane));
                         let act = at_u32(&keep_lanes, lane);
                         back_packed.push(push_select(&mut func, ty, act, nv, cur_v));
@@ -2783,6 +3480,8 @@ fn rewrite_amac_nest<A: Allocator + Copy>(
             push_jump(&mut func, b_amac_inner_hdr, &back_packed);
         }
         InnerShape::SingleBlock { inner_cond, inner_cond_inverted, .. } => {
+            let inner_cond = *inner_cond;
+            let inner_cond_inverted = *inner_cond_inverted;
             let _ = begin_block(&mut func, BlockKind::Normal);
             let mut inner_nu_params: Vec<Vec<u32, A>, A> = Vec::with_capacity_in(n_ip, alloc);
             for p in 0..n_ip {
@@ -2834,6 +3533,7 @@ fn rewrite_amac_nest<A: Allocator + Copy>(
                 &mut lane_maps,
                 &mut func,
                 alloc,
+                |_, _, _| {},
             );
 
             if plan.inner_is_uniform {
@@ -3007,9 +3707,21 @@ fn rewrite_amac_nest<A: Allocator + Copy>(
         }
     }
 
-    // Advance `q_next = q_cur + K` up front so any `outer_latch` reference to `iv_next_inst` maps cleanly.
-    let k_c_latch = push_iconst(&mut func, plan.iv_ty, u64::from(to_u32(k_width)));
-    let q_next = push_bin(&mut func, Op::Add, Flags::NONE, plan.iv_ty, q_cur, k_c_latch);
+    // Advance `q_next = q_cur + K` (or `ptr_add(p_cur, K * stride)`) up front so any `outer_latch`
+    // reference to `iv_next_inst` maps cleanly.
+    let (k_c_latch, q_next, diff_ty) = match plan.iv_kind {
+        OuterIvKind::Counted { ty, .. } => {
+            let kc = push_iconst(&mut func, ty, u64::from(to_u32(k_width)));
+            let qn = push_bin(&mut func, Op::Add, Flags::NONE, ty, q_cur, kc);
+            (kc, qn, ty)
+        }
+        OuterIvKind::Pointer { stride } => {
+            let k_bytes = u64::from(to_u32(k_width)).saturating_mul(stride);
+            let kc = push_iconst(&mut func, Ty::I64, k_bytes);
+            let qn = push_bin(&mut func, Op::PtrAdd, Flags::NONE, Ty::PTR, q_cur, kc);
+            (kc, qn, Ty::I64)
+        }
+    };
     for lane in 0..k_width {
         let next_lane_q = if lane + 1 < k_width {
             at_u32(&q_lanes, lane + 1)
@@ -3047,8 +3759,20 @@ fn rewrite_amac_nest<A: Allocator + Copy>(
         red_next_vals.push(acc_next);
     }
 
-    let rem = push_bin(&mut func, Op::Sub, Flags::NONE, plan.iv_ty, bound_new, q_next);
-    let more_k = push_icmp(&mut func, IntCond::Uge, rem, k_c_latch);
+    let (rem_opt, more_k) = match plan.iv_kind {
+        OuterIvKind::Counted { ty, .. } => {
+            let rem = push_bin(&mut func, Op::Sub, Flags::NONE, ty, bound_new, q_next);
+            let mk = push_icmp(&mut func, IntCond::Uge, rem, k_c_latch);
+            (Some(rem), mk)
+        }
+        OuterIvKind::Pointer { .. } => {
+            // Since `b_amac_outer_body` is only reached when `bound_new - q0 >= k_bytes`,
+            // `ptr_end_minus_k` lies in `[q0, bound_new]` and `q_next <= bound_new`, so this
+            // single comparison is both wrap-free and strictly within provenance bounds.
+            let mk = push_icmp(&mut func, IntCond::Ule, q_next, ptr_end_minus_k);
+            (None, mk)
+        }
+    };
 
     match plan.outer_shape {
         OuterShape::HeaderBody { .. } => {
@@ -3066,8 +3790,13 @@ fn rewrite_amac_nest<A: Allocator + Copy>(
 
             // 6. Emit `b_amac_tail_check`: skip scalar do-while tail completely when `rem == 0`.
             let _ = begin_block(&mut func, BlockKind::Normal);
-            let zero_c = push_iconst(&mut func, plan.iv_ty, 0);
-            let has_tail = push_icmp(&mut func, IntCond::Ne, rem, zero_c);
+            let has_tail = match rem_opt {
+                Some(rem) => {
+                    let zero_c = push_iconst(&mut func, diff_ty, 0);
+                    push_icmp(&mut func, IntCond::Ne, rem, zero_c)
+                }
+                None => push_icmp(&mut func, IntCond::Ult, q_next, bound_new),
+            };
             let mut mapped_exit_args: Vec<u32, A> = Vec::with_capacity_in(outer_exit_args.len(), alloc);
             for &ev in outer_exit_args {
                 let mapped = if ev == plan.iv_next_inst {
@@ -3741,5 +4470,189 @@ mod tests {
 
         let out = interleave_amac_loops(aliased.view(), AmacOpts::arm64(), TestHeap).unwrap();
         assert_eq!(out.stats.nests_interleaved, 0, "must NOT interleave when output store may alias inputs");
+    }
+
+    #[derive(Clone, Copy)]
+    enum InnerBsearchForm {
+        IfConverted,
+        BranchDirectToHdr,
+        BranchViaMerge,
+    }
+
+    /// Builds exact post-inlining, post-BCE `bsearch_batch`:
+    /// - Pointer-IV outer loop over `queries` (`p != end`, `p_next = ptr_add(p, 8)` in `outer_body`,
+    ///   `q = load i64 [p]`),
+    /// - `mid = lo + ((hi - lo) >> 1)` inner binary search (if-converted or branching),
+    /// - `acc = acc.wrapping_add(lo)` reduction in `outer_latch`.
+    fn build_ptr_iv_bsearch_batch<A: Allocator + Copy>(
+        table: &[u64],
+        queries: &[u64],
+        inner_form: InnerBsearchForm,
+        alloc: A,
+    ) -> Func<A> {
+        let mut b = Builder::<A, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let table_bytes = (table.len().max(1) * 8) as u32;
+        let query_bytes = (queries.len().max(1) * 8) as u32;
+        let arr_slot = b.slot(table_bytes, 3, SlotKind::Temp);
+        let qry_slot = b.slot(query_bytes, 3, SlotKind::Temp);
+
+        let [entry, h_q, b_q, h_bs, b_bs, end_bs, exit_all] =
+            [(); 7].map(|_| b.create_block(BlockKind::Normal));
+        let then_bs = b.create_block(BlockKind::Normal);
+        let else_bs = b.create_block(BlockKind::Normal);
+        let merge_bs = b.create_block(BlockKind::Normal);
+
+        b.begin(entry);
+        let n_q = b.param(Ty::I64);
+        let n_arr = b.param(Ty::I64);
+        let arr_p = b.slot_addr(arr_slot);
+        let qry_p = b.slot_addr(qry_slot);
+        for (k, &v) in table.iter().enumerate() {
+            let cv = b.iconst(Ty::I64, u128::from(v));
+            b.store(Flags::NONE, cv, arr_p, (k * 8) as i32, MemAttrs::aligned(3));
+        }
+        for (k, &v) in queries.iter().enumerate() {
+            let cv = b.iconst(Ty::I64, u128::from(v));
+            b.store(Flags::NONE, cv, qry_p, (k * 8) as i32, MemAttrs::aligned(3));
+        }
+        let zero = b.iconst(Ty::I64, 0);
+        let one = b.iconst(Ty::I64, 1);
+        let three = b.iconst(Ty::I64, 3);
+        let eight = b.iconst(Ty::I64, 8);
+        let qry_bytes_v = b.binary(Op::Shl, Flags::NONE, n_q, three);
+        let qry_end = b.ptr_add(Flags::NONE, qry_p, qry_bytes_v);
+        b.jump((h_q, &[qry_p, zero]));
+
+        // Pointer-IV outer header: `if p == qry_end { break; }`
+        b.begin(h_q);
+        let p = b.param(Ty::PTR);
+        let acc = b.param(Ty::I64);
+        let done = b.icmp(IntCond::Eq, p, qry_end);
+        b.br(Flags::NONE, done, (exit_all, &[acc]), (b_q, &[]));
+
+        // `slice::iter::next` body: advance `p_next = ptr_add(p, 8)` and load `q = *p`.
+        b.begin(b_q);
+        let p_next = b.ptr_add(Flags::NONE, p, eight);
+        let key = b.load(Ty::I64, Flags::NONE, p, 0, MemAttrs::aligned(3));
+        b.jump((h_bs, &[zero, n_arr]));
+
+        b.begin(h_bs);
+        let lo = b.param(Ty::I64);
+        let hi = b.param(Ty::I64);
+        let keep_bs = b.icmp(IntCond::Ult, lo, hi);
+        b.br(Flags::NONE, keep_bs, (b_bs, &[]), (end_bs, &[lo]));
+
+        b.begin(b_bs);
+        let diff = b.binary(Op::Sub, Flags::NONE, hi, lo);
+        let half = b.binary(Op::Lshr, Flags::NONE, diff, one);
+        let mid = b.binary(Op::Add, Flags::NONE, lo, half);
+        let m_off = b.binary(Op::Shl, Flags::NONE, mid, three);
+        let mp = b.ptr_add(Flags::NONE, arr_p, m_off);
+        let mv = b.load(Ty::I64, Flags::NONE, mp, 0, MemAttrs::aligned(3));
+        let lt = b.icmp(IntCond::Ult, mv, key);
+        match inner_form {
+            InnerBsearchForm::IfConverted => {
+                let mid1 = b.binary(Op::Add, Flags::NONE, mid, one);
+                let lo2 = b.select(Flags::NONE, lt, mid1, lo);
+                let hi2 = b.select(Flags::NONE, lt, hi, mid);
+                b.jump((h_bs, &[lo2, hi2]));
+            }
+            InnerBsearchForm::BranchDirectToHdr => {
+                b.br(Flags::NONE, lt, (then_bs, &[]), (else_bs, &[]));
+
+                b.begin(then_bs);
+                let mid1 = b.binary(Op::Add, Flags::NONE, mid, one);
+                b.jump((h_bs, &[mid1, hi]));
+
+                b.begin(else_bs);
+                b.jump((h_bs, &[lo, mid]));
+            }
+            InnerBsearchForm::BranchViaMerge => {
+                b.br(Flags::NONE, lt, (then_bs, &[]), (else_bs, &[]));
+
+                b.begin(then_bs);
+                let mid1 = b.binary(Op::Add, Flags::NONE, mid, one);
+                b.jump((merge_bs, &[mid1, hi]));
+
+                b.begin(else_bs);
+                b.jump((merge_bs, &[lo, mid]));
+
+                b.begin(merge_bs);
+                let m_lo = b.param(Ty::I64);
+                let m_hi = b.param(Ty::I64);
+                b.jump((h_bs, &[m_lo, m_hi]));
+            }
+        }
+
+        b.begin(end_bs);
+        let res_lo = b.param(Ty::I64);
+        let acc2 = b.binary(Op::Add, Flags::NONE, acc, res_lo);
+        b.jump((h_q, &[p_next, acc2]));
+
+        b.begin(exit_all);
+        let final_acc = b.param(Ty::I64);
+        b.ret(&[final_acc]);
+        b.finish_checked().unwrap()
+    }
+
+    #[test]
+    fn amac_real_rust_ptr_iv_bsearch_batch_if_converted_branching_and_rotated_matches_eval() {
+        let alloc = blaze_own::testing::heap().alloc();
+        for &n in &[0usize, 1, 7, 13, 64] {
+            let q_max = 32usize;
+            let (table, queries) = make_table_and_queries(n, q_max);
+            for form in [
+                InnerBsearchForm::IfConverted,
+                InnerBsearchForm::BranchDirectToHdr,
+                InnerBsearchForm::BranchViaMerge,
+            ] {
+                let orig = build_ptr_iv_bsearch_batch(&table, &queries, form, alloc);
+
+                let out_pf = interleave_amac_loops(orig.view(), AmacOpts::arm64(), alloc).unwrap();
+                verify(out_pf.func.view()).expect("pointer-IV AMAC output must verify");
+                assert_eq!(out_pf.stats.nests_interleaved, 1);
+                assert_eq!(out_pf.stats.group_width_used, 4);
+                assert!(out_pf.stats.prefetches_inserted >= 4);
+                assert_eq!(
+                    count_prefetches(out_pf.func.view()),
+                    out_pf.stats.prefetches_inserted as usize
+                );
+
+                // Idempotence: second pass must be a no-op.
+                let again = interleave_amac_loops(out_pf.func.view(), AmacOpts::arm64(), alloc).unwrap();
+                assert_eq!(again.stats.nests_interleaved, 0);
+
+                let eval_fn = strip_prefetch_intrinsics(out_pf.func.view());
+                for &q in &[0usize, 1, 3, 4, 5, 11, 32] {
+                    let args = [Val::Int(q as u128), Val::Int(n as u128)];
+                    let expected = eval_u64(orig.view(), &args);
+                    let got = eval_u64(eval_fn.view(), &args);
+                    assert_eq!(expected, got, "pointer-IV AMAC mismatch at N={n}, Q={q}");
+                }
+            }
+
+            // Also verify post-`rotate_loops` pointer-IV `bsearch_batch` (`Rotated` outer + `SingleBlock` inner).
+            let orig_if = build_ptr_iv_bsearch_batch(&table, &queries, InnerBsearchForm::IfConverted, alloc);
+            let rot = rotate_loops(orig_if.view(), alloc).unwrap();
+            let out_rot = interleave_amac_loops(rot.func.view(), AmacOpts::arm64(), alloc).unwrap();
+            verify(out_rot.func.view()).expect("rotated pointer-IV AMAC output must verify");
+            assert_eq!(out_rot.stats.nests_interleaved, 1);
+            assert_eq!(out_rot.stats.group_width_used, 4);
+            assert!(out_rot.stats.prefetches_inserted >= 4);
+            let eval_rot = strip_prefetch_intrinsics(out_rot.func.view());
+            for &q in &[0usize, 1, 3, 4, 5, 11, 32] {
+                let args = [Val::Int(q as u128), Val::Int(n as u128)];
+                let expected = eval_u64(orig_if.view(), &args);
+                let got = eval_u64(eval_rot.view(), &args);
+                assert_eq!(expected, got, "rotated pointer-IV AMAC mismatch at N={n}, Q={q}");
+            }
+        }
     }
 }

@@ -572,14 +572,38 @@ fn reg_bank(view: &View<'_>, ty: Ty) -> u8 {
     }
 }
 
+/// True iff `inst` is a 3-arg NEON destructive 2-address accumulate `TargetIntrinsic`
+/// (`dst = op(acc, a, b)` where `arg0` is the in-place accumulator).
+#[inline]
+fn is_neon_acc_intrinsic(view: &View<'_>, inst: usize) -> bool {
+    if view.op(inst) != Op::TargetIntrinsic {
+        return false;
+    }
+    let Some(&at_raw) = view.data.get(inst) else {
+        return false;
+    };
+    let Some(&id_raw) = view.extra.get(idx(at_raw)) else {
+        return false;
+    };
+    let name = view.intrinsic_name(blaze_lir::func::IntrinsicId(id_raw));
+    name == b"blaze.neon.sdot"
+        || name == b"blaze.neon.udot"
+        || name == b"blaze.neon.smmla"
+        || name == b"blaze.neon.ummla"
+}
+
 /// True iff `inst` reads all of its inputs before writing its destination register,
 /// allowing safe zero-copy coalescing with a dying operand whose `last_use == inst`
-/// (e.g. `fmla v16.4s, v20.4s, v21.4s`, `add.2d v16, v16, v21`, or `add x9, x9, #1`).
+/// (e.g. `fmla v16.4s, v20.4s, v21.4s`, `sdot v16.4s, v20.16b, v24.16b`, `add.2d v16, v16, v21`,
+/// or `add x9, x9, #1`).
 fn is_rbw(view: &View<'_>, inst: usize) -> bool {
     let op = view.op(inst);
     let ty = view.tys.get(inst).copied().map_or(Ty::NONE, Ty);
     if is_gpr_pair_ty(view, ty) {
         return false;
+    }
+    if is_neon_acc_intrinsic(view, inst) {
+        return true;
     }
     if op == Op::Icmp {
         let is_i128_cmp = view
@@ -696,15 +720,9 @@ fn preferred_inplace_operand(
             let at = idx(*view.data.get(inst)?);
             valid_src(*view.extra.get(at + 2)?)
         }
-        Op::TargetIntrinsic => {
+        Op::TargetIntrinsic if is_neon_acc_intrinsic(view, inst) => {
             let at = idx(*view.data.get(inst)?);
-            let id = blaze_lir::func::IntrinsicId(*view.extra.get(at)?);
-            let name = view.intrinsic_name(id);
-            if name == b"blaze.neon.sdot" || name == b"blaze.neon.udot" {
-                valid_src(*view.extra.get(at + 2)?)
-            } else {
-                None
-            }
+            valid_src(*view.extra.get(at + 2)?)
         }
         Op::Fadd => {
             let at = idx(*view.data.get(inst)?);
@@ -847,6 +865,11 @@ fn vec_fma_avoid_regs(
         Op::Fma | Op::Fmuladd => {
             let ra = view.extra.get(at).copied().map_or(NO_REG, vec_reg_of);
             let rb = view.extra.get(at + 1).copied().map_or(NO_REG, vec_reg_of);
+            (ra, rb)
+        }
+        Op::TargetIntrinsic if is_neon_acc_intrinsic(view, inst) => {
+            let ra = view.extra.get(at + 3).copied().map_or(NO_REG, vec_reg_of);
+            let rb = view.extra.get(at + 4).copied().map_or(NO_REG, vec_reg_of);
             (ra, rb)
         }
         Op::Fadd => {
@@ -1757,17 +1780,28 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
 #[cfg(test)]
 mod tests {
     use blaze_lir::{
-        Flags, Op, Ty,
-        builder::{Builder, Full, Param, Variadic},
+        Flags, IntCond, Op, Scalar, Ty,
+        builder::{Builder, Full, MemAttrs, Param, Variadic},
         func::{BlockKind, Conv},
     };
-    use blaze_own::Alloc;
-    use blaze_tier::CallClobbers;
+    use blaze_own::{Alloc, Vec};
+    use blaze_tier::{CallClobbers, Machine, Names, Outside, RoutinePlaces};
 
     use super::{
-        AllocLoc, CALLER_SAVED_FP, CALLER_SAVED_GPR, ScratchOrder, allocate_with_ipra_and_order,
-        build_caller_fp_order, build_caller_gpr_order,
+        AllocLoc, CALLER_SAVED_FP, CALLER_SAVED_GPR, ScratchOrder, allocate,
+        allocate_with_ipra_and_order, build_caller_fp_order, build_caller_gpr_order,
     };
+
+    struct NoNames;
+    impl Names for NoNames {
+        fn name(&self, _of: Outside) -> Option<blaze_tier::Named<'_>> {
+            None
+        }
+
+        fn routines(&self) -> RoutinePlaces {
+            RoutinePlaces::NONE
+        }
+    }
 
     fn test_alloc() -> Alloc<'static> {
         blaze_own::testing::heap().alloc()
@@ -1853,5 +1887,180 @@ mod tests {
             !avoided_alloc.clobbers.clobbers_gpr(9),
             "callee must avoid clobbering caller-hot X9 when demoted in ScratchOrder"
         );
+    }
+
+    #[test]
+    fn sdot_loop_coalesces_four_accumulators_with_zero_moves() {
+        let alloc = test_alloc();
+        let v16i8 = Ty::vector(Scalar::I8, 16).expect("v16i8");
+        let v4i32 = Ty::vector(Scalar::I32, 4).expect("v4i32");
+
+        for intr_name in [
+            "blaze.neon.sdot",
+            "blaze.neon.udot",
+            "blaze.neon.smmla",
+            "blaze.neon.ummla",
+        ] {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::I64)],
+                &[Param::of(Ty::I32)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            let loop_hdr = b.create_block(BlockKind::Normal);
+            let exit = b.create_block(BlockKind::Normal);
+
+            b.begin(entry);
+            let pa = b.param(Ty::PTR);
+            let pb = b.param(Ty::PTR);
+            let n = b.param(Ty::I64);
+            let z64 = b.iconst(Ty::I64, 0);
+            let z32 = b.iconst(Ty::I32, 0);
+            let init0 = b.convert(Op::Splat, Flags::NONE, v4i32, z32);
+            let init1 = b.convert(Op::Splat, Flags::NONE, v4i32, z32);
+            let init2 = b.convert(Op::Splat, Flags::NONE, v4i32, z32);
+            let init3 = b.convert(Op::Splat, Flags::NONE, v4i32, z32);
+            b.jump((loop_hdr, &[z64, init0, init1, init2, init3]));
+
+            b.begin(loop_hdr);
+            let p_i = b.param(Ty::I64);
+            let p_acc0 = b.param(v4i32);
+            let p_acc1 = b.param(v4i32);
+            let p_acc2 = b.param(v4i32);
+            let p_acc3 = b.param(v4i32);
+            let ap = b.ptr_add(Flags::NONE, pa, p_i);
+            let bp = b.ptr_add(Flags::NONE, pb, p_i);
+            let a0 = b.load(v16i8, Flags::NONE, ap, 0, MemAttrs::aligned(4));
+            let a1 = b.load(v16i8, Flags::NONE, ap, 16, MemAttrs::aligned(4));
+            let a2 = b.load(v16i8, Flags::NONE, ap, 32, MemAttrs::aligned(4));
+            let a3 = b.load(v16i8, Flags::NONE, ap, 48, MemAttrs::aligned(4));
+            let b0 = b.load(v16i8, Flags::NONE, bp, 0, MemAttrs::aligned(4));
+            let b1 = b.load(v16i8, Flags::NONE, bp, 16, MemAttrs::aligned(4));
+            let b2 = b.load(v16i8, Flags::NONE, bp, 32, MemAttrs::aligned(4));
+            let b3 = b.load(v16i8, Flags::NONE, bp, 48, MemAttrs::aligned(4));
+            let dot_sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(v4i32), Param::of(v16i8), Param::of(v16i8)],
+                &[Param::of(v4i32)],
+            );
+            let dot_id = b.intrinsic(intr_name, dot_sig);
+            let s0 = b.target_intrinsic(dot_id, &[p_acc0, a0, b0]);
+            let s1 = b.target_intrinsic(dot_id, &[p_acc1, a1, b1]);
+            let s2 = b.target_intrinsic(dot_id, &[p_acc2, a2, b2]);
+            let s3 = b.target_intrinsic(dot_id, &[p_acc3, a3, b3]);
+            let c64 = b.iconst(Ty::I64, 64);
+            let i_next = b.binary(Op::Add, Flags::NONE, p_i, c64);
+            let cond = b.icmp(IntCond::Ult, i_next, n);
+            b.br(
+                Flags::NONE,
+                cond,
+                (loop_hdr, &[i_next, s0, s1, s2, s3]),
+                (exit, &[s0, s1, s2, s3]),
+            );
+
+            b.begin(exit);
+            let e0 = b.param(v4i32);
+            let e1 = b.param(v4i32);
+            let e2 = b.param(v4i32);
+            let e3 = b.param(v4i32);
+            let sum01 = b.binary(Op::Add, Flags::NONE, e0, e1);
+            let sum23 = b.binary(Op::Add, Flags::NONE, e2, e3);
+            let sum = b.binary(Op::Add, Flags::NONE, sum01, sum23);
+            let red = b.convert(Op::ReduceAdd, Flags::NONE, Ty::I32, sum);
+            b.ret(&[red]);
+
+            let func = b.finish_checked().expect("4x neon acc loop builds");
+            let view = func.view();
+            let n_inst = view.len();
+            let mut skip: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+            let mut tail: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+            for _ in 0..n_inst {
+                skip.push(false);
+                tail.push(false);
+            }
+            let ra = allocate(&view, &skip, &tail, 32, crate::Os::MacOs, alloc)
+                .expect("regalloc succeeds for 4x neon acc loop");
+
+            let pairs = [(p_acc0, s0), (p_acc1, s1), (p_acc2, s2), (p_acc3, s3)];
+            let mut regs = [u8::MAX; 4];
+            for (k, &(acc_p, acc_next)) in pairs.iter().enumerate() {
+                let loc_p = ra.loc_of[acc_p.index()];
+                let loc_n = ra.loc_of[acc_next.index()];
+                assert_eq!(
+                    loc_n, loc_p,
+                    "{intr_name} acc[{k}] must coalesce in-place with loop param"
+                );
+                match loc_p {
+                    AllocLoc::Vec(r) => regs[k] = r,
+                    other => panic!("{intr_name} acc[{k}] expected Vec reg, got {other:?}"),
+                }
+            }
+            for i in 0..4 {
+                for j in (i + 1)..4 {
+                    assert_ne!(regs[i], regs[j], "{intr_name} accumulators must hold distinct regs");
+                }
+            }
+            assert_eq!(
+                ra.loc_of[i_next.index()],
+                ra.loc_of[p_i.index()],
+                "{intr_name} loop IV must coalesce in-place"
+            );
+
+            // For `blaze.neon.sdot`, also emit AArch64 machine code and assert ZERO `mov.16b`
+            // inside the loop body and ZERO back-edge copy trampoline after `ret`.
+            if intr_name == "blaze.neon.sdot" {
+                let emitted = super::super::isel::emit_sota_a64(
+                    view,
+                    &NoNames,
+                    super::super::CallMode::DirectBl,
+                    Machine::LSE,
+                    true,
+                    alloc,
+                )
+                .expect("emit_sota_a64 succeeds for 4x sdot loop");
+                assert_eq!(emitted.code.len() % 4, 0);
+                let mut words: Vec<u32, Alloc<'static>> = Vec::with_capacity_in(emitted.code.len() / 4, alloc);
+                for chunk in emitted.code.chunks_exact(4) {
+                    words.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+                }
+                assert_eq!(
+                    words.last().copied(),
+                    Some(crate::enc::ret()),
+                    "back-edge must not emit an out-of-line copy trampoline after ret"
+                );
+                let mut back_branch = None;
+                for (i, &w) in words.iter().enumerate() {
+                    if (w & 0xff00_0010) == 0x5400_0000 {
+                        let imm19 = ((w >> 5) & 0x7_ffff) as i32;
+                        let disp = (imm19 << 13) >> 13;
+                        if disp < 0 {
+                            back_branch = Some((i, (i as isize + disp as isize) as usize));
+                        }
+                    }
+                }
+                let (b_idx, loop_start) =
+                    back_branch.expect("expected direct backward b.cond back-edge to loop header");
+                let loop_words = &words[loop_start..=b_idx];
+                let sdot_count = loop_words
+                    .iter()
+                    .filter(|&&w| (w & 0xffe0_fc00) == 0x4e80_9400)
+                    .count();
+                let mov16b_count = loop_words
+                    .iter()
+                    .filter(|&&w| {
+                        (w & 0xffe0_fc00) == 0x4ea0_1c00 && ((w >> 16) & 0x1f) == ((w >> 5) & 0x1f)
+                    })
+                    .count();
+                assert_eq!(sdot_count, 4, "expected 4 sdot.4s instructions in loop body");
+                assert_eq!(
+                    mov16b_count, 0,
+                    "expected ZERO mov.16b instructions in 4x sdot loop body, got {mov16b_count}"
+                );
+            }
+        }
     }
 }

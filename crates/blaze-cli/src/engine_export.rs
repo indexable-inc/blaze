@@ -798,7 +798,7 @@ fn export_program<'f>(
                 if walk.kind(row) != RowKind::Instance {
                     continue;
                 }
-                if matches!(outcomes[row], RowOutcome::UnbuiltStub(_)) {
+                if matches!(outcomes.get(row), Some(RowOutcome::UnbuiltStub(_) | RowOutcome::Lto { .. })) {
                     continue;
                 }
                 lto_buf.clear();

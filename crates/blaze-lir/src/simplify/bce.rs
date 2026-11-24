@@ -269,6 +269,153 @@ fn decompose_usub_sat_const(view: &View<'_>, val: u32) -> Option<(u32, u128)> {
     None
 }
 
+/// Decomposes a binary-search midpoint `lo + ((hi - lo) >> k)` (`1 <= k < width`),
+/// `((hi - lo) >> k) + lo`, `lo + ((hi - lo) / d)` (`d >= 2`), or `((hi - lo) / d) + lo`
+/// into `Some((lo, hi))`.
+#[inline]
+fn decompose_midpoint(view: &View<'_>, val: u32) -> Option<(u32, u32)> {
+    let vi = to_idx(val);
+    if vi >= view.len() || view.op(vi) != Op::Add {
+        return None;
+    }
+    let ty = Ty(*view.tys.get(vi)?);
+    if !ty.is_scalar() || !ty.is_int() {
+        return None;
+    }
+    let bits = ty.bits(view.head.ptr_bits);
+    if bits == 0 || bits > 128 {
+        return None;
+    }
+    let at = to_idx(*view.data.get(vi)?);
+    let l = *view.extra.get(at)?;
+    let r = *view.extra.get(at + 1)?;
+    let match_half = |lo: u32, half: u32| -> Option<(u32, u32)> {
+        let hi_idx = to_idx(half);
+        if hi_idx >= view.len() {
+            return None;
+        }
+        let diff = match view.op(hi_idx) {
+            Op::Lshr => {
+                let sat = to_idx(*view.data.get(hi_idx)?);
+                let d = *view.extra.get(sat)?;
+                let sh = *view.extra.get(sat + 1)?;
+                let (k, _) = const_int(view, to_idx(sh))?;
+                if k < 1 || k >= u128::from(bits) {
+                    return None;
+                }
+                d
+            }
+            Op::Udiv => {
+                let uat = to_idx(*view.data.get(hi_idx)?);
+                let d = *view.extra.get(uat)?;
+                let dv = *view.extra.get(uat + 1)?;
+                let (c, _) = const_int(view, to_idx(dv))?;
+                if c < 2 {
+                    return None;
+                }
+                d
+            }
+            _ => return None,
+        };
+        let di = to_idx(diff);
+        if di >= view.len() || view.op(di) != Op::Sub {
+            return None;
+        }
+        let sub_at = to_idx(*view.data.get(di)?);
+        let hi = *view.extra.get(sub_at)?;
+        let sub_lo = *view.extra.get(sub_at + 1)?;
+        if sub_lo == lo { Some((lo, hi)) } else { None }
+    };
+    match_half(l, r).or_else(|| match_half(r, l))
+}
+
+/// Unwraps up to 4 boolean wrappers (`Not`, `Xor(_, 1)`, `Trunc(Zext(i1))`,
+/// `Icmp(Eq|Ne, i1|Zext(i1), 0|1)`) and returns `(inner_cond, flipped)`.
+fn unwrap_bool_cond(view: &View<'_>, mut cond_val: u32) -> (u32, bool) {
+    let mut flipped = false;
+    for _ in 0..4 {
+        let ci = to_idx(cond_val);
+        if ci >= view.len() {
+            break;
+        }
+        match view.op(ci) {
+            Op::Not if Ty(at_u16(view.tys, ci)) == Ty::I1 => {
+                cond_val = at_u32(view.data, ci);
+                flipped = !flipped;
+            }
+            Op::Xor if Ty(at_u16(view.tys, ci)) == Ty::I1 => {
+                let pos = to_idx(at_u32(view.data, ci));
+                let (Some(&l), Some(&r)) = (view.extra.get(pos), view.extra.get(pos + 1)) else {
+                    break;
+                };
+                if const_int(view, to_idx(r)).is_some_and(|(k, _)| k == 1) {
+                    cond_val = l;
+                    flipped = !flipped;
+                } else if const_int(view, to_idx(l)).is_some_and(|(k, _)| k == 1) {
+                    cond_val = r;
+                    flipped = !flipped;
+                } else {
+                    break;
+                }
+            }
+            Op::Icmp => {
+                let cat = to_idx(at_u32(view.data, ci));
+                let Some(ic) = view.extra.get(cat).copied().and_then(IntCond::from_word) else {
+                    break;
+                };
+                if ic != IntCond::Eq && ic != IntCond::Ne {
+                    break;
+                }
+                let (Some(&lhs), Some(&rhs)) = (view.extra.get(cat + 1), view.extra.get(cat + 2)) else {
+                    break;
+                };
+                let (val, c) = if let Some((k, _)) = const_int(view, to_idx(rhs)).filter(|&(k, _)| k <= 1) {
+                    (lhs, k)
+                } else if let Some((k, _)) = const_int(view, to_idx(lhs)).filter(|&(k, _)| k <= 1) {
+                    (rhs, k)
+                } else {
+                    break;
+                };
+                let vi = to_idx(val);
+                if vi >= view.len() {
+                    break;
+                }
+                let inner_i1 = if Ty(at_u16(view.tys, vi)) == Ty::I1 {
+                    val
+                } else if view.op(vi) == Op::Zext {
+                    let src = at_u32(view.data, vi);
+                    if to_idx(src) < view.len() && Ty(at_u16(view.tys, to_idx(src))) == Ty::I1 {
+                        src
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                };
+                let is_inv = (c == 0 && ic == IntCond::Eq) || (c == 1 && ic == IntCond::Ne);
+                cond_val = inner_i1;
+                if is_inv {
+                    flipped = !flipped;
+                }
+            }
+            Op::Trunc if Ty(at_u16(view.tys, ci)) == Ty::I1 => {
+                let src = at_u32(view.data, ci);
+                let si = to_idx(src);
+                if si < view.len() && view.op(si) == Op::Zext {
+                    let inner = at_u32(view.data, si);
+                    if to_idx(inner) < view.len() && Ty(at_u16(view.tys, to_idx(inner))) == Ty::I1 {
+                        cond_val = inner;
+                        continue;
+                    }
+                }
+                break;
+            }
+            _ => break,
+        }
+    }
+    (cond_val, flipped)
+}
+
 /// Returns `Some(max_val)` if `root` is statically proven to lie in `0..=max_val` (unsigned)
 /// purely from its defining operation (`Lshr` by constant, `And` with mask, or `Zext`),
 /// independent of control-flow facts.
@@ -539,7 +686,357 @@ fn eval_fact(view: &View<'_>, facts: &[RelFact], q_cond: IntCond, q_a: u32, q_b:
     if let Some(res) = try_affine_ult(q_b, q_a, swap_cond(q_cond)) {
         return Some(res);
     }
+    // 4. Binary-search midpoint bounds proof:
+    //    For unsigned integers with `lo < hi` (`Ult(lo, hi)`), `diff = hi - lo >= 1`, so
+    //    `half = diff >> k < diff` (`1 <= k < width`). Therefore `mid = lo + half` has zero
+    //    unsigned overflow and satisfies `lo <= mid < hi`. By transitivity with `hi <= bound`
+    //    (or `hi < bound` / `hi == bound`), `mid < bound`!
+    let try_midpoint = |mid_cand: u32, rhs: u32, cond: IntCond| -> Option<bool> {
+        let (lo, hi) = decompose_midpoint(view, mid_cand)?;
+        let lo_lt_hi = facts.iter().any(|&f| {
+            (f.a == lo && f.b == hi && f.cond == IntCond::Ult)
+                || (f.a == hi && f.b == lo && f.cond == IntCond::Ugt)
+        });
+        if !lo_lt_hi {
+            return None;
+        }
+        if rhs == hi {
+            if let Some(res) = implies(IntCond::Ult, cond) {
+                return Some(res);
+            }
+        }
+        if rhs == lo {
+            if let Some(res) = implies(IntCond::Uge, cond) {
+                return Some(res);
+            }
+        }
+        let hi_le_rhs = facts.iter().any(|&f| {
+            (f.a == hi
+                && f.b == rhs
+                && matches!(f.cond, IntCond::Ule | IntCond::Ult | IntCond::Eq))
+                || (f.a == rhs
+                    && f.b == hi
+                    && matches!(f.cond, IntCond::Uge | IntCond::Ugt | IntCond::Eq))
+        });
+        if hi_le_rhs {
+            if let Some(res) = implies(IntCond::Ult, cond) {
+                return Some(res);
+            }
+        }
+        if let Some((qc, qw)) = const_int(view, to_idx(rhs)) {
+            for &f in facts {
+                let hi_c_bound = if f.a == hi {
+                    const_int(view, to_idx(f.b))
+                        .filter(|&(_, fw)| fw == qw)
+                        .map(|(fc, _)| (f.cond, fc))
+                } else if f.b == hi {
+                    const_int(view, to_idx(f.a))
+                        .filter(|&(_, fw)| fw == qw)
+                        .map(|(fc, _)| (swap_cond(f.cond), fc))
+                } else {
+                    None
+                };
+                if let Some((hc, fc)) = hi_c_bound {
+                    let upper = match hc {
+                        IntCond::Ule | IntCond::Eq => Some(fc),
+                        IntCond::Ult => fc.checked_sub(1),
+                        _ => None,
+                    };
+                    if let Some(u) = upper {
+                        if let Some(res) = eval_const_range(IntCond::Ult, u, cond, qc, qw) {
+                            return Some(res);
+                        }
+                    }
+                }
+            }
+        }
+        for &f in facts {
+            let lower_rel = if f.a == rhs && f.b == lo {
+                Some(f.cond)
+            } else if f.a == lo && f.b == rhs {
+                Some(swap_cond(f.cond))
+            } else {
+                None
+            };
+            match lower_rel {
+                Some(IntCond::Ult) => {
+                    if let Some(res) = implies(IntCond::Ugt, cond) {
+                        return Some(res);
+                    }
+                }
+                Some(IntCond::Ule | IntCond::Eq) => {
+                    if let Some(res) = implies(IntCond::Uge, cond) {
+                        return Some(res);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    };
+    if let Some(res) = try_midpoint(q_a, q_b, q_cond) {
+        return Some(res);
+    }
+    if let Some(res) = try_midpoint(q_b, q_a, swap_cond(q_cond)) {
+        return Some(res);
+    }
     None
+}
+
+#[inline]
+fn push_unique_fact<A: Allocator>(dst: &mut Vec<RelFact, A>, fact: RelFact) {
+    if !dst.iter().any(|&f| f == fact) {
+        dst.push(fact);
+    }
+}
+
+fn compute_reachable_without<A: Allocator>(
+    view: &View<'_>,
+    skip: usize,
+    reach: &mut [bool],
+    work: &mut Vec<usize, A>,
+) {
+    let blocks = view.blocks();
+    for slot in reach.iter_mut() {
+        *slot = false;
+    }
+    work.clear();
+    if skip == 0 || blocks == 0 {
+        return;
+    }
+    set_at(reach, 0, true);
+    work.push(0);
+    while let Some(cur) = work.pop() {
+        let term = view.terminator(Block(to_u32(cur)));
+        each(view, term, |item| {
+            if let Item::Edge(edge) = item {
+                let tb = to_idx(edge.block);
+                if tb < blocks && tb != skip && !reach.get(tb).copied().unwrap_or(true) {
+                    set_at(reach, tb, true);
+                    work.push(tb);
+                }
+            }
+        });
+    }
+}
+
+/// If `pred`'s terminating `Op::Br` along edge `ordinal` (`0` = then, `1` = else) directly proves
+/// `Ult(a, b)` (or `Ugt(b, a)`), returns `Some((a, b))`.
+fn edge_br_ult(view: &View<'_>, pred: u32, target: u32, ordinal: u32) -> Option<(u32, u32)> {
+    let term = view.terminator(Block(pred));
+    if view.op(term) != Op::Br {
+        return None;
+    }
+    let at = to_idx(*view.data.get(term)?);
+    let cv = *view.extra.get(at)?;
+    let t_blk = *view.extra.get(at + 1)?;
+    let t_argc = to_idx(*view.extra.get(at + 2)?);
+    let e_blk = *view.extra.get(at + 3 + t_argc)?;
+    let is_true = if ordinal == 0 && t_blk == target {
+        true
+    } else if ordinal == 1 && e_blk == target {
+        false
+    } else {
+        return None;
+    };
+    let (raw_cv, flipped) = unwrap_bool_cond(view, cv);
+    let eff_true = is_true ^ flipped;
+    let cvi = to_idx(raw_cv);
+    if cvi >= view.len() || view.op(cvi) != Op::Icmp {
+        return None;
+    }
+    let cat = to_idx(*view.data.get(cvi)?);
+    let cond = IntCond::from_word(*view.extra.get(cat)?)?;
+    let a = *view.extra.get(cat + 1)?;
+    let b = *view.extra.get(cat + 2)?;
+    match if eff_true { cond } else { invert_cond(cond) } {
+        IntCond::Ult => Some((a, b)),
+        IntCond::Ugt => Some((b, a)),
+        _ => None,
+    }
+}
+
+/// Iteratively checks whether `start_val <= target_param` (unsigned) is proven at `start_blk`
+/// inside the natural loop headed by `loop_hdr` (where every reachable block `b` with
+/// `!reach_no_h[b]` is dominated by `loop_hdr`).
+#[allow(clippy::too_many_arguments)]
+fn is_proven_ule<A: Allocator>(
+    view: &View<'_>,
+    preds: &[Vec<u32, A>],
+    inst_block: &[u32],
+    block_facts: &[Vec<RelFact, A>],
+    reachable: &[bool],
+    reach_no_h: &[bool],
+    loop_hdr: usize,
+    start_blk: usize,
+    start_val: u32,
+    target_param: u32,
+) -> bool {
+    const MAX_DEPTH: u8 = 6;
+    const MAX_STEPS: usize = 32;
+
+    let mut stack = [(0usize, 0u32, 0u8); 32];
+    let mut sp: usize = 0;
+    if let Some(slot) = stack.get_mut(sp) {
+        *slot = (start_blk, start_val, 0);
+        sp += 1;
+    }
+    let mut steps: usize = 0;
+    while sp > 0 {
+        if steps >= MAX_STEPS {
+            return false;
+        }
+        sp -= 1;
+        steps += 1;
+        let Some(&(blk, val, depth)) = stack.get(sp) else {
+            return false;
+        };
+        if val == target_param {
+            continue;
+        }
+        let facts = block_facts.get(blk).map_or(&[][..], Vec::as_slice);
+        if eval_fact(view, facts, IntCond::Ule, val, target_param) == Some(true) {
+            continue;
+        }
+        if depth >= MAX_DEPTH {
+            return false;
+        }
+        let vi = to_idx(val);
+        if vi >= view.len() {
+            return false;
+        }
+        match view.op(vi) {
+            Op::Select => {
+                let Some(&at_raw) = view.data.get(vi) else {
+                    return false;
+                };
+                let at = to_idx(at_raw);
+                let (Some(&tv), Some(&fv)) = (view.extra.get(at + 1), view.extra.get(at + 2)) else {
+                    return false;
+                };
+                if sp + 2 > stack.len() {
+                    return false;
+                }
+                if let Some(slot) = stack.get_mut(sp) {
+                    *slot = (blk, tv, depth + 1);
+                    sp += 1;
+                }
+                if let Some(slot) = stack.get_mut(sp) {
+                    *slot = (blk, fv, depth + 1);
+                    sp += 1;
+                }
+            }
+            Op::Umin | Op::And => {
+                let Some(&at_raw) = view.data.get(vi) else {
+                    return false;
+                };
+                let at = to_idx(at_raw);
+                let (Some(&l), Some(&r)) = (view.extra.get(at), view.extra.get(at + 1)) else {
+                    return false;
+                };
+                let ok = l == target_param
+                    || r == target_param
+                    || eval_fact(view, facts, IntCond::Ule, l, target_param) == Some(true)
+                    || eval_fact(view, facts, IntCond::Ule, r, target_param) == Some(true);
+                if !ok {
+                    return false;
+                }
+            }
+            Op::UsubSat => {
+                let Some(&at_raw) = view.data.get(vi) else {
+                    return false;
+                };
+                let at = to_idx(at_raw);
+                let Some(&l) = view.extra.get(at) else {
+                    return false;
+                };
+                if sp >= stack.len() {
+                    return false;
+                }
+                if let Some(slot) = stack.get_mut(sp) {
+                    *slot = (blk, l, depth + 1);
+                    sp += 1;
+                }
+            }
+            Op::Lshr => {
+                let Some(&at_raw) = view.data.get(vi) else {
+                    return false;
+                };
+                let at = to_idx(at_raw);
+                let (Some(&l), Some(&r)) = (view.extra.get(at), view.extra.get(at + 1)) else {
+                    return false;
+                };
+                let ty = Ty(at_u16(view.tys, vi));
+                let bits = ty.bits(view.head.ptr_bits);
+                if !const_int(view, to_idx(r)).is_some_and(|(k, _)| k < u128::from(bits))
+                    || sp >= stack.len()
+                {
+                    return false;
+                }
+                if let Some(slot) = stack.get_mut(sp) {
+                    *slot = (blk, l, depth + 1);
+                    sp += 1;
+                }
+            }
+            Op::Param => {
+                let m = to_idx(at_u32(inst_block, vi));
+                if m == loop_hdr || reach_no_h.get(m).copied().unwrap_or(true) {
+                    return false;
+                }
+                let m_params = view.params(Block(to_u32(m)));
+                if vi < m_params.start || vi >= m_params.end {
+                    return false;
+                }
+                let param_pos = vi - m_params.start;
+                let Some(mps) = preds.get(m) else {
+                    return false;
+                };
+                if mps.is_empty() {
+                    return false;
+                }
+                let mut pushed_any = false;
+                let mut ok = true;
+                for &mp_u32 in mps {
+                    let mp = to_idx(mp_u32);
+                    if !reachable.get(mp).copied().unwrap_or(false) {
+                        continue;
+                    }
+                    if reach_no_h.get(mp).copied().unwrap_or(true) {
+                        ok = false;
+                        break;
+                    }
+                    let term = view.terminator(Block(mp_u32));
+                    each(view, term, |item| {
+                        if !ok {
+                            return;
+                        }
+                        if let Item::Edge(edge) = item && to_idx(edge.block) == m {
+                            if let Some((astart, argc)) = edge.args && param_pos < argc {
+                                let arg = at_u32(view.extra, astart + param_pos);
+                                if let Some(slot) = stack.get_mut(sp) {
+                                    *slot = (mp, arg, depth + 1);
+                                    sp += 1;
+                                    pushed_any = true;
+                                } else {
+                                    ok = false;
+                                }
+                            } else {
+                                ok = false;
+                            }
+                        }
+                    });
+                    if !ok {
+                        break;
+                    }
+                }
+                if !ok || !pushed_any {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Eliminates redundant bounds checks and dominating comparisons implied by dominating branches.
@@ -553,13 +1050,17 @@ pub fn eliminate_redundant_checks<A: Allocator + Copy>(
         return Ok(BceOutput { func: view.to_func_in(alloc), stats: BceStats::default() });
     }
 
-    // Build predecessor lists to identify single-predecessor guarded edges (`Br -> then/else`).
+    // Build predecessor lists, instruction-to-block ownership, and entry reachability.
     let mut preds: Vec<Vec<u32, A>, A> = Vec::with_capacity_in(blocks, alloc);
     for _ in 0..blocks {
         preds.push(Vec::new_in(alloc));
     }
+    let mut inst_block = filled(len, 0u32, &alloc);
     for b in 0..blocks {
         let b32 = to_u32(b);
+        for inst in view.block(Block(b32)) {
+            set_at(&mut inst_block, inst, b32);
+        }
         let term = view.terminator(Block(b32));
         each(&view, term, |item| {
             if let Item::Edge(edge) = item {
@@ -573,6 +1074,23 @@ pub fn eliminate_redundant_checks<A: Allocator + Copy>(
         });
     }
 
+    let mut reachable = filled(blocks, false, &alloc);
+    let mut work: Vec<usize, A> = Vec::with_capacity_in(blocks, alloc);
+    set_at(&mut reachable, 0, true);
+    work.push(0);
+    while let Some(cur) = work.pop() {
+        let term = view.terminator(Block(to_u32(cur)));
+        each(&view, term, |item| {
+            if let Item::Edge(edge) = item {
+                let tb = to_idx(edge.block);
+                if tb < blocks && !reachable.get(tb).copied().unwrap_or(true) {
+                    set_at(&mut reachable, tb, true);
+                    work.push(tb);
+                }
+            }
+        });
+    }
+
     // Compute per-block dominating relational facts along single-predecessor chains (which covers
     // loop headers -> body -> bounds-check -> latch and nested if/else guards cleanly in O(B)!).
     let mut block_facts: Vec<Vec<RelFact, A>, A> = Vec::with_capacity_in(blocks, alloc);
@@ -580,6 +1098,93 @@ pub fn eliminate_redundant_checks<A: Allocator + Copy>(
     for _ in 0..blocks {
         block_facts.push(Vec::new_in(alloc));
         bool_facts.push(Vec::new_in(alloc));
+    }
+
+    // Edge-intersection `Ult(p_a, p_b)` on block parameters (covers rotated do-while loops like
+    // `if 0 < len { do { ... } while lo < hi; }` where every incoming edge is guarded by `lo < hi`).
+    for h in 1..blocks {
+        if !reachable.get(h).copied().unwrap_or(false) {
+            continue;
+        }
+        let h_u32 = to_u32(h);
+        let h_params = view.params(Block(h_u32));
+        if h_params.len() < 2 {
+            continue;
+        }
+        let Some(ps) = preds.get(h) else {
+            continue;
+        };
+        if ps.is_empty() {
+            continue;
+        }
+        let mut cand: Option<(usize, usize)> = None;
+        let mut saw_edge = false;
+        let mut all_ok = true;
+        for &p_u32 in ps {
+            if !reachable.get(to_idx(p_u32)).copied().unwrap_or(false) {
+                continue;
+            }
+            let term = view.terminator(Block(p_u32));
+            each(&view, term, |item| {
+                if !all_ok {
+                    return;
+                }
+                if let Item::Edge(edge) = item && edge.block == h_u32 {
+                    saw_edge = true;
+                    let Some((astart, argc)) = edge.args else {
+                        all_ok = false;
+                        return;
+                    };
+                    if argc != h_params.len() {
+                        all_ok = false;
+                        return;
+                    }
+                    let Some((lhs, rhs)) = edge_br_ult(&view, p_u32, h_u32, edge.ordinal) else {
+                        all_ok = false;
+                        return;
+                    };
+                    if let Some((pa, pb)) = cand {
+                        let a_arg = at_u32(view.extra, astart + pa);
+                        let b_arg = at_u32(view.extra, astart + pb);
+                        if a_arg != lhs || b_arg != rhs {
+                            all_ok = false;
+                        }
+                    } else {
+                        let mut pos_a = None;
+                        let mut pos_b = None;
+                        for k in 0..argc {
+                            let arg = at_u32(view.extra, astart + k);
+                            if arg == lhs && pos_a.is_none() {
+                                pos_a = Some(k);
+                            }
+                            if arg == rhs && pos_b.is_none() {
+                                pos_b = Some(k);
+                            }
+                        }
+                        if let (Some(pa), Some(pb)) = (pos_a, pos_b) && pa != pb {
+                            cand = Some((pa, pb));
+                        } else {
+                            all_ok = false;
+                        }
+                    }
+                }
+            });
+            if !all_ok {
+                break;
+            }
+        }
+        if all_ok && saw_edge && let Some((pa, pb)) = cand {
+            if let Some(dst) = block_facts.get_mut(h) {
+                push_unique_fact(
+                    dst,
+                    RelFact {
+                        cond: IntCond::Ult,
+                        a: to_u32(h_params.start + pa),
+                        b: to_u32(h_params.start + pb),
+                    },
+                );
+            }
+        }
     }
 
     // Forward propagation in block order:
@@ -612,7 +1217,7 @@ pub fn eliminate_redundant_checks<A: Allocator + Copy>(
             for k in 0..pfacts_len {
                 if let Some(f) = block_facts.get(p).and_then(|v| v.get(k)).copied() {
                     if let Some(dst) = block_facts.get_mut(b) {
-                        dst.push(f);
+                        push_unique_fact(dst, f);
                     }
                 }
             }
@@ -644,17 +1249,211 @@ pub fn eliminate_redundant_checks<A: Allocator + Copy>(
                         if let Some(dst) = bool_facts.get_mut(b) {
                             dst.push((cv, is_true));
                         }
-                        let cvi = to_idx(cv);
-                        if view.op(cvi) == Op::Icmp {
+                        let (raw_cv, flipped) = unwrap_bool_cond(&view, cv);
+                        let eff_true = is_true ^ flipped;
+                        if raw_cv != cv {
+                            if let Some(dst) = bool_facts.get_mut(b) {
+                                dst.push((raw_cv, eff_true));
+                            }
+                        }
+                        let cvi = to_idx(raw_cv);
+                        if cvi < len && view.op(cvi) == Op::Icmp {
                             let cat = to_idx(at_u32(view.data, cvi));
                             if let Some(cond) = IntCond::from_word(at_u32(view.extra, cat)) {
                                 let a = at_u32(view.extra, cat + 1);
                                 let bv = at_u32(view.extra, cat + 2);
-                                let implied = if is_true { cond } else { invert_cond(cond) };
+                                let implied = if eff_true { cond } else { invert_cond(cond) };
                                 if let Some(dst) = block_facts.get_mut(b) {
-                                    dst.push(RelFact { cond: implied, a, b: bv });
+                                    push_unique_fact(dst, RelFact { cond: implied, a, b: bv });
                                 }
                             }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Inductive `Ule(param, bound)` loop-parameter invariants:
+    // If natural loop header `H` has a single dominating entry predecessor `pre` passing `bound`
+    // for parameter `p`, and every dominated back-edge passes a value proven `<= p` (e.g. `p`
+    // itself, `mid = lo + ((hi - lo) >> 1)`, or `Select(_, p, mid)`), then `Ule(p, bound)` holds
+    // at `H` and every block dominated by `H`!
+    if blocks <= 2048 {
+        let mut reach_no_h = filled(blocks, false, &alloc);
+        for h in 1..blocks {
+            if !reachable.get(h).copied().unwrap_or(false) {
+                continue;
+            }
+            let h_u32 = to_u32(h);
+            let h_params = view.params(Block(h_u32));
+            if h_params.is_empty() {
+                continue;
+            }
+            let Some(ps) = preds.get(h) else {
+                continue;
+            };
+            if ps.len() < 2 {
+                continue;
+            }
+            compute_reachable_without(&view, h, &mut reach_no_h, &mut work);
+            let mut entry_pred: Option<u32> = None;
+            let mut multi_entry = false;
+            let mut back_count: usize = 0;
+            for &p_u32 in ps {
+                let pi = to_idx(p_u32);
+                if !reachable.get(pi).copied().unwrap_or(false) {
+                    continue;
+                }
+                if reach_no_h.get(pi).copied().unwrap_or(false) {
+                    if entry_pred.is_some() {
+                        multi_entry = true;
+                        break;
+                    }
+                    entry_pred = Some(p_u32);
+                } else {
+                    back_count += 1;
+                }
+            }
+            let (Some(pre_u32), false) = (entry_pred, multi_entry) else {
+                continue;
+            };
+            if back_count == 0 {
+                continue;
+            }
+            for pos in 0..h_params.len() {
+                let p_idx = h_params.start + pos;
+                let p_inst = to_u32(p_idx);
+                let p_ty = Ty(at_u16(view.tys, p_idx));
+                if !p_ty.is_scalar() || !p_ty.is_int() {
+                    continue;
+                }
+                // Extract the unique initial value passed from `pre` into `H` at `pos`.
+                let mut init_val: Option<u32> = None;
+                let mut init_ok = true;
+                let pre_term = view.terminator(Block(pre_u32));
+                each(&view, pre_term, |item| {
+                    if !init_ok {
+                        return;
+                    }
+                    if let Item::Edge(edge) = item && edge.block == h_u32 {
+                        if let Some((astart, argc)) = edge.args && pos < argc {
+                            let arg = at_u32(view.extra, astart + pos);
+                            if let Some(prev) = init_val {
+                                if prev != arg {
+                                    init_ok = false;
+                                }
+                            } else {
+                                init_val = Some(arg);
+                            }
+                        } else {
+                            init_ok = false;
+                        }
+                    }
+                });
+                let (Some(init_v), true) = (init_val, init_ok) else {
+                    continue;
+                };
+                if init_v == p_inst {
+                    continue;
+                }
+                // Verify every back-edge into `H` passes a value proven `<= p_inst`.
+                let mut all_back_ok = true;
+                let mut saw_back_edge = false;
+                for &bp_u32 in ps {
+                    let bpi = to_idx(bp_u32);
+                    if !reachable.get(bpi).copied().unwrap_or(false)
+                        || reach_no_h.get(bpi).copied().unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    let bterm = view.terminator(Block(bp_u32));
+                    each(&view, bterm, |item| {
+                        if !all_back_ok {
+                            return;
+                        }
+                        if let Item::Edge(edge) = item && edge.block == h_u32 {
+                            saw_back_edge = true;
+                            if let Some((astart, argc)) = edge.args && pos < argc {
+                                let arg = at_u32(view.extra, astart + pos);
+                                if !is_proven_ule(
+                                    &view,
+                                    &preds,
+                                    &inst_block,
+                                    &block_facts,
+                                    &reachable,
+                                    &reach_no_h,
+                                    h,
+                                    bpi,
+                                    arg,
+                                    p_inst,
+                                ) {
+                                    all_back_ok = false;
+                                }
+                            } else {
+                                all_back_ok = false;
+                            }
+                        }
+                    });
+                    if !all_back_ok {
+                        break;
+                    }
+                }
+                if !all_back_ok || !saw_back_edge {
+                    continue;
+                }
+                // Collect `Ule(p_inst, init_v)` plus any direct transitive upper bounds on `init_v`.
+                let mut derived = [None; 4];
+                let mut dlen: usize = 0;
+                if let Some(slot) = derived.get_mut(dlen) {
+                    *slot = Some(RelFact { cond: IntCond::Ule, a: p_inst, b: init_v });
+                    dlen += 1;
+                }
+                if let Some((base_n, _)) = decompose_usub_sat_const(&view, init_v)
+                    && let Some(slot) = derived.get_mut(dlen)
+                {
+                    *slot = Some(RelFact { cond: IntCond::Ule, a: p_inst, b: base_n });
+                    dlen += 1;
+                }
+                let h_facts_len = block_facts.get(h).map_or(0, Vec::len);
+                for k in 0..h_facts_len {
+                    if dlen >= derived.len() {
+                        break;
+                    }
+                    let Some(hf) = block_facts.get(h).and_then(|v| v.get(k)).copied() else {
+                        continue;
+                    };
+                    let extra_rel = if hf.a == init_v {
+                        match hf.cond {
+                            IntCond::Ule | IntCond::Eq => Some((IntCond::Ule, hf.b)),
+                            IntCond::Ult => Some((IntCond::Ult, hf.b)),
+                            _ => None,
+                        }
+                    } else if hf.b == init_v {
+                        match hf.cond {
+                            IntCond::Uge | IntCond::Eq => Some((IntCond::Ule, hf.a)),
+                            IntCond::Ugt => Some((IntCond::Ult, hf.a)),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some((cond, ob)) = extra_rel
+                        && ob != p_inst
+                        && let Some(slot) = derived.get_mut(dlen)
+                    {
+                        *slot = Some(RelFact { cond, a: p_inst, b: ob });
+                        dlen += 1;
+                    }
+                }
+                // Propagate the proven invariant to `H` and every reachable block dominated by `H`.
+                for d in 0..blocks {
+                    let dominated_by_h = d == h
+                        || (reachable.get(d).copied().unwrap_or(false)
+                            && !reach_no_h.get(d).copied().unwrap_or(true));
+                    if dominated_by_h && let Some(dst) = block_facts.get_mut(d) {
+                        for f in derived.into_iter().take(dlen).flatten() {
+                            push_unique_fact(dst, f);
                         }
                     }
                 }
@@ -693,7 +1492,18 @@ pub fn eliminate_redundant_checks<A: Allocator + Copy>(
             } else if op == Op::Br {
                 let at = to_idx(at_u32(view.data, inst));
                 let cv = at_u32(view.extra, at);
-                let folded_cv = folded_const.get(to_idx(cv)).copied().flatten();
+                let folded_cv = folded_const.get(to_idx(cv)).copied().flatten().or_else(|| {
+                    let (raw_cv, flipped) = unwrap_bool_cond(&view, cv);
+                    if raw_cv != cv {
+                        folded_const
+                            .get(to_idx(raw_cv))
+                            .copied()
+                            .flatten()
+                            .map(|r| r ^ flipped)
+                    } else {
+                        None
+                    }
+                });
                 if let Some(res) = folded_cv
                     .or_else(|| b_bools.iter().find(|&&(v, _)| v == cv).map(|&(_, r)| r))
                 {
@@ -714,13 +1524,6 @@ pub fn eliminate_redundant_checks<A: Allocator + Copy>(
         br_inst: usize,
         m_params_start: usize,
         m_params_len: usize,
-    }
-    let mut inst_block = filled(len, 0u32, &alloc);
-    for b in 0..blocks {
-        let b32 = to_u32(b);
-        for inst in view.block(Block(b32)) {
-            set_at(&mut inst_block, inst, b32);
-        }
     }
     let mut threadable: Vec<Option<ThreadTarget>, A> = Vec::with_capacity_in(blocks, alloc);
     for b in 0..blocks {
@@ -1387,6 +2190,110 @@ mod tests {
         assert!(
             (0..bce_bad.func.view().len()).any(|k| bce_bad.func.view().op(k) == Op::Trap),
             "`zext(u32 -> u64, x & 63) < 63` trap must NOT be eliminated!"
+        );
+    }
+
+    #[test]
+    fn eliminates_binary_search_midpoint_bounds_check() {
+        use crate::func::SlotKind;
+
+        let build = |monotone_hi: bool| {
+            let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let table_slot = b.slot(8 * 8, 8, SlotKind::Temp);
+            let [entry, hdr, chk, oob, body, go_right, go_left, exit] =
+                [(); 8].map(|_| b.create_block(BlockKind::Normal));
+
+            b.begin(entry);
+            let len = b.param(Ty::I64);
+            let q = b.param(Ty::I64);
+            let ptr = b.slot_addr(table_slot);
+            for k in 0..8u32 {
+                let elem = b.iconst(Ty::I64, u128::from((k + 1) * 10));
+                b.store(Flags::NONE, elem, ptr, (k * 8) as i32, MemAttrs::aligned(3));
+            }
+            let z = b.iconst(Ty::I64, 0);
+            let one = b.iconst(Ty::I64, 1);
+            let three = b.iconst(Ty::I64, 3);
+            b.jump((hdr, &[z, len]));
+
+            b.begin(hdr);
+            let lo = b.param(Ty::I64);
+            let hi = b.param(Ty::I64);
+            let keep = b.icmp(IntCond::Ult, lo, hi);
+            b.br(Flags::NONE, keep, (chk, &[]), (exit, &[lo]));
+
+            b.begin(chk);
+            let diff = b.binary(Op::Sub, Flags::NONE, hi, lo);
+            let half = b.binary(Op::Lshr, Flags::NONE, diff, one);
+            let mid = b.binary(Op::Add, Flags::NONE, lo, half);
+            let in_bounds = b.icmp(IntCond::Ult, mid, len);
+            b.br(Flags::NONE, in_bounds, (body, &[]), (oob, &[]));
+
+            b.begin(oob);
+            b.trap(1);
+
+            b.begin(body);
+            let byte_off = b.binary(Op::Shl, Flags::NONE, mid, three);
+            let ep = b.ptr_add(Flags::NONE, ptr, byte_off);
+            let val = b.load(Ty::I64, Flags::NONE, ep, 0, MemAttrs::aligned(3));
+            let lt_q = b.icmp(IntCond::Ult, val, q);
+            b.br(Flags::NONE, lt_q, (go_right, &[]), (go_left, &[]));
+
+            b.begin(go_right);
+            let lo_next = b.binary(Op::Add, Flags::NONE, mid, one);
+            b.jump((hdr, &[lo_next, hi]));
+
+            b.begin(go_left);
+            let hi_next = if monotone_hi {
+                mid
+            } else {
+                b.binary(Op::Add, Flags::NONE, hi, one)
+            };
+            b.jump((hdr, &[lo, hi_next]));
+
+            b.begin(exit);
+            let res = b.param(Ty::I64);
+            b.ret(&[res]);
+            b.finish_checked().unwrap()
+        };
+
+        // Positive: `lo = 0, hi = len; while lo < hi { mid = lo + ((hi - lo) >> 1); check(mid < len); ... }`
+        let func = build(true);
+        let bce = eliminate_redundant_checks(func.view(), TestHeap).unwrap();
+        verify(bce.func.view()).unwrap();
+        assert!(bce.stats.checks_eliminated >= 1);
+        let v = bce.func.view();
+        assert!(
+            !(0..v.len()).any(|k| matches!(v.op(k), Op::Trap | Op::Unreachable)),
+            "binary-search midpoint bounds check must be completely eliminated (0 Trap/Unreachable)"
+        );
+        for &len_v in &[0u128, 1, 2, 5, 7, 8] {
+            for &qv in &[0u128, 10, 25, 40, 75, 80, 99] {
+                let args = [Val::Int(len_v), Val::Int(qv)];
+                let Outcome::Returned(orig) = eval::run_in(func.view(), &args, 20_000, TestHeap).unwrap() else {
+                    panic!("orig bsearch eval failed at len={len_v}, q={qv}");
+                };
+                let Outcome::Returned(opt) = eval::run_in(bce.func.view(), &args, 20_000, TestHeap).unwrap() else {
+                    panic!("bce bsearch eval failed at len={len_v}, q={qv}");
+                };
+                assert_eq!(orig, opt, "bsearch BCE mismatch at len={len_v}, q={qv}");
+            }
+        }
+
+        // Negative control: if a back-edge increments `hi`, `Ule(hi, len)` is NOT invariant and Trap MUST stay.
+        let func_bad = build(false);
+        let bce_bad = eliminate_redundant_checks(func_bad.view(), TestHeap).unwrap();
+        verify(bce_bad.func.view()).unwrap();
+        assert!(
+            (0..bce_bad.func.view().len()).any(|k| bce_bad.func.view().op(k) == Op::Trap),
+            "non-monotone `hi` back-edge must NOT eliminate bounds check trap!"
         );
     }
 }
