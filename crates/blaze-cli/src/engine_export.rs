@@ -716,6 +716,7 @@ fn export_program<'f>(
         &mut maker,
         lto_opts,
         alloc,
+        heap.alloc(),
     )
     .map_err(|why| {
         box_err(

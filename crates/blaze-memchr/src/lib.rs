@@ -53,6 +53,7 @@ mod tests;
 
 use core::simd::{Mask, Simd, cmp::SimdPartialEq};
 
+pub use blaze_int;
 use blaze_int::Int;
 
 /// A vector of byte lanes. `eq` gives a `Hit` (which lanes are equal), `or` and `and` combine

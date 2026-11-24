@@ -3,7 +3,7 @@
 
 use core::alloc::Allocator;
 
-use blaze_own::{ByteCursor, RevBitCursor, SeqOp, Vec};
+use blaze_own::{ByteCursor, Int, RevBitCursor, SeqLeafResult, SeqOp, Vec};
 
 use crate::dict::MAX_DICT_BYTES;
 use crate::fse::{
@@ -18,25 +18,17 @@ use crate::{
 };
 
 const MAX_PREALLOC_HINT: usize = 16 << 20;
-const ZERO_PAGE: [u8; 4096] = [0u8; 4096];
 
-/// Grow `lit_buf` (reused across blocks and calls) via 4 KiB bulk `memcpy` chunks.
+/// Grow `lit_buf` (reused across blocks and calls) via a single `memset` into spare capacity.
 #[inline]
 fn grow_lit_buf<A: Allocator>(buf: &mut Vec<u8, A>, target: usize) -> Result<(), ZstdError> {
     if buf.len() >= target {
         return Ok(());
     }
-    let mut rem = target - buf.len();
-    buf.try_reserve(rem)?;
-    while rem >= ZERO_PAGE.len() {
-        buf.try_extend_from_slice(&ZERO_PAGE)?;
-        rem -= ZERO_PAGE.len();
-    }
-    if rem > 0
-        && let Some(tail) = ZERO_PAGE.get(..rem)
-    {
-        buf.try_extend_from_slice(tail)?;
-    }
+    let rem = target - buf.len();
+    let mut cur = buf.byte_cursor();
+    cur.try_fill_bytes(0, rem)?;
+    cur.finish();
     Ok(())
 }
 
@@ -89,28 +81,22 @@ impl<'a> Cursor<'a> {
     #[inline]
     fn read_u16_le(&mut self) -> Result<u16, ZstdError> {
         let bytes = self.read_slice(2)?;
-        let [b0, b1] = *bytes else {
-            return Err(ZstdError::Truncated);
-        };
-        Ok(u16::from_le_bytes([b0, b1]))
+        let &arr = bytes.first_chunk::<2>().ok_or(ZstdError::Truncated)?;
+        Ok(u16::from_le_bytes(arr))
     }
 
     #[inline]
     fn read_u32_le(&mut self) -> Result<u32, ZstdError> {
         let bytes = self.read_slice(4)?;
-        let [b0, b1, b2, b3] = *bytes else {
-            return Err(ZstdError::Truncated);
-        };
-        Ok(u32::from_le_bytes([b0, b1, b2, b3]))
+        let &arr = bytes.first_chunk::<4>().ok_or(ZstdError::Truncated)?;
+        Ok(u32::from_le_bytes(arr))
     }
 
     #[inline]
     fn read_u64_le(&mut self) -> Result<u64, ZstdError> {
         let bytes = self.read_slice(8)?;
-        let [b0, b1, b2, b3, b4, b5, b6, b7] = *bytes else {
-            return Err(ZstdError::Truncated);
-        };
-        Ok(u64::from_le_bytes([b0, b1, b2, b3, b4, b5, b6, b7]))
+        let &arr = bytes.first_chunk::<8>().ok_or(ZstdError::Truncated)?;
+        Ok(u64::from_le_bytes(arr))
     }
 }
 
@@ -184,8 +170,7 @@ pub(crate) fn peek_frame_content_size(input: &[u8]) -> Result<Option<u64>, ZstdE
         }
         if (SKIPPABLE_MAGIC_MIN..=SKIPPABLE_MAGIC_MAX).contains(&magic) {
             let skip_u32 = cur.read_u32_le()?;
-            let skip_len = usize::try_from(skip_u32).map_err(|_| ZstdError::Truncated)?;
-            cur.skip(skip_len)?;
+            cur.skip(skip_u32.widen_to::<usize>())?;
             if cur.is_empty() {
                 return Ok(Some(0));
             }
@@ -367,8 +352,7 @@ fn decompress_into_core<A: Allocator, O: Allocator>(
         let magic = cur.read_u32_le()?;
         if (SKIPPABLE_MAGIC_MIN..=SKIPPABLE_MAGIC_MAX).contains(&magic) {
             let skip_u32 = cur.read_u32_le()?;
-            let skip_len = usize::try_from(skip_u32).map_err(|_| ZstdError::Truncated)?;
-            cur.skip(skip_len)?;
+            cur.skip(skip_u32.widen_to::<usize>())?;
             continue;
         }
         if magic != ZSTD_MAGIC {
@@ -379,13 +363,11 @@ fn decompress_into_core<A: Allocator, O: Allocator>(
         let produced_so_far = out.len().saturating_sub(start_out_len);
         if let Some(cs) = hdr.content_size {
             let rem_cap = limits.most_output_bytes.saturating_sub(produced_so_far);
-            let rem_cap_u64 = u64::try_from(rem_cap).unwrap_or(u64::MAX);
-            if cs > rem_cap_u64 {
+            if cs > rem_cap.widen_to::<u64>() {
                 return Err(ZstdError::OutputTooLarge { limit: limits.most_output_bytes });
             }
         }
-        let win_limit_u64 = u64::try_from(limits.most_window_bytes).unwrap_or(u64::MAX);
-        if hdr.window_bytes > win_limit_u64 {
+        if hdr.window_bytes > limits.most_window_bytes.widen_to::<u64>() {
             return Err(ZstdError::WindowTooLarge {
                 window_bytes: hdr.window_bytes,
                 limit: limits.most_window_bytes,
@@ -402,20 +384,17 @@ fn decompress_into_core<A: Allocator, O: Allocator>(
             // Reserve the entire frame once without zeroing (plus 64B slack for NEON wildcopy).
             if let Some(cs) = hdr.content_size {
                 let safe_cap = input.len().saturating_mul(16).max(65_536).min(MAX_PREALLOC_HINT);
-                let hint = usize::try_from(cs).unwrap_or(safe_cap).min(safe_cap);
+                let hint = cs.saturate::<usize>().min(safe_cap);
                 writer.try_reserve(hint.saturating_add(64))?;
             }
 
             loop {
                 let bh = cur.read_slice(3)?;
-                let [b0, b1, b2] = *bh else {
-                    return Err(ZstdError::Truncated);
-                };
+                let &[b0, b1, b2] = bh.first_chunk::<3>().ok_or(ZstdError::Truncated)?;
                 let hdr_u32 = u32::from_le_bytes([b0, b1, b2, 0]);
                 let last_block = (hdr_u32 & 1) != 0;
                 let block_type = (hdr_u32 >> 1) & 0x03;
-                let block_size =
-                    usize::try_from(hdr_u32 >> 3).map_err(|_| ZstdError::Truncated)?;
+                let block_size = (hdr_u32 >> 3).widen_to::<usize>();
 
                 match block_type {
                     0 => {
@@ -473,9 +452,7 @@ fn decompress_into_core<A: Allocator, O: Allocator>(
         if hdr.checksum_flag {
             let expected = cur.read_u32_le()?;
             let frame_slice = out.get(frame_start..).ok_or(ZstdError::CorruptSequences)?;
-            let hash = xxh64(frame_slice, 0);
-            let [c0, c1, c2, c3, ..] = hash.to_le_bytes();
-            let actual = u32::from_le_bytes([c0, c1, c2, c3]);
+            let actual = xxh64(frame_slice, 0).truncate_to::<u32>();
             if !skip_checksum && actual != expected {
                 return Err(ZstdError::ChecksumMismatch { expected, actual });
             }
@@ -483,7 +460,7 @@ fn decompress_into_core<A: Allocator, O: Allocator>(
 
         if let Some(expected) = hdr.content_size {
             let actual = out.len().saturating_sub(frame_start);
-            if u64::try_from(actual).ok() != Some(expected) {
+            if actual.widen_to::<u64>() != expected {
                 return Err(ZstdError::ContentSizeMismatch { expected, actual });
             }
         }
@@ -541,10 +518,8 @@ fn decode_literals<'a, A: Allocator>(
                     let b1 = cur.read_u8().map_err(|_| ZstdError::CorruptLiterals)?;
                     let b2 = cur.read_u8().map_err(|_| ZstdError::CorruptLiterals)?;
                     let v = u32::from_le_bytes([b0, b1, b2, 0]);
-                    let regen = usize::try_from((v >> 4) & 0x3FF)
-                        .map_err(|_| ZstdError::CorruptLiterals)?;
-                    let comp = usize::try_from((v >> 14) & 0x3FF)
-                        .map_err(|_| ZstdError::CorruptLiterals)?;
+                    let regen = ((v >> 4) & 0x3FF).widen_to::<usize>();
+                    let comp = ((v >> 14) & 0x3FF).widen_to::<usize>();
                     let streams: u8 = if size_format == 0 { 1 } else { 4 };
                     (streams, regen, comp)
                 }
@@ -553,10 +528,8 @@ fn decode_literals<'a, A: Allocator>(
                     let b2 = cur.read_u8().map_err(|_| ZstdError::CorruptLiterals)?;
                     let b3 = cur.read_u8().map_err(|_| ZstdError::CorruptLiterals)?;
                     let v = u32::from_le_bytes([b0, b1, b2, b3]);
-                    let regen = usize::try_from((v >> 4) & 0x3FFF)
-                        .map_err(|_| ZstdError::CorruptLiterals)?;
-                    let comp = usize::try_from((v >> 18) & 0x3FFF)
-                        .map_err(|_| ZstdError::CorruptLiterals)?;
+                    let regen = ((v >> 4) & 0x3FFF).widen_to::<usize>();
+                    let comp = ((v >> 18) & 0x3FFF).widen_to::<usize>();
                     (4u8, regen, comp)
                 }
                 _ => {
@@ -565,10 +538,8 @@ fn decode_literals<'a, A: Allocator>(
                     let b3 = cur.read_u8().map_err(|_| ZstdError::CorruptLiterals)?;
                     let b4 = cur.read_u8().map_err(|_| ZstdError::CorruptLiterals)?;
                     let v = u64::from_le_bytes([b0, b1, b2, b3, b4, 0, 0, 0]);
-                    let regen = usize::try_from((v >> 4) & 0x3_FFFF)
-                        .map_err(|_| ZstdError::CorruptLiterals)?;
-                    let comp = usize::try_from((v >> 22) & 0x3_FFFF)
-                        .map_err(|_| ZstdError::CorruptLiterals)?;
+                    let regen = ((v >> 4) & 0x3_FFFF).truncate_to::<usize>();
+                    let comp = ((v >> 22) & 0x3_FFFF).truncate_to::<usize>();
                     (4u8, regen, comp)
                 }
             };
@@ -662,7 +633,7 @@ fn resolve_offset(
 ) -> Result<usize, ZstdError> {
     let [r0, r1, r2] = *rep;
     if offset_value > 3 {
-        let off = usize::try_from(offset_value - 3).map_err(|_| ZstdError::CorruptSequences)?;
+        let off = (offset_value - 3).widen_to::<usize>();
         *rep = [off, r0, r1];
         return Ok(off);
     }
@@ -730,19 +701,10 @@ struct FastSeqOut<'a> {
 }
 
 #[inline(always)]
-fn extract_top(win: u64, n: u32) -> u32 {
-    // `(!n) & 63 == 63 - (n & 63)`, exact for all `n in 0..=32` (returns `0` when `n == 0`)
-    // and compiles to a single `mvn` + `lsr` reusing the already-extracted `n` register.
-    let v = (win >> 1).wrapping_shr(!n);
-    let [b0, b1, b2, b3, ..] = v.to_le_bytes();
-    u32::from_le_bytes([b0, b1, b2, b3])
-}
-
-#[inline(always)]
-fn extract_top_usize(win: u64, n: u32) -> usize {
-    // Directly produces `usize` for FSE state deltas (`n <= 9`), avoiding 32->64 zero-extend moves.
-    let v = (win >> 1).wrapping_shr(!n);
-    usize::try_from(v).unwrap_or(0)
+fn extract_top_u64(w: u64, nbits: u64) -> u64 {
+    // `63 ^ nbits == 63 - nbits` for all `nbits in 0..=63` (returns `0` when `nbits == 0`),
+    // compiling to a single immediate `eor x, x, #63` + `lsr` with zero `ubfx #0, #32`.
+    (w >> 1) >> (63u64 ^ nbits)
 }
 
 struct FusedState<'a> {
@@ -768,6 +730,8 @@ enum LeafStop {
 ///
 /// - Indexes all three pre-resolved FSE tables (`LL`, `OF`, `ML`) from ONE base pointer register
 ///   via the flat 2048-entry `SeqTables` array.
+/// - Holds `SeqExecCtx` in registers across the loop and commits `len` back to `writer` once at
+///   exit via `ctx.finish()`, breaking the store-to-load stall on `writer.len`.
 /// - Specializes `FULL_WINDOW` (`frame_start == 0 && block_out_limit <= win_usize`, true for all
 ///   frames fitting within their window), eliminating `frame_start`, `win_usize`, and `umin`.
 /// - Counts `rem` down to zero so `last_idx` needs no register, keeping hot pointers in GPRs.
@@ -790,10 +754,9 @@ fn decode_exec_leaf<const SINGLE_RELOAD: bool, const FULL_WINDOW: bool, A: Alloc
     let [mut r0, mut r1, mut r2] = st.rep;
     let mut lit_pos = st.lit_pos;
     let mut rem = last_idx.saturating_sub(st.seq_idx);
-    let lit_safe_end = literals.len().saturating_sub(32);
-    let out_safe_limit = block_out_limit.min(writer.cap().saturating_sub(48));
     let min_avail: usize = if SINGLE_RELOAD { 8 } else { 16 };
     let mut stop = LeafStop::Done;
+    let mut ctx = writer.seq_exec_ctx(literals, block_out_limit);
 
     while rem > 0 && br.avail_bytes() >= min_avail {
         let e_ll = tables.entry_flat(ll_state);
@@ -803,9 +766,15 @@ fn decode_exec_leaf<const SINGLE_RELOAD: bool, const FULL_WINDOW: bool, A: Alloc
         if !br.reload_if_slack8() {
             break;
         }
-        let (of_base, of_eb, of_nb, of_bl) = e_of.unpack();
-        let (ml_base, ml_eb, ml_nb, ml_bl) = e_ml.unpack();
-        let (ll_base, ll_eb, ll_nb, ll_bl) = e_ll.unpack();
+
+        // Extract bit widths as native `u64` from the 3 packed `u64` entries (`e_ll`, `e_of`,
+        // `e_ml`), avoiding 32-to-64 zero-extension (`ubfx #0, #32`) on AArch64.
+        let of_eb = e_of.extra_bits_u64();
+        let ml_eb = e_ml.extra_bits_u64();
+        let ll_eb = e_ll.extra_bits_u64();
+        let ll_nb = e_ll.num_bits_u64();
+        let ml_nb = e_ml.num_bits_u64();
+        let of_nb = e_of.num_bits_u64();
 
         // Balanced parallel bit-offset tree: `o_ll_nb` and `o_ml_nb` resolve together in 2 cycles.
         let o_ll_eb = of_eb + ml_eb;
@@ -820,15 +789,17 @@ fn decode_exec_leaf<const SINGLE_RELOAD: bool, const FULL_WINDOW: bool, A: Alloc
         }
 
         let we = br.bits_window();
-        br.advance_fast(total);
+        br.advance_fast(total.truncate_to::<u32>());
 
-        ll_state = ll_bl + extract_top_usize(we.wrapping_shl(o_ll_nb), ll_nb);
-        ml_state = ml_bl + extract_top_usize(we.wrapping_shl(o_ml_nb), ml_nb);
-        of_state = of_bl + extract_top_usize(we.wrapping_shl(o_of_nb), of_nb);
+        ll_state = e_ll.baseline() + extract_top_u64(we << o_ll_nb, ll_nb).truncate_to::<usize>();
+        ml_state = e_ml.baseline() + extract_top_u64(we << o_ml_nb, ml_nb).truncate_to::<usize>();
+        of_state = e_of.baseline() + extract_top_u64(we << o_of_nb, of_nb).truncate_to::<usize>();
 
-        let offset_value = of_base.wrapping_add(extract_top(we, of_eb));
-        let match_len_u32 = ml_base.wrapping_add(extract_top(we.wrapping_shl(of_eb), ml_eb));
-        let lit_len_u32 = ll_base.wrapping_add(extract_top(we.wrapping_shl(o_ll_eb), ll_eb));
+        let offset_value = e_of.base().wrapping_add(extract_top_u64(we, of_eb).truncate_to::<u32>());
+        let match_len_u32 =
+            e_ml.base().wrapping_add(extract_top_u64(we << of_eb, ml_eb).truncate_to::<u32>());
+        let lit_len_u32 =
+            e_ll.base().wrapping_add(extract_top_u64(we << o_ll_eb, ll_eb).truncate_to::<u32>());
 
         // Branchless 2-level `csel` tree in 32-bit registers for repeat offsets.
         let rep_code = offset_value.wrapping_sub(1) + u32::from(lit_len_u32 == 0);
@@ -842,56 +813,53 @@ fn decode_exec_leaf<const SINGLE_RELOAD: bool, const FULL_WINDOW: bool, A: Alloc
         r1 = if rep_code == 0 { r1 } else { r0 };
         r0 = actual_offset;
 
-        let lit_len = usize::try_from(lit_len_u32).unwrap_or(usize::MAX);
-        let match_len = usize::try_from(match_len_u32).unwrap_or(usize::MAX);
-        let off_usize = usize::try_from(actual_offset).unwrap_or(usize::MAX);
+        let lit_len = lit_len_u32.widen_to::<usize>();
+        let match_len = match_len_u32.widen_to::<usize>();
+        let off_usize = actual_offset.widen_to::<usize>();
 
-        let lit_end = lit_pos + lit_len;
-        let after_lit = writer.len() + lit_len;
-        let next_out = after_lit + match_len;
-        let max_off = if FULL_WINDOW {
-            after_lit
-        } else {
-            (after_lit - frame_start).min(win_usize)
-        };
-        if lit_pos > lit_safe_end
-            || lit_len > 32
-            || next_out > out_safe_limit
-            || off_usize.wrapping_sub(1) >= max_off
-        {
-            if lit_end > literals.len() {
+        match ctx.exec_leaf(
+            lit_pos,
+            lit_len,
+            off_usize,
+            match_len,
+            block_out_limit,
+            frame_start,
+            win_usize,
+            FULL_WINDOW,
+        ) {
+            SeqLeafResult::Done => {
+                lit_pos += lit_len;
+                rem -= 1;
+            }
+            SeqLeafResult::Pending => {
+                stop = LeafStop::Pending(SeqOp {
+                    lit_len: lit_len_u32,
+                    match_len: match_len_u32,
+                    offset: actual_offset,
+                });
+                break;
+            }
+            SeqLeafResult::LitOverflow => {
                 stop = LeafStop::LitOverflow;
                 break;
             }
-            if next_out > block_out_limit {
-                stop = LeafStop::OutOverflow { next_out };
+            SeqLeafResult::OutOverflow => {
+                stop = LeafStop::OutOverflow { next_out: ctx.len() + lit_len + match_len };
                 break;
             }
-            if off_usize.wrapping_sub(1) >= max_off {
-                let available = if FULL_WINDOW { after_lit } else { after_lit - frame_start };
+            SeqLeafResult::BadOffset => {
+                let available = if FULL_WINDOW {
+                    ctx.len() + lit_len
+                } else {
+                    (ctx.len() + lit_len).saturating_sub(frame_start)
+                };
                 stop = LeafStop::BadOffset { offset: off_usize, available };
                 break;
             }
-            stop = LeafStop::Pending(SeqOp {
-                lit_len: lit_len_u32,
-                match_len: match_len_u32,
-                offset: actual_offset,
-            });
-            break;
         }
-
-        if !writer.try_exec_seq_leaf(literals, lit_pos, lit_len, off_usize, match_len) {
-            stop = LeafStop::Pending(SeqOp {
-                lit_len: lit_len_u32,
-                match_len: match_len_u32,
-                offset: actual_offset,
-            });
-            break;
-        }
-        lit_pos = lit_end;
-        rem -= 1;
     }
 
+    ctx.finish();
     st.br = br;
     st.ll_state = ll_state;
     st.of_state = of_state;
@@ -924,26 +892,20 @@ fn decode_one_wide_seq<A: Allocator>(
     let ml_extra = st.br.read_bits_branchless(ml_eb);
     let _ = st.br.reload_if_slack8();
     let ll_extra = st.br.read_bits_branchless(ll_eb);
-    let ll_add = usize::try_from(st.br.read_bits_branchless(ll_nb)).unwrap_or(0);
-    let ml_add = usize::try_from(st.br.read_bits_branchless(ml_nb)).unwrap_or(0);
-    let of_add = usize::try_from(st.br.read_bits_branchless(of_nb)).unwrap_or(0);
+    let ll_add = st.br.read_bits_branchless(ll_nb).widen_to::<usize>();
+    let ml_add = st.br.read_bits_branchless(ml_nb).widen_to::<usize>();
+    let of_add = st.br.read_bits_branchless(of_nb).widen_to::<usize>();
 
     st.ll_state = ll_bl + ll_add;
     st.ml_state = ml_bl + ml_add;
     st.of_state = of_bl + of_add;
 
     let offset_value = of_base.wrapping_add(of_extra);
-    let match_len = usize::try_from(ml_base.wrapping_add(ml_extra))
-        .map_err(|_| ZstdError::CorruptSequences)?;
-    let lit_len = usize::try_from(ll_base.wrapping_add(ll_extra))
-        .map_err(|_| ZstdError::CorruptSequences)?;
+    let match_len = ml_base.wrapping_add(ml_extra).widen_to::<usize>();
+    let lit_len = ll_base.wrapping_add(ll_extra).widen_to::<usize>();
 
     let [r0, r1, r2] = st.rep;
-    let mut rep_usize = [
-        usize::try_from(r0).unwrap_or(usize::MAX),
-        usize::try_from(r1).unwrap_or(usize::MAX),
-        usize::try_from(r2).unwrap_or(usize::MAX),
-    ];
+    let mut rep_usize = [r0.widen_to::<usize>(), r1.widen_to::<usize>(), r2.widen_to::<usize>()];
     let lit_end = st.lit_pos.checked_add(lit_len).ok_or(ZstdError::CorruptSequences)?;
     if lit_end > literals.len() {
         return Err(ZstdError::CorruptSequences);
@@ -964,11 +926,7 @@ fn decode_one_wide_seq<A: Allocator>(
         return Err(ZstdError::BadOffset { offset: actual_offset, available });
     }
     let [nr0, nr1, nr2] = rep_usize;
-    st.rep = [
-        u32::try_from(nr0).unwrap_or(u32::MAX),
-        u32::try_from(nr1).unwrap_or(u32::MAX),
-        u32::try_from(nr2).unwrap_or(u32::MAX),
-    ];
+    st.rep = [nr0.saturate::<u32>(), nr1.saturate::<u32>(), nr2.saturate::<u32>()];
     if !writer.exec_seq_within_cap(literals, st.lit_pos, lit_len, actual_offset, match_len) {
         return Err(ZstdError::OutputTooLarge { limit });
     }
@@ -1002,11 +960,7 @@ fn decode_sequences_fast<'a, A: Allocator>(
         ll_state,
         of_state,
         ml_state,
-        rep: [
-            u32::try_from(r0_in).unwrap_or(u32::MAX),
-            u32::try_from(r1_in).unwrap_or(u32::MAX),
-            u32::try_from(r2_in).unwrap_or(u32::MAX),
-        ],
+        rep: [r0_in.saturate::<u32>(), r1_in.saturate::<u32>(), r2_in.saturate::<u32>()],
         lit_pos: 0,
         seq_idx: 0,
     };
@@ -1059,12 +1013,9 @@ fn decode_sequences_fast<'a, A: Allocator>(
         match stop {
             LeafStop::Done => break,
             LeafStop::Pending(seq) => {
-                let lit_len =
-                    usize::try_from(seq.lit_len).map_err(|_| ZstdError::CorruptSequences)?;
-                let match_len =
-                    usize::try_from(seq.match_len).map_err(|_| ZstdError::CorruptSequences)?;
-                let offset =
-                    usize::try_from(seq.offset).map_err(|_| ZstdError::CorruptSequences)?;
+                let lit_len = seq.lit_len.widen_to::<usize>();
+                let match_len = seq.match_len.widen_to::<usize>();
+                let offset = seq.offset.widen_to::<usize>();
                 if !writer.exec_seq_within_cap(literals, st.lit_pos, lit_len, offset, match_len) {
                     return Err(ZstdError::OutputTooLarge { limit });
                 }
@@ -1104,11 +1055,7 @@ fn decode_sequences_fast<'a, A: Allocator>(
         ll_state: st.ll_state,
         of_state: st.of_state,
         ml_state: st.ml_state,
-        rep: [
-            usize::try_from(r0_out).unwrap_or(usize::MAX),
-            usize::try_from(r1_out).unwrap_or(usize::MAX),
-            usize::try_from(r2_out).unwrap_or(usize::MAX),
-        ],
+        rep: [r0_out.widen_to::<usize>(), r1_out.widen_to::<usize>(), r2_out.widen_to::<usize>()],
         lit_pos: st.lit_pos,
         seq_idx: st.seq_idx,
     })
@@ -1209,12 +1156,9 @@ fn decode_compressed_block<A: Allocator, O: Allocator>(
     let of_log = u32::from(state.seqs.of_log());
     let ml_log = u32::from(state.seqs.ml_log());
 
-    let ll_raw = usize::try_from(br.read_bits(ll_log).ok_or(ZstdError::CorruptSequences)?)
-        .map_err(|_| ZstdError::CorruptSequences)?;
-    let of_raw = usize::try_from(br.read_bits(of_log).ok_or(ZstdError::CorruptSequences)?)
-        .map_err(|_| ZstdError::CorruptSequences)?;
-    let ml_raw = usize::try_from(br.read_bits(ml_log).ok_or(ZstdError::CorruptSequences)?)
-        .map_err(|_| ZstdError::CorruptSequences)?;
+    let ll_raw = br.read_bits(ll_log).ok_or(ZstdError::CorruptSequences)?.widen_to::<usize>();
+    let of_raw = br.read_bits(of_log).ok_or(ZstdError::CorruptSequences)?.widen_to::<usize>();
+    let ml_raw = br.read_bits(ml_log).ok_or(ZstdError::CorruptSequences)?.widen_to::<usize>();
 
     if ll_raw >= (1usize << ll_log)
         || of_raw >= (1usize << of_log)
@@ -1232,7 +1176,7 @@ fn decode_compressed_block<A: Allocator, O: Allocator>(
     let block_reserve = block_out_limit.saturating_sub(block_start_out).saturating_add(64);
     writer.try_reserve(block_reserve)?;
 
-    let win_usize = usize::try_from(window_bytes).unwrap_or(usize::MAX);
+    let win_usize = window_bytes.saturate::<usize>();
     let lit_total = literals.len();
     let last_idx = num_seq - 1;
 
@@ -1273,22 +1217,20 @@ fn decode_compressed_block<A: Allocator, O: Allocator>(
         let ml_extra = br.read_bits(ml_eb).ok_or(ZstdError::CorruptSequences)?;
         let ll_extra = br.read_bits(ll_eb).ok_or(ZstdError::CorruptSequences)?;
         if seq_idx < last_idx {
-            let ll_add = usize::try_from(br.read_bits(ll_nb).ok_or(ZstdError::CorruptSequences)?)
-                .map_err(|_| ZstdError::CorruptSequences)?;
-            let ml_add = usize::try_from(br.read_bits(ml_nb).ok_or(ZstdError::CorruptSequences)?)
-                .map_err(|_| ZstdError::CorruptSequences)?;
-            let of_add = usize::try_from(br.read_bits(of_nb).ok_or(ZstdError::CorruptSequences)?)
-                .map_err(|_| ZstdError::CorruptSequences)?;
+            let ll_add =
+                br.read_bits(ll_nb).ok_or(ZstdError::CorruptSequences)?.widen_to::<usize>();
+            let ml_add =
+                br.read_bits(ml_nb).ok_or(ZstdError::CorruptSequences)?.widen_to::<usize>();
+            let of_add =
+                br.read_bits(of_nb).ok_or(ZstdError::CorruptSequences)?.widen_to::<usize>();
             ll_state = ll_bl + ll_add;
             ml_state = ml_bl + ml_add;
             of_state = of_bl + of_add;
         }
 
         let offset_value = of_base.wrapping_add(of_extra);
-        let match_len = usize::try_from(ml_base.wrapping_add(ml_extra))
-            .map_err(|_| ZstdError::CorruptSequences)?;
-        let lit_len = usize::try_from(ll_base.wrapping_add(ll_extra))
-            .map_err(|_| ZstdError::CorruptSequences)?;
+        let match_len = ml_base.wrapping_add(ml_extra).widen_to::<usize>();
+        let lit_len = ll_base.wrapping_add(ll_extra).widen_to::<usize>();
 
         let lit_end = lit_pos.checked_add(lit_len).ok_or(ZstdError::CorruptSequences)?;
         if lit_end > lit_total {

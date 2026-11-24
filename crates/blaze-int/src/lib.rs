@@ -390,6 +390,50 @@ macro_rules! truncate {
 
 table!(impls);
 
+/// A `usize` statically proved strictly less than `N` (checked once at construction,
+/// Rule 74 `verify-once` and Rule 76 `correct-by-construction`).
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Idx<const N: usize>(usize);
+
+impl<const N: usize> Idx<N> {
+    /// Construct an `Idx<N>` if `value < N`.
+    #[inline(always)]
+    #[must_use]
+    pub const fn new(value: usize) -> Option<Self> {
+        if value < N { Some(Self(value)) } else { None }
+    }
+
+    /// Construct an `Idx<N>` from `value & (N - 1)`. Compile-time asserts that `N` is a
+    /// non-zero power of two.
+    #[inline(always)]
+    #[must_use]
+    pub const fn from_masked(value: usize) -> Self {
+        let mask = const {
+            assert!(N.is_power_of_two(), "Idx::from_masked requires a non-zero power-of-two N");
+            N - 1
+        };
+        Self(value & mask)
+    }
+
+    /// Construct an `Idx<N>` from any `u8`. Compile-time asserts that `256 <= N`.
+    #[inline(always)]
+    #[must_use]
+    pub const fn from_u8(value: u8) -> Self {
+        const {
+            assert!(256 <= N, "Idx::from_u8 requires N >= 256");
+        }
+        Self(Cast::<u8, usize>::widen(value))
+    }
+
+    /// The proven in-bounds `usize` value (`< N`).
+    #[inline(always)]
+    #[must_use]
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
 // Time as a number: `Nanos`, `Deadline` and the handed-in `Clock` (the module's doc).
 pub mod time;
 
@@ -397,3 +441,35 @@ pub use time::{Clock, Deadline, Nanos};
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod idx_tests {
+    use super::Idx;
+
+    #[test]
+    fn idx_new_checks_bounds() {
+        assert_eq!(Idx::<0>::new(0), None);
+        assert_eq!(Idx::<4>::new(0).map(Idx::get), Some(0));
+        assert_eq!(Idx::<4>::new(3).map(Idx::get), Some(3));
+        assert_eq!(Idx::<4>::new(4), None);
+        assert_eq!(Idx::<4>::new(usize::MAX), None);
+    }
+
+    #[test]
+    fn idx_from_masked_wraps_to_power_of_two() {
+        assert_eq!(Idx::<1>::from_masked(0).get(), 0);
+        assert_eq!(Idx::<1>::from_masked(99).get(), 0);
+        assert_eq!(Idx::<16>::from_masked(0).get(), 0);
+        assert_eq!(Idx::<16>::from_masked(15).get(), 15);
+        assert_eq!(Idx::<16>::from_masked(16).get(), 0);
+        assert_eq!(Idx::<16>::from_masked(usize::MAX).get(), 15);
+    }
+
+    #[test]
+    fn idx_from_u8_covers_all_bytes() {
+        for b in 0u8..=u8::MAX {
+            assert_eq!(Idx::<256>::from_u8(b).get(), usize::from(b));
+            assert_eq!(Idx::<512>::from_u8(b).get(), usize::from(b));
+        }
+    }
+}

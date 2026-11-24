@@ -11,7 +11,7 @@ use core::marker::PhantomData;
 use core::ptr;
 use core::slice;
 
-use crate::{AllocFailure, Vec};
+use crate::{AllocFailure, Int, Vec};
 
 /// A decoded LZ77 sequence `(lit_len, match_len, offset)` for batched execution via
 /// [`ByteCursor::exec_seq_batch`].
@@ -25,6 +25,22 @@ pub struct SeqOp {
 impl SeqOp {
     /// Zero-initialized placeholder entry for fixed-size stack batches.
     pub const ZERO: Self = Self { lit_len: 0, match_len: 0, offset: 0 };
+}
+
+/// Outcome of [`ByteCursor::exec_seq_leaf_checked`] and [`SeqExecCtx::exec_leaf`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SeqLeafResult {
+    /// Sequence executed inline and `ByteCursor::len` advanced.
+    Done,
+    /// Valid sequence that needs general out-of-line handling (e.g., `lit_len > 32`,
+    /// `offset < 8`, `offset < 16 && match_len > 16`, or final slack region).
+    Pending,
+    /// `lit_pos + lit_len > literals.len()`.
+    LitOverflow,
+    /// `self.len + lit_len + match_len > block_out_limit`.
+    OutOverflow,
+    /// `offset == 0 || offset > max_off`.
+    BadOffset,
 }
 
 /// A register-cached, zero-pre-zeroing append cursor over a [`Vec<u8, A>`].
@@ -404,14 +420,14 @@ impl<'a, A: Allocator> ByteCursor<'a, A> {
         offset: usize,
         match_len: usize,
     ) -> bool {
-        let lit_safe_end = literals.len().saturating_sub(32);
-        let out_safe_end = self.cap.saturating_sub(48);
         let len = self.len;
-        let after_lit = len + lit_len;
-        let next_out = after_lit + match_len;
+        let after_lit = len.saturating_add(lit_len);
+        let next_out = after_lit.saturating_add(match_len);
         if lit_len > 32
-            || lit_pos > lit_safe_end
-            || next_out > out_safe_end
+            || literals.len() < 32
+            || lit_pos > literals.len() - 32
+            || self.cap < 48
+            || next_out > self.cap - 48
             || offset == 0
             || offset > after_lit
         {
@@ -445,15 +461,21 @@ impl<'a, A: Allocator> ByteCursor<'a, A> {
             unsafe {
                 let ls = literals.as_ptr().add(lit_pos);
                 let ld = self.base.add(len);
-                ptr::copy_nonoverlapping(ls, ld, 16);
+                ptr::write_unaligned(ld.cast::<u128>(), ptr::read_unaligned(ls.cast::<u128>()));
                 if lit_len > 16 {
-                    ptr::copy_nonoverlapping(ls.add(16), ld.add(16), 16);
+                    ptr::write_unaligned(
+                        ld.add(16).cast::<u128>(),
+                        ptr::read_unaligned(ls.add(16).cast::<u128>()),
+                    );
                 }
                 let ms = self.base.add(after_lit - offset);
                 let md = self.base.add(after_lit);
-                ptr::copy_nonoverlapping(ms, md, 8);
+                ptr::write_unaligned(md.cast::<u64>(), ptr::read_unaligned(ms.cast::<u64>()));
                 if match_len > 8 {
-                    ptr::copy_nonoverlapping(ms.add(8), md.add(8), 8);
+                    ptr::write_unaligned(
+                        md.add(8).cast::<u64>(),
+                        ptr::read_unaligned(ms.add(8).cast::<u64>()),
+                    );
                 }
             }
             self.len = next_out;
@@ -468,22 +490,31 @@ impl<'a, A: Allocator> ByteCursor<'a, A> {
         unsafe {
             let ls = literals.as_ptr().add(lit_pos);
             let ld = self.base.add(len);
-            ptr::copy_nonoverlapping(ls, ld, 16);
+            ptr::write_unaligned(ld.cast::<u128>(), ptr::read_unaligned(ls.cast::<u128>()));
             if lit_len > 16 {
-                ptr::copy_nonoverlapping(ls.add(16), ld.add(16), 16);
+                ptr::write_unaligned(
+                    ld.add(16).cast::<u128>(),
+                    ptr::read_unaligned(ls.add(16).cast::<u128>()),
+                );
             }
 
             let ms = self.base.add(after_lit - offset);
             let md = self.base.add(after_lit);
-            ptr::copy_nonoverlapping(ms, md, 16);
+            ptr::write_unaligned(md.cast::<u128>(), ptr::read_unaligned(ms.cast::<u128>()));
             if match_len > 16 {
-                ptr::copy_nonoverlapping(ms.add(16), md.add(16), 16);
+                ptr::write_unaligned(
+                    md.add(16).cast::<u128>(),
+                    ptr::read_unaligned(ms.add(16).cast::<u128>()),
+                );
                 if match_len > 32 {
                     let mut sp = ms.add(32);
                     let mut dp = md.add(32);
                     let end = md.add(match_len);
                     while dp < end {
-                        ptr::copy_nonoverlapping(sp, dp, 16);
+                        ptr::write_unaligned(
+                            dp.cast::<u128>(),
+                            ptr::read_unaligned(sp.cast::<u128>()),
+                        );
                         sp = sp.add(16);
                         dp = dp.add(16);
                     }
@@ -492,6 +523,166 @@ impl<'a, A: Allocator> ByteCursor<'a, A> {
         }
         self.len = next_out;
         true
+    }
+
+    /// Call-free inline fast path with unified single-check validation for fused Zstandard
+    /// sequence execution.
+    ///
+    /// Verifies literal bounds, `block_out_limit`, capacity slack, and window-clamped `offset`
+    /// bounds once up front, then executes inline using unaligned 128-bit (`u128`) and 64-bit
+    /// (`u64`) wildcopies without placing any out-of-line call in the hot leaf loop.
+    ///
+    /// On any non-[`SeqLeafResult::Done`] outcome, `self.len` is left unchanged.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn exec_seq_leaf_checked(
+        &mut self,
+        literals: &[u8],
+        lit_pos: usize,
+        lit_len: usize,
+        offset: usize,
+        match_len: usize,
+        block_out_limit: usize,
+        frame_start: usize,
+        win_usize: usize,
+        full_window: bool,
+    ) -> SeqLeafResult {
+        let len = self.len;
+        let after_lit = len.saturating_add(lit_len);
+        let next_out = after_lit.saturating_add(match_len);
+        let max_off = if full_window {
+            after_lit
+        } else {
+            after_lit.saturating_sub(frame_start).min(win_usize)
+        };
+        if lit_len > 32
+            || literals.len() < 32
+            || lit_pos > literals.len() - 32
+            || self.cap < 48
+            || next_out > block_out_limit.min(self.cap - 48)
+            || offset.wrapping_sub(1) >= max_off
+        {
+            let Some(lit_end) = lit_pos.checked_add(lit_len) else {
+                return SeqLeafResult::LitOverflow;
+            };
+            if lit_end > literals.len() {
+                return SeqLeafResult::LitOverflow;
+            }
+            let Some(exact_after_lit) = len.checked_add(lit_len) else {
+                return SeqLeafResult::OutOverflow;
+            };
+            let Some(exact_next_out) = exact_after_lit.checked_add(match_len) else {
+                return SeqLeafResult::OutOverflow;
+            };
+            if exact_next_out > block_out_limit {
+                return SeqLeafResult::OutOverflow;
+            }
+            let exact_max_off = if full_window {
+                exact_after_lit
+            } else {
+                exact_after_lit.saturating_sub(frame_start).min(win_usize)
+            };
+            if offset.wrapping_sub(1) >= exact_max_off {
+                return SeqLeafResult::BadOffset;
+            }
+            return SeqLeafResult::Pending;
+        }
+
+        if (lit_len | match_len) <= 16 && offset >= 16 {
+            // SAFETY:
+            // - `literals.len() >= 32` and `lit_pos <= literals.len() - 32`, so `lit_pos + 16 <= literals.len()`.
+            // - `self.cap >= 48` and `next_out <= self.cap - 48`, so `after_lit == len + lit_len`,
+            //   `next_out == after_lit + match_len`, `len + 16 < self.cap`, and `after_lit + 16 < self.cap`.
+            // - `16 <= offset <= max_off <= after_lit`, so `after_lit - offset` points to 16 initialized
+            //   bytes strictly before `after_lit`.
+            unsafe {
+                let ls = literals.as_ptr().add(lit_pos);
+                let ld = self.base.add(len);
+                ptr::write_unaligned(ld.cast::<u128>(), ptr::read_unaligned(ls.cast::<u128>()));
+                let ms = self.base.add(after_lit - offset);
+                let md = self.base.add(after_lit);
+                ptr::write_unaligned(md.cast::<u128>(), ptr::read_unaligned(ms.cast::<u128>()));
+            }
+            self.len = next_out;
+            return SeqLeafResult::Done;
+        }
+
+        if offset < 16 {
+            if offset < 8 || match_len > 16 {
+                return SeqLeafResult::Pending;
+            }
+            // SAFETY:
+            // - `lit_pos + 32 <= literals.len()` and `len + 32 < self.cap`, so up to 2x16B literal
+            //   wildcopies stay strictly in bounds.
+            // - `8 <= offset <= max_off <= after_lit`, `match_len <= 16`, and `after_lit + 16 < self.cap`,
+            //   so the first 8B load reads initialized history before `after_lit`, and after storing
+            //   `md..md + 8` the optional second 8B load at `ms + 8` also reads initialized bytes.
+            unsafe {
+                let ls = literals.as_ptr().add(lit_pos);
+                let ld = self.base.add(len);
+                ptr::write_unaligned(ld.cast::<u128>(), ptr::read_unaligned(ls.cast::<u128>()));
+                if lit_len > 16 {
+                    ptr::write_unaligned(
+                        ld.add(16).cast::<u128>(),
+                        ptr::read_unaligned(ls.add(16).cast::<u128>()),
+                    );
+                }
+                let ms = self.base.add(after_lit - offset);
+                let md = self.base.add(after_lit);
+                ptr::write_unaligned(md.cast::<u64>(), ptr::read_unaligned(ms.cast::<u64>()));
+                if match_len > 8 {
+                    ptr::write_unaligned(
+                        md.add(8).cast::<u64>(),
+                        ptr::read_unaligned(ms.add(8).cast::<u64>()),
+                    );
+                }
+            }
+            self.len = next_out;
+            return SeqLeafResult::Done;
+        }
+
+        // SAFETY:
+        // - `lit_pos + 32 <= literals.len()` and `len + 32 < self.cap`, so 1x16B / 2x16B literal
+        //   wildcopies stay strictly in bounds.
+        // - `16 <= offset <= max_off <= after_lit` and `next_out + 48 <= self.cap`, so every 16B
+        //   match wildcopy chunk reads initialized history strictly before its destination (`sp + 16 <= dp`)
+        //   and writes strictly inside `self.base..self.base + self.cap` (`dp + 16 <= base + next_out + 15 < base + cap`).
+        unsafe {
+            let ls = literals.as_ptr().add(lit_pos);
+            let ld = self.base.add(len);
+            ptr::write_unaligned(ld.cast::<u128>(), ptr::read_unaligned(ls.cast::<u128>()));
+            if lit_len > 16 {
+                ptr::write_unaligned(
+                    ld.add(16).cast::<u128>(),
+                    ptr::read_unaligned(ls.add(16).cast::<u128>()),
+                );
+            }
+
+            let ms = self.base.add(after_lit - offset);
+            let md = self.base.add(after_lit);
+            ptr::write_unaligned(md.cast::<u128>(), ptr::read_unaligned(ms.cast::<u128>()));
+            if match_len > 16 {
+                ptr::write_unaligned(
+                    md.add(16).cast::<u128>(),
+                    ptr::read_unaligned(ms.add(16).cast::<u128>()),
+                );
+                if match_len > 32 {
+                    let mut sp = ms.add(32);
+                    let mut dp = md.add(32);
+                    let end = md.add(match_len);
+                    while dp < end {
+                        ptr::write_unaligned(
+                            dp.cast::<u128>(),
+                            ptr::read_unaligned(sp.cast::<u128>()),
+                        );
+                        sp = sp.add(16);
+                        dp = dp.add(16);
+                    }
+                }
+            }
+        }
+        self.len = next_out;
+        SeqLeafResult::Done
     }
 
     /// Execute a batch of decoded LZ77 sequences (`&[SeqOp]`) back-to-back in a tight
@@ -533,7 +724,7 @@ impl<'a, A: Allocator> ByteCursor<'a, A> {
             }
         }
         let (Ok(sum_lits), Ok(sum_out)) =
-            (usize::try_from(sum_lits_u64), usize::try_from(sum_out_u64))
+            (sum_lits_u64.narrow::<usize>(), sum_out_u64.narrow::<usize>())
         else {
             return self.exec_seq_batch_tail(literals, lit_pos, seqs);
         };
@@ -542,21 +733,9 @@ impl<'a, A: Allocator> ByteCursor<'a, A> {
         let out_slack_ok = fits_fast && cap - len >= sum_out.saturating_add(48);
         if lit_slack_ok && out_slack_ok {
             for seq in seqs {
-                let Ok(lit_len) = usize::try_from(seq.lit_len) else {
-                    self.len = len;
-                    *lit_pos = lp;
-                    return false;
-                };
-                let Ok(match_len) = usize::try_from(seq.match_len) else {
-                    self.len = len;
-                    *lit_pos = lp;
-                    return false;
-                };
-                let Ok(offset) = usize::try_from(seq.offset) else {
-                    self.len = len;
-                    *lit_pos = lp;
-                    return false;
-                };
+                let lit_len = seq.lit_len.widen_to::<usize>();
+                let match_len = seq.match_len.widen_to::<usize>();
+                let offset = seq.offset.widen_to::<usize>();
 
                 // 1. Copy literals: 1x16B for <= 16, 2x16B for 17..=32, cold helper for > 32.
                 // SAFETY: Batch pre-check guarantees `lp + lit_len + 32 <= lit_total` and
@@ -645,21 +824,9 @@ impl<'a, A: Allocator> ByteCursor<'a, A> {
         }
         // Tail fallback for the final batch of a block where < 32B literal slack remains.
         for seq in seqs {
-            let Ok(lit_len) = usize::try_from(seq.lit_len) else {
-                self.len = len;
-                *lit_pos = lp;
-                return false;
-            };
-            let Ok(match_len) = usize::try_from(seq.match_len) else {
-                self.len = len;
-                *lit_pos = lp;
-                return false;
-            };
-            let Ok(offset) = usize::try_from(seq.offset) else {
-                self.len = len;
-                *lit_pos = lp;
-                return false;
-            };
+            let lit_len = seq.lit_len.widen_to::<usize>();
+            let match_len = seq.match_len.widen_to::<usize>();
+            let offset = seq.offset.widen_to::<usize>();
 
             let src_rem = lit_total - lp;
             let spare = cap - len;
@@ -730,6 +897,44 @@ impl<'a, A: Allocator> ByteCursor<'a, A> {
         self.len = len;
         *lit_pos = lp;
         true
+    }
+
+    /// Open a value-type, register-resident [`SeqExecCtx`] for fused Zstandard sequence decoding.
+    ///
+    /// Caches `base`, `len`, `literals` pointer/length, and precomputed slack bounds by value so
+    /// LLVM SROA keeps them in CPU registers across the hot loop without per-sequence `ByteCursor`
+    /// memory loads or stores. Call [`SeqExecCtx::finish`] after the loop to commit `len` back to
+    /// this cursor.
+    #[inline(always)]
+    #[must_use]
+    pub fn seq_exec_ctx<'b>(
+        &'b mut self,
+        literals: &'b [u8],
+        block_out_limit: usize,
+    ) -> SeqExecCtx<'b, 'a, A> {
+        let base = self.base;
+        let len = self.len;
+        let out_safe_plus1 = if self.cap < 48 {
+            0
+        } else {
+            block_out_limit.min(self.cap - 48).saturating_add(1)
+        };
+        let lit_len = literals.len();
+        let lit_safe_plus1 = if lit_len < 32 {
+            0
+        } else {
+            (lit_len - 32).saturating_add(1)
+        };
+        SeqExecCtx {
+            cursor: self,
+            base,
+            len,
+            lit_ptr: literals.as_ptr(),
+            lit_len,
+            lit_safe_plus1,
+            out_safe_plus1,
+            _lit: PhantomData,
+        }
     }
 
     /// Commit the written length back into the underlying [`Vec<u8, A>`].
@@ -885,6 +1090,186 @@ impl<A: Allocator> Drop for ByteCursor<'_, A> {
     }
 }
 
+/// Value-type, register-resident sequence execution cursor for fused Zstandard decoding.
+///
+/// Holds `base`, `len`, `lit_ptr`, `lit_len`, `lit_safe_plus1`, and `out_safe_plus1` by value so
+/// SROA keeps them in CPU registers across the inner loop without per-sequence [`ByteCursor`]
+/// memory loads or stores. Intentionally implements no [`Drop`] so hot leaf loops emit zero
+/// drop-glue landing pads; call [`SeqExecCtx::finish`] on loop exit to commit `len` back to the
+/// parent [`ByteCursor`].
+pub struct SeqExecCtx<'b, 'a, A: Allocator> {
+    cursor: &'b mut ByteCursor<'a, A>,
+    base: *mut u8,
+    len: usize,
+    lit_ptr: *const u8,
+    lit_len: usize,
+    lit_safe_plus1: usize,
+    out_safe_plus1: usize,
+    _lit: PhantomData<&'b [u8]>,
+}
+
+impl<A: Allocator> SeqExecCtx<'_, '_, A> {
+    /// Number of initialized bytes written so far (including bytes executed in this context).
+    #[inline(always)]
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns `true` when zero bytes have been written so far.
+    #[inline(always)]
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Commit the register-cached `len` back to the parent [`ByteCursor`].
+    #[inline(always)]
+    pub fn finish(self) {
+        self.cursor.len = self.len;
+    }
+
+    /// Call-free inline fast path with separated literal and match copies for fused Zstandard
+    /// sequence execution.
+    ///
+    /// Uses precomputed `lit_safe_plus1` and `out_safe_plus1` slack thresholds so the hot path
+    /// stays strictly register-resident without touching `self.cursor`, and keeps `lit_len > 16`
+    /// and `match_len > 16` branches independent to avoid combined branch mispredictions.
+    /// `block_out_limit` should match the limit passed to [`ByteCursor::seq_exec_ctx`].
+    ///
+    /// On any non-[`SeqLeafResult::Done`] outcome, `self.len` is left unchanged.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn exec_leaf(
+        &mut self,
+        lit_pos: usize,
+        lit_len: usize,
+        offset: usize,
+        match_len: usize,
+        block_out_limit: usize,
+        frame_start: usize,
+        win_usize: usize,
+        full_window: bool,
+    ) -> SeqLeafResult {
+        let len = self.len;
+        let after_lit = len.saturating_add(lit_len);
+        let next_out = after_lit.saturating_add(match_len);
+        let max_off = if full_window {
+            after_lit
+        } else {
+            after_lit.saturating_sub(frame_start).min(win_usize)
+        };
+        if lit_len > 32
+            || lit_pos >= self.lit_safe_plus1
+            || next_out >= self.out_safe_plus1
+            || offset.wrapping_sub(1) >= max_off
+        {
+            let Some(lit_end) = lit_pos.checked_add(lit_len) else {
+                return SeqLeafResult::LitOverflow;
+            };
+            if lit_end > self.lit_len {
+                return SeqLeafResult::LitOverflow;
+            }
+            let Some(exact_after_lit) = len.checked_add(lit_len) else {
+                return SeqLeafResult::OutOverflow;
+            };
+            let Some(exact_next_out) = exact_after_lit.checked_add(match_len) else {
+                return SeqLeafResult::OutOverflow;
+            };
+            if exact_next_out > block_out_limit {
+                return SeqLeafResult::OutOverflow;
+            }
+            if offset.wrapping_sub(1) >= max_off {
+                return SeqLeafResult::BadOffset;
+            }
+            return SeqLeafResult::Pending;
+        }
+
+        if offset >= 16 {
+            // SAFETY:
+            // - `lit_pos < self.lit_safe_plus1` implies `self.lit_len >= 32` and
+            //   `lit_pos + 32 <= self.lit_len`, so 1x16B / 2x16B literal loads stay in bounds.
+            // - `next_out < self.out_safe_plus1` implies `self.cap >= 48`, `after_lit == len + lit_len`,
+            //   `next_out == after_lit + match_len`, `len + 32 < self.cap`, and
+            //   `next_out + 48 <= self.cap`, so literal and match 16B wildcopies stay in bounds.
+            // - `16 <= offset <= max_off <= after_lit`, so `after_lit - offset` points into
+            //   initialized history `0..after_lit` and every 16B match chunk `(msrc + k, mdst + k)`
+            //   reads initialized bytes non-overlapping with its destination.
+            unsafe {
+                let lsrc = self.lit_ptr.add(lit_pos);
+                let ldst = self.base.add(len);
+                ptr::write_unaligned(ldst.cast::<u128>(), ptr::read_unaligned(lsrc.cast::<u128>()));
+                if lit_len > 16 {
+                    ptr::write_unaligned(
+                        ldst.add(16).cast::<u128>(),
+                        ptr::read_unaligned(lsrc.add(16).cast::<u128>()),
+                    );
+                }
+                let mut msrc = self.base.add(after_lit - offset);
+                let mut mdst = self.base.add(after_lit);
+                ptr::write_unaligned(mdst.cast::<u128>(), ptr::read_unaligned(msrc.cast::<u128>()));
+                if match_len > 16 {
+                    ptr::write_unaligned(
+                        mdst.add(16).cast::<u128>(),
+                        ptr::read_unaligned(msrc.add(16).cast::<u128>()),
+                    );
+                    if match_len > 32 {
+                        let end = mdst.add(match_len);
+                        msrc = msrc.add(32);
+                        mdst = mdst.add(32);
+                        while mdst < end {
+                            ptr::write_unaligned(
+                                mdst.cast::<u128>(),
+                                ptr::read_unaligned(msrc.cast::<u128>()),
+                            );
+                            msrc = msrc.add(16);
+                            mdst = mdst.add(16);
+                        }
+                    }
+                }
+            }
+            self.len = next_out;
+            return SeqLeafResult::Done;
+        }
+
+        if offset >= 8 && match_len <= 16 {
+            // SAFETY:
+            // - `lit_pos < self.lit_safe_plus1` implies `self.lit_len >= 32` and
+            //   `lit_pos + 32 <= self.lit_len`.
+            // - `next_out < self.out_safe_plus1` implies `self.cap >= 48`, `len + 32 < self.cap`,
+            //   and `after_lit + 16 < self.cap`.
+            // - `8 <= offset <= max_off <= after_lit` and `match_len <= 16`, so the first 8B load
+            //   at `after_lit - offset` reads initialized history before `after_lit`, and after
+            //   storing `mdst..mdst + 8` the optional second 8B load at `msrc + 8` also reads
+            //   initialized bytes non-overlapping with `mdst + 8..mdst + 16`.
+            unsafe {
+                let lsrc = self.lit_ptr.add(lit_pos);
+                let ldst = self.base.add(len);
+                ptr::write_unaligned(ldst.cast::<u128>(), ptr::read_unaligned(lsrc.cast::<u128>()));
+                if lit_len > 16 {
+                    ptr::write_unaligned(
+                        ldst.add(16).cast::<u128>(),
+                        ptr::read_unaligned(lsrc.add(16).cast::<u128>()),
+                    );
+                }
+                let msrc = self.base.add(after_lit - offset);
+                let mdst = self.base.add(after_lit);
+                ptr::write_unaligned(mdst.cast::<u64>(), ptr::read_unaligned(msrc.cast::<u64>()));
+                if match_len > 8 {
+                    ptr::write_unaligned(
+                        mdst.add(8).cast::<u64>(),
+                        ptr::read_unaligned(msrc.add(8).cast::<u64>()),
+                    );
+                }
+            }
+            self.len = next_out;
+            return SeqLeafResult::Done;
+        }
+
+        SeqLeafResult::Pending
+    }
+}
+
 /// Safe pointer-based reverse bitstream reader for RFC 8878 Zstandard (Huffman & FSE).
 ///
 /// Maintains `self.start <= self.ptr`, and whenever `self.ptr > self.start` the original borrowed
@@ -927,7 +1312,7 @@ impl<'a> RevBitCursor<'a> {
             if let Some(dst) = buf.get_mut(..n) {
                 dst.copy_from_slice(bytes);
             }
-            let unused_high = u32::try_from(8 - n).ok()?;
+            let unused_high = (8 - n).truncate_to::<u32>();
             Some(Self {
                 start,
                 ptr: start,
@@ -962,8 +1347,7 @@ impl<'a> RevBitCursor<'a> {
     pub fn reload(&mut self) -> bool {
         // SAFETY: `self.ptr >= self.start` (struct invariant).
         let avail = unsafe { self.ptr.offset_from_unsigned(self.start) };
-        let [lo, ..] = self.bits_consumed.to_le_bytes();
-        let adv = usize::from(lo >> 3);
+        let adv = (self.bits_consumed >> 3).widen_to::<usize>();
         if avail > adv {
             // SAFETY: `avail > adv >= 0` guarantees `avail >= 1` (hence original `len >= 8` and
             // `ptr` only moves down from `end - 8`) and `self.ptr.sub(adv) > self.start`, so
@@ -998,8 +1382,7 @@ impl<'a> RevBitCursor<'a> {
         if avail < 8 || self.bits_consumed >= 64 {
             return false;
         }
-        let [lo, ..] = self.bits_consumed.to_le_bytes();
-        let adv = usize::from(lo >> 3);
+        let adv = (self.bits_consumed >> 3).widen_to::<usize>();
         // SAFETY: `adv <= 7 < 8 <= avail = ptr - start`, so `ptr.sub(adv) > start` and
         // `ptr.sub(adv)..ptr.sub(adv) + 8` lies strictly within the borrowed slice.
         unsafe {
@@ -1017,8 +1400,7 @@ impl<'a> RevBitCursor<'a> {
     pub fn reload_fast(&mut self) {
         let avail = self.avail_bytes();
         if avail > 0 {
-            let [lo, ..] = self.bits_consumed.to_le_bytes();
-            let adv = usize::from(lo >> 3);
+            let adv = (self.bits_consumed >> 3).widen_to::<usize>();
             let step = adv.min(avail);
             // SAFETY: `avail > 0` implies original `len >= 8`, and `step <= avail = ptr - start`,
             // so `self.ptr.sub(step)..self.ptr.sub(step) + 8` lies strictly inside the slice.
@@ -1026,7 +1408,7 @@ impl<'a> RevBitCursor<'a> {
                 self.ptr = self.ptr.sub(step);
                 self.container = u64::from_le(ptr::read_unaligned(self.ptr.cast::<u64>()));
             }
-            let step_bits = u32::try_from(step).unwrap_or(0) << 3;
+            let step_bits = step.truncate_to::<u32>() << 3;
             self.bits_consumed = self.bits_consumed.saturating_sub(step_bits);
         }
     }
@@ -1045,8 +1427,7 @@ impl<'a> RevBitCursor<'a> {
     #[must_use]
     pub fn peek_fast(&self, shift_r: u32) -> usize {
         let shifted = (self.container << self.bits_consumed) >> shift_r;
-        let [b0, b1, ..] = shifted.to_le_bytes();
-        usize::from(u16::from_le_bytes([b0, b1]))
+        shifted.truncate_to::<u16>().widen_to::<usize>()
     }
 
     /// Branchless advance of `n` bits after a verified fast peek.
@@ -1061,8 +1442,7 @@ impl<'a> RevBitCursor<'a> {
     pub fn read_bits_branchless(&mut self, n: u32) -> u32 {
         let shifted = ((self.container << self.bits_consumed) >> 1) >> (63 - n);
         self.bits_consumed += n;
-        let [b0, b1, b2, b3, ..] = shifted.to_le_bytes();
-        u32::from_le_bytes([b0, b1, b2, b3])
+        shifted.truncate_to::<u32>()
     }
 
     /// Read exactly `n` bits (`0..=32`), reloading if needed.
@@ -1083,8 +1463,7 @@ impl<'a> RevBitCursor<'a> {
         }
         let shifted = (self.container << self.bits_consumed) >> (64 - n);
         self.bits_consumed = next;
-        let [b0, b1, b2, b3, ..] = shifted.to_le_bytes();
-        Some(u32::from_le_bytes([b0, b1, b2, b3]))
+        Some(shifted.truncate_to::<u32>())
     }
 
     /// Peek `n` bits (`1..=11`) for Huffman tail lookup, right-padding with zeros near stream end.
@@ -1097,8 +1476,7 @@ impl<'a> RevBitCursor<'a> {
             return 0;
         }
         let shifted = (self.container << self.bits_consumed) >> (64 - n);
-        let [b0, b1, ..] = shifted.to_le_bytes();
-        u32::from(u16::from_le_bytes([b0, b1]))
+        shifted.truncate_to::<u16>().widen_to::<u32>()
     }
 
     /// Consume `n` bits (`0..=32`), returning `false` if fewer than `n` bits remain.
@@ -1129,7 +1507,7 @@ impl<'a> RevBitCursor<'a> {
 #[cold]
 #[inline(never)]
 fn reload_tail_val(start: *const u8, avail: usize, bits_consumed: u32) -> (u64, u32) {
-    let step = u32::try_from(avail).unwrap_or(0);
+    let step = avail.truncate_to::<u32>();
     let bits = bits_consumed.saturating_sub(step * 8);
     // SAFETY: Caller only invokes this when `avail > 0`, which guarantees `len >= 8`.
     let container = u64::from_le(unsafe { ptr::read_unaligned(start.cast::<u64>()) });
@@ -1219,7 +1597,7 @@ pub fn common_prefix_len(input: &[u8], a: usize, b: usize, limit_end: usize) -> 
             let vb = u64::from_le(ptr::read_unaligned(pb.cast::<u64>()));
             let diff = va ^ vb;
             if diff != 0 {
-                return len + usize::try_from(diff.trailing_zeros() >> 3).unwrap_or(0);
+                return len + (diff.trailing_zeros() >> 3).widen_to::<usize>();
             }
             pa = pa.add(8);
             pb = pb.add(8);
@@ -1434,5 +1812,291 @@ mod tests {
         rbc.advance_fast(32); // advances 4 bytes via clamping `reload_fast` -> avail becomes 3
         rbc.reload_fast();
         assert_eq!(rbc.avail_bytes(), 3);
+    }
+
+    #[test]
+    fn byte_cursor_exec_seq_leaf_checked_all_outcomes() {
+        use super::SeqLeafResult;
+
+        let h = heap();
+        let alloc = h.alloc();
+        let lits = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+        let mut out = Vec::try_with_capacity_in(512, alloc).expect("cap");
+        let mut expected = Vec::new_in(alloc);
+        {
+            let mut cur = out.byte_cursor();
+            let block_limit = 300;
+            // 1. <=16B lits + <=16B match (u128 fast path)
+            assert_eq!(
+                cur.exec_seq_leaf_checked(lits, 0, 16, 16, 12, block_limit, 0, 1024, true),
+                SeqLeafResult::Done
+            );
+            // 2. 17..=32B lits + >32B match (2x u128 + wildcopy loop)
+            assert_eq!(
+                cur.exec_seq_leaf_checked(lits, 16, 20, 20, 40, block_limit, 0, 1024, true),
+                SeqLeafResult::Done
+            );
+            // 3. 8 <= offset < 16 with match_len <= 16 (u64 path)
+            assert_eq!(
+                cur.exec_seq_leaf_checked(lits, 36, 18, 10, 13, block_limit, 0, 1024, false),
+                SeqLeafResult::Done
+            );
+            let saved = cur.len();
+
+            // 4. Pending cases (valid sequence, needs out-of-line general handler)
+            assert_eq!(
+                cur.exec_seq_leaf_checked(lits, 54, 33, 16, 4, block_limit, 0, 1024, true),
+                SeqLeafResult::Pending
+            );
+            assert_eq!(
+                cur.exec_seq_leaf_checked(lits, 54, 4, 4, 8, block_limit, 0, 1024, true),
+                SeqLeafResult::Pending
+            );
+            assert_eq!(
+                cur.exec_seq_leaf_checked(lits, 54, 4, 10, 20, block_limit, 0, 1024, true),
+                SeqLeafResult::Pending
+            );
+            assert_eq!(
+                cur.exec_seq_leaf_checked(lits, lits.len() - 10, 4, 16, 4, block_limit, 0, 1024, true),
+                SeqLeafResult::Pending
+            );
+            assert_eq!(
+                cur.exec_seq_leaf_checked(b"", 0, 0, 16, 4, block_limit, 0, 1024, true),
+                SeqLeafResult::Pending
+            );
+
+            // 5. Typed error classifications
+            assert_eq!(
+                cur.exec_seq_leaf_checked(lits, lits.len() - 4, 5, 16, 4, block_limit, 0, 1024, true),
+                SeqLeafResult::LitOverflow
+            );
+            assert_eq!(
+                cur.exec_seq_leaf_checked(lits, 54, 4, 16, block_limit - saved, block_limit, 0, 1024, true),
+                SeqLeafResult::OutOverflow
+            );
+            assert_eq!(
+                cur.exec_seq_leaf_checked(lits, 54, 4, 0, 4, block_limit, 0, 1024, true),
+                SeqLeafResult::BadOffset
+            );
+            assert_eq!(
+                cur.exec_seq_leaf_checked(lits, 54, 4, saved + 5, 4, block_limit, 0, 1024, true),
+                SeqLeafResult::BadOffset
+            );
+            // Window / frame_start clamp when full_window == false
+            assert_eq!(
+                cur.exec_seq_leaf_checked(lits, 54, 4, 32, 4, block_limit, 0, 16, false),
+                SeqLeafResult::BadOffset
+            );
+            assert_eq!(
+                cur.exec_seq_leaf_checked(lits, 54, 4, 20, 4, block_limit, saved - 10, 1024, false),
+                SeqLeafResult::BadOffset
+            );
+            assert_eq!(cur.len(), saved);
+            cur.finish();
+        }
+
+        for &(lp, ll, off, ml) in &[(0usize, 16usize, 16usize, 12usize), (16, 20, 20, 40), (36, 18, 10, 13)]
+        {
+            expected.extend_from_slice(&lits[lp..lp + ll]);
+            for _ in 0..ml {
+                let b = expected[expected.len() - off];
+                expected.push(b);
+            }
+        }
+        assert_eq!(out.as_slice(), expected.as_slice());
+    }
+
+    #[test]
+    fn seq_exec_ctx_all_outcomes_and_short_slices() {
+        use super::SeqLeafResult;
+
+        let h = heap();
+        let alloc = h.alloc();
+        let lits = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+        let mut out = Vec::try_with_capacity_in(512, alloc).expect("cap");
+        let mut expected = Vec::new_in(alloc);
+        let block_limit = 350;
+        let done_seqs: [(usize, usize, usize, usize, bool); 6] = [
+            // 1. <=16B lits + <=16B match, offset >= 16
+            (0, 16, 16, 12, true),
+            // 2. 17..=32B lits + 17..=32B match, offset >= 16
+            (16, 20, 20, 24, true),
+            // 3. <=16B lits + >32B match (wildcopy loop), offset >= 16
+            (36, 5, 25, 49, true),
+            // 4. 17..=32B lits + <=8B match, 8 <= offset < 16, windowed
+            (41, 18, 10, 7, false),
+            // 5. <=16B lits + 9..=16B match, 8 <= offset < 16
+            (59, 4, 8, 16, true),
+            // 6. 0B lit + 0B match with valid offset >= 16
+            (63, 0, 16, 0, true),
+        ];
+
+        {
+            let mut cur = out.byte_cursor();
+            let mut ctx = cur.seq_exec_ctx(lits, block_limit);
+            assert!(ctx.is_empty());
+
+            for &(lp, ll, off, ml, full_win) in &done_seqs {
+                assert_eq!(
+                    ctx.exec_leaf(lp, ll, off, ml, block_limit, 0, 1024, full_win),
+                    SeqLeafResult::Done
+                );
+            }
+            let saved = ctx.len();
+            assert!(!ctx.is_empty());
+
+            // Pending cases (valid sequence needing general out-of-line handler).
+            assert_eq!(
+                ctx.exec_leaf(63, 33, 16, 4, block_limit, 0, 1024, true),
+                SeqLeafResult::Pending
+            );
+            assert_eq!(
+                ctx.exec_leaf(63, 4, 4, 8, block_limit, 0, 1024, true),
+                SeqLeafResult::Pending
+            );
+            assert_eq!(
+                ctx.exec_leaf(63, 4, 10, 20, block_limit, 0, 1024, true),
+                SeqLeafResult::Pending
+            );
+            assert_eq!(
+                ctx.exec_leaf(lits.len() - 10, 4, 16, 4, block_limit, 0, 1024, true),
+                SeqLeafResult::Pending
+            );
+
+            // Typed error classifications (including arithmetic overflow & window clamps).
+            assert_eq!(
+                ctx.exec_leaf(lits.len() - 4, 5, 16, 4, block_limit, 0, 1024, true),
+                SeqLeafResult::LitOverflow
+            );
+            assert_eq!(
+                ctx.exec_leaf(usize::MAX, 1, 16, 4, block_limit, 0, 1024, true),
+                SeqLeafResult::LitOverflow
+            );
+            assert_eq!(
+                ctx.exec_leaf(63, 4, 16, block_limit - saved, block_limit, 0, 1024, true),
+                SeqLeafResult::OutOverflow
+            );
+            assert_eq!(
+                ctx.exec_leaf(63, 4, 16, usize::MAX, block_limit, 0, 1024, true),
+                SeqLeafResult::OutOverflow
+            );
+            assert_eq!(
+                ctx.exec_leaf(63, 4, 0, 4, block_limit, 0, 1024, true),
+                SeqLeafResult::BadOffset
+            );
+            assert_eq!(
+                ctx.exec_leaf(63, 4, saved + 5, 4, block_limit, 0, 1024, true),
+                SeqLeafResult::BadOffset
+            );
+            assert_eq!(
+                ctx.exec_leaf(63, 4, 32, 4, block_limit, 0, 16, false),
+                SeqLeafResult::BadOffset
+            );
+            assert_eq!(
+                ctx.exec_leaf(63, 4, 20, 4, block_limit, saved - 10, 1024, false),
+                SeqLeafResult::BadOffset
+            );
+            assert_eq!(ctx.len(), saved);
+            ctx.finish();
+            assert_eq!(cur.len(), saved);
+
+            // Empty and short (< 32B) literal slices must never enter the wildcopy fast path.
+            {
+                let mut empty_ctx = cur.seq_exec_ctx(b"", block_limit);
+                assert_eq!(
+                    empty_ctx.exec_leaf(0, 0, 16, 4, block_limit, 0, 1024, true),
+                    SeqLeafResult::Pending
+                );
+                assert_eq!(
+                    empty_ctx.exec_leaf(0, 0, 16, 0, block_limit, 0, 1024, true),
+                    SeqLeafResult::Pending
+                );
+                assert_eq!(
+                    empty_ctx.exec_leaf(0, 1, 16, 4, block_limit, 0, 1024, true),
+                    SeqLeafResult::LitOverflow
+                );
+                empty_ctx.finish();
+            }
+            {
+                let short_lits = b"hello_world";
+                let mut short_ctx = cur.seq_exec_ctx(short_lits, block_limit);
+                assert_eq!(
+                    short_ctx.exec_leaf(0, 5, 16, 4, block_limit, 0, 1024, true),
+                    SeqLeafResult::Pending
+                );
+                assert_eq!(
+                    short_ctx.exec_leaf(8, 4, 16, 4, block_limit, 0, 1024, true),
+                    SeqLeafResult::LitOverflow
+                );
+                short_ctx.finish();
+            }
+            // Exact 32-byte literal slice: `lit_pos == 1` is Pending, `lit_pos == 0` is Done.
+            let lits32 = b"0123456789abcdef0123456789abcdef";
+            {
+                let mut exact32_ctx = cur.seq_exec_ctx(lits32, block_limit);
+                assert_eq!(
+                    exact32_ctx.exec_leaf(1, 4, 16, 4, block_limit, 0, 1024, true),
+                    SeqLeafResult::Pending
+                );
+                assert_eq!(
+                    exact32_ctx.exec_leaf(0, 4, 16, 4, block_limit, 0, 1024, true),
+                    SeqLeafResult::Done
+                );
+                exact32_ctx.finish();
+            }
+            assert_eq!(cur.len(), saved + 8);
+            cur.finish();
+        }
+
+        for &(lp, ll, off, ml, _) in &done_seqs {
+            expected.extend_from_slice(&lits[lp..lp + ll]);
+            for _ in 0..ml {
+                let b = expected[expected.len() - off];
+                expected.push(b);
+            }
+        }
+        expected.extend_from_slice(b"0123");
+        for _ in 0..4 {
+            let b = expected[expected.len() - 16];
+            expected.push(b);
+        }
+        assert_eq!(out.as_slice(), expected.as_slice());
+
+        // Short output capacity (< 48B) and zero capacity must never enter the wildcopy fast path.
+        let mut tiny = Vec::try_with_capacity_in(16, alloc).expect("cap");
+        {
+            let mut cur = tiny.byte_cursor();
+            assert!(cur.cap() < 48);
+            assert!(cur.try_push(b'x').is_ok());
+            let mut ctx = cur.seq_exec_ctx(lits, 16);
+            assert_eq!(
+                ctx.exec_leaf(0, 4, 4, 4, 16, 0, 1024, true),
+                SeqLeafResult::Pending
+            );
+            assert_eq!(
+                ctx.exec_leaf(0, 0, 1, 0, 16, 0, 1024, true),
+                SeqLeafResult::Pending
+            );
+            assert_eq!(ctx.len(), 1);
+            ctx.finish();
+            cur.finish();
+        }
+        assert_eq!(tiny.as_slice(), b"x");
+
+        let mut zero_cap = Vec::new_in(alloc);
+        {
+            let mut cur = zero_cap.byte_cursor();
+            let mut ctx = cur.seq_exec_ctx(lits, 0);
+            assert_eq!(
+                ctx.exec_leaf(0, 0, 1, 0, 0, 0, 1024, true),
+                SeqLeafResult::BadOffset
+            );
+            assert_eq!(ctx.len(), 0);
+            ctx.finish();
+            cur.finish();
+        }
+        assert!(zero_cap.is_empty());
     }
 }

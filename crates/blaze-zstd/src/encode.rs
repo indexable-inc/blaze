@@ -6,16 +6,16 @@
 use core::alloc::Allocator;
 
 use blaze_own::{
-    LZ77_DEF_BUCKETS, LZ77_FAST_HASH_SIZE, SeqOp, Vec, fse_pack_sequences_fast, lz77_scan_default,
-    lz77_scan_fast,
+    Int, LZ77_DEF_BUCKETS, LZ77_FAST_HASH_SIZE, Pow2Array, SeqOp, Vec, fse_pack_sequences_fast,
+    lz77_scan_default, lz77_scan_fast,
 };
 
 use crate::dict::ZstdDict;
 use crate::fse::{
     FseDecTable, FseEncTable, LL_DEFAULT_LOG, LL_DEFAULT_NORM, LL_ENC_PACKED, LL_MAX_CODE,
     ML_DEFAULT_LOG, ML_DEFAULT_NORM, ML_ENC_PACKED, ML_MAX_CODE, OF_DEFAULT_LOG, OF_DEFAULT_NORM,
-    OF_MAX_CODE, encode_ll_fast, encode_ll_raw, encode_ml_fast, encode_ml_raw, encode_of_fast,
-    encode_of_raw, normalize_fse_counts, write_fse_header,
+    OF_MAX_CODE, encode_ll_fast, encode_ml_fast, encode_of_fast, ll_code_raw, ml_code_raw,
+    normalize_fse_counts, of_code_raw, write_fse_header,
 };
 use crate::huffman::{HuffEncCache, encode_huffman_literals_into};
 use crate::xxh64::xxh64;
@@ -27,40 +27,20 @@ const MAX_WINDOW: usize = 1 << 22;
 const WINDOW_DESC_4M: u8 = 12u8 << 3;
 
 #[inline]
-fn ensure_zero_u64<A: Allocator>(table: &mut Vec<u64, A>, len: usize) -> Result<(), ZstdError> {
+fn ensure_zeroed<T: Copy, A: Allocator>(
+    table: &mut Vec<T, A>,
+    len: usize,
+    zero: T,
+) -> Result<(), ZstdError> {
     if table.len() >= len {
         if let Some(s) = table.as_mut_slice().get_mut(..len) {
-            s.fill(0);
+            s.fill(zero);
         }
         return Ok(());
     }
     table.clear();
     table.try_reserve(len)?;
-    let chunk = [0u64; 128];
-    let mut rem = len;
-    while rem >= chunk.len() {
-        table.try_extend_from_slice(&chunk)?;
-        rem -= chunk.len();
-    }
-    if rem > 0
-        && let Some(tail) = chunk.get(..rem)
-    {
-        table.try_extend_from_slice(tail)?;
-    }
-    Ok(())
-}
-
-#[inline]
-fn ensure_zero_hash<A: Allocator>(table: &mut Vec<u32, A>, len: usize) -> Result<(), ZstdError> {
-    if table.len() >= len {
-        if let Some(s) = table.as_mut_slice().get_mut(..len) {
-            s.fill(0);
-        }
-        return Ok(());
-    }
-    table.clear();
-    table.try_reserve(len)?;
-    let chunk = [0u32; 256];
+    let chunk = [zero; 128];
     let mut rem = len;
     while rem >= chunk.len() {
         table.try_extend_from_slice(&chunk)?;
@@ -97,11 +77,9 @@ fn write_raw_literals_header<A: Allocator>(
     lit_len: usize,
 ) -> Result<(), ZstdError> {
     if lit_len < 32 {
-        let len_u8 = u8::try_from(lit_len).map_err(|_| ZstdError::CorruptLiterals)?;
-        out.try_push(len_u8 << 3).map_err(|r| r.why)?;
+        out.try_push(lit_len.truncate_to::<u8>() << 3).map_err(|r| r.why)?;
     } else if lit_len < 4_096 {
-        let len_u16 = u16::try_from(lit_len).map_err(|_| ZstdError::CorruptLiterals)?;
-        let v = (len_u16 << 4) | 0b0100;
+        let v = (lit_len.truncate_to::<u16>() << 4) | 0b0100;
         out.try_extend_from_slice(&v.to_le_bytes())?;
     } else {
         let len_u32 = u32::try_from(lit_len).map_err(|_| ZstdError::CorruptLiterals)?;
@@ -115,11 +93,10 @@ fn write_raw_literals_header<A: Allocator>(
 #[inline]
 fn write_num_sequences<A: Allocator>(out: &mut Vec<u8, A>, n: usize) -> Result<(), ZstdError> {
     if n < 128 {
-        let b0 = u8::try_from(n).map_err(|_| ZstdError::CorruptSequences)?;
-        out.try_push(b0).map_err(|r| r.why)?;
+        out.try_push(n.truncate_to::<u8>()).map_err(|r| r.why)?;
     } else if n < 0x7F00 {
-        let hi = u8::try_from((n >> 8) + 128).map_err(|_| ZstdError::CorruptSequences)?;
-        let lo = u8::try_from(n & 0xFF).map_err(|_| ZstdError::CorruptSequences)?;
+        let hi = ((n >> 8) + 128).truncate_to::<u8>();
+        let lo = n.truncate_to::<u8>();
         out.try_extend_from_slice(&[hi, lo])?;
     } else {
         let adj = n.checked_sub(0x7F00).ok_or(ZstdError::CorruptSequences)?;
@@ -214,6 +191,25 @@ fn pack_raw_sequences_fse<A: Allocator>(
     Ok(())
 }
 
+/// Zero-spill leaf sequence symbol histogrammer using power-of-two masked counters so every
+/// counter pointer and LUT base stays register-resident across the entire block.
+#[inline(never)]
+fn count_seq_symbols(
+    raw_seqs: &[SeqOp],
+    ll_counts: &mut Pow2Array<u32, 64>,
+    of_counts: &mut Pow2Array<u32, 32>,
+    ml_counts: &mut Pow2Array<u32, 64>,
+) {
+    for raw in raw_seqs {
+        let ll_c = ll_code_raw(raw.lit_len);
+        let ml_c = ml_code_raw(raw.match_len);
+        let of_c = of_code_raw(raw.offset);
+        ll_counts.set_masked(ll_c, ll_counts.get_masked(ll_c).wrapping_add(1));
+        of_counts.set_masked(of_c, of_counts.get_masked(of_c).wrapping_add(1));
+        ml_counts.set_masked(ml_c, ml_counts.get_masked(ml_c).wrapping_add(1));
+    }
+}
+
 /// Choose between `RLE_Mode (1)`, `FSE_Compressed_Mode (2)`, or `Predefined_Mode (0)` for one
 /// sequence code stream (`LL`, `OF`, or `ML`).
 enum SeqTableChoice {
@@ -234,7 +230,7 @@ fn plan_seq_table(
     for (sym, &c) in counts.iter().enumerate() {
         if c > 0 {
             distinct += 1;
-            only_sym = u8::try_from(sym).unwrap_or(0);
+            only_sym = sym.truncate_to::<u8>();
         }
     }
     if distinct == 1 {
@@ -363,7 +359,7 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
 
         // 2. Frame header descriptor + optional Window_Descriptor + Frame_Content_Size
         let has_dict = dict.is_some();
-        let len_u64 = u64::try_from(input.len()).map_err(|_| ZstdError::CorruptSequences)?;
+        let len_u64 = input.len().widen_to::<u64>();
         let single_segment = !has_dict && input.len() <= MAX_BLOCK_SIZE;
         let fcs_flag: u8 = if single_segment && len_u64 <= 255 {
             0
@@ -390,16 +386,13 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
 
         match fcs_flag {
             0 => {
-                let b = u8::try_from(len_u64).map_err(|_| ZstdError::CorruptSequences)?;
-                out.try_push(b).map_err(|r| r.why)?;
+                out.try_push(len_u64.truncate_to::<u8>()).map_err(|r| r.why)?;
             }
             1 => {
-                let adj = u16::try_from(len_u64 - 256).map_err(|_| ZstdError::CorruptSequences)?;
-                out.try_extend_from_slice(&adj.to_le_bytes())?;
+                out.try_extend_from_slice(&(len_u64 - 256).truncate_to::<u16>().to_le_bytes())?;
             }
             2 => {
-                let v = u32::try_from(len_u64).map_err(|_| ZstdError::CorruptSequences)?;
-                out.try_extend_from_slice(&v.to_le_bytes())?;
+                out.try_extend_from_slice(&len_u64.truncate_to::<u32>().to_le_bytes())?;
             }
             _ => {
                 out.try_extend_from_slice(&len_u64.to_le_bytes())?;
@@ -439,9 +432,9 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
                 db.len()
             } else {
                 if fast_mode {
-                    ensure_zero_hash(&mut self.hash_table, LZ77_FAST_HASH_SIZE)?;
+                    ensure_zeroed(&mut self.hash_table, LZ77_FAST_HASH_SIZE, 0u32)?;
                 } else {
-                    ensure_zero_u64(&mut self.hash_table_2way, LZ77_DEF_BUCKETS)?;
+                    ensure_zeroed(&mut self.hash_table_2way, LZ77_DEF_BUCKETS, 0u64)?;
                 }
                 0
             };
@@ -544,8 +537,7 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
         // 4. Optional trailing 32-bit XXH64 content checksum
         if opts.checksum {
             let hash = xxh64(input, 0);
-            let [c0, c1, c2, c3, ..] = hash.to_le_bytes();
-            out.try_extend_from_slice(&[c0, c1, c2, c3])?;
+            out.try_extend_from_slice(&hash.truncate_to::<u32>().to_le_bytes())?;
         }
 
         Ok(())
@@ -623,25 +615,12 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
             return Ok(false);
         }
 
-        let mut ll_counts = [0u32; LL_MAX_CODE + 1];
-        let mut of_counts = [0u32; OF_MAX_CODE + 1];
-        let mut ml_counts = [0u32; ML_MAX_CODE + 1];
-        for raw in self.raw_seqs.as_slice() {
-            let (ll_c, _, _) = encode_ll_raw(raw.lit_len);
-            let (ml_c, _, _) = encode_ml_raw(raw.match_len);
-            let (of_c, _, _) = encode_of_raw(raw.offset);
-            if let Some(s) = ll_counts.get_mut(usize::from(ll_c)) {
-                *s += 1;
-            }
-            if let Some(s) = of_counts.get_mut(usize::from(of_c)) {
-                *s += 1;
-            }
-            if let Some(s) = ml_counts.get_mut(usize::from(ml_c)) {
-                *s += 1;
-            }
-        }
-
+        let mut ll_counts = Pow2Array::<u32, 64>::splat(0);
+        let mut of_counts = Pow2Array::<u32, 32>::splat(0);
+        let mut ml_counts = Pow2Array::<u32, 64>::splat(0);
         let raw_seqs = self.raw_seqs.as_slice();
+        count_seq_symbols(raw_seqs, &mut ll_counts, &mut of_counts, &mut ml_counts);
+
         write_num_sequences(&mut self.comp_buf, raw_seqs.len())?;
 
         let (ll_tbl, of_tbl, ml_tbl): (&FseEncTable, &FseEncTable, &FseEncTable) = {
@@ -649,22 +628,25 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
 
             let (ll_log, of_log, ml_log) =
                 if raw_seqs.len() >= 1_024 { (8, 7, 8) } else { (6, 6, 6) };
+            let ll_slice = ll_counts.as_slice().get(..=LL_MAX_CODE).unwrap_or(&[]);
+            let of_slice = of_counts.as_slice();
+            let ml_slice = ml_counts.as_slice().get(..=ML_MAX_CODE).unwrap_or(&[]);
             let ll_choice = plan_seq_table(
-                &ll_counts,
+                ll_slice,
                 total,
                 ll_log,
                 &mut self.scratch_dec,
                 &mut self.custom_ll,
             );
             let of_choice = plan_seq_table(
-                &of_counts,
+                of_slice,
                 total,
                 of_log,
                 &mut self.scratch_dec,
                 &mut self.custom_of,
             );
             let ml_choice = plan_seq_table(
-                &ml_counts,
+                ml_slice,
                 total,
                 ml_log,
                 &mut self.scratch_dec,
@@ -726,33 +708,26 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
     /// window), and `ML` code seeded to at least 1 so blocks 1..N can unconditionally reuse them
     /// via `Repeat` mode (`0xFC`) in a single zero-histogram pass.
     fn try_build_fast_seeded_fse(&mut self) -> Result<bool, ZstdError> {
-        let mut ll_counts = [1u32; LL_MAX_CODE + 1];
-        let mut of_counts = [0u32; OF_MAX_CODE + 1];
-        let mut ml_counts = [1u32; ML_MAX_CODE + 1];
+        let mut ll_counts = Pow2Array::<u32, 64>::splat(0);
+        let mut of_counts = Pow2Array::<u32, 32>::splat(0);
+        let mut ml_counts = Pow2Array::<u32, 64>::splat(0);
         const FAST_MAX_OF_CODE: usize = 20;
-        if let Some(s) = of_counts.get_mut(..=FAST_MAX_OF_CODE) {
+        if let Some(s) = ll_counts.as_mut_slice().get_mut(..=LL_MAX_CODE) {
+            s.fill(1);
+        }
+        if let Some(s) = of_counts.as_mut_slice().get_mut(..=FAST_MAX_OF_CODE) {
+            s.fill(1);
+        }
+        if let Some(s) = ml_counts.as_mut_slice().get_mut(..=ML_MAX_CODE) {
             s.fill(1);
         }
 
-        for raw in self.raw_seqs.as_slice() {
-            let (ll_c, _, _) = encode_ll_raw(raw.lit_len);
-            let (ml_c, _, _) = encode_ml_raw(raw.match_len);
-            let (of_c, _, _) = encode_of_raw(raw.offset);
-            if let Some(s) = ll_counts.get_mut(usize::from(ll_c)) {
-                *s = s.saturating_add(1);
-            }
-            if let Some(s) = of_counts.get_mut(usize::from(of_c)) {
-                *s = s.saturating_add(1);
-            }
-            if let Some(s) = ml_counts.get_mut(usize::from(ml_c)) {
-                *s = s.saturating_add(1);
-            }
-        }
+        count_seq_symbols(self.raw_seqs.as_slice(), &mut ll_counts, &mut of_counts, &mut ml_counts);
 
-        let seq_n = u32::try_from(self.raw_seqs.len()).unwrap_or(u32::MAX);
-        let ll_total = seq_n.saturating_add(u32::try_from(LL_MAX_CODE + 1).unwrap_or(0));
-        let of_total = seq_n.saturating_add(u32::try_from(FAST_MAX_OF_CODE + 1).unwrap_or(0));
-        let ml_total = seq_n.saturating_add(u32::try_from(ML_MAX_CODE + 1).unwrap_or(0));
+        let seq_n = self.raw_seqs.len().saturate::<u32>();
+        let ll_total = seq_n.saturating_add((LL_MAX_CODE + 1).truncate_to::<u32>());
+        let of_total = seq_n.saturating_add((FAST_MAX_OF_CODE + 1).truncate_to::<u32>());
+        let ml_total = seq_n.saturating_add((ML_MAX_CODE + 1).truncate_to::<u32>());
 
         let mut ll_norm = [0i16; LL_MAX_CODE + 1];
         let mut of_norm = [0i16; OF_MAX_CODE + 1];
@@ -762,13 +737,17 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
         let of_log: u8 = 7;
         let ml_log: u8 = 8;
 
-        let Some(ll_max) = normalize_fse_counts(&ll_counts, ll_total, ll_log, &mut ll_norm) else {
+        let ll_slice_c = ll_counts.as_slice().get(..=LL_MAX_CODE).unwrap_or(&[]);
+        let of_slice_c = of_counts.as_slice();
+        let ml_slice_c = ml_counts.as_slice().get(..=ML_MAX_CODE).unwrap_or(&[]);
+
+        let Some(ll_max) = normalize_fse_counts(ll_slice_c, ll_total, ll_log, &mut ll_norm) else {
             return Ok(false);
         };
-        let Some(of_max) = normalize_fse_counts(&of_counts, of_total, of_log, &mut of_norm) else {
+        let Some(of_max) = normalize_fse_counts(of_slice_c, of_total, of_log, &mut of_norm) else {
             return Ok(false);
         };
-        let Some(ml_max) = normalize_fse_counts(&ml_counts, ml_total, ml_log, &mut ml_norm) else {
+        let Some(ml_max) = normalize_fse_counts(ml_slice_c, ml_total, ml_log, &mut ml_norm) else {
             return Ok(false);
         };
 

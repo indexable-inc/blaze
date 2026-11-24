@@ -161,14 +161,17 @@ pub use lists::Lists;
 pub use paths::{DirId, PathId, PathsView, Paths, SealedPaths};
 pub use segs::{Appender, Segs, SharedSegs};
 pub use texts::{SortedTexts, Texts};
+pub use blaze_memchr::blaze_int::{self, Idx, Int};
 pub use arc::Arc;
 pub use boxed::{Box, CallOnce};
 pub use btree::{BTreeMap, BTreeSet};
-pub use byte_cursor::{ByteCursor, RevBitCursor, SeqOp, SliceWriter, common_prefix_len};
+pub use byte_cursor::{
+    ByteCursor, RevBitCursor, SeqExecCtx, SeqLeafResult, SeqOp, SliceWriter, common_prefix_len,
+};
 pub use lz77::{
     FsePackTable, LZ77_DEF_BUCKETS, LZ77_FAST_HASH_SIZE, fse_pack_sequences_fast,
-    huff_encode_stream_raw, lz77_preload_default, lz77_preload_fast, lz77_scan_default,
-    lz77_scan_fast,
+    huff_encode_stream_checked_raw, huff_encode_stream_raw, lz77_preload_default,
+    lz77_preload_fast, lz77_scan_default, lz77_scan_fast,
 };
 pub use cow::{Cow, ToOwnedIn};
 pub use deque::VecDeque;
@@ -178,7 +181,7 @@ pub use heap4::{Heap4, Heap4Plant};
 pub use make::{CloneIn, DefaultIn, FromIn, FromStrIn, IntoIn, LocalShare, ParseIn, Share};
 pub use packed::{Pack, Packed};
 pub use pod::{AnyBitPattern, CastError, CheckedBitPattern, NoUninit, Pod, TransparentWrapper, Zeroable};
-pub use pow2_table::{Pow2Table, SlackSlice, low_u32, top_bits};
+pub use pow2_table::{FixedTable, Pow2Array, Pow2Table, SlackSlice, low_u32, top_bits};
 pub use raw::RawBuf;
 pub use rc::Rc;
 pub use soa::Soa;

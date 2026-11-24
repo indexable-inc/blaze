@@ -148,6 +148,12 @@ impl<T, A: Allocator> RawBuf<T, A> {
         if !self.needs_to_grow(len, additional) {
             return Ok(());
         }
+        self.try_reserve_cold(len, additional)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn try_reserve_cold(&mut self, len: usize, additional: usize) -> Result<(), AllocFailure> {
         let overflow =
             AllocFailure::CapacityOverflow { what: type_name::<T>(), len, additional };
         let Some(required) = len.checked_add(additional) else { return Err(overflow) };
@@ -166,16 +172,27 @@ impl<T, A: Allocator> RawBuf<T, A> {
     #[cold]
     #[inline(never)]
     fn reserve_cold(&mut self, len: usize, additional: usize) {
-        if let Err(failure) = self.try_reserve(len, additional) {
+        if let Err(failure) = self.try_reserve_cold(len, additional) {
             fail(failure);
         }
     }
 
     /// Room for exactly `additional` more values after `len` (the allocator may give more).
+    #[inline]
     pub fn try_reserve_exact(&mut self, len: usize, additional: usize) -> Result<(), AllocFailure> {
         if !self.needs_to_grow(len, additional) {
             return Ok(());
         }
+        self.try_reserve_exact_cold(len, additional)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn try_reserve_exact_cold(
+        &mut self,
+        len: usize,
+        additional: usize,
+    ) -> Result<(), AllocFailure> {
         let overflow =
             AllocFailure::CapacityOverflow { what: type_name::<T>(), len, additional };
         let Some(required) = len.checked_add(additional) else { return Err(overflow) };
@@ -185,6 +202,8 @@ impl<T, A: Allocator> RawBuf<T, A> {
     /// Moves the buffer to a block of `cap` values; `overflow` is the failure when that does
     /// not fit `isize::MAX` bytes. Only called when growing, so never for a `T` sized 0 (its
     /// capacity is `usize::MAX`, which no request exceeds).
+    #[cold]
+    #[inline(never)]
     fn grow_to(&mut self, cap: usize, overflow: AllocFailure) -> Result<(), AllocFailure> {
         debug_assert!(!is_zst::<T>() && cap > self.cap);
         let Ok(layout) = Layout::array::<T>(cap) else { return Err(overflow) };
