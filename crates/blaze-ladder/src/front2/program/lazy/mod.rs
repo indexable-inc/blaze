@@ -251,6 +251,12 @@ struct LazyConsts<'n, S> {
     names: S,
     index: crate::front2::index::Index<'n>,
     prepared: &'n Prepares<'n>,
+    /// Persistent impl-filing index reused across constant evaluations of frozen heads so
+    /// every crate's unfiled impl rows are filed at most once per lazy program instead of
+    /// once per constant evaluation.
+    bucket_index: RefCell<Option<crate::front2::buckets::BucketIndex>>,
+    /// Evaluated constant bit patterns reused across frozen heads in this program.
+    cached_bits: RefCell<blaze_hash::HashMap<blaze_id::ItemKey, u128, Alloc<'static>>>,
 }
 
 struct SharedLazyConsts<'n, S>(&'n RefCell<Option<LazyConsts<'n, S>>>);
@@ -267,12 +273,46 @@ impl<'n, S: NamesSource<'n>> crate::front2::tables::head::ConstValues<'n> for Sh
             let item = checker_of(c);
             return Err(crate::front2::consts::ConstFail::Body { item, error: BodyError::NoBody(item) });
         };
-        crate::front2::tables::head::StoreConsts {
-            names: consts.names,
-            index: &consts.index,
-            prepared: consts.prepared,
+        let cacheable = store.maps.const_proofs.is_none()
+            && !store.maps.qpaths.borrow().is_leaf(c)
+            && !store.maps.inherents.borrow().has(c);
+        if cacheable
+            && let Some(&bits) = consts.cached_bits.borrow().get(&c)
+        {
+            store.maps.file_bits(c, bits);
+            return Ok(());
         }
-        .eval(store, keys, c)
+        let reused = consts.bucket_index.borrow_mut().take();
+        let mut buckets = Some(match reused {
+            Some(ix) => Buckets::from_index(ix),
+            None => Buckets::for_source(consts.names, &consts.index),
+        });
+        let mut evaluator = Consts::default();
+        let mut r = crate::front2::check::Records {
+            names: consts.names,
+            keys,
+            index: &consts.index,
+            store,
+            buckets: &mut buckets,
+            order: crate::front2::check::BuildOrder::AsAsked,
+            consts: Some((&mut evaluator, consts.prepared)),
+        };
+        let result = crate::front2::check::eval_len(&mut r, c);
+        if let Some(b) = buckets {
+            let mut ix = b.into_index();
+            ix.clear_for_store();
+            let mut slot = consts.bucket_index.borrow_mut();
+            if slot.as_ref().is_none_or(|old| ix.unfiled_crates_len() >= old.unfiled_crates_len()) {
+                *slot = Some(ix);
+            }
+        }
+        if result.is_ok()
+            && cacheable
+            && let Some(&bits) = store.maps.const_bits.get(&c)
+        {
+            consts.cached_bits.borrow_mut().insert(c, bits);
+        }
+        result
     }
 }
 
@@ -489,6 +529,8 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
                 names: front.names,
                 index: consts_index,
                 prepared,
+                bucket_index: RefCell::new(None),
+                cached_bits: RefCell::new(blaze_hash::HashMap::new_in(alloc)),
             })));
             let consts_eval: &'n mut SharedLazyConsts<'n, S> = front.frame.alloc(SharedLazyConsts(consts_cell));
             let seeded = crate::front2::tables::head::SeededHeads::new(crate::front2::tables::head::SeededHeadsOpts {

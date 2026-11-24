@@ -291,3 +291,40 @@ fn an_unnamed_intrinsic_with_no_body_is_refused_naming_it_and_its_place() {
         Err(e) => assert!(e.contains(INTRINSIC), "the whole run's refusal names the intrinsic: {e}"),
     }
 }
+
+/// C23 `roundevenf` / `roundeven` (and `rintf`/`rint`/`nearbyintf`/`nearbyint`) declared in an
+/// `extern "C"` block (as core's `round_ties_even` fallback body does) lower in place to LIR
+/// `Op::Nearest` without linking a C symbol (macOS libSystem lacks `roundevenf`/`roundeven`).
+#[test]
+fn extern_c_roundeven_lowers_to_nearest_without_libm_symbol() {
+    let text = "#![feature(no_core, lang_items)]
+#![no_core]
+#![no_main]
+
+#[lang = \"sized\"]
+trait Sized {}
+
+#[lang = \"copy\"]
+trait Copy {}
+impl Copy for f32 {}
+impl Copy for f64 {}
+
+unsafe extern \"C\" {
+    fn roundevenf(x: f32) -> f32;
+    fn roundeven(x: f64) -> f64;
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    let a = unsafe { roundevenf(2.5f32) } as i32; // ties to even -> 2
+    let b = unsafe { roundevenf(3.5f32) } as i32; // ties to even -> 4
+    let c = unsafe { roundeven(2.5f64) } as i32;  // ties to even -> 2
+    let d = unsafe { roundeven(3.5f64) } as i32;  // ties to even -> 4
+    a + b + c + d
+}
+";
+    let counts = walk_text(text).unwrap_or_else(|e| panic!("walk refused extern \"C\" roundeven: {e}"));
+    let status = run_whole(text).unwrap_or_else(|e| panic!("run_whole refused extern \"C\" roundeven: {e}"));
+    assert_eq!(status, 12, "roundeven(2.5) + roundeven(3.5) for f32 and f64 = 2 + 4 + 2 + 4 = 12");
+    println!("d106 extern C roundeven: walk {counts}; run status {status}");
+}

@@ -37,14 +37,44 @@ pub(crate) fn resolved_shim_self<P: FrontEnd>(
     called: Instance,
     ground: &mut PortableTys<'_>,
 ) -> Result<Instance, ResolveError> {
-    shim_self_resolved_by(adts, called, ground, |item, args, ground| program.resolve(caller, item, args, ground))
+    shim_self_resolved_by(program, adts, caller, called, ground, |item, args, ground| program.resolve(caller, item, args, ground))
+}
+
+/// Resolves a fn item `target` that stands as a shim's target (a `reify_shim` or `fn_shim`
+/// `Self`): a language-given `Clone::clone` (tuple, fn item/ptr, closure, record, union, or
+/// `AUTO_COPY_PUB` ADT), a language-given `From::from` (structural union), or a constructor
+/// has no written impl item to select and runs at its own key; any other trait method resolves
+/// to the selected impl's fn via `resolve`.
+fn resolve_fn_item<'g, P: FrontEnd>(
+    program: &P,
+    caller: usize,
+    target: Instance,
+    ground: &mut PortableTys<'g>,
+    resolve: impl FnOnce(blaze_typeck::ItemKey, blaze_typeck::List, &mut PortableTys<'g>) -> Result<(blaze_typeck::ItemKey, blaze_typeck::List), ResolveError>,
+) -> Result<(blaze_typeck::ItemKey, blaze_typeck::List), ResolveError> {
+    if program.ctor_of(target.item).is_some()
+        || crate::clone_shim::language_clone_unconditional(program, target, ground).is_some()
+        || crate::clone_shim::language_from(program, target, ground).is_some()
+    {
+        return Ok((target.item, target.args));
+    }
+    match resolve(target.item, target.args, ground) {
+        Ok(resolved) => Ok(resolved),
+        Err(ResolveError::NoImpl { trait_, .. }) => match crate::clone_shim::language_clone_adt(program, caller, target, trait_, ground)? {
+            Some(_) => Ok((target.item, target.args)),
+            None => Err(ResolveError::NoImpl { trait_, item: target.item }),
+        },
+        Err(error) => Err(error),
+    }
 }
 
 /// [`resolved_shim_self`] with the call's resolution asked of `resolve`: the one home of the
 /// rewrite, for a caller that answers the resolution itself (run/make_one.rs `Asking`, which
 /// logs it in the instance's read list).
-pub(crate) fn shim_self_resolved_by<'g>(
+pub(crate) fn shim_self_resolved_by<'g, P: FrontEnd>(
+    program: &P,
     adts: &dyn Adts,
+    caller: usize,
     called: Instance,
     ground: &mut PortableTys<'g>,
     resolve: impl FnOnce(blaze_typeck::ItemKey, blaze_typeck::List, &mut PortableTys<'g>) -> Result<(blaze_typeck::ItemKey, blaze_typeck::List), ResolveError>,
@@ -53,7 +83,7 @@ pub(crate) fn shim_self_resolved_by<'g>(
         return Ok(called);
     }
     if let Some(target) = blaze_build::reify_shim_of(called, ground.view()) {
-        let (runs, runs_args) = resolve(target.item, target.args, ground)?;
+        let (runs, runs_args) = resolve_fn_item(program, caller, target, ground, resolve)?;
         if runs == target.item && runs_args == target.args {
             return Ok(called);
         }
@@ -63,7 +93,7 @@ pub(crate) fn shim_self_resolved_by<'g>(
     }
     let Some(shim) = crate::fn_shim::fn_shim_of(adts, called, ground) else { return Ok(called) };
     let Some((item, args)) = shim.item else { return Ok(called) };
-    let (runs, runs_args) = resolve(item, args, ground)?;
+    let (runs, runs_args) = resolve_fn_item(program, caller, Instance { item, args }, ground, resolve)?;
     if runs == item && runs_args == args {
         return Ok(called);
     }

@@ -75,7 +75,7 @@ pub(super) struct Indexed {
     /// Each (crate, bucket) filed, with its digest.
     filed: HashMap<(usize, BucketKey), u64, Global>,
     /// Each crate whose unfiled list is filed, with the list's digest.
-    unfiled: HashMap<usize, u64, Global>,
+    pub(super) unfiled: HashMap<usize, u64, Global>,
     /// The incoherent fact's digest, once `BucketIndex::crate_state` holds it.
     pub(super) incoherent: Option<u64>,
     pub(super) trait_reads: HashMap<(ItemKey, Shape), TraitReads, Global>,
@@ -309,7 +309,9 @@ impl BucketIndex {
             self.indexed.not_filed[*why as usize] += 1;
             plain.push(*row);
         }
-        let counts = file_rows(names, krate, &plain, &mut |f| self.take(names, krate, f));
+        let mut aliases = self.alias_shapes.take();
+        let counts = super::file_rows_with_aliases(names, krate, &plain, aliases.as_mut(), &mut |f| self.take(names, krate, f));
+        self.alias_shapes = aliases;
         self.count(counts);
     }
 

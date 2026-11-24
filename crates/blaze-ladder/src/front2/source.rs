@@ -273,6 +273,18 @@ pub trait NamesSource<'n>: Copy {
     /// text of an unrelated body.
     fn enclosing_keys(self, krate: usize, visit: impl FnMut(ItemKey) -> Result<(), crate::seam::PositionGap>) -> Result<(), crate::seam::PositionGap>;
 
+    /// Cached lookup of a written local item `wanted` inside crate `krate`, populating `krate`'s
+    /// per-crate index via `build` on the first miss. Returns `None` for sources that do not
+    /// maintain a per-crate written-local index (e.g. read-recording table views).
+    fn cached_local_start(
+        self,
+        _krate: usize,
+        _wanted: blaze_typeck::ItemKey,
+        _build: impl FnOnce(Alloc<'n>) -> Result<HashMap<blaze_typeck::ItemKey, Option<(ItemKey, u32)>, Alloc<'n>>, crate::seam::PositionGap>,
+    ) -> Option<Result<(ItemKey, u32), crate::seam::PositionGap>> {
+        None
+    }
+
     /// Question 10k: the whole text the expansion `call` of crate `krate` made (`None`: not
     /// served; over records the reason is in the log).
     fn expansion_text(self, krate: usize, call: ItemKey) -> Option<&'n str>;
@@ -1246,6 +1258,10 @@ pub struct Records<'n> {
     /// Per-crate `#![blaze::...]` extension flags detected once from file 0 (`Records::blaze_extensions`),
     /// avoiding repeated full scans of crate root files on every lowered item head.
     extensions: AVec<'n, OnceCell<parser::Extensions>>,
+    /// Per-crate written-local item start cache (`local_position::in_source`), built lazily once
+    /// per crate on the first written-local source-position lookup so repeated publications do
+    /// not rescan every enclosing body in the crate.
+    local_starts: RefCell<HashMap<usize, Result<HashMap<blaze_typeck::ItemKey, Option<(ItemKey, u32)>, Alloc<'n>>, crate::seam::PositionGap>, Alloc<'n>>>,
     /// The allocator the records were opened with, the caller's: a walk's and a digest's
     /// scratch too.
     alloc: Alloc<'n>,
@@ -1286,6 +1302,7 @@ impl<'n> Records<'n> {
             origins_opened: Cell::new(0),
             scratch: RefCell::new(ThroughScratch::new_in(alloc)),
             extensions,
+            local_starts: RefCell::new(HashMap::new_in(alloc)),
             alloc,
         }
     }
@@ -1929,6 +1946,28 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
             }
         }
         Ok(())
+    }
+
+    fn cached_local_start(
+        self,
+        krate: usize,
+        wanted: blaze_typeck::ItemKey,
+        build: impl FnOnce(Alloc<'n>) -> Result<HashMap<blaze_typeck::ItemKey, Option<(ItemKey, u32)>, Alloc<'n>>, crate::seam::PositionGap>,
+    ) -> Option<Result<(ItemKey, u32), crate::seam::PositionGap>> {
+        use crate::seam::PositionGap;
+        if !self.local_starts.borrow().contains_key(&krate) {
+            let built = build(self.alloc);
+            self.local_starts.borrow_mut().insert(krate, built);
+        }
+        let guard = self.local_starts.borrow();
+        let entry = guard.get(&krate)?;
+        Some(match entry {
+            Ok(map) => match map.get(&wanted) {
+                Some(Some(hit)) => Ok(*hit),
+                Some(None) | None => Err(PositionGap::NoItem),
+            },
+            Err(e) => Err(*e),
+        })
     }
 
     fn expansion_text(self, krate: usize, call: ItemKey) -> Option<&'n str> {

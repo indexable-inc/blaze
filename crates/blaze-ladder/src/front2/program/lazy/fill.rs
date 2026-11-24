@@ -513,6 +513,14 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         // `head_abi`, which tabled.rs `row` calls too): a fn's own head ("C" nounwind,
         // "C-unwind" not), or a foreign fn's block. An ABI with no reading is refused by name.
         let own = head_abi(self.front.names, &self.store, key, || Box::from(path.as_str())).map_err(&refuse)?;
+        let intrinsic = intrinsic.or_else(|| {
+            (kind == FnKind::Foreign)
+                .then(|| {
+                    let head = self.store.fns.get(&key)?;
+                    seam_rules::libm_float_intrinsic(own.abi, symbol, head, self.store.tys.view())
+                })
+                .flatten()
+        });
         // `#[rustc_nounwind]` makes any fn nounwind (core/src/panicking.rs:88-92), as tabled.rs.
         let build = BuildAbi { abi: own.abi, nounwind: own.nounwind || symbols.nounwind };
         Ok(self.push(key, kind, build, symbols.track_caller, symbols.fn_attrs, at, &path, symbol, symbols.export.as_deref(), intrinsic))

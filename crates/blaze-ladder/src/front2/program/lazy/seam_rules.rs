@@ -59,6 +59,44 @@ pub(in crate::front2::program) fn llvm_row(foreign: Option<&str>, link_name: Opt
     }))
 }
 
+/// Recognizes an IEEE-754 C `libm` ties-to-even rounding declaration (`roundevenf`/`roundeven`,
+/// `rintf`/`rint`, `nearbyintf`/`nearbyint`) with its exact scalar float signature and lowers
+/// direct calls in place to LIR `Op::Nearest` (`frintn` on ARM64) instead of linking a C symbol
+/// (macOS libSystem lacks C23 `roundevenf`/`roundeven`). The row keeps `FnKind::Foreign` and its
+/// C symbol so indirect uses keep their original ABI/symbol contract.
+pub(in crate::front2::program) fn libm_float_intrinsic(
+    abi: Abi,
+    symbol: &str,
+    head: &crate::front2::heads::FnHead<'_>,
+    tys: blaze_typeck::PTys<'_>,
+) -> Option<Intrinsic> {
+    use blaze_build::intrinsics::target::{
+        Target,
+        float::{FloatCall, FloatFn, Shape},
+    };
+    use blaze_typeck::{FloatTy, PNode};
+
+    if abi != Abi::C || head.parent != 0 || head.own != 0 || head.c_variadic || head.inputs.len() != 1 {
+        return None;
+    }
+    let name = symbol.strip_prefix('_').unwrap_or(symbol);
+    let (func, shape, want) = match name {
+        "roundevenf" => (FloatFn::Roundeven, Shape::F32, FloatTy::F32),
+        "roundeven" => (FloatFn::Roundeven, Shape::F64, FloatTy::F64),
+        "rintf" => (FloatFn::Rint, Shape::F32, FloatTy::F32),
+        "rint" => (FloatFn::Rint, Shape::F64, FloatTy::F64),
+        "nearbyintf" => (FloatFn::Nearbyint, Shape::F32, FloatTy::F32),
+        "nearbyint" => (FloatFn::Nearbyint, Shape::F64, FloatTy::F64),
+        _ => return None,
+    };
+    let input = tys.node(head.inputs[0]).ok()?;
+    let output = tys.node(head.output).ok()?;
+    if input != PNode::Float(want) || output != PNode::Float(want) {
+        return None;
+    }
+    Some(Intrinsic::Target(Target::Float(FloatCall { func, shape })))
+}
+
 /// A panic entry, allocator shim or std-internal declaration supplies the call's ABI.
 /// Its row has no outside symbol to link.
 pub(in crate::front2::program) fn bound_decl_row<'n, S: NamesSource<'n>>(

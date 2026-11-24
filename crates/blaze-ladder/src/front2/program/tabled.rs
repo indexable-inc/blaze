@@ -167,6 +167,11 @@ fn row<'n>(
         }
         _ => None,
     };
+    let intrinsic = intrinsic.or_else(|| {
+        (kind == FnKind::Foreign)
+            .then(|| lazy::seam_rules::libm_float_intrinsic(own.abi, &symbol, head, store.tys.view()))
+            .flatten()
+    });
     // `#[rustc_nounwind]` makes any fn nounwind (core/src/panicking.rs:88-92).
     let nounwind = own.nounwind || symbols.nounwind;
     Ok(Row { body, checked, kind, at, abi: own.abi, nounwind, track_caller: symbols.track_caller, fn_attrs: symbols.fn_attrs, symbol, export: symbols.export, lits, intrinsic })
