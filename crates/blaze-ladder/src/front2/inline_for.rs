@@ -96,6 +96,16 @@ pub fn subst_typeck_body(
             *t = tys.subst(*t, args)?;
         }
     }
+    for p in typeck.paths.iter_mut() {
+        if let Some(anchor) = &mut p.anchor {
+            anchor.ty = tys.subst(anchor.ty, args)?;
+        }
+    }
+    for site in typeck.inline_fors.iter_mut() {
+        if let InlineForKind::Variants { ty, .. } = &mut site.kind {
+            *ty = tys.subst(*ty, args)?;
+        }
+    }
     if let Some(tc::CoroutineKind::Async { output }) = &mut typeck.coroutine {
         *output = tys.subst(*output, args)?;
     }
@@ -393,13 +403,336 @@ enum AggShape {
     Struct(ItemKey),
 }
 
+/// One enum variant's declaration name, constructor shape, and field names (empty for unit,
+/// `"0"`, `"1"`, ... for tuple, declared identifier names for braced).
+struct EnumVariantSpec<'a> {
+    name: AString<'a>,
+    ctor: tc::CtorKind,
+    fields: AVec<'a, AString<'a>>,
+}
+
+/// How an enum type is prefixed before `::Variant` in expanded `match` arms.
+enum EnumPrefix<'a> {
+    /// `<Type>` (generic param or `Self` substituted via `param_subst`, carrying its type args).
+    Anchored(AString<'a>),
+    /// Bare or crate/extern-qualified path `crate::mod::Enum` (generic args inferred from scrutinee).
+    Path(AString<'a>),
+}
+
+impl EnumPrefix<'_> {
+    fn write_variant(&self, out: &mut AString<'_>, variant: &str) {
+        match self {
+            EnumPrefix::Anchored(ty) => {
+                let _ = write!(out, "<{}>::{variant}", ty.as_str());
+            }
+            EnumPrefix::Path(path) => {
+                let _ = write!(out, "{}::{variant}", path.as_str());
+            }
+        }
+    }
+}
+
+/// Writes `s` converted to ASCII lowercase into `out`.
+fn write_ascii_lower(out: &mut AString<'_>, s: &str) {
+    for ch in s.chars() {
+        out.push(ch.to_ascii_lowercase());
+    }
+}
+
+/// Writes `s` converted from PascalCase / camelCase / acronym identifiers into `snake_case`.
+/// Examples: `"Inspector"` -> `"inspector"`, `"OnDeleteCascade"` -> `"on_delete_cascade"`,
+/// `"HTTPServer"` -> `"http_server"`, `"F32"` -> `"f32"`.
+fn write_snake_case(out: &mut AString<'_>, s: &str) {
+    let bytes = s.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b.is_ascii_uppercase() {
+            if i > 0 {
+                let prev = bytes.get(i - 1).copied().unwrap_or(0);
+                let next = bytes.get(i + 1).copied().unwrap_or(0);
+                let boundary = prev != b'_'
+                    && (prev.is_ascii_lowercase()
+                        || prev.is_ascii_digit()
+                        || (prev.is_ascii_uppercase() && next.is_ascii_lowercase()));
+                if boundary {
+                    out.push('_');
+                }
+            }
+            out.push(char::from(b.to_ascii_lowercase()));
+        } else {
+            out.push(char::from(b));
+        }
+    }
+}
+
+/// Typed failure while extracting or rendering an enum `inline for` / `variants::<E>()` site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EnumRenderError {
+    AdtLoadFailed,
+    AdtUnavailable,
+    NotAnEnum,
+    NoLibraryKey,
+    NoSourceText,
+    HeadLowerFailed,
+    SpellVariantNames,
+    UnspelledVariantName,
+    FieldRangeOutOfBounds,
+    UnspelledFieldName,
+    ReadRecordPat,
+    DecodeRecordField,
+    ReadRecordFieldName,
+    ReadRecordBindRange,
+    SliceRecordBind,
+    BadEnumRecordField,
+    BadVariantsRecordField,
+    ReadEnumPat,
+    ReadTupleElems,
+    SliceTupleElem,
+    SlicePat,
+    SliceIter,
+    SliceTyArg,
+    SliceBody,
+    VariantsValueNeedsUnitEnum,
+}
+
+impl EnumRenderError {
+    const fn message(self) -> &'static str {
+        match self {
+            EnumRenderError::AdtLoadFailed => "enum definition could not be loaded",
+            EnumRenderError::AdtUnavailable => "enum definition is not available",
+            EnumRenderError::NotAnEnum => "expected an enum type",
+            EnumRenderError::NoLibraryKey => "enum has no library key for variant spellings",
+            EnumRenderError::NoSourceText => "enum has no source text",
+            EnumRenderError::HeadLowerFailed => "enum head did not lower",
+            EnumRenderError::SpellVariantNames => "enum variant names could not be spelled",
+            EnumRenderError::UnspelledVariantName => "enum variant name is unspelled",
+            EnumRenderError::FieldRangeOutOfBounds => "enum variant field range is out of bounds",
+            EnumRenderError::UnspelledFieldName => "enum struct variant field name is unspelled",
+            EnumRenderError::ReadRecordPat => "could not read enum inline for record pattern",
+            EnumRenderError::DecodeRecordField => "could not decode enum inline for record pattern field",
+            EnumRenderError::ReadRecordFieldName => "could not read enum inline for record pattern field name",
+            EnumRenderError::ReadRecordBindRange => "could not read enum inline for record pattern binding range",
+            EnumRenderError::SliceRecordBind => "could not slice enum inline for record pattern binding",
+            EnumRenderError::BadEnumRecordField => {
+                "enum inline for record pattern fields must be drawn from: name, lower, snake, index, payload"
+            }
+            EnumRenderError::BadVariantsRecordField => {
+                "variants::<E>() record pattern fields must be drawn from: name, lower, snake, index, value"
+            }
+            EnumRenderError::ReadEnumPat => "could not read enum inline for pattern",
+            EnumRenderError::ReadTupleElems => "could not read enum tuple pattern elements",
+            EnumRenderError::SliceTupleElem => "could not slice enum tuple pattern element",
+            EnumRenderError::SlicePat => "could not slice enum inline for pattern",
+            EnumRenderError::SliceIter => "could not slice enum iterable source text",
+            EnumRenderError::SliceTyArg => "could not slice type argument for variants::<E>() expansion",
+            EnumRenderError::SliceBody => "could not slice body source text for enum inline for expansion",
+            EnumRenderError::VariantsValueNeedsUnitEnum => {
+                "variants::<E>() value binding requires a fieldless enum (use a metadata-only pattern like `{ name, index }` or `(name, _, _)` for enums with fields)"
+            }
+        }
+    }
+}
+
+/// Extracts all variants of an `AdtKind::Enum` in declaration order.
+fn extract_enum_variants<'n, 'a, S: NamesSource<'n>>(
+    r: &mut Records<'_, 'n, S>,
+    adt_key: ItemKey,
+    alloc: Alloc<'a>,
+) -> Result<AVec<'a, EnumVariantSpec<'a>>, EnumRenderError> {
+    if !r.store.adts.contains_key(&adt_key) {
+        if let Some(lib) = r.keys.library_in(r.names, adt_key) {
+            if r.store.ensure(r.names, r.keys, Want::Adt(lib)).is_err() {
+                return Err(EnumRenderError::AdtLoadFailed);
+            }
+        }
+    }
+    let Some(adt) = r.store.adts.get(&adt_key) else {
+        return Err(EnumRenderError::AdtUnavailable);
+    };
+    if adt.kind != tc::AdtKind::Enum {
+        return Err(EnumRenderError::NotAnEnum);
+    }
+    if adt.variants.is_empty() {
+        return Ok(OwnVec::new_in(alloc));
+    }
+    let Some(lib) = r.keys.library_in(r.names, adt_key) else {
+        return Err(EnumRenderError::NoLibraryKey);
+    };
+    let Some(it) = r.names.text_of(lib) else {
+        return Err(EnumRenderError::NoSourceText);
+    };
+    let Ok(low) = super::heads::lower(r.names, lib, it.text) else {
+        return Err(EnumRenderError::HeadLowerFailed);
+    };
+    let head_view = low.view();
+    let Ok(head_spell) = Spelling::of(&head_view) else {
+        return Err(EnumRenderError::SpellVariantNames);
+    };
+    let mut variants: AVec<'a, EnumVariantSpec<'a>> =
+        OwnVec::with_capacity_in(adt.variants.len(), alloc);
+    for v in adt.variants.iter() {
+        let Ok(v_text) = head_spell.get(v.name) else {
+            return Err(EnumRenderError::UnspelledVariantName);
+        };
+        let mut name = OwnString::with_capacity_in(v_text.len(), alloc);
+        name.push_str(v_text);
+        let Some(adt_fields) = adt.fields.get(v.fields.range()) else {
+            return Err(EnumRenderError::FieldRangeOutOfBounds);
+        };
+        let mut fields: AVec<'a, AString<'a>> = OwnVec::with_capacity_in(adt_fields.len(), alloc);
+        match v.ctor {
+            tc::CtorKind::Unit => {}
+            tc::CtorKind::Tuple => {
+                for idx in 0..adt_fields.len() {
+                    let mut f_name = OwnString::new_in(alloc);
+                    let _ = write!(f_name, "{idx}");
+                    fields.push(f_name);
+                }
+            }
+            tc::CtorKind::Braces => {
+                for f in adt_fields {
+                    let Ok(f_text) = head_spell.get(f.name) else {
+                        return Err(EnumRenderError::UnspelledFieldName);
+                    };
+                    let mut f_name = OwnString::with_capacity_in(f_text.len(), alloc);
+                    f_name.push_str(f_text);
+                    fields.push(f_name);
+                }
+            }
+        }
+        variants.push(EnumVariantSpec { name, ctor: v.ctor, fields });
+    }
+    Ok(variants)
+}
+
+/// Computes a valid path prefix (`<E>` / `<Self>` / `crate::...::Enum` / `::dep::...::Enum` / `LocalEnum`)
+/// for matching variants of `adt_key` inside `body`.
+fn spell_enum_prefix<'n, 'a, S: NamesSource<'n>>(
+    r: &mut Records<'_, 'n, S>,
+    body: &Body<'n>,
+    probe_tys: PTys<'_>,
+    inner_ty: PTy,
+    adt_key: ItemKey,
+    alloc: Alloc<'a>,
+) -> Option<EnumPrefix<'a>> {
+    // 1. Inside a monomorphized generic body, prefer the in-scope type parameter name (or `Self`)
+    //    so private, block-local, and cross-crate enums resolve cleanly via `<E>::Variant`
+    //    without visibility or cross-crate path issues.
+    if let Some((orig_key, subst_args)) = &body.param_subst {
+        let mut self_matches = false;
+        let mut matched_param: Option<tc::Name> = None;
+        let mut orig_lib_text: Option<(blaze_id::ItemKey, &'n str)> = None;
+        if let Some(orig_head) = r.store.fns.get(orig_key) {
+            match orig_head.self_ {
+                SelfTy::None => {}
+                SelfTy::Trait(_) => {
+                    if let Some(&first) = subst_args.first()
+                        && args_equal(r.store.tys.view(), &[first], probe_tys, &[inner_ty], alloc)
+                    {
+                        self_matches = true;
+                    }
+                }
+                SelfTy::Ty(self_ty, _) => {
+                    if let Ok(sub_self) = r.store.tys.subst(self_ty, subst_args)
+                        && args_equal(r.store.tys.view(), &[sub_self], probe_tys, &[inner_ty], alloc)
+                    {
+                        self_matches = true;
+                    }
+                }
+            }
+            if !self_matches {
+                let store_view = r.store.tys.view();
+                for &(param_name, param_idx) in orig_head.params.iter() {
+                    if let Ok(ix) = usize::try_from(param_idx)
+                        && let Some(&sub_ty) = subst_args.get(ix)
+                        && args_equal(store_view, &[sub_ty], probe_tys, &[inner_ty], alloc)
+                    {
+                        matched_param = Some(param_name);
+                        orig_lib_text = Some((orig_head.lib, orig_head.text));
+                        break;
+                    }
+                }
+            }
+        }
+        if self_matches {
+            let mut s = OwnString::with_capacity_in(4, alloc);
+            s.push_str("Self");
+            return Some(EnumPrefix::Anchored(s));
+        }
+        if let Some(param_name) = matched_param {
+            let view = body.lowered.view();
+            if let Ok(spell) = Spelling::of(&view)
+                && let Ok(text) = spell.get(param_name)
+            {
+                let mut s = OwnString::with_capacity_in(text.len(), alloc);
+                s.push_str(text);
+                return Some(EnumPrefix::Anchored(s));
+            }
+            if let Some((lib, text)) = orig_lib_text
+                && let Ok(low) = super::heads::lower(r.names, lib, text)
+            {
+                let head_view = low.view();
+                if let Ok(spell) = Spelling::of(&head_view)
+                    && let Ok(p_text) = spell.get(param_name)
+                {
+                    let mut s = OwnString::with_capacity_in(p_text.len(), alloc);
+                    s.push_str(p_text);
+                    return Some(EnumPrefix::Anchored(s));
+                }
+            }
+        }
+    }
+
+    // 2. Concrete enum: use bare name if block-local, else `crate::...::Enum` (same crate)
+    //    or `::krate::...::Enum` (external crate).
+    let lib = r.keys.library_in(r.names, adt_key)?;
+    let name = r.names.name_of(lib)?;
+    if let Some(home) = r.names.home_of(lib) {
+        if r.store.locals.block_owner(home).is_some() {
+            let mut s = OwnString::with_capacity_in(name.len(), alloc);
+            s.push_str(name);
+            return Some(EnumPrefix::Path(s));
+        }
+        if let Some(mod_path) = r.names.module_path(home) {
+            let same_crate = r.names.crate_of(lib) == r.names.crate_of(body.item);
+            let mut buf = OwnString::with_capacity_in(mod_path.len() + name.len() + 8, alloc);
+            if same_crate {
+                buf.push_str("crate");
+                for seg in mod_path
+                    .split("::")
+                    .skip(1)
+                    .filter(|s| !s.is_empty() && !blaze_scope::blocks::is_block_module(s))
+                {
+                    buf.push_str("::");
+                    buf.push_str(seg);
+                }
+            } else {
+                for seg in mod_path
+                    .split("::")
+                    .filter(|s| !s.is_empty() && !blaze_scope::blocks::is_block_module(s))
+                {
+                    buf.push_str("::");
+                    buf.push_str(seg);
+                }
+            }
+            buf.push_str("::");
+            buf.push_str(name);
+            return Some(EnumPrefix::Path(buf));
+        }
+    }
+    let mut s = OwnString::with_capacity_in(name.len(), alloc);
+    s.push_str(name);
+    Some(EnumPrefix::Path(s))
+}
+
 /// Classification of an `inline for` iterable's type.
 enum IterKind<'a> {
     /// Depends on a generic type parameter (`T`, `&T`, `&mut T`): defer to monomorphic specialization.
     Generic,
     /// Concrete record, tuple, or single-variant struct (optionally behind `&` or `&mut`).
     Concrete { shape: AggShape, ref_mutbl: Option<Mutbl>, fields: AVec<'a, FieldSpec<'a>> },
-    /// Not a record, tuple, or single-variant struct.
+    /// Concrete enum (optionally behind `&` or `&mut`), unrolled as an exhaustive `match`.
+    Enum { adt: ItemKey, inner_ty: PTy, variants: AVec<'a, EnumVariantSpec<'a>> },
+    /// Not a record, tuple, struct, or enum.
     NotIterable(&'static str),
 }
 
@@ -473,8 +806,14 @@ fn extract_fields<'n, 'a, S: NamesSource<'n>>(
             let Some(adt) = r.store.adts.get(&adt_key) else {
                 return IterKind::NotIterable("struct definition is not available");
             };
+            if adt.kind == tc::AdtKind::Enum {
+                return match extract_enum_variants(r, adt_key, alloc) {
+                    Ok(variants) => IterKind::Enum { adt: adt_key, inner_ty: inner, variants },
+                    Err(why) => IterKind::NotIterable(why.message()),
+                };
+            }
             if adt.kind != tc::AdtKind::Struct {
-                return IterKind::NotIterable("inline for supports records, tuples, and structs (not enums or unions)");
+                return IterKind::NotIterable("inline for supports records, tuples, structs, and enums (not unions)");
             }
             let Some(variant) = adt.variants.first() else {
                 return IterKind::Concrete {
@@ -535,7 +874,7 @@ fn extract_fields<'n, 'a, S: NamesSource<'n>>(
             }
         }
         _ => IterKind::NotIterable(
-            "inline for requires a structural record, tuple, or struct (or a reference to one)",
+            "inline for requires a structural record, tuple, struct, or enum (or a reference to one)",
         ),
     }
 }
@@ -720,6 +1059,413 @@ fn parse_zip_pat<'v>(view: &blaze_lower::View<'v>, pat: tc::PatId) -> Result<Zip
     }
 }
 
+/// Metadata or payload binding inside a record pattern over an enum value or `variants::<E>()`.
+#[derive(Clone, Copy)]
+enum EnumFieldKind {
+    Name,
+    Lower,
+    Snake,
+    Index,
+    Payload,
+    Value,
+}
+
+/// One record-pattern binding (`field: pat_src`) inside an enum `inline for`.
+#[derive(Clone, Copy)]
+struct EnumRecordBind<'s> {
+    kind: EnumFieldKind,
+    pat_src: &'s str,
+}
+
+/// Pattern shape for value-level `inline for pat in enum_val { body }`.
+enum EnumValuePat<'s, 'a> {
+    /// `inline for name in enum_val` -> binds exact variant name (`&'static str`).
+    Name(&'s str),
+    /// `inline for (name, payload) in enum_val` / `(name, lower, payload)` /
+    /// `(name, lower, snake, index, payload)` / `{ name, lower, snake, index, payload }`.
+    Fields(AVec<'a, EnumRecordBind<'s>>),
+}
+
+/// Pattern shape for type-level `inline for pat in variants::<E>() { body }`.
+enum VariantsPat<'s, 'a> {
+    /// `inline for v in variants::<E>()` -> binds unit variant value `E`.
+    Value(&'s str),
+    /// `inline for (name, v) in variants::<E>()` / `(name, lower, v)` /
+    /// `(name, lower, snake, index, v)` / `{ name, lower, snake, index, value }`.
+    Fields(AVec<'a, EnumRecordBind<'s>>),
+}
+
+/// Checks whether a pattern node is a plain wildcard `_` (so omitted payload/value slots avoid
+/// moving non-Copy fields or requiring a fieldless enum).
+fn pat_is_wild(view: &blaze_lower::View<'_>, pat: tc::PatId) -> bool {
+    matches!(view.pat(pat), Ok(blaze_lower::Pat::Wild))
+}
+
+/// Slices a tuple pattern element's source text.
+fn slice_pat_elem<'v>(
+    view: &blaze_lower::View<'v>,
+    id: u32,
+) -> Result<(tc::PatId, &'v str), EnumRenderError> {
+    let pid = tc::PatId(id);
+    let src = view
+        .pat_range(pid)
+        .ok()
+        .and_then(|r| view.text_at(r).ok())
+        .ok_or(EnumRenderError::SliceTupleElem)?;
+    Ok((pid, src))
+}
+
+/// Parses a `Pat::Record` for either value-level enum reflection (`allow_payload = true`) or
+/// `variants::<E>()` (`allow_payload = false`).
+fn parse_enum_record_pat<'v, 'a>(
+    view: &blaze_lower::View<'v>,
+    fields: blaze_lower::List,
+    allow_payload: bool,
+    alloc: Alloc<'a>,
+) -> Result<AVec<'a, EnumRecordBind<'v>>, EnumRenderError> {
+    let rows = view.rows(fields).map_err(|_| EnumRenderError::ReadRecordPat)?;
+    let mut binds: AVec<'a, EnumRecordBind<'v>> = OwnVec::with_capacity_in(rows.len(), alloc);
+    for &row in rows {
+        let fp = blaze_lower::FieldPat::decode(row)
+            .map_err(|_| EnumRenderError::DecodeRecordField)?;
+        let field_name = view
+            .name_text(fp.name)
+            .map_err(|_| EnumRenderError::ReadRecordFieldName)?;
+        let pat_range = view
+            .pat_range(fp.pat)
+            .map_err(|_| EnumRenderError::ReadRecordBindRange)?;
+        let pat_src = view
+            .text_at(pat_range)
+            .map_err(|_| EnumRenderError::SliceRecordBind)?;
+        let kind = match field_name {
+            "name" => EnumFieldKind::Name,
+            "lower" => EnumFieldKind::Lower,
+            "snake" => EnumFieldKind::Snake,
+            "index" => EnumFieldKind::Index,
+            "payload" if allow_payload => EnumFieldKind::Payload,
+            "value" if !allow_payload => EnumFieldKind::Value,
+            _ if allow_payload => return Err(EnumRenderError::BadEnumRecordField),
+            _ => return Err(EnumRenderError::BadVariantsRecordField),
+        };
+        if matches!(kind, EnumFieldKind::Payload | EnumFieldKind::Value) && pat_is_wild(view, fp.pat) {
+            continue;
+        }
+        binds.push(EnumRecordBind { kind, pat_src });
+    }
+    Ok(binds)
+}
+
+/// Converts a 2-, 3-, or 5-element tuple pattern `(name, last)`, `(name, lower, last)`, or
+/// `(name, lower, snake, index, last)` into `EnumRecordBind` entries, omitting wildcard `_`
+/// payload/value slots so non-Copy or payload enums work cleanly without `#![blaze::records]`.
+fn parse_enum_tuple_pat<'v, 'a>(
+    view: &blaze_lower::View<'v>,
+    ids: &[u32],
+    last_kind: EnumFieldKind,
+    alloc: Alloc<'a>,
+) -> Result<Option<AVec<'a, EnumRecordBind<'v>>>, EnumRenderError> {
+    let spec: &[EnumFieldKind] = match ids.len() {
+        2 => &[EnumFieldKind::Name, last_kind],
+        3 => &[EnumFieldKind::Name, EnumFieldKind::Lower, last_kind],
+        5 => &[
+            EnumFieldKind::Name,
+            EnumFieldKind::Lower,
+            EnumFieldKind::Snake,
+            EnumFieldKind::Index,
+            last_kind,
+        ],
+        _ => return Ok(None),
+    };
+    let mut binds: AVec<'a, EnumRecordBind<'v>> = OwnVec::with_capacity_in(ids.len(), alloc);
+    for (&id, &kind) in ids.iter().zip(spec.iter()) {
+        let (pid, pat_src) = slice_pat_elem(view, id)?;
+        if matches!(kind, EnumFieldKind::Payload | EnumFieldKind::Value) && pat_is_wild(view, pid) {
+            continue;
+        }
+        binds.push(EnumRecordBind { kind, pat_src });
+    }
+    Ok(Some(binds))
+}
+
+/// Parses the loop pattern of a value-level `inline for pat in enum_val { body }`.
+fn parse_enum_value_pat<'v, 'a>(
+    view: &blaze_lower::View<'v>,
+    pat: tc::PatId,
+    alloc: Alloc<'a>,
+) -> Result<EnumValuePat<'v, 'a>, EnumRenderError> {
+    match view.pat(pat).map_err(|_| EnumRenderError::ReadEnumPat)? {
+        blaze_lower::Pat::Tuple { elems, rest: None } => {
+            let ids = view.ids(elems).map_err(|_| EnumRenderError::ReadTupleElems)?;
+            if let Some(binds) = parse_enum_tuple_pat(view, ids, EnumFieldKind::Payload, alloc)? {
+                return Ok(EnumValuePat::Fields(binds));
+            }
+            let pat_src = view
+                .pat_range(pat)
+                .ok()
+                .and_then(|r| view.text_at(r).ok())
+                .ok_or(EnumRenderError::SlicePat)?;
+            Ok(EnumValuePat::Name(pat_src))
+        }
+        blaze_lower::Pat::Record { fields, .. } => {
+            Ok(EnumValuePat::Fields(parse_enum_record_pat(view, fields, true, alloc)?))
+        }
+        _ => {
+            let pat_src = view
+                .pat_range(pat)
+                .ok()
+                .and_then(|r| view.text_at(r).ok())
+                .ok_or(EnumRenderError::SlicePat)?;
+            Ok(EnumValuePat::Name(pat_src))
+        }
+    }
+}
+
+/// Parses the loop pattern of `inline for pat in variants::<E>() { body }`.
+fn parse_variants_pat<'v, 'a>(
+    view: &blaze_lower::View<'v>,
+    pat: tc::PatId,
+    alloc: Alloc<'a>,
+) -> Result<VariantsPat<'v, 'a>, EnumRenderError> {
+    match view.pat(pat).map_err(|_| EnumRenderError::ReadEnumPat)? {
+        blaze_lower::Pat::Tuple { elems, rest: None } => {
+            let ids = view.ids(elems).map_err(|_| EnumRenderError::ReadTupleElems)?;
+            if let Some(binds) = parse_enum_tuple_pat(view, ids, EnumFieldKind::Value, alloc)? {
+                return Ok(VariantsPat::Fields(binds));
+            }
+            let pat_src = view
+                .pat_range(pat)
+                .ok()
+                .and_then(|r| view.text_at(r).ok())
+                .ok_or(EnumRenderError::SlicePat)?;
+            Ok(VariantsPat::Value(pat_src))
+        }
+        blaze_lower::Pat::Record { fields, .. } => {
+            Ok(VariantsPat::Fields(parse_enum_record_pat(view, fields, false, alloc)?))
+        }
+        _ => {
+            let pat_src = view
+                .pat_range(pat)
+                .ok()
+                .and_then(|r| view.text_at(r).ok())
+                .ok_or(EnumRenderError::SlicePat)?;
+            Ok(VariantsPat::Value(pat_src))
+        }
+    }
+}
+
+/// Emits one metadata binding (`name` / `lower` / `snake` / `index`) for `variant` at `idx`.
+fn write_enum_meta_binding(
+    out: &mut AString<'_>,
+    kind: EnumFieldKind,
+    pat_src: &str,
+    variant_name: &str,
+    idx: usize,
+) {
+    match kind {
+        EnumFieldKind::Name => {
+            let _ = write!(out, "let {pat_src}: &'static str = \"{variant_name}\"; ");
+        }
+        EnumFieldKind::Lower => {
+            let _ = write!(out, "let {pat_src}: &'static str = \"");
+            write_ascii_lower(out, variant_name);
+            out.push_str("\"; ");
+        }
+        EnumFieldKind::Snake => {
+            let _ = write!(out, "let {pat_src}: &'static str = \"");
+            write_snake_case(out, variant_name);
+            out.push_str("\"; ");
+        }
+        EnumFieldKind::Index => {
+            let _ = write!(out, "let {pat_src}: usize = {idx}usize; ");
+        }
+        EnumFieldKind::Payload | EnumFieldKind::Value => {}
+    }
+}
+
+/// Emits the payload aggregate expression for `variant` whose destructured fields are bound as
+/// `__blaze_ef_{round}_{site_idx}_{i}`.
+fn write_enum_payload_expr(
+    out: &mut AString<'_>,
+    variant: &EnumVariantSpec<'_>,
+    round: usize,
+    site_idx: usize,
+) {
+    match variant.ctor {
+        tc::CtorKind::Unit => out.push_str("()"),
+        tc::CtorKind::Tuple => match variant.fields.len() {
+            0 => out.push_str("()"),
+            1 => {
+                let _ = write!(out, "(__blaze_ef_{round}_{site_idx}_0,)");
+            }
+            n => {
+                out.push('(');
+                for i in 0..n {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    let _ = write!(out, "__blaze_ef_{round}_{site_idx}_{i}");
+                }
+                out.push(')');
+            }
+        },
+        tc::CtorKind::Braces => {
+            if variant.fields.is_empty() {
+                out.push_str("()");
+            } else {
+                out.push_str("{ ");
+                for (i, fname) in variant.fields.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    let _ = write!(out, "{}: __blaze_ef_{round}_{site_idx}_{i}", fname.as_str());
+                }
+                out.push_str(" }");
+            }
+        }
+    }
+}
+
+/// Formats one value-level `inline for pat in enum_val { body }` into an exhaustive `match`.
+fn render_enum_unrolled<'a>(
+    view: &blaze_lower::View<'_>,
+    site: InlineForSite,
+    prefix: &EnumPrefix<'_>,
+    variants: &[EnumVariantSpec<'a>],
+    round: usize,
+    site_idx: usize,
+    alloc: Alloc<'a>,
+) -> Result<AString<'a>, EnumRenderError> {
+    let pat = parse_enum_value_pat(view, site.pat, alloc)?;
+    let iter_src = view
+        .expr_range(site.iter)
+        .ok()
+        .and_then(|r| view.text_at(r).ok())
+        .ok_or(EnumRenderError::SliceIter)?;
+    let body_src = view
+        .expr_range(site.body)
+        .ok()
+        .and_then(|r| view.text_at(r).ok())
+        .ok_or(EnumRenderError::SliceBody)?;
+    let needs_payload = match &pat {
+        EnumValuePat::Name(_) => false,
+        EnumValuePat::Fields(binds) => binds.iter().any(|b| matches!(b.kind, EnumFieldKind::Payload)),
+    };
+    let mut out = OwnString::new_in(alloc);
+    let _ = write!(
+        out,
+        "{{ let __blaze_inline_iter_{round}_{site_idx} = ({iter_src}); match __blaze_inline_iter_{round}_{site_idx} {{"
+    );
+    for (v_idx, variant) in variants.iter().enumerate() {
+        out.push(' ');
+        prefix.write_variant(&mut out, variant.name.as_str());
+        match variant.ctor {
+            tc::CtorKind::Unit => {}
+            tc::CtorKind::Tuple => {
+                if !needs_payload {
+                    out.push_str("(..)");
+                } else {
+                    out.push('(');
+                    for i in 0..variant.fields.len() {
+                        if i > 0 {
+                            out.push_str(", ");
+                        }
+                        let _ = write!(out, "__blaze_ef_{round}_{site_idx}_{i}");
+                    }
+                    out.push(')');
+                }
+            }
+            tc::CtorKind::Braces => {
+                if !needs_payload {
+                    out.push_str(" { .. }");
+                } else {
+                    out.push_str(" { ");
+                    for (i, fname) in variant.fields.iter().enumerate() {
+                        if i > 0 {
+                            out.push_str(", ");
+                        }
+                        let _ = write!(out, "{}: __blaze_ef_{round}_{site_idx}_{i}", fname.as_str());
+                    }
+                    out.push_str(" }");
+                }
+            }
+        }
+        out.push_str(" => { ");
+        match &pat {
+            EnumValuePat::Name(pat_src) => {
+                write_enum_meta_binding(&mut out, EnumFieldKind::Name, pat_src, variant.name.as_str(), v_idx);
+            }
+            EnumValuePat::Fields(binds) => {
+                for b in binds.iter() {
+                    if matches!(b.kind, EnumFieldKind::Payload) {
+                        let _ = write!(out, "let {} = ", b.pat_src);
+                        write_enum_payload_expr(&mut out, variant, round, site_idx);
+                        out.push_str("; ");
+                    } else {
+                        write_enum_meta_binding(&mut out, b.kind, b.pat_src, variant.name.as_str(), v_idx);
+                    }
+                }
+            }
+        }
+        let _ = write!(out, "{body_src} }}");
+    }
+    out.push_str(" } }");
+    Ok(out)
+}
+
+/// Formats one type-level `inline for pat in variants::<E>() { body }` into straight-line blocks.
+fn render_variants_unrolled<'a>(
+    view: &blaze_lower::View<'_>,
+    site: InlineForSite,
+    ty_arg: blaze_lower::TypeId,
+    variants: &[EnumVariantSpec<'a>],
+    alloc: Alloc<'a>,
+) -> Result<AString<'a>, EnumRenderError> {
+    let pat = parse_variants_pat(view, site.pat, alloc)?;
+    let ty_src = view
+        .type_range(ty_arg)
+        .ok()
+        .and_then(|r| view.text_at(r).ok())
+        .ok_or(EnumRenderError::SliceTyArg)?;
+    let body_src = view
+        .expr_range(site.body)
+        .ok()
+        .and_then(|r| view.text_at(r).ok())
+        .ok_or(EnumRenderError::SliceBody)?;
+    let needs_value = match &pat {
+        VariantsPat::Value(_) => true,
+        VariantsPat::Fields(binds) => binds.iter().any(|b| matches!(b.kind, EnumFieldKind::Value)),
+    };
+    if needs_value && variants.iter().any(|v| v.ctor != tc::CtorKind::Unit) {
+        return Err(EnumRenderError::VariantsValueNeedsUnitEnum);
+    }
+    let mut out = OwnString::new_in(alloc);
+    if variants.is_empty() {
+        out.push_str("{}");
+        return Ok(out);
+    }
+    out.push('{');
+    for (v_idx, variant) in variants.iter().enumerate() {
+        out.push_str(" { ");
+        match &pat {
+            VariantsPat::Value(v_src) => {
+                let _ = write!(out, "let {v_src} = <{ty_src}>::{}; ", variant.name.as_str());
+            }
+            VariantsPat::Fields(binds) => {
+                for b in binds.iter() {
+                    if matches!(b.kind, EnumFieldKind::Value) {
+                        let _ = write!(out, "let {} = <{ty_src}>::{}; ", b.pat_src, variant.name.as_str());
+                    } else {
+                        write_enum_meta_binding(&mut out, b.kind, b.pat_src, variant.name.as_str(), v_idx);
+                    }
+                }
+            }
+        }
+        let _ = write!(out, "{body_src} }}");
+    }
+    out.push_str(" }");
+    Ok(out)
+}
+
 /// Formats one unrolled `inline for pat in zip_fields(lhs, rhs) { body }` expansion into `out`.
 fn render_zip_unrolled<'a>(
     view: &blaze_lower::View<'_>,
@@ -892,6 +1638,34 @@ pub fn expand_concrete_body<'n, S: NamesSource<'n>>(
                             let at = body.typeck.expr_ranges.get(iter.ix()).copied().unwrap_or_default();
                             return Err(CheckFail::InlineFor { owner: body.owner, at, why });
                         }
+                        IterKind::Enum { adt, inner_ty, variants } => {
+                            let Some(prefix) =
+                                spell_enum_prefix(r, body, probe_tys, inner_ty, adt, alloc)
+                            else {
+                                let at = body.typeck.expr_ranges.get(site.expr.ix()).copied().unwrap_or_default();
+                                return Err(CheckFail::InlineFor {
+                                    owner: body.owner,
+                                    at,
+                                    why: "could not spell enum path for inline for expansion",
+                                });
+                            };
+                            let view = body.lowered.view();
+                            let replacement = render_enum_unrolled(
+                                &view,
+                                site,
+                                &prefix,
+                                &variants,
+                                round,
+                                site_idx,
+                                alloc,
+                            )
+                            .map_err(|why| CheckFail::InlineFor {
+                                owner: body.owner,
+                                at: body.typeck.expr_ranges.get(site.expr.ix()).copied().unwrap_or_default(),
+                                why: why.message(),
+                            })?;
+                            rewrites.push(Rewrite { start, end, replacement });
+                        }
                         IterKind::Concrete { ref_mutbl, fields, .. } => {
                             let view = body.lowered.view();
                             let Some(replacement) =
@@ -948,6 +1722,14 @@ pub fn expand_concrete_body<'n, S: NamesSource<'n>>(
                             let at = body.typeck.expr_ranges.get(rhs.ix()).copied().unwrap_or_default();
                             return Err(CheckFail::InlineFor { owner: body.owner, at, why });
                         }
+                        (IterKind::Enum { .. }, _) | (_, IterKind::Enum { .. }) => {
+                            let at = body.typeck.expr_ranges.get(site.iter.ix()).copied().unwrap_or_default();
+                            return Err(CheckFail::InlineFor {
+                                owner: body.owner,
+                                at,
+                                why: "zip_fields supports records, tuples, and structs (not enums)",
+                            });
+                        }
                         (IterKind::Generic, _) | (_, IterKind::Generic) => {
                             any_generic = true;
                         }
@@ -982,6 +1764,46 @@ pub fn expand_concrete_body<'n, S: NamesSource<'n>>(
                                 why: why.message(),
                             })?;
                             rewrites.push(Rewrite { start, end, replacement });
+                        }
+                    }
+                }
+                InlineForKind::Variants { ty, ty_arg } => {
+                    let node = {
+                        let body_tys = body.tys.view(&r.store.tys).map_err(|error| {
+                            CheckFail::Check { owner: body.owner, error }
+                        })?;
+                        body_tys.get(ty).copied()
+                    };
+                    match node {
+                        Some(PNode::Param(_)) => {
+                            any_generic = true;
+                        }
+                        Some(PNode::Adt(adt_key, _)) => {
+                            let variants = extract_enum_variants(r, adt_key, alloc).map_err(|why| {
+                                CheckFail::InlineFor {
+                                    owner: body.owner,
+                                    at: body.typeck.expr_ranges.get(site.iter.ix()).copied().unwrap_or_default(),
+                                    why: why.message(),
+                                }
+                            })?;
+                            let view = body.lowered.view();
+                            let replacement =
+                                render_variants_unrolled(&view, site, ty_arg, &variants, alloc).map_err(
+                                    |why| CheckFail::InlineFor {
+                                        owner: body.owner,
+                                        at: body.typeck.expr_ranges.get(site.expr.ix()).copied().unwrap_or_default(),
+                                        why: why.message(),
+                                    },
+                                )?;
+                            rewrites.push(Rewrite { start, end, replacement });
+                        }
+                        _ => {
+                            let at = body.typeck.expr_ranges.get(site.iter.ix()).copied().unwrap_or_default();
+                            return Err(CheckFail::InlineFor {
+                                owner: body.owner,
+                                at,
+                                why: "variants::<T>() requires an enum type",
+                            });
                         }
                     }
                 }
@@ -1299,6 +2121,7 @@ fn check_for_fields_generic_bodies<'n, S: NamesSource<'n>>(
                 });
                 rewrites.push(Rewrite { start, end, replacement });
             }
+            InlineForKind::Variants { .. } => {}
         }
     }
 
@@ -2376,6 +3199,469 @@ pub extern \"C\" fn main() -> i32 {
         ];
         for src in cases {
             assert!(run_zip(src).is_err());
+        }
+    }
+
+    #[test]
+    fn enum_case_helpers_format_lower_and_snake() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let lower_of = |s: &str| {
+            let mut out = OwnString::new_in(alloc);
+            write_ascii_lower(&mut out, s);
+            out
+        };
+        let snake_of = |s: &str| {
+            let mut out = OwnString::new_in(alloc);
+            write_snake_case(&mut out, s);
+            out
+        };
+        assert_eq!(lower_of("Inspector").as_str(), "inspector");
+        assert_eq!(lower_of("OnDeleteCascade").as_str(), "ondeletecascade");
+        assert_eq!(snake_of("Inspector").as_str(), "inspector");
+        assert_eq!(snake_of("ViewKind").as_str(), "view_kind");
+        assert_eq!(snake_of("OnDeleteCascade").as_str(), "on_delete_cascade");
+        assert_eq!(snake_of("HTTPServer").as_str(), "http_server");
+        assert_eq!(snake_of("F32").as_str(), "f32");
+        assert_eq!(snake_of("Vec2D").as_str(), "vec2_d");
+    }
+
+    #[test]
+    fn variants_lowers_all_pattern_forms() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let src = "fn f<E>() {
+    inline for v in variants::<E>() { let _ = v; }
+    inline for (name, v) in variants::<E>() { let _ = name; let _ = v; }
+    inline for { name, lower, snake, index, value } in variants::<E>() {
+        let _ = (name, lower, snake, index, value);
+    }
+}";
+        let mut cfg = NoCfg;
+        let mut values = NoModule;
+        let Ok(lowered) = blaze_lower::lower_body_with_extensions(
+            src,
+            Edition::E2024,
+            parser::Extensions::RECORDS,
+            &mut cfg,
+            &mut values,
+            alloc,
+        ) else {
+            assert!(false, "lower_body_with_extensions failed");
+            return;
+        };
+        let view = lowered.view();
+        let mut tys = PortableTys::new_in(alloc);
+        let mut types = DummyTypes;
+        let Ok(tb) = to_typeck(&view, ItemKey(1), &mut tys, &mut types, alloc) else {
+            assert!(false, "to_typeck failed");
+            return;
+        };
+        assert_eq!(tb.inline_fors.len(), 3);
+        for site in tb.inline_fors.iter() {
+            let InlineForKind::Variants { ty_arg, .. } = site.kind else {
+                assert!(false, "expected InlineForKind::Variants");
+                return;
+            };
+            let ty_src = view
+                .type_range(ty_arg)
+                .ok()
+                .and_then(|r| view.text_at(r).ok());
+            assert_eq!(ty_src, Some("E"));
+        }
+    }
+
+    #[test]
+    fn enum_reflection_unit_enums_as_str_from_str_and_cross_module_run() {
+        let got = run_zip(
+            "
+#[repr(C)]
+struct StrParts { ptr: *const u8, len: usize }
+
+impl Copy for StrParts {}
+
+union StrWide { s: &'static str, parts: StrParts }
+
+fn str_eq(a: &'static str, b: &'static str) -> bool {
+    let pa = unsafe { StrWide { s: a }.parts };
+    let pb = unsafe { StrWide { s: b }.parts };
+    if pa.len != pb.len {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < pa.len {
+        let ba = unsafe { *((pa.ptr as usize + i) as *const u8) };
+        let bb = unsafe { *((pb.ptr as usize + i) as *const u8) };
+        if ba != bb {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn str_len(s: &'static str) -> u32 {
+    unsafe { StrWide { s }.parts.len as u32 }
+}
+
+enum MyOpt<T> {
+    None,
+    Some(T),
+}
+
+mod reflect {
+    use super::{MyOpt, str_eq};
+
+    pub fn as_str<E>(v: E) -> &'static str {
+        inline for name in v { name }
+    }
+
+    pub fn as_lowercase_str<E>(v: E) -> &'static str {
+        inline for { lower } in v { lower }
+    }
+
+    pub fn as_snake_str<E>(v: E) -> &'static str {
+        inline for { snake } in v { snake }
+    }
+
+    pub fn variant_index<E>(v: E) -> usize {
+        inline for { index } in v { index }
+    }
+
+    pub fn from_str<E>(s: &'static str) -> MyOpt<E> {
+        inline for (name, v) in variants::<E>() {
+            if str_eq(s, name) {
+                return MyOpt::Some(v);
+            }
+        }
+        MyOpt::None
+    }
+
+    pub fn from_lowercase_str<E>(s: &'static str) -> MyOpt<E> {
+        inline for { lower, value } in variants::<E>() {
+            if str_eq(s, lower) {
+                return MyOpt::Some(value);
+            }
+        }
+        MyOpt::None
+    }
+
+    pub fn from_snake_str<E>(s: &'static str) -> MyOpt<E> {
+        inline for { snake, value } in variants::<E>() {
+            if str_eq(s, snake) {
+                return MyOpt::Some(value);
+            }
+        }
+        MyOpt::None
+    }
+
+    pub fn variant_count<E>() -> u32 {
+        let mut n: u32 = 0;
+        inline for { index: _ } in variants::<E>() {
+            n = n + 1;
+        }
+        n
+    }
+}
+
+enum ViewKind {
+    Inspector,
+    Graph,
+    Archetypes,
+    Query,
+    Schemas,
+}
+
+impl Copy for ViewKind {}
+
+impl ViewKind {
+    fn lower_self(self) -> &'static str {
+        inline for { lower } in self { lower }
+    }
+    fn parse_self(s: &'static str) -> MyOpt<Self> {
+        inline for { lower, value } in variants::<Self>() {
+            if str_eq(s, lower) {
+                return MyOpt::Some(value);
+            }
+        }
+        MyOpt::None
+    }
+}
+
+enum BuiltinRel {
+    ChildOf,
+    IsA,
+    OnDeleteCascade,
+    HTTPServer,
+}
+
+impl Copy for BuiltinRel {}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let mut score: u32 = 0;
+
+    // 1. Generic cross-module as_str / as_lowercase_str / as_snake_str / variant_index: +15
+    if str_eq(reflect::as_str(ViewKind::Inspector), \"Inspector\") { score = score + 1; }
+    if str_eq(reflect::as_lowercase_str(ViewKind::Archetypes), \"archetypes\") { score = score + 2; }
+    if str_eq(reflect::as_snake_str(BuiltinRel::OnDeleteCascade), \"on_delete_cascade\") { score = score + 4; }
+    if str_eq(reflect::as_snake_str(BuiltinRel::HTTPServer), \"http_server\") { score = score + 8; }
+
+    // 2. Variant index & count: index(Schemas)=4, count(ViewKind)=5, count(BuiltinRel)=4 -> +13 => 28
+    score = score + reflect::variant_index(ViewKind::Schemas) as u32;
+    score = score + reflect::variant_count::<ViewKind>();
+    score = score + reflect::variant_count::<BuiltinRel>();
+
+    // 3. Generic cross-module from_str / from_lowercase_str / from_snake_str: +15 => 43
+    if let MyOpt::Some(ViewKind::Graph) = reflect::from_str::<ViewKind>(\"Graph\") {
+        score = score + 1;
+    }
+    if let MyOpt::Some(ViewKind::Query) = reflect::from_lowercase_str::<ViewKind>(\"query\") {
+        score = score + 2;
+    }
+    if let MyOpt::None = reflect::from_lowercase_str::<ViewKind>(\"bogus\") {
+        score = score + 4;
+    }
+    if let MyOpt::Some(BuiltinRel::OnDeleteCascade) = reflect::from_snake_str::<BuiltinRel>(\"on_delete_cascade\") {
+        score = score + 8;
+    }
+
+    // 4. Inherent impl methods using `self` and `variants::<Self>()`: +6 => 49
+    if str_eq(ViewKind::Schemas.lower_self(), \"schemas\") { score = score + 2; }
+    if let MyOpt::Some(ViewKind::Inspector) = ViewKind::parse_self(\"inspector\") {
+        score = score + 4;
+    }
+
+    // 5. Concrete `inline for` over unit enum value and `variants::<E>()` value binding: +10 => 59
+    let rel_tag = inline for { snake } in BuiltinRel::ChildOf { snake };
+    if str_eq(rel_tag, \"child_of\") { score = score + 3; }
+    let mut all_idx_sum: u32 = 0;
+    inline for v in variants::<ViewKind>() {
+        all_idx_sum = all_idx_sum + reflect::variant_index(v) as u32;
+    }
+    // 0+1+2+3+4 = 10 -> +7 => 59
+    if all_idx_sum == 10 { score = score + 7; }
+
+    // 6. Block-local private enum passed into cross-module generic reflect functions: +11 => 70
+    enum LocalTab {
+        AlphaOne,
+        BetaTwo,
+    }
+    impl Copy for LocalTab {}
+    if str_eq(reflect::as_snake_str(LocalTab::AlphaOne), \"alpha_one\") { score = score + 5; }
+    if let MyOpt::Some(LocalTab::BetaTwo) = reflect::from_lowercase_str::<LocalTab>(\"betatwo\") {
+        score = score + 6;
+    }
+
+    // 7. Concrete reference `&ViewKind` reflection: +4 => 74
+    let tab = ViewKind::Graph;
+    let tab_len = str_len(inline for name in &tab { name });
+    if tab_len == 5 { score = score + 4; }
+
+    score as i32
+}
+",
+        );
+        assert!(matches!(got, Ok(74)), "unexpected result: {got:?}");
+    }
+
+    #[test]
+    fn enum_reflection_payload_enums_and_nested_inline_for_run() {
+        let got = run_zip(
+            "
+#[repr(C)]
+struct StrParts { ptr: *const u8, len: usize }
+
+impl Copy for StrParts {}
+
+union StrWide { s: &'static str, parts: StrParts }
+
+fn str_len(s: &'static str) -> u32 {
+    unsafe { StrWide { s }.parts.len as u32 }
+}
+
+trait ReadU32 {
+    fn read_u32(&self) -> u32;
+    fn add_u32(&mut self, delta: u32);
+}
+
+impl ReadU32 for u32 {
+    fn read_u32(&self) -> u32 { *self }
+    fn add_u32(&mut self, delta: u32) { *self = *self + delta; }
+}
+
+// Non-Copy payload type to prove metadata-only enum reflection does not move payloads.
+struct Token(u32);
+
+impl ReadU32 for Token {
+    fn read_u32(&self) -> u32 { self.0 }
+    fn add_u32(&mut self, delta: u32) { self.0 = self.0 + delta; }
+}
+
+enum Shape {
+    Empty,
+    Circle(u32),
+    Segment(u32, u32),
+    Rect { w: u32, h: u32 },
+}
+
+enum Msg {
+    Ping,
+    One(Token),
+    Two { a: Token, b: Token },
+}
+
+enum Maybe<T> {
+    Nothing,
+    Just(T),
+    Named { val: T },
+}
+
+fn sum_payload<E>(v: &E) -> u32 {
+    let mut total: u32 = 0;
+    inline for (_name, payload) in v {
+        inline for field in payload {
+            total = total + field.read_u32();
+        }
+    }
+    total
+}
+
+fn bump_payload<E>(v: &mut E, delta: u32) {
+    inline for { payload } in v {
+        inline for field in payload {
+            field.add_u32(delta);
+        }
+    }
+}
+
+fn tag_len<E>(v: &E) -> u32 {
+    inline for { lower } in v { str_len(lower) }
+}
+
+fn variant_name_len_sum<E>() -> u32 {
+    let mut total: u32 = 0;
+    inline for { name, index: _ } in variants::<E>() {
+        total = total + str_len(name);
+    }
+    total
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let mut score: u32 = 0;
+
+    // 1. Generic sum_payload across all 4 variant shapes (unit, 1-tuple, 2-tuple, braced):
+    //    0 + 7 + (3+4) + (5+6) = 25
+    let mut s0 = Shape::Empty;
+    let mut s1 = Shape::Circle(7);
+    let mut s2 = Shape::Segment(3, 4);
+    let mut s3 = Shape::Rect { w: 5, h: 6 };
+    score = score + sum_payload(&s0) + sum_payload(&s1) + sum_payload(&s2) + sum_payload(&s3);
+
+    // 2. Generic mutable bump_payload (+2 per field):
+    //    s0: 0 fields (+0), s1: 1 field (+2 -> 9), s2: 2 fields (+4 -> 11), s3: 2 fields (+4 -> 15)
+    //    sum after bump = 0 + 9 + 11 + 15 = 35 => score = 60
+    bump_payload(&mut s0, 2);
+    bump_payload(&mut s1, 2);
+    bump_payload(&mut s2, 2);
+    bump_payload(&mut s3, 2);
+    score = score + sum_payload(&s0) + sum_payload(&s1) + sum_payload(&s2) + sum_payload(&s3);
+
+    // 3. Non-Copy payload enum: metadata-only tag_len doesn't move Token, and sum_payload reads &Token:
+    //    \"two\" (3) + (10 + 11 = 21) = 24 => score = 84
+    let m = Msg::Two { a: Token(10), b: Token(11) };
+    score = score + tag_len(&m) + sum_payload(&m);
+
+    // 4. Metadata-only `variants::<Shape>()` works even on payload enums:
+    //    \"Empty\"(5) + \"Circle\"(6) + \"Segment\"(7) + \"Rect\"(4) = 22 => score = 106
+    score = score + variant_name_len_sum::<Shape>();
+
+    // 5. Generic enum `Maybe<u32>` reflected both concretely and generically:
+    //    sum_payload(&Maybe::Named { val: 8 }) = 8, concrete tag len \"just\" = 4 => +12 => 118
+    let mb = Maybe::Named { val: 8u32 };
+    let mb2 = Maybe::Just(1u32);
+    score = score + sum_payload(&mb);
+    score = score + inline for { lower } in &mb2 { str_len(lower) };
+
+    score as i32
+}
+",
+        );
+        assert!(matches!(got, Ok(118)), "unexpected result: {got:?}");
+    }
+
+    #[test]
+    fn enum_reflection_rejects_invalid_uses() {
+        let cases = [
+            // variants::<Struct>() rejected
+            "
+struct Point { x: u32 }
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    inline for { name } in variants::<Point>() { let _ = name; }
+    0
+}
+",
+            // variants::<u32>() rejected
+            "
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    inline for { name } in variants::<u32>() { let _ = name; }
+    0
+}
+",
+            // variants::<PayloadEnum>() with value binding rejected
+            "
+enum Payload { A, B(u32) }
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    inline for v in variants::<Payload>() { let _ = v; }
+    0
+}
+",
+            // variants::<PayloadEnum>() with (name, v) rejected
+            "
+enum Payload { A, B { x: u32 } }
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    inline for (n, v) in variants::<Payload>() { let _ = (n, v); }
+    0
+}
+",
+            // unknown record field on variants::<E>() rejected
+            "
+enum Mode { A, B }
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    inline for { bogus } in variants::<Mode>() { let _ = bogus; }
+    0
+}
+",
+            // unknown record field on value-level enum inline for rejected
+            "
+enum Mode { A, B }
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let m = Mode::A;
+    inline for { bogus } in m { let _ = bogus; }
+    0
+}
+",
+            // zip_fields on enum rejected
+            "
+enum Mode { A, B }
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let a = Mode::A;
+    let b = Mode::B;
+    inline for (x, y) in zip_fields(&a, &b) { let _ = (x, y); }
+    0
+}
+",
+        ];
+        for src in cases {
+            assert!(run_zip(src).is_err(), "expected enum reflection error for:\n{src}");
         }
     }
 }
