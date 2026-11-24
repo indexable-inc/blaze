@@ -23,16 +23,16 @@ use core::fmt;
 use blaze_code::record::{Symbol, TrapSource};
 use blaze_emit::Isa;
 use blaze_lir::{
-    Block, BlockKind, Flags, Op, VerifyError,
+    Block, BlockKind, Field, Flags, Layout, Op, Ty, VerifyError,
     body::{Bodies, BodyId, DatumId, Target},
-    func::{FnAttrs, Inline, RefId, RefKind, RefRec},
+    func::{Conv, FnAttrs, Inline, ParamKind, RefId, RefKind, RefRec, SigId, SigRec},
     inline::{InlinePolicy, NoWeights},
     lto::{ModuleBody, OptimizedBody, lto_optimize_module},
     simplify::SimplifyError,
     verify,
 };
 use blaze_own::{AVec, Alloc, Vec};
-use blaze_tier::Machine;
+use blaze_tier::{Arch, Machine};
 use blaze_typeck::ItemKey;
 
 use super::{BuiltCallee, BuiltLir, Maker, RecordsProgram, Typing};
@@ -200,6 +200,7 @@ struct LtoOrigin<'a> {
     row: usize,
     symbol: Symbol,
     is_seed: bool,
+    lowered_libm: bool,
     orig_unreachables: usize,
     built: BuiltLir<'a>,
 }
@@ -335,6 +336,481 @@ fn push_vtable_datum<'a>(out: &mut AVec<'a, (Symbol, AVec<'a, u8>)>, symbol: Sym
     out.push((symbol, copied));
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct LibmOp {
+    op: Op,
+    ty: Ty,
+    arity: u8,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct LoweredLibmCall {
+    op: Op,
+    ty: Ty,
+    arity: u8,
+    args: [u32; 3],
+    /// `Some(normal_blk)` when lowering an `Op::Invoke` terminator (emits `Op::Jump(normal_blk)`
+    /// right after the native float op); `None` when lowering an `Op::Call`.
+    invoke_normal: Option<u32>,
+}
+
+fn op_byte(op: Op) -> Option<u8> {
+    let idx = Op::ALL.iter().position(|&o| o == op)?;
+    u8::try_from(idx).ok()
+}
+
+/// Maps an IEEE-754 C libm symbol name (with or without a leading `_`) to its exact hardware LIR
+/// op, gated strictly to ops supported by `blaze-emit`'s `sota` backend for `machine`.
+///
+/// (`Op::Fcopysign` is intentionally omitted because neither `sota/isel.rs` nor `sota/x86_64.rs`
+/// supports it yet.)
+fn match_ieee_libm(raw_name: &str, machine: Machine) -> Option<LibmOp> {
+    let name = raw_name.strip_prefix('_').unwrap_or(raw_name);
+    let candidate = match name {
+        "fmaf" => LibmOp { op: Op::Fma, ty: Ty::F32, arity: 3 },
+        "fma" => LibmOp { op: Op::Fma, ty: Ty::F64, arity: 3 },
+        "sqrtf" => LibmOp { op: Op::Sqrt, ty: Ty::F32, arity: 1 },
+        "sqrt" => LibmOp { op: Op::Sqrt, ty: Ty::F64, arity: 1 },
+        "fabsf" => LibmOp { op: Op::Fabs, ty: Ty::F32, arity: 1 },
+        "fabs" => LibmOp { op: Op::Fabs, ty: Ty::F64, arity: 1 },
+        "floorf" => LibmOp { op: Op::Floor, ty: Ty::F32, arity: 1 },
+        "floor" => LibmOp { op: Op::Floor, ty: Ty::F64, arity: 1 },
+        "ceilf" => LibmOp { op: Op::Ceil, ty: Ty::F32, arity: 1 },
+        "ceil" => LibmOp { op: Op::Ceil, ty: Ty::F64, arity: 1 },
+        "truncf" => LibmOp { op: Op::Ftrunc, ty: Ty::F32, arity: 1 },
+        "trunc" => LibmOp { op: Op::Ftrunc, ty: Ty::F64, arity: 1 },
+        "rintf" | "nearbyintf" | "roundevenf" => LibmOp { op: Op::Nearest, ty: Ty::F32, arity: 1 },
+        "rint" | "nearbyint" | "roundeven" => LibmOp { op: Op::Nearest, ty: Ty::F64, arity: 1 },
+        "roundf" => LibmOp { op: Op::Fround, ty: Ty::F32, arity: 1 },
+        "round" => LibmOp { op: Op::Fround, ty: Ty::F64, arity: 1 },
+        _ => return None,
+    };
+    let supported = match machine.arch {
+        Arch::Arm64 => true,
+        Arch::X86_64 => candidate.op == Op::Fma && (machine.features & Machine::FMA) != 0,
+    };
+    if supported { Some(candidate) } else { None }
+}
+
+/// Checks whether instruction `inst` is a non-variadic `Conv::C` `Op::Call` or `Op::Invoke` to an
+/// exact IEEE-754 libm function supported by `sota` on `machine` with matching signature and types.
+fn detect_libm_call(built: &BuiltLir<'_>, inst: usize, machine: Machine) -> Option<LoweredLibmCall> {
+    let view = built.func.view();
+    let op = Op::from_byte(*view.ops.get(inst)?)?;
+    let is_invoke = match op {
+        Op::Call => false,
+        Op::Invoke => true,
+        _ => return None,
+    };
+    let extra_start = usize::try_from(*view.data.get(inst)?).ok()?;
+    let ref_word = *view.extra.get(extra_start)?;
+    let sig_word = *view.extra.get(extra_start.checked_add(1)?)?;
+    let (invoke_normal, args_len_pos) = if is_invoke {
+        let normal_blk = *view.extra.get(extra_start.checked_add(2)?)?;
+        let normal_idx = usize::try_from(normal_blk).ok()?;
+        if normal_blk == 0 || normal_idx >= view.blocks() || normal_idx >= view.block_kinds.len() {
+            return None;
+        }
+        let normal_block = Block(normal_blk);
+        if view.block_kind(normal_block).is_landing() || !view.params(normal_block).is_empty() {
+            return None;
+        }
+        (Some(normal_blk), extra_start.checked_add(4)?)
+    } else {
+        (None, extra_start.checked_add(2)?)
+    };
+
+    let ref_rec = view.refs.get(RefId(ref_word).index())?;
+    if RefKind::from_word(ref_rec.kind) != Some(RefKind::Func) {
+        return None;
+    }
+    let place_idx = usize::try_from(ref_rec.place).ok()?;
+    let BuiltCallee::C { start, len } = *built.funcs.get(place_idx)? else {
+        return None;
+    };
+    let c_name = built.c_str(start, len)?;
+    let libm = match_ieee_libm(c_name, machine)?;
+    let arity = usize::from(libm.arity);
+
+    let sig_rec = view.sigs.get(SigId(sig_word).index())?;
+    if Conv::from_byte(sig_rec.conv) != Some(Conv::C)
+        || (sig_rec.bits & SigRec::VARIADIC) != 0
+        || usize::from(sig_rec.params) != arity
+        || sig_rec.rets != 1
+    {
+        return None;
+    }
+    let sig_first = usize::try_from(sig_rec.first).ok()?;
+    let sig_ret_pos = sig_first.checked_add(arity)?;
+    let sig_params = view.sig_params.get(sig_first..sig_ret_pos)?;
+    let sig_ret = view.sig_params.get(sig_ret_pos)?;
+    for p in sig_params {
+        if Ty(p.ty) != libm.ty || ParamKind::from_byte(p.kind) != Some(ParamKind::Value) {
+            return None;
+        }
+    }
+    if Ty(sig_ret.ty) != libm.ty || ParamKind::from_byte(sig_ret.kind) != Some(ParamKind::Value) {
+        return None;
+    }
+
+    if Ty(*view.tys.get(inst)?) != libm.ty {
+        return None;
+    }
+    let argc = usize::try_from(*view.extra.get(args_len_pos)?).ok()?;
+    if argc != arity {
+        return None;
+    }
+    let args_start = args_len_pos.checked_add(1)?;
+    let arg_words = view.extra.get(args_start..args_start.checked_add(arity)?)?;
+    let mut args = [0u32; 3];
+    for (k, &v) in arg_words.iter().enumerate() {
+        let v_idx = usize::try_from(v).ok()?;
+        if Ty(*view.tys.get(v_idx)?) != libm.ty {
+            return None;
+        }
+        if let Some(slot) = args.get_mut(k) {
+            *slot = v;
+        }
+    }
+
+    Some(LoweredLibmCall {
+        op: libm.op,
+        ty: libm.ty,
+        arity: libm.arity,
+        args,
+        invoke_normal,
+    })
+}
+
+fn remap_val(val_map: &[u32], old: u32) -> Option<u32> {
+    let idx = usize::try_from(old).ok()?;
+    val_map.get(idx).copied()
+}
+
+fn copy_remapped_target<'a>(
+    old_extra: &[u32],
+    at: &mut usize,
+    val_map: &[u32],
+    out_extra: &mut AVec<'a, u32>,
+) -> Option<()> {
+    let block = *old_extra.get(*at)?;
+    *at = at.checked_add(1)?;
+    out_extra.push(block);
+    let n_word = *old_extra.get(*at)?;
+    *at = at.checked_add(1)?;
+    out_extra.push(n_word);
+    let n = usize::try_from(n_word).ok()?;
+    for _ in 0..n {
+        let v = *old_extra.get(*at)?;
+        *at = at.checked_add(1)?;
+        out_extra.push(remap_val(val_map, v)?);
+    }
+    Some(())
+}
+
+fn copy_remapped_extra<'a>(
+    old_extra: &[u32],
+    start: usize,
+    fields: &[Field],
+    ty: Ty,
+    old_tys: &[u16],
+    val_map: &[u32],
+    out_extra: &mut AVec<'a, u32>,
+) -> Option<()> {
+    let mut at = start;
+    let mut last_value: Option<u32> = None;
+    for &field in fields {
+        match field {
+            Field::Value => {
+                let v = *old_extra.get(at)?;
+                at = at.checked_add(1)?;
+                last_value = Some(v);
+                out_extra.push(remap_val(val_map, v)?);
+            }
+            Field::Block
+            | Field::Imm
+            | Field::Offset
+            | Field::IntCond
+            | Field::FloatCond
+            | Field::Rmw
+            | Field::Ref
+            | Field::Sig
+            | Field::Slot
+            | Field::Intrinsic
+            | Field::Asm => {
+                let w = *old_extra.get(at)?;
+                at = at.checked_add(1)?;
+                out_extra.push(w);
+            }
+            Field::Target => {
+                copy_remapped_target(old_extra, &mut at, val_map, out_extra)?;
+            }
+            Field::Values => {
+                let n_word = *old_extra.get(at)?;
+                at = at.checked_add(1)?;
+                out_extra.push(n_word);
+                let n = usize::try_from(n_word).ok()?;
+                for _ in 0..n {
+                    let v = *old_extra.get(at)?;
+                    at = at.checked_add(1)?;
+                    out_extra.push(remap_val(val_map, v)?);
+                }
+            }
+            Field::Blocks | Field::Mask => {
+                let n_word = *old_extra.get(at)?;
+                at = at.checked_add(1)?;
+                out_extra.push(n_word);
+                let n = usize::try_from(n_word).ok()?;
+                for _ in 0..n {
+                    let w = *old_extra.get(at)?;
+                    at = at.checked_add(1)?;
+                    out_extra.push(w);
+                }
+            }
+            Field::Const => {
+                let words = usize::try_from(ty.const_words()).ok()?;
+                for _ in 0..words {
+                    let w = *old_extra.get(at)?;
+                    at = at.checked_add(1)?;
+                    out_extra.push(w);
+                }
+            }
+            Field::Cases => {
+                let scrutinee = last_value?;
+                let scrut_idx = usize::try_from(scrutinee).ok()?;
+                let scrut_ty = Ty(*old_tys.get(scrut_idx)?);
+                let width = usize::try_from(scrut_ty.const_words()).ok()?;
+                let n_word = *old_extra.get(at)?;
+                at = at.checked_add(1)?;
+                out_extra.push(n_word);
+                let n = usize::try_from(n_word).ok()?;
+                for _ in 0..n {
+                    for _ in 0..width {
+                        let w = *old_extra.get(at)?;
+                        at = at.checked_add(1)?;
+                        out_extra.push(w);
+                    }
+                    copy_remapped_target(old_extra, &mut at, val_map, out_extra)?;
+                }
+            }
+        }
+    }
+    Some(())
+}
+
+/// Lowers hardware-exact IEEE-754 libm `Op::Call` / `Op::Invoke` instructions in `built` to native
+/// LIR float ops supported by `sota` on `machine`, rebuilding `extra` contiguously and preserving
+/// SSA numbering across `Op::Invoke -> [Op::Fma/Sqrt/..., Op::Jump(normal)]` expansions.
+///
+/// Running this immediately after `maker.build_lir` turns `std::f32::mul_add` / `std::f64::mul_add`
+/// / `sqrt` wrappers into tiny unwind-free pure leaves that `lto_optimize_module` inlines directly
+/// into caller loops (exposing `Op::Fma` to `gemm.rs` SME2 `FMOPA.S`/`FMOPA.D`).
+/// Returns `true` iff at least one call/invoke was lowered.
+fn lower_ieee_libm_calls<'a>(built: &mut BuiltLir<'a>, machine: Machine, alloc: Alloc<'a>) -> bool {
+    let n = built.func.ops.len();
+    if n == 0 || built.funcs.is_empty() || built.c_text.is_empty() {
+        return false;
+    }
+
+    // Fast path: scan before allocating any rewrite buffers.
+    let mut first_match: Option<(usize, LoweredLibmCall)> = None;
+    for i in 0..n {
+        if let Some(hit) = detect_libm_call(built, i, machine) {
+            first_match = Some((i, hit));
+            break;
+        }
+    }
+    let Some((first_idx, first_hit)) = first_match else {
+        return false;
+    };
+
+    let mut rewrites: AVec<'a, Option<LoweredLibmCall>> = Vec::with_capacity_in(n, alloc);
+    rewrites.resize(n, None);
+    if let Some(slot) = rewrites.get_mut(first_idx) {
+        *slot = Some(first_hit);
+    }
+    let mut extra_insts = usize::from(first_hit.invoke_normal.is_some());
+    for i in (first_idx + 1)..n {
+        if let Some(hit) = detect_libm_call(built, i, machine) {
+            if hit.invoke_normal.is_some() {
+                extra_insts = extra_insts.saturating_add(1);
+            }
+            if let Some(slot) = rewrites.get_mut(i) {
+                *slot = Some(hit);
+            }
+        }
+    }
+
+    let mut val_map: AVec<'a, u32> = Vec::with_capacity_in(n, alloc);
+    let mut next_inst = 0u32;
+    for i in 0..n {
+        val_map.push(next_inst);
+        let Some(step1) = next_inst.checked_add(1) else {
+            return false;
+        };
+        next_inst = step1;
+        if matches!(rewrites.get(i), Some(Some(r)) if r.invoke_normal.is_some()) {
+            let Some(step2) = next_inst.checked_add(1) else {
+                return false;
+            };
+            next_inst = step2;
+        }
+    }
+
+    let Some(jump_byte) = op_byte(Op::Jump) else {
+        return false;
+    };
+    let new_cap = n.saturating_add(extra_insts);
+    let mut new_ops: AVec<'a, u8> = Vec::with_capacity_in(new_cap, alloc);
+    let mut new_flags: AVec<'a, u8> = Vec::with_capacity_in(new_cap, alloc);
+    let mut new_tys: AVec<'a, u16> = Vec::with_capacity_in(new_cap, alloc);
+    let mut new_data: AVec<'a, u32> = Vec::with_capacity_in(new_cap, alloc);
+    let mut new_extra: AVec<'a, u32> = Vec::with_capacity_in(built.func.extra.len(), alloc);
+    let mut new_attrs: AVec<'a, u32> = Vec::with_capacity_in(new_cap, alloc);
+    let mut new_locs: AVec<'a, u32> = Vec::with_capacity_in(new_cap, alloc);
+
+    {
+        let view = built.func.view();
+        for i in 0..n {
+            let Some(&old_loc) = view.locs.get(i) else {
+                return false;
+            };
+            if let Some(Some(hit)) = rewrites.get(i).copied() {
+                let Some(byte) = op_byte(hit.op) else {
+                    return false;
+                };
+                let data_word = if hit.arity == 1 {
+                    let [a0_old, ..] = hit.args;
+                    let Some(a0) = remap_val(val_map.as_slice(), a0_old) else {
+                        return false;
+                    };
+                    a0
+                } else {
+                    let Ok(pos) = u32::try_from(new_extra.len()) else {
+                        return false;
+                    };
+                    for k in 0..usize::from(hit.arity) {
+                        let Some(&arg) = hit.args.get(k) else {
+                            return false;
+                        };
+                        let Some(mapped) = remap_val(val_map.as_slice(), arg) else {
+                            return false;
+                        };
+                        new_extra.push(mapped);
+                    }
+                    pos
+                };
+                new_ops.push(byte);
+                new_flags.push(Flags::NONE.0);
+                new_tys.push(hit.ty.0);
+                new_data.push(data_word);
+                new_attrs.push(0);
+                new_locs.push(old_loc);
+
+                if let Some(normal_blk) = hit.invoke_normal {
+                    let Ok(jump_pos) = u32::try_from(new_extra.len()) else {
+                        return false;
+                    };
+                    new_ops.push(jump_byte);
+                    new_flags.push(Flags::NONE.0);
+                    new_tys.push(Ty::NONE.0);
+                    new_data.push(jump_pos);
+                    new_attrs.push(0);
+                    new_locs.push(old_loc);
+                    new_extra.push(normal_blk);
+                    new_extra.push(0);
+                }
+                continue;
+            }
+
+            let Some(&old_op_byte) = view.ops.get(i) else {
+                return false;
+            };
+            let Some(old_op) = Op::from_byte(old_op_byte) else {
+                return false;
+            };
+            let Some(&old_flag) = view.flags.get(i) else {
+                return false;
+            };
+            let Some(&old_ty_raw) = view.tys.get(i) else {
+                return false;
+            };
+            let Some(&old_data) = view.data.get(i) else {
+                return false;
+            };
+            let Some(&old_attr) = view.attrs.get(i) else {
+                return false;
+            };
+
+            let new_data_word = match old_op.info().layout {
+                Layout::None => 0,
+                Layout::Data(Field::Value) => {
+                    let Some(mapped) = remap_val(val_map.as_slice(), old_data) else {
+                        return false;
+                    };
+                    mapped
+                }
+                Layout::Data(_) => old_data,
+                Layout::Extra(fields) => {
+                    let Ok(pos) = u32::try_from(new_extra.len()) else {
+                        return false;
+                    };
+                    let Ok(old_start) = usize::try_from(old_data) else {
+                        return false;
+                    };
+                    if copy_remapped_extra(
+                        view.extra,
+                        old_start,
+                        fields,
+                        Ty(old_ty_raw),
+                        view.tys,
+                        val_map.as_slice(),
+                        &mut new_extra,
+                    )
+                    .is_none()
+                    {
+                        return false;
+                    }
+                    pos
+                }
+            };
+
+            new_ops.push(old_op_byte);
+            new_flags.push(old_flag);
+            new_tys.push(old_ty_raw);
+            new_data.push(new_data_word);
+            new_attrs.push(old_attr);
+            new_locs.push(old_loc);
+        }
+    }
+
+    let mut new_block_starts: AVec<'a, u32> = Vec::with_capacity_in(built.func.block_starts.len(), alloc);
+    for &old_start in built.func.block_starts.iter() {
+        let Some(mapped) = remap_val(val_map.as_slice(), old_start) else {
+            return false;
+        };
+        new_block_starts.push(mapped);
+    }
+
+    built.func.ops.clear();
+    built.func.ops.extend_from_slice(new_ops.as_slice());
+    built.func.flags.clear();
+    built.func.flags.extend_from_slice(new_flags.as_slice());
+    built.func.tys.clear();
+    built.func.tys.extend_from_slice(new_tys.as_slice());
+    built.func.data.clear();
+    built.func.data.extend_from_slice(new_data.as_slice());
+    built.func.extra.clear();
+    built.func.extra.extend_from_slice(new_extra.as_slice());
+    built.func.attrs.clear();
+    built.func.attrs.extend_from_slice(new_attrs.as_slice());
+    built.func.locs.clear();
+    built.func.locs.extend_from_slice(new_locs.as_slice());
+    built.func.block_starts.clear();
+    built.func.block_starts.extend_from_slice(new_block_starts.as_slice());
+    true
+}
+
 /// Runs demand-driven whole-program cross-function LIR inlining and host-ISA SOTA emission over
 /// workspace seed rows and their small inlineable callees.
 #[expect(clippy::too_many_arguments, reason = "whole-program export LTO over walk, seeds, gate, maker, options, and allocator")]
@@ -409,9 +885,14 @@ where
         let Some(grant) = grant_for(tabled) else {
             return Err(ExportLtoError::NotRunnable { symbol: symbol.0, tabled });
         };
-        let built = maker
+        let mut built = maker
             .build_lir(&grant, tabled, name, alloc)
             .map_err(|error| ExportLtoError::BuildLir { symbol: symbol.0, error })?;
+        let lowered_libm = lower_ieee_libm_calls(&mut built, opts.machine, alloc);
+        if lowered_libm {
+            verify(built.func.view())
+                .map_err(|error| ExportLtoError::Verify { symbol: symbol.0, error })?;
+        }
 
         let view = built.func.view();
         if !is_seed {
@@ -481,6 +962,7 @@ where
             row,
             symbol,
             is_seed,
+            lowered_libm,
             orig_unreachables,
             built,
         });
@@ -514,7 +996,7 @@ where
     // 3. Expand reference tables transitively for every `ImportedRef` and emit host-ISA records.
     let mut out_bodies: AVec<'a, LtoBodyOut<'a>> = Vec::with_capacity_in(n, alloc);
     for (idx, (orig, opt)) in origins.iter().zip(lto.bodies.iter()).enumerate() {
-        if !orig.is_seed && opt.read.is_empty() {
+        if !orig.is_seed && !orig.lowered_libm && opt.read.is_empty() {
             continue;
         }
         let mut funcs: AVec<'a, Callee<'_>> = Vec::with_capacity_in(orig.built.funcs.len() + opt.imported_refs.len(), alloc);
@@ -694,4 +1176,253 @@ where
         module_bodies: n,
         total_inlined: lto.total_inlined_bodies,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use blaze_lir::{
+        Builder, Full,
+        builder::{Param, Variadic},
+    };
+    use blaze_tier::Os as TierOs;
+
+    fn arm64_machine() -> Machine {
+        Machine {
+            arch: Arch::Arm64,
+            os: TierOs::MacOs,
+            features: Machine::LSE | Machine::DOTPROD | Machine::SME | Machine::SME2,
+        }
+    }
+
+    fn x64_machine(features: u64) -> Machine {
+        Machine {
+            arch: Arch::X86_64,
+            os: TierOs::Linux,
+            features,
+        }
+    }
+
+    fn make_built_with_c_callees(
+        func: blaze_lir::Func<Alloc<'static>>,
+        c_names: &[&str],
+        alloc: Alloc<'static>,
+    ) -> BuiltLir<'static> {
+        let mut funcs: AVec<'static, BuiltCallee> = Vec::with_capacity_in(c_names.len(), alloc);
+        let mut c_text: AVec<'static, u8> = Vec::new_in(alloc);
+        for &name in c_names {
+            let start = u32::try_from(c_text.len()).expect("c_text fits u32");
+            let len = u32::try_from(name.len()).expect("c_name fits u32");
+            c_text.extend_from_slice(name.as_bytes());
+            funcs.push(BuiltCallee::C { start, len });
+        }
+        BuiltLir {
+            func,
+            funcs,
+            statics: Vec::new_in(alloc),
+            c_statics: Vec::new_in(alloc),
+            vtables: Vec::new_in(alloc),
+            vtable_data: Vec::new_in(alloc),
+            tls: Vec::new_in(alloc),
+            traps: Vec::new_in(alloc),
+            c_text,
+        }
+    }
+
+    fn build_c_call_fn(
+        c_name: &str,
+        param_tys: &[Ty],
+        ret_ty: Ty,
+        variadic: Variadic,
+        alloc: Alloc<'static>,
+    ) -> BuiltLir<'static> {
+        let mut b: Builder<Alloc<'static>, Full> = Builder::new_in(64, alloc);
+        let sig_params: std::vec::Vec<Param> = param_tys.iter().copied().map(Param::of).collect();
+        let ret_params = [Param::of(ret_ty)];
+        let own_sig = b.sig(Conv::C, Variadic::No, &sig_params, &ret_params);
+        let callee_sig = b.sig(Conv::C, variadic, &sig_params, &ret_params);
+        b.set_signature(own_sig);
+        let callee_ref = b.reference(RefKind::Func, 0);
+
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let args: std::vec::Vec<_> = param_tys.iter().copied().map(|ty| b.param(ty)).collect();
+        let res = b.call(Flags::NONE, callee_ref, callee_sig, &args);
+        b.ret(&[res]);
+
+        let func = b.finish_checked().expect("valid initial LIR");
+        make_built_with_c_callees(func, &[c_name], alloc)
+    }
+
+    #[test]
+    fn lowers_call_fmaf_and_underscored_fma() {
+        let alloc = blaze_own::testing::heap().alloc();
+        for (name, ty) in [("fmaf", Ty::F32), ("_fmaf", Ty::F32), ("fma", Ty::F64), ("_fma", Ty::F64)] {
+            let mut built = build_c_call_fn(name, &[ty, ty, ty], ty, Variadic::No, alloc);
+            assert!(lower_ieee_libm_calls(&mut built, arm64_machine(), alloc), "{name} should lower");
+            verify(built.func.view()).expect("lowered LIR must verify");
+
+            let view = built.func.view();
+            let call_count = (0..view.len()).filter(|&i| matches!(view.op(i), Op::Call | Op::Invoke)).count();
+            assert_eq!(call_count, 0, "{name} should have no calls left");
+
+            let fma_inst = (0..view.len()).find(|&i| view.op(i) == Op::Fma).expect("expected Op::Fma");
+            assert_eq!(Ty(view.tys[fma_inst]), ty);
+            assert_eq!(view.flags(fma_inst), Flags::NONE);
+            let mut ops = view.operands(fma_inst);
+            assert_eq!(ops.value().0, 0);
+            assert_eq!(ops.value().0, 1);
+            assert_eq!(ops.value().0, 2);
+        }
+    }
+
+    #[test]
+    fn lowers_call_unary_ieee_libm_ops_on_arm64() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let cases = [
+            ("sqrtf", Ty::F32, Op::Sqrt),
+            ("sqrt", Ty::F64, Op::Sqrt),
+            ("_sqrtf", Ty::F32, Op::Sqrt),
+            ("fabsf", Ty::F32, Op::Fabs),
+            ("fabs", Ty::F64, Op::Fabs),
+            ("floorf", Ty::F32, Op::Floor),
+            ("floor", Ty::F64, Op::Floor),
+            ("ceilf", Ty::F32, Op::Ceil),
+            ("ceil", Ty::F64, Op::Ceil),
+            ("truncf", Ty::F32, Op::Ftrunc),
+            ("trunc", Ty::F64, Op::Ftrunc),
+            ("rintf", Ty::F32, Op::Nearest),
+            ("rint", Ty::F64, Op::Nearest),
+            ("roundf", Ty::F32, Op::Fround),
+            ("round", Ty::F64, Op::Fround),
+        ];
+        for (name, ty, expected_op) in cases {
+            let mut built = build_c_call_fn(name, &[ty], ty, Variadic::No, alloc);
+            assert!(lower_ieee_libm_calls(&mut built, arm64_machine(), alloc), "{name} should lower");
+            verify(built.func.view()).expect("lowered unary libm LIR must verify");
+
+            let view = built.func.view();
+            assert_eq!(
+                (0..view.len()).filter(|&i| matches!(view.op(i), Op::Call | Op::Invoke)).count(),
+                0
+            );
+            let inst = (0..view.len()).find(|&i| view.op(i) == expected_op).expect("expected lowered unary op");
+            assert_eq!(Ty(view.tys[inst]), ty);
+            assert_eq!(view.flags(inst), Flags::NONE);
+            assert_eq!(view.operands(inst).value().0, 0);
+        }
+    }
+
+    #[test]
+    fn lowers_chained_invoke_fmaf_and_sqrtf_and_verifies() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut b: Builder<Alloc<'static>, Full> = Builder::new_in(64, alloc);
+        let own_sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::F32), Param::of(Ty::F32), Param::of(Ty::F32), Param::of(Ty::F32)],
+            &[Param::of(Ty::F32)],
+        );
+        let fma_sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::F32), Param::of(Ty::F32), Param::of(Ty::F32)],
+            &[Param::of(Ty::F32)],
+        );
+        let sqrt_sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::F32)], &[Param::of(Ty::F32)]);
+        b.set_signature(own_sig);
+
+        let fmaf_ref = b.reference(RefKind::Func, 0);
+        let sqrtf_ref = b.reference(RefKind::Func, 1);
+
+        let entry = b.create_block(BlockKind::Normal);
+        let after_fma = b.create_block(BlockKind::Normal);
+        let after_sqrt = b.create_block(BlockKind::Normal);
+        let cleanup = b.create_block(BlockKind::Cleanup);
+
+        b.begin(entry);
+        let a = b.param(Ty::F32);
+        let x = b.param(Ty::F32);
+        let c = b.param(Ty::F32);
+        let bias = b.param(Ty::F32);
+        let fma_val = b.invoke(Flags::NONE, fmaf_ref, fma_sig, &[a, x, c], after_fma, cleanup);
+
+        b.begin(after_fma);
+        let shifted = b.binary(Op::Fadd, Flags::NONE, fma_val, bias);
+        let sqrt_val = b.invoke(Flags::NONE, sqrtf_ref, sqrt_sig, &[shifted], after_sqrt, cleanup);
+
+        b.begin(after_sqrt);
+        let final_val = b.binary(Op::Fadd, Flags::NONE, sqrt_val, fma_val);
+        b.ret(&[final_val]);
+
+        b.begin(cleanup);
+        let exc = b.param(Ty::PTR);
+        b.resume(exc);
+
+        let func = b.finish_checked().expect("valid initial invoke LIR");
+        let mut built = make_built_with_c_callees(func, &["fmaf", "sqrtf"], alloc);
+
+        assert!(lower_ieee_libm_calls(&mut built, arm64_machine(), alloc));
+        verify(built.func.view()).expect("lowered invoke LIR must verify");
+
+        let view = built.func.view();
+        assert_eq!(
+            (0..view.len()).filter(|&i| matches!(view.op(i), Op::Call | Op::Invoke)).count(),
+            0,
+            "all libm invokes should be lowered"
+        );
+        let fma_inst = (0..view.len()).find(|&i| view.op(i) == Op::Fma).expect("expected Op::Fma");
+        let sqrt_inst = (0..view.len()).find(|&i| view.op(i) == Op::Sqrt).expect("expected Op::Sqrt");
+        assert_eq!(view.op(fma_inst + 1), Op::Jump);
+        assert_eq!(view.op(sqrt_inst + 1), Op::Jump);
+
+        let ret_inst = (0..view.len()).find(|&i| view.op(i) == Op::Return).expect("expected Op::Return");
+        let ret_val = view.operands(ret_inst).values().get(0);
+        assert_eq!(view.op(ret_val.index()), Op::Fadd);
+        let mut final_ops = view.operands(ret_val.index());
+        assert_eq!(final_ops.value().index(), sqrt_inst);
+        assert_eq!(final_ops.value().index(), fma_inst);
+    }
+
+    #[test]
+    fn leaves_unknown_mismatched_variadic_and_unsupported_targets_untouched() {
+        let alloc = blaze_own::testing::heap().alloc();
+
+        // Unknown C functions and ops unsupported by `sota` (`copysignf`/`copysign`) stay untouched.
+        for (name, params, ret, variadic) in [
+            ("sinf", &[Ty::F32][..], Ty::F32, Variadic::No),
+            ("printf", &[Ty::PTR][..], Ty::I32, Variadic::Yes),
+            ("copysignf", &[Ty::F32, Ty::F32][..], Ty::F32, Variadic::No),
+            ("copysign", &[Ty::F64, Ty::F64][..], Ty::F64, Variadic::No),
+            // Mismatched signatures for known names: wrong precision, wrong arity, or variadic.
+            ("fmaf", &[Ty::F64, Ty::F64, Ty::F64][..], Ty::F64, Variadic::No),
+            ("fma", &[Ty::F32, Ty::F32, Ty::F32][..], Ty::F32, Variadic::No),
+            ("fmaf", &[Ty::F32, Ty::F32][..], Ty::F32, Variadic::No),
+            ("sqrtf", &[Ty::F64][..], Ty::F64, Variadic::No),
+            ("sqrt", &[Ty::F32][..], Ty::F32, Variadic::No),
+            ("fmaf", &[Ty::F32, Ty::F32, Ty::F32][..], Ty::F32, Variadic::Yes),
+        ] {
+            let mut built = build_c_call_fn(name, params, ret, variadic, alloc);
+            assert!(
+                !lower_ieee_libm_calls(&mut built, arm64_machine(), alloc),
+                "{name} ({params:?} -> {ret:?}, {variadic:?}) must not lower"
+            );
+            verify(built.func.view()).expect("untouched LIR must verify");
+            assert_eq!(
+                (0..built.func.view().len()).filter(|&i| built.func.view().op(i) == Op::Call).count(),
+                1
+            );
+        }
+
+        // x86-64 gating: `Op::Fma` requires `Machine::FMA`; `Op::Sqrt` is unsupported on x86-64 sota.
+        let mut fma_no_feat = build_c_call_fn("fmaf", &[Ty::F32, Ty::F32, Ty::F32], Ty::F32, Variadic::No, alloc);
+        assert!(!lower_ieee_libm_calls(&mut fma_no_feat, x64_machine(0), alloc));
+
+        let mut fma_with_feat = build_c_call_fn("fmaf", &[Ty::F32, Ty::F32, Ty::F32], Ty::F32, Variadic::No, alloc);
+        assert!(lower_ieee_libm_calls(&mut fma_with_feat, x64_machine(Machine::FMA), alloc));
+        verify(fma_with_feat.func.view()).expect("x86-64 FMA lowered LIR must verify");
+
+        let mut sqrt_x64 = build_c_call_fn("sqrtf", &[Ty::F32], Ty::F32, Variadic::No, alloc);
+        assert!(!lower_ieee_libm_calls(&mut sqrt_x64, x64_machine(Machine::FMA | Machine::AVX2), alloc));
+    }
 }

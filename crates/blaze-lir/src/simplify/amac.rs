@@ -95,16 +95,17 @@ impl AmacOpts {
         }
     }
 
-    /// Apple Silicon M-series (128 KB L1d / 16 MB L2) SOTA preset: 8-way lockstep AMAC with L1
-    /// read prefetching (`max_state_regs: 28` fits 8-way binary search `8 * 3 = 24 <= 28`, and
-    /// steps down cleanly to 4-way for wider state), entering variable-trip masked AMAC once the
-    /// searched table exceeds L1d (`>= 65_536` elements / 512 KB) so L1-resident searches stay on
-    /// the tight scalar loop while L2/SLC/DRAM searches gain full 8-way MLP.
+    /// Apple Silicon M-series (128 KB L1d / 16 MB L2) SOTA preset: up to 8-way lockstep AMAC with
+    /// L1 read prefetching and `max_state_regs: 18` (leaving 8 GPRs free for shared base pointers,
+    /// bounds, `p`, `end`, `acc`, and active mask so total live GPRs stay <= 26 on AArch64 with
+    /// zero stack spills: `K = 8` for 2-reg pointer chasing, `K = 6` for 3-reg `bsearch_batch`,
+    /// `K = 4` for 4-reg state), entering variable-trip masked AMAC once the searched table exceeds
+    /// L1d (`>= 65_536` elements / 512 KB).
     pub const fn apple_silicon() -> Self {
         Self {
             group_width: 8,
             emit_prefetch: true,
-            max_state_regs: 28,
+            max_state_regs: 18,
             min_var_trip_bound: 65_536,
         }
     }
@@ -951,6 +952,55 @@ fn match_ptr_step(view: &View<'_>, val: u32, base: u32) -> Option<u64> {
     (1..=MAX_PTR_STRIDE).contains(&stride).then_some(stride)
 }
 
+/// Recognizes `bound = PtrAdd[INBOUNDS](iv_init, byte_len)` (the standard Rust `slice::Iter`
+/// end-pointer form) with an `i64` byte offset, returning `Some(byte_len)`.
+fn inbounds_ptr_byte_offset(view: &View<'_>, iv_init: u32, bound: u32) -> Option<u32> {
+    let bi = to_idx(bound);
+    if bi >= view.len()
+        || view.op(bi) != Op::PtrAdd
+        || !Flags(at_u8(view.flags, bi)).contains(Flags::INBOUNDS)
+    {
+        return None;
+    }
+    let pat = to_idx(at_u32(view.data, bi));
+    let base = at_u32(view.extra, pat);
+    let off = at_u32(view.extra, pat + 1);
+    if base == iv_init && Ty(at_u16(view.tys, to_idx(off))) == Ty::I64 {
+        Some(off)
+    } else {
+        None
+    }
+}
+
+/// Picks the largest group width `K` in `2..=min(group_width, MAX_GROUP_WIDTH)` whose inner-loop
+/// register footprint (`n_uniform_params + K * per_lane_regs`) fits inside `max_state_regs`,
+/// stepping down through even widths (`8 -> 6 -> 4 -> 2`) so contiguous loads pair into `ldp`.
+#[inline]
+fn select_group_width(
+    group_width: usize,
+    n_uniform_params: usize,
+    per_lane_regs: usize,
+    max_state_regs: usize,
+) -> usize {
+    let max_k = group_width.min(MAX_GROUP_WIDTH);
+    if max_k < 2 || per_lane_regs == 0 || n_uniform_params >= max_state_regs {
+        return 0;
+    }
+    let mut cand = max_k;
+    while cand >= 2 {
+        if n_uniform_params.saturating_add(cand.saturating_mul(per_lane_regs)) <= max_state_regs {
+            return cand;
+        }
+        cand = match cand {
+            8 => 6,
+            6 => 4,
+            4 => 2,
+            _ => cand - 1,
+        };
+    }
+    0
+}
+
 // ---------------------------------------------------------------------------
 // AMAC nest plan types & detection (`detect_amac_nest`)
 // ---------------------------------------------------------------------------
@@ -1100,6 +1150,7 @@ struct AmacPlan<A: Allocator> {
     outer_shape: OuterShape<A>,
     outer_latch: u32,
     iv_pos: usize,
+    iv_init: u32,
     iv_inst: u32,
     iv_next_inst: u32,
     iv_kind: OuterIvKind,
@@ -1195,7 +1246,7 @@ fn detect_amac_nest<A: Allocator + Copy>(
         if oh_params.is_empty() || oh_params.len() > MAX_OUTER_REDUCTIONS + 1 {
             continue;
         }
-        let pre_edge = match view.op(pre_term) {
+        let (pre_edge, pre_args_at) = match view.op(pre_term) {
             Op::Jump => {
                 let jat = to_idx(at_u32(view.data, pre_term));
                 if at_u32(view.extra, jat) != outer_hdr
@@ -1203,7 +1254,7 @@ fn detect_amac_nest<A: Allocator + Copy>(
                 {
                     continue;
                 }
-                PreheaderEdge::Jump
+                (PreheaderEdge::Jump, jat + 2)
             }
             Op::Br => {
                 let bat = to_idx(at_u32(view.data, pre_term));
@@ -1213,9 +1264,9 @@ fn detect_amac_nest<A: Allocator + Copy>(
                 let e_blk = at_u32(view.extra, e_at);
                 let e_argc = to_idx(at_u32(view.extra, e_at + 1));
                 if t_blk == outer_hdr && e_blk != outer_hdr && t_argc == oh_params.len() {
-                    PreheaderEdge::BrThen
+                    (PreheaderEdge::BrThen, bat + 3)
                 } else if e_blk == outer_hdr && t_blk != outer_hdr && e_argc == oh_params.len() {
-                    PreheaderEdge::BrElse
+                    (PreheaderEdge::BrElse, e_at + 2)
                 } else {
                     continue;
                 }
@@ -1382,6 +1433,7 @@ fn detect_amac_nest<A: Allocator + Copy>(
         let Some((iv_pos, iv_inst, iv_next_inst, iv_kind, bound)) = found_iv else {
             continue;
         };
+        let iv_init = at_u32(view.extra, pre_args_at + iv_pos);
 
         // Helper: whether a value is strictly outer-loop-invariant and already emitted before `outer_hdr`.
         let is_pre_outer_inv = |v: u32| -> bool {
@@ -2346,16 +2398,7 @@ fn detect_amac_nest<A: Allocator + Copy>(
         }
 
         // Pick largest group width `K <= min(opts.group_width, MAX_GROUP_WIDTH)` fitting `max_state_regs`.
-        let max_k = opts.group_width.min(MAX_GROUP_WIDTH);
-        let mut chosen_k = 0usize;
-        let mut cand = max_k;
-        while cand >= 2 {
-            if n_uniform_params + cand * per_lane_regs <= opts.max_state_regs {
-                chosen_k = cand;
-                break;
-            }
-            cand /= 2;
-        }
+        let chosen_k = select_group_width(opts.group_width, n_uniform_params, per_lane_regs, opts.max_state_regs);
         if chosen_k < 2 {
             continue;
         }
@@ -2425,6 +2468,7 @@ fn detect_amac_nest<A: Allocator + Copy>(
             outer_shape,
             outer_latch,
             iv_pos,
+            iv_init,
             iv_inst,
             iv_next_inst,
             iv_kind,
@@ -3079,21 +3123,36 @@ fn rewrite_amac_nest<A: Allocator + Copy>(
             push_bin(&mut func, Op::And, Flags::NONE, Ty::I1, is_lt, ge_k)
         }
         OuterIvKind::Pointer { stride } => {
-            // Check `q0 + k_width * stride <= bound_new` without `Op::PtrAddr` and without ever
-            // comparing an out-of-bounds pointer: step at most `k_width` times while `p < bound_new`.
             let k_bytes = u64::from(to_u32(k_width)).saturating_mul(stride);
             let neg_k_bytes = push_iconst(&mut func, Ty::I64, (0u64).wrapping_sub(k_bytes));
             ptr_end_minus_k = push_bin(&mut func, Op::PtrAdd, Flags::NONE, Ty::PTR, bound_new, neg_k_bytes);
-            let step_c = push_iconst(&mut func, Ty::I64, stride);
-            let mut p = q0;
-            let mut ok = push_iconst(&mut func, Ty::I1, 1);
-            for _ in 0..k_width {
-                let lt = push_icmp(&mut func, IntCond::Ult, p, bound_new);
-                ok = push_bin(&mut func, Op::And, Flags::NONE, Ty::I1, ok, lt);
-                let p_step = push_bin(&mut func, Op::PtrAdd, Flags::NONE, Ty::PTR, p, step_c);
-                p = push_select(&mut func, Ty::PTR, ok, p_step, p);
+            if let Some(byte_len_new) = inbounds_ptr_byte_offset(view, plan.iv_init, plan.bound)
+                .map(|bl| at_u32(&val_map, to_idx(bl)))
+                .filter(|&v| v != NONE)
+            {
+                // Fast 2-check path for `bound = PtrAdd[INBOUNDS](iv_init, byte_len)` (all Rust
+                // `slice::Iter` loops): `INBOUNDS` guarantees `q0` and `bound_new` share one
+                // allocation without address wrap, so `q0 < bound_new && byte_len >= k_bytes` is
+                // exact, provenance-safe, and `eval`-safe with zero `Op::PtrAddr` or selects.
+                let is_lt = push_icmp(&mut func, IntCond::Ult, q0, bound_new);
+                let k_bytes_c = push_iconst(&mut func, Ty::I64, k_bytes);
+                let ge_k = push_icmp(&mut func, IntCond::Uge, byte_len_new, k_bytes_c);
+                push_bin(&mut func, Op::And, Flags::NONE, Ty::I1, is_lt, ge_k)
+            } else {
+                // Opaque-pointer fallback: check `q0 + k_width * stride <= bound_new` without
+                // `Op::PtrAddr` and without ever comparing an out-of-bounds pointer by stepping
+                // at most `k_width` times while `p < bound_new`.
+                let step_c = push_iconst(&mut func, Ty::I64, stride);
+                let mut p = q0;
+                let mut ok = push_iconst(&mut func, Ty::I1, 1);
+                for _ in 0..k_width {
+                    let lt = push_icmp(&mut func, IntCond::Ult, p, bound_new);
+                    ok = push_bin(&mut func, Op::And, Flags::NONE, Ty::I1, ok, lt);
+                    let p_step = push_bin(&mut func, Op::PtrAdd, Flags::NONE, Ty::PTR, p, step_c);
+                    p = push_select(&mut func, Ty::PTR, ok, p_step, p);
+                }
+                ok
             }
-            ok
         }
     };
     // Hoist all pure outer-loop-invariant `outer_body` instructions once into `b_amac_entry` so
@@ -4756,12 +4815,46 @@ mod tests {
     }
 
     #[test]
+    fn select_group_width_respects_apple_silicon_register_budget() {
+        let m = AmacOpts::apple_silicon();
+        assert_eq!(m.group_width, 8);
+        assert_eq!(m.max_state_regs, 18);
+        // 2-reg pointer chase -> K = 8 (16 <= 18)
+        assert_eq!(select_group_width(m.group_width, 0, 2, m.max_state_regs), 8);
+        // 3-reg bsearch_batch (`lo, hi, q`) -> K = 6 (18 <= 18, zero GPR spills)
+        assert_eq!(select_group_width(m.group_width, 0, 3, m.max_state_regs), 6);
+        // 4-reg state -> K = 4 (16 <= 18)
+        assert_eq!(select_group_width(m.group_width, 0, 4, m.max_state_regs), 4);
+        // 5-reg state -> K = 2 (10 <= 18)
+        assert_eq!(select_group_width(m.group_width, 0, 5, m.max_state_regs), 2);
+        // 10-reg state -> exceeds budget even at K = 2
+        assert_eq!(select_group_width(m.group_width, 0, 10, m.max_state_regs), 0);
+        // Uniform param + 2-reg lane state -> K = 8 (1 + 16 = 17 <= 18)
+        assert_eq!(select_group_width(m.group_width, 1, 2, m.max_state_regs), 8);
+
+        let w = AmacOpts::wide_8();
+        assert_eq!(select_group_width(w.group_width, 0, 3, w.max_state_regs), 8);
+        assert_eq!(select_group_width(w.group_width, 0, 4, w.max_state_regs), 6);
+
+        let a = AmacOpts::arm64();
+        assert_eq!(select_group_width(a.group_width, 0, 3, a.max_state_regs), 4);
+    }
+
+    #[test]
     fn amac_8way_guarded_rotated_bsearch_batch_matches_eval() {
         let alloc = blaze_own::testing::heap().alloc();
-        // Verify Apple Silicon preset enables 8-way AMAC and passes `table_len = 1_048_576`.
+        // Verify Apple Silicon preset targets up to 8-way with a 18-reg spill-free budget
+        // (`K = 6` on 3-reg `bsearch_batch`) and passes `table_len = 1_048_576`.
         let m_opts = AmacOpts::apple_silicon();
         assert_eq!(m_opts.group_width, 8);
+        assert_eq!(m_opts.max_state_regs, 18);
         assert!(m_opts.min_var_trip_bound <= 1_048_576);
+
+        let configs = [
+            (AmacOpts::wide_8(), 8u32),
+            (AmacOpts::apple_silicon(), 6u32),
+            (AmacOpts { min_var_trip_bound: 0, ..AmacOpts::apple_silicon() }, 6u32),
+        ];
 
         for enter_is_then in [true, false] {
             for &table_len in &[0usize, 1, 16, 64] {
@@ -4769,14 +4862,25 @@ mod tests {
                 let (table, queries) = make_table_and_queries(table_len, q_max);
                 let orig = build_guarded_rotated_bsearch_batch(&table, &queries, enter_is_then, alloc);
 
-                for opts in [AmacOpts::wide_8(), AmacOpts::apple_silicon()] {
+                for (opts, expected_k) in configs {
                     let out = interleave_amac_loops(orig.view(), opts, alloc).unwrap();
                     let v = out.func.view();
-                    verify(v).expect("8-way guarded rotated AMAC output must verify");
+                    verify(v).expect("guarded rotated AMAC output must verify");
                     assert_eq!(out.stats.nests_interleaved, 1);
-                    assert_eq!(out.stats.group_width_used, 8);
-                    assert_eq!(out.stats.prefetches_inserted, 8);
-                    assert_eq!(count_prefetches(v), 8);
+                    assert_eq!(out.stats.group_width_used, expected_k);
+                    assert_eq!(out.stats.prefetches_inserted, expected_k);
+                    assert_eq!(count_prefetches(v), expected_k as usize);
+
+                    // `bound = PtrAdd[INBOUNDS](q_ptr, Shl(q_len, 3))` MUST take the fast 2-check
+                    // path in `b_amac_entry` (block 1) with `<= 1` `Op::Select` (zero pointer-step chain!).
+                    let entry_selects = v
+                        .block(Block(1))
+                        .filter(|&inst| v.op(inst) == Op::Select)
+                        .count();
+                    assert!(
+                        entry_selects <= 1,
+                        "expected <= 1 Op::Select in b_amac_entry for INBOUNDS slice::Iter bound, got {entry_selects}"
+                    );
 
                     // Guard was hoisted into `b_amac_entry`, so `b_amac_outer_body` (block 2) MUST
                     // jump unconditionally into `b_amac_inner_hdr` (block 3) with ZERO skip branch!
@@ -4786,7 +4890,7 @@ mod tests {
                         "b_amac_outer_body must enter b_amac_inner_hdr unconditionally"
                     );
 
-                    // All 8 software prefetches in `b_amac_inner_hdr` (block 3) MUST precede all 8 loads.
+                    // All `expected_k` software prefetches in `b_amac_inner_hdr` (block 3) MUST precede all loads.
                     let mut pf_count = 0usize;
                     let mut ld_count = 0usize;
                     let mut last_pf = 0usize;
@@ -4803,22 +4907,22 @@ mod tests {
                             first_ld = first_ld.min(inst);
                         }
                     }
-                    assert_eq!(pf_count, 8, "expected 8 prefetches in b_amac_inner_hdr");
-                    assert_eq!(ld_count, 8, "expected 8 loads in b_amac_inner_hdr");
-                    assert!(last_pf < first_ld, "all 8 prefetches must be emitted before all 8 loads");
+                    assert_eq!(pf_count, expected_k as usize, "expected {expected_k} prefetches in b_amac_inner_hdr");
+                    assert_eq!(ld_count, expected_k as usize, "expected {expected_k} loads in b_amac_inner_hdr");
+                    assert!(last_pf < first_ld, "all {expected_k} prefetches must be emitted before all loads");
 
                     // Idempotence: second pass must be a no-op.
                     let again = interleave_amac_loops(v, opts, alloc).unwrap();
                     assert_eq!(again.stats.nests_interleaved, 0);
 
                     let eval_fn = strip_prefetch_intrinsics(v);
-                    for &q_len in &[0usize, 1, 7, 8, 15, 25] {
+                    for &q_len in &[0usize, 1, 5, 6, 7, 8, 11, 12, 13, 15, 19, 25] {
                         let args = [Val::Int(table_len as u128), Val::Int(q_len as u128)];
                         let expected = eval_u64(orig.view(), &args);
                         let got = eval_u64(eval_fn.view(), &args);
                         assert_eq!(
                             expected, got,
-                            "8-way guarded rotated bsearch_batch mismatch at enter_is_then={enter_is_then}, table_len={table_len}, q_len={q_len}, opts={opts:?}"
+                            "guarded rotated bsearch_batch mismatch at K={expected_k}, enter_is_then={enter_is_then}, table_len={table_len}, q_len={q_len}, opts={opts:?}"
                         );
                     }
                 }

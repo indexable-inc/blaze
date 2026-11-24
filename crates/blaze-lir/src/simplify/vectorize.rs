@@ -101,6 +101,11 @@ enum ReductionInput {
     /// Conditional-count reduction `acc_next = acc + (icmp(cond, a, b) ? 1 : 0)`.
     /// Vectorized as `vacc_u = Sub(vacc_u, Select(vec_icmp(cond, a, b), splat(-1), splat(0)))`.
     CountCond { cond: IntCond, a: u32, b: u32 },
+    /// Bit-population-count sum reduction `acc_next = acc + popcnt(src)` over contiguous integer
+    /// loads (`I8`/`I16`/`I32`/`I64`). Vectorized as 4x-unrolled `<16 x i8>` chunked `Op::Popcnt`
+    /// (up to 30 iterations = 1,920 bytes per chunk -> max `240 <= 255` per `u8` lane) with
+    /// `<8 x i16>` byte-pair widening and `Op::ReduceAdd(Ty::I16)`.
+    Popcnt { src: u32 },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -641,6 +646,124 @@ fn match_count_cond_update(
     }
     let eff_cond = if invert { invert_int_cond(raw_ic) } else { raw_ic };
     Some((eff_cond, a, b, extra_acc_use))
+}
+
+/// Matches a popcount-sum reduction update on `acc` (`p_inst`) of type `I32` or `I64` over
+/// contiguous integer elements of type `elem_ty` (`I8`, `I16`, `I32`, `I64`):
+/// - `acc + Popcnt(v)`
+/// - `acc + Zext(Popcnt(v))` (e.g. `u8`/`u16`/`u32` `count_ones() as u64`)
+/// - `acc + Zext(Trunc(Popcnt(v) -> I32) -> I64)` (Rust `u64::count_ones() as u64`)
+/// - `acc + And(Popcnt(v), mask)` where `mask` preserves all bits of `0..=elem_bits` (e.g. `0xffff_ffff`)
+/// - `acc + Trunc(Popcnt(v) -> I32)` (when `acc` is `I32` and `elem_ty` is `I64`)
+/// - Optional `Zext` of `elem_ty` immediately inside `Popcnt(Zext(v))` (zero-extension adds 0 set bits).
+/// Returns `Some(v)` where `v` has type `elem_ty` (verified later to be a unit-stride `Op::Load`).
+fn match_popcnt_update(
+    view: &View<'_>,
+    body_block: u32,
+    inst_block: &[u32],
+    p_inst: u32,
+    back_v: u32,
+    elem_ty: Ty,
+) -> Option<u32> {
+    if elem_ty.is_float() || !elem_ty.is_int() {
+        return None;
+    }
+    let elem_bits = elem_ty.bits(64);
+    if !matches!(elem_bits, 8 | 16 | 32 | 64) {
+        return None;
+    }
+    let bi = to_idx(back_v);
+    if view.op(bi) != Op::Add {
+        return None;
+    }
+    let bat = to_idx(at(view.data, bi));
+    let (l, r) = (at(view.extra, bat), at(view.extra, bat + 1));
+    let mut cur = if l == p_inst && r != p_inst {
+        r
+    } else if r == p_inst && l != p_inst {
+        l
+    } else {
+        return None;
+    };
+
+    let need_mask = (u64::from(elem_bits) << 1) - 1;
+    let mut eff_mask = u64::MAX;
+    let mut min_width = Ty(at(view.tys, to_idx(cur))).bits(64);
+
+    for _ in 0..5 {
+        let ci = to_idx(cur);
+        if ci >= view.len() || at(inst_block, ci) != body_block {
+            return None;
+        }
+        match view.op(ci) {
+            Op::Popcnt => {
+                // Max popcount of an `elem_bits <= 64` integer is 64 (< 128), so any width >= 8
+                // preserves all bits with sign bit 0 (making Trunc/Zext/Sext exact no-ops).
+                if min_width < 8 || (eff_mask & need_mask) != need_mask {
+                    return None;
+                }
+                let mut src = at(view.data, ci);
+                for _ in 0..2 {
+                    let si = to_idx(src);
+                    if si >= view.len() {
+                        return None;
+                    }
+                    if Ty(at(view.tys, si)) == elem_ty {
+                        break;
+                    }
+                    if at(inst_block, si) == body_block && view.op(si) == Op::Zext {
+                        src = at(view.data, si);
+                    } else {
+                        return None;
+                    }
+                }
+                let fsi = to_idx(src);
+                if fsi < view.len()
+                    && at(inst_block, fsi) == body_block
+                    && Ty(at(view.tys, fsi)) == elem_ty
+                {
+                    return Some(src);
+                }
+                return None;
+            }
+            Op::Zext | Op::Sext => {
+                let inner = at(view.data, ci);
+                let ii = to_idx(inner);
+                if ii >= view.len() {
+                    return None;
+                }
+                let in_bits = Ty(at(view.tys, ii)).bits(64);
+                if in_bits < 8 {
+                    return None;
+                }
+                min_width = min_width.min(in_bits);
+                cur = inner;
+            }
+            Op::Trunc => {
+                let cur_bits = Ty(at(view.tys, ci)).bits(64);
+                if cur_bits < 8 {
+                    return None;
+                }
+                min_width = min_width.min(cur_bits);
+                cur = at(view.data, ci);
+            }
+            Op::And => {
+                let aat = to_idx(at(view.data, ci));
+                let (al, ar) = (at(view.extra, aat), at(view.extra, aat + 1));
+                if let Some(m) = const_u64(view, to_idx(ar)) {
+                    eff_mask &= m;
+                    cur = al;
+                } else if let Some(m) = const_u64(view, to_idx(al)) {
+                    eff_mask &= m;
+                    cur = ar;
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// Checks whether `ptr_val` is a unit-stride address for a pointer-IV loop (`p + const_off` or
@@ -1328,6 +1451,43 @@ fn find_vectorizable_loop<A: Allocator + Copy>(
                 continue;
             }
 
+            // Check contiguous byte-level `Op::Popcnt` sum reduction (`elem_ty ∈ {I8, I16, I32, I64}`,
+            // `acc_ty ∈ {I32, I64}`, 16-byte SIMD `<16 x i8>` chunked path).
+            if vec_bytes == 16
+                && matches!(p_ty, Ty::I32 | Ty::I64)
+                && let Some(pop_src) = match_popcnt_update(view, body_block, &inst_block, p_inst, back_v, elem_ty)
+            {
+                let mut other_use = false;
+                for inst in body_start..=body_end {
+                    if inst == bi {
+                        continue;
+                    }
+                    each(view, inst, |item| {
+                        if let Item::Value(v) = item
+                            && v == p_inst
+                        {
+                            other_use = true;
+                        }
+                    });
+                }
+                if other_use {
+                    bad_params = true;
+                    break;
+                }
+                set_at(&mut is_reduction_update, bi, true);
+                reductions.push(ReductionSpec {
+                    param_pos: pos,
+                    param_inst: p_inst,
+                    acc_ty: p_ty,
+                    init_val: at(&pre_args, pos),
+                    op: Op::Add,
+                    flags: Flags::NONE,
+                    update_inst: back_v,
+                    input: ReductionInput::Popcnt { src: pop_src },
+                });
+                continue;
+            }
+
             if p_ty != elem_ty {
                 bad_params = true;
                 break;
@@ -1482,8 +1642,15 @@ fn find_vectorizable_loop<A: Allocator + Copy>(
 
         // Walk backward from reduction inputs (or `store.store_val`) to collect `vec_exprs`
         // and verify every intermediate op is a supported vector ALU op of `elem_ty`!
+        let has_popcnt = reductions
+            .iter()
+            .any(|r| matches!(r.input, ReductionInput::Popcnt { .. }));
+        if has_popcnt && reductions.iter().any(|r| !matches!(r.input, ReductionInput::Popcnt { .. })) {
+            continue;
+        }
         let mut needed = filled(len, false, &alloc);
         let mut stack: Vec<u32, A> = Vec::new_in(alloc);
+        let mut expr_bad = false;
         for red in &reductions {
             match red.input {
                 ReductionInput::Elem(ev) => stack.push(ev),
@@ -1491,13 +1658,22 @@ fn find_vectorizable_loop<A: Allocator + Copy>(
                     stack.push(a);
                     stack.push(b);
                 }
+                ReductionInput::Popcnt { src } => {
+                    if !at(&is_mem_inst, to_idx(src)) {
+                        expr_bad = true;
+                        break;
+                    }
+                    stack.push(src);
+                }
             }
+        }
+        if expr_bad {
+            continue;
         }
         if let Some(st) = store {
             stack.push(st.store_val);
         }
         let mut inv_scalars: Vec<u32, A> = Vec::new_in(alloc);
-        let mut expr_bad = false;
         while let Some(v) = stack.pop() {
             let vi = to_idx(v);
             if at(&needed, vi) {
@@ -1970,9 +2146,32 @@ pub fn auto_vectorize_loops_with_width<A: Allocator + Copy>(
         .reductions
         .iter()
         .any(|r| matches!(r.input, ReductionInput::CountCond { .. }));
-    let needs_chunk = plan.reductions.iter().any(|r| r.acc_ty != plan.elem_ty);
+    let has_popcnt = plan
+        .reductions
+        .iter()
+        .any(|r| matches!(r.input, ReductionInput::Popcnt { .. }));
+    let (loop_vec_ty, popcnt_wide_ty) = if has_popcnt {
+        let (Some(v16i8), Some(v8i16)) = (
+            Ty::vector(crate::ty::Scalar::I8, 16),
+            Ty::vector(crate::ty::Scalar::I16, 8),
+        ) else {
+            return Ok(VectorizeOutput {
+                func: view.to_func_in(alloc),
+                stats: VectorizeStats::default(),
+            });
+        };
+        (v16i8, v8i16)
+    } else {
+        (plan.vec_ty, Ty::NONE)
+    };
+    let needs_chunk = has_popcnt || plan.reductions.iter().any(|r| r.acc_ty != plan.elem_ty);
     let is_single = matches!(plan.shape, LoopShape::SingleBlock { .. });
-    let chunk_elems: u64 = if plan.elem_ty == Ty::I32 {
+    // For `<16 x i8>` byte-popcnt, cap each chunk at 30 inner iterations (`30 * 64 = 1,920` bytes
+    // at 4x unroll) so every `u8` lane stays `<= 30 * 8 = 240 <= 255` (ZERO `u8` overflow), and
+    // widening byte pairs into `<8 x i16>` sums to `<= 8 * 4 * 2 * 240 = 15,360 <= 65,535`!
+    let chunk_elems: u64 = if has_popcnt {
+        30u64.saturating_mul(unroll_step)
+    } else if plan.elem_ty == Ty::I32 {
         1u64 << 28
     } else if plan.elem_ty == Ty::I16 {
         1u64 << 15
@@ -2368,6 +2567,12 @@ pub fn auto_vectorize_loops_with_width<A: Allocator + Copy>(
 
             let mut red_id_splats: Vec<u32, A> = Vec::with_capacity_in(plan.reductions.len(), alloc);
             for red in &plan.reductions {
+                if matches!(red.input, ReductionInput::Popcnt { .. }) {
+                    let z8 = push_iconst(&mut func, Ty::I8, 0);
+                    let sp = push_inst(&mut func, Op::Splat, Flags::NONE, loop_vec_ty, z8, 0);
+                    red_id_splats.push(sp);
+                    continue;
+                }
                 let id_scalar = if is_minmax_op(red.op) {
                     at(&val_map, to_idx(red.init_val))
                 } else if plan.elem_ty.is_float() {
@@ -2380,6 +2585,16 @@ pub fn auto_vectorize_loops_with_width<A: Allocator + Copy>(
                 let sp = push_inst(&mut func, Op::Splat, Flags::NONE, plan.vec_ty, id_scalar, 0);
                 red_id_splats.push(sp);
             }
+            let (v_pop_mask_ff, v_pop_sh_8) = if has_popcnt {
+                let k_ff = push_iconst(&mut func, Ty::I16, 0x00ff);
+                let k_8 = push_iconst(&mut func, Ty::I16, 8);
+                (
+                    push_inst(&mut func, Op::Splat, Flags::NONE, popcnt_wide_ty, k_ff, 0),
+                    push_inst(&mut func, Op::Splat, Flags::NONE, popcnt_wide_ty, k_8, 0),
+                )
+            } else {
+                (NONE, NONE)
+            };
             let (v_neg1_mask, v_zero_mask) = if has_count_cond {
                 let c_neg1 = push_iconst(&mut func, plan.elem_ty, u64::MAX);
                 let c_zero = push_iconst(&mut func, plan.elem_ty, 0);
@@ -2488,7 +2703,7 @@ pub fn auto_vectorize_loops_with_width<A: Allocator + Copy>(
             for _ in 0..plan.reductions.len() {
                 let mut row = [NONE; 4];
                 for u in 0..unroll {
-                    set_at(&mut row, u, push_inst(&mut func, Op::Param, Flags::NONE, plan.vec_ty, 0, 0));
+                    set_at(&mut row, u, push_inst(&mut func, Op::Param, Flags::NONE, loop_vec_ty, 0, 0));
                 }
                 vacc_params.push(row);
             }
@@ -2519,7 +2734,7 @@ pub fn auto_vectorize_loops_with_width<A: Allocator + Copy>(
                     func.extra.push(vptr);
                     let u_i32 = i32::try_from(u).unwrap_or(0);
                     func.extra.push(ld.const_off.wrapping_add(u_i32.wrapping_mul(vec_bytes_i32)).cast_unsigned());
-                    let q = push_inst(&mut func, Op::Load, Flags::NONE, plan.vec_ty, idx, ld.mem_attr);
+                    let q = push_inst(&mut func, Op::Load, Flags::NONE, loop_vec_ty, idx, ld.mem_attr);
                     set_at(vm, to_idx(ld.inst), q);
                 }
                 let is_last_load_of_stream =
@@ -2667,6 +2882,11 @@ pub fn auto_vectorize_loops_with_width<A: Allocator + Copy>(
                             let mvec = push_inst(&mut func, Op::Select, Flags::NONE, plan.vec_ty, sdst, 0);
                             push_bin(&mut func, Op::Sub, Flags::NONE, plan.vec_ty, acc_u, mvec)
                         }
+                        ReductionInput::Popcnt { src } => {
+                            let v_bytes = at(vm, to_idx(src));
+                            let v_cnt = push_inst(&mut func, Op::Popcnt, Flags::NONE, loop_vec_ty, v_bytes, 0);
+                            push_bin(&mut func, Op::Add, Flags::NONE, loop_vec_ty, acc_u, v_cnt)
+                        }
                     };
                     vec_back_args.push(n_acc);
                     vec_red_args.push(n_acc);
@@ -2688,23 +2908,54 @@ pub fn auto_vectorize_loops_with_width<A: Allocator + Copy>(
                     done_ptr_params.push(push_inst(&mut func, Op::Param, Flags::NONE, Ty::PTR, 0, 0));
                 }
             }
+            let mut done_acc_params: Vec<[u32; 4], A> = Vec::with_capacity_in(plan.reductions.len(), alloc);
+            for _ in 0..plan.reductions.len() {
+                let mut row = [NONE; 4];
+                for u in 0..unroll {
+                    set_at(&mut row, u, push_inst(&mut func, Op::Param, Flags::NONE, loop_vec_ty, 0, 0));
+                }
+                done_acc_params.push(row);
+            }
             let mut red_scalar_vals: Vec<u32, A> = Vec::with_capacity_in(plan.reductions.len(), alloc);
             for (ridx, red) in plan.reductions.iter().enumerate() {
-                let d0 = push_inst(&mut func, Op::Param, Flags::NONE, plan.vec_ty, 0, 0);
-                let d1 = push_inst(&mut func, Op::Param, Flags::NONE, plan.vec_ty, 0, 0);
+                let [d0, d1, d2, d3] = done_acc_params.get(ridx).copied().unwrap_or([NONE; 4]);
+                let init_new = if needs_chunk {
+                    at(&chunk_acc_params, ridx)
+                } else {
+                    at(&val_map, to_idx(red.init_val))
+                };
+                if matches!(red.input, ReductionInput::Popcnt { .. }) {
+                    // Widen `<16 x i8>` byte accumulators pairwise into `<8 x i16>` (ZERO `u16` overflow:
+                    // max per `u16` lane = `4 * 2 * 240 = 1,920`, sum of 8 lanes = `15,360 <= 65,535`).
+                    let widen_pair = |func: &mut Func<A>, vb: u32| -> u32 {
+                        let vh = push_inst(func, Op::Bitcast, Flags::NONE, popcnt_wide_ty, vb, 0);
+                        let lo = push_bin(func, Op::And, Flags::NONE, popcnt_wide_ty, vh, v_pop_mask_ff);
+                        let hi = push_bin(func, Op::Lshr, Flags::NONE, popcnt_wide_ty, vh, v_pop_sh_8);
+                        push_bin(func, Op::Add, Flags::NONE, popcnt_wide_ty, lo, hi)
+                    };
+                    let w0 = widen_pair(&mut func, d0);
+                    let w1 = widen_pair(&mut func, d1);
+                    let w_all = if unroll == 4 {
+                        let w2 = widen_pair(&mut func, d2);
+                        let w3 = widen_pair(&mut func, d3);
+                        let w01 = push_bin(&mut func, Op::Add, Flags::NONE, popcnt_wide_ty, w0, w1);
+                        let w23 = push_bin(&mut func, Op::Add, Flags::NONE, popcnt_wide_ty, w2, w3);
+                        push_bin(&mut func, Op::Add, Flags::NONE, popcnt_wide_ty, w01, w23)
+                    } else {
+                        push_bin(&mut func, Op::Add, Flags::NONE, popcnt_wide_ty, w0, w1)
+                    };
+                    let chunk_sum_16 = push_inst(&mut func, Op::ReduceAdd, Flags::NONE, Ty::I16, w_all, 0);
+                    let chunk_sum = push_inst(&mut func, Op::Zext, Flags::NONE, red.acc_ty, chunk_sum_16, 0);
+                    let final_s = push_bin(&mut func, Op::Add, Flags::NONE, red.acc_ty, init_new, chunk_sum);
+                    red_scalar_vals.push(final_s);
+                    continue;
+                }
                 let comb = if unroll == 4 {
-                    let d2 = push_inst(&mut func, Op::Param, Flags::NONE, plan.vec_ty, 0, 0);
-                    let d3 = push_inst(&mut func, Op::Param, Flags::NONE, plan.vec_ty, 0, 0);
                     let c01 = push_bin(&mut func, red.op, red.flags, plan.vec_ty, d0, d1);
                     let c23 = push_bin(&mut func, red.op, red.flags, plan.vec_ty, d2, d3);
                     push_bin(&mut func, red.op, red.flags, plan.vec_ty, c01, c23)
                 } else {
                     push_bin(&mut func, red.op, red.flags, plan.vec_ty, d0, d1)
-                };
-                let init_new = if needs_chunk {
-                    at(&chunk_acc_params, ridx)
-                } else {
-                    at(&val_map, to_idx(red.init_val))
                 };
                 let final_s = if red.op == Op::Fadd {
                     push_bin(&mut func, Op::ReduceFadd, red.flags, plan.elem_ty, init_new, comb)
@@ -3606,7 +3857,9 @@ pub fn vectorize_iv_div_loops<A: Allocator + Copy>(
                         // Canonical `uadalp.2d` pattern: zero-extend & pairwise add `<4 x i32>` into `<2 x i64>`!
                         let elem_val = match red.input {
                             ReductionInput::Elem(ev) => ev,
-                            ReductionInput::Fma { .. } | ReductionInput::CountCond { .. } => NONE,
+                            ReductionInput::Fma { .. }
+                            | ReductionInput::CountCond { .. }
+                            | ReductionInput::Popcnt { .. } => NONE,
                         };
                         let e_vec = at(&vmap, to_idx(elem_val));
                         let bc = push_inst(&mut func, Op::Bitcast, Flags::NONE, vec_ty, e_vec, 0);
@@ -3795,7 +4048,9 @@ pub fn vectorize_iv_div_loops<A: Allocator + Copy>(
                     for (ridx, red) in plan.reductions.iter().enumerate() {
                         let elem_val = match red.input {
                             ReductionInput::Elem(ev) => ev,
-                            ReductionInput::Fma { .. } | ReductionInput::CountCond { .. } => NONE,
+                            ReductionInput::Fma { .. }
+                            | ReductionInput::CountCond { .. }
+                            | ReductionInput::Popcnt { .. } => NONE,
                         };
                         let acc_u = vacc_params.get(ridx).and_then(|row| row.get(u)).copied().unwrap_or(NONE);
                         let nv = push_bin(
@@ -5409,6 +5664,387 @@ mod tests {
                     init_f.to_bits()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn slice_iter_popcount_u64_vectorizes_to_chunked_v16i8_and_matches_eval() {
+        use blaze_own::Alloc;
+        use crate::{
+            eval::{self, Outcome, Val},
+            func::SlotKind,
+            legalize::legalize,
+            ty::Scalar,
+        };
+
+        let v16i8 = Ty::vector(Scalar::I8, 16).unwrap();
+        let v8i16 = Ty::vector(Scalar::I16, 8).unwrap();
+
+        // 1. Exact `slice::Iter` `popcount_u64` across 300 `u64`s (crossing the 240-`u64` = 1,920-byte
+        //    chunk boundary!) covering:
+        //    - `Trunc(Popcnt(I64) -> I32)` + `Zext(I32 -> I64)` (`HeaderBody`, mixed bit patterns)
+        //    - `And(Popcnt(I64), 0xffff_ffff)` (`SingleBlock` rotated with `PreTerm::Br`, mixed bit patterns)
+        //    - Direct `Add(acc, Popcnt(I64))` (`HeaderBody`, all-`u64::MAX` stressing `30 * 8 = 240` saturation)
+        #[derive(Clone, Copy)]
+        enum Pop64Form {
+            TruncZextHeaderBody,
+            AndMaskSingleBlockRotated,
+            DirectAllOnesHeaderBody,
+        }
+
+        let mut data64 = [0u64; 300];
+        for (k, slot) in data64.iter_mut().enumerate() {
+            *slot = match k {
+                0 => 0,
+                1 => u64::MAX,
+                2 => 1,
+                3 => 1u64 << 63,
+                4 => 0x5555_5555_5555_5555,
+                5 => 0xaaaa_aaaa_aaaa_aaaa,
+                _ => (k as u64)
+                    .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                    .wrapping_add(0xbf58_476d_1ce4_e5b9),
+            };
+        }
+        let all_ones64 = [u64::MAX; 300];
+
+        for form in [
+            Pop64Form::TruncZextHeaderBody,
+            Pop64Form::AndMaskSingleBlockRotated,
+            Pop64Form::DirectAllOnesHeaderBody,
+        ] {
+            let vals: &[u64; 300] = match form {
+                Pop64Form::DirectAllOnesHeaderBody => &all_ones64,
+                _ => &data64,
+            };
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, blaze_own::testing::heap().alloc());
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let slot = b.slot(300 * 8, 4, SlotKind::Temp);
+
+            let func = match form {
+                Pop64Form::AndMaskSingleBlockRotated => {
+                    let [entry, body, exit] = [(); 3].map(|_| b.create_block(BlockKind::Normal));
+                    b.begin(entry);
+                    let len = b.param(Ty::I64);
+                    let base = b.slot_addr(slot);
+                    for (k, &val) in vals.iter().enumerate() {
+                        let c = b.iconst(Ty::I64, u128::from(val));
+                        b.store(Flags::NONE, c, base, (k * 8) as i32, MemAttrs::aligned(3));
+                    }
+                    let k3 = b.iconst(Ty::I64, 3);
+                    let bytes = b.binary(Op::Shl, Flags::NONE, len, k3);
+                    let end = b.ptr_add(Flags::INBOUNDS, base, bytes);
+                    let z64 = b.iconst(Ty::I64, 0);
+                    let eight = b.iconst(Ty::I64, 8);
+                    let mask32 = b.iconst(Ty::I64, 0xffff_ffff);
+                    let nonempty = b.icmp(IntCond::Ne, base, end);
+                    b.br(Flags::NONE, nonempty, (body, &[base, z64]), (exit, &[z64]));
+
+                    b.begin(body);
+                    let p = b.param(Ty::PTR);
+                    let acc = b.param(Ty::I64);
+                    let p_next = b.ptr_add(Flags::INBOUNDS, p, eight);
+                    let x = b.load(Ty::I64, Flags::NONE, p, 0, MemAttrs::aligned(3));
+                    let pc = b.unary(Op::Popcnt, Flags::NONE, x);
+                    let pc_m = b.binary(Op::And, Flags::NONE, pc, mask32);
+                    let acc_next = b.binary(Op::Add, Flags::NONE, acc, pc_m);
+                    let keep = b.icmp(IntCond::Ne, p_next, end);
+                    b.br(Flags::NONE, keep, (body, &[p_next, acc_next]), (exit, &[acc_next]));
+
+                    b.begin(exit);
+                    let res = b.param(Ty::I64);
+                    b.ret(&[res]);
+                    b.finish_checked().unwrap()
+                }
+                Pop64Form::TruncZextHeaderBody | Pop64Form::DirectAllOnesHeaderBody => {
+                    let [entry, hdr, body, exit] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+                    b.begin(entry);
+                    let len = b.param(Ty::I64);
+                    let base = b.slot_addr(slot);
+                    for (k, &val) in vals.iter().enumerate() {
+                        let c = b.iconst(Ty::I64, u128::from(val));
+                        b.store(Flags::NONE, c, base, (k * 8) as i32, MemAttrs::aligned(3));
+                    }
+                    let k3 = b.iconst(Ty::I64, 3);
+                    let bytes = b.binary(Op::Shl, Flags::NONE, len, k3);
+                    let end = b.ptr_add(Flags::INBOUNDS, base, bytes);
+                    let z64 = b.iconst(Ty::I64, 0);
+                    let eight = b.iconst(Ty::I64, 8);
+                    b.jump((hdr, &[base, z64]));
+
+                    b.begin(hdr);
+                    let p = b.param(Ty::PTR);
+                    let acc = b.param(Ty::I64);
+                    let keep = b.icmp(IntCond::Ne, p, end);
+                    b.br(Flags::NONE, keep, (body, &[]), (exit, &[acc]));
+
+                    b.begin(body);
+                    let p_next = b.ptr_add(Flags::INBOUNDS, p, eight);
+                    let x = b.load(Ty::I64, Flags::NONE, p, 0, MemAttrs::aligned(3));
+                    let pc = b.unary(Op::Popcnt, Flags::NONE, x);
+                    let term = if matches!(form, Pop64Form::TruncZextHeaderBody) {
+                        let t32 = b.convert(Op::Trunc, Flags::NONE, Ty::I32, pc);
+                        b.convert(Op::Zext, Flags::NONE, Ty::I64, t32)
+                    } else {
+                        pc
+                    };
+                    let acc_next = b.binary(Op::Add, Flags::NONE, acc, term);
+                    b.jump((hdr, &[p_next, acc_next]));
+
+                    b.begin(exit);
+                    let res = b.param(Ty::I64);
+                    b.ret(&[res]);
+                    b.finish_checked().unwrap()
+                }
+            };
+
+            let out = auto_vectorize_loops(func.view(), blaze_own::testing::heap().alloc()).unwrap();
+            verify(out.func.view()).unwrap();
+            assert_eq!(out.stats.loops_vectorized, 1, "popcount_u64 must vectorize");
+            let v = out.func.view();
+            assert_eq!(
+                (0..v.len()).filter(|&k| v.op(k) == Op::PtrAddr).count(),
+                0,
+                "inbounds slice::Iter popcount_u64 should emit zero Op::PtrAddr"
+            );
+            assert!(
+                (0..v.len()).filter(|&k| v.op(k) == Op::Popcnt && Ty(v.tys[k]) == v16i8).count() >= 4,
+                "expected >= 4 <16 x i8> Op::Popcnt ops"
+            );
+            assert_eq!(
+                (0..v.len()).filter(|&k| v.op(k) == Op::Load && Ty(v.tys[k]) == v16i8).count(),
+                4,
+                "expected 4x-unrolled <16 x i8> loads (64B/iter)"
+            );
+            assert!(
+                (0..v.len()).any(|k| v.op(k) == Op::Bitcast && Ty(v.tys[k]) == v8i16),
+                "expected <16 x i8> -> <8 x i16> bitcast widening"
+            );
+            assert!(
+                (0..v.len()).any(|k| v.op(k) == Op::ReduceAdd && Ty(v.tys[k]) == Ty::I16),
+                "expected Ty::I16 horizontal ReduceAdd on widened <8 x i16>"
+            );
+
+            let mut legalized = out.func;
+            legalize(&mut legalized, &NoRoutines, blaze_own::testing::heap().alloc()).unwrap();
+            verify(legalized.view()).unwrap();
+
+            for &n in &[0usize, 1, 7, 8, 9, 16, 240, 250, 300] {
+                let expected: u64 = vals[..n].iter().map(|&x| u64::from(x.count_ones())).sum();
+                let args = [Val::Int(n as u128)];
+                let Outcome::Returned(orig) =
+                    eval::run_in(func.view(), &args, 500_000, blaze_own::testing::heap().alloc()).unwrap()
+                else {
+                    panic!("orig popcount_u64 eval failed at n={n}");
+                };
+                let Outcome::Returned(got) =
+                    eval::run_in(legalized.view(), &args, 500_000, blaze_own::testing::heap().alloc()).unwrap()
+                else {
+                    panic!("vec popcount_u64 eval failed at n={n}");
+                };
+                assert_eq!(orig.as_slice(), &[Val::Int(u128::from(expected))]);
+                assert_eq!(got.as_slice(), orig.as_slice(), "popcount_u64 mismatch at n={n}");
+            }
+        }
+
+        // 2. Direct `Add(acc, Popcnt(v))` for `I32` (`acc_ty = I32` and `I64`) and counted-IV `I8`!
+        let mut data32 = [0u32; 40];
+        for (k, slot) in data32.iter_mut().enumerate() {
+            *slot = if k == 0 {
+                u32::MAX
+            } else {
+                (k as u32).wrapping_mul(0x9e37_79b9).wrapping_add(17)
+            };
+        }
+        for acc_ty in [Ty::I32, Ty::I64] {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, blaze_own::testing::heap().alloc());
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(acc_ty)]);
+            b.set_signature(sig);
+            let slot = b.slot(40 * 4, 4, SlotKind::Temp);
+            let [entry, hdr, body, exit] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+            b.begin(entry);
+            let len = b.param(Ty::I64);
+            let base = b.slot_addr(slot);
+            for (k, &val) in data32.iter().enumerate() {
+                let c = b.iconst(Ty::I32, u128::from(val));
+                b.store(Flags::NONE, c, base, (k * 4) as i32, MemAttrs::aligned(2));
+            }
+            let k2 = b.iconst(Ty::I64, 2);
+            let bytes = b.binary(Op::Shl, Flags::NONE, len, k2);
+            let end = b.ptr_add(Flags::INBOUNDS, base, bytes);
+            let z_acc = b.iconst(acc_ty, 0);
+            let four = b.iconst(Ty::I64, 4);
+            b.jump((hdr, &[base, z_acc]));
+
+            b.begin(hdr);
+            let p = b.param(Ty::PTR);
+            let acc = b.param(acc_ty);
+            let keep = b.icmp(IntCond::Ne, p, end);
+            b.br(Flags::NONE, keep, (body, &[]), (exit, &[acc]));
+
+            b.begin(body);
+            let p_next = b.ptr_add(Flags::INBOUNDS, p, four);
+            let x = b.load(Ty::I32, Flags::NONE, p, 0, MemAttrs::aligned(2));
+            let pc = b.unary(Op::Popcnt, Flags::NONE, x);
+            let term = if acc_ty == Ty::I64 {
+                b.convert(Op::Zext, Flags::NONE, Ty::I64, pc)
+            } else {
+                pc
+            };
+            let acc_next = b.binary(Op::Add, Flags::NONE, acc, term);
+            b.jump((hdr, &[p_next, acc_next]));
+
+            b.begin(exit);
+            let res = b.param(acc_ty);
+            b.ret(&[res]);
+            let func = b.finish_checked().unwrap();
+
+            let out = auto_vectorize_loops(func.view(), blaze_own::testing::heap().alloc()).unwrap();
+            verify(out.func.view()).unwrap();
+            assert_eq!(out.stats.loops_vectorized, 1);
+            let v = out.func.view();
+            assert!((0..v.len()).filter(|&k| v.op(k) == Op::Popcnt && Ty(v.tys[k]) == v16i8).count() >= 4);
+
+            let mut legalized = out.func;
+            legalize(&mut legalized, &NoRoutines, blaze_own::testing::heap().alloc()).unwrap();
+            verify(legalized.view()).unwrap();
+
+            for &n in &[0usize, 1, 15, 16, 17, 35] {
+                let expected: u64 = data32[..n].iter().map(|&x| u64::from(x.count_ones())).sum();
+                let args = [Val::Int(n as u128)];
+                let Outcome::Returned(orig) =
+                    eval::run_in(func.view(), &args, 200_000, blaze_own::testing::heap().alloc()).unwrap()
+                else {
+                    panic!("orig popcount_u32 eval failed at n={n}");
+                };
+                let Outcome::Returned(got) =
+                    eval::run_in(legalized.view(), &args, 200_000, blaze_own::testing::heap().alloc()).unwrap()
+                else {
+                    panic!("vec popcount_u32 eval failed at n={n}");
+                };
+                assert_eq!(orig.as_slice(), &[Val::Int(u128::from(expected))]);
+                assert_eq!(got.as_slice(), orig.as_slice(), "popcount_u32 mismatch at n={n}");
+            }
+        }
+
+        // 3. Counted-IV `I8` popcount (`for i in 0..n { acc += xs[i].count_ones() as u64; }`).
+        let mut data8 = [0u8; 130];
+        for (k, slot) in data8.iter_mut().enumerate() {
+            *slot = if k % 5 == 0 {
+                0xff
+            } else {
+                (k as u8).wrapping_mul(37).wrapping_add(11)
+            };
+        }
+        {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, blaze_own::testing::heap().alloc());
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let slot = b.slot(130, 4, SlotKind::Temp);
+            let [entry, hdr, body, exit] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+            b.begin(entry);
+            let len = b.param(Ty::I64);
+            let base = b.slot_addr(slot);
+            for (k, &val) in data8.iter().enumerate() {
+                let c = b.iconst(Ty::I8, u128::from(val));
+                b.store(Flags::NONE, c, base, k as i32, MemAttrs::aligned(0));
+            }
+            let z64 = b.iconst(Ty::I64, 0);
+            let one64 = b.iconst(Ty::I64, 1);
+            b.jump((hdr, &[z64, z64]));
+
+            b.begin(hdr);
+            let i = b.param(Ty::I64);
+            let acc = b.param(Ty::I64);
+            let keep = b.icmp(IntCond::Ult, i, len);
+            b.br(Flags::NONE, keep, (body, &[]), (exit, &[acc]));
+
+            b.begin(body);
+            let ep = b.ptr_add(Flags::NONE, base, i);
+            let x = b.load(Ty::I8, Flags::NONE, ep, 0, MemAttrs::aligned(0));
+            let pc = b.unary(Op::Popcnt, Flags::NONE, x);
+            let pc64 = b.convert(Op::Zext, Flags::NONE, Ty::I64, pc);
+            let acc_next = b.binary(Op::Add, Flags::NONE, acc, pc64);
+            let i_next = b.binary(Op::Add, Flags::NONE, i, one64);
+            b.jump((hdr, &[i_next, acc_next]));
+
+            b.begin(exit);
+            let res = b.param(Ty::I64);
+            b.ret(&[res]);
+            let func = b.finish_checked().unwrap();
+
+            let out = auto_vectorize_loops(func.view(), blaze_own::testing::heap().alloc()).unwrap();
+            verify(out.func.view()).unwrap();
+            assert_eq!(out.stats.loops_vectorized, 1);
+            let v = out.func.view();
+            assert!((0..v.len()).filter(|&k| v.op(k) == Op::Popcnt && Ty(v.tys[k]) == v16i8).count() >= 4);
+
+            let mut legalized = out.func;
+            legalize(&mut legalized, &NoRoutines, blaze_own::testing::heap().alloc()).unwrap();
+            verify(legalized.view()).unwrap();
+
+            for &n in &[0usize, 1, 7, 63, 64, 65, 130] {
+                let expected: u64 = data8[..n].iter().map(|&x| u64::from(x.count_ones())).sum();
+                let args = [Val::Int(n as u128)];
+                let Outcome::Returned(orig) =
+                    eval::run_in(func.view(), &args, 200_000, blaze_own::testing::heap().alloc()).unwrap()
+                else {
+                    panic!("orig popcount_u8 eval failed at n={n}");
+                };
+                let Outcome::Returned(got) =
+                    eval::run_in(legalized.view(), &args, 200_000, blaze_own::testing::heap().alloc()).unwrap()
+                else {
+                    panic!("vec popcount_u8 eval failed at n={n}");
+                };
+                assert_eq!(orig.as_slice(), &[Val::Int(u128::from(expected))]);
+                assert_eq!(got.as_slice(), orig.as_slice(), "popcount_u8 mismatch at n={n}");
+            }
+        }
+
+        // 4. Negative control: masked parity `And(Popcnt(v), 1)` must NOT vectorize as popcount sum!
+        {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, blaze_own::testing::heap().alloc());
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let [entry, hdr, body, exit] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+            b.begin(entry);
+            let base = b.param(Ty::PTR);
+            let len = b.param(Ty::I64);
+            let k3 = b.iconst(Ty::I64, 3);
+            let bytes = b.binary(Op::Shl, Flags::NONE, len, k3);
+            let end = b.ptr_add(Flags::INBOUNDS, base, bytes);
+            let z64 = b.iconst(Ty::I64, 0);
+            let one64 = b.iconst(Ty::I64, 1);
+            let eight = b.iconst(Ty::I64, 8);
+            b.jump((hdr, &[base, z64]));
+
+            b.begin(hdr);
+            let p = b.param(Ty::PTR);
+            let acc = b.param(Ty::I64);
+            let keep = b.icmp(IntCond::Ne, p, end);
+            b.br(Flags::NONE, keep, (body, &[]), (exit, &[acc]));
+
+            b.begin(body);
+            let p_next = b.ptr_add(Flags::INBOUNDS, p, eight);
+            let x = b.load(Ty::I64, Flags::NONE, p, 0, MemAttrs::aligned(3));
+            let pc = b.unary(Op::Popcnt, Flags::NONE, x);
+            let parity = b.binary(Op::And, Flags::NONE, pc, one64);
+            let acc_next = b.binary(Op::Add, Flags::NONE, acc, parity);
+            b.jump((hdr, &[p_next, acc_next]));
+
+            b.begin(exit);
+            let res = b.param(Ty::I64);
+            b.ret(&[res]);
+            let func = b.finish_checked().unwrap();
+
+            let out = auto_vectorize_loops(func.view(), blaze_own::testing::heap().alloc()).unwrap();
+            assert_eq!(out.stats.loops_vectorized, 0, "masked parity And(Popcnt, 1) must not vectorize");
         }
     }
 }

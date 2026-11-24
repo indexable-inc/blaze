@@ -843,7 +843,16 @@ fn vec_fma_avoid_regs(
     inst: usize,
 ) -> (u8, u8) {
     let vec_reg_of = |v: u32| -> u8 {
-        match loc_try.get(idx(v)).copied() {
+        let vi = idx(v);
+        if skip_alloc.get(vi).copied().unwrap_or(false) && view.op(vi) == Op::Splat {
+            if let Some(&sv) = view.data.get(vi) {
+                return match loc_try.get(idx(sv)).copied() {
+                    Some(AllocLoc::Fp(r)) => r,
+                    _ => NO_REG,
+                };
+            }
+        }
+        match loc_try.get(vi).copied() {
             Some(AllocLoc::Vec(r)) => r,
             _ => NO_REG,
         }
@@ -1098,15 +1107,21 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
         }
     }
 
-    // Propagate fused producers' operand lifetimes to their consumer's position (reverse scan).
+    // Propagate fused producers' operand lifetimes and loop weights to their consumer's position (reverse scan).
     for inst in (0..len).rev() {
         if skip_alloc.get(inst).copied().unwrap_or(false) {
             let consumer_end = last_use.get(inst).copied().unwrap_or(0);
+            let consumer_w = use_weight.get(inst).copied().unwrap_or(0);
             for_each_use(view, inst, |v| {
                 let vi = idx(v);
                 if let Some(lu) = last_use.get_mut(vi) {
                     if consumer_end > *lu {
                         *lu = consumer_end;
+                    }
+                }
+                if let Some(w) = use_weight.get_mut(vi) {
+                    if consumer_w > *w {
+                        *w = consumer_w;
                     }
                 }
             });
@@ -1354,6 +1369,32 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
             None
         };
         remat_val.push(cv);
+    }
+
+    // Propagate scalar FP return hints backward through lane-0 `Op::Extract` into the source vector
+    // so `v -> extract(v, 0) -> ret` stays in the same FP register with zero `fmov` instructions.
+    for inst in (0..len).rev() {
+        if view.op(inst) == Op::Extract {
+            let ty = view.tys.get(inst).copied().map_or(Ty::NONE, Ty);
+            if is_fp_ty(ty).is_some() {
+                let ih = hint.get(inst).copied().unwrap_or(NO_REG);
+                if ih != NO_REG {
+                    if let Some(&d) = view.data.get(inst) {
+                        let at = idx(d);
+                        if view.extra.get(at + 1).copied() == Some(0) {
+                            if let Some(&vec_v) = view.extra.get(at) {
+                                let vi = idx(vec_v);
+                                if let Some(vh) = hint.get_mut(vi) {
+                                    if *vh == NO_REG {
+                                        *vh = ih;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Propagate priority weights and return-value hints backward along `phi_partner` chains so
@@ -1613,6 +1654,24 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
                     spill_cost = spill_cost.saturating_add(u64::from(cand.weight).saturating_mul(8));
                 }
             } else if is_fp_ty(ty).is_some() {
+                let extract_lane0_hint = if view.op(inst) == Op::Extract {
+                    view.data.get(inst).and_then(|&d| {
+                        let at = idx(d);
+                        let vec_v = *view.extra.get(at)?;
+                        let lane = *view.extra.get(at + 1)?;
+                        if lane == 0 {
+                            match loc_try.get(idx(vec_v)).copied() {
+                                Some(AllocLoc::Vec(r)) => Some(r),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                } else {
+                    None
+                }
+                .unwrap_or(NO_REG);
                 let try_fp = |h: u8| -> Option<Reg> {
                     if h != NO_REG
                         && fp_safe(u32::from(h))
@@ -1625,6 +1684,7 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
                 };
                 let chosen = try_fp(primary_hint)
                     .or_else(|| try_fp(secondary_hint))
+                    .or_else(|| try_fp(extract_lane0_hint))
                     .or_else(|| {
                         caller_fp_order
                             .iter()
