@@ -81,7 +81,7 @@ blaze-lex	63
 blaze-lint	270
 blaze-lint-defs	109
 blaze-lir	1462
-blaze-lower	320
+blaze-lower	319
 blaze-macro-run	4
 blaze-malloc	65
 blaze-manifest	150

@@ -25,7 +25,7 @@
 
 use std::{
     fs,
-    path::Path,
+    path::{Component, Path},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -177,6 +177,7 @@ pub struct ProcMacros<'r> {
     comptime_patch_enabled: bool,
     patch_hits: AtomicU64,
     patch_fallbacks: AtomicU64,
+    stage_seq: AtomicU64,
     /// Each package a call was expanded in, with its crate name's results and its own
     /// verdicts on them: sorted by the package's address, which a slot keeps alive, so a
     /// package is found by identity with no hash of it a call.
@@ -221,6 +222,7 @@ impl<'r> ProcMacros<'r> {
             comptime_patch_enabled,
             patch_hits: AtomicU64::new(0),
             patch_fallbacks: AtomicU64::new(0),
+            stage_seq: AtomicU64::new(0),
             slots: Mutex::new(Vec::new()),
             tables: Mutex::new(Vec::new()),
         }
@@ -525,12 +527,10 @@ impl<'r> ProcMacros<'r> {
         };
         // Native zero-Wasm fast path (D175): expand directly via `NativeServerPool` on host `.dylib`/`.so`.
         if let Some(ref dylib) = module.native_dylib {
-            let real_dir: Option<String> = match &package.files {
-                crate::sandbox::Files::Folder(dir) => {
-                    let canon = fs::canonicalize(dir);
-                    let resolved = canon.as_deref().unwrap_or(dir.as_path());
-                    Some(resolved.to_string_lossy().into_owned())
-                }
+            let listed_dir: Option<blaze_own::AString<'_>>;
+            let member_joined;
+            let raw_dir: Option<&Path> = match &package.files {
+                crate::sandbox::Files::Folder(dir) => Some(dir.as_path()),
                 crate::sandbox::Files::Member { workspace, root } => {
                     let seen = root.seen().to_string();
                     let rel = seen.strip_prefix("/workspace").unwrap_or("").trim_start_matches('/');
@@ -539,41 +539,28 @@ impl<'r> ProcMacros<'r> {
                     } else {
                         workspace.as_path()
                     };
-                    let joined;
-                    let full = if rel.is_empty() {
-                        base
+                    if rel.is_empty() {
+                        Some(base)
                     } else {
-                        joined = base.join(rel);
-                        joined.as_path()
-                    };
-                    let canon = fs::canonicalize(full);
-                    let resolved = canon.as_deref().unwrap_or(full);
-                    Some(resolved.to_string_lossy().into_owned())
+                        member_joined = base.join(rel);
+                        Some(member_joined.as_path())
+                    }
                 }
-                crate::sandbox::Files::Listed(files) => {
-                    // Materialize `Cargo.toml` once by content digest so fetched-crate proc macros
-                    // (`proc-macro-crate`, `jsonrpsee`, `derive_more`, etc.) can read `$CARGO_MANIFEST_DIR/Cargo.toml`.
-                    files.iter().find(|(name, _)| name == "Cargo.toml").and_then(|(_, bytes)| {
-                        let digest = blaze_sha256::digest(bytes);
-                        let mut hex = String::with_capacity(64);
-                        for b in digest {
-                            use core::fmt::Write;
-                            let _ = write!(&mut hex, "{b:02x}");
-                        }
-                        let dir = std::env::temp_dir().join("blaze-pm-manifests").join(&hex);
-                        let manifest = dir.join("Cargo.toml");
-                        if !manifest.is_file() {
-                            let _ = fs::create_dir_all(&dir);
-                            let tmp = dir.join(format!(".Cargo.toml.{}", std::process::id()));
-                            if fs::write(&tmp, bytes).is_ok() {
-                                let _ = fs::rename(&tmp, &manifest);
-                            }
-                        }
-                        let canon = fs::canonicalize(&dir).unwrap_or(dir);
-                        Some(canon.to_string_lossy().into_owned())
-                    })
+                crate::sandbox::Files::Listed(_) => {
+                    // Materialize all safe relative files from the fetched crate once by content
+                    // digest so proc macros (`proc-macro-crate`, `i18n-embed-fl`, `jsonrpsee`,
+                    // `rust-embed`, etc.) can read any package file under `$CARGO_MANIFEST_DIR`.
+                    let base = std::env::temp_dir().join("blaze-pm-manifests");
+                    let seq = self.stage_seq.fetch_add(1, Ordering::Relaxed);
+                    listed_dir = materialize_listed_in(&base, &package.files, seq, alloc);
+                    listed_dir.as_deref().map(Path::new)
                 }
             };
+            let real_dir: Option<String> = raw_dir.map(|dir| {
+                let canon = fs::canonicalize(dir);
+                let resolved = canon.as_deref().unwrap_or(dir);
+                resolved.to_string_lossy().into_owned()
+            });
             let manifest_path = real_dir
                 .as_deref()
                 .map(|dir| Path::new(dir).join("Cargo.toml").to_string_lossy().into_owned());
@@ -732,5 +719,197 @@ impl<C: ExpandCx> ExpandCx for ProcCx<'_, '_, C> {
 
     fn run_proc_macro<'a>(&self, def: &MacroDefinition<'_>, call: ProcCall<'_>, alloc: Alloc<'a>) -> Result<Produced<'a>, HostError> {
         self.procs.run(def, &call, self.edition, &self.package, alloc)
+    }
+}
+
+/// Validates a relative path from [`crate::sandbox::Files::Listed`], refusing empty paths,
+/// NUL bytes, backslashes, absolute prefixes, `.` and `..` traversal components.
+fn safe_rel_path(name: &str) -> bool {
+    if name.is_empty() || name.as_bytes().contains(&0) || name.contains('\\') {
+        return false;
+    }
+    if name.split('/').any(|seg| seg.is_empty() || seg == "." || seg == "..") {
+        return false;
+    }
+    let mut saw_normal = false;
+    for comp in Path::new(name).components() {
+        match comp {
+            Component::Normal(part) if !part.is_empty() => saw_normal = true,
+            _ => return false,
+        }
+    }
+    saw_normal
+}
+
+/// Materializes all safe relative files from [`crate::sandbox::Files::Listed`] under
+/// `base/<tree-hex>/`, keyed by a SHA-256 digest of the canonically sorted `(name, bytes)`
+/// list. Uses a unique staging directory + atomic rename + sibling `<tree-hex>.ready` marker
+/// so concurrent workers never observe a half-populated tree and reuse the directory across runs.
+fn materialize_listed_in<'a>(base: &Path, files: &crate::sandbox::Files, seq: u64, alloc: Alloc<'a>) -> Option<blaze_own::AString<'a>> {
+    use core::fmt::Write as _;
+
+    let crate::sandbox::Files::Listed(files) = files else {
+        return None;
+    };
+    let mut entries: blaze_own::Vec<(&str, &[u8]), Alloc<'a>> = blaze_own::Vec::new_in(alloc);
+    for (name, bytes) in files.iter() {
+        if safe_rel_path(name) {
+            entries.push((name.as_str(), bytes.as_slice()));
+        }
+    }
+    if entries.is_empty() {
+        return None;
+    }
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+
+    let mut hasher = blaze_sha256::Sha256::new();
+    hasher.update(b"blaze-pm-listed-tree-v1\0");
+    for &(name, bytes) in entries.iter() {
+        let name_len = u64::try_from(name.len()).unwrap_or(u64::MAX);
+        let bytes_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        hasher.update(&name_len.to_le_bytes());
+        hasher.update(name.as_bytes());
+        hasher.update(&bytes_len.to_le_bytes());
+        hasher.update(bytes);
+    }
+    let digest = hasher.finish();
+    let mut hex_buf = blaze_own::AString::new_in(alloc);
+    for b in digest {
+        let _ = write!(&mut hex_buf, "{b:02x}");
+    }
+    let hex = hex_buf.as_str();
+
+    let dir = base.join(hex);
+    let mut ready_name = blaze_own::AString::new_in(alloc);
+    let _ = write!(&mut ready_name, "{hex}.ready");
+    let ready = base.join(ready_name.as_str());
+
+    if !(ready.is_file() && dir.is_dir()) {
+        let pid = std::process::id();
+        let mut stage_name = blaze_own::AString::new_in(alloc);
+        let _ = write!(&mut stage_name, ".stage-{hex}-{pid}-{seq}");
+        let stage = base.join(stage_name.as_str());
+
+        let mk_dir = |p: &Path| fs::create_dir_all(p);
+        let write_file = |p: &Path, b: &[u8]| fs::write(p, b);
+        let rename = |from: &Path, to: &Path| fs::rename(from, to);
+        let rm_dir = |p: &Path| {
+            let _ = fs::remove_dir_all(p);
+        };
+
+        rm_dir(&stage);
+        if mk_dir(&stage).is_err() {
+            return None;
+        }
+        for &(rel, bytes) in entries.iter() {
+            let dest = stage.join(rel);
+            let ok = dest.parent().is_none_or(|p| mk_dir(p).is_ok()) && write_file(&dest, bytes).is_ok();
+            if !ok {
+                rm_dir(&stage);
+                return None;
+            }
+        }
+        if rename(&stage, &dir).is_err() {
+            rm_dir(&stage);
+            if !dir.is_dir() {
+                return None;
+            }
+        }
+        let mut ready_tmp_name = blaze_own::AString::new_in(alloc);
+        let _ = write!(&mut ready_tmp_name, ".ready-{hex}-{pid}-{seq}");
+        let ready_tmp = base.join(ready_tmp_name.as_str());
+        if write_file(&ready_tmp, b"1").is_ok() {
+            let _ = rename(&ready_tmp, &ready);
+        }
+    }
+
+    let mut out = blaze_own::AString::new_in(alloc);
+    out.push_str(dir.to_str()?);
+    Some(out)
+}
+
+#[cfg(test)]
+mod listed_dir_tests {
+    use super::{Arc, Path, fs, materialize_listed_in, safe_rel_path};
+    use crate::sandbox::{Files, ListedBytes};
+
+    fn listed<const N: usize>(items: [(&str, &'static [u8]); N]) -> Files {
+        Files::Listed(Arc::from(items.map(|(name, bytes)| (name.into(), ListedBytes::Static(bytes)))))
+    }
+
+    #[test]
+    fn safe_rel_path_rejects_traversal_and_unsafe_paths() {
+        assert!(safe_rel_path("Cargo.toml"));
+        assert!(safe_rel_path("i18n/en-US/age.ftl"));
+        for bad in ["", "/etc/passwd", "../escape", "a/../b", "./a", "a/./b", "a//b", "a\0b", r"a\b"] {
+            assert!(!safe_rel_path(bad), "expected `{bad:?}` to be rejected");
+        }
+    }
+
+    #[test]
+    fn materializes_all_files_reuses_and_keys_by_full_tree() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let mut root_str = blaze_own::AString::new_in(alloc);
+        {
+            use core::fmt::Write as _;
+            let _ = write!(&mut root_str, "/tmp/blaze-hook-listed-test-{}", core::ptr::from_ref(&heap) as usize);
+        }
+        let root = Path::new(root_str.as_str());
+        let _ = fs::remove_dir_all(root);
+
+        let files_a = listed([
+            ("Cargo.toml", b"[package]\nname = \"age\"\n".as_slice()),
+            ("i18n.toml", b"fallback_language = \"en-US\"\n[fluent]\nassets_dir = \"i18n\"\n".as_slice()),
+            ("i18n/en-US/age.ftl", b"err-decryption = Decryption failed\n".as_slice()),
+            ("../escape.txt", b"must not be written".as_slice()),
+            ("/abs.txt", b"must not be written".as_slice()),
+        ]);
+        let files_a_reordered = listed([
+            ("i18n/en-US/age.ftl", b"err-decryption = Decryption failed\n".as_slice()),
+            ("Cargo.toml", b"[package]\nname = \"age\"\n".as_slice()),
+            ("i18n.toml", b"fallback_language = \"en-US\"\n[fluent]\nassets_dir = \"i18n\"\n".as_slice()),
+        ]);
+        let files_b = listed([
+            ("Cargo.toml", b"[package]\nname = \"age\"\n".as_slice()),
+            ("i18n.toml", b"fallback_language = \"fr\"\n".as_slice()),
+        ]);
+
+        let dir1_s = materialize_listed_in(root, &files_a, 0, alloc).expect("materializes safe files");
+        let dir1 = Path::new(dir1_s.as_str());
+        assert_eq!(fs::read(dir1.join("Cargo.toml")).unwrap(), b"[package]\nname = \"age\"\n");
+        assert_eq!(fs::read(dir1.join("i18n.toml")).unwrap(), b"fallback_language = \"en-US\"\n[fluent]\nassets_dir = \"i18n\"\n");
+        assert_eq!(fs::read(dir1.join("i18n/en-US/age.ftl")).unwrap(), b"err-decryption = Decryption failed\n");
+        assert!(!root.join("escape.txt").exists(), "traversal path must not escape");
+        assert!(!dir1.join(".ready").exists(), "marker must live outside the package dir");
+
+        // Reordered identical safe files reuse the exact same content-addressed directory.
+        let dir2_s = materialize_listed_in(root, &files_a_reordered, 1, alloc).expect("reuses tree");
+        assert_eq!(dir1_s.as_str(), dir2_s.as_str());
+
+        // Simulating a race where another worker published `dir` before writing `.ready`:
+        // removing `.ready` and re-running with a different seq still succeeds and restores `.ready`.
+        let hex = dir1.file_name().and_then(|s| s.to_str()).expect("hex dir name");
+        let mut ready_name = blaze_own::AString::new_in(alloc);
+        {
+            use core::fmt::Write as _;
+            let _ = write!(&mut ready_name, "{hex}.ready");
+        }
+        let ready = root.join(ready_name.as_str());
+        assert!(ready.is_file(), "ready marker must be created");
+        let _ = fs::remove_file(&ready);
+        let dir_race_s = materialize_listed_in(root, &files_a, 2, alloc).expect("handles existing dir race");
+        assert_eq!(dir1_s.as_str(), dir_race_s.as_str());
+        assert!(ready.is_file(), "ready marker must be restored");
+
+        // Changing a non-Cargo.toml file produces a distinct directory digest.
+        let dir3_s = materialize_listed_in(root, &files_b, 3, alloc).expect("distinct tree");
+        assert_ne!(dir1_s.as_str(), dir3_s.as_str());
+
+        // Empty or all-unsafe file lists return None.
+        assert!(materialize_listed_in(root, &listed([]), 4, alloc).is_none());
+        assert!(materialize_listed_in(root, &listed([("../bad", b"x".as_slice()), ("/bad", b"y".as_slice())]), 5, alloc).is_none());
+
+        let _ = fs::remove_dir_all(root);
     }
 }

@@ -134,3 +134,41 @@ fn the_architecture_is_a_read_of_the_record() {
     assert_eq!((a64, x86), (vec![], vec![]));
     assert_eq!((a64_reads, x86_reads), (vec![], vec![]), "no `asm!`: no read, one record for both");
 }
+
+/// Discarded outputs (`out(reg) _`, `lateout(reg) _`, `inout(reg) x => _`) must mark their
+/// `_` expression slots reached so writeback never fails with `Malformed(Unreached(_))`
+/// (cmov's `cseleq!` aarch64 backend).
+#[test]
+fn discarded_outputs_check_clean() {
+    let mut fx = Fx::new();
+    let u64_ = fx.ty(PNode::Uint(UintTy::U64));
+    let u16_ = fx.ty(PNode::Uint(UintTy::U16));
+    let unit = fx.unit();
+    let f = fx.func("f", 0, &[u64_, u64_, u16_, u16_], unit, StdVec::new());
+    let g = fx.func("g", 0, &[u64_], unit, StdVec::new());
+    fx.finish();
+    let cmovne = r#"fn f(lhs: u64, rhs: u64, cond: u16, mut tmp: u16) {
+        unsafe {
+            builtin # asm(
+                "eor {0:x}, {1:x}, {2:x}",
+                "cmp {0:x}, 0",
+                "csel {3:x}, {4:x}, {5:x}, NE",
+                out(reg) _,
+                in(reg) lhs,
+                in(reg) rhs,
+                inlateout(reg) tmp,
+                in(reg) cond,
+                in(reg) tmp,
+                options(pure, nomem, nostack),
+            )
+        }
+    }"#;
+    let (found, _) = check_for(&fx, f, "aarch64", cmovne);
+    assert_eq!(found, vec![], "discarded `out(reg) _` must check clean");
+
+    let split_discard = r#"fn g(x: u64) {
+        unsafe { builtin # asm("nop /* {} */", inout(reg) x => _) }
+    }"#;
+    let (found, _) = check_for(&fx, g, "aarch64", split_discard);
+    assert_eq!(found, vec![], "discarded `inout(reg) x => _` must check clean");
+}

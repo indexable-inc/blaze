@@ -805,7 +805,7 @@ fn an_attribute_without_arguments_gets_an_empty_stream() {
 /// An answer kept by another host version is never read: the version is in the base key. The
 /// control finds the same answer kept under this version.
 #[test]
-fn an_answer_of_another_host_version_is_not_read() {
+fn an_answer_of_a_previous_host_version_is_not_read() {
     let setup = setup(&[], 1);
     let root = folder("host-version");
     let pkg = package(&root, &[]);

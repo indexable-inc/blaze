@@ -348,14 +348,19 @@ impl<'b, 'w, 'c, W: World, C: TypeCtx> Machine<'b, 'w, 'c, '_, W, C> {
             };
             match o.kind {
                 AsmKind::InOut | AsmKind::InLateOut if f.b == 0 => {
-                    let out = o.out_expr.filter(|&x| !matches!(self.body.expr(x), Ok(Expr::Underscore)));
-                    if let Some(x) = out {
-                        f.b = 1;
-                        f.t = t;
-                        self.check_place_code(x, DiagCode::InvalidLhs)?;
-                        self.resume(f, 1)?;
-                        self.push_expr(x, Expectation::None, Then::Nothing)?;
-                        return Ok(Flow::Wait);
+                    if let Some(x) = o.out_expr {
+                        if self.body.expr(x)? == Expr::Underscore {
+                            // `inout(reg) a => _` / `inlateout(reg) a => _`: discarded output,
+                            // mark reached with `()` so writeback never rejects its slot as unreached.
+                            self.mark_asm_discarded(x);
+                        } else {
+                            f.b = 1;
+                            f.t = t;
+                            self.check_place_code(x, DiagCode::InvalidLhs)?;
+                            self.resume(f, 1)?;
+                            self.push_expr(x, Expectation::None, Then::Nothing)?;
+                            return Ok(Flow::Wait);
+                        }
                     }
                     if let Some(class) = class {
                         self.asms.push(AsmCheck::Reg { expr: o.expr, ty: t, class, out: None });
@@ -388,7 +393,9 @@ impl<'b, 'w, 'c, W: World, C: TypeCtx> Machine<'b, 'w, 'c, '_, W, C> {
         }
         while let Some(&o) = ops.get(f.a as usize) {
             if o.kind.is_output() && !o.kind.is_input() && self.body.expr(o.expr)? == Expr::Underscore {
-                // `out(reg) _`: discarded, nothing to check (its slot is never reached).
+                // `out(reg) _` / `lateout(reg) _`: discarded output, mark reached with `()` so
+                // writeback never rejects its slot as unreached.
+                self.mark_asm_discarded(o.expr);
                 f.a += 1;
                 continue;
             }
@@ -405,6 +412,17 @@ impl<'b, 'w, 'c, W: World, C: TypeCtx> Machine<'b, 'w, 'c, '_, W, C> {
             return Ok(Flow::Wait);
         }
         Ok(Flow::Done(if options & ASM_NORETURN != 0 { self.common.never } else { self.common.unit }))
+    }
+
+    /// Marks a discarded `_` output slot reached with `()` so writeback never rejects it as
+    /// `Malformed::Unreached`.
+    fn mark_asm_discarded(&mut self, e: ExprId) {
+        if let Some(slot) = self.reached.get_mut(e.ix()) {
+            *slot = true;
+        }
+        if let Some(slot) = self.expr_ty.get_mut(e.ix()) {
+            *slot = self.common.unit;
+        }
     }
 
     /// Each register named: a class or register of `arch`, not reserved, and no explicit
