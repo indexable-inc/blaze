@@ -483,7 +483,15 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                         c = up;
                     }
                     let up = self.expr_parent.get(c as usize).ok_or(malformed("an expression without a row of parents (`scan_flags` did not run)"))?.0;
-                    !self.use_keeps_state(c, up)
+                    // Unlike a local scrutinee (matched in place), an `EnvPlace` scrutinee of
+                    // `match` or `let` is evaluated by value (`Task::Eval` -> `env_moved`).
+                    let match_or_let_scrutinee = up != NO_EXPR
+                        && usize::try_from(up).ok().and_then(|u| body.exprs.get(u)).is_some_and(|expr| match *expr {
+                            Expr::Match { scrutinee, .. } => scrutinee.0 == c,
+                            Expr::Let { init, .. } => init.0 == c,
+                            _ => false,
+                        });
+                    match_or_let_scrutinee || !self.use_keeps_state(c, up)
                 }
                 Expr::Closure { .. } | Expr::AsyncBlock { .. } if x != owner.0 => {
                     let checked = self.checked;

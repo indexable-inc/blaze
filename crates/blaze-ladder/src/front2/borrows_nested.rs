@@ -221,6 +221,9 @@ impl Facts for NestedFacts<'_, '_> {
     fn param_copy(&self, index: u32) -> bool {
         self.facts.param_copy(index)
     }
+    fn alias_copy(&self, alias: tc::PTy) -> bool {
+        self.facts.alias_copy(alias)
+    }
     fn shape(&self, item: tc::ItemKey) -> Option<Shape<'_>> {
         self.facts.shape(item)
     }
@@ -295,6 +298,9 @@ impl Facts for NestedFacts<'_, '_> {
     }
     fn drop_strict(&self, adt: tc::ItemKey) -> Option<&[bool]> {
         self.facts.drop_strict(adt)
+    }
+    fn drop_lifetimes(&self, adt: tc::ItemKey) -> Option<&[bool]> {
+        self.facts.drop_lifetimes(adt)
     }
     fn closure_requirements(&self, closure: tc::ExprId) -> &[Requirement] {
         let (lo, hi) = run_of(self.closures, closure);

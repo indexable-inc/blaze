@@ -811,6 +811,202 @@ fn take_fut<F: core::future::Future<Output = u8>>(f: F) -> F {
 fn pass_async_fn_to_fut_bound(x: &u8) -> impl core::future::Future<Output = u8> + '_ {
     take_fut(wait_val(x))
 }
+
+// --- Final 36 tempo borrows classes (A..G) + negative controls ---
+
+// Class A: Higher-ranked `dyn for<'a> Fn` in invariant `&mut` across multiple calls
+struct Decoded<'a>(&'a [u8]);
+type DecoderReg = Vec<Box<dyn for<'a> Fn(&'a [u8]) -> Option<Decoded<'a>> + Send + Sync>>;
+fn add_reg(_: &mut DecoderReg) {}
+fn dyn_hr_mut_multiple_calls() -> DecoderReg {
+    let mut r: DecoderReg = Vec::new();
+    add_reg(&mut r);
+    add_reg(&mut r);
+    add_reg(&mut r);
+    r
+}
+fn take_hr_box(_: &mut Box<dyn for<'a> Fn(&'a [u8]) -> Option<Decoded<'a>> + Send + Sync>) {}
+fn control_dyn_universal_passed_to_hr<'x>(r: &mut Box<dyn Fn(&'x [u8]) -> Option<Decoded<'x>> + Send + Sync>) {
+    take_hr_box(r);
+}
+fn take_hr_two(_: &mut Box<dyn for<'a, 'b> Fn(&'a u8, &'b u8) -> &'a u8 + Send + Sync>) {}
+fn take_hr_one(_: &mut Box<dyn for<'a> Fn(&'a u8, &'a u8) -> &'a u8 + Send + Sync>) {}
+fn control_dyn_mismatch_hr_binders(mut b: Box<dyn for<'a, 'b> Fn(&'a u8, &'b u8) -> &'a u8 + Send + Sync>) {
+    take_hr_two(&mut b);
+    take_hr_one(&mut b);
+}
+
+// Class B: Structural drop glue with non-dropping borrowed fields (`RoutingPolicy`, `DecodedTempoPrecompileError`, `DbStorageOverlay`)
+struct Policy<'a> {
+    r: &'a u8,
+    owned: Vec<u8>,
+}
+struct Actor {
+    x: u8,
+    y: u8,
+}
+impl Actor {
+    fn policy(&self) -> Policy<'_> {
+        Policy { r: &self.x, owned: Vec::new() }
+    }
+    fn drop_glue_unrelated_lifetime(&mut self) -> u8 {
+        let p = self.policy();
+        let v = *p.r;
+        self.y = v;
+        self.y
+    }
+}
+struct DecErr<'a> {
+    msg: String,
+    bytes: &'a [u8],
+}
+fn try_dec<'a>(b: &'a [u8]) -> Option<DecErr<'a>> {
+    if b.is_empty() { None } else { Some(DecErr { msg: String::new(), bytes: b }) }
+}
+fn drop_glue_match_none_move(v: Vec<u8>) -> usize {
+    match try_dec(&v) {
+        Some(e) => e.msg.len() + e.bytes.len(),
+        None => {
+            let n = v.len();
+            drop(v);
+            n
+        }
+    }
+}
+struct GuardDrop<'a>(&'a u8);
+impl<'a> Drop for GuardDrop<'a> {
+    fn drop(&mut self) {
+        let _ = *self.0;
+    }
+}
+struct WrapGuard<'a> {
+    g: GuardDrop<'a>,
+    owned: Vec<u8>,
+}
+fn control_drop_impl_borrows_lifetime(mut x: u8) -> u8 {
+    let w = WrapGuard { g: GuardDrop(&x), owned: Vec::new() };
+    let v = *w.g.0;
+    x = v + 1;
+    x
+}
+struct DynHolder<'a> {
+    d: Box<dyn core::fmt::Debug + 'a>,
+    owned: Vec<u8>,
+}
+fn control_drop_box_dyn_borrows_lifetime(mut x: u8) -> u8 {
+    let h = DynHolder { d: Box::new(&x), owned: Vec::new() };
+    let _ = h.owned.len();
+    x = 2;
+    x
+}
+
+// Class C: `Copy` impl with `RegionOutlives` bound already on ADT (`ContentRefDeserializer`)
+struct RefDe<'a, 'de: 'a, E> {
+    data: &'a &'de [u8],
+    _e: core::marker::PhantomData<E>,
+}
+impl<'a, 'de: 'a, E> Copy for RefDe<'a, 'de, E> {}
+impl<'a, 'de: 'a, E> Clone for RefDe<'a, 'de, E> {
+    fn clone(&self) -> Self { *self }
+}
+fn copy_with_region_outlives<'a, 'de: 'a, E>(d: RefDe<'a, 'de, E>) -> (RefDe<'a, 'de, E>, RefDe<'a, 'de, E>) {
+    (d, d)
+}
+struct NoOutlives<'a, 'b, E>(&'a u8, &'b u8, core::marker::PhantomData<E>);
+impl<'a, 'b: 'a, E: Copy> Copy for NoOutlives<'a, 'b, E> {}
+impl<'a, 'b: 'a, E: Copy> Clone for NoOutlives<'a, 'b, E> {
+    fn clone(&self) -> Self { *self }
+}
+fn control_copy_not_copy_param<'a, 'b: 'a>(d: NoOutlives<'a, 'b, String>) -> (NoOutlives<'a, 'b, String>, NoOutlives<'a, 'b, String>) {
+    (d, d)
+}
+
+// Class D: Constant promotion of array repeat expressions (`&[0; 64]`, `&[(1, [[0x11; 4]; 2])]`)
+fn take_static_slice(s: &'static [u8]) -> usize { s.len() }
+fn const_promote_repeat_slice() -> usize {
+    take_static_slice(&[0u8; 64])
+}
+fn const_promote_nested_repeat() -> &'static [(u8, [[u8; 4]; 2])] {
+    &[(1, [[0x11; 4]; 2]), (2, [[0x22; 4]; 2])]
+}
+fn control_non_const_repeat_not_promoted(x: u8) -> &'static [u8] {
+    &[x; 4]
+}
+
+// Class E: Associated type `Copy` bound (`M::At<'_>` where `type At<'a>: Copy`)
+trait Obs {
+    type At<'a>: Copy;
+    fn read(&self, at: Self::At<'_>) -> u8;
+}
+fn use_assoc_copy<M: Obs>(m: &M, at: M::At<'_>) -> u8 {
+    m.read(at) + m.read(at)
+}
+trait ObsNoCopy {
+    type At<'a>;
+    fn read(&self, at: Self::At<'_>) -> u8;
+}
+fn control_assoc_type_not_copy<M: ObsNoCopy>(m: &M, at: M::At<'_>) -> u8 {
+    m.read(at) + m.read(at)
+}
+
+// Class F: Disjoint field capture of enum matched by value inside `async` block
+struct InnerBlock {
+    body: String,
+    witness: Option<String>,
+}
+struct OuterPeer {
+    block: InnerBlock,
+}
+async fn take_str(s: String) -> usize { s.len() }
+async fn async_disjoint_field_match(peer: OuterPeer) -> usize {
+    let b = peer.block.body;
+    let n = async {
+        match peer.block.witness {
+            Some(w) => take_str(w).await,
+            None => 0,
+        }
+    }.await;
+    b.len() + n
+}
+async fn control_async_same_field_moved_twice(peer: OuterPeer) -> usize {
+    let w0 = peer.block.witness;
+    let n = async {
+        match peer.block.witness {
+            Some(w) => take_str(w).await,
+            None => 0,
+        }
+    }.await;
+    w0.map_or(0, |s| s.len()) + n
+}
+
+// Class G: Nested RPIT / RPITIT opaque in `Result<impl Trait, E>`
+trait EngineCfg {
+    type Err;
+    fn tx_iter(&self, p: &u8) -> Result<impl Iterator<Item = u8>, Self::Err>;
+}
+struct InnerCfg;
+impl EngineCfg for InnerCfg {
+    type Err = ();
+    fn tx_iter(&self, p: &u8) -> Result<impl Iterator<Item = u8>, Self::Err> {
+        Ok(core::iter::once(*p))
+    }
+}
+struct OuterCfg {
+    inner: InnerCfg,
+}
+impl EngineCfg for OuterCfg {
+    type Err = ();
+    fn tx_iter(&self, p: &u8) -> Result<impl Iterator<Item = u8>, Self::Err> {
+        self.inner.tx_iter(p)
+    }
+}
+fn control_nested_rpit_dangling(p: &u8) -> Result<impl Iterator<Item = &u8> + '_, ()> {
+    let local = *p;
+    Ok(core::iter::once(&local))
+}
+fn control_nested_rpit_uncaptured<'a, 'b>(_a: &'a u8, b: &'b u8) -> Result<impl Iterator<Item = u8> + use<'a>, ()> {
+    Ok(core::iter::once(b).copied())
+}
 "#;
     let heap = blaze_own::testing::heap();
     let tc = open_toolchain();

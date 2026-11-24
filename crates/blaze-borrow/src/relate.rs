@@ -54,6 +54,14 @@ pub trait Constraints {
     /// `'a: 'static`.
     fn outlives_static(&mut self, a: Origin);
     fn fresh(&mut self, kind: Kind) -> Origin;
+    /// A canonical rigid placeholder for the `ordinal`-th distinct higher-ranked binder variable
+    /// (`0, 1, ...` by first appearance inside a `dyn for<..>` trait object at invariant position).
+    /// Sharing by `ordinal` across calls in one body lets a local `dyn for<'a> Tr<'a>` be passed
+    /// by `&mut` to multiple calls while still rejecting caller universals, `'static`, local
+    /// borrows, and mismatched binder arity (`for<'a, 'b>` vs `for<'a>`).
+    fn dyn_placeholder(&mut self, _ordinal: u32) -> Origin {
+        self.fresh(Kind::Placeholder)
+    }
 }
 
 /// A closure of the caller body's signature, laid over its `PNode::FnPtr([in.., out])` in the
@@ -409,6 +417,27 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         Ok(o)
     }
 
+    fn hr_dyn_origin(&mut self, node: PTy, key: BoundAt) -> Result<Origin, Refused> {
+        let mut ordinal = 0u32;
+        if let Some(used) = self.hr.get(..self.hr_len) {
+            for &(k, o) in used.iter().flatten() {
+                if k == key {
+                    return Ok(o);
+                }
+                if k.env == key.env && k.binder == key.binder {
+                    ordinal += 1;
+                }
+            }
+        }
+        let Some(slot) = self.hr.get_mut(self.hr_len) else {
+            return Err(self.malformed(node, Bad::StepBound));
+        };
+        let o = self.out.dyn_placeholder(ordinal);
+        *slot = Some((key, o));
+        self.hr_len += 1;
+        Ok(o)
+    }
+
     fn hr_has(&self, key: BoundAt) -> bool {
         self.hr.get(..self.hr_len).is_some_and(|used| used.iter().flatten().any(|&(k, _)| k == key))
     }
@@ -437,26 +466,28 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             }
         }
         if let Reg::Bound { binder, var } = a {
-            let kind = match self.binder_v {
-                BinderCtx::FnPtr(Variance::Co) | BinderCtx::Dynamic(Variance::Co) | BinderCtx::Clause => Kind::Existential,
-                BinderCtx::FnPtr(Variance::Contra) | BinderCtx::Dynamic(Variance::Contra) => Kind::Placeholder,
-                BinderCtx::Dynamic(Variance::In) if eb.is_none() => Kind::Placeholder,
+            let key = BoundAt { env: ea, binder, var };
+            let o = match self.binder_v {
+                BinderCtx::FnPtr(Variance::Co) | BinderCtx::Dynamic(Variance::Co) | BinderCtx::Clause => self.hr_origin(node, key, Kind::Existential)?,
+                BinderCtx::FnPtr(Variance::Contra) | BinderCtx::Dynamic(Variance::Contra) => self.hr_origin(node, key, Kind::Placeholder)?,
+                BinderCtx::Dynamic(Variance::In) if eb.is_none() => self.hr_dyn_origin(node, key)?,
                 BinderCtx::None | BinderCtx::FnPtr(Variance::In) | BinderCtx::Dynamic(Variance::In) => {
                     return Err(Refused::HigherRanked { item: self.item, node, binder });
                 }
             };
-            a = Reg::Origin(self.hr_origin(node, BoundAt { env: ea, binder, var }, kind)?);
+            a = Reg::Origin(o);
         }
         if let Reg::Bound { binder, var } = b {
-            let kind = match self.binder_v {
-                BinderCtx::FnPtr(Variance::Co) | BinderCtx::Dynamic(Variance::Co) | BinderCtx::Clause => Kind::Placeholder,
-                BinderCtx::FnPtr(Variance::Contra) | BinderCtx::Dynamic(Variance::Contra) => Kind::Existential,
-                BinderCtx::Dynamic(Variance::In) if ea.is_none() => Kind::Placeholder,
+            let key = BoundAt { env: eb, binder, var };
+            let o = match self.binder_v {
+                BinderCtx::FnPtr(Variance::Co) | BinderCtx::Dynamic(Variance::Co) | BinderCtx::Clause => self.hr_origin(node, key, Kind::Placeholder)?,
+                BinderCtx::FnPtr(Variance::Contra) | BinderCtx::Dynamic(Variance::Contra) => self.hr_origin(node, key, Kind::Existential)?,
+                BinderCtx::Dynamic(Variance::In) if ea.is_none() => self.hr_dyn_origin(node, key)?,
                 BinderCtx::None | BinderCtx::FnPtr(Variance::In) | BinderCtx::Dynamic(Variance::In) => {
                     return Err(Refused::HigherRanked { item: self.item, node, binder });
                 }
             };
-            b = Reg::Origin(self.hr_origin(node, BoundAt { env: eb, binder, var }, kind)?);
+            b = Reg::Origin(o);
         }
         match v {
             Variance::Co => self.outlives(node, a, b),

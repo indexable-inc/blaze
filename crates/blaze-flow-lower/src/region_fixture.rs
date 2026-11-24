@@ -573,6 +573,12 @@ impl<F: Facts> Facts for WithRegions<'_, F> {
     fn is_zero_slot_builtin_assoc(&self, trait_: ItemKey, name: Name) -> bool {
         self.base.is_zero_slot_builtin_assoc(trait_, name)
     }
+    fn drop_lifetimes(&self, adt: ItemKey) -> Option<&[bool]> {
+        self.base.drop_lifetimes(adt)
+    }
+    fn alias_copy(&self, alias: PTy) -> bool {
+        self.base.alias_copy(alias)
+    }
     fn ties(&self, item: ItemKey) -> Option<Ties<'_>> {
         self.base.ties(item)
     }

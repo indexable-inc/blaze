@@ -41,6 +41,26 @@ use crate::{Facts, Form, Lower, MOST_POSITIONS, ProjectionUnbound, Refusal, TyD}
 /// closure capturing ...): past it, `Form::Bound` (rule 18), never an unbounded recursion.
 pub(crate) const MOST_BODY_NEST: usize = 64;
 
+/// Captured lifetime groups recorded by [`Lower::lay_slots`] for return-position `impl Trait`
+/// opaques nested inside a signature output (e.g. `Result<impl Trait, E>`). Each entry in
+/// `slots` maps a laid output slot index to its group index in `groups`, which slices `caps`.
+pub(crate) struct RpitLaid<A: Allocator> {
+    pub(crate) slots: Vec<(u32, u32), A>,
+    pub(crate) groups: Vec<(u32, u32), A>,
+    pub(crate) caps: Vec<Region, A>,
+}
+
+impl<A: Allocator + Copy> RpitLaid<A> {
+    pub(crate) fn new_in(alloc: A) -> Self {
+        RpitLaid { slots: Vec::new_in(alloc), groups: Vec::new_in(alloc), caps: Vec::new_in(alloc) }
+    }
+    pub(crate) fn clear(&mut self) {
+        self.slots.clear();
+        self.groups.clear();
+        self.caps.clear();
+    }
+}
+
 /// THE GRAIN of a place's origins: a type parameter of the lowering through its call rule.
 pub(crate) trait Grain {
     /// `true` for [`RegionSlots`].
@@ -58,6 +78,7 @@ pub(crate) trait Grain {
         body_t: PTy,
         slots: &[Region],
         out: &mut Vec<Option<Region>, A>,
+        rpit: Option<&mut RpitLaid<A>>,
         e: ExprId,
     ) -> Result<bool, Refusal>;
     /// The knowns of the body's own signature's open projections, once it is laid.
@@ -81,6 +102,7 @@ impl Grain for Positions {
         body_t: PTy,
         slots: &[Region],
         out: &mut Vec<Option<Region>, A>,
+        _rpit: Option<&mut RpitLaid<A>>,
         e: ExprId,
     ) -> Result<bool, Refusal> {
         l.lay_over_in(declared, body_t, slots, out, true, e)
@@ -107,9 +129,10 @@ impl Grain for RegionSlots {
         body_t: PTy,
         slots: &[Region],
         out: &mut Vec<Option<Region>, A>,
+        rpit: Option<&mut RpitLaid<A>>,
         e: ExprId,
     ) -> Result<bool, Refusal> {
-        l.lay_slots(declared, body_t, slots, out, e)
+        l.lay_slots(declared, body_t, slots, out, rpit, e)
     }
     /// A projection's slots are its trait's lifetimes and its arguments' (rustc: an alias's
     /// regions are its arguments'): no origin stands for "the projection" to know a meet of,
@@ -275,29 +298,12 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
             Some(r) => self.owner_sig_count(r, e)?,
             None => 0,
         };
-        if row.is_some() {
-            for f in ck.env_fields_by::<blaze_typeck::Places>(expr) {
-                let Some(t) = f.place_ty(ck) else {
-                    return self.refuse(Form::Malformed, e);
-                };
-                let m = self.region_slots_in(t, path, e)?;
-                n = match n.checked_add(u32::from(f.how != CaptureKind::ByValue)).and_then(|n| n.checked_add(m)) {
-                    Some(n) if n <= MOST_POSITIONS => n,
-                    _ => return self.refuse(Form::Bound, e),
-                };
-            }
-            return Ok(n);
-        }
-        for &row in self.captures_of(expr) {
-            let i = row as usize;
-            let (Some(&pat), Some(&kind)) = (ck.captures.column::<1>().get(i), ck.captures.column::<2>().get(i)) else {
-                return self.refuse(Form::Malformed, e);
-            };
-            let Some(&t) = ck.local_ty.get(pat.ix()) else {
+        for f in ck.env_fields_by::<blaze_typeck::Places>(expr) {
+            let Some(t) = f.place_ty(ck) else {
                 return self.refuse(Form::Malformed, e);
             };
             let m = self.region_slots_in(t, path, e)?;
-            n = match n.checked_add(u32::from(kind != CaptureKind::ByValue)).and_then(|n| n.checked_add(m)) {
+            n = match n.checked_add(u32::from(f.how != CaptureKind::ByValue)).and_then(|n| n.checked_add(m)) {
                 Some(n) if n <= MOST_POSITIONS => n,
                 _ => return self.refuse(Form::Bound, e),
             };
@@ -338,8 +344,19 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
     ///
     /// The column must be consumed whole. `out` has one entry per slot of `body_t`, in its
     /// pre-order.
-    pub(crate) fn lay_slots(&self, declared: PTy, body_t: PTy, slots: &[Region], out: &mut Vec<Option<Region>, A>, e: ExprId) -> Result<bool, Refusal> {
+    pub(crate) fn lay_slots(
+        &self,
+        declared: PTy,
+        body_t: PTy,
+        slots: &[Region],
+        out: &mut Vec<Option<Region>, A>,
+        mut rpit: Option<&mut RpitLaid<A>>,
+        e: ExprId,
+    ) -> Result<bool, Refusal> {
         out.clear();
+        if let Some(rp) = rpit.as_deref_mut() {
+            rp.clear();
+        }
         let facts: &'b F = self.facts;
         let arity = FactsArity { facts };
         let heads = Columns::new(facts.region_tys().unwrap_or(self.tys), &arity, &arity);
@@ -428,7 +445,35 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                             continue 'frames;
                         }
                     }
-                    PNode::Opaque(..) | PNode::FnDef(..) | PNode::Param(_) => {}
+                    PNode::Opaque(..) => {
+                        let n = match body.count(b) {
+                            Ok(n) => n.get(),
+                            Err(u) => return self.uncounted(u, e),
+                        };
+                        if let Some(rp) = rpit.as_deref_mut() {
+                            let Ok(cap_start) = u32::try_from(rp.caps.len()) else { return self.refuse(Form::Bound, e) };
+                            for &r in mine {
+                                if let Some(rr) = bound_region(frame.binds.as_deref(), r) {
+                                    rp.caps.push(rr);
+                                }
+                            }
+                            let Ok(cap_end) = u32::try_from(rp.caps.len()) else { return self.refuse(Form::Bound, e) };
+                            let cap_len = cap_end.saturating_sub(cap_start);
+                            let Ok(gid) = u32::try_from(rp.groups.len()) else { return self.refuse(Form::Bound, e) };
+                            rp.groups.push((cap_start, cap_len));
+                            for _ in 0..n {
+                                let Ok(slot_idx) = u32::try_from(out.len()) else { return self.refuse(Form::Bound, e) };
+                                rp.slots.push((slot_idx, gid));
+                                out.push(None);
+                            }
+                        } else {
+                            for _ in 0..n {
+                                out.push(None);
+                            }
+                        }
+                        continue;
+                    }
+                    PNode::FnDef(..) | PNode::Param(_) => {}
                     _ => {
                         aligned = false;
                         break;
@@ -448,6 +493,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                 Some((trait_, b, before)) => {
                     if !ok {
                         out.truncate(before);
+                        if let Some(rp) = rpit.as_deref_mut() {
+                            rp.slots.retain(|&(slot, _)| usize::try_from(slot).is_ok_and(|s| s < before));
+                        }
                         self.coarse_step(Form::ProjectionUnbound { trait_, why: ProjectionUnbound::ValueUnaligned }, e);
                         let n = match body.count(b) {
                             Ok(n) => n.get(),
