@@ -656,6 +656,7 @@ fn new_rules_are_off_until_named() {
         Rule::UnusedImport,
         Rule::UnusedMut,
         Rule::HeapLeak,
+        Rule::ParallelVecs,
     ] {
         assert!(!Step::Strict.rules().runs(rule), "{} runs in strict", rule.name());
         assert!(Step::Strict.rules().with(rule).runs(rule));
@@ -2611,6 +2612,45 @@ fn heap_leak_flags_leak_and_allows_root_and_bump() {
         "fn f(frame: &Frame) { let _ = s.into_bump_str(); }",
         "fn f(root: Root) { let _ = Root::leak(root); }",
         "#[test]\nfn t() { let _ = v.leak(); }",
+    ]);
+}
+
+#[test]
+fn parallel_vecs_flags_adjacent_avecs_and_struct_fields() {
+    let rule = Rule::ParallelVecs;
+    let only = RuleSet::only(&[rule]);
+    assert_eq!(rule.name(), "parallel-vecs");
+    assert_eq!(Rule::from_name("parallel-vecs"), Some(rule));
+    assert_eq!(rule.lint(), Some("parallel_vecs"));
+    assert_eq!(Rule::from_lint("parallel_vecs"), Some(rule));
+    assert_eq!(Template::ParallelVecs.rule(), rule);
+
+    let locals = "\
+fn build<'b>(alloc: Alloc<'b>) {
+    let mut m_code: AVec<'b, u64> = AVec::new_in(alloc);
+    let mut m_outline: AVec<'b, u64> = AVec::new_in(alloc);
+    let mut m_name_at: AVec<'b, u64> = AVec::new_in(alloc);
+    let mut m_meta: AVec<'b, u64> = AVec::new_in(alloc);
+}";
+    let hits = found(&only, locals, FILE);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].0, "parallel-vecs");
+    assert!(hits[0].1.contains("m_code") && hits[0].1.contains("m_meta"));
+
+    let fields = "\
+struct Columns<'a> {
+    pub code: AVec<'a, u64>,
+    pub outline: AVec<'a, u64>,
+    pub name_at: blaze_own::Vec<u64, Alloc<'a>>,
+}";
+    let field_hits = found(&only, fields, FILE);
+    assert_eq!(field_hits.len(), 1);
+    assert_eq!(field_hits[0].0, "parallel-vecs");
+
+    none(rule, &[
+        "fn f(alloc: Alloc<'_>) { let mut a: AVec<'_, u64> = AVec::new_in(alloc); let mut b: AVec<'_, u64> = AVec::new_in(alloc); }",
+        "struct Two<'a> { a: AVec<'a, u64>, b: AVec<'a, u64>, c: u64 }",
+        "fn f(alloc: Alloc<'_>) { let a = AVec::new_in(alloc); let x = 1; let b = AVec::new_in(alloc); let y = 2; let c = AVec::new_in(alloc); }",
     ]);
 }
 

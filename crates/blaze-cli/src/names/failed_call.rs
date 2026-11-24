@@ -48,7 +48,7 @@ where
         return own;
     }
     let mut calls: blaze_own::AVec<'b, blaze_id::ItemKey> = blaze_own::AVec::new_in(bump.alloc());
-    calls.extend(c.expansions.iter().filter(|(_, e)| e.refused.is_some()).map(|(call, _)| *call));
+    calls.extend(c.expansions.iter().filter(|(_, e)| e.refused().is_some()).map(|(call, _)| *call));
     calls.sort_unstable();
     for call in calls.iter() {
         let Some(row) = blaze_scope::names_record::refused_row(c, *call, bump) else { continue };

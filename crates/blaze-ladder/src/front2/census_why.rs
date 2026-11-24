@@ -363,7 +363,7 @@ fn header_path<'n>(names: &'n Names<'n>, impl_: LibKey, why: &str, block: &mut W
         }
         let state = match c.expansions.get(&key) {
             None => "NEVER MADE (no expansion filed)",
-            Some(e) if e.refused.is_some() => "REFUSED",
+            Some(e) if e.refused().is_some() => "REFUSED",
             Some(e) if e.made.is_none() => "MADE NO TEXT",
             Some(_) => {
                 expanded += 1;
@@ -374,7 +374,7 @@ fn header_path<'n>(names: &'n Names<'n>, impl_: LibKey, why: &str, block: &mut W
         let _ = write!(line, "call `{}` ({}) at ", call.name, shape(call.kind));
         loc_line(c, call.loc, &mut line);
         let _ = write!(line, ": {state}");
-        if let Some(r) = c.expansions.get(&key).and_then(|e| e.refused.as_ref()) {
+        if let Some(r) = c.expansions.get(&key).and_then(|e| e.refused()) {
             let _ = write!(line, ": {}", r.why.text());
         }
         line.push_str("; its path ");
@@ -407,7 +407,7 @@ fn header_path<'n>(names: &'n Names<'n>, impl_: LibKey, why: &str, block: &mut W
         loc_line(c, call.loc, &mut line);
         match c.expansions.get(&key) {
             None => line.push_str(": never made"),
-            Some(e) => match (e.refused.as_ref(), e.made) {
+            Some(e) => match (e.refused(), e.made) {
                 (Some(r), _) => {
                     let _ = write!(line, ": refused: {}", r.why.text());
                 }

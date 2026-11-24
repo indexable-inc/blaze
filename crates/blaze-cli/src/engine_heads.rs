@@ -537,6 +537,21 @@ impl HeadsStage {
         self.made.binary_search_by_key(&name, |one| one.name).ok().map(|at| &self.made[at])
     }
 
+    /// Releases `name`'s handed payload bytes once `put_phase` has committed them to the store
+    /// (rule 51): keeps the `Made` header so `engine_head_notes` still knows the task ran.
+    pub(crate) fn release_payload(&mut self, name: Name) -> usize {
+        let Ok(at) = self.made.binary_search_by_key(&name, |one| one.name) else {
+            return 0;
+        };
+        let Some(one) = self.made.get_mut(at) else {
+            return 0;
+        };
+        let freed = one.payload.len();
+        one.payload.clear();
+        one.payload.shrink_to_fit();
+        freed
+    }
+
     /// The Heads phase: every task entered once, its result in `buffer`, its tables on `shelf`.
     #[expect(clippy::too_many_arguments, reason = "a phase's edge: each argument one handle of it")]
     pub(crate) fn run_phase<'a, 'r, 'l>(

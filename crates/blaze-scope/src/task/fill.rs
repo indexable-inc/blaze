@@ -144,6 +144,12 @@ pub trait Par {
     fn block_scopes(&self) -> crate::surface::BlockScopes {
         crate::surface::BlockScopes::Modules
     }
+
+    /// Whether to populate `Tables::by_place` (only in-memory `Names::item_at` / `blaze-ladder`
+    /// link tests read it; record-based `crate_scope` builds skip it to save ~15–20 MB on `core`).
+    fn track_by_place(&self) -> bool {
+        true
+    }
 }
 
 /// A planted bug of D116's on-demand decision ([`Par::decide_plant`]): a control, never the

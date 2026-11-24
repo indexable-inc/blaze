@@ -140,7 +140,7 @@ fn a_run_the_sandbox_stopped_is_refused_by_the_path_it_named() {
     let show = user
         .expansions
         .iter()
-        .filter(|(_, e)| e.refused.is_some())
+        .filter(|(_, e)| e.refused().is_some())
         .filter_map(|(call, _)| record.failed(*call, bump).unwrap_or_else(|e| panic!("failed: {e:?}")))
         .find(|row| row.path == "procs::Show")
         .unwrap_or_else(|| panic!("the derive `procs::Show` has a row"));
@@ -172,7 +172,7 @@ fn every_refused_call_leaves_a_row_that_reads_back() {
     let written = encode(user, alloc).unwrap_or_else(|e| panic!("encode: {e:?}"));
     let record = NamesRecord::open(Verified::check(aligned(&written, bump)).unwrap_or_else(|e| panic!("check: {e:?}")));
 
-    let mut refused: Vec<ItemKey> = user.expansions.iter().filter(|(_, e)| e.refused.is_some()).map(|(k, _)| *k).collect();
+    let mut refused: Vec<ItemKey> = user.expansions.iter().filter(|(_, e)| e.refused().is_some()).map(|(k, _)| *k).collect();
     refused.sort_unstable();
     let mut rows: Vec<FailedRow<'_>> = Vec::new();
     for call in refused {

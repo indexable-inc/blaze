@@ -80,9 +80,9 @@ fn split_of(names: &CrateNames<'_>, alloc: blaze_own::Bump<'static>) -> (Split<'
 }
 
 /// The record `key` of `split`, opened.
-fn record<'s>(split: &'s Split<'_>, key: ContentId) -> ExpansionRecord<'s> {
+fn record<'s>(split: &'s Split<'s>, key: ContentId) -> ExpansionRecord<'s> {
     let at = split.records.binary_search_by_key(&key, |r| r.key).unwrap_or_else(|_| panic!("the split holds record {key:?}"));
-    ExpansionRecord::open(&split.records[at].bytes).unwrap_or_else(|e| panic!("record {key:?} opens: {e}"))
+    ExpansionRecord::open_in(&split.records[at].bytes, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("record {key:?} opens: {e}"))
 }
 
 /// Rule: 50 calls of one macro with equal input name ONE expansion record, from 50 directory
@@ -110,7 +110,7 @@ fn equal_calls_share_one_expansion_record() {
     }
     // The call part: 64 fixed bytes and the path `many`, padded to 4.
     assert_eq!(call_part, 64 + 4, "a call part is the fixed words and the path");
-    let bound = 16 + MODULES * (DIRECTORY_ROW + 68);
+    let bound = 16 + 32 + MODULES * (DIRECTORY_ROW + 68);
     assert!(split.directory.len() <= bound, "the directory is {} bytes, over {bound}", split.directory.len());
     let old: usize = 16 + names.expansions.iter().filter_map(|(_, e)| e.made).map(|m| 48 + m.text.len() + m.origins.map_or(0, |o| o.len())).sum::<usize>();
     let new = split.directory.len() + split.records[0].bytes.len();

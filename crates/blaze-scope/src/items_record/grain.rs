@@ -69,6 +69,9 @@ impl<'a> ItemsRecord<'a> {
             return Err(short);
         }
         let base = self.field(F_GRAIN_AT) as usize;
+        if base == 0 {
+            return Err(short);
+        }
         let Some(r) = i.checked_mul(GRAIN_ROW).and_then(|o| base.checked_add(o)).filter(|r| r.checked_add(GRAIN_ROW).is_some_and(|end| end <= self.bytes.len())) else {
             return Err(short);
         };

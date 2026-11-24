@@ -115,7 +115,7 @@ blaze-rng	3
 blaze-roots	24
 blaze-run	273
 blaze-rungs	2
-blaze-scope	1688
+blaze-scope	1675
 blaze-screen	30
 blaze-script	91
 blaze-semver	9
@@ -130,7 +130,7 @@ blaze-squeeze	112
 blaze-stage	39
 blaze-std	622
 blaze-store-check	9
-blaze-surface	205
+blaze-surface	203
 blaze-swiss	38
 blaze-sys	38
 blaze-tar	28

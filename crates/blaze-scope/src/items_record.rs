@@ -85,7 +85,11 @@ const MAGIC: [u8; 4] = *b"BZIT";
 /// 14: columnar encoding (`blaze_columns::enc`) for item, member, impl, bucket and variant
 /// tables (O(1) in-place reads, zero-byte elision for all-default sparse columns, deduplicated
 /// 32-byte ID dictionaries); a version-13 record is refused the same way.
-const VERSION: u32 = 14;
+/// 15: 24-byte crate-prefix-stripped keys in `T_ITEMS`/`T_MEMBERS`/`T_IMPLS`, 8-byte `owners`
+/// index rows (`(owner_row, member_row)`), and optional `grain` section (`F_GRAIN_AT == 0` when
+/// omitted for non-Surface dependency crates); a version-14 record is refused the same way.
+const VERSION: u32 = 15;
+const KEY_TAIL: usize = 24;
 const ALIGN: usize = 16;
 const HEADER: usize = 256;
 const KEYS_AT: usize = 160;
@@ -619,7 +623,14 @@ struct ImplOut<'s> {
 /// names is in the unfiled list (`TraitNotRead`, `SelfNotRead`), which a reader files itself.
 /// A caller that holds the names of the crate's dependencies calls [`encode_with`].
 pub fn encode<'n, 'b>(names: &'n CrateNames<'_>, alloc: Alloc<'b>) -> Result<RecordBytes<'b>, ItemsRecordError> {
-    encode_with(names, &buckets::OwnNames(names), alloc)
+    encode_with_opts(names, &buckets::OwnNames(names), true, alloc)
+}
+
+/// [`encode`], optionally omitting the `grain` section (`include_grain = false` for non-Surface
+/// toolchain/registry crates that never have `SignatureFile` subjects, saving ~6 MB and ~130k
+/// item-chain BLAKE3 hashes on `core`/`alloc`/`std`).
+pub fn encode_for<'n, 'b>(names: &'n CrateNames<'_>, include_grain: bool, alloc: Alloc<'b>) -> Result<RecordBytes<'b>, ItemsRecordError> {
+    encode_with_opts(names, &buckets::OwnNames(names), include_grain, alloc)
 }
 
 /// [`encode`], its bucket index resolved by `heads`: the names every impl header's trait path
@@ -628,6 +639,10 @@ pub fn encode<'n, 'b>(names: &'n CrateNames<'_>, alloc: Alloc<'b>) -> Result<Rec
 /// solve's answers AND of what `heads` answers for the crate's impl headers: a key or read
 /// list the record is kept under must cover the names `heads` reads (rule 21).
 pub fn encode_with<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>, heads: &H, alloc: Alloc<'b>) -> Result<RecordBytes<'b>, ItemsRecordError> {
+    encode_with_opts(names, heads, true, alloc)
+}
+
+pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>, heads: &H, include_grain: bool, alloc: Alloc<'b>) -> Result<RecordBytes<'b>, ItemsRecordError> {
     let mut strings: Strings<'b, 'n> = Strings::new(alloc);
     let tables = &names.tables;
 
@@ -756,7 +771,8 @@ pub fn encode_with<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>, hea
             let (trait_path, self_path) = (strings.put(i.trait_path)?, strings.put(i.self_path)?);
             let (head, arity) = i.head.byte();
             let roots = (if i.trait_root.is_some() { ROOT_TRAIT } else { 0 }) | (if i.self_root.is_some() { ROOT_SELF } else { 0 });
-            impl_rows.extend_from_slice(&i.key.0.0);
+            debug_assert_eq!(i.key.0.0[..8], names.key.prefix());
+            impl_rows.extend_from_slice(&i.key.0.0[8..]);
             buf.push(cols::ImplCol {
                 module: u64::from(module_at(i.module)?),
                 trait_at: u64::from(trait_path.0),
@@ -825,7 +841,8 @@ pub fn encode_with<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>, hea
             };
             let name_len = u16::try_from(name.1).map_err(|_| ItemsRecordError::TooBig { what: "an item's name" })?;
             let lifetimes = lifetimes_field(*key, detail, it.text, names.edition)?;
-            item_rows.extend_from_slice(&key.0.0);
+            debug_assert_eq!(key.0.0[..8], names.key.prefix());
+            item_rows.extend_from_slice(&key.0.0[8..]);
             buf.push(cols::ItemCol {
                 module: u64::from(module_at(it.module)?),
                 code: u64::from(code),
@@ -903,7 +920,8 @@ pub fn encode_with<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>, hea
             }
             let name_len = u16::try_from(name.1).map_err(|_| ItemsRecordError::TooBig { what: "a member's name" })?;
             let lifetimes = lifetimes_field(m.key, m.detail, m.text, names.edition)?;
-            member_keys.extend_from_slice(&m.key.0.0);
+            debug_assert_eq!(m.key.0.0[..8], names.key.prefix());
+            member_keys.extend_from_slice(&m.key.0.0[8..]);
             member_buf.push(cols::MemberCol {
                 code: u64::from(code),
                 outline: u64::from(m.item.0),
@@ -1054,7 +1072,9 @@ pub fn encode_with<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>, hea
         out.extend_from_slice(s);
     }
     out.extend_from_slice(&strings.bytes);
-    grain::append(&mut out, names, &items)?;
+    if include_grain {
+        grain::append(&mut out, names, &items)?;
+    }
     owners::append(&mut out, &mut owned)?;
     variants::append(&mut out, &tables.enums, alloc)?;
     // In the impl table's order: row `i`'s filing at index `i`.
@@ -1130,7 +1150,7 @@ fn impl_out<'n, 'x: 'n, H: buckets::HeadNames>(heads: &H, krate: CrateItemKey, e
 /// [`crate::resolve::Expansion::refused`]).
 pub fn each_refused_impl_row<'n, 'x: 'n>(names: &'n CrateNames<'x>, each: &mut dyn FnMut(ImplRow<'n>)) {
     for (call, expansion) in names.expansions.iter() {
-        if expansion.refused.is_none() {
+        if expansion.refused().is_none() {
             continue;
         }
         // A refused call the lowering does not know has no shape to read: not a derive.
@@ -1543,7 +1563,7 @@ impl<'a> ItemsCols<'a> {
         if count == 0 {
             return Ok(Self::empty());
         }
-        let Some(keys_bytes) = count.checked_mul(32) else {
+        let Some(keys_bytes) = count.checked_mul(KEY_TAIL) else {
             return Err(ItemsRecordError::Short { what: "item rows", at: base });
         };
         let (keys, [c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11]) = cols::read_dir::<12>(bytes, base, keys_bytes, "item rows")?;
@@ -1593,7 +1613,7 @@ impl<'a> MembersCols<'a> {
         if count == 0 {
             return Ok(Self::empty());
         }
-        let Some(keys_bytes) = count.checked_mul(32) else {
+        let Some(keys_bytes) = count.checked_mul(KEY_TAIL) else {
             return Err(ItemsRecordError::Short { what: "member rows", at: base });
         };
         let (keys, [c0, c1, c2, c3, c4, c5]) = cols::read_dir::<6>(bytes, base, keys_bytes, "member rows")?;
@@ -1643,7 +1663,7 @@ impl<'a> ImplsCols<'a> {
         if count == 0 {
             return Ok(Self::empty());
         }
-        let Some(keys_bytes) = count.checked_mul(32) else {
+        let Some(keys_bytes) = count.checked_mul(KEY_TAIL) else {
             return Err(ItemsRecordError::Short { what: "impl rows", at: base });
         };
         let (keys, [c0, c1, c2, c3, c4, c5, c6, c7, c8]) = cols::read_dir::<9>(bytes, base, keys_bytes, "impl rows")?;
@@ -1826,19 +1846,35 @@ impl<'a> ItemsRecord<'a> {
         self.offsets[t] + i * WIDTHS[t]
     }
 
-    /// The row of table `t` keyed `key` (its first 32 bytes): [`find_keyed`] over the table's
-    /// rows, which `open` checked lie inside the bytes.
+    /// The row of table `t` keyed `key`: [`find_keyed`] over the table's rows, which `open`
+    /// checked lie inside the bytes. `T_ITEMS` stores 24-byte suffixes under `self.key.prefix()`.
     fn find(&self, t: usize, key: ItemKey) -> Option<usize> {
         if t == T_ITEMS {
-            return find_keyed(self.item_cols.keys, 32, &key.0.0);
+            if key.0.0[..8] != self.key.prefix() {
+                return None;
+            }
+            return blaze_format::rows::find_row(self.item_cols.keys, KEY_TAIL, 0, &key.0.0[8..]).ok();
         }
         let start = self.offsets[t];
         find_keyed(&self.bytes[start..start + self.counts[t] * WIDTHS[t]], WIDTHS[t], &key.0.0)
     }
 
     #[inline]
+    fn tail_at<'b>(keys: &'b [u8], i: usize) -> &'b [u8] {
+        keys.get(i * KEY_TAIL..i * KEY_TAIL + KEY_TAIL).unwrap_or(&[0u8; KEY_TAIL])
+    }
+
+    #[inline]
+    fn key_from_tail(&self, tail: &[u8]) -> ItemKey {
+        let mut out = [0u8; 32];
+        out[..8].copy_from_slice(&self.key.prefix());
+        out[8..].copy_from_slice(tail);
+        ItemKey(ContentId(out))
+    }
+
+    #[inline]
     pub(super) fn item_key(&self, i: usize) -> ItemKey {
-        key_at(self.item_cols.keys, i * 32)
+        self.key_from_tail(Self::tail_at(self.item_cols.keys, i))
     }
 
     #[inline]
@@ -1851,9 +1887,19 @@ impl<'a> ItemsRecord<'a> {
         ItemIndex(self.item_cols.outline.get_u32(i))
     }
 
+    /// The current FileItems body hash of `outline` in `file` without touching the `grain` section.
+    pub fn file_body_hash(&self, file: u32, outline: ItemIndex) -> Result<ContentId, ItemsRecordError> {
+        Ok(self.file_entry(file, outline)?.1.hash)
+    }
+
+    #[inline]
+    pub(super) fn member_key_tail(&self, k: usize) -> &'a [u8] {
+        Self::tail_at(self.member_cols.keys, k)
+    }
+
     #[inline]
     pub(super) fn member_key(&self, k: usize) -> ItemKey {
-        key_at(self.member_cols.keys, k * 32)
+        self.key_from_tail(self.member_key_tail(k))
     }
 
     #[inline]
@@ -1864,7 +1910,7 @@ impl<'a> ItemsRecord<'a> {
 
     #[inline]
     pub(super) fn impl_bucket_fields(&self, row: usize) -> (ItemKey, u8, u8) {
-        let key = key_at(self.impl_cols.keys, row * 32);
+        let key = self.key_from_tail(Self::tail_at(self.impl_cols.keys, row));
         let meta = self.impl_cols.meta.get(row);
         let head = u8::try_from((meta >> 32) & 0xff).unwrap_or(0);
         let marks = u8::try_from((meta >> 40) & 0xff).unwrap_or(0);
@@ -2176,7 +2222,7 @@ impl<'a> ItemsRecord<'a> {
             return Ok(None);
         }
         let c = self.impl_cols;
-        let key = key_at(c.keys, i * 32);
+        let key = self.key_from_tail(Self::tail_at(c.keys, i));
         let meta = c.meta.get(i);
         let bits = u32::try_from(meta & 0xffff_ffff).unwrap_or(0);
         let head_byte = u8::try_from((meta >> 32) & 0xff).unwrap_or(0);

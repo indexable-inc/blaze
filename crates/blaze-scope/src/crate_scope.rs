@@ -1368,6 +1368,10 @@ impl<P: Par> Par for OfMembers<'_, P> {
     fn block_scopes(&self) -> crate::surface::BlockScopes {
         self.par.block_scopes()
     }
+
+    fn track_by_place(&self) -> bool {
+        self.par.track_by_place()
+    }
 }
 
 /// `par` with D189's seam set to `scopes` ([`Par::block_scopes`]), for a whole-crate solve:
@@ -1412,6 +1416,10 @@ impl<P: Par> Par for Strategy<'_, P> {
 
     fn tree_record_read(&self, bytes: usize) {
         self.par.tree_record_read(bytes);
+    }
+
+    fn track_by_place(&self) -> bool {
+        self.par.track_by_place()
     }
 
     fn block_scopes(&self) -> crate::surface::BlockScopes {

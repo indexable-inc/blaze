@@ -91,8 +91,8 @@ pub(crate) fn solve_and_write<'a, F: ScopeFacts<Name = &'a str>>(
     places: &dyn Fn(ItemKey) -> Option<(ItemKey, u32)>,
     root: ItemKey,
     expand: &dyn Fn(ItemKey, Def),
-    made: &dyn Fn(&mut AVec<'a, ItemKey>),
-    held: &dyn Fn(&mut AVec<'a, (ItemKey, u32)>),
+    made: &dyn Fn(&mut AVec<'_, ItemKey>),
+    held: &dyn Fn(&mut AVec<'_, (ItemKey, u32)>),
     check: Option<&dyn Fn() -> u64>,
     plant: crate::task::DecidePlant,
     groups: bool,
@@ -141,7 +141,7 @@ pub(crate) fn solve_and_write<'a, F: ScopeFacts<Name = &'a str>>(
         // after the rest, round by round, until a run makes none.
         let mut rounds = 0u32;
         loop {
-            let mut extra: AVec<'a, ItemKey> = AVec::new_in(out_alloc);
+            let mut extra: AVec<'_, ItemKey> = AVec::new_in(solver_alloc);
             made(&mut extra);
             extra.retain(|k| !c.by_key.contains_key(k));
             if extra.is_empty() {
@@ -171,7 +171,7 @@ pub(crate) fn solve_and_write<'a, F: ScopeFacts<Name = &'a str>>(
             c.run(facts, expand, &[]).map_err(Unwritten::Run)?;
         }
         // Each held body's cut of its module's textual sequence, over the final fragments.
-        let mut at: AVec<'a, (ItemKey, u32)> = AVec::new_in(out_alloc);
+        let mut at: AVec<'_, (ItemKey, u32)> = AVec::new_in(solver_alloc);
         held(&mut at);
         at.sort_unstable();
         at.dedup();
@@ -188,7 +188,8 @@ pub(crate) fn solve_and_write<'a, F: ScopeFacts<Name = &'a str>>(
         let mut keys: AVec<'_, ItemKey> = AVec::with_capacity_in(c.modules.len(), solver_alloc);
         keys.extend(c.modules.iter().filter(|m| !m.foreign && !m.unread && m.text != FragId::MAX).map(|m| m.key));
         keys.sort_unstable();
-        let mut done: HashMap<ItemKey, Resolved<'a, &'a str>, Alloc<'a>> = HashMap::new_in(out_alloc);
+        let extra_recorded = records.as_ref().map_or(0, |r| r.recorded.borrow().len());
+        let mut done: HashMap<ItemKey, Resolved<'a, &'a str>, Alloc<'a>> = HashMap::with_capacity_in(keys.len() + extra_recorded, out_alloc);
         for &k in keys.iter() {
             let Some((scope, unknown)) = c.scope(&ix, k, out_alloc) else { continue };
             if unknown > 0 {

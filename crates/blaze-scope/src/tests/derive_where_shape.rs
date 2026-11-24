@@ -137,7 +137,7 @@ fn derive_where_s_struct_is_declared_through_its_two_expansions() {
         .expansions
         .iter()
         .filter(|&(k, _)| user.tables.calls.get(k).is_some_and(|c| c.depth == 0))
-        .flat_map(|(_, e)| e.decls.calls.iter().map(|c| (c.kind, c.path.segments.join("::"), c.role)))
+        .flat_map(|(_, e)| e.decls().into_iter().flat_map(|d| d.calls.iter()).map(|c| (c.kind, c.path.segments.join("::"), c.role)))
         .collect();
     // The `derive_where` attribute calls that made text: run as the macro, not inert as the helper.
     let attr_runs = user

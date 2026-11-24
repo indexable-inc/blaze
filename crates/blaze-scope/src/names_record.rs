@@ -139,12 +139,12 @@ where
     'n: 'b,
 {
     let expansion = names.expansions.get(&call)?;
-    expansion.refused?;
+    expansion.refused()?;
     let src = names.tables.calls.get(&call);
     let (path, shape, implicit) = src.map_or(("", CallShape::FnLike, false), |s| (s.name, s.kind, s.implicit));
     let file = src.and_then(|s| names.files.get(s.loc.file as usize)).map_or("", |f| f.shown);
     let on = src.and_then(|s| s.on).unwrap_or("");
-    let why = match expansion.refused_by {
+    let why = match expansion.refused_by() {
         Some((ExpandNote::Failed { failed, .. }, _)) => CallRefusal::Failed(failed),
         Some((note, env)) => {
             let (kind, words) = crate::call_refusal::words_of(&note, env, alloc.alloc());
@@ -160,19 +160,19 @@ where
 /// call key at this boundary (rule 25).
 fn failed_section<'b>(names: &CrateNames<'_>, alloc: Alloc<'b>) -> Result<RecordBytes<'b>, NamesRecordError> {
     let mut keys: AVec<'b, ItemKey> = AVec::new_in(alloc);
-    keys.extend(names.expansions.iter().filter(|(_, e)| e.refused.is_some()).map(|(call, _)| *call));
+    keys.extend(names.expansions.iter().filter(|(_, e)| e.refused().is_some()).map(|(call, _)| *call));
     keys.sort_unstable();
     let mut calls = AVec::with_capacity_in(keys.len(), alloc);
     for call in keys.iter() {
         let Some(expansion) = names.expansions.get(call) else { continue };
-        if expansion.refused.is_none() {
+        if expansion.refused().is_none() {
             continue;
         }
         let src = names.tables.calls.get(call);
         let (path, shape, implicit) = src.map_or(("", CallShape::FnLike, false), |s| (s.name, s.kind, s.implicit));
         let file = src.and_then(|s| usize::try_from(s.loc.file).ok()).and_then(|idx| names.files.get(idx)).map_or("", |f| f.shown);
         let on = src.and_then(|s| s.on).unwrap_or("");
-        let (kind, reason) = match expansion.refused_by {
+        let (kind, reason) = match expansion.refused_by() {
             Some((ExpandNote::Failed { failed, .. }, _)) => (RefusalKind::Failed, failed.write_record(alloc)),
             Some((note, env)) => {
                 let (kind, words) = crate::call_refusal::words_of(&note, env, alloc);

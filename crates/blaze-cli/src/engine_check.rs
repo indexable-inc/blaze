@@ -3762,7 +3762,7 @@ where
         // reads hit committed file-backed segment mappings with zero `kept_arenas` pinning.
         store.flush_puts()?;
     }
-    let phase = match prior.or_else(|| mixed.map(|task| task.planned.phase)) {
+    let mut phase = match prior.or_else(|| mixed.map(|task| task.planned.phase)) {
         Some(phase) => phase,
         None => match engine.next_phase()? { Some(phase) => phase, None => return Ok(false) },
     };
@@ -3788,7 +3788,8 @@ where
     rq.times.coordinator(Coordinator::Planning, ns(planning.since_start()), ns(began.since_start()));
     // The Bodies phase's run facts, in this phase's arena: made by `run_phase`, copied into the
     // put below, dropped with the phase's other buffers.
-    let phase_facts = run_stage(rq, engine, store, read, records, pipeline, last_lines, stored, files, phase, mixed, &mut entered, at_phase, heads_snap, heads_lazy)?;
+    let phase_facts = run_stage(rq, engine, store, read, records, pipeline, last_lines, stored, files, &mut phase, mixed, &mut entered, at_phase, heads_snap, heads_lazy)?;
+    *rq.active = Some(phase);
     // Pipelined: the coordinator filed finished Scripts and Names tasks in order; else it ran
     // the phase whole (its pool joined).
     let what = if mixed.is_some() { Coordinator::Filing } else { Coordinator::Phase };
@@ -4254,7 +4255,7 @@ fn run_stage<'d, 'f, 'r, 's, 'w, 'm, 'p, 'l>(
     last_lines: Option<&crate::engine_lines::Last<'_, '_>>,
     stored: Option<&crate::engine_answer::Stored<'_>>,
     files: &[(Name, &[Planned])],
-    phase: Phase,
+    phase: &mut Phase,
     mixed: Option<Task>,
     entered: &mut SVec<'_, Task>,
     at_phase: SharedAlloc<'p>,
@@ -4274,7 +4275,7 @@ where
     match (mixed, phase.stage) {
         (Some(first), _) => {
             let stage = rq.names.as_mut().ok_or(EngineCheckError::MissingEntry { task: first.planned.name, table: Table::NamesWorld, key: first.planned.name })?;
-            pipeline.collect(cx, &mut *rq.scripts, stage, &mut *store, rq.handles, first, entered, &mut rq.buffers[0], &mut *rq.times, alloc, frame)?;
+            *phase = pipeline.collect(cx, &mut *rq.scripts, stage, &mut *store, rq.handles, entered, &mut rq.buffers[0], &mut *rq.times, alloc, frame)?;
         }
         (None, Stage::Outlines) => outlines_phase(rq, engine, &entered[..])?,
         (None, Stage::Units) => {
@@ -5692,10 +5693,10 @@ fn put_phase<'m>(
     }
     rq.puts += put_now;
     // Written now, so the store's arena frees them: the next phase reads them in place from the
-    // segment's mapping (rule 51; store.rs `commit_puts`). Flush at the end of `Stage::Heads`
-    // so `Heads`'s final arena frees before `Bodies` allocates and `Bodies` reads committed
-    // segment mappings with zero `kept_arenas` pinning.
-    let flush_stage_end = phase.stage == Stage::Heads && !engine.has_pending_stage(Stage::Heads);
+    // segment's mapping (rule 51; store.rs `commit_puts`). Flush at the end of `Stage::Names` and
+    // `Stage::Heads` so each stage's final arena frees before the next stage allocates and later
+    // stages read committed file-backed segment mappings with zero `kept_arenas` pinning.
+    let flush_stage_end = matches!(phase.stage, Stage::Names | Stage::Heads) && !engine.has_pending_stage(phase.stage);
     if put_now > 0 || flush_stage_end {
         {
             let _cx = cx.span("store: a phase's commit on the command thread (batch copy, layout copy, segment digest, flip, map)");
@@ -5715,12 +5716,17 @@ fn put_phase<'m>(
     // its findings and lines, never its bytes; a later phase reads the store.
     for task in entered.iter() {
         let name = task.planned.name;
-        let result = match phase.stage {
-            Stage::Names => rq.names.as_mut().and_then(|stage| stage.results.iter_mut().rev().find(|one| one.name == name)),
-            Stage::Scripts => rq.scripts.results.iter_mut().find(|one| one.name == name),
-            Stage::Units | Stage::Outlines | Stage::Heads | Stage::Bodies | Stage::Lints => None,
+        let freed = match phase.stage {
+            Stage::Names => rq.names.as_mut()
+                .and_then(|stage| stage.results.iter_mut().rev().find(|one| one.name == name))
+                .and_then(|one| one.made.as_mut().ok())
+                .map_or(0, |record| record.release_handed()),
+            Stage::Scripts => rq.scripts.results.iter_mut().find(|one| one.name == name)
+                .and_then(|one| one.made.as_mut().ok())
+                .map_or(0, |record| record.release_handed()),
+            Stage::Heads => rq.heads.release_payload(name),
+            Stage::Units | Stage::Outlines | Stage::Bodies | Stage::Lints => 0,
         };
-        let freed = result.and_then(|one| one.made.as_mut().ok()).map_or(0, |record| record.release_handed());
         rq.ledger.released(phase.stage, freed);
     }
     rq.ledger.merged(phase.stage, crate::store::Store::kept(&*store));

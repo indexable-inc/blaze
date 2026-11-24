@@ -193,7 +193,7 @@ impl<'c, 'a: 'c> WaitsOn<'c, 'a> {
     fn form(&self, module: ItemKey, site: UseSite) -> Option<UseForm<&'a str>> {
         let uses = match site.expansion {
             None => &self.names.decls.get(&module)?.1.uses,
-            Some(call) => &self.names.expansions.get(&call)?.decls.uses,
+            Some(call) => &self.names.expansions.get(&call)?.decls()?.uses,
         };
         uses.get(site.index as usize).map(|it| it.leaf)
     }

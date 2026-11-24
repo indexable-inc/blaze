@@ -61,6 +61,25 @@ pub trait ScopeFacts {
         let _ = (module, out);
         false
     }
+
+    /// Borrows `module`'s declarations for `f` without cloning into the crate's frame when the
+    /// backing store already holds them in memory (`resolve::Facts`).
+    fn with_decls<R>(&self, module: ItemKey, f: impl FnOnce(&DeclsBuilder<'_, Self::Name>) -> R) -> Result<R, SurfaceError> {
+        let d = self.decls(module)?;
+        Ok(f(&d))
+    }
+
+    /// Borrows `krate`'s root record for `f` without cloning when held in memory.
+    fn with_crate_root<R>(&self, krate: CrateItemKey, f: impl FnOnce(&CrateRootBuilder<'_, Self::Name>) -> R) -> Result<R, SurfaceError> {
+        let r = self.crate_root(krate)?;
+        Ok(f(&r))
+    }
+
+    /// Borrows `call`'s expanded declarations for `f` without cloning when held in memory.
+    fn with_expansion<R>(&self, call: ItemKey, f: impl FnOnce(Option<&ExpandedDecls<'_, Self::Name>>) -> R) -> Result<R, SurfaceError> {
+        let e = self.expansion(call)?;
+        Ok(f(e.as_ref()))
+    }
 }
 
 /// [`ScopeFacts`] over the records an [`Items`] reads: names are the records' string-table

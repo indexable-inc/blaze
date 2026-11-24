@@ -395,14 +395,18 @@ byte_enum! {
     }
 }
 
+/// Sentinel `vis_key` table index for `Visibility::Public` (and any visibility with no key).
+pub(crate) const NO_VIS_KEY: u16 = u16::MAX;
+
 blaze_format::record! {
+    /// Form 2: `vis_key` is a `u16` index into `ModuleScopeRoot::vis_keys` (`NO_VIS_KEY` for
+    /// public), shrinking each binding row from 84 to 52 bytes (-38%).
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-    pub(crate) struct BindingRow: 1 {
+    pub(crate) struct BindingRow: 2 {
         pub(crate) name: Text,
         pub(crate) def: ContentId,
-        pub(crate) vis_key: ContentId,
         pub(crate) expansion: u16,
-        pub(crate) pad: u16,
+        pub(crate) vis_key: u16,
         pub(crate) ns: Namespace,
         pub(crate) origin: Origin,
         pub(crate) def_kind: DefKindTag,
@@ -410,7 +414,7 @@ blaze_format::record! {
         pub(crate) vis: VisibilityTag,
         pub(crate) state: StateTag,
         pub(crate) ambiguity: AmbiguityKind,
-        pub(crate) pad2: u8,
+        pub(crate) pad: u8,
     }
 }
 
@@ -459,25 +463,26 @@ blaze_format::record! {
 
 blaze_format::record! {
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-    pub(crate) struct TraitRow: 1 {
+    pub(crate) struct TraitRow: 2 {
         pub(crate) index: u32,
         pub(crate) expansion: ContentId,
         pub(crate) def: ContentId,
-        pub(crate) vis_key: ContentId,
+        pub(crate) vis_key: u16,
         pub(crate) def_kind: DefKindTag,
         pub(crate) shape: MacroShapes,
         pub(crate) vis: VisibilityTag,
-        pub(crate) pad: u8,
+        pub(crate) pad0: u8,
+        pub(crate) pad1: u16,
     }
 }
 
 blaze_format::record! {
     /// One glob edge: the module or enum a `use ..::*` of the scope imports from.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-    pub(crate) struct GlobRow: 1 {
+    pub(crate) struct GlobRow: 2 {
         pub(crate) source: ContentId,
-        pub(crate) vis_key: ContentId,
         pub(crate) expansion: u16,
+        pub(crate) vis_key: u16,
         pub(crate) def_kind: DefKindTag,
         pub(crate) shape: MacroShapes,
         pub(crate) vis: VisibilityTag,
@@ -486,11 +491,10 @@ blaze_format::record! {
 }
 
 blaze_format::record! {
-    /// Form 3: the bindings are the module's own (declared, named imports, extern crates,
-    /// macro exports); a name reached through a glob is not copied, the glob is an edge. No
-    /// fellows (form 2 named them): a record says nothing of how it was solved.
+    /// Form 4: adds `vis_keys` dictionary so restricted visibility keys are stored once per
+    /// distinct module per scope instead of 32 zero/repeated bytes on every binding/glob/trait row.
     #[derive(Clone, Copy, Debug)]
-    pub(crate) struct ModuleScopeRoot: 3 {
+    pub(crate) struct ModuleScopeRoot: 4 {
         pub(crate) module: ContentId,
         pub(crate) bindings: Slice<BindingRow>,
         pub(crate) globs: Slice<GlobRow>,
@@ -502,6 +506,7 @@ blaze_format::record! {
         pub(crate) paths: Slice<PathRow>,
         pub(crate) segments: Slice<Text>,
         pub(crate) strings: Slice<u8>,
+        pub(crate) vis_keys: Slice<ContentId>,
     }
 }
 
@@ -590,6 +595,21 @@ impl<N: AsRef<str> + Copy> ScopeBuilder<'_, N> {
     pub(crate) fn write_sorted<'b>(&self, sort: bool, alloc: Alloc<'b>) -> Result<RecordBytes<'b>, BuildError> {
         let mut strings = Strings::new_in(alloc);
         let mut paths = PathTable::new_in(alloc);
+        let mut vis_keys: Vec<ContentId, Alloc<'b>> = Vec::new_in(alloc);
+        let intern_vis = |vis: Visibility, table: &mut Vec<ContentId, Alloc<'b>>| -> Result<(VisibilityTag, u16), BuildError> {
+            let (tag, key) = vis.to_record();
+            if tag == VisibilityTag::Public && key == ZERO {
+                return Ok((tag, NO_VIS_KEY));
+            }
+            if let Some(pos) = table.iter().position(|k| *k == key) {
+                let idx = u16::try_from(pos).map_err(|_| BuildError::TooLarge { table: "ModuleScope vis_keys" })?;
+                return Ok((tag, idx));
+            }
+            let idx = u16::try_from(table.len()).ok().filter(|&n| n < NO_VIS_KEY)
+                .ok_or(BuildError::TooLarge { table: "ModuleScope vis_keys" })?;
+            table.push(key);
+            Ok((tag, idx))
+        };
 
         let mut order = Vec::from_iter_in(0..self.bindings.len(), alloc);
         let bindings = &self.bindings;
@@ -604,14 +624,13 @@ impl<N: AsRef<str> + Copy> ScopeBuilder<'_, N> {
         for &at in order.iter() {
             let e = bindings[at];
             let (def, def_kind, shape) = def_parts(Some(e.binding.def));
-            let (vis, vis_key) = e.binding.vis.to_record();
+            let (vis, vis_key) = intern_vis(e.binding.vis, &mut vis_keys)?;
             let (state, ambiguity) = e.binding.state.to_record();
             rows.push(BindingRow {
                 name: strings.push(e.name.as_ref(), TABLE)?,
                 def,
-                vis_key,
                 expansion: e.binding.expansion,
-                pad: 0,
+                vis_key,
                 ns: e.ns,
                 origin: e.binding.origin,
                 def_kind,
@@ -619,7 +638,7 @@ impl<N: AsRef<str> + Copy> ScopeBuilder<'_, N> {
                 vis,
                 state,
                 ambiguity,
-                pad2: 0,
+                pad: 0,
             });
         }
 
@@ -630,14 +649,15 @@ impl<N: AsRef<str> + Copy> ScopeBuilder<'_, N> {
         let textual = textual_rows(&self.textual, &mut strings, alloc)?;
         let macro_exports = textual_rows(&self.macro_exports, &mut strings, alloc)?;
 
-        let mut globs = Vec::with_capacity_in(self.globs.len(), alloc);
-        for edge in self.globs.iter() {
-            let (source, def_kind, shape) = def_parts(Some(edge.source));
-            let (vis, vis_key) = edge.vis.to_record();
-            globs.push(GlobRow { source, vis_key, expansion: edge.expansion, def_kind, shape, vis, pad: 0 });
-        }
+        let mut glob_order = Vec::from_iter_in(0..self.globs.len(), alloc);
         if sort {
-            globs.sort_unstable_by_key(|row| row.source);
+            glob_order.sort_unstable_by_key(|&i| self.globs.get(i).map(|g| g.source.key.0));
+        }
+        let mut globs = Vec::with_capacity_in(glob_order.len(), alloc);
+        for edge in glob_order.iter().filter_map(|&i| self.globs.get(i)) {
+            let (source, def_kind, shape) = def_parts(Some(edge.source));
+            let (vis, vis_key) = intern_vis(edge.vis, &mut vis_keys)?;
+            globs.push(GlobRow { source, expansion: edge.expansion, vis_key, def_kind, shape, vis, pad: 0 });
         }
         if let Some(pair) = globs.windows(2).find(|pair| pair[0].source == pair[1].source) {
             return Err(BuildError::Twice { table: "ModuleScope globs", key: pair[1].source });
@@ -649,23 +669,22 @@ impl<N: AsRef<str> + Copy> ScopeBuilder<'_, N> {
         if let Some(pair) = marks.windows(2).find(|pair| pair[0].child == pair[1].child) {
             return Err(BuildError::Twice { table: "ModuleScope marks", key: pair[1].child });
         }
-        let traits = Vec::from_iter_in(
-            self.traits.iter().map(|t| {
-                let (def, def_kind, shape) = def_parts(Some(t.def));
-                let (vis, vis_key) = t.vis.to_record();
-                TraitRow {
-                    index: t.site.index,
-                    expansion: key_word(t.site.expansion),
-                    def,
-                    vis_key,
-                    def_kind,
-                    shape,
-                    vis,
-                    pad: 0,
-                }
-            }),
-            alloc,
-        );
+        let mut traits = Vec::with_capacity_in(self.traits.len(), alloc);
+        for t in self.traits.iter() {
+            let (def, def_kind, shape) = def_parts(Some(t.def));
+            let (vis, vis_key) = intern_vis(t.vis, &mut vis_keys)?;
+            traits.push(TraitRow {
+                index: t.site.index,
+                expansion: key_word(t.site.expansion),
+                def,
+                vis_key,
+                def_kind,
+                shape,
+                vis,
+                pad0: 0,
+                pad1: 0,
+            });
+        }
 
         let mut out = Writer::new(WriterOpts { schema: <ModuleScopeRoot as Record>::SCHEMA, alloc: alloc, capacity: None });
         let text = Column::push(&mut out, strings.bytes());
@@ -678,6 +697,7 @@ impl<N: AsRef<str> + Copy> ScopeBuilder<'_, N> {
         let macro_exports = Column::push(&mut out, &macro_exports);
         let path_rows = Column::push(&mut out, &paths.rows);
         let segments = Column::push(&mut out, &paths.segments);
+        let vis_keys = Column::push(&mut out, &vis_keys);
         Ok(finish_with(out, |at| ModuleScopeRoot {
             module: self.module.0,
             bindings: bindings.slice(at, offset_of!(ModuleScopeRoot, bindings)),
@@ -690,6 +710,7 @@ impl<N: AsRef<str> + Copy> ScopeBuilder<'_, N> {
             paths: path_rows.slice(at, offset_of!(ModuleScopeRoot, paths)),
             segments: segments.slice(at, offset_of!(ModuleScopeRoot, segments)),
             strings: text.slice(at, offset_of!(ModuleScopeRoot, strings)),
+            vis_keys: vis_keys.slice(at, offset_of!(ModuleScopeRoot, vis_keys)),
         }))
     }
 }
@@ -804,6 +825,19 @@ pub struct ScopeView<'a> {
     macro_exports: &'a [TextualRow],
     paths: Paths<'a>,
     strings: &'a str,
+    vis_keys: &'a [ContentId],
+}
+
+pub(crate) fn vis_of(vis_keys: &[ContentId], vis: VisibilityTag, idx: u16) -> Visibility {
+    let key = if idx == NO_VIS_KEY { ZERO } else { vis_keys.get(usize::from(idx)).copied().unwrap_or(ZERO) };
+    Visibility::from_record(vis, key)
+}
+
+fn check_vis_key<T: Record>(vis_keys: &[ContentId], idx: u16, row: &T, buffer: &[u8]) -> Result<(), FormatError> {
+    if idx != NO_VIS_KEY && usize::from(idx) >= vis_keys.len() {
+        return Err(FormatError::Invalid { at: at_of_record(row, buffer), what: "visibility key index out of range" });
+    }
+    Ok(())
 }
 
 impl<'a> ScopeView<'a> {
@@ -825,14 +859,22 @@ impl<'a> ScopeView<'a> {
             macro_exports: root.macro_exports.follow(buffer)?,
             paths,
             strings,
+            vis_keys: root.vis_keys.follow(buffer)?,
         };
         for row in view.rows {
             check_text(strings, row.name, row, buffer)?;
+            check_vis_key(view.vis_keys, row.vis_key, row, buffer)?;
         }
         check_increasing(view.rows, buffer, "bindings out of order or two of one slot", |row| {
             (row.ns, text_of(strings, row.name))
         })?;
+        for row in view.globs {
+            check_vis_key(view.vis_keys, row.vis_key, row, buffer)?;
+        }
         check_increasing(view.globs, buffer, "glob edges out of order or two of one source", |row| row.source)?;
+        for row in view.traits {
+            check_vis_key(view.vis_keys, row.vis_key, row, buffer)?;
+        }
         for row in view.errors {
             check_text(strings, row.name, row, buffer)?;
             let has_path = matches!(row.tag, ErrorTag::Import | ErrorTag::Macro | ErrorTag::RestrictedNotAncestor);
@@ -861,7 +903,7 @@ impl<'a> ScopeView<'a> {
             name: text_of(self.strings, row.name),
             binding: Binding {
                 def: def_of(row.def, row.def_kind, row.shape),
-                vis: Visibility::from_record(row.vis, row.vis_key),
+                vis: vis_of(self.vis_keys, row.vis, row.vis_key),
                 origin: row.origin,
                 expansion: row.expansion,
                 state: BindingState::from_record(row.state, row.ambiguity),
@@ -901,9 +943,10 @@ impl<'a> ScopeView<'a> {
 
     /// The glob edges, by source.
     pub fn globs(&self) -> impl ExactSizeIterator<Item = GlobEdge> + use<'a> {
-        self.globs.iter().map(|row| GlobEdge {
+        let vis_keys = self.vis_keys;
+        self.globs.iter().map(move |row| GlobEdge {
             source: def_of(row.source, row.def_kind, row.shape),
-            vis: Visibility::from_record(row.vis, row.vis_key),
+            vis: vis_of(vis_keys, row.vis, row.vis_key),
             expansion: row.expansion,
         })
     }
@@ -957,10 +1000,11 @@ impl<'a> ScopeView<'a> {
 
     /// The `use .. as _` imports, in the module's tree order.
     pub fn traits(&self) -> impl ExactSizeIterator<Item = AnonImport> + use<'a> {
-        self.traits.iter().map(|row| AnonImport {
+        let vis_keys = self.vis_keys;
+        self.traits.iter().map(move |row| AnonImport {
             site: UseSite { expansion: key_of_word(row.expansion), index: row.index },
             def: def_of(row.def, row.def_kind, row.shape),
-            vis: Visibility::from_record(row.vis, row.vis_key),
+            vis: vis_of(vis_keys, row.vis, row.vis_key),
         })
     }
 

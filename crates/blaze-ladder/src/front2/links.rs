@@ -212,15 +212,15 @@ fn taken_inputs<'a>(c: &CrateNames<'a>, alloc: Alloc<'a>) -> Result<AVec<'a, Spo
 /// owner's body is the member at its entry with no writing call, one a member-position call
 /// wrote (an entry at the top of that call's expansion) the member that call wrote at its
 /// entry. prost-derive's `impl Message for T { fn merge_field(..) { .. } }` is such a member.
-fn entry_of(c: &CrateNames<'_>, inputs: &[Spot], at: At, outline: &Outline<'_>, item: ItemIndex) -> Entry {
-    if let Some(key) = c.tables.by_place.get(&(at, item)) {
-        return Entry::Keyed(*key);
+fn entry_of(c: &CrateNames<'_>, by_place: &dyn Fn(At, ItemIndex) -> Option<ItemKey>, inputs: &[Spot], at: At, outline: &Outline<'_>, item: ItemIndex) -> Entry {
+    if let Some(key) = by_place(at, item) {
+        return Entry::Keyed(key);
     }
     if inputs.binary_search(&spot(at, item)).is_ok() {
         return Entry::Input;
     }
     let (owner, written_by) = match outline.item(item).parent {
-        Some(p) if matches!(outline.item(p).detail, ItemDetail::Impl | ItemDetail::Trait) => (c.tables.by_place.get(&(at, p)).copied(), None),
+        Some(p) if matches!(outline.item(p).detail, ItemDetail::Impl | ItemDetail::Trait) => (by_place(at, p), None),
         Some(_) => return Entry::Unkeyed,
         None => match at {
             At::Expansion(call) => (c.tables.calls.get(&call).and_then(|src| src.owner), Some(call)),
@@ -261,6 +261,24 @@ where
     'n: 'b,
 {
     let alloc = bump.alloc();
+    // When `c.tables.by_place` was skipped during record-only solve (saving ~15-20 MB on `core`'s
+    // crate frame), build the reverse map once in the ephemeral scratch `alloc` (freed on return).
+    let local_by_place: Option<blaze_hash::HashMap<(At, ItemIndex), ItemKey, Alloc<'b>>> =
+        if c.tables.by_place.is_empty() && !c.tables.texts.is_empty() {
+            let mut m = blaze_hash::HashMap::with_capacity_in(c.tables.texts.len(), alloc);
+            for (k, (t, at)) in c.tables.texts.iter() {
+                m.insert((*at, t.item), *k);
+            }
+            Some(m)
+        } else {
+            None
+        };
+    let by_place = |at: At, item: ItemIndex| -> Option<ItemKey> {
+        match &local_by_place {
+            Some(m) => m.get(&(at, item)).copied(),
+            None => c.tables.by_place.get(&(at, item)).copied(),
+        }
+    };
     let mut gather = Gather::new(c.name, c.edition, c.cfg.atoms(), &c.values, bump)?;
     gather.crate_key = Some(c.key);
     let inputs = taken_inputs(c, alloc)?;
@@ -268,9 +286,9 @@ where
     let mut walked: AVec<'b, ItemKey> = AVec::new_in(alloc);
     for (n, file) in c.files.iter().enumerate() {
         let at = At::File(n as u32);
-        gather.text(TextOf::File(file.shown), file.text, &file.outline, &|item| entry_of(c, &inputs, at, &file.outline, item))?;
+        gather.text(TextOf::File(file.shown), file.text, &file.outline, &|item| entry_of(c, &by_place, &inputs, at, &file.outline, item))?;
         gather.met.reverse();
-        expand_met(c, &inputs, &mut gather, &mut walked)?;
+        expand_met(c, &by_place, &inputs, &mut gather, &mut walked)?;
     }
     // An extern block written by an item macro (ring's `prefixed_extern!`) declares roots too,
     // wherever the call is. Only the expansions no walked text holds as an entry start a walk
@@ -284,7 +302,7 @@ where
     for (call, expansion) in c.expansions.iter() {
         let Some(m) = expansion.made else { continue };
         let entry = c.tables.calls.get(call).and_then(|src| src.place.as_ref()).and_then(|p| Some((p.text?, p.item)));
-        if entry.is_some_and(|(at, item)| c.tables.by_place.get(&(at, item)) == Some(call)) {
+        if entry.is_some_and(|(at, item)| by_place(at, item) == Some(*call)) {
             continue;
         }
         rest.try_push((*call, m)).map_err(|_| LinksError::Alloc)?;
@@ -294,9 +312,9 @@ where
         let Err(slot) = walked.binary_search(&call) else { continue };
         walked.try_insert_slice_shift(slot, &[call]).map_err(|_| LinksError::Alloc)?;
         let at = At::Expansion(call);
-        gather.text(TextOf::Expansion(call), m.text, &m.outline, &|item| entry_of(c, &inputs, at, &m.outline, item))?;
+        gather.text(TextOf::Expansion(call), m.text, &m.outline, &|item| entry_of(c, &by_place, &inputs, at, &m.outline, item))?;
         gather.met.reverse();
-        expand_met(c, &inputs, &mut gather, &mut walked)?;
+        expand_met(c, &by_place, &inputs, &mut gather, &mut walked)?;
     }
     gather.finish()
 }
@@ -307,13 +325,13 @@ where
 /// read as that block's entries (the Reference, items.extern: an extern block's items may be
 /// macro invocations; ring's `prefixed_extern!` writes `extern "C" { prefixed_item! { .. } }`,
 /// each `prefixed_item!` one `#[link_name = ..] fn`), never as the module's items.
-fn expand_met<'n, 'b>(c: &CrateNames<'n>, inputs: &[Spot], gather: &mut Gather<'b, '_>, walked: &mut AVec<'b, ItemKey>) -> Result<(), LinksError<'b>>
+fn expand_met<'n, 'b>(c: &CrateNames<'n>, by_place: &dyn Fn(At, ItemIndex) -> Option<ItemKey>, inputs: &[Spot], gather: &mut Gather<'b, '_>, walked: &mut AVec<'b, ItemKey>) -> Result<(), LinksError<'b>>
 where
     'n: 'b,
 {
     while let Some((call, foreign)) = gather.met.pop() {
         let Some(expansion) = c.expansions.get(&call) else { continue };
-        if foreign && expansion.refused.is_some() {
+        if foreign && expansion.refused().is_some() {
             return Err(LinksError::ForeignCall { krate: gather.krate, call });
         }
         let Some(m) = expansion.made else { continue };
@@ -322,7 +340,7 @@ where
         let base = gather.met.len();
         let at = At::Expansion(call);
         gather.top_foreign = foreign;
-        let walk = gather.text(TextOf::Expansion(call), m.text, &m.outline, &|item| entry_of(c, inputs, at, &m.outline, item));
+        let walk = gather.text(TextOf::Expansion(call), m.text, &m.outline, &|item| entry_of(c, by_place, inputs, at, &m.outline, item));
         gather.top_foreign = false;
         walk?;
         // The calls this text wrote, first written popped first.

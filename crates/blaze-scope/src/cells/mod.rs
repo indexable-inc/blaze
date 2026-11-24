@@ -1321,13 +1321,14 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         };
         // The dependencies by name before any text is read: an `extern crate` of any module
         // names one.
-        {
-            let r = facts.crate_root(info.krate).map_err(|error| CellError::Facts { module: root, error })?;
-            cells.dep_roots.extend(r.deps.iter().map(|d| (d.name, d.root)));
-            cells.tools.extend(r.tools.iter().copied());
-            cells.builtin_attrs.extend(r.builtin_attrs.iter().copied());
-            cells.arbitrary_ints = r.head.arbitrary_ints;
-        }
+        facts
+            .with_crate_root(info.krate, |r| {
+                cells.dep_roots.extend(r.deps.iter().map(|d| (d.name, d.root)));
+                cells.tools.extend(r.tools.iter().copied());
+                cells.builtin_attrs.extend(r.builtin_attrs.iter().copied());
+                cells.arbitrary_ints = r.head.arbitrary_ints;
+            })
+            .map_err(|error| CellError::Facts { module: root, error })?;
         Ok(cells)
     }
 
@@ -1359,8 +1360,16 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 lines.insert(m, own);
                 continue;
             }
-            let d = match facts.decls(m) {
-                Ok(d) => d,
+            match facts.with_decls(m, |d| {
+                own.reserve(d.mods.len());
+                for c in d.mods.iter() {
+                    if extent == Extent::Subtrees {
+                        todo.push(c.module);
+                    }
+                    own.push((c.module, c.macro_use));
+                }
+            }) {
+                Ok(()) => {}
                 // A `mod` line of a module the facts hold no text of: bound, its inside unknown.
                 Err(SurfaceError::NoRecord { .. })
                     if self.plant != CellPlant::UnreadModuleRefuses && !(self.modules.is_empty() && tops.first() == Some(&m)) =>
@@ -1370,13 +1379,6 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                     continue;
                 }
                 Err(error) => return Err(CellError::Facts { module: m, error }),
-            };
-            own.reserve(d.mods.len());
-            for c in d.mods.iter() {
-                if extent == Extent::Subtrees {
-                    todo.push(c.module);
-                }
-                own.push((c.module, c.macro_use));
             }
             lines.insert(m, own);
         }
@@ -1651,21 +1653,26 @@ impl<'a, N: crate::Name> Cells<'a, N> {
     /// Reads module `m`'s own text.
     fn read_text<F: ScopeFacts<Name = N>>(&mut self, facts: &F, m: ModId) -> Result<(), CellError> {
         let key = self.modules[m as usize].key;
-        let d = facts.decls(key).map_err(|error| CellError::Facts { module: key, error })?;
         if m == self.root {
             // `#[macro_export]` macros are public names of the crate root in the macro namespace
             // (Reference `macros.by-example.export`).
-            let r = facts.crate_root(self.krate).map_err(|error| CellError::Facts { module: key, error })?;
-            for &(name, def, shapes) in r.macro_exports.iter() {
-                // The root's text fragment is the next one made (`read_fragment` below).
-                let text = self.frags.len() as FragId;
-                let entry = (Def { key: def, kind: DefKind::Macro(shapes) }, Visibility::Public, Origin::MacroExport, text);
-                self.add_explicit(m, Namespace::Macros, name, entry)?;
-                self.stats.names_declared += 1;
-            }
+            facts
+                .with_crate_root(self.krate, |r| -> Result<(), CellError> {
+                    for &(name, def, shapes) in r.macro_exports.iter() {
+                        // The root's text fragment is the next one made (`read_fragment` below).
+                        let text = self.frags.len() as FragId;
+                        let entry = (Def { key: def, kind: DefKind::Macro(shapes) }, Visibility::Public, Origin::MacroExport, text);
+                        self.add_explicit(m, Namespace::Macros, name, entry)?;
+                        self.stats.names_declared += 1;
+                    }
+                    Ok(())
+                })
+                .map_err(|error| CellError::Facts { module: key, error })??;
             self.read_outer(facts, m)?;
         }
-        let f = self.read_fragment(m, &d, None)?;
+        let f = facts
+            .with_decls(key, |d| self.read_fragment(m, d, None))
+            .map_err(|error| CellError::Facts { module: key, error })??;
         self.modules[m as usize].text = f;
         Ok(())
     }
@@ -1674,31 +1681,36 @@ impl<'a, N: crate::Name> Cells<'a, N> {
     /// the root's text is (a one-group solve whose group the root is not in).
     fn read_outer<F: ScopeFacts<Name = N>>(&mut self, facts: &F, m: ModId) -> Result<(), CellError> {
         let key = self.modules[m as usize].key;
-        {
-            let r = facts.crate_root(self.krate).map_err(|error| CellError::Facts { module: key, error })?;
-            // The outer scopes (R6, R8): sorted already by the record's rule.
-            self.outer.externs.extend_from_slice(&r.extern_prelude);
-            self.outer.macro_use = !r.macro_use.is_empty();
-            self.macro_use.extend_from_slice(&r.macro_use);
-            self.edition = r.head.edition;
-            if let Some(p) = r.head.prelude {
-                // A standard prelude of a dependency is read like any module of it.
-                let prelude = match self.by_key.get(&p) {
-                    Some(&local) => Some(local),
-                    None => self.foreign(p),
-                };
-                match prelude {
-                    Some(m) => self.outer.local = Some(m),
-                    None => {
-                        let pd = facts.decls(p).map_err(|error| CellError::Facts { module: p, error })?;
-                        for it in pd.items.iter() {
-                            self.outer.foreign.entry((it.ns, it.name)).or_insert(it.def);
-                        }
-                        for c in pd.mods.iter() {
-                            self.outer.foreign.entry((Namespace::Types, c.name)).or_insert(Def::module(c.module));
-                        }
-                        self.outer.foreign_open = !pd.uses.is_empty() || !pd.calls.is_empty();
-                    }
+        let prelude_key = facts
+            .with_crate_root(self.krate, |r| {
+                // The outer scopes (R6, R8): sorted already by the record's rule.
+                self.outer.externs.extend_from_slice(&r.extern_prelude);
+                self.outer.macro_use = !r.macro_use.is_empty();
+                self.macro_use.extend_from_slice(&r.macro_use);
+                self.edition = r.head.edition;
+                r.head.prelude
+            })
+            .map_err(|error| CellError::Facts { module: key, error })?;
+        if let Some(p) = prelude_key {
+            // A standard prelude of a dependency is read like any module of it.
+            let prelude = match self.by_key.get(&p) {
+                Some(&local) => Some(local),
+                None => self.foreign(p),
+            };
+            match prelude {
+                Some(m) => self.outer.local = Some(m),
+                None => {
+                    facts
+                        .with_decls(p, |pd| {
+                            for it in pd.items.iter() {
+                                self.outer.foreign.entry((it.ns, it.name)).or_insert(it.def);
+                            }
+                            for c in pd.mods.iter() {
+                                self.outer.foreign.entry((Namespace::Types, c.name)).or_insert(Def::module(c.module));
+                            }
+                            self.outer.foreign_open = !pd.uses.is_empty() || !pd.calls.is_empty();
+                        })
+                        .map_err(|error| CellError::Facts { module: p, error })?;
                 }
             }
         }
@@ -2018,17 +2030,25 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             self.helpers.insert(def.key, names);
         }
         expand(at.key, def);
-        let d = match facts.expansion(at.key) {
-            Ok(Some(d)) => d,
+        let mut tops: AVec<'a, ItemKey> = AVec::new_in(self.alloc);
+        match facts.with_expansion(at.key, |opt| {
+            let Some(d) = opt else { return false };
+            tops.reserve(d.mods.len());
+            for c in d.mods.iter() {
+                tops.push(c.module);
+            }
+            true
+        }) {
+            Ok(true) => {}
+            Ok(false) => return Err(CellError::NotExpanded { call: at.key }),
+            Err(error) => return Err(CellError::Expansion { call: at.key, error }),
+        }
+        let made = self.make_modules(facts, &tops)?;
+        let f = match facts.with_expansion(at.key, |opt| opt.map(|d| self.read_fragment(m, d, Some((at.frag, at.pos))))) {
+            Ok(Some(res)) => res?,
             Ok(None) => return Err(CellError::NotExpanded { call: at.key }),
             Err(error) => return Err(CellError::Expansion { call: at.key, error }),
         };
-        let mut tops: AVec<'a, ItemKey> = AVec::new_in(self.alloc);
-        for c in d.mods.iter() {
-            tops.push(c.module);
-        }
-        let made = self.make_modules(facts, &tops)?;
-        let f = self.read_fragment(m, &d, Some((at.frag, at.pos)))?;
         for &n in made.iter() {
             self.read_text(facts, n)?;
         }

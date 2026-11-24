@@ -8,29 +8,28 @@
 //! module_scope.rs by the wiring.
 
 use blaze_format::field;
-use blaze_id::ItemKey;
+use blaze_id::{ContentId, ItemKey};
 
-use super::{ErrorTag, GlobEdge, GlobRow, ModuleScopeRoot, RefusedWhy, ScopeView, TextualDef, def_of};
+use super::{ErrorTag, GlobEdge, GlobRow, ModuleScopeRoot, RefusedWhy, ScopeView, TextualDef, def_of, vis_of};
 use crate::column::text_of;
-use crate::kind::Visibility;
 use crate::path::Paths;
 
 /// A scope's glob edges as a lookup through globs walks them: the working form's slice
 /// ([`Globs::of`]) or a record's rows read in place ([`ScopeView::edges`]). Each edge is made
-/// when asked, from 48 bytes of the row: nothing is decoded ahead.
+/// when asked, from 40 bytes of the row: nothing is decoded ahead.
 #[derive(Clone, Copy, Debug)]
 pub struct Globs<'w>(Of<'w>);
 
 #[derive(Clone, Copy, Debug)]
 enum Of<'w> {
     Edges(&'w [GlobEdge]),
-    Rows(&'w [GlobRow]),
+    Rows(&'w [GlobRow], &'w [ContentId]),
 }
 
-fn edge_of(row: &GlobRow) -> GlobEdge {
+fn edge_of(row: &GlobRow, vis_keys: &[ContentId]) -> GlobEdge {
     GlobEdge {
         source: def_of(row.source, row.def_kind, row.shape),
-        vis: Visibility::from_record(row.vis, row.vis_key),
+        vis: vis_of(vis_keys, row.vis, row.vis_key),
         expansion: row.expansion,
     }
 }
@@ -44,7 +43,7 @@ impl<'w> Globs<'w> {
     pub fn len(&self) -> usize {
         match self.0 {
             Of::Edges(edges) => edges.len(),
-            Of::Rows(rows) => rows.len(),
+            Of::Rows(rows, _) => rows.len(),
         }
     }
 
@@ -56,24 +55,44 @@ impl<'w> Globs<'w> {
     pub fn get(&self, i: usize) -> Option<GlobEdge> {
         match self.0 {
             Of::Edges(edges) => edges.get(i).copied(),
-            Of::Rows(rows) => rows.get(i).map(edge_of),
-        }
-    }
-
-    /// Edge `i` of `0..len()`.
-    fn at(&self, i: usize) -> GlobEdge {
-        match self.0 {
-            Of::Edges(edges) => edges[i],
-            Of::Rows(rows) => edge_of(&rows[i]),
+            Of::Rows(rows, vis_keys) => rows.get(i).map(|row| edge_of(row, vis_keys)),
         }
     }
 
     /// Every edge, by source.
-    pub fn iter(&self) -> impl ExactSizeIterator<Item = GlobEdge> + use<'w> {
-        let globs = *self;
-        (0..globs.len()).map(move |i| globs.at(i))
+    pub fn iter(&self) -> GlobIter<'w> {
+        match self.0 {
+            Of::Edges(edges) => GlobIter::Edges(edges.iter()),
+            Of::Rows(rows, vis_keys) => GlobIter::Rows(rows.iter(), vis_keys),
+        }
     }
 }
+
+/// Iterator returned by [`Globs::iter`].
+pub enum GlobIter<'w> {
+    Edges(core::slice::Iter<'w, GlobEdge>),
+    Rows(core::slice::Iter<'w, GlobRow>, &'w [ContentId]),
+}
+
+impl Iterator for GlobIter<'_> {
+    type Item = GlobEdge;
+
+    fn next(&mut self) -> Option<GlobEdge> {
+        match self {
+            GlobIter::Edges(it) => it.next().copied(),
+            GlobIter::Rows(it, vis_keys) => it.next().map(|row| edge_of(row, vis_keys)),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            GlobIter::Edges(it) => it.size_hint(),
+            GlobIter::Rows(it, _) => it.size_hint(),
+        }
+    }
+}
+
+impl ExactSizeIterator for GlobIter<'_> {}
 
 impl<'a> ScopeView<'a> {
     /// The record in `buffer` with no check at all: O(1), no allocation. Each column is a
@@ -111,12 +130,13 @@ impl<'a> ScopeView<'a> {
             macro_exports: field!(root, ModuleScopeRoot, macro_exports).items().as_slice(),
             paths,
             strings,
+            vis_keys: field!(root, ModuleScopeRoot, vis_keys).items().as_slice(),
         }
     }
 
     /// The glob edges as a lookup walks them, read in place.
     pub fn edges(&self) -> Globs<'a> {
-        Globs(Of::Rows(self.globs))
+        Globs(Of::Rows(self.globs, self.vis_keys))
     }
 
     /// The first refused macro call of the scope (in the order the errors are written) and why:

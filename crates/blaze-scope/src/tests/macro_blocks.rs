@@ -324,7 +324,7 @@ fn dollar_crate_in_a_copied_field_names_the_defining_crate() {
     let writer = directory.entry(writer).expect("read writer's row").expect("recorded make! invocation");
     assert_eq!(entry.call_part, writer.call_part, "copied tokens refer to the original invocation");
     let bytes = &split.records.iter().find(|r| r.key == entry.record).expect("the block's record").bytes;
-    let held = ExpansionRecord::open(bytes).expect("open the block's record");
+    let held = ExpansionRecord::open_in(bytes, bump).expect("open the block's record");
     let text = entry.text(&held).expect("the block's text");
     let item = items.slice(span, &|at| (at == TextOf::Expansion { call: block }).then_some(text)).expect("L's declaration");
     let origins = entry.origins(&held).expect("read block origins").expect("the block keeps origins");

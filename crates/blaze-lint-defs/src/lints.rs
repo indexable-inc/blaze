@@ -583,4 +583,7 @@ pub(super) const BLAZE: &[Lint] = &[
     // Anonymous tuple return types with unnamed state (`(Option<T>, bool)`, `(A, B, C)`), checked by blaze-lint's `anon-tuple-return` rule.
     l("blaze::anon_tuple_return", Allow, "detects a function returning an anonymous tuple carrying unnamed state (e.g. `(Option<T>, bool)`, `(T, bool)`, or 3+ elements) where a named struct should name each field")
         .externally_loaded(),
+    // 3+ adjacent Vec/AVec declarations or struct fields, checked by blaze-lint's `parallel-vecs` rule.
+    l("blaze::parallel_vecs", Allow, "detects 3+ adjacent `Vec`/`AVec` locals or struct fields where a single-allocation `blaze_own::Soa` / `blaze_own::soa!` should share one length, capacity and backing block")
+        .externally_loaded(),
 ];

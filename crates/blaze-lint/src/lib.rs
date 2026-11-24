@@ -300,6 +300,10 @@ pub enum Rule {
     /// by `BumpAlloc`), and intentional `'static` allocations should use `ProgramArena` or `const`.
     /// The lint `blaze::heap_leak`.
     HeapLeak = 45,
+    /// Three or more adjacent `Vec`/`AVec`/`StdVec` local declarations or struct fields where a
+    /// single-allocation `blaze_own::Soa` / `blaze_own::soa!` shares one length, capacity, and
+    /// backing block. The lint `blaze::parallel_vecs`.
+    ParallelVecs = 46,
 }
 
 impl Rule {
@@ -353,6 +357,7 @@ impl Rule {
         Rule::UnusedImport,
         Rule::UnusedMut,
         Rule::HeapLeak,
+        Rule::ParallelVecs,
     ];
 
     /// The ten rules ported from blaze's scripts: what [`Step::Strict`] runs. The rules after
@@ -422,6 +427,7 @@ impl Rule {
             Rule::UnusedImport => "unused-import",
             Rule::UnusedMut => "unused-mut",
             Rule::HeapLeak => "heap-leak",
+            Rule::ParallelVecs => "parallel-vecs",
         }
     }
 
@@ -463,6 +469,7 @@ impl Rule {
             Rule::UnusedImport => Some("unused_import"),
             Rule::UnusedMut => Some("unused_mut"),
             Rule::HeapLeak => Some("heap_leak"),
+            Rule::ParallelVecs => Some("parallel_vecs"),
             _ => None,
         }
     }
@@ -718,6 +725,8 @@ pub enum Template {
     UnusedMut = 400,
     /// `.leak()` / `Box::leak` / `Vec::leak` call outside `Root::leak` and tests.
     HeapLeak = 410,
+    /// 3+ adjacent `Vec`/`AVec`/`StdVec` local bindings or struct fields; argument: count.
+    ParallelVecs = 420,
 }
 
 impl Template {
@@ -766,6 +775,7 @@ impl Template {
             390 => Rule::UnusedImport,
             400 => Rule::UnusedMut,
             410 => Rule::HeapLeak,
+            420 => Rule::ParallelVecs,
             _ => Rule::VariantCount,
         }
     }
@@ -863,6 +873,7 @@ impl Template {
             Template::UnusedImport => "unused-import",
             Template::UnusedMut => "unused-mut",
             Template::HeapLeak => "heap-leak",
+            Template::ParallelVecs => "parallel-vecs",
         }
     }
 }

@@ -472,6 +472,7 @@ pub(crate) struct StoreLoad<'n> {
     /// damaged row); `None`: the crate made no text for the call.
     unserved: RefCell<AVec<'n, Unserved>>,
     alloc: Alloc<'n>,
+    bump: Bump<'n>,
 }
 
 /// One expansion a question asked that was not served ([`StoreLoad::unserved`]).
@@ -501,12 +502,13 @@ impl core::fmt::Display for ExpansionReadError {
 
 impl<'n> StoreLoad<'n> {
     #[cfg(test)]
-    pub(crate) fn new(crates: &'n [CrateRecords<'n>], packages: &'n [&'n str], texts: &'n dyn SourceTexts<'n>, alloc: Alloc<'n>) -> StoreLoad<'n> {
-        Self::from_parts(crates, packages, texts, None, None, None, alloc)
+    pub(crate) fn new(crates: &'n [CrateRecords<'n>], packages: &'n [&'n str], texts: &'n dyn SourceTexts<'n>, bump: Bump<'n>, alloc: Alloc<'n>) -> StoreLoad<'n> {
+        Self::from_parts(crates, packages, texts, None, None, None, bump, alloc)
     }
 
     /// Both (the merge of two lanes, 2026-11-18): the snapshot for lazy expansion texts and
     /// the outlines for current file ranges. The engine's Bodies path passes both.
+    #[expect(clippy::too_many_arguments, reason = "test and driver loader inputs, each one handle")]
     pub(crate) fn from_parts(
         crates: &'n [CrateRecords<'n>],
         packages: &'n [&'n str],
@@ -514,12 +516,14 @@ impl<'n> StoreLoad<'n> {
         snapshot: Option<&'n StoreSnapshot>,
         expansion_keys: Option<&'n SharedSet<Key, blaze_own::SharedAlloc<'static>>>,
         outlines: Option<&'n [crate::engine_tasks::Outlined<'n>]>,
+        bump: Bump<'n>,
         alloc: Alloc<'n>,
     ) -> Self {
-        Self::from_crates(CratesFrom::Opened(crates), packages, texts, snapshot, expansion_keys, outlines, alloc)
+        Self::from_crates(CratesFrom::Opened(crates), packages, texts, snapshot, expansion_keys, outlines, bump, alloc)
     }
 
     /// [`StoreLoad::from_parts`] over either source of crates ([`CratesFrom`]).
+    #[expect(clippy::too_many_arguments, reason = "loader inputs, each one handle")]
     pub(crate) fn from_crates(
         crates: CratesFrom<'n>,
         packages: &'n [&'n str],
@@ -527,9 +531,10 @@ impl<'n> StoreLoad<'n> {
         snapshot: Option<&'n StoreSnapshot>,
         expansion_keys: Option<&'n SharedSet<Key, blaze_own::SharedAlloc<'static>>>,
         outlines: Option<&'n [crate::engine_tasks::Outlined<'n>]>,
+        bump: Bump<'n>,
         alloc: Alloc<'n>,
     ) -> Self {
-        StoreLoad { crates, refused: core::cell::Cell::new(None), packages, texts, snapshot, expansion_keys, outlines, unserved: RefCell::new(AVec::new_in(alloc)), alloc }
+        StoreLoad { crates, refused: core::cell::Cell::new(None), packages, texts, snapshot, expansion_keys, outlines, unserved: RefCell::new(AVec::new_in(alloc)), alloc, bump }
     }
 
     /// The crates' keys in reader order: `Records::new`'s `keys`.
@@ -588,7 +593,7 @@ impl<'n> StoreLoad<'n> {
         }
         let bytes = snapshot.expansion_get(key).map_err(|error| ExpansionReadError::Snapshot { call, key, error })?
             .ok_or(ExpansionReadError::Record(ExpansionRecordsError::Missing { call, key: entry.record }))?;
-        let record = ExpansionRecord::open(bytes).map_err(ExpansionReadError::Record)?;
+        let record = ExpansionRecord::open_in(bytes, self.bump).map_err(ExpansionReadError::Record)?;
         let text = entry.text(&record).map_err(ExpansionReadError::Record)?;
         Ok(Some(LoadedExpansion { text, origins: Some((entry.call_part, record.column)) }))
     }
@@ -809,7 +814,7 @@ mod tests {
         // The load and the log go in the frame, as the command places them (run_names.rs
         // `names_records_with_snapshot`): the reader takes both for the one lifetime it lives
         // for, which a stack value that is dropped cannot give.
-        let load: &StoreLoad<'_> = frame.alloc(StoreLoad::from_parts(&read, &packages, &Files, Some(&snapshot), None, None, g));
+        let load: &StoreLoad<'_> = frame.alloc(StoreLoad::from_parts(&read, &packages, &Files, Some(&snapshot), None, None, bump, g));
         let crate_names: std::vec::Vec<_> = names.crates().iter().map(|c| c.name).collect();
         let log: &Log<'_> = frame.alloc(Log::new(&crate_names, g));
         let records = frame.alloc(Records::new(load.keys(&frame), load, log, &frame, g));
@@ -1012,7 +1017,7 @@ mod tests {
             .collect();
         let read: &'static [CrateRecords<'static>] = std::vec::Vec::leak(read);
         let packages: &'static [&'static str] = std::vec::Vec::leak(order.iter().map(|_| "/").collect());
-        let load: &'static StoreLoad<'static> = std::boxed::Box::leak(std::boxed::Box::new(StoreLoad::new(read, packages, &PreludeFiles, g)));
+        let load: &'static StoreLoad<'static> = std::boxed::Box::leak(std::boxed::Box::new(StoreLoad::new(read, packages, &PreludeFiles, b, g)));
         let crate_names: &'static [&'static str] = std::vec::Vec::leak(order.iter().map(|at| &*std::string::String::from(names.crates()[*at].name).leak()).collect());
         let log: &'static Log<'static> = std::boxed::Box::leak(std::boxed::Box::new(Log::new(crate_names, g)));
         let frame: &'static Frame = std::boxed::Box::leak(std::boxed::Box::new(Frame::new(bstd::mem::Tag::Other).expect("a frame")));

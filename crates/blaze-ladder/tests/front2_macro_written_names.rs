@@ -150,6 +150,7 @@ struct Held<'a> {
     items: &'a [u8],
     file: &'a str,
     expansions: &'a Split<'a>,
+    bump: blaze_own::Bump<'a>,
 }
 
 impl<'a> Held<'a> {
@@ -157,7 +158,7 @@ impl<'a> Held<'a> {
         let directory = Directory::open(&self.expansions.directory).expect("open the expansion directory");
         let entry = directory.entry(key).expect("read the expansion entry")?;
         let row = self.expansions.records.iter().find(|r| r.key == entry.record).expect("stored expansion bytes");
-        let record = ExpansionRecord::open(&row.bytes).expect("open the expansion record");
+        let record = ExpansionRecord::open_in(&row.bytes, self.bump).expect("open the expansion record");
         Some((entry, record))
     }
 }
@@ -179,6 +180,8 @@ impl<'a> Load<'a> for Kept<'a> {
 }
 
 fn keep<'a>(names: &Names<'_>, frame: &'a Frame, alloc: Alloc<'a>) -> Kept<'a> {
+    let erased = frame.alloc(blaze_own::Erased::new(frame));
+    let bump = erased.bump();
     Kept(names.crates().iter().map(|c| {
         let [file] = c.files.as_slice() else { panic!("expected one file in {}", c.name) };
         Held {
@@ -186,6 +189,7 @@ fn keep<'a>(names: &Names<'_>, frame: &'a Frame, alloc: Alloc<'a>) -> Kept<'a> {
             items: aligned(&items_record::encode_with(c, names, alloc).expect("encode items"), blaze_own::testing::bump()),
             file: frame.alloc_str(file.text),
             expansions: frame.alloc(expansion_records::write(c, alloc).expect("encode expansions")),
+            bump,
         }
     }).collect())
 }

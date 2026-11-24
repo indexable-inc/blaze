@@ -735,6 +735,9 @@ impl<'f> NamesStage<'f> {
     }
 
     fn runner(names: &Names<'f>, made: &crate::names::NamesWorld<'_>, handles: &Handles<'_, 'f>, frame: &'f Frame) -> Result<Option<&'static crate::proc_runner::ProcRunner<'static>>, &'f str> {
+        if !made.world().crates.iter().any(|c| c.input.implicit.proc_macro) {
+            return Ok(None);
+        }
         match (names.procs(), handles.side) {
             (None, Some(side)) => match crate::proc_runner::make(made, *names.list(), side) {
                 Ok(runner) => {
@@ -1289,6 +1292,26 @@ impl<'j, 'a: 'j> NamesQueue<'j, 'a> {
         self.order.first_key_value().map(|(_, task)| *task)
     }
 
+    /// Highest-priority ALREADY-FINISHED `Names` task (non-leaf lowest wave first, then Name),
+    /// eliminating wave-wide and hash-order head-of-line blocking while preserving priority.
+    pub(crate) fn first_ready(&self) -> Option<EngineTask> {
+        self.order
+            .iter()
+            .find(|((_, _, name), _)| self.answered.contains_key(name))
+            .map(|(_, task)| *task)
+    }
+
+    /// Next ALREADY-FINISHED `Names` task in `phase` (if `feeds_only`, restricted to non-leaf
+    /// tasks so leaf crates do not delay admitting newly unblocked downstream waves).
+    pub(crate) fn next_ready_in_phase(&self, phase: blaze_engine::Phase, feeds_only: bool) -> Option<EngineTask> {
+        self.order
+            .iter()
+            .find(|((is_leaf, _, name), task)| {
+                task.planned.phase == phase && (!feeds_only || !*is_leaf) && self.answered.contains_key(name)
+            })
+            .map(|(_, task)| *task)
+    }
+
     #[cfg(test)]
     fn next_virtual(&self) -> Option<(u64, Name)> {
         self.running.values().filter_map(|r| r.end_tick.map(|tick| (tick, r.task.planned.name))).min()
@@ -1338,15 +1361,18 @@ impl<'j, 'a: 'j> NamesQueue<'j, 'a> {
         self.answered.contains_key(&name)
     }
 
-    pub(crate) fn set_width(&mut self, scope: &bstd::task::Scope<'_>, handles: &Handles<'_, '_>, scripts_pending: bool) -> core::num::NonZeroU32 {
+    pub(crate) fn set_width(&mut self, scope: &bstd::task::Scope<'_>, handles: &Handles<'_, '_>, runnable_scripts: usize) -> core::num::NonZeroU32 {
         let width = handles.workers.get().min(scope.workers());
         #[cfg(test)]
         let width = if crate::engine_scripts::runner_clock().is_some() { handles.workers.get() } else { width };
-        let workers = if scripts_pending {
-            core::num::NonZeroU32::new(width.saturating_sub(width.div_ceil(4))).unwrap_or(core::num::NonZeroU32::MIN)
+        let reserve = if runnable_scripts > 0 {
+            let cap = width.div_ceil(4);
+            let want = u32::try_from(runnable_scripts).unwrap_or(u32::MAX);
+            cap.min(want)
         } else {
-            core::num::NonZeroU32::new(width).unwrap_or(core::num::NonZeroU32::MIN)
+            0
         };
+        let workers = core::num::NonZeroU32::new(width.saturating_sub(reserve)).unwrap_or(core::num::NonZeroU32::MIN);
         self.width = workers.get() as usize;
         workers
     }
@@ -1358,7 +1384,7 @@ impl<'j, 'a: 'j> NamesQueue<'j, 'a> {
         &mut self, scope: &'j bstd::task::Scope<'j>, cx: &Cx, stage: &mut NamesStage<'f>,
         store: &mut dyn crate::store::Store<'r>, read: &mut EngineRecords<'r>, view: blaze_engine::View<'_, '_>,
         handles: &Handles<'j, 'f>, task: EngineTask, alloc: SharedAlloc<'a>, frame: &'f Frame,
-        waiter: &'j blaze_core::wait::Parker, scripts_pending: bool,
+        waiter: &'j blaze_core::wait::Parker, runnable_scripts: usize,
     ) -> Result<(), CliError> {
         let name = task.planned.name;
         stage.admissions.admit(name)?;
@@ -1589,7 +1615,7 @@ impl<'j, 'a: 'j> NamesQueue<'j, 'a> {
                 }
             }
         } else { None };
-        let workers = self.set_width(scope, handles, scripts_pending);
+        let workers = self.set_width(scope, handles, runnable_scripts);
         let uncommitted_snap = if gate.is_ok() && needs_uncommitted_snap {
             self.uncommitted_snap.as_ref().map(|(_, snap)| Share::share(snap))
         } else {
