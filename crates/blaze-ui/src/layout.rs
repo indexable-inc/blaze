@@ -13,7 +13,8 @@ use blaze_ecs::{Entity, World};
 use blaze_own::Vec as OwnVec;
 
 use crate::components::{
-    ChildOrder, ComputedRect, Hidden, LabelText, ScrollOffset, SubText, TextInputState, WidgetKind,
+    ChildOrder, ComputedRect, Hidden, IntrinsicSize, LabelText, ScrollOffset, SubText,
+    TextInputState, WidgetKind,
 };
 use crate::draw::DrawList;
 use crate::error::UiError;
@@ -467,7 +468,17 @@ impl<A: Allocator + Copy> LayoutEngine<A> {
                         .clamp(c_style.min_h, c_style.max_h);
                         total_content_w = total_content_w.max(w);
                         total_content_h = total_content_h.max(h);
-                        Rect::new(content_rect.x, content_rect.y, w, h)
+                        let x_off = match style.align {
+                            Align::Start | Align::Stretch => 0.0,
+                            Align::Center => (content_rect.w - w) * 0.5,
+                            Align::End => content_rect.w - w,
+                        };
+                        let y_off = match style.justify {
+                            Justify::Start | Justify::SpaceBetween => 0.0,
+                            Justify::Center => (content_rect.h - h) * 0.5,
+                            Justify::End => content_rect.h - h,
+                        };
+                        Rect::new(content_rect.x + x_off, content_rect.y + y_off, w, h)
                     }
                 };
 
@@ -557,6 +568,9 @@ fn measure_leaf_intrinsic<A: Allocator + Copy + 'static>(
     entity: Entity,
     draw: &DrawList<A>,
 ) -> Vec2 {
+    if let Ok(Some(intr)) = world.get::<IntrinsicSize>(entity) {
+        return intr.0;
+    }
     let kind = world
         .get::<WidgetKind>(entity)
         .ok()

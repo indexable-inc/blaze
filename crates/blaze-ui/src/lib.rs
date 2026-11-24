@@ -38,6 +38,7 @@ pub mod slug_shader;
 pub mod style;
 pub mod types;
 pub mod ui;
+pub mod view;
 pub mod virtual_list;
 pub mod workbench;
 
@@ -46,10 +47,12 @@ mod tests;
 
 pub use components::{
     ActionTag, Active, BadgeTone, CanvasBatch, ChildOrder, ComputedRect, Disabled, DockedIn,
-    Focusable, Focused, FrameStats, GpuSlot, Hidden, Hovered, Inspects, Interactive, LabelText,
-    ScrollOffset, Selected, SliderState, SubText, TextInputState, ToggleState, TooltipFor,
-    TreeRowState, WidgetKind, register_ui_schema,
+    Focusable, Focused, FrameStats, GpuSlot, Hidden, Hovered, Inspects, Interactive, IntrinsicSize,
+    LabelText, ScrollOffset, Selected, ShapedGlyph, ShapedText, SliderState, SubText,
+    TextInputState, TextStyle, ToggleState, TooltipFor, TreeRowState, WidgetKind,
+    register_ui_schema,
 };
+pub use view::{ViewNode, ViewScope, extract_slug_insts, measure_ui_slug_text};
 pub use dock::{
     DOCK_HEADER_H, DOCK_SPLIT_GAP, DockDrag, DockLeaf, DockLeafRect, DockSplit, DockSplitterRect,
     DockTab, DockWorkspace, DropZone, SplitDir,

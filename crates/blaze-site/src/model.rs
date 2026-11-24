@@ -6,6 +6,7 @@ use core::alloc::Allocator;
 use blaze_ecs::{ChildOf, Entity, World};
 use blaze_json::{Event, Limits, Reader, Str};
 use blaze_own::{String as OwnString, Vec as OwnVec};
+use blaze_ui::ChildOrder;
 
 use crate::error::SiteError;
 use crate::palette::{ImageName, RoleName};
@@ -203,6 +204,88 @@ pub struct SiteFocused;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SitePressed;
 
+/// Owned HarfBuzz-shaped word stream stored directly as a `blaze_ecs` component so every piece of
+/// text, glyph run, role, and inline icon lives inside the ECS (no external `PageModel` lookup!).
+pub struct EcsWords<A: Allocator + Copy>(pub OwnVec<Word<A>, A>);
+
+/// Owned clipboard payload component attached to command / copy entities in `blaze_ecs::World`.
+pub struct SiteCopyText<A: Allocator + Copy>(pub OwnString<A>);
+
+/// Flecs-style singleton metadata stored directly in `blaze_ecs::World` (`world.singleton::<SiteMeta<A>>()`).
+pub struct SiteMeta<A: Allocator + Copy> {
+    pub domain: OwnString<A>,
+}
+
+/// Semantic ECS marker tags identifying page roles for declarative `ecs_query!` access.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SiteWordmark;
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SiteBacked;
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SiteHeroTitle;
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SiteInstallCmd;
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SiteCopyLabel;
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SiteFeatureList;
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SiteFeatureItem;
+
+fn copy_word_in<A: Allocator + Copy>(w: &Word<A>, alloc: A) -> Result<Word<A>, SiteError> {
+    let text = OwnString::try_from_str_in(w.text.as_str(), alloc)?;
+    let mut glyphs = OwnVec::try_with_capacity_in(w.glyphs.len(), alloc)?;
+    for &g in w.glyphs.as_slice() {
+        glyphs.try_push(g).map_err(|r| SiteError::Alloc(r.why))?;
+    }
+    let mut xs = OwnVec::try_with_capacity_in(w.xs.len(), alloc)?;
+    for &x in w.xs.as_slice() {
+        xs.try_push(x).map_err(|r| SiteError::Alloc(r.why))?;
+    }
+    let mut scramble = OwnVec::try_with_capacity_in(w.scramble.len(), alloc)?;
+    for &s in w.scramble.as_slice() {
+        scramble.try_push(s).map_err(|r| SiteError::Alloc(r.why))?;
+    }
+    Ok(Word {
+        text,
+        role: w.role,
+        glyphs,
+        xs,
+        adv: w.adv,
+        space: w.space,
+        link: w.link,
+        chip: w.chip,
+        chip_kind: w.chip_kind,
+        deco: w.deco,
+        image: w.image,
+        rise: w.rise,
+        drop: w.drop,
+        raise: w.raise,
+        part: w.part,
+        scramble,
+    })
+}
+
+fn copy_words_in<A: Allocator + Copy>(
+    words: &[Word<A>],
+    alloc: A,
+) -> Result<EcsWords<A>, SiteError> {
+    let mut out = OwnVec::try_with_capacity_in(words.len(), alloc)?;
+    for w in words {
+        out.try_push(copy_word_in(w, alloc)?).map_err(|r| SiteError::Alloc(r.why))?;
+    }
+    Ok(EcsWords(out))
+}
+
+fn extract_domain_from_copy(copy_cmd: &str) -> &str {
+    let Some(pos) = copy_cmd.find("https://") else {
+        return "";
+    };
+    let rest = copy_cmd.get(pos + 8..).unwrap_or("");
+    let end = rest.find(|c: char| c.is_ascii_whitespace() || c == '|').unwrap_or(rest.len());
+    rest.get(..end).unwrap_or("")
+}
+
 /// Entities created when mounting [`PageModel`] into a `blaze_ecs::World`.
 pub struct SiteEcsHandles<A: Allocator + Copy> {
     pub root: Entity,
@@ -243,46 +326,120 @@ impl<A: Allocator + Copy + 'static> PageModel<A> {
     }
 
     /// Mount this page's blocks, items, links, command parts, copy button, and find bar into a
-    /// relational `blaze_ecs::World` (`ChildOf` + Flecs 4.2 `DontFragment` interaction tags).
+    /// relational `blaze_ecs::World` (`ChildOf` + `OrderedChildren` + `EcsWords<A>` +
+    /// Flecs 4.2 `DontFragment` interaction tags + `SiteMeta<A>` singleton).
     pub fn mount_into_ecs(&self, world: &mut World<A>, alloc: A) -> Result<SiteEcsHandles<A>, SiteError> {
         let _ = world.register_copy::<SiteNodeKind>()?;
+        let _ = world.register_copy::<ChildOrder>()?;
         world.mark_tag_dont_fragment::<SiteHovered>()?;
         world.mark_tag_dont_fragment::<SiteFocused>()?;
         world.mark_tag_dont_fragment::<SitePressed>()?;
 
         let root = world.spawn_named("BlazeSite::Root")?;
         world.set_copy(root, SiteNodeKind::PageRoot)?;
+        let ordered_tag = world.ordered_children();
+        world.add_tag(root, ordered_tag)?;
+
+        let copy_button = world.spawn_named("BlazeSite::CopyButton")?;
+        world.set_copy(copy_button, SiteNodeKind::CopyButton)?;
+        world.relate::<ChildOf>(copy_button, root)?;
+
+        let mut domain_str: Option<&str> = None;
+        let mut first_list_tagged = false;
+        let mut first_cmd_tagged = false;
 
         for (bi, block) in self.blocks.as_slice().iter().enumerate() {
             let b_ent = world.spawn()?;
             world.set_copy(b_ent, SiteNodeKind::Block(u32::try_from(bi).unwrap_or(0)))?;
+            world.set_copy(b_ent, ChildOrder(u32::try_from(bi).unwrap_or(0)))?;
             world.relate::<ChildOf>(b_ent, root)?;
-            if let Block::List { items } | Block::Soon { items, .. } = block {
-                // Iterative walk over nested items in exact document order (push in reverse onto LIFO stack).
-                let mut stack: OwnVec<(usize, Entity), A> = OwnVec::new_in(alloc);
-                let mut ri = items.len();
-                while ri > 0 {
-                    ri -= 1;
-                    if let Some(&idx) = items.get(ri) {
-                        stack.try_push((idx, b_ent)).map_err(|r| SiteError::Alloc(r.why))?;
+
+            match block {
+                Block::Bar { name, backed, .. } => {
+                    let wm = world.spawn()?;
+                    world.set(wm, copy_words_in(name.as_slice(), alloc)?)?;
+                    world.add_tag_typed::<SiteWordmark>(wm)?;
+                    world.relate::<ChildOf>(wm, b_ent)?;
+
+                    if !backed.is_empty() {
+                        let bk = world.spawn()?;
+                        world.set(bk, copy_words_in(backed.as_slice(), alloc)?)?;
+                        world.add_tag_typed::<SiteBacked>(bk)?;
+                        world.relate::<ChildOf>(bk, b_ent)?;
                     }
                 }
-                while let Some((item_idx, parent_ent)) = stack.pop() {
-                    let it_ent = world.spawn()?;
-                    world.set_copy(it_ent, SiteNodeKind::ListItem(u32::try_from(item_idx).unwrap_or(0)))?;
-                    world.relate::<ChildOf>(it_ent, parent_ent)?;
-                    if let Some(node) = self.items_arena.get(item_idx) {
-                        let mut ci = node.children.len();
-                        while ci > 0 {
-                            ci -= 1;
-                            if let Some(&ch) = node.children.get(ci) {
-                                stack.try_push((ch, it_ent)).map_err(|r| SiteError::Alloc(r.why))?;
+                Block::Title { words } => {
+                    world.set(b_ent, copy_words_in(words.as_slice(), alloc)?)?;
+                    world.add_tag_typed::<SiteHeroTitle>(b_ent)?;
+                }
+                Block::Label { words } => {
+                    world.set(b_ent, copy_words_in(words.as_slice(), alloc)?)?;
+                }
+                Block::Command { words, copy, button, .. } => {
+                    world.set(b_ent, copy_words_in(words.as_slice(), alloc)?)?;
+                    world.set(b_ent, SiteCopyText(OwnString::try_from_str_in(copy.as_str(), alloc)?))?;
+                    if !first_cmd_tagged {
+                        first_cmd_tagged = true;
+                        world.add_tag_typed::<SiteInstallCmd>(b_ent)?;
+                        let dom = extract_domain_from_copy(copy.as_str());
+                        if !dom.is_empty() {
+                            domain_str = Some(dom);
+                        }
+                        if !button.is_empty() {
+                            world.set(copy_button, copy_words_in(button.as_slice(), alloc)?)?;
+                            world.add_tag_typed::<SiteCopyLabel>(copy_button)?;
+                        }
+                    }
+                }
+                Block::List { items } | Block::Soon { items, .. } => {
+                    world.add_tag(b_ent, ordered_tag)?;
+                    let is_primary_list = matches!(block, Block::List { .. }) && !first_list_tagged;
+                    if is_primary_list {
+                        first_list_tagged = true;
+                        world.add_tag_typed::<SiteFeatureList>(b_ent)?;
+                    }
+                    // Iterative walk over nested items in exact document order (push in reverse onto LIFO stack).
+                    let mut stack: OwnVec<(usize, Entity, u32), A> = OwnVec::new_in(alloc);
+                    let mut ri = items.len();
+                    while ri > 0 {
+                        ri -= 1;
+                        if let Some(&idx) = items.get(ri) {
+                            stack
+                                .try_push((idx, b_ent, u32::try_from(ri).unwrap_or(0)))
+                                .map_err(|r| SiteError::Alloc(r.why))?;
+                        }
+                    }
+                    while let Some((item_idx, parent_ent, sibling_ord)) = stack.pop() {
+                        let it_ent = world.spawn()?;
+                        world.set_copy(it_ent, SiteNodeKind::ListItem(u32::try_from(item_idx).unwrap_or(0)))?;
+                        world.set_copy(it_ent, ChildOrder(sibling_ord))?;
+                        world.relate::<ChildOf>(it_ent, parent_ent)?;
+                        if let Some(node) = self.items_arena.get(item_idx) {
+                            world.set(it_ent, copy_words_in(node.words.as_slice(), alloc)?)?;
+                            if is_primary_list && parent_ent == b_ent {
+                                world.add_tag_typed::<SiteFeatureItem>(it_ent)?;
+                            }
+                            let mut ci = node.children.len();
+                            while ci > 0 {
+                                ci -= 1;
+                                if let Some(&ch) = node.children.get(ci) {
+                                    stack
+                                        .try_push((ch, it_ent, u32::try_from(ci).unwrap_or(0)))
+                                        .map_err(|r| SiteError::Alloc(r.why))?;
+                                }
                             }
                         }
                     }
                 }
+                Block::Sign { closing, .. } => {
+                    world.set(b_ent, copy_words_in(closing.as_slice(), alloc)?)?;
+                }
+                Block::Notes { .. } | Block::Footer { .. } => {}
             }
         }
+
+        let dom_owned = OwnString::try_from_str_in(domain_str.unwrap_or(""), alloc)?;
+        let _ = world.set_singleton(SiteMeta { domain: dom_owned })?;
 
         let mut link_entities = OwnVec::try_with_capacity_in(self.links.len(), alloc)?;
         for i in 0..self.links.len() {
@@ -303,10 +460,6 @@ impl<A: Allocator + Copy + 'static> PageModel<A> {
                 }
             }
         }
-
-        let copy_button = world.spawn_named("BlazeSite::CopyButton")?;
-        world.set_copy(copy_button, SiteNodeKind::CopyButton)?;
-        world.relate::<ChildOf>(copy_button, root)?;
 
         let find_bar = world.spawn_named("BlazeSite::FindBar")?;
         world.set_copy(find_bar, SiteNodeKind::FindBar)?;

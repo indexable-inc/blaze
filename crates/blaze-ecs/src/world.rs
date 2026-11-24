@@ -1743,6 +1743,31 @@ impl<A: Allocator + Copy + 'static> World<A> {
     // Typed Tags, Relations & Prefabs (Zero-String Ergonomic API)
     // -------------------------------------------------------------------------
 
+    /// Flecs-style singleton: set component `T` directly on type `T`'s canonical entity.
+    pub fn set_singleton<T: 'static>(&mut self, value: T) -> Result<Entity, EcsError> {
+        let ent = self.tag_entity::<T>()?;
+        self.set(ent, value)?;
+        Ok(ent)
+    }
+
+    /// Flecs-style singleton: borrow component `T` from type `T`'s canonical entity, if set.
+    #[inline]
+    pub fn singleton<T: 'static>(&self) -> Result<Option<&T>, EcsError> {
+        let Some(ent) = self.tag_entity_id::<T>() else {
+            return Ok(None);
+        };
+        self.get::<T>(ent)
+    }
+
+    /// Flecs-style singleton: mutably borrow component `T` from type `T`'s canonical entity.
+    #[inline]
+    pub fn singleton_mut<T: 'static>(&mut self) -> Result<Option<&mut T>, EcsError> {
+        let Some(ent) = self.tag_entity_id::<T>() else {
+            return Ok(None);
+        };
+        self.get_mut::<T>(ent)
+    }
+
     /// Return the cached entity for typed tag `T` without creating one if absent.
     #[inline]
     pub fn tag_entity_id<T: 'static>(&self) -> Option<Entity> {

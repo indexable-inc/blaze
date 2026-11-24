@@ -603,11 +603,36 @@ async function boot() {
     }
   }
 
-  const fetches = [fetch('/blaze_site.wasm'), fetch('/page.json')];
-  if (device) fetches.push(fetch('/fonts/text.bin'));
+  const asset = (key, fallback) =>
+    document.body?.dataset?.[key] || document.documentElement?.dataset?.[key] || fallback;
+  const wasmUrl = asset('wasm', '/blaze_site.wasm');
+  const pageUrl = asset('page', '/page.json');
+  const fontUrl = asset('font', '/fonts/text.bin');
+  const fetches = [fetch(wasmUrl), fetch(pageUrl)];
+  if (device) fetches.push(fetch(fontUrl));
   const responses = await Promise.all(fetches);
+  for (const r of responses) {
+    if (!r.ok) {
+      if (r.status === 404 && !sessionStorage.getItem('blaze-reload-once')) {
+        sessionStorage.setItem('blaze-reload-once', '1');
+        window.location.reload();
+        return;
+      }
+      throw new Error(`Asset fetch failed (${r.status}): ${r.url}`);
+    }
+  }
   const buffers = await Promise.all(responses.map((r) => r.arrayBuffer()));
   const [wasmBytes, pageBytes, fontBytes] = buffers;
+  const magic = new Uint8Array(wasmBytes, 0, 4);
+  if (magic[0] !== 0x00 || magic[1] !== 0x61 || magic[2] !== 0x73 || magic[3] !== 0x6d) {
+    if (!sessionStorage.getItem('blaze-reload-once')) {
+      sessionStorage.setItem('blaze-reload-once', '1');
+      window.location.reload();
+      return;
+    }
+    throw new Error(`Invalid WebAssembly response from ${wasmUrl}`);
+  }
+  sessionStorage.removeItem('blaze-reload-once');
 
   const { instance } = await WebAssembly.instantiate(wasmBytes, {});
   const w = instance.exports;
@@ -795,7 +820,11 @@ async function boot() {
     const nLen = w.site_take_nav_len(h);
     if (nLen > 0) {
       const href = readStr(w.site_nav_ptr(h), nLen);
-      window.open(href, '_blank', 'noopener,noreferrer');
+      if (href.startsWith('/') || href.startsWith('#')) {
+        window.location.assign(href);
+      } else {
+        window.open(href, '_blank', 'noopener,noreferrer');
+      }
     }
     canvas.style.cursor = readStr(w.site_cursor_ptr(h), w.site_cursor_len(h));
   };
