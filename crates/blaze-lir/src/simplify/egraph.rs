@@ -87,13 +87,15 @@ pub struct AegraphOutput<A: Allocator> {
 pub struct RegBudget {
     pub gprs: u16,
     pub fprs: u16,
+    /// Whether the target ISA has native single-rounding hardware FMA (`fmadd` on AArch64, FMA3 on x86-64).
+    pub hardware_fma: bool,
 }
 
 impl RegBudget {
     /// Apple Silicon / AArch64 AAPCS64 allocatable registers (excluding SP/FP/LR/X16/X17/X18).
-    pub const AARCH64: Self = Self { gprs: 18, fprs: 24 };
+    pub const AARCH64: Self = Self { gprs: 18, fprs: 24, hardware_fma: true };
     /// x86-64 SysV allocatable registers (excluding RSP/RBP).
-    pub const X86_64: Self = Self { gprs: 13, fprs: 16 };
+    pub const X86_64: Self = Self { gprs: 13, fprs: 16, hardware_fma: true };
 }
 
 /// Chordal-SSA register pressure & spill estimate for a function.
@@ -125,6 +127,101 @@ struct ENodeKey {
 #[inline]
 fn u32_ix(v: u32) -> usize {
     usize::try_from(v).unwrap_or(usize::MAX)
+}
+
+#[inline]
+fn usize_u32(v: usize) -> u32 {
+    u32::try_from(v).unwrap_or(u32::MAX)
+}
+
+#[inline]
+fn get_u32(s: &[u32], i: usize) -> Option<u32> {
+    s.get(i).copied()
+}
+
+#[inline]
+fn get_u16(s: &[u16], i: usize) -> Option<u16> {
+    s.get(i).copied()
+}
+
+#[inline]
+fn get_u8(s: &[u8], i: usize) -> Option<u8> {
+    s.get(i).copied()
+}
+
+#[inline]
+fn get_const(s: &[Option<u128>], v: u32) -> Option<u128> {
+    s.get(u32_ix(v)).copied().flatten()
+}
+
+#[inline]
+fn copy_const(s: &mut [Option<u128>], dst: usize, src: u32) {
+    let val = s.get(u32_ix(src)).copied().flatten();
+    if let Some(slot) = s.get_mut(dst) {
+        *slot = val;
+    }
+}
+
+#[inline]
+fn set_at<T>(s: &mut [T], i: usize, val: T) {
+    if let Some(slot) = s.get_mut(i) {
+        *slot = val;
+    }
+}
+
+#[inline]
+fn extra_pair(view: &View<'_>, at: usize) -> Option<(u32, u32)> {
+    Some((*view.extra.get(at)?, *view.extra.get(at.checked_add(1)?)?))
+}
+
+#[inline]
+fn extra_triple(view: &View<'_>, at: usize) -> Option<(u32, u32, u32)> {
+    Some((
+        *view.extra.get(at)?,
+        *view.extra.get(at.checked_add(1)?)?,
+        *view.extra.get(at.checked_add(2)?)?,
+    ))
+}
+
+#[inline]
+fn inst_flags_zero(view: &View<'_>, i: usize) -> bool {
+    view.flags.get(i).copied() == Some(0)
+}
+
+#[inline]
+fn inst_ty(view: &View<'_>, i: usize) -> Option<Ty> {
+    view.tys.get(i).copied().map(Ty)
+}
+
+#[inline]
+fn unary_stand(view: &View<'_>, stands: &[u32], v: u32, expect_op: Op) -> Option<u32> {
+    let vi = u32_ix(v);
+    if view.op(vi) == expect_op {
+        stand_of(stands, *view.data.get(vi)?)
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn op_byte(op: Op) -> u8 {
+    Op::ALL.iter().position(|&o| o == op).and_then(|i| u8::try_from(i).ok()).unwrap_or(0)
+}
+
+#[inline]
+const fn int_cond_word(c: IntCond) -> u32 {
+    match c {
+        IntCond::Eq => 0,
+        IntCond::Ne => 1,
+        IntCond::Ult => 2,
+        IntCond::Ule => 3,
+        IntCond::Ugt => 4,
+        IntCond::Uge => 5,
+        IntCond::Slt => 6,
+        IntCond::Sle => 7,
+        IntCond::Sgt => 8,
+        IntCond::Sge => 9,
+    }
 }
 
 #[inline]
@@ -341,7 +438,41 @@ impl<A: Allocator + Copy> ScopedENodes<A> {
 
 #[inline]
 fn is_commutative(op: Op) -> bool {
-    matches!(op, Op::Add | Op::Mul | Op::And | Op::Or | Op::Xor)
+    matches!(op, Op::Add | Op::Mul | Op::Umulhi | Op::Smulhi | Op::And | Op::Or | Op::Xor)
+}
+
+#[derive(Clone, Copy)]
+enum MagicDiv64 {
+    MulShift { magic: u64, shift: u32 },
+    MulAddShift { magic: u64, post_shift: u32 },
+}
+
+/// Exact Granlund–Montgomery magic multiplier for 64-bit unsigned division by `d` (`3 <= d <= u64::MAX / 2`).
+fn magic_udiv64(d: u64) -> Option<MagicDiv64> {
+    if d <= 2 || d.is_power_of_two() || d > (u64::MAX / 2) {
+        return None;
+    }
+    let d128 = u128::from(d);
+    let max_n = u128::from(u64::MAX);
+    let two64 = 1u128 << 64;
+    let nc = two64 - (two64 % d128) - 1;
+    for shift in 0..63u32 {
+        let two_p = 1u128 << (64 + shift);
+        let delta = d128 - (two_p % d128);
+        let m = (two_p + delta) / d128;
+        if m <= max_n && nc.checked_mul(delta).is_some_and(|p| p < two_p) {
+            return Some(MagicDiv64::MulShift { magic: low_u64(m), shift });
+        }
+    }
+    for shift in 1..64u32 {
+        let two_p = 1u128 << (64 + shift);
+        let delta = d128 - (two_p % d128);
+        let m = (two_p + delta) / d128;
+        if m > max_n && m < (two64 << 1) && nc.checked_mul(delta).is_some_and(|p| p < two_p) {
+            return Some(MagicDiv64::MulAddShift { magic: low_u64(m - two64), post_shift: shift - 1 });
+        }
+    }
+    None
 }
 
 #[inline]
@@ -473,6 +604,14 @@ pub fn aegraph_optimize<A: Allocator + Copy>(
     view: View<'_>,
     alloc: A,
 ) -> Result<AegraphOutput<A>, SimplifyError> {
+    aegraph_optimize_inner(view, true, alloc)
+}
+
+fn aegraph_optimize_inner<A: Allocator + Copy>(
+    view: View<'_>,
+    fuse_fma: bool,
+    alloc: A,
+) -> Result<AegraphOutput<A>, SimplifyError> {
     if view.blocks() == 0 {
         return Err(SimplifyError::Refused { inst: 0, what: "a function with no blocks" });
     }
@@ -499,6 +638,7 @@ pub fn aegraph_optimize<A: Allocator + Copy>(
     };
 
     let mut table = ScopedENodes::new(len, &alloc);
+    let mut mem_known: Vec<(u32, i32, u16, u32), A> = Vec::new_in(alloc);
 
     // Explicit DFS over the dominator tree with scoped hash-consing rollback.
     enum Frame {
@@ -521,11 +661,67 @@ pub fn aegraph_optimize<A: Allocator + Copy>(
                     dfs.push(Frame::Enter(child));
                 }
 
+                mem_known.clear();
                 let range = view.block(Block(b));
                 for inst in range {
                     let op = view.op(inst);
                     let flags = Flags(view.flags[inst]);
                     let ty = Ty(view.tys[inst]);
+
+                    // Local sound store-to-load forwarding & redundant non-volatile load GVN.
+                    match op {
+                        Op::Load if !flags.contains(Flags::VOLATILE) => {
+                            let Some(at) = get_u32(view.data, inst).map(u32_ix) else { continue };
+                            let Some((raw_ptr, raw_off)) = extra_pair(&view, at) else { continue };
+                            let Some(ptr) = stand_of(&stands, raw_ptr) else { continue };
+                            let off = raw_off.cast_signed();
+                            if let Some(&(_, _, _, prev_v)) = mem_known
+                                .iter()
+                                .find(|&&(p, o, t, _)| p == ptr && o == off && t == ty.0)
+                            {
+                                set_at(&mut stands, inst, prev_v);
+                                copy_const(&mut known_const, inst, prev_v);
+                                stats.gvn_hits += 1;
+                                continue;
+                            }
+                            if mem_known.len() < 32 {
+                                mem_known.push((ptr, off, ty.0, usize_u32(inst)));
+                            }
+                            continue;
+                        }
+                        Op::Store if !flags.contains(Flags::VOLATILE) => {
+                            let Some(at) = get_u32(view.data, inst).map(u32_ix) else { continue };
+                            let Some((raw_val, raw_ptr, raw_off)) = extra_triple(&view, at) else { continue };
+                            let Some(val) = stand_of(&stands, raw_val) else { continue };
+                            let Some(ptr) = stand_of(&stands, raw_ptr) else { continue };
+                            let off = raw_off.cast_signed();
+                            let Some(val_ty) = get_u16(view.tys, u32_ix(raw_val)) else { continue };
+                            // Conservative alias flush, then record exact forwarded store.
+                            mem_known.clear();
+                            mem_known.push((ptr, off, val_ty, val));
+                            continue;
+                        }
+                        Op::Load
+                        | Op::Store
+                        | Op::Call
+                        | Op::CallIndirect
+                        | Op::Invoke
+                        | Op::InvokeIndirect
+                        | Op::Memcpy
+                        | Op::Memmove
+                        | Op::Memset
+                        | Op::AtomicLoad
+                        | Op::AtomicStore
+                        | Op::AtomicRmw
+                        | Op::Cmpxchg
+                        | Op::Fence
+                        | Op::Asm
+                        | Op::AsmBr
+                        | Op::TargetIntrinsic => {
+                            mem_known.clear();
+                        }
+                        _ => {}
+                    }
 
                     // Record constants immediately (and deduplicate identical constants by e-node).
                     if op == Op::Iconst {
@@ -555,6 +751,20 @@ pub fn aegraph_optimize<A: Allocator + Copy>(
                             let words = ty.const_words() as usize;
                             let v = wide_value(&view.extra[at..at + words], bits);
                             known_const[inst] = Some(v);
+                            if v <= u128::from(u64::MAX) {
+                                let key = ENodeKey {
+                                    op: op_byte(Op::Iconst),
+                                    ty: ty.0,
+                                    cond: 0,
+                                    a: low_u32(v),
+                                    b: low_u32(v >> 32),
+                                    c: low_u32(v >> 64),
+                                };
+                                if let Some(prev) = table.get_or_insert(key, usize_u32(inst)) {
+                                    set_at(&mut stands, inst, prev);
+                                    stats.gvn_hits += 1;
+                                }
+                            }
                         }
                         continue;
                     }
@@ -599,8 +809,9 @@ pub fn aegraph_optimize<A: Allocator + Copy>(
                     }
 
                     // Contract `fadd(fmul(a, b), c)` / `fadd(c, fmul(a, b))` into native hardware
-                    // `Op::Fma(a, b, c)` ONLY when `Flags::CONTRACT` explicitly permits contraction.
-                    if op == Op::Fadd && ty.is_scalar() && ty.is_float() && flags.contains(Flags::CONTRACT) {
+                    // `Op::Fma(a, b, c)` ONLY when `Flags::CONTRACT` explicitly permits contraction
+                    // and the target supports native hardware FMA.
+                    if fuse_fma && op == Op::Fadd && ty.is_scalar() && ty.is_float() && flags.contains(Flags::CONTRACT) {
                         if let Some(&raw_at) = view.data.get(inst)
                             && let Some(at) = usize::try_from(raw_at).ok()
                             && let (Some(&raw_l), Some(&raw_r), Some(inst_id)) = (
@@ -630,8 +841,9 @@ pub fn aegraph_optimize<A: Allocator + Copy>(
                         }
                     }
 
-                    // Only rewrite flag-free pure scalar ops (preserves every promise/UB/effect).
-                    if flags.0 != 0 {
+                    // Only rewrite pure ops with no meaning flags (volatile/atomic orderings stay untouched;
+                    // promise flags like nsw/nuw/inbounds are safe to refine or drop).
+                    if op.info().flags.meanings_only(flags).0 != 0 {
                         continue;
                     }
 
@@ -668,6 +880,7 @@ pub fn aegraph_optimize<A: Allocator + Copy>(
                         Op::Add
                         | Op::Sub
                         | Op::Mul
+                        | Op::Umulhi
                         | Op::And
                         | Op::Or
                         | Op::Xor
@@ -702,6 +915,10 @@ pub fn aegraph_optimize<A: Allocator + Copy>(
                                         folded_val = Some(a);
                                     } else if ca == Some(0) {
                                         folded_val = Some(b);
+                                    } else if unary_stand(&view, &stands, b, Op::Neg) == Some(a)
+                                        || unary_stand(&view, &stands, a, Op::Neg) == Some(b)
+                                    {
+                                        folded_const = Some(0); // x + (-x) == 0
                                     } else if a == b {
                                         stats.strength_reductions += 1; // x + x == x << 1
                                     }
@@ -711,6 +928,10 @@ pub fn aegraph_optimize<A: Allocator + Copy>(
                                         folded_val = Some(a);
                                     } else if a == b {
                                         folded_const = Some(0);
+                                    } else if ca == Some(0)
+                                        && let Some(inner) = unary_stand(&view, &stands, b, Op::Neg)
+                                    {
+                                        folded_val = Some(inner); // 0 - (-x) == x
                                     }
                                 }
                                 Op::Mul => {
@@ -733,6 +954,10 @@ pub fn aegraph_optimize<A: Allocator + Copy>(
                                         folded_val = Some(a);
                                     } else if ca == Some(mask) {
                                         folded_val = Some(b);
+                                    } else if unary_stand(&view, &stands, b, Op::Not) == Some(a)
+                                        || unary_stand(&view, &stands, a, Op::Not) == Some(b)
+                                    {
+                                        folded_const = Some(0); // x & !x == 0
                                     }
                                 }
                                 Op::Or => {
@@ -742,6 +967,10 @@ pub fn aegraph_optimize<A: Allocator + Copy>(
                                         folded_val = Some(a);
                                     } else if ca == Some(0) {
                                         folded_val = Some(b);
+                                    } else if unary_stand(&view, &stands, b, Op::Not) == Some(a)
+                                        || unary_stand(&view, &stands, a, Op::Not) == Some(b)
+                                    {
+                                        folded_const = Some(mask); // x | !x == all_ones
                                     }
                                 }
                                 Op::Xor => {
@@ -751,6 +980,10 @@ pub fn aegraph_optimize<A: Allocator + Copy>(
                                         folded_val = Some(a);
                                     } else if ca == Some(0) {
                                         folded_val = Some(b);
+                                    } else if unary_stand(&view, &stands, b, Op::Not) == Some(a)
+                                        || unary_stand(&view, &stands, a, Op::Not) == Some(b)
+                                    {
+                                        folded_const = Some(mask); // x ^ !x == all_ones
                                     }
                                 }
                                 Op::Shl | Op::Lshr | Op::Ashr => {
@@ -763,15 +996,19 @@ pub fn aegraph_optimize<A: Allocator + Copy>(
                                 Op::Udiv => {
                                     if cb == Some(1) {
                                         folded_val = Some(a);
-                                    } else if cb.is_some_and(is_power_of_two_gt1) {
-                                        stats.strength_reductions += 1; // udiv x, 2^k == lshr x, k
+                                    } else if cb.is_some_and(is_power_of_two_gt1)
+                                        || (bits == 64 && cb.and_then(|v| u64::try_from(v).ok()).and_then(magic_udiv64).is_some())
+                                    {
+                                        stats.strength_reductions += 1;
                                     }
                                 }
                                 Op::Urem => {
                                     if cb == Some(1) {
                                         folded_const = Some(0);
-                                    } else if cb.is_some_and(is_power_of_two_gt1) {
-                                        stats.strength_reductions += 1; // urem x, 2^k == and x, 2^k - 1
+                                    } else if cb.is_some_and(is_power_of_two_gt1)
+                                        || (bits == 64 && cb.and_then(|v| u64::try_from(v).ok()).and_then(magic_udiv64).is_some())
+                                    {
+                                        stats.strength_reductions += 1;
                                     }
                                 }
                                 _ => {}
@@ -803,6 +1040,114 @@ pub fn aegraph_optimize<A: Allocator + Copy>(
                             }
                         }
 
+                        Op::Zext | Op::Sext | Op::Trunc => {
+                            let Some((bits, mask)) = scalar_int_mask(ty, ptr_bits) else { continue };
+                            let Some(raw_a) = get_u32(view.data, inst) else { continue };
+                            let Some(a) = stand_of(&stands, raw_a) else { continue };
+                            let ai = u32_ix(a);
+                            let Some(src_ty) = inst_ty(&view, ai) else { continue };
+                            if src_ty == ty {
+                                set_at(&mut stands, inst, a);
+                                copy_const(&mut known_const, inst, a);
+                                stats.identities_folded += 1;
+                                continue;
+                            }
+                            // `trunc(zext|sext(inner)) -> inner` when `inner` already has type `ty`
+                            // (eliminates `trunc i1 (zext i8 (icmp ...))` round-trips from Rust `bool`!).
+                            if op == Op::Trunc
+                                && matches!(view.op(ai), Op::Zext | Op::Sext)
+                                && inst_flags_zero(&view, ai)
+                                && let Some(raw_inner) = get_u32(view.data, ai)
+                                && let Some(inner) = stand_of(&stands, raw_inner)
+                                && inst_ty(&view, u32_ix(inner)) == Some(ty)
+                            {
+                                set_at(&mut stands, inst, inner);
+                                copy_const(&mut known_const, inst, inner);
+                                stats.identities_folded += 1;
+                                continue;
+                            }
+                            if let Some(ca) = get_const(&known_const, a) {
+                                if let Some((src_bits, _)) = scalar_int_mask(src_ty, ptr_bits) {
+                                    let res = match op {
+                                        Op::Sext => sext(ca, src_bits).cast_unsigned() & mask,
+                                        _ => ca & mask,
+                                    };
+                                    let _ = bits;
+                                    set_at(&mut known_const, inst, Some(res));
+                                    set_at(&mut edit_const, inst, Some(res));
+                                    stats.constants_folded += 1;
+                                    continue;
+                                }
+                            }
+                            let key = ENodeKey { op: inst_op_byte(&view, inst), ty: ty.0, cond: 0, a, b: 0, c: 0 };
+                            if let Some(prev) = table.get_or_insert(key, usize_u32(inst)) {
+                                set_at(&mut stands, inst, prev);
+                                copy_const(&mut known_const, inst, prev);
+                                stats.gvn_hits += 1;
+                            }
+                        }
+
+                        Op::FromExposed => {
+                            let Some(raw_a) = get_u32(view.data, inst) else { continue };
+                            let Some(a) = stand_of(&stands, raw_a) else { continue };
+                            let ai = u32_ix(a);
+                            if matches!(view.op(ai), Op::Expose | Op::PtrAddr)
+                                && inst_flags_zero(&view, ai)
+                                && let Some(raw_p) = get_u32(view.data, ai)
+                                && let Some(p) = stand_of(&stands, raw_p)
+                                && inst_ty(&view, u32_ix(p)) == Some(ty)
+                            {
+                                set_at(&mut stands, inst, p);
+                                stats.identities_folded += 1;
+                                continue;
+                            }
+                            let key = ENodeKey { op: inst_op_byte(&view, inst), ty: ty.0, cond: 0, a, b: 0, c: 0 };
+                            if let Some(prev) = table.get_or_insert(key, usize_u32(inst)) {
+                                set_at(&mut stands, inst, prev);
+                                stats.gvn_hits += 1;
+                            }
+                        }
+
+                        Op::PtrAddr | Op::Expose => {
+                            let Some(raw_a) = get_u32(view.data, inst) else { continue };
+                            let Some(a) = stand_of(&stands, raw_a) else { continue };
+                            let ai = u32_ix(a);
+                            if view.op(ai) == Op::FromExposed
+                                && inst_flags_zero(&view, ai)
+                                && let Some(raw_x) = get_u32(view.data, ai)
+                                && let Some(x) = stand_of(&stands, raw_x)
+                                && inst_ty(&view, u32_ix(x)) == Some(ty)
+                            {
+                                set_at(&mut stands, inst, x);
+                                copy_const(&mut known_const, inst, x);
+                                stats.identities_folded += 1;
+                                continue;
+                            }
+                            let key = ENodeKey { op: inst_op_byte(&view, inst), ty: ty.0, cond: 0, a, b: 0, c: 0 };
+                            if let Some(prev) = table.get_or_insert(key, usize_u32(inst)) {
+                                set_at(&mut stands, inst, prev);
+                                copy_const(&mut known_const, inst, prev);
+                                stats.gvn_hits += 1;
+                            }
+                        }
+
+                        Op::PtrAdd => {
+                            let Some(at) = get_u32(view.data, inst).map(u32_ix) else { continue };
+                            let Some((raw_a, raw_b)) = extra_pair(&view, at) else { continue };
+                            let Some(a) = stand_of(&stands, raw_a) else { continue };
+                            let Some(b) = stand_of(&stands, raw_b) else { continue };
+                            if get_const(&known_const, b) == Some(0) {
+                                set_at(&mut stands, inst, a);
+                                stats.identities_folded += 1;
+                                continue;
+                            }
+                            let key = ENodeKey { op: inst_op_byte(&view, inst), ty: ty.0, cond: 0, a, b, c: 0 };
+                            if let Some(prev) = table.get_or_insert(key, usize_u32(inst)) {
+                                set_at(&mut stands, inst, prev);
+                                stats.gvn_hits += 1;
+                            }
+                        }
+
                         Op::Icmp => {
                             let at = view.data[inst] as usize;
                             let cond_raw = view.extra[at];
@@ -830,6 +1175,50 @@ pub fn aegraph_optimize<A: Allocator + Copy>(
                                 edit_const[inst] = Some(truth);
                                 stats.identities_folded += 1;
                                 continue;
+                            }
+                            // Unwrap Rust `bool` (`i8`) round-trips:
+                            // `icmp ne (zext(c: i1)), 0 -> c` and `icmp eq (zext(c: i1)), 1 -> c`!
+                            // Unlocks `CmpBr`/`CmpSelect` fusion, auto-vectorization, memchr, and 4x unroll
+                            // on every real Rust `while`/`if` condition lowered through `i8` bools!
+                            if ty == Ty::I1 {
+                                let unwrap_bool = |v: u32| -> Option<u32> {
+                                    let vi = u32_ix(v);
+                                    if inst_ty(&view, vi) == Some(Ty::I1) {
+                                        Some(v)
+                                    } else if view.op(vi) == Op::Zext && inst_flags_zero(&view, vi) {
+                                        let inner = stand_of(&stands, get_u32(view.data, vi)?)?;
+                                        (inst_ty(&view, u32_ix(inner)) == Some(Ty::I1)).then_some(inner)
+                                    } else {
+                                        None
+                                    }
+                                };
+                                let folded_bool = match cond {
+                                    IntCond::Ne => {
+                                        if get_const(&known_const, b) == Some(0) {
+                                            unwrap_bool(a)
+                                        } else if get_const(&known_const, a) == Some(0) {
+                                            unwrap_bool(b)
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                    IntCond::Eq => {
+                                        if get_const(&known_const, b) == Some(1) {
+                                            unwrap_bool(a)
+                                        } else if get_const(&known_const, a) == Some(1) {
+                                            unwrap_bool(b)
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                    _ => None,
+                                };
+                                if let Some(inner) = folded_bool {
+                                    set_at(&mut stands, inst, inner);
+                                    copy_const(&mut known_const, inst, inner);
+                                    stats.identities_folded += 1;
+                                    continue;
+                                }
                             }
                             let (ka, kb, kcond) = match cond {
                                 IntCond::Eq | IntCond::Ne if a > b => (b, a, cond as u8),
@@ -1262,6 +1651,8 @@ const fn is_licm_pure(op: Op) -> bool {
             | Op::Add
             | Op::Sub
             | Op::Mul
+            | Op::Umulhi
+            | Op::Smulhi
             | Op::Neg
             | Op::And
             | Op::Or
@@ -1270,11 +1661,14 @@ const fn is_licm_pure(op: Op) -> bool {
             | Op::Shl
             | Op::Lshr
             | Op::Ashr
-            | Op::Icmp
-            | Op::Fcmp
+            | Op::Zext
+            | Op::Sext
+            | Op::Trunc
             | Op::Fadd
             | Op::Fsub
             | Op::Fmul
+            | Op::Icmp
+            | Op::Fcmp
             | Op::Fdiv
             | Op::Fneg
             | Op::Fabs
@@ -1291,6 +1685,14 @@ const fn is_licm_pure(op: Op) -> bool {
             | Op::Fcopysign
             | Op::Fma
             | Op::Select
+            | Op::FuncAddr
+            | Op::DataAddr
+            | Op::SlotAddr
+            | Op::PtrAddr
+            | Op::Expose
+            | Op::FromExposed
+            | Op::PtrAdd
+            | Op::Splat
     )
 }
 
@@ -1532,41 +1934,62 @@ pub struct SotaFeedbackOutput<A: Allocator> {
     pub rounds_run: u32,
 }
 
+#[derive(Clone, Copy)]
+enum ValFixup {
+    Data { dst_inst: usize, old_val: u32 },
+    Extra { dst_extra: usize, old_val: u32 },
+}
+
 /// Copies one instruction from `view` into `func`, remapping all value operands through `val_map`.
+/// Any operand whose defining block appears later in non-RPO layout order is recorded in `fixups`
+/// and patched once all blocks have been emitted.
 fn copy_inst_remapped<A: Allocator + Copy>(
     view: &View<'_>,
     inst: usize,
     val_map: &[u32],
+    fixups: &mut Vec<ValFixup, A>,
     func: &mut Func<A>,
-) -> Result<u32, SimplifyError> {
+) -> u32 {
     let op = view.op(inst);
     let flags = view.flags[inst];
     let ty = view.tys[inst];
     let attrs = view.attrs[inst];
     let loc = view.locs[inst];
-    let map_val = |v: u32| -> Result<u32, SimplifyError> {
-        let mapped = val_map[v as usize];
-        if mapped == NONE {
-            Err(SimplifyError::Refused { inst, what: "unmapped operand during SOTA rewrite" })
-        } else {
-            Ok(mapped)
-        }
-    };
+    let out_idx = usize_u32(func.ops.len());
 
     let data = match op.info().layout {
         Layout::None => 0,
-        Layout::Data(Field::Value) => map_val(view.data[inst])?,
+        Layout::Data(Field::Value) => {
+            let old = get_u32(view.data, inst).unwrap_or(0);
+            let mapped = get_u32(val_map, u32_ix(old)).unwrap_or(NONE);
+            if mapped == NONE {
+                fixups.push(ValFixup::Data { dst_inst: u32_ix(out_idx), old_val: old });
+                0
+            } else {
+                mapped
+            }
+        }
         Layout::Data(_) => view.data[inst],
         Layout::Extra(fields) => {
             let start = func.extra.len() as u32;
             let words = view.extra;
             let mut at = view.data[inst] as usize;
             let mut scrutinee = None;
+            let mut push_val = |func: &mut Func<A>, old: u32| {
+                let mapped = get_u32(val_map, u32_ix(old)).unwrap_or(NONE);
+                if mapped == NONE {
+                    let dst_extra = func.extra.len();
+                    fixups.push(ValFixup::Extra { dst_extra, old_val: old });
+                    func.extra.push(0);
+                } else {
+                    func.extra.push(mapped);
+                }
+            };
             for &field in fields {
                 match field {
                     Field::Value => {
                         scrutinee = Some(words[at]);
-                        func.extra.push(map_val(words[at])?);
+                        push_val(func, get_u32(words, at).unwrap_or(0));
                         at += 1;
                     }
                     Field::Block
@@ -1589,7 +2012,7 @@ fn copy_inst_remapped<A: Allocator + Copy>(
                         func.extra.push(block);
                         func.extra.push(n as u32);
                         for k in 0..n {
-                            func.extra.push(map_val(words[at + 2 + k])?);
+                            push_val(func, get_u32(words, at + 2 + k).unwrap_or(0));
                         }
                         at += 2 + n;
                     }
@@ -1597,7 +2020,7 @@ fn copy_inst_remapped<A: Allocator + Copy>(
                         let n = words[at] as usize;
                         func.extra.push(n as u32);
                         for k in 0..n {
-                            func.extra.push(map_val(words[at + 1 + k])?);
+                            push_val(func, get_u32(words, at + 1 + k).unwrap_or(0));
                         }
                         at += 1 + n;
                     }
@@ -1629,7 +2052,7 @@ fn copy_inst_remapped<A: Allocator + Copy>(
                             func.extra.push(block);
                             func.extra.push(argc as u32);
                             for k in 0..argc {
-                                func.extra.push(map_val(words[at + 2 + k])?);
+                                push_val(func, get_u32(words, at + 2 + k).unwrap_or(0));
                             }
                             at += 2 + argc;
                         }
@@ -1640,14 +2063,55 @@ fn copy_inst_remapped<A: Allocator + Copy>(
         }
     };
 
-    let out_idx = func.ops.len() as u32;
     func.ops.push(op as u8);
     func.flags.push(flags);
     func.tys.push(ty);
     func.data.push(data);
     func.attrs.push(attrs);
     func.locs.push(loc);
-    Ok(out_idx)
+    out_idx
+}
+
+fn apply_val_fixups<A: Allocator>(
+    func: &mut Func<A>,
+    val_map: &[u32],
+    fixups: &[ValFixup],
+) -> Result<(), SimplifyError> {
+    for &fix in fixups {
+        match fix {
+            ValFixup::Data { dst_inst, old_val } => {
+                let mapped = get_u32(val_map, u32_ix(old_val)).unwrap_or(NONE);
+                if mapped == NONE {
+                    return Err(SimplifyError::Refused { inst: dst_inst, what: "unmapped operand during SOTA rewrite" });
+                }
+                set_at(&mut func.data, dst_inst, mapped);
+            }
+            ValFixup::Extra { dst_extra, old_val } => {
+                let mapped = get_u32(val_map, u32_ix(old_val)).unwrap_or(NONE);
+                if mapped == NONE {
+                    return Err(SimplifyError::Refused { inst: dst_extra, what: "unmapped operand during SOTA rewrite" });
+                }
+                set_at(&mut func.extra, dst_extra, mapped);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[inline]
+const fn invert_int_cond(c: IntCond) -> IntCond {
+    match c {
+        IntCond::Eq => IntCond::Ne,
+        IntCond::Ne => IntCond::Eq,
+        IntCond::Ult => IntCond::Uge,
+        IntCond::Uge => IntCond::Ult,
+        IntCond::Ule => IntCond::Ugt,
+        IntCond::Ugt => IntCond::Ule,
+        IntCond::Slt => IntCond::Sge,
+        IntCond::Sge => IntCond::Slt,
+        IntCond::Sle => IntCond::Sgt,
+        IntCond::Sgt => IntCond::Sle,
+    }
 }
 
 /// Emits an integer constant (`Iconst` or `IconstWide`) of scalar type `ty` into `func`.
@@ -1730,9 +2194,17 @@ pub fn materialize_strength_reduction<A: Allocator + Copy>(
     let len = view.len();
     let ptr_bits = view.head.ptr_bits;
 
-    // Collect known constants in one forward scan.
+    // Collect known constants and per-value use counts in one forward scan.
     let mut known: Vec<Option<u128>, A> = filled(len, None, &alloc);
+    let mut uses: Vec<u32, A> = filled(len, 0u32, &alloc);
     for inst in 0..len {
+        each(&view, inst, |item| {
+            if let Item::Value(v) = item {
+                if let Some(u) = uses.get_mut(u32_ix(v)) {
+                    *u = u.saturating_add(1);
+                }
+            }
+        });
         let op = view.op(inst);
         let ty = Ty(view.tys[inst]);
         if op == Op::Iconst {
@@ -1760,6 +2232,7 @@ pub fn materialize_strength_reduction<A: Allocator + Copy>(
     func.block_kinds.clear();
 
     let mut val_map = filled(len, NONE, &alloc);
+    let mut fixups: Vec<ValFixup, A> = Vec::new_in(alloc);
     let mut rewrites = 0u32;
 
     for b in 0..view.blocks() {
@@ -1771,9 +2244,129 @@ pub fn materialize_strength_reduction<A: Allocator + Copy>(
             let loc = view.locs[inst];
             let mut replaced = None;
 
-            if Flags(view.flags[inst]).0 == 0 {
-                if let Some((bits, _)) = scalar_int_mask(ty, ptr_bits) {
-                    if matches!(op, Op::Mul | Op::Udiv | Op::Urem | Op::Add) {
+            if op.info().flags.meanings_only(Flags(get_u8(view.flags, inst).unwrap_or(0))).0 == 0 {
+                // Canonicalize pointer-int-pointer offset arithmetic directly to `Op::PtrAdd(base, off)`:
+                // `from_exposed(add(expose|ptr_addr(p), off)) -> ptr_add(p, off)` (and commutative),
+                // `ptr_with_addr(p, add(expose|ptr_addr(p), off)) -> ptr_add(p, off)`.
+                // Unlocks 4x NEON auto-vectorization, `memchr`, 2D loop interchange, and AArch64 `[base, idx, lsl #k]`!
+                if op == Op::FromExposed && ty == Ty::PTR {
+                    if let Some(sum_raw) = get_u32(view.data, inst).map(u32_ix)
+                        && view.op(sum_raw) == Op::Add
+                        && inst_flags_zero(&view, sum_raw)
+                        && let Some(sat) = get_u32(view.data, sum_raw).map(u32_ix)
+                        && let Some((sa, sb)) = extra_pair(&view, sat)
+                    {
+                        let try_base_off = |cand_ptr: u32, cand_off: u32| -> Option<(u32, u32)> {
+                            let ci = u32_ix(cand_ptr);
+                            if matches!(view.op(ci), Op::Expose | Op::PtrAddr) && inst_flags_zero(&view, ci) {
+                                let base_raw = get_u32(view.data, ci)?;
+                                if inst_ty(&view, u32_ix(base_raw)) == Some(Ty::PTR) {
+                                    let mb = get_u32(&val_map, u32_ix(base_raw))?;
+                                    let mo = get_u32(&val_map, u32_ix(cand_off))?;
+                                    if mb != NONE && mo != NONE {
+                                        return Some((mb, mo));
+                                    }
+                                }
+                            }
+                            None
+                        };
+                        if let Some((base_m, off_m)) = try_base_off(sa, sb).or_else(|| try_base_off(sb, sa)) {
+                            replaced = Some(push_binary_inst(&mut func, Op::PtrAdd, Ty::PTR, base_m, off_m, loc));
+                        }
+                    }
+                } else if op == Op::PtrWithAddr && ty == Ty::PTR {
+                    if let Some(at) = get_u32(view.data, inst).map(u32_ix)
+                        && let Some((base_raw, sum_u32)) = extra_pair(&view, at)
+                    {
+                        let sum_raw = u32_ix(sum_u32);
+                        if view.op(sum_raw) == Op::Add
+                            && inst_flags_zero(&view, sum_raw)
+                            && let Some(sat) = get_u32(view.data, sum_raw).map(u32_ix)
+                            && let Some((sa, sb)) = extra_pair(&view, sat)
+                        {
+                            let is_addr_of_base = |v: u32| -> bool {
+                                let vi = u32_ix(v);
+                                matches!(view.op(vi), Op::Expose | Op::PtrAddr)
+                                    && inst_flags_zero(&view, vi)
+                                    && get_u32(view.data, vi) == Some(base_raw)
+                            };
+                            let off_raw = if is_addr_of_base(sa) {
+                                Some(sb)
+                            } else if is_addr_of_base(sb) {
+                                Some(sa)
+                            } else {
+                                None
+                            };
+                            if let Some(off_r) = off_raw
+                                && let Some(mb) = get_u32(&val_map, u32_ix(base_raw))
+                                && let Some(mo) = get_u32(&val_map, u32_ix(off_r))
+                                && mb != NONE
+                                && mo != NONE
+                            {
+                                replaced = Some(push_binary_inst(&mut func, Op::PtrAdd, Ty::PTR, mb, mo, loc));
+                            }
+                        }
+                    }
+                } else if op == Op::Icmp && ty == Ty::I1 {
+                    // `icmp eq (zext(icmp(c, x, y))), 0 -> icmp(invert(c), x, y)` (folds negated Rust bool conditions!).
+                    if let Some(at) = get_u32(view.data, inst).map(u32_ix)
+                        && let Some((cond_raw, raw_a, raw_b)) = extra_triple(&view, at)
+                        && IntCond::from_word(cond_raw) == Some(IntCond::Eq)
+                    {
+                        let cand = if get_const(&known, raw_b) == Some(0) {
+                            Some(raw_a)
+                        } else if get_const(&known, raw_a) == Some(0) {
+                            Some(raw_b)
+                        } else {
+                            None
+                        };
+                        if let Some(c_raw) = cand {
+                            let ci = u32_ix(c_raw);
+                            let inner_raw = if inst_ty(&view, ci) == Some(Ty::I1) {
+                                Some(c_raw)
+                            } else if view.op(ci) == Op::Zext
+                                && inst_flags_zero(&view, ci)
+                                && let Some(z) = get_u32(view.data, ci)
+                            {
+                                (inst_ty(&view, u32_ix(z)) == Some(Ty::I1)).then_some(z)
+                            } else {
+                                None
+                            };
+                            if let Some(ir) = inner_raw {
+                                let iri = u32_ix(ir);
+                                if view.op(iri) == Op::Icmp
+                                    && inst_flags_zero(&view, iri)
+                                    && let Some(iat) = get_u32(view.data, iri).map(u32_ix)
+                                    && let Some((icond_raw, raw_x, raw_y)) = extra_triple(&view, iat)
+                                    && let Some(icond) = IntCond::from_word(icond_raw)
+                                    && let Some(mx) = get_u32(&val_map, u32_ix(raw_x))
+                                    && let Some(my) = get_u32(&val_map, u32_ix(raw_y))
+                                    && mx != NONE
+                                    && my != NONE
+                                {
+                                    let inv = invert_int_cond(icond);
+                                    let start = usize_u32(func.extra.len());
+                                    func.extra.push(int_cond_word(inv));
+                                    func.extra.push(mx);
+                                    func.extra.push(my);
+                                    let idx = usize_u32(func.ops.len());
+                                    func.ops.push(op_byte(Op::Icmp));
+                                    func.flags.push(0);
+                                    func.tys.push(Ty::I1.0);
+                                    func.data.push(start);
+                                    func.attrs.push(0);
+                                    func.locs.push(loc);
+                                    replaced = Some(idx);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if replaced.is_none()
+                    && let Some((bits, mask)) = scalar_int_mask(ty, ptr_bits)
+                {
+                    if matches!(op, Op::Mul | Op::Udiv | Op::Urem | Op::Add | Op::Sub | Op::And | Op::Or | Op::Xor | Op::Shl | Op::Lshr) {
                         let at = view.data[inst] as usize;
                         let raw_a = view.extra[at];
                         let raw_b = view.extra[at + 1];
@@ -1781,6 +2374,34 @@ pub fn materialize_strength_reduction<A: Allocator + Copy>(
                         let b_val = val_map[raw_b as usize];
                         let ca = known[raw_a as usize];
                         let cb = known[raw_b as usize];
+                        if a != NONE && b_val != NONE {
+
+                        // Helper: extract `(inner_x, c1)` if `raw_op` is `same_op(inner_x, c1)` (or commutative).
+                        let extract_chain_const = |cand: u32, want_op: Op, comm: bool| -> Option<(u32, u128)> {
+                            let ci = u32_ix(cand);
+                            if view.op(ci) == want_op
+                                && inst_ty(&view, ci) == Some(ty)
+                                && want_op.info().flags.meanings_only(Flags(get_u8(view.flags, ci)?)).0 == 0
+                            {
+                                let cat = u32_ix(get_u32(view.data, ci)?);
+                                let (ia, ib) = extra_pair(&view, cat)?;
+                                if let Some(c1) = get_const(&known, ib) {
+                                    let ma = get_u32(&val_map, u32_ix(ia))?;
+                                    if ma != NONE {
+                                        return Some((ma, c1));
+                                    }
+                                }
+                                if comm {
+                                    if let Some(c1) = get_const(&known, ia) {
+                                        let mb = get_u32(&val_map, u32_ix(ib))?;
+                                        if mb != NONE {
+                                            return Some((mb, c1));
+                                        }
+                                    }
+                                }
+                            }
+                            None
+                        };
 
                         match op {
                             Op::Mul => {
@@ -1796,6 +2417,35 @@ pub fn materialize_strength_reduction<A: Allocator + Copy>(
                                         let kc = push_const_inst(&mut func, ty, ptr_bits, u128::from(k), loc);
                                         replaced = Some(push_binary_inst(&mut func, Op::Shl, ty, b_val, kc, loc));
                                     }
+                                } else if let Some(c2) = cb {
+                                    if let Some((x, c1)) = extract_chain_const(raw_a, Op::Mul, true) {
+                                        let combined = c1.wrapping_mul(c2) & mask;
+                                        let cc = push_const_inst(&mut func, ty, ptr_bits, combined, loc);
+                                        replaced = Some(push_binary_inst(&mut func, Op::Mul, ty, x, cc, loc));
+                                    }
+                                } else if let Some(c2) = ca {
+                                    if let Some((x, c1)) = extract_chain_const(raw_b, Op::Mul, true) {
+                                        let combined = c1.wrapping_mul(c2) & mask;
+                                        let cc = push_const_inst(&mut func, ty, ptr_bits, combined, loc);
+                                        replaced = Some(push_binary_inst(&mut func, Op::Mul, ty, x, cc, loc));
+                                    }
+                                }
+                                // `x * {3, 5, 9} -> add(x, shl(x, {1, 2, 3}))`:
+                                // lowers to ONE 1-cycle `add rd, x, x, lsl #k` on AArch64 and ONE `lea [x + x*scale]` on x86-64
+                                // with zero multiply-pipe pressure and zero constant register!
+                                if replaced.is_none() && (bits == 32 || bits == 64) {
+                                    let shift_add = if let Some(c) = cb.filter(|&c| c == 3 || c == 5 || c == 9) {
+                                        Some((a, (c - 1).trailing_zeros()))
+                                    } else if let Some(c) = ca.filter(|&c| c == 3 || c == 5 || c == 9) {
+                                        Some((b_val, (c - 1).trailing_zeros()))
+                                    } else {
+                                        None
+                                    };
+                                    if let Some((x, k)) = shift_add {
+                                        let kc = push_const_inst(&mut func, ty, ptr_bits, u128::from(k), loc);
+                                        let sh = push_binary_inst(&mut func, Op::Shl, ty, x, kc, loc);
+                                        replaced = Some(push_binary_inst(&mut func, Op::Add, ty, x, sh, loc));
+                                    }
                                 }
                             }
                             Op::Udiv => {
@@ -1805,6 +2455,38 @@ pub fn materialize_strength_reduction<A: Allocator + Copy>(
                                         let kc = push_const_inst(&mut func, ty, ptr_bits, u128::from(k), loc);
                                         replaced = Some(push_binary_inst(&mut func, Op::Lshr, ty, a, kc, loc));
                                     }
+                                } else if bits == 64
+                                    && let Some(d) = cb.and_then(|v| u64::try_from(v).ok())
+                                    && let Some(plan) = magic_udiv64(d)
+                                {
+                                    // Granlund–Montgomery magic multiply at LIR level so LICM hoists the
+                                    // 64-bit magic constant ONCE out of loops and GVN shares `q` with `Urem`!
+                                    replaced = Some(match plan {
+                                        MagicDiv64::MulShift { magic, shift } => {
+                                            let mc = push_const_inst(&mut func, ty, ptr_bits, u128::from(magic), loc);
+                                            let hi = push_binary_inst(&mut func, Op::Umulhi, ty, a, mc, loc);
+                                            if shift == 0 {
+                                                hi
+                                            } else {
+                                                let sc = push_const_inst(&mut func, ty, ptr_bits, u128::from(shift), loc);
+                                                push_binary_inst(&mut func, Op::Lshr, ty, hi, sc, loc)
+                                            }
+                                        }
+                                        MagicDiv64::MulAddShift { magic, post_shift } => {
+                                            let mc = push_const_inst(&mut func, ty, ptr_bits, u128::from(magic), loc);
+                                            let q = push_binary_inst(&mut func, Op::Umulhi, ty, a, mc, loc);
+                                            let diff = push_binary_inst(&mut func, Op::Sub, ty, a, q, loc);
+                                            let one = push_const_inst(&mut func, ty, ptr_bits, 1, loc);
+                                            let half = push_binary_inst(&mut func, Op::Lshr, ty, diff, one, loc);
+                                            let sum = push_binary_inst(&mut func, Op::Add, ty, half, q, loc);
+                                            if post_shift == 0 {
+                                                sum
+                                            } else {
+                                                let sc = push_const_inst(&mut func, ty, ptr_bits, u128::from(post_shift), loc);
+                                                push_binary_inst(&mut func, Op::Lshr, ty, sum, sc, loc)
+                                            }
+                                        }
+                                    });
                                 }
                             }
                             Op::Urem => {
@@ -1812,13 +2494,234 @@ pub fn materialize_strength_reduction<A: Allocator + Copy>(
                                     let mask_v = v - 1;
                                     let mc = push_const_inst(&mut func, ty, ptr_bits, mask_v, loc);
                                     replaced = Some(push_binary_inst(&mut func, Op::And, ty, a, mc, loc));
+                                } else if bits == 64
+                                    && let Some(d) = cb.and_then(|v| u64::try_from(v).ok())
+                                    && let Some(plan) = magic_udiv64(d)
+                                {
+                                    let q = match plan {
+                                        MagicDiv64::MulShift { magic, shift } => {
+                                            let mc = push_const_inst(&mut func, ty, ptr_bits, u128::from(magic), loc);
+                                            let hi = push_binary_inst(&mut func, Op::Umulhi, ty, a, mc, loc);
+                                            if shift == 0 {
+                                                hi
+                                            } else {
+                                                let sc = push_const_inst(&mut func, ty, ptr_bits, u128::from(shift), loc);
+                                                push_binary_inst(&mut func, Op::Lshr, ty, hi, sc, loc)
+                                            }
+                                        }
+                                        MagicDiv64::MulAddShift { magic, post_shift } => {
+                                            let mc = push_const_inst(&mut func, ty, ptr_bits, u128::from(magic), loc);
+                                            let q = push_binary_inst(&mut func, Op::Umulhi, ty, a, mc, loc);
+                                            let diff = push_binary_inst(&mut func, Op::Sub, ty, a, q, loc);
+                                            let one = push_const_inst(&mut func, ty, ptr_bits, 1, loc);
+                                            let half = push_binary_inst(&mut func, Op::Lshr, ty, diff, one, loc);
+                                            let sum = push_binary_inst(&mut func, Op::Add, ty, half, q, loc);
+                                            if post_shift == 0 {
+                                                sum
+                                            } else {
+                                                let sc = push_const_inst(&mut func, ty, ptr_bits, u128::from(post_shift), loc);
+                                                push_binary_inst(&mut func, Op::Lshr, ty, sum, sc, loc)
+                                            }
+                                        }
+                                    };
+                                    let dc = push_const_inst(&mut func, ty, ptr_bits, u128::from(d), loc);
+                                    let prod = push_binary_inst(&mut func, Op::Mul, ty, q, dc, loc);
+                                    replaced = Some(push_binary_inst(&mut func, Op::Sub, ty, a, prod, loc));
                                 }
                             }
                             Op::Add if raw_a == raw_b => {
                                 let one = push_const_inst(&mut func, ty, ptr_bits, 1, loc);
                                 replaced = Some(push_binary_inst(&mut func, Op::Shl, ty, a, one, loc));
                             }
+                            Op::Add => {
+                                // Reassociate `(x + c1) + c2 -> x + (c1 + c2)`.
+                                if let Some(c2) = cb {
+                                    if let Some((x, c1)) = extract_chain_const(raw_a, Op::Add, true) {
+                                        let combined = c1.wrapping_add(c2) & mask;
+                                        let cc = push_const_inst(&mut func, ty, ptr_bits, combined, loc);
+                                        replaced = Some(push_binary_inst(&mut func, Op::Add, ty, x, cc, loc));
+                                    }
+                                } else if let Some(c2) = ca {
+                                    if let Some((x, c1)) = extract_chain_const(raw_b, Op::Add, true) {
+                                        let combined = c1.wrapping_add(c2) & mask;
+                                        let cc = push_const_inst(&mut func, ty, ptr_bits, combined, loc);
+                                        replaced = Some(push_binary_inst(&mut func, Op::Add, ty, x, cc, loc));
+                                    }
+                                }
+                                // Algebraic cancellation & mul-sub folding:
+                                // - `x + (y - x) -> y`
+                                // - `x + (y - x * c) -> y - x * (c - 1)` (collapses `q + (i - q * 10) -> i - q * 9`!)
+                                // - `x + x * c -> x * (c + 1)`
+                                if replaced.is_none() {
+                                    let try_add_fold = |raw_x: u32, x_mapped: u32, raw_other: u32| -> Option<(Option<u32>, Option<(u32, u32, u128)>, Option<(u32, u128)>)> {
+                                        let oi = u32_ix(raw_other);
+                                        let oop = view.op(oi);
+                                        if inst_ty(&view, oi) != Some(ty)
+                                            || oop.info().flags.meanings_only(Flags(get_u8(view.flags, oi)?)).0 != 0
+                                        {
+                                            return None;
+                                        }
+                                        let oat = u32_ix(get_u32(view.data, oi)?);
+                                        match oop {
+                                            Op::Sub => {
+                                                let (oy, oz) = extra_pair(&view, oat)?;
+                                                let my = get_u32(&val_map, u32_ix(oy))?;
+                                                if my == NONE {
+                                                    return None;
+                                                }
+                                                if oz == raw_x {
+                                                    return Some((Some(my), None, None));
+                                                }
+                                                if let Some((mx, c)) = extract_chain_const(oz, Op::Mul, true) {
+                                                    if mx == x_mapped && c >= 2 {
+                                                        return Some((None, Some((my, x_mapped, (c - 1) & mask)), None));
+                                                    }
+                                                }
+                                                None
+                                            }
+                                            Op::Mul => {
+                                                let (ma, mb) = extra_pair(&view, oat)?;
+                                                if ma == raw_x {
+                                                    if let Some(c) = get_const(&known, mb) {
+                                                        return Some((None, None, Some((x_mapped, c.wrapping_add(1) & mask))));
+                                                    }
+                                                } else if mb == raw_x {
+                                                    if let Some(c) = get_const(&known, ma) {
+                                                        return Some((None, None, Some((x_mapped, c.wrapping_add(1) & mask))));
+                                                    }
+                                                }
+                                                None
+                                            }
+                                            _ => None,
+                                        }
+                                    };
+                                    let folded = try_add_fold(raw_a, a, raw_b).or_else(|| try_add_fold(raw_b, b_val, raw_a));
+                                    if let Some((direct_y, sub_mul, mul_inc)) = folded {
+                                        if let Some(y) = direct_y {
+                                            replaced = Some(y);
+                                        } else if let Some((y, x, c_minus_1)) = sub_mul {
+                                            if c_minus_1 == 1 {
+                                                replaced = Some(push_binary_inst(&mut func, Op::Sub, ty, y, x, loc));
+                                            } else {
+                                                let cc = push_const_inst(&mut func, ty, ptr_bits, c_minus_1, loc);
+                                                let m = push_binary_inst(&mut func, Op::Mul, ty, x, cc, loc);
+                                                replaced = Some(push_binary_inst(&mut func, Op::Sub, ty, y, m, loc));
+                                            }
+                                        } else if let Some((x, c_plus_1)) = mul_inc {
+                                            let cc = push_const_inst(&mut func, ty, ptr_bits, c_plus_1, loc);
+                                            replaced = Some(push_binary_inst(&mut func, Op::Mul, ty, x, cc, loc));
+                                        }
+                                    }
+                                }
+                                // Loop-carried reduction reassociation:
+                                // `add(add(param, x), y) -> add(param, add(x, y))` when the inner add has 1 use
+                                // and neither `x` nor `y` is an `Op::Param`. Halves critical-path latency on
+                                // accumulators, exposes `q + (i - q * 10) -> i - q * 9`, and unlocks 4x unrolling!
+                                if replaced.is_none() {
+                                    let try_param_reassoc = |inner_raw: u32, y_raw: u32, y_mapped: u32| -> Option<(u32, u32, u32)> {
+                                        let ii = u32_ix(inner_raw);
+                                        if get_u32(&uses, ii) != Some(1)
+                                            || view.op(ii) != Op::Add
+                                            || inst_ty(&view, ii) != Some(ty)
+                                            || !inst_flags_zero(&view, ii)
+                                            || view.op(u32_ix(y_raw)) == Op::Param
+                                        {
+                                            return None;
+                                        }
+                                        let iat = u32_ix(get_u32(view.data, ii)?);
+                                        let (ia, ib) = extra_pair(&view, iat)?;
+                                        let (p_raw, x_raw) = if view.op(u32_ix(ia)) == Op::Param && view.op(u32_ix(ib)) != Op::Param {
+                                            (ia, ib)
+                                        } else if view.op(u32_ix(ib)) == Op::Param && view.op(u32_ix(ia)) != Op::Param {
+                                            (ib, ia)
+                                        } else {
+                                            return None;
+                                        };
+                                        let mp = get_u32(&val_map, u32_ix(p_raw))?;
+                                        let mx = get_u32(&val_map, u32_ix(x_raw))?;
+                                        if mp != NONE && mx != NONE {
+                                            Some((mp, mx, y_mapped))
+                                        } else {
+                                            None
+                                        }
+                                    };
+                                    if let Some((mp, mx, my)) =
+                                        try_param_reassoc(raw_a, raw_b, b_val).or_else(|| try_param_reassoc(raw_b, raw_a, a))
+                                    {
+                                        let xy = push_binary_inst(&mut func, Op::Add, ty, mx, my, loc);
+                                        replaced = Some(push_binary_inst(&mut func, Op::Add, ty, mp, xy, loc));
+                                    }
+                                }
+                            }
+                            Op::Sub => {
+                                if ca == Some(0) {
+                                    // `0 - x -> neg(x)` (enables AArch64 `csneg` fusion).
+                                    let out_idx = usize_u32(func.ops.len());
+                                    func.ops.push(op_byte(Op::Neg));
+                                    func.flags.push(0);
+                                    func.tys.push(ty.0);
+                                    func.data.push(b_val);
+                                    func.attrs.push(0);
+                                    func.locs.push(loc);
+                                    replaced = Some(out_idx);
+                                } else if let Some(c2) = cb {
+                                    if let Some((x, c1)) = extract_chain_const(raw_a, Op::Sub, false) {
+                                        let combined = c1.wrapping_add(c2) & mask;
+                                        let cc = push_const_inst(&mut func, ty, ptr_bits, combined, loc);
+                                        replaced = Some(push_binary_inst(&mut func, Op::Sub, ty, x, cc, loc));
+                                    }
+                                }
+                            }
+                            Op::And | Op::Or | Op::Xor => {
+                                if op == Op::Xor && (cb == Some(mask) || ca == Some(mask)) {
+                                    // `x ^ !0 -> not(x)` (enables AArch64 `bic`/`orn`/`eon` fusion).
+                                    let src = if cb == Some(mask) { a } else { b_val };
+                                    let out_idx = usize_u32(func.ops.len());
+                                    func.ops.push(op_byte(Op::Not));
+                                    func.flags.push(0);
+                                    func.tys.push(ty.0);
+                                    func.data.push(src);
+                                    func.attrs.push(0);
+                                    func.locs.push(loc);
+                                    replaced = Some(out_idx);
+                                } else if let Some(c2) = cb {
+                                    if let Some((x, c1)) = extract_chain_const(raw_a, op, true) {
+                                        let combined = match op {
+                                            Op::And => c1 & c2,
+                                            Op::Or => c1 | c2,
+                                            _ => c1 ^ c2,
+                                        } & mask;
+                                        let cc = push_const_inst(&mut func, ty, ptr_bits, combined, loc);
+                                        replaced = Some(push_binary_inst(&mut func, op, ty, x, cc, loc));
+                                    }
+                                } else if let Some(c2) = ca {
+                                    if let Some((x, c1)) = extract_chain_const(raw_b, op, true) {
+                                        let combined = match op {
+                                            Op::And => c1 & c2,
+                                            Op::Or => c1 | c2,
+                                            _ => c1 ^ c2,
+                                        } & mask;
+                                        let cc = push_const_inst(&mut func, ty, ptr_bits, combined, loc);
+                                        replaced = Some(push_binary_inst(&mut func, op, ty, x, cc, loc));
+                                    }
+                                }
+                            }
+                            Op::Shl | Op::Lshr => {
+                                if let Some(c2) = cb {
+                                    if let Some((x, c1)) = extract_chain_const(raw_a, op, false) {
+                                        let s1 = low_u32(c1 % u128::from(bits));
+                                        let s2 = low_u32(c2 % u128::from(bits));
+                                        if s1 + s2 < bits {
+                                            let cc = push_const_inst(&mut func, ty, ptr_bits, u128::from(s1 + s2), loc);
+                                            replaced = Some(push_binary_inst(&mut func, op, ty, x, cc, loc));
+                                        } else {
+                                            replaced = Some(push_const_inst(&mut func, ty, ptr_bits, 0, loc));
+                                        }
+                                    }
+                                }
+                            }
                             _ => {}
+                        }
                         }
                     }
                 }
@@ -1828,7 +2731,8 @@ pub fn materialize_strength_reduction<A: Allocator + Copy>(
                 val_map[inst] = new_idx;
                 rewrites += 1;
             } else {
-                val_map[inst] = copy_inst_remapped(&view, inst, &val_map, &mut func)?;
+                let mapped = copy_inst_remapped(&view, inst, &val_map, &mut fixups, &mut func);
+                set_at(&mut val_map, inst, mapped);
             }
         }
     }
@@ -1836,6 +2740,7 @@ pub fn materialize_strength_reduction<A: Allocator + Copy>(
     if rewrites == 0 {
         return Ok((view.to_func_in(alloc), 0));
     }
+    apply_val_fixups(&mut func, &val_map, &fixups)?;
     verify(func.view()).map_err(SimplifyError::Verify)?;
     Ok((func, rewrites))
 }
@@ -1999,6 +2904,7 @@ pub fn hoist_loop_invariants<A: Allocator + Copy>(
     func.block_kinds.clear();
 
     let mut val_map = filled(len, NONE, &alloc);
+    let mut fixups: Vec<ValFixup, A> = Vec::new_in(alloc);
 
     for b in 0..blocks {
         func.block_starts.push(func.ops.len() as u32);
@@ -2010,16 +2916,20 @@ pub fn hoist_loop_invariants<A: Allocator + Copy>(
             if hoist_to[inst] != NONE {
                 continue;
             }
-            val_map[inst] = copy_inst_remapped(&view, inst, &val_map, &mut func)?;
+            let mapped = copy_inst_remapped(&view, inst, &val_map, &mut fixups, &mut func);
+            set_at(&mut val_map, inst, mapped);
         }
         // Insert any instructions hoisted into this preheader right before its `Jump` terminator.
         for &h_inst in &hoisted_by_preheader[b] {
-            val_map[h_inst] = copy_inst_remapped(&view, h_inst, &val_map, &mut func)?;
+            let mapped = copy_inst_remapped(&view, h_inst, &val_map, &mut fixups, &mut func);
+            set_at(&mut val_map, h_inst, mapped);
         }
         // Emit block terminator.
-        val_map[term] = copy_inst_remapped(&view, term, &val_map, &mut func)?;
+        let mapped = copy_inst_remapped(&view, term, &val_map, &mut fixups, &mut func);
+        set_at(&mut val_map, term, mapped);
     }
 
+    apply_val_fixups(&mut func, &val_map, &fixups)?;
     verify(func.view()).map_err(SimplifyError::Verify)?;
     Ok((func, total_hoisted))
 }
@@ -2042,7 +2952,7 @@ pub fn sota_optimize_fixpoint<A: Allocator + Copy>(
 
     for _ in 0..rounds {
         rounds_run += 1;
-        let step = aegraph_optimize(cur.view(), alloc)?;
+        let step = aegraph_optimize_inner(cur.view(), budget.hardware_fma, alloc)?;
         let (sr_func, sr_count) = materialize_strength_reduction(step.func.view(), alloc)?;
         let (licm_func, hoisted_count) = hoist_loop_invariants(sr_func.view(), alloc)?;
         let prop = super::propagate(licm_func.view(), alloc)?;
@@ -2089,7 +2999,7 @@ pub fn sota_optimize_fixpoint<A: Allocator + Copy>(
 
 #[cfg(test)]
 mod tests {
-    use std::alloc::Global;
+    use blaze_own::testing::TestHeap;
 
     use super::*;
     use crate::{
@@ -2100,8 +3010,8 @@ mod tests {
 
     #[test]
     fn aegraph_gvn_commutativity_identities_and_eval_equivalence() {
-        let alloc = Global;
-        let mut b = Builder::<Global, Full>::new_in(64, alloc);
+        let alloc = TestHeap;
+        let mut b = Builder::<TestHeap, Full>::new_in(64, alloc);
         let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64), Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
         b.set_signature(sig);
         let entry = b.create_block(BlockKind::Normal);
@@ -2151,8 +3061,8 @@ mod tests {
 
     #[test]
     fn loop_analysis_licm_induction_vars_and_pgo_opportunistic_inlining_feedback() {
-        let alloc = Global;
-        let mut b = Builder::<Global, Full>::new_in(64, alloc);
+        let alloc = TestHeap;
+        let mut b = Builder::<TestHeap, Full>::new_in(64, alloc);
         let sig = b.sig(
             Conv::C,
             Variadic::No,
@@ -2218,12 +3128,10 @@ mod tests {
         assert!(res.inline_sites.iter().any(|s| s.speculative_devirt));
 
         // Verify that `inv_prod = factor * n` was physically hoisted out of the loop body into block 0!
-        let body_ops: std::vec::Vec<Op> = res
-            .func
-            .view()
-            .block(Block(2))
-            .map(|i| res.func.view().op(i))
-            .collect();
+        let mut body_ops = Vec::new_in(alloc);
+        for i in res.func.view().block(Block(2)) {
+            body_ops.push(res.func.view().op(i));
+        }
         assert!(
             !body_ops.contains(&Op::Mul),
             "expected loop-invariant Mul to be hoisted out of block 2 into preheader block 0; body ops: {body_ops:?}"
@@ -2232,8 +3140,8 @@ mod tests {
 
     #[test]
     fn strength_reduction_and_licm_preserve_eval_semantics() {
-        let alloc = Global;
-        let mut b = Builder::<Global, Full>::new_in(64, alloc);
+        let alloc = TestHeap;
+        let mut b = Builder::<TestHeap, Full>::new_in(64, alloc);
         let sig = b.sig(
             Conv::C,
             Variadic::No,
@@ -2276,7 +3184,10 @@ mod tests {
         let res = sota_optimize_fixpoint(func.view(), RegBudget::AARCH64, 3, |_| 1, alloc).unwrap();
 
         // No Udiv, Urem, or Mul left in the entire function!
-        let all_ops: std::vec::Vec<Op> = (0..res.func.ops.len()).map(|i| res.func.view().op(i)).collect();
+        let mut all_ops = Vec::new_in(alloc);
+        for i in 0..res.func.ops.len() {
+            all_ops.push(res.func.view().op(i));
+        }
         assert!(!all_ops.contains(&Op::Udiv), "expected Udiv strength-reduced to Lshr: {all_ops:?}");
         assert!(!all_ops.contains(&Op::Urem), "expected Urem strength-reduced to And: {all_ops:?}");
         assert!(!all_ops.contains(&Op::Mul), "expected Mul-by-8 strength-reduced to Shl: {all_ops:?}");
@@ -2436,5 +3347,61 @@ mod tests {
             eval::run_in(fn_nan.view(), &[], 10_000, alloc).unwrap(),
             eval::run_in(opt_nan.func.view(), &[], 10_000, alloc).unwrap(),
         );
+    }
+
+    #[test]
+    fn rust_bool_unwrap_from_exposed_and_loop_reassoc_preserve_eval() {
+        let alloc = TestHeap;
+        let mut b = Builder::<TestHeap, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let [entry, header, body, exit] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+
+        b.begin(entry);
+        let n = b.param(Ty::I64);
+        let k = b.param(Ty::I64);
+        let zero = b.iconst(Ty::I64, 0);
+        b.jump((header, &[zero, zero]));
+
+        b.begin(header);
+        let i = b.param(Ty::I64);
+        let acc = b.param(Ty::I64);
+        // Rust `bool` round-trip: `icmp ne (zext i8 (icmp ult i, n)), 0` -> `icmp ult i, n`!
+        let raw_cmp = b.icmp(IntCond::Ult, i, n);
+        let bool_i8 = b.convert(Op::Zext, Flags::NONE, Ty::I8, raw_cmp);
+        let zero_i8 = b.iconst(Ty::I8, 0);
+        let cond = b.icmp(IntCond::Ne, bool_i8, zero_i8);
+        b.br(Flags::NONE, cond, (body, &[]), (exit, &[]));
+
+        b.begin(body);
+        // Loop-carried accumulator reassociation: `(acc + i) + k -> acc + (i + k)`!
+        let a1 = b.binary(Op::Add, Flags::NONE, acc, i);
+        let a2 = b.binary(Op::Add, Flags::NONE, a1, k);
+        let one = b.iconst(Ty::I64, 1);
+        let i2 = b.binary(Op::Add, Flags::NONE, i, one);
+        b.jump((header, &[i2, a2]));
+
+        b.begin(exit);
+        b.ret(&[acc]);
+
+        let func = b.finish_checked().unwrap();
+        let res = sota_optimize_fixpoint(func.view(), RegBudget::AARCH64, 3, |_| 1, alloc).unwrap();
+        let mut all_ops = Vec::new_in(alloc);
+        for i in 0..res.func.ops.len() {
+            all_ops.push(res.func.view().op(i));
+        }
+        assert!(!all_ops.contains(&Op::Zext), "expected Rust bool i8 zext round-trip eliminated: {all_ops:?}");
+
+        for &(nv, kv) in &[(0u64, 3u64), (1, 7), (15, 11), (40, 100)] {
+            let args = [Val::Int(u128::from(nv)), Val::Int(u128::from(kv))];
+            let before = eval::run_in(func.view(), &args, 100_000, alloc).unwrap();
+            let after = eval::run_in(res.func.view(), &args, 100_000, alloc).unwrap();
+            assert_eq!(before, after, "mismatch on ({nv}, {kv})");
+        }
     }
 }
