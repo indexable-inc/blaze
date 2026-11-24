@@ -292,6 +292,9 @@ pub struct LazyProgram<'n, S: NamesSource<'n> = &'n Names<'n>> {
     /// Each crate's members keyed as their containers' heads key them, made the first time a
     /// key of the crate is asked that the key map does not know (lazy/locate.rs).
     member_rows: HashMap<usize, locate::MemberIndex<'n>, Global>,
+    /// Monomorphized specializations of generic `inline for` functions (`FrontEnd::specialized_row`,
+    /// `FrontEnd::specialize_inline_for`), created on demand per `(orig, concrete_args)`.
+    inline_for_specs: AVec<'n, crate::front2::inline_for::SpecRow>,
     counts: LazyCounts,
     alloc: Alloc<'n>,
 }
@@ -365,6 +368,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             definers: crate::front2::tait::Definers::new_in(alloc),
             internal_bindings: RefCell::new(front_end::InternalBindings::new_in(alloc)),
             member_rows: HashMap::new_in(Global),
+            inline_for_specs: AVec::new_in(alloc),
             counts: LazyCounts::default(),
             alloc,
         })
@@ -413,5 +417,16 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
     /// A lang item of [`SEAM_LANGS`], as looked up when the program was made.
     fn made_lang(&self, item: LangItem) -> Option<ItemKey> {
         self.langs.iter().find(|(l, _)| *l == item).and_then(|(_, k)| *k)
+    }
+
+    /// If `key` is a synthetic generic `inline for` specialization key, returns the original
+    /// generic function's key.
+    fn spec_orig(&self, key: ItemKey) -> Option<ItemKey> {
+        for s in self.inline_for_specs.iter() {
+            if self.rows.key.get(s.row).copied() == Some(key) {
+                return Some(s.orig);
+            }
+        }
+        None
     }
 }

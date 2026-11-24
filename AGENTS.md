@@ -141,7 +141,7 @@ covers. Numbers are stable ids, not an order. Edit tools/agents/rules.ts, run it
 - **85. newtypes-and-named-returns**: Use newtypes, enums and named return structs instead of bare primitives or `(Option<T>, bool)`.
 
 ### Building, lanes and machines (skill `build-and-test`)
-- **2. blaze-builds-blaze**: Cargo is the dev-loop builder for now; blaze still builds itself and makes every verdict.
+- **2. blaze-builds-blaze**: Run apps, demos and Blaze-edition code with blaze, never rustc; dogfood and fix any gap you hit.
 - **7. verify-on-real-projects**: Judge blaze by real projects it builds passing their own tests, never against cargo.
 - **8. own-nightly**: Each project builds with `pins/toolchain`; toolchain files, rustup and `RUSTC` are ignored.
 - **22. measure-the-exact-tree**: A measurement, bisect or checkpoint names and keeps the tree and binary it ran on.

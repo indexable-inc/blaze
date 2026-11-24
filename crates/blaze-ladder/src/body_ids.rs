@@ -242,13 +242,14 @@ pub fn each_item(name: &[u8], mut each: impl FnMut(ItemKey)) -> Result<(), NameE
         let tag = *name.get(at).ok_or(NameError::Truncated { at })?;
         // (the payload's bytes, whether it starts with an item's key)
         let (payload, keyed) = match tag {
-            0 | 1 | 5 | 6 | 7 | 10 | 11 | 15 | 16 => (0, false),
+            0 | 1 | 5 | 6 | 7 | 10 | 11 | 15 | 16 | 26 => (0, false),
             2 | 3 | 4 | 8 | 9 | 21 => (1, false),
-            12 | 13 | 17 | 19 => (16, true),
+            12 | 13 | 17 | 19 | 24 => (16, true),
             14 => (16, false),
             18 => (24, true),
             20 | 23 => (20, true),
             22 => (4, false),
+            25 => (8, false),
             _ => return Err(NameError::Tag { tag, at }),
         };
         if keyed {
