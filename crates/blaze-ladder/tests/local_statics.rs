@@ -569,6 +569,75 @@ fn absent() -> Maybe {
     );
 }
 
+/// The `eyre::DefaultHandler` -> `Box::new` -> `SizedTypeProperties::LAYOUT` shape: a generic
+/// associated constant (`Props::SIZE`, mirroring `SizedTypeProperties::LAYOUT`) calls `size_of`
+/// on a struct holding a TAIT (`type LazyResolve = impl FnOnce() -> u64`) whose defining fn
+/// returns a closure capturing a struct and is never called. Constant evaluation's layout
+/// (`ConstsWorld::opaque_hidden`) must check the defining fn on demand (capturing its closure
+/// facts too) and lay out the struct cleanly instead of refusing "field 0 ... has no ground form".
+#[test]
+fn const_layout_of_struct_holding_uncalled_tait_closure_succeeds() {
+    walks_clean(
+        "const layout of uncalled tait closure",
+        "#[rustc_intrinsic]
+const fn size_of<T>() -> usize;
+
+struct Capture {
+    a: u64,
+    b: u64,
+}
+
+mod helper {
+    pub(super) type LazyResolve = impl super::FnOnce() -> u64;
+
+    #[define_opaque(LazyResolve)]
+    pub(super) fn lazy_resolve(c: super::Capture) -> LazyResolve {
+        move || c.a + c.b
+    }
+}
+
+enum Inner {
+    None,
+    Captured(helper::LazyResolve),
+}
+
+struct Holder {
+    f: Inner,
+}
+
+trait Props: Sized {
+    const SIZE: usize = size_of::<Self>();
+}
+
+impl<T> Props for T {}
+
+#[inline(never)]
+fn layout_size<T>() -> usize {
+    T::SIZE
+}",
+        "layout_size::<Holder>() as i32",
+    );
+}
+
+/// An enum with >64 explicit discriminant constants (mirroring `nix::errno::consts::Errno`, which
+/// has 107 `= libc::E*` variants on macOS and 133 on Linux): `lazy/fill.rs` (`adt_row` / `make_want`)
+/// and the other `NeedConst` driver loops must evaluate every explicit discriminant instead of
+/// stopping at 64 (`MOST_ADT_LENS`).
+#[test]
+fn enum_with_more_than_64_const_discriminants_builds_row() {
+    use core::fmt::Write as _;
+    let mut items = blaze_own::String::new_in(alloc());
+    for i in 1..=80 {
+        let _ = writeln!(items, "const C{i}: i32 = {i};");
+    }
+    items.push_str("#[repr(i32)]\nenum BigErrno {\n    Zero = 0,\n");
+    for i in 1..=80 {
+        let _ = writeln!(items, "    E{i} = C{i},");
+    }
+    items.push_str("}\n#[inline(never)]\nfn pick(e: BigErrno) -> i32 {\n    match e {\n        BigErrno::E80 => 3,\n        _ => 4,\n    }\n}\n");
+    walks_clean("big errno discriminants", &items, "pick(BigErrno::E80)");
+}
+
 /// The twin: the same alias where its defining fn IS called (`some` calls `make`), so the walk
 /// checks `make` by the call: 3 (`Maybe::Some`).
 /// Prints "local static opaque called: {counts}; run status 3".

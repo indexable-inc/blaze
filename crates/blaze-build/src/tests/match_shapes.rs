@@ -325,3 +325,142 @@ fn or_pattern_bindings_move_their_part_out() {
     let refused = match_drops(Scrut::A, Arms::OrGuard, false).err().unwrap_or_default();
     assert!(refused.contains("in an or-pattern of a guarded arm"), "{refused}");
 }
+
+/// Matching on `&mut E` or `&&E` with a variant arm and a catch-all identifier arm (`toml::de::
+/// parser::document::descend_path`, `match last_child.as_mut() { DeValue::Table(t) => ..,
+/// existing => .. }`): top-level `existing` does NOT peel references (Reference, "Binding modes"),
+/// so it binds the original reference scalar (`&mut E` / `&&E`), never the dereferenced `V::Place`
+/// (which failed with "a place where a scalar was expected").
+#[test]
+fn match_on_ref_to_enum_with_catchall_binding() {
+    use blaze_typeck::UnOp;
+    const U64: PNode = PNode::Uint(UintTy::U64);
+    let mut w = TestWorld::new();
+    w.enum_(200, &[("Table", CtorKind::Tuple, &[("0", U32)]), ("Other", CtorKind::Tuple, &[("0", U64)])]);
+    let e_ty = w.types.intern(PNode::Adt(ItemKey(200), List::EMPTY)).expect("intern");
+    let ref_e_node = PNode::Ref(Mutbl::Not, e_ty);
+    let ref_e_ty = w.types.intern(ref_e_node).expect("intern");
+    let ref_ref_e_node = PNode::Ref(Mutbl::Not, ref_e_ty);
+    let inspect_ref = ItemKey(203);
+    w.func(inspect_ref.0, "inspect_ref", &[ref_e_node], U32);
+    let inspect_ref_ref = ItemKey(204);
+    w.func(inspect_ref_ref.0, "inspect_ref_ref", &[ref_ref_e_node], U32);
+    w.func(1, "main", &[], U32);
+
+    // Helper: `inspect_ref(x: &E) -> u32 { match x { Table(v) => *v, Other(v) => *v as u32 } }`
+    // and `inspect_ref_ref(x: &&E) -> u32 { match x { Table(v) => *v, Other(v) => *v as u32 } }`.
+    let plain = |b: &mut BodyBuf, name: &str| {
+        b.pat(Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name::of(name), sub: None, ty: None })
+    };
+    let build_inspect = |w: &TestWorld, fn_key: ItemKey| {
+        let mut b = BodyBuf::new();
+        let u32_ty = b.types.intern(U32).expect("intern");
+        let x = plain(&mut b, "x");
+        b.params.push(x);
+        let s = b.local(x);
+        let v1 = plain(&mut b, "v1");
+        let p_tbl = b.path("Table");
+        let e1 = b.pats_list(&[v1]);
+        let p1 = b.pat(Pat::TupleStruct { path: p_tbl, elems: e1, rest: None });
+        let v1_l = b.local(v1);
+        let d1 = b.e(Expr::Unary { op: UnOp::Deref, operand: v1_l });
+        let v2 = plain(&mut b, "v2");
+        let p_oth = b.path("Other");
+        let e2 = b.pats_list(&[v2]);
+        let p2 = b.pat(Pat::TupleStruct { path: p_oth, elems: e2, rest: None });
+        let v2_l = b.local(v2);
+        let d2 = b.e(Expr::Unary { op: UnOp::Deref, operand: v2_l });
+        let c2 = b.e(Expr::Cast { operand: d2, ty: u32_ty });
+        let al = arms(&mut b, &[(p1, d1), (p2, c2)]);
+        let root = b.e(Expr::Match { scrutinee: s, arms: al });
+        let mut g = PortableTys::new_in(blaze_own::testing::heap().alloc());
+        build_instance(w, &b, fn_key, root, &[], &mut g).unwrap_or_else(|e| panic!("{e}"))
+    };
+    let f_ref = build_inspect(&w, inspect_ref);
+    let f_ref_ref = build_inspect(&w, inspect_ref_ref);
+
+    // `main`:
+    //   let mut a = Other(17u64);
+    //   let ra = &mut a;
+    //   let r1: u32 = match ra { Table(t) => *t, existing => inspect_ref(existing) };
+    //   let b = Table(5u32);
+    //   let rb = &b;
+    //   let rrb = &rb;
+    //   let r2: u32 = match rrb { Other(_) => 0u32, existing => inspect_ref_ref(existing) };
+    //   r1 * 100 + r2   // 1705
+    let mut b = BodyBuf::new();
+    let other_p = b.path("Other");
+    let other_e = b.e(Expr::Path(other_p));
+    let v17 = b.int(17, Some(IntSuffix::Uint(UintTy::U64)));
+    let a_args = b.exprs_list(&[v17]);
+    let init_a = b.e(Expr::Call { callee: other_e, args: a_args });
+    let a = b.bind("a");
+    let s0 = Stmt::Let { pat: a, ty: None, init: Some(init_a), else_: None };
+    let a_l = b.local(a);
+    let ra_init = b.e(Expr::Ref { mutbl: Mutbl::Mut, operand: a_l });
+    let ra = plain(&mut b, "ra");
+    let s1 = Stmt::Let { pat: ra, ty: None, init: Some(ra_init), else_: None };
+
+    let t_pat = plain(&mut b, "t");
+    let tbl_p = b.path("Table");
+    let tbl_e = b.pats_list(&[t_pat]);
+    let p_tbl = b.pat(Pat::TupleStruct { path: tbl_p, elems: tbl_e, rest: None });
+    let t_l = b.local(t_pat);
+    let t_deref = b.e(Expr::Unary { op: UnOp::Deref, operand: t_l });
+    let ex1 = plain(&mut b, "existing");
+    let ex1_l = b.local(ex1);
+    let ir_p = b.path("inspect_ref");
+    let call1_f = b.e(Expr::Path(ir_p));
+    let c1_args = b.exprs_list(&[ex1_l]);
+    let call1 = b.e(Expr::Call { callee: call1_f, args: c1_args });
+    let ra_l = b.local(ra);
+    let m1_arms = arms(&mut b, &[(p_tbl, t_deref), (ex1, call1)]);
+    let m1 = b.e(Expr::Match { scrutinee: ra_l, arms: m1_arms });
+    let r1 = plain(&mut b, "r1");
+    let s2 = Stmt::Let { pat: r1, ty: None, init: Some(m1), else_: None };
+
+    let table_p = b.path("Table");
+    let table_e = b.e(Expr::Path(table_p));
+    let v5 = b.int(5, Some(IntSuffix::Uint(UintTy::U32)));
+    let b_args = b.exprs_list(&[v5]);
+    let init_b = b.e(Expr::Call { callee: table_e, args: b_args });
+    let bv = plain(&mut b, "b");
+    let s3 = Stmt::Let { pat: bv, ty: None, init: Some(init_b), else_: None };
+    let b_l = b.local(bv);
+    let rb_init = b.e(Expr::Ref { mutbl: Mutbl::Not, operand: b_l });
+    let rb = plain(&mut b, "rb");
+    let s4 = Stmt::Let { pat: rb, ty: None, init: Some(rb_init), else_: None };
+    let rb_l = b.local(rb);
+    let rrb_init = b.e(Expr::Ref { mutbl: Mutbl::Not, operand: rb_l });
+    let rrb = plain(&mut b, "rrb");
+    let s5 = Stmt::Let { pat: rrb, ty: None, init: Some(rrb_init), else_: None };
+
+    let w_pat = b.pat(Pat::Wild);
+    let oth_p = b.path("Other");
+    let oth_e = b.pats_list(&[w_pat]);
+    let p_oth = b.pat(Pat::TupleStruct { path: oth_p, elems: oth_e, rest: None });
+    let z0 = b.int(0, Some(IntSuffix::Uint(UintTy::U32)));
+    let ex2 = plain(&mut b, "existing2");
+    let ex2_l = b.local(ex2);
+    let irr_p = b.path("inspect_ref_ref");
+    let call2_f = b.e(Expr::Path(irr_p));
+    let c2_args = b.exprs_list(&[ex2_l]);
+    let call2 = b.e(Expr::Call { callee: call2_f, args: c2_args });
+    let rrb_l = b.local(rrb);
+    let m2_arms = arms(&mut b, &[(p_oth, z0), (ex2, call2)]);
+    let m2 = b.e(Expr::Match { scrutinee: rrb_l, arms: m2_arms });
+    let r2 = plain(&mut b, "r2");
+    let s6 = Stmt::Let { pat: r2, ty: None, init: Some(m2), else_: None };
+
+    let r1_l = b.local(r1);
+    let k100 = b.int(100, Some(IntSuffix::Uint(UintTy::U32)));
+    let scaled = b.bin(BinOp::Mul, r1_l, k100);
+    let r2_l = b.local(r2);
+    let sum = b.bin(BinOp::Add, scaled, r2_l);
+    let stmts = [s0, s1, s2, s3, s4, s5, s6];
+    let root = b.block(&stmts, Some(sum));
+    let main = build(&w, &b, root).unwrap_or_else(|e| panic!("{e}"));
+    #[cfg(target_arch = "aarch64")]
+    assert_eq!(run_native(&[(inspect_ref, &f_ref), (inspect_ref_ref, &f_ref_ref), (MAIN, &main)]) as u32, 1705);
+    let _ = (f_ref, f_ref_ref, main);
+}

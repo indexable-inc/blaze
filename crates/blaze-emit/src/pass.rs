@@ -1243,33 +1243,76 @@ impl<A: Allocator> Pass<'_, '_, A> {
             }
             Op::Switch => {
                 let scrutinee = o.value();
-                self.width_of(inst, op, scrutinee)?;
                 let default = o.target();
-                self.ld(X9, scrutinee);
-                for (words, to) in o.cases(scrutinee) {
-                    // A safe point between cases (pass/reach.rs): an island's fall-through
-                    // `b` leaves `x9`, the scrutinee, as it is.
-                    self.reach_point()?;
-                    let value = words.iter().rev().fold(0u64, |it, &word| (it << 32) | u64::from(word));
-                    match value < 4096 {
-                        true => self.put(enc::cmp_imm(X9, value as u32)),
-                        false => {
-                            self.mov_imm(X10, value);
-                            self.put(enc::cmp(X9, X10));
+                if Self::is_wide(self.view.ty(scrutinee)) {
+                    self.ld2(X9, X11, scrutinee);
+                    for (words, to) in o.cases(scrutinee) {
+                        // A safe point between cases (pass/reach.rs): an island's fall-through
+                        // `b` leaves `x9` and `x11`, the scrutinee halves, as they are.
+                        self.reach_point()?;
+                        if words.len() != 4 {
+                            return Err(unsupported(inst, op, "a 128-bit switch case of other than four words"));
+                        }
+                        let lo = u64::from(words[0]) | (u64::from(words[1]) << 32);
+                        let hi = u64::from(words[2]) | (u64::from(words[3]) << 32);
+                        let lo_diff = match lo {
+                            0 => X9,
+                            _ => {
+                                self.mov_imm(X10, lo);
+                                self.put(enc::eor(X10, X9, X10));
+                                X10
+                            }
+                        };
+                        let hi_diff = match hi {
+                            0 => X11,
+                            _ => {
+                                self.mov_imm(X8, hi);
+                                self.put(enc::eor(X8, X11, X8));
+                                X8
+                            }
+                        };
+                        self.put(enc::orr(X10, lo_diff, hi_diff));
+                        self.put(enc::cmp_imm(X10, 0));
+                        match to.args.is_empty() {
+                            // `b.ne +8; b to` when `to` is placed more than 1 MiB back.
+                            true => self.branch_if(enc::b_cond(Cond::Eq, 0), enc::b_cond(Cond::Ne, 2), to.block.0),
+                            false => {
+                                let at = self.here();
+                                self.put(enc::b_cond(Cond::Ne, 0));
+                                self.edge(to, None)?;
+                                self.land(at)?;
+                            }
                         }
                     }
-                    match to.args.is_empty() {
-                        // `b.ne +8; b to` when `to` is placed more than 1 MiB back.
-                        true => self.branch_if(enc::b_cond(Cond::Eq, 0), enc::b_cond(Cond::Ne, 2), to.block.0),
-                        false => {
-                            let at = self.here();
-                            self.put(enc::b_cond(Cond::Ne, 0));
-                            self.edge(to, None)?;
-                            self.land(at)?;
+                    self.edge(default, next)?;
+                } else {
+                    self.width_of(inst, op, scrutinee)?;
+                    self.ld(X9, scrutinee);
+                    for (words, to) in o.cases(scrutinee) {
+                        // A safe point between cases (pass/reach.rs): an island's fall-through
+                        // `b` leaves `x9`, the scrutinee, as it is.
+                        self.reach_point()?;
+                        let value = words.iter().rev().fold(0u64, |it, &word| (it << 32) | u64::from(word));
+                        match value < 4096 {
+                            true => self.put(enc::cmp_imm(X9, value as u32)),
+                            false => {
+                                self.mov_imm(X10, value);
+                                self.put(enc::cmp(X9, X10));
+                            }
+                        }
+                        match to.args.is_empty() {
+                            // `b.ne +8; b to` when `to` is placed more than 1 MiB back.
+                            true => self.branch_if(enc::b_cond(Cond::Eq, 0), enc::b_cond(Cond::Ne, 2), to.block.0),
+                            false => {
+                                let at = self.here();
+                                self.put(enc::b_cond(Cond::Ne, 0));
+                                self.edge(to, None)?;
+                                self.land(at)?;
+                            }
                         }
                     }
+                    self.edge(default, next)?;
                 }
-                self.edge(default, next)?;
             }
             Op::Return => {
                 let values = o.values();

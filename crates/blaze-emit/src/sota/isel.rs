@@ -10006,7 +10006,99 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                     let default_argc = to_idx(at_u32(view.extra, at + 2));
                     let cases_at = at + 3 + default_argc;
                     let num_cases = to_idx(at_u32(view.extra, cases_at));
-                    let width_words = to_idx(ty_at(view.tys, to_idx(scrutinee)).const_words());
+                    let scrut_ty = ty_at(view.tys, to_idx(scrutinee));
+                    let width_words = to_idx(scrut_ty.const_words());
+
+                    if scrut_ty == Ty::I128 {
+                        if width_words != 4 {
+                            return Err(TierError::Refused {
+                                tier: TIER,
+                                inst: Some(u32_of(inst)),
+                                what: "non-4-word i128 switch",
+                            });
+                        }
+                        let load_h = |words: &mut Vec<u32, Alloc<'a>>, hi: bool| -> Reg {
+                            match at_loc(&reg_alloc.loc_of, to_idx(scrutinee)) {
+                                AllocLoc::GprPair(lo, h) => u32::from(if hi { h } else { lo }),
+                                AllocLoc::GprPairSpill(s0, s1) => {
+                                    emit_ld_spill_gpr(words, X16, spill_base, if hi { s1 } else { s0 });
+                                    X16
+                                }
+                                _ => {
+                                    internal_err.set(Some(TierError::Refused {
+                                        tier: TIER,
+                                        inst: Some(scrutinee),
+                                        what: "unexpected i128 switch scrutinee loc",
+                                    }));
+                                    X16
+                                }
+                            }
+                        };
+                        let mut pos = cases_at + 1;
+                        for _ in 0..num_cases {
+                            let lo = u64::from(at_u32(view.extra, pos)) | (u64::from(at_u32(view.extra, pos + 1)) << 32);
+                            let hi = u64::from(at_u32(view.extra, pos + 2)) | (u64::from(at_u32(view.extra, pos + 3)) << 32);
+                            pos += 4;
+                            let case_block = at_u32(view.extra, pos);
+                            let case_argc = to_idx(at_u32(view.extra, pos + 1));
+                            let case_args_start = pos + 2;
+                            pos += 2 + case_argc;
+
+                            let sr_lo = load_h(&mut words, false);
+                            if lo <= 4095 {
+                                words.push(enc::cmp_imm(sr_lo, trunc_u32(lo)));
+                            } else {
+                                emit_const_u64(&mut words, X17, lo);
+                                words.push(enc::cmp(sr_lo, X17));
+                            }
+                            let skip_lo = words.len();
+                            words.push(enc::b_cond(Cond::Ne, 0));
+
+                            let sr_hi = load_h(&mut words, true);
+                            if hi <= 4095 {
+                                words.push(enc::cmp_imm(sr_hi, trunc_u32(hi)));
+                            } else {
+                                emit_const_u64(&mut words, X17, hi);
+                                words.push(enc::cmp(sr_hi, X17));
+                            }
+                            if case_argc == 0 {
+                                let widx = words.len();
+                                words.push(enc::b_cond(Cond::Eq, 0));
+                                patches.push(BranchPatch { word_idx: widx, kind: PatchKind::BCond(Cond::Eq), target_block: case_block });
+                                let after = words.len();
+                                set_at(&mut words, skip_lo, enc::b_cond(Cond::Ne, i32_of(after - skip_lo)));
+                            } else {
+                                let skip_hi = words.len();
+                                words.push(enc::b_cond(Cond::Ne, 0));
+                                emit_edge_moves(&mut words, &mut gpr_moves, &mut fp_moves, &mut const_edge_writes, case_block, case_args_start, case_argc);
+                                let w_jump = words.len();
+                                words.push(enc::b(0));
+                                patches.push(BranchPatch { word_idx: w_jump, kind: PatchKind::B, target_block: case_block });
+                                let after = words.len();
+                                set_at(&mut words, skip_lo, enc::b_cond(Cond::Ne, i32_of(after - skip_lo)));
+                                set_at(&mut words, skip_hi, enc::b_cond(Cond::Ne, i32_of(after - skip_hi)));
+                            }
+                        }
+                        emit_edge_moves(&mut words, &mut gpr_moves, &mut fp_moves, &mut const_edge_writes, default_block, at + 3, default_argc);
+                        let def_range = view.block(Block(default_block));
+                        if default_argc == 0
+                            && !def_range.is_empty()
+                            && view.op(def_range.start) == Op::Unreachable
+                            && blaze_lir::verify::sole_switch_default(&view, Block(default_block)).is_some()
+                        {
+                            let sr_lo = load_h(&mut words, false);
+                            if sr_lo != X9 {
+                                words.push(enc::mov(X9, sr_lo));
+                            }
+                        }
+                        if next_block != Some(to_idx(default_block)) {
+                            let widx = words.len();
+                            words.push(enc::b(0));
+                            patches.push(BranchPatch { word_idx: widx, kind: PatchKind::B, target_block: default_block });
+                        }
+                        inst += 1;
+                        continue;
+                    }
 
                     let sr = load_gpr(&mut words, scrutinee, X16);
 

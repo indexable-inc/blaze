@@ -441,8 +441,9 @@ pub(super) fn method_dispatch(
 const MOST_OBJECT_TRAITS: usize = 1024;
 
 /// The constants one ADT head may name before its row is given up on (reach.rs's
-/// `MOST_LENS`): a pattern type's ends, an array length.
-const MOST_ADT_LENS: u32 = 64;
+/// `MOST_LENS`): a pattern type's ends, an array length, or explicit enum discriminants
+/// (e.g. `nix::errno::consts::Errno` has >100 `= libc::E*` variants).
+const MOST_ADT_LENS: u32 = 1024;
 
 /// Every static `bodies` name, evaluated once ([`super::statics::static_values`]); one
 /// refused is named: in a survey filed in `left_out` and left out (each reader's build then
