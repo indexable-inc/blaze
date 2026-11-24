@@ -47,7 +47,7 @@ mod tests;
 
 pub use call::call;
 pub use inst::{
-    Arg, Ask, Callee, Clause, ClauseIn, EnvId, Envs, GenericArgs, ImplHead, ImplValue, Inst, Late, NotSelected, Selected,
+    Arg, Ask, Callee, Clause, ClauseIn, EnvId, Envs, GenericArgs, ImplHead, ImplValue, Inst, Late, NotSelected, RpititTarget, Selected,
     Selection, SelfShape, Side, Sig, Slots, Typed, ValueKind, instantiate, split_fn_col,
 };
 pub use relate::{ClosureSig, Constraints, Cx, Kind, Owner, clauses, head_eq, relate, relate_sides, well_formed};

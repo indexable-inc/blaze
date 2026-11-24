@@ -121,6 +121,133 @@ fn arr_escape<'a, 'b>(x: &'a u8, y: &'b u8) -> &'b u8 {
     arr[0]
 }
 
+pub struct FieldName<const N: usize>([u8; N]);
+impl<const N: usize> FieldName<N> {
+    pub const fn new() -> Self {
+        Self([b'a'; N])
+    }
+    pub const fn as_str(&self) -> &str {
+        "a"
+    }
+}
+
+pub struct FieldSet {
+    pub names: &'static [&'static str],
+}
+impl FieldSet {
+    pub const fn new(names: &'static [&'static str]) -> Self {
+        Self { names }
+    }
+}
+
+pub struct Meta<'a> {
+    pub name: &'a str,
+    pub fields: FieldSet,
+}
+impl<'a> Meta<'a> {
+    pub const fn new(name: &'a str, fields: FieldSet) -> Self {
+        Self { name, fields }
+    }
+}
+
+pub static STATIC_META: Meta<'static> = {
+    Meta::new(
+        "ev",
+        FieldSet::new(&[{
+            const NAME: FieldName<1> = FieldName::new();
+            NAME.as_str()
+        }]),
+    )
+};
+
+fn fn_meta_non_promotable() -> Meta<'static> {
+    Meta::new(
+        "ev",
+        FieldSet::new(&[{
+            const NAME: FieldName<1> = FieldName::new();
+            NAME.as_str()
+        }]),
+    )
+}
+
+pub static STATIC_LOCAL_BORROW: &'static u8 = {
+    let x = 1u8;
+    &x
+};
+
+pub const fn wrap_str(s: &'static String) -> W<'static> {
+    W(s)
+}
+
+pub static STATIC_DROP_NONEXT: W<'static> = wrap_str(&String::new());
+
+pub struct CellRef<'a>(pub &'a std::cell::UnsafeCell<u8>);
+unsafe impl Sync for CellRef<'_> {}
+pub const fn wrap_cell(c: &'static std::cell::UnsafeCell<u8>) -> CellRef<'static> {
+    CellRef(c)
+}
+
+pub static STATIC_CELL_NONEXT: CellRef<'static> = wrap_cell(&std::cell::UnsafeCell::new(1));
+
+pub const fn id_ref<'a>(r: &'a &'a u8) -> &'a &'a u8 {
+    r
+}
+
+pub static STATIC_INNER_DANGLING: &'static &'static u8 = id_ref(&{
+    let y = 1u8;
+    &y
+});
+
+struct DropRef<'a>(&'a u8);
+impl Drop for DropRef<'_> {
+    fn drop(&mut self) {}
+}
+
+fn closure_ref_capture_in_arc_drop_order() {
+    let holder;
+    let names = "field";
+    holder = std::sync::Arc::new(|v: u8| (names, v));
+    let _ = holder(1);
+}
+
+fn closure_drop_capture_in_arc_drop_order() {
+    let holder;
+    let x = 1u8;
+    let g = DropRef(&x);
+    holder = std::sync::Arc::new(move || {
+        let _ = &g;
+    });
+    holder();
+}
+
+static STATIC_LAZY: std::sync::LazyLock<Vec<u8>> = std::sync::LazyLock::new(Vec::new);
+const CONST_VEC: Vec<u8> = Vec::new();
+
+fn slice_id(s: &[u8]) -> &[u8] {
+    s
+}
+
+fn static_lazylock_deref() -> usize {
+    let r = slice_id(&*STATIC_LAZY);
+    r.len()
+}
+
+fn const_vec_deref_temp() -> usize {
+    let r = slice_id(&*CONST_VEC);
+    r.len()
+}
+
+struct OuterWriter<W: std::io::Write>(std::io::BufWriter<W>);
+
+fn transitive_strict_drop_in_outer(c: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    let w = OuterWriter(std::io::BufWriter::new(&mut out));
+    if c {
+        drop(w);
+    }
+    out
+}
+
 fn main() {}
 "#;
 
@@ -165,8 +292,31 @@ fn of<'r>(rows: &'r [(String, Verdict)], n: &str) -> &'r Verdict {
 
 #[test]
 fn temporaries_live_and_die_where_rust_says() {
-    let oracles = ["C_EXT", "ctor_ext", "deref_ext", "exit_order", "arr"];
-    let twins = ["fn_ext", "call_noext", "deref_noext", "exit_keep", "arr_escape"];
+    let oracles = [
+        "C_EXT",
+        "ctor_ext",
+        "deref_ext",
+        "exit_order",
+        "arr",
+        "STATIC_META",
+        "closure_ref_capture_in_arc_drop_order",
+        "static_lazylock_deref",
+    ];
+    let twins = [
+        "fn_ext",
+        "call_noext",
+        "deref_noext",
+        "exit_keep",
+        "arr_escape",
+        "fn_meta_non_promotable",
+        "STATIC_LOCAL_BORROW",
+        "STATIC_DROP_NONEXT",
+        "STATIC_CELL_NONEXT",
+        "STATIC_INNER_DANGLING",
+        "closure_drop_capture_in_arc_drop_order",
+        "const_vec_deref_temp",
+        "transitive_strict_drop_in_outer",
+    ];
     let all: Vec<&str> = oracles.iter().chain(twins.iter()).copied().collect();
     let rows = verdicts(&all);
     for n in oracles {

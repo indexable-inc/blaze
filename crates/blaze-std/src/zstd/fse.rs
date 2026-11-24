@@ -52,6 +52,7 @@ const LL_BITS: [u8; 36] = [
 ];
 
 /// Direct LUT mapping `lit_len` (`0..64`) to its Literals_Length code.
+#[cfg(test)]
 const LL_CODE_LUT: [u8; 64] = [
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 16, 17, 17, 18, 18, 19, 19, 20, 20,
     20, 20, 21, 21, 21, 21, 22, 22, 22, 22, 22, 22, 22, 22, 23, 23, 23, 23, 23, 23, 23, 23, 24, 24,
@@ -72,6 +73,7 @@ const ML_BITS: [u8; 53] = [
 ];
 
 /// Direct LUT mapping `match_len - 3` (`0..128`) to its Match_Length code.
+#[cfg(test)]
 const ML_CODE_LUT: [u8; 128] = [
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
     26, 27, 28, 29, 30, 31, 32, 32, 33, 33, 34, 34, 35, 35, 36, 36, 36, 36, 37, 37, 37, 37, 38, 38,
@@ -86,7 +88,7 @@ const fn pack_seq(code: u32, bits: u32, base: u32) -> u32 {
 }
 
 /// Packed 32-bit LL encoding table for `0..64`: `code | (bits << 8) | (base << 16)`.
-const LL_ENC_PACKED: [u32; 64] = [
+pub(crate) const LL_ENC_PACKED: [u32; 64] = [
     pack_seq(0, 0, 0), pack_seq(1, 0, 1), pack_seq(2, 0, 2), pack_seq(3, 0, 3),
     pack_seq(4, 0, 4), pack_seq(5, 0, 5), pack_seq(6, 0, 6), pack_seq(7, 0, 7),
     pack_seq(8, 0, 8), pack_seq(9, 0, 9), pack_seq(10, 0, 10), pack_seq(11, 0, 11),
@@ -106,7 +108,7 @@ const LL_ENC_PACKED: [u32; 64] = [
 ];
 
 /// Packed 32-bit ML encoding table for `match_len - 3` in `0..128`: `code | (bits << 8) | (base << 16)`.
-const ML_ENC_PACKED: [u32; 128] = [
+pub(crate) const ML_ENC_PACKED: [u32; 128] = [
     pack_seq(0, 0, 3), pack_seq(1, 0, 4), pack_seq(2, 0, 5), pack_seq(3, 0, 6),
     pack_seq(4, 0, 7), pack_seq(5, 0, 8), pack_seq(6, 0, 9), pack_seq(7, 0, 10),
     pack_seq(8, 0, 11), pack_seq(9, 0, 12), pack_seq(10, 0, 13), pack_seq(11, 0, 14),
@@ -968,6 +970,7 @@ pub(crate) fn normalize_fse_counts(
 pub(crate) struct FseEncTable {
     state_table: [u8; MAX_ENC_TABLE_SIZE],
     meta: [FseSymMeta; MAX_FSE_SYMBOLS],
+    packed_meta: [u64; MAX_FSE_SYMBOLS],
     table_size: u16,
     accuracy_log: u8,
 }
@@ -977,18 +980,33 @@ impl FseEncTable {
         Self {
             state_table: [0u8; MAX_ENC_TABLE_SIZE],
             meta: [FseSymMeta::ZERO; MAX_FSE_SYMBOLS],
+            packed_meta: [0u64; MAX_FSE_SYMBOLS],
             table_size: 0,
             accuracy_log: 0,
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) const fn pack_view(&self) -> blaze_own::FsePackTable<'_> {
+        blaze_own::FsePackTable {
+            state_table: &self.state_table,
+            meta: &self.packed_meta,
+            table_size: self.table_size,
+            accuracy_log: self.accuracy_log,
         }
     }
 
     /// Build a single-symbol RLE encoder table (`accuracy_log = 0`, 0 bits per transition).
     pub(crate) fn set_rle(&mut self, sym: u8) -> Result<(), ZstdError> {
         self.meta.fill(FseSymMeta::ZERO);
+        self.packed_meta.fill(0);
         if let Some(slot) = self.meta.get_mut(usize::from(sym)) {
             *slot = FseSymMeta { offset: 0, count: 1, split: 0, max_nb: 0 };
         } else {
             return Err(ZstdError::CorruptFse);
+        }
+        if let Some(p) = self.packed_meta.get_mut(usize::from(sym)) {
+            *p = 1u64 << 16;
         }
         if let Some(first) = self.state_table.first_mut() {
             *first = 0;
@@ -998,6 +1016,7 @@ impl FseEncTable {
         Ok(())
     }
 
+    #[cfg(test)]
     #[inline(always)]
     pub(crate) const fn accuracy_log(&self) -> u8 {
         self.accuracy_log
@@ -1023,6 +1042,7 @@ impl FseEncTable {
         }
 
         self.meta.fill(FseSymMeta::ZERO);
+        self.packed_meta.fill(0);
         let mut cursor: usize = 0;
         for sym in 0..MAX_FSE_SYMBOLS {
             let count = *counts.get(sym).ok_or(ZstdError::CorruptFse)?;
@@ -1038,13 +1058,22 @@ impl FseEncTable {
             } else {
                 (2u32 * p).saturating_sub(next_pow2) << (max_nb - 1)
             };
+            let offset_u16 = u16::try_from(cursor).map_err(|_| ZstdError::CorruptFse)?;
+            let split_u16 = u16::try_from(split_u32).map_err(|_| ZstdError::CorruptFse)?;
+            let max_nb_u8 = u8::try_from(max_nb).map_err(|_| ZstdError::CorruptFse)?;
             let slot = self.meta.get_mut(sym).ok_or(ZstdError::CorruptFse)?;
             *slot = FseSymMeta {
-                offset: u16::try_from(cursor).map_err(|_| ZstdError::CorruptFse)?,
+                offset: offset_u16,
                 count,
-                split: u16::try_from(split_u32).map_err(|_| ZstdError::CorruptFse)?,
-                max_nb: u8::try_from(max_nb).map_err(|_| ZstdError::CorruptFse)?,
+                split: split_u16,
+                max_nb: max_nb_u8,
             };
+            if let Some(pm) = self.packed_meta.get_mut(sym) {
+                *pm = u64::from(offset_u16)
+                    | (u64::from(count) << 16)
+                    | (u64::from(split_u16) << 32)
+                    | (u64::from(max_nb_u8) << 48);
+            }
             cursor += usize::from(count);
         }
 
@@ -1082,6 +1111,7 @@ impl FseEncTable {
 
     /// Branchless O(1) inverse transition when caller guarantees `sym` is present in this table
     /// (zero `Option`, zero `checked_sub`, masked `& 63` index).
+    #[cfg(test)]
     #[inline(always)]
     pub(crate) fn encode_step_fast(&self, sym: u8, target_state: u8) -> (u8, u32, u32) {
         let m = self

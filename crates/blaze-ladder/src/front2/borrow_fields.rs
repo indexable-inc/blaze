@@ -562,37 +562,171 @@ fn is_uncond_copy<'n, 'a, S: NamesSource<'n>>(
     scratch.get(s..e).is_some_and(|need| need.iter().all(|&b| !b))
 }
 
-/// Structural drop summary for `adt`: `(needs_drop_unconditionally, drop_args_span)`.
+/// Structural drop summary for an ADT ([`drop_facts_of`]).
+pub(super) struct DropFactsSummary {
+    pub(super) needs_drop: bool,
+    pub(super) drop_args: Option<(u32, u32)>,
+    pub(super) drop_strict: Option<(u32, u32)>,
+}
+
+fn all_param_bits(generics: u32) -> u64 {
+    if generics >= 64 { u64::MAX } else { (1u64 << generics) - 1 }
+}
+
+/// Bitmask of `adt`'s generic arguments (`0..generics`) that are NOT marked `#[may_dangle]` on
+/// `adt`'s unique `Drop` impl (RFC 1327): bit `j` set means dropping `adt` may inspect arbitrary
+/// lifetimes inside argument `j`. Conservative `all_param_bits(generics)` when unread.
+fn drop_impl_strict_mask<'n, S: NamesSource<'n>>(
+    r: &mut Records<'_, 'n, S>,
+    langs: super::BorrowLangs,
+    adt: tc::ItemKey,
+    generics: u32,
+) -> u64 {
+    let all = all_param_bits(generics);
+    if generics == 0 || generics > 64 {
+        return all;
+    }
+    let Some(drop_tr) = langs.drop else { return all };
+    let Some(impls) = answer_impls(r, drop_tr, tc::Shape::Adt(adt)) else { return all };
+    let &[imp] = &impls[..] else { return all };
+    if !r.store.impls.contains_key(&imp) {
+        let Some(lib) = r.keys.library_in(r.names, imp) else { return all };
+        if !super::ensure_one(r, Want::Impl(lib)) {
+            return all;
+        }
+    }
+    let Some(lib) = r.keys.library_in(r.names, imp) else { return all };
+    let Some(item) = r.names.signature_text_of(lib) else { return all };
+    if !item.text.contains("may_dangle") {
+        return all;
+    }
+    let Some(krate) = r.names.crate_of(lib) else { return all };
+    let edition = r.names.edition_of(krate).unwrap_or(blaze_surface::Edition::E2024);
+    let Ok(md_mask) = blaze_file_items::impl_may_dangle_params(item.text, edition) else {
+        return all;
+    };
+    if md_mask == 0 {
+        return all;
+    }
+    let tys = r.store.tys.view();
+    let Some(head) = r.store.impls.get(&imp) else { return all };
+    let Ok(tc::PNode::Adt(k, l)) = tys.node(head.self_ty) else { return all };
+    if k != adt {
+        return all;
+    }
+    let Ok(args) = tys.list(l) else { return all };
+    let mut strict = all;
+    for (j, &a) in args.iter().enumerate() {
+        if j < 64
+            && let Ok(tc::PNode::Param(p)) = tys.node(a)
+            && p < 64
+            && (md_mask & (1u64 << p)) != 0
+        {
+            strict &= !(1u64 << j);
+        }
+    }
+    strict
+}
+
+/// Collects every `PNode::Param(p)` appearing anywhere inside `root` (even behind references or
+/// pointers) into `strict_params` (RFC 1327: a strict `Drop` impl can inspect any lifetime inside
+/// its non-`#[may_dangle]` argument).
+fn collect_strict_params(
+    tys: tc::PTys<'_>,
+    root: tc::PTy,
+    generics: u32,
+    strict_params: &mut u64,
+    scratch: &mut AVec<'_, tc::PTy>,
+) -> bool {
+    scratch.clear();
+    scratch.push(root);
+    let mut steps = 0u32;
+    while let Some(ty) = scratch.pop() {
+        steps += 1;
+        if steps > MOST_DROP_NODES {
+            *strict_params = all_param_bits(generics);
+            return false;
+        }
+        match tys.node(ty) {
+            Ok(tc::PNode::Param(p)) => {
+                if p < generics && p < 64 {
+                    *strict_params |= 1u64 << p;
+                }
+            }
+            Ok(
+                tc::PNode::Ref(_, i)
+                | tc::PNode::Ptr(_, i)
+                | tc::PNode::Slice(i)
+                | tc::PNode::Array(i, _)
+                | tc::PNode::Pat(i, _),
+            ) => scratch.push(i),
+            Ok(
+                tc::PNode::Tuple(l)
+                | tc::PNode::Record(_, l)
+                | tc::PNode::Union(l)
+                | tc::PNode::FnPtr(l, _)
+                | tc::PNode::Adt(_, l)
+                | tc::PNode::Opaque(_, l)
+                | tc::PNode::FnDef(_, l)
+                | tc::PNode::Dynamic(l)
+                | tc::PNode::ExTrait(_, l),
+            ) => {
+                if let Ok(es) = tys.list(l) {
+                    scratch.extend_from_slice(es);
+                }
+            }
+            Ok(tc::PNode::Alias { args, .. }) => {
+                if let Ok(es) = tys.list(args) {
+                    scratch.extend_from_slice(es);
+                }
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+/// Structural drop summary for `adt`: `needs_drop`, `drop_args`, and `drop_strict` (RFC 1327).
 /// Computes a bounded fixed point over ADTs reachable from `adt`'s fields in dropping positions
 /// and files a `BorrowAdt` (`DROP_ADT_DETAIL`) read row for each nested ADT inspected (rule 21).
 #[expect(clippy::too_many_arguments, reason = "the ADT's already-queried Copy/Drop facts and output buffers")]
-pub fn drop_facts_of<'n, 'a, S: NamesSource<'n>>(
+pub(super) fn drop_facts_of<'n, 'a, S: NamesSource<'n>>(
     r: &mut Records<'_, 'n, S>,
     langs: super::BorrowLangs,
     adt: tc::ItemKey,
     adt_drop_impl: Option<bool>,
     adt_uncond_copy: bool,
     need: &mut AVec<'a, bool>,
+    strict_need: &mut AVec<'a, bool>,
     reads: &mut AVec<'a, Read>,
     alloc: Alloc<'a>,
-) -> (bool, Option<(u32, u32)>) {
+) -> DropFactsSummary {
     let is_inert = |k: tc::ItemKey| langs.manually_drop == Some(k) || langs.phantom_data == Some(k);
     if is_inert(adt) || adt_uncond_copy {
         let generics = BodyHeadFacts::new(&*r.store, r.names).adt(adt).map_or(0, |row| row.generics);
-        return push_drop_mask(generics, 0, need);
-    }
-    if adt_drop_impl != Some(false) {
-        return (true, None);
+        let (needs_drop, drop_args) = push_drop_mask(generics, 0, need);
+        let drop_strict = push_bool_mask(generics, 0, strict_need);
+        return DropFactsSummary { needs_drop, drop_args, drop_strict };
     }
     let Some(root_row) = BodyHeadFacts::new(&*r.store, r.names).adt(adt) else {
-        return (true, None);
+        return DropFactsSummary { needs_drop: true, drop_args: None, drop_strict: None };
     };
     let root_generics = root_row.generics;
+    if adt_drop_impl == Some(true) {
+        let strict_mask = drop_impl_strict_mask(r, langs, adt, root_generics);
+        let drop_strict = if root_generics <= 64 { push_bool_mask(root_generics, strict_mask, strict_need) } else { None };
+        return DropFactsSummary { needs_drop: true, drop_args: None, drop_strict };
+    }
+    if adt_drop_impl != Some(false) {
+        return DropFactsSummary { needs_drop: true, drop_args: None, drop_strict: None };
+    }
     if root_row.kind == tc::AdtKind::Union {
-        return push_drop_mask(root_generics, 0, need);
+        let (needs_drop, drop_args) = push_drop_mask(root_generics, 0, need);
+        let drop_strict = push_bool_mask(root_generics, 0, strict_need);
+        return DropFactsSummary { needs_drop, drop_args, drop_strict };
     }
     if root_generics > 64 {
-        return (true, None);
+        return DropFactsSummary { needs_drop: true, drop_args: None, drop_strict: None };
     }
 
     // Discover reachable ADTs in dropping positions (BFS, bounded by MOST_DROP_ADTS).
@@ -602,14 +736,25 @@ pub fn drop_facts_of<'n, 'a, S: NamesSource<'n>>(
         generics: u32,
         uncond: bool,
         params: u64,
+        has_drop_impl: bool,
+        strict_params: u64,
     }
     let mut nodes: AVec<'a, DropNode> = AVec::new_in(alloc);
-    nodes.push(DropNode { key: adt, fixed: None, generics: root_generics, uncond: false, params: 0 });
+    nodes.push(DropNode {
+        key: adt,
+        fixed: None,
+        generics: root_generics,
+        uncond: false,
+        params: 0,
+        has_drop_impl: false,
+        strict_params: 0,
+    });
     let mut cursor = 0usize;
     let mut capped = false;
     let mut field_tys: AVec<'a, tc::PTy> = AVec::new_in(alloc);
     let mut field_spans: AVec<'a, (usize, usize)> = AVec::new_in(alloc);
     let mut ty_stack: AVec<'a, tc::PTy> = AVec::new_in(alloc);
+    let mut strict_stack: AVec<'a, tc::PTy> = AVec::new_in(alloc);
     let mut copy_scratch: AVec<'a, bool> = AVec::new_in(alloc);
 
     while let Some(key) = nodes.get(cursor).map(|n| n.key) {
@@ -635,14 +780,21 @@ pub fn drop_facts_of<'n, 'a, S: NamesSource<'n>>(
         } else {
             super::has_impl(r, langs.drop, key).ok()
         };
-        let row_opt = BodyHeadFacts::new(&*r.store, r.names).adt(key);
-        let (made, union, generics) = match row_opt {
+        let (made, union, generics) = match BodyHeadFacts::new(&*r.store, r.names).adt(key) {
             Some(row) => (true, row.kind == tc::AdtKind::Union, row.generics),
             None => (false, false, 0),
         };
+        let impl_strict = if drop_impl == Some(true) {
+            drop_impl_strict_mask(r, langs, key, generics)
+        } else if !made || generics > 64 || drop_impl.is_none() {
+            all_param_bits(generics)
+        } else {
+            0
+        };
         let fields_start = field_tys.len();
-        let mut fhash = tc::StableHasher::new("blaze-ladder front2 borrow drop fields v1");
-        if let Some(row) = row_opt {
+        let mut fhash = tc::StableHasher::new("blaze-ladder front2 borrow drop fields v2");
+        fhash.u64(impl_strict);
+        if let Some(row) = BodyHeadFacts::new(&*r.store, r.names).adt(key) {
             let tys = r.store.tys.view();
             fhash.u32(u32::try_from(row.fields.len()).unwrap_or(u32::MAX));
             for f in row.fields.iter() {
@@ -669,6 +821,8 @@ pub fn drop_facts_of<'n, 'a, S: NamesSource<'n>>(
         if let Some(node) = nodes.get_mut(cursor) {
             node.generics = generics;
             node.fixed = fixed;
+            node.has_drop_impl = drop_impl == Some(true);
+            node.strict_params = impl_strict;
             if let Some((u, p)) = fixed {
                 node.uncond = u;
                 node.params = p;
@@ -701,7 +855,15 @@ pub fn drop_facts_of<'n, 'a, S: NamesSource<'n>>(
                                 capped = true;
                                 break;
                             }
-                            nodes.push(DropNode { key: nested, fixed: None, generics: 0, uncond: false, params: 0 });
+                            nodes.push(DropNode {
+                                key: nested,
+                                fixed: None,
+                                generics: 0,
+                                uncond: false,
+                                params: 0,
+                                has_drop_impl: false,
+                                strict_params: 0,
+                            });
                         }
                         if let Ok(es) = tys.list(args) {
                             ty_stack.extend_from_slice(es);
@@ -715,24 +877,28 @@ pub fn drop_facts_of<'n, 'a, S: NamesSource<'n>>(
     }
 
     if capped {
-        return (true, None);
+        return DropFactsSummary { needs_drop: true, drop_args: None, drop_strict: None };
     }
 
-    // Monotone fixed point over `nodes`: each pass only sets `uncond = true` or sets bits in `params`.
+    // Monotone fixed point over `nodes`: each pass only sets `uncond = true` or sets bits in
+    // `params` / `strict_params`.
     let tys = r.store.tys.view();
     let max_iters = nodes.len().saturating_add(2);
     for _ in 0..max_iters {
         let mut changed = false;
         for idx in 0..nodes.len() {
-            let Some((fixed, generics, old_uncond, old_params)) = nodes.get(idx).map(|n| (n.fixed, n.generics, n.uncond, n.params)) else {
+            let Some((fixed, generics, old_uncond, old_params, old_strict)) =
+                nodes.get(idx).map(|n| (n.fixed, n.generics, n.uncond, n.params, n.strict_params))
+            else {
                 continue;
             };
-            if fixed.is_some() || old_uncond {
+            if fixed.is_some() {
                 continue;
             }
             let Some(&(fs, fe)) = field_spans.get(idx) else { continue };
             let mut uncond = old_uncond;
             let mut params = old_params;
+            let mut strict_params = old_strict;
             ty_stack.clear();
             if let Some(slice) = field_tys.get(fs..fe) {
                 ty_stack.extend_from_slice(slice);
@@ -742,6 +908,7 @@ pub fn drop_facts_of<'n, 'a, S: NamesSource<'n>>(
                 steps += 1;
                 if steps > MOST_DROP_NODES {
                     uncond = true;
+                    strict_params = all_param_bits(generics);
                     break;
                 }
                 match tys.node(t) {
@@ -764,13 +931,13 @@ pub fn drop_facts_of<'n, 'a, S: NamesSource<'n>>(
                             params |= 1u64 << p;
                         } else {
                             uncond = true;
-                            break;
                         }
                     }
                     Ok(tc::PNode::Tuple(l)) => match tys.list(l) {
                         Ok(es) => ty_stack.extend_from_slice(es),
                         Err(_) => {
                             uncond = true;
+                            strict_params = all_param_bits(generics);
                             break;
                         }
                     },
@@ -778,34 +945,43 @@ pub fn drop_facts_of<'n, 'a, S: NamesSource<'n>>(
                     Ok(tc::PNode::Adt(nested, args)) => {
                         let Some(target) = nodes.iter().find(|n| n.key == nested) else {
                             uncond = true;
-                            break;
+                            collect_strict_params(tys, t, generics, &mut strict_params, &mut strict_stack);
+                            continue;
                         };
-                        if target.uncond {
+                        let target_uncond = target.uncond;
+                        let target_params = target.params;
+                        let target_strict = target.strict_params;
+                        let target_has_drop = target.has_drop_impl;
+                        if target_uncond {
                             uncond = true;
-                            break;
                         }
-                        let mask = target.params;
                         let Ok(es) = tys.list(args) else {
                             uncond = true;
+                            strict_params = all_param_bits(generics);
                             break;
                         };
                         for (j, &arg) in es.iter().enumerate() {
-                            if j >= 64 || (mask & (1u64 << j)) != 0 {
+                            let is_strict = j >= 64 || (target_strict & (1u64 << j)) != 0;
+                            if is_strict {
+                                collect_strict_params(tys, arg, generics, &mut strict_params, &mut strict_stack);
+                            } else if target_has_drop || target_uncond || (target_params & (1u64 << j)) != 0 {
+                                // `#[may_dangle]` on `Drop` or structural glue: recurse into `arg`.
                                 ty_stack.push(arg);
                             }
                         }
                     }
                     _ => {
                         uncond = true;
-                        break;
+                        collect_strict_params(tys, t, generics, &mut strict_params, &mut strict_stack);
                     }
                 }
             }
-            if (uncond != old_uncond || params != old_params)
+            if (uncond != old_uncond || params != old_params || strict_params != old_strict)
                 && let Some(node) = nodes.get_mut(idx)
             {
                 node.uncond = uncond;
                 node.params = params;
+                node.strict_params = strict_params;
                 changed = true;
             }
         }
@@ -815,17 +991,32 @@ pub fn drop_facts_of<'n, 'a, S: NamesSource<'n>>(
     }
 
     match nodes.first() {
-        Some(root) if !root.uncond => push_drop_mask(root_generics, root.params, need),
-        _ => (true, None),
+        Some(root) => {
+            let (needs_drop, drop_args) = if !root.uncond {
+                push_drop_mask(root_generics, root.params, need)
+            } else {
+                (true, None)
+            };
+            let drop_strict = push_bool_mask(root_generics, root.strict_params, strict_need);
+            DropFactsSummary { needs_drop, drop_args, drop_strict }
+        }
+        None => DropFactsSummary { needs_drop: true, drop_args: None, drop_strict: None },
     }
 }
 
-fn push_drop_mask(generics: u32, mask: u64, need: &mut AVec<'_, bool>) -> (bool, Option<(u32, u32)>) {
-    let Ok(start) = u32::try_from(need.len()) else { return (true, None) };
+fn push_bool_mask(generics: u32, mask: u64, out: &mut AVec<'_, bool>) -> Option<(u32, u32)> {
+    let start = u32::try_from(out.len()).ok()?;
     for j in 0..generics {
-        need.push(j < 64 && (mask & (1u64 << j)) != 0);
+        out.push(j < 64 && (mask & (1u64 << j)) != 0);
     }
-    (false, Some((start, generics)))
+    Some((start, generics))
+}
+
+fn push_drop_mask(generics: u32, mask: u64, need: &mut AVec<'_, bool>) -> (bool, Option<(u32, u32)>) {
+    match push_bool_mask(generics, mask, need) {
+        Some(span) => (false, Some(span)),
+        None => (true, None),
+    }
 }
 
 fn hash_pty_for_drop(tys: tc::PTys<'_>, root: tc::PTy, h: &mut tc::StableHasher, budget: &mut u32, stack: &mut AVec<'_, tc::PTy>) {

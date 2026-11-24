@@ -298,6 +298,26 @@ pub(crate) const fn str_reg_scaled(size: Size, rt: Reg, rn: Reg, rm: Reg) -> u32
     0x3820_7800 | (size.bits() << 30) | (rm << 16) | (rn << 5) | rt
 }
 
+/// `ldr{b,h,,} rt, [rn, wm, uxtw]` (unscaled 32-bit unsigned-extended register-index load).
+pub(crate) const fn ldr_reg_uxtw(size: Size, rt: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x3860_4800 | (size.bits() << 30) | (rm << 16) | (rn << 5) | rt
+}
+
+/// `str{b,h,,} rt, [rn, wm, uxtw]` (unscaled 32-bit unsigned-extended register-index store).
+pub(crate) const fn str_reg_uxtw(size: Size, rt: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x3820_4800 | (size.bits() << 30) | (rm << 16) | (rn << 5) | rt
+}
+
+/// `ldr{b,h,,} rt, [rn, wm, uxtw #size]` (scaled 32-bit unsigned-extended register-index load).
+pub(crate) const fn ldr_reg_uxtw_scaled(size: Size, rt: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x3860_5800 | (size.bits() << 30) | (rm << 16) | (rn << 5) | rt
+}
+
+/// `str{b,h,,} rt, [rn, wm, uxtw #size]` (scaled 32-bit unsigned-extended register-index store).
+pub(crate) const fn str_reg_uxtw_scaled(size: Size, rt: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x3820_5800 | (size.bits() << 30) | (rm << 16) | (rn << 5) | rt
+}
+
 /// `ldrsw xt, [xn, xm, lsl #2]` (signed 32-bit scaled load for dense PC-relative jump tables).
 pub(crate) const fn ldrsw_reg_scaled(rt: Reg, rn: Reg, rm: Reg) -> u32 {
     0xb8a0_7800 | (rm << 16) | (rn << 5) | rt
@@ -395,6 +415,34 @@ pub(crate) const fn sbfm(rd: Reg, rn: Reg, immr: u32, imms: u32) -> u32 {
 
 pub(crate) const fn ubfm(rd: Reg, rn: Reg, immr: u32, imms: u32) -> u32 {
     0xd340_0000 | (immr << 16) | (imms << 10) | (rn << 5) | rd
+}
+
+/// `ubfx xd/wd, xn/wn, #lsb, #width` (C6.2.417: alias of `ubfm` with `immr = lsb`, `imms = lsb + width - 1`).
+pub(crate) const fn ubfx(is64: bool, rd: Reg, rn: Reg, lsb: u32, width: u32) -> u32 {
+    if is64 {
+        ubfm(rd, rn, lsb & 63, (lsb + width - 1) & 63)
+    } else {
+        ubfm_w(rd, rn, lsb & 31, (lsb + width - 1) & 31)
+    }
+}
+
+/// `bfm xd, xn, #immr, #imms` (C6.2.30: 64-bit bitfield move; `N=1`).
+pub(crate) const fn bfm(rd: Reg, rn: Reg, immr: u32, imms: u32) -> u32 {
+    0xb340_0000 | ((immr & 63) << 16) | ((imms & 63) << 10) | (rn << 5) | rd
+}
+
+/// `bfm wd, wn, #immr, #imms` (C6.2.30: 32-bit bitfield move; `N=0`).
+pub(crate) const fn bfm_w(rd: Reg, rn: Reg, immr: u32, imms: u32) -> u32 {
+    0x3300_0000 | ((immr & 31) << 16) | ((imms & 31) << 10) | (rn << 5) | rd
+}
+
+/// `bfxil xd/wd, xn/wn, #lsb, #width` (C6.2.31: alias of `bfm` with `immr = lsb`, `imms = lsb + width - 1`).
+pub(crate) const fn bfxil(is64: bool, rd: Reg, rn: Reg, lsb: u32, width: u32) -> u32 {
+    if is64 {
+        bfm(rd, rn, lsb & 63, (lsb + width - 1) & 63)
+    } else {
+        bfm_w(rd, rn, lsb & 31, (lsb + width - 1) & 31)
+    }
 }
 
 /// `sbfx xd, xn, #0, #bits`: the low `bits` (1..=63) sign-extended; `sxtb`/`sxth`/`sxtw` at

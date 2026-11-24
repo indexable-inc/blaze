@@ -1325,8 +1325,10 @@ pub struct ContainerRegions {
     pub param_bounds: blaze_own::Vec<ContainerParamBound, Alloc<'static>>,
 }
 
-/// Extract non-higher-ranked trait bounds on bare type parameters (`PNode::Param(p)`) from a
-/// container's laid clause columns (`HeadRegions::clauses`).
+/// Extract non-higher-ranked trait bounds on bare type parameters (`PNode::Param(p)`) from laid
+/// clause columns (`HeadRegions::clauses`), elaborating transitive supertraits whose columns are
+/// filed in `regions_store` (e.g. `M: MakeOutput<Writer<'w>, Out>` -> `M: MakeVisitor<Writer<'w>>`
+/// so `M::Visitor` gets `'w`).
 fn extract_container_param_bounds<A: core::alloc::Allocator>(
     tys: tc::PTys<'_>,
     clauses: &[tc::region_facts::ClauseRegions<A>],
@@ -1346,6 +1348,169 @@ fn extract_container_param_bounds<A: core::alloc::Allocator>(
         out.push(ContainerParamBound { param, trait_, regions });
     }
     out
+}
+
+/// Elaborates supertrait bounds for each `Param(p): Trait<...>` clause in `clauses` using
+/// supertrait clause columns filed in `regions_store`, pushing both direct bounds and
+/// transitive supertrait bounds into `out`.
+fn extract_elaborated_param_bounds<A: core::alloc::Allocator>(
+    tys: tc::PTys<'_>,
+    regions_store: &super::head_record::RegionTable,
+    arity: &dyn tc::regions::Arity,
+    clauses: &[tc::region_facts::ClauseRegions<A>],
+    out: &mut blaze_own::Vec<ContainerParamBound, Alloc<'static>>,
+    alloc: Alloc<'static>,
+) {
+    struct WorkItem {
+        param: u32,
+        trait_: ItemKey,
+        own_lts: blaze_own::Vec<Region, Alloc<'static>>,
+        arg_slots: blaze_own::Vec<blaze_own::Vec<Region, Alloc<'static>>, Alloc<'static>>,
+    }
+    let map_reg = |r: Region, own_lts: &[Region]| -> Option<Region> {
+        match r {
+            Region::Static => Some(Region::Static),
+            Region::Param(i) => usize::try_from(i).ok().and_then(|idx| own_lts.get(idx).copied()),
+            Region::Late { .. } => None,
+        }
+    };
+    let mut work: blaze_own::Vec<WorkItem, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+    for c in clauses {
+        if c.binders != 0 {
+            continue;
+        }
+        let Ok(PNode::ExTrait(trait_, args)) = tys.node(c.col.ty()) else { continue };
+        let Ok(list) = tys.list(args) else { continue };
+        let Some(&first) = list.first() else { continue };
+        let Ok(PNode::Param(param)) = tys.node(first) else { continue };
+        let col = c.col.as_slice();
+        let mut regions = blaze_own::Vec::with_capacity_in(col.len(), alloc);
+        regions.extend_from_slice(col);
+        out.push(ContainerParamBound { param, trait_, regions });
+
+        let tc::regions::Count::Known(own_n) = arity.trait_lifetimes(trait_) else { continue };
+        let Ok(own_len) = usize::try_from(own_n) else { continue };
+        let Some(own_slice) = col.get(..own_len) else { continue };
+        let mut own_lts = blaze_own::Vec::with_capacity_in(own_len, alloc);
+        own_lts.extend_from_slice(own_slice);
+        let mut off = own_len;
+        let mut arg_slots: blaze_own::Vec<blaze_own::Vec<Region, Alloc<'static>>, Alloc<'static>> = blaze_own::Vec::with_capacity_in(list.len(), alloc);
+        let mut ok = true;
+        for &a in list {
+            let Ok(sn) = tc::regions::slots(tys, a, arity, alloc) else {
+                ok = false;
+                break;
+            };
+            let Ok(slen) = usize::try_from(sn) else {
+                ok = false;
+                break;
+            };
+            let Some(next_off) = off.checked_add(slen) else {
+                ok = false;
+                break;
+            };
+            let Some(sl) = col.get(off..next_off) else {
+                ok = false;
+                break;
+            };
+            let mut v = blaze_own::Vec::with_capacity_in(slen, alloc);
+            v.extend_from_slice(sl);
+            arg_slots.push(v);
+            off = next_off;
+        }
+        if ok && off == col.len() {
+            work.push(WorkItem { param, trait_, own_lts, arg_slots });
+        }
+    }
+    let mut steps = 0u32;
+    while let Some(item) = work.pop() {
+        steps += 1;
+        if steps > 64 {
+            break;
+        }
+        let Some(tr_filed) = regions_store.made(item.trait_) else { continue };
+        let tr_arity = tr_filed.arity();
+        for sc in tr_filed.regions().clauses.iter() {
+            if sc.binders != 0 {
+                continue;
+            }
+            let Ok(PNode::ExTrait(sup_tr, sup_args)) = tys.node(sc.col.ty()) else { continue };
+            let Ok(sup_list) = tys.list(sup_args) else { continue };
+            if !sup_list.first().is_some_and(|&f| matches!(tys.node(f), Ok(PNode::Param(0)))) {
+                continue;
+            }
+            let sup_col = sc.col.as_slice();
+            let tc::regions::Count::Known(sup_own_n) = tr_arity.trait_lifetimes(sup_tr) else { continue };
+            let Ok(sup_own_len) = usize::try_from(sup_own_n) else { continue };
+            let Some(sup_own_slice) = sup_col.get(..sup_own_len) else { continue };
+            let mut sup_own = blaze_own::Vec::with_capacity_in(sup_own_len, alloc);
+            let mut ok = true;
+            for &r in sup_own_slice {
+                let Some(mr) = map_reg(r, &item.own_lts) else {
+                    ok = false;
+                    break;
+                };
+                sup_own.push(mr);
+            }
+            if !ok {
+                continue;
+            }
+            let mut flat = blaze_own::Vec::with_capacity_in(sup_col.len(), alloc);
+            flat.extend_from_slice(&sup_own);
+            let mut next_args: blaze_own::Vec<blaze_own::Vec<Region, Alloc<'static>>, Alloc<'static>> = blaze_own::Vec::with_capacity_in(sup_list.len(), alloc);
+            let mut sc_off = sup_own_len;
+            for &sa in sup_list {
+                let mut sa_slots: blaze_own::Vec<Region, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+                let res = tc::regions::each_slot_node(tys, sa, tr_arity, alloc, &mut |_, node, own| {
+                    if let PNode::Param(p) = node {
+                        let Some(ps) = usize::try_from(p).ok().and_then(|pi| item.arg_slots.get(pi)) else {
+                            ok = false;
+                            return Ok(());
+                        };
+                        sa_slots.extend_from_slice(ps);
+                        flat.extend_from_slice(ps);
+                        return Ok(());
+                    }
+                    let Ok(olen) = usize::try_from(own) else {
+                        ok = false;
+                        return Ok(());
+                    };
+                    let Some(next_off) = sc_off.checked_add(olen) else {
+                        ok = false;
+                        return Ok(());
+                    };
+                    let Some(sl) = sup_col.get(sc_off..next_off) else {
+                        ok = false;
+                        return Ok(());
+                    };
+                    for &r in sl {
+                        let Some(mr) = map_reg(r, &item.own_lts) else {
+                            ok = false;
+                            return Ok(());
+                        };
+                        sa_slots.push(mr);
+                        flat.push(mr);
+                    }
+                    sc_off = next_off;
+                    Ok(())
+                });
+                if res.is_err() || !ok {
+                    ok = false;
+                    break;
+                }
+                next_args.push(sa_slots);
+            }
+            if !ok || sc_off != sup_col.len() {
+                continue;
+            }
+            let dup = out.iter().any(|e| e.param == item.param && e.trait_ == sup_tr && e.regions.as_slice() == flat.as_slice());
+            if dup {
+                continue;
+            }
+            out.push(ContainerParamBound { param: item.param, trait_: sup_tr, regions: flat });
+            work.push(WorkItem { param: item.param, trait_: sup_tr, own_lts: sup_own, arg_slots: next_args });
+        }
+    }
 }
 
 impl ContainerRegions {
@@ -1582,12 +1747,53 @@ fn async_future_filed<'n, H: Heads, S: NamesSource<'n>>(
 fn written_of(v: &View<'_>, preds: &Preds, more: &[lf::TypeId], alloc: Alloc<'static>) -> (blaze_own::Vec<lf::TypeId, Alloc<'static>>, Option<RegionsRefusal>) {
     let mut out = blaze_own::Vec::new_in(alloc);
     for &t in more {
-        if !out.contains(&t) {
+        if out.scan_for(&t).is_none() {
             out.push(t);
         }
     }
     let unlisted = hreg::written_types(v, preds, &mut out).err();
     (out, unlisted)
+}
+
+/// Pre-lays non-higher-ranked `Param(p): Trait<...>` clauses of `preds` and merges them with
+/// `given.param_bounds` so sibling clauses and fields in the same item (e.g.
+/// `where M: MakeOutput<Writer<'writer>, Out>, M::Visitor: VisitFmt`) can read the bound's
+/// trait lifetimes and type-argument regions via `SelfGiven::param_bounds`.
+#[expect(clippy::too_many_arguments, reason = "lay_written's arguments plus scope and preds for pre-laying own param bounds")]
+fn with_own_param_bounds<'n, H: Heads, S: NamesSource<'n>>(
+    b: &Builder<'_, H, S>,
+    tys: &mut PortableTys<'_>,
+    regions_store: &super::head_record::RegionTable,
+    arity: &dyn tc::regions::Arity,
+    env: &Env<'_>,
+    v: &View<'_>,
+    preds: &Preds,
+    scope: &Scope,
+    given: SelfGiven<'_>,
+    opaques: Captures<'_>,
+    alloc: Alloc<'static>,
+) -> Result<blaze_own::Vec<ContainerParamBound, Alloc<'static>>, Why> {
+    let mut merged: blaze_own::Vec<ContainerParamBound, Alloc<'static>> = blaze_own::Vec::with_capacity_in(given.param_bounds.len(), alloc);
+    for pb in given.param_bounds {
+        let mut regs = blaze_own::Vec::with_capacity_in(pb.regions.len(), alloc);
+        regs.extend_from_slice(&pb.regions);
+        merged.push(ContainerParamBound { param: pb.param, trait_: pb.trait_, regions: regs });
+    }
+    let has_own_param_bound = preds.clauses.iter().zip(preds.sources.iter()).any(|(&c, &src)| {
+        matches!(src, hreg::Src::Trait { binders, .. } if binders == hreg::Binders::NONE)
+            && matches!(c, PClause::Trait { args, .. } if tys.view().list(args).ok().and_then(|l| l.first()).is_some_and(|&f| matches!(tys.view().node(f), Ok(PNode::Param(_)))))
+    });
+    if !has_own_param_bound {
+        return Ok(merged);
+    }
+    let mut ptypes: blaze_own::Vec<lf::TypeId, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+    let _ = hreg::param_bound_types(v, tys.view(), preds, &mut ptypes);
+    let laid = lay_written(b, tys, env, v, &ptypes, given, opaques, alloc)?;
+    let cx = hreg::Cx { v, facts: arity, written: &laid, scope, made: &[], alloc };
+    let mut cols: blaze_own::Vec<tc::region_facts::ClauseRegions<Alloc<'static>>, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+    hreg::param_bound_clauses(&cx, tys, preds, &mut cols);
+    extract_elaborated_param_bounds(tys.view(), regions_store, arity, &cols, &mut merged, alloc);
+    Ok(merged)
 }
 
 /// [`written_of`] then [`lay_written`]: each type listed is laid, and a type the listing
@@ -3811,6 +4017,198 @@ impl<'n> Store<'n> {
         Ok(())
     }
 
+    /// Lays and files region clauses for each associated type of a trait restored from a frozen
+    /// head record (which stores `AssocSide::bounds` in `Store::preds` without `FiledRegions` for
+    /// `AssocTyDef::item`). No-op if every associated type of `key` already has regions or a
+    /// recorded refusal.
+    pub fn ensure_assoc_regions<S: NamesSource<'n>>(&mut self, names: S, keys: &mut Keys, key: LibKey) {
+        let ck = checker_of(key);
+        let needs_any = self.trait_defs.get(&ck).is_some_and(|def| {
+            def.assoc.iter().any(|a| {
+                self.regions.made(a.item).is_none()
+                    && self.regions.unread(a.item).why == tc::region_facts::UnreadWhy::NoHead
+            })
+        });
+        if !needs_any {
+            return;
+        }
+        let mut lowered = None;
+        let Ok(frame) = self.lower_frame(names, key, &mut lowered) else { return };
+        let module = frame.module;
+        let v = frame.low.view();
+        let alloc = self.tys.alloc();
+        let mut ps: blaze_own::Vec<(Name, u32), Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+        let mut own = 0u32;
+        if let Ok(rows) = v.rows(v.list(head::GENERICS)) {
+            let mut idx = 1u32;
+            for &n in rows {
+                match lf::GenericParam::decode(n) {
+                    Ok(lf::GenericParam::Lifetime { .. }) => {}
+                    Ok(lf::GenericParam::Type { name, .. }) | Ok(lf::GenericParam::Const { name, .. }) => {
+                        if let Ok(nm) = v.name(name) {
+                            ps.push((Name(nm), idx));
+                        }
+                        idx += 1;
+                    }
+                    Err(_) => return,
+                }
+            }
+            own = idx.saturating_sub(1);
+        }
+        let mut cs: blaze_own::Vec<(u32, PTy), Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+        if let Some(existing) = self.maps.const_params.get(&key) {
+            cs.extend_from_slice(existing);
+        }
+        let Ok(marks) = self.marks(names, key, v.item()) else { return };
+        let mut bounds: blaze_own::Vec<super::types::ParamBound, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+        for _ in 0..16u32 {
+            bounds.clear();
+            let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::Trait(key), self_assoc: &[], anon: &[], consts: &cs, body: None };
+            let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
+            match b.param_bounds_in(&mut self.tys, &env, &v, 1, &mut bounds) {
+                Ok(()) => break,
+                Err(Why::Need(dep)) => {
+                    if self.ensure(names, keys, Want::Head(dep)).is_err() {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+        let Ok(scope) = Scope::item(&v, None, 0, alloc) else { return };
+        let Ok(mem_list) = members(names, key) else { return };
+        for m in &mem_list {
+            if !matches!(m.detail, ItemDetail::TypeAlias) {
+                continue;
+            }
+            let Ok(item) = keys.member(ck, MemberKind::Type, m.name) else { continue };
+            if self.regions.made(item).is_some() || self.regions.unread(item).why != tc::region_facts::UnreadWhy::NoHead {
+                continue;
+            }
+            let Ok(low) = lower(names, key, m.text) else { continue };
+            let mv = low.view();
+            if mv.cfg_out() {
+                continue;
+            }
+            let Ok(m_marks) = super::item_site::member_marks(names, key, m.written_by, m.text) else { continue };
+            for _ in 0..16u32 {
+                let mut own_ps: blaze_own::Vec<(Name, u32), Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+                own_ps.extend_from_slice(&ps);
+                let mut own_cs: blaze_own::Vec<(u32, PTy), Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+                own_cs.extend_from_slice(&cs);
+                let mut of_type = 0u32;
+                let mut gen_need: Option<LibKey> = None;
+                let mut gen_err = false;
+                if let Ok(rows) = mv.rows(mv.list(head::GENERICS)) {
+                    let base = own + 1;
+                    let mut idx = base;
+                    let cenv = Env { module, params: &[], bounds: Bounds::Done(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &[], body: None };
+                    let cb = Builder { resolver: Paths { names }, heads: &self.maps, marks: m_marks };
+                    for &n in rows {
+                        match lf::GenericParam::decode(n) {
+                            Ok(lf::GenericParam::Lifetime { .. }) => {}
+                            Ok(lf::GenericParam::Type { name, .. }) => {
+                                if let Ok(nm) = mv.name(name) {
+                                    own_ps.push((Name(nm), idx));
+                                }
+                                idx += 1;
+                            }
+                            Ok(lf::GenericParam::Const { name, ty, default: _ }) => {
+                                if let Ok(nm) = mv.name(name) {
+                                    own_ps.push((Name(nm), idx));
+                                }
+                                match cb.ty(&mut self.tys, &cenv, &mv, ty) {
+                                    Ok(t) => own_cs.push((idx, t)),
+                                    Err(Why::Need(dep)) => {
+                                        gen_need = Some(dep);
+                                        break;
+                                    }
+                                    Err(_) => {
+                                        gen_err = true;
+                                        break;
+                                    }
+                                }
+                                idx += 1;
+                            }
+                            Err(_) => {
+                                gen_err = true;
+                                break;
+                            }
+                        }
+                    }
+                    of_type = idx.saturating_sub(base);
+                }
+                if let Some(dep) = gen_need {
+                    if self.ensure(names, keys, Want::Head(dep)).is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                if gen_err {
+                    break;
+                }
+                let total = own + 1 + of_type;
+                let Ok(total_cap) = usize::try_from(total) else { break };
+                let mut arg_nodes: blaze_own::Vec<PTy, Alloc<'static>> = blaze_own::Vec::with_capacity_in(total_cap, alloc);
+                let mut intern_ok = true;
+                for i in 0..total {
+                    let n = if own_cs.iter().any(|(c, _)| *c == i) { PNode::ConstParam(i) } else { PNode::Param(i) };
+                    match intern(&mut self.tys, n) {
+                        Ok(t) => arg_nodes.push(t),
+                        Err(_) => {
+                            intern_ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !intern_ok {
+                    break;
+                }
+                let Ok(alias_args) = intern_list(&mut self.tys, &arg_nodes) else { break };
+                let Ok(alias) = intern(&mut self.tys, PNode::Alias { trait_: ck, name: Name::of(m.name), args: alias_args }) else { break };
+                let Ok(assoc_scope) = Scope::item(&mv, Some(&scope), scope.params(), alloc) else { break };
+                let Ok(ap_scope) = Scope::item(&mv, Some(&scope), scope.params(), alloc) else { break };
+                let mut ap = Preds::new_in(ap_scope);
+                let own_env = Env { module, params: &own_ps, bounds: Bounds::Done(&bounds), self_: SelfTy::Trait(key), self_assoc: &[], anon: &[], consts: &own_cs, body: None };
+                let b = Builder { resolver: Paths { names }, heads: &self.maps, marks: m_marks };
+                match b.assoc_ty_bounds(&mut self.tys, &own_env, &mv, alias, self.sized, &mut ap) {
+                    Ok(()) => {
+                        let laid = match lay_listed(&b, &mut self.tys, &own_env, &mv, (&ap, &[]), SelfGiven::NONE, Captures::NONE, alloc) {
+                            Ok(l) => l,
+                            Err(Why::Need(dep)) => {
+                                if self.ensure(names, keys, Want::Head(dep)).is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
+                            Err(_) => break,
+                        };
+                        let arity = HeadsArity { heads: &self.maps, opaques: &[], names };
+                        let pcount = assoc_scope.params();
+                        let Ok(pcap) = usize::try_from(pcount) else { break };
+                        let mut ident: blaze_own::Vec<Region, Alloc<'static>> = blaze_own::Vec::with_capacity_in(pcap, alloc);
+                        for i in 0..pcount {
+                            ident.push(Region::Param(i));
+                        }
+                        let made = [(alias, &ident[..])];
+                        let cx = hreg::Cx { v: &mv, facts: &arity, written: &laid, scope: &assoc_scope, made: &made, alloc };
+                        let head = hreg::clause_regions(&cx, &mut self.tys, &ap, pcount, None).map_err(RegionGap::Clauses);
+                        let view = self.tys.view();
+                        let filed = head.and_then(|h| super::head_record::FiledRegions::new(h, &arity, view, alloc).map_err(RegionGap::Record));
+                        file_regions(self, item, filed);
+                        break;
+                    }
+                    Err(Why::Need(dep)) => {
+                        if self.ensure(names, keys, Want::Head(dep)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+
     /// A trait's predicates (its supertraits and where clauses on its generics, `Self` =
     /// `Param(0)`) and its fns' signatures, each fn's clauses its trait's plus
     /// `Self: Trait<params>`.
@@ -3868,8 +4266,10 @@ impl<'n> Store<'n> {
         // D148: the trait's clauses' columns (filed under its key with its clauses below), and
         // the columns its members inherit, in `inherited`'s order.
         let trait_regions = {
-            let laid = lay_listed(&b, &mut self.tys, &env, v, (&preds, &[]), SelfGiven::NONE, Captures::NONE, alloc)?;
             let arity = HeadsArity { heads: &self.maps, opaques: &[], names };
+            let own_bounds = with_own_param_bounds(&b, &mut self.tys, &self.regions, &arity, &env, v, &preds, &scope, SelfGiven::NONE, Captures::NONE, alloc)?;
+            let trait_given = SelfGiven { param_bounds: &own_bounds, ..SelfGiven::NONE };
+            let laid = lay_listed(&b, &mut self.tys, &env, v, (&preds, &[]), trait_given, Captures::NONE, alloc)?;
             let cx = hreg::Cx { v, facts: &arity, written: &laid, scope: &scope, made: &[], alloc };
             let own = hreg::clause_regions(&cx, &mut self.tys, &preds, scope.params(), None);
             let members = match &own {
@@ -4201,8 +4601,10 @@ impl<'n> Store<'n> {
         let filed = {
             let mut written: blaze_own::Vec<lf::TypeId, Alloc<'static>> = blaze_own::Vec::with_capacity_in(field_at.len(), alloc);
             written.extend(field_at.iter().map(|f| f.written));
-            let laid = lay_listed(&b, &mut self.tys, &env, v, (&preds, &written), SelfGiven::NONE, Captures::NONE, alloc)?;
             let arity = HeadsArity { heads: &self.maps, opaques: &[], names };
+            let own_bounds = with_own_param_bounds(&b, &mut self.tys, &self.regions, &arity, &env, v, &preds, &scope, SelfGiven::NONE, Captures::NONE, alloc)?;
+            let adt_given = SelfGiven { param_bounds: &own_bounds, ..SelfGiven::NONE };
+            let laid = lay_listed(&b, &mut self.tys, &env, v, (&preds, &written), adt_given, Captures::NONE, alloc)?;
             let cx = hreg::Cx { v, facts: &arity, written: &laid, scope: &scope, made: &[], alloc };
             let mut head = hreg::adt_regions(&cx, &mut self.tys, &preds, &field_at).map_err(RegionGap::Clauses);
             if let Ok(ref mut h) = head {
@@ -4681,9 +5083,13 @@ impl<'n> Store<'n> {
         // self type's walk does not see).
         let filed = {
             // The header's own where clauses, walked after its columns and given them, as the
-            // values were (`given`).
-            let laid = lay_listed(&b, &mut self.tys, &env, v, (&preds, &[]), given, Captures::NONE, alloc)?;
+            // values were (`given`), plus own non-higher-ranked `Param: Trait<...>` bounds so
+            // sibling projection clauses like `M::Visitor: VisitFmt` under `M: MakeOutput<W<'a>, _>`
+            // resolve their bound's type-argument lifetimes.
             let arity = HeadsArity { heads: &self.maps, opaques: &[], names };
+            let own_bounds = with_own_param_bounds(&b, &mut self.tys, &self.regions, &arity, &env, v, &preds, &scope, given, Captures::NONE, alloc)?;
+            let impl_given = SelfGiven { param_bounds: &own_bounds, ..given };
+            let laid = lay_listed(&b, &mut self.tys, &env, v, (&preds, &[]), impl_given, Captures::NONE, alloc)?;
             let cx = hreg::Cx { v, facts: &arity, written: &laid, scope: &scope, made: &[], alloc };
             let head = header_head.and_then(|mut h| {
                 hreg::fill_clauses(&cx, &mut self.tys, &preds, None, &mut h)?;
@@ -5435,26 +5841,23 @@ impl<'n> Store<'n> {
         // equivalent to" "fn example<'a>(x: &'a str) -> impl Future<Output = usize> + 'a"):
         // its output is opaque 0 with the bounds `Future`, `Output = T` and `Sized`. Its body
         // is an async block (a coroutine): the checker's and the code builder's, not the head's.
+        let mut async_info: Option<(ItemKey, ItemKey, List)> = None;
         let output = if is_async {
             let fut = super::langs::future_trait(Paths { names }, self.sized.ok_or(Why::Unsupported("an `async fn` in a program with no `Sized` (no core)", whole))?)
                 .map_err(|e| Why::Program(format!("the `Future` trait of an `async fn`: {e}").into_boxed_str(), whole))?
                 .ok_or(Why::Unsupported("an `async fn` in a program whose core has no `future::Future`", whole))?;
+            let fut_ck = checker_of(fut);
             let k = super::keys::opaque_key(key, 0);
             let me = intern(&mut self.tys, PNode::Opaque(k, ident))?;
             let args = intern_list(&mut self.tys, &[me])?;
-            // Its clauses are made here, not written (`Src::Derived`): its regions stay refused
-            // until a producer lays the `Output = T` column from the return type's slots.
+            // Its clauses are derived (`Future`, `Output = T`, `Sized`); `Future` and `Output = T`
+            // are laid below once `written_output` is numbered by `fn_regions`.
             let mut op = Preds::new_in(fn_scope.clone_in(alloc));
-            op.push(PClause::Trait { trait_: checker_of(fut), args }, hreg::Src::Derived);
-            op.push(PClause::Projection { trait_: checker_of(fut), args, name: Name::of("Output"), term: written }, hreg::Src::Derived);
+            op.push(PClause::Trait { trait_: fut_ck, args }, hreg::Src::Derived);
+            op.push(PClause::Projection { trait_: fut_ck, args, name: Name::of("Output"), term: written }, hreg::Src::Derived);
             if let Some(s) = self.sized {
                 op.push(PClause::Trait { trait_: checker_of(s), args }, hreg::Src::Derived);
             }
-            // Its regions: the future captures every lifetime in scope (the Reference, "Async
-            // functions": "+ 'a" of each; Rust 2024 "Capturing rules": all in-scope generic
-            // parameters), laid above as `Param(0..n)` (`captures`); its clauses are derived,
-            // so they have no column (heads_regions.rs `fill_clauses`), and `T`'s slots are
-            // the fn's own `written_output` column. Refused only when the scope's count was.
             let filed = match (in_scope, all_captures.of(k)) {
                 (Some(count), Some(run)) => async_future_filed(&rb, &mut self.tys, &self.maps, &ret_env, &rv, (&op, me), (count, run, all_captures), (self_laid, &fn_scope), alloc)?,
                 _ => Err(RegionGap::Laid(RegionRefusal::not_laid(NotLaidWhy::AsyncCount, whole), SigPart::Output)),
@@ -5462,6 +5865,7 @@ impl<'n> Store<'n> {
             file_regions(self, k, filed);
             self.preds.insert(k, op);
             self.opaques.insert(k, (key, 0));
+            async_info = Some((k, fut_ck, args));
             me
         } else {
             written
@@ -5594,6 +5998,15 @@ impl<'n> Store<'n> {
         // Every ADT's, trait's and associated type's count the column asks is read from the
         // names (D155: its crate's items record), whatever this store made before; no need is
         // raised for a count.
+        let async_clause_nodes = match async_info {
+            Some((op_k, fut_ck, fut_args)) => {
+                let ex_tr = intern(&mut self.tys, PNode::ExTrait(fut_ck, fut_args))?;
+                let ex_pr = intern(&mut self.tys, PNode::ExProj { trait_: fut_ck, name: Name::of("Output"), args: fut_args, term: written })?;
+                Some((op_k, ex_tr, ex_pr))
+            }
+            None => None,
+        };
+        let mut async_op_filed: Option<(ItemKey, Result<super::head_record::FiledRegions, RegionGap>)> = None;
         let filed = match fn_regions(v, &sink, &sig, alloc)? {
             Err(why) => Err(RegionGap::placed(&sink, why)),
             Ok((params, sig_slots, written_slots)) => {
@@ -5604,6 +6017,29 @@ impl<'n> Store<'n> {
                 let view = self.tys.view();
                 match (RegionCol::lay(view, sig_ty, &arity, &sig_slots, alloc), written_slots.map(|w| RegionCol::lay(view, written, &arity, &w, alloc)).transpose()) {
                     (Ok(sig_col), Ok(written_col)) => {
+                        if let (Some((op_k, ex_tr, ex_pr)), Some(count)) = (async_clause_nodes, in_scope)
+                            && let Ok(cap_len) = usize::try_from(count)
+                        {
+                            let mut cap_regs: blaze_own::Vec<Region, Alloc<'static>> = blaze_own::Vec::with_capacity_in(cap_len, alloc);
+                            for i in 0..count {
+                                cap_regs.push(Region::Param(i));
+                            }
+                            let mut op_hr = HeadRegions::new_in(LifetimeParams::new_in(count, alloc), alloc);
+                            op_hr.opaque_captures = Some(count);
+                            if let Ok(tr_col) = RegionCol::lay(view, ex_tr, &arity, &cap_regs, alloc) {
+                                op_hr.clauses.push(tc::region_facts::ClauseRegions { nth: 0, binders: 0, col: tr_col });
+                            }
+                            if let Some(wc) = written_col.as_ref() {
+                                let mut proj_regs: blaze_own::Vec<Region, Alloc<'static>> = blaze_own::Vec::with_capacity_in(cap_len + wc.as_slice().len(), alloc);
+                                proj_regs.extend_from_slice(&cap_regs);
+                                proj_regs.extend_from_slice(wc.as_slice());
+                                if let Ok(pr_col) = RegionCol::lay(view, ex_pr, &arity, &proj_regs, alloc) {
+                                    op_hr.clauses.push(tc::region_facts::ClauseRegions { nth: 1, binders: 0, col: pr_col });
+                                }
+                            }
+                            let op_filed = super::head_record::FiledRegions::new(op_hr, &arity, view, alloc).map_err(RegionGap::Record);
+                            async_op_filed = Some((op_k, op_filed));
+                        }
                         let mut hr = HeadRegions::new_in(params, alloc);
                         hr.sig = Some(sig_col);
                         hr.written_output = written_col;
@@ -5617,7 +6053,9 @@ impl<'n> Store<'n> {
                             (None, _) => None,
                         };
                         let preds = self.preds.get(&key).ok_or(Why::Regions(RegionsRefusal::Disagree { what: "a fn whose clauses, filed above, are gone" }))?;
-                        let laid = lay_listed(&b, &mut self.tys, &env, v, (preds, &[]), self_laid, sink.captures(), alloc)?;
+                        let own_bounds = with_own_param_bounds(&b, &mut self.tys, &self.regions, &arity, &env, v, preds, &fn_scope, self_laid, sink.captures(), alloc)?;
+                        let fn_given = SelfGiven { param_bounds: &own_bounds, ..self_laid };
+                        let laid = lay_listed(&b, &mut self.tys, &env, v, (preds, &[]), fn_given, sink.captures(), alloc)?;
                         let cx = hreg::Cx { v, facts: &arity, written: &laid, scope: &fn_scope, made: &[], alloc };
                         match hreg::fill_clauses(&cx, &mut self.tys, preds, container_heads, &mut hr) {
                             Ok(()) => {
@@ -5631,6 +6069,11 @@ impl<'n> Store<'n> {
                 }
             }
         };
+        if let Some((op_k, op_filed)) = async_op_filed
+            && op_filed.is_ok()
+        {
+            file_regions(self, op_k, op_filed);
+        }
         file_regions(self, key, filed);
         if Self::view_has_record_type(v) {
             let rec_env = Env { module, params: &ps, bounds: Bounds::Done(&bounds), self_, self_assoc: &self_assoc, anon: &anon, consts: &cs, body: None };
