@@ -2153,7 +2153,7 @@ pub extern \"C\" fn main() -> i32 {
             use blaze_code::record::{Space, Target};
             use blaze_launch_rt::sys::{Code, page};
 
-            let mut members = Vec::new();
+            let mut members = blaze_own::Vec::new_in(alloc);
             for row in 0..walk.len() {
                 assert_eq!(walk.kind(row), RowKind::Instance);
                 let bytes = store.get(walk.key(row).expect("record key")).expect("store get").expect("record");
@@ -2175,7 +2175,7 @@ pub extern \"C\" fn main() -> i32 {
                 memory.write((write.at - base) as usize, &write.value.to_le_bytes()).expect("write reloc");
             }
             let addr = image.home(Target { space: Space::Func, symbol: walk.symbol(0) }).expect("main");
-            let main_fn: extern "C-unwind" fn() -> i32 = unsafe { std::mem::transmute(addr as usize) };
+            let main_fn: extern "C-unwind" fn() -> i32 = unsafe { core::mem::transmute(addr as usize) };
             assert_eq!(main_fn(), 42, "{label}: native execution returned wrong value");
         }
         #[cfg(not(target_arch = "aarch64"))]
