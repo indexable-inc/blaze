@@ -775,3 +775,199 @@ fn handle_tip() -> i32 {{
     let refusal = try_walk(&fixture(&program(&items, "handle_tip()"))).expect_err("`file!()` in a body of a program with no package");
     assert!(refusal.contains("HostError { ask: Place, why: Refused }"), "refused at the place question: {refusal}");
 }
+
+/// Regression for `tempo-ext` (`Iterator::chain` with `std::env::SplitPaths`): a TAIT alias
+/// (`type SplitPaths = Map<impl FnMut(u8) -> bool>`) wrapped in a struct and passed to a generic
+/// trait method whose post-analysis `Reveal::All` ground resolution asks for the alias opaque's
+/// hidden type must define the alias via `#[define_opaque(..)]` and reveal it instead of failing
+/// with `Gap { Hidden(AliasOpaque { .. }) }`.
+#[test]
+fn tait_alias_opaque_revealed_in_generic_trait_method_runs() {
+    runs_to_three(
+        "tait alias opaque in generic trait method",
+        "mod unix {
+    use super::{FnMut, Sized};
+
+    pub struct Map<F> {
+        pub val: u8,
+        pub f: F,
+    }
+
+    pub type SplitPaths = Map<impl FnMut(u8) -> bool>;
+
+    #[define_opaque(SplitPaths)]
+    pub fn split_paths(val: u8) -> SplitPaths {
+        fn is_three(b: u8) -> bool {
+            b == 3
+        }
+        Map { val, f: is_three }
+    }
+}
+
+pub struct SplitPaths {
+    inner: unix::SplitPaths,
+}
+
+trait MyIter {
+    type Item;
+    fn first(&mut self) -> Self::Item;
+    fn chain<U: MyIntoIter<Item = Self::Item>>(self, other: U) -> Chain<Self, U::IntoIter>
+    where
+        Self: Sized,
+    {
+        Chain { a: self, b: other.into_iter() }
+    }
+}
+
+trait MyIntoIter {
+    type Item;
+    type IntoIter: MyIter<Item = Self::Item>;
+    fn into_iter(self) -> Self::IntoIter;
+}
+
+impl<I: MyIter> MyIntoIter for I {
+    type Item = I::Item;
+    type IntoIter = I;
+    fn into_iter(self) -> I {
+        self
+    }
+}
+
+struct Once(i32);
+impl MyIter for Once {
+    type Item = i32;
+    fn first(&mut self) -> i32 {
+        self.0
+    }
+}
+
+impl MyIter for SplitPaths {
+    type Item = i32;
+    fn first(&mut self) -> i32 {
+        if (self.inner.f)(self.inner.val) { 3 } else { 0 }
+    }
+}
+
+struct Chain<A, B> {
+    a: A,
+    b: B,
+}
+
+impl<A: MyIter<Item = i32>, B: MyIter<Item = i32>> Chain<A, B> {
+    fn sum(&mut self) -> i32 {
+        self.a.first() + self.b.first()
+    }
+}
+
+#[inline(never)]
+fn run_chain() -> i32 {
+    let sp = SplitPaths { inner: unix::split_paths(3) };
+    let mut c = Once(0).chain(sp);
+    c.sum()
+}",
+        "run_chain()",
+    );
+}
+
+/// Regression for `tempo-chainspec` (`test_tempo_hardforks_in_inner_hardforks`): calling a
+/// required trait fn returning `impl Trait` (RPITIT) in lazy mode — both when the selected impl
+/// fn returns its own `impl Trait` and when it returns a concrete type — and passing the RPITIT
+/// value into another method must table/check the trait fn and selected impl fn on demand rather
+/// than failing with "whose trait fn or selected impl fn is not in the program".
+#[test]
+fn rpitit_trait_and_impl_fn_built_lazily_runs() {
+    runs_to_three(
+        "rpitit lazy trait and impl fn",
+        "trait MyIter {
+    fn next_val(&mut self) -> i32;
+    fn read_once(mut self) -> i32
+    where
+        Self: Sized,
+    {
+        self.next_val()
+    }
+}
+
+struct One(i32);
+impl MyIter for One {
+    fn next_val(&mut self) -> i32 {
+        self.0
+    }
+}
+
+trait Hardforks {
+    fn forks_iter(&self) -> impl MyIter;
+}
+
+struct SpecOpaque(i32);
+impl Hardforks for SpecOpaque {
+    fn forks_iter(&self) -> impl MyIter {
+        One(self.0)
+    }
+}
+
+struct SpecConcrete(i32);
+impl Hardforks for SpecConcrete {
+    fn forks_iter(&self) -> One {
+        One(self.0)
+    }
+}
+
+#[inline(never)]
+fn check_both() -> i32 {
+    let a = SpecOpaque(1).forks_iter().read_once();
+    let b = SpecConcrete(2).forks_iter().read_once();
+    a + b
+}",
+        "check_both()",
+    );
+}
+
+/// Regression for `tempo-dkg-onchain-artifacts` (`bytes::buf::buf_impl::Buf::try_get_u32`):
+/// a local `const SIZE: usize = size_of::<$typ>();` inside a macro expansion block used as the
+/// array length in `*const [_; SIZE]` (whose element type `_` has no path node!) inside a closure
+/// in a trait default method must resolve `SIZE` from the enclosing block scope instead of
+/// failing with `NotFound` at the module.
+#[test]
+fn macro_local_const_in_infer_array_ptr_cast_runs() {
+    runs_to_three(
+        "macro local const in infer array ptr cast",
+        "#[rustc_intrinsic]
+const fn size_of<T>() -> usize;
+
+macro_rules! buf_try_get_impl {
+    ($this:ident, $typ:ty) => {{
+        const SIZE: usize = size_of::<$typ>();
+        let f = |src: *const u8| unsafe {
+            let [_, _, _, last] = *(src as *const _ as *const [_; SIZE]);
+            last
+        };
+        f($this.ptr())
+    }};
+}
+
+trait Buf {
+    fn ptr(&self) -> *const u8;
+    fn try_get_u32(&mut self) -> u8 {
+        buf_try_get_impl!(self, u32)
+    }
+}
+
+struct SliceBuf {
+    data: [u8; 4],
+}
+
+impl Buf for SliceBuf {
+    fn ptr(&self) -> *const u8 {
+        &self.data as *const [u8; 4] as *const u8
+    }
+}
+
+#[inline(never)]
+fn read_buf() -> i32 {
+    let mut b = SliceBuf { data: [0, 0, 0, 3] };
+    b.try_get_u32() as i32
+}",
+        "read_buf()",
+    );
+}

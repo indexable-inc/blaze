@@ -53,6 +53,10 @@ pub enum Fill {
     /// A `where const { COND }` condition (`cond`, ground-args digest) whose truth value must
     /// be evaluated at the ground arguments queued in `Store::where_const_pending`.
     ConstHolds(ItemKey, u64),
+    /// An opaque type (including a TAIT alias's `#[define_opaque(..)]` opaque) whose defining
+    /// body must be checked and filed into `Store::hidden` before a `Reveal::All` question can
+    /// read its hidden type.
+    DefineOpaque(ItemKey),
 }
 
 /// A question this front end cannot answer yet, by the item it is about.
@@ -440,7 +444,7 @@ impl<'w, 'n, S: NamesSource<'n>> BodyWorld<'w, 'n, S> {
         let made = match fill {
             Fill::Impls(trait_, shape, seen) => trait_question(self.names, &mut heads, b, trait_, shape, seen, BuildOrder::AsAsked),
             Fill::Inherent(shape, name) => inherent_question(self.names, &mut heads, b, shape, name, BuildOrder::AsAsked),
-            Fill::Store(_) | Fill::InferredOutput(_) | Fill::ConstHolds(..) => return self.fill(fill),
+            Fill::Store(_) | Fill::InferredOutput(_) | Fill::ConstHolds(..) | Fill::DefineOpaque(_) => return self.fill(fill),
         };
         // Under the one ask, an import its question met refused is the question's gap.
         if let Some(refused) = self.store.asks.take_refused() {
@@ -1104,6 +1108,9 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
             super::opaque_auto::HiddenAnswer::Known(h) => Ok(Some(h)),
             super::opaque_auto::HiddenAnswer::Opaque => Ok(None),
             super::opaque_auto::HiddenAnswer::NoneGiven => {
+                if matches!(self.reveal, super::opaque_auto::Reveal::All) {
+                    return self.fill(Fill::DefineOpaque(filed));
+                }
                 if super::tait::of_alias(ordinal) {
                     return self.gap(Gap::Hidden(super::opaque_auto::HiddenFail::AliasOpaque { opaque: item, alias: owner }));
                 }

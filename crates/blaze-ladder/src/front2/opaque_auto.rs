@@ -121,6 +121,12 @@ pub struct HiddenTable<'a> {
     tys: PortableTys<'a>,
     /// By the defining fn's checker key.
     rows: HashMap<ItemKey, Row<'a>, Alloc<'a>>,
+    /// Reverse index from each filed opaque's key to the defining fn's checker key in `rows`
+    /// (needed for TAIT opaques whose owner in `Store::opaques` is the type alias, not the
+    /// `#[define_opaque(..)]` defining fn).
+    opaque_owner: HashMap<ItemKey, ItemKey, Alloc<'a>>,
+    /// Memo of each crate's `#[define_opaque(..)]` defining fns for TAIT reveal.
+    pub(super) definers: super::tait::Definers<'a>,
     /// The opaques the running check reads the hidden type of (its own leak list, sorted).
     leaking: Vec<ItemKey, Alloc<'a>>,
     /// The defining fns on the work list while [`define`] runs.
@@ -162,6 +168,8 @@ impl<'a> HiddenTable<'a> {
             alloc,
             tys: PortableTys::new_in(alloc),
             rows: HashMap::new_in(alloc),
+            opaque_owner: HashMap::new_in(alloc),
+            definers: super::tait::Definers::new_in(alloc),
             leaking: Vec::new_in(alloc),
             defining: Vec::new_in(alloc),
             wanted: None,
@@ -200,7 +208,8 @@ impl<'a> HiddenTable<'a> {
         if !seen {
             return HiddenAnswer::Opaque;
         }
-        match self.rows.get(&owner).and_then(|row| row.hidden.iter().find(|h| h.0 == filed)) {
+        let row = self.rows.get(&owner).or_else(|| self.opaque_owner.get(&filed).and_then(|definer| self.rows.get(definer)));
+        match row.and_then(|row| row.hidden.iter().find(|h| h.0 == filed)) {
             Some(&(_, ty)) => HiddenAnswer::Known(Hidden { ty, types: self.tys.view() }),
             None => HiddenAnswer::NoneGiven,
         }
@@ -361,6 +370,9 @@ impl<'a> HiddenTable<'a> {
                 }
             }
         }
+        for &(k, _) in &hidden {
+            self.opaque_owner.insert(k, owner);
+        }
         self.rows.insert(owner, Row { hidden, coroutines });
         Ok(())
     }
@@ -465,7 +477,7 @@ impl core::fmt::Display for HiddenFail {
     }
 }
 
-fn gap(owner: ItemKey, fail: HiddenFail) -> CheckFail {
+pub(super) fn gap(owner: ItemKey, fail: HiddenFail) -> CheckFail {
     let mut gaps = std::vec::Vec::new();
     gaps.push(Gap::Hidden(fail));
     CheckFail::Gap { owner, gaps }
@@ -546,24 +558,49 @@ pub(crate) fn after_auto_gap<'n, S: NamesSource<'n>>(
 /// Files the defining body of `opaque` (and of every opaque its check stops on first), by a
 /// work list.
 fn define<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, opaque: ItemKey) -> Result<(), HiddenFail> {
+    define_with(r, opaque, false)
+}
+
+/// Files the defining body of `opaque` for post-analysis `Reveal::All` resolution (an instance's
+/// ground trait selection/normalization), resolving TAIT aliases to their `#[define_opaque(..)]`
+/// defining fn via `tait::defining_fn`.
+pub(crate) fn define_for_reveal<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, opaque: ItemKey) -> Result<(), HiddenFail> {
+    define_with(r, opaque, true)
+}
+
+fn define_with<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, opaque: ItemKey, allow_alias: bool) -> Result<(), HiddenFail> {
     let mut stack: Vec<ItemKey, Alloc<'static>> = r.store.hidden.new_leaks();
     stack.push(opaque);
-    let got = run(r, &mut stack);
+    let got = run(r, &mut stack, allow_alias);
     r.store.hidden.defining.clear();
     r.store.hidden.wanted = None;
     r.store.hidden.cycle = None;
     got
 }
 
-fn run<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, stack: &mut Vec<ItemKey, Alloc<'static>>) -> Result<(), HiddenFail> {
-    for _ in 0..MOST_DEFINES {
-        let Some(&opaque) = stack.last() else { return Ok(()) };
-        // A provided trait fn's default `impl Trait` is filed under its source (rpitit.rs).
-        let filed = super::rpitit::filed_as(r.store, opaque);
-        let Some(&(owner, index)) = r.store.opaques.get(&filed) else { return Err(HiddenFail::NoHead { opaque }) };
-        if super::tait::of_alias(index) {
+fn definer_of<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, opaque: ItemKey, allow_alias: bool) -> Result<(ItemKey, ItemKey), HiddenFail> {
+    // A provided trait fn's default `impl Trait` is filed under its source (rpitit.rs).
+    let filed = super::rpitit::filed_as(r.store, opaque);
+    let Some(&(owner, index)) = r.store.opaques.get(&filed) else { return Err(HiddenFail::NoHead { opaque }) };
+    if super::tait::of_alias(index) {
+        if !allow_alias {
             return Err(HiddenFail::AliasOpaque { opaque, alias: owner });
         }
+        let Some(lib) = r.keys.library_in(r.names, owner) else {
+            return Err(HiddenFail::AliasOpaque { opaque, alias: owner });
+        };
+        let Ok(definer_lib) = super::tait::defining_fn(&r.store.hidden.definers, r.names, lib) else {
+            return Err(HiddenFail::AliasOpaque { opaque, alias: owner });
+        };
+        return Ok((filed, super::keys::checker_of(definer_lib)));
+    }
+    Ok((filed, owner))
+}
+
+fn run<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, stack: &mut Vec<ItemKey, Alloc<'static>>, allow_alias: bool) -> Result<(), HiddenFail> {
+    for _ in 0..MOST_DEFINES {
+        let Some(&opaque) = stack.last() else { return Ok(()) };
+        let (filed, owner) = definer_of(r, opaque, allow_alias)?;
         if r.store.hidden.filed(owner) {
             if !r.store.hidden.gives(owner, filed) {
                 return Err(HiddenFail::NoneGiven { opaque, owner, shown: shown(r, owner) });
@@ -575,7 +612,7 @@ fn run<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, stack: &mut Vec<ItemK
         // their opaques is the cycle.
         r.store.hidden.defining.clear();
         for &o in stack.iter() {
-            if let Some(&(w, _)) = r.store.opaques.get(&super::rpitit::filed_as(r.store, o)) {
+            if let Ok((_, w)) = definer_of(r, o, allow_alias) {
                 r.store.hidden.defining.push(w);
             }
         }
