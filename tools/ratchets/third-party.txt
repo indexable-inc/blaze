@@ -153,6 +153,8 @@ blaze-toolchain	0	0	86
 blaze-trace	0	1	1
 blaze-ty	0	0	8
 blaze-typeck	0	0	8
+blaze-ui	0	0	1
+blaze-ui-wasm	0	0	1
 blaze-unit-graph	0	0	86
 blaze-units	0	0	1
 blaze-v2-proof	0	0	64

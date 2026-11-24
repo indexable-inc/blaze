@@ -1,0 +1,24 @@
+[package]
+name = "blaze-ui-wasm"
+description = "Zero-import, `#![no_std]`, `#![blaze::sans_io]` WebAssembly (`wasm32-unknown-unknown`) C-ABI cdylib over `blaze-ui::WorkbenchApp` and Rust-authored `gpu::emit` WebGPU WGSL shaders"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+doctest = false
+
+[dependencies]
+# Explicit-allocator owning collections (`Box`, `String`, `Vec`).
+blaze-own.workspace = true
+# Relational ECS UI library + Rust -> WGSL/MSL 2.4 shaders + self-hosting Workbench.
+blaze-ui.workspace = true
+
+[lints]
+workspace = true

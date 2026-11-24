@@ -1018,3 +1018,77 @@ fn structured_ir_emits_valid_msl24_and_wgsl_matching_entry_desc() {
     assert!(wgsl_src.contains("workgroupBarrier();"));
     assert!(wgsl_src.contains("arrayLength(&acc)"));
 }
+
+#[derive(Copy, Clone, crate::Varyings)]
+struct PipeV {
+    pos: Position,
+    uv: Vec2,
+    clip_id: Flat<u32>,
+}
+
+#[crate::vertex]
+fn pipe_vs(vi: VertexIndex, vp: &Vec4, insts: &[Vec4]) -> PipeV {
+    let _ = (vi, vp, insts);
+    PipeV { pos: Position(Vec4::splat(0.0)), uv: Vec2::splat(0.0), clip_id: Flat(0) }
+}
+
+#[crate::fragment]
+fn pipe_fs(v: PipeV, vp: &Vec4, clips: &[Vec4], smp: &Sampler, tex: &Texture2d) -> Vec4 {
+    let _ = (v, vp, clips, smp, tex);
+    Vec4::splat(1.0)
+}
+
+#[test]
+fn emit_wgsl_pipeline_deduplicates_and_numbers_shared_vertex_fragment_bindings() {
+    use crate::emit::{
+        IrEntry, IrExpr, IrField, IrStmt, IrStruct, IrTy, ShaderModule, StackWriter, emit_msl, emit_wgsl_pipeline,
+    };
+
+    const VP_FIELDS: [IrField; 1] = [IrField { name: "size", ty: IrTy::Vec4 }];
+    const STRUCTS: [IrStruct; 1] = [IrStruct { name: "Vp", fields: &VP_FIELDS }];
+
+    let vs_ret = IrExpr::Construct(
+        IrTy::Struct("pipe_vs_out"),
+        &[
+            IrExpr::Construct(IrTy::Vec4, &[IrExpr::LitF32(0.0), IrExpr::LitF32(0.0), IrExpr::LitF32(0.0), IrExpr::LitF32(1.0)]),
+            IrExpr::Construct(IrTy::Vec2, &[IrExpr::LitF32(0.0), IrExpr::LitF32(0.0)]),
+            IrExpr::LitU32(0),
+        ],
+    );
+    let vs_body = [IrStmt::Return(Some(vs_ret))];
+
+    let v_var = IrExpr::Var("v");
+    let v_uv = IrExpr::Field(&v_var, "uv");
+    let sampled = IrExpr::Sample2d { tex: "tex", smp: "smp", uv: &v_uv, level: None };
+    let fs_body = [IrStmt::Return(Some(sampled))];
+
+    let entries = [
+        IrEntry {
+            desc: &pipe_vs::ENTRY,
+            param_types: &[IrTy::Void, IrTy::Struct("Vp"), IrTy::Vec4],
+            body: &vs_body,
+        },
+        IrEntry {
+            desc: &pipe_fs::ENTRY,
+            param_types: &[IrTy::Void, IrTy::Struct("Vp"), IrTy::Vec4, IrTy::Void, IrTy::Void],
+            body: &fs_body,
+        },
+    ];
+    let module = ShaderModule { structs: &STRUCTS, helpers: &[], entries: &entries };
+
+    let mut wgsl = StackWriter::<4096>::new();
+    emit_wgsl_pipeline(&module, &mut wgsl).expect("pipeline WGSL fits");
+    let src = wgsl.as_str();
+    assert!(src.contains("@group(0) @binding(0) var<uniform> vp: Vp;"));
+    assert!(src.contains("@group(0) @binding(1) var<storage, read> insts: array<vec4<f32>>;"));
+    assert!(src.contains("@group(0) @binding(2) var<storage, read> clips: array<vec4<f32>>;"));
+    assert!(src.contains("@group(0) @binding(3) var smp: sampler;"));
+    assert!(src.contains("@group(0) @binding(4) var tex: texture_2d<f32>;"));
+    assert_eq!(src.matches("var<uniform> vp").count(), 1, "shared `vp` must only be declared once");
+    assert!(!src.contains("_gpu_sizes"), "unused `_gpu_sizes` omitted for clean WebGPU bind group");
+
+    let mut msl = StackWriter::<4096>::new();
+    emit_msl(&module, &mut msl).expect("pipeline MSL fits");
+    assert!(msl.as_str().contains("vertex pipe_vs_out pipe_vs("));
+    assert!(msl.as_str().contains("fragment float4 pipe_fs("));
+}

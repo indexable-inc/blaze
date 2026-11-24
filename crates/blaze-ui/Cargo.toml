@@ -1,0 +1,31 @@
+[package]
+name = "blaze-ui"
+description = "Zero-dependency, `#![no_std]`, `#![forbid(unsafe_code)]`, `#![blaze::sans_io]` relational ECS UI library (`ChildOf` ordered trees, `IsA` cascading style prefabs, binary-tree docking, layout, input, widgets, hybrid dense `CanvasBatch`, and Rust-authored `gpu::emit` WGSL & MSL 2.4 SDF/glyph WebGPU shaders)"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# Relational ECS core (`World`, `Entity`, `ChildOf`, `IsA`, `Relation`, typed queries).
+blaze-ecs.workspace = true
+# Explicit integer conversions (zero `as` casts).
+blaze-int.workspace = true
+# Explicit-allocator owning collections (`Vec`, `String`, `Box`, `Alloc`).
+blaze-own.workspace = true
+# Rust -> WGSL & MSL 2.4 shader IR + `#[gpu::vertex]`/`#[gpu::fragment]`/`#[derive(gpu::Varyings)]` + `#![no_std]` `f32` math.
+gpu.workspace = true
+
+[dev-dependencies]
+# Root allocator capability for unit tests.
+blaze-own = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true
