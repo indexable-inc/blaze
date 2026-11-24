@@ -104,16 +104,28 @@ fn built(text: &str, panic: Panic) -> Result<Built<Alloc<'static>>, BuildError> 
     build(verified, from.view(), ITEM, &mut subst, &World { panic }, Alloc::global())
 }
 
-fn printed(b: &Built<Alloc<'static>>) -> String {
+fn printed(b: &Built<Alloc<'static>>) -> impl core::ops::Deref<Target = str> + core::fmt::Display {
     blaze_lir::print(b.func.view())
 }
 
-fn returned(outcome: Outcome<Alloc<'static>>) -> Vec<Val> {
+fn returned(outcome: Outcome<Alloc<'static>>) -> blaze_own::Vec<Val, Alloc<'static>> {
     match outcome {
-        Outcome::Returned(vals) => vals.iter().copied().collect(),
+        Outcome::Returned(vals) => {
+            let mut out = blaze_own::Vec::with_capacity_in(vals.len(), heap());
+            out.extend(vals.iter().copied());
+            out
+        }
         _ => panic!("the run did not return"),
     }
 }
+
+trait DefaultAlloc {
+    type A: core::alloc::Allocator;
+}
+impl<A: core::alloc::Allocator> DefaultAlloc for Vec<u8, A> {
+    type A = A;
+}
+type PromotedRecord = blaze_build::data::DataRecord<<Vec<u8> as DefaultAlloc>::A>;
 
 /// A body of one block that traps: what every panic entry is here.
 fn trapping() -> blaze_lir::Func<Alloc<'static>> {
@@ -134,6 +146,12 @@ struct One<'v> {
 impl Bodies for One<'_> {
     fn callee(&self, _: BodyId, _: RefId) -> Option<(BodyId, View<'_>)> {
         Some((BodyId([1; 32]), self.callee))
+    }
+    fn target(&self, _: BodyId, _: RefId) -> Option<blaze_lir::body::Target> {
+        Some(blaze_lir::body::Target::Func(BodyId([1; 32])))
+    }
+    fn body(&self, id: BodyId) -> Option<View<'_>> {
+        if id == BodyId([1; 32]) { Some(self.callee) } else { None }
     }
 }
 
@@ -306,21 +324,19 @@ fn call_with_cleanup_is_an_invoke() {
     assert!(!text.contains("invoke") && text.contains("call"), "{text}");
 }
 
-/// A row this builder does not translate is refused by name, here a promoted constant.
+/// A row this builder does not translate is refused by name, here an inline `asm!` block.
 /// Should give `BuildError::Unsupported` at row 0.
 #[test]
 fn unsupported_row_is_named() {
     let text = "\
-local _0: t3 return
-const c0 = promoted 0: t3
+local _0: t0 return
 bb0:
-  _0 = const c0
-  return
+  asm 0() unwind continue
 ";
     match built(text, Panic::Abort) {
         Err(BuildError::Unsupported { stmt, what }) => {
             assert_eq!(stmt.0, 0);
-            assert!(what.contains("promoted"), "{what}");
+            assert!(what.contains("asm"), "{what}");
         }
         other => panic!("not refused by name: {:?}", other.err()),
     }
@@ -812,4 +828,290 @@ bb0:
     // arr = [10, 20, 30, 40]; subslice [1..-1] = [20, 30]; [-1] = 30, [0] = 20 -> 30 + 20 = 50!
     let out = run_in(b.func.view(), &[], 1000, heap()).unwrap();
     assert_eq!(returned(out), [Val::Int(50)]);
+}
+
+/// `ConstKind::Promoted(expr_id)` loads its evaluated `DataRecord` via `Adts::promoted_value`
+/// and returns its address; a missing record is refused with `BuildError::NoPromotedValue`.
+#[test]
+fn promoted_const_loads_data_row_and_executes() {
+    struct PromotedWorld {
+        rec: Option<PromotedRecord>,
+    }
+    impl LayoutFacts for PromotedWorld {
+        fn adt(&self, _: ItemKey) -> Option<Adt<'_>> { None }
+        fn repr(&self, _: ItemKey) -> Result<ReprAttrs, Missing> { Ok(ReprAttrs::RUST) }
+        fn discriminant(&self, _: ItemKey, _: u32) -> Result<Option<i128>, Missing> { Ok(None) }
+        fn valid_range(&self, _: ItemKey) -> Result<ValidRange, Missing> { Ok(ValidRange::default()) }
+    }
+    impl Adts for PromotedWorld {
+        fn adt(&self, _: ItemKey) -> Option<Adt<'_>> { None }
+        fn facts(&self) -> &dyn LayoutFacts { self }
+        fn overflow_checks(&self) -> OverflowChecks { OverflowChecks::Off }
+        fn ub_checks(&self) -> blaze_build::UbChecks { blaze_build::UbChecks::Off }
+        fn drop_impl(&self, _: PTy, _: &mut PortableTys<'_>) -> Result<Option<ItemKey>, blaze_build::BuildError> { Ok(None) }
+        fn abi(&self, _: ItemKey) -> Option<Abi> { Some(Abi::Rust) }
+        fn promoted_value(&self, owner: ItemKey, borrow: blaze_typeck::ExprId, _: &[PTy]) -> Option<&PromotedRecord> {
+            if owner == ITEM && borrow == blaze_typeck::ExprId(5) { self.rec.as_ref() } else { None }
+        }
+    }
+
+    let mut t = PortableTys::new_in(heap());
+    let i64_ = t.intern(PNode::Int(IntTy::I64)).unwrap(); // t0
+    let _ref_i64 = t.intern(PNode::Ref(Mutbl::Not, i64_)).unwrap(); // t1
+    let text = "\
+local _0: t0 return
+local _1: t1 temp e5 value
+const c0 = promoted 5: t1
+bb0:
+  _1 = const c0
+  _0 = copy _1.*
+  return
+";
+    let body = blaze_body::text::parse(text, heap()).unwrap();
+    let verified = blaze_body::verify(&body).unwrap();
+
+    let bytes = 42i64.to_le_bytes().to_vec();
+    let allocs = core::iter::once(blaze_build::data::DataAlloc { bytes, align: 3, mutable: false, relocs: Default::default() }).collect();
+    let w = PromotedWorld { rec: Some(blaze_build::data::DataRecord { allocs }) };
+    let mut ground = PortableTys::new_in(heap());
+    let mut subst = Subst { args: &[], ground: &mut ground, scratch: heap() };
+    let b = build(verified, t.view(), ITEM, &mut subst, &w, heap()).unwrap();
+    let lir = printed(&b);
+    assert!(lir.contains("data_addr"), "{lir}");
+    let out = run_in(b.func.view(), &[], 1000, heap()).unwrap();
+    assert_eq!(returned(out), [Val::Int(42)]);
+
+    let missing = PromotedWorld { rec: None };
+    let mut g2 = PortableTys::new_in(heap());
+    let mut s2 = Subst { args: &[], ground: &mut g2, scratch: heap() };
+    assert!(matches!(
+        build(verified, t.view(), ITEM, &mut s2, &missing, heap()),
+        Err(BuildError::NoPromotedValue { stmt, expr }) if stmt.0 == 0 && expr == blaze_typeck::ExprId(5)
+    ));
+}
+
+/// `CastKind::ClosureFnPointer` reifies a non-capturing closure to its `FnOnce::call_once`
+/// instance address and executes through the resulting function pointer.
+#[test]
+fn closure_fn_pointer_cast_emits_call_once_ref_and_executes() {
+    const CALL_ONCE: ItemKey = ItemKey(77);
+    struct ClosureWorld {
+        ctys: PortableTys<'static>,
+        csig: PTy,
+        cenv: PTy,
+    }
+    impl LayoutFacts for ClosureWorld {
+        fn adt(&self, _: ItemKey) -> Option<Adt<'_>> { None }
+        fn repr(&self, _: ItemKey) -> Result<ReprAttrs, Missing> { Ok(ReprAttrs::RUST) }
+        fn discriminant(&self, _: ItemKey, _: u32) -> Result<Option<i128>, Missing> { Ok(None) }
+        fn valid_range(&self, _: ItemKey) -> Result<ValidRange, Missing> { Ok(ValidRange::default()) }
+        fn closure(&self, owner: ItemKey, ordinal: u32) -> Option<blaze_build::layout::ClosureFacts<'_>> {
+            if owner == ITEM && ordinal == 0 {
+                Some(blaze_build::layout::ClosureFacts {
+                    types: self.ctys.view(),
+                    sig: self.csig,
+                    env: self.cenv,
+                    kind: blaze_build::FnTrait::Fn,
+                })
+            } else {
+                None
+            }
+        }
+    }
+    impl Adts for ClosureWorld {
+        fn adt(&self, _: ItemKey) -> Option<Adt<'_>> { None }
+        fn facts(&self) -> &dyn LayoutFacts { self }
+        fn overflow_checks(&self) -> OverflowChecks { OverflowChecks::Off }
+        fn ub_checks(&self) -> blaze_build::UbChecks { blaze_build::UbChecks::Off }
+        fn drop_impl(&self, _: PTy, _: &mut PortableTys<'_>) -> Result<Option<ItemKey>, blaze_build::BuildError> { Ok(None) }
+        fn abi(&self, k: ItemKey) -> Option<Abi> {
+            if k == CALL_ONCE { Some(Abi::RustCall) } else { Some(Abi::Rust) }
+        }
+        fn fn_trait_method(&self, which: blaze_build::FnTrait) -> Option<ItemKey> {
+            if which == blaze_build::FnTrait::FnOnce { Some(CALL_ONCE) } else { None }
+        }
+    }
+
+    let mut ctys = PortableTys::new_in(heap());
+    let ci64 = ctys.intern(PNode::Int(IntTy::I64)).unwrap();
+    let sig_list = ctys.intern_list(&[ci64, ci64]).unwrap();
+    let csig = ctys.intern(PNode::FnPtr(sig_list, blaze_typeck::FnPtrHeader::RUST)).unwrap();
+    let empty_env = ctys.intern_list(&[]).unwrap();
+    let cenv = ctys.intern(PNode::Tuple(empty_env)).unwrap();
+    let w = ClosureWorld { ctys, csig, cenv };
+
+    let mut t = PortableTys::new_in(heap());
+    let i64_ = t.intern(PNode::Int(IntTy::I64)).unwrap(); // t0
+    let empty = t.intern_list(&[]).unwrap();
+    let _cty = t.intern(PNode::Closure { owner: ITEM, ordinal: 0, args: empty }).unwrap(); // t1
+    let fpl = t.intern_list(&[i64_, i64_]).unwrap();
+    let _fpty = t.intern(PNode::FnPtr(fpl, blaze_typeck::FnPtrHeader::RUST)).unwrap(); // t2
+
+    let text = "\
+local _0: t0 return
+local _1: t0 arg 0
+local _2: t1 temp e0 value
+local _3: t2 temp e1 value
+bb0:
+  _2 = closure t1()
+  _3 = cast closure_fn_pointer(move _2) as t2
+  call value copy _3(copy _1) -> _0 then bb1 unwind continue
+bb1:
+  return
+";
+    let body = blaze_body::text::parse(text, heap()).unwrap();
+    let verified = blaze_body::verify(&body).unwrap();
+    let mut ground = PortableTys::new_in(heap());
+    let mut subst = Subst { args: &[], ground: &mut ground, scratch: heap() };
+    let b = build(verified, t.view(), ITEM, &mut subst, &w, heap()).unwrap();
+    assert_eq!(b.refs.len(), 1);
+    assert_eq!(b.refs[0].item, CALL_ONCE);
+
+    // Build a simple `|x| x + 10` callee body and execute through the function pointer!
+    let mut cb: Builder<Alloc<'static>, Full> = Builder::new_in(64, heap());
+    let p = blaze_lir::builder::Param::of(blaze_lir::Ty::I64);
+    let sig = cb.sig(Conv::C, Variadic::No, &[p], &[p]);
+    cb.set_signature(sig);
+    let ent = cb.create_block(BlockKind::Normal);
+    cb.begin(ent);
+    let x = cb.param(blaze_lir::Ty::I64);
+    let ten = cb.iconst(blaze_lir::Ty::I64, 10);
+    let sum = cb.binary(blaze_lir::Op::Add, blaze_lir::Flags::NONE, x, ten);
+    cb.ret(&[sum]);
+    let callee_func = cb.finish_checked().unwrap();
+
+    let bodies = One { callee: callee_func.view() };
+    let out = run_calls_in(b.func.view(), BodyId([0; 32]), &[Val::Int(32)], 1000, &bodies, heap()).unwrap();
+    assert_eq!(returned(out), [Val::Int(42)]);
+}
+
+/// `#[track_caller]`: a tracked fn takes a hidden last `Location` ptr and forwards it to a tracked
+/// callee (and returns it from `caller_location`), while an untracked caller materializes a
+/// `Location` data row from `def_site` + statement span, and `ReifyFnPointer` uses `REIFY_SHIM_ITEM`.
+#[test]
+fn track_caller_receives_forwards_and_materializes_location() {
+    const TRACKED_OUTER: ItemKey = ItemKey(0x201);
+    const TRACKED_INNER: ItemKey = ItemKey(0x202);
+    const UNTRACKED_CALLER: ItemKey = ItemKey(0x203);
+    const LOC_ADT: ItemKey = ItemKey(0x204);
+    const CALLER_LOC_INTR: ItemKey = ItemKey(0x205);
+
+    struct TrackWorld {
+        loc_tys: PortableTys<'static>,
+        loc_fields: [blaze_typeck::Field; 3],
+        loc_variants: [blaze_typeck::Variant; 1],
+    }
+    impl LayoutFacts for TrackWorld {
+        fn adt(&self, k: ItemKey) -> Option<Adt<'_>> {
+            if k == LOC_ADT {
+                Some(Adt {
+                    kind: blaze_typeck::AdtKind::Struct,
+                    generics: 0,
+                    types: self.loc_tys.view(),
+                    variants: &self.loc_variants,
+                    fields: &self.loc_fields,
+                })
+            } else {
+                None
+            }
+        }
+        fn repr(&self, _: ItemKey) -> Result<ReprAttrs, Missing> { Ok(ReprAttrs::RUST) }
+        fn discriminant(&self, _: ItemKey, _: u32) -> Result<Option<i128>, Missing> { Ok(None) }
+        fn valid_range(&self, _: ItemKey) -> Result<ValidRange, Missing> { Ok(ValidRange::default()) }
+    }
+    impl Adts for TrackWorld {
+        fn adt(&self, k: ItemKey) -> Option<Adt<'_>> { LayoutFacts::adt(self, k) }
+        fn facts(&self) -> &dyn LayoutFacts { self }
+        fn overflow_checks(&self) -> OverflowChecks { OverflowChecks::Off }
+        fn ub_checks(&self) -> blaze_build::UbChecks { blaze_build::UbChecks::Off }
+        fn drop_impl(&self, _: PTy, _: &mut PortableTys<'_>) -> Result<Option<ItemKey>, blaze_build::BuildError> { Ok(None) }
+        fn abi(&self, _: ItemKey) -> Option<Abi> { Some(Abi::Rust) }
+        fn intrinsic(&self, k: ItemKey) -> Option<blaze_build::Intrinsic> {
+            if k == CALLER_LOC_INTR {
+                Some(blaze_build::Intrinsic::Table(blaze_build::intrinsics::Which::CallerLocation))
+            } else {
+                None
+            }
+        }
+        fn location_adt(&self) -> Option<ItemKey> { Some(LOC_ADT) }
+        fn track_caller(&self, inst: blaze_build::Instance, _: &mut PortableTys<'_>) -> Option<bool> {
+            Some(inst.item == TRACKED_OUTER || inst.item == TRACKED_INNER)
+        }
+        fn def_site(&self, item: ItemKey) -> Result<blaze_build::CallerSite<'_>, blaze_build::SiteGap> {
+            Ok(blaze_build::CallerSite { file: "test.rs", item, offset: 10 })
+        }
+    }
+
+    let mut lt = PortableTys::new_in(heap());
+    let str_t = lt.intern(PNode::Str).unwrap();
+    let ref_str = lt.intern(PNode::Ref(Mutbl::Not, str_t)).unwrap();
+    let u32_t = lt.intern(PNode::Uint(blaze_typeck::UintTy::U32)).unwrap();
+    let loc_fields = [
+        blaze_typeck::Field { name: blaze_typeck::Name::of("file"), ty: ref_str },
+        blaze_typeck::Field { name: blaze_typeck::Name::of("line"), ty: u32_t },
+        blaze_typeck::Field { name: blaze_typeck::Name::of("col"), ty: u32_t },
+    ];
+    let loc_variants = [blaze_typeck::Variant {
+        key: LOC_ADT,
+        name: blaze_typeck::Name::of("Location"),
+        fields: blaze_typeck::List { start: 0, len: 3 },
+        ctor: blaze_typeck::CtorKind::Braces,
+    }];
+    let w = TrackWorld { loc_tys: lt, loc_fields, loc_variants };
+
+    let mut t = PortableTys::new_in(heap());
+    let i64_ = t.intern(PNode::Int(IntTy::I64)).unwrap(); // t0
+    let empty = t.intern_list(&[]).unwrap();
+    let loc_t = t.intern(PNode::Adt(LOC_ADT, empty)).unwrap(); // t1
+    let _ref_loc = t.intern(PNode::Ref(Mutbl::Not, loc_t)).unwrap(); // t2
+    let _fn_def = t.intern(PNode::FnDef(TRACKED_INNER, empty)).unwrap(); // t3
+    let fpl = t.intern_list(&[i64_, i64_]).unwrap();
+    let _fn_ptr = t.intern(PNode::FnPtr(fpl, blaze_typeck::FnPtrHeader::RUST)).unwrap(); // t4
+
+    // 1. Tracked fn forwarding hidden location to `TRACKED_INNER` and reading `caller_location`:
+    let fwd_text = "\
+local _0: t2 return
+local _1: t0 arg 0
+local _2: t0 temp e0 value
+bb0:
+  call fn k202<0,0>(copy _1) -> _2 then bb1 unwind continue @12..20
+bb1:
+  call fn k205<0,0>() -> _0 then bb2 unwind continue @22..30
+bb2:
+  return
+";
+    let fb = blaze_body::text::parse(fwd_text, heap()).unwrap();
+    let fv = blaze_body::verify(&fb).unwrap();
+    let mut g1 = PortableTys::new_in(heap());
+    let mut s1 = Subst { args: &[], ground: &mut g1, scratch: heap() };
+    let b1 = build(fv, t.view(), TRACKED_OUTER, &mut s1, &w, heap()).unwrap();
+    let lir1 = printed(&b1);
+    // Entry takes `(i64, ptr)` (extra hidden location arg!) and passes it to `k202`!
+    assert!(lir1.contains("i64, ptr"), "expected hidden location param:\n{lir1}");
+    assert!(!lir1.contains("data_addr"), "forwarded location must not materialize new row:\n{lir1}");
+
+    // 2. Untracked caller calling `TRACKED_INNER` + reifying `TRACKED_INNER` as fn ptr:
+    let call_text = "\
+local _0: t4 return
+local _1: t0 arg 0
+local _2: t0 temp e0 value
+const c0 = fn k202<0,0>: t3
+bb0:
+  call fn k202<0,0>(copy _1) -> _2 then bb1 unwind continue @42..50
+bb1:
+  _0 = cast reify_fn_pointer(const c0) as t4
+  return
+";
+    let cb = blaze_body::text::parse(call_text, heap()).unwrap();
+    let cv = blaze_body::verify(&cb).unwrap();
+    let mut g2 = PortableTys::new_in(heap());
+    let mut s2 = Subst { args: &[], ground: &mut g2, scratch: heap() };
+    let b2 = build(cv, t.view(), UNTRACKED_CALLER, &mut s2, &w, heap()).unwrap();
+    let lir2 = printed(&b2);
+    assert!(lir2.contains("data_addr"), "untracked caller must materialize Location data row:\n{lir2}");
+    assert!(
+        b2.refs.iter().any(|r| r.item == blaze_build::REIFY_SHIM_ITEM),
+        "reifying tracked fn must target REIFY_SHIM_ITEM: {:?}",
+        b2.refs
+    );
 }

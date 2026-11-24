@@ -93,6 +93,8 @@ pub enum BuildError {
     NoConstValue { stmt: Stmt, item: ItemKey },
     /// The world gave no evaluated constant record for anonymous `const { .. }` block `expr`.
     NoConstBlock { stmt: Stmt, expr: ExprId },
+    /// The world gave no evaluated constant record for promoted borrow `expr`.
+    NoPromotedValue { stmt: Stmt, expr: ExprId },
     /// The world gave no fn instance for relocation key `key` inside a constant record.
     NoConstFnInstance { stmt: Stmt, key: InstanceKey },
     /// The world gave no vtable ref for relocation key `key` inside a constant record.
@@ -120,6 +122,7 @@ impl fmt::Display for BuildError {
             BuildError::Vtable { stmt, error } => write!(f, "row {} of the body: {error}", at(stmt)),
             BuildError::NoConstValue { stmt, item } => write!(f, "row {} of the body: no evaluated constant value for {:#x}", stmt.0, item.0),
             BuildError::NoConstBlock { stmt, expr } => write!(f, "row {} of the body: no evaluated const block value for e{}", stmt.0, expr.0),
+            BuildError::NoPromotedValue { stmt, expr } => write!(f, "row {} of the body: no evaluated promoted value for e{}", stmt.0, expr.0),
             BuildError::NoConstFnInstance { stmt, key } => write!(f, "row {} of the body: no fn instance for const reloc {:?}", stmt.0, key.0),
             BuildError::NoConstVtable { stmt, key } => write!(f, "row {} of the body: no vtable for const reloc {:?}", stmt.0, key.0),
             BuildError::Lir(error) => write!(f, "the LIR function: {error}"),
@@ -161,6 +164,17 @@ pub(crate) enum V {
     Mem { ptr: Value, off: i32, lay: LayoutId },
 }
 
+/// What the function being built was given of its caller's location (`#[track_caller]`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Track {
+    /// An untracked function: a location needed for a tracked callee is materialized from the call site.
+    No,
+    /// `Adts::track_caller` answered `None`: tracked calls and `caller_location` are refused by name.
+    Unsaid,
+    /// A tracked function: its hidden last parameter (`&'static Location<'static>`), forwarded to tracked callees.
+    Passed(Value),
+}
+
 /// How a value crosses a call of the Rust ABI: blaze-build's one plan, the walk's.
 pub(crate) use blaze_build::abi::Pass;
 
@@ -173,6 +187,8 @@ pub(crate) struct Cx<'a, 'g, 't, A: Allocator + Copy> {
     pub(crate) item: ItemKey,
     /// The fn item's calling convention (`Rust`, `C`, or `RustCall`).
     pub(crate) abi: Abi,
+    /// Whether the fn being built is `#[track_caller]` and, if so, its hidden location parameter.
+    pub(crate) track: Track,
     pub(crate) subst: &'a mut Subst<'g, 't>,
     pub(crate) adts: &'a dyn Adts,
     pub(crate) alloc: A,
@@ -226,6 +242,7 @@ pub fn build<A: Allocator + Copy>(
         from,
         item,
         abi,
+        track: Track::Unsaid,
         subst,
         adts,
         alloc: alloc,

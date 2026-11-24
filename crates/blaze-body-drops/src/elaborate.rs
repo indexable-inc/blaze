@@ -105,6 +105,7 @@ pub fn elaborate_planted<F: DropFacts, A: Allocator + Copy>(
         cases: Vec::new_in(alloc),
         order: Vec::new_in(alloc),
         blocks: Vec::new_in(alloc),
+        projs: Vec::new_in(alloc),
         konst: None,
     };
     e.copy_tables()?;
@@ -177,6 +178,7 @@ struct Elab<'v, 'f, F: DropFacts, A: Allocator + Copy> {
     cases: Vec<(u128, Block), A>,
     order: Vec<usize, A>,
     blocks: Vec<Block, A>,
+    projs: Vec<Proj, A>,
     /// The flags' `false` and `true`, made when the first flag is.
     konst: Option<(Const, Const)>,
 }
@@ -255,14 +257,33 @@ impl<F: DropFacts, A: Allocator + Copy> Elab<'_, '_, F, A> {
         Ok(())
     }
 
-    /// The type of a dropped place, from the body: a local's or a field's.
-    fn place_ty(&self, stmt: Stmt, place: Place) -> Result<blaze_body::body::PTy, ElabError> {
-        let row = self.v.place(place);
-        match row.proj {
-            None => Ok(self.v.local(row.local).ty),
-            Some(Proj::Field { ty, .. }) => Ok(ty),
-            Some(_) => Err(ElabError::PlaceType { stmt, place }),
+    /// The type of a dropped place: a local's or a field's directly, or resolved iteratively
+    /// through non-field projections (`Deref`, `DerefBox`, `Index`, `ConstIndex`, `Subslice`,
+    /// `Downcast`) via [`DropFacts::project_ty`].
+    fn place_ty(&mut self, stmt: Stmt, place: Place) -> Result<blaze_body::body::PTy, ElabError> {
+        self.projs.clear();
+        let mut cur = place;
+        let anchor_ty = loop {
+            let row = self.v.place(cur);
+            match (row.parent, row.proj) {
+                (_, None) => break self.v.local(row.local).ty,
+                (_, Some(Proj::Field { ty, .. })) => break ty,
+                (Some(parent), Some(proj)) => {
+                    self.projs.push(proj);
+                    cur = parent;
+                }
+                (None, Some(_)) => return Err(ElabError::PlaceType { stmt, place }),
+            }
+        };
+        let mut ty = anchor_ty;
+        while let Some(proj) = self.projs.pop() {
+            ty = match self.facts.project_ty(ty, proj) {
+                Some(next) => next,
+                None if matches!(proj, Proj::Downcast(_)) => ty,
+                None => return Err(ElabError::PlaceType { stmt, place }),
+            };
         }
+        Ok(ty)
     }
 
     /// A plan for each statement: the facts read once, the parts' places and the flags made.
@@ -285,8 +306,9 @@ impl<F: DropFacts, A: Allocator + Copy> Elab<'_, '_, F, A> {
     }
 
     fn plan_drop(&mut self, stmt: Stmt, place: Place) -> Result<Plan, ElabError> {
+        let ty = self.place_ty(stmt, place)?;
         let facts = self.facts;
-        if facts.needs_drop(self.place_ty(stmt, place)?) == NeedsDrop::No {
+        if facts.needs_drop(ty) == NeedsDrop::No {
             return Ok(Plan::Remove);
         }
         let parts = match facts.at(stmt) {

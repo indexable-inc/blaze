@@ -17,6 +17,7 @@
 //! d = tuple|array|adt|closure|coroutine (..) d = (..')
 //! d = size T | align T | tls cN              d = const
 //! d = discr P; switch copy|move d [..]       switch P' -> ..        (one flow row for both)
+//! d = discr P  (lone, e.g. enum as int)      d = (copy P')
 //! live _N, dead _N                           live _N, dead _N
 //! activate LN                                activate LN'
 //! fakeread P                                 P' = copy P'           (blaze-flow-lower's guard use)
@@ -41,7 +42,8 @@
 //! every cleanup block, entered only by an unwind edge (`verify`), is unreachable and is left
 //! out whole with its rows, its loans and its subsets. Places: `.N:T` is `Field(N)`, `[_N]` is
 //! `Index` (the flow's index names no local, so the read of the index local is not an access),
-//! `#N` is `Downcast(N)`; a constant index or a subslice is [`ProjectError::SlicePlace`].
+//! `#N` is `Downcast(N)`, constant index `[k]` is `ConstantIndex`, and subslice `[a..b]` is
+//! `Subslice`.
 //! Origins, placeholders, `mentions` and `known` carry over id for id; a body local `_N` is the
 //! flow's `_N`, and the one flow local past them is the scratch local `k`.
 #![blaze::sans_io]
@@ -257,10 +259,11 @@ pub fn project<A: Allocator + Copy>(body: Verified<'_>, alloc: A) -> Result<Proj
                     Proj::Deref => fl::Proj::Deref,
                     Proj::DerefBox => fl::Proj::DerefBox,
                     Proj::Index(_) => fl::Proj::Index,
-                    Proj::Downcast(v) => fl::Proj::Downcast(v),
-                    Proj::ConstIndex { .. } | Proj::Subslice { .. } => {
-                        return Err(ProjectError::SlicePlace { place: bd::Place(i) });
+                    Proj::ConstIndex { offset, min_length, from_end } => {
+                        fl::Proj::ConstantIndex { offset, min_length, from_end }
                     }
+                    Proj::Subslice { from, to, from_end } => fl::Proj::Subslice { from, to, from_end },
+                    Proj::Downcast(v) => fl::Proj::Downcast(v),
                 };
                 b.project_marked(parent, proj, row.of_drop_type)
             }
@@ -681,27 +684,28 @@ impl<A: Allocator + Copy> Emit<'_, A> {
             Value::Discriminant(p) => {
                 // `d = discr p; switch d`: blaze-flow-lower's switch on the matched place, whose
                 // read is the shallow one of a switch. Both rows are the one flow statement.
-                // An assignment is never a block's last row (verify), so the next row exists
-                // and is in this block.
+                // A lone `d = discr p` (e.g. an enum-to-integer cast) reads `p` as a shared copy
+                // and writes `d`, as `Value::Len(p)` does.
                 let next = bd::Stmt(row.0 + 1);
-                let StmtKind::Switch { on: Operand::Copy(x) | Operand::Move(x), cases, otherwise } =
+                if let StmtKind::Switch { on: Operand::Copy(x) | Operand::Move(x), cases, otherwise } =
                     body.stmt(next).kind
-                else {
-                    return Err(ProjectError::LoneDiscriminant { stmt: row });
-                };
-                if x != dest {
-                    return Err(ProjectError::LoneDiscriminant { stmt: row });
+                    && x == dest
+                {
+                    let on = self.place(p);
+                    self.switch(row, on, cases, otherwise, sp)?;
+                    self.subsets_at(row);
+                    if let Some(&mapped) = self.flow_stmt.get(row.index())
+                        && let Some(slot) = self.flow_stmt.get_mut(next.index())
+                    {
+                        *slot = mapped;
+                    }
+                    self.subsets_at(next);
+                    return Ok(2);
                 }
                 let on = self.place(p);
-                self.switch(row, on, cases, otherwise, sp)?;
-                self.subsets_at(row);
-                if let Some(&mapped) = self.flow_stmt.get(row.index())
-                    && let Some(slot) = self.flow_stmt.get_mut(next.index())
-                {
-                    *slot = mapped;
-                }
-                self.subsets_at(next);
-                return Ok(2);
+                self.ops.push(fl::Operand::Copy(on));
+                self.primary(row);
+                self.b.aggregate(d, &self.ops, sp);
             }
         }
         self.subsets_at(row);

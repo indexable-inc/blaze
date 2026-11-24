@@ -206,8 +206,30 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
         r
     }
 
+    /// Whether the checker promoted borrow or autoref `e` (`Checked::promoted`, sorted).
+    pub(crate) fn is_promoted(&self, e: ExprId) -> bool {
+        self.ck.promoted.binary_search_by_key(&e.0, |x| x.0).is_ok()
+    }
+
     fn val_inner(&mut self, e: ExprId) -> Result<Val, LowerError> {
         let (lo, hi) = self.adjust_rows(e);
+        // A shared autoref promoted to `'static` (`Checked::promoted`): the constant's address,
+        // never a frame temporary; any coercions after it (e.g. `Unsize`) run from `lo + 1`.
+        if hi > lo
+            && !matches!(self.expr(e)?, Expr::Ref { .. })
+            && let Some((AdjustKind::Borrow { mutbl: Mutbl::Not, raw: false, .. }, to)) = self.adjust(lo)
+            && self.is_promoted(e)
+        {
+            let c = self.b.new_const(ConstDecl { kind: ConstKind::Promoted(e.0), ty: to });
+            let mut v = Val::Op(Operand::Const(c), to);
+            for i in (lo + 1)..hi {
+                let Some((k, next_to)) = self.adjust(i) else {
+                    return self.refuse(Construct::Malformed, e);
+                };
+                v = self.apply(v, k, next_to, e)?;
+            }
+            return Ok(v);
+        }
         let ty = self.expr_ty(e)?;
         let mut v = if self.is_place_expr(e)? {
             Val::Place(self.place_unadjusted(e)?, ty)
@@ -227,6 +249,27 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
             Val::Place(t, ty)
         };
         for i in lo..hi {
+            let Some((k, to)) = self.adjust(i) else {
+                return self.refuse(Construct::Malformed, e);
+            };
+            v = self.apply(v, k, to, e)?;
+        }
+        Ok(v)
+    }
+
+    /// Lowers `e` applying only adjustments `lo..end` (used by array-to-slice overloaded index).
+    fn val_prefix(&mut self, e: ExprId, lo: usize, end: usize) -> Result<Val, LowerError> {
+        let ty = self.expr_ty(e)?;
+        let mut v = if self.is_place_expr(e)? {
+            Val::Place(self.place_unadjusted(e)?, ty)
+        } else if let Some(c) = self.const_operand(e)? {
+            Val::Op(c, ty)
+        } else {
+            let t = self.temp(e, ty, Role::Value)?;
+            self.value_into(t, e)?;
+            Val::Place(t, ty)
+        };
+        for i in lo..end {
             let Some((k, to)) = self.adjust(i) else {
                 return self.refuse(Construct::Malformed, e);
             };
@@ -276,7 +319,45 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
                 let d = self.deref(p, ty, At::Expr(e))?;
                 Ok(Val::Place(d, to))
             }
-            AdjustKind::Deref { overloaded: Some(_) } => self.refuse(Construct::OverloadedDeref, e),
+            AdjustKind::Deref { overloaded: Some(mutbl) } => {
+                let self_ty = match v {
+                    Val::Place(_, t) | Val::Op(_, t) => t,
+                };
+                let at = At::Expr(e);
+                let p = self.to_place(v, e)?;
+                // `Box<T>` deref is builtin (`Proj::DerefBox`), never a recursive call to
+                // `alloc`'s `Deref::deref` (`&**self`).
+                if let PNode::Adt(k, _) = self.node(self_ty, at)?
+                    && self.adt_facts(k, at)?.is_box
+                {
+                    let d = self.b.project(p, Proj::DerefBox);
+                    return Ok(Val::Place(d, to));
+                }
+                let Some(key) = self.facts.deref_fn(mutbl) else {
+                    return self.refuse(Construct::OverloadedDeref, e);
+                };
+                let arg_ty = self.find_ty(PNode::Ref(mutbl, self_ty), at)?;
+                let arg_temp = self.temp(e, arg_ty, Role::Borrow)?;
+                let bkind = match mutbl {
+                    Mutbl::Not => BorrowKind::Shared,
+                    Mutbl::Mut => BorrowKind::Mut,
+                };
+                let o = self.b.origin(false);
+                self.b.borrow(arg_temp, bkind, p, o, span);
+                let arg_op = match mutbl {
+                    Mutbl::Not => Operand::Copy(arg_temp),
+                    Mutbl::Mut => Operand::Move(arg_temp),
+                };
+                let Ok(args_list) = self.b.intern_list(&[self_ty]) else {
+                    return self.refuse(Construct::Malformed, e);
+                };
+                let ret_ty = self.find_ty(PNode::Ref(mutbl, to), at)?;
+                let ret_temp = self.temp(e, ret_ty, Role::Value)?;
+                let act = self.activate.len();
+                self.emit_call_ty(Callee::Method { key, args: args_list }, &[arg_op], ret_temp, ret_ty, e, act)?;
+                let d = self.b.project(ret_temp, Proj::Deref);
+                Ok(Val::Place(d, to))
+            }
             AdjustKind::Borrow { mutbl, two_phase, raw } => {
                 let p = self.to_place(v, e)?;
                 let t = self.temp(e, to, Role::Borrow)?;
@@ -497,6 +578,13 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
         }
     }
 
+    /// Whether `operand` carries an overloaded dereference as its last adjustment (the checker
+    /// records written `*x` on `x` itself for `Deref`/`DerefMut`/`Box`).
+    fn deref_on_operand(&self, operand: ExprId) -> bool {
+        let (lo, hi) = self.adjust_rows(operand);
+        hi > lo && matches!(self.adjust(hi - 1), Some((AdjustKind::Deref { overloaded: Some(_) }, _)))
+    }
+
     /// The place place expression `e` names, before `e`'s own adjustments.
     fn place_unadjusted(&mut self, e: ExprId) -> Result<Place, LowerError> {
         match self.expr(e)? {
@@ -512,8 +600,8 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
             }
             Expr::Index { base, index } => self.index_place(e, base, index),
             Expr::Unary { op: UnOp::Deref, operand } => {
-                if self.callee_of(e).is_some() {
-                    return self.refuse(Construct::OverloadedDeref, e);
+                if self.deref_on_operand(operand) {
+                    return self.place(operand);
                 }
                 let ty = self.adjusted_ty(operand)?;
                 let p = self.place(operand)?;
@@ -536,25 +624,92 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
         Ok(self.b.project_marked(bp, Proj::Field { index, ty }, marked))
     }
 
-    /// `base[index]` of an array or slice: the index in its own local, then `assert(index <
-    /// len)` (the Reference, "Array and slice indexing expressions": out of bounds panics).
+    /// `base[index]`: builtin array/slice element (`usize` index with bounds check), or
+    /// overloaded `*Index::index(&base, index)` / `*IndexMut::index_mut(&mut base, index)`.
     fn index_place(&mut self, e: ExprId, base: ExprId, index: ExprId) -> Result<Place, LowerError> {
-        if self.callee_of(e).is_some() {
-            return self.refuse(Construct::OverloadedIndex, e);
-        }
         let span = self.span(e);
-        let bp = self.place(base)?;
+        let at = At::Expr(e);
+        let bt = self.adjusted_ty(base)?;
         let it = self.adjusted_ty(index)?;
-        let iv = self.operand(index)?;
-        let (il, ip) = self.temp_local(index, it, Role::Value)?;
-        self.b.assign(ip, Value::Use(iv), span);
-        let len = self.scratch(e, it);
-        self.b.assign(len, Value::Len(bp), span);
-        let bool_ty = self.bool_ty(At::Expr(e))?;
-        let lt = self.scratch(e, bool_ty);
-        self.b.assign(lt, Value::Binary { op: BBin::Lt, lhs: Operand::Copy(ip), rhs: Operand::Copy(len) }, span);
-        self.assert(Operand::Move(lt), true, AssertKind::Bounds, &[Operand::Copy(len), Operand::Copy(ip)], span);
-        Ok(self.b.project(bp, Proj::Index(il)))
+        let builtin = matches!(self.node(bt, At::Expr(base))?, PNode::Array(..) | PNode::Slice(_))
+            && matches!(self.node(it, At::Expr(index))?, PNode::Uint(UintTy::Usize));
+        if builtin {
+            let bp = self.place(base)?;
+            let iv = self.operand(index)?;
+            let (il, ip) = self.temp_local(index, it, Role::Value)?;
+            self.b.assign(ip, Value::Use(iv), span);
+            let len = self.scratch(e, it);
+            self.b.assign(len, Value::Len(bp), span);
+            let bool_ty = self.bool_ty(at)?;
+            let lt = self.scratch(e, bool_ty);
+            self.b.assign(lt, Value::Binary { op: BBin::Lt, lhs: Operand::Copy(ip), rhs: Operand::Copy(len) }, span);
+            self.assert(Operand::Move(lt), true, AssertKind::Bounds, &[Operand::Copy(len), Operand::Copy(ip)], span);
+            return Ok(self.b.project(bp, Proj::Index(il)));
+        }
+        let mutbl = if self.ck.index_is_mut(e) { Mutbl::Mut } else { Mutbl::Not };
+        let Some(key) = self.facts.index_fn(mutbl) else {
+            return self.refuse(Construct::OverloadedIndex, e);
+        };
+        let bkind = match mutbl {
+            Mutbl::Not => BorrowKind::Shared,
+            Mutbl::Mut => BorrowKind::Mut,
+        };
+        // Check for array-to-slice step on `base` (`a[1..3]`): checker records a builtin `Deref`
+        // from `[T; N]` to `[T]`; lower it as borrowing `[T; N]` and unsizing to `&[T]`/`&mut [T]`.
+        let (blo, bhi) = self.adjust_rows(base);
+        let array_to_slice = if bhi > blo
+            && matches!(self.adjust(bhi - 1), Some((AdjustKind::Deref { overloaded: None }, _)))
+        {
+            let before = if bhi - 1 == blo {
+                self.expr_ty(base)?
+            } else {
+                let Some((_, prev)) = self.adjust(bhi - 2) else {
+                    return self.refuse(Construct::Malformed, base);
+                };
+                prev
+            };
+            if matches!(self.node(before, At::Expr(base))?, PNode::Array(..)) { Some(before) } else { None }
+        } else {
+            None
+        };
+        let ref_ty = self.find_ty(PNode::Ref(mutbl, bt), at)?;
+        let base_op = if let Some(arr_ty) = array_to_slice {
+            let v = self.val_prefix(base, blo, bhi - 1)?;
+            let ap = self.to_place(v, base)?;
+            let thin_ty = self.find_ty(PNode::Ref(mutbl, arr_ty), at)?;
+            let thin_t = self.temp(base, thin_ty, Role::Borrow)?;
+            let o = self.b.origin(false);
+            self.b.borrow(thin_t, bkind, ap, o, span);
+            let thin_op = match mutbl {
+                Mutbl::Not => Operand::Copy(thin_t),
+                Mutbl::Mut => Operand::Move(thin_t),
+            };
+            let wide_t = self.temp(base, ref_ty, Role::Value)?;
+            self.b.assign(wide_t, Value::Cast { kind: CastKind::Unsize, operand: thin_op, ty: ref_ty }, span);
+            match mutbl {
+                Mutbl::Not => Operand::Copy(wide_t),
+                Mutbl::Mut => Operand::Move(wide_t),
+            }
+        } else {
+            let bp = self.place(base)?;
+            let rt = self.temp(base, ref_ty, Role::Borrow)?;
+            let o = self.b.origin(false);
+            self.b.borrow(rt, bkind, bp, o, span);
+            match mutbl {
+                Mutbl::Not => Operand::Copy(rt),
+                Mutbl::Mut => Operand::Move(rt),
+            }
+        };
+        let idx_op = self.operand(index)?;
+        let Ok(args_list) = self.b.intern_list(&[bt, it]) else {
+            return self.refuse(Construct::Malformed, e);
+        };
+        let out_ty = self.expr_ty(e)?;
+        let ret_ty = self.find_ty(PNode::Ref(mutbl, out_ty), at)?;
+        let ret_temp = self.temp(e, ret_ty, Role::Value)?;
+        let act = self.activate.len();
+        self.emit_call_ty(Callee::Method { key, args: args_list }, &[base_op, idx_op], ret_temp, ret_ty, e, act)?;
+        Ok(self.b.project(ret_temp, Proj::Deref))
     }
 
     /// A static's place: `*(const static)`, the constant its address (`&T`, or `*mut T` for a
@@ -573,7 +728,8 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
         Ok(self.b.project(t, Proj::Deref))
     }
 
-    /// `e` as a constant operand, when it is one: a literal, a fn item, a constant.
+    /// `e` as a constant operand, when it is one: a literal, a fn item, a constant, or a promoted
+    /// shared borrow.
     fn const_operand(&mut self, e: ExprId) -> Result<Option<Operand>, LowerError> {
         match self.expr(e)? {
             Expr::Lit(l) => Ok(Some(self.lit(e, l)?)),
@@ -581,6 +737,10 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
             Expr::ConstBlock { .. } => {
                 let ty = self.expr_ty(e)?;
                 Ok(Some(Operand::Const(self.b.new_const(ConstDecl { kind: ConstKind::Anon(e), ty }))))
+            }
+            Expr::Ref { mutbl: Mutbl::Not, .. } if self.is_promoted(e) => {
+                let ty = self.expr_ty(e)?;
+                Ok(Some(Operand::Const(self.b.new_const(ConstDecl { kind: ConstKind::Promoted(e.0), ty }))))
             }
             _ => Ok(None),
         }
@@ -728,8 +888,42 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
         Ok(ops)
     }
 
+    /// Resolves the `ClosureKind` of closure `(owner, ordinal)`: from `Checked::closures` when
+    /// defined in this body, else from `BodyFacts::closure_kind`.
+    fn resolve_closure_kind(&self, owner: ItemKey, ordinal: u32) -> Option<blaze_typeck::ClosureKind> {
+        if owner == self.body.owner {
+            let mut seen = 0u32;
+            for (idx, x) in self.body.exprs.iter().enumerate() {
+                if matches!(x, Expr::Closure { .. }) {
+                    if seen == ordinal {
+                        let cid = ExprId(u32::try_from(idx).ok()?);
+                        let row = self.ck.closures.column::<0>().iter().position(|&c| c == cid)?;
+                        return self.ck.closures.column::<1>().get(row).copied();
+                    }
+                    seen += 1;
+                }
+            }
+        }
+        self.facts.closure_kind(owner, ordinal)
+    }
+
+    /// Packs call argument operands `arg_ops` into a tuple temporary of type `tuple_ty`.
+    fn pack_args_tuple(&mut self, arg_ops: &[Operand], tuple_ty: PTy, e: ExprId) -> Result<Operand, LowerError> {
+        let span = self.span(e);
+        let t = self.temp(e, tuple_ty, Role::Value)?;
+        let operands = self.b.operands(arg_ops);
+        self.b.assign(t, Value::Aggregate { kind: AggregateKind::Tuple, ty: tuple_ty, operands }, span);
+        if self.is_copy(tuple_ty, At::Expr(e))? {
+            Ok(Operand::Copy(t))
+        } else {
+            Ok(Operand::Move(t))
+        }
+    }
+
     /// `callee(args..)`: a constructor is an aggregate; a fn item is called by name (its path
-    /// not evaluated); a fn pointer is called through its value, evaluated first.
+    /// not evaluated); a fn pointer is called through its value, evaluated first; closures and
+    /// `Fn`/`FnMut`/`FnOnce`/`dyn Fn` values are called through their `Fn*` trait method with
+    /// arguments packed into a tuple (spread by `Abi::RustCall`).
     fn call_into(&mut self, dest: Place, e: ExprId, callee: ExprId, args: List) -> Result<(), LowerError> {
         let ids = self.exprs_in(args, e)?;
         let span = self.span(e);
@@ -742,18 +936,70 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
         }
         let cty = self.adjusted_ty(callee)?;
         let act = self.activate.len();
-        let c = match self.node(cty, At::Expr(callee))? {
+        match self.node(cty, At::Expr(callee))? {
             PNode::FnDef(k, l) => {
                 if !matches!(self.expr(callee)?, Expr::Path(_)) {
                     let _ = self.operand(callee)?;
                 }
-                self.item_callee(k, l, e)?
+                let c = self.item_callee(k, l, e)?;
+                let ops = self.operands_of(ids)?;
+                self.emit_call(c, &ops, dest, e, act)
             }
-            PNode::FnPtr(..) => Callee::Value(self.operand(callee)?),
-            _ => return self.refuse(Construct::CallThroughFnTrait, e),
-        };
-        let ops = self.operands_of(ids)?;
-        self.emit_call(c, &ops, dest, e, act)
+            PNode::FnPtr(..) => {
+                let c = Callee::Value(self.operand(callee)?);
+                let ops = self.operands_of(ids)?;
+                self.emit_call(c, &ops, dest, e, act)
+            }
+            PNode::Closure { owner, ordinal, .. } if self.callee_of(e).is_none() => {
+                let Some(kind) = self.resolve_closure_kind(owner, ordinal) else {
+                    return self.refuse(Construct::CallThroughFnTrait, e);
+                };
+                let Some(key) = self.facts.fn_trait_method(kind) else {
+                    return self.refuse(Construct::CallThroughFnTrait, e);
+                };
+                let recv_op = match kind {
+                    blaze_typeck::ClosureKind::Fn => self.borrowed(callee, Mutbl::Not)?,
+                    blaze_typeck::ClosureKind::FnMut => self.borrowed(callee, Mutbl::Mut)?,
+                    blaze_typeck::ClosureKind::FnOnce => self.operand(callee)?,
+                };
+                let mut arg_tys: Vec<PTy, A> = Vec::with_capacity_in(ids.len(), self.alloc);
+                for &a in ids {
+                    arg_tys.push(self.adjusted_ty(a)?);
+                }
+                let arg_ops = self.operands_of(ids)?;
+                let Ok(tuple_list) = self.b.intern_list(&arg_tys) else {
+                    return self.refuse(Construct::Malformed, e);
+                };
+                let tuple_ty = self.find_ty(PNode::Tuple(tuple_list), At::Expr(e))?;
+                let tuple_op = self.pack_args_tuple(&arg_ops, tuple_ty, e)?;
+                let Ok(fn_args) = self.b.intern_list(&[cty, tuple_ty]) else {
+                    return self.refuse(Construct::Malformed, e);
+                };
+                self.emit_call(Callee::Method { key, args: fn_args }, &[recv_op, tuple_op], dest, e, act)
+            }
+            _ => {
+                let Some((key, fn_args)) = self.callee_of(e) else {
+                    return self.refuse(Construct::CallThroughFnTrait, e);
+                };
+                let callee_op = self.operand(callee)?;
+                let arg_ops = self.operands_of(ids)?;
+                let tuple_ty = match self.list(fn_args, At::Expr(e))?.get(1) {
+                    Some(&t) => t,
+                    None => {
+                        let mut arg_tys: Vec<PTy, A> = Vec::with_capacity_in(ids.len(), self.alloc);
+                        for &a in ids {
+                            arg_tys.push(self.adjusted_ty(a)?);
+                        }
+                        let Ok(tuple_list) = self.b.intern_list(&arg_tys) else {
+                            return self.refuse(Construct::Malformed, e);
+                        };
+                        self.find_ty(PNode::Tuple(tuple_list), At::Expr(e))?
+                    }
+                };
+                let tuple_op = self.pack_args_tuple(&arg_ops, tuple_ty, e)?;
+                self.emit_call(Callee::Method { key, args: fn_args }, &[callee_op, tuple_op], dest, e, act)
+            }
+        }
     }
 
     /// `receiver.name(args..)`: the method the check chose, the adjusted receiver first.
@@ -773,6 +1019,21 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
     /// The call row: the two-phase loans made since `act` activated first; its unwind edge the
     /// chain of what is live; a call of type `!` has no return block.
     pub(crate) fn emit_call(&mut self, c: Callee, ops: &[Operand], dest: Place, e: ExprId, act: usize) -> Result<(), LowerError> {
+        let ty = self.expr_ty(e)?;
+        self.emit_call_ty(c, ops, dest, ty, e, act)
+    }
+
+    /// Emits a call whose return type is `ret_ty` (distinct from `self.expr_ty(e)` for helper
+    /// trait calls like `Deref::deref` and `Index::index`).
+    pub(crate) fn emit_call_ty(
+        &mut self,
+        c: Callee,
+        ops: &[Operand],
+        dest: Place,
+        ret_ty: PTy,
+        e: ExprId,
+        act: usize,
+    ) -> Result<(), LowerError> {
         let span = self.span(e);
         let mut i = act;
         while let Some(&loan) = self.activate.get(i) {
@@ -782,8 +1043,7 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
         self.activate.truncate(act);
         let callee = self.b.callee(c);
         let args = self.b.operands(ops);
-        let ty = self.expr_ty(e)?;
-        let diverges = matches!(self.node(ty, At::Expr(e))?, PNode::Never);
+        let diverges = matches!(self.node(ret_ty, At::Expr(e))?, PNode::Never);
         let unwind = self.unwind_here();
         if diverges {
             self.b.terminate(StmtKind::Call { callee, args, dest: None, target: None, unwind }, span);
@@ -1208,11 +1468,9 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
     /// (`Checked::promoted`) is the promoted constant, and its operand's code does not run here.
     fn ref_into(&mut self, dest: Place, e: ExprId, mutbl: Mutbl, operand: ExprId) -> Result<(), LowerError> {
         let span = self.span(e);
-        if mutbl == Mutbl::Not
-            && let Ok(i) = self.ck.promoted.binary_search_by_key(&e.0, |x| x.0)
-        {
+        if mutbl == Mutbl::Not && self.is_promoted(e) {
             let ty = self.expr_ty(e)?;
-            let c = self.b.new_const(ConstDecl { kind: ConstKind::Promoted(i as u32), ty });
+            let c = self.b.new_const(ConstDecl { kind: ConstKind::Promoted(e.0), ty });
             self.b.assign(dest, Value::Use(Operand::Const(c)), span);
             return Ok(());
         }
