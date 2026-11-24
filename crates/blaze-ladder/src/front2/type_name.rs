@@ -46,6 +46,33 @@ enum Piece<'a> {
     ImplHeader(&'a str),
 }
 
+/// Writes the display name of variant `variant` (0-based declaration index, with leading `r#`
+/// stripped for raw identifiers) of enum `adt` into `out` and returns `true`; returns `false`
+/// when `adt` has no variant table or `variant` is out of range.
+pub(crate) fn variant_name<'n, S: NamesSource<'n>>(
+    names: S,
+    keys: &Keys,
+    adt: ItemKey,
+    variant: u32,
+    out: &mut dyn FnMut(&str),
+) -> bool {
+    let Some(lib) = keys.library_in(names, adt) else {
+        return false;
+    };
+    let Some(vs) = names.variants(lib) else {
+        return false;
+    };
+    let Ok(idx) = usize::try_from(variant) else {
+        return false;
+    };
+    let Some(v) = vs.get(idx) else {
+        return false;
+    };
+    let text = v.name.strip_prefix("r#").unwrap_or(v.name);
+    out(text);
+    true
+}
+
 /// Writes `item`'s full path into `out` and returns `true`; returns `false` without calling
 /// `out` when no path is known or the bound is exceeded.
 pub(crate) fn item_path<'a, 'n: 'a, S: NamesSource<'n>>(

@@ -175,12 +175,23 @@ pub enum Which {
     BlazeFieldCount,
     /// blaze's `blaze_int_cast::<S, D>(x)`: `x as D` ([`int_cast_bits`] the rule).
     BlazeIntCast,
+    /// blaze's `blaze_is_enum::<T>() -> bool`: whether `T` is an `enum` ADT ([`is_enum`] the rule).
+    BlazeIsEnum,
+    /// blaze's `blaze_is_unit_enum::<T>() -> bool`: whether `T` is a fieldless `enum` ADT
+    /// ([`is_unit_enum`] the rule).
+    BlazeIsUnitEnum,
     /// blaze's `blaze_record_schema_id::<T>() -> u64`: canonical structural schema hash of a
     /// record (`0` for non-records; [`record_schema_id`] the rule).
     BlazeRecordSchemaId,
     /// blaze's `blaze_records_disjoint::<A, B>() -> bool`: whether two structural record types
     /// share zero field names ([`records_disjoint`] the rule).
     BlazeRecordsDisjoint,
+    /// blaze's `blaze_variant_count::<T>() -> usize`: number of declared variants of an `enum`
+    /// ADT (`0` for non-enums; [`variant_count`] the rule).
+    BlazeVariantCount,
+    /// blaze's `blaze_variant_name::<T>(idx: usize) -> &'static str`: display name of variant
+    /// `idx` of enum `T` (`""` if out of range or non-enum; consteval-only like `type_name`).
+    BlazeVariantName,
     /// A `simd_*` intrinsic: its rows and its build are intrinsics/simd.rs's.
     Simd(simd::SimdOp),
 }
@@ -236,8 +247,12 @@ pub const TABLE: &[Entry] = &[
     e("black_box", Which::BlackBox, "See documentation of [`std::hint::black_box`] for details.", "its argument"),
     e("blaze_field_count", Which::BlazeFieldCount, "blaze: compile-time field count of a structural record, tuple, or struct (`0` for enums, unions, and other types).", "a constant `usize` from `field_count`"),
     e("blaze_int_cast", Which::BlazeIntCast, "blaze: `x as D` between two integer types of any width, the standard ones and those of `#![blaze::arbitrary_ints]` (`u3`, `i24`): it truncates to `D`'s width, or extends by `S`'s sign, and never panics.", "`trunc`, or `sext`/`zext` by `S`'s sign, or the value itself at one width (`int_cast_bits` the rule)"),
+    e("blaze_is_enum", Which::BlazeIsEnum, "blaze: compile-time check whether `T` is an `enum` ADT.", "a constant `bool` from `is_enum`"),
+    e("blaze_is_unit_enum", Which::BlazeIsUnitEnum, "blaze: compile-time check whether `T` is a fieldless `enum` ADT.", "a constant `bool` from `is_unit_enum`"),
     e("blaze_record_schema_id", Which::BlazeRecordSchemaId, "blaze: canonical compile-time 64-bit structural schema ID of a record (`0` for non-records).", "a constant `u64` from `record_schema_id`"),
     e("blaze_records_disjoint", Which::BlazeRecordsDisjoint, "blaze: compile-time check that two structural record types share zero field names.", "a constant `bool` from `records_disjoint`"),
+    e("blaze_variant_count", Which::BlazeVariantCount, "blaze: compile-time variant count of an `enum` ADT (`0` for non-enums).", "a constant `usize` from `variant_count`"),
+    e("blaze_variant_name", Which::BlazeVariantName, "blaze: compile-time display name of variant `idx` of an `enum` ADT (`\"\"` when out of range or non-enum).", "a constant `&'static str` evaluated in `blaze-consteval`"),
     e("bswap", Which::Bswap, "Reverses the bytes in an integer type `T`.", "`bswap` (a byte: itself)"),
     e("caller_location", Which::CallerLocation, "Gets a reference to a static `Location` indicating where it was called.", "the address of a data row of the site's `Location`, or the location a `#[track_caller]` fn was passed"),
     e("catch_unwind", Which::CatchUnwind, "Rust's \"try catch\" construct for unwinding.", "an `invoke` of `try_fn` whose `catch` landing block calls `catch_fn` (walk/unwind.rs); under `panic = abort` a call and `false`"),
@@ -550,17 +565,11 @@ pub fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
         }
         W::VariantCount => {
             let t = t0.ok_or_else(need_t)?;
-            let n = match s.cx.cx.ground.view().node(t).map_err(|_| shape())? {
-                blaze_typeck::PNode::Adt(key, _) => {
-                    let adt = s.cx.cx.facts.adt(key).ok_or(IntrinsicError::Shape { which: c.which, why: "the ADT's definition is missing" })?;
-                    match adt.kind {
-                        blaze_typeck::AdtKind::Enum => adt.variants.len() as u64,
-                        blaze_typeck::AdtKind::Struct | blaze_typeck::AdtKind::Union => 0,
-                    }
-                }
-                _ => 0,
-            };
-            Out::Scalar(s.usize(n))
+            let count = variant_count(t, s.cx.cx.ground.view(), s.cx.cx.facts).map_err(|e| match e {
+                FieldCountError::MissingType => s.shape("a type argument not in the ground table"),
+                FieldCountError::NoAdt(adt) => IntrinsicError::Layout(LayoutError { ty: t, why: crate::layout::Refusal::NoAdt(adt) }),
+            })?;
+            Out::Scalar(s.usize(count))
         }
         W::SizeOfVal | W::AlignOfVal => {
             let id = s.layout(t0.ok_or_else(need_t)?)?;
@@ -1165,6 +1174,31 @@ pub fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
             let id = record_schema_id(t, s.cx.cx.ground.view()).ok_or(s.shape("a type argument not in the ground table"))?;
             Out::Scalar(s.b.iconst(Ty::I64, u128::from(id)))
         }
+        W::BlazeIsEnum => {
+            let t = t0.ok_or_else(need_t)?;
+            let yes = is_enum(t, s.cx.cx.ground.view(), s.cx.cx.facts).map_err(|e| match e {
+                FieldCountError::MissingType => s.shape("a type argument not in the ground table"),
+                FieldCountError::NoAdt(adt) => IntrinsicError::Layout(LayoutError { ty: t, why: crate::layout::Refusal::NoAdt(adt) }),
+            })?;
+            Out::Scalar(s.b.iconst(Ty::I8, u128::from(yes)))
+        }
+        W::BlazeIsUnitEnum => {
+            let t = t0.ok_or_else(need_t)?;
+            let yes = is_unit_enum(t, s.cx.cx.ground.view(), s.cx.cx.facts).map_err(|e| match e {
+                FieldCountError::MissingType => s.shape("a type argument not in the ground table"),
+                FieldCountError::NoAdt(adt) => IntrinsicError::Layout(LayoutError { ty: t, why: crate::layout::Refusal::NoAdt(adt) }),
+            })?;
+            Out::Scalar(s.b.iconst(Ty::I8, u128::from(yes)))
+        }
+        W::BlazeVariantCount => {
+            let t = t0.ok_or_else(need_t)?;
+            let count = variant_count(t, s.cx.cx.ground.view(), s.cx.cx.facts).map_err(|e| match e {
+                FieldCountError::MissingType => s.shape("a type argument not in the ground table"),
+                FieldCountError::NoAdt(adt) => IntrinsicError::Layout(LayoutError { ty: t, why: crate::layout::Refusal::NoAdt(adt) }),
+            })?;
+            Out::Scalar(s.usize(count))
+        }
+        W::BlazeVariantName => return Err(s.shape("`blaze_variant_name` reached the intrinsic builder: evaluate it in a `const` / `where const` context (blaze-consteval)")),
     };
     Ok(out)
 }
@@ -1305,6 +1339,48 @@ pub fn record_schema_id(ty: PTy, tys: PTys<'_>) -> Option<u64> {
         PNode::Record(schema, _) => schema.0,
         _ => 0,
     })
+}
+
+/// `blaze_is_enum::<T>()`'s rule: `true` iff `T` is an `AdtKind::Enum`.
+pub fn is_enum(ty: PTy, tys: PTys<'_>, facts: &dyn LayoutFacts) -> Result<bool, FieldCountError> {
+    let node = tys.get(ty).copied().ok_or(FieldCountError::MissingType)?;
+    match node {
+        PNode::Adt(adt_key, _) => {
+            let adt = facts.adt(adt_key).ok_or(FieldCountError::NoAdt(adt_key))?;
+            Ok(adt.kind == AdtKind::Enum)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// `blaze_is_unit_enum::<T>()`'s rule: `true` iff `T` is an `AdtKind::Enum` whose variants are all
+/// unit variants (`CtorKind::Unit`).
+pub fn is_unit_enum(ty: PTy, tys: PTys<'_>, facts: &dyn LayoutFacts) -> Result<bool, FieldCountError> {
+    let node = tys.get(ty).copied().ok_or(FieldCountError::MissingType)?;
+    match node {
+        PNode::Adt(adt_key, _) => {
+            let adt = facts.adt(adt_key).ok_or(FieldCountError::NoAdt(adt_key))?;
+            Ok(adt.kind == AdtKind::Enum && adt.variants.iter().all(|v| v.ctor == blaze_typeck::CtorKind::Unit))
+        }
+        _ => Ok(false),
+    }
+}
+
+/// `blaze_variant_count::<T>()`'s rule: number of declared variants if `T` is an `AdtKind::Enum`,
+/// else `0`.
+pub fn variant_count(ty: PTy, tys: PTys<'_>, facts: &dyn LayoutFacts) -> Result<u64, FieldCountError> {
+    let node = tys.get(ty).copied().ok_or(FieldCountError::MissingType)?;
+    match node {
+        PNode::Adt(adt_key, _) => {
+            let adt = facts.adt(adt_key).ok_or(FieldCountError::NoAdt(adt_key))?;
+            if adt.kind == AdtKind::Enum {
+                Ok(u64::try_from(adt.variants.len()).unwrap_or(0))
+            } else {
+                Ok(0)
+            }
+        }
+        _ => Ok(0),
+    }
 }
 
 /// `discriminant_value::<T>(v)`: the tag at `v` decoded by `T`'s encoding, as the call's type.

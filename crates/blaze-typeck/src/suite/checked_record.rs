@@ -227,7 +227,7 @@ fn every_lang_tag_decodes_to_its_item() {
         assert_eq!(LangItem::of_tag(i as u8), Some(l));
         seen = format!("{l:?}");
     }
-    assert_eq!(seen, "From", "the list ends at the last variant");
+    assert_eq!(seen, "UnitEnum", "the list ends at the last variant");
     assert_eq!(LangItem::of_tag(LangItem::ALL.len() as u8), None, "control: a tag past the list");
 }
 

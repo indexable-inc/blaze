@@ -764,4 +764,8 @@ impl<'n, S: NamesSource<'n>> blaze_build::type_name::TypeNames for LazyProgram<'
     fn item_path(&self, item: ItemKey, out: &mut dyn FnMut(&str)) -> bool {
         crate::front2::type_name::item_path(self.front.names, &self.front.keys, &self.store, item, out)
     }
+
+    fn variant_name(&self, adt: ItemKey, variant: u32, out: &mut dyn FnMut(&str)) -> bool {
+        crate::front2::type_name::variant_name(self.front.names, &self.front.keys, adt, variant, out)
+    }
 }

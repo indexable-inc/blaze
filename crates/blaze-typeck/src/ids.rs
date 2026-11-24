@@ -376,6 +376,10 @@ pub enum LangItem {
     /// The trait `From` (`from` / `core::convert::From`), for error-union `?` propagation.
     /// Last, so the earlier items keep their content hashes.
     From,
+    /// Compiler-builtin marker trait satisfied by every `enum` ADT (`#[lang = "blaze_enum"]`).
+    Enum,
+    /// Compiler-builtin marker trait satisfied by every fieldless `enum` ADT (`#[lang = "blaze_unit_enum"]`).
+    UnitEnum,
 }
 
 impl LangItem {
@@ -411,7 +415,7 @@ impl LangItem {
     /// and the checked-body record ([`crate::checked_record`]) write. The one home of the list
     /// (blaze-ladder's front2/langs.rs `ALL` names this one; tests/front2_bounds.rs checks its
     /// length against `variant_count` and its order, so a new variant cannot be left out).
-    pub const ALL: [LangItem; 99] = {
+    pub const ALL: [LangItem; 101] = {
         use LangItem::*;
         [
             Sized, Copy, Deref, DerefMut, Add, Sub, Mul, Div, Rem, BitAnd, BitOr, BitXor, Shl, Shr, AddAssign, SubAssign, MulAssign, DivAssign, RemAssign, BitAndAssign, BitOrAssign,
@@ -422,7 +426,7 @@ impl LangItem {
             RangeToInclusive, IntoFutureIntoFuture, FuturePoll, PinNewUnchecked, GetContext, PollReady, PollPending, FutureOutput, TryTraitFromOutput,
             Freeze,
             AsyncFn, AsyncFnMut, AsyncFnOnce, AsyncFnOnceOutput, CallOnceFuture, CallRefFuture,
-            From,
+            From, Enum, UnitEnum,
         ]
     };
 

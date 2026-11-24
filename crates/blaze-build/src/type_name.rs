@@ -39,6 +39,14 @@ pub trait TypeNames {
         let _ = (name, out);
         false
     }
+
+    /// Gives the display name of variant `variant` (0-based declaration index, with leading `r#`
+    /// stripped for raw identifiers) of enum `adt` to `out` and says `true`; `false` when `adt`
+    /// is not an enum or `variant` is out of range.
+    fn variant_name(&self, adt: ItemKey, variant: u32, out: &mut dyn FnMut(&str)) -> bool {
+        let _ = (adt, variant, out);
+        false
+    }
 }
 
 /// Why a type's name was not printed.

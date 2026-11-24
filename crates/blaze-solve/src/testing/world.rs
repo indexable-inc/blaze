@@ -74,6 +74,8 @@ fn lang_of(name: &str) -> Option<Lang> {
         "async_fn_once_output" => Lang::AsyncFnOnceOutput,
         "call_once_future" => Lang::CallOnceFuture,
         "call_ref_future" => Lang::CallRefFuture,
+        "blaze_enum" => Lang::Enum,
+        "blaze_unit_enum" => Lang::UnitEnum,
         _ => return None,
     })
 }

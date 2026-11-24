@@ -1970,7 +1970,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
                     PNode::Adt(key, _) => {
                         let adt = self.world.adt(key).ok_or(Stop::Refused(Refusal::Missing { what: "ADT definition", item: key }))?;
                         match adt.kind {
-                            blaze_typeck::AdtKind::Enum => adt.variants.len() as u128,
+                            blaze_typeck::AdtKind::Enum => u128::try_from(adt.variants.len()).unwrap_or(0),
                             blaze_typeck::AdtKind::Struct | blaze_typeck::AdtKind::Union => 0,
                         }
                     }
@@ -2239,6 +2239,57 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
                 let id = blaze_build::intrinsics::record_schema_id(t, self.ground.view())
                     .ok_or(malformed("`blaze_record_schema_id` of a type not in the ground table"))?;
                 s(u128::from(id))
+            }
+            Intrinsic::BlazeIsEnum => {
+                let t = t0.ok_or(malformed("`blaze_is_enum` with no type"))?;
+                let yes = blaze_build::intrinsics::is_enum(t, self.ground.view(), self.world).map_err(|e| match e {
+                    blaze_build::intrinsics::FieldCountError::MissingType => malformed("`blaze_is_enum` of a type not in the ground table"),
+                    blaze_build::intrinsics::FieldCountError::NoAdt(item) => Stop::Refused(Refusal::Missing { what: "ADT definition", item }),
+                })?;
+                s(u128::from(yes))
+            }
+            Intrinsic::BlazeIsUnitEnum => {
+                let t = t0.ok_or(malformed("`blaze_is_unit_enum` with no type"))?;
+                let yes = blaze_build::intrinsics::is_unit_enum(t, self.ground.view(), self.world).map_err(|e| match e {
+                    blaze_build::intrinsics::FieldCountError::MissingType => malformed("`blaze_is_unit_enum` of a type not in the ground table"),
+                    blaze_build::intrinsics::FieldCountError::NoAdt(item) => Stop::Refused(Refusal::Missing { what: "ADT definition", item }),
+                })?;
+                s(u128::from(yes))
+            }
+            Intrinsic::BlazeVariantCount => {
+                let t = t0.ok_or(malformed("`blaze_variant_count` with no type"))?;
+                let count = blaze_build::intrinsics::variant_count(t, self.ground.view(), self.world).map_err(|e| match e {
+                    blaze_build::intrinsics::FieldCountError::MissingType => malformed("`blaze_variant_count` of a type not in the ground table"),
+                    blaze_build::intrinsics::FieldCountError::NoAdt(item) => Stop::Refused(Refusal::Missing { what: "ADT definition", item }),
+                })?;
+                s(u128::from(count))
+            }
+            Intrinsic::BlazeVariantName => {
+                let t = t0.ok_or(malformed("`blaze_variant_name` with no type"))?;
+                let raw_idx = int(0)?;
+                let mut text = blaze_own::String::new_in(self.alloc);
+                if let Some(PNode::Adt(adt_key, _)) = self.ground.view().get(t).copied()
+                    && let Ok(v_idx) = u32::try_from(raw_idx)
+                {
+                    let adt = self
+                        .world
+                        .adt(adt_key)
+                        .ok_or(Stop::Refused(Refusal::Missing { what: "ADT definition", item: adt_key }))?;
+                    if adt.kind == blaze_typeck::AdtKind::Enum && usize::try_from(v_idx).is_ok_and(|ix| ix < adt.variants.len()) {
+                        let names = self
+                            .world
+                            .type_names()
+                            .ok_or(unsupported("`blaze_variant_name` in a world that names no items (`ConstWorld::type_names`)"))?;
+                        let _ = names.variant_name(adt_key, v_idx, &mut |s| text.push_str(s));
+                    }
+                }
+                let len = u64::try_from(text.len()).unwrap_or(0);
+                let id = self.work.mem.allocate(len, 0, true, Origin::Data)?;
+                if len > 0 {
+                    self.work.mem.fill(id, text.as_bytes(), &[])?;
+                }
+                self.work.mem.get_mut(id)?.mutable = false;
+                Ok(Val::pair(Scalar::Ptr(Pointer { alloc: id, offset: 0 }), Scalar::Int(u128::from(len))))
             }
             // `raw_eq::<T>(a, b)` ("Determines whether the raw bytes of the two values are
             // equal") and `compare_bytes(left, right, bytes)` ("Lexicographically compare ... as

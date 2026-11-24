@@ -50,6 +50,9 @@ pub enum Fill {
     /// A callee whose return signature contains `_` (`-> _`, `-> Option<_>`, `-> Result<T, _>`)
     /// and whose body must be checked first to infer its concrete return type.
     InferredOutput(ItemKey),
+    /// A `where const { COND }` condition (`cond`, ground-args digest) whose truth value must
+    /// be evaluated at the ground arguments queued in `Store::where_const_pending`.
+    ConstHolds(ItemKey, u64),
 }
 
 /// A question this front end cannot answer yet, by the item it is about.
@@ -437,7 +440,7 @@ impl<'w, 'n, S: NamesSource<'n>> BodyWorld<'w, 'n, S> {
         let made = match fill {
             Fill::Impls(trait_, shape, seen) => trait_question(self.names, &mut heads, b, trait_, shape, seen, BuildOrder::AsAsked),
             Fill::Inherent(shape, name) => inherent_question(self.names, &mut heads, b, shape, name, BuildOrder::AsAsked),
-            Fill::Store(_) | Fill::InferredOutput(_) => return self.fill(fill),
+            Fill::Store(_) | Fill::InferredOutput(_) | Fill::ConstHolds(..) => return self.fill(fill),
         };
         // Under the one ask, an import its question met refused is the question's gap.
         if let Some(refused) = self.store.asks.take_refused() {
@@ -1252,7 +1255,30 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
     }
 
     fn const_holds_once(&self, cond: ItemKey, args: &[PTy], types: PTys<'_>) -> Fetch<tc::ConstHolds> {
-        self.gap(Gap::BodyRecord(tc::Question::ConstHolds(cond, tc::ground_args_digest(args, types))))
+        let digest = tc::ground_args_digest(args, types);
+        if let Some(&ans) = self.store.where_const_answers.get(&(cond, digest)) {
+            return Ok(ans);
+        }
+        if self.store.maps.evaluating.get() > 0 {
+            return self.gap(Gap::BodyRecord(tc::Question::ConstHolds(cond, digest)));
+        }
+        let alloc = self.store.tys.alloc();
+        let mut req_tys = blaze_typeck::PortableTys::new_in(alloc);
+        let Ok(list) = super::const_at::copy_ground(types, args, &mut req_tys, alloc) else {
+            return self.gap(Gap::BodyRecord(tc::Question::ConstHolds(cond, digest)));
+        };
+        let Ok(slice) = req_tys.view().list(list) else {
+            return self.gap(Gap::BodyRecord(tc::Question::ConstHolds(cond, digest)));
+        };
+        let mut copied = blaze_own::Vec::with_capacity_in(slice.len(), alloc);
+        copied.extend_from_slice(slice);
+        {
+            let mut pending = self.store.where_const_pending.borrow_mut();
+            if !pending.iter().any(|p| p.cond == cond && p.digest == digest) {
+                pending.push(super::heads::PendingConstHolds { cond, digest, tys: req_tys, args: copied });
+            }
+        }
+        self.fill(Fill::ConstHolds(cond, digest))
     }
 
     /// The item's const generic parameters as its head made them (`Maps::const_params`: a

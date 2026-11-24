@@ -396,12 +396,14 @@ pub fn lang_item(l: Lang) -> LangItem {
         Lang::CallOnceFuture => LangItem::CallOnceFuture,
         Lang::CallRefFuture => LangItem::CallRefFuture,
         Lang::From => LangItem::From,
+        Lang::Enum => LangItem::Enum,
+        Lang::UnitEnum => LangItem::UnitEnum,
     }
 }
 
 /// The solver's lang item of typeck's, for the ones the solver knows.
 fn solver_lang(l: LangItem) -> Option<Lang> {
-    const ALL: [Lang; 36] = [
+    const ALL: [Lang; 38] = [
         Lang::Sized,
         Lang::MetaSized,
         Lang::PointeeSized,
@@ -438,6 +440,8 @@ fn solver_lang(l: LangItem) -> Option<Lang> {
         Lang::CallOnceFuture,
         Lang::CallRefFuture,
         Lang::From,
+        Lang::Enum,
+        Lang::UnitEnum,
     ];
     ALL.into_iter().find(|&s| lang_item(s) == l)
 }
@@ -1023,7 +1027,13 @@ impl<'a> FactCache<'a> {
         let wc = reads.predicates(k)?;
         let mut flags = match a.kind {
             AdtKind::Struct => AdtFlags::STRUCT,
-            AdtKind::Enum => AdtFlags::ENUM,
+            AdtKind::Enum => {
+                if a.variants.iter().all(|v| v.ctor == crate::world::CtorKind::Unit) {
+                    AdtFlags::ENUM | AdtFlags::UNIT_ENUM
+                } else {
+                    AdtFlags::ENUM
+                }
+            }
             AdtKind::Union => AdtFlags::UNION,
         };
         for (l, f) in [

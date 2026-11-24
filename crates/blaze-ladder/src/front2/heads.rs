@@ -2294,9 +2294,25 @@ pub struct ProvisionalImpl {
     pub waiting_const: LibKey,
 }
 
+/// A queued `where const { COND }` evaluation request captured by `BodyWorld::const_holds`
+/// while holding only `&Store`, drained by `check::eval_where_const` between check rounds.
+pub struct PendingConstHolds {
+    pub cond: ItemKey,
+    pub digest: u64,
+    pub tys: PortableTys<'static>,
+    pub args: blaze_own::Vec<PTy, Alloc<'static>>,
+}
+
 pub struct Store<'n> {
     pub tys: PortableTys<'static>,
     pub maps: Maps,
+    /// Evaluated `where const { COND }` condition answers, keyed by `(cond_item, ground_args_digest)`.
+    pub where_const_answers: Rows<(ItemKey, u64), tc::ConstHolds>,
+    /// Queued `where const { COND }` condition requests waiting to be evaluated between rounds.
+    pub(super) where_const_pending: core::cell::RefCell<blaze_own::Vec<PendingConstHolds, Alloc<'static>>>,
+    /// Maps a `PClause::Const` condition key loaded from a frozen `HeadRecord` back to its
+    /// owning item (`Want`) so its synthetic `FnHead` can be reconstructed on demand.
+    pub(super) where_const_owners: Rows<ItemKey, Want>,
     pub adts: Rows<ItemKey, AdtRow>,
     /// Each ADT's Blaze-edition automatic `Copy`/`Clone` eligibility (`AdtFlags::AUTO_COPY_PUB`),
     /// kept in a side table so `AdtRow` and `head_record::VERSION` stay untouched.
@@ -2793,6 +2809,9 @@ impl<'n> Store<'n> {
                 Err(error) => panic!("the heads store's type table over fresh columns was refused: {error:?}"),
             },
             maps: Maps::new_in(alloc),
+            where_const_answers: Rows::new_in(alloc),
+            where_const_pending: core::cell::RefCell::new(blaze_own::Vec::new_in(alloc)),
+            where_const_owners: Rows::new_in(alloc),
             adts: Rows::new_in(alloc),
             auto_copy_pub: Rows::new_in(alloc),
             adt_declarations: Rows::new_in(alloc),
@@ -2862,6 +2881,250 @@ impl<'n> Store<'n> {
     /// records carry it, form 9).
     pub fn member_frame(&self, ck: ItemKey) -> Option<&MemberFrame> {
         self.member_frames.get(&ck)
+    }
+
+    fn record_where_const_owners(&self, owner: Want, clauses: &[PClause]) {
+        for c in clauses {
+            if let PClause::Const { cond, .. } = *c {
+                self.where_const_owners.insert(cond, owner);
+            }
+        }
+    }
+
+    /// Lowers every `where const { COND }` collected in `preds.conds` into a `PClause::Const`
+    /// clause + synthetic `bool`-returning constant `FnHead` in `fns` so `World::const_holds`
+    /// can evaluate the condition at arbitrary ground generic arguments.
+    /// Takes individual store fields so callers can invoke it while a `Builder` borrows `self.maps`.
+    #[expect(clippy::too_many_arguments, reason = "owner item head context for synthetic const fn")]
+    fn file_where_consts(
+        tys: &mut PortableTys<'static>,
+        locals: &super::locals::Locals<'n>,
+        fns: &Rows<ItemKey, FnHead<'n>>,
+        preds_table: &Rows<ItemKey, Preds>,
+        owner_ck: ItemKey,
+        lib: LibKey,
+        module: LibKey,
+        v: &View<'_>,
+        env: &Env<'_>,
+        bounds: &[ParamBound],
+        total_generics: u32,
+        keys: &Keys,
+        preds: &mut Preds,
+    ) -> Result<(), Why> {
+        if preds.conds.is_empty() {
+            return Ok(());
+        }
+        let alloc = tys.alloc();
+        let bool_ty = intern(tys, PNode::Bool)?;
+        let args = params(tys, 0, total_generics, env.consts)?;
+        let conds = core::mem::take(&mut preds.conds);
+        let mut made: blaze_own::Vec<(ItemKey, &'n str), Alloc<'static>> = blaze_own::Vec::with_capacity_in(conds.len(), alloc);
+        for (k, &cond) in conds.iter().enumerate() {
+            let at = v.const_range(cond)?;
+            let r = v.site(at)?;
+            let written = v.text_at(at)?.trim();
+            let body_expr = match written.strip_prefix("const") {
+                Some(rest) => rest.trim_start(),
+                None => written,
+            };
+            let member_name = blaze_own::format_in!(alloc, "where const {k}");
+            let cond_key = keys
+                .member(owner_ck, MemberKind::Anon, member_name.as_str())
+                .map_err(|_| Why::Unsupported("duplicate `where const` condition key", r))?;
+            let decl = blaze_own::format_in!(alloc, "const _: bool = {body_expr};");
+            let text: &'n str = locals.keep_text(decl.as_str());
+            preds.push(PClause::Const { cond: cond_key, args }, super::heads_regions::Src::Derived);
+            made.push((cond_key, text));
+        }
+        for &(cond_key, text) in &made {
+            let mut cp = Preds::new_in(preds.scope.clone_in(alloc));
+            for &c in &preds.clauses {
+                if !matches!(c, PClause::Const { cond, .. } if cond == cond_key) {
+                    cp.push(c, super::heads_regions::Src::Derived);
+                }
+            }
+            preds_table.insert(cond_key, cp);
+            let mut row = FnHead {
+                lib,
+                text,
+                text_prefix: None,
+                container: None,
+                parent: 0,
+                own: total_generics,
+                declared: 0,
+                self_param: false,
+                header: tc::FnPtrHeader::RUST,
+                c_variadic: false,
+                qualifiers: FnQualifiers::CONST.note_lifetimes(text),
+                legacy_const_generics: Default::default(),
+                inputs: Default::default(),
+                output: bool_ty,
+                has_body: true,
+                module,
+                params: Default::default(),
+                consts: Default::default(),
+                bounds: Default::default(),
+                self_: env.self_,
+                self_assoc: Default::default(),
+            };
+            row.params.extend_from_slice(env.params);
+            row.consts.extend_from_slice(env.consts);
+            row.bounds.extend_from_slice(bounds);
+            row.self_assoc.extend_from_slice(env.self_assoc);
+            fns.insert(cond_key, row);
+        }
+        Ok(())
+    }
+
+    /// Reconstructs the synthetic `FnHead` + `Preds` for a `where const` condition key whose
+    /// owning item's head was imported from a frozen `HeadRecord` (which carries `PClause::Const`
+    /// in its predicates without duplicating the synthetic `const _: bool = ...;` fn head).
+    pub(super) fn ensure_where_const_head<S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, cond: ItemKey) -> Result<bool, HeadError> {
+        if self.fns.contains_key(&cond) {
+            return Ok(true);
+        }
+        let Some(&owner_want) = self.where_const_owners.get(&cond) else {
+            return Ok(false);
+        };
+        let alloc = self.tys.alloc();
+        let mut own_params: blaze_own::Vec<(Name, u32), Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+        let mut own_consts: blaze_own::Vec<(u32, PTy), Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+        let mut own_bounds: blaze_own::Vec<ParamBound, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+        let mut own_assoc: blaze_own::Vec<(Name, PTy), Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+        let mut clauses: blaze_own::Vec<PClause, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+        let (owner_ck, lib, module, text, total_generics, self_) = match owner_want {
+            Want::Impl(lib) => {
+                let ck = checker_of(lib);
+                let Some(it) = names.signature_text_of(lib) else { return Ok(false) };
+                let Some(frame) = self.member_frames.get(&ck) else { return Ok(false) };
+                let Some(imp) = self.impls.get(&ck) else { return Ok(false) };
+                let Some(p) = self.preds.get(&ck) else { return Ok(false) };
+                own_params.extend_from_slice(&frame.params);
+                own_consts.extend_from_slice(&frame.consts);
+                own_bounds.extend_from_slice(&frame.bounds);
+                own_assoc.extend_from_slice(&imp.assoc);
+                clauses.extend_from_slice(&p.clauses);
+                (ck, lib, frame.module, it.text, frame.generics, frame.self_)
+            }
+            Want::Fn(lib) => {
+                let ck = checker_of(lib);
+                let Some(f) = self.fns.get(&ck) else { return Ok(false) };
+                let Some(p) = self.preds.get(&ck) else { return Ok(false) };
+                own_params.extend_from_slice(&f.params);
+                own_consts.extend_from_slice(&f.consts);
+                own_bounds.extend_from_slice(&f.bounds);
+                own_assoc.extend_from_slice(&f.self_assoc);
+                clauses.extend_from_slice(&p.clauses);
+                (ck, lib, f.module, f.text, f.parent + f.own, f.self_)
+            }
+            Want::MemberFn(lib, fk) => {
+                let Some(f) = self.fns.get(&fk) else { return Ok(false) };
+                let Some(p) = self.preds.get(&fk) else { return Ok(false) };
+                own_params.extend_from_slice(&f.params);
+                own_consts.extend_from_slice(&f.consts);
+                own_bounds.extend_from_slice(&f.bounds);
+                own_assoc.extend_from_slice(&f.self_assoc);
+                clauses.extend_from_slice(&p.clauses);
+                (fk, lib, f.module, f.text, f.parent + f.own, f.self_)
+            }
+            Want::Adt(lib) => {
+                let ck = checker_of(lib);
+                let Some(it) = names.signature_text_of(lib) else { return Ok(false) };
+                let Some(module) = names.home_of(lib) else { return Ok(false) };
+                let Some(adt) = self.adts.get(&ck) else { return Ok(false) };
+                let Some(p) = self.preds.get(&ck) else { return Ok(false) };
+                if let Some(cs) = self.maps.const_params.get(&lib) {
+                    own_consts.extend_from_slice(cs);
+                }
+                clauses.extend_from_slice(&p.clauses);
+                let low = lower(names, lib, it.text).map_err(|_| HeadError::Item(lib, Why::Unsupported("lowering ADT for `where const`", Range::new(0, 0))))?;
+                let v = low.view();
+                let mut tmp_ps = Default::default();
+                param_names(&v, 0, &mut tmp_ps, Consts::Keep).map_err(|w| HeadError::Item(lib, w))?;
+                own_params.extend_from_slice(&tmp_ps);
+                let self_args = params(&mut self.tys, 0, adt.generics, &own_consts).map_err(|w| HeadError::Item(lib, w))?;
+                let self_ty = intern(&mut self.tys, PNode::Adt(ck, self_args)).map_err(|w| HeadError::Item(lib, w))?;
+                (ck, lib, module, it.text, adt.generics, SelfTy::Ty(self_ty, None))
+            }
+            Want::Members(lib) => {
+                let ck = checker_of(lib);
+                let Some(it) = names.signature_text_of(lib) else { return Ok(false) };
+                let Some(module) = names.home_of(lib) else { return Ok(false) };
+                let Some(tr) = self.maps.traits.get(&lib) else { return Ok(false) };
+                let Some(p) = self.preds.get(&ck) else { return Ok(false) };
+                if let Some(cs) = self.maps.const_params.get(&lib) {
+                    own_consts.extend_from_slice(cs);
+                }
+                clauses.extend_from_slice(&p.clauses);
+                let low = lower(names, lib, it.text).map_err(|_| HeadError::Item(lib, Why::Unsupported("lowering trait for `where const`", Range::new(0, 0))))?;
+                let v = low.view();
+                let mut tmp_ps = Default::default();
+                param_names(&v, 1, &mut tmp_ps, Consts::Keep).map_err(|w| HeadError::Item(lib, w))?;
+                own_params.extend_from_slice(&tmp_ps);
+                (ck, lib, module, it.text, tr.generics, SelfTy::Trait(lib))
+            }
+            Want::Head(_) => return Ok(false),
+        };
+        let low = lower(names, lib, text).map_err(|_| HeadError::Item(lib, Why::Unsupported("lowering owner for `where const`", Range::new(0, 0))))?;
+        let v = low.view();
+        let rows = v.rows(v.list(head::WHERE)).map_err(|b| HeadError::Item(lib, Why::from(b)))?;
+        let bool_ty = intern(&mut self.tys, PNode::Bool).map_err(|w| HeadError::Item(lib, w))?;
+        let mut k = 0usize;
+        for &n in rows {
+            let lf::WherePred::Const { cond: c } = lf::WherePred::decode(n).map_err(|b| HeadError::Item(lib, Why::from(b)))? else {
+                continue;
+            };
+            let at = v.const_range(c).map_err(|b| HeadError::Item(lib, Why::from(b)))?;
+            let written = v.text_at(at).map_err(|b| HeadError::Item(lib, Why::from(b)))?.trim();
+            let body_expr = match written.strip_prefix("const") {
+                Some(rest) => rest.trim_start(),
+                None => written,
+            };
+            let member_name = blaze_own::format_in!(alloc, "where const {k}");
+            let cond_key = keys.member(owner_ck, MemberKind::Anon, member_name.as_str()).map_err(HeadError::Key)?;
+            k += 1;
+            if self.fns.contains_key(&cond_key) {
+                continue;
+            }
+            let decl_buf = blaze_own::format_in!(alloc, "const _: bool = {body_expr};");
+            let decl: &'n str = self.locals.keep_text(decl_buf.as_str());
+            let mut cp = Preds::new_in(Scope::new_in(alloc));
+            for &cl in &clauses {
+                if !matches!(cl, PClause::Const { cond: x, .. } if x == cond_key) {
+                    cp.push(cl, super::heads_regions::Src::Derived);
+                }
+            }
+            self.preds.insert(cond_key, cp);
+            let mut row = FnHead {
+                lib,
+                text: decl,
+                text_prefix: None,
+                container: None,
+                parent: 0,
+                own: total_generics,
+                declared: 0,
+                self_param: false,
+                header: tc::FnPtrHeader::RUST,
+                c_variadic: false,
+                qualifiers: FnQualifiers::CONST.note_lifetimes(decl),
+                legacy_const_generics: Default::default(),
+                inputs: Default::default(),
+                output: bool_ty,
+                has_body: true,
+                module,
+                params: Default::default(),
+                consts: Default::default(),
+                bounds: Default::default(),
+                self_,
+                self_assoc: Default::default(),
+            };
+            row.params.extend_from_slice(&own_params);
+            row.consts.extend_from_slice(&own_consts);
+            row.bounds.extend_from_slice(&own_bounds);
+            row.self_assoc.extend_from_slice(&own_assoc);
+            self.fns.insert(cond_key, row);
+        }
+        Ok(self.fns.contains_key(&cond))
     }
 
     /// Whether ADT `item` is eligible for Blaze-edition automatic `Copy`/`Clone`
@@ -3390,7 +3653,10 @@ impl<'n> Store<'n> {
                         self.type_misses.insert(key, misses);
                     }
                     if let Some(p) = preds {
-                        self.preds.insert(key, blaze_own::Box::into_inner(p));
+                        let p = blaze_own::Box::into_inner(p);
+                        let owner = if head.container.is_some() { Want::MemberFn(head.lib, key) } else { Want::Fn(head.lib) };
+                        self.record_where_const_owners(owner, &p.clauses);
+                        self.preds.insert(key, p);
                     }
                     if let Some(m) = static_ {
                         self.statics.insert(key, m);
@@ -3425,7 +3691,9 @@ impl<'n> Store<'n> {
                     self.maps.const_params.insert(key, const_params.iter().copied().collect());
                     self.field_defaults.insert(ck, field_defaults.iter().copied().collect());
                     if let Some(p) = preds {
-                        self.preds.insert(ck, blaze_own::Box::into_inner(p));
+                        let p = blaze_own::Box::into_inner(p);
+                        self.record_where_const_owners(Want::Adt(key), &p.clauses);
+                        self.preds.insert(ck, p);
                     }
                     self.adts.insert(ck, row);
                 }
@@ -3531,7 +3799,9 @@ impl<'n> Store<'n> {
                         self.trait_defs.insert(ck, x);
                     }
                     if let Some(p) = preds {
-                        self.preds.insert(ck, blaze_own::Box::into_inner(p));
+                        let p = blaze_own::Box::into_inner(p);
+                        self.record_where_const_owners(Want::Members(key), &p.clauses);
+                        self.preds.insert(ck, p);
                     }
                     self.maps.const_params.insert(key, const_params.iter().copied().collect());
                     self.maps.traits.insert(key, head);
@@ -3566,7 +3836,9 @@ impl<'n> Store<'n> {
                         self.member_frames.insert(key, f);
                     }
                     if let Some(p) = preds {
-                        self.preds.insert(key, blaze_own::Box::into_inner(p));
+                        let p = blaze_own::Box::into_inner(p);
+                        self.record_where_const_owners(Want::Impl(lib), &p.clauses);
+                        self.preds.insert(key, p);
                     }
                     self.impls.insert(key, head);
                 }
@@ -4262,6 +4534,7 @@ impl<'n> Store<'n> {
         // the header's bounds with their associated item constraints, `where Self: ..`).
         let mut supertraits = Vec::new_in(Global);
         b.predicates_implying(&mut self.tys, &env, v, 1, Some(me), self.sized, &mut preds, &mut |c| supertraits.push(c))?;
+        Self::file_where_consts(&mut self.tys, &self.locals, &self.fns, &self.preds, ck, key, module, v, &env, &bounds, own + 1, keys, &mut preds)?;
         let mut inherited = Vec::with_capacity_in(preds.clauses.len() + 1, Global);
         inherited.push(PClause::Trait { trait_: ck, args: params(&mut self.tys, 0, own + 1, &cs)? });
         inherited.extend_from_slice(&preds.clauses);
@@ -4553,6 +4826,7 @@ impl<'n> Store<'n> {
                 let r = v.site(v.row_range(v.list(head::FIELDS).start + i as u32)?)?;
                 written.push((var.discriminant, r));
                 let name = v.name_text(var.name)?;
+                let name = name.strip_prefix("r#").unwrap_or(name);
                 let lk = lib_vs.and_then(|vs| vs.iter().find(|x| x.name == name)).map(|x| x.key);
                 let lk = lk.ok_or_else(|| Why::Program(format!("variant `{name}` is not in the names library").into_boxed_str(), r))?;
                 shapes.push((checker_of(lk), Name::of(name), ctor_of(var.shape), var.fields));
@@ -4615,6 +4889,7 @@ impl<'n> Store<'n> {
         let scope = Scope::item(v, None, 0, alloc).map_err(Why::Regions)?;
         let mut preds = Preds::new_in(scope.clone_in(alloc));
         b.predicates(&mut self.tys, &env, v, 0, None, self.sized, &mut preds)?;
+        Self::file_where_consts(&mut self.tys, &self.locals, &self.fns, &self.preds, ck, key, module, v, &env, &bounds, generics, keys, &mut preds)?;
         // D148: the ADT's regions (its own lifetimes, its clauses' columns, its fields'), filed
         // under its checker key ([`super::head_record::regions_key`]), plus a `HeadRegions::sig`
         // for each tuple struct / tuple variant constructor (`CtorSig`) so `FnDef` values like
@@ -5074,6 +5349,7 @@ impl<'n> Store<'n> {
         let env = Env { self_assoc: &assoc, ..env };
         let mut preds = Preds::new_in(scope.clone_in(alloc));
         b.predicates(&mut self.tys, &env, v, 0, None, self.sized, &mut preds)?;
+        Self::file_where_consts(&mut self.tys, &self.locals, &self.fns, &self.preds, ck, key, module, v, &env, &bounds, generics, keys, &mut preds)?;
         let mut consts = Vec::with_capacity_in(const_texts.len(), Global);
         let mut life_names = Vec::new_in(alloc);
         lifetime_names(v, &mut life_names)?;
@@ -5935,6 +6211,7 @@ impl<'n> Store<'n> {
         }
         b.predicates(&mut self.tys, &env, v, parent, None, self.sized, &mut preds)?;
         b.impl_bounds(&mut self.tys, &env, v, &anon[..params_end], self.sized, &mut preds)?;
+        Self::file_where_consts(&mut self.tys, &self.locals, &self.fns, &self.preds, key, lib, env.module, v, &env, &bounds, parent + own, keys, &mut preds)?;
         // The bounds' E0405s: one per bound path (the parameter-bound walk and the predicates
         // walk each meet it), in text order. One the words cannot be made for (a path not in
         // the fn's own text) stays the head's error, as before.
