@@ -598,7 +598,7 @@ pub fn make_entry_with_vtables<'a, 'd>(
 }
 
 /// Target [`blaze_tier::Machine`] for `blaze export` on `isa`: starts from `isa`'s baseline
-/// features (`LSE`, plus `DOTPROD` on `Os::MacOs`), and on macOS arm64 probes `sysctlbyname`
+/// features (`LSE`, plus `DOTPROD | CRC32` on `Os::MacOs`), and on macOS arm64 probes `sysctlbyname`
 /// (via safe `blaze_sys::macos::sysctl_u32`) for `FEAT_SME`, `FEAT_SME2`, `FEAT_CSSC`, and
 /// `FEAT_SHA3` so exported binaries use the host CPU's full native ISA.
 pub fn export_machine(isa: Isa) -> blaze_tier::Machine {
@@ -608,7 +608,7 @@ pub fn export_machine(isa: Isa) -> blaze_tier::Machine {
         Os::Linux => TierOs::Linux,
     };
     let mut features = (if isa.lse { Machine::LSE } else { 0 })
-        | (if isa.os == Os::MacOs { Machine::DOTPROD } else { 0 });
+        | (if isa.os == Os::MacOs { Machine::DOTPROD | Machine::CRC32 } else { 0 });
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if isa.os == Os::MacOs {
         const PROBES: [(&core::ffi::CStr, u64); 4] = [

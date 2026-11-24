@@ -14,7 +14,7 @@
 //!    (`Func`, `Static`, `Tls`, `Vtable`, and C externs) back to its originating body's reference
 //!    tables, binds soft-float routines at collision-free tail places, and emits each optimized
 //!    body into an ephemeral sealed `CodeRecord` via `emit_sota_record_for_machine` targeting the
-//!    probed host [`Machine`] (`export_machine`: `LSE | DOTPROD | SME | SME2 | CSSC | SHA3`).
+//!    probed host [`Machine`] (`export_machine`: `LSE | DOTPROD | CRC32 | SME | SME2 | CSSC | SHA3`).
 //! 4. Keeps host-specific LTO records strictly in the caller's export allocator — never writing
 //!    them back to portable `CodeStore` (Rule 25).
 
@@ -1191,7 +1191,7 @@ mod tests {
         Machine {
             arch: Arch::Arm64,
             os: TierOs::MacOs,
-            features: Machine::LSE | Machine::DOTPROD | Machine::SME | Machine::SME2,
+            features: Machine::LSE | Machine::DOTPROD | Machine::CRC32 | Machine::SME | Machine::SME2,
         }
     }
 
