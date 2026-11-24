@@ -258,18 +258,26 @@ impl<A: Allocator + Copy + 'static> PageModel<A> {
             world.set_copy(b_ent, SiteNodeKind::Block(u32::try_from(bi).unwrap_or(0)))?;
             world.relate::<ChildOf>(b_ent, root)?;
             if let Block::List { items } | Block::Soon { items, .. } = block {
-                // Iterative walk over nested items using explicit stack.
+                // Iterative walk over nested items in exact document order (push in reverse onto LIFO stack).
                 let mut stack: OwnVec<(usize, Entity), A> = OwnVec::new_in(alloc);
-                for &idx in items.as_slice() {
-                    stack.try_push((idx, b_ent)).map_err(|r| SiteError::Alloc(r.why))?;
+                let mut ri = items.len();
+                while ri > 0 {
+                    ri -= 1;
+                    if let Some(&idx) = items.get(ri) {
+                        stack.try_push((idx, b_ent)).map_err(|r| SiteError::Alloc(r.why))?;
+                    }
                 }
                 while let Some((item_idx, parent_ent)) = stack.pop() {
                     let it_ent = world.spawn()?;
                     world.set_copy(it_ent, SiteNodeKind::ListItem(u32::try_from(item_idx).unwrap_or(0)))?;
                     world.relate::<ChildOf>(it_ent, parent_ent)?;
                     if let Some(node) = self.items_arena.get(item_idx) {
-                        for &ch in node.children.as_slice() {
-                            stack.try_push((ch, it_ent)).map_err(|r| SiteError::Alloc(r.why))?;
+                        let mut ci = node.children.len();
+                        while ci > 0 {
+                            ci -= 1;
+                            if let Some(&ch) = node.children.get(ci) {
+                                stack.try_push((ch, it_ent)).map_err(|r| SiteError::Alloc(r.why))?;
+                            }
                         }
                     }
                 }

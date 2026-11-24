@@ -1784,7 +1784,14 @@ impl<'w, Q: QueryFetch, A: Allocator + Copy + 'static> TypedQuery<'w, Q, A> {
         Ok(self)
     }
 
-    /// Require entities carrying typed tag `T`.
+    /// Require entities carrying component `T` without fetching its data.
+    pub fn with_component<T: 'static>(mut self) -> Result<Self, EcsError> {
+        let cid = self.world.component::<T>()?;
+        self.spec = self.spec.with_component(cid)?;
+        Ok(self)
+    }
+
+    /// Require entities carrying typed tag `T` (supports both archetype & `DontFragment` tags).
     pub fn with_tag<T: 'static>(mut self) -> Result<Self, EcsError> {
         let tag = self.world.tag_entity::<T>()?;
         self.spec = self.spec.with_tag(tag)?;
@@ -1812,6 +1819,41 @@ impl<'w, Q: QueryFetch, A: Allocator + Copy + 'static> TypedQuery<'w, Q, A> {
         let wc = self.world.wildcard();
         self.spec = self.spec.with_pair(rel, wc)?;
         Ok(self)
+    }
+
+    /// Exclude entities carrying any target for typed relation `(R, *)`.
+    pub fn without_any_relation<R: Relation>(mut self) -> Result<Self, EcsError> {
+        if let Some(rel) = self.world.relation_entity_id::<R>() {
+            let wc = self.world.wildcard();
+            self.spec = self.spec.without_pair(rel, wc)?;
+        }
+        Ok(self)
+    }
+
+    /// Enable Flecs topological parent-before-child cascade ordering over relation `R` (e.g. `ChildOf`).
+    pub fn cascade<R: Relation>(mut self) -> Result<Self, EcsError> {
+        let rel = self.world.relation_entity::<R>()?;
+        self.spec = self.spec.cascade(rel);
+        Ok(self)
+    }
+
+    /// Freeze this typed query into an incrementally-synced [`super::query::CachedQuery`].
+    pub fn build_cached(self) -> Result<super::query::CachedQuery<A>, EcsError> {
+        let alloc = self.world.alloc();
+        let mut full = Q::build_spec(self.world, alloc)?;
+        for &term in self.spec.terms() {
+            match term {
+                super::query::QueryTerm::With(id) => full = full.with(id)?,
+                super::query::QueryTerm::Without(id) => full = full.without(id)?,
+            }
+        }
+        if let Some(rel) = self.spec.cascade_relation() {
+            full = full.cascade(rel);
+        }
+        if self.spec.includes_prefabs() {
+            full = full.include_prefabs(true);
+        }
+        Ok(super::query::CachedQuery::new(full, alloc))
     }
 
     /// Include `PREFAB`-tagged entities in results (excluded by default).

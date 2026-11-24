@@ -12,6 +12,7 @@
 #![blaze::sans_io]
 
 pub mod error;
+pub mod html;
 pub mod layout;
 pub mod model;
 pub mod palette;
@@ -23,6 +24,7 @@ mod tests;
 
 pub use blaze_ui::slug_shader::{SiteInst, SiteUniform, emit_slug_site_msl, emit_slug_site_wgsl};
 pub use error::SiteError;
+pub use html::project_ecs_html;
 pub use layout::{CharBox, CharRange, PageLayout, Pic, PlacedGlyph, Shape, ShapeKind, TipLayout, Viewport};
 pub use model::{Block, ChipKind, ItemNode, Link, PageModel, SiteEcsHandles, SiteFocused, SiteHovered, SiteNodeKind, SitePressed};
 pub use palette::{ImageName, RoleName, SiteTheme, Token};
