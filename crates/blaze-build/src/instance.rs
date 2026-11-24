@@ -384,6 +384,48 @@ pub fn reify_shim_key_args(target: Instance, ground: &mut PortableTys<'_>, scrat
     ground.intern_list(&all).map_err(full)
 }
 
+/// Synthetic item key naming the by-value `self` vtable shim of a trait method dispatched
+/// through a trait object (`FnOnce::call_once` on `Box<dyn FnOnce<Args>>`):
+/// `Instance { item: VTABLE_SHIM_ITEM, args: [PNode::FnDef(target.item, target.args)] }`.
+///
+/// The shim takes `(data_ptr: *mut Self, args..)` where `data_ptr` points to the concrete
+/// receiver in memory (e.g. a `Box`'s heap allocation), reads/moves the concrete `Self` out by
+/// value according to its Rust ABI, and calls `target` directly.
+pub const VTABLE_SHIM_ITEM: ItemKey = ItemKey(u128::from_be_bytes(*b"blaze-build vts1"));
+
+/// The `VTableShim` instance wrapping concrete by-value callee `callee`:
+/// `Instance { item: VTABLE_SHIM_ITEM, args: [PNode::FnDef(callee.item, callee.args)] }`.
+pub fn vtable_shim_instance(callee: Instance, ground: &mut PortableTys<'_>) -> Result<Instance, BuildError> {
+    let full = |_| BuildError::Malformed { what: "the ground table is full" };
+    let fn_ty = ground.intern(PNode::FnDef(callee.item, callee.args)).map_err(full)?;
+    let args = ground.intern_list(&[fn_ty]).map_err(full)?;
+    Ok(Instance { item: VTABLE_SHIM_ITEM, args })
+}
+
+/// If `instance` is a `VTableShim` (`item == VTABLE_SHIM_ITEM`, `args == [FnDef(target, args)]`),
+/// returns the underlying concrete callee `Instance`.
+pub fn vtable_shim_of(instance: Instance, ground: PTys<'_>) -> Option<Instance> {
+    if instance.item != VTABLE_SHIM_ITEM {
+        return None;
+    }
+    let &[fn_ty] = ground.list(instance.args).ok()? else { return None };
+    let PNode::FnDef(item, args) = ground.node(fn_ty).ok()? else { return None };
+    Some(Instance { item, args })
+}
+
+/// The list a `VTableShim` for `target` is keyed by over its tabled owner's code identity:
+/// `VTABLE_SHIM_ITEM` as a `FnDef`, `target.item` as a `FnDef`, then `target.args`. Distinct
+/// from the owner's own list, any `FnShim`, any `ReifyShim`, and any closure method list.
+pub fn vtable_shim_key_args(target: Instance, ground: &mut PortableTys<'_>, scratch: Alloc<'_>) -> Result<List, BuildError> {
+    let malformed = |_| BuildError::Malformed { what: "a vtable shim's target arguments past the ground table" };
+    let full = |_| BuildError::Malformed { what: "the ground table is full" };
+    let mut all: Vec<PTy, Alloc<'_>> = Vec::new_in(scratch);
+    all.push(ground.intern(PNode::FnDef(VTABLE_SHIM_ITEM, List::EMPTY)).map_err(full)?);
+    all.push(ground.intern(PNode::FnDef(target.item, List::EMPTY)).map_err(full)?);
+    all.extend_from_slice(ground.view().list(target.args).map_err(malformed)?);
+    ground.intern_list(&all).map_err(full)
+}
+
 /// The one function every type lowered at an instance passes through (signatures, locals,
 /// fields, casts, a callee's signature): `ty` of table `from`, in `ground` with `Param(i)`
 /// replaced by `args[i]` (`args` are types of `ground`), every projection then normalized by

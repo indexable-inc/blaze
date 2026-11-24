@@ -32,7 +32,7 @@ use blaze_typeck::{CtorKind, Def, Expr, ExprId, ItemKey, Mutbl, PNode, PortableT
 use super::super::{Tables, run_native_vt};
 use super::{World, build, dyn_ty, world};
 use crate::Intrinsic;
-use crate::vtable::ObjectMethod;
+use crate::vtable::{MethodDispatch, ObjectMethod};
 
 /// The added items: `Nest`, the trait `Get`, its method and its impl fn for `u128`.
 struct Added {
@@ -64,7 +64,7 @@ fn world_nested_dyn() -> (World, Added) {
     let transmute = fx.func("transmute", 2, &[p0], p1, Vec::new());
     fx.finish();
     w.intrinsics.push((transmute, Intrinsic::Table(crate::intrinsics::Which::Transmute)));
-    w.traits.push((get_tr, StdVec::new(), std::vec![ObjectMethod { item: get, dispatch: true }]));
+    w.traits.push((get_tr, StdVec::new(), std::vec![ObjectMethod { item: get, dispatch: MethodDispatch::Direct }]));
     (w, Added { nest, get_tr, get, get_u128 })
 }
 

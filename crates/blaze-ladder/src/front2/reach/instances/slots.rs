@@ -37,8 +37,8 @@
 
 use super::{Box, Coerced, Global, HashMap, ItemKey, Met, PNode, Records, Shape, Vec, supertrait_closure, tc};
 use crate::front2::heads::Want;
-use crate::front2::keys::Origin;
-use crate::front2::program::dispatchable;
+use crate::front2::keys::{Origin, checker_of};
+use crate::front2::program::method_dispatch;
 
 /// How a trait fn was met (a bit of `Met::how`, beside `AT_INSTANCE`, `AT_OBJECT` and
 /// `BY_BUILDER`): a slot of a table some coercion makes. Asked at the shapes coerced to a
@@ -158,9 +158,11 @@ fn slots_of(r: &mut Records<'_, '_>, principal: ItemKey) -> Vec<Slot, Global> {
             continue;
         }
         let Some(head) = r.store.maps.traits.get(&lib) else { continue };
+        let allow_by_value_self = r.index.lang("fn_once").is_some_and(|l| checker_of(l) == t)
+            || r.index.lang("async_fn_once").is_some_and(|l| checker_of(l) == t);
         for m in head.members.iter() {
             let tc::dyn_compat::MemberShape::Fn(facts) = &m.shape else { continue };
-            if !dispatchable(m, facts) {
+            if method_dispatch(m, facts, allow_by_value_self) == blaze_build::vtable::MethodDispatch::None {
                 continue;
             }
             let Some(&(_, f)) = head.fns.iter().find(|(n, _)| *n == m.name) else { continue };

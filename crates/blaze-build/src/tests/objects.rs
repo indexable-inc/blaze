@@ -12,7 +12,7 @@ use blaze_typeck::{Adt, ExprId, InferCtx, ItemKey, LangItem, Mutbl, Needs, Outco
 
 use super::{Tables, run_native_vt};
 use crate::layout::{LayoutFacts, Missing, ReprAttrs, ValidRange};
-use crate::vtable::{ObjectMethod, ObjectSuper, ObjectTrait};
+use crate::vtable::{MethodDispatch, ObjectMethod, ObjectSuper, ObjectTrait};
 use crate::{Abi, Adts, Built, Intrinsic, Subst};
 
 mod boxed_slice;
@@ -112,7 +112,7 @@ fn world_with(field: BoxField) -> World {
     let main_us = fx.func("main_us", 0, &[], usize_, Vec::new());
     let boxes = boxes(&mut fx, p0, u64_, &mut impls, field);
     fx.finish();
-    let method = |item| ObjectMethod { item, dispatch: true };
+    let method = |item| ObjectMethod { item, dispatch: MethodDispatch::Direct };
     let traits = std::vec![
         (tr, StdVec::new(), std::vec![method(m)]),
         (sub, std::vec![ObjectSuper::plain(tr)], std::vec![method(n)]),
@@ -830,7 +830,7 @@ fn a_trait_edit_rekeys_exactly_the_callers_whose_slot_moved() {
     let edit = |at_end: bool| {
         let mut w = world();
         let methods = &mut w.traits.iter_mut().find(|(k, _, _)| *k == tr).expect("Tr").2;
-        let new = ObjectMethod { item: e, dispatch: true };
+        let new = ObjectMethod { item: e, dispatch: MethodDispatch::Direct };
         if at_end { methods.push(new) } else { methods.insert(0, new) }
         w
     };
@@ -886,7 +886,7 @@ fn a_trait_method_added_rebuilds_tables_and_only_callers_of_moved_slots() {
     let (tr, e) = (w.tr, w.boxes.get);
     let edit = |w: &mut World, at_end: bool| {
         let methods = &mut w.traits.iter_mut().find(|(k, _, _)| *k == tr).expect("Tr").2;
-        let new = ObjectMethod { item: e, dispatch: true };
+        let new = ObjectMethod { item: e, dispatch: MethodDispatch::Direct };
         if at_end { methods.push(new) } else { methods.insert(0, new) }
     };
     edit(&mut w, true);
@@ -925,7 +925,7 @@ fn a_slotless_method_on_an_object_is_refused_not_called_directly() {
         let tr = w.tr;
         let obj = if obj == "tr" { w.tr } else { w.sub };
         for m in w.traits.iter_mut().find(|(k, _, _)| *k == tr).expect("Tr").2.iter_mut() {
-            m.dispatch = false;
+            m.dispatch = MethodDispatch::None;
         }
         let mut b = Bb::new();
         let x = b.bind("x");

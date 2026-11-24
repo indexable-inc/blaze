@@ -179,6 +179,10 @@ enum Do {
     Visit(Node),
     Begin(Block),
     Jump(Block),
+    /// The `dyn` contents of a `Box` of type `g` at `place` (wide pointer at `off`), dropped via
+    /// `dyn_glue` only if `bit` of `mask` is still set (otherwise moved out, e.g. `Box<dyn
+    /// FnOnce>::call_once`), with `BoxFree` owed on unwind when `free` is true.
+    BoxDyn { g: PTy, place: (Value, i32), off: i32, bit: u32, free: bool },
     /// The `Box` of type `g` at `place`, its contents visited: its allocation freed alone.
     BoxFree { g: PTy, place: (Value, i32) },
 }
@@ -633,6 +637,28 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 Do::Begin(b) => self.begin(b),
                 Do::Jump(b) => self.jump(b, &[]),
                 Do::Visit(n) => self.drop_node(n, at, mask, switch_bits && n.depth == 0, ps, &mut todo)?,
+                Do::BoxDyn { g, place, off, bit, free } => {
+                    let fa = self.b.slot_addr(mask);
+                    let word = self.b.load(Ty::I64, Flags::NONE, fa, 0, MemAttrs::aligned(3));
+                    let one = self.b.iconst(Ty::I64, 1u128 << bit);
+                    let held = self.b.binary(Op::And, Flags::NONE, word, one);
+                    let zero = self.b.iconst(Ty::I64, 0);
+                    let set = self.b.icmp(IntCond::Ne, held, zero);
+                    let yes = self.create();
+                    let skip = self.create();
+                    self.br(set, (yes, &[]), (skip, &[]));
+                    self.begin(yes);
+                    let data = self.b.load(Ty::PTR, Flags::NONE, place.0, place.1 + off, MemAttrs::aligned(3));
+                    let vt = self.b.load(Ty::PTR, Flags::NONE, place.0, place.1 + off + 8, MemAttrs::aligned(3));
+                    if free {
+                        let p = self.address(place);
+                        self.drop_owing(super::unwind_ladder::DropStep::DynGlue { data, vt }, super::unwind_ladder::DropStep::BoxFree { g, p })?;
+                    } else {
+                        self.dyn_glue(data, vt)?;
+                    }
+                    self.jump(skip, &[]);
+                    self.begin(skip);
+                }
                 Do::BoxFree { g, place } => {
                     let p = self.address(place);
                     self.drop_box_free(g, p)?;

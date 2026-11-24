@@ -75,6 +75,8 @@ pub(super) enum DropStep {
     Parts { l: u32, p: Value },
     /// The contents of the `Box` at `p` (`list` its arguments): walk.rs `drop_box_contents`.
     BoxContents { list: List, p: Value },
+    /// The trait object at `data` whose table is `vt`: walk.rs `dyn_glue`.
+    DynGlue { data: Value, vt: Value },
     /// The `Box` of ground type `g` at `p` without its contents: its `Drop` (the free), then its
     /// own fields (walk/moves/boxes.rs `drop_box_free`).
     BoxFree { g: PTy, p: Value },
@@ -135,7 +137,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
 
     /// Performs `step` with `after` owed on its unwind path (and not performed here): one
     /// step of a loop whose remaining iterations are `after`.
-    fn drop_owing(&mut self, step: DropStep, after: DropStep) -> Result<(), BuildError> {
+    pub(super) fn drop_owing(&mut self, step: DropStep, after: DropStep) -> Result<(), BuildError> {
         if !self.ladder_applies() {
             return self.perform(step, false);
         }
@@ -162,6 +164,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             DropStep::Impl { instance, p } => self.call_ptr(instance, p),
             DropStep::Parts { l, p } => self.drop_parts(l as usize, p),
             DropStep::BoxContents { list, p } => self.drop_box_contents(list, p),
+            DropStep::DynGlue { data, vt } => self.dyn_glue(data, vt),
             DropStep::BoxFree { g, p } => self.drop_box_free(g, p),
             DropStep::Elements { elem, data, from, len, stride } => self.elements(elem, data, from, len, stride),
             DropStep::Frame { below } => {
@@ -226,6 +229,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 DropStep::Field { .. }
                 | DropStep::Impl { .. }
                 | DropStep::BoxContents { .. }
+                | DropStep::DynGlue { .. }
                 | DropStep::BoxFree { .. }
                 | DropStep::Elements { .. } => true,
             };
