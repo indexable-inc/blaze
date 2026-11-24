@@ -846,10 +846,16 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 S::Make(t, nkids) => {
                     let start = done.len() - nkids;
                     let mut args = None;
-                    let made = self.make(tys, env, v, t, &done[start..], &mut args)?;
-                    if let Some(s) = sink.as_deref_mut() {
-                        self.regions_made(tys, env, v, t, made, &done[start..], args.as_deref().unwrap_or(&[]), s)?;
-                    }
+                    let made = if matches!(v.ty(t)?, lf::TypeRef::Macro(_)) {
+                        let r = place(v, v.type_range(t))?;
+                        self.macro_ty(tys, env, v, t, r, sink.as_deref_mut())?
+                    } else {
+                        let made = self.make(tys, env, v, t, &done[start..], &mut args)?;
+                        if let Some(s) = sink.as_deref_mut() {
+                            self.regions_made(tys, env, v, t, made, &done[start..], args.as_deref().unwrap_or(&[]), s)?;
+                        }
+                        made
+                    };
                     done.truncate(start);
                     done.push(made);
                 }
@@ -1538,7 +1544,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 let l = intern_list(tys, &l)?;
                 intern(tys, PNode::FnPtr(l, tc::FnPtrHeader { abi, safety, c_variadic: variadic }))
             }
-            lf::TypeRef::Macro(_) => self.macro_ty(tys, env, v, t, r),
+            lf::TypeRef::Macro(_) => self.macro_ty(tys, env, v, t, r, None),
             lf::TypeRef::Pat { pat, .. } => self.pat_ty(tys, env, v, kids[0], pat, r),
             // `for<'a> fn(&'a T)`: the binder's lifetimes are erased ([`super::preds::lifetimes_only`],
             // checked where `children` lists the inner type), so the type is its inner type.
@@ -3012,6 +3018,38 @@ impl<'s> RegionSink<'s> {
 
     pub fn self_regions(&self) -> Option<&[Region]> {
         self.self_slots.as_deref()
+    }
+
+    /// Snapshot of slot, elided-site and refusal state before walking a type macro's expansion.
+    pub(super) fn mark_expansion(&self) -> (usize, usize, bool) {
+        (self.slots.len(), self.elided.len(), self.refused.is_some())
+    }
+
+    /// Rewrites ranges recorded while walking a type macro's expansion (which are relative to
+    /// the expanded text) to the macro call's range `at` in the enclosing item.
+    pub(super) fn remap_expansion_ranges(&mut self, mark: (usize, usize, bool), at: Range) {
+        let (slots_from, elided_from, had_refused) = mark;
+        for slot in self.slots.get_mut(slots_from..).into_iter().flatten() {
+            match &mut slot.kind {
+                SlotKind::Named(_, r) | SlotKind::ObjectDefault(r) => *r = at,
+                _ => {}
+            }
+        }
+        for r in self.elided.get_mut(elided_from..).into_iter().flatten() {
+            *r = at;
+        }
+        if !had_refused
+            && let Some(why) = &mut self.refused
+        {
+            match why {
+                RegionRefusal::Undeclared { at: r }
+                | RegionRefusal::LifetimeArgs { at: r, .. }
+                | RegionRefusal::ObjectDefault { at: r }
+                | RegionRefusal::NotLaid { at: r, .. }
+                | RegionRefusal::NoType { at: r } => *r = at,
+                RegionRefusal::Regions(_) | RegionRefusal::NoContainer { .. } => {}
+            }
+        }
     }
 
     /// The impl's trait reference's column for the types made next, in the numbering `Self`'s

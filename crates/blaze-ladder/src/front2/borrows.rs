@@ -3530,13 +3530,25 @@ macro_rules! byte {
     };
 }
 
-fn m(x: &u8, _y: byte!()) -> &u8 {
+fn m_macro(x: &u8, _y: byte!()) -> &u8 {
+    x
+}
+
+fn calls_macro_type() {
+    let a = 1u8;
+    let r = m_macro(&a, 2);
+    let _ = *r;
+}
+
+struct Def<T = &'static u8>(T);
+
+fn m(x: &u8, _y: Def) -> &u8 {
     x
 }
 
 fn calls_soft_refused() {
     let a = 1u8;
-    let r = m(&a, 2);
+    let r = m(&a, Def(&0));
     let _ = *r;
 }
 
@@ -3642,6 +3654,12 @@ fn main() {}
         std::println!("h: {h_text}");
         assert!(h_text.contains("E0106"), "h's own check reports its E0106: {h_text}");
 
+        // A callee whose signature contains a type macro (`m_macro` takes `byte!()`) has its
+        // expanded type's regions laid and its calls borrow-checked cleanly.
+        let (types, mac) = world.check_borrows(body("calls_macro_type"), alloc);
+        assert!(types.is_clean(), "calls_macro_type is typed: {types:?}");
+        assert!(mac.is_clean(), "calls_macro_type is clean: {mac:?}");
+
         // A head whose regions alone were refused: typed, and the call refused by its name.
         let (types, soft) = world.check_borrows(body("calls_soft_refused"), alloc);
         std::println!("calls_soft_refused: {types:?} {soft:?}");
@@ -3654,16 +3672,16 @@ fn main() {}
                 assert!(matches!(why, blaze_typeck::region_facts::UnreadWhy::Refused { .. }), "calls_soft_refused: why: {why:?}");
                 let named = item.and_then(|lib| names.item_text(lib)).and_then(|t| t.name);
                 assert_eq!(named, Some("m"), "calls_soft_refused names the callee");
-                // By its typed cause and part: `m`'s input 1 is `byte!()`, a type macro's
-                // expansion the region walk does not lay; the class is printed first and short
-                // (blaze-cli `first_refusal_class` keeps up to the first `] `).
+                // By its typed cause and part: `m`'s input 1 is `Def`, whose defaulted argument
+                // carries a lifetime the region walk does not lay; the class is printed first and
+                // short (blaze-cli `first_refusal_class` keeps up to the first `] `).
                 use crate::front2::head_record::Unlaid;
                 use crate::front2::types::{NotLaidWhy, SigPart};
-                assert_eq!(unlaid, Some(Unlaid::NotLaid { why: NotLaidWhy::TypeMacro, part: SigPart::Input(1) }), "calls_soft_refused: the typed kind");
+                assert_eq!(unlaid, Some(Unlaid::NotLaid { why: NotLaidWhy::DefaultArg, part: SigPart::Input(1) }), "calls_soft_refused: the typed kind");
                 let mut said = super::Words::EMPTY;
                 core::fmt::Write::write_fmt(&mut said, format_args!("{refused}")).unwrap();
                 let said = said.as_str();
-                assert!(said.starts_with("[NotLaid/TypeMacro/Input] "), "calls_soft_refused: the class is not first: {said}");
+                assert!(said.starts_with("[NotLaid/DefaultArg/Input] "), "calls_soft_refused: the class is not first: {said}");
                 assert!(said.contains("input 1"), "calls_soft_refused: the input is not named: {said}");
                 // CONTROL (rule 23): the same refusal with no typed kind prints the old class,
                 // so the bracket above is the kind's, not the text's.

@@ -334,13 +334,12 @@ pub fn facts<A: Allocator + Copy>(flow: &Flow<A>, alloc: A) -> Result<Facts<A>, 
         if matches!(flow.stmt(stmt).kind, StmtKind::Activate(_)) {
             has_activate = true;
         }
-        if split_drop
-            && let StmtKind::Drop(p) = flow.stmt(stmt).kind
+        if let StmtKind::Drop(p) = flow.stmt(stmt).kind
             && init.drop_may_run(flow, stmt, p)
         {
             drop_uses.push((s, flow.place(p).local));
         }
-        let def = uses_and_def(flow, &init, stmt, !split_drop, |l| uses_data.push(l));
+        let def = uses_and_def(flow, &init, stmt, false, |l| uses_data.push(l));
         defs.push(def);
         uses_off.push(uses_data.len() as u32);
     }
@@ -457,18 +456,23 @@ pub fn facts<A: Allocator + Copy>(flow: &Flow<A>, alloc: A) -> Result<Facts<A>, 
             }
         }
     }
-    // Optional second backward liveness pass for drop-only uses when some local origins are
-    // non-dropping (`flow.local_no_drop_origins`): only drop-live origins of `local(p)` become
-    // live along paths reaching `StmtKind::Drop(p)`.
-    let mut drop_in = if split_drop && !drop_uses.is_empty() && o > 0 { Some(Bits::new_in(n, locals, alloc)) } else { None };
+    // Second backward liveness pass for drop-only uses: a local is drop-live along paths reaching
+    // `StmtKind::Drop(p)` ONLY where the local may be initialized (RFC 2094, "liveness"), so a
+    // conditional move in one branch of an `if`/`else` does not leak drop-liveness back from the
+    // join block's `Drop(p)`. When `split_drop` is set, only drop-live origins of `local(p)` are
+    // marked live from `drop_in`/`drop_out`.
+    let mut drop_in = if !drop_uses.is_empty() && o > 0 { Some(Bits::new_in(n, locals, alloc)) } else { None };
     let mut drop_out = if drop_in.is_some() { Some(Bits::new_in(n, locals, alloc)) } else { None };
     if let (Some(d_in), Some(d_out)) = (&mut drop_in, &mut drop_out) {
+        let (maybe_init_in, maybe_init_out) = init.local_maybe_init(flow, alloc);
         for &(s, l) in &drop_uses {
             d_in.set(s, l.index());
             for &pred in preds.row(s) {
-                let p = pred as usize;
-                if bits::union_into(d_out.row_mut(p), d_in.row(s)) {
-                    worklist.push(post_rank[p] as usize);
+                let p = usize::try_from(pred).unwrap_or(0);
+                if maybe_init_out.get(p, l.index()) && d_out.set(p, l.index()) {
+                    if let Some(&pr) = post_rank.get(p) {
+                        worklist.push(usize::try_from(pr).unwrap_or(0));
+                    }
                 }
             }
         }
@@ -478,16 +482,34 @@ pub fn facts<A: Allocator + Copy>(flow: &Flow<A>, alloc: A) -> Result<Facts<A>, 
             if dpops > limit {
                 return Err(Bound::Passes { what: "drop liveness passes", limit });
             }
-            let s = postorder[rank] as usize;
+            let s = postorder.get(rank).copied().and_then(|v| usize::try_from(v).ok()).unwrap_or(0);
             scratch_l.copy_from_slice(d_out.row(s));
-            if let Some(d) = defs[s] {
+            if let Some(d) = defs.get(s).copied().flatten() {
                 bits::put(&mut scratch_l, d.index(), false);
+            }
+            for (dst, &mask) in scratch_l.iter_mut().zip(maybe_init_in.row(s).iter()) {
+                *dst &= mask;
             }
             if bits::union_into(d_in.row_mut(s), &scratch_l) {
                 for &pred in preds.row(s) {
-                    let p = pred as usize;
-                    if bits::union_into(d_out.row_mut(p), d_in.row(s)) {
-                        worklist.push(post_rank[p] as usize);
+                    let p = usize::try_from(pred).unwrap_or(0);
+                    let mut grew = false;
+                    for ((dst, &src), &mask) in d_out
+                        .row_mut(p)
+                        .iter_mut()
+                        .zip(d_in.row(s).iter())
+                        .zip(maybe_init_out.row(p).iter())
+                    {
+                        let next = *dst | (src & mask);
+                        if next != *dst {
+                            *dst = next;
+                            grew = true;
+                        }
+                    }
+                    if grew {
+                        if let Some(&pr) = post_rank.get(p) {
+                            worklist.push(usize::try_from(pr).unwrap_or(0));
+                        }
                     }
                 }
             }
@@ -563,27 +585,34 @@ pub fn facts<A: Allocator + Copy>(flow: &Flow<A>, alloc: A) -> Result<Facts<A>, 
             }
         }
         if let (Some(d_in), Some(d_out)) = (&drop_in, &drop_out) {
-            let mut drop_pairs: Vec<(usize, Origin), A> = Vec::new_in(alloc);
-            for &(l, origin) in &flow.local_origins {
-                if flow.local_no_drop_origins.binary_search(&(l, origin)).is_err() {
-                    drop_pairs.push((l.index(), origin));
+            let mut drop_origins_owned = None;
+            let mut local_has_drop_owned = None;
+            if split_drop {
+                let mut drop_pairs: Vec<(usize, Origin), A> = Vec::new_in(alloc);
+                for &(l, origin) in &flow.local_origins {
+                    if flow.local_no_drop_origins.binary_search(&(l, origin)).is_err() {
+                        drop_pairs.push((l.index(), origin));
+                    }
                 }
-            }
-            let drop_origins_by_local = Csr::from_iter(locals, drop_pairs.iter().copied(), alloc);
-            let mut local_has_drop_origin = Vec::with_capacity_in(lw, alloc);
-            local_has_drop_origin.resize(lw, 0u64);
-            for l in 0..locals {
-                if !drop_origins_by_local.row(l).is_empty() {
-                    bits::put(&mut local_has_drop_origin, l, true);
+                let csr = Csr::from_iter(locals, drop_pairs.iter().copied(), alloc);
+                let mut has = Vec::with_capacity_in(lw, alloc);
+                has.resize(lw, 0u64);
+                for l in 0..locals {
+                    if !csr.row(l).is_empty() {
+                        bits::put(&mut has, l, true);
+                    }
                 }
+                drop_origins_owned = Some(csr);
+                local_has_drop_owned = Some(has);
             }
+            let drop_origins_by_local = drop_origins_owned.as_ref().unwrap_or(&origins_by_local);
+            let local_has_drop_origin = local_has_drop_owned.as_deref().unwrap_or(&local_has_origin);
             for s in 0..n {
                 let start_p = 2 * s;
                 let mid_p = 2 * s + 1;
                 let in_row = d_in.row(s);
                 let out_row = d_out.row(s);
-                for w in 0..lw {
-                    let mask = local_has_drop_origin[w];
+                for (w, &mask) in local_has_drop_origin.iter().enumerate() {
                     if mask == 0 {
                         continue;
                     }
@@ -591,7 +620,7 @@ pub fn facts<A: Allocator + Copy>(flow: &Flow<A>, alloc: A) -> Result<Facts<A>, 
                     let base = w * 64;
                     let mut b = in_w & mask;
                     while b != 0 {
-                        let local = base + b.trailing_zeros() as usize;
+                        let local = base + usize::try_from(b.trailing_zeros()).unwrap_or(0);
                         b &= b - 1;
                         for &origin in drop_origins_by_local.row(local) {
                             let oi = origin.index();
@@ -601,7 +630,7 @@ pub fn facts<A: Allocator + Copy>(flow: &Flow<A>, alloc: A) -> Result<Facts<A>, 
                     }
                     let mut b = (out_row[w] & !in_w) & mask;
                     while b != 0 {
-                        let local = base + b.trailing_zeros() as usize;
+                        let local = base + usize::try_from(b.trailing_zeros()).unwrap_or(0);
                         b &= b - 1;
                         for &origin in drop_origins_by_local.row(local) {
                             live.set(mid_p, origin.index());
@@ -795,7 +824,8 @@ pub fn loan_parts<A: Allocator + Copy>(
                     break;
                 }
                 let mut used = false;
-                let drop_live = flow.local_no_drop_origins.binary_search(&(local, origin)).is_err();
+                let drop_live = flow.local_no_drop_origins.binary_search(&(local, origin)).is_err()
+                    && facts.init.drop_may_run(flow, s, flow.local_place(local));
                 let def = uses_and_def(flow, &facts.init, t, drop_live, |l| used |= l == local);
                 if used {
                     if best.is_none_or(|(bd, bs, _)| (d, t) < (bd, bs)) {

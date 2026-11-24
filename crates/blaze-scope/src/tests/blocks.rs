@@ -632,3 +632,52 @@ fn a_weak_lang_item_declared_in_two_bodies_is_no_lang_row() {
     assert_eq!(langs.iter().filter(|l| **l == "panic").count(), 1, "a fn's own `#[lang]` is a row: {langs:?}");
     std::println!("BLOCK weak lang uses: lang rows {langs:?}");
 }
+
+/// `assert!(cond, msg..)` expands to `if !(cond) { $crate::panic::panic_2021!(msg..) }`, whose
+/// block holds a macro call: the names library must expand it and file its expansion block module
+/// so `front2`'s `scope_table::build` finds the block scope when resolving paths inside `msg`.
+/// Plain `assert!(cond)` without `,` expands to `if !(cond) { $crate::panicking::panic(..) }`
+/// (no call in the block) and needs no expansion block module.
+const BUILTIN_ASSERT_BLOCKS: &str = "#![no_core]
+#![feature(no_core, rustc_attrs, decl_macro)]
+pub mod panicking {
+    pub fn panic(_msg: &str) -> ! { loop {} }
+    pub fn panic_fmt(_a: ()) -> ! { loop {} }
+}
+pub mod panic {
+    pub macro panic_2021 {
+        ($($t:tt)+) => ({ $crate::panicking::panic_fmt($crate::const_format_args!($($t)+)); }),
+    }
+}
+#[rustc_builtin_macro]
+macro_rules! const_format_args { ($($t:tt)*) => {{}}; }
+#[rustc_builtin_macro]
+macro_rules! assert { ($($t:tt)*) => {{}}; }
+
+pub const K: u32 = 7;
+pub fn with_msg(x: u32) {
+    assert!(x > K, \"got {}\", K);
+}
+pub fn without_msg(x: u32) {
+    assert!(x > K);
+}
+";
+
+static BUILTIN_ASSERT_BLOCKS_TEXTS: Texts = Texts(&[&[("/user/lib.rs", BUILTIN_ASSERT_BLOCKS)]]);
+
+#[test]
+fn builtin_assert_with_message_files_its_expansion_block_modules() {
+    let crates = [input("user", "/user/lib.rs", &[])];
+    let names = resolved(&crates, &BUILTIN_ASSERT_BLOCKS_TEXTS);
+    let expansion_blocks = names
+        .krate(0)
+        .made
+        .values()
+        .filter(|m| m.info.name.is_some_and(|n| n.starts_with(crate::expanded_blocks::EXPANSION_BLOCK)))
+        .count();
+    // `with_msg`'s `assert!(x > K, ..)` writes two nested expansion block modules:
+    // 1. `assert!`'s `if !(..) { $crate::panic::panic_2021!(..) }`
+    // 2. `panic_2021!`'s `{ $crate::panicking::panic_fmt($crate::const_format_args!(..)); }`
+    // `without_msg`'s `assert!(x > K)` writes none.
+    assert_eq!(expansion_blocks, 2, "expected 2 expansion block modules for `assert!` with message");
+}
