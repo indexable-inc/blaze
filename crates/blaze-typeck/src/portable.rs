@@ -1764,6 +1764,41 @@ impl<'a> OwnTys<'a> {
         self.nodes.len()
     }
 
+    /// Copies the kept own columns into `alloc`.
+    pub fn clone_in<'b>(&self, alloc: Alloc<'b>) -> OwnTys<'b> {
+        let mut nodes = Vec::with_capacity_in(self.nodes.len(), alloc);
+        nodes.extend_from_slice(&self.nodes);
+        let mut lists = Vec::with_capacity_in(self.lists.len(), alloc);
+        lists.extend_from_slice(&self.lists);
+        let mut record_schemas = Vec::with_capacity_in(self.record_schemas.len(), alloc);
+        record_schemas.extend_from_slice(&self.record_schemas);
+        let mut record_names = Vec::with_capacity_in(self.record_names.len(), alloc);
+        record_names.extend_from_slice(&self.record_names);
+        OwnTys {
+            base_nodes: self.base_nodes,
+            base_lists: self.base_lists,
+            base_record_schemas: self.base_record_schemas,
+            base_record_names: self.base_record_names,
+            nodes,
+            lists,
+            record_schemas,
+            record_names,
+            whole: self.whole,
+        }
+    }
+
+    /// Appends one node to this body's table (`base` directly when `whole`, else this overlay's
+    /// own nodes). Used when patching a body's deferred anonymous constant arguments.
+    pub fn push_node(&mut self, base: &mut PortableTys<'_>, node: PNode) -> Result<PTy, CheckError> {
+        if self.whole {
+            return base.intern(node);
+        }
+        let own = u32::try_from(self.nodes.len()).map_err(|_| CheckError::Limit(crate::error::Limit::Table))?;
+        let id = self.base_nodes.checked_add(own).ok_or(CheckError::Limit(crate::error::Limit::Table))?;
+        self.nodes.push(node);
+        Ok(PTy(id))
+    }
+
     /// The body's table: `base`'s first nodes and list entries as they were when the body
     /// began, then the body's own. Refused (`Malformed::Overlay`) when `base` is shorter than
     /// that or is itself an overlay.

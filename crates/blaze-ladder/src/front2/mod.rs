@@ -23,6 +23,7 @@ pub mod expansion_origin;
 pub mod block_traits;
 pub mod block_type_uses;
 pub mod body;
+mod body_const_gaps;
 pub mod body_host;
 pub mod body_scopes;
 #[cfg(test)]

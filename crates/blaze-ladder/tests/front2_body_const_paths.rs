@@ -408,3 +408,232 @@ pub extern \"C\" fn main() -> i32 {
     assert!(rows.is_empty(), "every instance builds: {rows:?}");
     assert!(counts.built >= 5, "`main`, `zeros` at 2, 3 and 12, `bytes` and `from_be_bytes` at 12 built: {} of {}", counts.built, counts.tried);
 }
+
+/// Method calls and anchored associated fns with unsuffixed anonymous const arguments
+/// (`reader.read::<{ 256 / 8 }>()`, `<U12>::from_be_bytes::<{ 24 / 2 }>(b)`, `s.tag::<{ 256 / 8 }>()`,
+/// `s.neg::<{ -4 }>()`): `to_typeck` does not know the callee's const parameter type yet, so
+/// `check_body` learns it from the resolved callee, evaluates the constant at that declared
+/// type, and re-checks with the real `ConstValue`.
+#[test]
+fn a_method_call_const_arg_with_unsuffixed_expr() {
+    const TEXT: &str = "
+struct Reader;
+impl Reader {
+    pub const fn read<const N: usize>(self) -> [u8; N] {
+        [0u8; N]
+    }
+    pub const fn tag<const N: u8>(&self) -> u8 {
+        N
+    }
+    pub const fn neg<const N: i8>(&self) -> i8 {
+        N
+    }
+}
+
+fn method_ok() -> [u8; 32] {
+    let r = Reader;
+    r.read::<{ 256 / 8 }>()
+}
+
+fn method_wrong() -> [u8; 31] {
+    let r = Reader;
+    r.read::<{ 256 / 8 }>()
+}
+
+fn method_unconstrained() {
+    let r = Reader;
+    let _ = r.read::<{ 256 / 8 }>();
+}
+
+fn method_u8_and_neg_i8() -> (u8, i8) {
+    let r = Reader;
+    (r.tag::<{ 256 / 8 }>(), r.neg::<{ -4 }>())
+}
+
+fn anchored_expr(b: [u8; 12]) -> [u8; 12] {
+    <U12>::from_be_bytes::<{ 24 / 2 }>(b)
+}
+
+fn anchored_expr_wrong(b: [u8; 12]) -> [u8; 13] {
+    <U12>::from_be_bytes::<{ 24 / 2 }>(b)
+}
+";
+    expect(
+        "method const arg",
+        &check_fns(
+            TEXT,
+            &["method_ok", "method_wrong", "method_unconstrained", "method_u8_and_neg_i8", "anchored_expr", "anchored_expr_wrong"],
+        ),
+        &[true, false, true, true, true, false],
+    );
+}
+
+/// The `keccak_const` / `tempo_precompiles::tip20::ISSUER_ROLE` shape: a `const` item calls
+/// a macro-expanded `const fn finalize(&self) -> [u8; { 256 / 8 }]` whose body calls
+/// `reader.read::<{ 256 / 8 }>()`. Evaluating `ROLE` inside `Consts::value` checks `finalize`
+/// while `r.consts` is `None` (`evaluating > 0`), so the deferred anonymous constant must
+/// unwind via `const_nested_fail` to `Consts::value_listed` and evaluate cleanly.
+#[test]
+fn a_const_item_calling_const_fn_with_method_const_arg_evaluates() {
+    const TEXT: &str = "
+struct Reader;
+impl Reader {
+    pub const fn read<const N: usize>(self) -> (Self, [u8; N]) {
+        (self, [7u8; N])
+    }
+}
+
+macro_rules! mk_hasher {
+    ($name:ident, $security:literal) => {
+        pub struct $name;
+        impl $name {
+            pub const fn new() -> Self { $name }
+            pub const fn finalize(&self) -> [u8; { $security / 8 }] {
+                let reader = Reader;
+                let (_, output) = reader.read::<{ $security / 8 }>();
+                output
+            }
+        }
+    };
+}
+
+mk_hasher!(Keccak256, 256);
+
+pub const ROLE: [u8; 32] = Keccak256::new().finalize();
+
+fn use_role() -> [u8; 32] {
+    ROLE
+}
+";
+    expect("const item method arg", &check_fns(TEXT, &["use_role"]), &[true]);
+    // Also evaluate `ROLE` directly through `Consts::value` (the exact `ISSUER_ROLE` path).
+    let heap = blaze_own::testing::heap();
+    let alloc = heap.alloc();
+    let program = format!("{PRELUDE}{TEXT}");
+    let files = [SourceFile { path: "src/main.rs", text: &program }];
+    let tc = Toolchain::none(alloc);
+    let new = NewFront { package: "ladder", edition: "2024", shelf: None, overflow: blaze_build::OverflowChecks::On };
+    let texts = ProgramTexts::new(&files, "src/main.rs", new, &tc, blaze_build::Panic::Unwind).unwrap();
+    let user = texts.user();
+    let inputs = Inputs::new(&user, &tc).unwrap();
+    let crates = inputs.crates();
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap();
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).unwrap();
+    let mut front = Front2::new(&names, &frame, &files, alloc).unwrap();
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
+    let mut store = Store::new(front.index.lang("sized"), front.frame, alloc);
+    let (mut buckets, mut consts) = (None, Consts::default());
+    let found = names::path(&names, names.root(0), Namespace::Values, Written { kind: PathKind::Plain, segments: &["ROLE"] }, alloc).unwrap();
+    let k = found.whole(1).unwrap().key;
+    store.ensure(&names, &mut front.keys, Want::Fn(k)).unwrap();
+    let mut records = Records { names: &names, keys: &mut front.keys, index: &front.index, store: &mut store, buckets: &mut buckets, order: BuildOrder::AsAsked, consts: None };
+    let rec = consts.value(&mut records, prepared, checker_of(k)).unwrap_or_else(|e| panic!("evaluating ROLE failed: {e}"));
+    assert_eq!(rec.data.allocs[0].bytes.as_slice(), &[7u8; 32], "ROLE must evaluate to [7u8; 32]");
+}
+
+/// The `evm2::interpreter::dispatch::make_selector_tables` shape: a written type in a
+/// macro-expanded generic `const fn` names a generic associated type with const arguments on
+/// a type parameter (`F::Config<{ crate::SpecId::FRONTIER as u32 }, CUSTOM_SPEC_ID>`), as
+/// well as qualified (`<F as Selector<T>>::Config<...>`, `<F>::Config<...>`) and `Self`
+/// (`Self::Config<...>`) forms.
+#[test]
+fn a_gat_const_arg_on_a_type_param_self_or_qualified_type_lowers() {
+    const TEXT: &str = "
+#[repr(u32)]
+pub enum SpecId {
+    Frontier = 0,
+    Homestead = 1,
+}
+
+pub trait Config<T> {
+    const CODE: u32;
+}
+
+pub trait Selector<T> {
+    type Config<const BASE: u32, const CUSTOM: u32>: Config<T>;
+}
+
+pub struct BaseConfig<const BASE: u32, const CUSTOM: u32>;
+impl<T, const BASE: u32, const CUSTOM: u32> Config<T> for BaseConfig<BASE, CUSTOM> {
+    const CODE: u32 = BASE;
+}
+
+pub struct BaseSelector;
+impl<T> Selector<T> for BaseSelector {
+    type Config<const BASE: u32, const CUSTOM: u32> = BaseConfig<BASE, CUSTOM>;
+}
+
+impl BaseSelector {
+    pub const fn self_check<const CUSTOM: u32>() -> u32 {
+        make_entry::<(), <Self as Selector<()>>::Config<{ crate::SpecId::Homestead as u32 }, CUSTOM>>()
+    }
+}
+
+pub const fn make_entry<T, C: Config<T>>() -> u32 {
+    C::CODE
+}
+
+pub const fn make_selector_tables<T, F, const CUSTOM: u32>() -> [u32; 2]
+where
+    F: Selector<T>,
+{
+    macro_rules! expand_specs {
+        ($($spec:ident),*) => {
+            [$(make_entry::<T, F::Config<{ crate::SpecId::$spec as u32 }, CUSTOM>>()),*]
+        };
+    }
+    expand_specs!(Frontier, Homestead)
+}
+
+pub const fn qualified_forms<T, F, const CUSTOM: u32>() -> [u32; 2]
+where
+    F: Selector<T>,
+{
+    [
+        make_entry::<T, <F as Selector<T>>::Config<{ crate::SpecId::Frontier as u32 }, CUSTOM>>(),
+        make_entry::<T, <F>::Config<{ crate::SpecId::Homestead as u32 }, CUSTOM>>(),
+    ]
+}
+
+pub const TABLES: [u32; 2] = make_selector_tables::<(), BaseSelector, 13>();
+
+fn check_tables() -> [u32; 2] {
+    TABLES
+}
+
+fn check_qualified() -> [u32; 2] {
+    qualified_forms::<(), BaseSelector, 13>()
+}
+
+fn check_self_form() -> u32 {
+    BaseSelector::self_check::<13>()
+}
+";
+    expect("gat const arg", &check_fns(TEXT, &["make_selector_tables", "qualified_forms", "check_tables", "check_qualified", "check_self_form"]), &[true, true, true, true, true]);
+    // Also evaluate `TABLES` via `Consts::value` to verify end-to-end consteval.
+    let heap = blaze_own::testing::heap();
+    let alloc = heap.alloc();
+    let program = format!("{PRELUDE}{TEXT}");
+    let files = [SourceFile { path: "src/main.rs", text: &program }];
+    let tc = Toolchain::none(alloc);
+    let new = NewFront { package: "ladder", edition: "2024", shelf: None, overflow: blaze_build::OverflowChecks::On };
+    let texts = ProgramTexts::new(&files, "src/main.rs", new, &tc, blaze_build::Panic::Unwind).unwrap();
+    let user = texts.user();
+    let inputs = Inputs::new(&user, &tc).unwrap();
+    let crates = inputs.crates();
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap();
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).unwrap();
+    let mut front = Front2::new(&names, &frame, &files, alloc).unwrap();
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
+    let mut store = Store::new(front.index.lang("sized"), front.frame, alloc);
+    let (mut buckets, mut consts) = (None, Consts::default());
+    let found = names::path(&names, names.root(0), Namespace::Values, Written { kind: PathKind::Plain, segments: &["TABLES"] }, alloc).unwrap();
+    let k = found.whole(1).unwrap().key;
+    store.ensure(&names, &mut front.keys, Want::Fn(k)).unwrap();
+    let mut records = Records { names: &names, keys: &mut front.keys, index: &front.index, store: &mut store, buckets: &mut buckets, order: BuildOrder::AsAsked, consts: None };
+    let rec = consts.value(&mut records, prepared, checker_of(k)).unwrap_or_else(|e| panic!("evaluating TABLES failed: {e}"));
+    let mut want = [0u8; 8];
+    want[0..4].copy_from_slice(&0u32.to_ne_bytes());
+    want[4..8].copy_from_slice(&1u32.to_ne_bytes());
+    assert_eq!(rec.data.allocs[0].bytes.as_slice(), &want, "TABLES must evaluate to [0u32, 1u32]");
+}

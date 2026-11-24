@@ -1069,7 +1069,7 @@ fn gat_segment(view: &View<'_>, at: ArgAt) -> Result<Option<(blaze_typeck::PathI
 /// The words of the constant expression `text` that may be names: each run of identifier
 /// bytes not starting with a digit (a number's digits and suffix are one token, never an
 /// identifier). A word inside a string literal is one too: a superset, never short of a name.
-fn identifiers(text: &str) -> impl Iterator<Item = &str> {
+pub(super) fn identifiers(text: &str) -> impl Iterator<Item = &str> {
     let bytes = text.as_bytes();
     let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80;
     let mut i = 0;
