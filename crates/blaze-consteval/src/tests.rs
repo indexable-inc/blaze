@@ -19,6 +19,7 @@ mod closure_fn_ptr;
 mod dst_tail;
 mod fn_fact;
 mod needs_drop;
+mod read_via_copy;
 mod records_unions;
 mod transmute_unchecked;
 mod type_id;

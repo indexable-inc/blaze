@@ -40,7 +40,7 @@ blaze-code	139
 blaze-columns	2
 blaze-comptime-sys	150
 blaze-cond	13
-blaze-consteval	359
+blaze-consteval	357
 blaze-core	755
 blaze-cunit	62
 blaze-data	1
@@ -55,7 +55,7 @@ blaze-export	411
 blaze-facts	12
 blaze-fetch	185
 blaze-file-items	94
-blaze-flow	142
+blaze-flow	135
 blaze-flow-lower	429
 blaze-fmt	62
 blaze-format	44

@@ -698,7 +698,7 @@ impl Refusal<'_> {
 
 impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Machine<'w, 'l, 'g, 't, 'wk, 'a, W, L, K> {
     /// The code of `item` at ground arguments `args`: the unit's, or compiled now.
-    pub(super) fn code<A: Allocator + Copy>(&mut self, codes: &mut CodeTable<A>, item: ItemKey, args: List) -> R<'a, u32> {
+    pub(super) fn code<A: Allocator + Copy>(&mut self, codes: &mut CodeTable<A>, item: ItemKey, args: List, param_tys: &[PTy]) -> R<'a, u32> {
         let old = codes.by.get(&(item, args)).copied();
         if let Some(i) = old {
             let c = &codes.list[i as usize];
@@ -774,7 +774,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
                 restart: None,
             };
             cc.homes.resize(typed.body.pats.len(), Home::None);
-            self.body(&mut cc, &mut code)?;
+            self.body(&mut cc, &mut code, param_tys)?;
             let restart = cc.restart;
             drop(cc);
             match restart {
@@ -808,29 +808,51 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
         })
     }
 
+    /// When `cand` peels through one or more `PNode::Ref` layers down to `peeled`, returns `cand`
+    /// (the unpeeled type for default-binding-mode patterns like `fn f(Label(a, b): &Label)` or
+    /// `let Label(a, b) = &label;`, where `typeck` records `pat_ty` at the peeled type);
+    /// otherwise returns `peeled`.
+    fn unpeeled_ref_ty(&self, cand: PTy, peeled: PTy) -> R<'a, PTy> {
+        let mut cur = cand;
+        for _ in 0..64 {
+            if cur == peeled {
+                return Ok(cand);
+            }
+            match self.node(cur)? {
+                PNode::Ref(_, inner) => cur = inner,
+                _ => break,
+            }
+        }
+        Ok(peeled)
+    }
+
     /// Compiles the whole body: the parameters' bindings, then its expression, then `Ret`.
-    fn body<A: Allocator + Clone>(&mut self, cc: &mut Cc<'w, '_>, code: &mut Code<A>) -> R<'a, ()> {
+    fn body<A: Allocator + Clone>(&mut self, cc: &mut Cc<'w, '_>, code: &mut Code<A>, param_tys: &[PTy]) -> R<'a, ()> {
         let typed = cc.typed;
         let body = typed.body;
         // The arguments arrive in registers 0..n.
         for _ in body.params.iter() {
             self.reg(cc, Kind::V);
         }
-        for (i, &pat) in body.params.iter().enumerate() {
-            let i = i as u32;
-            let t = match self.cg(cc, *typed.pat_ty.get(pat.ix()).ok_or(malformed("a pattern with no type"))?) {
+        for (ix, &pat) in body.params.iter().enumerate() {
+            let i = ix as u32;
+            let t_pat = match self.cg(cc, *typed.pat_ty.get(pat.ix()).ok_or(malformed("a pattern with no type"))?) {
                 Ok(t) => t,
                 Err(s) => {
                     self.late(code, cc, s);
                     continue;
                 }
             };
+            let t = match param_tys.get(ix).copied() {
+                Some(arg_ty) => self.unpeeled_ref_ty(arg_ty, t_pat)?,
+                None => t_pat,
+            };
             if let Pat::Bind { ann: blaze_typeck::BindAnn { by_ref: None, .. }, sub: None, .. } = body.pats[pat.ix()]
                 && self.union_pat_c(cc, pat).is_none()
             {
                 if self.reg_home(cc, pat, t)? {
                     cc.homes[pat.ix()] = Home::Reg(i);
-                    cc.kinds[i as usize] = Kind::Local(pat);
+                    cc.kinds[ix] = Kind::Local(pat);
                     continue;
                 }
             }
@@ -2078,11 +2100,13 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
                 cc.rs.push(t.dst);
             }
             C::Let { s, e } => {
-                let Stmt::Let { pat, else_, .. } = body.stmts.get(s.ix()).copied().ok_or(malformed("a statement past the body"))? else {
+                let Stmt::Let { pat, init: Some(init_expr), else_, .. } = body.stmts.get(s.ix()).copied().ok_or(malformed("a statement past the body"))? else {
                     return Err(malformed("a let task"));
                 };
                 let init = self.pop_r(cc)?;
-                let t = self.cg(cc, *typed.pat_ty.get(pat.ix()).ok_or(malformed("a pattern with no type"))?)?;
+                let t_pat = self.cg(cc, *typed.pat_ty.get(pat.ix()).ok_or(malformed("a pattern with no type"))?)?;
+                let init_ty = self.final_ty_c(cc, init_expr)?;
+                let t = self.unpeeled_ref_ty(init_ty, t_pat)?;
                 if cc.kinds[init as usize] != Kind::P {
                     // A plain binding kept in a register.
                     let Home::Reg(r) = self.home(cc, &mut code.slots, pat)? else { return Err(malformed("a value for a binding in memory")) };

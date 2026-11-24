@@ -106,6 +106,46 @@ fn vec_iter(v: &Vec<(&'static str, u8)>) -> usize {
     }
     n
 }
+
+// evm2's `ExecutionConfig<T>` -> `InstrTable<T>` -> `RawInstrFn<T> = extern_table!(fn(..))`
+// wrapped inside `Evm<'a, T>`: a type alias expanding through a type macro to a fn pointer with
+// elided lifetimes must lay its regions so both `ExecCfg<T>` and `WrapEvm<'a, T>` compute sound
+// variances rather than failing with `[Unified/VarianceUnknown]`.
+macro_rules! extern_table {
+    (fn($($args:tt)*) -> $ret:ty) => {
+        extern \"C\" fn($($args)*) -> $ret
+    };
+}
+
+struct State<'f, T>(&'f mut T);
+type RawInstrFn<T> = extern_table!(fn(state: &mut State<'_, T>) -> u8);
+type InstrTable<T> = [RawInstrFn<T>; 4];
+
+struct ExecCfg<T> {
+    instructions: &'static InstrTable<T>,
+}
+
+struct WrapEvm<'a, T> {
+    cfg: ExecCfg<T>,
+    data: &'a u8,
+}
+
+fn evm_co<'a, 'b: 'a, T>(e: WrapEvm<'b, T>) -> WrapEvm<'a, T> {
+    e
+}
+
+fn evm_bad<'a, 'b: 'a, T>(e: WrapEvm<'a, T>) -> WrapEvm<'b, T> {
+    e
+}
+
+// `assert!(cond, \".. {K} ..\", arg)` expands to `if !(cond) { $crate::panic::panic_2021!(..) }`,
+// whose block holds a macro call: the names library must file that expansion block module so
+// resolving `K` or `String::from` inside the format args never hits a missing block scope gap.
+const LIMIT: u64 = 100;
+
+fn assert_with_const_path(x: u64) {
+    assert!(x > LIMIT, \"expected > {LIMIT}, got {}\", String::from(\"low\"));
+}
 ";
 
 fn shown(item: &str, v: &BorrowVerdict<'_>) -> String {
@@ -195,4 +235,11 @@ fn variance_of_every_adt_parameter() {
     // The sampler's case: `slice::Iter<'_, (&'static str, u8)>` covariant in `T`.
     let (ok, _, _, line) = check("vec_iter", FactsPlant::None);
     assert!(ok, "vec_iter: {line}");
+    // evm2's `Evm<'a, T>` -> `ExecutionConfig<T>` -> `InstrTable<T>` -> `RawInstrFn<T>` through
+    // a type macro `extern_table!(fn(..))`: covariant in `'a`, never `VarianceUnknown`.
+    clean(&mut check, "evm_co");
+    error(&mut check, "evm_bad");
+    // `assert!(cond, ".. {LIMIT} ..", String::from(..))` in a body: expansion block filed cleanly.
+    let (ok, _, _, line) = check("assert_with_const_path", FactsPlant::None);
+    assert!(ok, "assert_with_const_path: {line}");
 }

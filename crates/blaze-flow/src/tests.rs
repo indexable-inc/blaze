@@ -1353,3 +1353,65 @@ fn a_borrow_behind_shared_ref_deref_does_not_conflict_with_prefix_mut_borrow() {
         "CONTROL: expected Invalidated for &mut-ref deref, got {findings:?}"
     );
 }
+
+/// A local holding a drop-live borrow (`let guard = &mut x`) moved on one branch of an `if`/`else`
+/// and left alive on the other has a conditional `Drop(guard)` at the join block. Drop-liveness
+/// from that join `Drop(guard)` must NOT leak backward into the branch where `guard` was already
+/// moved, so re-borrowing `&mut x` after moving `guard` in that branch is accepted (RFC 2094).
+/// NEGATIVE CONTROL (rule 23): when `guard` is NOT moved in the `else` branch, `Drop(guard)` runs
+/// on that branch too and re-borrowing `&mut x` MUST be rejected (`Invalidated`).
+#[test]
+fn conditional_move_does_not_leak_drop_liveness_across_join() {
+    let run = |move_in_else: bool| {
+        // _0 return, _1 cond, _2 x, _3 guard (holds drop-live borrow of x), _4 moved_out, _5 x2
+        let mut b = FlowBuilder::new_in(6, 2, Global);
+        let bb_entry = b.block();
+        let bb_then = b.block();
+        let bb_else = b.block();
+        let bb_join = b.block();
+
+        let cond = Place(1);
+        let x = Place(2);
+        let guard = Place(3);
+        let moved_out = Place(4);
+        let x2 = Place(5);
+        let o_guard = b.origin(false);
+        let o_x2 = b.origin(false);
+        b.mentions(3, o_guard);
+        b.mentions(5, o_x2);
+
+        b.start(bb_entry);
+        let _l1 = b.borrow(guard, BorrowKind::Mut, x, o_guard, S);
+        b.switch(cond, &[bb_then, bb_else], S);
+
+        b.start(bb_then);
+        b.goto(bb_join, S);
+
+        b.start(bb_else);
+        if move_in_else {
+            b.assign(moved_out, Operand::Move(guard), S);
+        }
+        let _l2 = b.borrow(x2, BorrowKind::Mut, x, o_x2, S);
+        b.goto(bb_join, S);
+
+        b.start(bb_join);
+        b.stmt(StmtKind::Drop(guard), S);
+        b.ret(S);
+
+        let flow = finish(b);
+        tiers(&flow)
+    };
+
+    let (_t1, ok_findings) = run(true);
+    assert!(
+        ok_findings.is_empty(),
+        "moving guard in else branch must not leak drop-liveness from join Drop(guard); got {ok_findings:?}"
+    );
+
+    let (t1, bad_findings) = run(false);
+    assert_eq!(t1, TierOne::Refused, "CONTROL: unmoved guard in else branch must refuse tier one");
+    assert!(
+        bad_findings.iter().any(|f| matches!(*f, BorrowFinding::Invalidated { .. })),
+        "CONTROL: without moving guard in else branch, join Drop(guard) must conflict with &mut x; got {bad_findings:?}"
+    );
+}

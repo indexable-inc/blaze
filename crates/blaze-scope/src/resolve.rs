@@ -3616,7 +3616,16 @@ fn expand_call<'a, S: SourceTexts<'a>>(
         let def_may = match mac.body {
             MacroBody::Rules(rules) => Some(run.prepares.may_declare(def_key, &[rules])),
             MacroBody::Macro2 { params, body } => Some(run.prepares.may_declare(def_key, &[params.unwrap_or(""), body])),
-            MacroBody::BuiltinFn(name) => Some(matches!(name, "include" | "global_asm")),
+            MacroBody::BuiltinFn(name) => Some(match BuiltinFn::of_library(name) {
+                Some(BuiltinFn::Include | BuiltinFn::GlobalAsm) => true,
+                // `assert!(cond, msg..)` expands to `if !(cond) { $crate::panic::panic_2021!(msg..) }`,
+                // whose block holds a macro call; `assert!(cond)` without `,` writes no call in its block.
+                Some(BuiltinFn::Assert) => src.input.contains(','),
+                // Non-empty `panic!(..)` / `unreachable!(..)` expand via `panic_2021!` /
+                // `unreachable_2021!` to a block holding `const_format_args!` / `format_args!`.
+                Some(BuiltinFn::Panic | BuiltinFn::Unreachable) => !src.input.trim().is_empty(),
+                _ => false,
+            }),
             MacroBody::BuiltinDerive { .. } | MacroBody::BuiltinOther(_) | MacroBody::Proc { .. } => None,
         };
         if def_may == Some(false) && !blaze_file_items::nested::may_declare(src.input) {

@@ -690,7 +690,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
     // ---- The evaluation ----
 
     fn evaluate<A: Allocator + Copy>(&mut self, codes: &mut CodeTable<A>, item: ItemKey, args: List) -> R<'a, ConstRecord<Alloc<'a>>> {
-        let ci = self.code(codes, item, args)?;
+        let ci = self.code(codes, item, args, &[])?;
         let (code_id, ret) = {
             let c = &codes.list[ci as usize];
             (c.code_id, c.ret)
@@ -1322,19 +1322,31 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
     /// A `const fn` call: the callee's code (compiled when first called), its frame, its
     /// arguments in its first registers.
     fn call<A: Allocator + Copy>(&mut self, codes: &mut CodeTable<A>, f: Frame, dst: Reg, k: u32) -> R<'a, ()> {
-        let (item, args, link) = {
+        let (item, args, link, regs) = {
             let c = &codes.list[f.code as usize].calls[k as usize];
-            (c.item, c.args, c.link.get())
+            (c.item, c.args, c.link.get(), c.regs)
         };
         let ci = if link != u32::MAX && codes.list[link as usize].complete {
             link
         } else {
-            let ci = self.code(codes, item, args)?;
+            let reg_start = usize::try_from(regs.0).map_err(|_| malformed("a call's argument register past usize"))?;
+            let reg_len = usize::try_from(regs.1).map_err(|_| malformed("a call's argument count past usize"))?;
+            let reg_end = reg_start.checked_add(reg_len).ok_or(malformed("a call's argument register overflow"))?;
+            let code_idx = usize::try_from(f.code).map_err(|_| malformed("a frame's code index past usize"))?;
+            let arg_regs = codes
+                .list
+                .get(code_idx)
+                .and_then(|c| c.regs_of.get(reg_start..reg_end))
+                .ok_or(malformed("a call's argument registers past its code"))?;
+            let mut param_tys: Vec<PTy, Alloc<'a>> = Vec::with_capacity_in(reg_len, self.alloc);
+            for &(_, t) in arg_regs {
+                param_tys.push(t);
+            }
+            let ci = self.code(codes, item, args, &param_tys)?;
             codes.list[f.code as usize].calls[k as usize].link.set(ci);
             ci
         };
         let caller = &codes.list[f.code as usize];
-        let regs = caller.calls[k as usize].regs;
         if regs.1 != codes.list[ci as usize].params {
             return Err(malformed("a call with another count of arguments than parameters"));
         }
@@ -2311,6 +2323,27 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
                     Intrinsic::RawEq => s(u128::from(order == 0)),
                     _ => s(u128::from(order as u32)),
                 }
+            }
+            // The pinned core (library/core/src/intrinsics/mod.rs): `read_via_copy::<T>(ptr)` is
+            // the implementation detail of `core::ptr::read`, a bitwise copy of `*ptr` of type
+            // `T`. A zero-sized read through a non-null, aligned integer pointer (e.g.
+            // `NonNull::dangling()`) succeeds without touching memory; null or unaligned integer
+            // pointers, dangling allocations, out-of-bounds, uninit scalars, and invalid scalar
+            // values are refused.
+            Intrinsic::ReadViaCopy => {
+                let t = t0.ok_or(malformed("`read_via_copy` with no type"))?;
+                let (v, _) = *vals.first().ok_or(malformed("`read_via_copy` with no pointer"))?;
+                let pl = self.deref(v)?;
+                let info = self.tyinfo(t)?;
+                if info.repr == Repr::Zst && pl.alloc == NO_ALLOC {
+                    let (_, align_log2) = self.size_align(t)?;
+                    let align = 1u64 << align_log2;
+                    if pl.offset == 0 || !pl.offset.is_multiple_of(align) {
+                        return Err(Stop::Refused(Refusal::IntAsPointer));
+                    }
+                    return Ok(Val::Zst);
+                }
+                self.load_i(pl, info)
             }
             // A row of the table the evaluator does not compute: refused by its name.
             other => Err(unsupported(other.entry().name)),

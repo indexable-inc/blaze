@@ -159,6 +159,58 @@ impl<A: Allocator> Inits<A> {
         let row = self.init.row(s.index());
         self.subtrees.subtree(p).iter().any(|&q| bits::test(row, q as usize))
     }
+
+    /// For each statement `s` and local `l`, whether some place of `l` may be initialized on
+    /// entry to `s` (`in_bits`) and after `s` executes (`out_bits`). Drop-liveness is restricted
+    /// to these sets (RFC 2094, "liveness": a variable is drop-live only where it may be
+    /// initialized, so a `Drop(l)` after an `if`/`else` join does not propagate drop-liveness
+    /// back into a branch where `l` was already moved).
+    pub(crate) fn local_maybe_init<B: Allocator, C: Allocator + Copy>(
+        &self,
+        flow: &Flow<B>,
+        alloc: C,
+    ) -> (Bits<C>, Bits<C>) {
+        fn mark_locals<B: Allocator, C: Allocator>(
+            row: &[u64],
+            flow: &Flow<B>,
+            target: &mut Bits<C>,
+            s: usize,
+        ) {
+            for (w, &word) in row.iter().enumerate() {
+                let mut b = word;
+                let base = w * 64;
+                while b != 0 {
+                    let bit = usize::try_from(b.trailing_zeros()).unwrap_or(0);
+                    b &= b - 1;
+                    if let Some(pr) = flow.places.get(base + bit) {
+                        target.set(s, pr.local.index());
+                    }
+                }
+            }
+        }
+        let n = flow.stmts.len();
+        let locals = usize::try_from(flow.locals).unwrap_or(0);
+        let mut in_bits = Bits::new_in(n, locals, alloc);
+        let mut out_bits = Bits::new_in(n, locals, alloc);
+        let pw = self.init.words();
+        let mut scratch_init = Vec::with_capacity_in(pw, alloc);
+        scratch_init.resize(pw, 0u64);
+        let mut scratch_uninit = Vec::with_capacity_in(pw, alloc);
+        scratch_uninit.resize(pw, 0u64);
+        for (s, &reached) in self.reached.iter().enumerate() {
+            if !reached {
+                continue;
+            }
+            let Ok(s32) = u32::try_from(s) else { break };
+            let in_row = self.init.row(s);
+            mark_locals(in_row, flow, &mut in_bits, s);
+            scratch_init.copy_from_slice(in_row);
+            scratch_uninit.copy_from_slice(self.uninit.row(s));
+            transfer_with(&self.subtrees, flow, Stmt(s32), &mut scratch_init, &mut scratch_uninit);
+            mark_locals(&scratch_init, flow, &mut out_bits, s);
+        }
+        (in_bits, out_bits)
+    }
 }
 
 /// Calls `f` on each operand a value reads.
