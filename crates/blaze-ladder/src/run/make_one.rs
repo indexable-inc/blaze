@@ -859,6 +859,14 @@ fn make_instance_timed<P: FrontEnd, T: Typing<P>>(
     for &item in items.iter() {
         program.head_row(item)?;
     }
+    // A test report shim calls `Termination::report` (the trait method, which `name_ref` then
+    // resolves to the selected impl): ensure its trait head and row exist before the build asks
+    // for its signature and ABI.
+    if blaze_build::test_report_shim_of(instance, state.work.ground.view()).is_some()
+        && let Some(report_fn) = program.termination_report()
+    {
+        program.head_row(report_fn)?;
+    }
     // Generic `inline for` functions specialize on demand at concrete ground arguments into a
     // monomorphic unrolled row with 0 generic args of its own (matching `run.rs:2321-2327`).
     let (build_i, build_instance) = if instance.args.len > 0 && instance.item == tabled {
@@ -1097,6 +1105,7 @@ fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize
     } else if crate::fn_shim::fn_shim_of(&facts, instance, &work.ground).is_some()
         || blaze_build::reify_shim_of(instance, work.ground.view()).is_some()
         || blaze_build::vtable_shim_of(instance, work.ground.view()).is_some()
+        || blaze_build::test_report_shim_of(instance, work.ground.view()).is_some()
     {
         None
     } else {
@@ -1486,9 +1495,10 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
         _ => None,
     };
     let is_vtable_shim = instance.item != function.key && blaze_build::vtable_shim_of(instance, work.ground.view()).is_some();
+    let is_test_report_shim = instance.item != function.key && blaze_build::test_report_shim_of(instance, work.ground.view()).is_some();
     let checked = match (function.body, bodies.checked.get(i).and_then(Option::as_ref)) {
         (Some((body, _)), Some(done)) => Some((body, done)),
-        _ if ctor_row.is_some() || builtin_clone.is_some() || builtin_from.is_some() || is_vtable_shim => None,
+        _ if ctor_row.is_some() || builtin_clone.is_some() || builtin_from.is_some() || is_vtable_shim || is_test_report_shim => None,
         _ => return Err(callee_refusal(program, name(), instance.args, instance, crate::callee_shown::CalleeGap::NoBody, work.ground.view())),
     };
     let malformed = |_| RunError::Build { function: name(), error: BuildError::Malformed { what: "an instance's arguments past the ground table" }, range: None };
@@ -1504,9 +1514,22 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
         blaze_build::vtable_shim_of(instance, work.ground.view()).map(|target| super::vtable_shim_plan(&adts, target, &work.ground))
     };
     let reify = if instance.item == function.key || vtable_shim.is_some() { None } else { blaze_build::reify_shim_of(instance, work.ground.view()) };
-    let coroutine = if instance.item == function.key || vtable_shim.is_some() || reify.is_some() { None } else { crate::front2::coroutines::part_of(&adts, instance, &work.ground) };
-    let shim = if instance.item == function.key || vtable_shim.is_some() || reify.is_some() || coroutine.is_some() { None } else { crate::fn_shim::fn_shim_of(&adts, instance, &work.ground) };
-    let closure = if instance.item == function.key || vtable_shim.is_some() || reify.is_some() || shim.is_some() || coroutine.is_some() {
+    let test_report = if instance.item == function.key || vtable_shim.is_some() || reify.is_some() {
+        None
+    } else {
+        blaze_build::test_report_shim_of(instance, work.ground.view())
+    };
+    let coroutine = if instance.item == function.key || vtable_shim.is_some() || reify.is_some() || test_report.is_some() {
+        None
+    } else {
+        crate::front2::coroutines::part_of(&adts, instance, &work.ground)
+    };
+    let shim = if instance.item == function.key || vtable_shim.is_some() || reify.is_some() || test_report.is_some() || coroutine.is_some() {
+        None
+    } else {
+        crate::fn_shim::fn_shim_of(&adts, instance, &work.ground)
+    };
+    let closure = if instance.item == function.key || vtable_shim.is_some() || reify.is_some() || test_report.is_some() || shim.is_some() || coroutine.is_some() {
         None
     } else {
         let first = work.ground.view().list(instance.args).map_err(malformed)?.first().copied();
@@ -1523,6 +1546,8 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
         plan.owner_args
     } else if let Some(target) = reify {
         target.args
+    } else if test_report.is_some() {
+        List::EMPTY
     } else {
         match shim {
             Some(s) => s.item.map_or(List::EMPTY, |(_, fn_args)| fn_args),
@@ -1567,7 +1592,7 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
     };
     // The states this instance's own types hold, laid out from types and each coroutine built
     // into its state BEFORE this build (lay_states.rs): the build never meets a state not laid.
-    if from_coroutine.is_none() && shim.is_none() && vtable_shim.is_none() {
+    if from_coroutine.is_none() && shim.is_none() && vtable_shim.is_none() && test_report.is_none() {
         let roots = roots_of_instance(program, bodies, &adts, i, &args, &mut work.ground, work.alloc)?;
         if !roots.is_empty()
             && let Lay::Unchecked(owner) = lay_and_build(program, &[], &work.langs, bodies, &mut work.ground, &mut work.layouts, &mut work.stash, i, &roots, work.alloc)?
@@ -1590,13 +1615,19 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
                 Some(_) => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, Some(&program.sig(i)), &mut subst, &adts, Global),
                 None => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, None, &mut subst, &adts, Global),
             }
-        } else if vtable_shim.is_some() || reify.is_some() || builtin_clone.is_some() || builtin_from.is_some() {
+        } else if vtable_shim.is_some() || reify.is_some() || test_report.is_some() || builtin_clone.is_some() || builtin_from.is_some() {
             let g = Global;
             if let Some(plan) = vtable_shim {
                 let sig = plan.needs_sig.then(|| program.sig(i));
                 blaze_build::build_vtable_shim(plan.target, sig.as_ref(), &mut subst, &adts, g)
             } else if let Some(target) = reify {
                 blaze_build::build_reify_shim(target.item, &program.sig(i), &mut subst, &adts, g)
+            } else if let Some(test_item) = test_report {
+                let report_fn = program.termination_report().ok_or(BuildError::NoLangFn { expr: None, name: "termination::report" });
+                report_fn.and_then(|report_fn| {
+                    let report_row = program.fn_index(report_fn).ok_or(BuildError::NoAbi { item: report_fn })?;
+                    blaze_build::build_test_report_shim(test_item, &program.sig(i), report_fn, &program.sig(report_row), &mut subst, &adts, g)
+                })
             } else if let Some(made) = builtin_clone {
                 // A fn item's and a fn pointer's clone is a copy of its bytes (`Copy` by the
                 // language, no solver asked); a tuple's or a closure's clones each field by its own
@@ -2404,6 +2435,9 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
         let (item, args) = match decode_instance(name, &mut ground, self.alloc) {
             Ok((item, args)) => {
                 let view = ground.view();
+                if let Some(test) = blaze_build::test_report_shim_of(Instance { item, args }, view) {
+                    return Some(InstanceShown { item: program.item_shown(test), args: None });
+                }
                 let args = match view.list(args) {
                     Ok([]) => None,
                     _ => Some(crate::callee_shown::args_shown(view, args, &|k| program.item_named(k))),

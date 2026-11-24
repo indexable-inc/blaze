@@ -26,7 +26,7 @@ use crate::{Abi, Adts, BuildError, Built, Instance, Intrinsic, Subst, ground};
 
 #[path = "closure.rs"]
 mod closure;
-pub(crate) use closure::{build_builtin_clone, build_builtin_from, build_ctor_fn, build_fn_shim, build_reify_shim, build_vtable_shim, closures_in};
+pub(crate) use closure::{build_builtin_clone, build_builtin_from, build_ctor_fn, build_fn_shim, build_reify_shim, build_test_report_shim, build_vtable_shim, closures_in};
 #[cfg(test)]
 pub(crate) use closure::{empty_record as empty_record_for_tests, empty_view as empty_view_for_tests};
 #[path = "coroutine.rs"]

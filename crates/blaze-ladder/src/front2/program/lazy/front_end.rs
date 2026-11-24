@@ -544,6 +544,17 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
         declared.then(|| crate::front2::keys::member_key_of(tr, MemberKind::Fn, name))
     }
 
+    fn termination_report(&self) -> Option<ItemKey> {
+        let lib = self.front.index.lang(crate::front2::test_entry::TERMINATION_LANG)?;
+        let tr = checker_of(lib);
+        if let Some(filed) = self.front.keys.filed_member(tr, MemberKind::Fn, "report") {
+            return Some(filed);
+        }
+        let mut declared = false;
+        self.front.names.each_member(lib, &mut |m| declared |= m.kind == blaze_surface::ItemKind::Function && m.name == Some("report"));
+        declared.then(|| crate::front2::keys::member_key_of(tr, MemberKind::Fn, "report"))
+    }
+
     fn fmt_argument_adt(&self) -> Option<ItemKey> {
         self.front.index.lang("format_argument").map(checker_of)
     }

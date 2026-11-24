@@ -1778,7 +1778,8 @@ pub fn build_stubbed(names: &blaze_scope::resolve::Names<'_>, files: &[SourceFil
     }
     // Placed in this process as literal-word code (place.rs), which carries no landing pads:
     // built Abort, with D91's stop at a raise, until run.md piece 13 deletes this path.
-    let built = build_from(&mut program, None, None, true, texts.overflow, IN_PROCESS_UB, blaze_build::Panic::Abort, alloc)?;
+    let plan = BuildPlan { entry: BuildEntry::Program, stub_refusals: true, overflow: texts.overflow, ub: IN_PROCESS_UB, panic: blaze_build::Panic::Abort };
+    let built = build_from(&mut program, None, None, plan, alloc)?;
     built.ok_or(RunError::NoMain)
 }
 
@@ -1799,7 +1800,20 @@ fn build_noting(files: &[SourceFile<'_>], root: &str, blaze: &mut BlazeAttrs, ov
 pub fn build_with<P: FrontEnd>(program: &mut P, overflow: OverflowChecks, alloc: Alloc<'static>) -> Result<Built, RunError> {
     // Only a survey goes on with no entry: a run's `None` is no `main`. Placed in this process
     // (place.rs): built Abort with D91's stop, until run.md piece 13 deletes this path.
-    build_from(program, None, None, false, overflow, IN_PROCESS_UB, blaze_build::Panic::Abort, alloc)?.ok_or(RunError::NoMain)
+    let plan = BuildPlan { entry: BuildEntry::Program, stub_refusals: false, overflow, ub: IN_PROCESS_UB, panic: blaze_build::Panic::Abort };
+    build_from(program, None, None, plan, alloc)?.ok_or(RunError::NoMain)
+}
+
+/// Builds one test row of a whole-program suite ([`crate::front2::program::suite::SuiteEntry`]):
+/// either the test fn directly (`Direct`, `Entry::Unit`) or its test report shim (`Report`,
+/// `Entry::I32`, calling `test()` then `<R as Termination>::report`, returning the `ExitCode` byte).
+pub fn build_suite_entry<P: FrontEnd>(program: &mut P, entry: crate::front2::program::suite::SuiteEntry, overflow: OverflowChecks, alloc: Alloc<'static>) -> Result<Built, RunError> {
+    let mode = match entry {
+        crate::front2::program::suite::SuiteEntry::Direct { row } => BuildEntry::Direct(row),
+        crate::front2::program::suite::SuiteEntry::Report { test, .. } => BuildEntry::TestReport(test),
+    };
+    let plan = BuildPlan { entry: mode, stub_refusals: true, overflow, ub: IN_PROCESS_UB, panic: blaze_build::Panic::Abort };
+    build_from(program, None, None, plan, alloc)?.ok_or(RunError::NoMain)
 }
 
 /// What `ub_checks()` is on the in-process paths ([`build_with`], [`build_survey`], the
@@ -1822,7 +1836,8 @@ pub fn build_records<P: FrontEnd>(program: &mut P, records: &mut crate::code_rec
     let overflow = records.builder.settings.overflow_checks;
     let panic = crate::panic_strategy::of_strategy(records.builder.settings.panic);
     let ub = blaze_build::UbChecks::of_debug_assertions(records.builder.settings.debug_assertions);
-    build_from(program, None, Some(records), false, overflow, ub, panic, alloc)?;
+    let plan = BuildPlan { entry: BuildEntry::Program, stub_refusals: false, overflow, ub, panic };
+    build_from(program, None, Some(records), plan, alloc)?;
     Ok(())
 }
 
@@ -1865,7 +1880,8 @@ pub struct SurveyCounts {
 pub fn build_survey<P: FrontEnd>(program: &mut P, refused: &mut Vec<(Box<str>, Box<str>), Global>, overflow: OverflowChecks, alloc: Alloc<'static>) -> Result<SurveyCounts, RunError> {
     let mut counts = SurveyCounts { built: 0, tried: 0, no_instance: Vec::new_in(Global) };
     // As the in-process run builds (D91): Abort, until run.md piece 13.
-    build_from(program, Some((refused, &mut counts)), None, false, overflow, IN_PROCESS_UB, blaze_build::Panic::Abort, alloc)?;
+    let plan = BuildPlan { entry: BuildEntry::Program, stub_refusals: false, overflow, ub: IN_PROCESS_UB, panic: blaze_build::Panic::Abort };
+    build_from(program, Some((refused, &mut counts)), None, plan, alloc)?;
     Ok(counts)
 }
 
@@ -2244,18 +2260,32 @@ fn class_of(debug: &str) -> Box<str> {
 /// walk cannot build keeps its first refusal and its slot holds a stub (crate::stub), and a
 /// reference that has no instance gets a stub slot of its own ([`unresolved`]): the answer's
 /// `refused` lists them by stub number.
-fn build_from<P: FrontEnd>(
-    program: &mut P,
-    surveyed: Option<(&mut Vec<(Box<str>, Box<str>), Global>, &mut SurveyCounts)>,
-    mut records: Option<&mut crate::code_records::RecordRun<'_>>,
+#[derive(Clone, Copy)]
+enum BuildEntry {
+    Program,
+    Direct(usize),
+    TestReport(usize),
+}
+
+#[derive(Clone, Copy)]
+struct BuildPlan {
+    entry: BuildEntry,
     stub_refusals: bool,
     overflow: OverflowChecks,
     ub: blaze_build::UbChecks,
     panic: blaze_build::Panic,
+}
+
+fn build_from<P: FrontEnd>(
+    program: &mut P,
+    surveyed: Option<(&mut Vec<(Box<str>, Box<str>), Global>, &mut SurveyCounts)>,
+    mut records: Option<&mut crate::code_records::RecordRun<'_>>,
+    plan: BuildPlan,
     // The caller's, for the build's tables (ground types, layouts, closures, coroutines) and
     // each instance's scratch: none outlives the build.
     alloc: Alloc<'static>,
 ) -> Result<Option<Built>, RunError> {
+    let BuildPlan { entry: entry_mode, stub_refusals, overflow, ub, panic } = plan;
     let (survey, mut counts) = match surveyed {
         Some((refused, counts)) => (Some(refused), Some(counts)),
         None => (None, None),
@@ -2265,14 +2295,20 @@ fn build_from<P: FrontEnd>(
     // records and keeps no body, so it has no slots to stub).
     let stubs = (stub_refusals || (survey.is_none() && records.is_none())).then(|| Stubs { refused: Vec::new_in(Global), slot: 0, last: None });
     let mut survey = Sink { survey, stubs, stub_refusals };
-    let entry = match (program.entry(), survey.survey.is_some()) {
-        (Some(main), _) => Some(main),
-        (None, true) => None,
-        (None, false) => return Err(RunError::NoMain),
+    let (entry, test_report_entry) = match entry_mode {
+        BuildEntry::Direct(row) => (Some(row), false),
+        BuildEntry::TestReport(row) => (Some(row), true),
+        BuildEntry::Program => match (program.entry(), survey.survey.is_some()) {
+            (Some(main), _) => (Some(main), false),
+            (None, true) => (None, false),
+            (None, false) => return Err(RunError::NoMain),
+        },
     };
     // A survey builds what the entry reaches whatever its shape (his `main` takes `cx, io`).
-    let start = match (survey.survey.is_some(), entry) {
-        (false, Some(main)) => entry_shape(&*program, main)?,
+    let start = match (survey.survey.is_some(), entry_mode, entry) {
+        (false, BuildEntry::Direct(_), Some(_)) => Start::Plain(Entry::Unit),
+        (false, BuildEntry::TestReport(_), Some(_)) => Start::Plain(Entry::I32),
+        (false, BuildEntry::Program, Some(main)) => entry_shape(&*program, main)?,
         _ => Start::Plain(Entry::Unit),
     };
     if let Some(main) = entry
@@ -2280,11 +2316,12 @@ fn build_from<P: FrontEnd>(
     {
         return Err(RunError::MainShape { main: program.function(main).named(), what: "it has no body" });
     }
-    let checked = program.check_all()?;
+    let mut checked = program.check_all()?;
+    let out = (|| -> Result<Option<Built>, RunError> {
     // Kept mutable: between instances the loop pulls the constants the next instance needs at
     // its ground arguments (`FrontEnd::const_at`, front2/const_at.rs); `program` is a shared
     // borrow of it, taken again in each step of the loop and after it.
-    let program_mut = program;
+    let program_mut = &mut *program;
     let program = &*program_mut;
     let mut ground = PortableTys::new_in(alloc);
     let mut static_instances = blaze_hash::HashMap::new_in(alloc);
@@ -2340,6 +2377,10 @@ fn build_from<P: FrontEnd>(
             let args = blaze_build::vtable_shim_key_args(target, ground, alloc).map_err(fail)?;
             return blaze_build::instance_key_normalized(code, args, PTys::EMPTY, ground, facts, alloc).map_err(fail);
         }
+        if blaze_build::test_report_shim_of(instance, ground.view()).is_some() {
+            let args = blaze_build::test_report_shim_key_args(ground).map_err(fail)?;
+            return blaze_build::instance_key_normalized(code, args, PTys::EMPTY, ground, facts, alloc).map_err(fail);
+        }
         let from = checked.get(c).and_then(Option::as_ref).map_or(PTys::EMPTY, |d| d.types.view());
         let args = if let Some(shim) = clones.shim_of(instance, ground) {
             // A builtin clone, keyed by `Self` and whether it is `Copy` (clone_shim.rs).
@@ -2370,7 +2411,13 @@ fn build_from<P: FrontEnd>(
     let mut tables = Tables { refs: Vec::new_in(Global), images: Vec::new_in(Global) };
     let mut layouts = Layouts::new_in(alloc);
     if let Some(main) = entry {
-        reached.instances.push(Instance { item: program.function(main).key, args: List::EMPTY });
+        let root_inst = if test_report_entry {
+            blaze_build::test_report_shim_instance(program.function(main).key, &mut ground)
+                .map_err(|error| RunError::Build { function: program.function(main).named(), error, range: None })?
+        } else {
+            Instance { item: program.function(main).key, args: List::EMPTY }
+        };
+        reached.instances.push(root_inst);
         reached.tabled.push(main);
         // The entry's key reads its body's types' facts (a `Drop` impl at each): an answer no
         // check made is made (`FrontEnd::make_asked`) and the key asked again, as an
@@ -2379,7 +2426,7 @@ fn build_from<P: FrontEnd>(
         let key = loop {
             let program = &*program_mut;
             let keyer = FrontAdts(program, main, &consts, &langs, &checked_bodies);
-            match key_of(program, main, Instance { item: program.function(main).key, args: List::EMPTY }, &mut ground, &keyer) {
+            match key_of(program, main, root_inst, &mut ground, &keyer) {
                 Err(e) if asks_again(&e) && rounds < crate::front2::check::MOST_ROUNDS => {
                     if !program_mut.make_asked(main)? {
                         return Err(e);
@@ -2599,9 +2646,10 @@ fn build_from<P: FrontEnd>(
             None if clone_row.is_none() => crate::clone_shim::language_from(&*program, instance, &ground),
             _ => None,
         };
+        let is_test_report = blaze_build::test_report_shim_of(instance, ground.view()).is_some();
         let (body, done) = match (function.body, checked[i].as_ref()) {
             (Some((body, _)), Some(done)) => (Some(body), Some(done)),
-            _ if ctor_row.is_some() || clone_row.is_some() || from_row.is_some() => (None, None),
+            _ if ctor_row.is_some() || clone_row.is_some() || from_row.is_some() || is_test_report => (None, None),
             _ => {
             let refusal = callee_refusal(&*program, name(), instance.args, instance, crate::callee_shown::CalleeGap::NoBody, ground.view());
             // A survey files it (by the fn and the callee) and goes on, as its doc promises; a
@@ -2674,6 +2722,7 @@ fn build_from<P: FrontEnd>(
             && clone_row.is_none()
             && from_row.is_none()
             && blaze_build::vtable_shim_of(instance, ground.view()).is_none()
+            && blaze_build::test_report_shim_of(instance, ground.view()).is_none()
         {
             return Err(callee_refusal(&*program, named, instance.args, instance, crate::callee_shown::CalleeGap::NoBody, ground.view()));
         }
@@ -2746,17 +2795,22 @@ fn build_from<P: FrontEnd>(
         } else {
             blaze_build::reify_shim_of(instance, ground.view())
         };
-        let coroutine = if is_own_instance || vtable_shim.is_some() || reify.is_some() {
+        let test_report = if is_own_instance || vtable_shim.is_some() || reify.is_some() {
+            None
+        } else {
+            blaze_build::test_report_shim_of(instance, ground.view())
+        };
+        let coroutine = if is_own_instance || vtable_shim.is_some() || reify.is_some() || test_report.is_some() {
             None
         } else {
             crate::front2::coroutines::part_of(&FrontAdts(program, i, &consts, &langs, &checked_bodies), instance, &ground)
         };
-        let shim = if is_own_instance || vtable_shim.is_some() || reify.is_some() || coroutine.is_some() {
+        let shim = if is_own_instance || vtable_shim.is_some() || reify.is_some() || test_report.is_some() || coroutine.is_some() {
             None
         } else {
             crate::fn_shim::fn_shim_of(&FrontAdts(program, i, &consts, &langs, &checked_bodies), instance, &ground)
         };
-        let closure = if is_own_instance || vtable_shim.is_some() || reify.is_some() || shim.is_some() || coroutine.is_some() {
+        let closure = if is_own_instance || vtable_shim.is_some() || reify.is_some() || test_report.is_some() || shim.is_some() || coroutine.is_some() {
             None
         } else {
             let first = ground.view().list(instance.args).map_err(malformed)?.first().copied();
@@ -2775,6 +2829,8 @@ fn build_from<P: FrontEnd>(
             plan.owner_args
         } else if let Some(target) = reify {
             target.args
+        } else if test_report.is_some() {
+            List::EMPTY
         } else {
             match shim {
                 Some(s) => s.item.map_or(List::EMPTY, |(_, fn_args)| fn_args),
@@ -2820,7 +2876,7 @@ fn build_from<P: FrontEnd>(
         // built into its state BEFORE this build (run/lay_states.rs): the build never meets a
         // state not laid. A coroutine's own function was built with its coroutine; a shim has
         // no body of its own.
-        if from_coroutine.is_none() && shim.is_none() && vtable_shim.is_none() && clone_row.is_none() && from_row.is_none() {
+        if from_coroutine.is_none() && shim.is_none() && vtable_shim.is_none() && test_report.is_none() && clone_row.is_none() && from_row.is_none() {
             let adts = FrontAdts(&*program, i, &consts, &langs, &checked_bodies);
             let laid = match lay_states::roots_of_instance(&*program, &checked_bodies, &adts, i, &args, &mut ground, alloc) {
                 Ok(roots) if roots.is_empty() => Ok(lay_states::Lay::Done),
@@ -2857,13 +2913,19 @@ fn build_from<P: FrontEnd>(
                 Some(_) => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, Some(&program.sig(i)), &mut subst, world, Global),
                 None => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, None, &mut subst, world, Global),
             }
-        } else if vtable_shim.is_some() || reify.is_some() || clone_row.is_some() || from_row.is_some() {
+        } else if vtable_shim.is_some() || reify.is_some() || test_report.is_some() || clone_row.is_some() || from_row.is_some() {
             let g = Global;
             if let Some(plan) = vtable_shim {
                 let sig = plan.needs_sig.then(|| program.sig(i));
                 blaze_build::build_vtable_shim(plan.target, sig.as_ref(), &mut subst, world, g)
             } else if let Some(target) = reify {
                 blaze_build::build_reify_shim(target.item, &program.sig(i), &mut subst, world, g)
+            } else if let Some(test_item) = test_report {
+                let report_fn = program.termination_report().ok_or(BuildError::NoLangFn { expr: None, name: "termination::report" });
+                report_fn.and_then(|report_fn| {
+                    let report_row = program.fn_index(report_fn).ok_or(BuildError::NoAbi { item: report_fn })?;
+                    blaze_build::build_test_report_shim(test_item, &program.sig(i), report_fn, &program.sig(report_row), &mut subst, world, g)
+                })
             } else if let Some((s, copy)) = clone_row {
                 // A builtin clone: its bytes when `Self: Copy`, else each field's own `clone`.
                 match copy {
@@ -3474,6 +3536,9 @@ fn build_from<P: FrontEnd>(
     let reached = u32::try_from(reached.instances.len()).map_err(|_| RunError::TooManyInstances)?;
     let refused = survey.stubs.map_or_else(|| Vec::new_in(Global), |stubs| stubs.refused);
     Ok(Some(Built { bodies, vtables: tables.images, start, start_fn: program.function(main).named(), image, getter, ender, refused, reached, static_fns, static_vtables, paths }))
+    })();
+    program.restore_checked(&mut checked);
+    out
 }
 
 /// Each fn instance `image` points at (its `ImageTarget::Fn` words), sorted by key, with its
