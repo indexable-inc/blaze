@@ -1037,7 +1037,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                         closure_regs.push(match s {
                             crate::closure::SigSlot::Owner(j) => Region::Param(j),
                             crate::closure::SigSlot::Static => Region::Static,
-                            crate::closure::SigSlot::Late(Some((binder, var))) => Region::Late { binder, var },
+                            crate::closure::SigSlot::Late(Some((binder, var))) | crate::closure::SigSlot::InnerBound(binder, var) => Region::Late { binder, var },
                             crate::closure::SigSlot::Late(None) => {
                                 let var = next_late;
                                 next_late += 1;

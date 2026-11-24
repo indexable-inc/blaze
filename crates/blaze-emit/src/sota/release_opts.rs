@@ -390,7 +390,7 @@ pub(crate) fn compute_block_order<'a>(view: &View<'_>, alloc: Alloc<'a>) -> Vec<
     for b in 0..blocks {
         is_cold.push(is_cold_block(view, b));
         let term = view.terminator(Block(u32_of(b)));
-        is_ret.push(view.op(term) == Op::Return);
+        is_ret.push(matches!(view.op(term), Op::Return | Op::TailCall | Op::TailCallIndirect));
     }
 
     let depth = if blocks <= EXACT_LOOP_DEPTH_MAX_BLOCKS {
@@ -635,7 +635,7 @@ pub(crate) fn compute_block_order<'a>(view: &View<'_>, alloc: Alloc<'a>) -> Vec<
         for inst in l_range {
             if matches!(
                 view.op(inst),
-                Op::Call | Op::CallIndirect | Op::Invoke | Op::InvokeIndirect
+                Op::Call | Op::CallIndirect | Op::Invoke | Op::InvokeIndirect | Op::TailCall | Op::TailCallIndirect
             ) {
                 l_has_call = true;
                 break;
@@ -711,10 +711,12 @@ pub(crate) fn detect_tail_calls<'a>(
 ) -> Vec<bool, Alloc<'a>> {
     let len = view.len();
     let mut is_tail: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(len, alloc);
-    for _ in 0..len {
-        is_tail.push(false);
+    for inst in 0..len {
+        is_tail.push(matches!(view.op(inst), Op::TailCall | Op::TailCallIndirect));
     }
-    // Never tail-call if the function allocates local stack slots (a slot address might be passed).
+    // Never implicitly tail-call if the function allocates local stack slots (a slot address might be passed).
+    // Explicit `Op::TailCall`/`Op::TailCallIndirect` (RFC 3407 `become`) already dropped all locals and
+    // stays marked true above.
     if !view.slots.is_empty() {
         return is_tail;
     }

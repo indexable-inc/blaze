@@ -1423,7 +1423,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
             | Op::Scatter => return Err(unsupported(inst, op, "a vector operation")),
             Op::Invoke | Op::InvokeIndirect => self.call(inst, op).map(|()| self.invoke_normal(inst, op, next))?,
             Op::Resume => self.resume(inst),
-            Op::TailCall | Op::TailCallIndirect => return Err(unsupported(inst, op, "a tail call")),
+            Op::TailCall | Op::TailCallIndirect => self.tail_call(inst, op)?,
             Op::Asm => self.asm(inst, op)?,
             Op::AsmBr => return Err(unsupported(inst, op, "an `asm!` block with `label` operands (`asm_br`)")),
             // A coroutine body is split by `blaze_lir::coroutine::split` before any backend
@@ -1587,6 +1587,89 @@ impl<A: Allocator> Pass<'_, '_, A> {
                 _ => return Err(unsupported(inst, op, "an `i128` or float return beside another return")),
             }
         }
+        Ok(())
+    }
+
+    /// A `tail_call` or `tail_call_indirect`: loads all register arguments and the callee address
+    /// into `x16` from the current frame, tears down the frame (`add sp, fp, #0; ldp fp, lr,
+    /// [sp], #16`), and branches directly to `x16` (`br x16`) in O(1) stack space.
+    fn tail_call(&mut self, inst: usize, op: Op) -> Result<(), EmitError> {
+        let view = self.view;
+        let mut o = view.operands(inst);
+        let (direct, indirect) = match op {
+            Op::TailCall => (Some(o.reference()), None),
+            _ => (None, Some(o.value())),
+        };
+        let sig_id = o.sig();
+        let args = o.values();
+        let sig = view.sig(sig_id);
+        let isa = self.isa;
+        let Some(&sig_rec) = view.sigs.get(sig_id.index()) else {
+            return Err(unsupported(inst, op, "a tail call whose signature index is out of range"));
+        };
+        check_sig(view, isa, sig_rec, sig.params, sig.rets).map_err(|why| unsupported(inst, op, why))?;
+        let variadic = sig_rec.bits & SigRec::VARIADIC != 0;
+        if variadic {
+            return Err(unsupported(inst, op, "a variadic tail call"));
+        }
+        if args.len() != sig.params.len() {
+            return Err(unsupported(inst, op, "arguments other than the signature's parameters"));
+        }
+        if sig.rets.len() != self.rets.len()
+            || !sig.rets.iter().zip(self.rets).all(|(a, b)| a.ty == b.ty && a.kind == b.kind && a.ext == b.ext)
+        {
+            return Err(unsupported(inst, op, "a tail call whose return signature differs from the caller"));
+        }
+        let imported = match direct {
+            Some(reference) if self.in_record() => Some(self.func_place(inst, op, reference)?),
+            _ => None,
+        };
+        let callee = match direct {
+            Some(reference) if imported.is_none() => Some(self.literal(inst, op, reference)?),
+            _ => None,
+        };
+        let mut regs = Regs::new(isa.os);
+        for (arg, param) in args.iter().zip(sig.params) {
+            match ParamKind::from_byte(param.kind) {
+                Some(ParamKind::Byval) => return Err(unsupported(inst, op, "a `byval` tail-call argument")),
+                Some(ParamKind::Sret) => {
+                    self.ld(X8, arg);
+                    continue;
+                }
+                _ => {}
+            }
+            let Some(at) = regs.next(Ty(param.ty)) else {
+                return Err(unsupported(inst, op, "a stacked tail-call argument"));
+            };
+            match at {
+                Loc::X(gpr) => {
+                    self.ld(gpr, arg);
+                    if Ext::from_byte(param.ext) == Some(Ext::Sext) {
+                        let width = self.width_of(inst, op, arg)?;
+                        self.widen_signed(gpr, width);
+                    }
+                }
+                Loc::Pair(gpr) => self.ld2(gpr, gpr + 1, arg),
+                Loc::V(v, w) => self.v_out(v, arg, w),
+            }
+        }
+        match (callee, indirect) {
+            (Some((literal, via)), _) => {
+                self.put_to(enc::ldr_lit(X16, 0), Field::Imm19, Label::Literal(literal));
+                if via == Via::Slot {
+                    self.put(enc::ldr(Size::X, X16, X16, 0));
+                }
+            }
+            (None, Some(pointer)) => self.ld(X16, pointer),
+            (None, None) => match imported {
+                // Load site (`call: false`): `br x16` follows the epilogue, not `blr x16`.
+                Some(place) => self.import_load(X16, RelocTo::Func(place)),
+                None => return Err(unsupported(inst, op, "a tail call that names no callee")),
+            },
+        }
+        self.put(enc::add_imm(SP, FP, 0, false));
+        self.put(enc::ldp_post(FP, LR, SP, 16));
+        self.put(enc::br(X16));
         Ok(())
     }
 

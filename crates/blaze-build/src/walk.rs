@@ -35,6 +35,7 @@ pub(crate) mod coroutine;
 pub(crate) mod arith_checks;
 mod asm;
 mod c_variadic;
+mod tail_call;
 mod casts;
 mod const_scalar;
 mod fmt;
@@ -423,6 +424,9 @@ enum Task {
     ArmEnd { m: u32 },
     MatchEnd,
     Call(ExprId),
+    /// `become <call_expr>` (RFC 3407): emits `Op::TailCall` / `Op::TailCallIndirect` when
+    /// eligible (after running all scope drops), or falls back to a normal call + return.
+    BecomeCall(ExprId),
     /// The call of an operator the check recorded a callee for, its operands on the value
     /// stack (walk/operators.rs).
     OpCall(ExprId),
@@ -547,6 +551,10 @@ struct Walk<'x, 'c, 't, A: Allocator + Copy> {
     ret_pass: Pass,
     /// The hidden result pointer of a fn returning an aggregate.
     sret: Option<Value>,
+    /// Incoming caller-owned `Pass::Ref` parameter buffers `(ptr, size, align_log2)`: reusable
+    /// as outgoing `Pass::Ref` argument buffers in `Op::TailCall` / `Op::TailCallIndirect` once
+    /// the current frame's locals have been dropped.
+    ref_params: blaze_own::Vec<(Value, u32, u8), A>,
     /// Per pattern: the binding's state changes under a branch or loop of its scope, so it
     /// gets a drop flag if its type needs drop (`scan_flags`).
     needs_flag: Vec<bool, A>,
@@ -640,7 +648,10 @@ fn malformed(what: &'static str) -> BuildError {
 /// Unwinding permission is separate from the machine signature of a C-family pointer.
 fn pointer_abi(abi: blaze_typeck::Abi) -> Option<Abi> {
     match abi {
-        blaze_typeck::Abi::Rust => Some(Abi::Rust),
+        blaze_typeck::Abi::Rust
+        | blaze_typeck::Abi::RustCold
+        | blaze_typeck::Abi::RustPreserveNone
+        | blaze_typeck::Abi::RustTail => Some(Abi::Rust),
         blaze_typeck::Abi::C | blaze_typeck::Abi::CUnwind => Some(Abi::C),
         blaze_typeck::Abi::RustCall => Some(Abi::RustCall),
         _ => None,
@@ -903,6 +914,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         ret: Repr::None,
         ret_pass: Pass::Ignore,
         sret: None,
+        ref_params: blaze_own::Vec::new_in(alloc),
         needs_flag,
         partial,
         expr_parent: Vec::new_in(alloc),
@@ -2864,6 +2876,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     }
                 }
                 Expr::Break { value, .. } | Expr::Return { value } => kids.extend(value.map(|c| (c, false))),
+                Expr::Become { value } => kids.push((value, false)),
                 Expr::Call { callee, args } => {
                     kids.push((callee, false));
                     kids.extend(list(args)?.iter().map(|&c| (c, false)));
@@ -3294,7 +3307,15 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             }
             // The caller's copy (or the one a C parameter's registers are written to) is the
             // callee's to keep: a binding lives in it.
-            match self.take_passed(repr, passes[i], &mut next)? {
+            let &pass = passes.get(i).ok_or(malformed("parameter pass missing"))?;
+            let passed = self.take_passed(repr, pass, &mut next)?;
+            if pass == Pass::Ref
+                && let V::Place(at, 0) = passed
+            {
+                let (size, align) = self.size_align(repr);
+                self.ref_params.push((at, size, align));
+            }
+            match passed {
                 V::Place(at, off) if matches!(self.pat(p)?, Pat::Bind { .. }) => {
                     self.bind_at(p, (at, off))?;
                     self.own_pat(p)?;
@@ -3554,18 +3575,23 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     /// Returns the fresh `SlotId` when `self.place` had to allocate a temporary slot for a
     /// non-place `v`, so the caller can end it right after the call.
     fn pass_arg(&mut self, v: V, repr: Repr, p: Pass, out: &mut Vec<Value, A>) -> Result<Option<SlotId>, BuildError> {
+        self.pass_arg_into(v, repr, p, |x| out.push(x))
+    }
+
+    /// The argument values of `v`, held as `repr`, passed as `p`, handed to `push`.
+    fn pass_arg_into(&mut self, v: V, repr: Repr, p: Pass, mut push: impl FnMut(Value)) -> Result<Option<SlotId>, BuildError> {
         let mut made = None;
         let fresh = |v: V| !matches!(v, V::Place(..));
         match p {
             Pass::Ignore => {}
-            Pass::Scalar { ty, agg: false, .. } => out.push(self.scalar(v, ty)?),
+            Pass::Scalar { ty, agg: false, .. } => push(self.scalar(v, ty)?),
             Pass::Scalar { ty, agg: true, .. } => {
                 let at = self.place(v, repr)?;
                 if fresh(v) {
                     made = self.whole_slot(at);
                 }
                 let attrs = self.mem(repr);
-                out.push(self.b.load(ty, Flags::NONE, at.0, at.1, attrs));
+                push(self.b.load(ty, Flags::NONE, at.0, at.1, attrs));
             }
             // `ArgCopy` made the caller's copy; a `byval` one is copied again by the call.
             Pass::Ref | Pass::Memory { .. } => {
@@ -3573,7 +3599,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 if fresh(v) {
                     made = self.whole_slot(at);
                 }
-                out.push(self.address(at));
+                push(self.address(at));
             }
             Pass::Wide { metadata } => {
                 let (ptr, off) = self.place(v, repr)?;
@@ -3581,8 +3607,8 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     made = self.whole_slot((ptr, off));
                 }
                 let attrs = self.mem(repr);
-                out.push(self.b.load(Ty::PTR, Flags::NONE, ptr, off, attrs));
-                out.push(self.b.load(metadata, Flags::NONE, ptr, off + 8, attrs));
+                push(self.b.load(Ty::PTR, Flags::NONE, ptr, off, attrs));
+                push(self.b.load(metadata, Flags::NONE, ptr, off + 8, attrs));
             }
             Pass::Words { size } => {
                 let at = self.place(v, repr)?;
@@ -3591,7 +3617,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 }
                 let align = self.size_align(repr).1;
                 for k in 0..size.div_ceil(8) {
-                    out.push(self.read_word(at, k * 8, (size - k * 8).min(8), align)?);
+                    push(self.read_word(at, k * 8, (size - k * 8).min(8), align)?);
                 }
             }
         }
@@ -3989,6 +4015,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 self.push_val(v, None);
             }
             Task::Call(e) => self.call(e)?,
+            Task::BecomeCall(e) => self.become_call(e)?,
             Task::OpCall(e) => self.operator_call(e)?,
             Task::Unary(e, op) => {
                 let v = self.pop()?;
@@ -5970,6 +5997,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     self.work.push(Task::Eval(v));
                 }
             }
+            Expr::Become { value } => self.eval_become(value)?,
             Expr::Call { callee, args } => {
                 let list = self.body.expr_lists.get(args.range()).ok_or(malformed("a call's arguments past `expr_lists`"))?;
                 let t = self.adjusted_ty(callee)?;

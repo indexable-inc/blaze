@@ -1358,6 +1358,86 @@ fn control_reflexive_proj_lifetime_mismatch<'a, P: LtProj<'a>>(p: &P, x: &'a u8)
     let _ = x;
     need_static_proj::<P, _>(p.make(&local));
 }
+
+// Class R: tip20/checks.rs:48 check! macro with `over:` and `judge:`
+type Emit<'a> = &'a mut dyn FnMut(&dyn core::fmt::Display, Option<u8>);
+struct TipCheck<C: ?Sized> {
+    id: &'static str,
+    run: fn(&C, Emit<'_>),
+}
+struct TipLedger {
+    token: u8,
+}
+impl core::fmt::Display for TipLedger {
+    fn fmt(&self, _f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { Ok(()) }
+}
+struct TipStep<M> {
+    pre: M,
+    post: M,
+    logs: Vec<u8>,
+}
+impl<M> TipStep<M> {
+    fn logs_from(&self, _: u8) -> impl Iterator<Item = &u8> {
+        self.logs.iter()
+    }
+}
+fn tip_each<C: ?Sized, S: core::fmt::Display>(
+    ctx: &C,
+    subjects: impl IntoIterator<Item = S>,
+    judge: impl Fn(&C, &S) -> Option<u8>,
+    emit: Emit<'_>,
+) {
+    for subject in subjects {
+        let verdict = judge(ctx, &subject);
+        emit(&subject, verdict);
+    }
+}
+fn tip_step_checks() -> TipCheck<TipStep<TipLedger>> {
+    TipCheck::<TipStep<TipLedger>> {
+        id: "TRANSFER_EVENTS",
+        run: |step: &TipStep<TipLedger>, emit| {
+            tip_each(
+                step,
+                [&step.post],
+                |s, _| {
+                    let transfers: Vec<u8> = s.logs_from(s.post.token).filter_map(|log| Some(*log)).collect();
+                    let _ = transfers.len();
+                    Some(0u8)
+                },
+                emit,
+            )
+        },
+    }
+}
+fn need_static_ledger(_: &'static TipLedger) {}
+fn control_tip_step_escapes_to_static() -> TipCheck<TipStep<TipLedger>> {
+    TipCheck::<TipStep<TipLedger>> {
+        id: "BAD_STATIC",
+        run: |step: &TipStep<TipLedger>, _emit| {
+            need_static_ledger(&step.post);
+        },
+    }
+}
+fn need_static_emit(_: Emit<'static>) {}
+fn control_tip_step_escapes_emit_to_static() -> TipCheck<TipStep<TipLedger>> {
+    TipCheck::<TipStep<TipLedger>> {
+        id: "BAD_EMIT_STATIC",
+        run: |_step: &TipStep<TipLedger>, emit| {
+            need_static_emit(emit);
+        },
+    }
+}
+
+// Class S: RFC 3407 `become` explicit tail calls (valid passthrough vs borrowing a local)
+fn become_sink(x: &u8) -> u8 { *x }
+fn become_valid_passthrough(x: &u8) -> u8 {
+    let _local = 9u8;
+    become become_sink(x);
+}
+fn control_become_borrows_local() -> u8 {
+    let local = 9u8;
+    become become_sink(&local);
+}
 "#;
     let heap = blaze_own::testing::heap();
     let tc = open_toolchain();

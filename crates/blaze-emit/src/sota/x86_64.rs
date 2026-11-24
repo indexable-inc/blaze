@@ -476,6 +476,8 @@ fn check_x64_subset(view: &View<'_>, has_fma: bool, has_avx2: bool, has_avx512: 
                 | Op::ReduceFadd
                 | Op::Call
                 | Op::CallIndirect
+                | Op::TailCall
+                | Op::TailCallIndirect
                 | Op::TargetIntrinsic
         );
         if !ok {
@@ -609,10 +611,19 @@ fn check_x64_subset(view: &View<'_>, has_fma: bool, has_avx2: bool, has_avx512: 
                 return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "unsupported x86-64 atomic_rmw" });
             }
         }
-        if matches!(op, Op::Call | Op::CallIndirect) {
+        if matches!(op, Op::Call | Op::CallIndirect | Op::TailCall | Op::TailCallIndirect) {
             let at = to_idx(at_u32(view.data, inst));
             let sig_id = SigId(at_u32(view.extra, at + 1));
             check_x64_sig(view, sig_id, Some(u32_of(inst)))?;
+            if matches!(op, Op::TailCall | Op::TailCallIndirect) {
+                let sig = view.sig(sig_id);
+                let func_sig = view.sig(SigId(view.head.sig));
+                if sig.rets.len() != func_sig.rets.len()
+                    || !sig.rets.iter().zip(func_sig.rets.iter()).all(|(a, b)| a.ty == b.ty && a.kind == b.kind && a.ext == b.ext)
+                {
+                    return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "x64 tail call return mismatch" });
+                }
+            }
         }
     }
     Ok(())
@@ -1292,7 +1303,7 @@ pub(crate) fn emit_sota_x64<'a>(
     }
     for b in 0..blocks {
         let term = view.terminator(Block(u32_of(b)));
-        if view.op(term) == Op::Return {
+        if matches!(view.op(term), Op::Return | Op::TailCall | Op::TailCallIndirect) {
             let at = to_idx(at_u32(view.data, term));
             let retc = to_idx(at_u32(view.extra, at));
             if retc >= 1 {
@@ -3849,12 +3860,14 @@ pub(crate) fn emit_sota_x64<'a>(
                         }
                     }
                 }
-                Op::Call | Op::CallIndirect => {
+                Op::Call | Op::CallIndirect | Op::TailCall | Op::TailCallIndirect => {
                     let at = to_idx(at_u32(view.data, inst));
                     let sig_id = SigId(at_u32(view.extra, at + 1));
                     let argc = to_idx(at_u32(view.extra, at + 2));
-                    let is_tail = at_bool(&tail_calls, inst);
-                    let direct_target = if op == Op::Call {
+                    let is_direct = matches!(op, Op::Call | Op::TailCall);
+                    let is_explicit_tail = matches!(op, Op::TailCall | Op::TailCallIndirect);
+                    let is_tail = is_explicit_tail || at_bool(&tail_calls, inst);
+                    let direct_target = if is_direct {
                         let rec = view.reference(RefId(at_u32(view.extra, at)));
                         Some(resolve_x64_outside(names, Outside::Func(rec.place), Space::Func, true, &mut out, inst)?)
                     } else {
@@ -3863,7 +3876,7 @@ pub(crate) fn emit_sota_x64<'a>(
                     gpr_moves.clear();
                     xmm_moves.clear();
                     const_writes.clear();
-                    if op == Op::CallIndirect {
+                    if !is_direct {
                         let cv = at_u32(view.extra, at);
                         gpr_moves.push((X64Loc::Gpr(R11), at_loc(&loc_of, to_idx(cv))));
                     }
@@ -3905,12 +3918,20 @@ pub(crate) fn emit_sota_x64<'a>(
                     if is_tail {
                         emit_epilogue(&mut code);
                         if let Some(target) = direct_target {
-                            let disp_at = u32_of(x64::jmp_rel32(&mut code));
-                            out.relocs.push(Reloc { at: disp_at, in_relro: false, kind: RelocKind::Pc32, target, addend: -4 });
+                            match call_mode {
+                                CallMode::DirectBl => {
+                                    let disp_at = u32_of(x64::jmp_rel32(&mut code));
+                                    out.relocs.push(Reloc { at: disp_at, in_relro: false, kind: RelocKind::Pc32, target, addend: -4 });
+                                }
+                                CallMode::GotSlot => {
+                                    let disp_at = u32_of(x64::jmp_rip_got(&mut code));
+                                    out.relocs.push(Reloc { at: disp_at, in_relro: false, kind: RelocKind::GotPc32, target, addend: -4 });
+                                }
+                            }
                         } else {
                             x64::jmp_r64(&mut code, R11);
                         }
-                        inst += 2;
+                        inst += if is_explicit_tail { 1 } else { 2 };
                         continue;
                     }
                     if let Some(target) = direct_target {

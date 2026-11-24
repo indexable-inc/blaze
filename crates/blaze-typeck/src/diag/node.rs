@@ -63,6 +63,7 @@ pub const fn expr_form(e: &Expr) -> &'static str {
         Expr::Break { .. } => "a `break`",
         Expr::Continue { .. } => "a `continue`",
         Expr::Return { .. } => "a `return`",
+        Expr::Become { .. } => "a `become`",
         Expr::Call { .. } => "a call",
         Expr::MethodCall { .. } => "a method call",
         Expr::Field { .. } => "a field access",
@@ -421,6 +422,10 @@ impl Sketch<'_, '_, '_, '_> {
                         }
                         Expr::Return { value: Some(v) } => {
                             self.out.write_str("return ")?;
+                            let _ = stack.push(SketchTask::Expr(v, d));
+                        }
+                        Expr::Become { value: v } => {
+                            self.out.write_str("become ")?;
                             let _ = stack.push(SketchTask::Expr(v, d));
                         }
                         Expr::Break { value: Some(v), .. } => {

@@ -670,6 +670,7 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
             Expr::Break { value, target } => self.break_(e, value, target),
             Expr::Continue { target } => self.continue_(e, target),
             Expr::Return { value } => self.return_(e, value),
+            Expr::Become { value } => self.return_(e, Some(value)),
             Expr::Let { .. } => self.refuse(Construct::LetChain, e),
             Expr::Call { callee, args } => self.call_into(dest, e, callee, args),
             Expr::MethodCall { receiver, args, .. } => self.method_into(dest, e, receiver, args),

@@ -122,6 +122,7 @@ pub(super) fn task_expr(t: &Task) -> Option<ExprId> {
         | Task::Break(e, _)
         | Task::Match(e)
         | Task::Call(e)
+        | Task::BecomeCall(e)
         | Task::OpCall(e)
         | Task::Unary(e, _)
         | Task::Deref(e)

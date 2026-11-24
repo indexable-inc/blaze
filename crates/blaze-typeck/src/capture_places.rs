@@ -758,6 +758,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             }
             Expr::Repeat { elem, .. } => cp.tasks.push(Task::Consume(elem)),
             Expr::Break { value, .. } | Expr::Return { value } => cp.tasks.extend(value.map(Task::Consume)),
+            Expr::Become { value } => cp.tasks.push(Task::Consume(value)),
             // A comparison takes its operands by reference (rustc's autoref of `PartialEq` and
             // `PartialOrd`, present when the closure is analysed); the others by value.
             Expr::Binary { op, lhs, rhs } => {

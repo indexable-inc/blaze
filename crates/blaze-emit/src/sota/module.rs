@@ -258,7 +258,7 @@ fn estimate_caller_live_pressure(view: View<'_>) -> (RegSet, RegSet) {
 
     let mut last_call: Option<usize> = None;
     for inst in 0..view.len() {
-        if matches!(view.op(inst), Op::Call | Op::Invoke | Op::CallIndirect | Op::InvokeIndirect) {
+        if matches!(view.op(inst), Op::Call | Op::Invoke | Op::CallIndirect | Op::InvokeIndirect | Op::TailCall | Op::TailCallIndirect) {
             last_call = Some(inst);
         }
     }
@@ -324,7 +324,7 @@ fn direct_callee_idx(
     names: &ImportedNames<'_, '_, '_>,
     input_bodies: &InputBodies<'_, '_, '_>,
 ) -> Option<usize> {
-    if !matches!(view.op(inst), Op::Call | Op::Invoke) {
+    if !matches!(view.op(inst), Op::Call | Op::Invoke | Op::TailCall) {
         return None;
     }
     let &data_at = view.data.get(inst)?;
@@ -613,11 +613,11 @@ pub fn compile_module_a64<'a, 'f, F: Tier>(
             if !used_fallback && !preserve_all_cold {
                 for inst in 0..view.len() {
                     match view.op(inst) {
-                        Op::Call | Op::Invoke => {
+                        Op::Call | Op::Invoke | Op::TailCall => {
                             let callee_clob = lookup_clobbers(inst).unwrap_or(CallClobbers::C_ABI_ARM64);
                             clobbers.clobbered = clobbers.clobbered.union(callee_clob.clobbered);
                         }
-                        Op::CallIndirect | Op::InvokeIndirect => {
+                        Op::CallIndirect | Op::InvokeIndirect | Op::TailCallIndirect => {
                             clobbers.clobbered = clobbers.clobbered.union(CallClobbers::C_ABI_ARM64.clobbered);
                         }
                         _ => {}

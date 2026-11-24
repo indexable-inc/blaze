@@ -1310,7 +1310,7 @@ impl Conv<'_, '_, '_, '_, '_> {
             Expr::Continue { target: Some(target) } => tc::Expr::Continue { target },
             Expr::Continue { target: None } => return self.refuse("a continue with no target", r),
             Expr::Return { value } => tc::Expr::Return { value },
-            Expr::Become { .. } => return self.refuse("`become`", r),
+            Expr::Become { value } => tc::Expr::Become { value },
             Expr::Yield { .. } => return self.refuse("`yield`", r),
             Expr::Call { callee, args } => {
                 self.call_arg_ints(args)?;
@@ -1930,6 +1930,7 @@ fn wire_inline_fors<'a>(out: &mut TypeckBody<'a>, alloc: Alloc<'a>) {
                             work.push(Work::Expr(x));
                         }
                     }
+                    tc::Expr::Become { value } => work.push(Work::Expr(value)),
                     tc::Expr::Block { stmts, tail, .. } | tc::Expr::ConstBlock { stmts, tail, .. } => {
                         if let Some(slice) = out.stmt_lists.get(stmts.range()) {
                             for &s in slice {

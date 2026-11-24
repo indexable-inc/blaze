@@ -1393,6 +1393,8 @@ fn check_subset(view: &View<'_>, has_lse: bool, has_crc32: bool, os: crate::Os) 
                 | Op::CallIndirect
                 | Op::Invoke
                 | Op::InvokeIndirect
+                | Op::TailCall
+                | Op::TailCallIndirect
                 | Op::Resume
         );
         if !ok {
@@ -1802,9 +1804,9 @@ fn check_subset(view: &View<'_>, has_lse: bool, has_crc32: bool, os: crate::Os) 
                     return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "non-func func_addr" });
                 }
             }
-            Op::Call | Op::CallIndirect => {
+            Op::Call | Op::CallIndirect | Op::TailCall | Op::TailCallIndirect => {
                 let at = to_idx(at_u32(view.data, inst));
-                if op == Op::Call {
+                if matches!(op, Op::Call | Op::TailCall) {
                     let rec = view.reference(RefId(at_u32(view.extra, at)));
                     if RefKind::from_word(rec.kind) != Some(RefKind::Func) {
                         return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "non-func call target" });
@@ -1812,9 +1814,30 @@ fn check_subset(view: &View<'_>, has_lse: bool, has_crc32: bool, os: crate::Os) 
                 }
                 let sig_id = SigId(at_u32(view.extra, at + 1));
                 check_sota_sig(view, sig_id, Some(u32_of(inst)), os)?;
+                let sig = view.sig(sig_id);
                 let argc = to_idx(at_u32(view.extra, at + 2));
-                if argc != view.sig(sig_id).params.len() {
+                if argc != sig.params.len() {
                     return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "call argc mismatch" });
+                }
+                if matches!(op, Op::TailCall | Op::TailCallIndirect) {
+                    let func_sig = view.sig(SigId(view.head.sig));
+                    if sig.rets.len() != func_sig.rets.len()
+                        || !sig.rets.iter().zip(func_sig.rets.iter()).all(|(a, b)| a.ty == b.ty && a.kind == b.kind && a.ext == b.ext)
+                    {
+                        return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "tail call return mismatch" });
+                    }
+                    let mut regs = Regs::new(os);
+                    for p in sig.params {
+                        if ParamKind::from_byte(p.kind) == Some(ParamKind::Byval) {
+                            return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "byval tail call arg" });
+                        }
+                        if ParamKind::from_byte(p.kind) == Some(ParamKind::Sret) {
+                            continue;
+                        }
+                        if regs.next(Ty(p.ty)).is_none() {
+                            return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "stacked tail call arg" });
+                        }
+                    }
                 }
             }
             Op::Invoke | Op::InvokeIndirect => {
@@ -2143,6 +2166,9 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
     let len = view.len();
     let blocks = view.blocks();
     let tail_calls = if preserve_all_cold {
+        if (0..len).any(|i| matches!(view.op(i), Op::TailCall | Op::TailCallIndirect)) {
+            return Err(TierError::Refused { tier: TIER, inst: None, what: "tail call in preserve_all_cold" });
+        }
         let mut tc: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(len, alloc);
         for _ in 0..len {
             tc.push(false);
@@ -2543,6 +2569,8 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                                 | Op::CallIndirect
                                 | Op::Invoke
                                 | Op::InvokeIndirect
+                                | Op::TailCall
+                                | Op::TailCallIndirect
                                 | Op::Udiv
                                 | Op::Sdiv
                                 | Op::Urem
@@ -2699,6 +2727,8 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                                 | Op::CallIndirect
                                 | Op::Invoke
                                 | Op::InvokeIndirect
+                                | Op::TailCall
+                                | Op::TailCallIndirect
                                 | Op::Udiv
                                 | Op::Sdiv
                                 | Op::Urem
@@ -5928,6 +5958,8 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                             | Op::CallIndirect
                             | Op::Invoke
                             | Op::InvokeIndirect
+                            | Op::TailCall
+                            | Op::TailCallIndirect
                             | Op::Memcpy
                             | Op::Memmove
                             | Op::Memset
@@ -10570,10 +10602,11 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                         }
                     }
                 }
-                Op::Call | Op::CallIndirect | Op::Invoke | Op::InvokeIndirect => {
+                Op::Call | Op::CallIndirect | Op::Invoke | Op::InvokeIndirect | Op::TailCall | Op::TailCallIndirect => {
                     let at = to_idx(at_u32(view.data, inst));
-                    let is_direct = matches!(op, Op::Call | Op::Invoke);
+                    let is_direct = matches!(op, Op::Call | Op::Invoke | Op::TailCall);
                     let is_invoke = matches!(op, Op::Invoke | Op::InvokeIndirect);
+                    let is_explicit_tail = matches!(op, Op::TailCall | Op::TailCallIndirect);
                     let sig_id = SigId(at_u32(view.extra, at + 1));
                     let sig = view.sig(sig_id);
                     let invoke_blocks = if is_invoke {
@@ -10587,7 +10620,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                         to_idx(at_u32(view.extra, at + 2))
                     };
                     let args_base = if is_invoke { at + 5 } else { at + 3 };
-                    let is_tail = !is_invoke && at_bool(&tail_calls, inst);
+                    let is_tail = is_explicit_tail || (!is_invoke && at_bool(&tail_calls, inst));
 
                     let direct_target = if is_direct {
                         let rec = view.reference(RefId(at_u32(view.extra, at)));
@@ -10765,14 +10798,27 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                         // Tail-Call Optimization: tear down frame (if any) and jump directly (`b` / `br`)!
                         emit_epilogue(&mut words);
                         if let Some(target) = direct_target {
-                            let b_at = u32_of(words.len() * 4);
-                            words.push(enc::b(0));
-                            out.relocs.push(Reloc { at: b_at, in_relro: false, kind: RelocKind::Branch26, target, addend: 0 });
+                            match call_mode {
+                                CallMode::DirectBl => {
+                                    let b_at = u32_of(words.len() * 4);
+                                    words.push(enc::b(0));
+                                    out.relocs.push(Reloc { at: b_at, in_relro: false, kind: RelocKind::Branch26, target, addend: 0 });
+                                }
+                                CallMode::GotSlot => {
+                                    let adrp_at = u32_of(words.len() * 4);
+                                    words.push(enc::adrp(X16, 0));
+                                    words.push(enc::ldr(Size::X, X16, X16, 0));
+                                    out.relocs.push(Reloc { at: adrp_at, in_relro: false, kind: RelocKind::GotPage21, target, addend: 0 });
+                                    out.relocs.push(Reloc { at: adrp_at + 4, in_relro: false, kind: RelocKind::GotPageOff12, target, addend: 0 });
+                                    words.push(enc::br(X16));
+                                }
+                            }
                         } else {
                             words.push(enc::br(X17));
                         }
-                        // Skip the immediately following `Op::Return`!
-                        inst += 2;
+                        // Skip the immediately following `Op::Return` for implicit TCO; explicit
+                        // `Op::TailCall`/`Op::TailCallIndirect` is already the block terminator.
+                        inst += if is_explicit_tail { 1 } else { 2 };
                         continue;
                     }
 

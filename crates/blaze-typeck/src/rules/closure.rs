@@ -762,6 +762,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     exprs.push((v, USE_MOVE));
                 }
             }
+            Expr::Become { value } => exprs.push((value, USE_MOVE)),
             Expr::Call { callee, args } => {
                 // An overloaded call has a checked receiver just like a method call.
                 // FnOnce consumes it. Fn and FnMut leave a borrow adjustment.
