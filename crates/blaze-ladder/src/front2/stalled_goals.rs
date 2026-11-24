@@ -283,7 +283,7 @@ impl<'a> Decision<'a> {
 /// rows pushed into `reads` (the module doc).
 pub fn decide_stalled_goals<'n, 'a, S: NamesSource<'n>>(
     r: &mut Records<'_, 'n, S>,
-    body: &Body<'n>,
+    body: &Body<'_>,
     done: &tc::Checked<'_>,
     interiors: &AsyncInteriors<'a>,
     reads: &mut AVec<'a, Read>,
@@ -584,7 +584,7 @@ impl AsyncInteriors<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use blaze_own::AVec;
     use blaze_typeck as tc;
 
@@ -592,6 +592,11 @@ mod tests {
     use crate::crates::{DirShelf, Inputs, Toolchain, UserCrate};
     use crate::front2::project::{BodyRef, ProjectWorld};
     use crate::refusal::SourceFile;
+
+    pub(crate) fn fixture_toolchain() -> Toolchain {
+        let home = std::env::var("HOME").expect("HOME");
+        Toolchain::open(&mut DirShelf::new(format!("{home}/.blaze/v2/toolchain"))).expect("fixture toolchain")
+    }
 
     /// WHEN an async block's interior is exact: its witness was lowered (blaze-flow-lower
     /// `lower_async_witness`) and kept ([`AsyncInteriors::keep`]), or the check's own record is
@@ -620,8 +625,7 @@ fn local_send() {
 fn main() {}
 "#;
         let alloc = blaze_own::testing::heap().alloc();
-        let home = std::env::var("HOME").expect("HOME");
-        let tc = Toolchain::open(&mut DirShelf::new(format!("{home}/.blaze/v2/toolchain"))).expect("fixture toolchain");
+        let tc = fixture_toolchain();
         let files = [("/refused/src/main.rs".to_owned(), SOURCE.to_owned())];
         let user = UserCrate {
             name: "refused", dir: "/refused/", root: "/refused/src/main.rs", files: &files,
@@ -669,5 +673,80 @@ fn main() {}
         assert!(!verdict.is_clean() && verdict.reads.is_none(), "{verdict:?}");
         let shown = format!("{:?}", verdict.refused);
         assert!(shown.contains(PLANTED), "the refusal names the witness: {shown}");
+    }
+
+    /// `check_body` (`LazyProgram::check_one` — the `blaze run`/`blaze test` path) must decide
+    /// stalled async `Send` goals on their exact witness interior rather than refusing with
+    /// `INTERIOR_GAP`, while still rejecting a future that genuinely holds `!Send` across an
+    /// `.await` with E0277.
+    #[test]
+    fn check_body_decides_stalled_async_send_and_rejects_rc_across_await() {
+        use crate::front2::keys::checker_of;
+        use crate::front2::program::lazy::LazyProgram;
+        use crate::seam::FrontEnd;
+
+        const SEND_OK: &str = r#"
+use std::future::Future;
+use std::pin::Pin;
+use std::rc::Rc;
+
+fn accept(_: Pin<Box<dyn Future<Output = ()> + Send>>) {}
+
+fn main() {
+    let fut: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async move {
+        let local = Rc::new(1u8);
+        drop(local);
+        async {}.await;
+    });
+    accept(fut);
+}
+"#;
+        const NOT_SEND: &str = r#"
+use std::future::Future;
+use std::pin::Pin;
+use std::rc::Rc;
+
+fn accept(_: Pin<Box<dyn Future<Output = ()> + Send>>) {}
+
+fn main() {
+    let fut: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async move {
+        let local = Rc::new(1u8);
+        async {}.await;
+        drop(local);
+    });
+    accept(fut);
+}
+"#;
+        let alloc = blaze_own::testing::heap().alloc();
+        let tc = fixture_toolchain();
+        let check_main = |name: &'static str, source: &'static str| {
+            let dir = format!("/{name}/");
+            let root = format!("/{name}/src/main.rs");
+            let files = [(root.clone(), source.to_owned())];
+            let user = UserCrate {
+                name, dir: &dir, root: &root, files: &files,
+                edition: edition::PackageEdition::of_manifest("2024").expect("Rust 2024"), panic: blaze_build::Panic::Unwind,
+            };
+            let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("fixture frame");
+            let erased = blaze_own::Erased::new(&frame);
+            let inputs = Inputs::new(&user, &tc).expect("fixture crate");
+            let crates = inputs.crates();
+            let names = inputs.resolve(&crates, erased.bump()).expect("fixture names");
+            let sources = [SourceFile { path: "src/main.rs", text: source }];
+            let main_key = names
+                .items(0)
+                .find_map(|(item, _, _)| (names.item_text(item).and_then(|t| t.name) == Some("main")).then_some(checker_of(item)))
+                .expect("fixture `main`");
+            let mut lazy = LazyProgram::new(&names, &frame, &sources, Some(main_key), alloc).expect("lazy program");
+            lazy.check_one(main_key).map(|_| ())
+        };
+
+        check_main("stalled_ok", SEND_OK).expect("dropped-before-await Rc must check clean via LazyProgram::check_one");
+        let err = check_main("stalled_err", NOT_SEND).expect_err("held-across-await Rc must be rejected by LazyProgram::check_one");
+        let shown = format!("{err:?}");
+        assert!(
+            shown.contains("E0277") && shown.contains("Send"),
+            "expected E0277 Send diagnostic for non-Send future, got: {shown}"
+        );
     }
 }

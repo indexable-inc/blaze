@@ -3000,7 +3000,7 @@ fn gap_words<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, callee: tc::ItemKey
 /// `FutureWitness` by `decide_stalled_goals`, never a pass (rule 3).
 pub(super) fn witness_and_decide<'n, 'a, S: NamesSource<'n>>(
     r: &mut Records<'_, 'n, S>,
-    body: &Body<'n>,
+    body: &Body<'_>,
     done: &tc::Checked<'_>,
     reads: &mut AVec<'a, Read>,
     alloc: Alloc<'a>,

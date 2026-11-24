@@ -82,7 +82,7 @@ pub const TERM_NODES: usize = 1 << 16;
 pub const READS_CAP: usize = 1 << 20;
 
 /// What a row asked (the module doc's list). The byte is the question's first.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 #[repr(u8)]
 pub enum ReadKind {
     Adt = 1,
