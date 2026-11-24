@@ -143,9 +143,10 @@
 //! - **No variant.** An enum of no inhabited variant is uninhabited: it has no value, and
 //!   code that would hold one is unreachable. A variant that is absent from the layout
 //!   (uninhabited, its fields all zero-sized) has no fields to write.
-//! - **Copies.** A copy switches on the discriminant, copies that variant's fields alone,
-//!   then writes its tag ([`layout::Layouts::tag_write`]; none for a niche variant whose
-//!   field holds it): a copy never reads a byte that the value's variant does not define.
+//! - **Copies.** Aggregate copies (structs, tuples, arrays, unions, enums, and coroutine states)
+//!   emit one byte-and-provenance-preserving bulk copy (`Op::Memcpy` when statically disjoint,
+//!   `Op::Memmove` otherwise) rather than expanding nested enums into per-variant switch trees.
+//!   LIR `sroa`/`memopt` and the backends lower small constant-length copies to loads and stores.
 //! - **Construction.** A tuple variant's ctor call `V(a, b)`, a unit variant `V` and a struct
 //!   variant literal `V { .. }` write the tag, then each field, in a temporary (layout keeps
 //!   another variant's fields clear of a niche, so the order is free).

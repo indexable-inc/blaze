@@ -308,20 +308,6 @@ enum Home {
     At(Value, i32),
 }
 
-/// One step of an aggregate copy (`Walk::copy`).
-#[derive(Clone, Copy)]
-enum CopyStep {
-    Copy { repr: Repr, from: (Value, i32), to: (Value, i32) },
-    /// The end of a loop's body over an array: the next element, or out.
-    Next { i: Value, header: Block, exit: Block },
-    /// Start building into a block (an enum variant's copy, or the copy's join).
-    Begin(Block),
-    /// The end of an enum variant's copy: on to the join.
-    Jump(Block),
-    /// Write variant `variant`'s tag of enum layout `id` at `to` (after its fields).
-    Tag { id: LayoutId, variant: u32, to: (Value, i32) },
-}
-
 /// What `break` and `continue` reach: a loop, or a block a `break` leaves.
 #[derive(Clone, Copy)]
 struct Target {
@@ -1894,147 +1880,61 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         }
     }
 
+    /// Whether `[from, from + size)` and `[to, to + size)` are statically provably disjoint.
+    fn copy_disjoint(&self, from: (Value, i32), to: (Value, i32), size: u32) -> bool {
+        let view = self.b.func().view();
+        let slot_of = |v: Value| {
+            let ix = v.index();
+            (ix < view.len() && view.op(ix) == Op::SlotAddr).then(|| view.operands(ix).slot())
+        };
+        let is_non_slot_disjoint = |v: Value| {
+            let ix = v.index();
+            self.sret == Some(v) || (ix < view.len() && matches!(view.op(ix), Op::DataAddr | Op::TlsAddr))
+        };
+        match (slot_of(from.0), slot_of(to.0)) {
+            (Some(a), Some(b)) => a != b || i64::from(from.1).abs_diff(i64::from(to.1)) >= u64::from(size),
+            (Some(_), None) => is_non_slot_disjoint(to.0),
+            (None, Some(_)) => is_non_slot_disjoint(from.0),
+            (None, None) => false,
+        }
+    }
+
     /// Copies layout `l`'s `size` bytes from one place to another, whatever they hold, as one
-    /// `memcpy`. A union's bytes may be uninitialised past the field written, and may carry a
-    /// pointer's provenance: LIR's `memcpy` keeps both ("Bytes keep their provenance"), while
-    /// an integer load of an uninitialised byte is undefined and an integer drops provenance.
-    /// The backends lower a small `memcpy` of a known length to loads and stores themselves.
+    /// `memcpy` (when statically disjoint) or `memmove` (otherwise). LIR's bulk copy preserves
+    /// both uninitialised/padding bytes and pointer provenance ("Bytes keep their provenance"),
+    /// avoids exploding nested enums into exponential per-variant switch trees, and lets LIR's
+    /// `sroa`/`memopt` and the backends lower small constant-length copies to loads and stores.
     fn copy_bytes(&mut self, l: u32, from: (Value, i32), to: (Value, i32)) {
         // The walk's `Layout::size` is a `u32`; its `align` and `MemAttrs::align` are both log2
         // of the alignment in bytes.
         let (size, align) = (self.layouts[l as usize].size, self.layouts[l as usize].align);
-        if size == 0 {
+        if size == 0 || from == to {
             return;
         }
+        let op = if self.copy_disjoint(from, to, size) { Op::Memcpy } else { Op::Memmove };
         let (src, dst) = (self.address(from), self.address(to));
         let len = self.b.iconst(Ty::I64, u128::from(size));
         let mut attrs = MemAttrs::aligned(align);
         attrs.src_align = align;
-        self.b.bulk(Op::Memcpy, Flags::NONE, dst, src, len, attrs);
+        self.b.bulk(op, Flags::NONE, dst, src, len, attrs);
     }
 
-    /// Copies a value of `repr` from one place to another, scalar leaf by scalar leaf (never
-    /// the padding), by a work list: a struct's or tuple's fields in turn, an array's elements
-    /// unrolled up to `UNROLL_LEAVES` leaves and in a loop beyond.
+    /// Copies a value of `repr` from one place to another: scalars as load+store, aggregates as
+    /// one byte-and-provenance-preserving bulk copy (`Op::Memcpy` / `Op::Memmove`).
     fn copy(&mut self, repr: Repr, from: (Value, i32), to: (Value, i32)) -> Result<(), BuildError> {
         let before = self.b.func().ops.len();
-        let copied = self.copy_leaves(repr, from, to);
-        self.copy_insts += (self.b.func().ops.len() - before) as u64;
-        copied
-    }
-
-    /// [`Walk::copy`]'s work, counted by it.
-    fn copy_leaves(&mut self, repr: Repr, from: (Value, i32), to: (Value, i32)) -> Result<(), BuildError> {
-        let mut stack = Vec::new_in(self.alloc);
-        stack.push(CopyStep::Copy { repr, from, to });
-        while let Some(step) = stack.pop() {
-            let (repr, from, to) = match step {
-                CopyStep::Copy { repr, from, to } => (repr, from, to),
-                CopyStep::Next { i, header, exit } => {
-                    let one = self.b.iconst(Ty::I64, 1);
-                    let next = self.b.binary(Op::Add, Flags::NONE, i, one);
-                    self.jump(header, &[next]);
-                    self.begin(exit);
-                    continue;
-                }
-                CopyStep::Begin(block) => {
-                    self.begin(block);
-                    continue;
-                }
-                CopyStep::Jump(block) => {
-                    self.jump(block, &[]);
-                    continue;
-                }
-                CopyStep::Tag { id, variant, to } => {
-                    self.write_tag(Some(id), variant, to);
-                    continue;
-                }
-            };
-            let l = match repr.kept() {
-                Kept::None => continue,
-                Kept::Agg(l) => l,
-                Kept::Scalar(ty) => {
+        match repr.kept() {
+            Kept::None => {}
+            Kept::Scalar(ty) => {
+                if from != to {
                     let attrs = self.mem(repr);
                     let x = self.b.load(ty, Flags::NONE, from.0, from.1, attrs);
                     self.b.store(Flags::NONE, x, to.0, to.1, attrs);
-                    continue;
-                }
-            };
-            // A coroutine's state is copied whole: what the pass keeps in it and its tag are no
-            // field of its row (coroutine.rs `copy_state`).
-            if self.copy_state(l, from, to) {
-                continue;
-            }
-            // A union is copied as its bytes, never by its fields and never switching on a tag:
-            // the layout does not know which field is live (the Reference, "Unions": reading a
-            // field reinterprets the bytes; the copy keeps every byte, uninitialised ones too).
-            // `MaybeUninit<T>` is one: `uninit()` leaves `value: ManuallyDrop<T>`'s bytes unwritten.
-            if self.layouts[l as usize].is_union {
-                self.copy_bytes(l, from, to);
-                continue;
-            }
-            match self.layouts[l as usize].shape {
-                Shape::Fields { first, len } => {
-                    for i in (first..first + len).rev() {
-                        let (_, off, repr) = self.layout_fields[i as usize];
-                        let off = off as i32;
-                        stack.push(CopyStep::Copy { repr, from: (from.0, from.1 + off), to: (to.0, to.1 + off) });
-                    }
-                }
-                Shape::Array { elem, len, stride } => {
-                    if self.layouts[l as usize].leaves <= UNROLL_LEAVES {
-                        for i in (0..len).rev() {
-                            let off = (i * stride) as i32;
-                            stack.push(CopyStep::Copy { repr: elem, from: (from.0, from.1 + off), to: (to.0, to.1 + off) });
-                        }
-                        continue;
-                    }
-                    let (i, fp, tp, header, exit) = self.array_loop(len, stride, from, to);
-                    stack.push(CopyStep::Next { i, header, exit });
-                    stack.push(CopyStep::Copy { repr: elem, from: (fp, 0), to: (tp, 0) });
-                }
-                // Switch on the variant, copy its fields alone, write its tag (lib.rs, "Enums"):
-                // a copy never reads a byte the value's variant leaves undefined.
-                Shape::Enum { id, first, len } => {
-                    if self.layouts[l as usize].leaves == 0 {
-                        continue;
-                    }
-                    let fields = |w: &Self, v: u32, stack: &mut Vec<CopyStep, A>| {
-                        let (f, n) = w.layout_variants[(first + v) as usize];
-                        for i in (f..f + n).rev() {
-                            let (_, off, repr) = w.layout_fields[i as usize];
-                            let off = off as i32;
-                            stack.push(CopyStep::Copy { repr, from: (from.0, from.1 + off), to: (to.0, to.1 + off) });
-                        }
-                    };
-                    match self.ls.get(id).variants {
-                        // One present variant and no tag: its fields.
-                        Variants::Single { index } if index < len => fields(self, index, &mut stack),
-                        Variants::Single { .. } => {}
-                        Variants::Multiple { .. } => {
-                            let d = self.read_discriminant(id, from)?;
-                            let join = self.create();
-                            let none = self.create();
-                            stack.push(CopyStep::Begin(join));
-                            let mut cases = Vec::new_in(self.alloc);
-                            for v in (0..len).rev() {
-                                let case = self.discriminant_case(id, v)?;
-                                let block = self.create();
-                                cases.push((case, block));
-                                stack.push(CopyStep::Jump(join));
-                                stack.push(CopyStep::Tag { id, variant: v, to });
-                                fields(self, v, &mut stack);
-                                stack.push(CopyStep::Begin(block));
-                            }
-                            self.switch(d, none, &cases);
-                            // No variant has another discriminant: holding one is UB.
-                            self.begin(none);
-                            self.unreachable_of_enum(id, len, self.task_at)?;
-                        }
-                    }
                 }
             }
+            Kept::Agg(l) => self.copy_bytes(l, from, to),
         }
+        self.copy_insts += (self.b.func().ops.len() - before) as u64;
         Ok(())
     }
 

@@ -1565,9 +1565,10 @@ fn a_struct_is_returned_through_the_result_pointer() {
     let mk = build_instance(&w, &callee, ItemKey(3), root, &[], &mut g).unwrap_or_else(|e| panic!("{e}"));
     let text = blaze_lir::print(mk.func.view());
     assert_eq!(own_sig(&mk), (vec_of(&[Ty::PTR, Ty::I32, Ty::I8]), vec_of(&[])), "{text}");
-    // The result pointer is the entry's first parameter, `v0`; both fields are stored through it.
-    let through = text.lines().filter(|l| l.contains("store") && l.contains("v0")).count();
-    assert_eq!(through, 2, "{text}");
+    // The result pointer is the entry's first parameter, `v0`; the struct is copied through it
+    // as one disjoint `memcpy` (not field-by-field stores).
+    let through = text.lines().filter(|l| l.contains("memcpy v0,")).count();
+    assert_eq!(through, 1, "{text}");
 
     w.func(1, "main", &[], I32);
     let mut b = BodyBuf::new();
@@ -2166,6 +2167,11 @@ fn an_enum_is_built_copied_and_matched() {
         Some(take),
     );
     let built = build(&w, &b, root).unwrap_or_else(|e| panic!("{e}"));
+    // Copying `let f = e` emits a single bulk `memcpy` (not a per-variant switch tree): only
+    // the two source `match` expressions (`match k` and `match f`) emit `switch`.
+    let text = blaze_lir::print(built.func.view());
+    assert_eq!(text.lines().filter(|l| l.trim_start().starts_with("switch ")).count(), 2, "{text}");
+    assert!(text.contains("memcpy "), "{text}");
     assert_eq!(one(&built, &[Val::Int(0)]), 1);
     assert_eq!(one(&built, &[Val::Int(1)]), 42);
     assert_eq!(one(&built, &[Val::Int(2)]), 109);
