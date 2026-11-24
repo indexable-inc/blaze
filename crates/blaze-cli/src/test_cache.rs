@@ -6,11 +6,14 @@
 //! `test.<suite_id>` (`store/roots.rs::keep_test_suite`).
 //!
 //! Soundness (rules 4, 21, 25):
-//! - A test pass is kept ONLY when it ran sandboxed, harnessed, with no native C library,
-//!   every entered Rust function and static was keyed (`CodeKey`), and every entered code
-//!   record passed [`check_record_purity`] (no impure foreign C symbols, no raw `svc`/system-reg
-//!   instructions). Any test that touches wall clock, filesystem, env, randomness, network,
-//!   threads, or unknown foreign code is marked `NotKept` by name and always reruns.
+//! - A test pass is kept ONLY when it ran sandboxed, harnessed, without loading any native C
+//!   library (suites with a native image that overrides no pure libc symbol load it lazily only
+//!   if the test actually publishes an impure/foreign record or datum, running any C initializers
+//!   lazily before entering the first foreign function), every entered Rust function and static was keyed (`CodeKey`), and every entered code record
+//!   and datum passed [`check_record_purity`] / [`check_datum_purity`] (no impure foreign C
+//!   symbols, no raw `svc`/system-reg instructions). Any test that touches wall clock, filesystem,
+//!   env, randomness, network, threads, or unknown foreign code is marked `NotKept` by name and
+//!   always reruns.
 //! - On a subsequent run, every previously entered function's current [`CodeKey`] is recomputed
 //!   from `RunIds` via [`blaze_ladder::body_ids::instance_key`] (pure hashing, zero compilation).
 //!   Unchanged tests are reused via `blaze-run::plan::Plan`'s coarse proof without running;
@@ -19,6 +22,7 @@
 
 use blaze_cas::Key as CasKey;
 use blaze_cas::plain::{Lent, LentError, Namespace};
+use blaze_code::datum::DatumView;
 use blaze_code::record::{CodeView, Space, Symbol as CodeSymbol};
 use blaze_core::Driver;
 use blaze_hash::{BuildKeyHasher, FixedState, Map, MapOpts, Set};
@@ -219,7 +223,25 @@ pub(crate) fn check_record_purity(bytes: &[u8]) -> Result<(), NotKept> {
     Ok(())
 }
 
-fn classify_outside_symbol(raw: &str) -> Result<(), NotKept> {
+/// Checks whether a static, thread-local, or vtable [`DatumView`] references only provably pure
+/// external C symbols (no function pointers to foreign C code or addresses of foreign C globals).
+pub(crate) fn check_datum_purity(bytes: &[u8]) -> Result<(), NotKept> {
+    let Ok(view) = DatumView::read(bytes) else {
+        return Err(NotKept::Untraced);
+    };
+    for i in 0..view.targets() {
+        let target = view.target(i);
+        if target.space == Space::Outside {
+            let Some(name) = view.name(target.symbol) else {
+                return Err(NotKept::Foreign);
+            };
+            classify_outside_symbol(name)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn classify_outside_symbol(raw: &str) -> Result<(), NotKept> {
     match raw {
         // Wall clock, monotonic time reads, and sleeps.
         "clock_gettime"
@@ -687,6 +709,7 @@ impl<'a, 'm, D: Driver> TestCache<'a, 'm, D> {
     /// Answers `Effect::Look`: recomputes `test`'s address from its previous head row's asks
     /// answered with today's code identities, and checks whether a `BZTR` pass exists there.
     pub(crate) fn look(&self, suite: SuiteId, test: TestId) -> Result<bool, DriveError> {
+        let suite = self.resolve_suite(suite, test);
         let Ok(idx) = usize::try_from(suite.0) else { return Ok(false) };
         let Some(slot) = self.suites.get(idx) else { return Ok(false) };
         let Some(head_bytes) = slot.head_bytes else { return Ok(false) };
@@ -878,7 +901,8 @@ impl<D: Driver> Answers for TestCache<'_, '_, D> {
 }
 
 impl<D: Driver> Filed for TestCache<'_, '_, D> {
-    fn file(&mut self, suite: SuiteId, _test: TestId, address: Address, slot: Slot, bytes: &[u8]) -> Result<(), DriveError> {
+    fn file(&mut self, suite: SuiteId, test: TestId, address: Address, slot: Slot, bytes: &[u8]) -> Result<(), DriveError> {
+        let suite = self.resolve_suite(suite, test);
         let key = result_slot_key(address, slot);
         let store_err = |e: LentError| DriveError::CacheStore { what: "writing test result record", why: CacheError::Store(e) };
         self.lent.put(&key, Namespace::LOCAL, TestRun::TAG, bytes).map_err(store_err)?;
@@ -1134,5 +1158,29 @@ mod tests {
         let mut stale = Set::new(blaze_hash::SetOpts { hasher: FixedState, alloc, capacity: None });
         assert_eq!(decode_verified(bytes.as_slice(), &moved, &mut stale), None);
         assert!(stale.is_empty());
+    }
+
+    #[test]
+    fn check_datum_purity_separates_pure_and_foreign_datums() {
+        assert_eq!(check_datum_purity(b"not a datum"), Err(NotKept::Untraced));
+
+        let alloc = blaze_own::testing::heap().alloc();
+        let build_datum = |outside: Option<&str>| {
+            let mut d = blaze_code::datum::Datum::new_in(blaze_code::datum::Place::ReadOnly, 8, alloc);
+            d.bytes.extend_from_slice(&[0u8; 8]);
+            if let Some(name) = outside {
+                let target = d.outside(name);
+                d.words.push(blaze_code::record::Word { at: 0, target, addend: 0 });
+            }
+            let sealed = d.seal().expect("seal synthetic Datum");
+            let mut out = Vec::new_in(alloc);
+            sealed.encode(&mut out);
+            out
+        };
+
+        assert_eq!(check_datum_purity(&build_datum(None)), Ok(()));
+        assert_eq!(check_datum_purity(&build_datum(Some("memcpy"))), Ok(()));
+        assert_eq!(check_datum_purity(&build_datum(Some("clock_gettime"))), Err(NotKept::Clock));
+        assert_eq!(check_datum_purity(&build_datum(Some("secp256k1_ecdsa_verify"))), Err(NotKept::Foreign));
     }
 }

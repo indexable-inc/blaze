@@ -244,21 +244,33 @@ pub struct Loaded {
     pub inits: u32,
 }
 
+/// One declared native word slot paired with whether `Down::Native` newly numbered it.
+/// Newly numbered slots must be stubbed before their thunks are written into the image;
+/// slots declared earlier in the run (during lazy loading) already have a stub or published
+/// body and must NOT be re-stubbed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct NativeWordSlot {
+    pub slot: SlotId,
+    pub is_new: bool,
+}
+
 /// The load's order (the module's steps 1 to 4).
 pub struct NativeLoad;
 
 impl NativeLoad {
-    /// Stubs each declared slot through `memory`, opens the record, checks the descriptor,
+    /// Stubs each newly declared slot through `memory`, opens the record, checks the descriptor,
     /// fills word i with `memory.thunk(slot_i)`, then each pointer row's cell with its word's
     /// thunk. `slots[i]` is the local slot of the parent's pair i.
     pub fn start<N: Natives, M: Memory>(
         record: RecordId,
-        slots: &[SlotId],
+        slots: &[NativeWordSlot],
         natives: &mut N,
         memory: &mut M,
     ) -> Result<Loaded, RunModeError> {
-        for &slot in slots {
-            memory.stub(slot)?;
+        for &word in slots {
+            if word.is_new {
+                memory.stub(word.slot)?;
+            }
         }
         let base = natives.open(record).map_err(RunModeError::Native)?;
         let d = natives.descriptor(record).map_err(RunModeError::Native)?;
@@ -272,8 +284,9 @@ impl NativeLoad {
         if d.words != declared {
             return refuse(NativeError::Words { record, image: d.words, declared });
         }
-        for (index, &slot) in slots.iter().enumerate() {
-            natives.write_word(base + d.word_at + 8 * index as u64, memory.thunk(slot));
+        for (index, &word) in slots.iter().enumerate() {
+            let offset = u64::try_from(index).unwrap_or(u64::MAX).saturating_mul(8);
+            natives.write_word(base + d.word_at + offset, memory.thunk(word.slot));
         }
         // Checked whole before the first cell is written: a refused row leaves no half-filled
         // data behind (the process stops on the error anyway, but nothing ran with it).
@@ -288,7 +301,8 @@ impl NativeLoad {
         }
         for row in 0..d.pointers {
             let r = natives.pointer_row(base + d.pointer_at + POINTER_ROW_LEN * u64::from(row));
-            natives.write_word(base + r.at, memory.thunk(slots[r.word as usize]));
+            let word_idx = usize::try_from(r.word).unwrap_or(usize::MAX);
+            natives.write_word(base + r.at, memory.thunk(slots[word_idx].slot));
         }
         Ok(Loaded { record, base, inits_at: base + d.init_at, inits: d.inits })
     }

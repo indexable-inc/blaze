@@ -1487,6 +1487,93 @@ fn the_native_library_is_the_first_frame() {
     std::println!("native: the library told first, its words slots 0 and 1; told late refused");
 }
 
+/// Asserts that `Needs::arm_lazy_native` sends NO `Down::Native` for pure records, sends
+/// `Down::Native` BEFORE `Down::Publish` on the first foreign publication while reusing any
+/// already-declared word slot (and assigning fresh slots to remaining words in word order), and
+/// sends `Down::Native` at most once even if multiple foreign publications follow.
+#[test]
+fn lazy_native_sends_before_first_foreign_record_and_reuses_declared_slots() {
+    let frame = bstd::mem::Frame::with_reserve(1 << 20, bstd::mem::Tag::Other).expect("the test's frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let alloc = erased.handle();
+    let word_a = Symbol([1; 32]);
+    let word_b = Symbol([2; 32]);
+    let foreign_1 = Symbol([3; 32]);
+    let foreign_2 = Symbol([4; 32]);
+    let words = [word_a, word_b];
+    let library = RecordId([5; 32]);
+
+    struct LazyModel {
+        foreign_1: Symbol,
+        foreign_2: Symbol,
+    }
+    impl Resolve for LazyModel {
+        fn resolve(&mut self, symbol: &Symbol) -> Result<Resolved<'_>, ParentError> {
+            Ok(Resolved::Record {
+                key: CodeKey(blaze_ids::ContentId(symbol.0)),
+                record: RecordId(symbol.0),
+                declares: &[],
+                data: &[],
+                named: &[],
+                sent: Sent::NONE,
+            })
+        }
+
+        fn publication_with_native(
+            &mut self,
+            symbol: &Symbol,
+            _values: &mut AVec<'_, u8>,
+            needs_native: &mut bool,
+        ) -> Result<Resolved<'_>, ParentError> {
+            if *symbol == self.foreign_1 || *symbol == self.foreign_2 {
+                *needs_native = true;
+            }
+            self.resolve(symbol)
+        }
+    }
+
+    let mut needs = Needs::new(alloc);
+    needs.arm_lazy_native(library, &words);
+    let mut out = wire_out(alloc);
+    needs.name_personality(Some(CodeSymbol([9; 32])), &mut out).expect("personality");
+
+    let mut model = LazyModel { foreign_1, foreign_2 };
+    // 1. Pure call to `word_a` (also exported to C): assigns slot 1 and must NOT send `Native`.
+    out.clear();
+    assert!(needs.answer(Needed::Symbol(word_a), &mut model, &mut out).expect("pure answer"));
+    let pure_frames = frames(&out);
+    assert!(
+        !pure_frames.iter().any(|f| f.starts_with("Native ")),
+        "pure record must not trigger Down::Native: {pure_frames:?}"
+    );
+
+    // 2. First foreign call: must emit `Native 5 2` BEFORE `Declare`/`Publish`, reusing slot 1
+    //    for `word_a` and assigning slot 2 for `word_b`, then slot 3 for `foreign_1`.
+    out.clear();
+    assert!(needs.answer(Needed::Symbol(foreign_1), &mut model, &mut out).expect("foreign 1"));
+    let foreign_frames = frames(&out);
+    assert_eq!(foreign_frames.first().map(|s| s.as_str()), Some("Native 5 2"), "Native must precede foreign Publish: {foreign_frames:?}");
+    let (_, first) = Down::decode(split(&out).expect("frame").expect("one").0).expect("down");
+    let Down::Native { words: told, .. } = first else { panic!("first frame must be Native") };
+    let pairs: AVec<'_, (Symbol, u32)> = {
+        let mut p = AVec::new_in(alloc);
+        for it in told.iter() {
+            p.push((it.symbol, it.slot.0));
+        }
+        p
+    };
+    assert_eq!(pairs.as_slice(), &[(word_a, 1), (word_b, 2)], "word_a reuses slot 1; word_b gets slot 2");
+
+    // 3. Second foreign call: Native already sent, must NOT send a second Native frame.
+    out.clear();
+    assert!(needs.answer(Needed::Symbol(foreign_2), &mut model, &mut out).expect("foreign 2"));
+    let second_frames = frames(&out);
+    assert!(
+        !second_frames.iter().any(|f| f.starts_with("Native ")),
+        "Native must be sent at most once: {second_frames:?}"
+    );
+}
+
 /// The toy's maker as a code worker keeps it: made for one start class (test_drive.rs
 /// `MadeFor`).
 struct ToyKept<'t> {

@@ -603,6 +603,16 @@ pub(crate) trait Resolve {
     fn publication(&mut self, symbol: &Symbol, _values: &mut AVec<'_, u8>) -> Result<Resolved<'_>, ParentError> {
         self.resolve(symbol)
     }
+    /// Resolves a publication and sets `*needs_native = true` when the record or any accompanying
+    /// datum requires the suite's lazily-armed native library before placement.
+    fn publication_with_native(
+        &mut self,
+        symbol: &Symbol,
+        values: &mut AVec<'_, u8>,
+        _needs_native: &mut bool,
+    ) -> Result<Resolved<'_>, ParentError> {
+        self.publication(symbol, values)
+    }
     /// The sink the run's events go to (blaze-screen [`Watch`]): the loop tells it when the
     /// program starts and when a need is answered. [`Unwatched`] unless the resolver has one.
     fn watch(&self) -> &dyn Watch {
@@ -2077,6 +2087,9 @@ pub(crate) struct Needs<'a> {
     /// Where the program struck, as its crash handler told it (`Up::Fault`): the first one
     /// read, said by name once the program has ended (run_fault.rs).
     fault: Option<blaze_launch::wire::fault::Fault>,
+    /// Native library armed for lazy mid-run delivery (`arm_lazy_native`): sent at most once,
+    /// before the first impure/foreign record or datum (or warm impure pre-publish batch).
+    pending_native: Option<(RecordId, &'a [Symbol])>,
 }
 
 /// What a `Publish` stands on ([`Needs::publish`]): how the statics its record names are on the
@@ -2116,6 +2129,7 @@ impl<'a> Needs<'a> {
             answered: 0,
             resolved: 0,
             fault: None,
+            pending_native: None,
         }
     }
 
@@ -2379,6 +2393,43 @@ impl<'a> Needs<'a> {
         Ok(())
     }
 
+    /// Arms a lazy native library to be delivered on demand ([`Self::flush_pending_native`])
+    /// before the first foreign/impure publication, instead of eagerly at start.
+    pub(crate) fn arm_lazy_native(&mut self, library: RecordId, words: &'a [Symbol]) {
+        self.pending_native = Some((library, words));
+    }
+
+    /// Sends `Down::Native` lazily mid-run (after slots have already been numbered) before
+    /// publishing a foreign record or datum. Flushes any pending `Declare` pairs first, assigns
+    /// or reuses each word's slot in word order, and encodes `Down::Native` carrying all
+    /// `words.len()` pairs. Any newly numbered word slots are declared by `Down::Native` itself.
+    pub(crate) fn tell_native_lazy<A: Allocator>(
+        &mut self,
+        library: RecordId,
+        words: &[Symbol],
+        out: &mut WireOut<A>,
+    ) -> Result<(), ParentError> {
+        self.declare(out)?;
+        let mut all: AVec<'_, Declared> = Vec::with_capacity_in(words.len(), self.alloc);
+        for &symbol in words {
+            let slot = self.slot_of(symbol)?;
+            all.push(Declared { symbol, slot });
+        }
+        let id = self.id();
+        Down::Native { library, words: List::of(all.as_slice()) }.encode(id, out)?;
+        // Newly numbered word slots were declared in `Down::Native`: not again in the next `Declare`.
+        self.pairs.clear();
+        Ok(())
+    }
+
+    /// Sends the armed lazy native library if not yet sent; a no-op once sent or when unarmed.
+    pub(crate) fn flush_pending_native<A: Allocator>(&mut self, out: &mut WireOut<A>) -> Result<(), ParentError> {
+        let Some((library, words)) = self.pending_native.take() else {
+            return Ok(());
+        };
+        self.tell_native_lazy(library, words, out)
+    }
+
     /// The program's personality routine named before anything is published (UNWIND.md 3.3,
     /// piece P3; blaze-launch wire/personality.rs): its symbol's slot numbered and told in a
     /// `Declare`, then `Down::Personality` naming that slot, once. The symbol is NOT resolved:
@@ -2485,7 +2536,8 @@ impl<'a> Needs<'a> {
             Some(Met::Unknown { .. }) => self.failed(need, out).map(|()| true),
             Some(Met::Declared(_)) | None => {
                 let mut values = Vec::new_in(self.alloc);
-                match resolve.publication(&symbol, &mut values)? {
+                let mut needs_native = false;
+                match resolve.publication_with_native(&symbol, &mut values, &mut needs_native)? {
                     Resolved::Waiting => Ok(false),
                     Resolved::Unknown => {
                         self.resolved += 1;
@@ -2493,6 +2545,10 @@ impl<'a> Needs<'a> {
                         self.failed(need, out).map(|()| true)
                     }
                     Resolved::Record { key, record, declares, data, named, sent } => {
+                        // Lazy native library first: must load before any foreign `Data`/`Publish`.
+                        if needs_native {
+                            self.flush_pending_native(out)?;
+                        }
                         // The bytes first: nothing may name a record before its bytes.
                         self.send(sent, out)?;
                         self.resolved += 1;

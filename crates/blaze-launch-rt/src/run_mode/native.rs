@@ -7,26 +7,26 @@
 use blaze_launch::wire::run::Declared;
 use blaze_launch::wire::{List, RecordId};
 use blaze_own::{AVec, Vec};
-use blaze_run::SlotId;
 
 use super::{Act, Memory, RunMode, RunModeError};
-use crate::native_lib::{Loaded, NativeError, NativeLoad, Natives};
+use crate::native_lib::{Loaded, NativeError, NativeLoad, NativeWordSlot, Natives};
 
 /// Where the run is with its native library.
 pub(super) enum NativeState<'a> {
     /// No `Native` yet.
     Waiting,
-    /// The parent's `Native` named `record`; `slots[i]` is the local slot of its pair i. The
-    /// driver loads it on the [`Act::Native`] that followed.
-    Declared { record: RecordId, slots: AVec<'a, SlotId> },
+    /// The parent's `Native` named `record`; `slots[i]` is the local slot of its pair i and
+    /// whether it was newly declared (needs stubbing) or already declared earlier in the run.
+    /// The driver loads it on the [`Act::Native`] that followed.
+    Declared { record: RecordId, slots: AVec<'a, NativeWordSlot> },
     Loaded(Loaded),
 }
 
 impl<'a> RunMode<'a> {
     /// `Down::Native { library, words }`: declares each pair (as `Declare` does: the parent's
     /// slot number for the symbol, fixed for the run) and asks the driver to load `library`.
-    /// Its slots are stubbed by the load itself (NativeLoad::start, before any word is filled),
-    /// so no `Act::Stub` is pushed for them here.
+    /// Newly declared slots are stubbed by the load itself (`NativeLoad::start`, before any word
+    /// is filled); already-declared slots keep their existing stub or published body.
     pub(super) fn on_native(
         &mut self,
         library: RecordId,
@@ -36,10 +36,10 @@ impl<'a> RunMode<'a> {
         if !matches!(self.native, NativeState::Waiting) {
             return Err(RunModeError::Native(NativeError::Twice { record: library }));
         }
-        let mut slots: AVec<'a, SlotId> = Vec::new_in(self.alloc);
+        let mut slots: AVec<'a, NativeWordSlot> = Vec::new_in(self.alloc);
         for Declared { symbol, slot } in words.iter() {
-            let (local, _new) = self.declare_pair(symbol, slot)?;
-            slots.push(local);
+            let (local, is_new) = self.declare_pair(symbol, slot)?;
+            slots.push(NativeWordSlot { slot: local, is_new });
         }
         self.native = NativeState::Declared { record: library, slots };
         out.push(Act::Native { record: library });

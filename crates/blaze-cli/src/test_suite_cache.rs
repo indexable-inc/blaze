@@ -30,7 +30,7 @@ use blaze_ladder::body_ids::{
     BodyIds as _, DeclaredList, EntryForm, Form as _, How, Make, RowKind, Scratch, Stepped, Unkeyed, Walk, instance_key,
 };
 use blaze_ladder::code_records::statics::{each_static_named, each_vtable_datum, entry_record};
-use blaze_ladder::code_records::{Builder, CodeClass, CodeKey, CodeStore, content_key};
+use blaze_ladder::code_records::{Builder, CodeKey, CodeStore, content_key};
 use blaze_ladder::code_records::reads::Verdict;
 use blaze_ladder::run::make_one::{ByKind, MOST_WALKED, MakeWatch, Maker, NamesRecords};
 use blaze_ladder::run::special::{MakerKind, MakerStart, Roots, StartHead};
@@ -52,7 +52,7 @@ use crate::run_parent::{
     self, FIRST_CALL_SPAN, HOW_FOUND, HOW_MADE, HOW_NO_RECORD, HOW_SPECIAL, HOW_STALE, Needs, ParentError, Resolve,
     Resolved, RunMaker, Start as _, Tally,
 };
-use crate::test_cache::{EnteredFn, check_record_purity};
+use crate::test_cache::{EnteredFn, check_datum_purity, check_record_purity};
 
 /// Cap on warm suite functions queued for batch pre-publishing per suite (rule 18).
 const WARM_CAP: usize = 16_384;
@@ -73,6 +73,7 @@ struct CachedDatum {
     named: AVec<'static, Symbol>,
     entered: Option<CachedEntered>,
     unkeyed: bool,
+    purity: Result<(), NotKept>,
 }
 
 /// Cached function publication resolved once per suite.
@@ -86,7 +87,6 @@ pub(crate) struct CachedPub {
     pub lands: bool,
     pub purity: Result<(), NotKept>,
     pub entered: Option<CachedEntered>,
-    pub pure_toolchain: bool,
     pub unkeyed: bool,
     pub tabled: Option<ItemKey>,
 }
@@ -161,8 +161,6 @@ pub(crate) struct ChildSent<'a> {
     sent_records: Set<[u8; 32], BuildKeyHasher, Alloc<'a>>,
     /// Index into `SuiteCache::warm_order` already pre-published to this impure child.
     pub warm_cursor: usize,
-    /// Whether pure toolchain entries were already batch-flushed to this pure child.
-    pub pure_toolchain_flushed: bool,
 }
 
 impl<'a> ChildSent<'a> {
@@ -171,7 +169,6 @@ impl<'a> ChildSent<'a> {
             told: Set::new(SetOpts { hasher: BuildKeyHasher::default(), alloc, capacity: None }),
             sent_records: Set::new(SetOpts { hasher: BuildKeyHasher::default(), alloc, capacity: None }),
             warm_cursor: 0,
-            pure_toolchain_flushed: false,
         }
     }
 }
@@ -321,7 +318,6 @@ impl<'h> SuiteCache<'h> {
                 lands,
                 purity,
                 entered: None,
-                pure_toolchain: false,
                 unkeyed: false,
                 tabled: None,
             };
@@ -395,7 +391,6 @@ impl<'h> SuiteCache<'h> {
         };
         let unkeyed = unkeyed_step || entered.is_none();
         let purity = if unkeyed { Err(NotKept::Untraced) } else { check_record_purity(record) };
-        let pure_toolchain = !unkeyed && purity.is_ok() && ids.class(tabled) == CodeClass::Toolchain;
 
         // Resolve and cache every transitive static/thread-local row not already in `self.datums`.
         let mut next = 0usize;
@@ -451,6 +446,7 @@ impl<'h> SuiteCache<'h> {
                 })
             };
             let s_unkeyed = s_unkeyed_step || s_entered.is_none();
+            let s_purity = if s_unkeyed { Err(NotKept::Untraced) } else { check_datum_purity(s_datum) };
             self.by_record.insert(s_record.0, CachedRecord::Datum(static_sym));
             self.datums.insert(
                 static_sym,
@@ -461,6 +457,7 @@ impl<'h> SuiteCache<'h> {
                     named: s_named,
                     entered: s_entered,
                     unkeyed: s_unkeyed,
+                    purity: s_purity,
                 },
             );
         }
@@ -478,7 +475,6 @@ impl<'h> SuiteCache<'h> {
                 lands,
                 purity,
                 entered,
-                pure_toolchain,
                 unkeyed,
                 tabled: Some(tabled),
             },
@@ -516,10 +512,11 @@ impl<'h> SuiteCache<'h> {
                 }
                 named.sort_unstable();
                 named.dedup();
+                let v_purity = check_datum_purity(vdatum);
                 by_record.insert(record.0, CachedRecord::Datum(vtable.0));
                 datums.insert(
                     vtable.0,
-                    CachedDatum { record, bytes, declares, named, entered: None, unkeyed: false },
+                    CachedDatum { record, bytes, declares, named, entered: None, unkeyed: false, purity: v_purity },
                 );
                 Ok(())
             },
@@ -623,8 +620,8 @@ impl<'h> SuiteCache<'h> {
         }
     }
 
-    /// Gathers all unsent datums, transitive declares, named statics, inline byte slices, and
-    /// `EnteredFn` refs for publishing cached `symbol` to a specific child.
+    /// Gathers all unsent datums, transitive declares, named statics, inline byte slices,
+    /// `EnteredFn` refs, and datum purity for publishing cached `symbol` to a specific child.
     #[expect(clippy::too_many_arguments, reason = "fills reusable output buffers for one child publication")]
     pub(crate) fn gather_for_child<'s>(
         &'s self,
@@ -637,6 +634,7 @@ impl<'h> SuiteCache<'h> {
         out_inline: &mut AVec<'_, (RecordId, &'s [u8])>,
         out_entered: &mut AVec<'_, &'s CachedEntered>,
         any_unkeyed: &mut bool,
+        datums_purity: &mut Result<(), NotKept>,
     ) -> Result<Option<&'s CachedPub>, ParentError> {
         let Some(entry) = self.pubs.get(&symbol.0) else {
             return Ok(None);
@@ -651,6 +649,7 @@ impl<'h> SuiteCache<'h> {
         out_inline.clear();
         out_entered.clear();
         *any_unkeyed = entry.unkeyed;
+        *datums_purity = Ok(());
 
         out_declares.extend_from_slice(entry.declares.as_slice());
         out_named.extend_from_slice(entry.named.as_slice());
@@ -678,6 +677,11 @@ impl<'h> SuiteCache<'h> {
             if datum.unkeyed {
                 *any_unkeyed = true;
             }
+            if datums_purity.is_ok()
+                && let Err(why) = datum.purity
+            {
+                *datums_purity = Err(why);
+            }
             out_data.push(Datum { symbol: static_sym, record: datum.record });
             if child.sent_records.insert(datum.record.0) {
                 out_inline.push((datum.record, datum.bytes.as_slice()));
@@ -693,24 +697,21 @@ impl<'h> SuiteCache<'h> {
         Ok(Some(entry))
     }
 
-    /// Batch-pre-publishes warm functions from `self.warm_order` into `out` via `needs`.
-    /// When `only_pure_toolchain` is true, only keyed pure `CodeClass::Toolchain` functions are
-    /// pre-published and their `EnteredFn` metadata is appended to `entered_fns`.
-    #[expect(clippy::too_many_arguments, reason = "pre-publishes cached suite entries into one child's wire buffer")]
-    pub(crate) fn prepublish_warm<'c, A: Allocator>(
+    /// Batch-pre-publishes warm functions from `self.warm_order` into `out` via `needs` for an
+    /// impure child (`keep.is_err()`). Pure tests never receive pre-published functions so their
+    /// `entered_fns` and `BZTR` addresses stay exact and deterministic across runs (rule 25).
+    #[expect(clippy::too_many_arguments, reason = "pre-publishes cached suite entries into one impure child's wire buffer")]
+    pub(crate) fn prepublish_warm<A: Allocator>(
         &self,
         test_entry: [u8; 32],
         head: StartHead,
-        only_pure_toolchain: bool,
         child: &mut ChildSent<'_>,
         needs: &mut Needs<'_>,
         out: &mut crate::run_parent::WireOut<A>,
-        entered_fns: &mut AVec<'c, EnteredFn<'c>>,
-        cache_alloc: Alloc<'c>,
         tally: &mut Tally,
         scratch_alloc: Alloc<'_>,
     ) -> Result<usize, ParentError> {
-        let start = if only_pure_toolchain { 0 } else { child.warm_cursor };
+        let start = child.warm_cursor;
         let total = self.warm_order.len();
         if start >= total {
             return Ok(0);
@@ -726,13 +727,11 @@ impl<'h> SuiteCache<'h> {
                 continue;
             }
             let Some(entry) = self.pubs.get(&sym.0) else { continue };
-            if only_pure_toolchain && !entry.pure_toolchain {
-                continue;
-            }
             if entry.lands && head.personality.is_none() {
                 continue;
             }
             let mut any_unkeyed = false;
+            let mut datums_purity = Ok(());
             let Some(entry) = self.gather_for_child(
                 sym,
                 head,
@@ -743,6 +742,7 @@ impl<'h> SuiteCache<'h> {
                 &mut inline,
                 &mut entered,
                 &mut any_unkeyed,
+                &mut datums_purity,
             )? else {
                 continue;
             };
@@ -760,25 +760,9 @@ impl<'h> SuiteCache<'h> {
                 let rows = 1 + data.len();
                 tally.reached += rows;
                 tally.found += rows;
-                if only_pure_toolchain {
-                    for e in entered.iter() {
-                        let mut name = Vec::with_capacity_in(e.name.len(), cache_alloc);
-                        name.extend_from_slice(e.name.as_slice());
-                        entered_fns.push(EnteredFn {
-                            symbol: e.symbol,
-                            code_key: e.code_key,
-                            tabled: e.tabled,
-                            name,
-                        });
-                    }
-                }
             }
         }
-        if only_pure_toolchain {
-            child.pure_toolchain_flushed = true;
-        } else {
-            child.warm_cursor = total;
-        }
+        child.warm_cursor = total;
         Ok(published)
     }
 
@@ -1034,10 +1018,21 @@ impl Resolve for ChildResolver<'_, '_, '_, '_> {
     #[cfg(test)]
     fn resolve(&mut self, symbol: &Symbol) -> Result<Resolved<'_>, ParentError> {
         let mut values = Vec::new_in(self.alloc);
-        self.publication(symbol, &mut values)
+        let mut needs_native = false;
+        self.publication_with_native(symbol, &mut values, &mut needs_native)
     }
 
     fn publication(&mut self, symbol: &Symbol, values: &mut AVec<'_, u8>) -> Result<Resolved<'_>, ParentError> {
+        let mut needs_native = false;
+        self.publication_with_native(symbol, values, &mut needs_native)
+    }
+
+    fn publication_with_native(
+        &mut self,
+        symbol: &Symbol,
+        values: &mut AVec<'_, u8>,
+        needs_native: &mut bool,
+    ) -> Result<Resolved<'_>, ParentError> {
         let mut cache = self.cache.borrow_mut();
         let Some(counts) = cache.ensure_cached(
             *symbol,
@@ -1055,6 +1050,7 @@ impl Resolve for ChildResolver<'_, '_, '_, '_> {
         let mut inline = Vec::new_in(self.alloc);
         let mut entered = Vec::new_in(self.alloc);
         let mut any_unkeyed = false;
+        let mut datums_purity = Ok(());
         let head = self.roots.head();
         let Some(entry) = cache.gather_for_child(
             *symbol,
@@ -1066,6 +1062,7 @@ impl Resolve for ChildResolver<'_, '_, '_, '_> {
             &mut inline,
             &mut entered,
             &mut any_unkeyed,
+            &mut datums_purity,
         )? else {
             self.requested = Some(ChildAnswer::Unresolved(*symbol));
             return Ok(Resolved::Unknown);
@@ -1082,10 +1079,14 @@ impl Resolve for ChildResolver<'_, '_, '_, '_> {
         self.tally.made += counts.made;
         self.tally.unkeyed += counts.unkeyed;
         self.tally.found += rows.saturating_sub(counts.made + counts.unkeyed);
+        let combined_purity = entry.purity.and(datums_purity);
+        if any_unkeyed || combined_purity.is_err() {
+            *needs_native = true;
+        }
         if self.keep.is_ok() {
             if any_unkeyed {
                 *self.keep = Err(NotKept::Untraced);
-            } else if let Err(why) = entry.purity {
+            } else if let Err(why) = combined_purity {
                 *self.keep = Err(why);
             } else {
                 for e in entered.iter() {
@@ -1102,8 +1103,7 @@ impl Resolve for ChildResolver<'_, '_, '_, '_> {
         }
         let key = entry.key;
         let record = entry.record;
-        let purity = entry.purity;
-        self.requested = Some(ChildAnswer::Ready { symbol: *symbol, purity, any_unkeyed, counts });
+        self.requested = Some(ChildAnswer::Ready { symbol: *symbol, purity: combined_purity, any_unkeyed, counts });
         Ok(Resolved::Record {
             key,
             record,
