@@ -46,7 +46,7 @@ use blaze_lir::{
     amac::{AmacOpts, interleave_amac_loops},
     bce::eliminate_redundant_checks,
     bce_hoist::{BceHoistOpts, hoist_loop_bounds_checks},
-    coldsplit::partition_cold_blocks,
+    coldsplit::{partition_cold_blocks, reorder_blocks_rpo},
     egraph::{RegBudget, sota_optimize_fixpoint},
     gemm::{GemmOpts, optimize_gemm_loops},
     ifconv::if_convert,
@@ -215,6 +215,10 @@ fn run_sroa_thread_cleanup<'a>(
     let v = cur.as_ref().map_or(input, |f| f.view());
     if let Ok(f) = coalesce_cfg(v, alloc) {
         cur = Some(f);
+    }
+    let v = cur.as_ref().map_or(input, |f| f.view());
+    if let Ok(Some(rpo)) = reorder_blocks_rpo(v, alloc) {
+        cur = Some(rpo.func);
     }
     cur.filter(|f| verify(f.view()).is_ok())
 }

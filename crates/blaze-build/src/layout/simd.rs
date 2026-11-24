@@ -122,7 +122,7 @@ impl<A: Allocator + Clone> Layouts<A> {
         // field is never under-aligned by it (its alignment divides the vector's).
         let vector_align = align.trailing_zeros() as u8;
         let raised = ReprAttrs { packed: None, align: Some(attrs.align.map_or(vector_align, |a| a.max(vector_align))), ..attrs };
-        let mut u = self.univariant(fields, Order::Declaration, raised, 0, 0, cx.scratch)?;
+        let mut u = self.univariant(fields, Order::Declaration, raised, 0, 0, false, cx.scratch)?;
         // Without `repr(align)`, the struct's size is the rule's: the array rounded up to the
         // vector alignment.
         if attrs.align.is_none() && u.size != size {

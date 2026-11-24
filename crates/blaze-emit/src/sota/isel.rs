@@ -2071,6 +2071,19 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
     let os = if is_macos { crate::Os::MacOs } else { crate::Os::Linux };
     check_subset(&view, has_lse, os)?;
 
+    // Canonicalize into dominator-respecting RPO order before fusion, loop-depth analysis, and
+    // linear-interval register allocation (`regalloc` requires `def_block <= use_block` for all
+    // reachable blocks and `target <= src` for all natural loop back-edges).
+    let rpo_owned = blaze_lir::coldsplit::reorder_blocks_rpo(view, alloc).ok().flatten();
+    let view = rpo_owned.as_ref().map_or(view, |r| r.func.view());
+    let call_clobbers = |new_inst: usize| -> CallClobbers {
+        let orig = rpo_owned
+            .as_ref()
+            .and_then(|r| r.old_inst_of_new.get(new_inst).copied())
+            .unwrap_or(new_inst);
+        call_clobbers(orig)
+    };
+
     let len = view.len();
     let blocks = view.blocks();
     let tail_calls = if preserve_all_cold {

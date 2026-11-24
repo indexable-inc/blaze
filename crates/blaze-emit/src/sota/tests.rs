@@ -2326,4 +2326,140 @@ mod std_readiness_tests {
         // SAFETY: `func` has signature `extern "C" fn(u64) -> u64`.
         assert_eq!(unsafe { exec.as_fn::<extern "C" fn(u64) -> u64>() }(5), 45);
     }
+
+    /// Regression test for the `crypto_bigint::Uint::<4>::from_be_slice` infinite loop:
+    /// when `thread_jumps` folds a loop entry directly into a higher-indexed body block,
+    /// the resulting CFG is valid SSA but non-RPO (`header > latch`). Both the full SOTA
+    /// pipeline and direct `emit_sota_a64` must canonicalize to dominator-first RPO before
+    /// linear-interval register allocation so values defined in `header` and used in `latch`
+    /// never get clobbered.
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    fn sota_non_rpo_uadd_overflow_loop_matches_evaluator_on_hardware() {
+        let alloc = test_alloc();
+        // 1. Original slot-based checked-add loop (`while j < 4 { buf = j; j += 1; }`).
+        let func = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let [entry, header, body, trap_blk, cont, exit] =
+                [(); 6].map(|_| b.create_block(BlockKind::Normal));
+
+            b.begin(entry);
+            let s_buf = b.slot(8, 3, SlotKind::Named);
+            let s_j = b.slot(8, 3, SlotKind::Named);
+            let p_buf = b.slot_addr(s_buf);
+            let p_j = b.slot_addr(s_j);
+            let zero = b.iconst(Ty::I64, 0);
+            b.store(Flags::NONE, zero, p_buf, 0, MemAttrs::aligned(3));
+            b.store(Flags::NONE, zero, p_j, 0, MemAttrs::aligned(3));
+            b.jump((header, &[]));
+
+            b.begin(header);
+            let j0 = b.load(Ty::I64, Flags::NONE, p_j, 0, MemAttrs::aligned(3));
+            let four = b.iconst(Ty::I64, 4);
+            let cond = b.icmp(IntCond::Ult, j0, four);
+            b.br(Flags::NONE, cond, (body, &[]), (exit, &[]));
+
+            b.begin(body);
+            let j1 = b.load(Ty::I64, Flags::NONE, p_j, 0, MemAttrs::aligned(3));
+            b.store(Flags::NONE, j1, p_buf, 0, MemAttrs::aligned(3));
+            let j2 = b.load(Ty::I64, Flags::NONE, p_j, 0, MemAttrs::aligned(3));
+            let one = b.iconst(Ty::I64, 1);
+            let pair = b.overflow(Op::UaddOverflow, j2, one);
+            let nj = b.project(pair, 0);
+            let ovf = b.project(pair, 1);
+            b.br(Flags::NONE, ovf, (trap_blk, &[]), (cont, &[]));
+
+            b.begin(trap_blk);
+            b.trap(1);
+
+            b.begin(cont);
+            b.store(Flags::NONE, nj, p_j, 0, MemAttrs::aligned(3));
+            b.jump((header, &[]));
+
+            b.begin(exit);
+            let res = b.load(Ty::I64, Flags::NONE, p_buf, 0, MemAttrs::aligned(3));
+            b.ret(&[res]);
+            b.finish_checked().unwrap()
+        };
+
+        assert!(matches!(
+            eval::run_in(func.view(), &[], 10_000, alloc).unwrap(),
+            Outcome::Returned(ref v) if v.as_slice() == [Val::Int(3)]
+        ));
+        let pre = crate::sota::run_sroa_thread_cleanup(func.view(), alloc);
+        let mid_in = pre.as_ref().map_or(func.view(), |f| f.view());
+        let opt = blaze_lir::egraph::sota_optimize_fixpoint(
+            mid_in,
+            blaze_lir::egraph::RegBudget::AARCH64,
+            3,
+            |_| 1,
+            alloc,
+        )
+        .unwrap();
+        let late = crate::sota::run_sota_loop_and_late_passes(
+            opt.func.view(),
+            MAC_ARM64,
+            blaze_lir::egraph::RegBudget::AARCH64,
+            true,
+            Some(blaze_lir::superopt::SuperoptOpts::apple_silicon()),
+            alloc,
+        );
+        let emitted = crate::sota::isel::emit_sota_a64(
+            late.view(),
+            &NoNames,
+            crate::sota::CallMode::GotSlot,
+            MAC_ARM64.features,
+            true,
+            alloc,
+        )
+        .unwrap();
+        let (exec, _) = load_exec(emitted);
+        let f_ptr: extern "C" fn() -> u64 = unsafe { exec.as_fn() };
+        assert_eq!(f_ptr(), 3);
+
+        // 2. Direct non-RPO SSA LIR (latch block 1 before dominating header block 2) emitted
+        //    directly via `emit_sota_a64` without mid-end passes.
+        let non_rpo_src = "\
+func ptr64 sig s0 attrs [] features \"\"
+type t0 = {i64, i1}
+sig s0 = c () -> (i64)
+block0 normal:
+  v0 = iconst i64 0
+  v1 = iconst i64 4
+  v2 = iconst i64 1
+  jump block2(v0)
+block1 normal:
+  v4 = icmp i1 ult, v8, v1
+  br v4, block2(v8), block4()
+block2 normal:
+  v6 = param i64
+  v7 = uadd_overflow t0 v6, v2
+  v8 = project i64 v7, 0
+  v9 = project i1 v7, 1
+  br v9, block3(), block1()
+block3 normal:
+  trap 1
+block4 normal:
+  return (v6)
+";
+        let non_rpo = blaze_lir::parse::parse(non_rpo_src).expect("parses non-RPO LIR");
+        assert!(
+            blaze_lir::coldsplit::reorder_blocks_rpo(non_rpo.view(), alloc).unwrap().is_some(),
+            "test input must genuinely be non-RPO"
+        );
+        let emitted2 = crate::sota::isel::emit_sota_a64(
+            non_rpo.view(),
+            &NoNames,
+            crate::sota::CallMode::GotSlot,
+            MAC_ARM64.features,
+            true,
+            alloc,
+        )
+        .unwrap();
+        let (exec2, _) = load_exec(emitted2);
+        let f_ptr2: extern "C" fn() -> u64 = unsafe { exec2.as_fn() };
+        assert_eq!(f_ptr2(), 3);
+    }
 }
