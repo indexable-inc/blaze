@@ -792,9 +792,29 @@ fn build_cfg_info<A: Allocator + Copy>(view: &View<'_>, alloc: &A) -> CfgInfo<A>
     CfgInfo { inst_block, preds, idom }
 }
 
-/// Structural header/body/latch skeleton of a counted `for i in iv_init..bound` loop.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LoopShape {
+    HeaderBody,
+    SingleBlock { exit: u32 },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LoopIvKind {
+    /// Counted `Ty::I64` IV (`iv += 1`, bounded by `bound`).
+    Counted,
+    /// Running `Ty::PTR` IV (`p0 += 1`, bounded by `bound = end_ptr`), plus optional lockstep `p1 += 1`.
+    Pointer {
+        sec_ptr_pos: Option<usize>,
+        sec_ptr_inst: u32,
+        sec_ptr_init: u32,
+    },
+}
+
+/// Structural header/body/latch skeleton of a counted or pointer-IV byte loop.
 #[derive(Clone, Copy)]
 struct CountedLoop {
+    shape: LoopShape,
+    iv_kind: LoopIvKind,
     preheader: u32,
     header: u32,
     body: u32,
@@ -803,16 +823,139 @@ struct CountedLoop {
     iv_inst: u32,
     iv_init: u32,
     bound: u32,
-    /// If `param_count == 2`, the non-IV accumulator parameter metadata.
+    /// Optional scalar accumulator parameter metadata.
     acc_pos: Option<usize>,
     acc_inst: u32,
     acc_init: u32,
     acc_next: u32,
     acc_ty: Ty,
+    single_exit_argc: usize,
+    single_exit_args: [u32; 4],
 }
 
-/// Matches a 2-block counted loop (`preheader -> header -> body -> header`, `header -> exit`)
-/// where `header` has 1 parameter (`iv: I64`) or 2 parameters (`iv: I64` and `acc`).
+/// Unwraps up to 4 boolean negation/zext wrappers (`Not`, `Xor(_, 1)`, `Icmp(Eq|Ne, i1|zext(i1), 0|1)`).
+fn unwrap_bool_cond(view: &View<'_>, mut cond_val: u32) -> (u32, bool) {
+    let mut flipped = false;
+    for _ in 0..4 {
+        let ci = to_idx(cond_val);
+        if ci >= view.len() {
+            break;
+        }
+        match view.op(ci) {
+            Op::Not => {
+                cond_val = at(view.data, ci);
+                flipped = !flipped;
+            }
+            Op::Xor => {
+                let pos = to_idx(at(view.data, ci));
+                let (l, r) = (at(view.extra, pos), at(view.extra, pos + 1));
+                if const_u64(view, to_idx(r)) == Some(1) {
+                    cond_val = l;
+                    flipped = !flipped;
+                } else if const_u64(view, to_idx(l)) == Some(1) {
+                    cond_val = r;
+                    flipped = !flipped;
+                } else {
+                    break;
+                }
+            }
+            Op::Icmp => {
+                let cat = to_idx(at(view.data, ci));
+                let Some(ic) = IntCond::from_word(at(view.extra, cat)) else {
+                    break;
+                };
+                if ic != IntCond::Eq && ic != IntCond::Ne {
+                    break;
+                }
+                let (lhs, rhs) = (at(view.extra, cat + 1), at(view.extra, cat + 2));
+                let (val, c) = if let Some(k) = const_u64(view, to_idx(rhs)).filter(|&k| k <= 1) {
+                    (lhs, k)
+                } else if let Some(k) = const_u64(view, to_idx(lhs)).filter(|&k| k <= 1) {
+                    (rhs, k)
+                } else {
+                    break;
+                };
+                let vi = to_idx(val);
+                let inner_i1 = if Ty(at(view.tys, vi)) == Ty::I1 {
+                    val
+                } else if view.op(vi) == Op::Zext {
+                    let src = at(view.data, vi);
+                    if Ty(at(view.tys, to_idx(src))) == Ty::I1 {
+                        src
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                };
+                let is_inv = (c == 0 && ic == IntCond::Eq) || (c == 1 && ic == IntCond::Ne);
+                cond_val = inner_i1;
+                if is_inv {
+                    flipped = !flipped;
+                }
+            }
+            _ => break,
+        }
+    }
+    (cond_val, flipped)
+}
+
+#[inline]
+fn unwrap_ptr_addr(view: &View<'_>, v: u32) -> u32 {
+    let vi = to_idx(v);
+    if view.op(vi) == Op::PtrAddr {
+        at(view.data, vi)
+    } else {
+        v
+    }
+}
+
+/// Strips up to 2 unit-scale `Mul(x, 1)` / `Mul(1, x)` wrappers (e.g. `blaze-build`'s `stride = 1`
+/// slice-index offset before egraph folding).
+fn unwrap_unit_scale(view: &View<'_>, cfg: &CfgInfo<impl Allocator>, mut v: u32, body: u32) -> u32 {
+    for _ in 0..2 {
+        let vi = to_idx(v);
+        if at(&cfg.inst_block, vi) != body || view.op(vi) != Op::Mul {
+            break;
+        }
+        let mat = to_idx(at(view.data, vi));
+        let (l, r) = (at(view.extra, mat), at(view.extra, mat + 1));
+        if const_u64(view, to_idx(r)) == Some(1) {
+            v = l;
+        } else if const_u64(view, to_idx(l)) == Some(1) {
+            v = r;
+        } else {
+            break;
+        }
+    }
+    v
+}
+
+#[inline]
+fn is_ptr_step1(view: &View<'_>, cfg: &CfgInfo<impl Allocator>, body: u32, step_v: u32, ptr_iv: u32) -> bool {
+    let si = to_idx(step_v);
+    if at(&cfg.inst_block, si) != body || view.op(si) != Op::PtrAdd {
+        return false;
+    }
+    let idx = to_idx(at(view.data, si));
+    at(view.extra, idx) == ptr_iv && const_u64(view, to_idx(at(view.extra, idx + 1))) == Some(1)
+}
+
+#[inline]
+fn is_int_step1(view: &View<'_>, cfg: &CfgInfo<impl Allocator>, body: u32, step_v: u32, iv: u32) -> bool {
+    let si = to_idx(step_v);
+    if at(&cfg.inst_block, si) != body || view.op(si) != Op::Add {
+        return false;
+    }
+    let idx = to_idx(at(view.data, si));
+    let (al, ar) = (at(view.extra, idx), at(view.extra, idx + 1));
+    (al == iv && const_u64(view, to_idx(ar)) == Some(1))
+        || (ar == iv && const_u64(view, to_idx(al)) == Some(1))
+}
+
+/// Matches a counted or pointer-IV byte loop (`HeaderBody` or `SingleBlock`) with 1..=3 params:
+/// - Counted `Ty::I64` IV (`iv += 1`, `iv < bound` or `iv != bound` from 0) + optional `acc`.
+/// - Pointer `Ty::PTR` IV (`p0 += 1`, `p0 != end` / `p0 < end`) + optional lockstep `p1 += 1` + optional `acc`.
 fn match_counted_loop(view: &View<'_>, cfg: &CfgInfo<impl Allocator>, header: u32) -> Option<CountedLoop> {
     if view.block_kind(Block(header)) != BlockKind::Normal {
         return None;
@@ -829,7 +972,7 @@ fn match_counted_loop(view: &View<'_>, cfg: &CfgInfo<impl Allocator>, header: u3
     } else {
         return None;
     };
-    if preheader == header || body == header || preheader == body {
+    if preheader == header || preheader == body {
         return None;
     }
     if view.block_kind(Block(body)) != BlockKind::Normal {
@@ -844,58 +987,78 @@ fn match_counted_loop(view: &View<'_>, cfg: &CfgInfo<impl Allocator>, header: u3
     let pre_at = to_idx(at(view.data, pre_term));
     let h_params = view.params(Block(header));
     let param_count = h_params.len();
-    if param_count != 1 && param_count != 2 {
+    if param_count == 0 || param_count > 3 {
         return None;
     }
     if at(view.extra, pre_at) != header || to_idx(at(view.extra, pre_at + 1)) != param_count {
         return None;
     }
 
-    // `body` must have 1 pred (`header`), 0 params, and end with `Jump(header, latch_args)`.
-    if cfg.preds.get(to_idx(body)).map(Vec::len) != Some(1)
-        || !view.params(Block(body)).is_empty()
-    {
-        return None;
-    }
-    let b_term = view.terminator(Block(body));
-    if view.op(b_term) != Op::Jump {
-        return None;
-    }
-    let latch_at = to_idx(at(view.data, b_term));
-    if at(view.extra, latch_at) != header || to_idx(at(view.extra, latch_at + 1)) != param_count {
-        return None;
-    }
-
-    // `header` must end with `Br(cmp, ...)` entering `body` iff `iv < bound`.
     let h_range = view.block(Block(header));
     let h_term = h_range.end.checked_sub(1)?;
     if view.op(h_term) != Op::Br {
         return None;
     }
     let h_at = to_idx(at(view.data, h_term));
-    let cmp_inst = to_idx(at(view.extra, h_at));
+    let raw_cmp_val = at(view.extra, h_at);
     let t_blk = at(view.extra, h_at + 1);
     let t_argc = to_idx(at(view.extra, h_at + 2));
-    let f_blk = at(view.extra, h_at + 3 + t_argc);
-    let f_argc = to_idx(at(view.extra, h_at + 4 + t_argc));
+    let f_at = h_at + 3 + t_argc;
+    let f_blk = at(view.extra, f_at);
+    let f_argc = to_idx(at(view.extra, f_at + 1));
 
-    // Only allow `Param`, `Icmp`, and constants in `header`.
-    for inst in h_range.start..h_term {
-        if inst != cmp_inst
-            && !matches!(view.op(inst), Op::Param | Op::Iconst | Op::IconstWide)
+    let (shape, latch_args_at, stay_on_true, single_exit_argc, single_exit_args) = if body == header {
+        let mut ex_args = [0u32; 4];
+        if t_blk == header && f_blk != header && t_argc == param_count && f_argc <= 4 {
+            for k in 0..f_argc {
+                set_at(&mut ex_args, k, at(view.extra, f_at + 2 + k));
+            }
+            (LoopShape::SingleBlock { exit: f_blk }, h_at + 3, true, f_argc, ex_args)
+        } else if f_blk == header && t_blk != header && f_argc == param_count && t_argc <= 4 {
+            for k in 0..t_argc {
+                set_at(&mut ex_args, k, at(view.extra, h_at + 3 + k));
+            }
+            (LoopShape::SingleBlock { exit: t_blk }, f_at + 2, false, t_argc, ex_args)
+        } else {
+            return None;
+        }
+    } else {
+        // 2-block `HeaderBody`: `body` has 1 pred (`header`), 0 params, and ends with `Jump(header, latch_args)`.
+        if cfg.preds.get(to_idx(body)).map(Vec::len) != Some(1)
+            || !view.params(Block(body)).is_empty()
         {
             return None;
         }
-    }
-
-    let body_on_true = if t_blk == body && t_argc == 0 && f_blk != body {
-        true
-    } else if f_blk == body && f_argc == 0 && t_blk != body {
-        false
-    } else {
-        return None;
+        let b_term = view.terminator(Block(body));
+        if view.op(b_term) != Op::Jump {
+            return None;
+        }
+        let latch_at = to_idx(at(view.data, b_term));
+        if at(view.extra, latch_at) != header || to_idx(at(view.extra, latch_at + 1)) != param_count {
+            return None;
+        }
+        // Only allow pure compare/bool/ptr_addr/constant helpers in `header`.
+        for inst in h_range.start..h_term {
+            if !matches!(
+                view.op(inst),
+                Op::Param | Op::Icmp | Op::PtrAddr | Op::Not | Op::Xor | Op::Zext | Op::Iconst | Op::IconstWide
+            ) {
+                return None;
+            }
+        }
+        let body_on_true = if t_blk == body && t_argc == 0 && f_blk != body && f_blk != header {
+            true
+        } else if f_blk == body && f_argc == 0 && t_blk != body && t_blk != header {
+            false
+        } else {
+            return None;
+        };
+        (LoopShape::HeaderBody, latch_at + 2, body_on_true, 0, [0u32; 4])
     };
 
+    let (inner_cmp, flipped) = unwrap_bool_cond(view, raw_cmp_val);
+    let stay_cond = stay_on_true ^ flipped;
+    let cmp_inst = to_idx(inner_cmp);
     if view.op(cmp_inst) != Op::Icmp {
         return None;
     }
@@ -904,55 +1067,156 @@ fn match_counted_loop(view: &View<'_>, cfg: &CfgInfo<impl Allocator>, header: u3
     let cmp_a = at(view.extra, cmp_at + 1);
     let cmp_b = at(view.extra, cmp_at + 2);
 
-    // Match strict unsigned upper bound `enter body iff iv < bound`.
-    let (iv_inst, bound) = match (body_on_true, cond) {
-        (true, IntCond::Ult) | (false, IntCond::Uge) => (cmp_a, cmp_b),
-        (true, IntCond::Ugt) | (false, IntCond::Ule) => (cmp_b, cmp_a),
-        _ => return None,
-    };
+    // Try matching the primary IV (counted `Ty::I64` or pointer `Ty::PTR`).
+    let mut found_primary: Option<(usize, u32, u32, u32, bool)> = None;
+    for pos in 0..param_count {
+        let p_idx = h_params.start + pos;
+        let p_inst = to_u32(p_idx);
+        let p_ty = Ty(at(view.tys, p_idx));
+        let p_init = at(view.extra, pre_at + 2 + pos);
+        let p_next = at(view.extra, latch_args_at + pos);
+        if !is_ready_invariant(&cfg.inst_block, &cfg.idom, p_init, preheader) {
+            continue;
+        }
+        let cmp_target = match shape {
+            LoopShape::HeaderBody => p_inst,
+            LoopShape::SingleBlock { .. } => p_next,
+        };
+        if p_ty == Ty::I64 && is_int_step1(view, cfg, body, p_next, p_inst) {
+            let start_zero = const_u64(view, to_idx(p_init)) == Some(0);
+            let bound_opt = if stay_cond {
+                if cmp_a == cmp_target && (cond == IntCond::Ult || (start_zero && cond == IntCond::Ne)) {
+                    Some(cmp_b)
+                } else if cmp_b == cmp_target && (cond == IntCond::Ugt || (start_zero && cond == IntCond::Ne)) {
+                    Some(cmp_a)
+                } else {
+                    None
+                }
+            } else if cmp_a == cmp_target && (cond == IntCond::Uge || (start_zero && cond == IntCond::Eq)) {
+                Some(cmp_b)
+            } else if cmp_b == cmp_target && (cond == IntCond::Ule || (start_zero && cond == IntCond::Eq)) {
+                Some(cmp_a)
+            } else {
+                None
+            };
+            if let Some(bnd) = bound_opt
+                && Ty(at(view.tys, to_idx(bnd))) == Ty::I64
+                && is_ready_invariant(&cfg.inst_block, &cfg.idom, bnd, preheader)
+            {
+                found_primary = Some((pos, p_inst, p_init, bnd, false));
+                break;
+            }
+        } else if p_ty == Ty::PTR && is_ptr_step1(view, cfg, body, p_next, p_inst) {
+            let ua = unwrap_ptr_addr(view, cmp_a);
+            let ub = unwrap_ptr_addr(view, cmp_b);
+            let end_opt = if stay_cond {
+                if ua == cmp_target && matches!(cond, IntCond::Ult | IntCond::Ne) {
+                    Some(ub)
+                } else if ub == cmp_target && matches!(cond, IntCond::Ugt | IntCond::Ne) {
+                    Some(ua)
+                } else {
+                    None
+                }
+            } else if ua == cmp_target && matches!(cond, IntCond::Uge | IntCond::Eq) {
+                Some(ub)
+            } else if ub == cmp_target && matches!(cond, IntCond::Ule | IntCond::Eq) {
+                Some(ua)
+            } else {
+                None
+            };
+            if let Some(end_ptr) = end_opt
+                && Ty(at(view.tys, to_idx(end_ptr))) == Ty::PTR
+                && is_ready_invariant(&cfg.inst_block, &cfg.idom, end_ptr, preheader)
+            {
+                found_primary = Some((pos, p_inst, p_init, end_ptr, true));
+                break;
+            }
+        }
+    }
+    let (iv_pos, iv_inst, iv_init, bound, is_ptr_iv) = found_primary?;
 
-    // Identify `iv_pos` among `header` parameters; must be `Ty::I64`.
-    let iv_pos = (0..param_count).find(|&k| to_u32(h_params.start + k) == iv_inst)?;
-    if Ty(at(view.tys, to_idx(iv_inst))) != Ty::I64 {
-        return None;
-    }
-    if !is_ready_invariant(&cfg.inst_block, &cfg.idom, bound, preheader) {
-        return None;
-    }
+    // Classify remaining header params (at most 1 secondary lockstep `Ty::PTR` IV for pointer loops,
+    // and at most 1 scalar accumulator `acc`).
+    let mut sec_ptr_pos: Option<usize> = None;
+    let mut sec_ptr_inst = NONE;
+    let mut sec_ptr_init = NONE;
+    let mut acc_pos: Option<usize> = None;
+    let mut acc_inst = NONE;
+    let mut acc_init = NONE;
+    let mut acc_next = NONE;
+    let mut acc_ty = Ty::NONE;
 
-    let iv_init = at(view.extra, pre_at + 2 + iv_pos);
-    if !is_ready_invariant(&cfg.inst_block, &cfg.idom, iv_init, preheader) {
-        return None;
-    }
-
-    // Verify `iv_next = Add(iv, 1)` in `body`.
-    let iv_next = at(view.extra, latch_at + 2 + iv_pos);
-    let iv_next_idx = to_idx(iv_next);
-    if at(&cfg.inst_block, iv_next_idx) != body || view.op(iv_next_idx) != Op::Add {
-        return None;
-    }
-    let add_at = to_idx(at(view.data, iv_next_idx));
-    let (al, ar) = (at(view.extra, add_at), at(view.extra, add_at + 1));
-    let step_is_1 = (al == iv_inst && const_u64(view, to_idx(ar)) == Some(1))
-        || (ar == iv_inst && const_u64(view, to_idx(al)) == Some(1));
-    if !step_is_1 {
-        return None;
-    }
-
-    let (acc_pos, acc_inst, acc_init, acc_next, acc_ty) = if param_count == 2 {
-        let ap = 1 - iv_pos;
-        let ai = to_u32(h_params.start + ap);
-        let a_init = at(view.extra, pre_at + 2 + ap);
-        let a_next = at(view.extra, latch_at + 2 + ap);
-        if !is_ready_invariant(&cfg.inst_block, &cfg.idom, a_init, preheader) {
+    for pos in 0..param_count {
+        if pos == iv_pos {
+            continue;
+        }
+        let p_idx = h_params.start + pos;
+        let p_inst = to_u32(p_idx);
+        let p_ty = Ty(at(view.tys, p_idx));
+        let p_init = at(view.extra, pre_at + 2 + pos);
+        let p_next = at(view.extra, latch_args_at + pos);
+        if !is_ready_invariant(&cfg.inst_block, &cfg.idom, p_init, preheader) {
             return None;
         }
-        (Some(ap), ai, a_init, a_next, Ty(at(view.tys, to_idx(ai))))
+        if is_ptr_iv && p_ty == Ty::PTR && is_ptr_step1(view, cfg, body, p_next, p_inst) {
+            if sec_ptr_pos.is_some() {
+                return None;
+            }
+            sec_ptr_pos = Some(pos);
+            sec_ptr_inst = p_inst;
+            sec_ptr_init = p_init;
+        } else {
+            if acc_pos.is_some() {
+                return None;
+            }
+            acc_pos = Some(pos);
+            acc_inst = p_inst;
+            acc_init = p_init;
+            acc_next = p_next;
+            acc_ty = p_ty;
+        }
+    }
+
+    // For `SingleBlock`, ensure no instruction in `header` escapes directly to outside blocks and
+    // every exit argument is either `acc_next` or ready invariant at `preheader`.
+    if matches!(shape, LoopShape::SingleBlock { .. }) {
+        for b in 0..view.blocks() {
+            let b32 = to_u32(b);
+            if b32 == header {
+                continue;
+            }
+            for inst in view.block(Block(b32)) {
+                let mut escapes = false;
+                each(view, inst, |item| {
+                    if let Item::Value(v) = item
+                        && at(&cfg.inst_block, to_idx(v)) == header
+                    {
+                        escapes = true;
+                    }
+                });
+                if escapes {
+                    return None;
+                }
+            }
+        }
+        for k in 0..single_exit_argc {
+            let ea = at(&single_exit_args, k);
+            let is_acc_upd = acc_pos.is_some() && ea == acc_next;
+            if !is_acc_upd && !is_ready_invariant(&cfg.inst_block, &cfg.idom, ea, preheader) {
+                return None;
+            }
+        }
+    }
+
+    let iv_kind = if is_ptr_iv {
+        LoopIvKind::Pointer { sec_ptr_pos, sec_ptr_inst, sec_ptr_init }
     } else {
-        (None, NONE, NONE, NONE, Ty::NONE)
+        LoopIvKind::Counted
     };
 
     Some(CountedLoop {
+        shape,
+        iv_kind,
         preheader,
         header,
         body,
@@ -966,20 +1230,72 @@ fn match_counted_loop(view: &View<'_>, cfg: &CfgInfo<impl Allocator>, header: u3
         acc_init,
         acc_next,
         acc_ty,
+        single_exit_argc,
+        single_exit_args,
     })
 }
 
-/// Checks that `load_inst` is a non-volatile `Ty::I8` load at `PtrAdd(base, iv) + const_off`
-/// where `base` is invariant and ready at `preheader`.
+/// Checks that `ptr_v + off` addresses a unit-stride byte stream for `lp` (counted `PtrAdd(base, iv)`
+/// or `PtrAdd(base, Mul(iv, 1))`, or pointer-IV `p0`/`p1` with optional constant byte offset).
+fn match_unit_i8_ptr(
+    view: &View<'_>,
+    cfg: &CfgInfo<impl Allocator>,
+    lp: CountedLoop,
+    ptr_v: u32,
+    off: i32,
+) -> Option<(u32, i32)> {
+    match lp.iv_kind {
+        LoopIvKind::Counted => {
+            let pi = to_idx(ptr_v);
+            if view.op(pi) != Op::PtrAdd {
+                return None;
+            }
+            let pat = to_idx(at(view.data, pi));
+            let base = at(view.extra, pat);
+            let idx = unwrap_unit_scale(view, cfg, at(view.extra, pat + 1), lp.body);
+            if idx != lp.iv_inst || !is_ready_invariant(&cfg.inst_block, &cfg.idom, base, lp.preheader) {
+                return None;
+            }
+            Some((base, off))
+        }
+        LoopIvKind::Pointer { sec_ptr_inst, sec_ptr_init, .. } => {
+            let mut cur = ptr_v;
+            let mut total_off = off;
+            for _ in 0..2 {
+                if cur == lp.iv_inst {
+                    return Some((lp.iv_init, total_off));
+                }
+                if sec_ptr_inst != NONE && cur == sec_ptr_inst {
+                    return Some((sec_ptr_init, total_off));
+                }
+                let ci = to_idx(cur);
+                if view.op(ci) == Op::PtrAdd {
+                    let pat = to_idx(at(view.data, ci));
+                    let (base, by) = (at(view.extra, pat), at(view.extra, pat + 1));
+                    if let Some(c) = const_u64(view, to_idx(by))
+                        && let Ok(c32) = i32::try_from(c.cast_signed())
+                        && let Some(sum) = total_off.checked_add(c32)
+                    {
+                        cur = base;
+                        total_off = sum;
+                        continue;
+                    }
+                }
+                break;
+            }
+            None
+        }
+    }
+}
+
+/// Checks that `load_inst` is a non-volatile `Ty::I8` unit-stride load for `lp`.
 fn match_unit_i8_load(
     view: &View<'_>,
     cfg: &CfgInfo<impl Allocator>,
     load_inst: usize,
-    body: u32,
-    iv_inst: u32,
-    preheader: u32,
+    lp: CountedLoop,
 ) -> Option<(u32, i32)> {
-    if at(&cfg.inst_block, load_inst) != body
+    if at(&cfg.inst_block, load_inst) != lp.body
         || view.op(load_inst) != Op::Load
         || Ty(at(view.tys, load_inst)) != Ty::I8
         || Flags(at(view.flags, load_inst)).contains(Flags::VOLATILE)
@@ -987,18 +1303,9 @@ fn match_unit_i8_load(
         return None;
     }
     let lat = to_idx(at(view.data, load_inst));
-    let ptr_v = to_idx(at(view.extra, lat));
+    let ptr_v = at(view.extra, lat);
     let off = at(view.extra, lat + 1).cast_signed();
-    if view.op(ptr_v) != Op::PtrAdd {
-        return None;
-    }
-    let pat = to_idx(at(view.data, ptr_v));
-    let base = at(view.extra, pat);
-    let idx = at(view.extra, pat + 1);
-    if idx != iv_inst || !is_ready_invariant(&cfg.inst_block, &cfg.idom, base, preheader) {
-        return None;
-    }
-    Some((base, off))
+    match_unit_i8_ptr(view, cfg, lp, ptr_v, off)
 }
 
 fn emit_offset_base<A: Allocator>(func: &mut Func<A>, base: u32, off: i32) -> u32 {
@@ -1010,20 +1317,22 @@ fn emit_offset_base<A: Allocator>(func: &mut Func<A>, base: u32, off: i32) -> u3
     }
 }
 
-/// Builds a 1- or 2-element argument list for `orig_header` in the exact original parameter order.
+/// Builds a 1..=3 element argument list for `orig_header` in the exact original parameter order.
 fn ordered_header_args(
-    param_count: usize,
-    iv_pos: usize,
+    lp: CountedLoop,
     iv_val: u32,
-    acc_pos: Option<usize>,
+    sec_ptr_val: u32,
     acc_val: u32,
-) -> ([u32; 2], usize) {
-    let mut buf = [0u32; 2];
-    set_at(&mut buf, iv_pos, iv_val);
-    if let Some(ap) = acc_pos {
+) -> ([u32; 3], usize) {
+    let mut buf = [0u32; 3];
+    set_at(&mut buf, lp.iv_pos, iv_val);
+    if let LoopIvKind::Pointer { sec_ptr_pos: Some(sp), .. } = lp.iv_kind {
+        set_at(&mut buf, sp, sec_ptr_val);
+    }
+    if let Some(ap) = lp.acc_pos {
         set_at(&mut buf, ap, acc_val);
     }
-    (buf, param_count)
+    (buf, lp.param_count)
 }
 
 // ============================================================================
@@ -1075,16 +1384,22 @@ struct LutPlan {
 }
 
 /// Traces `idx_val` feeding `PtrAdd(lut_base, idx_val)` back to `(src_load_inst, LutIndexMode)`.
+/// Handles both `(inp[i] & 15) as usize` (`Zext(And(load i8, 15))`) and `(inp[i] as usize) & 15`
+/// (`And(Zext(load i8), 15)`), as well as optional `Mul(_, 1)` and `Sext` for `& 15`/`& 63`.
 fn match_lut_index_expr(
     view: &View<'_>,
     cfg: &CfgInfo<impl Allocator>,
     idx_val: u32,
     body: u32,
 ) -> Option<(usize, LutIndexMode)> {
-    let mut cur = to_idx(idx_val);
-    // Strip at most two leading `Zext` layers (e.g. `i8 -> i32 -> i64` or `i8 -> i64`).
+    let mut cur = to_idx(unwrap_unit_scale(view, cfg, idx_val, body));
+    // Strip at most two leading `Zext`/`Sext` layers (e.g. `i8 -> i32 -> i64` or `i8 -> i64`).
+    let mut saw_outer_sext = false;
     for _ in 0..2 {
-        if at(&cfg.inst_block, cur) == body && view.op(cur) == Op::Zext {
+        if at(&cfg.inst_block, cur) == body && matches!(view.op(cur), Op::Zext | Op::Sext) {
+            if view.op(cur) == Op::Sext {
+                saw_outer_sext = true;
+            }
             cur = to_idx(at(view.data, cur));
         } else {
             break;
@@ -1117,6 +1432,9 @@ fn match_lut_index_expr(
             }
         }
         Op::Lshr => {
+            if saw_outer_sext {
+                return None;
+            }
             let sat = to_idx(at(view.data, cur));
             let (l, r) = (at(view.extra, sat), at(view.extra, sat + 1));
             if const_u64(view, to_idx(r)) != Some(4) {
@@ -1127,10 +1445,14 @@ fn match_lut_index_expr(
         _ => return None,
     };
 
-    // `src_expr` is either the `Ty::I8` load directly, or `Zext(Ty::I8 load)`.
+    // `src_expr` is either the `Ty::I8` load directly, `Zext(Ty::I8 load)`, or (for bitmasks
+    // `& 15` / `& 63` which preserve only the low 4/6 bits) `Sext(Ty::I8 load)`.
+    let allow_sext = matches!(mode, LutIndexMode::Mask16 | LutIndexMode::Mask64);
     let mut load_cand = to_idx(src_expr);
     for _ in 0..2 {
-        if at(&cfg.inst_block, load_cand) == body && view.op(load_cand) == Op::Zext {
+        if at(&cfg.inst_block, load_cand) == body
+            && (view.op(load_cand) == Op::Zext || (allow_sext && view.op(load_cand) == Op::Sext))
+        {
             load_cand = to_idx(at(view.data, load_cand));
         } else {
             break;
@@ -1155,10 +1477,10 @@ fn find_lut_plan(view: &View<'_>, cfg: &CfgInfo<impl Allocator>) -> Option<LutPl
         let b_range = view.block(Block(lp.body));
         let b_term = b_range.end.saturating_sub(1);
 
-        // Identify the sink: either a single unit-stride `i8` store (1-param loop) or an
-        // `Add`/`Xor` reduction into `acc` (2-param loop).
-        let (lut_load_inst, store_inst, sink) = if lp.param_count == 1 {
-            // Must have exactly 1 `Op::Store` in `body`, storing `Ty::I8` at `PtrAdd(dst_base, iv)`.
+        // Identify the sink: either a single unit-stride `i8` store (`acc_pos.is_none()`) or an
+        // `Add`/`Xor` reduction into `acc` (`acc_pos.is_some()`).
+        let (lut_load_inst, store_inst, sink) = if lp.acc_pos.is_none() {
+            // Must have exactly 1 `Op::Store` in `body`, storing `Ty::I8` at a unit-stride stream.
             let mut found_store: Option<usize> = None;
             let mut bad = false;
             for inst in b_range.start..b_term {
@@ -1176,18 +1498,14 @@ fn find_lut_plan(view: &View<'_>, cfg: &CfgInfo<impl Allocator>) -> Option<LutPl
             }
             let sat = to_idx(at(view.data, st));
             let val_v = at(view.extra, sat);
-            let dst_ptr = to_idx(at(view.extra, sat + 1));
+            let dst_ptr = at(view.extra, sat + 1);
             let dst_off = at(view.extra, sat + 2).cast_signed();
-            if Ty(at(view.tys, to_idx(val_v))) != Ty::I8 || view.op(dst_ptr) != Op::PtrAdd {
+            if Ty(at(view.tys, to_idx(val_v))) != Ty::I8 {
                 continue;
             }
-            let dpat = to_idx(at(view.data, dst_ptr));
-            let (dst_base, dst_idx) = (at(view.extra, dpat), at(view.extra, dpat + 1));
-            if dst_idx != lp.iv_inst
-                || !is_ready_invariant(&cfg.inst_block, &cfg.idom, dst_base, lp.preheader)
-            {
+            let Some((dst_base, dst_off)) = match_unit_i8_ptr(view, cfg, lp, dst_ptr, dst_off) else {
                 continue;
-            }
+            };
             (to_idx(val_v), Some(st), LutSink::Store { dst_base, dst_off })
         } else {
             // Reduction loop: `acc_ty` must be `I8`, `I32`, or `I64`.
@@ -1251,13 +1569,12 @@ fn find_lut_plan(view: &View<'_>, cfg: &CfgInfo<impl Allocator>) -> Option<LutPl
         if src_load_inst == lut_load_inst {
             continue;
         }
-        let Some((src_base, src_off)) =
-            match_unit_i8_load(view, cfg, src_load_inst, lp.body, lp.iv_inst, lp.preheader)
-        else {
+        let Some((src_base, src_off)) = match_unit_i8_load(view, cfg, src_load_inst, lp) else {
             continue;
         };
 
         // Purity check: no other loads, stores, calls, traps, or side-effecting ops in `body`.
+        let is_single = matches!(lp.shape, LoopShape::SingleBlock { .. });
         let body_ok = (b_range.start..b_term).all(|k| {
             k == src_load_inst
                 || k == lut_load_inst
@@ -1268,11 +1585,17 @@ fn find_lut_plan(view: &View<'_>, cfg: &CfgInfo<impl Allocator>) -> Option<LutPl
                         | Op::And
                         | Op::Lshr
                         | Op::Zext
+                        | Op::Sext
                         | Op::Add
+                        | Op::Mul
                         | Op::Xor
                         | Op::Iconst
                         | Op::IconstWide
+                        | Op::Freeze
+                        | Op::Assume
                 )
+                || (is_single
+                    && matches!(view.op(k), Op::Param | Op::Icmp | Op::PtrAddr | Op::Not))
         });
         if !body_ok {
             continue;
@@ -1303,25 +1626,48 @@ fn apply_lut_plan<A: Allocator + Copy>(
         return Err(SimplifyError::Refused { inst: 0, what: "vector type <4 x i32>" });
     };
 
+    let is_ptr_iv = matches!(plan.lp.iv_kind, LoopIvKind::Pointer { .. });
+    let single_exit_old = match plan.lp.shape {
+        LoopShape::HeaderBody => NONE,
+        LoopShape::SingleBlock { exit } => exit,
+    };
+    let is_single = single_exit_old != NONE;
     let use_chunked_i64 =
         matches!(plan.sink, LutSink::ReduceAdd) && plan.lp.acc_ty == Ty::I64;
     let needs_vred = !matches!(plan.sink, LutSink::Store { .. });
-    let extra_blocks: usize = if use_chunked_i64 {
-        4 // vpre, vchunk, vloop, vred
-    } else if needs_vred {
-        3 // vpre, vloop, vred
-    } else {
-        2 // vpre, vloop
-    };
+    let needs_vtail = (!needs_vred && (is_ptr_iv || is_single)) || (needs_vred && use_chunked_i64 && is_single);
+
+    let extra_blocks: usize = 2
+        + usize::from(use_chunked_i64)
+        + usize::from(needs_vred)
+        + usize::from(needs_vtail);
 
     let blocks = view.blocks();
     let len = view.len();
     let insert_at = to_idx(plan.lp.preheader) + 1;
-    let vpre_blk = to_u32(insert_at);
-    let (vchunk_blk, vloop_blk, vred_blk) = if use_chunked_i64 {
-        (to_u32(insert_at + 1), to_u32(insert_at + 2), to_u32(insert_at + 3))
+    let mut cursor = insert_at;
+    let vpre_blk = to_u32(cursor);
+    cursor += 1;
+    let vchunk_blk = if use_chunked_i64 {
+        let b = to_u32(cursor);
+        cursor += 1;
+        b
     } else {
-        (NONE, to_u32(insert_at + 1), to_u32(insert_at + 2))
+        NONE
+    };
+    let vloop_blk = to_u32(cursor);
+    cursor += 1;
+    let vred_blk = if needs_vred {
+        let b = to_u32(cursor);
+        cursor += 1;
+        b
+    } else {
+        NONE
+    };
+    let vtail_blk = if needs_vtail {
+        to_u32(cursor)
+    } else {
+        NONE
     };
 
     let mut blk_map: Vec<u32, A> = Vec::with_capacity_in(blocks, alloc);
@@ -1329,6 +1675,7 @@ fn apply_lut_plan<A: Allocator + Copy>(
         blk_map.push(if b < insert_at { to_u32(b) } else { to_u32(b + extra_blocks) });
     }
     let orig_hdr_new = at(&blk_map, to_idx(plan.lp.header));
+    let orig_exit_new = if is_single { at(&blk_map, to_idx(single_exit_old)) } else { NONE };
 
     let mut func = view.to_func_in(alloc);
     clear_func_code(&mut func);
@@ -1369,8 +1716,12 @@ fn apply_lut_plan<A: Allocator + Copy>(
             set_at(&mut val_map, inst, mapped);
         }
 
-        let iv_init = at(&val_map, to_idx(plan.lp.iv_init));
-        let bound = at(&val_map, to_idx(plan.lp.bound));
+        let orig_iv_init = at(&val_map, to_idx(plan.lp.iv_init));
+        let orig_bound = at(&val_map, to_idx(plan.lp.bound));
+        let orig_sec_init = match plan.lp.iv_kind {
+            LoopIvKind::Pointer { sec_ptr_pos: Some(_), sec_ptr_init, .. } => at(&val_map, to_idx(sec_ptr_init)),
+            _ => NONE,
+        };
         let src_base = at(&val_map, to_idx(plan.src_base));
         let lut_base = at(&val_map, to_idx(plan.lut_base));
         let acc_init = if plan.lp.acc_pos.is_some() {
@@ -1379,8 +1730,18 @@ fn apply_lut_plan<A: Allocator + Copy>(
             NONE
         };
 
-        let has_rem = push_icmp(&mut func, IntCond::Ult, Ty::I1, iv_init, bound);
-        let rem = push_bin(&mut func, Op::Sub, Flags::NONE, Ty::I64, bound, iv_init);
+        let (iv_init, tail_bound, has_rem, rem) = if is_ptr_iv {
+            let p0_addr = push_unary(&mut func, Op::PtrAddr, Ty::I64, orig_iv_init);
+            let end_addr = push_unary(&mut func, Op::PtrAddr, Ty::I64, orig_bound);
+            let hr = push_icmp(&mut func, IntCond::Ult, Ty::I1, p0_addr, end_addr);
+            let r = push_bin(&mut func, Op::Sub, Flags::NONE, Ty::I64, end_addr, p0_addr);
+            let z0 = push_iconst(&mut func, Ty::I64, 0);
+            (z0, r, hr, r)
+        } else {
+            let hr = push_icmp(&mut func, IntCond::Ult, Ty::I1, orig_iv_init, orig_bound);
+            let r = push_bin(&mut func, Op::Sub, Flags::NONE, Ty::I64, orig_bound, orig_iv_init);
+            (orig_iv_init, orig_bound, hr, r)
+        };
         let k64 = push_iconst(&mut func, Ty::I64, 64);
         let enough = push_icmp(&mut func, IntCond::Uge, Ty::I1, rem, k64);
         let mut go_vec = push_bin(&mut func, Op::And, Flags::NONE, Ty::I1, has_rem, enough);
@@ -1421,13 +1782,7 @@ fn apply_lut_plan<A: Allocator + Copy>(
             LutSink::ReduceAdd | LutSink::ReduceXor => NONE,
         };
 
-        let (orig_args, orig_argc) = ordered_header_args(
-            plan.lp.param_count,
-            plan.lp.iv_pos,
-            iv_init,
-            plan.lp.acc_pos,
-            acc_init,
-        );
+        let (orig_args, orig_argc) = ordered_header_args(plan.lp, orig_iv_init, orig_sec_init, acc_init);
         let orig_slice = orig_args.get(..orig_argc).unwrap_or(&[]);
         push_br(&mut func, go_vec, vpre_blk, &[], orig_hdr_new, orig_slice);
 
@@ -1436,7 +1791,11 @@ fn apply_lut_plan<A: Allocator + Copy>(
         func.block_kinds.push(block_kind_byte(BlockKind::Normal));
         let kmask64 = push_iconst(&mut func, Ty::I64, !63u64);
         let vcnt = push_bin(&mut func, Op::And, Flags::NONE, Ty::I64, rem, kmask64);
-        let vend = push_bin(&mut func, Op::Add, Flags::NONE, Ty::I64, iv_init, vcnt);
+        let vend = if is_ptr_iv {
+            vcnt
+        } else {
+            push_bin(&mut func, Op::Add, Flags::NONE, Ty::I64, iv_init, vcnt)
+        };
 
         let t0 = push_load(&mut func, v16i8, lut_base_adj, 0, 0);
         let (t1, t2, t3) = if plan.mode.is_64() {
@@ -1574,8 +1933,49 @@ fn apply_lut_plan<A: Allocator + Copy>(
         let iv_next = push_bin(&mut func, Op::Add, Flags::NONE, Ty::I64, iv, k64);
         let keep = push_icmp(&mut func, IntCond::Ult, Ty::I1, iv_next, inner_end);
 
+        let emit_tail_jump = |func: &mut Func<A>, iv_done: u32, acc_done: u32| {
+            let (iv_hdr, sec_hdr) = if is_ptr_iv {
+                let p0_after = push_bin(func, Op::PtrAdd, Flags::NONE, Ty::PTR, orig_iv_init, iv_done);
+                let p1_after = if orig_sec_init != NONE {
+                    push_bin(func, Op::PtrAdd, Flags::NONE, Ty::PTR, orig_sec_init, iv_done)
+                } else {
+                    NONE
+                };
+                (p0_after, p1_after)
+            } else {
+                (iv_done, NONE)
+            };
+            let (tail_args, tail_argc) = ordered_header_args(plan.lp, iv_hdr, sec_hdr, acc_done);
+            let tail_slice = tail_args.get(..tail_argc).unwrap_or(&[]);
+            if is_single {
+                let has_tail = push_icmp(func, IntCond::Ult, Ty::I1, iv_done, tail_bound);
+                let mut ex_buf = [0u32; 4];
+                for k in 0..plan.lp.single_exit_argc {
+                    let ea = at(&plan.lp.single_exit_args, k);
+                    let mapped = if plan.lp.acc_pos.is_some() && ea == plan.lp.acc_next {
+                        acc_done
+                    } else {
+                        at(&val_map, to_idx(ea))
+                    };
+                    set_at(&mut ex_buf, k, mapped);
+                }
+                let ex_slice = ex_buf.get(..plan.lp.single_exit_argc).unwrap_or(&[]);
+                push_br(func, has_tail, orig_hdr_new, tail_slice, orig_exit_new, ex_slice);
+            } else {
+                push_jump(func, orig_hdr_new, tail_slice);
+            }
+        };
+
         if !needs_vred {
-            push_br(&mut func, keep, vloop_blk, &[iv_next], orig_hdr_new, &[iv_next]);
+            if needs_vtail {
+                push_br(&mut func, keep, vloop_blk, &[iv_next], vtail_blk, &[iv_next]);
+                func.block_starts.push(to_u32(func.ops.len()));
+                func.block_kinds.push(block_kind_byte(BlockKind::Normal));
+                let iv_done = push_inst(&mut func, Op::Param, Flags::NONE, Ty::I64, 0, 0);
+                emit_tail_jump(&mut func, iv_done, NONE);
+            } else {
+                push_br(&mut func, keep, vloop_blk, &[iv_next], orig_hdr_new, &[iv_next]);
+            }
         } else {
             let [nv0, nv1, nv2, nv3] = next_vaccs;
             let loop_args = [iv_next, nv0, nv1, nv2, nv3];
@@ -1606,19 +2006,33 @@ fn apply_lut_plan<A: Allocator + Copy>(
             };
             let acc_after = push_bin(&mut func, comb_op, Flags::NONE, plan.lp.acc_ty, chunk_acc_param, widened);
 
-            let (tail_args, tail_argc) = ordered_header_args(
-                plan.lp.param_count,
-                plan.lp.iv_pos,
-                iv_r,
-                plan.lp.acc_pos,
-                acc_after,
-            );
-            let tail_slice = tail_args.get(..tail_argc).unwrap_or(&[]);
             if use_chunked_i64 {
                 let more = push_icmp(&mut func, IntCond::Ult, Ty::I1, iv_r, vend);
-                push_br(&mut func, more, vchunk_blk, &[iv_r, acc_after], orig_hdr_new, tail_slice);
+                if needs_vtail {
+                    push_br(&mut func, more, vchunk_blk, &[iv_r, acc_after], vtail_blk, &[iv_r, acc_after]);
+                    func.block_starts.push(to_u32(func.ops.len()));
+                    func.block_kinds.push(block_kind_byte(BlockKind::Normal));
+                    let iv_t = push_inst(&mut func, Op::Param, Flags::NONE, Ty::I64, 0, 0);
+                    let acc_t = push_inst(&mut func, Op::Param, Flags::NONE, plan.lp.acc_ty, 0, 0);
+                    emit_tail_jump(&mut func, iv_t, acc_t);
+                } else {
+                    let (iv_hdr, sec_hdr) = if is_ptr_iv {
+                        let p0_after = push_bin(&mut func, Op::PtrAdd, Flags::NONE, Ty::PTR, orig_iv_init, iv_r);
+                        let p1_after = if orig_sec_init != NONE {
+                            push_bin(&mut func, Op::PtrAdd, Flags::NONE, Ty::PTR, orig_sec_init, iv_r)
+                        } else {
+                            NONE
+                        };
+                        (p0_after, p1_after)
+                    } else {
+                        (iv_r, NONE)
+                    };
+                    let (tail_args, tail_argc) = ordered_header_args(plan.lp, iv_hdr, sec_hdr, acc_after);
+                    let tail_slice = tail_args.get(..tail_argc).unwrap_or(&[]);
+                    push_br(&mut func, more, vchunk_blk, &[iv_r, acc_after], orig_hdr_new, tail_slice);
+                }
             } else {
-                push_jump(&mut func, orig_hdr_new, tail_slice);
+                emit_tail_jump(&mut func, iv_r, acc_after);
             }
         }
     }
@@ -1733,28 +2147,30 @@ fn match_dot_product_term(
     }
 
     // Form 1: `Mul(Sext(a), Sext(b))` or `Mul(Zext(a), Zext(b))` directly at `acc_ty`.
-    // Form 2 (for `acc_ty == Ty::I64`): `Sext(Mul(Sext(a), Sext(b)))` or `Zext(Mul(Zext(a), Zext(b)))`
-    // where the inner `Mul` is `i16` or `i32` (since `i8 * i8` fits in `i16`/`i32` without overflow,
-    // and `u8 * u8` fits in `u16`/`u32` without overflow!).
+    // Form 2 (for `acc_ty` in `I32 | I64`): `Sext(Mul(Sext(a), Sext(b)))` or `Zext(Mul(Zext(a), Zext(b)))`
+    // where the inner `Mul` is narrower (`i16` or `i32`, since `i8 * i8` fits in `i16`/`i32` without
+    // overflow and `u8 * u8` fits in `u16`/`u32` without overflow!).
     let (mul_idx, forced_ext) = match view.op(ti) {
         Op::Mul => (ti, None),
-        Op::Sext if acc_ty == Ty::I64 => {
+        Op::Sext if matches!(acc_ty, Ty::I32 | Ty::I64) => {
             let inner = to_idx(at(view.data, ti));
             let inner_ty = Ty(at(view.tys, inner));
             if at(&cfg.inst_block, inner) != body
                 || view.op(inner) != Op::Mul
                 || !matches!(inner_ty, Ty::I16 | Ty::I32)
+                || inner_ty.bits(64) >= acc_ty.bits(64)
             {
                 return None;
             }
             (inner, Some(Op::Sext))
         }
-        Op::Zext if acc_ty == Ty::I64 => {
+        Op::Zext if matches!(acc_ty, Ty::I32 | Ty::I64) => {
             let inner = to_idx(at(view.data, ti));
             let inner_ty = Ty(at(view.tys, inner));
             if at(&cfg.inst_block, inner) != body
                 || view.op(inner) != Op::Mul
                 || !matches!(inner_ty, Ty::I16 | Ty::I32)
+                || inner_ty.bits(64) >= acc_ty.bits(64)
             {
                 return None;
             }
@@ -1786,7 +2202,7 @@ fn find_dotprod_plan(view: &View<'_>, cfg: &CfgInfo<impl Allocator>) -> Option<D
         let Some(lp) = match_counted_loop(view, cfg, to_u32(h)) else {
             continue;
         };
-        if lp.param_count != 2 || !matches!(lp.acc_ty, Ty::I32 | Ty::I64) {
+        if lp.acc_pos.is_none() || !matches!(lp.acc_ty, Ty::I32 | Ty::I64) {
             continue;
         }
         let upd = to_idx(lp.acc_next);
@@ -1809,26 +2225,33 @@ fn find_dotprod_plan(view: &View<'_>, cfg: &CfgInfo<impl Allocator>) -> Option<D
             continue;
         };
 
-        let Some((base_a, off_a)) =
-            match_unit_i8_load(view, cfg, load_a, lp.body, lp.iv_inst, lp.preheader)
-        else {
+        let Some((base_a, off_a)) = match_unit_i8_load(view, cfg, load_a, lp) else {
             continue;
         };
-        let Some((base_b, off_b)) =
-            match_unit_i8_load(view, cfg, load_b, lp.body, lp.iv_inst, lp.preheader)
-        else {
+        let Some((base_b, off_b)) = match_unit_i8_load(view, cfg, load_b, lp) else {
             continue;
         };
 
         let b_range = view.block(Block(lp.body));
         let b_term = b_range.end.saturating_sub(1);
+        let is_single = matches!(lp.shape, LoopShape::SingleBlock { .. });
         let body_ok = (b_range.start..b_term).all(|k| {
             k == load_a
                 || k == load_b
                 || matches!(
                     view.op(k),
-                    Op::PtrAdd | Op::Sext | Op::Zext | Op::Mul | Op::Add | Op::Iconst | Op::IconstWide
+                    Op::PtrAdd
+                        | Op::Sext
+                        | Op::Zext
+                        | Op::Mul
+                        | Op::Add
+                        | Op::Iconst
+                        | Op::IconstWide
+                        | Op::Freeze
+                        | Op::Assume
                 )
+                || (is_single
+                    && matches!(view.op(k), Op::Param | Op::Icmp | Op::PtrAddr | Op::Not))
         });
         if !body_ok {
             continue;
@@ -1858,28 +2281,41 @@ fn apply_dotprod_plan<A: Allocator + Copy>(
         return Err(SimplifyError::Refused { inst: 0, what: "vector type <4 x i32>" });
     };
 
-    let use_chunked_i64 = plan.lp.acc_ty == Ty::I64;
-    let extra_blocks: usize = if use_chunked_i64 {
-        4 // vpre, vchunk, vloop, vred
-    } else {
-        3 // vpre, vloop, vred
+    let is_ptr_iv = matches!(plan.lp.iv_kind, LoopIvKind::Pointer { .. });
+    let single_exit_old = match plan.lp.shape {
+        LoopShape::HeaderBody => NONE,
+        LoopShape::SingleBlock { exit } => exit,
     };
+    let is_single = single_exit_old != NONE;
+    let use_chunked_i64 = plan.lp.acc_ty == Ty::I64;
+    let needs_vtail = use_chunked_i64 && is_single;
+    let extra_blocks: usize = 3 + usize::from(use_chunked_i64) + usize::from(needs_vtail);
 
     let blocks = view.blocks();
     let len = view.len();
     let insert_at = to_idx(plan.lp.preheader) + 1;
-    let vpre_blk = to_u32(insert_at);
-    let (vchunk_blk, vloop_blk, vred_blk) = if use_chunked_i64 {
-        (to_u32(insert_at + 1), to_u32(insert_at + 2), to_u32(insert_at + 3))
+    let mut cursor = insert_at;
+    let vpre_blk = to_u32(cursor);
+    cursor += 1;
+    let vchunk_blk = if use_chunked_i64 {
+        let b = to_u32(cursor);
+        cursor += 1;
+        b
     } else {
-        (NONE, to_u32(insert_at + 1), to_u32(insert_at + 2))
+        NONE
     };
+    let vloop_blk = to_u32(cursor);
+    cursor += 1;
+    let vred_blk = to_u32(cursor);
+    cursor += 1;
+    let vtail_blk = if needs_vtail { to_u32(cursor) } else { NONE };
 
     let mut blk_map: Vec<u32, A> = Vec::with_capacity_in(blocks, alloc);
     for b in 0..blocks {
         blk_map.push(if b < insert_at { to_u32(b) } else { to_u32(b + extra_blocks) });
     }
     let orig_hdr_new = at(&blk_map, to_idx(plan.lp.header));
+    let orig_exit_new = if is_single { at(&blk_map, to_idx(single_exit_old)) } else { NONE };
 
     let mut func = view.to_func_in(alloc);
     clear_func_code(&mut func);
@@ -1913,25 +2349,33 @@ fn apply_dotprod_plan<A: Allocator + Copy>(
             set_at(&mut val_map, inst, mapped);
         }
 
-        let iv_init = at(&val_map, to_idx(plan.lp.iv_init));
-        let bound = at(&val_map, to_idx(plan.lp.bound));
+        let orig_iv_init = at(&val_map, to_idx(plan.lp.iv_init));
+        let orig_bound = at(&val_map, to_idx(plan.lp.bound));
+        let orig_sec_init = match plan.lp.iv_kind {
+            LoopIvKind::Pointer { sec_ptr_pos: Some(_), sec_ptr_init, .. } => at(&val_map, to_idx(sec_ptr_init)),
+            _ => NONE,
+        };
         let acc_init = at(&val_map, to_idx(plan.lp.acc_init));
         let base_a = at(&val_map, to_idx(plan.base_a));
         let base_b = at(&val_map, to_idx(plan.base_b));
 
-        let has_rem = push_icmp(&mut func, IntCond::Ult, Ty::I1, iv_init, bound);
-        let rem = push_bin(&mut func, Op::Sub, Flags::NONE, Ty::I64, bound, iv_init);
+        let (iv_init, tail_bound, has_rem, rem) = if is_ptr_iv {
+            let p0_addr = push_unary(&mut func, Op::PtrAddr, Ty::I64, orig_iv_init);
+            let end_addr = push_unary(&mut func, Op::PtrAddr, Ty::I64, orig_bound);
+            let hr = push_icmp(&mut func, IntCond::Ult, Ty::I1, p0_addr, end_addr);
+            let r = push_bin(&mut func, Op::Sub, Flags::NONE, Ty::I64, end_addr, p0_addr);
+            let z0 = push_iconst(&mut func, Ty::I64, 0);
+            (z0, r, hr, r)
+        } else {
+            let hr = push_icmp(&mut func, IntCond::Ult, Ty::I1, orig_iv_init, orig_bound);
+            let r = push_bin(&mut func, Op::Sub, Flags::NONE, Ty::I64, orig_bound, orig_iv_init);
+            (orig_iv_init, orig_bound, hr, r)
+        };
         let k64 = push_iconst(&mut func, Ty::I64, 64);
         let enough = push_icmp(&mut func, IntCond::Uge, Ty::I1, rem, k64);
         let go_vec = push_bin(&mut func, Op::And, Flags::NONE, Ty::I1, has_rem, enough);
 
-        let (orig_args, orig_argc) = ordered_header_args(
-            plan.lp.param_count,
-            plan.lp.iv_pos,
-            iv_init,
-            plan.lp.acc_pos,
-            acc_init,
-        );
+        let (orig_args, orig_argc) = ordered_header_args(plan.lp, orig_iv_init, orig_sec_init, acc_init);
         let orig_slice = orig_args.get(..orig_argc).unwrap_or(&[]);
         push_br(&mut func, go_vec, vpre_blk, &[], orig_hdr_new, orig_slice);
 
@@ -1940,7 +2384,11 @@ fn apply_dotprod_plan<A: Allocator + Copy>(
         func.block_kinds.push(block_kind_byte(BlockKind::Normal));
         let kmask64 = push_iconst(&mut func, Ty::I64, !63u64);
         let vcnt = push_bin(&mut func, Op::And, Flags::NONE, Ty::I64, rem, kmask64);
-        let vend = push_bin(&mut func, Op::Add, Flags::NONE, Ty::I64, iv_init, vcnt);
+        let vend = if is_ptr_iv {
+            vcnt
+        } else {
+            push_bin(&mut func, Op::Add, Flags::NONE, Ty::I64, iv_init, vcnt)
+        };
         let base_a_adj = emit_offset_base(&mut func, base_a, plan.off_a);
         let same_stream = plan.base_a == plan.base_b && plan.off_a == plan.off_b;
         let base_b_adj = if same_stream {
@@ -2049,19 +2497,66 @@ fn apply_dotprod_plan<A: Allocator + Copy>(
         };
         let acc_after = push_bin(&mut func, Op::Add, Flags::NONE, plan.lp.acc_ty, chunk_acc_param, sum_acc);
 
-        let (tail_args, tail_argc) = ordered_header_args(
-            plan.lp.param_count,
-            plan.lp.iv_pos,
-            iv_r,
-            plan.lp.acc_pos,
-            acc_after,
-        );
-        let tail_slice = tail_args.get(..tail_argc).unwrap_or(&[]);
+        let emit_tail_jump = |func: &mut Func<A>, iv_done: u32, acc_done: u32| {
+            let (iv_hdr, sec_hdr) = if is_ptr_iv {
+                let p0_after = push_bin(func, Op::PtrAdd, Flags::NONE, Ty::PTR, orig_iv_init, iv_done);
+                let p1_after = if orig_sec_init != NONE {
+                    push_bin(func, Op::PtrAdd, Flags::NONE, Ty::PTR, orig_sec_init, iv_done)
+                } else {
+                    NONE
+                };
+                (p0_after, p1_after)
+            } else {
+                (iv_done, NONE)
+            };
+            let (tail_args, tail_argc) = ordered_header_args(plan.lp, iv_hdr, sec_hdr, acc_done);
+            let tail_slice = tail_args.get(..tail_argc).unwrap_or(&[]);
+            if is_single {
+                let has_tail = push_icmp(func, IntCond::Ult, Ty::I1, iv_done, tail_bound);
+                let mut ex_buf = [0u32; 4];
+                for k in 0..plan.lp.single_exit_argc {
+                    let ea = at(&plan.lp.single_exit_args, k);
+                    let mapped = if plan.lp.acc_pos.is_some() && ea == plan.lp.acc_next {
+                        acc_done
+                    } else {
+                        at(&val_map, to_idx(ea))
+                    };
+                    set_at(&mut ex_buf, k, mapped);
+                }
+                let ex_slice = ex_buf.get(..plan.lp.single_exit_argc).unwrap_or(&[]);
+                push_br(func, has_tail, orig_hdr_new, tail_slice, orig_exit_new, ex_slice);
+            } else {
+                push_jump(func, orig_hdr_new, tail_slice);
+            }
+        };
+
         if use_chunked_i64 {
             let more = push_icmp(&mut func, IntCond::Ult, Ty::I1, iv_r, vend);
-            push_br(&mut func, more, vchunk_blk, &[iv_r, acc_after], orig_hdr_new, tail_slice);
+            if needs_vtail {
+                push_br(&mut func, more, vchunk_blk, &[iv_r, acc_after], vtail_blk, &[iv_r, acc_after]);
+                func.block_starts.push(to_u32(func.ops.len()));
+                func.block_kinds.push(block_kind_byte(BlockKind::Normal));
+                let iv_t = push_inst(&mut func, Op::Param, Flags::NONE, Ty::I64, 0, 0);
+                let acc_t = push_inst(&mut func, Op::Param, Flags::NONE, plan.lp.acc_ty, 0, 0);
+                emit_tail_jump(&mut func, iv_t, acc_t);
+            } else {
+                let (iv_hdr, sec_hdr) = if is_ptr_iv {
+                    let p0_after = push_bin(&mut func, Op::PtrAdd, Flags::NONE, Ty::PTR, orig_iv_init, iv_r);
+                    let p1_after = if orig_sec_init != NONE {
+                        push_bin(&mut func, Op::PtrAdd, Flags::NONE, Ty::PTR, orig_sec_init, iv_r)
+                    } else {
+                        NONE
+                    };
+                    (p0_after, p1_after)
+                } else {
+                    (iv_r, NONE)
+                };
+                let (tail_args, tail_argc) = ordered_header_args(plan.lp, iv_hdr, sec_hdr, acc_after);
+                let tail_slice = tail_args.get(..tail_argc).unwrap_or(&[]);
+                push_br(&mut func, more, vchunk_blk, &[iv_r, acc_after], orig_hdr_new, tail_slice);
+            }
         } else {
-            push_jump(&mut func, orig_hdr_new, tail_slice);
+            emit_tail_jump(&mut func, iv_r, acc_after);
         }
     }
 
@@ -3121,5 +3616,151 @@ mod tests {
                 other => panic!("unexpected outcome: {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn lut16_both_zext_mask_orders_mul1_and_pointer_iv_lower_to_4x_tbl16() {
+        // 1. `(inp[i] as usize) & 15` (`And(Zext(load i8), 15)`) + `Mul(idx, 1)` stride-1 offsets.
+        let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::I64)],
+            &[],
+        );
+        b.set_signature(sig);
+        let [entry, hdr, body, exit] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+        b.begin(entry);
+        let dst = b.param(Ty::PTR);
+        let src = b.param(Ty::PTR);
+        let lut = b.param(Ty::PTR);
+        let n = b.param(Ty::I64);
+        let z = b.iconst(Ty::I64, 0);
+        let one = b.iconst(Ty::I64, 1);
+        b.jump((hdr, &[z]));
+
+        b.begin(hdr);
+        let i = b.param(Ty::I64);
+        let keep = b.icmp(IntCond::Ne, i, n);
+        b.br(Flags::NONE, keep, (body, &[]), (exit, &[]));
+
+        b.begin(body);
+        let off_i = b.binary(Op::Mul, Flags::NONE, i, one);
+        let psrc = b.ptr_add(Flags::NONE, src, off_i);
+        let byte = b.load(Ty::I8, Flags::NONE, psrc, 0, MemAttrs::default());
+        let byte64 = b.convert(Op::Zext, Flags::NONE, Ty::I64, byte);
+        let k15 = b.iconst(Ty::I64, 15);
+        let masked64 = b.binary(Op::And, Flags::NONE, byte64, k15);
+        let lut_off = b.binary(Op::Mul, Flags::NONE, masked64, one);
+        let plut = b.ptr_add(Flags::NONE, lut, lut_off);
+        let out = b.load(Ty::I8, Flags::NONE, plut, 0, MemAttrs::default());
+        let pdst = b.ptr_add(Flags::NONE, dst, off_i);
+        b.store(Flags::NONE, out, pdst, 0, MemAttrs::default());
+        let i_next = b.binary(Op::Add, Flags::NONE, i, one);
+        b.jump((hdr, &[i_next]));
+
+        b.begin(exit);
+        b.ret(&[]);
+        let func_and_zext = b.finish_checked().unwrap();
+
+        let out1 = lower_simd_idioms(func_and_zext.view(), SimdIdiomOpts::apple_silicon(), TestHeap).unwrap();
+        verify(out1.func.view()).unwrap();
+        assert_eq!(out1.stats.tbl_loops, 1);
+        assert_eq!(count_intrinsic_calls(&out1.func.view(), NEON_TBL16_INTRINSIC), 4);
+
+        // 2. Pointer-IV `byte_lut16` (`(inp[i] & 15) as usize` = `Zext(And(load i8, 15))` with lockstep `p_src`, `p_dst`).
+        let mut p = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+        let psig = p.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::PTR)],
+            &[],
+        );
+        p.set_signature(psig);
+        let [pentry, phdr, pbody, pexit] = [(); 4].map(|_| p.create_block(BlockKind::Normal));
+        p.begin(pentry);
+        let pdst0 = p.param(Ty::PTR);
+        let psrc0 = p.param(Ty::PTR);
+        let psrc_end = p.param(Ty::PTR);
+        let plut0 = p.param(Ty::PTR);
+        let pone = p.iconst(Ty::I64, 1);
+        p.jump((phdr, &[psrc0, pdst0]));
+
+        p.begin(phdr);
+        let ps = p.param(Ty::PTR);
+        let pd = p.param(Ty::PTR);
+        let pkeep = p.icmp(IntCond::Ne, ps, psrc_end);
+        p.br(Flags::NONE, pkeep, (pbody, &[]), (pexit, &[]));
+
+        p.begin(pbody);
+        let pb = p.load(Ty::I8, Flags::NONE, ps, 0, MemAttrs::default());
+        let pk15 = p.iconst(Ty::I8, 15);
+        let pm = p.binary(Op::And, Flags::NONE, pb, pk15);
+        let pidx = p.convert(Op::Zext, Flags::NONE, Ty::I64, pm);
+        let pl = p.ptr_add(Flags::NONE, plut0, pidx);
+        let pout = p.load(Ty::I8, Flags::NONE, pl, 0, MemAttrs::default());
+        p.store(Flags::NONE, pout, pd, 0, MemAttrs::default());
+        let ps2 = p.ptr_add(Flags::NONE, ps, pone);
+        let pd2 = p.ptr_add(Flags::NONE, pd, pone);
+        p.jump((phdr, &[ps2, pd2]));
+
+        p.begin(pexit);
+        p.ret(&[]);
+        let func_ptr = p.finish_checked().unwrap();
+
+        let out2 = lower_simd_idioms(func_ptr.view(), SimdIdiomOpts::apple_silicon(), TestHeap).unwrap();
+        verify(out2.func.view()).unwrap();
+        assert_eq!(out2.stats.tbl_loops, 1);
+        assert_eq!(count_intrinsic_calls(&out2.func.view(), NEON_TBL16_INTRINSIC), 4);
+    }
+
+    #[test]
+    fn i8_dot_pointer_iv_and_counted_mul1_lower_to_4x_neon_sdot() {
+        // 1. Pointer-IV `i8_dot` (`pa`, `pb`, `acc: i32`, `pa != end_a`, `pa += 1`, `pb += 1`).
+        let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::PTR)],
+            &[Param::of(Ty::I32)],
+        );
+        b.set_signature(sig);
+        let [entry, hdr, body, exit] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+        b.begin(entry);
+        let pa0 = b.param(Ty::PTR);
+        let pa_end = b.param(Ty::PTR);
+        let pb0 = b.param(Ty::PTR);
+        let z32 = b.iconst(Ty::I32, 0);
+        let one = b.iconst(Ty::I64, 1);
+        b.jump((hdr, &[pa0, pb0, z32]));
+
+        b.begin(hdr);
+        let pa = b.param(Ty::PTR);
+        let pb = b.param(Ty::PTR);
+        let acc = b.param(Ty::I32);
+        let done = b.icmp(IntCond::Eq, pa, pa_end);
+        b.br(Flags::NONE, done, (exit, &[acc]), (body, &[]));
+
+        b.begin(body);
+        let va = b.load(Ty::I8, Flags::NONE, pa, 0, MemAttrs::default());
+        let vb = b.load(Ty::I8, Flags::NONE, pb, 0, MemAttrs::default());
+        let ea = b.convert(Op::Sext, Flags::NONE, Ty::I32, va);
+        let eb = b.convert(Op::Sext, Flags::NONE, Ty::I32, vb);
+        let prod = b.binary(Op::Mul, Flags::NONE, ea, eb);
+        let acc2 = b.binary(Op::Add, Flags::NONE, acc, prod);
+        let pa2 = b.ptr_add(Flags::NONE, pa, one);
+        let pb2 = b.ptr_add(Flags::NONE, pb, one);
+        b.jump((hdr, &[pa2, pb2, acc2]));
+
+        b.begin(exit);
+        let res = b.param(Ty::I32);
+        b.ret(&[res]);
+        let func_ptr = b.finish_checked().unwrap();
+
+        let out = lower_simd_idioms(func_ptr.view(), SimdIdiomOpts::apple_silicon(), TestHeap).unwrap();
+        verify(out.func.view()).unwrap();
+        assert_eq!(out.stats.dotprod_loops, 1);
+        assert_eq!(count_intrinsic_calls(&out.func.view(), NEON_SDOT_INTRINSIC), 4);
+        assert!((0..out.func.view().len()).any(|k| out.func.view().op(k) == Op::ReduceAdd));
     }
 }

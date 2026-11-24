@@ -57,10 +57,11 @@ use blaze_lir::{
     prefetch::insert_software_prefetch,
     sched::schedule_dag,
     simd_idioms::{SimdIdiomOpts, lower_simd_idioms},
-    simplify::scalar_replace,
+    simplify::{coalesce_cfg, dead, propagate, scalar_replace},
     slp::{slp_vectorize, vectorize_memchr_loops},
     superopt::{SuperoptOpts, superopt_a64},
     taildup::tail_duplicate_dispatch,
+    thread_jumps,
     unroll::{rotate_loops, unroll_scalar_loops},
     unswitch::unswitch_loops,
     vectorize::{auto_vectorize_loops_with_width, vectorize_iv_div_loops},
@@ -185,9 +186,42 @@ impl<F: Tier> Sota<F> {
     }
 }
 
-/// Shared Stage 1b–1g loop, vectorization, dispatch tail-duplication, superoptimization,
+/// Runs `scalar_replace -> propagate -> thread_jumps -> propagate -> dead -> coalesce_cfg`
+/// (best-effort per sub-pass, verified before returning) so local stack slots (`Option<usize>`,
+/// `Option<&T>`, `Range<usize>`) promote into SSA block parameters, phi-discriminant
+/// `Switch`/`Br` chains thread away, and single-predecessor jump chains coalesce into canonical
+/// loop shapes before downstream loop/vector/GEMM passes inspect the CFG.
+fn run_sroa_thread_cleanup<'a>(
+    input: blaze_lir::View<'_>,
+    alloc: Alloc<'a>,
+) -> Option<blaze_lir::Func<Alloc<'a>>> {
+    let mut cur: Option<blaze_lir::Func<Alloc<'a>>> = scalar_replace(input, alloc).ok();
+    let v = cur.as_ref().map_or(input, |f| f.view());
+    if let Ok(f) = propagate(v, alloc) {
+        cur = Some(f);
+    }
+    let v = cur.as_ref().map_or(input, |f| f.view());
+    if let Ok(f) = thread_jumps(v, alloc) {
+        cur = Some(f);
+    }
+    let v = cur.as_ref().map_or(input, |f| f.view());
+    if let Ok(f) = propagate(v, alloc) {
+        cur = Some(f);
+    }
+    let v = cur.as_ref().map_or(input, |f| f.view());
+    if let Ok(f) = dead(v, alloc) {
+        cur = Some(f);
+    }
+    let v = cur.as_ref().map_or(input, |f| f.view());
+    if let Ok(f) = coalesce_cfg(v, alloc) {
+        cur = Some(f);
+    }
+    cur.filter(|f| verify(f.view()).is_ok())
+}
+
+/// Shared Stage 1a–1g loop, vectorization, dispatch tail-duplication, superoptimization,
 /// scheduling, and hot/cold partitioning stack used by both [`optimize_sota_midend`] and
-/// [`emit_sota_record_measured`].
+/// [`emit_sota_record_for_machine`].
 fn run_sota_loop_and_late_passes<'a>(
     input: blaze_lir::View<'_>,
     machine: Machine,
@@ -201,13 +235,23 @@ fn run_sota_loop_and_late_passes<'a>(
         Arch::X86_64 => blaze_lir::superopt::AArch64MicroArch::X86_64Zen5,
     };
 
+    // Stage 1a: Post-fixpoint SROA + copy/const propagation + phi-discriminant jump threading +
+    // DCE + CFG coalescing so `Option`/iterator `Switch`/`Br` discriminants exposed by
+    // `sota_optimize_fixpoint` collapse into canonical counted/pointer-IV loops before BCE
+    // hoisting, GEMM, SIMD idioms, vectorization, and AMAC inspect the CFG.
+    let pre_loop_clean = run_sroa_thread_cleanup(input, alloc);
+    let loop_in = match &pre_loop_clean {
+        Some(f) => f.view(),
+        None => input,
+    };
+
     // Stage 1b-0: Dominating BCE + Safe-Rust Loop-Versioning Bounds-Check Hoisting + Triple-Nested
     // GEMM recognition (Auto-SME2 FMOPA / 4x16 NEON register blocking) run BEFORE `unswitch_loops`
     // so safe Rust slice loops hoist their panic checks and expose clean 1D/3D fast-path loops!
-    let bce0_out = eliminate_redundant_checks(input, alloc).ok();
+    let bce0_out = eliminate_redundant_checks(loop_in, alloc).ok();
     let post_bce0 = match &bce0_out {
         Some(o) => o.func.view(),
-        None => input,
+        None => loop_in,
     };
     let hoist_out = if auto_vectorize {
         hoist_loop_bounds_checks(post_bce0, BceHoistOpts::default_sota(), alloc)
@@ -271,11 +315,21 @@ fn run_sota_loop_and_late_passes<'a>(
         None => post_ifc,
     };
 
-    // Stage 1c: Alias-aware Memory LICM + Dead Store Elimination + Loop Fusion & 2D Interchange.
-    let mem_func = optimize_memory(post_clean, alloc).ok().map(|o| o.func);
-    let post_mem = match &mem_func {
-        Some(f) => f.view(),
-        None => post_clean,
+    // Stage 1c: Alias-aware Memory LICM + Dead Store Elimination + post-memopt SROA/jump-thread
+    // cleanup + Loop Fusion & 2D Interchange.
+    let mem_out = optimize_memory(post_clean, alloc).ok();
+    let mem_changed = mem_out
+        .as_ref()
+        .is_some_and(|o| o.stats.loads_hoisted > 0 || o.stats.dead_stores_eliminated > 0);
+    let mem_clean = if mem_changed {
+        mem_out.as_ref().and_then(|o| run_sroa_thread_cleanup(o.func.view(), alloc))
+    } else {
+        None
+    };
+    let post_mem = match (&mem_clean, &mem_out) {
+        (Some(f), _) => f.view(),
+        (None, Some(o)) => o.func.view(),
+        (None, None) => post_clean,
     };
     let fuse_func = if auto_vectorize {
         fuse_adjacent_loops(post_mem, alloc).ok().filter(|o| o.stats.loops_fused > 0).map(|o| o.func)
@@ -528,10 +582,11 @@ pub(crate) fn optimize_sota_midend<'a>(
         Arch::X86_64 => RegBudget { hardware_fma: (machine.features & Machine::FMA) != 0, ..RegBudget::X86_64 },
     };
 
-    // Stage 0: Scalar Replacement of Aggregates (SROA) promotes non-escaping local stack slots
-    // straight into SSA registers before Aegraph + LICM + Strength Reduction.
-    let sroa_func = scalar_replace(input, alloc).ok();
-    let mid_in = match &sroa_func {
+    // Stage 0: SROA + copy/const propagation + phi-discriminant jump threading + DCE + CFG
+    // coalescing promotes non-escaping local stack slots into SSA registers and collapses
+    // `Option`/iterator discriminants before Aegraph + LICM + Strength Reduction.
+    let pre_clean = run_sroa_thread_cleanup(input, alloc);
+    let mid_in = match &pre_clean {
         Some(f) => f.view(),
         None => input,
     };
@@ -731,8 +786,8 @@ pub fn emit_sota_record_for_machine<'a>(
         },
     };
 
-    let sroa_func = scalar_replace(func.view(), alloc).ok();
-    let mid_in = match &sroa_func {
+    let pre_clean = run_sroa_thread_cleanup(func.view(), alloc);
+    let mid_in = match &pre_clean {
         Some(f) => f.view(),
         None => func.view(),
     };

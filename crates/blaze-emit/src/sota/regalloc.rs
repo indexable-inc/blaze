@@ -1030,7 +1030,10 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
                     .and_then(|&d| view.extra.get(idx(d)))
                     .is_some_and(|&id| {
                         let name = view.intrinsic_name(blaze_lir::func::IntrinsicId(id));
-                        name == b"blaze.sme2.gemm_f32" || name == b"blaze.sme2.gemm_f64"
+                        name == b"blaze.sme2.gemm_f32"
+                            || name == b"blaze.sme2.gemm_f64"
+                            || name == b"blaze.sme2.gemm_i8_i32"
+                            || name == b"blaze.sme2.gemm_u8_u32"
                     });
             let is_non_tail_call = (matches!(
                 op,

@@ -47,6 +47,14 @@ pub const SME2_GEMM_F32_INTRINSIC: &str = "blaze.sme2.gemm_f32";
 /// `(c: ptr, a: ptr, b: ptr, m: i64, n: i64, k: i64, flags: i64) -> ()`.
 pub const SME2_GEMM_F64_INTRINSIC: &str = "blaze.sme2.gemm_f64";
 
+/// Target intrinsic name emitted for hardware SME2 signed `i8 -> i32` (`SMOPA`) GEMM:
+/// `(c: ptr, a: ptr, b: ptr, m: i64, n: i64, k: i64, flags: i64) -> ()`.
+pub const SME2_GEMM_I8_I32_INTRINSIC: &str = "blaze.sme2.gemm_i8_i32";
+
+/// Target intrinsic name emitted for hardware SME2 unsigned `u8 -> u32` (`UMOPA`) GEMM:
+/// `(c: ptr, a: ptr, b: ptr, m: i64, n: i64, k: i64, flags: i64) -> ()`.
+pub const SME2_GEMM_U8_U32_INTRINSIC: &str = "blaze.sme2.gemm_u8_u32";
+
 /// Maximum number of disjoint GEMM nests lowered per function in a single pass.
 const MAX_GEMMS_PER_FUNC: usize = 8;
 
@@ -1320,15 +1328,12 @@ fn discover_counted_loops<A: Allocator + Copy>(
             } else {
                 continue;
             };
-            // If preheader was a `Br`, its skip edge must go to the same exit (or be a non-matching guard).
-            if let Some((_, _, skip_blk, _)) = &pre_br_skip
-                && *skip_blk != exit
-            {
-                continue;
-            }
+            // For pre-tested `HeaderBody` loops, the loop tests `0 < bound` itself in `header`,
+            // so `preheader` may end in any `Br` (e.g. a preceding sibling loop's exit branch or
+            // outer loop's header branch after jump-threading collapses forwarding preheaders).
             let skip_args = match pre_br_skip {
-                Some((_, _, _, sa)) => sa,
-                None => Vec::new_in(alloc),
+                Some((_, _, skip_blk, sa)) if skip_blk == exit => sa,
+                _ => Vec::new_in(alloc),
             };
 
             // Identify primary IV `0..bound` stepping by `+1`.
@@ -2059,8 +2064,81 @@ fn eval_affine_ptr<A: Allocator>(
 // Triple-Nested GEMM Recognition (`detect_gemm_nest`)
 // ---------------------------------------------------------------------------
 
+/// Recognized element/accumulator precision kind for a GEMM loop nest.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GemmElem {
+    F32,
+    F64,
+    I32,
+    /// Widening signed `i8 * i8 -> i32` GEMM (`SMOPA`).
+    I8ToI32,
+    /// Widening unsigned `u8 * u8 -> u32` GEMM (`UMOPA`).
+    U8ToU32,
+}
+
+impl GemmElem {
+    #[inline]
+    const fn acc_ty(self) -> Ty {
+        match self {
+            Self::F32 => Ty::F32,
+            Self::F64 => Ty::F64,
+            Self::I32 | Self::I8ToI32 | Self::U8ToU32 => Ty::I32,
+        }
+    }
+
+    #[inline]
+    const fn acc_bytes(self) -> u64 {
+        match self {
+            Self::F64 => 8,
+            Self::F32 | Self::I32 | Self::I8ToI32 | Self::U8ToU32 => 4,
+        }
+    }
+
+    #[inline]
+    const fn acc_shift(self) -> u32 {
+        match self {
+            Self::F64 => 3,
+            Self::F32 | Self::I32 | Self::I8ToI32 | Self::U8ToU32 => 2,
+        }
+    }
+
+    #[inline]
+    const fn input_bytes(self) -> u64 {
+        match self {
+            Self::F64 => 8,
+            Self::F32 | Self::I32 => 4,
+            Self::I8ToI32 | Self::U8ToU32 => 1,
+        }
+    }
+
+    #[inline]
+    const fn input_shift(self) -> u32 {
+        match self {
+            Self::F64 => 3,
+            Self::F32 | Self::I32 => 2,
+            Self::I8ToI32 | Self::U8ToU32 => 0,
+        }
+    }
+
+    #[inline]
+    const fn sme2_intrinsic(self) -> Option<&'static str> {
+        match self {
+            Self::F32 => Some(SME2_GEMM_F32_INTRINSIC),
+            Self::F64 => Some(SME2_GEMM_F64_INTRINSIC),
+            Self::I8ToI32 => Some(SME2_GEMM_I8_I32_INTRINSIC),
+            Self::U8ToU32 => Some(SME2_GEMM_U8_U32_INTRINSIC),
+            Self::I32 => None,
+        }
+    }
+
+    #[inline]
+    const fn supports_neon_4x16(self) -> bool {
+        matches!(self, Self::F32 | Self::F64 | Self::I32)
+    }
+}
+
 struct GemmKernel<A: Allocator> {
-    elem_ty: Ty,
+    elem: GemmElem,
     a_ptr: u32,
     a_const_off: i64,
     b_ptr: u32,
@@ -2105,20 +2183,50 @@ fn is_strict_subset(sub: &[bool], sup: &[bool]) -> bool {
     strict
 }
 
+/// Checks if `a` and `b` have no overlapping blocks.
+fn is_disjoint_sets(a: &[bool], b: &[bool]) -> bool {
+    for i in 0..a.len() {
+        if at(a, i) && at(b, i) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Checks whether two element strides are provably equal in `view`.
+fn same_dim_stride(view: &View<'_>, a: DimStride, b: DimStride) -> bool {
+    match (a, b) {
+        (DimStride::Zero, DimStride::Zero) => true,
+        (DimStride::Const(x), DimStride::Const(y)) => x == y,
+        (DimStride::Value(x), DimStride::Value(y)) => same_val_or_const(view, x, y),
+        (DimStride::Const(c), DimStride::Value(v)) | (DimStride::Value(v), DimStride::Const(c)) => {
+            const_u64(view, to_idx(v)) == Some(c)
+        }
+        _ => false,
+    }
+}
+
 /// Checks that every block inside `outer` has straight-line control flow except for the loop
-/// headers/latches/rotated-preheaders of `L0`, `L1`, `L2`, and that no edge exits `L0` except to
-/// `L0.exit` with outside-defined arguments matching `L0.exit_args`.
+/// headers/latches/rotated-preheaders of `L0`, `L1`, `L2` (and optional preceding sibling
+/// row-zero-init loop `l_zero`), and that no edge exits `L0` except to `L0.exit` with
+/// outside-defined arguments matching `L0.exit_args`.
 fn verify_nest_cfg<A: Allocator + Copy>(
     view: &View<'_>,
     cfg: &CfgInfo<A>,
     l0: &CountedLoop<A>,
     l1: &CountedLoop<A>,
     l2: &CountedLoop<A>,
+    l_zero: Option<&CountedLoop<A>>,
     all_natural_loops: &[(u32, u32)],
 ) -> bool {
     let blocks = view.blocks();
-    // 1. Strict nesting: L2 ⊂ L1 ⊂ L0.
+    // 1. Strict nesting: L2 ⊂ L1 ⊂ L0, and optional sibling `l_zero ⊂ L0` disjoint from `L1`.
     if !is_strict_subset(&l2.in_loop, &l1.in_loop) || !is_strict_subset(&l1.in_loop, &l0.in_loop) {
+        return false;
+    }
+    if let Some(lz) = l_zero
+        && (!is_strict_subset(&lz.in_loop, &l0.in_loop) || !is_disjoint_sets(&lz.in_loop, &l1.in_loop))
+    {
         return false;
     }
     // 2. No other natural loops inside L0.
@@ -2126,19 +2234,36 @@ fn verify_nest_cfg<A: Allocator + Copy>(
         if at(&l0.in_loop, to_idx(h)) {
             let is_known = (h == l0.header && l == l0.latch)
                 || (h == l1.header && l == l1.latch)
-                || (h == l2.header && l == l2.latch);
+                || (h == l2.header && l == l2.latch)
+                || l_zero.is_some_and(|lz| h == lz.header && l == lz.latch);
             if !is_known {
                 return false;
             }
         }
     }
-    // 3. L1 preheader & exit live inside L0 \ L1; L2 preheader & exit live inside L1 \ L2.
+    // 3. L1 preheader & exit live inside L0 \ (L1 ∪ l_zero); L2 preheader & exit live inside L1 \ L2;
+    //    optional `l_zero` preheader & exit live inside L0 \ (l_zero ∪ L1).
     if !at(&l0.in_loop, to_idx(l1.preheader))
         || at(&l1.in_loop, to_idx(l1.preheader))
         || !at(&l0.in_loop, to_idx(l1.exit))
         || at(&l1.in_loop, to_idx(l1.exit))
     {
         return false;
+    }
+    if let Some(lz) = l_zero {
+        let direct_lz_to_l1 = lz.exit == l1.header
+            && (l1.preheader == lz.header || (lz.is_rotated && l1.preheader == lz.latch));
+        if (!direct_lz_to_l1 && at(&lz.in_loop, to_idx(l1.preheader)))
+            || at(&lz.in_loop, to_idx(l1.exit))
+            || !at(&l0.in_loop, to_idx(lz.preheader))
+            || at(&lz.in_loop, to_idx(lz.preheader))
+            || at(&l1.in_loop, to_idx(lz.preheader))
+            || !at(&l0.in_loop, to_idx(lz.exit))
+            || at(&lz.in_loop, to_idx(lz.exit))
+            || (!direct_lz_to_l1 && at(&l1.in_loop, to_idx(lz.exit)))
+        {
+            return false;
+        }
     }
     if !at(&l1.in_loop, to_idx(l2.preheader))
         || at(&l2.in_loop, to_idx(l2.preheader))
@@ -2147,7 +2272,7 @@ fn verify_nest_cfg<A: Allocator + Copy>(
     {
         return false;
     }
-    // 4. Dominance along the nest spine.
+    // 4. Dominance along the nest spine (with optional `l_zero` strictly preceding `l1`).
     if !cfg.dominates(l0.header, l1.header)
         || !cfg.dominates(l1.header, l2.header)
         || !cfg.dominates(l1.exit, l0.latch)
@@ -2155,13 +2280,34 @@ fn verify_nest_cfg<A: Allocator + Copy>(
     {
         return false;
     }
-    // 5. Innermost loop L2 has exact canonical shape (1 block if rotated, 2 blocks if HeaderBody).
+    if let Some(lz) = l_zero {
+        let direct_lz_to_l1 = lz.exit == l1.header
+            && (l1.preheader == lz.header || (lz.is_rotated && l1.preheader == lz.latch));
+        let precedes_l1 = if direct_lz_to_l1 {
+            cfg.dominates(lz.header, l1.header)
+        } else {
+            cfg.dominates(lz.exit, l1.preheader)
+        };
+        if !cfg.dominates(l0.header, lz.header) || !precedes_l1 {
+            return false;
+        }
+    }
+    // 5. Innermost loop L2 (and optional `l_zero`) has exact canonical shape (1 block if rotated, 2 if HeaderBody).
     if l2.is_rotated {
         if l2.block_count != 1 || l2.header != l2.latch {
             return false;
         }
     } else if l2.block_count != 2 || l2.body_entry != l2.latch {
         return false;
+    }
+    if let Some(lz) = l_zero {
+        if lz.is_rotated {
+            if lz.block_count != 1 || lz.header != lz.latch {
+                return false;
+            }
+        } else if lz.block_count != 2 || lz.body_entry != lz.latch {
+            return false;
+        }
     }
 
     // 6. Verify every block inside L0 only uses approved terminators and never jumps outside L0
@@ -2183,7 +2329,12 @@ fn verify_nest_cfg<A: Allocator + Copy>(
             || (b32 == l1.latch && l1.is_rotated)
             || (b32 == l2.preheader && l2.is_rotated)
             || (b32 == l2.header && !l2.is_rotated)
-            || (b32 == l2.latch && l2.is_rotated);
+            || (b32 == l2.latch && l2.is_rotated)
+            || l_zero.is_some_and(|lz| {
+                (b32 == lz.preheader && lz.is_rotated)
+                    || (b32 == lz.header && !lz.is_rotated)
+                    || (b32 == lz.latch && lz.is_rotated)
+            });
         if op == Op::Br {
             if !allowed_br {
                 return false;
@@ -2338,7 +2489,79 @@ fn affine_to_elem_strides(aff: AffinePtr, elem_bytes: u64) -> Option<[DimStride;
     Some([s0, s1, s2])
 }
 
-/// Attempts to recognize a triple-nested GEMM kernel rooted at `outer_idx` among `counted` loops.
+/// Extracts `(elem_kind, lhs_load, rhs_load)` from the two multiplicands of `match_mac`,
+/// supporting uniform `f32`/`f64`/`i32` loads as well as widening `Sext(load i8)` (`i8 -> i32`)
+/// and `Zext(load i8)` (`u8 -> u32`) inputs.
+fn extract_gemm_input_loads(
+    view: &View<'_>,
+    lhs_val: u32,
+    rhs_val: u32,
+    acc_ty: Ty,
+    in_outer: &[bool],
+    inst_block: &[u32],
+) -> Option<(GemmElem, u32, u32)> {
+    let li = to_idx(lhs_val);
+    let ri = to_idx(rhs_val);
+    if !at(in_outer, to_idx(at(inst_block, li))) || !at(in_outer, to_idx(at(inst_block, ri))) {
+        return None;
+    }
+    let lop = view.op(li);
+    let rop = view.op(ri);
+    if acc_ty == Ty::F32 {
+        if lhs_val != rhs_val
+            && lop == Op::Load
+            && rop == Op::Load
+            && Ty(at(view.tys, li)) == Ty::F32
+            && Ty(at(view.tys, ri)) == Ty::F32
+        {
+            return Some((GemmElem::F32, lhs_val, rhs_val));
+        }
+        return None;
+    }
+    if acc_ty == Ty::F64 {
+        if lhs_val != rhs_val
+            && lop == Op::Load
+            && rop == Op::Load
+            && Ty(at(view.tys, li)) == Ty::F64
+            && Ty(at(view.tys, ri)) == Ty::F64
+        {
+            return Some((GemmElem::F64, lhs_val, rhs_val));
+        }
+        return None;
+    }
+    if acc_ty == Ty::I32 {
+        if lhs_val != rhs_val
+            && lop == Op::Load
+            && rop == Op::Load
+            && Ty(at(view.tys, li)) == Ty::I32
+            && Ty(at(view.tys, ri)) == Ty::I32
+        {
+            return Some((GemmElem::I32, lhs_val, rhs_val));
+        }
+        if (lop == Op::Sext && rop == Op::Sext) || (lop == Op::Zext && rop == Op::Zext) {
+            let l_src = at(view.data, li);
+            let r_src = at(view.data, ri);
+            let lsi = to_idx(l_src);
+            let rsi = to_idx(r_src);
+            if l_src != r_src
+                && at(in_outer, to_idx(at(inst_block, lsi)))
+                && at(in_outer, to_idx(at(inst_block, rsi)))
+                && view.op(lsi) == Op::Load
+                && view.op(rsi) == Op::Load
+                && Ty(at(view.tys, lsi)) == Ty::I8
+                && Ty(at(view.tys, rsi)) == Ty::I8
+            {
+                let elem = if lop == Op::Sext { GemmElem::I8ToI32 } else { GemmElem::U8ToU32 };
+                return Some((elem, l_src, r_src));
+            }
+        }
+    }
+    None
+}
+
+/// Attempts to recognize a triple-nested GEMM kernel rooted at `outer_idx` among `counted` loops
+/// (including an optional preceding sibling row-zero-init loop `for j in 0..N { C[i*ldc+j] = 0 }`
+/// inside `outer`, which turns the nest into an overwrite GEMM `C = A * B` with `flags = 0`).
 fn detect_gemm_nest<A: Allocator + Copy>(
     view: &View<'_>,
     cfg: &CfgInfo<A>,
@@ -2349,14 +2572,12 @@ fn detect_gemm_nest<A: Allocator + Copy>(
 ) -> Option<GemmKernel<A>> {
     let l0 = counted.get(outer_idx)?;
 
-    // Find the unique middle loop `l1` directly inside `l0` and innermost loop `l2` inside `l1`.
+    // 1. Find the unique middle loop `l1` inside `l0` (contains a child counted loop).
     let mut mid_idx: Option<usize> = None;
-    let mut inner_idx: Option<usize> = None;
     for (idx, cand) in counted.iter().enumerate() {
         if idx == outer_idx || !is_strict_subset(&cand.in_loop, &l0.in_loop) {
             continue;
         }
-        // Check if `cand` contains another counted loop inside `l0` -> then `cand` is `l1`.
         let mut contains_child = false;
         for (j, other) in counted.iter().enumerate() {
             if j != idx && is_strict_subset(&other.in_loop, &cand.in_loop) {
@@ -2369,23 +2590,52 @@ fn detect_gemm_nest<A: Allocator + Copy>(
                 return None;
             }
             mid_idx = Some(idx);
-        } else {
+        }
+    }
+    let mid_i = mid_idx?;
+    let l1 = counted.get(mid_i)?;
+
+    // 2. Partition remaining counted loops strictly inside `l0` into the unique `l2 ⊂ l1` and at
+    //    most one sibling leaf loop `l_zero ⊂ l0` disjoint from `l1`.
+    let mut inner_idx: Option<usize> = None;
+    let mut zero_idx: Option<usize> = None;
+    for (idx, cand) in counted.iter().enumerate() {
+        if idx == outer_idx || idx == mid_i || !is_strict_subset(&cand.in_loop, &l0.in_loop) {
+            continue;
+        }
+        if is_strict_subset(&cand.in_loop, &l1.in_loop) {
             if inner_idx.is_some() {
                 return None;
             }
             inner_idx = Some(idx);
+        } else if is_disjoint_sets(&cand.in_loop, &l1.in_loop) {
+            if zero_idx.is_some() {
+                return None;
+            }
+            zero_idx = Some(idx);
+        } else {
+            return None;
         }
     }
-    let l1 = counted.get(mid_idx?)?;
     let l2 = counted.get(inner_idx?)?;
+    let l_zero = match zero_idx {
+        Some(zi) => Some(counted.get(zi)?),
+        None => None,
+    };
 
-    if !verify_nest_cfg(view, cfg, l0, l1, l2, all_natural_loops) {
+    if !verify_nest_cfg(view, cfg, l0, l1, l2, l_zero, all_natural_loops) {
         return None;
     }
 
-    // All three bounds must dominate `l0.preheader`.
+    // All loop bounds must dominate `l0.preheader` and lie outside `l0`.
     for &bval in &[l0.bound, l1.bound, l2.bound] {
         let bb = at(&cfg.inst_block, to_idx(bval));
+        if at(&l0.in_loop, to_idx(bb)) || !cfg.dominates(bb, l0.preheader) {
+            return None;
+        }
+    }
+    if let Some(lz) = l_zero {
+        let bb = at(&cfg.inst_block, to_idx(lz.bound));
         if at(&l0.in_loop, to_idx(bb)) || !cfg.dominates(bb, l0.preheader) {
             return None;
         }
@@ -2423,20 +2673,42 @@ fn detect_gemm_nest<A: Allocator + Copy>(
             }
         }
     }
-    if stores.len() != 1 || !(loads.len() == 2 || loads.len() == 3) {
-        return None;
-    }
+    let (store_c, zero_store_opt) = if let Some(lz) = l_zero {
+        if stores.len() != 2 || !(loads.len() == 2 || loads.len() == 3) {
+            return None;
+        }
+        for &ld in &loads {
+            if at(&lz.in_loop, to_idx(at(&cfg.inst_block, to_idx(ld)))) {
+                return None;
+            }
+        }
+        let s0 = at(&stores, 0);
+        let s1 = at(&stores, 1);
+        let s0_in_z = at(&lz.in_loop, to_idx(at(&cfg.inst_block, to_idx(s0))));
+        let s1_in_z = at(&lz.in_loop, to_idx(at(&cfg.inst_block, to_idx(s1))));
+        if s0_in_z && !s1_in_z {
+            (s1, Some(s0))
+        } else if s1_in_z && !s0_in_z {
+            (s0, Some(s1))
+        } else {
+            return None;
+        }
+    } else {
+        if stores.len() != 1 || !(loads.len() == 2 || loads.len() == 3) {
+            return None;
+        }
+        (at(&stores, 0), None)
+    };
 
-    let store_c = at(&stores, 0);
     let st_i = to_idx(store_c);
     let st_pos = to_idx(at(view.data, st_i));
     let store_val = at(view.extra, st_pos);
     let store_ptr = at(view.extra, st_pos + 1);
     let store_off = at(view.extra, st_pos + 2).cast_signed();
-    let elem_ty = Ty(at(view.tys, to_idx(store_val)));
-    let elem_bytes: u64 = if elem_ty == Ty::F32 || elem_ty == Ty::I32 {
+    let acc_ty = Ty(at(view.tys, to_idx(store_val)));
+    let acc_bytes: u64 = if acc_ty == Ty::F32 || acc_ty == Ty::I32 {
         4
-    } else if elem_ty == Ty::F64 {
+    } else if acc_ty == Ty::F64 {
         8
     } else {
         return None;
@@ -2453,9 +2725,9 @@ fn detect_gemm_nest<A: Allocator + Copy>(
 
     // Match the MAC pattern: either Case A (`store_c` inside `L2`, RMW `C += A*B`), or Case B
     // (`store_c` inside `L1 \ L2` after `L2`, register-accumulated dot-product in `L2`).
-    let (lhs_val, rhs_val, is_accumulate_into_c, load_c_opt, fma_flags) = if at(&l2.in_loop, to_idx(store_blk)) {
+    let (lhs_val, rhs_val, mut is_accumulate_into_c, load_c_opt, fma_flags) = if at(&l2.in_loop, to_idx(store_blk)) {
         // Case A: RMW inside L2 (`i-k-j` or unhoisted `i-j-k`).
-        let (a_v, b_v, acc_in, fl) = match_mac(view, store_val, elem_ty)?;
+        let (a_v, b_v, acc_in, fl) = match_mac(view, store_val, acc_ty)?;
         if view.op(to_idx(acc_in)) != Op::Load {
             return None;
         }
@@ -2508,17 +2780,17 @@ fn detect_gemm_nest<A: Allocator + Copy>(
         let acc_init = at(&l2.pre_args, acc_pos);
         if let Some(sk) = skip_init_opt
             && !same_val_or_const(view, sk, acc_init)
-            && !(is_zero_elem_const(view, to_idx(sk), elem_ty)
-                && is_zero_elem_const(view, to_idx(acc_init), elem_ty))
+            && !(is_zero_elem_const(view, to_idx(sk), acc_ty)
+                && is_zero_elem_const(view, to_idx(acc_init), acc_ty))
         {
             return None;
         }
         let acc_back = at(&l2.back_args, acc_pos);
-        let (a_v, b_v, acc_in, fl) = match_mac(view, acc_back, elem_ty)?;
+        let (a_v, b_v, acc_in, fl) = match_mac(view, acc_back, acc_ty)?;
         if acc_in != acc_param {
             return None;
         }
-        if is_zero_elem_const(view, to_idx(acc_init), elem_ty) {
+        if is_zero_elem_const(view, to_idx(acc_init), acc_ty) {
             (a_v, b_v, false, None, fl)
         } else if view.op(to_idx(acc_init)) == Op::Load {
             (a_v, b_v, true, Some(acc_init), fl)
@@ -2529,23 +2801,17 @@ fn detect_gemm_nest<A: Allocator + Copy>(
         return None;
     };
 
-    // Verify every collected load is accounted for (exact 2 inputs `lhs_val`, `rhs_val` + optional `load_c`).
-    if lhs_val == rhs_val
-        || !at(&l0.in_loop, to_idx(at(&cfg.inst_block, to_idx(lhs_val))))
-        || !at(&l0.in_loop, to_idx(at(&cfg.inst_block, to_idx(rhs_val))))
-        || view.op(to_idx(lhs_val)) != Op::Load
-        || view.op(to_idx(rhs_val)) != Op::Load
-        || Ty(at(view.tys, to_idx(lhs_val))) != elem_ty
-        || Ty(at(view.tys, to_idx(rhs_val))) != elem_ty
-    {
-        return None;
-    }
+    // Resolve the two input matrix loads (uniform `f32`/`f64`/`i32` or widening `Sext`/`Zext` from `i8`).
+    let (elem, lhs_load, rhs_load) =
+        extract_gemm_input_loads(view, lhs_val, rhs_val, acc_ty, &l0.in_loop, &cfg.inst_block)?;
+
+    // Verify every collected load is accounted for (exact 2 inputs `lhs_load`, `rhs_load` + optional `load_c`).
     let expected_loads = if load_c_opt.is_some() { 3 } else { 2 };
     if loads.len() != expected_loads {
         return None;
     }
     for &ld in &loads {
-        if ld != lhs_val && ld != rhs_val && Some(ld) != load_c_opt {
+        if ld != lhs_load && ld != rhs_load && Some(ld) != load_c_opt {
             return None;
         }
     }
@@ -2553,7 +2819,7 @@ fn detect_gemm_nest<A: Allocator + Copy>(
     // If accumulating into `C`, verify `load_c`'s affine address equals `store_c`'s affine address!
     if let Some(load_c) = load_c_opt {
         let lci = to_idx(load_c);
-        if Ty(at(view.tys, lci)) != elem_ty {
+        if Ty(at(view.tys, lci)) != acc_ty {
             return None;
         }
         let lcp = to_idx(at(view.data, lci));
@@ -2568,18 +2834,18 @@ fn detect_gemm_nest<A: Allocator + Copy>(
         }
     }
 
-    // Evaluate affine addresses of the two multiplicand loads.
+    // Evaluate affine addresses of the two multiplicand loads (byte stride = `elem.input_bytes()`).
     let eval_load_aff = |ld: u32| -> Option<AffinePtr> {
         let li = to_idx(ld);
         let lp = to_idx(at(view.data, li));
         eval_affine_ptr(view, at(view.extra, lp), at(view.extra, lp + 1).cast_signed(), &nest)
     };
-    let lhs_aff = eval_load_aff(lhs_val)?;
-    let rhs_aff = eval_load_aff(rhs_val)?;
+    let lhs_aff = eval_load_aff(lhs_load)?;
+    let rhs_aff = eval_load_aff(rhs_load)?;
 
-    let lhs_str = affine_to_elem_strides(lhs_aff, elem_bytes)?;
-    let rhs_str = affine_to_elem_strides(rhs_aff, elem_bytes)?;
-    let c_str = affine_to_elem_strides(c_aff, elem_bytes)?;
+    let lhs_str = affine_to_elem_strides(lhs_aff, elem.input_bytes())?;
+    let rhs_str = affine_to_elem_strides(rhs_aff, elem.input_bytes())?;
+    let c_str = affine_to_elem_strides(c_aff, acc_bytes)?;
 
     // Match either `(lhs = A, rhs = B)` or `(lhs = B, rhs = A)` (multiplication is commutative).
     let (a_aff, b_aff, i_ax, k_ax, j_ax, lda, ldb, ldc) =
@@ -2625,8 +2891,43 @@ fn detect_gemm_nest<A: Allocator + Copy>(
     let lj = loop_at(j_ax);
     let lk = loop_at(k_ax);
 
+    // If a preceding sibling zero-init loop `l_zero` was found inside `l0`, verify it zeroes the
+    // exact same `C` row `C[i * ldc + 0..N]` and upgrade the entire nest to overwrite mode (`flags = 0`)!
+    if let (Some(lz), Some(zero_store)) = (l_zero, zero_store_opt) {
+        if i_ax != 0 {
+            return None;
+        }
+        let zsi = to_idx(zero_store);
+        let zsp = to_idx(at(view.data, zsi));
+        let z_val = at(view.extra, zsp);
+        let z_ptr = at(view.extra, zsp + 1);
+        let z_off = at(view.extra, zsp + 2).cast_signed();
+        if !is_zero_elem_const(view, to_idx(z_val), acc_ty) {
+            return None;
+        }
+        let zero_nest = NestRef {
+            loops: [l0, lz, lz],
+            in_outer: &l0.in_loop,
+            inst_block: &cfg.inst_block,
+        };
+        let z_aff = eval_affine_ptr(view, z_ptr, z_off, &zero_nest)?;
+        if z_aff.base != c_aff.base || z_aff.off.const_off != c_aff.off.const_off {
+            return None;
+        }
+        let [zs0, zs1, zs2] = affine_to_elem_strides(z_aff, acc_bytes)?;
+        let [cs0, _, _] = c_str;
+        if !same_dim_stride(view, zs0, cs0)
+            || zs1 != DimStride::Const(1)
+            || zs2 != DimStride::Zero
+            || !same_val_or_const(view, lz.bound, lj.bound)
+        {
+            return None;
+        }
+        is_accumulate_into_c = false;
+    }
+
     Some(GemmKernel {
-        elem_ty,
+        elem,
         a_ptr: a_aff.base,
         a_const_off: a_aff.off.const_off,
         b_ptr: b_aff.base,
@@ -2741,13 +3042,15 @@ fn emit_gemm_lowered<A: Allocator + Copy>(
     func: &mut Func<A>,
     alloc: A,
 ) -> Result<(), SimplifyError> {
-    let elem_ty = kernel.elem_ty;
-    let (elem_bytes, elem_shift, lanes, vec_ty): (u64, u32, u64, Ty) = if elem_ty == Ty::F32 {
-        (4, 2, 4, Ty::vector(crate::Scalar::F32, 4).unwrap_or(Ty::F32))
+    let elem_ty = kernel.elem.acc_ty();
+    let elem_bytes = kernel.elem.acc_bytes();
+    let elem_shift = kernel.elem.acc_shift();
+    let (lanes, vec_ty): (u64, Ty) = if elem_ty == Ty::F32 {
+        (4, Ty::vector(crate::Scalar::F32, 4).unwrap_or(Ty::F32))
     } else if elem_ty == Ty::F64 {
-        (8, 3, 2, Ty::vector(crate::Scalar::F64, 2).unwrap_or(Ty::F64))
+        (2, Ty::vector(crate::Scalar::F64, 2).unwrap_or(Ty::F64))
     } else {
-        (4, 2, 4, Ty::vector(crate::Scalar::I32, 4).unwrap_or(Ty::I32))
+        (4, Ty::vector(crate::Scalar::I32, 4).unwrap_or(Ty::I32))
     };
     let n_step = 4 * lanes; // 16 for f32/i32, 8 for f64 (always 64 bytes = 4 x 128-bit vectors)
     let min_sme2 = opts.min_sme2_dim.max(1);
@@ -2914,15 +3217,28 @@ fn emit_gemm_lowered<A: Allocator + Copy>(
     // --- Optional Block: `alias_guard_blk` (wraparound-safe `C` vs `A` and `C` vs `B` checks) ---
     if needs_alias {
         let _ = begin_block(func, BlockKind::Normal);
-        let sh_v = push_iconst(func, Ty::I64, u64::from(elem_shift));
+        let c_shift = kernel.elem.acc_shift();
+        let in_shift = kernel.elem.input_shift();
+        let c_sh_v = push_iconst(func, Ty::I64, u64::from(c_shift));
+        let in_sh_v = if in_shift == 0 {
+            NONE
+        } else if in_shift == c_shift {
+            c_sh_v
+        } else {
+            push_iconst(func, Ty::I64, u64::from(in_shift))
+        };
         let c_elems = push_bin(func, Op::Mul, Flags::NONE, Ty::I64, m64, ldc64);
-        let bytes_c = push_bin(func, Op::Shl, Flags::NONE, Ty::I64, c_elems, sh_v);
+        let bytes_c = push_bin(func, Op::Shl, Flags::NONE, Ty::I64, c_elems, c_sh_v);
         let c_addr = push_inst(func, Op::PtrAddr, Flags::NONE, Ty::I64, c_base, 0);
 
         let mut alias_ok = NONE;
         if plan.check_ca {
             let a_elems = push_bin(func, Op::Mul, Flags::NONE, Ty::I64, m64, lda64);
-            let bytes_a = push_bin(func, Op::Shl, Flags::NONE, Ty::I64, a_elems, sh_v);
+            let bytes_a = if in_shift == 0 {
+                a_elems
+            } else {
+                push_bin(func, Op::Shl, Flags::NONE, Ty::I64, a_elems, in_sh_v)
+            };
             let a_addr = push_inst(func, Op::PtrAddr, Flags::NONE, Ty::I64, a_base, 0);
             let d_ca = push_bin(func, Op::Sub, Flags::NONE, Ty::I64, c_addr, a_addr);
             let d_ac = push_inst(func, Op::Neg, Flags::NONE, Ty::I64, d_ca, 0);
@@ -2933,7 +3249,11 @@ fn emit_gemm_lowered<A: Allocator + Copy>(
         }
         if plan.check_cb {
             let b_elems = push_bin(func, Op::Mul, Flags::NONE, Ty::I64, k64, ldb64);
-            let bytes_b = push_bin(func, Op::Shl, Flags::NONE, Ty::I64, b_elems, sh_v);
+            let bytes_b = if in_shift == 0 {
+                b_elems
+            } else {
+                push_bin(func, Op::Shl, Flags::NONE, Ty::I64, b_elems, in_sh_v)
+            };
             let b_addr = push_inst(func, Op::PtrAddr, Flags::NONE, Ty::I64, b_base, 0);
             let d_cb = push_bin(func, Op::Sub, Flags::NONE, Ty::I64, c_addr, b_addr);
             let d_bc = push_inst(func, Op::Neg, Flags::NONE, Ty::I64, d_cb, 0);
@@ -2966,11 +3286,7 @@ fn emit_gemm_lowered<A: Allocator + Copy>(
         }
 
         let _ = begin_block(func, BlockKind::Normal);
-        let intr_name = if elem_ty == Ty::F64 {
-            SME2_GEMM_F64_INTRINSIC
-        } else {
-            SME2_GEMM_F32_INTRINSIC
-        };
+        let intr_name = kernel.elem.sme2_intrinsic().unwrap_or(SME2_GEMM_F32_INTRINSIC);
         let intr_id = ensure_sme2_intrinsic(func, intr_name);
         let flags_val = push_iconst(func, Ty::I64, u64::from(kernel.is_accumulate_into_c));
         let _ = push_target_intrinsic(func, intr_id, &[c_base, a_base, b_base, m64, n64, k64, flags_val]);
@@ -3434,9 +3750,8 @@ pub fn optimize_gemm_loops<A: Allocator + Copy>(
         let compact_strides = k.lda.matches_bound(&view, k.k_dim)
             && k.ldb.matches_bound(&view, k.n_dim)
             && k.ldc.matches_bound(&view, k.n_dim);
-        let emit_sme2 =
-            opts.enable_sme2 && (k.elem_ty == Ty::F32 || k.elem_ty == Ty::F64) && compact_strides;
-        let emit_neon = opts.enable_neon_4x16;
+        let emit_sme2 = opts.enable_sme2 && k.elem.sme2_intrinsic().is_some() && compact_strides;
+        let emit_neon = opts.enable_neon_4x16 && k.elem.supports_neon_4x16();
         if !emit_sme2 && !emit_neon {
             plans.push(LowerPlan {
                 emit_sme2: false,
@@ -4134,5 +4449,427 @@ mod tests {
         let ng_out = optimize_gemm_loops(non_gemm_fn.view(), GemmOpts::sme2(), TestHeap).unwrap();
         verify(ng_out.func.view()).unwrap();
         assert_eq!(ng_out.stats.gemms_detected, 0);
+    }
+
+    /// Builds `i-k-j` widening `i8/u8 -> i32` GEMM `C[i*n + j] += ext(A[i*n + k]) * ext(B[k*n + j])`
+    /// with 1-byte strides on `A` and `B` and 4-byte stride on `C`.
+    fn build_ikj_byte_gemm(ext_a: Op, ext_b: Op, c_noalias: bool) -> Func<TestHeap> {
+        let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+        let mut c_param = Param::of(Ty::PTR);
+        if c_noalias {
+            c_param.facts = Facts {
+                bits: ParamFactsRec::NOALIAS,
+                ..Facts::default()
+            };
+        }
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[c_param, Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::I64)],
+            &[],
+        );
+        b.set_signature(sig);
+
+        let [entry, i_hdr, i_body, k_hdr, k_body, j_hdr, j_body, k_latch, i_latch, exit] =
+            [(); 10].map(|_| b.create_block(BlockKind::Normal));
+
+        b.begin(entry);
+        let pc = b.param(Ty::PTR);
+        let pa = b.param(Ty::PTR);
+        let pb = b.param(Ty::PTR);
+        let n = b.param(Ty::I64);
+        let zero = b.iconst(Ty::I64, 0);
+        let one = b.iconst(Ty::I64, 1);
+        let two = b.iconst(Ty::I64, 2);
+        b.jump((i_hdr, &[zero]));
+
+        b.begin(i_hdr);
+        let i = b.param(Ty::I64);
+        let keep_i = b.icmp(IntCond::Ult, i, n);
+        b.br(Flags::NONE, keep_i, (i_body, &[]), (exit, &[]));
+
+        b.begin(i_body);
+        let i_n = b.binary(Op::Mul, Flags::NONE, i, n);
+        b.jump((k_hdr, &[zero]));
+
+        b.begin(k_hdr);
+        let k = b.param(Ty::I64);
+        let keep_k = b.icmp(IntCond::Ult, k, n);
+        b.br(Flags::NONE, keep_k, (k_body, &[]), (i_latch, &[]));
+
+        b.begin(k_body);
+        let a_idx = b.binary(Op::Add, Flags::NONE, i_n, k);
+        let a_ptr = b.ptr_add(Flags::NONE, pa, a_idx);
+        let a_raw = b.load(Ty::I8, Flags::NONE, a_ptr, 0, MemAttrs::aligned(0));
+        let a_val = b.convert(ext_a, Flags::NONE, Ty::I32, a_raw);
+        let k_n = b.binary(Op::Mul, Flags::NONE, k, n);
+        b.jump((j_hdr, &[zero]));
+
+        b.begin(j_hdr);
+        let j = b.param(Ty::I64);
+        let keep_j = b.icmp(IntCond::Ult, j, n);
+        b.br(Flags::NONE, keep_j, (j_body, &[]), (k_latch, &[]));
+
+        b.begin(j_body);
+        let b_idx = b.binary(Op::Add, Flags::NONE, k_n, j);
+        let b_ptr = b.ptr_add(Flags::NONE, pb, b_idx);
+        let b_raw = b.load(Ty::I8, Flags::NONE, b_ptr, 0, MemAttrs::aligned(0));
+        let b_val = b.convert(ext_b, Flags::NONE, Ty::I32, b_raw);
+
+        let c_idx = b.binary(Op::Add, Flags::NONE, i_n, j);
+        let c_off = b.binary(Op::Shl, Flags::NONE, c_idx, two);
+        let c_ptr = b.ptr_add(Flags::NONE, pc, c_off);
+        let c_val = b.load(Ty::I32, Flags::NONE, c_ptr, 0, MemAttrs::aligned(2));
+        let prod = b.binary(Op::Mul, Flags::NONE, a_val, b_val);
+        let c_new = b.binary(Op::Add, Flags::NONE, c_val, prod);
+        b.store(Flags::NONE, c_new, c_ptr, 0, MemAttrs::aligned(2));
+        let j2 = b.binary(Op::Add, Flags::NONE, j, one);
+        b.jump((j_hdr, &[j2]));
+
+        b.begin(k_latch);
+        let k2 = b.binary(Op::Add, Flags::NONE, k, one);
+        b.jump((k_hdr, &[k2]));
+
+        b.begin(i_latch);
+        let i2 = b.binary(Op::Add, Flags::NONE, i, one);
+        b.jump((i_hdr, &[i2]));
+
+        b.begin(exit);
+        b.ret(&[]);
+        b.finish_checked().unwrap()
+    }
+
+    /// Builds rectangular `i-j-k` dot-product widening `i8/u8 -> i32` GEMM
+    /// `C[i*N + j] = sum_k ext(A[i*K + k]) * ext(B[k*N + j])` (overwrite mode, `flags = 0`).
+    fn build_ijk_dot_byte_gemm(ext_op: Op) -> Func<TestHeap> {
+        let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[
+                Param::of(Ty::PTR),
+                Param::of(Ty::PTR),
+                Param::of(Ty::PTR),
+                Param::of(Ty::I64),
+                Param::of(Ty::I64),
+                Param::of(Ty::I64),
+            ],
+            &[],
+        );
+        b.set_signature(sig);
+
+        let [entry, i_hdr, i_body, j_hdr, j_body, k_hdr, k_body, j_latch, i_latch, exit] =
+            [(); 10].map(|_| b.create_block(BlockKind::Normal));
+
+        b.begin(entry);
+        let pc = b.param(Ty::PTR);
+        let pa = b.param(Ty::PTR);
+        let pb = b.param(Ty::PTR);
+        let m = b.param(Ty::I64);
+        let n = b.param(Ty::I64);
+        let k_dim = b.param(Ty::I64);
+        let zero = b.iconst(Ty::I64, 0);
+        let one = b.iconst(Ty::I64, 1);
+        let two = b.iconst(Ty::I64, 2);
+        let izero = b.iconst(Ty::I32, 0);
+        b.jump((i_hdr, &[zero]));
+
+        b.begin(i_hdr);
+        let i = b.param(Ty::I64);
+        let keep_i = b.icmp(IntCond::Ult, i, m);
+        b.br(Flags::NONE, keep_i, (i_body, &[]), (exit, &[]));
+
+        b.begin(i_body);
+        let i_k = b.binary(Op::Mul, Flags::NONE, i, k_dim);
+        let i_n = b.binary(Op::Mul, Flags::NONE, i, n);
+        b.jump((j_hdr, &[zero]));
+
+        b.begin(j_hdr);
+        let j = b.param(Ty::I64);
+        let keep_j = b.icmp(IntCond::Ult, j, n);
+        b.br(Flags::NONE, keep_j, (j_body, &[]), (i_latch, &[]));
+
+        b.begin(j_body);
+        b.jump((k_hdr, &[zero, izero]));
+
+        b.begin(k_hdr);
+        let k = b.param(Ty::I64);
+        let acc = b.param(Ty::I32);
+        let keep_k = b.icmp(IntCond::Ult, k, k_dim);
+        b.br(Flags::NONE, keep_k, (k_body, &[]), (j_latch, &[acc]));
+
+        b.begin(k_body);
+        let a_idx = b.binary(Op::Add, Flags::NONE, i_k, k);
+        let a_ptr = b.ptr_add(Flags::NONE, pa, a_idx);
+        let a_raw = b.load(Ty::I8, Flags::NONE, a_ptr, 0, MemAttrs::aligned(0));
+        let a_val = b.convert(ext_op, Flags::NONE, Ty::I32, a_raw);
+        let k_n = b.binary(Op::Mul, Flags::NONE, k, n);
+        let b_idx = b.binary(Op::Add, Flags::NONE, k_n, j);
+        let b_ptr = b.ptr_add(Flags::NONE, pb, b_idx);
+        let b_raw = b.load(Ty::I8, Flags::NONE, b_ptr, 0, MemAttrs::aligned(0));
+        let b_val = b.convert(ext_op, Flags::NONE, Ty::I32, b_raw);
+        let prod = b.binary(Op::Mul, Flags::NONE, a_val, b_val);
+        let acc2 = b.binary(Op::Add, Flags::NONE, acc, prod);
+        let k2 = b.binary(Op::Add, Flags::NONE, k, one);
+        b.jump((k_hdr, &[k2, acc2]));
+
+        b.begin(j_latch);
+        let final_acc = b.param(Ty::I32);
+        let c_idx = b.binary(Op::Add, Flags::NONE, i_n, j);
+        let c_off = b.binary(Op::Shl, Flags::NONE, c_idx, two);
+        let c_ptr = b.ptr_add(Flags::NONE, pc, c_off);
+        b.store(Flags::NONE, final_acc, c_ptr, 0, MemAttrs::aligned(2));
+        let j2 = b.binary(Op::Add, Flags::NONE, j, one);
+        b.jump((j_hdr, &[j2]));
+
+        b.begin(i_latch);
+        let i2 = b.binary(Op::Add, Flags::NONE, i, one);
+        b.jump((i_hdr, &[i2]));
+
+        b.begin(exit);
+        b.ret(&[]);
+        b.finish_checked().unwrap()
+    }
+
+    /// Builds idiomatic safe-Rust overwrite matmul with a sibling row-zero-init loop inside `i`:
+    /// `for i in 0..n { for j in 0..n { c[i*n+j] = 0; } for k in 0..n { ... for j in 0..n { c[i*n+j] += a*b; } } }`.
+    /// When `zero_after_k` is true, places the zero-init loop AFTER the `k` loop (negative test).
+    fn build_sibling_zero_init_ikj_gemm(is_i8: bool, zero_after_k: bool) -> Func<TestHeap> {
+        let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::I64)],
+            &[],
+        );
+        b.set_signature(sig);
+
+        let [
+            entry,
+            i_hdr,
+            i_body,
+            z_hdr,
+            z_body,
+            k_pre,
+            k_hdr,
+            k_body,
+            j_hdr,
+            j_body,
+            k_latch,
+            i_latch,
+            exit,
+        ] = [(); 13].map(|_| b.create_block(BlockKind::Normal));
+        let acc_ty = if is_i8 { Ty::I32 } else { Ty::F32 };
+
+        b.begin(entry);
+        let pc = b.param(Ty::PTR);
+        let pa = b.param(Ty::PTR);
+        let pb = b.param(Ty::PTR);
+        let n = b.param(Ty::I64);
+        let zero = b.iconst(Ty::I64, 0);
+        let one = b.iconst(Ty::I64, 1);
+        let two = b.iconst(Ty::I64, 2);
+        let zero_elem = if is_i8 { b.iconst(Ty::I32, 0) } else { b.fconst(Ty::F32, 0) };
+        b.jump((i_hdr, &[zero]));
+
+        b.begin(i_hdr);
+        let i = b.param(Ty::I64);
+        let keep_i = b.icmp(IntCond::Ult, i, n);
+        b.br(Flags::NONE, keep_i, (i_body, &[]), (exit, &[]));
+
+        b.begin(i_body);
+        let i_n = b.binary(Op::Mul, Flags::NONE, i, n);
+        if zero_after_k {
+            b.jump((k_pre, &[]));
+        } else {
+            b.jump((z_hdr, &[zero]));
+        }
+
+        b.begin(z_hdr);
+        let jz = b.param(Ty::I64);
+        let keep_jz = b.icmp(IntCond::Ult, jz, n);
+        let z_exit = if zero_after_k { i_latch } else { k_pre };
+        b.br(Flags::NONE, keep_jz, (z_body, &[]), (z_exit, &[]));
+
+        b.begin(z_body);
+        let z_idx = b.binary(Op::Add, Flags::NONE, i_n, jz);
+        let z_off = b.binary(Op::Shl, Flags::NONE, z_idx, two);
+        let z_ptr = b.ptr_add(Flags::NONE, pc, z_off);
+        b.store(Flags::NONE, zero_elem, z_ptr, 0, MemAttrs::aligned(2));
+        let jz2 = b.binary(Op::Add, Flags::NONE, jz, one);
+        b.jump((z_hdr, &[jz2]));
+
+        b.begin(k_pre);
+        b.jump((k_hdr, &[zero]));
+
+        b.begin(k_hdr);
+        let k = b.param(Ty::I64);
+        let keep_k = b.icmp(IntCond::Ult, k, n);
+        let k_exit = if zero_after_k { z_hdr } else { i_latch };
+        let k_exit_args: &[crate::Value] = if zero_after_k { &[zero] } else { &[] };
+        b.br(Flags::NONE, keep_k, (k_body, &[]), (k_exit, k_exit_args));
+
+        b.begin(k_body);
+        let a_idx = b.binary(Op::Add, Flags::NONE, i_n, k);
+        let a_val = if is_i8 {
+            let a_ptr = b.ptr_add(Flags::NONE, pa, a_idx);
+            let a_raw = b.load(Ty::I8, Flags::NONE, a_ptr, 0, MemAttrs::aligned(0));
+            b.convert(Op::Sext, Flags::NONE, Ty::I32, a_raw)
+        } else {
+            let a_off = b.binary(Op::Shl, Flags::NONE, a_idx, two);
+            let a_ptr = b.ptr_add(Flags::NONE, pa, a_off);
+            b.load(Ty::F32, Flags::NONE, a_ptr, 0, MemAttrs::aligned(2))
+        };
+        let k_n = b.binary(Op::Mul, Flags::NONE, k, n);
+        b.jump((j_hdr, &[zero]));
+
+        b.begin(j_hdr);
+        let j = b.param(Ty::I64);
+        let keep_j = b.icmp(IntCond::Ult, j, n);
+        b.br(Flags::NONE, keep_j, (j_body, &[]), (k_latch, &[]));
+
+        b.begin(j_body);
+        let b_idx = b.binary(Op::Add, Flags::NONE, k_n, j);
+        let b_val = if is_i8 {
+            let b_ptr = b.ptr_add(Flags::NONE, pb, b_idx);
+            let b_raw = b.load(Ty::I8, Flags::NONE, b_ptr, 0, MemAttrs::aligned(0));
+            b.convert(Op::Sext, Flags::NONE, Ty::I32, b_raw)
+        } else {
+            let b_off = b.binary(Op::Shl, Flags::NONE, b_idx, two);
+            let b_ptr = b.ptr_add(Flags::NONE, pb, b_off);
+            b.load(Ty::F32, Flags::NONE, b_ptr, 0, MemAttrs::aligned(2))
+        };
+        let c_idx = b.binary(Op::Add, Flags::NONE, i_n, j);
+        let c_off = b.binary(Op::Shl, Flags::NONE, c_idx, two);
+        let c_ptr = b.ptr_add(Flags::NONE, pc, c_off);
+        let c_val = b.load(acc_ty, Flags::NONE, c_ptr, 0, MemAttrs::aligned(2));
+        let c_new = if is_i8 {
+            let prod = b.binary(Op::Mul, Flags::NONE, a_val, b_val);
+            b.binary(Op::Add, Flags::NONE, c_val, prod)
+        } else {
+            b.ternary(Op::Fma, Flags::NONE, a_val, b_val, c_val)
+        };
+        b.store(Flags::NONE, c_new, c_ptr, 0, MemAttrs::aligned(2));
+        let j2 = b.binary(Op::Add, Flags::NONE, j, one);
+        b.jump((j_hdr, &[j2]));
+
+        b.begin(k_latch);
+        let k2 = b.binary(Op::Add, Flags::NONE, k, one);
+        b.jump((k_hdr, &[k2]));
+
+        b.begin(i_latch);
+        let i2 = b.binary(Op::Add, Flags::NONE, i, one);
+        b.jump((i_hdr, &[i2]));
+
+        b.begin(exit);
+        b.ret(&[]);
+        b.finish_checked().unwrap()
+    }
+
+    #[test]
+    fn signed_i8_gemm_lowers_to_sme2_smopa() {
+        // 1. i-k-j accumulate (`flags = 1`) with runtime alias check.
+        let ikj_fn = build_ikj_byte_gemm(Op::Sext, Op::Sext, false);
+        let out = optimize_gemm_loops(ikj_fn.view(), GemmOpts::sme2(), TestHeap).unwrap();
+        verify(out.func.view()).unwrap();
+        assert_eq!(out.stats.gemms_detected, 1);
+        assert_eq!(out.stats.sme2_lowered, 1);
+        assert_eq!(out.stats.neon_blocked, 0);
+        let args = find_intrinsic_call(out.func.view(), SME2_GEMM_I8_I32_INTRINSIC)
+            .expect("SME2 i8->i32 intrinsic emitted");
+        assert_eq!(args.len(), 7);
+        assert_eq!(const_u64(&out.func.view(), args[6] as usize), Some(1));
+        assert!(
+            (0..out.func.view().len()).filter(|&i| out.func.view().op(i) == Op::Umin).count() >= 2,
+            "runtime alias guard must check C vs A and C vs B"
+        );
+
+        // 2. NOALIAS C skips runtime alias checks.
+        let noalias_fn = build_ikj_byte_gemm(Op::Sext, Op::Sext, true);
+        let noalias_out = optimize_gemm_loops(noalias_fn.view(), GemmOpts::sme2(), TestHeap).unwrap();
+        verify(noalias_out.func.view()).unwrap();
+        assert_eq!(noalias_out.stats.sme2_lowered, 1);
+        assert_eq!((0..noalias_out.func.view().len()).filter(|&i| noalias_out.func.view().op(i) == Op::Umin).count(), 0);
+
+        // 3. Rectangular i-j-k dot-product overwrite (`flags = 0`).
+        let ijk_fn = build_ijk_dot_byte_gemm(Op::Sext);
+        let ijk_out = optimize_gemm_loops(ijk_fn.view(), GemmOpts::sme2(), TestHeap).unwrap();
+        verify(ijk_out.func.view()).unwrap();
+        assert_eq!(ijk_out.stats.sme2_lowered, 1);
+        let ijk_args = find_intrinsic_call(ijk_out.func.view(), SME2_GEMM_I8_I32_INTRINSIC)
+            .expect("SME2 i8->i32 intrinsic emitted for i-j-k");
+        assert_eq!(const_u64(&ijk_out.func.view(), ijk_args[6] as usize), Some(0));
+
+        // 4. Without SME2 (`GemmOpts::neon()`), widening i8->i32 stays untouched; mixed Sext/Zext is rejected.
+        let neon_only = optimize_gemm_loops(ikj_fn.view(), GemmOpts::neon(), TestHeap).unwrap();
+        assert_eq!(neon_only.stats.gemms_detected, 0);
+        let mixed_fn = build_ikj_byte_gemm(Op::Sext, Op::Zext, true);
+        let mixed_out = optimize_gemm_loops(mixed_fn.view(), GemmOpts::sme2(), TestHeap).unwrap();
+        assert_eq!(mixed_out.stats.gemms_detected, 0);
+    }
+
+    #[test]
+    fn unsigned_u8_gemm_lowers_to_sme2_umopa() {
+        let ikj_fn = build_ikj_byte_gemm(Op::Zext, Op::Zext, true);
+        let out = optimize_gemm_loops(ikj_fn.view(), GemmOpts::sme2(), TestHeap).unwrap();
+        verify(out.func.view()).unwrap();
+        assert_eq!(out.stats.gemms_detected, 1);
+        assert_eq!(out.stats.sme2_lowered, 1);
+        let args = find_intrinsic_call(out.func.view(), SME2_GEMM_U8_U32_INTRINSIC)
+            .expect("SME2 u8->u32 intrinsic emitted");
+        assert_eq!(args.len(), 7);
+        assert_eq!(const_u64(&out.func.view(), args[6] as usize), Some(1));
+
+        let ijk_fn = build_ijk_dot_byte_gemm(Op::Zext);
+        let ijk_out = optimize_gemm_loops(ijk_fn.view(), GemmOpts::sme2(), TestHeap).unwrap();
+        verify(ijk_out.func.view()).unwrap();
+        assert_eq!(ijk_out.stats.sme2_lowered, 1);
+        let ijk_args = find_intrinsic_call(ijk_out.func.view(), SME2_GEMM_U8_U32_INTRINSIC)
+            .expect("SME2 u8->u32 intrinsic emitted for i-j-k");
+        assert_eq!(const_u64(&ijk_out.func.view(), ijk_args[6] as usize), Some(0));
+    }
+
+    #[test]
+    fn sibling_zero_init_loop_lowers_to_overwrite_gemm_f32_and_i8() {
+        // 1. Idiomatic f32: `for i { for j { c[i,j] = 0.0 }; for k { for j { c[i,j] += a*b } } }`
+        let f32_fn = build_sibling_zero_init_ikj_gemm(false, false);
+        let f32_sme2 = optimize_gemm_loops(f32_fn.view(), GemmOpts::sme2(), TestHeap).unwrap();
+        verify(f32_sme2.func.view()).unwrap();
+        assert_eq!(f32_sme2.stats.gemms_detected, 1);
+        assert_eq!(f32_sme2.stats.sme2_lowered, 1);
+        assert_eq!(f32_sme2.stats.neon_blocked, 1);
+        let f32_args = find_intrinsic_call(f32_sme2.func.view(), SME2_GEMM_F32_INTRINSIC)
+            .expect("SME2 f32 intrinsic emitted for sibling zero-init loop");
+        assert_eq!(
+            const_u64(&f32_sme2.func.view(), f32_args[6] as usize),
+            Some(0),
+            "sibling zero-init loop must emit overwrite mode (flags = 0)"
+        );
+
+        // Verify NEON 4x16 path also uses overwrite mode (zero-splat instead of loading C).
+        let f32_neon = optimize_gemm_loops(f32_fn.view(), GemmOpts::neon(), TestHeap).unwrap();
+        verify(f32_neon.func.view()).unwrap();
+        let v4f32 = Ty::vector(crate::Scalar::F32, 4).unwrap();
+        assert!(max_vec_fmas_in_block(f32_neon.func.view(), v4f32) >= 16);
+
+        // 2. Idiomatic i8->i32: `for i { for j { c[i,j] = 0 }; for k { for j { c[i,j] += (a as i32)*(b as i32) } } }`
+        let i8_fn = build_sibling_zero_init_ikj_gemm(true, false);
+        let i8_sme2 = optimize_gemm_loops(i8_fn.view(), GemmOpts::sme2(), TestHeap).unwrap();
+        verify(i8_sme2.func.view()).unwrap();
+        assert_eq!(i8_sme2.stats.gemms_detected, 1);
+        assert_eq!(i8_sme2.stats.sme2_lowered, 1);
+        let i8_args = find_intrinsic_call(i8_sme2.func.view(), SME2_GEMM_I8_I32_INTRINSIC)
+            .expect("SME2 i8->i32 intrinsic emitted for sibling zero-init loop");
+        assert_eq!(
+            const_u64(&i8_sme2.func.view(), i8_args[6] as usize),
+            Some(0),
+            "sibling zero-init i8->i32 loop must emit overwrite mode (flags = 0)"
+        );
+
+        // 3. Negative control: zero-init loop AFTER the k-j loop must NOT be recognized as overwrite GEMM!
+        let bad_order = build_sibling_zero_init_ikj_gemm(false, true);
+        let bad_out = optimize_gemm_loops(bad_order.view(), GemmOpts::sme2(), TestHeap).unwrap();
+        verify(bad_out.func.view()).unwrap();
+        assert_eq!(bad_out.stats.gemms_detected, 0);
     }
 }

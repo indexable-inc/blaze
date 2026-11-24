@@ -597,6 +597,62 @@ pub fn make_entry_with_vtables<'a, 'd>(
     Ok(out)
 }
 
+/// Target [`blaze_tier::Machine`] for `blaze export` on `isa`: starts from `isa`'s baseline
+/// features (`LSE`, plus `DOTPROD` on `Os::MacOs`), and on macOS arm64 probes `sysctlbyname`
+/// (via safe `blaze_sys::macos::sysctl_u32`) for `FEAT_SME`, `FEAT_SME2`, `FEAT_CSSC`, and
+/// `FEAT_SHA3` so exported binaries use the host CPU's full native ISA.
+pub fn export_machine(isa: Isa) -> blaze_tier::Machine {
+    use blaze_tier::{Arch, Machine, Os as TierOs};
+    let os = match isa.os {
+        Os::MacOs => TierOs::MacOs,
+        Os::Linux => TierOs::Linux,
+    };
+    let mut features = (if isa.lse { Machine::LSE } else { 0 })
+        | (if isa.os == Os::MacOs { Machine::DOTPROD } else { 0 });
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if isa.os == Os::MacOs {
+        const PROBES: [(&core::ffi::CStr, u64); 4] = [
+            (c"hw.optional.arm.FEAT_SME", Machine::SME),
+            (c"hw.optional.arm.FEAT_SME2", Machine::SME2),
+            (c"hw.optional.arm.FEAT_CSSC", Machine::CSSC),
+            (c"hw.optional.arm.FEAT_SHA3", Machine::SHA3),
+        ];
+        for (name, bit) in PROBES {
+            if matches!(blaze_sys::macos::sysctl_u32(name), Ok(Some(v)) if v != 0) {
+                features |= bit;
+            }
+        }
+    }
+    Machine { arch: Arch::Arm64, os, features }
+}
+
+/// Emits a sealed canonical `CodeRecord` for `func` targeting explicit host `machine` features
+/// (e.g. `Machine::SME2 | Machine::CSSC | Machine::SHA3` from [`export_machine`]), returning the
+/// encoded `CodeRecord` bytes and any `SoftFloat` routines that legalization called.
+///
+/// Unlike [`make_entry_with_vtables`], this produces raw `CodeRecord` bytes (not an `ENTRY`
+/// wrapper for `CodeStore`) so host-specific LTO records stay ephemeral in the export buffer and
+/// never pollute portable cached store entries (Rule 25).
+pub fn emit_code_record_for_machine<'a, 'd>(
+    func: Verified<'_>,
+    names: &InstanceNames<'_>,
+    routines: crate::front2::builtins_shim::Routines<'d>,
+    traps: &[TrapSource],
+    machine: blaze_tier::Machine,
+    alloc: Alloc<'a>,
+) -> Result<(AVec<'a, u8>, AVec<'a, Declared<'d>>), CodeRecordError> {
+    let (record, _insts, called) = blaze_emit::emit_sota_record_for_machine(func, names, routines.places(), machine, traps, alloc)
+        .map_err(|why| routines.refusal(why))?;
+    let mut extra_declared: AVec<'a, Declared<'d>> = Vec::new_in(alloc);
+    for r in called.iter() {
+        extra_declared.push(routines.declared(r)?);
+    }
+    let sealed = record.seal().map_err(CodeRecordError::Seal)?;
+    let mut code: AVec<'a, u8> = Vec::new_in(alloc);
+    sealed.encode(&mut code);
+    Ok((code, extra_declared))
+}
+
 /// The declared statics block onto `out`: their count (4), then each item key (16), ascending
 /// and each once (a record may name one static at two places). `Err` names what is too large.
 pub(crate) fn put_statics(statics: &[ItemKey], out: &mut AVec<'_, u8>, alloc: Alloc<'_>) -> Result<(), &'static str> {

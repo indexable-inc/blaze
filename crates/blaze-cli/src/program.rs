@@ -129,15 +129,26 @@ pub(crate) const NOT_RUN: u8 = 125;
 /// The `dev` profile's `overflow-checks` (decision D101), which `blaze run` builds the program
 /// with and `blaze check` finds what that build refuses with: on, unless the workspace root's
 /// manifest (`Cargo.toml` at `root`, the checkout's root, where the layout reads the workspace
-/// from; a member's own `[profile]` is not read, as cargo reads only the root's) says otherwise under `[profile.dev]` (blaze-manifest `layout::profile`).
-/// `blaze export` will take `BuiltinProfile::Release` the same way (off unless set).
+/// from; a member's own `[profile]` is not read, as cargo reads only the root's) says otherwise
+/// under `[profile.dev]` (blaze-manifest `layout::profile`).
 pub fn dev_overflow(cx: &Cx, root: &Dir<ReadWrite>, frame: &Frame) -> Result<OverflowChecks, CliError> {
+    profile_overflow(cx, root, BuiltinProfile::Dev, frame)
+}
+
+/// The `release` profile's `overflow-checks` (decision D101), which `blaze export` builds the
+/// program with: off, unless the workspace root's manifest explicitly enables it under
+/// `[profile.release]`.
+pub fn release_overflow(cx: &Cx, root: &Dir<ReadWrite>, frame: &Frame) -> Result<OverflowChecks, CliError> {
+    profile_overflow(cx, root, BuiltinProfile::Release, frame)
+}
+
+fn profile_overflow(cx: &Cx, root: &Dir<ReadWrite>, which: BuiltinProfile, frame: &Frame) -> Result<OverflowChecks, CliError> {
     let refused = |why: &dyn core::fmt::Display| CliError::Program(crate::ManifestRefused::of(why, frame));
     let mut bytes = Bytes::new_in(frame, "the root manifest");
     root.read_all(cx, &Path::new(ROOT_MANIFEST)?, &mut bytes)?;
     let text = core::str::from_utf8(bytes.as_slice()).map_err(|_| CliError::Text { what: "the root manifest is not UTF-8" })?;
     let erased = blaze_own::Erased::new(frame);
-    let on = profile::overflow_checks(text, ManifestId(0), ROOT_MANIFEST, BuiltinProfile::Dev, erased.handle()).map_err(|e| refused(&e))?;
+    let on = profile::overflow_checks(text, ManifestId(0), ROOT_MANIFEST, which, erased.handle()).map_err(|e| refused(&e))?;
     Ok(if on { OverflowChecks::On } else { OverflowChecks::Off })
 }
 
@@ -147,12 +158,22 @@ pub fn dev_overflow(cx: &Cx, root: &Dir<ReadWrite>, frame: &Frame) -> Result<Ove
 /// blaze-manifest `layout::panic`, which refuses any other value naming the manifest, the
 /// profile and the value). Not read for a test build (blaze-world `panic::TEST_PROFILE`).
 pub fn dev_profile_panic(cx: &Cx, root: &Dir<ReadWrite>, frame: &Frame) -> Result<panic::ProfilePanic, CliError> {
+    profile_panic(cx, root, BuiltinProfile::Dev, frame)
+}
+
+/// The `release` profile's `panic` (UNWIND.md 3.1), which `blaze export` reads from
+/// `[profile.release]` in the workspace root's manifest (`unwind` unless `panic = "abort"`).
+pub fn release_profile_panic(cx: &Cx, root: &Dir<ReadWrite>, frame: &Frame) -> Result<panic::ProfilePanic, CliError> {
+    profile_panic(cx, root, BuiltinProfile::Release, frame)
+}
+
+fn profile_panic(cx: &Cx, root: &Dir<ReadWrite>, which: BuiltinProfile, frame: &Frame) -> Result<panic::ProfilePanic, CliError> {
     let refused = |why: &dyn core::fmt::Display| CliError::Program(crate::ManifestRefused::of(why, frame));
     let mut bytes = Bytes::new_in(frame, "the root manifest");
     root.read_all(cx, &Path::new(ROOT_MANIFEST)?, &mut bytes)?;
     let text = core::str::from_utf8(bytes.as_slice()).map_err(|_| CliError::Text { what: "the root manifest is not UTF-8" })?;
     let erased = blaze_own::Erased::new(frame);
-    panic::panic_strategy(text, ManifestId(0), ROOT_MANIFEST, BuiltinProfile::Dev, erased.handle()).map_err(|e| refused(&e))
+    panic::panic_strategy(text, ManifestId(0), ROOT_MANIFEST, which, erased.handle()).map_err(|e| refused(&e))
 }
 
 /// The program's strategy for the record run of `blaze run` (`own_process::run_own`'s caller

@@ -57,6 +57,73 @@ use crate::front2::program::lazy::LazyRefusal;
 use super::lay_states::{Lay, lay_and_build, roots_of_instance, unchecked_owner};
 use crate::symbols::{decode_instance, encode_instance, fn_symbol_of_name, vtable_symbol};
 
+/// Whole-program demand-driven cross-function LIR inlining and LTO for `blaze export`.
+#[path = "export_lto.rs"]
+pub mod export_lto;
+
+/// One function reference in a [`BuiltLir`] body: either a Rust instance symbol or an offset span
+/// into [`BuiltLir::c_text`] naming a C extern function.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BuiltCallee {
+    Symbol(blaze_code::record::Symbol),
+    C { start: u32, len: u32 },
+}
+
+/// One instance lowered to verified LIR with all outside references resolved, before machine-code
+/// emission (used by [`export_lto`] for whole-program cross-function inlining and LTO).
+pub struct BuiltLir<'a> {
+    pub func: blaze_lir::Func<Alloc<'a>>,
+    /// Direct function references in `func.refs` order (without soft-float routines appended yet).
+    pub funcs: AVec<'a, BuiltCallee>,
+    /// Static items in `func.refs` order.
+    pub statics: AVec<'a, ItemKey>,
+    /// Foreign (`extern`) statics among `statics`: `(item, start, len)` into `c_text`.
+    pub c_statics: AVec<'a, (ItemKey, u32, u32)>,
+    /// Vtable symbols in `func.refs` order.
+    pub vtables: AVec<'a, blaze_code::record::Symbol>,
+    /// Encoded vtable datums needed by `vtables` (and their supertraits).
+    pub vtable_data: AVec<'a, (blaze_code::record::Symbol, AVec<'a, u8>)>,
+    /// Thread-local items in `func.refs` order.
+    pub tls: AVec<'a, ItemKey>,
+    /// Build-side trap sources for `Op::Unreachable` instructions.
+    pub traps: AVec<'a, blaze_code::record::TrapSource>,
+    /// Concatenated UTF-8 bytes of all C function and C static names referenced by this body.
+    pub c_text: AVec<'a, u8>,
+}
+
+impl<'a> BuiltLir<'a> {
+    /// Resolves `BuiltCallee` at `place` into a [`Callee`] borrowing from `self.c_text`.
+    pub fn callee_at(&self, place: u32) -> Option<Callee<'_>> {
+        let idx = usize::try_from(place).ok()?;
+        match *self.funcs.get(idx)? {
+            BuiltCallee::Symbol(sym) => Some(Callee::Symbol(sym)),
+            BuiltCallee::C { start, len } => self.c_str(start, len).map(Callee::C),
+        }
+    }
+
+    /// Returns the C static symbol name for `item`, if it is a foreign static.
+    pub fn foreign_static_name(&self, item: ItemKey) -> Option<&str> {
+        let &(_, start, len) = self.c_statics.iter().find(|(k, _, _)| *k == item)?;
+        self.c_str(start, len)
+    }
+
+    /// Slices a UTF-8 C symbol name out of `self.c_text`.
+    pub fn c_str(&self, start: u32, len: u32) -> Option<&str> {
+        let s = usize::try_from(start).ok()?;
+        let l = usize::try_from(len).ok()?;
+        let e = s.checked_add(l)?;
+        let bytes = self.c_text.get(s..e)?;
+        core::str::from_utf8(bytes).ok()
+    }
+}
+
+/// Destination for one built instance inside [`build_one`]: either emit an encoded `CodeStore`
+/// entry, or hand back the verified LIR and resolved reference tables for whole-program LTO.
+enum BuildSink<'e, 'a> {
+    Entry(&'e mut AVec<'a, u8>),
+    Lir { alloc: Alloc<'a>, out: &'e mut Option<BuiltLir<'a>> },
+}
+
 /// How many bodies were checked for a walk's makes: the claim "a run that finds every record
 /// checks no body" is read here. A plain counter, owned by the maker and read by the test.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -805,14 +872,29 @@ pub fn make_instance<P: FrontEnd, T: Typing<P>>(
 }
 
 /// [`make_instance`]'s work, timed by it.
-fn make_instance_timed<P: FrontEnd, T: Typing<P>>(
+fn make_instance_timed<'a, P: FrontEnd, T: Typing<P>>(
     program: &mut P,
     typing: &mut T,
     state: &mut MakerState,
     checks: &mut CheckCount,
     tabled: ItemKey,
     name: &[u8],
-    entry: &mut AVec<'_, u8>,
+    entry: &mut AVec<'a, u8>,
+) -> Result<(), RunError> {
+    let mut sink = BuildSink::Entry(entry);
+    run_instance_loop(program, typing, state, checks, tabled, name, &mut sink)
+}
+
+/// Shared instance-lowering loop for both [`make_instance_timed`] (entry emission) and
+/// [`Maker::build_lir`] (LIR extraction for export LTO).
+fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>>(
+    program: &mut P,
+    typing: &mut T,
+    state: &mut MakerState,
+    checks: &mut CheckCount,
+    tabled: ItemKey,
+    name: &[u8],
+    sink: &mut BuildSink<'_, 'a>,
 ) -> Result<(), RunError> {
     let alloc = state.work.alloc;
     // The bodies this ONE instance reads: its fn's, and each owner its name holds.
@@ -922,7 +1004,7 @@ fn make_instance_timed<P: FrontEnd, T: Typing<P>>(
         let MakerState { checked, tables, work, .. } = &mut *state;
         let t = tables.take().ok_or_else(|| tables_gone(tabled))?;
         let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow, ub: work.ub, panic: work.panic, alloc: work.alloc };
-        let step = build_one(&*program, &bodies, work, build_i, build_instance, entry);
+        let step = build_one(&*program, &bodies, work, build_i, build_instance, sink);
         *tables = Some(Tables { closures: bodies.closures, coroutines: bodies.coroutines, const_at: bodies.const_at });
         let step = match step {
             Err(e) if asks_again(&e) && asked < crate::front2::check::MOST_ROUNDS => {
@@ -1499,8 +1581,8 @@ fn verify_rows<'n>(program: &mut RecordsProgram<'n>, state: &mut MakerState, i: 
 }
 
 /// build_from's step for one instance, from "A closure's `Fn*` method instance" to
-/// `make_entry`, over one borrow of the bodies.
-fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: usize, instance: Instance, entry: &mut AVec<'_, u8>) -> Result<Step, RunError> {
+/// `make_entry` (or LIR extraction for LTO), over one borrow of the bodies.
+fn build_one<'a, P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: usize, instance: Instance, sink: &mut BuildSink<'_, 'a>) -> Result<Step, RunError> {
     let function = program.function(i);
     let name = || function.named();
     // A ctor's row has no body: its own instance is built as a fn, and a `Fn*` shim of it
@@ -1593,6 +1675,13 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
         None => None,
         Some((of, part)) => {
             let find = |stash: &[BuiltParts]| stash.iter().position(|b| b.owner == of.owner && b.ordinal == of.ordinal && b.args[..] == args[..]);
+            if matches!(sink, BuildSink::Lir { .. })
+                && let Some(at) = find(&work.stash[..])
+                && work.stash.get(at).and_then(|b| b.parts.get(part.index())).is_some_and(Option::is_none)
+            {
+                bodies.coroutines.states.forget(of.owner, of.ordinal, &args);
+                work.stash.swap_remove(at);
+            }
             if find(&work.stash[..]).is_none() {
                 // Its state laid out from types, with every state it holds, and each built into
                 // its state (lay_states.rs).
@@ -1736,9 +1825,6 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
     for &table in built.vtables.iter() {
         vtables.push(vtable_symbol(table, work.ground.view(), work.alloc).map_err(sym)?);
     }
-    // The soft-float routines after the instance's own references: the emitter's one table
-    // (front2/builtins_shim.rs); `make_entry` declares those it says the record calls.
-    let routines = work.routines.bind(&mut funcs).map_err(|error| RunError::CodeRecord { function: name(), error })?;
     // A static an `extern` block declares is named by its C symbol (the seam's
     // `foreign_static`), never by a record of its own.
     let mut c_statics: AVec<'_, (ItemKey, &str)> = blaze_own::Vec::new_in(work.alloc);
@@ -1747,163 +1833,220 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
             c_statics.push((s, c));
         }
     }
-    let names = InstanceNames { funcs: &funcs, statics: &built.statics, c_statics: &c_statics, vtables: &vtables, tls: &built.thread_locals };
-    let mut declared: AVec<'_, Declared<'_>> = blaze_own::Vec::with_capacity_in(reach.rows.len(), work.alloc);
-    for n in 0..reach.rows.len() {
-        let (tabled, name_bytes) = reach.row(n);
-        declared.push(Declared { tabled, name: name_bytes });
-    }
-    let mut carried: AVec<'_, VtableDatum<'_>> = blaze_own::Vec::with_capacity_in(vtable_data.len(), work.alloc);
-    for (symbol, datum) in vtable_data.iter() {
-        carried.push(VtableDatum { symbol: *symbol, datum: datum.as_slice() });
-    }
-    // The read list: every question this build asked, named for good now that the build is
-    // done (code_reads.rs `ReadLog::seal`); a question answered two ways is refused (rule 21).
-    let read_list = work.reads.seal(&mut work.ground, work.alloc).map_err(|error| RunError::CodeRecord { function: name(), error: CodeRecordError::Reads(error) })?;
-    let emitted_from = work.clock.map(|c| c.now());
-    let mut inlined_func: Option<blaze_lir::func::Func<Global>> = None;
-    if work.export_lto && from_coroutine.is_none() {
-        struct ExportInlineBodies<'a, 'b> {
-            root: blaze_lir::body::BodyId,
-            root_refs: &'a [blaze_lir::func::RefRec],
-            funcs: &'a [Callee<'b>],
-            bank: &'a blaze_hash::Map<
-                blaze_code::record::Symbol,
-                blaze_lir::func::Func<Global>,
-                blaze_hash::FixedState,
-                Global,
-            >,
-        }
-        impl blaze_lir::body::Bodies for ExportInlineBodies<'_, '_> {
-            fn callee(
-                &self,
-                from: blaze_lir::body::BodyId,
-                reference: blaze_lir::func::RefId,
-            ) -> Option<(blaze_lir::body::BodyId, blaze_lir::View<'_>)> {
-                if from != self.root {
-                    return None;
-                }
-                let r = *self.root_refs.get(usize::try_from(reference.0).ok()?)?;
-                if r.kind != (blaze_lir::func::RefKind::Func as u32) {
-                    return None;
-                }
-                let idx = usize::try_from(r.place).ok()?;
-                let Callee::Symbol(sym) = *self.funcs.get(idx)? else {
-                    return None;
-                };
-                let f = self.bank.get(&sym)?;
-                Some((blaze_lir::body::BodyId(sym.0), f.view()))
-            }
-        }
-        let has_bank_callee = funcs.iter().any(|c| match c {
-            Callee::Symbol(sym) => work.inline_bank.contains_key(sym),
-            Callee::C(_) => false,
-        });
-        if has_bank_callee {
-            let root_id = blaze_lir::body::BodyId(
-                work.export_lto_symbol.map_or([0u8; 32], |s| s.0),
-            );
-            let root_view = built.func.verified().view();
-            let bodies = ExportInlineBodies {
-                root: root_id,
-                root_refs: root_view.refs,
-                funcs: &funcs,
-                bank: &work.inline_bank,
+    match sink {
+        BuildSink::Lir { alloc, out } => {
+            let out_alloc = *alloc;
+            let mut c_text: AVec<'a, u8> = blaze_own::Vec::new_in(out_alloc);
+            let mut push_c = |s: &str| -> Result<(u32, u32), RunError> {
+                let start = u32::try_from(c_text.len()).map_err(|_| RunError::CodeRecord {
+                    function: name(),
+                    error: CodeRecordError::Seal(blaze_code::record::RecordError::TooLarge { what: "LTO C symbol table" }),
+                })?;
+                let len = u32::try_from(s.len()).map_err(|_| RunError::CodeRecord {
+                    function: name(),
+                    error: CodeRecordError::Seal(blaze_code::record::RecordError::TooLarge { what: "LTO C symbol name" }),
+                })?;
+                c_text.extend_from_slice(s.as_bytes());
+                Ok((start, len))
             };
-            let policy = blaze_lir::inline::InlinePolicy {
-                cost_threshold: 160,
-                max_callee_insts: 256,
-                hot_multiplier: 4,
-                hot_weight_threshold: 1,
-                max_depth: 6,
-                max_growth: 4096,
-                allow_external_refs: false,
-                allow_loops: true,
-            };
-            if let Ok(guided) = blaze_lir::inline::inline_guided(
-                built.func.verified().view(),
-                root_id,
-                &bodies,
-                &blaze_lir::inline::NoWeights,
-                policy,
-                Global,
-            ) && !guided.read.is_empty()
-                && blaze_lir::verify(guided.func.view()).is_ok()
-            {
-                work.export_lto_inlined = true;
-                inlined_func = Some(guided.func);
+            let mut lir_funcs: AVec<'a, BuiltCallee> = blaze_own::Vec::with_capacity_in(funcs.len(), out_alloc);
+            for &callee in funcs.iter() {
+                match callee {
+                    Callee::Symbol(s) => lir_funcs.push(BuiltCallee::Symbol(s)),
+                    Callee::C(cname) => {
+                        let (start, len) = push_c(cname)?;
+                        lir_funcs.push(BuiltCallee::C { start, len });
+                    }
+                }
             }
-        }
-    }
-    let made = if work.export_lto && (work.export_lto_populate_only || !work.export_lto_inlined) {
-        // Populate-only pass or nothing was inlined into this function: skip re-emitting its
-        // CodeRecord, and only record its LIR in `inline_bank` if it's a small closed leaf.
-        None
-    } else if let Some(ref f) = inlined_func
-        && let Ok(v) = blaze_lir::verify(f.view())
-    {
-        Some(
-            make_entry_with_vtables(v, &names, &mut carried, routines, &mut declared, &read_list, &built.traps, work.isa, work.alloc)
-                .map_err(|error| RunError::CodeRecord { function: name(), error })?,
-        )
-    } else {
-        Some(
-            make_entry_with_vtables(built.func.verified(), &names, &mut carried, routines, &mut declared, &read_list, &built.traps, work.isa, work.alloc)
-                .map_err(|error| RunError::CodeRecord { function: name(), error })?,
-        )
-    };
-    if let Some(ref made) = made {
-        if let (Some(c), Some(from)) = (work.clock, emitted_from) {
-            work.times.emit += c.now().saturating_sub(from);
-            work.times.last = Some(MadeSizes::of(name(), built, made));
-        }
-        entry.extend_from_slice(made);
-    }
-    // In export LTO mode, cache small closed 0-call functions in `inline_bank` for their callers.
-    if work.export_lto
-        && from_coroutine.is_none()
-        && let Some(sym) = work.export_lto_symbol
-        && built.statics.is_empty()
-        && built.vtables.is_empty()
-        && built.thread_locals.is_empty()
-    {
-        let shrink_for_bank = |raw: blaze_lir::func::Func<Global>| -> Option<blaze_lir::func::Func<Global>> {
-            // Raw `blaze-build` LIR has temporary stack slots and dead `if false` branches
-            // (e.g. `debug_assertions` / `ub_checks` panic calls). Run fast SROA + propagate +
-            // dead so small helpers collapse to their true 0-call leaf size before banking.
-            if raw.view().ops.len() > 2048 {
-                return None;
+            let mut lir_c_statics: AVec<'a, (ItemKey, u32, u32)> = blaze_own::Vec::with_capacity_in(c_statics.len(), out_alloc);
+            for &(item, cname) in c_statics.iter() {
+                let (start, len) = push_c(cname)?;
+                lir_c_statics.push((item, start, len));
             }
-            let f1 = blaze_lir::simplify::scalar_replace(raw.view(), Global).unwrap_or(raw);
-            let f2 = blaze_lir::simplify::propagate(f1.view(), Global).unwrap_or(f1);
-            let f3 = blaze_lir::simplify::dead(f2.view(), Global).unwrap_or(f2);
-            let v = f3.view();
-            let is_leaf = v.ops.len() <= 256
-                && !v.ops.iter().any(|&o| {
-                    matches!(
-                        blaze_lir::Op::from_byte(o),
-                        Some(blaze_lir::Op::Call | blaze_lir::Op::CallIndirect | blaze_lir::Op::Invoke)
-                    )
+            let mut lir_statics: AVec<'a, ItemKey> = blaze_own::Vec::with_capacity_in(built.statics.len(), out_alloc);
+            lir_statics.extend_from_slice(&built.statics);
+            let mut lir_vtables: AVec<'a, blaze_code::record::Symbol> = blaze_own::Vec::with_capacity_in(vtables.len(), out_alloc);
+            lir_vtables.extend_from_slice(vtables.as_slice());
+            let mut lir_vtable_data: AVec<'a, (blaze_code::record::Symbol, AVec<'a, u8>)> = blaze_own::Vec::with_capacity_in(vtable_data.len(), out_alloc);
+            for (vsym, bytes) in vtable_data.iter() {
+                let mut copied: AVec<'a, u8> = blaze_own::Vec::with_capacity_in(bytes.len(), out_alloc);
+                copied.extend_from_slice(bytes.as_slice());
+                lir_vtable_data.push((*vsym, copied));
+            }
+            let mut lir_tls: AVec<'a, ItemKey> = blaze_own::Vec::with_capacity_in(built.thread_locals.len(), out_alloc);
+            lir_tls.extend_from_slice(&built.thread_locals);
+            let mut lir_traps: AVec<'a, blaze_code::record::TrapSource> = blaze_own::Vec::with_capacity_in(built.traps.len(), out_alloc);
+            lir_traps.extend_from_slice(&built.traps);
+            **out = Some(BuiltLir {
+                func: built.func.view().to_func_in(out_alloc),
+                funcs: lir_funcs,
+                statics: lir_statics,
+                c_statics: lir_c_statics,
+                vtables: lir_vtables,
+                vtable_data: lir_vtable_data,
+                tls: lir_tls,
+                traps: lir_traps,
+                c_text,
+            });
+            return Ok(Step::Entry);
+        }
+        BuildSink::Entry(entry) => {
+            // The soft-float routines after the instance's own references: the emitter's one table
+            // (front2/builtins_shim.rs); `make_entry` declares those it says the record calls.
+            let routines = work.routines.bind(&mut funcs).map_err(|error| RunError::CodeRecord { function: name(), error })?;
+            let names = InstanceNames { funcs: &funcs, statics: &built.statics, c_statics: &c_statics, vtables: &vtables, tls: &built.thread_locals };
+            let mut declared: AVec<'_, Declared<'_>> = blaze_own::Vec::with_capacity_in(reach.rows.len(), work.alloc);
+            for n in 0..reach.rows.len() {
+                let (tabled, name_bytes) = reach.row(n);
+                declared.push(Declared { tabled, name: name_bytes });
+            }
+            let mut carried: AVec<'_, VtableDatum<'_>> = blaze_own::Vec::with_capacity_in(vtable_data.len(), work.alloc);
+            for (symbol, datum) in vtable_data.iter() {
+                carried.push(VtableDatum { symbol: *symbol, datum: datum.as_slice() });
+            }
+            // The read list: every question this build asked, named for good now that the build is
+            // done (code_reads.rs `ReadLog::seal`); a question answered two ways is refused (rule 21).
+            let read_list = work.reads.seal(&mut work.ground, work.alloc).map_err(|error| RunError::CodeRecord { function: name(), error: CodeRecordError::Reads(error) })?;
+            let emitted_from = work.clock.map(|c| c.now());
+            let mut inlined_func: Option<blaze_lir::func::Func<Global>> = None;
+            if work.export_lto && from_coroutine.is_none() {
+                struct ExportInlineBodies<'a, 'b> {
+                    root: blaze_lir::body::BodyId,
+                    root_refs: &'a [blaze_lir::func::RefRec],
+                    funcs: &'a [Callee<'b>],
+                    bank: &'a blaze_hash::Map<
+                        blaze_code::record::Symbol,
+                        blaze_lir::func::Func<Global>,
+                        blaze_hash::FixedState,
+                        Global,
+                    >,
+                }
+                impl blaze_lir::body::Bodies for ExportInlineBodies<'_, '_> {
+                    fn callee(
+                        &self,
+                        from: blaze_lir::body::BodyId,
+                        reference: blaze_lir::func::RefId,
+                    ) -> Option<(blaze_lir::body::BodyId, blaze_lir::View<'_>)> {
+                        if from != self.root {
+                            return None;
+                        }
+                        let r = *self.root_refs.get(usize::try_from(reference.0).ok()?)?;
+                        if r.kind != (blaze_lir::func::RefKind::Func as u32) {
+                            return None;
+                        }
+                        let idx = usize::try_from(r.place).ok()?;
+                        let Callee::Symbol(sym) = *self.funcs.get(idx)? else {
+                            return None;
+                        };
+                        let f = self.bank.get(&sym)?;
+                        Some((blaze_lir::body::BodyId(sym.0), f.view()))
+                    }
+                }
+                let has_bank_callee = funcs.iter().any(|c| match c {
+                    Callee::Symbol(sym) => work.inline_bank.contains_key(sym),
+                    Callee::C(_) => false,
                 });
-            if is_leaf && blaze_lir::verify(v).is_ok() {
-                Some(f3)
-            } else {
+                if has_bank_callee {
+                    let root_id = blaze_lir::body::BodyId(
+                        work.export_lto_symbol.map_or([0u8; 32], |s| s.0),
+                    );
+                    let root_view = built.func.verified().view();
+                    let bodies = ExportInlineBodies {
+                        root: root_id,
+                        root_refs: root_view.refs,
+                        funcs: &funcs,
+                        bank: &work.inline_bank,
+                    };
+                    let policy = blaze_lir::inline::InlinePolicy {
+                        cost_threshold: 160,
+                        max_callee_insts: 256,
+                        hot_multiplier: 4,
+                        hot_weight_threshold: 1,
+                        max_depth: 6,
+                        max_growth: 4096,
+                        allow_external_refs: false,
+                        allow_loops: true,
+                    };
+                    if let Ok(guided) = blaze_lir::inline::inline_guided(
+                        built.func.verified().view(),
+                        root_id,
+                        &bodies,
+                        &blaze_lir::inline::NoWeights,
+                        policy,
+                        Global,
+                    ) && !guided.read.is_empty()
+                        && blaze_lir::verify(guided.func.view()).is_ok()
+                    {
+                        work.export_lto_inlined = true;
+                        inlined_func = Some(guided.func);
+                    }
+                }
+            }
+            let made = if work.export_lto && (work.export_lto_populate_only || !work.export_lto_inlined) {
                 None
+            } else if let Some(ref f) = inlined_func
+                && let Ok(v) = blaze_lir::verify(f.view())
+            {
+                Some(
+                    make_entry_with_vtables(v, &names, &mut carried, routines, &mut declared, &read_list, &built.traps, work.isa, work.alloc)
+                        .map_err(|error| RunError::CodeRecord { function: name(), error })?,
+                )
+            } else {
+                Some(
+                    make_entry_with_vtables(built.func.verified(), &names, &mut carried, routines, &mut declared, &read_list, &built.traps, work.isa, work.alloc)
+                        .map_err(|error| RunError::CodeRecord { function: name(), error })?,
+                )
+            };
+            if let Some(ref made) = made {
+                if let (Some(c), Some(from)) = (work.clock, emitted_from) {
+                    work.times.emit += c.now().saturating_sub(from);
+                    work.times.last = Some(MadeSizes::of(name(), built, made));
+                }
+                entry.extend_from_slice(made);
             }
-        };
-        if let Some(f) = inlined_func {
-            if let Some(shrunk) = shrink_for_bank(f) {
-                let _ = work.inline_bank.insert(sym, shrunk);
+            if work.export_lto
+                && from_coroutine.is_none()
+                && let Some(sym) = work.export_lto_symbol
+                && built.statics.is_empty()
+                && built.vtables.is_empty()
+                && built.thread_locals.is_empty()
+            {
+                let shrink_for_bank = |raw: blaze_lir::func::Func<Global>| -> Option<blaze_lir::func::Func<Global>> {
+                    if raw.view().ops.len() > 2048 {
+                        return None;
+                    }
+                    let f1 = blaze_lir::simplify::scalar_replace(raw.view(), Global).unwrap_or(raw);
+                    let f2 = blaze_lir::simplify::propagate(f1.view(), Global).unwrap_or(f1);
+                    let f3 = blaze_lir::simplify::dead(f2.view(), Global).unwrap_or(f2);
+                    let v = f3.view();
+                    let is_leaf = v.ops.len() <= 256
+                        && !v.ops.iter().any(|&o| {
+                            matches!(
+                                blaze_lir::Op::from_byte(o),
+                                Some(blaze_lir::Op::Call | blaze_lir::Op::CallIndirect | blaze_lir::Op::Invoke)
+                            )
+                        });
+                    if is_leaf && blaze_lir::verify(v).is_ok() {
+                        Some(f3)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(f) = inlined_func {
+                    if let Some(shrunk) = shrink_for_bank(f) {
+                        let _ = work.inline_bank.insert(sym, shrunk);
+                    }
+                } else if let Some(b) = own
+                    && let Some(shrunk) = shrink_for_bank(b.func.into_func())
+                {
+                    let _ = work.inline_bank.insert(sym, shrunk);
+                }
             }
-        } else if let Some(b) = own
-            && let Some(shrunk) = shrink_for_bank(b.func.into_func())
-        {
-            let _ = work.inline_bank.insert(sym, shrunk);
+            if let Some((at, part)) = from_coroutine {
+                work.stash[at].parts[part] = None;
+            }
         }
-    }
-    // The coroutine's part leaves the stash with its entry made, not before.
-    if let Some((at, part)) = from_coroutine {
-        work.stash[at].parts[part] = None;
     }
     Ok(Step::Entry)
 }
@@ -2535,6 +2678,39 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
             (watch.report)(&sizes);
         }
         Ok(())
+    }
+
+    /// Builds verified LIR and resolved outside references for one instance without emitting
+    /// machine code yet (used by [`export_lto`] for whole-program cross-function inlining).
+    pub fn build_lir<'a>(&mut self, _grant: &G, tabled: ItemKey, name: &[u8], alloc: Alloc<'a>) -> Result<BuiltLir<'a>, RunError> {
+        if let Some(void) = self.void(tabled) {
+            return Err(void);
+        }
+        let made = self.build_lir_over(tabled, name, alloc);
+        if let Some(void) = self.void(tabled) {
+            return Err(void);
+        }
+        made
+    }
+
+    fn build_lir_over<'a>(&mut self, tabled: ItemKey, name: &[u8], alloc: Alloc<'a>) -> Result<BuiltLir<'a>, RunError> {
+        self.construct(tabled)?;
+        let Some((program, state)) = self.made.as_mut() else {
+            return Err(RunError::OneBody { key: tabled, why: "the maker's program was not made (make_one.rs `Maker::build_lir`)" });
+        };
+        let mut out: Option<BuiltLir<'a>> = None;
+        let mut sink = BuildSink::Lir { alloc, out: &mut out };
+        run_instance_loop(program, &mut self.typing, state, &mut self.checks, tabled, name, &mut sink)?;
+        out.ok_or(RunError::OneBody { key: tabled, why: "the LIR build completed without producing a body (make_one.rs `Maker::build_lir`)" })
+    }
+
+    /// Binds compiler_builtins soft-float routines onto `funcs` (after all original + LTO-imported
+    /// function references) so host-machine emission can legalize `f128` operations if needed.
+    pub fn bind_routines<'m>(&'m self, funcs: &mut AVec<'_, Callee<'_>>) -> Result<crate::front2::builtins_shim::Routines<'m>, CodeRecordError> {
+        match self.made.as_ref() {
+            Some((_, state)) => state.work.routines.bind(funcs),
+            None => Ok(crate::front2::builtins_shim::Routines::NONE),
+        }
     }
 
     /// The program made on the first call, then static `item`'s value made its entry

@@ -31,15 +31,16 @@ use blaze_lir::{
 };
 use blaze_own::{Alloc, Vec};
 use blaze_tier::{
-    Arch, CallClobbers, Emitted, Machine, Named, Names, Outside, RegSet, RoutinePlaces, Tier,
+    Arch, CallClobbers, Emitted, Machine, Named, Names, Outside, Reg, RegSet, RoutinePlaces, Tier,
     TierError, TierName,
 };
 
 use super::{
     CallMode, Sota,
-    abi::{AbiFnInput, ZeroAbiOpts, ZeroAbiStats, plan_module_abi},
+    abi::{AbiFnInput, CallConvKind, ZeroAbiOpts, ZeroAbiStats, plan_module_abi},
     bolt::{BoltCallEdge, BoltFn, BoltLayoutStats, BoltOpts, PlacedFn, pack_module_pages},
     isel, optimize_sota_midend,
+    regalloc::ScratchOrder,
 };
 
 /// One input function in a whole-program / crate SOTA compilation batch.
@@ -248,6 +249,74 @@ impl Names for ImportedNames<'_, '_, '_> {
     }
 }
 
+/// Estimates caller live-register pressure (`(gpr_pressure, fp_pressure)`) from post-LTO LIR
+/// before emission so [`plan_module_abi`] can assign register-avoidance [`ScratchOrder`]s to
+/// callees prior to code generation.
+fn estimate_caller_live_pressure(view: View<'_>) -> (RegSet, RegSet) {
+    const SCRATCH_GPRS: [u8; 7] = [9, 10, 11, 12, 13, 14, 15];
+    const SCRATCH_FPS: [u8; 13] = [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28];
+
+    let mut last_call: Option<usize> = None;
+    for inst in 0..view.len() {
+        if matches!(view.op(inst), Op::Call | Op::Invoke | Op::CallIndirect | Op::InvokeIndirect) {
+            last_call = Some(inst);
+        }
+    }
+    let Some(last_call_idx) = last_call else {
+        return (RegSet::EMPTY, RegSet::EMPTY);
+    };
+
+    let mut gpr_args = 0usize;
+    let mut fp_args = 0usize;
+    let mut gpr_temps = 0usize;
+    let mut fp_temps = 0usize;
+    let entry_params = view.params(blaze_lir::Block(0));
+    for inst in 0..last_call_idx {
+        let Some(&ty_raw) = view.tys.get(inst) else {
+            break;
+        };
+        let ty = blaze_lir::Ty(ty_raw);
+        if ty == blaze_lir::Ty::NONE {
+            continue;
+        }
+        let op = view.op(inst);
+        if matches!(op, Op::Iconst | Op::IconstWide | Op::Fconst | Op::FconstWide) {
+            continue;
+        }
+        let is_entry_param = inst >= entry_params.start && inst < entry_params.end;
+        if ty.is_float() || ty.is_vector() {
+            if is_entry_param {
+                fp_args += 1;
+            } else {
+                fp_temps += 1;
+            }
+        } else if is_entry_param {
+            gpr_args += 1;
+        } else {
+            gpr_temps += 1;
+        }
+    }
+
+    // Cap pressure strictly below caller-saved pool sizes so callees always retain untouched
+    // registers ahead of demoted caller-hot registers in `ScratchOrder`.
+    let mut gpr_set = RegSet::EMPTY;
+    for &r in SCRATCH_GPRS.get(..gpr_temps.min(4)).unwrap_or(&[]) {
+        gpr_set = gpr_set.with(Reg(r));
+    }
+    for r in 0..u8::try_from(gpr_args.min(4)).unwrap_or(0) {
+        gpr_set = gpr_set.with(Reg(r));
+    }
+
+    let mut fp_set = RegSet::EMPTY;
+    for &v in SCRATCH_FPS.get(..fp_temps.min(6)).unwrap_or(&[]) {
+        fp_set = fp_set.with(Reg(32 + v));
+    }
+    for v in 0..u8::try_from(fp_args.min(4)).unwrap_or(0) {
+        fp_set = fp_set.with(Reg(32 + v));
+    }
+    (gpr_set, fp_set)
+}
+
 /// Resolves a direct `Op::Call` or `Op::Invoke` instruction to its intra-module callee index.
 fn direct_callee_idx(
     view: View<'_>,
@@ -370,136 +439,9 @@ pub fn compile_module_a64<'a, 'f, F: Tier>(
     }
     let emit_sccs = tarjan_sccs(n, &adj_offsets, &adj, alloc);
 
-    // 4. Emit callees before callers with IPRA (`CallClobbers` propagation).
-    let mut compiled: Vec<Option<CompiledModuleFn<'a>>, Alloc<'a>> = Vec::with_capacity_in(n, alloc);
-    let mut known_clobbers: Vec<Option<CallClobbers>, Alloc<'a>> = Vec::with_capacity_in(n, alloc);
-    for _ in 0..n {
-        compiled.push(None);
-        known_clobbers.push(None);
-    }
-    let is_macos = opts.machine.os == blaze_tier::Os::MacOs;
-    let mut ipra_calls_narrowed = 0usize;
-
-    for scc_idx in 0..emit_sccs.len() {
-        let comp = emit_sccs.component(scc_idx);
-        for &node in comp {
-            let idx = usize::try_from(node).map_err(|_| TierError::Refused {
-                tier: TierName::Sota,
-                inst: None,
-                what: "module SCC node index overflow",
-            })?;
-            let names = ImportedNames {
-                body_idx: idx,
-                fns,
-                lto_bodies: &lto.bodies,
-                by_sym: &input_bodies.by_sym,
-            };
-            let opt_func = opt_funcs.get(idx).ok_or(TierError::Refused {
-                tier: TierName::Sota,
-                inst: None,
-                what: "missing module function",
-            })?;
-            let verified = verify(opt_func.view()).map_err(|_| TierError::Refused {
-                tier: TierName::Sota,
-                inst: None,
-                what: "post-LTO optimized LIR failed verify",
-            })?;
-
-            // Count & feed IPRA call-clobber masks for direct `Op::Call` / `Op::Invoke` sites
-            // targeting already-compiled callees with strictly narrower clobber sets than C ABI.
-            let view = verified.view();
-            let lookup_clobbers = |inst: usize| -> Option<CallClobbers> {
-                let cidx = direct_callee_idx(view, inst, &names, &input_bodies)?;
-                known_clobbers.get(cidx).and_then(|c| *c)
-            };
-            let mut narrowed_here = 0usize;
-            for inst in 0..view.len() {
-                if let Some(clob) = lookup_clobbers(inst)
-                    && (CallClobbers::C_ABI_ARM64.clobbered.0 & !clob.clobbered.0) != 0
-                {
-                    narrowed_here += 1;
-                }
-            }
-
-            let emit_res = isel::emit_sota_a64_with_ipra(
-                view,
-                &names,
-                opts.call_mode,
-                opts.machine.features,
-                is_macos,
-                |inst| lookup_clobbers(inst).unwrap_or(CallClobbers::C_ABI_ARM64),
-                alloc,
-            );
-
-            let (emitted, mut clobbers, used_fallback) = match emit_res {
-                Ok((em, clob)) => {
-                    ipra_calls_narrowed += narrowed_here;
-                    (em, clob, false)
-                }
-                Err(err) => {
-                    if let Some(fb) = fallback {
-                        let em = fb.emit(verified, &names, opts.machine, alloc)?;
-                        (em, CallClobbers::C_ABI_ARM64, true)
-                    } else {
-                        return Err(err);
-                    }
-                }
-            };
-
-            // Soundly union callee clobbers for tail-called `Op::Call`/`Op::CallIndirect` sites
-            // (which `regalloc` excludes from `call_positions` since they do not clobber locals).
-            if !used_fallback {
-                for inst in 0..view.len() {
-                    match view.op(inst) {
-                        Op::Call | Op::Invoke => {
-                            let callee_clob = lookup_clobbers(inst).unwrap_or(CallClobbers::C_ABI_ARM64);
-                            clobbers.clobbered = clobbers.clobbered.union(callee_clob.clobbered);
-                        }
-                        Op::CallIndirect | Op::InvokeIndirect => {
-                            clobbers.clobbered = clobbers.clobbered.union(CallClobbers::C_ABI_ARM64.clobbered);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            if let Some(slot) = known_clobbers.get_mut(idx) {
-                *slot = Some(clobbers);
-            }
-            let sym = fns
-                .get(idx)
-                .ok_or(TierError::Refused {
-                    tier: TierName::Sota,
-                    inst: None,
-                    what: "missing module function symbol",
-                })?
-                .symbol;
-            let inlined_bodies = lto.bodies.get(idx).map_or(0, |b| b.read.len());
-            if let Some(slot) = compiled.get_mut(idx) {
-                *slot = Some(CompiledModuleFn {
-                    symbol: sym,
-                    emitted,
-                    clobbers,
-                    inlined_bodies,
-                    used_fallback,
-                });
-            }
-        }
-    }
-
-    let mut functions: Vec<CompiledModuleFn<'a>, Alloc<'a>> = Vec::with_capacity_in(n, alloc);
-    for slot in compiled {
-        let compiled_fn = slot.ok_or(TierError::Refused {
-            tier: TierName::Sota,
-            inst: None,
-            what: "module function omitted during compilation",
-        })?;
-        functions.push(compiled_fn);
-    }
-
-    // 5. Whole-module Zero-ABI planning (internal fast ABI, cold `preserve_all`, global SCC
-    //    pointer pinning, and caller-pressure register-avoidance ordering from post-inline LIR
-    //    and bottom-up IPRA `clobbers`).
+    // 4. Whole-module Zero-ABI planning BEFORE emission: internal fast ABI, cold `preserve_all`,
+    //    global SCC pointer pinning, and caller-pressure register-avoidance `ScratchOrder`s from
+    //    the post-LTO call graph & `FnAttrs::COLD`.
     let mut in_degree: Vec<usize, Alloc<'a>> = Vec::with_capacity_in(n, alloc);
     let mut address_taken: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(n, alloc);
     for _ in 0..n {
@@ -565,9 +507,7 @@ pub fn compile_module_a64<'a, 'f, F: Tier>(
         let is_addr_taken = address_taken.get(idx).copied().unwrap_or(false);
         let is_cold = (view.head.attrs & FnAttrs::COLD) != 0;
         let direct_callees = callees_per_fn.get(idx).map_or(EMPTY_CALLEES, Vec::as_slice);
-        let clob = known_clobbers.get(idx).and_then(|c| *c).unwrap_or(CallClobbers::C_ABI_ARM64);
-        let caller_live_pressure_gprs = RegSet(clob.clobbered.0 & 0x0000_0000_ffff_ffff);
-        let caller_live_pressure_fps = RegSet(clob.clobbered.0 & 0xffff_ffff_0000_0000);
+        let (caller_live_pressure_gprs, caller_live_pressure_fps) = estimate_caller_live_pressure(view);
         abi_inputs.push(AbiFnInput {
             view,
             is_exported,
@@ -580,6 +520,144 @@ pub fn compile_module_a64<'a, 'f, F: Tier>(
     }
     let abi_plan = plan_module_abi(&abi_inputs, ZeroAbiOpts::arm64_export(), alloc);
     let abi_stats = abi_plan.stats;
+
+    // 5. Emit callees before callers with Zero-ABI `ScratchOrder` + `ColdPreserveAll` + IPRA
+    //    (`CallClobbers` propagation).
+    let mut compiled: Vec<Option<CompiledModuleFn<'a>>, Alloc<'a>> = Vec::with_capacity_in(n, alloc);
+    let mut known_clobbers: Vec<Option<CallClobbers>, Alloc<'a>> = Vec::with_capacity_in(n, alloc);
+    for _ in 0..n {
+        compiled.push(None);
+        known_clobbers.push(None);
+    }
+    let is_macos = opts.machine.os == blaze_tier::Os::MacOs;
+    let mut ipra_calls_narrowed = 0usize;
+
+    for scc_idx in 0..emit_sccs.len() {
+        let comp = emit_sccs.component(scc_idx);
+        for &node in comp {
+            let idx = usize::try_from(node).map_err(|_| TierError::Refused {
+                tier: TierName::Sota,
+                inst: None,
+                what: "module SCC node index overflow",
+            })?;
+            let names = ImportedNames {
+                body_idx: idx,
+                fns,
+                lto_bodies: &lto.bodies,
+                by_sym: &input_bodies.by_sym,
+            };
+            let opt_func = opt_funcs.get(idx).ok_or(TierError::Refused {
+                tier: TierName::Sota,
+                inst: None,
+                what: "missing module function",
+            })?;
+            let verified = verify(opt_func.view()).map_err(|_| TierError::Refused {
+                tier: TierName::Sota,
+                inst: None,
+                what: "post-LTO optimized LIR failed verify",
+            })?;
+
+            // Count & feed IPRA call-clobber masks for direct `Op::Call` / `Op::Invoke` sites
+            // targeting already-compiled callees with strictly narrower clobber sets than C ABI.
+            let view = verified.view();
+            let lookup_clobbers = |inst: usize| -> Option<CallClobbers> {
+                let cidx = direct_callee_idx(view, inst, &names, &input_bodies)?;
+                known_clobbers.get(cidx).and_then(|c| *c)
+            };
+            let mut narrowed_here = 0usize;
+            for inst in 0..view.len() {
+                if let Some(clob) = lookup_clobbers(inst)
+                    && (CallClobbers::C_ABI_ARM64.clobbered.0 & !clob.clobbered.0) != 0
+                {
+                    narrowed_here += 1;
+                }
+            }
+
+            let fn_plan = abi_plan.plans.get(idx);
+            let scratch_order = fn_plan.map(|p| ScratchOrder {
+                gpr: p.scratch_gpr_order,
+                fp: p.scratch_fp_order,
+            });
+            let preserve_all_cold = fn_plan.is_some_and(|p| p.conv == CallConvKind::ColdPreserveAll);
+
+            let emit_res = isel::emit_sota_a64_with_abi(
+                view,
+                &names,
+                opts.call_mode,
+                opts.machine.features,
+                is_macos,
+                |inst| lookup_clobbers(inst).unwrap_or(CallClobbers::C_ABI_ARM64),
+                scratch_order.as_ref(),
+                preserve_all_cold,
+                alloc,
+            );
+
+            let (emitted, mut clobbers, used_fallback) = match emit_res {
+                Ok((em, clob)) => {
+                    ipra_calls_narrowed += narrowed_here;
+                    (em, clob, false)
+                }
+                Err(err) => {
+                    if let Some(fb) = fallback {
+                        let em = fb.emit(verified, &names, opts.machine, alloc)?;
+                        (em, CallClobbers::C_ABI_ARM64, true)
+                    } else {
+                        return Err(err);
+                    }
+                }
+            };
+
+            // Soundly union callee clobbers for tail-called `Op::Call`/`Op::CallIndirect` sites
+            // (which `regalloc` excludes from `call_positions` since they do not clobber locals).
+            // `preserve_all_cold` disables TCO and saves/restores all callee-clobbered scratch regs.
+            if !used_fallback && !preserve_all_cold {
+                for inst in 0..view.len() {
+                    match view.op(inst) {
+                        Op::Call | Op::Invoke => {
+                            let callee_clob = lookup_clobbers(inst).unwrap_or(CallClobbers::C_ABI_ARM64);
+                            clobbers.clobbered = clobbers.clobbered.union(callee_clob.clobbered);
+                        }
+                        Op::CallIndirect | Op::InvokeIndirect => {
+                            clobbers.clobbered = clobbers.clobbered.union(CallClobbers::C_ABI_ARM64.clobbered);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            if let Some(slot) = known_clobbers.get_mut(idx) {
+                *slot = Some(clobbers);
+            }
+            let sym = fns
+                .get(idx)
+                .ok_or(TierError::Refused {
+                    tier: TierName::Sota,
+                    inst: None,
+                    what: "missing module function symbol",
+                })?
+                .symbol;
+            let inlined_bodies = lto.bodies.get(idx).map_or(0, |b| b.read.len());
+            if let Some(slot) = compiled.get_mut(idx) {
+                *slot = Some(CompiledModuleFn {
+                    symbol: sym,
+                    emitted,
+                    clobbers,
+                    inlined_bodies,
+                    used_fallback,
+                });
+            }
+        }
+    }
+
+    let mut functions: Vec<CompiledModuleFn<'a>, Alloc<'a>> = Vec::with_capacity_in(n, alloc);
+    for slot in compiled {
+        let compiled_fn = slot.ok_or(TierError::Refused {
+            tier: TierName::Sota,
+            inst: None,
+            what: "module function omitted during compilation",
+        })?;
+        functions.push(compiled_fn);
+    }
 
     // 6. 16 KB Apple Silicon BOLT page-exact layout & hot/cold section packing over the compiled
     //    module's code sizes and post-inline weighted call graph.
@@ -1122,5 +1200,332 @@ mod tests {
             cold_placed.page_index >= out.bolt_layout.hot_pages,
             "cold sink must reside strictly after hot pages"
         );
+    }
+
+    #[test]
+    fn cold_preserve_all_helper_preserves_hot_caller_regs_with_zero_spills() {
+        let alloc = test_alloc();
+        let sym_ext = Symbol::of_name("sota_mod_test::external_panic_sink");
+        let sym_cold = Symbol::of_name("sota_mod_test::cold_preserve_helper");
+        let sym_hot = Symbol::of_name("sota_mod_test::hot_loop_caller");
+
+        // 1. Internal #[cold] #[inline(never)] helper calling an external C-ABI symbol (which
+        //    clobbers all C_ABI_ARM64 regs). Under `ColdPreserveAll`, its prologue/epilogue must
+        //    save/restore all modified caller-saved GPRs/FPs outside `x0` and report narrow IPRA clobbers.
+        let mut bc = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let cold_sig = bc.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+        let ext_sig = bc.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+        bc.set_signature(cold_sig);
+        bc.set_attrs(FnAttrs(FnAttrs::COLD).with_inline(Inline::Never));
+        let ext_ref = bc.reference(RefKind::Func, 0);
+        let c_entry = bc.create_block(BlockKind::Normal);
+        bc.begin(c_entry);
+        let cx = bc.param(Ty::I64);
+        let c_ext = bc.call(Flags::NONE, ext_ref, ext_sig, &[cx]);
+        let one = bc.iconst(Ty::I64, 1);
+        let c_out = bc.binary(Op::Add, Flags::NONE, c_ext, one);
+        bc.ret(&[c_out]);
+        let func_cold = bc.finish_checked().expect("cold helper LIR builds");
+
+        // 2. Hot caller loop keeping 4 live values (`n`, `step`, `salt`, `i`) across a cold branch
+        //    calling `cold_preserve_helper`.
+        let mut bh = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let hot_sig = bh.sig(
+            Conv::C,
+            Variadic::No,
+            &[
+                Param::of(Ty::I64),
+                Param::of(Ty::I64),
+                Param::of(Ty::I64),
+                Param::of(Ty::I64),
+            ],
+            &[Param::of(Ty::I64)],
+        );
+        let call_cold_sig = bh.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+        bh.set_signature(hot_sig);
+        let cold_ref = bh.reference(RefKind::Func, 0);
+        let h_entry = bh.create_block(BlockKind::Normal);
+        let h_header = bh.create_block(BlockKind::Normal);
+        let h_body = bh.create_block(BlockKind::Normal);
+        let h_cold = bh.create_block(BlockKind::Cold);
+        let h_merge = bh.create_block(BlockKind::Normal);
+        let h_exit = bh.create_block(BlockKind::Normal);
+
+        bh.begin(h_entry);
+        let n = bh.param(Ty::I64);
+        let seed = bh.param(Ty::I64);
+        let step = bh.param(Ty::I64);
+        let salt = bh.param(Ty::I64);
+        let zero = bh.iconst(Ty::I64, 0);
+        bh.jump((h_header, &[zero, seed]));
+
+        bh.begin(h_header);
+        let i = bh.param(Ty::I64);
+        let acc = bh.param(Ty::I64);
+        let keep = bh.icmp(IntCond::Ult, i, n);
+        bh.br(Flags::NONE, keep, (h_body, &[]), (h_exit, &[]));
+
+        bh.begin(h_body);
+        let is_zero = bh.icmp(IntCond::Eq, acc, zero);
+        bh.br(Flags::NONE, is_zero, (h_cold, &[]), (h_merge, &[acc]));
+
+        bh.begin(h_cold);
+        let fixed = bh.call(Flags::NONE, cold_ref, call_cold_sig, &[acc]);
+        bh.jump((h_merge, &[fixed]));
+
+        bh.begin(h_merge);
+        let cur = bh.param(Ty::I64);
+        let added = bh.binary(Op::Add, Flags::NONE, cur, step);
+        let next_acc = bh.binary(Op::Xor, Flags::NONE, added, salt);
+        let h_one = bh.iconst(Ty::I64, 1);
+        let next_i = bh.binary(Op::Add, Flags::NONE, i, h_one);
+        bh.jump((h_header, &[next_i, next_acc]));
+
+        bh.begin(h_exit);
+        bh.ret(&[acc]);
+        let func_hot = bh.finish_checked().expect("hot caller LIR builds");
+
+        let cold_names = TableNames(&[(0, sym_ext)]);
+        let hot_names = TableNames(&[(0, sym_cold)]);
+        let fns = [
+            ModuleFn {
+                symbol: sym_hot,
+                func: verify(func_hot.view()).expect("hot caller verifies"),
+                names: &hot_names,
+            },
+            ModuleFn {
+                symbol: sym_cold,
+                func: verify(func_cold.view()).expect("cold helper verifies"),
+                names: &cold_names,
+            },
+        ];
+
+        let opts = SotaModuleOpts::for_export(MAC_ARM64);
+        let out = compile_module_a64(&fns, &NoWeights, opts, Option::<&crate::Reference>::None, alloc)
+            .expect("ColdPreserveAll module compilation succeeds");
+
+        assert_eq!(out.abi_stats.cold_preserve_all_fns, 1);
+        assert!(out.ipra_calls_narrowed >= 1, "expected caller to narrow cold helper call via ColdPreserveAll");
+
+        let hot_out = &out.functions[0];
+        let cold_out = &out.functions[1];
+        assert!(!hot_out.used_fallback && !cold_out.used_fallback);
+
+        // Cold helper preserves every caller-saved GPR outside its `x0` return slot and every scratch FP.
+        for r in 1..=15u8 {
+            assert!(
+                !cold_out.clobbers.clobbers_gpr(r),
+                "ColdPreserveAll helper must preserve caller-saved x{r}"
+            );
+        }
+        for v in (0..=7u8).chain(16..=28u8) {
+            assert!(
+                !cold_out.clobbers.clobbers_fp(v),
+                "ColdPreserveAll helper must preserve caller-saved v{v}"
+            );
+        }
+
+        // Hot caller keeps all 4 live loop values in caller-saved registers with zero spills/callee saves!
+        let hot_frame = hot_out.emitted.unwind_frame.expect("hot caller saves fp/lr");
+        assert_eq!(hot_frame.x_pairs, 0, "hot caller must save zero callee-saved GPR pairs");
+        assert_eq!(hot_frame.d_pairs, 0, "hot caller must save zero callee-saved FP pairs");
+        assert!(
+            !decode_words(&hot_out.emitted.code).any(|w| (w & 0xff80_03ff) == 0xd100_03ff),
+            "hot caller must allocate zero stack spill frame (`sub sp, sp, #imm`)"
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn sota_end_to_end_i8_gemm_executes_on_sme2_hardware() {
+        use blaze_tier::Tier;
+
+        unsafe extern "C" {
+            fn sysctlbyname(
+                name: *const core::ffi::c_char,
+                oldp: *mut core::ffi::c_void,
+                oldlenp: *mut usize,
+                newp: *const core::ffi::c_void,
+                newlen: usize,
+            ) -> core::ffi::c_int;
+        }
+
+        let mut sme2_val: i32 = 0;
+        let mut sme2_len = core::mem::size_of::<i32>();
+        // SAFETY: read-only sysctl query into valid stack `i32` storage.
+        let rc = unsafe {
+            sysctlbyname(
+                c"hw.optional.arm.FEAT_SME2".as_ptr(),
+                (&raw mut sme2_val).cast::<core::ffi::c_void>(),
+                &raw mut sme2_len,
+                core::ptr::null(),
+                0,
+            )
+        };
+        if rc != 0 || sme2_val == 0 {
+            return;
+        }
+
+        let alloc = test_alloc();
+        let no_names = TableNames(&[]);
+        let mac_sme2 = Machine {
+            arch: Arch::Arm64,
+            os: Os::MacOs,
+            features: Machine::LSE | Machine::SME2,
+        };
+
+        // Build idiomatic safe-Rust-style `i8 -> i32` GEMM (both accumulate and sibling zero-init overwrite).
+        let build_i8_gemm = |with_zero_init: bool| {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::I64)],
+                &[],
+            );
+            b.set_signature(sig);
+            let [entry, i_hdr, i_body, k_pre, k_hdr, k_body, j_hdr, j_body, k_latch, i_latch, exit] =
+                [(); 11].map(|_| b.create_block(BlockKind::Normal));
+            let zero_blocks = with_zero_init
+                .then(|| (b.create_block(BlockKind::Normal), b.create_block(BlockKind::Normal)));
+
+            b.begin(entry);
+            let pc = b.param(Ty::PTR);
+            let pa = b.param(Ty::PTR);
+            let pb = b.param(Ty::PTR);
+            let n = b.param(Ty::I64);
+            let zero = b.iconst(Ty::I64, 0);
+            let one = b.iconst(Ty::I64, 1);
+            let two = b.iconst(Ty::I64, 2);
+            let izero = b.iconst(Ty::I32, 0);
+            b.jump((i_hdr, &[zero]));
+
+            b.begin(i_hdr);
+            let i = b.param(Ty::I64);
+            let keep_i = b.icmp(IntCond::Ult, i, n);
+            b.br(Flags::NONE, keep_i, (i_body, &[]), (exit, &[]));
+
+            b.begin(i_body);
+            let i_n = b.binary(Op::Mul, Flags::NONE, i, n);
+            if let Some((z_hdr, z_body)) = zero_blocks {
+                b.jump((z_hdr, &[zero]));
+
+                b.begin(z_hdr);
+                let jz = b.param(Ty::I64);
+                let keep_jz = b.icmp(IntCond::Ult, jz, n);
+                b.br(Flags::NONE, keep_jz, (z_body, &[]), (k_pre, &[]));
+
+                b.begin(z_body);
+                let z_idx = b.binary(Op::Add, Flags::NONE, i_n, jz);
+                let z_off = b.binary(Op::Shl, Flags::NONE, z_idx, two);
+                let z_ptr = b.ptr_add(Flags::NONE, pc, z_off);
+                b.store(Flags::NONE, izero, z_ptr, 0, MemAttrs::aligned(2));
+                let jz2 = b.binary(Op::Add, Flags::NONE, jz, one);
+                b.jump((z_hdr, &[jz2]));
+            } else {
+                b.jump((k_pre, &[]));
+            }
+
+            b.begin(k_pre);
+            b.jump((k_hdr, &[zero]));
+
+            b.begin(k_hdr);
+            let k = b.param(Ty::I64);
+            let keep_k = b.icmp(IntCond::Ult, k, n);
+            b.br(Flags::NONE, keep_k, (k_body, &[]), (i_latch, &[]));
+
+            b.begin(k_body);
+            let a_idx = b.binary(Op::Add, Flags::NONE, i_n, k);
+            let a_ptr = b.ptr_add(Flags::NONE, pa, a_idx);
+            let a_raw = b.load(Ty::I8, Flags::NONE, a_ptr, 0, MemAttrs::aligned(0));
+            let a_val = b.convert(Op::Sext, Flags::NONE, Ty::I32, a_raw);
+            let k_n = b.binary(Op::Mul, Flags::NONE, k, n);
+            b.jump((j_hdr, &[zero]));
+
+            b.begin(j_hdr);
+            let j = b.param(Ty::I64);
+            let keep_j = b.icmp(IntCond::Ult, j, n);
+            b.br(Flags::NONE, keep_j, (j_body, &[]), (k_latch, &[]));
+
+            b.begin(j_body);
+            let b_idx = b.binary(Op::Add, Flags::NONE, k_n, j);
+            let b_ptr = b.ptr_add(Flags::NONE, pb, b_idx);
+            let b_raw = b.load(Ty::I8, Flags::NONE, b_ptr, 0, MemAttrs::aligned(0));
+            let b_val = b.convert(Op::Sext, Flags::NONE, Ty::I32, b_raw);
+            let c_idx = b.binary(Op::Add, Flags::NONE, i_n, j);
+            let c_off = b.binary(Op::Shl, Flags::NONE, c_idx, two);
+            let c_ptr = b.ptr_add(Flags::NONE, pc, c_off);
+            let c_val = b.load(Ty::I32, Flags::NONE, c_ptr, 0, MemAttrs::aligned(2));
+            let prod = b.binary(Op::Mul, Flags::NONE, a_val, b_val);
+            let c_new = b.binary(Op::Add, Flags::NONE, c_val, prod);
+            b.store(Flags::NONE, c_new, c_ptr, 0, MemAttrs::aligned(2));
+            let j2 = b.binary(Op::Add, Flags::NONE, j, one);
+            b.jump((j_hdr, &[j2]));
+
+            b.begin(k_latch);
+            let k2 = b.binary(Op::Add, Flags::NONE, k, one);
+            b.jump((k_hdr, &[k2]));
+
+            b.begin(i_latch);
+            let i2 = b.binary(Op::Add, Flags::NONE, i, one);
+            b.jump((i_hdr, &[i2]));
+
+            b.begin(exit);
+            b.ret(&[]);
+            b.finish_checked().expect("i8 GEMM LIR builds")
+        };
+
+        for &with_zero_init in &[false, true] {
+            let func = build_i8_gemm(with_zero_init);
+            let verified = verify(func.view()).expect("i8 GEMM LIR verifies");
+            let emitted = super::Sota::standalone()
+                .emit(verified, &no_names, mac_sme2, alloc)
+                .expect("Sota SME2 i8->i32 GEMM emission succeeds");
+            assert!(emitted.relocs.is_empty(), "self-contained SME2 GEMM must have zero relocs");
+            assert!(
+                decode_words(&emitted.code).any(|w| w == super::super::sme2::smstart()),
+                "emitted code must embed SME2 smstart (with_zero_init={with_zero_init})"
+            );
+            assert!(
+                decode_words(&emitted.code).any(|w| (w & 0xffe0_0000) == 0xa080_0000),
+                "emitted code must embed hardware SMOPA instructions (with_zero_init={with_zero_init})"
+            );
+
+            let exec = blaze_inproc::exec::Executable::new(&emitted.code, 0)
+                .expect("W^X mapping for end-to-end Sota SME2 i8->i32 GEMM succeeds");
+            type MatmulI8Fn = extern "C" fn(*mut i32, *const i8, *const i8, i64);
+            // SAFETY: `emitted.code` is valid AArch64+SME2 machine code matching `MatmulI8Fn`'s C ABI.
+            let kernel: MatmulI8Fn = unsafe { exec.as_fn() };
+
+            for &n in &[3usize, 16, 33, 64] {
+                let a: std::vec::Vec<i8> = (0..n * n)
+                    .map(|idx| (((idx.wrapping_mul(37).wrapping_add(11)) % 251) as i32 - 125) as i8)
+                    .collect();
+                let b: std::vec::Vec<i8> = (0..n * n)
+                    .map(|idx| (((idx.wrapping_mul(53).wrapping_add(7)) % 241) as i32 - 120) as i8)
+                    .collect();
+                let init_c: std::vec::Vec<i32> = (0..n * n)
+                    .map(|idx| ((idx.wrapping_mul(19).wrapping_add(3)) % 1009) as i32 - 500)
+                    .collect();
+                let mut got = init_c.clone();
+                let mut expected = init_c;
+
+                kernel(got.as_mut_ptr(), a.as_ptr(), b.as_ptr(), n as i64);
+
+                for i in 0..n {
+                    for j in 0..n {
+                        let mut sum = if with_zero_init { 0i32 } else { expected[i * n + j] };
+                        for k in 0..n {
+                            sum = sum.wrapping_add(i32::from(a[i * n + k]).wrapping_mul(i32::from(b[k * n + j])));
+                        }
+                        expected[i * n + j] = sum;
+                    }
+                }
+                assert_eq!(
+                    got, expected,
+                    "end-to-end Sota SME2 i8->i32 GEMM mismatch at n={n}, with_zero_init={with_zero_init}"
+                );
+            }
+        }
     }
 }
