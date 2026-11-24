@@ -117,8 +117,8 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                     DataTarget::Fn(key) => {
                         let adts = self.adts;
                         let instance = adts.const_fn_instance(key, self.ground).ok_or(BuildError::NoConstFnInstance { expr: e, key })?;
-                        self.refuse_tracked_pointer(e, instance)?;
-                        let place = self.ref_place(instance);
+                        let target = self.reify_target(instance)?;
+                        let place = self.ref_place(target);
                         self.b.reference(RefKind::Func, place)
                     }
                     DataTarget::Vtable(_) => return Err(unsupported(e, "a const holding a `&dyn Trait` (its vtable is not a reference of this function)")),

@@ -26,9 +26,12 @@
 //!   `call_once`): [`crate::Adts::def_site`] of the shim's owner. So
 //!   `Some(()).map(tracked_fn)` reports core's `ops/function.rs` at the `Fn*` method, as rustc's
 //!   build does.
-//! - **A tracked fn taken as a fn pointer**: refused by name. Its shim (rustc's `ReifyShim`),
-//!   which passes the fn's own definition site so a pointer of the ordinary signature can call
-//!   it, is not built yet.
+//! - **A tracked fn taken as a fn pointer**: points to its `ReifyShim`
+//!   ([`crate::build_reify_shim`], named by [`crate::REIFY_SHIM_ITEM`]), which has the plain fn
+//!   pointer signature (no hidden location parameter), materializes a `Location` row for the fn's
+//!   own definition site ([`crate::Adts::def_site`]), and calls the tracked fn with that location
+//!   passed last (the Reference, "The `track_caller` attribute": calling a coerced fn pointer
+//!   returns the location of the function's definition).
 //!
 //! A closure's body, drop glue and a coroutine's entries are never tracked here
 //! ([`Track::No`]): `#[track_caller]` on a closure is the unstable `closure_track_caller`,
@@ -69,8 +72,8 @@ const UNSAID_OWN: &str =
     "this fn's own `#[track_caller]` is not said (`Adts::track_caller`): `caller_location` would be its caller's place or this call's";
 const NO_SITE: &str = "the world does not say where the expression is (`Adts::caller_site`)";
 const NO_EXPR: &str = "a tracked fn called by code the build inserted with no expression to give the call's place";
-const POINTER: &str =
-    "a `#[track_caller]` fn taken as a fn pointer: its shim, which passes the fn's own definition site, is not built yet";
+const NO_REIFY_DEF_SITE: &str =
+    "a `#[track_caller]` fn taken as a fn pointer: the world does not say where the fn is defined (`Adts::def_site`), the place its reify shim passes";
 const NO_DEF_SITE: &str =
     "a `#[track_caller]` fn called through a `Fn*` shim: the world does not say where the shim's `Fn*` method is defined (`Adts::def_site`), the place the shim passes";
 const VTABLE: &str =
@@ -128,12 +131,24 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     /// the `Fn*` method's definition site, never a forwarded one (the shim is untracked).
     /// `None`: not tracked, nothing passed.
     pub(super) fn shim_caller_arg(&mut self, callee: Instance) -> Result<Option<Value>, BuildError> {
+        self.def_site_caller_arg(callee, self.body.owner, NO_DEF_SITE)
+    }
+
+    /// The location a `ReifyShim` (closure.rs `run_reify_shim`) passes to the tracked fn `callee`
+    /// it calls: a row of `callee`'s OWN definition site (`Adts::def_site(callee.item)`).
+    /// `None`: not tracked, nothing passed.
+    pub(super) fn reify_caller_arg(&mut self, callee: Instance) -> Result<Option<Value>, BuildError> {
+        self.def_site_caller_arg(callee, callee.item, NO_REIFY_DEF_SITE)
+    }
+
+    /// Shared helper for call shims (`Fn*` shim and `ReifyShim`): if `callee` is tracked, builds a
+    /// `Location` data row for `site_item`'s definition site (`Adts::def_site(site_item)`).
+    fn def_site_caller_arg(&mut self, callee: Instance, site_item: ItemKey, why: &'static str) -> Result<Option<Value>, BuildError> {
         if self.tracked(callee) != Some(true) {
             return Ok(None);
         }
-        let owner = self.body.owner;
         let adts = self.adts;
-        let site = adts.def_site(owner).map_err(|gap| BuildError::TrackCaller { expr: None, item: callee.item, why: NO_DEF_SITE, gap: Some(gap) })?;
+        let site = adts.def_site(site_item).map_err(|gap| BuildError::TrackCaller { expr: None, item: callee.item, why, gap: Some(gap) })?;
         let (loc_ty, ret) = self.location_tys(None)?;
         Ok(Some(self.location_row(None, callee.item, Site::Here(site), loc_ty, ret)?))
     }
@@ -249,20 +264,21 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         Ok((sig, vs))
     }
 
-    /// The address of fn `instance` taken as a fn pointer at `e` (a `ReifyFnPointer`
-    /// coercion, a cast of a fn item): refused for a tracked fn (module doc).
-    pub(super) fn reify_addr(&mut self, e: ExprId, instance: Instance) -> Result<Value, BuildError> {
-        self.refuse_tracked_pointer(e, instance)?;
-        Ok(self.fn_addr(instance))
+    /// The instance whose address represents `instance` as a plain fn pointer: its `ReifyShim`
+    /// when `instance` is `#[track_caller]`, else `instance` itself.
+    pub(super) fn reify_target(&mut self, instance: Instance) -> Result<Instance, BuildError> {
+        if self.tracked(instance) == Some(true) {
+            return crate::reify_shim_instance(instance, self.ground);
+        }
+        Ok(instance)
     }
 
-    /// Refuses fn `instance` as a pointer at `e` (a reify, a cast, a constant's fn relocation)
-    /// when it is tracked: a pointer call passes no location (module doc).
-    pub(super) fn refuse_tracked_pointer(&mut self, e: ExprId, instance: Instance) -> Result<(), BuildError> {
-        if self.tracked(instance) == Some(true) {
-            return Err(BuildError::TrackCaller { expr: Some(e), item: instance.item, why: POINTER, gap: None });
-        }
-        Ok(())
+    /// The address of fn `instance` taken as a fn pointer at `e` (a `ReifyFnPointer`
+    /// coercion, a cast of a fn item): its `ReifyShim`'s address when `instance` is
+    /// `#[track_caller]`, else `instance`'s own address.
+    pub(super) fn reify_addr(&mut self, _e: ExprId, instance: Instance) -> Result<Value, BuildError> {
+        let target = self.reify_target(instance)?;
+        Ok(self.fn_addr(target))
     }
 
     /// Refuses a dynamic call at `e` of trait method `instance` the world says is tracked

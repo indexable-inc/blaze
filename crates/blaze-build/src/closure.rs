@@ -638,7 +638,8 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         let me = self.take_passed(reprs[0], passes[0], &mut next)?;
         // A tracked fn item's hidden last argument: a row of this shim's `Fn*` method's
         // definition site (walk/track_caller.rs `shim_caller_arg`). A fn pointer's target is
-        // never tracked (its reify is refused for a tracked fn).
+        // never tracked directly (reifying a tracked fn points to its `ReifyShim`, which has
+        // the plain fn pointer ABI).
         let mut loc = None;
         let callee_ref = match target {
             Some(instance) => {
@@ -681,10 +682,93 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         } else {
             self.ret_value(v)?;
         }
+        self.check_lir_error()
+    }
+
+    fn check_lir_error(&self) -> Result<(), BuildError> {
         if let Some(error) = self.b.error() {
             return Err(BuildError::Lir(error.clone()));
         }
         Ok(())
+    }
+
+    /// The `ReifyShim` of a `#[track_caller]` fn `callee` at `self.args` (lib.rs
+    /// `build_reify_shim`): takes the plain fn pointer ABI (no hidden `&Location` parameter),
+    /// materializes a `Location` row for `callee`'s own definition site (`Adts::def_site`), and
+    /// calls `callee` directly with that location passed last.
+    fn run_reify_shim(&mut self, callee: ItemKey, sig: &FnSig<'_>) -> Result<(), BuildError> {
+        let sig_err = |error: TyErr| match error {
+            TyErr::Unsupported(what) => BuildError::UnsupportedSig { what },
+            TyErr::Malformed(what) => malformed(what),
+            TyErr::Other(error) => error,
+        };
+        let generics = sig.parent_count.checked_add(sig.own_count).ok_or(malformed("a generic count past u32"))?;
+        if u32::try_from(self.args.len()).ok() != Some(generics) {
+            return Err(malformed("a reify shim whose argument count is not its fn's generic count"));
+        }
+        let abi = self.adts.abi(callee).ok_or(BuildError::NoAbi { item: callee })?;
+        if abi == Abi::RustCall {
+            return Err(BuildError::UnsupportedSig { what: "a \"rust-call\" function taken as a fn pointer" });
+        }
+        let n = sig.inputs.len();
+        let mut reprs = blaze_own::Vec::with_capacity_in(n, self.alloc);
+        let mut passes = blaze_own::Vec::with_capacity_in(n, self.alloc);
+        for &t in sig.inputs.iter() {
+            let g = self.ground_in(sig.types, t).map_err(sig_err)?;
+            let repr = self.repr(g).map_err(sig_err)?;
+            let pass = self.pass(g, repr, abi, Some(callee))?;
+            reprs.push(repr);
+            passes.push(pass);
+        }
+        let output = self.ground_in(sig.types, sig.output).map_err(sig_err)?;
+        self.ret = self.repr(output).map_err(sig_err)?;
+        self.ret_pass = self.pass(output, self.ret, abi, Some(callee))?;
+        let (params, rets) = self.sig_of(&passes, self.ret_pass);
+        let own = self.b.sig(Conv::C, Variadic::No, &params, &rets);
+        self.b.set_signature(own);
+        let entry = self.create();
+        if let Some(slot) = self.reached.get_mut(entry.index()) {
+            *slot = true;
+        }
+        self.begin(entry);
+        let mut values = blaze_own::Vec::with_capacity_in(params.len(), self.alloc);
+        for p in params.iter() {
+            values.push(self.b.param(p.ty));
+        }
+        let mut next = values.iter().copied();
+        if let Pass::Ref | Pass::Memory { .. } = self.ret_pass {
+            self.sret = Some(next.next().ok_or(malformed("a result pointer without its value"))?);
+        }
+        self.scope_marks.push(0);
+        let args = self.ground.intern_list(self.args).map_err(|_| malformed("the ground table is full"))?;
+        let target = Instance { item: callee, args };
+        let loc = self.reify_caller_arg(target)?;
+        let callee_nounwind = self.adts.nounwind(callee) == Some(true);
+        let place = self.ref_place(target);
+        let callee_ref = Callee::Direct(self.b.reference(RefKind::Func, place));
+        let mut treprs = blaze_own::Vec::with_capacity_in(n + usize::from(loc.is_some()), self.alloc);
+        let mut tpasses = blaze_own::Vec::with_capacity_in(n + usize::from(loc.is_some()), self.alloc);
+        for (&repr, &pass) in reprs.iter().zip(passes.iter()) {
+            let v = self.take_passed(repr, pass, &mut next)?;
+            self.push_val(v, None);
+            treprs.push(repr);
+            tpasses.push(pass);
+        }
+        if let Some(loc) = loc {
+            self.push_val(V::Scalar(loc), None);
+            treprs.push(Repr::Ptr);
+            tpasses.push(track_caller::PASS);
+        }
+        let rrepr = self.ret;
+        let rpass = self.ret_pass;
+        self.emit_call_from(callee_ref, &treprs, &tpasses, None, callee_nounwind, rrepr, rpass)?;
+        let v = self.pop()?;
+        if let PNode::Never = self.ground_node(output).map_err(sig_err)? {
+            self.unreachable_of(TrapKind::AfterDivergingCall, None);
+        } else {
+            self.ret_value(v)?;
+        }
+        self.check_lir_error()
     }
 }
 
@@ -744,6 +828,23 @@ pub(crate) fn build_fn_shim<A: Allocator + Copy>(
     let body = empty_view(owner, checked.types.view());
     let mut w = Walk::new(&body, &checked, subst, adts, alloc);
     w.run_fn_shim(callee, tuple, which, sig)?;
+    w.into_built()
+}
+
+/// Builds the `ReifyShim` of `#[track_caller]` fn `callee` (lib.rs `build_reify_shim`,
+/// `Walk::run_reify_shim`). Its walk is given an empty body named by `callee` and an empty check
+/// record: neither is read.
+pub(crate) fn build_reify_shim<A: Allocator + Copy>(
+    callee: ItemKey,
+    sig: &FnSig<'_>,
+    subst: &mut Subst<'_, '_>,
+    adts: &dyn Adts,
+    alloc: A,
+) -> Result<Built<A>, BuildError> {
+    let checked = empty_record(subst.scratch);
+    let body = empty_view(callee, checked.types.view());
+    let mut w = Walk::new(&body, &checked, subst, adts, alloc);
+    w.run_reify_shim(callee, sig)?;
     w.into_built()
 }
 

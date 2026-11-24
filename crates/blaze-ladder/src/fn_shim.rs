@@ -76,6 +76,9 @@ pub(crate) fn fn_shim_owner<P: FrontEnd>(program: &P, adts: &dyn Adts, called: I
 /// makes a ctor's row by `head_row`).
 pub(crate) fn untabled_owner<P: FrontEnd>(program: &P, adts: &dyn Adts, called: Instance, ground: &PortableTys<'_>) -> Option<Instance> {
     let view = ground.view();
+    if let Some(target) = blaze_build::reify_shim_of(called, view) {
+        return program.fn_index(target.item).is_none().then_some(target);
+    }
     let &first = view.list(called.args).ok()?.first()?;
     if !METHODS.into_iter().any(|w| adts.fn_trait_method(w) == Some(called.item)) {
         return None;
