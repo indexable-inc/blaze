@@ -66,9 +66,10 @@ fn answer(cx: &Cx, conn: &Conn, root: &Dir<ReadWrite>, lies: bool) -> Result<(),
         Some(whole) => {
             let end = (last + 1).min(whole.len() as u64);
             let mut body = whole[first as usize..end as usize].to_vec();
-            // Past the 128-byte header: a payload's byte (blaze-cas `HEADER`).
-            if lies && name.rsplit('/').next().is_some_and(|it| it.starts_with("seg-")) && body.len() > 200 {
-                body[200] ^= 0x5a;
+            // Flip a byte inside every `segz-` wire segment reply.
+            if lies && name.rsplit('/').next().is_some_and(|it| it.starts_with("segz-")) && !body.is_empty() {
+                let at = body.len() - 1;
+                body[at] ^= 0x5a;
             }
             let mut wire = format!(
                 "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {first}-{}/{}\r\nContent-Length: {}\r\n\r\n",
@@ -178,6 +179,6 @@ fn a_server_that_flips_a_payload_byte_is_refused_and_nothing_is_rooted() {
     let cx = world.io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("a root context");
     let (_c, lent) = developer_home(&world.io, &cx, "/c", 7);
     let (taken, _) = over_http(&world, &cx, &lent, true);
-    assert!(matches!(taken, Err(TakeError::Segment { why: SegmentWhy::Check(_), .. })), "a liar's segment: {taken:?}");
+    assert!(matches!(taken, Err(TakeError::Segment { why: SegmentWhy::Check(_) | SegmentWhy::Wire(_), .. })), "a liar's segment: {taken:?}");
     assert!(!rooted(&lent), "a liar's set was rooted");
 }

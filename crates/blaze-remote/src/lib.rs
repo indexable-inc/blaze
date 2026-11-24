@@ -128,6 +128,7 @@ pub mod settings;
 pub mod shard;
 pub mod trust;
 mod wire;
+pub mod wire_segment;
 
 #[cfg(all(test, feature = "sign"))]
 mod fake;

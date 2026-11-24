@@ -214,10 +214,12 @@ crates/blaze-protocol/src/lib.rs	SCHEMA	not persisted: the protocol's messages
 crates/blaze-record/src/list.rs	LAYOUT	none
 crates/blaze-remote/src/http3.rs	TICKETS_LAYOUT	none
 crates/blaze-remote/src/http3.rs	TICKETS_MAGIC	none
-crates/blaze-remote/src/read/form.rs	FORMAT	none
+crates/blaze-remote/src/read/form.rs	FORMAT	test previous_format_is_refused
 crates/blaze-remote/src/read/form.rs	HEAD_MAGIC	none
 crates/blaze-remote/src/read/form.rs	MANIFEST_MAGIC	none
 crates/blaze-remote/src/read/form.rs	SUMMARY_MAGIC	none
+crates/blaze-remote/src/wire_segment.rs	MAGIC	test previous_magic_and_version_are_refused
+crates/blaze-remote/src/wire_segment.rs	VERSION	test previous_magic_and_version_are_refused
 crates/blaze-run/src/head.rs	MAGIC	none
 crates/blaze-run/src/head.rs	VERSION	none
 crates/blaze-run/src/judge.rs	MAGIC	none

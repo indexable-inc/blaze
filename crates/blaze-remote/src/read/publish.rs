@@ -12,6 +12,7 @@ use blaze_own::{Alloc, Vec};
 
 use super::form::{self, Head, Object, PAGE_ENTRIES_MOST, REMOTE_ENTRY, Row};
 use crate::trust::Signer;
+use crate::wire_segment::{self, WireSegmentError};
 
 /// Why segments were not sealed into an origin's objects: each names the segment.
 #[derive(Debug)]
@@ -20,6 +21,8 @@ pub enum PublishError {
     Segment(StoreError),
     Namespace { segment: ContentId, found: Namespace, wanted: Namespace },
     Entry { segment: ContentId, index: u32, what: &'static str },
+    /// Encoding the `BZS1` wire segment failed.
+    Wire { segment: ContentId, error: WireSegmentError },
     TooMany { segments: u64 },
     /// The prefix would be past what any reader takes (`form::PREFIX_MOST`).
     PrefixTooLarge { len: u64 },
@@ -38,6 +41,7 @@ impl core::fmt::Display for PublishError {
             PublishError::Segment(error) => write!(f, "{error}"),
             PublishError::Namespace { segment, found, wanted } => write!(f, "segment {}: of namespace {:#x}, not {:#x}", hex(segment), found.0, wanted.0),
             PublishError::Entry { segment, index, what } => write!(f, "segment {}, entry {index}: {what}", hex(segment)),
+            PublishError::Wire { segment, error } => write!(f, "segment {} wire encode: {error}", hex(segment)),
             PublishError::TooMany { segments } => write!(f, "{segments} segments, past the {} a manifest names", form::ROWS_MOST),
             PublishError::PrefixTooLarge { len } => write!(f, "a prefix of {len} bytes, past the {} a reader takes", form::PREFIX_MOST),
         }
@@ -74,6 +78,7 @@ pub fn publish_bound<'a>(
     assert!((1..=PAGE_ENTRIES_MOST).contains(&page_entries), "entries a page is 1..={PAGE_ENTRIES_MOST}");
     let mut out: Vec<Sealed<'a>, Alloc<'a>> = Vec::new_in(alloc);
     let mut rows: Vec<Row, Alloc<'_>> = Vec::new_in(alloc);
+    let mut wire_encoder = wire_segment::WireSegmentEncoder::new_in(alloc);
     for &bytes in segments {
         let described = check_segment(bytes)?;
         if described.namespace != namespace {
@@ -103,6 +108,8 @@ pub fn publish_bound<'a>(
         }
         let mut summary = Vec::new_in(alloc);
         form::encode_summary(described.digest, &keys, page_entries, &digests, &mut summary);
+        let mut wire = Vec::new_in(alloc);
+        wire_encoder.encode(bytes, &mut wire).map_err(|error| PublishError::Wire { segment: described.digest, error })?;
         rows.push(Row {
             segment: described.digest,
             len: bytes.len() as u64,
@@ -112,10 +119,12 @@ pub fn publish_bound<'a>(
             page_entries,
             summary: ContentId::of(form::SUMMARY_DOMAIN, &summary),
             summary_len: summary.len() as u64,
+            wire_len: u64::try_from(wire.len()).unwrap_or(u64::MAX),
         });
         let mut whole = Vec::with_capacity_in(bytes.len(), alloc);
         whole.extend_from_slice(bytes);
         out.push(Sealed { object: Object::Segment(described.digest), bytes: whole });
+        out.push(Sealed { object: Object::SegmentWire(described.digest), bytes: wire });
         out.push(Sealed { object: Object::Index(described.digest), bytes: index });
         out.push(Sealed { object: Object::Summary(described.digest), bytes: summary });
     }

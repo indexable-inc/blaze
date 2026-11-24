@@ -11,9 +11,13 @@
 //! - `manifest-<digest>`: `BLRM`, format u32, namespace u64, rows u32, zero u32, generation
 //!   u64, then rows of [`ROW`] bytes, sorted by segment digest, each segment once: segment
 //!   digest 32, segment length u64, index offset u64, records u32, pages u32, entries a page
-//!   u32, zero u32, summary digest 32, summary length u64. Its digest is the head's.
+//!   u32, zero u32, summary digest 32, summary length u64, wire length u64. Its digest is the
+//!   head's.
 //! - `seg-<digest>`: the plain store's segment, byte for byte (blaze-cas `seal_segment`): the
 //!   payloads are read from it by range, in place.
+//! - `segz-<digest>`: the `BZS1` OpenZL-style structured columnar wire encoding of
+//!   `seg-<digest>` ([`crate::wire_segment`]): fetched whole in one GET by fresh homes taking a
+//!   published set.
 //! - `sum-<segment digest>`: `BLRF`, format u32, segment digest 32, records u32, pages u32,
 //!   entries a page u32, filter length u32, zero u64; the segment's [`Fuse8`] over its keys'
 //!   first eight bytes; zeros to 8; then per index page its first key (32) and its digest (32).
@@ -38,9 +42,12 @@ use blaze_own::{Alloc, Vec};
 
 use crate::trust::PublicKey;
 use crate::wire::{id_at, key_at, sig_at, u32_at, u64_at};
+use crate::wire_segment::{WIRE_MIN_LEN, WIRE_MOST};
 
 /// The read path's own objects' format.
-pub const FORMAT: u32 = 1;
+/// Format 1 had 104-byte manifest rows without `wire_len`; format 2 adds `wire_len: u64` (112
+/// bytes) naming the `BZS1` `segz-<digest>` object length for single-GET whole-set downloads.
+pub const FORMAT: u32 = 2;
 pub const HEAD_LEN: usize = 160;
 /// The bytes of a head its signature covers.
 pub const HEAD_SIGNED: usize = 96;
@@ -52,7 +59,7 @@ const HEAD_MAGIC: [u8; 4] = *b"BLRH";
 const MANIFEST_MAGIC: [u8; 4] = *b"BLRM";
 const SUMMARY_MAGIC: [u8; 4] = *b"BLRF";
 pub const MANIFEST_HEADER: usize = 32;
-pub const ROW: usize = 104;
+pub const ROW: usize = 112;
 /// Segments one manifest names at most: a manifest is then at most 416 KiB.
 pub const ROWS_MOST: u32 = 4096;
 pub const MANIFEST_MOST: u64 = (MANIFEST_HEADER + ROW * ROWS_MOST as usize) as u64;
@@ -80,6 +87,8 @@ pub enum Object {
     Prefix,
     Manifest(ContentId),
     Segment(ContentId),
+    /// `BZS1` columnar wire encoding of [`Object::Segment`]: fetched whole in one GET.
+    SegmentWire(ContentId),
     Summary(ContentId),
     Index(ContentId),
 }
@@ -114,6 +123,7 @@ impl Object {
             Object::Prefix => (b"prefix", None),
             Object::Manifest(id) => (b"manifest-", Some(id)),
             Object::Segment(id) => (b"seg-", Some(id)),
+            Object::SegmentWire(id) => (b"segz-", Some(id)),
             Object::Summary(id) => (b"sum-", Some(id)),
             Object::Index(id) => (b"idx-", Some(id)),
         };
@@ -139,6 +149,7 @@ impl fmt::Display for Object {
             Object::Head => 4,
             Object::Prefix => 6,
             Object::Manifest(_) => 9 + 12,
+            Object::SegmentWire(_) => 5 + 12,
             Object::Segment(_) | Object::Summary(_) | Object::Index(_) => 4 + 12,
         })])
     }
@@ -291,6 +302,8 @@ pub struct Row {
     pub page_entries: u32,
     pub summary: ContentId,
     pub summary_len: u64,
+    /// Byte length of the `BZS1` wire object (`segz-<segment>`).
+    pub wire_len: u64,
 }
 
 impl Row {
@@ -310,6 +323,7 @@ impl Row {
         out.extend_from_slice(&0u32.to_le_bytes());
         out.extend_from_slice(&self.summary.0);
         out.extend_from_slice(&self.summary_len.to_le_bytes());
+        out.extend_from_slice(&self.wire_len.to_le_bytes());
     }
 
     /// The row at `bytes[..ROW]`, every field held to what a sealed segment can be.
@@ -324,12 +338,16 @@ impl Row {
             page_entries: u32_at(bytes, 56),
             summary: id_at(bytes, 64),
             summary_len: u64_at(bytes, 96),
+            wire_len: u64_at(bytes, 104),
         };
         if u32_at(bytes, 60) != 0 {
             return Err(bad("a row's reserved word is not zero"));
         }
         if row.len > SEGMENT_MOST || row.len < (HEADER + FOOTER) as u64 {
             return Err(Refused::TooLarge { object, what: "a segment's length", len: row.len, most: SEGMENT_MOST });
+        }
+        if row.wire_len > WIRE_MOST || row.wire_len < WIRE_MIN_LEN {
+            return Err(Refused::TooLarge { object, what: "a wire segment's length", len: row.wire_len, most: WIRE_MOST });
         }
         if row.count > COUNT_MOST {
             return Err(Refused::TooLarge { object, what: "a segment's records", len: u64::from(row.count), most: u64::from(COUNT_MOST) });

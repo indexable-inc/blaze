@@ -157,18 +157,18 @@ pub fn write_rank(object: &Object) -> u8 {
     match object {
         Object::Head => 2,
         Object::Prefix => 1,
-        Object::Manifest(_) | Object::Segment(_) | Object::Summary(_) | Object::Index(_) => 0,
+        Object::Manifest(_) | Object::Segment(_) | Object::SegmentWire(_) | Object::Summary(_) | Object::Index(_) => 0,
     }
 }
 
 /// Whether `name` is one an object of a set may have: `head`, `prefix`, or `manifest-`, `seg-`,
-/// `sum-` or `idx-` and 64 lowercase hex digits. Every [`Object::name`] is; nothing else is, so
-/// no name a reader or writer uses can leave the set's folder.
+/// `segz-`, `sum-` or `idx-` and 64 lowercase hex digits. Every [`Object::name`] is; nothing else
+/// is, so no name a reader or writer uses can leave the set's folder.
 pub fn is_object_name(name: &str) -> bool {
     if name == "head" || name == "prefix" {
         return true;
     }
-    let digest = ["manifest-", "seg-", "sum-", "idx-"].iter().find_map(|prefix| name.strip_prefix(prefix));
+    let digest = ["manifest-", "segz-", "seg-", "sum-", "idx-"].iter().find_map(|prefix| name.strip_prefix(prefix));
     match digest {
         Some(hex) => hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
         None => false,
@@ -198,13 +198,13 @@ mod tests {
     #[test]
     fn every_object_name_is_a_digest_name_and_nothing_else_is() {
         let id = ContentId([0xab; 32]);
-        for object in [Object::Head, Object::Prefix, Object::Manifest(id), Object::Segment(id), Object::Summary(id), Object::Index(id)] {
+        for object in [Object::Head, Object::Prefix, Object::Manifest(id), Object::Segment(id), Object::SegmentWire(id), Object::Summary(id), Object::Index(id)] {
             let name = object.name();
             assert!(is_object_name(name.as_str()), "{} is not a set's object name", name.as_str());
         }
-        for bad in ["", "heads", "seg-", "seg-../../etc", "../head", "seg-ABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABAB"] {
+        for bad in ["", "heads", "seg-", "segz-", "seg-../../etc", "../head", "seg-ABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABAB"] {
             assert!(!is_object_name(bad), "{bad:?} taken as an object's name");
         }
-        assert_eq!((write_rank(&Object::Segment(id)), write_rank(&Object::Prefix), write_rank(&Object::Head)), (0, 1, 2));
+        assert_eq!((write_rank(&Object::Segment(id)), write_rank(&Object::SegmentWire(id)), write_rank(&Object::Prefix), write_rank(&Object::Head)), (0, 0, 1, 2));
     }
 }

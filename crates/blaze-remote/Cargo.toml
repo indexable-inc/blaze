@@ -37,6 +37,8 @@ blaze-http = { workspace = true, optional = true }
 blaze-core = { workspace = true, optional = true }
 # The allocator as a value (`Alloc<'_>`) and the owning types the read path keeps its tables in.
 blaze-own.workspace = true
+# Pure `#![no_std]` RFC 8878 Zstandard for the `BZS1` structured segment wire format.
+blaze-zstd.workspace = true
 # Settings and the commands' typed input.
 blaze-data.workspace = true
 blaze-json.workspace = true
@@ -59,6 +61,7 @@ required-features = ["sign"]
 
 [dev-dependencies]
 # An independent SHA-256 for the SigV4 test's own HMAC chain (the signer uses `ring`'s).
+blaze-own = { workspace = true, features = ["testing"] }
 blaze-sha256.workspace = true
 blaze-sim.workspace = true
 

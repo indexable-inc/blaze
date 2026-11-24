@@ -86,7 +86,7 @@ crates/blaze-queue	0	crates/blaze-check,crates/blaze-own,crates/blaze-spin
 crates/blaze-radix	0	-
 crates/blaze-reclaim	0	crates/blaze-check
 crates/blaze-record	0	crates/blaze-ids
-crates/blaze-remote	1	crates/blaze-cas,crates/blaze-core,crates/blaze-data,crates/blaze-ed25519,crates/blaze-format,crates/blaze-http,crates/blaze-ids,crates/blaze-json,crates/blaze-keyed,crates/blaze-own
+crates/blaze-remote	1	crates/blaze-cas,crates/blaze-core,crates/blaze-data,crates/blaze-ed25519,crates/blaze-format,crates/blaze-http,crates/blaze-ids,crates/blaze-json,crates/blaze-keyed,crates/blaze-own,crates/blaze-zstd
 crates/blaze-report	2	crates/blaze-data,crates/blaze-lex,crates/blaze-own,crates/blaze-text,crates/blaze-toml,crates/blaze-unicode
 crates/blaze-resolve	3	crates/blaze-core,crates/blaze-hash,crates/blaze-ids,crates/blaze-own,crates/blaze-semver,crates/blaze-source,crates/blaze-toml,crates/blaze-trace,crates/blaze-unicode,crates/stdx
 crates/blaze-rng	0	-
