@@ -34,7 +34,7 @@ use super::{C, Cc, Code, Kind, Op};
 use crate::ConstWorld;
 use crate::layout::Layout;
 
-impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine<'w, 'l, 'g, 't, 'wk, 'a, W, L, K> {
+impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Machine<'w, 'l, 'g, 't, 'wk, 'a, W, L, K> {
     /// Whether `if` condition `cond` is compiled by links: a `let`, or an `&&` chain.
     pub(super) fn cond_by_links(&self, cc: &Cc<'w, '_>, cond: ExprId) -> R<'a, bool> {
         Ok(matches!(self.expr_c(cc, cond)?, Expr::Let { .. } | Expr::Binary { op: BinOp::And, .. }))

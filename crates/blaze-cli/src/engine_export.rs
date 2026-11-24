@@ -804,6 +804,22 @@ fn export_program<'f>(
                     export_bump,
                     heap,
                 )?;
+                statics::each_vtable_datum(
+                    entry_bytes,
+                    |vtable_sym, datum_bytes| {
+                        push_datum(
+                            &mut data,
+                            &mut seen_data,
+                            &mut tls_count,
+                            Target { space: Space::Vtable, symbol: vtable_sym },
+                            datum_bytes,
+                            frame,
+                            export_bump,
+                            heap,
+                        )
+                    },
+                    |why| box_err(ExportCliError::Decode { symbol: symbol.0, what: "vtable entry", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap),
+                )?;
             }
             RowKind::ThreadLocal => {
                 push_datum(
@@ -815,6 +831,22 @@ fn export_program<'f>(
                     frame,
                     export_bump,
                     heap,
+                )?;
+                statics::each_vtable_datum(
+                    entry_bytes,
+                    |vtable_sym, datum_bytes| {
+                        push_datum(
+                            &mut data,
+                            &mut seen_data,
+                            &mut tls_count,
+                            Target { space: Space::Vtable, symbol: vtable_sym },
+                            datum_bytes,
+                            frame,
+                            export_bump,
+                            heap,
+                        )
+                    },
+                    |why| box_err(ExportCliError::Decode { symbol: symbol.0, what: "vtable entry", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap),
                 )?;
             }
         }

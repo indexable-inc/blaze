@@ -767,6 +767,20 @@ impl<'n> Consts<'n> {
         Some(blaze_build::Instance { item: named.instance.item, args })
     }
 
+    /// The vtable reference that key `key` names in a record this evaluator made (blaze-consteval
+    /// `ConstRecord::vtables`), its concrete type and trait arguments copied from this evaluator's
+    /// ground table into `ground`: the seam's `FrontEnd::const_vtable_ref`.
+    pub fn vtable_ref(&self, key: blaze_build::vtable::VtableKey, ground: &mut PortableTys<'_>, scratch: Alloc<'_>) -> Option<blaze_build::vtable::VtableRef> {
+        let named = self.records.iter().find_map(|r| r.record.vtable_named(key))?;
+        let (unit, _, _) = self.unit.as_ref()?;
+        let from = unit.view();
+        let concrete_list = super::const_at::copy_ground(from, &[named.vtable.concrete], ground, scratch).ok()?;
+        let concrete = *ground.view().list(concrete_list).ok()?.first()?;
+        let args = from.list(named.vtable.args).ok()?;
+        let args = super::const_at::copy_ground(from, args, ground, scratch).ok()?;
+        Some(blaze_build::vtable::VtableRef { concrete, principal: named.vtable.principal, args })
+    }
+
     /// `args` (types of `from`, all ground) copied into this evaluator's own type table, as
     /// one list of it.
     /// `alloc` is the store's: the unit's tables are kept with the evaluator.

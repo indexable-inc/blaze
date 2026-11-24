@@ -466,6 +466,22 @@ impl MakerState {
         kind: StaticItem,
         template: bool,
     ) -> Result<AVec<'static, u8>, crate::code_records::statics::StaticRecordError> {
+        self.static_entry_with_vtables(program, value, kind, template, &[], &[], &[])
+    }
+
+    /// [`Self::static_entry`] carrying the resolved vtable symbols, declared instances and datums
+    /// built for any `DataTarget::Vtable` words in `value`.
+    #[allow(clippy::too_many_arguments)]
+    fn static_entry_with_vtables<P: FrontEnd>(
+        &mut self,
+        program: &P,
+        value: &crate::seam::SeamData,
+        kind: StaticItem,
+        template: bool,
+        vtable_syms: &[(blaze_build::vtable::VtableKey, blaze_code::record::Symbol)],
+        extra_declared: &[Declared<'_>],
+        carried_vtables: &[VtableDatum<'_>],
+    ) -> Result<AVec<'static, u8>, crate::code_records::statics::StaticRecordError> {
         use crate::code_records::statics::{make_static_entry_with_targets, make_template_entry_with_targets};
 
         let alloc = self.work.alloc;
@@ -483,10 +499,11 @@ impl MakerState {
             encode_instance(instance.item, instance.args, view, alloc, &mut name)?;
             Ok(Some((tabled, name)))
         };
+        let vtable_target = |key| Ok(vtable_syms.iter().find(|&&(k, _)| k == key).map(|&(_, sym)| sym));
         if template {
-            make_template_entry_with_targets(value, kind, fn_target, alloc)
+            make_template_entry_with_targets(value, kind, fn_target, vtable_target, extra_declared, carried_vtables, alloc)
         } else {
-            make_static_entry_with_targets(value, kind, fn_target, alloc)
+            make_static_entry_with_targets(value, kind, fn_target, vtable_target, extra_declared, carried_vtables, alloc)
         }
     }
 
@@ -1614,7 +1631,23 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
     // not this one's, so a vtable's size read through it would be in no read list.
     let mut layouts: Layouts<Alloc<'static>> = Layouts::new_in(work.alloc);
     for &want in built.vtables.iter() {
-        vtable_rows(program, &asking, &mut work.ground, &mut layouts, work.alloc, &mut reach, i, instance.args, want, &mut untabled, &mut vtable_data)?;
+        vtable_rows(
+            program,
+            &asking,
+            &mut work.ground,
+            &mut layouts,
+            work.alloc,
+            &mut reach,
+            i,
+            instance.args,
+            want,
+            &mut |k, e| {
+                if !untabled.iter().any(|(x, _)| *x == k) {
+                    untabled.push((k, e));
+                }
+            },
+            &mut vtable_data,
+        )?;
     }
     // Every untabled callee of this build at once (its calls' and its vtables' words): checked,
     // then the instance made again.
@@ -1670,7 +1703,11 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
 fn build_refusal<P: FrontEnd>(program: &P, function: Named, body: Option<&blaze_lower::typeck::TypeckBody<'static>>, error: BuildError) -> RunError {
     let ranges = |all: &[blaze_typeck::Range], i: u32| all.get(i as usize).copied();
     let range = match error {
-        BuildError::Unsupported { expr, .. } | BuildError::UnsupportedType { expr, .. } | BuildError::NoConstBlockValue { expr, .. } | BuildError::NoConstFnInstance { expr, .. } => {
+        BuildError::Unsupported { expr, .. }
+        | BuildError::UnsupportedType { expr, .. }
+        | BuildError::NoConstBlockValue { expr, .. }
+        | BuildError::NoConstFnInstance { expr, .. }
+        | BuildError::NoConstVtable { expr, .. } => {
             body.and_then(|body| ranges(&body.expr_ranges, expr.0))
         }
         BuildError::UnsupportedPat { pat, .. } => body.and_then(|body| ranges(&body.pat_ranges, pat.0)),
@@ -1882,7 +1919,7 @@ fn vtable_rows<P: FrontEnd>(
     i: usize,
     at: List,
     want: VtableRef,
-    untabled: &mut Vec<(ItemKey, RunError), Global>,
+    on_untabled: &mut impl FnMut(ItemKey, RunError),
     data: &mut AVec<'_, (blaze_code::record::Symbol, AVec<'static, u8>)>,
 ) -> Result<(), RunError> {
     let world = asking.world();
@@ -1968,10 +2005,8 @@ fn vtable_rows<P: FrontEnd>(
             // A `dyn Fn*` made from a fn item (or a closure) whose item no row tables yet: as
             // `name_ref`'s, checked and the instance made again (fn_shim.rs `untabled_owner`).
             if let Some(owner) = crate::fn_shim::untabled_owner(program, adts, f, ground) {
-                if !untabled.iter().any(|(k, _)| *k == owner.item) {
-                    let refusal = callee_refusal(program, name(), at, owner, crate::callee_shown::CalleeGap::VtableWord, ground.view());
-                    untabled.push((owner.item, refusal));
-                }
+                let refusal = callee_refusal(program, name(), at, owner, crate::callee_shown::CalleeGap::VtableWord, ground.view());
+                on_untabled(owner.item, refusal);
                 whole = false;
                 continue;
             }
@@ -1984,9 +2019,7 @@ fn vtable_rows<P: FrontEnd>(
             };
             let refusal = || callee_refusal(program, name(), at, Instance { item, args }, crate::callee_shown::CalleeGap::VtableWord, ground.view());
             let Some(c) = program.fn_index(item) else {
-                if !untabled.iter().any(|(k, _)| *k == item) {
-                    untabled.push((item, refusal()));
-                }
+                on_untabled(item, refusal());
                 whole = false;
                 continue;
             };
@@ -2266,8 +2299,126 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
             return Err(RunError::OneBody { key: item, why: "the maker's program was not made (make_one.rs `Maker::make_static`)" });
         };
         let kind = program.make_static_value(item).map_err(|e| RunError::Front2(Front2Refusal::Lazy(e)))?;
+        let alloc = state.work.alloc;
+        let mut vtable_keys: AVec<'_, blaze_build::vtable::VtableKey> = blaze_own::Vec::new_in(alloc);
+        {
+            let value = program.static_value(item).map_err(|e| RunError::Front2(Front2Refusal::Lazy(e)))?;
+            for a in value.allocs.iter() {
+                for r in a.relocs.iter() {
+                    if let blaze_build::data::DataTarget::Vtable(key) = r.target
+                        && vtable_keys.scan_for(&key).is_none()
+                    {
+                        vtable_keys.push(key);
+                    }
+                }
+            }
+        }
+        if vtable_keys.is_empty() {
+            let value = program.static_value(item).map_err(|e| RunError::Front2(Front2Refusal::Lazy(e)))?;
+            let made = match state.static_entry(program, value, kind, template) {
+                Ok(made) => made,
+                Err(error) => return Err(RunError::StaticRecord { static_: program.static_shown(item), error }),
+            };
+            entry.extend_from_slice(&made);
+            return Ok(());
+        }
+        // Resolve each vtable key the static names and build its datum(s) + declared method rows,
+        // retrying missing object traits, lazy impl fills, and untabled method bodies as `make_instance` does.
+        let mut resolved: AVec<'_, (blaze_build::vtable::VtableKey, VtableRef)> = blaze_own::Vec::with_capacity_in(vtable_keys.len(), alloc);
+        for key in vtable_keys {
+            if let Some(vtable) = program.const_vtable_ref(key, &mut state.work.ground, alloc) {
+                program.object_table(vtable.principal)?;
+                resolved.push((key, vtable));
+            }
+        }
+        let mut vtable_syms: AVec<'_, (blaze_build::vtable::VtableKey, blaze_code::record::Symbol)> = blaze_own::Vec::with_capacity_in(resolved.len(), alloc);
+        for &(key, vtable) in resolved.iter() {
+            let sym = vtable_symbol(vtable, state.work.ground.view(), alloc)
+                .map_err(|error| RunError::StaticRecord { static_: program.static_shown(item), error: crate::code_records::statics::StaticRecordError::VtableName { alloc: 0, at: 0, error } })?;
+            vtable_syms.push((key, sym));
+        }
+        let mut reach = Reach::new_in(alloc);
+        let mut vtable_data: AVec<'_, (blaze_code::record::Symbol, AVec<'static, u8>)> = blaze_own::Vec::new_in(alloc);
+        if !resolved.is_empty() && program.fn_count() > 0 {
+            let mut asked = 0u32;
+            let mut owners = 0usize;
+            loop {
+                reach = Reach::new_in(alloc);
+                vtable_data.clear();
+                let mut untabled: AVec<'_, (ItemKey, RunError)> = blaze_own::Vec::new_in(alloc);
+                let step = {
+                    let MakerState { checked, tables, work, .. } = &mut *state;
+                    let t = tables.take().ok_or_else(|| tables_gone(item))?;
+                    let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow, ub: work.ub, panic: work.panic, alloc: work.alloc };
+                    work.reads.clear();
+                    let asking = Asking::new(&*program, 0, &work.langs, &bodies, &work.reads);
+                    let mut layouts: Layouts<Alloc<'static>> = Layouts::new_in(alloc);
+                    let mut res = Ok(());
+                    for &(_, want) in resolved.iter() {
+                        if let Err(e) = vtable_rows(
+                            &*program,
+                            &asking,
+                            &mut work.ground,
+                            &mut layouts,
+                            alloc,
+                            &mut reach,
+                            0,
+                            List::EMPTY,
+                            want,
+                            &mut |k, e| {
+                                if !untabled.iter().any(|(x, _)| *x == k) {
+                                    untabled.push((k, e));
+                                }
+                            },
+                            &mut vtable_data,
+                        ) {
+                            res = Err(e);
+                            break;
+                        }
+                    }
+                    *tables = Some(Tables { closures: bodies.closures, coroutines: bodies.coroutines, const_at: bodies.const_at });
+                    res
+                };
+                match step {
+                    Err(e) if asks_again(&e) && asked < crate::front2::check::MOST_ROUNDS => {
+                        asked += 1;
+                        if program.make_asked(0)? {
+                            continue;
+                        }
+                        return Err(e);
+                    }
+                    Err(e) if let Some(t) = object_missing(&e) && asked < crate::front2::check::MOST_ROUNDS => {
+                        asked += 1;
+                        if program.object_table(t)? {
+                            continue;
+                        }
+                        return Err(e);
+                    }
+                    Err(e) => return Err(e),
+                    Ok(()) if !untabled.is_empty() => {
+                        for (key, refusal) in untabled {
+                            owners += 1;
+                            if owners > MOST_HELD_COROUTINES || state.asked.binary_search_by_key(&key, |r| r.0).is_ok() {
+                                return Err(refusal);
+                            }
+                            state.ensure(program, &mut self.typing, key, &mut self.checks)?;
+                        }
+                    }
+                    Ok(()) => break,
+                }
+            }
+        }
+        let mut extra_declared: AVec<'_, Declared<'_>> = blaze_own::Vec::with_capacity_in(reach.rows.len(), alloc);
+        for n in 0..reach.rows.len() {
+            let (tabled, name_bytes) = reach.row(n);
+            extra_declared.push(Declared { tabled, name: name_bytes });
+        }
+        let mut carried: AVec<'_, VtableDatum<'_>> = blaze_own::Vec::with_capacity_in(vtable_data.len(), alloc);
+        for (symbol, datum) in vtable_data.iter() {
+            carried.push(VtableDatum { symbol: *symbol, datum: datum.as_slice() });
+        }
         let value = program.static_value(item).map_err(|e| RunError::Front2(Front2Refusal::Lazy(e)))?;
-        let made = match state.static_entry(program, value, kind, template) {
+        let made = match state.static_entry_with_vtables(program, value, kind, template, &vtable_syms, &extra_declared, &carried) {
             Ok(made) => made,
             Err(error) => return Err(RunError::StaticRecord { static_: program.static_shown(item), error }),
         };

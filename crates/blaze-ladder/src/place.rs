@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use blaze_build::InstanceKey;
 use blaze_build::data::{DataError, StaticImage};
+use blaze_build::vtable::VtableKey;
 use blaze_emit::{Code, Fixup, Reloc, RelocTo, Routine};
 use blaze_typeck::ItemKey;
 use blaze_launch::wire::{self, List, RecordId};
@@ -263,6 +264,9 @@ impl core::fmt::Display for PlaceError {
             PlaceError::NoEntry { slot } => write!(f, "the entry's slot {slot} holds no code after the commit"),
             PlaceError::Statics(DataError::NoFn { key }) => {
                 write!(f, "a static points to fn instance {:?}, which the build gave no slot (run.rs `static_fn_slots`)", key.0)
+            }
+            PlaceError::Statics(DataError::NoVtable { key }) => {
+                write!(f, "a static points to vtable {:?}, which the build placed no table for", key.0)
             }
             PlaceError::Statics(error) => write!(f, "the static image: {error:?}"),
             PlaceError::NoMemory { bytes } => write!(f, "no memory for the {bytes}-byte static image"),
@@ -521,8 +525,16 @@ pub fn load_statics(image: &StaticImage<Global>) -> Result<u64, PlaceError> {
 }
 
 /// Writes `image` at `base` (from [`load_statics`]), each fn word the entry thunk of the slot
-/// `fns` gives its instance (`fns` sorted by key), from `place`'s declared slots.
-fn write_statics(image: &StaticImage<Global>, base: u64, fns: &[(InstanceKey, u32)], place: Place) -> Result<(), PlaceError> {
+/// `fns` gives its instance (`fns` sorted by key) and each vtable word the address of the table
+/// `static_vtables` gives its key (`static_vtables` sorted by key), from `place`'s declared slots.
+fn write_statics(
+    image: &StaticImage<Global>,
+    base: u64,
+    fns: &[(InstanceKey, u32)],
+    static_vtables: &[(VtableKey, u32)],
+    vtables: &mut Vtables<'_>,
+    place: Place,
+) -> Result<(), PlaceError> {
     // SAFETY: `base` is `load_statics`' allocation of at least `image.bytes.len()` bytes for
     // this image, never freed, and no Rust reference to it is alive (the placed code has not
     // run: the commit comes after this); `fill` writes exactly `image.bytes.len()` of them.
@@ -531,7 +543,12 @@ fn write_statics(image: &StaticImage<Global>, base: u64, fns: &[(InstanceKey, u3
         let at = fns.binary_search_by_key(&key, |f| f.0).ok()?;
         place.thunk(Slot(fns[at].1))
     };
-    image.fill(base, out, fn_at).map_err(PlaceError::Statics)
+    let vtable_at = |key: VtableKey| {
+        let at = static_vtables.binary_search_by_key(&key, |v| v.0).ok()?;
+        let &(_, slot) = static_vtables.get(at)?;
+        vtables.address(slot, place).ok()
+    };
+    image.fill(base, out, fn_at, vtable_at).map_err(PlaceError::Statics)
 }
 
 
@@ -543,7 +560,8 @@ pub fn record_id(code: &Code<Global>) -> RecordId {
 
 /// Places `bodies`, body `n` in slot `n`, in one edit. `image` is the program's statics and the
 /// memory reserved for them ([`load_statics`]), written here once the slots are declared, each
-/// fn pointer in it the thunk of the slot `static_fns` gives its instance (sorted by key);
+/// fn pointer in it the thunk of the slot `static_fns` gives its instance (sorted by key) and
+/// each vtable pointer the table `static_vtables` gives its key (sorted by key);
 /// `tls` is what thread-local words name. `said` is each stub's refusal in words, by stub
 /// number (crate::stub; empty for a program with none).
 pub fn place(
@@ -551,11 +569,12 @@ pub fn place(
     vtables: &[VtableImage],
     image: Option<(&StaticImage<Global>, u64)>,
     static_fns: &[(InstanceKey, u32)],
+    static_vtables: &[(VtableKey, u32)],
     tls: Option<Tls>,
     said: Box<[Box<str>]>,
 ) -> Result<Placed, PlaceError> {
     let stops = Box::new(crate::stub::Stops::new(said));
-    let vtables = Vtables::write(vtables)?;
+    let mut vtables = Vtables::write(vtables)?;
     let page = blaze_launch_rt::sys::page().map_err(|e| PlaceError::Launcher(e.into()))? as u64;
     // Each body on its own alignment (blaze-emit `Code::align`, log2: 16 bytes unless a datum of
     // it asks more).
@@ -566,9 +585,9 @@ pub fn place(
     if !bodies.is_empty() {
         driver.declare(slots).map_err(PlaceError::Launcher)?;
     }
-    // The statics now: every slot has a word and a thunk, so a fn pointer has its address.
+    // The statics now: every slot has a word and a thunk, so a fn pointer or vtable word has its address.
     if let Some((image, base)) = image {
-        write_statics(image, base, static_fns, driver.place())?;
+        write_statics(image, base, static_fns, static_vtables, &mut vtables, driver.place())?;
     }
     let mut binds = Vec::with_capacity_in(bodies.len(), Global);
     for (n, body) in bodies.iter().enumerate() {

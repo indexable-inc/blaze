@@ -121,7 +121,12 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                         let place = self.ref_place(target);
                         self.b.reference(RefKind::Func, place)
                     }
-                    DataTarget::Vtable(_) => return Err(unsupported(e, "a const holding a `&dyn Trait` (its vtable is not a reference of this function)")),
+                    DataTarget::Vtable(key) => {
+                        let adts = self.adts;
+                        let vtable = adts.const_vtable_ref(key, self.ground).ok_or(BuildError::NoConstVtable { expr: e, key })?;
+                        let place = self.vtable_place(vtable)?;
+                        self.b.reference(RefKind::Vtable, place)
+                    }
                 };
                 relocs.push(DataReloc { offset: r.offset, target, addend });
             }

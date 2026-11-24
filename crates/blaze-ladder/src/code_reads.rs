@@ -1013,6 +1013,10 @@ impl Adts for Recorded<'_> {
         self.world.const_fn_instance(key, ground)
     }
 
+    fn const_vtable_ref(&self, key: blaze_build::vtable::VtableKey, ground: &mut PortableTys<'_>) -> Option<blaze_build::vtable::VtableRef> {
+        self.world.const_vtable_ref(key, ground)
+    }
+
     fn format_template(&self, owner: ItemKey, expr: ExprId) -> Option<&[blaze_build::FmtPiece<'_>]> {
         self.world.format_template(owner, expr)
     }

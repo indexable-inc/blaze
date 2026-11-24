@@ -547,6 +547,16 @@ pub trait Adts {
         None
     }
 
+    /// The vtable reference that key `key` names in an evaluated constant's record (a
+    /// `DataTarget::Vtable(key)` of a [`Adts::const_value`], [`Adts::const_block_value`] or
+    /// [`Adts::promoted_value`] answer: `const X: &dyn Tr = &S;`), its types interned in `ground`.
+    /// No answer is refused with [`BuildError::NoConstVtable`]. An evaluator's record names the
+    /// table of each of its vtable words (blaze-consteval `ConstRecord::vtables`).
+    fn const_vtable_ref(&self, key: vtable::VtableKey, ground: &mut PortableTys<'_>) -> Option<vtable::VtableRef> {
+        let _ = (key, ground);
+        None
+    }
+
     /// The template of `format_args!` expression `expr` of the body of `owner`: its literal
     /// texts (escapes and `{{`/`}}` processed) and placeholders in order, one placeholder per
     /// row of the expression's `fmt_uses` that is not a count (walk/fmt.rs). The checker's
@@ -993,6 +1003,9 @@ pub enum BuildError {
     /// The value of constant path, const block or promoted borrow `expr` holds a fn pointer to
     /// instance `key`, which [`Adts::const_fn_instance`] does not give.
     NoConstFnInstance { expr: ExprId, key: InstanceKey },
+    /// The value of constant path, const block or promoted borrow `expr` holds a vtable pointer
+    /// `key`, which [`Adts::const_vtable_ref`] does not give.
+    NoConstVtable { expr: ExprId, key: vtable::VtableKey },
     /// Path pattern `pat` names const `item`, whose value [`Adts::const_value`] does not hold.
     NoPatConstValue { pat: PatId, item: ItemKey },
     /// A layout read a record that is not made yet: `item`'s (an enum's explicit discriminant).
@@ -1142,6 +1155,15 @@ impl fmt::Display for BuildError {
                     "expression {}: the value of the constant, const block or promoted borrow here holds a fn pointer to instance {key:?}, \
                      which no record the build's `Adts` holds names (every evaluated record names the instance of each of its fn words: \
                      blaze-consteval `ConstRecord::fns`)",
+                    expr.0
+                )
+            }
+            BuildError::NoConstVtable { expr, key } => {
+                write!(
+                    f,
+                    "expression {}: the value of the constant, const block or promoted borrow here holds a vtable pointer {key:?}, \
+                     which no record the build's `Adts` holds names (every evaluated record names the table of each of its vtable words: \
+                     blaze-consteval `ConstRecord::vtables`)",
                     expr.0
                 )
             }

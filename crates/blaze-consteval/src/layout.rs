@@ -187,15 +187,15 @@ pub(crate) fn int_size(n: PNode) -> Option<u64> {
 /// How many struct tails [`is_unsized`] follows before it refuses (rule 18).
 const TAIL_DEPTH: u32 = 64;
 
-/// Whether a pointer to `pointee` is wide (pointer and length): a slice, `str`, or a struct
-/// whose last field is, followed through each struct's last field (the Reference, "Dynamically
-/// sized types": "a struct may contain a DST as the last field ... making the struct itself a
-/// DST"; core's `CStr { inner: [c_char] }`).
+/// Whether a pointer to `pointee` is wide (pointer and metadata: slice length or vtable): a
+/// slice, `str`, trait object (`dyn Trait`), or a struct whose last field is, followed through
+/// each struct's last field (the Reference, "Dynamically sized types": "a struct may contain a
+/// DST as the last field ... making the struct itself a DST"; core's `CStr { inner: [c_char] }`).
 pub fn is_unsized<W: LayoutFacts>(world: &W, g: &mut PortableTys<'_>, pointee: PTy, scratch: Alloc<'_>) -> Result<bool, Refusal<'static>> {
     let mut t = pointee;
     for _ in 0..TAIL_DEPTH {
         match g.view().node(t).map_err(|_| bad())? {
-            PNode::Slice(_) | PNode::Str => return Ok(true),
+            PNode::Slice(_) | PNode::Str | PNode::Dynamic(_) => return Ok(true),
             PNode::Adt(key, args) => {
                 let Some(adt) = world.adt(key) else { return Err(Refusal::Missing { what: "ADT definition", item: key }) };
                 if adt.kind != blaze_typeck::AdtKind::Struct {

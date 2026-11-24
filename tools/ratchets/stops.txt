@@ -73,14 +73,14 @@ blaze-int	41
 blaze-json	32
 blaze-keyed	588
 blaze-kit	167
-blaze-ladder	1142
+blaze-ladder	1141
 blaze-launch	83
 blaze-launch-rt	219
 blaze-launcher	2
 blaze-lex	63
 blaze-lint	270
 blaze-lint-defs	109
-blaze-lir	1542
+blaze-lir	1541
 blaze-lower	320
 blaze-macro-run	4
 blaze-malloc	65
