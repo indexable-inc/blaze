@@ -29,6 +29,61 @@ pub const PACKAGE: &str = "/package";
 pub mod seen_env;
 pub use seen_env::SeenMismatch;
 
+/// File bytes in a [`Files::Listed`] sandbox tree: zero-copy static slice for raw files,
+/// or owned bytes when decompressed from a `BLZFPK04` pack.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ListedBytes {
+    Static(&'static [u8]),
+    Owned(blaze_own::Vec<u8, blaze_own::SharedAlloc<'static>>),
+}
+
+impl ListedBytes {
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            ListedBytes::Static(s) => s,
+            ListedBytes::Owned(s) => s.as_slice(),
+        }
+    }
+}
+
+impl core::ops::Deref for ListedBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl AsRef<[u8]> for ListedBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl From<&'static [u8]> for ListedBytes {
+    fn from(s: &'static [u8]) -> Self {
+        ListedBytes::Static(s)
+    }
+}
+
+impl From<blaze_own::Vec<u8, blaze_own::SharedAlloc<'static>>> for ListedBytes {
+    fn from(s: blaze_own::Vec<u8, blaze_own::SharedAlloc<'static>>) -> Self {
+        ListedBytes::Owned(s)
+    }
+}
+
+impl PartialEq<[u8]> for ListedBytes {
+    fn eq(&self, other: &[u8]) -> bool {
+        self.as_slice() == other
+    }
+}
+
+impl PartialEq<&[u8]> for ListedBytes {
+    fn eq(&self, other: &&[u8]) -> bool {
+        self.as_slice() == *other
+    }
+}
+
 /// A package's own files, the only ones its macros see.
 #[derive(Clone)]
 pub enum Files {
@@ -36,7 +91,7 @@ pub enum Files {
     Folder(PathBuf),
     /// A record's files (a fetched package's, read in place from its fetch record), by their
     /// path from the package's folder, sorted by path, each once.
-    Listed(std::sync::Arc<[(String, &'static [u8])]>),
+    Listed(std::sync::Arc<[(String, ListedBytes)]>),
     /// A workspace member's (D96 (3)): its workspace's folder on disk, served at `/workspace`
     /// with the member at `root`'s dir in it; paths are from the workspace's folder.
     Member { workspace: PathBuf, root: crate::script_sandbox::ScriptRoot },
@@ -92,7 +147,7 @@ impl Files {
     }
 
     /// The listed files under the folder `rel` (`""`: the package's).
-    fn under<'f>(files: &'f [(String, &'static [u8])], rel: &str) -> impl Iterator<Item = &'f str> + 'f {
+    fn under<'f>(files: &'f [(String, ListedBytes)], rel: &str) -> impl Iterator<Item = &'f str> + 'f {
         let prefix = if rel.is_empty() { String::new() } else { format!("{rel}/") };
         let start = files.partition_point(|(path, _)| path.as_str() < prefix.as_str());
         let n = prefix.len();

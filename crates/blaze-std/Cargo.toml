@@ -68,6 +68,7 @@ blaze-spin.workspace = true
 # `bstd::sort` (`blaze-sort` + `blaze-radix`), and `bstd::compress` / `bstd::digest::{Crc32, Adler32}`.
 blaze-arrow-ipc.workspace = true
 blaze-base64.workspace = true
+blaze-zstd.workspace = true
 blaze-bitflags.workspace = true
 blaze-columns.workspace = true
 blaze-deflate.workspace = true

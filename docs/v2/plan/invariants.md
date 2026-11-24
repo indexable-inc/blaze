@@ -610,8 +610,6 @@ By level: 258 tested, 87 simulated, 1 model-checked, 15 proved.
   Controls: `unquoted_keyword_strings`.
 - **`property_zip_round_trip_and_hostile_bytes_never_panic`** *tested* (`crates/blaze-std/src/zip.rs`): Store and Deflate ZIP archives round-trip with verified CRC-32 and hostile archive bytes never panic.
   Controls: `skipped_crc_verification`.
-- **`property_zstd_round_trip_and_hostile_bytes_never_panic`** *tested* (`crates/blaze-std/src/zstd/tests.rs`): RFC 8878 Zstandard compression and decompression round-trip across arbitrary inputs and hostile bytes never panic.
-  Controls: `skipped_checksum`.
 
 ### blaze-surface
 
@@ -642,6 +640,11 @@ By level: 258 tested, 87 simulated, 1 model-checked, 15 proved.
   Controls: `an_answer_with_no_flush`, `an_ask_joined_to_an_earlier_flush`, `an_overflow_taken_as_whole`, `a_place_of_a_dead_instance_accepted`, `names_dropped_without_forgetting_their_places`.
 - **`a_slow_page_never_grows_the_viewer`** *tested* (`crates/blaze-watch/src/sim/viewer.rs`): the viewer bounds slow-page queues, checks origin and pairing keys before routing or toggling, and expires idle viewers without holding resources forever.
   Controls: `a_page_queue_past_its_bound`, `a_route_before_the_origin_check`, `a_toggle_before_the_key_check`, `a_page_that_holds_the_viewer_forever`.
+
+### blaze-zstd
+
+- **`property_zstd_round_trip_and_hostile_bytes_never_panic`** *tested* (`crates/blaze-zstd/src/tests.rs`): RFC 8878 Zstandard compression and decompression round-trip across arbitrary inputs and hostile bytes never panic.
+  Controls: `skipped_checksum`.
 
 ### const-ast
 

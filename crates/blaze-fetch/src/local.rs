@@ -250,7 +250,10 @@ mod tests {
         assert_eq!(record.as_slice(), network.as_slice(), "an adopted record is the network path's, byte for byte");
         assert_eq!(made.files, 2);
         let view = PackView::open_source(&unit.source(), record.as_slice()).expect("it opens under the lock's source id");
-        assert_eq!(view.find("src/lib.rs").map(|file| file.bytes), Some(&b"pub fn a() {}\n"[..]));
+        assert_eq!(
+            view.read("src/lib.rs", blaze_own::testing::heap().alloc()).expect("reads src/lib.rs").map(|file| file.bytes.as_slice().to_vec()),
+            Some(b"pub fn a() {}\n".to_vec())
+        );
 
         let got = blaze_sha256::digest(other.as_slice());
         assert_ne!(got, sha256);

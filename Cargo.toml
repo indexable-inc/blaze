@@ -150,6 +150,7 @@ blaze-lir.opt-level = 2
 blaze-emit.opt-level = 2
 blaze-ed25519.opt-level = 2
 blaze-deflate.opt-level = 2
+blaze-zstd.opt-level = 2
 # Generic front-end and engine crates (`blaze-ladder` monomorphizes `blaze-typeck`/`blaze-solve`/
 # `blaze-flow-lower`/`blaze-build`; `blaze-cli` monomorphizes `blaze-scope::resolve_crate_verified`
 # over `JobTexts`/`FilePar`): without opt-level = 2 here, those generic instantiations compile at
@@ -495,6 +496,8 @@ blaze-toml = { path = "crates/blaze-toml" }
 blaze-v2-proof = { path = "crates/blaze-v2-proof" }
 # WASI preview 1 for wasm guests at both pointer widths.
 blaze-wasi = { path = "crates/blaze-wasi" }
+# blaze's own RFC 8878 Zstandard with raw-content dictionaries and XXH64: no_std, sans-IO, zero-unsafe, bounded.
+blaze-zstd = { path = "crates/blaze-zstd" }
 intern = { path = "crates/intern", version = "0.0.0" }
 parser = { path = "crates/parser", version = "0.0.0" }
 paths = { path = "crates/paths", version = "0.0.0" }

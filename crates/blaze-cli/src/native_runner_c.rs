@@ -614,22 +614,23 @@ fn lay_package<'s>(cx: &Cx, c: &mut CTasks<'_>, list: &CrateList<'_>, r: usize, 
     }
     let prefix = if dir.is_empty() { None } else { Some(dir) };
     let mut laid = 0u32;
-    for file in view.files() {
+    for entry in view.entries() {
         let rest = match prefix {
-            None => file.path,
-            Some(dir) => match file.path.strip_prefix(dir).and_then(|rest| rest.strip_prefix('/')) {
+            None => entry.path,
+            Some(dir) => match entry.path.strip_prefix(dir).and_then(|rest| rest.strip_prefix('/')) {
                 Some(rest) => rest,
                 None => continue,
             },
         };
         if rest.split('/').any(|part| part.is_empty() || part == "." || part == "..") {
-            return Err(lay(format_args!("its pack names `{}`, which is not a path in a folder", file.path)));
+            return Err(lay(format_args!("its pack names `{}`, which is not a path in a folder", entry.path)));
         }
         let path = bstd::mem::format_in!(scratch, "{}/{rest}", part.as_str());
         if let Some((parent, _)) = path.as_str().rsplit_once('/') {
             std::fs::create_dir_all(parent).map_err(|e| lay(format_args!("{parent}: {e}")))?;
         }
-        std::fs::write(path.as_str(), file.bytes).map_err(|e| lay(format_args!("{}: {e}", path.as_str())))?;
+        let bytes = entry.read_in(scratch).map_err(|e| lay(format_args!("{}: {}", entry.path, blaze_text::Shown(&e))))?;
+        std::fs::write(path.as_str(), bytes.as_slice()).map_err(|e| lay(format_args!("{}: {e}", path.as_str())))?;
         laid += 1;
     }
     if laid == 0 {

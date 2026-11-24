@@ -53,7 +53,7 @@ blaze-engine	119
 blaze-expand	284
 blaze-export	425
 blaze-facts	12
-blaze-fetch	213
+blaze-fetch	185
 blaze-file-items	94
 blaze-flow	142
 blaze-flow-lower	442

@@ -170,7 +170,7 @@ impl Records<'static> for Folder {
 enum Src<'p> {
     Dir(&'p Path),
     /// The record and the package's directory in it (`""` for a crate's own record).
-    Pack(PackView<'static>, &'p str),
+    Pack(PackView<'static>, &'p str, Alloc<'p>),
 }
 
 /// `a/b/../c` as `a/c`; `None` when it climbs above the root.
@@ -201,7 +201,7 @@ impl Src<'_> {
         let rel = normal(rel)?;
         match self {
             Src::Dir(dir) => std::fs::read_to_string(dir.join(&rel)).ok(),
-            Src::Pack(view, dir) => view.find(&join(dir, &rel)).and_then(|f| String::from_utf8(f.bytes.to_vec()).ok()),
+            Src::Pack(view, dir, alloc) => view.read(&join(dir, &rel), *alloc).ok().flatten().and_then(|f| String::from_utf8(f.bytes.as_slice().to_vec()).ok()),
         }
     }
 
@@ -225,12 +225,12 @@ impl Src<'_> {
                     }
                 }
             }
-            Src::Pack(view, dir) => {
+            Src::Pack(view, dir, _) => {
                 let prefix = join(dir, &rel);
-                for file in view.files() {
-                    let Some(below) = file.path.strip_prefix(prefix.as_str()) else { continue };
-                    if (prefix.is_empty() || below.starts_with('/')) && file.path.ends_with(".rs") && out.len() < 4000 {
-                        let in_package = if dir.is_empty() { file.path } else { &file.path[dir.len() + 1..] };
+                for entry in view.entries() {
+                    let Some(below) = entry.path.strip_prefix(prefix.as_str()) else { continue };
+                    if (prefix.is_empty() || below.starts_with('/')) && entry.path.ends_with(".rs") && out.len() < 4000 {
+                        let in_package = if dir.is_empty() { entry.path } else { &entry.path[dir.len() + 1..] };
                         out.push(in_package.to_string());
                     }
                 }
@@ -750,7 +750,7 @@ fn main() {
         };
         let src = match (member_dirs.get(&unit.package), dirs.get(&unit.package)) {
             (Some(dir), _) => Src::Dir(dir),
-            (None, Some((view, dir))) => Src::Pack(*view, dir),
+            (None, Some((view, dir))) => Src::Pack(*view, dir, alloc),
             _ => {
                 println!("  {key}: no files (not in the store)");
                 continue;
@@ -819,7 +819,7 @@ fn main() {
         }
         let src = match (member_dirs.get(&id), dirs.get(&id)) {
             (Some(dir), _) => Src::Dir(dir),
-            (None, Some((view, dir))) => Src::Pack(*view, dir),
+            (None, Some((view, dir))) => Src::Pack(*view, dir, alloc),
             _ => {
                 absent += 1;
                 continue;

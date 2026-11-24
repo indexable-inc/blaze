@@ -90,3 +90,71 @@ fn a_listing_is_sorted_and_refuses_escapes() {
     }
     assert_eq!(tree::parse(format!("blaze tree 2\nfile {hex} 1 a b\n").as_bytes()).unwrap()[0].path, "a b");
 }
+
+#[test]
+fn previous_magic_is_refused() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut b = crate::pack::Builder::new(
+        crate::pack::Kind::Tree,
+        [0u8; 32],
+        crate::pack::Limits { most_files: 16, most_bytes: 1 << 20, most_path: 256 },
+        64,
+        alloc,
+    )
+    .expect("builder");
+    b.file("src/lib.rs", crate::Mode::File, b"pub fn hi() {}\n").expect("add file");
+    let mut record = b.finish().expect("finish");
+    assert_eq!(&record.as_slice()[..8], crate::pack::MAGIC);
+    // Rewriting header magic to previous BLZFPK03 (with valid BLAKE3 footer) must be refused.
+    record.as_mut_slice()[..8].copy_from_slice(b"BLZFPK03");
+    let body_len = record.len() - crate::pack::FOOTER;
+    let new_digest = Blake3::of(&record.as_slice()[..body_len]).0;
+    record.as_mut_slice()[body_len..].copy_from_slice(&new_digest);
+    assert!(matches!(crate::PackView::open(record.as_slice()), Err(crate::PackRefused::Form { .. })));
+    assert!(matches!(crate::PackView::open_verified(record.as_slice()), Err(crate::PackRefused::Form { .. })));
+}
+
+#[test]
+fn blzfpk04_compresses_small_and_large_rust_files_and_round_trips() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let small_rs = concat!(
+        "// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or\n",
+        "// https://www.apache.org/licenses/LICENSE-2.0> or the MIT license\n",
+        "#![no_std]\nuse core::fmt::{self, Debug, Display};\n",
+        "#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]\n",
+        "pub struct Point { pub x: i32, pub y: i32 }\n",
+        "impl fmt::Display for Point {\n",
+        "    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, \"{},{}\", self.x, self.y) }\n",
+        "}\n",
+    );
+    let mut large_rs = blaze_own::Vec::new_in(alloc);
+    for i in 0..900u32 {
+        let line = format!("pub const fn f_{i}(x: u64) -> u64 {{ x.wrapping_add({i}) }}\n");
+        large_rs.extend_from_slice(line.as_bytes());
+    }
+    let tiny = b"tiny\n";
+
+    let mut b = crate::pack::Builder::new(
+        crate::pack::Kind::Tree,
+        [7u8; 32],
+        crate::pack::Limits { most_files: 16, most_bytes: 4 << 20, most_path: 256 },
+        (small_rs.len() + large_rs.len() + tiny.len()) as u64,
+        alloc,
+    )
+    .expect("builder");
+    b.file("src/small.rs", crate::Mode::File, small_rs.as_bytes()).expect("small");
+    b.file("src/large.rs", crate::Mode::File, large_rs.as_slice()).expect("large");
+    b.file("src/tiny.txt", crate::Mode::File, tiny).expect("tiny");
+    let record = b.finish().expect("finish");
+
+    let view = crate::PackView::open(record.as_slice()).expect("open");
+    assert_eq!(view.len(), 3);
+    assert_eq!(view.find_entry("src/small.rs").expect("small entry").codec, crate::Codec::ZstdRustDict);
+    assert_eq!(view.find_entry("src/large.rs").expect("large entry").codec, crate::Codec::Zstd);
+    assert_eq!(view.find_entry("src/tiny.txt").expect("tiny entry").codec, crate::Codec::Raw);
+    assert!(view.data_len() < view.raw_data_len() / 3, "expected >3x compression: stored={} raw={}", view.data_len(), view.raw_data_len());
+
+    assert_eq!(view.read("src/small.rs", alloc).expect("read small").expect("some").bytes.as_slice(), small_rs.as_bytes());
+    assert_eq!(view.read("src/large.rs", alloc).expect("read large").expect("some").bytes.as_slice(), large_rs.as_slice());
+    assert_eq!(view.read("src/tiny.txt", alloc).expect("read tiny").expect("some").bytes.as_slice(), tiny);
+}

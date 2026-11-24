@@ -968,6 +968,7 @@ dependencies = [
  "blaze-tar",
  "blaze-text",
  "blaze-unicode",
+ "blaze-zstd",
 ]
 
 [[package]]
@@ -2165,6 +2166,7 @@ dependencies = [
  "blaze-unicode",
  "blaze-units",
  "blaze-url",
+ "blaze-zstd",
  "objc2-core-foundation",
  "objc2-core-media",
  "objc2-core-video",
@@ -2428,6 +2430,14 @@ dependencies = [
  "blaze-id",
  "blaze-json",
  "blaze-mem",
+ "blaze-own",
+ "blaze-sim",
+]
+
+[[package]]
+name = "blaze-zstd"
+version = "0.0.0"
+dependencies = [
  "blaze-own",
  "blaze-sim",
 ]

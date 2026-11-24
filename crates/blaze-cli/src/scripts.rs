@@ -761,7 +761,20 @@ fn tree_of(files: &Files<'_>, checkout: crate::engine_script_reads::Served<'_>, 
             }
             (Err(error), _) => Err(failed("a member folder a script cannot see", format_args!("the build script of {package}: its folder '{dir}': {error}"), false)),
         },
-        Files::Pack { view, dir, git } => Ok((mem_tree(view.files().map(|f| (f.path, f.bytes)), dir, *git), ScriptRoot::package())),
+        Files::Pack { view, dir, git } => {
+            let Ok(frame) = bstd::mem::Frame::new(bstd::mem::Tag::Other) else {
+                return Err(failed("a build script's decode frame failed", format_args!("the build script of {package}: out of memory"), false));
+            };
+            let mut decoded: blaze_own::Vec<(&str, blaze_fetch::FileBytes<'_, &bstd::mem::Frame>), &bstd::mem::Frame> =
+                blaze_own::Vec::with_capacity_in(view.len(), &frame);
+            for entry in view.entries() {
+                let bytes = entry.read_in(&frame).map_err(|why| {
+                    failed("a build script's pack entry failed to decode", format_args!("the build script of {package}: {}: {}", entry.path, blaze_text::Shown(&why)), false)
+                })?;
+                decoded.push((entry.path, bytes));
+            }
+            Ok((mem_tree(decoded.iter().map(|(p, b)| (*p, b.as_slice())), dir, *git), ScriptRoot::package()))
+        }
     }
 }
 

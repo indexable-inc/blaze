@@ -807,8 +807,9 @@ mod tests {
         let mut ver = OwnString::new_in(blaze_own::testing::heap().alloc());
         ver.str("0.1.0");
         let unit = Unit::Crate { package: blaze_manifest::lock::LockId(0), name: "lan_demo", version: ver, sha256: digest };
-        let view = PackView::open_source(&unit.source(), rec.as_slice()).expect("valid BLZFPK03");
-        assert_eq!(view.find("src/lib.rs").map(|f| f.bytes), Some(&lib[..]));
+        let view = PackView::open_source(&unit.source(), rec.as_slice()).expect("valid BLZFPK04");
+        let file = view.read("src/lib.rs", blaze_own::testing::heap().alloc()).expect("read").expect("src/lib.rs");
+        assert_eq!(file.bytes.as_slice(), &lib[..]);
     }
 
     /// End-to-end loopback security test:

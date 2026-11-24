@@ -196,14 +196,14 @@ mod with_sandbox {
             let files = if CrateGraph::toolchain(&self.list, krate) {
                 sandbox_files(PackageAt::Toolchain)
             } else if let Some(place) = self.package_of.get(krate).copied().flatten().and_then(|pkg_id| crate::proc_callers::placed_of(self.placed, pkg_id)) {
-                crate::proc_callers::shown(place, self.checkout).map_err(|e| fail(format_args!("{e}")))?
+                crate::proc_callers::shown(place, self.checkout, self.heap.shared()).map_err(|e| fail(format_args!("{e}")))?
             } else if self.list.member(krate) {
                 let dir = self.list.shown_from(krate).strip_prefix("/0/").unwrap_or("").trim_end_matches('/');
-                crate::proc_callers::shown(blaze_world::Place::Checkout { dir }, self.checkout)
+                crate::proc_callers::shown(blaze_world::Place::Checkout { dir }, self.checkout, self.heap.shared())
                     .map_err(|e| fail(format_args!("{e}")))?
             } else if let Some(rest) = self.list.shown_from(krate).strip_prefix("/0/") {
                 let dir = rest.trim_end_matches('/');
-                crate::proc_callers::shown(blaze_world::Place::Path { dir }, self.checkout)
+                crate::proc_callers::shown(blaze_world::Place::Path { dir }, self.checkout, self.heap.shared())
                     .map_err(|e| fail(format_args!("{e}")))?
             } else {
                 let shown_from = self.list.shown_from(krate);
@@ -226,7 +226,7 @@ mod with_sandbox {
                         return Err(fail(format_args!("the names world never placed its package, so a proc macro called in it cannot be shown its files")));
                     }
                 };
-                crate::proc_callers::shown(blaze_world::Place::Pack { view, dir }, self.checkout)
+                crate::proc_callers::shown(blaze_world::Place::Pack { view, dir }, self.checkout, self.heap.shared())
                     .map_err(|e| fail(format_args!("{e}")))?
             };
             let erased = blaze_own::Erased::new(&frame);

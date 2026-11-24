@@ -667,8 +667,8 @@ mod shared_pack_tests {
 
         for _ in 0..64 {
             let view = open_row_shared(&cx, from, row, 1, &dirs, &frame).unwrap_or_else(|e| panic!("open pack: {}", e.0));
-            let file = view.find("src/lib.rs").expect("src/lib.rs");
-            assert_eq!(file.bytes, b"pub fn ok() {}\n");
+            let file = view.read("src/lib.rs", &frame).expect("read").expect("src/lib.rs");
+            assert_eq!(file.bytes.as_slice(), b"pub fn ok() {}\n");
         }
         assert_eq!(dirs.opened_count(), 1, "64 suite opens must share one sources Dir, never open 64 drivers");
     }

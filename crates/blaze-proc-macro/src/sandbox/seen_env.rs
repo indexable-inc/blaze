@@ -228,7 +228,10 @@ mod tests {
     /// `test sandbox::seen_env::tests::a_fetched_package_s_climb_is_refused_by_name ... ok`.
     #[test]
     fn a_fetched_package_s_climb_is_refused_by_name() {
-        let files: Vec<(String, &'static [u8])> = vec![("Cargo.toml".to_owned(), &b"[package]\nname = \"dep\"\n"[..]), ("x".to_owned(), &b"inside"[..])];
+        let files: Vec<(String, crate::sandbox::ListedBytes)> = vec![
+            ("Cargo.toml".to_owned(), crate::sandbox::ListedBytes::Static(&b"[package]\nname = \"dep\"\n"[..])),
+            ("x".to_owned(), crate::sandbox::ListedBytes::Static(&b"inside"[..])),
+        ];
         let package = Package::new(Files::Listed(Arc::from(files)), env_of(&[("CARGO_MANIFEST_DIR", "/package")])).unwrap_or_else(|e| panic!("a fetched package: {e}"));
         let mut sandbox = Sandbox::new(Arc::new(package));
         assert_eq!(read_joined(&mut sandbox, "x").as_deref(), Ok(&b"inside"[..]));

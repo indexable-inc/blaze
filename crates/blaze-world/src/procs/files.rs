@@ -19,8 +19,8 @@ use std::string::{String, ToString};
 use std::sync::Arc;
 use std::vec::Vec;
 
-use blaze_fetch::PackView;
-use blaze_proc_macro::sandbox::Files;
+use blaze_fetch::{FileBytes, PackView};
+use blaze_proc_macro::sandbox::{Files, ListedBytes};
 
 /// Where one crate's package is, as the caller already knows it from loading the crate's own
 /// files (the same place its sources are read from).
@@ -31,7 +31,7 @@ pub enum PackageAt<'a> {
     /// A fetched package: its fetch record, and the package's folder inside it (`""` for a
     /// registry crate, whose record is its package; a git package's folder in its commit).
     /// The folder may be written with or without a trailing `/`.
-    Pack { view: PackView<'static>, dir: &'a str },
+    Pack { view: PackView<'static>, dir: &'a str, alloc: blaze_own::SharedAlloc<'static> },
     /// A toolchain crate (core, alloc, std, proc_macro): it calls no proc macro of a package,
     /// so it is shown no files.
     Toolchain,
@@ -47,15 +47,24 @@ pub enum PackageAt<'a> {
 pub fn sandbox_files(at: PackageAt<'_>) -> Files {
     match at {
         PackageAt::Disk(dir) => Files::Folder(dir.to_path_buf()),
-        PackageAt::Pack { view, dir } => {
+        PackageAt::Pack { view, dir, alloc } => {
             let dir = dir.trim_matches('/');
             let mut prefix = String::with_capacity(dir.len() + 1);
             if !dir.is_empty() {
                 prefix.push_str(dir);
                 prefix.push('/');
             }
-            let listed: Vec<(String, &'static [u8])> =
-                view.files().filter_map(|file| file.path.strip_prefix(prefix.as_str()).map(|rel| (rel.to_string(), file.bytes))).collect();
+            let listed: Vec<(String, ListedBytes)> = view
+                .entries()
+                .filter_map(|entry| {
+                    let rel = entry.path.strip_prefix(prefix.as_str())?;
+                    let bytes = match entry.read_in(alloc).ok()? {
+                        FileBytes::Borrowed(s) => ListedBytes::Static(s),
+                        FileBytes::Owned(v) => ListedBytes::Owned(v),
+                    };
+                    Some((rel.to_string(), bytes))
+                })
+                .collect();
             Files::Listed(Arc::from(listed))
         }
         PackageAt::Toolchain => Files::Listed(Arc::from(Vec::new())),
@@ -162,11 +171,12 @@ mod tests {
         let registry: &'static [u8] = std::boxed::Box::leak(registry.into_boxed_slice());
         let registry = PackView::open_verified(registry).expect("a pack");
 
+        let alloc = blaze_own::testing::heap().shared();
         let cases: Vec<(&str, PackageAt<'_>, Want<'_>)> = vec![
             ("member", PackageAt::Disk(&member), Want::Folder(&member)),
-            ("git dependency", PackageAt::Pack { view: git, dir: "crates/rpc/rpc-eth-api" }, Want::Manifest(DEP_MANIFEST)),
-            ("git dependency, folder with `/`", PackageAt::Pack { view: git, dir: "crates/rpc/rpc-eth-api/" }, Want::Manifest(DEP_MANIFEST)),
-            ("registry dependency", PackageAt::Pack { view: registry, dir: "" }, Want::Manifest(DEP_MANIFEST)),
+            ("git dependency", PackageAt::Pack { view: git, dir: "crates/rpc/rpc-eth-api", alloc }, Want::Manifest(DEP_MANIFEST)),
+            ("git dependency, folder with `/`", PackageAt::Pack { view: git, dir: "crates/rpc/rpc-eth-api/", alloc }, Want::Manifest(DEP_MANIFEST)),
+            ("registry dependency", PackageAt::Pack { view: registry, dir: "", alloc }, Want::Manifest(DEP_MANIFEST)),
         ];
         for (what, at, want) in &cases {
             own_package(&sandbox_files(*at), want).unwrap_or_else(|why| panic!("{what}: {why}"));
