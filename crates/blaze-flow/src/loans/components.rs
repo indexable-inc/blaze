@@ -472,7 +472,8 @@ mod tests {
             (Origin(130), Origin(131)),
             (Origin(131), Origin(130)),
         ]);
-        let mut graph = Components::new(Global);
+        let g = Global;
+        let mut graph = Components::new(g);
         let mut meter = Meter::new(u64::MAX);
         assert!(graph.build(&edges, &mut meter).is_ok());
         assert!(graph.reach.is_empty());
@@ -513,7 +514,7 @@ mod tests {
         for i in [0, 64, 66, 68, 131, 135, 195] {
             crate::bits::put(&mut live, i, true);
         }
-        let mut generators = blaze_own::Vec::new_in(Global);
+        let mut generators = blaze_own::Vec::new_in(g);
         assert!(graph.project(&live, &mut generators, &mut meter).is_ok());
         assert_eq!(generators.len(), 6);
         assert!(graph.build(&generators, &mut meter).is_ok());

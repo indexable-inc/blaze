@@ -1406,8 +1406,10 @@ fn count(names: &blaze_scope::resolve::Names<'static>, inners: Option<&[blaze_sc
         n.macro_paths += d.calls.len();
     }
     for e in c.expansions.values() {
-        n.imports += e.decls.uses.len();
-        n.macro_paths += e.decls.calls.len();
+        if let Some(d) = e.decls() {
+            n.imports += d.uses.len();
+            n.macro_paths += d.calls.len();
+        }
     }
     for m in c.made.values() {
         n.imports += m.decls.uses.len();
