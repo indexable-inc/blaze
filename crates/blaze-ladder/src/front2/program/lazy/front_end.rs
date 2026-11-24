@@ -616,7 +616,8 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
     /// `Front2Program::object_trait`.
     fn object_trait(&self, t: ItemKey) -> Option<blaze_build::vtable::ObjectTrait<'_>> {
         let o = self.objects.get(&t)?;
-        Some(blaze_build::vtable::ObjectTrait { supers: &o.supers, super_args: &o.super_args, methods: &o.methods, shape: o.shape })
+        let tys = o.super_tys.as_ref().map_or(PTys::EMPTY, PortableTys::view);
+        Some(blaze_build::vtable::ObjectTrait { supers: &o.supers, tys, methods: &o.methods, shape: o.shape })
     }
 
     /// fill.rs `object_asked`: `t`'s table from its head and its supertraits' heads, so an
@@ -642,6 +643,10 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
     /// A run leaves nothing out: a fn that does not check is `check_one`'s refusal.
     fn left_out(&self, _key: ItemKey) -> Option<&str> {
         None
+    }
+
+    fn type_names(&self) -> Option<&dyn blaze_build::type_name::TypeNames> {
+        Some(self)
     }
 
     // (5) Literals: of the live body of `owner`.
@@ -740,5 +745,11 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
     /// The statics made so far, sorted by key: each one's own data record.
     fn static_records(&self) -> &[(ItemKey, DataRecord<Global>)] {
         &self.statics.values
+    }
+}
+
+impl<'n, S: NamesSource<'n>> blaze_build::type_name::TypeNames for LazyProgram<'n, S> {
+    fn item_path(&self, item: ItemKey, out: &mut dyn FnMut(&str)) -> bool {
+        crate::front2::type_name::item_path(self.front.names, &self.front.keys, &self.store, item, out)
     }
 }

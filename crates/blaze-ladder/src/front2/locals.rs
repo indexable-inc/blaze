@@ -419,6 +419,10 @@ pub struct Locals<'n> {
     /// constant's own body continues there ([`Locals::find`]), as a local item's does; the
     /// constant is no item, so it is not in `heads`.
     anons: HashMap<ItemKey, (ItemKey, u32), &'n Frame>,
+    /// Each block module (`__blaze_block_*`) owned by a lowered body, mapping the block module's
+    /// library key back to its enclosing body's checker key: what `type_name` prints items
+    /// declared in that block (`struct LocalStruct;` in `fn outer`) under (`crate::outer::LocalStruct`).
+    block_owners: HashMap<LibKey, ItemKey, &'n Frame>,
     /// The scope table's planted bug, for the test that must catch it; `Planted::None` else.
     planted: super::scope_table::Planted,
     /// Under `BlockScopes::Bodies`, each body's record ([`BodyScopes`]); `None` under `Modules`.
@@ -435,7 +439,16 @@ fn covariant<'s, 'l: 's>(locals: &'s Locals<'l>) -> &'s Locals<'s> {
 
 impl<'n> Locals<'n> {
     pub fn new(frame: &'n Frame) -> Locals<'n> {
-        Locals { frame, bodies: HashMap::new_in(frame), heads: HashMap::new_in(frame), foreign: HashMap::new_in(frame), anons: HashMap::new_in(frame), planted: super::scope_table::Planted::None, body_scopes: None }
+        Locals {
+            frame,
+            bodies: HashMap::new_in(frame),
+            heads: HashMap::new_in(frame),
+            foreign: HashMap::new_in(frame),
+            anons: HashMap::new_in(frame),
+            block_owners: HashMap::new_in(frame),
+            planted: super::scope_table::Planted::None,
+            body_scopes: None,
+        }
     }
 
     /// Reads every body kept after this under `BlockScopes::Bodies`: its block names from its
@@ -496,6 +509,11 @@ impl<'n> Locals<'n> {
     /// The local items of the body `owner`.
     pub fn body(&self, owner: ItemKey) -> Option<&BodyLocals<'n>> {
         self.bodies.get(&owner)
+    }
+
+    /// The body (`ItemKey`) whose lowered block owns the block module `module`.
+    pub fn block_owner(&self, module: LibKey) -> Option<ItemKey> {
+        self.block_owners.get(&module).copied()
     }
 
     /// The body whose row `gap` names, and that row, when the gap names a row by its body's
@@ -747,6 +765,14 @@ impl<'n> Locals<'n> {
         }
         let blocks: &'n [BlockModule] = frame.alloc_slice_copy(&blocks);
         let scopes: &'n [super::scope_table::ScopeAt] = frame.alloc_slice_copy(&table.scopes);
+        for scope in scopes.iter() {
+            if let Some(m) = scope.own() {
+                self.block_owners.insert(m, at.owner);
+            }
+        }
+        for block in blocks.iter() {
+            self.block_owners.insert(block.module, at.owner);
+        }
         let names_of_blocks = match self.body_scopes {
             None => super::scope_table::BlockNames::Modules,
             Some(s) => match library_body.ok_or(NoBodyScope::NoLibraryBody).and_then(|body| s.of(body)) {

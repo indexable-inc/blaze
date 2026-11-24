@@ -26,9 +26,10 @@ use core::fmt;
 
 use blaze_ids::{ContentId, Hasher};
 use blaze_own::Alloc;
-use blaze_typeck::{ItemKey, List, PTy, PortableTys};
+use blaze_typeck::{CheckError, ItemKey, List, PNode, PTy, PTys, PortableTys};
 
 use crate::data::{DataAlloc, DataRecord, DataReloc, DataTarget};
+use crate::layout::LayoutFacts;
 use crate::{BuildError, Instance, InstanceKey, instance_key};
 
 /// Words before the methods: the drop glue, the size, the alignment.
@@ -37,59 +38,46 @@ pub const HEADER_WORDS: u32 = 3;
 /// A trait as a trait object sees it, from the world (the checker's trait facts).
 #[derive(Clone, Copy, Debug)]
 pub struct ObjectTrait<'a> {
-    /// The supertraits, in declaration order, each with where its generic arguments come from
-    /// (`Fn<Args>: FnMut<Args>`). A supertrait argument that is not one of the trait's own
-    /// arguments (`trait A<T>: B<Vec<T>>`) is refused by the world by name until a type tree
-    /// is carried here.
+    /// The supertraits, in declaration order, each with its generic arguments (after `Self`)
+    /// as type trees in [`ObjectTrait::tys`], parameterized over this trait's own generic
+    /// parameters (`Self` is `Param(0)`, its parameters from `Param(1)` / `ConstParam(1)`).
     pub supers: &'a [ObjectSuper],
-    /// The pool [`ObjectSuper::args`] index: each entry the position, in this trait's own
-    /// arguments (`Self` 0, then its generic parameters in order), of one supertrait argument.
-    pub super_args: &'a [u32],
+    /// The portable type table holding the supertrait argument trees indexed by
+    /// [`ObjectSuper::args`] (`PTys::EMPTY` when no supertrait carries arguments).
+    pub tys: PTys<'a>,
     /// The methods, in declaration order.
     pub methods: &'a [ObjectMethod],
     /// The hash of what the table's shape reads: this trait's methods (and whether each is
-    /// dispatchable), its supertraits, and theirs, transitively. Part of every table's key.
+    /// dispatchable), its supertraits and their argument trees, and theirs, transitively.
+    /// Part of every table's key.
     pub shape: ContentId,
-}
-
-/// A run of a position pool: `pool[at..at + len]`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub struct ArgSpan {
-    pub at: u32,
-    pub len: u32,
-}
-
-impl ArgSpan {
-    fn of<'p>(self, pool: &'p [u32]) -> Option<&'p [u32]> {
-        let at = self.at as usize;
-        pool.get(at..at.checked_add(self.len as usize)?)
-    }
 }
 
 /// One supertrait of a trait as a trait object sees it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ObjectSuper {
     pub trait_: ItemKey,
-    /// Its arguments after `Self`, in [`ObjectTrait::super_args`]: empty for a supertrait
-    /// with no generic arguments (its `Self` is always the trait's `Self`).
-    pub args: ArgSpan,
+    /// Its arguments after `Self`, a list in [`ObjectTrait::tys`]: `List::EMPTY` for a
+    /// supertrait with no generic arguments (its `Self` is always the trait's `Self`).
+    pub args: List,
 }
 
 impl ObjectSuper {
     /// A supertrait with no generic arguments (`trait Sub: Tr`).
     pub const fn plain(trait_: ItemKey) -> ObjectSuper {
-        ObjectSuper { trait_, args: ArgSpan { at: 0, len: 0 } }
+        ObjectSuper { trait_, args: List::EMPTY }
     }
 }
 
-/// Which arguments a trait of a table's tree is instantiated at, as positions in the table's
-/// `[concrete, principal args..]`.
+/// Which arguments a trait of a table's tree is instantiated at, in [`Shape::tys`],
+/// parameterized over the principal's `[Self = Param(0), principal args..]` (`Param(1)..`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TraitArgs {
-    /// The principal: the whole list.
+    /// The principal: its own `[concrete, principal args..]`.
     Principal,
-    /// A supertrait: [`Shape::args`]`[span]`, `Self` (position 0) first.
-    At(ArgSpan),
+    /// A supertrait: its arguments after `Self`, as a list in [`Shape::tys`] (`List::EMPTY`
+    /// when it has no generic arguments; `Self` is always the table's concrete type).
+    At(List),
 }
 
 /// One method of a trait.
@@ -107,8 +95,9 @@ pub struct ObjectMethod {
 pub enum Word {
     /// Method `item` of trait `trait_`, an instance at `args`.
     Method { trait_: ItemKey, item: ItemKey, args: TraitArgs },
-    /// The address of the same type's table for supertrait `S`, off the first chain.
-    Super(ItemKey),
+    /// The address of the same concrete type's table for supertrait `trait_` at `args`,
+    /// off the first chain.
+    Super { trait_: ItemKey, args: TraitArgs },
 }
 
 /// How a pointer to `dyn Principal` becomes a pointer to `dyn S`.
@@ -125,17 +114,14 @@ pub enum Upcast {
 pub enum VtableError {
     /// The world gave no [`ObjectTrait`] for this trait.
     NoTrait(ItemKey),
-    /// A table past 2^32 words.
+    /// A table past 2^32 words (or its type table is full).
     TooLarge,
-    /// Supertrait `super_` of `trait_` names an argument position past `trait_`'s own
-    /// arguments, or a span past the pool: the world's facts are malformed.
+    /// Supertrait `super_` of `trait_` names an argument past `trait_`'s own arguments, or a
+    /// malformed type list in `ObjectTrait::tys`: the world's facts are malformed.
     SuperArg { trait_: ItemKey, super_: ItemKey },
     /// A trait reached twice in one tree at different arguments (`trait X: A<u8> + A<u16>`):
     /// a slot or an upcast named by the trait alone would be ambiguous.
     TwiceAtOtherArgs(ItemKey),
-    /// A generic supertrait off the first chain: its word is the address of its own table,
-    /// which a [`Word::Super`] names by the trait alone, without arguments.
-    GenericSuper(ItemKey),
 }
 
 impl fmt::Display for VtableError {
@@ -147,35 +133,42 @@ impl fmt::Display for VtableError {
                 write!(f, "trait {:#x}: its supertrait {:#x} names an argument past the trait's own (malformed trait-object facts)", trait_.0, super_.0)
             }
             VtableError::TwiceAtOtherArgs(t) => write!(f, "trait {:#x} is reached twice in one table's supertraits at different arguments, which a table does not carry", t.0),
-            VtableError::GenericSuper(t) => {
-                write!(f, "trait {:#x}: a supertrait with generic arguments off the first supertrait chain, whose table word does not carry arguments yet", t.0)
-            }
         }
     }
 }
 
-/// The words after the header of `principal`'s tables, and which traits are its prefix.
-pub struct Shape<A: Allocator> {
-    pub principal: ItemKey,
-    pub words: Vec<Word, A>,
-    /// The principal and its first supertrait chain: an upcast to one keeps the pointer.
-    pub prefix: Vec<ItemKey, A>,
-    /// The pool [`TraitArgs::At`] spans index: positions in a table's `[concrete, principal
-    /// args..]`.
-    pub args: Vec<u32, A>,
+fn map_copy_err(e: CheckError, bad: VtableError) -> VtableError {
+    match e {
+        CheckError::Limit(_) => VtableError::TooLarge,
+        _ => bad,
+    }
 }
 
-impl<A: Allocator + Copy> Shape<A> {
+/// The words after the header of `principal`'s tables, and which traits are its prefix.
+pub struct Shape<'a> {
+    pub principal: ItemKey,
+    pub words: blaze_own::Vec<Word, Alloc<'a>>,
+    /// The principal and its first supertrait chain: an upcast to one keeps the pointer.
+    pub prefix: blaze_own::Vec<ItemKey, Alloc<'a>>,
+    /// The composed supertrait argument types indexed by [`TraitArgs::At`], parameterized
+    /// over the principal's `[Self = Param(0), principal args..]` (`Param(1)..`).
+    pub tys: PortableTys<'a>,
+}
+
+impl<'a> Shape<'a> {
     /// The shape of `principal`'s tables. `facts` is the world's [`ObjectTrait`] of a trait.
     /// Depth first without recursion: a stack of (trait, next supertrait, on the first chain,
-    /// its arguments). A supertrait's arguments are its trait's, composed: `dyn Fn<(u8,)>`'s
-    /// `FnMut<Args>` is at `[concrete, (u8,)]`, positions `[0, 1]`.
-    pub fn of<'f>(principal: ItemKey, facts: impl Fn(ItemKey) -> Option<ObjectTrait<'f>>, alloc: A) -> Result<Shape<A>, VtableError> {
-        let mut words = Vec::new_in(alloc);
-        let mut prefix = Vec::new_in(alloc);
-        let mut args: Vec<u32, A> = Vec::new_in(alloc);
-        let mut seen: Vec<(ItemKey, TraitArgs), A> = Vec::new_in(alloc);
-        let mut stack: Vec<(ItemKey, usize, bool, TraitArgs), A> = Vec::new_in(alloc);
+    /// its arguments). A supertrait's arguments are substituted through its trait's own
+    /// composed arguments: `trait A: B<[u8]>` with `trait B<X>: C<Option<X>>` lays `C` out at
+    /// `[Option<[u8]>]`.
+    pub fn of<'f>(principal: ItemKey, facts: impl Fn(ItemKey) -> Option<ObjectTrait<'f>>, alloc: Alloc<'a>) -> Result<Shape<'a>, VtableError> {
+        let mut words = blaze_own::Vec::new_in(alloc);
+        let mut prefix = blaze_own::Vec::new_in(alloc);
+        let mut tys = PortableTys::new_in(alloc);
+        let mut seen: blaze_own::Vec<(ItemKey, TraitArgs), Alloc<'a>> = blaze_own::Vec::new_in(alloc);
+        let mut stack: blaze_own::Vec<(ItemKey, usize, bool, TraitArgs), Alloc<'a>> = blaze_own::Vec::new_in(alloc);
+        let mut copied: blaze_own::Vec<PTy, Alloc<'a>> = blaze_own::Vec::new_in(alloc);
+        let mut parent_with_self: blaze_own::Vec<PTy, Alloc<'a>> = blaze_own::Vec::new_in(alloc);
         seen.push((principal, TraitArgs::Principal));
         stack.push((principal, 0, true, TraitArgs::Principal));
         while let Some(&(t, next, first, at)) = stack.last() {
@@ -185,21 +178,31 @@ impl<A: Allocator + Copy> Shape<A> {
                 stack[top].1 = next + 1;
                 let is_first = next == 0;
                 let bad = VtableError::SuperArg { trait_: t, super_: s.trait_ };
-                let written = s.args.of(o.super_args).ok_or(bad)?;
-                // `s`'s positions in the table's list: `Self` (the concrete type, 0), then each
-                // argument through `t`'s own positions.
-                let start = args.len();
-                args.push(0);
-                for &p in written {
-                    let q = match at {
-                        TraitArgs::Principal => p,
-                        TraitArgs::At(span) => *span.of(&args).and_then(|own| own.get(p as usize)).ok_or(bad)?,
-                    };
-                    args.push(q);
-                }
-                let span = ArgSpan {
-                    at: u32::try_from(start).map_err(|_| VtableError::TooLarge)?,
-                    len: u32::try_from(args.len() - start).map_err(|_| VtableError::TooLarge)?,
+                let written = o.tys.list(s.args).map_err(|_| bad)?;
+                let composed = if written.is_empty() {
+                    List::EMPTY
+                } else {
+                    copied.clear();
+                    match at {
+                        TraitArgs::Principal => {
+                            for &a in written {
+                                let c = tys.copy_from(o.tys, a, None).map_err(|e| map_copy_err(e, bad))?;
+                                copied.push(c);
+                            }
+                        }
+                        TraitArgs::At(parent_list) => {
+                            parent_with_self.clear();
+                            let self_ty = tys.intern(PNode::Param(0)).map_err(|_| VtableError::TooLarge)?;
+                            parent_with_self.push(self_ty);
+                            let own = tys.view().list(parent_list).map_err(|_| bad)?;
+                            parent_with_self.extend_from_slice(own);
+                            for &a in written {
+                                let c = tys.copy_from(o.tys, a, Some(&parent_with_self)).map_err(|e| map_copy_err(e, bad))?;
+                                copied.push(c);
+                            }
+                        }
+                    }
+                    tys.intern_list(&copied).map_err(|_| VtableError::TooLarge)?
                 };
                 match seen.iter().find(|(k, _)| *k == s.trait_).map(|&(_, before)| before) {
                     Some(before) => {
@@ -207,16 +210,15 @@ impl<A: Allocator + Copy> Shape<A> {
                         // (E0391); it is met here only as already laid out.
                         let same = match before {
                             TraitArgs::Principal => true,
-                            TraitArgs::At(b) => b.of(&args) == span.of(&args),
+                            TraitArgs::At(b) => b == composed,
                         };
-                        args.truncate(start);
                         if !same {
                             return Err(VtableError::TwiceAtOtherArgs(s.trait_));
                         }
                     }
                     None => {
-                        seen.push((s.trait_, TraitArgs::At(span)));
-                        stack.push((s.trait_, 0, first && is_first, TraitArgs::At(span)));
+                        seen.push((s.trait_, TraitArgs::At(composed)));
+                        stack.push((s.trait_, 0, first && is_first, TraitArgs::At(composed)));
                     }
                 }
                 continue;
@@ -225,31 +227,28 @@ impl<A: Allocator + Copy> Shape<A> {
             words.extend(o.methods.iter().filter(|m| m.dispatch).map(|m| Word::Method { trait_: t, item: m.item, args: at }));
             match first {
                 true => prefix.push(t),
-                false => {
-                    if let TraitArgs::At(span) = at
-                        && span.len > 1
-                    {
-                        return Err(VtableError::GenericSuper(t));
-                    }
-                    words.push(Word::Super(t));
-                }
+                false => words.push(Word::Super { trait_: t, args: at }),
             }
         }
         u32::try_from(words.len()).ok().and_then(|n| n.checked_add(HEADER_WORDS)).ok_or(VtableError::TooLarge)?;
-        Ok(Shape { principal, words, prefix, args })
+        Ok(Shape { principal, words, prefix, tys })
     }
 
     /// The slot (after the header) of method `item`, `None` when it has none.
     pub fn slot(&self, item: ItemKey) -> Option<u32> {
-        self.words.iter().position(|w| matches!(*w, Word::Method { item: i, .. } if i == item)).map(|at| at as u32)
+        self.words.iter().position(|w| matches!(*w, Word::Method { item: i, .. } if i == item)).and_then(|at| u32::try_from(at).ok())
     }
 
     /// How to upcast to supertrait `to`; `None` when `to` is not the principal or above it.
     pub fn upcast(&self, to: ItemKey) -> Option<Upcast> {
-        if self.prefix.contains(&to) {
+        if self.prefix.scan_for(&to).is_some() {
             return Some(Upcast::Prefix);
         }
-        self.words.iter().position(|w| *w == Word::Super(to)).map(|at| Upcast::Load(at as u32))
+        self.words
+            .iter()
+            .position(|w| matches!(*w, Word::Super { trait_, .. } if trait_ == to))
+            .and_then(|at| u32::try_from(at).ok())
+            .map(Upcast::Load)
     }
 }
 
@@ -330,8 +329,9 @@ pub enum VtableTarget {
     /// A fn instance's entry: the drop glue, or a trait method at `[T, trait args..]` (the
     /// world resolves it to the impl's, as for any trait method call).
     Fn(Instance),
-    /// The same concrete type's table for supertrait `S` (a supertrait has no arguments here).
-    Super(ItemKey),
+    /// The same concrete type's table for a supertrait off the first chain, with its grounded
+    /// arguments after `Self`.
+    Super(VtableRef),
 }
 
 /// One table: its bytes (the header's size and alignment, every other word 0) and relocations
@@ -345,7 +345,18 @@ impl<A: Allocator + Copy> Vtable<A> {
     /// `concrete`'s table for `shape`'s principal at `args` (the principal's arguments, types of
     /// the ground table, which `concrete` is in too). `size` and `align` are bytes; `drop` the
     /// glue instance when `concrete` needs drop.
-    pub fn build(shape: &Shape<A>, concrete: PTy, args: &[PTy], size: u64, align: u64, drop: Option<Instance>, ground: &mut PortableTys<'_>, alloc: A) -> Result<Vtable<A>, BuildError> {
+    pub fn build(
+        shape: &Shape<'_>,
+        concrete: PTy,
+        args: &[PTy],
+        size: u64,
+        align: u64,
+        drop: Option<Instance>,
+        ground: &mut PortableTys<'_>,
+        facts: &dyn LayoutFacts,
+        scratch: Alloc<'_>,
+        alloc: A,
+    ) -> Result<Vtable<A>, BuildError> {
         let full = || BuildError::Malformed { what: "the ground table is full" };
         let words = shape.words.len() + HEADER_WORDS as usize;
         let mut bytes = Vec::with_capacity_in(8 * words, alloc);
@@ -356,25 +367,42 @@ impl<A: Allocator + Copy> Vtable<A> {
         if let Some(glue) = drop {
             relocs.push((0, VtableTarget::Fn(glue)));
         }
-        let mut with_args: Vec<PTy, A> = Vec::with_capacity_in(1 + args.len(), alloc);
+        let mut with_args: blaze_own::Vec<PTy, Alloc<'_>> = blaze_own::Vec::with_capacity_in(1 + args.len(), scratch);
         with_args.push(concrete);
         with_args.extend_from_slice(args);
         let principal_args = ground.intern_list(&with_args).map_err(|_| full())?;
-        let mut picked: Vec<PTy, A> = Vec::new_in(alloc);
+        let shape_view = shape.tys.view();
+        let mut picked: blaze_own::Vec<PTy, Alloc<'_>> = blaze_own::Vec::new_in(scratch);
         for (i, w) in shape.words.iter().enumerate() {
-            let offset = 8 * (HEADER_WORDS + i as u32);
+            let word_idx = u32::try_from(i).map_err(|_| BuildError::Malformed { what: "a vtable past 2^32 words" })?;
+            let offset = 8 * (HEADER_WORDS + word_idx);
             let to = match *w {
                 Word::Method { item, args: TraitArgs::Principal, .. } => VtableTarget::Fn(Instance { item, args: principal_args }),
-                Word::Method { item, args: TraitArgs::At(span), .. } => {
-                    let at = span.of(&shape.args).ok_or(BuildError::Malformed { what: "a vtable word's arguments past its shape's pool" })?;
+                Word::Method { item, args: TraitArgs::At(list), .. } => {
+                    let at = shape_view.list(list).map_err(|_| BuildError::Malformed { what: "a vtable word's arguments past its shape's table" })?;
                     picked.clear();
-                    for &p in at {
-                        picked.push(*with_args.get(p as usize).ok_or(BuildError::Malformed { what: "a supertrait argument past the principal's arguments" })?);
+                    picked.push(concrete);
+                    for &a in at {
+                        let g = crate::instance::ground(shape_view, a, &with_args, ground, scratch, facts)?;
+                        picked.push(g);
                     }
                     let args: List = ground.intern_list(&picked).map_err(|_| full())?;
                     VtableTarget::Fn(Instance { item, args })
                 }
-                Word::Super(s) => VtableTarget::Super(s),
+                Word::Super { trait_, args: TraitArgs::Principal } => {
+                    let args: List = ground.intern_list(args).map_err(|_| full())?;
+                    VtableTarget::Super(VtableRef { concrete, principal: trait_, args })
+                }
+                Word::Super { trait_, args: TraitArgs::At(list) } => {
+                    let at = shape_view.list(list).map_err(|_| BuildError::Malformed { what: "a supertrait word's arguments past its shape's table" })?;
+                    picked.clear();
+                    for &a in at {
+                        let g = crate::instance::ground(shape_view, a, &with_args, ground, scratch, facts)?;
+                        picked.push(g);
+                    }
+                    let args: List = ground.intern_list(&picked).map_err(|_| full())?;
+                    VtableTarget::Super(VtableRef { concrete, principal: trait_, args })
+                }
             };
             relocs.push((offset, to));
         }
@@ -386,7 +414,7 @@ impl<A: Allocator + Copy> Vtable<A> {
     pub fn record<E>(
         &self,
         mut fn_key: impl FnMut(Instance) -> Result<InstanceKey, E>,
-        mut super_key: impl FnMut(ItemKey) -> Result<VtableKey, E>,
+        mut super_key: impl FnMut(VtableRef) -> Result<VtableKey, E>,
         alloc: A,
     ) -> Result<DataRecord<A>, E> {
         let mut bytes = Vec::with_capacity_in(self.bytes.len(), alloc);

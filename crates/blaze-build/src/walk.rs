@@ -924,7 +924,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 if a == b {
                     continue;
                 }
-                let shape = crate::vtable::Shape::of(a, |t| self.adts.object_trait(t), self.alloc)
+                let shape = crate::vtable::Shape::of(a, |t| self.adts.object_trait(t), self.scratch)
                     .map_err(|error| BuildError::Vtable { at: Some(e), error })?;
                 let slot = match shape.upcast(b) {
                     Some(crate::vtable::Upcast::Prefix) => None,
@@ -6107,7 +6107,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             return Ok(None);
         };
         let adts = self.adts;
-        let shape = crate::vtable::Shape::of(principal, |t| adts.object_trait(t), self.alloc)
+        let shape = crate::vtable::Shape::of(principal, |t| adts.object_trait(t), self.scratch)
             .map_err(|error| BuildError::Vtable { at: Some(e), error })?;
         if let Some(slot) = shape.slot(instance.item) {
             return Ok(Some((principal, slot)));
@@ -6120,7 +6120,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         // or `self` by value, which `unsized_fn_params` can call on `Box<dyn FnOnce>`): refused
         // by name. A method of another trait (`impl Other for dyn Tr`) is an ordinary call.
         let traits = shape.prefix.iter().copied().chain(shape.words.iter().filter_map(|w| match *w {
-            crate::vtable::Word::Super(s) => Some(s),
+            crate::vtable::Word::Super { trait_, .. } => Some(trait_),
             crate::vtable::Word::Method { .. } => None,
         }));
         for t in traits {

@@ -276,6 +276,10 @@ pub trait FrontEnd {
     fn adt(&self, key: ItemKey) -> Option<Adt<'_>>;
     /// An item's name for messages, where the front end can give it.
     fn item_named(&self, key: ItemKey) -> Option<Box<str>>;
+    /// The item paths `type_name` and the validity assertions print (`blaze_build::Adts::type_names`).
+    fn type_names(&self) -> Option<&dyn blaze_build::type_name::TypeNames> {
+        None
+    }
     /// Why a survey left `key` out of the program (a reached fn whose check failed, an ADT row
     /// not made, a fn with no head or no body): the build's "no ABI", "no ADT row" and "no
     /// callee" refusals of a call or a type naming it then say this cause instead of only the

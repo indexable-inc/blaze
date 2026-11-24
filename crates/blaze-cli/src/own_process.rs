@@ -618,7 +618,7 @@ mod tests {
             launcher: std::boxed::Box::from(launcher.as_str()),
             exe: std::boxed::Box::from(exe),
             there,
-            error: bstd::procs::RunError { step: bstd::procs::RunStep::Start, proc: None, fault: bstd::procs::RunFault::Host("starting it") },
+            error: bstd::procs::RunError { step: bstd::procs::RunStep::Start, proc: None, fault: bstd::procs::RunFault::Host { what: "starting it", os: 0 } },
         };
         let said = std::format!("{error}");
         assert!(said.contains("no `blaze-launcher` beside `/opt/blaze/bin/blaze`") && said.contains("/opt/blaze/bin/blaze-launcher"), "{said}");

@@ -101,9 +101,7 @@ fn inherited(own: RawFd) -> io::Result<OwnedFd> {
     // SAFETY: no pointers; on a closed `own` the call fails with EBADF, which is returned.
     let copied = unsafe { libc::fcntl(own, libc::F_DUPFD_CLOEXEC, 3) };
     if copied < 0 {
-        let error = io::Error::last_os_error();
-        // alloc: an error path.
-        return Err(io::Error::new(error.kind(), format!("this process's descriptor {own}, to inherit: {error}")));
+        return Err(io::Error::last_os_error());
     }
     // SAFETY: the call made it; owned once from here.
     Ok(unsafe { OwnedFd::from_raw_fd(copied) })

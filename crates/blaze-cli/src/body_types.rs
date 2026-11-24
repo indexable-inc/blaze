@@ -179,25 +179,46 @@ impl<'f> SyncLazyTrees<'f> {
         Ok(blaze_own::Box::leak_static(blaze_own::Box::new_in(lazy, g)))
     }
 
-    pub(crate) fn tree(&self, cx: &Cx, fs: &bstd::fs::Fs, scratch: &Frame, k: usize) -> Option<PackView<'static>> {
+    pub(crate) fn trees_len(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub(crate) fn open_tree_with(
+        &self,
+        cx: &Cx,
+        fs: &bstd::fs::Fs,
+        dirs: Option<&SyncPackDirs>,
+        scratch: &Frame,
+        k: usize,
+    ) -> Option<(PackView<'static>, bool)> {
         let slot = self.slots.get(k.checked_sub(1)?)?;
-        let got = match slot.get() {
-            Some(got) => got,
+        let (got, newly_opened) = match slot.get() {
+            Some(got) => (*got, false),
             None => {
                 let from = PackHome { home: self.home, fs, heap: self.heap };
-                let mut dirs = PackDirs::default();
-                let opened = open_tree(cx, from, &self.list, k, &mut dirs, scratch);
-                let _ = slot.set(opened);
-                slot.get()?
+                let opened = match dirs {
+                    Some(shared) => open_tree_shared(cx, from, &self.list, k, shared, scratch).map_err(|r| r.0),
+                    None => {
+                        let mut local = PackDirs::default();
+                        open_tree(cx, from, &self.list, k, &mut local, scratch)
+                    }
+                };
+                let newly_opened = slot.set(opened).is_ok();
+                (*slot.get()?, newly_opened)
             }
         };
         match got {
-            Ok(view) => Some(*view),
+            Ok(view) => Some((view, newly_opened)),
             Err(why) => {
-                let _ = self.refused.set(*why);
+                let _ = self.refused.set(why);
                 None
             }
         }
+    }
+
+    pub(crate) fn tree(&self, cx: &Cx, fs: &bstd::fs::Fs, scratch: &Frame, k: usize) -> Option<PackView<'static>> {
+        let (view, _) = self.open_tree_with(cx, fs, None, scratch, k)?;
+        Some(view)
     }
 
     pub(crate) fn refused(&self) -> Option<&'static str> {
@@ -245,6 +266,23 @@ pub(crate) struct PackDirs {
     sources: Option<Dir<ReadOnly>>,
 }
 
+/// Thread-safe, command-scoped cache of the two read-only pack folders (`shelf` and `sources`),
+/// each opened at most once via `Fs::home` and closed when this value drops. Never bump-allocate
+/// or leak this: each opened `Dir<ReadOnly>` owns a secondary driver (`Io::beside`) with its own
+/// file worker thread and descriptor table.
+#[derive(Default)]
+pub(crate) struct SyncPackDirs {
+    shelf: bstd::sync::PublishOnce<Dir<ReadOnly>>,
+    sources: bstd::sync::PublishOnce<Dir<ReadOnly>>,
+}
+
+impl SyncPackDirs {
+    #[cfg(test)]
+    pub(crate) fn opened_count(&self) -> usize {
+        usize::from(self.shelf.get().is_some()) + usize::from(self.sources.get().is_some())
+    }
+}
+
 /// Tree `k` (1-based) of `list` opened from where the table names it ([`open_trees`] says how
 /// and what is refused): THE ONE OPENER of a tree, for both schedules (every tree at once,
 /// [`open_trees`]; each on its first read, [`LazyTrees`]). Its folder is opened in `dirs`
@@ -258,31 +296,29 @@ fn open_tree(cx: &Cx, from: PackHome<'_>, list: &CrateList<'static>, k: usize, d
     open_row(cx, from, row, k, dirs, scratch)
 }
 
-/// Tree `k`'s pack as its row `row` names it, opened and checked as [`open_trees`] says: THE
-/// ONE OPENER of a pack, for a list of any lifetime (native_runner_c.rs lays a fetched
-/// package's files from it). Its folder is opened in `dirs` the first time a pack of it is
-/// asked; a refusal's words are kept on `from.heap`.
-pub(crate) fn open_row(cx: &Cx, from: PackHome<'_>, row: TreeRow, k: usize, dirs: &mut PackDirs, scratch: &Frame) -> Result<PackView<'static>, &'static str> {
+/// Typed refusal from opening or verifying a single pack file.
+#[derive(Clone, Copy, Debug)]
+struct PackRefusal(&'static str);
+
+fn open_tree_shared(cx: &Cx, from: PackHome<'_>, list: &CrateList<'static>, k: usize, dirs: &SyncPackDirs, scratch: &Frame) -> Result<PackView<'static>, PackRefusal> {
     let heap = from.heap;
-    let kept = |words: &str| -> &'static str { blaze_own::Box::leak_static(blaze_own::AString::from_str_in(words, heap.alloc()).into_boxed_str()) };
-    let (folder, name, dir) = match row.origin {
-        PackOrigin::Shelf { digest } => (crate::toolchain::SHELF, digest, &mut dirs.shelf),
-        PackOrigin::Source { key } => (crate::fetch::SOURCES, key.0, &mut dirs.sources),
+    let kept = |words: &str| -> PackRefusal { PackRefusal(blaze_own::Box::leak_static(blaze_own::AString::from_str_in(words, heap.alloc()).into_boxed_str())) };
+    let Some(row) = list.tree(k) else {
+        return Err(kept(bstd::mem::format_in!(scratch, "the crate list names no tree {k} of its {} (blaze-world crate_list.rs)", list.trees()).as_str()));
     };
-    let hex = crate::fetch::key_hex(&ContentId(name));
-    let hex = core::str::from_utf8(&hex).map_err(|_| "a pack's name is not hex (fetch.rs `key_hex`)")?;
-    let at = bstd::mem::format_in!(scratch, "tree {k} of the crate list, `<home>/{folder}/{hex}`");
-    if dir.is_none() {
-        let Some(home) = from.home else {
-            return Err(kept(bstd::mem::format_in!(scratch, "{at}: HOME is not set, and the pack is beneath it").as_str()));
-        };
-        let path = Path::new(folder).map_err(|e| kept(bstd::mem::format_in!(scratch, "{at}: {e}").as_str()))?;
-        let opened = from.fs.home(cx, home, &path).map_err(|e| kept(bstd::mem::format_in!(scratch, "{at}: {e}").as_str()))?;
-        *dir = Some(opened.read_only());
-    }
-    let Some(dir) = dir.as_ref() else {
-        return Err(kept(bstd::mem::format_in!(scratch, "{at}: its folder was not opened").as_str()));
-    };
+    open_row_shared(cx, from, row, k, dirs, scratch)
+}
+
+fn map_pack_in_dir(
+    cx: &Cx,
+    dir: &Dir<ReadOnly>,
+    row: TreeRow,
+    hex: &str,
+    at: &str,
+    heap: &'static blaze_own::Heap,
+    scratch: &Frame,
+) -> Result<PackView<'static>, PackRefusal> {
+    let kept = |words: &str| -> PackRefusal { PackRefusal(blaze_own::Box::leak_static(blaze_own::AString::from_str_in(words, heap.alloc()).into_boxed_str())) };
     let file = Path::new(hex).map_err(|e| kept(bstd::mem::format_in!(scratch, "{at}: {e}").as_str()))?;
     let mapping = dir.map_read(cx, &file).map_err(|e| kept(bstd::mem::format_in!(scratch, "{at} could not be mapped: {e}").as_str()))?;
     // Kept for the command: every body reads the pack's files in place.
@@ -300,28 +336,114 @@ pub(crate) fn open_row(cx: &Cx, from: PackHome<'_>, row: TreeRow, k: usize, dirs
     Ok(view)
 }
 
-/// What opens tree `k` of a crate list at its first read ([`LazyTrees`]): the list's own
-/// opener ([`ListTrees`], over [`open_tree`]), or a test's.
+fn open_home_pack_dir(cx: &Cx, from: PackHome<'_>, folder: &str, at: &str, scratch: &Frame) -> Result<Dir<ReadOnly>, PackRefusal> {
+    let heap = from.heap;
+    let kept = |words: &str| -> PackRefusal { PackRefusal(blaze_own::Box::leak_static(blaze_own::AString::from_str_in(words, heap.alloc()).into_boxed_str())) };
+    let Some(home) = from.home else {
+        return Err(kept(bstd::mem::format_in!(scratch, "{at}: HOME is not set, and the pack is beneath it").as_str()));
+    };
+    let path = Path::new(folder).map_err(|e| kept(bstd::mem::format_in!(scratch, "{at}: {e}").as_str()))?;
+    let opened = from.fs.home(cx, home, &path).map_err(|e| kept(bstd::mem::format_in!(scratch, "{at}: {e}").as_str()))?;
+    Ok(opened.read_only())
+}
+
+fn open_row_shared(cx: &Cx, from: PackHome<'_>, row: TreeRow, k: usize, dirs: &SyncPackDirs, scratch: &Frame) -> Result<PackView<'static>, PackRefusal> {
+    let (folder, name, slot) = match row.origin {
+        PackOrigin::Shelf { digest } => (crate::toolchain::SHELF, digest, &dirs.shelf),
+        PackOrigin::Source { key } => (crate::fetch::SOURCES, key.0, &dirs.sources),
+    };
+    let hex = crate::fetch::key_hex(&ContentId(name));
+    let hex = core::str::from_utf8(&hex).map_err(|_| PackRefusal("a pack's name is not hex (fetch.rs `key_hex`)"))?;
+    let at = bstd::mem::format_in!(scratch, "tree {k} of the crate list, `<home>/{folder}/{hex}`");
+    let dir = match slot.get() {
+        Some(dir) => dir,
+        None => {
+            let opened = open_home_pack_dir(cx, from, folder, at.as_str(), scratch)?;
+            // If another thread raced and published first, `opened` drops here and closes its driver.
+            let _ = slot.set(opened);
+            let Some(dir) = slot.get() else {
+                let kept = |words: &str| -> PackRefusal { PackRefusal(blaze_own::Box::leak_static(blaze_own::AString::from_str_in(words, from.heap.alloc()).into_boxed_str())) };
+                return Err(kept(bstd::mem::format_in!(scratch, "{at}: its folder was not opened").as_str()));
+            };
+            dir
+        }
+    };
+    map_pack_in_dir(cx, dir, row, hex, at.as_str(), from.heap, scratch)
+}
+
+/// Tree `k`'s pack as its row `row` names it, opened and checked as [`open_trees`] says: THE
+/// ONE OPENER of a pack, for a list of any lifetime (native_runner_c.rs lays a fetched
+/// package's files from it). Its folder is opened in `dirs` the first time a pack of it is
+/// asked; a refusal's words are kept on `from.heap`.
+pub(crate) fn open_row(cx: &Cx, from: PackHome<'_>, row: TreeRow, k: usize, dirs: &mut PackDirs, scratch: &Frame) -> Result<PackView<'static>, &'static str> {
+    let heap = from.heap;
+    let kept = |words: &str| -> &'static str { blaze_own::Box::leak_static(blaze_own::AString::from_str_in(words, heap.alloc()).into_boxed_str()) };
+    let (folder, name, dir) = match row.origin {
+        PackOrigin::Shelf { digest } => (crate::toolchain::SHELF, digest, &mut dirs.shelf),
+        PackOrigin::Source { key } => (crate::fetch::SOURCES, key.0, &mut dirs.sources),
+    };
+    let hex = crate::fetch::key_hex(&ContentId(name));
+    let hex = core::str::from_utf8(&hex).map_err(|_| "a pack's name is not hex (fetch.rs `key_hex`)")?;
+    let at = bstd::mem::format_in!(scratch, "tree {k} of the crate list, `<home>/{folder}/{hex}`");
+    if dir.is_none() {
+        *dir = Some(open_home_pack_dir(cx, from, folder, at.as_str(), scratch).map_err(|r| r.0)?);
+    }
+    let Some(dir) = dir.as_ref() else {
+        return Err(kept(bstd::mem::format_in!(scratch, "{at}: its folder was not opened").as_str()));
+    };
+    map_pack_in_dir(cx, dir, row, hex, at.as_str(), heap, scratch).map_err(|r| r.0)
+}
+
+/// Command-wide lazy pack view with per-session open/refusal accounting ([`TreesSeen`]).
+/// Holds only shared references (no `Drop` resources), so bump-allocating it per suite never
+/// leaks secondary drivers or file descriptors while sharing one [`SyncLazyTrees`] mapping cache
+/// and one command-scoped [`SyncPackDirs`] across all suites and code workers.
+#[derive(Clone, Copy)]
+pub(crate) struct SharedTrees<'n> {
+    packs: &'static SyncLazyTrees<'static>,
+    fs: &'n bstd::fs::Fs,
+    dirs: &'n SyncPackDirs,
+    seen: &'n TreesSeen,
+}
+
+impl<'n> SharedTrees<'n> {
+    pub(crate) fn new(
+        packs: &'static SyncLazyTrees<'static>,
+        fs: &'n bstd::fs::Fs,
+        dirs: &'n SyncPackDirs,
+        seen: &'n TreesSeen,
+    ) -> SharedTrees<'n> {
+        seen.trees.set(u32::try_from(packs.trees_len()).unwrap_or(u32::MAX));
+        SharedTrees { packs, fs, dirs, seen }
+    }
+
+    pub(crate) fn tree(&self, cx: &Cx, scratch: &Frame, k: usize) -> Option<PackView<'static>> {
+        match self.packs.open_tree_with(cx, self.fs, Some(self.dirs), scratch, k) {
+            Some((view, newly_opened)) => {
+                if newly_opened {
+                    self.seen.opened.set(self.seen.opened.get() + 1);
+                }
+                Some(view)
+            }
+            None => {
+                if let Some(why) = self.packs.refused()
+                    && self.seen.refused.get().is_none()
+                {
+                    self.seen.refused.set(Some(why));
+                }
+                None
+            }
+        }
+    }
+
+    pub(crate) fn refused(&self) -> Option<&'static str> {
+        self.seen.refused().or_else(|| self.packs.refused())
+    }
+}
+
+/// What opens tree `k` of a crate list at its first read ([`LazyTrees`]).
 pub(crate) trait OpenTree {
     fn open(&self, k: usize) -> Result<PackView<'static>, &'static str>;
-}
-
-/// [`open_tree`] over one crate list, its folders opened at the first pack asked of each.
-pub(crate) struct ListTrees<'n> {
-    pub(crate) cx: &'n Cx,
-    pub(crate) from: PackHome<'n>,
-    pub(crate) list: &'n CrateList<'static>,
-    pub(crate) scratch: &'n Frame,
-    pub(crate) dirs: core::cell::RefCell<PackDirs>,
-}
-
-impl OpenTree for ListTrees<'_> {
-    fn open(&self, k: usize) -> Result<PackView<'static>, &'static str> {
-        let _opening = self.cx.span("run names: open a tree at its first read");
-        // One job, one thread (the run's parent): the folders' borrow ends with this open.
-        let mut dirs = self.dirs.borrow_mut();
-        open_tree(self.cx, self.from, self.list, k, &mut dirs, self.scratch)
-    }
 }
 
 /// A slot of [`LazyTrees`]: empty until its tree's first read, then the pack or why not.
@@ -503,5 +625,52 @@ pub(crate) fn names_world<'f>(
             Ok(Ok(()))
         }
         Err(_) => Ok(Err("the crates' inputs could not be made (names.rs `world`): the `CrateScope` tasks say why")),
+    }
+}
+
+#[cfg(test)]
+mod shared_pack_tests {
+    use super::*;
+    use blaze_fetch::Mode;
+    use blaze_fetch::pack::{Builder, Kind as PackKind, Limits as PackLimits};
+    use bstd::fs::{Content, Durable};
+    use bstd::io::{Io, Limits, SimWorld};
+
+    /// Regression for multi-suite `blaze test` FD/driver exhaustion: opening the same pack
+    /// across many suites through one command-scoped `SyncPackDirs` opens the home folder at
+    /// most once (not once per suite) and cleanly drops it at scope exit.
+    #[test]
+    fn shared_pack_dirs_opens_each_home_folder_at_most_once() {
+        let io = Io::simulated(SimWorld::new(91, Limits::USUAL));
+        let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("root cx");
+        let fs = io.need_fs().expect("fs");
+        let frame = Frame::new(bstd::mem::Tag::Other).expect("frame");
+        let heap = blaze_own::testing::heap();
+
+        let limits = PackLimits { most_files: 8, most_bytes: 1 << 16, most_path: 128 };
+        let mut builder = Builder::new(PackKind::Crate, [0x42; 32], limits, 0, heap.alloc()).expect("builder");
+        builder.file("src/lib.rs", Mode::File, b"pub fn ok() {}\n").expect("file");
+        let pack_bytes = builder.finish().expect("pack bytes");
+        let verified = PackView::open_verified(&pack_bytes).expect("valid pack");
+        let key = ContentId::of("shared_pack_dirs test", &pack_bytes);
+        let hex_bytes = crate::fetch::key_hex(&key);
+        let hex = core::str::from_utf8(&hex_bytes).expect("hex");
+
+        let home = "/h";
+        let sources_dir = fs.home(&cx, home, &Path::new(crate::fetch::SOURCES).expect("sources path")).expect("sources home");
+        sources_dir.publish(&cx, &Path::new(hex).expect("hex path"), Content::bytes(&pack_bytes), Durable::No).expect("publish pack");
+        drop(sources_dir);
+
+        let dirs = SyncPackDirs::default();
+        assert_eq!(dirs.opened_count(), 0);
+        let from = PackHome { home: Some(home), fs: &fs, heap };
+        let row = TreeRow { origin: PackOrigin::Source { key }, kind: PackKind::Crate, files: verified.tree().0 };
+
+        for _ in 0..64 {
+            let view = open_row_shared(&cx, from, row, 1, &dirs, &frame).unwrap_or_else(|e| panic!("open pack: {}", e.0));
+            let file = view.find("src/lib.rs").expect("src/lib.rs");
+            assert_eq!(file.bytes, b"pub fn ok() {}\n");
+        }
+        assert_eq!(dirs.opened_count(), 1, "64 suite opens must share one sources Dir, never open 64 drivers");
     }
 }

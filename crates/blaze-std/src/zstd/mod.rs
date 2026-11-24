@@ -27,6 +27,9 @@ use core::fmt;
 
 use blaze_own::{AllocFailure, Vec};
 
+pub use decode::ZstdDecoder;
+pub use encode::ZstdEncoder;
+
 pub(crate) const ZSTD_MAGIC: u32 = 0xFD2F_B528;
 pub(crate) const SKIPPABLE_MAGIC_MIN: u32 = 0x184D_2A50;
 pub(crate) const SKIPPABLE_MAGIC_MAX: u32 = 0x184D_2A5F;

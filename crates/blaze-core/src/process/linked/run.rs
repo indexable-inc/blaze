@@ -410,6 +410,53 @@ mod tests {
         assert_eq!(sid, child_pid, "detached child leads its own session (sid == pid)");
         assert_ne!(sid, own_sid, "detached child is in a different session from its parent");
     }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn open_fd_count() -> usize {
+        // SAFETY: `F_GETFD` inspects descriptor existence without side effects; closed fds return -1/EBADF.
+        (0..1024).filter(|&fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0).count()
+    }
+
+    /// Spawning many linked children (piped stdout/stderr, channel on fd 3, own process group)
+    /// must not leak file descriptors or leave unreaped zombies, and a spawn failure must
+    /// preserve its OS errno (e.g. ENOENT) instead of returning 0.
+    #[test]
+    fn many_linked_spawns_leak_no_descriptors_or_zombies_and_preserve_errno() {
+        let bound = Deadline::at(Duration::from_secs(30));
+        let before_fds = open_fd_count();
+        for _ in 0..64 {
+            let (parent, end) = channel::pair().expect("a socket pair");
+            let given = [(end.as_fd(), channel::CHILD_FD)];
+            let run_link = RunLink {
+                inherit: &given,
+                own_group: true,
+                streams: Streams::PIPED,
+                arg0: None,
+                parent_death: ParentDeath::DropOnly,
+                confine: None,
+            };
+            let started = start_run(&sh("exit 0"), &run_link).expect("sh starts");
+            drop(end);
+            assert_eq!(ended(started.child, bound), Exit::Exited(0));
+            drop(started.stdout);
+            drop(started.stderr);
+            drop(parent);
+        }
+        let after_fds = open_fd_count();
+        // Each iteration opens 4+ FDs (socketpair, stdout pipe, stderr pipe, kqueue/pidfd,
+        // /dev/null); even a 1-FD leak per spawn would grow open FDs by >= 64.
+        assert!(
+            after_fds.saturating_sub(before_fds) < 16,
+            "FD leak across 64 linked spawns: before={before_fds}, after={after_fds}"
+        );
+        let mut missing = sh("");
+        missing.program = PathBuf::from("/nonexistent/blaze-spawn-errno-check");
+        missing.args.clear();
+        missing.env.clear();
+        let err = start_run(&missing, &link(&[], Streams::PIPED)).err().expect("missing binary must fail");
+        assert_eq!(err.op, LinkOp::Spawn);
+        assert_eq!(err.os, libc::ENOENT, "expected ENOENT, got {err}");
+    }
 }
 
 // The child's confine step (D177), on the host's kernel: Landlock and seccomp entered between

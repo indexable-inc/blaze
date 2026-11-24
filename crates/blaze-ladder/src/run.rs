@@ -12,7 +12,7 @@ use std::alloc::Global;
 use blaze_build::data::{DataAlloc, DataError, DataRecord, DataTarget, ImageTarget, StaticImage};
 use blaze_build::tls::{self, TlsError};
 use blaze_build::layout::{LayoutCx, LayoutFacts, Layouts, Missing, ReprAttrs, ValidRange};
-use blaze_build::vtable::{Shape, Vtable, VtableRef, VtableTarget, Word};
+use blaze_build::vtable::{Shape, Vtable, VtableRef, VtableTarget};
 use blaze_consteval::{
     Answer, Codes, ConstError, ConstRecord, ConstWorld, FnKind as ConstFnKind, Limits, Lits, Need, NeedKind, RecordKey, Settle,
     Typed, value_of,
@@ -1034,6 +1034,10 @@ impl<P: FrontEnd> Adts for FrontAdts<'_, P> {
 
     fn lang_fn(&self, name: &str) -> Option<ItemKey> {
         self.0.fn_lang(FnLang::named(name)?)
+    }
+
+    fn type_names(&self) -> Option<&dyn blaze_build::type_name::TypeNames> {
+        self.0.type_names()
     }
 
     fn future_poll(&self) -> Option<ItemKey> {
@@ -2918,16 +2922,7 @@ fn build_from<P: FrontEnd>(
                         stack.pop();
                         continue;
                     }
-                    let shape = Shape::of(t.principal, |k| program.object_trait(k), Global).map_err(|e| fail(VtableFail::Shape(e)))?;
-                    let above = |s: ItemKey| VtableRef { concrete: t.concrete, principal: s, args: List::EMPTY };
-                    let missing = shape.words.iter().find_map(|w| match *w {
-                        Word::Super(s) => (!tables.refs.contains(&above(s))).then(|| above(s)),
-                        Word::Method { .. } => None,
-                    });
-                    if let Some(r) = missing {
-                        stack.push(r);
-                        continue;
-                    }
+                    let shape = Shape::of(t.principal, |k| program.object_trait(k), alloc).map_err(|e| fail(VtableFail::Shape(e)))?;
                     let mut cx = LayoutCx { ground: &mut ground, facts: &adts, scratch: alloc };
                     let id = layouts.of(t.concrete, &mut cx).map_err(|e| fail(VtableFail::Layout(e)))?;
                     let (size, align) = (layouts.get(id).size, layouts.get(id).align_bytes());
@@ -2944,8 +2939,21 @@ fn build_from<P: FrontEnd>(
                     let glue_item = glue.map(|g| g.item);
                     let mut targs = Vec::new_in(Global);
                     targs.extend_from_slice(ground.view().list(t.args).map_err(|_| full())?);
-                    let table = Vtable::build(&shape, t.concrete, &targs, size, align, glue, &mut ground, Global)
+                    let table = Vtable::build(&shape, t.concrete, &targs, size, align, glue, &mut ground, &adts, alloc, Global)
                         .map_err(|e| fail(VtableFail::Build(e)))?;
+                    let mut pushed_super = false;
+                    for &(_, to) in table.relocs.iter() {
+                        if let VtableTarget::Super(sup) = to
+                            && !tables.refs.contains(&sup)
+                            && !stack.contains(&sup)
+                        {
+                            stack.push(sup);
+                            pushed_super = true;
+                        }
+                    }
+                    if pushed_super {
+                        continue;
+                    }
                     let mut words = Vec::with_capacity_in(table.relocs.len(), Global);
                     for &(offset, to) in table.relocs.iter() {
                         // A fn item of a trait's method as the word's self: the body that runs,
@@ -2980,9 +2988,9 @@ fn build_from<P: FrontEnd>(
                                 let key = key_of(program, c, Instance { item, args }, &mut ground, &adts)?;
                                 VtableWord::Slot(reached.slot(Instance { item, args }, c, key)?)
                             }
-                            VtableTarget::Super(s) => match tables.refs.iter().position(|r| *r == above(s)) {
+                            VtableTarget::Super(sup) => match tables.refs.iter().position(|r| *r == sup) {
                                 Some(n) => VtableWord::Table(u32::try_from(n).map_err(|_| RunError::TooManyInstances)?),
-                                None => return Err(fail(VtableFail::Shape(blaze_build::vtable::VtableError::NoTrait(s)))),
+                                None => return Err(fail(VtableFail::Shape(blaze_build::vtable::VtableError::NoTrait(sup.principal)))),
                             },
                         };
                         words.push((offset, word));

@@ -16,7 +16,7 @@ use bstd::fs::{Dir, ReadWrite};
 use bstd::mem::{Bytes, Frame};
 use bstd::path::Path;
 
-use crate::body_types::{LazyTrees, SyncLazyTrees};
+use crate::body_types::{LazyTrees, SharedTrees, SyncLazyTrees};
 use crate::work::held_str;
 
 /// Thread-safe subset of [`Packs`] for worker pools (`Open` or `SyncLazy`).
@@ -43,6 +43,7 @@ impl<'n> From<SyncPacks<'n>> for Packs<'n> {
 pub(crate) enum Packs<'n> {
     Open(&'n [PackView<'n>]),
     OnFirstRead(&'n LazyTrees<'n>),
+    Shared(SharedTrees<'n>),
     SyncLazy(&'n SyncLazyTrees<'n>, &'n bstd::fs::Fs),
 }
 
@@ -54,6 +55,7 @@ impl<'n> Packs<'n> {
         match self {
             Packs::Open(views) => views.get(k.checked_sub(1)?).copied(),
             Packs::OnFirstRead(lazy) => lazy.tree(k),
+            Packs::Shared(shared) => shared.tree(cx, frame, k),
             Packs::SyncLazy(lazy, fs) => lazy.tree(cx, fs, frame, k),
         }
     }
@@ -68,6 +70,12 @@ impl<'a: 'n, 'p: 'a, 'n> From<&'a [PackView<'p>]> for Packs<'n> {
 impl<'n> From<&'n LazyTrees<'n>> for Packs<'n> {
     fn from(lazy: &'n LazyTrees<'n>) -> Packs<'n> {
         Packs::OnFirstRead(lazy)
+    }
+}
+
+impl<'n> From<SharedTrees<'n>> for Packs<'n> {
+    fn from(shared: SharedTrees<'n>) -> Packs<'n> {
+        Packs::Shared(shared)
     }
 }
 
