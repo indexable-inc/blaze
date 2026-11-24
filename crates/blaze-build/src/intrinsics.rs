@@ -565,17 +565,11 @@ pub fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
         }
         W::VariantCount => {
             let t = t0.ok_or_else(need_t)?;
-            let n = match s.cx.cx.ground.view().node(t).map_err(|_| shape())? {
-                blaze_typeck::PNode::Adt(key, _) => {
-                    let adt = s.cx.cx.facts.adt(key).ok_or(IntrinsicError::Shape { which: c.which, why: "the ADT's definition is missing" })?;
-                    match adt.kind {
-                        blaze_typeck::AdtKind::Enum => adt.variants.len() as u64,
-                        blaze_typeck::AdtKind::Struct | blaze_typeck::AdtKind::Union => 0,
-                    }
-                }
-                _ => 0,
-            };
-            Out::Scalar(s.usize(n))
+            let count = variant_count(t, s.cx.cx.ground.view(), s.cx.cx.facts).map_err(|e| match e {
+                FieldCountError::MissingType => s.shape("a type argument not in the ground table"),
+                FieldCountError::NoAdt(adt) => IntrinsicError::Layout(LayoutError { ty: t, why: crate::layout::Refusal::NoAdt(adt) }),
+            })?;
+            Out::Scalar(s.usize(count))
         }
         W::SizeOfVal | W::AlignOfVal => {
             let id = s.layout(t0.ok_or_else(need_t)?)?;

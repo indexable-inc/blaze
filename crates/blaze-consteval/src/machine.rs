@@ -1970,7 +1970,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
                     PNode::Adt(key, _) => {
                         let adt = self.world.adt(key).ok_or(Stop::Refused(Refusal::Missing { what: "ADT definition", item: key }))?;
                         match adt.kind {
-                            blaze_typeck::AdtKind::Enum => adt.variants.len() as u128,
+                            blaze_typeck::AdtKind::Enum => u128::try_from(adt.variants.len()).unwrap_or(0),
                             blaze_typeck::AdtKind::Struct | blaze_typeck::AdtKind::Union => 0,
                         }
                     }
