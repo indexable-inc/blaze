@@ -1456,6 +1456,9 @@ struct Cursor {
     count: u32,
     /// Younger than [`WINDOW`]: a pruning slice keeps all of it.
     young: bool,
+    /// Covered by a live lease under [`Liveness::Reached`]: a tiered merge keeps every record
+    /// from this segment intact so active leases never block tier compaction.
+    leased: bool,
 }
 
 /// Keep-priority tiers for root-level LRU eviction (lower value = kept longer).
@@ -1507,11 +1510,11 @@ enum Keep {
 
 impl Keep {
     #[inline]
-    fn keeps(&self, key: &ContentId, young: bool) -> bool {
+    fn keeps(&self, key: &ContentId, young: bool, leased: bool) -> bool {
         match self {
             Keep::All => true,
             Keep::Rooted { owner, kept_count } => young || owner.get(&key.0).is_some_and(|&slot| (slot & !SIZED_BIT) < *kept_count),
-            Keep::Reached { owner, kept_count } => owner.get(&key.0).is_some_and(|&slot| (slot & !SIZED_BIT) < *kept_count),
+            Keep::Reached { owner, kept_count } => leased || owner.get(&key.0).is_some_and(|&slot| (slot & !SIZED_BIT) < *kept_count),
         }
     }
 }
@@ -1596,7 +1599,7 @@ impl<A: Allocator + Clone> Merge<A> {
                 self.heap.swap_remove(0);
             }
             self.sift_down(maps, 0);
-            if !self.keep.keeps(&entry.key, cursor.young) {
+            if !self.keep.keeps(&entry.key, cursor.young, cursor.leased) {
                 self.dropped += 1;
                 continue;
             }
@@ -2391,7 +2394,7 @@ impl<A: Allocator + Clone> Plain<A> {
         if self.plant() == Plant::CleanupOneSlice {
             return false;
         }
-        let merge_due = || self.cfg.liveness == Liveness::Reached && !self.plan_tiered(|it| self.sweepable(it, self.now_ns)).is_empty();
+        let merge_due = || self.cfg.liveness == Liveness::Reached && !self.plan_tiered(|it| self.mergeable(it)).is_empty();
         let replaced = last.segments > 0;
         // The planted starvation keeps the old stop after a sweep, not the lease's case.
         let after_sweep = replaced && self.plant() != Plant::SweepBeforeMerge;
@@ -3288,12 +3291,27 @@ impl<A: Allocator + Clone> Plain<A> {
         Renewed::Extended(key)
     }
 
+    /// Whether any retired file is past `GRACE_NS`, unmarked as lost, and not held by any active
+    /// lease opened before its grace window elapsed (matching the unlink rule in [`Plain::build`]).
+    fn has_unlinkable_retired(&self, now_ns: u64) -> bool {
+        let lease_never_expires = self.plant() == Plant::LeaseNeverExpires;
+        self.manifest.retired.iter().any(|it| {
+            it.lost.is_none()
+                && it.since_ns.saturating_add(GRACE_NS) <= now_ns
+                && !self.manifest.leases.iter().any(|lease| {
+                    (lease.expires_ns > now_ns || lease_never_expires)
+                        && lease.opened_ns < it.since_ns.saturating_add(GRACE_NS)
+                })
+        })
+    }
+
     /// O(segments + roots + retired) check of whether real compaction or GC housekeeping is due
     /// at `now_ns`, using only the in-memory manifest (no `map_all`, no index probes):
     /// - total committed bytes exceed the budget high watermark;
-    /// - any tier of any namespace exceeds `K` open mergeable segments;
+    /// - any tier of any namespace exceeds `K` open mergeable segments (including leased open
+    ///   segments, which tiered merges compact losslessly);
     /// - any root has expired (`expires_ns <= now_ns`);
-    /// - any retired file is past `GRACE_NS` and ready to unlink.
+    /// - any retired file is past `GRACE_NS`, not held by a live lease, and ready to unlink.
     pub fn needs_housekeeping(&self, now_ns: u64) -> bool {
         if self.over_budget() {
             return true;
@@ -3301,18 +3319,13 @@ impl<A: Allocator + Clone> Plain<A> {
         if self.manifest.roots.iter().any(|it| it.expires_ns != NEVER && it.expires_ns <= now_ns) {
             return true;
         }
-        if self.manifest.retired.iter().any(|it| it.lost.is_none() && it.since_ns.saturating_add(GRACE_NS) <= now_ns) {
+        if self.has_unlinkable_retired(now_ns) {
             return true;
         }
         let tiers = self.tiers();
         let segs = &self.manifest.segments;
         let blind = tiers.plant == TierPlant::PastCap;
-        let mergeable = |seg: &Segment| {
-            seg.local
-                && !seg.published
-                && (blind || !tiers.closed(seg.file_len()))
-                && (self.cfg.liveness == Liveness::Everything || !self.leased(seg, now_ns))
-        };
+        let mergeable = |seg: &Segment| seg.local && !seg.published && (blind || !tiers.closed(seg.file_len()));
         for (idx, first) in segs.iter().enumerate() {
             if segs.iter().take(idx).any(|prev| prev.namespace == first.namespace) {
                 continue;
@@ -3326,6 +3339,41 @@ impl<A: Allocator + Clone> Plain<A> {
                         return true;
                     }
                 }
+            }
+        }
+        false
+    }
+
+    /// Open mergeable segment threshold in one namespace past which a commit automatically folds
+    /// one lossless tiered-merge slice into its own flip (`Driven::commit_records`):
+    /// `K * open_tiers + K` (24 for [`Tiers::STORE`]), guaranteeing by pigeonhole that at least
+    /// one open tier exceeds `K` while leaving normal interactive runs (<= 20 open segments) with
+    /// zero foreground compaction overhead.
+    pub(crate) fn auto_merge_open_threshold(&self) -> usize {
+        let tiers = self.tiers();
+        let open_tiers = tiers.tier(tiers.segment_most()).saturating_sub(1);
+        tiers.most().saturating_mul(open_tiers).saturating_add(tiers.most())
+    }
+
+    /// Whether any namespace has accumulated at least [`Plain::auto_merge_open_threshold`] open
+    /// mergeable segments and should automatically fold one tiered-merge slice into the next
+    /// commit flip so consecutive multi-phase commits stay well below [`Plain::named_most`].
+    pub fn needs_auto_tier_merge(&self) -> bool {
+        let tiers = self.tiers();
+        let blind = tiers.plant == TierPlant::PastCap;
+        let threshold = self.auto_merge_open_threshold();
+        let segs = &self.manifest.segments;
+        for (idx, first) in segs.iter().enumerate() {
+            if segs.iter().take(idx).any(|prev| prev.namespace == first.namespace) {
+                continue;
+            }
+            let open = segs
+                .iter()
+                .skip(idx)
+                .filter(|it| it.namespace == first.namespace && it.local && !it.published && (blind || !tiers.closed(it.file_len())))
+                .count();
+            if open >= threshold {
+                return true;
             }
         }
         false
@@ -3992,7 +4040,7 @@ impl<A: Allocator + Clone> Plain<A> {
     /// there), unlinked past [`GRACE_NS`]. A crash after the rename and before the flip leaves
     /// the renamed file, the same kind of orphan. A copy whose bytes are a named segment's, or
     /// one of its own inputs', removes its temporary file and writes nothing more.
-    fn stream_segment(&mut self, copied: Copied<A>, why: Why<A>, now_ns: u64, effects: &mut Vec<Effect>) {
+    fn stream_segment<E: core::iter::Extend<Effect>>(&mut self, copied: Copied<A>, why: Why<A>, now_ns: u64, effects: &mut E) {
         let Copied { mut merge, count, index_at, lowest, highest } = copied;
         let namespace = merge.namespace;
         let header = format::header_of(namespace, count, lowest, highest, index_at);
@@ -4035,7 +4083,7 @@ impl<A: Allocator + Clone> Plain<A> {
         head.extend_from_slice(&header);
         let mut pieces = self.alloc_vec();
         pieces.push((0, head));
-        effects.push(Effect::Truncate { file: file.share(), len, tag: self.tag(SEG_TRUNCATE, 0) });
+        effects.extend(core::iter::once(Effect::Truncate { file: file.share(), len, tag: self.tag(SEG_TRUNCATE, 0) }));
         self.phase = Phase::Writing(Box::new(Writing { seg, file, pieces, left: 0, stream: Some(stream), commit: None }), Box::new(why));
     }
 
@@ -4139,7 +4187,7 @@ impl<A: Allocator + Clone> Plain<A> {
         } else {
             pieces.push((0, header));
         }
-        effects.push(Effect::Truncate { file: file.share(), len, tag: self.tag(SEG_TRUNCATE, 0) });
+        effects.extend(core::iter::once(Effect::Truncate { file: file.share(), len, tag: self.tag(SEG_TRUNCATE, 0) }));
         self.phase = Phase::Writing(Box::new(Writing { seg, file, pieces, left: 0, stream: None, commit }), Box::new(why));
     }
 
@@ -4207,6 +4255,44 @@ impl<A: Allocator + Clone> Plain<A> {
         }
         self.compact(effects);
         self.fold_asked = self.plant() != Plant::SliceFlipsAlone;
+        Ok(true)
+    }
+
+    /// Plans and streams ONE tiered-merge slice directly (no directory listing, no sparse sweep,
+    /// no root-LRU eviction) and parks it for the next commit's flip ([`Plain::slice_parked`]).
+    /// Under [`Liveness::Reached`], leased segments remain mergeable while preserving 100% of
+    /// their records (`Cursor::leased`), so active leases never stall tier compaction.
+    /// Returns `Ok(true)` if stream effects were queued, `Ok(false)` if no effects are pending
+    /// (already parked, no tier over `K`, or an empty copy already parked synchronously).
+    pub fn fold_tiered_slice<E: core::iter::Extend<Effect>>(&mut self, now_ns: u64, effects: &mut E) -> Result<bool, StoreError> {
+        if !self.ready() {
+            return Err(StoreError::Busy { phase: self.what() });
+        }
+        assert!(self.eager, "Plain::fold_tiered_slice copies from a whole store: Plain::map_all first");
+        if self.folding.is_some() {
+            return Ok(false);
+        }
+        let candidates = self.plan_tiered(|it| self.mergeable(it));
+        if candidates.is_empty() {
+            return Ok(false);
+        }
+        let prune = self.cfg.liveness == Liveness::Reached;
+        let mut stats = Sliced { merged: true, ..Sliced::default() };
+        let (out, ids) = self.copy_live(candidates, prune, now_ns, None, &mut stats)?;
+        self.fold_asked = true;
+        if out.count == 0 {
+            let empty_orphans = self.alloc_vec();
+            self.fold_asked = false;
+            self.folding = Some(Folded { seg: None, candidates: ids, orphans: empty_orphans, evict: None, stats });
+            self.phase = Phase::Ready;
+            return Ok(false);
+        }
+        let entry_bytes = u64::try_from(ENTRY).unwrap_or(0);
+        let footer_bytes = u64::try_from(FOOTER).unwrap_or(0);
+        stats.bytes_out = out.index_at + u64::from(out.count) * entry_bytes + footer_bytes;
+        self.orphans_for_compact.clear();
+        self.evict_for_compact = None;
+        self.stream_segment(out, Why::Compact { candidates: ids, stats }, now_ns, effects);
         Ok(true)
     }
 
@@ -4551,7 +4637,22 @@ impl<A: Allocator + Clone> Plain<A> {
         };
         let expired_roots = u32::try_from(self.manifest.roots.iter().filter(|it| it.expires_ns != NEVER && it.expires_ns <= now_ns).count()).unwrap_or(u32::MAX);
         let lru_evict_roots = evict.as_ref().map_or(0, |it| u32::try_from(it.len()).unwrap_or(u32::MAX));
-        let retired_ready = u32::try_from(self.manifest.retired.iter().filter(|it| it.lost.is_none() && it.since_ns.saturating_add(GRACE_NS) <= now_ns).count()).unwrap_or(u32::MAX);
+        let lease_never_expires = self.plant() == Plant::LeaseNeverExpires;
+        let retired_ready = u32::try_from(
+            self.manifest
+                .retired
+                .iter()
+                .filter(|it| {
+                    it.lost.is_none()
+                        && it.since_ns.saturating_add(GRACE_NS) <= now_ns
+                        && !self.manifest.leases.iter().any(|lease| {
+                            (lease.expires_ns > now_ns || lease_never_expires)
+                                && lease.opened_ns < it.since_ns.saturating_add(GRACE_NS)
+                        })
+                })
+                .count(),
+        )
+        .unwrap_or(u32::MAX);
         let surviving_live = if evict.is_some() {
             live_bytes.min(low_watermark_bytes)
         } else {
@@ -4619,7 +4720,7 @@ impl<A: Allocator + Clone> Plain<A> {
     /// not here are never in a run (a run stops at one) nor in a merge. And whether it is the
     /// tiered merge ([`Sliced::merged`]).
     fn plan_reached(&mut self, now_ns: u64, over_or_evict: bool, kept_count: Option<u32>) -> Result<(Vec<Segment, A>, bool), StoreError> {
-        let merge = self.plan_tiered(|it| self.sweepable(it, now_ns));
+        let merge = self.plan_tiered(|it| self.mergeable(it));
         if !merge.is_empty() && self.plant() != Plant::SweepBeforeMerge {
             return Ok((merge, true));
         }
@@ -4670,10 +4771,18 @@ impl<A: Allocator + Clone> Plain<A> {
         Ok((out, false))
     }
 
-    /// A [`Liveness::Reached`] slice may take `seg`, in a sweep's run or a merge: held here,
-    /// not published, mapped, and kept whole by no live lease.
+    /// A tiered merge may take `seg`: held here, not published, and mapped. Unlike
+    /// [`Plain::sweepable`], leased segments remain mergeable — [`Plain::copy_live`] preserves
+    /// 100% of their records (`Cursor::leased`) and [`Plain::build`] keeps the merged row's
+    /// generation under the active lease so live leases never stall tier compaction.
+    fn mergeable(&self, seg: &Segment) -> bool {
+        seg.local && !seg.published && self.by_id.contains_key(&seg.id)
+    }
+
+    /// A [`Liveness::Reached`] sweep slice may take `seg`: held here, not published, mapped, and
+    /// kept whole by no live lease.
     fn sweepable(&self, seg: &Segment, now_ns: u64) -> bool {
-        seg.local && !seg.published && self.by_id.contains_key(&seg.id) && !self.leased(seg, now_ns)
+        self.mergeable(seg) && !self.leased(seg, now_ns)
     }
 
     /// A live lease keeps `seg` whole: it is of the lease's generation or newer.
@@ -4984,7 +5093,7 @@ impl<A: Allocator + Clone> Plain<A> {
             Err(why) => return self.stop(why),
         };
         let mut stats = Sliced { orphans: orphans.len() as u32, merged, ..Sliced::default() };
-        let expired = self.manifest.retired.iter().any(|it| it.lost.is_none() && it.since_ns.saturating_add(GRACE_NS) <= now_ns);
+        let expired = self.has_unlinkable_retired(now_ns);
         let expired_roots = self.manifest.roots.iter().any(|it| it.expires_ns != NEVER && it.expires_ns <= now_ns);
         if candidates.is_empty() {
             if orphans.is_empty() && !expired && !expired_roots && evict.is_none() {
@@ -5059,7 +5168,8 @@ impl<A: Allocator + Clone> Plain<A> {
             let Some(&at) = self.by_id.get(&seg.id) else { return true };
             let Some(mapped) = self.maps.get(at) else { return true };
             let run = mapped.run();
-            (0..seg.count as usize).any(|i| keep.keeps(&format::key_at(run, i), false))
+            let seg_count = usize::try_from(seg.count).unwrap_or(usize::MAX);
+            (0..seg_count).any(|i| keep.keeps(&format::key_at(run, i), false, false))
         };
         let mut kept_candidates = Vec::with_capacity_in(candidates.len(), &self.alloc);
         kept_candidates.extend(candidates.into_iter().filter(|seg| !seg.published || !holds_live(seg)));
@@ -5073,7 +5183,8 @@ impl<A: Allocator + Clone> Plain<A> {
                 continue;
             }
             let Some(&map_idx) = self.by_id.get(&seg.id) else { continue };
-            cursors.push(Cursor { map: u32::try_from(map_idx).unwrap_or(u32::MAX), next: 0, count: seg.count, young: seg.generation + WINDOW > current });
+            let leased = self.cfg.liveness == Liveness::Reached && self.leased(seg, now_ns);
+            cursors.push(Cursor { map: u32::try_from(map_idx).unwrap_or(u32::MAX), next: 0, count: seg.count, young: seg.generation + WINDOW > current, leased });
         }
         let heap = Vec::with_capacity_in(cursors.len(), self.alloc.clone());
         let mut merge = Merge { keep, namespace, cursors, heap, last: None, dropped: 0 };
@@ -5250,10 +5361,21 @@ impl<A: Allocator + Clone> Plain<A> {
             m.segments.retain(|it| it.published || !candidates.contains(&it.id));
             if let Some((seg, _)) = seg {
                 m.retired.retain(|it| !(it.id == seg.id && !it.log));
-                // The copy is as old as the oldest it replaced: pruning sees its records' age,
-                // not the slice's, and no lease taken since keeps it.
+                // When any merged candidate is covered by a live lease in `m`, preserve the
+                // highest leased candidate's generation so the merged copy stays covered by every
+                // active lease and cannot be swept before those leases release or expire.
+                // Otherwise the copy takes the oldest replaced generation so pruning sees its
+                // records' age and no later lease captures it.
+                let leased_max = own_segments
+                    .iter()
+                    .filter(|it| {
+                        candidates.contains(&it.id)
+                            && m.leases.iter().any(|l| it.generation >= l.since && (l.expires_ns > now_ns || lease_never_expires))
+                    })
+                    .map(|it| it.generation)
+                    .max();
                 let oldest = own_segments.iter().filter(|it| candidates.contains(&it.id)).map(|it| it.generation).min();
-                seg.generation = oldest.unwrap_or(generation);
+                seg.generation = leased_max.or(oldest).unwrap_or(generation);
                 m.segments.insert(place.unwrap_or(0).min(m.segments.len()), *seg);
             }
             for id in candidates.iter().filter(|id| copy != Some(**id)) {
@@ -5287,12 +5409,35 @@ impl<A: Allocator + Clone> Plain<A> {
                 let mut present_segs: Vec<u64, &A> = Vec::with_capacity_in(m.segments.len(), &self.alloc);
                 present_segs.extend(m.segments.iter().map(|it| it.id));
                 present_segs.sort_unstable();
+                // A segment covered by this process's own still-live lease in `m` can only have
+                // been replaced by a lossless tiered merge (which keeps 100% of leased segments'
+                // records and preserves lease generation), never swept — unless any segment loss
+                // was recorded in `m.retired`. Skip redundant carry for such segments.
+                let own_live_lease_since = if m.retired.iter().any(|r| !r.log && r.lost.is_some()) {
+                    None
+                } else {
+                    m.leases
+                        .iter()
+                        .find(|it| it.holder == own_nonce && (it.expires_ns > now_ns || lease_never_expires))
+                        .map(|it| it.since)
+                };
+                let touch_missing = |id: &u64| -> bool {
+                    if present_segs.binary_search(id).is_ok() {
+                        return false;
+                    }
+                    if let Some(since) = own_live_lease_since
+                        && own_segments.iter().any(|seg| seg.id == *id && seg.generation >= since)
+                    {
+                        return false;
+                    }
+                    true
+                };
                 if refused.is_some() {
                 } else if now_ns.saturating_sub(*started_ns) > GRACE_NS / 2 {
                     // A compaction may have retired its segment as named by no generation:
                     // it is not flipped.
                     refused = Some(StoreError::CommitTooSlow { took_s: now_ns.saturating_sub(*started_ns) / 1_000_000_000, grace_s: GRACE_NS / 1_000_000_000 });
-                } else if let Some(&(segment, key)) = self.touches.iter().find(|(id, _)| present_segs.binary_search(id).is_err()).or_else(|| extra_carry.first())
+                } else if let Some(&(segment, key)) = self.touches.iter().find(|(id, _)| touch_missing(id)).or_else(|| extra_carry.first())
                     && self.plant() != Plant::CarrySkipped
                 {
                     // A record this commit's roots name, dead in its view (or whose protecting
@@ -5308,7 +5453,7 @@ impl<A: Allocator + Clone> Plain<A> {
                         refused = Some(StoreError::SweptUnder { key, segment });
                     } else {
                         self.carrying.clear();
-                        self.carrying.extend(self.touches.iter().filter(|(id, _)| present_segs.binary_search(id).is_err()).copied());
+                        self.carrying.extend(self.touches.iter().filter(|(id, _)| touch_missing(id)).copied());
                         self.carrying.extend(extra_carry);
                         self.carrying.sort_unstable();
                         self.carrying.dedup();
@@ -6115,7 +6260,7 @@ impl<A: Allocator + Clone> Plain<A> {
                 self.sealed.clear();
             }
             Then::Compact(mut stats) => {
-                let retired_ready = self.manifest.retired.iter().any(|it| it.lost.is_none() && it.since_ns.saturating_add(GRACE_NS) <= self.now_ns);
+                let retired_ready = self.has_unlinkable_retired(self.now_ns);
                 if retired_ready {
                     stats.more = true;
                 } else {

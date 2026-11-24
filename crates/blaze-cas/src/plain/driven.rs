@@ -193,6 +193,10 @@ pub struct Driven<D: Driver, A: Allocator + Clone> {
     /// The test's power cut ([`Driven::cut`]).
     #[cfg(test)]
     cut: Option<Cut>,
+    /// Test-only knob to suppress automatic tiered merging on commit when a test intentionally
+    /// constructs many unmerged segments (e.g. `bloom_tests` exercising 120-segment skipping).
+    #[cfg(test)]
+    auto_merge: bool,
 }
 
 /// Where a test's power cut falls ([`Driven::cut`]): every run from then on stops, as if the
@@ -307,6 +311,13 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
         self.cut = at;
     }
 
+    /// Suppresses automatic tiered merging on commit for tests that deliberately construct many
+    /// unmerged segments to measure multi-segment probing / Bloom skipping.
+    #[cfg(test)]
+    pub(crate) fn disable_auto_merge(&mut self) {
+        self.auto_merge = false;
+    }
+
     fn bare(driver: D, root: &Path, mut core: Plain<A>) -> Driven<D, A> {
         core.set_stream_commits(true);
         Driven {
@@ -319,6 +330,8 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
             files: BTreeMap::new(),
             #[cfg(test)]
             cut: None,
+            #[cfg(test)]
+            auto_merge: true,
         }
     }
 
@@ -664,12 +677,28 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
     pub fn commit_records(&mut self, batches: &[&Batch], records: &[LentRecord<'_>]) -> Result<Committed<A>, StoreError> {
         // After the answer: what is left unmapped is mapped, so the layout refuses two values
         // under one key against every row. A commit with nothing to lay out maps nothing.
-        if self.core.holds_uncommitted() || batches.iter().any(|it| !it.is_empty()) || !records.is_empty() {
+        let writing = self.core.holds_uncommitted() || batches.iter().any(|it| !it.is_empty()) || !records.is_empty();
+        let mut auto_folded = false;
+        if writing {
             self.map_all()?;
+            #[cfg(test)]
+            let allow_auto = self.auto_merge;
+            #[cfg(not(test))]
+            let allow_auto = true;
+            if allow_auto && !self.core.slice_parked() && self.core.needs_auto_tier_merge() {
+                let now = self.driver.wall_ns();
+                if self.core.fold_tiered_slice(now, &mut self.effects)? {
+                    self.run("auto-merging tiers on commit")?;
+                }
+                auto_folded = self.core.slice_parked();
+            }
         }
         let now = self.driver.wall_ns();
         self.core.commit_records(batches, records, now, &mut self.effects)?;
         self.run_with("committing", batches, records)?;
+        if auto_folded {
+            let _ = self.core.take_sliced();
+        }
         match self.core.take_committed() {
             Some(outcome) => outcome,
             None => Err(StoreError::Unfinished { what: "a commit" }),

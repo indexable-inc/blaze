@@ -213,3 +213,235 @@ fn a_commit_after_each_phase_leaves_a_home_the_next_request_finishes() {
     assert!(bad > 0, "the planted pointer written by a phase's commit went unseen");
     println!("phase commit, planted pointer in a phase's commit: caught ({bad} homes held an answer without its records)");
 }
+
+fn reached_cfg(n: u64, root: &Frame) -> PlainConfig<&Frame> {
+    let mut c = cfg(n, root);
+    c.durable = false;
+    c.liveness = super::Liveness::Reached;
+    c
+}
+
+/// 250+ consecutive phase commits in a single `Liveness::Reached` command (holding a live lease
+/// throughout) must keep named segments bounded `<= named_most` at every single commit via
+/// automatic lossless tiered merging, preserve every single committed record byte-for-byte, and
+/// stay bounded after releasing the lease and running `compact`.
+#[test]
+fn consecutive_phase_commits_keep_segment_count_bounded_under_named_most() {
+    use super::core::ROOT_LIFE_NS;
+
+    let root = test_root();
+    let lent = Lent::new(
+        Driven::with(Sim::new(77, Faults::default()), Path::new("/sim"), reached_cfg(1, &root), &root).expect("open"),
+        &root,
+    );
+    let mut all_keys = blaze_own::Vec::new_in(&root);
+    let mut peak_named = 0u32;
+    for phase in 0..300u32 {
+        let base = phase * 4;
+        for j in 0..4u32 {
+            let n = base + j;
+            let k = record(n);
+            lent.put(&k, Namespace::LOCAL, TAG, &value(n)).expect("put");
+            all_keys.push((n, k));
+        }
+        lent.commit().expect("phase commit");
+        let (_, named) = lent.mapped_of_named();
+        let most = lent.named_most();
+        peak_named = peak_named.max(named);
+        assert!(named <= most, "phase {phase}: named {named} segments exceeded named_most {most}");
+    }
+    assert!(peak_named <= 32, "expected auto-merge to keep open segments tight (peak_named={peak_named})");
+    // Every single phase record must read back intact while the lease is still live.
+    for &(n, k) in &all_keys {
+        let got = lent.get(&k).expect("get").expect("phase record must survive lossless leased tier merge");
+        assert_eq!(got.bytes, value(n).as_slice(), "corrupt bytes for record {n}");
+    }
+    // Root all keys, release lease, commit, and verify reopen reads every record cleanly.
+    let mut key_list = blaze_own::Vec::with_capacity_in(all_keys.len(), &root);
+    key_list.extend(all_keys.iter().map(|&(_, k)| k));
+    lent.root_for("answer", &key_list, ROOT_LIFE_NS).expect("root");
+    lent.release_lease();
+    lent.commit().expect("final commit");
+    let (_, final_named) = lent.mapped_of_named();
+    assert!(final_named <= lent.named_most(), "final named {final_named} exceeded named_most");
+
+    let sim = lent.into_store().into_driver();
+    let reopen = Lent::new(
+        Driven::with(sim, Path::new("/sim"), reached_cfg(2, &root), &root).expect("reopen"),
+        &root,
+    );
+    for &(n, k) in &all_keys {
+        let got = reopen.get(&k).expect("reopen get").expect("rooted record must survive");
+        assert_eq!(got.bytes, value(n).as_slice());
+    }
+}
+
+/// A crashed/dead process holding an active lease must NOT stall tiered compaction (neither
+/// explicit `compact` nor automatic tier merging across 250+ subsequent phase commits), yet its
+/// unrooted records MUST remain intact until `LEASE_NS` expires and MUST be swept once it expires.
+#[test]
+fn stale_lease_does_not_block_tiered_compaction_and_preserves_leased_records_until_expiry() {
+    use core::time::Duration;
+    use super::core::{GRACE_NS, LEASE_NS, ROOT_LIFE_NS};
+
+    let root = test_root();
+    let sim = Sim::new(88, Faults::default());
+
+    // Process 1 commits enough unrooted records under a live lease that once its lease expires
+    // the merged segment is under half live (<50% live) and therefore eligible for sweep.
+    let mut dead_keys = blaze_own::Vec::new_in(&root);
+    dead_keys.extend((100_000..100_400u32).map(|n| (n, record(n))));
+    let sim = {
+        let p1 = Driven::with(sim, Path::new("/sim"), reached_cfg(1, &root), &root).expect("p1 open");
+        let lent1 = Lent::new(p1, &root);
+        for &(n, k) in &dead_keys {
+            lent1.put(&k, Namespace::LOCAL, TAG, &value(n)).expect("dead put");
+        }
+        lent1.commit().expect("dead commit with lease");
+        assert_eq!(lent1.leases_len(), 1, "p1 must leave an active lease");
+        let mut s = lent1.into_store().into_driver();
+        s.processes_died();
+        s
+    };
+
+    // Process 2 runs 260 phase commits while p1's stale lease is active.
+    let mut live_keys = blaze_own::Vec::new_in(&root);
+    live_keys.extend((0..260u32).map(|n| (n, record(n))));
+    let sim = {
+        let lent2 = Lent::new(
+            Driven::with(sim, Path::new("/sim"), reached_cfg(2, &root), &root).expect("p2 open"),
+            &root,
+        );
+        for &(n, k) in &live_keys {
+            lent2.put(&k, Namespace::LOCAL, TAG, &value(n)).expect("p2 put");
+            lent2.commit().expect("p2 phase commit");
+            let (_, named) = lent2.mapped_of_named();
+            assert!(named <= lent2.named_most(), "phase {n}: stale lease caused {named} > named_most {}", lent2.named_most());
+        }
+        let mut rooted = blaze_own::Vec::with_capacity_in(live_keys.len(), &root);
+        rooted.extend(live_keys.iter().map(|&(_, k)| k));
+        lent2.root_for("p2.answer", &rooted, ROOT_LIFE_NS).expect("p2 root");
+        lent2.release_lease();
+        lent2.commit().expect("p2 final commit");
+        // While p1's lease is live, compact() still compacts any tiers > K, preserves p1's records,
+        // and does not report spurious housekeeping for retired files held by p1's lease.
+        let _ = lent2.compact_foreground(32).expect("compact under stale lease");
+        let (_, after_named) = lent2.mapped_of_named();
+        assert!(after_named <= 8, "tiered compaction under stale lease should collapse segments (got {after_named})");
+        for &(n, k) in &dead_keys {
+            let got = lent2.get(&k).expect("get dead").expect("leased dead record must be kept before LEASE_NS");
+            assert_eq!(got.bytes, value(n).as_slice());
+        }
+        lent2.into_store().into_driver()
+    };
+
+    // Advance past GRACE_NS (still within LEASE_NS): retired files are held by p1's lease, so
+    // needs_housekeeping must be false (no spurious background GC spin).
+    let mut sim = sim;
+    sim.advance(Duration::from_nanos(GRACE_NS + 1_000_000_000));
+    let mut sim = {
+        let mut check = Driven::with(sim, Path::new("/sim"), reached_cfg(3, &root), &root).expect("check open");
+        let now = check.driver().wall_ns();
+        assert!(!check.needs_housekeeping(now), "retired files held by active lease must not trigger spurious housekeeping");
+        check.into_driver()
+    };
+
+    // Advance past LEASE_NS: p1's lease expires and compact sweeps p1's unrooted records cleanly.
+    sim.advance(Duration::from_nanos(LEASE_NS));
+    let mut gc = Driven::with(sim, Path::new("/sim"), reached_cfg(4, &root), &root).expect("gc open");
+    let _ = gc.compact_foreground(32).expect("post-expiry gc");
+    for &(n, k) in &live_keys {
+        let got = gc.get(&k).expect("get live").expect("rooted record must survive post-expiry gc");
+        assert_eq!(gc.got(got).bytes, value(n).as_slice());
+    }
+    for &(_, k) in &dead_keys {
+        assert!(gc.get(&k).expect("get dead after expiry").is_none(), "expired dead lease's unrooted records must be swept");
+    }
+}
+
+/// Concurrent background GC merging a running writer's leased segments must not cause redundant
+/// `carry` or `SweptUnder` when the writer later roots its records and releases its lease.
+#[test]
+fn concurrent_gc_merging_leased_segments_does_not_trigger_carry_or_swept_under() {
+    use core::time::Duration;
+    use blaze_core::{Driver, wait::Deadline};
+    use super::core::{Plain, ROOT_LIFE_NS};
+
+    let root = test_root();
+    let mut sim = Sim::new(99, Faults::default());
+
+    let settle = |sim: &mut Sim, store: &mut Plain<&Frame>, effects: &mut _| {
+        let mut done = core::iter::empty().collect();
+        for _ in 0..100_000u32 {
+            sim.submit(effects);
+            if store.ready() && sim.in_flight() == 0 {
+                return;
+            }
+            let now = sim.now();
+            sim.poll(&mut done, Deadline::after(now, Duration::from_secs(1)));
+            let wall = sim.wall_ns();
+            for c in done.drain(..) {
+                if store.owns(c.tag) {
+                    store.complete(c, wall, effects);
+                }
+            }
+            if store.broken().is_some() {
+                return;
+            }
+        }
+        panic!("store did not settle");
+    };
+
+    // Writer opens and commits 12 phase segments under its live lease.
+    let mut writer = Plain::new(reached_cfg(1, &root), &root);
+    let mut weffects = core::iter::empty().collect();
+    writer.open_whole(&mut weffects);
+    settle(&mut sim, &mut writer, &mut weffects);
+    writer.handed();
+
+    let mut keys = blaze_own::Vec::new_in(&root);
+    keys.extend((200_000..200_012u32).map(|n| (n, record(n))));
+    for &(n, k) in &keys {
+        writer.put(k, Namespace::LOCAL, TAG, &value(n)).expect("put");
+        let wall = sim.wall_ns();
+        writer.commit(&[], wall, &mut weffects).expect("phase commit");
+        settle(&mut sim, &mut writer, &mut weffects);
+        assert!(matches!(writer.take_committed(), Some(Ok(_))));
+    }
+
+    // Concurrent GC opens on the same `sim` while writer's lease is live and merges all 12 leased
+    // segments down to 1 segment while preserving every leased record.
+    let mut gc = Plain::new(reached_cfg(2, &root), &root);
+    let mut geffects = core::iter::empty().collect();
+    gc.open_whole(&mut geffects);
+    settle(&mut sim, &mut gc, &mut geffects);
+    gc.handed();
+    assert!(gc.compact(&mut geffects), "gc compact starts");
+    settle(&mut sim, &mut gc, &mut geffects);
+    let sliced = gc.take_sliced().expect("gc sliced");
+    assert!(sliced.segments > 0 && sliced.merged && !sliced.aborted, "gc must merge leased segments: {sliced:?}");
+    assert_eq!(gc.segments().len(), 1, "12 leased segments must merge into 1");
+
+    // Writer (still holding its old pre-merge view!) now sets its answer root referencing all 12
+    // keys from its now-merged segments, releases its lease, and commits — must succeed with 0
+    // carried records and 0 SweptUnder errors!
+    let mut key_list = blaze_own::Vec::with_capacity_in(keys.len(), &root);
+    key_list.extend(keys.iter().map(|&(_, k)| k));
+    writer.root_for("writer.answer", &key_list, ROOT_LIFE_NS).expect("root");
+    writer.release_lease();
+    let wall = sim.wall_ns();
+    writer.commit(&[], wall, &mut weffects).expect("writer final commit");
+    settle(&mut sim, &mut writer, &mut weffects);
+    match writer.take_committed() {
+        Some(Ok(_)) => {}
+        other => panic!("writer final commit failed: {other:?}"),
+    }
+    assert_eq!(writer.carried(), 0, "segments covered by writer's own live lease must not trigger redundant carry");
+
+    // Fresh reader verifies every rooted key reads back cleanly from the merged store.
+    let mut reader = Driven::with(sim, Path::new("/sim"), reached_cfg(3, &root), &root).expect("reader open");
+    for &(n, k) in &keys {
+        let got = reader.get(&k).expect("get").expect("record must be present");
+        assert_eq!(reader.got(got).bytes, value(n).as_slice());
+    }
+}
