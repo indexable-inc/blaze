@@ -184,8 +184,8 @@ fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::Shared
     let native = match (std::env::var_os("BLAZE_LAUNCH_NATIVE"), start.form) {
         (None, _) => None,
         (Some(_), EntryForm::Comptime) => stop(CANNOT_RUN, "BLAZE_LAUNCH_NATIVE is set for a compile-time program, which links no native library"),
-        (Some(hex), _) => match run_mode::parse_record(hex.as_encoded_bytes()) {
-            Ok(record) => Some(record),
+        (Some(raw), _) => match run_mode::parse_native_start(raw.as_encoded_bytes()) {
+            Ok(start) => Some(start),
             Err(why) => stop(CANNOT_RUN, &format!("BLAZE_LAUNCH_NATIVE (the program's native library record): {why}")),
         },
     };

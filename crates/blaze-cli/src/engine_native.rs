@@ -168,6 +168,22 @@ pub(crate) enum NativeError<'w> {
     Send { words: &'w str },
 }
 
+/// Whether a suite's native library can be loaded lazily on first foreign symbol reference,
+/// or must be loaded eagerly before the entry runs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum NativeLoadMode {
+    /// Must be loaded before entry: defines/overrides a symbol in
+    /// `test_cache::classify_outside_symbol`'s pure allowlist (e.g. a custom `malloc`), so even
+    /// pure Rust code calling that symbol must bind through the native library.
+    Eager,
+    /// Safe to load lazily on demand: exports no pure-allowlist symbol, so a pure Rust test that
+    /// never references an impure/foreign `Space::Outside` target never `dlopen`s the library
+    /// and never runs its C initializers. When a test does reference an impure/foreign target,
+    /// `Down::Native` is sent lazily before placement and any C initializers run on the waking
+    /// main thread before entering that function.
+    Lazy,
+}
+
 /// What a program's start is handed of its native image (blaze-launch wire/run.rs
 /// `Down::Native`'s rule): sent exactly when the image holds native code of its crates.
 #[derive(Clone, Copy, Debug)]
@@ -186,6 +202,9 @@ pub(crate) struct NativeSend<'w> {
     /// Each word's export by its library item, in word order: what the run's roots root
     /// (blaze-ladder run/special.rs `run_roots`'s `exports`), as no Rust record need call it.
     pub(crate) items: &'w [blaze_id::ItemKey],
+    /// Whether this image can be loaded lazily for pure `blaze test` runs (`Lazy`) or must be
+    /// loaded eagerly before entry (`Eager`).
+    pub(crate) load_mode: NativeLoadMode,
 }
 
 /// The program's image as `blaze run` hands it on: its key (the start list is rooted beside
@@ -373,6 +392,136 @@ fn macho_holds_native(file: &[u8]) -> Result<bool, &'static str> {
     Ok(false)
 }
 
+/// Whether a Mach-O dylib exports any defined external symbol that shadows a symbol in
+/// `test_cache::classify_outside_symbol`'s pure allowlist (e.g., a custom C `malloc` or `memcpy`).
+/// Fails closed (`true`, forcing eager loading) on truncated headers or absent `LC_SYMTAB`.
+fn macho_exports_pure_symbol(file: &[u8]) -> bool {
+    let u32_at = |at: usize| {
+        file.get(at..at.saturating_add(4))
+            .and_then(|b| b.try_into().ok())
+            .map(u32::from_le_bytes)
+    };
+    if u32_at(0) != Some(0xfeed_facf) {
+        return true;
+    }
+    let Some(ncmds) = u32_at(16).and_then(|v| usize::try_from(v).ok()) else {
+        return true;
+    };
+    let mut at = 32usize;
+    let mut saw_symtab = false;
+    for _ in 0..ncmds {
+        let Some(cmd) = u32_at(at) else { return true };
+        let Some(size) = u32_at(at + 4).and_then(|v| usize::try_from(v).ok()) else { return true };
+        if size < 8 {
+            return true;
+        }
+        // LC_SYMTAB (0x2): symoff (+8), nsyms (+12), stroff (+16), strsize (+20).
+        if cmd == 0x2 {
+            saw_symtab = true;
+            let Some(symoff) = u32_at(at + 8).and_then(|v| usize::try_from(v).ok()) else { return true };
+            let Some(nsyms) = u32_at(at + 12).and_then(|v| usize::try_from(v).ok()) else { return true };
+            let Some(stroff) = u32_at(at + 16).and_then(|v| usize::try_from(v).ok()) else { return true };
+            let Some(strsize) = u32_at(at + 20).and_then(|v| usize::try_from(v).ok()) else { return true };
+            let Some(str_end) = stroff.checked_add(strsize) else { return true };
+            let Some(strtab) = file.get(stroff..str_end) else { return true };
+            for k in 0..nsyms {
+                let Some(row) = k.checked_mul(16).and_then(|off| symoff.checked_add(off)) else {
+                    return true;
+                };
+                let Some(n_strx) = u32_at(row).and_then(|v| usize::try_from(v).ok()) else { return true };
+                let Some(&n_type) = file.get(row + 4) else { return true };
+                // Non-STAB (`n_type & 0xe0 == 0`), defined in a section (`N_SECT = 0x0e`), external (`N_EXT = 0x01`).
+                if (n_type & 0xef) == 0x0f
+                    && let Some(rest) = strtab.get(n_strx..)
+                {
+                    let raw = rest.split(|&b| b == 0).next().unwrap_or(rest);
+                    let unmangled = raw.strip_prefix(b"_").unwrap_or(raw);
+                    if let Ok(name) = core::str::from_utf8(unmangled)
+                        && crate::test_cache::classify_outside_symbol(name).is_ok()
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        let Some(next) = at.checked_add(size) else { return true };
+        at = next;
+    }
+    !saw_symtab
+}
+
+/// Whether an arm64 ELF shared object exports any defined global/weak symbol in `.dynsym` that
+/// shadows a pure allowlist symbol. Fails closed (`true`, forcing eager loading) on truncated
+/// headers or absent `.dynsym`/`.dynstr`.
+fn elf_exports_pure_symbol(file: &[u8]) -> bool {
+    let u16_at = |at: usize| {
+        file.get(at..at.saturating_add(2))
+            .and_then(|b| b.try_into().ok())
+            .map(u16::from_le_bytes)
+    };
+    let u32_at = |at: usize| {
+        file.get(at..at.saturating_add(4))
+            .and_then(|b| b.try_into().ok())
+            .map(u32::from_le_bytes)
+    };
+    let u64_at = |at: usize| {
+        file.get(at..at.saturating_add(8))
+            .and_then(|b| b.try_into().ok())
+            .map(u64::from_le_bytes)
+    };
+    if file.get(0..6) != Some(&[0x7F, b'E', b'L', b'F', 2, 1][..]) {
+        return true;
+    }
+    let Some(shoff) = u64_at(40).and_then(|v| usize::try_from(v).ok()) else { return true };
+    let Some(shentsize) = u16_at(58).map(usize::from) else { return true };
+    let Some(shnum) = u16_at(60).map(usize::from) else { return true };
+    if shoff == 0 || shnum == 0 || shentsize != 64 {
+        return true;
+    }
+    for k in 0..shnum {
+        let Some(s) = k.checked_mul(64).and_then(|off| shoff.checked_add(off)) else { return true };
+        let Some(sh_type) = u32_at(s + 4) else { return true };
+        // SHT_DYNSYM == 11
+        if sh_type != 11 {
+            continue;
+        }
+        let Some(dynsym_off) = u64_at(s + 24).and_then(|v| usize::try_from(v).ok()) else { return true };
+        let Some(dynsym_size) = u64_at(s + 32).and_then(|v| usize::try_from(v).ok()) else { return true };
+        let Some(link) = u32_at(s + 40).and_then(|v| usize::try_from(v).ok()) else { return true };
+        let Some(entsize) = u64_at(s + 56).and_then(|v| usize::try_from(v).ok()) else { return true };
+        if link >= shnum || entsize < 24 {
+            return true;
+        }
+        let Some(str_sh) = link.checked_mul(64).and_then(|off| shoff.checked_add(off)) else { return true };
+        let Some(str_off) = u64_at(str_sh + 24).and_then(|v| usize::try_from(v).ok()) else { return true };
+        let Some(str_size) = u64_at(str_sh + 32).and_then(|v| usize::try_from(v).ok()) else { return true };
+        let Some(str_end) = str_off.checked_add(str_size) else { return true };
+        let Some(dynstr) = file.get(str_off..str_end) else { return true };
+        let nsyms = dynsym_size / entsize;
+        for i in 0..nsyms {
+            let Some(row) = i.checked_mul(entsize).and_then(|off| dynsym_off.checked_add(off)) else {
+                return true;
+            };
+            let Some(st_name) = u32_at(row).and_then(|v| usize::try_from(v).ok()) else { return true };
+            let Some(&st_info) = file.get(row + 4) else { return true };
+            let Some(st_shndx) = u16_at(row + 6) else { return true };
+            // Defined (`st_shndx != SHN_UNDEF`) and global/weak (`bind != STB_LOCAL`).
+            if st_shndx != 0 && (st_info >> 4) != 0
+                && let Some(rest) = dynstr.get(st_name..)
+            {
+                let raw = rest.split(|&b| b == 0).next().unwrap_or(rest);
+                if let Ok(name) = core::str::from_utf8(raw)
+                    && crate::test_cache::classify_outside_symbol(name).is_ok()
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    true
+}
+
 /// What the start of the program whose image is `payload` is sent ([`NativeSend`]), `None`
 /// when the image holds no native code: on macOS by its Mach-O headers
 /// ([`macho_holds_native`]); on Linux by its descriptor and ELF headers ([`elf_holds_native`]).
@@ -389,6 +538,15 @@ fn send_of<'w>(cx: &Cx, key: Key, payload: &[u8], crates: &[CrateIn<'_>], platfo
     if !holds {
         return Ok(None);
     }
+    let shadows_pure = match platform {
+        Platform::MacosArm64 => macho_exports_pure_symbol(payload),
+        Platform::LinuxArm64 => elf_exports_pure_symbol(payload),
+    };
+    let load_mode = if shadows_pure {
+        NativeLoadMode::Eager
+    } else {
+        NativeLoadMode::Lazy
+    };
     // Each word's Rust function: the export of that name among the crates' tables.
     let erased = blaze_own::Erased::new(scratch);
     let alloc = erased.handle();
@@ -428,7 +586,7 @@ fn send_of<'w>(cx: &Cx, key: Key, payload: &[u8], crates: &[CrateIn<'_>], platfo
     if dir.stat(cx, &name).map_err(|why| refused(bstd::mem::format_in!(scratch, "{why}").as_str()))?.is_none() {
         dir.publish(cx, &name, bstd::fs::Content::bytes(payload), bstd::fs::Durable::No).map_err(|why| refused(bstd::mem::format_in!(scratch, "the library's file: {why}").as_str()))?;
     }
-    Ok(Some(NativeSend { library: blaze_launch::wire::RecordId(key.0.0), hex: held(hex.as_str(), ask), words: words.into_bump_slice(), items: items.into_bump_slice() }))
+    Ok(Some(NativeSend { library: blaze_launch::wire::RecordId(key.0.0), hex: held(hex.as_str(), ask), words: words.into_bump_slice(), items: items.into_bump_slice(), load_mode }))
 }
 
 /// 32 bytes as 64 lowercase hex digits.
@@ -1416,5 +1574,58 @@ mod tests {
         )
         .expect("linux image linking libm");
         assert_eq!(elf_holds_native(store.image(linked_m.key)), Ok(true), "DT_NEEDED libm.so.6 holds native dependency");
+    }
+
+    #[test]
+    fn macho_exports_pure_symbol_flags_libc_overrides_and_allows_c_libraries() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let build_macho = |exports: &[&[u8]], include_symtab: bool| {
+            let mut strtab = Vec::new_in(alloc);
+            strtab.push(0u8);
+            let mut nlists = Vec::new_in(alloc);
+            for name in exports {
+                let strx = u32::try_from(strtab.len()).expect("strx");
+                strtab.extend_from_slice(name);
+                strtab.push(0u8);
+                // nlist_64: n_strx (4), n_type (1 = N_SECT | N_EXT = 0x0f), n_sect (1), n_desc (2), n_value (8)
+                nlists.extend_from_slice(&strx.to_le_bytes());
+                nlists.push(0x0f);
+                nlists.push(1);
+                nlists.extend_from_slice(&0u16.to_le_bytes());
+                nlists.extend_from_slice(&0x4000u64.to_le_bytes());
+            }
+            let ncmds: u32 = if include_symtab { 1 } else { 0 };
+            let symoff: u32 = 32 + if include_symtab { 24 } else { 0 };
+            let stroff: u32 = symoff + u32::try_from(nlists.len()).expect("nlists len");
+            let mut file = Vec::new_in(alloc);
+            file.extend_from_slice(&0xfeed_facfu32.to_le_bytes());
+            file.extend_from_slice(&0x0100_000cu32.to_le_bytes());
+            file.extend_from_slice(&0u32.to_le_bytes());
+            file.extend_from_slice(&6u32.to_le_bytes()); // MH_DYLIB
+            file.extend_from_slice(&ncmds.to_le_bytes());
+            file.extend_from_slice(&(ncmds * 24).to_le_bytes());
+            file.extend_from_slice(&0u32.to_le_bytes());
+            file.extend_from_slice(&0u32.to_le_bytes());
+            if include_symtab {
+                file.extend_from_slice(&0x2u32.to_le_bytes()); // LC_SYMTAB
+                file.extend_from_slice(&24u32.to_le_bytes());
+                file.extend_from_slice(&symoff.to_le_bytes());
+                file.extend_from_slice(&u32::try_from(exports.len()).expect("nsyms").to_le_bytes());
+                file.extend_from_slice(&stroff.to_le_bytes());
+                file.extend_from_slice(&u32::try_from(strtab.len()).expect("strsize").to_le_bytes());
+                file.extend_from_slice(&nlists);
+                file.extend_from_slice(&strtab);
+            }
+            file
+        };
+
+        let safe = build_macho(&[b"___blaze_native_v1", b"_blst_p1_mult", b"_secp256k1_ecdsa_verify"], true);
+        assert!(!macho_exports_pure_symbol(&safe), "regular C library exports allow lazy loading");
+
+        let overriding = build_macho(&[b"___blaze_native_v1", b"_malloc"], true);
+        assert!(macho_exports_pure_symbol(&overriding), "dylib overriding malloc must stay eager");
+
+        let no_symtab = build_macho(&[], false);
+        assert!(macho_exports_pure_symbol(&no_symtab), "missing LC_SYMTAB fails closed to eager");
     }
 }

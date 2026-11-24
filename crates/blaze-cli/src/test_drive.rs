@@ -2492,7 +2492,12 @@ struct TestResolve<'r, R> {
 }
 
 enum TestAnswer {
-    Ready { symbol: Symbol, record: blaze_launch::wire::RecordId },
+    Ready {
+        symbol: Symbol,
+        record: blaze_launch::wire::RecordId,
+        purity: Result<(), NotKept>,
+        saw_record: bool,
+    },
     Unresolved(Symbol),
     /// Its row waits for its code, made by a worker (run_parent.rs `Codes::Pooled`, D194): the
     /// need is not taken, and the run parks until the relay answers it.
@@ -2506,9 +2511,39 @@ impl<R: Resolve> Resolve for TestResolve<'_, R> {
     }
 
     fn publication(&mut self, symbol: &Symbol, values: &mut AVec<'_, u8>) -> Result<Resolved<'_>, ParentError> {
+        let mut needs_native = false;
+        self.publication_with_native(symbol, values, &mut needs_native)
+    }
+
+    fn publication_with_native(
+        &mut self,
+        symbol: &Symbol,
+        values: &mut AVec<'_, u8>,
+        needs_native: &mut bool,
+    ) -> Result<Resolved<'_>, ParentError> {
         let answer = self.parent.publication(symbol, values)?;
         self.requested = Some(match answer {
-            Resolved::Record { record, .. } => TestAnswer::Ready { symbol: *symbol, record },
+            Resolved::Record { record, sent, .. } => {
+                let mut purity = Ok(());
+                let mut saw_record = false;
+                for (rec_id, bytes) in sent.each() {
+                    let check = if rec_id == record {
+                        saw_record = true;
+                        crate::test_cache::check_record_purity(bytes)
+                    } else {
+                        crate::test_cache::check_datum_purity(bytes)
+                    };
+                    if purity.is_ok()
+                        && let Err(why) = check
+                    {
+                        purity = Err(why);
+                    }
+                }
+                if purity.is_err() {
+                    *needs_native = true;
+                }
+                TestAnswer::Ready { symbol: *symbol, record, purity, saw_record }
+            }
             Resolved::Unknown => TestAnswer::Unresolved(*symbol),
             Resolved::Waiting => TestAnswer::Waiting(*symbol),
         });
@@ -2611,10 +2646,18 @@ impl<'c> Launched<'c, '_, '_> {
         let mut needs = Needs::new(alloc);
         let mut ahead = std::vec::Vec::new_in(alloc);
         let mut placed = Vec::new_in(alloc);
-        // The native library first, before any `Declare`: the child hands its entry over only
-        // once it has loaded it (own_process.rs `run_own`, the same order).
+        // Eager native library first, before any `Declare`, when the image carries C initializers,
+        // shadows a pure libc symbol, or runs an unharnessed custom test. Otherwise arm lazy
+        // delivery so pure tests never load the dylib and remain cacheable.
+        let eager_native = self.native.is_some_and(|send| {
+            send.load_mode == crate::engine_native::NativeLoadMode::Eager || !self.tests.harnessed()
+        });
         if let Some(send) = self.native {
-            needs.tell_native(send.library, send.words, &mut ahead).map_err(|cause| test_parent_error(&mut lazy, cause))?;
+            if eager_native {
+                needs.tell_native(send.library, send.words, &mut ahead).map_err(|cause| test_parent_error(&mut lazy, cause))?;
+            } else {
+                needs.arm_lazy_native(send.library, send.words);
+            }
         }
         signals.begin(Doing::Roots);
         let head = run_parent::ahead_of(None, &mut lazy, &mut needs, &mut placed, &mut ahead)
@@ -2630,8 +2673,10 @@ impl<'c> Launched<'c, '_, '_> {
         let command = self.env.iter().copied().filter(|(name, _)| *name != "TMPDIR" && package.binary_search_by(|(set, _)| set.cmp(name)).is_err());
         run_parent::launch_env(command, self.store, entry.as_str(), None, &mut vars);
         // `launch_env` left out any `BLAZE_LAUNCH_NATIVE` of the command's own: the parent's word.
+        let lazy_native = self.native.filter(|_| !eager_native).map(|send| bstd::mem::format_in!(frame, "lazy:{}", send.hex));
         if let Some(send) = self.native {
-            vars.push(("BLAZE_LAUNCH_NATIVE", send.hex));
+            let value = lazy_native.as_ref().map_or(send.hex, |s| s.as_str());
+            vars.push(("BLAZE_LAUNCH_NATIVE", value));
         }
         // 4. The profile (blaze-run child.rs, the one test profile), the launcher under it.
         let profile = seatbelt_profile(temp.as_str(), self.store, self.native, frame, alloc)?;
@@ -2667,7 +2712,7 @@ impl<'c> Launched<'c, '_, '_> {
         let mut torn = None;
         let mut keep: Result<(), NotKept> = if !self.tests.harnessed() {
             Err(NotKept::Untraced)
-        } else if self.native.is_some() {
+        } else if eager_native {
             Err(NotKept::Foreign)
         } else {
             Ok(())
@@ -2854,13 +2899,15 @@ impl<'c> Launched<'c, '_, '_> {
                                     instance: lazy.name_of(symbol), symbol, site: None, cause: RefusalCause::Unresolved,
                                 }));
                             }
-                            Some(TestAnswer::Ready { symbol, record }) => {
+                            Some(TestAnswer::Ready { symbol, record, purity, saw_record }) => {
                                 let after = lazy.tally();
                                 let unkeyed = after.unkeyed - before.unkeyed;
                                 if keep.is_ok() {
                                     if unkeyed > 0 {
                                         keep = Err(NotKept::Untraced);
-                                    } else {
+                                    } else if let Err(why) = purity {
+                                        keep = Err(why);
+                                    } else if !saw_record {
                                         rec_bytes.clear();
                                         match lazy.read_record(&record, &mut rec_bytes) {
                                             Ok(()) => {
@@ -3048,9 +3095,16 @@ impl<'c> Launched<'c, '_, '_> {
         let mut child_sent = ChildSent::new(alloc);
         let mut ahead = run_parent::wire_out(alloc);
         let mut tally = run_parent::Tally::default();
+        let eager_native = self.native.is_some_and(|send| {
+            send.load_mode == crate::engine_native::NativeLoadMode::Eager || !self.tests.harnessed()
+        });
         if let Some(send) = self.native {
-            if let Err(cause) = needs.tell_native(send.library, send.words, &mut ahead) {
-                return Err(test_parent_error_places(&mut *self.suite_cache.borrow_mut(), cause));
+            if eager_native {
+                if let Err(cause) = needs.tell_native(send.library, send.words, &mut ahead) {
+                    return Err(test_parent_error_places(&mut *self.suite_cache.borrow_mut(), cause));
+                }
+            } else {
+                needs.arm_lazy_native(send.library, send.words);
             }
         }
         if let Err(cause) = needs.name_personality(head.personality, &mut ahead) {
@@ -3058,24 +3112,21 @@ impl<'c> Launched<'c, '_, '_> {
         }
         let mut keep: Result<(), NotKept> = if !self.tests.harnessed() {
             Err(NotKept::Untraced)
-        } else if self.native.is_some() {
+        } else if eager_native {
             Err(NotKept::Foreign)
         } else {
             Ok(())
         };
         let mut entered_fns: AVec<'_, crate::test_cache::EnteredFn<'_>> = Vec::new_in(self.cache_alloc);
-        // If this test is already impure at launch (native C image or custom harness), batch
+        // If this test is already impure at launch (eager native C image or custom harness), batch
         // pre-publish the suite's warm functions into `ahead` before spawning.
         if keep.is_err() {
             let prep = self.suite_cache.borrow().prepublish_warm(
                 test_entry,
                 head,
-                false,
                 &mut child_sent,
                 &mut needs,
                 &mut ahead,
-                &mut entered_fns,
-                self.cache_alloc,
                 &mut tally,
                 alloc,
             );
@@ -3092,8 +3143,10 @@ impl<'c> Launched<'c, '_, '_> {
         let package = self.place.vars;
         let command = self.env.iter().copied().filter(|(name, _)| *name != "TMPDIR" && package.binary_search_by(|(set, _)| set.cmp(name)).is_err());
         run_parent::launch_env(command, self.store, entry.as_str(), None, &mut vars);
+        let lazy_native = self.native.filter(|_| !eager_native).map(|send| bstd::mem::format_in!(frame, "lazy:{}", send.hex));
         if let Some(send) = self.native {
-            vars.push(("BLAZE_LAUNCH_NATIVE", send.hex));
+            let value = lazy_native.as_ref().map_or(send.hex, |s| s.as_str());
+            vars.push(("BLAZE_LAUNCH_NATIVE", value));
         }
         // 4. Seatbelt profile + spawn.
         let profile = seatbelt_profile(temp.as_str(), self.store, self.native, frame, alloc)?;
@@ -3260,42 +3313,28 @@ impl<'c> Launched<'c, '_, '_> {
                             }));
                         }
                         Some(ChildAnswer::Ready { symbol, counts, .. }) => {
-                            // Batch pre-publish:
-                            // (a) When a test becomes impure (or warm_order grew by >= 256 while impure),
-                            //     push all remaining warm suite functions in one batch.
-                            // (b) When a pure test makes >= 128 calls, push pure keyed toolchain functions
-                            //     once so heavy pure tests avoid stdlib IPC storms without breaking TestCache.
+                            // Batch pre-publish for impure tests: when a test becomes impure (or
+                            // warm_order grew by >= 256 while impure), push all remaining warm
+                            // suite functions in one batch. Pure tests never receive pre-published
+                            // functions so their `entered_fns` and `BZTR` addresses stay exact.
                             let warm_len = self.suite_cache.borrow().warm_len();
                             if keep.is_err()
                                 && child_sent.warm_cursor < warm_len
                                 && (was_keep_ok || warm_len.saturating_sub(child_sent.warm_cursor) >= 256)
                             {
-                                if let Err(cause) = self.suite_cache.borrow().prepublish_warm(
-                                    test_entry,
-                                    head,
-                                    false,
-                                    &mut child_sent,
-                                    &mut needs,
-                                    &mut reply,
-                                    &mut entered_fns,
-                                    self.cache_alloc,
-                                    &mut tally,
-                                    alloc,
-                                ) {
+                                // Ensure any lazily-armed native library is loaded before pre-publishing
+                                // warm suite functions (which may include foreign callers from earlier tests).
+                                if let Err(cause) = needs.flush_pending_native(&mut reply) {
                                     signals.add_host_nanos(run.now().saturating_sub(serving));
                                     stop_child(run).map_err(child_error)?;
                                     return Err(test_parent_error_places(&mut *self.suite_cache.borrow_mut(), cause));
                                 }
-                            } else if keep.is_ok() && !child_sent.pure_toolchain_flushed && calls.len() >= 128 && warm_len > 0 {
                                 if let Err(cause) = self.suite_cache.borrow().prepublish_warm(
                                     test_entry,
                                     head,
-                                    true,
                                     &mut child_sent,
                                     &mut needs,
                                     &mut reply,
-                                    &mut entered_fns,
-                                    self.cache_alloc,
                                     &mut tally,
                                     alloc,
                                 ) {
@@ -4367,7 +4406,13 @@ mod native_tests {
     const HEX: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
     fn send(hex: &'static str) -> NativeSend<'static> {
-        NativeSend { library: blaze_launch::wire::RecordId([7; 32]), hex, words: &[], items: &[] }
+        NativeSend {
+            library: blaze_launch::wire::RecordId([7; 32]),
+            hex,
+            words: &[],
+            items: &[],
+            load_mode: crate::engine_native::NativeLoadMode::Lazy,
+        }
     }
 
     /// A test program whose image holds C gets one grant more than the test profile: its

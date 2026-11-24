@@ -2306,19 +2306,43 @@ fn format_errno(call: &str, errno: i32) -> String {
 /// the process, because the run's unwind registry is made in it and the system's unwinder keeps
 /// the registry's finder until the process ends (run_mode/personality.rs `run_registry`).
 ///
-/// `native` is the program's native library record when its start names one
-/// (BLAZE_LAUNCH_NATIVE, [`parse_record`]; the parent's rule is wire/run.rs `Down::Native`'s):
-/// the control thread then reads the parent's frames until its `Native`, at most
+/// How the program's native library is loaded (`BLAZE_LAUNCH_NATIVE`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NativeStart {
+    /// Eager: the parent writes `Down::Native` first; the control thread loads it and the first
+    /// thread runs its initializers before calling the entry (`blaze run`, or images with inits).
+    Eager(RecordId),
+    /// Lazy: the entry runs immediately without loading the library; if the parent later sends
+    /// `Down::Native` for this exact record before publishing foreign code, the control thread
+    /// loads it on demand and publishes any C initializers to run once on the waking mutator
+    /// thread before entering the newly bound function.
+    Lazy(RecordId),
+}
+
+/// Parses `BLAZE_LAUNCH_NATIVE`: `<64 hex>` for eager loading, or `lazy:<64 hex>` for lazy loading.
+pub fn parse_native_start(raw: &[u8]) -> Result<NativeStart, EntryRefused> {
+    if let Some(hex) = raw.strip_prefix(b"lazy:") {
+        Ok(NativeStart::Lazy(parse_record(hex)?))
+    } else {
+        Ok(NativeStart::Eager(parse_record(raw)?))
+    }
+}
+
+/// `native` is the program's native library start mode when its start names one
+/// (`BLAZE_LAUNCH_NATIVE`, [`parse_native_start`]; the parent's rule is wire/run.rs `Down::Native`'s):
+/// under [`NativeStart::Eager`], the control thread reads frames until its `Native`, at most
 /// [`NATIVE_WAIT_MS`], loads the library from `source`'s folder (`dlopen`, its words and
 /// pointer cells filled) BEFORE the entry's thunk is handed here, and this thread runs the
-/// library's initializers ([`crate::native_lib::run_inits`]) before the entry is called. `None`:
-/// nothing waits and nothing is opened, the start as before.
+/// library's initializers ([`crate::native_lib::run_inits`]) before the entry is called; under
+/// [`NativeStart::Lazy`], the entry starts immediately and the library loads on demand if the
+/// parent sends `Down::Native` for that exact record mid-run. `None`: nothing waits and nothing
+/// is opened.
 #[expect(clippy::too_many_arguments, reason = "the run's edge: each argument one handle or fact of it")]
 pub fn run<S: RecordSource + RecordFiles + Sync, B: Bind + Send>(
     fd: std::os::fd::OwnedFd,
     source: &S,
     entry: CodeSymbol,
-    native: Option<RecordId>,
+    native: Option<NativeStart>,
     handed: Handed,
     bind: B,
     end: End,
@@ -2534,6 +2558,13 @@ pub fn parse_record(hex: &[u8]) -> Result<RecordId, EntryRefused> {
     Ok(RecordId(id))
 }
 
+/// Whether the control thread expects a `Down::Native` from the parent, and when.
+enum NativeExpect {
+    None,
+    Eager { record: RecordId, since: Nanos },
+    Lazy { record: RecordId },
+}
+
 /// The control thread: maps the run's memory (its tables are in the run's allocator, which
 /// stays on this thread), starts the socket's reader, writes the entry's stub, then is the one
 /// writer of code and words for the life of the process.
@@ -2541,7 +2572,7 @@ fn control<S: RecordSource + RecordFiles, B: Bind>(
     fd: i32,
     source: &S,
     entry: CodeSymbol,
-    native: Option<RecordId>,
+    native: Option<NativeStart>,
     bind: B,
     alloc: blaze_own::SharedAlloc<'static>,
     ready: &crate::sys::Handoff<Ready>,
@@ -2582,18 +2613,21 @@ fn control<S: RecordSource + RecordFiles, B: Bind>(
         }
     }
     acts.clear();
-    // The entry's thunk goes to the first thread now, or, when the start names a native
-    // library, once that library is loaded (`Act::Native` below): `owed` is the library and
-    // when the wait for its `Native` began (rule 18: at most NATIVE_WAIT_MS).
-    let mut owed: Option<(RecordId, Nanos)> = None;
-    match native {
-        None => ready.put(Ok((memory.thunk(entry), std::sync::Arc::clone(&shared), None))),
+    // The entry's thunk goes to the first thread now (for `None` or `NativeStart::Lazy`), or,
+    // under `NativeStart::Eager`, once that library is loaded (`Act::Native` below; bounded by
+    // `NATIVE_WAIT_MS`, rule 18).
+    let mut expect = match native {
         // Linux: the load is not built (NATIVE.md W5: the ELF image's initializers and its
         // loader's checks); refused by name, never skipped.
-        Some(_) if cfg!(not(target_os = "macos")) => {
+        Some(NativeStart::Eager(_)) if cfg!(not(target_os = "macos")) => {
             return ready.put(Err(RunModeError::NotBuilt { what: "a program's native library on Linux (NATIVE.md W5)" }));
         }
-        Some(record) => owed = Some((record, now())),
+        Some(NativeStart::Eager(record)) => NativeExpect::Eager { record, since: now() },
+        None => NativeExpect::None,
+        Some(NativeStart::Lazy(record)) => NativeExpect::Lazy { record },
+    };
+    if !matches!(expect, NativeExpect::Eager { .. }) {
+        ready.put(Ok((memory.thunk(entry), std::sync::Arc::clone(&shared), None)));
     }
     // Threads waiting in a stub: the slot, the thread, and the stub waiters' row its answer
     // goes to (`Waiters::answer`).
@@ -2660,18 +2694,35 @@ fn control<S: RecordSource + RecordFiles, B: Bind>(
                 Act::Stop(Stop::ParentGone { waiting }) => stop_with(format_args!(
                     "blaze: the program's parent (`blaze run`) is gone while {waiting} threads wait for code"
                 )),
-                // The library the start named (BLAZE_LAUNCH_NATIVE), loaded before the entry's
-                // thunk is handed over: its words and pointer cells hold their slots' thunks
-                // (stubs until placed) before any C runs. A `Native` the start did not name, or
-                // another record than it named, is the parent out of step: stopped by name.
-                Act::Native { record } => match owed.take() {
-                    Some((named, _)) if named == record => match load_library(&mut mode, source, &mut memory) {
-                        Ok(loaded) => {
-                            ready.put(Ok((memory.thunk(entry), std::sync::Arc::clone(&shared), Some(loaded))));
-                            Ok(())
+                // The library the start named (BLAZE_LAUNCH_NATIVE): under Eager, loaded before
+                // the entry's thunk is handed over; under Lazy, loaded on demand before placing
+                // the first foreign record/datum (any C initializers run lazily on the waking
+                // mutator thread before entering the newly bound function). A `Native` the start
+                // did not name, or another record than it named, is the parent out of step:
+                // stopped by name.
+                Act::Native { record } => match core::mem::replace(&mut expect, NativeExpect::None) {
+                    NativeExpect::Eager { record: named, .. } if named == record => {
+                        match load_library(&mut mode, source, &mut memory) {
+                            Ok(loaded) => {
+                                ready.put(Ok((memory.thunk(entry), std::sync::Arc::clone(&shared), Some(loaded))));
+                                Ok(())
+                            }
+                            Err(why) => return ready.put(Err(why)),
                         }
-                        Err(why) => return ready.put(Err(why)),
-                    },
+                    }
+                    NativeExpect::Lazy { record: named } if named == record => {
+                        if cfg!(not(target_os = "macos")) {
+                            Err(RunModeError::NotBuilt { what: "a program's native library on Linux (NATIVE.md W5)" })
+                        } else {
+                            match load_library(&mut mode, source, &mut memory) {
+                                Ok(loaded) => {
+                                    shared.publish_lazy_inits(loaded);
+                                    Ok(())
+                                }
+                                Err(why) => Err(why),
+                            }
+                        }
+                    }
                     _ => stop_with(format_args!(
                         "blaze: the parent sent native library {record:?}, which this program's start did not name (BLAZE_LAUNCH_NATIVE; NATIVE.md 3.7)"
                     )),
@@ -2681,9 +2732,9 @@ fn control<S: RecordSource + RecordFiles, B: Bind>(
                 stop_with(format_args!("blaze: the program stopped: its code could not come: {why}"));
             }
         }
-        // The start's wait for the parent's `Native`, bounded (rule 18): the reader's tick
+        // The start's wait for an eager parent `Native`, bounded (rule 18): the reader's tick
         // brings an event at least every TICK_MS, so this is checked while nothing comes.
-        if let Some((_, since)) = &owed
+        if let NativeExpect::Eager { since, .. } = &expect
             && now.0.saturating_sub(since.0) > NATIVE_WAIT_MS * 1_000_000
         {
             return ready.put(Err(RunModeError::Native(NativeError::NotSent { bound_ms: NATIVE_WAIT_MS })));
