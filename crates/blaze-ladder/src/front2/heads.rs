@@ -168,6 +168,26 @@ pub(crate) fn all_self_defaults(defaults: &[Option<PTy>], tys: tc::PTys<'_>) -> 
     defaults.iter().all(|d| d.is_some_and(|p| matches!(tys.get(p), Some(PNode::Param(0)))))
 }
 
+/// Supertrait associated-type equalities on `Self` (`<Param(0) as Tr<..>>::Name == Term`)
+/// extracted from a trait's implied supertrait clauses (`TraitExtra::supertraits`).
+fn extract_super_projs<A: core::alloc::Allocator>(
+    tys: tc::PTys<'_>,
+    supertraits: &[PClause],
+    alloc: A,
+) -> blaze_own::Vec<super::types::SuperProj, A> {
+    let mut out = blaze_own::Vec::new_in(alloc);
+    for c in supertraits {
+        if let PClause::Projection { trait_, args, name, term } = *c
+            && let Ok(list) = tys.list(args)
+            && let Some(&first) = list.first()
+            && matches!(tys.get(first), Some(PNode::Param(0)))
+        {
+            out.push(super::types::SuperProj { trait_, name, args, term });
+        }
+    }
+    out
+}
+
 /// The heads [`Builder`] reads.
 pub struct Maps {
     /// Each struct's, enum's and union's type parameter count and their defaults (over its
@@ -190,6 +210,10 @@ pub struct Maps {
     /// made with its members ([`Want::Members`]), since a supertrait's head may need the
     /// trait's (`FromResidual<R = <Self as Try>::Residual>`).
     pub supers: Rows<LibKey, Vec<(LibKey, List), Global>>,
+    /// Each trait's supertrait associated-type equalities on `Self` (see
+    /// [`Heads::trait_super_projs`]), filed with `supers` and restored from
+    /// [`TraitExtra::supertraits`].
+    pub super_projs: Rows<LibKey, blaze_own::Vec<super::types::SuperProj, Alloc<'static>>>,
     /// Each type alias's generic count and aliased type ([`Heads::alias`]); `None` where its
     /// head was refused, with the why in `alias_gaps`: an alias no path uses never fails a
     /// check, and one that is used fails only the item that names it.
@@ -281,6 +305,7 @@ impl Maps {
             assoc_where: Rows::new_in(alloc),
             assoc_consts: Rows::new_in(alloc),
             supers: Rows::new_in(alloc),
+            super_projs: Rows::new_in(alloc),
             aliases: Rows::new_in(alloc),
             alias_defaults: Rows::new_in(alloc),
             alias_slots: Rows::new_in(alloc),
@@ -316,6 +341,7 @@ impl Maps {
             assoc_where,
             assoc_consts,
             supers,
+            super_projs,
             aliases,
             alias_defaults,
             alias_slots,
@@ -345,6 +371,7 @@ impl Maps {
         assoc_where.clear();
         assoc_consts.clear();
         supers.clear();
+        super_projs.clear();
         aliases.clear();
         alias_defaults.clear();
         alias_slots.clear();
@@ -521,6 +548,9 @@ impl Heads for Maps {
     }
     fn trait_supers(&self, trait_: LibKey) -> Option<&[(LibKey, List)]> {
         self.supers.get(&trait_).map(|s| &s[..])
+    }
+    fn trait_super_projs(&self, trait_: LibKey) -> Option<&[super::types::SuperProj]> {
+        self.super_projs.get(&trait_).map(|s| &s[..])
     }
     fn trait_has_assoc(&self, trait_: LibKey, name: Name) -> Option<bool> {
         self.traits.get(&trait_).map(|t| t.assoc.contains(&name))
@@ -4043,6 +4073,11 @@ impl<'n> Store<'n> {
                     // Filed with its members (`Store::trait_members`), as `trait_defs` is.
                     if extra.is_some() || !supers.is_empty() {
                         self.maps.supers.insert(key, supers.iter().copied().collect());
+                        let super_projs = match &extra {
+                            Some(x) => extract_super_projs(self.tys.view(), &x.supertraits, self.maps.alloc),
+                            None => blaze_own::Vec::new_in(self.maps.alloc),
+                        };
+                        self.maps.super_projs.insert(key, super_projs);
                     }
                     if let Some(x) = extra {
                         self.trait_defs.insert(ck, x);
@@ -4855,7 +4890,9 @@ impl<'n> Store<'n> {
             }
         }
         file_regions(self, ck, trait_regions.0);
+        let super_projs = extract_super_projs(self.tys.view(), &supertraits, self.maps.alloc);
         self.maps.supers.insert(key, supers);
+        self.maps.super_projs.insert(key, super_projs);
         let mut assoc = Vec::new_in(Global);
         let mut consts: Vec<(Name, ItemKey), Global> = Vec::new_in(Global);
         // Each associated type's own const parameters (own position, type): filed after the

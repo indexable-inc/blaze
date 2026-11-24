@@ -406,8 +406,30 @@ impl<'c, 'a, T: Tys, F: Facts> Cx<'c, 'a, T, F> {
                 trait_,
                 args_after_self: self.map_list(args_after_self, &mut f)?,
             },
-            Pred::Projection { alias, term } => Pred::Projection { alias: f(self, alias)?, term: f(self, term)? },
-            Pred::NormalizesTo { alias, term } => Pred::NormalizesTo { alias: f(self, alias)?, term: f(self, term)? },
+            // `alias` in `Projection` / `NormalizesTo` is an `AliasTerm` (def + args), not a
+            // replaceable type position (rustc_next_trait_solver `ReplaceProjectionWith` folds
+            // only the alias's arguments and `term`, never replacing the outer alias head with
+            // a non-alias type).
+            Pred::Projection { alias, term } => {
+                let alias = match self.kind(alias) {
+                    TyKind::Alias(r, k, d, l) => {
+                        let nl = self.map_list(l, &mut f)?;
+                        if nl == l { alias } else { self.mk(TyKind::Alias(r, k, d, nl))? }
+                    }
+                    _ => f(self, alias)?,
+                };
+                Pred::Projection { alias, term: f(self, term)? }
+            }
+            Pred::NormalizesTo { alias, term } => {
+                let alias = match self.kind(alias) {
+                    TyKind::Alias(r, k, d, l) => {
+                        let nl = self.map_list(l, &mut f)?;
+                        if nl == l { alias } else { self.mk(TyKind::Alias(r, k, d, nl))? }
+                    }
+                    _ => f(self, alias)?,
+                };
+                Pred::NormalizesTo { alias, term: f(self, term)? }
+            }
             Pred::TypeOutlives { ty, region } => Pred::TypeOutlives { ty: f(self, ty)?, region: f(self, region)? },
             Pred::RegionOutlives { a, b } => Pred::RegionOutlives { a: f(self, a)?, b: f(self, b)? },
             Pred::WellFormed(t) => Pred::WellFormed(f(self, t)?),
