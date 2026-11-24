@@ -86,7 +86,8 @@ pub mod statics;
 /// 8: the instance names an entry declares are symbols.rs' form 2 (a shared forest, each
 /// distinct type once), never form 1's trees: an entry of 7 is refused by its form, never
 /// listed by `body_ids::each_item` as a forest.
-pub const ENTRY_FORM: u32 = 8;
+/// 9: a static's entry carries the datum of each vtable its datum names (`statics`).
+pub const ENTRY_FORM: u32 = 9;
 
 /// One vtable a code record names, as the entry carries it (run.md, "Statics in the run": a
 /// vtable is data the child places before the record, as a static's datum is): its symbol

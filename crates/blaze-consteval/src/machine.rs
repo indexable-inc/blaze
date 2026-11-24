@@ -10,6 +10,7 @@ mod late_tests;
 
 use core::alloc::Allocator;
 
+use blaze_build::vtable::{VtableKey, VtableRef, vtable_key};
 use blaze_build::{InstanceKey, instance_key};
 use blaze_ids::ContentId;
 use blaze_own::{Alloc, Vec};
@@ -24,7 +25,7 @@ use crate::arith::{int_bits, smax, smin, umax};
 use crate::error::{At, ConstError, Op as Arith, PanicPart, Refusal};
 use crate::layout::{self, IntRepr, Layout, LayoutCx};
 use crate::mem::{AllocId, Memory, Origin, PTR, Pointer, Scalar};
-use crate::record::{ConstFn, ConstRecord, DataAlloc, DataRecord, DataReloc, DataTarget, RecordKey};
+use crate::record::{ConstFn, ConstRecord, ConstVtable, DataAlloc, DataRecord, DataReloc, DataTarget, RecordKey};
 use crate::soft::Format;
 use crate::{ConstWorld, Intrinsic, Limits};
 
@@ -97,7 +98,7 @@ const fn unsupported<'a>(what: &'static str) -> Stop<'a> {
 /// (consteval.md, "Seams"): one call per constant used, its record placed as data. `codes` is
 /// the unit's compiled bodies: it lives as long as `ground` and `layout`, whose ids it holds.
 #[allow(clippy::too_many_arguments)]
-pub fn value_of<'a, W: ConstWorld, L: Layout, A: Allocator + Clone>(
+pub fn value_of<'a, W: ConstWorld, L: Layout, A: Allocator + Copy>(
     world: &W,
     layout: &mut L,
     codes: &mut Codes<A>,
@@ -122,7 +123,7 @@ pub fn value_of<'a, W: ConstWorld, L: Layout, A: Allocator + Clone>(
 /// An array length or a const generic argument of type `usize`: the value of the anonymous
 /// const `item` (the length's expression) as a `u64`, and its record to keep. The checker's
 /// seam: `World::const_value` answers from the record ([`len_of`]).
-pub fn eval_len<'a, W: ConstWorld, L: Layout, A: Allocator + Clone>(
+pub fn eval_len<'a, W: ConstWorld, L: Layout, A: Allocator + Copy>(
     world: &W,
     layout: &mut L,
     codes: &mut Codes<A>,
@@ -325,8 +326,10 @@ enum Mode {
     Place,
 }
 
-/// Sentinel for an integer word (no allocation provenance) in a compact [`Pair`].
+/// Sentinel for an integer word (no allocation provenance) in a compact [`Pair`] or no metadata in [`Place`].
 const NO_ALLOC: u32 = u32::MAX;
+/// Sentinel in [`Place::meta_alloc`] for integer metadata (a slice or `str` length).
+const INT_META: u32 = u32::MAX - 1;
 
 /// Two 8-byte scalars (a wide pointer's address and metadata), packed into 24 bytes (align 8).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -426,12 +429,13 @@ impl Val {
 }
 
 /// A place: an address (an allocation and offset, or an integer address with `alloc == NO_ALLOC`
-/// when formed by dereferencing a provenance-free raw pointer), and a length for a slice's or
-/// `str`'s.
+/// when formed by dereferencing a provenance-free raw pointer), and optional metadata: a length
+/// (`meta_alloc == INT_META`) for a slice or `str`, or a vtable pointer (`meta_alloc < INT_META`)
+/// for a trait object (`dyn Trait`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Place {
     alloc: u32,
-    has_meta: bool,
+    meta_alloc: u32,
     offset: u64,
     meta: u64,
 }
@@ -439,23 +443,28 @@ struct Place {
 impl Place {
     #[inline(always)]
     fn of(ptr: Pointer) -> Place {
-        Place { alloc: ptr.alloc.0, has_meta: false, offset: ptr.offset, meta: 0 }
+        Place { alloc: ptr.alloc.0, meta_alloc: NO_ALLOC, offset: ptr.offset, meta: 0 }
     }
 
     #[inline(always)]
-    fn with_meta(ptr: Pointer, meta: Option<u64>) -> Place {
+    fn encode_meta(meta: Option<Scalar>) -> (u32, u64) {
         match meta {
-            Some(m) => Place { alloc: ptr.alloc.0, has_meta: true, offset: ptr.offset, meta: m },
-            None => Place { alloc: ptr.alloc.0, has_meta: false, offset: ptr.offset, meta: 0 },
+            None => (NO_ALLOC, 0),
+            Some(Scalar::Int(m)) => (INT_META, u64::try_from(m & u128::from(u64::MAX)).unwrap_or(0)),
+            Some(Scalar::Ptr(p)) => (p.alloc.0, p.offset),
         }
     }
 
     #[inline(always)]
-    fn from_int(addr: u64, meta: Option<u64>) -> Place {
-        match meta {
-            Some(m) => Place { alloc: NO_ALLOC, has_meta: true, offset: addr, meta: m },
-            None => Place { alloc: NO_ALLOC, has_meta: false, offset: addr, meta: 0 },
-        }
+    fn with_meta(ptr: Pointer, meta: Option<Scalar>) -> Place {
+        let (meta_alloc, meta) = Self::encode_meta(meta);
+        Place { alloc: ptr.alloc.0, meta_alloc, offset: ptr.offset, meta }
+    }
+
+    #[inline(always)]
+    fn from_int(addr: u64, meta: Option<Scalar>) -> Place {
+        let (meta_alloc, meta) = Self::encode_meta(meta);
+        Place { alloc: NO_ALLOC, meta_alloc, offset: addr, meta }
     }
 
     #[inline(always)]
@@ -468,8 +477,28 @@ impl Place {
     }
 
     #[inline(always)]
-    fn meta(self) -> Option<u64> {
-        self.has_meta.then_some(self.meta)
+    fn has_meta(self) -> bool {
+        self.meta_alloc != NO_ALLOC
+    }
+
+    #[inline(always)]
+    fn drop_meta(&mut self) {
+        self.meta_alloc = NO_ALLOC;
+        self.meta = 0;
+    }
+
+    #[inline(always)]
+    fn meta(self) -> Option<Scalar> {
+        match self.meta_alloc {
+            NO_ALLOC => None,
+            INT_META => Some(Scalar::Int(u128::from(self.meta))),
+            a => Some(Scalar::Ptr(Pointer { alloc: AllocId(a), offset: self.meta })),
+        }
+    }
+
+    #[inline(always)]
+    fn len_meta(self) -> Option<u64> {
+        (self.meta_alloc == INT_META).then_some(self.meta)
     }
 }
 
@@ -554,7 +583,7 @@ const _: () = assert!(core::mem::size_of::<Flow>() <= 8);
 /// The machine's working vectors, kept in [`Codes`] between evaluations of its unit and
 /// borrowed in place (`&mut Work`): each evaluation empties them and keeps their room, so
 /// after the first few nothing grows and nothing moves by value.
-pub(crate) struct Work<K: Allocator + Clone> {
+pub(crate) struct Work<K: Allocator + Copy> {
     mem: Memory<K>,
     frames: Vec<Frame, K>,
     regs: Vec<Out, K>,
@@ -563,6 +592,7 @@ pub(crate) struct Work<K: Allocator + Clone> {
     decoded: Vec<(RecordKey, AllocId), K>,
     statics: Vec<(ItemKey, AllocId), K>,
     fns: Vec<(ConstFn, AllocId), K>,
+    vtables: Vec<(ConstVtable, AllocId), K>,
     /// Cached immutable string/byte-string literal allocations by `(code_idx << 32) | str_idx`.
     strs: Vec<(u64, AllocId), K>,
     /// Cached `type_name::<T>()` allocations by ground `PTy`: `(ty, alloc, len)`.
@@ -571,7 +601,7 @@ pub(crate) struct Work<K: Allocator + Clone> {
     entered: Vec<u32, K>,
 }
 
-impl<K: Allocator + Clone> Work<K> {
+impl<K: Allocator + Copy> Work<K> {
     pub(crate) fn new_in(alloc: K) -> Work<K> {
         Work {
             mem: Memory::new_in(0, alloc.clone()),
@@ -582,6 +612,7 @@ impl<K: Allocator + Clone> Work<K> {
             decoded: Vec::new_in(alloc.clone()),
             statics: Vec::new_in(alloc.clone()),
             fns: Vec::new_in(alloc.clone()),
+            vtables: Vec::new_in(alloc),
             strs: Vec::new_in(alloc.clone()),
             type_names: Vec::new_in(alloc.clone()),
             reads: Vec::new_in(alloc.clone()),
@@ -598,6 +629,7 @@ impl<K: Allocator + Clone> Work<K> {
         self.decoded.clear();
         self.statics.clear();
         self.fns.clear();
+        self.vtables.clear();
         self.strs.clear();
         self.type_names.clear();
         self.reads.clear();
@@ -605,7 +637,7 @@ impl<K: Allocator + Clone> Work<K> {
     }
 }
 
-struct Machine<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> {
+struct Machine<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> {
     world: &'w W,
     layout: &'l mut L,
     ground: &'g mut PortableTys<'t>,
@@ -622,7 +654,7 @@ struct Machine<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator +
     plant: Plant,
 }
 
-impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine<'w, 'l, 'g, 't, 'wk, 'a, W, L, K> {
+impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Machine<'w, 'l, 'g, 't, 'wk, 'a, W, L, K> {
     /// A machine borrowing `work` in place, emptied (every evaluation starts from nothing).
     fn new(world: &'w W, layout: &'l mut L, ground: &'g mut PortableTys<'t>, limits: Limits, alloc: Alloc<'a>, work: &'wk mut Work<K>) -> Self {
         work.reset(limits.memory);
@@ -657,7 +689,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
 
     // ---- The evaluation ----
 
-    fn evaluate<A: Allocator + Clone>(&mut self, codes: &mut CodeTable<A>, item: ItemKey, args: List) -> R<'a, ConstRecord<Alloc<'a>>> {
+    fn evaluate<A: Allocator + Copy>(&mut self, codes: &mut CodeTable<A>, item: ItemKey, args: List) -> R<'a, ConstRecord<Alloc<'a>>> {
         let ci = self.code(codes, item, args)?;
         let (code_id, ret) = {
             let c = &codes.list[ci as usize];
@@ -675,7 +707,8 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
         let mut reads = Vec::with_capacity_in(self.work.reads.len(), self.alloc);
         reads.extend_from_slice(&self.work.reads);
         let fns = self.fns_named(&data)?;
-        Ok(ConstRecord { key, data, reads, fns })
+        let vtables = self.vtables_named(&data)?;
+        Ok(ConstRecord { key, data, reads, fns, vtables })
     }
 
     /// The instance of each fn word of `data` ([`ConstFn`]), sorted by key, each once: every
@@ -694,13 +727,37 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
         Ok(fns)
     }
 
+    /// The vtable reference of each vtable word of `data` ([`ConstVtable`]), sorted by key,
+    /// each once: every vtable allocation this evaluation made or decoded was made from one
+    /// (`vtable_ptr`), so a word with none is malformed.
+    fn vtables_named(&self, data: &DataRecord<Alloc<'a>>) -> R<'a, Vec<ConstVtable, Alloc<'a>>> {
+        let mut vtables: Vec<ConstVtable, Alloc<'a>> = Vec::new_in(self.alloc);
+        for a in data.allocs.iter() {
+            for r in a.relocs.iter() {
+                let DataTarget::Vtable(key) = r.target else { continue };
+                let Err(at) = vtables.binary_search_by_key(&key, |v| v.key) else { continue };
+                let named = self.work.vtables.iter().find(|(v, _)| v.key == key).ok_or(malformed("a vtable word whose table the evaluation did not make"))?;
+                vtables.insert_shift(at, named.0);
+            }
+        }
+        Ok(vtables)
+    }
+
+    fn vtable_key_of(&mut self, concrete: PTy, principal: ItemKey, args: List) -> R<'a, VtableKey> {
+        let mut args_buf: Vec<PTy, Alloc<'a>> = Vec::new_in(self.alloc);
+        args_buf.extend_from_slice(self.ground.view().list(args).map_err(|_| malformed("a trait object's arguments past the ground table"))?);
+        let shape = self.world.code_id(principal);
+        vtable_key(concrete, principal, &args_buf, shape, self.ground, self.alloc)
+            .map_err(|_| malformed("a vtable's types past the ground table"))
+    }
+
     fn instance(&self, item: ItemKey, args: List) -> R<'a, InstanceKey> {
         instance_key(self.world.code_id(item), args, self.ground.view(), self.alloc).map_err(|_| malformed("an instance's arguments past the ground table"))
     }
 
     /// Pushes a frame running code `ci` with registers from `base`; its value goes to the
     /// caller's register `dst`.
-    fn enter<A: Allocator + Clone>(&mut self, codes: &CodeTable<A>, ci: u32, dst: Reg, base: u32) -> R<'a, ()> {
+    fn enter<A: Allocator + Copy>(&mut self, codes: &CodeTable<A>, ci: u32, dst: Reg, base: u32) -> R<'a, ()> {
         if self.work.frames.len() as u32 >= self.limits.depth {
             return Err(Stop::Refused(Refusal::CallDepth { limit: self.limits.depth }));
         }
@@ -727,7 +784,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
     // Not inlined: inside `value_of`'s large frame the loop's values were spilled and reloaded
     // through the stack on every step.
     #[inline(never)]
-    fn run<A: Allocator + Clone>(&mut self, codes: &mut CodeTable<A>) -> R<'a, Val> {
+    fn run<A: Allocator + Copy>(&mut self, codes: &mut CodeTable<A>) -> R<'a, Val> {
         'frame: loop {
             let top = self.work.frames.len().checked_sub(1).ok_or(malformed("no frame"))?;
             let mut f = self.work.frames[top];
@@ -933,12 +990,12 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                 let raw = match meta {
                     Meta::Keep => false,
                     Meta::Drop => {
-                        pl.has_meta = false;
+                        pl.drop_meta();
                         false
                     }
                     Meta::Need => {
-                        if !pl.has_meta {
-                            return self.fail(malformed("an unsized place with no length"));
+                        if !pl.has_meta() {
+                            return self.fail(malformed("an unsized place with no metadata"));
                         }
                         false
                     }
@@ -956,6 +1013,43 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                 match try_step!(self.val(b, src)).as_scalar() {
                     Some(p) => self.set(b, dst, Out::Pair(Pair::of(p, Scalar::Int(u128::from(n))))),
                     None => return self.fail(malformed("an unsizing coercion of a wide pointer")),
+                }
+            }
+            Op::UnsizeDyn { dst, src, k } => {
+                let Some(&named) = usize::try_from(k).ok().and_then(|i| code.vtables.get(i)) else {
+                    return self.fail(malformed("a trait-object vtable index past the code's table"));
+                };
+                let Some(p) = try_step!(self.val(b, src)).as_scalar() else {
+                    return self.fail(malformed("a trait-object unsizing of a wide pointer"));
+                };
+                let vt = try_step!(self.vtable_ptr(named));
+                self.set(b, dst, Out::Pair(Pair::of(p, Scalar::Ptr(vt))));
+            }
+            Op::UnsizeDynUpcast { dst, src, k } => {
+                let Some(&(principal, args)) = usize::try_from(k).ok().and_then(|i| code.dyn_upcasts.get(i)) else {
+                    return self.fail(malformed("a trait-object upcast index past the code's table"));
+                };
+                let Val::Pair(pair) = try_step!(self.val(b, src)) else {
+                    return self.fail(malformed("a trait-object upcast of a value that is not a wide pointer"));
+                };
+                let Scalar::Ptr(vp) = pair.second() else {
+                    return self.fail(malformed("a trait-object upcast whose metadata is not a vtable pointer"));
+                };
+                let old_key = match try_step!(self.work.mem.get(vp.alloc)).origin {
+                    Origin::Vtable(key) => key,
+                    _ => return self.fail(malformed("a trait-object upcast whose metadata does not point to a vtable")),
+                };
+                let old = match self.work.vtables.iter().find(|(v, _)| v.key == old_key) {
+                    Some(&(named, _)) => named,
+                    None => return self.fail(malformed("a trait-object upcast whose vtable was not registered")),
+                };
+                if old.vtable.principal == principal && old.vtable.args == args {
+                    self.set(b, dst, Out::Pair(pair));
+                } else {
+                    let concrete = old.vtable.concrete;
+                    let key = try_step!(self.vtable_key_of(concrete, principal, args));
+                    let vt = try_step!(self.vtable_ptr(ConstVtable { key, vtable: VtableRef { concrete, principal, args } }));
+                    self.set(b, dst, Out::Pair(Pair::of(pair.first(), Scalar::Ptr(vt))));
                 }
             }
             Op::FnPtr { dst, k } => {
@@ -1022,7 +1116,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                 let pl = try_step!(self.place(b, idx.base));
                 let len = match idx.len {
                     Some(n) => n,
-                    None => try_step!(pl.meta().ok_or(malformed("a slice place with no length"))),
+                    None => try_step!(pl.len_meta().ok_or(malformed("a slice place with no length"))),
                 };
                 let Some(i) = i.as_int() else { return self.fail(Stop::Refused(Refusal::PointerAsInt)) };
                 if i >= u128::from(len) {
@@ -1037,7 +1131,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
             Op::FromEnd { dst, src, k } => {
                 let s = code.slice_ops[k as usize];
                 let pl = try_step!(self.place(b, src));
-                let len = try_step!(pl.meta().ok_or(malformed("a slice place with no length")));
+                let len = try_step!(pl.len_meta().ok_or(malformed("a slice place with no length")));
                 let i = try_step!(len.checked_sub(s.back).ok_or(malformed("a slice pattern's element past a slice its length test let through")));
                 let next = try_step!(self.place_offset(pl, s.size * i, None));
                 self.set(b, dst, Out::Place(next));
@@ -1045,9 +1139,9 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
             Op::Subslice { dst, src, k } => {
                 let s = code.slice_ops[k as usize];
                 let pl = try_step!(self.place(b, src));
-                let len = try_step!(pl.meta().ok_or(malformed("a slice place with no length")));
+                let len = try_step!(pl.len_meta().ok_or(malformed("a slice place with no length")));
                 let left = try_step!(len.checked_sub(s.from + s.back).ok_or(malformed("a slice pattern's `..` past a slice its length test let through")));
-                let next = try_step!(self.place_offset(pl, s.size * s.from, Some(left)));
+                let next = try_step!(self.place_offset(pl, s.size * s.from, Some(Scalar::Int(u128::from(left)))));
                 self.set(b, dst, Out::Place(next));
             }
             Op::Build { dst, k } => {
@@ -1196,7 +1290,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
             Op::IfLen { place, k, fail } => {
                 let (len, at_least) = code.if_lens[k as usize];
                 let pl = try_step!(self.place(b, place));
-                let have = try_step!(pl.meta().ok_or(malformed("a slice place with no length")));
+                let have = try_step!(pl.len_meta().ok_or(malformed("a slice place with no length")));
                 if if at_least { have < len } else { have != len } {
                     return Flow::Goto(fail);
                 }
@@ -1227,7 +1321,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
 
     /// A `const fn` call: the callee's code (compiled when first called), its frame, its
     /// arguments in its first registers.
-    fn call<A: Allocator + Clone>(&mut self, codes: &mut CodeTable<A>, f: Frame, dst: Reg, k: u32) -> R<'a, ()> {
+    fn call<A: Allocator + Copy>(&mut self, codes: &mut CodeTable<A>, f: Frame, dst: Reg, k: u32) -> R<'a, ()> {
         let (item, args, link) = {
             let c = &codes.list[f.code as usize].calls[k as usize];
             (c.item, c.args, c.link.get())
@@ -1296,7 +1390,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
             }
             PNode::FnPtr(..) => Repr::Scalar(PTR),
             PNode::FnDef(..) | PNode::Never => Repr::Zst,
-            PNode::Str | PNode::Slice(_) => return Err(unsupported("a value of an unsized type")),
+            PNode::Str | PNode::Slice(_) | PNode::Dynamic(_) => return Err(unsupported("a value of an unsized type")),
             _ => match self.size_align(t)?.0 {
                 0 => Repr::Zst,
                 n => Repr::Mem(n),
@@ -1476,10 +1570,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
             Val::Ptr(p) => Place::of(p),
             Val::Int(addr) => Place::from_int(addr, None),
             Val::Pair(pair) => {
-                let Scalar::Int(n) = pair.second() else {
-                    return Err(malformed("a dereference of a value that is not a pointer"));
-                };
-                let meta = Some(u64::try_from(n).map_err(|_| malformed("a wide pointer's length past `u64`"))?);
+                let meta = Some(pair.second());
                 match pair.first() {
                     Scalar::Ptr(p) => Place::with_meta(p, meta),
                     Scalar::Int(addr) => {
@@ -1497,9 +1588,10 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
     /// `meta`. A zero-byte projection preserves provenance-free and dangling places as Rust's
     /// `&raw const (*p).first_field` allows; a non-zero projection requires a live allocation
     /// and (when its size is loaded) stays within `0..=len`.
-    fn place_offset(&self, pl: Place, off: u64, meta: Option<u64>) -> R<'a, Place> {
+    fn place_offset(&self, pl: Place, off: u64, meta: Option<Scalar>) -> R<'a, Place> {
         if off == 0 {
-            return Ok(Place { alloc: pl.alloc, has_meta: meta.is_some(), offset: pl.offset, meta: meta.unwrap_or(0) });
+            let (meta_alloc, meta) = Place::encode_meta(meta);
+            return Ok(Place { alloc: pl.alloc, meta_alloc, offset: pl.offset, meta });
         }
         let ptr = pl.ptr()?;
         let a = self.work.mem.get(ptr.alloc)?;
@@ -1529,7 +1621,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                 return Err(Stop::Refused(Refusal::IntAsPointer));
             }
             return Ok(match pl.meta() {
-                Some(n) => Val::pair(Scalar::Int(u128::from(pl.offset)), Scalar::Int(u128::from(n))),
+                Some(m) => Val::pair(Scalar::Int(u128::from(pl.offset)), m),
                 None => Val::Int(pl.offset),
             });
         }
@@ -1549,7 +1641,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
         }
         let ptr = Pointer { alloc: AllocId(pl.alloc), offset: pl.offset };
         Ok(match pl.meta() {
-            Some(n) => Val::pair(Scalar::Ptr(ptr), Scalar::Int(u128::from(n))),
+            Some(m) => Val::pair(Scalar::Ptr(ptr), m),
             None => Val::Ptr(ptr),
         })
     }
@@ -1562,6 +1654,20 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
             None => {
                 let id = self.work.mem.allocate(0, 0, false, Origin::Fn(named.key))?;
                 self.work.fns.push((named, id));
+                id
+            }
+        };
+        Ok(Pointer { alloc: id, offset: 0 })
+    }
+
+    /// The pointer to vtable `named`: one zero-sized allocation per vtable key an evaluation,
+    /// which remembers the table reference so the record can name it ([`ConstVtable`]).
+    fn vtable_ptr(&mut self, named: ConstVtable) -> R<'a, Pointer> {
+        let id = match self.work.vtables.iter().find(|(v, _)| v.key == named.key) {
+            Some(&(_, id)) => id,
+            None => {
+                let id = self.work.mem.allocate(0, 0, false, Origin::Vtable(named.key))?;
+                self.work.vtables.push((named, id));
                 id
             }
         };
@@ -1613,9 +1719,10 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                         let named = record.fn_named(key).ok_or(malformed("a record's fn word whose instance the record does not name"))?;
                         self.fn_ptr(named)?.alloc
                     }
-                    // A `&dyn Tr` in a const (codegen.md, "Trait objects"): the builder refuses
-                    // it in a const's record, so none reaches here yet; refused by name.
-                    DataTarget::Vtable(_) => return Err(unsupported("a vtable's address in a constant (a `&dyn` in a const)")),
+                    DataTarget::Vtable(key) => {
+                        let named = record.vtable_named(key).ok_or(malformed("a record's vtable word whose table the record does not name"))?;
+                        self.vtable_ptr(named)?.alloc
+                    }
                 };
                 relocs.push((u64::from(r.offset), target));
             }
@@ -1675,7 +1782,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                 let own = |a: &crate::mem::Allocation| match a.origin {
                     Origin::Local => a.live,
                     Origin::Static(_) => true,
-                    Origin::Data | Origin::Fn(_) => false,
+                    Origin::Data | Origin::Fn(_) | Origin::Vtable(_) => false,
                 };
                 let inside = p.offset < pa.len() && q.offset < qa.len();
                 if inside && (own(pa) || own(qa)) { 0 } else { 2 }
@@ -2234,6 +2341,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                 let target = match t.origin {
                     Origin::Static(k) => DataTarget::Static(k),
                     Origin::Fn(key) => DataTarget::Fn(key),
+                    Origin::Vtable(key) => DataTarget::Vtable(key),
                     Origin::Data | Origin::Local => {
                         if !t.live {
                             return Err(Stop::Refused(Refusal::Dangling));
@@ -2436,7 +2544,7 @@ fn valid<'a>(s: Scalar, v: Valid) -> R<'a, ()> {
 
 /// `value_of` with a planted bug, for the tests' controls.
 #[cfg(test)]
-pub(crate) fn value_of_planted<'a, W: ConstWorld, L: Layout, A: Allocator + Clone>(
+pub(crate) fn value_of_planted<'a, W: ConstWorld, L: Layout, A: Allocator + Copy>(
     world: &W,
     layout: &mut L,
     codes: &mut Codes<A>,

@@ -2157,6 +2157,10 @@ impl FrontEnd for Front2Program<'_> {
         self.consts.fn_instance(key, ground, scratch)
     }
 
+    fn const_vtable_ref(&self, key: blaze_build::vtable::VtableKey, ground: &mut tc::PortableTys<'_>, scratch: Alloc<'_>) -> Option<blaze_build::vtable::VtableRef> {
+        self.consts.vtable_ref(key, ground, scratch)
+    }
+
     fn evaluates_at_args(&self) -> bool {
         true
     }

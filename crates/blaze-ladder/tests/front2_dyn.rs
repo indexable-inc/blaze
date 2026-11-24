@@ -897,6 +897,116 @@ pub extern \"C\" fn main() -> i32 {
             "promoted autoref `&'static Fork` (33) + `(&Fork::Homestead).score()` (22)"
         );
     }
+
+    const CONST_AND_STATIC_DYN_PROGRAM: &str = "
+impl<T: PointeeSized + Unsize<U>, U: PointeeSized> CoerceUnsized<*const U> for *const T {}
+impl<T: PointeeSized + Unsize<U>, U: PointeeSized> CoerceUnsized<*mut U> for *mut T {}
+
+trait SuperA {
+    fn a(&self) -> u32;
+}
+
+trait SuperB {
+    fn b(&self) -> u32;
+}
+
+trait Sub: SuperA + SuperB {
+    fn sub(&self) -> u32;
+}
+
+trait Callsite {
+    fn id(&self) -> u32;
+}
+
+#[repr(C)]
+struct NonZst {
+    val: u32,
+}
+
+struct Unit;
+
+struct MyCallsite {
+    id: u32,
+}
+
+struct UnitCallsite;
+
+struct Meta<'a> {
+    tag: u32,
+    callsite: &'a dyn Callsite,
+}
+
+struct Wrap<T: PointeeSized> {
+    prefix: u32,
+    tail: T,
+}
+
+impl SuperA for NonZst {
+    fn a(&self) -> u32 { self.val + 1 }
+}
+
+impl SuperB for NonZst {
+    fn b(&self) -> u32 { self.val + 2 }
+}
+
+impl Sub for NonZst {
+    fn sub(&self) -> u32 { self.val + 3 }
+}
+
+impl SuperA for Unit {
+    fn a(&self) -> u32 { 7 }
+}
+
+impl Callsite for MyCallsite {
+    fn id(&self) -> u32 { self.id }
+}
+
+impl Callsite for UnitCallsite {
+    fn id(&self) -> u32 { 13 }
+}
+
+const CONST_NON_ZST: &dyn SuperA = &NonZst { val: 10 };
+const CONST_UNIT: &dyn SuperA = &Unit;
+const CONST_REBORROW: &dyn SuperA = &*CONST_NON_ZST;
+const CONST_RAW: *const dyn SuperA = &NonZst { val: 4 };
+const CONST_SUB: &dyn Sub = &NonZst { val: 5 };
+const CONST_UP_PREFIX: &dyn SuperA = CONST_SUB;
+const CONST_UP_OFFCHAIN: &dyn SuperB = CONST_SUB;
+const W_TAIL: Wrap<NonZst> = Wrap { prefix: 3, tail: NonZst { val: 8 } };
+const CONST_TAIL: &Wrap<dyn SuperA> = &W_TAIL;
+
+// Exact `tracing` static CALLSITE + static META shape:
+static CALLSITE: MyCallsite = MyCallsite { id: 19 };
+static META: Meta<'static> = Meta { tag: 2, callsite: &CALLSITE };
+
+static ZST_CALLSITE: UnitCallsite = UnitCallsite;
+static ZST_META: Meta<'static> = Meta { tag: 1, callsite: &ZST_CALLSITE };
+
+static DIRECT_DYN: &dyn SuperA = &NonZst { val: 6 };
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let r1 = CONST_NON_ZST.a();           // 11
+    let r2 = CONST_UNIT.a();              // 7
+    let r3 = CONST_REBORROW.a();          // 11
+    let r4 = unsafe { (*CONST_RAW).a() }; // 5
+    let r5 = CONST_UP_PREFIX.a();         // 6
+    let r6 = CONST_UP_OFFCHAIN.b();       // 7
+    let r7 = CONST_TAIL.prefix + CONST_TAIL.tail.a(); // 3 + 9 = 12
+    let r8 = META.tag + META.callsite.id();           // 2 + 19 = 21
+    let r9 = ZST_META.tag + ZST_META.callsite.id();   // 1 + 13 = 14
+    let r10 = DIRECT_DYN.a();             // 7
+    (r1 + r2 + r3 + r4 + r5 + r6 + r7 + r8 + r9 + r10) as i32
+}
+";
+
+    #[test]
+    fn const_and_static_dyn_unsize_runs_end_to_end() {
+        survey_clean(CONST_AND_STATIC_DYN_PROGRAM, "ConstAndStaticDyn");
+        // 11 + 7 + 11 + 5 + 6 + 7 + 12 + 21 + 14 + 7 = 101
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(run(CONST_AND_STATIC_DYN_PROGRAM), Ok(101), "const and static &dyn Trait dispatch");
+    }
 }
 
 mod box_dyn_fnonce {

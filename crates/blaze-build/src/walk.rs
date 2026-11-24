@@ -5238,9 +5238,8 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         self.b.func_addr(r)
     }
 
-    /// The address of `table`: `data_addr` of its `Vtable` reference, one place per table. The
-    /// unsizing to `dyn` (codegen.md, "Trait objects") pairs it with the data pointer.
-    fn vtable_addr(&mut self, table: crate::vtable::VtableRef) -> Result<Value, BuildError> {
+    /// The place of `table` in `self.vtables`, one place per table.
+    pub(super) fn vtable_place(&mut self, table: crate::vtable::VtableRef) -> Result<u32, BuildError> {
         let place = match self.vtables.iter().position(|&t| t == table) {
             Some(at) => at,
             None => {
@@ -5248,7 +5247,13 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 self.vtables.len() - 1
             }
         };
-        let place = u32::try_from(place).map_err(|_| malformed("more than 2^32 vtables"))?;
+        u32::try_from(place).map_err(|_| malformed("more than 2^32 vtables"))
+    }
+
+    /// The address of `table`: `data_addr` of its `Vtable` reference, one place per table. The
+    /// unsizing to `dyn` (codegen.md, "Trait objects") pairs it with the data pointer.
+    fn vtable_addr(&mut self, table: crate::vtable::VtableRef) -> Result<Value, BuildError> {
+        let place = self.vtable_place(table)?;
         let r = self.b.reference(RefKind::Vtable, place);
         Ok(self.b.data_addr(r))
     }

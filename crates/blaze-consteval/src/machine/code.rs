@@ -28,7 +28,7 @@ use super::{Machine, Mode, Need, NeedKind, R, Repr, Stop, Val, Work, int_info, m
 use crate::error::Refusal;
 use crate::layout::{self, Layout};
 use crate::lit;
-use crate::record::{ConstFn, RecordKey};
+use crate::record::{ConstFn, ConstVtable, RecordKey};
 use crate::soft::Format;
 use crate::{ConstWorld, FnKind, FnTraitMethod, Intrinsic, Typed};
 
@@ -158,6 +158,10 @@ pub(super) enum Op {
     Unsize { dst: Reg, src: Reg, n: u32 },
     /// A pointer to an array made a slice's pointer and length (`Code::u64s[k]`).
     UnsizeWide { dst: Reg, src: Reg, k: u32 },
+    /// A thin pointer unsized to a trait object (`Code::vtables[k]`).
+    UnsizeDyn { dst: Reg, src: Reg, k: u32 },
+    /// A trait-object wide pointer upcast to a supertrait (`Code::dyn_upcasts[k]`).
+    UnsizeDynUpcast { dst: Reg, src: Reg, k: u32 },
     /// A fn pointer to `Code::fns[k]`.
     FnPtr { dst: Reg, k: u32 },
     Unary { dst: Reg, src: Reg, op: UnOp, num: Num },
@@ -327,6 +331,10 @@ pub(super) struct Code<A: Allocator + Clone> {
     pub(super) consts: Vec<(ItemKey, List, RecordKey), A>,
     /// The fn pointers it makes: each one's key and the instance it was made from.
     pub(super) fns: Vec<ConstFn, A>,
+    /// The trait-object vtables it names (`Op::UnsizeDyn`).
+    pub(super) vtables: Vec<ConstVtable, A>,
+    /// The target `(principal, args)` of trait-object upcasts (`Op::UnsizeDynUpcast`).
+    pub(super) dyn_upcasts: Vec<(ItemKey, List), A>,
     pub(super) calls: Vec<Call, A>,
     /// Argument registers of calls and their types.
     pub(super) regs_of: Vec<(Reg, PTy), A>,
@@ -396,7 +404,7 @@ impl EnumFacts {
 
 /// The compiled bodies of a unit, separated from `Work` so `Machine` can borrow `&mut Work`
 /// and `&mut CodeTable` simultaneously with zero moves.
-pub(super) struct CodeTable<A: Allocator + Clone> {
+pub(super) struct CodeTable<A: Allocator + Copy> {
     pub(super) list: Vec<Code<A>, A>,
     pub(super) by: HashMap<(ItemKey, List), u32, A>,
     pub(super) alloc: A,
@@ -407,14 +415,14 @@ pub(super) struct CodeTable<A: Allocator + Clone> {
 /// The code of a unit's bodies, by item and ground arguments: compiled once, run by every
 /// evaluation in the unit. It lives as long as the unit's ground table and layouts, whose ids
 /// it holds.
-pub struct Codes<A: Allocator + Clone> {
+pub struct Codes<A: Allocator + Copy> {
     pub(super) table: CodeTable<A>,
     /// The machine's working vectors, kept for the next evaluation of the unit and borrowed
     /// in place (`&mut Work`) with zero struct moves.
     pub(super) work: Work<A>,
 }
 
-impl<A: Allocator + Clone> Codes<A> {
+impl<A: Allocator + Copy> Codes<A> {
     pub fn new_in(alloc: A) -> Codes<A> {
         Codes {
             table: CodeTable {
@@ -688,9 +696,9 @@ impl Refusal<'_> {
     }
 }
 
-impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine<'w, 'l, 'g, 't, 'wk, 'a, W, L, K> {
+impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Machine<'w, 'l, 'g, 't, 'wk, 'a, W, L, K> {
     /// The code of `item` at ground arguments `args`: the unit's, or compiled now.
-    pub(super) fn code<A: Allocator + Clone>(&mut self, codes: &mut CodeTable<A>, item: ItemKey, args: List) -> R<'a, u32> {
+    pub(super) fn code<A: Allocator + Copy>(&mut self, codes: &mut CodeTable<A>, item: ItemKey, args: List) -> R<'a, u32> {
         let old = codes.by.get(&(item, args)).copied();
         if let Some(i) = old {
             let c = &codes.list[i as usize];
@@ -732,6 +740,8 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                 statics: Vec::new_in(codes.alloc.clone()),
                 consts: Vec::new_in(codes.alloc.clone()),
                 fns: Vec::new_in(codes.alloc.clone()),
+                vtables: Vec::new_in(codes.alloc),
+                dyn_upcasts: Vec::new_in(codes.alloc),
                 calls: Vec::new_in(codes.alloc.clone()),
                 regs_of: Vec::new_in(codes.alloc.clone()),
                 builds: Vec::new_in(codes.alloc.clone()),
@@ -941,6 +951,181 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
             }
         };
         self.emit(code, cc, op)
+    }
+
+    /// Principal trait and its arguments after `Self` of ground trait object `t`, `None` for
+    /// auto-trait-only objects (`dyn Send`).
+    fn principal_c(&self, t: PTy) -> R<'a, Option<(ItemKey, List)>> {
+        let view = self.ground.view();
+        let PNode::Dynamic(l) = view.node(t).map_err(|_| malformed("a type past the ground table"))? else {
+            return Err(malformed("a trait object's principal asked of another type"));
+        };
+        let preds = view.list(l).map_err(|_| malformed("a trait object's predicates past the ground table"))?;
+        let Some(&first) = preds.first() else {
+            return Err(unsupported("a trait object with no predicates"));
+        };
+        Ok(match view.node(first).map_err(|_| malformed("a type past the ground table"))? {
+            PNode::ExTrait(k, args) => Some((k, args)),
+            _ => None,
+        })
+    }
+
+    /// Walks pointees `f` and `g` through matching struct tails (the Reference, "Unsized
+    /// coercions": a struct whose last field involves `T`), returning the pair whose metadata
+    /// the unsized wide pointer carries.
+    fn unsize_tails_c(&mut self, mut f: PTy, mut g: PTy) -> R<'a, (PTy, PTy)> {
+        const UNSIZE_DEPTH: u32 = 16;
+        for _ in 0..UNSIZE_DEPTH {
+            if f == g {
+                return Ok((f, g));
+            }
+            let (k, nfields) = match (self.node(f)?, self.node(g)?) {
+                (PNode::Adt(k, _), PNode::Adt(k2, _)) if k == k2 => {
+                    let adt = self.world.adt(k).ok_or(Stop::Refused(Refusal::Missing { what: "ADT definition", item: k }))?;
+                    if adt.kind != AdtKind::Struct || adt.variants.len() != 1 {
+                        return Err(unsupported("an unsizing of a pointee that is an enum or a union"));
+                    }
+                    let len = adt.variants[0].fields.len;
+                    if len == 0 {
+                        return Err(unsupported("an unsizing of a pointee struct without fields"));
+                    }
+                    (k, len)
+                }
+                _ => return Ok((f, g)),
+            };
+            let _ = k;
+            let last = nfields - 1;
+            f = self.field_ty(f, 0, last)?;
+            g = self.field_ty(g, 0, last)?;
+        }
+        Err(unsupported("an unsizing whose pointee passes through more struct tails than the bound"))
+    }
+
+    /// Unsizing coercion from ground type `ty` to `next` (array-to-slice, concrete-to-`dyn`,
+    /// `dyn` upcast, pointee struct-tail unsizing, and nested `CoerceUnsized` structs such as
+    /// `NonNull<T>` or `Pin<&T>`), peeled iteratively up to `UNSIZE_DEPTH` wrappers.
+    fn unsize_c<A: Allocator + Clone>(&mut self, cc: &mut Cc<'w, '_>, code: &mut Code<A>, mut out: Reg, mut ty: PTy, mut next: PTy) -> R<'a, Reg> {
+        const UNSIZE_DEPTH: u32 = 16;
+        enum Wrap<'a> {
+            Pat(PTy),
+            Adt { next: PTy, coerced_fi: u32, coerced_ty: PTy, parts: Vec<(u32, Reg, PTy), Alloc<'a>> },
+        }
+        let mut wraps: Vec<Wrap<'a>, Alloc<'a>> = Vec::new_in(self.alloc);
+        let mut cur = None;
+        for _ in 0..UNSIZE_DEPTH {
+            if ty == next {
+                cur = Some(out);
+                break;
+            }
+            match (self.node(ty)?, self.node(next)?) {
+                (PNode::Ref(_, f) | PNode::Ptr(_, f), PNode::Ref(_, g) | PNode::Ptr(_, g)) => {
+                    let (from, to) = self.unsize_tails_c(f, g)?;
+                    let leaf = match (self.node(from)?, self.node(to)?) {
+                        (PNode::Array(_, n), PNode::Slice(_)) => {
+                            let src = self.as_value(cc, code, out, ty)?;
+                            let n = self.len(n)?;
+                            let dst = self.reg(cc, Kind::V);
+                            self.emit_unsize(code, cc, dst, src, n);
+                            dst
+                        }
+                        (PNode::Dynamic(_), PNode::Dynamic(_)) => {
+                            let src = self.as_value(cc, code, out, ty)?;
+                            let Some((principal, args)) = self.principal_c(to)? else {
+                                return Err(unsupported("an unsizing to a trait object of auto traits alone (no principal trait)"));
+                            };
+                            let k = u32::try_from(code.dyn_upcasts.len()).map_err(|_| malformed("more trait-object upcasts than fit u32"))?;
+                            code.dyn_upcasts.push((principal, args));
+                            let dst = self.reg(cc, Kind::V);
+                            self.emit(code, cc, Op::UnsizeDynUpcast { dst, src, k });
+                            dst
+                        }
+                        (_, PNode::Dynamic(_)) => {
+                            let src = self.as_value(cc, code, out, ty)?;
+                            let Some((principal, args)) = self.principal_c(to)? else {
+                                return Err(unsupported("an unsizing to a trait object of auto traits alone (no principal trait)"));
+                            };
+                            let key = self.vtable_key_of(from, principal, args)?;
+                            let k = u32::try_from(code.vtables.len()).map_err(|_| malformed("more trait-object vtables than fit u32"))?;
+                            code.vtables.push(ConstVtable { key, vtable: blaze_build::vtable::VtableRef { concrete: from, principal, args } });
+                            let dst = self.reg(cc, Kind::V);
+                            self.emit(code, cc, Op::UnsizeDyn { dst, src, k });
+                            dst
+                        }
+                        _ if from == to => self.as_value(cc, code, out, ty)?,
+                        _ => return Err(unsupported("an unsizing coercion other than to a slice or a trait object")),
+                    };
+                    cur = Some(leaf);
+                    break;
+                }
+                (PNode::Pat(bs, ps), PNode::Pat(bt, pt)) => {
+                    let view = self.ground.view();
+                    let lps = view.list(ps).map_err(|_| malformed("a pattern type's ranges past the ground table"))?;
+                    let lpt = view.list(pt).map_err(|_| malformed("a pattern type's ranges past the ground table"))?;
+                    if lps != lpt {
+                        return Err(unsupported("an unsizing between two pattern types of different patterns"));
+                    }
+                    out = self.as_place(cc, code, out, ty)?;
+                    wraps.push(Wrap::Pat(bt));
+                    ty = bs;
+                    next = bt;
+                }
+                (PNode::Adt(k, _), PNode::Adt(k2, _)) if k == k2 => {
+                    let adt = self.world.adt(k).ok_or(Stop::Refused(Refusal::Missing { what: "ADT definition", item: k }))?;
+                    if adt.kind != AdtKind::Struct || adt.variants.len() != 1 {
+                        return Err(unsupported("an unsizing coercion through an enum or a union"));
+                    }
+                    let nfields = self.variant_fields(ty, 0)?;
+                    let src_pl = self.as_place(cc, code, out, ty)?;
+                    let cap = usize::try_from(nfields).unwrap_or(0);
+                    let mut parts: Vec<(u32, Reg, PTy), Alloc<'a>> = Vec::with_capacity_in(cap, self.alloc);
+                    let mut next_step: Option<(u32, Reg, PTy, PTy)> = None;
+                    for fi in 0..nfields {
+                        let fty_s = self.field_ty(ty, 0, fi)?;
+                        let fty_t = self.field_ty(next, 0, fi)?;
+                        if fty_s == fty_t {
+                            if self.size_align(fty_s)?.0 == 0 {
+                                continue;
+                            }
+                            let soff = self.field_offset(ty, 0, fi)?;
+                            let fpl = self.reg(cc, Kind::P);
+                            self.emit_field(code, cc, fpl, src_pl, soff, false);
+                            parts.push((fi, fpl, fty_t));
+                        } else if self.size_align(fty_s)?.0 == 0 && self.size_align(fty_t)?.0 == 0 {
+                            continue;
+                        } else {
+                            if next_step.is_some() {
+                                return Err(unsupported("an unsizing coercion through a struct where more than one field differs"));
+                            }
+                            let soff = self.field_offset(ty, 0, fi)?;
+                            let fpl = self.reg(cc, Kind::P);
+                            self.emit_field(code, cc, fpl, src_pl, soff, false);
+                            next_step = Some((fi, fpl, fty_s, fty_t));
+                        }
+                    }
+                    let Some((coerced_fi, fpl, fty_s, fty_t)) = next_step else {
+                        return Err(unsupported("an unsizing coercion through a struct where no field holding bytes differs"));
+                    };
+                    wraps.push(Wrap::Adt { next, coerced_fi, coerced_ty: fty_t, parts });
+                    out = fpl;
+                    ty = fty_s;
+                    next = fty_t;
+                }
+                _ => return Err(unsupported("an unsizing coercion of a value that is not a pointer or a struct holding one")),
+            }
+        }
+        let Some(mut cur) = cur else {
+            return Err(unsupported("an unsizing coercion through more nested structs than the bound"));
+        };
+        while let Some(wrap) = wraps.pop() {
+            cur = match wrap {
+                Wrap::Pat(bt) => self.as_place(cc, code, cur, bt)?,
+                Wrap::Adt { next, coerced_fi, coerced_ty, mut parts } => {
+                    parts.push((coerced_fi, cur, coerced_ty));
+                    self.build(cc, code, next, 0, &parts, false)?
+                }
+            };
+        }
+        Ok(cur)
     }
 
     /// Fn item type `ty`'s value as a fn pointer: the one reification, for the checker's
@@ -2485,19 +2670,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                     self.emit(code, cc, Op::FnPtr { dst, k: code.fns.len() as u32 - 1 });
                     dst
                 }
-                AdjustKind::Unsize => {
-                    let src = self.as_value(cc, code, out, ty)?;
-                    let n = match self.node(ty)? {
-                        PNode::Ref(_, a) | PNode::Ptr(_, a) => match self.node(a)? {
-                            PNode::Array(_, n) => self.len(n)?,
-                            _ => return Err(unsupported("an unsizing coercion other than an array to a slice")),
-                        },
-                        _ => return Err(unsupported("an unsizing coercion of a value that is not a pointer")),
-                    };
-                    let dst = self.reg(cc, Kind::V);
-                    self.emit_unsize(code, cc, dst, src, n);
-                    dst
-                }
+                AdjustKind::Unsize => self.unsize_c(cc, code, out, ty, next)?,
                 AdjustKind::UnionInject { variant } => {
                     let PNode::Union(ul) = self.node(next)? else {
                         return Err(malformed("a union injection to a type that is not a structural union"));
