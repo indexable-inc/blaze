@@ -829,7 +829,7 @@ fn cell() -> Want {
 const ONE: &[u8] = b"the first freeze's bytes";
 const OTHER: &[u8] = b"another freeze's bytes!!";
 
-fn entry(bytes: &'static [u8]) -> Entry {
+fn entry(bytes: &'static [u8]) -> Entry<'static> {
     Entry { want: cell(), member: false, bytes, out: blaze_ids::ContentId::of("blaze-cli heads once race", bytes), reads: &[], heads: &[], consts: &[], record: None }
 }
 

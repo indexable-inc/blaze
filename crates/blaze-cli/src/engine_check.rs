@@ -2397,10 +2397,7 @@ fn checking<'f, 'd>(
     let mut heads = made_boxed(heap, || crate::engine_heads::HeadsStage::new(scope_reads));
     heads.freeze = head_units;
     heads.jobs = head_jobs;
-    // PHASE-MEM-DEBT(Heads): the request's frozen heads on the process heap
-    // (engine_heads_once.rs `HeadsOnce::new`, `heap: &'static Heap`): they cross from the Heads
-    // phases to the Bodies phases, so the request's; to take `SharedAlloc<'r>` of the request.
-    heads.once = Some(crate::engine_heads_once::HeadsOnce::new(heap, crate::engine_heads_once::OncePlant::Rule, head_sources));
+    heads.head_sources = head_sources;
     let planned_now: &SVec<'_, Planned> = &planned;
     // The edit's files and each phase's count, in a frame of their own ([`own_frame`]).
     let (files, phase_counts) = own_frame(|| {
@@ -3692,9 +3689,43 @@ where
     'f: 's,
     'm: 's,
 {
-    let heads_snap: core::cell::OnceCell<crate::store::SharedSnapshot> = core::cell::OnceCell::new();
-    let mut heads_lazy: Option<crate::front_load::ScopeRecords<'_>> = None;
-    while one_phase(rq, engine, store, read, records, pipeline, last_lines, stored, files, &heads_snap, &mut heads_lazy)? {}
+    let mut heads_snap: core::cell::OnceCell<crate::store::SharedSnapshot> = core::cell::OnceCell::new();
+    let mut heads_once: Option<crate::engine_heads_once::HeadsOnce> = None;
+    loop {
+        let mut heads_lazy: Option<crate::front_load::ScopeRecords<'_>> = None;
+        let mut reset_heads = false;
+        let mut more = true;
+        while more {
+            let mut ran_heads = false;
+            more = one_phase(
+                rq,
+                engine,
+                store,
+                read,
+                records,
+                pipeline,
+                last_lines,
+                stored,
+                files,
+                &heads_snap,
+                &mut heads_lazy,
+                &mut heads_once,
+                &mut ran_heads,
+            )?;
+            if ran_heads && !engine.has_pending_stage(Stage::Heads) {
+                reset_heads = true;
+                break;
+            }
+        }
+        drop(heads_lazy);
+        if reset_heads {
+            heads_once = None;
+            heads_snap = core::cell::OnceCell::new();
+        }
+        if !more {
+            break;
+        }
+    }
     Ok(())
 }
 
@@ -3722,6 +3753,8 @@ fn one_phase<'d, 'f, 'r, 's, 'w, 'm, 'l>(
     files: &[(Name, &[Planned])],
     heads_snap: &'l core::cell::OnceCell<crate::store::SharedSnapshot>,
     heads_lazy: &mut Option<crate::front_load::ScopeRecords<'l>>,
+    heads_once: &mut Option<crate::engine_heads_once::HeadsOnce>,
+    ran_heads: &mut bool,
 ) -> Result<bool, CliError>
 where
     'r: 's,
@@ -3788,7 +3821,10 @@ where
     rq.times.coordinator(Coordinator::Planning, ns(planning.since_start()), ns(began.since_start()));
     // The Bodies phase's run facts, in this phase's arena: made by `run_phase`, copied into the
     // put below, dropped with the phase's other buffers.
-    let phase_facts = run_stage(rq, engine, store, read, records, pipeline, last_lines, stored, files, &mut phase, mixed, &mut entered, at_phase, heads_snap, heads_lazy)?;
+    let phase_facts = run_stage(rq, engine, store, read, records, pipeline, last_lines, stored, files, &mut phase, mixed, &mut entered, at_phase, heads_snap, heads_lazy, heads_once)?;
+    if phase.stage == Stage::Heads {
+        *ran_heads = true;
+    }
     *rq.active = Some(phase);
     // Pipelined: the coordinator filed finished Scripts and Names tasks in order; else it ran
     // the phase whole (its pool joined).
@@ -3816,7 +3852,16 @@ where
     rq.ran.push((phase, 0, count));
     // The phase's records to the store, sorted by key, before the next phase reads them.
     let putting = clock.now();
-    put_phase(rq, engine, store, read, records, phase, &entered, phase_facts.as_ref(), &mem)?;
+    put_phase(rq, engine, store, read, records, phase, &entered, phase_facts.as_ref(), &mem, heads_once)?;
+    if phase.stage == Stage::Heads && !engine.has_pending_stage(Stage::Heads) {
+        if let Some(once) = heads_once.take() {
+            rq.heads.finish_once(once.counts(), once.put_keys(), heap.shared());
+        }
+        *heads_lazy = None;
+    }
+    if phase.stage == Stage::Lints && !engine.has_pending_stage(Stage::Lints) {
+        rq.lints.release_priors();
+    }
     let folding = clock.now();
     rq.times.coordinator(Coordinator::Put, ns(putting.since_start()), ns(folding.since_start()));
     rq.phase_times.push(rq.times.fold(phase, ns(began.since_start()), ns(merging.since_start()), merge, folding.since(putting).map_or(0, ns)));
@@ -3865,6 +3910,9 @@ fn serve_found<'d, 'f, 'r, 's, 'w, 'm>(
     let by = stage.found();
     // No found file then and none now: the request of every project with no computed module.
     if old.is_empty() && by.iter().all(|one| one.outlined.is_empty()) {
+        if let Some(stage) = rq.names.as_mut() {
+            stage.clear_found();
+        }
         return Ok(());
     }
     let Some(list) = stage.names.as_ref().map(|world| world.list()) else { return Ok(()) };
@@ -3946,6 +3994,9 @@ fn serve_found<'d, 'f, 'r, 's, 'w, 'm>(
     }
     let moved = !news.is_empty() || masks.len() != old.len() || old.iter().any(|(file, place)| masks.get(file) != Some(&(place.unit, place.flags & PLACE_FOUND)));
     if !moved {
+        if let Some(stage) = rq.names.as_mut() {
+            stage.clear_found();
+        }
         return Ok(());
     }
     // 2. Every outline in one table: the walk's copied (COST: the outlines' bytes, once on a
@@ -4173,10 +4224,14 @@ fn serve_found<'d, 'f, 'r, 's, 'w, 'm>(
         rq.bodies.note_entered(filed.iter().map(|task| task.planned.name), heap.alloc());
         let request_mem = rq.request_mem;
         let mem = request_mem.phase(Stage::Outlines)?;
-        put_phase(rq, &*engine, store, read, records, Phase::new(Stage::Outlines, 0), &filed, None, &mem)?;
+        let mut no_heads_once = None;
+        put_phase(rq, &*engine, store, read, records, Phase::new(Stage::Outlines, 0), &filed, None, &mem, &mut no_heads_once)?;
         drop(filed);
         let row = mem.end();
         rq.board.phase_mem(row.stage, rq.phase_mem.add(row));
+    }
+    if let Some(stage) = rq.names.as_mut() {
+        stage.clear_found();
     }
     Ok(())
 }
@@ -4261,6 +4316,7 @@ fn run_stage<'d, 'f, 'r, 's, 'w, 'm, 'p, 'l>(
     at_phase: SharedAlloc<'p>,
     heads_snap: &'l core::cell::OnceCell<crate::store::SharedSnapshot>,
     heads_lazy: &mut Option<crate::front_load::ScopeRecords<'l>>,
+    heads_once: &mut Option<crate::engine_heads_once::HeadsOnce>,
 ) -> Result<Option<crate::engine_bodies::MadeFacts<'p>>, CliError>
 where
     'r: 's,
@@ -4303,7 +4359,7 @@ where
         // PHASE-MEM-DEBT(Scripts): as Names': `ScriptsStage::results` on the request frame and
         // the process heap, kept to the command's end; to take `at_phase`.
         (None, Stage::Scripts) => rq.buffers[0].done.extend(entered.iter().map(|task| crate::engine_tasks::failed(task, alloc))),
-        (None, Stage::Heads) => heads_phase(rq, engine, store, read, &entered[..], heads_snap, heads_lazy)?,
+        (None, Stage::Heads) => heads_phase(rq, engine, store, read, &entered[..], at_phase, heads_snap, heads_lazy, heads_once)?,
         // PHASE-MEM-DEBT(Lints): `LintsStage::made` on the process heap, kept to the command's
         // end for the put and the print; to take `at_phase`.
         (None, Stage::Lints) => {
@@ -4468,8 +4524,10 @@ fn bodies_phase<'r, 'm, 'p>(
         table.body_locals = rq.body_locals;
     }
     // The dependency heads the Heads stage put by key are listed by the root too.
-    if let (Some(table), Some(once)) = (request_heads.as_mut(), rq.heads.once.as_ref()) {
-        table.list_too(once.put_keys());
+    if let Some(table) = request_heads.as_mut()
+        && !rq.heads.once_put_keys().is_empty()
+    {
+        table.list_too(rq.heads.once_put_keys());
     }
     // Stand unchanged members from the last request's members record (StandingMembers) on the
     // phase path too: every outline entered earlier (plus any found file affected by serve_found)
@@ -5354,8 +5412,10 @@ fn ready_drive<'d, 'f, 'r, 's, 'w, 'm>(
     if let Some(table) = request_heads.as_mut() {
         table.body_locals = rq.body_locals;
     }
-    if let (Some(table), Some(once)) = (request_heads.as_mut(), rq.heads.once.as_ref()) {
-        table.list_too(once.put_keys());
+    if let Some(table) = request_heads.as_mut()
+        && !rq.heads.once_put_keys().is_empty()
+    {
+        table.list_too(rq.heads.once_put_keys());
     }
     let listing_snapshot = crate::store::Store::snapshot(&*store)?;
     let listings = rq.heads.listings(heap, listing_snapshot.as_ref(), handles.tool);
@@ -5536,14 +5596,16 @@ fn ready_put<'m>(
 /// A Heads phase: the closed dependencies' heads found by key, then the head tasks run.
 #[inline(never)]
 #[expect(clippy::too_many_arguments, reason = "heads phase handles, each named")]
-fn heads_phase<'r, 'm, 'l>(
+fn heads_phase<'r, 'm, 'p, 'l>(
     rq: &mut Drive<'_, '_, 'r, '_, '_>,
     engine: &Engine<'r, Everything>,
     store: &mut crate::store::CommandStore<'m, '_, bstd::io::LentDriver>,
     read: &mut crate::engine_records::EngineRecords<'m>,
     entered: &[Task],
+    at_phase: SharedAlloc<'p>,
     heads_snap: &'l core::cell::OnceCell<crate::store::SharedSnapshot>,
     heads_lazy: &mut Option<crate::front_load::ScopeRecords<'l>>,
+    heads_once: &mut Option<crate::engine_heads_once::HeadsOnce>,
 ) -> Result<(), CliError> {
     #[cfg(test)]
     stack_probe::at("heads_phase");
@@ -5551,24 +5613,23 @@ fn heads_phase<'r, 'm, 'l>(
     let body_tool = tools.of(Name { kind: blaze_drive::Kind::BodyCheck, subject: blaze_ids::ContentId([0; 32]) });
     let handles = crate::engine_bodies::Handles { root: rq.root, env: rq.env, graph: rq.graph, names: rq.names.as_ref().map(crate::engine_names::NamesInputs::ran), outlined: rq.outlined, workers: rq.workers, clock: rq.phases.clock(), board: rq.board, tool: body_tool, scoped: rq.scoped };
     let crate::engine_bodies::BodiesStage { kept, shelf, .. } = &mut *rq.bodies;
-    // PHASE-MEM-DEBT(Heads): `HeadsStage::made` and `refused` on the process heap, kept to the
-    // command's end for the put and the notes, and the shelf's tables carried to the Bodies
-    // phases (`bodies.shelf`): to take `at_phase` for the first, and the store's records read in
-    // place for the second. A closed dependency's head is found by its key in the store's
-    // committed snapshot (lane H9; engine_heads_once.rs, "A CLOSED DEPENDENCY'S HEAD").
-    if let (Some(once), Some(stage), Some(graph)) = (rq.heads.once.as_mut(), rq.names.as_ref(), rq.graph) {
+    let once = heads_once.get_or_insert_with(|| {
+        crate::engine_heads_once::HeadsOnce::new(heap, crate::engine_heads_once::OncePlant::Rule, rq.heads.head_sources)
+    });
+    if let (Some(stage), Some(graph)) = (rq.names.as_ref(), rq.graph) {
         if let Some(list) = kept.list(cx, &mut *store, &graph, frame)? {
             let records = store.snapshot_in(heap.shared())?;
             let crates = crate::engine_seeds::crates_in(&list, stage, heap.shared());
             once.find_dependencies(crate::engine_seeds::DependencyFinder::new(records, crates, crate::engine_seeds::tool_of(tools)));
         }
     }
-    rq.heads.run_phase(cx, &mut *store, &mut *read, &handles, kept, shelf, entered, engine.view(), &mut rq.buffers[0], &mut *rq.times, alloc, frame, heads_snap, heads_lazy)
+    rq.heads.run_phase(cx, &mut *store, &mut *read, &handles, kept, shelf, entered, engine.view(), &mut rq.buffers[0], &mut *rq.times, alloc, at_phase, frame, heads_snap, heads_lazy, once)
 }
 
 /// The phase's records to the store, sorted by key, committed before the next phase reads
 /// them; each handed payload freed; each producer's mark for the phases after.
 #[inline(never)]
+#[expect(clippy::too_many_arguments, reason = "put phase handles, each named")]
 fn put_phase<'m>(
     rq: &mut Drive<'_, '_, '_, '_, '_>,
     engine: &Engine<'_, Everything>,
@@ -5579,6 +5640,7 @@ fn put_phase<'m>(
     entered: &[Task],
     phase_facts: Option<&crate::engine_bodies::MadeFacts<'_>>,
     mem: &crate::engine_phase_mem::PhaseMem<'_>,
+    heads_once: &mut Option<crate::engine_heads_once::HeadsOnce>,
 ) -> Result<(), CliError> {
     #[cfg(test)]
     stack_probe::at("put_phase");
@@ -5687,7 +5749,7 @@ fn put_phase<'m>(
     }
     // The closed dependency heads frozen this phase, put under their keys (lane H9).
     if phase.stage == Stage::Heads
-        && let Some(once) = rq.heads.once.as_mut()
+        && let Some(once) = heads_once.as_mut()
     {
         put_now += once.put_dependencies(cx, &mut *store, &mut *rq.ledger)?;
     }
@@ -5707,7 +5769,7 @@ fn put_phase<'m>(
             }
         }
         if phase.stage == Stage::Heads
-            && let Some(once) = rq.heads.once.as_mut()
+            && let Some(once) = heads_once.as_mut()
         {
             once.committed(store.snapshot_in(heap.shared())?);
         }
@@ -5725,7 +5787,8 @@ fn put_phase<'m>(
                 .and_then(|one| one.made.as_mut().ok())
                 .map_or(0, |record| record.release_handed()),
             Stage::Heads => rq.heads.release_payload(name),
-            Stage::Units | Stage::Outlines | Stage::Bodies | Stage::Lints => 0,
+            Stage::Lints => rq.lints.release_payload(name),
+            Stage::Units | Stage::Outlines | Stage::Bodies => 0,
         };
         rq.ledger.released(phase.stage, freed);
     }

@@ -618,6 +618,11 @@ impl<'m> Stored<'m> {
     fn cursor_of(&self, at: Where, name: &str) -> Option<Cursor> {
         self.units().find(|(kind, it, _)| *kind == at as u8 && *it == name).map(|(_, _, cursor)| cursor)
     }
+
+    /// Whether the stored answer kept a usable journal cursor for the checkout root.
+    pub(crate) fn has_checkout_cursor(&self) -> bool {
+        self.cursor_of(Where::Checkout, "").is_some_and(|cursor| cursor != Cursor::None)
+    }
 }
 
 /// The replay of a request (the module's rule): the checkout's folder, one stream, under one
@@ -906,6 +911,16 @@ impl<'t> Taken<'t> {
             unit.cursor = Some(journal);
             self.helper_place = Some(helper);
         }
+    }
+
+    /// Records a refused checkout unit directly from a helper's fresh `(journal, helper)` pair
+    /// when no prior checkout cursor was stored: equivalent to replaying from `Cursor::None` and
+    /// then calling [`Taken::pair_with_helper`], without opening a redundant OS journal stream.
+    pub(crate) fn refused_with_helper_place(&mut self, journal: Cursor, helper: [u8; HELPER_PLACE]) {
+        let name_at = self.names.push("");
+        self.refuse(Refused::NoCursor);
+        self.units.push(Unit { at: Where::Checkout, name: name_at, cursor: Some(journal), since: None, heard: None });
+        self.helper_place = Some(helper);
     }
 
     /// `Both`: the helper's `names` added to what the checkout's replay heard, so the rows

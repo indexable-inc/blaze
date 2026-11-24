@@ -414,6 +414,27 @@ impl LintsStage {
         self.made.binary_search_by_key(&name, |one| one.name).ok().map(|at| &self.made[at])
     }
 
+    /// Releases `name`'s handed payload bytes and reads once `put_phase` has committed them to the
+    /// store (rule 51), keeping findings/messages/counts for `lines_of` and the profile.
+    pub(crate) fn release_payload(&mut self, name: Name) -> usize {
+        let Ok(at) = self.made.binary_search_by_key(&name, |one| one.name) else {
+            return 0;
+        };
+        let Some(one) = self.made.get_mut(at) else {
+            return 0;
+        };
+        let freed = one.record.release_handed();
+        one.record.reads.clear();
+        one.record.reads.shrink_to_fit();
+        freed
+    }
+
+    /// Releases cached prior lint records once `Stage::Lints` finishes.
+    pub(crate) fn release_priors(&mut self) {
+        self.priors.clear();
+        self.priors.shrink_to_fit();
+    }
+
     /// Task `name`'s last record (the stored answer's, engine_check.rs `lint_priors`), kept as
     /// what its units may be kept by key from. Read back here, once; one that does not read
     /// refuses the task by name when it runs (rule 3).

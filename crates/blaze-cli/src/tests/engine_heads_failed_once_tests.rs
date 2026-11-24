@@ -116,7 +116,7 @@ fn need() -> Want {
     Want::Head(blaze_id::ItemKey(blaze_id::ContentId::of("blaze-cli heads failed once", b"its need")))
 }
 
-fn failed(said: &'static str, needs: Option<Want>) -> FailedEntry {
+fn failed(said: &'static str, needs: Option<Want>) -> FailedEntry<'static> {
     let cause = crate::engine_head_notes::Cause::new(crate::engine_head_notes::RootKind::Head, said);
     FailedEntry { want: cell(), cause, needs, reads: &[], heads: &[] }
 }

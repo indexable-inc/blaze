@@ -330,6 +330,11 @@ impl<'f> NamesStage<'f> {
         &self.found
     }
 
+    /// Drops the per-crate found-file outlines and probes once `serve_found` has applied them.
+    pub(crate) fn clear_found(&mut self) {
+        self.found.clear();
+    }
+
     /// The oracle's sums over every crate filed.
     pub(crate) fn oracle_totals(&self) -> OracleTotals {
         let mut t = OracleTotals { crates: self.oracle.len() as u64, not_compared: self.oracle_missed.len() as u64, ..OracleTotals::default() };

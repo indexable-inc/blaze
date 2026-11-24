@@ -62,7 +62,7 @@ fn cell() -> Want {
 }
 
 /// `names`' `WHOLE` cells lent in `heap` until the test run ends.
-fn cover_of(heap: &'static blaze_own::Heap, names: &[&str]) -> Cover {
+fn cover_of(heap: &'static blaze_own::Heap, names: &[&str]) -> Cover<'static> {
     let mut cells: blaze_own::Vec<CellId, blaze_own::Alloc<'static>> = blaze_own::Vec::with_capacity_in(names.len(), heap.alloc());
     cells.extend(names.iter().map(|n| CellId { of: scope(n), cell: WHOLE }));
     cells.sort_unstable();
@@ -78,7 +78,7 @@ fn race(tape: &Tape, plant: OncePlant, heap: &'static blaze_own::Heap) -> Result
     let other = tape.bool("the second cover holds other cells");
     let made = [cover_of(heap, &["core", "alloc"]), if other { cover_of(heap, &["core"]) } else { cover_of(heap, &["core", "alloc"]) }];
     let mut step = [0u8; 2];
-    let mut handed: [Option<Cover>; 2] = [None, None];
+    let mut handed: [Option<Cover<'_>>; 2] = [None, None];
     let mut first: Option<usize> = None;
     while step != [2, 2] {
         let w = match (step[0] < 2, step[1] < 2) {
