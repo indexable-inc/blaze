@@ -2500,3 +2500,100 @@ fn engine_check_scoped_skips_unrelated_sibling_and_preserves_whole_answer() {
     assert!(after.certified, "scoped certificate remains valid after whole-workspace check");
     assert!(after_ids.is_empty(), "scoped check stays clean after whole-workspace check: {after_ids:?}");
 }
+
+/// A stored answer whose pointer, lines, and root directory exist in the store while one or more
+/// lazy task pages were pruned (reproducing the live `tempo` missing-page wedge) must NOT wedge
+/// the checkout with `rc=125`:
+/// - under `--driver=ready` (explicit ready-only mode) it still fails closed with an actionable
+///   `blaze clean` hint;
+/// - under the default driver (`Phases` / `Auto`) it reports the missing page visibly via
+///   `Unreadable::Pages(PagesError::Missing { .. })`, rebuilds cleanly in full once, overwrites
+///   the checkout's stored answer, and the very next check hits the certificate.
+#[test]
+fn missing_stored_answer_page_rebuilds_visibly_and_unwedges_checkout() {
+    use blaze_cas::plain::{LEASE_NS, ROOT_LIFE_NS, Settings};
+
+    let io = Io::simulated(SimWorld::new(37, Limits::USUAL));
+    three_crates(&io);
+    let (first_ids, first) = engine_from(&io, 2, false);
+    assert!(first.entered > 0, "cold check must enter tasks");
+
+    // Simulate a pruned task page while pointer + lines + root directory remain live:
+    // unroot `{root}.reach` (which pins task pages), keep `{root}` and `{root}.answer` pinned,
+    // advance past the lease window, and compact the store so the unpinned page records are swept.
+    let cx = io.cx(BUDGET, TASK_FRAME).expect("root context");
+    let frame = cx.frame();
+    let fs = io.need_fs().expect("fs");
+    let host = io.need_host().expect("host");
+    let mut rng = io.need_rng().expect("rng");
+    let heap = blaze_own::testing::heap();
+    let answer_root = crate::engine_answer::root_name("ws", frame);
+    let reach_root = bstd::mem::format_in!(frame, "{}.{}", answer_root.as_str(), crate::engine_answer::REACH_ROOT);
+    let answer_index_root = bstd::mem::format_in!(frame, "{}.{}", answer_root.as_str(), crate::engine_answer::ANSWER_ROOT);
+    let store_home = crate::store::Home::of(&cx, &fs, Some("/h")).expect("home");
+    {
+        let facts = crate::store::Facts { boot: Some(1), nonce: 37 };
+        let lent = store_home.open_store(&Settings::default(), facts, heap.alloc()).expect("open store");
+        assert!(lent.has_root(reach_root.as_str()), "cold check must have pinned reach root");
+        lent.unroot(reach_root.as_str());
+        assert!(lent.renew_root(answer_root.as_str(), ROOT_LIFE_NS).is_live());
+        assert!(lent.renew_root(answer_index_root.as_str(), ROOT_LIFE_NS).is_live());
+        lent.commit().expect("commit unroot of reach");
+    }
+    // Advance past lease expiry so unpinned page records are eligible for compaction.
+    io.with_sim(|sim| sim.advance(core::time::Duration::from_nanos(LEASE_NS + 1_000_000))).expect("advance clock");
+    {
+        let facts = crate::store::Facts { boot: Some(1), nonce: 38 };
+        let lent = store_home.open_store(&Settings::default(), facts, heap.alloc()).expect("reopen for compact");
+        let _ = lent.compact_foreground(32).expect("compact");
+        lent.commit().expect("commit compact");
+    }
+
+    // Edit a body so the certificate does not short-circuit and `checking` reads a lazy page.
+    write(&io, "a/src/m.rs", "pub fn k() -> u8 {\n    let _ = 9u8;\n    2\n}\n");
+
+    // 1. Explicit `--driver=ready` must still fail closed with an actionable `blaze clean` hint.
+    let cx2 = io.cx(BUDGET, TASK_FRAME).expect("fresh context after clock advance");
+    let frame2 = cx2.frame();
+    let mut ready_opts = opts(&io, 2, false);
+    ready_opts.driver = crate::engine_ready_edit::Driver::Ready;
+    let ready_err = {
+        let root = fs.open_dir(&cx2, &Path::new("ws").expect("path")).expect("open");
+        let out = io.need_out().expect("out");
+        let err = io.need_err().expect("err");
+        let mut phases = boxed(|| Phases::new(io.need_clock().expect("clock")));
+        let mut shown = print::Shown::new(blaze_report::frame::Caps::LINES, View::Person, "/ws", frame2);
+        let args = io.args();
+        let net = io.net();
+        engine_check::check(&cx2, &fs, &host, &mut rng, args.as_ref(), net.as_ref(), &root, ready_opts, &mut shown, &mut phases, &out, &err)
+            .err()
+            .expect("explicit --driver=ready must fail closed when a stored page is missing")
+    };
+    let ready_msg = ready_err.to_string();
+    assert!(ready_msg.contains("is not in the store"), "expected missing-page error, got: {ready_msg}");
+    assert!(ready_msg.contains("blaze clean"), "expected actionable `blaze clean` hint, got: {ready_msg}");
+
+    // 2. `Driver::Auto` (the default CLI driver) hits `PagesError::Missing` on the lazy page read,
+    //    recovers cleanly once with a visible `Unreadable::Pages(Missing)` note, and overwrites the
+    //    checkout's stored answer with a complete one.
+    let before = stdout(&io).len();
+    let mut auto_opts = opts(&io, 2, false);
+    auto_opts.driver = crate::engine_ready_edit::Driver::Auto;
+    let (recovered_ids, recovered) = engine_opts(&io, auto_opts);
+    let printed = stdout(&io).split_off(before);
+    assert!(!recovered.from_last, "recovery pass must answer in full");
+    assert!(
+        matches!(recovered.unreadable, Some(crate::engine_answer::Unreadable::Pages(blaze_engine::pages::PagesError::Missing { .. }))),
+        "expected Unreadable::Pages(Missing), got {:?}",
+        recovered.unreadable
+    );
+    assert!(printed.contains("the stored engine answer is not read"), "visible note must be printed:\n{printed}");
+    assert!(printed.contains("is not in the store"), "note must name missing page:\n{printed}");
+    assert!(printed.contains("answering in full and writing it anew"), "note must explain full rebuild:\n{printed}");
+    assert_eq!(recovered_ids, first_ids, "recovered check must produce identical findings");
+
+    // 3. Subsequent check hits the freshly written certificate with no unreadable note.
+    let (_, after) = engine_from(&io, 2, false);
+    assert!(after.certified, "checkout must be unwedged and hit certificate on next check");
+    assert!(after.unreadable.is_none(), "no unreadable note after unwedging: {:?}", after.unreadable);
+}

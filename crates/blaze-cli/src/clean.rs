@@ -287,17 +287,50 @@ impl fmt::Display for NotLooked<'_> {
 /// What `blaze clean` prints when no folder was there to remove.
 pub const NOTHING: &str = "nothing to remove";
 
+/// Capabilities for unrooting this checkout's cached answers from the home's shared store when
+/// `blaze clean` runs without `--store` / `--all`.
+pub(crate) struct StoreClean<'a> {
+    pub(crate) host: &'a bstd::host::Host,
+    pub(crate) rng: &'a mut bstd::rng::Rng,
+    pub(crate) heap: &'static blaze_own::Heap,
+}
+
 /// `blaze clean [dir] [--store]`: each folder removed printed as it goes ("removed <path>: <n>
 /// files, <bytes> bytes freed"), or "nothing to remove"; exit status 0. A refusal stops it
 /// before anything more is removed.
-pub fn run(cx: &Cx, fs: &bstd::fs::Fs, env: Option<&bstd::env::Env>, args: &bstd::args::Args, out: &bstd::out::Out) -> Result<bstd::entry::Status, crate::CliError> {
+#[expect(clippy::too_many_arguments, reason = "clean command edge: each argument one specific capability")]
+pub fn run(
+    cx: &Cx,
+    fs: &bstd::fs::Fs,
+    env: Option<&bstd::env::Env>,
+    args: &bstd::args::Args,
+    host: &bstd::host::Host,
+    rng: &mut bstd::rng::Rng,
+    out: &bstd::out::Out,
+    heap: &'static blaze_own::Heap,
+) -> Result<bstd::entry::Status, crate::CliError> {
     // The home, read here at the edge (rule 75).
     let home = env.and_then(|env| env.get(&bstd::env::VarName::new("HOME").ok()?).ok().flatten());
-    run_with(cx, fs, args.each().skip(2), home, out)
+    run_with_store(cx, fs, args.each().skip(2), home, out, Some(StoreClean { host, rng, heap }))
 }
 
-/// [`run`] on the words after `clean` and the home `HOME` names.
+/// [`run`] on the words after `clean` and the home `HOME` names (without opening the shared CAS
+/// store, for directory-only fixture tests).
 pub fn run_with<'w>(cx: &Cx, fs: &bstd::fs::Fs, words: impl Iterator<Item = &'w str>, home: Option<&str>, out: &bstd::out::Out) -> Result<bstd::entry::Status, crate::CliError> {
+    run_with_store(cx, fs, words, home, out, None)
+}
+
+/// [`run`] on the words after `clean`, the home `HOME` names, and optional shared-store cleanup
+/// capabilities so `blaze clean` without `--store` unroots this checkout's stored answers from
+/// `<HOME>/.blaze/v2/store` without disturbing other checkouts.
+pub(crate) fn run_with_store<'w>(
+    cx: &Cx,
+    fs: &bstd::fs::Fs,
+    words: impl Iterator<Item = &'w str>,
+    home: Option<&str>,
+    out: &bstd::out::Out,
+    store_clean: Option<StoreClean<'_>>,
+) -> Result<bstd::entry::Status, crate::CliError> {
     let mut dir = None;
     let mut with_store = false;
     let mut with_all = false;
@@ -406,6 +439,33 @@ pub fn run_with<'w>(cx: &Cx, fs: &bstd::fs::Fs, words: impl Iterator<Item = &'w 
                 let removed = remove_other(cx, &home_dir, &at, form, SweepPlant::None).map_err(crate::CliError::Clean)?;
                 out.line(cx, format_args!("{}", SaidOther { lead: lead.as_str(), legacy: matches!(form.kind, crate::store::plain_place::forms::FormKind::Legacy), removed: &removed }))?;
                 any = true;
+            }
+            if let Some(sc) = store_clean {
+                let own_store = bstd::mem::format_in!(frame, ".blaze/{}", crate::store::plain_place::STORE_DIR);
+                if home_dir.stat(cx, &Path::new(own_store.as_str())?)?.is_some() {
+                    let checkout_rel = match &checkout {
+                        crate::checkout::Checkout::Under(under) => under.as_str(),
+                        crate::checkout::Checkout::Here => "",
+                    };
+                    let checkout_at = match crate::run_package::locate(cx, fs, &checkout, frame) {
+                        Ok(located) => located.at,
+                        Err(_) => checkout_rel,
+                    };
+                    let checkout_key = match crate::engine_script_reads::Served::at_edge(cx.is_simulated(), checkout_at, frame) {
+                        Ok(served) => served.root_text().unwrap_or(checkout_at),
+                        Err(_) => checkout_at,
+                    };
+                    let store_home = crate::store::Home::of(cx, fs, home)?;
+                    let boot = sc.host.boot().ok().map(|b| crate::store::boot_fact(&b));
+                    let facts = crate::store::Facts { boot, nonce: crate::store::nonce(sc.rng) };
+                    let lent = store_home.open_store(&blaze_cas::plain::Settings::default(), facts, sc.heap.alloc())?;
+                    let unrooted = crate::engine_answer::unroot_checkout(&lent, checkout_key, frame)?;
+                    if unrooted > 0 {
+                        let noun = if unrooted == 1 { "root" } else { "roots" };
+                        out.line(cx, format_args!("cleared {unrooted} cached answer {noun} for this checkout in {}{}", lead.as_str(), own_store.as_str()))?;
+                        any = true;
+                    }
+                }
             }
         }
     }
