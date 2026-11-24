@@ -340,11 +340,11 @@ pub const SITE_HTML: &str = r##"<!doctype html>
     vertical-align: -0.15em;
     height: 1.05em;
     width: auto;
+    line-height: 1;
   }
   .ico svg { height: 100%; width: auto; display: block; }
   .ico-mask { color: inherit; }
   .ico-mask svg { fill: currentColor; }
-  .ico-mask svg path { stroke: currentColor; }
   .r-cmd { color: var(--ink-1); }
   .r-cmdDim { color: var(--ink-3); }
   .r-cmdFaint { color: var(--ink-4); }

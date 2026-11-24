@@ -190,9 +190,12 @@ fn layout_find_matches_and_cursor_anchored_pinch_zoom_work() {
     assert!(site.insts.len() > 10);
     assert!(site.insts.as_slice().iter().any(|i| (i.fx.x - site_kind::SHADOW).abs() < 0.1));
 
-    // All 9 SVGs are embedded directly inside `blaze-site`
+    // All 9 SVGs are embedded directly inside `blaze-site` and declare explicit `viewBox`
     for img in ImageName::ALL {
-        assert!(img.svg_source().contains("<svg"));
+        let src = img.svg_source();
+        assert!(src.contains("<svg"));
+        assert!(src.contains("viewBox="));
+        assert!(!src.contains("<?xml"));
     }
 
     // Reset zoom returns to 100% centered
