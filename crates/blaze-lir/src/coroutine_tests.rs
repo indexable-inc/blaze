@@ -23,7 +23,7 @@
 //! (Destructors) "When control flow leaves a drop scope all variables associated to that
 //! scope are dropped": the cancel path is the builder's, and the pass must run exactly it.
 
-use std::alloc::Global;
+use std::alloc::{Allocator, Global};
 
 use blaze_sim::{Broke, Config, Tape, check, control};
 
@@ -416,7 +416,7 @@ fn direct(view: View<'_>, shape: Shape, upvars: [u64; 2], cancel: Option<u32>) -
 
 /// The pass's outputs, driven as a state machine: `poll` until it is not Pending, or `drop`
 /// where `cancel` says; a state that returned is dropped too, which must do nothing.
-fn machine(split: &Split<Global>, upvars: [u64; 2], cancel: Option<u32>, most_polls: u64) -> Result<Vec<Event>, Fault> {
+fn machine<A: Allocator>(split: &Split<A>, upvars: [u64; 2], cancel: Option<u32>, most_polls: u64) -> Result<Vec<Event>, Fault> {
     let (poll, glue) = (split.poll.view(), split.drop.view());
     let layout = &split.layout;
     let mut world = World::new(layout.size as usize, upvars);
@@ -490,7 +490,7 @@ fn machine(split: &Split<Global>, upvars: [u64; 2], cancel: Option<u32>, most_po
 }
 
 /// Whether the body and its split agree on every schedule.
-fn agree(view: View<'_>, shape: Shape, split: &Split<Global>, upvars: [u64; 2]) -> Result<(), Broke> {
+fn agree<A: Allocator>(view: View<'_>, shape: Shape, split: &Split<A>, upvars: [u64; 2]) -> Result<(), Broke> {
     let texts = || format!("{}\npoll:\n{}\ndrop:\n{}", print(view), print(split.poll.view()), print(split.drop.view()));
     for (name, func) in [("poll", &split.poll), ("drop", &split.drop)] {
         verify(func.view()).map_err(|e| Broke::Oracle(format!("the {name} is not LIR: {e}\n{}", texts())))?;
@@ -766,7 +766,7 @@ struct Made {
 }
 
 /// `(state: ptr, cx: i64) -> (i64, i64)`: the returns are `Poll`'s tag and its value.
-fn own_sig(b: &mut Builder<Global, Full>) {
+fn own_sig<A: Allocator + Clone>(b: &mut Builder<A, Full>) {
     let sig = b.sig(
         Conv::C,
         Variadic::No,

@@ -41,12 +41,12 @@ use core::alloc::Allocator;
 
 use blaze_lir::builder::MemAttrs;
 use blaze_lir::func::{SlotId, SlotKind};
-use blaze_lir::{Flags, IntCond, Ty, Value};
+use blaze_lir::{Flags, IntCond, Op, Ty, Value};
 use blaze_own::Vec;
 use blaze_typeck::{BinOp, CtorKind, Def, Edition, Expr, ExprId, Stmt, UnOp};
 
 use super::lets::scope::LetAnchor;
-use super::{Held, NO_EXPR, Repr, Task, Walk, malformed, unsupported};
+use super::{Held, Home, LocalOwn, NO_EXPR, Repr, Task, V, Walk, malformed, unsupported};
 use crate::BuildError;
 
 /// `Walk::temp_here` per expression: not a temporary scope of its own.
@@ -435,6 +435,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// reverse order of creation; the bindings its `let` made, and extended temporaries
     /// (`Held::Temp`, its block's), stay.
     pub(super) fn temp_end(&mut self) -> Result<(), BuildError> {
+        let depth = self.temp_scopes.len().saturating_sub(1);
         let mark = self.temp_marks.pop().ok_or(malformed("a statement's temporaries out of order"))? as usize;
         self.temp_scopes.pop().ok_or(malformed("a statement's temporaries out of order"))?;
         let mut i = self.scope_pats.len();
@@ -442,14 +443,231 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             i -= 1;
             let h = self.scope_pats[i];
             // `Held::Moved`: a temporary scrutinee a match by tests moves out of (walk/moves.rs).
-            if let Held::Rest { .. } | Held::Moved { .. } = h {
+            if let Held::Rest { at, .. } = h {
                 self.drop_held(h, true)?;
                 self.scope_pats.remove(i);
+                if let Some(slot) = self.whole_slot(at) {
+                    self.end_temp_slot(slot);
+                }
+            } else if let Held::Moved { at, mask, .. } = h {
+                self.drop_held(h, true)?;
+                self.scope_pats.remove(i);
+                if self.live {
+                    self.b.slot_dead(mask);
+                }
+                if let Some(slot) = self.whole_slot(at) {
+                    self.end_temp_slot(slot);
+                }
             } else if self.super_let_ends_here(h)? {
                 // A `super let` binding of a block in this scope (walk/super_let.rs).
                 self.scope_pats.remove(i);
             }
         }
+        // End non-dropping temporary slots registered in this temporary scope.
+        let mut j = self.temp_slots.len();
+        while j > 0 {
+            j -= 1;
+            if self.temp_slots.get(j).is_some_and(|&(d, _)| d >= depth) {
+                let (_, slot) = self.temp_slots.remove_swap(j);
+                self.end_temp_slot(slot);
+            }
+        }
         Ok(())
+    }
+
+    /// Whether `slot` is a `SlotKind::Temp` in the current LIR function.
+    fn is_temp_slot(&self, slot: SlotId) -> bool {
+        self.b
+            .func()
+            .view()
+            .slots
+            .get(slot.index())
+            .is_some_and(|s| SlotKind::from_byte(s.kind) == Some(SlotKind::Temp))
+    }
+
+    /// Registers a non-dropping temporary slot (`SlotKind::Temp`) created for expression `e`
+    /// (a borrowed copy temporary or `format_args!` argument array) so its storage ends when
+    /// its temporary (or extended `let` block) scope closes, and names it if the flow saves `e`.
+    pub(super) fn hold_copy_temp(&mut self, e: ExprId, at: (Value, i32)) -> Result<(), BuildError> {
+        let Some(slot) = self.whole_slot(at) else { return Ok(()) };
+        if !self.is_temp_slot(slot) {
+            return Ok(());
+        }
+        self.name_slot(slot, blaze_flow_lower::identity::Identity::Temp(e, blaze_flow_lower::identity::Role::Value));
+        if self.co.is_none() {
+            return Ok(());
+        }
+        if let Some((_, init, _)) = self.extended_by(e)? {
+            if let Some(t) = self.temp_scope_index(init)
+                && let Some(&(_, depth)) = self.temp_scopes.get(t)
+                && let Ok(d) = usize::try_from(depth)
+            {
+                self.scope_slots.push((d, slot));
+            }
+            return Ok(());
+        }
+        if let Ok(anchor) = self.temp_anchor(e)
+            && let Some(t) = self.temp_scope_index(anchor)
+        {
+            self.temp_slots.push((t, slot));
+        }
+        Ok(())
+    }
+
+    /// The slot `p` addresses (at any byte offset), if `p` is a `slot_addr`.
+    pub(super) fn value_slot(&self, p: Value) -> Option<SlotId> {
+        let view = self.b.func().view();
+        let ix = p.index();
+        (ix < view.len() && view.op(ix) == Op::SlotAddr).then(|| view.data.get(ix).copied().map(SlotId)).flatten()
+    }
+
+    /// Whether any value currently on the walk's value stack addresses `slot`.
+    fn vals_use_slot(&self, slot: SlotId) -> bool {
+        self.vals.iter().any(|&v| match v {
+            V::Place(p, _) | V::Unsized(p, _) | V::Scalar(p) => self.value_slot(p) == Some(slot),
+            V::None => false,
+        })
+    }
+
+    /// Whether `slot` is owned by an entry currently in `scope_pats`.
+    pub(super) fn slot_held(&self, slot: SlotId) -> bool {
+        self.scope_pats.iter().any(|&h| match h {
+            Held::Rest { at, .. } => self.value_slot(at.0) == Some(slot),
+            Held::Moved { at, mask, .. } => mask == slot || self.value_slot(at.0) == Some(slot),
+            Held::Temp { at, flag, .. } => {
+                self.value_slot(at.0) == Some(slot)
+                    || flag.is_some_and(|(f, home)| f == slot || home == slot)
+            }
+            Held::Pat(p) => {
+                let home_hit = match self.slots.get(p.ix()).copied().flatten() {
+                    Some((Home::Slot(s), _)) => s == slot,
+                    Some((Home::At(v, _), _)) => self.value_slot(v) == Some(slot),
+                    None => false,
+                };
+                let own_hit = match self.owned.get(p.ix()).copied() {
+                    Some(LocalOwn::Drop(o)) => o.flag == Some(slot) || o.rest == Some(slot),
+                    Some(LocalOwn::KeptFlags(s)) => s == slot,
+                    _ => false,
+                };
+                home_hit || own_hit
+            }
+            Held::EnvPlace(_) => false,
+        })
+    }
+
+    /// Whether `slot` is bound as any local's home (even a non-dropping local not in `scope_pats`).
+    fn slot_is_local(&self, slot: SlotId) -> bool {
+        self.slots.iter().any(|s| match *s {
+            Some((Home::Slot(s), _)) => s == slot,
+            Some((Home::At(v, _), _)) => self.value_slot(v) == Some(slot),
+            None => false,
+        })
+    }
+
+    /// Ends `slot` (`slot_dead`) when it is a `SlotKind::Temp` in live code that nothing on the
+    /// value stack, in an open drop scope, or in a local binding still holds.
+    pub(super) fn end_temp_slot(&mut self, slot: SlotId) {
+        if !self.live {
+            return;
+        }
+        if !self.is_temp_slot(slot) {
+            return;
+        }
+        if self.vals_use_slot(slot) || self.slot_held(slot) || self.slot_is_local(slot) {
+            return;
+        }
+        self.b.slot_dead(slot);
+    }
+
+    /// Ends the `SlotKind::Temp` slot underlying `v`, if `v` is a whole-slot place and unused.
+    pub(super) fn end_temp_val(&mut self, v: V) {
+        if let V::Place(p, off) = v
+            && let Some(slot) = self.whole_slot((p, off))
+        {
+            self.end_temp_slot(slot);
+        }
+    }
+
+    /// Ends the storage of slots owned by the drop scope closing at `(mark, depth)`, sparing any
+    /// slot backing the scope's settled tail value `v` or still live on the value stack.
+    pub(super) fn end_scope_slots(&mut self, mark: usize, depth: usize, v: V) {
+        let kept = match v {
+            V::Place(p, _) | V::Unsized(p, _) | V::Scalar(p) => self.value_slot(p),
+            V::None => None,
+        };
+        let mut dead: Vec<SlotId, A> = Vec::new_in(self.alloc);
+        if self.live
+            && let Some(held) = self.scope_pats.get(mark..)
+        {
+            for &h in held {
+                match h {
+                    Held::Pat(p) => {
+                        match self.slots.get(p.ix()).copied().flatten() {
+                            Some((Home::Slot(s), _)) => dead.push(s),
+                            Some((Home::At(val, off), _)) => {
+                                if let Some(s) = self.whole_slot((val, off)) {
+                                    dead.push(s);
+                                }
+                            }
+                            None => {}
+                        }
+                        match self.owned.get(p.ix()).copied() {
+                            Some(LocalOwn::Drop(o)) => {
+                                if let Some(f) = o.flag {
+                                    dead.push(f);
+                                }
+                                if let Some(r) = o.rest {
+                                    dead.push(r);
+                                }
+                            }
+                            Some(LocalOwn::KeptFlags(r)) => dead.push(r),
+                            _ => {}
+                        }
+                    }
+                    Held::Rest { at, .. } => {
+                        if let Some(s) = self.whole_slot(at)
+                            && self.is_temp_slot(s)
+                        {
+                            dead.push(s);
+                        }
+                    }
+                    Held::Moved { at, mask, .. } => {
+                        dead.push(mask);
+                        if let Some(s) = self.whole_slot(at)
+                            && self.is_temp_slot(s)
+                        {
+                            dead.push(s);
+                        }
+                    }
+                    Held::Temp { at, flag, .. } => {
+                        if let Some(s) = self.whole_slot(at)
+                            && self.is_temp_slot(s)
+                        {
+                            dead.push(s);
+                        }
+                        if let Some((f, home)) = flag {
+                            dead.push(f);
+                            dead.push(home);
+                        }
+                    }
+                    Held::EnvPlace(_) => {}
+                }
+            }
+        }
+        let mut j = self.scope_slots.len();
+        while j > 0 {
+            j -= 1;
+            if self.scope_slots.get(j).is_some_and(|&(d, _)| d >= depth) {
+                let (_, slot) = self.scope_slots.remove_swap(j);
+                if self.live {
+                    dead.push(slot);
+                }
+            }
+        }
+        for slot in dead {
+            if Some(slot) != kept && !self.vals_use_slot(slot) {
+                self.b.slot_dead(slot);
+            }
+        }
     }
 }

@@ -12,7 +12,7 @@ use std::alloc::Global;
 
 use super::{PENDING, PREFIX, READY, STATE, agree, own_sig};
 use crate::{
-    Block, BlockKind, Builder, Flags, Full, Func, Op, Ty,
+    Block, BlockKind, Builder, Flags, Full, Func, IntCond, Op, Ty,
     builder::MemAttrs,
     coroutine::{CoroutineError, Panics, Region, Saved, Shape, SlotName, StateField, split_in},
     func::{SlotId, SlotKind},
@@ -168,4 +168,235 @@ fn a_region_with_another_tag_width_is_refused() {
     let wide = Region { tag_ty: Ty::I16, ..LAID };
     assert_eq!(split_in(func.view(), SHAPE, Panics::NONE, wide, &named(kept), Global).err(), Some(CoroutineError::RegionTag { points: 1 }));
     std::println!("a region with another tag width is RegionTag");
+}
+
+/// A 0-suspend laid-state coroutine whose `invoke` unwinds to a `Cleanup` block using a
+/// stack-only `SlotAddr` and an SSA value made in the entry block: neither crosses a suspend,
+/// so `split_in` accepts it (no false `ValueAcrossSuspend`) and runs identically on normal
+/// and unwinding schedules.
+#[test]
+fn a_zero_suspend_invoke_cleanup_keeps_stack_slot_and_value_without_crossing() {
+    use crate::builder::{Param, Variadic};
+    use crate::func::{Conv, RefKind};
+    let heap = blaze_own::testing::heap();
+    let a = heap.alloc();
+    let mut b = Builder::<_, Full>::new_in(64, a);
+    own_sig(&mut b);
+    let observe_sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[]);
+    let observe = b.reference(RefKind::Func, 0);
+    let may_unwind = b.reference(RefKind::Func, 1);
+    let [entry, normal, unresumed] = [(); 3].map(|_| b.create_block(BlockKind::Normal));
+    let pad = b.create_block(BlockKind::Cleanup);
+    let local = b.slot(8, 3, SlotKind::Named);
+    b.begin(entry);
+    let (state, cx) = (b.param(Ty::PTR), b.param(Ty::I64));
+    let at = b.slot_addr(local);
+    let upvar = b.load(Ty::I64, Flags::NONE, state, 0, MemAttrs::default());
+    let sum = b.binary(Op::Add, Flags::NONE, upvar, cx);
+    b.store(Flags::NONE, sum, at, 0, MemAttrs::default());
+    b.invoke(Flags::NONE, may_unwind, observe_sig, &[cx], normal, pad);
+    b.begin(normal);
+    let out = b.load(Ty::I64, Flags::NONE, at, 0, MemAttrs::default());
+    let ready = b.iconst(Ty::I64, u128::from(READY));
+    b.ret(&[ready, out]);
+    b.begin(pad);
+    let exception = b.param(Ty::PTR);
+    // Uses both the non-kept stack slot's `slot_addr` (`at`) and the SSA value `sum` from entry.
+    let saved = b.load(Ty::I64, Flags::NONE, at, 0, MemAttrs::default());
+    b.call(Flags::NONE, observe, observe_sig, &[saved]);
+    b.call(Flags::NONE, observe, observe_sig, &[sum]);
+    b.resume(exception);
+    b.begin(unresumed);
+    b.cancelled();
+    let func = b.finish_checked().expect("the body is LIR");
+    // Begun in order: entry 0, normal 1, pad 2, unresumed 3.
+    let shape = Shape { state_param: STATE as u32, prefix_size: PREFIX, prefix_align: 3, unresumed: Block(3) };
+    let region = Region { start: 16, end: 16, tag_offset: 16, tag_ty: Ty::I8, size: 24, align: 3 };
+    let split = split_in(func.view(), shape, Panics::NONE, region, &[], a)
+        .expect("0-suspend cleanup using stack slot and entry value must split cleanly");
+    if let Err(broke) = agree(func.view(), shape, &split, [5, 9]) {
+        panic!("{broke}");
+    }
+}
+
+/// After a suspend, a `Cleanup` landing block may use a post-suspend stack slot and value
+/// directly (neither crosses the suspend), while a pre-suspend SSA value used in that same
+/// post-suspend `Cleanup` block is still refused as `ValueAcrossSuspend`.
+#[test]
+fn a_post_suspend_cleanup_accepts_post_suspend_values_and_refuses_pre_suspend_values() {
+    use crate::builder::{Param, Variadic};
+    use crate::func::{Conv, RefKind};
+    let heap = blaze_own::testing::heap();
+    let a = heap.alloc();
+    let build = |use_pre_suspend: bool| {
+        let mut b = Builder::<_, Full>::new_in(64, a);
+        own_sig(&mut b);
+        let observe_sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[]);
+        let observe = b.reference(RefKind::Func, 0);
+        let may_unwind = b.reference(RefKind::Func, 1);
+        let [entry, resume, normal, cancel, unresumed] = [(); 5].map(|_| b.create_block(BlockKind::Normal));
+        let pad = b.create_block(BlockKind::Cleanup);
+        let kept = b.slot(8, 3, SlotKind::Named);
+        let post = b.slot(8, 3, SlotKind::Temp);
+        b.begin(entry);
+        let (state, cx) = (b.param(Ty::PTR), b.param(Ty::I64));
+        let kept_at = b.slot_addr(kept);
+        let upvar = b.load(Ty::I64, Flags::NONE, state, 0, MemAttrs::default());
+        let pre_val = b.binary(Op::Add, Flags::NONE, upvar, cx);
+        b.store(Flags::NONE, upvar, kept_at, 0, MemAttrs::default());
+        let pending = b.iconst(Ty::I64, u128::from(PENDING));
+        b.suspend(0, resume, cancel, &[pending, pending]);
+        b.begin(resume);
+        let post_at = b.slot_addr(post);
+        let post_val = b.load(Ty::I64, Flags::NONE, kept_at, 0, MemAttrs::default());
+        b.store(Flags::NONE, post_val, post_at, 0, MemAttrs::default());
+        b.invoke(Flags::NONE, may_unwind, observe_sig, &[cx], normal, pad);
+        b.begin(normal);
+        let out = b.load(Ty::I64, Flags::NONE, post_at, 0, MemAttrs::default());
+        let ready = b.iconst(Ty::I64, u128::from(READY));
+        b.ret(&[ready, out]);
+        b.begin(pad);
+        let exception = b.param(Ty::PTR);
+        let seen = b.load(Ty::I64, Flags::NONE, post_at, 0, MemAttrs::default());
+        b.call(Flags::NONE, observe, observe_sig, &[seen]);
+        if use_pre_suspend {
+            b.call(Flags::NONE, observe, observe_sig, &[pre_val]);
+        } else {
+            b.call(Flags::NONE, observe, observe_sig, &[post_val]);
+        }
+        b.resume(exception);
+        b.begin(cancel);
+        b.cancelled();
+        b.begin(unresumed);
+        b.cancelled();
+        let func = b.finish_checked().expect("the body is LIR");
+        let shape = Shape { state_param: STATE as u32, prefix_size: PREFIX, prefix_align: 3, unresumed: Block(4) };
+        (func, shape, kept, pre_val)
+    };
+    let (func, shape, kept, _) = build(false);
+    let split = split_in(func.view(), shape, Panics::NONE, LAID, &named(kept), a)
+        .expect("post-suspend cleanup using post-suspend slot and value must split");
+    if let Err(broke) = agree(func.view(), shape, &split, [5, 9]) {
+        panic!("{broke}");
+    }
+    let (func_bad, shape_bad, kept_bad, pre_val) = build(true);
+    let err = split_in(func_bad.view(), shape_bad, Panics::NONE, LAID, &named(kept_bad), a).err();
+    assert_eq!(err, Some(CoroutineError::ValueAcrossSuspend { value: pre_val.index() as u32 }));
+}
+
+/// Copying bytes between unnamed scratch slots via `Op::Memcpy` before a suspend does not
+/// escape either slot's address: neither counts as reached after the suspend.
+#[test]
+fn a_memcpy_between_scratch_slots_before_suspend_is_not_escaped() {
+    let heap = blaze_own::testing::heap();
+    let a = heap.alloc();
+    let mut b = Builder::<_, Full>::new_in(64, a);
+    own_sig(&mut b);
+    let [entry, resume, cancel, unresumed] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+    let kept = b.slot(8, 3, SlotKind::Named);
+    let src = b.slot(8, 3, SlotKind::Temp);
+    let dst = b.slot(8, 3, SlotKind::Temp);
+    b.begin(entry);
+    let (state, cx) = (b.param(Ty::PTR), b.param(Ty::I64));
+    let sa = b.slot_addr(src);
+    let da = b.slot_addr(dst);
+    let ka = b.slot_addr(kept);
+    let upvar = b.load(Ty::I64, Flags::NONE, state, 0, MemAttrs::default());
+    b.store(Flags::NONE, upvar, sa, 0, MemAttrs::default());
+    let len = b.iconst(Ty::I64, 8);
+    b.bulk(Op::Memcpy, Flags::NONE, da, sa, len, MemAttrs::aligned(3));
+    let copied = b.load(Ty::I64, Flags::NONE, da, 0, MemAttrs::default());
+    let sum = b.binary(Op::Add, Flags::NONE, copied, cx);
+    b.store(Flags::NONE, sum, ka, 0, MemAttrs::default());
+    let pending = b.iconst(Ty::I64, u128::from(PENDING));
+    b.suspend(0, resume, cancel, &[pending, pending]);
+    b.begin(resume);
+    let out = b.load(Ty::I64, Flags::NONE, ka, 0, MemAttrs::default());
+    let ready = b.iconst(Ty::I64, u128::from(READY));
+    b.ret(&[ready, out]);
+    b.begin(cancel);
+    b.cancelled();
+    b.begin(unresumed);
+    b.cancelled();
+    let func = b.finish_checked().expect("the body is LIR");
+    let split = split_in(func.view(), SHAPE, Panics::NONE, LAID, &named(kept), a)
+        .expect("memcpy between pre-suspend scratch slots must not escape them");
+    assert_eq!(&split.layout.fields[..], &[StateField { what: Saved::Slot(kept), offset: 16, size: 8, align: 3 }]);
+    crate::verify(split.poll.view()).expect("poll verifies");
+    crate::verify(split.drop.view()).expect("drop verifies");
+}
+
+/// An unescaped unnamed slot inside a loop that is fully overwritten on every path from
+/// `resume`/`cancel` before any read is not live across the suspend (a `Copy` loop local used
+/// only before `.await`). A partial overwrite of a wider slot followed by a read of the
+/// untouched bytes is still refused as `UnnamedAcrossSuspend`.
+#[test]
+fn a_loop_slot_overwritten_after_resume_is_not_reached_unless_partial() {
+    let heap = blaze_own::testing::heap();
+    let a = heap.alloc();
+    let build = |partial: bool| {
+        let mut b = Builder::<_, Full>::new_in(64, a);
+        own_sig(&mut b);
+        let [entry, header, body_blk, resume, done, cancel, unresumed] =
+            [(); 7].map(|_| b.create_block(BlockKind::Normal));
+        let kept = b.slot(8, 3, SlotKind::Named);
+        let scratch = b.slot(if partial { 16 } else { 8 }, 3, SlotKind::Temp);
+        b.begin(entry);
+        let (state, _cx) = (b.param(Ty::PTR), b.param(Ty::I64));
+        let ka = b.slot_addr(kept);
+        let upvar = b.load(Ty::I64, Flags::NONE, state, 0, MemAttrs::default());
+        b.store(Flags::NONE, upvar, ka, 0, MemAttrs::default());
+        if partial {
+            // Write the untouched upper half once before the loop.
+            let sa_init = b.slot_addr(scratch);
+            b.store(Flags::NONE, upvar, sa_init, 8, MemAttrs::default());
+        }
+        b.jump((header, &[]));
+
+        b.begin(header);
+        let rem = b.load(Ty::I64, Flags::NONE, ka, 0, MemAttrs::default());
+        let zero = b.iconst(Ty::I64, 0);
+        let more = b.icmp(IntCond::Ne, rem, zero);
+        b.br(Flags::NONE, more, (body_blk, &[]), (done, &[]));
+
+        b.begin(body_blk);
+        // Full write when !partial (8 bytes into 8-byte slot); partial write when partial (8 of 16).
+        let sa = b.slot_addr(scratch);
+        let one = b.iconst(Ty::I64, 1);
+        let next = b.binary(Op::Sub, Flags::NONE, rem, one);
+        b.store(Flags::NONE, next, sa, 0, MemAttrs::default());
+        let read_off = if partial { 8 } else { 0 };
+        let val = b.load(Ty::I64, Flags::NONE, sa, read_off, MemAttrs::default());
+        b.store(Flags::NONE, val, ka, 0, MemAttrs::default());
+        let pending = b.iconst(Ty::I64, u128::from(PENDING));
+        b.suspend(0, resume, cancel, &[pending, pending]);
+
+        b.begin(resume);
+        b.jump((header, &[]));
+
+        b.begin(done);
+        let out = b.load(Ty::I64, Flags::NONE, ka, 0, MemAttrs::default());
+        let ready = b.iconst(Ty::I64, u128::from(READY));
+        b.ret(&[ready, out]);
+
+        b.begin(cancel);
+        b.cancelled();
+
+        b.begin(unresumed);
+        b.cancelled();
+
+        let func = b.finish_checked().expect("the body is LIR");
+        let shape = Shape { state_param: STATE as u32, prefix_size: PREFIX, prefix_align: 3, unresumed: Block(6) };
+        (func, shape, kept, scratch)
+    };
+    let (func, shape, kept, _) = build(false);
+    let split = split_in(func.view(), shape, Panics::NONE, LAID, &named(kept), a)
+        .expect("fully overwritten loop scratch slot must not be marked live across suspend");
+    assert_eq!(&split.layout.fields[..], &[StateField { what: Saved::Slot(kept), offset: 16, size: 8, align: 3 }]);
+    if let Err(broke) = agree(func.view(), shape, &split, [2, 0]) {
+        panic!("{broke}");
+    }
+    let (func_bad, shape_bad, kept_bad, scratch_bad) = build(true);
+    let err = split_in(func_bad.view(), shape_bad, Panics::NONE, LAID, &named(kept_bad), a).err();
+    assert_eq!(err, Some(CoroutineError::UnnamedAcrossSuspend { slot: scratch_bad.0 }));
 }
