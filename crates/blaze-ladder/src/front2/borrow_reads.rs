@@ -393,22 +393,24 @@ pub fn impl_read(imp: u128, names: &[tc::Name], regions: &dyn blaze_flow_lower::
     Read { fact: Fact { kind: FactKind::BorrowHead, key: imp, detail: IMPL_DETAIL }, answer: Some(h.finish()) }
 }
 
-/// The `detail` of a trait's `Self` supertraits read for transitive `Copy` bounds (borrows.rs).
+/// The `detail` of a trait's `Self` supertraits read for transitive `Copy` and `'static` bounds (borrows.rs).
 pub const COPY_SUPERTRAIT_DETAIL: u64 = 9;
-const COPY_SUPERTRAIT_DOMAIN: &str = "blaze-ladder front2 borrow copy supertrait v1";
+const COPY_SUPERTRAIT_DOMAIN: &str = "blaze-ladder front2 borrow copy supertrait v2";
 
 /// The `detail` of a nested ADT's drop summary read (borrow_fields.rs `drop_facts_of`).
 pub const DROP_ADT_DETAIL: u64 = 10;
 const DROP_ADT_DOMAIN: &str = "blaze-ladder front2 borrow drop adt v1";
 
-/// The row of what the borrow check took about trait `trait_key`'s direct `Self` supertraits.
-/// `supers` is `None` when the trait head was not made, else the sorted direct supertrait keys.
-pub fn copy_supertrait_read(trait_key: u128, supers: Option<&[u128]>) -> Read {
+/// The row of what the borrow check took about trait `trait_key`'s direct `Self` supertraits
+/// (and whether it directly declares `Self: 'static`).
+/// `supers` is `None` when the trait head was not made, else `(sorted direct supertrait keys, self_static)`.
+pub fn copy_supertrait_read(trait_key: u128, supers: Option<(&[u128], bool)>) -> Read {
     let mut h = StableHasher::new(COPY_SUPERTRAIT_DOMAIN);
     match supers {
         None => h.tag(0),
-        Some(list) => {
+        Some((list, self_static)) => {
             h.tag(1);
+            h.tag(u8::from(self_static));
             h.u32(u32::try_from(list.len()).unwrap_or(u32::MAX));
             for &sup in list {
                 h.u128(sup);

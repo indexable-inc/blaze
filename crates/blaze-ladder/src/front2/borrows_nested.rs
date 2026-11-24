@@ -253,7 +253,7 @@ impl Facts for NestedFacts<'_, '_> {
     fn assoc_item(&self, trait_: tc::ItemKey, name: tc::Name) -> Option<tc::ItemKey> {
         self.facts.assoc_item(trait_, name)
     }
-    fn owner_trait_impl(&self) -> Option<(tc::ItemKey, tc::ItemKey, u32, tc::ItemKey)> {
+    fn owner_trait_impl(&self) -> Option<blaze_flow_lower::OwnerTraitImpl> {
         self.facts.owner_trait_impl()
     }
     fn deref_impl(&self, adt: tc::ItemKey) -> Option<tc::ItemKey> {

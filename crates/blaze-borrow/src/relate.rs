@@ -266,11 +266,13 @@ impl<A: Allocator + Copy> AskArgs for Keyer<'_, '_, '_, A> {
         }
     }
 
-    fn self_adt(&self) -> Option<ItemKey> {
+    fn self_shape(&self) -> Option<crate::inst::SelfShape> {
         let side = self.arg(0)?;
         let Ok(Resolved::Side(s)) = self.walk.resolve(side) else { return None };
         match self.walk.node(s) {
-            Ok(PNode::Adt(k, _)) => Some(k),
+            Ok(PNode::Adt(k, _)) => Some(crate::inst::SelfShape::Adt(k)),
+            Ok(PNode::Ref(m, _)) => Some(crate::inst::SelfShape::Ref(m)),
+            Ok(PNode::Tuple(_)) => self.walk.kids_of(s).ok().map(|k| crate::inst::SelfShape::Tuple(k.len())),
             _ => None,
         }
     }
@@ -627,6 +629,13 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                         return Keyed::Differ;
                     }
                     enter = Some((Side { ty: ta, slots: a.slots }, tb, d + 1));
+                    continue;
+                }
+                // An impl's or callee's const parameter (never bound by `blaze-borrow`, since
+                // consts carry no region slots and `Array(c, _)` ignores its length) matches a
+                // typeck row's const argument loosely (`Keyed::Unknown`), never `Differ`.
+                if matches!(a.slots, Slots::Sig { .. }) && matches!(na, PNode::ConstParam(_)) && is_const(nb) {
+                    out = Keyed::Unknown;
                     continue;
                 }
                 if !head_eq(na, nb) {

@@ -575,8 +575,8 @@ pub struct BorrowFacts<'a> {
     deref_impls: AVec<'a, (u128, tc::ItemKey)>,
     /// `(trait_key, assoc_name, assoc_item)` sorted by `(trait_key, assoc_name)` (`Facts::assoc_item`).
     assoc_items: AVec<'a, (u128, tc::Name, tc::ItemKey)>,
-    /// Enclosing trait impl of `owner`, if `owner` is a method of `impl<..> Trait for Adt<..>`.
-    owner_trait_impl: Option<(tc::ItemKey, tc::ItemKey, u32, tc::ItemKey)>,
+    /// Enclosing trait impl of `owner`, if `owner` is a method of `impl<..> Trait for SelfTy`.
+    owner_trait_impl: Option<blaze_flow_lower::OwnerTraitImpl>,
 }
 
 /// The facts the lowering asks: a body's gathered [`BorrowFacts`] with the head records' region
@@ -790,7 +790,7 @@ impl Facts for ReadBy<'_, '_> {
         let at = self.facts.assoc_items.binary_search_by_key(&(trait_.0, name), |&(k, n, _)| (k, n)).ok()?;
         Some(self.facts.assoc_items[at].2)
     }
-    fn owner_trait_impl(&self) -> Option<(tc::ItemKey, tc::ItemKey, u32, tc::ItemKey)> {
+    fn owner_trait_impl(&self) -> Option<blaze_flow_lower::OwnerTraitImpl> {
         self.facts.owner_trait_impl
     }
     fn deref_impl(&self, adt: tc::ItemKey) -> Option<tc::ItemKey> {
@@ -1316,11 +1316,12 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                 | super::by_origin::KeyKind::Anon { .. }
         )
     );
-    // The owner's `T: Copy` clauses (own and inherited), including transitive supertraits
-    // (`T: Tr` where `trait Tr: Copy`, e.g. `Planted<P>: Copy`, `ArbitraryInt: Copy`): a value
-    // of such a parameter is copied, never moved (the Reference, "Copy types"). Each inspected
-    // trait's direct `Self` supertraits are filed as a `BorrowHead` read row (rule 21).
-    if let Some(copy) = langs.copy {
+    // The owner's `T: Copy` and transitive supertrait `T: 'static` clauses (own and inherited),
+    // including transitive supertraits (`T: Tr` where `trait Tr: Copy` or `trait Tr: 'static`,
+    // e.g. `Planted<P>: Copy`, `Relation: 'static`, `Prefab: 'static`). Each inspected trait's
+    // direct `Self` supertraits and `Self: 'static` flag are filed as a `BorrowHead` read row (rule 21).
+    let mut param_static: AVec<'a, u32> = AVec::new_in(alloc);
+    {
         let mut param_traits: AVec<'a, (u32, tc::ItemKey)> = AVec::new_in(alloc);
         if let Some(p) = r.store.preds.get(&owner) {
             let tys = r.store.tys.view();
@@ -1330,7 +1331,7 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                     && let Some(&first) = list.first()
                     && let Ok(tc::PNode::Param(i)) = tys.node(first)
                 {
-                    if trait_ == copy {
+                    if Some(trait_) == langs.copy {
                         g.param_copy.push(i);
                     } else {
                         param_traits.push((i, trait_));
@@ -1344,17 +1345,21 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             let mut direct: AVec<'a, u128> = AVec::new_in(alloc);
             let mut recorded: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
             for &(param, start_trait) in param_traits.iter() {
-                if g.param_copy.scan_for(&param).is_some() {
+                let mut found_copy = g.param_copy.scan_for(&param).is_some();
+                let mut found_static = param_static.scan_for(&param).is_some();
+                if found_copy && found_static {
                     continue;
                 }
                 visited.clear();
                 stack.clear();
                 stack.push(start_trait);
-                let mut found_copy = false;
                 while let Some(t) = stack.pop() {
-                    if t == copy {
+                    if Some(t) == langs.copy {
                         found_copy = true;
-                        break;
+                        if found_static {
+                            break;
+                        }
+                        continue;
                     }
                     if visited.scan_for(&t).is_some() || visited.len() >= 64 {
                         continue;
@@ -1366,22 +1371,35 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                         ensure_one(r, Want::Members(lib));
                     }
                     direct.clear();
+                    let mut self_static = false;
                     if let Some(def) = r.store.trait_defs.get(&t) {
                         let tys = r.store.tys.view();
                         for sc in def.supertraits.iter() {
-                            if let tc::PClause::Trait { trait_: sup, args } = *sc
-                                && let Ok(list) = tys.list(args)
-                                && let Some(&first) = list.first()
-                                && matches!(tys.node(first), Ok(tc::PNode::Param(0)))
-                            {
-                                direct.push(sup.0);
+                            match *sc {
+                                tc::PClause::Trait { trait_: sup, args }
+                                    if tys.list(args).ok().and_then(|l| l.first().copied()).is_some_and(|first| matches!(tys.node(first), Ok(tc::PNode::Param(0)))) =>
+                                {
+                                    direct.push(sup.0);
+                                }
+                                tc::PClause::TypeOutlives { ty, region: tc::regions::Region::Static }
+                                    if matches!(tys.node(ty), Ok(tc::PNode::Param(0))) =>
+                                {
+                                    self_static = true;
+                                }
+                                _ => {}
                             }
                         }
                         direct.sort_unstable();
                         direct.dedup();
                         if recorded.scan_for(&t).is_none() {
                             recorded.push(t);
-                            g.reads.push(copy_supertrait_read(t.0, Some(&direct)));
+                            g.reads.push(copy_supertrait_read(t.0, Some((&direct, self_static))));
+                        }
+                        if self_static {
+                            found_static = true;
+                        }
+                        if found_copy && found_static {
+                            break;
                         }
                         for &sup in direct.iter() {
                             stack.push(tc::ItemKey(sup));
@@ -1394,10 +1412,15 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                 if found_copy {
                     g.param_copy.push(param);
                 }
+                if found_static {
+                    param_static.push(param);
+                }
             }
         }
         g.param_copy.sort_unstable();
         g.param_copy.dedup();
+        param_static.sort_unstable();
+        param_static.dedup();
     }
     // Ensure callees, FnDef value items, selected impls, and supertrait heads BEFORE collecting
     // ADTs so every ADT named inside a signature, selected impl header/assoc value, or supertrait
@@ -1479,11 +1502,19 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
     if let Some(Origin::Member { container, .. }) = r.keys.origin(owner).cloned()
         && let Some(ih) = r.store.impls.get(&container)
         && let Some(tr) = ih.trait_
-        && let Ok(tc::PNode::Adt(self_adt, _)) = r.store.tys.view().node(ih.self_ty)
     {
-        g.owner_trait_impl = Some((container, tr, ih.generics, self_adt));
-        traits.push(tr.0);
-        selected.push((container.0, None));
+        let tys = r.store.tys.view();
+        let self_shape = match tys.node(ih.self_ty) {
+            Ok(tc::PNode::Adt(k, _)) => Some(blaze_flow_lower::SelfShape::Adt(k)),
+            Ok(tc::PNode::Ref(m, _)) => Some(blaze_flow_lower::SelfShape::Ref(m)),
+            Ok(tc::PNode::Tuple(l)) => tys.list(l).ok().and_then(|ks| u32::try_from(ks.len()).ok()).map(blaze_flow_lower::SelfShape::Tuple),
+            _ => None,
+        };
+        if let Some(self_shape) = self_shape {
+            g.owner_trait_impl = Some(blaze_flow_lower::OwnerTraitImpl { imp: container, trait_: tr, generics: ih.generics, self_shape });
+            traits.push(tr.0);
+            selected.push((container.0, None));
+        }
     }
     for p in c.selected.iter() {
         traits.push(p.trait_.0);
@@ -1959,7 +1990,8 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             let key = tc::ItemKey(k);
             let head = r.store.fns.get(&key);
             let clauses = r.store.preds.get(&key).map(|p| &p.clauses[..]);
-            g.calls.gather(k, head, clauses, r.store.tys.view(), &regions, future, alloc);
+            let extra_static: &[u32] = if k == owner.0 { &param_static } else { &[] };
+            g.calls.gather(k, head, clauses, r.store.tys.view(), &regions, future, extra_static, alloc);
             g.ties.gather(k, head, clauses, r.store.tys.view(), &regions);
         }
         // Each trait object's principal: whether it declares a lifetime decides how an unsized

@@ -108,10 +108,13 @@ pub struct PlaceRow {
     /// slice"), where the same projection of an array `[T; N]` is. Its own fact, never read
     /// from [`Self::of_drop_type`] (lane B12 item 6).
     pub of_slice: bool,
+    /// A `Proj::Deref` of a shared reference (`&T`) or raw pointer (`*const T` / `*mut T`):
+    /// a loan behind this deref does not lock prefixes above it (rustc `places_conflict`:
+    /// supporting prefixes stop at a shared-ref or raw-ptr deref).
+    pub of_shared_ref: bool,
 }
 
-/// What a place made by [`FlowBuilder::project_in`] is marked as: one fact per row, the
-/// reason a move out of it is refused (moves.rs `move_out`).
+/// What a place made by [`FlowBuilder::project_in`] is marked as: one fact per row.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PlaceMark {
     None,
@@ -119,6 +122,8 @@ pub enum PlaceMark {
     DropField,
     /// [`PlaceRow::of_slice`].
     SliceElement,
+    /// [`PlaceRow::of_shared_ref`].
+    SharedDeref,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -528,6 +533,7 @@ impl<A: Allocator + Copy> FlowBuilder<A> {
                 depth: 0,
                 of_drop_type: false,
                 of_slice: false,
+                of_shared_ref: false,
             });
             first_child.push(NO_CHILD);
             next_sibling.push(NO_CHILD);
@@ -574,7 +580,7 @@ impl<A: Allocator + Copy> FlowBuilder<A> {
     pub fn add_local(&mut self) -> Local {
         let l = Local(self.flow.locals);
         self.flow.locals += 1;
-        self.flow.places.push(PlaceRow { local: l, parent: None, proj: None, depth: 0, of_drop_type: false, of_slice: false });
+        self.flow.places.push(PlaceRow { local: l, parent: None, proj: None, depth: 0, of_drop_type: false, of_slice: false, of_shared_ref: false });
         self.first_child.push(NO_CHILD);
         self.next_sibling.push(NO_CHILD);
         self.flow.local_places.push(Place(self.flow.places.len() as u32 - 1));
@@ -611,6 +617,7 @@ impl<A: Allocator + Copy> FlowBuilder<A> {
             depth: up.depth + 1,
             of_drop_type: mark == PlaceMark::DropField,
             of_slice: mark == PlaceMark::SliceElement,
+            of_shared_ref: mark == PlaceMark::SharedDeref,
         });
         self.first_child.push(NO_CHILD);
         self.next_sibling.push(self.first_child[p_idx]);

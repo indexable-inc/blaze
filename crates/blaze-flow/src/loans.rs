@@ -132,7 +132,16 @@ pub fn conflicts<A: Allocator>(flow: &Flow<A>, l: Loan, a: Access, activated: bo
     if !a.write && !(row.kind == BorrowKind::Mut || row.kind == BorrowKind::TwoPhase && activated) {
         return false;
     }
-    if a.drop {
+    // Prefix checks when the access is a strict prefix of the borrowed place (`a.place` above
+    // `row.place`):
+    // 1. A loan behind a `Proj::Deref` of a shared reference (`&T`) or raw pointer
+    //    (`of_shared_ref`) does not lock prefixes above that deref: `&T` is `Copy` and mutating,
+    //    borrowing or dropping an ancestor holding `&T` cannot invalidate its referent (rustc
+    //    `places_conflict`: supporting prefixes stop at a shared-ref / raw-ptr deref).
+    // 2. Dropping a value without a `Drop` impl (and whose intermediate fields up to the deref
+    //    have no `Drop` impl) never accesses behind a `&`/`&mut` `Proj::Deref` (`Proj::DerefBox`
+    //    still conflicts because dropping `Box` frees its referent).
+    {
         let (ra, rb) = (flow.place(row.place), flow.place(a.place));
         if ra.local == rb.local && rb.depth < ra.depth {
             let mut prefix = true;
@@ -143,16 +152,21 @@ pub fn conflicts<A: Allocator>(flow: &Flow<A>, l: Loan, a: Access, activated: bo
                 }
             }
             if prefix {
-                // Dropping a value without a `Drop` impl (and whose intermediate fields up to
-                // the deref have no `Drop` impl) never accesses behind a `&`/`&mut` `Proj::Deref`
-                // (`Proj::DerefBox` still conflicts because dropping `Box` frees its referent).
                 for d in (rb.depth + 1)..=ra.depth {
                     let step = flow.place(flow.ancestor(row.place, d));
-                    if step.of_drop_type {
-                        break;
-                    }
-                    if step.proj == Some(Proj::Deref) {
+                    if step.of_shared_ref {
                         return false;
+                    }
+                }
+                if a.drop {
+                    for d in (rb.depth + 1)..=ra.depth {
+                        let step = flow.place(flow.ancestor(row.place, d));
+                        if step.of_drop_type {
+                            break;
+                        }
+                        if step.proj == Some(Proj::Deref) {
+                            return false;
+                        }
                     }
                 }
             }

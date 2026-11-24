@@ -567,12 +567,12 @@ impl<F: Facts> Selected for CallSel<'_, F> {
         let Some(r) = found else {
             // If no call row answers, check the body owner's own enclosing trait impl (for
             // projections on `Self` inside the caller's own `where`-clauses, e.g. `Cycle<I>::Item`,
-            // `Zip<A, B>::Item`).
-            if let Some((imp, imp_tr, ntypes, self_adt)) = self.facts.owner_trait_impl()
-                && imp_tr == ask.trait_
-                && args.self_adt() == Some(self_adt)
+            // `Zip<A, B>::Item`, `(&T0, &T1)::Item`).
+            if let Some(oti) = self.facts.owner_trait_impl()
+                && oti.trait_ == ask.trait_
+                && args.self_shape() == Some(oti.self_shape)
             {
-                return self.impl_at_count(ask, imp, ntypes);
+                return self.impl_at_count(ask, oti.imp, oti.generics);
             }
             return Selection::Not(NotSelected::Unanswered);
         };
@@ -1075,6 +1075,152 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
             return Ok(());
         }
         self.tie_closure_args(item, g, params, lifetimes, &types, &col, e)
+    }
+
+    /// Relates a call through an `Fn*` callable (`F: Fn*(..)` or `dyn Fn*(..)`) using
+    /// `blaze_borrow::Callee::Value` so associated types like `Self::Item<'_>` normalize through
+    /// the same one-rule engine as direct calls. Returns `Ok(true)` when handled cleanly,
+    /// `Ok(false)` to let the caller fall back or refuse.
+    #[expect(clippy::too_many_arguments, reason = "laid callable signature, call operands, destination and site")]
+    pub(crate) fn call_value_one(
+        &mut self,
+        args_tup: PTy,
+        args_slots: &[Region],
+        out_match: Option<(PTy, &[Region])>,
+        args: &[Val],
+        dest: Place,
+        dest_ty: TyD,
+        e: ExprId,
+    ) -> Result<bool, Refusal> {
+        if self.in_nested {
+            let has_param = args_slots.iter().any(|r| matches!(r, Region::Param(_)))
+                || out_match.is_some_and(|(_, s)| s.iter().any(|r| matches!(r, Region::Param(_))));
+            if has_param {
+                return Ok(false);
+            }
+        }
+        if out_match.is_none() && self.info(dest).len != 0 {
+            return Ok(false);
+        }
+        let facts: &'b F = self.facts;
+        let arity = FactsArity { facts };
+        let heads = Columns::new(facts.region_tys().unwrap_or(self.tys), &arity, &arity);
+        let Ok(tkids) = heads.kids(args_tup) else { return Ok(false) };
+        if tkids.len() as usize != args.len() {
+            return Ok(false);
+        }
+        let mut inputs: Vec<Typed<'_>, A> = Vec::with_capacity_in(args.len(), self.alloc);
+        let mut rest = args_slots;
+        for i in 0..tkids.len() {
+            let Some(ty) = tkids.get(i) else { return Ok(false) };
+            let Ok(c) = heads.count(ty) else { return Ok(false) };
+            let Some((col, after)) = rest.split_at_checked(c.get() as usize) else { return Ok(false) };
+            inputs.push(Typed { ty, col });
+            rest = after;
+        }
+        if !rest.is_empty() {
+            return Ok(false);
+        }
+        let mut binder: Option<u32> = None;
+        for r in args_slots.iter().chain(out_match.map_or(&[][..], |(_, s)| s).iter()) {
+            if let Region::Late { binder: b, .. } = *r {
+                binder = Some(binder.map_or(b, |cur| cur.min(b)));
+            }
+        }
+        let binder = binder.unwrap_or(0);
+        let mut bodies: Vec<(PTy, SlotCount), A> = Vec::new_in(self.alloc);
+        if <R::Grain as Grain>::SLOTS {
+            for v in args.iter() {
+                self.body_slots(v.ty.ty, &mut bodies, e)?;
+            }
+            self.body_slots(dest_ty.ty, &mut bodies, e)?;
+        }
+        let caller = BodyTypes::new(Columns::new(self.tys, &arity, &arity), &bodies);
+        let owner = self.body.owner;
+        let mut col: Vec<Origin, A> = Vec::new_in(self.alloc);
+        let mut seen: Vec<u32, A> = Vec::new_in(self.alloc);
+        let mut val_args: Vec<Arg, A> = Vec::with_capacity_in(args.len(), self.alloc);
+        for v in args.iter() {
+            let at = match v.at {
+                At::Place(p) => Some(self.info(p)),
+                At::Const => None,
+            };
+            let Ok(a) = self.value_slots(v.ty, at, &caller, &mut col, &mut seen, owner, e) else {
+                return Ok(false);
+            };
+            val_args.push(a);
+        }
+        let dest_info = self.info(dest);
+        let Ok(dest_arg) = self.value_slots(dest_ty, Some(dest_info), &caller, &mut col, &mut seen, owner, e) else {
+            return Ok(false);
+        };
+        let mut body_rows: Vec<(PTy, u32, u32), A> = Vec::new_in(self.alloc);
+        let mut held: Vec<u32, A> = Vec::new_in(self.alloc);
+        for &(t, _) in bodies.iter() {
+            let mut one: Vec<u32, A> = Vec::new_in(self.alloc);
+            self.captured_params(t, e, &mut one)?;
+            let (Ok(start), Ok(len)) = (u32::try_from(held.len()), u32::try_from(one.len())) else { return Ok(false) };
+            for &p in one.iter() {
+                if !seen.contains(&p) {
+                    seen.push(p);
+                }
+                held.push(p);
+            }
+            body_rows.push((t, start, len));
+        }
+        let Ok(lifetimes) = self.fresh_slots(&mut col, 0, owner, e) else { return Ok(false) };
+        let static_ = self.universal(Region::Static);
+        let regions = facts.regions();
+        let Ok(own) = facts.sig(owner) else { return Ok(false) };
+        if !self.in_nested {
+            for i in 0..own.params().count() {
+                self.universal(Region::Param(i));
+            }
+        }
+        for &p in seen.iter() {
+            self.param_origin(p);
+        }
+        let Ok(bounds) = regions.clauses(owner) else { return Ok(false) };
+        let sel = CallSel { rows: self.ck.call_selections(e), facts, tys: self.tys };
+        let output = match out_match {
+            Some((ty, col)) => Typed { ty, col },
+            // When the callable has no `Output = ..` clause (so returns `()`, 0 slots), pass
+            // `args_tup` so `well_formed` stays valid and skip relating `output` to `dest`.
+            None => Typed { ty: args_tup, col: args_slots },
+        };
+        let callee = Callee::Value { kind: blaze_borrow::ValueKind::Bound, owner, binder, inputs: &inputs, output };
+        let who = CallOwner {
+            item: owner,
+            uni: &self.uni,
+            params: &self.param_origs,
+            bounds,
+            heads: &heads,
+            bodies: BodyParams { rows: &body_rows, held: &held },
+            closures: ClosureSigs { rows: &[], regs: &[] },
+        };
+        let mut sink = Sink { b: &mut self.b, static_, drop_next: false };
+        let mut cx = Cx { types: &caller, sig_types: &heads, selected: &sel, owner: &who, origins: &col, out: &mut sink };
+        let generics = GenericArgs { lifetimes, types: &[] };
+        let res = if out_match.is_some() {
+            blaze_borrow::call(&mut cx, callee, generics, &val_args, dest_arg, self.alloc)
+        } else {
+            let mut inst = match blaze_borrow::instantiate(callee, generics, &mut |_| cx.out.fresh(Kind::Existential), self.alloc) {
+                Ok(i) => i,
+                Err(_) => return Ok(false),
+            };
+            let mut ok = Ok(());
+            for (a, &input) in val_args.iter().zip(inst.inputs.iter()) {
+                if let Err(err) = blaze_borrow::relate_sides(&mut cx, &mut inst.envs, owner, blaze_borrow::Side::caller(*a), input, Variance::Co) {
+                    ok = Err(err);
+                    break;
+                }
+            }
+            if ok.is_ok() {
+                ok = blaze_borrow::well_formed(&mut cx, &mut inst);
+            }
+            ok
+        };
+        Ok(res.is_ok())
     }
 
     /// A closure of this body among the call's type arguments (`Option::map`'s `F`,

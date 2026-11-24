@@ -114,12 +114,13 @@ impl<'a> CallBoundsTable<'a> {
         tys: tc::PTys<'_>,
         regions: &dyn RegionFacts,
         future: Option<blaze_id::ItemKey>,
+        extra_static: &[u32],
         alloc: Alloc<'a>,
     ) {
         let made = match (head, clauses) {
             (None, _) => Err(CallBoundsRefusal::NoHead),
             (_, None) => Err(CallBoundsRefusal::NoClauses),
-            (Some(h), Some(c)) => make(tc::ItemKey(k), &h.bounds, c, tys, regions, future, alloc),
+            (Some(h), Some(c)) => make(tc::ItemKey(k), &h.bounds, c, tys, regions, future, extra_static, alloc),
         };
         self.reads.push(call_bounds_read(k, made.as_ref().map_err(|e| *e)));
         if let Ok(buf) = made
@@ -161,6 +162,7 @@ fn make<'a>(
     tys: tc::PTys<'_>,
     regions: &dyn RegionFacts,
     future: Option<blaze_id::ItemKey>,
+    extra_static: &[u32],
     alloc: Alloc<'a>,
 ) -> Result<CallBoundsBuf<'a>, CallBoundsRefusal> {
     let future = future.map(super::keys::checker_of);
@@ -183,6 +185,11 @@ fn make<'a>(
             Some(t) => outlives.push((t, region)),
             None => unread_below = u32::MAX,
         }
+    }
+    // Transitive supertrait `Self: 'static` bounds on the owner's type parameters
+    // (`R: Relation` where `trait Relation: 'static`).
+    for &p in extra_static {
+        outlives.push((OutlivesType::Param(p), Region::Static));
     }
     outlives.sort_unstable();
     outlives.dedup();
@@ -317,7 +324,7 @@ mod tests {
         let mut tys = tc::PortableTys::new_in(a());
         let t = tys.intern(tc::PNode::Param(0)).unwrap();
         let clauses = [tc::PClause::TypeOutlives { ty: t, region: Region::Static }];
-        make(tc::ItemKey(G), &[], &clauses, tys.view(), facts, None, a())
+        make(tc::ItemKey(G), &[], &clauses, tys.view(), facts, None, &[], a())
     }
 
     #[test]
@@ -354,7 +361,7 @@ mod tests {
         let u = tys.intern(tc::PNode::Param(0)).unwrap();
         let r = tys.intern(tc::PNode::Ref(tc::Mutbl::Not, u)).unwrap();
         let clauses = [tc::PClause::TypeOutlives { ty: r, region: Region::Static }];
-        let b = make(tc::ItemKey(G), &[], &clauses, tys.view(), &Facts { outlives: Ok(&[]) }, None, a()).expect("filed");
+        let b = make(tc::ItemKey(G), &[], &clauses, tys.view(), &Facts { outlives: Ok(&[]) }, None, &[], a()).expect("filed");
         assert_eq!(b.unread_below, u32::MAX);
         assert!(b.outlives.is_empty());
     }

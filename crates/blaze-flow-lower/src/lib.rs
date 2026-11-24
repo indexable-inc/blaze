@@ -220,6 +220,18 @@ pub enum FieldRegion {
     Bound(u32),
 }
 
+pub use blaze_borrow::SelfShape;
+
+/// The enclosing trait impl of the body owner, when the body is a method of a trait impl
+/// whose `Self` type has a matchable outer constructor (`Adt`, `Ref`, or `Tuple`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OwnerTraitImpl {
+    pub imp: ItemKey,
+    pub trait_: ItemKey,
+    pub generics: u32,
+    pub self_shape: SelfShape,
+}
+
 /// What the lowering needs to know about a callee's signature (flow.md section 7, heads).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CalleeFacts {
@@ -371,11 +383,11 @@ pub trait Facts {
         let _ = (trait_, name);
         None
     }
-    /// If the body owner is a method of a trait impl `impl<..> Trait for Adt<..>`, returns
-    /// `(impl_key, trait_key, impl_type_param_count, self_adt_key)` so `blaze-borrow` can
+    /// If the body owner is a method of a trait impl `impl<..> Trait for SelfTy` (where `SelfTy`
+    /// is an `Adt`, `Ref`, or `Tuple`), returns its [`OwnerTraitImpl`] so `blaze-borrow` can
     /// normalize projections on the enclosing impl's own `Self` (e.g. `Cycle<I>::Item`,
-    /// `Zip<A, B>::Item`) even when the callee itself mentions another iterator.
-    fn owner_trait_impl(&self) -> Option<(ItemKey, ItemKey, u32, ItemKey)> {
+    /// `Zip<A, B>::Item`, `(&T0, &T1)::Item`) even when the call site has no explicit selection row.
+    fn owner_trait_impl(&self) -> Option<OwnerTraitImpl> {
         None
     }
     /// The unique `Deref` impl for ADT `adt`, when known (`answer_impls(Deref, Adt(adt))` has
@@ -1915,6 +1927,12 @@ struct Lower<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule = one_
     /// Pattern-bound locals extracted directly from an ADT variant field (`(pat, adt, variant, field)`),
     /// so `call_through_value` can read the field's declared `dyn Fn*` regions (e.g. `Provider::Handler(handler)`).
     local_field_source: Vec<(PatId, ItemKey, u32, u32), A>,
+    /// Places projected from an ADT field (`(place, adt, variant, field)`), so pattern bindings
+    /// extracting a fn pointer (e.g. `let Some(dup) = self.duplicator`) can trace back to the
+    /// field's declared region column.
+    place_field_source: Vec<(Place, ItemKey, u32, u32), A>,
+    /// Pattern-bound `FnPtr` locals traced back to their source ADT field (`(pat, adt, variant, field)`).
+    local_fn_field: Vec<(PatId, ItemKey, u32, u32), A>,
 }
 
 /// Every type walk visits each node at most once per position: bounded by the table's size.
@@ -2011,6 +2029,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             awaited: Vec::new_in(alloc),
             coarse: core::cell::Cell::new(None),
             local_field_source: Vec::new_in(alloc),
+            place_field_source: Vec::new_in(alloc),
+            local_fn_field: Vec::new_in(alloc),
         };
         blaze_own::Box::new_in(l, alloc)
     }
@@ -2764,8 +2784,18 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
     }
 
     /// As [`Self::project`], the new place marked `mark` (blaze-flow `PlaceMark`: a field of a
-    /// `Drop` type, an element of an unsized `[T]`).
+    /// `Drop` type, an element of an unsized `[T]`, a deref of `&T` / raw pointer).
     fn project_mark(&mut self, parent: Place, parent_ty: TyD, proj: Proj, child: TyD, mark: blaze_flow::PlaceMark, e: ExprId) -> Result<Place, Refusal> {
+        let mark = if proj == Proj::Deref && mark == blaze_flow::PlaceMark::None {
+            let shared_or_ptr = match parent_ty.wrap {
+                Some(Mutbl::Not) => true,
+                Some(Mutbl::Mut) => false,
+                None => matches!(self.node(parent_ty.ty, e)?, PNode::Ref(Mutbl::Not, _) | PNode::Ptr(..)),
+            };
+            if shared_or_ptr { blaze_flow::PlaceMark::SharedDeref } else { mark }
+        } else {
+            mark
+        };
         let p = self.b.project_in(parent, proj, mark);
         let pi = self.info(parent);
         let mut info = PInfo { start: pi.start, len: pi.len, exact: false, deref: 0, parent: parent.0, local: pi.local };
@@ -5803,6 +5833,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         if v.ty.wrap.is_some() {
             return self.refuse(Form::Malformed, e);
         }
+        let mut field_adt: Option<ItemKey> = None;
         let (idx, drop_type) = match self.node(v.ty.ty, e)? {
             PNode::Tuple(_) => match self.expr(e)? {
                 Expr::TupleField { index, .. } => (index, false),
@@ -5813,6 +5844,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 if f.union {
                     return self.refuse(Form::Union, e);
                 }
+                field_adt = Some(k);
                 match self.field_of(e) {
                     Some(i) => (i, f.drop_impl),
                     None => return self.refuse(Form::UnknownField, e),
@@ -5821,6 +5853,17 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             _ => return self.refuse(Form::UnknownField, e),
         };
         let fp = self.project(p, v.ty, Proj::Field(idx), ty, drop_type, e)?;
+        if let Some(k) = field_adt {
+            let holds_fn = match self.node(ty.ty, e)? {
+                PNode::FnPtr(..) => true,
+                PNode::Ref(_, inner) => matches!(self.node(inner, e)?, PNode::FnPtr(..)),
+                PNode::Adt(_, l) => self.list(l, e)?.first().is_some_and(|&a| matches!(self.node(a, e), Ok(PNode::FnPtr(..)))),
+                _ => false,
+            };
+            if holds_fn {
+                self.place_field_source.push((fp, k, 0, idx));
+            }
+        }
         self.push_place(fp, ty);
         Ok(())
     }
@@ -6360,6 +6403,28 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         let mut vs: Vec<Val, A> = Vec::new_in(self.alloc);
         vs.extend_from_slice(&self.vals[at + usize::from(by_type.is_some())..]);
         self.vals.truncate(at);
+        // RFC 2025: all call arguments are evaluated BEFORE a pending two-phase borrow activates
+        // at the call (`self.add_tag(entity, self.builtins.prefab)` reads `self.builtins.prefab`
+        // while `self`'s two-phase borrow is still reserved, not after `Activate`). Settle any
+        // non-temporary place operand into a fresh temporary before emitting `Activate`.
+        let pending = self.two_phase.len();
+        if (mark as usize) < pending {
+            for v in vs.iter_mut() {
+                let At::Place(p) = v.at else { continue };
+                let pi = self.info(p);
+                if pi.parent == u32::MAX && self.temps.iter().any(|l| l.0 == pi.local) {
+                    continue;
+                }
+                let op = self.operand(*v, e)?;
+                let arg_t = self.temp(v.ty, e)?;
+                let arg_tp = self.place_of(arg_t);
+                self.b.assign(arg_tp, op, self.span(e));
+                if pi.len > 0 {
+                    self.relate(p, arg_tp, v.ty, e)?;
+                }
+                *v = Val { at: At::Place(arg_tp), ty: v.ty };
+            }
+        }
         let mut ops: Vec<Operand, A> = Vec::new_in(self.alloc);
         let mut ins: Vec<Place, A> = Vec::new_in(self.alloc);
         for v in vs.iter().copied() {
@@ -6371,7 +6436,6 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         let t = self.temp(ty, e)?;
         let tp = self.place_of(t);
         // RFC 2025: a two-phase borrow is activated at its first use, the call.
-        let pending = self.two_phase.len();
         for i in mark as usize..pending {
             let l = self.two_phase[i];
             self.b.stmt(StmtKind::Activate(l), self.span(e));
@@ -6859,6 +6923,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         dest_ty: TyD,
         e: ExprId,
     ) -> Result<bool, Refusal> {
+        if R::ONE && self.call_value_one(args_tup, args_slots, out_match, args, dest, dest_ty, e)? {
+            return Ok(true);
+        }
         let mut ends: Vec<u32, A> = Vec::new_in(self.alloc);
         let mut at = 0u32;
         for v in args.iter() {
@@ -6921,8 +6988,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         self.call_laid(laid, None, &seed, args, dest, dest_ty, e)
     }
 
-    /// Calls a fn pointer loaded from a struct field (`(self.cb)(args)`), reading the field's
-    /// declared regions from `Facts::field_regions`.
+    /// Calls a fn pointer loaded from a struct field (`(self.cb)(args)`, or extracted via a
+    /// pattern like `let Some(dup) = self.duplicator; dup(x)`), reading the field's declared
+    /// regions from `Facts::regions().field(...)` (or `Facts::field_regions(...)`).
     fn call_through_field_fn_ptr(&mut self, mut c: ExprId, callee_val: Val, args: &[Val], dest: Place, dest_ty: TyD, e: ExprId) -> Result<bool, Refusal> {
         if dest_ty.wrap.is_some() || args.iter().any(|v| v.ty.wrap.is_some()) || callee_val.ty.wrap.is_some() {
             return Ok(false);
@@ -6941,65 +7009,158 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             }
             c = i;
         }
-        let Expr::Field { base, .. } = self.expr(c)? else {
-            return Ok(false);
-        };
-        let Some(field_idx) = self.field_of(c) else {
-            return Ok(false);
-        };
         let facts: &'b F = self.facts;
-        let mut bt = self.adjusted_ty(base)?;
-        let mut bsteps = 0u32;
-        loop {
-            bsteps += 1;
-            if bsteps > 16 {
-                return Ok(false);
-            }
-            match self.node(bt, e)? {
-                PNode::Ref(_, inner) => bt = inner,
-                PNode::Adt(k, l) if facts.adt(k).is_some_and(|a| a.is_box) => {
-                    let Some(&inner) = self.list(l, e)?.first() else { return Ok(false) };
-                    bt = inner;
+        let (adt, variant, field_idx, adt_args) = match self.expr(c)? {
+            Expr::Field { base, .. } => {
+                let Some(field_idx) = self.field_of(c) else {
+                    return Ok(false);
+                };
+                let mut bt = self.adjusted_ty(base)?;
+                let mut bsteps = 0u32;
+                loop {
+                    bsteps += 1;
+                    if bsteps > 16 {
+                        return Ok(false);
+                    }
+                    match self.node(bt, e)? {
+                        PNode::Ref(_, inner) => bt = inner,
+                        PNode::Adt(k, l) if facts.adt(k).is_some_and(|a| a.is_box) => {
+                            let Some(&inner) = self.list(l, e)?.first() else { return Ok(false) };
+                            bt = inner;
+                        }
+                        _ => break,
+                    }
                 }
-                _ => break,
+                let PNode::Adt(adt, adt_args) = self.node(bt, e)? else {
+                    return Ok(false);
+                };
+                (adt, 0u32, field_idx, Some(adt_args))
             }
-        }
-        let PNode::Adt(adt, _) = self.node(bt, e)? else {
-            return Ok(false);
+            Expr::Local(p) => {
+                let Some(&(_, adt, variant, field_idx)) = self.local_fn_field.iter().find(|&&(pat, ..)| pat == p) else {
+                    return Ok(false);
+                };
+                (adt, variant, field_idx, None)
+            }
+            _ => return Ok(false),
         };
-        let Some(fregs) = facts.field_regions(adt, 0, field_idx) else {
-            return Ok(false);
-        };
-        let mut regions: Vec<Region, A> = Vec::new_in(self.alloc);
-        let mut seed: Vec<(Region, Origin), A> = Vec::new_in(self.alloc);
         let place_info = match callee_val.at {
             At::Place(p) => Some(self.info(p)),
             At::Const => None,
         };
-        for (j, &fr) in fregs.iter().enumerate() {
-            let r = match fr {
-                FieldRegion::Static => Region::Static,
-                FieldRegion::Bound(k) => Region::Late { binder: 0, var: k },
-                FieldRegion::Lifetime(i) => {
-                    let Some(pi) = place_info else { return Ok(false) };
-                    if !pi.exact || pi.len as usize != fregs.len() {
-                        return Ok(false);
-                    }
-                    let r = Region::Param(i);
-                    if !seed.iter().any(|(x, _)| *x == r) {
-                        seed.push((r, self.origs[(pi.start + j as u32) as usize]));
-                    }
-                    r
-                }
-                FieldRegion::Arg(_) => return Ok(false),
-            };
-            regions.push(r);
-        }
         let mut ends: Vec<u32, A> = Vec::new_in(self.alloc);
         let mut at = 0u32;
         for v in args.iter() {
             at += self.npos_d(v.ty, e)?;
             ends.push(at);
+        }
+        let dlen = self.npos_d(dest_ty, e)?;
+        // Preferred path: read the field's declared region column directly from `Facts::regions()`
+        // (peeling `&`/`&mut` and zero-lifetime wrappers like `Option<fn(..)>` / `Box<fn(..)>`).
+        if let Ok(col) = facts.regions().field(adt, variant, field_idx) {
+            let arity = crate::one_call::FactsArity { facts };
+            let heads = blaze_borrow::Columns::new(facts.region_tys().unwrap_or(self.tys), &arity, &arity);
+            let mut declared = col.ty();
+            let mut slots = col.as_slice();
+            for _ in 0..16 {
+                match self.head_node(declared, e)? {
+                    PNode::Ref(_, inner) => {
+                        let Some(rest) = slots.get(1..) else { break };
+                        declared = inner;
+                        slots = rest;
+                    }
+                    PNode::Adt(k, l) if facts.adt(k).is_some_and(|a| a.lifetimes == 0) => {
+                        let list = self.head_list(l, e)?;
+                        let Some(&inner) = list.first() else { break };
+                        if list.len() > 2 {
+                            break;
+                        }
+                        let Ok(ic) = blaze_borrow::RegionTypes::count(&heads, inner) else { break };
+                        let Some(inner_slots) = slots.get(..ic.get() as usize) else { break };
+                        declared = inner;
+                        slots = inner_slots;
+                    }
+                    _ => break,
+                }
+            }
+            if let PNode::FnPtr(fn_list, _) = self.head_node(declared, e)? {
+                let fn_kids = self.head_list(fn_list, e)?;
+                if fn_kids.len() == args.len() + 1 && slots.len() == (at + dlen) as usize {
+                    let mut counts_ok = true;
+                    let mut prev = 0u32;
+                    for (i, &kid) in fn_kids[..args.len()].iter().enumerate() {
+                        let want = ends[i] - prev;
+                        prev = ends[i];
+                        if blaze_borrow::RegionTypes::count(&heads, kid).ok().map(|c| c.get()) != Some(want) {
+                            counts_ok = false;
+                            break;
+                        }
+                    }
+                    if counts_ok && blaze_borrow::RegionTypes::count(&heads, fn_kids[args.len()]).ok().map(|c| c.get()) == Some(dlen) {
+                        let binders = facts.fn_binders();
+                        let mut seed: Vec<(Region, Origin), A> = Vec::new_in(self.alloc);
+                        let mut seed_ok = true;
+                        for (j, &r) in slots.iter().enumerate() {
+                            let free = matches!(r, Region::Param(_)) || (!binders && matches!(r, Region::Late { .. }));
+                            if free && !seed.iter().any(|(x, _)| *x == r) {
+                                let Some(pi) = place_info else {
+                                    seed_ok = false;
+                                    break;
+                                };
+                                if !pi.exact || pi.len as usize != slots.len() {
+                                    seed_ok = false;
+                                    break;
+                                }
+                                seed.push((r, self.origs[(pi.start + j as u32) as usize]));
+                            }
+                        }
+                        if seed_ok {
+                            let laid = Laid { regions: slots, ends: &ends, bounds: &[] };
+                            if self.call_laid(laid, None, &seed, args, dest, dest_ty, e)? {
+                                return Ok(true);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let Some(fregs) = facts.field_regions(adt, variant, field_idx) else {
+            return Ok(false);
+        };
+        let mut regions: Vec<Region, A> = Vec::new_in(self.alloc);
+        let mut seed: Vec<(Region, Origin), A> = Vec::new_in(self.alloc);
+        let mut pos = 0u32;
+        for &fr in fregs.iter() {
+            match fr {
+                FieldRegion::Static => {
+                    regions.push(Region::Static);
+                    pos += 1;
+                }
+                FieldRegion::Bound(k) => {
+                    regions.push(Region::Late { binder: 0, var: k });
+                    pos += 1;
+                }
+                FieldRegion::Lifetime(i) => {
+                    let Some(pi) = place_info else { return Ok(false) };
+                    if !pi.exact {
+                        return Ok(false);
+                    }
+                    let Some(&orig) = self.origs.get((pi.start + pos) as usize) else { return Ok(false) };
+                    let r = Region::Param(i);
+                    if !seed.iter().any(|(x, _)| *x == r) {
+                        seed.push((r, orig));
+                    }
+                    regions.push(r);
+                    pos += 1;
+                }
+                FieldRegion::Arg(arg_i) => {
+                    let Some(al) = adt_args else { return Ok(false) };
+                    let Some(&arg_ty) = self.list(al, e)?.get(arg_i as usize) else { return Ok(false) };
+                    if self.npos(arg_ty, e)? != 0 {
+                        return Ok(false);
+                    }
+                }
+            }
         }
         if at as usize > regions.len() {
             return Ok(false);
@@ -7310,6 +7471,20 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                         Some(&t) => TyD::of(t),
                         None => return self.refuse_pat(Form::Malformed, p),
                     };
+                    if !self.place_field_source.is_empty() && matches!(self.node(lt.ty, root)?, PNode::FnPtr(..)) {
+                        let mut cur = place.0;
+                        for _ in 0..8 {
+                            if let Some(&(_, adt, variant, fi)) = self.place_field_source.iter().find(|&&(pl, ..)| pl.0 == cur) {
+                                self.local_fn_field.push((p, adt, variant, fi));
+                                break;
+                            }
+                            let Some(info) = self.pinfo.get(cur as usize) else { break };
+                            if info.parent == u32::MAX {
+                                break;
+                            }
+                            cur = info.parent;
+                        }
+                    }
                     if let Some(blaze_typeck::UnionPat::Variant(v)) = union_pat
                         && ty.wrap.is_none()
                         && let PNode::Union(ul) = self.node(ty.ty, root)?

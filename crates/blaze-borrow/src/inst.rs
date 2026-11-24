@@ -30,7 +30,7 @@ use blaze_flow::Origin;
 use blaze_own::Vec;
 use blaze_typeck::region_facts::{ClauseView, ColView, Outlives, ParamsView};
 use blaze_typeck::regions::Region;
-use blaze_typeck::{ItemKey, Name, PTy};
+use blaze_typeck::{ItemKey, Mutbl, Name, PTy};
 
 use crate::types::{RegionTypes, SlotCount, SlotRange};
 use crate::{Bad, Refused, Reg};
@@ -650,6 +650,15 @@ pub enum Keyed {
     Unknown,
 }
 
+/// The outer constructor shape of a trait impl's `Self` type (used to match projections on
+/// the caller's own enclosing trait impl `Self`, e.g. `Zip<A, B>::Item` or `(&T0, &T1)::Item`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelfShape {
+    Adt(ItemKey),
+    Ref(Mutbl),
+    Tuple(u32),
+}
+
 /// The asked alias's or bound's arguments `[Self, trait args..]` at the call, as the walk reads
 /// them (relate.rs `Keyer`): what a selection row is keyed against.
 pub trait AskArgs {
@@ -657,8 +666,8 @@ pub trait AskArgs {
     fn count(&self) -> Option<u32>;
     /// The `k`-th argument against `ty`, a type of the CALLER's table (a row's argument).
     fn compare(&self, k: u32, ty: PTy) -> Keyed;
-    /// If argument 0 (`Self`) resolves to a nominal `PNode::Adt(k, _)`, its `ItemKey`.
-    fn self_adt(&self) -> Option<ItemKey> {
+    /// If argument 0 (`Self`) resolves to an `Adt`, `Ref`, or `Tuple`, its outer shape.
+    fn self_shape(&self) -> Option<SelfShape> {
         None
     }
 }
