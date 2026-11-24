@@ -4258,10 +4258,13 @@ impl<A: Allocator + Clone> Plain<A> {
         Ok(true)
     }
 
-    /// Plans and streams ONE tiered-merge slice directly (no directory listing, no sparse sweep,
-    /// no root-LRU eviction) and parks it for the next commit's flip ([`Plain::slice_parked`]).
-    /// Under [`Liveness::Reached`], leased segments remain mergeable while preserving 100% of
-    /// their records (`Cursor::leased`), so active leases never stall tier compaction.
+    /// Plans and streams ONE lossless tiered-merge slice directly (no pruning, no directory
+    /// listing, no sparse sweep, no root-LRU eviction) and parks it for the next commit's flip
+    /// ([`Plain::slice_parked`]).
+    ///
+    /// Always passes `prune = false` (`Keep::All`) so a mid-build commit never drops records from
+    /// unleased or not-yet-rooted segments written by earlier phases or concurrent runs; pruning
+    /// stays strictly in explicit `compact` / GC.
     /// Returns `Ok(true)` if stream effects were queued, `Ok(false)` if no effects are pending
     /// (already parked, no tier over `K`, or an empty copy already parked synchronously).
     pub fn fold_tiered_slice<E: core::iter::Extend<Effect>>(&mut self, now_ns: u64, effects: &mut E) -> Result<bool, StoreError> {
@@ -4276,9 +4279,8 @@ impl<A: Allocator + Clone> Plain<A> {
         if candidates.is_empty() {
             return Ok(false);
         }
-        let prune = self.cfg.liveness == Liveness::Reached;
         let mut stats = Sliced { merged: true, ..Sliced::default() };
-        let (out, ids) = self.copy_live(candidates, prune, now_ns, None, &mut stats)?;
+        let (out, ids) = self.copy_live(candidates, false, now_ns, None, &mut stats)?;
         self.fold_asked = true;
         if out.count == 0 {
             let empty_orphans = self.alloc_vec();

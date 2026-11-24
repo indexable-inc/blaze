@@ -445,3 +445,46 @@ fn concurrent_gc_merging_leased_segments_does_not_trigger_carry_or_swept_under()
         assert_eq!(reader.got(got).bytes, value(n).as_slice());
     }
 }
+
+/// Automatic tiered merging inside `commit_records` (`Plain::fold_tiered_slice`) MUST be strictly
+/// lossless (`Keep::All`) even under `Liveness::Reached` for segments whose lease has already been
+/// released and whose records are not yet covered by a committed root (e.g. records committed by
+/// an earlier phase or another process before its answer root flips).
+#[test]
+fn auto_tier_merge_during_commit_is_lossless_for_unleased_records() {
+    let root = test_root();
+    let sim = Sim::new(113, Faults::default());
+
+    // Process 1 writes 6 segments of records without registering a root, releases its lease,
+    // and exits (simulating records from an earlier phase/build before root flip).
+    let mut p1_keys = blaze_own::Vec::new_in(&root);
+    let sim = {
+        let mut p1 = Driven::with(sim, Path::new("/sim"), reached_cfg(1, &root), &root).expect("p1 open");
+        for i in 0..6u32 {
+            let n = 80_000 + i;
+            let k = record(n);
+            p1.put(k, Namespace::LOCAL, TAG, &value(n)).expect("p1 put");
+            p1.commit_with(&[]).expect("p1 commit");
+            p1_keys.push((n, k));
+        }
+        p1.release_lease();
+        p1.commit_with(&[]).expect("p1 release commit");
+        p1.into_driver()
+    };
+
+    // Process 2 performs 30 phase commits under Liveness::Reached, crossing the auto-merge
+    // threshold (`auto_merge_open_threshold` = 24) and folding Process 1's unleased segments.
+    let mut p2 = Driven::with(sim, Path::new("/sim"), reached_cfg(2, &root), &root).expect("p2 open");
+    for i in 0..30u32 {
+        let n = 90_000 + i;
+        let k = record(n);
+        p2.put(k, Namespace::LOCAL, TAG, &value(n)).expect("p2 put");
+        p2.commit_with(&[]).expect("p2 commit");
+    }
+
+    // Every single unleased, unrooted record from Process 1 MUST still be intact!
+    for &(n, k) in &p1_keys {
+        let got = p2.get(&k).expect("get").expect("auto-merge during commit must never drop unleased records");
+        assert_eq!(p2.got(got).bytes, value(n).as_slice());
+    }
+}
