@@ -951,6 +951,11 @@ pub(crate) fn select_owning_owner<W: World>(
                     cond,
                     args: import_list(cx, &mut NoClosures, preds.types, args, &[], 0)?,
                 },
+                PClause::ForFields { container, trait_, args } => Goal::ForFields {
+                    container: import(cx, &mut NoClosures, preds.types, container, &[], 0)?,
+                    trait_,
+                    args: import_list(cx, &mut NoClosures, preds.types, args, &[], 0)?,
+                },
                 PClause::TypeOutlives { .. } | PClause::RegionOutlives { .. } => continue,
             };
             cx.assume(goal)?;
