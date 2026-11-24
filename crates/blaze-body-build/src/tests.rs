@@ -356,3 +356,460 @@ bb0:
     let lir_tls = printed(&b_tls);
     assert!(lir_tls.contains("tls_addr"), "{lir_tls}");
 }
+
+fn heap() -> Alloc<'static> {
+    blaze_own::testing::heap().alloc()
+}
+
+/// Configurable facts world for exercising C ABI, `rust-call`, intrinsics, overflow checks,
+/// unions, and `dyn Trait` vtables without touching the global allocator.
+struct RichWorld<'a> {
+    abi: Abi,
+    callee_abi: Abi,
+    overflow: OverflowChecks,
+    intrinsic_item: Option<(ItemKey, blaze_build::Intrinsic)>,
+    union_key: Option<ItemKey>,
+    union_types: Option<PortableTys<'static>>,
+    union_fields: &'a [blaze_typeck::Field],
+    union_variants: &'a [blaze_typeck::Variant],
+    trait_key: Option<ItemKey>,
+    trait_methods: &'a [blaze_build::vtable::ObjectMethod],
+}
+
+impl<'a> RichWorld<'a> {
+    fn base() -> Self {
+        Self {
+            abi: Abi::Rust,
+            callee_abi: Abi::Rust,
+            overflow: OverflowChecks::On,
+            intrinsic_item: None,
+            union_key: None,
+            union_types: None,
+            union_fields: &[],
+            union_variants: &[],
+            trait_key: None,
+            trait_methods: &[],
+        }
+    }
+}
+
+impl LayoutFacts for RichWorld<'_> {
+    fn adt(&self, k: ItemKey) -> Option<Adt<'_>> {
+        if self.union_key == Some(k) {
+            let tys = self.union_types.as_ref()?;
+            return Some(Adt {
+                kind: blaze_typeck::AdtKind::Union,
+                generics: 0,
+                types: tys.view(),
+                variants: self.union_variants,
+                fields: self.union_fields,
+            });
+        }
+        None
+    }
+    fn repr(&self, _: ItemKey) -> Result<ReprAttrs, Missing> {
+        Ok(ReprAttrs::RUST)
+    }
+    fn discriminant(&self, _: ItemKey, _: u32) -> Result<Option<i128>, Missing> {
+        Ok(None)
+    }
+    fn valid_range(&self, _: ItemKey) -> Result<ValidRange, Missing> {
+        Ok(ValidRange::default())
+    }
+}
+
+impl Adts for RichWorld<'_> {
+    fn adt(&self, k: ItemKey) -> Option<Adt<'_>> {
+        LayoutFacts::adt(self, k)
+    }
+    fn facts(&self) -> &dyn LayoutFacts {
+        self
+    }
+    fn panic(&self) -> Panic {
+        Panic::Abort
+    }
+    fn overflow_checks(&self) -> OverflowChecks {
+        self.overflow
+    }
+    fn ub_checks(&self) -> blaze_build::UbChecks {
+        blaze_build::UbChecks::Off
+    }
+    fn drop_impl(&self, _: PTy, _: &mut PortableTys<'_>) -> Result<Option<ItemKey>, blaze_build::BuildError> {
+        Ok(None)
+    }
+    fn abi(&self, k: ItemKey) -> Option<Abi> {
+        if k == CALLEE { Some(self.callee_abi) } else { Some(self.abi) }
+    }
+    fn intrinsic(&self, k: ItemKey) -> Option<blaze_build::Intrinsic> {
+        self.intrinsic_item.and_then(|(ik, intr)| (ik == k).then_some(intr))
+    }
+    fn object_trait(&self, t: ItemKey) -> Option<blaze_build::vtable::ObjectTrait<'_>> {
+        if self.trait_key == Some(t) {
+            return Some(blaze_build::vtable::ObjectTrait {
+                supers: &[],
+                tys: blaze_typeck::PTys::EMPTY,
+                methods: self.trait_methods,
+                shape: blaze_ids::ContentId([7; 32]),
+            });
+        }
+        None
+    }
+    fn lang_fn(&self, name: &str) -> Option<ItemKey> {
+        match name {
+            "panic_cannot_unwind" => Some(CANNOT_UNWIND),
+            n if blaze_build::PanicConst::ALL.iter().any(|p| p.lang() == n) => Some(PANIC),
+            _ => None,
+        }
+    }
+}
+
+/// With `OverflowChecks::Off`, arithmetic overflow asserts (`add`, `sub`, `mul`, `shl`, `shr`, `neg`)
+/// are elided so `i64::MAX + 1` wraps to `i64::MIN` with no `cold` panic block.
+#[test]
+fn overflow_checks_off_elides_add_overflow_assert() {
+    let from = from_table();
+    let body = blaze_body::text::parse(OVERFLOW, heap()).unwrap();
+    let verified = blaze_body::verify(&body).unwrap();
+    let mut ground = PortableTys::new_in(heap());
+    let mut subst = Subst { args: &[], ground: &mut ground, scratch: heap() };
+    let mut w = RichWorld::base();
+    w.overflow = OverflowChecks::Off;
+    let b = build(verified, from.view(), ITEM, &mut subst, &w, heap()).unwrap();
+    let text = printed(&b);
+    assert!(!text.contains("cold"), "overflow check should be elided:\n{text}");
+    let out = run_in(b.func.view(), &[Val::Int(u128::from(i64::MAX.cast_unsigned()))], 1000, heap()).unwrap();
+    assert_eq!(returned(out), [Val::Int(u128::from(i64::MIN.cast_unsigned()))]);
+}
+
+/// `extern "C"` functions and calls handle both small composites (`Pass::Words` in 1-2 `i64`
+/// registers) and >16-byte composites (`Pass::Memory` `byval`/`sret`).
+#[test]
+fn c_abi_words_and_memory_composites_execute() {
+    let mut t = PortableTys::new_in(heap());
+    let i64_ = t.intern(PNode::Int(IntTy::I64)).unwrap(); // t0
+    let i32_ = t.intern(PNode::Int(IntTy::I32)).unwrap(); // t1
+    let l12 = t.intern_list(&[i32_, i32_, i32_]).unwrap();
+    let _c12 = t.intern(PNode::Tuple(l12)).unwrap(); // t2: 12-byte (no padding) C Words composite
+    let l24 = t.intern_list(&[i64_, i64_, i64_]).unwrap();
+    let _c24 = t.intern(PNode::Tuple(l24)).unwrap(); // t3: 24-byte C Memory (byval/sret) composite
+
+    // Callee: extern "C" fn(p: (i32, i32, i32)) -> (i32, i32, i32) { (p.0 + 1, p.1, p.2) }
+    let callee_text = "\
+local _0: t2 return
+local _1: t2 arg 0
+local _2: t1 temp e0 value
+const c0 = scalar 0x1: t1
+bb0:
+  _2 = add(copy _1.0:t1, const c0)
+  _0 = tuple t2(copy _2, copy _1.1:t1, copy _1.2:t1)
+  return
+";
+    // Caller: extern "C" fn() -> i64 { let r = k7((10, 20, 12)); (r.0 + r.1 + r.2) as i64 }
+    let caller_text = "\
+local _0: t0 return
+local _1: t2 temp e0 value
+local _2: t2 temp e1 value
+local _3: t1 temp e2 value
+local _4: t1 temp e3 value
+const c0 = scalar 0xa: t1
+const c1 = scalar 0x14: t1
+const c2 = scalar 0xc: t1
+bb0:
+  _1 = tuple t2(const c0, const c1, const c2)
+  call fn k7<0,0>(move _1) -> _2 then bb1 unwind continue
+bb1:
+  _3 = add(copy _2.0:t1, copy _2.1:t1)
+  _4 = add(copy _3, copy _2.2:t1)
+  _0 = cast int_to_int(copy _4) as t0
+  return
+";
+    let mut w = RichWorld::base();
+    w.abi = Abi::C;
+    w.callee_abi = Abi::C;
+    let build_one = |text: &str, item: ItemKey| {
+        let body = blaze_body::text::parse(text, heap()).unwrap();
+        let verified = blaze_body::verify(&body).unwrap();
+        let mut ground = PortableTys::new_in(heap());
+        let mut subst = Subst { args: &[], ground: &mut ground, scratch: heap() };
+        build(verified, t.view(), item, &mut subst, &w, heap()).unwrap()
+    };
+    let callee = build_one(callee_text, CALLEE);
+    let caller = build_one(caller_text, ITEM);
+    let bodies = One { callee: callee.func.view() };
+    let out = run_calls_in(caller.func.view(), BodyId([0; 32]), &[], 1000, &bodies, heap()).unwrap();
+    assert_eq!(returned(out), [Val::Int(43)]);
+
+    // 24-byte `Pass::Memory` (`byval` + `sret`): extern "C" fn(t3) -> t3, called from caller.
+    let callee24 = "\
+local _0: t3 return
+local _1: t3 arg 0
+local _2: t0 temp e0 value
+bb0:
+  _2 = add(copy _1.0:t0, copy _1.1:t0)
+  _0 = tuple t3(copy _2, copy _1.1:t0, copy _1.2:t0)
+  return
+";
+    let caller24 = "\
+local _0: t0 return
+local _1: t3 temp e0 value
+local _2: t3 temp e1 value
+const c0 = scalar 0xa: t0
+const c1 = scalar 0x14: t0
+const c2 = scalar 0xc: t0
+bb0:
+  _1 = tuple t3(const c0, const c1, const c2)
+  call fn k7<0,0>(move _1) -> _2 then bb1 unwind continue
+bb1:
+  _0 = add(copy _2.0:t0, copy _2.2:t0)
+  return
+";
+    let c24_b = build_one(callee24, CALLEE);
+    let r24_b = build_one(caller24, ITEM);
+    let bodies24 = One { callee: c24_b.func.view() };
+    let out24 = run_calls_in(r24_b.func.view(), BodyId([0; 32]), &[], 1000, &bodies24, heap()).unwrap();
+    assert_eq!(returned(out24), [Val::Int(42)]);
+}
+
+/// `extern "rust-call"` spreads the trailing tuple argument across individual Rust ABI parameters
+/// on both caller and callee sides.
+#[test]
+fn rust_call_abi_spreads_tuple_argument() {
+    let from = from_table(); // t0 = i64, t2 = (i64, i64)
+    let callee_text = "\
+local _0: t0 return
+local _1: t0 arg 0
+local _2: t2 arg 1
+local _3: t0 temp e0 value
+bb0:
+  _3 = add(copy _1, copy _2.0:t0)
+  _0 = add(copy _3, copy _2.1:t0)
+  return
+";
+    let caller_text = "\
+local _0: t0 return
+local _1: t2 temp e0 value
+const c0 = scalar 0x5: t0
+const c1 = scalar 0xa: t0
+const c2 = scalar 0x1b: t0
+bb0:
+  _1 = tuple t2(const c1, const c2)
+  call fn k7<0,0>(const c0, move _1) -> _0 then bb1 unwind continue
+bb1:
+  return
+";
+    let mut w = RichWorld::base();
+    w.abi = Abi::Rust;
+    w.callee_abi = Abi::RustCall;
+    let build_one = |text: &str, item: ItemKey| {
+        let body = blaze_body::text::parse(text, heap()).unwrap();
+        let verified = blaze_body::verify(&body).unwrap();
+        let mut ground = PortableTys::new_in(heap());
+        let mut subst = Subst { args: &[], ground: &mut ground, scratch: heap() };
+        build(verified, from.view(), item, &mut subst, &w, heap()).unwrap()
+    };
+    let callee = build_one(callee_text, CALLEE);
+    let caller = build_one(caller_text, ITEM);
+    let bodies = One { callee: callee.func.view() };
+    let out = run_calls_in(caller.func.view(), BodyId([0; 32]), &[], 1000, &bodies, heap()).unwrap();
+    assert_eq!(returned(out), [Val::Int(42)]);
+}
+
+/// `Intrinsic::Table` calls (`ctpop`) lower directly through `blaze_build::intrinsics::build`
+/// and execute with zero call overhead.
+#[test]
+fn table_intrinsics_lower_and_execute() {
+    let mut t = PortableTys::new_in(heap());
+    let u64_ = t.intern(PNode::Uint(blaze_typeck::UintTy::U64)).unwrap(); // t0
+    let _u32_ = t.intern(PNode::Uint(blaze_typeck::UintTy::U32)).unwrap(); // t1 (`ctpop` returns u32)
+    let _g = t.intern_list(&[u64_]).unwrap(); // list 0..1 = [u64]
+    let text = "\
+local _0: t1 return
+local _1: t0 arg 0
+bb0:
+  call intrinsic k7<0,1>(copy _1) -> _0 then bb1 unwind continue
+bb1:
+  return
+";
+    let mut w = RichWorld::base();
+    w.intrinsic_item = Some((CALLEE, blaze_build::Intrinsic::Table(blaze_build::intrinsics::Which::Ctpop)));
+    let body = blaze_body::text::parse(text, heap()).unwrap();
+    let verified = blaze_body::verify(&body).unwrap();
+    let mut ground = PortableTys::new_in(heap());
+    let mut subst = Subst { args: &[], ground: &mut ground, scratch: heap() };
+    let b = build(verified, t.view(), ITEM, &mut subst, &w, heap()).unwrap();
+    assert!(b.refs.is_empty(), "intrinsic lowered inline, no function ref");
+    let out = run_in(b.func.view(), &[Val::Int(0xF0F0)], 1000, heap()).unwrap();
+    assert_eq!(returned(out), [Val::Int(8)]);
+}
+
+/// `CastKind::Unsize` to `&dyn Trait` emits a `Vtable` reference into `Built::vtables`, and
+/// `Callee::Method` with `Self = dyn Trait` dispatches through the vtable slot via `call_indirect`.
+#[test]
+fn dyn_vtable_unsize_and_method_dispatch() {
+    const TRAIT: ItemKey = ItemKey(55);
+    let mut t = PortableTys::new_in(heap());
+    let i64_ = t.intern(PNode::Int(IntTy::I64)).unwrap(); // t0
+    let ref_i64 = t.intern(PNode::Ref(Mutbl::Not, i64_)).unwrap(); // t1
+    let empty = t.intern_list(&[]).unwrap();
+    let ex = t.intern(PNode::ExTrait(TRAIT, empty)).unwrap(); // t2
+    let preds = t.intern_list(&[ex]).unwrap();
+    let dyn_tr = t.intern(PNode::Dynamic(preds)).unwrap(); // t3
+    let _ref_dyn = t.intern(PNode::Ref(Mutbl::Not, dyn_tr)).unwrap(); // t4
+    let dyn_args = t.intern_list(&[dyn_tr]).unwrap(); // list 1..2 = [dyn Tr]
+    assert_eq!((dyn_args.start, dyn_args.len), (1, 1));
+    let _ = ref_i64;
+    let text = "\
+local _0: t0 return
+local _1: t1 arg 0
+local _2: t4 temp e0 value
+bb0:
+  _2 = cast unsize(copy _1) as t4
+  call method k7<1,1>(copy _2) -> _0 then bb1 unwind continue
+bb1:
+  return
+";
+    let methods = [blaze_build::vtable::ObjectMethod {
+        item: CALLEE,
+        dispatch: blaze_build::vtable::MethodDispatch::Direct,
+    }];
+    let mut w = RichWorld::base();
+    w.trait_key = Some(TRAIT);
+    w.trait_methods = &methods;
+    let body = blaze_body::text::parse(text, heap()).unwrap();
+    let verified = blaze_body::verify(&body).unwrap();
+    let mut ground = PortableTys::new_in(heap());
+    let mut subst = Subst { args: &[], ground: &mut ground, scratch: heap() };
+    let b = build(verified, t.view(), ITEM, &mut subst, &w, heap()).unwrap();
+    assert_eq!(b.vtables.len(), 1);
+    assert_eq!(b.vtables[0].principal, TRAIT);
+    let lir = printed(&b);
+    assert!(lir.contains("call_indirect"), "dyn method should dispatch via vtable:\n{lir}");
+}
+
+/// `ConstKind::Param` and large `Value::Repeat` (> 64 elements, lowered as a counted LIR loop)
+/// build and execute accurately; missing `ConstKind::Item`/`Anon` report typed errors.
+#[test]
+fn const_param_item_anon_and_large_repeat_execute() {
+    let mut t = PortableTys::new_in(heap());
+    let i64_ = t.intern(PNode::Int(IntTy::I64)).unwrap(); // t0
+    let usize_ = t.intern(PNode::Uint(blaze_typeck::UintTy::Usize)).unwrap(); // t1
+    let c100 = t.intern(PNode::ConstValue { ty: usize_, bits: 100 }).unwrap(); // t2
+    let _arr100 = t.intern(PNode::Array(i64_, c100)).unwrap(); // t3
+
+    let text = "\
+local _0: t0 return
+local _1: t3 temp e0 value
+local _2: t0 temp e1 value
+local _3: t0 temp e2 value
+const c0 = param 0: t0
+const c1 = scalar 0x64: t1
+bb0:
+  _1 = repeat(const c0, c1)
+  _2 = copy _1[99 of 100]
+  _3 = copy _1[0 of 100]
+  _0 = add(copy _2, copy _3)
+  return
+";
+    let w = RichWorld::base();
+    let body = blaze_body::text::parse(text, heap()).unwrap();
+    let verified = blaze_body::verify(&body).unwrap();
+    let mut ground = PortableTys::new_in(heap());
+    let g_i64 = ground.intern(PNode::Int(IntTy::I64)).unwrap();
+    let g_p0 = ground.intern(PNode::ConstValue { ty: g_i64, bits: 21 }).unwrap();
+    let mut subst = Subst { args: &[g_p0], ground: &mut ground, scratch: heap() };
+    let b = build(verified, t.view(), ITEM, &mut subst, &w, heap()).unwrap();
+    // 21 (arr[99]) + 21 (arr[0]) = 42
+    let out = run_in(b.func.view(), &[], 10000, heap()).unwrap();
+    assert_eq!(returned(out), [Val::Int(42)]);
+
+    // Missing const item / const block surface typed errors rather than Unsupported.
+    let item_text = "local _0: t0 return\nconst c0 = item k99<0,0>: t0\nbb0:\n  _0 = const c0\n  return\n";
+    let ib = blaze_body::text::parse(item_text, heap()).unwrap();
+    let iv = blaze_body::verify(&ib).unwrap();
+    let mut g2 = PortableTys::new_in(heap());
+    let mut s2 = Subst { args: &[], ground: &mut g2, scratch: heap() };
+    assert!(matches!(build(iv, t.view(), ITEM, &mut s2, &w, heap()), Err(BuildError::NoConstValue { .. })));
+
+    let anon_text = "local _0: t0 return\nconst c0 = anon e5: t0\nbb0:\n  _0 = const c0\n  return\n";
+    let ab = blaze_body::text::parse(anon_text, heap()).unwrap();
+    let av = blaze_body::verify(&ab).unwrap();
+    let mut g3 = PortableTys::new_in(heap());
+    let mut s3 = Subst { args: &[], ground: &mut g3, scratch: heap() };
+    assert!(matches!(build(av, t.view(), ITEM, &mut s3, &w, heap()), Err(BuildError::NoConstBlock { .. })));
+}
+
+/// `Proj::ConstIndex` from the end of a slice, `Proj::Subslice`, `CastKind::Transmute` of a
+/// pair, and `AdtKind::Union` aggregates all build and execute accurately.
+#[test]
+fn slice_from_end_subslice_transmute_pair_and_union_execute() {
+    const UNION_K: ItemKey = ItemKey(88);
+    let mut t = PortableTys::new_in(heap());
+    let i64_ = t.intern(PNode::Int(IntTy::I64)).unwrap(); // t0
+    let u64_ = t.intern(PNode::Uint(blaze_typeck::UintTy::U64)).unwrap(); // t1
+    let usize_ = t.intern(PNode::Uint(blaze_typeck::UintTy::Usize)).unwrap(); // t2
+    let c4 = t.intern(PNode::ConstValue { ty: usize_, bits: 4 }).unwrap(); // t3
+    let arr4 = t.intern(PNode::Array(i64_, c4)).unwrap(); // t4
+    let _ref_arr4 = t.intern(PNode::Ref(Mutbl::Not, arr4)).unwrap(); // t5
+    let slice = t.intern(PNode::Slice(i64_)).unwrap(); // t6
+    let _ref_slice = t.intern(PNode::Ref(Mutbl::Not, slice)).unwrap(); // t7
+    let pi = t.intern_list(&[i64_, i64_]).unwrap();
+    let _pair_i = t.intern(PNode::Tuple(pi)).unwrap(); // t8
+    let pu = t.intern_list(&[u64_, u64_]).unwrap();
+    let _pair_u = t.intern(PNode::Tuple(pu)).unwrap(); // t9
+    let empty = t.intern_list(&[]).unwrap();
+    let _union_ty = t.intern(PNode::Adt(UNION_K, empty)).unwrap(); // t10
+
+    let text = "\
+local _0: t0 return
+local _1: t4 temp e0 value
+local _2: t5 temp e1 value
+local _3: t7 temp e2 value
+local _4: t7 temp e3 value
+local _5: t8 temp e4 value
+local _6: t9 temp e5 value
+local _7: t10 temp e6 value
+origin 'o0
+origin 'o1
+const c0 = scalar 0xa: t0
+const c1 = scalar 0x14: t0
+const c2 = scalar 0x1e: t0
+const c3 = scalar 0x28: t0
+bb0:
+  _1 = array t4(const c0, const c1, const c2, const c3)
+  _2 = borrow shared _1 L0 'o0
+  _3 = cast unsize(copy _2) as t7
+  _4 = borrow shared _3.*[1..-1] L1 'o1
+  _5 = tuple t8(copy _4.*[-1 of 1], copy _4.*[0 of 1])
+  _6 = cast transmute(move _5) as t9
+  _7 = adt t10 #0(copy _6.0:t1)
+  _0 = add(copy _7.1:t0, copy _6.1:t1)
+  return
+";
+    let mut ut = PortableTys::new_in(heap());
+    let u_u64 = ut.intern(PNode::Uint(blaze_typeck::UintTy::U64)).unwrap();
+    let u_i64 = ut.intern(PNode::Int(IntTy::I64)).unwrap();
+    let union_fields = [
+        blaze_typeck::Field { name: blaze_typeck::Name::of("a"), ty: u_u64 },
+        blaze_typeck::Field { name: blaze_typeck::Name::of("b"), ty: u_i64 },
+    ];
+    let union_variants = [blaze_typeck::Variant {
+        key: UNION_K,
+        name: blaze_typeck::Name::of("U"),
+        fields: blaze_typeck::List { start: 0, len: 2 },
+        ctor: blaze_typeck::CtorKind::Braces,
+    }];
+    let mut w = RichWorld::base();
+    w.union_key = Some(UNION_K);
+    w.union_types = Some(ut);
+    w.union_fields = &union_fields;
+    w.union_variants = &union_variants;
+
+    let body = blaze_body::text::parse(text, heap()).unwrap();
+    let verified = blaze_body::verify(&body).unwrap();
+    let mut ground = PortableTys::new_in(heap());
+    let mut subst = Subst { args: &[], ground: &mut ground, scratch: heap() };
+    let b = build(verified, t.view(), ITEM, &mut subst, &w, heap()).unwrap();
+    // arr = [10, 20, 30, 40]; subslice [1..-1] = [20, 30]; [-1] = 30, [0] = 20 -> 30 + 20 = 50!
+    let out = run_in(b.func.view(), &[], 1000, heap()).unwrap();
+    assert_eq!(returned(out), [Val::Int(50)]);
+}

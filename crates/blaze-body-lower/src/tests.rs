@@ -686,3 +686,238 @@ fn structural_union_inject_widen_and_match_patterns() {
     assert!(text.contains("discr "), "union widening and matching emit Value::Discriminant:\n{text}");
     assert!(text.contains("#0.0"), "union downcast + payload field projection emitted:\n{text}");
 }
+
+/// Facts world that answers integer pattern literals and enum/union metadata for lowering tests.
+struct RichFacts<'a> {
+    int_pats: &'a [(blaze_typeck::PatId, u128)],
+    enum_key: Option<ItemKey>,
+    union_key: Option<ItemKey>,
+}
+
+impl Facts for RichFacts<'_> {
+    fn regions(&self) -> &dyn blaze_flow_lower::RegionFacts {
+        &blaze_flow_lower::NoRegions
+    }
+    fn region_tys(&self) -> Option<blaze_typeck::PTys<'_>> {
+        None
+    }
+    fn adt_variances(&self, _: ItemKey) -> Option<&[blaze_flow_lower::Variance]> {
+        None
+    }
+    fn implied_bounds(&self) -> Option<(&[(u32, blaze_flow_lower::Region)], &[(blaze_flow_lower::Region, blaze_flow_lower::Region)])> {
+        None
+    }
+    fn constant_initializer(&self) -> bool {
+        false
+    }
+    fn fn_binders(&self) -> bool {
+        true
+    }
+    fn closure_bodies_checked(&self) -> bool {
+        false
+    }
+    fn closure_requirements(&self, _: ExprId) -> &[blaze_flow_lower::Requirement] {
+        &[]
+    }
+    fn async_bodies_checked(&self) -> bool {
+        false
+    }
+    fn is_future(&self, _: blaze_typeck::PTy) -> Option<bool> {
+        None
+    }
+    fn shape(&self, _: ItemKey) -> Option<blaze_flow_lower::Shape<'_>> {
+        None
+    }
+    fn object_trait_lifetimes(&self, _: ItemKey) -> Option<bool> {
+        None
+    }
+    fn call_bounds(&self, _: ItemKey) -> Option<blaze_flow_lower::CallBounds<'_>> {
+        None
+    }
+    fn trait_lifetimes(&self, _: ItemKey) -> Option<u32> {
+        None
+    }
+    fn alias_lifetimes(&self, _: ItemKey, _: Name) -> Option<u32> {
+        None
+    }
+    fn ties(&self, _: ItemKey) -> Option<blaze_flow_lower::Ties<'_>> {
+        None
+    }
+    fn field_param(&self, _: ItemKey, _: u32, _: u32) -> Option<u32> {
+        None
+    }
+    fn field_lead(&self, _: ItemKey, _: u32, _: u32) -> Option<blaze_flow_lower::FieldLead> {
+        None
+    }
+    fn field_regions(&self, _: ItemKey, _: u32, _: u32) -> Option<&[blaze_flow_lower::FieldRegion]> {
+        None
+    }
+    fn copy_args(&self, _: ItemKey) -> Option<&[bool]> {
+        None
+    }
+    fn adt(&self, k: ItemKey) -> Option<AdtFacts> {
+        if self.enum_key == Some(k) {
+            return Some(AdtFacts { copy: true, drop_impl: false, needs_drop: false, lifetimes: 0, union: false, is_enum: true, is_box: false });
+        }
+        if self.union_key == Some(k) {
+            return Some(AdtFacts { copy: true, drop_impl: false, needs_drop: false, lifetimes: 0, union: true, is_enum: false, is_box: false });
+        }
+        Some(AdtFacts { copy: false, drop_impl: false, needs_drop: true, lifetimes: 0, union: false, is_enum: false, is_box: false })
+    }
+    fn callee(&self, _: ItemKey) -> Option<CalleeFacts> {
+        Some(CalleeFacts { writes_lifetimes: false, self_ref: false, c_variadic: false })
+    }
+    fn field(&self, k: ItemKey, _: u32, name: Name) -> Option<u32> {
+        if self.union_key == Some(k) {
+            if name == Name::of("a") {
+                return Some(0);
+            }
+            if name == Name::of("b") {
+                return Some(1);
+            }
+        }
+        None
+    }
+    fn field_count(&self, k: ItemKey, _: u32) -> Option<u32> {
+        if self.union_key == Some(k) { Some(2) } else { None }
+    }
+    fn param_copy(&self, _: u32) -> bool {
+        false
+    }
+}
+
+impl BodyFacts for RichFacts<'_> {
+    fn int_pat(&self, p: blaze_typeck::PatId) -> Option<u128> {
+        self.int_pats.iter().find(|(k, _)| *k == p).map(|(_, v)| *v)
+    }
+    fn trait_item(&self, _: ItemKey) -> Option<bool> {
+        Some(false)
+    }
+    fn pointer_bits(&self) -> Option<u32> {
+        Some(64)
+    }
+}
+
+/// Lowers `let pat = init else { return ..; }`, range patterns (`1..=5`), or-patterns (`6 | 7`),
+/// slice/array patterns (`let [first, .., last] = [x, 10, 20];`), destructuring tuple swap
+/// (`(first, last) = (last, first);`), and verifies the resulting `blaze-body`.
+#[test]
+fn let_else_range_or_slice_and_destructuring_assign_lower_and_verify() {
+    use blaze_typeck::{
+        Arm, BindAnn, IntSuffix, List, Lit, PNode, Pat, PatId, PortableTys, Range, ScopeId, Stmt, StmtId, UintTy,
+    };
+
+    let mut fx = Fx::new();
+    let u32_t = fx.u32();
+    let owner = fx.func("f", 0, &[u32_t], u32_t, Default::default());
+    fx.finish();
+
+    let body_tys = PortableTys::new_in(heap());
+    let mk_bind = |name: &str, mutable: bool| Pat::Bind {
+        ann: BindAnn { by_ref: None, mutable },
+        name: Name::of(name),
+        sub: None,
+        ty: None,
+    };
+    let lit_u32 = || Pat::Lit(Lit::Int(Some(IntSuffix::Uint(UintTy::U32))));
+    let pats = [
+        mk_bind("x", false),                                            // 0: param x
+        lit_u32(),                                                      // 1: 1u32 (range lo)
+        lit_u32(),                                                      // 2: 5u32 (range hi)
+        Pat::Range { lo: Some(PatId(1)), hi: Some(PatId(2)), inclusive: true }, // 3: 1..=5
+        lit_u32(),                                                      // 4: 6u32
+        lit_u32(),                                                      // 5: 7u32
+        Pat::Or { alts: List { start: 0, len: 2 } },                    // 6: 6 | 7
+        Pat::Wild,                                                      // 7: _
+        lit_u32(),                                                      // 8: 10u32 (let-else pat)
+        mk_bind("first", true),                                         // 9
+        Pat::Wild,                                                      // 10: ..
+        mk_bind("last", true),                                          // 11
+        Pat::Slice { elems: List { start: 2, len: 3 }, rest: Some(1) }, // 12: [first, .., last]
+    ];
+    let pat_lists = [PatId(4), PatId(5), PatId(9), PatId(10), PatId(11)];
+    let mut pat_ranges = blaze_own::Vec::with_capacity_in(pats.len(), heap());
+    for i in 0..pats.len() {
+        let s = u32::try_from(i).unwrap_or(0);
+        pat_ranges.push(Range { start: s, end: s + 1 });
+    }
+    let exprs = [
+        Expr::Local(PatId(0)),                                          // 0: x
+        Expr::Lit(Lit::Int(Some(IntSuffix::Uint(UintTy::U32)))),        // 1: 10u32
+        Expr::Lit(Lit::Int(Some(IntSuffix::Uint(UintTy::U32)))),        // 2: 20u32
+        Expr::Lit(Lit::Int(Some(IntSuffix::Uint(UintTy::U32)))),        // 3: 30u32
+        Expr::Match { scrutinee: ExprId(0), arms: List { start: 0, len: 3 } }, // 4: match x { 1..=5 => 10, 6 | 7 => 20, _ => 30 }
+        Expr::Lit(Lit::Int(Some(IntSuffix::Uint(UintTy::U32)))),        // 5: 99u32
+        Expr::Return { value: Some(ExprId(5)) },                        // 6: return 99u32
+        Expr::Local(PatId(0)),                                          // 7: x
+        Expr::Lit(Lit::Int(Some(IntSuffix::Uint(UintTy::U32)))),        // 8: 100u32
+        Expr::Lit(Lit::Int(Some(IntSuffix::Uint(UintTy::U32)))),        // 9: 200u32
+        Expr::Array { elems: List { start: 0, len: 3 } },               // 10: [x, 100, 200]
+        Expr::Local(PatId(9)),                                          // 11: first
+        Expr::Local(PatId(11)),                                         // 12: last
+        Expr::Assign { lhs: ExprId(11), rhs: ExprId(12) },              // 13: first = last
+        Expr::Local(PatId(9)),                                          // 14: first
+        Expr::Block { stmts: List { start: 0, len: 3 }, tail: Some(ExprId(14)), scope: ScopeId(0) }, // 15
+    ];
+    let expr_lists = [ExprId(7), ExprId(8), ExprId(9)];
+    let mut expr_ranges = blaze_own::Vec::with_capacity_in(exprs.len(), heap());
+    for i in 0..exprs.len() {
+        let s = u32::try_from(i).unwrap_or(0);
+        expr_ranges.push(Range { start: s, end: s + 1 });
+    }
+    let arms = [
+        Arm { pat: PatId(3), guard: None, body: ExprId(1) },
+        Arm { pat: PatId(6), guard: None, body: ExprId(2) },
+        Arm { pat: PatId(7), guard: None, body: ExprId(3) },
+    ];
+    let stmts = [
+        Stmt::Let { pat: PatId(8), ty: None, init: Some(ExprId(4)), else_: Some(ExprId(6)) },
+        Stmt::Let { pat: PatId(12), ty: None, init: Some(ExprId(10)), else_: None },
+        Stmt::Expr { expr: ExprId(13), semi: true },
+    ];
+    let stmt_lists = [StmtId(0), StmtId(1), StmtId(2)];
+    let call_arg_ints = [
+        (ExprId(1), 10),
+        (ExprId(2), 20),
+        (ExprId(3), 30),
+        (ExprId(5), 99),
+        (ExprId(8), 100),
+        (ExprId(9), 200),
+    ];
+    let params = [PatId(0)];
+    let mut bv = empty_body_view(owner, body_tys.view(), ExprId(15));
+    bv.params = &params;
+    bv.pats = &pats;
+    bv.pat_lists = &pat_lists;
+    bv.pat_ranges = &pat_ranges;
+    bv.exprs = &exprs;
+    bv.expr_lists = &expr_lists;
+    bv.expr_ranges = &expr_ranges;
+    bv.arms = &arms;
+    bv.stmts = &stmts;
+    bv.stmt_lists = &stmt_lists;
+    bv.call_arg_ints = &call_arg_ints;
+
+    let mut cx = InferCtx::new_in(heap());
+    let ck = match blaze_typeck::check(&bv, &fx, &mut cx, &Needs::new_in(heap()), heap()) {
+        Ok(Outcome::Done(c)) => {
+            assert!(c.diags.is_empty(), "fixture type-checks clean: {:?}", c.diags);
+            c
+        }
+        Ok(Outcome::Need(n)) => panic!("world missed {:?}", n.questions),
+        Err(e) => panic!("{e:?}"),
+    };
+    let int_pats = [(PatId(1), 1), (PatId(2), 5), (PatId(4), 6), (PatId(5), 7), (PatId(8), 10)];
+    let facts = RichFacts {
+        int_pats: &int_pats,
+        enum_key: None,
+        union_key: None,
+    };
+    let body = lower(&bv, &ck, &facts, heap()).expect("lowering succeeds");
+    let mut text = blaze_own::String::new_in(heap());
+    blaze_body::print(&body.view(), &mut text).expect("prints");
+    blaze_body::verify(&body).unwrap_or_else(|e| panic!("verify failed: {e:?}\n{text}"));
+    assert!(text.contains("ge(") && text.contains("le("), "range pattern emits ge/le:\n{text}");
+    assert!(text.contains("[-1 of 2]"), "slice pattern emits from_end ConstIndex:\n{text}");
+    let _ = PNode::Bool;
+}

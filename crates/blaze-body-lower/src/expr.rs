@@ -529,13 +529,7 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
         let bt = self.adjusted_ty(base)?;
         let ty = self.expr_ty(e)?;
         let marked = match self.node(bt, At::Expr(base))? {
-            PNode::Adt(k, _) => {
-                let f = self.adt_facts(k, At::Expr(base))?;
-                if f.union {
-                    return self.refuse(Construct::Union, e);
-                }
-                f.drop_impl
-            }
+            PNode::Adt(k, _) => self.adt_facts(k, At::Expr(base))?.drop_impl,
             _ => false,
         };
         let bp = self.place(base)?;
@@ -617,7 +611,13 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
                 let Some(bytes) = facts.str_lit(e) else { return self.refuse(Construct::NoLiteralValue, e) };
                 return Ok(Operand::Const(self.b.new_bytes(bytes, ty)));
             }
-            Lit::CStr => return self.refuse(Construct::CStr, e),
+            Lit::CStr => {
+                let Some(bytes) = facts.str_lit(e) else { return self.refuse(Construct::NoLiteralValue, e) };
+                let mut nul = Vec::with_capacity_in(bytes.len() + 1, self.alloc);
+                nul.extend_from_slice(bytes);
+                nul.push(0);
+                return Ok(Operand::Const(self.b.new_bytes(&nul, ty)));
+            }
         };
         Ok(self.scalar(bits, ty))
     }
@@ -1038,7 +1038,9 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
     /// `lhs = rhs`: the value first, then the place (the Reference, "Assignment expressions");
     /// the old value dropped (un-elaborated) before the write, and on that drop's unwind edge
     /// the new value written so the place still owns it. `_ = rhs` evaluates `rhs` as a place
-    /// and reads it, moving nothing.
+    /// and reads it, moving nothing. Destructuring assignment (`(a, b) = rhs`, `[a, b] = rhs`,
+    /// `S { x, y } = rhs`, `S(a, b) = rhs`) evaluates `rhs` into a temporary first, then assigns
+    /// each sub-place in left-to-right order.
     fn assign_expr(&mut self, e: ExprId, lhs: ExprId, rhs: ExprId) -> Result<(), LowerError> {
         let span = self.span(e);
         if let Expr::Underscore = self.expr(lhs)? {
@@ -1047,12 +1049,19 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
             return Ok(());
         }
         if !self.is_place_expr(lhs)? {
-            return self.refuse(Construct::DestructuringAssign, lhs);
+            let rty = self.adjusted_ty(rhs)?;
+            let src = self.place(rhs)?;
+            return self.destructure_assign(lhs, src, rty, span);
         }
         let v = self.operand(rhs)?;
         let ty = self.adjusted_ty(lhs)?;
         let p = self.place(lhs)?;
-        if self.needs_drop(ty, At::Expr(lhs))? {
+        self.write_place_dropping(p, ty, v, At::Expr(lhs), span)
+    }
+
+    /// Drops `p` (if `ty` needs drop, with unwind-safe write-back) and assigns `v` into `p`.
+    fn write_place_dropping(&mut self, p: Place, ty: PTy, v: Operand, at: At, span: Span) -> Result<(), LowerError> {
+        if self.needs_drop(ty, at)? {
             let chain = self.unwind_here();
             let after = self.unwind_block(chain);
             let r = self.b.new_block(BlockKind::Cleanup);
@@ -1063,6 +1072,116 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
         }
         self.b.assign(p, Value::Use(v), span);
         Ok(())
+    }
+
+    /// Destructuring assignment of value place `src` (of type `src_ty`) into assignee expression `lhs`.
+    fn destructure_assign(&mut self, lhs: ExprId, src: Place, src_ty: PTy, span: Span) -> Result<(), LowerError> {
+        self.depth += 1;
+        if self.depth > MOST_DEPTH {
+            return self.refuse(Construct::Depth, lhs);
+        }
+        let r = self.destructure_assign_inner(lhs, src, src_ty, span);
+        self.depth -= 1;
+        r
+    }
+
+    fn destructure_assign_inner(&mut self, lhs: ExprId, src: Place, src_ty: PTy, span: Span) -> Result<(), LowerError> {
+        let at = At::Expr(lhs);
+        match self.expr(lhs)? {
+            Expr::Underscore => {
+                self.b.push(StmtKind::FakeRead(src), span);
+                Ok(())
+            }
+            Expr::Paren(inner) => self.destructure_assign(inner, src, src_ty, span),
+            _ if self.is_place_expr(lhs)? => {
+                let op = if self.is_copy(src_ty, at)? { Operand::Copy(src) } else { Operand::Move(src) };
+                let ty = self.adjusted_ty(lhs)?;
+                let p = self.place(lhs)?;
+                self.write_place_dropping(p, ty, op, at, span)
+            }
+            Expr::Tuple { elems } => {
+                let PNode::Tuple(flist) = self.node(src_ty, at)? else {
+                    return self.refuse(Construct::DestructuringAssign, lhs);
+                };
+                let mut ftys: Vec<PTy, A> = Vec::new_in(self.alloc);
+                ftys.extend_from_slice(self.list(flist, at)?);
+                let ids = self.exprs_in(elems, lhs)?;
+                for (i, &sub) in ids.iter().enumerate() {
+                    let Some(&fty) = ftys.get(i) else { return self.refuse(Construct::Malformed, sub) };
+                    let Ok(idx) = u32::try_from(i) else { return self.refuse(Construct::Malformed, sub) };
+                    let fp = self.b.project(src, Proj::Field { index: idx, ty: fty });
+                    self.destructure_assign(sub, fp, fty, span)?;
+                }
+                Ok(())
+            }
+            Expr::Array { elems } => {
+                let PNode::Array(elem_ty, _) = self.node(src_ty, at)? else {
+                    return self.refuse(Construct::DestructuringAssign, lhs);
+                };
+                let ids = self.exprs_in(elems, lhs)?;
+                let Ok(len) = u32::try_from(ids.len()) else { return self.refuse(Construct::Malformed, lhs) };
+                for (i, &sub) in ids.iter().enumerate() {
+                    let Ok(offset) = u32::try_from(i) else { return self.refuse(Construct::Malformed, sub) };
+                    let ep = self.b.project(src, Proj::ConstIndex { offset, min_length: len, from_end: false });
+                    self.destructure_assign(sub, ep, elem_ty, span)?;
+                }
+                Ok(())
+            }
+            Expr::Call { callee, args } if matches!(self.expr_def(callee), Some(Def::Ctor { .. })) => {
+                let Some(Def::Ctor { adt, variant, .. }) = self.expr_def(callee) else {
+                    return self.refuse(Construct::DestructuringAssign, lhs);
+                };
+                let adt_f = self.adt_facts(adt, at)?;
+                let base = if adt_f.is_enum { self.b.project(src, Proj::Downcast(variant)) } else { src };
+                let ids = self.exprs_in(args, lhs)?;
+                for (i, &sub) in ids.iter().enumerate() {
+                    let fty = self.adjusted_ty(sub)?;
+                    let Ok(index) = u32::try_from(i) else { return self.refuse(Construct::Malformed, sub) };
+                    let fp = self.b.project_marked(base, Proj::Field { index, ty: fty }, adt_f.drop_impl);
+                    self.destructure_assign(sub, fp, fty, span)?;
+                }
+                Ok(())
+            }
+            Expr::Struct { fields, .. } => {
+                let (adt, variant) = match self.expr_def(lhs) {
+                    Some(Def::Ctor { adt, variant, .. }) => (adt, variant),
+                    Some(Def::Adt(k)) => (k, 0),
+                    _ => match self.node(src_ty, at)? {
+                        PNode::Adt(k, _) => (k, 0),
+                        _ => return self.refuse(Construct::DestructuringAssign, lhs),
+                    },
+                };
+                let adt_f = self.adt_facts(adt, at)?;
+                let base = if adt_f.is_enum { self.b.project(src, Proj::Downcast(variant)) } else { src };
+                for fi in self.field_inits_in(fields, lhs)? {
+                    let Some(i) = self.facts.field(adt, variant, fi.name) else {
+                        return self.refuse(Construct::UnknownField, fi.expr);
+                    };
+                    let fty = self.adjusted_ty(fi.expr)?;
+                    let fp = self.b.project_marked(base, Proj::Field { index: i, ty: fty }, adt_f.drop_impl);
+                    self.destructure_assign(fi.expr, fp, fty, span)?;
+                }
+                Ok(())
+            }
+            Expr::Record { fields, .. } => {
+                let PNode::Record(schema, flist) = self.node(src_ty, at)? else {
+                    return self.refuse(Construct::DestructuringAssign, lhs);
+                };
+                let mut ftys: Vec<PTy, A> = Vec::new_in(self.alloc);
+                ftys.extend_from_slice(self.list(flist, at)?);
+                for fi in self.field_inits_in(fields, lhs)? {
+                    let Some(i) = self.tys.record_field_index(schema, fi.name) else {
+                        return self.refuse(Construct::UnknownField, fi.expr);
+                    };
+                    let Ok(ix) = usize::try_from(i) else { return self.refuse(Construct::Malformed, fi.expr) };
+                    let Some(&fty) = ftys.get(ix) else { return self.refuse(Construct::Malformed, fi.expr) };
+                    let fp = self.b.project(src, Proj::Field { index: i, ty: fty });
+                    self.destructure_assign(fi.expr, fp, fty, span)?;
+                }
+                Ok(())
+            }
+            _ => self.refuse(Construct::DestructuringAssign, lhs),
+        }
     }
 
     /// `lhs op= rhs`: of primitives, the value then the place, and the operation's checks; an
@@ -1124,6 +1243,14 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
             return Ok(());
         }
         let intish = |n: PNode| matches!(n, PNode::Int(_) | PNode::Uint(_));
+        if let PNode::Adt(k, _) = fnode
+            && intish(tnode)
+            && self.adt_facts(k, at)?.is_enum
+        {
+            let p = self.place(operand)?;
+            self.b.assign(dest, Value::Discriminant(p), span);
+            return Ok(());
+        }
         let kind = match (fnode, tnode) {
             (PNode::Int(_) | PNode::Uint(_) | PNode::Bool | PNode::Char, PNode::Int(_) | PNode::Uint(_)) => CastKind::IntToInt,
             (PNode::Uint(UintTy::U8), PNode::Char) => CastKind::IntToInt,
@@ -1195,7 +1322,13 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
             },
         };
         if self.adt_facts(adt, at)?.union {
-            return self.refuse(Construct::Union, e);
+            let inits = self.field_inits_in(fields, e)?;
+            let [fi] = inits else { return self.refuse(Construct::Malformed, e) };
+            let Some(i) = self.facts.field(adt, 0, fi.name) else { return self.refuse(Construct::UnknownField, fi.expr) };
+            let o = self.operand(fi.expr)?;
+            let operands = self.b.operands(&[o]);
+            self.b.assign(dest, Value::Aggregate { kind: AggregateKind::Adt(i), ty, operands }, span);
+            return Ok(());
         }
         let Some(n) = self.facts.field_count(adt, variant) else { return self.refuse(Construct::UnknownField, e) };
         let mut slots: Vec<Option<Operand>, A> = Vec::new_in(self.alloc);

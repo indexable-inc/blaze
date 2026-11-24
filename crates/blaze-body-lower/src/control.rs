@@ -82,13 +82,13 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
                 self.close(span)
             }
             Stmt::Let { pat, init, else_, .. } => {
-                if else_.is_some() {
-                    return self.refuse_pat(Construct::LetElse, pat);
-                }
                 if self.is_super_let(s) {
                     return self.refuse_pat(Construct::SuperLet, pat);
                 }
-                self.let_stmt(pat, init)
+                match else_ {
+                    Some(diverge) => self.let_else_stmt(pat, init, diverge),
+                    None => self.let_stmt(pat, init),
+                }
             }
         }
     }
@@ -137,6 +137,38 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
         self.extended = prev;
         self.ext_mark = prev_mark;
         self.close(span)?;
+        self.schedule(&out);
+        Ok(())
+    }
+
+    /// `let pat = init else { diverge };` (the Reference, "Let statements"): `init` is evaluated
+    /// in its statement temporary scope; if `pat` fails to match, the statement's temporaries
+    /// are dropped BEFORE `diverge` runs (and `diverge` cannot return); if `pat` matches, its
+    /// bindings are made, the statement's temporaries are dropped, and the bindings join the
+    /// enclosing block's scope.
+    fn let_else_stmt(&mut self, pat: PatId, init: Option<ExprId>, diverge: ExprId) -> Result<(), LowerError> {
+        let Some(init) = init else {
+            return self.refuse_pat(Construct::Malformed, pat);
+        };
+        let span = self.pat_span(pat);
+        let tm = self.open();
+        let ty = self.adjusted_ty(init)?;
+        let p = self.place(init)?;
+        let eb = self.b.new_block(BlockKind::Normal);
+        let after = self.b.new_block(BlockKind::Normal);
+        self.test_pat(pat, p, ty, eb, init)?;
+        let mut out: Vec<Binding, A> = Vec::new_in(self.alloc);
+        self.bind_pat(pat, p, ty, &mut out)?;
+        self.emit_exit(tm, span)?;
+        self.goto(after, span);
+        self.b.start(eb);
+        self.emit_exit(tm, span)?;
+        self.pop_scope();
+        let else_ty = self.adjusted_ty(diverge)?;
+        let dead = self.scratch(diverge, else_ty);
+        self.lower_into(dead, diverge)?;
+        self.b.terminate(StmtKind::Unreachable, self.span(diverge));
+        self.b.start(after);
         self.schedule(&out);
         Ok(())
     }

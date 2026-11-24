@@ -5,13 +5,15 @@ use blaze_own::Vec;
 use core::alloc::Allocator;
 
 use blaze_body::{AggregateKind, BinOp, CastKind, Const, ConstKind, Local, Operand, Place, Proj, UnOp, Value as BodyValue};
+use blaze_build::data::{DataRecord, DataTarget};
 use blaze_build::intrinsics::{lir, read_discriminant, resize_in};
 use blaze_build::layout::{Fields, Layout, LayoutCx, LayoutId, Variants};
+use blaze_build::vtable::{self, HEADER_WORDS, VtableRef};
 use blaze_build::{Instance, ground};
-use blaze_lir::builder::MemAttrs;
-use blaze_lir::func::{RefKind, SlotKind};
-use blaze_lir::{Flags, FloatCond, IntCond, Op, Ty, Value};
-use blaze_typeck::{AdtKind, PNode, PTy};
+use blaze_lir::builder::{DataReloc, MemAttrs};
+use blaze_lir::func::{BlockKind, RefId, RefKind, SlotKind};
+use blaze_lir::{Flags, FloatCond, IntCond, Op, Scalar, Ty, Value};
+use blaze_typeck::{AdtKind, List, PNode, PTy, UintTy};
 
 use crate::{BuildError, Cx, Held, V};
 
@@ -31,8 +33,8 @@ pub(crate) fn second(l: &Layout) -> i32 {
     (a.prim.size().div_ceil(align) * align) as i32
 }
 
-/// The most elements a `[x; N]` row is written as stores of.
-const REPEAT_CAP: u64 = 4096;
+/// Above this element count, `[x; N]` emits a counted LIR loop instead of unrolled stores.
+const REPEAT_UNROLL_CAP: u64 = 64;
 
 impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
     /// `ty` of the body's table at this instance, in the ground table.
@@ -369,19 +371,94 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                         return Err(self.malformed("an index into a value local"));
                     };
                     let (elem_g, elem, stride) = self.element(g, lay)?;
-                    let k = match (from_end, self.layouts.get(lay).fields) {
-                        (false, _) => u64::from(offset),
-                        (true, Fields::Array { count, .. }) => {
-                            count.checked_sub(u64::from(offset)).ok_or(self.malformed("an index from the end past an array"))?
-                        }
-                        (true, _) => return Err(self.unsupported("a constant index from the end of a slice")),
-                    };
-                    let by = k.checked_mul(stride).and_then(|b| i32::try_from(b).ok()).ok_or(self.malformed("an element past 2 GiB"))?;
-                    at = At::Mem { ptr, off: off + by, lay: elem, meta };
+                    if from_end && matches!(self.node(g)?, PNode::Slice(_)) {
+                        let len = meta.ok_or(self.malformed("a slice index from the end without its length metadata"))?;
+                        let sub = self.b.iconst(Ty::I64, u128::from(offset));
+                        let idx = self.b.binary(Op::Sub, Flags::NONE, len, sub);
+                        let by = self.b.iconst(Ty::I64, u128::from(stride));
+                        let bytes = self.b.binary(Op::Mul, Flags::NONE, idx, by);
+                        let base = self.addr(ptr, off);
+                        let at_elem = self.b.ptr_add(Flags::NONE, base, bytes);
+                        at = At::Mem { ptr: at_elem, off: 0, lay: elem, meta: None };
+                    } else {
+                        let k = match (from_end, self.layouts.get(lay).fields) {
+                            (false, _) => u64::from(offset),
+                            (true, Fields::Array { count, .. }) => {
+                                count.checked_sub(u64::from(offset)).ok_or(self.malformed("an index from the end past an array"))?
+                            }
+                            (true, _) => return Err(self.malformed("a slice index from the end without its length metadata")),
+                        };
+                        let by = k.checked_mul(stride).and_then(|b| i32::try_from(b).ok()).ok_or(self.malformed("an element past 2 GiB"))?;
+                        at = At::Mem { ptr, off: off + by, lay: elem, meta: None };
+                    }
                     (g, lay) = (elem_g, elem);
                 }
-                Proj::DerefBox => return Err(self.unsupported("a dereference of a `Box`")),
-                Proj::Subslice { .. } => return Err(self.unsupported("a subslice place")),
+                Proj::DerefBox => {
+                    let pointee = match self.node(g)? {
+                        PNode::Adt(_, args) => {
+                            let list = self.subst.ground.view().list(args).map_err(|_| self.malformed("a Box's arguments past the ground table"))?;
+                            *list.first().ok_or(self.malformed("a Box without its element type argument"))?
+                        }
+                        _ => return Err(self.malformed("a `DerefBox` of a type that is not an ADT")),
+                    };
+                    let plain = self.layout(pointee)?;
+                    let ptr_ty = self.subst.ground.intern(PNode::Ptr(blaze_typeck::Mutbl::Mut, pointee))
+                        .map_err(|_| self.malformed("the ground table is full"))?;
+                    let ptr_lay = self.layout(ptr_ty)?;
+                    let x = match at {
+                        At::Val(x) => x,
+                        At::Mem { ptr, off, .. } => self.load_at(ptr, off, ptr_lay)?,
+                    };
+                    at = match x {
+                        V::One(p) => At::Mem { ptr: p, off: 0, lay: plain, meta: None },
+                        V::Two(p, m) => At::Mem { ptr: p, off: 0, lay: plain, meta: Some(m) },
+                        V::None | V::Mem { .. } => return Err(self.malformed("a `Box` dereference of a value that is not a pointer")),
+                    };
+                    (g, lay) = (pointee, plain);
+                }
+                Proj::Subslice { from, to, from_end } => {
+                    let At::Mem { ptr, off, meta, .. } = at else {
+                        return Err(self.malformed("a subslice of a value local"));
+                    };
+                    let (elem_g, _, stride) = self.element(g, lay)?;
+                    let start_by = u64::from(from)
+                        .checked_mul(stride)
+                        .and_then(|b| i32::try_from(b).ok())
+                        .ok_or(self.malformed("a subslice start past 2 GiB"))?;
+                    match self.node(g)? {
+                        PNode::Array(_, len_ty) => {
+                            let n = u64::try_from(self.const_bits(len_ty)?).map_err(|_| self.malformed("an array length past u64"))?;
+                            let sub_len = if from_end {
+                                n.checked_sub(u64::from(from) + u64::from(to))
+                            } else {
+                                u64::from(to).checked_sub(u64::from(from))
+                            }
+                            .ok_or(self.malformed("a subslice range past its array"))?;
+                            let usize_ty = self.subst.ground.intern(PNode::Uint(UintTy::Usize))
+                                .map_err(|_| self.malformed("the ground table is full"))?;
+                            let len_val = self.subst.ground.intern(PNode::ConstValue { ty: usize_ty, bits: u128::from(sub_len) })
+                                .map_err(|_| self.malformed("the ground table is full"))?;
+                            let sub_g = self.subst.ground.intern(PNode::Array(elem_g, len_val))
+                                .map_err(|_| self.malformed("the ground table is full"))?;
+                            let sub_lay = self.layout(sub_g)?;
+                            at = At::Mem { ptr, off: off + start_by, lay: sub_lay, meta: None };
+                            (g, lay) = (sub_g, sub_lay);
+                        }
+                        PNode::Slice(_) => {
+                            let len = meta.ok_or(self.malformed("a subslice of a slice without its length metadata"))?;
+                            let new_len = if from_end {
+                                let trim = self.b.iconst(Ty::I64, u128::from(u64::from(from) + u64::from(to)));
+                                self.b.binary(Op::Sub, Flags::NONE, len, trim)
+                            } else {
+                                let sub_len = u64::from(to).checked_sub(u64::from(from))
+                                    .ok_or(self.malformed("a subslice with `to < from`"))?;
+                                self.b.iconst(Ty::I64, u128::from(sub_len))
+                            };
+                            at = At::Mem { ptr, off: off + start_by, lay, meta: Some(new_len) };
+                        }
+                        _ => return Err(self.malformed("a subslice of a type that is not an array or slice")),
+                    }
+                }
             }
         }
         Ok((at, g))
@@ -444,6 +521,147 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
         }
     }
 
+    /// A scalar LIR constant of `ty` whose bits are `value` (little-endian): integers, floats,
+    /// and exposed-provenance pointers (`0` -> `null`, non-zero -> `from_exposed`).
+    pub(crate) fn const_scalar(&mut self, ty: Ty, value: u128) -> Result<Value, BuildError> {
+        if !ty.is_scalar() {
+            return Err(self.malformed("a scalar constant of a type with no constant form"));
+        }
+        match ty.elem() {
+            Scalar::I1 | Scalar::I8 | Scalar::I16 | Scalar::I32 | Scalar::I64 | Scalar::I128 => {
+                Ok(self.b.iconst(ty, value))
+            }
+            Scalar::Ptr => {
+                if value == 0 {
+                    return Ok(self.b.null());
+                }
+                if value > u128::from(u64::MAX) {
+                    return Err(self.malformed("a pointer constant's address past 64 bits"));
+                }
+                let address = self.b.iconst(Ty::I64, value);
+                Ok(self.b.convert(Op::FromExposed, Flags::NONE, Ty::PTR, address))
+            }
+            Scalar::F16 | Scalar::F32 | Scalar::F64 | Scalar::F128 => Ok(self.b.fconst(ty, value)),
+            Scalar::None => Err(self.malformed("a scalar constant of a type with no constant form")),
+        }
+    }
+
+    /// Materializes every allocation of `record` as a LIR data row (targets before referrers),
+    /// resolving Local, Static, Fn, and Vtable relocations, and returns the root's address.
+    fn data_rows<DA: Allocator>(&mut self, record: &DataRecord<DA>) -> Result<Value, BuildError> {
+        const TODO: u8 = 0;
+        const OPEN: u8 = 1;
+        let stmt = self.row()?;
+        let n = record.allocs.len();
+        let mut state: Vec<u8, A> = Vec::with_capacity_in(n, self.alloc);
+        state.resize(n, TODO);
+        let mut rows: Vec<Option<RefId>, A> = Vec::with_capacity_in(n, self.alloc);
+        rows.resize(n, None);
+        let mut stack: Vec<usize, A> = Vec::new_in(self.alloc);
+        stack.push(0usize);
+        let mut relocs: Vec<DataReloc, A> = Vec::new_in(self.alloc);
+        while let Some(&k) = stack.last() {
+            if rows.get(k).copied().flatten().is_some() {
+                stack.pop();
+                continue;
+            }
+            let a = record.allocs.get(k).ok_or(self.malformed("a const allocation index past its record"))?;
+            if state.get(k).copied() == Some(TODO) {
+                if let Some(slot) = state.get_mut(k) {
+                    *slot = OPEN;
+                }
+                for r in a.relocs.iter() {
+                    if let DataTarget::Local(t) = r.target {
+                        let t = usize::try_from(t).map_err(|_| self.malformed("a const allocation index past usize"))?;
+                        match (rows.get(t), state.get(t)) {
+                            (Some(Some(_)), _) => {}
+                            (Some(None), Some(&OPEN)) => {
+                                return Err(self.unsupported("a const whose allocations point at each other in a cycle"));
+                            }
+                            (Some(None), _) => stack.push(t),
+                            (None, _) => return Err(self.malformed("a const's relocation to an allocation past its record")),
+                        }
+                    }
+                }
+                continue;
+            }
+            relocs.clear();
+            for r in a.relocs.iter() {
+                let off = usize::try_from(r.offset).map_err(|_| self.malformed("a const relocation offset past usize"))?;
+                let word = a.bytes.get(off..off + 8).ok_or(self.malformed("a const's relocation past its bytes"))?;
+                let addend = i64::from_le_bytes(word.try_into().map_err(|_| self.malformed("a relocation word not of 8 bytes"))?);
+                let target = match r.target {
+                    DataTarget::Local(t) => {
+                        let ti = usize::try_from(t).map_err(|_| self.malformed("a const allocation index past usize"))?;
+                        rows.get(ti).copied().flatten().ok_or(self.malformed("a const's row made before its target"))?
+                    }
+                    DataTarget::Static(s) => self.static_ref(s),
+                    DataTarget::Fn(key) => {
+                        let instance = self.adts.const_fn_instance(key, self.subst.ground).ok_or(BuildError::NoConstFnInstance { stmt, key })?;
+                        self.func_ref(instance)
+                    }
+                    DataTarget::Vtable(key) => {
+                        let vt = self.adts.const_vtable_ref(key, self.subst.ground).ok_or(BuildError::NoConstVtable { stmt, key })?;
+                        self.vtable_ref(vt)
+                    }
+                };
+                relocs.push(DataReloc { offset: r.offset, target, addend });
+            }
+            if a.mutable {
+                return Err(self.unsupported("a const with a mutable allocation"));
+            }
+            let mut bytes: Vec<u8, A> = Vec::with_capacity_in(a.bytes.len(), self.alloc);
+            bytes.extend_from_slice(&a.bytes);
+            for r in relocs.iter() {
+                let start = usize::try_from(r.offset).map_err(|_| self.malformed("a const relocation offset past usize"))?;
+                if let Some(slice) = bytes.get_mut(start..start + 8) {
+                    slice.fill(0);
+                }
+            }
+            let row = self.b.data(&bytes, u32::from(a.align), &relocs);
+            if let Some(slot) = rows.get_mut(k) {
+                *slot = Some(row);
+            }
+            stack.pop();
+        }
+        let root = rows.first().copied().flatten().ok_or(self.malformed("a const's root row not made"))?;
+        Ok(self.b.data_addr(root))
+    }
+
+    /// Reads an evaluated `DataRecord` as a value of layout `lay`.
+    fn const_record_value<DA: Allocator>(&mut self, lay: LayoutId, record: &DataRecord<DA>) -> Result<V, BuildError> {
+        record.check().map_err(|_| self.malformed("a const's record that breaks the data form"))?;
+        let l = *self.layouts.get(lay);
+        if l.is_zst() {
+            return Ok(V::None);
+        }
+        let root = record.allocs.first().ok_or(self.malformed("a const's record with no allocation"))?;
+        if let Some(s) = l.scalar
+            && root.relocs.is_empty()
+        {
+            let ty = lir(s.prim).0;
+            let width = usize::try_from(ty.bits(crate::PTR_BITS) / 8).map_err(|_| self.malformed("a scalar width past usize"))?;
+            let bytes = root.bytes.get(..width).ok_or(self.malformed("a const's bytes shorter than its type"))?;
+            let mut bits = 0u128;
+            for (i, &byte) in bytes.iter().enumerate() {
+                bits |= u128::from(byte) << (8 * i);
+            }
+            return Ok(V::One(self.const_scalar(ty, bits)?));
+        }
+        let at = self.data_rows(record)?;
+        self.load_at(at, 0, lay)
+    }
+
+    /// The scalar bits of a const generic parameter `idx` from `subst.args`.
+    fn const_param_bits(&self, idx: u32) -> Result<u128, BuildError> {
+        let i = usize::try_from(idx).map_err(|_| self.malformed("a const parameter index past usize"))?;
+        let g = *self.subst.args.get(i).ok_or(self.malformed("a const parameter past the instance's arguments"))?;
+        match self.node(g)? {
+            PNode::ConstValue { bits, .. } => Ok(bits),
+            _ => Err(self.malformed("a const parameter's argument that is not a value in the ground table")),
+        }
+    }
+
     /// Constant `c` and its ground type.
     fn constant(&mut self, c: Const) -> Result<(V, PTy), BuildError> {
         let decl = self.v.konst(c);
@@ -456,8 +674,7 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                     V::None
                 } else if let Some(s) = l.scalar {
                     let ty = lir(s.prim).0;
-                    let v = if ty.is_float() { self.b.fconst(ty, bits) } else { self.b.iconst(ty, bits) };
-                    V::One(v)
+                    V::One(self.const_scalar(ty, bits)?)
                 } else {
                     return Err(self.unsupported("a scalar constant of a type that is not one scalar"));
                 }
@@ -475,14 +692,41 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                 }
             }
             ConstKind::FnItem { .. } => return Err(self.malformed("a fn item constant of a sized type")),
-            ConstKind::Item { .. } => return Err(self.unsupported("a constant item's value (the evaluator's record)")),
+            ConstKind::Item { key, args } => {
+                let stmt = self.row()?;
+                let from = self.from;
+                let v = self.v;
+                let tys = v.ty_list(&from, args).map_err(|_| self.malformed("a constant's arguments past the body's tables"))?;
+                let mut ground_args: Vec<PTy, A> = Vec::with_capacity_in(tys.len(), self.alloc);
+                for t in tys.iter() {
+                    ground_args.push(self.ground(t)?);
+                }
+                let record = self.adts.const_value(key, &ground_args).ok_or(BuildError::NoConstValue { stmt, item: key })?;
+                self.const_record_value(lay, record)?
+            }
             ConstKind::Promoted(_) => return Err(self.unsupported("a promoted constant")),
             ConstKind::StaticAddr(item) => {
                 let r = self.static_ref(item);
                 V::One(self.b.data_addr(r))
             }
-            ConstKind::Anon(_) => return Err(self.unsupported("an anonymous constant (a const block)")),
-            ConstKind::Param(_) => return Err(self.unsupported("a const generic parameter's value")),
+            ConstKind::Anon(expr) => {
+                let stmt = self.row()?;
+                let record = self.adts.const_block_value(self.item, expr, self.subst.args).ok_or(BuildError::NoConstBlock { stmt, expr })?;
+                self.const_record_value(lay, record)?
+            }
+            ConstKind::Param(idx) => {
+                let bits = self.const_param_bits(idx)?;
+                if l.is_zst() {
+                    V::None
+                } else if let Some(s) = l.scalar {
+                    let ty = lir(s.prim).0;
+                    let width = ty.bits(crate::PTR_BITS);
+                    let masked = if width >= 128 { bits } else { bits & ((1u128 << width) - 1) };
+                    V::One(self.const_scalar(ty, masked)?)
+                } else {
+                    return Err(self.unsupported("a const generic parameter of a non-scalar type"));
+                }
+            }
         };
         Ok((x, g))
     }
@@ -514,7 +758,10 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
 
     /// Writes the fields `fields` (index, value, the value's layout) of variant `variant` of
     /// `dest`, whose layout is `lay`, and its tag.
-    fn write_fields(&mut self, dest: Place, lay: LayoutId, variant: Option<u32>, fields: &[(u32, V, LayoutId)]) -> Result<(), BuildError> {
+    pub(crate) fn write_fields(&mut self, dest: Place, lay: LayoutId, variant: Option<u32>, fields: &[(u32, V, LayoutId)]) -> Result<(), BuildError> {
+        if self.layouts.get(lay).is_zst() {
+            return Ok(());
+        }
         let row = self.v.place(dest);
         let value_local = row.depth == 0 && self.held.get(self.ix(row.local)?).is_some_and(|h| h.is_value());
         if value_local {
@@ -629,14 +876,20 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                 let elem = self.layout(g)?;
                 let n = match self.v.konst(count).kind {
                     ConstKind::Scalar { bits } => bits,
-                    _ => return Err(self.unsupported("a repeat count that is not a scalar constant")),
+                    ConstKind::Param(idx) => self.const_param_bits(idx)?,
+                    _ => return Err(self.unsupported("a repeat count that is not a scalar or param constant")),
                 };
-                let n = u64::try_from(n).ok().filter(|&n| n <= REPEAT_CAP).ok_or(self.unsupported("a repeat of more than 4096 elements"))?;
-                let mut fields: Vec<(u32, V, LayoutId), A> = Vec::with_capacity_in(n as usize, self.alloc);
-                for i in 0..n as u32 {
-                    fields.push((i, x, elem));
+                let n = u64::try_from(n).map_err(|_| self.malformed("a repeat count past u64"))?;
+                if n <= REPEAT_UNROLL_CAP {
+                    let count_usize = usize::try_from(n).unwrap_or(0);
+                    let count_u32 = u32::try_from(n).unwrap_or(0);
+                    let mut fields: Vec<(u32, V, LayoutId), A> = Vec::with_capacity_in(count_usize, self.alloc);
+                    for i in 0..count_u32 {
+                        fields.push((i, x, elem));
+                    }
+                    return self.write_fields(dest, dlay, None, &fields);
                 }
-                return self.write_fields(dest, dlay, None, &fields);
+                return self.repeat_loop(dest, dlay, x, elem, n);
             }
             BodyValue::Len(place) => {
                 let (at, g) = self.resolve(place)?;
@@ -685,6 +938,47 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
             },
         };
         self.write(dest, x, dlay)
+    }
+
+    /// Emits a counted LIR loop storing `x` (of layout `elem`) `n` times into `dest` (of layout
+    /// `dlay`), used for large `[x; N]` repeats without bloating code size or capping `N`.
+    fn repeat_loop(&mut self, dest: Place, dlay: LayoutId, x: V, elem: LayoutId, n: u64) -> Result<(), BuildError> {
+        let dl = *self.layouts.get(dlay);
+        if dl.is_zst() || n == 0 {
+            return Ok(());
+        }
+        let stride = match dl.fields {
+            Fields::Array { stride, .. } => stride,
+            _ => self.layouts.get(elem).size,
+        };
+        let (ptr, off) = match self.v.place(dest).depth {
+            0 => (self.base(self.v.place(dest).local)?, 0),
+            _ => match self.resolve(dest)?.0 {
+                At::Mem { ptr, off, .. } => (ptr, off),
+                At::Val(_) => return Err(self.malformed("a large repeat into a value local")),
+            },
+        };
+        let base = self.addr(ptr, off);
+        let head = self.b.create_block(BlockKind::Normal);
+        let body = self.b.create_block(BlockKind::Normal);
+        let done = self.b.create_block(BlockKind::Normal);
+        let zero = self.b.iconst(Ty::I64, 0);
+        let limit = self.b.iconst(Ty::I64, u128::from(n));
+        let stride_val = self.b.iconst(Ty::I64, u128::from(stride));
+        let one = self.b.iconst(Ty::I64, 1);
+        self.b.jump((head, &[zero]));
+        self.b.begin(head);
+        let idx = self.b.param(Ty::I64);
+        let cond = self.b.icmp(IntCond::Ult, idx, limit);
+        self.b.br(Flags::NONE, cond, (body, &[]), (done, &[]));
+        self.b.begin(body);
+        let byte_off = self.b.binary(Op::Mul, Flags::NONE, idx, stride_val);
+        let dst_elem = self.b.ptr_add(Flags::NONE, base, byte_off);
+        self.store_v(dst_elem, 0, elem, x)?;
+        let next = self.b.binary(Op::Add, Flags::NONE, idx, one);
+        self.b.jump((head, &[next]));
+        self.b.begin(done);
+        Ok(())
     }
 
     /// The layout of place `p`'s type.
@@ -891,26 +1185,23 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                 let x = self.scalar(a)?;
                 V::One(self.b.convert(Op::FromExposed, Flags::NONE, Ty::PTR, x))
             }
-            CastKind::Transmute => match a {
-                V::One(x) => {
-                    let ty = target(self)?;
-                    if self.b.ty(x) == ty { V::One(x) } else { V::One(self.b.convert(Op::Bitcast, Flags::NONE, ty, x)) }
+            CastKind::Transmute => {
+                let flay = self.layout(g)?;
+                let fl = *self.layouts.get(flay);
+                if fl.size != tl.size {
+                    return Err(self.malformed("a transmute between types of different sizes"));
                 }
-                _ => return Err(self.unsupported("a transmute of a value that is not one scalar")),
-            },
-            CastKind::Unsize => {
-                // `&[T; N]` to `&[T]`: the length joins the address.
-                let pointee = match self.node(g)? {
-                    PNode::Ref(_, t) | PNode::Ptr(_, t) => t,
-                    _ => return Err(self.unsupported("an unsizing of a value that is not a reference or raw pointer")),
-                };
-                let PNode::Array(_, len) = self.node(pointee)? else {
-                    return Err(self.unsupported("an unsizing to a trait object"));
-                };
-                let n = self.const_bits(len)?;
-                let x = self.scalar(a)?;
-                V::Two(x, self.b.iconst(Ty::I64, n))
+                if tl.is_zst() {
+                    V::None
+                } else if let (V::One(x), Some(s)) = (a, tl.scalar) {
+                    let ty = lir(s.prim).0;
+                    if self.b.ty(x) == ty { V::One(x) } else { V::One(self.b.convert(Op::Bitcast, Flags::NONE, ty, x)) }
+                } else {
+                    let (ptr, off) = self.in_memory(a, flay)?;
+                    self.load_at(ptr, off, tlay)?
+                }
             }
+            CastKind::Unsize => self.unsize(a, g, to)?,
             CastKind::ReifyFnPointer => {
                 let PNode::FnDef(item, args) = self.node(g)? else {
                     return Err(self.malformed("a fn pointer made from a value that is not a fn item"));
@@ -949,6 +1240,7 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
 
     /// `kind ty (operands)` written field by field into `dest`.
     fn aggregate(&mut self, dest: Place, kind: AggregateKind, ty: PTy, operands: blaze_body::Ops, dlay: LayoutId) -> Result<(), BuildError> {
+        let mut is_union = false;
         let variant = match kind {
             AggregateKind::Tuple | AggregateKind::Array | AggregateKind::Closure => None,
             AggregateKind::Adt(v) => {
@@ -956,24 +1248,167 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                 if let PNode::Adt(key, _) = self.node(g)?
                     && self.adts.adt(key).is_some_and(|adt| adt.kind == AdtKind::Union)
                 {
-                    return Err(self.unsupported("a union built from its field"));
+                    is_union = true;
+                    None
+                } else {
+                    Some(v)
                 }
-                Some(v)
             }
             AggregateKind::Coroutine => return Err(self.unsupported("a coroutine built from its upvars")),
         };
-        let mut fields: Vec<(u32, V, LayoutId), A> = Vec::with_capacity_in(operands.len() as usize, self.alloc);
         let ops: Vec<Operand, A> = {
             let mut out = Vec::with_capacity_in(operands.len() as usize, self.alloc);
             out.extend(self.v.ops(operands));
             out
         };
+        if is_union {
+            let Some(&o) = ops.first() else {
+                return Err(self.malformed("a union aggregate without its active field operand"));
+            };
+            let (x, g) = self.operand(o)?;
+            let flay = self.layout(g)?;
+            let (ptr, off) = match self.v.place(dest).depth {
+                0 => (self.base(self.v.place(dest).local)?, 0),
+                _ => match self.resolve(dest)?.0 {
+                    At::Mem { ptr, off, .. } => (ptr, off),
+                    At::Val(_) => return Err(self.malformed("a union written to a value local")),
+                },
+            };
+            return self.store_v(ptr, off, flay, x);
+        }
+        let mut fields: Vec<(u32, V, LayoutId), A> = Vec::with_capacity_in(ops.len(), self.alloc);
         for (i, &o) in ops.iter().enumerate() {
             let (x, g) = self.operand(o)?;
             let flay = self.layout(g)?;
             fields.push((i as u32, x, flay));
         }
         self.write_fields(dest, dlay, variant, &fields)
+    }
+
+    /// The principal trait of ground trait object `t` and its arguments after `Self`, `None` for
+    /// auto-trait-only `dyn Send`.
+    pub(crate) fn principal(&self, t: PTy) -> Result<Option<(blaze_typeck::ItemKey, List)>, BuildError> {
+        let view = self.subst.ground.view();
+        let PNode::Dynamic(l) = view.node(t).map_err(|_| self.malformed("a type past the ground table"))? else {
+            return Err(self.malformed("a trait object's principal asked of another type"));
+        };
+        let preds = view.list(l).map_err(|_| self.malformed("a trait object's predicates past the ground table"))?;
+        let Some(&first) = preds.first() else {
+            return Err(self.unsupported("a trait object with no predicates"));
+        };
+        Ok(match view.node(first).map_err(|_| self.malformed("a type past the ground table"))? {
+            PNode::ExTrait(k, args) => Some((k, args)),
+            _ => None,
+        })
+    }
+
+    /// Unsizes reference/raw-pointer value `a` of ground type `from_ty` to `to_ty`:
+    /// `&[T; N] -> &[T]`, `&T -> &dyn Tr`, `&dyn Sub -> &dyn Super`, and struct-tail unsizing.
+    fn unsize(&mut self, a: V, from_ty: PTy, to_ty: PTy) -> Result<V, BuildError> {
+        let pointee_of = |cx: &Self, ty: PTy| match cx.node(ty)? {
+            PNode::Ref(_, t) | PNode::Ptr(_, t) => Ok(t),
+            _ => Err(cx.unsupported("an unsizing of a value that is not a reference or raw pointer")),
+        };
+        let mut f = pointee_of(self, from_ty)?;
+        let mut t = pointee_of(self, to_ty)?;
+        // Peel matching struct tails (`S<[T; N]>` -> `S<[T]>`, `S<T>` -> `S<dyn Tr>`).
+        for _ in 0..16 {
+            if f == t {
+                break;
+            }
+            let (PNode::Adt(k1, lf), PNode::Adt(k2, lt)) = (self.node(f)?, self.node(t)?) else {
+                break;
+            };
+            if k1 != k2 {
+                break;
+            }
+            let Some(adt) = self.adts.adt(k1) else {
+                return Err(self.malformed("an ADT without its definition during unsizing"));
+            };
+            if adt.kind != AdtKind::Struct || adt.variants.len() != 1 {
+                return Err(self.unsupported("an unsizing of a non-struct ADT tail"));
+            }
+            let Some(fields) = adt.fields.get(adt.variants[0].fields.range()) else {
+                return Err(self.malformed("an ADT's fields past their column"));
+            };
+            let Some(last) = fields.last() else {
+                return Err(self.unsupported("an unsizing of an empty struct"));
+            };
+            let (types, last_ty) = (adt.types, last.ty);
+            let mut args_f: Vec<PTy, A> = Vec::new_in(self.alloc);
+            args_f.extend_from_slice(self.subst.ground.view().list(lf).map_err(|_| self.malformed("a struct's arguments past the ground table"))?);
+            let next_f = ground(types, last_ty, &args_f, self.subst.ground, self.subst.scratch, self.adts.facts()).map_err(|e| self.facts(e))?;
+            let mut args_t: Vec<PTy, A> = Vec::new_in(self.alloc);
+            args_t.extend_from_slice(self.subst.ground.view().list(lt).map_err(|_| self.malformed("a struct's arguments past the ground table"))?);
+            let next_t = ground(types, last_ty, &args_t, self.subst.ground, self.subst.scratch, self.adts.facts()).map_err(|e| self.facts(e))?;
+            f = next_f;
+            t = next_t;
+        }
+        let (data, old_meta) = match a {
+            V::One(p) => (p, None),
+            V::Two(p, m) => (p, Some(m)),
+            V::Mem { ptr, off, lay } => match self.load_at(ptr, off, lay)? {
+                V::One(p) => (p, None),
+                V::Two(p, m) => (p, Some(m)),
+                _ => return Err(self.malformed("an unsized pointer operand that is not a pointer")),
+            },
+            V::None => return Err(self.malformed("an unsizing of a zero-sized value")),
+        };
+        let meta = match (self.node(f)?, self.node(t)?, old_meta) {
+            (PNode::Array(_, len), PNode::Slice(_), None) => {
+                let n = self.const_bits(len)?;
+                self.b.iconst(Ty::I64, n)
+            }
+            (PNode::Dynamic(_), PNode::Dynamic(_), Some(vt)) => {
+                let (pf, pt) = (self.principal(f)?, self.principal(t)?);
+                match (pf, pt) {
+                    (_, None) => return Err(self.unsupported("an unsizing to a trait object of auto traits alone")),
+                    (Some((a_tr, _)), Some((b_tr, _))) if a_tr == b_tr => vt,
+                    (Some((a_tr, _)), Some((b_tr, _))) => {
+                        let shape = vtable::Shape::of(a_tr, |tr| self.adts.object_trait(tr), self.subst.scratch)
+                            .map_err(|error| BuildError::Vtable { stmt: self.stmt, error })?;
+                        match shape.upcast(b_tr) {
+                            Some(vtable::Upcast::Prefix) => vt,
+                            Some(vtable::Upcast::Load(slot)) => {
+                                let off = 8 * (HEADER_WORDS + slot);
+                                let off = i32::try_from(off).map_err(|_| self.malformed("a vtable slot past 2^31 bytes"))?;
+                                self.b.load(Ty::PTR, Flags::NONE, vt, off, MemAttrs::aligned(3))
+                            }
+                            None => return Err(self.malformed("an upcast to a trait that is not a supertrait")),
+                        }
+                    }
+                    (None, Some(_)) => return Err(self.malformed("an upcast from a trait object without a principal")),
+                }
+            }
+            (_, PNode::Dynamic(_), None) => {
+                let Some((principal, args)) = self.principal(t)? else {
+                    return Err(self.unsupported("an unsizing to a trait object of auto traits alone"));
+                };
+                self.vtable_addr(VtableRef { concrete: f, principal, args })
+            }
+            _ => return Err(self.unsupported("an unsizing coercion of an unsupported shape")),
+        };
+        Ok(V::Two(data, meta))
+    }
+
+    /// The vtable reference of `table`, deduplicated into `Built::vtables`.
+    pub(crate) fn vtable_ref(&mut self, table: VtableRef) -> RefId {
+        if let Some(i) = self.vtables.iter().position(|&t| t == table)
+            && let Some(&r) = self.vtable_ids.get(i)
+        {
+            return r;
+        }
+        let place = u32::try_from(self.vtables.len()).unwrap_or(u32::MAX);
+        let r = self.b.reference(RefKind::Vtable, place);
+        self.vtables.push(table);
+        self.vtable_ids.push(r);
+        r
+    }
+
+    /// The address of `table`: `data_addr` of its `Vtable` reference.
+    pub(crate) fn vtable_addr(&mut self, table: VtableRef) -> Value {
+        let r = self.vtable_ref(table);
+        self.b.data_addr(r)
     }
 
     /// The function reference of `instance`, one per instance.
