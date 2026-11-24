@@ -81,68 +81,158 @@ const ML_CODE_LUT: [u8; 128] = [
     42, 42, 42, 42, 42, 42,
 ];
 
-/// Encode a literal length (`0..=131_071`) into `(ll_code, extra_val, extra_bits)` in O(1).
+const fn pack_seq(code: u32, bits: u32, base: u32) -> u32 {
+    code | (bits << 8) | (base << 16)
+}
+
+/// Packed 32-bit LL encoding table for `0..64`: `code | (bits << 8) | (base << 16)`.
+const LL_ENC_PACKED: [u32; 64] = [
+    pack_seq(0, 0, 0), pack_seq(1, 0, 1), pack_seq(2, 0, 2), pack_seq(3, 0, 3),
+    pack_seq(4, 0, 4), pack_seq(5, 0, 5), pack_seq(6, 0, 6), pack_seq(7, 0, 7),
+    pack_seq(8, 0, 8), pack_seq(9, 0, 9), pack_seq(10, 0, 10), pack_seq(11, 0, 11),
+    pack_seq(12, 0, 12), pack_seq(13, 0, 13), pack_seq(14, 0, 14), pack_seq(15, 0, 15),
+    pack_seq(16, 1, 16), pack_seq(16, 1, 16), pack_seq(17, 1, 18), pack_seq(17, 1, 18),
+    pack_seq(18, 1, 20), pack_seq(18, 1, 20), pack_seq(19, 1, 22), pack_seq(19, 1, 22),
+    pack_seq(20, 2, 24), pack_seq(20, 2, 24), pack_seq(20, 2, 24), pack_seq(20, 2, 24),
+    pack_seq(21, 2, 28), pack_seq(21, 2, 28), pack_seq(21, 2, 28), pack_seq(21, 2, 28),
+    pack_seq(22, 3, 32), pack_seq(22, 3, 32), pack_seq(22, 3, 32), pack_seq(22, 3, 32),
+    pack_seq(22, 3, 32), pack_seq(22, 3, 32), pack_seq(22, 3, 32), pack_seq(22, 3, 32),
+    pack_seq(23, 3, 40), pack_seq(23, 3, 40), pack_seq(23, 3, 40), pack_seq(23, 3, 40),
+    pack_seq(23, 3, 40), pack_seq(23, 3, 40), pack_seq(23, 3, 40), pack_seq(23, 3, 40),
+    pack_seq(24, 4, 48), pack_seq(24, 4, 48), pack_seq(24, 4, 48), pack_seq(24, 4, 48),
+    pack_seq(24, 4, 48), pack_seq(24, 4, 48), pack_seq(24, 4, 48), pack_seq(24, 4, 48),
+    pack_seq(24, 4, 48), pack_seq(24, 4, 48), pack_seq(24, 4, 48), pack_seq(24, 4, 48),
+    pack_seq(24, 4, 48), pack_seq(24, 4, 48), pack_seq(24, 4, 48), pack_seq(24, 4, 48),
+];
+
+/// Packed 32-bit ML encoding table for `match_len - 3` in `0..128`: `code | (bits << 8) | (base << 16)`.
+const ML_ENC_PACKED: [u32; 128] = [
+    pack_seq(0, 0, 3), pack_seq(1, 0, 4), pack_seq(2, 0, 5), pack_seq(3, 0, 6),
+    pack_seq(4, 0, 7), pack_seq(5, 0, 8), pack_seq(6, 0, 9), pack_seq(7, 0, 10),
+    pack_seq(8, 0, 11), pack_seq(9, 0, 12), pack_seq(10, 0, 13), pack_seq(11, 0, 14),
+    pack_seq(12, 0, 15), pack_seq(13, 0, 16), pack_seq(14, 0, 17), pack_seq(15, 0, 18),
+    pack_seq(16, 0, 19), pack_seq(17, 0, 20), pack_seq(18, 0, 21), pack_seq(19, 0, 22),
+    pack_seq(20, 0, 23), pack_seq(21, 0, 24), pack_seq(22, 0, 25), pack_seq(23, 0, 26),
+    pack_seq(24, 0, 27), pack_seq(25, 0, 28), pack_seq(26, 0, 29), pack_seq(27, 0, 30),
+    pack_seq(28, 0, 31), pack_seq(29, 0, 32), pack_seq(30, 0, 33), pack_seq(31, 0, 34),
+    pack_seq(32, 1, 35), pack_seq(32, 1, 35), pack_seq(33, 1, 37), pack_seq(33, 1, 37),
+    pack_seq(34, 1, 39), pack_seq(34, 1, 39), pack_seq(35, 1, 41), pack_seq(35, 1, 41),
+    pack_seq(36, 2, 43), pack_seq(36, 2, 43), pack_seq(36, 2, 43), pack_seq(36, 2, 43),
+    pack_seq(37, 2, 47), pack_seq(37, 2, 47), pack_seq(37, 2, 47), pack_seq(37, 2, 47),
+    pack_seq(38, 3, 51), pack_seq(38, 3, 51), pack_seq(38, 3, 51), pack_seq(38, 3, 51),
+    pack_seq(38, 3, 51), pack_seq(38, 3, 51), pack_seq(38, 3, 51), pack_seq(38, 3, 51),
+    pack_seq(39, 3, 59), pack_seq(39, 3, 59), pack_seq(39, 3, 59), pack_seq(39, 3, 59),
+    pack_seq(39, 3, 59), pack_seq(39, 3, 59), pack_seq(39, 3, 59), pack_seq(39, 3, 59),
+    pack_seq(40, 4, 67), pack_seq(40, 4, 67), pack_seq(40, 4, 67), pack_seq(40, 4, 67),
+    pack_seq(40, 4, 67), pack_seq(40, 4, 67), pack_seq(40, 4, 67), pack_seq(40, 4, 67),
+    pack_seq(40, 4, 67), pack_seq(40, 4, 67), pack_seq(40, 4, 67), pack_seq(40, 4, 67),
+    pack_seq(40, 4, 67), pack_seq(40, 4, 67), pack_seq(40, 4, 67), pack_seq(40, 4, 67),
+    pack_seq(41, 4, 83), pack_seq(41, 4, 83), pack_seq(41, 4, 83), pack_seq(41, 4, 83),
+    pack_seq(41, 4, 83), pack_seq(41, 4, 83), pack_seq(41, 4, 83), pack_seq(41, 4, 83),
+    pack_seq(41, 4, 83), pack_seq(41, 4, 83), pack_seq(41, 4, 83), pack_seq(41, 4, 83),
+    pack_seq(41, 4, 83), pack_seq(41, 4, 83), pack_seq(41, 4, 83), pack_seq(41, 4, 83),
+    pack_seq(42, 5, 99), pack_seq(42, 5, 99), pack_seq(42, 5, 99), pack_seq(42, 5, 99),
+    pack_seq(42, 5, 99), pack_seq(42, 5, 99), pack_seq(42, 5, 99), pack_seq(42, 5, 99),
+    pack_seq(42, 5, 99), pack_seq(42, 5, 99), pack_seq(42, 5, 99), pack_seq(42, 5, 99),
+    pack_seq(42, 5, 99), pack_seq(42, 5, 99), pack_seq(42, 5, 99), pack_seq(42, 5, 99),
+    pack_seq(42, 5, 99), pack_seq(42, 5, 99), pack_seq(42, 5, 99), pack_seq(42, 5, 99),
+    pack_seq(42, 5, 99), pack_seq(42, 5, 99), pack_seq(42, 5, 99), pack_seq(42, 5, 99),
+    pack_seq(42, 5, 99), pack_seq(42, 5, 99), pack_seq(42, 5, 99), pack_seq(42, 5, 99),
+    pack_seq(42, 5, 99), pack_seq(42, 5, 99), pack_seq(42, 5, 99), pack_seq(42, 5, 99),
+];
+
+/// Branchless single-LUT LL encoder for valid `lit_len < 131_072` (no `Option` overhead).
 #[inline(always)]
-pub(crate) fn encode_ll(lit_len: usize) -> Option<(u8, u32, u32)> {
+pub(crate) fn encode_ll_raw(lit_len: u32) -> (u8, u32, u32) {
     if lit_len < 64 {
-        let code = *LL_CODE_LUT.get(lit_len)?;
-        let code_idx = usize::from(code);
-        let base = *LL_BASE.get(code_idx)?;
-        let bits = u32::from(*LL_BITS.get(code_idx)?);
-        let len_u32 = u32::try_from(lit_len).ok()?;
-        return Some((code, len_u32 - base, bits));
+        let idx = usize::try_from(lit_len).unwrap_or(0) & 63;
+        let packed = LL_ENC_PACKED.get(idx).copied().unwrap_or(0);
+        let [code, bits_b, ..] = packed.to_le_bytes();
+        let base = packed >> 16;
+        return (code, lit_len - base, u32::from(bits_b));
     }
-    let len_u32 = u32::try_from(lit_len).ok()?;
-    if len_u32 < 128 {
-        return Some((25, len_u32 - 64, 6));
+    if lit_len < 128 {
+        return (25, lit_len - 64, 6);
     }
-    if len_u32 < 131_072 {
-        let bits = 31u32 - len_u32.leading_zeros();
-        let code = u8::try_from(bits + 19).ok()?;
-        let base = 1u32 << bits;
-        return Some((code, len_u32 - base, bits));
-    }
-    None
+    let bits = 31u32 - lit_len.leading_zeros();
+    let [code, ..] = (bits + 19).to_le_bytes();
+    let base = 1u32 << bits;
+    (code, lit_len - base, bits)
 }
 
-/// Encode a match length (`3..=131_074`) into `(ml_code, extra_val, extra_bits)` in O(1).
+/// Branchless single-LUT ML encoder for valid `match_len in 3..=131_074` (no `Option` overhead).
 #[inline(always)]
-pub(crate) fn encode_ml(match_len: usize) -> Option<(u8, u32, u32)> {
-    let m = match_len.checked_sub(3)?;
+pub(crate) fn encode_ml_raw(match_len: u32) -> (u8, u32, u32) {
+    let m = match_len.saturating_sub(3);
     if m < 128 {
-        let code = *ML_CODE_LUT.get(m)?;
-        let code_idx = usize::from(code);
-        let base = *ML_BASE.get(code_idx)?;
-        let bits = u32::from(*ML_BITS.get(code_idx)?);
-        let len_u32 = u32::try_from(match_len).ok()?;
-        return Some((code, len_u32 - base, bits));
+        let idx = usize::try_from(m).unwrap_or(0) & 127;
+        let packed = ML_ENC_PACKED.get(idx).copied().unwrap_or(0);
+        let [code, bits_b, ..] = packed.to_le_bytes();
+        let base = packed >> 16;
+        return (code, match_len - base, u32::from(bits_b));
     }
-    let m_u32 = u32::try_from(m).ok()?;
-    if m_u32 < 256 {
-        return Some((43, m_u32 - 128, 7));
-    }
-    if m_u32 < 131_072 {
-        let bits = 31u32 - m_u32.leading_zeros();
-        let code = u8::try_from(bits + 36).ok()?;
-        let base = 1u32 << bits;
-        return Some((code, m_u32 - base, bits));
-    }
-    None
+    let bits = 31u32 - m.leading_zeros();
+    let [code, ..] = (bits + 36).to_le_bytes();
+    let base = (1u32 << bits) + 3;
+    (code, match_len - base, bits)
 }
 
-/// Encode an `Offset_Value` (`>= 1`) into `(of_code, extra_val, extra_bits)`.
+/// Branchless OF encoder for valid `offset_value >= 1` (no `Option` overhead).
 #[inline(always)]
-pub(crate) fn encode_of(offset_value: u32) -> Option<(u8, u32, u32)> {
+pub(crate) fn encode_of_raw(offset_value: u32) -> (u8, u32, u32) {
+    let bits = 31u32 - offset_value.leading_zeros();
+    let [code, ..] = bits.to_le_bytes();
+    (code, offset_value - (1u32 << bits), bits)
+}
+
+/// Fast branchless single-LUT LL encoder for `lit_len: u32` (`0..=131_071`).
+#[inline(always)]
+pub(crate) fn encode_ll_fast(lit_len: u32) -> Option<(u8, u32, u32)> {
+    if lit_len >= 131_072 {
+        return None;
+    }
+    Some(encode_ll_raw(lit_len))
+}
+
+/// Fast branchless single-LUT ML encoder for `match_len: u32` (`3..=131_074`).
+#[inline(always)]
+pub(crate) fn encode_ml_fast(match_len: u32) -> Option<(u8, u32, u32)> {
+    if match_len < 3 || match_len >= 131_075 {
+        return None;
+    }
+    Some(encode_ml_raw(match_len))
+}
+
+/// Fast branchless OF encoder for `offset_value: u32` (`>= 1`).
+#[inline(always)]
+pub(crate) fn encode_of_fast(offset_value: u32) -> Option<(u8, u32, u32)> {
     if offset_value == 0 {
         return None;
     }
-    let bits = 31u32 - offset_value.leading_zeros();
-    if bits > 28 {
-        return None;
-    }
-    let code = u8::try_from(bits).ok()?;
-    let extra = offset_value - (1u32 << bits);
-    Some((code, extra, bits))
+    Some(encode_of_raw(offset_value))
+}
+
+/// Encode a literal length (`0..=131_071`) into `(ll_code, extra_val, extra_bits)` in O(1).
+#[cfg(test)]
+#[inline(always)]
+pub(crate) fn encode_ll(lit_len: usize) -> Option<(u8, u32, u32)> {
+    let len_u32 = u32::try_from(lit_len).ok()?;
+    encode_ll_fast(len_u32)
+}
+
+/// Encode a match length (`3..=131_074`) into `(ml_code, extra_val, extra_bits)` in O(1).
+#[cfg(test)]
+#[inline(always)]
+pub(crate) fn encode_ml(match_len: usize) -> Option<(u8, u32, u32)> {
+    let len_u32 = u32::try_from(match_len).ok()?;
+    encode_ml_fast(len_u32)
+}
+
+/// Encode an `Offset_Value` (`>= 1`) into `(of_code, extra_val, extra_bits)`.
+#[cfg(test)]
+#[inline(always)]
+pub(crate) fn encode_of(offset_value: u32) -> Option<(u8, u32, u32)> {
+    encode_of_fast(offset_value)
 }
 
 // ---------------------------------------------------------------------------
@@ -408,44 +498,83 @@ pub(crate) enum SeqKind {
     Ml,
 }
 
-/// Fixed-capacity pre-resolved sequence FSE decoding table (512 entries = 4 KiB in L1D).
-pub(crate) struct SeqDecTable {
-    entries: [SeqDecEntry; MAX_FSE_TABLE_SIZE],
-    accuracy_log: u8,
-    max_extra_bits: u8,
+/// Total flat sequence-table capacity: LL (`0..512`), OF (`512..1024`), ML (`1024..1536`),
+/// padded to power-of-two `2048` so a single base pointer + `& 2047` indexes all three tables.
+pub(crate) const SEQ_TABLES_FLAT_LEN: usize = 2048;
+pub(crate) const SEQ_OF_OFFSET: usize = 512;
+pub(crate) const SEQ_ML_OFFSET: usize = 1024;
+
+/// Contiguous power-of-two flat table holding pre-resolved LL, OF, and ML sequence FSE entries
+/// under a single base pointer register (OF baselines pre-biased by `+512`, ML by `+1024`).
+pub(crate) struct SeqTables {
+    entries: [SeqDecEntry; SEQ_TABLES_FLAT_LEN],
+    ll_log: u8,
+    of_log: u8,
+    ml_log: u8,
+    ll_max_eb: u8,
+    of_max_eb: u8,
+    ml_max_eb: u8,
 }
 
-impl SeqDecTable {
+impl SeqTables {
     pub(crate) const fn new_empty() -> Self {
-        Self { entries: [SeqDecEntry::ZERO; MAX_FSE_TABLE_SIZE], accuracy_log: 0, max_extra_bits: 0 }
+        Self {
+            entries: [SeqDecEntry::ZERO; SEQ_TABLES_FLAT_LEN],
+            ll_log: 0,
+            of_log: 0,
+            ml_log: 0,
+            ll_max_eb: 0,
+            of_max_eb: 0,
+            ml_max_eb: 0,
+        }
     }
 
     #[inline(always)]
-    pub(crate) const fn accuracy_log(&self) -> u8 {
-        self.accuracy_log
+    pub(crate) const fn ll_log(&self) -> u8 {
+        self.ll_log
     }
 
     #[inline(always)]
-    pub(crate) const fn max_extra_bits(&self) -> u8 {
-        self.max_extra_bits
+    pub(crate) const fn of_log(&self) -> u8 {
+        self.of_log
     }
 
     #[inline(always)]
-    pub(crate) fn entry_fast(&self, state: usize) -> SeqDecEntry {
+    pub(crate) const fn ml_log(&self) -> u8 {
+        self.ml_log
+    }
+
+    #[inline(always)]
+    pub(crate) fn max_seq_bits(&self) -> u32 {
+        u32::from(self.ll_max_eb)
+            + u32::from(self.of_max_eb)
+            + u32::from(self.ml_max_eb)
+            + u32::from(self.ll_log)
+            + u32::from(self.of_log)
+            + u32::from(self.ml_log)
+    }
+
+    #[inline(always)]
+    pub(crate) fn entry_flat(&self, state: usize) -> SeqDecEntry {
         self.entries
-            .get(state & (MAX_FSE_TABLE_SIZE - 1))
+            .get(state & (SEQ_TABLES_FLAT_LEN - 1))
             .copied()
             .unwrap_or(SeqDecEntry::ZERO)
     }
 
-    /// Compile an [`FseDecTable`] into pre-resolved [`SeqDecEntry`] values, validating every
-    /// symbol code once up front.
+    /// Compile an [`FseDecTable`] into the corresponding flat slice of `self`, pre-biasing
+    /// `baseline` by `0` (LL), `512` (OF), or `1024` (ML).
     pub(crate) fn compile_from(&mut self, dec: &FseDecTable, kind: SeqKind) -> Result<(), ZstdError> {
         let log = dec.accuracy_log();
         if log > MAX_FSE_LOG {
             return Err(ZstdError::CorruptFse);
         }
         let table_size = 1usize << u32::from(log);
+        let (base_off, bias_u16): (usize, u16) = match kind {
+            SeqKind::Ll => (0, 0),
+            SeqKind::Of => (SEQ_OF_OFFSET, 512),
+            SeqKind::Ml => (SEQ_ML_OFFSET, 1024),
+        };
         let mut max_eb: u8 = 0;
         for state in 0..table_size {
             let e = dec.entry(state).ok_or(ZstdError::CorruptFse)?;
@@ -472,12 +601,25 @@ impl SeqDecTable {
             if extra_bits > max_eb {
                 max_eb = extra_bits;
             }
-            if let Some(slot) = self.entries.get_mut(state) {
-                *slot = SeqDecEntry::new(base, extra_bits, e.num_bits, e.baseline);
+            let biased_bl = e.baseline.checked_add(bias_u16).ok_or(ZstdError::CorruptFse)?;
+            if let Some(slot) = self.entries.get_mut(base_off + state) {
+                *slot = SeqDecEntry::new(base, extra_bits, e.num_bits, biased_bl);
             }
         }
-        self.accuracy_log = log;
-        self.max_extra_bits = max_eb;
+        match kind {
+            SeqKind::Ll => {
+                self.ll_log = log;
+                self.ll_max_eb = max_eb;
+            }
+            SeqKind::Of => {
+                self.of_log = log;
+                self.of_max_eb = max_eb;
+            }
+            SeqKind::Ml => {
+                self.ml_log = log;
+                self.ml_max_eb = max_eb;
+            }
+        }
         Ok(())
     }
 }
@@ -569,16 +711,11 @@ impl FseDecTable {
             for _ in 0..count {
                 let slot = self.entries.get_mut(pos).ok_or(ZstdError::CorruptFse)?;
                 slot.symbol = sym_u8;
-                let mut found = false;
-                for _ in 0..table_size {
+                pos = (pos + step) & table_mask;
+                let mut guard = table_size;
+                while pos >= high_threshold {
+                    guard = guard.checked_sub(1).ok_or(ZstdError::CorruptFse)?;
                     pos = (pos + step) & table_mask;
-                    if pos < high_threshold {
-                        found = true;
-                        break;
-                    }
-                }
-                if !found {
-                    return Err(ZstdError::CorruptFse);
                 }
             }
         }
@@ -940,6 +1077,27 @@ impl FseEncTable {
             return None;
         }
         self.state_table.get(usize::from(m.offset)).copied()
+    }
+
+    /// Branchless O(1) inverse transition when caller guarantees `sym` is present in this table
+    /// (zero `Option`, zero `checked_sub`, masked `& 63` index).
+    #[inline(always)]
+    pub(crate) fn encode_step_fast(&self, sym: u8, target_state: u8) -> (u8, u32, u32) {
+        let m = self
+            .meta
+            .get(usize::from(sym) & (MAX_FSE_SYMBOLS - 1))
+            .copied()
+            .unwrap_or(FseSymMeta::ZERO);
+        let nb = u32::from(m.max_nb).wrapping_sub(u32::from(target_state < m.split));
+        let target = u32::from(target_state);
+        let bits = target & ((1u32 << nb) - 1);
+        let u = (target + u32::from(self.table_size)) >> nb;
+        let idx = usize::from(m.offset)
+            .wrapping_add(usize::try_from(u).unwrap_or(0))
+            .wrapping_sub(usize::from(m.count))
+            & (MAX_ENC_TABLE_SIZE - 1);
+        let prev_state = self.state_table.get(idx).copied().unwrap_or(0);
+        (prev_state, bits, nb)
     }
 
     /// O(1) branch-minimal inverse transition: find the unique `(prev_state, bits_val, num_bits)`
