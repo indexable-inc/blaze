@@ -908,15 +908,23 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
     }
 
     fn impl_header_once(&self, item: ItemKey) -> Fetch<Option<ImplHeader<'_>>> {
-        if let Some(i) = self.store.impls.get(&item) {
+        if let Some((i, provisional)) = self.store.impl_or_provisional(item) {
+            if provisional {
+                self.store.note_provisional_read(item);
+            }
             // An impl of a trait with a fn returning `impl Trait`: that type's value
-            // here is a synthetic associated type's row (super::rpitit).
-            let assoc_types = match i.trait_ {
-                Some(trait_) => match self.rpitit_rows(trait_)? {
-                    Some(rows) => self.rpitit_retry(item, || super::rpitit::impl_assoc(self.store, item, i, rows))?,
+            // here is a synthetic associated type's row (super::rpitit). Skip rpitit
+            // caching while provisional so incomplete assoc types are never cached.
+            let assoc_types = if provisional {
+                &i.assoc[..]
+            } else {
+                match i.trait_ {
+                    Some(trait_) => match self.rpitit_rows(trait_)? {
+                        Some(rows) => self.rpitit_retry(item, || super::rpitit::impl_assoc(self.store, item, i, rows))?,
+                        None => &i.assoc[..],
+                    },
                     None => &i.assoc[..],
-                },
-                None => &i.assoc[..],
+                }
             };
             return Ok(Some(ImplHeader {
                 generics: i.generics,
@@ -945,7 +953,10 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
     }
 
     fn assoc_item_once(&self, container: ItemKey, name: Name) -> Fetch<Option<AssocItem>> {
-        if let Some(i) = self.store.impls.get(&container) {
+        if let Some((i, provisional)) = self.store.impl_or_provisional(container) {
+            if provisional {
+                self.store.note_provisional_read(container);
+            }
             // The fn's `self` from its text (`ImplHead::fn_self`): naming a member makes no
             // signature; `fn_sig` asks for it (`Want::MemberFn`) when the fn is used.
             if let Some(at) = i.fns.iter().position(|(n, _)| *n == name) {
