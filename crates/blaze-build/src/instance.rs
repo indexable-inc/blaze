@@ -303,13 +303,32 @@ pub fn instance_key_normalized(
     facts: &dyn LayoutFacts,
     scratch: Alloc<'_>,
 ) -> Result<InstanceKey, BuildError> {
+    instance_key_normalized_own(code, args, from, None, ground, facts, scratch)
+}
+
+/// Like [`instance_key_normalized`], rewriting any `PNode::Future` of `own`'s body inside a
+/// projection to its `PNode::Coroutine` identity before normalizing.
+pub fn instance_key_normalized_own(
+    code: ContentId,
+    args: List,
+    from: PTys<'_>,
+    own: Option<&BodyView<'_>>,
+    ground: &mut PortableTys<'_>,
+    facts: &dyn LayoutFacts,
+    scratch: Alloc<'_>,
+) -> Result<InstanceKey, BuildError> {
     let malformed = |_| BuildError::Malformed { what: "an instance's arguments past the ground table" };
     let mut all: Vec<PTy, Alloc<'_>> = Vec::new_in(scratch);
     all.extend_from_slice(ground.view().list(args).map_err(malformed)?);
     let given = all.len();
     for (at, node) in from.nodes().enumerate() {
         if matches!(node, PNode::Alias { .. }) {
-            let normalized = crate::instance::ground(from, PTy(at as u32), &all[..given], ground, scratch, facts)?;
+            let given_args = all.get(..given).ok_or(BuildError::Malformed { what: "an instance's arguments past the ground table" })?;
+            let ty = PTy(u32::try_from(at).map_err(|_| BuildError::Malformed { what: "a type index past u32" })?);
+            let normalized = match own {
+                Some(body) => crate::instance::ground_own(from, ty, given_args, body, ground, scratch, facts)?,
+                None => crate::instance::ground(from, ty, given_args, ground, scratch, facts)?,
+            };
             all.push(normalized);
         }
     }

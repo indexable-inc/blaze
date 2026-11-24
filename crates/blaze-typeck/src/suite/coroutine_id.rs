@@ -220,3 +220,53 @@ fn an_rc_captured_by_value_makes_the_callers_send_fail() {
     let unsatisfied = c.diags.iter().filter(|d| d.code == DiagCode::Unsatisfied).count();
     assert_eq!(unsatisfied, 1, "one E0277 for `Rc<u32>: Send` through the opaque's hidden type: {:?}", c.diags);
 }
+
+/// An `impl Trait` fn returning an ADT wrapping a local async block (`Wrap(async move { 1u32 })`)
+/// must canonicalize the nested `PNode::Future` to `PNode::Coroutine` in `Checked::hidden` so no
+/// body-local expression id crosses a body boundary.
+#[test]
+fn nested_future_in_hidden_type_is_canonicalized_to_coroutine() {
+    let mut fx = Fx::new();
+    let sized = fx.tr("Sized", 1, Default::default(), &[]);
+    fx.lang(LangItem::Sized, sized);
+    let future = fx.tr("Future", 1, Default::default(), &["Output"]);
+    fx.lang(LangItem::Future, future);
+    let marker = fx.tr("Marker", 1, Default::default(), &[]);
+    let p0 = fx.param(0);
+    let wrap = fx.tuple_strukt("Wrap", 1, &[p0]);
+    fx.use_path("Wrap", crate::world::Def::Ctor { adt: wrap, variant: 0, kind: crate::world::CtorKind::Tuple });
+    let wrap_p0 = fx.adt(wrap, &[p0]);
+    fx.imp("impl<T> Marker for Wrap<T>", 1, wrap_p0, Some((marker, &[])), &[], Default::default());
+    let o = fx.opaque_key("make::{opaque#0}");
+    let none = fx.list(&[]);
+    let opaque = fx.ty(PNode::Opaque(o, none));
+    let is_marker = fx.bound(marker, &[opaque]);
+    let is_sized = fx.bound(sized, &[opaque]);
+    fx.set_opaque_bounds(o, [is_marker, is_sized].into());
+    let make = fx.func("make", 0, &[], opaque, Default::default());
+    fx.finish();
+
+    let mut b = Bb::new();
+    let one = b.int(Some(IntSuffix::Uint(UintTy::U32)));
+    let ab = b.async_block(one, crate::body::Capture::Move);
+    let ctor = b.path(&["Wrap"]);
+    let wrapped = b.call(ctor, &[ab]);
+    let root = b.block(&[], Some(wrapped));
+
+    let c = check_body(&fx, &b, make, root, Plant::None, InferPlant::None);
+    assert!(c.diags.is_empty(), "expected clean body: {:?}", c.diags);
+    assert_eq!(c.hidden.len(), 1, "expected one hidden type: {:?}", c.hidden);
+    let types = c.types.view();
+    let PNode::Adt(adt, args) = types.node(c.hidden[0].1).expect("hidden node") else {
+        panic!("expected Wrap<_>, got {:?}", types.node(c.hidden[0].1));
+    };
+    assert_eq!(adt, wrap);
+    let &[inner] = types.list(args).expect("wrap args") else {
+        panic!("expected one type arg to Wrap");
+    };
+    assert!(
+        matches!(types.node(inner), Ok(PNode::Coroutine { owner, ordinal: 0, .. }) if owner == make),
+        "expected nested PNode::Coroutine {{ owner: make, ordinal: 0 }}, got {:?}",
+        types.node(inner)
+    );
+}

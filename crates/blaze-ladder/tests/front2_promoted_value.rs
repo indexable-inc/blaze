@@ -226,3 +226,78 @@ fn a_promoted_autoref_evaluates_to_its_unadjusted_value() {
     assert!(rec.data.allocs[0].relocs.is_empty(), "no relocations for unadjusted enum value: {rec:?}");
     assert_eq!(rec.data.allocs[0].bytes.as_slice(), &[2u8], "`Fork::C` discriminant is 2");
 }
+
+/// Regression test for Task 1 (nested `PNode::Future` saved across `.await` and returned inside an
+/// `impl Future` wrapper) and Task 2 (a promoted borrow inside a callee `async fn` whose coroutine
+/// is laid and built via `lay_and_build` before its own owner fn is built).
+#[test]
+fn callee_coroutine_with_promoted_borrow_and_nested_future_runs() {
+    use blaze_ladder::run::{FrontChoice, run_with};
+
+    const PRELUDE: &str = include_str!("../../blaze-cli/tests/ladder/front2/x0-async-01/src/prelude.rs");
+    const FUTURE: &str = include_str!("../../blaze-cli/tests/ladder/front2/x0-async-01/src/future.rs");
+    const MAIN: &str = r#"#![feature(no_core, lang_items, intrinsics, rustc_attrs, unboxed_closures, arbitrary_self_types, builtin_syntax)]
+#![no_core]
+#![no_main]
+#![allow(internal_features)]
+
+mod future;
+mod prelude;
+use future::*;
+use prelude::*;
+
+struct Wrap<F>(F);
+
+impl<F: Future<Output = u32>> Future for Wrap<F> {
+    type Output = u32;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<u32> {
+        let pinned = Pin { pointer: &mut self.pointer.0 };
+        <F as Future>::poll(pinned, cx)
+    }
+}
+
+fn wrapped_future(x: u32) -> impl Future<Output = u32> {
+    Wrap(async move { x + 1 })
+}
+
+async fn callee_with_promoted() -> u32 {
+    let r: &'static u32 = &40;
+    let bonus = wrapped_future(1).await;
+    *r + bonus
+}
+
+async fn caller() -> u32 {
+    let nested = Wrap(async move { 1u32 });
+    let a = callee_with_promoted().await;
+    let b = nested.await;
+    a + b
+}
+
+fn block_on<F: Future<Output = u32>>(mut fut: F) -> u32 {
+    let mut wakes = 0u32;
+    let mut cx = Context { wakes: &mut wakes };
+    loop {
+        let pinned = Pin { pointer: &mut fut };
+        match <F as Future>::poll(pinned, &mut cx) {
+            Poll::Ready(v) => return v,
+            Poll::Pending => {}
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn main() -> i32 {
+    block_on(caller()) as i32
+}
+"#;
+
+    let files = [
+        SourceFile { path: "src/main.rs", text: MAIN },
+        SourceFile { path: "src/prelude.rs", text: PRELUDE },
+        SourceFile { path: "src/future.rs", text: FUTURE },
+    ];
+    let new = NewFront { package: "ladder", edition: "2024", shelf: None, overflow: blaze_build::OverflowChecks::On };
+    let got = run_with(&files, "src/main.rs", None, FrontChoice::New(new), blaze_own::testing::heap().shared())
+        .unwrap_or_else(|e| panic!("async callee promoted borrow + nested future failed: {e}"));
+    assert_eq!(got, 43, "40 (callee promoted borrow) + 2 (nested saved future) + 1 (tuple element)");
+}

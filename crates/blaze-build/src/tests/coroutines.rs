@@ -158,6 +158,43 @@ fn a_coroutine_is_named_by_owner_ordinal_and_arguments() {
     println!("coroutine identity: owner {:#x} ordinal 0 read back; ordinals 0 and 1 differ; a future named by its expression refused", OWNER.0);
 }
 
+/// A body's own `PNode::Future` nested inside another type (e.g. a tuple or combinator ADT saved
+/// across an `.await`) is rewritten to `PNode::Coroutine` by `ground_own`, while `ground` (no
+/// owning body) refuses it by name.
+#[test]
+fn ground_own_rewrites_nested_future_to_coroutine_identity() {
+    let heap = blaze_own::testing::heap();
+    let alloc = heap.alloc();
+    let world = World::new();
+    let mut from = PortableTys::new_in(alloc);
+    let none = from.intern_list(&[]).unwrap();
+    let output = from.intern(PNode::Uint(UintTy::U64)).unwrap();
+    let interior = from.intern(PNode::Tuple(none)).unwrap();
+    let raw = from.intern(PNode::Future(ExprId(0), output, interior)).unwrap();
+    let pair = from.intern_list(&[output, raw]).unwrap();
+    let wrapped = from.intern(PNode::Tuple(pair)).unwrap();
+
+    let mut out = PortableTys::new_in(alloc);
+    let err = crate::ground(from.view(), wrapped, &[], &mut out, alloc, &world)
+        .expect_err("`ground` without an owning body must refuse a nested PNode::Future");
+    assert!(format!("{err}").contains("named by its expression"), "{err}");
+
+    let mut b = blaze_typeck::fixture::Bb::new();
+    let ab = b.async_block(ExprId(0), blaze_typeck::Capture::Move);
+    assert_eq!(ab, ExprId(0));
+    let view = b.view(OWNER, ab);
+    let grounded = crate::ground_own(from.view(), wrapped, &[], &view, &mut out, alloc, &world)
+        .expect("`ground_own` must rewrite nested PNode::Future to PNode::Coroutine");
+    let PNode::Tuple(gl) = out.view().node(grounded).unwrap() else {
+        panic!("expected grounded tuple");
+    };
+    let &[g0, g1] = out.view().list(gl).unwrap() else {
+        panic!("expected 2-tuple");
+    };
+    assert_eq!(out.view().node(g0).unwrap(), PNode::Uint(UintTy::U64));
+    assert_eq!(coroutine_of(out.view(), g1), Some(CoroutineOf { owner: OWNER, owner_args: out.intern_list(&[]).unwrap(), ordinal: 0 }));
+}
+
 /// The key of `enum Option<T> { None, Some(T) }` in [`NicheWorld`].
 const OPTION: ItemKey = ItemKey(0x0f);
 
