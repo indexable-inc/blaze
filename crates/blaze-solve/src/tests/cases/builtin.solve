@@ -398,3 +398,9 @@ goal dyn Iterator<Item = u8>: Iterator => yes
 
 case object_unrelated_trait_no = assembly/mod.rs::assemble_object_bound_candidates
 goal dyn Debug: Clone => no
+
+case object_supertrait_projection_yes = structural_traits.rs::predicates_for_object_candidate
+trait IterSub: Iterator<Item = u8>
+goal dyn IterSub<Item = u8>: IterSub => yes
+goal dyn IterSub<Item = u8>: Iterator => yes
+goal <dyn IterSub<Item = u8> as Iterator>::Item == u8 => yes

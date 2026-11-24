@@ -161,3 +161,83 @@ fn a_type_with_no_display_has_no_fmt() {
     let (_, c) = call_on_x(&fx, "plain", "fmt");
     assert_eq!(codes(&c), std::vec![DiagCode::NoMethod], "{:?}", c.diags);
 }
+
+/// `Box<dyn CloneTransport>` calling `clone_box(&self)` where `CloneTransport: Service<Item = u8>`
+/// (the object's `ExProj` satisfies its supertrait projection clause in `step_object`, and
+/// `map_pred` keeps `Pred::Projection.alias` an alias).
+#[test]
+fn box_dyn_trait_method_with_supertrait_projection() {
+    let mut fx = Fx::new();
+    let deref = fx.tr("Deref", 1, Default::default(), &["Target"]);
+    fx.lang(LangItem::Deref, deref);
+    let p0 = fx.param(0);
+    let r_self = fx.r(Mutbl::Not, p0);
+    let u8_ = fx.u8();
+    let service = fx.tr("Service", 1, Default::default(), &["Resp"]);
+    let sup_service = fx.bound(service, &[p0]);
+    let sup_resp = fx.proj(service, &[p0], "Resp", u8_);
+    let clone_tr = fx.tr("CloneTransport", 1, [sup_service, sup_resp].into(), &[]);
+    fx.trait_fn(clone_tr, "clone_box", true, &[r_self], u8_);
+    let box_k = fx.strukt("Box", 1, &[]);
+    let box_p0 = fx.adt(box_k, &[p0]);
+    fx.imp("impl<T> Deref for Box<T>", 1, box_p0, Some((deref, &[])), &[("Target", p0)], Default::default());
+    let ex_tr = fx.ty(PNode::ExTrait(clone_tr, List::EMPTY));
+    let ex_proj = fx.ty(PNode::ExProj { trait_: service, name: crate::ids::Name::of("Resp"), args: List::EMPTY, term: u8_ });
+    let dyn_tr = fx.t.dynamic(&[ex_tr, ex_proj]).expect("dyn CloneTransport");
+    let box_dyn = fx.adt(box_k, &[dyn_tr]);
+    fx.func("clone_boxed", 0, &[box_dyn], u8_, Default::default());
+    fx.finish();
+
+    let (b, c) = call_on_x(&fx, "clone_boxed", "clone_box");
+    let recv = "Box<dyn CloneTransport + Service::965d54750b7f79b1 = u8>";
+    expect(&fx, &b, &c, &Want {
+        exprs: &[(ExprId(0), recv), (ExprId(1), "u8"), (ExprId(2), "u8")],
+        pats: &[(PatId(0), recv)],
+        diags: &[],
+    });
+    assert!(callee(&fx, &c, ExprId(1)).starts_with("clone_box<dyn CloneTransport"));
+}
+
+/// `Box<NoDrop<dyn IterTrait>>` calling `&mut self` supertrait method `Iterator::next` through
+/// chained `Deref`/`DerefMut` (`Box<T> -> T`, `NoDrop<T> -> T`).
+#[test]
+fn box_nodrop_dyn_trait_chained_deref_mut_method() {
+    let mut fx = Fx::new();
+    let deref = fx.tr("Deref", 1, Default::default(), &["Target"]);
+    let deref_mut = fx.tr("DerefMut", 1, Default::default(), &[]);
+    fx.lang(LangItem::Deref, deref);
+    fx.lang(LangItem::DerefMut, deref_mut);
+    let p0 = fx.param(0);
+    let rm_self = fx.r(Mutbl::Mut, p0);
+    let u8_ = fx.u8();
+    let iter = fx.tr("Iterator", 1, Default::default(), &["Item"]);
+    let item_alias = fx.alias(iter, "Item", &[p0]);
+    fx.trait_fn(iter, "next", true, &[rm_self], item_alias);
+    let sup_iter = fx.bound(iter, &[p0]);
+    let sup_item = fx.proj(iter, &[p0], "Item", u8_);
+    let iter_tr = fx.tr("IterTrait", 1, [sup_iter, sup_item].into(), &[]);
+    let box_k = fx.strukt("Box", 1, &[]);
+    let nodrop_k = fx.strukt("NoDrop", 1, &[]);
+    let box_p0 = fx.adt(box_k, &[p0]);
+    let nodrop_p0 = fx.adt(nodrop_k, &[p0]);
+    fx.imp("impl<T> Deref for Box<T>", 1, box_p0, Some((deref, &[])), &[("Target", p0)], Default::default());
+    fx.imp("impl<T> DerefMut for Box<T>", 1, box_p0, Some((deref_mut, &[])), &[], Default::default());
+    fx.imp("impl<T> Deref for NoDrop<T>", 1, nodrop_p0, Some((deref, &[])), &[("Target", p0)], Default::default());
+    fx.imp("impl<T> DerefMut for NoDrop<T>", 1, nodrop_p0, Some((deref_mut, &[])), &[], Default::default());
+    let ex_tr = fx.ty(PNode::ExTrait(iter_tr, List::EMPTY));
+    let ex_proj = fx.ty(PNode::ExProj { trait_: iter, name: crate::ids::Name::of("Item"), args: List::EMPTY, term: u8_ });
+    let dyn_tr = fx.t.dynamic(&[ex_tr, ex_proj]).expect("dyn IterTrait");
+    let nodrop_dyn = fx.adt(nodrop_k, &[dyn_tr]);
+    let box_nodrop_dyn = fx.adt(box_k, &[nodrop_dyn]);
+    fx.func("next_item", 0, &[box_nodrop_dyn], u8_, Default::default());
+    fx.finish();
+
+    let (b, c) = call_on_x(&fx, "next_item", "next");
+    let recv = "Box<NoDrop<dyn IterTrait + Iterator::1ad232bd2f10c7fc = u8>>";
+    expect(&fx, &b, &c, &Want {
+        exprs: &[(ExprId(0), recv), (ExprId(1), "u8"), (ExprId(2), "u8")],
+        pats: &[(PatId(0), recv)],
+        diags: &[],
+    });
+    assert!(callee(&fx, &c, ExprId(1)).starts_with("next<dyn IterTrait"));
+}

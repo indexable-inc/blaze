@@ -225,6 +225,16 @@ pub fn intern_list(tys: &mut PortableTys<'_>, l: &[PTy]) -> Result<List, Why> {
     tys.intern_list(l).map_err(|_| table_full())
 }
 
+/// A supertrait associated-type equality on `Self` (`trait Sub: Sup<Item = T>`),
+/// over the declaring trait's own parameters (`Self` = `Param(0)`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SuperProj {
+    pub trait_: ItemKey,
+    pub name: Name,
+    pub args: List,
+    pub term: PTy,
+}
+
 /// The heads the type builder reads: an item's generics, a trait's defaults and associated
 /// types, by library key; `None` when not lowered yet.
 pub trait Heads {
@@ -295,6 +305,9 @@ pub trait Heads {
     /// The trait's supertraits written on its header (`: FnMut<Args>`), each with its
     /// arguments (`Self` first) over the trait's own parameters (`Self` = `Param(0)`).
     fn trait_supers(&self, trait_: LibKey) -> Option<&[(LibKey, List)]>;
+    /// The trait's supertrait associated-type equalities on `Self` (`: Sup<Item = T>`),
+    /// filed with its members alongside [`Heads::trait_supers`].
+    fn trait_super_projs(&self, trait_: LibKey) -> Option<&[SuperProj]>;
     /// Whether the trait is an `auto trait` (from its own head).
     fn trait_auto(&self, trait_: LibKey) -> Option<bool>;
     /// Whether the trait declares a `Self: 'static` bound (e.g. `core::any::Any`).
