@@ -3,7 +3,7 @@
 use core::alloc::Allocator;
 
 use blaze_own::blaze_int::Cast;
-use blaze_own::{AllocFailure, Int, Pow2Array, Vec};
+use blaze_own::{AllocFailure, Int, Pow2Array, Vec, low_u32};
 
 use crate::ZstdError;
 
@@ -347,15 +347,17 @@ impl<'a> FwdBitReader<'a> {
         word & ((1u32 << n) - 1)
     }
 
-    #[inline]
-    fn consume(&mut self, n: u32) -> Result<(), ZstdError> {
+    #[inline(always)]
+    fn consume(&mut self, n: u32) -> bool {
         let adv = n.widen_to::<usize>();
-        let next = self.bit_pos.checked_add(adv).ok_or(ZstdError::CorruptFse)?;
+        let Some(next) = self.bit_pos.checked_add(adv) else {
+            return false;
+        };
         if next > self.total_bits {
-            return Err(ZstdError::CorruptFse);
+            return false;
         }
         self.bit_pos = next;
-        Ok(())
+        true
     }
 
     #[inline]
@@ -400,39 +402,52 @@ impl<'a, A: Allocator> FwdBitWriter<'a, A> {
     }
 }
 
-/// Write an RFC 8878 §4.1.1 FSE distribution header for `norm` (`accuracy_log` in `5..=9`) into
-/// `out`. Exact inverse of [`FseDecTable::decode_header_and_build`].
-pub(crate) fn write_fse_header<A: Allocator>(
+fn write_fse_header_inner<A: Allocator>(
     norm: &[i16],
     accuracy_log: u8,
     out: &mut Vec<u8, A>,
-) -> Result<(), ZstdError> {
+) -> Result<bool, AllocFailure> {
     if !(5..=MAX_FSE_LOG).contains(&accuracy_log) || norm.len() > MAX_FSE_SYMBOLS {
-        return Err(ZstdError::CorruptFse);
+        return Ok(false);
     }
+    let table_size: i32 = 1i32 << u32::from(accuracy_log);
+    let mut sum: i32 = 0;
+    for &p in norm {
+        if p == -1 {
+            sum += 1;
+        } else if p > 0 {
+            sum += i32::from(p);
+        } else if p < -1 {
+            return Ok(false);
+        }
+    }
+    if sum != table_size {
+        return Ok(false);
+    }
+
     let mut bw = FwdBitWriter::new(out);
     bw.write(u32::from(accuracy_log - 5), 4)?;
 
-    let mut remaining: i32 = (1i32 << u32::from(accuracy_log)) + 1;
-    let mut threshold: i32 = 1i32 << u32::from(accuracy_log);
+    let mut remaining: i32 = table_size + 1;
+    let mut threshold: i32 = table_size;
     let mut nb_bits: u32 = u32::from(accuracy_log) + 1;
     let mut idx: usize = 0;
 
     while remaining > 1 && idx < norm.len() {
-        let prob = i32::from(*norm.get(idx).ok_or(ZstdError::CorruptFse)?);
+        let Some(&prob_i16) = norm.get(idx) else {
+            break;
+        };
+        let prob = i32::from(prob_i16);
         let max: i32 = (2 * threshold - 1) - remaining;
         let count: i32 = prob + 1;
-        let small_bits = nb_bits.checked_sub(1).ok_or(ZstdError::CorruptFse)?;
+        let small_bits = nb_bits.wrapping_sub(1);
 
         if count < max {
-            let val = u32::try_from(count).map_err(|_| ZstdError::CorruptFse)?;
-            bw.write(val, small_bits)?;
+            bw.write(count.cast_unsigned(), small_bits)?;
         } else if count < threshold {
-            let val = u32::try_from(count).map_err(|_| ZstdError::CorruptFse)?;
-            bw.write(val, nb_bits)?;
+            bw.write(count.cast_unsigned(), nb_bits)?;
         } else {
-            let val = u32::try_from(count + max).map_err(|_| ZstdError::CorruptFse)?;
-            bw.write(val, nb_bits)?;
+            bw.write((count + max).cast_unsigned(), nb_bits)?;
         }
 
         if prob == -1 {
@@ -459,15 +474,27 @@ pub(crate) fn write_fse_header<A: Allocator>(
                 bw.write(3, 2)?;
                 zeros -= 3;
             }
-            let rem_u32 = u32::try_from(zeros).map_err(|_| ZstdError::CorruptFse)?;
-            bw.write(rem_u32, 2)?;
+            bw.write(zeros.truncate_to::<u32>(), 2)?;
         }
     }
 
     if remaining != 1 {
-        return Err(ZstdError::CorruptFse);
+        return Ok(false);
     }
     bw.finish()?;
+    Ok(true)
+}
+
+/// Write an RFC 8878 §4.1.1 FSE distribution header for `norm` (`accuracy_log` in `5..=9`) into
+/// `out`. Exact inverse of [`FseDecTable::decode_header_and_build`].
+pub(crate) fn write_fse_header<A: Allocator>(
+    norm: &[i16],
+    accuracy_log: u8,
+    out: &mut Vec<u8, A>,
+) -> Result<(), ZstdError> {
+    if !write_fse_header_inner(norm, accuracy_log, out)? {
+        return Err(ZstdError::CorruptFse);
+    }
     Ok(())
 }
 
@@ -616,13 +643,7 @@ impl SeqTables {
         self.entries.get_masked(state)
     }
 
-    /// Compile an [`FseDecTable`] into the corresponding flat slice of `self`, pre-biasing
-    /// `baseline` by `0` (LL), `512` (OF), or `1024` (ML).
-    pub(crate) fn compile_from(&mut self, dec: &FseDecTable, kind: SeqKind) -> Result<(), ZstdError> {
-        let log = dec.accuracy_log();
-        if log > MAX_FSE_LOG {
-            return Err(ZstdError::CorruptFse);
-        }
+    fn compile_inner(&mut self, dec: &FseDecTable, kind: SeqKind, log: u8) -> bool {
         let table_size = 1usize << u32::from(log);
         let mut max_eb: u8 = 0;
         match kind {
@@ -631,7 +652,7 @@ impl SeqTables {
                     let e = dec.entry_masked(state);
                     let idx = usize::from(e.symbol);
                     if idx > LL_MAX_CODE {
-                        return Err(ZstdError::CorruptSequences);
+                        return false;
                     }
                     let base = LL_BASE.get_masked(idx);
                     let extra_bits = LL_BITS.get_masked(idx);
@@ -650,16 +671,16 @@ impl SeqTables {
                 for state in 0..table_size {
                     let e = dec.entry_masked(state);
                     if usize::from(e.symbol) > OF_MAX_CODE {
-                        return Err(ZstdError::CorruptSequences);
+                        return false;
                     }
                     let base = 1u32 << u32::from(e.symbol);
                     let extra_bits = e.symbol;
                     if extra_bits > max_eb {
                         max_eb = extra_bits;
                     }
-                    let biased_bl = e.baseline + 512;
+                    let biased_bl = e.baseline.wrapping_add(512);
                     self.entries.set_masked(
-                        SEQ_OF_OFFSET + state,
+                        SEQ_OF_OFFSET.wrapping_add(state),
                         SeqDecEntry::new(base, extra_bits, e.num_bits, biased_bl),
                     );
                 }
@@ -671,22 +692,35 @@ impl SeqTables {
                     let e = dec.entry_masked(state);
                     let idx = usize::from(e.symbol);
                     if idx > ML_MAX_CODE {
-                        return Err(ZstdError::CorruptSequences);
+                        return false;
                     }
                     let base = ML_BASE.get_masked(idx);
                     let extra_bits = ML_BITS.get_masked(idx);
                     if extra_bits > max_eb {
                         max_eb = extra_bits;
                     }
-                    let biased_bl = e.baseline + 1024;
+                    let biased_bl = e.baseline.wrapping_add(1024);
                     self.entries.set_masked(
-                        SEQ_ML_OFFSET + state,
+                        SEQ_ML_OFFSET.wrapping_add(state),
                         SeqDecEntry::new(base, extra_bits, e.num_bits, biased_bl),
                     );
                 }
                 self.ml_log = log;
                 self.ml_max_eb = max_eb;
             }
+        }
+        true
+    }
+
+    /// Compile an [`FseDecTable`] into the corresponding flat slice of `self`, pre-biasing
+    /// `baseline` by `0` (LL), `512` (OF), or `1024` (ML).
+    pub(crate) fn compile_from(&mut self, dec: &FseDecTable, kind: SeqKind) -> Result<(), ZstdError> {
+        let log = dec.accuracy_log();
+        if log > MAX_FSE_LOG {
+            return Err(ZstdError::CorruptFse);
+        }
+        if !self.compile_inner(dec, kind, log) {
+            return Err(ZstdError::CorruptSequences);
         }
         Ok(())
     }
@@ -709,15 +743,6 @@ impl FseDecTable {
     }
 
     #[inline(always)]
-    pub(crate) fn entry(&self, state: usize) -> Option<FseDecEntry> {
-        let size = 1usize << u32::from(self.accuracy_log);
-        if state >= size {
-            return None;
-        }
-        self.entries.as_slice().get(state).copied()
-    }
-
-    #[inline(always)]
     pub(crate) fn entry_masked(&self, state: usize) -> FseDecEntry {
         self.entries.get_masked(state)
     }
@@ -728,6 +753,103 @@ impl FseDecTable {
         self.entries.set_masked(0, FseDecEntry { symbol, num_bits: 0, baseline: 0 });
     }
 
+    /// Zero-`ZstdError` inner FSE table builder: validates `accuracy_log`, `norm` length, and sum
+    /// once upfront, then populates `self.entries` via masked `Pow2Array` accesses with zero
+    /// 40-byte `ZstdError` stack copies inside the table-fill loops.
+    fn build_from_norm_inner(&mut self, norm: &[i16], accuracy_log: u8) -> bool {
+        if accuracy_log > MAX_FSE_LOG || norm.len() > MAX_FSE_SYMBOLS {
+            return false;
+        }
+        let log_u32 = u32::from(accuracy_log);
+        let table_size = 1usize << log_u32;
+        let table_mask = table_size - 1;
+        let step = (table_size >> 1) + (table_size >> 3) + 3;
+
+        let mut high_threshold = table_size;
+        let mut symbol_next = Pow2Array::<u16, MAX_FSE_SYMBOLS>::splat(0);
+        let mut total: usize = 0;
+
+        // Pass 1: validate normalized probabilities, sum to `table_size`, place `-1` symbols
+        // at the top of the table descending, and seed `symbol_next[sym]`.
+        for (sym_idx, &prob) in norm.iter().enumerate() {
+            let sym_u8 = sym_idx.truncate_to::<u8>();
+            if prob == -1 {
+                if high_threshold == 0 {
+                    return false;
+                }
+                high_threshold = high_threshold.wrapping_sub(1);
+                self.entries.set_masked(
+                    high_threshold,
+                    FseDecEntry { symbol: sym_u8, num_bits: 0, baseline: 0 },
+                );
+                symbol_next.set_masked(sym_idx, 1);
+                total = total.wrapping_add(1);
+            } else if prob > 0 {
+                let count_u16 = prob.cast_unsigned();
+                symbol_next.set_masked(sym_idx, count_u16);
+                total = total.wrapping_add(usize::from(count_u16));
+            } else if prob < -1 {
+                return false;
+            }
+        }
+
+        if total != table_size {
+            return false;
+        }
+        // For `high_threshold >= 2`, `step` must be odd (`gcd(step, 2^L) == 1`) so spreading
+        // visits every slot `0..high_threshold` in bijection (always true for RFC 8878 `L >= 5`).
+        if high_threshold > 1 && (step & 1) == 0 {
+            return false;
+        }
+
+        // Pass 2: spread positive-probability symbols across `0..high_threshold`.
+        let mut pos: usize = 0;
+        for (sym_idx, &prob) in norm.iter().enumerate() {
+            if prob <= 0 {
+                continue;
+            }
+            let count = usize::from(prob.cast_unsigned());
+            let sym_u8 = sym_idx.truncate_to::<u8>();
+            let entry = FseDecEntry { symbol: sym_u8, num_bits: 0, baseline: 0 };
+            for _ in 0..count {
+                self.entries.set_masked(pos, entry);
+                pos = pos.wrapping_add(step) & table_mask;
+                while pos >= high_threshold {
+                    pos = pos.wrapping_add(step) & table_mask;
+                }
+            }
+        }
+
+        if pos != 0 {
+            return false;
+        }
+
+        // Pass 3: compute `num_bits` and `baseline` for every state `0..table_size`.
+        // Passes 1 & 2 proved every slot holds a symbol with `1 <= next_state < 2 * table_size`.
+        for state in 0..table_size {
+            let sym = self.entries.get_masked(state).symbol;
+            let sym_idx = usize::from(sym);
+            let next_state = symbol_next.get_masked(sym_idx);
+            symbol_next.set_masked(sym_idx, next_state.wrapping_add(1));
+
+            let high_bit = 15u32.wrapping_sub(next_state.leading_zeros());
+            let nb = log_u32.wrapping_sub(high_bit);
+            let base = (usize::from(next_state) << nb).wrapping_sub(table_size);
+
+            self.entries.set_masked(
+                state,
+                FseDecEntry {
+                    symbol: sym,
+                    num_bits: nb.truncate_to::<u8>(),
+                    baseline: base.truncate_to::<u16>(),
+                },
+            );
+        }
+
+        self.accuracy_log = accuracy_log;
+        true
+    }
+
     /// Build the FSE decoding table from a slice of normalized probabilities (`-1`, `0`, or `> 0`)
     /// summing to `1 << accuracy_log` (counting `-1` as `1`).
     pub(crate) fn build_from_norm(
@@ -735,122 +857,38 @@ impl FseDecTable {
         norm: &[i16],
         accuracy_log: u8,
     ) -> Result<(), ZstdError> {
-        if accuracy_log > MAX_FSE_LOG || norm.len() > MAX_FSE_SYMBOLS {
+        if !self.build_from_norm_inner(norm, accuracy_log) {
             return Err(ZstdError::CorruptFse);
         }
-        let table_size = 1usize << u32::from(accuracy_log);
-        let table_mask = table_size - 1;
-        let step = (table_size >> 1) + (table_size >> 3) + 3;
-
-        let mut high_threshold = table_size;
-        let mut symbol_next = [0u16; MAX_FSE_SYMBOLS];
-        let mut total: usize = 0;
-
-        // First pass: place "less than 1" (-1) symbols at the top of the table, descending.
-        for (sym_idx, &prob) in norm.iter().enumerate() {
-            let sym_u8 = u8::try_from(sym_idx).map_err(|_| ZstdError::CorruptFse)?;
-            if prob == -1 {
-                high_threshold = high_threshold.checked_sub(1).ok_or(ZstdError::CorruptFse)?;
-                let slot = self
-                    .entries
-                    .as_mut_slice()
-                    .get_mut(high_threshold)
-                    .ok_or(ZstdError::CorruptFse)?;
-                slot.symbol = sym_u8;
-                let next_slot = symbol_next.get_mut(sym_idx).ok_or(ZstdError::CorruptFse)?;
-                *next_slot = 1;
-                total = total.checked_add(1).ok_or(ZstdError::CorruptFse)?;
-            } else if prob > 0 {
-                let count = usize::try_from(prob).map_err(|_| ZstdError::CorruptFse)?;
-                let count_u16 = u16::try_from(count).map_err(|_| ZstdError::CorruptFse)?;
-                let next_slot = symbol_next.get_mut(sym_idx).ok_or(ZstdError::CorruptFse)?;
-                *next_slot = count_u16;
-                total = total.checked_add(count).ok_or(ZstdError::CorruptFse)?;
-            } else if prob < -1 {
-                return Err(ZstdError::CorruptFse);
-            }
-        }
-
-        if total != table_size {
-            return Err(ZstdError::CorruptFse);
-        }
-
-        // Second pass: spread positive-probability symbols across `0..high_threshold`.
-        let mut pos: usize = 0;
-        for (sym_idx, &prob) in norm.iter().enumerate() {
-            if prob <= 0 {
-                continue;
-            }
-            let count = usize::try_from(prob).map_err(|_| ZstdError::CorruptFse)?;
-            let sym_u8 = u8::try_from(sym_idx).map_err(|_| ZstdError::CorruptFse)?;
-            for _ in 0..count {
-                let slot = self.entries.as_mut_slice().get_mut(pos).ok_or(ZstdError::CorruptFse)?;
-                slot.symbol = sym_u8;
-                pos = (pos + step) & table_mask;
-                let mut guard = table_size;
-                while pos >= high_threshold {
-                    guard = guard.checked_sub(1).ok_or(ZstdError::CorruptFse)?;
-                    pos = (pos + step) & table_mask;
-                }
-            }
-        }
-
-        if pos != 0 {
-            return Err(ZstdError::CorruptFse);
-        }
-
-        // Third pass: compute `num_bits` and `baseline` for every state `0..table_size`.
-        for state in 0..table_size {
-            let slot = self.entries.as_mut_slice().get_mut(state).ok_or(ZstdError::CorruptFse)?;
-            let sym_idx = usize::from(slot.symbol);
-            let next_ref = symbol_next.get_mut(sym_idx).ok_or(ZstdError::CorruptFse)?;
-            let next_state = *next_ref;
-            if next_state == 0 {
-                return Err(ZstdError::CorruptFse);
-            }
-            *next_ref = next_state.checked_add(1).ok_or(ZstdError::CorruptFse)?;
-
-            let high_bit =
-                15u32.checked_sub(next_state.leading_zeros()).ok_or(ZstdError::CorruptFse)?;
-            let nb = u32::from(accuracy_log).checked_sub(high_bit).ok_or(ZstdError::CorruptFse)?;
-            let shifted = usize::from(next_state).checked_shl(nb).ok_or(ZstdError::CorruptFse)?;
-            let base = shifted.checked_sub(table_size).ok_or(ZstdError::CorruptFse)?;
-
-            slot.num_bits = u8::try_from(nb).map_err(|_| ZstdError::CorruptFse)?;
-            slot.baseline = u16::try_from(base).map_err(|_| ZstdError::CorruptFse)?;
-        }
-
-        self.accuracy_log = accuracy_log;
         Ok(())
     }
 
-    /// Decode an RFC 8878 §4.1.1 FSE distribution header from `src`, build the decoding table
-    /// into `self`, and return the number of header bytes consumed.
-    pub(crate) fn decode_header_and_build(
+    /// Zero-`ZstdError` RFC 8878 §4.1.1 FSE header decoder and table builder returning
+    /// `Some(bytes_consumed)` on success.
+    pub(crate) fn decode_header_and_build_opt(
         &mut self,
         src: &[u8],
         max_symbol: usize,
         max_log: u8,
-    ) -> Result<usize, ZstdError> {
+    ) -> Option<usize> {
         if src.is_empty() || max_symbol >= MAX_FSE_SYMBOLS || max_log > MAX_FSE_LOG {
-            return Err(ZstdError::CorruptFse);
+            return None;
         }
-        let mut reader = FwdBitReader::new(src).ok_or(ZstdError::CorruptFse)?;
+        let mut reader = FwdBitReader::new(src)?;
 
         let acc_raw = reader.peek(4);
-        reader.consume(4)?;
-        let accuracy_log = u8::try_from(acc_raw)
-            .ok()
-            .and_then(|v| v.checked_add(5))
-            .ok_or(ZstdError::CorruptFse)?;
+        if !reader.consume(4) {
+            return None;
+        }
+        let accuracy_log = acc_raw.truncate_to::<u8>().wrapping_add(5);
         if accuracy_log > max_log {
-            return Err(ZstdError::CorruptFse);
+            return None;
         }
 
         let mut remaining: i32 = (1i32 << u32::from(accuracy_log)) + 1;
         let mut threshold: i32 = 1i32 << u32::from(accuracy_log);
         let mut nb_bits: u32 = u32::from(accuracy_log) + 1;
-        let mut norm = [0i16; MAX_FSE_SYMBOLS];
+        let mut norm = Pow2Array::<i16, MAX_FSE_SYMBOLS>::splat(0);
         let mut symbol: usize = 0;
         let mut previous_is_zero = false;
 
@@ -859,13 +897,15 @@ impl FseDecTable {
                 // Repeat-zero run: 2 bits at a time; value 3 means add 3 and continue.
                 for _ in 0..=MAX_FSE_SYMBOLS {
                     let rep = reader.peek(2);
-                    reader.consume(2)?;
+                    if !reader.consume(2) {
+                        return None;
+                    }
                     symbol = symbol.saturating_add(rep.widen_to::<usize>());
                     if rep < 3 {
                         break;
                     }
                     if symbol > max_symbol + 1 {
-                        return Err(ZstdError::CorruptFse);
+                        return None;
                     }
                 }
                 if symbol > max_symbol {
@@ -873,17 +913,22 @@ impl FseDecTable {
                 }
             }
 
+            if nb_bits == 0 {
+                return None;
+            }
             let max: i32 = (2 * threshold - 1) - remaining;
-            let small_bits = nb_bits.checked_sub(1).ok_or(ZstdError::CorruptFse)?;
-            let small =
-                i32::try_from(reader.peek(small_bits)).map_err(|_| ZstdError::CorruptFse)?;
+            let small_bits = nb_bits - 1;
+            let small = reader.peek(small_bits).cast_signed();
             let count: i32 = if small < max {
-                reader.consume(small_bits)?;
+                if !reader.consume(small_bits) {
+                    return None;
+                }
                 small
             } else {
-                let full =
-                    i32::try_from(reader.peek(nb_bits)).map_err(|_| ZstdError::CorruptFse)?;
-                reader.consume(nb_bits)?;
+                let full = reader.peek(nb_bits).cast_signed();
+                if !reader.consume(nb_bits) {
+                    return None;
+                }
                 if full >= threshold { full - max } else { full }
             };
 
@@ -894,11 +939,10 @@ impl FseDecTable {
                 remaining -= prob;
             }
             if remaining < 1 {
-                return Err(ZstdError::CorruptFse);
+                return None;
             }
 
-            let slot = norm.get_mut(symbol).ok_or(ZstdError::CorruptFse)?;
-            *slot = i16::try_from(prob).map_err(|_| ZstdError::CorruptFse)?;
+            norm.set_masked(symbol, prob.truncate_to::<i16>());
             symbol += 1;
             previous_is_zero = prob == 0;
 
@@ -909,17 +953,30 @@ impl FseDecTable {
         }
 
         if remaining != 1 || symbol == 0 || symbol > max_symbol + 1 {
-            return Err(ZstdError::CorruptFse);
+            return None;
         }
 
         let bytes_read = reader.bytes_consumed();
         if bytes_read > src.len() {
-            return Err(ZstdError::CorruptFse);
+            return None;
         }
 
-        let norm_slice = norm.get(..symbol).ok_or(ZstdError::CorruptFse)?;
-        self.build_from_norm(norm_slice, accuracy_log)?;
-        Ok(bytes_read)
+        let norm_slice = norm.as_slice().get(..symbol)?;
+        if !self.build_from_norm_inner(norm_slice, accuracy_log) {
+            return None;
+        }
+        Some(bytes_read)
+    }
+
+    /// Decode an RFC 8878 §4.1.1 FSE distribution header from `src`, build the decoding table
+    /// into `self`, and return the number of header bytes consumed.
+    pub(crate) fn decode_header_and_build(
+        &mut self,
+        src: &[u8],
+        max_symbol: usize,
+        max_log: u8,
+    ) -> Result<usize, ZstdError> {
+        self.decode_header_and_build_opt(src, max_symbol, max_log).ok_or(ZstdError::CorruptFse)
     }
 }
 
@@ -929,21 +986,6 @@ impl FseDecTable {
 
 const MAX_ENC_LOG: u8 = 8;
 const MAX_ENC_TABLE_SIZE: usize = 1 << MAX_ENC_LOG;
-
-#[derive(Clone, Copy)]
-struct FseSymMeta {
-    /// Start index of this symbol's states in `state_table`.
-    offset: u16,
-    /// Number of states assigned to this symbol (`0` if unused).
-    count: u16,
-    /// `target < split` uses `max_nb - 1` bits; `target >= split` uses `max_nb` bits.
-    split: u16,
-    max_nb: u8,
-}
-
-impl FseSymMeta {
-    const ZERO: Self = Self { offset: 0, count: 0, split: 0, max_nb: 0 };
-}
 
 /// Normalize symbol frequency counts into RFC 8878 §4.1.1 FSE probabilities summing to
 /// `1 << accuracy_log` (counting `-1` as `1`). Returns `Some(max_sym)` on success or `None` if
@@ -1037,12 +1079,16 @@ pub(crate) fn normalize_fse_counts(
     Some(max_sym)
 }
 
-/// O(1) exact inverse of any [`FseDecTable`] with `accuracy_log <= 6` (used for predefined,
+/// O(1) exact inverse of any [`FseDecTable`] with `accuracy_log <= 8` (used for predefined,
 /// custom sequence, RLE, and Huffman-weight FSE compression).
+///
+/// Uses C `zstd`'s branchless `FSE_symbolCompressionTransform` (`delta_nb_bits |
+/// (delta_find_state << 32)` in `sym_tt`) over `+table_size`-biased states in
+/// `state_table_biased`.
 pub(crate) struct FseEncTable {
-    state_table: [u8; MAX_ENC_TABLE_SIZE],
-    meta: [FseSymMeta; MAX_FSE_SYMBOLS],
-    packed_meta: [u64; MAX_FSE_SYMBOLS],
+    state_table_biased: Pow2Array<u16, MAX_ENC_TABLE_SIZE>,
+    sym_tt: Pow2Array<u64, MAX_FSE_SYMBOLS>,
+    init_offset: Pow2Array<u8, MAX_FSE_SYMBOLS>,
     table_size: u16,
     accuracy_log: u8,
 }
@@ -1050,39 +1096,56 @@ pub(crate) struct FseEncTable {
 impl FseEncTable {
     pub(crate) const fn new_empty() -> Self {
         Self {
-            state_table: [0u8; MAX_ENC_TABLE_SIZE],
-            meta: [FseSymMeta::ZERO; MAX_FSE_SYMBOLS],
-            packed_meta: [0u64; MAX_FSE_SYMBOLS],
+            state_table_biased: Pow2Array::splat(0),
+            sym_tt: Pow2Array::splat(0),
+            init_offset: Pow2Array::splat(0),
             table_size: 0,
             accuracy_log: 0,
         }
     }
 
-    #[inline(always)]
-    pub(crate) const fn pack_view(&self) -> blaze_own::FsePackTable<'_> {
-        blaze_own::FsePackTable {
-            state_table: &self.state_table,
-            meta: &self.packed_meta,
-            table_size: self.table_size,
-            accuracy_log: self.accuracy_log,
-        }
+    #[inline]
+    pub(crate) fn write_ll_into(&self, dst: &mut blaze_own::FseSeqEncTables) {
+        dst.ll_tt.copy_from_slice(self.sym_tt.as_array());
+        dst.ll_st.copy_from_slice(self.state_table_biased.as_array());
+        dst.ll_table_size = self.table_size;
+        dst.ll_log = self.accuracy_log;
+    }
+
+    #[inline]
+    pub(crate) fn write_of_into(&self, dst: &mut blaze_own::FseSeqEncTables) {
+        dst.of_tt.copy_from_slice(self.sym_tt.as_array());
+        dst.of_st.copy_from_slice(self.state_table_biased.as_array());
+        dst.of_table_size = self.table_size;
+        dst.of_log = self.accuracy_log;
+    }
+
+    #[inline]
+    pub(crate) fn write_ml_into(&self, dst: &mut blaze_own::FseSeqEncTables) {
+        dst.ml_tt.copy_from_slice(self.sym_tt.as_array());
+        dst.ml_st.copy_from_slice(self.state_table_biased.as_array());
+        dst.ml_table_size = self.table_size;
+        dst.ml_log = self.accuracy_log;
     }
 
     /// Build a single-symbol RLE encoder table (`accuracy_log = 0`, 0 bits per transition).
     pub(crate) fn set_rle(&mut self, sym: u8) -> Result<(), ZstdError> {
-        self.meta.fill(FseSymMeta::ZERO);
-        self.packed_meta.fill(0);
-        if let Some(slot) = self.meta.get_mut(usize::from(sym)) {
-            *slot = FseSymMeta { offset: 0, count: 1, split: 0, max_nb: 0 };
-        } else {
+        let sym_idx = usize::from(sym);
+        if sym_idx >= MAX_FSE_SYMBOLS {
             return Err(ZstdError::CorruptFse);
         }
-        if let Some(p) = self.packed_meta.get_mut(usize::from(sym)) {
-            *p = 1u64 << 16;
-        }
-        if let Some(first) = self.state_table.first_mut() {
-            *first = 0;
-        }
+        self.sym_tt.fill(0);
+        self.init_offset.fill(0);
+        // `table_log = 0`, `table_size = 1`, `count = 1`, `cumul = 0`:
+        // `delta_nb_bits = (0 << 16).wrapping_sub(1)`, `delta_find_state = 0u32.wrapping_sub(1)`.
+        let delta_nb_bits = 0u32.wrapping_sub(1);
+        let delta_find_state = 0u32.wrapping_sub(1);
+        self.sym_tt.set_masked(
+            sym_idx,
+            u64::from(delta_nb_bits) | (u64::from(delta_find_state) << 32),
+        );
+        self.init_offset.set_masked(sym_idx, 0);
+        self.state_table_biased.set_masked(0, 1);
         self.table_size = 1;
         self.accuracy_log = 0;
         Ok(())
@@ -1100,85 +1163,125 @@ impl FseEncTable {
         Ok(table)
     }
 
-    pub(crate) fn rebuild_from_dec(&mut self, dec: &FseDecTable) -> Result<(), ZstdError> {
+    fn rebuild_from_dec_inner(&mut self, dec: &FseDecTable) -> bool {
         let log = dec.accuracy_log();
         if log > MAX_ENC_LOG {
-            return Err(ZstdError::CorruptFse);
+            return false;
         }
-        let table_size = 1usize << u32::from(log);
-        let mut counts = [0u16; MAX_FSE_SYMBOLS];
+        let log_u32 = u32::from(log);
+        let table_size = 1usize << log_u32;
+        let table_size_u32 = 1u32 << log_u32;
+        let table_size_u16 = table_size.truncate_to::<u16>();
+
+        let mut counts = Pow2Array::<u16, MAX_FSE_SYMBOLS>::splat(0);
         for state in 0..table_size {
-            let entry = dec.entry_masked(state);
-            let c = counts.get_mut(usize::from(entry.symbol)).ok_or(ZstdError::CorruptFse)?;
-            *c = c.checked_add(1).ok_or(ZstdError::CorruptFse)?;
+            let sym = usize::from(dec.entry_masked(state).symbol);
+            if sym >= MAX_FSE_SYMBOLS {
+                return false;
+            }
+            let c = counts.get_masked(sym);
+            counts.set_masked(sym, c.wrapping_add(1));
         }
 
-        self.meta.fill(FseSymMeta::ZERO);
-        self.packed_meta.fill(0);
+        self.sym_tt.fill(0);
+        self.init_offset.fill(0);
+
+        let mut write_pos = Pow2Array::<u16, MAX_FSE_SYMBOLS>::splat(0);
         let mut cursor: usize = 0;
         for sym in 0..MAX_FSE_SYMBOLS {
-            let count = *counts.get(sym).ok_or(ZstdError::CorruptFse)?;
-            if count == 0 {
+            let count_u16 = counts.get_masked(sym);
+            if count_u16 == 0 {
                 continue;
             }
-            let p = u32::from(count);
-            let high_bit = 31u32 - p.leading_zeros();
-            let max_nb = u32::from(log).checked_sub(high_bit).ok_or(ZstdError::CorruptFse)?;
-            let next_pow2 = 1u32 << (high_bit + 1);
-            let split_u32 = if max_nb == 0 {
-                0
-            } else {
-                (2u32 * p).saturating_sub(next_pow2) << (max_nb - 1)
-            };
-            let offset_u16 = u16::try_from(cursor).map_err(|_| ZstdError::CorruptFse)?;
-            let split_u16 = u16::try_from(split_u32).map_err(|_| ZstdError::CorruptFse)?;
-            let max_nb_u8 = u8::try_from(max_nb).map_err(|_| ZstdError::CorruptFse)?;
-            let slot = self.meta.get_mut(sym).ok_or(ZstdError::CorruptFse)?;
-            *slot = FseSymMeta {
-                offset: offset_u16,
-                count,
-                split: split_u16,
-                max_nb: max_nb_u8,
-            };
-            if let Some(pm) = self.packed_meta.get_mut(sym) {
-                *pm = u64::from(offset_u16)
-                    | (u64::from(count) << 16)
-                    | (u64::from(split_u16) << 32)
-                    | (u64::from(max_nb_u8) << 48);
-            }
-            cursor += usize::from(count);
-        }
+            let count = u32::from(count_u16);
+            let cursor_u32 = cursor.truncate_to::<u32>();
 
-        let mut write_pos = [0u16; MAX_FSE_SYMBOLS];
-        for sym in 0..MAX_FSE_SYMBOLS {
-            let dst = write_pos.get_mut(sym).ok_or(ZstdError::CorruptFse)?;
-            let m = *self.meta.get(sym).ok_or(ZstdError::CorruptFse)?;
-            *dst = m.offset;
+            // C `zstd` `FSE_symbolCompressionTransform`:
+            // `delta_nb_bits = (max_bits_out << 16) - min_state_plus`
+            // `delta_find_state = cumul - count` (wrapping u32, non-zero `delta_nb_bits` for all present symbols).
+            let (max_bits_out, min_state_plus) = if count == 1 {
+                (log_u32, table_size_u32)
+            } else {
+                let hb = 31u32.wrapping_sub(count.wrapping_sub(1).leading_zeros());
+                let mbo = log_u32.wrapping_sub(hb);
+                (mbo, count << mbo)
+            };
+            let delta_nb_bits = (max_bits_out << 16).wrapping_sub(min_state_plus);
+            let delta_find_state = cursor_u32.wrapping_sub(count);
+            self.sym_tt.set_masked(
+                sym,
+                u64::from(delta_nb_bits) | (u64::from(delta_find_state) << 32),
+            );
+            self.init_offset.set_masked(sym, cursor.truncate_to::<u8>());
+            write_pos.set_masked(sym, cursor.truncate_to::<u16>());
+
+            cursor = cursor.wrapping_add(usize::from(count_u16));
         }
 
         for state in 0..table_size {
-            let entry = dec.entry_masked(state);
-            let sym = usize::from(entry.symbol);
-            let pos_ref = write_pos.get_mut(sym).ok_or(ZstdError::CorruptFse)?;
-            let idx = usize::from(*pos_ref);
-            let slot = self.state_table.get_mut(idx).ok_or(ZstdError::CorruptFse)?;
-            *slot = u8::try_from(state).map_err(|_| ZstdError::CorruptFse)?;
-            *pos_ref = pos_ref.checked_add(1).ok_or(ZstdError::CorruptFse)?;
+            let sym = usize::from(dec.entry_masked(state).symbol);
+            let idx = usize::from(write_pos.get_masked(sym));
+            write_pos.set_masked(sym, idx.wrapping_add(1).truncate_to::<u16>());
+            self.state_table_biased
+                .set_masked(idx, state.wrapping_add(table_size).truncate_to::<u16>());
         }
 
-        self.table_size = u16::try_from(table_size).map_err(|_| ZstdError::CorruptFse)?;
+        self.table_size = table_size_u16;
         self.accuracy_log = log;
+        true
+    }
+
+    pub(crate) fn rebuild_from_dec(&mut self, dec: &FseDecTable) -> Result<(), ZstdError> {
+        if !self.rebuild_from_dec_inner(dec) {
+            return Err(ZstdError::CorruptFse);
+        }
         Ok(())
     }
 
-    /// Choose a valid decoder state for the last symbol `sym`.
+    /// Choose a valid unbiased decoder state (`0..table_size`) for the last symbol `sym`.
+    #[cfg(test)]
     #[inline(always)]
     pub(crate) fn init_state(&self, sym: u8) -> Option<u8> {
-        let m = *self.meta.get(usize::from(sym))?;
-        if m.count == 0 {
+        let s = usize::from(sym);
+        if s >= MAX_FSE_SYMBOLS || self.sym_tt.get_masked(s) == 0 {
             return None;
         }
-        self.state_table.get(usize::from(m.offset)).copied()
+        let off = usize::from(self.init_offset.get_masked(s));
+        let biased = self.state_table_biased.get_masked(off);
+        Some(biased.wrapping_sub(self.table_size).truncate_to::<u8>())
+    }
+
+    /// Choose a valid `+table_size`-biased state (`[table_size, 2 * table_size - 1]`) for `sym`.
+    #[inline(always)]
+    pub(crate) fn init_state_biased(&self, sym: u8) -> Option<u32> {
+        let s = usize::from(sym);
+        if s >= MAX_FSE_SYMBOLS || self.sym_tt.get_masked(s) == 0 {
+            return None;
+        }
+        let off = usize::from(self.init_offset.get_masked(s));
+        Some(u32::from(self.state_table_biased.get_masked(off)))
+    }
+
+    /// Remove the `+table_size` bias from a biased FSE state before writing the final `accuracy_log`
+    /// state bits to the reverse bitstream.
+    #[inline(always)]
+    pub(crate) fn finish_state(&self, state: u32) -> u32 {
+        state.wrapping_sub(u32::from(self.table_size))
+    }
+
+    /// Branchless C `zstd` `delta_nb_bits` + `delta_find_state` inverse transition on a biased
+    /// state (`state` in `[table_size, 2 * table_size - 1]`). Returns `(next_state_biased,
+    /// bits_val, num_bits)` with zero `cmp`/`cset` and zero `table_size` additions.
+    #[inline(always)]
+    pub(crate) fn encode_step_biased(&self, sym: u8, state: u32) -> (u32, u32, u32) {
+        let packed = self.sym_tt.get_masked(usize::from(sym));
+        let delta_nb_bits = low_u32(packed);
+        let delta_find_state = (packed >> 32).truncate_to::<u32>();
+        let nb_bits = state.wrapping_add(delta_nb_bits) >> 16;
+        let bits_val = state & ((1u32 << nb_bits).wrapping_sub(1));
+        let idx = (state >> nb_bits).wrapping_add(delta_find_state);
+        let next_state = u32::from(self.state_table_biased.get_masked(idx.widen_to::<usize>()));
+        (next_state, bits_val, nb_bits)
     }
 
     /// Branchless O(1) inverse transition when caller guarantees `sym` is present in this table
@@ -1186,41 +1289,9 @@ impl FseEncTable {
     #[cfg(test)]
     #[inline(always)]
     pub(crate) fn encode_step_fast(&self, sym: u8, target_state: u8) -> (u8, u32, u32) {
-        let m = self
-            .meta
-            .get(usize::from(sym) & (MAX_FSE_SYMBOLS - 1))
-            .copied()
-            .unwrap_or(FseSymMeta::ZERO);
-        let nb = u32::from(m.max_nb).wrapping_sub(u32::from(u16::from(target_state) < m.split));
-        let target = u32::from(target_state);
-        let bits = target & ((1u32 << nb) - 1);
-        let u = (target + u32::from(self.table_size)) >> nb;
-        let idx = usize::from(m.offset)
-            .wrapping_add(u.widen_to::<usize>())
-            .wrapping_sub(usize::from(m.count))
-            & (MAX_ENC_TABLE_SIZE - 1);
-        let prev_state = self.state_table.get(idx).copied().unwrap_or(0);
-        (prev_state, bits, nb)
-    }
-
-    /// O(1) branch-minimal inverse transition: find the unique `(prev_state, bits_val, num_bits)`
-    /// whose decoder transition from `prev_state` emits `sym` and lands on `target_state`.
-    #[inline(always)]
-    pub(crate) fn encode_step(&self, sym: u8, target_state: u8) -> Option<(u8, u32, u32)> {
-        let m = *self.meta.get(usize::from(sym))?;
-        if m.count == 0 {
-            return None;
-        }
-        let nb = if u16::from(target_state) < m.split {
-            u32::from(m.max_nb - 1)
-        } else {
-            u32::from(m.max_nb)
-        };
-        let target = u32::from(target_state);
-        let bits = target & ((1u32 << nb) - 1);
-        let u = (target + u32::from(self.table_size)) >> nb;
-        let rel = u.checked_sub(u32::from(m.count))?.widen_to::<usize>();
-        let prev_state = *self.state_table.get(usize::from(m.offset) + rel)?;
-        Some((prev_state, bits, nb))
+        let ts = u32::from(self.table_size);
+        let (next_biased, bits, nb) =
+            self.encode_step_biased(sym, u32::from(target_state).wrapping_add(ts));
+        (next_biased.wrapping_sub(ts).truncate_to::<u8>(), bits, nb)
     }
 }

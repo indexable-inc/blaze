@@ -1,6 +1,8 @@
 //! Pure `#![no_std]`, zero-unsafe 64-bit xxHash (`XXH64`), used by RFC 8878 Zstandard content
 //! checksums and re-exported by `bstd::digest`.
 
+use blaze_own::Int;
+
 #[inline]
 fn read_u32_le(bytes: &[u8]) -> u32 {
     match bytes.get(..4).and_then(|s| <[u8; 4]>::try_from(s).ok()) {
@@ -41,10 +43,7 @@ const fn xxh64_merge_round(acc: u64, val: u64) -> u64 {
 pub struct Xxh64 {
     seed: u64,
     total_len: u64,
-    v1: u64,
-    v2: u64,
-    v3: u64,
-    v4: u64,
+    v: [u64; 4],
     buf: [u8; 32],
     buf_len: usize,
 }
@@ -57,33 +56,20 @@ impl Xxh64 {
         Self {
             seed,
             total_len: 0,
-            v1: seed.wrapping_add(XXH64_P1).wrapping_add(XXH64_P2),
-            v2: seed.wrapping_add(XXH64_P2),
-            v3: seed,
-            v4: seed.wrapping_sub(XXH64_P1),
+            v: [
+                seed.wrapping_add(XXH64_P1).wrapping_add(XXH64_P2),
+                seed.wrapping_add(XXH64_P2),
+                seed,
+                seed.wrapping_sub(XXH64_P1),
+            ],
             buf: [0u8; 32],
             buf_len: 0,
         }
     }
 
-    #[inline]
-    fn consume_stripe(&mut self, stripe: &[u8]) {
-        if let (Some(a), Some(b), Some(c), Some(d)) = (
-            stripe.get(0..8),
-            stripe.get(8..16),
-            stripe.get(16..24),
-            stripe.get(24..32),
-        ) {
-            self.v1 = xxh64_round(self.v1, read_u64_le(a));
-            self.v2 = xxh64_round(self.v2, read_u64_le(b));
-            self.v3 = xxh64_round(self.v3, read_u64_le(c));
-            self.v4 = xxh64_round(self.v4, read_u64_le(d));
-        }
-    }
-
     /// Feed `bytes` into the hasher.
     pub fn update(&mut self, mut bytes: &[u8]) -> &mut Self {
-        self.total_len = self.total_len.wrapping_add(u64::try_from(bytes.len()).unwrap_or(0));
+        self.total_len = self.total_len.wrapping_add(bytes.len().widen_to::<u64>());
 
         if self.buf_len > 0 {
             let need = 32usize.saturating_sub(self.buf_len);
@@ -99,17 +85,14 @@ impl Xxh64 {
                     dst.copy_from_slice(head);
                 }
                 let stripe = self.buf;
-                self.consume_stripe(&stripe);
+                let _ = blaze_own::xxhash64_stripes(&mut self.v, &stripe);
                 self.buf_len = 0;
                 bytes = tail;
             }
         }
 
-        let mut chunks = bytes.chunks_exact(32);
-        for stripe in &mut chunks {
-            self.consume_stripe(stripe);
-        }
-        let rem = chunks.remainder();
+        let consumed = blaze_own::xxhash64_stripes(&mut self.v, bytes);
+        let rem = bytes.get(consumed..).unwrap_or(&[]);
         if !rem.is_empty() {
             if let Some(dst) = self.buf.get_mut(..rem.len()) {
                 dst.copy_from_slice(rem);
@@ -122,17 +105,17 @@ impl Xxh64 {
     /// Finalize and return the 64-bit `XXH64` hash.
     #[must_use]
     pub fn finish(&self) -> u64 {
+        let [v1, v2, v3, v4] = self.v;
         let mut h = if self.total_len >= 32 {
-            let acc = self
-                .v1
+            let acc = v1
                 .rotate_left(1)
-                .wrapping_add(self.v2.rotate_left(7))
-                .wrapping_add(self.v3.rotate_left(12))
-                .wrapping_add(self.v4.rotate_left(18));
-            let acc = xxh64_merge_round(acc, self.v1);
-            let acc = xxh64_merge_round(acc, self.v2);
-            let acc = xxh64_merge_round(acc, self.v3);
-            xxh64_merge_round(acc, self.v4)
+                .wrapping_add(v2.rotate_left(7))
+                .wrapping_add(v3.rotate_left(12))
+                .wrapping_add(v4.rotate_left(18));
+            let acc = xxh64_merge_round(acc, v1);
+            let acc = xxh64_merge_round(acc, v2);
+            let acc = xxh64_merge_round(acc, v3);
+            xxh64_merge_round(acc, v4)
         } else {
             self.seed.wrapping_add(XXH64_P5)
         };
@@ -173,7 +156,5 @@ impl Xxh64 {
 #[inline]
 #[must_use]
 pub fn xxh64(data: &[u8], seed: u64) -> u64 {
-    let mut h = Xxh64::new(seed);
-    h.update(data);
-    h.finish()
+    blaze_own::xxhash64_slice(data, seed)
 }
