@@ -3157,3 +3157,773 @@ pub extern \"C\" fn main() -> i32 {
     run_lazy_mode("LazyProgram + SecondCheck", false);
     run_lazy_mode("LazyProgram + FromRecord (blaze check -> blaze run)", true);
 }
+
+/// Shared `#![no_core]` harness mirroring `bstd::reflect` (`Enum`, `UnitEnum`, the 4 enum
+/// introspection intrinsics, `has_unique_lowercase_variants`, `has_unique_snake_variants`, and
+/// blanket `EnumMeta` / `FromVariantStr` / `FromLowercaseStr` / `FromSnakeStr` impls gated by
+/// `where const`).
+const ENUM_TRAITS_HARNESS: &str = r#"#![feature(no_core, lang_items)]
+#![no_core]
+#![no_main]
+
+#[lang = "sized"]
+trait Sized {}
+
+#[lang = "copy"]
+trait Copy {}
+
+#[lang = "panic_bounds_check"]
+fn panic_bounds_check(_index: usize, _len: usize) -> ! {
+    loop {}
+}
+
+#[lang = "blaze_enum"]
+trait Enum {}
+
+#[lang = "blaze_unit_enum"]
+trait UnitEnum: Enum {}
+
+#[rustc_intrinsic]
+const fn blaze_is_enum<T>() -> bool;
+
+#[rustc_intrinsic]
+const fn blaze_is_unit_enum<T>() -> bool;
+
+#[rustc_intrinsic]
+const fn blaze_variant_count<T>() -> usize;
+
+#[rustc_intrinsic]
+const fn blaze_variant_name<T>(index: usize) -> &'static str;
+
+impl Copy for bool {}
+impl Copy for u8 {}
+impl Copy for u32 {}
+impl Copy for i32 {}
+impl Copy for usize {}
+impl Copy for *const u8 {}
+
+union StrSlice { s: &'static str, bytes: &'static [u8] }
+
+#[repr(C)]
+struct StrParts { ptr: *const u8, len: usize }
+impl Copy for StrParts {}
+
+union StrWide { s: &'static str, parts: StrParts }
+
+const fn str_len(s: &'static str) -> usize {
+    unsafe { StrWide { s }.parts.len }
+}
+
+const fn str_byte(s: &'static str, idx: usize) -> u8 {
+    let bytes: &'static [u8] = unsafe { StrSlice { s }.bytes };
+    bytes[idx]
+}
+
+const fn str_eq(a: &'static str, b: &'static str) -> bool {
+    let n = str_len(a);
+    if n != str_len(b) {
+        return false;
+    }
+    let mut i = 0usize;
+    while i < n {
+        if str_byte(a, i) != str_byte(b, i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+const fn is_upper(b: u8) -> bool { b >= b'A' && b <= b'Z' }
+const fn is_lower(b: u8) -> bool { b >= b'a' && b <= b'z' }
+const fn is_digit(b: u8) -> bool { b >= b'0' && b <= b'9' }
+const fn to_lower(b: u8) -> u8 { if is_upper(b) { b + 32 } else { b } }
+
+const fn ascii_lower_eq(a: &'static str, b: &'static str) -> bool {
+    let n = str_len(a);
+    if n != str_len(b) {
+        return false;
+    }
+    let mut i = 0usize;
+    while i < n {
+        if to_lower(str_byte(a, i)) != to_lower(str_byte(b, i)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+const fn next_snake(s: &'static str, n: usize, i: usize, sep: bool) -> (bool, u8, usize, bool) {
+    if i >= n {
+        return (false, 0, i, false);
+    }
+    let b = str_byte(s, i);
+    if is_upper(b) {
+        if i > 0 && !sep {
+            let prev = str_byte(s, i - 1);
+            let next = if i + 1 < n { str_byte(s, i + 1) } else { 0 };
+            let boundary = prev != b'_'
+                && (is_lower(prev)
+                    || is_digit(prev)
+                    || prev >= 0x80
+                    || (is_upper(prev) && is_lower(next)));
+            if boundary {
+                return (true, b'_', i, true);
+            }
+        }
+        (true, b + 32, i + 1, false)
+    } else {
+        (true, b, i + 1, false)
+    }
+}
+
+const fn snake_eq(a: &'static str, b: &'static str) -> bool {
+    let an = str_len(a);
+    let bn = str_len(b);
+    let mut ai = 0usize;
+    let mut a_sep = false;
+    let mut bi = 0usize;
+    let mut b_sep = false;
+    loop {
+        let (a_ok, ac, next_ai, next_as) = next_snake(a, an, ai, a_sep);
+        let (b_ok, bc, next_bi, next_bs) = next_snake(b, bn, bi, b_sep);
+        if !a_ok && !b_ok {
+            return true;
+        }
+        if a_ok != b_ok || ac != bc {
+            return false;
+        }
+        ai = next_ai;
+        a_sep = next_as;
+        bi = next_bi;
+        b_sep = next_bs;
+    }
+}
+
+const fn has_unique_lowercase_variants<E>() -> bool {
+    if !blaze_is_enum::<E>() {
+        return false;
+    }
+    let n = blaze_variant_count::<E>();
+    let mut i = 0usize;
+    while i < n {
+        let a = blaze_variant_name::<E>(i);
+        let mut j = i + 1;
+        while j < n {
+            if ascii_lower_eq(a, blaze_variant_name::<E>(j)) {
+                return false;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+const fn has_unique_snake_variants<E>() -> bool {
+    if !blaze_is_enum::<E>() {
+        return false;
+    }
+    let n = blaze_variant_count::<E>();
+    let mut i = 0usize;
+    while i < n {
+        let a = blaze_variant_name::<E>(i);
+        let mut j = i + 1;
+        while j < n {
+            if snake_eq(a, blaze_variant_name::<E>(j)) {
+                return false;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+enum MyOpt<T> {
+    None,
+    Some(T),
+}
+
+trait EnumMeta: Enum {
+    fn as_str(&self) -> &'static str;
+    fn as_lowercase_str(&self) -> &'static str;
+    fn as_snake_str(&self) -> &'static str;
+    fn variant_index(&self) -> usize;
+    fn variant_count() -> usize;
+}
+
+trait FromVariantStr: UnitEnum + Sized {
+    fn from_variant_str(s: &'static str) -> MyOpt<Self>;
+}
+
+trait FromLowercaseStr: UnitEnum + Sized {
+    fn from_lowercase_str(s: &'static str) -> MyOpt<Self>;
+}
+
+trait FromSnakeStr: UnitEnum + Sized {
+    fn from_snake_str(s: &'static str) -> MyOpt<Self>;
+}
+
+impl<E: Enum> EnumMeta for E {
+    fn as_str(&self) -> &'static str {
+        inline for arm in self { arm.name }
+    }
+    fn as_lowercase_str(&self) -> &'static str {
+        inline for arm in self { arm.lower }
+    }
+    fn as_snake_str(&self) -> &'static str {
+        inline for arm in self { arm.snake }
+    }
+    fn variant_index(&self) -> usize {
+        inline for arm in self { arm.index }
+    }
+    fn variant_count() -> usize {
+        blaze_variant_count::<Self>()
+    }
+}
+
+impl<E: UnitEnum> FromVariantStr for E {
+    fn from_variant_str(s: &'static str) -> MyOpt<Self> {
+        inline for v in variants::<Self>() {
+            if str_eq(s, v.name) {
+                return MyOpt::Some(v.value);
+            }
+        }
+        MyOpt::None
+    }
+}
+
+impl<E: UnitEnum> FromLowercaseStr for E
+where
+    const { has_unique_lowercase_variants::<E>() }
+{
+    fn from_lowercase_str(s: &'static str) -> MyOpt<Self> {
+        inline for v in variants::<Self>() {
+            if str_eq(s, v.lower) {
+                return MyOpt::Some(v.value);
+            }
+        }
+        MyOpt::None
+    }
+}
+
+impl<E: UnitEnum> FromSnakeStr for E
+where
+    const { has_unique_snake_variants::<E>() }
+{
+    fn from_snake_str(s: &'static str) -> MyOpt<Self> {
+        inline for v in variants::<Self>() {
+            if str_eq(s, v.snake) {
+                return MyOpt::Some(v.value);
+            }
+        }
+        MyOpt::None
+    }
+}
+"#;
+
+/// End-to-end verification of `Enum`, `UnitEnum`, enum introspection intrinsics, `where const`
+/// uniqueness bounds, typed variant descriptors, raw identifiers, UTF-8 names, uninhabited enums,
+/// and payload enums — executed through BOTH `Front2Program` AND `LazyProgram` (`SecondCheck` +
+/// `FromRecord`, proving `where const` survives frozen `HeadRecord`s!).
+#[test]
+fn enum_traits_where_const_and_edge_cases_run_both_front2_and_lazy_from_record() {
+    let body = r#"
+enum ViewKind {
+    Inspector,
+    Graph,
+    Archetypes,
+    Query,
+    Schemas,
+}
+
+enum BuiltinRel {
+    ChildOf,
+    IsA,
+    OnDeleteCascade,
+    HTTPServer,
+}
+
+enum Weird {
+    SomeEnum,
+    someenum,
+}
+
+enum WeirdSnake {
+    FooBar,
+    foo_bar,
+}
+
+enum RawKw {
+    r#type,
+    r#match,
+}
+
+enum Never {}
+
+enum Shape {
+    Empty,
+    Circle(u32),
+    Rect { w: u32, h: u32 },
+}
+
+enum I18n {
+    CaféItem,
+    Alpha,
+}
+
+struct Point { x: u32 }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn main() -> i32 {
+    let mut score: u32 = 0;
+
+    // 1. EnumMeta + FromVariantStr / FromLowercaseStr / FromSnakeStr on ViewKind & BuiltinRel: +20
+    if str_eq(ViewKind::Graph.as_str(), "Graph") { score = score + 2; }
+    if str_eq(ViewKind::Archetypes.as_lowercase_str(), "archetypes") { score = score + 2; }
+    if str_eq(BuiltinRel::OnDeleteCascade.as_snake_str(), "on_delete_cascade") { score = score + 2; }
+    if ViewKind::Schemas.variant_index() == 4 && ViewKind::variant_count() == 5 { score = score + 2; }
+    if let MyOpt::Some(ViewKind::Query) = ViewKind::from_lowercase_str("query") { score = score + 3; }
+    if let MyOpt::Some(ViewKind::Inspector) = ViewKind::from_variant_str("Inspector") { score = score + 3; }
+    if let MyOpt::Some(BuiltinRel::HTTPServer) = BuiltinRel::from_snake_str("http_server") { score = score + 3; }
+    if let MyOpt::None = ViewKind::from_lowercase_str("missing") { score = score + 3; }
+
+    // 2. Case-colliding `Weird`: exact `as_str` and `from_variant_str` still work (+8 => 28)
+    if str_eq(Weird::SomeEnum.as_str(), "SomeEnum") && str_eq(Weird::someenum.as_str(), "someenum") {
+        score = score + 4;
+    }
+    if let MyOpt::Some(Weird::someenum) = Weird::from_variant_str("someenum") {
+        score = score + 4;
+    }
+
+    // 3. Snake-colliding `WeirdSnake`: exact + lowercase BOTH still work ("foobar" != "foo_bar") (+8 => 36)
+    if let MyOpt::Some(WeirdSnake::FooBar) = WeirdSnake::from_lowercase_str("foobar") {
+        score = score + 4;
+    }
+    if let MyOpt::Some(WeirdSnake::foo_bar) = WeirdSnake::from_lowercase_str("foo_bar") {
+        score = score + 4;
+    }
+
+    // 4. Raw-identifier variants `r#type`, `r#match` strip `r#` in strings (+8 => 44)
+    if str_eq(RawKw::r#type.as_str(), "type") && str_eq(RawKw::r#match.as_lowercase_str(), "match") {
+        score = score + 4;
+    }
+    if let MyOpt::Some(RawKw::r#type) = RawKw::from_variant_str("type") {
+        score = score + 2;
+    }
+    if let MyOpt::Some(RawKw::r#match) = RawKw::from_lowercase_str("match") {
+        score = score + 2;
+    }
+
+    // 5. Empty enum `Never` + payload enum `Shape` + non-enum `Point` intrinsics (+10 => 54)
+    if Never::variant_count() == 0 && blaze_is_enum::<Never>() && blaze_is_unit_enum::<Never>() {
+        score = score + 3;
+    }
+    if let MyOpt::None = Never::from_lowercase_str("anything") {
+        score = score + 2;
+    }
+    let sh = Shape::Circle(7);
+    if str_eq(sh.as_str(), "Circle") && sh.variant_index() == 1 && Shape::variant_count() == 3 {
+        score = score + 3;
+    }
+    if blaze_is_enum::<Shape>() && !blaze_is_unit_enum::<Shape>() && !blaze_is_enum::<Point>() && blaze_variant_count::<Point>() == 0 {
+        score = score + 2;
+    }
+
+    // 6. UTF-8 variant name preserved cleanly in snake_case (+6 => 60)
+    if str_eq(I18n::CaféItem.as_snake_str(), "café_item") {
+        score = score + 6;
+    }
+
+    score as i32
+}
+"#;
+    let src = [ENUM_TRAITS_HARNESS, body].concat();
+
+    // 1. Front2Program end-to-end native execution
+    let files = [SourceFile { path: "src/main.rs", text: &src }];
+    let got = run_with(&files, "src/main.rs", None, FrontChoice::New(NEW), blaze_own::testing::heap().shared())
+        .map_err(|e| format!("{e}").replace('\n', " "));
+    assert_eq!(got, Ok(60), "Front2Program enum traits failed");
+
+    // 2. LazyProgram `SecondCheck` AND `FromRecord` (real `blaze check` -> `blaze run` pipeline!)
+    use blaze_build::{OverflowChecks, Panic, UbChecks};
+    use blaze_emit::{Isa, Os};
+    use blaze_ids::Hasher;
+    use blaze_ids::producer::{CodeBuilder, Producers};
+    use blaze_ladder::body_ids::{BodyId, BodyIds, Fixture, Make, Read, RowKind, Walk};
+    use blaze_ladder::code_records::{Builder, CodeStore, EntryView, MemoryStore, Settings, TierName};
+    use blaze_ladder::crates::{Inputs, Toolchain};
+    use blaze_ladder::front2::keys::checker_of;
+    use blaze_ladder::front2::program::Front2Program;
+    use blaze_ladder::front2::program::lazy::LazyProgram;
+    use blaze_ladder::front2::program::lazy::typed::{TypedGap, TypedRecords};
+    use blaze_ladder::front2::project::{BodyRef, ProjectWorld};
+    use blaze_ladder::front2::source::NamesSource as _;
+    use blaze_ladder::program_texts::ProgramTexts;
+    use blaze_ladder::run::RunError;
+    use blaze_ladder::run::make_one::{CheckCount, FromRecord, MakerState, SecondCheck, Typing, make_instance, walk_records};
+    use blaze_ladder::seam::FrontEnd;
+    use blaze_mem::Frame;
+    use blaze_own::AVec;
+    use blaze_toolchain::ToolchainId;
+    use blaze_typeck::ItemKey;
+
+    let heap = blaze_own::testing::heap();
+    let alloc = heap.alloc();
+    let frame = Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
+    let tc = Toolchain::none(alloc);
+    let texts = ProgramTexts::new(&files, "src/main.rs", NEW, &tc, Panic::Abort).expect("program texts");
+    let user = texts.user();
+    let inputs = Inputs::new(&user, &tc).expect("inputs");
+    let crates = inputs.crates();
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).expect("names");
+
+    let mut encoded_records: blaze_own::Vec<(ItemKey, blaze_own::Vec<u8, blaze_own::Alloc<'static>>), blaze_own::Alloc<'static>> =
+        blaze_own::Vec::new_in(alloc);
+    {
+        let check_frame = Frame::new(blaze_mem::tag::Tag::Infer).expect("check frame");
+        let mut world = ProjectWorld::new(&names, &check_frame, &files, alloc).expect("project world");
+        let mut fn_items = blaze_own::Vec::new_in(alloc);
+        let mut impl_items = blaze_own::Vec::new_in(alloc);
+        (&names).each_item(0, &mut |item, _| {
+            match (&names).kind_of_item(item) {
+                Some(blaze_surface::ItemKind::Function) => fn_items.push(item),
+                Some(blaze_surface::ItemKind::Impl) => impl_items.push(item),
+                _ => {}
+            }
+        });
+        for item in fn_items {
+            let fn_name = (&names).name_of(item).unwrap_or("");
+            if fn_name.starts_with("blaze_") {
+                continue;
+            }
+            let (verdict, _borrows) = world.check_borrows(BodyRef::Free(item), alloc);
+            assert!(verdict.diagnostics.is_empty(), "{fn_name}: check diagnostics: {:?}", verdict.diagnostics);
+            assert!(verdict.gaps.is_empty(), "{fn_name}: check gaps: {:?}", verdict.gaps);
+            assert!(verdict.refused.is_none(), "{fn_name}: check refused: {:?}", verdict.refused);
+            let bytes = verdict.typed.expect("typed record encoded").expect("clean typed record");
+            let mut copy = blaze_own::Vec::with_capacity_in(bytes.len(), alloc);
+            copy.extend_from_slice(bytes.as_slice());
+            encoded_records.push((checker_of(item), copy));
+        }
+        for imp in impl_items {
+            let mut member_names: blaze_own::Vec<&str, _> = blaze_own::Vec::new_in(alloc);
+            (&names).each_member(imp, &mut |m| {
+                if m.kind == blaze_surface::ItemKind::Function
+                    && let Some(n) = m.name
+                {
+                    member_names.push(n);
+                }
+            });
+            for mname in member_names {
+                let (verdict, _borrows) = world.check_borrows(
+                    BodyRef::Member { container: imp, is_trait: false, kind: blaze_ladder::front2::keys::MemberKind::Fn, name: mname },
+                    alloc,
+                );
+                assert!(verdict.diagnostics.is_empty(), "impl member {mname}: check diagnostics: {:?}", verdict.diagnostics);
+                assert!(verdict.gaps.is_empty(), "impl member {mname}: check gaps: {:?}", verdict.gaps);
+                assert!(verdict.refused.is_none(), "impl member {mname}: check refused: {:?}", verdict.refused);
+                let bytes = verdict.typed.expect("typed record encoded").expect("clean typed record");
+                let mut copy = blaze_own::Vec::with_capacity_in(bytes.len(), alloc);
+                copy.extend_from_slice(bytes.as_slice());
+                let mk = blaze_ladder::front2::keys::member_key_of(checker_of(imp), blaze_ladder::front2::keys::MemberKind::Fn, mname);
+                encoded_records.push((mk, copy));
+            }
+        }
+    }
+
+    struct EveryItem;
+    static READS: [Read; 1] = [Read { fact: [3; 32], digest: [4; 32] }];
+    impl BodyIds for EveryItem {
+        fn body_check(&self, item: ItemKey) -> Option<BodyId<'_>> {
+            Some(BodyId { key: Hasher::new("enum-traits lazy test").part(&item.0.to_le_bytes()[..]).finish(), reads: &READS })
+        }
+        fn today(&self, fact: &[u8; 32]) -> Option<[u8; 32]> {
+            (*fact == READS[0].fact).then_some(READS[0].digest)
+        }
+        fn crate_fact(&self, _: ItemKey) -> Option<Read> {
+            Some(Read { fact: [8; 32], digest: [9; 32] })
+        }
+    }
+
+    struct MapTyped {
+        records: blaze_own::Vec<(ItemKey, blaze_own::Vec<u8, blaze_own::Alloc<'static>>), blaze_own::Alloc<'static>>,
+        alloc: blaze_own::Alloc<'static>,
+    }
+    impl TypedRecords for MapTyped {
+        fn typed(&mut self, key: ItemKey) -> Result<blaze_typeck::Checked<'static>, TypedGap> {
+            let Some((_, bytes)) = self.records.iter().find(|(k, _)| *k == key) else {
+                return Err(TypedGap::NoRecord { key });
+            };
+            blaze_typeck::checked_record::decode(bytes.as_slice(), self.alloc)
+                .map_err(|why| TypedGap::Record { key, why })
+        }
+    }
+
+    struct LazyWalkMaker<'p, P, T> {
+        program: &'p mut P,
+        typing: T,
+        state: Option<MakerState>,
+        checks: CheckCount,
+        isa: Isa,
+        overflow: OverflowChecks,
+        ub: UbChecks,
+        panic: Panic,
+        alloc: blaze_own::Alloc<'static>,
+    }
+    impl<P: FrontEnd, T: Typing<P>> Make for LazyWalkMaker<'_, P, T> {
+        type Error = RunError;
+        type Grant = Fixture;
+        fn make(&mut self, _grant: &Fixture, tabled: ItemKey, name: &[u8], entry: &mut AVec<'_, u8>) -> Result<(), Self::Error> {
+            if self.state.is_none() {
+                self.state = Some(MakerState::new(self.program, tabled, self.isa, self.overflow, self.ub, self.panic, self.alloc)?);
+            }
+            let Some(state) = self.state.as_mut() else {
+                return Err(RunError::OneBody { key: tabled, why: "maker state missing" });
+            };
+            make_instance(self.program, &mut self.typing, state, &mut self.checks, tabled, name, entry)
+        }
+        fn make_static(&mut self, _grant: &Fixture, item: ItemKey, _: &mut AVec<'_, u8>) -> Result<(), Self::Error> {
+            Err(RunError::OneBody { key: item, why: "unexpected static" })
+        }
+        fn make_thread_local(&mut self, _grant: &Fixture, item: ItemKey, _: &mut AVec<'_, u8>) -> Result<(), Self::Error> {
+            Err(RunError::OneBody { key: item, why: "unexpected tls" })
+        }
+    }
+
+    let whole = Front2Program::new(&names, &frame, &files, alloc).expect("whole program");
+    let entry = whole.function(whole.entry().expect("entry")).key;
+    let producer = Producers::for_tests(b"enum-traits lazy").get::<CodeBuilder>();
+    let isa = Isa { lse: true, os: if cfg!(target_os = "macos") { Os::MacOs } else { Os::Linux } };
+    let builder = Builder {
+        isa,
+        tier: TierName::Reference,
+        settings: Settings::baseline(OverflowChecks::Off, Panic::Abort),
+        toolchain: ToolchainId([8; 32]),
+        producer,
+        edition: edition::PackageEdition::of_manifest("blaze-2026.11").expect("blaze edition"),
+    };
+
+    let run_lazy = |label: &str, use_records: bool| {
+        let mut lazy = LazyProgram::new(&names, &frame, &files, Some(entry), alloc).expect("lazy program");
+        lazy.decide_start(blaze_ladder::run::special::MakerStart::ByRule).expect("decide_start");
+        let mut store = MemoryStore::new_in(alloc);
+        let walk: Walk<'_> = if use_records {
+            let mut maker = LazyWalkMaker {
+                program: &mut lazy,
+                typing: FromRecord(MapTyped { records: encoded_records.clone(), alloc }),
+                state: None,
+                checks: CheckCount::default(),
+                isa,
+                overflow: OverflowChecks::Off,
+                ub: UbChecks::Off,
+                panic: Panic::Abort,
+                alloc,
+            };
+            walk_records(entry, &EveryItem, &mut store, &builder, &producer, &mut maker, alloc)
+                .unwrap_or_else(|e| panic!("{label}: walk_records failed: {e}"))
+                .0
+        } else {
+            let mut maker = LazyWalkMaker {
+                program: &mut lazy,
+                typing: SecondCheck,
+                state: None,
+                checks: CheckCount::default(),
+                isa,
+                overflow: OverflowChecks::Off,
+                ub: UbChecks::Off,
+                panic: Panic::Abort,
+                alloc,
+            };
+            walk_records(entry, &EveryItem, &mut store, &builder, &producer, &mut maker, alloc)
+                .unwrap_or_else(|e| panic!("{label}: walk_records failed: {e}"))
+                .0
+        };
+        #[cfg(target_arch = "aarch64")]
+        {
+            use blaze_code::image::{Image, Kind, Member, lay_out_positions};
+            use blaze_code::record::{Space, Target};
+            use blaze_launch_rt::sys::{Code, page};
+
+            let mut members = blaze_own::Vec::new_in(alloc);
+            for row in 0..walk.len() {
+                assert_eq!(walk.kind(row), RowKind::Instance);
+                let bytes = store.get(walk.key(row).expect("record key")).expect("store get").expect("record");
+                members.push(Member { symbol: walk.symbol(row), record: EntryView::read(bytes).expect("entry").record });
+            }
+            let pg = page().expect("page size");
+            let segment = lay_out_positions(&members, Kind::Bundle, pg as u64, alloc, |_, row| {
+                Ok(lazy.source_position(ItemKey(row.item), row.site).expect("source position"))
+            })
+            .expect("lay out");
+            let mut memory = Code::map(segment.size as usize).expect("map");
+            let base = memory.base() as u64;
+            let mut image = Image::new(base, pg as u64, alloc).expect("image");
+            let placed = image.append(&segment).expect("append");
+            assert!(placed.outside.is_empty(), "{label}: unexpected native import");
+            memory.write(0, &segment.code).expect("write code");
+            memory.write(segment.relro_at as usize, &segment.relro).expect("write relro");
+            for write in placed.writes.iter() {
+                memory.write((write.at - base) as usize, &write.value.to_le_bytes()).expect("write reloc");
+            }
+            let addr = image.home(Target { space: Space::Func, symbol: walk.symbol(0) }).expect("main");
+            let main_fn: extern "C-unwind" fn() -> i32 = unsafe { core::mem::transmute(addr as usize) };
+            assert_eq!(main_fn(), 60, "{label}: native execution returned wrong value");
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        let _ = walk;
+    };
+
+    run_lazy("LazyProgram + SecondCheck", false);
+    run_lazy("LazyProgram + FromRecord", true);
+}
+
+/// Negative compile-time checks:
+/// - `enum Weird { SomeEnum, someenum }` fails `FromLowercaseStr` via `where const`!
+/// - `enum WeirdSnake { FooBar, foo_bar }` fails `FromSnakeStr` via `where const`!
+/// - Payload enum fails `UnitEnum` (`FromVariantStr`), struct fails `Enum` (`EnumMeta`)!
+/// - Definition-time strict checks catch unbounded `variants::<E>()`, `v.value` without `UnitEnum`,
+///   descriptor field typos (`arm.bogus`), and wrong return types with ZERO callers!
+#[test]
+fn enum_traits_where_const_and_definition_time_errors_are_rejected() {
+    let run_cases = [
+        (
+            "case-colliding enum rejected by FromLowercaseStr where const",
+            r#"
+enum Weird { SomeEnum, someenum }
+#[unsafe(no_mangle)]
+pub extern "C" fn main() -> i32 {
+    let _ = Weird::from_lowercase_str("someenum");
+    0
+}
+"#,
+        ),
+        (
+            "snake-colliding enum rejected by FromSnakeStr where const",
+            r#"
+enum WeirdSnake { FooBar, foo_bar }
+#[unsafe(no_mangle)]
+pub extern "C" fn main() -> i32 {
+    let _ = WeirdSnake::from_snake_str("foo_bar");
+    0
+}
+"#,
+        ),
+        (
+            "payload enum rejected by UnitEnum / FromVariantStr",
+            r#"
+enum Shape { Empty, Circle(u32) }
+#[unsafe(no_mangle)]
+pub extern "C" fn main() -> i32 {
+    let _ = Shape::from_variant_str("Empty");
+    0
+}
+"#,
+        ),
+        (
+            "struct rejected by Enum / EnumMeta",
+            r#"
+struct Point { x: u32 }
+#[unsafe(no_mangle)]
+pub extern "C" fn main() -> i32 {
+    let p = Point { x: 1 };
+    let _ = p.as_str();
+    0
+}
+"#,
+        ),
+    ];
+
+    for (label, body) in run_cases {
+        let src = [ENUM_TRAITS_HARNESS, body].concat();
+        let files = [SourceFile { path: "src/main.rs", text: &src }];
+        let res = run_with(&files, "src/main.rs", None, FrontChoice::New(NEW), blaze_own::testing::heap().shared());
+        assert!(res.is_err(), "expected compile-time rejection for: {label}");
+    }
+
+    // Definition-time strict checks with ZERO callers (as `blaze check` runs on every item).
+    use blaze_build::Panic;
+    use blaze_ladder::crates::{Inputs, Toolchain};
+    use blaze_ladder::front2::project::{BodyRef, ProjectWorld};
+    use blaze_ladder::front2::source::NamesSource as _;
+    use blaze_ladder::program_texts::ProgramTexts;
+    use blaze_mem::Frame;
+
+    let def_time_cases = [
+        (
+            "definition-time error: unbounded generic variants::<E>() with zero callers",
+            "bad_unbounded",
+            r#"
+fn bad_unbounded<E>() -> usize {
+    let mut n = 0usize;
+    inline for _ in variants::<E>() { n = n + 1; }
+    n
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn main() -> i32 { 0 }
+"#,
+        ),
+        (
+            "definition-time error: variants::<E>() v.value requires UnitEnum with zero callers",
+            "bad_needs_unit",
+            r#"
+fn bad_needs_unit<E: Enum>() -> MyOpt<E> {
+    inline for v in variants::<E>() { return MyOpt::Some(v.value); }
+    MyOpt::None
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn main() -> i32 { 0 }
+"#,
+        ),
+        (
+            "definition-time error: descriptor field typo caught with zero callers",
+            "bad_typo",
+            r#"
+fn bad_typo<E: Enum>(e: E) -> &'static str {
+    inline for arm in e { arm.bogus }
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn main() -> i32 { 0 }
+"#,
+        ),
+        (
+            "definition-time error: return type mismatch caught with zero callers",
+            "bad_ret",
+            r#"
+fn bad_ret<E: Enum>(e: E) -> u32 {
+    inline for arm in e { arm.name }
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn main() -> i32 { 0 }
+"#,
+        ),
+    ];
+
+    for (label, target_fn, body) in def_time_cases {
+        let src = [ENUM_TRAITS_HARNESS, body].concat();
+        let files = [SourceFile { path: "src/main.rs", text: &src }];
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let frame = Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
+        let tc = Toolchain::none(alloc);
+        let texts = ProgramTexts::new(&files, "src/main.rs", NEW, &tc, Panic::Abort).expect("program texts");
+        let user = texts.user();
+        let inputs = Inputs::new(&user, &tc).expect("inputs");
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, blaze_own::testing::bump()).expect("names");
+        let mut world = ProjectWorld::new(&names, &frame, &files, alloc).expect("project world");
+        let mut found = None;
+        (&names).each_item(0, &mut |item, _| {
+            if (&names).name_of(item) == Some(target_fn) {
+                found = Some(item);
+            }
+        });
+        let target = found.unwrap_or_else(|| panic!("missing fn `{target_fn}`"));
+        let (verdict, _borrows) = world.check_borrows(BodyRef::Free(target), alloc);
+        let rejected = !verdict.diagnostics.is_empty() || verdict.refused.is_some();
+        assert!(rejected, "expected definition-time rejection with zero callers for: {label} (got clean verdict)");
+    }
+}

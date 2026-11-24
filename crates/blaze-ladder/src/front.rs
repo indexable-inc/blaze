@@ -1115,6 +1115,8 @@ fn trait_lang(name: &str) -> Option<LangItem> {
         "discriminant_kind" => LangItem::DiscriminantKind,
         "future_trait" => LangItem::Future,
         "from" => LangItem::From,
+        "blaze_enum" => LangItem::Enum,
+        "blaze_unit_enum" => LangItem::UnitEnum,
         _ => return None,
     })
 }

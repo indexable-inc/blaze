@@ -112,7 +112,7 @@
 // Two builders (std.md, "Two builders"): what is plain Rust is compiled by rustc and by blaze;
 // what needs blaze's extensions is under `cfg(blaze)`, the cfg blaze sets for every crate it
 // compiles, each with a plain form under `cfg(not(blaze))` that says what the extension adds.
-#![cfg_attr(blaze, feature(blaze_comptime, blaze_const_exprs, blaze_verify))]
+#![cfg_attr(blaze, feature(blaze_comptime, blaze_const_exprs, blaze_verify, lang_items))]
 #![feature(
     allocator_ext,
     atomic_internals,
@@ -212,6 +212,9 @@ pub mod entry;
 pub mod env;
 /// Who decides how a pure function is computed: `Eval` and its providers, memo points, keys.
 pub mod eval;
+/// Zero-cost compile-time enum reflection traits (`Enum`, `UnitEnum`, `EnumMeta`,
+/// `FromVariantStr`, `FromLowercaseStr`, `FromSnakeStr`) and `const fn` introspection.
+pub mod reflect;
 /// Flat values: `Flat`, bytes that mean the same on any thread, process or machine.
 #[expect(
     unsafe_code,
@@ -905,6 +908,7 @@ pub mod prelude {
             cx::Cx,
             entry::Error,
             mem::{Alloc, Frame, Heap, String, format_in},
+            reflect::{Enum, EnumMeta, FromLowercaseStr, FromSnakeStr, FromVariantStr, UnitEnum},
             vec::Vec,
         };
 

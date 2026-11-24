@@ -682,6 +682,10 @@ impl<'n, S: NamesSource<'n>> blaze_build::type_name::TypeNames for ConstsWorld<'
     fn item_path(&self, item: ItemKey, out: &mut dyn FnMut(&str)) -> bool {
         super::type_name::item_path(self.names, self.keys, self.store, item, out)
     }
+
+    fn variant_name(&self, adt: ItemKey, variant: u32, out: &mut dyn FnMut(&str)) -> bool {
+        super::type_name::variant_name(self.names, self.keys, adt, variant, out)
+    }
 }
 
 /// Where an evaluation starts ([`Consts::value_at`]): `item` at no arguments; a trait's

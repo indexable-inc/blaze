@@ -741,6 +741,10 @@ pub enum Lang {
     CallRefFuture,
     /// The trait `From` (`from` / `core::convert::From`), for error-union conversions.
     From,
+    /// Compiler-builtin marker trait satisfied by every `enum` ADT (`#[lang = "blaze_enum"]`).
+    Enum,
+    /// Compiler-builtin marker trait satisfied by every fieldless `enum` ADT (`#[lang = "blaze_unit_enum"]`).
+    UnitEnum,
 }
 
 /// The shape of a self type impls are bucketed by (rustc's `SimplifiedType`, blaze-impls'

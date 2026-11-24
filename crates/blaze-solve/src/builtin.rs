@@ -429,6 +429,22 @@ pub fn assemble<T: Tys, F: Facts>(
                     out.push(certain(Certainty::Yes));
                 }
             }
+            Some(Lang::Enum) => {
+                if positive
+                    && let TyKind::Adt(ad, _) = k
+                    && cx.adt(ad)?.flags.has(AdtFlags::ENUM)
+                {
+                    out.push(certain(Certainty::Yes));
+                }
+            }
+            Some(Lang::UnitEnum) => {
+                if positive
+                    && let TyKind::Adt(ad, _) = k
+                    && cx.adt(ad)?.flags.has(AdtFlags::UNIT_ENUM)
+                {
+                    out.push(certain(Certainty::Yes));
+                }
+            }
             // `consider_builtin_pointee_candidate`, `consider_builtin_discriminant_kind_candidate`,
             // `consider_builtin_destruct_candidate` (every type, in a non-const environment).
             Some(Lang::Pointee | Lang::DiscriminantKind | Lang::Destruct) => {

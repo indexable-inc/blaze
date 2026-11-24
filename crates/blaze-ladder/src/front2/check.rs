@@ -2274,7 +2274,45 @@ fn make_once<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,fill: Fill) -> R
             }
         }
         Fill::InferredOutput(_) => Ok(()),
+        Fill::ConstHolds(cond, digest) => eval_where_const(r, cond, digest),
     }
+}
+
+/// Evaluates a queued `where const { COND }` condition at its ground arguments and caches
+/// the resulting `tc::ConstHolds` in `r.store.where_const_answers`.
+fn eval_where_const<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, cond: ItemKey, digest: u64) -> Result<(), MakeFail> {
+    if r.store.where_const_answers.contains_key(&(cond, digest)) {
+        return Ok(());
+    }
+    let req = {
+        let mut pending = r.store.where_const_pending.borrow_mut();
+        pending.iter().position(|p| p.cond == cond && p.digest == digest).map(|idx| pending.remove(idx))
+    };
+    let Some(req) = req else {
+        r.store.where_const_answers.insert((cond, digest), tc::ConstHolds::Error);
+        return Ok(());
+    };
+    if !r.store.fns.contains_key(&cond) {
+        let _ = r.store.ensure_where_const_head(r.names, r.keys, cond).map_err(MakeFail::Head)?;
+    }
+    if !r.store.fns.contains_key(&cond) {
+        r.store.where_const_answers.insert((cond, digest), tc::ConstHolds::Error);
+        return Ok(());
+    }
+    let Some((consts, prepared)) = r.consts.take() else {
+        r.store.where_const_answers.insert((cond, digest), tc::ConstHolds::Error);
+        return Ok(());
+    };
+    let alloc = r.store.tys.alloc();
+    let evaluated = consts.value_with_args(r, prepared, cond, req.tys.view(), &req.args, None, alloc);
+    let answer = match evaluated.ok().and_then(super::consts::int_of) {
+        Some(0) => tc::ConstHolds::False,
+        Some(1) => tc::ConstHolds::True,
+        _ => tc::ConstHolds::Error,
+    };
+    r.consts = Some((consts, prepared));
+    r.store.where_const_answers.insert((cond, digest), answer);
+    Ok(())
 }
 
 enum InferredErr {
