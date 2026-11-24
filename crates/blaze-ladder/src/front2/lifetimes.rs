@@ -298,6 +298,17 @@ impl Lives {
     pub fn new_in(alloc: Mem) -> Lives {
         Lives { fns: super::rows::Rows::new_in(alloc), adts: super::rows::Rows::new_in(alloc), containers: super::rows::Rows::new_in(alloc), counts: HashMap::new_in(alloc), alloc }
     }
+
+    pub fn clear(&mut self) {
+        let Lives { fns, adts, containers, counts, alloc: _ } = self;
+        fns.clear();
+        adts.clear();
+        containers.clear();
+        counts.clear();
+        if counts.capacity() > 256 {
+            counts.shrink_to(64);
+        }
+    }
 }
 
 /// The bound on any one walk (types, rows): a head past it is refused.
@@ -1228,6 +1239,69 @@ impl<'n> Store<'n> {
         }
     }
 
+    /// The lifetime part of the impl or trait `lib`, whose head is made, computed directly from
+    /// an already-lowered `View` so callers like `Store::impl_` and `Store::trait_members` do not
+    /// re-lex and re-lower the item text a second time.
+    pub(super) fn container_life_from_view<S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, lib: LibKey, module: LibKey, v: &View<'_>) {
+        let ck = checker_of(lib);
+        if self.lives.containers.contains_key(&ck) {
+            return;
+        }
+        let self_ty = match self.impls.get(&ck) {
+            Some(i) => Some(i.self_ty),
+            None if self.maps.traits.contains_key(&lib) => None,
+            None => return,
+        };
+        let Store { tys, lives, locals, .. } = self;
+        let Lives { counts, alloc, .. } = lives;
+        let mut r = Reader::new(names, keys, locals, tys.view(), counts, module, *alloc);
+        let made = read_container(&mut r, v, self_ty);
+        self.lives.containers.insert(ck, made);
+    }
+
+    /// The lifetime part of the struct, enum or union `lib`, computed directly from an
+    /// already-lowered `View` so `Store::adt` does not re-lex and re-lower the item text.
+    pub(super) fn adt_life_from_view<S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, lib: LibKey, module: LibKey, v: &View<'_>) {
+        if self.lives.adts.contains_key(&lib) {
+            return;
+        }
+        let Store { tys, adts, lives, locals, .. } = self;
+        let Lives { counts, alloc, .. } = lives;
+        let Some(row) = adts.get(&checker_of(lib)) else { return };
+        let mut field_tys: List<PTy> = Vec::with_capacity_in(row.fields.len(), *alloc);
+        for f in row.fields.iter() {
+            field_tys.push(f.ty);
+        }
+        let mut r = Reader::new(names, keys, locals, tys.view(), counts, module, *alloc);
+        let made = read_adt(&mut r, v, &field_tys, row.kind == tc::AdtKind::Enum);
+        self.lives.adts.insert(lib, made);
+    }
+
+    /// The lifetime parts actually encoded in head records (form 22: ADTs, traits, and impls;
+    /// fn records carry `HeadRegions` instead of form-10 `FnLife`, so computing `FnLife` during
+    /// export/digesting would lower every fn a second time and discard the result).
+    pub fn make_record_lives<S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, heads: &[HeadAt]) {
+        for at in heads.iter().copied() {
+            match at {
+                HeadAt::Adt(lib) => {
+                    let _ = self.adt_life(names, keys, lib);
+                }
+                HeadAt::Trait(lib) => {
+                    let _ = self.container_life(names, keys, lib);
+                }
+                HeadAt::Impl(k) => match keys.library_in(names, k) {
+                    Some(lib) => {
+                        let _ = self.container_life(names, keys, lib);
+                    }
+                    None => {
+                        self.lives.containers.insert(k, Err(LifeRefusal::NoHead));
+                    }
+                },
+                HeadAt::Fn(_) | HeadAt::Ctor(_) | HeadAt::Alias(_) | HeadAt::TraitAlias(_) | HeadAt::Opaque(_) => {}
+            }
+        }
+    }
+
     /// Every lifetime part the heads at `heads` have, made now (a refusal is made too): a fn's,
     /// an ADT's, a trait's and an impl's, so a head record of them holds its part
     /// ([`Store::lives_of`]). An impl whose library key the key map cannot tell is refused
@@ -1310,13 +1384,15 @@ impl<'n> Store<'n> {
         } else {
             None
         };
-        let low = lower(names, lib, h.text).map_err(|_| LifeRefusal::Text)?;
-        let mut r = Reader::new(names, keys, locals, tys.view(), counts, h.module, *alloc);
-        // The container's type parameters shadow items too: every name the head was read with.
-        for &(name, _) in h.params.iter() {
-            r.params.push(name);
-        }
-        read_fn(&mut r, &low.view(), &h.inputs[..], h_output, container)
+        super::heads::with_lowered(names, lib, h.text, |v| {
+            let mut r = Reader::new(names, keys, locals, tys.view(), counts, h.module, *alloc);
+            // The container's type parameters shadow items too: every name the head was read with.
+            for &(name, _) in h.params.iter() {
+                r.params.push(name);
+            }
+            read_fn(&mut r, v, &h.inputs[..], h_output, container)
+        })
+        .map_err(|_| LifeRefusal::Text)?
     }
 
     fn make_container_life<S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, lib: LibKey) -> Result<ContainerLife, LifeRefusal> {
@@ -1328,22 +1404,26 @@ impl<'n> Store<'n> {
         let Store { tys, lives, locals, .. } = self;
         let Lives { counts, alloc, .. } = lives;
         let (text, module) = item_text(names, locals, lib)?;
-        let low = lower(names, lib, text).map_err(|_| LifeRefusal::Text)?;
-        let mut r = Reader::new(names, keys, locals, tys.view(), counts, module, *alloc);
-        read_container(&mut r, &low.view(), self_ty)
+        super::heads::with_lowered(names, lib, text, |v| {
+            let mut r = Reader::new(names, keys, locals, tys.view(), counts, module, *alloc);
+            read_container(&mut r, v, self_ty)
+        })
+        .map_err(|_| LifeRefusal::Text)?
     }
 
     fn make_adt_life<S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, lib: LibKey) -> Result<AdtLife, LifeRefusal> {
         let Store { tys, adts, lives, locals, .. } = self;
         let Lives { counts, alloc, .. } = lives;
         let row = adts.get(&checker_of(lib)).ok_or(LifeRefusal::NoHead)?;
-        let mut field_tys: List<PTy> = Vec::new_in(*alloc);
+        let mut field_tys: List<PTy> = Vec::with_capacity_in(row.fields.len(), *alloc);
         for f in row.fields.iter() {
             field_tys.push(f.ty);
         }
         let (text, module) = item_text(names, locals, lib)?;
-        let low = lower(names, lib, text).map_err(|_| LifeRefusal::Text)?;
-        let mut r = Reader::new(names, keys, locals, tys.view(), counts, module, *alloc);
-        read_adt(&mut r, &low.view(), &field_tys, row.kind == tc::AdtKind::Enum)
+        super::heads::with_lowered(names, lib, text, |v| {
+            let mut r = Reader::new(names, keys, locals, tys.view(), counts, module, *alloc);
+            read_adt(&mut r, v, &field_tys, row.kind == tc::AdtKind::Enum)
+        })
+        .map_err(|_| LifeRefusal::Text)?
     }
 }

@@ -340,6 +340,36 @@ impl<T, A: Allocator> SharedSegs<T, A> {
         // SAFETY: below the published length: the slot holds a value, never written again.
         Some(unsafe { &*seg.add(at) })
     }
+
+    /// Drops all published values and resets length to 0, freeing segments `1..` while keeping
+    /// segment `0` allocated (if already allocated) so subsequent pushes reuse its backing memory.
+    pub fn clear_keep_first(&mut self) {
+        let len = *self.len.get_mut();
+        let mut left = len;
+        for (s, slot) in self.segs.iter_mut().enumerate() {
+            let seg = *slot.get_mut();
+            if seg.is_null() {
+                break;
+            }
+            let here = left.min(segment_len(s));
+            left -= here;
+            if here > 0 {
+                // SAFETY: `&mut self`: no appender or reader is alive; the first `here` slots
+                // of segment `s` hold initialized values, dropped once here.
+                unsafe { ptr::drop_in_place(ptr::slice_from_raw_parts_mut(seg, here)) };
+            }
+            if s > 0 {
+                *slot.get_mut() = ptr::null_mut();
+                if size_of::<T>() != 0
+                    && let Ok(layout) = segment_layout::<T>(s, 0)
+                {
+                    // SAFETY: allocated by `self.alloc` with this layout, freed once.
+                    unsafe { self.alloc.deallocate(NonNull::new_unchecked(seg.cast::<u8>()), layout) };
+                }
+            }
+        }
+        *self.len.get_mut() = 0;
+    }
 }
 
 impl<T, A: Allocator> Drop for SharedSegs<T, A> {

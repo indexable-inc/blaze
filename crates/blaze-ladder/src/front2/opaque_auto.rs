@@ -177,6 +177,18 @@ impl<'a> HiddenTable<'a> {
         }
     }
 
+    pub fn clear(&mut self) {
+        let HiddenTable { alloc: _, tys, rows, opaque_owner, definers, leaking, defining, wanted, cycle } = self;
+        tys.clear();
+        rows.clear();
+        opaque_owner.clear();
+        definers.clear();
+        leaking.clear();
+        defining.clear();
+        *wanted = None;
+        *cycle = None;
+    }
+
     /// An empty leak list for one check, in the table's allocator.
     pub fn new_leaks(&self) -> Vec<ItemKey, Alloc<'a>> {
         Vec::new_in(self.alloc)

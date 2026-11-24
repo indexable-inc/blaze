@@ -51,7 +51,7 @@ impl Cursor<'_, '_> {
 /// Feeds `output`, the parse of `lexed`, to `m`. A macro call met is kept as a macro call
 /// node: this feed has no expander (an expanding feed's own nested ones, `format_args!`'s
 /// arguments, are not expanded either).
-pub(crate) fn feed(m: &mut Machine<'_, '_, '_>, lexed: &LexedStr<'_>, output: &Output, base: u32) {
+pub(crate) fn feed(m: &mut Machine<'_, '_, '_, '_>, lexed: &LexedStr<'_>, output: &Output, base: u32) {
     run(m, output, lexed_toks(lexed, base), None);
 }
 
@@ -65,8 +65,8 @@ fn lexed_toks<'l, 't>(lexed: &'l LexedStr<'t>, base: u32) -> Toks<'l, 't, 'stati
 /// word's range in the machine's text), to `m`, each body macro call in it expanded through
 /// `expand` when there is one: the expansion's `$crate` and its other words are read as the
 /// expander wrote them, never lexed again from text.
-pub(crate) fn feed_words(m: &mut Machine<'_, '_, '_>, output: &Output, ranges: &[Range], expand: Option<&mut dyn Expand>) {
-    let mut owned = Vec::with_capacity_in(ranges.len(), m.allocator());
+pub(crate) fn feed_words<'s>(m: &mut Machine<'_, '_, '_, 's>, output: &Output, ranges: &[Range], expand: Option<&mut dyn Expand>) {
+    let mut owned = Vec::with_capacity_in(ranges.len(), m.scratch_allocator());
     owned.extend_from_slice(ranges);
     let expanding = expand.is_some();
     m.expanding = expanding;
@@ -79,7 +79,7 @@ pub(crate) fn feed_words(m: &mut Machine<'_, '_, '_>, output: &Output, ranges: &
 /// text's length. A step takes its range from the column in one step, never walking the trivia
 /// between its tokens; what it takes is [`Cursor::take`]'s on the same text (a take of no token
 /// is where the next token starts, or the text's end past the last).
-pub(crate) fn feed_input<'a>(m: &mut Machine<'_, '_, 'a>, output: &Output, ranges: AVec<'a, Range>, end: u32) {
+pub(crate) fn feed_input<'s>(m: &mut Machine<'_, '_, '_, 's>, output: &Output, ranges: AVec<'s, Range>, end: u32) {
     run(m, output, Toks::Input { ranges, pos: 0, end }, None);
 }
 
@@ -87,7 +87,7 @@ pub(crate) fn feed_input<'a>(m: &mut Machine<'_, '_, 'a>, output: &Output, range
 /// `expand` and feeding its expansion's parse in place: one stack of the parses open, the
 /// item's at the bottom, never a recursion.
 pub(crate) fn feed_expanding(
-    m: &mut Machine<'_, '_, '_>,
+    m: &mut Machine<'_, '_, '_, '_>,
     lexed: &LexedStr<'_>,
     output: &Output,
     base: u32,
@@ -188,10 +188,11 @@ impl Sizes {
     }
 }
 
-fn run<'a>(m: &mut Machine<'_, '_, 'a>, output: &Output, toks: Toks<'_, '_, 'a>, mut expand: Option<&mut dyn Expand>) {
+fn run<'s>(m: &mut Machine<'_, '_, '_, 's>, output: &Output, toks: Toks<'_, '_, 's>, mut expand: Option<&mut dyn Expand>) {
+    let scratch = m.scratch_allocator();
     let alloc = m.allocator();
     m.size_for(Sizes::of(output));
-    let mut levels: AVec<'_, Level<'_, '_, '_, '_>> = Vec::new_in(alloc);
+    let mut levels: AVec<'_, Level<'_, '_, '_, '_>> = Vec::new_in(scratch);
     levels.push(Level { parse: Parse::Base(output), at: 0, toks });
     // The calls this body has run, every nesting counted: past the budget, a call is refused.
     let mut spent = 0u32;
@@ -257,7 +258,7 @@ fn run<'a>(m: &mut Machine<'_, '_, 'a>, output: &Output, toks: Toks<'_, '_, 'a>,
 }
 
 /// One step to the machine.
-fn apply(m: &mut Machine<'_, '_, '_>, step: OutlineStep<'_>, at: &mut Toks<'_, '_, '_>) {
+fn apply(m: &mut Machine<'_, '_, '_, '_>, step: OutlineStep<'_>, at: &mut Toks<'_, '_, '_>) {
     match step {
         OutlineStep::Step(Step::Token { kind, n_input_tokens }) => {
             let range = at.take(u32::from(n_input_tokens));
@@ -294,7 +295,7 @@ fn apply(m: &mut Machine<'_, '_, '_>, step: OutlineStep<'_>, at: &mut Toks<'_, '
 
 /// Feeds `steps`, a parse's steps of `lexed`, to `m`.
 pub(crate) fn feed_steps<'s>(
-    m: &mut Machine<'_, '_, '_>,
+    m: &mut Machine<'_, '_, '_, '_>,
     lexed: &LexedStr<'_>,
     steps: impl Iterator<Item = OutlineStep<'s>>,
     base: u32,

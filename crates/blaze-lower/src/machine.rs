@@ -276,8 +276,9 @@ pub(crate) struct Entry {
     pub(crate) jumps: u32,
 }
 
-/// The machine. `'t` the item's text, `'c` the cfg set, `'a` the allocator of its output.
-pub struct Machine<'t, 'c, 'a> {
+/// The machine. `'t` the item's text, `'c` the cfg set, `'a` the allocator of its output, `'s`
+/// the allocator of its temporary stacks (dropped on [`Machine::finish`]).
+pub struct Machine<'t, 'c, 'a, 's> {
     text: &'t str,
     pub(crate) mode: Mode,
     pub(crate) edition: Edition,
@@ -288,10 +289,10 @@ pub struct Machine<'t, 'c, 'a> {
     /// or a type, whose patterns (a signature's parameters) no check reads.
     values: Option<&'c mut dyn ValueNames>,
     /// Every identifier pattern, settled by [`Machine::settle_patterns`] at the end.
-    idents: AVec<'a, Ident>,
+    idents: AVec<'s, Ident>,
     pub(crate) out: Columns<'a>,
-    frames: AVec<'a, Frame>,
-    pub(crate) vals: AVec<'a, Val>,
+    frames: AVec<'s, Frame>,
+    pub(crate) vals: AVec<'s, Val>,
     last_end: u32,
     /// Inside a node skipped wholesale: the depth below it, 0 outside.
     skip: u32,
@@ -299,38 +300,39 @@ pub struct Machine<'t, 'c, 'a> {
     skip_arm: bool,
     /// The frame of the item lowered; `usize::MAX` for an anonymous constant.
     root_depth: usize,
-    locals: AVec<'a, Local>,
-    top: HashMap<u64, u32, Alloc<'a>>,
-    pending: AVec<'a, (u64, u32)>,
+    locals: AVec<'s, Local>,
+    top: HashMap<u64, u32, Alloc<'s>>,
+    pending: AVec<'s, (u64, u32)>,
     /// Locals below it are hidden.
     barrier: u32,
-    pub(crate) entries: AVec<'a, Entry>,
+    pub(crate) entries: AVec<'s, Entry>,
     /// (entry, break or continue expression) waiting for the entry's node to close.
-    jumps: AVec<'a, (u32, u32)>,
+    jumps: AVec<'s, (u32, u32)>,
     /// The bodies open that `.await` and `yield` see: each a coroutine's kind (its `F_ASYNC`
     /// and `F_GEN` flags), or [`NOT_CORO`] for a plain closure, which hides the coroutine
     /// around it.
-    pub(crate) coros: AVec<'a, u32>,
-    scopes: AVec<'a, u32>,
+    pub(crate) coros: AVec<'s, u32>,
+    scopes: AVec<'s, u32>,
     needs: AVec<'a, Range>,
     /// The expression a closing frame's entry targets, set by its handler.
     pub(crate) loop_target: u32,
     alloc: Alloc<'a>,
+    scratch: Alloc<'s>,
     /// The item's text and, past its end, each expansion lowered in place, one after another:
     /// made at the first expansion; until then the item's text is read where it is.
     grown: Option<AString<'a>>,
     /// The words of the expansions in `grown`, in order: where each starts, its local
     /// hygiene ([`blaze_expand::local_hygiene`]), and which expansion and token it is.
-    words: AVec<'a, ExpWord>,
+    words: AVec<'s, ExpWord>,
     /// A body's macro call the feed is to expand, set when the call's node closes.
     request: Option<Request>,
     /// The `macro_rules!` the body has defined so far, in textual order, each with the depth
     /// of `scopes` it was written at: the Reference's textual scope ("Macros By Example",
     /// Scoping): visible after its statement, in nested blocks too, until its block ends.
-    local_macros: AVec<'a, LocalMacroAt>,
+    local_macros: AVec<'s, LocalMacroAt>,
     /// Each local hygiene an expansion's words carry, with the definition its template
     /// resolves locals and labels at (def_site.rs).
-    template_sites: AVec<'a, def_site::TemplateSite>,
+    template_sites: AVec<'s, def_site::TemplateSite>,
     /// Whether the feed has an expander: without one a call stays a macro call node.
     pub(crate) expanding: bool,
 }
@@ -459,7 +461,7 @@ fn bin_op(kind: SyntaxKind) -> Option<(BinOp, bool)> {
     })
 }
 
-impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
+impl<'t, 'c, 'a, 's> Machine<'t, 'c, 'a, 's> {
     pub(crate) fn new(
         text: &'t str,
         mode: Mode,
@@ -467,7 +469,19 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         cfg: &'c mut dyn Cfg,
         values: Option<&'c mut dyn ValueNames>,
         alloc: Alloc<'a>,
-    ) -> Machine<'t, 'c, 'a> {
+    ) -> Machine<'t, 'c, 'a, 'a> {
+        Machine::new_with_scratch(text, mode, edition, cfg, values, alloc, alloc)
+    }
+
+    pub(crate) fn new_with_scratch(
+        text: &'t str,
+        mode: Mode,
+        edition: Edition,
+        cfg: &'c mut dyn Cfg,
+        values: Option<&'c mut dyn ValueNames>,
+        alloc: Alloc<'a>,
+        scratch: Alloc<'s>,
+    ) -> Machine<'t, 'c, 'a, 's> {
         let mut out = Columns::new_in(alloc);
         out.head[head::MODE] = match mode {
             Mode::Signature => 0,
@@ -489,31 +503,32 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             edition,
             cfg: Some(cfg),
             values,
-            idents: Vec::new_in(alloc),
+            idents: Vec::new_in(scratch),
             out,
-            frames: Vec::new_in(alloc),
-            vals: Vec::new_in(alloc),
+            frames: Vec::new_in(scratch),
+            vals: Vec::new_in(scratch),
             last_end: 0,
             skip: 0,
             skip_name: NO_RANGE,
             skip_arm: false,
             root_depth: usize::MAX,
-            locals: Vec::new_in(alloc),
-            top: HashMap::new_in(alloc),
-            pending: Vec::new_in(alloc),
+            locals: Vec::new_in(scratch),
+            top: HashMap::new_in(scratch),
+            pending: Vec::new_in(scratch),
             barrier: 0,
-            entries: Vec::new_in(alloc),
-            jumps: Vec::new_in(alloc),
-            coros: Vec::new_in(alloc),
-            scopes: Vec::new_in(alloc),
+            entries: Vec::new_in(scratch),
+            jumps: Vec::new_in(scratch),
+            coros: Vec::new_in(scratch),
+            scopes: Vec::new_in(scratch),
             needs: Vec::new_in(alloc),
             loop_target: NONE,
             alloc,
+            scratch,
             grown: None,
-            words: Vec::new_in(alloc),
+            words: Vec::new_in(scratch),
             request: None,
-            local_macros: Vec::new_in(alloc),
-            template_sites: Vec::new_in(alloc),
+            local_macros: Vec::new_in(scratch),
+            template_sites: Vec::new_in(scratch),
             expanding: false,
         };
         if matches!(mode, Mode::Body | Mode::AnonConst) {
@@ -534,6 +549,10 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
 
     pub(crate) fn allocator(&self) -> Alloc<'a> {
         self.alloc
+    }
+
+    pub(crate) fn scratch_allocator(&self) -> Alloc<'s> {
+        self.scratch
     }
 
     /// Which text wrote the block whose `{` is at `open` of the machine's text
@@ -684,7 +703,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
     /// Appends an expansion's words to the text: each word's text, its first token and its
     /// local hygiene; records the call's read (its range and the expansion's key). Gives each
     /// word's range, for the feed.
-    pub(crate) fn append_expansion(&mut self, request: &Request, out: &crate::driver::BodyOut<'_>) -> AVec<'a, Range> {
+    pub(crate) fn append_expansion(&mut self, request: &Request, out: &crate::driver::BodyOut<'_>) -> AVec<'s, Range> {
         let grown = self.grown.get_or_insert_with(|| {
             let mut s = AString::new_in(self.alloc);
             s.push_str(self.text);
@@ -694,7 +713,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         self.out.expansion_calls.push(request.range);
         self.out.expansion_keys.push(out.key);
         self.out.expansion_starts.push(idx(grown.len() - self.text.len()));
-        let mut ranges = Vec::with_capacity_in(out.words.words.len(), self.alloc);
+        let mut ranges = Vec::with_capacity_in(out.words.words.len(), self.scratch);
         for w in out.words.words.iter() {
             // A space before each word that may take one: two words lex again as they were
             // (`a b` stays two, `::` stays one), as `format_args!` reads its input's text.

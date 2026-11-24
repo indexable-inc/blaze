@@ -244,10 +244,40 @@ where
     F: Arity + ?Sized,
     V: FnMut(PTy, PNode, u32) -> Result<(), RegionError>,
 {
-    let mut stack: Vec<PTy, A> = Vec::new_in(alloc);
-    stack.push(ty);
+    const INLINE: usize = 32;
+    let mut inline = [PTy(0); INLINE];
+    let mut inline_len = 1usize;
+    inline[0] = ty;
+    let mut overflow: Option<Vec<PTy, A>> = None;
+    let mut alloc = Some(alloc);
+    let mut push = |t: PTy, inline: &mut [PTy; INLINE], inline_len: &mut usize, overflow: &mut Option<Vec<PTy, A>>, alloc: &mut Option<A>| {
+        if let Some(v) = overflow.as_mut() {
+            v.push(t);
+        } else if let Some(slot) = inline.get_mut(*inline_len) {
+            *slot = t;
+            *inline_len += 1;
+        } else if let Some(a) = alloc.take() {
+            let mut v = Vec::with_capacity_in(INLINE * 2, a);
+            v.extend_from_slice(inline.as_slice());
+            v.push(t);
+            *overflow = Some(v);
+        }
+    };
     let mut total = 0u32;
-    while let Some(t) = stack.pop() {
+    loop {
+        let t = if let Some(v) = overflow.as_mut() {
+            match v.pop() {
+                Some(t) => t,
+                None => break,
+            }
+        } else if let Some(next_len) = inline_len.checked_sub(1)
+            && let Some(&t) = inline.get(next_len)
+        {
+            inline_len = next_len;
+            t
+        } else {
+            break;
+        };
         if *budget == 0 {
             return Err(RegionError::Bound { ty, limit: MOST_REGION_STEPS });
         }
@@ -260,11 +290,17 @@ where
         // Reversed onto the stack, so the first child is popped (and laid) first.
         match children {
             Kids::None => {}
-            Kids::One(c) => stack.push(c),
-            Kids::Many(l) => l.iter().rev().for_each(|&c| stack.push(c)),
+            Kids::One(c) => push(c, &mut inline, &mut inline_len, &mut overflow, &mut alloc),
+            Kids::Many(l) => {
+                for &c in l.iter().rev() {
+                    push(c, &mut inline, &mut inline_len, &mut overflow, &mut alloc);
+                }
+            }
             Kids::ManyThen(l, last) => {
-                stack.push(last);
-                l.iter().rev().for_each(|&c| stack.push(c));
+                push(last, &mut inline, &mut inline_len, &mut overflow, &mut alloc);
+                for &c in l.iter().rev() {
+                    push(c, &mut inline, &mut inline_len, &mut overflow, &mut alloc);
+                }
             }
         }
     }
@@ -309,7 +345,14 @@ impl<A: Allocator + Clone> RegionCol<A> {
         let root = tys.node(ty).map_err(RegionError::Table)?;
         let mut budget = MOST_REGION_STEPS - 1;
         let own = region_arity(ty, root, facts)?;
-        let mut starts: Vec<u32, A> = Vec::new_in(alloc.clone());
+        let children = kids(tys, ty, root)?;
+        let starts_cap = match children {
+            Kids::None => 1,
+            Kids::One(_) => 2,
+            Kids::Many(l) => 1 + l.len(),
+            Kids::ManyThen(l, _) => 2 + l.len(),
+        };
+        let mut starts: Vec<u32, A> = Vec::with_capacity_in(starts_cap, alloc.clone());
         starts.push(own);
         let mut total = own;
         let mut add = |c: PTy, starts: &mut Vec<u32, A>, total: &mut u32| -> Result<(), RegionError> {
@@ -318,7 +361,7 @@ impl<A: Allocator + Clone> RegionCol<A> {
             starts.push(*total);
             Ok(())
         };
-        match kids(tys, ty, root)? {
+        match children {
             Kids::None => {}
             Kids::One(c) => add(c, &mut starts, &mut total)?,
             Kids::Many(l) => {

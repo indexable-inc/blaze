@@ -13,7 +13,7 @@ use super::*;
 const ARCHES: [(&str, blaze_typeck::AsmArch); 2] =
     [("aarch64", blaze_typeck::AsmArch::Aarch64), ("x86_64", blaze_typeck::AsmArch::X86_64)];
 
-impl Machine<'_, '_, '_> {
+impl Machine<'_, '_, '_, '_> {
     /// `target_arch` for the `asm!` at `r`: each atom asked is a read of the record (its
     /// answer kept as a written atom's is, `cfg_atom`); an atom not known yet is a need at `r`
     /// and the pass's result is not kept (`Need`), so `None` then is never filed.

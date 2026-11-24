@@ -518,18 +518,107 @@ pub(super) const PRIMS: [(&str, PNode); 19] = [
     ("f64", PNode::Float(tc::FloatTy::F64)),
 ];
 
+/// Inline-backed small buffer for path segments and texts (nearly all Rust paths have `<= 8`
+/// segments), avoiding two heap allocations per path resolution.
+#[derive(Clone, Debug)]
+pub struct SmallPath<T: Copy, const N: usize = 8> {
+    inline: [T; N],
+    len: usize,
+    spill: Option<Vec<T, Global>>,
+}
+
+impl<T: Copy, const N: usize> SmallPath<T, N> {
+    #[inline]
+    fn new(fill: T) -> Self {
+        Self { inline: [fill; N], len: 0, spill: None }
+    }
+
+    #[inline]
+    fn push(&mut self, value: T) {
+        if let Some(v) = &mut self.spill {
+            v.push(value);
+        } else if let Some(slot) = self.inline.get_mut(self.len) {
+            *slot = value;
+            self.len += 1;
+        } else {
+            let mut v = Vec::with_capacity_in(N * 2, Global);
+            v.extend_from_slice(&self.inline);
+            v.push(value);
+            self.spill = Some(v);
+        }
+    }
+    #[inline]
+    fn pop(&mut self) -> Option<T> {
+        if let Some(v) = &mut self.spill {
+            v.pop()
+        } else if let Some(next_len) = self.len.checked_sub(1)
+            && let Some(&val) = self.inline.get(next_len)
+        {
+            self.len = next_len;
+            Some(val)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        if let Some(v) = &mut self.spill {
+            v.clear();
+        } else {
+            self.len = 0;
+        }
+    }
+
+    #[inline]
+    fn truncate(&mut self, len: usize) {
+        if let Some(v) = &mut self.spill {
+            v.truncate(len);
+        } else if len < self.len {
+            self.len = len;
+        }
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[T] {
+        match &self.spill {
+            Some(v) => v.as_slice(),
+            None => self.inline.get(..self.len).unwrap_or(&[]),
+        }
+    }
+}
+
+impl<T: Copy, const N: usize> core::ops::Deref for SmallPath<T, N> {
+    type Target = [T];
+    #[inline]
+    fn deref(&self) -> &[T] {
+        self.as_slice()
+    }
+}
+
+const EMPTY_SEGMENT: lf::Segment = lf::Segment {
+    kind: lf::SegKind::Ident,
+    name: None,
+    args: tc::List { start: 0, len: 0 },
+    has_args: false,
+    parenthesized: false,
+    return_notation: false,
+    ty: None,
+    trait_: None,
+};
+
 /// A path's segments as the resolver takes them: their texts, and whether it starts at `::`.
 /// A qualified (`<T as Tr>::X`) or parenthesized segment is not a plain path.
-pub fn path_texts<'v>(v: &View<'v>, p: PathIdx) -> Result<(bool, Vec<&'v str, Global>, Vec<lf::Segment, Global>, Range), Why> {
+pub fn path_texts<'v>(v: &View<'v>, p: PathIdx) -> Result<(bool, SmallPath<&'v str>, SmallPath<lf::Segment>, Range), Why> {
     path_texts_of(v, p, false)
 }
 
 /// [`path_texts`]; `sugar`: the caller reads `Fn(A) -> B` on the last segment itself.
-pub fn path_texts_of<'v>(v: &View<'v>, p: PathIdx, sugar: bool) -> Result<(bool, Vec<&'v str, Global>, Vec<lf::Segment, Global>, Range), Why> {
+pub fn path_texts_of<'v>(v: &View<'v>, p: PathIdx, sugar: bool) -> Result<(bool, SmallPath<&'v str>, SmallPath<lf::Segment>, Range), Why> {
     let r = place(v, v.path_range(p))?;
     let path = v.path(p)?;
-    let mut texts = Vec::new_in(Global);
-    let mut segs = Vec::new_in(Global);
+    let mut texts = SmallPath::new("");
+    let mut segs = SmallPath::new(EMPTY_SEGMENT);
     let all = v.segments(path)?;
     for (i, &n) in all.iter().enumerate() {
         let s = lf::Segment::decode(n)?;
@@ -559,14 +648,14 @@ pub fn path_texts_of<'v>(v: &View<'v>, p: PathIdx, sugar: bool) -> Result<(bool,
 /// is passed over. A const argument (`{ N + 1 }`, `3`) and an argument that is one plain
 /// name (`N`: a type or a constant by what the name resolves to) are made by
 /// [`Builder::path_args`] once the scope is known, so they are no child here.
-fn arg_types(v: &View<'_>, s: &lf::Segment, r: Range, out: &mut Vec<lf::TypeId, Global>) -> Result<(), Why> {
+fn arg_types_into(v: &View<'_>, s: &lf::Segment, r: Range, out: &mut impl FnMut(lf::TypeId)) -> Result<(), Why> {
     if !s.has_args {
         return Ok(());
     }
     for &n in v.rows(s.args)? {
         match lf::GenericArg::decode(n)? {
             lf::GenericArg::Type(t) if bare_name(v, t)?.is_some() => {}
-            lf::GenericArg::Type(t) => out.push(t),
+            lf::GenericArg::Type(t) => out(t),
             lf::GenericArg::Lifetime(_) | lf::GenericArg::AssocType { .. } | lf::GenericArg::Const(_) => {}
             _ => return Err(Why::Unsupported("an associated item constraint", r)),
         }
@@ -722,25 +811,27 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
     }
 
     fn walk_ty(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, t: lf::TypeId, mut sink: Option<&mut RegionSink<'_>>) -> Result<PTy, Why> {
+        #[derive(Clone, Copy)]
         enum S {
             Visit(lf::TypeId),
-            Make(lf::TypeId),
+            Make(lf::TypeId, usize),
         }
-        let mut todo = Vec::new_in(Global);
-        let mut done: Vec<PTy, Global> = Vec::new_in(Global);
-        let mut kids: Vec<lf::TypeId, Global> = Vec::new_in(Global);
+        let mut todo: SmallPath<S, 32> = SmallPath::new(S::Visit(lf::TypeId(0)));
+        let mut done: SmallPath<PTy, 32> = SmallPath::new(PTy(0));
+        let mut kids: SmallPath<lf::TypeId, 16> = SmallPath::new(lf::TypeId(0));
         todo.push(S::Visit(t));
         while let Some(step) = todo.pop() {
-            kids.clear();
             match step {
                 S::Visit(t) => {
-                    todo.push(S::Make(t));
-                    children(v, t, &mut kids)?;
-                    todo.extend(kids.iter().rev().map(|&k| S::Visit(k)));
+                    kids.clear();
+                    children_into(v, t, &mut |k| kids.push(k))?;
+                    todo.push(S::Make(t, kids.len()));
+                    for &k in kids.iter().rev() {
+                        todo.push(S::Visit(k));
+                    }
                 }
-                S::Make(t) => {
-                    children(v, t, &mut kids)?;
-                    let start = done.len() - kids.len();
+                S::Make(t, nkids) => {
+                    let start = done.len() - nkids;
                     let mut args = None;
                     let made = self.make(tys, env, v, t, &done[start..], &mut args)?;
                     if let Some(s) = sink.as_deref_mut() {
@@ -1012,116 +1103,119 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
     /// [`children`] listed them: a qualified path's self type first), each const argument
     /// and each one-name argument (`N`: a type if the name is a type parameter or resolves in
     /// the type namespace, else a constant; the Reference, "Generic parameters") made here.
-    pub(super) fn path_args(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, p: PathIdx, kids: &[PTy]) -> Result<Vec<PTy, Global>, Why> {
+    pub(super) fn path_args(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, p: PathIdx, kids: &[PTy]) -> Result<SmallPath<PTy, 8>, Why> {
         let r = place(v, v.path_range(p))?;
-        let path = v.path(p)?;
-        let mut out = Vec::with_capacity_in(kids.len(), Global);
+        let mut out: SmallPath<PTy, 8> = SmallPath::new(PTy(0));
         let mut next = kids.iter().copied();
-        // Each segment whose arguments are listed, with the path its arguments are for (the
-        // written path whose first token's mark says where it resolves: `const_want`).
-        let mut work: Vec<(lf::Segment, PathIdx, bool, Vec<&str, Global>), Global> = Vec::new_in(Global);
         let (abs, texts, segs, _) = path_texts_of(v, p, true)?;
-        for (k, s) in segs.iter().enumerate() {
+        let handle_seg = |tys: &mut PortableTys<'_>,
+                          out: &mut SmallPath<PTy, 8>,
+                          next: &mut core::iter::Copied<core::slice::Iter<'_, PTy>>,
+                          s: lf::Segment,
+                          spath: PathIdx,
+                          sabs: bool,
+                          stexts: &[&str]|
+         -> Result<(), Why> {
+            if !s.has_args {
+                return Ok(());
+            }
+            let mut index = 0u32;
+            for &n in v.rows(s.args)? {
+                let made = match lf::GenericArg::decode(n)? {
+                    lf::GenericArg::Type(t) => match bare_name(v, t)? {
+                        None => next.next().ok_or(program(format!("a type argument is missing"), r))?,
+                        Some(name) => {
+                            let param = env.params.iter().find(|(n, _)| *n == Name::of(name)).map(|&(_, i)| i);
+                            let is_const = param.is_some_and(|i| env.consts.iter().any(|(c, _)| *c == i));
+                            let lf::TypeRef::Path(tp) = v.ty(t)? else { return Err(program(format!("a one-name argument that is no path"), r)) };
+                            let ar = place(v, v.type_range(t))?;
+                            // An item the body declares takes part as in a body path's own
+                            // argument (body.rs `name_arg`; the one rule is const_open.rs
+                            // `local_arg`): the Reference, "Generic parameters": a one-name
+                            // argument is a type if it resolves to one in the type
+                            // namespace, else a const; "Statements", "Item declarations":
+                            // a block's item is in scope in its block. tempo's
+                            // `Exec::for_config::<Config<SPEC_ID>>()` names the `const
+                            // SPEC_ID` of its block; read at the module alone, it was
+                            // "cannot find type `SPEC_ID`".
+                            let local = match env.body {
+                                Some(body) => super::const_open::local_arg(body.locals, body.owner, self.heads, v, t, name, ar),
+                                None => Ok(None),
+                            };
+                            // The name resolves where its token's mark says, as the
+                            // argument's own type would (`path_ty`): never at the module
+                            // alone when a macro wrote it.
+                            let at_mark = |ns: Ns| self.resolve_at(env, v, tp, false, &[name], ns, ar);
+                            // A type if a type parameter, or the names library's answer in
+                            // the type namespace is a type (a constant item answers there
+                            // too, as the library files it: then it is a constant).
+                            let names_a_type = || match at_mark(Ns::Type) {
+                                Ok(f) => f.consumed == 1 && matches!(f.kind, Kind::Struct | Kind::Enum | Kind::Union | Kind::TypeAlias | Kind::Builtin(_) | Kind::WideInt { .. }),
+                                Err(_) => false,
+                            };
+                            let local_type = matches!(local, Ok(Some(super::const_open::LocalArg::Type)));
+                            let is_type = local_type || (!is_const && (param.is_some() || names_a_type()));
+                            if is_type {
+                                self.path_ty(tys, env, v, tp, &[])?
+                            } else if let Ok(Some(super::const_open::LocalArg::Const(bits))) = local {
+                                // The constant's bits in the parameter's type, as a module
+                                // constant's are (`const_term`). A scalar parameter only: a
+                                // fieldless enum's value is its variant under the enum's key
+                                // (const_enum.rs), which a body's constant's bits are not.
+                                let ty = self.const_want(env, v, spath, sabs, stexts, index, ar)?;
+                                if !matches!(tys.view().get(ty), Some(PNode::Bool | PNode::Char | PNode::Int(_) | PNode::Uint(_) | PNode::Infer | PNode::Error)) {
+                                    return Err(Why::Unsupported("a const argument naming a `const` the body declares, for a parameter whose type is no integer, `bool` or `char`", ar));
+                                }
+                                intern(tys, PNode::ConstValue { ty, bits })?
+                            } else if let Err(why) = local {
+                                // A body's constant not evaluated yet (`Why::NeedConst`: the
+                                // driver evaluates it and lowers again), or a body's value
+                                // item that is no constant: refused by name, never read at
+                                // the module, where the name would mean another item.
+                                return Err(why);
+                            } else {
+                                // A name that is no parameter, no type and no value here
+                                // names nothing: refused as unresolved, never guessed to be
+                                // a constant (zerocopy's `HasField<Client, value, ..>`, whose
+                                // `value` is an enum of the impl's own block, was refused
+                                // "argument 2 of `HasField` is a constant").
+                                if param.is_none() && name != "true" && name != "false" {
+                                    at_mark(Ns::Value)?;
+                                }
+                                let want = |_: &mut PortableTys<'_>| self.const_want(env, v, spath, sabs, stexts, index, ar);
+                                self.const_term(tys, env, name, ar, &want)?
+                            }
+                        }
+                    },
+                    lf::GenericArg::Const(c) => {
+                        let at = v.const_range(c)?;
+                        let ar = v.site(at)?;
+                        let text = v.text_at(at)?;
+                        let want = |_: &mut PortableTys<'_>| self.const_want(env, v, spath, sabs, stexts, index, ar);
+                        self.const_term(tys, env, text, ar, &want)?
+                    }
+                    _ => continue,
+                };
+                out.push(made);
+                index += 1;
+            }
+            Ok(())
+        };
+        for (k, &s) in segs.iter().enumerate() {
             if s.kind == lf::SegKind::Anchor {
                 out.push(next.next().ok_or(program(format!("a qualified path's self type is missing"), r))?);
                 // `<T>::X` has no trait whose arguments are listed (`children`).
                 if let Some(tr) = s.trait_ {
                     let lf::TypeRef::Path(tp) = v.ty(tr)? else { return Err(program(format!("a trait that is no path"), r)) };
                     let (tabs, ttexts, tsegs, _) = path_texts(v, tp)?;
-                    for ts in tsegs {
-                        work.push((ts, tp, tabs, ttexts.clone()));
+                    for &ts in tsegs.iter() {
+                        handle_seg(tys, &mut out, &mut next, ts, tp, tabs, &ttexts)?;
                     }
                 }
-            } else {
-                let mut upto = Vec::new_in(Global);
-                upto.extend_from_slice(&texts[..=k]);
-                work.push((*s, p, abs, upto));
-            }
-            // Arguments are lowered segment by segment, in the order `children` lists them.
-            for (s, spath, sabs, stexts) in work.drain(..) {
-                if !s.has_args {
-                    continue;
-                }
-                let mut index = 0u32;
-                for &n in v.rows(s.args)? {
-                    let made = match lf::GenericArg::decode(n)? {
-                        lf::GenericArg::Type(t) => match bare_name(v, t)? {
-                            None => next.next().ok_or(program(format!("a type argument is missing"), r))?,
-                            Some(name) => {
-                                let param = env.params.iter().find(|(n, _)| *n == Name::of(name)).map(|&(_, i)| i);
-                                let is_const = param.is_some_and(|i| env.consts.iter().any(|(c, _)| *c == i));
-                                let lf::TypeRef::Path(tp) = v.ty(t)? else { return Err(program(format!("a one-name argument that is no path"), r)) };
-                                let ar = place(v, v.type_range(t))?;
-                                // An item the body declares takes part as in a body path's own
-                                // argument (body.rs `name_arg`; the one rule is const_open.rs
-                                // `local_arg`): the Reference, "Generic parameters": a one-name
-                                // argument is a type if it resolves to one in the type
-                                // namespace, else a const; "Statements", "Item declarations":
-                                // a block's item is in scope in its block. tempo's
-                                // `Exec::for_config::<Config<SPEC_ID>>()` names the `const
-                                // SPEC_ID` of its block; read at the module alone, it was
-                                // "cannot find type `SPEC_ID`".
-                                let local = match env.body {
-                                    Some(body) => super::const_open::local_arg(body.locals, body.owner, self.heads, v, t, name, ar),
-                                    None => Ok(None),
-                                };
-                                // The name resolves where its token's mark says, as the
-                                // argument's own type would (`path_ty`): never at the module
-                                // alone when a macro wrote it.
-                                let at_mark = |ns: Ns| self.resolve_at(env, v, tp, false, &[name], ns, ar);
-                                // A type if a type parameter, or the names library's answer in
-                                // the type namespace is a type (a constant item answers there
-                                // too, as the library files it: then it is a constant).
-                                let names_a_type = || match at_mark(Ns::Type) {
-                                    Ok(f) => f.consumed == 1 && matches!(f.kind, Kind::Struct | Kind::Enum | Kind::Union | Kind::TypeAlias | Kind::Builtin(_) | Kind::WideInt { .. }),
-                                    Err(_) => false,
-                                };
-                                let local_type = matches!(local, Ok(Some(super::const_open::LocalArg::Type)));
-                                let is_type = local_type || (!is_const && (param.is_some() || names_a_type()));
-                                if is_type {
-                                    self.path_ty(tys, env, v, tp, &[])?
-                                } else if let Ok(Some(super::const_open::LocalArg::Const(bits))) = local {
-                                    // The constant's bits in the parameter's type, as a module
-                                    // constant's are (`const_term`). A scalar parameter only: a
-                                    // fieldless enum's value is its variant under the enum's key
-                                    // (const_enum.rs), which a body's constant's bits are not.
-                                    let ty = self.const_want(env, v, spath, sabs, &stexts, index, ar)?;
-                                    if !matches!(tys.view().get(ty), Some(PNode::Bool | PNode::Char | PNode::Int(_) | PNode::Uint(_) | PNode::Infer | PNode::Error)) {
-                                        return Err(Why::Unsupported("a const argument naming a `const` the body declares, for a parameter whose type is no integer, `bool` or `char`", ar));
-                                    }
-                                    intern(tys, PNode::ConstValue { ty, bits })?
-                                } else if let Err(why) = local {
-                                    // A body's constant not evaluated yet (`Why::NeedConst`: the
-                                    // driver evaluates it and lowers again), or a body's value
-                                    // item that is no constant: refused by name, never read at
-                                    // the module, where the name would mean another item.
-                                    return Err(why);
-                                } else {
-                                    // A name that is no parameter, no type and no value here
-                                    // names nothing: refused as unresolved, never guessed to be
-                                    // a constant (zerocopy's `HasField<Client, value, ..>`, whose
-                                    // `value` is an enum of the impl's own block, was refused
-                                    // "argument 2 of `HasField` is a constant").
-                                    if param.is_none() && name != "true" && name != "false" {
-                                        at_mark(Ns::Value)?;
-                                    }
-                                    let want = |_: &mut PortableTys<'_>| self.const_want(env, v, spath, sabs, &stexts, index, ar);
-                                    self.const_term(tys, env, name, ar, &want)?
-                                }
-                            }
-                        },
-                        lf::GenericArg::Const(c) => {
-                            let at = v.const_range(c)?;
-                            let ar = v.site(at)?;
-                            let text = v.text_at(at)?;
-                            let want = |_: &mut PortableTys<'_>| self.const_want(env, v, spath, sabs, &stexts, index, ar);
-                            self.const_term(tys, env, text, ar, &want)?
-                        }
-                        _ => continue,
-                    };
-                    out.push(made);
-                    index += 1;
-                }
+            } else if s.has_args
+                && let Some(upto) = texts.get(..=k)
+            {
+                handle_seg(tys, &mut out, &mut next, s, p, abs, upto)?;
             }
         }
         if next.next().is_some() {
@@ -1132,7 +1226,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
 
     /// The type `t` made of its children `kids`; a path's arguments (`path_args`' answer) are
     /// left in `args` for its region slots ([`Builder::regions_made`]).
-    fn make(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, t: lf::TypeId, kids: &[PTy], args: &mut Option<Vec<PTy, Global>>) -> Result<PTy, Why> {
+    fn make(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, t: lf::TypeId, kids: &[PTy], args: &mut Option<SmallPath<PTy, 8>>) -> Result<PTy, Why> {
         let r = place(v, v.type_range(t))?;
         match v.ty(t)? {
             // The written lifetime is the reference's region slot (`regions_made`), never
@@ -1664,10 +1758,10 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
     pub fn trait_ref(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, t: lf::TypeId, self_ty: PTy) -> Result<(LibKey, List), Why> {
         let r = place(v, v.type_range(t))?;
         let lf::TypeRef::Path(p) = v.ty(t)? else { return Err(program(format!("a trait that is no path"), r)) };
-        let mut written = Vec::new_in(Global);
-        children(v, t, &mut written)?;
-        let mut given = Vec::with_capacity_in(written.len(), Global);
-        for &w in &written {
+        let mut written: SmallPath<lf::TypeId, 8> = SmallPath::new(lf::TypeId(0));
+        children_into(v, t, &mut |id| written.push(id))?;
+        let mut given: SmallPath<PTy, 8> = SmallPath::new(PTy(0));
+        for &w in written.iter() {
             given.push(self.ty(tys, env, v, w)?);
         }
         let given = self.path_args(tys, env, v, p, &given)?;
@@ -1975,8 +2069,8 @@ pub fn children_of(t: blaze_typeck::PTys<'_>, ty: PTy, out: &mut Vec<PTy, Global
 /// The same numbering is a type alias's (super::tait `alias_opaques`: each `impl` an alias's
 /// type writes is one opaque of the alias), so `out` takes the caller's allocator.
 pub(super) fn return_impls<A: core::alloc::Allocator>(v: &View<'_>, ret: lf::TypeId, out: &mut Vec<lf::TypeId, A>) -> Result<bool, Why> {
-    let mut todo: Vec<lf::TypeId, Global> = Vec::new_in(Global);
-    let mut kids: Vec<lf::TypeId, Global> = Vec::new_in(Global);
+    let mut todo: SmallPath<lf::TypeId, 16> = SmallPath::new(lf::TypeId(0));
+    let mut kids: SmallPath<lf::TypeId, 16> = SmallPath::new(lf::TypeId(0));
     let mut macros = false;
     todo.push(ret);
     while let Some(t) = todo.pop() {
@@ -1986,21 +2080,23 @@ pub(super) fn return_impls<A: core::alloc::Allocator>(v: &View<'_>, ret: lf::Typ
                 out.push(t);
                 for &b in v.rows(bounds)? {
                     if let lf::Bound::Trait { ty, .. } = lf::Bound::decode(b)? {
-                        bound_arg_types(v, ty, &mut kids)?;
+                        bound_arg_types_into(v, ty, &mut |id| kids.push(id))?;
                     }
                 }
             }
             lf::TypeRef::Macro(_) => macros = true,
-            _ => children(v, t, &mut kids)?,
+            _ => children_into(v, t, &mut |id| kids.push(id))?,
         }
-        todo.extend(kids.iter().rev());
+        for &k in kids.iter().rev() {
+            todo.push(k);
+        }
     }
     Ok(macros)
 }
 
 /// The types written in a bound's trait path's arguments: type arguments, associated type
 /// bindings (`Item = T`) and a parenthesized `Fn(A) -> B`'s inputs and output, in order.
-fn bound_arg_types(v: &View<'_>, ty: lf::TypeId, out: &mut Vec<lf::TypeId, Global>) -> Result<(), Why> {
+fn bound_arg_types_into(v: &View<'_>, ty: lf::TypeId, out: &mut impl FnMut(lf::TypeId)) -> Result<(), Why> {
     let lf::TypeRef::Path(p) = v.ty(ty)? else { return Ok(()) };
     for &n in v.segments(v.path(p)?)? {
         let s = lf::Segment::decode(n)?;
@@ -2009,12 +2105,14 @@ fn bound_arg_types(v: &View<'_>, ty: lf::TypeId, out: &mut Vec<lf::TypeId, Globa
         }
         for &a in v.rows(s.args)? {
             match lf::GenericArg::decode(a)? {
-                lf::GenericArg::Type(t) | lf::GenericArg::AssocType { ty: t, .. } => out.push(t),
+                lf::GenericArg::Type(t) | lf::GenericArg::AssocType { ty: t, .. } => out(t),
                 _ => {}
             }
         }
         if s.parenthesized {
-            out.extend(s.ty);
+            if let Some(ret) = s.ty {
+                out(ret);
+            }
         }
     }
     Ok(())
@@ -2022,26 +2120,34 @@ fn bound_arg_types(v: &View<'_>, ty: lf::TypeId, out: &mut Vec<lf::TypeId, Globa
 
 /// The written types a type is made of, in order (the work list's children).
 pub(super) fn children(v: &View<'_>, t: lf::TypeId, out: &mut Vec<lf::TypeId, Global>) -> Result<(), Why> {
+    children_into(v, t, &mut |id| out.push(id))
+}
+
+fn children_into(v: &View<'_>, t: lf::TypeId, out: &mut impl FnMut(lf::TypeId)) -> Result<(), Why> {
     let r = place(v, v.type_range(t))?;
     match v.ty(t)? {
-        lf::TypeRef::Ref { inner, .. } | lf::TypeRef::Ptr { inner, .. } | lf::TypeRef::Slice(inner) => out.push(inner),
-        lf::TypeRef::Array { elem, .. } => out.push(elem),
-        lf::TypeRef::Tuple(l) | lf::TypeRef::Union(l) => out.extend(v.ids(l)?.iter().map(|&i| lf::TypeId(i))),
+        lf::TypeRef::Ref { inner, .. } | lf::TypeRef::Ptr { inner, .. } | lf::TypeRef::Slice(inner) => out(inner),
+        lf::TypeRef::Array { elem, .. } => out(elem),
+        lf::TypeRef::Tuple(l) | lf::TypeRef::Union(l) => {
+            for &i in v.ids(l)? {
+                out(lf::TypeId(i));
+            }
+        }
         lf::TypeRef::Path(p) => {
             let path = v.path(p)?;
             for &n in v.segments(path)? {
                 let s = lf::Segment::decode(n)?;
                 if s.kind == lf::SegKind::Anchor {
                     let Some(ty) = s.ty else { return Err(program(format!("a qualified path's self type is missing"), r)) };
-                    out.push(ty);
+                    out(ty);
                     // `<T>::X`: the self type only (`Builder::qualified_no_trait`).
                     let Some(tr) = s.trait_ else { continue };
                     let lf::TypeRef::Path(tp) = v.ty(tr)? else { return Err(program(format!("a trait that is no path"), r)) };
                     for &tn in v.segments(v.path(tp)?)? {
-                        arg_types(v, &lf::Segment::decode(tn)?, r, out)?;
+                        arg_types_into(v, &lf::Segment::decode(tn)?, r, out)?;
                     }
                 } else {
-                    arg_types(v, &s, r, out)?;
+                    arg_types_into(v, &s, r, out)?;
                 }
             }
         }
@@ -2059,14 +2165,16 @@ pub(super) fn children(v: &View<'_>, t: lf::TypeId, out: &mut Vec<lf::TypeId, Gl
                     }
                     continue;
                 }
-                out.push(p.ty.ok_or(Why::Unsupported("a fn pointer parameter with no type", r))?);
+                out(p.ty.ok_or(Why::Unsupported("a fn pointer parameter with no type", r))?);
             }
-            out.extend(ret);
+            if let Some(ret) = ret {
+                out(ret);
+            }
         }
         lf::TypeRef::Dyn(bounds) => {
             for &b in v.rows(bounds)? {
                 if let Some((_, seg)) = super::dyn_ty::dyn_bound(v, lf::Bound::decode(b)?, r)? {
-                    super::dyn_ty::dyn_arg_types(v, &seg, r, out)?;
+                    super::dyn_ty::dyn_arg_types_into(v, &seg, r, out)?;
                 }
             }
         }
@@ -2075,18 +2183,18 @@ pub(super) fn children(v: &View<'_>, t: lf::TypeId, out: &mut Vec<lf::TypeId, Gl
         lf::TypeRef::Impl(_) => {}
         // A signature's type macro is expanded from its own text ([`super::pattern_ty`]).
         lf::TypeRef::Macro(_) => {}
-        lf::TypeRef::Pat { base, .. } => out.push(base),
+        lf::TypeRef::Pat { base, .. } => out(base),
         lf::TypeRef::Record(fields) => {
             // Yield record field and spread types in written order so `make()` and
             // `record_regions()` align `rows[i]` with `kids[i]` before expanding spreads and
             // sorting into canonical alphabetical field-name order.
             for &n in v.rows(fields)? {
-                out.push(lf::Field::decode(n)?.ty);
+                out(lf::Field::decode(n)?.ty);
             }
         }
         lf::TypeRef::For { binder, inner } => {
             super::preds::lifetimes_only(v, binder, r)?;
-            out.push(inner);
+            out(inner);
         }
         lf::TypeRef::Error => return Err(Why::Unsupported("this type", r)),
     }
@@ -3187,7 +3295,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 let lf::TypeRef::Path(tp) = v.ty(tr)? else { return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::QualifiedNoTrait, r))) };
                 let tsegs = path_texts(v, tp)?.2;
                 let nt = tsegs.len();
-                for (j, ts) in tsegs.into_iter().enumerate() {
+                for (j, &ts) in tsegs.iter().enumerate() {
                     todo.push((ts, if j + 1 == nt { SegRole::QualifiedTrait } else { SegRole::Early }));
                 }
             } else {

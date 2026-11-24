@@ -121,6 +121,8 @@ pub struct OwnedRecorder<'a> {
     /// The binding reads' cell keys, each derived once whoever owns the read (a key is a
     /// function of the read alone): a names lookup hashes nothing here on a repeat.
     binding_keys: RefCell<BindingKeys<'a>>,
+    /// Reusable scratch buffer for sorting one owner's reads in [`OwnedRecorder::reads_of`].
+    sort_buf: RefCell<AVec<'a, TableRead>>,
 }
 
 impl<'a> OwnedRecorder<'a> {
@@ -136,6 +138,7 @@ impl<'a> OwnedRecorder<'a> {
             offered: Cell::new(0),
             broken: Cell::new(None),
             binding_keys: RefCell::new(BindingKeys::new_in(o.alloc)),
+            sort_buf: RefCell::new(AVec::new_in(o.alloc)),
         }
     }
 
@@ -171,16 +174,27 @@ impl<'a> OwnedRecorder<'a> {
             return Err(why);
         }
         let Some(at) = self.by_owner.borrow().get(&want_bytes(cell)).copied() else { return Ok(()) };
-        let slots = self.slots.borrow();
-        let slot = &slots[at as usize];
-        if slot.full {
-            return Err(OwnedError::Reads(ReadsFull { most: MOST_READS }));
+        let mut sorted = core::mem::replace(&mut *self.sort_buf.borrow_mut(), AVec::new_in(self.alloc));
+        {
+            let slots = self.slots.borrow();
+            let Some(slot) = slots.get(at as usize) else {
+                *self.sort_buf.borrow_mut() = sorted;
+                return Ok(());
+            };
+            if slot.full {
+                *self.sort_buf.borrow_mut() = sorted;
+                return Err(OwnedError::Reads(ReadsFull { most: MOST_READS }));
+            }
+            sorted.clear();
+            sorted.extend_from_slice(&slot.reads);
         }
-        let mut sorted: AVec<'a, TableRead> = AVec::with_capacity_in(slot.reads.len(), self.alloc);
-        sorted.extend_from_slice(&slot.reads);
         sorted.sort_unstable();
         for one in sorted.iter() {
             each(*one);
+        }
+        sorted.clear();
+        if sorted.capacity() <= 4096 {
+            *self.sort_buf.borrow_mut() = sorted;
         }
         Ok(())
     }

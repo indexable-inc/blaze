@@ -54,6 +54,18 @@ pub struct FilePaths<'n> {
     pub shown: &'n str,
 }
 
+/// What [`NamesSource::each_member_matching`] needs for a member row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemberWant {
+    /// Skip this member completely without reading its text.
+    Skip,
+    /// Yield this member's metadata (`key`, `name`, `kind`, `written_by`) with empty `text`
+    /// (avoiding file/expansion text lookup and FileItems verification for unused member text).
+    NameOnly,
+    /// Yield this member with its full current text.
+    WithText,
+}
+
 /// A member of a trait or an impl, as either source lists it (question 13).
 #[derive(Clone, Copy, Debug)]
 pub struct MemberOf<'n> {
@@ -308,6 +320,21 @@ pub trait NamesSource<'n>: Copy {
     /// Question 13: the members of the trait or impl `owner`, in declaration order, each given
     /// to `each`. `false`: the owner has no member row (a container with no member has none).
     fn each_member(self, owner: ItemKey, each: &mut dyn FnMut(MemberOf<'n>)) -> bool;
+
+    /// Filtered [`each_member`]: asks `want(kind, name)` on each member row before reading its
+    /// text, skipping `MemberWant::Skip` rows and avoiding text reads for `MemberWant::NameOnly`.
+    fn each_member_matching(
+        self,
+        owner: ItemKey,
+        want: &mut dyn FnMut(ItemKind, Option<&'n str>) -> MemberWant,
+        each: &mut dyn FnMut(MemberOf<'n>),
+    ) -> bool {
+        self.each_member(owner, &mut |m| {
+            if want(m.kind, m.name) != MemberWant::Skip {
+                each(m);
+            }
+        })
+    }
 
     /// The trait or impl a member is of, and the member's name (`Resolver::member_of`).
     fn member_owner(self, member: ItemKey) -> Option<(ItemKey, &'n str)>;
@@ -1216,6 +1243,9 @@ pub struct Records<'n> {
     /// segment and per lexical layer. Records are one thread's (they hold `RefCell`s), and a walk
     /// calls nothing that walks again, so the borrow is never contended.
     scratch: RefCell<ThroughScratch<'n>>,
+    /// Per-crate `#![blaze::...]` extension flags detected once from file 0 (`Records::blaze_extensions`),
+    /// avoiding repeated full scans of crate root files on every lowered item head.
+    extensions: AVec<'n, OnceCell<parser::Extensions>>,
     /// The allocator the records were opened with, the caller's: a walk's and a digest's
     /// scratch too.
     alloc: Alloc<'n>,
@@ -1232,6 +1262,10 @@ impl<'n> Records<'n> {
     pub fn new(keys: &'n [CrateItemKey], load: &'n dyn Load<'n>, log: &'n Log<'n>, frame: &'n blaze_mem::Frame, alloc: Alloc<'n>) -> Records<'n> {
         let origin_parts: ARc<'n, OriginParts<'n>> = ARc::new_in(RefCell::new(HashMap::new_in(alloc)), alloc);
         let bump = frame.alloc(Erased::new(frame)).bump();
+        let mut extensions = AVec::with_capacity_in(keys.len(), alloc);
+        for _ in 0..keys.len() {
+            extensions.push(OnceCell::new());
+        }
         Records {
             paths: VerifiedNames::new(keys, load, log, alloc),
             items: RecordItems::new(keys, Loader { load, log, origins: origin_parts.local_share() }, bump),
@@ -1251,6 +1285,7 @@ impl<'n> Records<'n> {
             marks: RefCell::new(HashMap::new_in(alloc)),
             origins_opened: Cell::new(0),
             scratch: RefCell::new(ThroughScratch::new_in(alloc)),
+            extensions,
             alloc,
         }
     }
@@ -1685,6 +1720,17 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
         Some(self.names_of(krate)?.crate_root().has_feature(name))
     }
 
+    fn blaze_extensions(self, krate: usize) -> parser::Extensions {
+        let Some(cell) = self.extensions.get(krate) else {
+            return parser::Extensions::NONE;
+        };
+        *cell.get_or_init(|| {
+            self.file_text(krate, 0)
+                .map(blaze_file_items::detect_blaze_extensions)
+                .unwrap_or(parser::Extensions::NONE)
+        })
+    }
+
     /// The link closure (linked.rs `Linked::closure`, the one work list) over what each
     /// crate's records hold of its links:
     /// - its extern prelude, the names record's crate-root `externs` (blaze-scope resolve.rs
@@ -2054,6 +2100,15 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
     }
 
     fn each_member(self, owner: ItemKey, each: &mut dyn FnMut(MemberOf<'n>)) -> bool {
+        self.each_member_matching(owner, &mut |_, _| MemberWant::WithText, each)
+    }
+
+    fn each_member_matching(
+        self,
+        owner: ItemKey,
+        want: &mut dyn FnMut(ItemKind, Option<&'n str>) -> MemberWant,
+        each: &mut dyn FnMut(MemberOf<'n>),
+    ) -> bool {
         let Some(krate) = self.items.crate_of(owner) else { return false };
         if self.items_of(krate).is_none() {
             return false;
@@ -2063,8 +2118,16 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
             // A member whose row or text does not read is an error filed; the rest are still
             // given, and the log voids the result.
             let Some(row) = self.read(krate, row) else { continue };
-            // Its entry and text as they are now (item_grain.rs `member_now`).
-            let Some((item, text)) = self.member_now(krate, owner, &row) else { continue };
+            let need = want(row.kind, row.name);
+            let (item, text) = match need {
+                MemberWant::Skip => continue,
+                MemberWant::NameOnly => (row.outline, ""),
+                MemberWant::WithText => {
+                    // Its entry and text as they are now (item_grain.rs `member_now`).
+                    let Some(now) = self.member_now(krate, owner, &row) else { continue };
+                    now
+                }
+            };
             each(MemberOf {
                 key: row.key,
                 name: row.name,

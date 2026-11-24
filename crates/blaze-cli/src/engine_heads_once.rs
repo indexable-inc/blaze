@@ -109,7 +109,7 @@ use blaze_ladder::front2::tables::head::SeededHeadsOpts;
 use blaze_ladder::front2::tables::owned_reads::{OwnedRecorder, ReadOwners as _};
 #[cfg(test)]
 use blaze_ladder::front2::tables::recorder::{Recorder, RecorderOpts};
-use blaze_ladder::front2::tables::recorder::TableRead;
+use blaze_ladder::front2::tables::recorder::{ReadOf, TableRead};
 use blaze_ladder::front2::tables::seeds::MOST_CELLS;
 use blaze_ladder::front2::tables::task::cell_id;
 use blaze_ladder::front2::tables::view::Tables;
@@ -899,6 +899,17 @@ impl<'n, S: NamesSource<'n>> ConstValues<'n> for OnceConsts<'_, 'n, S> {
     }
 }
 
+/// Precomputed per-crate scope placement entry for one crate in a split job's scope, sorted by
+/// `prefix`: allows [`place_read`] to resolve `TableRead::Names` without re-hashing
+/// `crate_scope_name`, querying `view.cell(CELLS)`, or hashing `NameCell::key()` for dependencies.
+#[derive(Clone, Copy)]
+pub(crate) struct ScopeCrate {
+    pub(crate) prefix: [u8; 8],
+    pub(crate) scope: Name,
+    pub(crate) is_member: bool,
+    pub(crate) has_cells: bool,
+}
+
 /// What one job's heads are frozen with (engine_heads.rs `heads_of`, once a job).
 pub(crate) struct JobCx<'j, 't, 'n, 'v, 'w> {
     /// The job's view, recording nowhere (its reads are taken by the recorders below).
@@ -932,6 +943,8 @@ pub(crate) struct JobCx<'j, 't, 'n, 'v, 'w> {
     /// The scope names of the job's crates that are members (sorted): every other crate's names
     /// reads are kept at its record's `WHOLE` ([`coarse`]).
     pub(crate) members: &'j [Name],
+    /// Precomputed scope metadata for each crate in `records`, sorted by 8-byte crate prefix.
+    pub(crate) crate_scopes: &'j [ScopeCrate],
 }
 
 /// Whether `want`'s item is a member crate's: its key's crate prefix is a member unit's (one of
@@ -1055,9 +1068,9 @@ fn publish_since<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &mut Owner
 /// evaluation's, and the text cell of each constant `consts` holds.
 fn cell_reads<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &mut Owners<'s>, w: Want, consts: &[(LibKey, u128)]) -> Result<Vec<CellId, Alloc<'static>>, &'static str> {
     let g = job.g;
-    let mut out: Vec<CellId, Alloc<'static>> = Vec::new_in(g);
-    names_of(job, owners, job.names, w, &mut out)?;
-    names_of(job, owners, job.evals, w, &mut out)?;
+    let mut out: Vec<CellId, Alloc<'static>> = Vec::with_capacity_in(16 + consts.len(), g);
+    names_of(job, owners, job.names, w, &mut |id| out.push(id))?;
+    names_of(job, owners, job.evals, w, &mut |id| out.push(id))?;
     for (c, _) in consts.iter() {
         match text_cell(job.records, job.subjects, *c) {
             Ok(Some(id)) => out.push(id),
@@ -1075,12 +1088,16 @@ fn cell_reads<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &mut Owners<'
 }
 
 /// `w`'s reads in `recorder`, each as the cell a reader records (engine_heads.rs `names_read`).
-fn names_of<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &mut Owners<'s>, recorder: &OwnedRecorder<'_>, w: Want, out: &mut Vec<CellId, Alloc<'static>>) -> Result<(), &'static str> {
+fn names_of<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &mut Owners<'s>, recorder: &OwnedRecorder<'_>, w: Want, out: &mut dyn FnMut(CellId)) -> Result<(), &'static str> {
     let mut result = Ok(());
     recorder
         .reads_of(w, &mut |one| {
             if result.is_ok() {
-                result = place_read(job, owners, one).map(|cell| out.extend(cell));
+                result = place_read(job, owners, one).map(|cell| {
+                    if let Some(id) = cell {
+                        out(id);
+                    }
+                });
             }
         })
         .map_err(|e| leak(job.g, format_args!("its head's freeze: {e}")))?;
@@ -1095,6 +1112,21 @@ fn place_read<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &mut Owners<'
             let shown = UnplacedIn { unplaced: &unplaced, crates: job.crates };
             leak(job.g, format_args!("placing a head's source read: {shown}"))
         });
+    }
+    // Fast path for `TableRead::Names`: resolve crate scope from precomputed `job.crate_scopes`,
+    // skipping `crate_scope_name` BLAKE3, `view.cell(CELLS)`, and (for dependencies) `NameCell::key()`.
+    if let ReadOf::Names { krate } = read.of() {
+        if krate == blaze_scope::BUILTIN_PREFIX {
+            return Ok(None);
+        }
+        if let Ok(at) = job.crate_scopes.binary_search_by_key(&krate, |c| c.prefix)
+            && let Some(&sc) = job.crate_scopes.get(at)
+        {
+            if !sc.is_member || !sc.has_cells {
+                return Ok(Some(CellId { of: sc.scope, cell: WHOLE }));
+            }
+            return Ok(Some(CellId { of: sc.scope, cell: blaze_drive::cells::Cell(read.cell()) }));
+        }
     }
     let Some(id) = cell_id(job.base, read).map_err(|why| leak(job.g, format_args!("placing a head's read {read:?}: {why}")))? else {
         return Ok(None);
@@ -1138,14 +1170,13 @@ fn reads_from<'n, 's: 'n>(
     }
     // Its task's own lookups in this job (its text, its `cell_of`): when another job froze it,
     // they are not in the entry.
-    let mut own: Vec<CellId, Alloc<'static>> = Vec::new_in(g);
-    names_of(job, owners, job.names, want, &mut own)?;
-    for id in own.iter() {
-        push(*id);
+    names_of(job, owners, job.names, want, push)?;
+    if heads.is_empty() {
+        return Ok(());
     }
-    let mut seen: blaze_hash::HashSet<[u8; WANT_BYTES], Alloc<'static>> = blaze_hash::HashSet::new_in(g);
+    let mut seen: blaze_hash::HashSet<[u8; WANT_BYTES], Alloc<'static>> = blaze_hash::HashSet::with_capacity_in(heads.len() + 1, g);
     seen.insert(want_bytes(want));
-    let mut next: Vec<Want, Alloc<'static>> = Vec::new_in(g);
+    let mut next: Vec<Want, Alloc<'static>> = Vec::with_capacity_in(heads.len(), g);
     next.extend_from_slice(heads);
     while let Some(w) = next.pop() {
         if !seen.insert(want_bytes(w)) {

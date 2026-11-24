@@ -797,6 +797,9 @@ pub trait Stable<T> {
     fn extend(&self, values: &[T]) -> Result<u32, Full>;
     /// Every element appended so far.
     fn as_slice(&self) -> &[T];
+    /// Resets the column to empty (`&mut self`: no live slices exist), retaining bounded backing
+    /// capacity for reuse.
+    fn clear(&mut self);
 }
 
 /// A [`Stable`] column at its cap: interned as `Limit::Table`.
@@ -838,6 +841,18 @@ impl<'a> OwnIndex<'a> {
         let found = self.list_index.find(hash, |id| lists.get(own_range(rows[id as usize])) == Some(tys))?;
         Some(rows[found as usize])
     }
+
+    fn clear(&mut self) {
+        self.node_index.clear();
+        if self.node_index.capacity() > 2048 {
+            self.node_index.shrink_to(256);
+        }
+        self.list_index.clear();
+        self.list_rows.clear();
+        if self.list_rows.capacity() > 2048 {
+            self.list_rows.shrink_to(256);
+        }
+    }
 }
 
 /// The `&self` form's own part: its columns and its index in a cell (borrowed only inside one
@@ -867,6 +882,7 @@ trait StableOwn {
     fn list_col(&self) -> &dyn Stable<PTy>;
     fn record_schema_col(&self) -> &dyn Stable<(RecordSchema, List)>;
     fn record_name_col(&self) -> &dyn Stable<Name>;
+    fn clear(&mut self);
 }
 
 fn table_full(_: Full) -> CheckError {
@@ -955,6 +971,14 @@ impl StableOwn for StableCols<'_> {
 
     fn record_name_col(&self) -> &dyn Stable<Name> {
         &*self.record_names
+    }
+
+    fn clear(&mut self) {
+        self.nodes.clear();
+        self.lists.clear();
+        self.record_schemas.clear();
+        self.record_names.clear();
+        self.index.get_mut().clear();
     }
 }
 
@@ -1241,6 +1265,28 @@ impl<'a> PortableTys<'a> {
             alloc,
         );
         Ok(PortableTys { base: None, alloc, own: Own::Stable(cols) })
+    }
+
+    /// Resets this table's own columns and interning index to empty (`&mut self`: no live views),
+    /// retaining bounded backing capacity for reuse across items.
+    pub fn clear(&mut self) {
+        self.base = None;
+        match &mut self.own {
+            Own::Owned { nodes, lists, record_schemas, record_names, index } => {
+                nodes.clear();
+                if nodes.capacity() > 2048 {
+                    nodes.shrink_to(256);
+                }
+                lists.clear();
+                if lists.capacity() > 2048 {
+                    lists.shrink_to(256);
+                }
+                record_schemas.clear();
+                record_names.clear();
+                index.clear();
+            }
+            Own::Stable(s) => s.clear(),
+        }
     }
 
     /// [`PortableTys::over`] with the own part in [`Stable`] columns ([`PortableTys::new_stable`]).

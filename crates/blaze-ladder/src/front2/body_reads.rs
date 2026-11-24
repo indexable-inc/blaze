@@ -193,6 +193,12 @@ impl Digests {
         Digests { by_owner: HashMap::new_in(Global), rows: Vec::new_in(Global) }
     }
 
+    pub fn clear(&mut self) {
+        let Digests { by_owner, rows } = self;
+        by_owner.clear();
+        rows.clear();
+    }
+
     /// `list`, read by a clean check of `owner`'s body, filed as its digest (and its rows, for
     /// a list of at most [`MOST_KEPT_ROWS`]); `scratch` holds one question's bytes at a time.
     /// A digest already filed for `owner` must be the same: another is
