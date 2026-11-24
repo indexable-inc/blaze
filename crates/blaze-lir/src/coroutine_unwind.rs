@@ -7,11 +7,12 @@
 //! block (a `cleanup` block) drops it and ends in `resume`. The split takes such bodies:
 //!
 //! - **Cleanup blocks.** An `invoke`'s landing block and every block reached from it is a
-//!   cleanup block. It is copied into whichever output holds it like any block; a kept value
-//!   used there is loaded from the state exactly as on a cancel path (the landing blocks are
-//!   counted where the suspends' cancel blocks are: a value live into one is kept). A cleanup
-//!   path may not suspend, as a cancel path may not: refused by name, "a suspension in a
-//!   cleanup path".
+//!   cleanup block. It is copied into whichever output holds it like any block; a value live
+//!   across a suspension into one is loaded from the state as on a cancel path (the `invoke`'s
+//!   unwind edge carries the backward liveness walk to the suspend's resume or cancel block),
+//!   while a value defined on the same side of every suspension still dominates the landing
+//!   block directly. A cleanup path may not suspend, as a cancel path may not: refused by
+//!   name, "a suspension in a cleanup path".
 //! - **Poisoning.** Every `resume` is preceded by a store of [`PANICKED`] at the tag, so a
 //!   state whose poll unwound is `Panicked`: the split's `drop` at `Panicked` returns at once
 //!   (the cleanup already dropped what was live), and `poll` at `Panicked` goes to

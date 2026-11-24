@@ -47,12 +47,14 @@ pub struct LaidState {
     pub niche: crate::StateNiche,
 }
 
-/// [`lay_state`]'s answer: the state, and per saved local (the recipe's order) its field's
-/// offset and its drop flag's offset (`None`: its type needs no drop).
+/// [`lay_state`]'s answer: the state, per saved local (the recipe's order) its field's offset
+/// and its drop flag's offset (`None`: its type needs no drop), and per by-value upvar needing
+/// a drop flag its flag's offset.
 pub struct Laid<A: Allocator> {
     pub state: LaidState,
     pub field: Vec<u32, A>,
     pub flag: Vec<Option<u32>, A>,
+    pub upvar_flag: Vec<u32, A>,
 }
 
 /// One saved local as the builder looks it up: its identity in the flow, its field's offset
@@ -139,6 +141,22 @@ pub fn lay_state<A: Allocator + Copy>(
     scratch: Alloc<'_>,
     alloc: A,
 ) -> Result<Laid<A>, BuildError> {
+    lay_state_with_upvar_flags(env, saved, needs_flag, 0, points, scratch, alloc)
+}
+
+/// [`lay_state`] with `upvar_flags` extra 1-byte drop-flag slots in the state's saved region
+/// for by-value upvars whose ground type needs drop (the unresumed path drops them if never
+/// polled, while the body owns them once polled and may move them conditionally across a
+/// suspension).
+pub fn lay_state_with_upvar_flags<A: Allocator + Copy>(
+    env: (u64, u8),
+    saved: &[(u64, u8)],
+    needs_flag: &[bool],
+    upvar_flags: usize,
+    points: u32,
+    scratch: Alloc<'_>,
+    alloc: A,
+) -> Result<Laid<A>, BuildError> {
     // Built at each use: `BuildError` is not `Clone`.
     let too_big = || BuildError::UnsupportedSig { what: "a coroutine state past 4 GiB" };
     let too_aligned = BuildError::UnsupportedSig { what: "a coroutine state field aligned past 2^31" };
@@ -175,7 +193,7 @@ pub fn lay_state<A: Allocator + Copy>(
         field[i as usize] = u32::try_from(here).map_err(|_| too_big())?;
         at = here.checked_add(size).ok_or_else(too_big)?;
     }
-    // The drop flags, a byte each, in recipe order.
+    // The drop flags, a byte each, in recipe order, followed by upvar drop flags.
     let mut flag: Vec<Option<u32>, A> = Vec::with_capacity_in(saved.len(), alloc);
     for &needs in needs_flag {
         if needs {
@@ -184,6 +202,11 @@ pub fn lay_state<A: Allocator + Copy>(
         } else {
             flag.push(None);
         }
+    }
+    let mut upvar_flag: Vec<u32, A> = Vec::with_capacity_in(upvar_flags, alloc);
+    for _ in 0..upvar_flags {
+        upvar_flag.push(u32::try_from(at).map_err(|_| too_big())?);
+        at += 1;
     }
     let tag_offset = align_up(at, tag_align);
     let align = env.1.max(region_align).max(tag_align);
@@ -195,5 +218,5 @@ pub fn lay_state<A: Allocator + Copy>(
     let shape = StateShape { size: size as u32, align, tag_offset: tag_offset as u32, tag_ty };
     let niche = crate::StateNiche { tag_offset: tag_offset as u32, tag_ty, valid_end: (tags - 1) as u32 };
     let region = StateRegion { start: start as u32, end: tag_offset as u32, align: region_align };
-    Ok(Laid { state: LaidState { shape, region, niche }, field, flag })
+    Ok(Laid { state: LaidState { shape, region, niche }, field, flag, upvar_flag })
 }

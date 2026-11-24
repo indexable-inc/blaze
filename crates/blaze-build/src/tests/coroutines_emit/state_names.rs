@@ -25,7 +25,9 @@ use blaze_typeck::{BinOp, Capture, ExprId, PatId};
 
 use super::{Prog, Ran, Script, async_body, async_fn, bin, call_await, let_u64, lit, open_world, run, run_laid};
 use crate::BuildError;
-use crate::coroutine_state::{LaidState, StateName, StateNames, StatePlan, StatePlant, UNNAMED_ACROSS, lay_state};
+use crate::coroutine_state::{
+    LaidState, StateName, StateNames, StatePlan, StatePlant, UNNAMED_ACROSS, lay_state, lay_state_with_upvar_flags,
+};
 
 /// A state laid from a written table: each saved local's identity, layout and whether it needs
 /// drop, in the recipe's order.
@@ -110,4 +112,39 @@ fn every_slot_kept_across_a_suspension_names_a_flow_local() {
         "state names: laid ready({}) at poll {}; builder-made slot refused at the await; without a's row refused (expression {})",
         ran.value, ran.polls, refused.0
     );
+}
+
+#[test]
+fn lay_state_with_upvar_flags_places_flags_inside_region() {
+    let heap = blaze_own::testing::heap();
+    let a = heap.alloc();
+    let saved_sizes = [(8u64, 3u8), (16, 3)];
+    let saved_flags = [true, false];
+    let laid = lay_state_with_upvar_flags((24, 3), &saved_sizes, &saved_flags, 2, 1, a, a)
+        .unwrap_or_else(|e| panic!("lay_state_with_upvar_flags: {e}"));
+    assert_eq!(laid.upvar_flag.len(), 2);
+    let region = laid.state.region;
+    let mut rows = StdVec::new();
+    for (i, &flag_off) in laid.upvar_flag.iter().enumerate() {
+        assert!(flag_off >= region.start && flag_off + 1 <= region.end);
+        rows.push(StateName {
+            identity: Identity::Binding(PatId(i as u32)),
+            offset: flag_off,
+            size: 0,
+            flag: Some(flag_off),
+        });
+    }
+    for (i, &(size, _)) in saved_sizes.iter().enumerate() {
+        rows.push(StateName {
+            identity: Identity::Binding(PatId((i + 10) as u32)),
+            offset: laid.field[i],
+            size: size as u32,
+            flag: laid.flag[i],
+        });
+    }
+    rows.sort_unstable_by_key(|r| r.identity);
+    let names = StateNames::new(&rows, region).unwrap_or_else(|e| panic!("StateNames::new: {e}"));
+    assert_eq!(names.get(Identity::Binding(PatId(0))).and_then(|r| r.flag), Some(laid.upvar_flag[0]));
+    assert_eq!(names.get(Identity::Binding(PatId(1))).and_then(|r| r.flag), Some(laid.upvar_flag[1]));
+    assert_ne!(laid.upvar_flag[0], laid.upvar_flag[1]);
 }

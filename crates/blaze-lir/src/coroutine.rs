@@ -401,8 +401,6 @@ struct Body<'a, A: Allocator> {
     suspends: Vec<SuspendAt, A>,
     /// Where `poll` goes on a finished state.
     panics: Panics,
-    /// The landing blocks of the body's `invoke`s, rising: the cleanup paths' entries.
-    landings: Vec<u32, A>,
     /// Per block: the `invoke` whose normal block it is, [`NONE`] for another.
     invoked: Vec<u32, A>,
 }
@@ -568,7 +566,7 @@ fn read<'a, A: Allocator + Copy>(
             _ => {}
         }
     }
-    Ok(Body { view, shape, entry_params, block_of, in_poll, in_drop, suspends, panics, landings, invoked })
+    Ok(Body { view, shape, entry_params, block_of, in_poll, in_drop, suspends, panics, invoked })
 }
 
 /// Per slot, whether the state keeps it: whether at some suspend its address may have been
@@ -608,11 +606,13 @@ fn crossing_values<A: Allocator + Copy>(body: &Body<'_, A>, alloc: &A) -> Vec<bo
         after[suspend.resume as usize] = true;
         after[suspend.cancel as usize] = true;
     }
-    // A cleanup path's entry is counted as a cancel block is (ASYNC.md P5): a value live into
-    // it is kept, and loaded there from the state.
-    for &landing in body.landings.iter() {
-        after[landing as usize] = true;
-    }
+    // A cleanup path's entry is NOT a resume/cancel boundary of its own: a landing block is
+    // entered only from an `invoke`'s unwind edge (which `preds` already carries). If that
+    // `invoke` lies after some suspend without passing through `made_in`, the backward walk
+    // through `preds` reaches that suspend's `resume` or `cancel` block (both in `after`) and
+    // marks the value crossing; if the `invoke` lies on the same side of every suspend as
+    // `made_in` (or the body has no suspends), `made_in` still strictly dominates the landing
+    // block in `poll`, so the value does not cross a suspension.
     // Predecessors, in CSR.
     let mut starts = filled(blocks + 1, 0u32, alloc);
     for b in (0..blocks).filter(|&b| held(b)) {
