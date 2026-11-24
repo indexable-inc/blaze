@@ -1124,7 +1124,7 @@ impl<'n> Consts<'n> {
         let source = r.store.read_const_body(r.names, r.keys, item);
         let lowered = lowered.map_err(|error| ConstFail::Body { item, error })?;
         source.map_err(|error| ConstFail::Body { item, error })?;
-        let (checked, lits) = {
+        let (mut checked, lits) = {
             let view = lowered.lowered.view();
             let spell = Spelling::of(&view).map_err(|why| ConstFail::Spelling { item, why })?;
             let scope = lowered.scope(&spell);
@@ -1143,10 +1143,48 @@ impl<'n> Consts<'n> {
             },
             // The operand is evaluated; the builder borrows its row. Only a borrow THIS check
             // promoted: one it did not is a runtime temporary, never a constant.
-            Some(BodyRoot::Promoted(borrow)) => match lowered.typeck.exprs.get(borrow.0 as usize) {
-                Some(&tc::Expr::Ref { mutbl: tc::Mutbl::Not, operand }) if checked.promoted.binary_search_by_key(&borrow.0, |x| x.0).is_ok() => Some(operand),
-                _ => return Err(ConstFail::NotPromoted { owner: item, borrow }),
-            },
+            Some(BodyRoot::Promoted(borrow)) => {
+                if checked.promoted.binary_search_by_key(&borrow.0, |x| x.0).is_err() {
+                    return Err(ConstFail::NotPromoted { owner: item, borrow });
+                }
+                match lowered.typeck.exprs.get(borrow.0 as usize) {
+                    Some(&tc::Expr::Ref { mutbl: tc::Mutbl::Not, operand }) => Some(operand),
+                    Some(_) => {
+                        // A promoted shared autoref (`AdjustKind::Borrow { mutbl: Not, raw: false }`
+                        // at index 0 on `borrow`): the promoted value is `borrow`'s unadjusted
+                        // value before its leading borrow and any coercions after it. Strip
+                        // `borrow`'s own adjustment rows from this `ConstBody`'s `checked` so the
+                        // evaluator produces `borrow`'s value directly.
+                        let adj_e = checked.adjusts.column::<0>();
+                        let start = adj_e.partition_point(|e| e.0 < borrow.0);
+                        let end = adj_e.partition_point(|e| e.0 <= borrow.0);
+                        if start == end
+                            || !matches!(
+                                checked.adjusts.column::<1>().get(start),
+                                Some(tc::AdjustKind::Borrow { mutbl: tc::Mutbl::Not, raw: false, .. })
+                            )
+                        {
+                            return Err(ConstFail::NotPromoted { owner: item, borrow });
+                        }
+                        let mut stripped = blaze_own::Soa::new_in(r.store.tys.alloc());
+                        for (i, ((&e, &k), &t)) in checked
+                            .adjusts
+                            .column::<0>()
+                            .iter()
+                            .zip(checked.adjusts.column::<1>().iter())
+                            .zip(checked.adjusts.column::<2>().iter())
+                            .enumerate()
+                        {
+                            if i < start || i >= end {
+                                stripped.push((e, k, t));
+                            }
+                        }
+                        checked.adjusts = stripped;
+                        Some(borrow)
+                    }
+                    None => return Err(ConstFail::NotPromoted { owner: item, borrow }),
+                }
+            }
         };
         let text = match (r.store.locals.head(item), r.keys.library_in(r.names, item)) {
             // An item declared in a body: its kept text (the names library holds none for

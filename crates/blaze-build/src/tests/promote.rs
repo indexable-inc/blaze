@@ -85,3 +85,79 @@ fn a_promoted_constants_fn_pointer_is_a_reference_of_the_function() {
     let refused = build(&w, &b, root).err().unwrap_or_default();
     assert!(refused.contains("holds a fn pointer to instance"), "{refused}");
 }
+
+/// `impl E { fn id(&self) -> &E }` called as `B.id()` (shared autoref on a unit variant):
+/// the receiver `B` is promoted to a constant row (`data_addr`), never spilled to a stack
+/// temporary. Also verifies `Expr::Ref` with a further shared autoref (`(&7).read()`) keeps
+/// two levels of indirection instead of confusing the `Expr::Ref` promotion with an autoref
+/// promotion.
+#[test]
+fn a_promoted_autoref_uses_constant_row_not_frame_temporary() {
+    let mut w = TestWorld::new();
+    let u32_t = w.ty(U32);
+    let u32_ref = PNode::Ref(Mutbl::Not, u32_t);
+    let u32_ref_t = w.ty(u32_ref);
+    let u32_ref_ref = PNode::Ref(Mutbl::Not, u32_ref_t);
+    w.func(1, "main", &[], U32);
+    w.func(20, "read_ref", &[u32_ref], U32);
+    w.func(21, "read_ref_ref", &[u32_ref_ref], U32);
+    let imp_u32 = ItemKey(200);
+    let imp_ref = ItemKey(201);
+    let u32_ref_ty = w.ty(u32_ref);
+    w.methods.push((
+        blaze_typeck::Shape::Uint(blaze_typeck::UintTy::U32),
+        blaze_typeck::Name::of("read_ref"),
+        blaze_typeck::AssocItem { container: imp_u32, item: ItemKey(20), kind: blaze_typeck::AssocKind::Fn { self_param: true } },
+        u32_t,
+    ));
+    w.methods.push((
+        blaze_typeck::Shape::Ref(Mutbl::Not),
+        blaze_typeck::Name::of("read_ref_ref"),
+        blaze_typeck::AssocItem { container: imp_ref, item: ItemKey(21), kind: blaze_typeck::AssocKind::Fn { self_param: true } },
+        u32_ref_ty,
+    ));
+
+    // Case 1: `7u32.read_ref()` -> `7u32` is autoref-promoted to a constant row.
+    let mut b = BodyBuf::new();
+    let seven = b.int(7, Some(blaze_typeck::IntSuffix::Uint(blaze_typeck::UintTy::U32)));
+    let root = b.e(Expr::MethodCall {
+        receiver: seven,
+        name: blaze_typeck::Name::of("read_ref"),
+        generic_args: List::EMPTY,
+        args: List::EMPTY,
+        scope: blaze_typeck::ScopeId(0),
+    });
+    w.promoted.push((seven, Some(record(&[7, 0, 0, 0], 2))));
+    let built = build(&w, &b, root).unwrap_or_else(|e| panic!("{e}"));
+    let text = blaze_lir::print(built.func.view());
+    assert!(
+        text.contains("bytes \"07000000\"") && text.contains("data_addr"),
+        "a promoted shared autoref must emit a constant data row:\n{text}"
+    );
+
+    w.promoted[0].1 = None;
+    let refused = build(&w, &b, root).err().unwrap_or_default();
+    assert!(refused.contains("has no promoted value"), "{refused}");
+
+    // Case 2: `(&7u32).read_ref_ref()` -> `&7u32` is an `Expr::Ref` (promoted) with a
+    // further shared autoref adjustment (`&&u32`); it must pass a stack slot holding the
+    // `data_addr` (two indirections), not the `data_addr` directly.
+    let mut b2 = BodyBuf::new();
+    let seven2 = b2.int(7, Some(blaze_typeck::IntSuffix::Uint(blaze_typeck::UintTy::U32)));
+    let r2 = b2.e(Expr::Ref { mutbl: Mutbl::Not, operand: seven2 });
+    let root2 = b2.e(Expr::MethodCall {
+        receiver: r2,
+        name: blaze_typeck::Name::of("read_ref_ref"),
+        generic_args: List::EMPTY,
+        args: List::EMPTY,
+        scope: blaze_typeck::ScopeId(0),
+    });
+    w.promoted.clear();
+    w.promoted.push((r2, Some(record(&[7, 0, 0, 0], 2))));
+    let built2 = build(&w, &b2, root2).unwrap_or_else(|e| panic!("{e}"));
+    let text2 = blaze_lir::print(built2.func.view());
+    assert!(
+        text2.contains("data_addr") && text2.contains("slot_addr"),
+        "an autoref of a promoted `Expr::Ref` must keep the second indirection:\n{text2}"
+    );
+}

@@ -35,6 +35,7 @@
 use blaze_own::{Alloc, Vec};
 
 use crate::body::Expr;
+use crate::columns::AdjustKind;
 use crate::diag::At;
 use crate::error::{CheckError, Limit, Stop};
 use crate::ids::{ExprId, LangItem, Mutbl, PatId};
@@ -52,6 +53,19 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     pub(crate) fn analyze_promotions(&mut self) -> Result<(), Stop> {
         self.promoted.clear();
         let bound = self.body.exprs.len() + self.body.pats.len() + self.body.stmts.len() + 1;
+        // Each expression's first adjustment (O(exprs + adjusts)): a leading shared non-raw
+        // autoref (`AdjustKind::Borrow { mutbl: Mutbl::Not, raw: false, .. }` with no leading
+        // derefs, e.g. `EthereumHardfork::Frontier.boxed()` or `[1, 2, 3].as_slice()`) borrows
+        // the expression's own rvalue, and is promoted by the same rule as `&operand`.
+        let mut first_adjust: Vec<Option<AdjustKind>, Alloc<'a>> = Vec::with_capacity_in(self.body.exprs.len(), self.alloc);
+        first_adjust.resize(self.body.exprs.len(), None);
+        for (&e, &k) in self.adjust.column::<0>().iter().zip(self.adjust.column::<1>().iter()) {
+            if let Some(slot) = first_adjust.get_mut(e.ix())
+                && slot.is_none()
+            {
+                *slot = Some(k);
+            }
+        }
         // The whole tree from the root, each expression with whether it is under a const block.
         let mut work: Vec<(ExprId, bool), Alloc<'a>> = Vec::new_in(self.alloc);
         let mut kids: Vec<ExprId, Alloc<'a>> = Vec::new_in(self.alloc);
@@ -66,12 +80,26 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
             let node = self.body.expr(x)?;
             let under = in_const || matches!(node, Expr::ConstBlock { .. });
-            if let Expr::Ref { mutbl: Mutbl::Not, operand } = node
-                && !in_const
-                && self.promotable(operand)?
-                && self.freeze_without_drop(self.expr_ty[operand.ix()])?
-            {
-                found.push(x);
+            if !in_const {
+                match node {
+                    Expr::Ref { mutbl: Mutbl::Not, operand } => {
+                        if self.promotable(operand)? && self.freeze_without_drop(self.expr_ty[operand.ix()])? {
+                            found.push(x);
+                        }
+                    }
+                    Expr::Ref { mutbl: Mutbl::Mut, .. } => {}
+                    _ => {
+                        if matches!(
+                            first_adjust.get(x.ix()).copied().flatten(),
+                            Some(AdjustKind::Borrow { mutbl: Mutbl::Not, raw: false, .. })
+                        ) && let Some(&ty) = self.expr_ty.get(x.ix())
+                            && self.promotable(x)?
+                            && self.freeze_without_drop(ty)?
+                        {
+                            found.push(x);
+                        }
+                    }
+                }
             }
             kids.clear();
             pats.clear();

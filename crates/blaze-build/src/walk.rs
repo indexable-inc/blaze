@@ -4073,6 +4073,17 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         }
         match (lead, borrow) {
             (0, false) => self.raw(e)?,
+            // A shared autoref promoted to a `'static` slot (walk/promote.rs): the address of
+            // `e`'s constant row, never a frame temporary; any coercions after it (e.g. `Unsize`)
+            // were already pushed above as `Task::Adjust(e, 1)`. An `Expr::Ref` listed in
+            // `Checked::promoted` promotes its own `&operand`, not a further autoref of it.
+            (0, true)
+                if !matches!(self.expr(e)?, Expr::Ref { .. })
+                    && matches!(kinds[0], AdjustKind::Borrow { mutbl: Mutbl::Not, raw: false, .. })
+                    && self.is_promoted(e) =>
+            {
+                self.promoted_ref(e)?;
+            }
             // An autoref: the address of `e`'s own place.
             (0, true) => {
                 self.work.push(Task::Ref);

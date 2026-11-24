@@ -5438,7 +5438,12 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 // Through a temporary, `RNG.with_borrow_mut(..)` (a `thread_local!` is a `const`
                 // `LocalKey` whose methods take `&'static self`) tied the temporary's loan to
                 // `'static` (tempo test_utils.rs:32, a false E0505 and E0597).
-                AdjustKind::Borrow { mutbl: Mutbl::Not, raw: false, .. } if matches!(v.at, At::Const) => {
+                AdjustKind::Borrow { mutbl: Mutbl::Not, raw: false, .. }
+                    if matches!(v.at, At::Const)
+                        || (i == lo
+                            && !matches!(self.body.exprs.get(e.ix()), Some(Expr::Ref { .. }))
+                            && self.ck.promoted.binary_search_by_key(&e.0, |x| x.0).is_ok()) =>
+                {
                     let t = self.temp(out, e)?;
                     let tp = self.place_of(t);
                     self.b.assign(tp, Operand::Const, self.span(e));
