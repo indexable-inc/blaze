@@ -640,7 +640,15 @@ pub fn eval_asked<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, c: LibKey)
         } else if !r.store.maps.qpaths.borrow_mut().enter(need) {
             Err(ConstFail::QPathDepth { need: checker_of(need), most: MOST_NESTED as u32 })
         } else {
+            let active_before = r.store.active_consts_len();
+            r.store.push_active_const(need);
             let out = eval_one(r, need, trait_, self_, name.as_str());
+            r.store.truncate_active_consts(active_before);
+            if r.store.clear_provisional_for(need)
+                && let Some(b) = r.buckets.as_ref()
+            {
+                b.clear_provisional();
+            }
             r.store.maps.qpaths.borrow_mut().leave(need);
             out
         };
