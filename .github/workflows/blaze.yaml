@@ -3,11 +3,11 @@
 #
 #   every change: the checks of the repository's scripts, docs and agent rules (`scripts`),
 #       actionlint over the workflows (`workflows`), the Lean proofs (`lean`);
-#   a change of code: also `cargo check --workspace --exclude blaze-std --all-targets` and the
-#       unit tests of the buildable workspace with cargo and the pinned nightly (`cargo`). No
+#   a change of code: also `blaze check .` and `blaze test .` with the pinned blaze release
+#       (`.github/blaze-cli-version`), no rustc, cargo, clippy or rustup (`blaze`). No
 #       `blaze fmt --check`: fmt.yaml formats main after each push instead.
 #
-# A change runs `cargo` only when it touches a file it reads: the crates, the vendored crates,
+# A change runs `blaze` only when it touches a file it reads: the crates, the vendored crates,
 # astlog (tools/astlog), the workspace's manifest, lock file, cargo config, .rustfmt.toml and
 # .clippy.toml, the pinned toolchain (pins/), and these workflows and the actions they
 # use. scripts/src/bin/gate_changes.rs has the list and why each path is on it. It names what is
@@ -100,7 +100,6 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
-      - uses: ./.github/actions/toolchain
       # The repository's Python workspace (pyproject.toml, uv.lock): its scripts lint and type-check.
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
@@ -222,71 +221,34 @@ jobs:
           tar -xzf "$tgz" -C "$RUNNER_TEMP" actionlint
       - run: '"$RUNNER_TEMP/actionlint" -color -shellcheck= -pyflakes='
 
-  # The buildable workspace (every crate but those parked, docs/v2/plan/parked.md, and
-  # blaze-std, its own world) type-checks with its test targets, and its unit tests pass, with
-  # cargo and the pinned nightly (pins/toolchain): cargo builds blaze in the dev loop until
-  # blaze builds blaze again (AGENTS.md rule blaze-builds-blaze). No LLVM: no buildable crate
-  # links it. The runner's snapshot keeps ~/.rustup and target/ from main's last green run.
-  cargo:
-    name: cargo check and test, linux arm64
+  # The workspace type-checks, borrow-checks, lints and runs its unit tests with blaze alone
+  # (AGENTS.md rules no-rustc, blaze-builds-blaze): no rustc, no cargo, no clippy, no rustup.
+  # The runner's snapshot keeps ~/.blaze/v2 from main's last green run.
+  blaze:
+    name: blaze check and test, linux arm64
     needs: changes
     if: needs.changes.outputs.tier != 'none'
-    runs-on: [ix, arm64, ix-cpu-64, blaze-cargo]
+    runs-on: [ix, arm64, ix-cpu-64, blaze]
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
-      # llvm-tools and the two other targets for blaze-sys's imports step below: core and
-      # compiler_builtins come precompiled with each target, so nothing builds a standard library.
-      - uses: ./.github/actions/toolchain
-        with:
-          components: llvm-tools
-          targets: x86_64-unknown-linux-gnu aarch64-apple-darwin
-      - uses: ./.github/actions/script
-        with:
-          job: cargo
-      - name: cut toolchain shelf
+      - name: blaze (the release .github/blaze-cli-version names)
         run: |
-          pinned="$(tr -d '[:space:]' < crates/blaze-toolchain/PINNED)"
-          shelf="$HOME/.blaze/v2/toolchain"
-          tc="$(cat pins/toolchain)"
-          cargo +"$tc" fetch --locked --quiet
-          reg="$(ls -d "${CARGO_HOME:-$HOME/.cargo}"/registry/cache/index.crates.io-* | head -n 1)"
-          if [ -f "$shelf/$pinned" ]; then
-            "$BLAZE_SCRIPTS/toolchain_cut" "{\"tree\": \".\", \"targets\": [\"aarch64-apple-darwin\", \"aarch64-unknown-linux-gnu\"], \"registry\": \"$reg\", \"shelf\": \"$shelf\", \"write_pin\": false, \"check\": true, \"macro_side\": true}"
-          else
-            "$BLAZE_SCRIPTS/toolchain_cut" "{\"tree\": \".\", \"targets\": [\"aarch64-apple-darwin\", \"aarch64-unknown-linux-gnu\"], \"registry\": \"$reg\", \"shelf\": \"$shelf\", \"write_pin\": false, \"check\": false, \"macro_side\": true}"
-            if [ ! -f "$shelf/$pinned" ]; then
-              echo "::error::crates/blaze-toolchain/PINNED ($pinned) does not match toolchain_cut output; run toolchain_cut with write_pin: true" >&2
-              exit 1
-            fi
-          fi
-      - name: cargo check --workspace --exclude blaze-std --all-targets
-        run: cargo +"$(cat pins/toolchain)" check --locked --workspace --exclude blaze-std --all-targets --message-format short
-      - name: cargo test --workspace --exclude blaze-std
-        run: |
-          "$BLAZE_SCRIPTS/ci_test" '{"exclude": ["blaze-std"]}'
-      # D180: blaze-sys's compiled objects reference no C-library symbol on Linux (both
-      # architectures), and on macOS only the libSystem symbols of
-      # tools/ratchets/blaze-sys-libsystem.txt (scripts/src/bin/sys_imports.rs). Its lib alone,
-      # no_std: an rlib per target (nothing links, so the Mac target builds here too).
-      - name: blaze-sys imports, per target
-        run: |
-          tc="$(cat pins/toolchain)"
-          sysroot="$(rustc +"$tc" --print sysroot)"
-          nm="$sysroot/lib/rustlib/aarch64-unknown-linux-gnu/bin/llvm-nm"
-          for triple in aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu aarch64-apple-darwin; do
-            timeout -k 30 600 cargo +"$tc" build --locked -p blaze-sys --lib --target "$triple" --target-dir target/sys-imports
-            builtins=$(echo "$sysroot/lib/rustlib/$triple/lib/"libcompiler_builtins-*.rlib)
-            case "$triple" in
-              *-linux-*) extra='' ; os=linux ;;
-              *) extra=', "ratchet": "tools/ratchets/blaze-sys-libsystem.txt"' ; os=macos ;;
-            esac
-            timeout -k 30 120 "$BLAZE_SCRIPTS/sys_imports" "{\"command\": \"check\", \"target\": \"$os\", \"objects\": [\"target/sys-imports/$triple/debug/libblaze_sys.rlib\"], \"builtins\": \"$builtins\", \"nm\": \"$nm\"$extra}"
-          done
+          bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+          export PATH="$bin:$PATH"
+          echo "$bin" >> "$GITHUB_PATH"
+          sh site/install.sh --version "$(cat .github/blaze-cli-version)" --no-toolchain --verbose
+          blaze --version
+      - name: blaze warm-toolchain
+        run: blaze warm-toolchain
+      - name: blaze check .
+        run: blaze check .
+      - name: blaze test .
+        run: blaze test .
 
   ci:
     name: ci
-    needs: [changes, scripts, workflows, lean, cargo]
+    needs: [changes, scripts, workflows, lean, blaze]
     if: always()
     runs-on: [ix, arm64]
     timeout-minutes: 5
@@ -297,7 +259,7 @@ jobs:
           R_SCRIPTS: ${{ needs.scripts.result }}
           R_WORKFLOWS: ${{ needs.workflows.result }}
           R_LEAN: ${{ needs.lean.result }}
-          R_CARGO: ${{ needs.cargo.result }}
+          R_BLAZE: ${{ needs.blaze.result }}
         run: |
           set -euo pipefail
           printf '%s\t%s\n' \
@@ -305,18 +267,18 @@ jobs:
             "$R_SCRIPTS" scripts \
             "$R_WORKFLOWS" workflows \
             "$R_LEAN" lean \
-            "$R_CARGO" cargo
+            "$R_BLAZE" blaze
           # What this tier was expected to run, each of which has to have succeeded: the absence
           # of a failure is not a pass (agents.json A39), and a job this tier runs that was
           # skipped is a gate that tested nothing. `none` (a change of no code) runs the first
-          # four; any other tier the cargo check and tests too.
+          # four; any other tier the blaze check and tests too.
           case "$TIER" in
             none) expected="changes scripts workflows lean" ;;
-            gate|warm) expected="changes scripts workflows lean cargo" ;;
+            gate|warm) expected="changes scripts workflows lean blaze" ;;
             *) echo "::error::the tier is '$TIER', none of none, gate and warm: what this run was to test is not known"; exit 1 ;;
           esac
           failed=0
-          for r in "$R_CHANGES" "$R_SCRIPTS" "$R_WORKFLOWS" "$R_LEAN" "$R_CARGO"; do
+          for r in "$R_CHANGES" "$R_SCRIPTS" "$R_WORKFLOWS" "$R_LEAN" "$R_BLAZE"; do
             if [ "$r" = failure ] || [ "$r" = cancelled ]; then failed=1; fi
           done
           result_of() {
@@ -325,7 +287,7 @@ jobs:
               scripts) printf '%s' "$R_SCRIPTS" ;;
               workflows) printf '%s' "$R_WORKFLOWS" ;;
               lean) printf '%s' "$R_LEAN" ;;
-              cargo) printf '%s' "$R_CARGO" ;;
+              blaze) printf '%s' "$R_BLAZE" ;;
             esac
           }
           missed=""

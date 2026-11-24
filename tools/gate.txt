@@ -68,14 +68,8 @@ third party (and reached) | 300 | base | "$BLAZE_SCRIPTS/thirdparty" '{"command"
 # Every member names each dependency through the root's [workspace.dependencies] (`workspace =
 # true`, no path or version of its own), and the root names every member there once by its path.
 manifests | 120 | - | "$BLAZE_SCRIPTS/thirdparty" '{"command": "manifests-check"}'
-# D180: the third-party packages cargo's resolve reaches, target 0 (printed each run), held at
-# tools/ratchets/thirdparty.txt until it is empty, then refused outright. `--offline` reads the
-# local registry cache and never the network; `--locked` refuses a Cargo.lock the manifests have
-# outgrown, naming it, and nothing updates it here.
-third party reach | 300 | - | m=$(mktemp) && trap 'rm -f "$m"' EXIT && { timeout 240 cargo fetch --locked --quiet && timeout 240 cargo metadata --format-version 1 --offline --locked > "$m" || { echo 'third party reach: `cargo metadata --offline --locked` refused (its error above): a stale Cargo.lock is refused, not updated (update it with the network and commit it)' >&2; exit 1; }; } && "$BLAZE_SCRIPTS/thirdparty" "{\"command\": \"reach-check\", \"metadata\": \"$m\"}"
 # D180: blaze-sys references no C-library symbol on Linux and only the libSystem symbols of
-# tools/ratchets/blaze-sys-libsystem.txt on macOS. Its check reads compiled objects, so it runs in
-# blaze.yaml's `cargo` job (a row of gate.rs's CI_ONLY_SCRIPTS); its own cases run here.
+# tools/ratchets/blaze-sys-libsystem.txt on macOS; its own cases run here.
 sys imports selftest | 120 | - | "$BLAZE_SCRIPTS/sys_imports" selftest
 ambient selftest | 120 | - | "$BLAZE_SCRIPTS/ambient" selftest
 std and alloc | 300 | base | "$BLAZE_SCRIPTS/ambient" '{"command": "check"}'

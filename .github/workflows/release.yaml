@@ -90,18 +90,20 @@ jobs:
       BLAZE_RELEASE: ${{ needs.prepare.outputs.version }}
     steps:
       - uses: actions/checkout@v7
-      - name: Install pinned nightly toolchain
+      - name: Install pinned blaze release
         run: |
-          tc="$(cat pins/toolchain)"
-          rustup toolchain install "$tc" --profile minimal --no-self-update
-          rustup default "$tc"
-          rustc --version
-      - name: Build release blaze binary
+          bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+          export PATH="$bin:$PATH"
+          echo "$bin" >> "$GITHUB_PATH"
+          sh site/install.sh --version "$(cat .github/blaze-cli-version)" --no-toolchain --verbose
+          blaze --version
+          blaze warm-toolchain
+      - name: Export release blaze binary
         env:
           MACOSX_DEPLOYMENT_TARGET: "13.0"
         run: |
-          tc="$(cat pins/toolchain)"
-          cargo +"$tc" build --release --locked -p blaze-cli --bin blaze
+          mkdir -p target/release
+          blaze export . -p blaze-cli --bin blaze -o target/release/blaze
       - name: Archive and checksum
         run: |
           mkdir -p "$NAME"
