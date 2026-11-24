@@ -752,25 +752,12 @@ pub(crate) fn checkout_path(checkout: &str) -> &Path {
 /// run's failure, naming the package and the folder.
 fn tree_of(files: &Files<'_>, checkout: crate::engine_script_reads::Served<'_>, package: &str) -> Result<(Tree, ScriptRoot), Ran> {
     match files {
-        Files::Member { dir } => match (ScriptRoot::member(dir), checkout) {
+        Files::Member { dir } | Files::External { dir } => match (ScriptRoot::member(dir), checkout) {
             (Ok(root), crate::engine_script_reads::Served::Root(checkout)) => Ok((dir_tree(checkout), root)),
             (Ok(_), crate::engine_script_reads::Served::Simulated) => {
-                Err(failed("a member's script with no served checkout", format_args!("the build script of {package}: its member folder '{dir}': a simulated world serves no checkout on disk"), false))
+                Err(failed("a member's script with no served checkout", format_args!("the build script of {package}: its folder '{dir}': a simulated world serves no checkout on disk"), false))
             }
-            (Err(error), _) => Err(failed("a member folder a script cannot see", format_args!("the build script of {package}: its member folder '{dir}': {error}"), false)),
-        },
-        Files::External { dir } => match (ScriptRoot::member(dir), checkout) {
-            (Ok(_), crate::engine_script_reads::Served::Root(checkout)) => {
-                let pkg_path = if dir.is_empty() { checkout.path().to_path_buf() } else { checkout.path().join(dir) };
-                match blaze_proc_macro::script_sandbox::RealRoot::resolve(&pkg_path) {
-                    Ok(root) => Ok((dir_tree(&root), ScriptRoot::package())),
-                    Err(error) => Err(failed("an external package folder a script cannot see", format_args!("the build script of {package}: its external folder '{dir}': {error}"), false)),
-                }
-            }
-            (Ok(_), crate::engine_script_reads::Served::Simulated) => {
-                Err(failed("an external package's script with no served checkout", format_args!("the build script of {package}: its external folder '{dir}': a simulated world serves no checkout on disk"), false))
-            }
-            (Err(error), _) => Err(failed("an external package folder a script cannot see", format_args!("the build script of {package}: its external folder '{dir}': {error}"), false)),
+            (Err(error), _) => Err(failed("a member folder a script cannot see", format_args!("the build script of {package}: its folder '{dir}': {error}"), false)),
         },
         Files::Pack { view, dir, git } => Ok((mem_tree(view.files().map(|f| (f.path, f.bytes)), dir, *git), ScriptRoot::package())),
     }
@@ -1081,8 +1068,7 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut crate::engi
         Side::Macro => Some(side_atoms(job.cfg, alloc.clone())),
     };
     let checkout_prefix = match job.files {
-        Files::Member { .. } => Some(""),
-        Files::External { dir } => Some(dir),
+        Files::Member { .. } | Files::External { .. } => Some(""),
         Files::Pack { .. } => None,
     };
     let is_checkout = checkout_prefix.is_some();

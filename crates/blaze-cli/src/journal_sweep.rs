@@ -804,6 +804,10 @@ impl<'t> Taken<'t> {
     pub(crate) fn begin(cx: &Cx, root: &Dir<ReadWrite>, clock: &Clock, frame: &'t Frame) -> Result<Taken<'t>, CliError> {
         let blazes_ignored = blazes_folder_ignores_all(cx, root, frame)?;
         let target_tagged = sweep::cargo_target_tagged(cx, root, frame)?;
+        // A git worktree's `.git` is a regular file pointing to a gitdir outside the watched
+        // checkout, so FSEvents on the checkout never sees HEAD/ref updates there; force script
+        // git reads to be followed on every command in a worktree.
+        let git_worktree = root.stat(cx, &Path::new(sweep::GIT)?)?.is_some_and(|meta| !meta.dir);
         let taken_wall_ns = clock.wall().as_ns();
         Ok(Taken {
             names: Texts::new_in(frame),
@@ -818,7 +822,7 @@ impl<'t> Taken<'t> {
             taken_wall_ns,
             helper_place: None,
             helper: None,
-            force_script_asks: false,
+            force_script_asks: git_worktree,
             facts_vouched: false,
         })
     }
@@ -851,7 +855,7 @@ impl<'t> Taken<'t> {
         self.journal = JournalUse::Kqueue;
         self.events = self.events.saturating_add(u64::try_from(told).unwrap_or(u64::MAX));
         self.streams = self.streams.saturating_add(1);
-        self.force_script_asks = force_script_asks;
+        self.force_script_asks |= force_script_asks;
         self.facts_vouched = facts_vouched;
         let heard = Heard { replayed: None, asked: dirty_paths };
         self.units.push(Unit { at: Where::Checkout, name: name_at, cursor: crash_cursor, since: None, heard: Some(heard) });
