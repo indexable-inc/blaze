@@ -298,6 +298,26 @@ pub(crate) const fn str_reg_scaled(size: Size, rt: Reg, rn: Reg, rm: Reg) -> u32
     0x3820_7800 | (size.bits() << 30) | (rm << 16) | (rn << 5) | rt
 }
 
+/// `ldr{b,h,,} rt, [rn, wm, uxtw]` (unscaled 32-bit unsigned-extended register-index load).
+pub(crate) const fn ldr_reg_uxtw(size: Size, rt: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x3860_4800 | (size.bits() << 30) | (rm << 16) | (rn << 5) | rt
+}
+
+/// `str{b,h,,} rt, [rn, wm, uxtw]` (unscaled 32-bit unsigned-extended register-index store).
+pub(crate) const fn str_reg_uxtw(size: Size, rt: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x3820_4800 | (size.bits() << 30) | (rm << 16) | (rn << 5) | rt
+}
+
+/// `ldr{b,h,,} rt, [rn, wm, uxtw #size]` (scaled 32-bit unsigned-extended register-index load).
+pub(crate) const fn ldr_reg_uxtw_scaled(size: Size, rt: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x3860_5800 | (size.bits() << 30) | (rm << 16) | (rn << 5) | rt
+}
+
+/// `str{b,h,,} rt, [rn, wm, uxtw #size]` (scaled 32-bit unsigned-extended register-index store).
+pub(crate) const fn str_reg_uxtw_scaled(size: Size, rt: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x3820_5800 | (size.bits() << 30) | (rm << 16) | (rn << 5) | rt
+}
+
 /// `ldrsw xt, [xn, xm, lsl #2]` (signed 32-bit scaled load for dense PC-relative jump tables).
 pub(crate) const fn ldrsw_reg_scaled(rt: Reg, rn: Reg, rm: Reg) -> u32 {
     0xb8a0_7800 | (rm << 16) | (rn << 5) | rt
