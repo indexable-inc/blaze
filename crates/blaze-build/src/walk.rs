@@ -4095,9 +4095,20 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     /// one calls `Deref::deref` with the pointer to its `Self` (`DerefCall`).
     fn push_deref_chain(&mut self, e: ExprId, lead: usize) {
         let rows = self.adjust_rows(e);
+        let kinds = &self.checked.adjusts.column::<1>()[rows.start..rows.start + lead];
+        let mut builtin_n = 0usize;
+        let mut builtin_u32 = 0u32;
+        for k in kinds {
+            if matches!(*k, AdjustKind::Deref { overloaded: None }) {
+                builtin_n += 1;
+                builtin_u32 += 1;
+            } else {
+                break;
+            }
+        }
         // The tasks run first to last, so they are pushed last to first.
-        for i in (1..lead).rev() {
-            match self.checked.adjusts.column::<1>()[rows.start + i] {
+        for i in (builtin_n.max(1)..lead).rev() {
+            match kinds[i] {
                 AdjustKind::Deref { overloaded: Some(_) } => self.work.push(Task::DerefCall(e, i as u32)),
                 // The pointer step `i` dereferences is the place step `i - 1` reached, loaded
                 // at its own type: a wide pointer whole (rule 76: never as a thin one).
@@ -4107,15 +4118,17 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 }
             }
         }
-        match self.checked.adjusts.column::<1>()[rows.start] {
-            // `e`'s value is the first pointer.
-            AdjustKind::Deref { overloaded: None } => self.work.push(Task::Raw(e)),
+        if builtin_n > 0 {
+            // Leading builtin dereferences go through `PlaceDerefs` so a closure body whose
+            // environment holds a place below its binding (`*r`, `**r`: env_places.rs) reads
+            // the captured place rather than the un-dereferenced root.
+            self.work.push(Task::Ref);
+            self.work.push(Task::PlaceDerefs(e, builtin_u32));
+        } else {
             // `e` is the `Self`: borrowed in place.
-            _ => {
-                self.work.push(Task::DerefCall(e, 0));
-                self.work.push(Task::Ref);
-                self.work.push(Task::PlaceDerefs(e, 0));
-            }
+            self.work.push(Task::DerefCall(e, 0));
+            self.work.push(Task::Ref);
+            self.work.push(Task::PlaceDerefs(e, 0));
         }
     }
 
@@ -5284,15 +5297,15 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             return Ok(());
         }
         if n > 0 {
-            // The value is the first pointer; each step but the last loads the next one, at the
-            // type adjustment row `row` left (a wide pointer whole). Pushed last to first: the
-            // first load (row 0) runs first.
+            // Step down one builtin dereference at a time so `env_use` is checked at every
+            // intermediate deref depth (e.g. `r: &mut &S` captured as `*r` with `n = 2`).
             self.work.push(Task::DerefPlace);
-            for row in (0..n - 1).rev() {
-                self.work.push(Task::LoadAdjusted(e, row));
-                self.work.push(Task::DerefPlace);
+            if n == 1 {
+                self.work.push(Task::Raw(e));
+            } else {
+                self.work.push(Task::LoadAdjusted(e, n - 2));
+                self.work.push(Task::PlaceDerefs(e, n - 1));
             }
-            self.work.push(Task::Raw(e));
             return Ok(());
         }
         match self.expr(e)? {

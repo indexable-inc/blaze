@@ -329,10 +329,19 @@ pub fn captures<'c>(checked: &'c blaze_typeck::Checked<'_>, e: ExprId) -> impl I
     (0..caps.len()).filter(move |&c| caps.column::<0>()[c] == e).map(move |c| (caps.column::<1>()[c], caps.column::<2>()[c]))
 }
 
-/// The ENVIRONMENT of closure or `async` block `e`: a tuple of one field per [`captures`] row,
+/// The environment strategy `blaze-build` lays out and walks: captured PLACES (RFC 2229).
+///
+/// Rust 2021+ closures reading through a borrowed local (e.g. `|(other, _)| id.seq_id ==
+/// other.seq_id` with `id: &'b T`) rely on RFC 2229 place capture (`*id` by shared reference ->
+/// `&'b T`, not `&&'b T` pointing at the enclosing function's stack slot for `id`, which dangles
+/// once the closure is returned). `blaze-flow-lower` and `blaze-body-lower` keep reading
+/// `blaze_typeck::ActiveEnv` until their own stage-2 switches land.
+pub type BuildEnv = blaze_typeck::Places;
+
+/// The ENVIRONMENT of closure or `async` block `e`: a tuple of one field per [`BuildEnv`] field,
 /// in its order (the Reference, "Closure types": "approximately equivalent to a struct which
 /// contains the captured values"), `&T` for `ByRef`, `&mut T` for `ByMutRef`, `T` for
-/// `ByValue`, each binding's type copied as written into `out` at `params`.
+/// `ByValue`, each place's type copied as written into `out` at `params`.
 pub(crate) fn environment(
     body: &blaze_typeck::BodyView<'_>,
     checked: &blaze_typeck::Checked<'_>,
@@ -341,7 +350,7 @@ pub(crate) fn environment(
     out: &mut PortableTys<'_>,
     scratch: Alloc<'_>,
 ) -> Result<PTy, BuildError> {
-    environment_by::<blaze_typeck::ActiveEnv>(body, checked, e, params, out, scratch)
+    environment_by::<BuildEnv>(body, checked, e, params, out, scratch)
 }
 
 /// [`environment`] under the environment strategy `R` (blaze-typeck env_fields.rs, rule 78):
