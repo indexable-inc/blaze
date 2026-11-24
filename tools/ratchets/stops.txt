@@ -30,7 +30,7 @@ blaze-cbor	27
 blaze-cc	8
 blaze-cert	108
 blaze-check	196
-blaze-cli	1350
+blaze-cli	1349
 blaze-code	94
 blaze-columns	193
 blaze-comptime	68
@@ -38,7 +38,7 @@ blaze-comptime-sys	48
 blaze-comptime/rungs/derive-hello	2
 blaze-cond	115
 blaze-consteval	204
-blaze-core	908
+blaze-core	907
 blaze-cunit	41
 blaze-data	52
 blaze-dbsp	55
@@ -73,7 +73,7 @@ blaze-int	41
 blaze-json	32
 blaze-keyed	588
 blaze-kit	167
-blaze-ladder	1136
+blaze-ladder	1135
 blaze-launch	83
 blaze-launch-rt	215
 blaze-launcher	2

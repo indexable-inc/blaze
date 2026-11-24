@@ -114,7 +114,7 @@ pub(in crate::front2::program) fn fn_abi<'n, S: NamesSource<'n>>(tabled: Option<
 /// The Reference, “The `track_caller` attribute”: “When applied to a function in a trait
 /// declaration, the attribute applies to all implementations.” This includes overrides of
 /// provided methods. An attribute on the impl method itself suffices independently.
-pub(in crate::front2::program) fn track_caller(keys: &Keys, store: &Store<'_>, key: ItemKey, own: impl Fn(ItemKey) -> Option<bool>) -> Option<bool> {
+pub(in crate::front2::program) fn track_caller<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'_>, key: ItemKey, own: impl Fn(ItemKey) -> Option<bool>) -> Option<bool> {
     if own(key)? {
         return Some(true);
     }
@@ -131,7 +131,10 @@ pub(in crate::front2::program) fn track_caller(keys: &Keys, store: &Store<'_>, k
             Some(crate::front2::keys::Origin::Item(lib)) => *lib,
             _ => store.fns.get(&key)?.lib,
         };
-        return store.maps.traits.contains_key(&lib).then_some(false);
+        if store.maps.traits.contains_key(&lib) || names.kind_of_item(lib) == Some(blaze_surface::ItemKind::Trait) {
+            return Some(false);
+        }
+        return None;
     };
     let Some(trait_) = imp.trait_ else {
         return Some(false);
@@ -202,7 +205,7 @@ pub(in crate::front2::program) fn nounwind_from<'n, S: NamesSource<'n>>(
 pub(in crate::front2::program) fn track_caller_from<'n, S: NamesSource<'n>>(
     names: S, keys: &Keys, store: &Store<'n>, key: ItemKey, tabled: impl Fn(ItemKey) -> Option<bool>,
 ) -> Option<bool> {
-    track_caller(keys, store, key, |k| {
+    track_caller(names, keys, store, key, |k| {
         if let Some(tracked) = tabled(k) {
             return Some(tracked);
         }

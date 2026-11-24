@@ -32,7 +32,7 @@ use blaze_ladder::body_ids::{
 use blaze_ladder::code_records::statics::{each_static_named, each_vtable_datum, entry_record};
 use blaze_ladder::code_records::{Builder, CodeClass, CodeKey, CodeStore, content_key};
 use blaze_ladder::code_records::reads::Verdict;
-use blaze_ladder::run::make_one::{MOST_WALKED, MakeWatch, Maker, NamesRecords, SecondCheck};
+use blaze_ladder::run::make_one::{ByKind, MOST_WALKED, MakeWatch, Maker, NamesRecords};
 use blaze_ladder::run::special::{Roots, StartHead};
 use blaze_ladder::run::RunError as LadderRunError;
 use blaze_launch::wire::RecordId;
@@ -50,10 +50,9 @@ use crate::run_fault::{Named, Places, SiteShown};
 use crate::run_ids::{RunIds, Runnable};
 use crate::run_parent::{
     self, FIRST_CALL_SPAN, HOW_FOUND, HOW_MADE, HOW_NO_RECORD, HOW_SPECIAL, HOW_STALE, Needs, ParentError, Resolve,
-    Resolved, Start as _, Tally,
+    Resolved, RunMaker, Start as _, Tally,
 };
 use crate::test_cache::{EnteredFn, check_record_purity};
-use crate::test_drive::TestMaker;
 
 /// Cap on warm suite functions queued for batch pre-publishing per suite (rule 18).
 const WARM_CAP: usize = 16_384;
@@ -108,9 +107,9 @@ pub(crate) struct StepCounts {
 }
 
 /// Thin [`Make`] wrapper that consults and updates `SuiteCache::verified` before delegating
-/// read-list verification to the suite's single [`TestMaker`].
+/// read-list verification to the suite's single [`RunMaker`].
 struct VerifyingMaker<'a, 'h> {
-    maker: &'a mut TestMaker<'h>,
+    maker: &'a mut RunMaker<'h>,
     verified: &'a mut Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
     verified_dirty: &'a mut bool,
 }
@@ -181,12 +180,13 @@ impl<'a> ChildSent<'a> {
 pub(crate) struct SuiteCache<'h> {
     names: NamesRecords<'h>,
     builder: Builder,
+    typed: crate::engine_body_record::TypedFrom<'h>,
     tables: Alloc<'static>,
     make_watch: MakeWatch<'static>,
     walk: Walk<'static>,
     scratch: Scratch<'static>,
     list: DeclaredList<'static>,
-    maker: Option<TestMaker<'h>>,
+    maker: Option<RunMaker<'h>>,
     verified: Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
     verified_dirty: bool,
     pubs: Map<[u8; 32], CachedPub, BuildKeyHasher, Alloc<'static>>,
@@ -199,12 +199,14 @@ impl<'h> SuiteCache<'h> {
     pub(crate) fn new(
         names: NamesRecords<'h>,
         builder: Builder,
+        typed: crate::engine_body_record::TypedFrom<'h>,
         tables: Alloc<'static>,
         make_watch: MakeWatch<'static>,
     ) -> SuiteCache<'h> {
         SuiteCache {
             names,
             builder,
+            typed,
             tables,
             make_watch,
             walk: Walk::new_in(tables),
@@ -562,7 +564,7 @@ impl<'h> SuiteCache<'h> {
                 watch.see(Step::Resolving { path: path.as_deref() });
                 let span = cx.span(FIRST_CALL_SPAN);
                 let maker = self.maker.get_or_insert_with(|| {
-                    let mut maker = Maker::of_roots(self.names, roots.maker_entry(), roots, SecondCheck, &self.builder, self.tables);
+                    let mut maker = Maker::of_roots(self.names, roots.maker_entry(), roots, ByKind::new(self.typed.over(*ids)), &self.builder, self.tables);
                     maker.watch(self.make_watch);
                     maker
                 });

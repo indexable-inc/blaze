@@ -68,7 +68,7 @@ use bstd::fs::{Dir, Durable, FsError, FsKind, ReadWrite};
 use bstd::io::Missing;
 use bstd::mem::Frame;
 use bstd::path::{Path, PathError};
-use bstd::procs::{ChannelError, Exit, GRACE, Held, Message, OutPipe, ParentDeath, ParentSignals, Read as Piped, Relay, RelayAct, RunChild, RunError as ProcError, RunFault, RunSpec, RunStep, SignalError, Spawner, Started, Streams, Waited};
+use bstd::procs::{ChannelError, Exit, GRACE, Held, Message, OutPipe, ParentDeath, ParentSignals, Read as Piped, Relay, RelayAct, RunChild, RunError as ProcError, RunFault, RunSpec, RunStep, SignalError, Spawner, Started, Streams, Waited, Write as ChannelWrite};
 
 use crate::code_store::HomeCodeStore;
 use crate::run_names::{Found, TestRows, TestUnit};
@@ -2643,6 +2643,8 @@ impl<'c> Launched<'c, '_, '_> {
         let mut relay = Relay::new(GRACE);
         let mut inbox = std::vec::Vec::new_in(alloc);
         let mut reply = ahead;
+        let mut reply_at = 0usize;
+        let mut write_since: Option<Duration> = None;
         let mut open = true;
         let mut calls = Vec::new_in(alloc);
         let mut published = 0;
@@ -2666,8 +2668,6 @@ impl<'c> Launched<'c, '_, '_> {
             signals.begin(Doing::Relaying);
             let now = run.now();
             let open_park = parked.map_or(Duration::ZERO, |park| now.saturating_sub(park.since));
-            let host_stalled = Duration::from_nanos(signals.stalled.get());
-            let until = Deadline::after(started_at, allowance.saturating_add(parked_for).saturating_add(open_park).saturating_add(host_stalled));
             if let Some(code) = self.codes {
                 let pumping = run.now();
                 code.pump()?;
@@ -2711,6 +2711,7 @@ impl<'c> Launched<'c, '_, '_> {
                     again = true;
                 }
             }
+            let until = current_until(started_at, allowance, parked_for.saturating_add(parked.map_or(Duration::ZERO, |park| now.saturating_sub(park.since))), signals);
             if until.passed(now) {
                 match stop_child(run).map_err(child_error)? {
                     Stopped::Exited { exit, left } => break (child_outcome(exit), Some(left)),
@@ -2743,26 +2744,54 @@ impl<'c> Launched<'c, '_, '_> {
             if drain_pipes(cx, &mut pipes, output, stderr, Deadline::PASSED)? {
                 signals.progress.set(true);
             }
-            if open && !reply.is_empty() {
-                let by = Deadline::after(run.now(), WRITE_BOUND).min(bound);
-                match run.send(&reply, by) {
-                    Ok(()) => {
-                        published = calls.len();
-                        signals.progress.set(true);
+            if open && reply_at < reply.len() {
+                match flush_reply(&mut run, &mut reply, &mut reply_at, &mut write_since, until, signals) {
+                    Ok(FlushOut::Done) => published = calls.len(),
+                    Ok(FlushOut::Pending) => {}
+                    Ok(FlushOut::Hangup) => open = false,
+                    Ok(FlushOut::TimedOut) => match stop_child(run).map_err(child_error)? {
+                        Stopped::Exited { exit, left } => break (child_outcome(exit), Some(left)),
+                        Stopped::Killed { left, .. } => break (How::TimedOut { after: budget }, Some(left)),
+                        Stopped::ZombieRace => break (How::TimedOut { after: budget }, None),
+                    },
+                    Err(error) => {
+                        stop_child(run).map_err(child_error)?;
+                        return Err(error);
                     }
-                    Err(ProcError { fault: RunFault::Channel(ChannelError::Hangup), .. }) => open = false,
-                    Err(error) => return Err(child_error(error)),
                 }
-                reply.clear();
             }
-            let poll = Deadline::after(run.now(), signals.wait.replace(Duration::ZERO)).min(bound);
+            let write_bound = write_since.map_or(Deadline::NEVER, |since| Deadline::after(since, WRITE_BOUND));
+            let poll = Deadline::after(run.now(), signals.wait.replace(Duration::ZERO)).min(bound).min(write_bound);
+            let mut try_recv = open && parked.is_none();
+            let mut recv_deadline = poll;
+            if open && reply_at < reply.len() {
+                let ready = run.wait_ready(parked.is_none(), true, poll).map_err(child_error)?;
+                if ready.writable {
+                    match flush_reply(&mut run, &mut reply, &mut reply_at, &mut write_since, until, signals) {
+                        Ok(FlushOut::Done) => published = calls.len(),
+                        Ok(FlushOut::Pending) => {}
+                        Ok(FlushOut::Hangup) => open = false,
+                        Ok(FlushOut::TimedOut) => match stop_child(run).map_err(child_error)? {
+                            Stopped::Exited { exit, left } => break (child_outcome(exit), Some(left)),
+                            Stopped::Killed { left, .. } => break (How::TimedOut { after: budget }, Some(left)),
+                            Stopped::ZombieRace => break (How::TimedOut { after: budget }, None),
+                        },
+                        Err(error) => {
+                            stop_child(run).map_err(child_error)?;
+                            return Err(error);
+                        }
+                    }
+                }
+                try_recv = open && parked.is_none() && ready.readable;
+                recv_deadline = Deadline::PASSED;
+            }
             // Parked, nothing is read or served: its frames wait in the channel, in order.
-            if open && parked.is_none() {
+            if try_recv {
                 let got = if core::mem::take(&mut again) {
                     // Its code came: the frames kept from the waiting one on, served again.
                     Some(inbox.len())
                 } else {
-                    match run.recv_message(&mut inbox, blaze_launch::wire::LONGEST_FRAME, poll) {
+                    match run.recv_message(&mut inbox, blaze_launch::wire::LONGEST_FRAME, recv_deadline) {
                         Ok(Message::Whole { len }) => {
                             signals.progress.set(true);
                             Some(len)
@@ -2782,6 +2811,7 @@ impl<'c> Launched<'c, '_, '_> {
                     }
                 };
                 if let Some(len) = got {
+                        compact_reply(&mut reply, &mut reply_at);
                         self.watch.see(blaze_screen::Step::Waits);
                         signals.begin(Doing::Serving);
                         let serving = run.now();
@@ -2885,20 +2915,33 @@ impl<'c> Launched<'c, '_, '_> {
                         let left = inbox.len() - taken;
                         inbox.copy_within(taken.., 0);
                         inbox.truncate(left);
-                        if open && !reply.is_empty() {
-                            let by = Deadline::after(run.now(), WRITE_BOUND).min(bound);
-                            match run.send(&reply, by) {
-                                Ok(()) => published = calls.len(),
-                                Err(ProcError { fault: RunFault::Channel(ChannelError::Hangup), .. }) => open = false,
-                                Err(error) => return Err(child_error(error)),
+                        if open && reply_at < reply.len() {
+                            let fresh_until = current_until(
+                                started_at,
+                                allowance,
+                                parked_for.saturating_add(parked.map_or(Duration::ZERO, |park| run.now().saturating_sub(park.since))),
+                                signals,
+                            );
+                            match flush_reply(&mut run, &mut reply, &mut reply_at, &mut write_since, fresh_until, signals) {
+                                Ok(FlushOut::Done) => published = calls.len(),
+                                Ok(FlushOut::Pending) => {}
+                                Ok(FlushOut::Hangup) => open = false,
+                                Ok(FlushOut::TimedOut) => match stop_child(run).map_err(child_error)? {
+                                    Stopped::Exited { exit, left } => break (child_outcome(exit), Some(left)),
+                                    Stopped::Killed { left, .. } => break (How::TimedOut { after: budget }, Some(left)),
+                                    Stopped::ZombieRace => break (How::TimedOut { after: budget }, None),
+                                },
+                                Err(error) => {
+                                    stop_child(run).map_err(child_error)?;
+                                    return Err(error);
+                                }
                             }
-                            reply.clear();
                         }
                         continue;
                 }
             }
             // Parked, the turn's wait is the sweep's interval (as a read's would be).
-            let look = if open && parked.is_none() { Deadline::PASSED } else { poll };
+            let look = if open && parked.is_none() { Deadline::PASSED } else if open && reply_at < reply.len() { Deadline::PASSED } else { poll };
             run = match run.wait(look).map_err(child_error)? {
                 Waited::Ended(reaped) => break (child_outcome(reaped.exit), Some(reaped.left)),
                 Waited::Running(running) => running,
@@ -3055,6 +3098,8 @@ impl<'c> Launched<'c, '_, '_> {
         let mut relay = Relay::new(GRACE);
         let mut inbox = run_parent::wire_out(alloc);
         let mut reply = ahead;
+        let mut reply_at = 0usize;
+        let mut write_since: Option<Duration> = None;
         let mut open = true;
         let mut calls = Vec::new_in(alloc);
         let mut published = 0;
@@ -3066,8 +3111,7 @@ impl<'c> Launched<'c, '_, '_> {
             let _span = cx.span("blaze test: service one child's pipes, requests and deadline");
             signals.begin(Doing::Relaying);
             let now = run.now();
-            let host_stalled = Duration::from_nanos(signals.stalled.get());
-            let until = Deadline::after(started_at, allowance.saturating_add(host_stalled));
+            let until = current_until(started_at, allowance, Duration::ZERO, signals);
             if until.passed(now) {
                 match stop_child(run).map_err(child_error)? {
                     Stopped::Exited { exit, left } => break (child_outcome(exit), Some(left)),
@@ -3099,21 +3143,49 @@ impl<'c> Launched<'c, '_, '_> {
             if drain_pipes(cx, &mut pipes, output, stderr, Deadline::PASSED)? {
                 signals.progress.set(true);
             }
-            if open && !reply.is_empty() {
-                let by = Deadline::after(run.now(), WRITE_BOUND).min(bound);
-                match run.send(&reply, by) {
-                    Ok(()) => {
-                        published = calls.len();
-                        signals.progress.set(true);
+            if open && reply_at < reply.len() {
+                match flush_reply(&mut run, &mut reply, &mut reply_at, &mut write_since, until, signals) {
+                    Ok(FlushOut::Done) => published = calls.len(),
+                    Ok(FlushOut::Pending) => {}
+                    Ok(FlushOut::Hangup) => open = false,
+                    Ok(FlushOut::TimedOut) => match stop_child(run).map_err(child_error)? {
+                        Stopped::Exited { exit, left } => break (child_outcome(exit), Some(left)),
+                        Stopped::Killed { left, .. } => break (How::TimedOut { after: budget }, Some(left)),
+                        Stopped::ZombieRace => break (How::TimedOut { after: budget }, None),
+                    },
+                    Err(error) => {
+                        stop_child(run).map_err(child_error)?;
+                        return Err(error);
                     }
-                    Err(ProcError { fault: RunFault::Channel(ChannelError::Hangup), .. }) => open = false,
-                    Err(error) => return Err(child_error(error)),
                 }
-                reply.clear();
             }
-            let poll = Deadline::after(run.now(), signals.wait.replace(Duration::ZERO)).min(bound);
-            if open {
-                let got = match run.recv_message(&mut inbox, blaze_launch::wire::LONGEST_FRAME, poll) {
+            let write_bound = write_since.map_or(Deadline::NEVER, |since| Deadline::after(since, WRITE_BOUND));
+            let poll = Deadline::after(run.now(), signals.wait.replace(Duration::ZERO)).min(bound).min(write_bound);
+            let mut try_recv = open;
+            let mut recv_deadline = poll;
+            if open && reply_at < reply.len() {
+                let ready = run.wait_ready(true, true, poll).map_err(child_error)?;
+                if ready.writable {
+                    match flush_reply(&mut run, &mut reply, &mut reply_at, &mut write_since, until, signals) {
+                        Ok(FlushOut::Done) => published = calls.len(),
+                        Ok(FlushOut::Pending) => {}
+                        Ok(FlushOut::Hangup) => open = false,
+                        Ok(FlushOut::TimedOut) => match stop_child(run).map_err(child_error)? {
+                            Stopped::Exited { exit, left } => break (child_outcome(exit), Some(left)),
+                            Stopped::Killed { left, .. } => break (How::TimedOut { after: budget }, Some(left)),
+                            Stopped::ZombieRace => break (How::TimedOut { after: budget }, None),
+                        },
+                        Err(error) => {
+                            stop_child(run).map_err(child_error)?;
+                            return Err(error);
+                        }
+                    }
+                }
+                try_recv = open && ready.readable;
+                recv_deadline = Deadline::PASSED;
+            }
+            if try_recv {
+                let got = match run.recv_message(&mut inbox, blaze_launch::wire::LONGEST_FRAME, recv_deadline) {
                     Ok(Message::Whole { len }) => {
                         signals.progress.set(true);
                         Some(len)
@@ -3132,6 +3204,7 @@ impl<'c> Launched<'c, '_, '_> {
                     Err(error) => return Err(child_error(error)),
                 };
                 if let Some(len) = got {
+                    compact_reply(&mut reply, &mut reply_at);
                     self.watch.see(blaze_screen::Step::Waits);
                     signals.begin(Doing::Serving);
                     let serving = run.now();
@@ -3233,20 +3306,24 @@ impl<'c> Launched<'c, '_, '_> {
                     let left = inbox.len() - taken;
                     inbox.copy_within(taken.., 0);
                     inbox.truncate(left);
-                    // Send immediately on the same turn so the child resumes without waiting an extra sweep.
-                    if open && !reply.is_empty() {
-                        let sending = run.now();
-                        let by = Deadline::after(sending, WRITE_BOUND).min(bound);
-                        match run.send(&reply, by) {
-                            Ok(()) => published = calls.len(),
-                            Err(ProcError { fault: RunFault::Channel(ChannelError::Hangup), .. }) => open = false,
-                            Err(error) => return Err(child_error(error)),
+                    // Flush as much as fits non-blockingly on the same turn so small replies wake
+                    // the child immediately while large batches stream without blocking or deadlocking.
+                    if open && reply_at < reply.len() {
+                        let fresh_until = current_until(started_at, allowance, Duration::ZERO, signals);
+                        match flush_reply(&mut run, &mut reply, &mut reply_at, &mut write_since, fresh_until, signals) {
+                            Ok(FlushOut::Done) => published = calls.len(),
+                            Ok(FlushOut::Pending) => {}
+                            Ok(FlushOut::Hangup) => open = false,
+                            Ok(FlushOut::TimedOut) => match stop_child(run).map_err(child_error)? {
+                                Stopped::Exited { exit, left } => break (child_outcome(exit), Some(left)),
+                                Stopped::Killed { left, .. } => break (How::TimedOut { after: budget }, Some(left)),
+                                Stopped::ZombieRace => break (How::TimedOut { after: budget }, None),
+                            },
+                            Err(error) => {
+                                stop_child(run).map_err(child_error)?;
+                                return Err(error);
+                            }
                         }
-                        let sent_elapsed = run.now().saturating_sub(sending);
-                        if sent_elapsed >= DRAIN_EVERY {
-                            signals.add_host_nanos(sent_elapsed);
-                        }
-                        reply.clear();
                     }
                     continue;
                 }
@@ -3479,6 +3556,108 @@ fn child_outcome(exit: Exit) -> How {
         Exit::Exited(0) => How::Reported(Said::Returned),
         Exit::Exited(code) => How::NoReport { code, torn: 0 },
         Exit::Signaled(number) => How::Signal { number },
+    }
+}
+
+/// Computes the test's execution deadline crediting both previously accumulated command-thread
+/// stall time (`signals.stalled`) and host work already performed during this poll
+/// (`signals.host_nanos`). Ensures a long compilation turn never leaves `until` stale in the past.
+fn current_until(started_at: Duration, allowance: Duration, parked: Duration, signals: &Signals) -> Deadline {
+    let stalled = signals.stalled.get().saturating_add(signals.host_nanos.get().unwrap_or(0));
+    Deadline::after(
+        started_at,
+        allowance.saturating_add(parked).saturating_add(Duration::from_nanos(stalled)),
+    )
+}
+
+/// Removes already-sent prefix bytes from `reply` before appending new frames.
+fn compact_reply<A: core::alloc::Allocator>(reply: &mut run_parent::WireOut<A>, reply_at: &mut usize) {
+    if *reply_at == 0 {
+        return;
+    }
+    let rem = reply.len().saturating_sub(*reply_at);
+    if rem == 0 {
+        reply.clear();
+    } else {
+        reply.copy_within(*reply_at.., 0);
+        reply.truncate(rem);
+    }
+    *reply_at = 0;
+}
+
+/// Outcome of one non-blocking incremental flush of the child's reply outbox.
+enum FlushOut {
+    /// All queued bytes were written into the child's channel.
+    Done,
+    /// Socket buffer filled before all bytes were written; remaining bytes stay queued for the
+    /// next turn while pipes and incoming child messages continue to drain.
+    Pending,
+    /// The child closed its end of the channel.
+    Hangup,
+    /// The test's execution deadline (`until`) passed while waiting for room to write.
+    TimedOut,
+}
+
+/// Non-blockingly flushes as much of `reply[*reply_at..]` as the kernel socket accepts without
+/// stalling sibling tests or deadlocking on large batches (e.g. `prepublish_warm` or large inline
+/// records). Resets `write_since` on every byte written and only fails with `WriteDeadline` if no
+/// progress occurs for `WRITE_BOUND` while `until` has not expired.
+fn flush_reply<A: core::alloc::Allocator>(
+    run: &mut bstd::procs::Served,
+    reply: &mut run_parent::WireOut<A>,
+    reply_at: &mut usize,
+    write_since: &mut Option<Duration>,
+    until: Deadline,
+    signals: &Signals,
+) -> Result<FlushOut, OneError> {
+    let Some(pending) = reply.get(*reply_at..) else {
+        reply.clear();
+        *reply_at = 0;
+        *write_since = None;
+        return Ok(FlushOut::Done);
+    };
+    if pending.is_empty() {
+        reply.clear();
+        *reply_at = 0;
+        *write_since = None;
+        return Ok(FlushOut::Done);
+    }
+    match run.send_some(pending, Deadline::PASSED) {
+        Ok(ChannelWrite::Bytes(n)) if n > 0 => {
+            *reply_at += n;
+            signals.progress.set(true);
+            if *reply_at >= reply.len() {
+                reply.clear();
+                *reply_at = 0;
+                *write_since = None;
+                Ok(FlushOut::Done)
+            } else {
+                *write_since = Some(run.now());
+                Ok(FlushOut::Pending)
+            }
+        }
+        Ok(ChannelWrite::Bytes(_) | ChannelWrite::Deadline) => {
+            let now = run.now();
+            if until.passed(now) {
+                return Ok(FlushOut::TimedOut);
+            }
+            let since = *write_since.get_or_insert(now);
+            if now.saturating_sub(since) >= WRITE_BOUND {
+                return Err(OneError::Loop(RunLoopError::Child(ProcError {
+                    step: RunStep::Send,
+                    proc: Some(run.id()),
+                    fault: RunFault::Channel(ChannelError::WriteDeadline { sent: *reply_at, of: reply.len() }),
+                })));
+            }
+            Ok(FlushOut::Pending)
+        }
+        Err(ProcError { fault: RunFault::Channel(ChannelError::Hangup), .. }) => {
+            reply.clear();
+            *reply_at = 0;
+            *write_since = None;
+            Ok(FlushOut::Hangup)
+        }
+        Err(error) => Err(OneError::Loop(RunLoopError::Child(error))),
     }
 }
 
@@ -3803,7 +3982,7 @@ pub(crate) fn run_suites<'h>(
     rng: &mut bstd::rng::Rng,
     out: &bstd::out::Out,
     err: &bstd::out::Out,
-    suites: &[Suite<'_, 'h>], ids: &RunIds<'h>, certificate: crate::start_list::Certificate, config: LoopConfig<'_>,
+    suites: &[Suite<'_, 'h>], ids: &RunIds<'h>, typed: crate::engine_body_record::TypedFrom<'h>, certificate: crate::start_list::Certificate, config: LoopConfig<'_>,
     args: &[&str], lent: &CommandLent, root: &Dir<ReadWrite>, procs: crate::job_texts::Procs<'_>, heap: &'static blaze_own::Heap, watch: &dyn Watch, frame: &Frame,
 ) -> Result<Status, DriveError> {
     let tables = heap.alloc();
@@ -3811,8 +3990,8 @@ pub(crate) fn run_suites<'h>(
     // every maker, the serial turns' and each code worker's (rule 16: a large or slow make's line).
     let make_watch = crate::run_parent::command_make_watch();
     match CODES {
-        Codes::Serial => run_selected(cx, fs, env, host, clock, out, err, suites, ids, certificate, config, args, lent, tables, watch, make_watch, frame, None),
-        Codes::Pooled => pooled(cx, clock, rng, suites, root, procs, heap, make_watch, |relay| run_selected(cx, fs, env, host, clock, out, err, suites, ids, certificate, config, args, lent, tables, watch, make_watch, frame, Some(relay))),
+        Codes::Serial => run_selected(cx, fs, env, host, clock, out, err, suites, ids, typed, certificate, config, args, lent, tables, watch, make_watch, frame, None),
+        Codes::Pooled => pooled(cx, clock, rng, suites, root, procs, heap, make_watch, |relay| run_selected(cx, fs, env, host, clock, out, err, suites, ids, typed, certificate, config, args, lent, tables, watch, make_watch, frame, Some(relay))),
     }
 }
 
@@ -3895,7 +4074,7 @@ fn run_selected<'h>(
     clock: &bstd::clock::Clock,
     out: &bstd::out::Out,
     err: &bstd::out::Out,
-    suites: &[Suite<'_, 'h>], ids: &RunIds<'h>, certificate: crate::start_list::Certificate, config: LoopConfig<'_>,
+    suites: &[Suite<'_, 'h>], ids: &RunIds<'h>, typed: crate::engine_body_record::TypedFrom<'h>, certificate: crate::start_list::Certificate, config: LoopConfig<'_>,
     args: &[&str], lent: &CommandLent, tables: Alloc<'static>, watch: &dyn Watch, make_watch: blaze_ladder::run::make_one::MakeWatch<'static>, frame: &Frame,
     relay: Option<&CodeRelay<'_>>,
 ) -> Result<Status, DriveError> {
@@ -3979,7 +4158,7 @@ fn run_selected<'h>(
     let mut suite_caches = Vec::with_capacity_in(suites.len(), alloc);
     for (index, suite) in suites.iter().enumerate() {
         let suite_id = SuiteId(u32::try_from(index).map_err(|_| DriveError::TooManyRows { count: suites.len() })?);
-        let mut sc = suite_cache::SuiteCache::new(suite.names, suite.builder, tables, make_watch);
+        let mut sc = suite_cache::SuiteCache::new(suite.names, suite.builder, typed, tables, make_watch);
         let _ = cache.load_verified(suite_id, &certificate, sc.verified_mut());
         suite_caches.push(RefCell::new(sc));
     }
@@ -4190,5 +4369,22 @@ mod native_tests {
         // PLANTED: a store path with a quote would end the profile's string early.
         assert!(matches!(with_native(plain(), "/h/\"/records", Some(send(HEX))), Err(OneError::Profile { .. })));
         assert!(matches!(with_native(plain(), "/h/records", Some(send("../x"))), Err(OneError::Profile { .. })));
+    }
+
+    #[test]
+    fn current_until_credits_in_progress_host_serve_time() {
+        let signals = Signals::default();
+        let started = Duration::from_secs(10);
+        let allowance = Duration::from_secs(60);
+        signals.stalled.set(Duration::from_secs(5).as_nanos() as u64);
+        // Simulate a 190 s compile inside `needs.serve` on the current turn before `sweep` rolls
+        // `host_nanos` into `stalled`.
+        signals.add_host_nanos(Duration::from_secs(190));
+        let now = started + Duration::from_secs(195);
+        let until = current_until(started, allowance, Duration::ZERO, &signals);
+        assert!(
+            !until.passed(now),
+            "current_until must credit same-turn host_nanos so send deadline is never already expired"
+        );
     }
 }

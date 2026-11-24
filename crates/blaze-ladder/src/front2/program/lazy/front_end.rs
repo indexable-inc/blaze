@@ -78,12 +78,10 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             return crate::front2::world_items::ctor_world(self.front.names, &self.front.keys, &self.front.index, &self.store, self.buckets.as_ref(), key, &self.asked, &self.asked_gaps, f);
         };
         let body = &live.made;
-        let view = body.lowered.view();
-        // A function of the lowering alone, made once when the body was checked.
-        let Ok(spell) = Spelling::of(&view) else {
-            return Err(ResolveError::Missing(tc::Question::FnSig(self.rows.key[i])));
-        };
-        let scope = body.scope(&spell);
+        // Ground-type queries (`resolve`, `holds`, `adt_drop_impl`, `normalize`) never resolve
+        // written AST paths, so reuse the prebuilt `fixed_spell` instead of rebuilding a per-body
+        // `Spelling` HashMap on every call.
+        let scope = body.scope(&self.fixed_spell);
         let world = BodyWorld {
             names: self.front.names,
             keys: &self.front.keys,

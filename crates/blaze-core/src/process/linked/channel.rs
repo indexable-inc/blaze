@@ -22,6 +22,11 @@ use std::{
     os::fd::{AsFd, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd},
 };
 
+use libc::{
+    EAGAIN, ECONNRESET, EINTR, EPIPE, POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLOUT, SO_RCVBUF, SO_SNDBUF, SOL_SOCKET,
+    c_int, c_short, pollfd, setsockopt, socklen_t,
+};
+
 use crate::wait::{Clock, Deadline, Waited};
 
 /// The descriptor the child's end is given as.
@@ -32,6 +37,10 @@ pub const PREFIX: usize = 4;
 
 /// The most bytes one read asks for.
 const READ_MOST: usize = 64 << 10;
+
+/// Target kernel send/receive buffer size for the Unix stream socket pair (256 KiB, with a 64 KiB
+/// fallback): avoids macOS's tiny 8 KiB default `AF_UNIX` buffer while remaining bounded.
+const SOCKET_BUF_TRY: [c_int; 2] = [256 << 10, 64 << 10];
 
 /// What a channel step was, for its error.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -99,6 +108,22 @@ pub enum Read {
     Deadline,
 }
 
+/// How an incremental non-blocking/bounded write went.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Write {
+    /// This many bytes were written into the channel.
+    Bytes(usize),
+    /// The deadline passed with the channel's send buffer still full (0 bytes written).
+    Deadline,
+}
+
+/// Which directions of a [`Channel`] became ready in [`Channel::wait_ready`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct ChannelReady {
+    pub readable: bool,
+    pub writable: bool,
+}
+
 /// How [`Channel::recv_message`] went.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Message {
@@ -125,6 +150,11 @@ impl ChildEnd {
     /// The end, borrowed, to give as `(end.fd(), CHILD_FD)` (a caller without `std`'s `AsFd`).
     pub fn fd(&self) -> BorrowedFd<'_> {
         self.0.as_fd()
+    }
+
+    /// Consumes the handle and returns the underlying owned descriptor.
+    pub fn into_fd(self) -> OwnedFd {
+        self.0
     }
 }
 
@@ -176,8 +206,32 @@ pub fn pair() -> Result<(Channel, ChildEnd), ChannelError> {
             return Err(os(ChannelOp::Flags));
         }
     }
+    tune_socket_buf(parent.as_raw_fd());
+    tune_socket_buf(child.as_raw_fd());
     let end = DeadlineFd::new(parent, "the run child's channel").map_err(|error| io_os(ChannelOp::Flags, &error))?;
     Ok((Channel { end }, ChildEnd(child)))
+}
+
+/// Best-effort raise of `SO_SNDBUF` and `SO_RCVBUF` on a Unix stream socket. Never fails: a
+/// kernel that caps buffer sizes simply keeps its current limit.
+fn tune_socket_buf(fd: c_int) {
+    for opt in [SO_SNDBUF, SO_RCVBUF] {
+        for &size in &SOCKET_BUF_TRY {
+            // SAFETY: valid open socket descriptor and a live `c_int` of its exact size.
+            let rc = unsafe {
+                setsockopt(
+                    fd,
+                    SOL_SOCKET,
+                    opt,
+                    (&raw const size).cast(),
+                    size_of::<c_int>() as socklen_t,
+                )
+            };
+            if rc == 0 {
+                break;
+            }
+        }
+    }
 }
 
 impl DeadlineFd {
@@ -205,40 +259,56 @@ impl DeadlineFd {
                 _ => {}
             }
             match io::Error::last_os_error().raw_os_error() {
-                Some(libc::EINTR) => continue,
+                Some(EINTR) => continue,
                 // A Unix socket whose peer closed with bytes it never read (Linux), or a reset:
                 // the peer is gone, which is the end of what it sends.
-                Some(libc::ECONNRESET) => return Ok(Read::Closed),
-                Some(libc::EAGAIN) => {}
+                Some(ECONNRESET) => return Ok(Read::Closed),
+                Some(EAGAIN) => {}
                 Some(code) => return Err(ChannelError::Os { op: ChannelOp::Read, os: code }),
                 None => return Err(ChannelError::Os { op: ChannelOp::Read, os: 0 }),
             }
             if deadline.passed(clock.now()) {
                 return Ok(Read::Deadline);
             }
-            if !self.ready(libc::POLLIN, deadline, clock)? {
+            if !self.ready(POLLIN, deadline, clock)? {
                 return Ok(Read::Deadline);
             }
         }
     }
 
-    /// Whether the descriptor became ready for `events` (or hung up, or failed: the next call
-    /// says which) by `deadline`.
-    fn ready(&self, events: libc::c_short, deadline: Deadline, clock: &impl Clock) -> Result<bool, ChannelError> {
-        let mut poll = [libc::pollfd { fd: self.fd.as_raw_fd(), events, revents: 0 }];
+    /// Waits for `events` by `deadline`, returning the raw `revents` mask when ready or `None` on
+    /// deadline.
+    fn poll_events(&self, events: c_short, deadline: Deadline, clock: &impl Clock) -> Result<Option<c_short>, ChannelError> {
+        let mut poll = [pollfd { fd: self.fd.as_raw_fd(), events, revents: 0 }];
         // wakes: the kernel, when the peer writes, reads or closes, or the deadline.
         match crate::wait::readable(self.what, &mut poll, deadline.finite(), clock) {
-            Ok(Waited::Ready(_)) => Ok(true),
-            Ok(Waited::Deadline) => Ok(false),
+            Ok(Waited::Ready(_)) => Ok(Some(poll[0].revents)),
+            Ok(Waited::Deadline) => Ok(None),
             Err(error) => Err(ChannelError::Os {
                 op: ChannelOp::Wait,
                 os: error.io_error().and_then(io::Error::raw_os_error).unwrap_or(0),
             }),
         }
     }
+
+    /// Whether the descriptor became ready for `events` (or hung up, or failed: the next call
+    /// says which) by `deadline`.
+    fn ready(&self, events: c_short, deadline: Deadline, clock: &impl Clock) -> Result<bool, ChannelError> {
+        Ok(self.poll_events(events, deadline, clock)?.is_some())
+    }
 }
 
 impl Channel {
+    /// Wraps an already-prepared non-blocking descriptor as a [`Channel`].
+    pub fn from_end(end: DeadlineFd) -> Channel {
+        Channel { end }
+    }
+
+    /// The underlying non-blocking descriptor.
+    pub fn end(&self) -> &DeadlineFd {
+        &self.end
+    }
+
     /// The parent's end, for a wait on several descriptors at once.
     pub fn as_fd(&self) -> BorrowedFd<'_> {
         self.end.fd.as_fd()
@@ -291,15 +361,19 @@ impl Channel {
         }
     }
 
-    /// All of `bytes`, which are whole messages, written by `deadline` on `clock`.
-    pub fn send(&mut self, bytes: &[u8], deadline: Deadline, clock: &impl Clock) -> Result<(), ChannelError> {
-        let whole = whole_messages(bytes);
-        if whole != bytes.len() {
-            return Err(ChannelError::NotWhole { at: whole, of: bytes.len() });
+    /// Writes as many bytes from `bytes` as fit into the channel without blocking once any byte
+    /// has moved, waiting up to `deadline` only if 0 bytes fit immediately. Returns
+    /// [`Write::Bytes`] with the count written, or [`Write::Deadline`] if the send buffer stayed
+    /// full past `deadline`. The caller keeps any unwritten suffix and can pump reads/pipes before
+    /// continuing, so arbitrary payload sizes never deadlock.
+    pub fn send_some(&mut self, bytes: &[u8], deadline: Deadline, clock: &impl Clock) -> Result<Write, ChannelError> {
+        if bytes.is_empty() {
+            return Ok(Write::Bytes(0));
         }
         let mut sent = 0;
-        while sent < bytes.len() {
-            let rest = &bytes[sent..];
+        while let Some(rest) = bytes.get(sent..)
+            && !rest.is_empty()
+        {
             #[cfg(target_os = "linux")]
             let flags = libc::MSG_NOSIGNAL;
             #[cfg(not(target_os = "linux"))]
@@ -307,18 +381,73 @@ impl Channel {
             // SAFETY: `rest` is live for its length; the socket is this end's.
             let put = unsafe { libc::send(self.end.fd.as_raw_fd(), rest.as_ptr().cast(), rest.len(), flags) };
             if put > 0 {
-                sent += put as usize;
+                sent += put.cast_unsigned();
                 continue;
             }
             match io::Error::last_os_error().raw_os_error() {
-                Some(libc::EINTR) => continue,
-                Some(libc::EPIPE | libc::ECONNRESET) => return Err(ChannelError::Hangup),
-                Some(libc::EAGAIN) => {}
+                Some(EINTR) => continue,
+                Some(EPIPE | ECONNRESET) => return Err(ChannelError::Hangup),
+                Some(EAGAIN) => {}
                 Some(code) => return Err(ChannelError::Os { op: ChannelOp::Write, os: code }),
                 None => return Err(ChannelError::Os { op: ChannelOp::Write, os: 0 }),
             }
-            if deadline.passed(clock.now()) || !self.end.ready(libc::POLLOUT, deadline, clock)? {
-                return Err(ChannelError::WriteDeadline { sent, of: bytes.len() });
+            if sent > 0 {
+                return Ok(Write::Bytes(sent));
+            }
+            if deadline.passed(clock.now()) || !self.end.ready(POLLOUT, deadline, clock)? {
+                return Ok(Write::Deadline);
+            }
+        }
+        Ok(Write::Bytes(sent))
+    }
+
+    /// Waits up to `deadline` for the channel to become readable (`want_read`) and/or writable
+    /// (`want_write`) in a single `poll` call. Hangup or error marks both requested directions
+    /// ready so the caller observes the close on its next read/write.
+    pub fn wait_ready(
+        &self,
+        want_read: bool,
+        want_write: bool,
+        deadline: Deadline,
+        clock: &impl Clock,
+    ) -> Result<ChannelReady, ChannelError> {
+        let mut events: c_short = 0;
+        if want_read {
+            events |= POLLIN;
+        }
+        if want_write {
+            events |= POLLOUT;
+        }
+        if events == 0 || deadline.passed(clock.now()) {
+            return Ok(ChannelReady::default());
+        }
+        match self.end.poll_events(events, deadline, clock)? {
+            Some(rev) => {
+                let hup = (rev & (POLLHUP | POLLERR | POLLNVAL)) != 0;
+                Ok(ChannelReady {
+                    readable: want_read && ((rev & POLLIN) != 0 || hup),
+                    writable: want_write && ((rev & POLLOUT) != 0 || hup),
+                })
+            }
+            None => Ok(ChannelReady::default()),
+        }
+    }
+
+    /// All of `bytes`, which are whole messages, written by `deadline` on `clock`.
+    pub fn send(&mut self, bytes: &[u8], deadline: Deadline, clock: &impl Clock) -> Result<(), ChannelError> {
+        let whole = whole_messages(bytes);
+        if whole != bytes.len() {
+            return Err(ChannelError::NotWhole { at: whole, of: bytes.len() });
+        }
+        let mut sent = 0;
+        while let Some(rest) = bytes.get(sent..)
+            && !rest.is_empty()
+        {
+            match self.send_some(rest, deadline, clock)? {
+                Write::Bytes(n) if n > 0 => sent += n,
+                Write::Bytes(_) | Write::Deadline => {
+                    return Err(ChannelError::WriteDeadline { sent, of: bytes.len() });
+                }
             }
         }
         Ok(())
@@ -396,5 +525,123 @@ mod tests {
             Err(ChannelError::TooLong { len: 64, most: 16 })
         );
         println!("channel: split frame joined, deadline kept the half, torn named, hangup named");
+    }
+
+    /// Verifies that sending a large multi-message payload (512 KiB) while the peer simultaneously
+    /// writes back 256 KiB across a real Unix stream socket pair never deadlocks when driven with
+    /// incremental `send_some` + `wait_ready` + `recv_message`, even with both ends shrunk to
+    /// macOS's 8 KiB default `AF_UNIX` buffer.
+    #[test]
+    fn large_bidirectional_payloads_never_deadlock() {
+        let clock = Monotonic::new();
+        let (mut parent, child_end) = pair().expect("a pair");
+        let mut child = Channel::from_end(DeadlineFd::new(child_end.into_fd(), "child").expect("child fd"));
+        // Shrink both ends to 8 KiB to prove the protocol itself is deadlock-free even on an
+        // 8 KiB kernel buffer (far smaller than the 512 KiB / 256 KiB messages exchanged).
+        let tiny: c_int = 8192;
+        for fd in [parent.as_fd().as_raw_fd(), child.as_fd().as_raw_fd()] {
+            for opt in [SO_SNDBUF, SO_RCVBUF] {
+                // SAFETY: valid open socket fd and live `c_int` of its size.
+                unsafe {
+                    setsockopt(fd, SOL_SOCKET, opt, (&raw const tiny).cast(), size_of::<c_int>() as socklen_t);
+                }
+            }
+        }
+
+        let frame = blaze_mem::Frame::with_reserve(1 << 21, blaze_mem::Tag::Other).expect("frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let alloc = erased.handle();
+
+        // Build a 512 KiB parent->child batch of length-prefixed frames (8 x 64 KiB) and a
+        // 256 KiB child->parent batch (4 x 64 KiB).
+        let mut parent_out: blaze_own::AVec<'_, u8> = blaze_own::AVec::new_in(alloc);
+        for idx in 0u8..8 {
+            let body_len = 64u32 * 1024;
+            parent_out.extend_from_slice(&body_len.to_be_bytes());
+            parent_out.resize(parent_out.len() + body_len as usize, idx.wrapping_add(1));
+        }
+        let expected_parent_len = parent_out.len();
+        assert_eq!(whole_messages(&parent_out), expected_parent_len);
+
+        let mut child_out: blaze_own::AVec<'_, u8> = blaze_own::AVec::new_in(alloc);
+        for idx in 0u8..4 {
+            let body_len = 64u32 * 1024;
+            child_out.extend_from_slice(&body_len.to_be_bytes());
+            child_out.resize(child_out.len() + body_len as usize, idx.wrapping_add(0xA0));
+        }
+        let expected_child_len = child_out.len();
+
+        let deadline = Deadline::after(clock.now(), Duration::from_secs(10));
+        let mut parent_sent = 0usize;
+        let mut child_sent = 0usize;
+        let mut parent_inbox = core::default::Default::default();
+        let mut child_inbox = core::default::Default::default();
+        let mut parent_got: blaze_own::AVec<'_, u8> = blaze_own::AVec::with_capacity_in(expected_child_len, alloc);
+        let mut child_got: blaze_own::AVec<'_, u8> = blaze_own::AVec::with_capacity_in(expected_parent_len, alloc);
+        let mut saw_backpressure = false;
+
+        while parent_sent < expected_parent_len
+            || child_sent < expected_child_len
+            || parent_got.len() < expected_child_len
+            || child_got.len() < expected_parent_len
+        {
+            assert!(!deadline.passed(clock.now()), "timed out: ps={parent_sent} cs={child_sent} pg={} cg={}", parent_got.len(), child_got.len());
+            if parent_sent < expected_parent_len {
+                let rem = expected_parent_len - parent_sent;
+                match parent.send_some(&parent_out[parent_sent..], Deadline::PASSED, &clock).expect("parent send_some") {
+                    Write::Bytes(n) => {
+                        if n < rem {
+                            saw_backpressure = true;
+                        }
+                        parent_sent += n;
+                    }
+                    Write::Deadline => saw_backpressure = true,
+                }
+            }
+            if child_sent < expected_child_len {
+                let rem = expected_child_len - child_sent;
+                match child.send_some(&child_out[child_sent..], Deadline::PASSED, &clock).expect("child send_some") {
+                    Write::Bytes(n) => {
+                        if n < rem {
+                            saw_backpressure = true;
+                        }
+                        child_sent += n;
+                    }
+                    Write::Deadline => saw_backpressure = true,
+                }
+            }
+            if parent_got.len() < expected_child_len {
+                match parent.recv_message(&mut parent_inbox, 128 * 1024, Deadline::PASSED, &clock).expect("parent recv") {
+                    Message::Whole { len } => {
+                        parent_got.extend_from_slice(&parent_inbox[..len]);
+                        parent_inbox.drain(..len);
+                    }
+                    Message::Deadline => {}
+                    Message::Closed => panic!("unexpected close on parent"),
+                }
+            }
+            if child_got.len() < expected_parent_len {
+                match child.recv_message(&mut child_inbox, 128 * 1024, Deadline::PASSED, &clock).expect("child recv") {
+                    Message::Whole { len } => {
+                        child_got.extend_from_slice(&child_inbox[..len]);
+                        child_inbox.drain(..len);
+                    }
+                    Message::Deadline => {}
+                    Message::Closed => panic!("unexpected close on child"),
+                }
+            }
+            if parent_sent < expected_parent_len || parent_got.len() < expected_child_len {
+                let want_read = parent_got.len() < expected_child_len && parent_inbox.len() < PREFIX;
+                let want_write = parent_sent < expected_parent_len;
+                if want_read || want_write {
+                    let ready = parent.wait_ready(want_read, want_write, deadline, &clock).expect("wait_ready");
+                    assert!(ready.readable || ready.writable);
+                }
+            }
+        }
+
+        assert!(saw_backpressure, "8 KiB socket must exercise partial-write backpressure");
+        assert_eq!(&child_got[..], &parent_out[..], "all 512 KiB arrived intact");
+        assert_eq!(&parent_got[..], &child_out[..], "all 256 KiB received intact");
     }
 }

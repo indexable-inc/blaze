@@ -28,7 +28,7 @@ use alloc::{string::String, vec::Vec};
 use core::{alloc::Allocator, fmt, time::Duration};
 
 pub use blaze_core::linked::{
-    channel::{CHILD_FD, ChannelError, Message, PREFIX, Read, whole_messages},
+    channel::{CHILD_FD, ChannelError, ChannelReady, Message, PREFIX, Read, Write, whole_messages},
     run::{Input, Output, ParentDeath, Streams},
 };
 use blaze_core::{
@@ -163,6 +163,22 @@ pub trait RunChild: Sized {
 
     /// `bytes`, whole messages, all written by `deadline`.
     fn send(&mut self, bytes: &[u8], deadline: Deadline) -> Result<(), RunError>;
+
+    /// Writes as many bytes from `bytes` (already whole-message framed by the caller) as fit
+    /// before `deadline` without blocking past the first partial write; returns [`Write::Deadline`]
+    /// if the channel stayed full. Default delegates to [`RunChild::send`] for simulated children.
+    fn send_some(&mut self, bytes: &[u8], deadline: Deadline) -> Result<Write, RunError> {
+        if bytes.is_empty() {
+            return Ok(Write::Bytes(0));
+        }
+        self.send(bytes, deadline).map(|()| Write::Bytes(bytes.len()))
+    }
+
+    /// Waits up to `deadline` for the channel to become readable and/or writable. Default reports
+    /// requested directions ready immediately for simulated children.
+    fn wait_ready(&mut self, want_read: bool, want_write: bool, _deadline: Deadline) -> Result<ChannelReady, RunError> {
+        Ok(ChannelReady { readable: want_read, writable: want_write })
+    }
 
     /// How it ended, by `deadline` (it is reaped, and only what it left is given), or the child
     /// back, still running. A wait that fails drops the child (native: killed and reaped).
@@ -442,6 +458,26 @@ impl RunChild for Served {
             Ok(()) => Ok(()),
             Err(ChannelError::WriteDeadline { .. }) if task_first => Err(rest.stopped(RunStep::Send, until)),
             Err(error) => Err(rest.error(RunStep::Send, RunFault::Channel(error))),
+        }
+    }
+
+    fn send_some(&mut self, bytes: &[u8], deadline: Deadline) -> Result<Write, RunError> {
+        let rest = &self.run.rest;
+        let (until, task_first) = rest.capped(deadline);
+        match self.channel.send_some(bytes, until, &DriverClock(&rest.io)) {
+            Ok(Write::Deadline) if task_first => Err(rest.stopped(RunStep::Send, until)),
+            Ok(write) => Ok(write),
+            Err(error) => Err(rest.error(RunStep::Send, RunFault::Channel(error))),
+        }
+    }
+
+    fn wait_ready(&mut self, want_read: bool, want_write: bool, deadline: Deadline) -> Result<ChannelReady, RunError> {
+        let rest = &self.run.rest;
+        let (until, task_first) = rest.capped(deadline);
+        match self.channel.wait_ready(want_read, want_write, until, &DriverClock(&rest.io)) {
+            Ok(ready) if !ready.readable && !ready.writable && task_first => Err(rest.stopped(RunStep::Recv, until)),
+            Ok(ready) => Ok(ready),
+            Err(error) => Err(rest.error(RunStep::Recv, RunFault::Channel(error))),
         }
     }
 
