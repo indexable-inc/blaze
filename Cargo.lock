@@ -353,6 +353,7 @@ version = "0.0.0"
 dependencies = [
  "blaze-body",
  "blaze-build",
+ "blaze-ids",
  "blaze-lir",
  "blaze-own",
  "blaze-typeck",

@@ -28,6 +28,8 @@ blaze-typeck.workspace = true
 blaze-own.workspace = true
 
 [dev-dependencies]
+# `ContentId` for vtable shape fixtures in tests.
+blaze-ids.workspace = true
 # The evaluator every test runs the built function on.
 blaze-lir = { workspace = true, features = ["eval"] }
 # `Alloc::global()`, named only at the tests' top.

@@ -14,9 +14,9 @@
 
 use core::alloc::Allocator;
 
-use blaze_body::{Block, BlockKind, BorrowKind, LocalDecl, LocalKind, Local, Operand, Place, Proj, Role, Span, StmtKind, Value};
+use blaze_body::{BinOp as BBin, Block, BlockKind, BorrowKind, LocalDecl, LocalKind, Local, Operand, Place, Proj, Role, Span, StmtKind, Value};
 use blaze_own::Vec;
-use blaze_typeck::{Def, ExprId, IntTy, ItemKey, Lit, List, Mutbl, PNode, PTy, Pat, PatId, UnionPat};
+use blaze_typeck::{Def, ExprId, IntTy, ItemKey, Lit, List, Mutbl, PNode, PTy, Pat, PatId, UintTy, UnionPat};
 
 use crate::scope::Binding;
 use crate::{At, BodyFacts, Construct, DiscrInt, Lower, LowerError, MOST_POSITIONS};
@@ -311,10 +311,193 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
                 }
                 Ok(())
             }
-            Pat::Or { .. } => self.refuse_pat(Construct::OrPattern, p),
-            Pat::Slice { .. } => self.refuse_pat(Construct::SlicePattern, p),
-            Pat::Range { .. } => self.refuse_pat(Construct::RangePattern, p),
+            Pat::Or { alts } => {
+                if self.pat_has_bindings(p)? {
+                    return self.refuse_pat(Construct::OrPattern, p);
+                }
+                let list = self.pats_in(alts, p)?;
+                if list.is_empty() {
+                    self.goto(fail, span);
+                    self.dead_block();
+                    return Ok(());
+                }
+                let ok = self.b.new_block(BlockKind::Normal);
+                let last = list.len() - 1;
+                for (i, &alt) in list.iter().enumerate() {
+                    if i == last {
+                        self.test_pat(alt, place, ty, fail, e)?;
+                        self.goto(ok, span);
+                    } else {
+                        let next = self.b.new_block(BlockKind::Normal);
+                        self.test_pat(alt, place, ty, next, e)?;
+                        self.goto(ok, span);
+                        self.b.start(next);
+                    }
+                }
+                self.b.start(ok);
+                Ok(())
+            }
+            Pat::Slice { elems, rest } => self.test_slice_pat(p, elems, rest, place, ty, fail, e),
+            Pat::Range { lo, hi, inclusive } => self.test_range_pat(p, lo, hi, inclusive, place, ty, fail, e),
         }
+    }
+
+    /// Whether pattern `root` introduces any `Pat::Bind`.
+    fn pat_has_bindings(&self, root: PatId) -> Result<bool, LowerError> {
+        let mut work: Vec<PatId, A> = Vec::new_in(self.alloc);
+        work.push(root);
+        let mut steps = 0u32;
+        while let Some(q) = work.pop() {
+            steps += 1;
+            if steps > MOST_POSITIONS {
+                return self.refuse_pat(Construct::Bound, root);
+            }
+            match self.pat(q)? {
+                Pat::Bind { .. } => return Ok(true),
+                Pat::Ref { inner, .. } => work.push(inner),
+                Pat::Tuple { elems, .. } | Pat::TupleStruct { elems, .. } | Pat::Slice { elems, .. } => {
+                    work.extend_from_slice(self.pats_in(elems, q)?);
+                }
+                Pat::Or { alts } => work.extend_from_slice(self.pats_in(alts, q)?),
+                Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
+                    for fp in self.field_pats_in(fields, q)? {
+                        work.push(fp.pat);
+                    }
+                }
+                Pat::Missing | Pat::Wild | Pat::Lit(_) | Pat::NegLit(_) | Pat::Path(_) | Pat::Range { .. } => {}
+            }
+        }
+        Ok(false)
+    }
+
+    /// Reads the integer/char bound of one endpoint of `Pat::Range`.
+    fn range_bound(&self, bound: PatId) -> Result<u128, LowerError> {
+        match self.pat(bound)? {
+            Pat::Lit(Lit::Int(_) | Lit::Char) | Pat::NegLit(Lit::Int(_)) => match self.facts.int_pat(bound) {
+                Some(v) => Ok(v),
+                None => self.refuse_pat(Construct::NoLiteralValue, bound),
+            },
+            _ => self.refuse_pat(Construct::ValuePattern, bound),
+        }
+    }
+
+    /// Tests `lo..=hi` / `lo..hi` / `lo..` / `..=hi` against `place` (of integer/char type `ty`).
+    fn test_range_pat(
+        &mut self,
+        p: PatId,
+        lo: Option<PatId>,
+        hi: Option<PatId>,
+        inclusive: bool,
+        place: Place,
+        ty: PTy,
+        fail: Block,
+        e: ExprId,
+    ) -> Result<(), LowerError> {
+        let span = self.pat_span(p);
+        let bool_ty = self.bool_ty(At::Pat(p))?;
+        if let Some(lp) = lo {
+            let bits = self.range_bound(lp)?;
+            let lo_c = self.scalar(bits, ty);
+            let cmp = self.scratch(e, bool_ty);
+            self.b.assign(cmp, Value::Binary { op: BBin::Ge, lhs: Operand::Copy(place), rhs: lo_c }, span);
+            let ok = self.b.new_block(BlockKind::Normal);
+            let cases = self.b.cases(&[(0, fail)]);
+            self.b.terminate(StmtKind::Switch { on: Operand::Move(cmp), cases, otherwise: ok }, span);
+            self.b.start(ok);
+        }
+        if let Some(hp) = hi {
+            let bits = self.range_bound(hp)?;
+            let hi_c = self.scalar(bits, ty);
+            let op = if inclusive { BBin::Le } else { BBin::Lt };
+            let cmp = self.scratch(e, bool_ty);
+            self.b.assign(cmp, Value::Binary { op, lhs: Operand::Copy(place), rhs: hi_c }, span);
+            let ok = self.b.new_block(BlockKind::Normal);
+            let cases = self.b.cases(&[(0, fail)]);
+            self.b.terminate(StmtKind::Switch { on: Operand::Move(cmp), cases, otherwise: ok }, span);
+            self.b.start(ok);
+        }
+        Ok(())
+    }
+
+    /// Element projections for a slice or array pattern `[p0, .., pk]`: returns `(proj, sub_pat, sub_ty)`
+    /// for each element and optional rest subslice.
+    fn slice_elems(
+        &self,
+        p: PatId,
+        elems: List,
+        rest: Option<u32>,
+        ty: PTy,
+    ) -> Result<(bool, u32, Vec<(Proj, PatId, PTy), A>), LowerError> {
+        let (is_slice, elem_ty) = match self.node(ty, At::Pat(p))? {
+            PNode::Slice(t) => (true, t),
+            PNode::Array(t, _) => (false, t),
+            _ => return self.refuse_pat(Construct::Malformed, p),
+        };
+        let subs = self.pats_in(elems, p)?;
+        let Ok(len) = u32::try_from(subs.len()) else { return self.refuse_pat(Construct::Malformed, p) };
+        let min_length = if rest.is_some() { len.saturating_sub(1) } else { len };
+        let mut out: Vec<(Proj, PatId, PTy), A> = Vec::with_capacity_in(subs.len(), self.alloc);
+        for (idx, &sub) in subs.iter().enumerate() {
+            let Ok(i) = u32::try_from(idx) else { return self.refuse_pat(Construct::Malformed, sub) };
+            match rest {
+                Some(r) if i == r => {
+                    let sub_ty = self.pat_ty(sub)?;
+                    let proj = Proj::Subslice { from: r, to: len - 1 - r, from_end: true };
+                    out.push((proj, sub, sub_ty));
+                }
+                Some(r) if i > r => {
+                    let proj = Proj::ConstIndex { offset: len - i, min_length, from_end: true };
+                    out.push((proj, sub, elem_ty));
+                }
+                _ => {
+                    let proj = Proj::ConstIndex { offset: i, min_length, from_end: false };
+                    out.push((proj, sub, elem_ty));
+                }
+            }
+        }
+        Ok((is_slice, min_length, out))
+    }
+
+    /// Tests a slice/array pattern: checks length for slices, then tests each element/subslice.
+    fn test_slice_pat(
+        &mut self,
+        p: PatId,
+        elems: List,
+        rest: Option<u32>,
+        place: Place,
+        ty: PTy,
+        fail: Block,
+        e: ExprId,
+    ) -> Result<(), LowerError> {
+        let span = self.pat_span(p);
+        let (is_slice, min_length, parts) = self.slice_elems(p, elems, rest, ty)?;
+        if is_slice {
+            let usize_ty = self.find_ty(PNode::Uint(UintTy::Usize), At::Pat(p))?;
+            let len_p = self.scratch(e, usize_ty);
+            self.b.assign(len_p, Value::Len(place), span);
+            if rest.is_some() {
+                if min_length > 0 {
+                    let bool_ty = self.bool_ty(At::Pat(p))?;
+                    let min_c = self.scalar(u128::from(min_length), usize_ty);
+                    let ok_flag = self.scratch(e, bool_ty);
+                    self.b.assign(ok_flag, Value::Binary { op: BBin::Ge, lhs: Operand::Move(len_p), rhs: min_c }, span);
+                    let ok = self.b.new_block(BlockKind::Normal);
+                    let cases = self.b.cases(&[(0, fail)]);
+                    self.b.terminate(StmtKind::Switch { on: Operand::Move(ok_flag), cases, otherwise: ok }, span);
+                    self.b.start(ok);
+                }
+            } else {
+                self.switch_eq(Operand::Move(len_p), u128::from(min_length), fail, span);
+            }
+        }
+        for &(proj, sub, sub_ty) in parts.iter() {
+            if matches!(self.pat(sub)?, Pat::Wild) {
+                continue;
+            }
+            let sp = self.b.project(place, proj);
+            self.test_pat(sub, sp, sub_ty, fail, e)?;
+        }
+        Ok(())
     }
 
     /// `switch on [bits -> ok] else fail`, then `ok` open.
@@ -395,7 +578,22 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
                         work.push(fp.pat);
                     }
                 }
-                Pat::Lit(_) | Pat::NegLit(_) | Pat::Range { .. } | Pat::Slice { .. } | Pat::Or { .. } => return Ok(false),
+                Pat::Slice { elems, rest } => {
+                    let pt = self.pat_ty(q)?;
+                    match self.node(pt, At::Pat(q))? {
+                        PNode::Array(..) => work.extend_from_slice(self.pats_in(elems, q)?),
+                        PNode::Slice(_) => {
+                            let subs = self.pats_in(elems, q)?;
+                            if subs.len() == 1 && rest == Some(0) {
+                                work.push(subs[0]);
+                            } else {
+                                return Ok(false);
+                            }
+                        }
+                        _ => return Ok(false),
+                    }
+                }
+                Pat::Lit(_) | Pat::NegLit(_) | Pat::Range { .. } | Pat::Or { .. } => return Ok(false),
             }
         }
         Ok(true)
@@ -519,8 +717,23 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
                 }
                 Ok(())
             }
-            Pat::Or { .. } => self.refuse_pat(Construct::OrPattern, p),
-            Pat::Slice { .. } => self.refuse_pat(Construct::SlicePattern, p),
+            Pat::Or { .. } => {
+                if self.pat_has_bindings(p)? {
+                    return self.refuse_pat(Construct::OrPattern, p);
+                }
+                Ok(())
+            }
+            Pat::Slice { elems, rest } => {
+                let (_, _, parts) = self.slice_elems(p, elems, rest, ty)?;
+                for &(proj, sub, sub_ty) in parts.iter() {
+                    if matches!(self.pat(sub)?, Pat::Wild) {
+                        continue;
+                    }
+                    let sp = self.b.project(place, proj);
+                    self.bind_pat(sub, sp, sub_ty, out)?;
+                }
+                Ok(())
+            }
         }
     }
 
