@@ -612,7 +612,7 @@ pub const HOME_IGNORE: &str = ".blaze/.gitignore";
 pub const HOME_IGNORE_TEXT: &[u8] = b"*\n";
 /// git's entry in the checkout's root: a directory in a clone, a file (`gitdir: ...`) in a
 /// worktree or a submodule. Not listed, whichever it is.
-const GIT: &str = ".git";
+pub(crate) const GIT: &str = ".git";
 /// The tag cargo writes in its build directory in the checkout's root
 /// (`Workspace::default_target_dir`, the root joined with `target`): a `target` holding it whose
 /// first bytes are the Cache Directory Tagging signature is cargo's, no package's, and not

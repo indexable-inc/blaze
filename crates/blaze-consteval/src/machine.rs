@@ -1964,6 +1964,20 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
                 let (size, align) = self.size_align(t)?;
                 s(if i == Intrinsic::SizeOf { u128::from(size) } else { 1u128 << align })
             }
+            Intrinsic::VariantCount => {
+                let t = t0.ok_or(malformed("`variant_count` with no type"))?;
+                let n = match self.ground.view().node(t).map_err(|_| malformed("`variant_count` type"))? {
+                    PNode::Adt(key, _) => {
+                        let adt = self.world.adt(key).ok_or(Stop::Refused(Refusal::Missing { what: "ADT definition", item: key }))?;
+                        match adt.kind {
+                            blaze_typeck::AdtKind::Enum => adt.variants.len() as u128,
+                            blaze_typeck::AdtKind::Struct | blaze_typeck::AdtKind::Union => 0,
+                        }
+                    }
+                    _ => 0,
+                };
+                s(n)
+            }
             // `transmute_unchecked` is `transmute` without the compile-time size check (the
             // pinned core, library/core/src/intrinsics/mod.rs: different sizes are "Undefined
             // Behavior at runtime"): in a constant that is refused, so both take one arm.
