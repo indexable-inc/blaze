@@ -145,10 +145,11 @@ impl<A: Allocator> Pass<'_, '_, A> {
         let from = 16 + slot.at;
         let from = i32::try_from(from).map_err(|_| EmitError::TooLarge { what: "a stacked parameter's offset" })?;
         if bits == 128 {
+            let off = self.cell_of(inst);
             self.mem(true, Size::X, X9, FP, from);
-            self.st_sp(X9, inst as u32 * 16);
+            self.st_sp(X9, off);
             self.mem(true, Size::X, X9, FP, from + 8);
-            self.st_sp(X9, inst as u32 * 16 + 8);
+            self.st_sp(X9, off + 8);
             return Ok(());
         }
         self.mem(true, size_of_bytes(slot.bytes), X9, FP, from);
@@ -204,7 +205,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
                 self.st_sp_sized(Size::X, X9, at);
                 continue;
             }
-            let cell = arg.value.0 * 16 + area;
+            let cell = self.cell_of(arg.value.index()) + area;
             if bytes == 16 {
                 self.ld_sp(X9, cell);
                 self.st_sp_sized(Size::X, X9, at);

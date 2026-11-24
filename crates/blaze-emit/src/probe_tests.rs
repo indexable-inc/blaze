@@ -136,15 +136,15 @@ fn walk(code: &[u8], entry: u64) -> Walk {
 /// Prints "a 1 MiB frame touches each 4096 bytes".
 #[test]
 fn a_1_mib_frame_touches_each_4096_bytes() {
-    // 4064: frame 4080, 16 + 4080 = 4096, at the bound: no probe.
-    let code = emitted(framed(4064).view(), &[]).expect("emits");
+    // 4080: frame 4080 (`ret` takes 0 cell bytes), 16 + 4080 = 4096, at the bound: no probe.
+    let code = emitted(framed(4080).view(), &[]).expect("emits");
     let bytes = &code.bytes;
     assert_eq!(word(bytes, FRAME_AT), enc::sub_imm(SP, SP, 0, true), "a 4080-byte frame keeps its first `sub`");
     assert_eq!(word(bytes, FRAME_AT + 4), enc::sub_imm(SP, SP, 4080, false), "a 4080-byte frame keeps its second `sub`");
 
     let entry: u64 = 1 << 40;
-    for slot in [4096u32, 8176, (1 << 20) - 16, 1 << 20] {
-        let frame = (16 + u64::from(slot)).next_multiple_of(16);
+    for slot in [4096u32, 8192, (1 << 20) - 16, 1 << 20] {
+        let frame = u64::from(slot).next_multiple_of(16);
         let code = emitted(framed(slot).view(), &[]).expect("emits");
         let bytes = &code.bytes;
         let first = word(bytes, FRAME_AT);

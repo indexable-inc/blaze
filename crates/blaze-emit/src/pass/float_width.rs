@@ -139,7 +139,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
                 self.put(enc::umov_h0(X9, v));
                 self.st(X9, inst);
             }
-            FloatWidth::Quad => self.q_cell(false, v, inst as u32 * 16),
+            FloatWidth::Quad => self.q_cell(false, v, self.cell_of(inst)),
         }
     }
 
@@ -151,7 +151,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
                 self.ld(X9, value);
                 self.put(enc::fmov_to_s(v, X9));
             }
-            FloatWidth::Quad => self.q_cell(true, v, value.0 * 16),
+            FloatWidth::Quad => self.q_cell(true, v, self.cell_of(value.index())),
         }
     }
 

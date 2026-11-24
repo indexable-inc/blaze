@@ -2024,4 +2024,306 @@ mod std_readiness_tests {
         assert_eq!(f(full_case ^ 1), 99);
         assert_eq!(f(high_case | 1), 99);
     }
+
+    /// A function whose live stack slots exceed 32 KiB AND simultaneously spills SSA values must
+    /// still emit natively on `Sota` (placing spill slots before local slots so `max_spill_slots`
+    /// never drops to 0) and execute with exact results.
+    #[test]
+    fn sota_large_live_slot_frame_places_spills_first_and_runs() {
+        let alloc = test_alloc();
+        let func = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            // 40 KiB live stack slot (> 32 KiB scaled-imm12 threshold!).
+            let big = b.slot(40_960, 4, blaze_lir::func::SlotKind::Named);
+            let p = b.slot_addr(big);
+            b.store(Flags::NONE, x, p, 0, blaze_lir::builder::MemAttrs::aligned(3));
+            b.store(Flags::NONE, x, p, 40_952, blaze_lir::builder::MemAttrs::aligned(3));
+            // Create 32 simultaneously live values to force GPR spills alongside the 40 KiB slot.
+            let mut live = [x; 32];
+            for (i, slot_v) in live.iter_mut().enumerate() {
+                let c = b.iconst(Ty::I64, (i as u128) + 3);
+                let v = b.binary(Op::Mul, Flags::NONE, x, c);
+                let w = b.binary(Op::Add, Flags::NONE, v, c);
+                *slot_v = w;
+            }
+            let first = b.load(Ty::I64, Flags::NONE, p, 0, blaze_lir::builder::MemAttrs::aligned(3));
+            let last = b.load(Ty::I64, Flags::NONE, p, 40_952, blaze_lir::builder::MemAttrs::aligned(3));
+            let mut acc = b.binary(Op::Add, Flags::NONE, first, last);
+            for &v in live.iter() {
+                acc = b.binary(Op::Add, Flags::NONE, acc, v);
+            }
+            b.ret(&[acc]);
+            b.finish_checked().unwrap()
+        };
+
+        let em = Sota::standalone()
+            .emit(verify(func.view()).unwrap(), &NoNames, MAC_ARM64, alloc)
+            .expect("Sota must emit >32 KiB slot frame with spills natively");
+        let (ex, _k) = load_exec_with_syms(em, &[]);
+        let f: extern "C" fn(u64) -> u64 = unsafe { ex.as_fn() };
+        let x = 7u64;
+        let expected: u64 = x * 2 + (0..32u64).map(|i| x * (i + 3) + (i + 3)).sum::<u64>();
+        assert_eq!(f(x), expected);
+    }
+
+    /// Linear-scan cell coloring (pass/frame.rs) compacts a 25,000+-instruction function from a
+    /// >400 KiB frame down to <=128 bytes while preserving exact execution semantics on Reference.
+    #[test]
+    fn cell_coloring_compacts_large_function_frame_and_runs() {
+        let alloc = test_alloc();
+        let func = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let mut acc = b.param(Ty::I64);
+            let slot = b.slot(8, 3, SlotKind::Temp);
+            for i in 0..5_000u128 {
+                let p = b.slot_addr(slot);
+                let k = b.iconst(Ty::I64, (i & 7) + 1);
+                acc = b.binary(Op::Add, Flags::NONE, acc, k);
+                b.store(Flags::NONE, acc, p, 0, MemAttrs::aligned(3));
+                let reloaded = b.load(Ty::I64, Flags::NONE, p, 0, MemAttrs::aligned(3));
+                acc = b.binary(Op::Xor, Flags::NONE, reloaded, k);
+            }
+            b.slot_dead(slot);
+            b.ret(&[acc]);
+            b.finish_checked().unwrap()
+        };
+
+        let cells = crate::pass::frame::layout_cells(func.view(), alloc).expect("cells");
+        assert!(
+            cells.end <= 128,
+            "25,000+ sequential instructions should compact to <= 128 B of cells, got {} B",
+            cells.end
+        );
+        let code = crate::tests::emitted(func.view(), &[]).expect("emits");
+        // Prologue frame adjustment at bytes 8..16 must be inline `sub sp` (no stack-probe branch!).
+        let w0 = u32::from_le_bytes(code.bytes[8..12].try_into().unwrap());
+        assert_eq!(w0 & 0xff80_0000, 0xd100_0000, "compact frame uses inline `sub sp`, not probe branch: {w0:#010x}");
+        let exec = crate::tests::run::place(&code, |_: crate::Fixup| 0);
+        // SAFETY: `func` has signature `extern "C" fn(u64) -> u64`.
+        let got = unsafe { exec.as_fn::<extern "C" fn(u64) -> u64>() }(42);
+        let mut want = 42u64;
+        for i in 0..5_000u64 {
+            let k = (i & 7) + 1;
+            want = want.wrapping_add(k) ^ k;
+        }
+        assert_eq!(got, want);
+    }
+
+    /// Stack-slot lifetime coloring (pass/frame.rs) overlaps sequential `SlotDead`-bounded temp
+    /// slots AND slots in disjoint `if/else` arms (even without `SlotDead`), while keeping
+    /// simultaneously live slots and hoisted `SlotAddr` pointer comparisons strictly disjoint.
+    #[test]
+    fn slot_coloring_reuses_dead_and_disjoint_slots_and_preserves_live_distinctness() {
+        let alloc = test_alloc();
+        let func = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let [entry, arm_a, arm_b, done] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+            b.begin(entry);
+            let sel = b.param(Ty::I64);
+            let mut sum = b.iconst(Ty::I64, 0);
+            for i in 0..32u128 {
+                let s = b.slot(1024, 3, SlotKind::Temp);
+                let p = b.slot_addr(s);
+                let v = b.iconst(Ty::I64, i + 1);
+                b.store(Flags::NONE, v, p, 0, MemAttrs::aligned(3));
+                let got = b.load(Ty::I64, Flags::NONE, p, 0, MemAttrs::aligned(3));
+                sum = b.binary(Op::Add, Flags::NONE, sum, got);
+                b.slot_dead(s);
+            }
+            let zero = b.iconst(Ty::I64, 0);
+            let is_zero = b.icmp(IntCond::Eq, sel, zero);
+            let sa = b.slot(2048, 3, SlotKind::Temp);
+            let sb = b.slot(2048, 3, SlotKind::Temp);
+            // Hoist both `slot_addr`s into entry (mirroring egraph/LICM) without using them there.
+            let pa = b.slot_addr(sa);
+            let pb = b.slot_addr(sb);
+            b.br(Flags::NONE, is_zero, (arm_a, &[]), (arm_b, &[]));
+
+            b.begin(arm_a);
+            let va = b.iconst(Ty::I64, 100);
+            b.store(Flags::NONE, va, pa, 16, MemAttrs::aligned(3));
+            let la = b.load(Ty::I64, Flags::NONE, pa, 16, MemAttrs::aligned(3));
+            let ra = b.binary(Op::Add, Flags::NONE, sum, la);
+            b.jump((done, &[ra]));
+
+            b.begin(arm_b);
+            let vb = b.iconst(Ty::I64, 200);
+            b.store(Flags::NONE, vb, pb, 16, MemAttrs::aligned(3));
+            let lb = b.load(Ty::I64, Flags::NONE, pb, 16, MemAttrs::aligned(3));
+            let rb = b.binary(Op::Add, Flags::NONE, sum, lb);
+            b.jump((done, &[rb]));
+
+            b.begin(done);
+            let res = b.param(Ty::I64);
+            b.ret(&[res]);
+            b.finish_checked().unwrap()
+        };
+
+        let packed = crate::pass::frame::pack_slots(func.view(), 0, alloc).expect("packs");
+        assert!(
+            packed.end <= 2048,
+            "32x1KiB dead temps + 2x2KiB disjoint arms must pack into <= 2048 B, got {} B",
+            packed.end
+        );
+        let code = crate::tests::emitted(func.view(), &[]).expect("emits");
+        let exec = crate::tests::run::place(&code, |_: crate::Fixup| 0);
+        // SAFETY: `func` has signature `extern "C" fn(u64) -> u64`.
+        let f = unsafe { exec.as_fn::<extern "C" fn(u64) -> u64>() };
+        assert_eq!(f(0), 528 + 100);
+        assert_eq!(f(1), 528 + 200);
+
+        // Simultaneously live slots (including pointer equality comparison) MUST stay distinct.
+        let func2 = {
+            let mut b2 = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig2 = b2.sig(Conv::C, Variadic::No, &[], &[Param::of(Ty::I64)]);
+            b2.set_signature(sig2);
+            let e2 = b2.create_block(BlockKind::Normal);
+            b2.begin(e2);
+            let s0 = b2.slot(64, 3, SlotKind::Named);
+            let s1 = b2.slot(64, 3, SlotKind::Named);
+            let p0 = b2.slot_addr(s0);
+            let p1 = b2.slot_addr(s1);
+            let c11 = b2.iconst(Ty::I64, 11);
+            let c22 = b2.iconst(Ty::I64, 22);
+            b2.store(Flags::NONE, c11, p0, 0, MemAttrs::aligned(3));
+            b2.store(Flags::NONE, c22, p1, 0, MemAttrs::aligned(3));
+            let l0 = b2.load(Ty::I64, Flags::NONE, p0, 0, MemAttrs::aligned(3));
+            let l1 = b2.load(Ty::I64, Flags::NONE, p1, 0, MemAttrs::aligned(3));
+            let ne = b2.icmp(IntCond::Ne, p0, p1);
+            let ne64 = b2.convert(Op::Zext, Flags::NONE, Ty::I64, ne);
+            let s01 = b2.binary(Op::Add, Flags::NONE, l0, l1);
+            let out = b2.binary(Op::Add, Flags::NONE, s01, ne64);
+            b2.ret(&[out]);
+            b2.finish_checked().unwrap()
+        };
+
+        let packed2 = crate::pass::frame::pack_slots(func2.view(), 0, alloc).expect("packs");
+        assert_ne!(packed2.slot_at[0], packed2.slot_at[1], "live slots must not overlap");
+        let code2 = crate::tests::emitted(func2.view(), &[]).expect("emits");
+        let exec2 = crate::tests::run::place(&code2, |_: crate::Fixup| 0);
+        // SAFETY: `func2` has signature `extern "C" fn() -> u64`.
+        assert_eq!(unsafe { exec2.as_fn::<extern "C" fn() -> u64>() }(), 11 + 22 + 1);
+    }
+
+    /// Cell coloring preserves cross-block values live across a loop back-edge and handles parallel
+    /// parameter swaps `(a, b) -> (b, a)` cleanly.
+    #[test]
+    fn cell_coloring_handles_loops_and_param_swaps() {
+        let alloc = test_alloc();
+        let func = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let [entry, header, body, exit] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+
+            b.begin(entry);
+            let n = b.param(Ty::I64);
+            let a0 = b.iconst(Ty::I64, 1);
+            let b0 = b.iconst(Ty::I64, 2);
+            let bonus = b.iconst(Ty::I64, 1000);
+            b.jump((header, &[n, a0, b0]));
+
+            b.begin(header);
+            let rem = b.param(Ty::I64);
+            let pa = b.param(Ty::I64);
+            let pb = b.param(Ty::I64);
+            let zero = b.iconst(Ty::I64, 0);
+            let cont = b.icmp(IntCond::Ugt, rem, zero);
+            b.br(Flags::NONE, cont, (body, &[]), (exit, &[]));
+
+            b.begin(body);
+            let one = b.iconst(Ty::I64, 1);
+            let next_rem = b.binary(Op::Sub, Flags::NONE, rem, one);
+            let mut tmp = one;
+            for k in 0..64u128 {
+                let c = b.iconst(Ty::I64, k);
+                tmp = b.binary(Op::Add, Flags::NONE, tmp, c);
+            }
+            let zero_mask = b.binary(Op::Xor, Flags::NONE, tmp, tmp);
+            let next_a = b.binary(Op::Add, Flags::NONE, pb, zero_mask);
+            let next_b = b.binary(Op::Add, Flags::NONE, pa, pb);
+            b.jump((header, &[next_rem, next_a, next_b]));
+
+            b.begin(exit);
+            let ans = b.binary(Op::Add, Flags::NONE, pa, bonus);
+            b.ret(&[ans]);
+            b.finish_checked().unwrap()
+        };
+
+        let code = crate::tests::emitted(func.view(), &[]).expect("emits");
+        let exec = crate::tests::run::place(&code, |_: crate::Fixup| 0);
+        // SAFETY: `func` has signature `extern "C" fn(u64) -> u64`.
+        assert_eq!(unsafe { exec.as_fn::<extern "C" fn(u64) -> u64>() }(5), 1013);
+    }
+
+    /// Regression test: two stack slots BOTH live across a loop back-edge (without `SlotDead`)
+    /// must conflict and receive disjoint offsets even though both are set in `at_start[header]`.
+    #[test]
+    fn slot_coloring_keeps_loop_carried_live_slots_disjoint() {
+        let alloc = test_alloc();
+        let func = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let [entry, header, body, exit] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+
+            b.begin(entry);
+            let n = b.param(Ty::I64);
+            let s0 = b.slot(64, 3, SlotKind::Named);
+            let s1 = b.slot(64, 3, SlotKind::Named);
+            let p0 = b.slot_addr(s0);
+            let p1 = b.slot_addr(s1);
+            let c10 = b.iconst(Ty::I64, 10);
+            let c20 = b.iconst(Ty::I64, 20);
+            b.store(Flags::NONE, c10, p0, 0, MemAttrs::aligned(3));
+            b.store(Flags::NONE, c20, p1, 0, MemAttrs::aligned(3));
+            b.jump((header, &[n]));
+
+            b.begin(header);
+            let rem = b.param(Ty::I64);
+            let zero = b.iconst(Ty::I64, 0);
+            let cont = b.icmp(IntCond::Ugt, rem, zero);
+            b.br(Flags::NONE, cont, (body, &[]), (exit, &[]));
+
+            b.begin(body);
+            let v0 = b.load(Ty::I64, Flags::NONE, p0, 0, MemAttrs::aligned(3));
+            let v1 = b.load(Ty::I64, Flags::NONE, p1, 0, MemAttrs::aligned(3));
+            let one = b.iconst(Ty::I64, 1);
+            let two = b.iconst(Ty::I64, 2);
+            let nv0 = b.binary(Op::Add, Flags::NONE, v0, one);
+            let nv1 = b.binary(Op::Add, Flags::NONE, v1, two);
+            b.store(Flags::NONE, nv0, p0, 0, MemAttrs::aligned(3));
+            b.store(Flags::NONE, nv1, p1, 0, MemAttrs::aligned(3));
+            let next_rem = b.binary(Op::Sub, Flags::NONE, rem, one);
+            b.jump((header, &[next_rem]));
+
+            b.begin(exit);
+            let f0 = b.load(Ty::I64, Flags::NONE, p0, 0, MemAttrs::aligned(3));
+            let f1 = b.load(Ty::I64, Flags::NONE, p1, 0, MemAttrs::aligned(3));
+            let sum = b.binary(Op::Add, Flags::NONE, f0, f1);
+            b.ret(&[sum]);
+            b.finish_checked().unwrap()
+        };
+
+        let packed = crate::pass::frame::pack_slots(func.view(), 0, alloc).expect("packs");
+        assert_ne!(
+            packed.slot_at[0], packed.slot_at[1],
+            "loop-carried live slots must never share an offset"
+        );
+        let code = crate::tests::emitted(func.view(), &[]).expect("emits");
+        let exec = crate::tests::run::place(&code, |_: crate::Fixup| 0);
+        // SAFETY: `func` has signature `extern "C" fn(u64) -> u64`.
+        assert_eq!(unsafe { exec.as_fn::<extern "C" fn(u64) -> u64>() }(5), 45);
+    }
 }

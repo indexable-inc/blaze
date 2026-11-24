@@ -113,13 +113,15 @@ pub(crate) fn compute_block_order<'a>(view: &View<'_>, alloc: Alloc<'a>) -> Vec<
     }
 
     let mut is_cold: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(blocks, alloc);
-    let mut depth: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(blocks, alloc);
+    let mut depth_diff: Vec<i32, Alloc<'a>> = Vec::with_capacity_in(blocks + 1, alloc);
     for b in 0..blocks {
         is_cold.push(is_cold_block(view, b));
-        depth.push(0);
+        depth_diff.push(0);
     }
+    depth_diff.push(0);
 
-    // Estimate loop nesting depth from backward CFG edges (`target <= b`).
+    // Estimate loop nesting depth from backward CFG edges (`target <= b`) in O(B) via a
+    // difference array.
     for b in 0..blocks {
         let term = view.terminator(Block(u32_of(b)));
         match view.op(term) {
@@ -128,10 +130,11 @@ pub(crate) fn compute_block_order<'a>(view: &View<'_>, alloc: Alloc<'a>) -> Vec<
                     if let Some(&t_raw) = view.extra.get(idx(at_raw)) {
                         let t = idx(t_raw);
                         if t <= b {
-                            if let Some(slice) = depth.get_mut(t..=b) {
-                                for d in slice {
-                                    *d = d.saturating_add(1);
-                                }
+                            if let Some(s) = depth_diff.get_mut(t) {
+                                *s = s.saturating_add(1);
+                            }
+                            if let Some(e) = depth_diff.get_mut(b + 1) {
+                                *e = e.saturating_sub(1);
                             }
                         }
                     }
@@ -149,10 +152,11 @@ pub(crate) fn compute_block_order<'a>(view: &View<'_>, alloc: Alloc<'a>) -> Vec<
                             let e = idx(e_raw);
                             for succ in [t, e] {
                                 if succ <= b {
-                                    if let Some(slice) = depth.get_mut(succ..=b) {
-                                        for d in slice {
-                                            *d = d.saturating_add(1);
-                                        }
+                                    if let Some(s) = depth_diff.get_mut(succ) {
+                                        *s = s.saturating_add(1);
+                                    }
+                                    if let Some(end_slot) = depth_diff.get_mut(b + 1) {
+                                        *end_slot = end_slot.saturating_sub(1);
                                     }
                                 }
                             }
@@ -164,9 +168,24 @@ pub(crate) fn compute_block_order<'a>(view: &View<'_>, alloc: Alloc<'a>) -> Vec<
         }
     }
 
-    let mut weight: Vec<u64, Alloc<'a>> = Vec::with_capacity_in(blocks, alloc);
-    for (&cold, &d) in is_cold.iter().zip(depth.iter()) {
-        weight.push(if cold { 1 } else { 100u64 << (d.min(4) * 3) });
+    // Bucket hot blocks by clamped loop depth `0..=4` (in ascending block id order) so step 2
+    // selects the highest-weight unplaced hot seed in O(B) total instead of O(B^2).
+    let mut buckets: [Vec<usize, Alloc<'a>>; 5] = [
+        Vec::new_in(alloc),
+        Vec::new_in(alloc),
+        Vec::new_in(alloc),
+        Vec::new_in(alloc),
+        Vec::new_in(alloc),
+    ];
+    let mut cur_depth: i32 = 0;
+    for (b, &cold) in is_cold.iter().enumerate() {
+        cur_depth = cur_depth.saturating_add(depth_diff.get(b).copied().unwrap_or(0));
+        if !cold {
+            let d = usize::try_from(cur_depth.clamp(0, 4)).unwrap_or(0);
+            if let Some(bucket) = buckets.get_mut(d) {
+                bucket.push(b);
+            }
+        }
     }
 
     // Pick the single hottest outgoing successor for each hot block (ExtTSP greedy trace step).
@@ -237,23 +256,25 @@ pub(crate) fn compute_block_order<'a>(view: &View<'_>, alloc: Alloc<'a>) -> Vec<
     }
 
     // 2. Repeatedly pick the highest-weight unplaced hot block (ties broken by ascending block id)
-    //    and extend its greedy hot fallthrough chain.
-    loop {
-        let mut seed: Option<(usize, u64)> = None;
-        for (b, ((&is_p, &cold), &w)) in placed.iter().zip(is_cold.iter()).zip(weight.iter()).enumerate() {
-            if !is_p && !cold && seed.is_none_or(|(_, sw)| w > sw) {
-                seed = Some((b, w));
+    //    and extend its greedy hot fallthrough chain — O(B) total via monotonic per-depth cursors.
+    let mut cursors = [0usize; 5];
+    for d in (0..5usize).rev() {
+        let (Some(bucket), Some(cursor)) = (buckets.get(d), cursors.get_mut(d)) else { continue };
+        while let Some(&b) = bucket.get(*cursor) {
+            *cursor += 1;
+            if placed.get(b).copied().unwrap_or(true) {
+                continue;
             }
-        }
-        let Some((mut cur_b, _)) = seed else { break };
-        loop {
-            if let Some(slot) = placed.get_mut(cur_b) {
-                *slot = true;
-            }
-            order.push(cur_b);
-            match best_hot_succ(cur_b, &placed) {
-                Some(next) => cur_b = next,
-                None => break,
+            let mut cur_b = b;
+            loop {
+                if let Some(slot) = placed.get_mut(cur_b) {
+                    *slot = true;
+                }
+                order.push(cur_b);
+                match best_hot_succ(cur_b, &placed) {
+                    Some(next) => cur_b = next,
+                    None => break,
+                }
             }
         }
     }
