@@ -120,6 +120,7 @@ const TOOLCHAIN_FACT_DOMAIN: &str = "blaze-cli run ids toolchain fact 1";
 const TOOLCHAIN_BODY_DOMAIN: &str = "blaze-cli run ids toolchain body 1";
 const LOCKED_FACT_DOMAIN: &str = "blaze-cli run ids locked crate fact 1";
 const LOCKED_DIGEST_DOMAIN: &str = "blaze-cli run ids locked crate digest 1";
+pub(crate) const CHECKOUT_DEP_DIGEST_DOMAIN: &str = "blaze-cli run ids checkout dep digest 1";
 const LOCKED_BODY_DOMAIN: &str = "blaze-cli run ids locked body 1";
 const DRIVE_FACT_DOMAIN: &str = "blaze-cli run ids drive read 1";
 const DRIVE_CELL_FACT_DOMAIN: &str = "blaze-cli run ids drive cell read 1";
@@ -161,8 +162,11 @@ fn prefix_of(item: ItemKey) -> [u8; 8] {
 pub(crate) enum Place {
     /// A toolchain crate, its root in a pack on the toolchain's shelf.
     Toolchain,
-    /// Its root is in the checkout (tree 0).
+    /// A workspace member crate, its root in the checkout (tree 0).
     Checkout,
+    /// A non-member dependency whose root is in the checkout (tree 0), such as a `[patch.crates-io]`
+    /// vendor crate: no `BodyCheck` rows, keyed coarsely by its `CrateScope` and observed file digests.
+    CheckoutDep,
     /// Its root is in a fetched package's pack: the sources store's key and its files' BLAKE3.
     Fetched { source: ContentId, files: [u8; 32] },
     /// None of those: `why`.
@@ -195,8 +199,11 @@ impl<'n> CrateTable<'n> for CrateList<'n> {
         CrateGraph::name(self, at)
     }
     fn place(&self, at: usize) -> Place {
-        if self.member(at) || self.root(at).starts_with("/0/") {
+        if self.member(at) {
             return Place::Checkout;
+        }
+        if self.root(at).starts_with("/0/") {
+            return Place::CheckoutDep;
         }
         let Some(k) = tree_of(self.root(at)) else { return Place::Unplaced { why: "its root names no tree (`/<k>/...`)" } };
         let Some(tree) = self.tree(k) else { return Place::Unplaced { why: "its root's tree is not in the crate list's tree table" } };
@@ -557,6 +564,13 @@ pub(crate) trait Answer: Today {
         known: Option<(ContentId, Name)>,
         out: &mut BodyScratch<'_>,
     ) -> Result<Option<BodyFacts>, RunIdsError<'static>>;
+
+    /// The content digest of a non-member checkout crate's inputs (`CrateScope` out plus the
+    /// `WHOLE`/`DATA` digests of every file and observation its `CrateScope` row recorded), for
+    /// [`Place::CheckoutDep`]. `Ok(None)`: the command does not know `scope` today.
+    fn checkout_dep_digest(&self, _scope: Name, _alloc: Alloc<'_>) -> Result<Option<[u8; 32]>, RunIdsError<'static>> {
+        Ok(None)
+    }
 }
 
 /// The record of `name` at store key `at`, opened whole and handed to `seen` part by part, then
@@ -1749,7 +1763,7 @@ impl<'a> RunIds<'a> {
 
         // The crates' grains, and each locked crate's closure digest.
         let n = crates.len();
-        let digests = locked_digests(crates, toolchain, scoped, alloc)?;
+        let digests = locked_digests(crates, toolchain, scoped, answer, alloc)?;
         let mut rows: AVec<'a, CrateRow> = Vec::with_capacity_in(n, alloc);
         for at in 0..n {
             if scoped.is_some_and(|s| !s.allows(at)) {
@@ -1758,7 +1772,7 @@ impl<'a> RunIds<'a> {
             let key = crates.key(at);
             let grain = match crates.place(at) {
                 Place::Toolchain => CrateGrain::Toolchain,
-                Place::Fetched { .. } => {
+                Place::Fetched { .. } | Place::CheckoutDep => {
                     let read = Read { fact: locked_fact(key), digest: digests[at] };
                     facts.push(read);
                     CrateGrain::Locked(read)
@@ -2269,6 +2283,7 @@ fn locked_digests<'n, 'a, C: CrateTable<'n> + ?Sized>(
     crates: &C,
     toolchain: ToolchainId,
     scoped: Option<&crate::engine_check::ScopedUnits>,
+    answer: &dyn Answer,
     alloc: Alloc<'a>,
 ) -> Result<AVec<'a, [u8; 32]>, RunIdsError<'n>> {
     const UNSEEN: u8 = 0;
@@ -2283,53 +2298,99 @@ fn locked_digests<'n, 'a, C: CrateTable<'n> + ?Sized>(
     // (row, its dependencies pushed)
     let mut stack: AVec<'a, (usize, bool)> = Vec::new_in(alloc);
     for root in 0..n {
-        if scoped.is_some_and(|s| !s.allows(root)) || !matches!(crates.place(root), Place::Fetched { .. }) || state[root] == DONE {
+        if scoped.is_some_and(|s| !s.allows(root))
+            || !matches!(crates.place(root), Place::Fetched { .. } | Place::CheckoutDep)
+            || state.get(root).copied() == Some(DONE)
+        {
             continue;
         }
         stack.push((root, false));
         while let Some((at, expanded)) = stack.pop() {
-            if state[at] == DONE {
-                continue;
-            }
-            let Place::Fetched { source, files } = crates.place(at) else {
-                // Only a locked crate is pushed (its dependencies are checked below).
-                state[at] = DONE;
+            let Some(&at_state) = state.get(at) else {
                 continue;
             };
+            if at_state == DONE {
+                continue;
+            }
+            let place = crates.place(at);
+            if !matches!(place, Place::Fetched { .. } | Place::CheckoutDep) {
+                // Only a locked or checkout-dep crate is pushed (its dependencies are checked below).
+                if let Some(slot) = state.get_mut(at) {
+                    *slot = DONE;
+                }
+                continue;
+            }
             deps.clear();
             crates.each_dep(at, &mut |dep| deps.push(dep));
             if !expanded {
-                if state[at] == OPEN {
+                if at_state == OPEN {
                     return Err(RunIdsError::Cycle { krate: crates.name(at) });
                 }
-                state[at] = OPEN;
+                if let Some(slot) = state.get_mut(at) {
+                    *slot = OPEN;
+                }
                 stack.push((at, true));
                 for dep in deps.iter().copied() {
-                    if dep >= n {
+                    let Some(&dep_state) = state.get(dep) else {
                         return Err(RunIdsError::NoRow { krate: crates.name(at), dep });
-                    }
+                    };
                     match crates.place(dep) {
                         Place::Toolchain => {
-                            digests[dep] = toolchain.0;
-                            state[dep] = DONE;
+                            if let Some(slot) = digests.get_mut(dep) {
+                                *slot = toolchain.0;
+                            }
+                            if let Some(slot) = state.get_mut(dep) {
+                                *slot = DONE;
+                            }
                         }
                         Place::Checkout => return Err(RunIdsError::LockedReadsWorkspace { krate: crates.name(at), dep: crates.name(dep) }),
                         Place::Unplaced { why } => return Err(RunIdsError::Unplaced { krate: crates.name(dep), why }),
-                        Place::Fetched { .. } if state[dep] == OPEN => return Err(RunIdsError::Cycle { krate: crates.name(dep) }),
-                        Place::Fetched { .. } if state[dep] == UNSEEN => stack.push((dep, false)),
-                        Place::Fetched { .. } => {}
+                        Place::Fetched { .. } | Place::CheckoutDep if dep_state == OPEN => return Err(RunIdsError::Cycle { krate: crates.name(dep) }),
+                        Place::Fetched { .. } | Place::CheckoutDep if dep_state == UNSEEN => stack.push((dep, false)),
+                        Place::Fetched { .. } | Place::CheckoutDep => {}
                     }
                 }
                 continue;
             }
-            let mut h = Hasher::new(LOCKED_DIGEST_DOMAIN);
-            h.id(&crates.key(at).0).id(&source).update(&files);
-            h.update(&(deps.len() as u64).to_le_bytes());
-            for dep in deps.iter().copied() {
-                h.update(&digests[dep]);
+            let dep_count = u64::try_from(deps.len()).unwrap_or(u64::MAX).to_le_bytes();
+            let digest = match place {
+                Place::Fetched { source, files } => {
+                    let mut h = Hasher::new(LOCKED_DIGEST_DOMAIN);
+                    h.id(&crates.key(at).0).id(&source).update(&files);
+                    h.update(&dep_count);
+                    for dep in deps.iter().copied() {
+                        if let Some(dep_digest) = digests.get(dep) {
+                            h.update(dep_digest);
+                        }
+                    }
+                    h.finish().0
+                }
+                Place::CheckoutDep => {
+                    let scope = blaze_drive::key::crate_scope_name(&crates.key(at));
+                    let Some(dep_digest) = answer.checkout_dep_digest(scope, alloc)? else {
+                        return Err(RunIdsError::Unplaced {
+                            krate: crates.name(at),
+                            why: "a non-member checkout crate whose `CrateScope` inputs are not known today",
+                        });
+                    };
+                    let mut h = Hasher::new(CHECKOUT_DEP_DIGEST_DOMAIN);
+                    h.id(&crates.key(at).0).update(&dep_digest);
+                    h.update(&dep_count);
+                    for dep in deps.iter().copied() {
+                        if let Some(dep_digest) = digests.get(dep) {
+                            h.update(dep_digest);
+                        }
+                    }
+                    h.finish().0
+                }
+                _ => ABSENT.0,
+            };
+            if let Some(slot) = digests.get_mut(at) {
+                *slot = digest;
             }
-            digests[at] = h.finish().0;
-            state[at] = DONE;
+            if let Some(slot) = state.get_mut(at) {
+                *slot = DONE;
+            }
         }
     }
     Ok(digests)

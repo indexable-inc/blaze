@@ -505,6 +505,7 @@ pub fn file_asked<'n>(store: &mut Store<'n>, keys: &mut Keys) -> Result<Vec<LibK
                 lib: a.module,
                 text,
                 text_prefix: None,
+                text_inline: true,
                 container: None,
                 parent: 0,
                 own: 0,

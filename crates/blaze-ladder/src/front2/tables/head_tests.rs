@@ -1242,3 +1242,65 @@ pub fn d(v: &V<u8>) -> &u8 { &v.t }
     let kind = planted.region_gaps.get(&k).map(crate::front2::heads::RegionGap::unlaid);
     assert_eq!(kind, Some(head_record::Unlaid::Counts), "CONTROL: `d`'s refusal is not `Counts`: {:?}", planted.region_gaps.get(&k));
 }
+
+/// An ADT with RFC 3681 field defaults freezes its synthetic `const _: T = v;` heads inline and
+/// imports cleanly into a fresh store without `HeadRecordError::NoText`.
+#[test]
+fn an_adt_with_field_defaults_freezes_and_imports_inline() {
+    const APP: &str = "#![feature(default_field_values)]
+pub struct Opts {
+    pub limit: u32 = 42,
+}
+";
+    let (names, sized, frame) = world_of(APP);
+    let mut opts = None;
+    NamesSource::each_item(names, APP_AT, &mut |key, _| {
+        if NamesSource::name_of(names, key) == Some("Opts") {
+            opts = Some(key);
+        }
+    });
+    let opts = opts.expect("`Opts` in fixture");
+    let mut maker = Store::new(sized, frame, a());
+    let mut maker_keys = Keys::new();
+    maker.ensure(names, &mut maker_keys, Want::Adt(opts)).unwrap_or_else(|e| panic!("ensure `Opts`: {e}"));
+    let bytes = export(names, &maker_keys, &mut maker, Want::Adt(opts), Plant::None, a()).unwrap_or_else(|e| panic!("export `Opts`: {e}"));
+    let frozen = FrozenHead::read(&bytes).unwrap_or_else(|e| panic!("read `Opts`: {e}"));
+    let seeded = Store::new(sized, frame, a());
+    let seeded_keys = Keys::new();
+    super::head::file_frozen(names, Want::Adt(opts), frozen, &seeded, &seeded_keys, a()).unwrap_or_else(|e| panic!("file `Opts` with inline default: {e}"));
+    let defaults = seeded.field_defaults.get(&checker_of(opts)).expect("field defaults filed");
+    let dk = defaults[0].expect("first field has default key");
+    let head = seeded.fns.get(&dk).expect("synthetic default fn head filed");
+    assert!(head.text_inline, "synthetic field default must keep text_inline");
+    assert_eq!(head.text, "const _: u32 = 42;");
+}
+
+/// A type alias naming `dyn Tr` whose trait has a method returning that alias (like cranelift's
+/// `type OwnedTargetIsa = Arc<dyn TargetIsa>` with `TargetIsa::wrapped -> OwnedTargetIsa`) freezes
+/// cleanly under both freezing orders (`Alias` first and `Tr` first) without a head cycle.
+#[test]
+fn a_trait_method_returning_alias_of_dyn_self_freezes_in_either_order() {
+    const APP: &str = "pub trait Super {}
+pub type Owned<'a> = &'a dyn Isa;
+pub trait Isa: Super {
+    fn wrapped(&self) -> Owned<'_>;
+}
+";
+    let (names, sized, frame) = world_of(APP);
+    let named = |want: &str| {
+        let mut found = None;
+        NamesSource::each_item(names, APP_AT, &mut |key, _| {
+            if NamesSource::name_of(names, key) == Some(want) {
+                found = Some(key);
+            }
+        });
+        found.unwrap_or_else(|| panic!("`{want}` in fixture"))
+    };
+    let (owned, isa) = (named("Owned"), named("Isa"));
+    for order in [[Want::Head(owned), Want::Members(isa)], [Want::Members(isa), Want::Head(owned)]] {
+        let mut seeded = SeededHeads::new(SeededHeadsOpts { names, sized, pointers: crate::front2::receiver::Pointers::NOT_LOOKED_UP, frame, scratch: a(), alloc: a(), consts: None, known: None, owners: None });
+        for want in order {
+            seeded.frozen(want).unwrap_or_else(|e| panic!("order {order:?} failed on {want:?}: {e}"));
+        }
+    }
+}

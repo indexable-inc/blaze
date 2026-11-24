@@ -1141,7 +1141,7 @@ fn real_typeck_body_lower_algebra_fma_body_build_native_lir_pipeline() {
             Some(AdtFacts { copy: true, drop_impl: false, needs_drop: false, lifetimes: 0, union: false, is_enum: false, is_box: false })
         }
         fn callee(&self, _: ItemKey) -> Option<CalleeFacts> {
-            Some(CalleeFacts { writes_lifetimes: false, self_ref: false })
+            Some(CalleeFacts { writes_lifetimes: false, self_ref: false, c_variadic: false })
         }
         fn field(&self, _: ItemKey, _: u32, _: Name) -> Option<u32> { None }
         fn field_count(&self, _: ItemKey, _: u32) -> Option<u32> { None }

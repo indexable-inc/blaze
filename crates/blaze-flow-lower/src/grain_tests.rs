@@ -131,7 +131,7 @@ impl Facts for Boxed {
         Some(AdtFacts { copy: false, drop_impl: false, needs_drop: true, lifetimes: 0, union: false, is_enum: false, is_box: self.known && k == self.boxed })
     }
     fn callee(&self, _: ItemKey) -> Option<CalleeFacts> {
-        Some(CalleeFacts { writes_lifetimes: false, self_ref: false })
+        Some(CalleeFacts { writes_lifetimes: false, self_ref: false, c_variadic: false })
     }
     fn adt_variances(&self, _: ItemKey) -> Option<&[Variance]> {
         None

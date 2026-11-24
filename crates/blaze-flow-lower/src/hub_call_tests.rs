@@ -132,7 +132,7 @@ impl Facts for World {
         (k == self.w).then_some(CO)
     }
     fn callee(&self, _: ItemKey) -> Option<CalleeFacts> {
-        Some(CalleeFacts { writes_lifetimes: false, self_ref: false })
+        Some(CalleeFacts { writes_lifetimes: false, self_ref: false, c_variadic: false })
     }
     fn call_bounds(&self, _: ItemKey) -> Option<CallBounds<'_>> {
         // `fn g<T>(t: &mut T)` declares no type-outlives bound and has no trait bound on `T`:

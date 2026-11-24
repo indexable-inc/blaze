@@ -1092,6 +1092,9 @@ pub struct FnHead<'n> {
     pub text: &'n str,
     /// Bytes before the body's opening brace, or `None` when the head checks the whole item.
     pub text_prefix: Option<u32>,
+    /// True when `text` is synthesized by the front end (e.g. RFC 3681 field defaults `const _: T = v;`)
+    /// rather than borrowed from a source item in `names`, so the head record embeds the text inline.
+    pub text_inline: bool,
     pub container: Option<ItemKey>,
     pub parent: u32,
     pub own: u32,
@@ -2630,12 +2633,15 @@ enum Step {
 /// and, once a step reached its text, that text's lowering, kept until the want is made.
 pub(super) struct HeadFrame<'n> {
     want: Want,
+    /// True when this frame only computes a trait's supertraits (`trait_supers`) after
+    /// `maps.traits` is already filed, without lowering member signatures.
+    supers_only: bool,
     lowered: Option<FrameLowering<'n>>,
 }
 
 impl<'n> HeadFrame<'n> {
     pub(super) fn new(want: Want) -> HeadFrame<'n> {
-        HeadFrame { want, lowered: None }
+        HeadFrame { want, supers_only: false, lowered: None }
     }
 }
 
@@ -3215,6 +3221,7 @@ impl<'n> Store<'n> {
                 lib,
                 text,
                 text_prefix: None,
+                text_inline: true,
                 container: None,
                 parent: 0,
                 own: total_generics,
@@ -3366,6 +3373,7 @@ impl<'n> Store<'n> {
                 lib,
                 text: decl,
                 text_prefix: None,
+                text_inline: true,
                 container: None,
                 parent: 0,
                 own: total_generics,
@@ -3558,6 +3566,30 @@ impl<'n> Store<'n> {
         if self.maps.traits.contains_key(&k) { Want::Members(k) } else { Want::Head(k) }
     }
 
+    /// Three-layer need progression for traits:
+    /// 1. `Want::Head(k)` (`supers_only: false`): trait generics, defaults, assoc names, dyn_compat;
+    /// 2. `Want::Head(k)` (`supers_only: true`): supertraits + `super_projs` (without member fns);
+    /// 3. `Want::Members(k)` (`supers_only: false`): full trait predicates and member signatures.
+    /// Layer 1 vs 2 keeps `Try: FromResidual<R = <Self as Try>::Residual>` acyclic;
+    /// Layer 2 vs 3 keeps `type OwnedTargetIsa = Arc<dyn TargetIsa>` with `TargetIsa::wrapped -> OwnedTargetIsa` acyclic.
+    fn need_step(&self, k: LibKey) -> (Want, bool) {
+        if !self.maps.traits.contains_key(&k) {
+            (Want::Head(k), false)
+        } else if !self.maps.supers.contains_key(&k) {
+            (Want::Head(k), true)
+        } else {
+            (Want::Members(k), false)
+        }
+    }
+
+    fn made_step(&self, want: Want, supers_only: bool) -> bool {
+        if supers_only {
+            self.maps.supers.contains_key(&want.key())
+        } else {
+            self.made(want)
+        }
+    }
+
     /// The marks the tokens of `key`'s text `text` keep, which its head's paths resolve by
     /// (front2 item_site.rs, token-mark-F1). An item declared in a body keeps its enclosing
     /// body's marks when a macro wrote that body (locals.rs `LocalHead::marks`: bstd's `main!`
@@ -3645,29 +3677,29 @@ impl<'n> Store<'n> {
         let _cost = super::tables::cost::Cost::enter_want(self.cost, want);
         // The want made by the step before: asked again at once, it was made and its lookup
         // still fails (no progress), which is named, never looped until `MOST_STEPS`.
-        let mut just_made = None;
+        let mut just_made: Option<(Want, bool)> = None;
         for _ in 0..MOST_STEPS {
             let stepped = super::tables::cost::Cost::step_start(self.cost);
             self.more_needs.clear();
             let (top, step) = {
                 let Some(frame) = stack.last_mut() else { return Ok(()) };
                 let top = frame.want;
-                (top, self.step(names, keys, top, &mut frame.lowered)?)
+                (top, self.step(names, keys, top, frame.supers_only, &mut frame.lowered)?)
             };
             super::tables::cost::Cost::step_end(self.cost, stepped, matches!(step, Step::Need(_)));
             let more = core::mem::replace(&mut self.more_needs, Vec::new_in(Global));
-            let need = match step {
+            let (need, need_supers) = match step {
                 Step::Done => {
-                    just_made = stack.pop().map(|f| f.want);
+                    just_made = stack.pop().map(|f| (f.want, f.supers_only));
                     continue;
                 }
-                Step::Need(k) => self.need(k),
-                Step::First(w) => w,
+                Step::Need(k) => self.need_step(k),
+                Step::First(w) => (w, false),
             };
-            if just_made == Some(need) {
+            if just_made == Some((need, need_supers)) {
                 return Err(HeadError::NeedMade { need, by: top });
             }
-            if stack.iter().any(|f| f.want == need) {
+            if stack.iter().any(|f| f.want == need && f.supers_only == need_supers) {
                 return Err(HeadError::Cycle(cycle(stack)));
             }
             just_made = None;
@@ -3676,12 +3708,12 @@ impl<'n> Store<'n> {
             // stops at it alone), is left to that step.
             if matches!(step, Step::Need(_)) {
                 for k in more.iter().rev() {
-                    let w = self.need(*k);
-                    if w != need && !self.made(w) && !stack.iter().any(|s| s.want == w) {
+                    let (w, ws) = self.need_step(*k);
+                    if (w, ws) != (need, need_supers) && !self.made_step(w, ws) && !stack.iter().any(|s| s.want == w && s.supers_only == ws) {
                         noted(w);
                         match seed(self, keys, w) {
                             Ok(Seeded::Filed) => {}
-                            Ok(Seeded::Lower) => stack.push(HeadFrame { want: w, lowered: None }),
+                            Ok(Seeded::Lower) => stack.push(HeadFrame { want: w, supers_only: ws, lowered: None }),
                             Err(SeedFailed) => return Err(HeadError::Seed { need: w, by: top }),
                         }
                     }
@@ -3691,13 +3723,13 @@ impl<'n> Store<'n> {
             match seed(self, keys, need) {
                 Ok(Seeded::Filed) => {
                     // Asked again at once by `top`, the filed record did not make what it reads.
-                    just_made = Some(need);
+                    just_made = Some((need, need_supers));
                     continue;
                 }
                 Ok(Seeded::Lower) => {}
                 Err(SeedFailed) => return Err(HeadError::Seed { need, by: top }),
             }
-            stack.push(HeadFrame { want: need, lowered: None });
+            stack.push(HeadFrame { want: need, supers_only: need_supers, lowered: None });
         }
         Err(HeadError::Cycle(cycle(stack)))
     }
@@ -3727,11 +3759,11 @@ impl<'n> Store<'n> {
         Ok(lowered.insert(FrameLowering { detail, text, module, low }))
     }
 
-    fn step<S: NamesSource<'n>>(&mut self, names: S, keys: &mut Keys, want: Want, lowered: &mut Option<FrameLowering<'n>>) -> Result<Step, HeadError> {
+    fn step<S: NamesSource<'n>>(&mut self, names: S, keys: &mut Keys, want: Want, supers_only: bool, lowered: &mut Option<FrameLowering<'n>>) -> Result<Step, HeadError> {
         let key = want.key();
         let ck = checker_of(key);
         // The one test the world's answers share (front2 by_origin.rs `Store::made`).
-        let done = self.made(want);
+        let done = self.made_step(want, supers_only);
         if done {
             return Ok(Step::Done);
         }
@@ -3769,6 +3801,7 @@ impl<'n> Store<'n> {
             (Want::Head(_), ItemDetail::Struct | ItemDetail::Enum | ItemDetail::Union) => {
                 self.adt_head(names, key, module, &v)
             }
+            (Want::Head(_), ItemDetail::Trait) if supers_only => self.trait_members(names, keys, key, module, &v, true),
             (Want::Head(_), ItemDetail::Trait) => self.trait_head(names, keys, key, module, &v, text),
             (Want::Head(_), ItemDetail::TraitAlias) => self.trait_alias(names, keys, key, module, &v),
             (Want::Head(_), ItemDetail::TypeAlias) => match self.alias(names, keys, key, module, &v) {
@@ -3790,7 +3823,7 @@ impl<'n> Store<'n> {
                 if !self.maps.traits.contains_key(&key) {
                     return Ok(Step::Need(key));
                 }
-                self.trait_members(names, keys, key, module, &v)
+                self.trait_members(names, keys, key, module, &v, false)
             }
             (Want::Impl(_), ItemDetail::Impl) => self.impl_(names, keys, key, module, &v),
             // A free constant's head is its type as a fn of no inputs (the checker reads a
@@ -4789,8 +4822,10 @@ impl<'n> Store<'n> {
 
     /// A trait's predicates (its supertraits and where clauses on its generics, `Self` =
     /// `Param(0)`) and its fns' signatures, each fn's clauses its trait's plus
-    /// `Self: Trait<params>`.
-    fn trait_members<S: NamesSource<'n>>(&mut self, names: S, keys: &mut Keys, key: LibKey, module: LibKey, v: &View<'_>) -> Result<(), Why> {
+    /// `Self: Trait<params>`. When `supers_only` is true (Layer 2 of `Want::Head`), only
+    /// `maps.supers` and `maps.super_projs` are filed so a type alias naming `dyn Tr` does
+    /// not cycle on a method of `Tr` that returns that alias.
+    fn trait_members<S: NamesSource<'n>>(&mut self, names: S, keys: &mut Keys, key: LibKey, module: LibKey, v: &View<'_>, supers_only: bool) -> Result<(), Why> {
         let whole = Range::new(0, 0);
         let ck = checker_of(key);
         let mut ps = Vec::new_in(Global);
@@ -4806,22 +4841,11 @@ impl<'n> Store<'n> {
         let alloc = self.tys.alloc();
         // The trait's lifetimes by name (D148): what its clauses and its members' read.
         let scope = Scope::item(v, None, 0, alloc).map_err(Why::Regions)?;
-        self.container_scopes.insert(ck, scope.clone_in(alloc));
-        // Its members' container group, a fact of this header as the scope is: filed here too,
-        // so a trait whose head was filed from a record with no lifetime part (`Head::Trait`'s
-        // `life` `None` or refused: no `restore_container`) still numbers its members' regions
-        // (D148), never `RegionRefusal::NoContainer` for a header that is here. One the record
-        // or `trait_head` filed stands.
-        self.container_regions.insert_absent(ck, ContainerRegions::of_header(v, None, alloc)?);
         let mut preds = Preds::new_in(scope.clone_in(alloc));
         // What elaborating `T: Trait` adds: its implied clauses (`Preds::predicates_implying`:
         // the header's bounds with their associated item constraints, `where Self: ..`).
         let mut supertraits = Vec::new_in(Global);
         b.predicates_implying(&mut self.tys, &env, v, 1, Some(me), self.sized, &mut preds, &mut |c| supertraits.push(c))?;
-        Self::file_where_consts(&mut self.tys, &self.locals, &self.fns, &self.preds, ck, key, module, v, &env, &bounds, own + 1, keys, &mut preds)?;
-        let mut inherited = Vec::with_capacity_in(preds.clauses.len() + 1, Global);
-        inherited.push(PClause::Trait { trait_: ck, args: params(&mut self.tys, 0, own + 1, &cs)? });
-        inherited.extend_from_slice(&preds.clauses);
         // Before the members' signatures: `Self::Output` in `Fn::call` is a supertrait's. The
         // supertraits proper: the implied trait clauses on `Self` (an associated type's bound,
         // `<Self as Super>::A: B`, names no trait whose items `Self::` reaches).
@@ -4835,6 +4859,23 @@ impl<'n> Store<'n> {
                 supers.push((lib, args));
             }
         }
+        if supers_only {
+            let super_projs = extract_super_projs(self.tys.view(), &supertraits, self.maps.alloc);
+            self.maps.supers.insert(key, supers);
+            self.maps.super_projs.insert(key, super_projs);
+            return Ok(());
+        }
+        self.container_scopes.insert(ck, scope.clone_in(alloc));
+        // Its members' container group, a fact of this header as the scope is: filed here too,
+        // so a trait whose head was filed from a record with no lifetime part (`Head::Trait`'s
+        // `life` `None` or refused: no `restore_container`) still numbers its members' regions
+        // (D148), never `RegionRefusal::NoContainer` for a header that is here. One the record
+        // or `trait_head` filed stands.
+        self.container_regions.insert_absent(ck, ContainerRegions::of_header(v, None, alloc)?);
+        Self::file_where_consts(&mut self.tys, &self.locals, &self.fns, &self.preds, ck, key, module, v, &env, &bounds, own + 1, keys, &mut preds)?;
+        let mut inherited = Vec::with_capacity_in(preds.clauses.len() + 1, Global);
+        inherited.push(PClause::Trait { trait_: ck, args: params(&mut self.tys, 0, own + 1, &cs)? });
+        inherited.extend_from_slice(&preds.clauses);
         // A trait's `Self` is `MetaSized` unless its header states a sizedness (self_size.rs;
         // core's `Write::write_fmt` needs it for its block impl's `W: ?Sized` at `W = Self`): a
         // clause of every member's env, as `Self: Trait` is; not a supertrait (vtables).
@@ -5033,7 +5074,7 @@ impl<'n> Store<'n> {
                         let alloc = *ps.allocator();
                         let row = FnHead {
                             qualifiers: FnQualifiers::of(mv)?,
-                            lib: key, text: m.text, text_prefix: None, container: Some(ck), parent: own + 1, own: 0, declared: 0, self_param: false,
+                            lib: key, text: m.text, text_prefix: None, text_inline: false, container: Some(ck), parent: own + 1, own: 0, declared: 0, self_param: false,
                             header, c_variadic: false, legacy_const_generics: Vec::new_in(alloc), inputs: Vec::new_in(alloc), output, has_body,
                             module, params: ps.to_vec_in(alloc), consts: cs.to_vec_in(alloc), bounds: own_bounds, self_: env.self_, self_assoc: Vec::new_in(alloc),
                         };
@@ -5256,6 +5297,7 @@ impl<'n> Store<'n> {
                 text,
                 qualifiers: FnQualifiers::CONST.note_lifetimes(text),
                 text_prefix: None,
+                text_inline: true,
                 container: None,
                 parent: 0,
                 own: generics,
@@ -5767,7 +5809,7 @@ impl<'n> Store<'n> {
             let has_body = cv.head.get(head::FLAGS).copied().unwrap_or(0) & sig::HAS_BODY != 0;
             let row = FnHead {
                 qualifiers: FnQualifiers::of(cv)?,
-                lib: key, text, text_prefix: None, container: Some(ck), parent: generics, own: 0, declared: 0, self_param: false,
+                lib: key, text, text_prefix: None, text_inline: false, container: Some(ck), parent: generics, own: 0, declared: 0, self_param: false,
                 header, c_variadic: false, legacy_const_generics: Vec::new_in(Global), inputs: Vec::new_in(Global), output, has_body,
                 module: env.module, params, consts, bounds: own_bounds, self_: env.self_, self_assoc,
             };
@@ -6037,6 +6079,7 @@ impl<'n> Store<'n> {
                     text,
                     qualifiers: FnQualifiers::CONST.note_lifetimes(text),
                     text_prefix: None,
+                    text_inline: true,
                     container: None,
                     parent: 0,
                     own: 0,
@@ -6641,7 +6684,7 @@ impl<'n> Store<'n> {
             let rec_env = Env { module, params: &ps, bounds: Bounds::Done(&bounds), self_, self_assoc: &self_assoc, anon: &anon, consts: &cs, body: None };
             self.register_record_defaults(names, keys, lib, &rec_env, marks, v)?;
         }
-        self.fns.insert(key, FnHead { lib, text, text_prefix, container, parent, own, declared, self_param, header, c_variadic, qualifiers, legacy_const_generics, inputs, output, has_body, module, params: ps, consts: cs, bounds, self_, self_assoc });
+        self.fns.insert(key, FnHead { lib, text, text_prefix, text_inline: false, container, parent, own, declared, self_param, header, c_variadic, qualifiers, legacy_const_generics, inputs, output, has_body, module, params: ps, consts: cs, bounds, self_, self_assoc });
         Ok(())
     }
 }

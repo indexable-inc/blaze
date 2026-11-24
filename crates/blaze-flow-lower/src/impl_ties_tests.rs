@@ -167,7 +167,7 @@ impl Facts for Heads<'_> {
         Some(region_fixture::all_co(u32::from(self.with_lifetime.contains(&k))))
     }
     fn callee(&self, item: ItemKey) -> Option<CalleeFacts> {
-        Some(CalleeFacts { writes_lifetimes: self.writes.contains(&item), self_ref: false })
+        Some(CalleeFacts { writes_lifetimes: self.writes.contains(&item), self_ref: false, c_variadic: false })
     }
     fn shape(&self, item: ItemKey) -> Option<Shape<'_>> {
         self.shapes.iter().find(|(k, _)| *k == item).map(|(_, s)| s.shape())

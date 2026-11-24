@@ -251,7 +251,7 @@ crates/blaze-scope/src/scope_record.rs	VERSION	none
 crates/blaze-scope/src/tests_record.rs	MAGIC	none
 crates/blaze-scope/src/tests_record.rs	VERSION	none
 crates/blaze-scope/src/tree_record.rs	MAGIC	none
-crates/blaze-scope/src/tree_record.rs	VERSION	none
+crates/blaze-scope/src/tree_record.rs	VERSION	test previous_version_3_is_rejected
 crates/blaze-script/src/engine.rs	STATUS_FORMAT	not persisted: a status line's form
 crates/blaze-script/src/finding.rs	SCHEMA	none
 crates/blaze-sim/src/board.rs	MAGIC	none

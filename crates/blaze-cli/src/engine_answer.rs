@@ -1519,7 +1519,7 @@ fn save<'m, D: Driver, S: Sharing>(
     workers: core::num::NonZeroU32,
     save_base: SaveBase,
 ) -> Result<Saved, CliError> {
-    let encoded = match last {
+    let mut encoded = match last {
         Some(stored) => {
             let mut pool_err: Option<CliError> = None;
             let mut snap_err: Option<CliError> = None;
@@ -1605,6 +1605,7 @@ fn save<'m, D: Driver, S: Sharing>(
     {
         saved.pages_digest = Some(test_pages_digest(lent, &encoded, alloc, frame)?);
     }
+    encoded.puts.clear();
     let mut header_pool_err: Option<CliError> = None;
     let (headers, writes) = Headers::after_with(last.map(|base| base.headers), kept, writer, kept.answer.serial, HeadersPlant::None, |index| match last {
         Some(base) => base.headers_at(index),

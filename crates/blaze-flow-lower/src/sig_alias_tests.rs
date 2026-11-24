@@ -100,7 +100,7 @@ impl Facts for Heads {
         Some(crate::region_fixture::all_co(self.lifetimes(k)))
     }
     fn callee(&self, _: ItemKey) -> Option<CalleeFacts> {
-        Some(CalleeFacts { writes_lifetimes: false, self_ref: false })
+        Some(CalleeFacts { writes_lifetimes: false, self_ref: false, c_variadic: false })
     }
     fn field(&self, _: ItemKey, _: u32, _: Name) -> Option<u32> {
         None

@@ -253,6 +253,9 @@ pub struct CalleeFacts {
     pub writes_lifetimes: bool,
     /// The first input is `&self` or `&mut self`: elided outputs take its lifetime.
     pub self_ref: bool,
+    /// A C-variadic foreign fn (`extern "C" fn(..., ...)`): calls may pass extra trailing
+    /// arguments beyond the declared formal inputs (each carrying no lifetime slots).
+    pub c_variadic: bool,
 }
 
 /// The facts the type checker's record does not hold (flow.md section 7: the named questions).
@@ -9139,7 +9142,7 @@ mod region_record_tests {
             None
         }
         fn callee(&self, k: ItemKey) -> Option<CalleeFacts> {
-            if self.refused.contains(&k) { None } else { Some(CalleeFacts { writes_lifetimes: true, self_ref: false }) }
+            if self.refused.contains(&k) { None } else { Some(CalleeFacts { writes_lifetimes: true, self_ref: false, c_variadic: false }) }
         }
         fn field(&self, _: ItemKey, _: u32, _: Name) -> Option<u32> {
             None
@@ -9559,7 +9562,7 @@ mod region_record_tests {
                 None
             }
             fn callee(&self, _: ItemKey) -> Option<CalleeFacts> {
-                Some(CalleeFacts { writes_lifetimes: false, self_ref: false })
+                Some(CalleeFacts { writes_lifetimes: false, self_ref: false, c_variadic: false })
             }
             fn field(&self, _: ItemKey, _: u32, _: Name) -> Option<u32> {
                 None

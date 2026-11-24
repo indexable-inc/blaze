@@ -66,7 +66,16 @@ pub enum ExportCliError {
     /// Computing the program's entry roots failed.
     Roots { shown: AString<'static> },
     /// A reached workspace body did not check clean (the call/reachability gate, D151).
-    NotChecked { function: ItemKey, symbol: [u8; 32], why: NotRunnable },
+    NotChecked {
+        krate: AString<'static>,
+        function: ItemKey,
+        symbol: [u8; 32],
+        row: usize,
+        reached: usize,
+        compiled: usize,
+        cached: usize,
+        why: NotRunnable,
+    },
     /// Stepping an instance/static/TLS row in the reachability walk failed.
     Walk { symbol: [u8; 32], shown: AString<'static> },
     /// Whole-program cross-function LIR inlining and LTO emission failed.
@@ -117,10 +126,11 @@ impl fmt::Display for ExportCliError {
             ExportCliError::Native { shown } => write!(f, "blaze export: native image: {} (engine_native.rs)", shown.as_str()),
             ExportCliError::Builder { shown } => write!(f, "blaze export: code builder: {} (engine_export.rs)", shown.as_str()),
             ExportCliError::Roots { shown } => write!(f, "blaze export: program roots: {} (engine_export.rs)", shown.as_str()),
-            ExportCliError::NotChecked { function, symbol, why } => write!(
+            ExportCliError::NotChecked { krate, function, symbol, row, reached, compiled, cached, why } => write!(
                 f,
-                "blaze export: reached fn {:#x} (symbol {}) may not be exported: {why} (engine_export.rs)",
+                "blaze export: reached fn {:#x} in crate `{}` (symbol {}; row {row}/{reached}, {compiled} compiled, {cached} cached) may not be exported: {why} (engine_export.rs)",
                 function.0,
+                krate.as_str(),
                 Hex(symbol)
             ),
             ExportCliError::Walk { symbol, shown } => write!(f, "blaze export: compiling symbol {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
@@ -148,6 +158,17 @@ fn owned_str(text: &str, alloc: Alloc<'static>) -> AString<'static> {
     let mut s = String::new_in(alloc);
     s.push_str(text);
     s
+}
+
+fn crate_of_item(list: &blaze_world::crate_list::CrateList<'_>, item: ItemKey, alloc: Alloc<'static>) -> AString<'static> {
+    let b = item.0.to_be_bytes();
+    let prefix = [b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]];
+    for at in 0..blaze_world::crate_list::CrateGraph::len(list) {
+        if list.key(at).prefix() == prefix {
+            return owned_str(blaze_world::crate_list::CrateGraph::name(list, at), alloc);
+        }
+    }
+    owned_str("<unknown>", alloc)
 }
 
 fn owned_fmt(args: fmt::Arguments<'_>, frame: &Frame, alloc: Alloc<'static>) -> AString<'static> {
@@ -662,7 +683,10 @@ fn export_program<'f>(
         let tabled = walk.tabled(row);
         let symbol = walk.symbol(row);
         let kind = walk.kind(row);
-        let proof = ids.runnable(tabled).map_err(|why| box_err(ExportCliError::NotChecked { function: tabled, symbol: symbol.0, why }, heap))?;
+        let proof = ids.runnable(tabled).map_err(|why| {
+            let krate = crate_of_item(list, tabled, heap.alloc());
+            box_err(ExportCliError::NotChecked { krate, function: tabled, symbol: symbol.0, row, reached: walk.len(), compiled, cached, why }, heap)
+        })?;
         match walk.one(row, &ids, &mut codes, &builder, &builder.producer, &mut maker, &proof, &body_ids::EntryForm, MOST_WALKED, &mut scratch) {
             Ok(one) => match one.stepped {
                 Stepped::Found(key) => {
@@ -751,7 +775,10 @@ fn export_program<'f>(
         next_row += 1;
         let tabled = walk.tabled(row);
         let symbol = walk.symbol(row);
-        let proof = ids.runnable(tabled).map_err(|why| box_err(ExportCliError::NotChecked { function: tabled, symbol: symbol.0, why }, heap))?;
+        let proof = ids.runnable(tabled).map_err(|why| {
+            let krate = crate_of_item(list, tabled, heap.alloc());
+            box_err(ExportCliError::NotChecked { krate, function: tabled, symbol: symbol.0, row, reached: walk.len(), compiled, cached, why }, heap)
+        })?;
         match walk.one(row, &ids, &mut codes, &builder, &builder.producer, &mut maker, &proof, &body_ids::EntryForm, MOST_WALKED, &mut scratch) {
             Ok(one) => match one.stepped {
                 Stepped::Found(key) => {

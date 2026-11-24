@@ -319,10 +319,17 @@ pub fn import_with_opaque_origins_boxed<'n, 'a, N: NamesSource<'n>>(
     for entry in frozen.heads() {
         let rec = |error| FreezeError::Record { want, at: entry.at, error };
         let text = match entry.at { HeadAt::Fn(_) => text_of(entry.at), _ => None };
-        let head = head_record::decode_with_origins_boxed(entry.record, text, &store.tys, alloc, &mut |key, origin| {
-            origins.push((key, origin, false));
-            Ok(())
-        }).map_err(rec)?;
+        let head = head_record::decode_with_origins_boxed_inline(
+            entry.record,
+            text,
+            &store.tys,
+            alloc,
+            &mut |s| store.locals.keep_text(s),
+            &mut |key, origin| {
+                origins.push((key, origin, false));
+                Ok(())
+            },
+        ).map_err(rec)?;
         match (entry.at, &*head) {
             (HeadAt::Opaque(at), Head::Opaque { key, fn_, index, preds, .. }) if at == *key => {
                 let origin = OpaqueOrigin { want, owner: *fn_, index: *index };

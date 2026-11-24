@@ -453,6 +453,10 @@ impl<'s, 'a> Cfg<'s, 'a> {
                 None if stack.len() > base => stack.pop().expect("the stack is longer than its base"),
                 None => break,
             };
+            let content = skip_attr_trivia(content);
+            if content.is_empty() {
+                continue;
+            }
             let name = prelude_attr(head(content));
             if let Some(path) = cells_answer(head(content)) {
                 attrs.checks.push(path);
@@ -942,8 +946,50 @@ pub fn strip_attr(raw: &str) -> &str {
     s.trim()
 }
 
+/// Skips leading ASCII whitespace, `// ...` line comments, and nested `/* ... */` block
+/// comments from attribute text (the Reference, "Comments": comments are whitespace).
+fn skip_attr_trivia(text: &str) -> &str {
+    let b = text.as_bytes();
+    let mut i = 0;
+    while let Some(&c) = b.get(i) {
+        match c {
+            b' ' | b'\t' | b'\n' | b'\r' => i += 1,
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                i += 2;
+                while b.get(i).is_some_and(|&ch| ch != b'\n') {
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                let mut open = 1u32;
+                i += 2;
+                while open > 0 {
+                    match (b.get(i), b.get(i + 1)) {
+                        (Some(&b'/'), Some(&b'*')) => {
+                            open += 1;
+                            i += 2;
+                        }
+                        (Some(&b'*'), Some(&b'/')) => {
+                            open -= 1;
+                            i += 2;
+                        }
+                        (Some(_), Some(_)) => i += 1,
+                        _ => break,
+                    }
+                }
+                if open > 0 {
+                    return "";
+                }
+            }
+            _ => break,
+        }
+    }
+    text.get(i..).unwrap_or("")
+}
+
 /// The path an attribute's content starts with.
 pub fn head(content: &str) -> &str {
+    let content = skip_attr_trivia(content);
     // An expansion's text holds spaces between its tokens (`:: core :: prelude :: v1 ::
     // derive (..)`): a space continues the path only beside a `::`.
     let b = content.as_bytes();
@@ -989,6 +1035,7 @@ pub fn prelude_attr(path: &str) -> &str {
 
 /// What is inside an attribute's outer parentheses, or nothing.
 pub fn args(content: &str) -> &str {
+    let content = skip_attr_trivia(content);
     match (content.find('('), content.rfind(')')) {
         (Some(open), Some(close)) if close > open => &content[open + 1..close],
         _ => "",
@@ -1040,6 +1087,33 @@ impl<'t> Iterator for SplitTop<'t> {
             }
             match c {
                 b'"' => self.in_str = true,
+                b'/' if bytes.get(self.at) == Some(&b'/') => {
+                    self.at += 1;
+                    while bytes.get(self.at).is_some_and(|&ch| ch != b'\n') {
+                        self.at += 1;
+                    }
+                }
+                b'/' if bytes.get(self.at) == Some(&b'*') => {
+                    let mut open = 1u32;
+                    self.at += 1;
+                    while open > 0 {
+                        match (bytes.get(self.at), bytes.get(self.at + 1)) {
+                            (Some(&b'/'), Some(&b'*')) => {
+                                open += 1;
+                                self.at += 2;
+                            }
+                            (Some(&b'*'), Some(&b'/')) => {
+                                open -= 1;
+                                self.at += 2;
+                            }
+                            (Some(_), Some(_)) => self.at += 1,
+                            _ => break,
+                        }
+                    }
+                    if open > 0 {
+                        self.at = bytes.len();
+                    }
+                }
                 b'(' | b'[' | b'{' | b'<' => self.depth += 1,
                 b')' | b']' | b'}' => self.depth -= 1,
                 b'>' if at == 0 || bytes[at - 1] != b'-' => self.depth -= 1,
@@ -1411,9 +1485,13 @@ pub trait Files<'t> {
     fn outline(&self, file: u32) -> &Outline<'_>;
 }
 
-/// Whether a module is one of the tree's.
+/// Whether a module is one of the tree's, and whether its own attributes mark it `macro_use`.
 pub trait Walked {
     fn walked(&self, module: ItemKey) -> bool;
+    /// Whether the walked module carries `#![macro_use]` (or `#[macro_use]` on its declaration).
+    fn macro_use(&self, _module: ItemKey) -> bool {
+        false
+    }
 }
 
 /// One module the walk found.
@@ -1431,6 +1509,8 @@ pub struct Module<'t, 'a> {
     /// What its children's `#[path]` is relative to.
     pub path_dir: AString<'a>,
     pub no_implicit_prelude: bool,
+    /// Its outer `#[macro_use]` or inner `#![macro_use]` (for an out-of-line module file).
+    pub macro_use: bool,
     /// `krate::a::b`.
     pub path: AString<'a>,
 }
@@ -1480,6 +1560,10 @@ impl Walked for Tree<'_, '_> {
     fn walked(&self, module: ItemKey) -> bool {
         self.by_key.contains_key(&module)
     }
+
+    fn macro_use(&self, module: ItemKey) -> bool {
+        self.by_key.get(&module).and_then(|&i| self.modules.get(i)).is_some_and(|m| m.macro_use)
+    }
 }
 
 /// What [`walk`] reads of one module's own text to make its children: one row per `mod` item
@@ -1492,13 +1576,15 @@ pub struct WalkRow<'t> {
     pub inline: bool,
     /// Its `#[no_implicit_prelude]`.
     pub no_implicit_prelude: bool,
+    /// Its `#[macro_use]`.
+    pub macro_use: bool,
     /// Its `#[path]`, read.
     pub path: Option<&'t str>,
 }
 
 /// The [`WalkRow`]s of module `item` of the file (`None`: the file's own items) and, for a
-/// file's own items, its inner `#![cfg]`'s verdict and `#![no_implicit_prelude]`: what the walk
-/// read of this text alone.
+/// file's own items, its inner `#![cfg]`'s verdict, `#![no_implicit_prelude]`, and `#![macro_use]`:
+/// what the walk read of this text alone.
 pub fn walk_rows<'t, 'a: 't>(
     cfg: &Cfg<'_, '_>,
     o: &Outline<'_>,
@@ -1507,14 +1593,14 @@ pub fn walk_rows<'t, 'a: 't>(
     edition: Edition,
     out: &mut AVec<'a, WalkRow<'t>>,
     bump: Bump<'a>,
-) -> Option<(bool, bool)> {
+) -> Option<(bool, bool, bool)> {
     let alloc = bump.alloc();
     // A file whose own `#![cfg]` is false has no `mod` lines to walk ([`walk`]).
     let own = item.is_none().then(|| {
         let f = file_attrs(cfg, o, text, alloc);
-        (f.cfg_ok, f.no_implicit_prelude)
+        (f.cfg_ok, f.no_implicit_prelude, f.macro_use)
     });
-    if own.is_some_and(|(cfg_ok, _)| !cfg_ok) {
+    if own.is_some_and(|(cfg_ok, _, _)| !cfg_ok) {
         return own;
     }
     for (_, child) in o.children(item) {
@@ -1530,7 +1616,7 @@ pub fn walk_rows<'t, 'a: 't>(
                 Err(_) => continue,
             }
         }
-        out.push(WalkRow { name, inline, no_implicit_prelude: attrs.no_implicit_prelude, path: attrs.path });
+        out.push(WalkRow { name, inline, no_implicit_prelude: attrs.no_implicit_prelude, macro_use: attrs.macro_use, path: attrs.path });
     }
     own
 }
@@ -1628,6 +1714,7 @@ pub fn walk<'t, 'a: 't, F: Files<'t> + ?Sized>(
         dir: root_dir.clone_in(alloc),
         path_dir: root_dir,
         no_implicit_prelude: root_attrs.no_implicit_prelude,
+        macro_use: root_attrs.macro_use,
         path: copied(name, alloc),
     });
     // A false crate-level `#![cfg]` removes "all of the following crate contents" (the
@@ -1684,6 +1771,7 @@ pub fn walk<'t, 'a: 't, F: Files<'t> + ?Sized>(
                     dir: d.clone_in(alloc),
                     path_dir: d,
                     no_implicit_prelude: attrs.no_implicit_prelude,
+                    macro_use: attrs.macro_use,
                     path: cpath,
                 });
                 continue;
@@ -1739,6 +1827,7 @@ pub fn walk<'t, 'a: 't, F: Files<'t> + ?Sized>(
                 dir: cdir,
                 path_dir: cpdir,
                 no_implicit_prelude: attrs.no_implicit_prelude || fattrs.no_implicit_prelude,
+                macro_use: attrs.macro_use || fattrs.macro_use,
                 path: cpath,
             });
         }
@@ -2853,7 +2942,13 @@ impl<'o, 's, 't, 'a: 't, W: Walked + ?Sized> Lower<'_, 'o, 's, 't, 'a, W> {
                     return false;
                 }
                 let pos = self.next_pos();
-                self.out.decls.mods.push(ChildModDecl { name, module, vis, macro_use: attrs.macro_use, pos });
+                self.out.decls.mods.push(ChildModDecl {
+                    name,
+                    module,
+                    vis,
+                    macro_use: attrs.macro_use || self.walked.macro_use(module),
+                    pos,
+                });
             }
             ItemDetail::Use { tree } => {
                 let Some(tree) = tree else {

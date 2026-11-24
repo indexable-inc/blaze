@@ -100,7 +100,7 @@ impl Facts for AsyncFacts {
         Some(AdtFacts { copy: false, drop_impl: false, needs_drop: true, lifetimes: 0, union: false, is_enum: false, is_box: false })
     }
     fn callee(&self, _: ItemKey) -> Option<CalleeFacts> {
-        Some(CalleeFacts { writes_lifetimes: false, self_ref: false })
+        Some(CalleeFacts { writes_lifetimes: false, self_ref: false, c_variadic: false })
     }
     fn field(&self, _: ItemKey, _: u32, _: Name) -> Option<u32> {
         None

@@ -1173,7 +1173,12 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
             };
             let mut sink = Sink { b: &mut self.b, static_, dyn_ph: &mut self.dyn_bound_placeholders, drop_next: drop_first };
             let mut cx = Cx { types: &caller, sig_types: &heads, selected: &sel, owner: &who, origins: &col, out: &mut sink };
-            blaze_borrow::call(&mut cx, Callee::Fn(sig), GenericArgs { lifetimes, types: &types }, &args, dest, self.alloc)
+            let c_variadic = facts.callee(item).is_some_and(|c| c.c_variadic);
+            let call_args = match args.split_at_checked(inputs.len()) {
+                Some((fixed, rest)) if c_variadic && !rest.is_empty() && rest.iter().all(|a| a.at.count().get() == 0) => fixed,
+                _ => &args[..],
+            };
+            blaze_borrow::call(&mut cx, Callee::Fn(sig), GenericArgs { lifetimes, types: &types }, call_args, dest, self.alloc)
         };
         if let Err(r) = res {
             return self.one_refuse(item, OneRuleWhy::of(r), e);

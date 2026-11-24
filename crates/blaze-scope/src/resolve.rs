@@ -2317,6 +2317,7 @@ fn from_tree_record<'a, S: SourceTexts<'a>, P: Par>(
             dir: AString::from_str_in(m.dir, alloc),
             path_dir: AString::from_str_in(m.path_dir, alloc),
             no_implicit_prelude: m.no_implicit_prelude,
+            macro_use: m.macro_use,
             path: AString::from_str_in(m.path, alloc),
         });
     }
@@ -2467,6 +2468,7 @@ fn tree_record_of<'a>(
             dir: m.dir.as_str(),
             path_dir: m.path_dir.as_str(),
             no_implicit_prelude: m.no_implicit_prelude,
+            macro_use: m.macro_use,
             path: m.path.as_str(),
             lines,
             rows,
