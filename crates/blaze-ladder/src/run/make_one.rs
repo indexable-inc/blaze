@@ -726,6 +726,14 @@ impl MakerState {
             self.asked.insert_shift(slot, (key, at));
             return Ok(at);
         }
+        // Populate head facts first so a tuple/unit struct ctor whose ADT has not yet been
+        // visited (e.g. when callers came from the verified code cache) is registered in
+        // `ctor_of` instead of being sent to `check_one` as a body-bearing fn.
+        let head_at = program.head_row(key)?;
+        if program.ctor_of(key).is_some() {
+            self.asked.insert_shift(slot, (key, head_at));
+            return Ok(head_at);
+        }
         // The body's checked columns by the typing seam: checked again, or read (`Typing`).
         let got = typing.check_one(program, key)?;
         let at = match got {

@@ -172,6 +172,14 @@ pub fn insert<A: core::alloc::Allocator>(spans: &mut Vec<Span, A>, span: Span) -
     if span.code_lo >= span.code_hi || span.eh_len == 0 {
         return Err(RegError::Empty { code_lo: span.code_lo, code_hi: span.code_hi });
     }
+    // Fast path for monotonic bump allocation (`Region::Area`): O(1) append with zero shifting.
+    if spans.last().is_none_or(|before| before.code_hi <= span.code_lo) {
+        if spans.len() == spans.capacity() {
+            return Err(RegError::Full { cap: spans.capacity() });
+        }
+        spans.push(span);
+        return Ok(());
+    }
     let at = spans.partition_point(|other| other.code_lo < span.code_lo);
     if let Some(next) = spans.get(at)
         && next.code_lo < span.code_hi
@@ -198,10 +206,31 @@ pub fn remove<A: core::alloc::Allocator>(spans: &mut Vec<Span, A>, code_lo: u64)
     }
 }
 
+/// One incremental Left-Right edit applied to the live side and owed to the spare side.
+#[derive(Clone, Copy)]
+enum PendingEdit {
+    Add(Span),
+    Remove(u64),
+}
+
+/// How the spare side relates to the live side (owned by the one writer).
+#[derive(Clone, Copy)]
+enum SpareState {
+    /// Both sides hold identical spans.
+    Synced,
+    /// The spare side is behind the live side by one `add` or `remove` edit (replayed in O(1)
+    /// for monotonic appends instead of copying the entire table).
+    Behind(PendingEdit),
+    /// An arbitrary closure edit ran on the live side: fall back to a full slice copy once.
+    Desynced,
+}
+
 /// The placed records, read by a throw on any thread and written by one [`Writer`] (the module
 /// says how).
 pub struct Registry {
     sides: [UnsafeCell<Vec<Span, SharedAlloc<'static>>>; 2],
+    /// State of the non-live side relative to the live side; only accessed by the one writer.
+    spare_state: UnsafeCell<SpareState>,
     /// The side readers read: 0 or 1.
     current: AtomicUsize,
     /// How many readers are counted on each side.
@@ -212,11 +241,11 @@ pub struct Registry {
     cap: usize,
 }
 
-// SAFETY: the sides are written only by the one `Writer` (claimed by `writer`), and only the side
-// no reader is on (the module's protocol: a reader reads a side only after counting itself on it
-// and seeing `current` still name it, and the writer edits the side `current` does not name and
-// drains a side before its next edit of it); everything else is atomics. `Vec<Span,
-// SharedAlloc>` itself is `Send + Sync`.
+// SAFETY: the sides and `spare_state` are written only by the one `Writer` (claimed by `writer`),
+// and only the side no reader is on (the module's protocol: a reader reads a side only after
+// counting itself on it and seeing `current` still name it, and the writer edits the side
+// `current` does not name and drains a side before its next edit of it); everything else is
+// atomics. `Vec<Span, SharedAlloc>` itself is `Send + Sync`.
 unsafe impl Sync for Registry {}
 
 impl Registry {
@@ -226,6 +255,7 @@ impl Registry {
         let side = || Vec::try_with_capacity_in(cap, alloc).map_err(|_| RegError::Alloc { cap });
         Ok(Registry {
             sides: [UnsafeCell::new(side()?), UnsafeCell::new(side()?)],
+            spare_state: UnsafeCell::new(SpareState::Synced),
             current: AtomicUsize::new(0),
             readers: [AtomicUsize::new(0), AtomicUsize::new(0)],
             writer: AtomicBool::new(false),
@@ -285,9 +315,14 @@ impl Drop for Writer<'_> {
 }
 
 impl Writer<'_> {
-    /// Copies the live side to the other, applies `change` there, publishes it, and waits until
-    /// no reader is left on the side it replaced. `code_lo` names the record in a drain error.
-    fn edit<T>(&mut self, code_lo: u64, change: impl FnOnce(&mut Vec<Span, SharedAlloc<'static>>) -> Result<T, RegError>) -> Result<T, RegError> {
+    /// Brings `spare` up to date with `live`, applies `change`, flips `current`, records
+    /// `next_state` for the newly-spare side, and waits until no reader remains on `live`.
+    fn run_edit<T>(
+        &mut self,
+        code_lo: u64,
+        next_state: SpareState,
+        change: impl FnOnce(&mut Vec<Span, SharedAlloc<'static>>) -> Result<T, RegError>,
+    ) -> Result<T, RegError> {
         let registry = self.registry;
         let live = registry.current.load(Ordering::SeqCst) & 1;
         let spare = live ^ 1;
@@ -299,10 +334,26 @@ impl Writer<'_> {
         // its second load and backs off without reading. So nothing reads it, and this writer is
         // the one writer.
         let next = unsafe { &mut *registry.sides[spare].get() };
-        next.clear();
-        // Within capacity (both sides have `cap`, and `from` holds at most `cap`): no allocation.
-        next.extend_from_slice(from.as_slice());
+        // SAFETY: `spare_state` is owned exclusively by the one writer while `writer` is true.
+        let spare_state = unsafe { &mut *registry.spare_state.get() };
+        match *spare_state {
+            SpareState::Synced => {}
+            SpareState::Behind(PendingEdit::Add(span)) => {
+                // This span was already validated when applied to `live`.
+                let _ = insert(next, span);
+            }
+            SpareState::Behind(PendingEdit::Remove(prev_lo)) => {
+                let _ = remove(next, prev_lo);
+            }
+            SpareState::Desynced => {
+                next.clear();
+                // Within capacity (both sides have `cap`, and `from` holds at most `cap`): no allocation.
+                next.extend_from_slice(from.as_slice());
+            }
+        }
+        *spare_state = SpareState::Synced;
         let out = change(next)?;
+        *spare_state = next_state;
         registry.current.store(spare, Ordering::SeqCst);
         let mut spins = 0u32;
         while registry.readers[live].load(Ordering::SeqCst) != 0 {
@@ -315,6 +366,12 @@ impl Writer<'_> {
         Ok(out)
     }
 
+    /// Applies an arbitrary closure edit (used by unit tests); falls back to one sync copy next.
+    #[cfg(test)]
+    fn edit<T>(&mut self, code_lo: u64, change: impl FnOnce(&mut Vec<Span, SharedAlloc<'static>>) -> Result<T, RegError>) -> Result<T, RegError> {
+        self.run_edit(code_lo, SpareState::Desynced, change)
+    }
+
     /// Registers `span`: from the return, a throw through its code finds its entry.
     ///
     /// # Safety
@@ -323,7 +380,7 @@ impl Writer<'_> {
     /// are at `span.eh_at`, and they and the code stay as they are until [`Writer::remove`] of
     /// the span has returned `Ok`.
     pub unsafe fn add(&mut self, span: Span) -> Result<(), RegError> {
-        self.edit(span.code_lo, |spans| insert(spans, span))?;
+        self.run_edit(span.code_lo, SpareState::Behind(PendingEdit::Add(span)), |spans| insert(spans, span))?;
         // SAFETY: the caller's contract, passed on.
         unsafe { os_add(span) };
         Ok(())
@@ -336,7 +393,7 @@ impl Writer<'_> {
     ///
     /// No thread is, or will be, in the record's code.
     pub unsafe fn remove(&mut self, code_lo: u64) -> Result<Span, RegError> {
-        let span = self.edit(code_lo, |spans| remove(spans, code_lo))?;
+        let span = self.run_edit(code_lo, SpareState::Behind(PendingEdit::Remove(code_lo)), |spans| remove(spans, code_lo))?;
         // SAFETY: the span was in the registry, so `add` registered it, once; no thread is in
         // its code (the caller's contract).
         unsafe { os_remove(span) };

@@ -35,7 +35,7 @@ blaze-cast	40
 blaze-cc	17
 blaze-cert	14
 blaze-check	108
-blaze-cli	674
+blaze-cli	666
 blaze-code	139
 blaze-columns	2
 blaze-comptime-sys	150
@@ -76,7 +76,7 @@ blaze-keyed	677
 blaze-kit	2
 blaze-ladder	1218
 blaze-launch	174
-blaze-launch-rt	458
+blaze-launch-rt	457
 blaze-launcher	6
 blaze-lint	187
 blaze-lint-defs	21

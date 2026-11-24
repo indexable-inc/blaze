@@ -223,4 +223,47 @@ mod placed {
         drop(eh);
         println!("unwind_reg: a panic below a placed record ran its landing pad and reached catch_unwind");
     }
+
+    #[test]
+    fn incremental_spare_sync_stays_consistent_across_adds_removes_errors_and_reacquire() {
+        let heap = blaze_own::testing::heap();
+        let registry = Registry::new_in(64, heap.shared()).expect("registry");
+        let span = |base: u64, len: u64, id: u64| Span { code_lo: base, code_hi: base + len, eh_at: base + 0x1_0000, eh_len: 32, id };
+        {
+            let mut writer = registry.writer().expect("the one writer");
+            // Monotonic appends exercise the O(1) append fast path and alternating Left-Right sync.
+            for i in 0..32u64 {
+                let lo = 0x1000 + i * 0x100;
+                // SAFETY: test-only synthetic spans; this local registry is never installed into the OS unwinder.
+                unsafe { writer.add(span(lo, 0x80, i + 1)) }.expect("monotonic add");
+            }
+            // Out-of-order insert between existing spans.
+            // SAFETY: synthetic span in local registry.
+            unsafe { writer.add(span(0x1080, 0x40, 100)) }.expect("interior insert");
+            // Overlap refusal must leave both tables consistent on the next valid edit.
+            // SAFETY: synthetic span in local registry.
+            assert!(matches!(unsafe { writer.add(span(0x1090, 0x20, 101)) }, Err(super::RegError::Overlaps { .. })));
+            // Remove an interior span, then add another.
+            // SAFETY: synthetic span in local registry.
+            unsafe { writer.remove(0x1080) }.expect("remove interior");
+            // SAFETY: synthetic span in local registry.
+            unsafe { writer.add(span(0x9000, 0x80, 200)) }.expect("post-remove append");
+        }
+        // Re-acquiring the writer after dropping must resync the spare cleanly.
+        {
+            let mut writer = registry.writer().expect("re-acquired writer");
+            // SAFETY: synthetic span in local registry.
+            unsafe { writer.remove(0x1000) }.expect("remove first after re-acquire");
+            // SAFETY: synthetic span in local registry.
+            unsafe { writer.add(span(0x9100, 0x80, 201)) }.expect("append after re-acquire");
+        }
+        assert_eq!(registry.lookup(0x1000), None);
+        assert_eq!(registry.lookup(0x1080), None);
+        for i in 1..32u64 {
+            let lo = 0x1000 + i * 0x100;
+            assert_eq!(registry.lookup(lo + 4).map(|s| s.id), Some(i + 1));
+        }
+        assert_eq!(registry.lookup(0x9010).map(|s| s.id), Some(200));
+        assert_eq!(registry.lookup(0x9110).map(|s| s.id), Some(201));
+    }
 }

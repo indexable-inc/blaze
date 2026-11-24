@@ -628,7 +628,8 @@ pub(crate) fn run_tests_status(
             let builder = crate::run_parent::builder_for(unit.edition.name(), overflow, panic, producer, isa).map_err(parent)?;
             runnable.push(crate::test_drive::Suite { names, crates, builder, unit: *unit, place, native: images[at] });
         }
-        let ran = crate::test_drive::run_suites(cx, launch.fs, launch.env, launch.host, clock, rng, launch.out, launch.err, &runnable, &ids, config, launch.args, standing.lent, root, procs, heap, watch, frame);
+        let certificate = crate::start_list::Certificate::of_answer(&standing);
+        let ran = crate::test_drive::run_suites(cx, launch.fs, launch.env, launch.host, clock, rng, launch.out, launch.err, &runnable, &ids, certificate, config, launch.args, standing.lent, root, procs, heap, watch, frame);
         end_procs(cx, &maker, err, "test")?;
         ids_line = Some(ids.line(&asked, ids_ns));
         ran.map_err(|error| CliError::Test(blaze_own::Box::new_in(error, heap.alloc())))?
