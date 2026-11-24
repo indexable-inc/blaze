@@ -19,7 +19,7 @@ use super::{
     SimplifyError,
     dce::{NONE, coalesce_cfg, dead, each, filled, Item},
 };
-use crate::{Block, Func, Op, Ty, View, verify};
+use crate::{Block, BlockKind, Func, Op, Ty, View, verify};
 
 /// Telemetry returned by [`unswitch_loops`].
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
@@ -64,19 +64,450 @@ fn op_byte(op: Op) -> u8 {
     Op::ALL.iter().position(|&c| c == op).and_then(|i| u8::try_from(i).ok()).unwrap_or(0)
 }
 
+#[inline]
+fn is_pure_const(view: &View<'_>, inst: usize) -> bool {
+    matches!(view.op(inst), Op::Iconst | Op::IconstWide) && at(view.flags, inst) == 0
+}
+
+#[inline]
+fn is_pure_guard_op(op: Op) -> bool {
+    matches!(
+        op,
+        Op::Icmp
+            | Op::Fcmp
+            | Op::Iconst
+            | Op::IconstWide
+            | Op::Add
+            | Op::Sub
+            | Op::And
+            | Op::Or
+            | Op::Xor
+            | Op::Not
+            | Op::Zext
+            | Op::Sext
+            | Op::Trunc
+    )
+}
+
+#[inline]
+fn is_outer_invariant(
+    view: &View<'_>,
+    val: u32,
+    in_loop: &[bool],
+    inst_block: &[u32],
+    preheader: u32,
+) -> bool {
+    let vi = to_idx(val);
+    let vb = at(inst_block, vi);
+    (!at(in_loop, to_idx(vb)) && vb <= preheader) || is_pure_const(view, vi)
+}
+
+fn for_each_use(view: &View<'_>, inst: usize, mut f: impl FnMut(u32)) {
+    each(view, inst, |item| match item {
+        Item::Value(v) => f(v),
+        Item::Edge(edge) => {
+            if let Some((start, count)) = edge.args {
+                for k in 0..count {
+                    f(at(view.extra, start + k));
+                }
+            }
+        }
+    });
+}
+
+enum UnswitchKind<A: Allocator> {
+    /// Loop-invariant `Op::Br` inside `loop_blocks`.
+    /// When `hoist_cmp` is `Some(cmp_inst)`, `cmp_inst` is a pure, flag-free `Icmp`/`Fcmp`
+    /// defined inside `loop_blocks` whose operands are outer-loop-invariant (or pure constants)
+    /// and is materialized in `preheader`.
+    InvariantBr {
+        inv_cond: u32,
+        br_inst: usize,
+        hoist_cmp: Option<usize>,
+    },
+    /// Nested inner loop whose first-iteration header guard `cond(init_args)` is
+    /// outer-loop-invariant (e.g. `0 < n` on `for q in 0..m { while lo < hi { ... } }`).
+    ///
+    /// - `L_true` (`cond(init_args)` takes `inner_body`): enters `inner_body` directly from
+    ///   `outer_entry_blk` with `init_args`, rotating `inner_header` to the bottom latch check.
+    /// - `L_false` (`cond(init_args)` takes `inner_exit`): skips `inner_blocks` completely,
+    ///   jumping straight from `outer_entry_blk` to `inner_exit` with substituted `exit_args`.
+    InnerLoopGuard {
+        outer_entry_blk: u32,
+        inner_header: u32,
+        inner_body: u32,
+        inner_exit: u32,
+        body_is_then: bool,
+        cond_inst: u32,
+        inner_blocks: Vec<u32, A>,
+        init_args: Vec<u32, A>,
+        exit_args: Vec<u32, A>,
+    },
+}
+
 struct UnswitchPlan<A: Allocator> {
     preheader: u32,
     header: u32,
     /// Blocks belonging to the natural loop (sorted ascending, `loop_blocks[0] == header`).
     loop_blocks: Vec<u32, A>,
-    /// The loop-invariant condition value tested by `br_inst`.
-    inv_cond: u32,
-    /// The `Op::Br` terminator instruction inside the loop testing `inv_cond`.
-    br_inst: usize,
+    kind: UnswitchKind<A>,
+    /// Block index defining each instruction in `view`.
+    inst_block: Vec<u32, A>,
     /// Unique external exit block (if any) that receives direct def-uses from `loop_blocks`.
     direct_exit: Option<u32>,
     /// Values defined in `loop_blocks` that are directly used outside `loop_blocks` (promoted to exit params).
     escaped_vals: Vec<u32, A>,
+}
+
+fn find_inner_loop_guard_candidate<A: Allocator + Copy>(
+    view: &View<'_>,
+    preheader: u32,
+    header: u32,
+    loop_blocks: &[u32],
+    in_loop: &[bool],
+    inst_block: &[u32],
+    preds: &[Vec<u32, A>],
+    escaped_vals: &[u32],
+    alloc: A,
+) -> Option<UnswitchKind<A>> {
+    let blocks = view.blocks();
+    let mut in_inner = filled(blocks, false, &alloc);
+
+    for &ih in loop_blocks {
+        if ih == header || view.block_kind(Block(ih)) != BlockKind::Normal {
+            continue;
+        }
+        let ih_idx = to_idx(ih);
+        let mut outside_preds = 0u32;
+        let mut outer_entry_blk = NONE;
+        let mut inner_latches: Vec<u32, A> = Vec::new_in(alloc);
+        let mut self_loop = false;
+        for &p in preds.get(ih_idx).map(Vec::as_slice).unwrap_or(&[]) {
+            if p == ih {
+                self_loop = true;
+                break;
+            } else if p < ih {
+                outside_preds += 1;
+                outer_entry_blk = p;
+            } else {
+                inner_latches.push(p);
+            }
+        }
+        if self_loop
+            || outside_preds != 1
+            || outer_entry_blk == NONE
+            || inner_latches.is_empty()
+            || !at(in_loop, to_idx(outer_entry_blk))
+            || !inner_latches.iter().all(|&l| at(in_loop, to_idx(l)))
+        {
+            continue;
+        }
+
+        // `outer_entry_blk` must enter `ih` via `Op::Jump(ih, init_args)`.
+        let oe_term = view.terminator(Block(outer_entry_blk));
+        if view.op(oe_term) != Op::Jump {
+            continue;
+        }
+        let oe_at = to_idx(at(view.data, oe_term));
+        if at(view.extra, oe_at) != ih {
+            continue;
+        }
+        let ih_params = view.params(Block(ih));
+        let n_params = ih_params.len();
+        if n_params == 0 || to_idx(at(view.extra, oe_at + 1)) != n_params {
+            continue;
+        }
+        let mut init_args: Vec<u32, A> = Vec::with_capacity_in(n_params, alloc);
+        for k in 0..n_params {
+            init_args.push(at(view.extra, oe_at + 2 + k));
+        }
+
+        // Collect all blocks in the inner natural sub-loop rooted at `ih`.
+        let mut inner_blocks: Vec<u32, A> = Vec::new_in(alloc);
+        let mut work: Vec<u32, A> = Vec::new_in(alloc);
+        set_at(&mut in_inner, ih_idx, true);
+        inner_blocks.push(ih);
+        for &l in &inner_latches {
+            if !at(&in_inner, to_idx(l)) {
+                set_at(&mut in_inner, to_idx(l), true);
+                inner_blocks.push(l);
+                work.push(l);
+            }
+        }
+        let mut bad_inner = false;
+        while let Some(cur) = work.pop() {
+            for &p in preds.get(to_idx(cur)).map(Vec::as_slice).unwrap_or(&[]) {
+                if p < ih || !at(in_loop, to_idx(p)) {
+                    bad_inner = true;
+                    break;
+                }
+                if !at(&in_inner, to_idx(p)) {
+                    set_at(&mut in_inner, to_idx(p), true);
+                    inner_blocks.push(p);
+                    work.push(p);
+                }
+            }
+            if bad_inner {
+                break;
+            }
+        }
+        if bad_inner || at(&in_inner, to_idx(outer_entry_blk)) {
+            for &ib in &inner_blocks {
+                set_at(&mut in_inner, to_idx(ib), false);
+            }
+            continue;
+        }
+        inner_blocks.sort_unstable();
+
+        // Parse `ih`'s `Op::Br(cond_inst, (t_blk, t_args), (e_blk, e_args))`.
+        let ih_term = view.terminator(Block(ih));
+        if view.op(ih_term) != Op::Br {
+            for &ib in &inner_blocks {
+                set_at(&mut in_inner, to_idx(ib), false);
+            }
+            continue;
+        }
+        let hat = to_idx(at(view.data, ih_term));
+        let cond_inst = at(view.extra, hat);
+        let t_blk = at(view.extra, hat + 1);
+        let t_argc = to_idx(at(view.extra, hat + 2));
+        let e_at = hat + 3 + t_argc;
+        let e_blk = at(view.extra, e_at);
+        let e_argc = to_idx(at(view.extra, e_at + 1));
+
+        let (inner_body, inner_exit, body_is_then, body_argc, exit_args_start, exit_argc) =
+            if at(&in_inner, to_idx(t_blk)) && t_blk != ih && !at(&in_inner, to_idx(e_blk)) {
+                (t_blk, e_blk, true, t_argc, e_at + 2, e_argc)
+            } else if at(&in_inner, to_idx(e_blk)) && e_blk != ih && !at(&in_inner, to_idx(t_blk)) {
+                (e_blk, t_blk, false, e_argc, hat + 3, t_argc)
+            } else {
+                for &ib in &inner_blocks {
+                    set_at(&mut in_inner, to_idx(ib), false);
+                }
+                continue;
+            };
+
+        // `inner_body` must have `ih` as its sole predecessor and carry no original block params.
+        if body_argc != 0
+            || !view.params(Block(inner_body)).is_empty()
+            || view.block_kind(Block(inner_body)) != BlockKind::Normal
+            || preds.get(to_idx(inner_body)).map(Vec::as_slice) != Some(&[ih])
+        {
+            for &ib in &inner_blocks {
+                set_at(&mut in_inner, to_idx(ib), false);
+            }
+            continue;
+        }
+
+        // Verify `ih`'s body is tiny, pure, flag-free, uses at least one `ih` param, and
+        // depends ONLY on outer-loop-invariant values (or `ih` params whose `init_args` are
+        // outer-loop-invariant).
+        let ih_range = view.block(Block(ih));
+        let h_body_start = ih_params.end;
+        let h_body_end = ih_range.end.saturating_sub(1);
+        let cond_idx = to_idx(cond_inst);
+        if h_body_end <= h_body_start
+            || h_body_end - h_body_start > 4
+            || cond_idx < h_body_start
+            || cond_idx >= h_body_end
+        {
+            for &ib in &inner_blocks {
+                set_at(&mut in_inner, to_idx(ib), false);
+            }
+            continue;
+        }
+        let mut guard_ok = true;
+        let mut uses_ih_param = false;
+        for hi in h_body_start..h_body_end {
+            if !is_pure_guard_op(view.op(hi)) || at(view.flags, hi) != 0 {
+                guard_ok = false;
+                break;
+            }
+            for_each_use(view, hi, |v| {
+                let vi = to_idx(v);
+                if vi >= h_body_start && vi < hi {
+                    // Defined earlier inside `ih`'s guard body.
+                } else if vi >= ih_params.start && vi < ih_params.end {
+                    uses_ih_param = true;
+                    let init_v = at(&init_args, vi - ih_params.start);
+                    if !is_outer_invariant(view, init_v, in_loop, inst_block, preheader) {
+                        guard_ok = false;
+                    }
+                } else if !is_outer_invariant(view, v, in_loop, inst_block, preheader) {
+                    guard_ok = false;
+                }
+            });
+            if !guard_ok {
+                break;
+            }
+        }
+        if !guard_ok || !uses_ih_param {
+            for &ib in &inner_blocks {
+                set_at(&mut in_inner, to_idx(ib), false);
+            }
+            continue;
+        }
+
+        // Collect `exit_args` and ensure every non-`ih_param` exit arg is available at
+        // `outer_entry_blk` in `L_false` (and not a non-param instruction of `ih`).
+        let mut exit_args: Vec<u32, A> = Vec::with_capacity_in(exit_argc, alloc);
+        let mut exit_args_ok = true;
+        for k in 0..exit_argc {
+            let ea = at(view.extra, exit_args_start + k);
+            let eai = to_idx(ea);
+            let eab = at(inst_block, eai);
+            let is_ih_param = eab == ih && eai >= ih_params.start && eai < ih_params.end;
+            if !is_ih_param {
+                let ok_before_entry = (!at(in_loop, to_idx(eab)) && eab <= preheader)
+                    || (at(in_loop, to_idx(eab)) && !at(&in_inner, to_idx(eab)) && eab <= outer_entry_blk);
+                if !ok_before_entry {
+                    exit_args_ok = false;
+                    break;
+                }
+            }
+            exit_args.push(ea);
+        }
+        if !exit_args_ok {
+            for &ib in &inner_blocks {
+                set_at(&mut in_inner, to_idx(ib), false);
+            }
+            continue;
+        }
+
+        // Ensure `ih` is the sole exiting block of `inner_blocks` (no early exits from body).
+        let mut exits_ok = true;
+        for &ib in &inner_blocks {
+            if ib == ih {
+                continue;
+            }
+            let term = view.terminator(Block(ib));
+            each(view, term, |item| {
+                if let Item::Edge(edge) = item
+                    && !at(&in_inner, to_idx(edge.block))
+                {
+                    exits_ok = false;
+                }
+            });
+            if !exits_ok {
+                break;
+            }
+        }
+        // Reject if any outer-loop escaped value lives inside `inner_blocks`.
+        if exits_ok {
+            for &ev in escaped_vals {
+                if at(&in_inner, to_idx(at(inst_block, to_idx(ev)))) {
+                    exits_ok = false;
+                    break;
+                }
+            }
+        }
+        if !exits_ok {
+            for &ib in &inner_blocks {
+                set_at(&mut in_inner, to_idx(ib), false);
+            }
+            continue;
+        }
+
+        // Build exact `L_true` emission positions to guarantee def-before-use ordering and
+        // ensure no illegal escape of `inner_blocks` defs.
+        let mut pos_true = filled(blocks, NONE, &alloc);
+        let mut next_pos = 0u32;
+        for b in 0..=to_idx(preheader) {
+            set_at(&mut pos_true, b, next_pos);
+            next_pos += 1;
+        }
+        for &lb in loop_blocks {
+            if lb < ih && !at(&in_inner, to_idx(lb)) {
+                set_at(&mut pos_true, to_idx(lb), next_pos);
+                next_pos += 1;
+            }
+        }
+        set_at(&mut pos_true, to_idx(inner_body), next_pos);
+        next_pos += 1;
+        for &ib in &inner_blocks {
+            if ib != ih && ib != inner_body {
+                set_at(&mut pos_true, to_idx(ib), next_pos);
+                next_pos += 1;
+            }
+        }
+        set_at(&mut pos_true, ih_idx, next_pos);
+        next_pos += 1;
+        for &lb in loop_blocks {
+            if lb > ih && !at(&in_inner, to_idx(lb)) {
+                set_at(&mut pos_true, to_idx(lb), next_pos);
+                next_pos += 1;
+            }
+        }
+
+        let mut uses_ok = true;
+        for b in 0..blocks {
+            let bu = to_u32(b);
+            let b_in_loop = at(in_loop, b);
+            let b_in_inner = at(&in_inner, b);
+            let b_pos = at(&pos_true, b);
+            for inst in view.block(Block(bu)) {
+                for_each_use(view, inst, |v| {
+                    let vi = to_idx(v);
+                    let vb = at(inst_block, vi);
+                    let vb_idx = to_idx(vb);
+                    // Non-param instructions in `ih` must never escape `ih`.
+                    if vb == ih && vi >= h_body_start && bu != ih {
+                        uses_ok = false;
+                        return;
+                    }
+                    // Values defined in `inner_blocks` may only be used outside `inner_blocks` if
+                    // they are `ih_params` used in a post-`ih` block of `loop_blocks`.
+                    if !b_in_inner && at(&in_inner, vb_idx) {
+                        let is_ih_param = vb == ih && vi >= ih_params.start && vi < ih_params.end;
+                        if !(is_ih_param && b_in_loop && bu > ih) {
+                            uses_ok = false;
+                            return;
+                        }
+                    }
+                    // Verify def-before-use in `L_true` emission order for every instruction in `loop_blocks`.
+                    if b_in_loop {
+                        let is_ih_param = vb == ih && vi >= ih_params.start && vi < ih_params.end;
+                        if !is_ih_param {
+                            if at(in_loop, vb_idx) {
+                                let v_pos = at(&pos_true, vb_idx);
+                                if v_pos == NONE || v_pos > b_pos || (vb == bu && vi >= inst) {
+                                    uses_ok = false;
+                                }
+                            } else if vb > preheader {
+                                uses_ok = false;
+                            }
+                        }
+                    }
+                });
+                if !uses_ok {
+                    break;
+                }
+            }
+            if !uses_ok {
+                break;
+            }
+        }
+
+        for &ib in &inner_blocks {
+            set_at(&mut in_inner, to_idx(ib), false);
+        }
+        if !uses_ok {
+            continue;
+        }
+
+        return Some(UnswitchKind::InnerLoopGuard {
+            outer_entry_blk,
+            inner_header: ih,
+            inner_body,
+            inner_exit,
+            body_is_then,
+            cond_inst,
+            inner_blocks,
+            init_args,
+            exit_args,
+        });
+    }
+    None
 }
 
 fn find_unswitch_candidate<A: Allocator + Copy>(view: &View<'_>, alloc: A) -> Option<UnswitchPlan<A>> {
@@ -184,28 +615,6 @@ fn find_unswitch_candidate<A: Allocator + Copy>(view: &View<'_>, alloc: A) -> Op
             continue;
         }
 
-        // Look for an internal `Op::Br` whose condition is defined outside the loop (`<= preheader`)
-        // and whose BOTH targets are inside the loop (or at least one inside, keeping the loop cyclic).
-        let mut found_br: Option<(u32, usize)> = None;
-        for &bb in &loop_blocks {
-            let term = view.terminator(Block(bb));
-            if view.op(term) == Op::Br {
-                let idx = to_idx(at(view.data, term));
-                let cv = at(view.extra, idx);
-                let cb = at(&inst_block, to_idx(cv));
-                if !at(&in_loop, to_idx(cb)) && cb <= preheader {
-                    found_br = Some((cv, term));
-                    break;
-                }
-            }
-        }
-        let Some((inv_cond, br_inst)) = found_br else {
-            for &bb in &loop_blocks {
-                set_at(&mut in_loop, to_idx(bb), false);
-            }
-            continue;
-        };
-
         // Check if any loop-defined value is directly used outside the loop (without an exit param).
         let mut exit_blocks: Vec<u32, A> = Vec::new_in(alloc);
         for &bb in &loop_blocks {
@@ -226,9 +635,8 @@ fn find_unswitch_candidate<A: Allocator + Copy>(view: &View<'_>, alloc: A) -> Op
                 continue;
             }
             for inst in view.block(Block(to_u32(b))) {
-                each(view, inst, |item| {
-                    if let Item::Value(v) = item
-                        && at(&in_loop, to_idx(at(&inst_block, to_idx(v))))
+                for_each_use(view, inst, |v| {
+                    if at(&in_loop, to_idx(at(&inst_block, to_idx(v))))
                         && escaped_vals.scan_for(&v).is_none()
                     {
                         escaped_vals.push(v);
@@ -241,8 +649,9 @@ fn find_unswitch_candidate<A: Allocator + Copy>(view: &View<'_>, alloc: A) -> Op
         // there is a single exit block whose ONLY predecessors are inside the loop!
         let direct_exit = if escaped_vals.is_empty() {
             None
-        } else if exit_blocks.len() == 1 {
-            let ex = exit_blocks[0];
+        } else if exit_blocks.len() == 1
+            && let Some(&ex) = exit_blocks.first()
+        {
             let all_preds_in_loop = preds
                 .get(to_idx(ex))
                 .is_some_and(|ps| ps.iter().all(|&p| at(&in_loop, to_idx(p))));
@@ -261,6 +670,65 @@ fn find_unswitch_candidate<A: Allocator + Copy>(view: &View<'_>, alloc: A) -> Op
             continue;
         };
 
+        // 1. Look for an internal `Op::Br` whose condition is defined outside the loop (`<= preheader`),
+        //    or is a pure, flag-free `Op::Icmp`/`Op::Fcmp` inside the loop with invariant operands.
+        let mut found_kind: Option<UnswitchKind<A>> = None;
+        for &bb in &loop_blocks {
+            let term = view.terminator(Block(bb));
+            if view.op(term) == Op::Br {
+                let idx = to_idx(at(view.data, term));
+                let cv = at(view.extra, idx);
+                let cvi = to_idx(cv);
+                let cb = at(&inst_block, cvi);
+                if !at(&in_loop, to_idx(cb)) && cb <= preheader {
+                    found_kind = Some(UnswitchKind::InvariantBr {
+                        inv_cond: cv,
+                        br_inst: term,
+                        hoist_cmp: None,
+                    });
+                    break;
+                }
+                if matches!(view.op(cvi), Op::Icmp | Op::Fcmp) && at(view.flags, cvi) == 0 {
+                    let cat = to_idx(at(view.data, cvi));
+                    let lhs = at(view.extra, cat + 1);
+                    let rhs = at(view.extra, cat + 2);
+                    if is_outer_invariant(view, lhs, &in_loop, &inst_block, preheader)
+                        && is_outer_invariant(view, rhs, &in_loop, &inst_block, preheader)
+                    {
+                        found_kind = Some(UnswitchKind::InvariantBr {
+                            inv_cond: cv,
+                            br_inst: term,
+                            hoist_cmp: Some(cvi),
+                        });
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 2. Otherwise look for a nested inner loop whose first-iteration header guard
+        //    `cond(init_args)` is outer-loop-invariant (e.g. `0 < n` in `bsearch_batch`).
+        if found_kind.is_none() {
+            found_kind = find_inner_loop_guard_candidate(
+                view,
+                preheader,
+                header,
+                &loop_blocks,
+                &in_loop,
+                &inst_block,
+                &preds,
+                &escaped_vals,
+                alloc,
+            );
+        }
+
+        let Some(kind) = found_kind else {
+            for &bb in &loop_blocks {
+                set_at(&mut in_loop, to_idx(bb), false);
+            }
+            continue;
+        };
+
         for &bb in &loop_blocks {
             set_at(&mut in_loop, to_idx(bb), false);
         }
@@ -268,8 +736,8 @@ fn find_unswitch_candidate<A: Allocator + Copy>(view: &View<'_>, alloc: A) -> Op
             preheader,
             header,
             loop_blocks,
-            inv_cond,
-            br_inst,
+            kind,
+            inst_block,
             direct_exit,
             escaped_vals,
         });
@@ -450,8 +918,86 @@ fn emit_folded_br<A: Allocator>(
     func.locs.push(at(view.locs, br_inst));
 }
 
-/// Hoists loop-invariant branches out of natural loops (up to `max_loops` unswitches), folding the
-/// dead arm out of each specialized clone and running `dead` + `coalesce_cfg`.
+fn emit_jump_with_args<A: Allocator>(
+    target: u32,
+    args: &[u32],
+    val_map: &[u32],
+    extra_escaped: &[u32],
+    loc: u32,
+    func: &mut Func<A>,
+) {
+    let dst_at = to_u32(func.extra.len());
+    func.extra.push(target);
+    func.extra.push(to_u32(args.len() + extra_escaped.len()));
+    for &a in args {
+        func.extra.push(at(val_map, to_idx(a)));
+    }
+    for &ev in extra_escaped {
+        func.extra.push(at(val_map, to_idx(ev)));
+    }
+    func.ops.push(op_byte(Op::Jump));
+    func.flags.push(0);
+    func.tys.push(Ty::NONE.0);
+    func.data.push(dst_at);
+    func.attrs.push(0);
+    func.locs.push(loc);
+}
+
+fn emit_inner_header_br<A: Allocator>(
+    cond_new: u32,
+    body_new: u32,
+    body_params: &[u32],
+    exit_new: u32,
+    exit_args_old: &[u32],
+    body_is_then: bool,
+    val_map: &[u32],
+    extra_escaped: &[u32],
+    flags: u8,
+    loc: u32,
+    func: &mut Func<A>,
+) {
+    let br_at = to_u32(func.extra.len());
+    func.extra.push(cond_new);
+    if body_is_then {
+        func.extra.push(body_new);
+        func.extra.push(to_u32(body_params.len()));
+        for &p in body_params {
+            func.extra.push(p);
+        }
+        func.extra.push(exit_new);
+        func.extra.push(to_u32(exit_args_old.len() + extra_escaped.len()));
+        for &a in exit_args_old {
+            func.extra.push(at(val_map, to_idx(a)));
+        }
+        for &ev in extra_escaped {
+            func.extra.push(at(val_map, to_idx(ev)));
+        }
+    } else {
+        func.extra.push(exit_new);
+        func.extra.push(to_u32(exit_args_old.len() + extra_escaped.len()));
+        for &a in exit_args_old {
+            func.extra.push(at(val_map, to_idx(a)));
+        }
+        for &ev in extra_escaped {
+            func.extra.push(at(val_map, to_idx(ev)));
+        }
+        func.extra.push(body_new);
+        func.extra.push(to_u32(body_params.len()));
+        for &p in body_params {
+            func.extra.push(p);
+        }
+    }
+    func.ops.push(op_byte(Op::Br));
+    func.flags.push(flags);
+    func.tys.push(Ty::NONE.0);
+    func.data.push(br_at);
+    func.attrs.push(0);
+    func.locs.push(loc);
+}
+
+/// Hoists loop-invariant branches (and outer-loop-invariant inner-loop entry guards) out of
+/// natural loops (up to `max_loops` unswitches), folding the dead arm out of each specialized
+/// clone and running `dead` + `coalesce_cfg`.
 pub fn unswitch_loops<A: Allocator + Copy>(
     view: View<'_>,
     max_loops: u32,
@@ -472,12 +1018,54 @@ pub fn unswitch_loops<A: Allocator + Copy>(
         for &bb in &plan.loop_blocks {
             set_at(&mut in_loop, to_idx(bb), true);
         }
-        let k = plan.loop_blocks.len();
+
+        // Compute ordered block lists for `L_true` and `L_false`.
+        // For `InnerLoopGuard`, `L_true` rotates `inner_body` immediately after `< inner_header`
+        // (and places `inner_header` at the bottom of `inner_blocks` as the latch check), while
+        // `L_false` omits `inner_blocks` completely.
+        let mut l_true_blocks: Vec<u32, A> = Vec::with_capacity_in(plan.loop_blocks.len(), alloc);
+        let mut l_false_blocks: Vec<u32, A> = Vec::with_capacity_in(plan.loop_blocks.len(), alloc);
+        match &plan.kind {
+            UnswitchKind::InvariantBr { .. } => {
+                for &lb in &plan.loop_blocks {
+                    l_true_blocks.push(lb);
+                    l_false_blocks.push(lb);
+                }
+            }
+            UnswitchKind::InnerLoopGuard { inner_header, inner_body, inner_blocks, .. } => {
+                let mut in_inner = filled(blocks, false, &alloc);
+                for &ib in inner_blocks {
+                    set_at(&mut in_inner, to_idx(ib), true);
+                }
+                for &lb in &plan.loop_blocks {
+                    if lb < *inner_header && !at(&in_inner, to_idx(lb)) {
+                        l_true_blocks.push(lb);
+                    }
+                }
+                l_true_blocks.push(*inner_body);
+                for &ib in inner_blocks {
+                    if ib != *inner_header && ib != *inner_body {
+                        l_true_blocks.push(ib);
+                    }
+                }
+                l_true_blocks.push(*inner_header);
+                for &lb in &plan.loop_blocks {
+                    if lb > *inner_header && !at(&in_inner, to_idx(lb)) {
+                        l_true_blocks.push(lb);
+                    }
+                }
+                for &lb in &plan.loop_blocks {
+                    if !at(&in_inner, to_idx(lb)) {
+                        l_false_blocks.push(lb);
+                    }
+                }
+            }
+        }
 
         // New block layout:
         //   0..=preheader -> unchanged
-        //   L_true blocks (k blocks, immediately after preheader -> hot fast loop!)
-        //   L_false blocks (k blocks -> cold fallback loop!)
+        //   L_true blocks (immediately after preheader -> hot fast loop!)
+        //   L_false blocks (cold fallback loop!)
         //   remaining non-loop blocks > preheader (shifted cleanly)
         let mut blk_map_outside = filled(blocks, NONE, &alloc);
         let mut blk_map_true = filled(blocks, NONE, &alloc);
@@ -491,11 +1079,11 @@ pub fn unswitch_loops<A: Allocator + Copy>(
             set_at(&mut blk_map_false, b, next_blk);
             next_blk += 1;
         }
-        for &lb in &plan.loop_blocks {
+        for &lb in &l_true_blocks {
             set_at(&mut blk_map_true, to_idx(lb), next_blk);
             next_blk += 1;
         }
-        for &lb in &plan.loop_blocks {
+        for &lb in &l_false_blocks {
             set_at(&mut blk_map_false, to_idx(lb), next_blk);
             next_blk += 1;
         }
@@ -507,7 +1095,6 @@ pub fn unswitch_loops<A: Allocator + Copy>(
                 next_blk += 1;
             }
         }
-        let _ = k;
 
         let mut func = v.to_func_in(alloc);
         func.ops.clear();
@@ -524,37 +1111,147 @@ pub fn unswitch_loops<A: Allocator + Copy>(
         let mut val_map_true = filled(len, NONE, &alloc);
         let mut val_map_false = filled(len, NONE, &alloc);
 
-        // 1. Emit blocks 0..=preheader; rewrite `preheader`'s `Jump` into `Br(inv_cond, L_true, L_false)`.
+        // 1. Emit blocks 0..=preheader; rewrite `preheader`'s `Jump` into `Br(cond, L_true, L_false)`.
         for b in 0..=preheader_idx {
             let b_u32 = to_u32(b);
             func.block_starts.push(to_u32(func.ops.len()));
             func.block_kinds.push(at(v.block_kinds, b));
             let range = v.block(Block(b_u32));
             if b_u32 == plan.preheader {
-                let term = range.end - 1;
+                let term = range.end.saturating_sub(1);
                 for inst in range.start..term {
                     let nv = emit_remapped(&v, inst, &val_map_out, &blk_map_outside, None, &[], &mut func);
                     set_at(&mut val_map_out, inst, nv);
                     set_at(&mut val_map_true, inst, nv);
                     set_at(&mut val_map_false, inst, nv);
                 }
+
+                let (hoisted_cond, then_header_new, else_header_new, br_flags) = match &plan.kind {
+                    UnswitchKind::InvariantBr { inv_cond, br_inst, hoist_cmp } => {
+                        let cond_new = if let Some(cmp_inst) = *hoist_cmp {
+                            let mut pre_map = filled(len, NONE, &alloc);
+                            for (dst, &src) in pre_map.iter_mut().zip(val_map_out.iter()) {
+                                *dst = src;
+                            }
+                            let cat = to_idx(at(v.data, cmp_inst));
+                            for off in [1usize, 2usize] {
+                                let op_v = at(v.extra, cat + off);
+                                let op_i = to_idx(op_v);
+                                if at(&pre_map, op_i) == NONE && is_pure_const(&v, op_i) {
+                                    let c_nv = emit_remapped(
+                                        &v,
+                                        op_i,
+                                        &pre_map,
+                                        &blk_map_outside,
+                                        None,
+                                        &[],
+                                        &mut func,
+                                    );
+                                    set_at(&mut pre_map, op_i, c_nv);
+                                }
+                            }
+                            emit_remapped(&v, cmp_inst, &pre_map, &blk_map_outside, None, &[], &mut func)
+                        } else {
+                            at(&val_map_out, to_idx(*inv_cond))
+                        };
+                        (
+                            cond_new,
+                            at(&blk_map_true, to_idx(plan.header)),
+                            at(&blk_map_false, to_idx(plan.header)),
+                            at(v.flags, *br_inst),
+                        )
+                    }
+                    UnswitchKind::InnerLoopGuard {
+                        inner_header,
+                        body_is_then,
+                        cond_inst,
+                        init_args,
+                        ..
+                    } => {
+                        let mut pre_map = filled(len, NONE, &alloc);
+                        for (dst, &src) in pre_map.iter_mut().zip(val_map_out.iter()) {
+                            *dst = src;
+                        }
+                        let ih_params = v.params(Block(*inner_header));
+                        let h_body_start = ih_params.end;
+                        let h_body_end = v.block(Block(*inner_header)).end.saturating_sub(1);
+                        for (k, &arg) in init_args.iter().enumerate() {
+                            let ai = to_idx(arg);
+                            let ab = at(&plan.inst_block, ai);
+                            let mapped = if !at(&in_loop, to_idx(ab)) && ab <= plan.preheader {
+                                at(&val_map_out, ai)
+                            } else if is_pure_const(&v, ai) {
+                                let existing = at(&pre_map, ai);
+                                if existing != NONE {
+                                    existing
+                                } else {
+                                    let c_nv = emit_remapped(
+                                        &v,
+                                        ai,
+                                        &pre_map,
+                                        &blk_map_outside,
+                                        None,
+                                        &[],
+                                        &mut func,
+                                    );
+                                    set_at(&mut pre_map, ai, c_nv);
+                                    c_nv
+                                }
+                            } else {
+                                NONE
+                            };
+                            if mapped != NONE {
+                                set_at(&mut pre_map, ih_params.start + k, mapped);
+                            }
+                        }
+                        for hi in h_body_start..h_body_end {
+                            for_each_use(&v, hi, |u| {
+                                let ui = to_idx(u);
+                                if at(&pre_map, ui) == NONE && is_pure_const(&v, ui) {
+                                    let c_nv = emit_remapped(
+                                        &v,
+                                        ui,
+                                        &pre_map,
+                                        &blk_map_outside,
+                                        None,
+                                        &[],
+                                        &mut func,
+                                    );
+                                    set_at(&mut pre_map, ui, c_nv);
+                                }
+                            });
+                        }
+                        for hi in h_body_start..h_body_end {
+                            let nv = emit_remapped(&v, hi, &pre_map, &blk_map_outside, None, &[], &mut func);
+                            set_at(&mut pre_map, hi, nv);
+                        }
+                        let cond_new = at(&pre_map, to_idx(*cond_inst));
+                        let (then_hdr, else_hdr) = if *body_is_then {
+                            (at(&blk_map_true, to_idx(plan.header)), at(&blk_map_false, to_idx(plan.header)))
+                        } else {
+                            (at(&blk_map_false, to_idx(plan.header)), at(&blk_map_true, to_idx(plan.header)))
+                        };
+                        (cond_new, then_hdr, else_hdr, 0u8)
+                    }
+                };
+
                 let jat = to_idx(at(v.data, term));
                 let argc_u32 = at(v.extra, jat + 1);
                 let argc = to_idx(argc_u32);
                 let br_at = to_u32(func.extra.len());
-                func.extra.push(at(&val_map_out, to_idx(plan.inv_cond)));
-                func.extra.push(at(&blk_map_true, to_idx(plan.header)));
+                func.extra.push(hoisted_cond);
+                func.extra.push(then_header_new);
                 func.extra.push(argc_u32);
                 for a in 0..argc {
                     func.extra.push(at(&val_map_out, to_idx(at(v.extra, jat + 2 + a))));
                 }
-                func.extra.push(at(&blk_map_false, to_idx(plan.header)));
+                func.extra.push(else_header_new);
                 func.extra.push(argc_u32);
                 for a in 0..argc {
                     func.extra.push(at(&val_map_out, to_idx(at(v.extra, jat + 2 + a))));
                 }
                 func.ops.push(op_byte(Op::Br));
-                func.flags.push(at(v.flags, plan.br_inst));
+                func.flags.push(br_flags);
                 func.tys.push(Ty::NONE.0);
                 func.data.push(br_at);
                 func.attrs.push(0);
@@ -569,66 +1266,261 @@ pub fn unswitch_loops<A: Allocator + Copy>(
             }
         }
 
-        // 2. Emit `L_true` clone (folding `br_inst` -> `then`!).
-        for &lb in &plan.loop_blocks {
-            func.block_starts.push(to_u32(func.ops.len()));
-            func.block_kinds.push(at(v.block_kinds, to_idx(lb)));
-            let range = v.block(Block(lb));
-            for inst in range {
-                if inst == plan.br_inst {
-                    emit_folded_br(
-                        &v,
-                        inst,
-                        true,
-                        &val_map_true,
-                        &blk_map_true,
-                        plan.direct_exit,
-                        &plan.escaped_vals,
-                        &mut func,
-                    );
-                } else {
-                    let nv = emit_remapped(
-                        &v,
-                        inst,
-                        &val_map_true,
-                        &blk_map_true,
-                        plan.direct_exit,
-                        &plan.escaped_vals,
-                        &mut func,
-                    );
-                    set_at(&mut val_map_true, inst, nv);
+        // 2. Emit `L_true` clone.
+        match &plan.kind {
+            UnswitchKind::InvariantBr { br_inst, .. } => {
+                for &lb in &l_true_blocks {
+                    func.block_starts.push(to_u32(func.ops.len()));
+                    func.block_kinds.push(at(v.block_kinds, to_idx(lb)));
+                    let range = v.block(Block(lb));
+                    for inst in range {
+                        if inst == *br_inst {
+                            emit_folded_br(
+                                &v,
+                                inst,
+                                true,
+                                &val_map_true,
+                                &blk_map_true,
+                                plan.direct_exit,
+                                &plan.escaped_vals,
+                                &mut func,
+                            );
+                        } else {
+                            let nv = emit_remapped(
+                                &v,
+                                inst,
+                                &val_map_true,
+                                &blk_map_true,
+                                plan.direct_exit,
+                                &plan.escaped_vals,
+                                &mut func,
+                            );
+                            set_at(&mut val_map_true, inst, nv);
+                        }
+                    }
+                }
+            }
+            UnswitchKind::InnerLoopGuard {
+                outer_entry_blk,
+                inner_header,
+                inner_body,
+                inner_exit,
+                body_is_then,
+                cond_inst,
+                init_args,
+                exit_args,
+                ..
+            } => {
+                let ih_params = v.params(Block(*inner_header));
+                for &lb in &l_true_blocks {
+                    func.block_starts.push(to_u32(func.ops.len()));
+                    func.block_kinds.push(at(v.block_kinds, to_idx(lb)));
+                    let range = v.block(Block(lb));
+                    let term = range.end.saturating_sub(1);
+                    if lb == *outer_entry_blk {
+                        for inst in range.start..term {
+                            let nv = emit_remapped(
+                                &v,
+                                inst,
+                                &val_map_true,
+                                &blk_map_true,
+                                plan.direct_exit,
+                                &plan.escaped_vals,
+                                &mut func,
+                            );
+                            set_at(&mut val_map_true, inst, nv);
+                        }
+                        // Jump directly into `inner_body_true(init_args)`, skipping the first guard!
+                        emit_jump_with_args(
+                            at(&blk_map_true, to_idx(*inner_body)),
+                            init_args.as_slice(),
+                            &val_map_true,
+                            &[],
+                            at(v.locs, term),
+                            &mut func,
+                        );
+                    } else if lb == *inner_body {
+                        // Materialize `inner_header`'s params directly at the top of `inner_body_true`.
+                        for k in 0..ih_params.len() {
+                            let hp = ih_params.start + k;
+                            let p_idx = to_u32(func.ops.len());
+                            func.ops.push(op_byte(Op::Param));
+                            func.flags.push(0);
+                            func.tys.push(at(v.tys, hp));
+                            func.data.push(0);
+                            func.attrs.push(0);
+                            func.locs.push(at(v.locs, hp));
+                            set_at(&mut val_map_true, hp, p_idx);
+                        }
+                        for inst in range {
+                            let nv = emit_remapped(
+                                &v,
+                                inst,
+                                &val_map_true,
+                                &blk_map_true,
+                                plan.direct_exit,
+                                &plan.escaped_vals,
+                                &mut func,
+                            );
+                            set_at(&mut val_map_true, inst, nv);
+                        }
+                    } else if lb == *inner_header {
+                        // Rotated bottom latch check: emit fresh params, guard body, and `Br`
+                        // passing those params back to `inner_body_true` (or exiting to `inner_exit_true`).
+                        let mut ih_true_params: Vec<u32, A> = Vec::with_capacity_in(ih_params.len(), alloc);
+                        for k in 0..ih_params.len() {
+                            let hp = ih_params.start + k;
+                            let p_idx = to_u32(func.ops.len());
+                            func.ops.push(op_byte(Op::Param));
+                            func.flags.push(0);
+                            func.tys.push(at(v.tys, hp));
+                            func.data.push(0);
+                            func.attrs.push(0);
+                            func.locs.push(at(v.locs, hp));
+                            set_at(&mut val_map_true, hp, p_idx);
+                            ih_true_params.push(p_idx);
+                        }
+                        for inst in ih_params.end..term {
+                            let nv = emit_remapped(
+                                &v,
+                                inst,
+                                &val_map_true,
+                                &blk_map_true,
+                                plan.direct_exit,
+                                &plan.escaped_vals,
+                                &mut func,
+                            );
+                            set_at(&mut val_map_true, inst, nv);
+                        }
+                        let extra_esc: &[u32] = if plan.direct_exit == Some(*inner_exit) {
+                            plan.escaped_vals.as_slice()
+                        } else {
+                            &[]
+                        };
+                        emit_inner_header_br(
+                            at(&val_map_true, to_idx(*cond_inst)),
+                            at(&blk_map_true, to_idx(*inner_body)),
+                            ih_true_params.as_slice(),
+                            at(&blk_map_true, to_idx(*inner_exit)),
+                            exit_args.as_slice(),
+                            *body_is_then,
+                            &val_map_true,
+                            extra_esc,
+                            at(v.flags, term),
+                            at(v.locs, term),
+                            &mut func,
+                        );
+                    } else {
+                        for inst in range {
+                            let nv = emit_remapped(
+                                &v,
+                                inst,
+                                &val_map_true,
+                                &blk_map_true,
+                                plan.direct_exit,
+                                &plan.escaped_vals,
+                                &mut func,
+                            );
+                            set_at(&mut val_map_true, inst, nv);
+                        }
+                    }
                 }
             }
         }
 
-        // 3. Emit `L_false` clone (folding `br_inst` -> `else`!).
-        for &lb in &plan.loop_blocks {
-            func.block_starts.push(to_u32(func.ops.len()));
-            func.block_kinds.push(at(v.block_kinds, to_idx(lb)));
-            let range = v.block(Block(lb));
-            for inst in range {
-                if inst == plan.br_inst {
-                    emit_folded_br(
-                        &v,
-                        inst,
-                        false,
-                        &val_map_false,
-                        &blk_map_false,
-                        plan.direct_exit,
-                        &plan.escaped_vals,
-                        &mut func,
-                    );
-                } else {
-                    let nv = emit_remapped(
-                        &v,
-                        inst,
-                        &val_map_false,
-                        &blk_map_false,
-                        plan.direct_exit,
-                        &plan.escaped_vals,
-                        &mut func,
-                    );
-                    set_at(&mut val_map_false, inst, nv);
+        // 3. Emit `L_false` clone.
+        match &plan.kind {
+            UnswitchKind::InvariantBr { br_inst, .. } => {
+                for &lb in &l_false_blocks {
+                    func.block_starts.push(to_u32(func.ops.len()));
+                    func.block_kinds.push(at(v.block_kinds, to_idx(lb)));
+                    let range = v.block(Block(lb));
+                    for inst in range {
+                        if inst == *br_inst {
+                            emit_folded_br(
+                                &v,
+                                inst,
+                                false,
+                                &val_map_false,
+                                &blk_map_false,
+                                plan.direct_exit,
+                                &plan.escaped_vals,
+                                &mut func,
+                            );
+                        } else {
+                            let nv = emit_remapped(
+                                &v,
+                                inst,
+                                &val_map_false,
+                                &blk_map_false,
+                                plan.direct_exit,
+                                &plan.escaped_vals,
+                                &mut func,
+                            );
+                            set_at(&mut val_map_false, inst, nv);
+                        }
+                    }
+                }
+            }
+            UnswitchKind::InnerLoopGuard {
+                outer_entry_blk,
+                inner_header,
+                inner_exit,
+                init_args,
+                exit_args,
+                ..
+            } => {
+                let ih_params = v.params(Block(*inner_header));
+                for &lb in &l_false_blocks {
+                    func.block_starts.push(to_u32(func.ops.len()));
+                    func.block_kinds.push(at(v.block_kinds, to_idx(lb)));
+                    let range = v.block(Block(lb));
+                    let term = range.end.saturating_sub(1);
+                    if lb == *outer_entry_blk {
+                        for inst in range.start..term {
+                            let nv = emit_remapped(
+                                &v,
+                                inst,
+                                &val_map_false,
+                                &blk_map_false,
+                                plan.direct_exit,
+                                &plan.escaped_vals,
+                                &mut func,
+                            );
+                            set_at(&mut val_map_false, inst, nv);
+                        }
+                        // Substitute `ih_params` with mapped `init_args`, then jump straight to `inner_exit_false`!
+                        for (k, &arg) in init_args.iter().enumerate() {
+                            let mapped_arg = at(&val_map_false, to_idx(arg));
+                            set_at(&mut val_map_false, ih_params.start + k, mapped_arg);
+                        }
+                        let extra_esc: &[u32] = if plan.direct_exit == Some(*inner_exit) {
+                            plan.escaped_vals.as_slice()
+                        } else {
+                            &[]
+                        };
+                        emit_jump_with_args(
+                            at(&blk_map_false, to_idx(*inner_exit)),
+                            exit_args.as_slice(),
+                            &val_map_false,
+                            extra_esc,
+                            at(v.locs, term),
+                            &mut func,
+                        );
+                    } else {
+                        for inst in range {
+                            let nv = emit_remapped(
+                                &v,
+                                inst,
+                                &val_map_false,
+                                &blk_map_false,
+                                plan.direct_exit,
+                                &plan.escaped_vals,
+                                &mut func,
+                            );
+                            set_at(&mut val_map_false, inst, nv);
+                        }
+                    }
                 }
             }
         }
@@ -683,9 +1575,10 @@ mod tests {
     use super::*;
     use crate::{
         Flags, IntCond,
-        builder::{Builder, Full, Param, Variadic},
+        builder::{Builder, Full, MemAttrs, Param, Variadic},
         eval::{self, Outcome, Val},
-        func::{BlockKind, Conv},
+        func::{Conv, SlotKind},
+        ifconv::if_convert,
     };
 
     #[test]
@@ -738,6 +1631,253 @@ mod tests {
                     panic!("unswitched eval failed");
                 };
                 assert_eq!(a, b, "unswitch mismatch for n={nv}, mode={m}");
+            }
+        }
+    }
+
+    #[test]
+    fn unswitch_hoists_invariant_inner_guard_out_of_bsearch_batch() {
+        // Exact nested `bsearch_batch` shape:
+        //   entry -> h_q(q, sum) -> b_q -> h_bs(lo, hi) -> b_bs -> {lt_blk, ge_blk} -> h_bs
+        //   h_bs -> end_bs(found) -> h_q
+        let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let arr_slot = b.slot(16 * 8, 3, SlotKind::Temp);
+        let keys_slot = b.slot(8 * 8, 3, SlotKind::Temp);
+        let [entry, h_q, b_q, h_bs, b_bs, lt_blk, ge_blk, end_bs, exit] =
+            [(); 9].map(|_| b.create_block(BlockKind::Normal));
+
+        b.begin(entry);
+        let n = b.param(Ty::I64);
+        let m = b.param(Ty::I64);
+        let arr = b.slot_addr(arr_slot);
+        let keys = b.slot_addr(keys_slot);
+        for k in 0..16u64 {
+            let v = b.iconst(Ty::I64, u128::from(k * 7 + 3));
+            b.store(Flags::NONE, v, arr, (k * 8) as i32, MemAttrs::aligned(3));
+        }
+        let query_vals = [0u64, 3, 10, 24, 52, 73, 108, 999];
+        for (k, &qv) in query_vals.iter().enumerate() {
+            let v = b.iconst(Ty::I64, u128::from(qv));
+            b.store(Flags::NONE, v, keys, (k * 8) as i32, MemAttrs::aligned(3));
+        }
+        let zero = b.iconst(Ty::I64, 0);
+        let one = b.iconst(Ty::I64, 1);
+        let three = b.iconst(Ty::I64, 3);
+        b.jump((h_q, &[zero, zero]));
+
+        b.begin(h_q);
+        let q = b.param(Ty::I64);
+        let sum = b.param(Ty::I64);
+        let kq = b.icmp(IntCond::Ult, q, m);
+        b.br(Flags::NONE, kq, (b_q, &[]), (exit, &[sum]));
+
+        b.begin(b_q);
+        let q_off = b.binary(Op::Shl, Flags::NONE, q, three);
+        let kp = b.ptr_add(Flags::NONE, keys, q_off);
+        let key = b.load(Ty::I64, Flags::NONE, kp, 0, MemAttrs::aligned(3));
+        b.jump((h_bs, &[zero, n]));
+
+        b.begin(h_bs);
+        let lo = b.param(Ty::I64);
+        let hi = b.param(Ty::I64);
+        let kbs = b.icmp(IntCond::Ult, lo, hi);
+        b.br(Flags::NONE, kbs, (b_bs, &[]), (end_bs, &[lo]));
+
+        b.begin(b_bs);
+        let diff = b.binary(Op::Sub, Flags::NONE, hi, lo);
+        let half = b.binary(Op::Lshr, Flags::NONE, diff, one);
+        let mid = b.binary(Op::Add, Flags::NONE, lo, half);
+        let m_off = b.binary(Op::Shl, Flags::NONE, mid, three);
+        let ap = b.ptr_add(Flags::NONE, arr, m_off);
+        let mv = b.load(Ty::I64, Flags::NONE, ap, 0, MemAttrs::aligned(3));
+        let is_lt = b.icmp(IntCond::Ult, mv, key);
+        b.br(Flags::NONE, is_lt, (lt_blk, &[]), (ge_blk, &[]));
+
+        b.begin(lt_blk);
+        let mid1 = b.binary(Op::Add, Flags::NONE, mid, one);
+        b.jump((h_bs, &[mid1, hi]));
+
+        b.begin(ge_blk);
+        b.jump((h_bs, &[lo, mid]));
+
+        b.begin(end_bs);
+        let found = b.param(Ty::I64);
+        let sum2 = b.binary(Op::Add, Flags::NONE, sum, found);
+        let q2 = b.binary(Op::Add, Flags::NONE, q, one);
+        b.jump((h_q, &[q2, sum2]));
+
+        b.begin(exit);
+        let res = b.param(Ty::I64);
+        b.ret(&[res]);
+        let func = b.finish_checked().unwrap();
+
+        let out = unswitch_loops(func.view(), 2, TestHeap).unwrap();
+        assert!(out.stats.loops_unswitched >= 1);
+        assert!(verify(out.func.view()).is_ok());
+
+        // Entry now branches on hoisted `0 < n` (`Op::Br`), and after `if_convert`, the hot
+        // `b_q_true` jumps directly into a single-block do-while `b_bs` with zero `0 < n` guard!
+        assert_eq!(out.func.view().op(out.func.view().terminator(Block(0))), Op::Br);
+        let ifc = if_convert(out.func.view(), 8, TestHeap).unwrap();
+        assert!(verify(ifc.func.view()).is_ok());
+        assert!(ifc.stats.branches_converted >= 1);
+
+        // Verify evaluator equivalence for `n = 0`, `n = 1`, `n = 16` across multiple query counts!
+        for &nv in &[0u128, 1, 16] {
+            for &mv in &[0u128, 1, 4, 8] {
+                let args = [Val::Int(nv), Val::Int(mv)];
+                let Outcome::Returned(orig) = eval::run_in(func.view(), &args, 50_000, TestHeap).unwrap() else {
+                    panic!("orig bsearch eval failed");
+                };
+                let Outcome::Returned(unsw) = eval::run_in(out.func.view(), &args, 50_000, TestHeap).unwrap() else {
+                    panic!("unswitched bsearch eval failed");
+                };
+                let Outcome::Returned(after_ifc) = eval::run_in(ifc.func.view(), &args, 50_000, TestHeap).unwrap() else {
+                    panic!("if_convert bsearch eval failed");
+                };
+                assert_eq!(orig, unsw, "unswitch bsearch mismatch for n={nv}, m={mv}");
+                assert_eq!(orig, after_ifc, "post-ifc bsearch mismatch for n={nv}, m={mv}");
+            }
+        }
+    }
+
+    #[test]
+    fn unswitch_hoists_invariant_inner_guard_two_block_inverted_polarity() {
+        // 2-block inner loop whose header tests `i >= n` (exit on `then`, body on `else`):
+        // `for q in 0..m { for i in 0..n { sum += q + i; } }`
+        let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let [entry, h_q, b_q, h_i, b_i, end_i, exit] = [(); 7].map(|_| b.create_block(BlockKind::Normal));
+        b.begin(entry);
+        let n = b.param(Ty::I64);
+        let m = b.param(Ty::I64);
+        let zero = b.iconst(Ty::I64, 0);
+        let one = b.iconst(Ty::I64, 1);
+        b.jump((h_q, &[zero, zero]));
+
+        b.begin(h_q);
+        let q = b.param(Ty::I64);
+        let sum = b.param(Ty::I64);
+        let kq = b.icmp(IntCond::Ult, q, m);
+        b.br(Flags::NONE, kq, (b_q, &[]), (exit, &[sum]));
+
+        b.begin(b_q);
+        b.jump((h_i, &[zero, sum]));
+
+        b.begin(h_i);
+        let i = b.param(Ty::I64);
+        let acc = b.param(Ty::I64);
+        let done = b.icmp(IntCond::Uge, i, n);
+        b.br(Flags::NONE, done, (end_i, &[acc]), (b_i, &[]));
+
+        b.begin(b_i);
+        let qi = b.binary(Op::Add, Flags::NONE, q, i);
+        let acc2 = b.binary(Op::Add, Flags::NONE, acc, qi);
+        let i2 = b.binary(Op::Add, Flags::NONE, i, one);
+        b.jump((h_i, &[i2, acc2]));
+
+        b.begin(end_i);
+        let res_acc = b.param(Ty::I64);
+        let q2 = b.binary(Op::Add, Flags::NONE, q, one);
+        b.jump((h_q, &[q2, res_acc]));
+
+        b.begin(exit);
+        let res = b.param(Ty::I64);
+        b.ret(&[res]);
+        let func = b.finish_checked().unwrap();
+
+        let out = unswitch_loops(func.view(), 2, TestHeap).unwrap();
+        assert_eq!(out.stats.loops_unswitched, 1);
+        assert!(verify(out.func.view()).is_ok());
+
+        for &nv in &[0u128, 1, 7, 16] {
+            for &mv in &[0u128, 1, 5] {
+                let args = [Val::Int(nv), Val::Int(mv)];
+                let Outcome::Returned(orig) = eval::run_in(func.view(), &args, 50_000, TestHeap).unwrap() else {
+                    panic!("orig eval failed");
+                };
+                let Outcome::Returned(unsw) = eval::run_in(out.func.view(), &args, 50_000, TestHeap).unwrap() else {
+                    panic!("unsw eval failed");
+                };
+                assert_eq!(orig, unsw, "inverted inner-guard mismatch for n={nv}, m={mv}");
+            }
+        }
+    }
+
+    #[test]
+    fn unswitch_hoists_loop_local_invariant_icmp_branch() {
+        // Post-rotation outer loop whose body contains `c = icmp(Ult, 0, n); br(c, do_while, end_in)`.
+        let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let [entry, h_q, b_q, do_in, end_in, exit] = [(); 6].map(|_| b.create_block(BlockKind::Normal));
+        b.begin(entry);
+        let n = b.param(Ty::I64);
+        let m = b.param(Ty::I64);
+        let zero = b.iconst(Ty::I64, 0);
+        let one = b.iconst(Ty::I64, 1);
+        b.jump((h_q, &[zero, zero]));
+
+        b.begin(h_q);
+        let q = b.param(Ty::I64);
+        let sum = b.param(Ty::I64);
+        let kq = b.icmp(IntCond::Ult, q, m);
+        b.br(Flags::NONE, kq, (b_q, &[]), (exit, &[sum]));
+
+        b.begin(b_q);
+        let has_in = b.icmp(IntCond::Ult, zero, n);
+        b.br(Flags::NONE, has_in, (do_in, &[zero, sum]), (end_in, &[sum]));
+
+        b.begin(do_in);
+        let i = b.param(Ty::I64);
+        let acc = b.param(Ty::I64);
+        let acc2 = b.binary(Op::Add, Flags::NONE, acc, i);
+        let i2 = b.binary(Op::Add, Flags::NONE, i, one);
+        let keep = b.icmp(IntCond::Ult, i2, n);
+        b.br(Flags::NONE, keep, (do_in, &[i2, acc2]), (end_in, &[acc2]));
+
+        b.begin(end_in);
+        let res_acc = b.param(Ty::I64);
+        let q2 = b.binary(Op::Add, Flags::NONE, q, one);
+        b.jump((h_q, &[q2, res_acc]));
+
+        b.begin(exit);
+        let res = b.param(Ty::I64);
+        b.ret(&[res]);
+        let func = b.finish_checked().unwrap();
+
+        let out = unswitch_loops(func.view(), 2, TestHeap).unwrap();
+        assert_eq!(out.stats.loops_unswitched, 1);
+        assert!(verify(out.func.view()).is_ok());
+
+        for &nv in &[0u128, 1, 16] {
+            for &mv in &[0u128, 1, 5] {
+                let args = [Val::Int(nv), Val::Int(mv)];
+                let Outcome::Returned(orig) = eval::run_in(func.view(), &args, 50_000, TestHeap).unwrap() else {
+                    panic!("orig eval failed");
+                };
+                let Outcome::Returned(unsw) = eval::run_in(out.func.view(), &args, 50_000, TestHeap).unwrap() else {
+                    panic!("unsw eval failed");
+                };
+                assert_eq!(orig, unsw, "loop-local icmp unswitch mismatch for n={nv}, m={mv}");
             }
         }
     }

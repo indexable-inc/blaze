@@ -887,6 +887,8 @@ fn aegraph_optimize_inner<A: Allocator + Copy>(
                         | Op::Shl
                         | Op::Lshr
                         | Op::Ashr
+                        | Op::Rotl
+                        | Op::Rotr
                         | Op::Udiv
                         | Op::Urem => {
                             let Some((bits, mask)) = scalar_int_mask(ty, ptr_bits) else { continue };
@@ -986,7 +988,7 @@ fn aegraph_optimize_inner<A: Allocator + Copy>(
                                         folded_const = Some(mask); // x ^ !x == all_ones
                                     }
                                 }
-                                Op::Shl | Op::Lshr | Op::Ashr => {
+                                Op::Shl | Op::Lshr | Op::Ashr | Op::Rotl | Op::Rotr => {
                                     if let Some(sh) = cb {
                                         if (sh % u128::from(bits)) == 0 {
                                             folded_val = Some(a);
@@ -1503,6 +1505,8 @@ pub const fn op_latency_cycles(op: Op) -> u32 {
         | Op::Shl
         | Op::Lshr
         | Op::Ashr
+        | Op::Rotl
+        | Op::Rotr
         | Op::Icmp
         | Op::Select => 1,
         Op::Mul | Op::Umulhi | Op::Smulhi => 3,
@@ -1661,6 +1665,8 @@ const fn is_licm_pure(op: Op) -> bool {
             | Op::Shl
             | Op::Lshr
             | Op::Ashr
+            | Op::Rotl
+            | Op::Rotr
             | Op::Zext
             | Op::Sext
             | Op::Trunc
@@ -2361,6 +2367,104 @@ pub fn materialize_strength_reduction<A: Allocator + Copy>(
                             }
                         }
                     }
+                } else if op == Op::Trunc && (ty == Ty::I64 || ty == Ty::I32) {
+                    // Fold widened multiply-high idioms into single-instruction `Op::Umulhi`/`Op::Smulhi`:
+                    //   `trunc(lshr|ashr(mul(zext(a), zext(b)), W) -> iW) -> umulhi(a, b)`
+                    //   `trunc(lshr|ashr(mul(sext(a), sext(b)), W) -> iW) -> smulhi(a, b)`
+                    // (Also handles a folded wide constant operand fitting in `iW`!)
+                    let narrow_bits = ty.bits(ptr_bits);
+                    let wide_ty = if ty == Ty::I64 { Ty::I128 } else { Ty::I64 };
+                    let wide_bits = wide_ty.bits(ptr_bits);
+                    let narrow_mask = if narrow_bits == 64 {
+                        u128::from(u64::MAX)
+                    } else {
+                        u128::from(u32::MAX)
+                    };
+                    if let Some(sh_raw) = get_u32(view.data, inst) {
+                        let shi = u32_ix(sh_raw);
+                        let shop = view.op(shi);
+                        if matches!(shop, Op::Lshr | Op::Ashr)
+                            && inst_ty(&view, shi) == Some(wide_ty)
+                            && get_u8(view.flags, shi).is_some_and(|f| shop.info().flags.meanings_only(Flags(f)).0 == 0)
+                            && let Some(sh_at) = get_u32(view.data, shi).map(u32_ix)
+                            && let Some((mul_raw, amt_raw)) = extra_pair(&view, sh_at)
+                            && get_const(&known, amt_raw) == Some(u128::from(narrow_bits))
+                        {
+                            let mi = u32_ix(mul_raw);
+                            if view.op(mi) == Op::Mul
+                                && inst_ty(&view, mi) == Some(wide_ty)
+                                && get_u8(view.flags, mi)
+                                    .is_some_and(|f| Op::Mul.info().flags.meanings_only(Flags(f)).0 == 0)
+                                && let Some(m_at) = get_u32(view.data, mi).map(u32_ix)
+                                && let Some((ma_raw, mb_raw)) = extra_pair(&view, m_at)
+                            {
+                                enum MulHiArg {
+                                    Val(u32),
+                                    Const(u128),
+                                }
+                                let extract_unsigned = |v: u32| -> Option<MulHiArg> {
+                                    let vi = u32_ix(v);
+                                    if view.op(vi) == Op::Zext && inst_flags_zero(&view, vi) {
+                                        let inner = get_u32(view.data, vi)?;
+                                        if inst_ty(&view, u32_ix(inner)) == Some(ty) {
+                                            let mv = get_u32(&val_map, u32_ix(inner))?;
+                                            if mv != NONE {
+                                                return Some(MulHiArg::Val(mv));
+                                            }
+                                        }
+                                    }
+                                    if let Some(c) = get_const(&known, v)
+                                        && c <= narrow_mask
+                                    {
+                                        return Some(MulHiArg::Const(c));
+                                    }
+                                    None
+                                };
+                                let extract_signed = |v: u32| -> Option<MulHiArg> {
+                                    let vi = u32_ix(v);
+                                    if view.op(vi) == Op::Sext && inst_flags_zero(&view, vi) {
+                                        let inner = get_u32(view.data, vi)?;
+                                        if inst_ty(&view, u32_ix(inner)) == Some(ty) {
+                                            let mv = get_u32(&val_map, u32_ix(inner))?;
+                                            if mv != NONE {
+                                                return Some(MulHiArg::Val(mv));
+                                            }
+                                        }
+                                    }
+                                    if let Some(c) = get_const(&known, v) {
+                                        let sc = sext(c, wide_bits);
+                                        let fits = if narrow_bits == 64 {
+                                            i64::try_from(sc).is_ok()
+                                        } else {
+                                            i32::try_from(sc).is_ok()
+                                        };
+                                        if fits {
+                                            return Some(MulHiArg::Const(c & narrow_mask));
+                                        }
+                                    }
+                                    None
+                                };
+                                let matched = match (extract_unsigned(ma_raw), extract_unsigned(mb_raw)) {
+                                    (Some(la), Some(rb)) => Some((Op::Umulhi, la, rb)),
+                                    _ => match (extract_signed(ma_raw), extract_signed(mb_raw)) {
+                                        (Some(la), Some(rb)) => Some((Op::Smulhi, la, rb)),
+                                        _ => None,
+                                    },
+                                };
+                                if let Some((mulhi_op, la, rb)) = matched {
+                                    let lhs_m = match la {
+                                        MulHiArg::Val(v) => v,
+                                        MulHiArg::Const(c) => push_const_inst(&mut func, ty, ptr_bits, c, loc),
+                                    };
+                                    let rhs_m = match rb {
+                                        MulHiArg::Val(v) => v,
+                                        MulHiArg::Const(c) => push_const_inst(&mut func, ty, ptr_bits, c, loc),
+                                    };
+                                    replaced = Some(push_binary_inst(&mut func, mulhi_op, ty, lhs_m, rhs_m, loc));
+                                }
+                            }
+                        }
+                    }
                 }
 
                 if replaced.is_none()
@@ -2375,6 +2479,47 @@ pub fn materialize_strength_reduction<A: Allocator + Copy>(
                         let ca = known[raw_a as usize];
                         let cb = known[raw_b as usize];
                         if a != NONE && b_val != NONE {
+
+                        // Helper: recognize `(x << k1) op (x >> k2)` (in either order) where `k1 + k2 == bits`
+                        // (`bits in {8, 16, 32, 64}`, `k1 > 0 && k2 > 0`) for `Op::Or`/`Op::Xor`/`Op::Add`
+                        // -> `Op::Rotl(x, k1)` (lowers to a single `extr` on AArch64!).
+                        let try_rotate = |lhs_raw: u32, rhs_raw: u32| -> Option<(u32, u128)> {
+                            if !matches!(bits, 8 | 16 | 32 | 64) {
+                                return None;
+                            }
+                            let extract_shift = |cand: u32, want_op: Op| -> Option<(u32, u128)> {
+                                let ci = u32_ix(cand);
+                                if view.op(ci) == want_op
+                                    && inst_ty(&view, ci) == Some(ty)
+                                    && want_op.info().flags.meanings_only(Flags(get_u8(view.flags, ci)?)).0 == 0
+                                {
+                                    let cat = u32_ix(get_u32(view.data, ci)?);
+                                    let (sx, sc) = extra_pair(&view, cat)?;
+                                    let k = get_const(&known, sc)?;
+                                    return Some((sx, k));
+                                }
+                                None
+                            };
+                            let pair = match (extract_shift(lhs_raw, Op::Shl), extract_shift(rhs_raw, Op::Lshr)) {
+                                (Some(l), Some(r)) => Some((l, r)),
+                                _ => match (extract_shift(rhs_raw, Op::Shl), extract_shift(lhs_raw, Op::Lshr)) {
+                                    (Some(l), Some(r)) => Some((l, r)),
+                                    _ => None,
+                                },
+                            };
+                            if let Some(((x1, k1), (x2, k2))) = pair
+                                && x1 == x2
+                                && k1 > 0
+                                && k2 > 0
+                                && k1.checked_add(k2) == Some(u128::from(bits))
+                            {
+                                let mx = get_u32(&val_map, u32_ix(x1))?;
+                                if mx != NONE {
+                                    return Some((mx, k1));
+                                }
+                            }
+                            None
+                        };
 
                         // Helper: extract `(inner_x, c1)` if `raw_op` is `same_op(inner_x, c1)` (or commutative).
                         let extract_chain_const = |cand: u32, want_op: Op, comm: bool| -> Option<(u32, u128)> {
@@ -2652,6 +2797,12 @@ pub fn materialize_strength_reduction<A: Allocator + Copy>(
                                         replaced = Some(push_binary_inst(&mut func, Op::Add, ty, mp, xy, loc));
                                     }
                                 }
+                                if replaced.is_none()
+                                    && let Some((mx, k1)) = try_rotate(raw_a, raw_b)
+                                {
+                                    let kc = push_const_inst(&mut func, ty, ptr_bits, k1, loc);
+                                    replaced = Some(push_binary_inst(&mut func, Op::Rotl, ty, mx, kc, loc));
+                                }
                             }
                             Op::Sub => {
                                 if ca == Some(0) {
@@ -2673,7 +2824,12 @@ pub fn materialize_strength_reduction<A: Allocator + Copy>(
                                 }
                             }
                             Op::And | Op::Or | Op::Xor => {
-                                if op == Op::Xor && (cb == Some(mask) || ca == Some(mask)) {
+                                if matches!(op, Op::Or | Op::Xor)
+                                    && let Some((mx, k1)) = try_rotate(raw_a, raw_b)
+                                {
+                                    let kc = push_const_inst(&mut func, ty, ptr_bits, k1, loc);
+                                    replaced = Some(push_binary_inst(&mut func, Op::Rotl, ty, mx, kc, loc));
+                                } else if op == Op::Xor && (cb == Some(mask) || ca == Some(mask)) {
                                     // `x ^ !0 -> not(x)` (enables AArch64 `bic`/`orn`/`eon` fusion).
                                     let src = if cb == Some(mask) { a } else { b_val };
                                     let out_idx = usize_u32(func.ops.len());
@@ -2842,7 +2998,7 @@ pub fn hoist_loop_invariants<A: Allocator + Copy>(
             && preheader != NONE
             && preheader < header
             && dominates(&idom, preheader, header)
-            && view.op(view.terminator(Block(preheader))) == Op::Jump;
+            && matches!(view.op(view.terminator(Block(preheader))), Op::Jump | Op::Br);
 
         if valid_preheader {
             // Sort loop blocks in layout order so hoisting preserves def-before-use order.
@@ -2866,7 +3022,10 @@ pub fn hoist_loop_invariants<A: Allocator + Copy>(
                                 let vi = v as usize;
                                 let def_b = inst_block[vi];
                                 let defined_outside = !in_loop[def_b as usize] && dominates(&idom, def_b, preheader);
-                                let already_hoisted_here = hoist_to[vi] == preheader;
+                                let h_blk = hoist_to.get(vi).copied().unwrap_or(NONE);
+                                let already_hoisted_here = h_blk != NONE
+                                    && h_blk <= preheader
+                                    && dominates(&idom, h_blk, preheader);
                                 if !defined_outside && !already_hoisted_here {
                                     all_ok = false;
                                 }
@@ -3402,6 +3561,153 @@ mod tests {
             let before = eval::run_in(func.view(), &args, 100_000, alloc).unwrap();
             let after = eval::run_in(res.func.view(), &args, 100_000, alloc).unwrap();
             assert_eq!(before, after, "mismatch on ({nv}, {kv})");
+        }
+    }
+
+    #[test]
+    fn rotate_idiom_folds_or_xor_add_shifts_to_rotl_and_matches_eval() {
+        let alloc = TestHeap;
+        let mut b = Builder::<TestHeap, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I32)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let x = b.param(Ty::I64);
+        let y = b.param(Ty::I32);
+
+        // 1. `Or(Shl(x, 13), Lshr(x, 51))` (exact `arx_mix` idiom)
+        let c13 = b.iconst(Ty::I64, 13);
+        let c51 = b.iconst(Ty::I64, 51);
+        let l1 = b.binary(Op::Shl, Flags::NONE, x, c13);
+        let r1 = b.binary(Op::Lshr, Flags::NONE, x, c51);
+        let rot1 = b.binary(Op::Or, Flags::NONE, l1, r1);
+
+        // 2. Reversed order `Or(Lshr(x, 45), Shl(x, 19))`
+        let c19 = b.iconst(Ty::I64, 19);
+        let c45 = b.iconst(Ty::I64, 45);
+        let r2 = b.binary(Op::Lshr, Flags::NONE, x, c45);
+        let l2 = b.binary(Op::Shl, Flags::NONE, x, c19);
+        let rot2 = b.binary(Op::Or, Flags::NONE, r2, l2);
+
+        // 3. `Xor(Shl(x, 7), Lshr(x, 57))`
+        let c7 = b.iconst(Ty::I64, 7);
+        let c57 = b.iconst(Ty::I64, 57);
+        let l3 = b.binary(Op::Shl, Flags::NONE, x, c7);
+        let r3 = b.binary(Op::Lshr, Flags::NONE, x, c57);
+        let rot3 = b.binary(Op::Xor, Flags::NONE, l3, r3);
+
+        // 4. `Add(Lshr(x, 33), Shl(x, 31))`
+        let c31 = b.iconst(Ty::I64, 31);
+        let c33 = b.iconst(Ty::I64, 33);
+        let r4 = b.binary(Op::Lshr, Flags::NONE, x, c33);
+        let l4 = b.binary(Op::Shl, Flags::NONE, x, c31);
+        let rot4 = b.binary(Op::Add, Flags::NONE, r4, l4);
+
+        // 5. 32-bit `Or(Shl(y, 5), Lshr(y, 27))`
+        let w5 = b.iconst(Ty::I32, 5);
+        let w27 = b.iconst(Ty::I32, 27);
+        let ly = b.binary(Op::Shl, Flags::NONE, y, w5);
+        let ry = b.binary(Op::Lshr, Flags::NONE, y, w27);
+        let roty = b.binary(Op::Or, Flags::NONE, ly, ry);
+        let roty64 = b.convert(Op::Zext, Flags::NONE, Ty::I64, roty);
+
+        let t1 = b.binary(Op::Xor, Flags::NONE, rot1, rot2);
+        let t2 = b.binary(Op::Xor, Flags::NONE, rot3, rot4);
+        let t3 = b.binary(Op::Add, Flags::NONE, t1, t2);
+        let out = b.binary(Op::Xor, Flags::NONE, t3, roty64);
+        b.ret(&[out]);
+        let func = b.finish_checked().unwrap();
+
+        let res = sota_optimize_fixpoint(func.view(), RegBudget::AARCH64, 3, |_| 1, alloc).unwrap();
+        let v = res.func.view();
+        let rotl_count = (0..v.len()).filter(|&i| v.op(i) == Op::Rotl).count();
+        let shl_count = (0..v.len()).filter(|&i| v.op(i) == Op::Shl).count();
+        let lshr_count = (0..v.len()).filter(|&i| v.op(i) == Op::Lshr).count();
+        assert_eq!(rotl_count, 5, "expected all 5 shift-pair rotates folded to Op::Rotl");
+        assert_eq!(shl_count, 0, "expected all dead Shl ops swept");
+        assert_eq!(lshr_count, 0, "expected all dead Lshr ops swept");
+
+        for &(xv, yv) in &[
+            (0u64, 0u32),
+            (1, 1),
+            (u64::MAX, u32::MAX),
+            (0x1234_5678_9abc_def0, 0xdead_beef),
+            (0x8000_0000_0000_0001, 0x8000_0001),
+        ] {
+            let args = [Val::Int(u128::from(xv)), Val::Int(u128::from(yv))];
+            let before = eval::run_in(func.view(), &args, 10_000, alloc).unwrap();
+            let after = eval::run_in(res.func.view(), &args, 10_000, alloc).unwrap();
+            assert_eq!(before, after, "rotate rewrite mismatch on ({xv:#x}, {yv:#x})");
+        }
+    }
+
+    #[test]
+    fn mulhi_idiom_folds_widened_i128_mul_shift_trunc_to_umulhi_and_matches_eval() {
+        let alloc = TestHeap;
+        let mut b = Builder::<TestHeap, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let a = b.param(Ty::I64);
+        let bv = b.param(Ty::I64);
+
+        // 1. Standard Rust `((a as u128).wrapping_mul(b as u128) >> 64) as u64` -> `Umulhi(a, b)`
+        let za = b.convert(Op::Zext, Flags::NONE, Ty::I128, a);
+        let zb = b.convert(Op::Zext, Flags::NONE, Ty::I128, bv);
+        let prod = b.binary(Op::Mul, Flags::NONE, za, zb);
+        let c64 = b.iconst(Ty::I128, 64);
+        let hi_w = b.binary(Op::Lshr, Flags::NONE, prod, c64);
+        let hi = b.convert(Op::Trunc, Flags::NONE, Ty::I64, hi_w);
+
+        // 2. Constant-folded wide rhs: `((a as u128) * 0xa076_1d64_78bd_642f_u128 >> 64) as u64` -> `Umulhi(a, secret)`
+        let secret_w = b.iconst(Ty::I128, 0xa076_1d64_78bd_642f);
+        let prod_c = b.binary(Op::Mul, Flags::NONE, za, secret_w);
+        let hi_cw = b.binary(Op::Lshr, Flags::NONE, prod_c, c64);
+        let hi_c = b.convert(Op::Trunc, Flags::NONE, Ty::I64, hi_cw);
+
+        // 3. Signed `(((a as i128).wrapping_mul(b as i128)) >> 64) as i64` -> `Smulhi(a, b)`
+        let sa = b.convert(Op::Sext, Flags::NONE, Ty::I128, a);
+        let sb = b.convert(Op::Sext, Flags::NONE, Ty::I128, bv);
+        let sprod = b.binary(Op::Mul, Flags::NONE, sa, sb);
+        let shi_w = b.binary(Op::Ashr, Flags::NONE, sprod, c64);
+        let shi = b.convert(Op::Trunc, Flags::NONE, Ty::I64, shi_w);
+
+        let t = b.binary(Op::Xor, Flags::NONE, hi, hi_c);
+        let out = b.binary(Op::Xor, Flags::NONE, t, shi);
+        b.ret(&[out]);
+        let func = b.finish_checked().unwrap();
+
+        let res = sota_optimize_fixpoint(func.view(), RegBudget::AARCH64, 3, |_| 1, alloc).unwrap();
+        let v = res.func.view();
+        let umulhi_cnt = (0..v.len()).filter(|&i| v.op(i) == Op::Umulhi).count();
+        let smulhi_cnt = (0..v.len()).filter(|&i| v.op(i) == Op::Smulhi).count();
+        let i128_mul_cnt = (0..v.len()).filter(|&i| v.op(i) == Op::Mul && Ty(v.tys[i]) == Ty::I128).count();
+        assert_eq!(umulhi_cnt, 2, "expected 2 Op::Umulhi ops");
+        assert_eq!(smulhi_cnt, 1, "expected 1 Op::Smulhi op");
+        assert_eq!(i128_mul_cnt, 0, "expected all widened i128 Mul ops eliminated");
+
+        for &(av, bv) in &[
+            (0u64, 0u64),
+            (1, u64::MAX),
+            (u64::MAX, u64::MAX),
+            (0x8000_0000_0000_0000, 0x8000_0000_0000_0000),
+            (0xdead_beef_cafe_babe, 0x9e37_79b9_7f4a_7c15),
+        ] {
+            let args = [Val::Int(u128::from(av)), Val::Int(u128::from(bv))];
+            let before = eval::run_in(func.view(), &args, 10_000, alloc).unwrap();
+            let after = eval::run_in(res.func.view(), &args, 10_000, alloc).unwrap();
+            assert_eq!(before, after, "mulhi rewrite mismatch on ({av:#x}, {bv:#x})");
         }
     }
 }
