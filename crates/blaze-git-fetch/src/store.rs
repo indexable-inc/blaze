@@ -332,3 +332,207 @@ impl<'c> Commit<'c> {
         self.parents.chunks_exact(48).map(|line| Oid::parse_hex(&line[7..47]).expect("checked by parse"))
     }
 }
+
+/// Read-only sans-IO access to one git repository's `objects/` store: loose objects and ranged
+/// reads into indexed packfiles.
+pub trait ObjectSource<A: Allocator> {
+    /// Reads loose object `objects/<hex[0..2]>/<hex[2..40]>` into `out` (cleared first).
+    /// Returns `Ok(true)` if present, `Ok(false)` if absent.
+    fn read_loose(&mut self, oid: &Oid, out: &mut Vec<u8, A>) -> Result<bool, StoreWhy>;
+
+    /// Reads `len` bytes at `offset` from pack `pack_idx` into `out` (cleared first).
+    /// Returns `Ok(true)` if all `len` bytes were read, `Ok(false)` if short or absent.
+    fn read_pack_range(&mut self, pack_idx: usize, offset: u64, len: u64, out: &mut Vec<u8, A>) -> Result<bool, StoreWhy>;
+}
+
+struct PackTable<'i, A: Allocator> {
+    idx: Idx<'i>,
+    pack_end: u64,
+    /// Sorted pack offsets, built lazily on the first object read from this pack so `entry_end`
+    /// is O(log n) rather than an O(n) scan per object.
+    sorted_offsets: Option<Vec<u64, A>>,
+}
+
+impl<'i, A: Allocator + Copy> PackTable<'i, A> {
+    fn entry_end(&mut self, offset: u64, alloc: A) -> Result<u64, (u64, StoreWhy)> {
+        if self.sorted_offsets.is_none() {
+            let count = usize::try_from(self.idx.len()).map_err(|_| (0, StoreWhy::IdxShort))?;
+            let mut offsets: Vec<u64, A> = Vec::new_in(alloc);
+            offsets.try_reserve(count).map_err(|e| (0, StoreWhy::Entry(PackWhy::Alloc(e))))?;
+            for at in 0..self.idx.len() {
+                offsets.push(self.idx.offset(at, self.pack_end)?);
+            }
+            offsets.sort_unstable();
+            self.sorted_offsets = Some(offsets);
+        }
+        let Some(offsets) = self.sorted_offsets.as_ref() else {
+            return Ok(self.pack_end);
+        };
+        let next = offsets.partition_point(|&o| o <= offset);
+        Ok(offsets.get(next).copied().unwrap_or(self.pack_end))
+    }
+}
+
+/// On-demand object reader over a repository's loose objects and all indexed packfiles.
+///
+/// Only touches `.idx` tables (O(log n) lookup per pack) and ranged slices of reachable objects —
+/// never scans or inflates unreachable history. Resolves both `OFS_DELTA` (within one pack) and
+/// `REF_DELTA` (across any pack or loose object) iteratively within [`crate::PackLimits`], and
+/// verifies every resolved object's SHA-1 against its requested [`Oid`].
+pub struct ObjectDb<'i, A: Allocator> {
+    packs: Vec<PackTable<'i, A>, A>,
+    limits: crate::PackLimits,
+    alloc: A,
+}
+
+impl<'i, A: Allocator + Copy> ObjectDb<'i, A> {
+    /// Creates an object DB over `packs` (each `(raw .idx bytes, .pack byte length)`).
+    pub fn new(
+        packs: &[(&'i [u8], u64)],
+        limits: crate::PackLimits,
+        alloc: A,
+    ) -> Result<ObjectDb<'i, A>, (u64, StoreWhy)> {
+        let mut parsed: Vec<PackTable<'i, A>, A> = Vec::new_in(alloc);
+        parsed.try_reserve(packs.len()).map_err(|e| (0, StoreWhy::Entry(PackWhy::Alloc(e))))?;
+        for &(idx_bytes, pack_len) in packs {
+            if pack_len < 32 {
+                return Err((0, StoreWhy::Entry(PackWhy::Short)));
+            }
+            let idx = Idx::parse(idx_bytes, limits.most_objects)?;
+            parsed.push(PackTable { idx, pack_end: pack_len - 20, sorted_offsets: None });
+        }
+        Ok(ObjectDb { packs: parsed, limits, alloc })
+    }
+
+    /// Reads object `oid` into `out` (cleared first), checking loose objects first and then all
+    /// indexed packs. Verifies that the resolved bytes hash to `oid`. Returns `Ok(None)` when no
+    /// loose object or pack index holds `oid` (reading zero packfile bytes).
+    pub fn read_object<S: ObjectSource<A>>(
+        &mut self,
+        oid: &Oid,
+        source: &mut S,
+        out: &mut Vec<u8, A>,
+    ) -> Result<Option<Kind>, (u64, StoreWhy)> {
+        out.clear();
+        let mut raw = Vec::new_in(self.alloc);
+        if source.read_loose(oid, &mut raw).map_err(|why| (0, why))? {
+            let mut whole = Vec::new_in(self.alloc);
+            let (kind, body) = loose(&raw, oid, self.limits.most_object, self.alloc, &mut whole)?;
+            let slice = whole.get(body..).ok_or((0, StoreWhy::LooseHeader))?;
+            out.try_extend_from_slice(slice).map_err(|e| (0, StoreWhy::Entry(PackWhy::Alloc(e))))?;
+            return Ok(Some(kind));
+        }
+        let Some((pack_idx, found)) = self.find_in_packs(oid) else {
+            return Ok(None);
+        };
+        let kind = self.read_packed(pack_idx, found, oid, source, out)?;
+        Ok(Some(kind))
+    }
+
+    fn find_in_packs(&self, oid: &Oid) -> Option<(usize, u32)> {
+        for (pack_idx, table) in self.packs.iter().enumerate() {
+            if let Ok(found) = table.idx.search(oid) {
+                return Some((pack_idx, found));
+            }
+        }
+        None
+    }
+
+    fn read_packed<S: ObjectSource<A>>(
+        &mut self,
+        start_pack: usize,
+        found: u32,
+        oid: &Oid,
+        source: &mut S,
+        out: &mut Vec<u8, A>,
+    ) -> Result<Kind, (u64, StoreWhy)> {
+        let mut cur_pack = start_pack;
+        let mut cur_at = {
+            let table = self.packs.get(cur_pack).ok_or((0, StoreWhy::IdxShort))?;
+            table.idx.offset(found, table.pack_end)?
+        };
+        let mut window = Vec::new_in(self.alloc);
+        let mut chain: Vec<(usize, u64), A> = Vec::new_in(self.alloc);
+        let max_window = self.limits.most_object.saturating_mul(2).saturating_add(64);
+
+        let kind = loop {
+            if chain.len() > usize::from(self.limits.most_depth) {
+                return Err((cur_at, StoreWhy::Entry(PackWhy::DepthOver { most: self.limits.most_depth })));
+            }
+            let head = self.read_entry_window(cur_pack, cur_at, max_window, source, &mut window)?;
+            match head.base {
+                Base::Whole(kind) => {
+                    inflate_entry(&window, &head, self.limits.most_object, out).map_err(|why| (cur_at, why))?;
+                    break kind;
+                }
+                Base::Ofs { back } => {
+                    chain.try_push((cur_pack, cur_at)).map_err(|r| (cur_at, StoreWhy::Entry(PackWhy::Alloc(r.why))))?;
+                    cur_at = match cur_at.checked_sub(back) {
+                        Some(base) if base >= 12 => base,
+                        _ => return Err((cur_at, StoreWhy::Entry(PackWhy::BaseOffset { back }))),
+                    };
+                }
+                Base::Ref { base } => {
+                    chain.try_push((cur_pack, cur_at)).map_err(|r| (cur_at, StoreWhy::Entry(PackWhy::Alloc(r.why))))?;
+                    // Cross-pack or loose base lookup across the entire object DB.
+                    let mut loose_raw = Vec::new_in(self.alloc);
+                    if source.read_loose(&base, &mut loose_raw).map_err(|why| (cur_at, why))? {
+                        let mut whole = Vec::new_in(self.alloc);
+                        let (kind, body) = loose(&loose_raw, &base, self.limits.most_object, self.alloc, &mut whole)?;
+                        let slice = whole.get(body..).ok_or((cur_at, StoreWhy::LooseHeader))?;
+                        out.clear();
+                        out.try_extend_from_slice(slice).map_err(|e| (cur_at, StoreWhy::Entry(PackWhy::Alloc(e))))?;
+                        break kind;
+                    }
+                    let Some((base_pack, base_idx)) = self.find_in_packs(&base) else {
+                        return Err((cur_at, StoreWhy::Entry(PackWhy::MissingBase { base })));
+                    };
+                    let base_at = {
+                        let table = self.packs.get(base_pack).ok_or((cur_at, StoreWhy::IdxShort))?;
+                        table.idx.offset(base_idx, table.pack_end)?
+                    };
+                    cur_pack = base_pack;
+                    cur_at = base_at;
+                }
+            }
+        };
+
+        let mut delta = Vec::new_in(self.alloc);
+        let mut next = Vec::new_in(self.alloc);
+        while let Some((delta_pack, delta_at)) = chain.pop() {
+            let head = self.read_entry_window(delta_pack, delta_at, max_window, source, &mut window)?;
+            delta.clear();
+            inflate_entry(&window, &head, self.limits.most_object, &mut delta).map_err(|why| (delta_at, why))?;
+            apply_delta(out, &delta, self.limits.most_object, &mut next).map_err(|why| (delta_at, why))?;
+            core::mem::swap(out, &mut next);
+        }
+        if Oid::of(kind, out) != *oid {
+            return Err((0, StoreWhy::Id { want: *oid }));
+        }
+        Ok(kind)
+    }
+
+    fn read_entry_window<S: ObjectSource<A>>(
+        &mut self,
+        pack_idx: usize,
+        at: u64,
+        max_window: u64,
+        source: &mut S,
+        window: &mut Vec<u8, A>,
+    ) -> Result<EntryHead, (u64, StoreWhy)> {
+        let alloc = self.alloc;
+        let end = {
+            let table = self.packs.get_mut(pack_idx).ok_or((at, StoreWhy::IdxShort))?;
+            table.entry_end(at, alloc)?
+        };
+        let len = end.saturating_sub(at);
+        if len == 0 || len > max_window {
+            return Err((at, StoreWhy::Entry(PackWhy::ObjectOver { size: len, most: max_window })));
+        }
+        window.clear();
+        if !source.read_pack_range(pack_idx, at, len, window).map_err(|why| (at, why))? {
+            return Err((at, StoreWhy::Entry(PackWhy::Header)));
+        }
+        entry_head(window).map_err(|why| (at, why))
+    }
+}

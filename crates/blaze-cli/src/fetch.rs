@@ -476,12 +476,18 @@ const CARGO_GIT: &str = "git";
 const CARGO_DB_IN_GIT: &str = "db";
 const CARGO_GIT_OBJECTS: &str = "objects";
 const CARGO_GIT_PACK: &str = "pack";
+/// Maximum byte length of a single `.idx` file read from cargo's `git/db` (rule 18).
+const MOST_GIT_IDX_BYTES: u64 = 64 << 20;
+/// Maximum byte length of a single loose git object file read from cargo's `git/db` (rule 18).
+const MOST_GIT_LOOSE_BYTES: u64 = 64 << 20;
 
 /// Cargo's local caches on this machine: `<cargo home>/registry/cache` for `.crate` archives
 /// (D78; fetch.md, "Where bytes come from", place 2) and `<cargo home>/git/db` for bare git
 /// repositories (fetch.md, piece 14). Each is looked at once a command, lazily on the first
 /// missing unit of its kind, through the effect layer's second tree (`Fs::home`), never `std::fs`.
-/// Nothing is believed of the place: only a `.crate`'s SHA-256 or a git pack's pinned commit SHA-1.
+/// Every traversal and read inside `git/db` uses the no-symlink confined APIs (`entries_confined`,
+/// `read_all_confined`, `read_range_confined`). Nothing is believed of the place: only a
+/// `.crate`'s SHA-256 or a git object's verified SHA-1 reachable from the lock's pinned commit.
 pub(crate) struct CargoCache {
     looked: Option<Looked>,
     git: Option<LookedGit>,
@@ -535,8 +541,9 @@ struct GitDbFolder {
     /// `<cargo home>/git/db/<folder>` and byte offset where `<folder>` starts.
     shown: blaze_own::String<Alloc<'static>>,
     name_at: usize,
-    /// Packfiles inside `db/<folder>/objects/pack`, listed lazily once a unit's repo matches.
-    packs: Option<GitDbPacks>,
+    /// Cached pack index bytes and `.pack` metadata for this repository's `objects/pack`,
+    /// loaded lazily once a unit's repo matches.
+    odb: Option<GitDbOdb>,
 }
 
 impl GitDbFolder {
@@ -545,10 +552,18 @@ impl GitDbFolder {
     }
 }
 
-enum GitDbPacks {
-    Closed { miss: ClosedMiss },
-    /// Each entry: (`<cargo home>/git/db/<folder>/objects/pack/<pack>`, byte offset where `<pack>` starts).
-    Open(blaze_own::Vec<(blaze_own::String<Alloc<'static>>, usize), Alloc<'static>>),
+struct GitPackEntry {
+    /// Relative path `db/<folder>/objects/pack/pack-<40hex>.pack` beneath `<cargo home>/git`.
+    pack_path: Path,
+    /// Raw `.idx` bytes (loaded once per matching repo via `read_all_confined`).
+    idx_bytes: blaze_own::Vec<u8, Alloc<'static>>,
+    /// Verified `.pack` file byte length from `entries_confined`.
+    pack_len: u64,
+}
+
+enum GitDbOdb {
+    Unreadable,
+    Ready { packs: blaze_own::Vec<GitPackEntry, Alloc<'static>> },
 }
 
 impl CargoCache {
@@ -560,8 +575,8 @@ impl CargoCache {
         })
     }
 
-    /// Opens cargo's `git/db` on the first git miss and lazily lists `objects/pack` for folders
-    /// matching `repo`, then returns an immutable view for borrowing try place names.
+    /// Opens cargo's `git/db` on the first git miss and lazily loads confined `.idx` tables for
+    /// folders matching `repo`, then returns an immutable view for borrowing try place names.
     fn looked_git(&mut self, cx: &Cx, env: &FetchEnv<'_>, repo: &str) -> Result<&LookedGit, CliError> {
         let looked = match &mut self.git {
             Some(looked) => looked,
@@ -573,34 +588,75 @@ impl CargoCache {
             let pack = Path::new(CARGO_GIT_PACK)?;
             let global = env.heap.alloc();
             for folder in folders.iter_mut() {
-                if folder.packs.is_some() || !local::git_db_folder(repo, folder.name()) {
+                if folder.odb.is_some() || !local::git_db_folder(repo, folder.name()) {
                     continue;
                 }
                 let Ok(folder_path) = Path::new(folder.name()) else {
-                    folder.packs = Some(GitDbPacks::Closed { miss: ClosedMiss::Unreadable });
+                    folder.odb = Some(GitDbOdb::Unreadable);
                     continue;
                 };
                 let pack_dir = db.join(&folder_path).join(&objects).join(&pack);
-                let listed = match git.entries(cx, &pack_dir) {
+                let odb = match git.entries_confined(cx, &pack_dir) {
                     Ok(Some(entries)) => {
                         let mut packs = blaze_own::Vec::new_in(global);
-                        for (name, _) in entries.iter().filter(|(name, _)| local::git_pack_file(name)) {
-                            let mut place = blaze_own::String::new_in(global);
-                            place.str(folder.shown.as_str()).str("/objects/pack/");
-                            let at = place.as_str().len();
-                            place.str(name);
-                            packs.push((place, at));
+                        let mut failed = false;
+                        for i in 0..entries.len() {
+                            if entries.kind(i) != bstd::fs::EntryKind::File {
+                                continue;
+                            }
+                            let name = entries.name(i);
+                            if !local::git_idx_file(name) {
+                                continue;
+                            }
+                            let idx_len = entries.len_of(i);
+                            if idx_len > MOST_GIT_IDX_BYTES {
+                                failed = true;
+                                break;
+                            }
+                            let Some(stem) = name.strip_suffix(".idx") else { continue };
+                            let pack_name_str = bstd::mem::format_in!(cx.frame(), "{stem}.pack");
+                            let Some(pack_i) = entries.find(pack_name_str.as_str()) else { continue };
+                            if entries.kind(pack_i) != bstd::fs::EntryKind::File {
+                                continue;
+                            }
+                            let pack_len = entries.len_of(pack_i);
+                            if pack_len > blaze_fetch::fetch::Limits::REAL.git_most {
+                                continue;
+                            }
+                            let (Ok(idx_leaf), Ok(pack_leaf)) = (Path::new(name), Path::new(pack_name_str.as_str())) else {
+                                failed = true;
+                                break;
+                            };
+                            let idx_path = pack_dir.join(&idx_leaf);
+                            let pack_path = pack_dir.join(&pack_leaf);
+                            let Ok(idx_usize) = usize::try_from(idx_len) else {
+                                failed = true;
+                                break;
+                            };
+                            let reserve = idx_usize.saturating_mul(2).max(1 << 16).saturating_add(1 << 16);
+                            let Ok(scratch) = Frame::with_reserve(reserve, bstd::mem::Tag::Other) else {
+                                failed = true;
+                                break;
+                            };
+                            let mut raw = Bytes::new_in(&scratch, "a cargo git pack .idx, confined read");
+                            if git.read_all_confined(cx, &idx_path, &mut raw).is_err() {
+                                failed = true;
+                                break;
+                            }
+                            let mut idx_bytes = blaze_own::Vec::new_in(global);
+                            if idx_bytes.try_extend_from_slice(raw.as_slice()).is_err() {
+                                failed = true;
+                                break;
+                            }
+                            packs.push(GitPackEntry { pack_path, idx_bytes, pack_len });
                         }
-                        if packs.is_empty() {
-                            GitDbPacks::Closed { miss: ClosedMiss::Absent }
-                        } else {
-                            GitDbPacks::Open(packs)
-                        }
+                        if failed { GitDbOdb::Unreadable } else { GitDbOdb::Ready { packs } }
                     }
-                    Ok(None) => GitDbPacks::Closed { miss: ClosedMiss::Absent },
-                    Err(_) => GitDbPacks::Closed { miss: ClosedMiss::Unreadable },
+                    // No `objects/pack` directory yet: loose objects under `objects/` may still hold the commit.
+                    Ok(None) => GitDbOdb::Ready { packs: blaze_own::Vec::new_in(global) },
+                    Err(_) => GitDbOdb::Unreadable,
                 };
-                folder.packs = Some(listed);
+                folder.odb = Some(odb);
             }
         }
         Ok(&*looked)
@@ -626,7 +682,7 @@ impl LookedGit {
                 return Ok(LookedGit::Closed { shown, miss: ClosedMiss::Unreadable });
             }
         };
-        let entries = match git.entries(cx, &Path::new(CARGO_DB_IN_GIT)?) {
+        let entries = match git.entries_confined(cx, &Path::new(CARGO_DB_IN_GIT)?) {
             Ok(Some(entries)) => entries,
             Ok(None) => return Ok(LookedGit::Closed { shown, miss: ClosedMiss::Absent }),
             Err(error) => {
@@ -635,12 +691,16 @@ impl LookedGit {
             }
         };
         let mut folders = blaze_own::Vec::new_in(global);
-        for (name, _) in entries.iter() {
+        for (name, kind) in entries.iter() {
+            // Only real directories under `git/db`: symlinks are never traversed.
+            if kind != bstd::fs::EntryKind::Dir {
+                continue;
+            }
             let mut place = blaze_own::String::new_in(global);
             place.str(shown.as_str()).str("/");
             let name_at = place.as_str().len();
             place.str(name);
-            folders.push(GitDbFolder { shown: place, name_at, packs: None });
+            folders.push(GitDbFolder { shown: place, name_at, odb: None });
         }
         if folders.is_empty() {
             shown.str(" (no repository folder in it)");
@@ -781,6 +841,81 @@ fn adopt_local_crate<'c>(
     Ok(false)
 }
 
+/// Confined `GitObjectSource` backed by `<cargo home>/git/db/<folder>/objects`: reads loose
+/// objects via `Dir::read_all_confined` and packfile slices via `Dir::read_range_confined` so no
+/// symlink inside `CARGO_HOME` is ever followed and no unreachable pack bytes are ever read.
+struct CargoGitSource<'a> {
+    cx: &'a Cx,
+    git: &'a Dir<ReadOnly>,
+    objects_dir: Path,
+    packs: &'a [GitPackEntry],
+}
+
+impl local::GitObjectSource<Alloc<'static>> for CargoGitSource<'_> {
+    fn read_loose(
+        &mut self,
+        oid: &local::GitOid,
+        out: &mut blaze_own::Vec<u8, Alloc<'static>>,
+    ) -> Result<bool, local::GitStoreWhy> {
+        out.clear();
+        let hex = oid.hex();
+        let (Ok(dir_str), Ok(file_str)) = (core::str::from_utf8(&hex[..2]), core::str::from_utf8(&hex[2..])) else {
+            return Err(local::GitStoreWhy::LooseHeader);
+        };
+        let (Ok(dir_part), Ok(file_part)) = (Path::new(dir_str), Path::new(file_str)) else {
+            return Err(local::GitStoreWhy::LooseHeader);
+        };
+        let path = self.objects_dir.join(&dir_part).join(&file_part);
+        let Ok(reserve) = usize::try_from(MOST_GIT_LOOSE_BYTES) else {
+            return Err(local::GitStoreWhy::LooseHeader);
+        };
+        let Ok(scratch) = Frame::with_reserve(reserve.saturating_add(1 << 16), bstd::mem::Tag::Other) else {
+            return Err(local::GitStoreWhy::LooseHeader);
+        };
+        let mut bytes = Bytes::new_in(&scratch, "a cargo git loose object, confined read");
+        match self.git.read_all_confined(self.cx, &path, &mut bytes) {
+            Ok(_) => {
+                if out.try_extend_from_slice(bytes.as_slice()).is_err() {
+                    return Err(local::GitStoreWhy::LooseHeader);
+                }
+                Ok(true)
+            }
+            Err(error) if error.kind == FsKind::NotFound => Ok(false),
+            Err(_) => Err(local::GitStoreWhy::LooseHeader),
+        }
+    }
+
+    fn read_pack_range(
+        &mut self,
+        pack_idx: usize,
+        offset: u64,
+        len: u64,
+        out: &mut blaze_own::Vec<u8, Alloc<'static>>,
+    ) -> Result<bool, local::GitStoreWhy> {
+        out.clear();
+        let Some(pack) = self.packs.get(pack_idx) else {
+            return Ok(false);
+        };
+        let Ok(len_usize) = usize::try_from(len) else {
+            return Ok(false);
+        };
+        let reserve = len_usize.saturating_mul(2).max(1 << 16).saturating_add(1 << 16);
+        let Ok(scratch) = Frame::with_reserve(reserve, bstd::mem::Tag::Other) else {
+            return Ok(false);
+        };
+        let mut bytes = Bytes::new_in(&scratch, "a cargo git pack range, confined read");
+        match self.git.read_range_confined(self.cx, &pack.pack_path, offset, len_usize, &mut bytes) {
+            Ok(read) if read == len_usize => {
+                if out.try_extend_from_slice(bytes.as_slice()).is_err() {
+                    return Ok(false);
+                }
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+}
+
 fn adopt_local_git<'c>(
     cx: &Cx,
     root: &Dir<ReadWrite>,
@@ -800,7 +935,6 @@ fn adopt_local_git<'c>(
     };
     let db = Path::new(CARGO_DB_IN_GIT)?;
     let objects = Path::new(CARGO_GIT_OBJECTS)?;
-    let pack_dir_name = Path::new(CARGO_GIT_PACK)?;
     let mut matched = false;
     for folder in folders.iter() {
         let folder_name = folder.name();
@@ -808,67 +942,30 @@ fn adopt_local_git<'c>(
             continue;
         }
         matched = true;
-        let packs = match &folder.packs {
-            Some(GitDbPacks::Open(packs)) => packs,
-            Some(GitDbPacks::Closed { miss }) => {
-                tries.push(Try { place: folder.shown.as_str(), miss: miss.to_miss() });
-                continue;
-            }
-            None => {
-                tries.push(Try { place: folder.shown.as_str(), miss: Miss::Absent });
+        let place = folder.shown.as_str();
+        let packs = match &folder.odb {
+            Some(GitDbOdb::Ready { packs }) => packs.as_slice(),
+            Some(GitDbOdb::Unreadable) | None => {
+                tries.push(Try { place, miss: Miss::Unreadable });
                 continue;
             }
         };
         let Ok(folder_path) = Path::new(folder_name) else {
-            tries.push(Try { place: folder.shown.as_str(), miss: Miss::Unreadable });
+            tries.push(Try { place, miss: Miss::Unreadable });
             continue;
         };
-        let pack_dir = db.join(&folder_path).join(&objects).join(&pack_dir_name);
-        for (pack_shown, pack_at) in packs.iter() {
-            let place = pack_shown.as_str();
-            let Some(pack_name) = place.get(*pack_at..) else {
-                tries.push(Try { place, miss: Miss::Unreadable });
-                continue;
-            };
-            let Ok(pack_file) = Path::new(pack_name) else {
-                tries.push(Try { place, miss: Miss::Unreadable });
-                continue;
-            };
-            let path = pack_dir.join(&pack_file);
-            let len = match git.stat(cx, &path) {
-                Ok(Some(meta)) if !meta.dir => meta.len,
-                Ok(_) => {
-                    tries.push(Try { place, miss: Miss::Absent });
-                    continue;
-                }
-                Err(_) => {
-                    tries.push(Try { place, miss: Miss::Unreadable });
-                    continue;
-                }
-            };
-            if len > blaze_fetch::fetch::Limits::REAL.git_most {
-                tries.push(Try { place, miss: Miss::Unreadable });
-                continue;
+        let objects_dir = db.join(&folder_path).join(&objects);
+        let mut tables: blaze_own::Vec<(&[u8], u64), Alloc<'static>> = blaze_own::Vec::new_in(env.heap.alloc());
+        for entry in packs.iter() {
+            tables.push((entry.idx_bytes.as_slice(), entry.pack_len));
+        }
+        let mut source = CargoGitSource { cx, git, objects_dir, packs };
+        match local::adopt_git_db(unit, tables.as_slice(), &mut source, &blaze_fetch::fetch::Limits::REAL.unpack, env.heap.alloc()) {
+            Ok((record, _)) => {
+                write_record(cx, root, &record_path(&unit.key())?, record.as_slice())?;
+                return Ok(true);
             }
-            let Ok(len) = usize::try_from(len) else {
-                tries.push(Try { place, miss: Miss::Unreadable });
-                continue;
-            };
-            let reserve = len.saturating_mul(2).max(1 << 16).saturating_add(1 << 16);
-            let scratch = Frame::with_reserve(reserve, bstd::mem::Tag::Other)
-                .map_err(|_| CliError::Text { what: "the frame a cargo git pack is read in could not be reserved" })?;
-            let mut bytes = Bytes::new_in(&scratch, "a git pack in cargo's git/db, checked against the lock");
-            if git.read_all(cx, &path, &mut bytes).is_err() {
-                tries.push(Try { place, miss: Miss::Unreadable });
-                continue;
-            }
-            match local::adopt_git_pack(unit, bytes.as_slice(), &blaze_fetch::fetch::Limits::REAL.unpack, env.heap.alloc()) {
-                Ok((record, _)) => {
-                    write_record(cx, root, &record_path(&unit.key())?, record.as_slice())?;
-                    return Ok(true);
-                }
-                Err(refused) => tries.push(Try { place, miss: Miss::Refused(refused) }),
-            }
+            Err(refused) => tries.push(Try { place, miss: Miss::Refused(refused) }),
         }
     }
     if !matched {

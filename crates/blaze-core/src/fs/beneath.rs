@@ -5,8 +5,10 @@
 use core::{alloc::Allocator, mem::MaybeUninit};
 use std::{fs::File, io, path::Path};
 
+use blaze_own::Share as _;
+
 #[cfg(unix)]
-use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
+use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, FromRawFd as _, IntoRawFd as _, OwnedFd};
 
 use crate::{FileName, threads::inline::LentRead};
 
@@ -280,15 +282,212 @@ pub(crate) fn read_whole_into_vec<A: Allocator>(path: &Path, into: &mut Vec<u8, 
     read_open_into_vec(&file, into)
 }
 
-/// Kernel-confined whole-file read: opens `rel` strictly beneath `root_dir` via
-/// `openat`/`O_NOFOLLOW` (refusing any symlink at any component with `ELOOP`) and reads straight
-/// into `into`'s uninitialized spare capacity (zero `memset(0)`, zero copy).
-pub(crate) fn read_whole_confined_into_vec<A: Allocator>(
+/// Kernel-confined read (whole file when `range` is `None`, or positional `[at..at+len]` when
+/// `Some((at, len))`): opens `rel` strictly beneath `root_dir` via `openat`/`O_NOFOLLOW` (Linux:
+/// `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`) and reads straight into `into`'s
+/// uninitialized spare capacity (zero `memset(0)`, zero intermediate copy).
+pub(crate) fn read_confined_into_vec<A: Allocator>(
     root_dir: &RootDir,
     root: &Path,
     rel: &FileName,
+    range: Option<(u64, usize)>,
     into: &mut Vec<u8, A>,
 ) -> io::Result<LentRead> {
     let file = open_beneath_readonly(root_dir, root, rel)?;
-    read_open_into_vec(&file, into)
+    let Some((at, len)) = range else {
+        return read_open_into_vec(&file, into);
+    };
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"));
+    }
+    if len == 0 {
+        return Ok(LentRead::Read { len: 0 });
+    }
+    if into.try_reserve(len).is_err() {
+        return Ok(LentRead::NoRoom { len: u64::try_from(len).unwrap_or(u64::MAX) });
+    }
+    let start = into.len();
+    let Some(spare) = into.spare_capacity_mut().get_mut(..len) else {
+        return Ok(LentRead::NoRoom { len: u64::try_from(len).unwrap_or(u64::MAX) });
+    };
+    let mut filled = 0usize;
+    while filled < len {
+        let Some(dst) = spare.get_mut(filled..) else { break };
+        let Some(pos) = at.checked_add(u64::try_from(filled).unwrap_or(u64::MAX)) else {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "read offset overflow"));
+        };
+        let n = read_at_uninit(&file, dst, pos)?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    #[expect(unsafe_code, reason = "pread initialized exactly `filled` bytes at `start..start + filled` within reserved capacity")]
+    unsafe {
+        into.set_len(start + filled);
+    }
+    Ok(LentRead::Read { len: u64::try_from(filled).unwrap_or(u64::MAX) })
+}
+
+/// Opens directory `rel` strictly beneath `root_dir` without following any symbolic link in any
+/// component (Linux `openat2(O_DIRECTORY | RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` or Unix
+/// component-by-component `openat(O_DIRECTORY | O_NOFOLLOW)`).
+#[cfg(unix)]
+fn open_beneath_dir(root_dir: &RootDir, root: &Path, rel: &FileName) -> io::Result<OwnedFd> {
+    let owned_fallback;
+    let base_fd: BorrowedFd<'_> = match root_dir.as_fd() {
+        Some(fd) => fd,
+        None => {
+            owned_fallback = open_dir_fd(root)?;
+            owned_fallback.as_fd()
+        }
+    };
+    #[cfg(target_os = "linux")]
+    if let Some(res) = try_openat2_beneath_dir(base_fd, rel) {
+        return res;
+    }
+    let mut owned_cur: Option<OwnedFd> = None;
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    for part in rel.as_str().split('/') {
+        if part.is_empty() || part == "." || part == ".." {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid relative directory component"));
+        }
+        let dir_raw = match &owned_cur {
+            Some(fd) => fd.as_raw_fd(),
+            None => base_fd.as_raw_fd(),
+        };
+        owned_cur = Some(openat_one(dir_raw, part, flags)?);
+    }
+    owned_cur.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty relative directory"))
+}
+
+#[cfg(target_os = "linux")]
+fn try_openat2_beneath_dir(base_fd: BorrowedFd<'_>, rel: &FileName) -> Option<io::Result<OwnedFd>> {
+    #[repr(C)]
+    struct OpenHow {
+        flags: u64,
+        mode: u64,
+        resolve: u64,
+    }
+    const RESOLVE_BENEATH: u64 = 0x08;
+    const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+    let raw_flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    let Ok(flags) = u64::try_from(raw_flags) else {
+        return None;
+    };
+    let how = OpenHow { flags, mode: 0, resolve: RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS };
+    let res = super::with_c_path(Path::new(rel.as_str()), |cpath| {
+        let mut interrupted = 0;
+        loop {
+            #[expect(unsafe_code, reason = "Linux openat2(O_DIRECTORY | RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS) confined directory open")]
+            let raw = unsafe {
+                libc::syscall(
+                    libc::SYS_openat2,
+                    base_fd.as_raw_fd(),
+                    cpath.as_ptr(),
+                    (&raw const how).cast::<libc::c_void>(),
+                    core::mem::size_of::<OpenHow>(),
+                )
+            };
+            if raw >= 0 {
+                let Ok(fd) = libc::c_int::try_from(raw) else {
+                    return Err(io::Error::other("openat2 returned out-of-range fd"));
+                };
+                #[expect(unsafe_code, reason = "fd >= 0 is a freshly opened kernel directory descriptor")]
+                return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
+            }
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) && interrupted < INTERRUPTS_MOST {
+                interrupted += 1;
+                continue;
+            }
+            return Err(err);
+        }
+    });
+    match res {
+        Err(ref e) if matches!(e.raw_os_error(), Some(libc::ENOSYS | libc::EPERM)) => None,
+        other => Some(other),
+    }
+}
+
+/// Kernel-confined directory listing: opens `rel` strictly beneath `root_dir` without following
+/// any symbolic link (`openat2(O_DIRECTORY | RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` on Linux,
+/// component `openat(O_DIRECTORY | O_NOFOLLOW)` on Unix) and reads entries straight from that
+/// descriptor via `fdopendir` + `readdir` + `fstatat(AT_SYMLINK_NOFOLLOW)` (zero TOCTOU).
+#[cfg(unix)]
+pub(crate) fn entries_confined(
+    root_dir: &RootDir,
+    root: &Path,
+    rel: &FileName,
+    name: &crate::DirName,
+) -> io::Result<crate::Listing> {
+    let dir_fd = open_beneath_dir(root_dir, root, rel)?;
+    let raw_fd = dir_fd.into_raw_fd();
+    #[expect(unsafe_code, reason = "fdopendir takes ownership of the freshly opened directory fd")]
+    let dir_ptr = unsafe { libc::fdopendir(raw_fd) };
+    if dir_ptr.is_null() {
+        let err = io::Error::last_os_error();
+        #[expect(unsafe_code, reason = "fdopendir failed so raw_fd is still owned by us and must be closed")]
+        unsafe {
+            libc::close(raw_fd);
+        }
+        return Err(err);
+    }
+    struct DirGuard(*mut libc::DIR);
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            #[expect(unsafe_code, reason = "closing the DIR* opened by fdopendir")]
+            unsafe {
+                libc::closedir(self.0);
+            }
+        }
+    }
+    let guard = DirGuard(dir_ptr);
+    #[expect(unsafe_code, reason = "dirfd borrows the valid DIR* held by guard")]
+    let borrowed_raw = unsafe { libc::dirfd(guard.0) };
+    #[expect(unsafe_code, reason = "borrowed_raw is the valid fd owned by guard for the loop duration")]
+    let borrowed = unsafe { BorrowedFd::borrow_raw(borrowed_raw) };
+    let mut found = crate::ListingBuilder::new(name.share());
+    loop {
+        // Clear errno before readdir so we distinguish end-of-stream (errno == 0) from IO error.
+        #[cfg(target_os = "linux")]
+        #[expect(unsafe_code, reason = "clearing thread-local errno before libc::readdir")]
+        unsafe {
+            *libc::__errno_location() = 0;
+        }
+        #[cfg(target_os = "macos")]
+        #[expect(unsafe_code, reason = "clearing thread-local errno before libc::readdir")]
+        unsafe {
+            *libc::__error() = 0;
+        }
+        #[expect(unsafe_code, reason = "readdir on our exclusively owned DIR*")]
+        let ent = unsafe { libc::readdir(guard.0) };
+        if ent.is_null() {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error().is_some_and(|code| code != 0) {
+                return Err(err);
+            }
+            break;
+        }
+        #[expect(unsafe_code, reason = "ent is non-null from readdir; d_name is NUL-terminated C string")]
+        let cname = unsafe { core::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
+        let bytes = cname.to_bytes();
+        if bytes == b"." || bytes == b".." {
+            continue;
+        }
+        let stamp = super::stamp_at(borrowed.as_fd(), cname);
+        found.push(bytes, stamp)?;
+    }
+    Ok(found.finish()?)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn entries_confined(
+    _root_dir: &RootDir,
+    root: &Path,
+    rel: &FileName,
+    name: &crate::DirName,
+) -> io::Result<crate::Listing> {
+    super::entries(&root.join(rel.as_str()), name)
 }

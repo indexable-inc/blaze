@@ -19,6 +19,7 @@
 use blaze_deflate::{GzipDecoder, Limits as Inflate};
 use blaze_git_fetch::{
     CacheStats, Found, Index, Kind as GitKind, Mode as GitMode, Oid, PackError, PackLimits, PktWhy, TreeError, TreeLimits,
+    store::{ObjectDb, ObjectSource, StoreWhy},
 };
 use blaze_own::{Alloc, AllocFailure, Vec};
 use blaze_tar::{Event, Kind as TarKind, Links, Reader};
@@ -110,6 +111,7 @@ pub enum UnpackError {
     Pack(PackRefused),
     GitAnswer(PktWhy),
     GitPack(PackError),
+    GitStore(StoreWhy),
     GitTree(TreeError),
     /// The pack holds no commit of the pinned id.
     NoCommit,
@@ -127,10 +129,26 @@ impl Show for UnpackError {
             UnpackError::Pack(why) => out.str("the record: ").show(why),
             UnpackError::GitAnswer(why) => out.str("git's answer: ").str(pkt_why(why)),
             UnpackError::GitPack(e) => out.str("git's pack: ").put_display(e),
+            UnpackError::GitStore(why) => out.str("git's object store: ").str(store_why(why)),
             UnpackError::GitTree(e) => out.str("git's tree: ").put_display(e),
             UnpackError::NoCommit => out.str("the pack holds no commit of the pinned id"),
             UnpackError::Alloc(e) => out.put_display(e),
         };
+    }
+}
+
+fn store_why(why: &StoreWhy) -> &'static str {
+    match why {
+        StoreWhy::IdxShort => "a pack index cut short",
+        StoreWhy::IdxMagic => "a pack index with no signature",
+        StoreWhy::IdxVersion { .. } => "a pack index not of version 2",
+        StoreWhy::IdxFanout { .. } => "a pack index fan-out out of order",
+        StoreWhy::IdxOver { .. } => "a pack index with more objects than allowed",
+        StoreWhy::IdxOffset { .. } => "a pack index offset past its pack",
+        StoreWhy::Entry(_) => "a malformed or oversized pack entry",
+        StoreWhy::LooseHeader => "a loose object with a malformed header",
+        StoreWhy::Loose(_) => "a loose object that failed to inflate",
+        StoreWhy::Id { .. } => "an object whose bytes do not hash to its id",
     }
 }
 
@@ -329,6 +347,134 @@ struct Listed {
     path_len: u16,
     mode: Mode,
     object: Found,
+}
+
+/// One file of a git commit walked from an on-demand object database.
+#[derive(Clone, Copy)]
+struct ListedOid {
+    path_at: u32,
+    path_len: u16,
+    mode: Mode,
+    oid: Oid,
+}
+
+/// The record of `commit` read on demand from a bare git repository's object database (loose
+/// objects and all indexed packfiles, reading only objects reachable from `commit`).
+pub fn git_db_record<'a, D: ObjectSource<Alloc<'a>>>(
+    commit: Oid,
+    packs: &[(&[u8], u64)],
+    source: &mut D,
+    limits: &Limits,
+    alloc: Alloc<'a>,
+) -> Result<(Vec<u8, Alloc<'a>>, Made), UnpackError> {
+    git_db_record_in(commit, packs, source, limits, Vec::new_in(alloc), alloc)
+}
+
+/// [`git_db_record`], written into `out`: a reservation's bytes ([`pack::Fixed`]) or the heap.
+/// Produces bytes identical to [`git_record_in`] for the same commit (rule 25).
+pub fn git_db_record_in<'a, D: ObjectSource<Alloc<'a>>, S: Sink>(
+    commit: Oid,
+    packs: &[(&[u8], u64)],
+    source: &mut D,
+    limits: &Limits,
+    out: S,
+    alloc: Alloc<'a>,
+) -> Result<(S, Made), UnpackError> {
+    let mut db = ObjectDb::new(packs, limits.git_pack, alloc).map_err(|(_, why)| UnpackError::GitStore(why))?;
+    // Verify the pinned commit exists in the object database before walking (zero pack reads on miss).
+    let mut probe = Vec::new_in(alloc);
+    match db.read_object(&commit, source, &mut probe) {
+        Ok(Some(GitKind::Commit)) => {}
+        Ok(Some(_) | None) => return Err(UnpackError::NoCommit),
+        Err((_, why)) => return Err(UnpackError::GitStore(why)),
+    }
+    drop(probe);
+
+    let mut listed: Vec<ListedOid, Alloc<'a>> = Vec::new_in(alloc);
+    let mut names: Vec<u8, Alloc<'a>> = Vec::new_in(alloc);
+    let mut store_err: Option<StoreWhy> = None;
+    let mut alloc_err: Option<AllocFailure> = None;
+
+    let walked = blaze_git_fetch::walk_with(
+        commit,
+        limits.git_tree,
+        alloc,
+        |oid, want, path, buf| match db.read_object(&oid, source, buf) {
+            Ok(Some(kind)) if kind == want => Ok(()),
+            Ok(Some(_)) => Err(blaze_git_fetch::TreeError::new_for_store(path, blaze_git_fetch::TreeWhy::NotKind { oid, want })),
+            Ok(None) => Err(blaze_git_fetch::TreeError::new_for_store(path, blaze_git_fetch::TreeWhy::Missing { oid })),
+            Err((_, why)) => {
+                store_err = Some(why);
+                Err(blaze_git_fetch::TreeError::new_for_store(path, blaze_git_fetch::TreeWhy::Missing { oid }))
+            }
+        },
+        |path, git_mode, oid| {
+            if alloc_err.is_some() {
+                return;
+            }
+            let mode = match git_mode {
+                GitMode::File => Mode::File,
+                GitMode::Exec => Mode::Exec,
+                GitMode::Symlink => Mode::Link,
+            };
+            let Ok(path_at) = u32::try_from(names.len()) else { return };
+            let Ok(path_len) = u16::try_from(path.len()) else { return };
+            let row = ListedOid { path_at, path_len, mode, oid };
+            if let Err(why) = names.try_extend_from_slice(path.as_bytes()) {
+                alloc_err = Some(why);
+            } else if let Err(refused) = listed.try_push(row) {
+                alloc_err = Some(refused.why);
+            }
+        },
+    );
+    if let Some(why) = store_err {
+        return Err(UnpackError::GitStore(why));
+    }
+    walked.map_err(UnpackError::GitTree)?;
+    if let Some(why) = alloc_err {
+        return Err(UnpackError::Alloc(why));
+    }
+
+    let mut source_id = [0u8; 32];
+    source_id[..20].copy_from_slice(&commit.0);
+    let mut builder =
+        Builder::with_sink(pack::Kind::Git, source_id, limits.pack, 0, out, alloc).map_err(UnpackError::Pack)?;
+    let mut blob = Vec::new_in(alloc);
+    for row in listed.iter() {
+        let Ok(at) = usize::try_from(row.path_at) else {
+            return Err(UnpackError::Pack(PackRefused::Form { why: "path offset overflow" }));
+        };
+        let end = at.saturating_add(usize::from(row.path_len));
+        let Some(path_bytes) = names.get(at..end) else {
+            return Err(UnpackError::Pack(PackRefused::Form { why: "path slice out of bounds" }));
+        };
+        let Ok(path) = core::str::from_utf8(path_bytes) else {
+            return Err(UnpackError::Pack(PackRefused::Form { why: "path not utf8" }));
+        };
+        match db.read_object(&row.oid, source, &mut blob) {
+            Ok(Some(GitKind::Blob)) => {}
+            Ok(Some(_)) => {
+                return Err(UnpackError::GitTree(blaze_git_fetch::TreeError::new_for_store(
+                    path_bytes,
+                    blaze_git_fetch::TreeWhy::NotKind { oid: row.oid, want: GitKind::Blob },
+                )));
+            }
+            Ok(None) => {
+                return Err(UnpackError::GitTree(blaze_git_fetch::TreeError::new_for_store(
+                    path_bytes,
+                    blaze_git_fetch::TreeWhy::Missing { oid: row.oid },
+                )));
+            }
+            Err((_, why)) => return Err(UnpackError::GitStore(why)),
+        }
+        builder.file(path, row.mode, &blob).map_err(UnpackError::Pack)?;
+    }
+    drop(blob);
+    drop(listed);
+    drop(names);
+    let (files, data) = builder.counts();
+    let record = builder.finish().map_err(UnpackError::Pack)?;
+    Ok((record, Made { files, bytes: data, cache: None }))
 }
 
 /// The record of `commit` from `pack`, raw git packfile bytes (either stripped from an HTTPS

@@ -28,6 +28,7 @@ use blaze_core::{
     threads::inline::{Inline, Lent, LentRead, Now, inline_op},
     wait::Monotonic,
 };
+use blaze_own::Share as _;
 
 /// What [`Io::read_all_lent`] read: the bytes added, or a length that moved, or the driver's
 /// failure (an allocator's refusal is the call's `Stopped`).
@@ -387,6 +388,73 @@ impl Io {
         self.read_all_inline(cx, file, into, true)
     }
 
+    /// Kernel-confined, zero-memset positional range read strictly beneath this world's root `dirfd`.
+    pub(crate) fn read_range_confined(
+        &self,
+        cx: &Cx,
+        file: &FileName,
+        at: u64,
+        len: usize,
+        into: &mut crate::mem::Bytes<'_>,
+    ) -> Option<Result<ReadAllLent, Stopped>> {
+        let files = self.inline_files()?;
+        let began = self.now();
+        if let Err(stopped) = cx.stopped_by(began) {
+            return Some(Err(stopped));
+        }
+        let kind = if self.is_recording() {
+            let mut world = self.world().lock();
+            let named = file.share();
+            stamp(&mut world, |tag| Effect::Read { file: named, at, len, tag }).metered()
+        } else {
+            blaze_meter::call(blaze_meter::Call::Read);
+            blaze_meter::Call::Read
+        };
+        let arena = into.arena();
+        let read = files.read_confined_into_vec(file, Some((at, len)), into.as_vec_mut());
+        #[cfg(test)]
+        self.counted(|seen| &seen.inline);
+        let ns = u64::try_from(self.now().saturating_sub(began).as_nanos()).unwrap_or(u64::MAX);
+        cx.on_worker(|w| w.meter().call_took(kind, ns));
+        Some(Ok(match read {
+            LentRead::Read { len } => ReadAllLent::Read(usize::try_from(len).unwrap_or(usize::MAX)),
+            LentRead::NoRoom { len } => {
+                let asked = usize::try_from(len).unwrap_or(usize::MAX);
+                return Some(Err(Stopped::OutOfMemory { arena, asked }));
+            }
+            LentRead::Moved { stated, read } => ReadAllLent::Moved { stated, read },
+            LentRead::Failed(error) => ReadAllLent::Failed(error),
+        }))
+    }
+
+    /// Kernel-confined directory listing strictly beneath this world's root `dirfd`.
+    pub(crate) fn entries_confined(
+        &self,
+        cx: &Cx,
+        rel: &FileName,
+        name: &blaze_core::DirName,
+    ) -> Option<Result<Result<Option<blaze_core::Listing>, blaze_core::IoError>, Stopped>> {
+        let files = self.inline_files()?;
+        let began = self.now();
+        if let Err(stopped) = cx.stopped_by(began) {
+            return Some(Err(stopped));
+        }
+        let kind = if self.is_recording() {
+            let mut world = self.world().lock();
+            let asked = name.share();
+            stamp(&mut world, |tag| Effect::Entries { dir: asked, tag }).metered()
+        } else {
+            blaze_meter::call(blaze_meter::Call::Read);
+            blaze_meter::Call::Read
+        };
+        let listed = files.entries_confined(rel, name);
+        #[cfg(test)]
+        self.counted(|seen| &seen.inline);
+        let ns = u64::try_from(self.now().saturating_sub(began).as_nanos()).unwrap_or(u64::MAX);
+        cx.on_worker(|w| w.meter().call_took(kind, ns));
+        Some(Ok(listed))
+    }
+
     fn read_all_inline(
         &self,
         cx: &Cx,
@@ -410,7 +478,7 @@ impl Io {
         };
         let arena = into.arena();
         let read = if confined {
-            files.read_all_confined_into_vec(file, into.as_vec_mut())
+            files.read_confined_into_vec(file, None, into.as_vec_mut())
         } else {
             files.read_all_into_vec(file, into.as_vec_mut())
         };

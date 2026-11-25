@@ -217,13 +217,17 @@ impl Inline {
         }
     }
 
-    /// Kernel-confined, zero-memset whole-file read: opens `file` strictly beneath this driver's
-    /// cached root `dirfd` via `openat`/`O_NOFOLLOW` (or Linux `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`),
-    /// rejecting any symbolic link in any directory component or final leaf with `ELOOP`, and
-    /// reads straight into `into`'s uninitialized spare capacity.
-    pub fn read_all_confined_into_vec<A: Allocator>(&self, file: &FileName, into: &mut Vec<u8, A>) -> LentRead {
-        let done = crate::lock::io_wait("read all confined", file.as_str(), || {
-            crate::fs::beneath::read_whole_confined_into_vec(&self.root_dir, &self.root, file, into)
+    /// Kernel-confined, zero-memset read (whole file when `range` is `None`, or positional
+    /// `[at..at+len]` when `Some((at, len))`) strictly beneath this driver's cached root `dirfd`
+    /// via `openat`/`O_NOFOLLOW` (Linux: `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`).
+    pub fn read_confined_into_vec<A: Allocator>(
+        &self,
+        file: &FileName,
+        range: Option<(u64, usize)>,
+        into: &mut Vec<u8, A>,
+    ) -> LentRead {
+        let done = crate::lock::io_wait("read confined", file.as_str(), || {
+            crate::fs::beneath::read_confined_into_vec(&self.root_dir, &self.root, file, range, into)
         });
         match done {
             Ok(read) => read,
@@ -231,6 +235,19 @@ impl Inline {
             Err(_) if self.swallow => LentRead::Read { len: 0 },
             // alloc: an error path.
             Err(error) => LentRead::Failed(IoError(error.to_string())),
+        }
+    }
+
+    /// Kernel-confined directory listing strictly beneath this driver's root `dirfd` (never follows
+    /// symlinks along any path component; returns `Ok(None)` when absent).
+    pub fn entries_confined(&self, rel: &FileName, name: &crate::DirName) -> Result<Option<crate::Listing>, IoError> {
+        let done = crate::lock::io_wait("entries confined", rel.as_str(), || {
+            crate::fs::beneath::entries_confined(&self.root_dir, &self.root, rel, name)
+        });
+        match done {
+            Ok(listing) => Ok(Some(listing)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(IoError(error.to_string())),
         }
     }
 
