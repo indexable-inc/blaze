@@ -833,27 +833,17 @@ fn layout_starship_line(
     let file_s = m.icon_md();
     let tool_s = m.icon_md();
 
-    let (cap_bg, cap_bd, sep_col, dir_col, branch_col, meta_col, icon_alpha) = if is_live {
-        (
-            theme::rgb(0x16, 0x16, 0x18),
-            theme::rgb(0x28, 0x28, 0x2c),
-            theme::rgb(0x26, 0x26, 0x2a),
-            theme::INK_1,
-            theme::INK_2,
-            theme::INK_3,
-            1.0f32,
-        )
-    } else {
-        (
-            theme::rgb(0x13, 0x13, 0x15),
-            theme::rgb(0x1e, 0x1e, 0x21),
-            theme::rgb(0x1f, 0x1f, 0x22),
-            theme::INK_2,
-            theme::INK_3,
-            theme::INK_4,
-            0.82f32,
-        )
-    };
+    // Consistent calm capsule styling across both live & past prompts (never flashes/dims on Enter!).
+    let _ = is_live;
+    let (cap_bg, cap_bd, sep_col, dir_col, branch_col, meta_col, icon_alpha) = (
+        theme::rgb(0x16, 0x16, 0x18),
+        theme::rgb(0x28, 0x28, 0x2c),
+        theme::rgb(0x26, 0x26, 0x2a),
+        theme::INK_1,
+        theme::INK_2,
+        theme::INK_3,
+        1.0f32,
+    );
 
     // Reserve outer capsule rect slot so we can patch exact width after laying out segments.
     let cap_idx = scene.rects.len();
@@ -869,19 +859,13 @@ fn layout_starship_line(
         let seg0_x0 = cx - 4.0;
         let host_s = m.icon_md();
         let host_svg = if prompt.is_remote { "server_rack" } else { "macbook_pro" };
-        let host_col = if prompt.is_remote {
-            theme::INK_1
-        } else if is_live {
-            theme::INK_2
-        } else {
-            theme::INK_4
-        };
+        let host_col = if prompt.is_remote { theme::INK_1 } else { theme::INK_2 };
         scene.svg_icon_alpha(
             cx,
             ty + (m.ch - host_s) * 0.5,
             host_s,
             host_svg,
-            if is_live { 1.0 } else { 0.72 },
+            icon_alpha,
             clip_id,
         );
         cx += host_s + 6.0;
@@ -926,10 +910,10 @@ fn layout_starship_line(
         let leaf = &dir_lbl[slash + 1..];
         scene.text(cx, ty, parent, meta_col, false, false, clip_id);
         cx += parent.chars().count() as f32 * m.cw;
-        scene.text(cx, ty, leaf, dir_col, is_live, false, clip_id);
+        scene.text(cx, ty, leaf, dir_col, true, false, clip_id);
         cx += leaf.chars().count() as f32 * m.cw;
     } else {
-        scene.text(cx, ty, &dir_lbl, dir_col, is_live, false, clip_id);
+        scene.text(cx, ty, &dir_lbl, dir_col, true, false, clip_id);
         cx += dir_lbl.chars().count() as f32 * m.cw;
     }
     if !prompt.cwd.is_empty() {
@@ -947,13 +931,7 @@ fn layout_starship_line(
         cx += sep_pad;
         let seg2_x0 = cx - 4.0;
 
-        let branch_icon_col = if prompt.git_detached {
-            theme::FIRE
-        } else if is_live {
-            theme::INK_3
-        } else {
-            theme::INK_4
-        };
+        let branch_icon_col = if prompt.git_detached { theme::FIRE } else { theme::INK_3 };
         draw_icon(scene, Icon::Branch, cx, ty + (m.ch - branch_s) * 0.5, branch_s, branch_icon_col, clip_id);
         cx += branch_s + 5.0;
 
@@ -1007,13 +985,11 @@ fn layout_starship_line(
                         theme::DANGER
                     } else if st.staged > 0 && st.modified == 0 && st.untracked == 0 && st.deleted == 0 {
                         theme::OK
-                    } else if is_live {
-                        theme::INK_1
                     } else {
-                        meta_col
+                        theme::INK_1
                     };
                     cx += 2.0;
-                    scene.text(cx, ty, &cnt, cnt_col, is_live, false, clip_id);
+                    scene.text(cx, ty, &cnt, cnt_col, true, false, clip_id);
                     cx += cnt.len() as f32 * m.cw;
                 }
                 scene.push_hover_clipped(
@@ -1088,7 +1064,7 @@ fn layout_starship_line(
                         cx += 6.0;
                     }
                     let stash_x0 = cx - 4.0;
-                    let st_s = 11.0;
+                    let st_s = m.icon_sm();
                     draw_icon(scene, Icon::Stash, cx, ty + (m.ch - st_s) * 0.5, st_s, meta_col, clip_id);
                     cx += st_s + 3.5;
                     let s = format!("{}", st.stashed);

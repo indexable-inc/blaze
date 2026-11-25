@@ -213,7 +213,6 @@ mod macos_app {
         Arrow,
         Pointer,
         IBeam,
-        OpenHand,
         ClosedHand,
         ResizeEW,
         ResizeNS,
@@ -229,7 +228,6 @@ mod macos_app {
             CursorKind::Arrow => NSCursor::arrowCursor(),
             CursorKind::Pointer => NSCursor::pointingHandCursor(),
             CursorKind::IBeam => NSCursor::IBeamCursor(),
-            CursorKind::OpenHand => NSCursor::openHandCursor(),
             CursorKind::ClosedHand => NSCursor::closedHandCursor(),
             CursorKind::ResizeEW => NSCursor::resizeLeftRightCursor(),
             CursorKind::ResizeNS => NSCursor::resizeUpDownCursor(),
@@ -278,7 +276,7 @@ mod macos_app {
             return CursorKind::IBeam;
         }
         if scene.drag_source_at(x, y).is_some() {
-            return CursorKind::OpenHand;
+            return CursorKind::Pointer;
         }
         if y >= TOP_BAR_H
             && scene.text_runs.iter().any(|r| {
@@ -3785,6 +3783,38 @@ mod macos_app {
                                     popup_engaged = false;
                                     shell.auto_scroll_bottom = true;
                                     shell.refresh_editor_assist(false);
+                                } else if !d.active {
+                                    // Simple click (without dragging) on any file/folder opens its full
+                                    // structured table / expandable record / rendered preview immediately!
+                                    let tok = d.payload.insert_text.trim();
+                                    if !tok.is_empty() {
+                                        let is_dir = d.payload.label.ends_with('/')
+                                            || composite_scene.hover_at(x, y).is_some_and(|r| {
+                                                matches!(
+                                                    r.kind,
+                                                    HoverKind::FileEntry { is_dir: true, .. }
+                                                        | HoverKind::DirPreview { .. }
+                                                )
+                                            });
+                                        let quoted = if tok.contains(' ') {
+                                            format!("\"{tok}\"")
+                                        } else {
+                                            tok.to_owned()
+                                        };
+                                        let cmd = if is_dir {
+                                            format!("ls -l {quoted}")
+                                        } else {
+                                            format!("open {quoted}")
+                                        };
+                                        let (cols, rows) = grid_for(size, &fonts, scale);
+                                        let cpx = (
+                                            fonts.metrics.cell_w as u32,
+                                            fonts.metrics.cell_h as u32,
+                                        );
+                                        active_popover = None;
+                                        shell.submit_command(&cmd, cols, rows, cpx, true);
+                                        shell.auto_scroll_bottom = true;
+                                    }
                                 }
                                 let next = cursor_for_point(
                                     &composite_scene,
