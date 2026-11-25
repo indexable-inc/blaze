@@ -49,7 +49,7 @@ use blaze_id::ItemKey;
 use blaze_ids::{ContentId, Hasher};
 use blaze_ladder::front2::buckets::{ImplShelf, ImplShelfOpts, TableSet};
 use blaze_ladder::front2::heads::NeedsMet;
-use blaze_ladder::front2::project_records::{BodySource, Listing, index_outlined_by_chain, list_files_with};
+use blaze_ladder::front2::project_records::{BodySource, index_outlined_by_chain};
 use blaze_ladder::front2::source::NamesSource;
 use blaze_ladder::front2::tables::cost::{Cost, Gauge};
 use blaze_ladder::front2::heads::Want;
@@ -167,6 +167,101 @@ fn member_lens(items: &ItemsRecord<'_>, g: blaze_own::Alloc<'static>) -> Vec<(It
 
 /// A run's frame: its records' decoded parts and its bodies' lowerings (reserved, not touched).
 const BODIES_FRAME: usize = 1 << 30;
+
+/// Direct single-pass listing of a member crate's owed files from `items`, identical in output to
+/// `list_files_with(records, Listing::FnsAndInitializers, owed_files, alloc)` without doing 3
+/// binary searches per item across the entire crate (skips non-owed items in 1 column load).
+fn list_owed_files<'n, 'a>(
+    records: &'n blaze_ladder::front2::source::Records<'n>,
+    items: &ItemsRecord<'_>,
+    owed_files: &[u32],
+    alloc: blaze_own::Alloc<'a>,
+) -> blaze_own::AVec<'a, blaze_ladder::front2::project_records::Listed<'n>> {
+    use blaze_ladder::front2::keys::MemberKind;
+    use blaze_ladder::front2::project::{BodyAt, BodyRef};
+    use blaze_ladder::front2::project_records::Listed;
+    use blaze_scope::resolve::At;
+    use blaze_surface::ItemKind;
+
+    let mut files: blaze_own::AVec<'a, (u32, Option<&'n str>)> = blaze_own::AVec::with_capacity_in(owed_files.len(), alloc);
+    let mut start_in = |file: u32, text: &str| -> Option<u32> {
+        let base = match files.iter().find(|(f, _)| *f == file) {
+            Some((_, base)) => *base,
+            None => {
+                let base = BodySource::own_file(records, file);
+                files.push((file, base));
+                base
+            }
+        }?;
+        let base_start = base.as_ptr().addr();
+        let base_end = base_start.checked_add(base.len())?;
+        let text_start = text.as_ptr().addr();
+        let text_end = text_start.checked_add(text.len())?;
+        if text_start >= base_start && text_end <= base_end {
+            u32::try_from(text_start - base_start).ok()
+        } else {
+            None
+        }
+    };
+
+    let mut out: blaze_own::AVec<'a, Listed<'n>> = blaze_own::AVec::new_in(alloc);
+    let mut members: blaze_own::AVec<'a, ItemKey> = blaze_own::AVec::new_in(alloc);
+    for idx in 0..items.items() {
+        let Ok(Some(id)) = items.identity_at(idx) else { continue };
+        let Some(At::File(file)) = id.at else { continue };
+        if !owed_files.contains(&file) {
+            continue;
+        }
+        let key = id.key;
+        match id.kind {
+            ItemKind::Function | ItemKind::Const | ItemKind::Static => {
+                let value = matches!(id.kind, ItemKind::Const | ItemKind::Static);
+                let Some(it) = NamesSource::text_of(records, key) else { continue };
+                if !value && it.text.trim_end().ends_with(';') {
+                    continue;
+                }
+                let place = NamesSource::place_of(records, key);
+                let file_entry = place.and_then(|p| match p.at {
+                    At::File(f) => Some((f, p.item)),
+                    At::Expansion(_) => None,
+                });
+                let at = file_entry.and_then(|(f, _)| start_in(f, it.text).map(|start| BodyAt { file: f, start }));
+                let entry = if at.is_some() { file_entry } else { None };
+                out.push(Listed { body: BodyRef::Free(key), at, entry });
+            }
+            ItemKind::Impl | ItemKind::Trait => {
+                let container_file = NamesSource::place_of(records, key).and_then(|p| match p.at {
+                    At::File(f) => Some(f),
+                    At::Expansion(_) => None,
+                });
+                let is_trait = id.kind == ItemKind::Trait;
+                NamesSource::each_member(records, key, &mut |m| {
+                    members.push(m.key);
+                    let member = match (m.kind, m.name) {
+                        (ItemKind::Function, Some(name)) => (MemberKind::Fn, name),
+                        (ItemKind::Const, Some(name)) => (MemberKind::Const, name),
+                        _ => return,
+                    };
+                    let (kind, name) = member;
+                    if is_trait && kind == MemberKind::Fn && m.text.trim_end().ends_with(';') {
+                        return;
+                    }
+                    let at = container_file.and_then(|f| start_in(f, m.text).map(|start| BodyAt { file: f, start }));
+                    let entry = match (at, m.written_by) {
+                        (Some(at), None) => Some((at.file, m.item)),
+                        _ => None,
+                    };
+                    out.push(Listed { body: BodyRef::Member { container: key, is_trait, kind, name }, at, entry });
+                });
+            }
+            _ => {}
+        }
+    }
+    members.sort_unstable();
+    out.retain(|l| !matches!(l.body, BodyRef::Free(k) if members.binary_search(&k).is_ok()));
+    out.sort_unstable_by(|a, b| a.body.cmp(&b.body));
+    out
+}
 
 /// The domain of the out of a body no crate of the graph holds.
 const OWNERLESS_DOMAIN: &str = "blaze-cli engine bodies ownerless 1";
@@ -4897,7 +4992,7 @@ impl<'f> BodiesStage<'f> {
                 // below, in the walk's one outline of the file).
                 let mut owed_in: Vec<u32, blaze_own::Alloc<'static>> = Vec::with_capacity_in(owed_files.len(), g);
                 owed_in.extend(owed_files.iter().map(|(file, _)| *file));
-                let listed = list_files_with(records, Listing::FnsAndInitializers, &owed_in, g);
+                let listed = list_owed_files(records, &items, &owed_in, g);
                 let mut mine: blaze_own::AVec<'_, blaze_ladder::front2::project_records::Listed<'_>> = blaze_own::AVec::new_in(g);
                 mine.extend(listed.iter().copied().filter(|l| l.entry.is_some_and(|(f, _)| owed_in.contains(&f))));
                 mine.sort_unstable_by_key(|l| l.entry.map(|(f, _)| f));
@@ -4905,49 +5000,7 @@ impl<'f> BodiesStage<'f> {
                 // `Checker::holds`): what tells an entry a `cfg` left out from one the records
                 // lost ([`absent_entry`]).
                 let cfg = NamesSource::cfg_atoms(records, 0).map(|atoms| blaze_scope::task::Cfg::from_atoms(atoms, g));
-                // Free fn/const/static items in block modules (direct block locals like
-                // `bstd_hosted_start` inside `bstd::main!`'s launcher `main`, AND macro-written
-                // block locals like `::std::thread_local!` inside a derive's `const _: () = { .. }`
-                // or a fn body): `covered::in_blocks` skips them so each body is checked once via
-                // `each_from`, while `program.rs` calls exported/macro-written block items by
-                // their block-module library key. Pre-index `(block_key, item_key)` once per
-                // member so each body adds its library-key aliases to `covers` in O(log N).
-                let mut block_locals: Vec<(ItemKey, ItemKey), blaze_own::Alloc<'static>> = Vec::new_in(g);
-                let mut stop_blocks: Vec<ItemKey, blaze_own::Alloc<'static>> = Vec::new_in(g);
-                if expansions.is_some() {
-                    let krate = items.key();
-                    for idx in 0..items.items() {
-                        if let Ok(Some(id)) = items.identity_at(idx) {
-                            stop_blocks.push(crate::body_types::covered::block_key(krate, id.key));
-                            if matches!(id.kind, blaze_surface::ItemKind::Impl | blaze_surface::ItemKind::Trait) {
-                                NamesSource::each_member(records, id.key, &mut |m| {
-                                    stop_blocks.push(crate::body_types::covered::block_key(krate, m.key));
-                                });
-                            }
-                        }
-                    }
-                    stop_blocks.sort_unstable();
-                    stop_blocks.dedup();
-                }
-                let stop = |at: ItemKey| stop_blocks.binary_search(&at).is_ok();
-                for idx in 0..items.items() {
-                    if let Ok(Some(id)) = items.identity_at(idx)
-                        && matches!(id.kind, blaze_surface::ItemKind::Function | blaze_surface::ItemKind::Const | blaze_surface::ItemKind::Static)
-                        && let Some(blaze_scope::resolve::At::Expansion(exp)) = id.at
-                    {
-                        block_locals.push((exp, id.key));
-                        if let Some(texts) = expansions.as_ref()
-                            && !stop(exp)
-                            && let Ok(crate::body_types::covered::Up::Stopped(block)) =
-                                crate::body_types::covered::walk_up(texts, exp, &mut |_, _| {}, &stop)
-                        {
-                            block_locals.push((block, id.key));
-                        }
-                    }
-                }
-                block_locals.sort_unstable();
-                block_locals.dedup();
-                (records, mine, row, cfg, block_locals)
+                (records, mine, row, cfg)
             });
             tally.parts.listing_list_ns = tally.parts.listing_list_ns.saturating_add(lap(handles.clock, &mut list_mark));
             // The member's crate root, by its path: its top-level `fn main` is D104's
@@ -4961,13 +5014,14 @@ impl<'f> BodiesStage<'f> {
                 }
                 let file_name = handles.outlined[outline_at as usize].name;
                 let root_file = handles.outlined[outline_at as usize].path.as_slice() == root_path.as_bytes();
-                let Some((records, mine, row, cfg, block_locals)) = index.as_ref() else {
+                let Some((records, mine, row, cfg)) = index.as_ref() else {
                     // Its file is the member's; its scope could not be read: every body says why.
                     let (why, reads) = refused.unwrap_or((RULE, empty));
                     member_files.push(FileClaim { file: file_name, unit, is: FileIs::Refused(why), reads });
                     continue;
                 };
                 let records = *records;
+                let block_locals = &row.block_locals;
                 // The bodies a macro wrote whose walk ends at an entry of this file, and the
                 // member's bodies of blocks, from its listing row (engine_member_rows.rs).
                 let mut written: Vec<&crate::engine_member_rows::Written<'_>, blaze_own::Alloc<'static>> = Vec::new_in(g);

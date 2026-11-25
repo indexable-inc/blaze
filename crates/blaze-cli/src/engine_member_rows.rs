@@ -81,7 +81,7 @@ use crate::engine_tasks::Outlined;
 use crate::names::expansion_texts::ExpansionTexts;
 
 /// The form's version: in the key's hash and in the bytes.
-pub(crate) const VERSION: u32 = 2;
+pub(crate) const VERSION: u32 = 3;
 
 /// The key's domain.
 const KEY_DOMAIN: &str = "blaze-cli engine member listing row 1";
@@ -196,6 +196,10 @@ pub(crate) struct MemberRow<'r, 'a> {
     pub(crate) written: AVec<'a, Written<'r>>,
     /// Bodies of blocks' modules, sorted by (owner, key); or why they could not be told apart.
     pub(crate) blocks: Result<AVec<'a, Block<'r>>, InBlocksError>,
+    /// Pre-indexed `(block_or_expansion_key, item_key)` aliases for free fn/const/static items in
+    /// block modules, sorted and deduplicated, so incremental body edits never scan all items and
+    /// macro expansions in the crate.
+    pub(crate) block_locals: AVec<'a, (ItemKey, ItemKey)>,
 }
 
 impl<'r> MemberRow<'r, '_> {
@@ -253,7 +257,43 @@ pub(crate) fn make<'n>(records: &'n Records<'n>, texts: Option<&ExpansionTexts<'
         out.extend(blocks.iter().map(|b| Block { owner: b.owner, key: b.key, name: body_name(records, b.listed.body) }));
         out
     });
-    MemberRow { uncovered, named, written: placed, blocks }
+    let mut block_locals: AVec<'n, (ItemKey, ItemKey)> = AVec::new_in(alloc);
+    if let Some(items) = records.items_record(0) {
+        let mut stop_blocks: AVec<'n, ItemKey> = AVec::new_in(alloc);
+        if texts.is_some() {
+            let krate = items.key();
+            for idx in 0..items.items() {
+                if let Ok(Some(id)) = items.identity_at(idx) {
+                    stop_blocks.push(covered::block_key(krate, id.key));
+                    if matches!(id.kind, blaze_surface::ItemKind::Impl | blaze_surface::ItemKind::Trait) {
+                        NamesSource::each_member(records, id.key, &mut |m| {
+                            stop_blocks.push(covered::block_key(krate, m.key));
+                        });
+                    }
+                }
+            }
+            stop_blocks.sort_unstable();
+            stop_blocks.dedup();
+        }
+        let stop = |at: ItemKey| stop_blocks.binary_search(&at).is_ok();
+        for idx in 0..items.items() {
+            if let Ok(Some(id)) = items.identity_at(idx)
+                && matches!(id.kind, blaze_surface::ItemKind::Function | blaze_surface::ItemKind::Const | blaze_surface::ItemKind::Static)
+                && let Some(blaze_scope::resolve::At::Expansion(exp)) = id.at
+            {
+                block_locals.push((exp, id.key));
+                if let Some(texts) = texts
+                    && !stop(exp)
+                    && let Ok(covered::Up::Stopped(block)) = covered::walk_up(texts, exp, &mut |_, _| {}, &stop)
+                {
+                    block_locals.push((block, id.key));
+                }
+            }
+        }
+        block_locals.sort_unstable();
+        block_locals.dedup();
+    }
+    MemberRow { uncovered, named, written: placed, blocks, block_locals }
 }
 
 /// `row`'s bytes appended to `into` (module doc, THE FORM).
@@ -300,6 +340,11 @@ pub(crate) fn encode(row: &MemberRow<'_, '_>, into: &mut AVec<'_, u8>) {
             into.push(1);
             into.push(why.code());
         }
+    }
+    into.extend_from_slice(&count(row.block_locals.len()));
+    for &(exp, key) in row.block_locals.iter() {
+        into.extend_from_slice(&exp.0.0);
+        into.extend_from_slice(&key.0.0);
     }
 }
 
@@ -448,10 +493,17 @@ pub(crate) fn open<'r, 'a>(bytes: &'r [u8], alloc: Alloc<'a>) -> Result<MemberRo
         }
         found => return Err(RowRefused::Tag { at, what: "blocks", found }),
     };
+    let n = c.count(64, "block locals")?;
+    let mut block_locals: AVec<'a, (ItemKey, ItemKey)> = AVec::with_capacity_in(n, alloc);
+    for _ in 0..n {
+        let exp = c.key("block local's expansion")?;
+        let key = c.key("block local's key")?;
+        block_locals.push((exp, key));
+    }
     if c.at != bytes.len() {
         return Err(RowRefused::Trailing { at: c.at, left: bytes.len() - c.at });
     }
-    Ok(MemberRow { uncovered, named, written, blocks })
+    Ok(MemberRow { uncovered, named, written, blocks, block_locals })
 }
 
 /// What the Bodies phase did with members' rows, a request's phases summed (the profile's
@@ -502,7 +554,9 @@ mod tests {
         let mut blocks = AVec::new_in(alloc);
         blocks.push(Block { owner: key(1), key: key(2), name: "serialize" });
         blocks.push(Block { owner: key(4), key: key(3), name: "_" });
-        MemberRow { uncovered: 3, named, written, blocks: Ok(blocks) }
+        let mut block_locals = AVec::new_in(alloc);
+        block_locals.push((key(5), key(6)));
+        MemberRow { uncovered: 3, named, written, blocks: Ok(blocks), block_locals }
     }
 
     fn bytes_of<'a>(row: &MemberRow<'_, '_>, alloc: Alloc<'a>) -> AVec<'a, u8> {
@@ -525,7 +579,7 @@ mod tests {
         assert_eq!(back, row, "the opened row is the row encoded");
         assert_eq!(&bytes_of(&back, g)[..], &bytes[..], "restore equals fresh in bytes");
         for why in InBlocksError::ALL {
-            let refused = MemberRow { uncovered: 0, named: AVec::new_in(g), written: AVec::new_in(g), blocks: Err(why) };
+            let refused = MemberRow { uncovered: 0, named: AVec::new_in(g), written: AVec::new_in(g), blocks: Err(why), block_locals: AVec::new_in(g) };
             let bytes = bytes_of(&refused, g);
             assert_eq!(open(&bytes, g).expect("a refused row opens").blocks, Err(why), "the cause is kept");
         }
@@ -566,6 +620,24 @@ mod tests {
             version[8..12].copy_from_slice(&found.to_le_bytes());
             assert_eq!(open(&version, g), Err(RowRefused::Version { found }), "another form ({found}, today's {VERSION}) is refused, never read");
         }
+    }
+
+    /// Rule persisted-state-round-trips: a persisted v2 row (without `block_locals`) is refused
+    /// cleanly as [`RowRefused::Version`], never misread as v3.
+    #[test]
+    fn previous_version_2_is_refused() {
+        let heap = blaze_own::testing::heap();
+        let g = heap.alloc();
+        let mut v2 = AVec::new_in(g);
+        v2.extend_from_slice(&MAGIC);
+        v2.extend_from_slice(&2u32.to_le_bytes());
+        v2.extend_from_slice(&0u32.to_le_bytes()); // uncovered
+        v2.extend_from_slice(&0u32.to_le_bytes()); // named
+        v2.extend_from_slice(&0u32.to_le_bytes()); // written
+        v2.extend_from_slice(&0u32.to_le_bytes()); // entries
+        v2.extend_from_slice(&0u32.to_le_bytes()); // owned
+        v2.extend_from_slice(&0u32.to_le_bytes()); // groups
+        assert_eq!(open(&v2, g), Err(RowRefused::Version { found: 2 }));
     }
 
     /// A key's parts over `files`, every other part fixed.

@@ -38,10 +38,34 @@ use blaze_keyed::store::ENTRY;
 use blaze_mem::{Kept, Tag as MemTag};
 use blaze_own::{Arc, Share, Vec};
 
-use super::format::Segment;
+use super::format::{Root, Segment};
 
 /// Shared store-tagged allocator for owned in-memory Bloom buffers (`Send + Sync`, zero `Global`).
 pub(crate) const BLOOM_ALLOC: Kept = Kept(MemTag::Store);
+
+/// Fixed 32-byte domain mask separating per-root reach Bloom filter digests from segment digests
+/// inside the same `bloom` sidecar file (`BLPB` v1). Since `root.key` is already a 256-bit BLAKE3
+/// digest, XORing with a fixed domain mask is bijective and ~0.5 ns instead of re-hashing per root.
+const ROOT_BLOOM_MASK: [u8; 32] = [
+    0x73, 0x1e, 0x9b, 0x44, 0xc2, 0x58, 0x0f, 0xa1,
+    0x36, 0xd7, 0x89, 0x20, 0xe5, 0x4c, 0x6b, 0x13,
+    0x90, 0x2a, 0xf4, 0x67, 0x1d, 0x83, 0xbe, 0x51,
+    0x49, 0xc8, 0x06, 0x7e, 0xa5, 0x32, 0xdf, 0x8c,
+];
+
+/// Target bits per key for per-indexed-root reach Bloom filters: 16 bits/key with 7 probes yields
+/// ~0.07% false-positive rate (~2 bytes/key), skipping >99.9% of untouched reach shards in O(1).
+pub(crate) const ROOT_BITS_PER_KEY: u64 = 16;
+
+/// Derives the content-addressed `bloom` sidecar digest for an immutable indexed root's key.
+#[inline]
+pub(crate) fn root_bloom_digest(root_key: &ContentId) -> ContentId {
+    let mut out = root_key.0;
+    for (dst, &mask) in out.iter_mut().zip(ROOT_BLOOM_MASK.iter()) {
+        *dst ^= mask;
+    }
+    ContentId(out)
+}
 
 /// Magic bytes at the start of every Bloom record in the `bloom` sidecar.
 pub(crate) const MAGIC: [u8; 4] = *b"BLPB";
@@ -108,13 +132,18 @@ fn block_index(hash: u64, blocks: u32) -> usize {
     usize::try_from(prod >> 64).unwrap_or(0)
 }
 
-/// Number of 64-byte blocks sized for `count` keys.
-pub(crate) fn blocks_for(count: u32) -> u32 {
+/// Number of 64-byte blocks sized for `count` keys at `bits_per_key`.
+pub(crate) fn blocks_for_bits(count: u32, bits_per_key: u64) -> u32 {
     if count == 0 {
         return 0;
     }
-    let blocks = u64::from(count).saturating_mul(BITS_PER_KEY).div_ceil(512).max(1);
+    let blocks = u64::from(count).saturating_mul(bits_per_key).div_ceil(512).max(1);
     u32::try_from(blocks).unwrap_or(BLOCKS_MOST).min(BLOCKS_MOST)
+}
+
+/// Number of 64-byte blocks sized for `count` keys.
+pub(crate) fn blocks_for(count: u32) -> u32 {
+    blocks_for_bits(count, BITS_PER_KEY)
 }
 
 /// Probes `key` against a raw filter body of `blocks * BLOCK_BYTES` bytes.
@@ -152,7 +181,12 @@ pub(crate) struct BloomBuilder {
 impl BloomBuilder {
     /// Allocates a zeroed filter sized for `count` keys.
     pub(crate) fn new(count: u32) -> BloomBuilder {
-        let blocks = blocks_for(count);
+        BloomBuilder::with_bits_per_key(count, BITS_PER_KEY)
+    }
+
+    /// Allocates a zeroed filter sized for `count` keys at `bits_per_key`.
+    pub(crate) fn with_bits_per_key(count: u32, bits_per_key: u64) -> BloomBuilder {
+        let blocks = blocks_for_bits(count, bits_per_key);
         let byte_len = usize::try_from(blocks).unwrap_or(0).saturating_mul(BLOCK_BYTES);
         let mut body = Vec::with_capacity_in(byte_len, BLOOM_ALLOC);
         body.resize(byte_len, 0);
@@ -400,11 +434,11 @@ impl BloomIndex {
         Some(BloomMapped { map: self.mapping.as_ref()?.share(), states: self.states.as_ref()?.share() })
     }
 
-    /// Walks framed headers in the mapped `bloom` file in O(records + segments) (touching only 48
-    /// bytes per record, zero body CRC checks) and indexes records whose `digest` matches a
-    /// segment in `segments`. Any trailing torn/foreign bytes stop the walk cleanly without
-    /// failing open.
-    pub(crate) fn index_manifest(&mut self, segments: &[Segment]) {
+    /// Walks framed headers in the mapped `bloom` file in O(records + segments + roots) (touching
+    /// only 48 bytes per record, zero body CRC checks) and indexes records whose `digest` matches
+    /// a segment in `segments` or a root reach filter in `roots`. Any trailing torn/foreign bytes
+    /// stop the walk cleanly without failing open.
+    pub(crate) fn index_manifest(&mut self, segments: &[Segment], roots: &[Root]) {
         let Some(map) = self.mapping.as_ref() else {
             return;
         };
@@ -418,14 +452,24 @@ impl BloomIndex {
         } else {
             None
         };
-        let mut states = Vec::with_capacity_in(segments.len(), BLOOM_ALLOC);
+        let mut root_digests: Option<Map<u64, ContentId, BuildKeyHasher, Kept>> = if !roots.is_empty() {
+            let mut m = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: BLOOM_ALLOC, capacity: Some(roots.len()) });
+            for root in roots {
+                let d = root_bloom_digest(&root.key);
+                m.insert(segment_id_of(&d), d);
+            }
+            Some(m)
+        } else {
+            None
+        };
+        let mut states = Vec::with_capacity_in(segments.len().saturating_add(roots.len()), BLOOM_ALLOC);
         let mut at = 0usize;
         while at < bytes.len() {
             let Some(hdr) = parse_header(bytes, at) else {
                 break;
             };
             let id = segment_id_of(&hdr.digest);
-            let matched = if let Some(ref map_ids) = by_seg_id {
+            let seg_matched = if let Some(ref map_ids) = by_seg_id {
                 match map_ids.get(&id) {
                     Some(&idx) => {
                         segments.get(idx).is_some_and(|seg| seg.digest == hdr.digest)
@@ -436,7 +480,9 @@ impl BloomIndex {
             } else {
                 segments.iter().any(|seg| seg.id == id && seg.digest == hdr.digest)
             };
-            if matched {
+            let root_matched = !seg_matched
+                && root_digests.as_ref().is_some_and(|m| m.get(&id).is_some_and(|d| *d == hdr.digest));
+            if seg_matched || root_matched {
                 let state_idx = u32::try_from(states.len()).unwrap_or(u32::MAX);
                 if state_idx != u32::MAX {
                     states.push(AtomicU8::new(STATE_UNVERIFIED));
@@ -455,10 +501,12 @@ impl BloomIndex {
             at = at.saturating_add(hdr.record_len);
         }
         let _ = by_seg_id.take();
+        let _ = root_digests.take();
         self.states = Some(Arc::new_in(states, BLOOM_ALLOC));
     }
 
-    /// Inserts a newly built framed record (from a commit or merge in this process) into memory.
+    /// Inserts a newly built framed record (from a commit, merge, or root bloom in this process)
+    /// into memory.
     pub(crate) fn insert_owned(&mut self, record_bytes: Vec<u8, Kept>) {
         let Some(hdr) = parse_header(&record_bytes, 0) else {
             return;
@@ -468,14 +516,25 @@ impl BloomIndex {
         self.entries.insert(id, BloomSlot::Owned { digest: hdr.digest, blocks: hdr.blocks, record });
     }
 
-    /// Prunes entries whose segment is no longer present in `segments`, preventing long-lived
-    /// processes from retaining owned Bloom buffers for retired segments.
-    pub(crate) fn prune(&mut self, segments: &[Segment]) {
+    /// Prunes entries whose segment or root is no longer present in `segments`/`roots`, preventing
+    /// long-lived processes from retaining owned Bloom buffers for retired entries.
+    pub(crate) fn prune(&mut self, segments: &[Segment], roots: &[Root]) {
+        let mut root_digests: Option<Map<u64, ContentId, BuildKeyHasher, Kept>> = if !roots.is_empty() {
+            let mut m = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: BLOOM_ALLOC, capacity: Some(roots.len()) });
+            for root in roots {
+                let d = root_bloom_digest(&root.key);
+                m.insert(segment_id_of(&d), d);
+            }
+            Some(m)
+        } else {
+            None
+        };
         self.entries.retain(|&id, slot| {
             let digest = match slot {
                 BloomSlot::Mapped { digest, .. } | BloomSlot::Owned { digest, .. } => *digest,
             };
             segments.iter().any(|seg| seg.id == id && seg.digest == digest)
+                || root_digests.as_ref().is_some_and(|m| m.get(&id).is_some_and(|d| *d == digest))
         });
     }
 
@@ -571,12 +630,59 @@ impl BloomIndex {
         }
     }
 
-    /// Returns the raw verified framed record bytes for `seg` if already present and valid.
-    pub(crate) fn raw_record(&self, seg: &Segment) -> Option<&[u8]> {
-        let slot = self.entries.get(&seg.id)?;
+    /// Returns `Some(false)` ONLY when a verified filter for `digest` proves NONE of `keys` is
+    /// present; `Some(true)` when at least one key may be present; `None` when no valid filter
+    /// exists for `digest` (absent, digest mismatch, or corrupt CRC).
+    pub(crate) fn may_contain_any_digest<'k>(
+        &self,
+        want: &ContentId,
+        mut keys: impl Iterator<Item = &'k [u8; 32]>,
+        trust_corrupt: bool,
+    ) -> Option<bool> {
+        let id = segment_id_of(want);
+        let slot = self.entries.get(&id)?;
+        let (body, blocks) = match slot {
+            BloomSlot::Mapped { digest, offset, blocks, crc, state_idx } => {
+                if digest != want {
+                    return None;
+                }
+                let map = self.mapping.as_ref()?;
+                let slot_state = self.states.as_ref().and_then(|s| usize::try_from(*state_idx).ok().and_then(|i| s.get(i)))?;
+                let body_len = usize::try_from(*blocks).ok()?.checked_mul(BLOCK_BYTES)?;
+                let end = offset.checked_add(RECORD_HEADER)?.checked_add(body_len)?;
+                let record = map.bytes().get(*offset..end)?;
+                let state = slot_state.load(Ordering::Acquire);
+                if state == STATE_CORRUPT {
+                    return None;
+                }
+                if state == STATE_UNVERIFIED && !trust_corrupt {
+                    if record_crc_valid(record, *crc) {
+                        slot_state.store(STATE_VALID, Ordering::Release);
+                    } else {
+                        slot_state.store(STATE_CORRUPT, Ordering::Release);
+                        return None;
+                    }
+                }
+                (record.get(RECORD_HEADER..)?, *blocks)
+            }
+            BloomSlot::Owned { digest, blocks, record } => {
+                if digest != want {
+                    return None;
+                }
+                (record.get(RECORD_HEADER..)?, *blocks)
+            }
+        };
+        Some(keys.any(|k| probe_bytes(body, blocks, k)))
+    }
+
+    /// Returns the raw verified framed record bytes for arbitrary `want` digest (e.g., a root reach
+    /// bloom) if already present and valid.
+    pub(crate) fn raw_record_digest(&self, want: &ContentId) -> Option<&[u8]> {
+        let id = segment_id_of(want);
+        let slot = self.entries.get(&id)?;
         match slot {
             BloomSlot::Mapped { digest, offset, blocks, crc, state_idx } => {
-                if *digest != seg.digest {
+                if digest != want {
                     return None;
                 }
                 let map = self.mapping.as_ref()?;
@@ -599,7 +705,7 @@ impl BloomIndex {
                 Some(record)
             }
             BloomSlot::Owned { digest, record, .. } => {
-                if *digest != seg.digest {
+                if digest != want {
                     return None;
                 }
                 Some(record.as_slice())
@@ -607,33 +713,55 @@ impl BloomIndex {
         }
     }
 
+    /// Returns the raw verified framed record bytes for `seg` if already present and valid.
+    pub(crate) fn raw_record(&self, seg: &Segment) -> Option<&[u8]> {
+        self.raw_record_digest(&seg.digest)
+    }
+
     /// Whether `seg` already has a known (non-corrupt) Bloom entry matching `seg.digest`.
     pub(crate) fn has(&self, seg: &Segment) -> bool {
-        let Some(slot) = self.entries.get(&seg.id) else {
+        self.has_digest(&seg.digest)
+    }
+
+    /// Whether `want` already has a known (non-corrupt) Bloom entry.
+    pub(crate) fn has_digest(&self, want: &ContentId) -> bool {
+        let id = segment_id_of(want);
+        let Some(slot) = self.entries.get(&id) else {
             return false;
         };
         match slot {
             BloomSlot::Mapped { digest, state_idx, .. } => {
-                *digest == seg.digest
+                digest == want
                     && self
                         .states
                         .as_ref()
                         .and_then(|s| usize::try_from(*state_idx).ok().and_then(|i| s.get(i)))
                         .is_some_and(|st| st.load(Ordering::Acquire) != STATE_CORRUPT)
             }
-            BloomSlot::Owned { digest, .. } => *digest == seg.digest,
+            BloomSlot::Owned { digest, .. } => digest == want,
         }
     }
 
     /// Whether the on-disk `bloom` file has accumulated enough dead bytes from retired segments
-    /// (more than 2x live + 64 KiB) to warrant rewriting compactly.
-    pub(crate) fn needs_compact(&self, segments: &[Segment]) -> bool {
+    /// and roots (more than 2x live + 64 KiB) to warrant rewriting compactly.
+    pub(crate) fn needs_compact(&self, segments: &[Segment], roots: &[Root]) -> bool {
         let mut live = 0u64;
         for seg in segments.iter().filter(|it| it.local) {
             if let Some(slot) = self.entries.get(&seg.id) {
                 let blocks = match slot {
                     BloomSlot::Mapped { digest, blocks, .. } if *digest == seg.digest => *blocks,
                     BloomSlot::Owned { digest, blocks, .. } if *digest == seg.digest => *blocks,
+                    _ => continue,
+                };
+                live = live.saturating_add(RECORD_HEADER_U64.saturating_add(u64::from(blocks).saturating_mul(BLOCK_BYTES_U64)));
+            }
+        }
+        for root in roots {
+            let want = root_bloom_digest(&root.key);
+            if let Some(slot) = self.entries.get(&segment_id_of(&want)) {
+                let blocks = match slot {
+                    BloomSlot::Mapped { digest, blocks, .. } if *digest == want => *blocks,
+                    BloomSlot::Owned { digest, blocks, .. } if *digest == want => *blocks,
                     _ => continue,
                 };
                 live = live.saturating_add(RECORD_HEADER_U64.saturating_add(u64::from(blocks).saturating_mul(BLOCK_BYTES_U64)));
@@ -732,11 +860,11 @@ mod tests {
             sealed: true,
             touched: 0,
         };
-        idx.prune(core::slice::from_ref(&live_seg));
+        idx.prune(core::slice::from_ref(&live_seg), &[]);
         assert_eq!(idx.entries.len(), 1);
         assert!(idx.entries.contains_key(&live_seg.id));
         idx.note_written(true, r1_len);
         assert_eq!(idx.mapped_bytes, r1_len);
-        assert!(!idx.needs_compact(core::slice::from_ref(&live_seg)));
+        assert!(!idx.needs_compact(core::slice::from_ref(&live_seg), &[]));
     }
 }

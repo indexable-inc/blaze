@@ -769,13 +769,18 @@ pub(crate) struct Stored<'a> {
     hashed_bytes: core::sync::atomic::AtomicU64,
     /// Rows asked by name ([`Stored::asks`]).
     asks: core::sync::atomic::AtomicUsize,
-    /// Each name asked, in ask order, the first [`MOST_ASKS_KEPT`]: what [`Stored::asked`]
-    /// tells by kind, repeats and distinct names apart (rule 17: which rows a request's reads
-    /// of the answer are, before why they scale).
-    asked: blaze_core::lock::Lock<blaze_own::Vec<(Name, blaze_engine::Ask), SharedAlloc<'a>>>,
+    /// Each name asked, sharded across [`ASKED_SHARDS`] locks, the first [`MOST_ASKS_KEPT`]: what
+    /// [`Stored::asked`] tells by kind, repeats and distinct names apart (rule 17: which rows a
+    /// request's reads of the answer are, before why they scale).
+    asked: AskedShards<'a>,
 }
 
 /// The names [`Stored::asked`] keeps (rule 18: a table has a cap): a ready edit asks hundreds;
+
+/// Shards for [`Stored::asked`] so parallel body workers never serialize on one global lock.
+const ASKED_SHARDS: usize = 16;
+
+type AskedShards<'a> = blaze_own::Box<[blaze_core::lock::Lock<blaze_own::Vec<(Name, blaze_engine::Ask), SharedAlloc<'a>>>; ASKED_SHARDS], SharedAlloc<'a>>;
 /// asks past it are counted ([`Stored::asks`]) and not told by kind.
 const MOST_ASKS_KEPT: usize = 1 << 16;
 
@@ -891,37 +896,50 @@ impl<'a> Stored<'a> {
             header_bytes: AtomicU64::new(0),
             hashed_bytes: AtomicU64::new(0),
             asks: AtomicUsize::new(0),
-            asked: blaze_core::lock::Lock::new("engine.answer: the rows asked by name", blaze_own::Vec::with_capacity_in(0, alloc)),
+            asked: blaze_own::Box::new_in(
+                core::array::from_fn(|_| blaze_core::lock::Lock::new("engine.answer: the rows asked by name", blaze_own::Vec::with_capacity_in(0, alloc))),
+                alloc,
+            ),
         }
     }
 
     /// One ask of `name`'s page for `ask`: counted, and kept under the cap for [`Stored::asked`].
     fn note_ask(&self, name: Name, ask: blaze_engine::Ask) {
-        if self.asks.fetch_add(1, core::sync::atomic::Ordering::Relaxed) >= MOST_ASKS_KEPT {
+        let slot = self.asks.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if slot >= MOST_ASKS_KEPT {
             return;
         }
-        let mut asked = self.asked.lock();
-        if asked.len() < MOST_ASKS_KEPT {
-            // A refused growth leaves the name untold, counted by `asks` (rule 3: the count
-            // says so, `AskedByKind::untold`).
-            let _ = asked.try_push((name, ask));
-        }
+        let Some(shard) = self.asked.get(slot & (ASKED_SHARDS - 1)) else { return };
+        let mut asked = shard.lock();
+        // A refused growth leaves the name untold, counted by `asks` (rule 3: the count
+        // says so, `AskedByKind::untold`).
+        let _ = asked.try_push((name, ask));
     }
 
     /// The rows asked so far by kind (repeats and distinct names apart) and by purpose (asks
     /// and distinct reads apart) ([`AskedByKind`]).
     pub(crate) fn asked(&self) -> AskedByKind {
         let mut by = AskedByKind::default();
-        let asked = self.asked.lock();
-        let mut sorted: blaze_own::Vec<(Name, blaze_engine::Ask), SharedAlloc<'a>> = blaze_own::Vec::with_capacity_in(asked.len(), self.alloc);
-        for &(name, ask) in asked.iter() {
-            by.asks[name.kind.index()] += 1;
-            by.by_purpose[ask.purpose()] += 1;
-            by.kind_purpose[name.kind.index()][ask.purpose()] += 1;
-            let _ = sorted.try_push((name, ask));
+        let total = self.asks().min(MOST_ASKS_KEPT);
+        let mut sorted: blaze_own::Vec<(Name, blaze_engine::Ask), SharedAlloc<'a>> = blaze_own::Vec::with_capacity_in(total, self.alloc);
+        let mut kept = 0usize;
+        for shard in self.asked.iter() {
+            let asked = shard.lock();
+            kept += asked.len();
+            for &(name, ask) in asked.iter() {
+                if let Some(slot) = by.asks.get_mut(name.kind.index()) {
+                    *slot += 1;
+                }
+                if let Some(slot) = by.by_purpose.get_mut(ask.purpose()) {
+                    *slot += 1;
+                }
+                if let Some(slot) = by.kind_purpose.get_mut(name.kind.index()).and_then(|row| row.get_mut(ask.purpose())) {
+                    *slot += 1;
+                }
+                let _ = sorted.try_push((name, ask));
+            }
         }
-        by.untold = u32::try_from(self.asks().saturating_sub(asked.len())).unwrap_or(u32::MAX);
-        drop(asked);
+        by.untold = u32::try_from(self.asks().saturating_sub(kept)).unwrap_or(u32::MAX);
         sorted.sort_unstable();
         let mut last_name = None;
         let mut last_read = None;
@@ -2484,13 +2502,17 @@ fn publish_reach_shards_from<D: Driver>(
     // fits within REACH_DELTA_CAP.
     if proof.is_ok() {
         let mut added: blaze_own::Vec<blaze_cas::Key, SharedAlloc<'_>> = blaze_own::Vec::new_in(alloc);
+        let mut replaced: blaze_own::Vec<blaze_cas::Key, SharedAlloc<'_>> = blaze_own::Vec::new_in(alloc);
         let mut moved = 0u32;
         let mut cleared = false;
         let has_deltas = match source {
             #[cfg(test)]
             ReachSource::Flat { last: Some((old, _)), now } => {
-                for (_was, is) in old.iter().zip(now.iter()).filter(|(was, is)| was != is) {
+                for (was, is) in old.iter().zip(now.iter()).filter(|(was, is)| was != is) {
                     moved = moved.saturating_add(1);
+                    if *was != Key::default() {
+                        replaced.push(index_of(*was));
+                    }
                     if *is != Key::default() {
                         added.push(index_of(*is));
                     } else {
@@ -2505,6 +2527,9 @@ fn publish_reach_shards_from<D: Driver>(
                 Some(deltas) => {
                     for delta in deltas.iter() {
                         moved = moved.saturating_add(1);
+                        if delta.old != Key::default() {
+                            replaced.push(index_of(delta.old));
+                        }
                         if delta.new != Key::default() {
                             added.push(index_of(delta.new));
                         } else {
@@ -2536,6 +2561,9 @@ fn publish_reach_shards_from<D: Driver>(
                         let delta_unchanged = keys_equal_bytes(&next_delta, carried_delta);
                         if delta_unchanged && lent.renew_root(delta_name.as_str(), blaze_cas::plain::ROOT_LIFE_NS).is_live() {
                             return Ok((total_live, Rekeyed { pages: moved, whole: None }));
+                        }
+                        if !replaced.is_empty() {
+                            lent.hint_replaced_indexes(&replaced);
                         }
                         lent.root_through(delta_name.as_str(), &next_delta, blaze_cas::plain::ROOT_LIFE_NS).map_err(crate::store::PlaceError::from)?;
                         return Ok((total_live, Rekeyed { pages: moved, whole: None }));

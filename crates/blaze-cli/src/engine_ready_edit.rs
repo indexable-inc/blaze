@@ -496,8 +496,47 @@ pub(crate) fn moved_cells(file: Name, stored: impl Iterator<Item = (Cell, Conten
 
 /// Step 2: the parts of a file's outline whose source moved between its stored record (`old`)
 /// and today's (`new`), each once, appended as [`Woken::Keyed`]. A part only in one of them
-/// moved (a body added or removed).
+/// moved (a body added or removed). Linear merge when both slices are sorted by name (always true
+/// for outline records), falling back to a scan otherwise.
 pub(crate) fn keyed(old: &[Part], new: &[Part], into: &mut SVec<'_, (Name, Woken)>) {
+    if old.is_sorted_by_key(|p| p.name) && new.is_sorted_by_key(|p| p.name) {
+        let mut old_it = old.iter().peekable();
+        let mut new_it = new.iter().peekable();
+        while let (Some(&o), Some(&n)) = (old_it.peek(), new_it.peek()) {
+            match o.name.cmp(&n.name) {
+                core::cmp::Ordering::Less => {
+                    if matches!(o.locate, Locate::Source(_)) {
+                        into.push((o.name, Woken::Keyed));
+                    }
+                    let _ = old_it.next();
+                }
+                core::cmp::Ordering::Greater => {
+                    if matches!(n.locate, Locate::Source(_)) {
+                        into.push((n.name, Woken::Keyed));
+                    }
+                    let _ = new_it.next();
+                }
+                core::cmp::Ordering::Equal => {
+                    if (matches!(o.locate, Locate::Source(_)) || matches!(n.locate, Locate::Source(_))) && o.locate != n.locate {
+                        into.push((n.name, Woken::Keyed));
+                    }
+                    let _ = old_it.next();
+                    let _ = new_it.next();
+                }
+            }
+        }
+        for o in old_it {
+            if matches!(o.locate, Locate::Source(_)) {
+                into.push((o.name, Woken::Keyed));
+            }
+        }
+        for n in new_it {
+            if matches!(n.locate, Locate::Source(_)) {
+                into.push((n.name, Woken::Keyed));
+            }
+        }
+        return;
+    }
     let source_of = |parts: &[Part], name: Name| parts.iter().find(|part| part.name == name).map(|part| part.locate);
     for part in new.iter().chain(old.iter().filter(|part| new.iter().all(|now| now.name != part.name))) {
         if matches!(part.locate, Locate::Source(_)) && source_of(new, part.name) != source_of(old, part.name) {

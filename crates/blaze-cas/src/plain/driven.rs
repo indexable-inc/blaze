@@ -791,6 +791,11 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
         self.root_through_owned(name, indexes, life_ns, &|_| false)
     }
 
+    /// [`Plain::hint_replaced_indexes`].
+    pub fn hint_replaced_indexes(&mut self, indexes: &[Key]) {
+        self.core.hint_replaced_indexes(indexes);
+    }
+
     /// O(1) lease renewal for an already-live root `name` ([`Plain::renew_root`]): checks the
     /// manifest's root entry against the driver's wall clock without probing or hashing held keys.
     pub fn renew_root(&mut self, name: &str, life_ns: u64) -> Renewed {
