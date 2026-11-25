@@ -184,7 +184,7 @@ fn size_report_csi_21_t_title() {
 fn report_encode_dec_mode_set() {
     // modes.zig:356 "Report.encode DEC mode set"
     eq(
-        bytes(|o| mode_report(o, ModeReport { mode: 1, ansi: false, state: ModeState::Set })),
+        bytes(|o| mode_report(o, ModeReport { mode: 1, ansi: false, state: ReportState::Set })),
         b"\x1b[?1;1$y",
     );
 }
@@ -193,7 +193,7 @@ fn report_encode_dec_mode_set() {
 fn report_encode_dec_mode_reset() {
     // modes.zig:364 "Report.encode DEC mode reset"
     eq(
-        bytes(|o| mode_report(o, ModeReport { mode: 1, ansi: false, state: ModeState::Reset })),
+        bytes(|o| mode_report(o, ModeReport { mode: 1, ansi: false, state: ReportState::Reset })),
         b"\x1b[?1;2$y",
     );
 }
@@ -202,7 +202,7 @@ fn report_encode_dec_mode_reset() {
 fn report_encode_ansi_mode() {
     // modes.zig:372 "Report.encode ANSI mode"
     eq(
-        bytes(|o| mode_report(o, ModeReport { mode: 4, ansi: true, state: ModeState::Set })),
+        bytes(|o| mode_report(o, ModeReport { mode: 4, ansi: true, state: ReportState::Set })),
         b"\x1b[4;1$y",
     );
 }
@@ -212,7 +212,10 @@ fn report_encode_not_recognized() {
     // modes.zig:380 "Report.encode not recognized"
     eq(
         bytes(|o| {
-            mode_report(o, ModeReport { mode: 9999, ansi: false, state: ModeState::NotRecognized })
+            mode_report(
+                o,
+                ModeReport { mode: 9999, ansi: false, state: ReportState::NotRecognized },
+            )
         }),
         b"\x1b[?9999;0$y",
     );
@@ -223,19 +226,28 @@ fn mode_report_truncates_to_fifteen_bits() {
     // ST:535: `@truncate(mode_raw)` into the u15 tag, and the permanent states' numbers.
     eq(
         bytes(|o| {
-            mode_report(o, ModeReport { mode: 40000, ansi: false, state: ModeState::NotRecognized })
+            mode_report(
+                o,
+                ModeReport { mode: 40000, ansi: false, state: ReportState::NotRecognized },
+            )
         }),
         b"\x1b[?7232;0$y",
     );
     eq(
         bytes(|o| {
-            mode_report(o, ModeReport { mode: 2027, ansi: false, state: ModeState::PermanentlySet })
+            mode_report(
+                o,
+                ModeReport { mode: 2027, ansi: false, state: ReportState::PermanentlySet },
+            )
         }),
         b"\x1b[?2027;3$y",
     );
     eq(
         bytes(|o| {
-            mode_report(o, ModeReport { mode: 3, ansi: false, state: ModeState::PermanentlyReset })
+            mode_report(
+                o,
+                ModeReport { mode: 3, ansi: false, state: ReportState::PermanentlyReset },
+            )
         }),
         b"\x1b[?3;4$y",
     );
@@ -664,11 +676,11 @@ fn inventory_12_color_scheme_996_and_change() {
 #[test]
 fn inventory_12_decrqm() {
     eq(
-        bytes(|o| mode_report(o, ModeReport { mode: 7, ansi: false, state: ModeState::Set })),
+        bytes(|o| mode_report(o, ModeReport { mode: 7, ansi: false, state: ReportState::Set })),
         b"\x1b[?7;1$y",
     );
     eq(
-        bytes(|o| mode_report(o, ModeReport { mode: 7, ansi: false, state: ModeState::Reset })),
+        bytes(|o| mode_report(o, ModeReport { mode: 7, ansi: false, state: ReportState::Reset })),
         b"\x1b[?7;2$y",
     );
 }

@@ -206,24 +206,5 @@ impl ModeState {
     }
 }
 
-/// How the mouse is reported (ghostty's `MouseEvents`).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum MouseEvents {
-    #[default]
-    None,
-    X10,
-    Normal,
-    Button,
-    Any,
-}
-
-/// The encoding of mouse reports (ghostty's `MouseFormat`).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum MouseFormat {
-    #[default]
-    X10,
-    Utf8,
-    Sgr,
-    Urxvt,
-    SgrPixels,
-}
+/// The mouse tracking mode and report format live with their encoder.
+pub use crate::input::mouse::{MouseEvents, MouseFormat};

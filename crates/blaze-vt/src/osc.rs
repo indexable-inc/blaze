@@ -235,6 +235,15 @@ pub enum Clipboard {
 }
 
 impl Clipboard {
+    /// The letter a reply names it by: `c`, `s`, `p`.
+    pub fn letter(self) -> u8 {
+        match self {
+            Clipboard::Standard => b'c',
+            Clipboard::Selection => b's',
+            Clipboard::Primary => b'p',
+        }
+    }
+
     pub fn from_kind(kind: u8) -> Clipboard {
         match kind {
             b's' => Clipboard::Selection,

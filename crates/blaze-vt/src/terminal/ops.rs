@@ -911,8 +911,9 @@ impl<'a, P: Planted<VtPlant>> Terminal<'a, P> {
             }
             Mode::SynchronizedOutput => self.effect(Effect::SynchronizedOutput(on)),
             Mode::FocusEvent if on => {
-                let f = self.focused;
-                self.reply_bytes(&[if f { b"\x1b[I" } else { b"\x1b[O" }]);
+                use crate::input::focus::{self, FocusEvent};
+                let ev = if self.focused { FocusEvent::Gained } else { FocusEvent::Lost };
+                self.reply_bytes(&[focus::encode(ev, self.focus_opts())]);
             }
             Mode::InBandSizeReports if on => self.report_in_band_size(),
             Mode::ReportColorScheme if on => self.report_color_scheme(),
@@ -949,19 +950,30 @@ impl<'a, P: Planted<VtPlant>> Terminal<'a, P> {
 
     /// `CSI 48 ; rows ; cols ; hpx ; wpx t` (mode 2048), when the cell size is known.
     pub(super) fn report_in_band_size(&mut self) {
-        if let Some(px) = self.opts.cell_px {
-            let (r, c) = (self.rows, self.cols);
-            let (h, w) = (r as u64 * u64::from(px.height), c as u64 * u64::from(px.width));
-            self.reply(format_args!("\x1b[48;{r};{c};{h};{w}t"));
-        }
+        self.size_report(crate::reply::SizeReport::Mode2048);
+    }
+
+    /// A size report, when the cell size is known (CSI 18 t needs none).
+    pub(super) fn size_report(&mut self, style: crate::reply::SizeReport) {
+        use crate::reply::SizeReport;
+        let px = match (self.opts.cell_px, style) {
+            (Some(px), _) => px,
+            (None, SizeReport::Csi18) => super::Pixels::default(),
+            (None, _) => return,
+        };
+        let size = crate::reply::Size {
+            rows: self.rows as u16,
+            columns: self.cols as u16,
+            cell_width: px.width,
+            cell_height: px.height,
+        };
+        self.reply(|o| crate::reply::size_report(o, style, size));
     }
 
     /// `CSI ? 997 ; 1|2 n`, when the host has said its scheme.
     pub(super) fn report_color_scheme(&mut self) {
-        match self.color_scheme {
-            Some(super::ColorScheme::Dark) => self.reply_bytes(&[b"\x1b[?997;1n"]),
-            Some(super::ColorScheme::Light) => self.reply_bytes(&[b"\x1b[?997;2n"]),
-            None => {}
+        if let Some(scheme) = self.color_scheme {
+            self.reply(|o| crate::reply::color_scheme(o, scheme));
         }
     }
 }

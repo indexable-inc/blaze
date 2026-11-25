@@ -1036,7 +1036,7 @@ fn reports() {
     assert_eq!(replies(&mut t), b"\x1bP>|libghostty\x1b\\");
     t.feed(b"\x1b[18t\x1b[14t\x1b[16t");
     assert_eq!(replies(&mut t), b"\x1b[8;24;80t", "no cell size: no pixel reports");
-    t.set_cell_px(Some(crate::terminal::CellPx { width: 10, height: 20 }));
+    t.set_cell_px(Some(crate::terminal::Pixels { width: 10, height: 20 }));
     t.feed(b"\x1b[14t\x1b[16t");
     assert_eq!(replies(&mut t), b"\x1b[4;480;800t\x1b[6;20;10t");
     t.feed(b"\x1b[?2048h");

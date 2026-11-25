@@ -41,28 +41,28 @@ pub enum Effect {
     ReverseColors(bool),
 }
 
-/// The pixel size of a cell, for the size reports (CSI 14/16 t, mode 2048).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct CellPx {
-    pub width: u32,
-    pub height: u32,
-}
+/// A cell's pixel size, for the size reports (CSI 14/16 t, mode 2048): the mouse encoder's
+/// [`Pixels`].
+pub use crate::input::mouse::Pixels;
+/// The host's color scheme (CSI ? 996 n): the reply encoder's.
+pub use crate::reply::ColorScheme;
 
 /// What the device attribute replies say (ghostty's `device_attributes.zig`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct DeviceAttributes<'a> {
-    /// DA1's conformance level and features: `CSI ? 62 ; 22 c` is `[62, 22]`.
-    pub primary: &'a [u16],
-    /// DA2's three values: `CSI > 1 ; 0 ; 0 c`.
-    pub secondary: [u16; 3],
-    /// DA3's unit id, eight hex digits; `None`: no reply (the app's choice).
-    pub tertiary: Option<&'a [u8]>,
+    pub primary: crate::reply::Da1<'a>,
+    pub secondary: crate::reply::Da2,
+    /// DA3's unit id; `None`: no reply (the app's choice).
+    pub tertiary: Option<u32>,
 }
 
 impl DeviceAttributes<'static> {
     /// libghostty's defaults: `\x1b[?62;22c`, `\x1b[>1;0;0c`, `\x1bP!|00000000\x1b\\`.
-    pub const LIB: DeviceAttributes<'static> =
-        DeviceAttributes { primary: &[62, 22], secondary: [1, 0, 0], tertiary: Some(b"00000000") };
+    pub const LIB: DeviceAttributes<'static> = DeviceAttributes {
+        primary: crate::reply::Da1::LIB,
+        secondary: crate::reply::Da2::LIB,
+        tertiary: Some(0),
+    };
 }
 
 /// Byte and entry caps on what the terminal keeps (AGENTS.md: every table has a cap).
@@ -108,7 +108,7 @@ pub struct Opts<'a> {
     /// Mode 2027's default (ghostty's `grapheme-width-method = unicode`).
     pub grapheme_cluster: bool,
     /// Cell pixel size; `None`: the pixel size reports get no reply.
-    pub cell_px: Option<CellPx>,
+    pub cell_px: Option<Pixels>,
     pub device: DeviceAttributes<'a>,
     /// XTVERSION's name; empty: `libghostty`, as ghostty's library says.
     pub xtversion: &'a [u8],
@@ -155,13 +155,6 @@ pub enum StatusDisplay {
     #[default]
     Main,
     StatusLine,
-}
-
-/// The color scheme the host reports for CSI ? 996 n.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ColorScheme {
-    Dark,
-    Light,
 }
 
 /// The scrolling region, inclusive, 0-based.
@@ -483,8 +476,56 @@ impl<'a, P: Planted<VtPlant>> Terminal<'a, P> {
     }
 
     /// The cell pixel size, for the size reports.
-    pub fn set_cell_px(&mut self, px: Option<CellPx>) {
+    pub fn set_cell_px(&mut self, px: Option<Pixels>) {
         self.opts.cell_px = px;
+    }
+
+    // ---- input options ---------------------------------------------------------------------
+
+    /// The key encoder's options from the modes (key_encode.zig:59 `fromTerminal`); the
+    /// platform and option-as-alt are the host's: `input::key::encode(&ev, &t.input_opts(..), out)`.
+    pub fn input_opts(
+        &self,
+        platform: crate::input::key::Platform,
+        macos_option_as_alt: crate::input::key::OptionAsAlt,
+    ) -> crate::input::key::EncodeOpts {
+        let m = &self.modes;
+        crate::input::key::EncodeOpts {
+            platform,
+            cursor_key_application: m.get(Mode::CursorKeys),
+            keypad_key_application: m.get(Mode::KeypadKeys),
+            backarrow_key_mode: m.get(Mode::BackarrowKey),
+            ignore_keypad_with_numlock: m.get(Mode::IgnoreKeypadWithNumlock),
+            alt_esc_prefix: m.get(Mode::AltEscPrefix),
+            modify_other_keys_state_2: self.flags.modify_other_keys_2,
+            kitty_flags: self.screen().kitty.current(),
+            macos_option_as_alt,
+        }
+    }
+
+    /// The mouse encoder's options: the tracking mode and format from the modes; the surface
+    /// size and whether a button is down are the host's.
+    pub fn mouse_opts(
+        &self,
+        size: crate::input::mouse::Size,
+        any_button_pressed: bool,
+    ) -> crate::input::mouse::MouseOpts {
+        crate::input::mouse::MouseOpts {
+            event: self.flags.mouse_event,
+            format: self.flags.mouse_format,
+            size,
+            any_button_pressed,
+        }
+    }
+
+    /// The paste encoder's options: bracketed paste (2004).
+    pub fn paste_opts(&self) -> crate::input::paste::PasteOpts {
+        crate::input::paste::PasteOpts { bracketed: self.modes.get(Mode::BracketedPaste) }
+    }
+
+    /// The focus encoder's options: focus reporting (1004).
+    pub fn focus_opts(&self) -> crate::input::focus::FocusOpts {
+        crate::input::focus::FocusOpts { reporting: self.modes.get(Mode::FocusEvent) }
     }
 
     /// Takes damage: whether everything needs drawing, and clears every row's dirty mark and
@@ -515,18 +556,20 @@ impl<'a, P: Planted<VtPlant>> Terminal<'a, P> {
         self.effects.push(e);
     }
 
-    /// Writes a reply whole, or not at all.
-    fn reply(&mut self, args: core::fmt::Arguments<'_>) {
+    /// Writes a reply with one of [`crate::reply`]'s encoders, whole or not at all: refused by
+    /// the allocator or past the cap, it is dropped and counted.
+    fn reply(
+        &mut self,
+        encode: impl FnOnce(crate::reply::Out<'_, 'a>) -> Result<(), AllocFailure>,
+    ) {
         let start = self.replies.len();
-        let mut w =
-            ReplyWriter { buf: &mut self.replies, cap: self.opts.caps.replies, failed: false };
-        let ok = core::fmt::write(&mut w, args).is_ok() && !w.failed;
-        if !ok {
+        if encode(&mut self.replies).is_err() || self.replies.len() > self.opts.caps.replies {
             self.replies.truncate(start);
             self.stats.replies_dropped += 1;
         }
     }
 
+    /// Raw reply bytes (a focus report, a colour report written by [`crate::osc::run_colors`]).
     fn reply_bytes(&mut self, parts: &[&[u8]]) {
         let n: usize = parts.iter().map(|p| p.len()).sum();
         if self.replies.len() + n > self.opts.caps.replies || self.replies.try_reserve(n).is_err() {
@@ -546,22 +589,5 @@ impl<'a, P: Planted<VtPlant>> Terminal<'a, P> {
 
     fn scr(&mut self) -> &mut Screen<'a, P> {
         self.screen_mut()
-    }
-}
-
-struct ReplyWriter<'r, 'a> {
-    buf: &'r mut Vec<u8, Alloc<'a>>,
-    cap: usize,
-    failed: bool,
-}
-
-impl core::fmt::Write for ReplyWriter<'_, '_> {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        if self.buf.len() + s.len() > self.cap || self.buf.try_reserve(s.len()).is_err() {
-            self.failed = true;
-            return Err(core::fmt::Error);
-        }
-        self.buf.extend_from_slice(s.as_bytes());
-        Ok(())
     }
 }

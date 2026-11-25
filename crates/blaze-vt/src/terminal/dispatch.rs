@@ -7,6 +7,7 @@ use super::ops::{EraseDisplay, EraseLine};
 use super::{DcsHead, Effect, Mode, StatusDisplay, Terminal};
 use crate::parser::{Csi, Dcs, Esc, Sink, Terminator};
 use crate::plant::VtPlant;
+use crate::reply;
 use crate::screen::{Charset, CursorShape, KittySet, ProtectedMode, Slot};
 use crate::style::{Color, Style};
 
@@ -29,9 +30,7 @@ impl<P: Planted<VtPlant>> Sink for Terminal<'_, P> {
             0x00..=0x02 => {}
             0x05 => {
                 let e = self.opts.enquiry;
-                if !e.is_empty() && e.len() < 256 {
-                    self.reply_bytes(&[e]);
-                }
+                self.reply(|o| reply::enquiry(o, e));
             }
             0x07 => self.effect(Effect::Bell),
             0x08 => self.cursor_left(1),
@@ -206,25 +205,11 @@ impl<P: Planted<VtPlant>> Terminal<'_, P> {
     fn device_attributes(&mut self, which: u8) {
         let d = self.opts.device;
         match which {
-            0 => {
-                let mut buf = [0u8; 128];
-                let mut w = Fixed { buf: &mut buf, n: 0 };
-                let _ = core::fmt::Write::write_str(&mut w, "\x1b[?");
-                for (i, v) in d.primary.iter().enumerate() {
-                    let sep = if i > 0 { ";" } else { "" };
-                    let _ = core::fmt::write(&mut w, format_args!("{sep}{v}"));
-                }
-                let _ = core::fmt::Write::write_str(&mut w, "c");
-                let n = w.n;
-                self.reply_bytes(&[&buf[..n]]);
-            }
-            1 => {
-                let [a, b, c] = d.secondary;
-                self.reply(format_args!("\x1b[>{a};{b};{c}c"));
-            }
+            0 => self.reply(|o| reply::da1(o, d.primary)),
+            1 => self.reply(|o| reply::da2(o, d.secondary)),
             _ => {
                 if let Some(id) = d.tertiary {
-                    self.reply_bytes(&[b"\x1bP!|", id, b"\x1b\\"]);
+                    self.reply(|o| reply::da3(o, id));
                 }
             }
         }
@@ -416,9 +401,8 @@ impl<P: Planted<VtPlant>> Terminal<'_, P> {
                 },
                 [b'>'] => {
                     let v = self.opts.xtversion;
-                    let v: &[u8] = if v.is_empty() { b"libghostty" } else { v };
                     if v.len() <= 256 {
-                        self.reply_bytes(&[b"\x1bP>|", v, b"\x1b\\"]);
+                        self.reply(|o| reply::xtversion(o, v));
                     }
                 }
                 _ => self.unsupported(),
@@ -466,8 +450,8 @@ impl<P: Planted<VtPlant>> Terminal<'_, P> {
             b'u' => match inter {
                 [] => self.restore_cursor(),
                 [b'?'] => {
-                    let f = self.scr().kitty.current();
-                    self.reply(format_args!("\x1b[?{f}u"));
+                    let f = self.scr().kitty.current().bits();
+                    self.reply(|o| reply::kitty_keyboard(o, f));
                 }
                 [b'>'] => match params {
                     [f] if *f > 31 => self.unsupported(),
@@ -533,10 +517,17 @@ impl<P: Planted<VtPlant>> Terminal<'_, P> {
                     _ => return self.unsupported(),
                 };
                 match (params, question) {
-                    ([5], false) => self.reply_bytes(&[b"\x1b[0n"]),
+                    ([5], false) => self.reply(reply::operating_status),
                     ([6], false) => {
-                        let (row, col) = self.cursor_pos_relative();
-                        self.reply(format_args!("\x1b[{row};{col}R"));
+                        let c = self.scr().cursor;
+                        let r = reply::CursorReport {
+                            x: c.x as u32,
+                            y: c.y as u32,
+                            origin: self.modes.get(Mode::Origin),
+                            left: self.region.left as u32,
+                            top: self.region.top as u32,
+                        };
+                        self.reply(|o| reply::cursor_position(o, r));
                     }
                     ([996], true) => self.report_color_scheme(),
                     _ => self.unsupported(),
@@ -549,17 +540,12 @@ impl<P: Planted<VtPlant>> Terminal<'_, P> {
 
     /// DECRQM `CSI ? n $ p`: `CSI ? n ; 1|2|0 $ y` (modes.zig `getReport`).
     fn request_mode(&mut self, n: u16) {
-        let v = match Mode::from_int(n, false) {
-            Some(m) => {
-                if self.modes.get(m) {
-                    1
-                } else {
-                    2
-                }
-            }
-            None => 0,
+        let state = match Mode::from_int(n, false) {
+            Some(m) if self.modes.get(m) => reply::ReportState::Set,
+            Some(_) => reply::ReportState::Reset,
+            None => reply::ReportState::NotRecognized,
         };
-        self.reply(format_args!("\x1b[?{n};{v}$y"));
+        self.reply(|o| reply::mode_report(o, reply::ModeReport { mode: n, ansi: false, state }));
     }
 
     /// DECSCUSR (S:1903; stream_terminal.zig `cursor_style`).
@@ -581,26 +567,12 @@ impl<P: Planted<VtPlant>> Terminal<'_, P> {
     /// XTWINOPS: the reports 14, 16, 18, 21 and the title stack 22/23 (S:2070).
     fn xtwinops(&mut self, params: &[u16]) {
         match params {
-            [14] => {
-                if let Some(px) = self.opts.cell_px {
-                    let h = self.rows as u64 * u64::from(px.height);
-                    let w = self.cols as u64 * u64::from(px.width);
-                    self.reply(format_args!("\x1b[4;{h};{w}t"));
-                }
-            }
-            [16] => {
-                if let Some(px) = self.opts.cell_px {
-                    let (h, w) = (px.height, px.width);
-                    self.reply(format_args!("\x1b[6;{h};{w}t"));
-                }
-            }
-            [18] => {
-                let (r, c) = (self.rows, self.cols);
-                self.reply(format_args!("\x1b[8;{r};{c}t"));
-            }
+            [14] => self.size_report(reply::SizeReport::Csi14),
+            [16] => self.size_report(reply::SizeReport::Csi16),
+            [18] => self.size_report(reply::SizeReport::Csi18),
             [21] => {
                 let title = core::mem::replace(&mut self.title, blaze_own::Vec::new_in(self.alloc));
-                self.reply_bytes(&[b"\x1b]l", &title, b"\x1b\\"]);
+                self.reply(|o| reply::title_report(o, &title));
                 self.title = title;
             }
             [22, 0 | 2] | [22, 0 | 2, _] => self.title_push(),
@@ -634,23 +606,5 @@ impl<P: Planted<VtPlant>> Terminal<'_, P> {
             self.title = t;
             self.effect(Effect::TitleChanged);
         }
-    }
-}
-
-/// A fixed buffer to format into.
-struct Fixed<'b> {
-    buf: &'b mut [u8],
-    n: usize,
-}
-
-impl core::fmt::Write for Fixed<'_> {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let end = self.n + s.len();
-        if end > self.buf.len() {
-            return Err(core::fmt::Error);
-        }
-        self.buf[self.n..end].copy_from_slice(s.as_bytes());
-        self.n = end;
-        Ok(())
     }
 }

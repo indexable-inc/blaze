@@ -13,6 +13,7 @@ use core::hash::{Hash, Hasher};
 use blaze_own::planted::Planted;
 use blaze_own::{Alloc, AllocFailure, Vec};
 
+use crate::input::key::KittyFlags;
 use crate::page::{Cell, MAX_EXT, PageList, Row, RowPrompt, SemanticContent, Wide};
 use crate::plant::VtPlant;
 use crate::style::{Color, Style};
@@ -603,10 +604,11 @@ pub enum ProtectedMode {
     Dec,
 }
 
-/// The kitty keyboard flags stack, 8 entries, the oldest evicted when full (kitty/key.zig).
+/// The kitty keyboard flags stack, 8 entries, the oldest evicted when full (kitty/key.zig
+/// `KeyFlagStack`). The flags themselves are the key encoder's [`KittyFlags`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub struct KittyFlags {
-    flags: [u8; 8],
+pub struct KittyFlagStack {
+    flags: [KittyFlags; 8],
     idx: u8,
 }
 
@@ -618,29 +620,32 @@ pub enum KittySet {
     Not,
 }
 
-impl KittyFlags {
-    pub fn current(&self) -> u8 {
+impl KittyFlagStack {
+    pub fn current(&self) -> KittyFlags {
         self.flags[usize::from(self.idx)]
     }
+    /// `CSI = v ; mode u`, `v` the protocol's integer.
     pub fn set(&mut self, mode: KittySet, v: u8) {
         let f = &mut self.flags[usize::from(self.idx)];
-        *f = match mode {
+        let cur = f.bits();
+        *f = KittyFlags::from_bits(match mode {
             KittySet::Set => v,
-            KittySet::Or => *f | v,
-            KittySet::Not => *f & !v,
-        } & 0x1F;
+            KittySet::Or => cur | v,
+            KittySet::Not => cur & !v,
+        });
     }
+    /// `CSI > v u`.
     pub fn push(&mut self, v: u8) {
         self.idx = (self.idx + 1) & 7;
-        self.flags[usize::from(self.idx)] = v & 0x1F;
+        self.flags[usize::from(self.idx)] = KittyFlags::from_bits(v);
     }
     pub fn pop(&mut self, n: usize) {
         if n >= 8 {
-            *self = KittyFlags::default();
+            *self = KittyFlagStack::default();
             return;
         }
         for _ in 0..n {
-            self.flags[usize::from(self.idx)] = 0;
+            self.flags[usize::from(self.idx)] = KittyFlags::DISABLED;
             self.idx = self.idx.wrapping_sub(1) & 7;
         }
     }
@@ -691,7 +696,7 @@ pub struct Screen<'a, P> {
     pub saved: Option<SavedCursor>,
     pub charset: Charsets,
     pub protected_mode: ProtectedMode,
-    pub kitty: KittyFlags,
+    pub kitty: KittyFlagStack,
     /// The alternate screen keeps no scrollback.
     pub no_scrollback: bool,
     /// Every row needs drawing (ghostty's `dirty.clear`).
@@ -730,7 +735,7 @@ impl<'a, P: Planted<VtPlant>> Screen<'a, P> {
             saved: None,
             charset: Charsets::default(),
             protected_mode: ProtectedMode::Off,
-            kitty: KittyFlags::default(),
+            kitty: KittyFlagStack::default(),
             no_scrollback,
             all_dirty: true,
             stats: ScreenStats::default(),
@@ -1258,7 +1263,7 @@ impl<'a, P: Planted<VtPlant>> Screen<'a, P> {
         self.cursor = Cursor { shape, ..Cursor::HOME };
         self.saved = None;
         self.charset = Charsets::default();
-        self.kitty = KittyFlags::default();
+        self.kitty = KittyFlagStack::default();
         self.protected_mode = ProtectedMode::Off;
         self.all_dirty = true;
     }

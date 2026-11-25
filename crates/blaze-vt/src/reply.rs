@@ -33,7 +33,9 @@ mod tests;
 use blaze_own::{Alloc, AllocFailure, Vec};
 
 use crate::dcs::{Decrqss, XtGetTcap};
+pub use crate::osc::Clipboard;
 use crate::parser::Terminator;
+pub use crate::screen::CursorShape;
 use crate::style::{Color, Rgb, Style, Underline};
 use crate::terminfo::{self, Cap};
 
@@ -226,9 +228,10 @@ pub fn color_scheme(out: Out<'_, '_>, scheme: ColorScheme) -> Result<(), AllocFa
 
 // --- modes ---
 
-/// A mode's state in a DECRPM (modes.zig:197).
+/// A mode's state in a DECRPM (modes.zig:197 `Report.State`; the modes themselves are
+/// [`crate::terminal::ModeState`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ModeState {
+pub enum ReportState {
     NotRecognized = 0,
     Set = 1,
     Reset = 2,
@@ -242,7 +245,7 @@ pub struct ModeReport {
     pub mode: u16,
     /// Asked as `CSI n $ p` (ANSI) rather than `CSI ? n $ p` (DEC).
     pub ansi: bool,
-    pub state: ModeState,
+    pub state: ReportState,
 }
 
 /// DECRPM: `CSI ? n ; s $ y`, or `CSI n ; s $ y` for the ANSI form. ghostty's mode tag holds
@@ -260,16 +263,6 @@ pub fn mode_report(out: Out<'_, '_>, r: ModeReport) -> Result<(), AllocFailure> 
 
 // --- DECRQSS ---
 
-/// The cursor's shape as DECSCUSR sets it. ghostty also has a hollow block (unfocused), which
-/// DECSCUSR cannot name and is reported as a block.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum CursorShape {
-    Block,
-    Underline,
-    Bar,
-    BlockHollow,
-}
-
 /// What DECRQSS reports from: the active screen's pen, region and cursor.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct DecrqssState<'s> {
@@ -282,6 +275,8 @@ pub struct DecrqssState<'s> {
     pub right: u32,
     /// DECLRMM (mode 69): DECSLRM is reported only while it is set.
     pub left_right_margins: bool,
+    /// The cursor's shape; a hollow block (unfocused), which DECSCUSR cannot name, is reported
+    /// as a block.
     pub cursor_shape: CursorShape,
     /// Mode 12.
     pub cursor_blink: bool,
@@ -642,28 +637,13 @@ pub fn osc21(
     })
 }
 
-/// Which clipboard an OSC 52 reply names.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Clipboard {
-    /// `c`.
-    Standard,
-    /// `s`.
-    Selection,
-    /// `p`.
-    Primary,
-}
-
 /// An OSC 52 read's reply: `OSC 52 ; kind ; base64 ST`, always `ST` whatever ended the query
 /// (Surface.zig:5953), even for empty contents. `base64` is the contents already encoded
 /// (standard alphabet, padded): the clipboard owner encodes them.
 pub fn osc52(out: Out<'_, '_>, kind: Clipboard, base64: &[u8]) -> Result<(), AllocFailure> {
     emit(out, |w| {
         w.bytes(b"\x1b]52;");
-        w.byte(match kind {
-            Clipboard::Standard => b'c',
-            Clipboard::Selection => b's',
-            Clipboard::Primary => b'p',
-        });
+        w.byte(kind.letter());
         w.byte(b';');
         w.bytes(base64);
         w.bytes(b"\x1b\\");
