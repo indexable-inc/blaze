@@ -2354,14 +2354,40 @@ pub fn run<S: RecordSource + RecordFiles + Sync, B: Bind + Send>(
         return Err(RunModeError::NotBuilt { what: "run mode on x86-64: code records are AArch64 (blaze-code a64)" });
     }
     let raw = fd.as_raw_fd();
+    // Capture process `argc`/`argv` once before guest execution starts so eager initializers,
+    // lazy initializers (allocation-free in `table::resolve`), and `Handed::CMain` all share the
+    // exact same argument array.
+    let (argc, argv) = match handed {
+        Handed::Comptime(args) => (args.argc, args.argv),
+        Handed::CMain => process_args(),
+        Handed::Unit | Handed::Hosted(_) => {
+            if cfg!(target_os = "linux") {
+                process_args()
+            } else {
+                (0, core::ptr::null())
+            }
+        }
+    };
+    let eager_native = matches!(native, Some(NativeStart::Eager(_)));
+    let open_ask: crate::sys::Handoff<Option<RecordId>> = crate::sys::Handoff::new();
+    let open_ans: crate::sys::Handoff<Result<crate::native_lib::DlNatives, RunModeError>> = crate::sys::Handoff::new();
     let ready: crate::sys::Handoff<Ready> = crate::sys::Handoff::new();
+    let argv_addr = argv as usize;
+    let open_bridge = eager_native.then_some((&open_ask, &open_ans));
     std::thread::scope(|scope| {
         let control = std::thread::Builder::new()
             .name("blaze-run-control".to_owned())
-            .spawn_scoped(scope, || control(raw, source, entry, native, bind, alloc, &ready));
+            .spawn_scoped(scope, || control(raw, source, entry, native, bind, alloc, argc, argv_addr, open_bridge, &ready));
         let Ok(control) = control else {
             return Err(RunModeError::Thread { what: "control" });
         };
+        if eager_native {
+            if let Some(record) = open_ask.take() {
+                // Run `dlopen` on the initial thread so any `DT_NEEDED` dependency constructors
+                // execute on the initial thread before `main`.
+                open_ans.put(crate::native_lib::DlNatives::open_record(source.folder(), record));
+            }
+        }
         // The wait "run mode: the entry's stub written": the control thread answers at once,
         // with the thunk or with why it has none (and then returns, so the scope's join ends).
         let (thunk, shared, loaded) = ready.take()?;
@@ -2373,9 +2399,14 @@ pub fn run<S: RecordSource + RecordFiles + Sync, B: Bind + Send>(
         // and before it is called (native_lib.rs step 5): an executable's order. They may call
         // Rust words: each is a slot's thunk, served by the control thread, already in its loop.
         if let Some(loaded) = loaded {
-            crate::native_lib::run_inits(loaded)?;
+            if let Err(why) = crate::native_lib::run_inits_with(loaded, argc, argv) {
+                drop(me);
+                shared.stop();
+                let _ = control.join();
+                return Err(why);
+            }
         }
-        let exit = call_entry(thunk, handed);
+        let exit = call_entry_with(thunk, handed, argc, argv);
         match (exit, end) {
             (EntryExit::Returned(status), End::Exit) => {
                 // The main thread stays a mutator to the end: `exit` runs the program's
@@ -2464,7 +2495,16 @@ enum EntryExit {
 /// without invoking host `panic_unwind::__rust_panic_cleanup` (which would reject the guest's
 /// `CANARY` with `"fatal runtime error: Rust cannot catch foreign exceptions, aborting"`) or
 /// `_Unwind_DeleteException` (which would invoke guest `__rust_drop_panic`).
+#[cfg(test)]
 fn call_entry(thunk: u64, handed: Handed) -> EntryExit {
+    let (argc, argv) = match handed {
+        Handed::CMain => process_args(),
+        _ => (0, core::ptr::null()),
+    };
+    call_entry_with(thunk, handed, argc, argv)
+}
+
+fn call_entry_with(thunk: u64, handed: Handed, argc: core::ffi::c_int, argv: *const *const core::ffi::c_char) -> EntryExit {
     use core::ffi::{c_char, c_int, c_void};
 
     enum Call {
@@ -2515,7 +2555,6 @@ fn call_entry(thunk: u64, handed: Handed) -> EntryExit {
             Call::Unit { entry }
         }
         Handed::CMain => {
-            let (argc, argv) = process_args();
             // SAFETY: as above, for `extern "C-unwind" fn(c_int, *const *const c_char) -> c_int`.
             let entry: extern "C-unwind" fn(c_int, *const *const c_char) -> c_int =
                 unsafe { core::mem::transmute(entry_addr) };
@@ -2574,9 +2613,32 @@ enum NativeExpect {
     Lazy { record: RecordId },
 }
 
+/// Ensures the initial thread waiting on `open_ask` for an eager native library is always woken
+/// with `None` if `control` returns early before reaching `Act::Native`.
+struct EagerOpenGate<'a> {
+    bridge: Option<(&'a crate::sys::Handoff<Option<RecordId>>, &'a crate::sys::Handoff<Result<crate::native_lib::DlNatives, RunModeError>>)>,
+}
+
+impl<'a> EagerOpenGate<'a> {
+    fn open(&mut self, record: RecordId) -> Option<Result<crate::native_lib::DlNatives, RunModeError>> {
+        let (ask, ans) = self.bridge.take()?;
+        ask.put(Some(record));
+        Some(ans.take())
+    }
+}
+
+impl Drop for EagerOpenGate<'_> {
+    fn drop(&mut self) {
+        if let Some((ask, _)) = self.bridge.take() {
+            ask.put(None);
+        }
+    }
+}
+
 /// The control thread: maps the run's memory (its tables are in the run's allocator, which
 /// stays on this thread), starts the socket's reader, writes the entry's stub, then is the one
 /// writer of code and words for the life of the process.
+#[expect(clippy::too_many_arguments, reason = "receives the run's handoffs, pre-captured args, and native open bridge")]
 fn control<S: RecordSource + RecordFiles, B: Bind>(
     fd: i32,
     source: &S,
@@ -2584,10 +2646,15 @@ fn control<S: RecordSource + RecordFiles, B: Bind>(
     native: Option<NativeStart>,
     bind: B,
     alloc: blaze_own::SharedAlloc<'static>,
+    argc: core::ffi::c_int,
+    argv_addr: usize,
+    open_bridge: Option<(&crate::sys::Handoff<Option<RecordId>>, &crate::sys::Handoff<Result<crate::native_lib::DlNatives, RunModeError>>)>,
     ready: &crate::sys::Handoff<Ready>,
 ) {
     use crate::stub_wait::Answer;
     use crate::table::Event as Queued;
+
+    let mut open_gate = EagerOpenGate { bridge: open_bridge };
 
     // The one unwind registry, before any record is placed: the finder installed (macOS) and
     // its writer kept by this thread, the one writer of code and words.
@@ -2600,6 +2667,7 @@ fn control<S: RecordSource + RecordFiles, B: Bind>(
         Ok(memory) => memory,
         Err(why) => return ready.put(Err(why)),
     };
+    memory.shared.set_process_args(argc, argv_addr as *const *const core::ffi::c_char);
     // The crash report tells the parent where the program struck on this socket (its frame
     // and `send`'s never interleave: `fault_report::hold_channel`).
     fault_report::channel(fd);
@@ -2709,7 +2777,12 @@ fn control<S: RecordSource + RecordFiles, B: Bind>(
                 // stopped by name.
                 Act::Native { record } => match core::mem::replace(&mut expect, NativeExpect::None) {
                     NativeExpect::Eager { record: named, .. } if named == record => {
-                        match load_library(&mut mode, source, &mut memory) {
+                        let opened = match open_gate.open(record) {
+                            Some(Ok(natives)) => load_library_opened(&mut mode, natives, &mut memory),
+                            Some(Err(why)) => Err(why),
+                            None => load_library(&mut mode, source, &mut memory),
+                        };
+                        match opened {
                             Ok(loaded) => {
                                 ready.put(Ok((memory.thunk(entry), std::sync::Arc::clone(&shared), Some(loaded))));
                                 Ok(())
@@ -2803,7 +2876,15 @@ mod thread_locals;
 ///   code record carries a type, so a mismatch is the program's own undefined behaviour, as
 ///   it is under a native link.
 fn load_library<S: RecordFiles, B: Bind>(mode: &mut RunMode<'_>, source: &S, memory: &mut NativeMemory<'_, B>) -> Result<crate::native_lib::Loaded, RunModeError> {
-    let mut natives = crate::native_lib::DlNatives::new(source.folder())?;
+    let natives = crate::native_lib::DlNatives::new(source.folder())?;
+    load_library_opened(mode, natives, memory)
+}
+
+fn load_library_opened<B: Bind>(
+    mode: &mut RunMode<'_>,
+    mut natives: crate::native_lib::DlNatives,
+    memory: &mut NativeMemory<'_, B>,
+) -> Result<crate::native_lib::Loaded, RunModeError> {
     let loaded = match mode.load_native(&mut natives, memory) {
         Ok(loaded) => loaded,
         Err(RunModeError::Native(NativeError::Open { record })) => return Err(RunModeError::Native(crate::native_lib::open_refused(record, natives.said()))),

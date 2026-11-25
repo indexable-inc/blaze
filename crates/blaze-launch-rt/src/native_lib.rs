@@ -361,9 +361,16 @@ pub struct DlNatives {
     /// The open image, once [`Natives::open`] succeeded. Never closed: the program's code runs
     /// from it until the process ends.
     handle: *mut c_void,
+    /// Set by [`DlNatives::open_record`] when the initial thread pre-opened the image so
+    /// `DT_NEEDED` constructors ran on the initial thread before `main`.
+    opened: Option<(RecordId, u64)>,
     said: [u8; SAID_MOST],
     said_len: usize,
 }
+
+// SAFETY: `dlopen` returns an opaque process-global handle valid for `dlsym` from any thread, and
+// ownership of `DlNatives` transfers exclusively once from the initial thread to the control thread.
+unsafe impl Send for DlNatives {}
 
 impl DlNatives {
     /// `folder` is the store's folder, without a trailing `/`; refused when a record's path
@@ -375,7 +382,22 @@ impl DlNatives {
         }
         let mut copy = [0u8; PATH_MOST];
         copy[..folder.len()].copy_from_slice(folder);
-        Ok(DlNatives { folder: copy, folder_len: folder.len(), handle: core::ptr::null_mut(), said: [0; SAID_MOST], said_len: 0 })
+        Ok(DlNatives { folder: copy, folder_len: folder.len(), handle: core::ptr::null_mut(), opened: None, said: [0; SAID_MOST], said_len: 0 })
+    }
+
+    /// Opens `record` from `folder` immediately on the calling thread (so any `DT_NEEDED` library
+    /// constructors execute on the process's initial thread before `main`), returning a `DlNatives`
+    /// whose subsequent [`Natives::open`] for `record` reuses the already-open handle.
+    pub fn open_record(folder: &[u8], record: RecordId) -> Result<DlNatives, RunModeError> {
+        let mut natives = DlNatives::new(folder)?;
+        match natives.open(record) {
+            Ok(base) => {
+                natives.opened = Some((record, base));
+                Ok(natives)
+            }
+            Err(NativeError::Open { record }) => Err(RunModeError::Native(open_refused(record, natives.said()))),
+            Err(why) => Err(RunModeError::Native(why)),
+        }
     }
 
     /// The `dlerror` text of the last failed `dlopen`, for the driver's message.
@@ -405,6 +427,12 @@ impl DlNatives {
 
 impl Natives for DlNatives {
     fn open(&mut self, record: RecordId) -> Result<u64, NativeError> {
+        if let Some((preopened, base)) = self.opened.take() {
+            if preopened == record {
+                return Ok(base);
+            }
+            return Err(NativeError::Twice { record });
+        }
         if !self.handle.is_null() {
             return Err(NativeError::Twice { record });
         }
@@ -520,10 +548,10 @@ impl Natives for DlNatives {
     }
 }
 
-/// Runs the library's initializers in order on the calling thread: the process's first thread,
-/// after the entry is numbered and before it is called (NATIVE.md 3.4, 3.7).
+/// Runs the library's initializers in order on the calling thread with the pre-captured process
+/// `argc`/`argv` (allocation-free and lock-free, safe to invoke from a lazy stub resolver).
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub fn run_inits(loaded: Loaded) -> Result<(), RunModeError> {
+pub fn run_inits_with(loaded: Loaded, argc: core::ffi::c_int, argv: *const *const core::ffi::c_char) -> Result<(), RunModeError> {
     if loaded.inits == 0 {
         return Ok(());
     }
@@ -535,14 +563,20 @@ pub fn run_inits(loaded: Loaded) -> Result<(), RunModeError> {
         // SAFETY: `_NSGetArgc`, `_NSGetArgv`, `_NSGetEnviron` (<crt_externs.h>) return the
         // process's own argc, argv and environ, set up by dyld before any code ran; the program
         // runs in this process, so they are its arguments (the entry's `argv` is the same list).
-        unsafe { (*_NSGetArgc(), (*_NSGetArgv()).cast_const().cast(), (*_NSGetEnviron()).cast_const().cast()) }
+        unsafe {
+            let envp: *const *const c_char = (*_NSGetEnviron()).cast_const().cast();
+            if argv.is_null() {
+                (*_NSGetArgc(), (*_NSGetArgv()).cast_const().cast(), envp)
+            } else {
+                (argc, argv, envp)
+            }
+        }
     };
     #[cfg(target_os = "linux")]
     let (argc, argv, envp) = {
         unsafe extern "C" {
             static environ: *const *const c_char;
         }
-        let (argc, argv) = crate::run_mode::process_args();
         // SAFETY: `environ` is the C library's process environment pointer array, set up before
         // `main` and live for the process's life.
         let envp = unsafe { environ };
@@ -569,10 +603,23 @@ pub fn run_inits(loaded: Loaded) -> Result<(), RunModeError> {
     Ok(())
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+/// Runs the library's initializers in order on the calling thread: the process's first thread,
+/// after the entry is numbered and before it is called (NATIVE.md 3.4, 3.7).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn run_inits(loaded: Loaded) -> Result<(), RunModeError> {
+    let empty: *const core::ffi::c_char = core::ptr::null();
+    run_inits_with(loaded, 0, &raw const empty)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn run_inits_with(loaded: Loaded, _argc: core::ffi::c_int, _argv: *const *const core::ffi::c_char) -> Result<(), RunModeError> {
     match loaded.inits {
         0 => Ok(()),
         _ => Err(RunModeError::NotBuilt { what: "a native library's initializers on this platform (NATIVE.md W5)" }),
     }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn run_inits(loaded: Loaded) -> Result<(), RunModeError> {
+    run_inits_with(loaded, 0, core::ptr::null())
 }

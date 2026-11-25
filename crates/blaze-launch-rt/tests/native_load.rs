@@ -289,10 +289,14 @@ fn a_c_function_of_the_loaded_library_returns_its_value() {
 #[test]
 fn run_inits_invokes_initializers_and_refuses_null_cell() {
     use core::ffi::{c_char, c_int};
-    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
     static RAN: AtomicBool = AtomicBool::new(false);
-    extern "C" fn mark_ran(_argc: c_int, _argv: *const *const c_char, _envp: *const *const c_char) {
+    static GOT_ARGC: AtomicI32 = AtomicI32::new(-1);
+    static GOT_ARGV: AtomicUsize = AtomicUsize::new(0);
+    extern "C" fn mark_ran(argc: c_int, argv: *const *const c_char, _envp: *const *const c_char) {
+        GOT_ARGC.store(argc, Ordering::SeqCst);
+        GOT_ARGV.store(argv as usize, Ordering::SeqCst);
         RAN.store(true, Ordering::SeqCst);
     }
 
@@ -303,8 +307,12 @@ fn run_inits_invokes_initializers_and_refuses_null_cell() {
         inits_at: valid_cells.as_ptr() as u64,
         inits: 1,
     };
-    native_lib::run_inits(loaded).expect("valid init cell runs");
+    let arg0 = c"blaze-test".as_ptr();
+    let argv_arr = [arg0, core::ptr::null()];
+    native_lib::run_inits_with(loaded, 1, argv_arr.as_ptr()).expect("valid init cell runs");
     assert!(RAN.load(Ordering::SeqCst), "initializer function must be invoked");
+    assert_eq!(GOT_ARGC.load(Ordering::SeqCst), 1, "initializer must receive pre-captured argc");
+    assert_eq!(GOT_ARGV.load(Ordering::SeqCst), argv_arr.as_ptr() as usize, "initializer must receive exact argv pointer");
 
     // Control: a null init cell is refused by name rather than called.
     let null_cells = [0u64];
@@ -318,6 +326,15 @@ fn run_inits_invokes_initializers_and_refuses_null_cell() {
         native_lib::run_inits(bad),
         Err(RunModeError::Native(NativeError::NullInit { record: LIBRARY, index: 0 })),
     );
+
+    let folder = filed("preopen");
+    let mut mode = RunMode::new(alloc());
+    told(&mut mode);
+    let mut preopened = DlNatives::open_record(folder.as_os_str().as_encoded_bytes(), LIBRARY)
+        .unwrap_or_else(|e| panic!("preopen failed: {e}"));
+    let pre_loaded = mode.load_native(&mut preopened, &mut SlotsOnly).unwrap_or_else(|e| panic!("load_native on preopened handle failed: {e}"));
+    assert_eq!(pre_loaded.record, LIBRARY);
+    let _ = std::fs::remove_dir_all(&folder);
 }
 
 /// The control: no library loaded (no `Native` sent), the same name is refused by type, naming

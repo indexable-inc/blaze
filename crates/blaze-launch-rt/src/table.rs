@@ -90,10 +90,17 @@ pub struct Shared {
     /// control thread.
     pid: u32,
     /// Pending lazy native library initializers published by the control thread and run once
-    /// by the waking mutator thread in [`resolve`] before entering the newly bound foreign code.
+    /// by the first waking mutator thread in [`resolve`] while concurrent waiters block until
+    /// initialization completes (`0` = none/done, `1` = pending, `2` = running).
     native_inits_base: AtomicU64,
     native_inits_at: AtomicU64,
     native_inits_count: AtomicU32,
+    native_inits_state: AtomicU64,
+    native_inits_owner: AtomicUsize,
+    /// Pre-captured process `argc`/`argv` stored once before guest execution so lazy Linux
+    /// initializers never allocate or lock inside [`resolve`].
+    native_argc: AtomicU32,
+    native_argv: AtomicUsize,
 }
 
 thread_local! {
@@ -130,18 +137,93 @@ impl Shared {
             native_inits_base: AtomicU64::new(0),
             native_inits_at: AtomicU64::new(0),
             native_inits_count: AtomicU32::new(0),
+            native_inits_state: AtomicU64::new(0),
+            native_inits_owner: AtomicUsize::new(0),
+            native_argc: AtomicU32::new(0),
+            native_argv: AtomicUsize::new(0),
         }
     }
 
-    /// Publishes a lazily loaded native library's initializer list so the waking mutator thread
-    /// runs it once before executing the newly bound foreign function.
+    /// Records the pre-captured process `argc`/`argv` before guest execution begins.
+    pub(crate) fn set_process_args(&self, argc: core::ffi::c_int, argv: *const *const core::ffi::c_char) {
+        self.native_argc.store(argc as u32, Ordering::Relaxed);
+        self.native_argv.store(argv as usize, Ordering::Release);
+    }
+
+    /// Publishes a lazily loaded native library's initializer list so the first waking mutator
+    /// thread runs it once while concurrent waiters block until initialization finishes.
     pub(crate) fn publish_lazy_inits(&self, loaded: crate::native_lib::Loaded) {
         if loaded.inits == 0 {
             return;
         }
         self.native_inits_base.store(loaded.base, Ordering::Relaxed);
         self.native_inits_at.store(loaded.inits_at, Ordering::Relaxed);
-        self.native_inits_count.store(loaded.inits, Ordering::Release);
+        self.native_inits_count.store(loaded.inits, Ordering::Relaxed);
+        self.native_inits_state.store(1, Ordering::Release);
+    }
+
+    /// Ensures any published lazy native library initializers have finished before entering foreign
+    /// code: one thread runs them allocation-free, concurrent threads block until completion, and
+    /// re-entrant Rust callbacks from inside an initializer on the runner thread proceed directly.
+    pub(crate) fn ensure_lazy_inits(&self, slot: usize) {
+        const IDLE: u64 = 0;
+        const PENDING: u64 = 1;
+        const RUNNING: u64 = 2;
+
+        #[cfg(unix)]
+        // SAFETY: `pthread_self()` is async-signal-safe and returns this thread's non-zero id.
+        let me = (unsafe { libc::pthread_self() } as usize).max(1);
+        #[cfg(not(unix))]
+        let me = 1usize;
+
+        let clock = Monotonic::new();
+        let deadline = Deadline::after(clock.now(), stub_wait::STUB_BOUND);
+        loop {
+            match self.native_inits_state.load(Ordering::Acquire) {
+                IDLE => return,
+                PENDING => {
+                    if self.native_inits_state.compare_exchange(PENDING, RUNNING, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                        self.native_inits_owner.store(me, Ordering::Release);
+                        let loaded = crate::native_lib::Loaded {
+                            record: blaze_launch::wire::RecordId([0; 32]),
+                            base: self.native_inits_base.load(Ordering::Relaxed),
+                            inits_at: self.native_inits_at.load(Ordering::Relaxed),
+                            inits: self.native_inits_count.load(Ordering::Relaxed),
+                        };
+                        let argc = self.native_argc.load(Ordering::Acquire) as core::ffi::c_int;
+                        let argv = self.native_argv.load(Ordering::Acquire) as *const *const core::ffi::c_char;
+                        let result = if argv.is_null() {
+                            crate::native_lib::run_inits(loaded)
+                        } else {
+                            crate::native_lib::run_inits_with(loaded, argc, argv)
+                        };
+                        self.native_inits_owner.store(0, Ordering::Release);
+                        self.native_inits_state.store(IDLE, Ordering::Release);
+                        blaze_core::wait::wake_shared(&self.native_inits_state);
+                        if result.is_err() {
+                            stop(slot, "a lazily loaded native library initializer failed");
+                        }
+                        return;
+                    }
+                }
+                RUNNING => {
+                    if self.native_inits_owner.load(Ordering::Acquire) == me {
+                        return;
+                    }
+                    let waited = blaze_core::wait::wait_shared(
+                        "a lazily loaded native library's initializers (table::Shared::ensure_lazy_inits)",
+                        &self.native_inits_state,
+                        RUNNING as u32,
+                        deadline,
+                        &clock,
+                    );
+                    if waited.is_err() {
+                        stop(slot, "timed out waiting for lazily loaded native library initializers");
+                    }
+                }
+                _ => return,
+            }
+        }
     }
 
     /// The address of `slot`'s word, which is the slot's for the life of the process: what
@@ -435,22 +517,10 @@ pub(crate) extern "C" fn resolve(stub: usize, context: *const c_void) -> *const 
     match answer {
         Answer::Bound => {
             // If the control thread lazily loaded the program's native library while answering
-            // this stub, run its C initializers once here on the mutator thread before entering
-            // the newly bound function (the control thread is free to serve any Rust word stubs
-            // the initializers call).
-            if shared.native_inits_count.load(Ordering::Acquire) != 0 {
-                let inits = shared.native_inits_count.swap(0, Ordering::AcqRel);
-                if inits > 0 {
-                    let loaded = crate::native_lib::Loaded {
-                        record: blaze_launch::wire::RecordId([0; 32]),
-                        base: shared.native_inits_base.load(Ordering::Relaxed),
-                        inits_at: shared.native_inits_at.load(Ordering::Relaxed),
-                        inits,
-                    };
-                    if crate::native_lib::run_inits(loaded).is_err() {
-                        stop(slot, "a lazily loaded native library initializer failed");
-                    }
-                }
+            // this stub, run its C initializers once here on the mutator thread while blocking
+            // concurrent waiters until initialization completes.
+            if shared.native_inits_state.load(Ordering::Acquire) != 0 {
+                shared.ensure_lazy_inits(slot);
             }
             // The resolver's exit is a safepoint (launcher.md, section 1): a thread that
             // began as a mutator reports its stack here while a batch waits.
@@ -489,4 +559,66 @@ fn stop_control(why: &blaze_core::wait::WaitError) -> ! {
     // The process ends below whether or not its last words could be written.
     drop(writeln!(to, "blaze: the launcher's control thread could not wait for its next event: {why}"));
     std::process::exit(101)
+}
+
+#[cfg(test)]
+mod lazy_init_tests {
+    use core::ffi::{c_char, c_int};
+    use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    use super::Shared;
+    use crate::stub_wait::Waiters;
+
+    #[test]
+    fn concurrent_waiters_block_until_lazy_initializers_finish() {
+        static ENTERED: AtomicBool = AtomicBool::new(false);
+        static RELEASE: AtomicBool = AtomicBool::new(false);
+        static DONE: AtomicBool = AtomicBool::new(false);
+        static COUNT: AtomicU32 = AtomicU32::new(0);
+
+        extern "C" fn slow_init(_argc: c_int, _argv: *const *const c_char, _envp: *const *const c_char) {
+            COUNT.fetch_add(1, Ordering::SeqCst);
+            ENTERED.store(true, Ordering::Release);
+            while !RELEASE.load(Ordering::Acquire) {
+                core::hint::spin_loop();
+            }
+            DONE.store(true, Ordering::Release);
+        }
+
+        let cell = [slow_init as *const () as usize as u64];
+        let shared = Arc::new(Shared::new(4, 0, 0, 0, 0..0, Waiters::reserve(core::num::NonZeroU32::MIN).expect("waiters")));
+        shared.publish_lazy_inits(crate::native_lib::Loaded {
+            record: blaze_launch::wire::RecordId([0; 32]),
+            base: 0,
+            inits_at: cell.as_ptr() as u64,
+            inits: 1,
+        });
+
+        let s1 = Arc::clone(&shared);
+        let s2 = Arc::clone(&shared);
+        let waiter_saw_done = Arc::new(AtomicBool::new(false));
+        let w_done = Arc::clone(&waiter_saw_done);
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                s1.ensure_lazy_inits(0);
+            });
+            while !ENTERED.load(Ordering::Acquire) {
+                core::hint::spin_loop();
+            }
+            let waiter = scope.spawn(move || {
+                s2.ensure_lazy_inits(1);
+                w_done.store(DONE.load(Ordering::Acquire), Ordering::SeqCst);
+            });
+            // Let the waiter enter `ensure_lazy_inits` while `slow_init` is still running.
+            for _ in 0..10_000 {
+                core::hint::spin_loop();
+            }
+            assert!(!waiter.is_finished(), "waiter must remain blocked while lazy initializer is still running");
+            RELEASE.store(true, Ordering::Release);
+            waiter.join().expect("waiter finishes");
+        });
+        assert!(waiter_saw_done.load(Ordering::SeqCst), "waiter must observe initializer completion");
+        assert_eq!(COUNT.load(Ordering::SeqCst), 1, "initializer must run exactly once");
+    }
 }
