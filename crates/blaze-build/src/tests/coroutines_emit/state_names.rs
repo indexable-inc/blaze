@@ -401,3 +401,186 @@ fn partially_moved_local_across_await_keeps_rest_word_in_state() {
         .unwrap_or_else(|e| panic!("partially moved local across await failed on cancel: {e}"));
     assert_eq!(cancelled, Ran { value: u64::MAX, polls: 1, drops: 2, made: 1 });
 }
+
+/// A flagged `Drop` local moved out inside a branch right before `.await` (`if true { consume_d(d);
+/// twice().await } else { ... }`) is proven definitely uninitialized on that branch, so neither its
+/// slot nor its drop flag is read on the cancel path and a laid state that does not save `d` builds
+/// and drops `d` exactly once on both completion and cancellation.
+#[test]
+fn branch_moved_flagged_local_before_await_needs_no_state_slot() {
+    let mut w = open_world();
+    let item = async_fn(&mut w, "branch_moved_before_await", "branch_moved_before_await_future");
+    w.fx.finish();
+    let mut b = async_body();
+    let mut lits = StdVec::new();
+    // let d = mk_d();
+    let d = b.bind("d");
+    let mk0 = b.path(&["mk_d"]);
+    let d0 = b.call(mk0, &[]);
+    let s0 = b.let_(d, None, d0);
+    // if true { consume_d(d); twice().await } else { consume_d(d); 99 }
+    let cond = bool_lit(&mut b, true);
+    let c1 = b.path(&["consume_d"]);
+    let dl1 = b.local(d);
+    let call_c1 = b.call(c1, &[dl1]);
+    let s_c1 = b.semi(call_c1);
+    let awaited = call_await(&mut b, "twice");
+    let then_blk = b.block(&[s_c1], Some(awaited));
+    let c2 = b.path(&["consume_d"]);
+    let dl2 = b.local(d);
+    let call_c2 = b.call(c2, &[dl2]);
+    let s_c2 = b.semi(call_c2);
+    let k99 = lit(&mut b, &mut lits, 99);
+    let else_blk = b.block(&[s_c2], Some(k99));
+    let if_e = if_expr(&mut b, cond, then_blk, Some(else_blk));
+    let body = b.block(&[s0], Some(if_e));
+    let root = b.async_block(body, Capture::Move);
+    let progs = [Prog { item, b: &b, root, lits: &lits }];
+    // `d` is moved before `.await` on the only suspending branch, so only `awaited` is saved!
+    let saved = [(Identity::Temp(awaited, Role::Awaitee), (16, 3), false)];
+    let laid = Laid::new((0, 0), &saved, 1, StatePlant::None);
+
+    let done = run_laid(&w, &progs, Script::Complete, Some(&laid))
+        .unwrap_or_else(|e| panic!("branch-moved flagged local failed on completion: {e}"));
+    assert_eq!(done, Ran { value: 2, polls: 3, drops: 1, made: 1 });
+
+    let cancelled = run_laid(&w, &progs, Script::CancelAfter(1), Some(&laid))
+        .unwrap_or_else(|e| panic!("branch-moved flagged local failed on cancel: {e}"));
+    assert_eq!(cancelled, Ran { value: u64::MAX, polls: 1, drops: 1, made: 1 });
+}
+
+/// A saved `Drop` local moved in arm 1 before the first `.await` while kept live in arm 2 across a
+/// second `.await` (like `tokio-tungstenite`'s `client_async_tls_with_config`) must keep its
+/// state name across both arms, dropping once on both completion and cancellation.
+#[test]
+fn saved_local_moved_before_first_await_stays_named_for_second_branch() {
+    let mut w = open_world();
+    let item = async_fn(&mut w, "moved_one_branch_kept_other", "moved_one_branch_kept_other_future");
+    w.fx.finish();
+    let mut b = async_body();
+    let lits = StdVec::new();
+    // let d = mk_d();
+    let d = b.bind("d");
+    let mk0 = b.path(&["mk_d"]);
+    let d0 = b.call(mk0, &[]);
+    let s0 = b.let_(d, None, d0);
+    // if false { consume_d(d); twice().await } else { twice().await }
+    let cond = bool_lit(&mut b, false);
+    let c1 = b.path(&["consume_d"]);
+    let dl1 = b.local(d);
+    let call_c1 = b.call(c1, &[dl1]);
+    let s_c1 = b.semi(call_c1);
+    let aw0 = call_await(&mut b, "twice");
+    let then_blk = b.block(&[s_c1], Some(aw0));
+    let aw1 = call_await(&mut b, "twice");
+    let else_blk = b.block(&[], Some(aw1));
+    let if_e = if_expr(&mut b, cond, then_blk, Some(else_blk));
+    let body = b.block(&[s0], Some(if_e));
+    let root = b.async_block(body, Capture::Move);
+    let progs = [Prog { item, b: &b, root, lits: &lits }];
+    let saved = [
+        (Identity::Binding(d), (8, 3), true),
+        (Identity::Temp(aw0, Role::Awaitee), (16, 3), false),
+        (Identity::Temp(aw1, Role::Awaitee), (16, 3), false),
+    ];
+    let laid = Laid::new((0, 0), &saved, 2, StatePlant::None);
+
+    let done = run_laid(&w, &progs, Script::Complete, Some(&laid))
+        .unwrap_or_else(|e| panic!("saved local moved in arm 1 failed on completion: {e}"));
+    assert_eq!(done, Ran { value: 2, polls: 3, drops: 1, made: 1 });
+
+    let cancelled = run_laid(&w, &progs, Script::CancelAfter(1), Some(&laid))
+        .unwrap_or_else(|e| panic!("saved local moved in arm 1 failed on cancel: {e}"));
+    assert_eq!(cancelled, Ran { value: u64::MAX, polls: 1, drops: 1, made: 1 });
+}
+
+/// A partially-moved dropping temporary across `.await` (`consume_d((mk_d(), mk_d()).0)` inside a
+/// statement whose second expression awaits) saves its 8-byte `rest` word in the laid state via
+/// `may_partial_move_temps`, dropping only the unmoved element on both completion and cancellation.
+#[test]
+fn partially_moved_temp_across_await_keeps_rest_word_in_state() {
+    let mut w = open_world();
+    let item = async_fn(&mut w, "partial_move_temp_across", "partial_move_temp_across_future");
+    w.fx.finish();
+    let mut b = async_body();
+    let lits = StdVec::new();
+    // let x = (mk_d(), mk_d()).0; (temp tuple dropped at statement end after `.await`)
+    // Specifically: `take_two((mk_d(), mk_d()).0, twice().await)` or `(consume_d((mk_d(), mk_d()).0), twice().await).1`
+    // Using tuple literal `(consume_d((mk_d(), mk_d()).0), twice().await)` keeps `(mk_d(), mk_d())`
+    // in the statement temporary scope across `twice().await`!
+    let mk0 = b.path(&["mk_d"]);
+    let d0 = b.call(mk0, &[]);
+    let mk1 = b.path(&["mk_d"]);
+    let d1 = b.call(mk1, &[]);
+    let tup = b.tuple(&[d0, d1]);
+    let f0 = tuple_field(&mut b, tup, 0);
+    let consume = b.path(&["consume_d"]);
+    let call_c = b.call(consume, &[f0]);
+    let awaited = call_await(&mut b, "twice");
+    let outer = b.tuple(&[call_c, awaited]);
+    let out_val = tuple_field(&mut b, outer, 1);
+    let body = b.block(&[], Some(out_val));
+    let root = b.async_block(body, Capture::Move);
+    let progs = [Prog { item, b: &b, root, lits: &lits }];
+    let view = b.view(item, root);
+    let heap = blaze_own::testing::heap();
+    let a = heap.alloc();
+    let temp_partial = crate::coroutine_state::may_partial_move_temps(&view, a);
+    assert!(temp_partial[tup.ix()], "may_partial_move_temps must flag `(mk_d(), mk_d())`");
+    let saved_sizes = [(16u64, 3u8), (16u64, 3u8)];
+    let needs_flag = [true, false];
+    let needs_rest = [true, false];
+    let l = lay_state_with_flags((0, 0), &saved_sizes, &needs_flag, &needs_rest, &[], &[], 1, a, a)
+        .unwrap_or_else(|e| panic!("lay_state_with_flags: {e}"));
+    let mut rows = StdVec::from([
+        StateName { identity: Identity::Temp(tup, Role::Value), offset: l.field[0], size: 16, flag: l.flag[0], rest: l.rest[0] },
+        StateName { identity: Identity::Temp(awaited, Role::Awaitee), offset: l.field[1], size: 16, flag: l.flag[1], rest: l.rest[1] },
+    ]);
+    rows.sort_unstable_by_key(|r| r.identity);
+    let laid = Laid { laid: l.state, rows, plant: StatePlant::None };
+
+    let done = run_laid(&w, &progs, Script::Complete, Some(&laid))
+        .unwrap_or_else(|e| panic!("partially moved temp across await failed on completion: {e}"));
+    assert_eq!(done, Ran { value: 2, polls: 3, drops: 2, made: 1 });
+
+    let cancelled = run_laid(&w, &progs, Script::CancelAfter(1), Some(&laid))
+        .unwrap_or_else(|e| panic!("partially moved temp across await failed on cancel: {e}"));
+    assert_eq!(cancelled, Ran { value: u64::MAX, polls: 1, drops: 2, made: 1 });
+}
+
+/// A `loop { let d = mk_d(); break; }; twice().await` ends `d`'s slot on the `break` edge so `d`
+/// is not kept across the subsequent `.await`, dropping `d` once before suspension.
+#[test]
+fn loop_break_before_await_ends_dropped_local_slot() {
+    let mut w = open_world();
+    let item = async_fn(&mut w, "loop_break_before_await", "loop_break_before_await_future");
+    w.fx.finish();
+    let mut b = async_body();
+    let lits = StdVec::new();
+    // loop { let d = mk_d(); break; }
+    let d = b.bind("d");
+    let mk0 = b.path(&["mk_d"]);
+    let d0 = b.call(mk0, &[]);
+    let s0 = b.let_(d, None, d0);
+    let loop_e = b.int(None);
+    let brk = b.int(None);
+    b.exprs[brk.ix()] = blaze_typeck::Expr::Break { value: None, target: loop_e };
+    let s1 = b.semi(brk);
+    let loop_body = b.block(&[s0, s1], None);
+    b.exprs[loop_e.ix()] = blaze_typeck::Expr::Loop { body: loop_body };
+    let s_loop = b.semi(loop_e);
+    let awaited = call_await(&mut b, "twice");
+    let body = b.block(&[s_loop], Some(awaited));
+    let root = b.async_block(body, Capture::Move);
+    let progs = [Prog { item, b: &b, root, lits: &lits }];
+    let saved = [(Identity::Temp(awaited, Role::Awaitee), (16, 3), false)];
+    let laid = Laid::new((0, 0), &saved, 1, StatePlant::None);
+
+    let done = run_laid(&w, &progs, Script::Complete, Some(&laid))
+        .unwrap_or_else(|e| panic!("loop break before await failed on completion: {e}"));
+    assert_eq!(done, Ran { value: 2, polls: 3, drops: 1, made: 1 });
+
+    let cancelled = run_laid(&w, &progs, Script::CancelAfter(1), Some(&laid))
+        .unwrap_or_else(|e| panic!("loop break before await failed on cancel: {e}"));
+    assert_eq!(cancelled, Ran { value: u64::MAX, polls: 1, drops: 1, made: 1 });
+}

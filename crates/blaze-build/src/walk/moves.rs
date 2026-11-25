@@ -157,6 +157,20 @@ impl<A: Allocator + Copy> Moves<A> {
             box_self: None,
         }
     }
+
+    /// Reports every slot still referenced by open move roots or a pending temporary box deref.
+    pub(super) fn for_each_live_slot(&self, mut f: impl FnMut(SlotId), value_slot: impl Fn(Value) -> Option<SlotId>) {
+        for r in self.roots.iter() {
+            if let Some(s) = r.mask {
+                f(s);
+            }
+        }
+        if let Some((_, v)) = self.box_self
+            && let Some(s) = value_slot(v)
+        {
+            f(s);
+        }
+    }
 }
 
 /// A node of a value being dropped: its type, its offset from the value, the length of its
@@ -231,10 +245,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             return Err(unsupported(scrutinee, "a temporary scrutinee that needs drop held as other than an aggregate (a `Box`), in a match by tests"));
         };
         self.hold_temp(scrutinee, (p, off), srepr)?;
-        let slot = self.b.slot(8, 3, SlotKind::Named);
-        let fa = self.b.slot_addr(slot);
-        let all = self.b.iconst(Ty::I64, u128::from(u64::MAX));
-        self.b.store(Flags::NONE, all, fa, 0, MemAttrs::aligned(3));
+        let slot = self.new_temp_mask((p, off), scrutinee);
         // `hold_temp`'s entry for it (a whole `Held::Rest` at its place) takes the word.
         let held = self.scope_pats.iter().rposition(|h| matches!(*h, Held::Rest { at, variant: None, .. } if at == (p, off)));
         let held = held.ok_or(malformed("a held temporary scrutinee missing from its scope"))?;
@@ -258,6 +269,31 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         self.b.store(Flags::NONE, all, fa, 0, MemAttrs::aligned(3));
         self.scope_pats.push(Held::Moved { at, g, mask: slot });
         self.moves.roots.push(Root { m, expr: self.body.root, owner: Owner::Temp, mask: Some(slot), g, field: None });
+    }
+
+    /// Allocates and initializes an 8-byte partial-move field-flags word (`Held::Moved::mask`)
+    /// for a temporary at `at` (from expression `expr`), naming it as that temporary's `rest`
+    /// sub-slot in a laid coroutine state when the flow saves it.
+    pub(super) fn new_temp_mask(&mut self, at: (Value, i32), expr: ExprId) -> SlotId {
+        let slot = self.b.slot(8, 3, SlotKind::Named);
+        if let Some(id) = self.whole_slot(at).and_then(|s| self.slot_identity(s)) {
+            self.name_rest(slot, id);
+        } else {
+            let mut cur = expr;
+            while let Ok(Expr::Paren(inner)) = self.expr(cur) {
+                cur = inner;
+            }
+            let role = if matches!(self.expr(cur), Ok(Expr::Await(_))) {
+                blaze_flow_lower::identity::Role::Result
+            } else {
+                blaze_flow_lower::identity::Role::Value
+            };
+            self.name_rest(slot, blaze_flow_lower::identity::Identity::Temp(cur, role));
+        }
+        let fa = self.b.slot_addr(slot);
+        let all = self.b.iconst(Ty::I64, u128::from(u64::MAX));
+        self.b.store(Flags::NONE, all, fa, 0, MemAttrs::aligned(3));
+        slot
     }
 
     /// Arm `pat` of match `m` is about to bind (`guarded`: it has a guard): its moves are of
@@ -763,10 +799,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             _ => {
                 let t = self.expr_ty(base)?;
                 let g = self.ground_ty(t).map_err(|error| Self::ty_err(base, error))?;
-                let slot = self.b.slot(8, 3, SlotKind::Named);
-                let fa = self.b.slot_addr(slot);
-                let all = self.b.iconst(Ty::I64, u128::from(u64::MAX));
-                self.b.store(Flags::NONE, all, fa, 0, MemAttrs::aligned(3));
+                let slot = self.new_temp_mask(held_at, base);
                 self.scope_pats[i] = Held::Moved { at: held_at, g, mask: slot };
                 slot
             }

@@ -82,6 +82,9 @@ pub(in crate::walk) struct EnvOwned {
 #[derive(Clone, Copy)]
 pub(in crate::walk) enum PlaceAt {
     Sized(Value, i32),
+    /// A sized place captured by reference in a coroutine/closure environment: `(env, off)` holds
+    /// the immutable pointer, reloaded on demand so it never crosses a coroutine suspension.
+    Indirect(Value, i32),
     Unsized(Value, i32),
 }
 
@@ -155,6 +158,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                     return Err(malformed("a binding captured before its binding (no home, no field of the environment above the place)"));
                 };
                 let at = self.env_places.at.get(j).copied().flatten().ok_or(malformed("a whole-binding field of an environment without its binding's home"))?;
+                let at = self.resolve_place(at);
                 (at, taken, Some((j, taken == f.len)))
             }
         };
@@ -209,6 +213,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                             at = PlaceAt::Sized(addr, foff);
                         }
                     }
+                    PlaceAt::Indirect(..) => return Err(malformed("unresolved indirect capture place in owner_place")),
                 },
                 CaptureProj::Deref => {
                     if !matches!(self.ground_node(g).map_err(|error| Self::ty_err(e, error))?, PNode::Ref(..) | PNode::Ptr(..)) {
@@ -295,6 +300,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                     self.b.store(Flags::NONE, meta, dst.0, dst.1 + 8, MemAttrs::aligned(3));
                     Ok(())
                 }
+                PlaceAt::Indirect(..) => Err(malformed("unresolved indirect capture place in store_env_place")),
             },
             CaptureKind::ByValue => {
                 let PlaceAt::Sized(base, off) = src else {
@@ -377,10 +383,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                     None => Repr::Ptr,
                 };
                 if stored_repr == Repr::Ptr {
-                    let V::Scalar(p) = self.load(Repr::Ptr, at) else {
-                        return Err(malformed("a capture's pointer not a scalar"));
-                    };
-                    PlaceAt::Sized(p, 0)
+                    PlaceAt::Indirect(at.0, at.1)
                 } else {
                     PlaceAt::Unsized(at.0, at.1)
                 }
@@ -627,6 +630,18 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// it out (`env_moved`). Refused: a move out of a field the body does not own (E0507, the
     /// checker's), and a use of a binding above its captured places (the analysis widens those,
     /// capture_places.rs `widen`).
+    /// Materializes a [`PlaceAt::Indirect`] capture pointer on demand so the pointer value never
+    /// crosses a coroutine suspension point.
+    fn resolve_place(&mut self, at: PlaceAt) -> PlaceAt {
+        match at {
+            PlaceAt::Indirect(env, off) => {
+                let p = self.b.load(Ty::PTR, Flags::NONE, env, off, MemAttrs::aligned(3));
+                PlaceAt::Sized(p, 0)
+            }
+            other => other,
+        }
+    }
+
     pub(in crate::walk) fn env_use(&mut self, e: ExprId, adjusted: u32, value: bool) -> Result<bool, BuildError> {
         if self.env_places.env.is_empty() {
             return Ok(false);
@@ -637,7 +652,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         match cover(self.checked, &self.env_places.env, &path) {
             Cover::Exact(j) => {
                 let Some(at) = self.env_places.at.get(j).copied().flatten() else { return Ok(false) };
-                match at {
+                match self.resolve_place(at) {
                     PlaceAt::Sized(base, off) => {
                         if !value {
                             self.push_val(V::Place(base, off), None);
@@ -658,11 +673,12 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                         }
                         Err(unsupported(e, "not lowered: a by-value use of an unsized captured place"))
                     }
+                    PlaceAt::Indirect(..) => return Err(malformed("unresolved indirect capture place in env_use")),
                 }
             }
             Cover::RefOf(j) => {
                 let Some(at) = self.env_places.at.get(j).copied().flatten() else { return Ok(false) };
-                match at {
+                match self.resolve_place(at) {
                     PlaceAt::Sized(base, off) => {
                         let p = self.address((base, off));
                         if value {
@@ -686,6 +702,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                             self.push_val(V::Place(to, 0), None);
                         }
                     }
+                    PlaceAt::Indirect(..) => return Err(malformed("unresolved indirect capture place in env_use")),
                 }
                 Ok(true)
             }

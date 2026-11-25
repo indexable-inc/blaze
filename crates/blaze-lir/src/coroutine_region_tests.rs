@@ -400,3 +400,54 @@ fn a_loop_slot_overwritten_after_resume_is_not_reached_unless_partial() {
     let err = split_in(func_bad.view(), shape_bad, Panics::NONE, LAID, &named(kept_bad), a).err();
     assert_eq!(err, Some(CoroutineError::UnnamedAcrossSuspend { slot: scratch_bad.0 }));
 }
+
+/// Pure, non-trapping SSA DAGs rooted at constants, `state_param`, and kept `slot_addr`s
+/// (`iconst_wide`, `ptr_add(state, off)`, `ptr_add(slot_addr(kept), off)`, arithmetic over
+/// constants) are rematerialized across a suspend in `split_in` with zero extra state bytes,
+/// agreeing with direct execution on every resume and cancel schedule.
+#[test]
+fn pure_rematerializable_dags_cross_suspend_without_state_fields() {
+    let heap = blaze_own::testing::heap();
+    let a = heap.alloc();
+    let mut b = Builder::<_, Full>::new_in(64, a);
+    own_sig(&mut b);
+    let [entry, resume, cancel, unresumed] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+    let kept = b.slot(8, 3, SlotKind::Named);
+    b.begin(entry);
+    let (state, _cx) = (b.param(Ty::PTR), b.param(Ty::I64));
+    let off8 = b.iconst(Ty::I64, 8);
+    let upvar_ptr = b.ptr_add(Flags::NONE, state, off8);
+    let kept_base = b.slot_addr(kept);
+    let zero = b.iconst(Ty::I64, 0);
+    let kept_ptr = b.ptr_add(Flags::NONE, kept_base, zero);
+    let wide = b.iconst(Ty::I64, 0x1_0000_0003u128);
+    let derived = b.binary(Op::Add, Flags::NONE, wide, off8);
+    let upvar0 = b.load(Ty::I64, Flags::NONE, state, 0, MemAttrs::default());
+    b.store(Flags::NONE, upvar0, kept_ptr, 0, MemAttrs::default());
+    let pending = b.iconst(Ty::I64, u128::from(PENDING));
+    b.suspend(0, resume, cancel, &[pending, pending]);
+
+    b.begin(resume);
+    let upvar1 = b.load(Ty::I64, Flags::NONE, upvar_ptr, 0, MemAttrs::default());
+    let saved = b.load(Ty::I64, Flags::NONE, kept_ptr, 0, MemAttrs::default());
+    let s1 = b.binary(Op::Add, Flags::NONE, saved, upvar1);
+    let out = b.binary(Op::Add, Flags::NONE, s1, derived);
+    let ready = b.iconst(Ty::I64, u128::from(READY));
+    b.ret(&[ready, out]);
+
+    b.begin(cancel);
+    // Cancel path also uses the rematerialized `ptr_add(slot_addr(kept), 0)`!
+    let _ = b.load(Ty::I64, Flags::NONE, kept_ptr, 0, MemAttrs::default());
+    b.cancelled();
+
+    b.begin(unresumed);
+    b.cancelled();
+
+    let func = b.finish_checked().expect("the body is LIR");
+    let split = split_in(func.view(), SHAPE, Panics::NONE, LAID, &named(kept), a)
+        .expect("pure DAGs over constants, state_param, and kept slot_addr must rematerialize");
+    assert_eq!(&split.layout.fields[..], &[StateField { what: Saved::Slot(kept), offset: 16, size: 8, align: 3 }]);
+    if let Err(broke) = agree(func.view(), SHAPE, &split, [5, 9]) {
+        panic!("{broke}");
+    }
+}

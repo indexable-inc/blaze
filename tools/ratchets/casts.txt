@@ -79,7 +79,7 @@ blaze-launch-rt	455
 blaze-launcher	6
 blaze-lint	185
 blaze-lint-defs	21
-blaze-lir	1376
+blaze-lir	1374
 blaze-lower	303
 blaze-malloc	48
 blaze-manifest	6

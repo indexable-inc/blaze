@@ -307,6 +307,21 @@ enum Shape {
 enum Home {
     Slot(SlotId),
     At(Value, i32),
+    /// A capture-by-reference home in a coroutine/closure environment: `(env, off)` holds the
+    /// immutable pointer to the captured variable, reloaded on demand so it never crosses a
+    /// coroutine suspension point.
+    Indirect(Value, i32),
+}
+
+/// Saved path-sensitive `definitely_uninit` slices in `Walk::du_pool` for an open `if` or `match`.
+#[derive(Clone, Copy)]
+struct BranchDu {
+    /// Start index in `Walk::du_pool` of the branch-entry snapshot (`body.pats.len()` bools).
+    entry: usize,
+    /// Start index in `Walk::du_pool` of the running join intersection (`body.pats.len()` bools).
+    join: usize,
+    /// Whether at least one live branch has folded into `join`.
+    any_live: bool,
 }
 
 /// What `break` and `continue` reach: a loop, or a block a `break` leaves.
@@ -564,9 +579,6 @@ struct Walk<'x, 'c, 't, A: Allocator + Copy> {
     /// Per expression: its parent (`NO_EXPR` for none) and whether the edge to it is
     /// conditional, from `scan_flags` (walk/temps.rs finds a temporary's scope by it).
     expr_parent: Vec<(u32, bool), A>,
-    /// Per pattern: the expression that declares it (`NO_EXPR` for parameters / outer captures),
-    /// from `scan_flags`.
-    pat_decl: blaze_own::Vec<u32, A>,
     /// Per statement being built: where its temporaries start in `scope_pats`.
     temp_marks: Vec<u32, A>,
     /// A `let`-`else` statement's own entries of `scope_pats` (its temporaries, its bindings),
@@ -595,10 +607,20 @@ struct Walk<'x, 'c, 't, A: Allocator + Copy> {
     owned: Vec<LocalOwn, A>,
     /// Per pattern: whether a binding without a flag is initialized here.
     init: Vec<bool, A>,
-    /// Per pattern: whether a flagged binding has been unconditionally moved out in its
-    /// declaring expression (and not re-initialized since), so subsequent drops and `.await`s
-    /// know it is definitely uninitialized without reading its drop flag.
+    /// Per pattern: whether a flagged binding is definitely uninitialized on every path reaching
+    /// the current block (path-sensitively saved/restored/intersected across branches, matches,
+    /// short-circuits, `let`-`else`, and break targets, and cleared at loop headers), so
+    /// subsequent drops and `.await`s skip redundant flag checks and end dead slots.
     definitely_uninit: blaze_own::Vec<bool, A>,
+    /// Flat LIFO backing pool for path-sensitive `definitely_uninit` snapshots.
+    du_pool: blaze_own::Vec<bool, A>,
+    if_du: blaze_own::Vec<BranchDu, A>,
+    match_du: blaze_own::Vec<BranchDu, A>,
+    short_du: blaze_own::Vec<usize, A>,
+    let_else_du: blaze_own::Vec<(usize, usize), A>,
+    /// Parallel to `targets`: running intersection of `definitely_uninit` across `break` edges
+    /// reaching `targets[i].exit` (`None` until a live `break` jumps to that target).
+    target_du: blaze_own::Vec<Option<blaze_own::Vec<bool, A>>, A>,
     /// Per pattern: remaining unwalked `Expr::Local(p)` occurrences in `body.exprs` (from
     /// `scan_flags`, decremented as `place_of` / `raw` visits them), so `end_moved_locals_before_await`
     /// only ends a non-dropping binding proven both unsaved by `blaze-flow` and never read later.
@@ -918,7 +940,6 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         needs_flag,
         partial,
         expr_parent: Vec::new_in(alloc),
-        pat_decl: blaze_own::Vec::new_in(alloc),
         temp_marks: Vec::new_in(alloc),
         let_else_held: Vec::new_in(alloc),
         temp_here: {
@@ -938,6 +959,12 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             du.resize(body.pats.len(), false);
             du
         },
+        du_pool: blaze_own::Vec::new_in(alloc),
+        if_du: blaze_own::Vec::new_in(alloc),
+        match_du: blaze_own::Vec::new_in(alloc),
+        short_du: blaze_own::Vec::new_in(alloc),
+        let_else_du: blaze_own::Vec::new_in(alloc),
+        target_du: blaze_own::Vec::new_in(alloc),
         uses_left: {
             let mut ul = blaze_own::Vec::with_capacity_in(body.pats.len(), alloc);
             ul.resize(body.pats.len(), 0);
@@ -1828,7 +1855,9 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     fn join_slot(&mut self, repr: Repr) -> Option<SlotId> {
         let Repr::Agg(_) = repr else { return None };
         let (size, align) = self.size_align(repr);
-        Some(self.b.slot(size, align, SlotKind::Temp))
+        let slot = self.b.slot(size, align, SlotKind::Temp);
+        self.name_temp(slot);
+        Some(slot)
     }
 
     /// Jumps to join block `join` with branch value `v` (of `repr`), copying into shared slot
@@ -2021,6 +2050,10 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         match home {
             Home::Slot(slot) => (self.b.slot_addr(slot), 0),
             Home::At(p, off) => (p, off),
+            Home::Indirect(env, off) => {
+                let ptr = self.b.load(Ty::PTR, Flags::NONE, env, off, MemAttrs::aligned(3));
+                (ptr, 0)
+            }
         }
     }
 
@@ -2078,6 +2111,25 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         }
         let repr = self.local_repr(p)?;
         self.slots[p.ix()] = Some((Home::At(at.0, at.1), repr));
+        self.captured.push(p);
+        Ok(())
+    }
+
+    /// Captured variable `p` held by reference at environment field `at`: the pointer stored in
+    /// `at` is reloaded on demand ([`Home::Indirect`]) so the pointer value never crosses a
+    /// coroutine suspension point.
+    fn bind_capture_indirect(&mut self, p: PatId, at: (Value, i32)) -> Result<(), BuildError> {
+        if !matches!(self.pat(p)?, Pat::Bind { .. }) {
+            return Err(malformed("a capture of other than a binding"));
+        }
+        if self.slots.get(p.ix()).copied().flatten().is_some() {
+            return Err(malformed("a binding bound twice"));
+        }
+        let repr = self.local_repr(p)?;
+        let Some(slot) = self.slots.get_mut(p.ix()) else {
+            return Err(malformed("a capture past `slots`"));
+        };
+        *slot = Some((Home::Indirect(at.0, at.1), repr));
         self.captured.push(p);
         Ok(())
     }
@@ -2367,6 +2419,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         let slot = match home {
             Home::Slot(s) => Some(s),
             Home::At(v, off) => self.whole_slot((v, off)),
+            Home::Indirect(..) => None,
         };
         if let Some(s) = slot
             && self.scope_slots.scan_for(&(depth, s)).is_none()
@@ -2611,6 +2664,9 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 self.set_flag(p, false);
                 self.jump(join, &[]);
                 self.begin(join);
+                if kill && let Some(du) = self.definitely_uninit.get_mut(p.ix()) {
+                    *du = true;
+                }
             }
         }
         Ok(())
@@ -2651,7 +2707,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                                 Held::Pat(pat) => match self.slots.get(pat.ix()).copied().flatten() {
                                     Some((Home::Slot(x), _)) => x == s,
                                     Some((Home::At(val, off), _)) => self.whole_slot((val, off)) == Some(s),
-                                    None => false,
+                                    Some((Home::Indirect(..), _)) | None => false,
                                 },
                                 _ => false,
                             })
@@ -2686,28 +2742,81 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         }
     }
 
-    /// Whether `e` executes unconditionally inside binding `p`'s declaring expression (no
-    /// branch or loop edge between `e` and `self.pat_decl[p]`).
-    fn unconditional_in_decl(&self, p: PatId, e: ExprId) -> bool {
-        let Some(&home) = self.pat_decl.get(p.ix()) else { return false };
-        let mut c = e.0;
-        let limit = self.expr_parent.len();
-        for _ in 0..=limit {
-            if c == home {
-                return true;
-            }
-            let Some(&(up, cond)) = usize::try_from(c).ok().and_then(|ix| self.expr_parent.get(ix)) else {
-                return false;
-            };
-            if cond {
-                return false;
-            }
-            if up == NO_EXPR {
-                return home == NO_EXPR;
-            }
-            c = up;
+    /// Pushes a copy of `self.definitely_uninit` onto `self.du_pool` and returns its start index.
+    fn du_push(&mut self) -> usize {
+        let start = self.du_pool.len();
+        self.du_pool.extend_from_slice(&self.definitely_uninit);
+        start
+    }
+
+    /// Pushes an all-`true` identity slice (the top of the `&&` meet lattice) onto `self.du_pool`.
+    fn du_push_true(&mut self) -> usize {
+        let start = self.du_pool.len();
+        let n = self.definitely_uninit.len();
+        self.du_pool.resize(start + n, true);
+        start
+    }
+
+    /// Restores `self.definitely_uninit` from the slice at `start` in `self.du_pool`.
+    fn du_restore(&mut self, start: usize) {
+        let n = self.definitely_uninit.len();
+        if let Some(src) = self.du_pool.get(start..start + n) {
+            self.definitely_uninit.copy_from_slice(src);
         }
-        false
+    }
+
+    /// Intersects `self.definitely_uninit` into the slice at `dst_start` in `self.du_pool`.
+    fn du_intersect_into(&mut self, dst_start: usize) {
+        let n = self.definitely_uninit.len();
+        if let Some(dst) = self.du_pool.get_mut(dst_start..dst_start + n) {
+            for (d, &s) in dst.iter_mut().zip(self.definitely_uninit.iter()) {
+                *d &= s;
+            }
+        }
+    }
+
+    /// Opens a `BranchDu` frame on `self.if_du` for an `if` or `if let`.
+    fn du_if_enter(&mut self) {
+        let entry = self.du_push();
+        let join = self.du_push_true();
+        self.if_du.push(BranchDu { entry, join, any_live: false });
+    }
+
+    /// Opens a `BranchDu` frame on `self.match_du` for a `match`.
+    pub(super) fn du_match_enter(&mut self) {
+        let entry = self.du_push();
+        let join = self.du_push_true();
+        self.match_du.push(BranchDu { entry, join, any_live: false });
+    }
+
+    /// Before a condition link or match guard may branch to `else` / next arm: conservatively
+    /// intersect the current `definitely_uninit` into the innermost open `if` / `match` entry
+    /// snapshot so any local initialized inside the condition/guard is not falsely treated as
+    /// uninitialized on the failure branch.
+    fn du_intersect_open_entries(&mut self) {
+        if let Some(&top) = self.if_du.last() {
+            self.du_intersect_into(top.entry);
+        }
+        if let Some(&top) = self.match_du.last() {
+            self.du_intersect_into(top.entry);
+        }
+    }
+
+    /// Folds the current `definitely_uninit` into the `break` join state of `self.targets[ti]`.
+    fn du_record_break(&mut self, ti: usize) {
+        let Some(slot) = self.target_du.get_mut(ti) else { return };
+        match slot {
+            Some(acc) => {
+                for (a, &cur) in acc.iter_mut().zip(self.definitely_uninit.iter()) {
+                    *a &= cur;
+                }
+            }
+            None => {
+                let mut copy = blaze_own::Vec::with_capacity_in(self.definitely_uninit.len(), self.alloc);
+                copy.extend_from_slice(&self.definitely_uninit);
+                *slot = Some(copy);
+            }
+        }
     }
 
     /// Binding `p` is used by value: a move, when its type needs drop.
@@ -2715,7 +2824,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         let Some(o) = self.owned.get(p.ix()).copied().and_then(LocalOwn::as_drop) else { return Ok(()) };
         if o.flag.is_some() {
             self.set_flag(p, false);
-            if self.live && o.rest.is_none() && self.unconditional_in_decl(p, e)
+            if self.live && o.rest.is_none()
                 && let Some(du) = self.definitely_uninit.get_mut(p.ix())
             {
                 *du = true;
@@ -2998,7 +3107,6 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         // A field taken out of a struct update's base likewise (walk/moves/struct_update.rs).
         self.scan_update_moves()?;
         self.expr_parent = parent;
-        self.pat_decl = decl;
         self.scan_temp_scopes()
     }
 
@@ -3879,8 +3987,20 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             Task::BlockExit(e) => {
                 let v = self.pop()?;
                 let t = self.targets.pop().filter(|t| t.expr == e).ok_or(malformed("a block's break target out of order"))?;
+                let exit_du = self.target_du.pop().flatten();
+                let fall_live = self.live;
                 self.join_jump(v, t.repr, t.res, t.exit)?;
                 self.begin(t.exit);
+                match (fall_live, exit_du) {
+                    (true, Some(acc)) => {
+                        for (d, &a) in self.definitely_uninit.iter_mut().zip(acc.iter()) {
+                            *d &= a;
+                        }
+                    }
+                    (true, None) => {}
+                    (false, Some(acc)) => self.definitely_uninit.copy_from_slice(&acc),
+                    (false, None) => self.definitely_uninit.fill(false),
+                }
                 let v = self.join_value(t.repr, t.res);
                 self.push_val(v, None);
             }
@@ -3892,6 +4012,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 let then_block = self.create();
                 let else_block = self.create();
                 let join = self.create();
+                self.du_if_enter();
                 self.br(c, (then_block, &[]), (else_block, &[]));
                 self.begin(then_block);
                 self.work.push(Task::IfThen { expr, else_, else_block, join, res });
@@ -3900,8 +4021,18 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             Task::IfThen { expr, else_, else_block, join, res } => {
                 let v = self.pop()?;
                 let repr = self.expr_repr(expr)?;
+                if self.live
+                    && let Some(top) = self.if_du.last_mut()
+                {
+                    let dst = top.join;
+                    top.any_live = true;
+                    self.du_intersect_into(dst);
+                }
                 self.join_jump(v, repr, res, join)?;
                 self.begin(else_block);
+                if let Some(&top) = self.if_du.last() {
+                    self.du_restore(top.entry);
+                }
                 match else_ {
                     Some(x) => {
                         self.work.push(Task::IfElse { expr, join, res });
@@ -3910,6 +4041,18 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     None => {
                         if repr != Repr::None {
                             return Err(malformed("an `if` without `else` whose type has a value"));
+                        }
+                        if let Some(mut top) = self.if_du.pop() {
+                            if self.live {
+                                self.du_intersect_into(top.join);
+                                top.any_live = true;
+                            }
+                            if top.any_live {
+                                self.du_restore(top.join);
+                            } else {
+                                self.definitely_uninit.fill(false);
+                            }
+                            self.du_pool.truncate(top.entry);
                         }
                         self.jump(join, &[]);
                         self.begin(join);
@@ -3920,17 +4063,51 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             Task::IfElse { expr, join, res } => {
                 let v = self.pop()?;
                 let repr = self.expr_repr(expr)?;
-                self.join_jump(v, repr, res, join)?;
-                self.begin(join);
+                if let Some(mut top) = self.if_du.pop() {
+                    if self.live {
+                        self.du_intersect_into(top.join);
+                        top.any_live = true;
+                    }
+                    self.join_jump(v, repr, res, join)?;
+                    self.begin(join);
+                    if top.any_live {
+                        self.du_restore(top.join);
+                    } else {
+                        self.definitely_uninit.fill(false);
+                    }
+                    self.du_pool.truncate(top.entry);
+                } else {
+                    self.join_jump(v, repr, res, join)?;
+                    self.begin(join);
+                }
                 let v = self.join_value(repr, res);
                 self.push_val(v, None);
             }
-            Task::LetLink { expr, fail } => self.let_link(expr, fail)?,
-            Task::CondLink(fail) => self.cond_link(fail)?,
-            Task::LetElse(s) => self.let_else_test(s)?,
-            Task::LetElseEnd(cont, from, els) => self.let_else_end(cont, from, els)?,
+            Task::LetLink { expr, fail } => {
+                self.du_intersect_open_entries();
+                self.let_link(expr, fail)?;
+            }
+            Task::CondLink(fail) => {
+                self.du_intersect_open_entries();
+                self.cond_link(fail)?;
+            }
+            Task::LetElse(s) => {
+                let pre = self.du_push();
+                self.let_else_test(s)?;
+                let post_pass = self.du_push();
+                self.du_restore(pre);
+                self.let_else_du.push((pre, post_pass));
+            }
+            Task::LetElseEnd(cont, from, els) => {
+                self.let_else_end(cont, from, els)?;
+                if let Some((pre, post_pass)) = self.let_else_du.pop() {
+                    self.du_restore(post_pass);
+                    self.du_pool.truncate(pre);
+                }
+            }
             Task::LoopEnd(e) => {
                 let t = self.targets.pop().filter(|t| t.expr == e).ok_or(malformed("a loop's target out of order"))?;
+                let exit_du = self.target_du.pop().flatten();
                 let header = t.header.ok_or(malformed("a loop without its head"))?;
                 if self.live {
                     self.jump(header, &[]);
@@ -3938,36 +4115,48 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     self.b.unreachable();
                 }
                 self.begin(t.exit);
+                if let Some(acc) = exit_du {
+                    self.definitely_uninit.copy_from_slice(&acc);
+                } else {
+                    self.definitely_uninit.fill(false);
+                }
                 let v = self.join_value(t.repr, t.res);
                 self.push_val(v, None);
             }
             Task::Break(target, has_value) => {
                 let v = if has_value { self.pop()? } else { V::None };
-                let t = *self
+                let ti = self
                     .targets
                     .iter()
-                    .rev()
-                    .find(|t| t.expr == target)
+                    .rposition(|t| t.expr == target)
                     .ok_or(malformed("a `break` whose target is not around it"))?;
+                let Some(&t) = self.targets.get(ti) else {
+                    return Err(malformed("a `break` whose target is not around it"));
+                };
                 if !self.live {
                     self.b.unreachable();
                     self.dead_block();
                     self.push_val(V::None, None);
                     return Ok(());
                 }
+                self.du_record_break(ti);
                 let start = self.scope_start(t.depth);
+                let depth = usize::try_from(t.depth).map_err(|_| malformed("a target depth past `usize`"))?;
                 match t.res {
                     Some(slot) => {
                         let to = (self.b.slot_addr(slot), 0);
                         self.store(v, t.repr, to)?;
                         self.end_temp_val(v);
                         self.drop_from(start)?;
+                        self.end_scope_slots_peek_except(start, depth, Some(slot));
                         self.jump(t.exit, &[]);
                     }
                     None => {
                         let v = self.settle(v, t.repr, start)?;
                         let arg = self.arg(v, t.repr)?;
+                        let kept = arg.and_then(|p| self.value_slot(p));
                         self.drop_from(start)?;
+                        self.end_scope_slots_peek_except(start, depth, kept);
                         self.jump(t.exit, arg.as_slice());
                     }
                 }
@@ -3985,17 +4174,28 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             Task::Guard { m, i } => {
                 let g = self.pop()?;
                 let c = self.cond(g)?;
+                self.du_intersect_open_entries();
                 let st = self.matches[m as usize];
                 let next = self.arm_blocks[(st.first + i + 1) as usize];
                 let body = self.create();
                 self.br(c, (body, &[]), (next, &[]));
                 self.begin(body);
             }
-            Task::GuardAlts { word, chains, n } => self.guard_alts(word, chains, n)?,
+            Task::GuardAlts { word, chains, n } => {
+                self.du_intersect_open_entries();
+                self.guard_alts(word, chains, n)?;
+            }
             Task::ArmMoves { from } => self.arm_moves(from)?,
             Task::ArmEnd { m } => {
                 let v = self.pop()?;
                 let st = self.matches[m as usize];
+                if self.live
+                    && let Some(top) = self.match_du.last_mut()
+                {
+                    let dst = top.join;
+                    top.any_live = true;
+                    self.du_intersect_into(dst);
+                }
                 self.join_jump(v, st.repr, st.res, st.join)?;
             }
             Task::MatchEnd => {
@@ -4011,6 +4211,14 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 }
                 self.arm_blocks.truncate(st.first as usize);
                 self.begin(st.join);
+                if let Some(top) = self.match_du.pop() {
+                    if top.any_live {
+                        self.du_restore(top.join);
+                    } else {
+                        self.definitely_uninit.fill(false);
+                    }
+                    self.du_pool.truncate(top.entry);
+                }
                 let v = self.join_value(st.repr, st.res);
                 self.push_val(v, None);
             }
@@ -4077,6 +4285,8 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 let c = self.cond(l)?;
                 let rhs_block = self.create();
                 let join = self.create();
+                let entry = self.du_push();
+                self.short_du.push(entry);
                 match op {
                     BinOp::And => {
                         let no = self.b.iconst(Ty::I8, 0);
@@ -4095,6 +4305,14 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             Task::ShortEnd(join) => {
                 let r = self.pop()?;
                 let r = self.scalar(r, Ty::I8)?;
+                let rhs_live = self.live;
+                if let Some(entry) = self.short_du.pop() {
+                    if rhs_live {
+                        self.du_intersect_into(entry);
+                    }
+                    self.du_restore(entry);
+                    self.du_pool.truncate(entry);
+                }
                 self.jump(join, &[r]);
                 self.begin(join);
                 let p = self.b.param(Ty::I8);
@@ -5274,8 +5492,14 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         let n = list.len();
         let base = self.vals.len().checked_sub(n).ok_or(malformed("an intrinsic's arguments missing from the value stack (a build bug)"))?;
         let mut cargs = Vec::with_capacity_in(n, self.alloc);
+        let mut arg_temps: blaze_own::Vec<SlotId, A> = blaze_own::Vec::new_in(self.alloc);
         for (i, &a) in list.iter().enumerate() {
             let v = self.vals[base + i];
+            if let V::Place(p, off) = v
+                && let Some(slot) = self.whole_slot((p, off))
+            {
+                arg_temps.push(slot);
+            }
             let at = self.adjusted_ty(a)?;
             let g = self.ground_ty(at).map_err(|error| Self::ty_err(a, error))?;
             let repr = self.repr_at(a, at)?;
@@ -5394,6 +5618,15 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 scalar => self.load(scalar, (addr, 0)),
             },
         };
+        let kept_out = match v {
+            V::Place(p, _) | V::Unsized(p, _) | V::Scalar(p) => self.value_slot(p),
+            V::None => None,
+        };
+        for slot in arg_temps {
+            if Some(slot) != kept_out {
+                self.end_temp_slot(slot);
+            }
+        }
         self.push_val(v, None);
         Ok(())
     }
@@ -5874,6 +6107,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     let res = self.join_slot(repr);
                     let exit = self.create();
                     self.targets.push(Target { expr: e, header: None, exit, repr, res, depth });
+                    self.target_du.push(None);
                     self.work.push(Task::BlockExit(e));
                 }
                 // The block's drop scope: its bindings are dropped after its value is made.
@@ -5888,7 +6122,10 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 }
             }
             // A condition holding a `let` (`if let`, `while let`, a let chain): walk/lets.rs.
-            Expr::If { cond, then, else_ } if self.cond_has_let(cond)? => self.if_let(e, cond, then, else_)?,
+            Expr::If { cond, then, else_ } if self.cond_has_let(cond)? => {
+                self.du_if_enter();
+                self.if_let(e, cond, then, else_)?;
+            }
             Expr::If { cond, then, else_ } => {
                 self.work.push(Task::If { expr: e, then, else_ });
                 self.work.push(Task::Eval(cond));
@@ -5965,8 +6202,11 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 let exit = self.create();
                 self.jump(header, &[]);
                 self.begin(header);
+                // A back-edge may re-initialize any outer flagged binding on a later iteration.
+                self.definitely_uninit.fill(false);
                 let depth = self.scope_marks.len() as u32;
                 self.targets.push(Target { expr: e, header: Some(header), exit, repr, res, depth });
+                self.target_du.push(None);
                 self.work.push(Task::LoopEnd(e));
                 self.work.push(Task::Discard);
                 self.work.push(Task::Eval(body));
@@ -5986,7 +6226,9 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     .ok_or(malformed("a `continue` whose loop is not around it"))?;
                 let header = t.header.ok_or(malformed("a `continue` of a block"))?;
                 let start = self.scope_start(t.depth);
+                let depth = usize::try_from(t.depth).map_err(|_| malformed("a target depth past `usize`"))?;
                 self.drop_from(start)?;
+                self.end_scope_slots_peek(start, depth);
                 self.jump(header, &[]);
                 self.dead_block();
                 self.push_val(V::None, None);
@@ -7187,6 +7429,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         }
         let res = self.join_slot(repr);
         self.matches.push(MatchState { expr: e, scrutinee: x, width, of_enum, join, repr, res, first, arms: n, guarded, by_ref, owner, tested: None });
+        self.du_match_enter();
         let m = (self.matches.len() - 1) as u32;
         self.work.push(Task::MatchEnd);
         for i in (0..n).rev() {
@@ -7196,6 +7439,9 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     }
 
     fn arm(&mut self, m: u32, i: u32) -> Result<(), BuildError> {
+        if let Some(&top) = self.match_du.last() {
+            self.du_restore(top.entry);
+        }
         let st = self.matches[m as usize];
         let Expr::Match { arms, .. } = self.expr(st.expr)? else { return Err(malformed("a match's state on another expression")) };
         let arm = *self.body.arms.get(arms.range()).and_then(|l| l.get(i as usize)).ok_or(malformed("an arm past `arms`"))?;

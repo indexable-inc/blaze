@@ -178,7 +178,7 @@ pub(super) struct Co {
     items: crate::AsyncItems,
     /// The one slot every `.await` of the body makes its `Pin` in: written before each poll,
     /// read by nothing after the call returns.
-    pin: Option<SlotId>,
+    pub(super) pin: Option<SlotId>,
 }
 
 /// A ground coroutine type read: its identity, and its upvars' tuple grounded at the owner's
@@ -533,10 +533,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 let (p, by) = (f.base, f.how);
                 match by {
                     CaptureKind::ByRef | CaptureKind::ByMutRef => {
-                        let V::Scalar(ptr) = self.load(Repr::Ptr, at) else {
-                            return Err(malformed("a capture's pointer not a scalar"));
-                        };
-                        self.bind_capture_at(p, (ptr, 0))?;
+                        self.bind_capture_indirect(p, at)?;
                     }
                     CaptureKind::ByValue => {
                         // The variable alone (not its subpattern's bindings: each is its own
@@ -770,7 +767,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         // written into the slot of the flow local it is, before the loop, and read back on the
         // Ready edge: the walk invents no slot across a suspend (walk/await_spill.rs).
         let spilled = self.spill_waiting(e)?;
-        self.end_moved_locals_before_await();
+        self.end_dead_slots_before_await(fut_slot);
         let planted = self.plant_before();
 
         // Steps 3 and 4, the loop's head: where a poll after a suspend goes on.

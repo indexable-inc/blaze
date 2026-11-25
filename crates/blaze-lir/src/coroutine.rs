@@ -713,6 +713,118 @@ fn align_up(at: u64, align: u8) -> u64 {
     (at + mask) & !mask
 }
 
+/// Maximum DAG depth and expanded node count for rematerializing a pure/address SSA value across a
+/// suspend.
+const MAX_REMAT_DEPTH: u8 = 16;
+const MAX_REMAT_NODES: usize = 64;
+
+/// Whether SSA value `value` can be rematerialized at its uses across a suspend with zero state
+/// bytes: any constant, symbol address, kept slot's address, `state_param`, or pure non-trapping
+/// DAG over them (bounded to `depth` levels and [`MAX_REMAT_NODES`] expanded nodes).
+fn can_remat(view: &View<'_>, state_param: u32, kept: &[bool], value: usize, depth: u8) -> bool {
+    let Ok(state_ix) = usize::try_from(state_param) else { return false };
+    let mut stack = [(0usize, 0u8); MAX_REMAT_NODES];
+    let Some(first) = stack.get_mut(0) else { return false };
+    *first = (value, depth);
+    let mut len = 1usize;
+    let mut visited = 0usize;
+    while len > 0 {
+        len -= 1;
+        let Some(&(cur, rem)) = stack.get(len) else { return false };
+        if cur == state_ix {
+            continue;
+        }
+        visited += 1;
+        if rem == 0 || visited > MAX_REMAT_NODES {
+            return false;
+        }
+        match view.op(cur) {
+            Op::SlotAddr => {
+                let is_kept = view
+                    .data
+                    .get(cur)
+                    .copied()
+                    .and_then(|d| usize::try_from(d).ok())
+                    .and_then(|s| kept.get(s).copied())
+                    .unwrap_or(false);
+                if !is_kept {
+                    return false;
+                }
+            }
+            Op::Iconst
+            | Op::IconstWide
+            | Op::Fconst
+            | Op::FconstWide
+            | Op::Vconst
+            | Op::Null
+            | Op::Uninit
+            | Op::FuncAddr
+            | Op::DataAddr => {}
+            Op::PtrAdd
+            | Op::PtrAddr
+            | Op::Expose
+            | Op::FromExposed
+            | Op::PtrWithAddr
+            | Op::Zext
+            | Op::Sext
+            | Op::Trunc
+            | Op::Bitcast
+            | Op::Fpext
+            | Op::Fptrunc
+            | Op::UitoFp
+            | Op::SitoFp
+            | Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Neg
+            | Op::And
+            | Op::Or
+            | Op::Xor
+            | Op::Not
+            | Op::Shl
+            | Op::Lshr
+            | Op::Ashr
+            | Op::Rotl
+            | Op::Rotr
+            | Op::Umin
+            | Op::Umax
+            | Op::Smin
+            | Op::Smax
+            | Op::UaddSat
+            | Op::SaddSat
+            | Op::UsubSat
+            | Op::SsubSat
+            | Op::Clz
+            | Op::Ctz
+            | Op::Popcnt
+            | Op::Bswap
+            | Op::Bitrev
+            | Op::Icmp
+            | Op::Fcmp
+            | Op::Select => {
+                let mut ok = true;
+                each_value(view, cur, |op_v| {
+                    let Ok(op_ix) = usize::try_from(op_v) else {
+                        ok = false;
+                        return;
+                    };
+                    if let Some(dst) = stack.get_mut(len) {
+                        *dst = (op_ix, rem - 1);
+                        len += 1;
+                    } else {
+                        ok = false;
+                    }
+                });
+                if !ok {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
 fn plan<S: Allocator + Copy, A: Allocator>(
     body: &Body<'_, S>,
     kept: &[bool],
@@ -771,12 +883,7 @@ fn plan<S: Allocator + Copy, A: Allocator>(
         }
     }
     for (value, _) in crossing.iter().enumerate().filter(|it| *it.1) {
-        let remade = match view.op(value) {
-            Op::SlotAddr => kept[view.data[value] as usize],
-            Op::Iconst | Op::Null | Op::FuncAddr | Op::DataAddr => true,
-            _ => false,
-        };
-        if remade {
+        if can_remat(view, body.shape.state_param, kept, value, MAX_REMAT_DEPTH) {
             home[value] = REMADE;
             continue;
         }
@@ -928,6 +1035,77 @@ impl<S: Allocator + Copy, A: Allocator> Emit<'_, '_, S, A> {
         self.push(Op::Store, Ty::NONE, &[tag, state, offset], loc);
     }
 
+    /// Rematerializes a `can_remat` SSA value (and any of its non-local operands) into the
+    /// current block, caching each remade value once per block in `self.fetched`.
+    fn fetch_remade(&mut self, root: u32, loc: u32) {
+        let mut stack = [(0u32, false); 2 * MAX_REMAT_NODES];
+        let mut len = 0usize;
+        if let Some(first) = stack.get_mut(0) {
+            *first = (root, false);
+            len = 1;
+        }
+        let view = self.body.view;
+        while len > 0 {
+            len -= 1;
+            let Some(&(value, ready)) = stack.get(len) else { break };
+            if value == self.body.shape.state_param {
+                continue;
+            }
+            let Ok(at) = usize::try_from(value) else { continue };
+            if self.body.block_of.get(at).copied() == Some(self.current)
+                || self.fetched_in.get(at).copied() == Some(self.current)
+            {
+                continue;
+            }
+            if matches!(view.op(at), Op::SlotAddr) {
+                let off = view
+                    .data
+                    .get(at)
+                    .copied()
+                    .and_then(|d| usize::try_from(d).ok())
+                    .and_then(|s| self.plan.slot_offset.get(s).copied());
+                let Some(off) = off else { continue };
+                let new = self.state_ptr(off, loc);
+                if let Some(dst) = self.fetched.get_mut(at) {
+                    *dst = new;
+                }
+                if let Some(dst) = self.fetched_in.get_mut(at) {
+                    *dst = self.current;
+                }
+                continue;
+            }
+            if ready {
+                let new = self.copy(at);
+                if let Some(dst) = self.fetched.get_mut(at) {
+                    *dst = new;
+                }
+                if let Some(dst) = self.fetched_in.get_mut(at) {
+                    *dst = self.current;
+                }
+            } else {
+                if let Some(dst) = stack.get_mut(len) {
+                    *dst = (value, true);
+                    len += 1;
+                }
+                each_value(&view, at, |op_v| {
+                    if op_v == self.body.shape.state_param {
+                        return;
+                    }
+                    let Ok(op_at) = usize::try_from(op_v) else { return };
+                    if self.body.block_of.get(op_at).copied() == Some(self.current)
+                        || self.fetched_in.get(op_at).copied() == Some(self.current)
+                    {
+                        return;
+                    }
+                    if let Some(dst) = stack.get_mut(len) {
+                        *dst = (op_v, false);
+                        len += 1;
+                    }
+                });
+            }
+        }
+    }
+
     /// Makes the body's `value` usable in the current block: nothing for a value used as it
     /// is made, else a load from its field or the value made again, once per block.
     fn fetch(&mut self, value: u32, loc: u32) {
@@ -939,16 +1117,14 @@ impl<S: Allocator + Copy, A: Allocator> Emit<'_, '_, S, A> {
         if home == DIRECT || self.body.block_of[at] == self.current || self.fetched_in[at] == self.current {
             return;
         }
+        if home == REMADE {
+            self.fetch_remade(value, loc);
+            return;
+        }
         let view = self.body.view;
         let ty = Ty(view.tys[at]);
         let state = self.state;
-        let new = if home == REMADE {
-            match view.op(at) {
-                Op::SlotAddr => self.state_ptr(self.plan.slot_offset[view.data[at] as usize], loc),
-                // `iconst`, `null`, `func_addr`, `data_addr`: one word, or none.
-                op => self.push(op, ty, &[view.data[at]], loc),
-            }
-        } else if cfg!(test) && self.plant == Plant::NoReloadOnCancel && self.which == Which::Drop {
+        let new = if cfg!(test) && self.plant == Plant::NoReloadOnCancel && self.which == Which::Drop {
             // Planted (test builds only): a cancel path's value is not loaded.
             self.push(Op::Uninit, ty, &[], loc)
         } else if ty == Ty::I1 {
