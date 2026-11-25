@@ -498,7 +498,6 @@ impl<'i, A: Allocator + Copy> ObjectDb<'i, A> {
             return Ok(None);
         };
         let kind = self.read_packed(pack_idx, found, oid, source, out)?;
-        self.charge_object(u64::try_from(out.len()).unwrap_or(u64::MAX))?;
         Ok(Some(kind))
     }
 
@@ -536,6 +535,7 @@ impl<'i, A: Allocator + Copy> ObjectDb<'i, A> {
             match head.base {
                 Base::Whole(kind) => {
                     inflate_entry(&window, &head, self.limits.most_object, out).map_err(|why| (cur_at, why))?;
+                    self.charge_object(u64::try_from(out.len()).unwrap_or(u64::MAX))?;
                     break kind;
                 }
                 Base::Ofs { back } => {
@@ -555,6 +555,7 @@ impl<'i, A: Allocator + Copy> ObjectDb<'i, A> {
                         let slice = whole.get(body..).ok_or((cur_at, StoreWhy::LooseHeader))?;
                         out.clear();
                         out.try_extend_from_slice(slice).map_err(|e| (cur_at, StoreWhy::Entry(PackWhy::Alloc(e))))?;
+                        self.charge_object(u64::try_from(out.len()).unwrap_or(u64::MAX))?;
                         break kind;
                     }
                     let Some((base_pack, base_idx)) = self.find_in_packs(&base) else {
@@ -577,6 +578,7 @@ impl<'i, A: Allocator + Copy> ObjectDb<'i, A> {
             delta.clear();
             inflate_entry(&window, &head, self.limits.most_object, &mut delta).map_err(|why| (delta_at, why))?;
             apply_delta(out, &delta, self.limits.most_object, &mut next).map_err(|why| (delta_at, why))?;
+            self.charge_object(u64::try_from(next.len()).unwrap_or(u64::MAX))?;
             core::mem::swap(out, &mut next);
         }
         if Oid::of(kind, out) != *oid {

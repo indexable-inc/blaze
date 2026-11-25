@@ -640,14 +640,18 @@ impl CargoCache {
                             }
                             let Some(stem) = name.strip_suffix(".idx") else { continue };
                             let pack_name_str = bstd::mem::format_in!(cx.frame(), "{stem}.pack");
-                            let Some(pack_i) = entries.find(pack_name_str.as_str()) else { continue };
+                            let Some(pack_i) = entries.find(pack_name_str.as_str()) else {
+                                failed = true;
+                                break;
+                            };
                             if entries.kind(pack_i) != bstd::fs::EntryKind::File {
                                 failed = true;
                                 break;
                             }
                             let pack_len = entries.len_of(pack_i);
                             if pack_len < 32 {
-                                continue;
+                                failed = true;
+                                break;
                             }
                             let (Ok(idx_leaf), Ok(pack_leaf)) = (Path::new(name), Path::new(pack_name_str.as_str())) else {
                                 failed = true;
