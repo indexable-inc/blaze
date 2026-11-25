@@ -222,6 +222,49 @@ fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::Shared
         ),
         (Some(path), _) => Some(path),
     };
+    // Optional unwind marker path (`BLAZE_LAUNCH_UNWOUND_FILE`, set only by `blaze test` for
+    // harnessed tests): runs the entry with `End::Return` so an uncaught Rust panic unwinding
+    // out of the test entry writes the marker and exits 101 instead of aborting with SIGABRT,
+    // keeping genuine SIGABRTs (C `abort()`, double-panic, allocator abort) distinct.
+    enum UnwoundSink {
+        File(PathBuf),
+        Fd(OwnedFd),
+    }
+    let unwound_sink = match (std::env::var_os("BLAZE_LAUNCH_UNWOUND_FILE"), start.form) {
+        (None, _) => None,
+        (Some(_), EntryForm::Comptime | EntryForm::Hosted) => stop(
+            CANNOT_RUN,
+            "BLAZE_LAUNCH_UNWOUND_FILE is set for a non-test entry",
+        ),
+        (Some(raw), EntryForm::Unit | EntryForm::CMain) => {
+            if let Some(fd_str) = raw.to_str().and_then(|s| s.strip_prefix("fd:")) {
+                let fd: i32 = match fd_str.parse() {
+                    Ok(n) if n > 3 => n,
+                    _ => stop(CANNOT_RUN, "BLAZE_LAUNCH_UNWOUND_FILE fd target is invalid"),
+                };
+                // SAFETY: validates `fd` is open and immediately marks it close-on-exec so no
+                // subprocess spawned by the test inherits the launcher-owned unwind channel.
+                if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1
+                    || unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1
+                {
+                    stop(CANNOT_RUN, "BLAZE_LAUNCH_UNWOUND_FILE fd is not open");
+                }
+                // SAFETY: `fd` was inherited from `blaze test` exclusively for this launcher.
+                Some(UnwoundSink::Fd(unsafe { OwnedFd::from_raw_fd(fd) }))
+            } else {
+                Some(UnwoundSink::File(PathBuf::from(raw)))
+            }
+        }
+    };
+    #[cfg(target_os = "linux")]
+    let sandbox_temp = match (std::env::var_os("BLAZE_LAUNCH_SANDBOX_TEMP"), start.form) {
+        (None, _) => None,
+        (Some(_), EntryForm::Comptime | EntryForm::Hosted) => stop(
+            CANNOT_RUN,
+            "BLAZE_LAUNCH_SANDBOX_TEMP is set for a non-test entry",
+        ),
+        (Some(raw), EntryForm::Unit | EntryForm::CMain) => Some(raw),
+    };
     let open_explore = std::env::var_os("BLAZE_LAUNCH_EXPLORE").is_some_and(|v| v == "1");
     if let Some(raw_stride) = std::env::var_os("BLAZE_ALLOC_SAMPLE_BYTES") {
         if let Some(stride) = raw_stride.to_str().and_then(|s| s.parse::<u64>().ok()) {
@@ -235,10 +278,37 @@ fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::Shared
         std::env::remove_var("BLAZE_LAUNCH_STORE");
         std::env::remove_var("BLAZE_LAUNCH_ENTRY");
         std::env::remove_var("BLAZE_LAUNCH_NATIVE");
+        std::env::remove_var("BLAZE_LAUNCH_UNWOUND_FILE");
+        std::env::remove_var("BLAZE_LAUNCH_SANDBOX_TEMP");
         std::env::remove_var(grants::VAR);
         std::env::remove_var(telemetry::VAR);
         std::env::remove_var("BLAZE_LAUNCH_EXPLORE");
         std::env::remove_var("BLAZE_ALLOC_SAMPLE_BYTES");
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(raw_temp) = sandbox_temp {
+        let Ok(temp_c) = CString::new(raw_temp.into_vec()) else {
+            stop(CANNOT_RUN, "BLAZE_LAUNCH_SANDBOX_TEMP holds a NUL byte");
+        };
+        let Ok(store_c) = CString::new(store.as_encoded_bytes()) else {
+            stop(CANNOT_RUN, "BLAZE_LAUNCH_STORE holds a NUL byte");
+        };
+        let cwd_c = std::env::current_dir()
+            .ok()
+            .and_then(|p| CString::new(p.into_os_string().into_vec()).ok());
+        let keep_ro_two = cwd_c.as_ref().map(|cwd| [store_c.as_c_str(), cwd.as_c_str()]);
+        let keep_ro_one = [store_c.as_c_str()];
+        let keep_ro: &[&core::ffi::CStr] = match keep_ro_two.as_ref() {
+            Some(pair) => pair,
+            None => &keep_ro_one,
+        };
+        if let Err(why) = blaze_sys::linux::confine::enter_test_sandbox(
+            temp_c.as_c_str(),
+            keep_ro,
+            cwd_c.as_deref(),
+        ) {
+            stop(CANNOT_RUN, &format!("Linux test sandbox refused: {why:?}"));
+        }
     }
     let telemetry_on = match telemetry_path {
         Some(path) => {
@@ -297,6 +367,7 @@ fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::Shared
     // span_exit frames). When `BLAZE_LAUNCH_TELEMETRY` is set, `ObservedBind` layers zero-touch
     // alloc/IO/mutex telemetry on top; otherwise plain `LauncherOwn<Dlsym>` pays zero overhead.
     let ordinary = |socket, handed| {
+        let end = if unwound_sink.is_some() { End::ExitOrReturnUnwound } else { End::Exit };
         let ran = if telemetry_on {
             run_mode::run(
                 socket,
@@ -305,7 +376,7 @@ fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::Shared
                 native,
                 handed,
                 ObservedBind::new(LauncherOwn::new(Dlsym)),
-                End::Exit,
+                end,
                 shared,
             )
         } else {
@@ -316,12 +387,35 @@ fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::Shared
                 native,
                 handed,
                 LauncherOwn::new(Dlsym),
-                End::Exit,
+                end,
                 shared,
             )
         };
         match ran {
-            Ok(status) => stop(STOPPED, &format!("the run returned status {status} where it ends the process (End::Exit)")),
+            Ok(status) => stop(STOPPED, &format!("the run returned status {status} where it ends the process")),
+            Err(run_mode::RunModeError::Unwound) => {
+                if let Some(sink) = unwound_sink.as_ref() {
+                    match sink {
+                        UnwoundSink::File(path) => {
+                            let _ = std::fs::write(path, b"1");
+                        }
+                        UnwoundSink::Fd(fd) => {
+                            use std::os::fd::AsRawFd;
+                            let frame: [u8; 5] = [0, 0, 0, 1, b'1'];
+                            // SAFETY: `fd` is the open launcher-owned unwind socket; writes a
+                            // single 5-byte length-prefixed sentinel frame before exiting 101.
+                            let _ = unsafe { libc::write(fd.as_raw_fd(), frame.as_ptr().cast(), frame.len()) };
+                        }
+                    }
+                    // SAFETY: flush stdio buffers and exit directly with `_exit(101)` so dyld TLS
+                    // destructors cannot attempt JIT stub resolution after the control thread stopped.
+                    unsafe {
+                        libc::fflush(core::ptr::null_mut());
+                        libc::_exit(101);
+                    }
+                }
+                stop(STOPPED, "an uncaught panic unwound out of the program's entry")
+            }
             Err(why) => why.to_string(),
         }
     };

@@ -45,9 +45,11 @@ pub const SHARED_BATCH: usize = 32;
 mod tests;
 
 /// How many shards a table has: a power of two, fixed so that a table is laid out the same on
-/// every machine; 64 keeps two writers on one shard rare at 128 threads, and an empty table at
-/// 64 lines.
-pub const SHARDS: usize = 64;
+/// every machine; 256 (top 8 bits of the 64-bit hash) keeps writer contention rare on 128-core
+/// machines, with each shard on its own 128-byte cache line.
+pub const SHARDS: usize = 256;
+
+const _: () = assert!(SHARDS.is_power_of_two() && SHARDS >= 2);
 
 /// Retired values a shard holds before a write asks which may be freed: the ask scans every
 /// thread's epoch slot, so it is made once per this many retirements, not per write.

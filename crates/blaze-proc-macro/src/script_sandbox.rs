@@ -181,10 +181,11 @@ impl blaze_own::planted::Plants for TreePlant {}
 pub enum Tree {
     /// A folder on disk, read-only (a workspace member's checkout), at its resolved root.
     Dir(RealRoot),
-    /// Files read out of a package's record: (path from the root, bytes), sorted by path.
+    /// Files read out of a package's record: (path from the root, bytes), sorted by path,
+    /// together with any unpopulated git submodules (`(path, commit_oid)`) inside the package.
     /// `git`: the commit when the record is a fetched git source's, whose `git` answers it
     /// gives (D54); `None` for a crate.
-    Mem { files: Arc<Vec<(String, Vec<u8>)>>, git: Option<git::Oid> },
+    Mem { files: Arc<Vec<(String, Vec<u8>)>>, submodules: Arc<[(String, [u8; 20])]>, git: Option<git::Oid> },
 }
 
 impl blaze_own::Share for Tree {}
@@ -199,6 +200,7 @@ enum Node<'t> {
 enum TreeFault {
     Outside(PathBuf),
     Special(PathBuf),
+    Submodule { path: PathBuf, submodule: PathBuf, commit: [u8; 20] },
     Io { path: PathBuf, op: &'static str, error: std::io::Error },
 }
 
@@ -207,6 +209,13 @@ impl std::fmt::Display for TreeFault {
         match self {
             Self::Outside(path) => write!(f, "`{}` is a link out of the served tree", path.display()),
             Self::Special(path) => write!(f, "`{}` in the served tree is neither a regular file nor a directory", path.display()),
+            Self::Submodule { path, submodule, commit } => {
+                write!(f, "`{}` is inside unpopulated git submodule `{}` at commit ", path.display(), submodule.display())?;
+                for byte in commit {
+                    write!(f, "{byte:02x}")?;
+                }
+                Ok(())
+            }
             Self::Io { path, op, error } => write!(f, "cannot {op} `{}` in the served tree: {error}", path.display()),
         }
     }
@@ -354,6 +363,16 @@ impl Tree {
         self.file_bytes(rel).ok().flatten().map(Cow::into_owned)
     }
 
+    fn submodule_covering(&self, rel: &str) -> Option<(&str, [u8; 20])> {
+        let Tree::Mem { submodules, .. } = self else { return None };
+        for (sub, commit) in submodules.iter() {
+            if rel == sub.as_str() || (rel.len() > sub.len() && rel.starts_with(sub.as_str()) && rel.as_bytes().get(sub.len()) == Some(&b'/')) {
+                return Some((sub.as_str(), *commit));
+            }
+        }
+        None
+    }
+
     fn file_bytes(&self, rel: &str) -> Result<Option<Cow<'_, [u8]>>, TreeFault> {
         match self {
             Tree::Dir(root) => {
@@ -363,12 +382,17 @@ impl Tree {
                 }
                 std::fs::read(path).map(|bytes| Some(Cow::Owned(bytes))).map_err(|error| TreeFault::Io { path: PathBuf::from(rel), op: "read", error })
             }
-            Tree::Mem { files, .. } => Ok(files.binary_search_by(|(path, _)| path.as_str().cmp(rel)).ok().map(|at| Cow::Borrowed(files[at].1.as_slice()))),
+            Tree::Mem { files, .. } => {
+                if let Some((submodule, commit)) = self.submodule_covering(rel) {
+                    return Err(TreeFault::Submodule { path: PathBuf::from(rel), submodule: PathBuf::from(submodule), commit });
+                }
+                Ok(files.binary_search_by(|(path, _)| path.as_str().cmp(rel)).ok().map(|at| Cow::Borrowed(files[at].1.as_slice())))
+            }
         }
     }
 
     /// What `rel` is: its bytes or its entries; `None` when absent. `Err`: a link out of the
-    /// tree.
+    /// tree, or a path inside an unpopulated git submodule.
     fn node(&self, rel: &str) -> Result<Option<Node<'_>>, TreeFault> {
         match self {
             Tree::Dir(root) => {
@@ -396,7 +420,10 @@ impl Tree {
                 let bytes = std::fs::read(&real).map_err(|error| fault("read", error))?;
                 Ok(Some(Node::File(Cow::Owned(bytes))))
             }
-            Tree::Mem { files, .. } => {
+            Tree::Mem { files, submodules, .. } => {
+                if let Some((submodule, commit)) = self.submodule_covering(rel) {
+                    return Err(TreeFault::Submodule { path: PathBuf::from(rel), submodule: PathBuf::from(submodule), commit });
+                }
                 if let Ok(at) = files.binary_search_by(|(path, _)| path.as_str().cmp(rel)) {
                     return Ok(Some(Node::File(Cow::Borrowed(&files[at].1))));
                 }
@@ -413,8 +440,15 @@ impl Tree {
                         entries.push((name.as_bytes().to_vec(), filetype));
                     }
                 }
+                for (sub, _) in submodules.iter() {
+                    if let Some(below) = sub.strip_prefix(prefix.as_str()) {
+                        let name = below.split_once('/').map_or(below, |(name, _)| name);
+                        entries.push((name.as_bytes().to_vec(), Filetype::Directory));
+                    }
+                }
                 // Full paths sort "a.txt" before "a/f"; the served names sort "a" first.
                 entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                entries.dedup_by(|a, b| a.0 == b.0);
                 Ok((!entries.is_empty() || rel.is_empty()).then_some(Node::Folder(entries)))
             }
         }
@@ -2035,10 +2069,26 @@ impl System for ScriptSandbox {
 /// A folder's files as a [`Tree::Mem`]: every file under `dir` of a record, by path from `dir`;
 /// `git` is the commit when the record is a fetched git source's.
 pub fn mem_tree<'f>(files: impl IntoIterator<Item = (&'f str, &'f [u8])>, dir: &str, git: Option<git::Oid>) -> Tree {
+    mem_tree_with_submodules(files, core::iter::empty(), dir, git)
+}
+
+/// [`mem_tree`], also carrying unpopulated git submodules (`(path, commit_oid)`) inside `dir`
+/// so sibling submodules outside `dir` are ignored while accesses to package-local submodules
+/// fail closed.
+pub fn mem_tree_with_submodules<'f>(
+    files: impl IntoIterator<Item = (&'f str, &'f [u8])>,
+    submodules: impl IntoIterator<Item = (&'f str, [u8; 20])>,
+    dir: &str,
+    git: Option<git::Oid>,
+) -> Tree {
     let prefix = if dir.is_empty() { String::new() } else { format!("{dir}/") };
-    let mut out: Vec<(String, Vec<u8>)> = files.into_iter().filter_map(|(path, bytes)| path.strip_prefix(prefix.as_str()).map(|rel| (rel.to_owned(), bytes.to_vec()))).collect();
+    let (mut out, mut subs): (Vec<(String, Vec<u8>)>, Vec<(String, [u8; 20])>) = (
+        files.into_iter().filter_map(|(path, bytes)| path.strip_prefix(prefix.as_str()).map(|rel| (rel.to_owned(), bytes.to_vec()))).collect(),
+        submodules.into_iter().filter_map(|(path, commit)| path.strip_prefix(prefix.as_str()).map(|rel| (rel.to_owned(), commit))).collect(),
+    );
     out.sort_by(|a, b| a.0.cmp(&b.0));
-    Tree::Mem { files: Arc::new(out), git }
+    subs.sort_by(|a, b| a.0.cmp(&b.0));
+    Tree::Mem { files: Arc::new(out), submodules: Arc::from(subs), git }
 }
 
 /// A folder of the checkout as a [`Tree::Dir`], at the root the command resolved once.
@@ -2052,3 +2102,36 @@ mod side_refusal_tests;
 mod escape_tests;
 #[cfg(all(test, unix))]
 mod served_tests;
+
+#[cfg(test)]
+mod submodule_tests {
+    use super::*;
+
+    #[test]
+    fn mem_tree_skips_sibling_submodules_and_fails_closed_on_package_local_submodules() {
+        let oid = [0xab; 20];
+        let tree = mem_tree_with_submodules(
+            [("pkg/Cargo.toml", b"[package]\nname = \"p\"\n".as_slice()), ("pkg/src/lib.rs", b"".as_slice())],
+            [("sibling_sub", oid), ("pkg/v8", oid)],
+            "pkg",
+            None,
+        );
+        // Normal files and parent directory listing work; sibling submodule outside `pkg` is ignored.
+        assert!(tree.node("Cargo.toml").expect("manifest").is_some());
+        assert!(tree.node("sibling_sub").expect("outside dir").is_none());
+        let Some(Node::Folder(root_entries)) = tree.node("").expect("root dir") else {
+            panic!("root must be a folder");
+        };
+        assert!(root_entries.iter().any(|(name, ft)| name.as_slice() == b"v8" && *ft == Filetype::Directory));
+        assert!(!root_entries.iter().any(|(name, _)| name.as_slice() == b"sibling_sub"));
+
+        // Package-local submodule and any path beneath it fail closed with TreeFault::Submodule.
+        for bad in ["v8", "v8/include/v8.h"] {
+            let err = tree.node(bad).err().expect("submodule path must fail closed");
+            let msg = err.to_string();
+            assert!(msg.contains("unpopulated git submodule `v8`"), "{msg}");
+            assert!(msg.contains("abababababababababababababababababababab"), "{msg}");
+            assert!(tree.file_bytes(bad).is_err());
+        }
+    }
+}

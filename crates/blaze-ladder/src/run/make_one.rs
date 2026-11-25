@@ -500,18 +500,6 @@ struct Work {
     /// `adt_drop_impl`, `resolve`) keyed by interned IDs in `self.ground`. Sits below `Recorded` /
     /// `Asking` so every build's `ReadLog` is unchanged.
     query_cache: core::cell::RefCell<QueryCache>,
-    /// Whole-program bottom-up export LTO mode: builds small closed callees into `inline_bank`
-    /// and splices them into callers via `blaze_lir::inline::inline_guided` before SOTA emission.
-    export_lto: bool,
-    export_lto_populate_only: bool,
-    export_lto_symbol: Option<blaze_code::record::Symbol>,
-    export_lto_inlined: bool,
-    inline_bank: blaze_hash::Map<
-        blaze_code::record::Symbol,
-        blaze_lir::func::Func<Global>,
-        blaze_hash::FixedState,
-        Global,
-    >,
 }
 
 /// Compact stack-inline argument list key for [`QueryCache::normalize`] (99%+ of projections have
@@ -709,15 +697,6 @@ impl MakerState {
             reads: ReadLog::new(ReadPlant::None),
             answers: Answers::new_in(alloc),
             query_cache: core::cell::RefCell::new(QueryCache::new_in(alloc)),
-            export_lto: false,
-            export_lto_populate_only: false,
-            export_lto_symbol: None,
-            export_lto_inlined: false,
-            inline_bank: blaze_hash::Map::new(blaze_hash::MapOpts {
-                hasher: blaze_hash::FixedState,
-                alloc: Global,
-                capacity: None,
-            }),
         };
         Ok(MakerState { asked: blaze_own::Vec::new_in(alloc), checked: blaze_own::Vec::new_in(alloc), tables: Some(tables), work })
     }
@@ -1533,7 +1512,7 @@ fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize
         if need_tys.is_empty() {
             Ok(())
         } else {
-            match crate::front2::coroutine_needs::held_coroutines(&mut work.ground, &need_tys, &facts, work.alloc) {
+            match crate::front2::coroutine_needs::referenced_coroutines(&mut work.ground, &need_tys, &facts, work.alloc) {
                 Ok(coro_roots) if coro_roots.is_empty() => Ok(()),
                 Ok(coro_roots) => match lay_only(&*program, &[], &work.langs, &bodies, &mut work.ground, &mut work.layouts, i, &coro_roots, work.alloc) {
                     Ok(LaidOnly::Done(recorded)) => {
@@ -1970,7 +1949,7 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
                 let t = tables.take().ok_or_else(|| tables_gone(tabled))?;
                 let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow, ub: work.ub, panic: work.panic, alloc: work.alloc };
                 let facts = FrontAdts(&*program, i, &[], &work.langs, &bodies);
-                let found = crate::front2::coroutine_needs::held_coroutines(&mut work.ground, &need_tys, &facts, work.alloc);
+                let found = crate::front2::coroutine_needs::referenced_coroutines(&mut work.ground, &need_tys, &facts, work.alloc);
                 *tables = Some(Tables { closures: bodies.closures, coroutines: bodies.coroutines, const_at: bodies.const_at });
                 found
             };
@@ -2244,8 +2223,10 @@ fn build_lir_phase<P: FrontEnd>(
             Some((at, part.index()))
         }
     };
-    if from_coroutine.is_none() && shim.is_none() && vtable_shim.is_none() && test_report.is_none() {
-        let roots = roots_of_instance(program, bodies, &adts, i, &args, &mut work.ground, work.alloc)?;
+    if from_coroutine.is_none() {
+        let include_body = shim.is_none() && vtable_shim.is_none() && test_report.is_none() && builtin_clone.is_none() && builtin_from.is_none();
+        let extra_args = (instance.args != owner_args).then_some(instance.args);
+        let roots = roots_of_instance(program, bodies, &adts, i, &args, extra_args, include_body, &mut work.ground, work.alloc)?;
         if !roots.is_empty() {
             match lay_and_build(program, &[], &work.langs, bodies, &mut work.ground, &mut work.layouts, &mut work.stash, i, &roots, true, work.alloc)? {
                 Lay::Done => {}
@@ -2478,139 +2459,14 @@ fn resolve_and_emit_phase<'a, P: FrontEnd>(
             }
             let read_list = work.reads.seal(&mut work.ground, work.alloc).map_err(|error| RunError::CodeRecord { function: name(), error: CodeRecordError::Reads(error) })?;
             let emitted_from = work.clock.map(|c| c.now());
-            let mut inlined_func: Option<blaze_lir::func::Func<Global>> = None;
-            if work.export_lto && from_coroutine.is_none() {
-                struct ExportInlineBodies<'a, 'b> {
-                    root: blaze_lir::body::BodyId,
-                    root_refs: &'a [blaze_lir::func::RefRec],
-                    funcs: &'a [Callee<'b>],
-                    bank: &'a blaze_hash::Map<
-                        blaze_code::record::Symbol,
-                        blaze_lir::func::Func<Global>,
-                        blaze_hash::FixedState,
-                        Global,
-                    >,
-                }
-                impl blaze_lir::body::Bodies for ExportInlineBodies<'_, '_> {
-                    fn callee(
-                        &self,
-                        from: blaze_lir::body::BodyId,
-                        reference: blaze_lir::func::RefId,
-                    ) -> Option<(blaze_lir::body::BodyId, blaze_lir::View<'_>)> {
-                        if from != self.root {
-                            return None;
-                        }
-                        let r = *self.root_refs.get(usize::try_from(reference.0).ok()?)?;
-                        if r.kind != (blaze_lir::func::RefKind::Func as u32) {
-                            return None;
-                        }
-                        let idx = usize::try_from(r.place).ok()?;
-                        let Callee::Symbol(sym) = *self.funcs.get(idx)? else {
-                            return None;
-                        };
-                        let f = self.bank.get(&sym)?;
-                        Some((blaze_lir::body::BodyId(sym.0), f.view()))
-                    }
-                }
-                let has_bank_callee = funcs.iter().any(|c| match c {
-                    Callee::Symbol(sym) => work.inline_bank.contains_key(sym),
-                    Callee::C(_) => false,
-                });
-                if has_bank_callee {
-                    let root_id = blaze_lir::body::BodyId(
-                        work.export_lto_symbol.map_or([0u8; 32], |s| s.0),
-                    );
-                    let root_view = built.func.verified().view();
-                    let bodies = ExportInlineBodies {
-                        root: root_id,
-                        root_refs: root_view.refs,
-                        funcs: &funcs,
-                        bank: &work.inline_bank,
-                    };
-                    let policy = blaze_lir::inline::InlinePolicy {
-                        cost_threshold: 160,
-                        max_callee_insts: 256,
-                        hot_multiplier: 4,
-                        hot_weight_threshold: 1,
-                        max_depth: 6,
-                        max_growth: 4096,
-                        allow_external_refs: false,
-                        allow_loops: true,
-                    };
-                    if let Ok(guided) = blaze_lir::inline::inline_guided(
-                        built.func.verified().view(),
-                        root_id,
-                        &bodies,
-                        &blaze_lir::inline::NoWeights,
-                        policy,
-                        Global,
-                    ) && !guided.read.is_empty()
-                        && blaze_lir::verify(guided.func.view()).is_ok()
-                    {
-                        work.export_lto_inlined = true;
-                        inlined_func = Some(guided.func);
-                    }
-                }
+            let made = make_entry_with_vtables(built.func.verified(), &names, &mut carried, routines, &mut declared, &read_list, &built.traps, work.isa, work.alloc)
+                .map_err(|error| RunError::CodeRecord { function: name(), error })?;
+            if let (Some(c), Some(from)) = (work.clock, emitted_from) {
+                work.times.emit += c.now().saturating_sub(from);
+                work.times.last = Some(MadeSizes::of(name(), built, &made));
             }
-            let made = if work.export_lto && (work.export_lto_populate_only || !work.export_lto_inlined) {
-                None
-            } else if let Some(ref f) = inlined_func
-                && let Ok(v) = blaze_lir::verify(f.view())
-            {
-                Some(
-                    make_entry_with_vtables(v, &names, &mut carried, routines, &mut declared, &read_list, &built.traps, work.isa, work.alloc)
-                        .map_err(|error| RunError::CodeRecord { function: name(), error })?,
-                )
-            } else {
-                Some(
-                    make_entry_with_vtables(built.func.verified(), &names, &mut carried, routines, &mut declared, &read_list, &built.traps, work.isa, work.alloc)
-                        .map_err(|error| RunError::CodeRecord { function: name(), error })?,
-                )
-            };
-            if let Some(ref made) = made {
-                if let (Some(c), Some(from)) = (work.clock, emitted_from) {
-                    work.times.emit += c.now().saturating_sub(from);
-                    work.times.last = Some(MadeSizes::of(name(), built, made));
-                }
-                entry.extend_from_slice(made);
-            }
-            let own = built_slot.take().and_then(|bp| bp.own);
-            if work.export_lto
-                && from_coroutine.is_none()
-                && let Some(sym) = work.export_lto_symbol
-                && own.as_ref().is_some_and(|b| b.statics.is_empty() && b.vtables.is_empty() && b.thread_locals.is_empty())
-            {
-                let shrink_for_bank = |raw: blaze_lir::func::Func<Global>| -> Option<blaze_lir::func::Func<Global>> {
-                    if raw.view().ops.len() > 2048 {
-                        return None;
-                    }
-                    let f1 = blaze_lir::simplify::scalar_replace(raw.view(), Global).unwrap_or(raw);
-                    let f2 = blaze_lir::simplify::propagate(f1.view(), Global).unwrap_or(f1);
-                    let f3 = blaze_lir::simplify::dead(f2.view(), Global).unwrap_or(f2);
-                    let v = f3.view();
-                    let is_leaf = v.ops.len() <= 256
-                        && !v.ops.iter().any(|&o| {
-                            matches!(
-                                blaze_lir::Op::from_byte(o),
-                                Some(blaze_lir::Op::Call | blaze_lir::Op::CallIndirect | blaze_lir::Op::Invoke)
-                            )
-                        });
-                    if is_leaf && blaze_lir::verify(v).is_ok() {
-                        Some(f3)
-                    } else {
-                        None
-                    }
-                };
-                if let Some(f) = inlined_func {
-                    if let Some(shrunk) = shrink_for_bank(f) {
-                        let _ = work.inline_bank.insert(sym, shrunk);
-                    }
-                } else if let Some(b) = own
-                    && let Some(shrunk) = shrink_for_bank(b.func.into_func())
-                {
-                    let _ = work.inline_bank.insert(sym, shrunk);
-                }
-            }
+            entry.extend_from_slice(&made);
+            let _ = built_slot.take();
             if let Some((at, part)) = from_coroutine {
                 work.stash[at].parts[part] = None;
             }
@@ -3241,39 +3097,6 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
         let first = errors.first()?;
         let first = std::format!("{first}").into_boxed_str();
         Some(RunError::Front2(Front2Refusal::Lazy(LazyRefusal::RecordsVoid { tabled, first, kept: errors.len(), dropped: log.dropped() })))
-    }
-
-    /// Bottom-up whole-program export LTO helper: builds `tabled`/`name`, splices any closed
-    /// callees already in `inline_bank` via `blaze_lir::inline::inline_guided`, caches small
-    /// 0-call results into `inline_bank`, and emits a new SOTA code entry into `entry` only when
-    /// at least one callee was inlined. Returns `Ok(true)` iff `entry` was populated.
-    pub fn make_export_lto(
-        &mut self,
-        symbol: blaze_code::record::Symbol,
-        tabled: ItemKey,
-        name: &[u8],
-        populate_only: bool,
-        entry: &mut AVec<'_, u8>,
-    ) -> Result<bool, RunError> {
-        self.construct(tabled)?;
-        let Some((program, state)) = self.made.as_mut() else {
-            return Ok(false);
-        };
-        if populate_only && state.work.inline_bank.contains_key(&symbol) {
-            return Ok(false);
-        }
-        state.work.export_lto = true;
-        state.work.export_lto_populate_only = populate_only;
-        state.work.export_lto_symbol = Some(symbol);
-        state.work.export_lto_inlined = false;
-        let res = make_instance(program, &mut self.typing, state, &mut self.checks, tabled, name, entry);
-        let inlined = !populate_only && state.work.export_lto_inlined && !entry.is_empty();
-        state.work.export_lto = false;
-        state.work.export_lto_populate_only = false;
-        state.work.export_lto_symbol = None;
-        state.work.export_lto_inlined = false;
-        res?;
-        Ok(inlined)
     }
 
     /// The program made on the first call, then the one instance.

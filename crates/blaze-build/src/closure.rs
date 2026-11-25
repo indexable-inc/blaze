@@ -170,9 +170,6 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         let repr = self.repr(g).map_err(|error| Self::ty_err(e, error))?;
         let mut fields: Vec<EnvField, A> = Vec::new_in(self.alloc);
         for f in self.checked.env_fields_by::<crate::layout::BuildEnv>(e) {
-            if let Some(cnt) = self.uses_left.get_mut(f.base.ix()) {
-                *cnt = cnt.saturating_sub(1);
-            }
             fields.push(f);
         }
         if let Repr::None = repr {

@@ -546,7 +546,27 @@ impl<'r> ProcMacros<'r> {
                         Some(member_joined.as_path())
                     }
                 }
-                crate::sandbox::Files::Listed(_) => {
+                crate::sandbox::Files::Listed(listed) => {
+                    if let Some((sub, commit)) = listed.iter().find_map(|(p, b)| match b {
+                        crate::sandbox::ListedBytes::Submodule(c) => Some((p.as_str(), *c)),
+                        _ => None,
+                    }) {
+                        let mut hex = blaze_own::AString::new_in(alloc);
+                        for byte in commit {
+                            let _ = core::fmt::Write::write_fmt(&mut hex, format_args!("{byte:02x}"));
+                        }
+                        let why = format!(
+                            "package contains unpopulated git submodule `{sub}` at commit {hex}; native proc-macro materialization refuses unpopulated submodules"
+                        );
+                        let expand_err = ExpandError {
+                            krate: macro_crate.label.as_str().to_owned(),
+                            name: export.name.as_str().to_owned(),
+                            error: CallError::Failed(why.as_str().to_owned()),
+                        };
+                        let refused = RunRefused { host: expand_err.error.host_error(), call: Some(CallError::Failed(why)) };
+                        self.report(Finding::Call { base, error: expand_err });
+                        return Err(refused);
+                    }
                     // Materialize all safe relative files from the fetched crate once by content
                     // digest so proc macros (`proc-macro-crate`, `i18n-embed-fl`, `jsonrpsee`,
                     // `rust-embed`, etc.) can read any package file under `$CARGO_MANIFEST_DIR`.
@@ -753,6 +773,9 @@ fn materialize_listed_in<'a>(base: &Path, files: &crate::sandbox::Files, seq: u6
     };
     let mut entries: blaze_own::Vec<(&str, &[u8]), Alloc<'a>> = blaze_own::Vec::new_in(alloc);
     for (name, bytes) in files.iter() {
+        if matches!(bytes, crate::sandbox::ListedBytes::Submodule(_)) {
+            continue;
+        }
         if safe_rel_path(name) {
             entries.push((name.as_str(), bytes.as_slice()));
         }

@@ -40,6 +40,16 @@ pub fn geteuid() -> u32 {
     (unsafe { raw::syscall0(nr::GETEUID) }) as u32
 }
 
+/// `getegid`: this process's effective group id. Cannot fail.
+///
+/// replaces libc::getegid
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn getegid() -> u32 {
+    // SAFETY: the call takes nothing and cannot fail.
+    u32::try_from(unsafe { raw::syscall0(nr::GETEGID) }).unwrap_or(u32::MAX)
+}
+
 /// `getppid`: the parent's process id (1, or a subreaper's, once the parent has exited).
 /// Cannot fail.
 ///

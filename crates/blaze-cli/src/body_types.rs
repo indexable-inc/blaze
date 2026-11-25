@@ -419,10 +419,36 @@ impl CachedPack {
         CachedPack { view, entries }
     }
 
-    fn get_or_load(&self, cx: &Cx, path: &str, alloc: blaze_own::SharedAlloc<'static>) -> Option<&CachedPackEntry> {
-        let at = self.view.find_index(path)?;
-        let slot = self.entries.get(at)?;
-        slot.get_or_make(cx, |_| Ok::<_, core::convert::Infallible>(CachedPackEntry::of(self.view.entry(at), alloc))).ok()
+    fn get_or_load(
+        &self,
+        cx: &Cx,
+        path: &str,
+        alloc: blaze_own::SharedAlloc<'static>,
+    ) -> Result<Option<&CachedPackEntry>, blaze_fetch::PackRefused> {
+        let Some(at) = self.view.find_index(path) else {
+            if let Some(sub) = self.view.submodule_covering(path) {
+                let commit = sub.submodule_commit().unwrap_or([0u8; 20]);
+                return Err(blaze_fetch::PackRefused::Submodule {
+                    path: blaze_fetch::unpack::Cut::of(path.as_bytes()),
+                    submodule: blaze_fetch::unpack::Cut::of(sub.path.as_bytes()),
+                    commit,
+                });
+            }
+            return Ok(None);
+        };
+        let entry = self.view.entry(at);
+        if entry.mode == blaze_fetch::Mode::Submodule {
+            let commit = entry.submodule_commit().unwrap_or([0u8; 20]);
+            return Err(blaze_fetch::PackRefused::Submodule {
+                path: blaze_fetch::unpack::Cut::of(path.as_bytes()),
+                submodule: blaze_fetch::unpack::Cut::of(entry.path.as_bytes()),
+                commit,
+            });
+        }
+        let Some(slot) = self.entries.get(at) else {
+            return Ok(None);
+        };
+        Ok(slot.get_or_make(cx, |_| Ok::<_, core::convert::Infallible>(CachedPackEntry::of(entry, alloc))).ok())
     }
 }
 
@@ -526,18 +552,42 @@ impl<'f> SyncLazyTrees<'f> {
         Some(pack.view)
     }
 
+    fn record_pack_refusal(&self, why: &blaze_fetch::PackRefused) {
+        if self.refused.get().is_some() {
+            return;
+        }
+        let mut msg = blaze_own::AString::new_in(self.heap.alloc());
+        blaze_text::Writes::show(&mut msg, why);
+        let leaked: &'static str = blaze_own::Box::leak_static(msg.into_boxed_str());
+        let _ = self.refused.set(leaked);
+    }
+
     /// Reads file `path` of pack `k` as UTF-8 text, decompressing and verifying UTF-8 at most
     /// once across all workers and stretches (zero bytes allocated in `scratch`).
     pub(crate) fn read_str(&self, cx: &Cx, fs: &bstd::fs::Fs, scratch: &Frame, k: usize, path: &str) -> Option<&str> {
         let (pack, _) = self.open_cached(cx, fs, None, scratch, k)?;
-        pack.get_or_load(cx, path, self.heap.shared())?.as_str()
+        match pack.get_or_load(cx, path, self.heap.shared()) {
+            Ok(Some(entry)) => entry.as_str(),
+            Ok(None) => None,
+            Err(why) => {
+                self.record_pack_refusal(&why);
+                None
+            }
+        }
     }
 
     /// Reads file `path` of pack `k` as raw bytes, decompressing at most once across all workers
     /// and stretches (zero bytes allocated in `scratch`).
     pub(crate) fn read_slice(&self, cx: &Cx, fs: &bstd::fs::Fs, scratch: &Frame, k: usize, path: &str) -> Option<&[u8]> {
         let (pack, _) = self.open_cached(cx, fs, None, scratch, k)?;
-        pack.get_or_load(cx, path, self.heap.shared())?.as_bytes()
+        match pack.get_or_load(cx, path, self.heap.shared()) {
+            Ok(Some(entry)) => entry.as_bytes(),
+            Ok(None) => None,
+            Err(why) => {
+                self.record_pack_refusal(&why);
+                None
+            }
+        }
     }
 
     /// Reads checkout file `inner` (`/0/<inner>`) from `root` at most once per `SyncLazyTrees`
@@ -770,13 +820,13 @@ impl<'n> SharedTrees<'n> {
         SharedTrees { packs, fs, dirs, seen }
     }
 
-    pub(crate) fn tree(&self, cx: &Cx, scratch: &Frame, k: usize) -> Option<PackView<'static>> {
-        match self.packs.open_tree_with(cx, self.fs, Some(self.dirs), scratch, k) {
-            Some((view, newly_opened)) => {
+    fn open_cached(&self, cx: &Cx, scratch: &Frame, k: usize) -> Option<&'static CachedPack> {
+        match self.packs.open_cached(cx, self.fs, Some(self.dirs), scratch, k) {
+            Some((pack, newly_opened)) => {
                 if newly_opened {
                     self.seen.opened.set(self.seen.opened.get() + 1);
                 }
-                Some(view)
+                Some(pack)
             }
             None => {
                 if let Some(why) = self.packs.refused()
@@ -784,6 +834,38 @@ impl<'n> SharedTrees<'n> {
                 {
                     self.seen.refused.set(Some(why));
                 }
+                None
+            }
+        }
+    }
+
+    pub(crate) fn tree(&self, cx: &Cx, scratch: &Frame, k: usize) -> Option<PackView<'static>> {
+        self.open_cached(cx, scratch, k).map(|pack| pack.view)
+    }
+
+    /// Reads file `path` of immutable pack `k` as UTF-8 text from the command-wide cache
+    /// (zero bytes allocated in `scratch`, zero repeat Zstd decode across workers/suites).
+    pub(crate) fn read_str(&self, cx: &Cx, scratch: &Frame, k: usize, path: &str) -> Option<&'static str> {
+        let pack = self.open_cached(cx, scratch, k)?;
+        match pack.get_or_load(cx, path, self.packs.heap.shared()) {
+            Ok(Some(entry)) => entry.as_str(),
+            Ok(None) => None,
+            Err(why) => {
+                self.packs.record_pack_refusal(&why);
+                None
+            }
+        }
+    }
+
+    /// Reads file `path` of immutable pack `k` as raw bytes from the command-wide cache
+    /// (zero bytes allocated in `scratch`, zero repeat Zstd decode across workers/suites).
+    pub(crate) fn read_slice(&self, cx: &Cx, scratch: &Frame, k: usize, path: &str) -> Option<&'static [u8]> {
+        let pack = self.open_cached(cx, scratch, k)?;
+        match pack.get_or_load(cx, path, self.packs.heap.shared()) {
+            Ok(Some(entry)) => entry.as_bytes(),
+            Ok(None) => None,
+            Err(why) => {
+                self.packs.record_pack_refusal(&why);
                 None
             }
         }
@@ -1025,6 +1107,40 @@ mod shared_pack_tests {
             assert_eq!(file.bytes.as_slice(), b"pub fn ok() {}\n");
         }
         assert_eq!(dirs.opened_count(), 1, "64 suite opens must share one sources Dir, never open 64 drivers");
+    }
+
+    #[test]
+    fn cached_pack_fails_closed_on_submodule_paths() {
+        let io = Io::simulated(SimWorld::new(93, Limits::USUAL));
+        let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("root cx");
+        let heap = blaze_own::testing::heap();
+        let limits = PackLimits { most_files: 8, most_bytes: 1 << 16, most_path: 128 };
+        let sub_oid = [0x33u8; 20];
+        let mut builder = Builder::new(PackKind::Git, [0x42; 32], limits, 0, heap.alloc()).expect("builder");
+        builder.file("src/lib.rs", Mode::File, b"pub fn ok() {}\n").expect("file");
+        builder.file("v8", Mode::Submodule, &sub_oid).expect("submodule");
+        let pack_bytes = builder.finish().expect("pack bytes");
+        let leaked: &'static [u8] = blaze_own::Box::leak_static(pack_bytes.into_boxed_slice());
+        let view = PackView::open_verified(leaked).expect("valid pack");
+        let cached = CachedPack::new(view, heap.shared());
+
+        let ok = cached.get_or_load(&cx, "src/lib.rs", heap.shared()).expect("normal file").expect("present");
+        assert_eq!(ok.as_str(), Some("pub fn ok() {}\n"));
+        assert!(cached.get_or_load(&cx, "v8_extra/foo.rs", heap.shared()).expect("non-submodule miss").is_none());
+
+        for bad in ["v8", "v8/src/lib.rs"] {
+            let Err(err) = cached.get_or_load(&cx, bad, heap.shared()) else {
+                panic!("submodule path `{bad}` must fail closed");
+            };
+            assert_eq!(
+                err,
+                blaze_fetch::PackRefused::Submodule {
+                    path: blaze_fetch::unpack::Cut::of(bad.as_bytes()),
+                    submodule: blaze_fetch::unpack::Cut::of(b"v8"),
+                    commit: sub_oid,
+                }
+            );
+        }
     }
 
     #[test]

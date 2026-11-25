@@ -542,7 +542,7 @@ fn send_of<'w>(cx: &Cx, key: Key, payload: &[u8], crates: &[CrateIn<'_>], platfo
         Platform::MacosArm64 => macho_exports_pure_symbol(payload),
         Platform::LinuxArm64 => elf_exports_pure_symbol(payload),
     };
-    let load_mode = if shadows_pure {
+    let load_mode = if descriptor.inits > 0 || shadows_pure {
         NativeLoadMode::Eager
     } else {
         NativeLoadMode::Lazy

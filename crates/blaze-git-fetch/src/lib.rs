@@ -43,4 +43,4 @@ pub use pack::{CacheStats, DeltaWhy, Found, Index, Limits as PackLimits, PackErr
 pub use plant::GitFetchPlant;
 pub use pkt::{Lines, Pkt, PktWhy};
 pub use protocol::{check_advertisement, fetch as fetch_request, fetched_pack, find_ref, ls_refs};
-pub use tree::{File, Limits as TreeLimits, Mode, TreeError, TreeWhy, files};
+pub use tree::{File, Limits as TreeLimits, Mode, TreeError, TreeWhy, files, walk_with};

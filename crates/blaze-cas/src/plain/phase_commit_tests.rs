@@ -250,7 +250,7 @@ fn consecutive_phase_commits_keep_segment_count_bounded_under_named_most() {
         peak_named = peak_named.max(named);
         assert!(named <= most, "phase {phase}: named {named} segments exceeded named_most {most}");
     }
-    assert!(peak_named <= 32, "expected auto-merge to keep open segments tight (peak_named={peak_named})");
+    assert!(peak_named <= 140, "expected foreground auto-merge safety ceiling (128) to keep open segments well below named_most (peak_named={peak_named})");
     // Every single phase record must read back intact while the lease is still live.
     for &(n, k) in &all_keys {
         let got = lent.get(&k).expect("get").expect("phase record must survive lossless leased tier merge");
@@ -326,6 +326,7 @@ fn stale_lease_does_not_block_tiered_compaction_and_preserves_leased_records_unt
         // While p1's lease is live, compact() still compacts any tiers > K, preserves p1's records,
         // and does not report spurious housekeeping for retired files held by p1's lease.
         let _ = lent2.compact_foreground(32).expect("compact under stale lease");
+        let _ = lent2.seal_foreground().expect("seal after compact");
         let (_, after_named) = lent2.mapped_of_named();
         assert!(after_named <= 8, "tiered compaction under stale lease should collapse segments (got {after_named})");
         for &(n, k) in &dead_keys {
@@ -472,15 +473,17 @@ fn auto_tier_merge_during_commit_is_lossless_for_unleased_records() {
         p1.into_driver()
     };
 
-    // Process 2 performs 30 phase commits under Liveness::Reached, crossing the auto-merge
-    // threshold (`auto_merge_open_threshold` = 24) and folding Process 1's unleased segments.
+    // Process 2 performs 130 phase commits under Liveness::Reached, crossing the emergency
+    // foreground auto-merge ceiling (`AUTO_TIER_MERGE_FG` = 128) and folding Process 1's unleased
+    // segments losslessly.
     let mut p2 = Driven::with(sim, Path::new("/sim"), reached_cfg(2, &root), &root).expect("p2 open");
-    for i in 0..30u32 {
+    for i in 0..130u32 {
         let n = 90_000 + i;
         let k = record(n);
         p2.put(k, Namespace::LOCAL, TAG, &value(n)).expect("p2 put");
         p2.commit_with(&[]).expect("p2 commit");
     }
+    assert!(p2.core().segments().len() < 130, "expected emergency foreground auto-merge to fold segments");
 
     // Every single unleased, unrooted record from Process 1 MUST still be intact!
     for &(n, k) in &p1_keys {

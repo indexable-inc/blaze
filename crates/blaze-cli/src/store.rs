@@ -32,7 +32,7 @@ use blaze_core::Driver;
 use blaze_own::{Alloc, Arc, Share};
 use blaze_remote::PublicKey;
 use blaze_remote::published::set::SetCheck;
-use blaze_remote::read::{Answer, BatchError, Ed25519Keys, HeadCheck, Limits, Namespace, Object, Origin, OriginError, Reader, SignatureWhy, Unfetched, fetch};
+use blaze_remote::read::{Answer, BatchError, BatchOutcome, BatchRead, Ed25519Keys, HeadCheck, Limits, Namespace, Object, Origin, OriginError, Reader, SignatureWhy, Unfetched, fetch};
 use bstd::Stopped;
 use bstd::clock::Clock;
 use bstd::cx::Cx;
@@ -897,7 +897,7 @@ pub fn after_answer_printed(cx: &Cx, lent: CommandLent, home: &Home, stats: bool
     // barriers, full foreground QoS) and spawn detached `blaze gc --background`
     // (QOS_CLASS_BACKGROUND + non-blocking gc.lock) so CLI exit is never delayed. In simulated
     // worlds without a spawner, run inline slices (including exit-tail seal).
-    let slices = if needs_hk && !bg_detached { AFTER_ANSWER_SLICES } else { 0 };
+    let slices = if needs_hk && !bg_detached && lent.needs_commit() { AFTER_ANSWER_SLICES } else { 0 };
     let has_work = slices > 0 || lent.needs_commit();
     let (after, commit_ns, spawn_bg) = if !has_work {
         let named = lent.named();
@@ -1321,17 +1321,29 @@ pub struct NamedOrigin {
     check: OneKey,
 }
 
-/// Where a named origin's objects are: a folder, or an `http://` base address.
+/// Where a named origin's objects are: a folder, or an `http://` / `https://` base address.
 enum OriginAt {
     Folder(Dir<ReadWrite>),
     Http(HttpAt),
 }
 
-/// An `http://host:port/prefix` origin: the base it was given, and the network narrowed to
-/// that one address (nothing else is reached; nothing ambient).
+/// Pooled keep-alive HTTPS/HTTP client shared across every read of an [`HttpAt`] origin
+/// (zero redundant TCP/TLS handshakes across waves and records).
+#[cfg(feature = "fetch")]
+struct PooledHttp {
+    handle: blaze_http::driver::Handle,
+    https_only: bool,
+}
+
+/// An `http://` or `https://` origin: the base it was given, the network narrowed to that one
+/// address (for `http://` over bstd's `Net`), and (under `feature = "fetch"`) a shared pooled
+/// keep-alive `blaze-http` client for `https://` R2/S3 origins with TLS verification and bounded
+/// parallel fetches.
 pub struct HttpAt {
     base: Url,
     net: Net,
+    #[cfg(feature = "fetch")]
+    pooled: Option<PooledHttp>,
 }
 
 /// The one trusted key of a named origin, owned, as the read path's head check; for a published
@@ -1380,10 +1392,8 @@ impl NamedOrigin {
             (None, None) => Ok(None),
             (Some(folder), Some(key)) => {
                 let key = PublicKey::from_hex(key).ok_or(CliError::Usage("--origin-key is not 64 hex digits (an Ed25519 public key)"))?;
-                let at = if folder.starts_with("https://") {
-                    return Err(CliError::Usage("--origin https://: bstd's Http has no TLS yet (D63, stage two); name an http:// origin or a folder"));
-                } else if folder.starts_with("http://") {
-                    let net = net.ok_or(CliError::Usage("--origin http://: this host offers no network"))?;
+                let at = if folder.starts_with("https://") || folder.starts_with("http://") {
+                    let net = net.ok_or(CliError::Usage("--origin http(s)://: this host offers no network"))?;
                     OriginAt::Http(HttpAt::of(folder, net)?)
                 } else {
                     OriginAt::Folder(fs.open_dir(cx, &Path::new(folder)?)?)
@@ -1395,21 +1405,18 @@ impl NamedOrigin {
     }
 
     /// The published set `set` of the origin `origin`: its folder `public/<toolchain>/<target>`
-    /// beneath a folder, or that path joined to an `http://` base (each object then one ranged
-    /// GET of `<base>/public/<toolchain>/<target>/<name>`). Believed when its head is signed over
-    /// the set's id by a key trusted for the origin (blaze-remote trust.rs `trusted_for`: the
-    /// compiled-in published keys, or `key`, the `--origin-key` named for it), at a generation
-    /// no lower than the floor `lent` holds for it. `https://` is refused by name, as for any
-    /// origin (no TLS yet).
+    /// beneath a folder, or that path joined to an `http://` / `https://` base (each object then
+    /// one ranged GET of `<base>/public/<toolchain>/<target>/<name>`). Believed when its head is
+    /// signed over the set's id by a key trusted for the origin (blaze-remote trust.rs
+    /// `trusted_for`: the compiled-in published keys, or `key`, the `--origin-key` named for it),
+    /// at a generation no lower than the floor `lent` holds for it.
     pub fn published<D: Driver>(cx: &Cx, fs: &Fs, net: Option<&Net>, origin: &str, key: Option<&str>, set: blaze_remote::published::set::SetName<'_>, lent: &Lent<D, StoreAlloc>) -> Result<NamedOrigin, CliError> {
         let named = match key {
             Some(key) => Some(PublicKey::from_hex(key).ok_or(CliError::Usage("--origin-key is not 64 hex digits (an Ed25519 public key)"))?),
             None => None,
         };
-        let at = if origin.starts_with("https://") {
-            return Err(CliError::Usage("--origin https://: bstd's Http has no TLS yet (D63, stage two); name an http:// origin or a folder"));
-        } else if origin.starts_with("http://") {
-            let net = net.ok_or(CliError::Usage("--origin http://: this host offers no network"))?;
+        let at = if origin.starts_with("https://") || origin.starts_with("http://") {
+            let net = net.ok_or(CliError::Usage("--origin http(s)://: this host offers no network"))?;
             let [public, toolchain, target] = set.dir();
             // Each part a checked set name (`[0-9a-z._-]`): nothing joined here leaves the base.
             let joined = bstd::mem::format_in!(cx.frame(), "{}/{}/{}/{}", origin.trim_end_matches('/'), public, toolchain, target);
@@ -1436,6 +1443,12 @@ pub enum RemoteError {
     Batch(BatchError),
     /// A fetched record could not be copied into the request's buffer.
     Copy(Stopped),
+    /// System TLS root certificates could not be loaded for an `https://` origin.
+    Tls(blaze_own::String<blaze_mem::Kept>),
+    /// Proxy settings for an `https://` origin were invalid.
+    Proxy(blaze_own::String<blaze_mem::Kept>),
+    /// The pooled HTTP/HTTPS driver thread could not be started.
+    Driver(blaze_own::String<blaze_mem::Kept>),
 }
 
 impl core::fmt::Display for RemoteError {
@@ -1443,6 +1456,9 @@ impl core::fmt::Display for RemoteError {
         match self {
             RemoteError::Batch(error) => write!(f, "the origin's read path: {error}"),
             RemoteError::Copy(stopped) => write!(f, "a record fetched from the origin: {stopped}"),
+            RemoteError::Tls(why) => write!(f, "the origin's HTTPS TLS roots: {why}"),
+            RemoteError::Proxy(why) => write!(f, "the origin's HTTP proxy settings: {why}"),
+            RemoteError::Driver(why) => write!(f, "starting the origin's pooled HTTPS driver: {why}"),
         }
     }
 }
@@ -1466,14 +1482,59 @@ impl Origin for FolderOrigin<'_> {
     }
 }
 
+/// Bounded concurrent ranged requests kept in flight against a pooled HTTP/HTTPS origin (rule 18).
+const ORIGIN_IN_FLIGHT: usize = 16;
+
+/// Extra wait slack past the earliest request deadline in flight when awaiting the HTTP driver.
+#[cfg(feature = "fetch")]
+const ORIGIN_ANSWER_SLACK: Duration = Duration::from_secs(1);
+
+#[cfg(feature = "fetch")]
+fn own_msg(display: impl core::fmt::Display) -> blaze_own::String<blaze_mem::Kept> {
+    let mut msg = blaze_own::String::new_in(blaze_mem::Kept(blaze_mem::Tag::Store));
+    let _ = core::fmt::write(&mut msg, format_args!("{display}"));
+    msg
+}
+
 impl HttpAt {
-    /// The origin at `base` (`http://host:port[/prefix]`), the network narrowed to its address.
+    /// The origin at `base` (`http://host:port[/prefix]` or `https://host[:port][/prefix]`),
+    /// the network narrowed to its address. For `https://` (R2/S3/static HTTPS origins), builds a
+    /// pooled keep-alive `blaze-http` client with verified system TLS roots (no fallback on TLS
+    /// setup or handshake failure, rule 3).
     fn of(base: &str, net: &Net) -> Result<HttpAt, CliError> {
-        let base = Url::parse(base.trim_end_matches('/')).map_err(|_| CliError::Usage("--origin http://: not a URL"))?;
-        let origin = base.origin().ok_or(CliError::Usage("--origin http://: the URL names no host"))?;
+        let trimmed = base.trim_end_matches('/');
+        let is_https = trimmed.starts_with("https://");
+        let parsed = Url::parse(trimmed).map_err(|_| CliError::Usage("--origin http(s)://: not a URL"))?;
+        let origin = parsed.origin().ok_or(CliError::Usage("--origin http(s)://: the URL names no host"))?;
         // clone: the origin's address, a refcount.
         let net = net.connect_only(&Addr::Tcp(origin.at().clone()));
-        Ok(HttpAt { base, net })
+        #[cfg(not(feature = "fetch"))]
+        {
+            if is_https {
+                return Err(CliError::Usage("--origin https:// requires blaze built with the `fetch` (HTTPS/TLS) feature"));
+            }
+            Ok(HttpAt { base: parsed, net })
+        }
+        #[cfg(feature = "fetch")]
+        {
+            let pooled = if is_https {
+                let places = blaze_http::roots::Places { cert_file: None, cert_dir: None };
+                let tls = blaze_http::roots::system(places).map_err(|e| CliError::Remote(RemoteError::Tls(own_msg(e))))?;
+                let proxies = blaze_http::proxy_env::from_env().map_err(|e| CliError::Remote(RemoteError::Proxy(own_msg(e))))?;
+                let config = blaze_http::Config {
+                    idle_most: ORIGIN_IN_FLIGHT,
+                    proxies,
+                    redirects: 0,
+                    ..blaze_http::Config::new(tls, ORIGIN_WIRE.user_agent, ORIGIN_WIRE.wait_most)
+                };
+                let handle = blaze_http::driver::Handle::spawn(blaze_http::Client::new(config), ORIGIN_IN_FLIGHT)
+                    .map_err(|e| CliError::Remote(RemoteError::Driver(own_msg(e))))?;
+                Some(PooledHttp { handle, https_only: true })
+            } else {
+                None
+            };
+            Ok(HttpAt { base: parsed, net, pooled })
+        }
     }
 }
 
@@ -1489,37 +1550,243 @@ const ORIGIN_WIRE: Wire = Wire {
     redirects: NO_REDIRECTS,
 };
 
-/// An `http://` origin: each ask one ranged GET of `<base>/<object name>` through bstd's
-/// `Http` over its `Net` (D63; remote-read.md, "HTTP in the tree"). bstd holds the reply to the
-/// ask's length before a byte past it is taken, takes only a `206` of exactly the range asked
-/// (blaze-h1's `Response::ranged`), refuses a redirect (`NO_REDIRECTS`) and bounds every wait;
-/// its simulation names each refusal (blaze-std tests/requests_servers.rs). A 404 is `Missing`,
-/// a 416 (asked past the object's end) no bytes, anything else `Unreadable`. Nothing here
-/// trusts the bytes: the read machine checks the signed head and the digest chain.
+/// An `http://` or `https://` origin: each ask one ranged GET of `<base>/<object name>`.
+///
+/// - For `https://` (R2/S3/static HTTPS origins under `feature = "fetch"`): dispatches over the
+///   origin's shared pooled keep-alive `blaze-http` client (verified TLS roots, `https_only: true`,
+///   `redirects: 0`, up to [`ORIGIN_IN_FLIGHT`] concurrent ranged GETs in [`Origin::read_batch`]).
+///   TLS handshake/verification failures return typed `OriginError::Unreadable` with zero fallback.
+/// - For `http://` (and simulated single-lane tests via [`HttpOrigin::read_with`]): uses bstd's
+///   `Http` over its `Net`.
+///
+/// A 404 is `Missing`, a 416 (asked past the object's end) no bytes, anything else `Unreadable`.
+/// Nothing here trusts the bytes: the read machine / take verifies the signed head and digest chain.
 struct HttpOrigin<'o> {
     cx: &'o Cx,
     at: &'o HttpAt,
-    /// bstd's client, reaching the origin's address alone.
+    clock: &'o Clock,
+    /// bstd's client, reaching the origin's address alone (used for `http://` and simulated tests).
     http: Http,
     /// The URL's text, reused from ask to ask.
-    url: blaze_own::Vec<u8, Global>,
+    url: blaze_own::Vec<u8, blaze_mem::Kept>,
 }
 
 impl<'o> HttpOrigin<'o> {
-    fn new(cx: &'o Cx, at: &'o HttpAt, clock: &Clock) -> HttpOrigin<'o> {
-        // No TLS yet (`https://` is refused where the origin is named), so no roots are trusted.
+    fn new(cx: &'o Cx, at: &'o HttpAt, clock: &'o Clock) -> HttpOrigin<'o> {
         let http = Http::over(&at.net, clock, &Roots::none(), ORIGIN_WIRE);
         let http = match at.base.origin() {
             Some(origin) => http.only(origin),
             None => http,
         };
-        HttpOrigin { cx, at, http, url: blaze_own::Vec::new_in(Global) }
+        HttpOrigin { cx, at, clock, http, url: blaze_own::Vec::new_in(blaze_mem::Kept(blaze_mem::Tag::Store)) }
+    }
+}
+
+#[cfg(feature = "fetch")]
+fn apply_ranged_fetched(at: u64, into: &mut [u8], fetched: blaze_http::driver::Fetched) -> Result<usize, OriginError> {
+    match fetched {
+        blaze_http::driver::Fetched::Answered { status: 206, headers, body, .. } => {
+            // Verify `Content-Range: bytes <at>-...` starts at the exact offset requested so a
+            // misbehaving origin or proxy cannot silently shift the returned slice.
+            let range_ok = headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("content-range"))
+                .and_then(|(_, v)| v.trim().strip_prefix("bytes "))
+                .and_then(|v| v.split_once('-'))
+                .and_then(|(first, _)| first.parse::<u64>().ok())
+                .is_some_and(|first| first == at);
+            if !range_ok || body.len() > into.len() {
+                return Err(OriginError::Unreadable);
+            }
+            let got = body.len();
+            if let Some(dst) = into.get_mut(..got) {
+                dst.copy_from_slice(body.as_slice());
+                Ok(got)
+            } else {
+                Err(OriginError::Unreadable)
+            }
+        }
+        blaze_http::driver::Fetched::Answered { status: 404, .. } => Err(OriginError::Missing),
+        blaze_http::driver::Fetched::Answered { status: 416, .. } => Ok(0),
+        // 200 on a ranged read, TLS verification/handshake failure, timeout, or any other status:
+        // typed refusal, never silently downgraded or retried (rule 3).
+        blaze_http::driver::Fetched::Answered { .. }
+        | blaze_http::driver::Fetched::Failed(_)
+        | blaze_http::driver::Fetched::TimedOut => Err(OriginError::Unreadable),
+    }
+}
+
+impl HttpOrigin<'_> {
+    fn now_ns(&self) -> u64 {
+        u64::try_from(self.clock.now().since_start().as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    #[cfg(feature = "fetch")]
+    fn build_pooled_request<A: core::alloc::Allocator>(
+        base: &Url,
+        url_buf: &mut blaze_own::Vec<u8, A>,
+        object: &Object,
+        at: u64,
+        len: usize,
+        https_only: bool,
+    ) -> Result<blaze_http::Request, OriginError> {
+        let name = object.name();
+        url_buf.clear();
+        for part in [base.as_str().as_bytes(), b"/", name.as_str().as_bytes()] {
+            url_buf.try_extend_from_slice(part).map_err(|_| OriginError::Unreadable)?;
+        }
+        let text = core::str::from_utf8(url_buf.as_slice()).map_err(|_| OriginError::Unreadable)?;
+        let len_u64 = u64::try_from(len).map_err(|_| OriginError::Unreadable)?;
+        let last = at.checked_add(len_u64.saturating_sub(1)).ok_or(OriginError::Unreadable)?;
+        Ok(blaze_http::Request {
+            method: blaze_http::Method::Get,
+            url: text.into(),
+            range: Some(blaze_http::Range { first: at, last: Some(last) }),
+            headers: Default::default(),
+            body: Default::default(),
+            gzip: false,
+            most: len_u64,
+            https_only,
+        })
+    }
+
+    #[cfg(feature = "fetch")]
+    fn read_pooled(&mut self, pooled: &PooledHttp, object: &Object, at: u64, into: &mut [u8], deadline_ns: u64) -> Result<usize, OriginError> {
+        if into.is_empty() {
+            return Ok(0);
+        }
+        let req = Self::build_pooled_request(&self.at.base, &mut self.url, object, at, into.len(), pooled.https_only)?;
+        let now = self.now_ns();
+        let allowed = Duration::from_nanos(deadline_ns.saturating_sub(now));
+        let (tx, rx) = blaze_core::chan::bounded(1);
+        pooled.handle.fetch(req, allowed, 0, &tx);
+        match blaze_http::mailbox::answer("the origin's HTTPS answer", &rx, allowed.saturating_add(ORIGIN_ANSWER_SLACK)) {
+            Ok(Some((_, fetched))) => apply_ranged_fetched(at, into, fetched),
+            Ok(None) | Err(_) => Err(OriginError::Unreadable),
+        }
+    }
+
+    #[cfg(feature = "fetch")]
+    fn read_batch_pooled(
+        &mut self,
+        pooled: &PooledHttp,
+        reads: &mut [BatchRead<'_>],
+        clock: &mut dyn FnMut() -> u64,
+        outcomes: &mut [BatchOutcome],
+    ) {
+        let total = reads.len().min(outcomes.len());
+        let mut offset = 0usize;
+        while offset < total {
+            let chunk_len = (total - offset).min(ORIGIN_IN_FLIGHT);
+            let Some(req_chunk) = reads.get_mut(offset..offset + chunk_len) else { break };
+            let Some(out_chunk) = outcomes.get_mut(offset..offset + chunk_len) else { break };
+            let (tx, rx) = blaze_core::chan::bounded(chunk_len);
+            let mut done = [false; ORIGIN_IN_FLIGHT];
+            let mut in_flight = 0usize;
+            let now = clock();
+
+            for (i, req) in req_chunk.iter().enumerate() {
+                if req.into.is_empty() {
+                    if let Some(slot) = out_chunk.get_mut(i) {
+                        *slot = BatchOutcome { result: Ok(0), at_ns: now };
+                    }
+                    if let Some(flag) = done.get_mut(i) {
+                        *flag = true;
+                    }
+                    continue;
+                }
+                match Self::build_pooled_request(&self.at.base, &mut self.url, &req.object, req.at, req.into.len(), pooled.https_only) {
+                    Ok(http_req) => {
+                        let allowed = Duration::from_nanos(req.deadline_ns.saturating_sub(now));
+                        let key = u64::try_from(i).unwrap_or(0);
+                        pooled.handle.fetch(http_req, allowed, key, &tx);
+                        in_flight += 1;
+                    }
+                    Err(err) => {
+                        if let Some(slot) = out_chunk.get_mut(i) {
+                            *slot = BatchOutcome { result: Err(err), at_ns: now };
+                        }
+                        if let Some(flag) = done.get_mut(i) {
+                            *flag = true;
+                        }
+                    }
+                }
+            }
+
+            while in_flight > 0 {
+                let earliest = req_chunk
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| !done.get(*i).copied().unwrap_or(true))
+                    .map(|(_, req)| req.deadline_ns)
+                    .min()
+                    .unwrap_or_else(|| clock());
+                let wait = Duration::from_nanos(earliest.saturating_sub(clock())).saturating_add(ORIGIN_ANSWER_SLACK);
+                match blaze_http::mailbox::answer("the origin's HTTPS batch answers", &rx, wait) {
+                    Ok(Some((key, fetched))) => {
+                        let at_ns = clock();
+                        if let Ok(idx) = usize::try_from(key)
+                            && idx < chunk_len
+                            && !done.get(idx).copied().unwrap_or(true)
+                        {
+                            let result = match req_chunk.get_mut(idx) {
+                                Some(req) => apply_ranged_fetched(req.at, req.into, fetched),
+                                None => Err(OriginError::Unreadable),
+                            };
+                            if let Some(slot) = out_chunk.get_mut(idx) {
+                                *slot = BatchOutcome { result, at_ns };
+                            }
+                            if let Some(flag) = done.get_mut(idx) {
+                                *flag = true;
+                            }
+                            in_flight -= 1;
+                        }
+                    }
+                    Ok(None) | Err(_) => {
+                        let failed_at = clock();
+                        for i in 0..chunk_len {
+                            if !done.get(i).copied().unwrap_or(true) {
+                                if let Some(slot) = out_chunk.get_mut(i) {
+                                    *slot = BatchOutcome { result: Err(OriginError::Unreadable), at_ns: failed_at };
+                                }
+                                if let Some(flag) = done.get_mut(i) {
+                                    *flag = true;
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            offset += chunk_len;
+        }
     }
 }
 
 impl Origin for HttpOrigin<'_> {
     fn read(&mut self, object: &Object, at: u64, into: &mut [u8], deadline_ns: u64) -> Result<usize, OriginError> {
+        #[cfg(feature = "fetch")]
+        if let Some(pooled) = &self.at.pooled {
+            return self.read_pooled(pooled, object, at, into, deadline_ns);
+        }
         self.read_with(object, at, into, deadline_ns, |_| {})
+    }
+
+    fn read_batch(
+        &mut self,
+        reads: &mut [BatchRead<'_>],
+        clock: &mut dyn FnMut() -> u64,
+        outcomes: &mut [BatchOutcome],
+    ) {
+        #[cfg(feature = "fetch")]
+        if let Some(pooled) = &self.at.pooled {
+            self.read_batch_pooled(pooled, reads, clock, outcomes);
+            return;
+        }
+        for (req, out) in reads.iter_mut().zip(outcomes.iter_mut()) {
+            let result = self.read(&req.object, req.at, req.into, req.deadline_ns);
+            *out = BatchOutcome { result, at_ns: clock() };
+        }
     }
 }
 

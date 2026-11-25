@@ -1,7 +1,8 @@
 //! A commit's files: its tree walked from an [`Index`](crate::Index), each file handed out with its path,
 //! mode and the blob to read. A name that could leave the checkout or mean something to git (`..`, `.`, `.git`
-//! in any case, a `/` or `\`, not UTF-8) is refused naming its path, as is a submodule (a
-//! gitlink), which needs a second fetch this walk does not make.
+//! in any case, a `/` or `\`, not UTF-8) is refused naming its path. A submodule (mode `0o160000`,
+//! a gitlink) is handed out as [`Mode::Submodule`] carrying its pinned commit [`Oid`] with
+//! `object: None`, since its commit lives in another repository rather than this pack.
 
 #![blaze::sans_io]
 
@@ -40,9 +41,12 @@ pub enum Mode {
     Exec,
     /// A symbolic link: its bytes are the target, for the caller to check before making it.
     Symlink,
+    /// A gitlink (mode `0o160000`): a submodule pinned to `oid` in another repository.
+    /// There is no blob in this pack (`File::object` is `None`).
+    Submodule,
 }
 
-/// One file of the tree.
+/// One file (or gitlink submodule) of the tree.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct File<'a> {
     /// `/`-separated, relative, each part checked.
@@ -50,7 +54,8 @@ pub struct File<'a> {
     pub mode: Mode,
     pub oid: Oid,
     /// The blob: its size, and what [`Index::read`](crate::Index::read) takes.
-    pub object: Found,
+    /// `None` for [`Mode::Submodule`].
+    pub object: Option<Found>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -66,8 +71,6 @@ pub enum TreeWhy {
     /// A name that is empty, `.`, `..`, `.git`, holds `/` or `\`, or is not UTF-8.
     Name,
     Mode { mode: u32 },
-    /// A gitlink: a submodule's commit.
-    Submodule,
     PathOver { most: u16 },
     FilesOver { most: u32 },
     DepthOver { most: u16 },
@@ -85,6 +88,10 @@ pub struct TreeError {
 }
 
 impl TreeError {
+    pub fn new_for_store(path: &[u8], why: TreeWhy) -> TreeError {
+        TreeError::new(path, why)
+    }
+
     fn new(path: &[u8], why: TreeWhy) -> TreeError {
         let mut copy = [0u8; 96];
         let len = path.len().min(96);
@@ -114,8 +121,7 @@ impl fmt::Display for TreeError {
             TreeWhy::Commit => f.write_str("the commit has no tree"),
             TreeWhy::Entry => f.write_str("a tree entry with no `mode name\\0id` shape"),
             TreeWhy::Name => f.write_str("a name that is empty, `.`, `..` or `.git`, holds a slash, or is not UTF-8"),
-            TreeWhy::Mode { mode } => write!(f, "mode {mode:o}, no file, link or directory"),
-            TreeWhy::Submodule => f.write_str("a submodule, which this fetch does not follow"),
+            TreeWhy::Mode { mode } => write!(f, "mode {mode:o}, no file, link, submodule or directory"),
             TreeWhy::PathOver { most } => write!(f, "a path longer than the most allowed, {most} bytes"),
             TreeWhy::FilesOver { most } => write!(f, "more files than the most allowed, {most}"),
             TreeWhy::DepthOver { most } => write!(f, "directories deeper than the most allowed, {most}"),
@@ -138,6 +144,77 @@ struct Open<B: Allocator> {
     tree: Vec<u8, B>,
     pos: usize,
     path_len: usize,
+}
+
+/// Walks `commit`'s tree using `read_object` (which reads `Kind::Commit` and `Kind::Tree` objects
+/// by their verified [`Oid`]) and invokes `visit(path, mode, oid)` for every file entry in
+/// deterministic git tree order. Shares the exact entry parsing, path validation, and limits
+/// enforcement with [`files`].
+pub fn walk_with<B: Allocator + Copy>(
+    commit: Oid,
+    limits: Limits,
+    alloc: B,
+    mut read_object: impl FnMut(Oid, Kind, &[u8], &mut Vec<u8, B>) -> Result<(), TreeError>,
+    mut visit: impl FnMut(&str, Mode, Oid) -> Result<(), TreeError>,
+) -> Result<(), TreeError> {
+    let at_root = |why| TreeError::new(b"", why);
+    let mut body = Vec::new_in(alloc);
+    read_object(commit, Kind::Commit, b"", &mut body)?;
+    let hex = body.strip_prefix(b"tree ").and_then(|rest| rest.get(..40)).ok_or(at_root(TreeWhy::Commit))?;
+    let root = Oid::parse_hex(hex).ok_or(at_root(TreeWhy::Commit))?;
+    drop(body);
+    let mut path: Vec<u8, B> = Vec::new_in(alloc);
+    let mut stack: Vec<Open<B>, B> = Vec::new_in(alloc);
+    let mut tree = Vec::new_in(alloc);
+    read_object(root, Kind::Tree, b"", &mut tree)?;
+    stack.try_push(Open { tree, pos: 0, path_len: 0 }).map_err(|r| at_root(TreeWhy::Alloc(r.why)))?;
+    let mut count = 0u32;
+    while let Some(top) = stack.last_mut() {
+        if top.pos == top.tree.len() {
+            stack.pop();
+            continue;
+        }
+        let base = top.path_len;
+        path.truncate(base);
+        let slice = top.tree.get(top.pos..).unwrap_or(&[]);
+        let (mode, name, oid, next) = entry(slice).ok_or(TreeError::new(&path, TreeWhy::Entry))?;
+        top.pos += next;
+        if base > 0 {
+            path.try_push(b'/').map_err(|r| TreeError::new(&[], TreeWhy::Alloc(r.why)))?;
+        }
+        path.try_extend_from_slice(name).map_err(|e| TreeError::new(&[], TreeWhy::Alloc(e)))?;
+        let refuse = |why| TreeError::new(&path, why);
+        if !good_name(name, blaze_own::planted::NoPlant) {
+            return Err(refuse(TreeWhy::Name));
+        }
+        if path.len() > usize::from(limits.most_path) {
+            return Err(refuse(TreeWhy::PathOver { most: limits.most_path }));
+        }
+        let mode = match mode {
+            0o040000 => {
+                if stack.len() > usize::from(limits.most_depth) {
+                    return Err(refuse(TreeWhy::DepthOver { most: limits.most_depth }));
+                }
+                let mut tree = Vec::new_in(alloc);
+                read_object(oid, Kind::Tree, &path, &mut tree)?;
+                let len = path.len();
+                stack.try_push(Open { tree, pos: 0, path_len: len }).map_err(|r| refuse(TreeWhy::Alloc(r.why)))?;
+                continue;
+            }
+            0o100644 | 0o100664 => Mode::File,
+            0o100755 => Mode::Exec,
+            0o120000 => Mode::Symlink,
+            0o160000 => Mode::Submodule,
+            mode => return Err(refuse(TreeWhy::Mode { mode })),
+        };
+        count += 1;
+        if count > limits.most_files {
+            return Err(refuse(TreeWhy::FilesOver { most: limits.most_files }));
+        }
+        let text = core::str::from_utf8(&path).map_err(|_| refuse(TreeWhy::Name))?;
+        visit(text, mode, oid)?;
+    }
+    Ok(())
 }
 
 /// Every file of `commit`'s tree, handed to `visit` in tree order: its path, mode and the
@@ -198,16 +275,19 @@ pub fn files<A: Allocator + Clone, B: Allocator + Clone, P: Planted<GitFetchPlan
             0o100644 | 0o100664 => Mode::File,
             0o100755 => Mode::Exec,
             0o120000 => Mode::Symlink,
-            0o160000 => return Err(refuse(TreeWhy::Submodule)),
+            0o160000 => Mode::Submodule,
             mode => return Err(refuse(TreeWhy::Mode { mode })),
         };
         count += 1;
         if count > limits.most_files {
             return Err(refuse(TreeWhy::FilesOver { most: limits.most_files }));
         }
-        let found = find(index, oid, Kind::Blob, &path)?;
+        let object = match mode {
+            Mode::Submodule => None,
+            Mode::File | Mode::Exec | Mode::Symlink => Some(find(index, oid, Kind::Blob, &path)?),
+        };
         let text = core::str::from_utf8(&path).map_err(|_| refuse(TreeWhy::Name))?;
-        visit(File { path: text, mode, oid, object: found });
+        visit(File { path: text, mode, oid, object });
     }
     Ok(())
 }

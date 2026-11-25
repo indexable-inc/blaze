@@ -178,9 +178,11 @@ fn member_lens(items: &ItemsRecord<'_>, g: blaze_own::Alloc<'static>) -> Vec<(It
 /// A run's frame: its records' decoded parts and its bodies' lowerings (reserved, not touched).
 const BODIES_FRAME: usize = 1 << 30;
 
-/// Direct single-pass listing of a member crate's owed files from `items`, identical in output to
-/// `list_files_with(records, Listing::FnsAndInitializers, owed_files, alloc)` without doing 3
-/// binary searches per item across the entire crate (skips non-owed items in 1 column load).
+/// Direct single-pass listing of a member crate's owed files' file-entry bodies from `items`,
+/// sorted by `(file, body)`: identical to filtering `list_files_with(records,
+/// Listing::FnsAndInitializers, owed_files, alloc)` to `entry.is_some()` and sorting by file,
+/// without redundant `place_of` binary searches or a second copy/sort (`owed_files` must be
+/// sorted ascending).
 fn list_owed_files<'n, 'a>(
     records: &'n blaze_ladder::front2::source::Records<'n>,
     items: &ItemsRecord<'_>,
@@ -193,6 +195,7 @@ fn list_owed_files<'n, 'a>(
     use blaze_scope::resolve::At;
     use blaze_surface::ItemKind;
 
+    let single_file = if owed_files.len() == 1 { owed_files.first().copied() } else { None };
     let mut files: blaze_own::AVec<'a, (u32, Option<&'n str>)> = blaze_own::AVec::with_capacity_in(owed_files.len(), alloc);
     let mut start_in = |file: u32, text: &str| -> Option<u32> {
         let base = match files.iter().find(|(f, _)| *f == file) {
@@ -219,7 +222,11 @@ fn list_owed_files<'n, 'a>(
     for idx in 0..items.items() {
         let Ok(Some(id)) = items.identity_at(idx) else { continue };
         let Some(At::File(file)) = id.at else { continue };
-        if !owed_files.contains(&file) {
+        let wanted = match single_file {
+            Some(only) => file == only,
+            None => owed_files.binary_search(&file).is_ok(),
+        };
+        if !wanted {
             continue;
         }
         let key = id.key;
@@ -230,38 +237,30 @@ fn list_owed_files<'n, 'a>(
                 if !value && it.text.trim_end().ends_with(';') {
                     continue;
                 }
-                let place = NamesSource::place_of(records, key);
-                let file_entry = place.and_then(|p| match p.at {
-                    At::File(f) => Some((f, p.item)),
-                    At::Expansion(_) => None,
-                });
-                let at = file_entry.and_then(|(f, _)| start_in(f, it.text).map(|start| BodyAt { file: f, start }));
-                let entry = if at.is_some() { file_entry } else { None };
-                out.push(Listed { body: BodyRef::Free(key), at, entry });
+                let Some(start) = start_in(file, it.text) else { continue };
+                out.push(Listed { body: BodyRef::Free(key), at: Some(BodyAt { file, start }), entry: Some((file, it.item)) });
             }
             ItemKind::Impl | ItemKind::Trait => {
-                let container_file = NamesSource::place_of(records, key).and_then(|p| match p.at {
-                    At::File(f) => Some(f),
-                    At::Expansion(_) => None,
-                });
                 let is_trait = id.kind == ItemKind::Trait;
                 NamesSource::each_member(records, key, &mut |m| {
                     members.push(m.key);
-                    let member = match (m.kind, m.name) {
+                    if m.written_by.is_some() {
+                        return;
+                    }
+                    let (kind, name) = match (m.kind, m.name) {
                         (ItemKind::Function, Some(name)) => (MemberKind::Fn, name),
                         (ItemKind::Const, Some(name)) => (MemberKind::Const, name),
                         _ => return,
                     };
-                    let (kind, name) = member;
                     if is_trait && kind == MemberKind::Fn && m.text.trim_end().ends_with(';') {
                         return;
                     }
-                    let at = container_file.and_then(|f| start_in(f, m.text).map(|start| BodyAt { file: f, start }));
-                    let entry = match (at, m.written_by) {
-                        (Some(at), None) => Some((at.file, m.item)),
-                        _ => None,
-                    };
-                    out.push(Listed { body: BodyRef::Member { container: key, is_trait, kind, name }, at, entry });
+                    let Some(start) = start_in(file, m.text) else { return };
+                    out.push(Listed {
+                        body: BodyRef::Member { container: key, is_trait, kind, name },
+                        at: Some(BodyAt { file, start }),
+                        entry: Some((file, m.item)),
+                    });
                 });
             }
             _ => {}
@@ -269,7 +268,7 @@ fn list_owed_files<'n, 'a>(
     }
     members.sort_unstable();
     out.retain(|l| !matches!(l.body, BodyRef::Free(k) if members.binary_search(&k).is_ok()));
-    out.sort_unstable_by(|a, b| a.body.cmp(&b.body));
+    out.sort_unstable_by(|a, b| a.entry.map(|(f, _)| f).cmp(&b.entry.map(|(f, _)| f)).then_with(|| a.body.cmp(&b.body)));
     out
 }
 
@@ -631,10 +630,12 @@ fn ns_between(from: bstd::clock::Instant, to: bstd::clock::Instant) -> u64 {
     to.since(from).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
 }
 
-/// One clean body's typed record in the phase's arena, put by [`BodiesStage::run_phase`] under
-/// `engine_body_record::typed_key(bytes)`, its key named by `check`'s run facts.
+/// One clean body's typed record in the phase's arena, hashed on its Bodies worker
+/// (`engine_body_record::typed_key(bytes)`) and put by [`BodiesStage::run_phase`], its key named
+/// by `check`'s run facts.
 struct TypedPut<'a> {
     check: Name,
+    key: Key,
     bytes: SVec<'a, u8>,
 }
 
@@ -675,11 +676,36 @@ pub(crate) struct RunOut<'a> {
     /// `DataCell::Followed`), its path and the answer the body saw: the leaf rows the request
     /// saves so the sweep follows them ([`BodiesStage::data_files`]).
     data_files: SVec<'a, (blaze_own::String<SharedAlloc<'a>>, ContentId)>,
+    /// Pre-encoded run-facts payloads (`engine_body_facts::write`) built on Bodies workers for
+    /// whole (unsliced) entries so coordinator merge skips per-body cover sorting and encoding.
+    facts_bytes: SVec<'a, u8>,
+    /// `(row_index, from, to)` slices in `facts_bytes`, in ascending `row_index` order.
+    facts_index: SVec<'a, (usize, u32, u32)>,
+    /// First `engine_body_facts::write` error observed on a worker, surfaced at merge.
+    facts_error: Option<(Name, crate::engine_body_facts::BodyFactsError)>,
 }
 
 impl<'a> RunOut<'a> {
     fn new(alloc: SharedAlloc<'a>) -> RunOut<'a> {
-        RunOut { found: SVec::new_in(alloc), messages: SVec::new_in(alloc), notes: SVec::new_in(alloc), locals: SVec::new_in(alloc), clean: 0, items: 0, item_tasks: 0, outs: SVec::new_in(alloc), scratch_most: 0, frames: FramesHeld::default(), typed: SVec::new_in(alloc), untyped_clean: 0, setup: StretchSetup::default(), data_files: SVec::new_in(alloc) }
+        RunOut {
+            found: SVec::new_in(alloc),
+            messages: SVec::new_in(alloc),
+            notes: SVec::new_in(alloc),
+            locals: SVec::new_in(alloc),
+            clean: 0,
+            items: 0,
+            item_tasks: 0,
+            outs: SVec::new_in(alloc),
+            scratch_most: 0,
+            frames: FramesHeld::default(),
+            typed: SVec::new_in(alloc),
+            untyped_clean: 0,
+            setup: StretchSetup::default(),
+            data_files: SVec::new_in(alloc),
+            facts_bytes: SVec::new_in(alloc),
+            facts_index: SVec::new_in(alloc),
+            facts_error: None,
+        }
     }
 }
 
@@ -711,6 +737,13 @@ const SCRATCH_KEEP: usize = 8 << 20;
 const HEADS_STRETCH_FRAME: usize = 512 << 20;
 const HEADS_STRETCH_CAP: usize = 64 << 20;
 const HEADS_STRETCH_KEEP: usize = 8 << 20;
+
+/// Virtual address-space reservation for a Bodies worker's reusable dependency-head freeze
+/// scratch frame ([`LazyBodySeed`]'s `SeededHeads`), reset and trimmed back to
+/// [`FREEZE_SCRATCH_KEEP`] after every freeze call so cold dependency head freezes never churn
+/// the `Global` heap.
+const FREEZE_SCRATCH: usize = 256 << 20;
+const FREEZE_SCRATCH_KEEP: usize = 4 << 20;
 
 /// What the runs' frames held committed (rule 16): the scratch's most at a body's end, the
 /// stretch frame's most at a stretch's end, the stretch heads frame's most, and how many times a
@@ -2073,7 +2106,7 @@ fn body_subject<'p>(one: &Ran<'_>, name: Name, base: Name, outlined: &[Outlined<
 /// `Unchecked` note is `TYPES_NOT_CHECKED`, a `BorrowsUnchecked` one `BORROWS_NOT_CHECKED`, and
 /// every refusal, panic, frame refusal and task fault `work::NOT_RUN` (those notes carry no rule
 /// number of their own). A body with no note that did not run is `NOT_RUN` too.
-fn note_rule(said: Option<&Said<&str>>, checked: bool) -> Option<u16> {
+fn note_rule<E>(said: Option<&Said<E>>, checked: bool) -> Option<u16> {
     match said {
         Some(Said::Unchecked { .. }) => Some(crate::body_types::TYPES_NOT_CHECKED),
         Some(Said::BorrowsUnchecked(_)) => Some(crate::body_types::BORROWS_NOT_CHECKED),
@@ -3270,11 +3303,26 @@ impl<'s, 'f, 'r> Prepared<'s, 'f, 'r> {
         }
         let mut entries: SVec<'a, &[One<'f>]> = SVec::with_capacity_in(runs.len(), alloc);
         let mut buffers: SVec<'a, (Buffer<'a>, SVec<'a, Ran<'f>>, RunOut<'a>)> = SVec::with_capacity_in(runs.len(), alloc);
+        let ones_by_name: Option<SVec<'a, (Name, usize)>> = if self.ones.len() > 8 && runs.len() > 1 {
+            let mut idx: SVec<'a, (Name, usize)> = SVec::with_capacity_in(self.ones.len(), alloc);
+            idx.extend(self.ones.iter().enumerate().map(|(at, one)| (one.task.planned.name, at)));
+            idx.sort_unstable_by_key(|&(name, _)| name);
+            Some(idx)
+        } else {
+            None
+        };
         for run in runs.into_iter() {
             stage.seeds.add(&run.tally);
             times.job(crate::engine_times::Step::BodiesRun, run.span.0, run.span.1);
             // The run's one entry: its body's `One` (`run_body` runs one, never a slice).
-            let one = run.ran.first().and_then(|ran| self.ones.iter().find(|one| one.task.planned.name == ran.name));
+            let one = run.ran.first().and_then(|ran| match ones_by_name.as_ref() {
+                Some(idx) => idx
+                    .binary_search_by_key(&ran.name, |&(name, _)| name)
+                    .ok()
+                    .and_then(|pos| idx.get(pos))
+                    .and_then(|&(_, at)| self.ones.get(at)),
+                None => self.ones.iter().find(|one| one.task.planned.name == ran.name),
+            });
             entries.push(one.map_or(&[][..], core::slice::from_ref));
             buffers.push((run.out, run.ran, run.findings));
         }
@@ -4332,15 +4380,23 @@ impl<'f> BodiesStage<'f> {
             // `blaze run` builds from it.
             self.untyped_clean = self.untyped_clean.saturating_add(run_out.untyped_clean);
             self.setup.add(run_out.setup);
+            if let Some((body, why)) = run_out.facts_error {
+                return Err(EngineCheckError::BodyFacts { body, why: crate::engine_body_facts::MakeError::Bytes(why) }.into());
+            }
+            let preencoded = run_out.facts_index.len() == ran.len();
             typed_keys.clear();
             for one in run_out.typed.iter() {
-                let key = crate::engine_body_record::typed_key(&one.bytes);
+                let key = one.key;
                 store.put(cx, key, &one.bytes)?;
                 self.typed_bytes = self.typed_bytes.saturating_add(one.bytes.len() as u64);
                 self.typed.get_or_insert_with(|| Vec::new_in(heap.alloc())).push(key);
-                typed_keys.push((one.check, key));
+                if !preencoded {
+                    typed_keys.push((one.check, key));
+                }
             }
-            typed_keys.sort_unstable_by_key(|one| one.0);
+            if !preencoded {
+                typed_keys.sort_unstable_by_key(|one| one.0);
+            }
             self.items += run_out.items;
             self.item_tasks += run_out.item_tasks;
             // One copy of the run's messages. Each row addresses its contiguous findings in
@@ -4358,32 +4414,65 @@ impl<'f> BodiesStage<'f> {
                 findings.push(BodyFinding { rule, at, message: &messages[from..end] });
                 from = end;
             }
-            // Each body of the run: its class from its note and its findings' rules, its covered
-            // keys from the run's `One` of that name (a body in a run ran unless it has a note),
-            // and each fn declared in a body its check reached (`RunOut::locals`, in run order).
-            for (at, one) in ran.iter().enumerate() {
-                // Its bodies as a program calls them ([`asked_keys`]: a method by its member
-                // key), not each library key's first 16 bytes.
-                let asked: &[blaze_typeck::ItemKey] = runs[run_at].iter().find(|task| task.task.planned.name == one.name).map_or(&[], |task| task.asked);
-                let rules = run_out.found.iter().filter(|found| found.0 == at).map(|found| found.1);
-                let rule = note_rule(one.said(), true);
-                let class = crate::engine_body_facts::class_of(rule.into_iter().chain(rules));
-                let from = run_out.locals.partition_point(|local| local.0 < at);
-                let to = run_out.locals.partition_point(|local| local.0 <= at);
-                covers.clear();
-                covers.extend(asked.iter().map(|key| key.0.to_be_bytes()));
-                // A fn declared in a body is always `Free` (front2 tables/task.rs `locals`): its
-                // checker key is its library key's first 16 bytes (keys.rs `Keys::local`).
-                for item in run_out.locals[from..to].iter().map(|local| &local.1) {
-                    covers.push(blaze_ladder::front2::keys::checker_of(*item).0.to_be_bytes());
+            if preencoded {
+                let base = made.bytes.len();
+                made.bytes.extend_from_slice(&run_out.facts_bytes);
+                made.index.reserve(run_out.facts_index.len());
+                for &(at, from, to) in run_out.facts_index.iter() {
+                    if let Some(one) = ran.get(at) {
+                        let start = base.saturating_add(usize::try_from(from).unwrap_or(0));
+                        let end = base.saturating_add(usize::try_from(to).unwrap_or(0));
+                        made.index.push((one.name, u32::try_from(start).unwrap_or(u32::MAX), u32::try_from(end).unwrap_or(u32::MAX)));
+                    }
                 }
-                covers.sort_unstable();
-                covers.dedup();
-                let typed = typed_keys.binary_search_by_key(&one.name, |typed| typed.0).ok().map(|at| typed_keys[at].1);
-                let from = made.bytes.len();
-                crate::engine_body_facts::write(class, &covers, typed, &mut made.bytes)
-                    .map_err(|why| EngineCheckError::BodyFacts { body: one.name, why: crate::engine_body_facts::MakeError::Bytes(why) })?;
-                made.index.push((one.name, from as u32, made.bytes.len() as u32));
+            } else {
+                // Fallback path for sliced entries (`join_slices`) and runs with refused rows:
+                // reuse any pre-encoded row verbatim, and encode any remaining row here.
+                for (at, one) in ran.iter().enumerate() {
+                    if let Ok(idx) = run_out.facts_index.binary_search_by_key(&at, |entry| entry.0)
+                        && let Some(&(_, f, t)) = run_out.facts_index.get(idx)
+                        && let (Ok(fs), Ok(ts)) = (usize::try_from(f), usize::try_from(t))
+                        && let Some(slice) = run_out.facts_bytes.get(fs..ts)
+                    {
+                        let from = made.bytes.len();
+                        made.bytes.extend_from_slice(slice);
+                        let end = made.bytes.len();
+                        made.index.push((one.name, u32::try_from(from).unwrap_or(u32::MAX), u32::try_from(end).unwrap_or(u32::MAX)));
+                        continue;
+                    }
+                    // Its bodies as a program calls them ([`asked_keys`]: a method by its member
+                    // key), not each library key's first 16 bytes. Each run appends `Ran` rows in
+                    // exact `runs[run_at]` index order (0..len), so `runs[run_at][at]` is O(1).
+                    let run_tasks = runs.get(run_at).copied().unwrap_or(&[]);
+                    let matched = run_tasks.get(at).filter(|task| task.task.planned.name == one.name);
+                    debug_assert!(
+                        matched.is_some() || run_tasks.iter().all(|task| task.task.planned.name != one.name),
+                        "join_runs expected ran[{at}] ({:?}) to match runs[{run_at}][{at}]",
+                        one.name,
+                    );
+                    let asked: &[blaze_typeck::ItemKey] = matched.map_or(&[], |task| task.asked);
+                    let found_from = run_out.found.partition_point(|found| found.0 < at);
+                    let found_to = run_out.found.partition_point(|found| found.0 <= at);
+                    let rules = run_out.found.get(found_from..found_to).unwrap_or(&[]).iter().map(|found| found.1);
+                    let rule = note_rule(one.said(), true);
+                    let class = crate::engine_body_facts::class_of(rule.into_iter().chain(rules));
+                    let from = run_out.locals.partition_point(|local| local.0 < at);
+                    let to = run_out.locals.partition_point(|local| local.0 <= at);
+                    covers.clear();
+                    covers.extend(asked.iter().map(|key| key.0.to_be_bytes()));
+                    // A fn declared in a body is always `Free` (front2 tables/task.rs `locals`): its
+                    // checker key is its library key's first 16 bytes (keys.rs `Keys::local`).
+                    for item in run_out.locals[from..to].iter().map(|local| &local.1) {
+                        covers.push(blaze_ladder::front2::keys::checker_of(*item).0.to_be_bytes());
+                    }
+                    covers.sort_unstable();
+                    covers.dedup();
+                    let typed = typed_keys.binary_search_by_key(&one.name, |typed| typed.0).ok().map(|at| typed_keys[at].1);
+                    let from = made.bytes.len();
+                    crate::engine_body_facts::write(class, &covers, typed, &mut made.bytes)
+                        .map_err(|why| EngineCheckError::BodyFacts { body: one.name, why: crate::engine_body_facts::MakeError::Bytes(why) })?;
+                    made.index.push((one.name, u32::try_from(from).unwrap_or(u32::MAX), u32::try_from(made.bytes.len()).unwrap_or(u32::MAX)));
+                }
             }
             self.ran.extend(ran.drain(..));
         }
@@ -4601,6 +4690,16 @@ impl<'f> BodiesStage<'f> {
                 (_, crate::engine_member_rows::FileHead::Text(_) | crate::engine_member_rows::FileHead::NotOutlined) => None,
             }
         };
+        // Precomputed `(slot, outline_at)` pairs for the owed files, sorted by `slot`, so a
+        // member stood below its heads (`kept_below`) intersects its recorded held files with
+        // `owed` in O(held * log(owed)) without scanning `items.files()`.
+        let mut owed_slots: Vec<(Name, u32), blaze_own::Alloc<'static>> = Vec::with_capacity_in(owed.len(), g);
+        for &outline_at in owed.iter() {
+            if let Some(one) = usize::try_from(outline_at).ok().and_then(|at| handles.outlined.get(at)) {
+                owed_slots.push((one.name, outline_at));
+            }
+        }
+        owed_slots.sort_unstable_by_key(|&(slot, _)| slot);
         loop {
             if handles.board.stopping().is_some() {
                 return Ok(Err(("stopped by signal", &[])));
@@ -4704,39 +4803,80 @@ impl<'f> BodiesStage<'f> {
                     }
                 }
             }
-            // The member's files: what its module tree reaches from its root under what plan
-            // time knows of its `test` (engine_body_plan.rs `reached_under`), the walk the
-            // planner took (the `Owners` fact `check` reads, blaze-drive owners.rs): each is
-            // this member's, checked or refused by name, never in "no crate holds" (rule 3). The
-            // atom is the plan's (engine_plan_cfg.rs `test_atom`), not the script run's answer
-            // this stage has: the walk must be the plan's reach (below).
-            let cuts = plan_cuts.get_or_insert_with(|| crate::engine_plan_cfg::PlanCuts::of(handles.outlined, g));
             // Its found files beside its root (engine_body_plan.rs `FoundEdge`), as the plan's walk took them.
             let found = plan_reach.map_or(&[][..], |plan| plan.found_of(own_name));
-            let reach = crate::engine_body_plan::reached_under(handles.outlined, cuts, crate::engine_body_plan::root_file(&list, member), crate::engine_plan_cfg::test_atom(&list, member), found, g).map_err(EngineCheckError::Unoutlined)?;
-            // The plan named this unit's rows from its reach (engine_body_plan.rs `Reach`): the
-            // walk today must be that reach, or a row would be planned for a file it does not
-            // reach, or none for one it does (the ready plan's reach is the last members
-            // record's: a `mod` the edit moved is this stop, named, rule 3).
-            if let Some(file) = plan_reach.and_then(|plan| plan.disagrees(own_name, &reach)) {
-                return Err(EngineCheckError::ReadyHost {
-                    task: file,
-                    what: "a member's module tree reaches this file, or no longer reaches it, unlike the reach the plan named its body rows from (a `mod` moved since the reach was read: engine_body_plan.rs `Reach`)",
+            // When a member stood below its heads on turn 1 (`again.is_some()`), `stands_below`
+            // already proved its unit, tool, `CrateScope` record, and every moved file's
+            // `entries_of` (including `surface`, every `mod`, and every `#[cfg]`) match the
+            // members record. Unless `row_key_unit_only` is planted or `found` carries an edge
+            // outside the record, verify each recorded slot is outlined (preserving
+            // `ReadsNoVisitedTree`) and reuse the record's reach, held file map, and `row_key`
+            // instead of walking `reached_under` and scanning all `0..items.files()`.
+            let kept_below = match (again.is_some() && !row_key_unit_only, stood_view.as_ref().and_then(|view| view.member(place))) {
+                (true, Some(kept)) => match &kept.state {
+                    rec::MemberState::Held(held)
+                        if found.iter().all(|edge| held.held.iter().any(|h| h.slot == edge.file) || kept.not_held.iter().any(|slot| *slot == edge.file)) =>
+                    {
+                        Some((held, kept.not_held.as_slice()))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            let reach = if let Some((held, not_held)) = kept_below {
+                let root = crate::engine_body_plan::root_file(&list, member);
+                for h in held.held.iter() {
+                    if handles.outlined.binary_search_by(|one| one.name.cmp(&h.slot)).is_err() {
+                        return Err(EngineCheckError::Unoutlined(crate::engine_body_plan::Unoutlined { file: h.slot, root }).into());
+                    }
                 }
-                .into());
-            }
+                for &slot in not_held.iter() {
+                    if handles.outlined.binary_search_by(|one| one.name.cmp(&slot)).is_err() {
+                        return Err(EngineCheckError::Unoutlined(crate::engine_body_plan::Unoutlined { file: slot, root }).into());
+                    }
+                }
+                Vec::new_in(g)
+            } else {
+                // The member's files: what its module tree reaches from its root under what plan
+                // time knows of its `test` (engine_body_plan.rs `reached_under`), the walk the
+                // planner took (the `Owners` fact `check` reads, blaze-drive owners.rs): each is
+                // this member's, checked or refused by name, never in "no crate holds" (rule 3). The
+                // atom is the plan's (engine_plan_cfg.rs `test_atom`), not the script run's answer
+                // this stage has: the walk must be the plan's reach (below).
+                let cuts = plan_cuts.get_or_insert_with(|| crate::engine_plan_cfg::PlanCuts::of(handles.outlined, g));
+                let reach = crate::engine_body_plan::reached_under(handles.outlined, cuts, crate::engine_body_plan::root_file(&list, member), crate::engine_plan_cfg::test_atom(&list, member), found, g).map_err(EngineCheckError::Unoutlined)?;
+                // The plan named this unit's rows from its reach (engine_body_plan.rs `Reach`): the
+                // walk today must be that reach, or a row would be planned for a file it does not
+                // reach, or none for one it does (the ready plan's reach is the last members
+                // record's: a `mod` the edit moved is this stop, named, rule 3).
+                if let Some(file) = plan_reach.and_then(|plan| plan.disagrees(own_name, &reach)) {
+                    return Err(EngineCheckError::ReadyHost {
+                        task: file,
+                        what: "a member's module tree reaches this file, or no longer reaches it, unlike the reach the plan named its body rows from (a `mod` moved since the reach was read: engine_body_plan.rs `Reach`)",
+                    }
+                    .into());
+                }
+                reach
+            };
             // What the members record keeps of a visit: each held file's head parts and each
             // reached file it does not hold, in the order the claims are made.
             let mut held_kept: Vec<rec::Held<'_>, blaze_own::Alloc<'static>> = Vec::new_in(g);
             let mut not_held_kept: Vec<Name, blaze_own::Alloc<'static>> = Vec::new_in(g);
-            let mut refuse_all = |files: &[Name], why: &'static str, reads: &'f [CellId]| member_files.extend(files.iter().map(|file| FileClaim { file: *file, unit, is: FileIs::Refused(why), reads }));
+            let mut refuse_all = |kept_below: Option<(&rec::HeldMember<'_>, &[Name])>, files: &[Name], why: &'static str, reads: &'f [CellId]| {
+                if let Some((held, not_held)) = kept_below {
+                    member_files.extend(held.held.iter().map(|h| FileClaim { file: h.slot, unit, is: FileIs::Refused(why), reads }));
+                    member_files.extend(not_held.iter().map(|&file| FileClaim { file, unit, is: FileIs::Refused(why), reads }));
+                } else {
+                    member_files.extend(files.iter().map(|file| FileClaim { file: *file, unit, is: FileIs::Refused(why), reads }));
+                }
+            };
             let Some(own) = input_at(member) else {
                 // Its crate's own names failed (a build script, its resolution): that failure
                 // is the crate's `CrateScope` row, reported there once; its bodies say so. Read
                 // as it is today: no task defines the crate's names cell (ABSENT), or its task
                 // failed and defines none; the task that comes, or its fix, moves it.
                 let why = if names.failed(own_name) { rec::RefusedWhy::ScopeFailed } else { rec::RefusedWhy::NoNamesTask };
-                refuse_all(&reach, why.words().unwrap_or("its crate has no `Names` task this command (engine_names.rs `plan`)"), own_cells);
+                refuse_all(kept_below, &reach, why.words().unwrap_or("its crate has no `Names` task this command (engine_names.rs `plan`)"), own_cells);
                 if again.is_none() {
                     members_out.member(&rec::Member { at: place, unit: unit_val, state: rec::MemberState::Refused(why), not_held: reach });
                 }
@@ -4761,7 +4901,7 @@ impl<'f> BodiesStage<'f> {
                     Ok(records) => records,
                     Err(error) => {
                         let cause = ScopeRefusal::Records { krate, at: member, error };
-                        refuse_all(&reach, crate::engine_head_notes::leak(heap.alloc(), format_args!("its crate's check scope was not read: {cause}")), own_cells);
+                        refuse_all(kept_below, &reach, crate::engine_head_notes::leak(heap.alloc(), format_args!("its crate's check scope was not read: {cause}")), own_cells);
                         if again.is_none() {
                             members_out.member(&rec::Member { at: place, unit: unit_val, state: rec::MemberState::Refused(rec::RefusedWhy::Unstood), not_held: reach });
                         }
@@ -4776,7 +4916,7 @@ impl<'f> BodiesStage<'f> {
                         own_records
                     }
                     Err(cause) => {
-                        refuse_all(&reach, crate::engine_head_notes::leak(heap.alloc(), format_args!("its crate's check scope was not read: {cause}")), own_cells);
+                        refuse_all(kept_below, &reach, crate::engine_head_notes::leak(heap.alloc(), format_args!("its crate's check scope was not read: {cause}")), own_cells);
                         if again.is_none() {
                             members_out.member(&rec::Member { at: place, unit: unit_val, state: rec::MemberState::Refused(rec::RefusedWhy::Unstood), not_held: reach });
                         }
@@ -4805,54 +4945,71 @@ impl<'f> BodiesStage<'f> {
             let mut files: Vec<(u32, u32), Global> = Vec::new_in(Global);
             // Each file row's head, by index: what the member's listing row is keyed by besides
             // its names record (engine_member_rows.rs `row_key`).
-            let mut file_heads: Vec<crate::engine_member_rows::FileHead, blaze_own::Alloc<'static>> = Vec::with_capacity_in(items.files(), g);
-            for file in 0..u32::try_from(items.files()).unwrap_or(u32::MAX) {
-                if (file & 15) == 0 && handles.board.stopping().is_some() {
-                    return Ok(Err(("stopped by signal", &[])));
-                }
-                let head = 'head: {
-                    let Ok(Some(row)) = items.file_surface(file) else { break 'head crate::engine_member_rows::FileHead::NotOutlined };
-                    let Some(path) = row.path.in_package(list.shown_from(member), g) else { break 'head crate::engine_member_rows::FileHead::NotOutlined };
-                    let Some(path) = path.strip_prefix("/0/") else { break 'head crate::engine_member_rows::FileHead::NotOutlined };
-                    // The outline this unit reaches, of the file's outlines (one a name it is
-                    // planned by: a `mod x;` slot and a `#[path]` to `x/mod.rs` are two).
-                    let Some(at) = crate::engine_body_plan::outline_at_path(handles.outlined, path.as_bytes(), &reach) else {
-                        // A file the request has an outline of but did not read back (the ready
-                        // setup's, [`BodiesStage::unread_outlines`]): the phase path would match
-                        // it, so a `NotOutlined` head here would key the member's row apart from
-                        // the phase path's. The setup's typed refusal, never that row (rule 3).
-                        if S::STANDING
-                            && let Some(unread) = self.unread.as_ref()
-                            && let Some(file) = slot_names(path, g).into_iter().flatten().find(|name| unread.binary_search(name).is_ok())
-                        {
-                            let root = Name::file(list.root(member).strip_prefix("/0/").unwrap_or(list.root(member)).as_bytes());
-                            return Err(EngineCheckError::Unoutlined(crate::engine_body_plan::Unoutlined { file, root }).into());
-                        }
-                        break 'head crate::engine_member_rows::FileHead::NotOutlined
-                    };
-                    files.push((file, u32::try_from(at).unwrap_or(u32::MAX)));
-                    // A member visited at need (piece A) gave its head subjects at its first
-                    // turn, from the record: equal to these (its files' listing facts are).
-                    if again.is_none() {
-                        heads.push(crate::engine_heads::Subject::new(list.key(member).prefix(), file, &handles.outlined[at]));
-                    }
-                    crate::engine_member_rows::FileHead::of(&handles.outlined[at])
-                };
-                file_heads.push(head);
-            }
+            let mut file_heads: Vec<crate::engine_member_rows::FileHead, blaze_own::Alloc<'static>> = Vec::new_in(g);
             // The member's files this phase owes: the only ones outlined and keyed below.
             let mut owed_files: Vec<(u32, u32), blaze_own::Alloc<'static>> = Vec::new_in(g);
-            owed_files.extend(files.iter().copied().filter(|(_, outline)| owed.binary_search(outline).is_ok()));
             // THE MEMBER'S LISTING ROW (engine_member_rows.rs, D149 piece I1): what the rest of
             // its whole listing was for (the bodies a macro wrote, of blocks, the uncovered
             // note), keyed by its unit, its names record, its files' texts and the tool: all
             // known from its own names record, so its stored row is read before its scope is
             // asked for. Its snapshot's refusal is raised below, only where the row is asked of.
-            let row_key = if row_key_unit_only {
-                // The planted control: no names record's `out`, no file's head.
-                crate::engine_member_rows::row_key(&crate::engine_member_rows::RowKey { unit: own_name, names: Input { out: blaze_drive::key::ABSENT, ..own }, files: &[], tool: handles.tool })
+            let row_key = if let Some((held, _)) = kept_below {
+                for h in held.held.iter() {
+                    if let Ok(idx) = owed_slots.binary_search_by_key(&h.slot, |&(slot, _)| slot)
+                        && let Some(&(_, outline_at)) = owed_slots.get(idx)
+                    {
+                        owed_files.push((h.file, outline_at));
+                    }
+                }
+                held.row
             } else {
-                crate::engine_member_rows::row_key(&crate::engine_member_rows::RowKey { unit: own_name, names: own, files: &file_heads, tool: handles.tool })
+                file_heads.reserve(items.files());
+                for file in 0..u32::try_from(items.files()).unwrap_or(u32::MAX) {
+                    if (file & 15) == 0 && handles.board.stopping().is_some() {
+                        return Ok(Err(("stopped by signal", &[])));
+                    }
+                    let head = 'head: {
+                        let Ok(Some(row)) = items.file_surface(file) else { break 'head crate::engine_member_rows::FileHead::NotOutlined };
+                        let Some(path) = row.path.in_package(list.shown_from(member), g) else { break 'head crate::engine_member_rows::FileHead::NotOutlined };
+                        let Some(path) = path.strip_prefix("/0/") else { break 'head crate::engine_member_rows::FileHead::NotOutlined };
+                        // The outline this unit reaches, of the file's outlines (one a name it is
+                        // planned by: a `mod x;` slot and a `#[path]` to `x/mod.rs` are two).
+                        let Some(at) = crate::engine_body_plan::outline_at_path(handles.outlined, path.as_bytes(), &reach) else {
+                            // A file the request has an outline of but did not read back (the ready
+                            // setup's, [`BodiesStage::unread_outlines`]): the phase path would match
+                            // it, so a `NotOutlined` head here would key the member's row apart from
+                            // the phase path's. The setup's typed refusal, never that row (rule 3).
+                            if S::STANDING
+                                && let Some(unread) = self.unread.as_ref()
+                                && let Some(file) = slot_names(path, g).into_iter().flatten().find(|name| unread.binary_search(name).is_ok())
+                            {
+                                let root = Name::file(list.root(member).strip_prefix("/0/").unwrap_or(list.root(member)).as_bytes());
+                                return Err(EngineCheckError::Unoutlined(crate::engine_body_plan::Unoutlined { file, root }).into());
+                            }
+                            break 'head crate::engine_member_rows::FileHead::NotOutlined
+                        };
+                        files.push((file, u32::try_from(at).unwrap_or(u32::MAX)));
+                        // A member visited at need (piece A) gave its head subjects at its first
+                        // turn, from the record: equal to these (its files' listing facts are).
+                        if again.is_none()
+                            && let Some(one) = handles.outlined.get(at)
+                        {
+                            heads.push(crate::engine_heads::Subject::new(list.key(member).prefix(), file, one));
+                        }
+                        match handles.outlined.get(at) {
+                            Some(one) => crate::engine_member_rows::FileHead::of(one),
+                            None => crate::engine_member_rows::FileHead::NotOutlined,
+                        }
+                    };
+                    file_heads.push(head);
+                }
+                owed_files.extend(files.iter().copied().filter(|(_, outline)| owed.binary_search(outline).is_ok()));
+                if row_key_unit_only {
+                    // The planted control: no names record's `out`, no file's head.
+                    crate::engine_member_rows::row_key(&crate::engine_member_rows::RowKey { unit: own_name, names: Input { out: blaze_drive::key::ABSENT, ..own }, files: &[], tool: handles.tool })
+                } else {
+                    crate::engine_member_rows::row_key(&crate::engine_member_rows::RowKey { unit: own_name, names: own, files: &file_heads, tool: handles.tool })
+                }
             };
             let probed = snapshot.get(row_key).map(|got| got.map(|bytes| crate::engine_member_rows::open(bytes, g)));
             tally.parts.files_ns = tally.parts.files_ns.saturating_add(lap(handles.clock, &mut member_mark));
@@ -4887,7 +5044,7 @@ impl<'f> BodiesStage<'f> {
                     Err(cause) => {
                         // As the oracle arm refuses it: before any claim or head subject of it.
                         heads.truncate(heads_at);
-                        refuse_all(&reach, crate::engine_head_notes::leak(heap.alloc(), format_args!("its crate's check scope was not read: {cause}")), own_cells);
+                        refuse_all(kept_below, &reach, crate::engine_head_notes::leak(heap.alloc(), format_args!("its crate's check scope was not read: {cause}")), own_cells);
                         if again.is_none() {
                             members_out.member(&rec::Member { at: place, unit: unit_val, state: rec::MemberState::Refused(rec::RefusedWhy::Unstood), not_held: reach });
                         }
@@ -4944,11 +5101,11 @@ impl<'f> BodiesStage<'f> {
                 member_files.push(FileClaim { file: *file, unit, is: FileIs::NotHeld, reads: own_cells });
                 not_held_kept.push(*file);
             }
-            held_kept.extend(files.iter().map(|&(file, at)| {
-                let one = &handles.outlined[at as usize];
-                rec::Held { file, slot: one.name, path: one.path.as_slice(), entries: crate::engine_listing_record::entries_of(one) }
-            }));
             if again.is_none() {
+                held_kept.extend(files.iter().filter_map(|&(file, at)| {
+                    let one = usize::try_from(at).ok().and_then(|idx| handles.outlined.get(idx))?;
+                    Some(rec::Held { file, slot: one.name, path: one.path.as_slice(), entries: crate::engine_listing_record::entries_of(one) })
+                }));
                 tally.files = tally.files.saturating_add(u32::try_from(files.len()).unwrap_or(u32::MAX));
             }
             tally.files_owed =tally.files_owed.saturating_add(u32::try_from(owed_files.len()).unwrap_or(u32::MAX));
@@ -5152,10 +5309,10 @@ impl<'f> BodiesStage<'f> {
                 // below, in the walk's one outline of the file).
                 let mut owed_in: Vec<u32, blaze_own::Alloc<'static>> = Vec::with_capacity_in(owed_files.len(), g);
                 owed_in.extend(owed_files.iter().map(|(file, _)| *file));
-                let listed = list_owed_files(records, &items, &owed_in, g);
-                let mut mine: blaze_own::AVec<'_, blaze_ladder::front2::project_records::Listed<'_>> = blaze_own::AVec::new_in(g);
-                mine.extend(listed.iter().copied().filter(|l| l.entry.is_some_and(|(f, _)| owed_in.contains(&f))));
-                mine.sort_unstable_by_key(|l| l.entry.map(|(f, _)| f));
+                if owed_in.len() > 1 {
+                    owed_in.sort_unstable();
+                }
+                let mine = list_owed_files(records, &items, &owed_in, g);
                 // The unit's cfg, as the names library lowered the crate (body_types.rs
                 // `Checker::holds`): what tells an entry a `cfg` left out from one the records
                 // lost ([`absent_entry`]).
@@ -6361,6 +6518,39 @@ impl<'d, 'a, 'b, 'f> StretchDriver<'d, 'a, 'b, 'f> {
         }
     }
 
+    /// Whether this stretch can check 2 or more body items and therefore benefits from reserving
+    /// [`HEADS_STRETCH_FRAME`] (`StretchStore`) to reuse frozen heads across bodies. A 1-body
+    /// incremental edit (`items <= 1`) skips the 512 MiB `mmap`/`munmap` completely.
+    fn wants_stretch_store(&self, group_bodies: u32) -> bool {
+        match self {
+            StretchDriver::Fixed { run, at, .. } => {
+                let mut count = 0usize;
+                for one in run.get(*at..).unwrap_or(&[]) {
+                    count = count.saturating_add(one.items.len());
+                    if count >= 2 {
+                        return true;
+                    }
+                }
+                false
+            }
+            StretchDriver::Stealing { runs, current, .. } => {
+                if group_bodies >= 2 {
+                    return true;
+                }
+                let Some((item, offset)) = current.as_ref() else { return false };
+                let Some(run) = runs.get(item.at) else { return false };
+                let mut count = 0usize;
+                for one in run.get(*offset..).unwrap_or(&[]) {
+                    count = count.saturating_add(one.items.len());
+                    if count >= 2 {
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+    }
+
     fn refuse_current<R: ?Sized + CellDigests>(
         &mut self,
         why: &'static str,
@@ -6521,6 +6711,20 @@ fn run_worker_stealing<'a, 'b, 'f, R: ?Sized + CellDigests>(
             worker.items.push(item);
         }
     };
+    let Ok(mut freeze_scratch) = blaze_ladder::front2::tables::head::FreezeScratch::new(FREEZE_SCRATCH, FREEZE_SCRATCH_KEEP, bstd::mem::Tag::Infer) else {
+        loop {
+            if shared.board.stopping().is_some() {
+                return;
+            }
+            let slot = cursor.fetch_add(1, Ordering::Relaxed);
+            let Some(&at) = dispatch.get(slot) else { return };
+            let Some(run) = runs.get(at).copied() else { continue };
+            let mut item = ItemDone::new(at, run.len(), clock, alloc, at_phase);
+            let _ = refuse::<R>(run, "the dependency-head freeze scratch frame could not be reserved (engine_bodies.rs `FREEZE_SCRATCH`)", None, &mut item.out, &mut item.ran, &mut item.run_out, alloc);
+            item.span.1 = crate::engine_times::ns(clock.now().since_start());
+            worker.items.push(item);
+        }
+    };
     let mut pending: Option<Pending<'a, 'b, 'f>> = None;
     loop {
         let next = match pending.take() {
@@ -6571,7 +6775,10 @@ fn run_worker_stealing<'a, 'b, 'f, R: ?Sized + CellDigests>(
                     worker_setup: &mut worker.setup,
                     pending: None,
                 };
-                let _ = run_stretch_with(cx, shared, &mut driver, &stretch, &mut scratch, clock, &mut worker.tally, alloc, at_phase);
+                let _ = freeze_scratch.with_resettable_alloc(|freeze_alloc, freeze_reset| {
+                    let stretch = &stretch;
+                    run_stretch_with(cx, shared, &mut driver, stretch, &mut scratch, freeze_alloc, freeze_reset, clock, &mut worker.tally, alloc, at_phase)
+                });
                 worker.frames.stretch_committed_most = worker.frames.stretch_committed_most.max(u64::try_from(stretch.committed()).unwrap_or(u64::MAX));
                 if let StretchDriver::Stealing { pending: carry, .. } = driver {
                     pending = carry;
@@ -6607,6 +6814,10 @@ fn run_bodies<'a, 'b, 'f, R: ?Sized + CellDigests>(cx: &Cx, shared: &Shared<'_, 
         refuse::<R>(run, "the scratch frame of its run's bodies could not be reserved (engine_bodies.rs `BODY_SCRATCH`)", None, out, ran, run_out, alloc);
         return;
     };
+    let Ok(mut freeze_scratch) = blaze_ladder::front2::tables::head::FreezeScratch::new(FREEZE_SCRATCH, FREEZE_SCRATCH_KEEP, bstd::mem::Tag::Infer) else {
+        refuse::<R>(run, "the dependency-head freeze scratch frame could not be reserved (engine_bodies.rs `FREEZE_SCRATCH`)", None, out, ran, run_out, alloc);
+        return;
+    };
     let mut at = 0;
     while at < run.len() {
         let rest = &run[at..];
@@ -6620,7 +6831,10 @@ fn run_bodies<'a, 'b, 'f, R: ?Sized + CellDigests>(cx: &Cx, shared: &Shared<'_, 
         let took = match Frame::with_reserve(BODIES_FRAME, bstd::mem::Tag::Infer) {
             Ok(stretch) => {
                 let mut driver = StretchDriver::Fixed { run: rest, at: 0, out, ran, run_out };
-                let took = run_stretch_with(cx, shared, &mut driver, &stretch, &mut scratch, clock, tally, alloc, at_phase);
+                let took = freeze_scratch.with_resettable_alloc(|freeze_alloc, freeze_reset| {
+                    let stretch = &stretch;
+                    run_stretch_with(cx, shared, &mut driver, stretch, &mut scratch, freeze_alloc, freeze_reset, clock, tally, alloc, at_phase)
+                });
                 // Its records' pages go as the stretch ends, not the run (the frame's drop: what
                 // its thread's shelf has no room for goes back, blaze-mem frame.rs `give_span`).
                 run_out.frames.stretch_committed_most = run_out.frames.stretch_committed_most.max(stretch.committed() as u64);
@@ -6817,7 +7031,7 @@ impl core::fmt::Display for LangIndexRefused {
 /// (`Known::Bytes`) and member refusals (`Known::Refused`) directly in O(1) without constructing
 /// `lang_index`, `Pointers`, `HeadConsts`, or `SeededHeads`. Only on a cold dependency head miss
 /// (`Known::Freeze`) does it lazily build the freezer once per stretch into `frame`.
-struct LazyBodySeed<'k, 'n, 't> {
+struct LazyBodySeed<'k, 'r, 'm, 'n, 't> {
     names: &'n blaze_ladder::front2::source::Records<'n>,
     heads: &'k crate::engine_seeds::StretchHeads<'k, 'k, 'n>,
     tables: Tables<'t, 'n>,
@@ -6827,6 +7041,10 @@ struct LazyBodySeed<'k, 'n, 't> {
     fb: blaze_own::Bump<'n>,
     fa: blaze_own::Alloc<'n>,
     g: blaze_own::Alloc<'static>,
+    freeze_alloc: blaze_own::Alloc<'static>,
+    freeze_reset: &'r blaze_ladder::front2::tables::head::FreezeReset<'r, 'm>,
+    freeze_exhausted: &'k core::cell::Cell<Option<(usize, usize)>>,
+    freeze_depth: core::cell::Cell<u32>,
     body_locals: blaze_ladder::front2::tables::seeds::BodyLocals,
     import_cache: &'k blaze_ladder::front2::tables::head::FrozenImportCache<'n>,
     front: Option<&'n blaze_ladder::front2::tables::task::StretchFront>,
@@ -6835,7 +7053,7 @@ struct LazyBodySeed<'k, 'n, 't> {
     inner: core::cell::OnceCell<Result<&'n crate::engine_seeds::BodySeed<'k, 'n, 'n, &'n blaze_ladder::front2::source::Records<'n>, crate::engine_seeds::StretchHeads<'k, 'k, 'n>>, LangIndexRefused>>,
 }
 
-impl<'k, 'n, 't> LazyBodySeed<'k, 'n, 't> {
+impl<'k, 'r, 'm, 'n, 't> LazyBodySeed<'k, 'r, 'm, 'n, 't> {
     fn index_reads(&self) -> u64 {
         self.index_reads.get()
     }
@@ -6877,7 +7095,7 @@ impl<'k, 'n, 't> LazyBodySeed<'k, 'n, 't> {
         // (engine_heads.rs `heads_of`): without them this freezer would write other bytes
         // under a dependency head's key (rule 21; lane H9).
         let pointers = pointers.unwrap_or_else(|| blaze_ladder::front2::receiver::Pointers::find(index, blaze_ladder::resolve::Paths { names: self.tables }));
-        let freezer = SeededHeads::new(SeededHeadsOpts { names: self.names, sized, pointers, frame: self.frame, scratch: self.g, alloc: self.fa, consts, known: Some(self.heads), owners: None });
+        let freezer = SeededHeads::new(SeededHeadsOpts { names: self.names, sized, pointers, frame: self.frame, scratch: self.freeze_alloc, alloc: self.fa, consts, known: Some(self.heads), owners: None });
         self.frame.alloc(crate::engine_seeds::BodySeed::new(RequestSeedOpts { names: self.names, heads: self.heads, freezer, body_locals: self.body_locals }))
     }
 
@@ -6899,7 +7117,7 @@ impl<'k, 'n, 't> LazyBodySeed<'k, 'n, 't> {
     }
 }
 
-impl<'n> HeadSeed<'n> for LazyBodySeed<'_, 'n, '_> {
+impl<'n> HeadSeed<'n> for LazyBodySeed<'_, '_, '_, 'n, '_> {
     fn seed(&self, store: &blaze_ladder::front2::heads::Store<'n>, keys: &blaze_ladder::front2::keys::Keys, need: Want, scratch: blaze_own::Alloc<'static>) -> Result<blaze_ladder::front2::heads::Seeded, SeedError> {
         if self.body_locals == blaze_ladder::front2::tables::seeds::BodyLocals::Lowered
             && blaze_ladder::front2::tables::seeds::of_the_body(store, need)
@@ -6920,7 +7138,27 @@ impl<'n> HeadSeed<'n> for LazyBodySeed<'_, 'n, '_> {
         }
         let inner = self.inner.get_or_init(|| self.build_freezer());
         match inner {
-            Ok(body_seed) => body_seed.seed(store, keys, need, scratch),
+            Ok(body_seed) => {
+                struct FreezeResetGuard<'a, 'k, 'm> {
+                    depth: &'a core::cell::Cell<u32>,
+                    reset: &'k blaze_ladder::front2::tables::head::FreezeReset<'k, 'm>,
+                    exhausted: &'k core::cell::Cell<Option<(usize, usize)>>,
+                }
+                impl Drop for FreezeResetGuard<'_, '_, '_> {
+                    fn drop(&mut self) {
+                        let next = self.depth.get().saturating_sub(1);
+                        self.depth.set(next);
+                        if next == 0
+                            && let Some(ex) = self.reset.reset_and_trim()
+                        {
+                            self.exhausted.set(Some(ex));
+                        }
+                    }
+                }
+                self.freeze_depth.set(self.freeze_depth.get().saturating_add(1));
+                let _reset = FreezeResetGuard { depth: &self.freeze_depth, reset: self.freeze_reset, exhausted: self.freeze_exhausted };
+                body_seed.seed(store, keys, need, scratch)
+            }
             Err(refused) => Err(SeedError::of_freeze(FreezeError::NotTheirs {
                 want: cell,
                 why: NotTheirs::Failed { said: refused.0 },
@@ -6933,12 +7171,14 @@ impl<'n> HeadSeed<'n> for LazyBodySeed<'_, 'n, '_> {
 /// `driver` checked over one view until `driver` stops (group change, [`STRETCH_FULL`], stop
 /// signal, or unwind). Returns how many bodies it checked (or refused for a fixed slice).
 #[expect(clippy::too_many_arguments, reason = "a stretch's edge: each argument one handle of it")]
-fn run_stretch_with<'d, 'a, 'b, 'f, R: ?Sized + CellDigests>(
+fn run_stretch_with<'d, 'a, 'b, 'f, 'r, 'm, R: ?Sized + CellDigests>(
     cx: &Cx,
     shared: &Shared<'_, 'a, '_, '_, R>,
     driver: &mut StretchDriver<'d, 'a, 'b, 'f>,
     frame: &Frame,
     scratch: &mut Frame,
+    freeze_alloc: blaze_own::Alloc<'static>,
+    freeze_reset: &'r blaze_ladder::front2::tables::head::FreezeReset<'r, 'm>,
     clock: &Clock,
     tally: &mut crate::engine_seeds::SeedTally,
     alloc: SharedAlloc<'a>,
@@ -7025,7 +7265,9 @@ fn run_stretch_with<'d, 'a, 'b, 'f, R: ?Sized + CellDigests>(
     let mut eval = EvalReads { placed: 0, ids: Vec::new_in(fa) };
     // Held on the stretch's stack in `g` so it leaves 0 bytes in `frame` and drops cleanly with the stretch.
     let import_cache = blaze_ladder::front2::tables::head::FrozenImportCache::new(g);
-    let seed: Option<&LazyBodySeed<'_, '_, '_>> = stretch_heads.as_ref().map(|table| {
+    let binding_keys = blaze_ladder::front2::tables::recorder::SharedBindingKeys::new(g);
+    let freeze_exhausted: core::cell::Cell<Option<(usize, usize)>> = core::cell::Cell::new(None);
+    let seed: Option<&LazyBodySeed<'_, '_, '_, '_, '_>> = stretch_heads.as_ref().map(|table| {
         &*frame.alloc(LazyBodySeed {
             names: opened.records,
             heads: table,
@@ -7036,6 +7278,10 @@ fn run_stretch_with<'d, 'a, 'b, 'f, R: ?Sized + CellDigests>(
             fb,
             fa,
             g,
+            freeze_alloc,
+            freeze_reset,
+            freeze_exhausted: &freeze_exhausted,
+            freeze_depth: core::cell::Cell::new(0),
             body_locals: table.body_locals(),
             import_cache: &import_cache,
             front: front_ref,
@@ -7082,7 +7328,7 @@ fn run_stretch_with<'d, 'a, 'b, 'f, R: ?Sized + CellDigests>(
         lang_ns: ns_between(set_heads, set_lang),
         owners_ns: ns_between(set_lang, set_done),
     });
-    let mut stretch_store = if body_frame.heads.is_some() {
+    let mut stretch_store = if body_frame.heads.is_some() && driver.wants_stretch_store(group.bodies) {
         match StretchStore::new(StretchStoreOpts {
             reserve: HEADS_STRETCH_FRAME,
             cap: HEADS_STRETCH_CAP,
@@ -7148,7 +7394,7 @@ fn run_stretch_with<'d, 'a, 'b, 'f, R: ?Sized + CellDigests>(
         let name = one.task.planned.name;
         let (made_before, hits_before) = ids.counts();
         let mut body_tally = crate::engine_seeds::SeedTally::default();
-        let mut recording = Some(Recorder::new(RecorderOpts { alloc: w }));
+        let mut recording = Some(Recorder::with_shared_bindings(RecorderOpts { alloc: w }, &binding_keys));
         // Keep the include log until publication: a frame can fill after the last include
         // and before the row's reads have been copied out.
         let data_at = opened.sources.0.data.borrow().len();
@@ -7160,13 +7406,17 @@ fn run_stretch_with<'d, 'a, 'b, 'f, R: ?Sized + CellDigests>(
         let frame_limit = |what: &'static str, heads: Option<&StretchStore<'_>>| {
             let scratch_full = sc.take_exhaustion();
             let heads_full = heads.and_then(StretchStore::take_exhaustion);
+            let freeze_full = freeze_exhausted.take();
             // A shared stretch has space left by its preceding bodies. No source cell
             // certifies that capacity. Only the body's private reservation starts empty.
             match frame.take_exhaustion() {
                 Some(used) => Some((used, frame.reserved(), what, Stands::OwedNextRequest)),
                 None => match heads_full {
                     Some((used, reserved)) => Some((used, reserved, what, Stands::OwedNextRequest)),
-                    None => scratch_full.map(|used| (used, sc.reserved(), what, Stands::ByReads)),
+                    None => match freeze_full {
+                        Some((used, reserved)) => Some((used, reserved, what, Stands::OwedNextRequest)),
+                        None => scratch_full.map(|used| (used, sc.reserved(), what, Stands::ByReads)),
+                    },
                 },
             }
         };
@@ -7251,7 +7501,7 @@ fn run_stretch_with<'d, 'a, 'b, 'f, R: ?Sized + CellDigests>(
                     let keys = blaze_ladder::front2::keys::Keys::new();
                     let error = blaze_ladder::front2::tables::head::fact_cell(opened.records, &keys, key).expect_err("no head for the data digest");
                     let shown = blaze_ladder::front2::item_shown::FactDefinition::of(opened.records, key, None, w);
-                    let active = recording.insert(Recorder::new(RecorderOpts { alloc: w }));
+                    let active = recording.insert(Recorder::with_shared_bindings(RecorderOpts { alloc: w }, &binding_keys));
                     for &key in &body.reads {
                         active.read(key);
                     }
@@ -7805,6 +8055,7 @@ fn run_stretch_with<'d, 'a, 'b, 'f, R: ?Sized + CellDigests>(
         opened.sources.0.data.borrow_mut().truncate(data_at);
         opened.sources.0.left.borrow_mut().truncate(left_at);
         let index = ran.len();
+        let entry_rule = note_rule(result.note.as_ref().map(|(said, _)| said), true);
         if let Some((said, head_failed)) = result.note {
             run_out.notes.push((index, said, head_failed));
         } else if result.checked && result.done.findings == 0 {
@@ -7819,15 +8070,46 @@ fn run_stretch_with<'d, 'a, 'b, 'f, R: ?Sized + CellDigests>(
             run_out.messages.extend_from_slice(finding.message);
             run_out.found.push((index, finding.rule, finding.at, run_out.messages.len()));
         }
-        run_out.locals.extend(result.locals.iter().map(|key| (index, *key)));
+        let mut entry_typed: Option<Key> = None;
         if result.checked {
             run_out.untyped_clean = run_out.untyped_clean.saturating_add(result.untyped_clean);
             run_out.typed.reserve(result.typed.len());
             for &(check, bytes) in result.typed.iter() {
+                let key = crate::engine_body_record::typed_key(bytes);
+                if check == name {
+                    entry_typed = Some(key);
+                }
                 let mut kept = SVec::with_capacity_in(bytes.len(), at_phase);
                 kept.extend_from_slice(bytes);
-                run_out.typed.push(TypedPut { check, bytes: kept });
+                run_out.typed.push(TypedPut { check, key, bytes: kept });
             }
+        }
+        let mut encoded_facts = false;
+        if one.part.is_none() && run_out.facts_error.is_none() {
+            let class = crate::engine_body_facts::class_of(entry_rule.into_iter().chain(result.found.iter().map(|finding| finding.rule)));
+            let mut covers: SVec<'_, [u8; 16]> = SVec::with_capacity_in(one.asked.len().saturating_add(result.locals.len()), at_phase);
+            covers.extend(one.asked.iter().map(|key| key.0.to_be_bytes()));
+            for item in result.locals.iter() {
+                covers.push(blaze_ladder::front2::keys::checker_of(*item).0.to_be_bytes());
+            }
+            covers.sort_unstable();
+            covers.dedup();
+            let from = run_out.facts_bytes.len();
+            match crate::engine_body_facts::write(class, &covers, entry_typed, &mut run_out.facts_bytes) {
+                Ok(()) => {
+                    let end = run_out.facts_bytes.len();
+                    if let (Ok(from), Ok(end)) = (u32::try_from(from), u32::try_from(end)) {
+                        run_out.facts_index.push((index, from, end));
+                        encoded_facts = true;
+                    }
+                }
+                Err(why) => {
+                    run_out.facts_error = Some((name, why));
+                }
+            }
+        }
+        if !encoded_facts {
+            run_out.locals.extend(result.locals.iter().map(|key| (index, *key)));
         }
         let (made_now, hits_now) = ids.counts();
         mem.ids_made = made_now - made_before;

@@ -305,10 +305,12 @@ fn key_of(crate_key: CrateItemKey, digests: impl Iterator<Item = ContentId>) -> 
 
 /// [`key_of`] of `rows` in any order.
 pub fn rows_key(crate_key: CrateItemKey, rows: &[ImplRow<'_>]) -> ContentId {
-    let mut by_key: Vec<(LibKey, ContentId), Global> = Vec::with_capacity_in(rows.len(), Global);
-    by_key.extend(rows.iter().map(|row| (row.key, row_digest(row))));
-    by_key.sort_unstable_by_key(|it| it.0);
-    key_of(crate_key, by_key.iter().map(|it| it.1))
+    blaze_mem::frame::task(blaze_mem::Tag::Infer, |frame| {
+        let mut by_key: blaze_own::Vec<(LibKey, ContentId), &blaze_mem::Frame> = blaze_own::Vec::with_capacity_in(rows.len(), frame);
+        by_key.extend(rows.iter().map(|row| (row.key, row_digest(row))));
+        by_key.sort_unstable_by_key(|it| it.0);
+        key_of(crate_key, by_key.iter().map(|it| it.1))
+    })
 }
 
 /// One contiguous chunk of a crate's impl rows filed independently ([`file_impl_rows_chunk`]),
@@ -922,15 +924,18 @@ pub fn framed<A: core::alloc::Allocator>(records: &CrateImpls<'_>, alloc: A) -> 
     out.extend_from_slice(FRAMED_MAGIC);
     put_part(&mut out, &records.directory[..]);
     put_part(&mut out, &records.no_impls_of[..]);
-    let mut order: std::vec::Vec<usize, Global> = std::vec::Vec::with_capacity_in(records.buckets.len(), Global);
-    order.extend(0..records.buckets.len());
-    order.sort_unstable_by_key(|at| records.buckets[*at].id);
-    put_len(&mut out, order.len());
-    for at in order {
-        let b = &records.buckets[at];
-        out.extend_from_slice(&b.id.0);
-        put_part(&mut out, &b.bytes[..]);
-    }
+    blaze_mem::frame::task(blaze_mem::Tag::Infer, |frame| {
+        let mut order: blaze_own::Vec<usize, &blaze_mem::Frame> = blaze_own::Vec::with_capacity_in(records.buckets.len(), frame);
+        order.extend(0..records.buckets.len());
+        order.sort_unstable_by_key(|at| records.buckets.get(*at).map(|b| b.id));
+        put_len(&mut out, order.len());
+        for at in order {
+            if let Some(b) = records.buckets.get(at) {
+                out.extend_from_slice(&b.id.0);
+                put_part(&mut out, &b.bytes[..]);
+            }
+        }
+    });
     debug_assert_eq!(out.len(), size, "framed's size is what it writes");
     out
 }
@@ -1000,7 +1005,8 @@ impl ImplShelf {
 
     /// Holds crate `krate`'s three kinds of record, copied once.
     pub fn put(&mut self, krate: CrateItemKey, records: &CrateImpls<'_>) -> Result<(), ShelvedTwice> {
-        match self.put_framed(krate, &framed(records, Global)) {
+        let res = blaze_mem::frame::task(blaze_mem::Tag::Infer, |frame| self.put_framed(krate, &framed(records, frame)));
+        match res {
             Ok(()) => Ok(()),
             Err(ShelfError::Twice(twice)) => Err(twice),
             // `framed` wrote them this call: a malformed read of its own bytes is this file's fault.
@@ -1685,7 +1691,7 @@ impl BucketIndex {
             return Ok(0);
         }
         let Homes { all, bare, blanket, local: _ } = home;
-        let mut reads: Vec<BucketRead, Global> = Vec::new_in(Global);
+        let mut reads: AVec<'static, BucketRead> = AVec::new_in(self.indexed.alloc);
         if [all, bare, blanket].contains(&Home::Incoherent) {
             if let Some(digest) = self.indexed.incoherent {
                 reads.push(BucketRead { krate: 0, bucket: INCOHERENT_FACT, answer: digest });

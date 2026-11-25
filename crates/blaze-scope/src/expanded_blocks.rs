@@ -154,6 +154,7 @@ pub(crate) fn render<'a>(
     written: &[bool],
     outer: Outer,
     copied: &mut dyn FnMut(crate::crate_roots::Copied),
+    synthetic_blocks: &mut AVec<'_, u32>,
     alloc: Alloc<'a>,
 ) -> AString<'a> {
     let mut copy = |out: &AString<'_>, from: u32, len: u32| {
@@ -205,6 +206,12 @@ pub(crate) fn render<'a>(
                     out.push_str(attrs);
                     out.push_str("\n");
                 }
+                // Record the exact byte offset of the synthetic block module's name in `out`,
+                // so `resolve::make_modules` identifies synthetic blocks structurally rather than
+                // by name prefix (a user or macro module legitimately named `__blaze_block_*` is
+                // not in this list).
+                let name_start = u32::try_from(out.len() + "mod ".len()).unwrap_or(u32::MAX);
+                synthetic_blocks.push(name_start);
                 // Writing to an own string does not fail.
                 let _ = match outer {
                     Outer::Module => writeln!(out, "mod {BLOCK_MODULE}{ordinal} {{\nuse super::*;"),
@@ -306,9 +313,14 @@ pub fn expansion_blocks<'a>(text: &str, alloc: Alloc<'a>) -> Result<ExpansionBlo
 /// declares nothing and calls nothing in statement position (`assert!(..)`, `println!(..)`:
 /// nothing of it is a name).
 ///
-/// With the slices of `text` it copied (offsets in `text`, not in the wrapped scan text).
+/// With the slices of `text` it copied (offsets in `text`, not in the wrapped scan text) and the
+/// sorted byte offsets of every synthetic block module name emitted in the rendered output.
 #[allow(clippy::type_complexity)]
-pub(crate) fn statements_as_items<'a>(text: &str, call: ItemKey, alloc: Alloc<'a>) -> Result<Option<(AString<'a>, AVec<'a, crate::crate_roots::Copied>)>, StatementsRefused> {
+pub(crate) fn statements_as_items<'a>(
+    text: &str,
+    call: ItemKey,
+    alloc: Alloc<'a>,
+) -> Result<Option<(AString<'a>, AVec<'a, crate::crate_roots::Copied>, AVec<'a, u32>)>, StatementsRefused> {
     // The calling block in the scan ([`wrapped`], where the rule is quoted).
     let wrapped = wrapped(text, alloc);
     let nested = scan(wrapped.as_str(), alloc);
@@ -326,15 +338,17 @@ pub(crate) fn statements_as_items<'a>(text: &str, call: ItemKey, alloc: Alloc<'a
     // The scan text is `{` + `text` + `\n}`: a slice of it at `from` is `text`'s at `from - 1`;
     // only slices inside `text` are copied (items, calls and attributes of blocks within it).
     let mut copies: AVec<'a, crate::crate_roots::Copied> = AVec::new_in(alloc);
+    let mut synthetic_blocks: AVec<'a, u32> = AVec::new_in(alloc);
     let out = render(
         wrapped.as_str(),
         &nested,
         &kept,
         Outer::Inline { call },
         &mut |c| copies.push(crate::crate_roots::Copied { from: c.from.saturating_sub(WRAP_OPEN), ..c }),
+        &mut synthetic_blocks,
         alloc,
     );
-    Ok((!out.is_empty()).then_some((out, copies)))
+    Ok((!out.is_empty()).then_some((out, copies, synthetic_blocks)))
 }
 
 #[cfg(test)]
@@ -360,7 +374,7 @@ mod tests {
             "mod {EXPANSION_BLOCK}{:016x}_0 {{\nuse super::*;\nmod __tokio_select_util {{ pub(super) type Mask = u8; }}\n}}\n",
             tag(call())
         );
-        assert_eq!(got.as_ref().map(|(s, _)| s.as_str()), Some(want.as_str()));
+        assert_eq!(got.as_ref().map(|(s, _, _)| s.as_str()), Some(want.as_str()));
     }
 
     /// A statement expansion's top-level items and statement calls are the calling block's
@@ -369,7 +383,7 @@ mod tests {
     fn top_level_items_are_the_calling_blocks() {
         let alloc = blaze_own::testing::heap().alloc();
         let got = statements_as_items("struct S; let x = S; inner!(x);", call(), alloc).unwrap_or_else(|e| panic!("read: {e}"));
-        assert_eq!(got.as_ref().map(|(s, _)| s.as_str()), Some("struct S;\ninner!(x);\n"));
+        assert_eq!(got.as_ref().map(|(s, _, _)| s.as_str()), Some("struct S;\ninner!(x);\n"));
     }
 
     /// The ordinals [`super::expansion_blocks`] gives are the numbers in the names `render`
@@ -386,7 +400,7 @@ mod tests {
         // Blocks: 0 the calling block, 1 `{ mod a .. }`, 2 `{ struct S; }` inside it, 3 `{ let
         // y = 1; }`, 4 `{ struct T; }` (`mod a`'s braces are its item's: not scanned).
         assert_eq!(got, std::vec![None, Some(0), Some(1), None, Some(2)]);
-        let (rendered, _) = statements_as_items(text, call(), alloc).unwrap_or_else(|e| panic!("read: {e}")).expect("it declares items");
+        let (rendered, _, _) = statements_as_items(text, call(), alloc).unwrap_or_else(|e| panic!("read: {e}")).expect("it declares items");
         let tag = std::format!("{:016x}", tag(call()));
         let zero = rendered.find(&std::format!("mod {EXPANSION_BLOCK}{tag}_0 {{")).expect("block 1 is `_0`");
         let one = rendered.find(&std::format!("mod {EXPANSION_BLOCK}{tag}_1 {{")).expect("block 2 is `_1`");

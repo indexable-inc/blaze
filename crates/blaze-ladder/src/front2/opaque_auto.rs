@@ -280,10 +280,8 @@ impl<'a> HiddenTable<'a> {
     fn wants(&self, owner: ItemKey, exprs: &[tc::Expr], done: &Checked<'_>) -> bool {
         if let Some(row) = self.rows.get(&owner) {
             // Only a newly checked producer can supply more precise facts. A read of its
-            // existing row does no flow work. The flow pass currently lowers async blocks.
-            return row.coroutines.iter().any(|&(at, _, interior)| {
-                at < tc::coroutine_id::CLOSURE_BASE && !interior.is_exact()
-            });
+            // existing row does no flow work.
+            return row.coroutines.iter().any(|&(_, _, interior)| !interior.is_exact());
         }
         !done.hidden.is_empty() || exprs.iter().any(|e| {
             matches!(e, tc::Expr::AsyncBlock { .. } | tc::Expr::Closure { is_async: true, .. })
@@ -513,7 +511,7 @@ pub(crate) fn file<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, body: &Bo
     // (including a direct await) already carry both the captures and pending
     // future. Flow uses the same binding rows and cannot refine unknown places.
     let needs_flow = body.typeck.exprs.iter().enumerate().any(|(i, e)| {
-        matches!(e, tc::Expr::AsyncBlock { .. })
+        matches!(e, tc::Expr::AsyncBlock { .. } | tc::Expr::Closure { is_async: true, .. })
             && done.coroutine_witness(tc::ExprId(i as u32)) == Some(tc::CoroutineWitness::NeedsSavedLocals)
     });
     let exacts = if needs_flow {

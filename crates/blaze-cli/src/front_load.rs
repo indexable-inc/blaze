@@ -295,24 +295,30 @@ impl<'r> ScopeRecords<'r> {
             };
             return Some(Ok(CurrentFile { text, surface: entry.surface, view }));
         }
-        let alloc = self.heap.alloc();
-        let outline = blaze_file_items::outline(text, edition, alloc);
-        let digest = ContentId::of(crate::sweep::FILE_DOMAIN, text.as_bytes());
-        let encoded = match outline.to_file_items(text, digest, alloc) {
-            Ok(e) => e,
-            Err(why) => return Some(Err(ItemsRecordError::FileItemsBuild { file, why })),
+        let (surface, buf, offset, len) = match blaze_mem::frame::task(blaze_mem::Tag::Parse, |scratch| {
+            let erased = blaze_own::Erased::new(scratch);
+            let alloc = erased.handle();
+            let outline = blaze_file_items::outline(text, edition, alloc);
+            let digest = ContentId::of(crate::sweep::FILE_DOMAIN, text.as_bytes());
+            let encoded = match outline.to_file_items(text, digest, alloc) {
+                Ok(e) => e,
+                Err(why) => return Err(ItemsRecordError::FileItemsBuild { file, why }),
+            };
+            let surface = outline.surface();
+            let len = encoded.len();
+            let mut buf = Vec::with_capacity_in(len.saturating_add(15), self.heap.shared());
+            buf.resize(len.saturating_add(15), 0);
+            let offset = (16 - (buf.as_ptr().addr() & 15)) & 15;
+            let Some(dst) = offset.checked_add(len).and_then(|end| buf.get_mut(offset..end)) else {
+                return Ok(None);
+            };
+            dst.copy_from_slice(&encoded);
+            Ok(Some((surface, buf, offset, len)))
+        }) {
+            Ok(Some(v)) => v,
+            Ok(None) => return None,
+            Err(why) => return Some(Err(why)),
         };
-        let surface = outline.surface();
-        let len = encoded.len();
-        let mut buf = Vec::with_capacity_in(len.saturating_add(15), self.heap.shared());
-        buf.resize(len.saturating_add(15), 0);
-        let offset = (16 - (buf.as_ptr().addr() & 15)) & 15;
-        let Some(dst) = offset.checked_add(len).and_then(|end| buf.get_mut(offset..end)) else {
-            return None;
-        };
-        dst.copy_from_slice(&encoded);
-        drop(encoded);
-        drop(outline);
         let Some(check_slice) = offset.checked_add(len).and_then(|end| buf.get(offset..end)) else {
             return None;
         };

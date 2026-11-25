@@ -169,6 +169,76 @@ pub type LockResult<T> = Result<T, PoisonError<T>>;";
     assert_eq!(n("#[stable(feature = \"rust1\", since = \"1.0.0\")]\npub struct PoisonError<T> {\n    data: T,\n    #[cfg(not(panic = \"unwind\"))]\n    _never: !,\n}"), Ok(0));
 }
 
+/// Outer attributes (`#[debug(..., match x { A => "a" })]`), parameter attributes
+/// (`#[attr(a => b)]`), and const-generic or array-length expressions (`{ if a > b { 1 } else { 0 } }`)
+/// hold `<`, `>`, and `=>` inside balanced `( ) [ ] { }` groups. Before separating `group` and
+/// `angle` depths (`Brackets`), every `=>` decremented the shared bracket depth until it underflowed
+/// (`GenericsError::Unclosed`), breaking real derive_more/thiserror structs (e.g.
+/// `codex_protocol`'s `ThreadSettingsOverrides`). Controls (rule 23): the exact same items with
+/// lifetime parameters or `#[may_dangle]` still count and index identically, and genuinely unclosed
+/// groups or angle brackets still fail with `Unclosed`.
+#[test]
+fn angles_and_fat_arrows_inside_attributes_and_groups_do_not_corrupt_depth() {
+    let n = |text: &str| declared_lifetimes(text, Edition::E2024);
+    let md = |text: &str| blaze_file_items::impl_may_dangle_params(text, Edition::E2024);
+
+    // Three `=>` arms inside an outer `#[debug(...)]` attribute (the exact `derive_more::Debug`
+    // shape from `codex_protocol::ThreadSettingsOverrides`).
+    const DERIVE_DEBUG_MATCH: &str = "\
+#[derive(derive_more::Debug, Clone)]
+#[debug(
+    \"Overrides {{ p: {:?} }}\",
+    profile.as_ref().map(|p| match p {
+        Profile::Managed { .. } => \"managed\",
+        Profile::Disabled => \"disabled\",
+        Profile::External { .. } => \"external\",
+    }),
+)]
+pub struct Overrides { pub x: u8 }";
+    assert_eq!(n(DERIVE_DEBUG_MATCH), Ok(0));
+
+    // CONTROL: identical attribute with a declared lifetime parameter still counts 1.
+    const DERIVE_DEBUG_MATCH_LT: &str = "\
+#[debug(
+    \"Overrides {{ p: {:?} }}\",
+    profile.as_ref().map(|p| match p {
+        Profile::Managed { .. } => \"managed\",
+        Profile::Disabled => \"disabled\",
+        Profile::External { .. } => \"external\",
+    }),
+)]
+pub struct Overrides<'a> { pub x: &'a u8 }";
+    assert_eq!(n(DERIVE_DEBUG_MATCH_LT), Ok(1));
+
+    // Comparisons `<` and `>` inside an outer attribute, a parameter attribute, and const blocks.
+    assert_eq!(n("#[cfg_attr(all(), my_attr(a < b, c > d, e => f))]\nstruct S<'a, #[p(x => y, u < v)] 'b>(&'a &'b u8);"), Ok(2));
+    assert_eq!(n("struct S<const N: usize = { if a > b { 1 } else { 0 } }, 'a>(&'a [u8; N]);"), Ok(1));
+    assert_eq!(n("struct S<const B: bool = { a < b }, 'a>(&'a u8);"), Ok(1));
+    assert_eq!(n("struct S<T: Fn(Vec<u8>) -> Result<(), E>, 'a>(&'a T);"), Ok(1));
+
+    // `impl_header` and `impl_may_dangle_params` with `=>` / `<` / `>` inside attributes and const expressions.
+    let (_, params, trait_, self_ty) = read("impl<#[attr(a => b, c < d)] T> Trait<[u8; { 1 > 0 }]> for S<[u8; { 1 < 2 }], T>");
+    assert_eq!(params, ["T"]);
+    assert_eq!(trait_, Some("Trait<[u8; { 1 > 0 }]>"));
+    assert_eq!(self_ty, "S<[u8; { 1 < 2 }], T>");
+    assert_eq!(
+        md("#[attr(match x { A => 1, B => 2, C => 3 })]\nunsafe impl<#[cfg(a => b)] #[may_dangle] T, const N: usize = { 1 < 2 }> Drop for S<T, N>"),
+        Ok(0b01)
+    );
+
+    // Refusal controls: genuinely unclosed groups or angles still return `Unclosed`.
+    assert_eq!(n("#[attr(a => b]\nstruct S;"), Err(GenericsError::Unclosed));
+    assert_eq!(n("struct S<T)>"), Err(GenericsError::Unclosed));
+    assert_eq!(
+        impl_header("impl<T> Trait for Foo<T", Edition::E2024, blaze_own::testing::heap().alloc()).map(|_| ()),
+        Err(HeaderError::Unclosed)
+    );
+    assert_eq!(
+        impl_header("impl<T)> Trait for Foo<T>", Edition::E2024, blaze_own::testing::heap().alloc()).map(|_| ()),
+        Err(HeaderError::Unclosed)
+    );
+}
+
 #[test]
 fn cores_nightly_items_outline_without_errors() {
     let text = "pub trait Share: Clone {\n    /// Doc.\n    final fn share(&self) -> Self { self.clone() }\n}\n\

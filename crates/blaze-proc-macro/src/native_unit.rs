@@ -481,7 +481,18 @@ pub fn native_outputs<'a>(
             let pkg_real = pkg_path.to_str().ok_or_else(|| NativeUnitError::Files { package: pkg(), folder: pkg_path.display().to_string(), why: "not UTF-8".to_owned() })?.to_owned();
             (pkg_real, Some(ws_real), None)
         }
-        Tree::Mem { files, .. } => {
+        Tree::Mem { files, submodules, .. } => {
+            if let Some((sub, commit)) = submodules.first() {
+                let mut hex = blaze_own::AString::new_in(alloc);
+                for byte in commit {
+                    let _ = core::fmt::Write::write_fmt(&mut hex, format_args!("{byte:02x}"));
+                }
+                return Err(NativeUnitError::Files {
+                    package: pkg(),
+                    folder: sub.as_str().to_owned(),
+                    why: format!("package contains unpopulated git submodule `{sub}` at commit {hex}; native build-script materialization refuses unpopulated submodules"),
+                });
+            }
             let pkg_rel = blaze_own::format_in!(alloc, "pkg/{}", run_key.as_str());
             let dir = fresh_folder(native.work, pkg_rel.as_str(), files, &pkg(), alloc)?;
             work_guard.push_dir(pkg_rel);
