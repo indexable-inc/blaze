@@ -90,6 +90,9 @@ pub(crate) fn level_in(step: Step, marks: RootMarks, number: u16) -> Level {
 /// `#![blaze::driver]`, `#![deny(blaze::..)]`) joined with its own top's (a module file may be
 /// a core in a crate that is not). For the crate root itself both texts are the same file.
 pub(crate) fn marks_of(crate_root_text: &str, text: &str) -> RootMarks {
+    if core::ptr::eq(crate_root_text, text) {
+        return RootMarks::read(text);
+    }
     RootMarks::read(crate_root_text).join(RootMarks::read(text))
 }
 
@@ -212,8 +215,14 @@ pub(crate) fn of_root(cx: &bstd::Cx, root: &bstd::fs::Dir<bstd::fs::ReadWrite>, 
 /// `path` relative to the workspace's root). All of it is in the scope's key, so it is in every
 /// unit's source ([`UnitKey`]).
 pub(crate) fn file_scope_in(marks: RootMarks, path: &str, text: &str) -> Scope {
-    let heads = if reads_own_heads(marks, path) { OwnHeads::read(text) } else { OwnHeads::NONE };
-    marks.scope(file_scope(path)).with_file_facts(heads, statics_of_path(path))
+    file_scope_counted(marks, path, text).0
+}
+
+fn file_scope_counted(marks: RootMarks, path: &str, text: &str) -> (Scope, bool) {
+    let base = marks.scope(file_scope(path));
+    let read_heads = base.reads_own_heads(&marks.rules(RuleSet::only(&[])));
+    let heads = if read_heads { OwnHeads::read(text) } else { OwnHeads::NONE };
+    (base.with_file_facts(heads, statics_of_path(path)), read_heads)
 }
 
 /// Whether a file's passes read the IO module names its text makes its own (`OwnHeads::read`,
@@ -229,18 +238,22 @@ pub(crate) fn reads_own_heads(marks: RootMarks, path: &str) -> bool {
 pub(crate) fn file_scope(path: &str) -> Scope {
     let mut parts = path.split('/');
     let name = parts.next_back().unwrap_or("");
-    let dirs: Vec<&str, Global> = {
-        let mut dirs = Vec::new_in(Global);
-        dirs.extend(parts);
-        dirs
-    };
-    let test = dirs.iter().any(|dir| matches!(*dir, "tests" | "benches")) || matches!(name, "tests.rs" | "test.rs");
-    let build_script = name == "build.rs" && dirs.last().is_some_and(|dir| *dir != "src");
+    let mut test = matches!(name, "tests.rs" | "test.rs");
+    let mut prev: Option<&str> = None;
+    let mut last: Option<&str> = None;
+    for dir in parts {
+        if matches!(dir, "tests" | "benches") {
+            test = true;
+        }
+        prev = last;
+        last = Some(dir);
+    }
+    let build_script = name == "build.rs" && last.is_some_and(|dir| dir != "src");
     let bin_dir = |dir: &str| matches!(dir, "bin" | "examples");
-    let bin_root = match dirs.as_slice() {
-        [.., up, _] if name == "main.rs" && bin_dir(*up) => true,
-        [.., dir] if name == "main.rs" && *dir == "src" => true,
-        [.., dir] => bin_dir(*dir),
+    let bin_root = match (prev, last) {
+        (Some(up), Some(_)) if name == "main.rs" && bin_dir(up) => true,
+        (_, Some(dir)) if name == "main.rs" && dir == "src" => true,
+        (_, Some(dir)) => bin_dir(dir),
         _ => false,
     };
     Scope::file(if test { TestBits::CFG } else { TestBits::NONE }, bin_root, build_script)
@@ -409,11 +422,13 @@ pub(crate) fn parts_with<K: UnitKey, A: core::alloc::Allocator + Copy>(
     parts: &mut Vec<Part, A>,
 ) -> Result<(), &'static str> {
     let units = Units::plan(outline.items(), text.len(), alloc).map_err(|_| UNPLANNED)?;
+    let marked = marks.rules(*rules);
+    let runs_unused_import = marked.runs(Rule::UnusedImport);
     let none = RuleSet::only(&[]);
     let count = units.list.len();
     let mut scopes: AVec<'_, Scope> = AVec::with_capacity_in(count, alloc);
     scopes.resize(count, file_scope_in(marks, path, text));
-    let variants = match marks.rules(*rules).runs(Rule::VariantCount) {
+    let variants = match marked.runs(Rule::VariantCount) {
         true => Some(Variants::gather(text, alloc).map_err(|_| UNGATHERED)?),
         false => None,
     };
@@ -430,7 +445,7 @@ pub(crate) fn parts_with<K: UnitKey, A: core::alloc::Allocator + Copy>(
         let mut source = K::source(&units, at, text, &own, scope, marks, variants.as_ref());
         // Top-level `use` items under `Rule::UnusedImport` read identifier uses from sibling
         // items in the file, so mix the whole-file digest into their unit key (rule 65).
-        if at > 0 && marks.rules(*rules).runs(Rule::UnusedImport) && own.text.contains("use") {
+        if runs_unused_import && is_top_level_use_unit(outline.items(), at) {
             let mut h = Hasher::new(UNIT_SOURCE_DOMAIN);
             h.update(&source.0).update(&file.0);
             source = h.finish();
@@ -529,6 +544,7 @@ struct Lone {
     name: Name,
     plan: UnitPlan,
     scope: Scope,
+    is_top_level_use: bool,
 }
 
 /// What every batch of a file reads: plain borrows a worker can take.
@@ -539,6 +555,473 @@ struct Shared<'s> {
     holes: &'s [Span],
     rules: &'s RuleSet,
     variants: Option<VariantsView<'s>>,
+}
+
+fn is_top_level_use_unit(items: &[blaze_surface::Item], unit: usize) -> bool {
+    unit.checked_sub(1)
+        .and_then(|i| items.get(i))
+        .is_some_and(|item| item.kind() == blaze_surface::ItemKind::Use && item.parent.is_none())
+}
+
+fn unit_bounds(items: &[blaze_surface::Item], unit: usize, text_len: u32) -> Result<(u32, u32), SparseLintError> {
+    match unit.checked_sub(1) {
+        None => Ok((0, text_len)),
+        Some(entry) => {
+            let item = items.get(entry).ok_or(SparseLintError::Unplanned)?;
+            Ok((item.range.start, item.range.end))
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SiteG {
+    Ident,
+    Int,
+    Other,
+    P(u8),
+}
+
+#[derive(Clone, Copy)]
+struct SiteTok {
+    start: u32,
+    end: u32,
+    g: SiteG,
+}
+
+/// Matches `blaze-lint`'s `variants.rs::int_value` (`MIN_COUNT = 3`): true iff `lit` parses as an
+/// integer literal in `3..=u32::MAX`.
+fn int_at_least_min(lit: &str) -> bool {
+    const MIN_VARIANT_COUNT: u32 = 3;
+    let b = lit.as_bytes();
+    let (radix, mut at) = match b {
+        [b'0', b'x', ..] => (16u32, 2usize),
+        [b'0', b'o', ..] => (8u32, 2usize),
+        [b'0', b'b', ..] => (2u32, 2usize),
+        _ => (10u32, 0usize),
+    };
+    let mut value = 0u32;
+    let mut digits = 0usize;
+    while let Some(c) = b.get(at).copied() {
+        let digit = match c {
+            b'_' => {
+                at += 1;
+                continue;
+            }
+            b'0'..=b'9' => u32::from(c - b'0'),
+            b'a'..=b'f' if radix == 16 => u32::from(c - b'a') + 10,
+            b'A'..=b'F' if radix == 16 => u32::from(c - b'A') + 10,
+            _ => break,
+        };
+        if digit >= radix {
+            return false;
+        }
+        let Some(next) = value.checked_mul(radix).and_then(|v| v.checked_add(digit)) else {
+            return false;
+        };
+        value = next;
+        digits += 1;
+        at += 1;
+    }
+    digits > 0 && value >= MIN_VARIANT_COUNT
+}
+
+/// Conservative per-segment pre-screen for `Rule::VariantCount` (`blaze-lint/src/variants.rs`
+/// `site_at`): returns `false` ONLY when `seg` (`text[seg_start..seg_end]`) provably contains no
+/// integer literal >= 3 in any of the three counting positions (`const`/`static` initializer,
+/// `[T; N]` array length, `..N` range end). Any cross-boundary token ambiguity returns `true`.
+fn segment_may_have_variant_count_site(
+    seg: &str,
+    seg_start: usize,
+    seg_end: usize,
+    file_len: usize,
+    toks: &mut AVec<'_, SiteTok>,
+) -> bool {
+    if !seg.as_bytes().iter().any(u8::is_ascii_digit) {
+        return false;
+    }
+    toks.clear();
+    let mut pos = 0u32;
+    let mut has_int = false;
+    for token in blaze_lex::tokenize(seg, blaze_lex::FrontmatterAllowed::No, blaze_lex::Cpu::BASELINE) {
+        let start = pos;
+        let end = pos.saturating_add(token.len);
+        pos = end;
+        let g = match token.kind {
+            blaze_lex::TokenKind::Whitespace
+            | blaze_lex::TokenKind::LineComment { .. }
+            | blaze_lex::TokenKind::BlockComment { .. } => continue,
+            blaze_lex::TokenKind::Eof => break,
+            blaze_lex::TokenKind::Ident => SiteG::Ident,
+            blaze_lex::TokenKind::Literal { kind: blaze_lex::LiteralKind::Int { .. }, .. } => {
+                has_int = true;
+                SiteG::Int
+            }
+            blaze_lex::TokenKind::Semi => SiteG::P(b';'),
+            blaze_lex::TokenKind::Comma => SiteG::P(b','),
+            blaze_lex::TokenKind::Dot => SiteG::P(b'.'),
+            blaze_lex::TokenKind::OpenParen => SiteG::P(b'('),
+            blaze_lex::TokenKind::CloseParen => SiteG::P(b')'),
+            blaze_lex::TokenKind::OpenBrace => SiteG::P(b'{'),
+            blaze_lex::TokenKind::CloseBrace => SiteG::P(b'}'),
+            blaze_lex::TokenKind::OpenBracket => SiteG::P(b'['),
+            blaze_lex::TokenKind::CloseBracket => SiteG::P(b']'),
+            blaze_lex::TokenKind::Pound => SiteG::P(b'#'),
+            blaze_lex::TokenKind::Colon => SiteG::P(b':'),
+            blaze_lex::TokenKind::Eq => SiteG::P(b'='),
+            blaze_lex::TokenKind::Bang => SiteG::P(b'!'),
+            blaze_lex::TokenKind::Lt => SiteG::P(b'<'),
+            blaze_lex::TokenKind::Gt => SiteG::P(b'>'),
+            blaze_lex::TokenKind::Minus => SiteG::P(b'-'),
+            blaze_lex::TokenKind::And => SiteG::P(b'&'),
+            blaze_lex::TokenKind::Or => SiteG::P(b'|'),
+            blaze_lex::TokenKind::Plus => SiteG::P(b'+'),
+            blaze_lex::TokenKind::Star => SiteG::P(b'*'),
+            blaze_lex::TokenKind::Slash => SiteG::P(b'/'),
+            blaze_lex::TokenKind::Caret => SiteG::P(b'^'),
+            blaze_lex::TokenKind::Percent => SiteG::P(b'%'),
+            _ => SiteG::Other,
+        };
+        toks.push(SiteTok { start, end, g });
+    }
+    if !has_int {
+        return false;
+    }
+    for (i, &t) in toks.iter().enumerate() {
+        if t.g != SiteG::Int {
+            continue;
+        }
+        let (Ok(ts), Ok(te)) = (usize::try_from(t.start), usize::try_from(t.end)) else {
+            return true;
+        };
+        let Some(lit) = seg.get(ts..te) else {
+            return true;
+        };
+        if !int_at_least_min(lit) {
+            continue;
+        }
+        let prev = i.checked_sub(1).and_then(|j| toks.get(j).copied());
+        let Some(prev) = prev else {
+            if seg_start > 0 {
+                return true;
+            }
+            continue;
+        };
+        let next = toks.get(i + 1).copied();
+        let at_seg_end = next.is_none() && seg_end < file_len;
+        match prev.g {
+            // (b) `[T; N]` / `[x; N]`
+            SiteG::P(b';') => {
+                if at_seg_end || matches!(next, Some(SiteTok { g: SiteG::P(b']'), .. })) {
+                    return true;
+                }
+            }
+            // (c) `a..N` / `..N`
+            SiteG::P(b'.') => {
+                let b2 = i.checked_sub(2).and_then(|j| toks.get(j).copied());
+                let Some(b2) = b2 else {
+                    if seg_start > 0 {
+                        return true;
+                    }
+                    continue;
+                };
+                if b2.g != SiteG::P(b'.') || b2.end != prev.start {
+                    continue;
+                }
+                let b3 = i.checked_sub(3).and_then(|j| toks.get(j).copied());
+                if b3.is_some_and(|tok| tok.g == SiteG::P(b'.') && tok.end == b2.start) {
+                    continue;
+                }
+                let ends = match next {
+                    None => true,
+                    Some(n) => matches!(n.g, SiteG::P(b')' | b']' | b'}' | b',' | b';' | b'{')),
+                };
+                if ends {
+                    return true;
+                }
+            }
+            // (a) `const N: T = K;` / `static N: T = K;`
+            SiteG::P(b'=') => {
+                if !at_seg_end && !matches!(next, Some(SiteTok { g: SiteG::P(b';'), .. })) {
+                    continue;
+                }
+                let b2 = i.checked_sub(2).and_then(|j| toks.get(j).copied());
+                if let Some(b2) = b2
+                    && b2.end == prev.start
+                    && matches!(
+                        b2.g,
+                        SiteG::P(b'=' | b'<' | b'>' | b'!' | b'+' | b'-' | b'*' | b'/' | b'%' | b'^' | b'&' | b'|')
+                    )
+                {
+                    continue;
+                }
+                let mut depth = 0usize;
+                for n in 2..=65usize {
+                    let Some(b) = i.checked_sub(n).and_then(|j| toks.get(j).copied()) else {
+                        if seg_start > 0 {
+                            return true;
+                        }
+                        break;
+                    };
+                    match b.g {
+                        SiteG::P(b')' | b']') => depth += 1,
+                        SiteG::P(b'(' | b'[') => {
+                            let Some(next_depth) = depth.checked_sub(1) else { break };
+                            depth = next_depth;
+                        }
+                        SiteG::P(b';' | b'{' | b'}' | b'=') if depth == 0 => break,
+                        SiteG::Ident if depth == 0 => {
+                            let word = usize::try_from(b.start)
+                                .ok()
+                                .zip(usize::try_from(b.end).ok())
+                                .and_then(|(s, e)| seg.get(s..e));
+                            match word {
+                                Some("const" | "static") => return true,
+                                Some("let") => break,
+                                _ => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether unit `plan` (with child `holes`) may contain a `Rule::VariantCount` counting site in
+/// its own bytes. Scans only the unit's own slices, never the untouched rest of the file.
+fn may_have_variant_count_site(text: &str, plan: UnitPlan, holes: &[Span], toks: &mut AVec<'_, SiteTok>) -> bool {
+    let Ok(base) = usize::try_from(plan.base) else { return true };
+    let Ok(end) = usize::try_from(plan.end) else { return true };
+    let Some(whole) = text.get(base..end) else { return true };
+    let mut from = 0usize;
+    for hole in holes {
+        let Ok(h_start) = usize::try_from(hole.start) else { return true };
+        let Ok(h_end) = usize::try_from(hole.end) else { return true };
+        let Some(seg) = whole.get(from..h_start) else { return true };
+        if segment_may_have_variant_count_site(seg, base + from, base + h_start, text.len(), toks) {
+            return true;
+        }
+        from = h_end;
+    }
+    let Some(rest) = whole.get(from..) else { return true };
+    segment_may_have_variant_count_site(rest, base + from, end, text.len(), toks)
+}
+
+/// Prepared unit plans, ancestor-derived scopes, holes, and optional `variant-count` facts shared
+/// by [`lint_units_in`] and [`lint_units_sparse`].
+struct PreparedUnits<'a> {
+    jobs: AVec<'a, (usize, usize)>,
+    lone: AVec<'a, (usize, Lone)>,
+    holes: AVec<'a, Span>,
+    variants: Option<Variants<'a>>,
+}
+
+#[expect(clippy::too_many_arguments, reason = "shared unit planning & scoping core for lint_units_in and lint_units_sparse")]
+fn prepare_units<'a>(
+    items: &[blaze_surface::Item],
+    chain_of: &dyn Fn(usize) -> u64,
+    text: &str,
+    path: &str,
+    file: ContentId,
+    asked: &[AskedUnit],
+    rules: &RuleSet,
+    marks: RootMarks,
+    alloc: Alloc<'a>,
+    counts: &mut LintCounts,
+) -> Result<PreparedUnits<'a>, SparseLintError> {
+    let text_len = u32::try_from(text.len()).map_err(|_| SparseLintError::Unplanned)?;
+    let mut jobs: AVec<'a, (usize, usize)> = AVec::with_capacity_in(asked.len(), alloc);
+    for (task, (name, place)) in asked.iter().enumerate() {
+        if let Some(unit) = unit_at(items, chain_of, file, *name, *place) {
+            jobs.push((unit, task));
+        }
+    }
+    jobs.sort_unstable();
+    let (root_scope, read_heads) = file_scope_counted(marks, path, text);
+    if read_heads {
+        counts.heads_read += 1;
+    }
+    let none = RuleSet::only(&[]);
+    let sparse_plan = jobs.len().saturating_mul(8) < items.len().saturating_add(1);
+    let (lone, holes) = if jobs.is_empty() {
+        (AVec::new_in(alloc), AVec::new_in(alloc))
+    } else if sparse_plan {
+        // Sparse path: plan and scope ONLY the asked units and their ancestor chain — avoiding
+        // O(items.len()) planning and scope/walked table allocations on large files.
+        let mut ancestors: AVec<'_, usize> = AVec::new_in(alloc);
+        let mut needed: AVec<'_, usize> = AVec::with_capacity_in(jobs.len().saturating_add(4), alloc);
+        for &(unit, _) in jobs.iter() {
+            needed.push(unit);
+            let mut up = Units::parent_of(items, unit);
+            let mut hops = 0usize;
+            while let Some(parent) = up {
+                hops += 1;
+                if hops > items.len().saturating_add(1) {
+                    return Err(SparseLintError::Unplanned);
+                }
+                ancestors.push(parent);
+                needed.push(parent);
+                up = Units::parent_of(items, parent);
+            }
+        }
+        ancestors.sort_unstable();
+        ancestors.dedup();
+        needed.sort_unstable();
+        needed.dedup();
+        let mut scopes: AVec<'_, Option<Scope>> = AVec::with_capacity_in(needed.len(), alloc);
+        scopes.resize(needed.len(), None);
+        if needed.first() == Some(&0)
+            && let Some(slot) = scopes.first_mut()
+        {
+            *slot = Some(root_scope);
+        }
+        let mut findings = Findings::new_in(alloc);
+        let mut scratch = blaze_lint::Scratch::new_in(alloc);
+        let mut parent_holes: AVec<'_, Span> = AVec::new_in(alloc);
+        let mut parent_children: AVec<'_, usize> = AVec::new_in(alloc);
+        for &parent in ancestors.iter() {
+            let slot = needed.binary_search(&parent).map_err(|_| SparseLintError::Unscoped)?;
+            let scope = scopes.get(slot).copied().flatten().ok_or(SparseLintError::Unscoped)?;
+            let (base, end) = unit_bounds(items, parent, text_len)?;
+            parent_holes.clear();
+            parent_children.clear();
+            let mut children = blaze_lint::ChildHoles::of(items, parent);
+            for (entry, hole) in children.by_ref() {
+                parent_holes.push(hole);
+                parent_children.push(entry + 1);
+            }
+            if children.bad.is_some() {
+                return Err(SparseLintError::Unplanned);
+            }
+            let child_count = u32::try_from(parent_holes.len()).map_err(|_| SparseLintError::Unplanned)?;
+            let plan = UnitPlan { base, end, children: blaze_lint::Run { from: 0, to: child_count } };
+            let own = blaze_lint::own_text(plan, &parent_holes, text, alloc).map_err(|_| SparseLintError::Unlinted)?;
+            findings.clear();
+            let at = Geometry { base, len: end.saturating_sub(base), holes: &parent_holes };
+            let linted = blaze_lint::lint_own_with(&none, &own, scope, at, None, &mut scratch, &mut findings).map_err(|_| SparseLintError::Unlinted)?;
+            let mut ni = 0usize;
+            for (&child, &given) in parent_children.iter().zip(linted.children.iter()) {
+                while let Some(&want) = needed.get(ni)
+                    && want < child
+                {
+                    ni += 1;
+                }
+                let Some(&want) = needed.get(ni) else { break };
+                if want == child {
+                    if let Some(dst) = scopes.get_mut(ni) {
+                        *dst = Some(given);
+                    }
+                    ni += 1;
+                }
+            }
+            counts.units_walked += 1;
+            counts.bytes_lexed += u64::try_from(own.text.len()).unwrap_or(u64::MAX);
+        }
+        let mut holes: AVec<'a, Span> = AVec::new_in(alloc);
+        let mut lone: AVec<'a, (usize, Lone)> = AVec::with_capacity_in(jobs.len(), alloc);
+        for &(unit, task) in jobs.iter() {
+            let name = asked.get(task).ok_or(SparseLintError::Unplanned)?.0;
+            let (base, end) = unit_bounds(items, unit, text_len)?;
+            let from = u32::try_from(holes.len()).map_err(|_| SparseLintError::Unplanned)?;
+            let mut children = blaze_lint::ChildHoles::of(items, unit);
+            for (_, hole) in children.by_ref() {
+                holes.push(hole);
+            }
+            if children.bad.is_some() {
+                return Err(SparseLintError::Unplanned);
+            }
+            let to = u32::try_from(holes.len()).map_err(|_| SparseLintError::Unplanned)?;
+            let plan = UnitPlan { base, end, children: blaze_lint::Run { from, to } };
+            let slot = needed.binary_search(&unit).map_err(|_| SparseLintError::Unscoped)?;
+            let scope = scopes.get(slot).copied().flatten().ok_or(SparseLintError::Unscoped)?;
+            let is_top_level_use = is_top_level_use_unit(items, unit);
+            lone.push((unit, Lone { name, plan, scope, is_top_level_use }));
+        }
+        (lone, holes)
+    } else {
+        // Dense path (cold / whole-file lint): plan all units once into flat arrays.
+        let units = Units::plan(items, text.len(), alloc).map_err(|_| SparseLintError::Unplanned)?;
+        let count = units.list.len();
+        let mut scopes: AVec<'_, Option<Scope>> = AVec::with_capacity_in(count, alloc);
+        scopes.resize(count, None);
+        if let Some(slot) = scopes.first_mut() {
+            *slot = Some(root_scope);
+        }
+        let mut walked: AVec<'_, bool> = AVec::with_capacity_in(count, alloc);
+        walked.resize(count, false);
+        let mut findings = Findings::new_in(alloc);
+        let mut stack: AVec<'_, usize> = AVec::new_in(alloc);
+        let mut scratch = blaze_lint::Scratch::new_in(alloc);
+        for &(unit, _) in jobs.iter() {
+            stack.clear();
+            let mut up = Units::parent_of(items, unit);
+            while let Some(parent) = up {
+                if walked.get(parent).copied().unwrap_or(false) {
+                    break;
+                }
+                stack.push(parent);
+                up = Units::parent_of(items, parent);
+            }
+            while let Some(parent) = stack.pop() {
+                let scope = scopes.get(parent).copied().flatten().ok_or(SparseLintError::Unscoped)?;
+                let own = units.own(parent, text, alloc).map_err(|_| SparseLintError::Unlinted)?;
+                findings.clear();
+                let linted = blaze_lint::lint_own_with(&none, &own, scope, geometry(&units, parent), None, &mut scratch, &mut findings).map_err(|_| SparseLintError::Unlinted)?;
+                for (child, given) in units.children_of(parent).iter().zip(linted.children.iter()) {
+                    if let Ok(idx) = usize::try_from(*child)
+                        && let Some(slot) = scopes.get_mut(idx)
+                    {
+                        *slot = Some(*given);
+                    }
+                }
+                if let Some(slot) = walked.get_mut(parent) {
+                    *slot = true;
+                }
+                counts.units_walked += 1;
+                counts.bytes_lexed += u64::try_from(own.text.len()).unwrap_or(u64::MAX);
+            }
+        }
+        let mut lone: AVec<'a, (usize, Lone)> = AVec::with_capacity_in(jobs.len(), alloc);
+        for &(unit, task) in jobs.iter() {
+            let name = asked.get(task).ok_or(SparseLintError::Unplanned)?.0;
+            let plan = *units.list.get(unit).ok_or(SparseLintError::Unplanned)?;
+            let scope = scopes.get(unit).copied().flatten().ok_or(SparseLintError::Unscoped)?;
+            let is_top_level_use = is_top_level_use_unit(items, unit);
+            lone.push((unit, Lone { name, plan, scope, is_top_level_use }));
+        }
+        (lone, units.holes)
+    };
+    let variants = if rules.runs(Rule::VariantCount) {
+        let need_gather = if lone.is_empty() {
+            false
+        } else {
+            let asked_bytes = lone
+                .iter()
+                .map(|&(_, one)| usize::try_from(one.plan.end.saturating_sub(one.plan.base)).unwrap_or(usize::MAX))
+                .fold(0usize, usize::saturating_add);
+            if asked_bytes < text.len() / 2 {
+                let mut tok_buf: AVec<'_, SiteTok> = AVec::new_in(alloc);
+                lone.iter().any(|&(_, one)| {
+                    let unit_holes = blaze_lint::holes_in(one.plan, &holes);
+                    may_have_variant_count_site(text, one.plan, unit_holes, &mut tok_buf)
+                })
+            } else {
+                true
+            }
+        };
+        if need_gather {
+            counts.variants_gathered += 1;
+            Some(Variants::gather(text, alloc).map_err(|_| SparseLintError::Ungathered)?)
+        } else {
+            Some(Variants::new_in(alloc))
+        }
+    } else {
+        None
+    };
+    Ok(PreparedUnits { jobs, lone, holes, variants })
 }
 
 /// The asked units of one file, linted by `rules` and what `marks` add to them (each rule whose
@@ -569,79 +1052,21 @@ pub(crate) fn lint_units_in<S: Split>(
 ) -> Result<(), &'static str> {
     let marked = marks.rules(*rules);
     let rules = &marked;
-    let units = Units::plan(items, text.len(), alloc).map_err(|_| UNPLANNED)?;
-    let count = units.list.len();
-    // 1. Each asked task's unit, in unit order: (unit, task).
-    let mut jobs: AVec<'_, (usize, usize)> = AVec::with_capacity_in(asked.len(), alloc);
-    for (task, (name, place)) in asked.iter().enumerate() {
-        if let Some(unit) = unit_at(items, chain_of, file, *name, *place) {
-            jobs.push((unit, task));
-        }
-    }
-    jobs.sort_unstable();
-    // 2. Each asked unit's scope: its ancestors walked outermost first, each once, no rule.
-    let mut scopes: AVec<'_, Option<Scope>> = AVec::with_capacity_in(count, alloc);
-    scopes.resize(count, None);
-    scopes[0] = Some(file_scope_in(marks, path, text));
-    if reads_own_heads(marks, path) {
-        counts.heads_read += 1;
-    }
-    let mut walked: AVec<'_, bool> = AVec::with_capacity_in(count, alloc);
-    walked.resize(count, false);
-    let none = RuleSet::only(&[]);
-    let mut findings = Findings::new_in(alloc);
-    let mut stack: AVec<'_, usize> = AVec::new_in(alloc);
-    let mut scratch = blaze_lint::Scratch::new_in(alloc);
-    for &(unit, _) in jobs.iter() {
-        stack.clear();
-        let mut up = Units::parent_of(items, unit);
-        // Bounded: one turn an ancestor.
-        while let Some(parent) = up {
-            if walked[parent] {
-                break;
-            }
-            stack.push(parent);
-            up = Units::parent_of(items, parent);
-        }
-        while let Some(parent) = stack.pop() {
-            let scope = scopes[parent].ok_or(UNSCOPED)?;
-            let own = units.own(parent, text, alloc).map_err(|_| UNLINTED)?;
-            findings.clear();
-            let linted = blaze_lint::lint_own_with(&none, &own, scope, geometry(&units, parent), None, &mut scratch, &mut findings).map_err(|_| UNLINTED)?;
-            for (child, given) in units.children_of(parent).iter().zip(linted.children.iter()) {
-                scopes[*child as usize] = Some(*given);
-            }
-            walked[parent] = true;
-            counts.units_walked += 1;
-            counts.bytes_lexed += own.text.len() as u64;
-        }
-    }
-    // 3. The file's facts the rules read.
-    let variants = match rules.runs(Rule::VariantCount) {
-        true => {
-            counts.variants_gathered += 1;
-            Some(Variants::gather(text, alloc).map_err(|_| UNGATHERED)?)
-        }
-        false => None,
-    };
-    let mut lone: AVec<'_, Lone> = AVec::with_capacity_in(jobs.len(), alloc);
-    for &(unit, task) in jobs.iter() {
-        lone.push(Lone { name: asked[task].0, plan: units.list[unit], scope: scopes[unit].ok_or(UNSCOPED)? });
-    }
-    let shared = Shared { text, holes: &units.holes, rules, variants: variants.as_ref().map(Variants::view) };
+    let prepared = prepare_units(items, chain_of, text, path, file, asked, rules, marks, alloc, counts).map_err(SparseLintError::as_str)?;
+    let shared = Shared { text, holes: &prepared.holes, rules, variants: prepared.variants.as_ref().map(Variants::view) };
     // 4. The asked units linted, merged in unit order.
-    let mut made: Vec<Record<Global>, Global> = Vec::with_capacity_in(lone.len(), Global);
+    let mut made: Vec<Record<Global>, Global> = Vec::with_capacity_in(prepared.lone.len(), Global);
     match S::BATCH {
-        Some(batch) if lone.len() > batch => {
+        Some(batch) if prepared.lone.len() > batch => {
             let scope = cx.scope();
-            let mut running = Vec::with_capacity_in(lone.len().div_ceil(batch), Global);
-            for chunk in lone.chunks(batch) {
+            let mut running = Vec::with_capacity_in(prepared.lone.len().div_ceil(batch), Global);
+            for chunk in prepared.lone.chunks(batch) {
                 running.push(scope.may_overlap("lint units, a batch of a file's", BATCH_FRAME, move |cx: &bstd::cx::Cx| {
                     let erased = blaze_own::Erased::new(cx.frame());
                     Ok::<_, core::convert::Infallible>(lint_batch(shared, chunk, erased.handle()))
                 }));
             }
-            counts.batches += running.len() as u64;
+            counts.batches += u64::try_from(running.len()).unwrap_or(u64::MAX);
             let mut ran = Vec::with_capacity_in(running.len(), Global);
             for handle in running.into_iter() {
                 ran.push(handle.join(cx).ok());
@@ -654,17 +1079,19 @@ pub(crate) fn lint_units_in<S: Split>(
             }
         }
         _ => {
-            let (records, bytes) = lint_batch(shared, &lone, alloc)?;
+            let (records, bytes) = lint_batch(shared, &prepared.lone, alloc)?;
             made.extend(records);
             counts.bytes_lexed += bytes;
         }
     }
-    counts.units_linted += made.len() as u64;
+    counts.units_linted += u64::try_from(made.len()).unwrap_or(u64::MAX);
     // 5. Each answer in the order asked.
     let mut answers: AVec<'_, Option<(usize, Record<Global>)>> = AVec::with_capacity_in(asked.len(), alloc);
     answers.resize_with(asked.len(), || None);
-    for (&(unit, task), record) in jobs.iter().zip(made) {
-        answers[task] = Some((unit, record));
+    for (&(unit, task), record) in prepared.jobs.iter().zip(made) {
+        if let Some(slot) = answers.get_mut(task) {
+            *slot = Some((unit, record));
+        }
     }
     for answer in answers.iter_mut() {
         did.push(answer.take().ok_or(Why::Refused { what: "a `Lint` part whose file holds no unit of its name at its place", rule: "blaze-cli lints.rs, lint_units_in" }));
@@ -750,79 +1177,14 @@ pub(crate) fn lint_units_sparse<S: Split, A: core::alloc::Allocator + Copy + Sen
 ) -> Result<(), SparseLintError> {
     let marked = marks.rules(*rules);
     let rules = &marked;
-    let units = Units::plan(items, text.len(), alloc).map_err(|_| SparseLintError::Unplanned)?;
-    let count = units.list.len();
-    let mut jobs: AVec<'_, (usize, usize)> = AVec::with_capacity_in(asked.len(), alloc);
-    for (task, (name, place)) in asked.iter().enumerate() {
-        if let Some(unit) = unit_at(items, chain_of, file, *name, *place) {
-            jobs.push((unit, task));
-        }
-    }
-    jobs.sort_unstable();
-    let mut scopes: AVec<'_, Option<Scope>> = AVec::with_capacity_in(count, alloc);
-    scopes.resize(count, None);
-    if let Some(root_scope) = scopes.first_mut() {
-        *root_scope = Some(file_scope_in(marks, path, text));
-    }
-    if reads_own_heads(marks, path) {
-        counts.heads_read += 1;
-    }
-    let mut walked: AVec<'_, bool> = AVec::with_capacity_in(count, alloc);
-    walked.resize(count, false);
-    let none = RuleSet::only(&[]);
-    let mut findings = Findings::new_in(alloc);
-    let mut stack: AVec<'_, usize> = AVec::new_in(alloc);
-    let mut scratch = blaze_lint::Scratch::new_in(alloc);
-    for &(unit, _) in jobs.iter() {
-        stack.clear();
-        let mut up = Units::parent_of(items, unit);
-        while let Some(parent) = up {
-            if walked.get(parent).copied().unwrap_or(false) {
-                break;
-            }
-            stack.push(parent);
-            up = Units::parent_of(items, parent);
-        }
-        while let Some(parent) = stack.pop() {
-            let scope = scopes.get(parent).copied().flatten().ok_or(SparseLintError::Unscoped)?;
-            let own = units.own(parent, text, alloc).map_err(|_| SparseLintError::Unlinted)?;
-            findings.clear();
-            let linted = blaze_lint::lint_own_with(&none, &own, scope, geometry(&units, parent), None, &mut scratch, &mut findings).map_err(|_| SparseLintError::Unlinted)?;
-            for (child, given) in units.children_of(parent).iter().zip(linted.children.iter()) {
-                if let Ok(idx) = usize::try_from(*child)
-                    && let Some(slot) = scopes.get_mut(idx)
-                {
-                    *slot = Some(*given);
-                }
-            }
-            if let Some(slot) = walked.get_mut(parent) {
-                *slot = true;
-            }
-            counts.units_walked += 1;
-            counts.bytes_lexed += u64::try_from(own.text.len()).unwrap_or(u64::MAX);
-        }
-    }
-    let variants = match rules.runs(Rule::VariantCount) {
-        true => {
-            counts.variants_gathered += 1;
-            Some(Variants::gather(text, alloc).map_err(|_| SparseLintError::Ungathered)?)
-        }
-        false => None,
-    };
-    let mut lone: AVec<'_, (usize, Lone)> = AVec::with_capacity_in(jobs.len(), alloc);
-    for &(unit, task) in jobs.iter() {
-        let name = asked.get(task).ok_or(SparseLintError::Unplanned)?.0;
-        let plan = *units.list.get(unit).ok_or(SparseLintError::Unplanned)?;
-        let scope = scopes.get(unit).copied().flatten().ok_or(SparseLintError::Unscoped)?;
-        lone.push((unit, Lone { name, plan, scope }));
-    }
-    let shared = Shared { text, holes: &units.holes, rules, variants: variants.as_ref().map(Variants::view) };
-    let mut made: AVec<'_, SparseUnit<A>> = AVec::with_capacity_in(lone.len(), alloc);
+    let prepared = prepare_units(items, chain_of, text, path, file, asked, rules, marks, alloc, counts)?;
+    let shared = Shared { text, holes: &prepared.holes, rules, variants: prepared.variants.as_ref().map(Variants::view) };
+    let mut made: AVec<'_, SparseUnit<A>> = AVec::with_capacity_in(prepared.lone.len(), alloc);
     match S::BATCH {
-        Some(batch) if lone.len() > batch => {
+        Some(batch) if prepared.lone.len() > batch => {
             let scope = cx.scope();
-            let mut running = Vec::with_capacity_in(lone.len().div_ceil(batch), out_alloc);
-            for chunk in lone.chunks(batch) {
+            let mut running = Vec::with_capacity_in(prepared.lone.len().div_ceil(batch), out_alloc);
+            for chunk in prepared.lone.chunks(batch) {
                 running.push(scope.may_overlap("lint units, a batch of a file's", BATCH_FRAME, move |cx: &bstd::cx::Cx| {
                     let erased = blaze_own::Erased::new(cx.frame());
                     Ok::<_, core::convert::Infallible>(lint_batch_sparse(shared, chunk, erased.handle(), out_alloc))
@@ -841,7 +1203,7 @@ pub(crate) fn lint_units_sparse<S: Split, A: core::alloc::Allocator + Copy + Sen
             }
         }
         _ => {
-            let (units_out, bytes) = lint_batch_sparse(shared, &lone, alloc, out_alloc)?;
+            let (units_out, bytes) = lint_batch_sparse(shared, &prepared.lone, alloc, out_alloc)?;
             made.extend(units_out);
             counts.bytes_lexed += bytes;
         }
@@ -849,7 +1211,7 @@ pub(crate) fn lint_units_sparse<S: Split, A: core::alloc::Allocator + Copy + Sen
     counts.units_linted += u64::try_from(made.len()).unwrap_or(u64::MAX);
     let mut answers: AVec<'_, Option<SparseUnit<A>>> = AVec::with_capacity_in(asked.len(), alloc);
     answers.resize_with(asked.len(), || None);
-    for (&(_, task), unit) in jobs.iter().zip(made) {
+    for (&(_, task), unit) in prepared.jobs.iter().zip(made) {
         if let Some(slot) = answers.get_mut(task) {
             *slot = Some(unit);
         }
@@ -876,9 +1238,9 @@ fn lint_batch_sparse<A: core::alloc::Allocator + Copy>(
         let holes = blaze_lint::holes_in(one.plan, shared.holes);
         let own = blaze_lint::own_text(one.plan, holes, shared.text, alloc).map_err(|_| SparseLintError::Unlinted)?;
         findings.clear();
-        let at = Geometry { base: one.plan.base, len: one.plan.end - one.plan.base, holes };
+        let at = Geometry { base: one.plan.base, len: one.plan.end.saturating_sub(one.plan.base), holes };
         let mut linted = blaze_lint::lint_own_with(shared.rules, &own, one.scope, at, shared.variants, &mut scratch, &mut findings).map_err(|_| SparseLintError::Unlinted)?;
-        if shared.rules.runs(Rule::UnusedImport) && holes.is_empty() && own.text.contains("use") {
+        if shared.rules.runs(Rule::UnusedImport) && one.is_top_level_use {
             blaze_lint::unused_imports_for_range(shared.text, one.scope, one.plan.base, one.plan.end, alloc, &mut findings, &mut linted).map_err(|_| SparseLintError::Unlinted)?;
         }
         bytes += u64::try_from(own.text.len()).unwrap_or(u64::MAX);
@@ -917,21 +1279,21 @@ fn lint_batch_sparse<A: core::alloc::Allocator + Copy>(
 /// The units `lone` linted by `shared.rules` in `alloc`: each one's record, in order, and the
 /// own bytes lexed. A function of its inputs alone, so a batch on a worker answers what the
 /// file's own task would ([`Split`]).
-fn lint_batch(shared: Shared<'_>, lone: &[Lone], alloc: Alloc<'_>) -> Result<(Vec<Record<Global>, Global>, u64), &'static str> {
+fn lint_batch(shared: Shared<'_>, lone: &[(usize, Lone)], alloc: Alloc<'_>) -> Result<(Vec<Record<Global>, Global>, u64), &'static str> {
     let mut records = Vec::with_capacity_in(lone.len(), Global);
     let mut bytes = 0u64;
     let mut findings = Findings::new_in(alloc);
     let mut scratch = blaze_lint::Scratch::new_in(alloc);
-    for one in lone {
+    for &(_, one) in lone {
         let holes = blaze_lint::holes_in(one.plan, shared.holes);
         let own = blaze_lint::own_text(one.plan, holes, shared.text, alloc).map_err(|_| UNLINTED)?;
         findings.clear();
-        let at = Geometry { base: one.plan.base, len: one.plan.end - one.plan.base, holes };
+        let at = Geometry { base: one.plan.base, len: one.plan.end.saturating_sub(one.plan.base), holes };
         let mut linted = blaze_lint::lint_own_with(shared.rules, &own, one.scope, at, shared.variants, &mut scratch, &mut findings).map_err(|_| UNLINTED)?;
-        if shared.rules.runs(Rule::UnusedImport) && holes.is_empty() && own.text.contains("use") {
+        if shared.rules.runs(Rule::UnusedImport) && one.is_top_level_use {
             blaze_lint::unused_imports_for_range(shared.text, one.scope, one.plan.base, one.plan.end, alloc, &mut findings, &mut linted).map_err(|_| UNLINTED)?;
         }
-        bytes += own.text.len() as u64;
+        bytes += u64::try_from(own.text.len()).unwrap_or(u64::MAX);
         records.push(record(one.name, shared.rules, own.text.as_str(), &findings, &linted));
     }
     Ok((records, bytes))
@@ -1140,5 +1502,178 @@ mod tests {
         assert!(marks.rules(Step::Rust.rules()).runs(Rule::SansIoCore));
         // The marks are in the key: a unit of a marked file is not the unmarked one's.
         assert_ne!(marks.key(), marks_of("", module).key());
+        // Same-slice fast path matches joining `RootMarks::read` with itself.
+        assert_eq!(marks_of(root, root), RootMarks::read(root).join(RootMarks::read(root)));
+    }
+
+    #[test]
+    fn file_scope_matches_all_path_shapes_without_alloc() {
+        assert_eq!(file_scope("app/src/lib.rs"), Scope::file(TestBits::NONE, false, false));
+        assert_eq!(file_scope("app/src/main.rs"), Scope::file(TestBits::NONE, true, false));
+        assert_eq!(file_scope("app/src/bin/tool.rs"), Scope::file(TestBits::NONE, true, false));
+        assert_eq!(file_scope("app/src/bin/tool/main.rs"), Scope::file(TestBits::NONE, true, false));
+        assert_eq!(file_scope("app/examples/demo.rs"), Scope::file(TestBits::NONE, true, false));
+        assert_eq!(file_scope("app/examples/demo/main.rs"), Scope::file(TestBits::NONE, true, false));
+        assert_eq!(file_scope("app/tests/it.rs"), Scope::file(TestBits::CFG, false, false));
+        assert_eq!(file_scope("app/benches/b.rs"), Scope::file(TestBits::CFG, false, false));
+        assert_eq!(file_scope("app/src/tests.rs"), Scope::file(TestBits::CFG, false, false));
+        assert_eq!(file_scope("app/src/test.rs"), Scope::file(TestBits::CFG, false, false));
+        assert_eq!(file_scope("app/build.rs"), Scope::file(TestBits::NONE, false, true));
+        assert_eq!(file_scope("app/src/build.rs"), Scope::file(TestBits::NONE, false, false));
+        assert_eq!(file_scope("build.rs"), Scope::file(TestBits::NONE, false, false));
+    }
+
+    /// Sparse 1-unit lint on a large synthetic multi-enum file must match full-file lint
+    /// byte-for-byte (unit, name, tokens, cost, findings, words, fixes) while skipping
+    /// whole-file `Variants::gather` when the asked unit has no counting site and never running
+    /// whole-file `UnusedImport` on non-`use` units.
+    #[test]
+    fn sparse_single_unit_lint_matches_full_file_on_large_multi_enum_file() {
+        use bstd::io::{Io, Limits, SimWorld};
+
+        type SparseSnap = (
+            usize,
+            Name,
+            u32,
+            blaze_lint::Cost,
+            Option<(std::vec::Vec<(u16, u32, u32, usize, usize)>, std::vec::Vec<u8>, std::vec::Vec<u8>)>,
+        );
+
+        let snap = |res: Result<SparseUnit<Global>, Why>| -> SparseSnap {
+            let u = res.expect("unit linted");
+            let found = u.found.map(|f| (f.findings.into_iter().collect(), f.words.into_iter().collect(), f.fixes.into_iter().collect()));
+            (u.unit, u.name, u.tokens, u.cost, found)
+        };
+
+        let mut text = std::string::String::from(
+            "//! Synthetic large multi-enum module.\n\
+             use core::fmt::Debug;\n\
+             pub enum Three { A, B, C }\n\
+             pub enum Five { A, B, C, D, E }\n\
+             pub enum Seven { A, B, C, D, E, F, G }\n\
+             pub const SITE_CONST: usize = 3;\n\
+             pub struct Big;\n\
+             impl Big {\n",
+        );
+        for i in 0..200usize {
+            if i == 100 {
+                text.push_str(
+                    "    pub fn refuse_user(&self, n: u32) -> u32 {\n\
+                         let x = 5;\n\
+                         for _ in 0..=7 {}\n\
+                         let _ = 0..7 + 1;\n\
+                         x + n\n\
+                     }\n",
+                );
+            } else if i == 110 {
+                text.push_str("    pub fn site_array(&self) -> [u8; 5] { [0u8; 5] }\n");
+            } else if i == 120 {
+                text.push_str("    pub fn site_range(&self) { for _ in 0..7 {} }\n");
+            } else {
+                text.push_str(&std::format!("    pub fn f{i:03}(&self, n: u32) -> u32 {{ n + 1 }}\n"));
+            }
+        }
+        text.push_str("}\n");
+
+        let io = Io::simulated(SimWorld::new(101, Limits::USUAL));
+        let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("root context");
+        let alloc = blaze_own::testing::heap().alloc();
+        let path = "app/src/big.rs";
+        let file = ContentId::of("lints sparse multi enum test", path.as_bytes());
+        let outline = blaze_file_items::outline(&text, blaze_surface::Edition::E2024, alloc);
+        let items = outline.items();
+        let chain_of = |at: usize| crate::work::item_chain(&outline, &items[at], &text);
+        let marks = marks_of(&text, &text);
+        let rules = Step::Strict.rules().with(Rule::UnusedImport);
+
+        let mut parts = Vec::new_in(Global);
+        parts_in(&outline, &text, path, file, marks, &rules, alloc, &mut parts).expect("lint parts");
+        let whole = file_lints_name(file);
+        let all_asked: std::vec::Vec<AskedUnit> = parts.iter().filter(|p| p.name != whole).map(|p| (p.name, p.place)).collect();
+
+        let mut full_counts = LintCounts::default();
+        let mut full_did = AVec::with_capacity_in(all_asked.len(), alloc);
+        lint_units_sparse::<Serial, Global>(&cx, items, &chain_of, &text, path, file, &all_asked, &rules, marks, alloc, Global, &mut full_counts, &mut full_did)
+            .expect("full lint");
+        let full_snaps: std::vec::Vec<SparseSnap> = full_did.into_iter().map(snap).collect();
+        assert_eq!(full_counts.variants_gathered, 1, "full-file lint gathers variants once");
+
+        let find_asked = |needle: &str| -> (AskedUnit, &SparseSnap) {
+            let start = u32::try_from(text.find(needle).expect("needle present")).expect("u32 offset");
+            let idx = all_asked
+                .iter()
+                .enumerate()
+                .position(|(i, &(_, place))| place == start && full_snaps[i].0 > 0)
+                .expect("asked item unit at needle");
+            (all_asked[idx], &full_snaps[idx])
+        };
+
+        // 1. Plain method containing decoys (`let x = 5`, `0..=7`, `0..7 + 1`) and substring `"use"`:
+        //    byte-identical to full-file lint AND skips whole-file `Variants::gather`.
+        let (asked_plain, full_plain) = find_asked("pub fn refuse_user");
+        let mut counts = LintCounts::default();
+        let mut did = AVec::with_capacity_in(1, alloc);
+        lint_units_sparse::<Serial, Global>(&cx, items, &chain_of, &text, path, file, &[asked_plain], &rules, marks, alloc, Global, &mut counts, &mut did)
+            .expect("sparse plain lint");
+        let got_plain = snap(did.pop().expect("one answer"));
+        assert_eq!(&got_plain, full_plain, "sparse plain unit must match full-file lint byte-for-byte");
+        assert_eq!(counts.variants_gathered, 0, "non-site unit must skip whole-file Variants::gather");
+        assert_eq!((counts.units_walked, counts.units_linted), (2, 1));
+
+        // 2. Method with array counting site `[0u8; 5]`: gathers variants and matches full-file lint.
+        let (asked_array, full_array) = find_asked("pub fn site_array");
+        let mut counts = LintCounts::default();
+        let mut did = AVec::with_capacity_in(1, alloc);
+        lint_units_sparse::<Serial, Global>(&cx, items, &chain_of, &text, path, file, &[asked_array], &rules, marks, alloc, Global, &mut counts, &mut did)
+            .expect("sparse array site lint");
+        let got_array = snap(did.pop().expect("one answer"));
+        assert_eq!(&got_array, full_array, "sparse array-site unit must match full-file lint byte-for-byte");
+        assert_eq!(counts.variants_gathered, 1);
+        assert!(
+            got_array.4.as_ref().is_some_and(|f| f.0.iter().any(|row| row.0 == number_of(Rule::VariantCount))),
+            "array site must emit VariantCount finding"
+        );
+
+        // 3. Method with range counting site `0..7`: gathers variants and matches full-file lint.
+        let (asked_range, full_range) = find_asked("pub fn site_range");
+        let mut counts = LintCounts::default();
+        let mut did = AVec::with_capacity_in(1, alloc);
+        lint_units_sparse::<Serial, Global>(&cx, items, &chain_of, &text, path, file, &[asked_range], &rules, marks, alloc, Global, &mut counts, &mut did)
+            .expect("sparse range site lint");
+        let got_range = snap(did.pop().expect("one answer"));
+        assert_eq!(&got_range, full_range, "sparse range-site unit must match full-file lint byte-for-byte");
+        assert_eq!(counts.variants_gathered, 1);
+        assert!(
+            got_range.4.as_ref().is_some_and(|f| f.0.iter().any(|row| row.0 == number_of(Rule::VariantCount))),
+            "range site must emit VariantCount finding"
+        );
+
+        // 4. Top-level `const` counting site `const SITE_CONST: usize = 3;`: matches full-file lint.
+        let (asked_const, full_const) = find_asked("pub const SITE_CONST");
+        let mut counts = LintCounts::default();
+        let mut did = AVec::with_capacity_in(1, alloc);
+        lint_units_sparse::<Serial, Global>(&cx, items, &chain_of, &text, path, file, &[asked_const], &rules, marks, alloc, Global, &mut counts, &mut did)
+            .expect("sparse const site lint");
+        let got_const = snap(did.pop().expect("one answer"));
+        assert_eq!(&got_const, full_const, "sparse const-site unit must match full-file lint byte-for-byte");
+        assert_eq!(counts.variants_gathered, 1);
+        assert!(
+            got_const.4.as_ref().is_some_and(|f| f.0.iter().any(|row| row.0 == number_of(Rule::VariantCount))),
+            "const site must emit VariantCount finding"
+        );
+
+        // 5. Top-level unused `use` item: matches full-file lint and skips Variants::gather.
+        let (asked_use, full_use) = find_asked("use core::fmt::Debug;");
+        let mut counts = LintCounts::default();
+        let mut did = AVec::with_capacity_in(1, alloc);
+        lint_units_sparse::<Serial, Global>(&cx, items, &chain_of, &text, path, file, &[asked_use], &rules, marks, alloc, Global, &mut counts, &mut did)
+            .expect("sparse use lint");
+        let got_use = snap(did.pop().expect("one answer"));
+        assert_eq!(&got_use, full_use, "sparse top-level use unit must match full-file lint byte-for-byte");
+        assert_eq!(counts.variants_gathered, 0);
+        assert!(
+            got_use.4.as_ref().is_some_and(|f| f.0.iter().any(|row| row.0 == number_of(Rule::UnusedImport))),
+            "unused top-level use must emit UnusedImport finding"
+        );
     }
 }

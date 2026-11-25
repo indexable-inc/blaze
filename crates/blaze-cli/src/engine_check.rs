@@ -3698,6 +3698,15 @@ fn checking<'f, 's: 'f>(
                     files.push((*file, &[]));
                 }
             }
+            if whole_plan && !root.owed_tasks.is_empty() {
+                let mut retired_owed_files: SSet<'_, Name> = SSet::new_in(alloc);
+                for planned in root.owed_tasks.values() {
+                    let file = planned.file;
+                    if !today.contains(&file) && !root.files.contains_key(&file) && retired_owed_files.insert(file) {
+                        files.push((file, &[]));
+                    }
+                }
+            }
         }
         (files, phase_counts)
     });

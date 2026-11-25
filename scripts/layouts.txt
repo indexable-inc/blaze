@@ -93,7 +93,7 @@ crates/blaze-engine/src/pages.rs	FILE_SHARD_MAGIC	none
 crates/blaze-engine/src/pages.rs	PAGE_MAGIC	test previous_page_magic_bep5_is_rejected
 crates/blaze-engine/src/pages.rs	PLACES_MAGIC	none
 crates/blaze-engine/src/pages.rs	RADIX_SHARD_MAGIC	none
-crates/blaze-engine/src/pages.rs	ROOT_MAGIC	test previous_root_magic_ber3_is_rejected
+crates/blaze-engine/src/pages.rs	ROOT_MAGIC	test previous_root_magic_ber4_is_rejected
 crates/blaze-engine/src/pages.rs	SUMMARY_MAGIC	none
 crates/blaze-engine/src/pages/headers.rs	MAGIC	none
 crates/blaze-expand/src/kept_set.rs	MAGIC	none
@@ -140,6 +140,7 @@ crates/blaze-ladder/src/front2/head_record.rs	MAGIC	none
 crates/blaze-ladder/src/front2/head_record.rs	VERSION	test previous_version_34_is_rejected
 crates/blaze-ladder/src/front2/tables/head.rs	MAGIC	none
 crates/blaze-ladder/src/front2/tables/head.rs	VERSION	none
+crates/blaze-ladder/src/front2/tables/task.rs	STRETCH_FRONT_MAGIC	test previous_stretch_front_magic_bsf0_is_rejected
 crates/blaze-ladder/src/native_links.rs	TABLE_MAGIC	none
 crates/blaze-ladder/src/natives.rs	AR_MAGIC	none
 crates/blaze-ladder/src/natives.rs	NATIVE_FORMAT	none

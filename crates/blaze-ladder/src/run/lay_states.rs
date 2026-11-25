@@ -140,6 +140,21 @@ pub(super) fn roots_of_instance<P: FrontEnd>(
         tys.sort_unstable();
         tys.dedup();
         for &t in tys.iter() {
+            if matches!(
+                record.node(t),
+                Ok(
+                    PNode::Bool
+                        | PNode::Char
+                        | PNode::Int(_)
+                        | PNode::Uint(_)
+                        | PNode::Float(_)
+                        | PNode::Str
+                        | PNode::Never
+                        | PNode::ConstValue { .. }
+                )
+            ) {
+                continue;
+            }
             if let Ok(g) = ground_saved(&view, record, t, None, args, ground, adts.facts(), alloc) {
                 roots.push(g);
             }

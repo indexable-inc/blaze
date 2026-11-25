@@ -278,6 +278,9 @@ const OWNERLESS_DOMAIN: &str = "blaze-cli engine bodies ownerless 1";
 /// The domain of the verdict of an entry whose expansion wrote several bodies (or none).
 const ENTRY_DOMAIN: &str = "blaze-cli engine bodies expansion entry 1";
 
+/// The domain of the CAS key for a member group's persisted `BSF1` [`StretchFront`] record.
+const STRETCH_FRONT_KEY_DOMAIN: &str = "blaze-cli engine stretch front 1";
+
 // The most bodies a macro wrote that no entry covers named by label in the request's note
 // (the rest counted in it): a cap on the note, never on what is counted (rule 18). Its one
 // home is the member row's form, which keeps a member's first ones (engine_member_rows.rs).
@@ -1622,12 +1625,78 @@ enum FoundAt {
     Tokens(parser::token_key::TokenPlace),
 }
 
+/// Per-group cached [`blaze_ladder::front2::tables::task::StretchFront`] initialized at most
+/// once across all stretches and workers of a member group.
+enum GroupFrontState {
+    /// Loaded from a `BSF1` CAS record or freshly built.
+    Ready {
+        front: blaze_ladder::front2::tables::task::StretchFront,
+        /// CAS key of this `BSF1` record (`Some` when read or queued for `store.put`).
+        key: Option<Key>,
+        /// Newly encoded `BSF1` payload to persist on coordinator merge (`None` on CAS hit or
+        /// when the group's front cannot be keyed from `lang` crates alone).
+        put: Option<(Key, blaze_own::Vec<u8, SharedAlloc<'static>>)>,
+    },
+    /// Fresh `StretchFront::new` refused (e.g. `LangTwice`): bodies surface it per body.
+    None,
+    /// Snapshot read, `BSF1` decode, or `BSF1` encode failed (rule 3: never silently ignored).
+    Error(&'static str),
+}
+
+/// Computes the content-addressed CAS key for `group`'s `BSF1` [`StretchFront`] record,
+/// covering format magic, `BodyCheck` tool identity, and every lang crate in `group.lang`
+/// (reader index, `CrateItemKey`, `CrateScope` name, and `CrateScope::WHOLE` digest).
+/// Returns `None` if any lang crate is unresolvable or its `CrateScope` digest is `ABSENT`.
+fn stretch_front_key<R: ?Sized + CellDigests>(group: &Group<'_, '_>, reads: &R) -> Option<Key> {
+    let mut h = Hasher::new(STRETCH_FRONT_KEY_DOMAIN);
+    h.update(blaze_ladder::front2::tables::task::STRETCH_FRONT_MAGIC);
+    h.update(&group.tool.0.0);
+    let count = u32::try_from(group.lang.len()).ok()?;
+    h.update(&count.to_le_bytes());
+    for &place in group.lang.iter() {
+        let place_u32 = u32::try_from(place).ok()?;
+        let world_at = group.crates.world_at(place)?;
+        let crate_key = group.list.key(world_at);
+        let scope_name = blaze_drive::key::crate_scope_name(&crate_key);
+        let scope_out = reads.cell(&CellId { of: scope_name, cell: WHOLE });
+        if scope_out == ABSENT {
+            return None;
+        }
+        let kind_u64 = u64::try_from(scope_name.kind.index()).ok()?;
+        h.update(&place_u32.to_le_bytes());
+        h.update(&crate_key.0.0);
+        h.update(&kind_u64.to_le_bytes());
+        h.update(&scope_name.subject.0);
+        h.update(&scope_out.0);
+    }
+    Some(Key(h.finish()))
+}
+
+/// True iff every read recorded while building `front` is a `Names` cell of a crate in
+/// `group.lang`, proving [`stretch_front_key`] covers every input (rule 21).
+fn stretch_front_reads_in_lang_crates(
+    group: &Group<'_, '_>,
+    front: &blaze_ladder::front2::tables::task::StretchFront,
+) -> bool {
+    front.reads().iter().all(|read| {
+        let TableRead::Names(cell) = *read else {
+            return false;
+        };
+        let prefix = cell.crate_prefix();
+        group.lang.iter().any(|&place| {
+            group.crates.world_at(place).is_some_and(|at| group.list.key(at).prefix() == prefix)
+        })
+    })
+}
+
 /// One member crate's check scope as a run reads it: all read-only, shared by its runs. Its
 /// crates' records are borrowed in place from the store's mapping for `'r` (engine_records.rs).
 struct Group<'f, 'r> {
     list: blaze_world::crate_list::CrateList<'static>,
     /// The member's own `CrateScope` name.
     own: Name,
+    /// The `BodyCheck` tool identity (covered by the `BSF1` [`stretch_front_key`], rule 21).
+    tool: blaze_drive::Tool,
     /// Its scope's crates in reader order, the member at 0: opened at the setup, or past the
     /// member each at its first question ([`GroupCrates`]).
     crates: GroupCrates<'r>,
@@ -1640,9 +1709,10 @@ struct Group<'f, 'r> {
     lang: Vec<usize, Global>,
     /// Each scope crate's `CrateScope` name, sorted: the whole graph's bucket fact widens to these.
     scope: Vec<Name, Global>,
-    /// Group-scoped lang-item index and receiver pointers built at most once per member group
-    /// across all stretches and workers (zero per-stretch rebuilds, zero stretch-frame growth).
-    front: bstd::sync::Once<Option<blaze_ladder::front2::tables::task::StretchFront>>,
+    /// Group-scoped lang-item index and receiver pointers loaded from `BSF1` CAS or built at most
+    /// once per member group across all stretches and workers (zero per-stretch rebuilds, zero
+    /// stretch-frame growth).
+    front: bstd::sync::Once<GroupFrontState>,
     /// Scheduled body items in this member group for this phase: groups with fewer than 2 bodies
     /// leave `goals` uninitialized so 1-body incremental edits pay zero table overhead.
     bodies: u32,
@@ -3300,6 +3370,7 @@ impl<'s, 'f, 'r> Prepared<'s, 'f, 'r> {
         stage.runs = u32::try_from(runs.len()).unwrap_or(u32::MAX);
         if let Some(found) = self.found.as_ref() {
             stage.uncovered = found.uncovered;
+            stage.persist_stretch_fronts(cx, store, &found.groups, self.heap)?;
         }
         let mut entries: SVec<'a, &[One<'f>]> = SVec::with_capacity_in(runs.len(), alloc);
         let mut buffers: SVec<'a, (Buffer<'a>, SVec<'a, Ran<'f>>, RunOut<'a>)> = SVec::with_capacity_in(runs.len(), alloc);
@@ -4305,9 +4376,42 @@ impl<'f> BodiesStage<'f> {
         let mut entry_runs: SVec<'p, &[One<'f>]> = SVec::with_capacity_in(buffers.len(), at_phase);
         entry_runs.extend(wholes.iter().map(core::slice::from_ref));
         entry_runs.extend(runs[parts.len()..].iter().copied());
+        self.persist_stretch_fronts(&cx, store, &found.groups, heap)?;
         let made = self.join_runs(&cx, store, buffer, times, &entry_runs, buffers, joined_runs, heap, frame, at_phase)?;
         self.wall_ns = self.wall_ns.saturating_add(handles.clock.now().since(began).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)));
         Ok(made)
+    }
+
+    /// Persists any newly built `BSF1` [`blaze_ladder::front2::tables::task::StretchFront`]
+    /// records from `groups` into `store`, pins every read or put `BSF1` key under
+    /// `self.member_rows` so GC keeps it alive across requests, and surfaces any corrupt `BSF1`
+    /// or snapshot-read error (rule 3).
+    fn persist_stretch_fronts<'r>(
+        &mut self,
+        cx: &Cx,
+        store: &mut dyn crate::store::Store<'r>,
+        groups: &[Group<'f, '_>],
+        heap: &'static blaze_own::Heap,
+    ) -> Result<(), CliError> {
+        let g = heap.alloc();
+        for group in groups.iter() {
+            let Some(state) = group.front.get() else { continue };
+            match state {
+                GroupFrontState::Ready { key, put, .. } => {
+                    if let Some((put_key, bytes)) = put.as_ref() {
+                        store.put(cx, *put_key, bytes.as_slice())?;
+                    }
+                    if let Some(kept_key) = *key {
+                        self.member_rows.get_or_insert_with(|| Vec::new_in(g)).push(kept_key);
+                    }
+                }
+                GroupFrontState::Error(what) => {
+                    return Err(CliError::Text { what: *what });
+                }
+                GroupFrontState::None => {}
+            }
+        }
+        Ok(())
     }
 
     /// THE BODIES' JOIN, one function both drivers call (rule 30): each run's results merged
@@ -5088,7 +5192,7 @@ impl<'f> BodiesStage<'f> {
                         (Some(rest), Some(own)) => Some(GroupCrates::ByNeed { own, rest }),
                         (Some(_), None) => None,
                     };
-                    (whole, cut_words, cut_missing, scope_cells, crates.map(|crates| Group { list, own: own.name, crates, env, script, lang: scope.lang, scope: scope.scope, front: bstd::sync::Once::new("bodies group front"), bodies: 0, goals: bstd::sync::Once::new("bodies group goals") }))
+                    (whole, cut_words, cut_missing, scope_cells, crates.map(|crates| Group { list, own: own.name, tool: handles.tool, crates, env, script, lang: scope.lang, scope: scope.scope, front: bstd::sync::Once::new("bodies group front"), bodies: 0, goals: bstd::sync::Once::new("bodies group goals") }))
                 }
                 None => (true, None, None, own_cells, None),
             };
@@ -7251,14 +7355,61 @@ fn run_stretch_with<'d, 'a, 'b, 'f, 'r, 'm, R: ?Sized + CellDigests>(
     // `StretchHeads`), on the stack so its `Owners` is dropped with the stretch.
     let stretch_heads = shared.seeds.map(|table| crate::engine_seeds::StretchHeads::new(table, shared.heads_failed, opened.records, shared.heads, group.crates.scope(shared.by_need), shared.listings, g));
     let set_heads = clock.now();
-    // Group-scoped lang IndexIn and receiver Pointers built at most once per member group (in
-    // `shared.heap.shared()`, zero Global allocs, zero stretch-frame growth) and reused across
-    // every stretch, body, and lazy dependency head freezer in the group.
-    let front_ref = group
-        .front
-        .get_or_make(cx, |_| Ok::<_, core::convert::Infallible>(blaze_ladder::front2::tables::task::StretchFront::new(tables, fa, shared.heap.shared()).ok()))
-        .ok()
-        .and_then(|opt| opt.as_ref());
+    // Group-scoped lang IndexIn and receiver Pointers persisted as a content-addressed `BSF1`
+    // CAS record: look up from the committed snapshot first (skipping lang-crate scanning and
+    // pointer resolution on warm and post-reboot incremental edits), or build once per member
+    // group (in `shared.heap.shared()`, zero Global allocs, zero stretch-frame growth) and queue
+    // the encoded `BSF1` bytes for coordinator `store.put`.
+    let front_state = group.front.get_or_make(cx, |_| {
+        let front_key = stretch_front_key(group, shared.reads);
+        if let Some(key) = front_key {
+            match shared.snapshot.get(key) {
+                Ok(Some(bytes)) => {
+                    return Ok::<_, core::convert::Infallible>(match blaze_ladder::front2::tables::task::StretchFront::decode(bytes, shared.heap.shared()) {
+                        Ok(front) => GroupFrontState::Ready { front, key: Some(key), put: None },
+                        Err(err) => GroupFrontState::Error(leak(
+                            g,
+                            format_args!("stored StretchFront BSF1 record {key} refused: {err} (engine_bodies.rs)"),
+                        )),
+                    });
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    return Ok::<_, core::convert::Infallible>(GroupFrontState::Error(leak(
+                        g,
+                        format_args!("reading StretchFront BSF1 record {key} from store snapshot failed: {err:?} (engine_bodies.rs)"),
+                    )));
+                }
+            }
+        }
+        match blaze_ladder::front2::tables::task::StretchFront::new(tables, fa, shared.heap.shared()) {
+            Ok(front) => {
+                if let Some(key) = front_key
+                    && stretch_front_reads_in_lang_crates(group, &front)
+                {
+                    let mut encoded = blaze_own::Vec::new_in(shared.heap.shared());
+                    match front.encode(&mut encoded) {
+                        Ok(()) => Ok(GroupFrontState::Ready { front, key: Some(key), put: Some((key, encoded)) }),
+                        Err(err) => Ok(GroupFrontState::Error(leak(
+                            g,
+                            format_args!("encoding StretchFront BSF1 record {key} failed: {err} (engine_bodies.rs)"),
+                        ))),
+                    }
+                } else {
+                    Ok(GroupFrontState::Ready { front, key: None, put: None })
+                }
+            }
+            Err(_) => Ok(GroupFrontState::None),
+        }
+    });
+    let front_ref = match front_state {
+        Ok(GroupFrontState::Ready { front, .. }) => Some(front),
+        Ok(GroupFrontState::None) => None,
+        Ok(GroupFrontState::Error(why)) => {
+            return driver.refuse_current::<R>(*why, scope, clock, alloc);
+        }
+        Err(_) => None,
+    };
     // The seed freezer's constant evaluator and lang index are built lazily on the first cold
     // dependency head miss (`LazyBodySeed`): warm edits (0 heads frozen) pay 0 us here.
     let evaluated: &Recorder<'_> = frame.alloc(Recorder::new(RecorderOpts { alloc: fa }));
