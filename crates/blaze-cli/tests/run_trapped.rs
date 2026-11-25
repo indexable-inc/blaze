@@ -34,7 +34,6 @@ fn a_trap_is_said_by_the_function_s_path_and_its_reason() {
         .current_dir(&dir)
         .env("HOME", &home)
         .env("CARGO_HOME", home.join(".cargo"))
-        .env("BLAZE_NO_DAEMON", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

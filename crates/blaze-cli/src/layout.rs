@@ -155,9 +155,9 @@ pub const LAYOUT: [Row; 22] = [
     ),
     home(
         ".blaze/v2/daemon",
-        "the resident per-checkout daemons' sockets, `<16 hex>.sock`, in a folder made the user's alone (mode 0700; blaze-watch daemon.rs `SOCKET_FOLDER`)",
+        "an old home's resident daemon sockets (retired; removed by `blaze clean --all`)",
         true,
-        Scope::Kept(Why::LiveHelper),
+        Scope::All,
     ),
     home(".blaze/v2/shared", "an old home's store (store.rs `OLD_HOME`): reported, never read", true, Scope::All),
     home(".blaze/v2/own", "an old home's store (store.rs `OLD_HOME`): reported, never read", true, Scope::All),
@@ -266,18 +266,13 @@ mod tests {
         }
     }
 
-    /// A home written by the previous layout (before `.blaze/v2/daemon` existed) still has every
-    /// pre-existing row accounted for, and the new `.blaze/v2/daemon` row is `LiveHelper` (never
-    /// required to exist and never wiped while a daemon is live).
+    /// A home written by a previous layout (with or without `.blaze/v2/daemon`) still has every
+    /// pre-existing row accounted for, and `.blaze/v2/daemon` is cleaned by `--all`.
     #[test]
     fn previous_layout_without_daemon_folder_is_handled() {
         let blaze = crate::store::HOME_FOLDER;
-        let daemon = row_of(
-            Place::Home,
-            &std::format!("{blaze}/v2/{}/0123456789abcdef.sock", blaze_watch::daemon::SOCKET_FOLDER),
-        )
-        .expect("the daemon's socket row");
-        assert_eq!(daemon.scope, Scope::Kept(Why::LiveHelper));
+        let daemon = row_of(Place::Home, &std::format!("{blaze}/v2/daemon/0123456789abcdef.sock")).expect("the retired daemon's socket row");
+        assert_eq!(daemon.scope, Scope::All);
         for prev in [
             ".blaze/v2/journal/0123456789abcdef.sock",
             ".blaze/v2/shared",

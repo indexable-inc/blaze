@@ -90,7 +90,7 @@ fn blaze_cmd(dir: &Path, home: &Path) -> Command {
     cmd.current_dir(dir)
         .env("HOME", home)
         .env("CARGO_HOME", home.join(".cargo"))
-        .env("BLAZE_NO_DAEMON", "1");
+;
     cmd
 }
 

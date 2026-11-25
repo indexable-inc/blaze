@@ -987,21 +987,6 @@ impl<'f> NamesWorld<'f> {
     }
 }
 
-/// Pre-indexed read-only tables of a validated `CrateList<'static>`, cached in the resident
-/// daemon's `HotGraph` so incremental edits skip `stored_graph_at`, `CrateList::open`, and
-/// ~3,300 BLAKE3 digests in [`Names::of_list`].
-pub(crate) struct HotList {
-    pub(crate) list: CrateList<'static>,
-    pub(crate) list_bytes: &'static [u8],
-    pub(crate) by_subject: blaze_own::Vec<(ContentId, usize), Alloc<'static>>,
-    pub(crate) public: blaze_own::Vec<ContentId, Alloc<'static>>,
-    pub(crate) scripts: blaze_own::Vec<(usize, Name), Alloc<'static>>,
-    pub(crate) script_placed: blaze_own::Vec<crate::scripts::RanAs, Alloc<'static>>,
-    pub(crate) modules: blaze_own::Vec<ModuleAt, Alloc<'static>>,
-    /// Sorted `Name::file(...)` of every member crate root `/0/<path>` listed in `list`.
-    pub(crate) listed_roots: blaze_own::Vec<Name, Alloc<'static>>,
-}
-
 impl<'f> Names<'f> {
     /// The names read from the crate list `list` (its bytes held to the command's end), the
     /// world made by need from `maker`'s record ([`Names::made_or_make`]). No world is made and
@@ -1067,48 +1052,6 @@ impl<'f> Names<'f> {
             resolved: 0,
             unresolved: 0,
         })
-    }
-
-    /// Captures the pre-indexed tables of `self` into a reusable [`HotList`] for the daemon.
-    pub(crate) fn to_hot_list(&self, heap: Alloc<'static>) -> HotList {
-        let mut listed_roots = blaze_own::Vec::new_in(heap);
-        for r in 0..blaze_world::crate_list::CrateGraph::len(&self.list) {
-            if let Some(file) = self.list.root(r).strip_prefix("/0/") {
-                listed_roots.push(Name::file(file.as_bytes()));
-            }
-        }
-        listed_roots.sort_unstable();
-        listed_roots.dedup();
-        HotList {
-            list: self.list,
-            list_bytes: self.list_bytes,
-            by_subject: blaze_own::Vec::from_slice_in(self.by_subject.as_slice(), heap),
-            public: blaze_own::Vec::from_slice_in(self.public.as_slice(), heap),
-            scripts: blaze_own::Vec::from_slice_in(self.scripts.as_slice(), heap),
-            script_placed: blaze_own::Vec::from_slice_in(self.script_placed.as_slice(), heap),
-            modules: blaze_own::Vec::from_slice_in(self.modules.as_slice(), heap),
-            listed_roots,
-        }
-    }
-
-    /// Reconstructs [`Names`] from a cached [`HotList`] via flat slice copies (0 BLAKE3 digests,
-    /// 0 `CrateList::open` re-validation).
-    pub(crate) fn from_hot_list(hot: &HotList, heap: Alloc<'static>) -> Names<'f> {
-        Names {
-            list: hot.list,
-            list_bytes: hot.list_bytes,
-            by_subject: blaze_own::Vec::from_slice_in(hot.by_subject.as_slice(), heap),
-            made: Default::default(),
-            public: blaze_own::Vec::from_slice_in(hot.public.as_slice(), heap),
-            scripts: blaze_own::Vec::from_slice_in(hot.scripts.as_slice(), heap),
-            script_placed: blaze_own::Vec::from_slice_in(hot.script_placed.as_slice(), heap),
-            modules: blaze_own::Vec::from_slice_in(hot.modules.as_slice(), heap),
-            world: core::cell::OnceCell::new(),
-            maker: None,
-            procs: core::cell::Cell::new(None),
-            resolved: 0,
-            unresolved: 0,
-        }
     }
 
     /// The crate list these names plan from.

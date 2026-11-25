@@ -1047,7 +1047,7 @@ impl<S: Stamps> Follow<S> {
     /// [`Follow::follow_marked`] by the walk `W` ([`Batched`] or the control [`Serial`]).
     #[cfg_attr(not(test), allow(dead_code, reason = "the walks' test (tests/sweep_looks_tests.rs) asks each walk by name"))]
     pub(crate) fn follow_marked_by<'f, W: Walk>(&self, cx: &Cx, root: &Dir<ReadWrite>, home: Option<&Dir<ReadWrite>>, last: &Leaves<'_>, marked: Option<&[bool]>, frame: &'f Frame) -> Result<(Followed<'f>, u32), CliError> {
-        self.follow_served_by::<W>(cx, root, home, last, marked, None, false, frame)
+        self.follow_served_by::<W>(cx, root, home, last, marked, None, frame)
     }
 
     /// [`Follow::follow_served_by`] with the batched looks.
@@ -1061,25 +1061,7 @@ impl<S: Stamps> Follow<S> {
         served: Option<&mut crate::engine_script_reads::CheckoutSweep<'_, '_>>,
         frame: &'f Frame,
     ) -> Result<(Followed<'f>, u32), CliError> {
-        self.follow_served_by::<Batched>(cx, root, home, last, marked, served, false, frame)
-    }
-
-    /// [`Follow::follow_served`] with optional `facts_vouched` proof from the resident daemon's
-    /// synchronous vnode watcher (skipping redundant 800 KB `blaze-fact-shim` re-hashing when
-    /// `KqueueVnode` proved all [`FACT_MOUNT`] inputs unchanged with 0 events).
-    #[expect(clippy::too_many_arguments, reason = "follow_served with explicit facts_vouched proof")]
-    pub(crate) fn follow_served_with_facts<'f>(
-        &self,
-        cx: &Cx,
-        root: &Dir<ReadWrite>,
-        home: Option<&Dir<ReadWrite>>,
-        last: &Leaves<'_>,
-        marked: Option<&[bool]>,
-        served: Option<&mut crate::engine_script_reads::CheckoutSweep<'_, '_>>,
-        facts_vouched: bool,
-        frame: &'f Frame,
-    ) -> Result<(Followed<'f>, u32), CliError> {
-        self.follow_served_by::<Batched>(cx, root, home, last, marked, served, facts_vouched, frame)
+        self.follow_served_by::<Batched>(cx, root, home, last, marked, served, frame)
     }
 
     /// A served script observation can depend on paths beyond its recorded name, including
@@ -1096,7 +1078,6 @@ impl<S: Stamps> Follow<S> {
         last: &Leaves<'_>,
         marked: Option<&[bool]>,
         mut served: Option<&mut crate::engine_script_reads::CheckoutSweep<'_, '_>>,
-        facts_vouched: bool,
         frame: &'f Frame,
     ) -> Result<(Followed<'f>, u32), CliError> {
         let cx = cx.span("sweep: stat each path the last answer read, and read only what its stamp does not prove");
@@ -1121,7 +1102,7 @@ impl<S: Stamps> Follow<S> {
             let path = last.path(i);
             let old_state = old.state();
             let fact_file = old.kind == LeafKind::ScriptFile && path.starts_with(FACT_MOUNT);
-            if unmarked(i) && (!fact_file || facts_vouched) && old.kind != LeafKind::MacroFiles {
+            if unmarked(i) && !fact_file && old.kind != LeafKind::MacroFiles {
                 now.push(old.kind, old.flags, path, old.stamp, old.id);
                 was.push(old_state);
                 continue;

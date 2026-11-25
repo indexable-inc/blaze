@@ -352,37 +352,6 @@ pub(crate) fn run_with_store<'w>(
     // shared store state (Wave 7, rule 70). `--store` / `--all` deletes the HOME-wide store
     // shared by every checkout, so shut down every daemon under `<HOME>/.blaze/v2/daemon/`.
     #[cfg(unix)]
-    if !cx.is_simulated()
-        && let Some(home_text) = home
-    {
-        if with_store {
-            let below = home_text.trim_matches('/');
-            if let Ok(path) = Path::new(below)
-                && let Ok(home_dir) = fs.home(cx, "/", &path)
-                && let Ok(daemon_rel) = Path::new(".blaze/v2/daemon")
-                && let Ok(Some(listed)) = home_dir.entries(cx, &daemon_rel)
-            {
-                let base = home_text.trim_end_matches('/');
-                for i in 0..listed.len() {
-                    let name = listed.name(i);
-                    if name.ends_with(".sock") {
-                        let full = bstd::mem::format_in!(frame, "{base}/.blaze/v2/daemon/{name}");
-                        crate::daemon_client::send_shutdown_socket(full.as_bytes());
-                    }
-                }
-            }
-        } else {
-            let checkout_rel = match &checkout {
-                crate::checkout::Checkout::Under(under) => under.as_str(),
-                crate::checkout::Checkout::Here => "",
-            };
-            if let Ok(served) = crate::engine_script_reads::Served::at_edge(false, checkout_rel, frame)
-                && let Some(root_abs) = served.root_text()
-            {
-                crate::daemon_client::send_shutdown(home_text, root_abs);
-            }
-        }
-    }
     let (root, lead) = match &checkout {
         crate::checkout::Checkout::Under(under) => (fs.open_dir(cx, under)?, bstd::mem::format_in!(frame, "{under}/")),
         crate::checkout::Checkout::Here => (fs.root(), bstd::mem::format_in!(frame, "")),
