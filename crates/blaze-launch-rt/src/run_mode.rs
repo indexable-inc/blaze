@@ -2372,12 +2372,11 @@ pub fn run<S: RecordSource + RecordFiles + Sync, B: Bind + Send>(
     let open_ask: crate::sys::Handoff<Option<RecordId>> = crate::sys::Handoff::new();
     let open_ans: crate::sys::Handoff<Result<crate::native_lib::DlNatives, RunModeError>> = crate::sys::Handoff::new();
     let ready: crate::sys::Handoff<Ready> = crate::sys::Handoff::new();
-    let argv_addr = argv as usize;
     let open_bridge = eager_native.then_some((&open_ask, &open_ans));
     std::thread::scope(|scope| {
         let control = std::thread::Builder::new()
             .name("blaze-run-control".to_owned())
-            .spawn_scoped(scope, || control(raw, source, entry, native, bind, alloc, argc, argv_addr, open_bridge, &ready));
+            .spawn_scoped(scope, || control(raw, source, entry, native, bind, alloc, open_bridge, &ready));
         let Ok(control) = control else {
             return Err(RunModeError::Thread { what: "control" });
         };
@@ -2638,7 +2637,7 @@ impl Drop for EagerOpenGate<'_> {
 /// The control thread: maps the run's memory (its tables are in the run's allocator, which
 /// stays on this thread), starts the socket's reader, writes the entry's stub, then is the one
 /// writer of code and words for the life of the process.
-#[expect(clippy::too_many_arguments, reason = "receives the run's handoffs, pre-captured args, and native open bridge")]
+#[expect(clippy::too_many_arguments, reason = "receives the run's handoffs and eager native open bridge")]
 fn control<S: RecordSource + RecordFiles, B: Bind>(
     fd: i32,
     source: &S,
@@ -2646,8 +2645,6 @@ fn control<S: RecordSource + RecordFiles, B: Bind>(
     native: Option<NativeStart>,
     bind: B,
     alloc: blaze_own::SharedAlloc<'static>,
-    argc: core::ffi::c_int,
-    argv_addr: usize,
     open_bridge: Option<(&crate::sys::Handoff<Option<RecordId>>, &crate::sys::Handoff<Result<crate::native_lib::DlNatives, RunModeError>>)>,
     ready: &crate::sys::Handoff<Ready>,
 ) {
@@ -2667,7 +2664,6 @@ fn control<S: RecordSource + RecordFiles, B: Bind>(
         Ok(memory) => memory,
         Err(why) => return ready.put(Err(why)),
     };
-    memory.shared.set_process_args(argc, argv_addr as *const *const core::ffi::c_char);
     // The crash report tells the parent where the program struck on this socket (its frame
     // and `send`'s never interleave: `fault_report::hold_channel`).
     fault_report::channel(fd);
@@ -2795,6 +2791,9 @@ fn control<S: RecordSource + RecordFiles, B: Bind>(
                             Err(RunModeError::NotBuilt { what: "a program's native library on this platform (NATIVE.md W5)" })
                         } else {
                             match load_library(&mut mode, source, &mut memory) {
+                                Ok(loaded) if cfg!(target_os = "linux") && loaded.inits > 0 => Err(RunModeError::NotBuilt {
+                                    what: "lazy native library initializers on Linux (images with C initializers must load eagerly)",
+                                }),
                                 Ok(loaded) => {
                                     shared.publish_lazy_inits(loaded);
                                     Ok(())

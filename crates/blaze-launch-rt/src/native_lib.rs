@@ -577,8 +577,11 @@ pub fn run_inits_with(loaded: Loaded, argc: core::ffi::c_int, argv: *const *cons
         unsafe extern "C" {
             static environ: *const *const c_char;
         }
-        // SAFETY: `environ` is the C library's process environment pointer array, set up before
-        // `main` and live for the process's life.
+        let empty: *const c_char = core::ptr::null();
+        let (argc, argv) = if argv.is_null() { (0, &raw const empty) } else { (argc, argv) };
+        // SAFETY: `run_inits_with` is called only on the process's initial thread before guest
+        // execution begins (images with C initializers load eagerly), so `environ` is immutable
+        // process startup state live for the process's life.
         let envp = unsafe { environ };
         (argc, argv, envp)
     };
@@ -607,8 +610,7 @@ pub fn run_inits_with(loaded: Loaded, argc: core::ffi::c_int, argv: *const *cons
 /// after the entry is numbered and before it is called (NATIVE.md 3.4, 3.7).
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn run_inits(loaded: Loaded) -> Result<(), RunModeError> {
-    let empty: *const core::ffi::c_char = core::ptr::null();
-    run_inits_with(loaded, 0, &raw const empty)
+    run_inits_with(loaded, 0, core::ptr::null())
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
