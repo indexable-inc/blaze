@@ -104,8 +104,8 @@ mod macos_app {
     use blaze_shell::rust_cell;
     use blaze_shell::svg_icons::IconAtlas;
     use blaze_shell::view::{
-        ActiveDrag, CursorTrail, DragPayload, HitAction, Scene, TextSelection,
-        compute_text_selection, select_at_point,
+        ActiveDrag, ActivePopover, CursorTrail, DragPayload, HitAction, HitRect, Scene,
+        TextSelection, compute_text_selection, select_at_point,
     };
 
     const FONT_POINTS: f64 = 13.0;
@@ -1113,6 +1113,8 @@ mod macos_app {
                 drag: None,
                 cursor_trail: None,
                 text_selection: None,
+                active_popover: None,
+                mouse_pos: None,
             });
             let max_s = (scene.total_content_height - scene.scroll_viewport_height).max(0.0);
             if shell.auto_scroll_bottom && max_s > 0.0 {
@@ -1132,6 +1134,8 @@ mod macos_app {
                     drag: None,
                     cursor_trail: None,
                     text_selection: None,
+                    active_popover: None,
+                    mouse_pos: None,
                 });
             }
             let glyphs = fonts.rasterize_runs(&scene.text_runs, scale);
@@ -1181,6 +1185,7 @@ mod macos_app {
         let mut selecting_composer = false;
         let mut selecting_output = false;
         let mut output_selection: Option<TextSelection> = None;
+        let mut active_popover: Option<ActivePopover> = None;
         let mut popup_engaged = false;
         let mut zoom_changed = false;
         let mut cur_cursor = CursorKind::Arrow;
@@ -1388,6 +1393,13 @@ mod macos_app {
 
                             // Interactive shell editor key handling.
                             output_selection = None;
+                            if active_popover.is_some() {
+                                active_popover = None;
+                                if key == Key::Escape {
+                                    dirty = true;
+                                    continue;
+                                }
+                            }
                             let text = keys::text_of(&ev);
 
                             if shell.editor.reverse_search.is_some() {
@@ -1400,7 +1412,10 @@ mod macos_app {
                                     shell.editor.reverse_search_up();
                                 } else if key == Key::ArrowDown || (ctrl && key == Key::KeyN) {
                                     shell.editor.reverse_search_down();
-                                } else if key == Key::Tab || key == Key::ArrowRight {
+                                } else if key == Key::Tab
+                                    || key == Key::ArrowRight
+                                    || (ctrl && key == Key::KeyF)
+                                {
                                     shell.editor.accept_reverse_search();
                                     popup_engaged = false;
                                     shell.refresh_editor_assist(false);
@@ -1564,6 +1579,18 @@ mod macos_app {
                                     }
                                     Key::KeyE => {
                                         shell.editor.move_end(shift);
+                                        shell.refresh_editor_assist(false);
+                                    }
+                                    Key::KeyF => {
+                                        shell.editor.move_right(shift);
+                                        shell.editor.dismiss_completions();
+                                        popup_engaged = false;
+                                        shell.refresh_editor_assist(false);
+                                    }
+                                    Key::KeyB => {
+                                        shell.editor.move_left(shift);
+                                        shell.editor.dismiss_completions();
+                                        popup_engaged = false;
                                         shell.refresh_editor_assist(false);
                                     }
                                     _ => {}
@@ -1732,17 +1759,39 @@ mod macos_app {
                                     ap.pty.write_all(seq);
                                 }
                             } else {
-                                let step = if ev.hasPreciseScrollingDeltas() {
+                                let step_y = if ev.hasPreciseScrollingDeltas() {
                                     dy as f32
                                 } else {
                                     dy as f32 * 24.0
                                 };
-                                let max_s = (shell.last_scene.total_content_height
-                                    - shell.last_scene.scroll_viewport_height)
-                                    .max(0.0);
-                                shell.scroll_y = (shell.scroll_y - step).clamp(0.0, max_s);
-                                shell.auto_scroll_bottom = false;
-                                dirty = true;
+                                let step_x = if ev.hasPreciseScrollingDeltas() {
+                                    ev.scrollingDeltaX() as f32
+                                } else {
+                                    ev.scrollingDeltaX() as f32 * 24.0
+                                };
+                                let pt = ev.locationInWindow();
+                                let mx = pt.x as f32;
+                                let my = (size.height - pt.y) as f32;
+                                if let Some(reg) = shell.last_scene.scroll_region_at(mx, my)
+                                    && shell.store.scroll_table(
+                                        reg.block,
+                                        step_y,
+                                        step_x,
+                                        reg.max_scroll_y,
+                                        reg.max_scroll_x,
+                                    )
+                                {
+                                    active_popover = None;
+                                    dirty = true;
+                                } else {
+                                    let max_s = (shell.last_scene.total_content_height
+                                        - shell.last_scene.scroll_viewport_height)
+                                        .max(0.0);
+                                    shell.scroll_y = (shell.scroll_y - step_y).clamp(0.0, max_s);
+                                    shell.auto_scroll_bottom = false;
+                                    active_popover = None;
+                                    dirty = true;
+                                }
                             }
                         }
                         NSEventType::LeftMouseDown if window.isKeyWindow() => {
@@ -1782,6 +1831,12 @@ mod macos_app {
                                         }
                                         HitAction::ToggleTableView(block_id) => {
                                             shell.store.toggle_table_view(block_id);
+                                            active_popover = None;
+                                            dirty = true;
+                                        }
+                                        HitAction::SortTableColumn { block, col } => {
+                                            shell.store.toggle_table_sort(block, col);
+                                            active_popover = None;
                                             dirty = true;
                                         }
                                         HitAction::ToggleExpandCell { block, row, col } => {
@@ -1814,8 +1869,64 @@ mod macos_app {
                                             zoom_changed = true;
                                             dirty = true;
                                         }
+                                        HitAction::OpenBranchPicker => {
+                                            if let Some(reg) = shell.last_scene.hover_at(x, y) {
+                                                let already_pinned = active_popover
+                                                    .as_ref()
+                                                    .is_some_and(|p| p.pinned && p.anchor == reg.rect);
+                                                active_popover = if already_pinned {
+                                                    None
+                                                } else {
+                                                    Some(ActivePopover {
+                                                        anchor: reg.rect,
+                                                        kind: reg.kind.clone(),
+                                                        pinned: true,
+                                                    })
+                                                };
+                                                dirty = true;
+                                            }
+                                        }
+                                        HitAction::SwitchGitBranch(branch) => {
+                                            active_popover = None;
+                                            let (cols, rows) = grid_for(size, &fonts, scale);
+                                            let cpx = (
+                                                fonts.metrics.cell_w as u32,
+                                                fonts.metrics.cell_h as u32,
+                                            );
+                                            let cmd = format!("git switch {branch}");
+                                            shell.submit_command(&cmd, cols, rows, cpx, true);
+                                            dirty = true;
+                                        }
+                                        HitAction::ChangeDir(dir) => {
+                                            active_popover = None;
+                                            let (cols, rows) = grid_for(size, &fonts, scale);
+                                            let cpx = (
+                                                fonts.metrics.cell_w as u32,
+                                                fonts.metrics.cell_h as u32,
+                                            );
+                                            let cmd = if dir.contains(' ') {
+                                                format!("cd \"{dir}\"")
+                                            } else {
+                                                format!("cd {dir}")
+                                            };
+                                            shell.submit_command(&cmd, cols, rows, cpx, false);
+                                            dirty = true;
+                                        }
+                                        HitAction::InsertToken(tok) => {
+                                            active_popover = None;
+                                            shell.editor.enter_vim_insert();
+                                            shell.editor.insert_dropped_token(&tok);
+                                            popup_engaged = false;
+                                            shell.auto_scroll_bottom = true;
+                                            shell.refresh_editor_assist(false);
+                                            dirty = true;
+                                        }
                                     }
                                     continue;
+                                }
+                                if active_popover.is_some() {
+                                    active_popover = None;
+                                    dirty = true;
                                 }
 
                                 // Click inside the inline composer: enter Insert mode and position/select cursor.
@@ -1905,6 +2016,50 @@ mod macos_app {
                             let in_traffic_lights = y >= 0.0 && y < TOP_BAR_H && x >= 0.0 && x < 76.0;
                             let in_window = x >= 0.0 && y >= 0.0 && x <= size.width as f32 && y <= size.height as f32;
                             if in_window && !in_traffic_lights {
+                                // Smooth native hover popover tracking (keeps popover alive while
+                                // pointer travels from anchor down into the interactive menu!).
+                                let in_open_popover = active_popover.as_ref().is_some_and(|p| {
+                                    if p.anchor.contains(x, y) {
+                                        return true;
+                                    }
+                                    if let Some(pr) = shell.last_scene.popover_rect {
+                                        if pr.contains(x, y) {
+                                            return true;
+                                        }
+                                        let bx0 = p.anchor.x0.min(pr.x0) - 4.0;
+                                        let bx1 = p.anchor.x1.max(pr.x1) + 4.0;
+                                        let by0 = p.anchor.y0.min(pr.y0);
+                                        let by1 = p.anchor.y1.max(pr.y1);
+                                        if HitRect::new(bx0, by0, bx1, by1).contains(x, y) {
+                                            return true;
+                                        }
+                                    }
+                                    false
+                                });
+                                if in_open_popover {
+                                    dirty = true;
+                                } else if !shell.store.is_alternate_screen()
+                                    && shell.editor.reverse_search.is_none()
+                                    && shell.editor.completions.is_empty()
+                                    && !selecting_composer
+                                    && !selecting_output
+                                    && pending_drag.is_none()
+                                    && let Some(reg) = shell.last_scene.hover_at(x, y)
+                                {
+                                    let next_pop = ActivePopover {
+                                        anchor: reg.rect,
+                                        kind: reg.kind.clone(),
+                                        pinned: false,
+                                    };
+                                    if active_popover.as_ref().is_none_or(|cur| !cur.pinned && cur.anchor != next_pop.anchor) {
+                                        active_popover = Some(next_pop);
+                                        dirty = true;
+                                    }
+                                } else if active_popover.as_ref().is_some_and(|p| !p.pinned) {
+                                    active_popover = None;
+                                    dirty = true;
+                                }
+
                                 let next = cursor_for_point(
                                     &shell.last_scene,
                                     shell.store.is_alternate_screen(),
@@ -1917,6 +2072,10 @@ mod macos_app {
                                 );
                                 apply_cursor(&mut cur_cursor, next);
                                 continue;
+                            }
+                            if active_popover.as_ref().is_some_and(|p| !p.pinned) {
+                                active_popover = None;
+                                dirty = true;
                             }
                             apply_cursor(&mut cur_cursor, CursorKind::Arrow);
                         }
@@ -2228,6 +2387,7 @@ mod macos_app {
                             head: [s.head[0], s.head[1] - sy],
                         })
                     };
+                    let mouse_pt = last_mouse.map(|(mx, my)| [mx, my]);
                     let first = build_scene(&LayoutInput {
                         store: &shell.store,
                         editor: &shell.editor,
@@ -2243,6 +2403,8 @@ mod macos_app {
                         drag: active_drag.as_ref(),
                         cursor_trail: active_trail,
                         text_selection: screen_sel(shell.scroll_y),
+                        active_popover: active_popover.as_ref(),
+                        mouse_pos: mouse_pt,
                     });
                     let max_s = (first.total_content_height - first.scroll_viewport_height).max(0.0);
                     let target_scroll = if shell.auto_scroll_bottom {
@@ -2268,6 +2430,8 @@ mod macos_app {
                             drag: active_drag.as_ref(),
                             cursor_trail: active_trail,
                             text_selection: screen_sel(shell.scroll_y),
+                            active_popover: active_popover.as_ref(),
+                            mouse_pos: mouse_pt,
                         })
                     } else {
                         first

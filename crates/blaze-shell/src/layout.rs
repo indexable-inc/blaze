@@ -23,9 +23,9 @@ use crate::prompt::PromptInfo;
 use crate::svg_icons::icon_name_for_file;
 use crate::theme;
 use crate::view::{
-    ActiveDrag, CellMetrics, CursorTrail, DragPayload, HitAction, HitRect, Scene, TextSelection,
-    compute_text_selection, format_duration_ms, format_value_cell_at, is_expandable_cell,
-    truncate_chars, wrap_lines,
+    ActiveDrag, ActivePopover, CellMetrics, CursorTrail, DragPayload, HitAction, HitRect,
+    HoverKind, Scene, TextSelection, compute_text_selection, format_duration_ms,
+    format_value_cell_at, is_expandable_cell, truncate_chars, wrap_lines,
 };
 
 pub const TOP_BAR_H: f32 = 34.0;
@@ -58,6 +58,10 @@ pub struct LayoutInput<'a> {
     pub cursor_trail: Option<CursorTrail>,
     /// Active mouse drag-selection over rendered output/terminal text (screen coordinates).
     pub text_selection: Option<TextSelection>,
+    /// Currently open hover/click popover anchored to a prompt segment or icon button.
+    pub active_popover: Option<&'a ActivePopover>,
+    /// Current logical pointer coordinates (for crisp row hover highlights inside popovers).
+    pub mouse_pos: Option<[f32; 2]>,
 }
 
 /// Lay out the full `ix.dev/blaze` + Starship inline-stream shell interface.
@@ -149,11 +153,13 @@ pub fn build_scene(input: &LayoutInput<'_>) -> Scene {
         input.inline_titlebar,
     );
 
-    // 5. Floating overlays: Atuin-class Ctrl+R history palette, Tab completion popup, drag chip.
+    // 5. Floating overlays: Atuin-class Ctrl+R history palette, Tab completion popup, hover popover, drag chip.
     if let Some(rs) = &input.editor.reverse_search {
         layout_reverse_search_overlay(&mut scene, rs, vw, vh, m, input.now_ns);
     } else if !input.editor.completions.is_empty() {
         layout_completion_popup(&mut scene, input.editor, col_x0, prompt_y0, prompt_y1, vh, col_x1, m);
+    } else if let Some(pop) = input.active_popover {
+        layout_active_popover(&mut scene, pop, vw, vh, m, input.mouse_pos);
     }
     if let Some(drag) = input.drag {
         layout_drag_overlay(&mut scene, drag, m);
@@ -185,9 +191,18 @@ fn layout_top_bar(
     let btn_y1 = TOP_BAR_H - 6.0;
     let fork_w = 26.0;
     let fork_x0 = (rx - fork_w).max(x + 20.0);
+    let fork_rect = HitRect::new(fork_x0, btn_y0, rx, btn_y1);
     scene.round_rect(fork_x0, btn_y0, rx, btn_y1, 6.0, theme::BG_CHIP, 1.0, theme::LINE, 0);
     draw_icon(scene, Icon::Branch, fork_x0 + (fork_w - icon_s) * 0.5, icon_y, icon_s, theme::INK_2, 0);
-    scene.push_hit(HitRect::new(fork_x0, btn_y0, rx, btn_y1), HitAction::ForkActiveBranch);
+    scene.push_hit(fork_rect, HitAction::ForkActiveBranch);
+    scene.push_hover_clipped(
+        fork_rect,
+        0,
+        HoverKind::Tooltip {
+            title: "Fork session branch".to_owned(),
+            subtitle: Some("Cmd+B · O(1) CoW snapshot".to_owned()),
+        },
+    );
     rx = fork_x0 - 10.0;
 
     // Quiet clickable zoom pill when zoomed in/out (`Cmd+`/`Cmd-`; click or `Cmd+0` to reset).
@@ -264,7 +279,7 @@ fn layout_top_bar(
         rx - 12.0
     };
 
-    // Clean minimal underline tabs with branch icons; active tab carries the one `--fire` bar.
+    // Sleek monochrome-first session tabs matching the prompt capsule (zero arbitrary orange).
     let active_id = store.active_branch_id();
     for branch in store.branches() {
         let is_active = branch.id == active_id;
@@ -272,24 +287,35 @@ fn layout_top_bar(
         let count_str = format!(" {}", branch.blocks.len());
         let name_w = name.chars().count() as f32 * m.cw;
         let count_w = count_str.chars().count() as f32 * m.cw;
-        let tab_w = icon_s + 6.0 + name_w + count_w;
+        let pad_x = 9.0;
+        let tab_w = pad_x * 2.0 + icon_s + 6.0 + name_w + count_w;
         if x + tab_w > tabs_limit {
             break;
         }
-        let icon_col = if is_active { theme::FIRE } else { theme::INK_4 };
+        let icon_col = if is_active { theme::INK_2 } else { theme::INK_4 };
         let name_col = if is_active { theme::INK_1 } else { theme::INK_3 };
         let count_col = if is_active { theme::INK_3 } else { theme::INK_4 };
-        draw_icon(scene, Icon::Branch, x, icon_y, icon_s, icon_col, 0);
-        scene.text(x + icon_s + 6.0, mid_y, name, name_col, is_active, false, 0);
-        scene.text(x + icon_s + 6.0 + name_w, mid_y, count_str, count_col, false, false, 0);
         if is_active {
-            scene.over_round_rect(x, TOP_BAR_H - 1.8, x + tab_w, TOP_BAR_H, 0.9, theme::FIRE, 0);
+            scene.round_rect(
+                x,
+                btn_y0,
+                x + tab_w,
+                btn_y1,
+                6.0,
+                theme::rgb(0x1a, 0x1a, 0x1d),
+                1.0,
+                theme::rgb(0x2a, 0x2a, 0x2e),
+                0,
+            );
         }
+        draw_icon(scene, Icon::Branch, x + pad_x, icon_y, icon_s, icon_col, 0);
+        scene.text(x + pad_x + icon_s + 6.0, mid_y, name, name_col, is_active, false, 0);
+        scene.text(x + pad_x + icon_s + 6.0 + name_w, mid_y, count_str, count_col, false, false, 0);
         scene.push_hit(
-            HitRect::new(x - 4.0, 0.0, x + tab_w + 4.0, TOP_BAR_H),
+            HitRect::new(x, btn_y0, x + tab_w, btn_y1),
             HitAction::SwitchBranch(branch.id),
         );
-        x += tab_w + 20.0;
+        x += tab_w + 8.0;
     }
 }
 
@@ -348,6 +374,7 @@ fn layout_starship_line(
     };
 
     // Segment 1: Location (macOS folder SVG + quiet parent path + crisp leaf dir).
+    let seg1_x0 = cx - 4.0;
     scene.svg_icon_alpha(cx, ty + (m.ch - folder_s) * 0.5, folder_s, "folder_macos", icon_alpha, clip_id);
     cx += folder_s + 6.0;
 
@@ -369,12 +396,20 @@ fn layout_starship_line(
         scene.text(cx, ty, &dir_lbl, dir_col, is_live, false, clip_id);
         cx += dir_lbl.chars().count() as f32 * m.cw;
     }
+    if !prompt.cwd.is_empty() {
+        scene.push_hover_clipped(
+            HitRect::new(seg1_x0, y, cx + 4.0, y + cap_h),
+            clip_id,
+            HoverKind::Directory { cwd: prompt.cwd.clone() },
+        );
+    }
 
-    // Segment 2: Git branch + in-progress state (separated by crisp 1px vertical hairline).
+    // Segment 2: Git branch + in-progress state (hover/click opens interactive branch switcher!).
     if let Some(branch) = &prompt.git_branch {
         cx += sep_pad;
         draw_divider(scene, cx);
         cx += sep_pad;
+        let seg2_x0 = cx - 4.0;
 
         let branch_icon_col = if prompt.git_detached {
             theme::FIRE
@@ -400,13 +435,29 @@ fn layout_starship_line(
                 scene.text(cx, ty, state_lbl, theme::FIRE, true, false, clip_id);
                 cx += state_lbl.chars().count() as f32 * m.cw;
             }
+        }
+        let branch_rect = HitRect::new(seg2_x0, y, cx + 4.0, y + cap_h);
+        let branches = prompt
+            .git_status
+            .as_ref()
+            .map(|s| s.branches.clone())
+            .filter(|b| !b.is_empty())
+            .unwrap_or_else(|| vec![branch.clone()]);
+        scene.push_hover_clipped(
+            branch_rect,
+            clip_id,
+            HoverKind::GitBranch { current: branch.clone(), branches },
+        );
+        scene.push_hit_clipped(branch_rect, clip_id, HitAction::OpenBranchPicker);
 
-            // Segment 3: Uncommitted files (IntelliJ SVG file icons + quiet ember/green count).
+        if let Some(st) = &prompt.git_status {
+            // Segment 3: Uncommitted files (hover lists exact files; click a file to insert path!).
             let total_dirty = st.conflicted + st.staged + st.modified + st.deleted + st.untracked;
             if !st.changed_icons.is_empty() {
                 cx += sep_pad;
                 draw_divider(scene, cx);
                 cx += sep_pad;
+                let seg3_x0 = cx - 4.0;
 
                 let shown_icons = st.changed_icons.len().min(4);
                 let f_iy = ty + (m.ch - file_s) * 0.5;
@@ -429,11 +480,19 @@ fn layout_starship_line(
                     scene.text(cx, ty, &cnt, cnt_col, is_live, false, clip_id);
                     cx += cnt.len() as f32 * m.cw;
                 }
+                scene.push_hover_clipped(
+                    HitRect::new(seg3_x0, y, cx + 4.0, y + cap_h),
+                    clip_id,
+                    HoverKind::GitChanges {
+                        files: st.changed_files.clone(),
+                        total: total_dirty,
+                    },
+                );
             } else if st.staged > 0 || st.conflicted > 0 {
-                // Staged-only or conflict-only state (clean subtle dot + count, never ANSI brackets).
                 cx += sep_pad;
                 draw_divider(scene, cx);
                 cx += sep_pad;
+                let seg3_x0 = cx - 4.0;
                 let dot_col = if st.conflicted > 0 { theme::DANGER } else { theme::OK };
                 scene.over_circle(cx + 3.0, ty + m.ch * 0.5, 2.6, dot_col, clip_id);
                 cx += 9.0;
@@ -441,50 +500,83 @@ fn layout_starship_line(
                 let cnt = format!("{n}");
                 scene.text(cx, ty, &cnt, meta_col, false, false, clip_id);
                 cx += cnt.len() as f32 * m.cw;
+                scene.push_hover_clipped(
+                    HitRect::new(seg3_x0, y, cx + 4.0, y + cap_h),
+                    clip_id,
+                    HoverKind::Tooltip {
+                        title: if st.conflicted > 0 {
+                            format!("{} merge conflict(s)", st.conflicted)
+                        } else {
+                            format!("{} staged change(s)", st.staged)
+                        },
+                        subtitle: Some("ready to commit".to_owned()),
+                    },
+                );
             }
 
-            // Segment 4: Ahead/behind & stash count (crisp SDF layers icon, never pink `[$3]`).
+            // Segment 4: Ahead/behind & stash count (hover over `≡ 3` inspects actual git stashes!).
             if st.ahead > 0 || st.behind > 0 || st.stashed > 0 {
                 cx += sep_pad;
                 draw_divider(scene, cx);
                 cx += sep_pad;
 
                 let mut need_gap = false;
-                if st.ahead > 0 {
-                    let s = format!("↑{}", st.ahead);
-                    scene.text(cx, ty, &s, meta_col, false, false, clip_id);
-                    cx += s.chars().count() as f32 * m.cw;
-                    need_gap = true;
-                }
-                if st.behind > 0 {
-                    if need_gap {
-                        cx += 5.0;
+                if st.ahead > 0 || st.behind > 0 {
+                    let ab_x0 = cx - 4.0;
+                    if st.ahead > 0 {
+                        let s = format!("↑{}", st.ahead);
+                        scene.text(cx, ty, &s, meta_col, false, false, clip_id);
+                        cx += s.chars().count() as f32 * m.cw;
+                        need_gap = true;
                     }
-                    let s = format!("↓{}", st.behind);
-                    scene.text(cx, ty, &s, meta_col, false, false, clip_id);
-                    cx += s.chars().count() as f32 * m.cw;
-                    need_gap = true;
+                    if st.behind > 0 {
+                        if need_gap {
+                            cx += 5.0;
+                        }
+                        let s = format!("↓{}", st.behind);
+                        scene.text(cx, ty, &s, meta_col, false, false, clip_id);
+                        cx += s.chars().count() as f32 * m.cw;
+                        need_gap = true;
+                    }
+                    scene.push_hover_clipped(
+                        HitRect::new(ab_x0, y, cx + 4.0, y + cap_h),
+                        clip_id,
+                        HoverKind::Tooltip {
+                            title: format!("{} ahead · {} behind upstream", st.ahead, st.behind),
+                            subtitle: Some("computed from .git/objects/info/commit-graph".to_owned()),
+                        },
+                    );
                 }
                 if st.stashed > 0 {
                     if need_gap {
                         cx += 6.0;
                     }
+                    let stash_x0 = cx - 4.0;
                     let st_s = 11.0;
                     draw_icon(scene, Icon::Stash, cx, ty + (m.ch - st_s) * 0.5, st_s, meta_col, clip_id);
                     cx += st_s + 3.5;
                     let s = format!("{}", st.stashed);
                     scene.text(cx, ty, &s, meta_col, false, false, clip_id);
                     cx += s.len() as f32 * m.cw;
+                    scene.push_hover_clipped(
+                        HitRect::new(stash_x0, y, cx + 4.0, y + cap_h),
+                        clip_id,
+                        HoverKind::GitStashes {
+                            stashes: st.stashes.clone(),
+                            total: st.stashed,
+                        },
+                    );
                 }
             }
         }
     }
 
-    // Segment 5: Detected project toolchain SVG icons (quietly separated inside the capsule).
+    // Segment 5: Detected project toolchain SVG icons (hover explains detected markers!).
     if !prompt.project_icons.is_empty() {
         cx += sep_pad;
         draw_divider(scene, cx);
         cx += sep_pad;
+        let seg5_x0 = cx - 4.0;
         let t_iy = ty + (m.ch - tool_s) * 0.5;
         for (i, &icon_name) in prompt.project_icons.iter().take(3).enumerate() {
             if i > 0 {
@@ -492,6 +584,13 @@ fn layout_starship_line(
             }
             scene.svg_icon_alpha(cx, t_iy, tool_s, icon_name, icon_alpha * 0.9, clip_id);
             cx += tool_s;
+        }
+        if !prompt.project_details.is_empty() {
+            scene.push_hover_clipped(
+                HitRect::new(seg5_x0, y, cx + 4.0, y + cap_h),
+                clip_id,
+                HoverKind::Toolchains { items: prompt.project_details.clone() },
+            );
         }
     }
 
@@ -533,11 +632,16 @@ fn layout_block(
     let act_s = 12.0;
     let act_iy = cur_y + (m.ch - act_s) * 0.5;
     let fx0 = rx - act_s;
+    let fork_hit = HitRect::new(fx0 - 4.0, cur_y - 2.0, rx + 4.0, cur_y + m.ch + 2.0);
     draw_icon(scene, Icon::Branch, fx0, act_iy, act_s, theme::INK_4, clip_id);
-    scene.push_hit_clipped(
-        HitRect::new(fx0 - 4.0, cur_y - 2.0, rx + 4.0, cur_y + m.ch + 2.0),
+    scene.push_hit_clipped(fork_hit, clip_id, HitAction::ForkBlock(block.id));
+    scene.push_hover_clipped(
+        fork_hit,
         clip_id,
-        HitAction::ForkBlock(block.id),
+        HoverKind::Tooltip {
+            title: "Fork session from this block".to_owned(),
+            subtitle: Some("O(1) copy-on-write state snapshot".to_owned()),
+        },
     );
     rx = fx0 - 12.0;
 
@@ -548,11 +652,20 @@ fn layout_block(
         let in_grid = block.is_grid_view(t.default_grid);
         let toggle_icon = if in_grid { Icon::Table } else { Icon::Grid };
         let mx0 = rx - act_s;
+        let toggle_hit = HitRect::new(mx0 - 4.0, cur_y - 2.0, rx + 4.0, cur_y + m.ch + 2.0);
         draw_icon(scene, toggle_icon, mx0, act_iy, act_s, theme::INK_4, clip_id);
-        scene.push_hit_clipped(
-            HitRect::new(mx0 - 4.0, cur_y - 2.0, rx + 4.0, cur_y + m.ch + 2.0),
+        scene.push_hit_clipped(toggle_hit, clip_id, HitAction::ToggleTableView(block.id));
+        scene.push_hover_clipped(
+            toggle_hit,
             clip_id,
-            HitAction::ToggleTableView(block.id),
+            HoverKind::Tooltip {
+                title: if in_grid {
+                    "Switch to detailed table".to_owned()
+                } else {
+                    "Switch to compact grid".to_owned()
+                },
+                subtitle: None,
+            },
         );
         rx = mx0 - 12.0;
     }
@@ -1052,20 +1165,40 @@ fn layout_table(
         return m.ch;
     }
 
-    let visible_rows = if depth == 0 && block.folded && table.nrows() > TABLE_FOLD_ROWS {
-        TABLE_FOLD_ROWS
-    } else {
-        table.nrows()
-    };
+    let total_rows = table.nrows();
+    let is_scrollable = depth == 0 && block.folded && total_rows > TABLE_FOLD_ROWS;
+    let visible_rows = if is_scrollable { TABLE_FOLD_ROWS } else { total_rows };
+
+    // Non-mutating row permutation when the user clicks a column header to sort!
+    let mut row_order: Vec<usize> = (0..total_rows).collect();
+    if depth == 0
+        && let Some((sort_col, desc)) = block.table_sort
+        && sort_col < ncols
+    {
+        row_order.sort_by(|&a, &b| {
+            let va = table.cell(a, sort_col);
+            let vb = table.cell(b, sort_col);
+            let ord = match (va, vb) {
+                (Some(x), Some(y)) => x.compare(y).unwrap_or_else(|| {
+                    format_value_cell_at(x, Some(now_ns)).cmp(&format_value_cell_at(y, Some(now_ns)))
+                }),
+                (Some(_), None) => core::cmp::Ordering::Greater,
+                (None, Some(_)) => core::cmp::Ordering::Less,
+                (None, None) => core::cmp::Ordering::Equal,
+            };
+            if desc { ord.reverse() } else { ord }
+        });
+    }
 
     let type_col_idx = table.col_index("type");
     let icon_s = 14.0;
     let icon_pad = icon_s + 7.0;
 
-    let idx_chars = table.nrows().max(1).to_string().len().max(2);
+    let idx_chars = total_rows.max(1).to_string().len().max(2);
     let idx_w = idx_chars as f32 * m.cw + 16.0;
     let col_gap = 22.0;
-    let avail_w = (width - idx_w).max(80.0);
+    let scrollbar_reserve = if is_scrollable { 12.0 } else { 0.0 };
+    let avail_w = (width - idx_w - scrollbar_reserve).max(80.0);
 
     let mut col_displays: Vec<ColDisplay> = Vec::with_capacity(ncols);
     let mut col_chars: Vec<usize> = Vec::with_capacity(ncols);
@@ -1073,17 +1206,18 @@ fn layout_table(
     let mut col_extra_px: Vec<f32> = Vec::with_capacity(ncols);
     let mut col_max_num: Vec<f64> = Vec::with_capacity(ncols);
 
+    let sample_rows = total_rows.min(256);
     for c in 0..ncols {
-        let disp = effective_col_display(table, c, visible_rows);
+        let disp = effective_col_display(table, c, sample_rows);
         col_displays.push(disp);
 
         let hdr = table.columns.get(c).map(|s| s.as_ref()).unwrap_or("");
-        let mut max_c = hdr.chars().count().max(3);
+        let mut max_c = (hdr.chars().count() + 2).max(3);
         let mut numeric_votes = 0usize;
         let mut non_empty = 0usize;
         let mut max_num = 0.0f64;
 
-        for r in 0..visible_rows {
+        for r in 0..sample_rows {
             if let Some(cell) = table.cell(r, c) {
                 let mut txt = format_value_cell_at(cell, Some(now_ns));
                 if disp == ColDisplay::FileEntry
@@ -1131,41 +1265,86 @@ fn layout_table(
             *w = (*w * scale).max(52.0);
         }
     }
-    let table_w = (idx_w + col_widths.iter().sum::<f32>() - col_gap * 0.4).min(width);
+    let table_w = (idx_w + col_widths.iter().sum::<f32>() - col_gap * 0.4).min(width - scrollbar_reserve);
     let x1 = x0 + table_w;
 
     let row_h = m.ch + TABLE_ROW_PAD_Y * 2.0;
 
-    // Minimal column headers + one crisp hairline underneath.
+    // Clickable sortable column headers + crisp hairline underneath.
     scene.text(x0, y0, "#", theme::INK_4, false, false, clip_id);
     let mut cx = x0 + idx_w;
     for c in 0..ncols {
         let cw = col_widths[c];
         let content_w = (cw - col_gap).max(m.cw * 2.0);
+        let col_raw = table.columns.get(c).map(|s| s.as_ref()).unwrap_or("");
+        let active_sort = if depth == 0 {
+            block.table_sort.and_then(|(sc, desc)| if sc == c { Some(desc) } else { None })
+        } else {
+            None
+        };
+        let suffix = match active_sort {
+            Some(true) => " ↓",
+            Some(false) => " ↑",
+            None => "",
+        };
         let max_ch = (content_w / m.cw).floor().max(2.0) as usize;
-        let hdr = truncate_chars(table.columns.get(c).map(|s| s.as_ref()).unwrap_or(""), max_ch);
+        let hdr_base = truncate_chars(col_raw, max_ch.saturating_sub(suffix.chars().count()).max(1));
+        let hdr = format!("{hdr_base}{suffix}");
         let tx = if col_right_align[c] {
             cx + content_w - hdr.chars().count() as f32 * m.cw
         } else {
             cx
         };
-        scene.text(tx, y0, hdr, theme::INK_3, false, false, clip_id);
+        let hdr_col = if active_sort.is_some() { theme::INK_1 } else { theme::INK_3 };
+        scene.text(tx, y0, hdr, hdr_col, active_sort.is_some(), false, clip_id);
+        if depth == 0 {
+            let hdr_hit = HitRect::new(cx - 4.0, y0 - 2.0, cx + content_w + 4.0, y0 + m.ch + 4.0);
+            scene.push_hit_clipped(
+                hdr_hit,
+                clip_id,
+                HitAction::SortTableColumn { block: block.id, col: c },
+            );
+            scene.push_hover_clipped(
+                hdr_hit,
+                clip_id,
+                HoverKind::Tooltip {
+                    title: format!("Sort by `{col_raw}`"),
+                    subtitle: Some(match active_sort {
+                        Some(true) => "currently descending · click for ascending".to_owned(),
+                        Some(false) => "currently ascending · click for descending".to_owned(),
+                        None => "click to sort rows".to_owned(),
+                    }),
+                },
+            );
+        }
         cx += cw;
     }
 
     let hdr_line_y = y0 + m.ch + 6.0;
     scene.line(x0, hdr_line_y, x1, hdr_line_y, 1.0, theme::LINE, clip_id);
 
-    let mut cur_y = hdr_line_y + 5.0;
+    let rows_top_y = hdr_line_y + 5.0;
+    let mut cur_y = rows_top_y;
+
+    // Snap scroll offset cleanly to exact integer row grid boundaries (never half-clipped rows!).
+    let max_first_row = total_rows.saturating_sub(visible_rows);
+    let max_scroll_y = max_first_row as f32 * row_h;
+    let first_row = if is_scrollable && max_first_row > 0 {
+        (block.table_scroll_y / row_h).round().clamp(0.0, max_first_row as f32) as usize
+    } else {
+        0
+    };
 
     if visible_rows == 0 {
         scene.text(x0, cur_y + TABLE_ROW_PAD_Y, "0 rows", theme::INK_4, false, true, clip_id);
         cur_y += row_h;
     } else {
-        for r in 0..visible_rows {
+        for vis_i in 0..visible_rows {
+            let disp_idx = first_row + vis_i;
+            let r = row_order[disp_idx];
             let ty = cur_y + TABLE_ROW_PAD_Y;
             let iy = ty + (m.ch - icon_s) * 0.5;
-            scene.text(x0, ty, r.to_string(), theme::INK_4, false, false, clip_id);
+            scene.text(x0, ty, disp_idx.to_string(), theme::INK_4, false, false, clip_id);
 
             let row_file_kind = type_col_idx
                 .and_then(|ti| table.cell(r, ti))
@@ -1371,12 +1550,55 @@ fn layout_table(
         }
     }
 
-    if depth == 0 && table.nrows() > TABLE_FOLD_ROWS {
+    // Crisp macOS-style minimal scrollbar track + thumb when scrolling a large table on the row grid.
+    if is_scrollable && max_first_row > 0 {
+        let track_h = (cur_y - rows_top_y).max(24.0);
+        let sb_x0 = x1 + 5.0;
+        let sb_w = 3.5;
+        scene.round_rect(
+            sb_x0,
+            rows_top_y,
+            sb_x0 + sb_w,
+            rows_top_y + track_h,
+            1.75,
+            theme::BG_TRACK,
+            0.0,
+            [0.0; 4],
+            clip_id,
+        );
+        let frac = (visible_rows as f32 / total_rows as f32).clamp(0.12, 1.0);
+        let thumb_h = (track_h * frac).max(18.0);
+        let pos_frac = first_row as f32 / max_first_row as f32;
+        let thumb_y0 = rows_top_y + (track_h - thumb_h) * pos_frac;
+        scene.over_round_rect(
+            sb_x0,
+            thumb_y0,
+            sb_x0 + sb_w,
+            thumb_y0 + thumb_h,
+            1.75,
+            theme::INK_4,
+            clip_id,
+        );
+        scene.push_scroll_region(
+            HitRect::new(x0, y0, x1 + 14.0, cur_y),
+            clip_id,
+            block.id,
+            max_scroll_y,
+            0.0,
+        );
+    }
+
+    if depth == 0 && total_rows > TABLE_FOLD_ROWS {
         cur_y += 4.0;
         let lbl = if block.folded {
-            format!("+ {} more rows", table.nrows() - TABLE_FOLD_ROWS)
+            format!(
+                "rows {}–{} of {} · scroll or show all",
+                first_row + 1,
+                first_row + visible_rows,
+                total_rows
+            )
         } else {
-            format!("− collapse to {TABLE_FOLD_ROWS} rows")
+            format!("− collapse to {TABLE_FOLD_ROWS}-row scrollable view")
         };
         let pw = lbl.chars().count() as f32 * m.cw + 8.0;
         scene.text(x0 + idx_w, cur_y, lbl, theme::INK_3, false, false, clip_id);
@@ -2775,4 +2997,346 @@ fn layout_reverse_search_overlay(
         let pv_cmd = truncate_chars(&sel.entry.command.replace('\n', " ↵ "), max_pv);
         scene.overlay_text_run(x0 + pad_x, pv_ty, pv_cmd, theme::INK_3, false, false, 0);
     }
+}
+
+/// Floating native Metal popover rendered when hovering or clicking any prompt capsule segment
+/// (branch switcher, uncommitted files, stashes, directory breadcrumbs, toolchains) or icon button.
+fn layout_active_popover(
+    scene: &mut Scene,
+    pop: &ActivePopover,
+    vw: f32,
+    vh: f32,
+    m: CellMetrics,
+    mouse_pos: Option<[f32; 2]>,
+) {
+    let pad_x = 11.0;
+    let pad_y = 8.0;
+    let row_h = m.ch + 7.0;
+    let hdr_h = m.ch + 7.0;
+    let icon_s = 12.5;
+    let gap = 6.0;
+
+    let is_hovered = |r: HitRect| -> bool {
+        mouse_pos.is_some_and(|[mx, my]| r.contains(mx, my))
+    };
+
+    // Compute exact popover dimensions per variant before placing relative to `pop.anchor`.
+    let (pop_w, pop_h): (f32, f32) = match &pop.kind {
+        HoverKind::Tooltip { title, subtitle } => {
+            let max_c = title
+                .chars()
+                .count()
+                .max(subtitle.as_ref().map_or(0, |s| s.chars().count()))
+                .min(48);
+            let w = (max_c as f32 * m.cw + pad_x * 2.0).clamp(110.0, 420.0);
+            let h = pad_y * 2.0 + m.ch + if subtitle.is_some() { m.ch + 2.0 } else { 0.0 };
+            (w, h)
+        }
+        HoverKind::GitBranch { branches, .. } => {
+            let shown = branches.len().clamp(1, 10);
+            let max_c = branches
+                .iter()
+                .take(shown)
+                .map(|b| b.chars().count())
+                .max()
+                .unwrap_or(10)
+                .max(24)
+                .min(42);
+            let w = (max_c as f32 * m.cw + pad_x * 2.0 + 36.0).clamp(220.0, 380.0);
+            let h = hdr_h + shown as f32 * row_h + pad_y;
+            (w, h)
+        }
+        HoverKind::GitStashes { stashes, .. } => {
+            let shown = stashes.len().clamp(1, 8);
+            let max_c = stashes
+                .iter()
+                .take(shown)
+                .map(|s| s.chars().count() + 11)
+                .max()
+                .unwrap_or(20)
+                .max(22)
+                .min(58);
+            let w = (max_c as f32 * m.cw + pad_x * 2.0).clamp(240.0, 520.0);
+            let h = hdr_h + shown as f32 * row_h + pad_y;
+            (w, h)
+        }
+        HoverKind::GitChanges { files, .. } => {
+            let shown = files.len().clamp(1, 10);
+            let max_c = files
+                .iter()
+                .take(shown)
+                .map(|(p, _, _)| p.chars().count() + 6)
+                .max()
+                .unwrap_or(20)
+                .max(26)
+                .min(56);
+            let w = (max_c as f32 * m.cw + pad_x * 2.0 + icon_s + 14.0).clamp(260.0, 500.0);
+            let h = hdr_h + shown as f32 * row_h + pad_y;
+            (w, h)
+        }
+        HoverKind::Directory { cwd } => {
+            let parts = parent_breadcrumbs(cwd);
+            let shown = parts.len().clamp(1, 8);
+            let max_c = parts
+                .iter()
+                .map(|(lbl, _)| lbl.chars().count())
+                .max()
+                .unwrap_or(16)
+                .max(24)
+                .min(50);
+            let w = (max_c as f32 * m.cw + pad_x * 2.0 + icon_s + 16.0).clamp(240.0, 460.0);
+            let h = hdr_h + shown as f32 * row_h + pad_y;
+            (w, h)
+        }
+        HoverKind::Toolchains { items } => {
+            let shown = items.len().clamp(1, 6);
+            let w = 250.0;
+            let h = hdr_h + shown as f32 * row_h + pad_y;
+            (w, h)
+        }
+    };
+
+    // Place cleanly below anchor (or flip above when near viewport bottom), clamped inside window.
+    let x0 = pop.anchor.x0.clamp(12.0, (vw - pop_w - 12.0).max(12.0));
+    let x1 = x0 + pop_w;
+    let below_y0 = pop.anchor.y1 + gap;
+    let y0 = if below_y0 + pop_h <= vh - 10.0 {
+        below_y0
+    } else {
+        (pop.anchor.y0 - gap - pop_h).max(TOP_BAR_H + 6.0)
+    };
+    let y1 = y0 + pop_h;
+
+    scene.popover_rect = Some(HitRect::new(x0, y0, x1, y1));
+
+    // Soft shadow + dark glass body + 1px hairline border.
+    scene.overlay_round_rect(
+        x0 - 2.0,
+        y0 + 3.0,
+        x1 + 2.0,
+        y1 + 5.0,
+        10.0,
+        theme::rgba(0, 0, 0, 0.42),
+        0.0,
+        [0.0; 4],
+        0,
+    );
+    scene.overlay_round_rect(
+        x0,
+        y0,
+        x1,
+        y1,
+        8.0,
+        theme::rgb(0x14, 0x14, 0x17),
+        1.0,
+        theme::rgb(0x2a, 0x2a, 0x2f),
+        0,
+    );
+
+    let draw_header = |scene: &mut Scene, left: &str, right: &str| -> f32 {
+        let hy = y0 + (hdr_h - m.ch) * 0.5;
+        scene.overlay_text_run(x0 + pad_x, hy, left, theme::INK_3, true, false, 0);
+        if !right.is_empty() {
+            let rw = right.chars().count() as f32 * m.cw;
+            scene.overlay_text_run(x1 - pad_x - rw, hy, right, theme::INK_4, false, false, 0);
+        }
+        scene.overlay_line(x0 + 1.0, y0 + hdr_h, x1 - 1.0, y0 + hdr_h, 1.0, theme::LINE_FAINT, 0);
+        y0 + hdr_h + 3.0
+    };
+
+    match &pop.kind {
+        HoverKind::Tooltip { title, subtitle } => {
+            let max_c = ((pop_w - pad_x * 2.0) / m.cw).floor().max(8.0) as usize;
+            scene.overlay_text_run(x0 + pad_x, y0 + pad_y, truncate_chars(title, max_c), theme::INK_1, false, false, 0);
+            if let Some(sub) = subtitle {
+                scene.overlay_text_run(
+                    x0 + pad_x,
+                    y0 + pad_y + m.ch + 2.0,
+                    truncate_chars(sub, max_c),
+                    theme::INK_3,
+                    false,
+                    false,
+                    0,
+                );
+            }
+        }
+        HoverKind::GitBranch { current, branches } => {
+            let mut ry = draw_header(scene, "git branches", "click to switch");
+            let max_c = ((pop_w - pad_x * 2.0 - 28.0) / m.cw).floor().max(8.0) as usize;
+            for br in branches.iter().take(10) {
+                let row_rect = HitRect::new(x0 + 4.0, ry, x1 - 4.0, ry + row_h);
+                let is_cur = br == current;
+                if is_hovered(row_rect) {
+                    scene.overlay_round_rect(
+                        row_rect.x0,
+                        row_rect.y0,
+                        row_rect.x1,
+                        row_rect.y1,
+                        5.0,
+                        theme::rgb(0x20, 0x20, 0x25),
+                        0.0,
+                        [0.0; 4],
+                        0,
+                    );
+                }
+                let ty = ry + (row_h - m.ch) * 0.5;
+                if is_cur {
+                    scene.overlay_round_rect(
+                        x0 + pad_x + 1.0,
+                        ty + m.ch * 0.5 - 2.5,
+                        x0 + pad_x + 6.0,
+                        ty + m.ch * 0.5 + 2.5,
+                        2.5,
+                        theme::OK,
+                        0.0,
+                        [0.0; 4],
+                        0,
+                    );
+                }
+                let col = if is_cur { theme::INK_1 } else { theme::INK_2 };
+                scene.overlay_text_run(x0 + pad_x + 14.0, ty, truncate_chars(br, max_c), col, is_cur, false, 0);
+                if is_cur {
+                    let tag = "current";
+                    let tw = tag.len() as f32 * m.cw;
+                    scene.overlay_text_run(x1 - pad_x - tw, ty, tag, theme::INK_4, false, false, 0);
+                } else {
+                    scene.push_hit(row_rect, HitAction::SwitchGitBranch(br.clone()));
+                }
+                ry += row_h;
+            }
+        }
+        HoverKind::GitStashes { stashes, total } => {
+            let mut ry = draw_header(scene, &format!("git stashes · {total}"), ".git/logs/refs/stash");
+            if stashes.is_empty() {
+                let ty = ry + (row_h - m.ch) * 0.5;
+                scene.overlay_text_run(x0 + pad_x, ty, "no stash descriptions", theme::INK_4, false, true, 0);
+            } else {
+                for (i, msg) in stashes.iter().take(8).enumerate() {
+                    let ty = ry + (row_h - m.ch) * 0.5;
+                    let idx_lbl = format!("@{{{i}}}");
+                    let idx_w = idx_lbl.len() as f32 * m.cw + 8.0;
+                    scene.overlay_text_run(x0 + pad_x, ty, idx_lbl, theme::INK_3, false, false, 0);
+                    let max_c = ((pop_w - pad_x * 2.0 - idx_w) / m.cw).floor().max(8.0) as usize;
+                    scene.overlay_text_run(
+                        x0 + pad_x + idx_w,
+                        ty,
+                        truncate_chars(msg, max_c),
+                        theme::INK_1,
+                        false,
+                        false,
+                        0,
+                    );
+                    ry += row_h;
+                }
+            }
+        }
+        HoverKind::GitChanges { files, total } => {
+            let mut ry = draw_header(scene, &format!("uncommitted · {total}"), "click to insert");
+            let max_c = ((pop_w - pad_x * 2.0 - icon_s - 28.0) / m.cw).floor().max(8.0) as usize;
+            for (path, icon, tag) in files.iter().take(10) {
+                let row_rect = HitRect::new(x0 + 4.0, ry, x1 - 4.0, ry + row_h);
+                if is_hovered(row_rect) {
+                    scene.overlay_round_rect(
+                        row_rect.x0,
+                        row_rect.y0,
+                        row_rect.x1,
+                        row_rect.y1,
+                        5.0,
+                        theme::rgb(0x20, 0x20, 0x25),
+                        0.0,
+                        [0.0; 4],
+                        0,
+                    );
+                }
+                let ty = ry + (row_h - m.ch) * 0.5;
+                scene.overlay_svg_icon(x0 + pad_x, ty + (m.ch - icon_s) * 0.5, icon_s, icon, 0);
+                scene.overlay_text_run(
+                    x0 + pad_x + icon_s + 7.0,
+                    ty,
+                    truncate_chars(path, max_c),
+                    theme::INK_2,
+                    false,
+                    false,
+                    0,
+                );
+                let tag_col = match *tag {
+                    "!" => theme::DANGER,
+                    "+" => theme::OK,
+                    "M" | "D" => theme::FIRE,
+                    _ => theme::INK_3,
+                };
+                scene.overlay_text_run(x1 - pad_x - m.cw, ty, *tag, tag_col, true, false, 0);
+                scene.push_hit(row_rect, HitAction::InsertToken(path.clone()));
+                ry += row_h;
+            }
+        }
+        HoverKind::Directory { cwd } => {
+            let mut ry = draw_header(scene, "directory", "click to cd");
+            let parts = parent_breadcrumbs(cwd);
+            let max_c = ((pop_w - pad_x * 2.0 - icon_s - 10.0) / m.cw).floor().max(8.0) as usize;
+            for (i, (label, full_path)) in parts.iter().enumerate() {
+                let is_cur = i + 1 == parts.len();
+                let row_rect = HitRect::new(x0 + 4.0, ry, x1 - 4.0, ry + row_h);
+                if is_hovered(row_rect) && !is_cur {
+                    scene.overlay_round_rect(
+                        row_rect.x0,
+                        row_rect.y0,
+                        row_rect.x1,
+                        row_rect.y1,
+                        5.0,
+                        theme::rgb(0x20, 0x20, 0x25),
+                        0.0,
+                        [0.0; 4],
+                        0,
+                    );
+                }
+                let ty = ry + (row_h - m.ch) * 0.5;
+                scene.overlay_svg_icon(x0 + pad_x, ty + (m.ch - icon_s) * 0.5, icon_s, "folder_macos", 0);
+                let col = if is_cur { theme::INK_1 } else { theme::INK_2 };
+                scene.overlay_text_run(
+                    x0 + pad_x + icon_s + 7.0,
+                    ty,
+                    truncate_chars(label, max_c),
+                    col,
+                    is_cur,
+                    false,
+                    0,
+                );
+                if !is_cur {
+                    scene.push_hit(row_rect, HitAction::ChangeDir(full_path.clone()));
+                }
+                ry += row_h;
+            }
+        }
+        HoverKind::Toolchains { items } => {
+            let mut ry = draw_header(scene, "project toolchains", "detected");
+            for &(icon, name, marker) in items.iter().take(6) {
+                let ty = ry + (row_h - m.ch) * 0.5;
+                scene.overlay_svg_icon(x0 + pad_x, ty + (m.ch - icon_s) * 0.5, icon_s, icon, 0);
+                scene.overlay_text_run(x0 + pad_x + icon_s + 7.0, ty, name, theme::INK_1, false, false, 0);
+                let mw = marker.len() as f32 * m.cw;
+                scene.overlay_text_run(x1 - pad_x - mw, ty, marker, theme::INK_4, false, false, 0);
+                ry += row_h;
+            }
+        }
+    }
+}
+
+fn parent_breadcrumbs(cwd: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let trimmed = cwd.trim_end_matches('/');
+    if trimmed.is_empty() {
+        out.push(("/".to_owned(), "/".to_owned()));
+        return out;
+    }
+    let mut acc = String::new();
+    for seg in trimmed.split('/').filter(|s| !s.is_empty()) {
+        acc.push('/');
+        acc.push_str(seg);
+        out.push((acc.clone(), acc.clone()));
+    }
+    if out.len() > 6 {
+        out = out.split_off(out.len() - 6);
+    }
+    out
 }

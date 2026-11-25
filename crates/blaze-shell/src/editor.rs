@@ -1664,8 +1664,121 @@ impl Editor {
                 }
             }
         } else {
+            // Smart command-aware argument completions (`ssh`, `git`, `blaze`, `cd`, table columns).
+            let stage_start = before.rfind(['|', ';', '\n']).map_or(0, |p| p + 1);
+            let stage_prefix = before[stage_start..token_start].trim();
+            let stage_words: Vec<&str> = stage_prefix.split_whitespace().collect();
+            let cmd0 = stage_words.first().copied().unwrap_or("");
+            let cmd_base = cmd0.trim_start_matches('^').rsplit('/').next().unwrap_or(cmd0);
+            let subcmd = stage_words.get(1).copied();
+
+            let mut handled_specialized = false;
+
+            if matches!(cmd_base, "ssh" | "sftp" | "mosh")
+                || (matches!(cmd_base, "scp" | "rsync")
+                    && !prefix.starts_with('/')
+                    && !prefix.starts_with("./")
+                    && !prefix.starts_with("../")
+                    && !prefix.starts_with('~'))
+            {
+                let home = state.get_env("HOME").unwrap_or("");
+                let (user_prefix, host_prefix) = match prefix.split_once('@') {
+                    Some((u, h)) => (Some(u), h),
+                    None => (None, prefix),
+                };
+                for (alias, detail, doc) in collect_ssh_hosts(home) {
+                    if let Some((score, mut idxs)) = fuzzy_match_score(&alias, host_prefix) {
+                        let (label, insert) = if let Some(u) = user_prefix {
+                            for i in &mut idxs {
+                                *i += u.len() + 1;
+                            }
+                            (format!("{u}@{alias}"), format!("{u}@{alias}"))
+                        } else {
+                            (alias.clone(), alias.clone())
+                        };
+                        scored.push((
+                            score + 70,
+                            CompletionItem {
+                                label,
+                                insert,
+                                detail,
+                                doc,
+                                kind: CompletionKind::External,
+                                icon: Some("shell_dark"),
+                                match_indices: idxs,
+                            },
+                        ));
+                    }
+                }
+                if matches!(cmd_base, "ssh" | "sftp" | "mosh") && !scored.is_empty() {
+                    handled_specialized = true;
+                }
+            } else if cmd_base == "git" {
+                if subcmd.is_none() {
+                    for &(sub, desc) in GIT_SUBCOMMANDS {
+                        if let Some((score, idxs)) = fuzzy_match_score(sub, prefix) {
+                            scored.push((
+                                score + 65,
+                                CompletionItem {
+                                    label: sub.to_owned(),
+                                    insert: sub.to_owned(),
+                                    detail: "git".to_owned(),
+                                    doc: desc.to_owned(),
+                                    kind: CompletionKind::Builtin,
+                                    icon: None,
+                                    match_indices: idxs,
+                                },
+                            ));
+                        }
+                    }
+                    handled_specialized = true;
+                } else if matches!(
+                    subcmd,
+                    Some("switch" | "checkout" | "co" | "merge" | "rebase" | "branch" | "diff" | "log" | "push" | "reset")
+                ) {
+                    let branches = crate::prompt::read_local_branches_for_cwd(state.cwd.as_ref(), 32);
+                    for br in branches {
+                        if let Some((score, idxs)) = fuzzy_match_score(&br, prefix) {
+                            scored.push((
+                                score + 60,
+                                CompletionItem {
+                                    label: br.clone(),
+                                    insert: br.clone(),
+                                    detail: "branch".to_owned(),
+                                    doc: format!("local git branch `{br}`"),
+                                    kind: CompletionKind::Keyword,
+                                    icon: None,
+                                    match_indices: idxs,
+                                },
+                            ));
+                        }
+                    }
+                    if matches!(subcmd, Some("switch" | "merge" | "rebase" | "branch")) && !scored.is_empty() {
+                        handled_specialized = true;
+                    }
+                }
+            } else if cmd_base == "blaze" && subcmd.is_none() {
+                for &(sub, desc) in BLAZE_SUBCOMMANDS {
+                    if let Some((score, idxs)) = fuzzy_match_score(sub, prefix) {
+                        scored.push((
+                            score + 65,
+                            CompletionItem {
+                                label: sub.to_owned(),
+                                insert: sub.to_owned(),
+                                detail: "blaze".to_owned(),
+                                doc: desc.to_owned(),
+                                kind: CompletionKind::Builtin,
+                                icon: Some("rust_dark"),
+                                match_indices: idxs,
+                            },
+                        ));
+                    }
+                }
+                handled_specialized = true;
+            }
+
             // Column-aware completion for table pipeline operators (`where`, `sort-by`, `select`, `get`, ...).
-            if expects_column_arg(before) {
+            if !handled_specialized && expects_column_arg(before) {
                 let cols = infer_pipeline_columns(before, recent_cols);
                 for (col_name, col_ty) in cols {
                     if let Some((score, idxs)) = fuzzy_match_score(&col_name, prefix) {
@@ -1684,8 +1797,10 @@ impl Editor {
                     }
                 }
             }
-            // Filesystem completion with macOS folder + IntelliJ New UI dark SVG icons.
-            collect_path_completions(state.cwd.as_ref(), prefix, &mut scored);
+            // Filesystem completion with macOS folder + IntelliJ New UI dark SVG icons (`cd` = dirs only).
+            if !handled_specialized {
+                collect_path_completions(state.cwd.as_ref(), prefix, cmd_base == "cd", &mut scored);
+            }
         }
 
         // Highest match score first, then alphabetical by label.
@@ -2073,7 +2188,158 @@ fn active_stage_command(before_cursor: &str) -> Option<&str> {
     before_cursor[stage_start..].split_whitespace().next()
 }
 
-fn collect_path_completions(cwd: &str, prefix: &str, out: &mut Vec<(i32, CompletionItem)>) {
+const GIT_SUBCOMMANDS: &[(&str, &str)] = &[
+    ("status", "Show working tree status"),
+    ("diff", "Show changes between commits or working tree"),
+    ("log", "Show commit logs"),
+    ("switch", "Switch branches"),
+    ("checkout", "Switch branches or restore working tree files"),
+    ("branch", "List, create, or delete branches"),
+    ("commit", "Record changes to the repository"),
+    ("add", "Add file contents to the index"),
+    ("push", "Update remote refs along with associated objects"),
+    ("pull", "Fetch from and integrate with another repository"),
+    ("fetch", "Download objects and refs from another repository"),
+    ("rebase", "Reapply commits on top of another base tip"),
+    ("stash", "Stash changes in a dirty working directory"),
+    ("merge", "Join two or more development histories together"),
+    ("restore", "Restore working tree files"),
+    ("reset", "Reset current HEAD to the specified state"),
+    ("show", "Show various types of objects"),
+    ("cherry-pick", "Apply changes introduced by existing commits"),
+    ("worktree", "Manage multiple working trees"),
+];
+
+const BLAZE_SUBCOMMANDS: &[(&str, &str)] = &[
+    ("check", "Check and lint a workspace incrementally"),
+    ("run", "Compile what is reached and run a binary"),
+    ("test", "Run workspace tests incrementally"),
+    ("export", "Export a standalone PGO-optimized native binary"),
+    ("ci", "Run CI checks with structured reporting"),
+    ("inspect", "Inspect lowered MIR/types for a file or function"),
+    ("why", "Explain why a file or item was rechecked"),
+    ("explain", "Explain a diagnostic or lint code"),
+    ("clean", "Remove checkout state (and --store for home store)"),
+    ("gc", "Compact store and evict stale records"),
+    ("peer", "Serve crate records to LAN peers"),
+    ("toolchain", "Print the pinned Rust toolchain"),
+    ("warm-toolchain", "Pre-warm toolchain records into the store"),
+    ("version", "Print blaze and toolchain versions"),
+    ("help", "Show blaze CLI help"),
+];
+
+/// Load SSH hosts via our sans-IO `blaze-ssh` parser (`~/.ssh/config` + `Include`s + `known_hosts`).
+fn collect_ssh_hosts(home: &str) -> Vec<(String, String, String)> {
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    if home.is_empty() {
+        return out;
+    }
+    let ssh_dir = PathBuf::from(home).join(".ssh");
+    let alloc = Alloc::global();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    if let Ok(root_text) = fs::read_to_string(ssh_dir.join("config")) {
+        let mut loader =
+            blaze_ssh::ConfigLoader::new(&root_text, blaze_ssh::ConfigLimits::SHIPPED, alloc);
+        for depth in 2..=blaze_ssh::ConfigLimits::SHIPPED.max_include_depth {
+            match loader.poll() {
+                blaze_ssh::LoadStep::NeedInclude(pat) => {
+                    let texts = read_ssh_include_pattern(&ssh_dir, home, pat.as_str());
+                    let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+                    loader.feed_files(&refs, depth);
+                }
+                blaze_ssh::LoadStep::Done(cfg) => {
+                    for h in cfg.list_hosts(128, alloc).iter() {
+                        let alias = h.alias.as_str().to_owned();
+                        if !seen.insert(alias.clone()) {
+                            continue;
+                        }
+                        let target = match (&h.user, &h.hostname, h.port) {
+                            (Some(u), Some(hn), Some(p)) if p != 22 => {
+                                format!("{}@{}:{p}", u.as_str(), hn.as_str())
+                            }
+                            (Some(u), Some(hn), _) => format!("{}@{}", u.as_str(), hn.as_str()),
+                            (None, Some(hn), Some(p)) if p != 22 => {
+                                format!("{}:{p}", hn.as_str())
+                            }
+                            (None, Some(hn), _) => hn.as_str().to_owned(),
+                            (Some(u), None, _) => format!("{}@{alias}", u.as_str()),
+                            _ => "ssh host".to_owned(),
+                        };
+                        let doc = if let Some(pj) = &h.proxy_jump {
+                            format!("~/.ssh/config · {target} (via {})", pj.as_str())
+                        } else {
+                            format!("~/.ssh/config · {target}")
+                        };
+                        out.push((alias, target, doc));
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    if let Ok(kh_text) = fs::read_to_string(ssh_dir.join("known_hosts")) {
+        for kh in blaze_ssh::parse_known_hosts(&kh_text, 128, alloc).iter() {
+            let host = kh.host.as_str().to_owned();
+            if seen.insert(host.clone()) {
+                let detail = match kh.port {
+                    Some(p) => format!("known:{p}"),
+                    None => "known_hosts".to_owned(),
+                };
+                out.push((host.clone(), detail, format!("~/.ssh/known_hosts · {host}")));
+            }
+        }
+    }
+    out
+}
+
+fn read_ssh_include_pattern(ssh_dir: &Path, home: &str, raw_pat: &str) -> Vec<String> {
+    let expanded = if let Some(rest) = raw_pat.strip_prefix("~/") {
+        PathBuf::from(home).join(rest)
+    } else if raw_pat.starts_with('/') {
+        PathBuf::from(raw_pat)
+    } else {
+        ssh_dir.join(raw_pat)
+    };
+    let s = expanded.to_string_lossy();
+    if !s.contains('*') && !s.contains('?') {
+        return fs::read_to_string(&expanded).into_iter().collect();
+    }
+    let Some(parent) = expanded.parent() else {
+        return Vec::new();
+    };
+    let Some(file_pat) = expanded.file_name().and_then(|n| n.to_str()) else {
+        return Vec::new();
+    };
+    let Ok(rd) = fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = rd
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if blaze_ssh::glob_match(file_pat, &name) && e.file_type().is_ok_and(|t| t.is_file()) {
+                Some(e.path())
+            } else {
+                None
+            }
+        })
+        .collect();
+    paths.sort();
+    paths
+        .into_iter()
+        .take(32)
+        .filter_map(|p| fs::read_to_string(p).ok())
+        .collect()
+}
+
+fn collect_path_completions(
+    cwd: &str,
+    prefix: &str,
+    dirs_only: bool,
+    out: &mut Vec<(i32, CompletionItem)>,
+) {
     let (dir_part, file_prefix) = match prefix.rfind('/') {
         Some(idx) => (&prefix[..=idx], &prefix[idx + 1..]),
         None => ("", prefix),
@@ -2094,11 +2360,14 @@ fn collect_path_completions(cwd: &str, prefix: &str, out: &mut Vec<(i32, Complet
         if !show_hidden && name.starts_with('.') {
             continue;
         }
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if dirs_only && !is_dir {
+            continue;
+        }
         let Some((score, idxs)) = fuzzy_match_score(&name, file_prefix) else {
             continue;
         };
         let meta = entry.metadata().ok();
-        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
         let kind_str = if is_dir { Some("dir") } else { Some("file") };
         let icon = Some(icon_name_for_file(&name, kind_str));
         let label = if is_dir { format!("{name}/") } else { name.clone() };
@@ -2141,6 +2410,7 @@ fn collect_path_completions(cwd: &str, prefix: &str, out: &mut Vec<(i32, Complet
 
 fn word_left_boundary(s: &str, cursor: usize) -> usize {
     let mut i = clamp_char_boundary(s, cursor);
+    // 1. Skip any whitespace right before the cursor.
     while i > 0 {
         let p = prev_char_boundary(s, i);
         let ch = s[p..i].chars().next().unwrap_or(' ');
@@ -2149,6 +2419,25 @@ fn word_left_boundary(s: &str, cursor: usize) -> usize {
         }
         i = p;
     }
+    // 2. Skip any punctuation/path separator run (`/`, `-`, `.`, etc.) right at the cursor
+    // so `Option+Backspace` / `Ctrl+W` at `ls /Volumes/Projects/|` deletes `Projects/` instead
+    // of getting stuck at `/`!
+    let mut skipped_sep = false;
+    while i > 0 {
+        let p = prev_char_boundary(s, i);
+        let ch = s[p..i].chars().next().unwrap_or(' ');
+        if !is_word_sep(ch) {
+            break;
+        }
+        i = p;
+        skipped_sep = true;
+        // Stop after consuming one slash so `/Volumes/Projects/|` deletes `Projects/`, then `Volumes/`.
+        if ch == '/' {
+            break;
+        }
+    }
+    // 3. Skip the word segment itself.
+    let before_word = i;
     while i > 0 {
         let p = prev_char_boundary(s, i);
         let ch = s[p..i].chars().next().unwrap_or(' ');
@@ -2156,6 +2445,10 @@ fn word_left_boundary(s: &str, cursor: usize) -> usize {
             break;
         }
         i = p;
+    }
+    // If we only saw a leading separator like `/` with whitespace before it, keep the deletion of that `/`.
+    if i == before_word && !skipped_sep && i > 0 {
+        i = prev_char_boundary(s, i);
     }
     i
 }
@@ -2171,6 +2464,20 @@ fn word_right_boundary(s: &str, cursor: usize) -> usize {
         }
         i = n;
     }
+    let mut skipped_sep = false;
+    while i < len {
+        let n = next_char_boundary(s, i);
+        let ch = s[i..n].chars().next().unwrap_or(' ');
+        if !is_word_sep(ch) {
+            break;
+        }
+        i = n;
+        skipped_sep = true;
+        if ch == '/' {
+            break;
+        }
+    }
+    let before_word = i;
     while i < len {
         let n = next_char_boundary(s, i);
         let ch = s[i..n].chars().next().unwrap_or(' ');
@@ -2178,6 +2485,9 @@ fn word_right_boundary(s: &str, cursor: usize) -> usize {
             break;
         }
         i = n;
+    }
+    if i == before_word && !skipped_sep && i < len {
+        i = next_char_boundary(s, i);
     }
     i
 }

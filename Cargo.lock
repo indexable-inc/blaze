@@ -2130,6 +2130,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-ssh"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
+ "blaze-sim",
+]
+
+[[package]]
 name = "blaze-stage"
 version = "0.0.0"
 dependencies = [

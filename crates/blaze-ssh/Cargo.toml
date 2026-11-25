@@ -1,0 +1,15 @@
+[package]
+name = "blaze-ssh"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+blaze-own = { path = "../blaze-own" }
+
+[dev-dependencies]
+blaze-own = { path = "../blaze-own", features = ["testing"] }
+blaze-sim = { path = "../blaze-sim" }
+
+[lints]
+workspace = true

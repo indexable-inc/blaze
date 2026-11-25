@@ -130,6 +130,8 @@ mod tests {
             drag: None,
             cursor_trail: None,
             text_selection: None,
+            active_popover: None,
+            mouse_pos: None,
         });
 
         // Fold toggle hit region must be present, and every block must have a ForkBlock hit target.
@@ -183,6 +185,8 @@ mod tests {
             drag: None,
             cursor_trail: None,
             text_selection: None,
+            active_popover: None,
+            mouse_pos: None,
         });
         assert!(
             scene_unfolded.total_content_height > h_folded,
@@ -207,6 +211,8 @@ mod tests {
             drag: None,
             cursor_trail: None,
             text_selection: None,
+            active_popover: None,
+            mouse_pos: None,
         });
         assert!(scene_expanded.total_content_height > h_before_expand);
         assert!(scene_expanded.text_runs.iter().any(|t| t.text == "meta"));
@@ -459,6 +465,8 @@ mod tests {
             drag: None,
             cursor_trail: None,
             text_selection: None,
+            active_popover: None,
+            mouse_pos: None,
         });
         assert!(
             grid_scene
@@ -504,6 +512,8 @@ mod tests {
             drag: None,
             cursor_trail: None,
             text_selection: None,
+            active_popover: None,
+            mouse_pos: None,
         });
         assert!(table_scene.total_content_height > grid_scene.total_content_height);
         assert!(
@@ -718,6 +728,8 @@ mod tests {
             drag: None,
             cursor_trail: None,
             text_selection: None,
+            active_popover: None,
+            mouse_pos: None,
         });
 
         assert!(
@@ -741,5 +753,86 @@ mod tests {
             extracted.contains("/Volumes/Projects/blaze"),
             "expected extracted text to include path, got: {extracted:?}"
         );
+    }
+
+    #[test]
+    fn word_kill_past_slashes_and_sortable_scrollable_table_and_ssh_completion() {
+        // 1. `Option+Backspace` / `Ctrl+W` at `ls /Volumes/Projects/|` steps cleanly across slashes!
+        let mut ed = Editor::new();
+        ed.set_text("ls /Volumes/Projects/".to_owned());
+        ed.kill_word_back();
+        assert_eq!(ed.text, "ls /Volumes/");
+        ed.kill_word_back();
+        assert_eq!(ed.text, "ls /");
+        ed.kill_word_back();
+        assert_eq!(ed.text, "ls ");
+        ed.kill_word_back();
+        assert_eq!(ed.text, "");
+
+        // 2. Context-aware SSH completion powered by sans-IO `blaze-ssh`!
+        let home = make_temp_dir("ssh-comp");
+        fs::create_dir_all(home.join(".ssh")).unwrap();
+        fs::write(
+            home.join(".ssh/config"),
+            "Host blaze-vm\n  HostName 10.0.0.42\n  User builder\n  Port 2222\n",
+        )
+        .unwrap();
+        let alloc = Alloc::global();
+        let home_str = home.to_string_lossy().into_owned();
+        let state = EngineState::new(&home_str, &[("HOME", &home_str)], alloc);
+        ed.set_text("ssh bl".to_owned());
+        ed.trigger_completion(&state);
+        assert_eq!(ed.text, "ssh blaze-vm ");
+        let _ = fs::remove_dir_all(&home);
+
+        // 3. Scrollable row-grid-snapped table + clickable column header sort!
+        let mut store = BlockStore::new(state.fork());
+        let prompt = PromptInfo::from_cwd("/tmp", "/tmp", 0, 1);
+        let mut t = Table::from_col_names(&["name", "size"], alloc);
+        for i in 0..24 {
+            t.push_row_values(&[
+                Value::string(&format!("f{i:02}.rs"), alloc),
+                Value::Size(Bytes((i as i64 + 1) * 100)),
+            ]);
+        }
+        let bid = store.record_block(
+            "ls -l".to_owned(),
+            prompt.clone(),
+            state.fork(),
+            state.fork(),
+            1,
+            1,
+            0,
+            BlockBody::Value(Value::Table(t)),
+        );
+        let s1 = build_scene(&LayoutInput {
+            store: &store,
+            editor: &ed,
+            prompt: &prompt,
+            viewport_w: 960.0,
+            viewport_h: 800.0,
+            metrics: CellMetrics::default(),
+            scroll_y: 0.0,
+            cursor_visible: true,
+            now_ns: 1_732_500_000_000_000_000,
+            zoom_pct: 100,
+            inline_titlebar: true,
+            drag: None,
+            cursor_trail: None,
+            text_selection: None,
+            active_popover: None,
+            mouse_pos: None,
+        });
+        assert!(!s1.scroll_regions.is_empty(), "expected scrollable table region");
+        assert!(
+            s1.hit_regions
+                .iter()
+                .any(|h| h.action == HitAction::SortTableColumn { block: bid, col: 1 }),
+            "expected clickable sort header for `size`"
+        );
+        assert!(store.toggle_table_sort(bid, 1));
+        assert_eq!(store.block(bid).unwrap().table_sort, Some((1, true)));
+        assert!(store.toggle_table_sort(bid, 1));
+        assert_eq!(store.block(bid).unwrap().table_sort, Some((1, false)));
     }
 }

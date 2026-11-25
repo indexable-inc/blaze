@@ -18,8 +18,8 @@ use blaze_git::machine::{
     DirListing, FileData, Got, PathScope, ScopedPath, StatEntry, StatusMachine, Step, Want,
 };
 use blaze_git::{
-    Divergence, FileKind, FileStat, Head, PromptStyle, RepoState, StatusOpts, WorktreeKind,
-    format_status,
+    ChangeKind, Divergence, FileKind, FileStat, Head, PromptStyle, RepoState, StatusOpts,
+    WorktreeKind, format_status,
 };
 use blaze_own::planted::NoPlant;
 use blaze_own::{AVec, Alloc, Vec as OwnVec};
@@ -55,6 +55,12 @@ pub struct GitStatusSummary {
     pub status_badge: String,
     /// Distinct IntelliJ SVG icon names for uncommitted files (`(icon_name, count)`), ordered by frequency.
     pub changed_icons: Vec<(&'static str, u32)>,
+    /// Representative uncommitted files `(rel_path, icon_name, status_tag)` for hover inspection.
+    pub changed_files: Vec<(String, &'static str, &'static str)>,
+    /// Recent stash descriptions parsed directly from `logs/refs/stash` (newest first, max 8).
+    pub stashes: Vec<String>,
+    /// Local git branches read directly from `refs/heads` + `packed-refs` (current first, max 16).
+    pub branches: Vec<String>,
     pub dirty: bool,
     pub conflicted: u32,
     pub staged: u32,
@@ -81,6 +87,8 @@ pub struct PromptInfo {
     pub in_rust_project: bool,
     /// Detected project toolchain/ecosystem IntelliJ SVG icons (e.g. `rust_dark`, `nix_dark`, `typeScript_dark`).
     pub project_icons: Vec<&'static str>,
+    /// Detailed project markers `(icon_name, toolchain_name, marker_file)` for hover inspection.
+    pub project_details: Vec<(&'static str, &'static str, &'static str)>,
     pub last_exit: i32,
     pub last_duration_ms: u64,
 }
@@ -97,25 +105,36 @@ impl PromptInfo {
         };
         let in_rust_project = has_marker("Cargo.toml");
         let mut project_icons = Vec::new();
+        let mut project_details = Vec::new();
         if in_rust_project {
             project_icons.push("rust_dark");
+            project_details.push(("rust_dark", "Rust", "Cargo.toml"));
         }
         if has_marker("tsconfig.json") {
             project_icons.push("typeScript_dark");
+            project_details.push(("typeScript_dark", "TypeScript", "tsconfig.json"));
         } else if has_marker("package.json") {
             project_icons.push("javaScript_dark");
+            project_details.push(("javaScript_dark", "JavaScript", "package.json"));
         }
-        if has_marker("pyproject.toml") || has_marker("requirements.txt") {
+        if has_marker("pyproject.toml") {
             project_icons.push("python_dark");
+            project_details.push(("python_dark", "Python", "pyproject.toml"));
+        } else if has_marker("requirements.txt") {
+            project_icons.push("python_dark");
+            project_details.push(("python_dark", "Python", "requirements.txt"));
         }
         if has_marker("go.mod") {
             project_icons.push("go_dark");
+            project_details.push(("go_dark", "Go", "go.mod"));
         }
         if has_marker("flake.nix") {
             project_icons.push("nix_dark");
+            project_details.push(("nix_dark", "Nix", "flake.nix"));
         }
         if has_marker("Dockerfile") {
             project_icons.push("docker_dark");
+            project_details.push(("docker_dark", "Docker", "Dockerfile"));
         }
         let (git_branch, git_detached) = match head {
             Some(h) => (Some(h.label), h.detached),
@@ -130,6 +149,7 @@ impl PromptInfo {
             git_status: None,
             in_rust_project,
             project_icons,
+            project_details,
             last_exit,
             last_duration_ms,
         }
@@ -332,12 +352,21 @@ pub fn query_blaze_git_status(cwd: &str) -> Option<GitStatusSummary> {
                     .map(|idx| full_fmt[idx + 1..].to_owned())
                     .unwrap_or_default();
 
-                // Collect distinct IntelliJ SVG icons for uncommitted files, ranked by count.
+                // Collect distinct IntelliJ SVG icons and representative file paths for uncommitted files.
                 let mut changed_icons: Vec<(&'static str, u32)> = Vec::new();
+                let mut changed_files: Vec<(String, &'static str, &'static str)> = Vec::new();
                 for sample in status.changed_samples.iter() {
                     let p = sample.path.as_str();
                     let leaf = p.rsplit('/').next().unwrap_or(p);
                     let icon = crate::svg_icons::icon_name_for_file(leaf, Some("file"));
+                    let tag = match sample.kind {
+                        ChangeKind::Modified => "M",
+                        ChangeKind::Untracked => "?",
+                        ChangeKind::Deleted => "D",
+                        ChangeKind::Staged => "+",
+                        ChangeKind::Conflicted => "!",
+                    };
+                    changed_files.push((p.to_owned(), icon, tag));
                     if let Some(slot) = changed_icons.iter_mut().find(|(n, _)| *n == icon) {
                         slot.1 += 1;
                     } else {
@@ -345,6 +374,9 @@ pub fn query_blaze_git_status(cwd: &str) -> Option<GitStatusSummary> {
                     }
                 }
                 changed_icons.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+
+                let stashes = read_git_stashes(&head.common_dir, 8);
+                let branches = read_local_branches(&head.common_dir, &branch, 16);
 
                 let dirty = c.conflicted > 0
                     || staged > 0
@@ -360,6 +392,9 @@ pub fn query_blaze_git_status(cwd: &str) -> Option<GitStatusSummary> {
                     state_label,
                     status_badge,
                     changed_icons,
+                    changed_files,
+                    stashes,
+                    branches,
                     dirty,
                     conflicted: c.conflicted,
                     staged,
@@ -381,6 +416,82 @@ pub fn query_blaze_git_status(cwd: &str) -> Option<GitStatusSummary> {
         }
     }
     None
+}
+
+/// Read local git branch names for `cwd` with zero subprocesses (for prompt popover & `git` tab completion).
+pub fn read_local_branches_for_cwd(cwd: &str, limit: usize) -> Vec<String> {
+    let Some(head) = read_git_head(cwd) else {
+        return Vec::new();
+    };
+    read_local_branches(&head.common_dir, &head.label, limit)
+}
+
+fn read_git_stashes(common_dir: &Path, limit: usize) -> Vec<String> {
+    let Ok(raw) = fs::read_to_string(common_dir.join("logs/refs/stash")) else {
+        return Vec::new();
+    };
+    raw.lines()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .take(limit)
+        .map(|line| {
+            line.split_once('\t')
+                .map(|(_, msg)| msg.trim().to_owned())
+                .unwrap_or_else(|| line.trim().to_owned())
+        })
+        .collect()
+}
+
+fn read_local_branches(common_dir: &Path, current: &str, limit: usize) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    fn walk_heads(dir: &Path, prefix: &str, out: &mut Vec<String>, depth: usize) {
+        if depth > 6 || out.len() >= 128 {
+            return;
+        }
+        let Ok(rd) = fs::read_dir(dir) else { return };
+        for ent in rd.flatten() {
+            let name = ent.file_name().to_string_lossy().into_owned();
+            let full = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
+            if let Ok(ft) = ent.file_type() {
+                if ft.is_dir() {
+                    walk_heads(&ent.path(), &full, out, depth + 1);
+                } else {
+                    out.push(full);
+                }
+            }
+        }
+    }
+    walk_heads(&common_dir.join("refs/heads"), "", &mut names, 0);
+    if let Ok(packed) = fs::read_to_string(common_dir.join("packed-refs")) {
+        for line in packed.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with('^') {
+                continue;
+            }
+            if let Some((_, refname)) = line.split_once(' ')
+                && let Some(branch) = refname.strip_prefix("refs/heads/")
+            {
+                names.push(branch.to_owned());
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    // Place current branch first, then `main`/`master`, then alphabetical.
+    names.sort_by(|a, b| {
+        let rank = |s: &str| {
+            if s == current {
+                0
+            } else if s == "main" || s == "master" {
+                1
+            } else {
+                2
+            }
+        };
+        rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
+    });
+    names.truncate(limit);
+    names
 }
 
 fn resolve_scoped(head: &GitHead, sp: &ScopedPath<'_>) -> PathBuf {

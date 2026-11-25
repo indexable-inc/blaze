@@ -13,8 +13,8 @@ use blaze_vt::terminal::{Terminal, Which};
 
 use crate::prompt::PromptInfo;
 
-/// Default row threshold after which large tables fold with a clickable "Show all N rows" bar.
-pub const TABLE_FOLD_ROWS: usize = 25;
+/// Default row threshold after which large tables become scrollable viewports.
+pub const TABLE_FOLD_ROWS: usize = 16;
 
 /// Unique identifier for a block in [`BlockStore`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -72,6 +72,12 @@ pub struct Block {
     pub folded: bool,
     /// Optional user override for compact grid vs detailed table view on file tables.
     pub grid_override: Option<bool>,
+    /// Smooth per-table vertical scroll offset in logical pixels (snapped to row grid in layout).
+    pub table_scroll_y: f32,
+    /// Smooth per-table horizontal scroll offset in logical pixels (for wide tables).
+    pub table_scroll_x: f32,
+    /// Optional interactive UI sort override `(col_idx, descending)` toggled by clicking table headers.
+    pub table_sort: Option<(usize, bool)>,
     /// `(row, col)` table cells currently expanded inline (for nested lists/records/tables).
     pub expanded_cells: Vec<(usize, usize)>,
     pub body: BlockBody,
@@ -207,6 +213,9 @@ impl BlockStore {
             exit_code,
             folded,
             grid_override: None,
+            table_scroll_y: 0.0,
+            table_scroll_x: 0.0,
+            table_sort: None,
             expanded_cells: Vec::new(),
             body,
         };
@@ -329,10 +338,69 @@ impl BlockStore {
     pub fn toggle_fold(&mut self, block_id: BlockId) -> bool {
         if let Some(b) = self.block_mut(block_id) {
             b.folded = !b.folded;
+            b.table_scroll_y = 0.0;
             true
         } else {
             false
         }
+    }
+
+    /// Toggle interactive column sort on a table block (`size`/`date`/numeric start descending;
+    /// strings start ascending; clicking the same column again flips direction).
+    pub fn toggle_table_sort(&mut self, block_id: BlockId, col: usize) -> bool {
+        let Some(blk) = self.block_mut(block_id) else {
+            return false;
+        };
+        let desc_first = match &blk.body {
+            BlockBody::Value(Value::Table(t)) => matches!(
+                t.col_display.get(col).copied(),
+                Some(blaze_sh::ColDisplay::FileSize | blaze_sh::ColDisplay::HumanTime)
+            ) || matches!(
+                t.cell(0, col),
+                Some(
+                    Value::Int(_)
+                        | Value::Float(_)
+                        | Value::Size(_)
+                        | Value::Duration(_)
+                        | Value::Date(_)
+                )
+            ),
+            _ => false,
+        };
+        blk.table_sort = match blk.table_sort {
+            Some((c, desc)) if c == col => Some((col, !desc)),
+            _ => Some((col, desc_first)),
+        };
+        blk.table_scroll_y = 0.0;
+        true
+    }
+
+    /// Scroll a table block vertically/horizontally within its clamped bounds; returns `true` if
+    /// the scroll offset actually moved (so trackpad scroll chains cleanly to the main feed at edges).
+    pub fn scroll_table(
+        &mut self,
+        block_id: BlockId,
+        dy: f32,
+        dx: f32,
+        max_y: f32,
+        max_x: f32,
+    ) -> bool {
+        let Some(blk) = self.block_mut(block_id) else {
+            return false;
+        };
+        let prev_y = blk.table_scroll_y;
+        let prev_x = blk.table_scroll_x;
+        if max_y > 0.0 {
+            blk.table_scroll_y = (blk.table_scroll_y - dy).clamp(0.0, max_y);
+        } else {
+            blk.table_scroll_y = 0.0;
+        }
+        if max_x > 0.0 {
+            blk.table_scroll_x = (blk.table_scroll_x - dx).clamp(0.0, max_x);
+        } else {
+            blk.table_scroll_x = 0.0;
+        }
+        (blk.table_scroll_y - prev_y).abs() > 0.05 || (blk.table_scroll_x - prev_x).abs() > 0.05
     }
 
     pub fn toggle_expand_cell(&mut self, block_id: BlockId, row: usize, col: usize) -> bool {

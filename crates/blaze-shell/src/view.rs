@@ -66,25 +66,66 @@ pub struct IconQuad {
 }
 
 /// Semantic UI action triggered by clicking a [`HitRegion`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HitAction {
     SwitchBranch(BranchId),
     ForkActiveBranch,
     ForkBlock(BlockId),
     ToggleFold(BlockId),
     ToggleTableView(BlockId),
+    SortTableColumn { block: BlockId, col: usize },
     ToggleExpandCell { block: BlockId, row: usize, col: usize },
     SelectCompletion(usize),
     SelectHistory(usize),
     CycleHistoryScope,
     ResetZoom,
+    /// Interactive prompt-capsule popover actions.
+    OpenBranchPicker,
+    SwitchGitBranch(String),
+    ChangeDir(String),
+    InsertToken(String),
 }
 
 /// Clickable UI target recorded during layout.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct HitRegion {
     pub rect: HitRect,
     pub action: HitAction,
+}
+
+/// Rich interactive hover popover kind attached to prompt capsule segments & icon buttons.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HoverKind {
+    Tooltip { title: String, subtitle: Option<String> },
+    Directory { cwd: String },
+    GitBranch { current: String, branches: Vec<String> },
+    GitChanges { files: Vec<(String, &'static str, &'static str)>, total: u32 },
+    GitStashes { stashes: Vec<String>, total: u32 },
+    Toolchains { items: Vec<(&'static str, &'static str, &'static str)> },
+}
+
+/// Hoverable region recorded during layout.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HoverRegion {
+    pub rect: HitRect,
+    pub kind: HoverKind,
+}
+
+/// Active floating popover anchored to a prompt segment or icon button.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ActivePopover {
+    pub anchor: HitRect,
+    pub kind: HoverKind,
+    pub pinned: bool,
+}
+
+/// Scrollable embedded table viewport recorded during layout for nested trackpad scrolling.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScrollRegion {
+    pub rect: HitRect,
+    pub block: BlockId,
+    pub max_scroll_y: f32,
+    pub max_scroll_x: f32,
 }
 
 /// Payload carried when dragging a rendered item (file, folder, crate, value) into the composer.
@@ -323,6 +364,12 @@ pub struct Scene {
     pub clips: Vec<ClipRectGpu>,
     /// Clickable regions in paint order (`hit_test` walks in reverse so top-most wins).
     pub hit_regions: Vec<HitRegion>,
+    /// Hoverable regions for interactive floating popovers (branch picker, stashes, dirty files, tooltips).
+    pub hover_regions: Vec<HoverRegion>,
+    /// Bounding rect of the currently open floating popover (keeps popover open while pointer moves into it).
+    pub popover_rect: Option<HitRect>,
+    /// Embedded scrollable table viewports for nested vertical/horizontal trackpad scrolling.
+    pub scroll_regions: Vec<ScrollRegion>,
     /// Draggable item regions (files, folders, crates) in paint order.
     pub drag_sources: Vec<DragSource>,
     /// Logical rect of the recessed composer input hotbar (for click-to-cursor & drag drop).
@@ -357,6 +404,9 @@ impl Scene {
             overlay_text: Vec::new(),
             clips: vec![infinite_clip],
             hit_regions: Vec::new(),
+            hover_regions: Vec::new(),
+            popover_rect: None,
+            scroll_regions: Vec::new(),
             drag_sources: Vec::new(),
             composer_rect: HitRect::new(0.0, 0.0, 0.0, 0.0),
             composer_text_origin: [0.0, 0.0],
@@ -674,7 +724,72 @@ impl Scene {
     pub fn hit_test(&self, x: f32, y: f32) -> Option<HitAction> {
         for region in self.hit_regions.iter().rev() {
             if region.rect.contains(x, y) {
-                return Some(region.action);
+                return Some(region.action.clone());
+            }
+        }
+        None
+    }
+
+    /// Record a hoverable region clipped against `self.clips[clip_id]`.
+    pub fn push_hover_clipped(&mut self, rect: HitRect, clip_id: u32, kind: HoverKind) {
+        let Some(clip) = self.clips.get(clip_id as usize) else {
+            self.hover_regions.push(HoverRegion { rect, kind });
+            return;
+        };
+        let x0 = rect.x0.max(clip.rect[0]);
+        let y0 = rect.y0.max(clip.rect[1]);
+        let x1 = rect.x1.min(clip.rect[2]);
+        let y1 = rect.y1.min(clip.rect[3]);
+        if x1 > x0 && y1 > y0 {
+            self.hover_regions.push(HoverRegion {
+                rect: HitRect::new(x0, y0, x1, y1),
+                kind,
+            });
+        }
+    }
+
+    /// Find the top-most hoverable region under `(x, y)`.
+    pub fn hover_at(&self, x: f32, y: f32) -> Option<&HoverRegion> {
+        for reg in self.hover_regions.iter().rev() {
+            if reg.rect.contains(x, y) {
+                return Some(reg);
+            }
+        }
+        None
+    }
+
+    /// Record a scrollable table viewport clipped against `self.clips[clip_id]`.
+    pub fn push_scroll_region(
+        &mut self,
+        rect: HitRect,
+        clip_id: u32,
+        block: BlockId,
+        max_scroll_y: f32,
+        max_scroll_x: f32,
+    ) {
+        let Some(clip) = self.clips.get(clip_id as usize) else {
+            self.scroll_regions.push(ScrollRegion { rect, block, max_scroll_y, max_scroll_x });
+            return;
+        };
+        let x0 = rect.x0.max(clip.rect[0]);
+        let y0 = rect.y0.max(clip.rect[1]);
+        let x1 = rect.x1.min(clip.rect[2]);
+        let y1 = rect.y1.min(clip.rect[3]);
+        if x1 > x0 && y1 > y0 {
+            self.scroll_regions.push(ScrollRegion {
+                rect: HitRect::new(x0, y0, x1, y1),
+                block,
+                max_scroll_y,
+                max_scroll_x,
+            });
+        }
+    }
+
+    /// Find the top-most scrollable table viewport under `(x, y)`.
+    pub fn scroll_region_at(&self, x: f32, y: f32) -> Option<ScrollRegion> {
+        for reg in self.scroll_regions.iter().rev() {
+            if reg.rect.contains(x, y) {
+                return Some(*reg);
             }
         }
         None

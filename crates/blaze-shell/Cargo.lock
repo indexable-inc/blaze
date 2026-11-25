@@ -151,6 +151,7 @@ dependencies = [
  "blaze-json",
  "blaze-own",
  "blaze-sh",
+ "blaze-ssh",
  "blaze-ui",
  "blaze-vim",
  "blaze-vt",
@@ -162,6 +163,13 @@ dependencies = [
  "objc2-foundation",
  "objc2-metal",
  "objc2-quartz-core",
+]
+
+[[package]]
+name = "blaze-ssh"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
 ]
 
 [[package]]
