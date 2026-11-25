@@ -133,7 +133,7 @@ impl DepProducer {
 #[derive(Clone, Debug)]
 enum Served {
     /// Files whose content is in the reader's key: a producer's `OUT_DIR`, or its fetched tree.
-    Keyed(Arc<Vec<(String, Vec<u8>)>>),
+    Keyed { files: Arc<Vec<(String, Vec<u8>)>>, submodules: Arc<[(String, [u8; 20])]> },
     /// Native producer's `OUT_DIR` with inline files and content-addressed stored files.
     Stored {
         inline: Arc<Vec<(String, Vec<u8>)>>,
@@ -363,12 +363,12 @@ fn mounted(mount: DepMount<'_>, producer: &DepProducer, reader: &Tree, allow_sto
                 }
                 (links, at.to_owned(), Served::Stored { inline: Arc::clone(&producer.out), stored: Arc::clone(&producer.stored_files) })
             } else {
-                (links, at.to_owned(), Served::Keyed(Arc::clone(&producer.out)))
+                (links, at.to_owned(), Served::Keyed { files: Arc::clone(&producer.out), submodules: Arc::from([]) })
             }
         }
         DepMount::Tree { links } => {
             let served = match (&producer.tree, reader) {
-                (Tree::Mem { files, .. }, _) => Served::Keyed(Arc::clone(files)),
+                (Tree::Mem { files, submodules, .. }, _) => Served::Keyed { files: Arc::clone(files), submodules: Arc::clone(submodules) },
                 (Tree::Dir(theirs), Tree::Dir(ours)) if theirs == ours => Served::ReaderTree,
                 (Tree::Dir(_), _) => return Err(DepViewError::OtherWorkspace { links: links.to_owned() }),
             };
@@ -394,10 +394,17 @@ fn content_id(mounts: &[Mounted]) -> ContentId {
             hasher.part(part.as_bytes());
         }
         match &mount.served {
-            Served::Keyed(files) => {
+            Served::Keyed { files, submodules } => {
                 hasher.update(&[1]).update(&(files.len() as u64).to_le_bytes());
                 for (path, bytes) in files.iter() {
                     hasher.part(path.as_bytes()).part(bytes);
+                }
+                if !submodules.is_empty() {
+                    let count = u64::try_from(submodules.len()).unwrap_or(u64::MAX);
+                    hasher.update(&[4]).update(&count.to_le_bytes());
+                    for (path, commit) in submodules.iter() {
+                        hasher.part(path.as_bytes()).update(commit);
+                    }
                 }
             }
             Served::Stored { inline, stored } => {
@@ -441,14 +448,9 @@ impl ScriptSandbox {
     /// Serve the operation through the mount whose grant the script used.
     fn dep_node(&mut self, mount: usize, rel: String, op: super::NodeRead) -> Result<Option<Node<'static>>, Stop> {
         let script = Arc::clone(&self.script);
-        match &script.deps.mounts[mount].served {
-            Served::Keyed(files) | Served::Stored { inline: files, .. } => {
-                let tree = Tree::Mem { files: Arc::clone(files), submodules: Arc::from([]), git: None };
-                match tree.node(&rel) {
-                    Ok(found) => Ok(found.map(owned)),
-                    Err(why) => Err(self.refuse(Refusal::Path(why.to_string()))),
-                }
-            }
+        let (files, subs) = match &script.deps.mounts[mount].served {
+            Served::Keyed { files, submodules } => (files, Some(submodules)),
+            Served::Stored { inline, .. } => (inline, None),
             Served::ReaderTree => {
                 let found = match script.tree.node(&rel) {
                     Ok(found) => found.map(owned),
@@ -456,8 +458,13 @@ impl ScriptSandbox {
                 };
                 // The same subjects as the reader's own reads of its tree: the same folder.
                 self.record_node(rel, op, found.as_ref());
-                Ok(found)
+                return Ok(found);
             }
+        };
+        let tree = Tree::Mem { files: Arc::clone(files), submodules: subs.map_or_else(|| Arc::from([]), Arc::clone), git: None };
+        match tree.node(&rel) {
+            Ok(found) => Ok(found.map(owned)),
+            Err(why) => Err(self.refuse(Refusal::Path(why.to_string()))),
         }
     }
 

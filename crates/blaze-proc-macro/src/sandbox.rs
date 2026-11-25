@@ -30,11 +30,13 @@ pub mod seen_env;
 pub use seen_env::SeenMismatch;
 
 /// File bytes in a [`Files::Listed`] sandbox tree: zero-copy static slice for raw files,
-/// or owned bytes when decompressed from a `BLZFPK04` pack.
+/// owned bytes when decompressed from a `BLZFPK05` pack, or an unpopulated git submodule.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ListedBytes {
     Static(&'static [u8]),
     Owned(blaze_own::Vec<u8, blaze_own::SharedAlloc<'static>>),
+    /// An unpopulated git submodule (`0o160000`) pinned at this 20-byte commit SHA-1.
+    Submodule([u8; 20]),
 }
 
 impl ListedBytes {
@@ -42,6 +44,7 @@ impl ListedBytes {
         match self {
             ListedBytes::Static(s) => s,
             ListedBytes::Owned(s) => s.as_slice(),
+            ListedBytes::Submodule(_) => &[],
         }
     }
 }
@@ -147,11 +150,43 @@ impl Files {
     }
 
     /// The listed files under the folder `rel` (`""`: the package's).
-    fn under<'f>(files: &'f [(String, ListedBytes)], rel: &str) -> impl Iterator<Item = &'f str> + 'f {
+    fn under<'f>(files: &'f [(String, ListedBytes)], rel: &str) -> impl Iterator<Item = (&'f str, &'f ListedBytes)> + 'f {
         let prefix = if rel.is_empty() { String::new() } else { format!("{rel}/") };
         let start = files.partition_point(|(path, _)| path.as_str() < prefix.as_str());
         let n = prefix.len();
-        files[start..].iter().map(|(path, _)| path.as_str()).take_while(move |path| path.starts_with(prefix.as_str())).map(move |path| &path[n..])
+        files[start..]
+            .iter()
+            .take_while(move |(path, _)| path.starts_with(prefix.as_str()))
+            .map(move |(path, bytes)| (&path[n..], bytes))
+    }
+
+    fn submodule_covering(&self, rel: &str) -> Option<(&str, [u8; 20])> {
+        let Files::Listed(files) = self else { return None };
+        for (path, bytes) in files.iter() {
+            let ListedBytes::Submodule(commit) = bytes else { continue };
+            if rel == path.as_str()
+                || (rel.len() > path.len()
+                    && rel.starts_with(path.as_str())
+                    && rel.as_bytes().get(path.len()) == Some(&b'/'))
+            {
+                return Some((path.as_str(), *commit));
+            }
+        }
+        None
+    }
+
+    fn submodule_hex(commit: &[u8; 20]) -> [u8; 40] {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut out = [0u8; 40];
+        for (i, &byte) in commit.iter().enumerate() {
+            if let Some(hi) = out.get_mut(i * 2) {
+                *hi = *HEX.get(usize::from(byte >> 4)).unwrap_or(&b'0');
+            }
+            if let Some(lo) = out.get_mut(i * 2 + 1) {
+                *lo = *HEX.get(usize::from(byte & 0x0f)).unwrap_or(&b'0');
+            }
+        }
+        out
     }
 
     fn find(&self, rel: &str) -> Result<Option<Found>, String> {
@@ -160,6 +195,10 @@ impl Files {
                 Ok(self.real(root, rel)?.and_then(|real| stat_of(&real)).map(|(filetype, size)| if filetype == Filetype::Directory { Found::Folder } else { Found::File(size) }))
             }
             Files::Listed(files) => {
+                if let Some((path, commit)) = self.submodule_covering(rel) {
+                    let hex = Self::submodule_hex(&commit);
+                    return Err(format!("`{rel}` is inside unpopulated git submodule `{path}` at commit {}", core::str::from_utf8(&hex).unwrap_or("")));
+                }
                 if let Ok(at) = files.binary_search_by(|(path, _)| path.as_str().cmp(rel)) {
                     return Ok(Some(Found::File(files[at].1.len() as u64)));
                 }
@@ -172,7 +211,13 @@ impl Files {
     fn bytes(&self, rel: &str) -> Result<Option<Vec<u8>>, String> {
         match self {
             Files::Folder(root) | Files::Member { workspace: root, .. } => Ok(self.real(root, rel)?.and_then(|real| std::fs::read(real).ok())),
-            Files::Listed(files) => Ok(files.binary_search_by(|(path, _)| path.as_str().cmp(rel)).ok().map(|at| files[at].1.to_vec())),
+            Files::Listed(files) => {
+                if let Some((path, commit)) = self.submodule_covering(rel) {
+                    let hex = Self::submodule_hex(&commit);
+                    return Err(format!("`{rel}` is inside unpopulated git submodule `{path}` at commit {}", core::str::from_utf8(&hex).unwrap_or("")));
+                }
+                Ok(files.binary_search_by(|(path, _)| path.as_str().cmp(rel)).ok().map(|at| files[at].1.to_vec()))
+            }
         }
     }
 
@@ -181,10 +226,15 @@ impl Files {
         match self {
             Files::Folder(root) | Files::Member { workspace: root, .. } => Ok(self.real(root, rel)?.map(|real| listing(&real)).unwrap_or_default()),
             Files::Listed(files) => {
+                if let Some((path, commit)) = self.submodule_covering(rel) {
+                    let hex = Self::submodule_hex(&commit);
+                    return Err(format!("`{rel}` is inside unpopulated git submodule `{path}` at commit {}", core::str::from_utf8(&hex).unwrap_or("")));
+                }
                 let mut entries: Vec<(Vec<u8>, Filetype)> = Vec::new();
-                for rest in Files::under(files, rel) {
+                for (rest, bytes) in Files::under(files, rel) {
                     let (name, filetype) = match rest.split_once('/') {
                         Some((name, _)) => (name, Filetype::Directory),
+                        None if matches!(bytes, ListedBytes::Submodule(_)) => (rest, Filetype::Directory),
                         None => (rest, Filetype::RegularFile),
                     };
                     if entries.last().map(|(last, _)| last.as_slice()) != Some(name.as_bytes()) {
@@ -637,6 +687,22 @@ mod seen_tests {
         let mut dep = Sandbox::new(Arc::new(dependency));
         assert_eq!(dep.resolve(b"/package/src/lib.rs").ok().as_deref(), Some("src/lib.rs"));
         assert!(dep.resolve(b"/workspace/x").is_err());
+
+        // Package-local submodules in `Files::Listed` appear as directories in parent listings
+        // and fail closed on find/bytes/listing.
+        let oid = [0xcd; 20];
+        let with_sub = Files::Listed(Arc::from([
+            (String::from("Cargo.toml"), super::ListedBytes::Static(b"[package]\n")),
+            (String::from("v8"), super::ListedBytes::Submodule(oid)),
+        ]));
+        assert!(with_sub.bytes("Cargo.toml").expect("manifest").is_some());
+        let root_list = with_sub.listing("").expect("root listing");
+        assert!(root_list.iter().any(|(name, ft)| name.as_slice() == b"v8" && *ft == blaze_wasi::Filetype::Directory));
+        for bad in ["v8", "v8/include/v8.h"] {
+            assert!(with_sub.find(bad).is_err(), "{bad} find must fail closed");
+            assert!(with_sub.bytes(bad).is_err(), "{bad} bytes must fail closed");
+            assert!(with_sub.listing(bad).is_err(), "{bad} listing must fail closed");
+        }
     }
 
     /// MX (2026-11-17): every proc-macro call written in a workspace member at a non-empty dir

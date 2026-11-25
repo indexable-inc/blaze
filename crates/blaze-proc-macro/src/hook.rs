@@ -753,6 +753,9 @@ fn materialize_listed_in<'a>(base: &Path, files: &crate::sandbox::Files, seq: u6
     };
     let mut entries: blaze_own::Vec<(&str, &[u8]), Alloc<'a>> = blaze_own::Vec::new_in(alloc);
     for (name, bytes) in files.iter() {
+        if matches!(bytes, crate::sandbox::ListedBytes::Submodule(_)) {
+            continue;
+        }
         if safe_rel_path(name) {
             entries.push((name.as_str(), bytes.as_slice()));
         }
