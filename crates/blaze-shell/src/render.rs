@@ -38,6 +38,7 @@ pub struct FrameDraw<'a> {
     pub glyphs: &'a [GlyphInst],
     pub over_rects: &'a [RectInst],
     pub overlay_rects: &'a [RectInst],
+    pub overlay_icons: &'a [GlyphInst],
     pub overlay_glyphs: &'a [GlyphInst],
 }
 
@@ -242,6 +243,12 @@ impl Renderer {
         );
         draw_layer(&self.sdf, self.buffer(frame.over_rects), frame.over_rects.len(), None);
         draw_layer(&self.sdf, self.buffer(frame.overlay_rects), frame.overlay_rects.len(), None);
+        draw_layer(
+            &self.sprite,
+            self.buffer(frame.overlay_icons),
+            frame.overlay_icons.len(),
+            Some((&*self.icon_atlas, &*self.linear_sampler)),
+        );
         draw_layer(
             &self.glyph,
             self.buffer(frame.overlay_glyphs),

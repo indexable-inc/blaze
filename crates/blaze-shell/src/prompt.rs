@@ -1,13 +1,28 @@
-//! In-process Rust prompt: cwd abbreviation, direct `.git/HEAD` reading (supporting
-//! both regular repos and git worktrees where `.git` is a file), and a single non-blocking
-//! background worker that checks git index dirtiness without ever stalling a keystroke.
+//! In-process Rust Starship-class prompt powered by `blaze-git`'s sans-IO hardware-floor
+//! status engine (`crates/blaze-git`): zero subprocesses, full `.git/index` v2–v4 + `TREE`
+//! cache-tree pruning, `.gitignore` stack, binary `commit-graph` ahead/behind, stash &
+//! rebase/merge state, and a single coalesced background status worker.
 
-use std::fs;
+use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+#[cfg(not(unix))]
 use std::time::UNIX_EPOCH;
+
+use blaze_git::machine::{
+    DirListing, FileData, Got, PathScope, ScopedPath, StatEntry, StatusMachine, Step, Want,
+};
+use blaze_git::{
+    Divergence, FileKind, FileStat, Head, PromptStyle, RepoState, StatusOpts, WorktreeKind,
+    format_status,
+};
+use blaze_own::planted::NoPlant;
+use blaze_own::{AVec, Alloc, Vec as OwnVec};
 
 /// Parsed git HEAD reference for the enclosing repository.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -16,28 +31,52 @@ pub struct GitHead {
     pub label: String,
     /// True when HEAD is detached at a commit hash rather than a symbolic ref.
     pub detached: bool,
-    /// Resolved `.git` directory (for worktrees, the `gitdir:` target).
+    /// Resolved per-worktree `.git` directory (for worktrees, the `gitdir:` target).
     pub git_dir: PathBuf,
+    /// Shared common `.git` directory (`commondir` for linked worktrees, else same as `git_dir`).
+    pub common_dir: PathBuf,
     /// Repository working-tree root containing `.git`.
     pub work_tree: PathBuf,
+    /// Normal checkout vs linked worktree.
+    pub kind: WorktreeKind,
 }
 
-/// Dirtiness summary computed asynchronously on the background status thread.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct GitDirty {
+/// Full Starship-class Git prompt summary produced by `blaze-git`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GitStatusSummary {
+    /// Branch name (or detached short OID).
+    pub branch: String,
+    pub detached: bool,
+    /// Optional exact tag at HEAD when detached.
+    pub tag: Option<String>,
+    /// Active merge / rebase / cherry-pick / bisect label (e.g. `"REBASING 2/4"`).
+    pub state_label: Option<String>,
+    /// Exact Starship status bracket (e.g. `"[?]"`, `"[!2+1?]"`, `"[⇡1]"`, or `""` when clean).
+    pub status_badge: String,
     pub dirty: bool,
-    pub modified: usize,
-    pub untracked: usize,
+    pub conflicted: u32,
+    pub staged: u32,
+    pub modified: u32,
+    pub deleted: u32,
+    pub untracked: u32,
+    pub stashed: u32,
+    pub ahead: u32,
+    pub behind: u32,
 }
 
-/// Snapshot of prompt metadata captured at block submission and displayed live in the input bar.
+/// Snapshot of prompt metadata captured at block submission and displayed live in the composer.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PromptInfo {
     pub cwd: String,
+    /// Full `~`-abbreviated path (used in tooltips / titlebar).
     pub cwd_display: String,
+    /// Concise Starship directory label (repo-rooted inside git, e.g. `blaze-shell-1124`).
+    pub dir_short: String,
     pub git_branch: Option<String>,
     pub git_detached: bool,
-    pub git_dirty: Option<GitDirty>,
+    pub git_status: Option<GitStatusSummary>,
+    /// True when a `Cargo.toml` lives in cwd or repo root.
+    pub in_rust_project: bool,
     pub last_exit: i32,
     pub last_duration_ms: u64,
 }
@@ -46,19 +85,73 @@ impl PromptInfo {
     /// Build a prompt snapshot synchronously (zero subprocesses: only direct stat/HEAD read).
     pub fn from_cwd(cwd: &str, home: &str, last_exit: i32, last_duration_ms: u64) -> Self {
         let head = read_git_head(cwd);
+        let cwd_display = abbreviate_home(cwd, home);
+        let dir_short = short_dir_display(cwd, home, head.as_ref().map(|h| h.work_tree.as_path()));
+        let in_rust_project = Path::new(cwd).join("Cargo.toml").exists()
+            || head.as_ref().is_some_and(|h| h.work_tree.join("Cargo.toml").exists());
         let (git_branch, git_detached) = match head {
             Some(h) => (Some(h.label), h.detached),
             None => (None, false),
         };
         Self {
             cwd: cwd.to_owned(),
-            cwd_display: abbreviate_home(cwd, home),
+            cwd_display,
+            dir_short,
             git_branch,
             git_detached,
-            git_dirty: None,
+            git_status: None,
+            in_rust_project,
             last_exit,
             last_duration_ms,
         }
+    }
+
+    /// Synchronously compute full `blaze-git` Starship status (used in `--demo --screenshot`).
+    pub fn refresh_git_sync(&mut self) {
+        if let Some(summary) = query_blaze_git_status(&self.cwd) {
+            self.git_branch = Some(summary.branch.clone());
+            self.git_detached = summary.detached;
+            self.git_status = Some(summary);
+        }
+    }
+}
+
+/// Starship-style concise directory label:
+/// - Inside a git repo: `<repo_name>` at root, or `<repo_name>/<rel>` (last 3 segments if deep).
+/// - Outside a git repo: `~` or last 2–3 path segments.
+pub fn short_dir_display(cwd: &str, home: &str, work_tree: Option<&Path>) -> String {
+    if let Some(root) = work_tree {
+        let root_name = root
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("/");
+        if let Ok(rel) = Path::new(cwd).strip_prefix(root) {
+            let rel_str = rel.to_string_lossy();
+            if rel_str.is_empty() {
+                return root_name.to_owned();
+            }
+            let comps: Vec<&str> = rel_str.split('/').filter(|s| !s.is_empty()).collect();
+            if comps.len() <= 2 {
+                return format!("{root_name}/{}", comps.join("/"));
+            }
+            return format!(
+                "{root_name}/…/{}/{}",
+                comps[comps.len() - 2],
+                comps[comps.len() - 1]
+            );
+        }
+    }
+    let abbr = abbreviate_home(cwd, home);
+    if abbr == "~" || abbr == "/" {
+        return abbr;
+    }
+    let parts: Vec<&str> = abbr.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.len() <= 2 {
+        abbr
+    } else if abbr.starts_with("~/") {
+        format!("~/…/{}/{}", parts[parts.len() - 2], parts[parts.len() - 1])
+    } else {
+        format!("{}/{}", parts[parts.len() - 2], parts[parts.len() - 1])
     }
 }
 
@@ -86,17 +179,26 @@ pub fn read_git_head(cwd: &str) -> Option<GitHead> {
     for _ in 0..64 {
         let dot_git = dir.join(".git");
         if let Ok(meta) = fs::symlink_metadata(&dot_git) {
-            let git_dir = if meta.is_dir() {
-                dot_git
+            let (git_dir, common_dir, kind) = if meta.is_dir() {
+                (dot_git.clone(), dot_git, WorktreeKind::Normal)
             } else if meta.is_file() {
-                parse_gitdir_file(&dot_git, &dir)?
+                let gd = parse_gitdir_file(&dot_git, &dir)?;
+                let cd = resolve_common_dir(&gd);
+                (gd, cd, WorktreeKind::LinkedWorktree)
             } else {
                 return None;
             };
             let head_path = git_dir.join("HEAD");
             let head_text = fs::read_to_string(&head_path).ok()?;
             let (label, detached) = parse_head_contents(&head_text)?;
-            return Some(GitHead { label, detached, git_dir, work_tree: dir });
+            return Some(GitHead {
+                label,
+                detached,
+                git_dir,
+                common_dir,
+                work_tree: dir,
+                kind,
+            });
         }
         if !dir.pop() {
             break;
@@ -116,6 +218,18 @@ fn parse_gitdir_file(dot_git_file: &Path, work_tree: &Path) -> Option<PathBuf> {
     if p.is_absolute() { Some(p) } else { Some(work_tree.join(p)) }
 }
 
+fn resolve_common_dir(git_dir: &Path) -> PathBuf {
+    let cd_file = git_dir.join("commondir");
+    if let Ok(raw) = fs::read_to_string(&cd_file) {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            let p = PathBuf::from(trimmed);
+            return if p.is_absolute() { p } else { git_dir.join(p) };
+        }
+    }
+    git_dir.to_path_buf()
+}
+
 fn parse_head_contents(contents: &str) -> Option<(String, bool)> {
     let line = contents.lines().next()?.trim();
     if line.is_empty() {
@@ -133,136 +247,287 @@ fn parse_head_contents(contents: &str) -> Option<(String, bool)> {
         }
         return Some((label.to_owned(), false));
     }
-    // Detached HEAD commit hash: take short 7-char prefix if hex.
     let short: String = line.chars().take(7).collect();
     if short.is_empty() { None } else { Some((short, true)) }
 }
 
-/// Check git working-tree dirtiness in-process by reading `<git_dir>/index` (v2/v3) and
-/// comparing each tracked entry's `(mtime_sec, size)` against `symlink_metadata`, bounded to
-/// keep latency tiny even in huge monorepos.
-pub fn check_git_dirty(head: &GitHead) -> GitDirty {
-    // Active merge / rebase / cherry-pick immediately marks repo dirty.
-    if head.git_dir.join("MERGE_HEAD").exists()
-        || head.git_dir.join("CHERRY_PICK_HEAD").exists()
-        || head.git_dir.join("rebase-merge").exists()
-        || head.git_dir.join("rebase-apply").exists()
-    {
-        return GitDirty { dirty: true, modified: 1, untracked: 0 };
+// =============================================================================
+// Thin OS driver over `blaze-git`'s sans-IO `StatusMachine`
+// =============================================================================
+
+/// Run `blaze-git`'s full Starship-class sans-IO `StatusMachine` for `cwd`.
+/// Zero subprocesses, supports normal repos & linked worktrees, `.gitignore`, index v2–v4,
+/// `TREE` cache-tree pruning, binary `commit-graph` ahead/behind, and stash counts.
+pub fn query_blaze_git_status(cwd: &str) -> Option<GitStatusSummary> {
+    let head = read_git_head(cwd)?;
+    let alloc = Alloc::global();
+    let mut machine = StatusMachine::new(StatusOpts::STARSHIP, head.kind, alloc, NoPlant);
+
+    // Supply user global gitignore (`~/.config/git/ignore`) if present.
+    if let Ok(home) = std::env::var("HOME") {
+        let global_ig = Path::new(&home).join(".config/git/ignore");
+        if let Ok(bytes) = fs::read(&global_ig) {
+            machine.set_global_exclude(&bytes);
+        }
     }
 
-    let index_path = head.git_dir.join("index");
-    let Ok(bytes) = fs::read(&index_path) else {
-        return GitDirty::default();
-    };
-    parse_index_and_stat(&bytes, &head.work_tree)
-}
-
-const MAX_INDEX_ENTRIES: usize = 25_000;
-
-fn parse_index_and_stat(bytes: &[u8], work_tree: &Path) -> GitDirty {
-    if bytes.len() < 12 || &bytes[0..4] != b"DIRC" {
-        return GitDirty::default();
-    }
-    let version = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-    if version != 2 && version != 3 {
-        // v4 uses prefix-compressed paths; conservatively report clean rather than misreading.
-        return GitDirty::default();
-    }
-    let entry_count = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
-    let limit = entry_count.min(MAX_INDEX_ENTRIES);
-
-    let mut pos = 12usize;
-    let mut modified = 0usize;
-
-    for _ in 0..limit {
-        // Fixed 62-byte entry header before optional 2-byte extended flags + NUL-terminated path.
-        if pos + 62 > bytes.len() {
-            break;
-        }
-        let entry_start = pos;
-        let mtime_sec = u32::from_be_bytes([
-            bytes[pos + 8],
-            bytes[pos + 9],
-            bytes[pos + 10],
-            bytes[pos + 11],
-        ]);
-        let mode = u32::from_be_bytes([
-            bytes[pos + 24],
-            bytes[pos + 25],
-            bytes[pos + 26],
-            bytes[pos + 27],
-        ]);
-        let file_size = u32::from_be_bytes([
-            bytes[pos + 36],
-            bytes[pos + 37],
-            bytes[pos + 38],
-            bytes[pos + 39],
-        ]);
-        let flags = u16::from_be_bytes([bytes[pos + 60], bytes[pos + 61]]);
-        let extended = version >= 3 && (flags & 0x4000) != 0;
-        let name_start = if extended { pos + 64 } else { pos + 62 };
-        if name_start >= bytes.len() {
-            break;
-        }
-        let Some(nul_rel) = bytes[name_start..].iter().position(|&b| b == 0) else {
-            break;
-        };
-        let name_bytes = &bytes[name_start..name_start + nul_rel];
-        // Advance to next 8-byte aligned entry boundary (with at least 1 NUL byte).
-        let raw_len = (name_start - entry_start) + nul_rel + 1;
-        let padded_len = (raw_len + 7) & !7;
-        pos = entry_start.saturating_add(padded_len);
-
-        // Skip submodules (gitlink mode 0o160000).
-        if (mode & 0o170000) == 0o160000 {
-            continue;
-        }
-        let Ok(rel_path) = core::str::from_utf8(name_bytes) else {
-            continue;
-        };
-        let full_path = work_tree.join(rel_path);
-        match fs::symlink_metadata(&full_path) {
-            Ok(meta) => {
-                let sz = meta.len() as u32;
-                let mt = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs() as u32)
-                    .unwrap_or(0);
-                // Fast stat check matching git's racy-index heuristic: size mismatch or newer mtime.
-                if (file_size != 0 && sz != file_size) || (mtime_sec != 0 && mt != mtime_sec) {
-                    modified += 1;
-                    // Early exit once we know the tree is dirty and have a small count for display.
-                    if modified >= 64 {
-                        break;
+    // Strictly bounded IO rounds (rule `bounded-progress`).
+    const MAX_ROUNDS: usize = 256;
+    for _ in 0..MAX_ROUNDS {
+        match machine.poll() {
+            Ok(Step::Done(status)) => {
+                let (branch, detached) = match &status.head {
+                    Head::Branch { name, .. } => (name.as_str().to_owned(), false),
+                    Head::Detached { short, .. } => (short.as_str().to_owned(), true),
+                };
+                let tag = status.tag.as_ref().map(|t| t.as_str().to_owned());
+                let state_label = status.state.label().map(|lbl| match status.state {
+                    RepoState::Rebase { step: Some(s), total: Some(t), .. }
+                    | RepoState::Am { step: Some(s), total: Some(t) }
+                    | RepoState::AmOrRebase { step: Some(s), total: Some(t) } => {
+                        format!("{lbl} {s}/{t}")
                     }
+                    _ => lbl.to_owned(),
+                });
+                let c = status.counts;
+                let staged = c.staged();
+                let div = status.upstream.as_ref().map(|u| u.divergence);
+                let ahead = div.map_or(0, Divergence::ahead);
+                let behind = div.map_or(0, Divergence::behind);
+
+                // Format exact Starship status bracket using `blaze-git`'s formatter.
+                let mut full_fmt = String::new();
+                let _ = format_status(&status, &PromptStyle::STARSHIP, &mut full_fmt);
+                let status_badge = full_fmt
+                    .rfind(" [")
+                    .map(|idx| full_fmt[idx + 1..].to_owned())
+                    .unwrap_or_default();
+
+                let dirty = c.conflicted > 0
+                    || staged > 0
+                    || c.modified > 0
+                    || c.deleted > 0
+                    || c.typechanged > 0
+                    || c.untracked > 0;
+
+                return Some(GitStatusSummary {
+                    branch,
+                    detached,
+                    tag,
+                    state_label,
+                    status_badge,
+                    dirty,
+                    conflicted: c.conflicted,
+                    staged,
+                    modified: c.modified,
+                    deleted: c.deleted,
+                    untracked: c.untracked,
+                    stashed: c.stashed,
+                    ahead,
+                    behind,
+                });
+            }
+            Ok(Step::Need(want)) => {
+                let got = execute_want(&head, want, alloc);
+                if machine.feed(got).is_err() {
+                    return None;
                 }
             }
-            Err(_) => {
-                // Tracked file deleted on disk.
-                modified += 1;
-                if modified >= 64 {
-                    break;
-                }
-            }
+            Err(_) => return None,
         }
     }
-
-    GitDirty { dirty: modified > 0, modified, untracked: 0 }
+    None
 }
+
+fn resolve_scoped(head: &GitHead, sp: &ScopedPath<'_>) -> PathBuf {
+    let base = match sp.scope {
+        PathScope::Worktree => &head.work_tree,
+        PathScope::GitDir => &head.git_dir,
+        PathScope::CommonDir => &head.common_dir,
+    };
+    let rel = sp.path.as_str();
+    if rel.is_empty() {
+        base.clone()
+    } else {
+        base.join(rel)
+    }
+}
+
+fn meta_to_file_stat(meta: &fs::Metadata) -> FileStat {
+    let ft = meta.file_type();
+    let kind = if ft.is_symlink() {
+        FileKind::Symlink
+    } else if ft.is_dir() {
+        FileKind::Dir
+    } else if ft.is_file() {
+        FileKind::File
+    } else {
+        FileKind::Other
+    };
+    #[cfg(unix)]
+    {
+        FileStat {
+            kind,
+            size: meta.len(),
+            mtime_sec: meta.mtime(),
+            mtime_nsec: meta.mtime_nsec().clamp(0, 999_999_999) as u32,
+            ctime_sec: meta.ctime(),
+            ctime_nsec: meta.ctime_nsec().clamp(0, 999_999_999) as u32,
+            ino: meta.ino(),
+            dev: meta.dev(),
+            mode: meta.mode(),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .unwrap_or_default();
+        FileStat {
+            kind,
+            size: meta.len(),
+            mtime_sec: mtime.as_secs() as i64,
+            mtime_nsec: mtime.subsec_nanos(),
+            ctime_sec: mtime.as_secs() as i64,
+            ctime_nsec: mtime.subsec_nanos(),
+            ino: 0,
+            dev: 0,
+            mode: 0o100644,
+        }
+    }
+}
+
+fn stat_path(p: &Path) -> FileStat {
+    match fs::symlink_metadata(p) {
+        Ok(meta) => meta_to_file_stat(&meta),
+        Err(_) => FileStat::GONE,
+    }
+}
+
+fn read_to_avec<'a>(p: &Path, alloc: Alloc<'a>) -> Option<AVec<'a, u8>> {
+    let data = fs::read(p).ok()?;
+    let mut out = OwnVec::with_capacity_in(data.len(), alloc);
+    out.extend_from_slice(&data);
+    Some(out)
+}
+
+fn execute_want<'a>(head: &GitHead, want: Want<'a>, alloc: Alloc<'a>) -> Got<'a> {
+    match want {
+        Want::ReadFiles(paths) => {
+            let mut out = OwnVec::with_capacity_in(paths.len(), alloc);
+            for sp in paths.iter() {
+                let full = resolve_scoped(head, sp);
+                out.push(read_to_avec(&full, alloc));
+            }
+            Got::Files(out)
+        }
+        Want::ReadWithStat(paths) => {
+            let mut out = OwnVec::with_capacity_in(paths.len(), alloc);
+            for sp in paths.iter() {
+                let full = resolve_scoped(head, sp);
+                let stat = fs::symlink_metadata(&full).ok().map(|m| meta_to_file_stat(&m));
+                let bytes = if stat.is_some() { read_to_avec(&full, alloc) } else { None };
+                out.push(FileData { bytes, stat });
+            }
+            Got::FilesWithStat(out)
+        }
+        Want::ListDirs(paths) => {
+            let mut out = OwnVec::with_capacity_in(paths.len(), alloc);
+            for sp in paths.iter() {
+                let full = resolve_scoped(head, sp);
+                let listing = match fs::read_dir(&full) {
+                    Ok(rd) => {
+                        let mut entries: Vec<(String, FileStat)> = Vec::new();
+                        for ent in rd.flatten() {
+                            let name = ent.file_name().to_string_lossy().into_owned();
+                            let ep = full.join(&name);
+                            let st = stat_path(&ep);
+                            if st.kind != FileKind::Gone {
+                                entries.push((name, st));
+                            }
+                        }
+                        // `blaze-git::DirListing` requires entries sorted by name bytes.
+                        entries.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+                        let name_bytes: usize = entries.iter().map(|(n, _)| n.len()).sum();
+                        let mut dl = DirListing::with_capacity(entries.len(), name_bytes, alloc);
+                        for (name, st) in entries {
+                            dl.push(&name, st);
+                        }
+                        Some(dl)
+                    }
+                    Err(_) => None,
+                };
+                out.push(listing);
+            }
+            Got::Dirs(out)
+        }
+        Want::StatPaths(paths) => {
+            let mut out = OwnVec::with_capacity_in(paths.len(), alloc);
+            for sp in paths.iter() {
+                let full = resolve_scoped(head, sp);
+                out.push(StatEntry { stat: stat_path(&full) });
+            }
+            Got::Stats(out)
+        }
+        Want::ReadLinks(paths) => {
+            let mut out = OwnVec::with_capacity_in(paths.len(), alloc);
+            for sp in paths.iter() {
+                let full = resolve_scoped(head, sp);
+                let bytes = fs::read_link(&full).ok().map(|target| {
+                    let s = target.to_string_lossy();
+                    let mut v = OwnVec::with_capacity_in(s.len(), alloc);
+                    v.extend_from_slice(s.as_bytes());
+                    v
+                });
+                out.push(bytes);
+            }
+            Got::Links(out)
+        }
+        Want::ReadRanges(ranges) => {
+            let mut out = OwnVec::with_capacity_in(ranges.len(), alloc);
+            for rr in ranges.iter() {
+                let sp = ScopedPath::new(rr.scope, rr.path.as_str(), alloc);
+                let full = resolve_scoped(head, &sp);
+                let bytes = (|| -> Option<AVec<'a, u8>> {
+                    let mut f = File::open(&full).ok()?;
+                    f.seek(SeekFrom::Start(rr.offset)).ok()?;
+                    let want_len = (rr.len as usize).min(64 << 20);
+                    let mut buf = vec![0u8; want_len];
+                    let mut read_total = 0usize;
+                    while read_total < want_len {
+                        let n = f.read(&mut buf[read_total..]).ok()?;
+                        if n == 0 {
+                            break;
+                        }
+                        read_total += n;
+                    }
+                    let mut v = OwnVec::with_capacity_in(read_total, alloc);
+                    v.extend_from_slice(&buf[..read_total]);
+                    Some(v)
+                })();
+                out.push(blaze_git::machine::RangeData { bytes });
+            }
+            Got::Ranges(out)
+        }
+    }
+}
+
+// =============================================================================
+// Single coalesced background status worker
+// =============================================================================
 
 struct WorkerSlot {
     pending_cwd: Option<String>,
     shutdown: bool,
 }
 
-/// Single background thread for asynchronous git status checks (coalesced bounded mailbox,
-/// atomic dirty notification, zero UI-thread blocking).
+/// Single background thread running `blaze-git`'s Starship status engine without ever
+/// blocking a keystroke (bounded 1-slot coalescing mailbox + single atomic poll).
 pub struct GitStatusWorker {
     req: Arc<(Mutex<WorkerSlot>, Condvar)>,
-    result: Arc<Mutex<Option<(String, GitDirty)>>>,
+    result: Arc<Mutex<Option<(String, Option<GitStatusSummary>)>>>,
     has_update: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
 }
@@ -273,7 +538,8 @@ impl GitStatusWorker {
             Mutex::new(WorkerSlot { pending_cwd: None, shutdown: false }),
             Condvar::new(),
         ));
-        let result: Arc<Mutex<Option<(String, GitDirty)>>> = Arc::new(Mutex::new(None));
+        let result: Arc<Mutex<Option<(String, Option<GitStatusSummary>)>>> =
+            Arc::new(Mutex::new(None));
         let has_update = Arc::new(AtomicBool::new(false));
 
         let req_bg = Arc::clone(&req);
@@ -299,11 +565,9 @@ impl GitStatusWorker {
                         slot.pending_cwd.take()
                     };
                     if let Some(cwd) = cwd {
-                        let dirty = read_git_head(&cwd)
-                            .map(|h| check_git_dirty(&h))
-                            .unwrap_or_default();
+                        let summary = query_blaze_git_status(&cwd);
                         if let Ok(mut out) = res_bg.lock() {
-                            *out = Some((cwd, dirty));
+                            *out = Some((cwd, summary));
                             flag_bg.store(true, Ordering::Release);
                         }
                     }
@@ -314,8 +578,7 @@ impl GitStatusWorker {
         Self { req, result, has_update, handle }
     }
 
-    /// Schedule a background git dirtiness refresh for `cwd`. Coalesces any unstarted previous
-    /// request so the mailbox stays strictly bounded to 1 slot.
+    /// Schedule a background `blaze-git` refresh for `cwd`. Coalesces pending requests.
     pub fn request(&self, cwd: &str) {
         let (lock, cvar) = &*self.req;
         if let Ok(mut slot) = lock.lock() {
@@ -325,7 +588,7 @@ impl GitStatusWorker {
     }
 
     /// Non-blocking poll for a completed status result (single atomic load when idle).
-    pub fn poll(&self) -> Option<(String, GitDirty)> {
+    pub fn poll(&self) -> Option<(String, Option<GitStatusSummary>)> {
         if !self.has_update.swap(false, Ordering::AcqRel) {
             return None;
         }

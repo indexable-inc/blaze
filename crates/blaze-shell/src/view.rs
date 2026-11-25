@@ -75,6 +75,7 @@ pub enum HitAction {
     ToggleTableView(BlockId),
     ToggleExpandCell { block: BlockId, row: usize, col: usize },
     SelectCompletion(usize),
+    ResetZoom,
 }
 
 /// Clickable UI target recorded during layout.
@@ -82,6 +83,30 @@ pub enum HitAction {
 pub struct HitRegion {
     pub rect: HitRect,
     pub action: HitAction,
+}
+
+/// Payload carried when dragging a rendered item (file, folder, crate, value) into the composer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DragPayload {
+    pub label: String,
+    pub insert_text: String,
+    pub icon: Option<&'static str>,
+}
+
+/// Draggable region recorded during layout.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DragSource {
+    pub rect: HitRect,
+    pub payload: DragPayload,
+}
+
+/// Live in-flight drag state passed into layout so the floating drag pill and composer drop glow render.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ActiveDrag {
+    pub x: f32,
+    pub y: f32,
+    pub over_composer: bool,
+    pub payload: DragPayload,
 }
 
 /// Complete layered frame output emitted by [`crate::layout::build_scene`].
@@ -95,14 +120,22 @@ pub struct Scene {
     pub icon_quads: Vec<IconQuad>,
     /// Foreground overlays (underlines, error carets, beam cursor, hairlines) drawn over text.
     pub over_rects: Vec<RectInst>,
-    /// Floating popup backgrounds (completion dropdown, Ctrl+R bar) drawn above all content.
+    /// Floating popup backgrounds (completion dropdown, Ctrl+R bar, drag chip) drawn above all content.
     pub overlay_rects: Vec<RectInst>,
-    /// Floating popup text runs drawn above `overlay_rects`.
+    /// Floating popup Retina SVG icons drawn above `overlay_rects`.
+    pub overlay_icons: Vec<IconQuad>,
+    /// Floating popup text runs drawn above `overlay_icons`.
     pub overlay_text: Vec<TextRun>,
     /// Fragment-shader rounded-rect clip table (slot 0 is always the unbounded full viewport).
     pub clips: Vec<ClipRectGpu>,
     /// Clickable regions in paint order (`hit_test` walks in reverse so top-most wins).
     pub hit_regions: Vec<HitRegion>,
+    /// Draggable item regions (files, folders, crates) in paint order.
+    pub drag_sources: Vec<DragSource>,
+    /// Logical rect of the recessed composer input hotbar (for click-to-cursor & drag drop).
+    pub composer_rect: HitRect,
+    /// Logical origin `[x, y]` of character `(0, 0)` inside the composer input hotbar.
+    pub composer_text_origin: [f32; 2],
     /// Total height of the scrollable block column in logical pixels.
     pub total_content_height: f32,
     /// Height of the visible scroll viewport between top bar and input bar.
@@ -125,9 +158,13 @@ impl Scene {
             icon_quads: Vec::new(),
             over_rects: Vec::new(),
             overlay_rects: Vec::new(),
+            overlay_icons: Vec::new(),
             overlay_text: Vec::new(),
             clips: vec![infinite_clip],
             hit_regions: Vec::new(),
+            drag_sources: Vec::new(),
+            composer_rect: HitRect::new(0.0, 0.0, 0.0, 0.0),
+            composer_text_origin: [0.0, 0.0],
             total_content_height: 0.0,
             scroll_viewport_height: 0.0,
             input_top_y: 0.0,
@@ -336,6 +373,38 @@ impl Scene {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn overlay_svg_icon(
+        &mut self,
+        x: f32,
+        y: f32,
+        size: f32,
+        name: &'static str,
+        clip_id: u32,
+    ) {
+        self.overlay_icons.push(IconQuad { x, y, w: size, h: size, name, alpha: 1.0, clip_id });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn overlay_line(
+        &mut self,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        thickness: f32,
+        color: [f32; 4],
+        clip_id: u32,
+    ) {
+        self.overlay_rects.push(RectInst {
+            rect: [x0, y0, x1, y1],
+            color,
+            border_color: [0.0; 4],
+            params: [thickness, 0.0, 0.0, prim_kind::LINE],
+            clip_info: [clip_id, 0, 0, 0],
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn text(
         &mut self,
         x: f32,
@@ -397,6 +466,34 @@ impl Scene {
         for region in self.hit_regions.iter().rev() {
             if region.rect.contains(x, y) {
                 return Some(region.action);
+            }
+        }
+        None
+    }
+
+    /// Record a draggable item clipped against `self.clips[clip_id]`.
+    pub fn push_drag_source_clipped(&mut self, rect: HitRect, clip_id: u32, payload: DragPayload) {
+        let Some(clip) = self.clips.get(clip_id as usize) else {
+            self.drag_sources.push(DragSource { rect, payload });
+            return;
+        };
+        let x0 = rect.x0.max(clip.rect[0]);
+        let y0 = rect.y0.max(clip.rect[1]);
+        let x1 = rect.x1.min(clip.rect[2]);
+        let y1 = rect.y1.min(clip.rect[3]);
+        if x1 > x0 && y1 > y0 {
+            self.drag_sources.push(DragSource {
+                rect: HitRect::new(x0, y0, x1, y1),
+                payload,
+            });
+        }
+    }
+
+    /// Find the top-most draggable item under `(x, y)`.
+    pub fn drag_source_at(&self, x: f32, y: f32) -> Option<&DragPayload> {
+        for src in self.drag_sources.iter().rev() {
+            if src.rect.contains(x, y) {
+                return Some(&src.payload);
             }
         }
         None

@@ -71,7 +71,7 @@ mod macos_app {
     use objc2_app_kit::{
         NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSEventMask,
         NSEventModifierFlags, NSEventType, NSPasteboard, NSPasteboardTypeString, NSWindow,
-        NSWindowStyleMask,
+        NSWindowStyleMask, NSWindowTitleVisibility,
     };
     use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSPoint, NSRect, NSSize, NSString};
     use objc2_metal::MTLCreateSystemDefaultDevice;
@@ -82,30 +82,39 @@ mod macos_app {
     use blaze_shell::font::Fonts;
     use blaze_shell::host::{InteractiveSpawn, run_command_line};
     use blaze_shell::keys;
-    use blaze_shell::layout::{LayoutInput, build_scene, layout_fullscreen_terminal};
+    use blaze_shell::layout::{LayoutInput, TOP_BAR_H, build_scene, layout_fullscreen_terminal};
     use blaze_shell::prompt::{GitStatusWorker, PromptInfo};
     use blaze_shell::pty::{Pty, Read as PtyRead};
     use blaze_shell::render::{FrameDraw, PIXEL_FORMAT, Renderer};
     use blaze_shell::rust_cell;
     use blaze_shell::svg_icons::IconAtlas;
-    use blaze_shell::view::{HitAction, Scene};
+    use blaze_shell::view::{ActiveDrag, DragPayload, HitAction, Scene};
 
     const FONT_POINTS: f64 = 13.0;
+    const MIN_FONT_POINTS: f64 = 8.5;
+    const MAX_FONT_POINTS: f64 = 28.0;
+    const ZOOM_STEP_POINTS: f64 = 1.5;
 
     struct CliOpts {
         demo: bool,
+        demo_popup: bool,
         scroll_bottom: bool,
         screenshot: Option<PathBuf>,
     }
 
     fn parse_cli() -> CliOpts {
         let mut demo = false;
+        let mut demo_popup = false;
         let mut scroll_bottom = false;
         let mut screenshot = None;
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--demo" => demo = true,
+                "--demo-popup" => {
+                    demo = true;
+                    demo_popup = true;
+                }
                 "--scroll-bottom" => scroll_bottom = true,
                 "--screenshot" => {
                     if let Some(p) = args.next() {
@@ -115,7 +124,17 @@ mod macos_app {
                 _ => {}
             }
         }
-        CliOpts { demo, scroll_bottom, screenshot }
+        CliOpts { demo, demo_popup, scroll_bottom, screenshot }
+    }
+
+    struct PendingDrag {
+        start_x: f32,
+        start_y: f32,
+        x: f32,
+        y: f32,
+        active: bool,
+        over_composer: bool,
+        payload: DragPayload,
     }
 
     struct ActivePty {
@@ -152,10 +171,12 @@ mod macos_app {
             let prompt = PromptInfo::from_cwd(&cwd, &home, 0, 0);
             let git_worker = GitStatusWorker::spawn();
             git_worker.request(&cwd);
+            let mut editor = Editor::new();
+            editor.load_user_abbreviations(&home);
 
             Self {
                 store: BlockStore::new(state),
-                editor: Editor::new(),
+                editor,
                 prompt,
                 home,
                 git_worker,
@@ -168,10 +189,33 @@ mod macos_app {
 
         fn refresh_prompt(&mut self, last_exit: i32, last_duration_ms: u64) {
             let cwd = self.store.active_state().cwd.as_ref().to_owned();
-            let prev_dirty = if self.prompt.cwd == cwd { self.prompt.git_dirty } else { None };
+            let prev_status = if self.prompt.cwd == cwd {
+                self.prompt.git_status.clone()
+            } else {
+                None
+            };
             self.prompt = PromptInfo::from_cwd(&cwd, &self.home, last_exit, last_duration_ms);
-            self.prompt.git_dirty = prev_dirty;
+            if let Some(st) = prev_status {
+                self.prompt.git_branch = Some(st.branch.clone());
+                self.prompt.git_detached = st.detached;
+                self.prompt.git_status = Some(st);
+            }
             self.git_worker.request(&cwd);
+        }
+
+        fn recent_table_columns(&self) -> Vec<String> {
+            for blk in self.store.active_blocks().iter().rev() {
+                if let BlockBody::Value(Value::Table(t)) = &blk.body {
+                    return t.columns.iter().map(|c| c.as_ref().to_owned()).collect();
+                }
+            }
+            Vec::new()
+        }
+
+        fn refresh_editor_assist(&mut self, open_popup: bool) {
+            let st = self.store.active_state().fork();
+            let cols = self.recent_table_columns();
+            self.editor.refresh_assist(&st, &cols, open_popup);
         }
 
         fn submit_command(&mut self, src: &str, term_cols: u16, term_rows: u16, cell_px: (u32, u32)) {
@@ -325,7 +369,17 @@ mod macos_app {
             }
         }
 
-        fn populate_demo(&mut self, cols: u16, rows: u16, cell_px: (u32, u32), scroll_bottom: bool) {
+        fn populate_demo(
+            &mut self,
+            cols: u16,
+            rows: u16,
+            cell_px: (u32, u32),
+            scroll_bottom: bool,
+            show_popup: bool,
+        ) {
+            // Compute real live `blaze-git` Starship status synchronously before demo commands.
+            self.prompt.refresh_git_sync();
+
             self.submit_command("ls", cols, rows, cell_px);
             self.submit_command("ls crates/blaze-sh/src | sort-by size -r | take 5", cols, rows, cell_px);
             self.submit_command("sys", cols, rows, cell_px);
@@ -342,7 +396,18 @@ mod macos_app {
                 self.submit_command("rust { (1..=10).sum::<i64>() }", cols, rows, cell_px);
             }
             self.submit_command("ls | get nonexistent_col", cols, rows, cell_px);
-            self.editor.set_text("ls | where size > 1KB | sort-by size -r".to_owned());
+            self.prompt.refresh_git_sync();
+
+            // Seed command history so Fish-style ghost autosuggestion works right away.
+            self.editor.push_history("ls crates/blaze-sh/src | sort-by size -r | take 5".to_owned());
+            self.editor.push_history("open Cargo.toml | get package".to_owned());
+            if show_popup {
+                self.editor.set_text_initial("open Ca".to_owned());
+                self.refresh_editor_assist(true);
+            } else {
+                self.editor.set_text_initial("ls crates/blaze-sh".to_owned());
+                self.refresh_editor_assist(false);
+            }
             self.auto_scroll_bottom = scroll_bottom;
             self.scroll_y = 0.0;
         }
@@ -398,7 +463,8 @@ mod macos_app {
         let style = NSWindowStyleMask::Titled
             | NSWindowStyleMask::Closable
             | NSWindowStyleMask::Miniaturizable
-            | NSWindowStyleMask::Resizable;
+            | NSWindowStyleMask::Resizable
+            | NSWindowStyleMask::FullSizeContentView;
         // SAFETY: valid content rect, style mask, and buffered backing store on main thread.
         let window = unsafe {
             NSWindow::initWithContentRect_styleMask_backing_defer(
@@ -412,7 +478,9 @@ mod macos_app {
         // SAFETY: `window` stays alive for the duration of `run()`.
         unsafe { window.setReleasedWhenClosed(false) };
         window.setTitle(&NSString::from_str("blaze-shell"));
+        window.setTitleVisibility(NSWindowTitleVisibility::Hidden);
         window.setTitlebarAppearsTransparent(true);
+        window.setMovableByWindowBackground(false);
         let bg_color = objc2_app_kit::NSColor::colorWithSRGBRed_green_blue_alpha(
             0x10 as f64 / 255.0,
             0x10 as f64 / 255.0,
@@ -444,7 +512,8 @@ mod macos_app {
         }
 
         let mut scale = window.backingScaleFactor().max(1.0);
-        let mut fonts = Fonts::new(FONT_POINTS, scale);
+        let mut font_points: f64 = FONT_POINTS;
+        let mut fonts = Fonts::new(font_points, scale);
         let mut icon_atlas = IconAtlas::new(scale);
         let mut size = view.bounds().size;
         layer.setContentsScale(scale);
@@ -454,13 +523,20 @@ mod macos_app {
         let (init_cols, init_rows) = grid_for(size, &fonts, scale);
         let cell_px = (fonts.metrics.cell_w as u32, fonts.metrics.cell_h as u32);
         if cli.demo {
-            shell.populate_demo(init_cols, init_rows, cell_px, cli.scroll_bottom);
+            shell.populate_demo(
+                init_cols,
+                init_rows,
+                cell_px,
+                cli.scroll_bottom,
+                cli.demo_popup,
+            );
         }
 
-        // Offscreen deterministic screenshot mode: render 2 frames (warming glyph atlas) and exit.
+        // Offscreen deterministic screenshot mode: render 1 frame (warming atlases) and exit.
         if let Some(shot_path) = cli.screenshot {
             let metrics = fonts.cell_metrics(scale);
             let frame_now = now_ns();
+            let zoom_pct = ((font_points / FONT_POINTS) * 100.0).round() as u16;
             let mut scene = build_scene(&LayoutInput {
                 store: &shell.store,
                 editor: &shell.editor,
@@ -471,6 +547,9 @@ mod macos_app {
                 scroll_y: shell.scroll_y,
                 cursor_visible: true,
                 now_ns: frame_now,
+                zoom_pct,
+                inline_titlebar: true,
+                drag: None,
             });
             let max_s = (scene.total_content_height - scene.scroll_viewport_height).max(0.0);
             if shell.auto_scroll_bottom && max_s > 0.0 {
@@ -485,6 +564,9 @@ mod macos_app {
                     scroll_y: shell.scroll_y,
                     cursor_visible: true,
                     now_ns: frame_now,
+                    zoom_pct,
+                    inline_titlebar: true,
+                    drag: None,
                 });
             }
             let glyphs = fonts.rasterize_runs(&scene.text_runs, scale);
@@ -493,6 +575,7 @@ mod macos_app {
                 renderer.upload(slot, &bytes);
             }
             let icons = icon_atlas.rasterize_quads(&scene.icon_quads);
+            let overlay_icons = icon_atlas.rasterize_quads(&scene.overlay_icons);
             for (slot, rgba) in icon_atlas.pending.drain(..) {
                 renderer.upload_icon(slot, &rgba);
             }
@@ -510,6 +593,7 @@ mod macos_app {
                 icons: &icons,
                 over_rects: &scene.over_rects,
                 overlay_rects: &scene.overlay_rects,
+                overlay_icons: &overlay_icons,
                 overlay_glyphs: &overlay_glyphs,
             };
             let w_px = (size.width * scale).round().max(1.0) as usize;
@@ -526,6 +610,10 @@ mod macos_app {
         let mut dirty = true;
         let mut blink_on = true;
         let mut last_blink = Instant::now();
+        let mut pending_drag: Option<PendingDrag> = None;
+        let mut selecting_composer = false;
+        let mut popup_engaged = false;
+        let mut zoom_changed = false;
 
         loop {
             let mut quit = false;
@@ -542,14 +630,68 @@ mod macos_app {
                     match ev.r#type() {
                         NSEventType::KeyDown if window.isKeyWindow() => {
                             let flags = ev.modifierFlags();
+                            let key = keys::key_of(ev.keyCode());
+                            let shift = flags.contains(NSEventModifierFlags::Shift);
+                            let ctrl = flags.contains(NSEventModifierFlags::Control);
+                            let alt = flags.contains(NSEventModifierFlags::Option);
                             let chars = ev
                                 .charactersIgnoringModifiers()
                                 .map(|s| s.to_string())
                                 .unwrap_or_default();
+                            let lower = chars.to_ascii_lowercase();
 
-                            // Global Command shortcuts.
+                            // Global macOS Command shortcuts (`Cmd+Q/W/K/B/A/C/X/V/Z`, zoom `Cmd+`/`Cmd-`/`Cmd+0`,
+                            // and natural line navigation `Cmd+Left/Right/Backspace`).
                             if flags.contains(NSEventModifierFlags::Command) {
-                                match chars.as_str() {
+                                // Zoom (`Cmd+=`/`Cmd++`, `Cmd+-`, `Cmd+0`).
+                                if matches!(lower.as_str(), "=" | "+")
+                                    || matches!(key, Key::Equal | Key::NumpadAdd)
+                                {
+                                    font_points = (font_points + ZOOM_STEP_POINTS).min(MAX_FONT_POINTS);
+                                    zoom_changed = true;
+                                    dirty = true;
+                                    continue;
+                                }
+                                if lower == "-" || matches!(key, Key::Minus | Key::NumpadSubtract) {
+                                    font_points = (font_points - ZOOM_STEP_POINTS).max(MIN_FONT_POINTS);
+                                    zoom_changed = true;
+                                    dirty = true;
+                                    continue;
+                                }
+                                if lower == "0" || matches!(key, Key::Digit0 | Key::Numpad0) {
+                                    font_points = FONT_POINTS;
+                                    zoom_changed = true;
+                                    dirty = true;
+                                    continue;
+                                }
+
+                                // Navigation & editing inside the composer when no PTY is running.
+                                if shell.active_pty.is_none() {
+                                    match key {
+                                        Key::ArrowLeft => {
+                                            shell.editor.move_home(shift);
+                                            shell.refresh_editor_assist(false);
+                                            dirty = true;
+                                            continue;
+                                        }
+                                        Key::ArrowRight => {
+                                            shell.editor.move_end(shift);
+                                            shell.refresh_editor_assist(false);
+                                            dirty = true;
+                                            continue;
+                                        }
+                                        Key::Backspace => {
+                                            shell.editor.kill_to_line_start();
+                                            popup_engaged = false;
+                                            shell.refresh_editor_assist(true);
+                                            dirty = true;
+                                            continue;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+
+                                match lower.as_str() {
                                     "q" | "w" => {
                                         quit = true;
                                         continue;
@@ -566,9 +708,33 @@ mod macos_app {
                                         dirty = true;
                                         continue;
                                     }
+                                    "z" if shell.active_pty.is_none() => {
+                                        if shift {
+                                            shell.editor.redo();
+                                        } else {
+                                            shell.editor.undo();
+                                        }
+                                        popup_engaged = false;
+                                        shell.refresh_editor_assist(false);
+                                        dirty = true;
+                                        continue;
+                                    }
                                     "a" if shell.active_pty.is_none() => {
                                         shell.editor.select_all();
                                         dirty = true;
+                                        continue;
+                                    }
+                                    "x" if shell.active_pty.is_none() => {
+                                        if let Some(cut) = shell.editor.cut_selection() {
+                                            let pb = NSPasteboard::generalPasteboard();
+                                            // SAFETY: valid static AppKit pasteboard type.
+                                            let t = unsafe { NSPasteboardTypeString };
+                                            pb.clearContents();
+                                            pb.setString_forType(&NSString::from_str(&cut), t);
+                                            popup_engaged = false;
+                                            shell.refresh_editor_assist(false);
+                                            dirty = true;
+                                        }
                                         continue;
                                     }
                                     "c" if shell.active_pty.is_none() => {
@@ -609,6 +775,8 @@ mod macos_app {
                                                 }
                                             } else {
                                                 shell.editor.insert_str(&pasted);
+                                                popup_engaged = false;
+                                                shell.refresh_editor_assist(false);
                                                 dirty = true;
                                             }
                                         }
@@ -639,10 +807,6 @@ mod macos_app {
                             }
 
                             // Interactive shell editor key handling.
-                            let key = keys::key_of(ev.keyCode());
-                            let shift = flags.contains(NSEventModifierFlags::Shift);
-                            let ctrl = flags.contains(NSEventModifierFlags::Control);
-                            let alt = flags.contains(NSEventModifierFlags::Option);
                             let text = keys::text_of(&ev);
 
                             if shell.editor.reverse_search.is_some() {
@@ -662,26 +826,64 @@ mod macos_app {
                             } else if ctrl {
                                 match key {
                                     Key::KeyR => shell.editor.start_reverse_search(),
+                                    Key::Space => {
+                                        let st = shell.store.active_state().fork();
+                                        let cols = shell.recent_table_columns();
+                                        shell.editor.trigger_completion_with_cols(&st, &cols);
+                                        popup_engaged = !shell.editor.completions.is_empty();
+                                    }
+                                    Key::KeyP if !shell.editor.completions.is_empty() => {
+                                        shell.editor.move_up();
+                                        popup_engaged = true;
+                                    }
+                                    Key::KeyN if !shell.editor.completions.is_empty() => {
+                                        shell.editor.move_down();
+                                        popup_engaged = true;
+                                    }
                                     Key::KeyC => {
                                         shell.editor.dismiss_completions();
                                         shell.editor.clear_line();
+                                        popup_engaged = false;
                                     }
-                                    Key::KeyU => shell.editor.clear_line(),
-                                    Key::KeyK => shell.editor.kill_to_end(),
-                                    Key::KeyW => shell.editor.kill_word_back(),
-                                    Key::KeyA => shell.editor.move_home(shift),
-                                    Key::KeyE => shell.editor.move_end(shift),
+                                    Key::KeyU => {
+                                        shell.editor.clear_line();
+                                        popup_engaged = false;
+                                    }
+                                    Key::KeyK => {
+                                        shell.editor.kill_to_end();
+                                        popup_engaged = false;
+                                        shell.refresh_editor_assist(false);
+                                    }
+                                    Key::KeyW => {
+                                        shell.editor.kill_word_back();
+                                        popup_engaged = false;
+                                        shell.refresh_editor_assist(true);
+                                    }
+                                    Key::KeyA => {
+                                        shell.editor.move_home(shift);
+                                        shell.refresh_editor_assist(false);
+                                    }
+                                    Key::KeyE => {
+                                        shell.editor.move_end(shift);
+                                        shell.refresh_editor_assist(false);
+                                    }
                                     _ => {}
                                 }
                             } else {
                                 match key {
                                     Key::Enter | Key::NumpadEnter => {
-                                        if !shell.editor.completions.is_empty() {
+                                        if popup_engaged && !shell.editor.completions.is_empty() {
                                             shell.editor.apply_selected_completion();
+                                            popup_engaged = false;
+                                            shell.refresh_editor_assist(true);
                                         } else if shift || shell.editor.is_incomplete() {
                                             shell.editor.insert_char('\n');
+                                            popup_engaged = false;
                                         } else {
+                                            // Expand trailing command-position abbreviation (`l`, `gs`, `..`) before running.
+                                            shell.editor.try_expand_abbreviation();
                                             let cmd = shell.editor.take_submitted();
+                                            popup_engaged = false;
                                             let (cols, rows) = grid_for(size, &fonts, scale);
                                             let cpx = (
                                                 fonts.metrics.cell_w as u32,
@@ -691,18 +893,48 @@ mod macos_app {
                                         }
                                     }
                                     Key::Tab => {
-                                        let st = shell.store.active_state().fork();
-                                        shell.editor.trigger_completion(&st);
+                                        if !shell.editor.completions.is_empty() && !popup_engaged {
+                                            shell.editor.apply_selected_completion();
+                                            popup_engaged = false;
+                                            shell.refresh_editor_assist(true);
+                                        } else {
+                                            let st = shell.store.active_state().fork();
+                                            let cols = shell.recent_table_columns();
+                                            shell.editor.trigger_completion_with_cols(&st, &cols);
+                                            popup_engaged = !shell.editor.completions.is_empty();
+                                        }
                                     }
-                                    Key::Escape => shell.editor.dismiss_completions(),
-                                    Key::Backspace => shell.editor.backspace(),
-                                    Key::Delete => shell.editor.delete_forward(),
+                                    Key::Escape => {
+                                        shell.editor.dismiss_completions();
+                                        popup_engaged = false;
+                                    }
+                                    Key::Backspace => {
+                                        if alt {
+                                            shell.editor.kill_word_back();
+                                        } else {
+                                            shell.editor.backspace();
+                                        }
+                                        popup_engaged = false;
+                                        shell.refresh_editor_assist(true);
+                                    }
+                                    Key::Delete => {
+                                        if alt {
+                                            shell.editor.kill_word_forward();
+                                        } else {
+                                            shell.editor.delete_forward();
+                                        }
+                                        popup_engaged = false;
+                                        shell.refresh_editor_assist(false);
+                                    }
                                     Key::ArrowLeft => {
                                         if alt {
                                             shell.editor.move_word_left(shift);
                                         } else {
                                             shell.editor.move_left(shift);
                                         }
+                                        shell.editor.dismiss_completions();
+                                        popup_engaged = false;
+                                        shell.refresh_editor_assist(false);
                                     }
                                     Key::ArrowRight => {
                                         if alt {
@@ -710,11 +942,36 @@ mod macos_app {
                                         } else {
                                             shell.editor.move_right(shift);
                                         }
+                                        shell.editor.dismiss_completions();
+                                        popup_engaged = false;
+                                        shell.refresh_editor_assist(false);
                                     }
-                                    Key::ArrowUp => shell.editor.move_up(),
-                                    Key::ArrowDown => shell.editor.move_down(),
-                                    Key::Home => shell.editor.move_home(shift),
-                                    Key::End => shell.editor.move_end(shift),
+                                    Key::ArrowUp => {
+                                        if !shell.editor.completions.is_empty() {
+                                            popup_engaged = true;
+                                        }
+                                        shell.editor.move_up();
+                                        if shell.editor.completions.is_empty() {
+                                            shell.refresh_editor_assist(false);
+                                        }
+                                    }
+                                    Key::ArrowDown => {
+                                        if !shell.editor.completions.is_empty() {
+                                            popup_engaged = true;
+                                        }
+                                        shell.editor.move_down();
+                                        if shell.editor.completions.is_empty() {
+                                            shell.refresh_editor_assist(false);
+                                        }
+                                    }
+                                    Key::Home => {
+                                        shell.editor.move_home(shift);
+                                        shell.refresh_editor_assist(false);
+                                    }
+                                    Key::End => {
+                                        shell.editor.move_end(shift);
+                                        shell.refresh_editor_assist(false);
+                                    }
                                     Key::PageUp => {
                                         shell.scroll_y = (shell.scroll_y
                                             - shell.last_scene.scroll_viewport_height * 0.75)
@@ -732,7 +989,13 @@ mod macos_app {
                                     }
                                     _ => {
                                         if !text.is_empty() {
+                                            if text == " " {
+                                                // Fish/Nushell inline abbreviation expansion on Space!
+                                                shell.editor.try_expand_abbreviation();
+                                            }
                                             shell.editor.insert_str(&text);
+                                            popup_engaged = false;
+                                            shell.refresh_editor_assist(true);
                                         }
                                     }
                                 }
@@ -819,11 +1082,110 @@ mod macos_app {
                                         }
                                         HitAction::SelectCompletion(idx) => {
                                             shell.editor.apply_completion(idx);
+                                            popup_engaged = false;
+                                            shell.refresh_editor_assist(true);
+                                            dirty = true;
+                                        }
+                                        HitAction::ResetZoom => {
+                                            font_points = FONT_POINTS;
+                                            zoom_changed = true;
                                             dirty = true;
                                         }
                                     }
                                     continue;
                                 }
+
+                                // Click inside the recessed composer hotbar: position cursor / word-select / drag-select.
+                                if shell.last_scene.composer_rect.contains(x, y) {
+                                    let m = fonts.cell_metrics(scale);
+                                    let [ox, oy] = shell.last_scene.composer_text_origin;
+                                    let line_step = (m.ch + 4.0).max(1.0);
+                                    let line = ((y - oy).max(0.0) / line_step).floor() as usize;
+                                    let col = (((x - ox).max(0.0) + m.cw * 0.45) / m.cw).floor() as usize;
+                                    let clicks = ev.clickCount();
+                                    let shift = ev.modifierFlags().contains(NSEventModifierFlags::Shift);
+                                    if clicks >= 3 {
+                                        shell.editor.select_all();
+                                    } else if clicks == 2 {
+                                        shell.editor.select_word_at(line, col);
+                                    } else {
+                                        shell.editor.set_cursor_at_line_col(line, col, shift);
+                                        selecting_composer = true;
+                                    }
+                                    shell.editor.dismiss_completions();
+                                    popup_engaged = false;
+                                    blink_on = true;
+                                    last_blink = Instant::now();
+                                    dirty = true;
+                                    continue;
+                                }
+
+                                // Press on any draggable file/folder/crate cell (e.g. `Cargo.lock`): arm drag-to-hotbar.
+                                if let Some(payload) = shell.last_scene.drag_source_at(x, y).cloned() {
+                                    pending_drag = Some(PendingDrag {
+                                        start_x: x,
+                                        start_y: y,
+                                        x,
+                                        y,
+                                        active: false,
+                                        over_composer: false,
+                                        payload,
+                                    });
+                                    continue;
+                                }
+
+                                // Empty inline titlebar drag moves the macOS window natively.
+                                if y < TOP_BAR_H && x > 74.0 {
+                                    window.performWindowDragWithEvent(&ev);
+                                    continue;
+                                }
+                            }
+                        }
+                        NSEventType::LeftMouseDragged if window.isKeyWindow() => {
+                            let pt = ev.locationInWindow();
+                            let x = pt.x as f32;
+                            let y = (size.height - pt.y) as f32;
+                            if let Some(d) = &mut pending_drag {
+                                d.x = x;
+                                d.y = y;
+                                if !d.active && (x - d.start_x).hypot(y - d.start_y) >= 4.0 {
+                                    d.active = true;
+                                }
+                                if d.active {
+                                    d.over_composer = shell.last_scene.composer_rect.contains(x, y);
+                                    dirty = true;
+                                }
+                                continue;
+                            }
+                            if selecting_composer {
+                                let m = fonts.cell_metrics(scale);
+                                let [ox, oy] = shell.last_scene.composer_text_origin;
+                                let line_step = (m.ch + 4.0).max(1.0);
+                                let line = ((y - oy).max(0.0) / line_step).floor() as usize;
+                                let col = (((x - ox).max(0.0) + m.cw * 0.45) / m.cw).floor() as usize;
+                                shell.editor.set_cursor_at_line_col(line, col, true);
+                                dirty = true;
+                                continue;
+                            }
+                        }
+                        NSEventType::LeftMouseUp => {
+                            if let Some(d) = pending_drag.take() {
+                                let pt = ev.locationInWindow();
+                                let x = pt.x as f32;
+                                let y = (size.height - pt.y) as f32;
+                                if d.active && shell.last_scene.composer_rect.contains(x, y) {
+                                    shell.editor.insert_dropped_token(&d.payload.insert_text);
+                                    popup_engaged = false;
+                                    shell.refresh_editor_assist(false);
+                                    blink_on = true;
+                                    last_blink = Instant::now();
+                                }
+                                dirty = true;
+                                continue;
+                            }
+                            if selecting_composer {
+                                selecting_composer = false;
+                                continue;
                             }
                         }
                         _ => {}
@@ -840,11 +1202,17 @@ mod macos_app {
                 break;
             }
 
-            // Poll asynchronous git status worker (single atomic check when idle).
-            if let Some((cwd, git_dirty)) = shell.git_worker.poll()
+            // Poll asynchronous `blaze-git` Starship status worker (single atomic check when idle).
+            if let Some((cwd, summary)) = shell.git_worker.poll()
                 && cwd == shell.prompt.cwd
             {
-                shell.prompt.git_dirty = Some(git_dirty);
+                if let Some(st) = summary {
+                    shell.prompt.git_branch = Some(st.branch.clone());
+                    shell.prompt.git_detached = st.detached;
+                    shell.prompt.git_status = Some(st);
+                } else {
+                    shell.prompt.git_status = None;
+                }
                 dirty = true;
             }
 
@@ -906,15 +1274,16 @@ mod macos_app {
                 dirty = true;
             }
 
-            // Handle window resize and backing scale changes.
+            // Handle window resize, backing scale changes, and `Cmd+`/`Cmd-`/`Cmd+0` zoom.
             let new_size = view.bounds().size;
             let new_scale = window.backingScaleFactor().max(1.0);
-            if new_size != size || (new_scale - scale).abs() > f64::EPSILON {
-                if (new_scale - scale).abs() > f64::EPSILON {
-                    fonts = Fonts::new(FONT_POINTS, new_scale);
-                    icon_atlas = IconAtlas::new(new_scale);
+            if new_size != size || (new_scale - scale).abs() > f64::EPSILON || zoom_changed {
+                if (new_scale - scale).abs() > f64::EPSILON || zoom_changed {
                     scale = new_scale;
+                    fonts = Fonts::new(font_points, scale);
+                    icon_atlas = IconAtlas::new(scale * (font_points / FONT_POINTS));
                     layer.setContentsScale(scale);
+                    zoom_changed = false;
                 }
                 size = new_size;
                 layer.setDrawableSize(NSSize::new(size.width * scale, size.height * scale));
@@ -943,6 +1312,19 @@ mod macos_app {
             if dirty {
                 let metrics = fonts.cell_metrics(scale);
                 let cursor_vis = blink_on && window.isKeyWindow();
+                let zoom_pct = ((font_points / FONT_POINTS) * 100.0).round() as u16;
+                let active_drag = pending_drag.as_ref().and_then(|d| {
+                    if d.active {
+                        Some(ActiveDrag {
+                            x: d.x,
+                            y: d.y,
+                            over_composer: d.over_composer,
+                            payload: d.payload.clone(),
+                        })
+                    } else {
+                        None
+                    }
+                });
                 let mut scene = if shell.store.is_alternate_screen()
                     && let Some(tid) = shell.store.active_running_terminal()
                     && let Some(blk) = shell.store.block(tid)
@@ -967,6 +1349,9 @@ mod macos_app {
                         scroll_y: shell.scroll_y,
                         cursor_visible: cursor_vis,
                         now_ns: frame_now,
+                        zoom_pct,
+                        inline_titlebar: true,
+                        drag: active_drag.as_ref(),
                     });
                     let max_s = (first.total_content_height - first.scroll_viewport_height).max(0.0);
                     let target_scroll = if shell.auto_scroll_bottom {
@@ -987,6 +1372,9 @@ mod macos_app {
                             scroll_y: shell.scroll_y,
                             cursor_visible: cursor_vis,
                             now_ns: frame_now,
+                            zoom_pct,
+                            inline_titlebar: true,
+                            drag: active_drag.as_ref(),
                         })
                     } else {
                         first
@@ -999,6 +1387,7 @@ mod macos_app {
                     renderer.upload(slot, &bytes);
                 }
                 let icons = icon_atlas.rasterize_quads(&scene.icon_quads);
+                let overlay_icons = icon_atlas.rasterize_quads(&scene.overlay_icons);
                 for (slot, rgba) in icon_atlas.pending.drain(..) {
                     renderer.upload_icon(slot, &rgba);
                 }
@@ -1016,15 +1405,17 @@ mod macos_app {
                     icons: &icons,
                     over_rects: &scene.over_rects,
                     overlay_rects: &scene.overlay_rects,
+                    overlay_icons: &overlay_icons,
                     overlay_glyphs: &overlay_glyphs,
                 };
                 renderer.draw(&layer, &frame);
-                // Keep only hit regions + scroll metadata in `last_scene` for instant mouse handling.
+                // Keep hit regions, drag sources & composer geometry in `last_scene` for instant mouse handling.
                 scene.rects.clear();
                 scene.text_runs.clear();
                 scene.icon_quads.clear();
                 scene.over_rects.clear();
                 scene.overlay_rects.clear();
+                scene.overlay_icons.clear();
                 scene.overlay_text.clear();
                 shell.last_scene = scene;
                 dirty = false;

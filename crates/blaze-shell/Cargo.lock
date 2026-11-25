@@ -51,10 +51,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-git"
+version = "0.0.0"
+dependencies = [
+ "blaze-git-fetch",
+ "blaze-hash",
+ "blaze-memchr",
+ "blaze-own",
+]
+
+[[package]]
+name = "blaze-git-fetch"
+version = "0.0.0"
+dependencies = [
+ "blaze-deflate",
+ "blaze-own",
+]
+
+[[package]]
 name = "blaze-glob"
 version = "0.0.0"
 dependencies = [
  "blaze-own",
+]
+
+[[package]]
+name = "blaze-hash"
+version = "0.0.0"
+dependencies = [
+ "blaze-check",
+ "blaze-own",
+ "blaze-reclaim",
+ "blaze-swiss",
 ]
 
 [[package]]
@@ -93,6 +121,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-reclaim"
+version = "0.0.0"
+dependencies = [
+ "blaze-check",
+]
+
+[[package]]
 name = "blaze-rng"
 version = "0.0.0"
 
@@ -112,6 +147,7 @@ name = "blaze-shell"
 version = "0.0.0"
 dependencies = [
  "blaze-data",
+ "blaze-git",
  "blaze-json",
  "blaze-own",
  "blaze-sh",
@@ -125,6 +161,15 @@ dependencies = [
  "objc2-foundation",
  "objc2-metal",
  "objc2-quartz-core",
+]
+
+[[package]]
+name = "blaze-swiss"
+version = "0.0.0"
+dependencies = [
+ "blaze-check",
+ "blaze-int",
+ "blaze-own",
 ]
 
 [[package]]

@@ -85,6 +85,22 @@ pub const SERIES_BLUE: [f32; 4] = rgb(0x39, 0x87, 0xe5);
 /// `--series-3`: `#199e70` (Config / duration accent)
 pub const SERIES_AQUA: [f32; 4] = rgb(0x19, 0x9e, 0x70);
 
+// Starship prompt semantic accents (clean pastel-vivid on warm `#101011` charcoal).
+/// Starship directory accent (crisp cyan-teal).
+pub const PROMPT_DIR: [f32; 4] = rgb(0x6e, 0xd8, 0xce);
+/// Starship git branch accent (soft violet-lavender).
+pub const PROMPT_BRANCH: [f32; 4] = rgb(0xc7, 0x9b, 0xf2);
+/// Starship git status `[?!+⇡]` badge accent (soft coral-rose).
+pub const PROMPT_STATUS: [f32; 4] = rgb(0xf2, 0x7d, 0x9a);
+/// Starship `❯` ok prompt accent (mint green).
+pub const PROMPT_OK: [f32; 4] = rgb(0x7a, 0xd8, 0x96);
+/// Starship sparkle / indicator accent (soft sky-periwinkle).
+pub const PROMPT_SPARK: [f32; 4] = rgb(0x74, 0xb0, 0xf7);
+/// Fish-style inline ghost autosuggestion text.
+pub const GHOST_INK: [f32; 4] = rgb(0x4f, 0x4f, 0x54);
+/// IntelliJ completion matched-character highlight.
+pub const MATCH_HIGHLIGHT: [f32; 4] = rgb(0xf0, 0x8a, 0x4b);
+
 /// Monochrome-first syntax highlighting matching `ix.dev/blaze`'s `$ curl -fsSL ... | sh`:
 /// commands and args in warm paper-white (`INK_1`), flags/pipes/operators in quiet stone,
 /// colour reserved for errors and Rust cells.

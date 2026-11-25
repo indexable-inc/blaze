@@ -125,6 +125,9 @@ mod tests {
             scroll_y: 0.0,
             cursor_visible: true,
             now_ns: 1_732_500_000_000_000_000,
+            zoom_pct: 100,
+            inline_titlebar: true,
+            drag: None,
         });
 
         // Fold toggle hit region must be present, and every block must have a ForkBlock hit target.
@@ -173,6 +176,9 @@ mod tests {
             scroll_y: 0.0,
             cursor_visible: true,
             now_ns: 1_732_500_000_000_000_000,
+            zoom_pct: 100,
+            inline_titlebar: true,
+            drag: None,
         });
         assert!(
             scene_unfolded.total_content_height > h_folded,
@@ -192,6 +198,9 @@ mod tests {
             scroll_y: 0.0,
             cursor_visible: true,
             now_ns: 1_732_500_000_000_000_000,
+            zoom_pct: 100,
+            inline_titlebar: true,
+            drag: None,
         });
         assert!(scene_expanded.total_content_height > h_before_expand);
         assert!(scene_expanded.text_runs.iter().any(|t| t.text == "meta"));
@@ -436,6 +445,9 @@ mod tests {
             scroll_y: 0.0,
             cursor_visible: true,
             now_ns: 1_732_500_000_000_000_000,
+            zoom_pct: 100,
+            inline_titlebar: true,
+            drag: None,
         });
         assert!(
             grid_scene
@@ -451,6 +463,13 @@ mod tests {
         assert!(
             grid_scene.icon_quads.iter().any(|q| q.name == "rust_dark"),
             "expected IntelliJ Rust SVG icon in grid"
+        );
+        assert!(
+            grid_scene
+                .drag_sources
+                .iter()
+                .any(|d| d.payload.insert_text == "Cargo.lock" && d.payload.icon == Some("lockFile_dark")),
+            "expected Cargo.lock to be draggable from ls grid"
         );
         assert!(
             !grid_scene.text_runs.iter().any(|t| t.text == "modified"),
@@ -469,11 +488,90 @@ mod tests {
             scroll_y: 0.0,
             cursor_visible: true,
             now_ns: 1_732_500_000_000_000_000,
+            zoom_pct: 100,
+            inline_titlebar: true,
+            drag: None,
         });
         assert!(table_scene.total_content_height > grid_scene.total_content_height);
         assert!(
             table_scene.text_runs.iter().any(|t| t.text == "modified"),
             "detailed table view should render column headers"
+        );
+        assert!(
+            table_scene
+                .drag_sources
+                .iter()
+                .any(|d| d.payload.insert_text == "Cargo.lock"),
+            "expected Cargo.lock to be draggable from ls table"
+        );
+    }
+
+    #[test]
+    fn undo_redo_abbreviations_ghost_completion_and_drag_drop_insert() {
+        use crate::editor::{CompletionKind, parse_nuon_abbreviations};
+
+        let alloc = Alloc::global();
+        let state = EngineState::new("/tmp", &[], alloc);
+        let mut ed = Editor::new();
+
+        // 1. Undo/redo (`Cmd+Z` / `Cmd+Shift+Z`) coalesces word typing and restores drops.
+        for ch in "open".chars() {
+            ed.insert_char(ch);
+        }
+        ed.insert_char(' ');
+        ed.insert_dropped_token("Cargo.lock");
+        assert_eq!(ed.text, "open Cargo.lock ");
+        assert!(ed.undo());
+        assert_eq!(ed.text, "open ");
+        assert!(ed.redo());
+        assert_eq!(ed.text, "open Cargo.lock ");
+
+        // Dropped paths with spaces are auto-quoted.
+        ed.insert_dropped_token("my notes.md");
+        assert_eq!(ed.text, "open Cargo.lock \"my notes.md\" ");
+
+        // 2. Command-position abbreviations (`l` -> `ls`, `ls | sb` -> `ls | sort-by`) + undo.
+        ed.clear_line();
+        ed.insert_str("l");
+        assert!(ed.try_expand_abbreviation());
+        assert_eq!(ed.text, "ls");
+        assert!(ed.undo());
+        assert_eq!(ed.text, "l");
+
+        ed.set_text("ls | sb".to_owned());
+        assert!(ed.try_expand_abbreviation());
+        assert_eq!(ed.text, "ls | sort-by");
+
+        // Argument position must NOT expand abbreviations (`open l` keeps `l`).
+        ed.set_text("open l".to_owned());
+        assert!(!ed.try_expand_abbreviation());
+        assert_eq!(ed.text, "open l");
+
+        // Parse Nushell `abbreviations.nuon` format.
+        let parsed = parse_nuon_abbreviations("# comment\n{\n  \"gs\": \"git status\"\n  \"l\": \"ls\"\n}\n");
+        assert_eq!(parsed, vec![("gs".to_owned(), "git status".to_owned()), ("l".to_owned(), "ls".to_owned())]);
+
+        // 3. Fish-style inline ghost autosuggestion (word-by-word and full accept).
+        ed.push_history("ls crates/blaze-sh/src | sort-by size -r".to_owned());
+        ed.set_text("ls cra".to_owned());
+        ed.refresh_assist(&state, &[], false);
+        assert_eq!(
+            ed.ghost.as_deref(),
+            Some("tes/blaze-sh/src | sort-by size -r")
+        );
+        assert!(ed.accept_ghost_word());
+        assert_eq!(ed.text, "ls crates");
+        assert!(ed.accept_ghost_full());
+        assert_eq!(ed.text, "ls crates/blaze-sh/src | sort-by size -r");
+
+        // 4. Column-aware IntelliJ completion after `ls | sort-by `.
+        ed.set_text("ls | sort-by ".to_owned());
+        ed.refresh_assist(&state, &[], true);
+        assert!(
+            ed.completions
+                .iter()
+                .any(|c| c.label == "modified" && c.kind == CompletionKind::Column),
+            "expected column-aware completion for `ls | sort-by `"
         );
     }
 }

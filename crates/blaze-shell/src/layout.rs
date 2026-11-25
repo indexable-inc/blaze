@@ -19,11 +19,12 @@ use crate::prompt::PromptInfo;
 use crate::svg_icons::icon_name_for_file;
 use crate::theme;
 use crate::view::{
-    CellMetrics, HitAction, HitRect, Scene, format_duration_ms, format_value_cell_at,
-    is_expandable_cell, truncate_chars, wrap_lines,
+    ActiveDrag, CellMetrics, DragPayload, HitAction, HitRect, Scene, format_duration_ms,
+    format_value_cell_at, is_expandable_cell, truncate_chars, wrap_lines,
 };
 
-const TOP_BAR_H: f32 = 36.0;
+pub const TOP_BAR_H: f32 = 38.0;
+const TRAFFIC_LIGHTS_PAD: f32 = 82.0;
 const OUTER_PAD_X: f32 = 28.0;
 const BLOCK_PAD_Y: f32 = 16.0;
 const TABLE_ROW_PAD_Y: f32 = 4.5;
@@ -42,6 +43,12 @@ pub struct LayoutInput<'a> {
     pub cursor_visible: bool,
     /// Current UTC timestamp in nanoseconds for human relative time formatting (`3m ago`).
     pub now_ns: i64,
+    /// Current UI zoom percentage (100 = default `13pt`).
+    pub zoom_pct: u16,
+    /// True when the top bar sits inline inside macOS's `FullSizeContentView` titlebar.
+    pub inline_titlebar: bool,
+    /// In-flight drag-and-drop payload and pointer position, if any.
+    pub drag: Option<&'a ActiveDrag>,
 }
 
 /// Lay out the full `ix.dev/blaze`-styled shell interface.
@@ -113,10 +120,18 @@ pub fn build_scene(input: &LayoutInput<'_>) -> Scene {
     }
     scene.total_content_height = content_y + 14.0;
 
-    // 4. Minimal top branch strip (clip 0).
-    layout_top_bar(&mut scene, input.store, vw, m);
+    // 4. Unified inline macOS titlebar (branch tabs, cwd/git pill, zoom, fork button).
+    layout_top_bar(
+        &mut scene,
+        input.store,
+        input.prompt,
+        vw,
+        m,
+        input.zoom_pct,
+        input.inline_titlebar,
+    );
 
-    // 5. Sleek `ix.dev/blaze` bottom composer (clip 0).
+    // 5. Sleek Starship + `ix.dev/blaze` bottom composer (clip 0).
     layout_composer(
         &mut scene,
         input.editor,
@@ -127,38 +142,103 @@ pub fn build_scene(input: &LayoutInput<'_>) -> Scene {
         box_h,
         m,
         input.cursor_visible,
+        input.drag,
     );
 
-    // 6. Floating overlays (completion popup and Ctrl+R reverse search).
+    // 6. Floating overlays (IntelliJ completion popup, Ctrl+R reverse search, drag chip).
     if let Some(rs) = &input.editor.reverse_search {
         layout_reverse_search_overlay(&mut scene, rs, col_x0, input_top_y - 8.0, col_x1, m);
     } else if !input.editor.completions.is_empty() {
         layout_completion_popup(&mut scene, input.editor, col_x0, input_top_y - 8.0, col_x1, m);
     }
+    if let Some(drag) = input.drag {
+        layout_drag_overlay(&mut scene, drag, m);
+    }
 
     scene
 }
 
-fn layout_top_bar(scene: &mut Scene, store: &BlockStore, vw: f32, m: CellMetrics) {
+fn layout_top_bar(
+    scene: &mut Scene,
+    store: &BlockStore,
+    prompt: &PromptInfo,
+    vw: f32,
+    m: CellMetrics,
+    zoom_pct: u16,
+    inline_titlebar: bool,
+) {
     scene.round_rect(0.0, 0.0, vw, TOP_BAR_H, 0.0, theme::BG_TOPBAR, 0.0, [0.0; 4], 0);
     scene.line(0.0, TOP_BAR_H - 0.5, vw, TOP_BAR_H - 0.5, 1.0, theme::LINE, 0);
 
     let mid_y = (TOP_BAR_H - m.ch) * 0.5;
     let icon_s = 11.5;
     let icon_y = (TOP_BAR_H - icon_s) * 0.5;
-    let mut x = OUTER_PAD_X;
+    let mut x = if inline_titlebar { TRAFFIC_LIGHTS_PAD } else { OUTER_PAD_X };
 
-    // Right-aligned minimal `fork` button with branch icon (subtle bordered pill like `Copy`).
+    // Right-aligned inline controls inside the titlebar: `fork`, optional zoom badge, cwd/git chip.
+    let mut rx = vw - 16.0;
     let fork_label = "fork";
-    let fork_w = icon_s + 6.0 + fork_label.len() as f32 * m.cw + 18.0;
-    let fork_x1 = vw - OUTER_PAD_X;
-    let fork_x0 = (fork_x1 - fork_w).max(x + 20.0);
-    let btn_y0 = 6.0;
-    let btn_y1 = TOP_BAR_H - 6.0;
-    scene.round_rect(fork_x0, btn_y0, fork_x1, btn_y1, 6.0, theme::BG_CHIP, 1.0, theme::LINE, 0);
+    let fork_w = icon_s + 6.0 + fork_label.len() as f32 * m.cw + 16.0;
+    let fork_x0 = (rx - fork_w).max(x + 20.0);
+    let btn_y0 = 7.0;
+    let btn_y1 = TOP_BAR_H - 7.0;
+    scene.round_rect(fork_x0, btn_y0, rx, btn_y1, 6.0, theme::BG_CHIP, 1.0, theme::LINE, 0);
     draw_icon(scene, Icon::Branch, fork_x0 + 8.0, icon_y, icon_s, theme::INK_3, 0);
-    scene.text(fork_x0 + 8.0 + icon_s + 6.0, mid_y, fork_label, theme::INK_2, false, false, 0);
-    scene.push_hit(HitRect::new(fork_x0, btn_y0, fork_x1, btn_y1), HitAction::ForkActiveBranch);
+    scene.text(fork_x0 + 8.0 + icon_s + 5.0, mid_y, fork_label, theme::INK_2, false, false, 0);
+    scene.push_hit(HitRect::new(fork_x0, btn_y0, rx, btn_y1), HitAction::ForkActiveBranch);
+    rx = fork_x0 - 10.0;
+
+    // Quiet clickable zoom pill when zoomed in/out (`Cmd+`/`Cmd-`; click or `Cmd+0` to reset).
+    if zoom_pct != 100 {
+        let z_lbl = format!("{zoom_pct}%");
+        let z_w = z_lbl.len() as f32 * m.cw + 14.0;
+        let zx0 = (rx - z_w).max(x + 20.0);
+        if zx0 > x + 60.0 {
+            scene.round_rect(zx0, btn_y0, rx, btn_y1, 6.0, theme::BG_CHIP, 1.0, theme::LINE, 0);
+            scene.text(zx0 + 7.0, mid_y, z_lbl, theme::INK_3, false, false, 0);
+            scene.push_hit(HitRect::new(zx0, btn_y0, rx, btn_y1), HitAction::ResetZoom);
+            rx = zx0 - 10.0;
+        }
+    }
+
+    // Inline repo/directory + branch status badge tucked cleanly on the right of the titlebar.
+    let dir_txt = truncate_chars(&prompt.dir_short, 24);
+    let branch_part = prompt.git_branch.as_deref().unwrap_or("");
+    let badge_part = prompt
+        .git_status
+        .as_ref()
+        .map(|s| s.status_badge.as_str())
+        .unwrap_or("");
+    let dir_icon_s = 13.0;
+    let mut info_w = dir_icon_s + 6.0 + dir_txt.chars().count() as f32 * m.cw;
+    if !branch_part.is_empty() {
+        info_w += 14.0 + icon_s + 5.0 + branch_part.chars().count() as f32 * m.cw;
+        if !badge_part.is_empty() {
+            info_w += 6.0 + badge_part.chars().count() as f32 * m.cw;
+        }
+    }
+    let info_x0 = rx - info_w - 8.0;
+    let tabs_limit = if info_x0 > x + 220.0 {
+        let mut ix = info_x0;
+        scene.svg_icon(ix, (TOP_BAR_H - dir_icon_s) * 0.5, dir_icon_s, "folder_macos", 0);
+        ix += dir_icon_s + 6.0;
+        scene.text(ix, mid_y, &dir_txt, theme::INK_2, false, false, 0);
+        ix += dir_txt.chars().count() as f32 * m.cw;
+        if !branch_part.is_empty() {
+            ix += 14.0;
+            draw_icon(scene, Icon::Branch, ix, icon_y, icon_s, theme::PROMPT_BRANCH, 0);
+            ix += icon_s + 5.0;
+            scene.text(ix, mid_y, branch_part, theme::PROMPT_BRANCH, false, false, 0);
+            ix += branch_part.chars().count() as f32 * m.cw;
+            if !badge_part.is_empty() {
+                ix += 6.0;
+                scene.text(ix, mid_y, badge_part, theme::PROMPT_STATUS, false, false, 0);
+            }
+        }
+        info_x0 - 18.0
+    } else {
+        rx - 12.0
+    };
 
     // Clean minimal underline tabs with branch icons; active tab carries the one `--fire` bar.
     let active_id = store.active_branch_id();
@@ -169,7 +249,7 @@ fn layout_top_bar(scene: &mut Scene, store: &BlockStore, vw: f32, m: CellMetrics
         let name_w = name.chars().count() as f32 * m.cw;
         let count_w = count_str.chars().count() as f32 * m.cw;
         let tab_w = icon_s + 6.0 + name_w + count_w;
-        if x + tab_w > fork_x0 - 16.0 {
+        if x + tab_w > tabs_limit {
             break;
         }
         let icon_col = if is_active { theme::FIRE } else { theme::INK_4 };
@@ -185,7 +265,67 @@ fn layout_top_bar(scene: &mut Scene, store: &BlockStore, vw: f32, m: CellMetrics
             HitRect::new(x - 4.0, 0.0, x + tab_w + 4.0, TOP_BAR_H),
             HitAction::SwitchBranch(branch.id),
         );
-        x += tab_w + 22.0;
+        x += tab_w + 20.0;
+    }
+}
+
+/// Draw a Starship-style context line (`folder  dir on  branch [?] ✦`) using `blaze-git` status.
+#[allow(clippy::too_many_arguments)]
+fn layout_starship_line(
+    scene: &mut Scene,
+    prompt: &PromptInfo,
+    x0: f32,
+    y: f32,
+    max_w: f32,
+    m: CellMetrics,
+    clip_id: u32,
+) {
+    let icon_s = 13.5;
+    let mut cx = x0;
+    let iy = y + (m.ch - icon_s) * 0.5;
+    scene.svg_icon(cx, iy, icon_s, "folder_macos", clip_id);
+    cx += icon_s + 6.0;
+
+    let max_dir = ((max_w * 0.45) / m.cw).floor().max(12.0) as usize;
+    let dir_lbl = truncate_chars(
+        if prompt.dir_short.is_empty() { &prompt.cwd_display } else { &prompt.dir_short },
+        max_dir,
+    );
+    scene.text(cx, y, &dir_lbl, theme::PROMPT_DIR, true, false, clip_id);
+    cx += dir_lbl.chars().count() as f32 * m.cw;
+
+    if let Some(branch) = &prompt.git_branch {
+        scene.text(cx, y, " on ", theme::INK_3, false, false, clip_id);
+        cx += 4.0 * m.cw;
+        let b_s = 12.0;
+        draw_icon(scene, Icon::Branch, cx, y + (m.ch - b_s) * 0.5, b_s, theme::PROMPT_BRANCH, clip_id);
+        cx += b_s + 4.0;
+
+        let branch_lbl = if prompt.git_detached {
+            format!("@{branch}")
+        } else {
+            branch.clone()
+        };
+        scene.text(cx, y, &branch_lbl, theme::PROMPT_BRANCH, true, false, clip_id);
+        cx += branch_lbl.chars().count() as f32 * m.cw;
+
+        if let Some(st) = &prompt.git_status {
+            if let Some(state_lbl) = &st.state_label {
+                let s_txt = format!(" ({state_lbl})");
+                scene.text(cx, y, &s_txt, theme::FIRE, true, false, clip_id);
+                cx += s_txt.chars().count() as f32 * m.cw;
+            }
+            if !st.status_badge.is_empty() {
+                cx += 0.8 * m.cw;
+                scene.text(cx, y, &st.status_badge, theme::PROMPT_STATUS, true, false, clip_id);
+                cx += st.status_badge.chars().count() as f32 * m.cw;
+            }
+        }
+    }
+
+    if prompt.in_rust_project || prompt.git_branch.is_some() {
+        cx += 0.9 * m.cw;
+        scene.text(cx, y, "✦", theme::PROMPT_SPARK, false, false, clip_id);
     }
 }
 
@@ -227,28 +367,10 @@ fn layout_block(
     now_ns: i64,
 ) -> f32 {
     let mut cur_y = y0;
-    let icon_s = 14.0;
 
-    // Quiet context line with crisp macOS blue folder & git-branch icons.
+    // Starship context line (`folder dir on  branch [?] ✦`) powered by `blaze-git`.
     if show_context {
-        let mut cx = x0;
-        let iy = cur_y + (m.ch - icon_s) * 0.5;
-        scene.svg_icon(cx, iy, icon_s, "folder_macos", clip_id);
-        cx += icon_s + 7.0;
-        let max_cwd = (((x1 - x0) * 0.55) / m.cw).floor().max(16.0) as usize;
-        let cwd_lbl = truncate_chars(&block.prompt_snapshot.cwd_display, max_cwd);
-        scene.text(cx, cur_y, &cwd_lbl, theme::INK_3, false, false, clip_id);
-        cx += cwd_lbl.chars().count() as f32 * m.cw;
-
-        if let Some(branch) = &block.prompt_snapshot.git_branch {
-            let dirty = block.prompt_snapshot.git_dirty.map(|d| d.dirty).unwrap_or(false);
-            cx += 16.0;
-            let bcol = if dirty { theme::FIRE } else { theme::INK_4 };
-            draw_icon(scene, Icon::Branch, cx, cur_y + (m.ch - 11.0) * 0.5, 11.0, bcol, clip_id);
-            cx += 16.0;
-            let git_lbl = if dirty { format!("{branch}*") } else { branch.clone() };
-            scene.text(cx, cur_y, git_lbl, theme::INK_3, false, false, clip_id);
-        }
+        layout_starship_line(scene, &block.prompt_snapshot, x0, cur_y, x1 - x0, m, clip_id);
         cur_y += m.ch + 8.0;
     }
 
@@ -299,14 +421,14 @@ fn layout_block(
         rx -= w + 12.0;
     }
 
-    // Command row: `$` prompt matching `ix.dev/blaze` (`$ curl ... | sh`) + command source.
+    // Command row: Starship `❯` prompt + syntax-highlighted command source.
     let prompt_col = match &block.body {
         BlockBody::Error { .. } | BlockBody::Value(Value::Error(_)) => theme::DANGER,
         BlockBody::RustCell { .. } => theme::FIRE,
         _ if block.exit_code != 0 => theme::DANGER,
-        _ => theme::INK_4,
+        _ => theme::PROMPT_OK,
     };
-    scene.text(x0, cur_y, "$", prompt_col, false, false, clip_id);
+    scene.text(x0, cur_y, "❯", prompt_col, true, false, clip_id);
 
     let cmd_x = x0 + 2.2 * m.cw;
     let cmd_max_x = (rx - 8.0).max(cmd_x + 100.0);
@@ -520,6 +642,37 @@ fn is_file_table(table: &Table<'_>) -> bool {
     false
 }
 
+/// If a block's command starts with `ls <dir>` (ignoring flags), return `<dir>` so dragging
+/// a file out of that listing inserts `<dir>/<name>` cleanly.
+fn resolve_block_dir_prefix(source: &str) -> Option<&str> {
+    let stage = source.split(['|', ';', '\n']).next()?.trim();
+    let mut parts = stage.split_whitespace();
+    if parts.next()? != "ls" {
+        return None;
+    }
+    for tok in parts {
+        if tok.starts_with('-') {
+            continue;
+        }
+        let cleaned = tok.trim_matches(|c| c == '"' || c == '\'').trim_end_matches('/');
+        if !cleaned.is_empty() && cleaned != "." {
+            return Some(cleaned);
+        }
+    }
+    None
+}
+
+fn drag_path_for_entry(block_source: &str, entry_name: &str) -> String {
+    if entry_name.contains('/') || entry_name.starts_with('~') {
+        return entry_name.to_owned();
+    }
+    if let Some(dir) = resolve_block_dir_prefix(block_source) {
+        format!("{dir}/{entry_name}")
+    } else {
+        entry_name.to_owned()
+    }
+}
+
 /// Compact `eza --grid`-style multi-column file & directory view using authentic macOS blue
 /// folders and IntelliJ New UI dark SVG icons — dense, instant scan, zero wasted height.
 #[allow(clippy::too_many_arguments)]
@@ -557,6 +710,7 @@ fn layout_file_grid(
 
     // Pre-collect display labels + SVG icon names.
     struct GridItem {
+        raw: String,
         label: String,
         icon: &'static str,
         is_dir: bool,
@@ -578,7 +732,7 @@ fn layout_file_grid(
         let icon = icon_name_for_file(raw, kind);
         let label_chars = label.chars().count().min(32);
         let w_px = icon_s + icon_gap + label_chars as f32 * m.cw;
-        items.push(GridItem { label, icon, is_dir, w_px });
+        items.push(GridItem { raw: raw.to_owned(), label, icon, is_dir, w_px });
     }
 
     // Pick the largest column count `ncols` (1..=6) whose column-major widths fit in `width`
@@ -617,9 +771,19 @@ fn layout_file_grid(
             if let Some(item) = items.get(idx) {
                 let max_ch = ((cw - icon_s - icon_gap).max(m.cw * 3.0) / m.cw).floor() as usize;
                 let txt = truncate_chars(&item.label, max_ch.max(3));
+                let item_w = icon_s + icon_gap + txt.chars().count() as f32 * m.cw;
                 scene.svg_icon(cx, iy, icon_s, item.icon, clip_id);
                 let col = if item.is_dir { theme::INK_1 } else { theme::INK_2 };
                 scene.text(cx + icon_s + icon_gap, ty, txt, col, false, false, clip_id);
+                scene.push_drag_source_clipped(
+                    HitRect::new(cx - 3.0, cur_y, cx + item_w + 4.0, cur_y + row_h),
+                    clip_id,
+                    DragPayload {
+                        label: item.label.clone(),
+                        insert_text: drag_path_for_entry(&block.source, &item.raw),
+                        icon: Some(item.icon),
+                    },
+                );
             }
             cx += cw + col_gap;
         }
@@ -864,29 +1028,48 @@ fn layout_table(
                                 let display_name = if is_dir && !raw_name.ends_with('/') {
                                     format!("{raw_name}/")
                                 } else {
-                                    raw_name
+                                    raw_name.clone()
                                 };
                                 let max_ch = ((content_w - icon_pad - 8.0) / m.cw).floor().max(3.0) as usize;
                                 let txt = truncate_chars(&display_name, max_ch);
+                                let chip_w = (icon_pad + txt.chars().count() as f32 * m.cw + 10.0)
+                                    .min(content_w + 2.0);
+                                let bx0 = rx - 5.0;
+                                let by0 = cur_y + 2.0;
+                                let by1 = cur_y + row_h - 2.0;
 
                                 // Sleek `ix.dev/blaze` inline chip for folders and `.rs` files.
                                 if is_dir || icon_name == "rust_dark" {
-                                    let chip_w = (icon_pad + txt.chars().count() as f32 * m.cw + 10.0)
-                                        .min(content_w + 2.0);
-                                    let bx0 = rx - 5.0;
-                                    let by0 = cur_y + 2.0;
-                                    let by1 = cur_y + row_h - 2.0;
                                     scene.round_rect(bx0, by0, bx0 + chip_w, by1, 4.0, theme::BG_CHIP, 0.0, [0.0; 4], clip_id);
                                 }
                                 scene.svg_icon(rx, iy, icon_s, icon_name, clip_id);
                                 scene.text(rx + icon_pad, ty, txt, theme::INK_1, false, false, clip_id);
+                                scene.push_drag_source_clipped(
+                                    HitRect::new(bx0, cur_y, bx0 + chip_w, cur_y + row_h),
+                                    clip_id,
+                                    DragPayload {
+                                        label: display_name,
+                                        insert_text: drag_path_for_entry(&block.source, &raw_name),
+                                        icon: Some(icon_name),
+                                    },
+                                );
                             }
                             ColDisplay::Crate => {
                                 let raw = format_value_cell_at(cell, Some(now_ns));
                                 let max_ch = ((content_w - icon_pad) / m.cw).floor().max(3.0) as usize;
                                 let txt = truncate_chars(&raw, max_ch);
+                                let item_w = icon_pad + txt.chars().count() as f32 * m.cw + 6.0;
                                 scene.svg_icon(rx, iy, icon_s, "rust_dark", clip_id);
                                 scene.text(rx + icon_pad, ty, txt, theme::INK_1, false, false, clip_id);
+                                scene.push_drag_source_clipped(
+                                    HitRect::new(rx - 4.0, cur_y, rx + item_w, cur_y + row_h),
+                                    clip_id,
+                                    DragPayload {
+                                        label: raw.clone(),
+                                        insert_text: raw,
+                                        icon: Some("rust_dark"),
+                                    },
+                                );
                             }
                             ColDisplay::Process => {
                                 let raw = format_value_cell_at(cell, Some(now_ns));
@@ -1515,8 +1698,8 @@ fn resolve_vt_color(c: VtColor, colors: &Colors, fallback: VtRgb, bold_bright: b
     }
 }
 
-/// Sleek `ix.dev/blaze` bottom composer: quiet path + git-branch label above a recessed
-/// rounded `$ ...` input bar (`#141415` fill, `1px solid #28282a`, `radius: 10px`).
+/// Sleek Starship + `ix.dev/blaze` bottom composer: `dir on  branch [?] ✦` above a
+/// recessed rounded `❯ ...` input bar with Fish ghost text and drag-drop highlight.
 #[allow(clippy::too_many_arguments)]
 fn layout_composer(
     scene: &mut Scene,
@@ -1528,9 +1711,11 @@ fn layout_composer(
     box_h: f32,
     m: CellMetrics,
     cursor_visible: bool,
+    drag: Option<&ActiveDrag>,
 ) {
     let trimmed = editor.text.trim_start();
     let is_rust_mode = trimmed.starts_with("rust") || trimmed.starts_with(":rs");
+    let drop_hover = drag.is_some_and(|d| d.over_composer);
 
     scene.round_rect(0.0, y0, vw, y1, 0.0, theme::BG_CANVAS, 0.0, [0.0; 4], 0);
     scene.line(0.0, y0 + 0.5, vw, y0 + 0.5, 1.0, theme::LINE_FAINT, 0);
@@ -1538,36 +1723,13 @@ fn layout_composer(
     let px = OUTER_PAD_X;
     let x1 = (vw - OUTER_PAD_X).max(px + 160.0);
     let label_y = y0 + 6.0;
-    let icon_s = 13.5;
 
-    // Quiet prompt metadata above the input box (matching `Install blaze · 13 MiB`).
-    let mut cx = px;
-    let iy = label_y + (m.ch - icon_s) * 0.5;
-    scene.svg_icon(cx, iy, icon_s, "folder_macos", 0);
-    cx += icon_s + 6.0;
-    let max_cwd = (((x1 - px) * 0.55) / m.cw).floor().max(16.0) as usize;
-    let cwd_lbl = truncate_chars(&prompt.cwd_display, max_cwd);
-    scene.text(cx, label_y, &cwd_lbl, theme::INK_3, false, false, 0);
-    cx += cwd_lbl.chars().count() as f32 * m.cw;
+    // Starship prompt line powered by `blaze-git`.
+    layout_starship_line(scene, prompt, px, label_y, (x1 - px) * 0.72, m, 0);
 
-    if let Some(branch) = &prompt.git_branch {
-        let dirty = prompt.git_dirty.map(|d| d.dirty).unwrap_or(false);
-        cx += 16.0;
-        let bcol = if dirty { theme::FIRE } else { theme::INK_4 };
-        draw_icon(scene, Icon::Branch, cx, iy + 0.5, icon_s - 0.5, bcol, 0);
-        cx += icon_s + 5.0;
-        let lbl = if prompt.git_detached {
-            format!("@{branch}")
-        } else if dirty {
-            format!("{branch}*")
-        } else {
-            branch.clone()
-        };
-        let txt_c = if dirty { theme::FIRE } else { theme::INK_3 };
-        scene.text(cx, label_y, lbl, txt_c, false, false, 0);
-    }
-
-    let right_txt = if is_rust_mode {
+    let right_txt = if drop_hover {
+        format!("drop `{}` to insert", drag.unwrap().payload.label)
+    } else if is_rust_mode {
         "rust · blaze run".to_owned()
     } else if prompt.last_exit != 0 {
         format!("exit {}  {}", prompt.last_exit, format_duration_ms(prompt.last_duration_ms))
@@ -1577,7 +1739,7 @@ fn layout_composer(
         String::new()
     };
     if !right_txt.is_empty() {
-        let right_col = if is_rust_mode {
+        let right_col = if drop_hover || is_rust_mode {
             theme::FIRE
         } else if prompt.last_exit != 0 {
             theme::DANGER
@@ -1591,8 +1753,17 @@ fn layout_composer(
     // Recessed rounded command box (`#141415` + `1px solid #28282a`, radius 10px).
     let box_y0 = y0 + 28.0;
     let box_y1 = (box_y0 + box_h).min(y1 - 12.0);
-    let box_border = if is_rust_mode { theme::FIRE } else { theme::LINE };
-    scene.round_rect(px, box_y0, x1, box_y1, 10.0, theme::BG_SURFACE, 1.0, box_border, 0);
+    let box_fill = if drop_hover { theme::BG_CHIP } else { theme::BG_SURFACE };
+    let box_border = if drop_hover || is_rust_mode {
+        theme::FIRE
+    } else if drag.is_some() {
+        theme::LINE_STRONG
+    } else {
+        theme::LINE
+    };
+    let border_w = if drop_hover { 1.5 } else { 1.0 };
+    scene.round_rect(px, box_y0, x1, box_y1, 10.0, box_fill, border_w, box_border, 0);
+    scene.composer_rect = HitRect::new(px, box_y0, x1, box_y1);
 
     let input_y = box_y0 + 11.0;
     let inner_x = px + 16.0;
@@ -1601,11 +1772,12 @@ fn layout_composer(
     } else if prompt.last_exit != 0 {
         theme::DANGER
     } else {
-        theme::INK_4
+        theme::PROMPT_OK
     };
-    scene.text(inner_x, input_y, "$", prompt_col, false, false, 0);
+    scene.text(inner_x, input_y, "❯", prompt_col, true, false, 0);
 
     let text_x = inner_x + 2.2 * m.cw;
+    scene.composer_text_origin = [text_x, input_y];
     let text_clip = scene.push_clip(text_x - 2.0, box_y0 + 2.0, x1 - 14.0, box_y1 - 2.0, 0.0);
     let line_step = m.ch + 4.0;
 
@@ -1640,17 +1812,32 @@ fn layout_composer(
     } else {
         let spans = editor.highlight_spans();
         layout_highlighted_source(scene, &editor.text, &spans, text_x, input_y, x1 - 16.0, m, text_clip);
+
+        // Fish/Nushell inline ghost autosuggestion directly after the cursor on single-line input.
+        if let Some(ghost) = &editor.ghost
+            && !editor.text.contains('\n')
+            && editor.cursor == editor.text.len()
+        {
+            let gx = text_x + editor.text.chars().count() as f32 * m.cw;
+            let avail_ch = ((x1 - 16.0 - gx) / m.cw).floor().max(0.0) as usize;
+            if avail_ch > 0 {
+                let gtxt = truncate_chars(ghost, avail_ch);
+                scene.text(gx, input_y, gtxt, theme::GHOST_INK, false, false, text_clip);
+            }
+        }
     }
 
     if cursor_visible {
         let (cline, ccol) = editor.cursor_line_col();
         let cur_x = text_x + ccol as f32 * m.cw;
         let cur_y = input_y + cline as f32 * line_step;
-        let cur_col = if is_rust_mode { theme::FIRE } else { theme::INK_1 };
+        let cur_col = if is_rust_mode || drop_hover { theme::FIRE } else { theme::INK_1 };
         scene.over_round_rect(cur_x, cur_y + 1.0, cur_x + 1.6, cur_y + m.ch - 1.0, 0.8, cur_col, text_clip);
     }
 }
 
+/// IntelliJ-style live autocomplete popup: Retina SVG file/folder icons, typed kind badges,
+/// matched-character highlighting, right-aligned type/size detail, and bottom Quick-Doc strip.
 fn layout_completion_popup(
     scene: &mut Scene,
     editor: &Editor,
@@ -1670,16 +1857,23 @@ fn layout_completion_popup(
         0
     };
     let row_h = m.ch + 8.0;
-    let popup_h = show as f32 * row_h + 12.0;
-    let popup_w = (x1 - x0).min(520.0);
+    let doc_h = m.ch + 12.0;
+    let popup_h = show as f32 * row_h + doc_h + 10.0;
+    let popup_w = (x1 - x0).min(560.0);
+
+    // Anchor horizontally near the active cursor token (clamped inside `[x0, x1 - popup_w]`).
+    let (_, ccol) = editor.cursor_line_col();
+    let desired_x = scene.composer_text_origin[0] + (ccol as f32 * m.cw) - 36.0;
+    let px0 = desired_x.clamp(x0, (x1 - popup_w).max(x0));
+    let px1 = px0 + popup_w;
     let py0 = (anchor_bottom_y - popup_h).max(TOP_BAR_H + 8.0);
     let py1 = py0 + popup_h;
 
-    scene.overlay_shadow(x0, py0 + 4.0, x0 + popup_w, py1 + 4.0, 8.0, 16.0, theme::SHADOW_SOFT, 0);
+    scene.overlay_shadow(px0, py0 + 4.0, px1, py1 + 4.0, 8.0, 18.0, theme::SHADOW_SOFT, 0);
     scene.overlay_round_rect(
-        x0,
+        px0,
         py0,
-        x0 + popup_w,
+        px1,
         py1,
         8.0,
         theme::BG_POPUP,
@@ -1688,16 +1882,17 @@ fn layout_completion_popup(
         0,
     );
 
-    let mut ry = py0 + 6.0;
+    let icon_s = 14.0;
+    let mut ry = py0 + 5.0;
     for offset in 0..show {
         let idx = win_start + offset;
         let item = &editor.completions[idx];
         let is_sel = idx == editor.completion_selected;
         if is_sel {
             scene.overlay_round_rect(
-                x0 + 5.0,
+                px0 + 5.0,
                 ry,
-                x0 + popup_w - 5.0,
+                px1 - 5.0,
                 ry + row_h,
                 5.0,
                 theme::BG_SELECTED,
@@ -1705,41 +1900,151 @@ fn layout_completion_popup(
                 [0.0; 4],
                 0,
             );
+            // Crisp left selection rail inside the selected row (IntelliJ style).
+            scene.overlay_round_rect(
+                px0 + 5.0,
+                ry + 4.0,
+                px0 + 7.0,
+                ry + row_h - 4.0,
+                1.0,
+                theme::FIRE,
+                0.0,
+                [0.0; 4],
+                0,
+            );
         }
-        let (tag, tag_col) = match item.kind {
-            CompletionKind::Builtin => ("cmd", theme::INK_3),
-            CompletionKind::Def => ("def", theme::FIRE),
-            CompletionKind::Keyword => ("kw ", theme::INK_3),
-            CompletionKind::Flag => ("flg", theme::INK_3),
-            CompletionKind::Variable => ("var", theme::INK_2),
-            CompletionKind::Dir => ("dir", theme::SERIES_BLUE),
-            CompletionKind::File => ("fil", theme::INK_3),
-        };
+
         let ty = ry + (row_h - m.ch) * 0.5;
-        scene.overlay_text_run(x0 + 12.0, ty, tag, tag_col, false, false, 0);
-        let label_x = x0 + 12.0 + 4.5 * m.cw;
-        let label_txt = truncate_chars(&item.label, 24);
+        let ix = px0 + 13.0;
+        let iy = ry + (row_h - icon_s) * 0.5;
+
+        if let Some(svg_name) = item.icon {
+            scene.overlay_svg_icon(ix, iy, icon_s, svg_name, 0);
+        } else {
+            let (glyph, bg_col, fg_col) = match item.kind {
+                CompletionKind::Abbrev => ("→", theme::FIRE_FAINT, theme::FIRE),
+                CompletionKind::Builtin => ("f", theme::rgba(0x39, 0x87, 0xe5, 0.16), theme::SERIES_BLUE),
+                CompletionKind::Def => ("λ", theme::FIRE_FAINT, theme::FIRE),
+                CompletionKind::Keyword => ("k", theme::rgba(0xc7, 0x9b, 0xf2, 0.16), theme::PROMPT_BRANCH),
+                CompletionKind::Flag => ("-", theme::BG_TRACK, theme::INK_3),
+                CompletionKind::Variable => ("$", theme::rgba(0x6e, 0xd8, 0xce, 0.16), theme::PROMPT_DIR),
+                CompletionKind::Column => ("▤", theme::rgba(0x7a, 0xd8, 0x96, 0.16), theme::PROMPT_OK),
+                CompletionKind::Dir => ("d", theme::rgba(0x39, 0x87, 0xe5, 0.16), theme::SERIES_BLUE),
+                CompletionKind::File => ("·", theme::BG_TRACK, theme::INK_3),
+                CompletionKind::External => ("›", theme::BG_TRACK, theme::INK_2),
+            };
+            scene.overlay_round_rect(ix, iy, ix + icon_s, iy + icon_s, 3.5, bg_col, 0.0, [0.0; 4], 0);
+            let gx = ix + (icon_s - m.cw) * 0.5;
+            scene.overlay_text_run(gx, ty, glyph, fg_col, true, false, 0);
+        }
+
+        // Right-aligned type / file-size detail.
+        let detail_txt = truncate_chars(&item.detail, 18);
+        let detail_w = detail_txt.chars().count() as f32 * m.cw;
+        let detail_x = px1 - 14.0 - detail_w;
         scene.overlay_text_run(
-            label_x,
+            detail_x,
             ty,
-            &label_txt,
-            if is_sel { theme::INK_1 } else { theme::INK_2 },
-            is_sel,
+            &detail_txt,
+            if is_sel { theme::INK_3 } else { theme::INK_4 },
+            false,
             false,
             0,
         );
 
-        let detail_x = x0 + 12.0 + 29.0 * m.cw;
-        let detail_max = ((x0 + popup_w - 12.0 - detail_x) / m.cw).floor().max(6.0) as usize;
-        let detail_txt = truncate_chars(&item.detail, detail_max);
-        scene.overlay_text_run(detail_x, ty, detail_txt, theme::INK_4, false, false, 0);
+        // Label with IntelliJ-style matched-character highlighting.
+        let label_x = ix + icon_s + 9.0;
+        let max_label_ch = ((detail_x - 14.0 - label_x) / m.cw).floor().max(6.0) as usize;
+        let label_txt = truncate_chars(&item.label, max_label_ch);
+        let base_col = if is_sel { theme::INK_1 } else { theme::INK_2 };
+
+        if item.match_indices.is_empty() {
+            scene.overlay_text_run(label_x, ty, &label_txt, base_col, is_sel, false, 0);
+        } else {
+            let mut run = String::new();
+            let mut run_start_col = 0usize;
+            let mut run_matched = false;
+            for (ci, ch) in label_txt.chars().enumerate() {
+                let matched = item.match_indices.contains(&ci);
+                if !run.is_empty() && matched != run_matched {
+                    let col = if run_matched { theme::MATCH_HIGHLIGHT } else { base_col };
+                    scene.overlay_text_run(
+                        label_x + run_start_col as f32 * m.cw,
+                        ty,
+                        core::mem::take(&mut run),
+                        col,
+                        run_matched || is_sel,
+                        false,
+                        0,
+                    );
+                    run_start_col = ci;
+                    run_matched = matched;
+                } else if run.is_empty() {
+                    run_start_col = ci;
+                    run_matched = matched;
+                }
+                run.push(ch);
+            }
+            if !run.is_empty() {
+                let col = if run_matched { theme::MATCH_HIGHLIGHT } else { base_col };
+                scene.overlay_text_run(
+                    label_x + run_start_col as f32 * m.cw,
+                    ty,
+                    run,
+                    col,
+                    run_matched || is_sel,
+                    false,
+                    0,
+                );
+            }
+        }
 
         scene.push_hit(
-            HitRect::new(x0 + 5.0, ry, x0 + popup_w - 5.0, ry + row_h),
+            HitRect::new(px0 + 5.0, ry, px1 - 5.0, ry + row_h),
             HitAction::SelectCompletion(idx),
         );
         ry += row_h;
     }
+
+    // Bottom IntelliJ Quick-Doc strip for the currently selected item.
+    let div_y = py1 - doc_h;
+    scene.overlay_line(px0 + 1.0, div_y, px1 - 1.0, div_y, 1.0, theme::LINE, 0);
+    let doc_ty = div_y + (doc_h - m.ch) * 0.5;
+    let hint = "↑↓  tab  esc";
+    let hint_w = hint.chars().count() as f32 * m.cw;
+    scene.overlay_text_run(px1 - 12.0 - hint_w, doc_ty, hint, theme::INK_4, false, false, 0);
+
+    if let Some(sel) = editor.completions.get(editor.completion_selected) {
+        let max_doc = ((px1 - 24.0 - hint_w - (px0 + 13.0)) / m.cw).floor().max(8.0) as usize;
+        let doc_txt = truncate_chars(&sel.doc, max_doc);
+        scene.overlay_text_run(px0 + 13.0, doc_ty, doc_txt, theme::INK_3, false, false, 0);
+    }
+}
+
+/// Floating pill rendered under the cursor while dragging a file/folder/crate into the hotbar.
+fn layout_drag_overlay(scene: &mut Scene, drag: &ActiveDrag, m: CellMetrics) {
+    let icon_s = 14.5;
+    let label = truncate_chars(&drag.payload.label, 34);
+    let text_w = label.chars().count() as f32 * m.cw;
+    let has_icon = drag.payload.icon.is_some();
+    let pad_x = 10.0;
+    let pill_w = pad_x * 2.0 + if has_icon { icon_s + 7.0 } else { 0.0 } + text_w;
+    let pill_h = m.ch + 10.0;
+    let x0 = drag.x + 12.0;
+    let y0 = (drag.y - pill_h * 0.5).max(TOP_BAR_H + 4.0);
+    let x1 = x0 + pill_w;
+    let y1 = y0 + pill_h;
+    let border = if drag.over_composer { theme::FIRE } else { theme::LINE_STRONG };
+
+    scene.overlay_shadow(x0, y0 + 3.0, x1, y1 + 3.0, 7.0, 14.0, theme::SHADOW_SOFT, 0);
+    scene.overlay_round_rect(x0, y0, x1, y1, 7.0, theme::BG_POPUP, 1.2, border, 0);
+
+    let mut cx = x0 + pad_x;
+    if let Some(svg_name) = drag.payload.icon {
+        scene.overlay_svg_icon(cx, y0 + (pill_h - icon_s) * 0.5, icon_s, svg_name, 0);
+        cx += icon_s + 7.0;
+    }
+    scene.overlay_text_run(cx, y0 + (pill_h - m.ch) * 0.5, label, theme::INK_1, false, false, 0);
 }
 
 fn layout_reverse_search_overlay(
