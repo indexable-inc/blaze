@@ -158,3 +158,57 @@ fn blzfpk04_compresses_small_and_large_rust_files_and_round_trips() {
     assert_eq!(view.read("src/large.rs", alloc).expect("read large").expect("some").bytes.as_slice(), large_rs.as_slice());
     assert_eq!(view.read("src/tiny.txt", alloc).expect("read tiny").expect("some").bytes.as_slice(), tiny);
 }
+
+#[test]
+fn submodule_entries_commit_to_tree_digest_and_fail_closed_on_reads() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let limits = crate::pack::Limits { most_files: 16, most_bytes: 1 << 20, most_path: 256 };
+    let oid_a = [0x11u8; 20];
+    let oid_b = [0x22u8; 20];
+
+    let build = |oid: [u8; 20]| {
+        let mut b = crate::pack::Builder::new(crate::pack::Kind::Git, [9u8; 32], limits, 128, alloc).expect("builder");
+        b.file("Cargo.toml", crate::Mode::File, b"[package]\nname = \"v8\"\n").expect("manifest");
+        b.file("src/lib.rs", crate::Mode::File, b"pub fn ok() {}\n").expect("lib");
+        b.file("v8", crate::Mode::Submodule, &oid).expect("submodule");
+        b.file("third_party/icu", crate::Mode::Submodule, &oid).expect("nested submodule");
+        b.finish().expect("finish")
+    };
+
+    let rec_a = build(oid_a);
+    let rec_b = build(oid_b);
+    let view_a = crate::PackView::open(rec_a.as_slice()).expect("open a");
+    let view_b = crate::PackView::open(rec_b.as_slice()).expect("open b");
+    assert_ne!(view_a.tree(), view_b.tree(), "changing a submodule commit OID must change the tree listing digest");
+
+    // Normal files still read cleanly; prefix-similar non-submodule paths return Ok(None).
+    assert_eq!(view_a.read("src/lib.rs", alloc).expect("read lib").expect("some").bytes.as_slice(), b"pub fn ok() {}\n");
+    assert!(view_a.read("v8_extra/foo.rs", alloc).expect("not under v8").is_none());
+    assert!(view_a.read("missing.rs", alloc).expect("missing").is_none());
+
+    // Metadata lookup exposes the submodule's pinned commit OID cleanly.
+    let sub_entry = view_a.find_entry("v8").expect("v8 entry");
+    assert_eq!(sub_entry.mode, crate::Mode::Submodule);
+    assert_eq!(sub_entry.codec, crate::Codec::Raw);
+    assert_eq!(sub_entry.submodule_commit(), Some(oid_a));
+
+    // Reads at or beneath a recorded submodule fail closed naming path, submodule, and commit OID.
+    for (bad_path, want_sub) in [("v8", "v8"), ("v8/src/lib.rs", "v8"), ("third_party/icu/Cargo.toml", "third_party/icu")] {
+        let err = view_a.read(bad_path, alloc).expect_err("must fail closed");
+        assert_eq!(
+            err,
+            crate::PackRefused::Submodule {
+                path: crate::unpack::Cut::of(bad_path.as_bytes()),
+                submodule: crate::unpack::Cut::of(want_sub.as_bytes()),
+                commit: oid_a,
+            }
+        );
+    }
+    let idx = view_a.find_index("v8").expect("v8 index");
+    assert!(matches!(view_a.read_at(idx, alloc), Err(crate::PackRefused::Submodule { .. })));
+
+    // Submodule payload that is not 20 bytes is refused.
+    let mut bad = crate::pack::Builder::new(crate::pack::Kind::Git, [9u8; 32], limits, 64, alloc).expect("builder");
+    bad.file("v8", crate::Mode::Submodule, b"short").expect("begin");
+    assert!(matches!(bad.finish(), Err(crate::PackRefused::Form { .. })));
+}

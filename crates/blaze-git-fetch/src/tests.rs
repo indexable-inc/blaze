@@ -375,7 +375,7 @@ fn read_back(
     let mut index = PlantedIndex::new_planted(&built.pack, pack, heap(), plant).map_err(ReadBack::Pack)?;
     let mut listed = StdVec::new();
     files(&mut index, built.commit, tree, heap(), |file| {
-        listed.push((file.path.to_string(), file.mode, file.object));
+        listed.push((file.path.to_string(), file.mode, file.object.expect("blob")));
     })
     .map_err(ReadBack::Tree)?;
     let mut got = BTreeMap::new();
@@ -842,8 +842,37 @@ fn names_that_leave_the_checkout_are_refused() {
     for name in [&b".."[..], b".", b".git", b".GIT", b"a\\b", b"", b"\xff"] {
         assert_eq!(walk(name, 0o100644, NoPlant), Err(TreeWhy::Name), "{name:?}");
     }
-    assert_eq!(walk(b"sub", 0o160000, NoPlant), Err(TreeWhy::Submodule));
+    assert_eq!(walk(b"sub", 0o160000, NoPlant), Ok(1));
+    assert_eq!(walk(b"..", 0o160000, NoPlant), Err(TreeWhy::Name));
     assert_eq!(walk(b"odd", 0o100600, NoPlant), Err(TreeWhy::Mode { mode: 0o100600 }));
+}
+
+#[test]
+fn gitlink_submodule_is_reported_with_pinned_oid_and_no_blob() {
+    // Submodule commit OID is NOT present as an object in the parent packfile.
+    let sub_commit = Oid([0xab; 20]);
+    let mut tree = b"160000 third_party/v8\0".to_vec();
+    // Put it inside a directory so we test nested submodule paths cleanly.
+    let _ = tree.drain(..);
+    tree.extend_from_slice(b"160000 v8\0");
+    tree.extend_from_slice(&sub_commit.0);
+    let mut root = b"40000 third_party\0".to_vec();
+    root.extend_from_slice(&Oid::of(Kind::Tree, &tree).0);
+    let commit = format!("tree {}\n\nm\n", Oid::of(Kind::Tree, &root)).into_bytes();
+    let commit_oid = Oid::of(Kind::Commit, &commit);
+    let objects = vec![
+        (Kind::Tree, tree, How::Whole),
+        (Kind::Tree, root, How::Whole),
+        (Kind::Commit, commit, How::Whole),
+    ];
+    let pack = write_pack(&objects, &[StdVec::new(), StdVec::new(), StdVec::new()], &[false; 3]);
+    let mut index = PlantedIndex::new_planted(&pack, PACK, heap(), NoPlant).expect("read");
+    let mut seen = StdVec::new();
+    files(&mut index, commit_oid, TREE, heap(), |file| {
+        seen.push((file.path.to_string(), file.mode, file.oid, file.object));
+    })
+    .expect("walk with gitlink");
+    assert_eq!(seen, vec![("third_party/v8".to_string(), Mode::Submodule, sub_commit, None)]);
 }
 
 /// The invariant of the name `..`.

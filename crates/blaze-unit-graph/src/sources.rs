@@ -419,6 +419,9 @@ fn member_version<'m>(m: &'m blaze_manifest::layout::Member<'_>) -> &'m str {
 fn scan<'a>(view: &PackView<'_>, package: &str, version: &Text<'a>, alloc: Alloc<'a>) -> Result<AVec<'a, (Text<'a>, Text<'a>)>, SourceError<'a>> {
     let mut out = Vec::new_in(alloc);
     for entry in view.entries() {
+        if entry.mode == blaze_fetch::Mode::Submodule {
+            continue;
+        }
         let dir = match entry.path {
             "Cargo.toml" => "",
             path => match path.strip_suffix("/Cargo.toml") {
@@ -493,11 +496,11 @@ fn listing<'v, 'a>(view: &PackView<'v>, dir: &str, alloc: Alloc<'a>) -> Option<A
     }
     let mut entries: AVec<'a, Entry<'v>> = Vec::new_in(alloc);
     for at in lo..view.len() {
-        let path = view.entry(at).path;
-        let Some(rest) = path.strip_prefix(prefix.as_str()) else { break };
+        let entry = view.entry(at);
+        let Some(rest) = entry.path.strip_prefix(prefix.as_str()) else { break };
         let (name, is_dir) = match rest.find('/') {
             Some(cut) => (&rest[..cut], true),
-            None => (rest, false),
+            None => (rest, entry.mode == blaze_fetch::Mode::Submodule),
         };
         if entries.last().is_some_and(|e| e.name == name) {
             continue;

@@ -56,6 +56,7 @@ pub fn sandbox_files(at: PackageAt<'_>) -> Files {
             }
             let listed: Vec<(String, ListedBytes)> = view
                 .entries()
+                .filter(|entry| entry.mode != blaze_fetch::Mode::Submodule)
                 .filter_map(|entry| {
                     let rel = entry.path.strip_prefix(prefix.as_str())?;
                     let bytes = match entry.read_in(alloc).ok()? {

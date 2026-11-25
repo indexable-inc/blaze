@@ -39,6 +39,8 @@ pub enum Kind {
     File,
     Exec,
     Link,
+    /// A git submodule (gitlink, mode `0o160000`): its bytes are its 20-byte pinned commit SHA-1.
+    Submodule,
 }
 
 impl Kind {
@@ -47,11 +49,12 @@ impl Kind {
             Kind::File => "file",
             Kind::Exec => "exec",
             Kind::Link => "link",
+            Kind::Submodule => "submodule",
         }
     }
 
     fn named(name: &str) -> Option<Kind> {
-        [Kind::File, Kind::Exec, Kind::Link].into_iter().find(|it| it.name() == name)
+        [Kind::File, Kind::Exec, Kind::Link, Kind::Submodule].into_iter().find(|it| it.name() == name)
     }
 }
 
@@ -230,7 +233,7 @@ pub fn parse(bytes: &[u8]) -> Result<Vec<Entry>, TreeRefused> {
         let kind = parts
             .next()
             .and_then(Kind::named)
-            .ok_or(refused("has no kind of file, exec or link"))?;
+            .ok_or(refused("has no kind of file, exec, link or submodule"))?;
         let hex = parts.next().ok_or(refused("has no BLAKE3"))?;
         let blake3 = blaze_format::hex::decode_lower::<32>(hex)
             .ok_or(refused("has no lower-case BLAKE3 of 64 digits"))?;
