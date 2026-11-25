@@ -23,7 +23,12 @@ use blaze_proc_macro::{
 };
 use bstd::{mem::Bytes, mem::TASK_FRAME, path::Path as BPath};
 
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 const TARGET: &str = "aarch64-apple-darwin";
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+const TARGET: &str = "x86_64-unknown-linux-gnu";
+#[cfg(not(any(all(target_arch = "aarch64", target_os = "macos"), all(target_arch = "x86_64", target_os = "linux"))))]
+const TARGET: &str = "unsupported-host";
 
 fn hex(bytes: &[u8]) -> std::string::String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -49,9 +54,17 @@ fn main() -> ExitCode {
     let frame = blaze_mem::Frame::with_reserve(1 << 36, blaze_mem::Tag::Usercode).expect("the entry's frame");
     let erased = blaze_own::Erased::new(&frame);
     let alloc: Alloc<'_> = erased.handle();
-    let settings = std::string::String::from_utf8(read(sdk, "SDKSettings.json")).expect("a UTF-8 SDKSettings.json");
-    let sdk_version = blaze_proc_macro::native_unit::sdk_version(&settings).expect("SDKSettings.json's Version");
-    let sysroot_key = format!("macos-sdk {sdk_version}");
+    // The sysroot's key: the SDK's version on macOS, the pinned sysroot folder's name (its
+    // pin's SHA-256) on Linux.
+    let sysroot_key = if TARGET.ends_with("-apple-darwin") {
+        let settings = std::string::String::from_utf8(read(sdk, "SDKSettings.json")).expect("a UTF-8 SDKSettings.json");
+        let sdk_version = blaze_proc_macro::native_unit::sdk_version(&settings).expect("SDKSettings.json's Version");
+        format!("macos-sdk {sdk_version}")
+    } else {
+        let name = sdk.rsplit('/').next().expect("the sysroot folder's name");
+        assert!(name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit()), "{sdk}: the pinned sysroot folder is not named by its pin's SHA-256");
+        format!("pinned-sysroot {name}")
+    };
     let (script_dir, script_name) = script.rsplit_once('/').expect("an absolute script path");
     let module = {
         let mut sha = blaze_sha256::Sha256::new();
@@ -70,7 +83,7 @@ fn main() -> ExitCode {
     let package = PackageFacts { name, version, links, ..PackageFacts::default() };
     // The target's cfg as the pinned nightly states it for aarch64-apple-darwin (the real path
     // takes it from the world: script_unit.rs's `serves.cfg`); `CARGO_CFG_*` comes from it.
-    let pairs: [(&str, Option<&str>); 13] = [
+    let apple: [(&str, Option<&str>); 13] = [
         ("debug_assertions", None),
         ("panic", Some("unwind")),
         ("target_abi", Some("")),
@@ -85,6 +98,21 @@ fn main() -> ExitCode {
         ("target_vendor", Some("apple")),
         ("unix", None),
     ];
+    let linux: [(&str, Option<&str>); 12] = [
+        ("debug_assertions", None),
+        ("panic", Some("unwind")),
+        ("target_abi", Some("")),
+        ("target_arch", Some("x86_64")),
+        ("target_endian", Some("little")),
+        ("target_env", Some("gnu")),
+        ("target_family", Some("unix")),
+        ("target_feature", Some("sse2")),
+        ("target_os", Some("linux")),
+        ("target_pointer_width", Some("64")),
+        ("target_has_atomic", Some("64")),
+        ("unix", None),
+    ];
+    let pairs: &[(&str, Option<&str>)] = if TARGET.ends_with("-apple-darwin") { &apple } else { &linux };
     let cfg: std::vec::Vec<blaze_unit_graph::CfgAtom<'_>> = pairs
         .iter()
         .map(|(n, v)| match v {
@@ -146,6 +174,7 @@ fn main() -> ExitCode {
     for (pass, package_dir, out_dir) in [("A", pkg_a, out_a), ("B", pkg_b, out_b)] {
         let c = CInputs {
             shelf: Shelf { dir: shelf, clang_major: blaze_build_script::toolchain::clang_major(blaze_pins::CLANG_JSON).unwrap_or_else(|e| panic!("{e}")) },
+            target: TARGET,
             sysroot: sdk,
             out_dir,
             package: package_dir,
