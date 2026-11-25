@@ -87,6 +87,7 @@ mod macos_app {
     use blaze_shell::pty::{Pty, Read as PtyRead};
     use blaze_shell::render::{FrameDraw, PIXEL_FORMAT, Renderer};
     use blaze_shell::rust_cell;
+    use blaze_shell::svg_icons::IconAtlas;
     use blaze_shell::view::{HitAction, Scene};
 
     const FONT_POINTS: f64 = 13.0;
@@ -325,7 +326,7 @@ mod macos_app {
         }
 
         fn populate_demo(&mut self, cols: u16, rows: u16, cell_px: (u32, u32), scroll_bottom: bool) {
-            self.submit_command("ls | take 7", cols, rows, cell_px);
+            self.submit_command("ls", cols, rows, cell_px);
             self.submit_command("ls crates/blaze-sh/src | sort-by size -r | take 5", cols, rows, cell_px);
             self.submit_command("sys", cols, rows, cell_px);
 
@@ -444,6 +445,7 @@ mod macos_app {
 
         let mut scale = window.backingScaleFactor().max(1.0);
         let mut fonts = Fonts::new(FONT_POINTS, scale);
+        let mut icon_atlas = IconAtlas::new(scale);
         let mut size = view.bounds().size;
         layer.setContentsScale(scale);
         layer.setDrawableSize(NSSize::new(size.width * scale, size.height * scale));
@@ -490,6 +492,10 @@ mod macos_app {
             for (slot, bytes) in fonts.pending.drain(..) {
                 renderer.upload(slot, &bytes);
             }
+            let icons = icon_atlas.rasterize_quads(&scene.icon_quads);
+            for (slot, rgba) in icon_atlas.pending.drain(..) {
+                renderer.upload_icon(slot, &rgba);
+            }
             let vp = ViewportUniform {
                 size: [size.width as f32, size.height as f32],
                 dpr: scale as f32,
@@ -501,6 +507,7 @@ mod macos_app {
                 clips: &scene.clips,
                 rects: &scene.rects,
                 glyphs: &glyphs,
+                icons: &icons,
                 over_rects: &scene.over_rects,
                 overlay_rects: &scene.overlay_rects,
                 overlay_glyphs: &overlay_glyphs,
@@ -802,6 +809,10 @@ mod macos_app {
                                             shell.store.toggle_fold(block_id);
                                             dirty = true;
                                         }
+                                        HitAction::ToggleTableView(block_id) => {
+                                            shell.store.toggle_table_view(block_id);
+                                            dirty = true;
+                                        }
                                         HitAction::ToggleExpandCell { block, row, col } => {
                                             shell.store.toggle_expand_cell(block, row, col);
                                             dirty = true;
@@ -901,6 +912,7 @@ mod macos_app {
             if new_size != size || (new_scale - scale).abs() > f64::EPSILON {
                 if (new_scale - scale).abs() > f64::EPSILON {
                     fonts = Fonts::new(FONT_POINTS, new_scale);
+                    icon_atlas = IconAtlas::new(new_scale);
                     scale = new_scale;
                     layer.setContentsScale(scale);
                 }
@@ -986,6 +998,10 @@ mod macos_app {
                 for (slot, bytes) in fonts.pending.drain(..) {
                     renderer.upload(slot, &bytes);
                 }
+                let icons = icon_atlas.rasterize_quads(&scene.icon_quads);
+                for (slot, rgba) in icon_atlas.pending.drain(..) {
+                    renderer.upload_icon(slot, &rgba);
+                }
                 let vp = ViewportUniform {
                     size: [size.width as f32, size.height as f32],
                     dpr: scale as f32,
@@ -997,6 +1013,7 @@ mod macos_app {
                     clips: &scene.clips,
                     rects: &scene.rects,
                     glyphs: &glyphs,
+                    icons: &icons,
                     over_rects: &scene.over_rects,
                     overlay_rects: &scene.overlay_rects,
                     overlay_glyphs: &overlay_glyphs,
@@ -1005,6 +1022,7 @@ mod macos_app {
                 // Keep only hit regions + scroll metadata in `last_scene` for instant mouse handling.
                 scene.rects.clear();
                 scene.text_runs.clear();
+                scene.icon_quads.clear();
                 scene.over_rects.clear();
                 scene.overlay_rects.clear();
                 scene.overlay_text.clear();

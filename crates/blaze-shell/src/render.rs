@@ -22,6 +22,7 @@ use objc2_metal::{
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 
 use crate::font::{ATLAS, Slot};
+use crate::svg_icons::{ICON_ATLAS_SIZE, IconSlot};
 
 type Dev = Retained<ProtocolObject<dyn MTLDevice>>;
 
@@ -33,6 +34,7 @@ pub struct FrameDraw<'a> {
     pub clear: [f32; 3],
     pub clips: &'a [ClipRectGpu],
     pub rects: &'a [RectInst],
+    pub icons: &'a [GlyphInst],
     pub glyphs: &'a [GlyphInst],
     pub over_rects: &'a [RectInst],
     pub overlay_rects: &'a [RectInst],
@@ -44,8 +46,11 @@ pub struct Renderer {
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     sdf: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     glyph: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    sprite: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     atlas: Retained<ProtocolObject<dyn MTLTexture>>,
+    icon_atlas: Retained<ProtocolObject<dyn MTLTexture>>,
     sampler: Retained<ProtocolObject<dyn MTLSamplerState>>,
+    linear_sampler: Retained<ProtocolObject<dyn MTLSamplerState>>,
 }
 
 fn pipeline(
@@ -81,10 +86,13 @@ impl Renderer {
     pub fn new(dev: Dev) -> Renderer {
         let mut sdf_src = String::new();
         let mut glyph_src = String::new();
+        let mut sprite_src = String::new();
         blaze_ui::shaders::emit_ui_sdf_msl(&mut sdf_src).expect("emit ui_sdf MSL");
         blaze_ui::shaders::emit_ui_glyph_msl(&mut glyph_src).expect("emit ui_glyph MSL");
+        blaze_ui::shaders::emit_ui_sprite_msl(&mut sprite_src).expect("emit ui_sprite MSL");
         let sdf = pipeline(&dev, &sdf_src, "ui_sdf_vs", "ui_sdf_fs");
         let glyph = pipeline(&dev, &glyph_src, "ui_glyph_vs", "ui_glyph_fs");
+        let sprite = pipeline(&dev, &sprite_src, "ui_glyph_vs", "ui_glyph_fs");
         let queue = dev.newCommandQueue().expect("Metal command queue");
         // SAFETY: valid 2D A8Unorm descriptor of size ATLAS x ATLAS.
         let td = unsafe {
@@ -96,11 +104,25 @@ impl Renderer {
             )
         };
         let atlas = dev.newTextureWithDescriptor(&td).expect("Metal glyph atlas texture");
+        // SAFETY: valid 2D RGBA8Unorm descriptor of size ICON_ATLAS_SIZE x ICON_ATLAS_SIZE.
+        let itd = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                MTLPixelFormat::RGBA8Unorm,
+                ICON_ATLAS_SIZE,
+                ICON_ATLAS_SIZE,
+                false,
+            )
+        };
+        let icon_atlas = dev.newTextureWithDescriptor(&itd).expect("Metal icon atlas texture");
         let sd = MTLSamplerDescriptor::new();
         sd.setMinFilter(MTLSamplerMinMagFilter::Nearest);
         sd.setMagFilter(MTLSamplerMinMagFilter::Nearest);
         let sampler = dev.newSamplerStateWithDescriptor(&sd).expect("Metal sampler");
-        Renderer { dev, queue, sdf, glyph, atlas, sampler }
+        let lsd = MTLSamplerDescriptor::new();
+        lsd.setMinFilter(MTLSamplerMinMagFilter::Linear);
+        lsd.setMagFilter(MTLSamplerMinMagFilter::Linear);
+        let linear_sampler = dev.newSamplerStateWithDescriptor(&lsd).expect("Metal linear sampler");
+        Renderer { dev, queue, sdf, glyph, sprite, atlas, icon_atlas, sampler, linear_sampler }
     }
 
     pub fn device(&self) -> &Dev {
@@ -120,6 +142,22 @@ impl Renderer {
                 0,
                 NonNull::new(bytes.as_ptr().cast_mut().cast::<c_void>()).expect("non-null"),
                 slot.w,
+            );
+        }
+    }
+
+    pub fn upload_icon(&self, slot: IconSlot, rgba_bytes: &[u8]) {
+        let region = MTLRegion {
+            origin: MTLOrigin { x: slot.x, y: slot.y, z: 0 },
+            size: MTLSize { width: slot.w, height: slot.h, depth: 1 },
+        };
+        // SAFETY: `rgba_bytes` holds `slot.w * slot.h * 4` RGBA8 bytes inside `ICON_ATLAS_SIZE`.
+        unsafe {
+            self.icon_atlas.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+                region,
+                0,
+                NonNull::new(rgba_bytes.as_ptr().cast_mut().cast::<c_void>()).expect("non-null"),
+                slot.w * 4,
             );
         }
     }
@@ -160,7 +198,7 @@ impl Renderer {
         let draw_layer = |pso: &ProtocolObject<dyn MTLRenderPipelineState>,
                           insts: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
                           n: usize,
-                          tex: bool| {
+                          tex: Option<(&ProtocolObject<dyn MTLTexture>, &ProtocolObject<dyn MTLSamplerState>)>| {
             if n == 0 {
                 return;
             }
@@ -176,9 +214,9 @@ impl Renderer {
                 enc.setVertexBuffer_offset_atIndex(Some(&vert_sizes), 0, 2);
                 enc.setFragmentBuffer_offset_atIndex(Some(&clipb), 0, 0);
                 enc.setFragmentBuffer_offset_atIndex(Some(&frag_sizes), 0, 1);
-                if tex {
-                    enc.setFragmentTexture_atIndex(Some(&self.atlas), 0);
-                    enc.setFragmentSamplerState_atIndex(Some(&self.sampler), 0);
+                if let Some((texture, samp)) = tex {
+                    enc.setFragmentTexture_atIndex(Some(texture), 0);
+                    enc.setFragmentSamplerState_atIndex(Some(samp), 0);
                 }
                 enc.drawPrimitives_vertexStart_vertexCount_instanceCount(
                     MTLPrimitiveType::Triangle,
@@ -189,11 +227,27 @@ impl Renderer {
             }
         };
 
-        draw_layer(&self.sdf, self.buffer(frame.rects), frame.rects.len(), false);
-        draw_layer(&self.glyph, self.buffer(frame.glyphs), frame.glyphs.len(), true);
-        draw_layer(&self.sdf, self.buffer(frame.over_rects), frame.over_rects.len(), false);
-        draw_layer(&self.sdf, self.buffer(frame.overlay_rects), frame.overlay_rects.len(), false);
-        draw_layer(&self.glyph, self.buffer(frame.overlay_glyphs), frame.overlay_glyphs.len(), true);
+        draw_layer(&self.sdf, self.buffer(frame.rects), frame.rects.len(), None);
+        draw_layer(
+            &self.sprite,
+            self.buffer(frame.icons),
+            frame.icons.len(),
+            Some((&*self.icon_atlas, &*self.linear_sampler)),
+        );
+        draw_layer(
+            &self.glyph,
+            self.buffer(frame.glyphs),
+            frame.glyphs.len(),
+            Some((&*self.atlas, &*self.sampler)),
+        );
+        draw_layer(&self.sdf, self.buffer(frame.over_rects), frame.over_rects.len(), None);
+        draw_layer(&self.sdf, self.buffer(frame.overlay_rects), frame.overlay_rects.len(), None);
+        draw_layer(
+            &self.glyph,
+            self.buffer(frame.overlay_glyphs),
+            frame.overlay_glyphs.len(),
+            Some((&*self.atlas, &*self.sampler)),
+        );
     }
 
     pub fn draw(&self, layer: &CAMetalLayer, frame: &FrameDraw<'_>) {

@@ -60,12 +60,18 @@ pub struct Block {
     pub exit_code: i32,
     /// Whether large tables (> 25 rows) are currently folded.
     pub folded: bool,
+    /// Optional user override for compact grid vs detailed table view on file tables.
+    pub grid_override: Option<bool>,
     /// `(row, col)` table cells currently expanded inline (for nested lists/records/tables).
     pub expanded_cells: Vec<(usize, usize)>,
     pub body: BlockBody,
 }
 
 impl Block {
+    pub fn is_grid_view(&self, default_grid: bool) -> bool {
+        self.grid_override.unwrap_or(default_grid)
+    }
+
     pub fn is_cell_expanded(&self, row: usize, col: usize) -> bool {
         self.expanded_cells.contains(&(row, col))
     }
@@ -190,10 +196,28 @@ impl BlockStore {
             duration_ms,
             exit_code,
             folded,
+            grid_override: None,
             expanded_cells: Vec::new(),
             body,
         };
         self.push_block(block)
+    }
+
+    /// Toggle compact grid vs detailed table view for a file-table block.
+    pub fn toggle_table_view(&mut self, id: BlockId) -> bool {
+        if let Some(blk) = self.block_mut(id) {
+            let default_grid = match &blk.body {
+                BlockBody::Value(Value::Table(t))
+                | BlockBody::StreamAndValue { value: Value::Table(t), .. }
+                | BlockBody::RustCell { value: Value::Table(t), .. } => t.default_grid,
+                _ => false,
+            };
+            let cur = blk.grid_override.unwrap_or(default_grid);
+            blk.grid_override = Some(!cur);
+            true
+        } else {
+            false
+        }
     }
 
     pub fn block(&self, id: BlockId) -> Option<&Block> {

@@ -1641,13 +1641,34 @@ fn builtin_ls<'a>(
     } else {
         Table::from_col_names(&["name", "type", "size", "modified"], alloc)
     };
+    table.default_grid = !long;
     table.set_col_display("name", crate::value::ColDisplay::FileEntry);
     table.set_col_display("size", crate::value::ColDisplay::FileSize);
     table.set_col_display("modified", crate::value::ColDisplay::HumanTime);
     if long {
         table.set_col_display("readonly", crate::value::ColDisplay::Status);
     }
-    for e in entries.iter() {
+    // Sort directories first, then case-insensitive by name (like `eza --group-directories-first`).
+    let mut order: AVec<'a, usize> = AVec::with_capacity_in(entries.len(), alloc);
+    for i in 0..entries.len() {
+        order.push(i);
+    }
+    order.sort_unstable_by(|&a, &b| {
+        let ea = &entries[a];
+        let eb = &entries[b];
+        let da = !matches!(ea.kind, crate::protocol::FileKind::Dir);
+        let db = !matches!(eb.kind, crate::protocol::FileKind::Dir);
+        da.cmp(&db).then_with(|| {
+            ea.name
+                .as_bytes()
+                .iter()
+                .map(u8::to_ascii_lowercase)
+                .cmp(eb.name.as_bytes().iter().map(u8::to_ascii_lowercase))
+                .then_with(|| ea.name.as_str().cmp(eb.name.as_str()))
+        })
+    });
+    for &idx in order.iter() {
+        let e = &entries[idx];
         eval.charge(1, span)?;
         if long {
             let row = [

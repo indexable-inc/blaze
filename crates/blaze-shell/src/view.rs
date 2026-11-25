@@ -53,6 +53,18 @@ impl HitRect {
     }
 }
 
+/// A Retina SVG icon quad positioned in logical pixels, resolved through `IconAtlas`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct IconQuad {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub name: &'static str,
+    pub alpha: f32,
+    pub clip_id: u32,
+}
+
 /// Semantic UI action triggered by clicking a [`HitRegion`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HitAction {
@@ -60,6 +72,7 @@ pub enum HitAction {
     ForkActiveBranch,
     ForkBlock(BlockId),
     ToggleFold(BlockId),
+    ToggleTableView(BlockId),
     ToggleExpandCell { block: BlockId, row: usize, col: usize },
     SelectCompletion(usize),
 }
@@ -78,6 +91,8 @@ pub struct Scene {
     pub rects: Vec<RectInst>,
     /// Primary text runs rasterized over `rects`.
     pub text_runs: Vec<TextRun>,
+    /// Retina RGBA SVG icons rasterized from `svg_icons::IconAtlas`.
+    pub icon_quads: Vec<IconQuad>,
     /// Foreground overlays (underlines, error carets, beam cursor, hairlines) drawn over text.
     pub over_rects: Vec<RectInst>,
     /// Floating popup backgrounds (completion dropdown, Ctrl+R bar) drawn above all content.
@@ -107,6 +122,7 @@ impl Scene {
         Self {
             rects: Vec::new(),
             text_runs: Vec::new(),
+            icon_quads: Vec::new(),
             over_rects: Vec::new(),
             overlay_rects: Vec::new(),
             overlay_text: Vec::new(),
@@ -305,6 +321,18 @@ impl Scene {
             params: [radius, ring_width, 0.0, prim_kind::CIRCLE],
             clip_info: [clip_id, 0, 0, 0],
         });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn svg_icon(
+        &mut self,
+        x: f32,
+        y: f32,
+        size: f32,
+        name: &'static str,
+        clip_id: u32,
+    ) {
+        self.icon_quads.push(IconQuad { x, y, w: size, h: size, name, alpha: 1.0, clip_id });
     }
 
     #[allow(clippy::too_many_arguments)]

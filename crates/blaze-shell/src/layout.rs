@@ -14,8 +14,9 @@ use blaze_vt::terminal::{Mode as VtMode, Terminal};
 
 use crate::blocks::{Block, BlockBody, BlockStore, TABLE_FOLD_ROWS};
 use crate::editor::{CompletionKind, Editor};
-use crate::icons::{Icon, draw_icon, icon_for_file, icon_for_record_key};
+use crate::icons::{Icon, draw_icon, icon_for_record_key};
 use crate::prompt::PromptInfo;
+use crate::svg_icons::icon_name_for_file;
 use crate::theme;
 use crate::view::{
     CellMetrics, HitAction, HitRect, Scene, format_duration_ms, format_value_cell_at,
@@ -226,13 +227,13 @@ fn layout_block(
     now_ns: i64,
 ) -> f32 {
     let mut cur_y = y0;
-    let icon_s = 12.0;
+    let icon_s = 14.0;
 
-    // Quiet context line with crisp folder & git-branch icons (only at top or on cwd change).
+    // Quiet context line with crisp macOS blue folder & git-branch icons.
     if show_context {
         let mut cx = x0;
         let iy = cur_y + (m.ch - icon_s) * 0.5;
-        draw_icon(scene, Icon::Folder, cx, iy, icon_s, theme::SERIES_BLUE, clip_id);
+        scene.svg_icon(cx, iy, icon_s, "folder_macos", clip_id);
         cx += icon_s + 7.0;
         let max_cwd = (((x1 - x0) * 0.55) / m.cw).floor().max(16.0) as usize;
         let cwd_lbl = truncate_chars(&block.prompt_snapshot.cwd_display, max_cwd);
@@ -243,15 +244,15 @@ fn layout_block(
             let dirty = block.prompt_snapshot.git_dirty.map(|d| d.dirty).unwrap_or(false);
             cx += 16.0;
             let bcol = if dirty { theme::FIRE } else { theme::INK_4 };
-            draw_icon(scene, Icon::Branch, cx, iy + 0.5, icon_s - 1.0, bcol, clip_id);
-            cx += icon_s + 5.0;
+            draw_icon(scene, Icon::Branch, cx, cur_y + (m.ch - 11.0) * 0.5, 11.0, bcol, clip_id);
+            cx += 16.0;
             let git_lbl = if dirty { format!("{branch}*") } else { branch.clone() };
             scene.text(cx, cur_y, git_lbl, theme::INK_3, false, false, clip_id);
         }
         cur_y += m.ch + 8.0;
     }
 
-    // Right-aligned quiet inline metadata on the command row: exit, duration, `fork`.
+    // Right-aligned quiet inline metadata on the command row: exit, duration, optional grid/table toggle, `fork`.
     let mut rx = x1;
     let fork_lbl = "fork";
     let fork_w = fork_lbl.len() as f32 * m.cw;
@@ -263,6 +264,23 @@ fn layout_block(
         HitAction::ForkBlock(block.id),
     );
     rx = fx0 - 14.0;
+
+    // Quiet `table` / `grid` toggle on file-entry tables (e.g. `ls`, `ls -l`, `ls | sort-by ...`).
+    if let BlockBody::Value(Value::Table(t)) = &block.body
+        && is_file_table(t)
+    {
+        let in_grid = block.is_grid_view(t.default_grid);
+        let mode_lbl = if in_grid { "table" } else { "grid" };
+        let mw = mode_lbl.len() as f32 * m.cw;
+        let mx0 = rx - mw;
+        scene.text(mx0, cur_y, mode_lbl, theme::INK_4, false, false, clip_id);
+        scene.push_hit_clipped(
+            HitRect::new(mx0 - 4.0, cur_y - 2.0, rx + 4.0, cur_y + m.ch + 2.0),
+            clip_id,
+            HitAction::ToggleTableView(block.id),
+        );
+        rx = mx0 - 14.0;
+    }
 
     let dur_lbl = format_duration_ms(block.duration_ms);
     let dur_w = dur_lbl.len() as f32 * m.cw;
@@ -478,7 +496,13 @@ fn layout_value(
 ) -> f32 {
     match val {
         Value::Nothing => 0.0,
-        Value::Table(t) => layout_table(scene, block, t, x0, y0, width, m, clip_id, depth, now_ns),
+        Value::Table(t) => {
+            if depth == 0 && is_file_table(t) && block.is_grid_view(t.default_grid) {
+                layout_file_grid(scene, block, t, x0, y0, width, m, clip_id)
+            } else {
+                layout_table(scene, block, t, x0, y0, width, m, clip_id, depth, now_ns)
+            }
+        }
         Value::Record(r) => layout_record(scene, block, r, x0, y0, width, m, clip_id, depth, now_ns),
         Value::List(items) => layout_list(scene, block, items, x0, y0, width, m, clip_id, depth, now_ns),
         Value::Error(err) => {
@@ -486,6 +510,140 @@ fn layout_value(
         }
         scalar => layout_scalar(scene, scalar, x0, y0, width, m, clip_id, now_ns),
     }
+}
+
+/// True when `table` represents filesystem entries (has a `FileEntry` `name` column).
+fn is_file_table(table: &Table<'_>) -> bool {
+    if let Some(ni) = table.col_index("name") {
+        return table.col_display(ni) == ColDisplay::FileEntry || table.col_index("type").is_some();
+    }
+    false
+}
+
+/// Compact `eza --grid`-style multi-column file & directory view using authentic macOS blue
+/// folders and IntelliJ New UI dark SVG icons — dense, instant scan, zero wasted height.
+#[allow(clippy::too_many_arguments)]
+fn layout_file_grid(
+    scene: &mut Scene,
+    block: &Block,
+    table: &Table<'_>,
+    x0: f32,
+    y0: f32,
+    width: f32,
+    m: CellMetrics,
+    clip_id: u32,
+) -> f32 {
+    let total = table.nrows();
+    if total == 0 {
+        scene.text(x0, y0, "empty directory", theme::INK_4, false, true, clip_id);
+        return m.ch;
+    }
+    let Some(name_col) = table.col_index("name") else {
+        return m.ch;
+    };
+    let type_col = table.col_index("type");
+
+    // In compact grid mode we can comfortably display up to 60 items before folding.
+    const GRID_FOLD_ITEMS: usize = 60;
+    let visible = if block.folded && total > GRID_FOLD_ITEMS {
+        GRID_FOLD_ITEMS
+    } else {
+        total
+    };
+
+    let icon_s = 14.5;
+    let icon_gap = 7.0;
+    let col_gap = 22.0;
+
+    // Pre-collect display labels + SVG icon names.
+    struct GridItem {
+        label: String,
+        icon: &'static str,
+        is_dir: bool,
+        w_px: f32,
+    }
+    let mut items: Vec<GridItem> = Vec::with_capacity(visible);
+    for r in 0..visible {
+        let raw = table
+            .cell(r, name_col)
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let kind = type_col.and_then(|ti| table.cell(r, ti)).and_then(Value::as_str);
+        let is_dir = matches!(kind, Some("dir")) || raw.ends_with('/');
+        let label = if is_dir && !raw.ends_with('/') {
+            format!("{raw}/")
+        } else {
+            raw.to_owned()
+        };
+        let icon = icon_name_for_file(raw, kind);
+        let label_chars = label.chars().count().min(32);
+        let w_px = icon_s + icon_gap + label_chars as f32 * m.cw;
+        items.push(GridItem { label, icon, is_dir, w_px });
+    }
+
+    // Pick the largest column count `ncols` (1..=6) whose column-major widths fit in `width`
+    // (exact `eza` optimal grid packing!).
+    let max_cols = visible.min(6);
+    let mut best_cols = 1usize;
+    let mut best_col_widths = vec![width];
+    for nc in (1..=max_cols).rev() {
+        let nrows = visible.div_ceil(nc);
+        let mut widths = vec![0.0f32; nc];
+        for (i, item) in items.iter().enumerate() {
+            let c = i / nrows;
+            if c < nc {
+                widths[c] = widths[c].max(item.w_px);
+            }
+        }
+        let sum: f32 = widths.iter().sum::<f32>() + (nc.saturating_sub(1) as f32) * col_gap;
+        if sum <= width || nc == 1 {
+            best_cols = nc;
+            best_col_widths = widths;
+            break;
+        }
+    }
+
+    let nrows = visible.div_ceil(best_cols);
+    let row_h = m.ch + 7.0;
+    let mut cur_y = y0;
+
+    for r in 0..nrows {
+        let ty = cur_y + 3.0;
+        let iy = ty + (m.ch - icon_s) * 0.5;
+        let mut cx = x0;
+        for c in 0..best_cols {
+            let idx = c * nrows + r;
+            let cw = best_col_widths[c];
+            if let Some(item) = items.get(idx) {
+                let max_ch = ((cw - icon_s - icon_gap).max(m.cw * 3.0) / m.cw).floor() as usize;
+                let txt = truncate_chars(&item.label, max_ch.max(3));
+                scene.svg_icon(cx, iy, icon_s, item.icon, clip_id);
+                let col = if item.is_dir { theme::INK_1 } else { theme::INK_2 };
+                scene.text(cx + icon_s + icon_gap, ty, txt, col, false, false, clip_id);
+            }
+            cx += cw + col_gap;
+        }
+        cur_y += row_h;
+    }
+
+    if total > GRID_FOLD_ITEMS {
+        cur_y += 4.0;
+        let lbl = if block.folded {
+            format!("+ {} more entries", total - GRID_FOLD_ITEMS)
+        } else {
+            format!("− collapse to {GRID_FOLD_ITEMS} entries")
+        };
+        let pw = lbl.chars().count() as f32 * m.cw + 8.0;
+        scene.text(x0, cur_y, lbl, theme::INK_3, false, false, clip_id);
+        scene.push_hit_clipped(
+            HitRect::new(x0 - 4.0, cur_y - 2.0, x0 + pw, cur_y + m.ch + 2.0),
+            clip_id,
+            HitAction::ToggleFold(block.id),
+        );
+        cur_y += m.ch + 4.0;
+    }
+
+    cur_y - y0
 }
 
 /// Resolve the effective semantic display type of column `c` in `table` (using explicit
@@ -553,7 +711,7 @@ fn layout_table(
     };
 
     let type_col_idx = table.col_index("type");
-    let icon_s = 12.0;
+    let icon_s = 14.0;
     let icon_pad = icon_s + 7.0;
 
     let idx_chars = table.nrows().max(1).to_string().len().max(2);
@@ -701,8 +859,8 @@ fn layout_table(
                         match disp {
                             ColDisplay::FileEntry => {
                                 let raw_name = format_value_cell_at(cell, Some(now_ns));
-                                let (icon, icol) = icon_for_file(&raw_name, row_file_kind);
-                                let is_dir = matches!(icon, Icon::Folder);
+                                let icon_name = icon_name_for_file(&raw_name, row_file_kind);
+                                let is_dir = matches!(row_file_kind, Some("dir")) || raw_name.ends_with('/');
                                 let display_name = if is_dir && !raw_name.ends_with('/') {
                                     format!("{raw_name}/")
                                 } else {
@@ -711,26 +869,23 @@ fn layout_table(
                                 let max_ch = ((content_w - icon_pad - 8.0) / m.cw).floor().max(3.0) as usize;
                                 let txt = truncate_chars(&display_name, max_ch);
 
-                                // Sleek `ix.dev/blaze` inline chip for folders and `.rs` files!
-                                if is_dir || matches!(icon, Icon::Rust) {
+                                // Sleek `ix.dev/blaze` inline chip for folders and `.rs` files.
+                                if is_dir || icon_name == "rust_dark" {
                                     let chip_w = (icon_pad + txt.chars().count() as f32 * m.cw + 10.0)
                                         .min(content_w + 2.0);
                                     let bx0 = rx - 5.0;
                                     let by0 = cur_y + 2.0;
                                     let by1 = cur_y + row_h - 2.0;
                                     scene.round_rect(bx0, by0, bx0 + chip_w, by1, 4.0, theme::BG_CHIP, 0.0, [0.0; 4], clip_id);
-                                    draw_icon(scene, icon, rx, iy, icon_s, icol, clip_id);
-                                    scene.text(rx + icon_pad, ty, txt, theme::INK_1, false, false, clip_id);
-                                } else {
-                                    draw_icon(scene, icon, rx, iy, icon_s, icol, clip_id);
-                                    scene.text(rx + icon_pad, ty, txt, theme::INK_1, false, false, clip_id);
                                 }
+                                scene.svg_icon(rx, iy, icon_s, icon_name, clip_id);
+                                scene.text(rx + icon_pad, ty, txt, theme::INK_1, false, false, clip_id);
                             }
                             ColDisplay::Crate => {
                                 let raw = format_value_cell_at(cell, Some(now_ns));
                                 let max_ch = ((content_w - icon_pad) / m.cw).floor().max(3.0) as usize;
                                 let txt = truncate_chars(&raw, max_ch);
-                                draw_icon(scene, Icon::Crate, rx, iy, icon_s, theme::SERIES_ORANGE, clip_id);
+                                scene.svg_icon(rx, iy, icon_s, "rust_dark", clip_id);
                                 scene.text(rx + icon_pad, ty, txt, theme::INK_1, false, false, clip_id);
                             }
                             ColDisplay::Process => {
@@ -1155,9 +1310,9 @@ fn layout_rust_cell_body(
     let px = x0 + 14.0;
     let inner_w = (width - 14.0).max(80.0);
     let mut cur_y = y0;
-    let icon_s = 12.0;
+    let icon_s = 14.0;
 
-    draw_icon(scene, Icon::Rust, px, cur_y + (m.ch - icon_s) * 0.5, icon_s, theme::SERIES_ORANGE, clip_id);
+    scene.svg_icon(px, cur_y + (m.ch - icon_s) * 0.5, icon_s, "rust_dark", clip_id);
     let timing = if run_ms > 0 {
         format!(
             "blaze run · {} / {}",
@@ -1383,12 +1538,12 @@ fn layout_composer(
     let px = OUTER_PAD_X;
     let x1 = (vw - OUTER_PAD_X).max(px + 160.0);
     let label_y = y0 + 6.0;
-    let icon_s = 11.5;
+    let icon_s = 13.5;
 
     // Quiet prompt metadata above the input box (matching `Install blaze · 13 MiB`).
     let mut cx = px;
     let iy = label_y + (m.ch - icon_s) * 0.5;
-    draw_icon(scene, Icon::Folder, cx, iy, icon_s, theme::SERIES_BLUE, 0);
+    scene.svg_icon(cx, iy, icon_s, "folder_macos", 0);
     cx += icon_s + 6.0;
     let max_cwd = (((x1 - px) * 0.55) / m.cw).floor().max(16.0) as usize;
     let cwd_lbl = truncate_chars(&prompt.cwd_display, max_cwd);

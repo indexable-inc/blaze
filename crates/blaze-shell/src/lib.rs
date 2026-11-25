@@ -10,6 +10,7 @@ pub mod icons;
 pub mod layout;
 pub mod prompt;
 pub mod rust_cell;
+pub mod svg_icons;
 pub mod theme;
 pub mod view;
 
@@ -364,5 +365,115 @@ mod tests {
         let def_src = synthesize_cell_source(&[], "struct Point { x: i64, y: i64 }", "null");
         assert!(def_src.contains("struct Point { x: i64, y: i64 }"));
         assert!(def_src.contains(&format!("{CELL_JSON_SENTINEL}null")));
+    }
+
+    #[test]
+    fn vendored_svg_icons_parse_and_grid_toggles_to_table() {
+        use blaze_sh::ColDisplay;
+        use crate::svg_icons::{SVG_SOURCES, get_svg, icon_name_for_file};
+
+        // Every embedded macOS folder + IntelliJ New UI dark SVG must parse into non-empty geometry.
+        assert!(SVG_SOURCES.len() >= 35);
+        for &(name, _) in SVG_SOURCES {
+            let art = get_svg(name).unwrap_or_else(|| panic!("missing parsed svg `{name}`"));
+            assert!(art.view[2] > 0.0 && art.view[3] > 0.0, "empty viewBox for `{name}`");
+            assert!(!art.layers.is_empty(), "no vector layers parsed for `{name}`");
+        }
+        assert_eq!(icon_name_for_file("crates", Some("dir")), "folder_macos");
+        assert_eq!(icon_name_for_file(".github", Some("dir")), "folderGithub_dark");
+        assert_eq!(icon_name_for_file("Cargo.toml", Some("file")), "toml_dark");
+        assert_eq!(icon_name_for_file("main.rs", Some("file")), "rust_dark");
+        assert_eq!(icon_name_for_file(".gitignore", Some("file")), "gitignore");
+
+        // File table with `default_grid = true` renders compact grid by default and toggles to table.
+        let alloc = Alloc::global();
+        let state = EngineState::new("/tmp", &[("HOME", "/tmp")], alloc);
+        let mut store = BlockStore::new(state.fork());
+        let prompt = PromptInfo::from_cwd("/tmp", "/tmp", 0, 1);
+
+        let mut table = Table::from_col_names(&["name", "type", "size", "modified"], alloc);
+        table.set_col_display("name", ColDisplay::FileEntry);
+        table.set_col_display("size", ColDisplay::FileSize);
+        table.set_col_display("modified", ColDisplay::HumanTime);
+        table.default_grid = true;
+        for (name, kind, sz) in [
+            ("crates", "dir", 0),
+            ("docs", "dir", 0),
+            ("Cargo.toml", "file", 4200),
+            ("Cargo.lock", "file", 190_000),
+            ("main.rs", "file", 12_400),
+            ("README.md", "file", 8100),
+        ] {
+            table.push_row_values(&[
+                Value::string(name, alloc),
+                Value::string(kind, alloc),
+                Value::Size(Bytes(sz)),
+                Value::Date(blaze_sh::DateTime {
+                    utc_ns: 1_732_500_000_000_000_000,
+                    offset_secs: 0,
+                }),
+            ]);
+        }
+        let bid = store.record_block(
+            "ls".to_owned(),
+            prompt.clone(),
+            state.fork(),
+            state.fork(),
+            1,
+            1,
+            0,
+            BlockBody::Value(Value::Table(table)),
+        );
+
+        let editor = Editor::new();
+        let grid_scene = build_scene(&LayoutInput {
+            store: &store,
+            editor: &editor,
+            prompt: &prompt,
+            viewport_w: 1000.0,
+            viewport_h: 800.0,
+            metrics: CellMetrics::default(),
+            scroll_y: 0.0,
+            cursor_visible: true,
+            now_ns: 1_732_500_000_000_000_000,
+        });
+        assert!(
+            grid_scene
+                .hit_regions
+                .iter()
+                .any(|h| h.action == HitAction::ToggleTableView(bid)),
+            "expected ToggleTableView hit region for file table"
+        );
+        assert!(
+            grid_scene.icon_quads.iter().any(|q| q.name == "folder_macos"),
+            "expected macOS folder SVG icon in grid"
+        );
+        assert!(
+            grid_scene.icon_quads.iter().any(|q| q.name == "rust_dark"),
+            "expected IntelliJ Rust SVG icon in grid"
+        );
+        assert!(
+            !grid_scene.text_runs.iter().any(|t| t.text == "modified"),
+            "compact grid should not render table column headers"
+        );
+
+        // Toggle to table view: height grows and column headers appear.
+        assert!(store.toggle_table_view(bid));
+        let table_scene = build_scene(&LayoutInput {
+            store: &store,
+            editor: &editor,
+            prompt: &prompt,
+            viewport_w: 1000.0,
+            viewport_h: 800.0,
+            metrics: CellMetrics::default(),
+            scroll_y: 0.0,
+            cursor_visible: true,
+            now_ns: 1_732_500_000_000_000_000,
+        });
+        assert!(table_scene.total_content_height > grid_scene.total_content_height);
+        assert!(
+            table_scene.text_runs.iter().any(|t| t.text == "modified"),
+            "detailed table view should render column headers"
+        );
     }
 }

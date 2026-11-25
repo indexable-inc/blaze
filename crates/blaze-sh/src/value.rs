@@ -227,6 +227,9 @@ pub struct Table<'a> {
     pub cols: PVec<'a, PVec<'a, Value<'a>>>,
     pub col_display: PVec<'a, ColDisplay>,
     pub nrows: usize,
+    /// When true (e.g. plain `ls`), renderers default to a dense multi-column `eza`-style
+    /// icon grid; `ls -l` or piped transforms (`sort-by`, `where`, `select`) show the full table.
+    pub default_grid: bool,
 }
 
 impl<'a> Share for Table<'a> {}
@@ -239,7 +242,7 @@ impl<'a> Table<'a> {
             cols.push(PVec::new(alloc));
             col_display.push(ColDisplay::Auto);
         }
-        Table { columns, cols, col_display, nrows: 0 }
+        Table { columns, cols, col_display, nrows: 0, default_grid: false }
     }
 
     /// Create an empty table with identical columns and [`ColDisplay`] metadata.
@@ -254,6 +257,7 @@ impl<'a> Table<'a> {
             cols,
             col_display: self.col_display.share(),
             nrows: 0,
+            default_grid: false,
         }
     }
 
@@ -384,7 +388,7 @@ impl<'a> Table<'a> {
             cols.push(self.cols.get(ci).unwrap().share());
             col_display.push(self.col_display(ci));
         }
-        Ok(Table { columns, cols, col_display, nrows: self.nrows })
+        Ok(Table { columns, cols, col_display, nrows: self.nrows, default_grid: false })
     }
 
     /// Drop named columns in O(ncols), sharing every surviving column's persistent vector.
@@ -401,7 +405,7 @@ impl<'a> Table<'a> {
                 col_display.push(self.col_display(c));
             }
         }
-        Table { columns, cols, col_display, nrows: self.nrows }
+        Table { columns, cols, col_display, nrows: self.nrows, default_grid: false }
     }
 
     /// Build a table from a list of records if all elements are records (or empty).
