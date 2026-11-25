@@ -522,42 +522,57 @@ impl Natives for DlNatives {
 
 /// Runs the library's initializers in order on the calling thread: the process's first thread,
 /// after the entry is numbered and before it is called (NATIVE.md 3.4, 3.7).
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn run_inits(loaded: Loaded) -> Result<(), RunModeError> {
-    use blaze_sys::posix::proc::{_NSGetArgc, _NSGetArgv, _NSGetEnviron};
+    if loaded.inits == 0 {
+        return Ok(());
+    }
     use core::ffi::{c_char, c_int};
     type Init = extern "C" fn(c_int, *const *const c_char, *const *const c_char);
-    // SAFETY: `_NSGetArgc`, `_NSGetArgv`, `_NSGetEnviron` (<crt_externs.h>) return the
-    // process's own argc, argv and environ, set up by dyld before any code ran; the program
-    // runs in this process, so they are its arguments (the entry's `argv` is the same list).
-    let (argc, argv, envp) = unsafe { (*_NSGetArgc(), *_NSGetArgv(), *_NSGetEnviron()) };
+    #[cfg(target_os = "macos")]
+    let (argc, argv, envp) = {
+        use blaze_sys::posix::proc::{_NSGetArgc, _NSGetArgv, _NSGetEnviron};
+        // SAFETY: `_NSGetArgc`, `_NSGetArgv`, `_NSGetEnviron` (<crt_externs.h>) return the
+        // process's own argc, argv and environ, set up by dyld before any code ran; the program
+        // runs in this process, so they are its arguments (the entry's `argv` is the same list).
+        unsafe { (*_NSGetArgc(), (*_NSGetArgv()).cast_const().cast(), (*_NSGetEnviron()).cast_const().cast()) }
+    };
+    #[cfg(target_os = "linux")]
+    let (argc, argv, envp) = {
+        unsafe extern "C" {
+            static environ: *const *const c_char;
+        }
+        let (argc, argv) = crate::run_mode::process_args();
+        // SAFETY: `environ` is the C library's process environment pointer array, set up before
+        // `main` and live for the process's life.
+        let envp = unsafe { environ };
+        (argc, argv, envp)
+    };
     for index in 0..loaded.inits {
         let cell = loaded.inits_at + 8 * u64::from(index);
-        // SAFETY: init cell `index < inits` of the image's `__blaze_inits`, 8-aligned and
-        // readable for the image's life; dyld rebased it at `dlopen` (W3 makes every init cell
-        // a rebase fixup), so it holds an absolute address in the image's text.
+        // SAFETY: init cell `index < inits` of the image's `__blaze_inits` / `.data.blaze_inits`,
+        // 8-aligned and readable for the image's life; dyld (rebase fixup) or ld.so
+        // (`R_AARCH64_RELATIVE`, native_so.rs) rebased it at `dlopen`, so it holds an absolute
+        // address in the image's text.
         let address = unsafe { (cell as *const u64).read_volatile() };
         if address == 0 {
             return Err(RunModeError::Native(NativeError::NullInit { record: loaded.record, index }));
         }
-        // SAFETY: a C initializer of a member the program's link pulled (`__mod_init_func`'s
-        // entry, moved to `__blaze_inits`). dyld calls these as `void (int argc, char **argv,
-        // char **envp, char **apple, const struct ProgramVars *)`; the first three are passed
-        // here, `apple` and `vars` are not (only libSystem's own initializers read them, and
-        // libSystem is never a member); an initializer declared `void (void)` ignores the
-        // arguments (AAPCS64: arguments are registers the callee may ignore).
+        // SAFETY: a C initializer of a member the program's link pulled (`__mod_init_func` on
+        // macOS, `.init_array` on Linux, moved to the image's inits region). Both dyld and glibc
+        // call these as `void (int argc, char **argv, char **envp, ...)`; an initializer declared
+        // `void (void)` ignores the arguments (AAPCS64: arguments are registers the callee may
+        // ignore).
         let init: Init = unsafe { core::mem::transmute(address as usize) };
-        init(argc, argv.cast_const().cast(), envp.cast_const().cast());
+        init(argc, argv, envp);
     }
     Ok(())
 }
 
-/// Linux: the native library is ELF (W5, not built), so an image with initializers is refused
-/// by name rather than called with arguments this driver has not checked.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn run_inits(loaded: Loaded) -> Result<(), RunModeError> {
     match loaded.inits {
         0 => Ok(()),
-        _ => Err(RunModeError::NotBuilt { what: "a native library's initializers on Linux (NATIVE.md W5)" }),
+        _ => Err(RunModeError::NotBuilt { what: "a native library's initializers on this platform (NATIVE.md W5)" }),
     }
 }

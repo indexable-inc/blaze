@@ -2420,6 +2420,26 @@ pub fn run<S: RecordSource + RecordFiles + Sync, B: Bind + Send>(
     })
 }
 
+/// The process's own `argc` and `argv`, built in `blaze_launch::KEPT` for the process's life
+/// and shared by `Handed::CMain` and Linux native-library initializers (`native_lib::run_inits`).
+pub(crate) fn process_args() -> (core::ffi::c_int, *const *const core::ffi::c_char) {
+    use core::ffi::{c_char, c_int};
+    use std::os::unix::ffi::OsStringExt;
+
+    // The program's `argv`, leaked for its life (it is the process's).
+    let mut args: std::vec::Vec<*const c_char, _> = std::vec::Vec::new_in(blaze_launch::KEPT);
+    for arg in std::env::args_os() {
+        match std::ffi::CString::new(arg.into_vec()) {
+            Ok(it) => args.push(it.into_raw().cast_const()),
+            Err(_) => stop_with(format_args!("blaze: an argument of this process has a NUL in it")),
+        }
+    }
+    args.push(core::ptr::null());
+    let argc = c_int::try_from(args.len() - 1).unwrap_or(c_int::MAX);
+    let argv = args.leak().as_ptr();
+    (argc, argv)
+}
+
 /// How the program's entry ended when called from the launcher's run thread.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum EntryExit {
@@ -2446,7 +2466,6 @@ enum EntryExit {
 /// `_Unwind_DeleteException` (which would invoke guest `__rust_drop_panic`).
 fn call_entry(thunk: u64, handed: Handed) -> EntryExit {
     use core::ffi::{c_char, c_int, c_void};
-    use std::os::unix::ffi::OsStringExt;
 
     enum Call {
         Hosted { entry: extern "C-unwind" fn(*const c_void) -> c_int, table: *const c_void },
@@ -2496,17 +2515,7 @@ fn call_entry(thunk: u64, handed: Handed) -> EntryExit {
             Call::Unit { entry }
         }
         Handed::CMain => {
-            // The program's `argv`, leaked for its life (it is the process's).
-            let mut args: std::vec::Vec<*const c_char> = std::vec::Vec::new_in(blaze_launch::KEPT);
-            for arg in std::env::args_os() {
-                match std::ffi::CString::new(arg.into_vec()) {
-                    Ok(it) => args.push(it.into_raw().cast_const()),
-                    Err(_) => stop_with(format_args!("blaze: an argument of this process has a NUL in it")),
-                }
-            }
-            args.push(core::ptr::null());
-            let argc = (args.len() - 1) as c_int;
-            let argv = args.leak().as_ptr();
+            let (argc, argv) = process_args();
             // SAFETY: as above, for `extern "C-unwind" fn(c_int, *const *const c_char) -> c_int`.
             let entry: extern "C-unwind" fn(c_int, *const *const c_char) -> c_int =
                 unsafe { core::mem::transmute(entry_addr) };
@@ -2617,10 +2626,8 @@ fn control<S: RecordSource + RecordFiles, B: Bind>(
     // under `NativeStart::Eager`, once that library is loaded (`Act::Native` below; bounded by
     // `NATIVE_WAIT_MS`, rule 18).
     let mut expect = match native {
-        // Linux: the load is not built (NATIVE.md W5: the ELF image's initializers and its
-        // loader's checks); refused by name, never skipped.
-        Some(NativeStart::Eager(_)) if cfg!(not(target_os = "macos")) => {
-            return ready.put(Err(RunModeError::NotBuilt { what: "a program's native library on Linux (NATIVE.md W5)" }));
+        Some(NativeStart::Eager(_)) if cfg!(not(any(target_os = "macos", target_os = "linux"))) => {
+            return ready.put(Err(RunModeError::NotBuilt { what: "a program's native library on this platform (NATIVE.md W5)" }));
         }
         Some(NativeStart::Eager(record)) => NativeExpect::Eager { record, since: now() },
         None => NativeExpect::None,
@@ -2711,8 +2718,8 @@ fn control<S: RecordSource + RecordFiles, B: Bind>(
                         }
                     }
                     NativeExpect::Lazy { record: named } if named == record => {
-                        if cfg!(not(target_os = "macos")) {
-                            Err(RunModeError::NotBuilt { what: "a program's native library on Linux (NATIVE.md W5)" })
+                        if cfg!(not(any(target_os = "macos", target_os = "linux"))) {
+                            Err(RunModeError::NotBuilt { what: "a program's native library on this platform (NATIVE.md W5)" })
                         } else {
                             match load_library(&mut mode, source, &mut memory) {
                                 Ok(loaded) => {
