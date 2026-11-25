@@ -425,6 +425,7 @@ pub fn git_db_record_in<'a, D: ObjectSource<Alloc<'a>>, S: Sink>(
                 GitMode::File => Mode::File,
                 GitMode::Exec => Mode::Exec,
                 GitMode::Symlink => Mode::Link,
+                GitMode::Submodule => Mode::Submodule,
             };
             let (Ok(path_at), Ok(path_len)) = (u32::try_from(names.len()), u16::try_from(path.len())) else {
                 path_overflow = true;
@@ -468,6 +469,10 @@ pub fn git_db_record_in<'a, D: ObjectSource<Alloc<'a>>, S: Sink>(
         let Ok(path) = core::str::from_utf8(path_bytes) else {
             return Err(UnpackError::Pack(PackRefused::Form { why: "path not utf8" }));
         };
+        if row.mode == Mode::Submodule {
+            builder.file(path, Mode::Submodule, &row.oid.0).map_err(UnpackError::Pack)?;
+            continue;
+        }
         match db.read_object(&row.oid, source, &mut blob) {
             Ok(Some(GitKind::Blob)) => {}
             Ok(Some(_)) => {

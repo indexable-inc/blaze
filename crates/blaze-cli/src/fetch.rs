@@ -620,12 +620,13 @@ impl CargoCache {
                         let mut folder_idx_bytes = repo_idx_bytes;
                         let mut failed = false;
                         for i in 0..entries.len() {
-                            if entries.kind(i) != bstd::fs::EntryKind::File {
-                                continue;
-                            }
                             let name = entries.name(i);
                             if !local::git_idx_file(name) {
                                 continue;
+                            }
+                            if entries.kind(i) != bstd::fs::EntryKind::File {
+                                failed = true;
+                                break;
                             }
                             if folder_packs >= MOST_GIT_PACKS {
                                 failed = true;
@@ -1007,15 +1008,34 @@ fn adopt_local_git<'c>(
         for entry in packs.iter() {
             tables.push((entry.idx_bytes.as_slice(), entry.pack_len));
         }
-        let unpack_limits = &blaze_fetch::fetch::Limits::REAL.unpack;
+        let unpack_limits = if cx.is_simulated() {
+            // Simulated `MappingWrite` backs reservations with a heap buffer, so bound simulation
+            // reservations while keeping the exact same `Dir::reserve` + `pack::Fixed` path.
+            let mut sim = blaze_fetch::fetch::Limits::REAL.unpack;
+            sim.pack.most_files = 1024;
+            sim.pack.most_bytes = 2 << 20;
+            sim.pack.most_path = 512;
+            sim
+        } else {
+            blaze_fetch::fetch::Limits::REAL.unpack
+        };
         let most_obj = unpack_limits.git_pack.most_object;
         let most_loose_bytes = most_obj.saturating_add(most_obj / 64).saturating_add(4096);
+        let target = record_path(&unit.key())?;
+        let room = blaze_fetch::unpack::git_room(&unpack_limits);
         let mut source = CargoGitSource { cx, git, objects_dir, packs, most_loose_bytes, io_failed: false };
-        match local::adopt_git_db(unit, tables.as_slice(), &mut source, unpack_limits, env.heap.alloc()) {
-            Ok((record, _)) => {
-                write_record(cx, root, &record_path(&unit.key())?, record.as_slice())?;
-                return Ok(true);
-            }
+        match root.reserve(cx, &target, room, |buf| {
+            local::adopt_git_db_in(
+                unit,
+                tables.as_slice(),
+                &mut source,
+                &unpack_limits,
+                blaze_fetch::pack::Fixed::new(buf),
+                env.heap.alloc(),
+            )
+            .map(|(fixed, _)| fixed.written())
+        })? {
+            Ok(()) => return Ok(true),
             Err(_) if source.io_failed => tries.push(Try { place, miss: Miss::Unreadable }),
             Err(refused) => tries.push(Try { place, miss: Miss::Refused(refused) }),
         }

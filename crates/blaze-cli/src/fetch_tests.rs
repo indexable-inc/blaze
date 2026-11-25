@@ -596,6 +596,10 @@ fn a_symlink_inside_cargos_git_db_is_refused_by_confined_reads() {
         let adopted = adopt_local(&cx, &root, &mut cargo, &native_env, unit, &mut tries).expect("no tool error");
         assert!(!adopted, "no symlinked repo, pack dir, or pack/idx file may be followed or adopted");
         assert!(held_bytes(&cx, &root, unit).is_none(), "nothing written to sources store");
+        assert!(
+            tries.iter().any(|t| t.place.contains("g-0000000000000003") && matches!(t.miss, Miss::Unreadable)),
+            "symlinked .idx in g-0000000000000003 must fail closed as Miss::Unreadable"
+        );
 
         // 4. Real pack-only Cargo git/db (NO loose objects) adopts cleanly over native confined
         // reads (preserving ENOENT on loose probe before searching packed objects).

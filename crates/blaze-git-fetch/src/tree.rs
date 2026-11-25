@@ -204,7 +204,7 @@ pub fn walk_with<B: Allocator + Copy>(
             0o100644 | 0o100664 => Mode::File,
             0o100755 => Mode::Exec,
             0o120000 => Mode::Symlink,
-            0o160000 => return Err(refuse(TreeWhy::Submodule)),
+            0o160000 => Mode::Submodule,
             mode => return Err(refuse(TreeWhy::Mode { mode })),
         };
         count += 1;

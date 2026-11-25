@@ -128,6 +128,9 @@ pub use read_sized::SizedError;
 // A whole file mapped read-only (`Dir::map_read`): a large plain array read in place.
 mod map_read;
 
+// Writing a large record once, in place (`Dir::reserve`): backed by `Effect::MapWrite`.
+mod reserve;
+
 // The boot the files are read in (`Fs::boot`): the files capability's own fact (D104 B1).
 mod boot;
 
@@ -851,6 +854,16 @@ impl FsError {
             FsKind::NotFound | FsKind::IsADirectory | FsKind::NotADirectory | FsKind::Exists | FsKind::OverQuota(..) | FsKind::Stale { .. } | FsKind::Moved { .. } | FsKind::Driver(..) | FsKind::Answered(..) => None,
         }
     }
+}
+
+/// Builds an `FsError` carrying a formatted `Display` message as `FsKind::Driver`.
+fn driver_error(op: FsOp, path: &(impl Named + ?Sized), value: &dyn fmt::Display) -> FsError {
+    FsError::new(op, path, FsKind::Driver(format!("{value}")))
+}
+
+/// Builds an `FsError` carrying a formatted `Display` message as `FsKind::Answered`.
+fn answered_error(op: FsOp, path: &(impl Named + ?Sized), value: &dyn fmt::Display) -> FsError {
+    FsError::new(op, path, FsKind::Answered(format!("{value}")))
 }
 
 /// `done`, which was not what `op` expects, as its error.

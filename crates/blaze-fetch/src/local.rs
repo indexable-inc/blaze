@@ -552,7 +552,12 @@ mod tests {
         let manifest_oid = Oid::of(GitKind::Blob, manifest);
         let src_tree = git_tree_of(&mut [("lib.rs", 0o100644, lib_oid)]);
         let src_oid = Oid::of(GitKind::Tree, src_tree.as_slice());
-        let root_tree = git_tree_of(&mut [("Cargo.toml", 0o100644, manifest_oid), ("src", 0o40000, src_oid)]);
+        let sub_oid = Oid([0x42; 20]);
+        let root_tree = git_tree_of(&mut [
+            ("Cargo.toml", 0o100644, manifest_oid),
+            ("src", 0o40000, src_oid),
+            ("sub", 0o160000, sub_oid),
+        ]);
         let root_oid = Oid::of(GitKind::Tree, root_tree.as_slice());
         let commit_bytes = alloc::format!("tree {root_oid}\nauthor a <a> 0 +0000\ncommitter a <a> 0 +0000\n\ninit\n");
         let commit = Oid::of(GitKind::Commit, commit_bytes.as_bytes());
@@ -595,7 +600,7 @@ mod tests {
         let (record, made) = adopt_git_db(&unit, &pack_tables, &mut db, &limits, alloc)
             .expect("split loose + multi-pack git db is adopted");
         assert_eq!(record.as_slice(), network.as_slice(), "adopted git db record equals network path byte for byte");
-        assert_eq!(made.files, 2);
+        assert_eq!(made.files, 3);
         assert_eq!(db.loose_hits, 1, "pinned commit must be read and verified exactly once");
         assert!(db.pack_bytes_read < 4096, "must not read unreachable pack objects: read {}", db.pack_bytes_read);
         let view = PackView::open_source(&unit.source(), record.as_slice()).expect("opens under git source id");
@@ -603,6 +608,9 @@ mod tests {
             view.read("src/lib.rs", alloc).expect("read").map(|file| file.bytes.as_slice().to_vec()),
             Some(lib.to_vec())
         );
+        let sub_entry = view.find_entry("sub").expect("submodule entry");
+        assert_eq!(sub_entry.mode, crate::Mode::Submodule);
+        assert_eq!(sub_entry.submodule_commit(), Some(sub_oid.0));
 
         // Aggregate object count cap (`PackLimits::most_objects`) is enforced across the ODB walk.
         let mut tight = limits;
