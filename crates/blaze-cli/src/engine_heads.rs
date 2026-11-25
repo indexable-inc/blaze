@@ -4443,6 +4443,21 @@ fn heads_of(
     let mut total_lowered = 0u32;
     let mut total_eval_lowered = 0u32;
     let mut total_taken = 0u32;
+    struct ActiveTask<'b, 'f> {
+        mine: &'static [ListedHead],
+        at_head: usize,
+        running: Option<crate::engine_status::Running<'b>>,
+        out: blaze_ids::Hasher,
+        worked: WorkedHead,
+        failed: Option<&'static str>,
+        incomplete_reads: bool,
+        settled: usize,
+        #[cfg(test)]
+        own_block_reads: Vec<CellId, Alloc<'f>>,
+        #[cfg(not(test))]
+        _frame: core::marker::PhantomData<&'f ()>,
+    }
+    let mut active: Option<ActiveTask<'_, '_>> = None;
     let mut at_task = 0usize;
     while at_task < tasks.len() {
         let mut stop_now = false;
@@ -4479,191 +4494,220 @@ fn heads_of(
                 sources: body_sources,
                 texts: opened.sources.0,
             };
-            while at_task < tasks.len() {
+            'batch: while at_task < tasks.len() {
                 let Some(task) = tasks.get(at_task) else { break };
-                let name = task.planned.name;
-                // The workers' scheduling point (engine_status.rs): stopped, this task and the rest are
-                // not begun; `run_items` refuses them (owed) and the driver stops before the merge.
-                if on_board.board.stopping().is_some() {
-                    let rest = tasks.get(at_task..).unwrap_or(&[]).iter().filter(|one| on_board.shows(one.planned.name, job.prefix)).count();
-                    on_board.board.refused(Stage::Heads, u64::try_from(rest).unwrap_or(u64::MAX));
-                    stop_now = true;
-                    break;
-                }
-                // The crate's listing: the setup's, or under the plant one made for this task alone
-                // (the control of engine_owners_once_tests.rs).
-                let listing = if plant == ListingsPlant::PerAsk { listings.listing(records, over, 0, crate_key, subjects)? } else { listing };
-                let mine = listing.of_entry(name);
-                // Shown on the board by the one unit that shows it, labelled by its entry's name.
-                let running = on_board.shows(name, job.prefix).then(|| {
-                    let entry_name = mine.first().map(|one| one.label.entry_name);
-                    on_board.board.show(Stage::Heads, board_label(entry_name, name), u64::try_from(frame.used()).unwrap_or(u64::MAX), on_board.board.now(on_board.clock))
-                });
-                let mut out = blaze_ids::Hasher::new(HEAD_OUT_DOMAIN);
-                let mut worked = WorkedHead {
-                    out: ContentId([0; 32]),
-                    defines: std::vec::Vec::new_in(*job.tasks.allocator()),
-                    items: SVec::new_in(heap.shared()),
-                    reads: std::vec::Vec::new_in(*job.tasks.allocator()),
-                    payload: std::vec::Vec::new_in(*job.tasks.allocator()),
-                    failed: SVec::new_in(heap.shared()),
-                    ctors: SVec::new_in(heap.shared()),
-                    adt_failed: false,
-                };
-                // When this file is held by this unit yet this entry produced no head (e.g., cut by
-                // `#[cfg]` on itself or an enclosing inline item), read the unit's `CfgAtoms` cell so a
-                // crate-level cfg/feature change wakes the entry without waking it on unrelated edits.
-                if mine.is_empty() {
-                    worked.reads.push(names_read(
-                        view,
-                        CellId { of: scope_name, cell: Cell(blaze_scope::names_cells::NameCell::CfgAtoms { krate: job.prefix }.key()) },
-                    ));
-                }
-                // A head task whose entry body holds items owns any block impls first written there.
-                // Its signature source intentionally ignores body tokens, so read each body's deterministic
-                // block-module expansion cell (`NameCell::Expansion { call: block_key(crate_key, body) }`):
-                // absent until the first block module appears, changing when one is added or edited, and
-                // completely unaffected by sibling items added elsewhere in the crate.
-                #[cfg(test)]
-                let mut own_block_reads: Vec<CellId, Alloc<'static>> = Vec::new_in(scratch_alloc);
-                if mine.iter().any(|head| head.body_holds_items) {
-                    let mut containers: Vec<blaze_id::ItemKey, Alloc<'static>> = Vec::new_in(scratch_alloc);
-                    let mut pushed_any = false;
-                    let mut push_block = |body: blaze_id::ItemKey| {
-                        let call = crate::body_types::covered::block_key(crate_key, body);
-                        let id = names_read(view, CellId { of: scope_name, cell: Cell(blaze_scope::names_cells::NameCell::Expansion { call }.key()) });
-                        worked.reads.push(id);
-                        #[cfg(test)]
-                        own_block_reads.push(id);
-                        pushed_any = true;
-                    };
-                    for head in mine.iter().filter(|head| head.body_holds_items) {
-                        match head.want {
-                            Want::Fn(lib) => push_block(lib),
-                            Want::Impl(lib) | Want::Members(lib) | Want::MemberFn(lib, _) => {
-                                if containers.scan_for(&lib).is_none() {
-                                    containers.push(lib);
-                                    records.each_member_row(lib, &mut |m| push_block(m.key));
-                                }
-                            }
-                            Want::Head(_) | Want::Adt(_) => {}
-                        }
-                    }
-                    if !pushed_any {
-                        let id = crate::engine_body_plan::not_held_cell(view, scope_name, job.prefix);
-                        worked.reads.push(id);
-                        #[cfg(test)]
-                        own_block_reads.push(id);
-                    }
-                }
-                let mut failed: Option<&'static str> = None;
-                let mut incomplete_reads = false;
-                // How long `worked.reads` was when it was last settled (`once_each`).
-                let mut settled = 0usize;
-                // Two heads under one cell would be two values under one key (rule 21): the whole
-                // entry is refused, the two heads named as its text names them.
-                if let Some(two) = mine.windows(2).find(|two| two.first().zip(two.get(1)).is_some_and(|(a, b)| a.cell == b.cell))
-                    && let (Some(first), Some(second)) = (two.first(), two.get(1))
-                {
-                    let (one, other) = (first.label, second.label);
-                    failed = Some(crate::engine_head_notes::leak(g, format_args!("two heads of its entry fall under one cell: {one} and {other}, the same kind and name (engine_heads.rs `head_cell`)")));
-                }
-                // Track the expansion cell even when the call has no head yet. A change that adds
-                // its first head must rerun this entry. Freezing a head requests its text separately.
-                for (_, call) in listing.calls_of(name).iter() {
-                    if !expansion_reads {
+                let mut cur = if let Some(cur) = active.take() {
+                    cur
+                } else {
+                    let name = task.planned.name;
+                    // The workers' scheduling point (engine_status.rs): stopped, this task and the rest are
+                    // not begun; `run_items` refuses them (owed) and the driver stops before the merge.
+                    if on_board.board.stopping().is_some() {
+                        let rest = tasks.get(at_task..).unwrap_or(&[]).iter().filter(|one| on_board.shows(one.planned.name, job.prefix)).count();
+                        on_board.board.refused(Stage::Heads, u64::try_from(rest).unwrap_or(u64::MAX));
+                        stop_now = true;
                         break;
                     }
-                    worked.reads.push(names_read(view, CellId { of: scope_name, cell: Cell(blaze_scope::names_cells::NameCell::Expansion { call: *call }.key()) }));
-                }
-                let mine = if failed.is_some() { &mine[..0] } else { mine };
-                for head in mine.iter() {
+                    // The crate's listing: the setup's, or under the plant one made for this task alone
+                    // (the control of engine_owners_once_tests.rs).
+                    let listing = if plant == ListingsPlant::PerAsk { listings.listing(records, over, 0, crate_key, subjects)? } else { listing };
+                    let mine = listing.of_entry(name);
+                    // Shown on the board by the one unit that shows it, labelled by its entry's name.
+                    let running = on_board.shows(name, job.prefix).then(|| {
+                        let entry_name = mine.first().map(|one| one.label.entry_name);
+                        on_board.board.show(Stage::Heads, board_label(entry_name, name), u64::try_from(frame.used()).unwrap_or(u64::MAX), on_board.board.now(on_board.clock))
+                    });
+                    let out = blaze_ids::Hasher::new(HEAD_OUT_DOMAIN);
+                    let mut worked = WorkedHead {
+                        out: ContentId([0; 32]),
+                        defines: std::vec::Vec::new_in(*job.tasks.allocator()),
+                        items: SVec::new_in(heap.shared()),
+                        reads: std::vec::Vec::new_in(*job.tasks.allocator()),
+                        payload: std::vec::Vec::new_in(*job.tasks.allocator()),
+                        failed: SVec::new_in(heap.shared()),
+                        ctors: SVec::new_in(heap.shared()),
+                        adt_failed: false,
+                    };
+                    // When this file is held by this unit yet this entry produced no head (e.g., cut by
+                    // `#[cfg]` on itself or an enclosing inline item), read the unit's `CfgAtoms` cell so a
+                    // crate-level cfg/feature change wakes the entry without waking it on unrelated edits.
+                    if mine.is_empty() {
+                        worked.reads.push(names_read(
+                            view,
+                            CellId { of: scope_name, cell: Cell(blaze_scope::names_cells::NameCell::CfgAtoms { krate: job.prefix }.key()) },
+                        ));
+                    }
+                    // A head task whose entry body holds items owns any block impls first written there.
+                    // Its signature source intentionally ignores body tokens, so read each body's deterministic
+                    // block-module expansion cell (`NameCell::Expansion { call: block_key(crate_key, body) }`):
+                    // absent until the first block module appears, changing when one is added or edited, and
+                    // completely unaffected by sibling items added elsewhere in the crate.
+                    #[cfg(test)]
+                    let mut own_block_reads: Vec<CellId, Alloc<'_>> = Vec::new_in(fa);
+                    if mine.iter().any(|head| head.body_holds_items) {
+                        let mut containers: Vec<blaze_id::ItemKey, Alloc<'static>> = Vec::new_in(scratch_alloc);
+                        let mut pushed_any = false;
+                        let mut push_block = |body: blaze_id::ItemKey| {
+                            let call = crate::body_types::covered::block_key(crate_key, body);
+                            let id = names_read(view, CellId { of: scope_name, cell: Cell(blaze_scope::names_cells::NameCell::Expansion { call }.key()) });
+                            worked.reads.push(id);
+                            #[cfg(test)]
+                            own_block_reads.push(id);
+                            pushed_any = true;
+                        };
+                        for head in mine.iter().filter(|head| head.body_holds_items) {
+                            match head.want {
+                                Want::Fn(lib) => push_block(lib),
+                                Want::Impl(lib) | Want::Members(lib) | Want::MemberFn(lib, _) => {
+                                    if containers.scan_for(&lib).is_none() {
+                                        containers.push(lib);
+                                        records.each_member_row(lib, &mut |m| push_block(m.key));
+                                    }
+                                }
+                                Want::Head(_) | Want::Adt(_) => {}
+                            }
+                        }
+                        if !pushed_any {
+                            let id = crate::engine_body_plan::not_held_cell(view, scope_name, job.prefix);
+                            worked.reads.push(id);
+                            #[cfg(test)]
+                            own_block_reads.push(id);
+                        }
+                    }
+                    let mut failed: Option<&'static str> = None;
+                    // Two heads under one cell would be two values under one key (rule 21): the whole
+                    // entry is refused, the two heads named as its text names them.
+                    if let Some(two) = mine.windows(2).find(|two| two.first().zip(two.get(1)).is_some_and(|(a, b)| a.cell == b.cell))
+                        && let (Some(first), Some(second)) = (two.first(), two.get(1))
+                    {
+                        let (one, other) = (first.label, second.label);
+                        failed = Some(crate::engine_head_notes::leak(g, format_args!("two heads of its entry fall under one cell: {one} and {other}, the same kind and name (engine_heads.rs `head_cell`)")));
+                    }
+                    // Track the expansion cell even when the call has no head yet. A change that adds
+                    // its first head must rerun this entry. Freezing a head requests its text separately.
+                    for (_, call) in listing.calls_of(name).iter() {
+                        if !expansion_reads {
+                            break;
+                        }
+                        worked.reads.push(names_read(view, CellId { of: scope_name, cell: Cell(blaze_scope::names_cells::NameCell::Expansion { call: *call }.key()) }));
+                    }
+                    let mine = if failed.is_some() { &mine[..0] } else { mine };
+                    ActiveTask {
+                        mine,
+                        at_head: 0,
+                        running,
+                        out,
+                        worked,
+                        failed,
+                        incomplete_reads: false,
+                        settled: 0,
+                        #[cfg(test)]
+                        own_block_reads,
+                        #[cfg(not(test))]
+                        _frame: core::marker::PhantomData,
+                    }
+                };
+                while cur.at_head < cur.mine.len() {
+                    let Some(head) = cur.mine.get(cur.at_head) else { break };
                     let (cell, want) = (&head.cell, &head.want);
-                    worked.items.push((head.item, job.prefix));
+                    cur.worked.items.push((head.item, job.prefix));
                     // An ADT's constructors, whether its head freezes or not: a failed head's are listed
                     // as not run ([`ctor_facts`]), never left without a row's word.
                     if let Want::Adt(lib) = *want {
-                        ctors_of(records, lib, &mut worked.ctors);
+                        ctors_of(records, lib, &mut cur.worked.ctors);
                     }
                     // Frozen through the split's one source, its reads its cells' own (engine_heads_once.rs
                     // `one_head`; a head that does not freeze is frozen again alone, as before).
-                    let made = crate::engine_heads_once::one_head(&job_cx, &mut source, &mut owners, *want, task, &mut |id| worked.reads.push(id), &mut failed);
-                    incomplete_reads |= failed.is_some();
+                    let made = crate::engine_heads_once::one_head(&job_cx, &mut source, &mut owners, *want, task, &mut |id| cur.worked.reads.push(id), &mut cur.failed);
+                    cur.incomplete_reads |= cur.failed.is_some();
+                    cur.at_head += 1;
                     if let Some(why) = job_cx.engine_refusal.get() {
-                        failed.get_or_insert(why);
-                        incomplete_reads = true;
+                        cur.failed.get_or_insert(why);
+                        cur.incomplete_reads = true;
                         break;
                     }
                     // Each cell once so far, whenever the list has doubled since it last was.
-                    if worked.reads.len() > settled.saturating_mul(2).max(SETTLE_AT) {
-                        once_each(&mut worked.reads);
-                        settled = worked.reads.len();
+                    if cur.worked.reads.len() > cur.settled.saturating_mul(2).max(SETTLE_AT) {
+                        once_each(&mut cur.worked.reads);
+                        cur.settled = cur.worked.reads.len();
                     }
                     let cell = *cell;
                     // A head not frozen fails alone (module docs): its cell the digest of its reason.
-                    let made = match made {
-                        Ok(made) => made,
+                    match made {
+                        Ok(made) => {
+                            cur.worked.defines.push((cell, made.out));
+                            cur.out.update(&cell.0).update(&made.out.0);
+                            // The cell too: a body finds a member's head by it (engine_seeds.rs `StretchHeads`).
+                            cur.worked.payload.extend_from_slice(&want_bytes(*want));
+                            cur.worked.payload.extend_from_slice(&cell.0);
+                            cur.worked.payload.extend_from_slice(&u32::try_from(made.bytes.len()).unwrap_or(u32::MAX).to_le_bytes());
+                            cur.worked.payload.extend_from_slice(&made.bytes);
+                        }
                         Err(cause) => {
                             let head = crate::engine_head_consts::head_label(records, *want, g);
                             let digest = cause.digest(HEAD_FAILED_DOMAIN);
-                            worked.defines.push((cell, digest));
-                            out.update(&cell.0).update(&digest.0);
-                            worked.failed.push((cell, head, cause));
-                            worked.adt_failed |= matches!(want, Want::Adt(_));
-                            continue;
+                            cur.worked.defines.push((cell, digest));
+                            cur.out.update(&cell.0).update(&digest.0);
+                            cur.worked.failed.push((cell, head, cause));
+                            cur.worked.adt_failed |= matches!(want, Want::Adt(_));
                         }
-                    };
-                    worked.defines.push((cell, made.out));
-                    out.update(&cell.0).update(&made.out.0);
-                    // The cell too: a body finds a member's head by it (engine_seeds.rs `StretchHeads`).
-                    worked.payload.extend_from_slice(&want_bytes(*want));
-                    worked.payload.extend_from_slice(&cell.0);
-                    worked.payload.extend_from_slice(&u32::try_from(made.bytes.len()).unwrap_or(u32::MAX).to_le_bytes());
-                    worked.payload.extend_from_slice(&made.bytes);
+                    }
+                    // Large multi-head entries (e.g. `sol!` macro expansions with hundreds of items)
+                    // can exhaust the per-split bump scratch frame within a single task if we wait
+                    // until the end of the task to reset. Yield mid-task so `scratch_frame` resets
+                    // and trims cleanly between heads while preserving `cur` across batches.
+                    if cur.at_head < cur.mine.len() && batch_frame.used() >= HEADS_SCRATCH_RESET_AT {
+                        if let Some(why) = crate::engine_heads_once::job_refusal(&freeze_names, &eval_names, g) {
+                            cur.failed.get_or_insert(why);
+                            cur.incomplete_reads = true;
+                        }
+                        active = Some(cur);
+                        break 'batch;
+                    }
                 }
                 // A read offered with no owner, or past a cap, fails the task by name (rule 3).
                 if let Some(why) = crate::engine_heads_once::job_refusal(&freeze_names, &eval_names, g) {
-                    failed.get_or_insert(why);
-                    incomplete_reads = true;
+                    cur.failed.get_or_insert(why);
+                    cur.incomplete_reads = true;
                 }
                 if let Some((_, why)) = opened.load.refused() {
-                    failed.get_or_insert(why);
-                    incomplete_reads = true;
+                    cur.failed.get_or_insert(why);
+                    cur.incomplete_reads = true;
                 }
                 if let Some(why) = packs.refused() {
-                    failed.get_or_insert(why);
-                    incomplete_reads = true;
+                    cur.failed.get_or_insert(why);
+                    cur.incomplete_reads = true;
                 }
                 // What the phase keeps of this task until its row is written: each cell once, in a
                 // block of that size.
-                if failed.is_some() {
+                if cur.failed.is_some() {
                     // Even a refusal before the first freeze depends on its member's names record.
-                    worked.reads.push(job.cells[1]);
+                    cur.worked.reads.push(job.cells[1]);
                 }
                 #[cfg(test)]
                 match plant {
                     ListingsPlant::WholeItemFile => {
-                        for id in &mut worked.reads {
+                        for id in &mut cur.worked.reads {
                             if id.of.kind == Kind::FileItems && id.cell != crate::engine_tasks::SURFACE && id.cell != crate::engine_tasks::HEADS {
                                 id.cell = WHOLE;
                             }
                         }
                     }
-                    ListingsPlant::DropItemText(missing) => worked.reads.retain(|id| *id != missing),
-                    ListingsPlant::DropOwnNames => worked.reads.retain(|id| own_block_reads.scan_for(id).is_none()),
+                    ListingsPlant::DropItemText(missing) => cur.worked.reads.retain(|id| *id != missing),
+                    ListingsPlant::DropOwnNames => cur.worked.reads.retain(|id| cur.own_block_reads.scan_for(id).is_none()),
                     _ => {}
                 }
-                once_each(&mut worked.reads);
-                worked.reads.shrink_to_fit();
-                once.read_list(&worked.reads);
-                done.push(match failed {
-                    Some(why) => Err(HeadFailed { why, reads: worked.reads, incomplete_reads }),
+                once_each(&mut cur.worked.reads);
+                cur.worked.reads.shrink_to_fit();
+                once.read_list(&cur.worked.reads);
+                done.push(match cur.failed {
+                    Some(why) => Err(HeadFailed { why, reads: cur.worked.reads, incomplete_reads: cur.incomplete_reads }),
                     None => {
-                        worked.out = out.finish();
-                        Ok(worked)
+                        cur.worked.out = cur.out.finish();
+                        Ok(cur.worked)
                     }
                 });
-                if let Some(running) = running {
+                if let Some(running) = cur.running {
                     running.end(on_board.board.now(on_board.clock));
                 }
                 at_task += 1;
