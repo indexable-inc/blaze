@@ -33,12 +33,13 @@ pub mod verify;
 mod tests;
 
 pub use body::{
-    AggregateKind, AssertKind, BadRow, BinOp, Block, BlockKind, BlockRow, Body, BodyRef, BorrowKind,
-    Callee, CalleeId, CastKind, Const, ConstDecl, ConstKind, Edge, Loan, LoanRow, Local, LocalDecl,
-    LocalKind, NONE, Operand, Ops, Origin, Place, PlaceRow, Point, Proj, Role, Span, Stmt, StmtKind,
-    StmtRow, Subset, Table, TyError, TyListRef, UnOp, Unwind, Value,
+    AggregateKind, AsmArch, AsmOpKind, AsmOpRow, AsmPiece, AsmRegKind, AsmRow, AssertKind, BadRow,
+    BinOp, Block, BlockKind, BlockRow, Body, BodyRef, BorrowKind, Callee, CalleeId, CastKind,
+    Const, ConstDecl, ConstKind, Edge, Loan, LoanRow, Local, LocalDecl, LocalKind, NONE, Operand,
+    Ops, Origin, Place, PlaceRow, Point, Proj, Role, Span, Stmt, StmtKind, StmtRow, Subset, Table,
+    TyError, TyListRef, UnOp, Unwind, Value,
 };
-pub use build::{BodyBuilder, BuildError};
+pub use build::{AsmOpInput, AsmPieceInput, BodyBuilder, BuildError};
 pub use kept::{KEPT_VERSION, Kept, KeptColumn, KeptError, KeptRoot, TableId};
 pub use record::{EncodeError, OpenError, VERSION, encode, open, try_encode};
 pub use text::{ParseError, ParseWhat, PrintError, parse, print};

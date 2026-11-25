@@ -1,8 +1,9 @@
 //! Synthetic LIR shims for `blaze-body-build`, independent of legacy `blaze-build`'s AST walk:
 //!
 //! - [`build_drop_glue`]: `core::ptr::drop_in_place::<T>` for sized types (structs, tuples,
-//!   closures, enums, arrays, unions, `Box<T>`), slices `[U]` / `str`, and `dyn Trait`, with
-//!   full `Panic::Unwind` unwind ladders and `Panic::Abort` direct calls.
+//!   closures, enums, arrays, unions, `Box<T>`), slices `[U]` / `str`, `dyn Trait`, and custom
+//!   DST structs/tuples ending in an unsized tail, with full `Panic::Unwind` unwind ladders and
+//!   `Panic::Abort` direct calls.
 //! - [`build_closure_shim`]: thin `FnMut::call_mut` / `FnOnce::call_once` entry over a closure
 //!   whose own kind is stronger (`Fn` -> `FnMut`/`FnOnce`, `FnMut` -> `FnOnce`), dropping the
 //!   closure value on normal return and unwind for `FnOnce`.
@@ -12,6 +13,10 @@
 //! - [`build_reify_shim`]: plain fn-pointer entry point (`ReifyShim`) for a `#[track_caller]` fn.
 //! - [`build_vtable_shim`]: by-value `self` `VTableShim` taking `(data_ptr, args..)` from a
 //!   dynamic call (e.g. `Box<dyn FnOnce>`).
+//! - [`build_builtin_clone`]: language-provided `Clone::clone` for tuples, records, closures,
+//!   structs, structural unions, fn items, and fn pointers.
+//! - [`build_builtin_from`]: language-provided `From::from` for structural error unions.
+//! - [`build_test_report_shim`]: `#[test]` `Termination::report` C `main` wrapper.
 
 use crate::AllocVec;
 use blaze_own::Vec;
@@ -20,7 +25,7 @@ use core::alloc::Allocator;
 use blaze_build::cabi::{self, CAbiError, Class};
 use blaze_build::drop_facts::needs_drop;
 use blaze_build::intrinsics::{Call, IntrinsicCx, Out, Site, Which, lir, read_discriminant, resize_in};
-use blaze_build::layout::{Fields, LayoutCx, LayoutError, LayoutId, Layouts, Variants, mask};
+use blaze_build::layout::{DynChain, Fields, LayoutCx, LayoutError, LayoutId, Layouts, Tail, Variants, mask};
 use blaze_build::vtable::VtableRef;
 use blaze_build::{Abi, Adts, Built, CallerSite, FnTrait, Instance, Panic, Subst, abi, ground};
 use blaze_lir::builder::{MemAttrs, Param, Variadic};
@@ -42,10 +47,12 @@ enum ShimTarget {
 /// One step in a drop-glue unwind ladder.
 #[derive(Clone, Copy)]
 enum DropStep {
-    /// Call `<T as Drop>::drop(p)`.
-    DropImpl { instance: Instance, p: Value, may_unwind: bool },
+    /// Call `<T as Drop>::drop(p)` (thin pointer when `meta` is `None`, wide when `Some`).
+    DropImpl { instance: Instance, p: Value, meta: Option<(Value, Ty)>, may_unwind: bool },
     /// Call `drop_in_place::<ty>` on `p + off` (sized).
     DropSized { ty: PTy, p: Value, off: i32 },
+    /// Call `drop_in_place::<ty>` on wide pointer `(data, meta)` (unsized).
+    DropWide { ty: PTy, data: Value, meta: Value, meta_ty: Ty },
     /// Drop the contents of `Box<T>` at `p` (`list` is `Box`'s generic args `[T, A]`).
     BoxContents { list: List, p: Value },
     /// Drop the fields/variants/elements of `ty` (of layout `lay`) at `p`.
@@ -600,6 +607,41 @@ impl<'a, 'g, 't, A: Allocator + Copy> ShimCx<'a, 'g, 't, A> {
         self.emit_void_call(ShimTarget::Direct(r), sig, &[ptr], may_unwind, unwinding)
     }
 
+    /// Emits `drop_in_place::<ty>` on wide pointer `(data, meta)` (for an unsized type `ty`).
+    fn emit_drop_wide_call(
+        &mut self,
+        ty: PTy,
+        data: Value,
+        meta: Value,
+        meta_ty: Ty,
+        unwinding: bool,
+    ) -> Result<Option<blaze_lir::Block>, BuildError> {
+        let (inst, may_unwind) = self.lang_drop_in_place(ty)?;
+        let r = self.func_ref(inst);
+        let sig = self.b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR), Param::of(meta_ty)], &[]);
+        self.emit_void_call(ShimTarget::Direct(r), sig, &[data, meta], may_unwind, unwinding)
+    }
+
+    /// Computes the runtime byte offset of a custom DST struct's `dyn` tail field from its
+    /// [`DynChain`] and vtable pointer (matching `blaze_build::dyn_tail::tail_offset`).
+    fn emit_dyn_tail_offset(&mut self, chain: DynChain, vtable: Value) -> Result<Value, BuildError> {
+        const ALIGN_WORD: i32 = 16;
+        let levels = chain.levels();
+        let outer = levels.first().ok_or(self.malformed("a `dyn` chain with no levels"))?;
+        let mut a = self.b.load(Ty::I64, Flags::NONE, vtable, ALIGN_WORD, MemAttrs::aligned(3));
+        if let Some(tail) = levels.get(1) {
+            let sized = self.b.iconst(Ty::I64, 1u128 << tail.align);
+            a = self.b.binary(Op::Umax, Flags::NONE, sized, a);
+        }
+        let at = self.b.iconst(Ty::I64, u128::from(outer.tail_at));
+        let one = self.b.iconst(Ty::I64, 1);
+        let m = self.b.binary(Op::Sub, Flags::NONE, a, one);
+        let up = self.b.binary(Op::Add, Flags::NONE, at, m);
+        let zero = self.b.iconst(Ty::I64, 0);
+        let keep = self.b.binary(Op::Sub, Flags::NONE, zero, a);
+        Ok(self.b.binary(Op::And, Flags::NONE, up, keep))
+    }
+
     /// Emits `dyn` trait object drop glue: loads vtable slot 0 and calls it with `data` if non-zero.
     fn emit_dyn_glue(&mut self, data: Value, vt: Value, unwinding: bool) -> Result<(), BuildError> {
         let word = self.b.load(Ty::I64, Flags::NONE, vt, 0, MemAttrs::aligned(3));
@@ -729,8 +771,19 @@ impl<'a, 'g, 't, A: Allocator + Copy> ShimCx<'a, 'g, 't, A> {
             }
             _ => {
                 if self.needs_drop_of(t)? {
+                    let t_lay = self.layout(t)?;
                     let data = self.b.load(Ty::PTR, Flags::NONE, p, 0, MemAttrs::aligned(3));
-                    self.emit_drop_sized_call(t, data, 0, unwinding)
+                    match self.layouts.get(t_lay).tail {
+                        Tail::Sized => self.emit_drop_sized_call(t, data, 0, unwinding),
+                        Tail::Slice { .. } => {
+                            let len = self.b.load(Ty::I64, Flags::NONE, p, 8, MemAttrs::aligned(3));
+                            self.emit_drop_wide_call(t, data, len, Ty::I64, unwinding)
+                        }
+                        Tail::Dyn => {
+                            let vt = self.b.load(Ty::PTR, Flags::NONE, p, 8, MemAttrs::aligned(3));
+                            self.emit_drop_wide_call(t, data, vt, Ty::PTR, unwinding)
+                        }
+                    }
                 } else {
                     Ok(None)
                 }
@@ -884,12 +937,21 @@ impl<'a, 'g, 't, A: Allocator + Copy> ShimCx<'a, 'g, 't, A> {
     /// when in normal mode under `Panic::Unwind`.
     fn emit_one_step(&mut self, step: DropStep, unwinding: bool) -> Result<Option<blaze_lir::Block>, BuildError> {
         match step {
-            DropStep::DropImpl { instance, p, may_unwind } => {
+            DropStep::DropImpl { instance, p, meta, may_unwind } => {
                 let r = self.func_ref(instance);
-                let sig = self.b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR)], &[]);
-                self.emit_void_call(ShimTarget::Direct(r), sig, &[p], may_unwind, unwinding)
+                match meta {
+                    None => {
+                        let sig = self.b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR)], &[]);
+                        self.emit_void_call(ShimTarget::Direct(r), sig, &[p], may_unwind, unwinding)
+                    }
+                    Some((m, mty)) => {
+                        let sig = self.b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR), Param::of(mty)], &[]);
+                        self.emit_void_call(ShimTarget::Direct(r), sig, &[p, m], may_unwind, unwinding)
+                    }
+                }
             }
             DropStep::DropSized { ty, p, off } => self.emit_drop_sized_call(ty, p, off, unwinding),
+            DropStep::DropWide { ty, data, meta, meta_ty } => self.emit_drop_wide_call(ty, data, meta, meta_ty, unwinding),
             DropStep::BoxContents { list, p } => self.emit_box_contents(list, p, unwinding),
             DropStep::Parts { ty, lay, p } => {
                 self.emit_parts(ty, lay, p, unwinding)?;
@@ -923,6 +985,82 @@ impl<'a, 'g, 't, A: Allocator + Copy> ShimCx<'a, 'g, 't, A> {
         }
         self.b.begin(after);
         Ok(())
+    }
+
+    /// Drops a custom DST struct or tuple `g` (whose last field is unsized: `[T]`, `str`,
+    /// `dyn Tr`, or a nested custom DST) at wide pointer `(data, meta)`:
+    /// 1. `<g as Drop>::drop((data, meta))` if `g` implements `Drop`;
+    /// 2. Each sized prefix field `0..n-1` that needs drop, in declaration order;
+    /// 3. The unsized tail field `n-1` via `drop_in_place::<tail>(tail_ptr, meta)` where
+    ///    `tail_ptr` uses the static offset for `Tail::Slice` or `emit_dyn_tail_offset` for
+    ///    `Tail::Dyn`.
+    fn emit_custom_dst_drop(&mut self, g: PTy, lay: LayoutId, data: Value, meta: Value, meta_ty: Ty) -> Result<(), BuildError> {
+        let mut field_tys: Vec<PTy, A> = Vec::new_in(self.alloc);
+        match self.node(g)? {
+            PNode::Tuple(l) | PNode::Record(_, l) => {
+                let slice = self.subst.ground.view().list(l).map_err(|_| self.malformed("a DST tuple's fields past the ground table"))?;
+                field_tys.extend_from_slice(slice);
+            }
+            PNode::Adt(key, args) => {
+                let adt = self.adts.adt(key).ok_or(self.malformed("a DST ADT missing in drop glue"))?;
+                if adt.kind != AdtKind::Struct || adt.variants.len() != 1 {
+                    return Err(self.malformed("an unsized ADT that is not a single-variant struct"));
+                }
+                let v = adt.variants.first().ok_or(self.malformed("a DST struct without its variant"))?;
+                let mut argv: Vec<PTy, A> = Vec::new_in(self.alloc);
+                argv.extend_from_slice(self.subst.ground.view().list(args).map_err(|_| self.malformed("a DST struct's args past the ground table"))?);
+                let start = usize::try_from(v.fields.start).map_err(|_| self.malformed("a field range past usize"))?;
+                let len = usize::try_from(v.fields.len).map_err(|_| self.malformed("a field range past usize"))?;
+                let fields = adt.fields.get(start..start + len).ok_or(self.malformed("a DST struct's fields past its ADT"))?;
+                for f in fields {
+                    let ft = ground(adt.types, f.ty, &argv, self.subst.ground, self.subst.scratch, self.adts.facts())
+                        .map_err(|e| BuildError::Facts { stmt: None, error: e })?;
+                    field_tys.push(ft);
+                }
+            }
+            _ => return Err(self.malformed("a custom unsized type that is neither a struct nor a tuple")),
+        }
+        let (&tail_ty, prefix_tys) = field_tys.split_last().ok_or(self.malformed("an unsized struct or tuple with no fields"))?;
+        let drop_fn = self.adts.drop_impl(g, self.subst.ground).map_err(|e| BuildError::Facts { stmt: None, error: e })?;
+        let mut steps: Vec<DropStep, A> = Vec::with_capacity_in(field_tys.len() + 1, self.alloc);
+        if let Some(item) = drop_fn {
+            let args = self.subst.ground.intern_list(&[g]).map_err(|_| self.malformed("the ground table is full"))?;
+            let may_unwind = self.adts.nounwind(item) != Some(true);
+            steps.push(DropStep::DropImpl { instance: Instance { item, args }, p: data, meta: Some((meta, meta_ty)), may_unwind });
+        }
+        for (i, &ft) in prefix_tys.iter().enumerate() {
+            if !self.needs_drop_of(ft)? {
+                continue;
+            }
+            let idx = u32::try_from(i).map_err(|_| self.malformed("a DST field index past u32"))?;
+            let off = self
+                .layouts
+                .field_offset(lay, idx)
+                .and_then(|o| i32::try_from(o).ok())
+                .ok_or(self.malformed("a DST prefix field offset past i32"))?;
+            steps.push(DropStep::DropSized { ty: ft, p: data, off });
+        }
+        if self.needs_drop_of(tail_ty)? {
+            let tail_ptr = match self.layouts.get(lay).tail {
+                Tail::Dyn => {
+                    let chain = self.layouts.dyn_chain(lay).ok_or(self.malformed("a `dyn`-tailed DST without its `DynChain`"))?;
+                    let off = self.emit_dyn_tail_offset(chain, meta)?;
+                    self.b.ptr_add(Flags::NONE, data, off)
+                }
+                Tail::Slice { .. } => {
+                    let last_idx = u32::try_from(prefix_tys.len()).map_err(|_| self.malformed("a DST tail index past u32"))?;
+                    let off = self
+                        .layouts
+                        .field_offset(lay, last_idx)
+                        .and_then(|o| i32::try_from(o).ok())
+                        .ok_or(self.malformed("a DST slice tail offset past i32"))?;
+                    self.addr(data, off)
+                }
+                Tail::Sized => return Err(self.malformed("custom DST drop glue asked of a sized layout")),
+            };
+            steps.push(DropStep::DropWide { ty: tail_ty, data: tail_ptr, meta, meta_ty });
+        }
+        self.emit_drop_sequence(&steps, false)
     }
 
     fn run_drop_glue(&mut self) -> Result<(), BuildError> {
@@ -972,8 +1110,16 @@ impl<'a, 'g, 't, A: Allocator + Copy> ShimCx<'a, 'g, 't, A> {
         }
 
         let lay = self.layout(g)?;
-        if self.layouts.get(lay).tail != blaze_build::layout::Tail::Sized {
-            return Err(self.malformed("drop glue for a custom unsized struct tail is not built yet"));
+        if self.layouts.get(lay).tail != Tail::Sized {
+            let &[data, meta] = vals.as_slice() else {
+                return Err(self.malformed("`drop_in_place::<Dst>` without wide pointer parameters"));
+            };
+            let Pass::Wide { metadata: meta_ty } = ptr_pass else {
+                return Err(self.malformed("an unsized `*mut Dst` not passed as a wide pointer"));
+            };
+            self.emit_custom_dst_drop(g, lay, data, meta, meta_ty)?;
+            self.b.ret(&[]);
+            return Ok(());
         }
         let &[p] = vals.as_slice() else {
             return Err(self.malformed("`drop_in_place::<T>` without its thin pointer parameter"));
@@ -990,7 +1136,7 @@ impl<'a, 'g, 't, A: Allocator + Copy> ShimCx<'a, 'g, 't, A> {
             if let Some(item) = drop_fn {
                 let args = self.subst.ground.intern_list(&[g]).map_err(|_| self.malformed("the ground table is full"))?;
                 let may_unwind = self.adts.nounwind(item) != Some(true);
-                steps.push(DropStep::DropImpl { instance: Instance { item, args }, p, may_unwind });
+                steps.push(DropStep::DropImpl { instance: Instance { item, args }, p, meta: None, may_unwind });
             }
             steps.push(DropStep::Parts { ty: g, lay, p });
             self.emit_drop_sequence(&steps, false)?;
@@ -1002,7 +1148,7 @@ impl<'a, 'g, 't, A: Allocator + Copy> ShimCx<'a, 'g, 't, A> {
         if let Some(item) = drop_fn {
             let args = self.subst.ground.intern_list(&[g]).map_err(|_| self.malformed("the ground table is full"))?;
             let may_unwind = self.adts.nounwind(item) != Some(true);
-            steps.push(DropStep::DropImpl { instance: Instance { item, args }, p, may_unwind });
+            steps.push(DropStep::DropImpl { instance: Instance { item, args }, p, meta: None, may_unwind });
         }
         steps.push(DropStep::Parts { ty: g, lay, p });
         self.emit_drop_sequence(&steps, false)?;
@@ -1543,6 +1689,612 @@ impl<'a, 'g, 't, A: Allocator + Copy> ShimCx<'a, 'g, 't, A> {
         }
         Ok(())
     }
+
+    /// Writes the enum/union tag of `variant` into `dst` (at offset 0) for layout `lay`.
+    fn write_tag(&mut self, lay: LayoutId, variant: u32, dst: Value) -> Result<(), BuildError> {
+        if let Some(tag) = self.layouts.tag_write(lay, variant) {
+            let at = i32::try_from(tag.offset).map_err(|_| self.malformed("a tag past 2 GiB"))?;
+            let ty = match lir(tag.scalar.prim).0 {
+                Ty::PTR => Ty::I64,
+                ty => ty,
+            };
+            let bits = self.b.iconst(ty, tag.value);
+            self.b.store(Flags::NONE, bits, dst, at, MemAttrs::aligned(tag.scalar.prim.align()));
+        }
+        Ok(())
+    }
+
+    /// Calls `clone::<ft>(field_ptr)` and returns its result value, optionally returning a
+    /// cleanup landing pad when `need_pad` is true under `Panic::Unwind` and `may_unwind`.
+    fn call_clone_field(
+        &mut self,
+        clone: ItemKey,
+        ft: PTy,
+        field_ptr: Value,
+        flay: LayoutId,
+        fpass: Pass,
+        sret_reuse: Option<Value>,
+        need_pad: bool,
+    ) -> Result<(V, Option<blaze_lir::Block>), BuildError> {
+        let ptr_pass = Pass::Scalar { ty: Ty::PTR, ext: Ext::None, agg: false };
+        let args = self.subst.ground.intern_list(&[ft]).map_err(|_| self.malformed("the ground table is full"))?;
+        let inst = Instance { item: clone, args };
+        let loc = self.def_site_caller_arg(inst, clone)?;
+        let target_ref = self.func_ref(inst);
+        let may_unwind = self.adts.nounwind(clone) != Some(true);
+        if !(need_pad && self.panic == Panic::Unwind && may_unwind) {
+            let v = self.call_value(
+                ShimTarget::Direct(target_ref),
+                &[V::One(field_ptr)],
+                &[flay],
+                &[ptr_pass],
+                flay,
+                fpass,
+                sret_reuse,
+                loc,
+            )?;
+            return Ok((v, None));
+        }
+        let mut c_passes: Vec<Pass, A> = Vec::with_capacity_in(2, self.alloc);
+        let mut c_values: Vec<Value, A> = Vec::with_capacity_in(3, self.alloc);
+        let sret_slot = match fpass {
+            Pass::Ref | Pass::Memory { .. } => {
+                let p = match sret_reuse {
+                    Some(p) => p,
+                    None => {
+                        let s = self.new_slot(flay, SlotKind::Temp)?;
+                        self.b.slot_addr(s)
+                    }
+                };
+                c_values.push(p);
+                Some(p)
+            }
+            _ => None,
+        };
+        c_values.push(field_ptr);
+        c_passes.push(ptr_pass);
+        if let Some(loc) = loc {
+            c_values.push(loc);
+            c_passes.push(ptr_pass);
+        }
+        let (c_params, c_rets) = abi::sig_of_in(&c_passes, fpass, self.alloc);
+        let c_sig = self.b.sig(Conv::C, Variadic::No, &c_params, &c_rets);
+        let normal = self.b.create_block(BlockKind::Normal);
+        let pad = self.b.create_block(BlockKind::Cleanup);
+        let r = self.b.invoke(Flags::NONE, target_ref, c_sig, &c_values, normal, pad);
+        self.b.begin(normal);
+        let v = self.unpack_call_result(r, flay, fpass, sret_slot)?;
+        Ok((v, Some(pad)))
+    }
+
+    /// Builtin `Clone::clone` for tuples, records, closures, structs, structural unions, fn items,
+    /// and fn pointers (`subst.args = [Self]`), matching `blaze-build`'s `clone_fn.rs`.
+    fn run_builtin_clone(&mut self, clone: ItemKey, copy: bool) -> Result<(), BuildError> {
+        let &[me] = self.subst.args else {
+            return Err(self.malformed("a builtin `clone` whose instance is not `[Self]`"));
+        };
+        let mut fields: Vec<PTy, A> = Vec::new_in(self.alloc);
+        let mut base = 0u64;
+        let mut is_union = false;
+        let held = match self.node(me)? {
+            PNode::FnDef(..) | PNode::FnPtr(..) => None,
+            PNode::Tuple(l) | PNode::Record(_, l) => {
+                let slice = self.subst.ground.view().list(l).map_err(|_| self.malformed("a tuple list past the ground table"))?;
+                fields.extend_from_slice(slice);
+                Some(me)
+            }
+            PNode::Union(l) => {
+                is_union = true;
+                let slice = self.subst.ground.view().list(l).map_err(|_| self.malformed("a union list past the ground table"))?;
+                fields.extend_from_slice(slice);
+                if slice.is_empty() { None } else { Some(me) }
+            }
+            PNode::Closure { owner, ordinal, args } => {
+                let facts = self.adts.facts();
+                let c = facts.closure(owner, ordinal).ok_or(self.malformed("a closure without facts in builtin `clone`"))?;
+                let mut oa: Vec<PTy, A> = Vec::new_in(self.alloc);
+                oa.extend_from_slice(self.subst.ground.view().list(args).map_err(|_| self.malformed("closure args past ground table"))?);
+                let env = ground(c.types, c.env, &oa, self.subst.ground, self.subst.scratch, facts)
+                    .map_err(|e| BuildError::Facts { stmt: None, error: e })?;
+                let PNode::Tuple(el) = self.node(env)? else {
+                    return Err(self.malformed("a closure's environment that is not a tuple"));
+                };
+                let slice = self.subst.ground.view().list(el).map_err(|_| self.malformed("a closure env past the ground table"))?;
+                fields.extend_from_slice(slice);
+                if !fields.is_empty() {
+                    let lc = self.layout(me)?;
+                    base = self
+                        .layouts
+                        .field_offset(lc, 0)
+                        .ok_or(self.malformed("a closure type's layout without its one field, the environment"))?;
+                }
+                Some(env)
+            }
+            PNode::Adt(adt_key, adt_args) => {
+                let facts = self.adts.facts();
+                let adt = facts.adt(adt_key).ok_or(self.malformed("a builtin `clone` of an ADT without facts"))?;
+                if adt.kind != AdtKind::Struct || adt.variants.len() != 1 {
+                    return Err(self.malformed("a builtin `clone` of an ADT that is not a struct"));
+                }
+                let mut argv: Vec<PTy, A> = Vec::new_in(self.alloc);
+                argv.extend_from_slice(self.subst.ground.view().list(adt_args).map_err(|_| self.malformed("an ADT's args past the ground table"))?);
+                for f in adt.fields.iter() {
+                    let g = ground(adt.types, f.ty, &argv, self.subst.ground, self.subst.scratch, facts)
+                        .map_err(|e| BuildError::Facts { stmt: None, error: e })?;
+                    fields.push(g);
+                }
+                if fields.is_empty() { None } else { Some(me) }
+            }
+            _ => return Err(self.malformed("a builtin `clone` of a type whose `Clone` the language does not give")),
+        };
+        let copy = copy || held.is_none();
+        let me_lay = self.layout(me)?;
+        let ret_pass = self.pass_of(me)?;
+        let ptr_pass = Pass::Scalar { ty: Ty::PTR, ext: Ext::None, agg: false };
+        let (params, rets) = abi::sig_of_in(&[ptr_pass], ret_pass, self.alloc);
+        let own_sig = self.b.sig(Conv::C, Variadic::No, &params, &rets);
+        self.b.set_signature(own_sig);
+        let entry = self.b.create_block(BlockKind::Normal);
+        self.b.begin(entry);
+        let mut vals: Vec<Value, A> = Vec::with_capacity_in(params.len(), self.alloc);
+        for p in params.iter() {
+            vals.push(self.b.param(p.ty));
+        }
+        let mut next = vals.iter().copied();
+        let sret = if matches!(ret_pass, Pass::Ref | Pass::Memory { .. }) {
+            Some(next.next().ok_or(self.malformed("a builtin `clone` missing its sret pointer"))?)
+        } else {
+            None
+        };
+        let at = next.next().ok_or(self.malformed("a builtin `clone` missing its `&self` pointer"))?;
+
+        if copy {
+            let v = self.load_at(at, 0, me_lay)?;
+            return self.ret_value(v, me_lay, ret_pass, sret);
+        }
+
+        if is_union {
+            if let &[only] = fields.as_slice() {
+                let (v, _) = self.call_clone_field(clone, only, at, me_lay, ret_pass, sret, false)?;
+                return self.ret_value(v, me_lay, ret_pass, sret);
+            }
+            if self.layouts.get(me_lay).is_zst() {
+                return self.ret_value(V::None, me_lay, ret_pass, sret);
+            }
+            let dst = match sret {
+                Some(p) => p,
+                None => {
+                    let slot = self.new_slot(me_lay, SlotKind::Temp)?;
+                    self.b.slot_addr(slot)
+                }
+            };
+            match self.layouts.get(me_lay).variants {
+                Variants::Single { index } => {
+                    let idx = usize::try_from(index).map_err(|_| self.malformed("a union variant past usize"))?;
+                    if let Some(&ft) = fields.get(idx) {
+                        let off = self
+                            .layouts
+                            .field_offset(me_lay, 0)
+                            .and_then(|o| i32::try_from(o).ok())
+                            .ok_or(self.malformed("a union field offset past i32"))?;
+                        let flay = self.layout(ft)?;
+                        let fpass = self.pass_of(ft)?;
+                        let field_ptr = self.addr(at, off);
+                        let dst_field = self.addr(dst, off);
+                        let reuse = matches!(fpass, Pass::Ref | Pass::Memory { .. }).then_some(dst_field);
+                        let (cloned, _) = self.call_clone_field(clone, ft, field_ptr, flay, fpass, reuse, false)?;
+                        if reuse.is_none() {
+                            self.store_v(dst, off, flay, cloned)?;
+                        }
+                    }
+                    if sret.is_some() {
+                        self.b.ret(&[]);
+                    } else {
+                        let res = self.load_at(dst, 0, me_lay)?;
+                        self.ret_value(res, me_lay, ret_pass, None)?;
+                    }
+                    return Ok(());
+                }
+                Variants::Multiple { tag, count, .. } => {
+                    let rty = match lir(tag.prim).0 {
+                        Ty::I128 => Ty::I128,
+                        _ => Ty::I64,
+                    };
+                    let dmask = mask(rty.bits(PTR_BITS));
+                    let discr = read_discriminant(&mut self.b, &self.layouts, me_lay, Some((at, 0)), rty)
+                        .ok_or(self.malformed("a structural union without a readable discriminant in `clone`"))?;
+                    let join = self.b.create_block(BlockKind::Normal);
+                    let none = self.b.create_block(BlockKind::Cold);
+                    let cap = usize::try_from(count).map_err(|_| self.malformed("too many union variants"))?;
+                    let mut arms: Vec<(u128, u32, blaze_lir::Block), A> = Vec::with_capacity_in(cap, self.alloc);
+                    for v in 0..count {
+                        let d = self.layouts.discriminant(me_lay, v).unwrap_or(i128::from(v)).cast_unsigned() & dmask;
+                        let blk = self.b.create_block(BlockKind::Normal);
+                        arms.push((d, v, blk));
+                    }
+                    let mut cases: Vec<(u128, (blaze_lir::Block, &[Value])), A> = Vec::with_capacity_in(arms.len(), self.alloc);
+                    for &(d, _, blk) in arms.iter() {
+                        cases.push((d, (blk, &[])));
+                    }
+                    self.b.switch(discr, (none, &[]), &cases);
+                    self.b.begin(none);
+                    self.b.unreachable();
+                    for &(_, v, blk) in arms.iter() {
+                        self.b.begin(blk);
+                        let Some(vlay) = self.layouts.variant(me_lay, v) else {
+                            self.b.unreachable();
+                            continue;
+                        };
+                        let v_idx = usize::try_from(v).map_err(|_| self.malformed("a union variant past usize"))?;
+                        let &ft = fields.get(v_idx).ok_or(self.malformed("a union variant past its members"))?;
+                        let off = self
+                            .layouts
+                            .field_offset(vlay, 0)
+                            .and_then(|o| i32::try_from(o).ok())
+                            .ok_or(self.malformed("a union field offset past i32"))?;
+                        let flay = self.layout(ft)?;
+                        let fpass = self.pass_of(ft)?;
+                        let field_ptr = self.addr(at, off);
+                        let dst_field = self.addr(dst, off);
+                        let reuse = matches!(fpass, Pass::Ref | Pass::Memory { .. }).then_some(dst_field);
+                        let (cloned, _) = self.call_clone_field(clone, ft, field_ptr, flay, fpass, reuse, false)?;
+                        if reuse.is_none() {
+                            self.store_v(dst, off, flay, cloned)?;
+                        }
+                        self.write_tag(me_lay, v, dst)?;
+                        self.b.jump((join, &[]));
+                    }
+                    self.b.begin(join);
+                    if sret.is_some() {
+                        self.b.ret(&[]);
+                    } else {
+                        let res = self.load_at(dst, 0, me_lay)?;
+                        self.ret_value(res, me_lay, ret_pass, None)?;
+                    }
+                    return Ok(());
+                }
+            }
+        }
+
+        // Field-by-field clone for tuple / record / closure / struct, with reverse-order unwind
+        // cleanup of already-cloned fields if a later field's `Clone::clone` panics.
+        let held_ty = held.ok_or(self.malformed("non-copy builtin `clone` without held type"))?;
+        let held_lay = self.layout(held_ty)?;
+        let dst = match sret {
+            Some(p) => p,
+            None => {
+                let slot = self.new_slot(me_lay, SlotKind::Temp)?;
+                self.b.slot_addr(slot)
+            }
+        };
+        let mut cloned_info: Vec<(PTy, i32, bool), A> = Vec::with_capacity_in(fields.len(), self.alloc);
+        let mut pads: Vec<(usize, blaze_lir::Block), A> = Vec::new_in(self.alloc);
+        let mut any_prior_drops = false;
+        for (j, &ft) in fields.iter().enumerate() {
+            let idx = u32::try_from(j).map_err(|_| self.malformed("a field index past u32"))?;
+            let foff = self
+                .layouts
+                .field_offset(held_lay, idx)
+                .ok_or(self.malformed("a field offset past its layout in builtin `clone`"))?;
+            let off = base
+                .checked_add(foff)
+                .and_then(|o| i32::try_from(o).ok())
+                .ok_or(self.malformed("a field offset past i32 in builtin `clone`"))?;
+            let flay = self.layout(ft)?;
+            let fpass = self.pass_of(ft)?;
+            let field_ptr = self.addr(at, off);
+            let dst_field = self.addr(dst, off);
+            let reuse = matches!(fpass, Pass::Ref | Pass::Memory { .. }).then_some(dst_field);
+            let (cloned, pad) = self.call_clone_field(clone, ft, field_ptr, flay, fpass, reuse, any_prior_drops)?;
+            if let Some(pad) = pad {
+                pads.push((j, pad));
+            }
+            if reuse.is_none() {
+                self.store_v(dst, off, flay, cloned)?;
+            }
+            let drops = self.needs_drop_of(ft)?;
+            cloned_info.push((ft, off, drops));
+            if drops {
+                any_prior_drops = true;
+            }
+        }
+        if !pads.is_empty() {
+            let done = self.b.create_block(BlockKind::Normal);
+            self.b.jump((done, &[]));
+            for &(j, pad) in pads.iter() {
+                self.b.begin(pad);
+                let exn = self.b.param(Ty::PTR);
+                for &(ft, off, drops) in cloned_info.iter().take(j).rev() {
+                    if drops {
+                        let _ = self.emit_drop_sized_call(ft, dst, off, true)?;
+                    }
+                }
+                self.b.resume(exn);
+            }
+            self.b.begin(done);
+        }
+        if sret.is_some() {
+            self.b.ret(&[]);
+        } else if self.layouts.get(me_lay).is_zst() {
+            self.b.ret(&[]);
+        } else {
+            let res = self.load_at(dst, 0, me_lay)?;
+            self.ret_value(res, me_lay, ret_pass, None)?;
+        }
+        Ok(())
+    }
+
+    /// Builtin `From::from(v: Src) -> Dst` for structural error unions (`subst.args = [Dst, Src]`),
+    /// where `Src` is a strict member or strict sub-union of `Dst`.
+    fn run_builtin_from(&mut self) -> Result<(), BuildError> {
+        let &[dst, src] = self.subst.args else {
+            return Err(self.malformed("a builtin `from` whose instance is not `[Self, T]`"));
+        };
+        let PNode::Union(dst_l_list) = self.node(dst)? else {
+            return Err(self.malformed("a builtin `from` whose `Self` is not a structural union"));
+        };
+        let mut dst_members: Vec<PTy, A> = Vec::new_in(self.alloc);
+        dst_members.extend_from_slice(self.subst.ground.view().list(dst_l_list).map_err(|_| self.malformed("a union list past the ground table"))?);
+
+        let dst_lay = self.layout(dst)?;
+        let ret_pass = self.pass_of(dst)?;
+        let src_lay = self.layout(src)?;
+        let src_pass = self.pass_of(src)?;
+        let (params, rets) = abi::sig_of_in(&[src_pass], ret_pass, self.alloc);
+        let own_sig = self.b.sig(Conv::C, Variadic::No, &params, &rets);
+        self.b.set_signature(own_sig);
+        let entry = self.b.create_block(BlockKind::Normal);
+        self.b.begin(entry);
+        let mut vals: Vec<Value, A> = Vec::with_capacity_in(params.len(), self.alloc);
+        for p in params.iter() {
+            vals.push(self.b.param(p.ty));
+        }
+        let mut next = vals.iter().copied();
+        let sret = if matches!(ret_pass, Pass::Ref | Pass::Memory { .. }) {
+            Some(next.next().ok_or(self.malformed("a builtin `from` missing its sret pointer"))?)
+        } else {
+            None
+        };
+        let v = self.take_param(src_lay, src_pass, &mut next)?;
+
+        let mut inject_member: Option<u32> = None;
+        let mut src_members: Vec<PTy, A> = Vec::new_in(self.alloc);
+        match self.node(src)? {
+            PNode::Union(src_l_list) => {
+                src_members.extend_from_slice(self.subst.ground.view().list(src_l_list).map_err(|_| self.malformed("a source union list past the ground table"))?);
+                if let [only] = src_members.as_slice() {
+                    let j = dst_members
+                        .iter()
+                        .position(|dm| dm == only)
+                        .ok_or(self.malformed("a builtin `from` missing a source union member"))?;
+                    inject_member = Some(u32::try_from(j).map_err(|_| self.malformed("a union variant index past u32"))?);
+                }
+            }
+            _ => {
+                let j = dst_members
+                    .iter()
+                    .position(|&dm| dm == src)
+                    .ok_or(self.malformed("a builtin `from` missing a source member"))?;
+                inject_member = Some(u32::try_from(j).map_err(|_| self.malformed("a union variant index past u32"))?);
+            }
+        }
+
+        if let Some(variant) = inject_member {
+            if dst_members.len() == 1 {
+                if variant != 0 {
+                    return Err(self.malformed("a single-member union injection at a non-zero variant"));
+                }
+                return self.ret_value(v, dst_lay, ret_pass, sret);
+            }
+            if self.layouts.get(dst_lay).is_zst() {
+                return self.ret_value(V::None, dst_lay, ret_pass, sret);
+            }
+            let dst_ptr = match sret {
+                Some(p) => p,
+                None => {
+                    let slot = self.new_slot(dst_lay, SlotKind::Temp)?;
+                    self.b.slot_addr(slot)
+                }
+            };
+            let vlay = match self.layouts.get(dst_lay).variants {
+                Variants::Multiple { .. } => self.layouts.variant(dst_lay, variant).ok_or(self.malformed("a union variant past its layout"))?,
+                Variants::Single { .. } => dst_lay,
+            };
+            let foff = self
+                .layouts
+                .field_offset(vlay, 0)
+                .and_then(|o| i32::try_from(o).ok())
+                .ok_or(self.malformed("a union variant field offset past i32"))?;
+            self.write_tag(dst_lay, variant, dst_ptr)?;
+            self.store_v(dst_ptr, foff, src_lay, v)?;
+            if sret.is_some() {
+                self.b.ret(&[]);
+            } else {
+                let res = self.load_at(dst_ptr, 0, dst_lay)?;
+                self.ret_value(res, dst_lay, ret_pass, None)?;
+            }
+            return Ok(());
+        }
+
+        // Multi-member source sub-union -> destination super-union remapping.
+        if self.layouts.get(dst_lay).is_zst() {
+            return self.ret_value(V::None, dst_lay, ret_pass, sret);
+        }
+        let (src_ptr, src_off) = self.in_memory(v, src_lay)?;
+        let dst_ptr = match sret {
+            Some(p) => p,
+            None => {
+                let slot = self.new_slot(dst_lay, SlotKind::Temp)?;
+                self.b.slot_addr(slot)
+            }
+        };
+        let copy_member = |cx: &mut Self, i: u32, j: u32, member_ty: PTy| -> Result<(), BuildError> {
+            let svlay = match cx.layouts.get(src_lay).variants {
+                Variants::Multiple { .. } => cx.layouts.variant(src_lay, i).ok_or(cx.malformed("a source union variant past its layout"))?,
+                Variants::Single { .. } => src_lay,
+            };
+            let dvlay = match cx.layouts.get(dst_lay).variants {
+                Variants::Multiple { .. } => cx.layouts.variant(dst_lay, j).ok_or(cx.malformed("a dest union variant past its layout"))?,
+                Variants::Single { .. } => dst_lay,
+            };
+            let soff = cx
+                .layouts
+                .field_offset(svlay, 0)
+                .and_then(|o| i32::try_from(o).ok())
+                .ok_or(cx.malformed("a source union field offset past i32"))?;
+            let doff = cx
+                .layouts
+                .field_offset(dvlay, 0)
+                .and_then(|o| i32::try_from(o).ok())
+                .ok_or(cx.malformed("a dest union field offset past i32"))?;
+            let mlay = cx.layout(member_ty)?;
+            cx.write_tag(dst_lay, j, dst_ptr)?;
+            let pv = cx.load_at(src_ptr, src_off + soff, mlay)?;
+            cx.store_v(dst_ptr, doff, mlay, pv)
+        };
+        match self.layouts.get(src_lay).variants {
+            Variants::Single { index } => {
+                let idx = usize::try_from(index).map_err(|_| self.malformed("a source union variant past usize"))?;
+                if let Some(&sm) = src_members.get(idx) {
+                    let j = dst_members
+                        .iter()
+                        .position(|&dm| dm == sm)
+                        .ok_or(self.malformed("a remapped union missing the single present source member"))?;
+                    let j = u32::try_from(j).map_err(|_| self.malformed("a union variant index past u32"))?;
+                    copy_member(self, index, j, sm)?;
+                }
+            }
+            Variants::Multiple { tag, .. } => {
+                let rty = match lir(tag.prim).0 {
+                    Ty::I128 => Ty::I128,
+                    _ => Ty::I64,
+                };
+                let dmask = mask(rty.bits(PTR_BITS));
+                let discr = read_discriminant(&mut self.b, &self.layouts, src_lay, Some((src_ptr, src_off)), rty)
+                    .ok_or(self.malformed("a source union without a readable discriminant in `from`"))?;
+                let join = self.b.create_block(BlockKind::Normal);
+                let none = self.b.create_block(BlockKind::Cold);
+                let mut arms: Vec<(u128, blaze_lir::Block, u32, u32, PTy), A> = Vec::with_capacity_in(src_members.len(), self.alloc);
+                for (i_idx, &sm) in src_members.iter().enumerate() {
+                    let Some(j_idx) = dst_members.iter().position(|&dm| dm == sm) else {
+                        continue;
+                    };
+                    let i = u32::try_from(i_idx).map_err(|_| self.malformed("a union variant index past u32"))?;
+                    let j = u32::try_from(j_idx).map_err(|_| self.malformed("a union variant index past u32"))?;
+                    let d = self.layouts.discriminant(src_lay, i).unwrap_or(i128::from(i)).cast_unsigned() & dmask;
+                    let blk = self.b.create_block(BlockKind::Normal);
+                    arms.push((d, blk, i, j, sm));
+                }
+                let mut cases: Vec<(u128, (blaze_lir::Block, &[Value])), A> = Vec::with_capacity_in(arms.len(), self.alloc);
+                for &(d, blk, ..) in arms.iter() {
+                    cases.push((d, (blk, &[])));
+                }
+                self.b.switch(discr, (none, &[]), &cases);
+                self.b.begin(none);
+                self.b.unreachable();
+                for &(_, blk, i, j, sm) in arms.iter() {
+                    self.b.begin(blk);
+                    copy_member(self, i, j, sm)?;
+                    self.b.jump((join, &[]));
+                }
+                self.b.begin(join);
+            }
+        }
+        if sret.is_some() {
+            self.b.ret(&[]);
+        } else {
+            let res = self.load_at(dst_ptr, 0, dst_lay)?;
+            self.ret_value(res, dst_lay, ret_pass, None)?;
+        }
+        Ok(())
+    }
+
+    /// `#[test]` `Termination::report` C `main` wrapper (`extern "C" fn(i32, *const *const c_char) -> i32`):
+    /// ignores `argc`/`argv`, calls `test()`, passes its result to `<R as Termination>::report`,
+    /// and returns the resulting `ExitCode` byte zero-extended to `i32`.
+    fn run_test_report_shim(
+        &mut self,
+        test: ItemKey,
+        test_sig: &FnSig<'_>,
+        report_fn: ItemKey,
+        report_sig: &FnSig<'_>,
+    ) -> Result<(), BuildError> {
+        let generics = test_sig.parent_count.checked_add(test_sig.own_count).ok_or(self.malformed("a generic count past u32"))?;
+        if generics != 0 || !self.subst.args.is_empty() {
+            return Err(self.malformed("a test report shim whose test fn has generic parameters"));
+        }
+        if !test_sig.inputs.is_empty() {
+            return Err(self.malformed("a test report shim whose test fn takes parameters"));
+        }
+        let test_abi = self.adts.abi(test).ok_or(BuildError::NoAbi { item: test })?;
+        let output = ground(test_sig.types, test_sig.output, &[], self.subst.ground, self.subst.scratch, self.adts.facts())
+            .map_err(|e| BuildError::Facts { stmt: None, error: e })?;
+        let output_lay = self.layout(output)?;
+        let output_pass = self.pass_of_abi(output, test_abi)?;
+
+        let own_sig = self.b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I32), Param::of(Ty::PTR)], &[Param::of(Ty::I32)]);
+        self.b.set_signature(own_sig);
+        let entry = self.b.create_block(BlockKind::Normal);
+        self.b.begin(entry);
+        let _argc = self.b.param(Ty::I32);
+        let _argv = self.b.param(Ty::PTR);
+
+        let test_inst = Instance { item: test, args: List::EMPTY };
+        let test_loc = self.def_site_caller_arg(test_inst, test)?;
+        let test_ref = self.func_ref(test_inst);
+        let r_val = self.call_value(ShimTarget::Direct(test_ref), &[], &[], &[], output_lay, output_pass, None, test_loc)?;
+        if matches!(self.node(output)?, PNode::Never) {
+            self.b.unreachable();
+            return Ok(());
+        }
+
+        let report_abi = self.adts.abi(report_fn).ok_or(BuildError::NoAbi { item: report_fn })?;
+        let report_self_pass = self.pass_of_abi(output, report_abi)?;
+        let exit_ty = ground(report_sig.types, report_sig.output, &[output], self.subst.ground, self.subst.scratch, self.adts.facts())
+            .map_err(|e| BuildError::Facts { stmt: None, error: e })?;
+        let exit_lay = self.layout(exit_ty)?;
+        let exit_pass = self.pass_of_abi(exit_ty, report_abi)?;
+
+        let report_args = self.subst.ground.intern_list(&[output]).map_err(|_| self.malformed("the ground table is full"))?;
+        let report_inst = Instance { item: report_fn, args: report_args };
+        let report_loc = self.def_site_caller_arg(report_inst, report_fn)?;
+        let report_ref = self.func_ref(report_inst);
+        let exit_val = self.call_value(
+            ShimTarget::Direct(report_ref),
+            &[r_val],
+            &[output_lay],
+            &[report_self_pass],
+            exit_lay,
+            exit_pass,
+            None,
+            report_loc,
+        )?;
+        if matches!(self.node(exit_ty)?, PNode::Never) {
+            self.b.unreachable();
+            return Ok(());
+        }
+
+        let exit_size = self.layouts.get(exit_lay).size;
+        let status = match exit_val {
+            V::None => self.b.iconst(Ty::I32, 0),
+            V::One(v) => match self.b.ty(v) {
+                Ty::I1 | Ty::I8 => self.b.convert(Op::Zext, Flags::NONE, Ty::I32, v),
+                Ty::I32 => v,
+                _ => return Err(self.malformed("a `Termination::report` return type that is neither `ExitCode`, `u8`, nor `i32`")),
+            },
+            V::Mem { ptr, off, .. } => match exit_size {
+                1 => {
+                    let byte = self.b.load(Ty::I8, Flags::NONE, ptr, off, MemAttrs::aligned(0));
+                    self.b.convert(Op::Zext, Flags::NONE, Ty::I32, byte)
+                }
+                4 => self.b.load(Ty::I32, Flags::NONE, ptr, off, MemAttrs::aligned(2)),
+                _ => return Err(self.malformed("a `Termination::report` return type whose size is neither 1 nor 4 bytes")),
+            },
+            V::Two(..) => return Err(self.malformed("a `Termination::report` return type that is a scalar pair")),
+        };
+        self.b.ret(&[status]);
+        Ok(())
+    }
 }
 
 /// Builds `core::ptr::drop_in_place::<T>` for the single ground type in `subst.args[0]`,
@@ -1623,5 +2375,47 @@ pub fn build_vtable_shim<A: Allocator + Copy>(
 ) -> Result<Built<A>, BuildError> {
     let mut cx = ShimCx::new(subst, adts, alloc);
     cx.run_vtable_shim(target, sig)?;
+    cx.finish()
+}
+
+/// Builds the language-provided `Clone::clone` shim for `Self` (`subst.args = [Self]`): a tuple,
+/// record, closure, struct, structural union, fn item, or fn pointer.
+pub fn build_builtin_clone<A: Allocator + Copy>(
+    clone: ItemKey,
+    copy: bool,
+    subst: &mut Subst<'_, '_>,
+    adts: &dyn Adts,
+    alloc: A,
+) -> Result<Built<A>, BuildError> {
+    let mut cx = ShimCx::new(subst, adts, alloc);
+    cx.run_builtin_clone(clone, copy)?;
+    cx.finish()
+}
+
+/// Builds the language-provided `From::from` shim for structural error unions
+/// (`subst.args = [Dst, Src]`).
+pub fn build_builtin_from<A: Allocator + Copy>(
+    _from: ItemKey,
+    subst: &mut Subst<'_, '_>,
+    adts: &dyn Adts,
+    alloc: A,
+) -> Result<Built<A>, BuildError> {
+    let mut cx = ShimCx::new(subst, adts, alloc);
+    cx.run_builtin_from()?;
+    cx.finish()
+}
+
+/// Builds the `#[test]` `Termination::report` C `main` wrapper for monomorphic test fn `test`.
+pub fn build_test_report_shim<A: Allocator + Copy>(
+    test: ItemKey,
+    test_sig: &FnSig<'_>,
+    report_fn: ItemKey,
+    report_sig: &FnSig<'_>,
+    subst: &mut Subst<'_, '_>,
+    adts: &dyn Adts,
+    alloc: A,
+) -> Result<Built<A>, BuildError> {
+    let mut cx = ShimCx::new(subst, adts, alloc);
+    cx.run_test_report_shim(test, test_sig, report_fn, report_sig)?;
     cx.finish()
 }

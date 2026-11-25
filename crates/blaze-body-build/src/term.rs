@@ -7,12 +7,12 @@ use core::alloc::Allocator;
 
 use blaze_body::{AssertKind, BinOp, Block as BodyBlock, Callee, CalleeId, Operand, Ops, Place, StmtKind, Unwind};
 use blaze_build::intrinsics::target::{Target as IntrinsicTarget, float::FloatCall};
-use blaze_build::intrinsics::{Arg, Call, GenericArg, IntrinsicCx, Out, Site, Which};
-use blaze_build::layout::{LayoutCx, LayoutId};
+use blaze_build::intrinsics::{Arg, Call, GenericArg, IntrinsicCx, IntrinsicError, Out, Site, Which, lir};
+use blaze_build::layout::{LayoutCx, LayoutId, Prim};
 use blaze_build::vtable::{self, HEADER_WORDS};
 use blaze_build::{Abi, CallerSite, Instance, Intrinsic, OverflowChecks, Panic, PanicConst, abi};
 use blaze_lir::builder::{MemAttrs, Param, Variadic};
-use blaze_lir::func::{BlockKind, Conv, Ext, RefId, SigId, SlotKind};
+use blaze_lir::func::{BlockKind, Conv, Ext, ParamKind, RefId, SigId, SlotKind};
 use blaze_lir::{Block, Flags, IntCond, Ty, Value};
 use blaze_typeck::{ItemKey, List, Mutbl, PNode, PTy};
 
@@ -86,7 +86,8 @@ impl<'a, A: Allocator + Copy> Cx<'a, '_, '_, A> {
             }
             StmtKind::Terminate => self.cannot_unwind(),
             StmtKind::Suspend { .. } => Err(self.unsupported("a suspension (a coroutine's body is split first)")),
-            StmtKind::InlineAsm { .. } => Err(self.unsupported("an `asm!` block")),
+            StmtKind::InlineAsm { asm, operands, target, .. } => self.inline_asm(asm, operands, target),
+            StmtKind::TailCall { callee, args } => self.tail_call(callee, args),
             StmtKind::Assign { .. }
             | StmtKind::StorageLive(_)
             | StmtKind::StorageDead(_)
@@ -97,7 +98,7 @@ impl<'a, A: Allocator + Copy> Cx<'a, '_, '_, A> {
         }
     }
 
-    fn goto(&mut self, to: BodyBlock) -> Result<(), BuildError> {
+    pub(crate) fn goto(&mut self, to: BodyBlock) -> Result<(), BuildError> {
         let block = self.lir_block(to)?;
         let args = self.args_for(to)?;
         self.b.jump((block, &args));
@@ -300,15 +301,15 @@ impl<'a, A: Allocator + Copy> Cx<'a, '_, '_, A> {
     }
 
     /// Lowers a compiler intrinsic (`Intrinsic::Table(which)`) directly via
-    /// `blaze_build::intrinsics::build`, sharing all 100+ intrinsics with zero duplication.
-    fn table_intrinsic(
+    /// `blaze_build::intrinsics::build`, returning `true` when execution continues normally
+    /// (`false` when the intrinsic diverged and emitted `unreachable`).
+    fn table_intrinsic_core(
         &mut self,
         which: Which,
         fn_args: List,
         args: Ops,
         dest: Option<Place>,
-        target: Option<BodyBlock>,
-    ) -> Result<(), BuildError> {
+    ) -> Result<bool, BuildError> {
         let stmt = self.row()?;
         let from = self.from;
         let v = self.v;
@@ -340,8 +341,30 @@ impl<'a, A: Allocator + Copy> Cx<'a, '_, '_, A> {
             out
         };
         let mut cargs: Vec<Arg, A> = Vec::with_capacity_in(ops.len(), self.alloc);
-        for &o in ops.iter() {
+        for (i, &o) in ops.iter().enumerate() {
             let (x, g) = self.operand(o)?;
+            if which == Which::VaArg && i == 0 {
+                let PNode::Ref(_, va_ty) = self.node(g)? else {
+                    return Err(BuildError::Intrinsic {
+                        stmt,
+                        error: IntrinsicError::Shape {
+                            which,
+                            why: "`va_arg` whose argument is not `&mut VaList`",
+                        },
+                    });
+                };
+                let va_lay = self.layout(va_ty)?;
+                let va_l = *self.layouts.get(va_lay);
+                if va_l.size != 8 || va_l.scalar.map(|s| s.prim) != Some(Prim::Ptr) {
+                    return Err(BuildError::Intrinsic {
+                        stmt,
+                        error: IntrinsicError::Unsupported {
+                            which,
+                            why: "a non-pointer `VaList` layout (Linux AAPCS64 register save area)",
+                        },
+                    });
+                }
+            }
             let lay = self.layout(g)?;
             let l = *self.layouts.get(lay);
             let arg = if l.is_zst() {
@@ -385,7 +408,7 @@ impl<'a, A: Allocator + Copy> Cx<'a, '_, '_, A> {
         match out {
             Out::Diverges => {
                 self.b.unreachable();
-                return Ok(());
+                return Ok(false);
             }
             Out::None => {}
             Out::Scalar(val) => {
@@ -421,6 +444,20 @@ impl<'a, A: Allocator + Copy> Cx<'a, '_, '_, A> {
                 }
             }
         }
+        Ok(true)
+    }
+
+    fn table_intrinsic(
+        &mut self,
+        which: Which,
+        fn_args: List,
+        args: Ops,
+        dest: Option<Place>,
+        target: Option<BodyBlock>,
+    ) -> Result<(), BuildError> {
+        if !self.table_intrinsic_core(which, fn_args, args, dest)? {
+            return Ok(());
+        }
         match target {
             Some(to) => self.goto(to),
             None => {
@@ -432,7 +469,7 @@ impl<'a, A: Allocator + Copy> Cx<'a, '_, '_, A> {
 
     /// Lowers a scalar floating-point intrinsic (`llvm.fma.*`, `llvm.sqrt.*`, `llvm.fabs.*`,
     /// etc.) directly to its native hardware LIR instruction, with zero call overhead.
-    fn float_intrinsic(&mut self, fc: FloatCall, args: Ops, dest: Option<Place>, target: Option<BodyBlock>) -> Result<(), BuildError> {
+    fn float_intrinsic_core(&mut self, fc: FloatCall, args: Ops, dest: Option<Place>) -> Result<(), BuildError> {
         if fc.shape.lanes().is_some() {
             return Err(self.unsupported("a vector float intrinsic call"));
         }
@@ -467,6 +504,11 @@ impl<'a, A: Allocator + Copy> Cx<'a, '_, '_, A> {
             let lay = self.dest_layout(dest)?;
             self.write(dest, V::One(res), lay)?;
         }
+        Ok(())
+    }
+
+    fn float_intrinsic(&mut self, fc: FloatCall, args: Ops, dest: Option<Place>, target: Option<BodyBlock>) -> Result<(), BuildError> {
+        self.float_intrinsic_core(fc, args, dest)?;
         match target {
             Some(to) => self.goto(to),
             None => {
@@ -508,6 +550,35 @@ impl<'a, A: Allocator + Copy> Cx<'a, '_, '_, A> {
         Ok(None)
     }
 
+    /// Checks that a C-variadic callee uses a non-unwinding `"C"` ABI, matching `blaze-build`'s
+    /// `walk/c_variadic.rs`.
+    fn check_c_variadic_abi(&self, abi: Abi, nounwind: Option<bool>) -> Result<(), BuildError> {
+        match (abi, nounwind) {
+            (Abi::C, Some(true)) => Ok(()),
+            (Abi::C, Some(false)) => Err(self.unsupported("a call of a C-variadic fn of an unwinding ABI (\"C-unwind\", \"system-unwind\")")),
+            (Abi::C, None) => Err(self.unsupported("a call of a C-variadic fn whose unwind category `Adts::nounwind` does not say")),
+            (Abi::Rust | Abi::RustCall, _) => Err(self.unsupported("`...` on a fn of an ABI other than \"C\" or \"system\"")),
+        }
+    }
+
+    /// Pass of one unnamed (`...`) C-variadic argument: register-sized promoted scalar (`i32`,
+    /// `i64`, `f64`, or pointer), matching `blaze-build`'s `walk/c_variadic.rs::vararg_pass`.
+    fn vararg_pass(&mut self, g: PTy) -> Result<Pass, BuildError> {
+        let lay = self.layout(g)?;
+        let l = *self.layouts.get(lay);
+        let Some(s) = l.scalar else {
+            return Err(self.unsupported("an aggregate, a wide pointer or a value-less type passed to `...`"));
+        };
+        if matches!(self.node(g)?, PNode::Bool) {
+            return Err(self.unsupported("a variable argument narrower than `c_int`, a `bool` or an `f32`"));
+        }
+        let ty = lir(s.prim).0;
+        match ty {
+            Ty::I32 | Ty::I64 | Ty::F64 | Ty::PTR => Ok(Pass::Scalar { ty, ext: Ext::None, agg: false }),
+            _ => Err(self.unsupported("a variable argument narrower than `c_int`, a `bool` or an `f32`")),
+        }
+    }
+
     fn call(&mut self, callee: CalleeId, args: Ops, dest: Option<Place>, target: Option<BodyBlock>, unwind: Unwind) -> Result<(), BuildError> {
         let ops: Vec<Operand, A> = {
             let mut out = Vec::with_capacity_in(args.len() as usize, self.alloc);
@@ -516,6 +587,7 @@ impl<'a, A: Allocator + Copy> Cx<'a, '_, '_, A> {
         };
         let mut dyn_slot: Option<u32> = None;
         let mut variadic = Variadic::No;
+        let mut declared: Option<usize> = None;
         let mut tracked_loc: Option<Value> = None;
         let (to, call_abi, may_unwind) = match self.v.callee(callee) {
             Callee::FnItem { key, args: fn_args } => {
@@ -532,8 +604,10 @@ impl<'a, A: Allocator + Copy> Cx<'a, '_, '_, A> {
                     None => {}
                 }
                 let abi = self.adts.abi(key).ok_or(BuildError::NoAbi { item: key })?;
-                if self.adts.c_variadic(key).is_some() {
+                if let Some(d) = self.adts.c_variadic(key) {
+                    self.check_c_variadic_abi(abi, self.adts.nounwind(key))?;
                     variadic = Variadic::Yes;
+                    declared = Some(usize::try_from(d).map_err(|_| self.malformed("a C-variadic parameter count past usize"))?);
                 }
                 let instance = self.instance(key, fn_args)?;
                 tracked_loc = self.caller_arg(instance, "the callee")?;
@@ -627,7 +701,10 @@ impl<'a, A: Allocator + Copy> Cx<'a, '_, '_, A> {
                 continue;
             }
             let lay = self.layout(g)?;
-            let pass = self.pass_of_abi(g, call_abi)?;
+            let pass = match declared {
+                Some(d) if idx >= d => self.vararg_pass(g)?,
+                _ => self.pass_of_abi(g, call_abi)?,
+            };
             self.pass_arg(x, lay, pass, matches!(o, Operand::Move(_)), &mut values)?;
             passes.push(pass);
         }
@@ -666,14 +743,393 @@ impl<'a, A: Allocator + Copy> Cx<'a, '_, '_, A> {
             values.push(loc);
             passes.push(Pass::Scalar { ty: Ty::PTR, ext: Ext::None, agg: false });
         }
-        let (params, rets) = abi::sig_of_in(&passes, rpass, self.alloc);
+        let named = match declared {
+            Some(d) => passes
+                .get(..d)
+                .ok_or(self.malformed("a C-variadic call with fewer arguments than declared parameters"))?,
+            None => &passes,
+        };
+        let (params, rets) = abi::sig_of_in(named, rpass, self.alloc);
         let sig = self.b.sig(Conv::C, variadic, &params, &rets);
         let landing = self.landing(unwind, may_unwind);
         self.emit(final_target, sig, &values, landing, result, target)
     }
 
+    /// Explicit tail call (`StmtKind::TailCall`, RFC 3407 `become <call_expr>`): emits
+    /// `Op::TailCall` / `Op::TailCallIndirect` when tail-call-eligible (reusing incoming
+    /// caller-owned `Pass::Ref` parameter buffers), or falls back cleanly to a normal call +
+    /// return when ineligible (variadic, `byval`, stacked args, unmatched `Pass::Ref`, or
+    /// incompatible return pass).
+    fn tail_call(&mut self, callee: CalleeId, args: Ops) -> Result<(), BuildError> {
+        let ret_ty = *self.tys.first().ok_or(self.malformed("a body without its return local"))?;
+        let ret_lay = *self.lays.first().ok_or(self.malformed("a body without its return local"))?;
+        let ret_place = self.v.local_place(blaze_body::Local(0));
+        let diverges = matches!(self.node(ret_ty)?, PNode::Never);
+
+        let ops: Vec<Operand, A> = {
+            let cap = usize::try_from(args.len()).unwrap_or(0);
+            let mut out = Vec::with_capacity_in(cap, self.alloc);
+            out.extend(self.v.ops(args));
+            out
+        };
+        let mut dyn_slot: Option<u32> = None;
+        let mut variadic = Variadic::No;
+        let mut declared: Option<usize> = None;
+        let mut tracked_loc: Option<Value> = None;
+        let (to, call_abi) = match self.v.callee(callee) {
+            Callee::FnItem { key, args: fn_args } => {
+                match self.adts.intrinsic(key) {
+                    Some(Intrinsic::Target(IntrinsicTarget::Float(fc))) => {
+                        return self.tail_intrinsic_float(fc, args, if diverges { None } else { Some(ret_place) });
+                    }
+                    Some(Intrinsic::Table(which)) => {
+                        return self.tail_intrinsic_table(which, fn_args, args, if diverges { None } else { Some(ret_place) });
+                    }
+                    Some(Intrinsic::Target(_)) => {
+                        return Err(self.unsupported("a target-specific non-float intrinsic call"));
+                    }
+                    None => {}
+                }
+                let abi = self.adts.abi(key).ok_or(BuildError::NoAbi { item: key })?;
+                if let Some(d) = self.adts.c_variadic(key) {
+                    self.check_c_variadic_abi(abi, self.adts.nounwind(key))?;
+                    variadic = Variadic::Yes;
+                    declared = Some(usize::try_from(d).map_err(|_| self.malformed("a C-variadic parameter count past usize"))?);
+                }
+                let instance = self.instance(key, fn_args)?;
+                tracked_loc = self.caller_arg(instance, "the callee")?;
+                if tracked_loc.is_some() && variadic == Variadic::Yes {
+                    return Err(self.malformed("a C-variadic fn that is `#[track_caller]` (E0737)"));
+                }
+                (Target::Direct(self.func_ref(instance)), abi)
+            }
+            Callee::Method { key, args: fn_args } => {
+                let abi = self.adts.abi(key).ok_or(BuildError::NoAbi { item: key })?;
+                let instance = self.instance(key, fn_args)?;
+                if let Some(slot) = self.dyn_vtable_slot(instance)? {
+                    if self.adts.track_caller(instance, self.subst.ground) == Some(true) {
+                        return Err(BuildError::TrackCaller { stmt: self.row()?, name: "the dyn method" });
+                    }
+                    dyn_slot = Some(slot);
+                    (Target::Direct(RefId(0)), abi)
+                } else {
+                    tracked_loc = self.caller_arg(instance, "the callee")?;
+                    (Target::Direct(self.func_ref(instance)), abi)
+                }
+            }
+            Callee::Value(o) => {
+                let (x, g) = self.operand(o)?;
+                let abi = match self.node(g)? {
+                    PNode::FnPtr(_, header) => {
+                        pointer_abi(header.abi).ok_or(self.unsupported("a fn pointer of an unsupported ABI"))?
+                    }
+                    _ => Abi::Rust,
+                };
+                (Target::Pointer(self.scalar(x)?), abi)
+            }
+            Callee::Intrinsic { key, args: fn_args } => match self.adts.intrinsic(key) {
+                Some(Intrinsic::Target(IntrinsicTarget::Float(fc))) => {
+                    return self.tail_intrinsic_float(fc, args, if diverges { None } else { Some(ret_place) });
+                }
+                Some(Intrinsic::Table(which)) => {
+                    return self.tail_intrinsic_table(which, fn_args, args, if diverges { None } else { Some(ret_place) });
+                }
+                _ => return Err(self.unsupported("an intrinsic call")),
+            },
+        };
+
+        let mut final_target = to;
+        let mut arg_vals: Vec<(V, LayoutId, Pass, bool), A> = Vec::with_capacity_in(ops.len() + 1, self.alloc);
+        let mut passes: Vec<Pass, A> = Vec::with_capacity_in(ops.len() + 1, self.alloc);
+        let regular_ops = if call_abi == Abi::RustCall && !ops.is_empty() { ops.len() - 1 } else { ops.len() };
+        for (idx, &o) in ops.iter().take(regular_ops).enumerate() {
+            let (x, g) = self.operand(o)?;
+            if idx == 0
+                && let Some(slot) = dyn_slot
+            {
+                let [data, vt] = self.wide_values(x)?;
+                let off = 8 * (HEADER_WORDS + slot);
+                let off = i32::try_from(off).map_err(|_| self.malformed("a vtable slot past 2^31 bytes"))?;
+                let fn_ptr = self.b.load(Ty::PTR, Flags::NONE, vt, off, MemAttrs::aligned(3));
+                final_target = Target::Pointer(fn_ptr);
+                let ptr_pass = Pass::Scalar { ty: Ty::PTR, ext: Ext::None, agg: false };
+                let lay = self.layout(g)?;
+                arg_vals.push((V::One(data), lay, ptr_pass, false));
+                passes.push(ptr_pass);
+                continue;
+            }
+            let lay = self.layout(g)?;
+            let pass = match declared {
+                Some(d) if idx >= d => self.vararg_pass(g)?,
+                _ => self.pass_of_abi(g, call_abi)?,
+            };
+            arg_vals.push((x, lay, pass, matches!(o, Operand::Move(_))));
+            passes.push(pass);
+        }
+        if call_abi == Abi::RustCall
+            && let Some(&last_op) = ops.last()
+        {
+            let (x, g) = self.operand(last_op)?;
+            let tlay = self.layout(g)?;
+            let PNode::Tuple(flist) = self.node(g)? else {
+                return Err(self.malformed("a \"rust-call\" call whose last argument is not a tuple"));
+            };
+            let field_tys: Vec<PTy, A> = {
+                let cap = usize::try_from(flist.len).unwrap_or(0);
+                let mut out = Vec::with_capacity_in(cap, self.alloc);
+                let slice = self.subst.ground.view().list(flist).map_err(|_| self.malformed("a tuple's fields past the ground table"))?;
+                out.extend_from_slice(slice);
+                out
+            };
+            if !field_tys.is_empty() {
+                let (ptr, off) = self.in_memory(x, tlay)?;
+                for (i, &fty) in field_tys.iter().enumerate() {
+                    let flay = self.layout(fty)?;
+                    let idx_u32 = u32::try_from(i).map_err(|_| self.malformed("a spread tuple field index past u32"))?;
+                    let foff = self
+                        .layouts
+                        .field_offset(tlay, idx_u32)
+                        .and_then(|o| i32::try_from(o).ok())
+                        .ok_or(self.malformed("a spread tuple field past its layout"))?;
+                    let fv = self.load_at(ptr, off + foff, flay)?;
+                    let fpass = self.pass_of(fty)?;
+                    arg_vals.push((fv, flay, fpass, matches!(last_op, Operand::Move(_))));
+                    passes.push(fpass);
+                }
+            }
+        }
+        if let Some(loc) = tracked_loc {
+            let ptr_pass = Pass::Scalar { ty: Ty::PTR, ext: Ext::None, agg: false };
+            arg_vals.push((V::One(loc), ret_lay, ptr_pass, false));
+            passes.push(ptr_pass);
+        }
+
+        let rpass = if diverges { Pass::Ignore } else { self.pass_of_abi(ret_ty, call_abi)? };
+        let named = match declared {
+            Some(d) => passes
+                .get(..d)
+                .ok_or(self.malformed("a C-variadic call with fewer arguments than declared parameters"))?,
+            None => &passes,
+        };
+        let (params, rets) = abi::sig_of_in(named, rpass, self.alloc);
+
+        // Check tail-call eligibility (matching `blaze-build`'s `walk/tail_call.rs`).
+        let mut can_tail = declared.is_none()
+            && !diverges
+            && !passes.iter().any(|p| matches!(p, Pass::Memory { .. }));
+        if can_tail {
+            let (_, own_rets) = abi::sig_of_in(&[], self.ret, self.alloc);
+            let need_sret = matches!(rpass, Pass::Ref | Pass::Memory { .. });
+            let have_sret = matches!(self.ret, Pass::Ref | Pass::Memory { .. }) && self.sret.is_some();
+            if rets.as_slice() != own_rets.as_slice() || need_sret != have_sret {
+                can_tail = false;
+            }
+        }
+        if can_tail {
+            let max_gpr = if cfg!(target_arch = "x86_64") { 6u32 } else { 8u32 };
+            let mut gpr = 0u32;
+            let mut fpr = 0u32;
+            for p in params.iter() {
+                if p.kind == ParamKind::Byval {
+                    can_tail = false;
+                    break;
+                }
+                if p.kind == ParamKind::Sret {
+                    if cfg!(target_arch = "x86_64") {
+                        gpr += 1;
+                    }
+                    continue;
+                }
+                if p.ty.is_float() {
+                    fpr += 1;
+                } else if p.ty == Ty::I128 {
+                    if !cfg!(target_arch = "x86_64") {
+                        gpr = (gpr + 1) & !1;
+                    }
+                    gpr += 2;
+                } else {
+                    gpr += 1;
+                }
+            }
+            if gpr > max_gpr || fpr > 8 {
+                can_tail = false;
+            }
+        }
+        let mut ref_match: Vec<Option<Value>, A> = Vec::with_capacity_in(arg_vals.len(), self.alloc);
+        if can_tail {
+            let mut used: Vec<bool, A> = Vec::with_capacity_in(self.ref_params.len(), self.alloc);
+            used.resize(self.ref_params.len(), false);
+            for &(_, lay, pass, _) in arg_vals.iter() {
+                if pass == Pass::Ref {
+                    let l = *self.layouts.get(lay);
+                    let mut chosen = None;
+                    for (used_slot, &(ptr, in_size, in_align)) in used.iter_mut().zip(self.ref_params.iter()) {
+                        if !*used_slot && in_size >= l.size && in_align >= l.align {
+                            *used_slot = true;
+                            chosen = Some(ptr);
+                            break;
+                        }
+                    }
+                    if chosen.is_none() {
+                        can_tail = false;
+                        break;
+                    }
+                    ref_match.push(chosen);
+                } else {
+                    ref_match.push(None);
+                }
+            }
+        }
+
+        if can_tail {
+            let mut values: Vec<Value, A> = Vec::with_capacity_in(params.len(), self.alloc);
+            if matches!(rpass, Pass::Ref | Pass::Memory { .. }) {
+                let sret = self.sret.ok_or(self.malformed("an aggregate `become` result without its sret pointer"))?;
+                values.push(sret);
+            }
+            let mut ref_copies: Vec<(LayoutId, V, Value), A> = Vec::new_in(self.alloc);
+            for (i, &(v, lay, pass, moved)) in arg_vals.iter().enumerate() {
+                if pass == Pass::Ref {
+                    let dst_ptr = ref_match
+                        .get(i)
+                        .copied()
+                        .flatten()
+                        .ok_or(self.malformed("a `Pass::Ref` tail-call arg without a matched buffer"))?;
+                    let src = match v {
+                        V::Mem { ptr, .. } if self.ref_params.iter().any(|&(rp, _, _)| rp == ptr) => {
+                            let tmp = self.new_slot(lay, SlotKind::Temp)?;
+                            let tptr = self.b.slot_addr(tmp);
+                            self.store_v(tptr, 0, lay, v)?;
+                            V::Mem { ptr: tptr, off: 0, lay }
+                        }
+                        other => other,
+                    };
+                    values.push(dst_ptr);
+                    ref_copies.push((lay, src, dst_ptr));
+                } else {
+                    self.pass_arg(v, lay, pass, moved, &mut values)?;
+                }
+            }
+            for &(lay, src, dst_ptr) in ref_copies.iter() {
+                self.store_v(dst_ptr, 0, lay, src)?;
+            }
+            let sig = self.b.sig(Conv::C, Variadic::No, &params, &rets);
+            match final_target {
+                Target::Direct(r) => {
+                    self.b.tail_call(Flags::NONE, r, sig, &values);
+                }
+                Target::Pointer(p) => {
+                    self.b.tail_call_indirect(Flags::NONE, p, sig, &values);
+                }
+            }
+            return Ok(());
+        }
+
+        // Fallback to normal call + return when ineligible for hardware tail call.
+        let mut values: Vec<Value, A> = Vec::with_capacity_in(params.len(), self.alloc);
+        let result = if diverges {
+            ResultTo::Nothing
+        } else {
+            match rpass {
+                Pass::Ignore => ResultTo::Nothing,
+                Pass::Scalar { .. } => ResultTo::Value { dest: ret_place, lay: ret_lay },
+                Pass::Wide { .. } => ResultTo::Wide { dest: ret_place, lay: ret_lay },
+                Pass::Ref | Pass::Memory { .. } => {
+                    let (ptr, temp) = match self.dest_memory(ret_place)? {
+                        Some(ptr) => (ptr, None),
+                        None => {
+                            let slot = self.new_slot(ret_lay, SlotKind::Temp)?;
+                            let ptr = self.b.slot_addr(slot);
+                            (ptr, Some(ptr))
+                        }
+                    };
+                    values.push(ptr);
+                    ResultTo::Memory { dest: ret_place, lay: ret_lay, temp }
+                }
+                Pass::Words { size } => ResultTo::Words { dest: ret_place, lay: ret_lay, size },
+            }
+        };
+        for &(v, lay, pass, moved) in arg_vals.iter() {
+            self.pass_arg(v, lay, pass, moved, &mut values)?;
+        }
+        let sig = self.b.sig(Conv::C, variadic, &params, &rets);
+        let r = match final_target {
+            Target::Direct(rf) => self.b.call(Flags::NONE, rf, sig, &values),
+            Target::Pointer(p) => self.b.call_indirect(Flags::NONE, p, sig, &values),
+        };
+        self.write_call_result(r, result)?;
+        if diverges {
+            self.b.unreachable();
+            Ok(())
+        } else {
+            self.ret()
+        }
+    }
+
+    fn tail_intrinsic_table(&mut self, which: Which, fn_args: List, args: Ops, dest: Option<Place>) -> Result<(), BuildError> {
+        if !self.table_intrinsic_core(which, fn_args, args, dest)? {
+            return Ok(());
+        }
+        if dest.is_some() {
+            self.ret()
+        } else {
+            self.b.unreachable();
+            Ok(())
+        }
+    }
+
+    fn tail_intrinsic_float(&mut self, fc: FloatCall, args: Ops, dest: Option<Place>) -> Result<(), BuildError> {
+        self.float_intrinsic_core(fc, args, dest)?;
+        if dest.is_some() {
+            self.ret()
+        } else {
+            self.b.unreachable();
+            Ok(())
+        }
+    }
+
+    fn write_call_result(&mut self, r: Value, result: ResultTo) -> Result<(), BuildError> {
+        match result {
+            ResultTo::Nothing => {}
+            ResultTo::Value { dest, lay } => self.write(dest, V::One(r), lay)?,
+            ResultTo::Wide { dest, lay } => {
+                let data = self.b.project(r, 0);
+                let metadata = self.b.project(r, 1);
+                self.write(dest, V::Two(data, metadata), lay)?;
+            }
+            ResultTo::Memory { temp: None, .. } => {}
+            ResultTo::Memory { dest, lay, temp: Some(ptr) } => {
+                let x = self.load_at(ptr, 0, lay)?;
+                self.write(dest, x, lay)?;
+            }
+            ResultTo::Words { dest, lay, size } => {
+                let align = self.layouts.get(lay).align;
+                let (ptr, is_temp) = match self.dest_memory(dest)? {
+                    Some(ptr) => (ptr, false),
+                    None => {
+                        let slot = self.new_slot(lay, SlotKind::Temp)?;
+                        (self.b.slot_addr(slot), true)
+                    }
+                };
+                if size > 8 {
+                    let w0 = self.b.project(r, 0);
+                    let w1 = self.b.project(r, 1);
+                    self.write_word(w0, ptr, 0, 0, 8, align);
+                    self.write_word(w1, ptr, 0, 8, size - 8, align);
+                } else {
+                    self.write_word(r, ptr, 0, 0, size, align);
+                }
+                if is_temp {
+                    let x = self.load_at(ptr, 0, lay)?;
+                    self.write(dest, x, lay)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The address of `dest` when it is memory already (`None`: a value local).
-    fn dest_memory(&mut self, dest: Place) -> Result<Option<Value>, BuildError> {
+    pub(crate) fn dest_memory(&mut self, dest: Place) -> Result<Option<Value>, BuildError> {
         let row = self.v.place(dest);
         if row.depth == 0 {
             let i = self.ix(row.local)?;
@@ -689,7 +1145,7 @@ impl<'a, A: Allocator + Copy> Cx<'a, '_, '_, A> {
     }
 
     /// The ground type of place `p`.
-    fn place_ty(&mut self, p: Place) -> Result<blaze_typeck::PTy, BuildError> {
+    pub(crate) fn place_ty(&mut self, p: Place) -> Result<blaze_typeck::PTy, BuildError> {
         let row = self.v.place(p);
         if row.depth == 0 {
             let i = self.ix(row.local)?;
@@ -737,42 +1193,7 @@ impl<'a, A: Allocator + Copy> Cx<'a, '_, '_, A> {
                 r
             }
         };
-        match result {
-            ResultTo::Nothing => {}
-            ResultTo::Value { dest, lay } => self.write(dest, V::One(r), lay)?,
-            ResultTo::Wide { dest, lay } => {
-                let data = self.b.project(r, 0);
-                let metadata = self.b.project(r, 1);
-                self.write(dest, V::Two(data, metadata), lay)?;
-            }
-            ResultTo::Memory { temp: None, .. } => {}
-            ResultTo::Memory { dest, lay, temp: Some(ptr) } => {
-                let x = self.load_at(ptr, 0, lay)?;
-                self.write(dest, x, lay)?;
-            }
-            ResultTo::Words { dest, lay, size } => {
-                let align = self.layouts.get(lay).align;
-                let (ptr, is_temp) = match self.dest_memory(dest)? {
-                    Some(ptr) => (ptr, false),
-                    None => {
-                        let slot = self.new_slot(lay, SlotKind::Temp)?;
-                        (self.b.slot_addr(slot), true)
-                    }
-                };
-                if size > 8 {
-                    let w0 = self.b.project(r, 0);
-                    let w1 = self.b.project(r, 1);
-                    self.write_word(w0, ptr, 0, 0, 8, align);
-                    self.write_word(w1, ptr, 0, 8, size - 8, align);
-                } else {
-                    self.write_word(r, ptr, 0, 0, size, align);
-                }
-                if is_temp {
-                    let x = self.load_at(ptr, 0, lay)?;
-                    self.write(dest, x, lay)?;
-                }
-            }
-        }
+        self.write_call_result(r, result)?;
         match target {
             Some(t) => self.goto(t),
             None => {

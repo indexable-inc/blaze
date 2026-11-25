@@ -602,6 +602,19 @@ fn stmt<W: Write>(b: &BodyRef<'_>, kind: StmtKind, w: &mut W) -> Result<(), Prin
             }
             unwind(u, w)?;
         }
+        StmtKind::TailCall { callee, args } => {
+            w.write_str("tail_call ")?;
+            match b.callee(callee)? {
+                Callee::FnItem { key, args } => item(w, "fn", key, args)?,
+                Callee::Method { key, args } => item(w, "method", key, args)?,
+                Callee::Intrinsic { key, args } => item(w, "intrinsic", key, args)?,
+                Callee::Value(o) => {
+                    w.write_str("value ")?;
+                    operand(b, o, w)?;
+                }
+            }
+            ops(b, args, w)?;
+        }
     }
     Ok(())
 }
@@ -1367,6 +1380,18 @@ impl<A: Allocator + Copy> Parser<A> {
                 let operands = self.ops(c)?;
                 let target = Self::then(c)?;
                 StmtKind::InlineAsm { asm, operands, target, unwind: Self::unwind(c)? }
+            }
+            "tail_call" => {
+                let callee = match c.word() {
+                    "fn" => Self::item(c).map(|(key, args)| Callee::FnItem { key, args })?,
+                    "method" => Self::item(c).map(|(key, args)| Callee::Method { key, args })?,
+                    "intrinsic" => Self::item(c).map(|(key, args)| Callee::Intrinsic { key, args })?,
+                    "value" => Callee::Value(self.operand(c)?),
+                    _ => return Err(c.err(ParseWhat::Expected("a callee"))),
+                };
+                let callee = self.b.callee(callee);
+                let args = self.ops(c)?;
+                StmtKind::TailCall { callee, args }
             }
             _ => return Err(c.err(ParseWhat::Expected("a statement"))),
         };
