@@ -37,7 +37,7 @@ use blaze_typeck::BodyView;
 
 use super::*;
 use crate::code_records::reads::{ReadLog, ReadPlant, Recorded, laid_answer};
-use crate::front2::coroutine_needs::{HOLDS_ITSELF, OrderError, held_coroutines, layout_order};
+use crate::front2::coroutine_needs::{HOLDS_ITSELF, OrderError, held_coroutines, layout_order, referenced_coroutines};
 
 /// How a lay ended.
 pub(super) enum Lay {
@@ -105,35 +105,52 @@ fn ground_saved(
     }
 }
 
-/// The coroutines instance `(i, args)`'s body types hold by value (the record's expression and
-/// local types, grounded; the module doc says why a refused one is not a root).
+/// The coroutines instance `(i, args)`'s arguments and (when `include_body`) body types hold by
+/// value or reference through pointers/refs/type args (the module doc says why a refused body type
+/// is not a root). Always inspects `args` and `extra_args` even when the instance has no body
+/// (e.g. `drop_in_place::<Wrapper<C>>`, `vtable_shim`, `fn_shim`, builtin `Clone`/`From`).
+#[expect(clippy::too_many_arguments, reason = "instance grounding tables and optional body walk flag")]
 pub(super) fn roots_of_instance<P: FrontEnd>(
     program: &P,
     bodies: &Bodies<'_>,
     adts: &dyn Adts,
     i: usize,
     args: &[PTy],
+    extra_args: Option<List>,
+    include_body: bool,
     ground: &mut PortableTys<'_>,
     alloc: Alloc<'static>,
 ) -> Result<AVec<'static, CoroutineOf>, RunError> {
     let name = || program.function(i).named();
-    let (Some((body, _)), Some(done)) = (program.function(i).body, bodies.checked.get(i).and_then(Option::as_ref)) else {
-        return Ok(AVec::new_in(alloc));
-    };
-    let view = body.view(program.body_types(i));
-    let record = done.types.view();
-    let mut tys: AVec<'_, PTy> = AVec::new_in(alloc);
-    tys.extend_from_slice(&done.expr_ty);
-    tys.extend_from_slice(&done.local_ty);
-    tys.sort_unstable();
-    tys.dedup();
-    let mut roots: AVec<'_, PTy> = AVec::new_in(alloc);
-    for &t in tys.iter() {
-        if let Ok(g) = ground_saved(&view, record, t, None, args, ground, adts.facts(), alloc) {
-            roots.push(g);
+    let mut roots: AVec<'_, PTy> = AVec::with_capacity_in(args.len(), alloc);
+    roots.extend_from_slice(args);
+    if let Some(list) = extra_args
+        && let Ok(slice) = ground.view().list(list)
+    {
+        roots.extend_from_slice(slice);
+    }
+    if include_body
+        && let (Some((body, _)), Some(done)) = (program.function(i).body, bodies.checked.get(i).and_then(Option::as_ref))
+    {
+        let view = body.view(program.body_types(i));
+        let record = done.types.view();
+        let mut tys: AVec<'_, PTy> = AVec::new_in(alloc);
+        tys.extend_from_slice(&done.expr_ty);
+        tys.extend_from_slice(&done.local_ty);
+        tys.sort_unstable();
+        tys.dedup();
+        for &t in tys.iter() {
+            if let Ok(g) = ground_saved(&view, record, t, None, args, ground, adts.facts(), alloc) {
+                roots.push(g);
+            }
         }
     }
-    held_coroutines(ground, &roots, adts.facts(), alloc).map_err(|error| build_error(program, name(), error, None))
+    if roots.is_empty() {
+        return Ok(AVec::new_in(alloc));
+    }
+    roots.sort_unstable();
+    roots.dedup();
+    referenced_coroutines(ground, &roots, adts.facts(), alloc).map_err(|error| build_error(program, name(), error, None))
 }
 
 /// The ground arguments of coroutine `c`'s owner, copied out of the ground table.
@@ -439,7 +456,7 @@ fn order_and_lay<P: FrontEnd, L: core::alloc::Allocator + Clone>(
             };
             let adts = FrontAdts(program, ci, consts, langs, bodies);
             let args = args_of(ground, c, alloc).map_err(|error| build_error(program, program.function(ci).named(), error, None))?;
-            let uses = roots_of_instance(program, bodies, &adts, ci, &args, &mut *ground, alloc)?;
+            let uses = roots_of_instance(program, bodies, &adts, ci, &args, None, true, &mut *ground, alloc)?;
             for &u in uses.iter() {
                 if !all.contains(&u) && !order.contains(&u) && !pending.contains(&u) {
                     pending.push(u);
