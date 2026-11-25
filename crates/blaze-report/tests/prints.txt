@@ -33,7 +33,6 @@ blaze-lir 10
 blaze-lower 6
 blaze-manifest 2
 blaze-mem 1
-blaze-names-demand 2
 blaze-native 5
 blaze-new 1
 blaze-proc-macro 24

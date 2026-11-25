@@ -47,7 +47,6 @@ blaze-manifest 267
 blaze-memo 1
 blaze-memo-macros 6
 blaze-meter 5
-blaze-names-source 1
 blaze-native 8
 blaze-new 34
 blaze-own 6

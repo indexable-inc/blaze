@@ -91,7 +91,6 @@ blaze-memchr	17
 blaze-memo	95
 blaze-memo-macros	3
 blaze-meter	45
-blaze-names-source	21
 blaze-native	100
 blaze-new	1
 blaze-own	183

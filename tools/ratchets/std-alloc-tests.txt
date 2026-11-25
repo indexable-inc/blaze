@@ -100,8 +100,6 @@ blaze-mem	67	3	6	201	3	3	37	0	0	0
 blaze-memchr	2	0	0	7	0	0	0	0	0	0
 blaze-memo	25	7	2	198	0	0	3	0	0	1
 blaze-meter	12	0	0	4	0	0	2	0	0	0
-blaze-names-demand	8	0	0	0	0	0	0	0	0	0
-blaze-names-source	8	2	0	0	0	0	0	0	0	0
 blaze-native	10	3	0	6	0	0	0	0	0	0
 blaze-own	38	0	5	163	0	0	9	0	0	0
 blaze-pack	3	0	0	39	0	0	0	0	0	0
