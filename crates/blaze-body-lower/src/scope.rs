@@ -133,6 +133,49 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
         }
     }
 
+    /// Drops entries `0..below` in reverse order (parameters last) while keeping entries
+    /// `below..sched.len()` live (the freshly-evaluated callee and arguments of a `become` tail
+    /// call). If a drop of entry `i < below` unwinds, its cleanup path drops `below..sched.len()`
+    /// in reverse order before chaining into `self.chain(i)`.
+    pub(crate) fn emit_exit_below(&mut self, below: usize, span: Span) -> Result<(), LowerError> {
+        let mut i = below;
+        while i > 0 {
+            i -= 1;
+            let Some(&x) = self.sched.get(i) else { return self.refuse(crate::Construct::Malformed, self.body.root) };
+            if x.drops {
+                let base_unwind = self.chain(i);
+                // Chain any droppable tail-call argument temps (`below..`) ahead of `base_unwind`.
+                let mut head = match base_unwind {
+                    Unwind::Cleanup(b) => Some(b),
+                    _ => None,
+                };
+                for j in below..self.sched.len() {
+                    let Some(&arg_e) = self.sched.get(j) else { continue };
+                    if arg_e.drops {
+                        let next_c = match head {
+                            Some(b) => b,
+                            None => self.resume_block(),
+                        };
+                        let blk = self.b.new_block(BlockKind::Cleanup);
+                        self.pending.push(Pending::Drop { block: blk, place: arg_e.place, next: next_c });
+                        head = Some(blk);
+                    }
+                }
+                let unwind = match head {
+                    Some(b) => Unwind::Cleanup(b),
+                    None => Unwind::Continue,
+                };
+                let next = self.b.new_block(BlockKind::Normal);
+                self.b.terminate(StmtKind::Drop { place: x.place, target: next, unwind }, span);
+                self.b.start(next);
+            }
+            if x.storage {
+                self.b.push(StmtKind::StorageDead(x.local), span);
+            }
+        }
+        Ok(())
+    }
+
     /// The exit rows from here down to schedule length `to`: each entry above it, last first,
     /// dropped when its type needs drop (that drop unwinding to the chain below it), then its
     /// storage ended. The schedule is not changed.

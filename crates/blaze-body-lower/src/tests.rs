@@ -1193,3 +1193,181 @@ fn wave2_let_chain_binding_or_value_pat_super_let_deref_index_fn_trait_lower_and
     assert!(tc.contains("method k301"), "OverloadedDeref in closure must emit method call k301:\n{tc}");
     let _ = Arm { pat: PatId(0), guard: None, body: ExprId(0) };
 }
+
+#[test]
+fn become_and_inline_asm_lower_and_verify() {
+    use blaze_typeck::{
+        AsmArch, AsmKind, AsmOperand, AsmPiece, AsmReg, BindAnn, BodyPath, IntTy, List, Lit, PNode,
+        Pat, PatId, PathIdx, PortableTys, Range, ScopeId, Segment, Stmt, StmtId,
+    };
+
+    // 1. `fn f(x: i32) -> i32 { become g(x) }` lowers to `StmtKind::TailCall` and verifies!
+    let mut fx = Fx::new();
+    let i32_t = fx.ty(PNode::Int(IntTy::I32));
+    let f_key = fx.func("f", 0, &[i32_t], i32_t, Default::default());
+    let _g_key = fx.func("g", 0, &[i32_t], i32_t, Default::default());
+    fx.finish();
+    let bt1 = PortableTys::new_in(heap());
+    let pats1 = [Pat::Bind {
+        name: Name::of("x"),
+        ann: BindAnn { by_ref: None, mutable: false },
+        sub: None,
+        ty: None,
+    }];
+    let pat_ranges1 = [Range { start: 0, end: 1 }];
+    let segments1 = [Segment { name: Name::of("g"), generic_args: List::EMPTY, has_args: false }];
+    let paths1 = [BodyPath {
+        scope: ScopeId(0),
+        segments: List { start: 0, len: 1 },
+        lang: None,
+        anchor: None,
+    }];
+    let exprs1 = [
+        Expr::Path(PathIdx(0)),                                            // 0: g
+        Expr::Local(PatId(0)),                                             // 1: x
+        Expr::Call { callee: ExprId(0), args: List { start: 0, len: 1 } }, // 2: g(x)
+        Expr::Become { value: ExprId(2) },                                 // 3: become g(x)
+    ];
+    let expr_lists1 = [ExprId(1)];
+    let expr_ranges1 = [
+        Range { start: 0, end: 1 },
+        Range { start: 1, end: 2 },
+        Range { start: 2, end: 3 },
+        Range { start: 3, end: 4 },
+    ];
+    let params1 = [PatId(0)];
+    let mut bv1 = empty_body_view(f_key, bt1.view(), ExprId(3));
+    bv1.params = &params1;
+    bv1.pats = &pats1;
+    bv1.pat_ranges = &pat_ranges1;
+    bv1.segments = &segments1;
+    bv1.paths = &paths1;
+    bv1.exprs = &exprs1;
+    bv1.expr_lists = &expr_lists1;
+    bv1.expr_ranges = &expr_ranges1;
+    let mut cx1 = InferCtx::new_in(heap());
+    let ck1 = match blaze_typeck::check(&bv1, &fx, &mut cx1, &Needs::new_in(heap()), heap()) {
+        Ok(Outcome::Done(c)) => {
+            assert!(c.diags.is_empty(), "become fixture type-checks clean: {:?}", c.diags);
+            c
+        }
+        Ok(Outcome::Need(n)) => panic!("become world missed {:?}", n.questions),
+        Err(e) => panic!("{e:?}"),
+    };
+    let body1 = lower(&bv1, &ck1, &Plain, heap()).expect("become lowers cleanly");
+    blaze_body::verify(&body1).expect("become body verifies");
+    let mut text1 = blaze_own::String::new_in(heap());
+    blaze_body::print(&body1.view(), &mut text1).expect("prints");
+    assert!(text1.contains("tail_call fn"), "become g(x) must lower to tail_call:\n{text1}");
+
+    // 2. `Expr::Asm` with `in(reg)` + `out(reg)` + `const` lowers, encodes via kept record,
+    //    reopens, and verifies with full `AsmRow` metadata!
+    let mut fx2 = Fx::new();
+    let i64_t = fx2.ty(PNode::Int(IntTy::I64));
+    let owner = fx2.func("asm_fn", 0, &[i64_t], i64_t, Default::default());
+    fx2.finish();
+    let mut bt = PortableTys::new_in(heap());
+    let bt_i64 = bt.intern(PNode::Int(IntTy::I64)).unwrap();
+    let pats = [
+        Pat::Bind {
+            name: Name::of("x"),
+            ann: BindAnn { by_ref: None, mutable: false },
+            sub: None,
+            ty: None,
+        },
+        Pat::Bind {
+            name: Name::of("out"),
+            ann: BindAnn { by_ref: None, mutable: true },
+            sub: None,
+            ty: None,
+        },
+    ];
+    let pat_ranges = [Range { start: 0, end: 1 }, Range { start: 1, end: 2 }];
+    let exprs = [
+        Expr::Lit(Lit::Int(None)), // 0: 0i64 (init out)
+        Expr::Local(PatId(0)),     // 1: x (in)
+        Expr::Local(PatId(1)),     // 2: out (out)
+        Expr::Lit(Lit::Int(None)), // 3: 7i64 (const)
+        Expr::Asm {
+            arch: AsmArch::Aarch64,
+            pieces: List { start: 0, len: 6 },
+            operands: List { start: 0, len: 3 },
+            options: 0,
+            clobber_abis: List::EMPTY,
+        }, // 4: asm!
+        Expr::Local(PatId(1)),     // 5: out (tail)
+        Expr::Block {
+            stmts: List { start: 0, len: 2 },
+            tail: Some(ExprId(5)),
+            scope: ScopeId(0),
+        }, // 6
+    ];
+    let expr_ranges = [
+        Range { start: 0, end: 1 },
+        Range { start: 1, end: 2 },
+        Range { start: 2, end: 3 },
+        Range { start: 3, end: 4 },
+        Range { start: 4, end: 5 },
+        Range { start: 5, end: 6 },
+        Range { start: 6, end: 7 },
+    ];
+    let stmts = [
+        Stmt::Let { pat: PatId(1), ty: Some(bt_i64), init: Some(ExprId(0)), else_: None },
+        Stmt::Expr { expr: ExprId(4), semi: true },
+    ];
+    let stmt_lists = [StmtId(0), StmtId(1)];
+    let params = [PatId(0)];
+    let asm_text = "add , , #reg";
+    let asm_pieces = [
+        AsmPiece::Text { first: 0, len: 4 }, // "add "
+        AsmPiece::Operand { index: 1, modifier: None },
+        AsmPiece::Text { first: 4, len: 2 }, // ", "
+        AsmPiece::Operand { index: 0, modifier: None },
+        AsmPiece::Text { first: 6, len: 3 }, // ", #"
+        AsmPiece::Operand { index: 2, modifier: None },
+    ];
+    let asm_operands = [
+        AsmOperand {
+            kind: AsmKind::In,
+            reg: Some(AsmReg::Class { first: 9, len: 3 }),
+            expr: ExprId(1),
+            out_expr: None,
+        },
+        AsmOperand {
+            kind: AsmKind::Out,
+            reg: Some(AsmReg::Class { first: 9, len: 3 }),
+            expr: ExprId(2),
+            out_expr: None,
+        },
+        AsmOperand { kind: AsmKind::Const, reg: None, expr: ExprId(3), out_expr: None },
+    ];
+    let call_arg_ints = [(ExprId(0), 0u128), (ExprId(3), 7u128)];
+    let mut bv = empty_body_view(owner, bt.view(), ExprId(6));
+    bv.params = &params;
+    bv.pats = &pats;
+    bv.pat_ranges = &pat_ranges;
+    bv.exprs = &exprs;
+    bv.expr_ranges = &expr_ranges;
+    bv.stmts = &stmts;
+    bv.stmt_lists = &stmt_lists;
+    bv.asm_text = asm_text;
+    bv.asm_pieces = &asm_pieces;
+    bv.asm_operands = &asm_operands;
+    bv.call_arg_ints = &call_arg_ints;
+    let unsafe_blocks = [ExprId(6)];
+    bv.unsafe_blocks = &unsafe_blocks;
+
+    let mut cx = InferCtx::new_in(heap());
+    let ck = match blaze_typeck::check(&bv, &fx2, &mut cx, &Needs::new_in(heap()), heap()) {
+        Ok(Outcome::Done(c)) => {
+            assert!(c.diags.is_empty(), "asm fixture type-checks clean: {:?}", c.diags);
+            c
+        }
+        Ok(Outcome::Need(n)) => panic!("asm world missed {:?}", n.questions),
+        Err(e) => panic!("{e:?}"),
+    };
+    let kept_bytes = crate::keep(&bv, &ck, &Plain, heap()).expect("asm body keeps cleanly");
+    let kept = blaze_body::kept::open(&kept_bytes, heap()).expect("kept asm record reopens cleanly");
+    assert_eq!(kept.verified().asms(), 1, "kept body must preserve its AsmRow");
+    assert_eq!(kept.verified().asm(0).ops.len(), 3, "AsmRow must preserve all 3 operands");
+}

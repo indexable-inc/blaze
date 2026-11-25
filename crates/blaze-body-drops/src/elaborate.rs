@@ -36,9 +36,9 @@ use core::cmp::Ordering;
 
 use blaze_body::body::{ExprId, Mutbl, NONE, Role};
 use blaze_body::{
-    BadRow, Block, BlockKind, Body, BodyBuilder, BuildError, CalleeId, Callee, Const, ConstDecl, ConstKind,
-    Local, LocalDecl, LocalKind, Operand, Ops, Origin, Place, Proj, Span, Stmt, StmtKind, Subset, Table,
-    Unwind, Value, Verified,
+    AsmOpInput, AsmPiece, AsmPieceInput, BadRow, Block, BlockKind, Body, BodyBuilder, BuildError,
+    Callee, CalleeId, Const, ConstDecl, ConstKind, Local, LocalDecl, LocalKind, Operand, Ops,
+    Origin, Place, Proj, Span, Stmt, StmtKind, Subset, Table, Unwind, Value, Verified,
 };
 
 use crate::facts::{DropFacts, DropState, Field, NeedsDrop, Part, PartState};
@@ -169,6 +169,8 @@ enum Pending {
     Guarded { block: Block, flag: u32, place: Place, target: Block, unwind: Unwind, span: Span },
     /// A call's return edge: the flags its destination covers, then the call's target.
     Return { block: Block, dest: Place, target: Block, span: Span },
+    /// An `asm!`'s fall-through edge: sets drop flags for any non-discarded output places, then jumps to `target`.
+    AsmReturn { block: Block, asm: u32, target: Block, span: Span },
     /// The end of a ladder that unwinds out of the body.
     Resume { block: Block, span: Span },
 }
@@ -267,6 +269,35 @@ impl<F: DropFacts, A: Allocator + Copy> Elab<'_, '_, F, A> {
         for i in 0..v.blocks() {
             let got = self.b.new_block(v.block(Block(i)).kind);
             self.same(Table::Blocks, got.0, i)?;
+        }
+        let mut pieces: Vec<AsmPieceInput<'_>, A> = Vec::new_in(self.alloc);
+        let mut aops: Vec<AsmOpInput<'_>, A> = Vec::new_in(self.alloc);
+        for i in 0..v.asms() {
+            let row = v.asm(i);
+            pieces.clear();
+            for pi in row.pieces.start..row.pieces.end {
+                pieces.push(match v.asm_piece(pi) {
+                    AsmPiece::Text { start, len } => AsmPieceInput::Text(v.asm_str(start, len)),
+                    AsmPiece::Line => AsmPieceInput::Line,
+                    AsmPiece::Operand { index, modifier } => AsmPieceInput::Operand { index, modifier },
+                });
+            }
+            aops.clear();
+            for oi in row.ops.start..row.ops.end {
+                let op = v.asm_op(oi);
+                aops.push(AsmOpInput {
+                    kind: op.kind,
+                    reg_kind: op.reg_kind,
+                    reg: v.asm_str(op.reg_start, op.reg_len),
+                    in_op: op.in_op,
+                    out_place: op.out_place,
+                    label: op.label,
+                    discard_out: op.discard_out,
+                });
+            }
+            let clobbers = v.asm_str(row.clobbers_start, row.clobbers_len);
+            let got = self.b.new_asm(row.arch, row.options, clobbers, &pieces, &aops);
+            self.same(Table::Asms, got, i)?;
         }
         for s in v.subsets() {
             self.subsets.push(s);
@@ -509,7 +540,7 @@ impl<F: DropFacts, A: Allocator + Copy> Elab<'_, '_, F, A> {
     fn moved_in_terminator(&mut self, kind: StmtKind, span: Span) {
         let v = self.v;
         match kind {
-            StmtKind::Call { callee, args, .. } => {
+            StmtKind::Call { callee, args, .. } | StmtKind::TailCall { callee, args } => {
                 if let Callee::Value(o) = v.callee(callee) {
                     self.moved(o, span);
                 }
@@ -669,7 +700,33 @@ impl<F: DropFacts, A: Allocator + Copy> Elab<'_, '_, F, A> {
             }
             StmtKind::InlineAsm { asm, operands, target, unwind } => {
                 let operands = self.reops(operands);
+                let target = match target {
+                    Some(t) if asm < v.asms() => {
+                        let row = v.asm(asm);
+                        let mut any_flag = false;
+                        for oi in row.ops.start..row.ops.end {
+                            if let Some(p) = v.asm_op(oi).out_place
+                                && self.any_under(p)
+                            {
+                                any_flag = true;
+                                break;
+                            }
+                        }
+                        if any_flag {
+                            let r = self.b.new_block(v.block(t).kind);
+                            self.pending.push(Pending::AsmReturn { block: r, asm, target: t, span });
+                            Some(r)
+                        } else {
+                            Some(t)
+                        }
+                    }
+                    other => other,
+                };
                 self.b.terminate(StmtKind::InlineAsm { asm, operands, target, unwind }, span);
+            }
+            StmtKind::TailCall { callee, args } => {
+                let args = self.reops(args);
+                self.b.terminate(StmtKind::TailCall { callee, args }, span);
             }
             other => {
                 self.b.terminate(other, span);
@@ -819,6 +876,16 @@ impl<F: DropFacts, A: Allocator + Copy> Elab<'_, '_, F, A> {
             Pending::Return { block, dest, target, span } => {
                 self.b.start(block);
                 self.set_under(dest, span);
+                self.b.terminate(StmtKind::Goto(target), span);
+            }
+            Pending::AsmReturn { block, asm, target, span } => {
+                self.b.start(block);
+                let row = self.v.asm(asm);
+                for oi in row.ops.start..row.ops.end {
+                    if let Some(dest) = self.v.asm_op(oi).out_place {
+                        self.set_under(dest, span);
+                    }
+                }
                 self.b.terminate(StmtKind::Goto(target), span);
             }
             Pending::Resume { block, span } => {

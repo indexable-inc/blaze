@@ -580,6 +580,7 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
                 self.jump(target)?;
             }
             StmtKind::Return => return self.ret(),
+            StmtKind::TailCall { callee, args } => return self.tail_call(callee, args),
             // Undefined behaviour reached (the Reference, "Behavior considered undefined").
             StmtKind::Unreachable => return Err(Refusal::Unreachable.into()),
             StmtKind::Resume => return Err(malformed("`resume` reached: the evaluator follows no unwind edge").into()),
@@ -844,6 +845,70 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
             FnKind::Intrinsic(i) => {
                 self.intrinsic(i, iargs, args, d)?;
                 self.jump_opt(target)
+            }
+        }
+    }
+
+    fn tail_call(&mut self, callee: CalleeId, args: Ops) -> R<'a, Option<DataRecord<Alloc<'a>>>> {
+        let body = self.top()?.body;
+        let ret = self.top()?.ret;
+        let (key, gargs) = match body.callee(callee) {
+            Callee::FnItem { key, args } | Callee::Method { key, args } | Callee::Intrinsic { key, args } => {
+                (key, self.ground_list(args)?)
+            }
+            Callee::Value(op) => self.callee_of_value(op)?,
+        };
+        let (item, iargs) = self.resolve(key, gargs)?;
+        match self.world.fn_kind(item) {
+            FnKind::Const => {
+                let f = self.frame(item, iargs, ret)?;
+                let mut k = 1usize;
+                for op in body.ops(args) {
+                    let Some(id) = f.locals.get(k).copied().flatten() else {
+                        for lid in f.locals.iter().flatten() {
+                            self.mem.kill(*lid);
+                        }
+                        return Err(malformed("a tail call with more arguments than its callee takes").into());
+                    };
+                    if let Err(e) = self.operand_into(op, Pointer { alloc: id, offset: 0 }) {
+                        for lid in f.locals.iter().flatten() {
+                            self.mem.kill(*lid);
+                        }
+                        return Err(e);
+                    }
+                    k += 1;
+                }
+                if k != usize::try_from(f.body.args()).unwrap_or(0) + 1 {
+                    for lid in f.locals.iter().flatten() {
+                        self.mem.kill(*lid);
+                    }
+                    return Err(malformed("a tail call with fewer arguments than its callee takes").into());
+                }
+                if let Some(old) = self.frames.pop() {
+                    for lid in old.locals.iter().flatten() {
+                        self.mem.kill(*lid);
+                    }
+                }
+                self.frames.push(f);
+                Ok(None)
+            }
+            FnKind::NotConst => Err(Refusal::NotConstFn { item }.into()),
+            FnKind::UnknownIntrinsic => Err(Refusal::UnknownIntrinsic { item }.into()),
+            FnKind::Missing(fact) => Err(Refusal::FnFact { item, fact }.into()),
+            FnKind::Ctor { variant, .. } => {
+                let d = self.place(body.local_place(Local(0)))?;
+                self.fields(d.ptr, d.ty, variant, body.ops(args))?;
+                self.set_tag(d.ptr, d.ty, variant)?;
+                self.ret()
+            }
+            FnKind::Panic => Err(Refusal::Panic { parts: Vec::new_in(self.alloc) }.into()),
+            FnKind::Intrinsic(Intrinsic::ConstEvalSelect) => {
+                Err(unsupported("`become const_eval_select` in a constant").into())
+            }
+            FnKind::Intrinsic(i) => {
+                let d = self.place(body.local_place(Local(0)))?;
+                self.intrinsic(i, iargs, args, Some(d))?;
+                self.ret()
             }
         }
     }

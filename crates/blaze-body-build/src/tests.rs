@@ -1366,3 +1366,642 @@ fn synthetic_drop_glue_and_shims_build_and_verify() {
         assert!(b_vt.refs.iter().any(|r| r.item == VTABLE_METHOD));
     }
 }
+
+#[test]
+fn builtin_clone_from_and_test_report_shims_build_and_verify() {
+    use blaze_typeck::{AdtKind, CtorKind, Field, FnPtrHeader, FnSig, List, Name, PTys, Variant};
+    use crate::{build_builtin_clone, build_builtin_from, build_test_report_shim};
+
+    const DROP_IN_PLACE: ItemKey = ItemKey(0x7100);
+    const PANIC_CANT_UNWIND: ItemKey = ItemKey(0x7101);
+    const CLONE_FN: ItemKey = ItemKey(0x7102);
+    const FROM_FN: ItemKey = ItemKey(0x7103);
+    const ADT_DROP: ItemKey = ItemKey(0x7104);
+    const DROP_IMPL_FN: ItemKey = ItemKey(0x7105);
+    const TEST_FN: ItemKey = ItemKey(0x7106);
+    const TEST_NEVER: ItemKey = ItemKey(0x7107);
+    const REPORT_FN: ItemKey = ItemKey(0x7108);
+    const EXIT_CODE_ADT: ItemKey = ItemKey(0x7109);
+
+    struct W {
+        tys: PortableTys<'static>,
+        drop_fields: [Field; 1],
+        drop_variants: [Variant; 1],
+        exit_fields: [Field; 1],
+        exit_variants: [Variant; 1],
+    }
+
+    impl LayoutFacts for W {
+        fn adt(&self, key: ItemKey) -> Option<Adt<'_>> {
+            let types = self.tys.view();
+            match key {
+                ADT_DROP => Some(Adt { kind: AdtKind::Struct, generics: 0, variants: &self.drop_variants, fields: &self.drop_fields, types }),
+                EXIT_CODE_ADT => Some(Adt { kind: AdtKind::Struct, generics: 0, variants: &self.exit_variants, fields: &self.exit_fields, types }),
+                _ => None,
+            }
+        }
+        fn repr(&self, _: ItemKey) -> Result<ReprAttrs, Missing> { Ok(ReprAttrs::RUST) }
+        fn discriminant(&self, _: ItemKey, _: u32) -> Result<Option<i128>, Missing> { Ok(None) }
+        fn valid_range(&self, _: ItemKey) -> Result<ValidRange, Missing> { Ok(ValidRange::default()) }
+    }
+
+    impl Adts for W {
+        fn adt(&self, key: ItemKey) -> Option<Adt<'_>> { LayoutFacts::adt(self, key) }
+        fn facts(&self) -> &dyn LayoutFacts { self }
+        fn overflow_checks(&self) -> OverflowChecks { OverflowChecks::Off }
+        fn ub_checks(&self) -> blaze_build::UbChecks { blaze_build::UbChecks::Off }
+        fn panic(&self) -> Panic { Panic::Unwind }
+        fn abi(&self, _: ItemKey) -> Option<Abi> { Some(Abi::Rust) }
+        fn lang_fn(&self, name: &str) -> Option<ItemKey> {
+            match name {
+                "drop_in_place" => Some(DROP_IN_PLACE),
+                "panic_cannot_unwind" => Some(PANIC_CANT_UNWIND),
+                _ => None,
+            }
+        }
+        fn drop_impl(&self, ty: PTy, ground: &mut PortableTys<'_>) -> Result<Option<ItemKey>, blaze_build::BuildError> {
+            Ok(match ground.view().node(ty) {
+                Ok(PNode::Adt(ADT_DROP, _)) => Some(DROP_IMPL_FN),
+                _ => None,
+            })
+        }
+    }
+
+    let mut at = PortableTys::new_in(heap());
+    let u8_t = at.intern(PNode::Uint(blaze_typeck::UintTy::U8)).unwrap();
+    let u32_t = at.intern(PNode::Uint(blaze_typeck::UintTy::U32)).unwrap();
+    let w = W {
+        tys: at,
+        drop_fields: [Field { name: Name::of("x"), ty: u32_t }],
+        drop_variants: [Variant { key: ADT_DROP, name: Name::of("D"), fields: List { start: 0, len: 1 }, ctor: CtorKind::Braces }],
+        exit_fields: [Field { name: Name::of("code"), ty: u8_t }],
+        exit_variants: [Variant { key: EXIT_CODE_ADT, name: Name::of("ExitCode"), fields: List { start: 0, len: 1 }, ctor: CtorKind::Tuple }],
+    };
+
+    // 1. `build_builtin_clone`: Copy tuple, non-Copy tuple with unwind drop, structural union, fn ptr.
+    {
+        let mut g = PortableTys::new_in(heap());
+        let g_u32 = g.intern(PNode::Uint(blaze_typeck::UintTy::U32)).unwrap();
+        let g_i64 = g.intern(PNode::Int(IntTy::I64)).unwrap();
+        let g_empty = g.intern_list(&[]).unwrap();
+        let g_drop = g.intern(PNode::Adt(ADT_DROP, g_empty)).unwrap();
+        let copy_tup_l = g.intern_list(&[g_u32, g_i64]).unwrap();
+        let copy_tup = g.intern(PNode::Tuple(copy_tup_l)).unwrap();
+        let drop_tup_l = g.intern_list(&[g_drop, g_drop]).unwrap();
+        let drop_tup = g.intern(PNode::Tuple(drop_tup_l)).unwrap();
+        let union_l = g.intern_list(&[g_drop, g_u32]).unwrap();
+        let union_ty = g.intern(PNode::Union(union_l)).unwrap();
+        let fp_l = g.intern_list(&[g_i64]).unwrap();
+        let fn_ptr = g.intern(PNode::FnPtr(fp_l, FnPtrHeader::RUST)).unwrap();
+
+        let b_copy = build_builtin_clone(CLONE_FN, true, &mut Subst { args: &[copy_tup], ground: &mut g, scratch: heap() }, &w, heap()).unwrap();
+        assert!(b_copy.refs.is_empty(), "Copy tuple builtin clone must not call field Clone::clone");
+
+        let b_drop = build_builtin_clone(CLONE_FN, false, &mut Subst { args: &[drop_tup], ground: &mut g, scratch: heap() }, &w, heap()).unwrap();
+        let lir_drop = printed(&b_drop);
+        assert!(b_drop.refs.iter().any(|r| r.item == CLONE_FN), "non-Copy tuple must call field Clone::clone");
+        assert!(b_drop.refs.iter().any(|r| r.item == DROP_IN_PLACE), "non-Copy tuple must drop prior field on unwind");
+        assert!(lir_drop.contains("invoke"), "non-Copy tuple clone must invoke second field:\n{lir_drop}");
+        assert!(lir_drop.contains("resume"), "non-Copy tuple clone must resume after cleanup:\n{lir_drop}");
+
+        let b_union = build_builtin_clone(CLONE_FN, false, &mut Subst { args: &[union_ty], ground: &mut g, scratch: heap() }, &w, heap()).unwrap();
+        let lir_union = printed(&b_union);
+        assert!(lir_union.contains("switch"), "structural union clone must switch on discriminant:\n{lir_union}");
+        assert!(b_union.refs.iter().any(|r| r.item == CLONE_FN));
+
+        let b_fp = build_builtin_clone(CLONE_FN, false, &mut Subst { args: &[fn_ptr], ground: &mut g, scratch: heap() }, &w, heap()).unwrap();
+        assert!(b_fp.refs.is_empty(), "fn ptr clone must copy pointer directly");
+    }
+
+    // 2. `build_builtin_from`: single-member injection & multi-member sub-union remapping.
+    {
+        let mut g = PortableTys::new_in(heap());
+        let g_i32 = g.intern(PNode::Int(IntTy::I32)).unwrap();
+        let g_i64 = g.intern(PNode::Int(IntTy::I64)).unwrap();
+        let g_u8 = g.intern(PNode::Uint(blaze_typeck::UintTy::U8)).unwrap();
+        let sub_l = g.intern_list(&[g_i32, g_i64]).unwrap();
+        let sub_u = g.intern(PNode::Union(sub_l)).unwrap();
+        let sup_l = g.intern_list(&[g_i64, g_u8, g_i32]).unwrap();
+        let sup_u = g.intern(PNode::Union(sup_l)).unwrap();
+
+        let b_inj = build_builtin_from(FROM_FN, &mut Subst { args: &[sup_u, g_i32], ground: &mut g, scratch: heap() }, &w, heap()).unwrap();
+        let lir_inj = printed(&b_inj);
+        assert!(lir_inj.contains("store"), "single-member union From::from must write tag and payload:\n{lir_inj}");
+
+        let b_remap = build_builtin_from(FROM_FN, &mut Subst { args: &[sup_u, sub_u], ground: &mut g, scratch: heap() }, &w, heap()).unwrap();
+        let lir_remap = printed(&b_remap);
+        assert!(lir_remap.contains("switch"), "sub-union From::from must switch on source discriminant:\n{lir_remap}");
+    }
+
+    // 3. `build_test_report_shim`: normal ExitCode struct return & diverging `!` test.
+    {
+        let mut g = PortableTys::new_in(heap());
+        let mut st = PortableTys::new_in(heap());
+        let s_u8 = st.intern(PNode::Uint(blaze_typeck::UintTy::U8)).unwrap();
+        let s_empty = st.intern_list(&[]).unwrap();
+        let s_exit = st.intern(PNode::Adt(EXIT_CODE_ADT, s_empty)).unwrap();
+        let s_never = st.intern(PNode::Never).unwrap();
+        let s_param0 = st.intern(PNode::Param(0)).unwrap();
+
+        fn mk_sig<'w>(types: PTys<'w>, inputs: &'w [PTy], output: PTy, own_count: u32) -> FnSig<'w> {
+            FnSig {
+                parent_count: 0,
+                own_count,
+                declared_count: own_count,
+                self_param: false,
+                header: FnPtrHeader::RUST,
+                c_variadic: false,
+                legacy_const_generics: &[],
+                inputs,
+                output,
+                types,
+            }
+        }
+        let test_sig = mk_sig(st.view(), &[], s_u8, 0);
+        let rep_in = [s_param0];
+        let report_sig = mk_sig(st.view(), &rep_in, s_exit, 1);
+
+        let b_test = build_test_report_shim(TEST_FN, &test_sig, REPORT_FN, &report_sig, &mut Subst { args: &[], ground: &mut g, scratch: heap() }, &w, heap()).unwrap();
+        let lir_test = printed(&b_test);
+        assert!(b_test.refs.iter().any(|r| r.item == TEST_FN), "test report shim must call test fn");
+        assert!(b_test.refs.iter().any(|r| r.item == REPORT_FN), "test report shim must call Termination::report");
+        assert!(lir_test.contains("zext"), "1-byte ExitCode must zero-extend to i32:\n{lir_test}");
+
+        let never_sig = mk_sig(st.view(), &[], s_never, 0);
+        let b_never = build_test_report_shim(TEST_NEVER, &never_sig, REPORT_FN, &report_sig, &mut Subst { args: &[], ground: &mut g, scratch: heap() }, &w, heap()).unwrap();
+        let lir_never = printed(&b_never);
+        assert!(lir_never.contains("unreachable"), "diverging test must end in unreachable:\n{lir_never}");
+    }
+}
+
+#[test]
+fn custom_dst_struct_unsized_tail_drop_glue_builds_and_verifies() {
+    use blaze_typeck::{AdtKind, CtorKind, Field, LangItem, List, Name, Variant};
+    use crate::build_drop_glue;
+
+    const DROP_IN_PLACE: ItemKey = ItemKey(0x7200);
+    const PANIC_CANT_UNWIND: ItemKey = ItemKey(0x7201);
+    const ADT_GUARD: ItemKey = ItemKey(0x7202);
+    const DROP_GUARD: ItemKey = ItemKey(0x7203);
+    const ADT_SLICE_DST: ItemKey = ItemKey(0x7204);
+    const DROP_SLICE_DST: ItemKey = ItemKey(0x7205);
+    const ADT_DYN_DST: ItemKey = ItemKey(0x7206);
+    const ADT_BOX: ItemKey = ItemKey(0x7207);
+    const DROP_BOX: ItemKey = ItemKey(0x7208);
+    const TRAIT_TR: ItemKey = ItemKey(0x7209);
+
+    struct DstWorld {
+        tys: PortableTys<'static>,
+        guard_fields: [Field; 1],
+        guard_variants: [Variant; 1],
+        slice_dst_fields: [Field; 2],
+        slice_dst_variants: [Variant; 1],
+        dyn_dst_fields: [Field; 2],
+        dyn_dst_variants: [Variant; 1],
+        box_fields: [Field; 1],
+        box_variants: [Variant; 1],
+    }
+
+    impl LayoutFacts for DstWorld {
+        fn adt(&self, key: ItemKey) -> Option<Adt<'_>> {
+            let types = self.tys.view();
+            match key {
+                ADT_GUARD => Some(Adt { kind: AdtKind::Struct, generics: 0, variants: &self.guard_variants, fields: &self.guard_fields, types }),
+                ADT_SLICE_DST => Some(Adt { kind: AdtKind::Struct, generics: 0, variants: &self.slice_dst_variants, fields: &self.slice_dst_fields, types }),
+                ADT_DYN_DST => Some(Adt { kind: AdtKind::Struct, generics: 0, variants: &self.dyn_dst_variants, fields: &self.dyn_dst_fields, types }),
+                ADT_BOX => Some(Adt { kind: AdtKind::Struct, generics: 1, variants: &self.box_variants, fields: &self.box_fields, types }),
+                _ => None,
+            }
+        }
+        fn repr(&self, _: ItemKey) -> Result<ReprAttrs, Missing> { Ok(ReprAttrs::RUST) }
+        fn discriminant(&self, _: ItemKey, _: u32) -> Result<Option<i128>, Missing> { Ok(None) }
+        fn valid_range(&self, _: ItemKey) -> Result<ValidRange, Missing> { Ok(ValidRange::default()) }
+    }
+
+    impl Adts for DstWorld {
+        fn adt(&self, key: ItemKey) -> Option<Adt<'_>> { LayoutFacts::adt(self, key) }
+        fn facts(&self) -> &dyn LayoutFacts { self }
+        fn overflow_checks(&self) -> OverflowChecks { OverflowChecks::Off }
+        fn ub_checks(&self) -> blaze_build::UbChecks { blaze_build::UbChecks::Off }
+        fn panic(&self) -> Panic { Panic::Unwind }
+        fn abi(&self, _: ItemKey) -> Option<Abi> { Some(Abi::Rust) }
+        fn lang_adt(&self, item: LangItem) -> Option<ItemKey> {
+            (item == LangItem::OwnedBox).then_some(ADT_BOX)
+        }
+        fn lang_fn(&self, name: &str) -> Option<ItemKey> {
+            match name {
+                "drop_in_place" => Some(DROP_IN_PLACE),
+                "panic_cannot_unwind" => Some(PANIC_CANT_UNWIND),
+                _ => None,
+            }
+        }
+        fn drop_impl(&self, ty: PTy, ground: &mut PortableTys<'_>) -> Result<Option<ItemKey>, blaze_build::BuildError> {
+            Ok(match ground.view().node(ty) {
+                Ok(PNode::Adt(ADT_GUARD, _)) => Some(DROP_GUARD),
+                Ok(PNode::Adt(ADT_SLICE_DST, _)) => Some(DROP_SLICE_DST),
+                Ok(PNode::Adt(ADT_BOX, _)) => Some(DROP_BOX),
+                _ => None,
+            })
+        }
+    }
+
+    let mut at = PortableTys::new_in(heap());
+    let u32_t = at.intern(PNode::Uint(blaze_typeck::UintTy::U32)).unwrap();
+    let empty = at.intern_list(&[]).unwrap();
+    let guard_t = at.intern(PNode::Adt(ADT_GUARD, empty)).unwrap();
+    let slice_guard_t = at.intern(PNode::Slice(guard_t)).unwrap();
+    let ex_tr = at.intern(PNode::ExTrait(TRAIT_TR, empty)).unwrap();
+    let dyn_l = at.intern_list(&[ex_tr]).unwrap();
+    let dyn_t = at.intern(PNode::Dynamic(dyn_l)).unwrap();
+    let param0 = at.intern(PNode::Param(0)).unwrap();
+    let ptr_param0 = at.intern(PNode::Ptr(Mutbl::Mut, param0)).unwrap();
+
+    let w = DstWorld {
+        tys: at,
+        guard_fields: [Field { name: Name::of("id"), ty: u32_t }],
+        guard_variants: [Variant { key: ADT_GUARD, name: Name::of("Guard"), fields: List { start: 0, len: 1 }, ctor: CtorKind::Braces }],
+        slice_dst_fields: [
+            Field { name: Name::of("head"), ty: guard_t },
+            Field { name: Name::of("tail"), ty: slice_guard_t },
+        ],
+        slice_dst_variants: [Variant { key: ADT_SLICE_DST, name: Name::of("SliceDst"), fields: List { start: 0, len: 2 }, ctor: CtorKind::Braces }],
+        dyn_dst_fields: [
+            Field { name: Name::of("head"), ty: guard_t },
+            Field { name: Name::of("tail"), ty: dyn_t },
+        ],
+        dyn_dst_variants: [Variant { key: ADT_DYN_DST, name: Name::of("DynDst"), fields: List { start: 0, len: 2 }, ctor: CtorKind::Braces }],
+        box_fields: [Field { name: Name::of("ptr"), ty: ptr_param0 }],
+        box_variants: [Variant { key: ADT_BOX, name: Name::of("Box"), fields: List { start: 0, len: 1 }, ctor: CtorKind::Tuple }],
+    };
+
+    let mut g = PortableTys::new_in(heap());
+    let g_empty = g.intern_list(&[]).unwrap();
+    let g_slice_dst = g.intern(PNode::Adt(ADT_SLICE_DST, g_empty)).unwrap();
+    let g_dyn_dst = g.intern(PNode::Adt(ADT_DYN_DST, g_empty)).unwrap();
+    let box_slice_args = g.intern_list(&[g_slice_dst]).unwrap();
+    let g_box_slice_dst = g.intern(PNode::Adt(ADT_BOX, box_slice_args)).unwrap();
+    let box_dyn_args = g.intern_list(&[g_dyn_dst]).unwrap();
+    let g_box_dyn_dst = g.intern(PNode::Adt(ADT_BOX, box_dyn_args)).unwrap();
+
+    // 1. Custom slice-tailed DST struct: Drop::drop(data, len), prefix Guard, tail [Guard].
+    let b_sd = build_drop_glue(&mut Subst { args: &[g_slice_dst], ground: &mut g, scratch: heap() }, &w, heap()).unwrap();
+    let lir_sd = printed(&b_sd);
+    assert!(b_sd.refs.iter().any(|r| r.item == DROP_SLICE_DST), "SliceDst glue must call Drop::drop");
+    assert!(b_sd.refs.iter().filter(|r| r.item == DROP_IN_PLACE).count() >= 2, "SliceDst glue must drop prefix and slice tail");
+    assert!(lir_sd.contains("invoke") && lir_sd.contains("resume"), "SliceDst glue must build unwind ladder:\n{lir_sd}");
+
+    // 2. Custom dyn-tailed DST struct: prefix Guard, runtime vtable alignment offset, drop_in_place::<dyn Tr>.
+    let b_dd = build_drop_glue(&mut Subst { args: &[g_dyn_dst], ground: &mut g, scratch: heap() }, &w, heap()).unwrap();
+    let lir_dd = printed(&b_dd);
+    assert!(lir_dd.contains("ptr_add"), "DynDst glue must compute runtime tail offset via vtable alignment:\n{lir_dd}");
+    assert!(b_dd.refs.iter().filter(|r| r.item == DROP_IN_PLACE).count() >= 2, "DynDst glue must drop prefix and dyn tail");
+
+    // 3. Box<SliceDst> and Box<DynDst> drop contents with wide pointers before Box::drop.
+    let b_bsd = build_drop_glue(&mut Subst { args: &[g_box_slice_dst], ground: &mut g, scratch: heap() }, &w, heap()).unwrap();
+    assert!(b_bsd.refs.iter().any(|r| r.item == DROP_IN_PLACE) && b_bsd.refs.iter().any(|r| r.item == DROP_BOX));
+    let b_bdd = build_drop_glue(&mut Subst { args: &[g_box_dyn_dst], ground: &mut g, scratch: heap() }, &w, heap()).unwrap();
+    assert!(b_bdd.refs.iter().any(|r| r.item == DROP_IN_PLACE) && b_bdd.refs.iter().any(|r| r.item == DROP_BOX));
+}
+
+#[test]
+fn c_variadic_def_call_and_va_arg_build_and_verify() {
+    use blaze_body::{BodyBuilder, Callee, LocalDecl, LocalKind, Operand, Span, StmtKind, Unwind, Value};
+    use blaze_typeck::{AdtKind, CtorKind, Field, List, Name, Variant};
+
+    const VA_LIST_ADT: ItemKey = ItemKey(0x7300);
+    const VA_DEF_FN: ItemKey = ItemKey(0x7301);
+    const VA_ARG_INTR: ItemKey = ItemKey(0x7302);
+    const CALLER_FN: ItemKey = ItemKey(0x7303);
+
+    struct VaWorld {
+        tys: PortableTys<'static>,
+        va_fields: [Field; 1],
+        va_variants: [Variant; 1],
+    }
+
+    impl LayoutFacts for VaWorld {
+        fn adt(&self, key: ItemKey) -> Option<Adt<'_>> {
+            (key == VA_LIST_ADT).then(|| Adt {
+                kind: AdtKind::Struct,
+                generics: 0,
+                variants: &self.va_variants,
+                fields: &self.va_fields,
+                types: self.tys.view(),
+            })
+        }
+        fn repr(&self, _: ItemKey) -> Result<ReprAttrs, Missing> { Ok(ReprAttrs::RUST) }
+        fn discriminant(&self, _: ItemKey, _: u32) -> Result<Option<i128>, Missing> { Ok(None) }
+        fn valid_range(&self, _: ItemKey) -> Result<ValidRange, Missing> { Ok(ValidRange::default()) }
+    }
+
+    impl Adts for VaWorld {
+        fn adt(&self, key: ItemKey) -> Option<Adt<'_>> { LayoutFacts::adt(self, key) }
+        fn facts(&self) -> &dyn LayoutFacts { self }
+        fn overflow_checks(&self) -> OverflowChecks { OverflowChecks::Off }
+        fn ub_checks(&self) -> blaze_build::UbChecks { blaze_build::UbChecks::Off }
+        fn panic(&self) -> Panic { Panic::Abort }
+        fn abi(&self, item: ItemKey) -> Option<Abi> {
+            Some(if item == VA_DEF_FN { Abi::C } else { Abi::Rust })
+        }
+        fn nounwind(&self, item: ItemKey) -> Option<bool> {
+            Some(item == VA_DEF_FN)
+        }
+        fn c_variadic(&self, item: ItemKey) -> Option<u32> {
+            (item == VA_DEF_FN).then_some(1)
+        }
+        fn intrinsic(&self, item: ItemKey) -> Option<blaze_build::Intrinsic> {
+            (item == VA_ARG_INTR).then_some(blaze_build::Intrinsic::Table(blaze_build::intrinsics::Which::VaArg))
+        }
+        fn drop_impl(&self, _: PTy, _: &mut PortableTys<'_>) -> Result<Option<ItemKey>, blaze_build::BuildError> {
+            Ok(None)
+        }
+    }
+
+    let mut at = PortableTys::new_in(heap());
+    let u8_t = at.intern(PNode::Uint(blaze_typeck::UintTy::U8)).unwrap();
+    let ptr_u8 = at.intern(PNode::Ptr(Mutbl::Mut, u8_t)).unwrap();
+    let w = VaWorld {
+        tys: at,
+        va_fields: [Field { name: Name::of("ptr"), ty: ptr_u8 }],
+        va_variants: [Variant { key: VA_LIST_ADT, name: Name::of("VaList"), fields: List { start: 0, len: 1 }, ctor: CtorKind::Tuple }],
+    };
+
+    let mut from = PortableTys::new_in(heap());
+    let i32_t = from.intern(PNode::Int(IntTy::I32)).unwrap();
+    let empty = from.intern_list(&[]).unwrap();
+    let va_t = from.intern(PNode::Adt(VA_LIST_ADT, empty)).unwrap();
+    let ref_mut_va = from.intern(PNode::Ref(Mutbl::Mut, va_t)).unwrap();
+    let va_arg_gen = from.intern_list(&[i32_t]).unwrap();
+
+    // 1. C-variadic definition: `extern "C" fn sum(first: i32, mut ap: ...) -> i32 { first + va_arg::<i32>(&mut ap) }`
+    let mut b = BodyBuilder::new_in(heap());
+    let l0 = b.new_local(LocalDecl { ty: i32_t, kind: LocalKind::Return, mutbl: Mutbl::Mut });
+    let l1 = b.new_local(LocalDecl { ty: i32_t, kind: LocalKind::Arg(0), mutbl: Mutbl::Not });
+    let l2 = b.new_local(LocalDecl { ty: va_t, kind: LocalKind::Arg(1), mutbl: Mutbl::Mut });
+    let l3 = b.new_local(LocalDecl { ty: ref_mut_va, kind: LocalKind::Temp(blaze_body::body::ExprId(0), blaze_body::Role::Borrow), mutbl: Mutbl::Not });
+    let l4 = b.new_local(LocalDecl { ty: i32_t, kind: LocalKind::Temp(blaze_body::body::ExprId(1), blaze_body::Role::Value), mutbl: Mutbl::Mut });
+    let p0 = b.local_place(l0);
+    let p1 = b.local_place(l1);
+    let p2 = b.local_place(l2);
+    let p3 = b.local_place(l3);
+    let p4 = b.local_place(l4);
+    let o0 = b.origin(false);
+    let bb0 = b.new_block(blaze_body::BlockKind::Normal);
+    let bb1 = b.new_block(blaze_body::BlockKind::Normal);
+    b.start(bb0);
+    b.borrow(p3, blaze_body::BorrowKind::Mut, p2, o0, Span::default());
+    let c_va = b.callee(Callee::Intrinsic { key: VA_ARG_INTR, args: va_arg_gen });
+    let a_va = b.operands(&[Operand::Move(p3)]);
+    b.terminate(StmtKind::Call { callee: c_va, args: a_va, dest: Some(p4), target: Some(bb1), unwind: Unwind::Continue }, Span::default());
+    b.start(bb1);
+    b.assign(p0, Value::Binary { op: blaze_body::BinOp::Add, lhs: Operand::Copy(p1), rhs: Operand::Copy(p4) }, Span::default());
+    b.terminate(StmtKind::Return, Span::default());
+    let body = b.finish().unwrap();
+    let ver = blaze_body::verify(&body).unwrap();
+
+    let mut ground = PortableTys::new_in(heap());
+    let built_def = build(ver, from.view(), VA_DEF_FN, &mut Subst { args: &[], ground: &mut ground, scratch: heap() }, &w, heap()).unwrap();
+    let lir_def = printed(&built_def);
+    assert!(lir_def.contains("blaze.va_start"), "C-variadic def must call blaze.va_start:\n{lir_def}");
+    assert!(lir_def.contains("variadic"), "C-variadic def signature must be variadic:\n{lir_def}");
+
+    // 2. Caller invoking `sum(10, 32)`: signature has 1 named param + `...`, call passes 2 args!
+    let mut cb = BodyBuilder::new_in(heap());
+    let cl0 = cb.new_local(LocalDecl { ty: i32_t, kind: LocalKind::Return, mutbl: Mutbl::Mut });
+    let cp0 = cb.local_place(cl0);
+    let k10 = cb.new_const(blaze_body::ConstDecl { kind: blaze_body::ConstKind::Scalar { bits: 10 }, ty: i32_t });
+    let k32 = cb.new_const(blaze_body::ConstDecl { kind: blaze_body::ConstKind::Scalar { bits: 32 }, ty: i32_t });
+    let cbb0 = cb.new_block(blaze_body::BlockKind::Normal);
+    let cbb1 = cb.new_block(blaze_body::BlockKind::Normal);
+    cb.start(cbb0);
+    let c_fn = cb.callee(Callee::FnItem { key: VA_DEF_FN, args: empty });
+    let c_args = cb.operands(&[Operand::Const(k10), Operand::Const(k32)]);
+    cb.terminate(StmtKind::Call { callee: c_fn, args: c_args, dest: Some(cp0), target: Some(cbb1), unwind: Unwind::Continue }, Span::default());
+    cb.start(cbb1);
+    cb.terminate(StmtKind::Return, Span::default());
+    let cbody = cb.finish().unwrap();
+    let cver = blaze_body::verify(&cbody).unwrap();
+
+    let built_call = build(cver, from.view(), CALLER_FN, &mut Subst { args: &[], ground: &mut ground, scratch: heap() }, &w, heap()).unwrap();
+    let lir_call = printed(&built_call);
+    assert!(lir_call.contains("variadic"), "C-variadic call signature must be variadic with named-only params:\n{lir_call}");
+}
+
+#[test]
+fn become_explicit_tail_call_emits_tail_call_and_reuses_ref_params() {
+    use blaze_body::{BodyBuilder, Callee, LocalDecl, LocalKind, Operand, Span, StmtKind};
+    use blaze_typeck::{AdtKind, CtorKind, Field, FnPtrHeader, List, Name, Variant};
+
+    const BIG_ADT: ItemKey = ItemKey(0x7400);
+    const TAIL_DIRECT: ItemKey = ItemKey(0x7401);
+    const TAIL_INDIRECT: ItemKey = ItemKey(0x7402);
+    const TAIL_BIG: ItemKey = ItemKey(0x7403);
+
+    struct TailWorld {
+        tys: PortableTys<'static>,
+        big_fields: [Field; 4],
+        big_variants: [Variant; 1],
+    }
+
+    impl LayoutFacts for TailWorld {
+        fn adt(&self, key: ItemKey) -> Option<Adt<'_>> {
+            (key == BIG_ADT).then(|| Adt {
+                kind: AdtKind::Struct,
+                generics: 0,
+                variants: &self.big_variants,
+                fields: &self.big_fields,
+                types: self.tys.view(),
+            })
+        }
+        fn repr(&self, _: ItemKey) -> Result<ReprAttrs, Missing> { Ok(ReprAttrs::RUST) }
+        fn discriminant(&self, _: ItemKey, _: u32) -> Result<Option<i128>, Missing> { Ok(None) }
+        fn valid_range(&self, _: ItemKey) -> Result<ValidRange, Missing> { Ok(ValidRange::default()) }
+    }
+
+    impl Adts for TailWorld {
+        fn adt(&self, key: ItemKey) -> Option<Adt<'_>> { LayoutFacts::adt(self, key) }
+        fn facts(&self) -> &dyn LayoutFacts { self }
+        fn overflow_checks(&self) -> OverflowChecks { OverflowChecks::Off }
+        fn ub_checks(&self) -> blaze_build::UbChecks { blaze_build::UbChecks::Off }
+        fn panic(&self) -> Panic { Panic::Abort }
+        fn abi(&self, _: ItemKey) -> Option<Abi> { Some(Abi::Rust) }
+        fn drop_impl(&self, _: PTy, _: &mut PortableTys<'_>) -> Result<Option<ItemKey>, blaze_build::BuildError> {
+            Ok(None)
+        }
+    }
+
+    let mut at = PortableTys::new_in(heap());
+    let i64_t = at.intern(PNode::Int(IntTy::I64)).unwrap();
+    let w = TailWorld {
+        tys: at,
+        big_fields: [
+            Field { name: Name::of("a"), ty: i64_t },
+            Field { name: Name::of("b"), ty: i64_t },
+            Field { name: Name::of("c"), ty: i64_t },
+            Field { name: Name::of("d"), ty: i64_t },
+        ],
+        big_variants: [Variant { key: BIG_ADT, name: Name::of("Big"), fields: List { start: 0, len: 4 }, ctor: CtorKind::Braces }],
+    };
+
+    let mut from = PortableTys::new_in(heap());
+    let f_i64 = from.intern(PNode::Int(IntTy::I64)).unwrap();
+    let empty = from.intern_list(&[]).unwrap();
+    let f_big = from.intern(PNode::Adt(BIG_ADT, empty)).unwrap();
+    let fp_list = from.intern_list(&[f_i64, f_i64]).unwrap();
+    let f_fnptr = from.intern(PNode::FnPtr(fp_list, FnPtrHeader::RUST)).unwrap();
+
+    // 1. Direct `tail_call` emits `Op::TailCall`.
+    let mut b = BodyBuilder::new_in(heap());
+    let _l0 = b.new_local(LocalDecl { ty: f_i64, kind: LocalKind::Return, mutbl: Mutbl::Mut });
+    let l1 = b.new_local(LocalDecl { ty: f_i64, kind: LocalKind::Arg(0), mutbl: Mutbl::Not });
+    let p1 = b.local_place(l1);
+    let bb0 = b.new_block(blaze_body::BlockKind::Normal);
+    b.start(bb0);
+    let c = b.callee(Callee::FnItem { key: CALLEE, args: empty });
+    let args = b.operands(&[Operand::Copy(p1)]);
+    b.terminate(StmtKind::TailCall { callee: c, args }, Span::default());
+    let body = b.finish().unwrap();
+    let ver = blaze_body::verify(&body).unwrap();
+    let mut g = PortableTys::new_in(heap());
+    let built = build(ver, from.view(), TAIL_DIRECT, &mut Subst { args: &[], ground: &mut g, scratch: heap() }, &w, heap()).unwrap();
+    let lir = printed(&built);
+    assert!(lir.contains("tail_call "), "direct StmtKind::TailCall must emit Op::TailCall:\n{lir}");
+
+    // 2. Indirect `tail_call` emits `Op::TailCallIndirect`.
+    let mut ib = BodyBuilder::new_in(heap());
+    let _il0 = ib.new_local(LocalDecl { ty: f_i64, kind: LocalKind::Return, mutbl: Mutbl::Mut });
+    let il1 = ib.new_local(LocalDecl { ty: f_fnptr, kind: LocalKind::Arg(0), mutbl: Mutbl::Not });
+    let il2 = ib.new_local(LocalDecl { ty: f_i64, kind: LocalKind::Arg(1), mutbl: Mutbl::Not });
+    let ip1 = ib.local_place(il1);
+    let ip2 = ib.local_place(il2);
+    let ibb0 = ib.new_block(blaze_body::BlockKind::Normal);
+    ib.start(ibb0);
+    let ic = ib.callee(Callee::Value(Operand::Copy(ip1)));
+    let iargs = ib.operands(&[Operand::Copy(ip2)]);
+    ib.terminate(StmtKind::TailCall { callee: ic, args: iargs }, Span::default());
+    let ibody = ib.finish().unwrap();
+    let iver = blaze_body::verify(&ibody).unwrap();
+    let ibuilt = build(iver, from.view(), TAIL_INDIRECT, &mut Subst { args: &[], ground: &mut g, scratch: heap() }, &w, heap()).unwrap();
+    let ilir = printed(&ibuilt);
+    assert!(ilir.contains("tail_call_indirect "), "indirect StmtKind::TailCall must emit Op::TailCallIndirect:\n{ilir}");
+
+    // 3. Large `Pass::Ref` struct parameter buffer reuse in `tail_call`.
+    let mut bb = BodyBuilder::new_in(heap());
+    let _bl0 = bb.new_local(LocalDecl { ty: f_big, kind: LocalKind::Return, mutbl: Mutbl::Mut });
+    let bl1 = bb.new_local(LocalDecl { ty: f_big, kind: LocalKind::Arg(0), mutbl: Mutbl::Not });
+    let bp1 = bb.local_place(bl1);
+    let bbb0 = bb.new_block(blaze_body::BlockKind::Normal);
+    bb.start(bbb0);
+    let bc = bb.callee(Callee::FnItem { key: TAIL_BIG, args: empty });
+    let bargs = bb.operands(&[Operand::Move(bp1)]);
+    bb.terminate(StmtKind::TailCall { callee: bc, args: bargs }, Span::default());
+    let bbody = bb.finish().unwrap();
+    let bver = blaze_body::verify(&bbody).unwrap();
+    let bbuilt = build(bver, from.view(), TAIL_BIG, &mut Subst { args: &[], ground: &mut g, scratch: heap() }, &w, heap()).unwrap();
+    let blir = printed(&bbuilt);
+    assert!(blir.contains("tail_call "), "Pass::Ref buffer reuse must emit real Op::TailCall:\n{blir}");
+}
+
+#[test]
+fn inline_asm_aarch64_in_out_inout_const_sym_label_builds_and_verifies() {
+    use blaze_body::{
+        AsmArch, AsmOpInput, AsmOpKind, AsmPieceInput, AsmRegKind, BodyBuilder, ConstDecl,
+        ConstKind, LocalDecl, LocalKind, Operand, Span, StmtKind, Unwind, Value,
+    };
+
+    let mut from = PortableTys::new_in(heap());
+    let i64_t = from.intern(PNode::Int(IntTy::I64)).unwrap();
+    let empty = from.intern_list(&[]).unwrap();
+    let fn_sym_t = from.intern(PNode::FnDef(CALLEE, empty)).unwrap();
+    let w = World { panic: Panic::Abort };
+
+    // 1. `asm!("add {out}, {inp}, #{c}", "bl {f}", inp = in(reg) x, out = out(reg) y, c = const 42, f = sym CALLEE, out("x9") _, clobber_abi("C"))`
+    let mut b = BodyBuilder::new_in(heap());
+    let l0 = b.new_local(LocalDecl { ty: i64_t, kind: LocalKind::Return, mutbl: Mutbl::Mut });
+    let l1 = b.new_local(LocalDecl { ty: i64_t, kind: LocalKind::Arg(0), mutbl: Mutbl::Not });
+    let p0 = b.local_place(l0);
+    let p1 = b.local_place(l1);
+    let k42 = b.new_const(ConstDecl { kind: ConstKind::Scalar { bits: 42 }, ty: i64_t });
+    let ksym = b.new_const(ConstDecl { kind: ConstKind::FnItem { key: CALLEE, args: empty }, ty: fn_sym_t });
+    let bb0 = b.new_block(blaze_body::BlockKind::Normal);
+    let bb1 = b.new_block(blaze_body::BlockKind::Normal);
+    let asm_id = b.new_asm(
+        AsmArch::Aarch64,
+        0,
+        "C",
+        &[
+            AsmPieceInput::Text("add "),
+            AsmPieceInput::Operand { index: 1, modifier: None },
+            AsmPieceInput::Text(", "),
+            AsmPieceInput::Operand { index: 0, modifier: None },
+            AsmPieceInput::Text(", #"),
+            AsmPieceInput::Operand { index: 2, modifier: None },
+            AsmPieceInput::Line,
+            AsmPieceInput::Text("bl "),
+            AsmPieceInput::Operand { index: 3, modifier: None },
+        ],
+        &[
+            AsmOpInput { kind: AsmOpKind::In, reg_kind: AsmRegKind::Class, reg: "reg", in_op: Some(0), out_place: None, label: None, discard_out: false },
+            AsmOpInput { kind: AsmOpKind::Out, reg_kind: AsmRegKind::Class, reg: "reg", in_op: None, out_place: Some(p0), label: None, discard_out: false },
+            AsmOpInput { kind: AsmOpKind::Const, reg_kind: AsmRegKind::None, reg: "", in_op: Some(1), out_place: None, label: None, discard_out: false },
+            AsmOpInput { kind: AsmOpKind::Sym, reg_kind: AsmRegKind::None, reg: "", in_op: Some(2), out_place: None, label: None, discard_out: false },
+            AsmOpInput { kind: AsmOpKind::Out, reg_kind: AsmRegKind::Explicit, reg: "x9", in_op: None, out_place: None, label: None, discard_out: true },
+        ],
+    );
+    let ops = b.operands(&[Operand::Copy(p1), Operand::Const(k42), Operand::Const(ksym)]);
+    b.start(bb0);
+    b.terminate(StmtKind::InlineAsm { asm: asm_id, operands: ops, target: Some(bb1), unwind: Unwind::Continue }, Span::default());
+    b.start(bb1);
+    b.terminate(StmtKind::Return, Span::default());
+    let body = b.finish().unwrap();
+    // Round-trip through binary record encoding to verify VERSION=4 preserves all asm tables!
+    let encoded = blaze_body::try_encode(&body.view(), heap()).unwrap();
+    let reopened = blaze_body::open(&encoded).unwrap();
+    let ver = blaze_body::verify_ref(reopened).unwrap();
+
+    let mut g = PortableTys::new_in(heap());
+    let built = build(ver, from.view(), ITEM, &mut Subst { args: &[], ground: &mut g, scratch: heap() }, &w, heap()).unwrap();
+    let lir = printed(&built);
+    assert!(lir.contains("asm "), "InlineAsm must emit LIR asm instruction:\n{lir}");
+    assert!(lir.contains("#42"), "const operand must be formatted into template:\n{lir}");
+    assert!(built.refs.iter().any(|r| r.item == CALLEE), "sym operand must register fn ref");
+
+    // 2. `asm!` with `label` operand emits `asm_br` and valid SSA bridge block!
+    let mut lb = BodyBuilder::new_in(heap());
+    let ll0 = lb.new_local(LocalDecl { ty: i64_t, kind: LocalKind::Return, mutbl: Mutbl::Mut });
+    let ll1 = lb.new_local(LocalDecl { ty: i64_t, kind: LocalKind::Arg(0), mutbl: Mutbl::Not });
+    let lp0 = lb.local_place(ll0);
+    let lp1 = lb.local_place(ll1);
+    let k1 = lb.new_const(ConstDecl { kind: ConstKind::Scalar { bits: 1 }, ty: i64_t });
+    let k2 = lb.new_const(ConstDecl { kind: ConstKind::Scalar { bits: 2 }, ty: i64_t });
+    let lbb0 = lb.new_block(blaze_body::BlockKind::Normal);
+    let lbb_fall = lb.new_block(blaze_body::BlockKind::Normal);
+    let lbb_lbl = lb.new_block(blaze_body::BlockKind::Normal);
+    let lbb_join = lb.new_block(blaze_body::BlockKind::Normal);
+    let lasm = lb.new_asm(
+        AsmArch::Aarch64,
+        0,
+        "",
+        &[AsmPieceInput::Text("cbnz "), AsmPieceInput::Operand { index: 0, modifier: None }, AsmPieceInput::Text(", "), AsmPieceInput::Operand { index: 1, modifier: None }],
+        &[
+            AsmOpInput { kind: AsmOpKind::In, reg_kind: AsmRegKind::Class, reg: "reg", in_op: Some(0), out_place: None, label: None, discard_out: false },
+            AsmOpInput { kind: AsmOpKind::Label, reg_kind: AsmRegKind::None, reg: "", in_op: None, out_place: None, label: Some(lbb_lbl), discard_out: false },
+        ],
+    );
+    let lops = lb.operands(&[Operand::Copy(lp1)]);
+    lb.start(lbb0);
+    lb.terminate(StmtKind::InlineAsm { asm: lasm, operands: lops, target: Some(lbb_fall), unwind: Unwind::Continue }, Span::default());
+    lb.start(lbb_fall);
+    lb.assign(lp0, Value::Use(Operand::Const(k1)), Span::default());
+    lb.terminate(StmtKind::Goto(lbb_join), Span::default());
+    lb.start(lbb_lbl);
+    lb.assign(lp0, Value::Use(Operand::Const(k2)), Span::default());
+    lb.terminate(StmtKind::Goto(lbb_join), Span::default());
+    lb.start(lbb_join);
+    lb.terminate(StmtKind::Return, Span::default());
+    let lbody = lb.finish().unwrap();
+    let lver = blaze_body::verify(&lbody).unwrap();
+    let lbuilt = build(lver, from.view(), ITEM, &mut Subst { args: &[], ground: &mut g, scratch: heap() }, &w, heap()).unwrap();
+    let llir = printed(&lbuilt);
+    assert!(llir.contains("asm_br "), "InlineAsm with label must emit LIR asm_br:\n{llir}");
+}

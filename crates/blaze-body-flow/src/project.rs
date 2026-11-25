@@ -589,6 +589,24 @@ impl<A: Allocator + Copy> Emit<'_, A> {
                 self.primary(row);
                 self.b.ret(sp);
             }
+            StmtKind::TailCall { callee, args } => {
+                self.ops.clear();
+                if let Callee::Value(o) = body.callee(callee) {
+                    let o = self.op(o);
+                    self.ops.push(o);
+                }
+                for o in body.ops(args) {
+                    let o = self.op(o);
+                    self.ops.push(o);
+                }
+                let d = self.place(body.local_place(bd::Local(0)));
+                self.primary(row);
+                self.b.call(&self.ops, d, sp);
+                self.subsets_at(row);
+                self.extra(row);
+                self.b.ret(sp);
+                return Ok(1);
+            }
             // No successor and nothing read: the process aborts, or (verify keeps `resume` in
             // cleanup blocks, left out) unwinding goes on.
             StmtKind::Unreachable | StmtKind::Terminate | StmtKind::Resume => {
