@@ -178,7 +178,17 @@ const UNSIGNED_SHORT: u64 = 5123;
 const UNSIGNED_INT: u64 = 5125;
 const ARRAY_BUFFER: u64 = 34962;
 const ELEMENT_ARRAY_BUFFER: u64 = 34963;
-const KNOWN_EXTENSIONS: [&str; 3] = ["KHR_materials_clearcoat", "KHR_materials_emissive_strength", "KHR_mesh_quantization"];
+const KNOWN_EXTENSIONS: [&str; 9] = [
+    "KHR_materials_clearcoat",
+    "KHR_materials_emissive_strength",
+    "KHR_materials_anisotropy",
+    "KHR_materials_sheen",
+    "KHR_materials_transmission",
+    "KHR_materials_ior",
+    "KHR_materials_volume",
+    "KHR_texture_transform",
+    "KHR_mesh_quantization",
+];
 
 struct View {
     offset: u64,
@@ -505,7 +515,7 @@ fn parse(bytes: &[u8]) -> Result<Parsed, Invalid> {
                 if g.views[acc.view].target.is_some_and(|t| t != ARRAY_BUFFER) {
                     return Err(Invalid::Field { at: format!("{here}.{name}"), why: "a vertex view not ARRAY_BUFFER" });
                 }
-                if acc.component != FLOAT {
+                if (name == "POSITION" || name == "NORMAL") && acc.component != FLOAT {
                     quantized = true;
                 }
                 match name {
@@ -549,6 +559,11 @@ fn parse(bytes: &[u8]) -> Result<Parsed, Invalid> {
                             if t[3] != 1.0 && t[3] != -1.0 {
                                 return Err(Invalid::Field { at: format!("{here}.TANGENT"), why: "handedness w not +-1" });
                             }
+                        }
+                    }
+                    "COLOR_0" => {
+                        if acc.comps != 4 || acc.component != 5121 || !acc.normalized {
+                            return Err(Invalid::Field { at: format!("{here}.COLOR_0"), why: "not normalized RGBA8 VEC4" });
                         }
                     }
                     _ => return Err(Invalid::Field { at: format!("{here}.{name}"), why: "an attribute this writer never writes" }),
