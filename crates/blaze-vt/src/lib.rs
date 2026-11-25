@@ -10,6 +10,7 @@
 //! | [`parser`] | the vt100.net state machine as ghostty runs it, UTF-8 in ground, events to a [`parser::Sink`] | built |
 //! | `utf8` | the decoder: one code point per call, U+FFFD for each maximal invalid subpart | built |
 //! | [`style`] | a cell's style: colours by source (unset, palette, RGB), underline styles, flags | built |
+//! | [`input`] | key (legacy, modifyOtherKeys 2, kitty flags 1–16), mouse (9/1000/1002/1003; X10, 1005, 1006, 1015, 1016), paste (2004, unsafe bytes) and focus (1004) encoding into the caller's buffer | built |
 //!
 //! The screen, terminal, SGR, OSC, DCS, kitty and input modules are written in lanes against
 //! these interfaces (vt.md, "Modules").
@@ -23,6 +24,7 @@
 #[cfg(test)]
 extern crate std;
 
+pub mod input;
 pub mod parser;
 pub mod style;
 mod utf8;
