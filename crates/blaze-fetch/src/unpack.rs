@@ -201,10 +201,14 @@ pub fn crate_room(archive: &[u8], limits: &Limits) -> CrateRoom {
 /// The largest record of a git commit under `limits`, which a reservation is made at: its
 /// size is known only once the pack is indexed and the tree listed.
 pub fn git_room(limits: &Limits) -> u64 {
-    let per_file = (pack::ROW + usize::from(limits.pack.most_path)) as u64;
-    (pack::HEADER + pack::FOOTER) as u64
-        + limits.pack.most_bytes
-        + u64::from(limits.pack.most_files).saturating_mul(per_file)
+    let per_file = u64::try_from(pack::ROW)
+        .unwrap_or(u64::MAX)
+        .saturating_add(u64::from(limits.pack.most_path));
+    u64::try_from(pack::HEADER)
+        .unwrap_or(u64::MAX)
+        .saturating_add(u64::try_from(pack::FOOTER).unwrap_or(u64::MAX))
+        .saturating_add(limits.pack.most_bytes)
+        .saturating_add(u64::from(limits.pack.most_files).saturating_mul(per_file))
 }
 
 /// The record of a `.crate` of `name` at `version` whose SHA-256, `sha256`, the caller checked.
