@@ -430,7 +430,9 @@ pub fn layout_window_top_bar(
     scene.round_rect(0.0, 0.0, vw, TOP_BAR_H, 0.0, theme::BG_TOPBAR, 0.0, [0.0; 4], 0);
     scene.line(0.0, TOP_BAR_H - 0.5, vw, TOP_BAR_H - 0.5, 1.0, theme::LINE, 0);
 
-    let mid_y = (TOP_BAR_H - m.ch) * 0.5;
+    // Fixed native macOS 12pt SF Pro chrome metrics (immune to `Cmd+`/`Cmd-` zoom so titlebar never clips!).
+    let chrome_ch = m.line_h(TextFace::Chrome);
+    let mid_y = (TOP_BAR_H - chrome_ch) * 0.5;
     let icon_s = 11.5;
     let icon_y = (TOP_BAR_H - icon_s) * 0.5;
     let btn_y0 = 6.0;
@@ -503,7 +505,7 @@ pub fn layout_window_top_bar(
     // Zoomed-pane badge (`Cmd+Shift+Enter` to unzoom back to full tiled layout).
     if is_zoomed && pane_count_in_tab > 1 {
         let z_lbl = format!("zoom 1/{pane_count_in_tab}");
-        let z_w = z_lbl.chars().count() as f32 * m.cw + 14.0;
+        let z_w = m.measure(&z_lbl, TextFace::Chrome) + 14.0;
         let zx0 = (rx - z_w).max(x + 20.0);
         if zx0 > x + 60.0 {
             let rect = HitRect::new(zx0, btn_y0, rx, btn_y1);
@@ -518,7 +520,7 @@ pub fn layout_window_top_bar(
                 theme::LINE_STRONG,
                 0,
             );
-            scene.text(zx0 + 7.0, mid_y, z_lbl, theme::INK_1, true, false, 0);
+            scene.chrome_text(zx0 + 7.0, mid_y, z_lbl, theme::INK_1, true, 0);
             scene.push_hit(rect, HitAction::ToggleZoomPane(focused_pane));
             scene.push_hover_clipped(
                 rect,
@@ -535,18 +537,18 @@ pub fn layout_window_top_bar(
     // Quiet clickable UI zoom % pill when zoomed in/out (`Cmd+`/`Cmd-`).
     if zoom_pct != 100 {
         let z_lbl = format!("{zoom_pct}%");
-        let z_w = z_lbl.len() as f32 * m.cw + 14.0;
+        let z_w = m.measure(&z_lbl, TextFace::Chrome) + 14.0;
         let zx0 = (rx - z_w).max(x + 20.0);
         if zx0 > x + 60.0 {
             scene.round_rect(zx0, btn_y0, rx, btn_y1, 5.5, theme::BG_CHIP, 1.0, theme::LINE, 0);
-            scene.text(zx0 + 7.0, mid_y, z_lbl, theme::INK_3, false, false, 0);
+            scene.chrome_text(zx0 + 7.0, mid_y, z_lbl, theme::INK_3, false, 0);
             scene.push_hit(HitRect::new(zx0, btn_y0, rx, btn_y1), HitAction::ResetZoom);
             rx = zx0 - 8.0;
         }
     }
 
     // De-duplicated window-level top bar: keep cwd/git strictly in the focused pane header &
-    // prompt capsule so workspace tabs enjoy clean, generous SF Pro typography!
+    // prompt capsule so workspace tabs enjoy clean, fixed native macOS SF Pro typography!
     let tabs_limit = rx - 10.0;
     let _ = prompt;
 
@@ -566,12 +568,12 @@ pub fn layout_window_top_bar(
             String::new()
         };
         let pad_x = 9.0;
-        let slot_w = m.measure(&slot_str, TextFace::UiSmall) + 2.0;
-        let title_w = m.measure(&title_str, TextFace::Ui) + 2.0;
+        let slot_w = m.measure(&slot_str, TextFace::Chrome) + 1.0;
+        let title_w = m.measure(&title_str, TextFace::Chrome) + 2.0;
         let badge_w = if badge_str.is_empty() {
             0.0
         } else {
-            m.measure(&badge_str, TextFace::UiSmall) + 2.0
+            m.measure(&badge_str, TextFace::Chrome) + 2.0
         };
         let tab_w = pad_x * 2.0 + slot_w + title_w + badge_w;
         if x + tab_w > tabs_end {
@@ -606,12 +608,12 @@ pub fn layout_window_top_bar(
         let slot_col = if tab.active { theme::INK_3 } else { theme::INK_4 };
         let title_col = if tab.active { theme::INK_1 } else { theme::INK_3 };
         let badge_col = if tab.active { theme::INK_3 } else { theme::INK_4 };
-        scene.ui_small(tx, mid_y, &slot_str, slot_col, false, false, 0);
+        scene.chrome_text(tx, mid_y, &slot_str, slot_col, false, 0);
         tx += slot_w;
-        scene.ui_text(tx, mid_y, &title_str, title_col, tab.active, false, 0);
+        scene.chrome_text(tx, mid_y, &title_str, title_col, tab.active, 0);
         tx += title_w;
         if !badge_str.is_empty() {
-            scene.ui_small(tx, mid_y, &badge_str, badge_col, false, false, 0);
+            scene.chrome_text(tx, mid_y, &badge_str, badge_col, false, 0);
         }
         let rect = HitRect::new(x, btn_y0, x + tab_w, btn_y1);
         scene.push_hit(rect, HitAction::SwitchTab(tab.id));
@@ -647,13 +649,13 @@ pub fn layout_window_top_bar(
         x += plus_w + 8.0;
     }
 
-    // If the focused pane has >1 CoW session branch (`Cmd+B`), show compact SF Pro branch switcher pills too.
+    // If the focused pane has >1 CoW session branch (`Cmd+B`), show compact fixed-chrome branch pills too.
     if store.branches().len() > 1 {
         let active_bid = store.active_branch_id();
         for branch in store.branches() {
             let is_active = branch.id == active_bid;
             let name = branch.name.as_str();
-            let bw = 16.0 + icon_s + 4.0 + m.measure(name, TextFace::UiSmall);
+            let bw = 16.0 + icon_s + 4.0 + m.measure(name, TextFace::Chrome);
             if x + bw > tabs_limit {
                 break;
             }
@@ -661,13 +663,12 @@ pub fn layout_window_top_bar(
                 scene.round_rect(x, btn_y0, x + bw, btn_y1, 5.5, theme::BG_CHIP, 1.0, theme::LINE_STRONG, 0);
             }
             draw_icon(scene, Icon::Branch, x + 6.0, icon_y, icon_s, if is_active { theme::INK_2 } else { theme::INK_4 }, 0);
-            scene.ui_small(
+            scene.chrome_text(
                 x + 6.0 + icon_s + 4.0,
                 mid_y,
                 name,
                 if is_active { theme::INK_2 } else { theme::INK_4 },
                 is_active,
-                false,
                 0,
             );
             scene.push_hit(HitRect::new(x, btn_y0, x + bw, btn_y1), HitAction::SwitchBranch(branch.id));
@@ -711,7 +712,8 @@ pub fn draw_tiled_pane_chrome(
     // Clicking anywhere on the header focuses the pane.
     scene.push_hit(HitRect::new(outer.x0, outer.y0, outer.x1, hdr_y1), HitAction::FocusPane(pane_id));
 
-    let mid_y = outer.y0 + (PANE_HEADER_H - m.ch) * 0.5;
+    let chrome_ch = m.line_h(TextFace::Chrome);
+    let mid_y = outer.y0 + (PANE_HEADER_H - chrome_ch) * 0.5;
     let mut lx = outer.x0 + 10.0;
     let dot_col = if focused { theme::INK_1 } else { theme::INK_4 };
     scene.over_circle(lx + 2.5, outer.y0 + PANE_HEADER_H * 0.5, 2.5, dot_col, 0);
@@ -774,15 +776,14 @@ pub fn draw_tiled_pane_chrome(
         label.push_str(tag);
         label.push(']');
     }
-    let avg_cw = m.measure("n", TextFace::UiSmall).max(4.5);
+    let avg_cw = m.measure("n", TextFace::Chrome).max(4.5);
     let max_c = ((rx - lx) / avg_cw).floor().max(6.0) as usize;
-    scene.ui_small(
+    scene.chrome_text(
         lx,
         mid_y,
         truncate_chars(&label, max_c),
         if focused { theme::INK_1 } else { theme::INK_4 },
         focused,
-        false,
         0,
     );
 
@@ -822,14 +823,15 @@ fn layout_starship_line(
     clip_id: u32,
     is_live: bool,
 ) -> f32 {
-    let cap_h = m.ch + 4.0;
-    let ty = y + 2.0;
-    let pad_x = 8.0;
-    let sep_pad = 8.0;
-    let folder_s = 12.5;
-    let branch_s = 11.0;
-    let file_s = 12.0;
-    let tool_s = 11.5;
+    let cap_h = m.ch + 6.0;
+    let ty = y + 3.0;
+    let pad_x = (m.cw * 1.1).round().max(8.0);
+    let sep_pad = (m.cw * 1.05).round().max(8.0);
+    // Uniform font-relative icon scale so EVERY icon inside the capsule matches text height at ANY zoom!
+    let folder_s = m.icon_md();
+    let branch_s = m.icon_sm();
+    let file_s = m.icon_md();
+    let tool_s = m.icon_md();
 
     let (cap_bg, cap_bd, sep_col, dir_col, branch_col, meta_col, icon_alpha) = if is_live {
         (
@@ -862,10 +864,10 @@ fn layout_starship_line(
         scene.line(x, y + 4.0, x, y + cap_h - 4.0, 1.0, sep_col, clip_id);
     };
 
-    // Segment 0: Modern Retina MacBook Pro / Server Rack icon + hostname (`SF Pro` UI label).
+    // Segment 0: Modern Retina MacBook Pro / Server Rack icon + hostname (matching text & icon scale!).
     if !prompt.host.is_empty() {
         let seg0_x0 = cx - 4.0;
-        let host_s = 13.5;
+        let host_s = m.icon_md();
         let host_svg = if prompt.is_remote { "server_rack" } else { "macbook_pro" };
         let host_col = if prompt.is_remote {
             theme::INK_1
@@ -882,10 +884,10 @@ fn layout_starship_line(
             if is_live { 1.0 } else { 0.72 },
             clip_id,
         );
-        cx += host_s + 5.0;
+        cx += host_s + 6.0;
         let host_lbl = truncate_chars(&prompt.host, 16);
-        scene.ui_small(cx, ty, &host_lbl, host_col, prompt.is_remote, false, clip_id);
-        cx += m.measure(&host_lbl, TextFace::UiSmall);
+        scene.text(cx, ty, &host_lbl, host_col, prompt.is_remote, false, clip_id);
+        cx += host_lbl.chars().count() as f32 * m.cw;
         scene.push_hover_clipped(
             HitRect::new(seg0_x0, y, cx + 4.0, y + cap_h),
             clip_id,
@@ -1597,9 +1599,9 @@ fn layout_file_grid(
         total
     };
 
-    let icon_s = 13.5;
-    let icon_gap = 5.0;
-    let col_gap = 14.0;
+    let icon_s = m.icon_md();
+    let icon_gap = (m.cw * 0.7).round().max(5.0);
+    let col_gap = (m.cw * 1.8).round().max(14.0);
 
     // Pre-collect display labels + SVG icon names.
     struct GridItem {
@@ -1798,8 +1800,8 @@ fn layout_table(
     }
 
     let type_col_idx = table.col_index("type");
-    let icon_s = 14.0;
-    let icon_pad = icon_s + 7.0;
+    let icon_s = m.icon_md();
+    let icon_pad = icon_s + (m.cw * 0.85).round().max(6.0);
 
     let idx_chars = total_rows.max(1).to_string().len().max(2);
     let idx_w = idx_chars as f32 * m.cw + 16.0;
@@ -1968,7 +1970,7 @@ fn layout_table(
         };
         let hdr_col = if active_sort.is_some() { theme::INK_1 } else { theme::INK_3 };
         if col_raw == "readonly" {
-            let ls = 11.0;
+            let ls = m.icon_sm();
             draw_icon(scene, Icon::Lock, cx + 2.0, y0 + (m.ch - ls) * 0.5, ls, hdr_col, clip_id);
             if !suffix.is_empty() {
                 scene.ui_small(cx + ls + 4.0, y0, suffix.trim(), hdr_col, true, false, clip_id);
@@ -2153,7 +2155,7 @@ fn layout_table(
                                     // Crisp icon-only boolean rendering (zero `○ false` / `● true` noise!).
                                     if col_name == "readonly" {
                                         if *flag {
-                                            let ls = 11.5;
+                                            let ls = m.icon_sm();
                                             draw_icon(scene, Icon::Lock, rx + 2.0, ty + (m.ch - ls) * 0.5, ls, theme::INK_2, clip_id);
                                             scene.push_hover_clipped(
                                                 HitRect::new(rx, cur_y, rx + 18.0, cur_y + row_h),
@@ -2411,7 +2413,7 @@ fn layout_record(
         return m.ch;
     }
     let has_any_icon = rec.iter().any(|(k, _)| icon_for_record_key(k).is_some());
-    let icon_s = 12.0;
+    let icon_s = m.icon_sm();
     let icon_gutter = if has_any_icon { icon_s + 8.0 } else { 0.0 };
 
     let max_key_chars = rec
@@ -3623,7 +3625,7 @@ fn layout_completion_popup(
         0,
     );
 
-    let icon_s = 14.0;
+    let icon_s = m.icon_md();
     let list_y0 = py0 + 5.0;
     let mut ry = list_y0;
     for offset in 0..show {
@@ -3799,7 +3801,7 @@ fn draw_overlay_scrollbar(
 
 /// Floating pill rendered under the cursor while dragging a file/folder/crate into the hotbar.
 fn layout_drag_overlay(scene: &mut Scene, drag: &ActiveDrag, m: CellMetrics) {
-    let icon_s = 14.5;
+    let icon_s = m.icon_md();
     let label = truncate_chars(&drag.payload.label, 34);
     let text_w = label.chars().count() as f32 * m.cw;
     let has_icon = drag.payload.icon.is_some();
@@ -4145,7 +4147,7 @@ fn layout_active_popover(
     let pad_y = 8.0;
     let row_h = m.ch + 7.0;
     let hdr_h = m.ch + 7.0;
-    let icon_s = 12.5;
+    let icon_s = m.icon_md();
     let gap = 6.0;
 
     let is_hovered = |r: HitRect| -> bool {

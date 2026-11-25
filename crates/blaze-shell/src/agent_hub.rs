@@ -352,7 +352,8 @@ fn layout_agent_hub_inner(
         let ty1 = ry + 5.0;
         let ty2 = ty1 + m.ch + 2.0;
         let svg = if ag.is_remote { "server_rack" } else { "macbook_pro" };
-        scene.svg_icon_alpha(17.0, ty1 + (m.ch - 13.5) * 0.5, 13.5, svg, if is_sel { 1.0 } else { 0.72 }, left_clip);
+        let ag_icon_s = m.icon_md();
+        scene.svg_icon_alpha(17.0, ty1 + (m.ch - ag_icon_s) * 0.5, ag_icon_s, svg, if is_sel { 1.0 } else { 0.72 }, left_clip);
 
         // Status indicator dot.
         let dot_col = match ag.status {

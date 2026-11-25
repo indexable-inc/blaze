@@ -794,10 +794,11 @@ fn layout_yazi_inner(
     scene.round_rect(0.0, TOP_BAR_H, vw, body_top, 0.0, theme::BG_SURFACE, 0.0, [0.0; 4], 0);
     scene.line(0.0, body_top - 0.5, vw, body_top - 0.5, 1.0, theme::LINE, 0);
     let hty = TOP_BAR_H + (header_h - m.ch) * 0.5;
-    scene.svg_icon(14.0, hty + (m.ch - 13.0) * 0.5, 13.0, "folder_macos", 0);
+    let hdr_icon_s = m.icon_md();
+    scene.svg_icon(14.0, hty + (m.ch - hdr_icon_s) * 0.5, hdr_icon_s, "folder_macos", 0);
     let cwd_str = yazi.cwd.to_string_lossy();
     let max_path_c = ((vw - 280.0) / m.cw).floor().max(16.0) as usize;
-    scene.text(34.0, hty, truncate_chars(&cwd_str, max_path_c), theme::INK_1, true, false, 0);
+    scene.text(14.0 + hdr_icon_s + 7.0, hty, truncate_chars(&cwd_str, max_path_c), theme::INK_1, true, false, 0);
 
     if yazi.filtering || !yazi.filter.is_empty() {
         let flbl = format!("/{}", yazi.filter);
@@ -824,7 +825,7 @@ fn layout_yazi_inner(
 
     let row_h = m.ch + 6.0;
     let max_vis_rows = ((body_h - 12.0) / row_h).floor().max(1.0) as usize;
-    let icon_s = 13.0;
+    let icon_s = m.icon_md();
 
     // Column 1: Parent directory (muted context; hidden when narrow so file list + preview stay legible).
     if col1_x1 > 0.0 {

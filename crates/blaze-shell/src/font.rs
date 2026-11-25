@@ -56,10 +56,12 @@ pub struct Fonts {
     ui: [CFRetained<CTFont>; 2],
     ui_small: [CFRetained<CTFont>; 2],
     heading: CFRetained<CTFont>,
+    chrome: [CFRetained<CTFont>; 2],
     pub metrics: Metrics,
     ui_m: FaceMetrics,
     ui_small_m: FaceMetrics,
     heading_m: FaceMetrics,
+    chrome_m: FaceMetrics,
     slots: HashMap<Key, Option<Slot>>,
     next_x: usize,
     next_y: usize,
@@ -179,6 +181,9 @@ impl Fonts {
         let ui = [pick_ui_font(px * 0.94, false), pick_ui_font(px * 0.94, true)];
         let ui_small = [pick_ui_font(px * 0.84, false), pick_ui_font(px * 0.84, true)];
         let heading = pick_ui_font(px * 1.18, true);
+        // Fixed native macOS 12pt SF Pro for titlebar tabs & pane headers (never overflows on Cmd+ zoom!).
+        let chrome_px = 12.0 * scale;
+        let chrome = [pick_ui_font(chrome_px, false), pick_ui_font(chrome_px, true)];
 
         let ui_m = measure_face_metrics(&ui[0], cell_h, baseline);
         let ui_small_m = measure_face_metrics(&ui_small[0], cell_h, baseline);
@@ -186,16 +191,22 @@ impl Fonts {
             y_nudge_px: 0.0,
             ..measure_face_metrics(&heading, cell_h, baseline)
         };
+        let chrome_m = FaceMetrics {
+            y_nudge_px: 0.0,
+            ..measure_face_metrics(&chrome[0], cell_h, baseline)
+        };
 
         Fonts {
             mono,
             ui,
             ui_small,
             heading,
+            chrome,
             metrics,
             ui_m,
             ui_small_m,
             heading_m,
+            chrome_m,
             slots: HashMap::new(),
             next_x: 0,
             next_y: 0,
@@ -243,6 +254,10 @@ impl Fonts {
                 TextFace::Heading => (
                     self.heading_m.space_adv * inv_scale,
                     self.heading_m.y_nudge_px * inv_scale,
+                ),
+                TextFace::Chrome => (
+                    self.chrome_m.space_adv * inv_scale,
+                    self.chrome_m.y_nudge_px * inv_scale,
                 ),
             };
             let y = run.y + y_nudge;
@@ -302,6 +317,11 @@ impl Fonts {
                 self.ui_small_m.baseline,
             ),
             TextFace::Heading => (self.heading.clone(), self.heading_m.h, self.heading_m.baseline),
+            TextFace::Chrome => (
+                self.chrome[usize::from(key.bold)].clone(),
+                self.chrome_m.h,
+                self.chrome_m.baseline,
+            ),
         };
 
         let (font, glyph) = match glyph_of(&base_font, key.ch) {

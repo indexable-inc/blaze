@@ -11,18 +11,21 @@ use crate::tiling::{PaneId, SplitAxis, TabId};
 /// Typography face & scale role: dual-font SF Pro (UI chrome & prose) + SF Mono (code & tabular data).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum TextFace {
-    /// Primary monospace (`13pt` SF Mono / Berkeley Mono / JetBrains Mono): commands, code, paths, PTY, tabular numbers.
+    /// Primary monospace (`1.0×` SF Mono / Berkeley Mono / JetBrains Mono): commands, code, paths, PTY, tabular numbers.
     #[default]
     Mono,
-    /// Proportional UI sans (`12.2pt` Apple SF Pro): tabs, pane headers, prose, directory names, command palette.
+    /// Proportional UI sans (`0.94×` Apple SF Pro): prose, directory headers, command palette — scales with zoom.
     Ui,
-    /// Compact proportional UI sans (`11pt` Apple SF Pro): table column headers, `blaze-sniff` tags, metadata, hints.
+    /// Compact proportional UI sans (`0.84×` Apple SF Pro): table headers, `blaze-sniff` tags, metadata, hints — scales with zoom.
     UiSmall,
-    /// Scaled proportional heading (`15.5pt` Apple SF Pro Semibold): rendered Markdown headings.
+    /// Scaled proportional heading (`1.18×` Apple SF Pro Semibold): rendered Markdown headings — scales with zoom.
     Heading,
+    /// Fixed native macOS titlebar & pane-header chrome (`12pt` SF Pro, immune to `Cmd+`/`Cmd-` zoom so fixed titlebars never clip).
+    Chrome,
 }
 
-/// Logical CSS-pixel dimensions of one monospace cell, with calibrated proportional measurement helpers.
+/// Logical CSS-pixel dimensions of one monospace cell, with calibrated proportional measurement &
+/// font-relative icon sizing helpers so icons always scale in lockstep with text on `Cmd+`/`Cmd-`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CellMetrics {
     pub cw: f32,
@@ -36,17 +39,31 @@ impl Default for CellMetrics {
 }
 
 impl CellMetrics {
+    /// Standard content SVG icon size (folders, files, MacBook Pro, toolchains) scaled to text height.
+    #[inline]
+    pub fn icon_md(&self) -> f32 {
+        (self.ch * 0.78).round().max(11.0)
+    }
+
+    /// Compact inline vector icon size (git branch, stash, lock, block buttons) scaled to text height.
+    #[inline]
+    pub fn icon_sm(&self) -> f32 {
+        (self.ch * 0.68).round().max(10.0)
+    }
+
     /// Deterministic logical width of `text` in `face` (exact `len * cw` for `Mono`,
     /// calibrated proportional glyph advance estimator for Apple SF Pro sans faces).
     pub fn measure(&self, text: &str, face: TextFace) -> f32 {
         if face == TextFace::Mono {
             return text.chars().count() as f32 * self.cw;
         }
+        let base_cw = if face == TextFace::Chrome { 7.8 } else { self.cw };
         let scale = match face {
             TextFace::Mono => 1.0,
             TextFace::Ui => 0.84,
             TextFace::UiSmall => 0.77,
             TextFace::Heading => 1.06,
+            TextFace::Chrome => 0.82,
         };
         let mut units = 0.0f32;
         for ch in text.chars() {
@@ -60,7 +77,7 @@ impl CellMetrics {
                 _ => 0.88,
             };
         }
-        units * self.cw * scale
+        units * base_cw * scale
     }
 
     /// Logical line height for `face`.
@@ -71,6 +88,7 @@ impl CellMetrics {
             TextFace::Ui => self.ch * 0.96,
             TextFace::UiSmall => self.ch * 0.88,
             TextFace::Heading => self.ch * 1.22,
+            TextFace::Chrome => 16.0,
         }
     }
 }
@@ -955,6 +973,20 @@ impl Scene {
         clip_id: u32,
     ) {
         self.text_with_face(x, y, text, color, true, false, TextFace::Heading, clip_id);
+    }
+
+    /// Fixed-size native macOS titlebar & pane-header SF Pro text (immune to `Cmd+`/`Cmd-` zoom).
+    #[allow(clippy::too_many_arguments)]
+    pub fn chrome_text(
+        &mut self,
+        x: f32,
+        y: f32,
+        text: impl Into<String>,
+        color: [f32; 4],
+        bold: bool,
+        clip_id: u32,
+    ) {
+        self.text_with_face(x, y, text, color, bold, false, TextFace::Chrome, clip_id);
     }
 
     #[allow(clippy::too_many_arguments)]
