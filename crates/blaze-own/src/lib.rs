@@ -170,9 +170,9 @@ pub use byte_cursor::{
     ByteCursor, RevBitCursor, SeqExecCtx, SeqLeafResult, SeqOp, SliceWriter, common_prefix_len,
 };
 pub use lz77::{
-    FseSeqEncTables, LZ77_DEF_BUCKETS, LZ77_FAST_HASH_SIZE, fse_pack_sequences_fast,
-    huff_encode_stream_checked_raw, huff_encode_stream_raw, lz77_preload_default,
-    lz77_preload_fast, lz77_scan_default, lz77_scan_fast,
+    FseSeqEncTables, LZ77_DEF_BUCKETS, LZ77_FAST_HASH_SIZE, count_seq_symbols_fast,
+    fse_pack_sequences_fast, huff_encode_stream_checked_raw, huff_encode_stream_raw,
+    lz77_preload_default, lz77_preload_fast, lz77_scan_default, lz77_scan_fast,
 };
 pub use cow::{Cow, ToOwnedIn};
 pub use deque::VecDeque;

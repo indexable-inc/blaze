@@ -145,8 +145,72 @@ fn op_byte(op: Op) -> u8 {
     Op::ALL.iter().position(|&o| o == op).and_then(|i| u8::try_from(i).ok()).unwrap_or(0)
 }
 
+const MAX_SMALL_COPY_CHUNKS: usize = 8;
+const MAX_SMALL_SLOT_COPY_BYTES: u64 = 32;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct CopyChunk {
+    off: i32,
+    ty: Ty,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct SmallCopyPlan {
+    chunks: [CopyChunk; MAX_SMALL_COPY_CHUNKS],
+    len: u8,
+}
+
+impl SmallCopyPlan {
+    #[inline]
+    fn single(ty: Ty) -> Self {
+        let mut chunks = [CopyChunk { off: 0, ty: Ty::NONE }; MAX_SMALL_COPY_CHUNKS];
+        set_at(&mut chunks, 0, CopyChunk { off: 0, ty });
+        Self { chunks, len: 1 }
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[CopyChunk] {
+        let n = usize::from(self.len).min(MAX_SMALL_COPY_CHUNKS);
+        self.chunks.get(..n).unwrap_or(&[])
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BulkMemop {
+    dst: u32,
+    src: u32,
+    len: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct SlotAccess {
+    slot: u32,
+    off: i64,
+    size: i64,
+    ty: Ty,
+}
+
+struct SlotFields<A: Allocator> {
+    accesses: Vec<SlotAccess, A>,
+}
+
+impl<A: Allocator> SlotFields<A> {
+    #[inline]
+    fn empty(alloc: A) -> Self {
+        Self { accesses: Vec::new_in(alloc) }
+    }
+
+    #[inline]
+    fn slice_for(&self, slot: u32) -> &[SlotAccess] {
+        let start = self.accesses.partition_point(|a| a.slot < slot);
+        let rest = self.accesses.get(start..).unwrap_or(&[]);
+        let len = rest.partition_point(|a| a.slot == slot);
+        rest.get(..len).unwrap_or(&[])
+    }
+}
+
 #[inline]
-fn small_memop_ty(view: &View<'_>, inst: usize) -> Option<Ty> {
+fn bulk_small_memop(view: &View<'_>, inst: usize) -> Option<BulkMemop> {
     if !matches!(view.op(inst), Op::Memcpy | Op::Memmove) {
         return None;
     }
@@ -154,14 +218,204 @@ fn small_memop_ty(view: &View<'_>, inst: usize) -> Option<Ty> {
         return None;
     }
     let at = to_idx(at_u32(view.data, inst));
+    let dst = at_u32(view.extra, at);
+    let src = at_u32(view.extra, at.checked_add(1)?);
     let len_val = at_u32(view.extra, at.checked_add(2)?);
-    match const_u64(view, to_idx(len_val))? {
-        1 => Some(Ty::I8),
-        2 => Some(Ty::I16),
-        4 => Some(Ty::I32),
-        8 => Some(Ty::I64),
+    let len = const_u64(view, to_idx(len_val))?;
+    if len == 0 || len > MAX_SMALL_SLOT_COPY_BYTES {
+        return None;
+    }
+    Some(BulkMemop { dst, src, len })
+}
+
+/// Resolves `(ptr, off)` through `0..8` constant `Op::PtrAdd(_, const_i64)` hops to
+/// `(slot_id, total_slot_off)` if rooted at `Op::SlotAddr`.
+fn resolve_slot_ptr_const(view: &View<'_>, mut ptr: u32, mut off: i64) -> Option<(u32, i64)> {
+    for _ in 0..8 {
+        let pi = to_idx(ptr);
+        if view.op(pi) == Op::PtrAdd {
+            let at = to_idx(at_u32(view.data, pi));
+            let base = at_u32(view.extra, at);
+            let by = at_u32(view.extra, at.saturating_add(1));
+            let d = const_i64(view, to_idx(by))?;
+            off = off.checked_add(d)?;
+            ptr = base;
+            continue;
+        }
+        break;
+    }
+    let pi = to_idx(ptr);
+    if view.op(pi) == Op::SlotAddr {
+        Some((at_u32(view.data, pi), off))
+    } else {
+        None
+    }
+}
+
+/// Resolves `ptr` to `(slot_id, slot_off)` when it points into a local `Op::SlotAddr` with
+/// `slot_off >= 0` and `slot_off + copy_len <= slot_size`.
+fn resolve_slot_copy_range(view: &View<'_>, ptr: u32, copy_len: u64) -> Option<(u32, i64)> {
+    let (slot, off) = resolve_slot_ptr_const(view, ptr, 0)?;
+    let slot_rec = view.slots.get(to_idx(slot))?;
+    if off < 0 {
+        return None;
+    }
+    let off_u64 = u64::try_from(off).ok()?;
+    let end = off_u64.checked_add(copy_len)?;
+    if end <= u64::from(slot_rec.size) {
+        Some((slot, off))
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn field_copy_ty_bytes(ty: Ty, ptr_bits: u32) -> Option<i64> {
+    if !ty.is_scalar() {
+        return None;
+    }
+    match ty {
+        Ty::I8 => Some(1),
+        Ty::I16 => Some(2),
+        Ty::I32 | Ty::F32 => Some(4),
+        Ty::I64 | Ty::F64 => Some(8),
+        Ty::PTR => {
+            let b = ptr_bits / 8;
+            if matches!(b, 4 | 8) { Some(i64::from(b)) } else { None }
+        }
         _ => None,
     }
+}
+
+/// Pre-scans non-volatile `Op::Load`/`Op::Store` accesses rooted at local stack slots so
+/// multi-chunk slot copies match SROA's exact scalar field layout.
+fn collect_slot_fields<A: Allocator + Copy>(view: &View<'_>, alloc: A) -> SlotFields<A> {
+    let mut accesses: Vec<SlotAccess, A> = Vec::new_in(alloc);
+    let ptr_bits = view.head.ptr_bits;
+    let len = view.len();
+    for inst in 0..len {
+        let op = view.op(inst);
+        if !matches!(op, Op::Load | Op::Store) {
+            continue;
+        }
+        if Flags(at_u8(view.flags, inst)).contains(Flags::VOLATILE) {
+            continue;
+        }
+        let at = to_idx(at_u32(view.data, inst));
+        let (ptr, inline_off, ty) = if op == Op::Load {
+            let ptr = at_u32(view.extra, at);
+            let off = i64::from(at_u32(view.extra, at.saturating_add(1)).cast_signed());
+            let ty = Ty(at_u16(view.tys, inst));
+            (ptr, off, ty)
+        } else {
+            let val = at_u32(view.extra, at);
+            let ptr = at_u32(view.extra, at.saturating_add(1));
+            let off = i64::from(at_u32(view.extra, at.saturating_add(2)).cast_signed());
+            let ty = Ty(at_u16(view.tys, to_idx(val)));
+            (ptr, off, ty)
+        };
+        let Some((slot, off)) = resolve_slot_ptr_const(view, ptr, inline_off) else {
+            continue;
+        };
+        if let Some(size) = field_copy_ty_bytes(ty, ptr_bits) {
+            accesses.push(SlotAccess { slot, off, size, ty });
+        } else {
+            let blocker_size = if ty == Ty::I1 { Some(1) } else { access_bytes(ty, ptr_bits) };
+            if let Some(size) = blocker_size {
+                accesses.push(SlotAccess { slot, off, size, ty: Ty::NONE });
+            }
+        }
+    }
+    accesses.sort_unstable();
+    accesses.dedup();
+    SlotFields { accesses }
+}
+
+/// Checks if observed scalar accesses to `slot` within `[slot_off .. slot_off + copy_len)` cleanly
+/// partition the copy range into `<= MAX_SMALL_COPY_CHUNKS` contiguous, non-overlapping scalar chunks.
+fn match_slot_fields<A: Allocator>(
+    slot_fields: &SlotFields<A>,
+    slot: u32,
+    slot_off: i64,
+    copy_len: u64,
+) -> Option<SmallCopyPlan> {
+    let copy_len_i64 = i64::try_from(copy_len).ok()?;
+    let range_start = slot_off;
+    let range_end = range_start.checked_add(copy_len_i64)?;
+    let accesses = slot_fields.slice_for(slot);
+    if accesses.is_empty() {
+        return None;
+    }
+
+    let mut chunks = [CopyChunk { off: 0, ty: Ty::NONE }; MAX_SMALL_COPY_CHUNKS];
+    let mut count: usize = 0;
+    let mut cursor = range_start;
+
+    for &acc in accesses {
+        let acc_end = acc.off.checked_add(acc.size)?;
+        if acc_end <= range_start {
+            continue;
+        }
+        if acc.off >= range_end {
+            break;
+        }
+        if acc.ty == Ty::NONE || acc.off < range_start || acc_end > range_end {
+            return None;
+        }
+        if acc.off != cursor || count >= MAX_SMALL_COPY_CHUNKS {
+            return None;
+        }
+        let rel_off = i32::try_from(acc.off.checked_sub(range_start)?).ok()?;
+        set_at(&mut chunks, count, CopyChunk { off: rel_off, ty: acc.ty });
+        count = count.saturating_add(1);
+        cursor = acc_end;
+    }
+
+    if cursor == range_end && count > 0 {
+        let len = u8::try_from(count).ok()?;
+        Some(SmallCopyPlan { chunks, len })
+    } else {
+        None
+    }
+}
+
+fn small_memop_plan<A: Allocator>(
+    view: &View<'_>,
+    inst: usize,
+    slot_fields: &SlotFields<A>,
+) -> Option<SmallCopyPlan> {
+    let op = bulk_small_memop(view, inst)?;
+    match op.len {
+        1 => return Some(SmallCopyPlan::single(Ty::I8)),
+        2 => return Some(SmallCopyPlan::single(Ty::I16)),
+        4 => return Some(SmallCopyPlan::single(Ty::I32)),
+        8 => return Some(SmallCopyPlan::single(Ty::I64)),
+        _ => {}
+    }
+
+    let src_slot = resolve_slot_copy_range(view, op.src, op.len);
+    let dst_slot = resolve_slot_copy_range(view, op.dst, op.len);
+    match (src_slot, dst_slot) {
+        // Distinct slot-to-slot copies (e.g. padded tuples like `(usize, u32)`) are left to
+        // `sroa::scalar_replace`, which promotes them with full padding awareness; never invent
+        // a wider chunk that would create an SROA width mismatch.
+        (Some((s1, _)), Some((s2, _))) if s1 != s2 => None,
+        (Some((s1, o1)), Some((s2, o2))) => match_slot_fields(slot_fields, s1, o1, op.len)
+            .or_else(|| match_slot_fields(slot_fields, s2, o2, op.len)),
+        (Some((slot, slot_off)), None) | (None, Some((slot, slot_off))) => {
+            match_slot_fields(slot_fields, slot, slot_off, op.len)
+        }
+        (None, None) => None,
+    }
+}
+
+#[inline]
+fn chunk_align(base_align: u8, off: i32) -> u8 {
+    if base_align == 0 || off == 0 {
+        return base_align;
+    }
+    let tz = u8::try_from(off.unsigned_abs().trailing_zeros()).unwrap_or(0);
+    base_align.min(tz)
 }
 
 fn intern_align_attr<A: Allocator>(func: &mut Func<A>, align: u8) -> u32 {
@@ -177,9 +431,12 @@ fn intern_align_attr<A: Allocator>(func: &mut Func<A>, align: u8) -> u32 {
     row.saturating_add(1)
 }
 
-/// Scalarizes non-volatile `Op::Memcpy` and `Op::Memmove` instructions with constant length
-/// `1`, `2`, `4`, or `8` bytes into an overlap-safe `Op::Load` + `Op::Store` pair (`Ty::I8`,
-/// `Ty::I16`, `Ty::I32`, `Ty::I64`).
+/// Scalarizes non-volatile `Op::Memcpy` and `Op::Memmove` instructions into overlap-safe
+/// `Op::Load` + `Op::Store` sequences (all loads before all stores):
+/// - Constant lengths `1`, `2`, `4`, or `8` bytes on any pointer (`Ty::I8`/`I16`/`I32`/`I64`).
+/// - Constant lengths `1..=32` bytes when `src` or `dst` resolves to a local `Op::SlotAddr`,
+///   matching the slot's observed scalar field layout (so SROA eliminates the slot completely)
+///   with an aligned power-of-2 fallback (`<= 8` chunks).
 ///
 /// Returns `Ok(None)` with zero heap allocations when no eligible instruction exists.
 pub fn scalarize_small_memops<A: Allocator + Copy>(
@@ -187,37 +444,58 @@ pub fn scalarize_small_memops<A: Allocator + Copy>(
     alloc: A,
 ) -> Result<Option<Func<A>>, SimplifyError> {
     let len = view.len();
-    let mut has_small = false;
+    let mut has_plain_small = false;
+    let mut has_slot_candidate = false;
     for inst in 0..len {
-        if small_memop_ty(&view, inst).is_some() {
-            has_small = true;
+        let Some(op) = bulk_small_memop(&view, inst) else {
+            continue;
+        };
+        if matches!(op.len, 1 | 2 | 4 | 8) {
+            has_plain_small = true;
+        } else if resolve_slot_copy_range(&view, op.src, op.len).is_some()
+            || resolve_slot_copy_range(&view, op.dst, op.len).is_some()
+        {
+            has_slot_candidate = true;
             break;
         }
     }
-    if !has_small {
+    if !has_plain_small && !has_slot_candidate {
         return Ok(None);
     }
+
+    let slot_fields = if has_slot_candidate {
+        collect_slot_fields(&view, alloc)
+    } else {
+        SlotFields::empty(alloc)
+    };
 
     // Pass 1: precompute the exact old->new instruction index map in layout order so any
     // non-RPO forward value reference resolves in O(1) without a fixup pass.
     let mut val_map = filled(len, NONE, &alloc);
     let mut next_idx: usize = 0;
+    let mut any_rewritten = false;
     for inst in 0..len {
-        if small_memop_ty(&view, inst).is_some() {
-            // `Memcpy`/`Memmove` produces no value (`Ty::NONE`) and expands to `Load` + `Store`.
-            next_idx = next_idx.saturating_add(2);
+        if let Some(plan) = small_memop_plan(&view, inst, &slot_fields) {
+            // `Memcpy`/`Memmove` produces no value (`Ty::NONE`) and expands to `n` `Load`s
+            // followed by `n` `Store`s.
+            let expanded = usize::from(plan.len).saturating_mul(2);
+            next_idx = next_idx.saturating_add(expanded);
+            any_rewritten = true;
         } else {
             set_at(&mut val_map, inst, to_u32(next_idx));
             next_idx = next_idx.saturating_add(1);
         }
     }
+    if !any_rewritten {
+        return Ok(None);
+    }
     if next_idx >= to_idx(NONE) {
         return Err(SimplifyError::Refused { inst: 0, what: "more values than LIR numbers" });
     }
 
-    // Pass 2: rebuild instructions, replacing each matching bulk op with `Load(ty, src)` +
-    // `Store(val, dst)`. Because the full `k`-byte load finishes into an SSA value before the
-    // store writes a single byte, this is overlap-safe even for `Op::Memmove`.
+    // Pass 2: rebuild instructions, replacing each matching bulk op with all `n` `Load`s into SSA
+    // values followed by all `n` `Store`s. Because every source byte is loaded before any
+    // destination byte is written, this is overlap-safe even for `Op::Memmove`.
     let mut func = view.to_func_in(alloc);
     func.ops.clear();
     func.flags.clear();
@@ -237,7 +515,7 @@ pub fn scalarize_small_memops<A: Allocator + Copy>(
         func.block_starts.push(to_u32(func.ops.len()));
         func.block_kinds.push(at_u8(view.block_kinds, b));
         for inst in view.block(Block(b32)) {
-            if let Some(ty) = small_memop_ty(&view, inst) {
+            if let Some(plan) = small_memop_plan(&view, inst, &slot_fields) {
                 let at = to_idx(at_u32(view.data, inst));
                 let old_dst = at_u32(view.extra, at);
                 let old_src = at_u32(view.extra, at.saturating_add(1));
@@ -248,30 +526,38 @@ pub fn scalarize_small_memops<A: Allocator + Copy>(
                     Some(m) => (m.align, m.src_align),
                     None => (0, 0),
                 };
-                let load_attr = intern_align_attr(&mut func, src_align);
-                let store_attr = intern_align_attr(&mut func, dst_align);
 
-                let load_extra = to_u32(func.extra.len());
-                func.extra.push(new_src);
-                func.extra.push(0);
-                let load_idx = to_u32(func.ops.len());
-                func.ops.push(load_op);
-                func.flags.push(Flags::NONE.0);
-                func.tys.push(ty.0);
-                func.data.push(load_extra);
-                func.attrs.push(load_attr);
-                func.locs.push(loc);
+                let chunks = plan.as_slice();
+                let mut load_idxs = [0u32; MAX_SMALL_COPY_CHUNKS];
+                for (i, &chunk) in chunks.iter().enumerate() {
+                    let load_attr = intern_align_attr(&mut func, chunk_align(src_align, chunk.off));
+                    let load_extra = to_u32(func.extra.len());
+                    func.extra.push(new_src);
+                    func.extra.push(chunk.off.cast_unsigned());
+                    let load_idx = to_u32(func.ops.len());
+                    func.ops.push(load_op);
+                    func.flags.push(Flags::NONE.0);
+                    func.tys.push(chunk.ty.0);
+                    func.data.push(load_extra);
+                    func.attrs.push(load_attr);
+                    func.locs.push(loc);
+                    set_at(&mut load_idxs, i, load_idx);
+                }
 
-                let store_extra = to_u32(func.extra.len());
-                func.extra.push(load_idx);
-                func.extra.push(new_dst);
-                func.extra.push(0);
-                func.ops.push(store_op);
-                func.flags.push(Flags::NONE.0);
-                func.tys.push(Ty::NONE.0);
-                func.data.push(store_extra);
-                func.attrs.push(store_attr);
-                func.locs.push(loc);
+                for (i, &chunk) in chunks.iter().enumerate() {
+                    let load_idx = at_u32(&load_idxs, i);
+                    let store_attr = intern_align_attr(&mut func, chunk_align(dst_align, chunk.off));
+                    let store_extra = to_u32(func.extra.len());
+                    func.extra.push(load_idx);
+                    func.extra.push(new_dst);
+                    func.extra.push(chunk.off.cast_unsigned());
+                    func.ops.push(store_op);
+                    func.flags.push(Flags::NONE.0);
+                    func.tys.push(Ty::NONE.0);
+                    func.data.push(store_extra);
+                    func.attrs.push(store_attr);
+                    func.locs.push(loc);
+                }
             } else {
                 let _ = copy_inst_same_blocks(&view, inst, &val_map, &mut func);
             }
@@ -1932,5 +2218,221 @@ mod tests {
                 "unexpected partial-overwrite result for v={v_val:#018x}: {after:?}"
             );
         }
+    }
+
+    #[test]
+    fn scalarize_slot_memcpy_12b_seqop_eliminates_slot_via_sroa() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut b = Builder::<_, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[
+                Param::of(Ty::PTR),
+                Param::of(Ty::I32),
+                Param::of(Ty::I32),
+                Param::of(Ty::I32),
+            ],
+            &[],
+        );
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let ext_dst = b.param(Ty::PTR);
+        let lit_len = b.param(Ty::I32);
+        let match_len = b.param(Ty::I32);
+        let offset = b.param(Ty::I32);
+
+        // 12-byte local slot (align = 4 = 1 << 2): exact `ptr::write(seq_dst, SeqOp { .. })` pattern.
+        let slot = b.slot(12, 2, SlotKind::Temp);
+        let sp = b.slot_addr(slot);
+        b.store(Flags::NONE, lit_len, sp, 0, MemAttrs::aligned(2));
+        b.store(Flags::NONE, match_len, sp, 4, MemAttrs::aligned(2));
+        b.store(Flags::NONE, offset, sp, 8, MemAttrs::aligned(2));
+        let len12 = b.iconst(Ty::I64, 12);
+        let al4 = MemAttrs { align: 2, src_align: 2, pointee_align: 0, bits: 0, range: None };
+        b.bulk(Op::Memcpy, Flags::NONE, ext_dst, sp, len12, al4);
+        b.ret(&[]);
+        let func = b.finish_checked().expect("valid 12B SeqOp input");
+
+        let scalarized = scalarize_small_memops(func.view(), alloc)
+            .expect("scalarize_small_memops succeeds")
+            .expect("must scalarize 12B slot memcpy");
+        let after_sroa = crate::simplify::sroa::scalar_replace(scalarized.view(), alloc)
+            .expect("sroa succeeds");
+        verify(after_sroa.view()).expect("after_sroa verifies");
+        assert!(after_sroa.slots.is_empty(), "12B SeqOp local slot must be eliminated by SROA");
+
+        let view = after_sroa.view();
+        let mut stores: Vec<(u32, u32, i32), _> = Vec::new_in(alloc);
+        for inst in 0..view.len() {
+            let op = view.op(inst);
+            assert_ne!(op, Op::Memcpy, "no Op::Memcpy may remain after scalarize + sroa");
+            assert_ne!(op, Op::Load, "no Op::Load may remain after scalarize + sroa");
+            assert_ne!(op, Op::SlotAddr, "no Op::SlotAddr may remain after scalarize + sroa");
+            if op == Op::Store {
+                let at = to_idx(at_u32(view.data, inst));
+                let val = at_u32(view.extra, at);
+                let ptr = at_u32(view.extra, at.saturating_add(1));
+                let off = at_u32(view.extra, at.saturating_add(2)).cast_signed();
+                stores.push((val, ptr, off));
+            }
+        }
+        assert_eq!(
+            stores.as_slice(),
+            &[
+                (lit_len.0, ext_dst.0, 0),
+                (match_len.0, ext_dst.0, 4),
+                (offset.0, ext_dst.0, 8),
+            ],
+            "must emit exactly 3 I32 stores directly to ext_dst at +0, +4, +8"
+        );
+    }
+
+    #[test]
+    fn scalarize_slot_memmove_12b_overlap_preserves_bytes() {
+        use crate::eval::{Outcome, Val, run_in};
+
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut b = Builder::<_, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[
+                Param::of(Ty::I32),
+                Param::of(Ty::I32),
+                Param::of(Ty::I32),
+                Param::of(Ty::I32),
+            ],
+            &[
+                Param::of(Ty::I32),
+                Param::of(Ty::I32),
+                Param::of(Ty::I32),
+                Param::of(Ty::I32),
+            ],
+        );
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let a = b.param(Ty::I32);
+        let c1 = b.param(Ty::I32);
+        let c2 = b.param(Ty::I32);
+        let d = b.param(Ty::I32);
+
+        let buf = b.slot(16, 2, SlotKind::Named);
+        let bp = b.slot_addr(buf);
+        b.store(Flags::NONE, a, bp, 0, MemAttrs::aligned(2));
+        b.store(Flags::NONE, c1, bp, 4, MemAttrs::aligned(2));
+        b.store(Flags::NONE, c2, bp, 8, MemAttrs::aligned(2));
+        b.store(Flags::NONE, d, bp, 12, MemAttrs::aligned(2));
+        let off4 = b.iconst(Ty::I64, 4);
+        let dst4 = b.ptr_add(Flags::NONE, bp, off4);
+        let len12 = b.iconst(Ty::I64, 12);
+        let al4 = MemAttrs { align: 2, src_align: 2, pointee_align: 0, bits: 0, range: None };
+        b.bulk(Op::Memmove, Flags::NONE, dst4, bp, len12, al4);
+        let r0 = b.load(Ty::I32, Flags::NONE, bp, 0, MemAttrs::aligned(2));
+        let r1 = b.load(Ty::I32, Flags::NONE, bp, 4, MemAttrs::aligned(2));
+        let r2 = b.load(Ty::I32, Flags::NONE, bp, 8, MemAttrs::aligned(2));
+        let r3 = b.load(Ty::I32, Flags::NONE, bp, 12, MemAttrs::aligned(2));
+        b.ret(&[r0, r1, r2, r3]);
+        let func = b.finish_checked().expect("valid overlapping 12B memmove input");
+
+        let opt = scalarize_small_memops(func.view(), alloc)
+            .expect("scalarize_small_memops succeeds")
+            .expect("must scalarize 12B slot memmove");
+        verify(opt.view()).expect("scalarized overlap memmove verifies");
+        for inst in 0..opt.view().len() {
+            assert_ne!(opt.view().op(inst), Op::Memmove, "no Op::Memmove may remain");
+        }
+
+        let fuel = 10_000;
+        let args = [
+            Val::Int(0x1111_2222),
+            Val::Int(0x3333_4444),
+            Val::Int(0x5555_6666),
+            Val::Int(0x7777_8888),
+        ];
+        let before = run_in(func.view(), &args, fuel, alloc).expect("eval before scalarize");
+        let after = run_in(opt.view(), &args, fuel, alloc).expect("eval after scalarize");
+        assert_eq!(before, after, "overlapping 12B memmove must preserve exact bytes");
+        assert!(
+            matches!(
+                after,
+                Outcome::Returned(ref vals)
+                    if vals.as_slice()
+                        == [
+                            Val::Int(0x1111_2222),
+                            Val::Int(0x1111_2222),
+                            Val::Int(0x3333_4444),
+                            Val::Int(0x5555_6666),
+                        ]
+            ),
+            "unexpected overlapping 12B memmove result: {after:?}"
+        );
+    }
+
+    #[test]
+    fn scalarize_non_slot_16b_memcpy_stays_bulk() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut b = Builder::<_, Full>::new_in(64, alloc);
+        let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR), Param::of(Ty::PTR)], &[]);
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let dst = b.param(Ty::PTR);
+        let src = b.param(Ty::PTR);
+        let len16 = b.iconst(Ty::I64, 16);
+        let al8 = MemAttrs { align: 3, src_align: 3, pointee_align: 0, bits: 0, range: None };
+        b.bulk(Op::Memcpy, Flags::NONE, dst, src, len16, al8);
+        b.ret(&[]);
+        let func = b.finish_checked().expect("valid non-slot 16B memcpy input");
+
+        let out = scalarize_small_memops(func.view(), alloc).expect("pass succeeds");
+        assert!(out.is_none(), "non-slot 16B memcpy must remain bulk for NEON ldr q; str q");
+    }
+
+    #[test]
+    fn scalarize_slot_to_slot_padded_tuple_preserves_sroa() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut b = Builder::<_, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I32)],
+            &[Param::of(Ty::I64), Param::of(Ty::I32)],
+        );
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let idx = b.param(Ty::I64);
+        let tag = b.param(Ty::I32);
+
+        // `(usize, u32)`: 16B slot with 4B trailing padding at +12..16.
+        let s_src = b.slot(16, 3, SlotKind::Temp);
+        let s_dst = b.slot(16, 3, SlotKind::Temp);
+        let p_src = b.slot_addr(s_src);
+        let p_dst = b.slot_addr(s_dst);
+        b.store(Flags::NONE, idx, p_src, 0, MemAttrs::aligned(3));
+        b.store(Flags::NONE, tag, p_src, 8, MemAttrs::aligned(2));
+        let len16 = b.iconst(Ty::I64, 16);
+        let al8 = MemAttrs { align: 3, src_align: 3, pointee_align: 0, bits: 0, range: None };
+        b.bulk(Op::Memcpy, Flags::NONE, p_dst, p_src, len16, al8);
+        let r0 = b.load(Ty::I64, Flags::NONE, p_dst, 0, MemAttrs::aligned(3));
+        let r1 = b.load(Ty::I32, Flags::NONE, p_dst, 8, MemAttrs::aligned(2));
+        b.ret(&[r0, r1]);
+        let func = b.finish_checked().expect("valid padded tuple slot-to-slot input");
+
+        let out = scalarize_small_memops(func.view(), alloc).expect("pass succeeds");
+        assert!(
+            out.is_none(),
+            "slot-to-slot padded tuple copy must be left intact for sroa::scalar_replace"
+        );
+        let after_sroa =
+            crate::simplify::sroa::scalar_replace(func.view(), alloc).expect("sroa succeeds");
+        verify(after_sroa.view()).expect("after_sroa verifies");
+        assert!(
+            after_sroa.slots.is_empty(),
+            "both padded tuple slots must be eliminated by SROA"
+        );
     }
 }

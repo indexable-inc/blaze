@@ -712,6 +712,16 @@ fn is_rbw(view: &View<'_>, inst: usize) -> bool {
     )
 }
 
+/// Resolves a zero-cost aliased value (`Op::Trunc`/`Op::Zext`) to its non-aliased root SSA index,
+/// or returns `v` unchanged when `alias_of` is empty or `alias_of[v] == u32::MAX`.
+#[inline]
+fn resolve_alias(alias_of: &[u32], v: usize) -> usize {
+    match alias_of.get(v).copied() {
+        Some(root) if root != u32::MAX => idx(root),
+        _ => v,
+    }
+}
+
 /// Returns the preferred same-bank operand `src` (ordered before `inst` by `is_before`) that
 /// `inst` should coalesce into:
 /// - Destructive 2-address NEON accumulators (`Fma`/`Fmuladd` operand `c`, `Fadd`/`Fsub` fused with
@@ -722,6 +732,7 @@ fn is_rbw(view: &View<'_>, inst: usize) -> bool {
 fn preferred_inplace_operand(
     view: &View<'_>,
     skip_alloc: &[bool],
+    alias_of: &[u32],
     is_before: impl Fn(usize) -> bool,
     is_dying: impl Fn(usize) -> bool,
     inst: usize,
@@ -733,7 +744,7 @@ fn preferred_inplace_operand(
     }
     let len = view.len();
     let valid_src = |v: u32| -> Option<usize> {
-        let vi = idx(v);
+        let vi = resolve_alias(alias_of, idx(v));
         if vi >= len || !is_before(vi) || skip_alloc.get(vi).copied().unwrap_or(false) {
             return None;
         }
@@ -790,11 +801,12 @@ fn preferred_inplace_operand(
             let at = idx(*view.data.get(inst)?);
             let a = *view.extra.get(at)?;
             let b = *view.extra.get(at + 1)?;
-            let (ai, bi) = (idx(a), idx(b));
+            let raw_ai = idx(a);
+            let (ai, bi) = (resolve_alias(alias_of, raw_ai), resolve_alias(alias_of, idx(b)));
             let (oa, ob) = (op_of(ai), op_of(bi));
             // Fused `VecUadalp`: `add(add(acc, and(...)), lshr(...))` where the inner `add` is skipped.
-            if skip_alloc.get(ai).copied().unwrap_or(false) && oa == Some(Op::Add) {
-                if let Some(&iat_raw) = view.data.get(ai) {
+            if skip_alloc.get(raw_ai).copied().unwrap_or(false) && op_of(raw_ai) == Some(Op::Add) {
+                if let Some(&iat_raw) = view.data.get(raw_ai) {
                     let iat = idx(iat_raw);
                     if let (Some(&ia), Some(&ib)) = (view.extra.get(iat), view.extra.get(iat + 1)) {
                         if op_of(idx(ib)) == Some(Op::And) {
@@ -829,7 +841,7 @@ fn preferred_inplace_operand(
             let at = idx(*view.data.get(inst)?);
             let a = *view.extra.get(at)?;
             let b = *view.extra.get(at + 1)?;
-            let (ai, bi) = (idx(a), idx(b));
+            let (ai, bi) = (resolve_alias(alias_of, idx(a)), resolve_alias(alias_of, idx(b)));
             let (oa, ob) = (op_of(ai), op_of(bi));
             if ob == Some(Op::Mul) && oa != Some(Op::Mul) {
                 valid_src(a)
@@ -1078,7 +1090,7 @@ fn is_folded_imm_use(view: &View<'_>, user: usize, vi: usize, cval: u64) -> bool
     let at = idx(at_raw);
     match op {
         Op::Add if bits == 64 || bits == 32 => {
-            if cval > 4095 {
+            if super::isel::is_addsub_imm12(cval).is_none() {
                 return false;
             }
             let (Some(&a), Some(&b)) = (view.extra.get(at), view.extra.get(at + 1)) else {
@@ -1088,7 +1100,7 @@ fn is_folded_imm_use(view: &View<'_>, user: usize, vi: usize, cval: u64) -> bool
             ai != bi && (ai == vi || bi == vi)
         }
         Op::Sub if bits == 64 || bits == 32 => {
-            if cval > 4095 {
+            if super::isel::is_addsub_imm12(cval).is_none() {
                 return false;
             }
             let (Some(&a), Some(&b)) = (view.extra.get(at), view.extra.get(at + 1)) else {
@@ -1096,8 +1108,18 @@ fn is_folded_imm_use(view: &View<'_>, user: usize, vi: usize, cval: u64) -> bool
             };
             idx(b) == vi && idx(a) != vi
         }
+        Op::And | Op::Or | Op::Xor if bits == 64 || bits == 32 => {
+            if crate::enc::logical_imm(cval, bits).is_none() {
+                return false;
+            }
+            let (Some(&a), Some(&b)) = (view.extra.get(at), view.extra.get(at + 1)) else {
+                return false;
+            };
+            let (ai, bi) = (idx(a), idx(b));
+            ai != bi && (ai == vi || bi == vi)
+        }
         Op::Icmp => {
-            if cval > 4095 {
+            if super::isel::is_addsub_imm12(cval).is_none() {
                 return false;
             }
             let (Some(&a), Some(&b)) = (view.extra.get(at + 1), view.extra.get(at + 2)) else {
@@ -1105,7 +1127,9 @@ fn is_folded_imm_use(view: &View<'_>, user: usize, vi: usize, cval: u64) -> bool
             };
             let a_ty = view.tys.get(idx(a)).copied().map_or(Ty::NONE, Ty);
             let abits = if a_ty.is_scalar() && a_ty.is_int() { a_ty.bits(64) } else { 0 };
-            (abits == 64 || abits == 32) && idx(b) == vi && idx(a) != vi
+            (abits == 64 || abits == 32)
+                && idx(a) != idx(b)
+                && (idx(b) == vi || (cval == 0 && idx(a) == vi))
         }
         Op::PtrAdd => {
             let Some(&b) = view.extra.get(at + 1) else {
@@ -1122,13 +1146,28 @@ fn is_folded_imm_use(view: &View<'_>, user: usize, vi: usize, cval: u64) -> bool
                 let shift = 64 - bbits;
                 (cval << shift).cast_signed() >> shift
             };
-            (-4095..=4095).contains(&delta)
+            super::isel::is_addsub_imm12(delta.unsigned_abs()).is_some()
         }
         Op::Shl | Op::Lshr | Op::Ashr | Op::Rotl | Op::Rotr if bits == 64 || bits == 32 => {
             let (Some(&a), Some(&b)) = (view.extra.get(at), view.extra.get(at + 1)) else {
                 return false;
             };
             idx(b) == vi && idx(a) != vi
+        }
+        Op::Select
+            if (cval == 0 || cval == 1)
+                && u_ty != Ty::I128
+                && is_fp_ty(u_ty).is_none()
+                && is_vec128_ty(u_ty).is_none() =>
+        {
+            let (Some(&c), Some(&t), Some(&f)) = (
+                view.extra.get(at),
+                view.extra.get(at + 1),
+                view.extra.get(at + 2),
+            ) else {
+                return false;
+            };
+            idx(c) != vi && (idx(t) == vi || idx(f) == vi)
         }
         _ => false,
     }
@@ -1384,7 +1423,7 @@ fn compute_rpo_and_loop_depth<A: Allocator + Copy>(
 
 /// Seeds ABI register hints for entry parameters (including `sret` in `X8`), landing-pad
 /// exception parameters (`X0`), and `Op::Return` values (`X0`/`X1`/`V0`/`V1`).
-fn seed_abi_and_return_hints(view: &View<'_>, os: crate::Os, hint: &mut [u8]) {
+fn seed_abi_and_return_hints(view: &View<'_>, alias_of: &[u32], os: crate::Os, hint: &mut [u8]) {
     let func_sig = view.sig(SigId(view.head.sig));
     let entry_params = view.params(Block(0));
     let mut regs = Regs::new(os);
@@ -1428,7 +1467,7 @@ fn seed_abi_and_return_hints(view: &View<'_>, os: crate::Os, hint: &mut [u8]) {
                     let retc = idx(retc_raw);
                     if retc >= 1 {
                         if let Some(&rv0_raw) = view.extra.get(at + 1) {
-                            let rv0 = idx(rv0_raw);
+                            let rv0 = resolve_alias(alias_of, idx(rv0_raw));
                             if let Some(slot) = hint.get_mut(rv0) {
                                 if *slot == NO_REG {
                                     let is_fp_or_vec = view.tys.get(rv0).copied().is_some_and(|t| {
@@ -1442,7 +1481,7 @@ fn seed_abi_and_return_hints(view: &View<'_>, os: crate::Os, hint: &mut [u8]) {
                     }
                     if retc == 2 {
                         if let Some(&rv1_raw) = view.extra.get(at + 2) {
-                            let rv1 = idx(rv1_raw);
+                            let rv1 = resolve_alias(alias_of, idx(rv1_raw));
                             if let Some(slot) = hint.get_mut(rv1) {
                                 if *slot == NO_REG {
                                     let is_fp_or_vec = view.tys.get(rv1).copied().is_some_and(|t| {
@@ -1653,6 +1692,7 @@ pub(crate) fn allocate_with_ipra<A: Allocator + Copy>(
     allocate_with_ipra_and_order(
         view,
         skip_alloc,
+        &[],
         tail_calls,
         max_spill_slots,
         os,
@@ -1669,9 +1709,11 @@ pub(crate) fn allocate_with_ipra<A: Allocator + Copy>(
 /// whenever `blocks <= EXACT_CFG_MAX_BLOCKS` and allocated SSA values `<= EXACT_CFG_MAX_VALS`
 /// (`<= 6.75 MiB` worst-case), and falls back to the O(N log K) RPO-ordered `BusySet` linear-scan
 /// allocator for mega-functions (e.g. 600k-inst / 130k-block generated parsers).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
     view: &View<'_>,
     skip_alloc: &[bool],
+    alias_of: &[u32],
     tail_calls: &[bool],
     max_spill_slots: u32,
     os: crate::Os,
@@ -1685,6 +1727,7 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
         allocate_exact_cfg(
             view,
             skip_alloc,
+            alias_of,
             tail_calls,
             max_spill_slots,
             os,
@@ -1697,6 +1740,7 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
         allocate_linear_scan_rpo(
             view,
             skip_alloc,
+            alias_of,
             tail_calls,
             max_spill_slots,
             os,
@@ -1716,6 +1760,7 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
 fn allocate_exact_cfg<A: Allocator + Copy>(
     view: &View<'_>,
     skip_alloc: &[bool],
+    alias_of: &[u32],
     tail_calls: &[bool],
     max_spill_slots: u32,
     os: crate::Os,
@@ -2165,7 +2210,7 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
         back_partner_prio.push(0);
     }
 
-    seed_abi_and_return_hints(view, os, &mut hint);
+    seed_abi_and_return_hints(view, alias_of, os, &mut hint);
 
     for b in 0..blocks {
         let term = view.terminator(Block(u32_of(b)));
@@ -2182,7 +2227,7 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
             if let Some(args) = view.extra.get(args_start..args_start + n) {
                 for (k, &arg_raw) in args.iter().enumerate() {
                     let p = target_params.start + k;
-                    let arg = idx(arg_raw);
+                    let arg = resolve_alias(alias_of, idx(arg_raw));
                     if arg >= len
                         || p >= len
                         || arg == p
@@ -2263,7 +2308,7 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
         }
         let pi = idx(partner);
         if let Some(acc) =
-            preferred_inplace_operand(view, skip_alloc, |vi| vi < inst, |ci| !vals_interfere(inst, ci), inst)
+            preferred_inplace_operand(view, skip_alloc, alias_of, |vi| vi < inst, |ci| !vals_interfere(inst, ci), inst)
         {
             if acc > pi
                 && pre_remat.get(acc).copied().unwrap_or(AllocLoc::None) == AllocLoc::None
@@ -2288,7 +2333,7 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
             continue;
         }
         if let Some(src) =
-            preferred_inplace_operand(view, skip_alloc, |vi| vi < inst, |ci| !vals_interfere(inst, ci), inst)
+            preferred_inplace_operand(view, skip_alloc, alias_of, |vi| vi < inst, |ci| !vals_interfere(inst, ci), inst)
         {
             if pre_remat.get(src).copied().unwrap_or(AllocLoc::None) == AllocLoc::None
                 && remat_val.get(src).copied().flatten().is_none()
@@ -2800,6 +2845,7 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
 fn allocate_linear_scan_rpo<A: Allocator + Copy>(
     view: &View<'_>,
     skip_alloc: &[bool],
+    alias_of: &[u32],
     tail_calls: &[bool],
     max_spill_slots: u32,
     os: crate::Os,
@@ -3043,7 +3089,7 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
         back_partner_prio.push(0);
     }
 
-    seed_abi_and_return_hints(view, os, &mut hint);
+    seed_abi_and_return_hints(view, alias_of, os, &mut hint);
 
     #[inline]
     fn intervals_conflict(s: usize, e: usize, s_rbw: bool, start: usize, end: usize, cur_rbw: bool) -> bool {
@@ -3067,7 +3113,7 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
             if let Some(args) = view.extra.get(args_start..args_start + n) {
                 for (k, &arg_raw) in args.iter().enumerate() {
                     let p = target_params.start + k;
-                    let arg = idx(arg_raw);
+                    let arg = resolve_alias(alias_of, idx(arg_raw));
                     if arg < len
                         && p < len
                         && rpo_pos.get(arg).copied().unwrap_or(0) > rpo_pos.get(p).copied().unwrap_or(usize::MAX)
@@ -3140,6 +3186,7 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
         if let Some(acc) = preferred_inplace_operand(
             view,
             skip_alloc,
+            alias_of,
             |vi| rpo_pos.get(vi).copied().unwrap_or(usize::MAX) < inst_pos,
             |ci| last_use_pos.get(ci).copied() == Some(inst_pos),
             inst,
@@ -3167,6 +3214,7 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
         if let Some(src) = preferred_inplace_operand(
             view,
             skip_alloc,
+            alias_of,
             |vi| rpo_pos.get(vi).copied().unwrap_or(usize::MAX) < inst_pos,
             |ci| last_use_pos.get(ci).copied() == Some(inst_pos),
             inst,
@@ -3856,6 +3904,7 @@ mod tests {
         let default_alloc = allocate_with_ipra_and_order(
             &view,
             &skip[..n],
+            &[],
             &tail[..n],
             32,
             crate::Os::MacOs,
@@ -3873,6 +3922,7 @@ mod tests {
         let avoided_alloc = allocate_with_ipra_and_order(
             &view,
             &skip[..n],
+            &[],
             &tail[..n],
             32,
             crate::Os::MacOs,
@@ -4573,6 +4623,7 @@ mod tests {
         let ra_rpo = allocate_linear_scan_rpo(
             &view,
             &skip,
+            &[],
             &tail,
             32,
             crate::Os::MacOs,
@@ -4645,6 +4696,7 @@ mod tests {
         let ra = allocate_linear_scan_rpo(
             &view,
             &skip,
+            &[],
             &tail,
             32,
             crate::Os::MacOs,
@@ -4710,6 +4762,7 @@ mod tests {
         let ra_rpo = allocate_linear_scan_rpo(
             &view,
             &skip,
+            &[],
             &tail,
             64,
             crate::Os::MacOs,
@@ -4833,6 +4886,7 @@ mod tests {
         let ra_rpo = allocate_linear_scan_rpo(
             &view,
             &skip,
+            &[],
             &tail,
             64,
             crate::Os::MacOs,
@@ -4899,6 +4953,7 @@ mod tests {
         let ra_rpo = allocate_linear_scan_rpo(
             &view,
             &skip,
+            &[],
             &tail,
             32,
             crate::Os::MacOs,
@@ -5098,6 +5153,7 @@ mod tests {
         let ra_rpo = allocate_linear_scan_rpo(
             &view,
             &skip,
+            &[],
             &tail,
             64,
             crate::Os::MacOs,
@@ -5203,6 +5259,7 @@ mod tests {
         let ra_rpo = allocate_linear_scan_rpo(
             &view,
             &skip,
+            &[],
             &tail,
             64,
             crate::Os::MacOs,
@@ -5292,6 +5349,7 @@ mod tests {
             let ra_rpo = allocate_linear_scan_rpo(
                 &view,
                 &skip,
+                &[],
                 &tail,
                 64,
                 crate::Os::MacOs,
@@ -5351,6 +5409,7 @@ mod tests {
             let ra_rpo = allocate_linear_scan_rpo(
                 &view,
                 &skip,
+                &[],
                 &tail,
                 64,
                 crate::Os::MacOs,
@@ -5419,6 +5478,7 @@ mod tests {
             let ra_rpo = allocate_linear_scan_rpo(
                 &view,
                 &skip,
+                &[],
                 &tail,
                 64,
                 crate::Os::MacOs,
@@ -5524,6 +5584,7 @@ mod tests {
             let ra_rpo = allocate_linear_scan_rpo(
                 &view,
                 &skip,
+                &[],
                 &tail,
                 64,
                 crate::Os::MacOs,
@@ -5632,6 +5693,7 @@ mod tests {
             let ra_rpo = allocate_linear_scan_rpo(
                 &view,
                 &skip,
+                &[],
                 &tail,
                 64,
                 crate::Os::MacOs,
@@ -5736,6 +5798,7 @@ mod tests {
         let ra_rpo = allocate_linear_scan_rpo(
             &view,
             &skip,
+            &[],
             &tail,
             64,
             crate::Os::MacOs,

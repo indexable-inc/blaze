@@ -54,13 +54,6 @@ const LL_BITS: Pow2Array<u8, 64> = Pow2Array::new([
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 ]);
 
-/// Direct power-of-two LUT mapping `lit_len` (`0..64`) to its Literals_Length code.
-const LL_CODE_LUT: Pow2Array<u8, 64> = Pow2Array::new([
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 16, 17, 17, 18, 18, 19, 19, 20, 20,
-    20, 20, 21, 21, 21, 21, 22, 22, 22, 22, 22, 22, 22, 22, 23, 23, 23, 23, 23, 23, 23, 23, 24, 24,
-    24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
-]);
-
 /// RFC 8878 §3.1.1.3.2.1.1 Match_Length baselines for codes 0..=52 (padded to 64 for masked indexing).
 const ML_BASE: Pow2Array<u32, 64> = Pow2Array::new([
     3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
@@ -74,16 +67,6 @@ const ML_BITS: Pow2Array<u8, 64> = Pow2Array::new([
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-]);
-
-/// Direct power-of-two LUT mapping `match_len - 3` (`0..128`) to its Match_Length code.
-const ML_CODE_LUT: Pow2Array<u8, 128> = Pow2Array::new([
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
-    26, 27, 28, 29, 30, 31, 32, 32, 33, 33, 34, 34, 35, 35, 36, 36, 36, 36, 37, 37, 37, 37, 38, 38,
-    38, 38, 38, 38, 38, 38, 39, 39, 39, 39, 39, 39, 39, 39, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40,
-    40, 40, 40, 40, 40, 40, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 42, 42,
-    42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42,
-    42, 42, 42, 42, 42, 42,
 ]);
 
 const fn pack_seq(code: u32, bits: u32, base: u32) -> u32 {
@@ -145,34 +128,6 @@ pub(crate) const ML_ENC_PACKED: [u32; 128] = [
     pack_seq(42, 5, 99), pack_seq(42, 5, 99), pack_seq(42, 5, 99), pack_seq(42, 5, 99),
     pack_seq(42, 5, 99), pack_seq(42, 5, 99), pack_seq(42, 5, 99), pack_seq(42, 5, 99),
 ];
-
-/// Code-only LL lookup (`0..=35`) for sequence histogramming (zero `Option`, zero extra-bits math).
-#[inline(always)]
-pub(crate) fn ll_code_raw(lit_len: u32) -> usize {
-    if lit_len < 64 {
-        return usize::from(LL_CODE_LUT.get_masked(lit_len.widen_to::<usize>()));
-    }
-    if lit_len < 128 {
-        return 25;
-    }
-    (50u32 - lit_len.leading_zeros()).widen_to::<usize>()
-}
-
-/// Code-only ML lookup (`0..=52`) for sequence histogramming (zero `Option`, zero extra-bits math).
-#[inline(always)]
-pub(crate) fn ml_code_raw(match_len: u32) -> usize {
-    let m = match_len.saturating_sub(3);
-    if m < 128 {
-        return usize::from(ML_CODE_LUT.get_masked(m.widen_to::<usize>()));
-    }
-    (67u32 - m.leading_zeros()).widen_to::<usize>()
-}
-
-/// Code-only OF lookup (`0..=31`) for sequence histogramming (zero `Option`, zero extra-bits math).
-#[inline(always)]
-pub(crate) fn of_code_raw(offset_value: u32) -> usize {
-    (31u32 - (offset_value | 1).leading_zeros()).widen_to::<usize>()
-}
 
 /// Branchless single-LUT LL encoder for valid `lit_len < 131_072` (no `Option` overhead).
 #[inline(always)]
@@ -1091,6 +1046,7 @@ pub(crate) struct FseEncTable {
     init_offset: Pow2Array<u8, MAX_FSE_SYMBOLS>,
     table_size: u16,
     accuracy_log: u8,
+    present_mask: u64,
 }
 
 impl FseEncTable {
@@ -1101,7 +1057,13 @@ impl FseEncTable {
             init_offset: Pow2Array::splat(0),
             table_size: 0,
             accuracy_log: 0,
+            present_mask: 0,
         }
+    }
+
+    #[inline(always)]
+    pub(crate) const fn present_mask(&self) -> u64 {
+        self.present_mask
     }
 
     #[inline]
@@ -1148,6 +1110,7 @@ impl FseEncTable {
         self.state_table_biased.set_masked(0, 1);
         self.table_size = 1;
         self.accuracy_log = 0;
+        self.present_mask = 1u64 << u32::from(sym);
         Ok(())
     }
 
@@ -1185,14 +1148,17 @@ impl FseEncTable {
 
         self.sym_tt.fill(0);
         self.init_offset.fill(0);
+        self.present_mask = 0;
 
         let mut write_pos = Pow2Array::<u16, MAX_FSE_SYMBOLS>::splat(0);
         let mut cursor: usize = 0;
+        let mut present_mask: u64 = 0;
         for sym in 0..MAX_FSE_SYMBOLS {
             let count_u16 = counts.get_masked(sym);
             if count_u16 == 0 {
                 continue;
             }
+            present_mask |= 1u64 << sym;
             let count = u32::from(count_u16);
             let cursor_u32 = cursor.truncate_to::<u32>();
 
@@ -1228,11 +1194,140 @@ impl FseEncTable {
 
         self.table_size = table_size_u16;
         self.accuracy_log = log;
+        self.present_mask = present_mask;
         true
     }
 
     pub(crate) fn rebuild_from_dec(&mut self, dec: &FseDecTable) -> Result<(), ZstdError> {
         if !self.rebuild_from_dec_inner(dec) {
+            return Err(ZstdError::CorruptFse);
+        }
+        Ok(())
+    }
+
+    fn rebuild_from_norm_inner(&mut self, norm: &[i16], accuracy_log: u8) -> bool {
+        if accuracy_log > MAX_ENC_LOG || norm.len() > MAX_FSE_SYMBOLS {
+            return false;
+        }
+        let log_u32 = u32::from(accuracy_log);
+        let table_size = 1usize << log_u32;
+        let table_size_u32 = 1u32 << log_u32;
+        let table_size_u16 = table_size.truncate_to::<u16>();
+        let table_mask = table_size - 1;
+        let step = (table_size >> 1) + (table_size >> 3) + 3;
+
+        self.sym_tt.fill(0);
+        self.init_offset.fill(0);
+        self.present_mask = 0;
+
+        let mut table_sym = Pow2Array::<u8, MAX_ENC_TABLE_SIZE>::splat(0);
+        let mut write_pos = Pow2Array::<u16, MAX_FSE_SYMBOLS>::splat(0);
+        let mut high_threshold = table_size;
+        let mut cursor: usize = 0;
+        let mut present_mask: u64 = 0;
+
+        // Pass 1: validate normalized probabilities, compute per-symbol transform entries and
+        // cumulative write cursors, and place `-1` symbols at the top of `table_sym` descending.
+        for (sym, &prob) in norm.iter().enumerate() {
+            if prob == 0 {
+                continue;
+            }
+            if prob < -1 {
+                return false;
+            }
+            let count: u32 = if prob == -1 {
+                if high_threshold == 0 {
+                    return false;
+                }
+                high_threshold = high_threshold.wrapping_sub(1);
+                table_sym.set_masked(high_threshold, sym.truncate_to::<u8>());
+                1
+            } else {
+                let Ok(c) = u32::try_from(prob) else {
+                    return false;
+                };
+                if c > table_size_u32 {
+                    return false;
+                }
+                c
+            };
+
+            let next_cursor = cursor.wrapping_add(count.widen_to::<usize>());
+            if next_cursor > table_size {
+                return false;
+            }
+
+            present_mask |= 1u64 << sym;
+            let cursor_u32 = cursor.truncate_to::<u32>();
+            let (max_bits_out, min_state_plus) = if count == 1 {
+                (log_u32, table_size_u32)
+            } else {
+                let hb = 31u32.wrapping_sub(count.wrapping_sub(1).leading_zeros());
+                let mbo = log_u32.wrapping_sub(hb);
+                (mbo, count << mbo)
+            };
+            let delta_nb_bits = (max_bits_out << 16).wrapping_sub(min_state_plus);
+            let delta_find_state = cursor_u32.wrapping_sub(count);
+            self.sym_tt.set_masked(
+                sym,
+                u64::from(delta_nb_bits) | (u64::from(delta_find_state) << 32),
+            );
+            self.init_offset.set_masked(sym, cursor.truncate_to::<u8>());
+            write_pos.set_masked(sym, cursor.truncate_to::<u16>());
+            cursor = next_cursor;
+        }
+
+        if cursor != table_size {
+            return false;
+        }
+        if high_threshold > 1 && (step & 1) == 0 {
+            return false;
+        }
+
+        // Pass 2: spread positive-probability symbols across `0..high_threshold` in exact
+        // RFC 8878 §4.1.1 order (matching `FseDecTable::build_from_norm_inner`).
+        let mut pos: usize = 0;
+        for (sym, &prob) in norm.iter().enumerate() {
+            if prob <= 0 {
+                continue;
+            }
+            let count = usize::from(prob.cast_unsigned());
+            let sym_u8 = sym.truncate_to::<u8>();
+            for _ in 0..count {
+                table_sym.set_masked(pos, sym_u8);
+                pos = pos.wrapping_add(step) & table_mask;
+                while pos >= high_threshold {
+                    pos = pos.wrapping_add(step) & table_mask;
+                }
+            }
+        }
+        if pos != 0 {
+            return false;
+        }
+
+        // Pass 3: scatter `+table_size`-biased state indices into per-symbol slots.
+        for state in 0..table_size {
+            let sym = usize::from(table_sym.get_masked(state));
+            let idx = usize::from(write_pos.get_masked(sym));
+            write_pos.set_masked(sym, idx.wrapping_add(1).truncate_to::<u16>());
+            self.state_table_biased
+                .set_masked(idx, state.wrapping_add(table_size).truncate_to::<u16>());
+        }
+
+        self.table_size = table_size_u16;
+        self.accuracy_log = accuracy_log;
+        self.present_mask = present_mask;
+        true
+    }
+
+    /// Build the FSE encoding table directly from normalized probabilities (`-1`, `0`, or `> 0`)
+    /// summing to `1 << accuracy_log` without constructing an intermediate [`FseDecTable`].
+    pub(crate) fn rebuild_from_norm(
+        &mut self,
+        norm: &[i16],
+        accuracy_log: u8,
+    ) -> Result<(), ZstdError> {
+        if !self.rebuild_from_norm_inner(norm, accuracy_log) {
             return Err(ZstdError::CorruptFse);
         }
         Ok(())
@@ -1293,5 +1388,50 @@ impl FseEncTable {
         let (next_biased, bits, nb) =
             self.encode_step_biased(sym, u32::from(target_state).wrapping_add(ts));
         (next_biased.wrapping_sub(ts).truncate_to::<u8>(), bits, nb)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_norm_matches_dec(norm: &[i16], accuracy_log: u8) {
+        let mut dec = FseDecTable::new_empty();
+        assert!(dec.build_from_norm(norm, accuracy_log).is_ok());
+        let mut via_dec = FseEncTable::new_empty();
+        assert!(via_dec.rebuild_from_dec(&dec).is_ok());
+
+        let mut direct = FseEncTable::new_empty();
+        assert!(direct.rebuild_from_norm(norm, accuracy_log).is_ok());
+
+        assert_eq!(direct.table_size, via_dec.table_size);
+        assert_eq!(direct.accuracy_log, via_dec.accuracy_log);
+        assert_eq!(direct.present_mask(), via_dec.present_mask());
+        assert_eq!(direct.sym_tt.as_slice(), via_dec.sym_tt.as_slice());
+        assert_eq!(direct.init_offset.as_slice(), via_dec.init_offset.as_slice());
+        assert_eq!(
+            direct.state_table_biased.as_slice(),
+            via_dec.state_table_biased.as_slice()
+        );
+    }
+
+    #[test]
+    fn rebuild_from_norm_matches_rebuild_from_dec_on_defaults_and_custom() {
+        assert_norm_matches_dec(&LL_DEFAULT_NORM, LL_DEFAULT_LOG);
+        assert_norm_matches_dec(&OF_DEFAULT_NORM, OF_DEFAULT_LOG);
+        assert_norm_matches_dec(&ML_DEFAULT_NORM, ML_DEFAULT_LOG);
+
+        let counts: [u32; 16] = [500, 0, 120, 45, 1, 0, 300, 12, 2, 0, 0, 80, 1, 9, 15, 3];
+        let total: u32 = counts.iter().copied().sum();
+        for log in [5u8, 6, 7, 8] {
+            let mut norm = [0i16; 16];
+            let max_sym = normalize_fse_counts(&counts, total, log, &mut norm);
+            assert!(max_sym.is_some());
+            if let Some(m) = max_sym
+                && let Some(slice) = norm.get(..=m)
+            {
+                assert_norm_matches_dec(slice, log);
+            }
+        }
     }
 }

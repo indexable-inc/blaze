@@ -15,8 +15,10 @@
 //! - **Pattern A (Phi-Discriminant Jump Threading)**: when a small pure block `M` terminates in
 //!   `br` or `switch` whose outcome evaluates statically for a predecessor edge `P -> M(args)`
 //!   (from integer constants or statically known `null`/non-null pointer facts), redirects that
-//!   edge straight to the resolved successor `S`, promoting any externally used parameter of `M`
-//!   into `S` when `M` is `S`'s unique reachable predecessor.
+//!   edge straight to the resolved successor `S`, reconstructing SSA via iterated dominance
+//!   frontiers on the post-threading CFG for any externally used parameter of `M` (including
+//!   uses in multi-predecessor post-merge blocks such as loop exits) and hoisting zero-operand
+//!   constants of `M` to the entry block when needed.
 //! - **Pattern B (Trivial Forwarding Block Collapse)**: when a non-entry block `B` has only pure
 //!   dead instructions and ends in `jump S(s_args)`, threads plain incoming edges straight through
 //!   `B` to `S`.
@@ -44,7 +46,7 @@ use crate::{
 };
 
 /// Maximum threading + coalescing fixpoint rounds per call.
-const MAX_ROUNDS: usize = 16;
+const MAX_ROUNDS: usize = 64;
 
 /// Maximum non-param, non-terminator pure instructions allowed inside a Pattern A candidate block.
 const MAX_THREAD_BLOCK_INSTS: usize = 16;
@@ -1903,7 +1905,14 @@ fn eval_block_for_edge<A: Allocator + Copy>(
     }
     for k in 0..param_count {
         let arg = at(view.extra, edge.args_start + k, NONE);
-        set_at(local_buf, k, facts.lookup(arg, global_vals));
+        let mut val = facts.lookup(arg, global_vals);
+        if val == EvalVal::Unknown && !facts.is_empty() {
+            let a_idx = to_idx(arg);
+            if a_idx < view.len() && is_pure_thread_op(view.op(a_idx)) {
+                val = eval_pure_inst(view, a_idx, |v| facts.lookup(v, global_vals));
+            }
+        }
+        set_at(local_buf, k, val);
     }
 
     let lookup = |v: u32, local: &[EvalVal]| -> EvalVal {
@@ -1933,6 +1942,262 @@ fn eval_block_for_edge<A: Allocator + Copy>(
 // Per-block threading plan & round rewriter
 // ---------------------------------------------------------------------------
 
+/// Whether `inst` is a zero-operand pure constant instruction safe to hoist to the entry block
+/// so threaded edges and external uses remain dominated without introducing a block parameter.
+#[inline]
+fn is_hoistable_const(view: &View<'_>, inst: usize) -> bool {
+    match view.op(inst) {
+        Op::Iconst | Op::IconstWide | Op::Fconst | Op::FconstWide | Op::Null | Op::SlotAddr => true,
+        Op::Uninit => Ty(at(view.tys, inst, 0)).is_scalar(),
+        _ => false,
+    }
+}
+
+/// One reachable incoming edge in the post-threading CFG `G'`.
+#[derive(Clone, Copy, Debug)]
+struct PostInEdge {
+    pred: u32,
+    is_threaded: bool,
+}
+
+/// Post-threading CFG `G'` for a single candidate block `m_block`: immediate dominators,
+/// reachable incoming edges (tagged threaded vs normal), and dominance frontiers.
+struct PostCfg<A: Allocator> {
+    idom: Vec<u32, A>,
+    in_start: Vec<u32, A>,
+    in_edges: Vec<PostInEdge, A>,
+    df_start: Vec<u32, A>,
+    df_blocks: Vec<u32, A>,
+}
+
+impl<A: Allocator + Copy> PostCfg<A> {
+    fn build(view: &View<'_>, threaded: &[ThreadedEdge], alloc: A) -> Option<Self> {
+        let blocks = view.blocks();
+        let mut succ_start = Vec::with_capacity_in(blocks + 1, alloc);
+        let mut succs: Vec<(u32, bool), A> = Vec::new_in(alloc);
+        for b in 0..blocks {
+            let b_u32 = to_u32(b);
+            succ_start.push(to_u32(succs.len()));
+            each(view, view.terminator(Block(b_u32)), |item| {
+                if let Item::Edge(edge) = item {
+                    if edge.args.is_some() {
+                        if let Some(te) = threaded.iter().find(|e| e.pred == b_u32 && e.ordinal == edge.ordinal) {
+                            succs.push((te.target.block, true));
+                            return;
+                        }
+                    }
+                    succs.push((edge.block, false));
+                }
+            });
+        }
+        succ_start.push(to_u32(succs.len()));
+
+        // Iterative reverse postorder from block 0 in `G'`.
+        let mut post: Vec<u32, A> = Vec::with_capacity_in(blocks, alloc);
+        let mut seen = filled(blocks, false, &alloc);
+        let mut stack: Vec<(u32, u32), A> = Vec::new_in(alloc);
+        if blocks > 0 {
+            set_at(&mut seen, 0, true);
+            stack.push((0, at(&succ_start, 0, 0)));
+        }
+        while let Some(top) = stack.last_mut() {
+            let (b, next) = *top;
+            let b_idx = to_idx(b);
+            let end = at(&succ_start, b_idx + 1, 0);
+            if next < end {
+                top.1 = next + 1;
+                let s = at(&succs, to_idx(next), (0, false)).0;
+                let s_idx = to_idx(s);
+                if !at(&seen, s_idx, true) {
+                    set_at(&mut seen, s_idx, true);
+                    stack.push((s, at(&succ_start, s_idx, 0)));
+                }
+            } else {
+                post.push(b);
+                stack.pop();
+            }
+        }
+        let mut rpo = Vec::with_capacity_in(post.len(), alloc);
+        rpo.extend_from_slice(&post);
+        rpo.reverse();
+
+        let mut rpo_order = filled(blocks, NONE, &alloc);
+        for (idx, &b) in rpo.iter().enumerate() {
+            set_at(&mut rpo_order, to_idx(b), to_u32(idx));
+        }
+
+        // Collect reachable predecessor pairs (for idom/DF) and tagged incoming edges (for Need).
+        let mut pred_pairs: Vec<(u32, u32), A> = Vec::new_in(alloc);
+        let mut in_counts = filled(blocks + 1, 0u32, &alloc);
+        for &b in rpo.iter() {
+            let b_idx = to_idx(b);
+            let s_s = to_idx(at(&succ_start, b_idx, 0));
+            let s_e = to_idx(at(&succ_start, b_idx + 1, 0));
+            if let Some(slice) = succs.get(s_s..s_e) {
+                for &(to, _) in slice {
+                    pred_pairs.push((to, b));
+                    if let Some(c) = in_counts.get_mut(to_idx(to) + 1) {
+                        *c += 1;
+                    }
+                }
+            }
+        }
+
+        // Deduplicated reachable predecessor CSR.
+        pred_pairs.sort_unstable();
+        pred_pairs.dedup();
+        let mut pred_start = filled(blocks + 1, 0u32, &alloc);
+        for &(to, _) in pred_pairs.iter() {
+            if let Some(c) = pred_start.get_mut(to_idx(to) + 1) {
+                *c += 1;
+            }
+        }
+        for b in 0..blocks {
+            let prev = at(&pred_start, b, 0);
+            if let Some(cur) = pred_start.get_mut(b + 1) {
+                *cur += prev;
+            }
+        }
+        let mut preds: Vec<u32, A> = Vec::with_capacity_in(pred_pairs.len(), alloc);
+        for &(_, from) in pred_pairs.iter() {
+            preds.push(from);
+        }
+
+        // Tagged reachable incoming edge CSR (preserving parallel threaded + normal edges).
+        for b in 0..blocks {
+            let prev = at(&in_counts, b, 0);
+            if let Some(cur) = in_counts.get_mut(b + 1) {
+                *cur += prev;
+            }
+        }
+        let in_start = in_counts;
+        let total_in = to_idx(at(&in_start, blocks, 0));
+        let mut in_fill = filled(blocks, 0u32, &alloc);
+        let mut in_edges = filled(total_in, PostInEdge { pred: 0, is_threaded: false }, &alloc);
+        for &b in rpo.iter() {
+            let b_idx = to_idx(b);
+            let s_s = to_idx(at(&succ_start, b_idx, 0));
+            let s_e = to_idx(at(&succ_start, b_idx + 1, 0));
+            if let Some(slice) = succs.get(s_s..s_e) {
+                for &(to, is_threaded) in slice {
+                    let to_idx_v = to_idx(to);
+                    let pos = to_idx(at(&in_start, to_idx_v, 0)) + to_idx(at(&in_fill, to_idx_v, 0));
+                    set_at(&mut in_edges, pos, PostInEdge { pred: b, is_threaded });
+                    if let Some(f) = in_fill.get_mut(to_idx_v) {
+                        *f += 1;
+                    }
+                }
+            }
+        }
+
+        // Iterative Cooper-Harvey-Kennedy dominators on `G'`.
+        let mut idom = filled(blocks, NONE, &alloc);
+        if blocks > 0 {
+            set_at(&mut idom, 0, 0);
+        }
+        let mut settled = false;
+        let max_dom_iters = blocks.saturating_mul(2).saturating_add(2);
+        for _ in 0..max_dom_iters {
+            let mut changed = false;
+            for &b in rpo.iter().skip(1) {
+                let b_idx = to_idx(b);
+                let p_s = to_idx(at(&pred_start, b_idx, 0));
+                let p_e = to_idx(at(&pred_start, b_idx + 1, 0));
+                let mut new_idom = NONE;
+                if let Some(slice) = preds.get(p_s..p_e) {
+                    for &p in slice {
+                        if at(&idom, to_idx(p), NONE) == NONE {
+                            continue;
+                        }
+                        new_idom = match new_idom {
+                            NONE => p,
+                            cur => intersect_dom(&idom, &rpo_order, p, cur),
+                        };
+                    }
+                }
+                if new_idom != at(&idom, b_idx, NONE) {
+                    set_at(&mut idom, b_idx, new_idom);
+                    changed = true;
+                }
+            }
+            if !changed {
+                settled = true;
+                break;
+            }
+        }
+        if !settled {
+            return None;
+        }
+
+        // Dominance frontiers `DF'(b)` via Cooper-Harvey-Kennedy.
+        let mut df_pairs: Vec<(u32, u32), A> = Vec::new_in(alloc);
+        for &b in rpo.iter() {
+            let b_idx = to_idx(b);
+            let p_s = to_idx(at(&pred_start, b_idx, 0));
+            let p_e = to_idx(at(&pred_start, b_idx + 1, 0));
+            if p_e.saturating_sub(p_s) < 2 {
+                continue;
+            }
+            let b_idom = at(&idom, b_idx, NONE);
+            if let Some(slice) = preds.get(p_s..p_e) {
+                for &p in slice {
+                    let mut runner = p;
+                    for _ in 0..=blocks {
+                        if runner == b_idom || runner == NONE {
+                            break;
+                        }
+                        df_pairs.push((runner, b));
+                        let parent = at(&idom, to_idx(runner), NONE);
+                        if parent == runner {
+                            break;
+                        }
+                        runner = parent;
+                    }
+                }
+            }
+        }
+        df_pairs.sort_unstable();
+        df_pairs.dedup();
+        let mut df_start = filled(blocks + 1, 0u32, &alloc);
+        for &(runner, _) in df_pairs.iter() {
+            if let Some(c) = df_start.get_mut(to_idx(runner) + 1) {
+                *c += 1;
+            }
+        }
+        for b in 0..blocks {
+            let prev = at(&df_start, b, 0);
+            if let Some(cur) = df_start.get_mut(b + 1) {
+                *cur += prev;
+            }
+        }
+        let mut df_blocks: Vec<u32, A> = Vec::with_capacity_in(df_pairs.len(), alloc);
+        for &(_, target) in df_pairs.iter() {
+            df_blocks.push(target);
+        }
+
+        Some(Self { idom, in_start, in_edges, df_start, df_blocks })
+    }
+
+    #[inline]
+    fn reachable(&self, b: u32) -> bool {
+        at(&self.idom, to_idx(b), NONE) != NONE
+    }
+
+    fn incoming_of(&self, b: u32) -> &[PostInEdge] {
+        let idx = to_idx(b);
+        let s = to_idx(at(&self.in_start, idx, 0));
+        let e = to_idx(at(&self.in_start, idx + 1, 0));
+        self.in_edges.get(s..e).unwrap_or(&[])
+    }
+
+    fn df_of(&self, b: u32) -> &[u32] {
+        let idx = to_idx(b);
+        let s = to_idx(at(&self.df_start, idx, 0));
+        let e = to_idx(at(&self.df_start, idx + 1, 0));
+        self.df_blocks.get(s..e).unwrap_or(&[])
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ThreadedEdge {
     pred: u32,
@@ -1941,7 +2206,8 @@ struct ThreadedEdge {
     target: TargetSlice,
 }
 
-/// One parameter of `m_block` promoted to a new parameter of successor `succ`.
+/// One parameter of `m_block` promoted to a new parameter of block `succ` (either a threaded
+/// target of `M` or an iterated-dominance-frontier merge block such as a shared loop exit).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 struct Promotion {
     succ: u32,
@@ -1953,9 +2219,12 @@ struct BlockPlan<A: Allocator> {
     m_block: u32,
     edges: Vec<ThreadedEdge, A>,
     promotions: Vec<Promotion, A>,
+    hoisted: Vec<u32, A>,
+    post_idom: Vec<u32, A>,
 }
 
-/// Plans threading for candidate block `m_block`, checking pureness and SSA dominance safety.
+/// Plans threading for candidate block `m_block`, checking pureness and reconstructing SSA via
+/// iterated dominance frontiers on the post-threading CFG for externally used parameters of `M`.
 fn plan_block_threading<A: Allocator + Copy>(
     view: &View<'_>,
     cfg: &Cfg<A>,
@@ -1991,7 +2260,7 @@ fn plan_block_threading<A: Allocator + Copy>(
     }
 
     let mut threaded: Vec<ThreadedEdge, A> = Vec::new_in(alloc);
-    let mut threaded_targets: Vec<u32, A> = Vec::new_in(alloc);
+    let mut hoisted: Vec<u32, A> = Vec::new_in(alloc);
 
     for &edge in in_edges {
         if edge.pred == m_block {
@@ -2003,16 +2272,22 @@ fn plan_block_threading<A: Allocator + Copy>(
         if target.block == m_block {
             continue;
         }
-        // Every value forwarded by `M -> S(s_args)` must be either a param of `M` or defined outside `M`.
+        // Every value forwarded by `M -> S(s_args)` must be a param of `M`, defined outside `M`,
+        // or a zero-operand pure constant of `M` hoistable to block 0.
         let mut args_ok = true;
+        let mut local_hoist: Vec<u32, A> = Vec::new_in(alloc);
         if let Some(s_args) = view.extra.get(target.args_start..target.args_start + target.args_len) {
             for &sv in s_args {
                 let sv_idx = to_idx(sv);
                 let is_m_param = sv_idx >= params.start && sv_idx < params.end;
                 let outside_m = at(&cfg.owner, sv_idx, NONE) != m_block;
                 if !is_m_param && !outside_m {
-                    args_ok = false;
-                    break;
+                    if is_hoistable_const(view, sv_idx) {
+                        local_hoist.push(sv);
+                    } else {
+                        args_ok = false;
+                        break;
+                    }
                 }
             }
         } else {
@@ -2021,74 +2296,189 @@ fn plan_block_threading<A: Allocator + Copy>(
         if !args_ok {
             continue;
         }
+        hoisted.extend_from_slice(&local_hoist);
         threaded.push(ThreadedEdge { pred: edge.pred, ordinal: edge.ordinal, m_block, target });
-        if threaded_targets.scan_for(&target.block).is_none() {
-            threaded_targets.push(target.block);
-        }
     }
 
     if threaded.is_empty() {
         return None;
     }
 
-    // Collect all unique successors of `M` that have `M` as their sole reachable predecessor and
-    // can safely receive promoted parameters.
-    let mut owned_succs: Vec<u32, A> = Vec::new_in(alloc);
-    each(view, term, |item| {
-        if let Item::Edge(Edge { block: s, args: Some(_), .. }) = item {
-            if s != m_block
-                && s != 0
-                && at(&cfg.unique_pred, to_idx(s), NONE) == m_block
-                && at(&cfg.plain_only, to_idx(s), false)
-                && !view.block_kind(Block(s)).is_landing()
-                && owned_succs.scan_for(&s).is_none()
-            {
-                owned_succs.push(s);
-            }
+    // Fast path: if no instruction or parameter of `M` is used outside `M`, zero SSA
+    // reconstruction is needed.
+    let mut any_ext = false;
+    for inst in range.start..term {
+        if !cross.of(inst).is_empty() {
+            any_ext = true;
+            break;
         }
-    });
+    }
+    if !any_ext {
+        hoisted.sort_unstable();
+        hoisted.dedup();
+        return Some(BlockPlan {
+            m_block,
+            edges: threaded,
+            promotions: Vec::new_in(alloc),
+            hoisted,
+            post_idom: Vec::new_in(alloc),
+        });
+    }
 
-    // Verify dominance safety for every instruction/param defined in `M` that has uses outside `M`.
+    // Build the post-threading CFG `G'` and reconstruct SSA for every value of `M` whose
+    // reachable external uses can be reached past a threaded edge.
+    let post = PostCfg::build(view, &threaded, alloc)?;
+    let blocks = view.blocks();
+    let mut in_need = filled(blocks, false, &alloc);
+    let mut need_list: Vec<u32, A> = Vec::new_in(alloc);
+    let mut in_phi = filled(blocks, false, &alloc);
+    let mut phi_list: Vec<u32, A> = Vec::new_in(alloc);
+    let mut phi_work: Vec<u32, A> = Vec::new_in(alloc);
     let mut promotions: Vec<Promotion, A> = Vec::new_in(alloc);
+
     for inst in range.start..term {
         let ext_blocks = cross.of(inst);
         if ext_blocks.is_empty() {
             continue;
         }
-        let is_param = inst < params.end;
+
+        // Clear previous iteration's scratch markers in O(|Need| + |Phi|).
+        for &b in need_list.iter() {
+            set_at(&mut in_need, to_idx(b), false);
+        }
+        need_list.clear();
+        for &b in phi_list.iter() {
+            set_at(&mut in_phi, to_idx(b), false);
+        }
+        phi_list.clear();
+
+        // Walk backwards in `G'` from every reachable external use along non-threaded edges
+        // without crossing `m_block` to collect the exact region `Need(inst)` inside `OldDom(M)`.
         for &ub in ext_blocks {
-            // Find the unique `M`-owned successor `s` that dominates `ub`.
-            let mut dom_succ = None;
-            for &s in owned_succs.iter() {
-                if cfg.is_dom(ub, s) {
-                    dom_succ = Some(s);
+            if post.reachable(ub) && !at(&in_need, to_idx(ub), true) {
+                set_at(&mut in_need, to_idx(ub), true);
+                need_list.push(ub);
+            }
+        }
+        if need_list.is_empty() {
+            continue;
+        }
+
+        let mut has_threaded_entry = false;
+        let mut head = 0usize;
+        while head < need_list.len() {
+            let cur = at(&need_list, head, NONE);
+            head += 1;
+            for &ie in post.incoming_of(cur) {
+                if ie.is_threaded {
+                    has_threaded_entry = true;
+                } else if ie.pred != m_block && post.reachable(ie.pred) {
+                    let p_idx = to_idx(ie.pred);
+                    if !at(&in_need, p_idx, true) {
+                        set_at(&mut in_need, p_idx, true);
+                        need_list.push(ie.pred);
+                    }
+                }
+            }
+        }
+
+        // If no threaded edge enters `Need(inst)`, every dynamic path to any reachable use still
+        // executes `m_block` last, so `m_block` dominates all uses and no rewrite is needed.
+        if !has_threaded_entry {
+            continue;
+        }
+
+        if inst >= params.end {
+            if is_hoistable_const(view, inst) {
+                hoisted.push(to_u32(inst));
+                continue;
+            }
+            return None;
+        }
+
+        // Parameter `p_k` of `M`: place new block parameters at every block in `Need(p_k)` that
+        // receives a reachable threaded edge, then close under `DF'` restricted to `Need(p_k)`.
+        phi_work.clear();
+        for &b in need_list.iter() {
+            if post.incoming_of(b).iter().any(|ie| ie.is_threaded) {
+                let b_idx = to_idx(b);
+                if !at(&in_phi, b_idx, true) {
+                    set_at(&mut in_phi, b_idx, true);
+                    phi_list.push(b);
+                    phi_work.push(b);
+                }
+            }
+        }
+        if post.reachable(m_block) {
+            phi_work.push(m_block);
+        }
+
+        let mut w_head = 0usize;
+        while w_head < phi_work.len() {
+            let d = at(&phi_work, w_head, NONE);
+            w_head += 1;
+            for &y in post.df_of(d) {
+                let y_idx = to_idx(y);
+                if at(&in_need, y_idx, false) && !at(&in_phi, y_idx, true) {
+                    set_at(&mut in_phi, y_idx, true);
+                    phi_list.push(y);
+                    phi_work.push(y);
+                }
+            }
+        }
+
+        // Every block receiving a promoted parameter must accept plain block-param arguments.
+        for &b in phi_list.iter() {
+            let b_idx = to_idx(b);
+            if b == 0
+                || b == m_block
+                || !at(&cfg.plain_only, b_idx, false)
+                || view.block_kind(Block(b)).is_landing()
+            {
+                return None;
+            }
+        }
+
+        // Belt-and-suspenders SSA check: every block in `Need(p_k)` must be dominated in `G'` by
+        // either a block in `phi_list` or `m_block`.
+        for &b in need_list.iter() {
+            let mut cur = b;
+            let mut found_def = false;
+            for _ in 0..=blocks {
+                if cur == m_block || at(&in_phi, to_idx(cur), false) {
+                    found_def = true;
                     break;
                 }
-            }
-            let Some(s) = dom_succ else {
-                // Used in a block not dominated by any sole-predecessor successor of M.
-                return None;
-            };
-            if threaded_targets.scan_for(&s).is_some() {
-                if !is_param {
-                    // Non-param instruction of M used inside a threaded successor: cannot forward.
-                    return None;
+                let parent = at(&post.idom, to_idx(cur), NONE);
+                if parent == NONE || parent == cur {
+                    break;
                 }
-                promotions.push(Promotion {
-                    succ: s,
-                    m_param_inst: to_u32(inst),
-                    m_param_idx: to_u32(inst - params.start),
-                });
+                cur = parent;
             }
-            // Otherwise `s` has M as sole predecessor and receives no threaded edge, so M still
-            // strictly dominates `s` and `ub`.
+            if !found_def {
+                return None;
+            }
+        }
+
+        let m_param_inst = to_u32(inst);
+        let m_param_idx = to_u32(inst - params.start);
+        for &b in phi_list.iter() {
+            promotions.push(Promotion { succ: b, m_param_inst, m_param_idx });
         }
     }
 
     promotions.sort_unstable();
     promotions.dedup();
+    hoisted.sort_unstable();
+    hoisted.dedup();
 
-    Some(BlockPlan { m_block, edges: threaded, promotions })
+    let post_idom = if promotions.is_empty() {
+        Vec::new_in(alloc)
+    } else {
+        post.idom
+    };
+
+    Some(BlockPlan { m_block, edges: threaded, promotions, hoisted, post_idom })
 }
 
 struct Fixup {
@@ -2096,12 +2486,16 @@ struct Fixup {
     in_data: bool,
 }
 
-/// Applies one round's non-interfering `threaded` edges and `promotions`, producing a verified `Func`.
+/// Applies one round's non-interfering `threaded` edges, `promotions`, and `hoisted` constants,
+/// producing a verified `Func`.
+#[allow(clippy::too_many_arguments)]
 fn apply_round<A: Allocator + Copy>(
     view: &View<'_>,
-    cfg: &Cfg<A>,
     threaded: &[ThreadedEdge],
     promotions: &[Promotion],
+    promo_m_block: u32,
+    post_idom: &[u32],
+    hoisted: &[u32],
     alloc: A,
 ) -> Result<Func<A>, SimplifyError> {
     let len = view.len();
@@ -2111,20 +2505,11 @@ fn apply_round<A: Allocator + Copy>(
         return Err(SimplifyError::Refused { inst: 0, what: "more values than LIR numbers in jump_thread" });
     }
 
-    // Per block `b`: which promoted successor `S` dominates `b` (unique since promoted `S`s are
-    // distinct children of one `M` in the dominator tree), or `NONE`.
-    let mut dom_promo_succ = filled(blocks, NONE, &alloc);
-    if !promotions.is_empty() {
-        for b in 0..blocks {
-            let b_u32 = to_u32(b);
-            for promo in promotions {
-                if cfg.is_dom(b_u32, promo.succ) {
-                    set_at(&mut dom_promo_succ, b, promo.succ);
-                    break;
-                }
-            }
-        }
-    }
+    let m_params = if promo_m_block != NONE {
+        view.params(Block(promo_m_block))
+    } else {
+        0..0
+    };
 
     let mut func = view.to_func_in(alloc);
     func.ops.clear();
@@ -2142,13 +2527,32 @@ fn apply_round<A: Allocator + Copy>(
     let mut fixups: Vec<Fixup, A> = Vec::new_in(alloc);
 
     let resolve_virtual = |old_v: u32, cur_block: usize| -> u32 {
-        let s = at(&dom_promo_succ, cur_block, NONE);
-        if s != NONE {
-            for (idx, promo) in promotions.iter().enumerate() {
-                if promo.succ == s && promo.m_param_inst == old_v {
-                    return to_u32(len.saturating_add(idx));
-                }
+        if promotions.is_empty() {
+            return old_v;
+        }
+        let old_idx = to_idx(old_v);
+        if old_idx < m_params.start || old_idx >= m_params.end {
+            return old_v;
+        }
+        let cur_u32 = to_u32(cur_block);
+        if cur_u32 == promo_m_block || at(post_idom, cur_block, NONE) == NONE {
+            return old_v;
+        }
+        let mut cur = cur_u32;
+        for _ in 0..=blocks {
+            if cur == promo_m_block {
+                return old_v;
             }
+            if let Ok(idx) = promotions.binary_search_by(|pr| {
+                pr.succ.cmp(&cur).then_with(|| pr.m_param_inst.cmp(&old_v))
+            }) {
+                return to_u32(len.saturating_add(idx));
+            }
+            let parent = at(post_idom, to_idx(cur), NONE);
+            if parent == NONE || parent == cur {
+                break;
+            }
+            cur = parent;
         }
         old_v
     };
@@ -2189,8 +2593,40 @@ fn apply_round<A: Allocator + Copy>(
             set_at(&mut full_map, len.saturating_add(promo_idx), new_idx);
         }
 
+        // 2b. Zero-operand constants hoisted from `M` into entry block `0`.
+        if b == 0 {
+            for &h_u32 in hoisted {
+                let inst = to_idx(h_u32);
+                let op = view.op(inst);
+                let new_idx = func.ops.len();
+                let data = match op.info().layout {
+                    Layout::None => 0,
+                    Layout::Data(_) => at(view.data, inst, 0),
+                    Layout::Extra(_) => {
+                        let extra_start = to_u32(func.extra.len());
+                        let p = to_idx(at(view.data, inst, 0));
+                        let w = to_idx(Ty(at(view.tys, inst, 0)).const_words());
+                        for k in 0..w {
+                            func.extra.push(at(view.extra, p + k, 0));
+                        }
+                        extra_start
+                    }
+                };
+                func.ops.push(at(view.ops, inst, 0));
+                func.flags.push(at(view.flags, inst, 0));
+                func.tys.push(at(view.tys, inst, 0));
+                func.data.push(data);
+                func.attrs.push(at(view.attrs, inst, 0));
+                func.locs.push(at(view.locs, inst, 0));
+                set_at(&mut full_map, inst, to_u32(new_idx));
+            }
+        }
+
         // 3. Body instructions and terminator of block `b`.
         for inst in params.end..range.end {
+            if !hoisted.is_empty() && hoisted.binary_search(&to_u32(inst)).is_ok() {
+                continue;
+            }
             let op = view.op(inst);
             let new_idx = func.ops.len();
             let data = match op.info().layout {
@@ -2451,7 +2887,8 @@ pub fn thread_jumps<A: Allocator + Copy>(view: View<'_>, alloc: A) -> Result<Fun
         }
         if any_fold {
             let folded = fold_terminators(v, &fold_jumps, alloc)?;
-            cur = dead(folded.view(), alloc)?;
+            let cleaned = dead(folded.view(), alloc)?;
+            cur = coalesce_cfg(cleaned.view(), alloc)?;
             any_coalesced = true;
             continue;
         }
@@ -2460,6 +2897,9 @@ pub fn thread_jumps<A: Allocator + Copy>(view: View<'_>, alloc: A) -> Result<Fun
         let cross = CrossUses::build(&v, &cfg, alloc);
         let mut round_edges: Vec<ThreadedEdge, A> = Vec::new_in(alloc);
         let mut round_promos: Vec<Promotion, A> = Vec::new_in(alloc);
+        let mut round_hoisted: Vec<u32, A> = Vec::new_in(alloc);
+        let mut round_promo_m: u32 = NONE;
+        let mut round_post_idom: Vec<u32, A> = Vec::new_in(alloc);
         let mut claimed_m = filled(blocks, false, &alloc);
         let mut claimed_ep = filled(blocks, false, &alloc);
 
@@ -2473,13 +2913,16 @@ pub fn thread_jumps<A: Allocator + Copy>(view: View<'_>, alloc: A) -> Result<Fun
             else {
                 continue;
             };
-            if !plan.promotions.is_empty() {
+            if !plan.promotions.is_empty() || !plan.hoisted.is_empty() {
                 if !round_edges.is_empty() {
-                    // Defer promotion-bearing block to next round so promotion scopes stay disjoint.
+                    // Defer promotion/hoist-bearing block to next round so scopes stay disjoint.
                     continue;
                 }
                 round_edges.extend_from_slice(&plan.edges);
                 round_promos.extend_from_slice(&plan.promotions);
+                round_hoisted.extend_from_slice(&plan.hoisted);
+                round_promo_m = plan.m_block;
+                round_post_idom = plan.post_idom;
                 break;
             }
             // Zero-promotion threading: ensure none of this block's endpoints collide with an
@@ -2509,7 +2952,15 @@ pub fn thread_jumps<A: Allocator + Copy>(view: View<'_>, alloc: A) -> Result<Fun
             break;
         }
 
-        let threaded_func = apply_round(&v, &cfg, &round_edges, &round_promos, alloc)?;
+        let threaded_func = apply_round(
+            &v,
+            &round_edges,
+            &round_promos,
+            round_promo_m,
+            &round_post_idom,
+            &round_hoisted,
+            alloc,
+        )?;
         cur = coalesce_cfg(threaded_func.view(), alloc)?;
         any_coalesced = true;
     }
@@ -3518,6 +3969,366 @@ mod tests {
                 print(v)
             );
             assert_eq!(count_op(v, Op::Trap), 0, "trap still folds via two-valued select:\n{}", print(v));
+        }
+    }
+
+    /// Exact `Option<u64>` merge diamond inside a loop (mirroring `decode_exec_leaf_single` +
+    /// `RevBitSlack8::reload_window_slack8`):
+    /// - `p_some -> merge(1, win, next_cur, rem_bits)`
+    /// - `p_none -> merge(0, 0, cur, bits)`
+    /// - `merge(tag, win, m_cur, m_bits)`: `is_some = icmp eq tag, 1; br is_some, body, loop_exit(acc, m_bits)`
+    /// - `body` uses `win, m_cur, m_bits` directly and exits to `loop_exit` or loops to `header`
+    /// - `loop_exit` (multi-predecessor post-dominator of `merge`) uses `m_cur` directly via SSA dominance.
+    /// Verifies `merge` and its tag branch are completely eliminated, `p_some` merges into `body`,
+    /// `verify` passes, and `run_in` matches bit-for-bit across immediate-None, full-Some, and
+    /// mid-loop-None trajectories.
+    #[test]
+    fn threads_option_merge_diamond_with_post_merge_exit_uses() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut b = Builder::<_, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64), Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64), Param::of(Ty::I64), Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+
+        let [entry, header, chk_bits, p_some, p_none, merge, body, loop_exit] =
+            [(); 8].map(|_| b.create_block(BlockKind::Normal));
+
+        b.begin(entry);
+        let init_cur = b.param(Ty::I64);
+        let limit = b.param(Ty::I64);
+        let init_bits = b.param(Ty::I64);
+        let rem0 = b.param(Ty::I64);
+        let zero = b.iconst(Ty::I64, 0);
+        let one = b.iconst(Ty::I64, 1);
+        let c3 = b.iconst(Ty::I64, 3);
+        let c7 = b.iconst(Ty::I64, 7);
+        let c10 = b.iconst(Ty::I64, 10);
+        let c64 = b.iconst(Ty::I64, 64);
+        b.jump((header, &[init_cur, init_bits, zero, rem0]));
+
+        b.begin(header);
+        let cur = b.param(Ty::I64);
+        let bits = b.param(Ty::I64);
+        let acc = b.param(Ty::I64);
+        let rem = b.param(Ty::I64);
+        let low = b.icmp(IntCond::Ult, cur, limit);
+        b.br(Flags::NONE, low, (p_none, &[]), (chk_bits, &[]));
+
+        b.begin(chk_bits);
+        let bad_bits = b.icmp(IntCond::Uge, bits, c64);
+        b.br(Flags::NONE, bad_bits, (p_none, &[]), (p_some, &[]));
+
+        b.begin(p_some);
+        let adv = b.binary(Op::Lshr, Flags::NONE, bits, c3);
+        let next_cur = b.binary(Op::Sub, Flags::NONE, cur, adv);
+        let rem_bits = b.binary(Op::And, Flags::NONE, bits, c7);
+        let win = b.binary(Op::Add, Flags::NONE, next_cur, rem_bits);
+        b.jump((merge, &[one, win, next_cur, rem_bits]));
+
+        b.begin(p_none);
+        b.jump((merge, &[zero, zero, cur, bits]));
+
+        b.begin(merge);
+        let tag = b.param(Ty::I64);
+        let m_win = b.param(Ty::I64);
+        let m_cur = b.param(Ty::I64);
+        let m_bits = b.param(Ty::I64);
+        let is_some = b.icmp(IntCond::Eq, tag, one);
+        b.br(Flags::NONE, is_some, (body, &[]), (loop_exit, &[acc, m_bits]));
+
+        b.begin(body);
+        let acc_next = b.binary(Op::Add, Flags::NONE, acc, m_win);
+        let bits_after = b.binary(Op::Add, Flags::NONE, m_bits, c10);
+        let rem_next = b.binary(Op::Sub, Flags::NONE, rem, one);
+        let done = b.icmp(IntCond::Eq, rem_next, zero);
+        b.br(
+            Flags::NONE,
+            done,
+            (loop_exit, &[acc_next, bits_after]),
+            (header, &[m_cur, bits_after, acc_next, rem_next]),
+        );
+
+        b.begin(loop_exit);
+        let out_acc = b.param(Ty::I64);
+        let out_bits = b.param(Ty::I64);
+        // Uses `m_cur` directly via SSA dominance from `merge` across BOTH `merge -> loop_exit`
+        // and `body -> loop_exit`.
+        b.ret(&[out_acc, m_cur, out_bits]);
+
+        let input = b.finish_checked().expect("valid option merge diamond input");
+        let out = thread_jumps(input.view(), alloc).expect("thread_jumps");
+        verify(out.view()).expect("output verifies");
+
+        let v = out.view();
+        assert_eq!(
+            count_op(v, Op::Br),
+            3,
+            "Option tag branch in merge block must be completely threaded away:\n{}",
+            print(v)
+        );
+        assert_eq!(
+            v.blocks(),
+            5,
+            "expected 5 blocks (entry, header, chk_bits, p_some+body, loop_exit):\n{}",
+            print(v)
+        );
+
+        for (args, expected) in [
+            ([5u128, 10, 0, 4], [0u128, 5, 0]),
+            ([100, 10, 64, 4], [0, 100, 64]),
+            ([100, 10, 8, 3], [300, 97, 14]),
+            ([11, 10, 16, 5], [9, 9, 10]),
+        ] {
+            let vals = args.map(Val::Int);
+            let before = run_in(input.view(), &vals, FUEL, alloc).expect("eval input");
+            let after = run_in(v, &vals, FUEL, alloc).expect("eval output");
+            assert_eq!(before, after, "semantics diverged for {args:?}");
+            assert!(
+                matches!(after, Outcome::Returned(ref got) if got[..] == expected.map(Val::Int)),
+                "unexpected result for {args:?}: {after:?}"
+            );
+        }
+    }
+
+    /// Tests a merge diamond whose `state` param is used in blocks strictly dominated by a
+    /// post-merge block reachable from BOTH `arm_a` and `arm_b`, while `merge` also passes a
+    /// local `iconst 0` as an edge argument to `arm_b`.
+    #[test]
+    fn threads_merge_with_shared_post_merge_and_hoisted_const() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut b = Builder::<_, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+
+        let [entry, p_some, p_none, merge, arm_a, arm_b, post_merge, sub_a, sub_b] =
+            [(); 9].map(|_| b.create_block(BlockKind::Normal));
+
+        b.begin(entry);
+        let cond = b.param(Ty::I64);
+        let x = b.param(Ty::I64);
+        let y = b.param(Ty::I64);
+        let z = b.iconst(Ty::I64, 0);
+        let c = b.icmp(IntCond::Ne, cond, z);
+        b.br(Flags::NONE, c, (p_some, &[]), (p_none, &[]));
+
+        b.begin(p_some);
+        let one = b.iconst(Ty::I64, 1);
+        let sx = b.binary(Op::Add, Flags::NONE, x, one);
+        b.jump((merge, &[one, x, sx]));
+
+        b.begin(p_none);
+        let z0 = b.iconst(Ty::I64, 0);
+        let sy = b.binary(Op::Add, Flags::NONE, y, y);
+        b.jump((merge, &[z0, z0, sy]));
+
+        b.begin(merge);
+        let tag = b.param(Ty::I64);
+        let pay = b.param(Ty::I64);
+        let state = b.param(Ty::I64);
+        let m_zero = b.iconst(Ty::I64, 0);
+        let is_zero = b.icmp(IntCond::Eq, tag, m_zero);
+        b.br(Flags::NONE, is_zero, (arm_b, &[m_zero]), (arm_a, &[]));
+
+        b.begin(arm_a);
+        let ten = b.iconst(Ty::I64, 10);
+        let va = b.binary(Op::Add, Flags::NONE, pay, ten);
+        b.jump((post_merge, &[va]));
+
+        b.begin(arm_b);
+        let b0 = b.param(Ty::I64);
+        let twenty = b.iconst(Ty::I64, 20);
+        let vb = b.binary(Op::Add, Flags::NONE, b0, twenty);
+        b.jump((post_merge, &[vb]));
+
+        b.begin(post_merge);
+        let pv = b.param(Ty::I64);
+        let nz = b.icmp(IntCond::Ne, pv, z);
+        b.br(Flags::NONE, nz, (sub_a, &[]), (sub_b, &[]));
+
+        b.begin(sub_a);
+        let ra = b.binary(Op::Add, Flags::NONE, pv, state);
+        b.ret(&[ra]);
+
+        b.begin(sub_b);
+        b.ret(&[state]);
+
+        let input = b.finish_checked().expect("valid shared post-merge input");
+        let out = thread_jumps(input.view(), alloc).expect("thread_jumps");
+        verify(out.view()).expect("output verifies");
+
+        let v = out.view();
+        assert_eq!(
+            count_op(v, Op::Br),
+            2,
+            "merge branch must be threaded away leaving entry and post_merge branches:\n{}",
+            print(v)
+        );
+
+        for (args, expected) in [([1u128, 5, 7], 21u128), ([0, 5, 7], 34)] {
+            let vals = args.map(Val::Int);
+            let before = run_in(input.view(), &vals, FUEL, alloc).expect("eval input");
+            let after = run_in(v, &vals, FUEL, alloc).expect("eval output");
+            assert_eq!(before, after, "semantics diverged for {args:?}");
+            assert!(
+                matches!(after, Outcome::Returned(ref got) if got[..] == [Val::Int(expected)]),
+                "unexpected result for {args:?}: {after:?}"
+            );
+        }
+    }
+
+    /// Partial threading with a live `merge` block (`p_some` and `p_none` thread while `p_dyn`
+    /// remains on `merge`) and a shared `post_merge` block using `merge`'s `state` param directly.
+    #[test]
+    fn partial_threading_with_post_merge_preserves_semantics() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut b = Builder::<_, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+
+        let [entry, p_some, p_none, p_dyn, merge, arm_a, arm_b, post_merge] =
+            [(); 8].map(|_| b.create_block(BlockKind::Normal));
+
+        b.begin(entry);
+        let sel = b.param(Ty::I64);
+        let dyn_tag = b.param(Ty::I64);
+        let x = b.param(Ty::I64);
+        b.switch(sel, (p_dyn, &[]), &[(0, (p_none, &[])), (1, (p_some, &[]))]);
+
+        b.begin(p_some);
+        let c1 = b.iconst(Ty::I64, 1);
+        let s1 = b.binary(Op::Add, Flags::NONE, x, c1);
+        b.jump((merge, &[c1, s1]));
+
+        b.begin(p_none);
+        let c0 = b.iconst(Ty::I64, 0);
+        let c2 = b.iconst(Ty::I64, 2);
+        let s0 = b.binary(Op::Add, Flags::NONE, x, c2);
+        b.jump((merge, &[c0, s0]));
+
+        b.begin(p_dyn);
+        let c3 = b.iconst(Ty::I64, 3);
+        let sd = b.binary(Op::Add, Flags::NONE, x, c3);
+        b.jump((merge, &[dyn_tag, sd]));
+
+        b.begin(merge);
+        let tag = b.param(Ty::I64);
+        let state = b.param(Ty::I64);
+        let z0 = b.iconst(Ty::I64, 0);
+        let is_zero = b.icmp(IntCond::Eq, tag, z0);
+        b.br(Flags::NONE, is_zero, (arm_b, &[]), (arm_a, &[]));
+
+        b.begin(arm_a);
+        let c10 = b.iconst(Ty::I64, 10);
+        b.jump((post_merge, &[c10]));
+
+        b.begin(arm_b);
+        let c20 = b.iconst(Ty::I64, 20);
+        b.jump((post_merge, &[c20]));
+
+        b.begin(post_merge);
+        let base = b.param(Ty::I64);
+        let res = b.binary(Op::Add, Flags::NONE, base, state);
+        b.ret(&[res]);
+
+        let input = b.finish_checked().expect("valid partial threading input");
+        let out = thread_jumps(input.view(), alloc).expect("thread_jumps");
+        verify(out.view()).expect("output verifies");
+
+        let v = out.view();
+        for (args, expected) in [
+            ([1u128, 0, 100], 111u128),
+            ([0, 0, 100], 122),
+            ([2, 0, 100], 123),
+            ([2, 1, 100], 113),
+        ] {
+            let vals = args.map(Val::Int);
+            let before = run_in(input.view(), &vals, FUEL, alloc).expect("eval input");
+            let after = run_in(v, &vals, FUEL, alloc).expect("eval output");
+            assert_eq!(before, after, "semantics diverged for {args:?}");
+            assert!(
+                matches!(after, Outcome::Returned(ref got) if got[..] == [Val::Int(expected)]),
+                "unexpected result for {args:?}: {after:?}"
+            );
+        }
+    }
+
+    /// Loop-header bypass control: `entry -> merge(dyn_tag, 0, 0)` stays unthreaded while the
+    /// backedge `back -> merge(1, i_next, acc_next)` threads straight to `body`. Even though
+    /// `merge` STILL dominates `body` in `G'`, `body` MUST receive promoted parameters for `i`
+    /// and `acc` so iterations `>= 2` read the updated backedge values instead of `0`.
+    #[test]
+    fn loop_header_self_bypass_threads_soundly() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut b = Builder::<_, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+
+        let [entry, merge, body, back, exit] = [(); 5].map(|_| b.create_block(BlockKind::Normal));
+
+        b.begin(entry);
+        let start_tag = b.param(Ty::I64);
+        let n = b.param(Ty::I64);
+        let z0 = b.iconst(Ty::I64, 0);
+        b.jump((merge, &[start_tag, z0, z0]));
+
+        b.begin(merge);
+        let tag = b.param(Ty::I64);
+        let i = b.param(Ty::I64);
+        let acc = b.param(Ty::I64);
+        let z = b.iconst(Ty::I64, 0);
+        let go = b.icmp(IntCond::Ne, tag, z);
+        b.br(Flags::NONE, go, (body, &[]), (exit, &[acc]));
+
+        b.begin(body);
+        let c1 = b.iconst(Ty::I64, 1);
+        let i_next = b.binary(Op::Add, Flags::NONE, i, c1);
+        let acc_next = b.binary(Op::Add, Flags::NONE, acc, i_next);
+        let done = b.icmp(IntCond::Uge, i_next, n);
+        b.br(Flags::NONE, done, (exit, &[acc_next]), (back, &[i_next, acc_next]));
+
+        b.begin(back);
+        let bi = b.param(Ty::I64);
+        let bacc = b.param(Ty::I64);
+        let one = b.iconst(Ty::I64, 1);
+        b.jump((merge, &[one, bi, bacc]));
+
+        b.begin(exit);
+        let out_acc = b.param(Ty::I64);
+        b.ret(&[out_acc]);
+
+        let input = b.finish_checked().expect("valid loop header bypass input");
+        let out = thread_jumps(input.view(), alloc).expect("thread_jumps");
+        verify(out.view()).expect("output verifies");
+
+        let v = out.view();
+        for (args, expected) in [([0u128, 5], 0u128), ([1, 1], 1), ([1, 5], 15)] {
+            let vals = args.map(Val::Int);
+            let before = run_in(input.view(), &vals, FUEL, alloc).expect("eval input");
+            let after = run_in(v, &vals, FUEL, alloc).expect("eval output");
+            assert_eq!(before, after, "semantics diverged for {args:?}");
+            assert!(
+                matches!(after, Outcome::Returned(ref got) if got[..] == [Val::Int(expected)]),
+                "unexpected result for {args:?}: {after:?}"
+            );
         }
     }
 }
