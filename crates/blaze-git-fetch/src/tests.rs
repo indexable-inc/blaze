@@ -994,3 +994,97 @@ fn answers_are_read_as_v2_says() {
     pkt(b"\x03fatal: no such object\n", &mut error);
     assert_eq!(fetched_pack(&error, 1 << 20, &mut Vec::new_in(heap())), Err(crate::PktWhy::Remote));
 }
+
+#[test]
+fn v1_pack_index_parses_searches_and_reads_objects() {
+    use crate::store::{Idx, ObjectDb, ObjectSource, StoreWhy};
+
+    let blob_a = b"alpha v1\n";
+    let blob_b = b"beta v1\n";
+    let oid_a = Oid::of(Kind::Blob, blob_a);
+    let oid_b = Oid::of(Kind::Blob, blob_b);
+
+    // Build a minimal packfile containing both blobs and record their offsets.
+    let mut pack = b"PACK".to_vec();
+    pack.extend_from_slice(&2u32.to_be_bytes());
+    pack.extend_from_slice(&2u32.to_be_bytes());
+    let mut items: StdVec<(Oid, u32)> = StdVec::new();
+    for (oid, bytes) in [(oid_a, blob_a.as_slice()), (oid_b, blob_b.as_slice())] {
+        let off = pack.len() as u32;
+        items.push((oid, off));
+        let mut size = bytes.len() as u64;
+        let mut byte = (3u8 << 4) | (size & 0x0f) as u8;
+        size >>= 4;
+        while size > 0 {
+            pack.push(byte | 0x80);
+            byte = (size & 0x7f) as u8;
+            size >>= 7;
+        }
+        pack.push(byte);
+        let mut z = Vec::new_in(heap());
+        blaze_deflate::zlib(bytes, blaze_deflate::Level::Fast, heap(), &mut z).expect("zlib");
+        pack.extend_from_slice(z.as_slice());
+    }
+    let pack_sha = crate::sha1::sha1(&pack);
+    pack.extend_from_slice(&pack_sha);
+
+    // Build a valid Git v1 .idx (no 8-byte signature): 256-entry fanout + sorted (be32 offset, 20-byte oid) + 40-byte trailer.
+    items.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+    let mut idx = StdVec::new();
+    for first in 0..=255u8 {
+        let count = items.iter().filter(|(oid, _)| oid.0[0] <= first).count() as u32;
+        idx.extend_from_slice(&count.to_be_bytes());
+    }
+    for (oid, off) in &items {
+        idx.extend_from_slice(&off.to_be_bytes());
+        idx.extend_from_slice(&oid.0);
+    }
+    idx.extend_from_slice(&pack_sha);
+    let idx_sha = crate::sha1::sha1(&idx);
+    idx.extend_from_slice(&idx_sha);
+
+    let parsed = Idx::parse(&idx, 16).expect("v1 idx parses");
+    assert_eq!(parsed.len(), 2);
+    let pack_end = pack.len() as u64 - 20;
+    for (oid, off) in &items {
+        let at = parsed.search(oid).expect("oid found in v1 idx");
+        assert_eq!(parsed.offset(at, pack_end), Ok(*off as u64));
+    }
+
+    struct MemPack<'a>(&'a [u8]);
+    impl ObjectSource<blaze_own::Alloc<'static>> for MemPack<'_> {
+        fn read_loose(&mut self, _: &Oid, _: &mut Vec<u8, blaze_own::Alloc<'static>>) -> Result<bool, StoreWhy> {
+            Ok(false)
+        }
+        fn read_pack_range(
+            &mut self,
+            pack_idx: usize,
+            offset: u64,
+            len: u64,
+            out: &mut Vec<u8, blaze_own::Alloc<'static>>,
+        ) -> Result<bool, StoreWhy> {
+            if pack_idx != 0 {
+                return Ok(false);
+            }
+            let start = offset as usize;
+            let end = start + len as usize;
+            let Some(slice) = self.0.get(start..end) else { return Ok(false) };
+            out.clear();
+            out.extend_from_slice(slice);
+            Ok(true)
+        }
+    }
+
+    let mut db = ObjectDb::new(&[(&idx, pack.len() as u64)], PACK, heap()).expect("odb");
+    let mut src = MemPack(&pack);
+    let mut out = Vec::new_in(heap());
+    assert_eq!(db.read_object(&oid_a, &mut src, &mut out), Ok(Some(Kind::Blob)));
+    assert_eq!(out.as_slice(), blob_a);
+    assert_eq!(db.read_object(&oid_b, &mut src, &mut out), Ok(Some(Kind::Blob)));
+    assert_eq!(out.as_slice(), blob_b);
+
+    // Non-v1 garbage of >= 1064 bytes with monotonic zeros (0 objects) + trailing extra bytes is rejected as IdxMagic.
+    let mut bad = vec![0u8; 1065];
+    bad[0] = 0;
+    assert_eq!(Idx::parse(&bad, 16).err(), Some((0, StoreWhy::IdxMagic)));
+}

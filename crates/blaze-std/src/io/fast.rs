@@ -38,6 +38,8 @@ pub(crate) enum ReadAllLent {
     Read(usize),
     /// The file's length moved between its `fstat` and its read (blaze-core `LentRead::Moved`).
     Moved { stated: u64, read: u64 },
+    /// The file did not exist on a confined read (`blaze_core::threads::inline::LentRead::NotFound`).
+    NotFound,
     Failed(blaze_core::IoError),
 }
 
@@ -423,6 +425,7 @@ impl Io {
                 return Some(Err(Stopped::OutOfMemory { arena, asked }));
             }
             LentRead::Moved { stated, read } => ReadAllLent::Moved { stated, read },
+            LentRead::NotFound => ReadAllLent::NotFound,
             LentRead::Failed(error) => ReadAllLent::Failed(error),
         }))
     }
@@ -494,6 +497,7 @@ impl Io {
                 return Some(Err(Stopped::OutOfMemory { arena, asked }));
             }
             LentRead::Moved { stated, read } => ReadAllLent::Moved { stated, read },
+            LentRead::NotFound => ReadAllLent::NotFound,
             LentRead::Failed(error) => ReadAllLent::Failed(error),
         }))
     }

@@ -536,9 +536,6 @@ enum LookedGit {
         git: Dir<ReadOnly>,
         shown: blaze_own::String<Alloc<'static>>,
         folders: blaze_own::Vec<GitDbFolder, Alloc<'static>>,
-        /// Aggregate `.idx` packs and bytes loaded across all matching Cargo git/db folders.
-        packs_loaded: usize,
-        idx_bytes_loaded: u64,
     },
 }
 
@@ -587,11 +584,26 @@ impl CargoCache {
             Some(looked) => looked,
             none => none.insert(LookedGit::open(cx, env)?),
         };
-        if let LookedGit::Open { git, folders, packs_loaded, idx_bytes_loaded, .. } = looked {
+        if let LookedGit::Open { git, folders, .. } = looked {
             let db = Path::new(CARGO_DB_IN_GIT)?;
             let objects = Path::new(CARGO_GIT_OBJECTS)?;
             let pack = Path::new(CARGO_GIT_PACK)?;
             let global = env.heap.alloc();
+            // Aggregate `.idx` budget across all folders matching `repo` (without leaking one
+            // repository's index usage into another repository in the same command).
+            let mut repo_packs: usize = 0;
+            let mut repo_idx_bytes: u64 = 0;
+            for folder in folders.iter() {
+                if !local::git_db_folder(repo, folder.name()) {
+                    continue;
+                }
+                if let Some(GitDbOdb::Ready { packs }) = &folder.odb {
+                    repo_packs = repo_packs.saturating_add(packs.len());
+                    for entry in packs.iter() {
+                        repo_idx_bytes = repo_idx_bytes.saturating_add(u64::try_from(entry.idx_bytes.len()).unwrap_or(u64::MAX));
+                    }
+                }
+            }
             for folder in folders.iter_mut() {
                 if folder.odb.is_some() || !local::git_db_folder(repo, folder.name()) {
                     continue;
@@ -604,8 +616,8 @@ impl CargoCache {
                 let odb = match git.entries_confined(cx, &pack_dir) {
                     Ok(Some(entries)) => {
                         let mut packs = blaze_own::Vec::new_in(global);
-                        let mut folder_packs = *packs_loaded;
-                        let mut folder_idx_bytes = *idx_bytes_loaded;
+                        let mut folder_packs = repo_packs;
+                        let mut folder_idx_bytes = repo_idx_bytes;
                         let mut failed = false;
                         for i in 0..entries.len() {
                             if entries.kind(i) != bstd::fs::EntryKind::File {
@@ -667,8 +679,8 @@ impl CargoCache {
                         if failed {
                             GitDbOdb::Unreadable
                         } else {
-                            *packs_loaded = folder_packs;
-                            *idx_bytes_loaded = folder_idx_bytes;
+                            repo_packs = folder_packs;
+                            repo_idx_bytes = folder_idx_bytes;
                             GitDbOdb::Ready { packs }
                         }
                     }
@@ -726,7 +738,7 @@ impl LookedGit {
             shown.str(" (no repository folder in it)");
             return Ok(LookedGit::Closed { shown, miss: ClosedMiss::Absent });
         }
-        Ok(LookedGit::Open { git, shown, folders, packs_loaded: 0, idx_bytes_loaded: 0 })
+        Ok(LookedGit::Open { git, shown, folders })
     }
 }
 
@@ -872,6 +884,8 @@ struct CargoGitSource<'a> {
     /// Upper bound for a single loose object file, derived from `git_pack.most_object` plus
     /// worst-case zlib framing overhead.
     most_loose_bytes: u64,
+    /// Set when a confined loose or pack read fails due to OS I/O, symlink refusal, or truncation.
+    io_failed: bool,
 }
 
 impl local::GitObjectSource<Alloc<'static>> for CargoGitSource<'_> {
@@ -904,7 +918,10 @@ impl local::GitObjectSource<Alloc<'static>> for CargoGitSource<'_> {
                 Ok(true)
             }
             Err(error) if error.kind == FsKind::NotFound => Ok(false),
-            Err(_) => Err(local::GitStoreWhy::LooseHeader),
+            Err(_) => {
+                self.io_failed = true;
+                Err(local::GitStoreWhy::LooseHeader)
+            }
         }
     }
 
@@ -917,24 +934,31 @@ impl local::GitObjectSource<Alloc<'static>> for CargoGitSource<'_> {
     ) -> Result<bool, local::GitStoreWhy> {
         out.clear();
         let Some(pack) = self.packs.get(pack_idx) else {
-            return Ok(false);
+            self.io_failed = true;
+            return Err(local::GitStoreWhy::IdxShort);
         };
         let Ok(len_usize) = usize::try_from(len) else {
-            return Ok(false);
+            self.io_failed = true;
+            return Err(local::GitStoreWhy::IdxShort);
         };
         let reserve = len_usize.saturating_mul(2).max(1 << 16).saturating_add(1 << 16);
         let Ok(scratch) = Frame::with_reserve(reserve, bstd::mem::Tag::Other) else {
-            return Ok(false);
+            self.io_failed = true;
+            return Err(local::GitStoreWhy::IdxShort);
         };
         let mut bytes = Bytes::new_in(&scratch, "a cargo git pack range, confined read");
         match self.git.read_range_confined(self.cx, &pack.pack_path, offset, len_usize, &mut bytes) {
             Ok(read) if read == len_usize => {
                 if out.try_extend_from_slice(bytes.as_slice()).is_err() {
-                    return Ok(false);
+                    self.io_failed = true;
+                    return Err(local::GitStoreWhy::IdxShort);
                 }
                 Ok(true)
             }
-            _ => Ok(false),
+            _ => {
+                self.io_failed = true;
+                Err(local::GitStoreWhy::IdxShort)
+            }
         }
     }
 }
@@ -985,12 +1009,13 @@ fn adopt_local_git<'c>(
         let unpack_limits = &blaze_fetch::fetch::Limits::REAL.unpack;
         let most_obj = unpack_limits.git_pack.most_object;
         let most_loose_bytes = most_obj.saturating_add(most_obj / 64).saturating_add(4096);
-        let mut source = CargoGitSource { cx, git, objects_dir, packs, most_loose_bytes };
+        let mut source = CargoGitSource { cx, git, objects_dir, packs, most_loose_bytes, io_failed: false };
         match local::adopt_git_db(unit, tables.as_slice(), &mut source, unpack_limits, env.heap.alloc()) {
             Ok((record, _)) => {
                 write_record(cx, root, &record_path(&unit.key())?, record.as_slice())?;
                 return Ok(true);
             }
+            Err(_) if source.io_failed => tries.push(Try { place, miss: Miss::Unreadable }),
             Err(refused) => tries.push(Try { place, miss: Miss::Refused(refused) }),
         }
     }

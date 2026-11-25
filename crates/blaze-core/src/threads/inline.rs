@@ -90,6 +90,8 @@ pub enum LentRead {
     /// "whole" to return, and a second read races the same writer (rule no-fallback: no retry);
     /// the asker learns it by name and decides.
     Moved { stated: u64, read: u64 },
+    /// The file did not exist (`ENOENT`) on a confined read.
+    NotFound,
     /// The call failed, saying this (the text a queued call's `Done::Failed` carries).
     Failed(IoError),
 }

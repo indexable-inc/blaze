@@ -50,51 +50,74 @@ pub enum StoreWhy {
     Id { want: Oid },
 }
 
-/// A version 2 pack index, borrowed.
+/// A version 1 or version 2 pack index, borrowed.
 #[derive(Clone, Copy)]
 pub struct Idx<'i> {
     bytes: &'i [u8],
     count: u32,
     large: usize,
+    version: u8,
 }
 
 const FANOUT: usize = 8;
 const IDS: usize = FANOUT + 256 * 4;
+const V1_IDS: usize = 256 * 4;
 
 fn be32(bytes: &[u8], at: usize) -> u32 {
     u32::from_be_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
 }
 
 impl<'i> Idx<'i> {
-    /// `bytes` read as a version 2 index of at most `most` objects.
+    /// `bytes` read as a version 1 or version 2 pack index of at most `most` objects.
     pub fn parse(bytes: &'i [u8], most: u32) -> Result<Idx<'i>, (u64, StoreWhy)> {
-        if bytes.len() < IDS + 40 {
+        if bytes.len() >= 8 && bytes.get(..4) == Some(&[0xff, b't', b'O', b'c']) {
+            if bytes.len() < IDS + 40 {
+                return Err((0, StoreWhy::IdxShort));
+            }
+            let version = be32(bytes, 4);
+            if version != 2 {
+                return Err((4, StoreWhy::IdxVersion { version }));
+            }
+            let mut last = 0;
+            for byte in 0..256usize {
+                let count = be32(bytes, FANOUT + byte * 4);
+                if count < last {
+                    return Err(((FANOUT + byte * 4) as u64, StoreWhy::IdxFanout { byte: byte as u8 }));
+                }
+                last = count;
+            }
+            if last > most {
+                return Err((IDS as u64 - 4, StoreWhy::IdxOver { count: last, most }));
+            }
+            // `last <= most <= u32::MAX`: 28 bytes per object fits a u64, and is checked against the length.
+            let fixed = IDS as u64 + u64::from(last) * 28 + 40;
+            if (bytes.len() as u64) < fixed || (bytes.len() as u64 - fixed) % 8 != 0 {
+                return Err((0, StoreWhy::IdxShort));
+            }
+            return Ok(Idx { bytes, count: last, large: ((bytes.len() as u64 - fixed) / 8) as usize, version: 2 });
+        }
+        // Version 1 pack index: no 8-byte signature, starts directly with the 256-entry fanout,
+        // followed by `count` 24-byte (u32 offset, 20-byte SHA-1) entries and 40-byte trailer.
+        if bytes.len() < V1_IDS + 40 {
             return Err((0, StoreWhy::IdxShort));
-        }
-        if bytes[..4] != [0xff, b't', b'O', b'c'] {
-            return Err((0, StoreWhy::IdxMagic));
-        }
-        let version = be32(bytes, 4);
-        if version != 2 {
-            return Err((4, StoreWhy::IdxVersion { version }));
         }
         let mut last = 0;
         for byte in 0..256usize {
-            let count = be32(bytes, FANOUT + byte * 4);
+            let count = be32(bytes, byte * 4);
             if count < last {
-                return Err(((FANOUT + byte * 4) as u64, StoreWhy::IdxFanout { byte: byte as u8 }));
+                let at = u64::try_from(byte * 4).unwrap_or(u64::MAX);
+                return Err((at, StoreWhy::IdxFanout { byte: u8::try_from(byte).unwrap_or(u8::MAX) }));
             }
             last = count;
         }
         if last > most {
-            return Err((IDS as u64 - 4, StoreWhy::IdxOver { count: last, most }));
+            return Err((u64::try_from(V1_IDS - 4).unwrap_or(u64::MAX), StoreWhy::IdxOver { count: last, most }));
         }
-        // `last <= most <= u32::MAX`: 28 bytes per object fits a u64, and is checked against the length.
-        let fixed = IDS as u64 + u64::from(last) * 28 + 40;
-        if (bytes.len() as u64) < fixed || (bytes.len() as u64 - fixed) % 8 != 0 {
-            return Err((0, StoreWhy::IdxShort));
+        let expected = u64::try_from(V1_IDS).unwrap_or(u64::MAX) + u64::from(last) * 24 + 40;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != expected {
+            return Err((0, StoreWhy::IdxMagic));
         }
-        Ok(Idx { bytes, count: last, large: ((bytes.len() as u64 - fixed) / 8) as usize })
+        Ok(Idx { bytes, count: last, large: 0, version: 1 })
     }
 
     pub fn len(&self) -> u32 {
@@ -107,15 +130,20 @@ impl<'i> Idx<'i> {
 
     /// The `at`-th id in sorted order.
     pub fn id(&self, at: u32) -> &'i [u8] {
+        if self.version == 1 {
+            let start = V1_IDS + usize::try_from(at).unwrap_or(usize::MAX) * 24 + 4;
+            return self.bytes.get(start..start + 20).unwrap_or(&[]);
+        }
         let start = IDS + at as usize * 20;
         &self.bytes[start..start + 20]
     }
 
     /// Where `oid` sits among the sorted ids: `Ok` found, `Err` where it would go.
     pub fn search(&self, oid: &Oid) -> Result<u32, u32> {
+        let fanout = if self.version == 1 { 0 } else { FANOUT };
         let first = usize::from(oid.0[0]);
-        let mut low = if first == 0 { 0 } else { be32(self.bytes, FANOUT + (first - 1) * 4) };
-        let mut high = be32(self.bytes, FANOUT + first * 4);
+        let mut low = if first == 0 { 0 } else { be32(self.bytes, fanout + (first - 1) * 4) };
+        let mut high = be32(self.bytes, fanout + first * 4);
         while low < high {
             let mid = low + (high - low) / 2;
             match self.id(mid).cmp(&oid.0[..]) {
@@ -129,6 +157,14 @@ impl<'i> Idx<'i> {
 
     /// The pack offset of the `at`-th id, checked to lie before `pack_end` (the trailer's start).
     pub fn offset(&self, at: u32, pack_end: u64) -> Result<u64, (u64, StoreWhy)> {
+        if self.version == 1 {
+            let off_at = V1_IDS + usize::try_from(at).unwrap_or(usize::MAX) * 24;
+            let offset = u64::from(be32(self.bytes, off_at));
+            if offset < 12 || offset >= pack_end {
+                return Err((u64::try_from(off_at).unwrap_or(u64::MAX), StoreWhy::IdxOffset { entry: at }));
+            }
+            return Ok(offset);
+        }
         let small_at = IDS + self.count as usize * 24 + at as usize * 4;
         let small = be32(self.bytes, small_at);
         let offset = if small & 0x8000_0000 == 0 {

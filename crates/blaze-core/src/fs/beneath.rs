@@ -293,7 +293,11 @@ pub(crate) fn read_confined_into_vec<A: Allocator>(
     range: Option<(u64, usize)>,
     into: &mut Vec<u8, A>,
 ) -> io::Result<LentRead> {
-    let file = open_beneath_readonly(root_dir, root, rel)?;
+    let file = match open_beneath_readonly(root_dir, root, rel) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(LentRead::NotFound),
+        Err(error) => return Err(error),
+    };
     let Some((at, len)) = range else {
         return read_open_into_vec(&file, into);
     };

@@ -1700,6 +1700,7 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
             return match lent {
                 Ok(crate::io::ReadAllLent::Read(read)) => Ok(read),
                 Ok(crate::io::ReadAllLent::Moved { stated, read }) => Err(FsError::new(FsOp::Read, &name, FsKind::Moved { stated, read })),
+                Ok(crate::io::ReadAllLent::NotFound) => Err(FsError::new(FsOp::Read, &name, FsKind::NotFound)),
                 Ok(crate::io::ReadAllLent::Failed(error)) => Err(FsError::new(FsOp::Read, &name, FsKind::Driver(error.0))),
                 Err(stopped) => Err(FsError::new(FsOp::Read, &name, FsKind::Stopped(stopped))),
             };
@@ -1732,6 +1733,7 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
             return match lent {
                 Ok(crate::io::ReadAllLent::Read(len)) => Ok(len),
                 Ok(crate::io::ReadAllLent::Moved { stated, read }) => Err(FsError::new(FsOp::Read, &name, FsKind::Moved { stated, read })),
+                Ok(crate::io::ReadAllLent::NotFound) => Err(FsError::new(FsOp::Read, &name, FsKind::NotFound)),
                 Ok(crate::io::ReadAllLent::Failed(error)) => Err(FsError::new(FsOp::Read, &name, FsKind::Driver(error.0))),
                 Err(stopped) => Err(FsError::new(FsOp::Read, &name, FsKind::Stopped(stopped))),
             };
@@ -2431,6 +2433,7 @@ impl<#[blaze::linear] P: Rights> File<P> {
             return match lent {
                 Ok(crate::io::ReadAllLent::Read(len)) => Ok(len),
                 Ok(crate::io::ReadAllLent::Moved { stated, read }) => Err(FsError::new(FsOp::Read, &self.name, FsKind::Moved { stated, read })),
+                Ok(crate::io::ReadAllLent::NotFound) => Ok(0),
                 // alloc: an error's message.
                 Ok(crate::io::ReadAllLent::Failed(error)) => Err(FsError::new(FsOp::Read, &self.name, FsKind::Driver(error.0))),
                 Err(stopped) => Err(FsError::new(FsOp::Read, &self.name, FsKind::Stopped(stopped))),

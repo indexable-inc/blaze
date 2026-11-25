@@ -596,6 +596,51 @@ fn a_symlink_inside_cargos_git_db_is_refused_by_confined_reads() {
         let adopted = adopt_local(&cx, &root, &mut cargo, &native_env, unit, &mut tries).expect("no tool error");
         assert!(!adopted, "no symlinked repo, pack dir, or pack/idx file may be followed or adopted");
         assert!(held_bytes(&cx, &root, unit).is_none(), "nothing written to sources store");
+
+        // 4. Real pack-only Cargo git/db (NO loose objects) adopts cleanly over native confined
+        // reads (preserving ENOENT on loose probe before searching packed objects).
+        let real_pack_dir = cargo_dir.join("git/db/g-0000000000000004/objects/pack");
+        std::fs::create_dir_all(&real_pack_dir).expect("real pack-only dir");
+        std::fs::write(real_pack_dir.join(pack_name), pack.as_slice()).expect("write real pack");
+        std::fs::write(real_pack_dir.join(idx_name), idx.as_slice()).expect("write real idx");
+        let mut cargo_ok = CargoCache::new();
+        let mut tries_ok = OwnVec::new_in(Alloc::global());
+        let adopted_ok = adopt_local(&cx, &root, &mut cargo_ok, &native_env, unit, &mut tries_ok).expect("no tool error");
+        assert!(adopted_ok, "pack-only Cargo git/db must adopt over native confined reads");
+        let held = held_bytes(&cx, &root, unit).expect("record written");
+        let view = blaze_fetch::PackView::open_source(&unit.source(), &held).expect("record opens");
+        assert_eq!(
+            view.read("src/lib.rs", blaze_own::testing::heap().alloc()).expect("read").map(|f| f.bytes.as_slice().to_vec()),
+            Some(lib.to_vec())
+        );
+
+        // 5. A real .idx whose .pack is replaced by a symlink after indexing fails closed as
+        // Miss::Unreadable (propagating confined pack-read errors rather than reporting PackHeader).
+        let bad_pack_dir = cargo_dir.join("git/db/g-0000000000000005/objects/pack");
+        std::fs::create_dir_all(&bad_pack_dir).expect("bad pack dir");
+        std::fs::write(bad_pack_dir.join(idx_name), idx.as_slice()).expect("write real idx");
+        std::fs::write(bad_pack_dir.join(pack_name), pack.as_slice()).expect("write real pack");
+        let _ = std::fs::remove_dir_all(cargo_dir.join("git/db/g-0000000000000004"));
+        let mut cargo_bad = CargoCache::new();
+        // Prime `cargo_bad`'s index cache for repo `g` with an absent commit so `g-0000000000000005`
+        // is indexed while `.pack` is a regular file, then swap `.pack` for a symlink.
+        let other_lock = git_lock_text(Oid([0xee; 20]));
+        let other_lockfile = match Lockfile::read(other_lock.as_str().as_bytes(), blaze_own::testing::heap(), cx.frame()) {
+            Ok(lockfile) => lockfile,
+            Err(words) => panic!("lock refused: {}", words.as_str()),
+        };
+        let other_unit = unit_g(other_lockfile.units).expect("other git unit");
+        let mut prime_tries = OwnVec::new_in(Alloc::global());
+        assert!(!adopt_local(&cx, &root, &mut cargo_bad, &native_env, other_unit, &mut prime_tries).expect("prime"));
+        std::fs::remove_file(bad_pack_dir.join(pack_name)).expect("remove real pack");
+        std::os::unix::fs::symlink(outside.join("objects/pack").join(pack_name), bad_pack_dir.join(pack_name)).expect("symlink pack");
+        let mut tries_bad = OwnVec::new_in(Alloc::global());
+        let adopted_bad = adopt_local(&cx, &root, &mut cargo_bad, &native_env, unit, &mut tries_bad).expect("no tool error");
+        assert!(!adopted_bad, "symlinked .pack must be refused");
+        assert!(
+            tries_bad.iter().any(|t| t.place.contains("g-0000000000000005") && matches!(t.miss, Miss::Unreadable)),
+            "symlinked .pack must report Miss::Unreadable"
+        );
     }
     drop((root, native_env, cx, io));
     let _ = std::fs::remove_dir_all(&base);
