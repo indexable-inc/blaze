@@ -402,6 +402,14 @@ impl Default for Table {
 }
 
 impl Table {
+    pub fn new_in(alloc: Alloc<'static>) -> Table {
+        Table { asked: Vec::new_in(alloc), tys: Vec::new_in(alloc), running: [None; MOST_NESTED] }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.asked.is_empty() && self.tys.is_empty()
+    }
+
     pub fn clear(&mut self) {
         let Table { asked, tys, running } = self;
         asked.clear();
@@ -672,7 +680,7 @@ pub fn eval_asked<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, c: LibKey)
             }
             Err(e) => {
                 use core::fmt::Write as _;
-                let mut why = String::new_in(r.store.tys.alloc());
+                let mut why = String::new_in(r.store.work_alloc());
                 if write!(why, "{e}").is_err() {
                     why.push_str(" (the rest of this refusal could not be written)");
                 }

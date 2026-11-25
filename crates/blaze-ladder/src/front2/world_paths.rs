@@ -66,7 +66,7 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
     /// What `segments`, written in the body, name; when nothing, which segment failed, why,
     /// and what the segments before it named ([`Self::path_miss`]).
     pub(super) fn path(&self, scope: ScopeId, p: PathIdx, segments: &[Name]) -> Fetch<PathAnswer> {
-        let alloc = self.store.tys.alloc();
+        let alloc = self.store.work_alloc();
         let mut written = SmallPathBuf::with_capacity(segments.len(), alloc);
         for &s in segments {
             match self.spell.get(s) {
@@ -133,7 +133,7 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
         let mut at_module = site.module;
         let mut local_type = None;
         let (found, via_glob) = match super::scope_table::value_prefix(
-            &self.resolver(), &self.store.locals, self.owner, self.module, Some(scope.0), first, written.len() == 1, mark, self.store.tys.alloc(),
+            &self.resolver(), &self.store.locals, self.owner, self.module, Some(scope.0), first, written.len() == 1, mark, self.store.work_alloc(),
         ) {
             Ok(prefix) => prefix,
             Err(gap) => return self.gap(Gap::Local(gap)),
@@ -280,6 +280,10 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
         };
         let written = &written[shift as usize..];
         let all = consumed as usize == written.len();
+        let _ = self.keys.item(target.key);
+        if let Kind::Variant { adt, .. } = target.kind {
+            let _ = self.keys.item(adt);
+        }
         let k = checker_of(target.key);
         let def = match target.kind {
             Kind::Fn => Def::Fn(k),

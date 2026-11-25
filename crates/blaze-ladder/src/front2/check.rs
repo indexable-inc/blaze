@@ -300,8 +300,8 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
 ) -> Result<tc::Checked<'static>, CheckFail> {
     let allow_diags = r.store.inline_for_probe;
     let owner = body.typeck.owner;
-    // The store's allocator: the checked body outlives the round (`Checked<'static>`).
-    let alloc = r.store.tys.alloc();
+    // The store's per-body work allocator: the checked body lives for this body check.
+    let alloc = r.store.work_alloc();
     let mut hints = Needs::new_in(alloc);
     // The records made between rounds, for a refusal past the last ([`rounds_fail`]).
     let mut made = 0u64;
@@ -943,7 +943,7 @@ fn adt_args_shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, tys: tc::PTys<
     let mut shown = args.len();
     while let Some(&arg) = shown.checked_sub(1).and_then(|i| args.get(i)) {
         let Some(&Some(d)) = defaults.get(shown - 1) else { break };
-        if !names_no_param(heads, d, r.store.tys.alloc()) || ty_shown(r, heads, d) != ty_shown(r, tys, arg) {
+        if !names_no_param(heads, d, r.store.work_alloc()) || ty_shown(r, heads, d) != ty_shown(r, tys, arg) {
             break;
         }
         shown -= 1;
@@ -1676,7 +1676,7 @@ fn trait_words<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, tys: tc::PTys<'_>
     // (`{Rhs}`) its own, by the index the trait's header gives it (heads.rs `param_names`).
     let shown: Vec<String, Global> = tys.list(args).map(|l| l.iter().map(|&t| ty_shown(r, tys, t)).collect()).unwrap_or_default();
     let mut params: Vec<(Name, u32), Global> = Vec::new_in(Global);
-    let params_read = super::heads::lower_alloc(r.names, lib, text.text, r.store.tys.alloc())
+    let params_read = super::heads::lower_alloc(r.names, lib, text.text, r.store.work_alloc())
         .map_err(|e| format!("{e:?}"))
         .and_then(|low| super::heads::param_names(&low.view(), 1, &mut params, super::heads::Consts::Keep).map_err(|e| format!("{e:?}")));
     let unread = |why: &dyn core::fmt::Display| Some(format!("the trait `{this}`'s `#[diagnostic::on_unimplemented]` does not read ({why})"));
@@ -1786,7 +1786,7 @@ pub fn callee_target<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,scope: &
     // `Vec<T>`) is selected where the instance is made, as on a bare parameter: an impl picked
     // here would be picked at types that are not the instance's. The impls of the self type's
     // shape are walked by reach.rs `Instances`.
-    let alloc = r.store.tys.alloc();
+    let alloc = r.store.work_alloc();
     if holds_param(ground.view(), args, alloc).map_err(|error| CheckFail::Check { owner, error })? {
         return Ok(Target::AtInstance(item));
     }
@@ -1875,7 +1875,7 @@ pub(crate) fn resolve_instance_full<'n, S: NamesSource<'n>>(
         _ => return Ok(None),
     };
     let Some(module) = r.keys.library_in(r.names, container) else { return Ok(None) };
-    let alloc = r.store.tys.alloc();
+    let alloc = r.store.work_alloc();
     let mut ground = tc::PortableTys::new_in(alloc);
     let mut g_args: blaze_own::Vec<tc::PTy, blaze_own::Alloc<'static>> =
         blaze_own::Vec::with_capacity_in(args.len(), alloc);
@@ -1957,7 +1957,7 @@ pub fn reach_capture_copy<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, sc
     let shown = |e| CheckFail::Check { owner, error: e };
     let Some(&me) = c.types.view().list(args).map_err(shown)?.first() else { return Ok(()) };
     let tc::PNode::Closure { owner: of, ordinal, .. } = c.types.view().node(me).map_err(shown)? else { return Ok(()) };
-    let alloc = r.store.tys.alloc();
+    let alloc = r.store.work_alloc();
     if of != owner || holds_param(c.types.view(), args, alloc).map_err(shown)? {
         return Ok(());
     }
@@ -2178,7 +2178,7 @@ pub fn eval_len<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,c: LibKey) ->
         return eval_len_inner(r, c);
     };
     if r.consts.is_none() { return eval_len_inner(r, c) }
-    let capture = r.store.maps.capture_const(r.store.tys.alloc());
+    let capture = r.store.maps.capture_const(r.store.work_alloc());
     let result = eval_len_inner(r, c);
     let inputs = r.store.maps.finish_capture(capture).expect("the pooled world's source recorder");
     r.store.maps.const_proofs.as_mut().expect("the pooled world's source proofs").finish(start, c, inputs);
@@ -2222,7 +2222,7 @@ fn eval_len_inner<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, c: LibKey)
     // whose header writes `W<{ size_of::<u8>() }>` stays a refused candidate, a named gap of
     // the questions it could answer, as before there was an evaluator behind the heads.
     let anonymous = |k: LibKey| super::anon::need_key(checker_of(k)) == k;
-    let eval_alloc = r.store.tys.alloc();
+    let eval_alloc = r.store.work_alloc();
     let mut more: blaze_own::Vec<(LibKey, u128), blaze_own::Alloc<'static>> = blaze_own::Vec::new_in(eval_alloc);
     let mut failed: blaze_own::Vec<(LibKey, Box<str>), blaze_own::Alloc<'static>> = blaze_own::Vec::new_in(eval_alloc);
     for &o in asked.iter() {
@@ -2300,7 +2300,7 @@ pub fn answer_impls<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,trait_: I
         return None;
     }
     let slice = b.impls_of(trait_, shape)?;
-    let mut out = blaze_own::Vec::with_capacity_in(slice.len(), r.store.tys.alloc());
+    let mut out = blaze_own::Vec::with_capacity_in(slice.len(), r.store.work_alloc());
     out.extend_from_slice(slice);
     Some(out)
 }
@@ -2310,7 +2310,7 @@ fn make_once<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,fill: Fill) -> R
         Fill::Store(want) => r.store.ensure(r.names, r.keys, want).map_err(MakeFail::Head),
         Fill::Impls(trait_, shape, seen) => {
             let (names, index, order) = (r.names, r.index, r.order);
-            let alloc = r.store.tys.alloc();
+            let alloc = r.store.work_alloc();
             let b = &*r.buckets.get_or_insert_with(|| Buckets::for_source_in(names, index, alloc));
             let mut heads = Lowering { names, keys: &mut *r.keys, store: &mut *r.store };
             match trait_question(names, &mut heads, b, trait_, shape, seen, order)? {
@@ -2320,7 +2320,7 @@ fn make_once<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,fill: Fill) -> R
         }
         Fill::Inherent(shape, name) => {
             let (names, index, order) = (r.names, r.index, r.order);
-            let alloc = r.store.tys.alloc();
+            let alloc = r.store.work_alloc();
             let b = &*r.buckets.get_or_insert_with(|| Buckets::for_source_in(names, index, alloc));
             let mut heads = Lowering { names, keys: &mut *r.keys, store: &mut *r.store };
             match inherent_question(names, &mut heads, b, shape, name, order)? {
@@ -2359,7 +2359,7 @@ fn eval_where_const<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, cond: It
         r.store.where_const_answers.insert((cond, digest), tc::ConstHolds::Error);
         return Ok(());
     };
-    let alloc = r.store.tys.alloc();
+    let alloc = r.store.work_alloc();
     let evaluated = consts.value_with_args(r, prepared, cond, req.tys.view(), &req.args, None, alloc);
     let answer = match evaluated.ok().and_then(super::consts::int_of) {
         Some(0) => tc::ConstHolds::False,
@@ -2384,7 +2384,7 @@ fn resolve_inferred_outputs<'n, S: NamesSource<'n>>(
     targets: &[ItemKey],
 ) -> Result<(), InferredErr> {
     const MOST_INFER_OUTPUTS: u32 = 256;
-    let alloc = r.store.tys.alloc();
+    let alloc = r.store.work_alloc();
     let base_caller = r.store.has_unresolved_inferred_output(caller).then_some(caller);
     let mut stack: blaze_own::Vec<ItemKey, blaze_own::Alloc<'static>> = blaze_own::Vec::new_in(alloc);
     for &t in targets.iter().rev() {
@@ -2552,7 +2552,7 @@ impl<'n> ImplHeads<'n> for Importing<'_, 'n> {
             });
         }
         let _cost = super::tables::cost::Cost::enter_want(self.store.cost, want);
-        let filed = self.seeds.seed(self.store, self.keys, want, self.store.tys.alloc());
+        let filed = self.seeds.seed(self.store, self.keys, want, self.store.work_alloc());
         if matches!(filed, Ok(super::heads::Seeded::Filed)) && self.store.made(want) {
             self.store.imported.set(self.store.imported.get() + 1);
             return Ok(Made::Made);
@@ -2578,10 +2578,10 @@ pub(super) fn trait_question<'n, S: NamesSource<'n>, H: ImplHeads<'n>>(names: S,
     // Only impls written where the orphan rules allow (`trait_home`) are candidates.
     let home = trait_home(names, heads.keys(), heads.store(), trait_, shape).map_err(MakeFail::Head)?;
     // Over a bucket index: this question's buckets of the crates `home` admits.
-    b.admit_shared(names, heads.keys(), home, ask, heads.store().tys.alloc()).map_err(MakeFail::from)?;
+    b.admit_shared(names, heads.keys(), home, ask, heads.store().work_alloc()).map_err(MakeFail::from)?;
     // And only impls of the crates the asking body sees (`Seen`): none of a crate downstream
     // of a checked body's, whose headers are then never made for it either.
-    let sight = b.sight(names, seen, heads.store().tys.alloc()).map_err(|why| MakeFail::Buckets(Unfilled::Sight(why)))?;
+    let sight = b.sight(names, seen, heads.store().work_alloc()).map_err(|why| MakeFail::Buckets(Unfilled::Sight(why)))?;
     let mut candidates = b.trait_candidates(trait_, shape, home);
     // A negative impl is a candidate of its trait's questions (`Buckets::answer`): it
     // decides an auto trait's structural rule, and the solver matches it to no positive
@@ -2606,7 +2606,7 @@ pub(super) fn inherent_question<'n, S: NamesSource<'n>, H: ImplHeads<'n>>(names:
     let _cost = super::tables::cost::Cost::enter(heads.store().cost, super::tables::cost::Part::Impls);
     // Only impls written in the type's own crate (`inherent_home`) are candidates.
     let home = inherent_home(names, heads.keys(), heads.store(), shape).map_err(MakeFail::Head)?;
-    b.admit_shared(names, heads.keys(), home, ask, heads.store().tys.alloc()).map_err(MakeFail::from)?;
+    b.admit_shared(names, heads.keys(), home, ask, heads.store().work_alloc()).map_err(MakeFail::from)?;
     // The name filters first, from the impls' member rows (no header made): an impl
     // that declares no member of the name is never the answer, so its header is not
     // lowered for it. rustc finds an inherent item by name before it unifies self

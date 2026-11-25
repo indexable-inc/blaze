@@ -431,7 +431,7 @@ pub(crate) fn check_body_keyed<'n, S: NamesSource<'n>>(
     // deferring entry and keeps `Stalls::Gap`.
     let stalls = if count.is_none() { super::stalled_goals::Stalls::Decide } else { super::stalled_goals::Stalls::Gap };
     let mut done = super::check::check_rounds_as(r, body, scope, count, asked, stalls, root_keys)?;
-    let scratch = r.store.tys.alloc();
+    let scratch = r.store.work_alloc();
     let owner = body.typeck.owner;
     let mut used_provisional = false;
     if !r.store.provisional_used.borrow().is_empty() {

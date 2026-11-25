@@ -159,6 +159,134 @@ impl StretchFront {
     }
 }
 
+/// Configuration for [`StretchStore::new`].
+pub struct StretchStoreOpts {
+    /// Virtual address-space reservation for the stretch heads frame (e.g. `512 MiB`).
+    pub reserve: usize,
+    /// Soft live-byte cap on `heads_frame.used()` past which the stretch store rolls over
+    /// (drops `Store` + `Keys`, resets `heads_frame`, and trims to `keep`) between bodies.
+    pub cap: usize,
+    /// Committed bytes retained in `heads_frame` after a rollover trim.
+    pub keep: usize,
+    /// Allocator for the pinned `Box<blaze_mem::Frame>` and reusable slot header (once per stretch).
+    pub alloc: Alloc<'static>,
+}
+
+struct StretchStoreInner<'n> {
+    store: super::super::heads::Store<'n>,
+    keys: Keys,
+    heads_alloc: Alloc<'static>,
+}
+
+struct StretchStoreSlot<'n> {
+    inner: Option<StretchStoreInner<'n>>,
+}
+
+/// Stretch-scoped reusable [`super::super::heads::Store`] and [`Keys`] across consecutive
+/// same-group bodies checked over frozen heads (`frame.heads.is_some()`).
+///
+/// Field order is load-bearing for `Drop`: `slot` drops FIRST (dropping `Store` and `Keys` while
+/// `heads_frame` and its embedded `Erased` allocator handle are still alive), and `heads_frame`
+/// drops SECOND (unmapping the virtual memory). `heads_frame` is boxed so moving [`StretchStore`]
+/// never invalidates the `Erased<&Frame>` handle placed inside `heads_frame`.
+pub struct StretchStore<'n> {
+    slot: blaze_own::Box<StretchStoreSlot<'n>, Alloc<'static>>,
+    heads_frame: blaze_own::Box<blaze_mem::Frame, Alloc<'static>>,
+    cap: usize,
+    keep: usize,
+    rollovers: u64,
+}
+
+impl<'n> StretchStore<'n> {
+    /// Reserves a dedicated heads frame for reusing imported frozen heads across bodies of one
+    /// stretch without allocating into `BODIES_FRAME` or leaking across stretches.
+    pub fn new(opts: StretchStoreOpts) -> Result<StretchStore<'n>, blaze_mem::MemError> {
+        let frame = blaze_mem::Frame::with_reserve(opts.reserve, blaze_mem::Tag::Infer)?;
+        Ok(StretchStore {
+            slot: blaze_own::Box::new_in(StretchStoreSlot { inner: None }, opts.alloc),
+            heads_frame: blaze_own::Box::new_in(frame, opts.alloc),
+            cap: opts.cap,
+            keep: opts.keep,
+            rollovers: 0,
+        })
+    }
+
+    /// Bytes currently committed in the stretch heads frame.
+    pub fn committed(&self) -> usize {
+        self.heads_frame.committed()
+    }
+
+    /// Bytes currently live in the stretch heads frame.
+    pub fn used(&self) -> usize {
+        self.heads_frame.used()
+    }
+
+    /// Total virtual reservation of the stretch heads frame.
+    pub fn reserved(&self) -> usize {
+        self.heads_frame.reserved()
+    }
+
+    /// Takes any recorded exhaustion of the stretch heads frame, returning `(used, reserved)`.
+    pub fn take_exhaustion(&self) -> Option<(usize, usize)> {
+        self.heads_frame.take_exhaustion().map(|used| (used, self.heads_frame.reserved()))
+    }
+
+    /// Number of times this stretch store rolled over (due to taint or exceeding `cap`).
+    pub fn rollovers(&self) -> u64 {
+        self.rollovers
+    }
+
+    fn reset_frame(&mut self) {
+        // Drop `Store` and `Keys` BEFORE resetting `heads_frame` so every persistent table drops
+        // while `heads_frame` and its embedded `Erased` handle are still live.
+        drop(self.slot.inner.take());
+        self.heads_frame.reset();
+        if self.heads_frame.committed() > self.keep {
+            self.heads_frame.trim(self.keep);
+        }
+    }
+
+    #[inline(never)]
+    fn take_or_init(
+        &mut self,
+        sized: Option<ItemKey>,
+        pointers: super::super::receiver::Pointers,
+        body_frame: &'n blaze_mem::Frame,
+    ) -> StretchStoreInner<'n> {
+        if let Some(inner) = self.slot.inner.take() {
+            return inner;
+        }
+        if self.heads_frame.used() > 0 {
+            self.heads_frame.reset();
+            if self.heads_frame.committed() > self.keep {
+                self.heads_frame.trim(self.keep);
+            }
+        }
+        let frame_ref: &blaze_mem::Frame = &self.heads_frame;
+        let erased: &blaze_own::Erased<&blaze_mem::Frame> = frame_ref.alloc(blaze_own::Erased::new(frame_ref));
+        // SAFETY: `self.heads_frame` is boxed at a pinned heap address, `erased` lives inside
+        // `self.heads_frame`, `self.slot` drops before `self.heads_frame`, and any taken
+        // `StretchStoreInner` is returned or dropped before `reset_frame()` or `Drop` runs via
+        // `BodyWorldGuard`.
+        let heads_alloc = unsafe { body_world_alloc(erased.handle()) };
+        let mut store = super::super::heads::Store::new(sized, body_frame, heads_alloc);
+        store.pointers = pointers;
+        let keys = Keys::new_in(heads_alloc);
+        StretchStoreInner { store, keys, heads_alloc }
+    }
+
+    #[inline(never)]
+    fn put_back(&mut self, inner: StretchStoreInner<'n>, status: super::super::heads::ReuseStatus) {
+        if status == super::super::heads::ReuseStatus::Clean && self.heads_frame.used() <= self.cap {
+            self.slot.inner = Some(inner);
+        } else {
+            drop(inner);
+            self.rollovers = self.rollovers.saturating_add(1);
+            self.reset_frame();
+        }
+    }
+}
+
 /// The ask a failed cell belonged to. At import time the checker may have made several
 /// distinct asks about the opaque, or none at all. The rows are sorted by fact kind.
 #[derive(Debug)]
@@ -490,7 +618,7 @@ pub fn check_body_reads<'n, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &Bod
 /// refuses with [`ReadsFull`].
 pub fn check_body_reads_observed<'n, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame<'n>, work: Alloc<'w>, recorder: &mut Option<Recorder<'w>>, keyer: Option<&dyn ReadKeyer>) -> Result<BodyReads<'w>, TaskError> {
     let active = recorder.get_or_insert_with(|| Recorder::new(RecorderOpts { alloc: work }));
-    let body = record_body_observed(tables, task, frame, work, active, keyer, Coverage::WithLocals, ReadReport::Distinct)?;
+    let body = record_body_observed(tables, task, frame, work, active, keyer, Coverage::WithLocals, ReadReport::Distinct, None)?;
     drop(recorder.take());
     Ok(body)
 }
@@ -498,8 +626,17 @@ pub fn check_body_reads_observed<'n, 'w>(tables: Tables<'_, 'n>, task: &Task, fr
 /// One item of an outline entry. Use the same immutable tables and placement policy
 /// for every item sharing this recorder. Each item returns the cells it first observed
 /// and its own verdict digest before the next item reuses the encoding buffer.
-pub fn check_body_item<'n, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame<'n>, work: Alloc<'w>, recorder: &mut Recorder<'w>, keyer: Option<&dyn ReadKeyer>, encoding: &mut AString<'w>) -> Result<BodyReads<'w>, TaskError> {
-    record_body_observed(tables, task, frame, work, recorder, keyer, Coverage::WithLocals, ReadReport::Entry(encoding))
+pub fn check_body_item<'n, 'w>(
+    tables: Tables<'_, 'n>,
+    task: &Task,
+    frame: &BodyFrame<'n>,
+    work: Alloc<'w>,
+    recorder: &mut Recorder<'w>,
+    keyer: Option<&dyn ReadKeyer>,
+    encoding: &mut AString<'w>,
+    stretch_store: Option<&mut StretchStore<'n>>,
+) -> Result<BodyReads<'w>, TaskError> {
+    record_body_observed(tables, task, frame, work, recorder, keyer, Coverage::WithLocals, ReadReport::Entry(encoding), stretch_store)
 }
 
 /// The one check behind [`check_body`], [`check_body_in`] and [`check_body_split`].
@@ -521,7 +658,7 @@ fn check_split<'n, 'a, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFram
 fn record_body<'n, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame<'n>, work: Alloc<'w>, coverage: Coverage, sorted_report: bool) -> Result<BodyReads<'w>, TaskError> {
     let mut recorder = Recorder::new(RecorderOpts { alloc: work });
     let report = if sorted_report { ReadReport::Sorted } else { ReadReport::Distinct };
-    record_body_observed(tables, task, frame, work, &mut recorder, None, coverage, report)
+    record_body_observed(tables, task, frame, work, &mut recorder, None, coverage, report, None)
 }
 
 enum ReadReport<'a, 'w> {
@@ -530,7 +667,17 @@ enum ReadReport<'a, 'w> {
     Entry(&'a mut AString<'w>),
 }
 
-fn record_body_observed<'n, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame<'n>, work: Alloc<'w>, recorder: &mut Recorder<'w>, keyer: Option<&dyn ReadKeyer>, coverage: Coverage, report: ReadReport<'_, 'w>) -> Result<BodyReads<'w>, TaskError> {
+fn record_body_observed<'n, 'w>(
+    tables: Tables<'_, 'n>,
+    task: &Task,
+    frame: &BodyFrame<'n>,
+    work: Alloc<'w>,
+    recorder: &mut Recorder<'w>,
+    keyer: Option<&dyn ReadKeyer>,
+    coverage: Coverage,
+    report: ReadReport<'_, 'w>,
+    stretch_store: Option<&mut StretchStore<'n>>,
+) -> Result<BodyReads<'w>, TaskError> {
     // D161 step 3's oracle over EVERY body any test checks (`--features asks-oracle`): the body
     // run both ways first, their answers equal or the test fails naming both.
     #[cfg(feature = "asks-oracle")]
@@ -543,7 +690,7 @@ fn record_body_observed<'n, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &Bod
     if let Err(differ) = compare_repeats(tables, task, frame, work, RepeatsPlant::Clean) {
         panic!("{differ}");
     }
-    record_body_as(tables, task, frame, work, recorder, keyer, coverage, report, super::super::asks::AsksMet::Again)
+    record_body_as(tables, task, frame, work, recorder, keyer, coverage, report, super::super::asks::AsksMet::Again, stretch_store)
 }
 
 /// Two answers of one body, one per side of D161 step 3's seam (front2 asks.rs `AsksMet`), that
@@ -636,7 +783,7 @@ pub fn compare_asks<'n, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFra
     let run = |met: AsksMet, heads: Option<&'n dyn HeadSeed<'n>>| {
         let shadow = BodyFrame { frame: frame.frame, alloc: frame.alloc, plant_drop: frame.plant_drop, cost: None, needs: frame.needs, heads, sources: frame.sources, goals: None, prepared: frame.prepared, front: frame.front };
         let mut recorder = Recorder::new(RecorderOpts { alloc: work });
-        record_body_as(tables, task, &shadow, work, &mut recorder, None, Coverage::WithLocals, ReadReport::Sorted, met)
+        record_body_as(tables, task, &shadow, work, &mut recorder, None, Coverage::WithLocals, ReadReport::Sorted, met, None)
     };
     // An unseeded body (a lowering store, where `Once` would meet its heads as `Again` does)
     // gets frozen heads of its own, one fresh seed a side ([`oracle_seed`]), so the oracle
@@ -730,7 +877,7 @@ fn release_oracle_seed<'n>(tables: Tables<'_, 'n>, frame: &BodyFrame<'n>, seed: 
 #[cfg(test)]
 pub(crate) fn record_body_met<'n, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame<'n>, work: Alloc<'w>, met: super::super::asks::AsksMet) -> Result<BodyReads<'w>, TaskError> {
     let mut recorder = Recorder::new(RecorderOpts { alloc: work });
-    record_body_as(tables, task, frame, work, &mut recorder, None, Coverage::WithLocals, ReadReport::Sorted, met)
+    record_body_as(tables, task, frame, work, &mut recorder, None, Coverage::WithLocals, ReadReport::Sorted, met, None)
 }
 
 #[cfg(test)]
@@ -866,7 +1013,7 @@ pub fn compare_repeats<'n, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &Body
         if let Some(cell) = drop {
             recorder.plant_drop(cell);
         }
-        record_body_as(tables, task, &shadow, work, &mut recorder, None, Coverage::WithLocals, ReadReport::Sorted, super::super::asks::AsksMet::Again)
+        record_body_as(tables, task, &shadow, work, &mut recorder, None, Coverage::WithLocals, ReadReport::Sorted, super::super::asks::AsksMet::Again, None)
     };
     let offer = run(Repeats::Offer, None);
     let drop = match (plant, &offer) {
@@ -913,6 +1060,54 @@ unsafe fn body_world_alloc<'w>(work: Alloc<'w>) -> Alloc<'static> {
     unsafe { core::mem::transmute::<Alloc<'w>, Alloc<'static>>(work) }
 }
 
+/// Stack RAII guard owning the body's [`ProjectWorld`] and (when reusing a [`StretchStore`]) the
+/// borrow of that stretch store.
+///
+/// Guarantees that on EVERY exit path (normal `Ok`, early `?` `Err`, or panic unwind), all
+/// `work`-backed fields on `Store`, `Maps`, and `Keys` are detached via `end_body_reuse` BEFORE
+/// `record_body_as` returns and BEFORE `BODY_SCRATCH` resets. Only [`Self::finish`] (invoked on
+/// clean `Ok` completion) calls `StretchStore::put_back`; `Drop` always drops `Store` + `Keys`
+/// and resets `heads_frame`.
+struct BodyWorldGuard<'v, 'n, 'w, 's> {
+    world: Option<blaze_own::Box<ProjectWorld<'n, Tables<'v, 'n>>, Alloc<'w>>>,
+    reuse: Option<(&'s mut StretchStore<'n>, Alloc<'static>, super::super::heads::ReuseSnapshot)>,
+}
+
+impl<'v, 'n, 'w, 's> BodyWorldGuard<'v, 'n, 'w, 's> {
+    #[inline(never)]
+    fn finish(mut self) {
+        let Some(world) = self.world.take() else { return };
+        if let Some((ss, heads_alloc, snapshot)) = self.reuse.take() {
+            let (mut store, mut keys) = blaze_own::Box::into_inner(world).into_store_and_keys();
+            let status = store.end_body_reuse(snapshot, &mut keys);
+            ss.put_back(StretchStoreInner { store, keys, heads_alloc }, status);
+        }
+    }
+}
+
+#[inline(never)]
+fn detach_and_reset_reuse<'v, 'n, 'w>(
+    world: blaze_own::Box<ProjectWorld<'n, Tables<'v, 'n>>, Alloc<'w>>,
+    ss: &mut StretchStore<'n>,
+    snapshot: super::super::heads::ReuseSnapshot,
+) {
+    let (mut store, mut keys) = blaze_own::Box::into_inner(world).into_store_and_keys();
+    let _ = store.end_body_reuse(snapshot, &mut keys);
+    drop(store);
+    drop(keys);
+    ss.reset_frame();
+}
+
+impl Drop for BodyWorldGuard<'_, '_, '_, '_> {
+    fn drop(&mut self) {
+        if let Some(world) = self.world.take()
+            && let Some((ss, _heads_alloc, snapshot)) = self.reuse.take()
+        {
+            detach_and_reset_reuse(world, ss, snapshot);
+        }
+    }
+}
+
 /// The body's world over `view`: its lang index, its `Front2` and the world itself, made in
 /// THIS frame and boxed in `alloc`. A debug build gives each local and temporary of a
 /// function its own slot for the whole call, and [`record_body_as`]'s frame stays on the
@@ -920,11 +1115,25 @@ unsafe fn body_world_alloc<'w>(work: Alloc<'w>) -> Alloc<'static> {
 /// bytes, the deepest of front2's): made there, the index, `Front2` and the world's value
 /// would ride under it; made here, only the box's pointer does.
 ///
-/// `world_alloc` is the body's resettable `work` scratch frame (`body_world_alloc`), so the
-/// store's tables, type interner, impl buckets, and checker arenas all live in `work` and are
-/// reclaimed in O(1) when the caller resets its scratch after this body finishes.
+/// When `stretch_store` is `Some` and `frame.heads` is `Some` (seeded body), reuses the stretch's
+/// persistent `Store` + `Keys` in `HEADS_STRETCH_FRAME` while binding all per-body scratch tables
+/// to `world_alloc` (`BODY_SCRATCH`); otherwise allocates everything in `world_alloc`.
 #[inline(never)]
-fn body_world<'v, 'n, 'w>(view: Tables<'v, 'n>, sink: &dyn ReadSink, name: Name, frame: &BodyFrame<'n>, asks: super::super::asks::AsksMet, alloc: Alloc<'w>, world_alloc: Alloc<'static>) -> Result<blaze_own::Box<ProjectWorld<'n, Tables<'v, 'n>>, Alloc<'w>>, TaskError> {
+fn body_world<'v, 'n, 'w, 's>(
+    view: Tables<'v, 'n>,
+    sink: &dyn ReadSink,
+    name: Name,
+    frame: &BodyFrame<'n>,
+    asks: super::super::asks::AsksMet,
+    alloc: Alloc<'w>,
+    stretch_store: Option<&'s mut StretchStore<'n>>,
+) -> Result<BodyWorldGuard<'v, 'n, 'w, 's>, TaskError> {
+    // SAFETY: `guard` (and `world` inside it) is owned locally in `record_body_as` and either
+    // finished via `BodyWorldGuard::finish` or dropped via `BodyWorldGuard::drop` strictly before
+    // `record_body_as` returns while `alloc: Alloc<'w>` is live. Both `finish` and `drop` call
+    // `Store::end_body_reuse`, detaching every `world_alloc`-backed field before `Store` is
+    // returned to `StretchStore` or dropped.
+    let world_alloc = unsafe { body_world_alloc(alloc) };
     let (index, pointers) = match frame.front {
         Some(sf) => {
             for &read in sf.reads.iter() {
@@ -942,25 +1151,53 @@ fn body_world<'v, 'n, 'w>(view: Tables<'v, 'n>, sink: &dyn ReadSink, name: Name,
             (index, None)
         }
     };
-    let front = Front2 { names: view, resolver: crate::resolve::Paths { names: view }, texts: Texts::empty(), keys: Keys::new_in(world_alloc), index, frame: frame.frame };
-    let mut world = blaze_own::Box::new_in(ProjectWorld::over_with_pointers(front, frame.prepared, pointers, world_alloc), alloc);
-    world.record_const_texts();
-    world.set_cost(frame.cost);
-    world.set_needs(frame.needs);
-    world.set_asks(asks).map_err(|why| TaskError::Asks { body: name, why })?;
-    world.set_seeds(frame.heads);
-    world.set_goal_share(frame.goals);
-    if let Some(sources) = frame.sources {
-        world.set_body_sources(sources);
+    let mut guard = match (stretch_store, frame.heads.is_some()) {
+        (Some(ss), true) => {
+            // Always resolve receiver pointers when `front` is `None` so read lists match a fresh
+            // world even without a precomputed `StretchFront` (rule 21).
+            let resolved_pointers = pointers.unwrap_or_else(|| super::super::receiver::Pointers::find(&index, crate::resolve::Paths { names: view }));
+            let StretchStoreInner { mut store, mut keys, heads_alloc } = ss.take_or_init(index.lang("sized"), resolved_pointers, frame.frame);
+            let snapshot = store.begin_body_reuse(world_alloc, &mut keys);
+            let front = Front2 { names: view, resolver: crate::resolve::Paths { names: view }, texts: Texts::empty(), keys, index, frame: frame.frame };
+            let world = blaze_own::Box::new_in(ProjectWorld::over_with_store(front, store, frame.prepared, world_alloc), alloc);
+            BodyWorldGuard { world: Some(world), reuse: Some((ss, heads_alloc, snapshot)) }
+        }
+        _ => {
+            let front = Front2 { names: view, resolver: crate::resolve::Paths { names: view }, texts: Texts::empty(), keys: Keys::new_in(world_alloc), index, frame: frame.frame };
+            let world = blaze_own::Box::new_in(ProjectWorld::over_with_pointers(front, frame.prepared, pointers, world_alloc), alloc);
+            BodyWorldGuard { world: Some(world), reuse: None }
+        }
+    };
+    if let Some(world) = guard.world.as_mut() {
+        world.record_const_texts();
+        world.set_cost(frame.cost);
+        world.set_needs(frame.needs);
+        world.set_asks(asks).map_err(|why| TaskError::Asks { body: name, why })?;
+        world.set_seeds(frame.heads);
+        world.set_goal_share(frame.goals);
+        if let Some(sources) = frame.sources {
+            world.set_body_sources(sources);
+        }
     }
-    Ok(world)
+    Ok(guard)
 }
 
 const _: () = assert!(core::mem::size_of::<blaze_own::Box<ProjectWorld<'static, Tables<'static, 'static>>, Alloc<'static>>>() == 2 * core::mem::size_of::<usize>());
 
 /// [`record_body_observed`] on one side of D161 step 3's seam (`asks`).
 #[allow(clippy::too_many_arguments)]
-fn record_body_as<'n, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame<'n>, work: Alloc<'w>, recorder: &mut Recorder<'w>, keyer: Option<&dyn ReadKeyer>, coverage: Coverage, report: ReadReport<'_, 'w>, asks: super::super::asks::AsksMet) -> Result<BodyReads<'w>, TaskError> {
+fn record_body_as<'n, 'w>(
+    tables: Tables<'_, 'n>,
+    task: &Task,
+    frame: &BodyFrame<'n>,
+    work: Alloc<'w>,
+    recorder: &mut Recorder<'w>,
+    keyer: Option<&dyn ReadKeyer>,
+    coverage: Coverage,
+    report: ReadReport<'_, 'w>,
+    asks: super::super::asks::AsksMet,
+    stretch_store: Option<&mut StretchStore<'n>>,
+) -> Result<BodyReads<'w>, TaskError> {
     let name = task.planned.name;
     let setup = Cost::enter(frame.cost, Part::Setup);
     let alloc = work;
@@ -977,15 +1214,9 @@ fn record_body_as<'n, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame
         BodyRef::Member { container, .. } => container,
         BodyRef::Free(key) => key,
     };
-    // SAFETY: `world` is owned locally in this function (moved into `collect_body_reads` and
-    // dropped there, or dropped on early return / unwind) strictly before `record_body_as`
-    // returns while `work: Alloc<'w>` is live. `const_texts` is copied into `frame.alloc`
-    // before `world` drops, and no `world_alloc`-backed handle escapes in `BodyReads` or
-    // `TaskError`.
-    let world_alloc = unsafe { body_world_alloc(alloc) };
     // In its own frame and behind a box: this frame rides under the whole check (the guard:
     // tests/front2_alias_opaques.rs `a_seeded_body_checks_on_a_small_stack`).
-    let mut world = body_world(view, &observed, name, frame, asks, alloc, world_alloc)?;
+    let mut guard = body_world(view, &observed, name, frame, asks, alloc, stretch_store)?;
     drop(setup);
     let root = Listed { body, at: None, entry: None };
     let mut goal_hits = AVec::new_in(alloc);
@@ -1012,21 +1243,26 @@ fn record_body_as<'n, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame
         pair
     };
     recorder.checking(Some("the body's reached verdict and local function lists"));
-    let reached = match coverage {
-        Coverage::WithLocals => world.each_from(&[root], alloc, check),
-        #[cfg(test)]
-        Coverage::RootOnly => {
-            let mut check = check;
-            let mut one = AVec::new_in(alloc);
-            one.push(Reached { listed: root, within: None, got: check(&mut *world, body) });
-            one
+    let reached = {
+        let Some(world) = guard.world.as_mut() else {
+            return Err(TaskError::Write);
+        };
+        match coverage {
+            Coverage::WithLocals => world.each_from(&[root], alloc, check),
+            #[cfg(test)]
+            Coverage::RootOnly => {
+                let mut check = check;
+                let mut one = AVec::new_in(alloc);
+                one.push(Reached { listed: root, within: None, got: check(&mut *world, body) });
+                one
+            }
         }
     };
     if let Some(error) = seed_error {
         return Err(error);
     }
     let sorted_report = matches!(report, ReadReport::Sorted);
-    let done = collect_body_reads(name, own, frame, alloc, &observed, view, world, reached, report)?;
+    let done = collect_body_reads(name, own, frame, alloc, &observed, view, guard, reached, report)?;
     let recorder_bytes = recorder.table_bytes();
     let (mut reads, mut read_tally) = recorder.take_item().map_err(TaskError::Full)?;
     recorder.checking(None);
@@ -1096,11 +1332,14 @@ fn collect_body_reads<'v, 'n, 'w>(
     alloc: Alloc<'w>,
     observed: &'v ObservedReads<'_, 'w, '_, 'n, '_>,
     view: Tables<'v, 'n>,
-    mut world: blaze_own::Box<ProjectWorld<'n, Tables<'v, 'n>>, Alloc<'w>>,
+    mut guard: BodyWorldGuard<'v, 'n, 'w, '_>,
     mut reached: AVec<'w, Reached<'n, (BodyVerdict<'w>, BorrowVerdict<'w>)>>,
     report: ReadReport<'_, 'w>,
 ) -> Result<CollectedBody<'w>, TaskError> {
     let recorder = observed.recorder;
+    let Some(world) = guard.world.as_mut() else {
+        return Err(TaskError::Write);
+    };
     // Each fn declared in a reached body: checked here, so covered by this check. A local is
     // always written `Free` (every_body.rs `each_from`); the root is the one with no `within`.
     recorder.checking(Some("the body's local function key list"));
@@ -1181,11 +1420,11 @@ fn collect_body_reads<'v, 'n, 'w>(
     }
     drop(world_const_texts);
     let asked = *world.store.asked.borrow();
-    drop(world);
-    let _ = view;
     if let Some(error) = observed.error.borrow_mut().take() {
         return Err(error);
     }
+    guard.finish();
+    let _ = view;
     // The root's verdict bytes, then each local fn's (a root with no local fn keeps its bytes).
     let digest = ContentId::of(OUT_DOMAIN, bytes.as_bytes());
     let verdict_capacity = bytes.capacity();
@@ -4159,7 +4398,7 @@ mod read_id_tests {
             let key = heads.iter().map(|want| want.key()).find(|&key| records.name_of(key) == Some(label)).expect("fixture function");
             let task = Task { planned: Planned { name: Name::new(Kind::BodyCheck, key.0), phase: Phase::new(Stage::Bodies, 0), source: ABSENT, file: Name::new(Kind::FileItems, ABSENT) }, key: Key(ABSENT) };
             let alone = check_body_reads(tables, &task, &frame, a()).expect("item checked alone");
-            let together = check_body_item(tables, &task, &frame, a(), &mut entry, None, &mut encoding).expect("item checked in the entry");
+            let together = check_body_item(tables, &task, &frame, a(), &mut entry, None, &mut encoding, None).expect("item checked in the entry");
             let fresh: std::collections::BTreeSet<_> = alone.reads.iter().copied().filter(|key| union.insert(*key)).collect();
             assert_eq!(together.reads.iter().copied().collect::<std::collections::BTreeSet<_>>(), fresh);
             assert_eq!(together.reads.len(), fresh.len());
@@ -4221,6 +4460,227 @@ mod read_id_tests {
         let absent_impl = TableRead::Impls { krate: [0; 16], bucket: [7; 16] };
         assert_eq!(memo.id(absent_impl).ok(), cell_id(tables, absent_impl).ok());
         assert_eq!(memo.ids.len(), 1, "TableRead::Impls must not populate or evict `ids`");
+    }
+
+    #[test]
+    fn stretch_store_reused_matches_fresh_forward_and_reversed() {
+        use blaze_drive::key::Key;
+        use blaze_engine::{Phase, Planned, Stage};
+        use super::super::head_tests::cells;
+
+        let src = "\
+#![no_std]
+pub trait Score {
+    type Out;
+    fn score(&self) -> Self::Out;
+}
+pub struct Pair<T> {
+    pub left: T,
+    pub right: T,
+}
+impl Score for Pair<u8> {
+    type Out = u8;
+    fn score(&self) -> u8 {
+        self.left
+    }
+}
+pub fn use_score<T: Score>(x: &T) -> T::Out {
+    x.score()
+}
+pub fn base(p: Pair<u8>) -> u8 {
+    use_score(&p)
+}
+pub fn alpha() -> u8 {
+    let p = Pair { left: 1u8, right: 2u8 };
+    base(p)
+}
+pub fn beta_with_local() -> u8 {
+    fn inner(x: u8) -> u8 {
+        x
+    }
+    let p = Pair { left: inner(3u8), right: 4u8 };
+    base(p)
+}
+pub fn gamma_err() -> u16 {
+    let p = Pair { left: 5u8, right: 6u8 };
+    base(p)
+}";
+        let (records, _, body_frame) = world_of(src);
+        let unused = Recorder::new(RecorderOpts { alloc: a() });
+        let base_tables = Tables::new(TablesOpts { records, impls: None, lang_crates: &[CORE_AT], reads: &unused });
+        let base_frame = BodyFrame { frame: body_frame, alloc: a(), plant_drop: None, cost: None, needs: NeedsMet::First, heads: None, sources: None, goals: None, prepared: None, front: None };
+        let seed: &'static _ = body_frame.alloc(super::super::seeds::Freezing::new(records, oracle_heads(base_tables, &base_frame)));
+        let heads = cells(records);
+        let names = ["base", "alpha", "beta_with_local", "gamma_err"];
+        let mut tasks: blaze_own::Vec<(&str, Task), Alloc<'static>> = blaze_own::Vec::new_in(a());
+        for label in names {
+            let Some(key) = heads.iter().map(|want| want.key()).find(|&key| records.name_of(key) == Some(label)) else {
+                panic!("missing fixture function {label}");
+            };
+            tasks.push((
+                label,
+                Task { planned: Planned { name: Name::new(Kind::BodyCheck, key.0), phase: Phase::new(Stage::Bodies, 0), source: ABSENT, file: Name::new(Kind::FileItems, ABSENT) }, key: Key(ABSENT) },
+            ));
+        }
+
+        fn check_once<'n>(
+            records: &'n super::super::super::source::Records<'n>,
+            unused: &Recorder<'_>,
+            frame: &BodyFrame<'n>,
+            task: &Task,
+            scratch: &mut blaze_mem::Frame,
+            reuse: Option<&mut StretchStore<'n>>,
+        ) -> (ContentId, bool, u32, blaze_own::Vec<TableRead, Alloc<'static>>, blaze_own::Vec<ItemKey, Alloc<'static>>, Option<blaze_own::Vec<u8, Alloc<'static>>>) {
+            let tables = Tables::new(TablesOpts { records, impls: None, lang_crates: &[CORE_AT], reads: unused });
+            scratch.reset();
+            let erased = blaze_own::Erased::new(&*scratch);
+            let w = erased.handle();
+            let mut rec = Recorder::new(RecorderOpts { alloc: w });
+            let mut enc = AString::new_in(w);
+            let got = match check_body_item(tables, task, frame, w, &mut rec, None, &mut enc, reuse) {
+                Ok(got) => got,
+                Err(error) => panic!("fixture body check failed: {error}"),
+            };
+            let mut reads: blaze_own::Vec<TableRead, Alloc<'static>> = blaze_own::Vec::with_capacity_in(got.reads.len(), a());
+            reads.extend_from_slice(got.reads.as_slice());
+            reads.sort_unstable();
+            let mut locals: blaze_own::Vec<ItemKey, Alloc<'static>> = blaze_own::Vec::with_capacity_in(got.locals.len(), a());
+            locals.extend_from_slice(got.locals.as_slice());
+            let typed = got.typed.as_ref().map(|b| {
+                let mut v = blaze_own::Vec::with_capacity_in(b.len(), a());
+                v.extend_from_slice(b.as_slice());
+                v
+            });
+            (got.out, got.failed, got.findings, reads, locals, typed)
+        }
+        let frame = BodyFrame { frame: body_frame, alloc: a(), plant_drop: None, cost: None, needs: NeedsMet::First, heads: Some(seed), sources: None, goals: None, prepared: None, front: None };
+
+        let Ok(mut scratch) = blaze_mem::Frame::with_reserve(32 << 20, blaze_mem::Tag::Diagnostics) else {
+            panic!("test scratch frame reservation failed");
+        };
+        let mut fresh_results = blaze_own::Vec::new_in(a());
+        for &(label, ref task) in tasks.iter() {
+            fresh_results.push((label, check_once(records, &unused, &frame, task, &mut scratch, None)));
+        }
+
+        // Forward reuse across all 4 bodies (including one with a body-local fn).
+        let Ok(mut forward_store) = StretchStore::new(StretchStoreOpts { reserve: 64 << 20, cap: 16 << 20, keep: 1 << 20, alloc: a() }) else {
+            panic!("forward StretchStore reservation failed");
+        };
+        for ((label, task), (_, expected)) in tasks.iter().zip(fresh_results.iter()) {
+            let got = check_once(records, &unused, &frame, task, &mut scratch, Some(&mut forward_store));
+            assert_eq!(got.0, expected.0, "forward out mismatch on {label}");
+            assert_eq!(got.1, expected.1, "forward failed mismatch on {label}");
+            assert_eq!(got.2, expected.2, "forward findings mismatch on {label}");
+            assert_eq!(got.3, expected.3, "forward reads mismatch on {label}");
+            assert_eq!(got.4, expected.4, "forward locals mismatch on {label}");
+            assert_eq!(got.5, expected.5, "forward typed mismatch on {label}");
+        }
+        assert_eq!(forward_store.rollovers(), 0, "surgical body-local cleanup must not taint stretch store");
+        assert!(forward_store.used() > 0, "reused store retains persistent heads");
+
+        // Reversed reuse across all 4 bodies.
+        let Ok(mut reverse_store) = StretchStore::new(StretchStoreOpts { reserve: 64 << 20, cap: 16 << 20, keep: 1 << 20, alloc: a() }) else {
+            panic!("reverse StretchStore reservation failed");
+        };
+        for ((label, task), (_, expected)) in tasks.iter().rev().zip(fresh_results.iter().rev()) {
+            let got = check_once(records, &unused, &frame, task, &mut scratch, Some(&mut reverse_store));
+            assert_eq!(got.0, expected.0, "reversed out mismatch on {label}");
+            assert_eq!(got.1, expected.1, "reversed failed mismatch on {label}");
+            assert_eq!(got.2, expected.2, "reversed findings mismatch on {label}");
+            assert_eq!(got.3, expected.3, "reversed reads mismatch on {label}");
+            assert_eq!(got.4, expected.4, "reversed locals mismatch on {label}");
+            assert_eq!(got.5, expected.5, "reversed typed mismatch on {label}");
+        }
+        assert_eq!(reverse_store.rollovers(), 0, "reversed reuse must not taint stretch store");
+
+        // Combined StretchStore + GoalTable(ReplayMode::SameScope) in forward and reversed order.
+        let goals: &'static _ = body_frame.alloc(super::super::goals::GoalTable::new_in(
+            super::super::goals::GoalTableOpts { share: super::super::goals::share_opts_same_scope(), most: super::super::goals::MOST_GOALS },
+            blaze_own::testing::heap().shared(),
+        ));
+        let shared_frame = BodyFrame { goals: Some(goals), ..frame };
+        let Ok(mut shared_fwd) = StretchStore::new(StretchStoreOpts { reserve: 64 << 20, cap: 16 << 20, keep: 1 << 20, alloc: a() }) else {
+            panic!("shared forward StretchStore reservation failed");
+        };
+        for ((label, task), (_, expected)) in tasks.iter().zip(fresh_results.iter()) {
+            let got = check_once(records, &unused, &shared_frame, task, &mut scratch, Some(&mut shared_fwd));
+            assert_eq!(got.0, expected.0, "shared forward out mismatch on {label}");
+            assert_eq!(got.1, expected.1, "shared forward failed mismatch on {label}");
+            assert_eq!(got.2, expected.2, "shared forward findings mismatch on {label}");
+            assert_eq!(got.3, expected.3, "shared forward reads mismatch on {label}");
+            assert_eq!(got.4, expected.4, "shared forward locals mismatch on {label}");
+            assert_eq!(got.5, expected.5, "shared forward typed mismatch on {label}");
+        }
+        let Ok(mut shared_rev) = StretchStore::new(StretchStoreOpts { reserve: 64 << 20, cap: 16 << 20, keep: 1 << 20, alloc: a() }) else {
+            panic!("shared reverse StretchStore reservation failed");
+        };
+        for ((label, task), (_, expected)) in tasks.iter().rev().zip(fresh_results.iter().rev()) {
+            let got = check_once(records, &unused, &shared_frame, task, &mut scratch, Some(&mut shared_rev));
+            assert_eq!(got.0, expected.0, "shared reversed out mismatch on {label}");
+            assert_eq!(got.1, expected.1, "shared reversed failed mismatch on {label}");
+            assert_eq!(got.2, expected.2, "shared reversed findings mismatch on {label}");
+            assert_eq!(got.3, expected.3, "shared reversed reads mismatch on {label}");
+            assert_eq!(got.4, expected.4, "shared reversed locals mismatch on {label}");
+            assert_eq!(got.5, expected.5, "shared reversed typed mismatch on {label}");
+        }
+    }
+
+    #[test]
+    fn stretch_store_cap_rollover_resets_heads_frame_and_preserves_outputs() {
+        use blaze_drive::key::Key;
+        use blaze_engine::{Phase, Planned, Stage};
+        use super::super::head_tests::cells;
+
+        let src = "#![no_std]\npub fn base() -> u8 { 1u8 }\npub fn one() -> u8 { base() }\npub fn two() -> u8 { one() }";
+        let (records, _, body_frame) = world_of(src);
+        let unused = Recorder::new(RecorderOpts { alloc: a() });
+        let base_tables = Tables::new(TablesOpts { records, impls: None, lang_crates: &[CORE_AT], reads: &unused });
+        let base_frame = BodyFrame { frame: body_frame, alloc: a(), plant_drop: None, cost: None, needs: NeedsMet::First, heads: None, sources: None, goals: None, prepared: None, front: None };
+        let seed: &'static _ = body_frame.alloc(super::super::seeds::Freezing::new(records, oracle_heads(base_tables, &base_frame)));
+        let heads = cells(records);
+        fn run_item<'n>(
+            records: &'n super::super::super::source::Records<'n>,
+            unused: &Recorder<'_>,
+            frame: &BodyFrame<'n>,
+            task: &Task,
+            scratch: &mut blaze_mem::Frame,
+            reuse: Option<&mut StretchStore<'n>>,
+        ) -> (ContentId, blaze_own::Vec<TableRead, Alloc<'static>>) {
+            let tables = Tables::new(TablesOpts { records, impls: None, lang_crates: &[CORE_AT], reads: unused });
+            scratch.reset();
+            let erased = blaze_own::Erased::new(&*scratch);
+            let w = erased.handle();
+            let mut rec = Recorder::new(RecorderOpts { alloc: w });
+            let mut enc = AString::new_in(w);
+            let got = match check_body_item(tables, task, frame, w, &mut rec, None, &mut enc, reuse) {
+                Ok(got) => got,
+                Err(error) => panic!("check failed: {error}"),
+            };
+            let mut reads: blaze_own::Vec<TableRead, Alloc<'static>> = blaze_own::Vec::with_capacity_in(got.reads.len(), a());
+            reads.extend_from_slice(got.reads.as_slice());
+            reads.sort_unstable();
+            (got.out, reads)
+        }
+        let frame = BodyFrame { frame: body_frame, alloc: a(), plant_drop: None, cost: None, needs: NeedsMet::First, heads: Some(seed), sources: None, goals: None, prepared: None, front: None };
+        let Ok(mut scratch) = blaze_mem::Frame::with_reserve(32 << 20, blaze_mem::Tag::Diagnostics) else {
+            panic!("test scratch frame reservation failed");
+        };
+        let Ok(mut capped) = StretchStore::new(StretchStoreOpts { reserve: 16 << 20, cap: 1, keep: 4 << 10, alloc: a() }) else {
+            panic!("capped StretchStore reservation failed");
+        };
+        for label in ["base", "one", "two"] {
+            let Some(key) = heads.iter().map(|want| want.key()).find(|&key| records.name_of(key) == Some(label)) else {
+                panic!("missing fixture function {label}");
+            };
+            let task = Task { planned: Planned { name: Name::new(Kind::BodyCheck, key.0), phase: Phase::new(Stage::Bodies, 0), source: ABSENT, file: Name::new(Kind::FileItems, ABSENT) }, key: Key(ABSENT) };
+            let (fresh_out, fresh_reads) = run_item(records, &unused, &frame, &task, &mut scratch, None);
+            let (reused_out, reused_reads) = run_item(records, &unused, &frame, &task, &mut scratch, Some(&mut capped));
+            assert_eq!(reused_out, fresh_out, "capped rollover out mismatch on {label}");
+            assert_eq!(reused_reads, fresh_reads, "capped rollover reads mismatch on {label}");
+            assert_eq!(capped.used(), 0, "heads_frame must be reset after cap rollover on {label}");
+        }
+        assert_eq!(capped.rollovers(), 3, "each body past 1-byte cap must trigger rollover");
     }
 }
 

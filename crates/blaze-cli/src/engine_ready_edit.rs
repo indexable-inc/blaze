@@ -398,6 +398,79 @@ pub(crate) fn choose(driver: Driver, root: Option<&blaze_engine::pages::Root<'_>
     Ok(Chosen::Wake { files: changed.len() })
 }
 
+/// Fast pre-check before `ready_preflight` when the sweep reports a moved `by_script()` leaf
+/// (`ScriptFile`, `ScriptListing`, `ScriptStat`, `ScriptGit`): checks whether any moved or
+/// removed `Kind::Given` cell wakes a `Kind::Script` task whose stored read list saw another
+/// digest (exact short-circuit of [`wake`] + [`forward`] + [`admit`] for
+/// [`PhasesWhy::ScriptRead`]). Avoids running and discarding `ready_setup`, `plan_reach`,
+/// outlining, and `wake` when a build script's checkout read moved.
+pub(crate) fn wakes_script(
+    stored: &Stored<'_>,
+    followed: &crate::sweep::Followed<'_>,
+    tools: &blaze_engine::Tools,
+    alloc: blaze_own::SharedAlloc<'_>,
+) -> Result<bool, CliError> {
+    let given_planned = crate::engine_script_reads::plan(&followed.now, alloc);
+    let mut moved: SVec<'_, Moved> = SVec::new_in(alloc);
+    for (one, answer, _) in given_planned.iter() {
+        let name = one.name;
+        let unchanged = stored
+            .root
+            .files
+            .get(&name)
+            .copied()
+            .flatten()
+            .is_some_and(|was| was == blaze_engine::pages::plan_digest(name, core::slice::from_ref(one), tools, alloc));
+        if unchanged {
+            continue;
+        }
+        let now = [(crate::engine_tasks::WHOLE, *answer)];
+        if let Some(row) = page_for(stored, name, blaze_engine::Ask::Row)?.and_then(|page| page.row(name)) {
+            moved_cells(name, row.defines(), &now, &mut moved);
+        } else {
+            moved_cells(name, core::iter::empty(), &now, &mut moved);
+        }
+    }
+    for &file in stored.root.files.keys() {
+        if file.kind == blaze_drive::Kind::Given
+            && given_planned.binary_search_by_key(&file, |(one, _, _)| one.name).is_err()
+            && let Some(row) = page_for(stored, file, blaze_engine::Ask::Row)?.and_then(|page| page.row(file))
+        {
+            moved_cells(file, row.defines(), &[], &mut moved);
+        }
+    }
+    if moved.is_empty() {
+        return Ok(false);
+    }
+    moved.sort_unstable_by_key(|one| one.id);
+    let mut scripts: SVec<'_, Name> = SVec::new_in(alloc);
+    for item in moved.iter() {
+        let Some(page) = page_for(stored, blaze_engine::pages::readers_slot(&item.id), blaze_engine::Ask::Readers)? else {
+            continue;
+        };
+        scripts.extend(page.readers(&item.id).filter(|name| name.kind == blaze_drive::Kind::Script));
+    }
+    if scripts.is_empty() {
+        return Ok(false);
+    }
+    scripts.sort_unstable();
+    scripts.dedup();
+    for &script in scripts.iter() {
+        let Some(row) = page_for(stored, script, blaze_engine::Ask::Row)?.and_then(|page| page.row(script)) else {
+            continue;
+        };
+        for (read, digest) in row.reads() {
+            if let Ok(at) = moved.binary_search_by(|one| one.id.cmp(&read))
+                && let Some(entry) = moved.get(at)
+                && entry.now != digest
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// The edit's scope on `Ready`: exactly the names the forward wake entered ([`forward`]'s
 /// `entering`, sorted and each once), and nothing else. A task outside it keeps its stored row:
 /// the precondition ([`choose`]) admitted only edits whose every other row the stored answer

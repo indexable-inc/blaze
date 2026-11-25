@@ -31,7 +31,7 @@ use blaze_id::{ContentId, CrateItemKey, ItemKey};
 use blaze_ladder::front2::source::{Load, LoadedExpansion};
 use blaze_own::{AVec, Alloc, Bump, SharedAlloc, Vec};
 use blaze_scope::items_record::{CurrentFile, ItemsRecordError, VerifiedItems};
-use blaze_scope::names_record::{NamesRecordError, Verified};
+use blaze_scope::names_record::{NamesRecordError, Verified, VerifiedModules};
 use blaze_scope::package_path::PackagePath;
 use blaze_scope::resolve::SourceTexts;
 use bstd::cx::Cx;
@@ -142,6 +142,31 @@ pub(crate) fn checked_records<'n>(
     Ok(CrateRecords { key, file_slots: &[], names, names_proof, items, items_proof, edition, expansions })
 }
 
+/// O(1) lazy-validated variant of [`checked_records`] for in-place local CAS records
+/// (`engine_records::InPlace`): verifies headers, alignment, all section bounds, column headers,
+/// crate keys, edition, `CrateRoot`, and expansion directory upfront, deferring module scope
+/// `ScopeView::read`, variant UTF-8, and `ItemsRecord` string UTF-8 checks until accessed.
+pub(crate) fn checked_records_lazy<'n>(
+    name: Name,
+    key: CrateItemKey,
+    names: &'n [u8],
+    items: &'n [u8],
+    expansions: &'n [u8],
+) -> Result<CrateRecords<'n>, LoadError> {
+    let expansions = ExpansionTexts::open(expansions).map_err(|error| LoadError::Expansions { name, error })?;
+    let names_proof = Verified::check_header(names).map_err(|error| LoadError::Names { name, error })?;
+    let found = names_proof.key();
+    if found != key {
+        return Err(LoadError::OtherCrate { name, asked: key, found, which: "names" });
+    }
+    let items_proof = VerifiedItems::check_header(items).map_err(|error| LoadError::Items { name, error })?;
+    let (found, edition) = (items_proof.key(), items_proof.edition());
+    if found != key {
+        return Err(LoadError::OtherCrate { name, asked: key, found, which: "items" });
+    }
+    Ok(CrateRecords { key, file_slots: &[], names, names_proof, items, items_proof, edition, expansions })
+}
+
 /// The crate `key`'s sections from the record `input` names, read from `store` by its key
 /// (`input.at`) in place and copied into `alloc` ([`crate_records`]). Expansion text records are
 /// opened later by `StoreLoad::expansion`.
@@ -211,6 +236,9 @@ impl CachedPackFileItems {
 
 struct OpenedCrate<'r> {
     records: CrateRecords<'r>,
+    /// Shared lock-free per-module verification bitmap for lazy `names_proof`, populated once per
+    /// accessed module across all workers of the request.
+    module_cache: VerifiedModules<'r, SharedAlloc<'static>>,
     /// Per-file `FileItems` cache for immutable pack crates (indexed by `file_index`).
     pack_files: blaze_own::Vec<OnceLock<CachedPackFileItems>, blaze_own::SharedAlloc<'static>>,
 }
@@ -312,7 +340,7 @@ impl<'r> ScopeRecords<'r> {
 
     /// Crate `one`'s records: opened at the first ask, the same after; `Err`: the words of why
     /// its record did not open, the same for every ask.
-    fn records(&self, one: &Unopened) -> Result<CrateRecords<'r>, &'static str> {
+    fn records<'s>(&'s self, one: &Unopened) -> Result<CrateRecords<'s>, &'static str> {
         use core::sync::atomic::Ordering::Relaxed;
         self.asks.fetch_add(1, Relaxed);
         let Some(slot) = self.slots.get(one.world_at) else {
@@ -324,13 +352,17 @@ impl<'r> ScopeRecords<'r> {
             self.opened.fetch_add(counts.records, Relaxed);
             self.bytes.fetch_add(counts.bytes, Relaxed);
             read.map(|records| {
+                let module_cache = records.names_proof.new_module_cache(self.heap.shared());
                 let nfiles = records.items_proof.files();
                 let pack_files = blaze_own::Vec::from_iter_in((0..nfiles).map(|_| OnceLock::new()), self.heap.shared());
-                OpenedCrate { records, pack_files }
+                OpenedCrate { records, module_cache, pack_files }
             })
             .map_err(|why| crate::engine_head_notes::leak(self.heap.alloc(), format_args!("{why}")))
         });
-        opened.as_ref().map(|o| o.records).map_err(|&e| e)
+        opened
+            .as_ref()
+            .map(|o| CrateRecords { names_proof: o.records.names_proof.bind_cache(&o.module_cache), ..o.records })
+            .map_err(|&e| e)
     }
 
     /// The one read of crate `one`'s record: from the snapshot by its key, in place, opened.
@@ -569,6 +601,22 @@ impl<'n> StoreLoad<'n> {
         alloc: Alloc<'n>,
     ) -> Self {
         let (texts, digests) = texts.split();
+        let crates = match crates {
+            CratesFrom::ByNeed { mut own, rest, records } => {
+                if own.names_proof.needs_module_cache() {
+                    own.names_proof = own.names_proof.bind_bump_cache(bump);
+                }
+                CratesFrom::ByNeed { own, rest, records }
+            }
+            CratesFrom::Opened(list) if list.iter().any(|one| one.names_proof.needs_module_cache()) => {
+                let mut bound = Vec::with_capacity_in(list.len(), bump);
+                for &one in list.iter() {
+                    bound.push(CrateRecords { names_proof: one.names_proof.bind_bump_cache(bump), ..one });
+                }
+                CratesFrom::Opened(bound.into_bump_slice())
+            }
+            CratesFrom::Opened(list) => CratesFrom::Opened(list),
+        };
         StoreLoad { crates, refused: core::cell::Cell::new(None), packages, texts, digests, snapshot, expansion_keys, outlines, unserved: RefCell::new(AVec::new_in(alloc)), alloc, bump }
     }
 
