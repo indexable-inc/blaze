@@ -10,6 +10,9 @@
 //! | [`parser`] | the vt100.net state machine as ghostty runs it, UTF-8 in ground, events to a [`parser::Sink`] | built |
 //! | `utf8` | the decoder: one code point per call, U+FFFD for each maximal invalid subpart | built |
 //! | [`style`] | a cell's style: colours by source (unset, palette, RGB), underline styles, flags | built |
+//! | [`sgr`] | SGR parameters to attributes (colon groups on 4, 38, 48, 58), applied to a [`style::Style`] | built |
+//! | [`color`] | colour specs (`rgb:`, `rgbi:`, `#…`, X11 names), the default and dynamic palettes, `rgb:` reply forms | built |
+//! | [`osc`] | an OSC payload to a command (every OSC ghostty parses), and the bytes a colour query replies | built |
 //!
 //! The screen, terminal, SGR, OSC, DCS, kitty and input modules are written in lanes against
 //! these interfaces (vt.md, "Modules").
@@ -23,7 +26,10 @@
 #[cfg(test)]
 extern crate std;
 
+pub mod color;
+pub mod osc;
 pub mod parser;
+pub mod sgr;
 pub mod style;
 mod utf8;
 
