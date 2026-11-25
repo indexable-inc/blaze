@@ -35,9 +35,9 @@ fn the_shelf_holds_llvm_nm() {
 /// shelf is not refused. Prints "shelf missing: bin/llvm-nm".
 #[test]
 fn a_shelf_without_llvm_nm_is_refused_by_name() {
-    assert_eq!(shelf_missing(|member| member != "bin/llvm-nm"), Some("bin/llvm-nm"));
-    assert_eq!(shelf_missing(|_| true), None);
-    println!("shelf missing: {}", shelf_missing(|member| member != "bin/llvm-nm").unwrap_or("nothing"));
+    assert_eq!(shelf_missing("aarch64-apple-darwin", |member| member != "bin/llvm-nm"), Some("bin/llvm-nm"));
+    assert_eq!(shelf_missing("aarch64-apple-darwin", |_| true), None);
+    println!("shelf missing: {}", shelf_missing("aarch64-apple-darwin", |member| member != "bin/llvm-nm").unwrap_or("nothing"));
 }
 
 /// The checked-in table's nm row: the shelf's `bin/llvm-nm`, named by `NM`, granted to
@@ -93,30 +93,30 @@ fn the_script_env_has_nm_from_the_table() {
 #[test]
 fn a_shelf_row_is_refused_unless_whole() {
     let alloc = blaze_own::testing::heap().alloc();
-    const PINS: &str = r#"{"shelf_programs": {"t": {"llvm-ar": {"member": "L/bin/llvm-ar", "sha256": "0000000000000000000000000000000000000000000000000000000000000000"}, "llvm-nm": {"member": "L/bin/llvm-nm", "sha256": "0000000000000000000000000000000000000000000000000000000000000000"}, "names": "llvm-ar llvm-nm"}}, "#;
+    const PINS: &str = r#"{"shelf_programs": {"aarch64-apple-darwin": {"llvm-ar": {"member": "LLVM-23.1.4-macOS-ARM64/bin/llvm-ar", "sha256": "0000000000000000000000000000000000000000000000000000000000000000"}, "llvm-nm": {"member": "LLVM-23.1.4-macOS-ARM64/bin/llvm-nm", "sha256": "0000000000000000000000000000000000000000000000000000000000000000"}, "names": "llvm-ar llvm-nm"}}, "#;
     let row = |body: &str| {
         let mut text = blaze_own::String::new_in(alloc);
         text.push_str(PINS);
-        text.push_str(r#""host_tools": {"t": {"nm": {"#);
+        text.push_str(r#""host_tools": {"aarch64-apple-darwin": {"nm": {"#);
         text.push_str(body);
         text.push_str(r#", "reads": "", "runs": "", "needed_by": "x", "runs_out_dir": "no"}, "names": "nm"}}}"#);
         text
     };
-    let refused = |field: &'static str| Some(HostToolError::Malformed { target: "t", tool: "nm", field });
+    let refused = |field: &'static str| Some(HostToolError::Malformed { target: "aarch64-apple-darwin", tool: "nm", field });
     let no_row = row(r#""shelf": "nm", "env": "NM""#);
-    assert_eq!(host_tools(no_row.as_str(), "t", alloc).err(), refused("shelf"));
+    assert_eq!(host_tools(no_row.as_str(), "aarch64-apple-darwin", alloc).err(), refused("shelf"));
     let no_env = row(r#""shelf": "llvm-nm""#);
-    assert_eq!(host_tools(no_env.as_str(), "t", alloc).err(), refused("env"));
+    assert_eq!(host_tools(no_env.as_str(), "aarch64-apple-darwin", alloc).err(), refused("env"));
     let both = row(r#""path": "/usr/bin/nm", "shelf": "llvm-nm", "env": "NM""#);
-    assert_eq!(host_tools(both.as_str(), "t", alloc).err(), refused("shelf"));
+    assert_eq!(host_tools(both.as_str(), "aarch64-apple-darwin", alloc).err(), refused("shelf"));
     let lower = row(r#""shelf": "llvm-nm", "env": "nm""#);
-    assert_eq!(host_tools(lower.as_str(), "t", alloc).err(), refused("env"));
+    assert_eq!(host_tools(lower.as_str(), "aarch64-apple-darwin", alloc).err(), refused("env"));
     let whole = row(r#""shelf": "llvm-nm", "env": "NM""#);
-    let tools = host_tools(whole.as_str(), "t", alloc).expect("a whole row");
+    let tools = host_tools(whole.as_str(), "aarch64-apple-darwin", alloc).expect("a whole row");
     assert_eq!((tools[0].place, tools[0].path), (Place::Shelf, "bin/llvm-nm"));
     let mut twice = blaze_own::String::new_in(alloc);
     twice.push_str(PINS);
-    twice.push_str(r#""host_tools": {"t": {"ar": {"shelf": "llvm-ar", "env": "NM", "reads": "", "runs": "", "needed_by": "x", "runs_out_dir": "no"}, "nm": {"shelf": "llvm-nm", "env": "NM", "reads": "", "runs": "", "needed_by": "x", "runs_out_dir": "no"}, "names": "ar nm"}}}"#);
-    assert_eq!(host_tools(twice.as_str(), "t", alloc).err(), refused("env"));
+    twice.push_str(r#""host_tools": {"aarch64-apple-darwin": {"ar": {"shelf": "llvm-ar", "env": "NM", "reads": "", "runs": "", "needed_by": "x", "runs_out_dir": "no"}, "nm": {"shelf": "llvm-nm", "env": "NM", "reads": "", "runs": "", "needed_by": "x", "runs_out_dir": "no"}, "names": "ar nm"}}}"#);
+    assert_eq!(host_tools(twice.as_str(), "aarch64-apple-darwin", alloc).err(), refused("env"));
     println!("shelf rows refused: no row, no env, both, lower case, twice");
 }

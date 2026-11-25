@@ -70,6 +70,7 @@ fn bindgen_is_told_the_shelf_resource_dir() {
     let shelf = "/h/.blaze/v2/toolchain/clang/5d3179db";
     let c = CInputs {
         shelf: Shelf { dir: shelf, clang_major: major },
+        target: "aarch64-apple-darwin",
         sysroot: "/sdk",
         out_dir: "/o",
         package: "/p",

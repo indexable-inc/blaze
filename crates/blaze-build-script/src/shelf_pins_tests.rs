@@ -96,17 +96,17 @@ fn a_tool_with_no_row_cannot_be_granted() {
     assert_eq!((nm.place, nm.path), (Place::Shelf, "bin/llvm-nm"));
     let table = |shelf: &str| {
         let mut text = blaze_own::String::new_in(alloc);
-        text.push_str(r#"{"shelf_programs": {"t": {"libclang.dylib": {"member": "L/lib/libclang.dylib", "sha256": "0000000000000000000000000000000000000000000000000000000000000000"}, "llvm-nm": {"member": "L/bin/llvm-nm", "sha256": "0000000000000000000000000000000000000000000000000000000000000000"}, "names": "libclang.dylib llvm-nm"}}, "host_tools": {"t": {"nm": {"shelf": ""#);
+        text.push_str(r#"{"shelf_programs": {"aarch64-apple-darwin": {"libclang.dylib": {"member": "LLVM-23.1.4-macOS-ARM64/lib/libclang.dylib", "sha256": "0000000000000000000000000000000000000000000000000000000000000000"}, "llvm-nm": {"member": "LLVM-23.1.4-macOS-ARM64/bin/llvm-nm", "sha256": "0000000000000000000000000000000000000000000000000000000000000000"}, "names": "libclang.dylib llvm-nm"}}, "host_tools": {"aarch64-apple-darwin": {"nm": {"shelf": ""#);
         text.push_str(shelf);
         text.push_str(r#"", "env": "NM", "reads": "", "runs": "", "needed_by": "x", "runs_out_dir": "no"}, "names": "nm"}}}"#);
         text
     };
-    let refused = Some(HostToolError::Malformed { target: "t", tool: "nm", field: "shelf" });
+    let refused = Some(HostToolError::Malformed { target: "aarch64-apple-darwin", tool: "nm", field: "shelf" });
     let pinned = table("llvm-nm");
-    assert_eq!(host_tools(pinned.as_str(), "t", alloc).expect("a pinned row")[0].path, "bin/llvm-nm");
+    assert_eq!(host_tools(pinned.as_str(), "aarch64-apple-darwin", alloc).expect("a pinned row")[0].path, "bin/llvm-nm");
     let no_row = table("llvm-objdump");
-    assert_eq!(host_tools(no_row.as_str(), "t", alloc).err(), refused);
+    assert_eq!(host_tools(no_row.as_str(), "aarch64-apple-darwin", alloc).err(), refused);
     let not_program = table("libclang.dylib");
-    assert_eq!(host_tools(not_program.as_str(), "t", alloc).err(), refused);
+    assert_eq!(host_tools(not_program.as_str(), "aarch64-apple-darwin", alloc).err(), refused);
     println!("shelf grants: nm is bin/llvm-nm; no row, not a program: refused");
 }

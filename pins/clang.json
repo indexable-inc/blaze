@@ -15,11 +15,26 @@
       "name": "LLVM-23.1.4-Linux-ARM64.tar.xz",
       "size": 1829686400,
       "sha256": "9b27cf263d711aa6ebfd4045ab241d947bd09b3cd19ffa5728f48a80c9eb3a91"
+    },
+    "x86_64-unknown-linux-gnu": {
+      "name": "LLVM-23.1.4-Linux-X64.tar.xz",
+      "size": 2017061664,
+      "sha256": "25d814fda50d5fb0084b42be09605d8b1595d49d5e2e03a3345d7e112ff6f9f3"
     }
   },
   "sysroots": {
     "aarch64-apple-darwin": "macos-sdk",
-    "aarch64-unknown-linux-gnu": null
+    "aarch64-unknown-linux-gnu": null,
+    "x86_64-unknown-linux-gnu": "9111b9f18ba1e036f109f15523d428b62e6f225079d5a7c2675a561b10e57e5e"
+  },
+  "sysroot_blobs_comment": "D69: where a pinned sysroot's bytes come from. The blob is a deterministic tar (sorted, mtime 0, owner 0) of the sysroot folder; its SHA-256 is the sysroots row above and the folder's name on the shelf (<home>/.blaze/v2/toolchain/sysroot/<sha256>). `source` names the inputs (pinned Ubuntu noble .debs, their own SHA-256s in the run's evidence); the assembled blob is fetched by an explicit path or URL, never searched for.",
+  "sysroot_blobs": {
+    "x86_64-unknown-linux-gnu": {
+      "name": "glibc-sysroot-x86_64-unknown-linux-gnu.tar",
+      "size": 35758080,
+      "sha256": "9111b9f18ba1e036f109f15523d428b62e6f225079d5a7c2675a561b10e57e5e",
+      "source": "Ubuntu 24.04 (noble) .debs: libc6 2.39-0ubuntu8.12, libc6-dev 2.39-0ubuntu8.12, linux-libc-dev 6.8.0-151.151, libgcc-13-dev 13.3.0-6ubuntu2~24.04.1, libgcc-s1 14.2.0-4ubuntu2~24.04.1"
+    }
   },
   "shelf_programs_comment": "shelf-pins: each program placed on a host's shelf, pinned one by one beside the archive's digest: per program row, `member` is its path in the archive and `sha256` the member's own SHA-256; its place on the shelf is the member without the archive's top folder (one of blaze_build_script::toolchain::SHELF_MEMBERS). The step that places a program checks the extracted member against its row and refuses it by name when no row pins it or the digest differs (blaze_build_script::shelf_pins::place_member). A host tool's `shelf` names one of these rows. `names` is sorted and each row's last field.",
   "shelf_programs": {
@@ -48,6 +63,29 @@
     },
     "aarch64-unknown-linux-gnu": {
       "names": ""
+    },
+    "x86_64-unknown-linux-gnu": {
+      "clang-23": {
+        "member": "LLVM-23.1.4-Linux-X64/bin/clang-23",
+        "sha256": "c336d48383874cffaab0dc4c5c359456d871f21380b746520dde5c7f4c125a67"
+      },
+      "libclang.so": {
+        "member": "LLVM-23.1.4-Linux-X64/lib/libclang.so.23.1.4",
+        "sha256": "8a03b201bb15a628412c815e76e72ad0d5460cf9ae76637aace6e05f91882bf7"
+      },
+      "lld": {
+        "member": "LLVM-23.1.4-Linux-X64/bin/lld",
+        "sha256": "0f8d53acaf6ff4990506a26739c12fb90315fdcc0430ec4c305ca75115774d4b"
+      },
+      "llvm-ar": {
+        "member": "LLVM-23.1.4-Linux-X64/bin/llvm-ar",
+        "sha256": "b4a89f7b23b7b8bc552a2250fc7a76557391d79dce97ab8b454ac405cd6b6a5a"
+      },
+      "llvm-nm": {
+        "member": "LLVM-23.1.4-Linux-X64/bin/llvm-nm",
+        "sha256": "fdf8ea7903fc2597095525148d9850109fa5c742974528969a6fdbae268424d2"
+      },
+      "names": "clang-23 libclang.so lld llvm-ar llvm-nm"
     }
   },
   "host_tools_comment": "D71: the only programs other than the C toolchain a native build script may start, per host target. `names`: the tools, space-separated, sorted. Per tool: `path`, the resolved real path (no link), granted read and execute; `reads`, space-separated folders its runtime needs, granted read-only (perl: libperl.dylib, privlib and archlib are /System/Library/Perl/<v>, vendorlib /System/Library/Perl/Extras/<v>, from libperl's own Config.pm; the site folder /Library/Perl is NOT granted: user-installed modules are not keyed); `runs`, space-separated real paths of the programs the tool itself starts, granted execute and each keyed by its digest (perl's piped `open` of a command with a quote in it, as cryptogams' keccak1600-armv8.pl opens arm-xlate.pl, starts /bin/sh, which reads the link /private/var/select/sh and starts /bin/bash on this host); `needed_by`, the scripts' packages known to start it, space-separated, sorted; `runs_out_dir`, yes or no: whether the tool starts programs the script wrote under its OUT_DIR, so the script's sandbox may start anything there and the pinned linker (D112: sh runs tikv-jemalloc-sys's configure, which compiles, links and runs its test programs). nm-row: a row gives its program either as `path` (on the machine) or as `shelf` (the name of its program's row in `shelf_programs`, which pins the archive member by digest and gives its place on the shelf; a tool with no row cannot be granted, shelf-pins: nm is the row llvm-nm, the shelf's bin/llvm-nm, from the same LLVM as its clang and lld, never the machine's /usr/bin/nm xcrun shim); `env`, where given, is the variable the script is told the program's real path in (NM), and that row's folder is not on PATH; a shelf row must give one. make is the real binary xcrun resolves /usr/bin/make to (the shim and xcrun are not granted); make's runs are what jemalloc's Makefile.in recipes start with no shell (GNU make execs a recipe line holding no shell syntax directly: `@mkdir -p`, `rm -f`, `ln -sf`, `echo`, `@touch`, `@true`, `$(INSTALL)`); sh's runs are what jemalloc's configure, config.sub, Makefile recipes and include scripts start, read from their text. The tool's binary digest and its row's `runs_out_dir` are in the run key and the record is marked `host-tool`: it never enters the shared cache. `interim`: a row whose grant widens the sandbox (runs_out_dir yes) says it holds only for D112's interim, records local (checked by host_tools' tests). Read by blaze_build_script::host_tools.",
@@ -100,6 +138,9 @@
       "names": "hostname make nm perl sh uname"
     },
     "aarch64-unknown-linux-gnu": {
+      "names": ""
+    },
+    "x86_64-unknown-linux-gnu": {
       "names": ""
     }
   }

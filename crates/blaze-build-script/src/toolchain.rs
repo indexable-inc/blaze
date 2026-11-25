@@ -193,25 +193,45 @@ impl<'s> Shelf<'s> {
     }
 }
 
-/// What the shelf holds of the pinned archive, each under the archive's top folder
-/// (`LLVM-23.1.4-macOS-ARM64/`), sorted: the unpack list's one home. The compilers, the linker
-/// (`ld64.lld`, a link to `lld`), `llvm-ar` (`AR`), `llvm-nm` (nm-row: `NM`, the host-tool row
-/// `nm` in the pin table: tikv-jemalloc-sys's configure dumps symbols with it), libclang and its
-/// resource folder. `bin/clang.cfg` and `bin/clang++.cfg` are written on the shelf, not unpacked.
+/// What the shelf holds of the pinned archive for an Apple host, each under the archive's top
+/// folder (`LLVM-23.1.4-macOS-ARM64/`), sorted: the unpack list's one home. The compilers, the
+/// linker (`ld64.lld`, a link to `lld`), `llvm-ar` (`AR`), `llvm-nm` (nm-row: `NM`, the
+/// host-tool row `nm` in the pin table: tikv-jemalloc-sys's configure dumps symbols with it),
+/// libclang and its resource folder. `bin/clang.cfg` and `bin/clang++.cfg` are written on the
+/// shelf, not unpacked.
 pub const SHELF_MEMBERS: [&str; 9] =
     ["bin/clang", "bin/clang++", "bin/clang-23", "bin/ld64.lld", "bin/lld", "bin/llvm-ar", "bin/llvm-nm", "lib/clang", "lib/libclang.dylib"];
 
-/// The first of [`SHELF_MEMBERS`] that `present` (the caller's look at `<shelf>/<member>`) says
-/// the shelf lacks, by name: a shelf unpacked before a member was added is refused naming it,
-/// never run without it. `None` when every member is there. Sans-IO.
-pub fn shelf_missing(mut present: impl FnMut(&str) -> bool) -> Option<&'static str> {
-    SHELF_MEMBERS.into_iter().find(|member| !present(*member))
+/// The Linux x86-64 shelf's members (D69): `ld.lld` (not `ld64.lld`) and the real
+/// `lib/libclang.so` (a link to `libclang.so.23.1.4` in the archive; the shelf holds the real
+/// file's bytes so nothing on the shelf dangles).
+pub const X86_64_LINUX_SHELF_MEMBERS: [&str; 9] =
+    ["bin/clang", "bin/clang++", "bin/clang-23", "bin/ld.lld", "bin/lld", "bin/llvm-ar", "bin/llvm-nm", "lib/clang", "lib/libclang.so"];
+
+/// `target`'s shelf member list: every member the shelf of its pinned archive must hold.
+pub fn shelf_members(target: &str) -> &'static [&'static str] {
+    match target {
+        "aarch64-apple-darwin" => &SHELF_MEMBERS,
+        "x86_64-unknown-linux-gnu" => &X86_64_LINUX_SHELF_MEMBERS,
+        _ => &[],
+    }
+}
+
+/// The first of [`shelf_members`]`(target)` that `present` (the caller's look at
+/// `<shelf>/<member>`) says the shelf lacks, by name: a shelf unpacked before a member was
+/// added is refused naming it, never run without it. `None` when every member is there.
+/// Sans-IO.
+pub fn shelf_missing(target: &str, mut present: impl FnMut(&str) -> bool) -> Option<&'static str> {
+    shelf_members(target).iter().copied().find(|member| !present(*member))
 }
 
 /// What a native script's C environment is made from.
 #[derive(Clone, Copy, Debug)]
 pub struct CInputs<'c> {
     pub shelf: Shelf<'c>,
+    /// The host target the script builds for: selects the flag shape (`-isysroot` and a
+    /// deployment target on Apple hosts, `--sysroot` on Linux ones).
+    pub target: &'c str,
     /// The macOS SDK folder (resolved once outside the sandbox), or a pinned sysroot's.
     pub sysroot: &'c str,
     /// The script's `OUT_DIR` and package folder, as the process sees them.
@@ -220,8 +240,16 @@ pub struct CInputs<'c> {
     /// What the script sees as its root: `package` (the served tree's real folder) is mapped to
     /// its `mount()`, the same path the script was told (D96).
     pub seen: SeenRoot<'c>,
-    /// The deployment target the record is keyed by.
+    /// The deployment target the record is keyed by (Apple hosts only).
     pub macos_min: &'c str,
+}
+
+impl CInputs<'_> {
+    /// Whether the host is an Apple one: the sysroot flag is `-isysroot` with a deployment
+    /// target; a Linux host takes `--sysroot` and none.
+    pub fn apple(&self) -> bool {
+        self.target.ends_with("-apple-darwin")
+    }
 }
 
 /// The macOS deployment target every script is given (`MACOSX_DEPLOYMENT_TARGET`, crate::env
@@ -246,30 +274,40 @@ pub fn c_env<'a>(c: &CInputs<'_>, alloc: Alloc<'a>) -> AVec<'a, (AString<'a>, AS
         out
     };
     let [clang, clangxx, ar] = c.shelf.programs(alloc);
-    let flags = text(&[
-        "-isysroot ",
-        c.sysroot,
-        " -ffile-prefix-map=",
-        c.out_dir,
-        "=/out -ffile-prefix-map=",
-        c.package,
-        "=",
-        c.seen.mount(),
-        " -fdebug-compilation-dir=. -MD -Wno-unused-command-line-argument",
-    ]);
+    let common = |prefix: &str, alloc: Alloc<'a>| {
+        text(&[
+            prefix,
+            c.sysroot,
+            " -ffile-prefix-map=",
+            c.out_dir,
+            "=/out -ffile-prefix-map=",
+            c.package,
+            "=",
+            c.seen.mount(),
+            " -fdebug-compilation-dir=. -MD -Wno-unused-command-line-argument",
+        ])
+    };
+    let cflags = if c.apple() { common("-isysroot ", alloc) } else { common("--sysroot=", alloc) };
     let mut env: AVec<'a, (AString<'a>, AString<'a>)> = Vec::new_in(alloc);
     let mut put = |k: &str, v: AString<'a>| env.push((text(&[k]), v));
     put("AR", ar);
     // D112 N5: libclang in the script's process finds no builtin headers by itself.
     let resource_dir = c.shelf.resource_dir(alloc);
-    put("BINDGEN_EXTRA_CLANG_ARGS", text(&["-isysroot ", c.sysroot, " -resource-dir ", resource_dir.as_str()]));
+    let bindgen_flags = if c.apple() {
+        text(&["-isysroot ", c.sysroot, " -resource-dir ", resource_dir.as_str()])
+    } else {
+        text(&["--sysroot=", c.sysroot, " -resource-dir ", resource_dir.as_str()])
+    };
+    put("BINDGEN_EXTRA_CLANG_ARGS", bindgen_flags);
     put("CC", clang);
-    put("CFLAGS", flags.clone());
+    put("CFLAGS", cflags.clone());
     put("CXX", clangxx);
-    put("CXXFLAGS", flags);
+    put("CXXFLAGS", cflags);
     put("LIBCLANG_PATH", text(&[c.shelf.dir, "/lib"]));
-    put("MACOSX_DEPLOYMENT_TARGET", text(&[c.macos_min]));
-    put("SDKROOT", text(&[c.sysroot]));
+    if c.apple() {
+        put("MACOSX_DEPLOYMENT_TARGET", text(&[c.macos_min]));
+        put("SDKROOT", text(&[c.sysroot]));
+    }
     put("SOURCE_DATE_EPOCH", text(&["0"]));
     env
 }

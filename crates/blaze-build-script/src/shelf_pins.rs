@@ -22,7 +22,7 @@ use blaze_own::{AVec, Alloc, Vec};
 
 use blaze_pins::CLANG_PATH;
 
-use crate::toolchain::{SHELF_MEMBERS, hex32, object, scalar};
+use crate::toolchain::{hex32, object, scalar, shelf_members};
 
 /// One program's row: the archive member and its SHA-256.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -108,7 +108,7 @@ fn program_row<'t>(row: &'t str, target: &'t str, program: &'t str) -> Result<Sh
     }
     let member = scalar(body, "member").ok_or(malformed("member"))?;
     let shelf_path = match member.split_once('/') {
-        Some((top, rest)) if !top.is_empty() && SHELF_MEMBERS.iter().any(|m| *m == rest) => rest,
+        Some((top, rest)) if !top.is_empty() && shelf_members(target).iter().any(|m| *m == rest) => rest,
         _ => return Err(malformed("member")),
     };
     let sha256 = scalar(body, "sha256").and_then(hex32).ok_or(malformed("sha256"))?;
