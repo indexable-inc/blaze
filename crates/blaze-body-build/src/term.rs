@@ -20,7 +20,7 @@ use crate::value::At;
 use crate::{BuildError, Cx, Pass, Track, V};
 
 /// Maps a fn-pointer's surface ABI onto the calling convention plan (matching `blaze-build`).
-fn pointer_abi(abi: blaze_typeck::Abi) -> Option<Abi> {
+pub(crate) fn pointer_abi(abi: blaze_typeck::Abi) -> Option<Abi> {
     match abi {
         blaze_typeck::Abi::Rust
         | blaze_typeck::Abi::RustCold

@@ -93,6 +93,7 @@ pub fn elaborate_planted<F: DropFacts, A: Allocator + Copy>(
         v: body,
         facts,
         plant,
+        alloc,
         b: BodyBuilder::new_in(alloc),
         flags: Vec::new_in(alloc),
         chains: Vec::new_in(alloc),
@@ -176,6 +177,7 @@ struct Elab<'v, 'f, F: DropFacts, A: Allocator + Copy> {
     v: Verified<'v>,
     facts: &'f F,
     plant: Plant,
+    alloc: A,
     b: BodyBuilder<A>,
     flags: Vec<Flag, A>,
     chains: Vec<Place, A>,
@@ -570,7 +572,15 @@ impl<F: DropFacts, A: Allocator + Copy> Elab<'_, '_, F, A> {
                 }
             }
         }
+        // Visit input blocks in statement-start order so loans and subsets (both recorded in
+        // original emission order) replay with identical IDs even when blocks were filled out of
+        // block-index order.
+        let mut block_order: Vec<u32, A> = Vec::with_capacity_in(usize::try_from(v.blocks()).unwrap_or(0), self.alloc);
         for bi in 0..v.blocks() {
+            block_order.push(bi);
+        }
+        block_order.sort_unstable_by_key(|&bi| v.block(Block(bi)).stmts.start);
+        for &bi in block_order.iter() {
             let block = Block(bi);
             let row = v.block(block);
             self.b.start(block);

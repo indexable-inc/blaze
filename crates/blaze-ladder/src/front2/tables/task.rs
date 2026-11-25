@@ -2081,6 +2081,44 @@ pub fn keep_frontend_body<'a, P: crate::seam::FrontEnd>(
     blaze_body_lower::keep(&view, done, &facts, alloc)
 }
 
+/// D119 Wave 5: lowers and encodes the `ordinal`-th closure body inside fn row `fn_index`
+/// into a verified kept body record (`blaze_body::kept`).
+pub fn keep_frontend_closure_body<'a, P: crate::seam::FrontEnd>(
+    program: &P,
+    fn_index: usize,
+    ordinal: u32,
+    done: &blaze_typeck::Checked<'_>,
+    checked: &[Option<blaze_typeck::Checked<'static>>],
+    alloc: Alloc<'a>,
+) -> Result<AVec<'a, u8>, blaze_body_lower::KeepError> {
+    let function = program.function(fn_index);
+    let Some((body, _)) = function.body else {
+        return Err(blaze_body_lower::KeepError::Lower(blaze_body_lower::LowerError {
+            construct: blaze_body_lower::Construct::Malformed,
+            at: blaze_body_lower::At::Body,
+            range: blaze_typeck::Range { start: 0, end: 0 },
+        }));
+    };
+    let view = body.view(program.body_types(fn_index));
+    let Some(closure_expr) = view
+        .exprs
+        .iter()
+        .enumerate()
+        .filter(|(_, x)| matches!(x, blaze_typeck::Expr::Closure { .. }))
+        .nth(usize::try_from(ordinal).unwrap_or(usize::MAX))
+        .and_then(|(idx, _)| u32::try_from(idx).ok().map(blaze_typeck::ExprId))
+    else {
+        return Err(blaze_body_lower::KeepError::Lower(blaze_body_lower::LowerError {
+            construct: blaze_body_lower::Construct::Malformed,
+            at: blaze_body_lower::At::Body,
+            range: blaze_typeck::Range { start: 0, end: 0 },
+        }));
+    };
+    let facts = FrontEndKeepFacts { program, fn_index, owner: function.key, done, checked, alloc };
+    let lowered = blaze_body_lower::lower_closure(&view, done, &facts, closure_expr, alloc).map_err(blaze_body_lower::KeepError::Lower)?;
+    blaze_body::kept::encode(&lowered, done.types.view(), alloc).map_err(blaze_body_lower::KeepError::Kept)
+}
+
 #[cfg(test)]
 mod kept_body_tests {
     use super::{KeepFacts, KeepValues, sorted_get};
@@ -2211,7 +2249,7 @@ mod kept_body_tests {
 
     // ---- D119 Wave 4 live cutover & side-by-side ladder oracles -----------------------------
 
-    use super::keep_frontend_body;
+    use super::{keep_frontend_body, keep_frontend_closure_body};
     use blaze_own::{AString, AVec, Alloc};
     use core::fmt::Write as _;
 
@@ -2312,6 +2350,172 @@ mod kept_body_tests {
         RungSpec { name: "front2/x0-drop-13-match-temp-in-expr", files: &[("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-drop-13-match-temp-in-expr/src/main.rs"))], expected: 42, has_extern_call: false, eval_skip: false },
         RungSpec { name: "front2/x0-drop-14-if-let-temp", files: &[("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-drop-14-if-let-temp/src/main.rs"))], expected: 42, has_extern_call: false, eval_skip: false },
         RungSpec { name: "front2/x0-static-03-fn-pointers", files: &[("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-static-03-fn-pointers/src/main.rs"))], expected: 42, has_extern_call: false, eval_skip: false },
+        // Wave 5 expanded coverage: closures, drops, drop glue, interior-mutable statics, extern-local, unions, struct update.
+        RungSpec { name: "front2/x0-static-05-interior-mut", files: &[("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-static-05-interior-mut/src/main.rs"))], expected: 0, has_extern_call: true, eval_skip: true },
+        RungSpec { name: "front2/x0-static-02-late-body", files: &[("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-static-02-late-body/src/main.rs"))], expected: 42, has_extern_call: false, eval_skip: false },
+        RungSpec { name: "front2/x0-static-04-generic-field", files: &[("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-static-04-generic-field/src/main.rs"))], expected: 42, has_extern_call: false, eval_skip: false },
+        RungSpec { name: "front2/x0-extern-local-01", files: &[("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-extern-local-01/src/main.rs"))], expected: 42, has_extern_call: true, eval_skip: true },
+        RungSpec {
+            name: "front2/x0-clo-02-by-mut",
+            files: &[
+                ("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-clo-02-by-mut/src/main.rs")),
+                ("src/prelude.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-clo-02-by-mut/src/prelude.rs")),
+            ],
+            expected: 42,
+            has_extern_call: false,
+            eval_skip: false,
+        },
+        RungSpec {
+            name: "front2/x0-clo-03-move-copy",
+            files: &[
+                ("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-clo-03-move-copy/src/main.rs")),
+                ("src/prelude.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-clo-03-move-copy/src/prelude.rs")),
+            ],
+            expected: 42,
+            has_extern_call: false,
+            eval_skip: false,
+        },
+        RungSpec {
+            name: "front2/x0-clo-04-generic-fn",
+            files: &[
+                ("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-clo-04-generic-fn/src/main.rs")),
+                ("src/prelude.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-clo-04-generic-fn/src/prelude.rs")),
+            ],
+            expected: 42,
+            has_extern_call: false,
+            eval_skip: false,
+        },
+        RungSpec {
+            name: "front2/x0-clo-08-fn-pointers",
+            files: &[
+                ("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-clo-08-fn-pointers/src/main.rs")),
+                ("src/prelude.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-clo-08-fn-pointers/src/prelude.rs")),
+            ],
+            expected: 42,
+            has_extern_call: false,
+            eval_skip: false,
+        },
+        RungSpec {
+            name: "front2/x0-clo-09-move-zst-drop",
+            files: &[
+                ("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-clo-09-move-zst-drop/src/main.rs")),
+                ("src/prelude.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-clo-09-move-zst-drop/src/prelude.rs")),
+            ],
+            expected: 42,
+            has_extern_call: false,
+            eval_skip: false,
+        },
+        RungSpec {
+            name: "front2/x0-clo-10-call-zst-drop",
+            files: &[
+                ("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-clo-10-call-zst-drop/src/main.rs")),
+                ("src/prelude.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-clo-10-call-zst-drop/src/prelude.rs")),
+            ],
+            expected: 42,
+            has_extern_call: false,
+            eval_skip: false,
+        },
+        RungSpec {
+            name: "front2/x0-drop-01-locals",
+            files: &[
+                ("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-drop-01-locals/src/main.rs")),
+                ("src/prelude.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-drop-01-locals/src/prelude.rs")),
+            ],
+            expected: 42,
+            has_extern_call: false,
+            eval_skip: false,
+        },
+        RungSpec {
+            name: "front2/x0-drop-02-fields",
+            files: &[
+                ("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-drop-02-fields/src/main.rs")),
+                ("src/prelude.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-drop-02-fields/src/prelude.rs")),
+            ],
+            expected: 42,
+            has_extern_call: false,
+            eval_skip: false,
+        },
+        RungSpec {
+            name: "front2/x0-drop-04-temporaries",
+            files: &[
+                ("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-drop-04-temporaries/src/main.rs")),
+                ("src/prelude.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-drop-04-temporaries/src/prelude.rs")),
+            ],
+            expected: 42,
+            has_extern_call: false,
+            eval_skip: false,
+        },
+        RungSpec {
+            name: "front2/x0-drop-05-reassign",
+            files: &[
+                ("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-drop-05-reassign/src/main.rs")),
+                ("src/prelude.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-drop-05-reassign/src/prelude.rs")),
+            ],
+            expected: 42,
+            has_extern_call: false,
+            eval_skip: false,
+        },
+        RungSpec {
+            name: "front2/x0-drop-07-drop-flags",
+            files: &[
+                ("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-drop-07-drop-flags/src/main.rs")),
+                ("src/prelude.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-drop-07-drop-flags/src/prelude.rs")),
+            ],
+            expected: 42,
+            has_extern_call: false,
+            eval_skip: false,
+        },
+        RungSpec {
+            name: "front2/x0-drop-08-return-break",
+            files: &[
+                ("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-drop-08-return-break/src/main.rs")),
+                ("src/prelude.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-drop-08-return-break/src/prelude.rs")),
+            ],
+            expected: 42,
+            has_extern_call: false,
+            eval_skip: false,
+        },
+        RungSpec {
+            name: "front2/x0-drop-09-partial-move",
+            files: &[
+                ("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-drop-09-partial-move/src/main.rs")),
+                ("src/prelude.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-drop-09-partial-move/src/prelude.rs")),
+            ],
+            expected: 42,
+            has_extern_call: false,
+            eval_skip: false,
+        },
+        RungSpec { name: "front2/x0-dropglue-02-slice", files: &[("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-dropglue-02-slice/src/main.rs"))], expected: 42, has_extern_call: false, eval_skip: false },
+        RungSpec {
+            name: "front2/x0-dyn-05-drop-in-place",
+            files: &[
+                ("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-dyn-05-drop-in-place/src/main.rs")),
+                ("src/prelude.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-dyn-05-drop-in-place/src/prelude.rs")),
+            ],
+            expected: 42,
+            has_extern_call: false,
+            eval_skip: true,
+        },
+        RungSpec {
+            name: "front2/x0-union-01-maybe-uninit-copy",
+            files: &[
+                ("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-union-01-maybe-uninit-copy/src/main.rs")),
+                ("src/prelude.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-union-01-maybe-uninit-copy/src/prelude.rs")),
+            ],
+            expected: 42,
+            has_extern_call: false,
+            eval_skip: false,
+        },
+        RungSpec {
+            name: "front2/x0-struct-update-01",
+            files: &[
+                ("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-struct-update-01/src/main.rs")),
+                ("src/prelude.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-struct-update-01/src/prelude.rs")),
+            ],
+            expected: 42,
+            has_extern_call: false,
+            eval_skip: false,
+        },
     ];
 
     /// Runs `f` with a checked `Front2Program` built from `#![no_core]` source files.
@@ -2729,6 +2933,20 @@ mod kept_body_tests {
         fn bool_ty(&self) -> blaze_typeck::PTy {
             self.bool_ty
         }
+
+        fn project_ty(&self, ty: blaze_typeck::PTy, proj: blaze_body::Proj) -> Option<blaze_typeck::PTy> {
+            use blaze_body::Proj;
+            use blaze_typeck::PNode;
+            let node = self.ty_node(ty)?;
+            match (proj, node) {
+                (Proj::Deref, PNode::Ref(_, inner) | PNode::Ptr(_, inner)) => Some(inner),
+                (Proj::DerefBox, PNode::Adt(_, args)) => self.body.body().ty_list(&self.tys, args).ok()?.iter().next(),
+                (Proj::Index(_) | Proj::ConstIndex { .. }, PNode::Array(elem, _) | PNode::Slice(elem)) => Some(elem),
+                (Proj::Subslice { .. }, PNode::Slice(_)) => Some(ty),
+                (Proj::Downcast(_), _) => Some(ty),
+                _ => None,
+            }
+        }
     }
 
     /// Minimal `blaze_build::Adts` + `LayoutFacts` adapter over `Front2Program` for the side-by-side
@@ -2999,46 +3217,64 @@ mod kept_body_tests {
         let mut const_needs = crate::front2::const_at::Needs::new_in(alloc);
         let mut ground = blaze_typeck::PortableTys::new_in(alloc);
         let entry_item = program.function(entry_row).key;
+        #[derive(Clone, Copy)]
+        enum OracleSlot {
+            Normal,
+            Closure { of: blaze_build::ClosureOf, ty: blaze_typeck::PTy, which: blaze_build::FnTrait },
+            FnShim { callee: blaze_typeck::PTy, tuple: blaze_typeck::PTy, which: blaze_build::FnTrait },
+        }
+
         let mut instances: AVec<'a, blaze_build::Instance> = AVec::new_in(out_alloc);
         let mut funcs: AVec<'a, blaze_build::Built<Alloc<'a>>> = AVec::new_in(out_alloc);
         let mut call_targets: AVec<'a, AVec<'a, u32>> = AVec::new_in(out_alloc);
         let mut static_targets: AVec<'a, AVec<'a, u32>> = AVec::new_in(out_alloc);
         let mut datums: AVec<'a, (ItemKey, AVec<'a, u8>, u8, bool, AVec<'a, blaze_lir::eval::DatumReloc>)> = AVec::new_in(out_alloc);
-        let mut closure_slots: AVec<'a, Option<(blaze_build::ClosureOf, blaze_build::FnTrait)>> = AVec::new_in(out_alloc);
+        let mut slots: AVec<'a, OracleSlot> = AVec::new_in(out_alloc);
         instances.push(blaze_build::Instance { item: entry_item, args: blaze_typeck::List::EMPTY });
-        closure_slots.push(None);
+        slots.push(OracleSlot::Normal);
 
         let mut body_built_count = 0u32;
         let mut cursor = 0usize;
         while cursor < instances.len() {
             let inst = instances[cursor];
-            let closure_info = closure_slots[cursor];
+            let slot = slots[cursor];
             cursor += 1;
-            let i = if let Some((of, _)) = closure_info {
-                let Some(idx) = program.fn_index(of.owner) else {
-                    let mut s = AString::new_in(out_alloc);
-                    let _ = write!(s, "missing closure owner {:?}", of.owner);
-                    return Err(s);
-                };
-                idx
-            } else {
-                let Some(idx) = program.fn_index(inst.item) else {
-                    let mut s = AString::new_in(out_alloc);
-                    let _ = write!(s, "missing fn_index for {:?}", inst.item);
-                    return Err(s);
-                };
-                idx
+            let (i, raw_args_list) = match slot {
+                OracleSlot::Closure { of, .. } => {
+                    let Some(idx) = program.fn_index(of.owner) else {
+                        let mut s = AString::new_in(out_alloc);
+                        let _ = write!(s, "missing closure owner {:?}", of.owner);
+                        return Err(s);
+                    };
+                    (idx, of.owner_args)
+                }
+                OracleSlot::FnShim { callee, .. } => match ground.view().node(callee).ok() {
+                    Some(blaze_typeck::PNode::FnDef(item, fn_args)) => {
+                        let Some(idx) = program.fn_index(item) else {
+                            let mut s = AString::new_in(out_alloc);
+                            let _ = write!(s, "missing fn_shim item {:?}", item);
+                            return Err(s);
+                        };
+                        (idx, fn_args)
+                    }
+                    _ => (entry_row, blaze_typeck::List::EMPTY),
+                },
+                OracleSlot::Normal => {
+                    let Some(idx) = program.fn_index(inst.item) else {
+                        let mut s = AString::new_in(out_alloc);
+                        let _ = write!(s, "missing fn_index for {:?}", inst.item);
+                        return Err(s);
+                    };
+                    (idx, inst.args)
+                }
             };
-            let raw_args = if let Some((of, _)) = closure_info {
-                ground.view().list(of.owner_args).expect("closure owner args")
-            } else {
-                ground.view().list(inst.args).expect("ground args")
-            };
+            let raw_args = ground.view().list(raw_args_list).expect("ground args");
             let mut args_copy = AVec::with_capacity_in(raw_args.len(), alloc);
             args_copy.extend_from_slice(raw_args);
 
             // Pull any generic const / const-block / promoted needs for this instance before building.
             if program.evaluates_at_args()
+                && !matches!(slot, OracleSlot::FnShim { .. })
                 && let Some((body, _)) = program.function(i).body
                 && let Some(done) = checked[i].as_ref()
             {
@@ -3065,101 +3301,193 @@ mod kept_body_tests {
                 let function = program.function(i);
                 let adts = OracleAdts { program: &*program, fn_index: i, checked, closures: &closures, const_at: &const_at, alloc };
                 let mut subst = blaze_build::Subst { args: &args_copy, ground: &mut ground, scratch: alloc };
-                let attempt: Result<blaze_build::Built<Alloc<'a>>, (bool, AString<'a>)> = if let Some((of, which)) = closure_info {
-                    let (body, _) = function.body.expect("closure owner body");
-                    let done = checked[i].as_ref().expect("closure owner checked");
-                    let view = body.view(program.body_types(i));
-                    blaze_build::build_closure(&view, done, of.ordinal, which, &program.sig(i), &mut subst, &adts, out_alloc).map_err(|e| {
-                        let missing = matches!(e, blaze_build::BuildError::Select(blaze_typeck::ResolveError::Missing(_)));
-                        let mut s = AString::new_in(out_alloc);
-                        let _ = write!(s, "closure `{}`#{}: {e}", function.path, of.ordinal);
-                        (missing, s)
-                    })
-                } else if matches!(function.kind, FnKind::Foreign) {
-                    let mut s = AString::new_in(out_alloc);
-                    let _ = write!(s, "extern fn `{}`", function.path);
-                    Err((false, s))
-                } else if let Some((_, variant)) = program.ctor_of(function.key) {
-                    blaze_build::build_ctor_fn(function.key, variant, &program.sig(i), &mut subst, &adts, out_alloc).map_err(|e| {
-                        let missing = matches!(e, blaze_build::BuildError::Select(blaze_typeck::ResolveError::Missing(_)));
-                        let mut s = AString::new_in(out_alloc);
-                        let _ = write!(s, "ctor `{}`: {e}", function.path);
-                        (missing, s)
-                    })
-                } else if Some(function.key) == program.fn_lang(FnLang::DropInPlace) {
-                    let (body, _) = function.body.expect("drop_in_place body");
-                    let done = checked[i].as_ref().expect("drop_in_place checked");
-                    let view = body.view(program.body_types(i));
-                    blaze_build::build_drop_glue(&view, done, &program.sig(i), &mut subst, &adts, out_alloc).map_err(|e| {
-                        let missing = matches!(e, blaze_build::BuildError::Select(blaze_typeck::ResolveError::Missing(_)));
-                        let mut s = AString::new_in(out_alloc);
-                        let _ = write!(s, "drop_glue: {e}");
-                        (missing, s)
-                    })
-                } else {
-                    let Some((body, _)) = function.body else {
-                        let mut s = AString::new_in(out_alloc);
-                        let _ = write!(s, "no body for `{}`", function.path);
-                        return Err(s);
-                    };
-                    let Some(done) = checked[i].as_ref() else {
-                        let mut s = AString::new_in(out_alloc);
-                        let _ = write!(s, "unchecked `{}`", function.path);
-                        return Err(s);
-                    };
-                    match side {
+                let is_missing_body_err = |e: &blaze_body_build::BuildError| {
+                    matches!(
+                        e,
+                        blaze_body_build::BuildError::Facts { error: blaze_build::BuildError::Select(blaze_typeck::ResolveError::Missing(_)), .. }
+                            | blaze_body_build::BuildError::NeedsDrop { error: blaze_build::drop_facts::NeedsDropError::Ask(blaze_build::BuildError::Select(blaze_typeck::ResolveError::Missing(_))), .. }
+                    )
+                };
+                let attempt: Result<blaze_build::Built<Alloc<'a>>, (bool, AString<'a>)> = match slot {
+                    OracleSlot::Closure { of, ty: closure_ty, which } => match side {
                         BuilderSide::Legacy => {
+                            let (body, _) = function.body.expect("closure owner body");
+                            let done = checked[i].as_ref().expect("closure owner checked");
                             let view = body.view(program.body_types(i));
-                            blaze_build::build(&view, done, &program.sig(i), &mut subst, &adts, out_alloc).map_err(|e| {
+                            blaze_build::build_closure(&view, done, of.ordinal, which, &program.sig(i), &mut subst, &adts, out_alloc).map_err(|e| {
                                 let missing = matches!(e, blaze_build::BuildError::Select(blaze_typeck::ResolveError::Missing(_)));
                                 let mut s = AString::new_in(out_alloc);
-                                let _ = write!(s, "legacy build `{}`: {e}", function.path);
+                                let _ = write!(s, "legacy closure `{}`#{}: {e}", function.path, of.ordinal);
                                 (missing, s)
                             })
                         }
-                        BuilderSide::D119Body => (|| -> Result<blaze_build::Built<Alloc<'a>>, (bool, AString<'a>)> {
-                            let kept_bytes = keep_frontend_body(&*program, i, done, checked, out_alloc).map_err(|e| {
+                        BuilderSide::D119Body => {
+                            let own_kind = closures.get(of.owner, of.ordinal).map(|c| c.kind);
+                            if own_kind == Some(which) {
+                                (|| -> Result<blaze_build::Built<Alloc<'a>>, (bool, AString<'a>)> {
+                                    let done = checked[i].as_ref().expect("closure owner checked");
+                                    let kept_bytes = keep_frontend_closure_body(&*program, i, of.ordinal, done, checked, out_alloc).map_err(|e| {
+                                        let mut s = AString::new_in(out_alloc);
+                                        let _ = write!(s, "keep closure `{}`#{}: {e:?}", function.path, of.ordinal);
+                                        (false, s)
+                                    })?;
+                                    let kept = blaze_body::kept::open(&kept_bytes, out_alloc).map_err(|e| {
+                                        let mut s = AString::new_in(out_alloc);
+                                        let _ = write!(s, "open closure `{}`#{}: {e:?}", function.path, of.ordinal);
+                                        (false, s)
+                                    })?;
+                                    let proj = blaze_body_flow::project(kept.verified(), out_alloc).map_err(|e| {
+                                        let mut s = AString::new_in(out_alloc);
+                                        let _ = write!(s, "project closure `{}`#{}: {e}", function.path, of.ordinal);
+                                        (false, s)
+                                    })?;
+                                    let drop_frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("drop frame");
+                                    let df = FlowDropFacts::build(&*program, kept.verified(), kept.tys(), &proj, out_alloc, &drop_frame).map_err(|e| {
+                                        let mut s = AString::new_in(out_alloc);
+                                        let _ = write!(s, "drop_facts closure `{}`#{}: {e:?}", function.path, of.ordinal);
+                                        (false, s)
+                                    })?;
+                                    let elab = blaze_body_drops::elaborate(kept.verified(), &df, out_alloc).map_err(|e| {
+                                        let mut s = AString::new_in(out_alloc);
+                                        let _ = write!(s, "elaborate closure `{}`#{}: {e:?}", function.path, of.ordinal);
+                                        (false, s)
+                                    })?;
+                                    let verified = blaze_body::verify(&elab).map_err(|e| {
+                                        let mut s = AString::new_in(out_alloc);
+                                        let _ = write!(s, "verify closure `{}`#{}: {e:?}", function.path, of.ordinal);
+                                        (false, s)
+                                    })?;
+                                    blaze_body_build::build_closure_body(verified, kept.tys(), of.owner, &mut subst, &adts, out_alloc).map_err(|e| {
+                                        let mut s = AString::new_in(out_alloc);
+                                        let _ = write!(s, "d119 closure `{}`#{}: {e}", function.path, of.ordinal);
+                                        (is_missing_body_err(&e), s)
+                                    })
+                                })()
+                            } else {
+                                blaze_body_build::build_closure_shim(closure_ty, which, &mut subst, &adts, out_alloc).map_err(|e| {
+                                    let mut s = AString::new_in(out_alloc);
+                                    let _ = write!(s, "d119 closure shim `{}`#{}: {e}", function.path, of.ordinal);
+                                    (is_missing_body_err(&e), s)
+                                })
+                            }
+                        }
+                    },
+                    OracleSlot::FnShim { callee, tuple, which } => {
+                        let is_fn_def = matches!(subst.ground.view().node(callee), Ok(blaze_typeck::PNode::FnDef(..)));
+                        let sig = is_fn_def.then(|| program.sig(i));
+                        match side {
+                            BuilderSide::Legacy => blaze_build::build_fn_shim(callee, tuple, which, sig.as_ref(), &mut subst, &adts, out_alloc).map_err(|e| {
+                                let missing = matches!(e, blaze_build::BuildError::Select(blaze_typeck::ResolveError::Missing(_)));
                                 let mut s = AString::new_in(out_alloc);
-                                let _ = write!(s, "keep `{}`: {e:?}", function.path);
-                                (false, s)
-                            })?;
-                            let kept = blaze_body::kept::open(&kept_bytes, out_alloc).map_err(|e| {
+                                let _ = write!(s, "legacy fn_shim: {e}");
+                                (missing, s)
+                            }),
+                            BuilderSide::D119Body => blaze_body_build::build_fn_shim(callee, tuple, which, sig.as_ref(), &mut subst, &adts, out_alloc).map_err(|e| {
                                 let mut s = AString::new_in(out_alloc);
-                                let _ = write!(s, "open `{}`: {e:?}", function.path);
-                                (false, s)
-                            })?;
-                            let proj = blaze_body_flow::project(kept.verified(), out_alloc).map_err(|e| {
+                                let _ = write!(s, "d119 fn_shim: {e}");
+                                (is_missing_body_err(&e), s)
+                            }),
+                        }
+                    }
+                    OracleSlot::Normal if matches!(function.kind, FnKind::Foreign) => {
+                        let mut s = AString::new_in(out_alloc);
+                        let _ = write!(s, "extern fn `{}`", function.path);
+                        Err((false, s))
+                    }
+                    OracleSlot::Normal if program.ctor_of(function.key).is_some() => {
+                        let (_, variant) = program.ctor_of(function.key).expect("ctor_of");
+                        match side {
+                            BuilderSide::Legacy => blaze_build::build_ctor_fn(function.key, variant, &program.sig(i), &mut subst, &adts, out_alloc).map_err(|e| {
+                                let missing = matches!(e, blaze_build::BuildError::Select(blaze_typeck::ResolveError::Missing(_)));
                                 let mut s = AString::new_in(out_alloc);
-                                let _ = write!(s, "project `{}`: {e}", function.path);
-                                (false, s)
-                            })?;
-                            let drop_frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("drop frame");
-                            let df = FlowDropFacts::build(&*program, kept.verified(), kept.tys(), &proj, out_alloc, &drop_frame).map_err(|e| {
+                                let _ = write!(s, "legacy ctor `{}`: {e}", function.path);
+                                (missing, s)
+                            }),
+                            BuilderSide::D119Body => blaze_body_build::build_ctor_fn(function.key, variant, &program.sig(i), &mut subst, &adts, out_alloc).map_err(|e| {
                                 let mut s = AString::new_in(out_alloc);
-                                let _ = write!(s, "drop_facts `{}`: {e:?}", function.path);
-                                (false, s)
-                            })?;
-                            let elab = blaze_body_drops::elaborate(kept.verified(), &df, out_alloc).map_err(|e| {
+                                let _ = write!(s, "d119 ctor `{}`: {e}", function.path);
+                                (is_missing_body_err(&e), s)
+                            }),
+                        }
+                    }
+                    OracleSlot::Normal if Some(function.key) == program.fn_lang(FnLang::DropInPlace) => match side {
+                        BuilderSide::Legacy => {
+                            let (body, _) = function.body.expect("drop_in_place body");
+                            let done = checked[i].as_ref().expect("drop_in_place checked");
+                            let view = body.view(program.body_types(i));
+                            blaze_build::build_drop_glue(&view, done, &program.sig(i), &mut subst, &adts, out_alloc).map_err(|e| {
+                                let missing = matches!(e, blaze_build::BuildError::Select(blaze_typeck::ResolveError::Missing(_)));
                                 let mut s = AString::new_in(out_alloc);
-                                let _ = write!(s, "elaborate `{}`: {e:?}", function.path);
-                                (false, s)
-                            })?;
-                            let verified = blaze_body::verify(&elab).map_err(|e| {
-                                let mut s = AString::new_in(out_alloc);
-                                let _ = write!(s, "verify_elab `{}`: {e:?}", function.path);
-                                (false, s)
-                            })?;
-                            blaze_body_build::build(verified, kept.tys(), function.key, &mut subst, &adts, out_alloc).map_err(|e| {
-                                let missing = matches!(
-                                    e,
-                                    blaze_body_build::BuildError::Facts { error: blaze_build::BuildError::Select(blaze_typeck::ResolveError::Missing(_)), .. }
-                                        | blaze_body_build::BuildError::NeedsDrop { error: blaze_build::drop_facts::NeedsDropError::Ask(blaze_build::BuildError::Select(blaze_typeck::ResolveError::Missing(_))), .. }
-                                );
-                                let mut s = AString::new_in(out_alloc);
-                                let _ = write!(s, "body_build `{}`: {e}", function.path);
+                                let _ = write!(s, "legacy drop_glue: {e}");
                                 (missing, s)
                             })
-                        })(),
+                        }
+                        BuilderSide::D119Body => blaze_body_build::build_drop_glue(&mut subst, &adts, out_alloc).map_err(|e| {
+                            let mut s = AString::new_in(out_alloc);
+                            let _ = write!(s, "d119 drop_glue: {e}");
+                            (is_missing_body_err(&e), s)
+                        }),
+                    },
+                    OracleSlot::Normal => {
+                        let Some((body, _)) = function.body else {
+                            let mut s = AString::new_in(out_alloc);
+                            let _ = write!(s, "no body for `{}`", function.path);
+                            return Err(s);
+                        };
+                        let Some(done) = checked[i].as_ref() else {
+                            let mut s = AString::new_in(out_alloc);
+                            let _ = write!(s, "unchecked `{}`", function.path);
+                            return Err(s);
+                        };
+                        match side {
+                            BuilderSide::Legacy => {
+                                let view = body.view(program.body_types(i));
+                                blaze_build::build(&view, done, &program.sig(i), &mut subst, &adts, out_alloc).map_err(|e| {
+                                    let missing = matches!(e, blaze_build::BuildError::Select(blaze_typeck::ResolveError::Missing(_)));
+                                    let mut s = AString::new_in(out_alloc);
+                                    let _ = write!(s, "legacy build `{}`: {e}", function.path);
+                                    (missing, s)
+                                })
+                            }
+                            BuilderSide::D119Body => (|| -> Result<blaze_build::Built<Alloc<'a>>, (bool, AString<'a>)> {
+                                let kept_bytes = keep_frontend_body(&*program, i, done, checked, out_alloc).map_err(|e| {
+                                    let mut s = AString::new_in(out_alloc);
+                                    let _ = write!(s, "keep `{}`: {e:?}", function.path);
+                                    (false, s)
+                                })?;
+                                let kept = blaze_body::kept::open(&kept_bytes, out_alloc).map_err(|e| {
+                                    let mut s = AString::new_in(out_alloc);
+                                    let _ = write!(s, "open `{}`: {e:?}", function.path);
+                                    (false, s)
+                                })?;
+                                let proj = blaze_body_flow::project(kept.verified(), out_alloc).map_err(|e| {
+                                    let mut s = AString::new_in(out_alloc);
+                                    let _ = write!(s, "project `{}`: {e}", function.path);
+                                    (false, s)
+                                })?;
+                                let drop_frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("drop frame");
+                                let df = FlowDropFacts::build(&*program, kept.verified(), kept.tys(), &proj, out_alloc, &drop_frame).map_err(|e| {
+                                    let mut s = AString::new_in(out_alloc);
+                                    let _ = write!(s, "drop_facts `{}`: {e:?}", function.path);
+                                    (false, s)
+                                })?;
+                                let elab = blaze_body_drops::elaborate(kept.verified(), &df, out_alloc).map_err(|e| {
+                                    let mut s = AString::new_in(out_alloc);
+                                    let _ = write!(s, "elaborate `{}`: {e:?}", function.path);
+                                    (false, s)
+                                })?;
+                                let verified = blaze_body::verify(&elab).map_err(|e| {
+                                    let mut s = AString::new_in(out_alloc);
+                                    let _ = write!(s, "verify_elab `{}`: {e:?}", function.path);
+                                    (false, s)
+                                })?;
+                                blaze_body_build::build(verified, kept.tys(), function.key, &mut subst, &adts, out_alloc).map_err(|e| {
+                                    let mut s = AString::new_in(out_alloc);
+                                    let _ = write!(s, "body_build `{}`: {e}", function.path);
+                                    (is_missing_body_err(&e), s)
+                                })
+                            })(),
+                        }
                     }
                 };
                 match attempt {
@@ -3186,26 +3514,40 @@ mod kept_body_tests {
                 s
             })?;
 
-            // Resolve every callee reference to its instance slot (including trait methods, closures, and `make_asked` retries).
+            // Resolve every callee reference to its instance slot (including trait methods, closures, fn shims, foreign decls, and `make_asked` retries).
             let mut targets = AVec::with_capacity_in(built.refs.len(), out_alloc);
             for &callee in built.refs.iter() {
-                // Check if this is a closure `Fn`/`FnMut`/`FnOnce` call first.
-                let closure_call = [blaze_build::FnTrait::Fn, blaze_build::FnTrait::FnMut, blaze_build::FnTrait::FnOnce]
+                // External C declarations (`extern "C" { fn ...; }`) have no body to build: record `u32::MAX` (unresolved/extern).
+                if program.fn_index(callee.item).is_some_and(|ci| matches!(program.function(ci).kind, FnKind::Foreign)) {
+                    targets.push(u32::MAX);
+                    continue;
+                }
+                // Check if this is an `Fn`/`FnMut`/`FnOnce` call (closure, fn item, or fn pointer).
+                let fn_trait_call = [blaze_build::FnTrait::Fn, blaze_build::FnTrait::FnMut, blaze_build::FnTrait::FnOnce]
                     .into_iter()
                     .find(|&w| {
                         let (lang, name) = crate::front2::langs::fn_trait_method(w);
                         program.lang_trait_fn(lang, name) == Some(callee.item)
                     })
                     .and_then(|which| {
-                        let first = *ground.view().list(callee.args).ok()?.first()?;
-                        Some((blaze_build::closure_of(ground.view(), first)?, which))
+                        let args_slice = ground.view().list(callee.args).ok()?;
+                        let first = *args_slice.first()?;
+                        if let Some(of) = blaze_build::closure_of(ground.view(), first) {
+                            Some(OracleSlot::Closure { of, ty: first, which })
+                        } else if matches!(ground.view().node(first), Ok(blaze_typeck::PNode::FnDef(..) | blaze_typeck::PNode::FnPtr(..)))
+                            && let Some(&tuple) = args_slice.get(1)
+                        {
+                            Some(OracleSlot::FnShim { callee: first, tuple, which })
+                        } else {
+                            None
+                        }
                     });
-                let (resolved, cslot) = if let Some(c) = closure_call {
-                    (callee, Some(c))
+                let (resolved, cslot) = if let Some(s) = fn_trait_call {
+                    (callee, s)
                 } else if Some(callee.item) == program.fn_lang(FnLang::DropInPlace) {
-                    (callee, None)
-                } else if program.fn_index(callee.item).is_some_and(|ci| matches!(program.function(ci).kind, FnKind::Foreign | FnKind::Ctor)) {
-                    (callee, None)
+                    (callee, OracleSlot::Normal)
+                } else if program.fn_index(callee.item).is_some_and(|ci| matches!(program.function(ci).kind, FnKind::Ctor)) {
+                    (callee, OracleSlot::Normal)
                 } else {
                     // Always resolve through `FrontEnd::resolve` (covers trait methods with OR without default bodies, and retries `make_asked`).
                     let mut r_retries = 0u32;
@@ -3219,8 +3561,8 @@ mod kept_body_tests {
                         }
                     };
                     match res {
-                        Ok(r) => (r, None),
-                        Err(_) if program.fn_index(callee.item).is_some() => (callee, None),
+                        Ok(r) => (r, OracleSlot::Normal),
+                        Err(_) if program.fn_index(callee.item).is_some() => (callee, OracleSlot::Normal),
                         Err(e) => {
                             let mut s = AString::new_in(out_alloc);
                             let _ = write!(s, "resolve `{}` -> {:?}: {e:?}", program.function(i).path, callee.item);
@@ -3229,11 +3571,11 @@ mod kept_body_tests {
                     }
                 };
                 if let Some(pos) = instances.iter().position(|&x| x == resolved) {
-                    targets.push(pos as u32);
+                    targets.push(u32::try_from(pos).unwrap_or(u32::MAX));
                 } else {
-                    let pos = instances.len() as u32;
+                    let pos = u32::try_from(instances.len()).unwrap_or(u32::MAX);
                     instances.push(resolved);
-                    closure_slots.push(cslot);
+                    slots.push(cslot);
                     targets.push(pos);
                 }
             }
@@ -3244,18 +3586,18 @@ mod kept_body_tests {
                 st_key: ItemKey,
                 ground: &mut blaze_typeck::PortableTys<'_>,
                 instances: &mut AVec<'a, blaze_build::Instance>,
-                closure_slots: &mut AVec<'a, Option<(blaze_build::ClosureOf, blaze_build::FnTrait)>>,
+                slots: &mut AVec<'a, OracleSlot>,
                 datums: &mut AVec<'a, (ItemKey, AVec<'a, u8>, u8, bool, AVec<'a, blaze_lir::eval::DatumReloc>)>,
                 alloc: Alloc<'static>,
                 out_alloc: Alloc<'a>,
             ) -> u32 {
                 if let Some(pos) = datums.iter().position(|(k, ..)| *k == st_key) {
-                    return pos as u32;
+                    return u32::try_from(pos).unwrap_or(u32::MAX);
                 }
                 let Some(rec) = program.static_records().iter().find(|(k, _)| *k == st_key).map(|(_, r)| r) else {
                     return u32::MAX;
                 };
-                let base_pos = datums.len() as u32;
+                let base_pos = u32::try_from(datums.len()).unwrap_or(u32::MAX);
                 let writable_static = program.static_item(st_key).is_some_and(|s| s.mutable);
                 // Reserve datum slots for all allocations in this record first so Alloc relocs know their target DatumId.
                 for (ai, a) in rec.allocs.iter().enumerate() {
@@ -3272,8 +3614,8 @@ mod kept_body_tests {
                 for (ai, a) in rec.allocs.iter().enumerate() {
                     let mut relocs = AVec::new_in(out_alloc);
                     for rel in a.relocs.iter() {
-                        let off = rel.offset as usize;
-                        let addend = if off + 8 <= a.bytes.len() {
+                        let off = usize::try_from(rel.offset).unwrap_or(usize::MAX);
+                        let addend = if off.saturating_add(8) <= a.bytes.len() {
                             i64::from_le_bytes([
                                 a.bytes[off], a.bytes[off + 1], a.bytes[off + 2], a.bytes[off + 3],
                                 a.bytes[off + 4], a.bytes[off + 5], a.bytes[off + 6], a.bytes[off + 7],
@@ -3289,7 +3631,7 @@ mod kept_body_tests {
                                     } else {
                                         let p = instances.len();
                                         instances.push(inst);
-                                        closure_slots.push(None);
+                                        slots.push(OracleSlot::Normal);
                                         p
                                     };
                                     relocs.push(blaze_lir::eval::DatumReloc {
@@ -3307,7 +3649,7 @@ mod kept_body_tests {
                                 });
                             }
                             blaze_build::data::DataTarget::Static(target_st) => {
-                                let tpos = intern_static(program, target_st, ground, instances, closure_slots, datums, alloc, out_alloc);
+                                let tpos = intern_static(program, target_st, ground, instances, slots, datums, alloc, out_alloc);
                                 if tpos != u32::MAX {
                                     relocs.push(blaze_lir::eval::DatumReloc {
                                         offset: rel.offset,
@@ -3319,14 +3661,14 @@ mod kept_body_tests {
                             _ => {}
                         }
                     }
-                    datums[base_pos as usize + ai].4 = relocs;
+                    datums[usize::try_from(base_pos).unwrap_or(0) + ai].4 = relocs;
                 }
                 base_pos
             }
 
             let mut statics = AVec::with_capacity_in(built.statics.len(), out_alloc);
             for &st_key in built.statics.iter() {
-                let pos = intern_static(&*program, st_key, &mut ground, &mut instances, &mut closure_slots, &mut datums, alloc, out_alloc);
+                let pos = intern_static(&*program, st_key, &mut ground, &mut instances, &mut slots, &mut datums, alloc, out_alloc);
                 statics.push(pos);
             }
 
@@ -3435,15 +3777,12 @@ mod kept_body_tests {
         let mut diffs = AString::new_in(alloc);
 
         for rung in LADDER_RUNGS {
-            if rung.has_extern_call {
-                continue;
-            }
             with_front2(rung.files, alloc, |program, checked| {
                 let old = build_rung_side(program, checked, BuilderSide::Legacy, alloc, alloc);
                 let new = build_rung_side(program, checked, BuilderSide::D119Body, alloc, alloc);
                 match (old, new) {
                     (Ok((old_prog, old_n)), Ok((new_prog, new_n))) => {
-                        if rung.eval_skip {
+                        if rung.has_extern_call || rung.eval_skip {
                             assert!(old_n > 0 && new_n > 0);
                             passed += 1;
                             return;
@@ -3457,9 +3796,10 @@ mod kept_body_tests {
                                     blaze_lir::eval::Outcome::Returned(vals) => matches!(vals[0], blaze_lir::eval::Val::Int(v) if v == u128::from(rung.expected)),
                                     _ => false,
                                 };
-                                // Note: on `front2/x0-drop-14-if-let-temp`, legacy `blaze-build` hits a dead-slot UB in
-                                // `blaze_lir::eval` while the D119 pipeline cleanly returns `42`.
-                                let legacy_dead_slot_bug = rung.name == "front2/x0-drop-14-if-let-temp"
+                                // Note: on `front2/x0-drop-14-if-let-temp` and `front2/x0-drop-08-return-break`, legacy
+                                // `blaze-build` hits a dead-slot UB in `blaze_lir::eval` while the D119 pipeline
+                                // cleanly returns `42`.
+                                let legacy_dead_slot_bug = matches!(rung.name, "front2/x0-drop-14-if-let-temp" | "front2/x0-drop-08-return-break")
                                     && matches!(o, blaze_lir::eval::Outcome::Undefined { why: "an access to a dead slot", .. });
                                 if (!legacy_dead_slot_bug && o != n) || !want_ok {
                                     let _ = writeln!(diffs, "EXEC_DIFF {}: old={o:?} new={n:?} want={} (bodies {old_n}/{new_n})", rung.name, rung.expected);
@@ -3484,7 +3824,11 @@ mod kept_body_tests {
                 }
             });
         }
-        assert!(diffs.is_empty() && passed > 0, "D119 body-build vs legacy-build oracle ({passed} passed):\n{diffs}");
+        assert!(
+            diffs.is_empty() && usize::try_from(passed) == Ok(LADDER_RUNGS.len()),
+            "D119 body-build vs legacy-build oracle ({passed}/{} passed):\n{diffs}",
+            LADDER_RUNGS.len(),
+        );
     }
 
     /// World implementing both `blaze_consteval::ConstWorld` and `blaze_body_eval::BodyWorld`
@@ -3578,6 +3922,10 @@ mod kept_body_tests {
         fn drop_glue(&self, _ty: blaze_typeck::PTy, _ground: &mut blaze_typeck::PortableTys<'_>, _scratch: Alloc<'_>) -> Result<blaze_body_eval::DropGlue, blaze_consteval::Refusal<'static>> {
             Ok(blaze_body_eval::DropGlue::Nothing)
         }
+
+        fn is_mut_static(&self, item: ItemKey) -> bool {
+            self.program.static_item(item).is_some_and(|s| s.mutable)
+        }
     }
 
     const CONST_ORACLE_SRC: &str = r#"
@@ -3589,6 +3937,12 @@ mod kept_body_tests {
 trait Sized {}
 #[lang = "copy"]
 trait Copy {}
+#[lang = "sync"]
+unsafe trait Sync {}
+#[lang = "unsafe_cell"]
+#[repr(transparent)]
+struct UnsafeCell<T> { value: T }
+impl Copy for u8 {}
 impl Copy for i32 {}
 impl Copy for u32 {}
 impl Copy for u64 {}
@@ -3597,6 +3951,16 @@ impl Copy for bool {}
 
 struct Pair { a: i32, b: i32 }
 enum Choice { Zero, One(i32), Two(i32, i32) }
+struct AtomicU8 { v: UnsafeCell<u8> }
+enum CellSlot { Empty, Full(UnsafeCell<u32>) }
+
+unsafe impl Sync for i32 {}
+unsafe impl Sync for u8 {}
+unsafe impl Sync for AtomicU8 {}
+unsafe impl Sync for (u8, AtomicU8) {}
+unsafe impl Sync for [AtomicU8; 2] {}
+unsafe impl Sync for CellSlot {}
+unsafe impl<'a> Sync for &'a AtomicU8 {}
 
 const fn add(a: i32, b: i32) -> i32 { a + b }
 const fn fact(n: i32) -> i32 {
@@ -3625,11 +3989,18 @@ const C_ENUM: i32 = eval_choice(Choice::Two(17, 25));
 const C_ARR: [i32; 4] = [1, 2, 3, 4];
 const C_ARR_SUM: i32 = C_ARR[0] + C_ARR[1] + C_ARR[2] + C_ARR[3];
 const C_REF: &[i32; 4] = &C_ARR;
+const K_ATOMIC: AtomicU8 = AtomicU8 { v: UnsafeCell { value: 1 } };
 static S_VAL: i32 = C_ADD + C_ENUM;
+static S_ATOMIC: AtomicU8 = AtomicU8 { v: UnsafeCell { value: 2 } };
+static S_TUPLE_CELL: (u8, AtomicU8) = (3, AtomicU8 { v: UnsafeCell { value: 4 } });
+static S_ARR_CELL: [AtomicU8; 2] = [AtomicU8 { v: UnsafeCell { value: 5 } }, AtomicU8 { v: UnsafeCell { value: 6 } }];
+static S_ENUM_CELL: CellSlot = CellSlot::Full(UnsafeCell { value: 7 });
+static S_REF_ATOMIC: &AtomicU8 = &AtomicU8 { v: UnsafeCell { value: 8 } };
+static mut S_MUT_SCALAR: i32 = 9;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main() -> i32 {
-    C_ADD + C_FACT + C_PAIR_SUM + C_ENUM + C_ARR_SUM + C_REF[2] + S_VAL
+    C_ADD + C_FACT + C_PAIR_SUM + C_ENUM + C_ARR_SUM + C_REF[2] + S_VAL + (K_ATOMIC.v.value as i32)
 }
 "#;
 
