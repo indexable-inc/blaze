@@ -256,6 +256,15 @@ fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::Shared
             }
         }
     };
+    #[cfg(target_os = "linux")]
+    let sandbox_temp = match (std::env::var_os("BLAZE_LAUNCH_SANDBOX_TEMP"), start.form) {
+        (None, _) => None,
+        (Some(_), EntryForm::Comptime | EntryForm::Hosted) => stop(
+            CANNOT_RUN,
+            "BLAZE_LAUNCH_SANDBOX_TEMP is set for a non-test entry",
+        ),
+        (Some(raw), EntryForm::Unit | EntryForm::CMain) => Some(raw),
+    };
     let open_explore = std::env::var_os("BLAZE_LAUNCH_EXPLORE").is_some_and(|v| v == "1");
     if let Some(raw_stride) = std::env::var_os("BLAZE_ALLOC_SAMPLE_BYTES") {
         if let Some(stride) = raw_stride.to_str().and_then(|s| s.parse::<u64>().ok()) {
@@ -270,10 +279,36 @@ fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::Shared
         std::env::remove_var("BLAZE_LAUNCH_ENTRY");
         std::env::remove_var("BLAZE_LAUNCH_NATIVE");
         std::env::remove_var("BLAZE_LAUNCH_UNWOUND_FILE");
+        std::env::remove_var("BLAZE_LAUNCH_SANDBOX_TEMP");
         std::env::remove_var(grants::VAR);
         std::env::remove_var(telemetry::VAR);
         std::env::remove_var("BLAZE_LAUNCH_EXPLORE");
         std::env::remove_var("BLAZE_ALLOC_SAMPLE_BYTES");
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(raw_temp) = sandbox_temp {
+        let Ok(temp_c) = CString::new(raw_temp.into_vec()) else {
+            stop(CANNOT_RUN, "BLAZE_LAUNCH_SANDBOX_TEMP holds a NUL byte");
+        };
+        let Ok(store_c) = CString::new(store.as_encoded_bytes()) else {
+            stop(CANNOT_RUN, "BLAZE_LAUNCH_STORE holds a NUL byte");
+        };
+        let cwd_c = std::env::current_dir()
+            .ok()
+            .and_then(|p| CString::new(p.into_os_string().into_vec()).ok());
+        let keep_ro_two = cwd_c.as_ref().map(|cwd| [store_c.as_c_str(), cwd.as_c_str()]);
+        let keep_ro_one = [store_c.as_c_str()];
+        let keep_ro: &[&core::ffi::CStr] = match keep_ro_two.as_ref() {
+            Some(pair) => pair,
+            None => &keep_ro_one,
+        };
+        if let Err(why) = blaze_sys::linux::confine::enter_test_sandbox(
+            temp_c.as_c_str(),
+            keep_ro,
+            cwd_c.as_deref(),
+        ) {
+            stop(CANNOT_RUN, &format!("Linux test sandbox refused: {why:?}"));
+        }
     }
     let telemetry_on = match telemetry_path {
         Some(path) => {

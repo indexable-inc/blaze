@@ -843,17 +843,10 @@ fn sandbox(profile: &str, temp: &[u8], alloc: Alloc<'_>) -> Option<i32> {
         let Ok(temp_c) = core::ffi::CStr::from_bytes_with_nul(temp) else {
             return Some(libc::EINVAL);
         };
-        let prepared = match blaze_sys::linux::confine::TestConfine::prepare(temp_c) {
-            Ok(p) => p,
-            Err(blaze_sys::linux::confine::TestConfineError::AbiProbe(e))
-            | Err(blaze_sys::linux::confine::TestConfineError::CreateRuleset(e))
-            | Err(blaze_sys::linux::confine::TestConfineError::OpenPath { errno: e, .. })
-            | Err(blaze_sys::linux::confine::TestConfineError::AddRule { errno: e, .. }) => return Some(i32::from(e.raw())),
-            Err(blaze_sys::linux::confine::TestConfineError::AbiTooOld { .. }) => return Some(libc::ENOSYS),
-        };
-        match blaze_sys::linux::confine::enter(&prepared.confine()) {
+        match blaze_sys::linux::confine::enter_test_sandbox(temp_c, &[], None) {
             Ok(()) => None,
-            Err((_, e)) => Some(i32::from(e.raw())),
+            Err(blaze_sys::linux::confine::TestConfineError::AbiTooOld { .. }) => Some(libc::ENOSYS),
+            Err(err) => Some(i32::from(err.raw_errno())),
         }
     }
 }

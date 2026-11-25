@@ -87,16 +87,21 @@ pub struct TestSandbox<'a> {
 #[cfg(target_os = "linux")]
 pub struct UnwoundChannel {
     channel: Channel,
-    io: Io,
 }
 
 #[cfg(target_os = "linux")]
 impl UnwoundChannel {
     /// Returns `true` iff the launcher wrote the unwind sentinel (`b"1"`) before exiting.
     pub fn did_unwind<A: Allocator>(&mut self, alloc: A) -> bool {
+        struct ZeroClock;
+        impl blaze_core::wait::Clock for ZeroClock {
+            fn now(&self) -> Duration {
+                Duration::ZERO
+            }
+        }
         let mut buf: Vec<u8, A> = Vec::new_in(alloc);
         matches!(
-            self.channel.recv_message(&mut buf, 16, Deadline::PASSED, &DriverClock(&self.io)),
+            self.channel.recv_message(&mut buf, 16, Deadline::PASSED, &ZeroClock),
             Ok(Message::Whole { .. }) if buf.get(PREFIX..) == Some(b"1")
         )
     }
@@ -340,11 +345,14 @@ impl Spawner {
         Ok(Started { child: Served { run, channel: parent }, pipes })
     }
 
-    /// `spec` started with its channel as [`CHILD_FD`] inside the Linux test sandbox
-    /// (`blaze_sys::linux::confine::TestConfine`: Landlock ABI >= 6 + seccomp +
-    /// `PR_SET_NO_NEW_PRIVS`, entered in the child before `execve`). When `sandbox.unwound_channel`
-    /// is true, also inherits a launcher-owned unwind channel on [`UNWOUND_FD`] and returns its
-    /// parent end. Refused steps are [`RunFault::Host`]; the program never runs unsandboxed (rule 9).
+    /// `spec` started with its channel as [`CHILD_FD`] for a Linux sandboxed test.
+    ///
+    /// When `sandbox.unwound_channel` is true, also inherits a launcher-owned unwind channel on
+    /// [`UNWOUND_FD`] and returns its parent end. The launcher itself enters the Linux test
+    /// sandbox (`blaze_sys::linux::confine::enter_test_sandbox`: user/net/ipc/mount namespaces,
+    /// read-only root with writable `$TMPDIR`, capability drop, `RLIMIT_CORE=0`, Landlock ABI >= 6,
+    /// and seccomp) while single-threaded before starting its control thread or loading guest code
+    /// (`test.md`, piece 9). Refused steps fail closed; the test never runs unsandboxed (rule 9).
     #[cfg(target_os = "linux")]
     pub fn start_served_test(
         &self,
@@ -352,29 +360,8 @@ impl Spawner {
         spec: &RunSpec<'_>,
         sandbox: &TestSandbox<'_>,
     ) -> Result<(Started<Served>, Option<UnwoundChannel>), RunError> {
-        fn c_path<'a>(path: &str, buf: &'a mut [u8; 4096], what: &'static str) -> Result<&'a core::ffi::CStr, RunError> {
-            let bytes = path.as_bytes();
-            if bytes.len() + 1 > buf.len() || bytes.contains(&0) {
-                return Err(RunError { step: RunStep::Start, proc: None, fault: RunFault::Host { what, os: 0 } });
-            }
-            buf[..bytes.len()].copy_from_slice(bytes);
-            buf[bytes.len()] = 0;
-            core::ffi::CStr::from_bytes_with_nul(&buf[..=bytes.len()])
-                .map_err(|_| RunError { step: RunStep::Start, proc: None, fault: RunFault::Host { what, os: 0 } })
-        }
+        let _ = sandbox.temp;
         let refuse = |fault| RunError { step: RunStep::Start, proc: None, fault };
-        let mut temp_buf = [0u8; 4096];
-        let temp_c = c_path(sandbox.temp, &mut temp_buf, "test sandbox temp path")?;
-        let prepared = blaze_sys::linux::confine::TestConfine::prepare(temp_c).map_err(|err| {
-            let (what, os) = match err {
-                blaze_sys::linux::confine::TestConfineError::AbiProbe(errno) => ("landlock ABI probe", i32::from(errno.raw())),
-                blaze_sys::linux::confine::TestConfineError::AbiTooOld { .. } => ("landlock ABI is older than 6 (signal scoping required)", 0),
-                blaze_sys::linux::confine::TestConfineError::CreateRuleset(errno) => ("landlock_create_ruleset", i32::from(errno.raw())),
-                blaze_sys::linux::confine::TestConfineError::OpenPath { which, errno } => (which, i32::from(errno.raw())),
-                blaze_sys::linux::confine::TestConfineError::AddRule { which, errno } => (which, i32::from(errno.raw())),
-            };
-            refuse(RunFault::Host { what, os })
-        })?;
         let (parent, child_end) = channel::pair().map_err(|error| refuse(RunFault::Channel(error)))?;
         let unwound_pair = if sandbox.unwound_channel {
             Some(channel::pair().map_err(|error| refuse(RunFault::Channel(error)))?)
@@ -384,17 +371,17 @@ impl Spawner {
         let Started { child: run, pipes } = match &unwound_pair {
             Some((_, unwound_child)) => {
                 let given = [(child_end.fd(), CHILD_FD), (unwound_child.fd(), UNWOUND_FD)];
-                self.start_with(cx, spec, &given, Some(&prepared.confine()))?
+                self.start_with(cx, spec, &given, None)?
             }
             None => {
                 let given = [(child_end.fd(), CHILD_FD)];
-                self.start_with(cx, spec, &given, Some(&prepared.confine()))?
+                self.start_with(cx, spec, &given, None)?
             }
         };
         drop(child_end);
         let unwound = unwound_pair.map(|(u_parent, u_child)| {
             drop(u_child);
-            UnwoundChannel { channel: u_parent, io: self.io.clone() }
+            UnwoundChannel { channel: u_parent }
         });
         Ok((Started { child: Served { run, channel: parent }, pipes }, unwound))
     }

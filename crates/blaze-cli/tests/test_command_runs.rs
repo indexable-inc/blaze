@@ -343,69 +343,136 @@ fn passes() {
     }
 }
 
-/// Linux test sandbox (Landlock ABI >= 6 + seccomp, `test.md` piece 9):
-/// - writes and `AF_UNIX` sockets inside `$TMPDIR` succeed;
-/// - writes outside `$TMPDIR` (creating or opening `Cargo.toml`) are refused with `PermissionDenied`;
-/// - `AF_INET` / `AF_INET6` sockets are refused with `PermissionDenied` (no off-machine network);
-/// - spawning a normal helper subprocess succeeds (`clone3 -> ENOSYS` fallback + non-namespace `clone`);
+/// Linux test sandbox (user/net/ipc/mount namespaces + read-only `/` + Landlock ABI >= 6 + seccomp, `test.md` piece 9):
+/// - writes, `chmod`, pathname `AF_UNIX`, and loopback TCP inside `$TMPDIR`/private netns succeed;
+/// - writes and `chmod` outside `$TMPDIR` are refused (`ReadOnlyFilesystem`/`PermissionDenied`);
+/// - external TCP (`1.1.1.1:80`) is refused (`NetworkUnreachable`) and host `/tmp` UNIX sockets are masked (`NotFound`);
+/// - capabilities are dropped (`CapEff == 0`), `RLIMIT_CORE == 0`, and spawning a helper works;
 /// - `#[should_panic(expected = ...)]` succeeds via the launcher-owned `fd:4` channel (no guest-
-///   writable unwind file in `$TMPDIR/..`), while `std::process::exit(101)` is NOT classified as a panic.
+///   writable unwind file in `$TMPDIR/..`), while `std::process::exit(101)` is NOT classified as a panic;
+/// - helpers spawned inside a test are killed when the test leader exits.
 #[test]
 #[cfg(target_os = "linux")]
 fn linux_sandbox_confines_writes_and_distinguishes_exit_101() {
-    let source = r#"
+    use std::os::unix::net::UnixListener;
+
+    // Bind a real host pathname UNIX socket in `/tmp` outside the test's `$TMPDIR`: the sandbox's
+    // empty `/tmp` tmpfs mask must make it completely unreachable from inside the test.
+    let host_sock_dir = std::env::temp_dir().join(format!("blaze_host_sock_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&host_sock_dir);
+    std::fs::create_dir_all(&host_sock_dir).expect("create host_sock_dir");
+    let host_sock_path = host_sock_dir.join("daemon.sock");
+    let _host_listener = UnixListener::bind(&host_sock_path).expect("bind host daemon socket");
+
+    let source = format!(r##"
 #[test]
-fn can_write_and_unix_socketpair_inside_tmpdir() {
+fn tmpdir_writes_chmod_unix_and_loopback_work() {{
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::{{UnixListener, UnixStream}};
+    use std::net::{{TcpListener, TcpStream}};
+
     let tmp = std::env::temp_dir();
-    let p = tmp.join("ok.txt");
-    std::fs::write(&p, b"hello").expect("write inside TMPDIR");
-    assert_eq!(std::fs::read(&p).expect("read back"), b"hello");
-    let (_a, _b) = std::os::unix::net::UnixStream::pair().expect("anonymous AF_UNIX socketpair allowed");
+    let p = tmp.join("ok.sh");
+    std::fs::write(&p, b"#!/bin/sh\n").expect("write inside TMPDIR");
+    assert_eq!(std::fs::read(&p).expect("read back"), b"#!/bin/sh\n");
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod inside TMPDIR must succeed");
+
+    // Sandbox-local pathname AF_UNIX bind + connect inside TMPDIR (short path under SUN_LEN).
+    let sock = tmp.join("s.sock");
+    if sock.as_os_str().len() < 100 {{
+        let srv = UnixListener::bind(&sock).expect("pathname AF_UNIX bind inside TMPDIR");
+        let _cli = UnixStream::connect(&sock).expect("pathname AF_UNIX connect inside TMPDIR");
+        let _ = srv.accept().expect("accept local AF_UNIX");
+    }}
+    let (_a, _b) = UnixStream::pair().expect("anonymous AF_UNIX socketpair allowed");
+
+    // Sandbox-local loopback TCP works inside the private netns.
+    let tcp = TcpListener::bind("127.0.0.1:0").expect("loopback TCP bind inside private netns");
+    let addr = tcp.local_addr().expect("loopback local_addr");
+    let _conn = TcpStream::connect(addr).expect("loopback TCP connect inside private netns");
+    let _ = tcp.accept().expect("loopback TCP accept");
+
     let status = std::process::Command::new("/bin/true").status().expect("spawn helper");
     assert!(status.success());
-}
+}}
 
 #[test]
-fn cannot_write_mutate_metadata_or_open_sockets() {
+fn outside_writes_chmod_external_net_host_sockets_caps_and_core_are_confined() {{
     use std::os::unix::fs::PermissionsExt;
     let cwd = std::env::current_dir().expect("current dir");
     let escaped = cwd.join("escaped.txt");
-    let err = std::fs::write(&escaped, b"nope").expect_err("creating file outside TMPDIR must be denied by Landlock");
-    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "expected EACCES/PermissionDenied creating file, got {err:?}");
+    let err = std::fs::write(&escaped, b"nope").expect_err("creating file outside TMPDIR must be denied");
+    assert!(
+        matches!(err.kind(), std::io::ErrorKind::ReadOnlyFilesystem | std::io::ErrorKind::PermissionDenied),
+        "expected EROFS/EACCES creating file outside TMPDIR, got {{err:?}}"
+    );
     let err2 = std::fs::OpenOptions::new()
         .write(true)
         .open(cwd.join("Cargo.toml"))
-        .expect_err("opening existing file for write outside TMPDIR must be denied by Landlock");
-    assert_eq!(err2.kind(), std::io::ErrorKind::PermissionDenied, "expected EACCES/PermissionDenied writing Cargo.toml, got {err2:?}");
+        .expect_err("opening existing file for write outside TMPDIR must be denied");
+    assert!(
+        matches!(err2.kind(), std::io::ErrorKind::ReadOnlyFilesystem | std::io::ErrorKind::PermissionDenied),
+        "expected EROFS/EACCES writing Cargo.toml, got {{err2:?}}"
+    );
     let err_chmod = std::fs::set_permissions(cwd.join("Cargo.toml"), std::fs::Permissions::from_mode(0o600))
-        .expect_err("chmod outside TMPDIR must be denied by seccomp");
-    assert_eq!(err_chmod.kind(), std::io::ErrorKind::PermissionDenied, "expected EPERM on chmod, got {err_chmod:?}");
-    let err_inet = std::net::TcpListener::bind("127.0.0.1:0").expect_err("AF_INET socket must be denied");
-    assert_eq!(err_inet.kind(), std::io::ErrorKind::PermissionDenied, "expected EPERM on AF_INET socket, got {err_inet:?}");
-    let err_unix = std::os::unix::net::UnixStream::connect("/run/nonexistent.sock")
-        .expect_err("pathname AF_UNIX socket must be denied");
-    assert_eq!(err_unix.kind(), std::io::ErrorKind::PermissionDenied, "expected EPERM on pathname AF_UNIX socket, got {err_unix:?}");
+        .expect_err("chmod outside TMPDIR must be denied by read-only mount");
+    assert!(
+        matches!(err_chmod.kind(), std::io::ErrorKind::ReadOnlyFilesystem | std::io::ErrorKind::PermissionDenied),
+        "expected EROFS/EPERM on outside chmod, got {{err_chmod:?}}"
+    );
+    // External non-loopback network is unreachable in the private netns.
+    let err_ext = std::net::TcpStream::connect("1.1.1.1:80").expect_err("external TCP must fail");
+    assert!(
+        matches!(err_ext.kind(), std::io::ErrorKind::NetworkUnreachable | std::io::ErrorKind::PermissionDenied),
+        "expected ENETUNREACH/EPERM on external TCP, got {{err_ext:?}}"
+    );
+    // Host pathname UNIX socket in /tmp is invisible behind the empty /tmp tmpfs mask.
+    let err_unix = std::os::unix::net::UnixStream::connect("{host_sock}")
+        .expect_err("host pathname AF_UNIX socket must be unreachable");
+    assert!(
+        matches!(err_unix.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied),
+        "expected ENOENT/EACCES on host pathname AF_UNIX socket, got {{err_unix:?}}"
+    );
+    // All capabilities dropped (`CapEff: 0000000000000000`) and core dumps disabled (`Max core file size 0 0`).
+    let status_txt = std::fs::read_to_string("/proc/self/status").expect("read /proc/self/status");
+    assert!(status_txt.contains("CapEff:\t0000000000000000"), "expected CapEff == 0:\n{{status_txt}}");
+    assert!(status_txt.contains("CapPrm:\t0000000000000000"), "expected CapPrm == 0:\n{{status_txt}}");
+    let limits_txt = std::fs::read_to_string("/proc/self/limits").expect("read /proc/self/limits");
+    let core_line = limits_txt.lines().find(|l| l.starts_with("Max core file size")).expect("Max core file size line");
+    let cols: Vec<&str> = core_line["Max core file size".len()..].split_whitespace().collect();
+    assert_eq!(&cols[..2], &["0", "0"], "expected RLIMIT_CORE == (0, 0), got {{core_line}}");
+
     // No guest-writable unwind marker exists beside TMPDIR.
     let parent_entries: Vec<_> = std::fs::read_dir(std::env::temp_dir().parent().unwrap())
         .expect("read parent")
         .filter_map(|e| e.ok())
         .filter(|e| e.file_name().to_string_lossy().starts_with("unwound-"))
         .collect();
-    assert!(parent_entries.is_empty(), "expected no filesystem unwind marker beside TMPDIR, found {parent_entries:?}");
-}
+    assert!(parent_entries.is_empty(), "expected no filesystem unwind marker beside TMPDIR, found {{parent_entries:?}}");
+}}
 
 #[test]
 #[should_panic(expected = "expected boom")]
-fn should_panic_works_with_unwound_channel() {
+fn should_panic_works_with_unwound_channel() {{
     panic!("expected boom");
-}
+}}
 
 #[test]
-fn exit_101_without_unwind_is_not_panic() {
+fn exit_101_without_unwind_is_not_panic() {{
+    // Also spawn a background sleeper before exiting: the runner must kill the child's process
+    // group upon leader exit so no helper outlives the test.
+    let child = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleep helper");
+    eprintln!("HELPER_PID={{}}", child.id());
     std::process::exit(101);
-}
-"#;
-    let said = blaze_test("test_command_runs_linux_sandbox", source);
+}}
+"##, host_sock = host_sock_path.display());
+
+    let said = blaze_test("test_command_runs_linux_sandbox", &source);
+    let _ = std::fs::remove_dir_all(&host_sock_dir);
     assert_eq!(said.code, Some(1), "{}", evidence("only exit_101 test should fail", &said));
     assert!(
         said.stdout.contains("FAILED exit_101_without_unwind_is_not_panic")
@@ -414,6 +481,28 @@ fn exit_101_without_unwind_is_not_panic() {
         "{}",
         evidence("3 sandbox/should_panic tests pass; exit(101) fails without being classified as panicked", &said)
     );
+    let helper_pid: u32 = said
+        .stdout
+        .lines()
+        .chain(said.stderr.lines())
+        .find_map(|l| l.trim().strip_prefix("HELPER_PID=").and_then(|s| s.parse().ok()))
+        .expect("expected HELPER_PID=<pid> in captured failure output");
+    let mut alive = true;
+    for _ in 0..50 {
+        let stat_path = format!("/proc/{helper_pid}/stat");
+        match std::fs::read_to_string(&stat_path) {
+            Err(_) => {
+                alive = false;
+                break;
+            }
+            Ok(s) if s.contains(") Z ") => {
+                alive = false;
+                break;
+            }
+            Ok(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
+    assert!(!alive, "spawned helper pid {helper_pid} outlived its finished test process!");
 }
 
 // Deliberately put beta first in the manifest. The command orders results by owner and path.

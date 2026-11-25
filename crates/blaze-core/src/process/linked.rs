@@ -284,7 +284,16 @@ impl LinkedChild {
     /// deadline and this wait agree).
     pub fn wait_until_on(mut self, deadline: Deadline, clock: &impl Clock) -> Result<Waited<LinkedChild>, LinkError> {
         match self.exited_by(deadline, clock)? {
-            true => self.reap_now().map(Waited::Ended),
+            true => {
+                if self.own_group {
+                    // SAFETY: `self.pid` is unreaped, so its process group id (`self.pid`) cannot
+                    // be reused. Terminate any surviving helpers spawned inside the child's
+                    // process group before reaping the leader so helpers never outlive a finished
+                    // test or command.
+                    unsafe { libc::kill(-self.pid, libc::SIGKILL) };
+                }
+                self.reap_now().map(Waited::Ended)
+            }
             false => Ok(Waited::Running(self)),
         }
     }

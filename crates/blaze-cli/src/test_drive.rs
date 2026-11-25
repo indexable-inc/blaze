@@ -2994,8 +2994,11 @@ impl<'c> Launched<'c, '_, '_> {
             vars.push(("BLAZE_LAUNCH_UNWOUND_FILE", unwound.as_str()));
         }
         #[cfg(target_os = "linux")]
-        if self.tests.harnessed() {
-            vars.push(("BLAZE_LAUNCH_UNWOUND_FILE", "fd:4"));
+        {
+            vars.push(("BLAZE_LAUNCH_SANDBOX_TEMP", temp.as_str()));
+            if self.tests.harnessed() {
+                vars.push(("BLAZE_LAUNCH_UNWOUND_FILE", "fd:4"));
+            }
         }
         // 4. Sandbox + spawn.
         #[cfg(target_os = "macos")]
