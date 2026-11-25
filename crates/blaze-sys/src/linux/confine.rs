@@ -80,9 +80,9 @@ pub fn prlimit(pid: i32, resource: Resource, limit: Rlimit) -> Result<(), Errno>
 /// The most limits one child is given (one per [`Resource`]).
 pub const MOST_LIMITS: usize = 3;
 
-/// The most instructions a [`Filter`] builds into (the deny list, two each, and the head and
-/// tail): a table has a cap (rule 18).
-pub const MOST_FILTER: usize = 80;
+/// The most instructions a [`Filter`] or test filter builds into (the deny list, two each, and
+/// the head and tail): a table has a cap (rule 18).
+pub const MOST_FILTER: usize = 128;
 
 /// What a hermetic child's seccomp filter refuses.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -157,30 +157,40 @@ const AUDIT_ARCH: u32 = 0xC000_00B7;
 /// (the host's counters), `io_uring_setup` (a second path for every call above),
 /// `keyctl`, `add_key`, `request_key`.
 pub mod deny {
-    /// `socket`.
+    /// `socketpair`: in the test sandbox restricted to `AF_UNIX` (anonymous pairs only; `socket`
+    /// itself is in `EPERM` so pathname UNIX and network sockets cannot be opened).
     #[cfg(target_arch = "x86_64")]
-    pub const SOCKET: u32 = 41;
+    pub const SOCKETPAIR: u32 = 53;
     #[cfg(target_arch = "aarch64")]
-    pub const SOCKET: u32 = 198;
-    /// Non-socket syscalls denied with `EPERM` in both hermetic and test sandboxes.
+    pub const SOCKETPAIR: u32 = 199;
+    /// Extra syscalls denied with `EPERM` in the test sandbox on top of [`EPERM`]:
+    /// - remaining mount API: `fsconfig` (431), `fspick` (433), `mount_setattr` (442);
+    /// - kill-domain escape after setup: `setpgid`, `setsid`;
+    /// - metadata mutation not mediated by Landlock: `chmod`/`fchmod`/`fchmodat`/`fchmodat2`,
+    ///   `chown`/`lchown`/`fchown`/`fchownat`, `*setxattr`, `*removexattr`,
+    ///   `utime`/`utimes`/`futimesat`/`utimensat`.
     #[cfg(target_arch = "x86_64")]
-    pub const NON_SOCKET_EPERM: [u32; 18] = [101, 310, 311, 165, 166, 155, 272, 308, 428, 429, 430, 432, 321, 298, 425, 250, 248, 249];
+    pub const TEST_EXTRA_EPERM: [u32; 23] = [
+        431, 433, 442,
+        109, 112,
+        90, 91, 268, 452,
+        92, 94, 93, 260,
+        188, 189, 190, 197, 198, 199,
+        132, 235, 261, 280,
+    ];
     #[cfg(target_arch = "aarch64")]
-    pub const NON_SOCKET_EPERM: [u32; 18] = [117, 270, 271, 40, 39, 41, 97, 268, 428, 429, 430, 432, 280, 241, 425, 219, 217, 218];
+    pub const TEST_EXTRA_EPERM: [u32; 17] = [
+        431, 433, 442,
+        154, 157,
+        52, 53, 452,
+        55, 54,
+        5, 6, 7, 14, 15, 16,
+        88,
+    ];
     #[cfg(target_arch = "x86_64")]
     pub const EPERM: [u32; 19] = [41, 101, 310, 311, 165, 166, 155, 272, 308, 428, 429, 430, 432, 321, 298, 425, 250, 248, 249];
     #[cfg(target_arch = "aarch64")]
     pub const EPERM: [u32; 19] = [198, 117, 270, 271, 40, 39, 41, 97, 268, 428, 429, 430, 432, 280, 241, 425, 219, 217, 218];
-    /// `setpgid` and `setsid`: denied in the test sandbox after setup so spawned helpers cannot
-    /// leave the test's process group (its kill domain).
-    #[cfg(target_arch = "x86_64")]
-    pub const SETPGID: u32 = 109;
-    #[cfg(target_arch = "aarch64")]
-    pub const SETPGID: u32 = 154;
-    #[cfg(target_arch = "x86_64")]
-    pub const SETSID: u32 = 112;
-    #[cfg(target_arch = "aarch64")]
-    pub const SETSID: u32 = 157;
     /// `clone`.
     #[cfg(target_arch = "x86_64")]
     pub const CLONE: u32 = 56;
@@ -252,15 +262,16 @@ const AF_UNIX: u32 = 1;
 const CLONE_NEW_MASK: u32 = 0x7E02_0080;
 
 /// Seccomp filter for a sandboxed test child (`docs/v2/plan/design/test.md`, piece 9):
-/// - Denies all non-socket dangerous syscalls (`ptrace`, mounts, namespaces, `bpf`,
-///   `perf_event_open`, `io_uring_setup`, keyrings) plus `setpgid` and `setsid` (so helpers
-///   cannot leave the test's kill process group) with `EPERM`.
+/// - Denies all syscalls in [`deny::EPERM`] (including `socket`, `ptrace`, mounts, namespaces,
+///   `bpf`, `perf_event_open`, `io_uring_setup`, keyrings) and [`deny::TEST_EXTRA_EPERM`]
+///   (`fsconfig`/`fspick`/`mount_setattr`, `setpgid`/`setsid`, and metadata-mutating `chmod`/
+///   `chown`/`*xattr`/`utime*` syscalls not mediated by Landlock) with `EPERM`.
 /// - Denies `clone3` with `ENOSYS` (glibc/musl fall back to `clone`) and rejects any `clone`
 ///   call carrying a `CLONE_NEW*` namespace flag with `EPERM`, while permitting ordinary threads
 ///   and helper subprocesses.
-/// - Restricts `socket(domain, ..)` to `AF_UNIX` (path-based sockets confined by Landlock to
-///   `$TMPDIR`, abstract sockets scoped by Landlock ABI 6), blocking all off-machine network
-///   families (`AF_INET`, `AF_INET6`, etc.) with `EPERM`.
+/// - Restricts `socketpair(domain, ..)` to `AF_UNIX` (anonymous in-sandbox IPC only; blocking
+///   `socket()` prevents both off-machine network access and pathname `AF_UNIX` connections to
+///   host daemons outside `$TMPDIR`).
 #[blaze::noalloc]
 #[blaze::nopanic]
 pub fn build_test(out: &mut [SockFilter; MOST_FILTER]) -> &[SockFilter] {
@@ -277,18 +288,18 @@ pub fn build_test(out: &mut [SockFilter; MOST_FILTER]) -> &[SockFilter] {
         put(jump(JGE_K, bit, 0, 1));
         put(stmt(RET_K, RET_KILL_PROCESS));
     }
-    for nr in deny::NON_SOCKET_EPERM {
+    for nr in deny::EPERM {
         put(jump(JEQ_K, nr, 0, 1));
         put(stmt(RET_K, RET_ERRNO | EPERM));
     }
-    for nr in [deny::SETPGID, deny::SETSID] {
+    for nr in deny::TEST_EXTRA_EPERM {
         put(jump(JEQ_K, nr, 0, 1));
         put(stmt(RET_K, RET_ERRNO | EPERM));
     }
     put(jump(JEQ_K, deny::CLONE3, 0, 1));
     put(stmt(RET_K, RET_ERRNO | ENOSYS));
-    // `socket(domain, ..)`: allow only AF_UNIX; deny all other socket families with EPERM.
-    put(jump(JEQ_K, deny::SOCKET, 0, 4));
+    // `socketpair(domain, ..)`: allow only anonymous AF_UNIX pairs; deny other families with EPERM.
+    put(jump(JEQ_K, deny::SOCKETPAIR, 0, 4));
     put(stmt(LD_W_ABS, DATA_ARG0));
     put(jump(JEQ_K, AF_UNIX, 0, 1));
     put(stmt(RET_K, RET_ALLOW));

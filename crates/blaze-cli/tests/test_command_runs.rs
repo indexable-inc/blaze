@@ -355,19 +355,19 @@ fn passes() {
 fn linux_sandbox_confines_writes_and_distinguishes_exit_101() {
     let source = r#"
 #[test]
-fn can_write_and_unix_socket_inside_tmpdir() {
+fn can_write_and_unix_socketpair_inside_tmpdir() {
     let tmp = std::env::temp_dir();
     let p = tmp.join("ok.txt");
     std::fs::write(&p, b"hello").expect("write inside TMPDIR");
     assert_eq!(std::fs::read(&p).expect("read back"), b"hello");
-    std::env::set_current_dir(&tmp).expect("chdir to TMPDIR");
-    let _listener = std::os::unix::net::UnixListener::bind("ok.sock").expect("AF_UNIX bind inside TMPDIR");
+    let (_a, _b) = std::os::unix::net::UnixStream::pair().expect("anonymous AF_UNIX socketpair allowed");
     let status = std::process::Command::new("/bin/true").status().expect("spawn helper");
     assert!(status.success());
 }
 
 #[test]
-fn cannot_write_outside_tmpdir_or_open_inet_socket() {
+fn cannot_write_mutate_metadata_or_open_sockets() {
+    use std::os::unix::fs::PermissionsExt;
     let cwd = std::env::current_dir().expect("current dir");
     let escaped = cwd.join("escaped.txt");
     let err = std::fs::write(&escaped, b"nope").expect_err("creating file outside TMPDIR must be denied by Landlock");
@@ -377,8 +377,14 @@ fn cannot_write_outside_tmpdir_or_open_inet_socket() {
         .open(cwd.join("Cargo.toml"))
         .expect_err("opening existing file for write outside TMPDIR must be denied by Landlock");
     assert_eq!(err2.kind(), std::io::ErrorKind::PermissionDenied, "expected EACCES/PermissionDenied writing Cargo.toml, got {err2:?}");
-    let err3 = std::net::TcpListener::bind("127.0.0.1:0").expect_err("AF_INET socket must be denied");
-    assert_eq!(err3.kind(), std::io::ErrorKind::PermissionDenied, "expected EPERM on AF_INET socket, got {err3:?}");
+    let err_chmod = std::fs::set_permissions(cwd.join("Cargo.toml"), std::fs::Permissions::from_mode(0o600))
+        .expect_err("chmod outside TMPDIR must be denied by seccomp");
+    assert_eq!(err_chmod.kind(), std::io::ErrorKind::PermissionDenied, "expected EPERM on chmod, got {err_chmod:?}");
+    let err_inet = std::net::TcpListener::bind("127.0.0.1:0").expect_err("AF_INET socket must be denied");
+    assert_eq!(err_inet.kind(), std::io::ErrorKind::PermissionDenied, "expected EPERM on AF_INET socket, got {err_inet:?}");
+    let err_unix = std::os::unix::net::UnixStream::connect("/run/nonexistent.sock")
+        .expect_err("pathname AF_UNIX socket must be denied");
+    assert_eq!(err_unix.kind(), std::io::ErrorKind::PermissionDenied, "expected EPERM on pathname AF_UNIX socket, got {err_unix:?}");
     // No guest-writable unwind marker exists beside TMPDIR.
     let parent_entries: Vec<_> = std::fs::read_dir(std::env::temp_dir().parent().unwrap())
         .expect("read parent")
