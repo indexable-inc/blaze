@@ -286,7 +286,7 @@ use crate::engine_member_rows::MOST_UNCOVERED_NAMED;
 
 /// The lines block of the note of bodies a macro wrote that no entry covers: no task's (its
 /// domain is no task name's), stable across requests.
-const UNCOVERED_NOTE: &[u8] = b"{bodies a macro wrote that no entry covers}";
+pub(crate) const UNCOVERED_NOTE: &[u8] = b"{bodies a macro wrote that no entry covers}";
 
 /// The label of the root's `fn main` that D104's launcher replaced (body_types/covered.rs
 /// `Root::label`): its findings are at the entry's start, said so (`WRITTEN_UNPLACED`).
@@ -343,16 +343,16 @@ pub(crate) fn plan_views<'h, P: ViewPlan>(outlined: &[Outlined<'_>], skipped: &[
                     Some(cfg) => crate::engine_body_plan::source_with_cfg(source, cfg),
                     None => source,
                 };
-                // A body two units or more hold: its units are in each row's key (rule 21).
-                let source = match views.len() {
-                    0 | 1 => source,
-                    _ => crate::engine_body_plan::source_at_views(source, &views),
-                };
+                // Each row's key covers ONLY its own unit's view (rule 21: distinguishes two units
+                // taking the base slot under different scopes) without folding sibling units, so
+                // narrowing from whole-workspace to scoped checks preserves every standing unit's
+                // body key; standing findings refresh their `VIEW` header from today's reach.
                 if !reached {
                     planned.push(Planned { name: part.name, phase: Phase::new(Stage::Bodies, 0), source, file: one.name });
                 }
-                for at in 0..views.len() {
-                    planned.push(Planned { name: at_view(part.name, P::view_of(&views, at)), phase: Phase::new(Stage::Bodies, 0), source, file: one.name });
+                for (at, &view) in views.iter().enumerate() {
+                    let row_source = crate::engine_body_plan::source_at_views(source, &[view]);
+                    planned.push(Planned { name: at_view(part.name, P::view_of(&views, at)), phase: Phase::new(Stage::Bodies, 0), source: row_source, file: one.name });
                 }
             }
         }
@@ -5545,6 +5545,63 @@ impl<'f> BodiesStage<'f> {
             lines.note(name, crate::engine_lines::Class::Head, crate::engine_head_notes::seed_words(first.head, first.why, frame).as_bytes());
         }
         Ok(())
+    }
+
+    /// Computes today's `VIEW` header for a standing `BodyCheck` row with findings so a standing
+    /// finding carried from a whole-workspace answer into a scoped check (or across a target
+    /// addition/removal) never keeps a stale `VIEW` unit list.
+    ///
+    /// Returns `Ok(None)` when `file` is not in `outlined` (e.g. an unread outline on the `Ready`
+    /// path, where no unit was added or removed so the stored `VIEW` header is already exact) or
+    /// when `self.reach` is absent; returns `Ok(Some(None))` when today's reach has `< 2` holders
+    /// (strip any stale `VIEW`); returns `Ok(Some(Some((base, at, units))))` when `>= 2` holders.
+    #[expect(clippy::type_complexity, reason = "optional refresh result for standing body VIEW header")]
+    pub(crate) fn standing_view<'s, 'r>(
+        &'s self,
+        name: Name,
+        outlined: &[Outlined<'_>],
+        file: Name,
+        frame: &'r Frame,
+    ) -> Result<Option<Option<(Name, u32, Vec<crate::engine_lines::ViewUnit<'s>, &'r Frame>)>>, EngineCheckError> {
+        let Some(reach) = self.reach.as_ref() else { return Ok(None) };
+        if reach.ranks(file).len() < 2 {
+            return Ok(Some(None));
+        }
+        let Ok(file_at) = outlined.binary_search_by(|one| one.name.cmp(&file)) else {
+            return Ok(None);
+        };
+        let Some(one) = outlined.get(file_at) else {
+            return Ok(None);
+        };
+        let Ok(record) = &one.made else {
+            return Ok(Some(None));
+        };
+        let erased = blaze_own::Erased::new(frame);
+        let cuts = crate::engine_plan_cfg::file_cuts(one, erased.handle());
+        let mut views: Vec<ViewKey, &'r Frame> = Vec::new_in(frame);
+        let mut ranks: Vec<u32, &'r Frame> = Vec::new_in(frame);
+        for part in record.parts.iter().filter(|part| matches!((part.name.kind, part.locate), (Kind::BodyCheck, Locate::Source(_)))) {
+            let cut = crate::engine_plan_cfg::part_cut(cuts.as_ref(), part);
+            ranks.clear();
+            ranks.extend(reach.body_ranks(file, cut));
+            reach.views_into(file, cut, &mut views);
+            for (i, _rank) in ranks.iter().enumerate() {
+                if at_view(part.name, Production::view_of(&views, i)) == name {
+                    if ranks.len() < 2 {
+                        return Ok(Some(None));
+                    }
+                    let mut units: Vec<crate::engine_lines::ViewUnit<'s>, &'r Frame> = Vec::with_capacity_in(ranks.len(), frame);
+                    for &r in ranks.iter() {
+                        units.push(reach.label(r).ok_or(EngineCheckError::Unplaced {
+                            body: name,
+                            what: "a unit that holds a row of the body has no label in the plan's reach (engine_body_plan.rs `Reach::label`)",
+                        })?);
+                    }
+                    return Ok(Some(Some((part.name, u32::try_from(i).unwrap_or(u32::MAX), units))));
+                }
+            }
+        }
+        Ok(Some(None))
     }
 
     /// Body `name`'s item as written, when it ran.
