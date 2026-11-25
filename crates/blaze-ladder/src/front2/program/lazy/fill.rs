@@ -666,7 +666,10 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         let place = names.place_of(lib)?;
         let blaze_scope::resolve::At::File(i) = place.at else { return None };
         let shown = names.file_shown(place.krate, i)?;
-        let (line, _) = super::seam_rules::source_position(names, keys, &self.store, outer, start).ok()?;
+        let (line, _) = {
+            let mut cache = self.site_cache.borrow_mut();
+            super::seam_rules::source_position(names, keys, &self.store, outer, start, Some(&mut cache)).ok()?
+        };
         // The text written at the range, when the range is the file's own (an expansion's row
         // is at its outermost call: the call's text).
         let written = names.item_start(lib).and_then(|(_, item_start)| {
@@ -699,8 +702,9 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
     /// column today (seam_rules.rs, THE POSITION RULE). `None`: the item's text is in no file
     /// (a macro's expansion) or the names do not place it.
     pub fn site_shown(&self, item: ItemKey, site: u32) -> Option<(&'n str, u32, u32)> {
-        let file = super::seam_rules::item_file(self.front.names, &self.front.keys, &self.store, item)?;
-        let (line, column) = super::seam_rules::source_position(self.front.names, &self.front.keys, &self.store, item, site).ok()?;
+        let mut cache = self.site_cache.borrow_mut();
+        let file = super::seam_rules::item_file(self.front.names, &self.front.keys, &self.store, item, Some(&mut cache))?;
+        let (line, column) = super::seam_rules::source_position(self.front.names, &self.front.keys, &self.store, item, site, Some(&mut cache)).ok()?;
         Some((file, line, column))
     }
 

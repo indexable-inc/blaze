@@ -44,8 +44,12 @@ use blaze_lir::{Builder, Flags, Full, IntCond, Op, Scalar, Ty, Value};
 /// A NEON integer function of the set.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NeonFn {
-    /// `tbl1`: a lookup in one 16-byte table.
+    /// `tbl1`: a lookup in one 16-byte table (0 for out-of-range indices).
     Tbl1,
+    /// `tbx1`: a lookup in one 16-byte table (keeps the default lane for out-of-range indices).
+    Tbx1,
+    /// `tbl2`: a lookup across two contiguous 16-byte tables (0 for indices >= 32).
+    Tbl2,
     /// `ushl`: shift left by a signed amount, right shifts logical.
     Ushl,
     /// `sshl`: shift left by a signed amount, right shifts arithmetic.
@@ -85,12 +89,16 @@ pub struct NeonCall {
     shape: IntShape,
 }
 
-/// The set: every call and its link name (one home for the spelling). `tbl1` is at the two
-/// shapes the library declares it at; the shifts at every integer shape; the pairwise
-/// maximum and minimum at the six the library declares (no 64-bit lanes: A64 has none).
-const NAMES: [(NeonCall, &str); 42] = [
+/// The set: every call and its link name (one home for the spelling). `tbl1`, `tbx1`, and
+/// `tbl2` are at the two shapes the library declares them at; the shifts at every integer shape;
+/// the pairwise maximum and minimum at the six the library declares (no 64-bit lanes: A64 has none).
+const NAMES: [(NeonCall, &str); 46] = [
     (NeonCall { func: NeonFn::Tbl1, shape: IntShape::V8I8 }, "llvm.aarch64.neon.tbl1.v8i8"),
     (NeonCall { func: NeonFn::Tbl1, shape: IntShape::V16I8 }, "llvm.aarch64.neon.tbl1.v16i8"),
+    (NeonCall { func: NeonFn::Tbx1, shape: IntShape::V8I8 }, "llvm.aarch64.neon.tbx1.v8i8"),
+    (NeonCall { func: NeonFn::Tbx1, shape: IntShape::V16I8 }, "llvm.aarch64.neon.tbx1.v16i8"),
+    (NeonCall { func: NeonFn::Tbl2, shape: IntShape::V8I8 }, "llvm.aarch64.neon.tbl2.v8i8"),
+    (NeonCall { func: NeonFn::Tbl2, shape: IntShape::V16I8 }, "llvm.aarch64.neon.tbl2.v16i8"),
     (NeonCall { func: NeonFn::Ushl, shape: IntShape::V8I8 }, "llvm.aarch64.neon.ushl.v8i8"),
     (NeonCall { func: NeonFn::Ushl, shape: IntShape::V16I8 }, "llvm.aarch64.neon.ushl.v16i8"),
     (NeonCall { func: NeonFn::Ushl, shape: IntShape::V4I16 }, "llvm.aarch64.neon.ushl.v4i16"),
@@ -203,27 +211,42 @@ impl NeonCall {
         NAMES.iter().find(|&&(call, _)| call == self).map(|&(_, name)| name).expect("every call is a row of `NAMES`")
     }
 
-    /// The shapes of its two operands, in order; the result is of [`NeonCall::shape`].
-    pub fn operands(self) -> [IntShape; 2] {
-        match self.func {
-            // The table is always 16 bytes; the indices are of the result's shape.
-            NeonFn::Tbl1 => [IntShape::V16I8, self.shape],
-            NeonFn::Ushl | NeonFn::Sshl | NeonFn::Umaxp | NeonFn::Uminp | NeonFn::Smaxp | NeonFn::Sminp => [self.shape, self.shape],
+    /// The shapes of its operands, in order; the result is of [`NeonCall::shape`].
+    pub fn operands(self) -> &'static [IntShape] {
+        use IntShape::*;
+        match (self.func, self.shape) {
+            (NeonFn::Tbl1, V8I8) => &[V16I8, V8I8],
+            (NeonFn::Tbl1, V16I8) => &[V16I8, V16I8],
+            (NeonFn::Tbx1, V8I8) => &[V8I8, V16I8, V8I8],
+            (NeonFn::Tbx1, V16I8) => &[V16I8, V16I8, V16I8],
+            (NeonFn::Tbl2, V8I8) => &[V16I8, V16I8, V8I8],
+            (NeonFn::Tbl2, V16I8) => &[V16I8, V16I8, V16I8],
+            (_, V8I8) => &[V8I8, V8I8],
+            (_, V16I8) => &[V16I8, V16I8],
+            (_, V4I16) => &[V4I16, V4I16],
+            (_, V8I16) => &[V8I16, V8I16],
+            (_, V2I32) => &[V2I32, V2I32],
+            (_, V4I32) => &[V4I32, V4I32],
+            (_, V1I64) => &[V1I64, V1I64],
+            (_, V2I64) => &[V2I64, V2I64],
         }
     }
 }
 
-/// `call` of the operands `a` and `x`, LIR vectors of [`NeonCall::operands`]' types: the result,
+/// `call` of the operands `ops`, LIR vectors of [`NeonCall::operands`]' types: the result,
 /// an LIR vector of the call's shape. See the module doc for each function's rule.
-pub fn build<A: Allocator + Clone>(b: &mut Builder<A, Full>, call: NeonCall, a: Value, x: Value) -> Value {
-    match call.func {
-        NeonFn::Tbl1 => table_lookup(b, call.shape, a, x),
-        NeonFn::Ushl => shift(b, call.shape, false, a, x),
-        NeonFn::Sshl => shift(b, call.shape, true, a, x),
-        NeonFn::Umaxp => pairwise(b, call.shape, Op::Umax, a, x),
-        NeonFn::Uminp => pairwise(b, call.shape, Op::Umin, a, x),
-        NeonFn::Smaxp => pairwise(b, call.shape, Op::Smax, a, x),
-        NeonFn::Sminp => pairwise(b, call.shape, Op::Smin, a, x),
+pub fn build<A: Allocator + Clone>(b: &mut Builder<A, Full>, call: NeonCall, ops: &[Value]) -> Option<Value> {
+    match (call.func, ops) {
+        (NeonFn::Tbl1, &[table, index]) => Some(table_lookup(b, call.shape, table, index)),
+        (NeonFn::Tbx1, &[default, table, index]) => Some(table_lookup_ext(b, call.shape, default, table, index)),
+        (NeonFn::Tbl2, &[table0, table1, index]) => Some(table_lookup2(b, call.shape, table0, table1, index)),
+        (NeonFn::Ushl, &[a, x]) => Some(shift(b, call.shape, false, a, x)),
+        (NeonFn::Sshl, &[a, x]) => Some(shift(b, call.shape, true, a, x)),
+        (NeonFn::Umaxp, &[a, x]) => Some(pairwise(b, call.shape, Op::Umax, a, x)),
+        (NeonFn::Uminp, &[a, x]) => Some(pairwise(b, call.shape, Op::Umin, a, x)),
+        (NeonFn::Smaxp, &[a, x]) => Some(pairwise(b, call.shape, Op::Smax, a, x)),
+        (NeonFn::Sminp, &[a, x]) => Some(pairwise(b, call.shape, Op::Smin, a, x)),
+        _ => None,
     }
 }
 
@@ -264,6 +287,27 @@ fn table_lookup<A: Allocator + Clone>(b: &mut Builder<A, Full>, shape: IntShape,
             b.shuffle(shape.ty(), looked, looked, &LOW)
         }
     }
+}
+
+/// `tbx1`: `default` and `index` of `shape` (`V8I8` or `V16I8`), `table` a `<16 x i8>`.
+/// Lanes whose unsigned index is `< 16` take `table[index]`; out-of-range lanes keep `default`.
+fn table_lookup_ext<A: Allocator + Clone>(b: &mut Builder<A, Full>, shape: IntShape, default: Value, table: Value, index: Value) -> Value {
+    let looked = table_lookup(b, shape, table, index);
+    let sixteen_lane = b.iconst(Ty::I8, 16);
+    let sixteen = b.convert(Op::Splat, Flags::NONE, shape.ty(), sixteen_lane);
+    let in_range = b.icmp(IntCond::Ult, index, sixteen);
+    b.select(Flags::NONE, in_range, looked, default)
+}
+
+/// `tbl2`: two contiguous `<16 x i8>` tables (`table0` for `0..16`, `table1` for `16..32`),
+/// `index` of `shape` (`V8I8` or `V16I8`). Indices `>= 32` yield 0.
+fn table_lookup2<A: Allocator + Clone>(b: &mut Builder<A, Full>, shape: IntShape, table0: Value, table1: Value, index: Value) -> Value {
+    let low = table_lookup(b, shape, table0, index);
+    let sixteen_lane = b.iconst(Ty::I8, 16);
+    let sixteen = b.convert(Op::Splat, Flags::NONE, shape.ty(), sixteen_lane);
+    let shifted = b.binary(Op::Sub, Flags::NONE, index, sixteen);
+    let high = table_lookup(b, shape, table1, shifted);
+    b.binary(Op::Or, Flags::NONE, low, high)
 }
 
 /// `ushl` (`signed` false) or `sshl` (`signed` true) of `a` by `by`, both of `shape`.

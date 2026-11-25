@@ -546,6 +546,7 @@ struct QueryCache {
     normalize: blaze_hash::HashMap<(ItemKey, blaze_typeck::Name, SmallArgs), PTy, Alloc<'static>>,
     drop_impl: blaze_hash::HashMap<ItemKey, Option<ItemKey>, Alloc<'static>>,
     resolve: blaze_hash::HashMap<(ItemKey, List), (ItemKey, List), Alloc<'static>>,
+    track_caller: blaze_hash::HashMap<ItemKey, bool, Alloc<'static>>,
 }
 
 impl QueryCache {
@@ -555,6 +556,7 @@ impl QueryCache {
             normalize: blaze_hash::HashMap::new_in(alloc),
             drop_impl: blaze_hash::HashMap::new_in(alloc),
             resolve: blaze_hash::HashMap::new_in(alloc),
+            track_caller: blaze_hash::HashMap::new_in(alloc),
         }
     }
 }
@@ -1308,11 +1310,30 @@ enum AskKey {
     Row(ReadKind, ItemKey),
 }
 
+fn build_error_ask_key(error: &BuildError) -> Option<AskKey> {
+    match error {
+        BuildError::Select(blaze_typeck::ResolveError::Missing(q)) => Some(AskKey::Question(*q)),
+        BuildError::NoAdt { adt } => Some(AskKey::Adt(*adt)),
+        _ => None,
+    }
+}
+
+fn layout_refusal_ask_key(why: &blaze_build::layout::Refusal) -> Option<AskKey> {
+    use blaze_build::layout::{Missing, Refusal};
+    match why {
+        Refusal::NoAdt(adt) | Refusal::Missing(Missing { item: adt }) => Some(AskKey::Adt(*adt)),
+        Refusal::Ground(error) | Refusal::FieldGround { error, .. } => build_error_ask_key(error),
+        _ => None,
+    }
+}
+
 fn ask_key(e: &RunError) -> Option<AskKey> {
     match e {
-        RunError::Build { error: BuildError::Select(blaze_typeck::ResolveError::Missing(q)), .. }
-        | RunError::Resolve { error: blaze_typeck::ResolveError::Missing(q), .. } => Some(AskKey::Question(*q)),
-        RunError::Build { error: BuildError::NoAdt { adt }, .. } | RunError::NoAdt { adt, .. } => Some(AskKey::Adt(*adt)),
+        RunError::Build { error, .. } => build_error_ask_key(error).or_else(|| object_missing(e).map(AskKey::Object)),
+        RunError::Resolve { error: blaze_typeck::ResolveError::Missing(q), .. } => Some(AskKey::Question(*q)),
+        RunError::NoAdt { adt, .. } => Some(AskKey::Adt(*adt)),
+        RunError::Vtable { why: VtableFail::Layout(error), .. } => layout_refusal_ask_key(&error.why),
+        RunError::Vtable { why: VtableFail::Build(error), .. } => build_error_ask_key(error),
         _ => object_missing(e).map(AskKey::Object),
     }
 }
@@ -1661,7 +1682,14 @@ impl<P: FrontEnd> blaze_build::Adts for CachedFront<'_, P> {
     fn abi(&self, item: ItemKey) -> Option<blaze_build::Abi> { self.front.abi(item) }
     fn nounwind(&self, owner: ItemKey) -> Option<bool> { self.front.nounwind(owner) }
     fn fn_attrs(&self, owner: ItemKey) -> blaze_lir::func::FnAttrs { self.front.fn_attrs(owner) }
-    fn track_caller(&self, instance: Instance, ground: &mut PortableTys<'_>) -> Option<bool> { self.front.track_caller(instance, ground) }
+    fn track_caller(&self, instance: Instance, ground: &mut PortableTys<'_>) -> Option<bool> {
+        if let Some(&hit) = self.cache.borrow().track_caller.get(&instance.item) {
+            return Some(hit);
+        }
+        let ans = self.front.track_caller(instance, ground)?;
+        self.cache.borrow_mut().track_caller.insert(instance.item, ans);
+        Some(ans)
+    }
     fn location_adt(&self) -> Option<ItemKey> { self.front.location_adt() }
     fn caller_site(&self, owner: ItemKey, expr: blaze_typeck::ExprId) -> Result<blaze_build::CallerSite<'_>, blaze_build::SiteGap> { self.front.caller_site(owner, expr) }
     fn def_site(&self, item: ItemKey) -> Result<blaze_build::CallerSite<'_>, blaze_build::SiteGap> { self.front.def_site(item) }
@@ -3340,7 +3368,32 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
         }
         let mut reach = Reach::new_in(alloc);
         let mut vtable_data: AVec<'_, (blaze_code::record::Symbol, AVec<'static, u8>)> = blaze_own::Vec::new_in(alloc);
-        if !resolved.is_empty() && program.fn_count() > 0 {
+        if !resolved.is_empty() {
+            // A fresh pooled worker whose first job is a static with vtables starts with
+            // `program.fn_count() == 0` when `self.entry` is `None` (`MakerStart::Direct`).
+            // Seed at least one checked fn row so `Asking::new(..., 0, ...)`, `vtable_rows`,
+            // and `program.make_asked(0)` have a valid world row — never skip building the
+            // carried vtable datums (which emits a static referencing an uncarried vtable,
+            // poisoning CAS and failing all later runs with `StaticUnsent`).
+            if program.fn_count() == 0 {
+                let seed = self
+                    .entry
+                    .or_else(|| program.fn_lang(FnLang::DropInPlace))
+                    .or_else(|| {
+                        resolved.iter().find_map(|&(_, v)| {
+                            program.object_trait(v.principal).and_then(|o| o.methods.first().map(|m| m.item))
+                        })
+                    });
+                if let Some(seed_fn) = seed {
+                    state.ensure(program, &mut self.typing, seed_fn, &mut self.checks)?;
+                }
+            }
+            if program.fn_count() == 0 {
+                return Err(RunError::OneBody {
+                    key: item,
+                    why: "a static references a vtable, and no function row could be seeded to build its vtable datum (make_one.rs `static_over`)",
+                });
+            }
             let mut asked = AskProgress::new_in(alloc);
             let mut owners = 0usize;
             loop {
@@ -3404,6 +3457,14 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
                         }
                     }
                     Ok(()) => break,
+                }
+            }
+            for &(_, sym) in vtable_syms.iter() {
+                if !vtable_data.iter().any(|(s, _)| *s == sym) {
+                    return Err(RunError::OneBody {
+                        key: item,
+                        why: "a static's referenced vtable datum was not built (make_one.rs `static_over`)",
+                    });
                 }
             }
         }

@@ -449,6 +449,9 @@ pub struct LazyProgram<'n, S: NamesSource<'n> = &'n Names<'n>> {
     /// Each internal-symbol declaration bound to its definition once (front_end.rs
     /// `InternalBindings`; the rule is seam_rules.rs's, shared with the whole program).
     internal_bindings: RefCell<front_end::InternalBindings<'n>>,
+    /// Per-program memoization cache for `caller_site`, `def_site`, and macro expansion
+    /// placement (seam_rules.rs `SiteCache`).
+    site_cache: RefCell<seam_rules::SiteCache<'n>>,
     /// Each crate's members keyed as their containers' heads key them, made the first time a
     /// key of the crate is asked that the key map does not know (lazy/locate.rs).
     member_rows: HashMap<usize, locate::MemberIndex<'n>, Global>,
@@ -581,6 +584,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             asked_gaps: RefCell::new(Vec::new_in(Global)),
             definers: crate::front2::tait::Definers::new_in(alloc),
             internal_bindings: RefCell::new(front_end::InternalBindings::new_in(alloc)),
+            site_cache: RefCell::new(seam_rules::SiteCache::new_in(alloc)),
             member_rows: HashMap::new_in(Global),
             inline_for_specs: AVec::new_in(alloc),
             fixed_spell: Spelling::fixed(),

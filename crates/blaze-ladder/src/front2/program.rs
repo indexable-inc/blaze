@@ -2284,7 +2284,7 @@ impl FrontEnd for Front2Program<'_> {
         let row = self.by_key.get(&owner).and_then(|&i| self.fns.get(i)).ok_or(not_live)?;
         let body = row.body.as_ref().ok_or(not_live)?;
         let anchor_owner = body.param_subst.as_ref().map_or(owner, |(orig, _)| *orig);
-        lazy::seam_rules::caller_site(self.front.names, &self.front.keys, &self.store, anchor_owner, body, expr)
+        lazy::seam_rules::caller_site(self.front.names, &self.front.keys, &self.store, anchor_owner, body, expr, None)
     }
 
     /// By seam_rules.rs `def_site`, from the item's head and the names source.
@@ -2294,7 +2294,7 @@ impl FrontEnd for Front2Program<'_> {
             .iter()
             .find(|s| self.fns.get(s.row).is_some_and(|r| r.key == item))
             .map_or(item, |s| s.orig);
-        lazy::seam_rules::def_site(self.front.names, &self.front.keys, &self.store, anchor)
+        lazy::seam_rules::def_site(self.front.names, &self.front.keys, &self.store, anchor, None)
     }
 
     fn expr_site(&self, owner: ItemKey, expr: ExprId) -> Option<u32> {
@@ -2306,7 +2306,7 @@ impl FrontEnd for Front2Program<'_> {
     /// item_grain.rs) and that text's line starts: an edit above the item moves the answer and
     /// no record (seam_rules.rs).
     fn source_position(&self, item: ItemKey, site: u32) -> Result<(u32, u32), crate::seam::PositionGap> {
-        lazy::seam_rules::source_position(self.front.names, &self.front.keys, &self.store, item, site)
+        lazy::seam_rules::source_position(self.front.names, &self.front.keys, &self.store, item, site, None)
     }
 
     /// A static the program reaches: its head's mutability and `#[thread_local]` (statics.rs).
