@@ -1212,17 +1212,19 @@ impl<A: Allocator, const WINDOW_FULL: bool> SeqExecCtx<'_, '_, A, WINDOW_FULL> {
     ///   `lit_len <= lit_limit - lit_ptr` (zero out-of-line `memcpy` calls, keeping callers true
     ///   call-free leaf functions).
     /// - Matches: unconditional 32-byte NEON wildcopy for `offset >= 32` (with stride-32 `2x16B`
-    ///   loop for `match_len > 32`), 16B wildcopy loop for `16 <= offset < 32`, and inline
-    ///   8B/doubled-16B copy for `8 <= offset < 16`.
+    ///   loop for `match_len > 32`), 16B wildcopy loop for `16 <= offset < 32`, inline
+    ///   8B/doubled-16B copy for `8 <= offset < 16`, inline 64-bit pattern splat + paired 2x8B
+    ///   wildcopy for `offset in {1, 2, 4}`, and period-multiple seed + 8B wildcopy for
+    ///   `offset in {3, 5, 6, 7}`.
     ///
     /// Returns `true` when executed inline (`self.out_ptr` advanced by `lit_len + match_len`,
     /// `self.lit_ptr` advanced by `lit_len`). Returns `false` without mutating `self.out_ptr`,
-    /// `self.lit_ptr`, or output memory whenever `offset < 8`, literal/output slack is exhausted
+    /// `self.lit_ptr`, or output memory whenever `offset == 0`, literal/output slack is exhausted
     /// (including `lit_len > lit_limit - lit_ptr` for `lit_len > 32`), or `offset` exceeds the
     /// active window, letting the caller classify and execute the sequence outside the hot loop.
     #[inline(always)]
     pub fn exec_leaf_fast(&mut self, lit_len: u32, offset: u32, match_len: u32) -> bool {
-        if offset < 8 || self.lit_ptr >= self.lit_limit {
+        if self.lit_ptr >= self.lit_limit {
             return false;
         }
         // SAFETY: `self.out_ptr <= self.out_limit` within `self.cursor`'s buffer (struct invariant).
@@ -1244,7 +1246,9 @@ impl<A: Allocator, const WINDOW_FULL: bool> SeqExecCtx<'_, '_, A, WINDOW_FULL> {
             // SAFETY: `after_lit >= self.out_ptr >= self.window_base` within the same allocation.
             unsafe { after_lit.offset_from_unsigned(self.window_base) }
         };
-        if off > max_off {
+        // Single unsigned compare rejects both `off == 0` (`usize::MAX >= max_off` since
+        // `max_off <= isize::MAX`) and `off > max_off`.
+        if off.wrapping_sub(1) >= max_off {
             return false;
         }
 
@@ -1270,7 +1274,8 @@ impl<A: Allocator, const WINDOW_FULL: bool> SeqExecCtx<'_, '_, A, WINDOW_FULL> {
             // - `self.lit_ptr < self.lit_limit` implies `self.lit_limit == lit_base + lit_total - 31`,
             //   and `ll <= lit_slack = lit_limit - lit_ptr` proves `self.lit_ptr + ll <= lits_end - 31`,
             //   i.e. `self.lit_ptr + ll + 31 <= lits_end`.
-            // - In every iteration of `while dp < after_lit`, `k = dp - self.out_ptr <= ll - 1`, so:
+            // - Because `ll > 32`, `dp = self.out_ptr < after_lit` strictly holds on entry; in
+            //   every iteration of the bottom-tested loop, `k = dp - self.out_ptr <= ll - 1`, so:
             //   * Source reads `[self.lit_ptr + k .. self.lit_ptr + k + 32]` and steps `sp` to
             //     `self.lit_ptr + k + 32 <= self.lit_ptr + ll + 31 <= lits_end` (in bounds).
             //   * Dest writes `[self.out_ptr + k .. self.out_ptr + k + 32]` and steps `dp` to
@@ -1282,50 +1287,77 @@ impl<A: Allocator, const WINDOW_FULL: bool> SeqExecCtx<'_, '_, A, WINDOW_FULL> {
             unsafe {
                 let mut sp = self.lit_ptr;
                 let mut dp = self.out_ptr;
-                while dp < after_lit {
+                loop {
                     copy_32_unaligned_pair(sp, dp);
                     sp = sp.add(32);
                     dp = dp.add(32);
+                    if dp >= after_lit {
+                        break;
+                    }
                 }
             }
         }
 
         // SAFETY:
+        // - All early exits have passed; `self.lit_ptr + ll <= lits_end` (`<= lits_end` for
+        //   `ll <= 32` and `<= self.lit_limit < lits_end` for `ll > 32`), and
+        //   `end = after_lit + ml < self.out_limit <= out_base + cap - 47`.
         // - `out_base..after_lit` is initialized with the exact `ll` literal bytes (wild bytes
-        //   from literal copy sit strictly at or past `after_lit`, never read because `off >= 8`).
-        // - `total_u64 < avail_out` guarantees `after_lit + ml <= min(block_out_limit, cap - 48)`,
-        //   leaving at least 48 writable spare bytes past `after_lit + ml` (`after_lit + 32 <=
-        //   cap_end - 16 < cap_end`, even if `ml == 0`).
-        // - `8 <= off <= max_off`:
+        //   from literal copy sit strictly at or past `after_lit`, never read because `off >= 1`).
+        // - `total_u64 < avail_out` guarantees `end <= min(block_out_limit, cap - 48)`, leaving
+        //   at least 48 writable spare bytes past `end` (`after_lit + 32 <= cap_end - 16`, even
+        //   when `ml == 0`).
+        // - `1 <= off <= max_off`:
         //   * When `!WINDOW_FULL`: `max_off = after_lit - window_base`, `window_base >= out_base`.
         //   * When `WINDOW_FULL`: constructor proved `initial_out_ptr - out_base >= max_window`,
         //     and `after_lit >= self.out_ptr >= initial_out_ptr`.
         //   Hence `msrc = after_lit.sub(off)` lies inside initialized `out_base..after_lit`:
         //   * `off >= 32`: `msrc + 32 <= after_lit`, so unconditional 32B match wildcopy reads
-        //     only initialized history; any `ml > 32` stride-32 loop maintains `dp - sp == off >= 32`
-        //     (so `sp + 32 <= dp`, strictly non-overlapping and reading only initialized bytes) and
-        //     writes `<= after_lit + ml + 31 <= cap_end - 17 < cap_end`.
+        //     only initialized history; any `ml > 32` bottom-tested stride-32 loop enters with
+        //     `dp = after_lit + 32 < end`, maintains `dp - sp == off >= 32` (so `sp + 32 <= dp`,
+        //     strictly non-overlapping and reading only initialized bytes), and writes
+        //     `<= end + 31 <= cap_end - 17 < cap_end`.
         //   * `16 <= off < 32`: `msrc + 16 <= after_lit`, so the initial 16B copy and any `ml > 16`
-        //     16B wildcopy loop maintain `dp - sp == off >= 16` and write `<= after_lit + ml + 15`.
+        //     bottom-tested 16B wildcopy loop (`dp = after_lit + 16 < end` on entry) maintain
+        //     `dp - sp == off >= 16` and write `<= end + 15`.
         //   * `8 <= off < 16`: two 8B copies initialize `after_lit..after_lit + 16` with
-        //     `dp - sp == off >= 8`; for `ml > 16`, doubling to period `2 * off >= 16` starts at
-        //     `sp = msrc.add(16 - off) >= msrc + 1 >= out_base` with `dp - sp == 2 * off >= 16`,
-        //     reading strictly initialized bytes and ending at `<= after_lit + ml + 15`.
-        // - Finally, `self.out_ptr` advances to `after_lit + ml < self.out_limit`, preserving
-        //   `self.out_ptr <= self.out_limit`, and `self.lit_ptr` advances by `ll` within `literals`
-        //   (`<= lits_end` for `ll <= 32` and `<= self.lit_limit < lits_end` for `ll > 32`).
+        //     `dp - sp == off >= 8`; for `ml > 16`, doubling to period `2 * off >= 16` enters the
+        //     bottom-tested loop with `dp = after_lit + 16 < end` and
+        //     `sp = msrc.add(16 - off) >= msrc + 1 >= out_base` (`dp - sp == 2 * off >= 16`),
+        //     reading strictly initialized bytes and ending at `<= end + 15`.
+        //   * `off in {1, 2, 4}`: `after_lit.sub(off)..after_lit` holds `off` initialized bytes;
+        //     splatting them to `word: u64` repeats the exact period across 8 bytes in native
+        //     endianness. The initial 8B store and any `ml > 8` bottom-tested paired 2x8B
+        //     stride-16 loop (`dp = after_lit + 8 < end` on entry; preventing
+        //     `LoopIdiomRecognize` from emitting `memset`/`memset_pattern16`) write up to
+        //     `end + 15 <= cap_end - 33 < cap_end`.
+        //   * `off in {3, 5, 6, 7}`: `step = if off == 3 { 9 } else { off << 1 }` is an exact
+        //     multiple of `off` with `9 <= step <= 14`. Seeding `0..step` (`step >= 9 > 0`) reads
+        //     only initialized `msrc + i < after_lit + i` and writes `after_lit..after_lit + step`
+        //     (`<= end + 14 <= cap_end - 34`). For `ml > step`, the bottom-tested loop enters with
+        //     `dp = after_lit + step < end`; each 8B copy from `dp.sub(step)` reads strictly
+        //     already-written bytes (`step >= 9 > 8`) at an exact multiple of `off`, writing up
+        //     to `end + 7 <= cap_end - 41 < cap_end`.
+        // - Finally, `self.lit_ptr` and `self.out_ptr` advance to their exact post-sequence
+        //   positions (`self.out_ptr = end < self.out_limit`, preserving `self.out_ptr <= self.out_limit`).
         unsafe {
+            self.lit_ptr = self.lit_ptr.add(ll);
+            let end = after_lit.add(ml);
+            self.out_ptr = end;
+
             if off >= 32 {
                 let msrc = after_lit.sub(off);
                 copy_32_unaligned_pair(msrc, after_lit);
                 if ml > 32 {
                     let mut sp = msrc.add(32);
                     let mut dp = after_lit.add(32);
-                    let end = after_lit.add(ml);
-                    while dp < end {
+                    loop {
                         copy_32_unaligned_pair(sp, dp);
                         sp = sp.add(32);
                         dp = dp.add(32);
+                        if dp >= end {
+                            break;
+                        }
                     }
                 }
             } else if off >= 16 {
@@ -1335,15 +1367,17 @@ impl<A: Allocator, const WINDOW_FULL: bool> SeqExecCtx<'_, '_, A, WINDOW_FULL> {
                 if ml > 16 {
                     let mut sp = msrc.add(16);
                     let mut dp = after_lit.add(16);
-                    let end = after_lit.add(ml);
-                    while dp < end {
+                    loop {
                         let v = ptr::read_unaligned(sp.cast::<u128>());
                         ptr::write_unaligned(dp.cast::<u128>(), v);
                         sp = sp.add(16);
                         dp = dp.add(16);
+                        if dp >= end {
+                            break;
+                        }
                     }
                 }
-            } else {
+            } else if off >= 8 {
                 let msrc = after_lit.sub(off);
                 let m0 = ptr::read_unaligned(msrc.cast::<u64>());
                 ptr::write_unaligned(after_lit.cast::<u64>(), m0);
@@ -1351,21 +1385,64 @@ impl<A: Allocator, const WINDOW_FULL: bool> SeqExecCtx<'_, '_, A, WINDOW_FULL> {
                     let m1 = ptr::read_unaligned(msrc.add(8).cast::<u64>());
                     ptr::write_unaligned(after_lit.add(8).cast::<u64>(), m1);
                     if ml > 16 {
-                        let end = after_lit.add(ml);
                         let mut sp = msrc.add(16 - off);
                         let mut dp = after_lit.add(16);
-                        while dp < end {
+                        loop {
                             let v = ptr::read_unaligned(sp.cast::<u128>());
                             ptr::write_unaligned(dp.cast::<u128>(), v);
                             sp = sp.add(16);
                             dp = dp.add(16);
+                            if dp >= end {
+                                break;
+                            }
+                        }
+                    }
+                }
+            } else if off == 1 || off == 2 || off == 4 {
+                let word = if off == 1 {
+                    u64::from(*after_lit.sub(1)).wrapping_mul(0x0101_0101_0101_0101)
+                } else if off == 2 {
+                    u64::from(ptr::read_unaligned(after_lit.sub(2).cast::<u16>()))
+                        .wrapping_mul(0x0001_0001_0001_0001)
+                } else {
+                    let q = u64::from(ptr::read_unaligned(after_lit.sub(4).cast::<u32>()));
+                    q | (q << 32)
+                };
+                ptr::write_unaligned(after_lit.cast::<u64>(), word);
+                if ml > 8 {
+                    let mut dp = after_lit.add(8);
+                    loop {
+                        ptr::write_unaligned(dp.cast::<u64>(), word);
+                        ptr::write_unaligned(dp.add(8).cast::<u64>(), word);
+                        dp = dp.add(16);
+                        if dp >= end {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                let step = if off == 3 { 9usize } else { off << 1 };
+                let msrc = after_lit.sub(off);
+                let mut i = 0usize;
+                loop {
+                    *after_lit.add(i) = *msrc.add(i);
+                    i += 1;
+                    if i >= step {
+                        break;
+                    }
+                }
+                if ml > step {
+                    let mut dp = after_lit.add(step);
+                    loop {
+                        let v = ptr::read_unaligned(dp.sub(step).cast::<u64>());
+                        ptr::write_unaligned(dp.cast::<u64>(), v);
+                        dp = dp.add(8);
+                        if dp >= end {
+                            break;
                         }
                     }
                 }
             }
-
-            self.lit_ptr = self.lit_ptr.add(ll);
-            self.out_ptr = after_lit.add(ml);
         }
         true
     }
@@ -1683,7 +1760,10 @@ impl<'a> RevBitSlack8<'a> {
     /// `bits_consumed >= 64`.
     #[inline(always)]
     pub fn reload_window_slack8(&mut self) -> Option<u64> {
-        if self.ptr < self.limit || self.bits_consumed >= 64 {
+        if self.ptr < self.limit {
+            return None;
+        }
+        if self.bits_consumed >= 64 {
             return None;
         }
         let adv = (self.bits_consumed >> 3).truncate_to::<usize>();
@@ -1710,7 +1790,10 @@ impl<'a> RevBitSlack8<'a> {
     /// `bits_consumed >= 64`.
     #[inline(always)]
     pub fn reload_window_slack16(&mut self) -> Option<u64> {
-        if self.limit.addr() == usize::MAX || self.bits_consumed >= 64 {
+        if self.limit.addr() == usize::MAX {
+            return None;
+        }
+        if self.bits_consumed >= 64 {
             return None;
         }
         // SAFETY: Non-sentinel `self.limit == orig_start + 8` implies `open_slack8` observed
@@ -2234,9 +2317,6 @@ mod tests {
             // Rejections must return `false` and leave `len` and `lit_pos` untouched.
             assert!(!ctx.exec_leaf_fast(33, 16, 4)); // lit_len > 32 exceeding remaining lit_slack (15)
             assert!(!ctx.exec_leaf_fast(4, 0, 4)); // offset == 0
-            for short_off in 1u32..=7 {
-                assert!(!ctx.exec_leaf_fast(4, short_off, 8)); // offset < 8 bails cleanly
-            }
             assert!(!ctx.exec_leaf_fast(4, (saved_len + 5).truncate_to::<u32>(), 4)); // offset > after_lit
             assert!(!ctx.exec_leaf_fast(4, 16, (block_limit - saved_len).truncate_to::<u32>())); // > block_limit
             assert!(!ctx.exec_leaf_fast(4, 16, u32::MAX)); // huge match_len
@@ -2269,7 +2349,6 @@ mod tests {
                 let mut full_ctx = cur.seq_exec_ctx::<true>(lits, 0, block_limit, 0, 24);
                 assert!(!full_ctx.exec_leaf_fast(4, 25, 4)); // offset > max_window
                 assert!(!full_ctx.exec_leaf_fast(4, 0, 4)); // offset == 0
-                assert!(!full_ctx.exec_leaf_fast(4, 7, 4)); // offset < 8
                 assert!(full_ctx.exec_leaf_fast(4, 24, 6)); // offset == max_window
                 full_ctx.finish();
             }
@@ -2516,7 +2595,7 @@ mod tests {
                         (ok, len, lp)
                     };
 
-                    if offset < 8 || (lit_len > 32 && ll_u > lit_slack) {
+                    if lit_len > 32 && ll_u > lit_slack {
                         assert!(
                             !grow_ok,
                             "grow should bail for off={offset}, ll={lit_len}, ml={match_len}"
@@ -2562,8 +2641,8 @@ mod tests {
             }
         }
 
-        // Also test cold start (`after_lit == offset`) for offsets 1..=40: `1..=7` bail cleanly
-        // without mutating `out_pos` or `lit_pos`; `8..=40` (including `lit_len > 32`) execute inline.
+        // Also test cold start (`after_lit == offset`) for all offsets 1..=40 (including 1..=7
+        // overlapping short offsets and `lit_len > 32`) inline at the exact 48B slack boundary.
         for offset in 1u32..=40 {
             let off_u = offset.widen_to::<usize>();
             for &match_len in &match_lens {
@@ -2580,13 +2659,6 @@ mod tests {
                     cur.finish();
                     (ok, len, lp)
                 };
-                if offset < 8 {
-                    assert!(!cold_ok, "cold should bail for off={offset}, ml={match_len}");
-                    assert_eq!(cold_len, 0);
-                    assert_eq!(cold_lit, 0);
-                    assert!(out_cold.is_empty());
-                    continue;
-                }
                 assert!(cold_ok, "cold failed for off={offset}, ml={match_len}");
                 assert_eq!(cold_len, exact_out);
                 assert_eq!(cold_lit, off_u);
@@ -2600,6 +2672,120 @@ mod tests {
                     out_cold.as_slice(),
                     expected.as_slice(),
                     "cold mismatch for off={offset}, ml={match_len}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn seq_exec_ctx_all_offsets_1_to_36_dense_oracle() {
+        let h = heap();
+        let alloc = h.alloc();
+
+        let mut seed = [0u8; 64];
+        for (i, b) in seed.iter_mut().enumerate() {
+            *b = i.wrapping_mul(37).wrapping_add(13).truncate_to::<u8>();
+        }
+        let mut lits = [0u8; 128];
+        for (i, b) in lits.iter_mut().enumerate() {
+            *b = i.wrapping_mul(53).wrapping_add(7).truncate_to::<u8>();
+        }
+
+        let lit_lens: [u32; 5] = [0, 1, 7, 32, 40];
+        let mut out = Vec::try_with_capacity_in(256, alloc).expect("cap");
+        let mut expected = Vec::try_with_capacity_in(256, alloc).expect("cap");
+
+        for offset in 1u32..=36 {
+            let off_u = offset.widen_to::<usize>();
+            for &lit_len in &lit_lens {
+                let ll_u = lit_len.widen_to::<usize>();
+                for match_len in 3u32..=80 {
+                    let ml_u = match_len.widen_to::<usize>();
+                    let exact_out = seed.len() + ll_u + ml_u;
+
+                    out.clear();
+                    out.extend_from_slice(&seed);
+                    let (ok, len, lp) = {
+                        let mut cur = out.byte_cursor();
+                        let mut ctx = cur.seq_exec_ctx::<false>(&lits, 0, exact_out, 0, 4096);
+                        let ok = ctx.exec_leaf_fast(lit_len, offset, match_len);
+                        let len = ctx.len();
+                        let lp = ctx.lit_pos();
+                        ctx.commit();
+                        cur.finish();
+                        (ok, len, lp)
+                    };
+                    assert!(ok, "failed for off={offset}, ll={lit_len}, ml={match_len}");
+                    assert_eq!(len, exact_out);
+                    assert_eq!(lp, ll_u);
+
+                    expected.clear();
+                    expected.extend_from_slice(&seed);
+                    expected.extend_from_slice(&lits[..ll_u]);
+                    for _ in 0..ml_u {
+                        let b = expected[expected.len() - off_u];
+                        expected.push(b);
+                    }
+                    assert_eq!(
+                        out.as_slice(),
+                        expected.as_slice(),
+                        "mismatch for off={offset}, ll={lit_len}, ml={match_len}"
+                    );
+                }
+            }
+        }
+
+        // Exact +48B capacity slack boundary for all short offsets 1..=7 across match lengths 0..=80
+        // in both WINDOW_FULL = false and WINDOW_FULL = true, plus offset == 0 rejection.
+        for offset in 1u32..=7 {
+            let off_u = offset.widen_to::<usize>();
+            for match_len in 0u32..=80 {
+                let ml_u = match_len.widen_to::<usize>();
+                let exact_out = seed.len() + 7 + ml_u;
+                let cap = exact_out + 48;
+
+                let mut out_grow = Vec::try_with_capacity_in(cap, alloc).expect("cap");
+                out_grow.extend_from_slice(&seed);
+                {
+                    let mut cur = out_grow.byte_cursor();
+                    let mut ctx = cur.seq_exec_ctx::<false>(&lits, 0, exact_out, 0, 4096);
+                    assert!(!ctx.exec_leaf_fast(7, 0, match_len));
+                    assert!(ctx.exec_leaf_fast(7, offset, match_len));
+                    assert_eq!(ctx.len(), exact_out);
+                    assert_eq!(ctx.lit_pos(), 7);
+                    ctx.commit();
+                    cur.finish();
+                }
+
+                let mut out_full = Vec::try_with_capacity_in(cap, alloc).expect("cap");
+                out_full.extend_from_slice(&seed);
+                {
+                    let mut cur = out_full.byte_cursor();
+                    let mut ctx = cur.seq_exec_ctx::<true>(&lits, 0, exact_out, 0, 32);
+                    assert!(!ctx.exec_leaf_fast(7, 0, match_len));
+                    assert!(ctx.exec_leaf_fast(7, offset, match_len));
+                    assert_eq!(ctx.len(), exact_out);
+                    assert_eq!(ctx.lit_pos(), 7);
+                    ctx.commit();
+                    cur.finish();
+                }
+
+                expected.clear();
+                expected.extend_from_slice(&seed);
+                expected.extend_from_slice(&lits[..7]);
+                for _ in 0..ml_u {
+                    let b = expected[expected.len() - off_u];
+                    expected.push(b);
+                }
+                assert_eq!(
+                    out_grow.as_slice(),
+                    expected.as_slice(),
+                    "exact-slack grow mismatch for off={offset}, ml={match_len}"
+                );
+                assert_eq!(
+                    out_full.as_slice(),
+                    expected.as_slice(),
+                    "exact-slack full mismatch for off={offset}, ml={match_len}"
                 );
             }
         }

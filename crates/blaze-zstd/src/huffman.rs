@@ -17,14 +17,31 @@ const MAX_HUFF_TABLE_SIZE: usize = 1 << MAX_HUFF_BITS;
 const HUFF_FSE_MAX_SYMBOL: usize = 12;
 const HUFF_FSE_MAX_LOG: u8 = 6;
 
+/// Single-symbol Huffman decoding entry packed into a single `u16` (`#[repr(transparent)]`)
+/// so `slice::fill` vectorizes directly to 128-bit NEON stores:
+/// - bits `0..8`: `symbol: u8`
+/// - bits `8..16`: `num_bits: u8`
+#[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct HuffEntry {
-    symbol: u8,
-    num_bits: u8,
-}
+struct HuffEntry(u16);
 
 impl HuffEntry {
-    const ZERO: Self = Self { symbol: 0, num_bits: 0 };
+    const ZERO: Self = Self(0);
+
+    #[inline(always)]
+    fn new(symbol: u8, num_bits: u8) -> Self {
+        Self(u16::from(symbol) | (u16::from(num_bits) << 8))
+    }
+
+    #[inline(always)]
+    fn symbol(self) -> u8 {
+        self.0.truncate_to::<u8>()
+    }
+
+    #[inline(always)]
+    fn num_bits(self) -> u8 {
+        (self.0 >> 8).truncate_to::<u8>()
+    }
 }
 
 /// Double-symbol (`HUF_4X2`) decoding entry packed into a single `u32` (`#[repr(transparent)]`):
@@ -197,20 +214,30 @@ impl HuffTable {
             return false;
         }
 
-        // Validate every explicit weight <= MAX_HUFF_BITS (11), sum `2^(w - 1)`, and count
-        // rank frequencies in one pass (`weight_sum <= 255 * 1024 = 261_120`, never overflows).
-        let mut weight_sum: u32 = 0;
+        // Pass 1 (branchless): validate every explicit weight <= MAX_HUFF_BITS (11) and count
+        // rank frequencies. `rank_count[0]` counts absent symbols (scattered past present symbols
+        // in Pass 2 with zero branches).
+        let mut max_w: u8 = 0;
         let mut rank_count = Pow2Array::<u16, 16>::splat(0);
-        for i in 0..num_explicit {
-            let w = weights.get_masked(i);
-            if w > MAX_HUFF_BITS {
-                return false;
+        let Some(exp_slice) = weights.as_slice().get(..num_explicit) else {
+            return false;
+        };
+        for &w in exp_slice {
+            if w > max_w {
+                max_w = w;
             }
-            if w > 0 {
-                weight_sum = weight_sum.wrapping_add(1u32 << u32::from(w - 1));
-                let w_idx = usize::from(w);
-                rank_count.set_masked(w_idx, rank_count.get_masked(w_idx).wrapping_add(1));
-            }
+            let w_idx = usize::from(w);
+            rank_count.set_masked(w_idx, rank_count.get_masked(w_idx).wrapping_add(1));
+        }
+        if max_w > MAX_HUFF_BITS {
+            return false;
+        }
+
+        // Sum `2^(w - 1)` across weights `1..=11` (`weight_sum <= 255 * 1024 = 261_120`).
+        let mut weight_sum: u32 = 0;
+        for w in 1..=usize::from(MAX_HUFF_BITS) {
+            let cnt = u32::from(rank_count.get_masked(w));
+            weight_sum = weight_sum.wrapping_add(cnt << (w - 1));
         }
         if weight_sum == 0 {
             return false;
@@ -234,57 +261,188 @@ impl HuffTable {
         weights.set_masked(num_explicit, last_weight);
         let lw_idx = usize::from(last_weight);
         rank_count.set_masked(lw_idx, rank_count.get_masked(lw_idx).wrapping_add(1));
+        if last_weight > max_w {
+            max_w = last_weight;
+        }
         let total_syms = num_explicit + 1;
 
         let max_bits_usize = usize::from(max_bits);
-        let mut rank_start = Pow2Array::<usize, 16>::splat(0);
+        let max_w_usize = usize::from(max_w);
+        let mut rank_origin = Pow2Array::<usize, 16>::splat(0);
+        let mut sym_start = Pow2Array::<usize, 16>::splat(0);
+        let mut sym_cursor = Pow2Array::<usize, 16>::splat(0);
         let mut cursor: usize = 0;
+        let mut s_off: usize = 0;
         for w in 1..=max_bits_usize {
-            rank_start.set_masked(w, cursor);
+            rank_origin.set_masked(w, cursor);
+            sym_start.set_masked(w, s_off);
+            sym_cursor.set_masked(w, s_off);
             let count = usize::from(rank_count.get_masked(w));
             cursor = cursor.wrapping_add(count << (w - 1));
+            s_off = s_off.wrapping_add(count);
         }
+        rank_origin.set_masked(max_bits_usize + 1, cursor);
+        sym_start.set_masked(max_bits_usize + 1, s_off);
 
         let table_size = 1usize << max_bits_usize;
         if cursor != table_size {
             return false;
         }
 
-        let entries_slice = self.entries.as_mut_slice();
-        for sym in 0..total_syms {
-            let w = weights.get_masked(sym);
-            if w == 0 {
-                continue;
-            }
-            let w_usize = usize::from(w);
-            let span = 1usize << (w_usize - 1);
-            let num_bits = (max_bits_usize + 1 - w_usize).truncate_to::<u8>();
-            let sym_u8 = sym.truncate_to::<u8>();
-            let start = rank_start.get_masked(w_usize);
-            let end = start.wrapping_add(span);
-            rank_start.set_masked(w_usize, end);
-            if let Some(slots) = entries_slice.get_mut(start..end) {
-                slots.fill(HuffEntry { symbol: sym_u8, num_bits });
+        // Pass 2 (branchless): group symbols by ascending weight in canonical ascending symbol
+        // order. Absent symbols (`w == 0`) scatter into `[s_off..total_syms)` past all present
+        // symbols (`s_off + rank_count[0] == total_syms <= 256`).
+        let mut sorted_syms = Pow2Array::<u8, 256>::splat(0);
+        sym_cursor.set_masked(0, s_off);
+        if let Some(all_w) = weights.as_slice().get(..total_syms) {
+            for (sym, &w) in all_w.iter().enumerate() {
+                let w_usize = usize::from(w);
+                let dst = sym_cursor.get_masked(w_usize);
+                sorted_syms.set_masked(dst, sym.truncate_to::<u8>());
+                sym_cursor.set_masked(w_usize, dst.wrapping_add(1));
             }
         }
 
-        // Compile double-symbol (`HUF_4X2`) table in one O(table_size) pass (~2 µs).
-        let table_mask = table_size - 1;
-        for idx in 0..table_size {
-            let e0 = self.lookup_fast(idx);
-            let rem = max_bits.wrapping_sub(e0.num_bits);
-            let idx2 = (idx << u32::from(e0.num_bits)) & table_mask;
-            let e1 = self.lookup_fast(idx2);
-            let entry_x2 = if e1.num_bits <= rem {
-                HuffEntryX2::new(
-                    u16::from(e0.symbol) | (u16::from(e1.symbol) << 8),
-                    e0.num_bits.wrapping_add(e1.num_bits),
-                    16,
-                )
-            } else {
-                HuffEntryX2::new(u16::from(e0.symbol), e0.num_bits, 8)
-            };
-            self.entries_x2.set_masked(idx, entry_x2);
+        // Pass 3: populate X1 (`entries`) and X2 (`entries_x2`) in weight-grouped monotonic order.
+        // Weight 1 (`num_bits == max_bits`, `span == 1`, `rem == 0`) never pairs with a second
+        // symbol; write 1 entry per symbol directly with zero fills or lookups.
+        let w1_end = sym_start.get_masked(2);
+        if let Some(w1_syms) = sorted_syms.as_slice().get(..w1_end) {
+            for (i, &s0) in w1_syms.iter().enumerate() {
+                self.entries.set_masked(i, HuffEntry::new(s0, max_bits));
+                self.entries_x2.set_masked(i, HuffEntryX2::new(u16::from(s0), max_bits, 8));
+            }
+        }
+
+        // Weights `2..=max_w`: for any weight `w0`, `nb0 = max_bits + 1 - w0`,
+        // `span0 = 1 << (w0 - 1)`, and a second symbol `s1` fits iff `w1 >= min_w1 = nb0 + 1`.
+        // Since `rank_origin[min_w1]` is an exact multiple of `2^(min_w1 - 1) = 2^nb0`, slots
+        // `[0..cut_j)` are contiguous single-symbol fills and `[cut_j..span0)` are branchless
+        // 2-symbol entries (`base0.wrapping_add(tail[k])`, auto-vectorizing to NEON `add.4s`).
+        if max_w_usize >= 2 {
+            let entries_slice = self.entries.as_mut_slice();
+            let x2_slice = self.entries_x2.as_mut_slice();
+            let sorted_slice = sorted_syms.as_slice();
+            let mut tail = [0u32; MAX_HUFF_TABLE_SIZE / 2];
+
+            for w0 in 2..=max_w_usize {
+                let s0_start = sym_start.get_masked(w0);
+                let s0_end = sym_start.get_masked(w0 + 1);
+                let count0 = s0_end.wrapping_sub(s0_start);
+                if count0 == 0 {
+                    continue;
+                }
+                let Some(s0_list) = sorted_slice.get(s0_start..s0_end) else {
+                    continue;
+                };
+                let span0 = 1usize << (w0 - 1);
+                let nb0_usize = max_bits_usize + 1 - w0;
+                let nb0 = nb0_usize.truncate_to::<u8>();
+                let min_w1 = nb0_usize + 1;
+                let mut pos = rank_origin.get_masked(w0);
+
+                if min_w1 > max_w_usize {
+                    for &s0 in s0_list {
+                        let end = pos.wrapping_add(span0);
+                        if let Some(slots) = entries_slice.get_mut(pos..end) {
+                            slots.fill(HuffEntry::new(s0, nb0));
+                        }
+                        if let Some(x2_slots) = x2_slice.get_mut(pos..end) {
+                            x2_slots.fill(HuffEntryX2::new(u16::from(s0), nb0, 8));
+                        }
+                        pos = end;
+                    }
+                    continue;
+                }
+
+                let cut_j = rank_origin.get_masked(min_w1) >> nb0_usize;
+                let two_len = span0.wrapping_sub(cut_j);
+
+                if count0 == 1 {
+                    if let Some(&s0) = s0_list.first() {
+                        let end = pos.wrapping_add(span0);
+                        let two_start = pos.wrapping_add(cut_j);
+                        if let Some(slots) = entries_slice.get_mut(pos..end) {
+                            slots.fill(HuffEntry::new(s0, nb0));
+                        }
+                        if cut_j > 0
+                            && let Some(x2_one) = x2_slice.get_mut(pos..two_start)
+                        {
+                            x2_one.fill(HuffEntryX2::new(u16::from(s0), nb0, 8));
+                        }
+                        let base0 = u32::from(s0) | (u32::from(nb0) << 16) | (16u32 << 24);
+                        let mut dst_pos = two_start;
+                        for w1 in min_w1..=max_w_usize {
+                            let s1_start = sym_start.get_masked(w1);
+                            let s1_end = sym_start.get_masked(w1 + 1);
+                            if s1_start == s1_end {
+                                continue;
+                            }
+                            let nb1 = (max_bits_usize + 1 - w1).truncate_to::<u8>();
+                            let nb1_shifted = u32::from(nb1) << 16;
+                            let rep = 1usize << (w1 - min_w1);
+                            if let Some(s1_list) = sorted_slice.get(s1_start..s1_end) {
+                                for &s1 in s1_list {
+                                    let entry = HuffEntryX2(
+                                        base0.wrapping_add((u32::from(s1) << 8) | nb1_shifted),
+                                    );
+                                    let next_pos = dst_pos.wrapping_add(rep);
+                                    if let Some(dst) = x2_slice.get_mut(dst_pos..next_pos) {
+                                        dst.fill(entry);
+                                    }
+                                    dst_pos = next_pos;
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                // Multiple symbols share weight `w0`: build `tail[0..two_len]` once, then add
+                // `base0` linearly across each symbol's 2-symbol slice (NEON `add.4s`).
+                let mut t_pos: usize = 0;
+                for w1 in min_w1..=max_w_usize {
+                    let s1_start = sym_start.get_masked(w1);
+                    let s1_end = sym_start.get_masked(w1 + 1);
+                    if s1_start == s1_end {
+                        continue;
+                    }
+                    let nb1 = (max_bits_usize + 1 - w1).truncate_to::<u8>();
+                    let nb1_shifted = u32::from(nb1) << 16;
+                    let rep = 1usize << (w1 - min_w1);
+                    if let Some(s1_list) = sorted_slice.get(s1_start..s1_end) {
+                        for &s1 in s1_list {
+                            let val = (u32::from(s1) << 8) | nb1_shifted;
+                            let next_t = t_pos.wrapping_add(rep);
+                            if let Some(dst) = tail.get_mut(t_pos..next_t) {
+                                dst.fill(val);
+                            }
+                            t_pos = next_t;
+                        }
+                    }
+                }
+
+                let src_tail = tail.get(..two_len).unwrap_or(&[]);
+                for &s0 in s0_list {
+                    let end = pos.wrapping_add(span0);
+                    let two_start = pos.wrapping_add(cut_j);
+                    if let Some(slots) = entries_slice.get_mut(pos..end) {
+                        slots.fill(HuffEntry::new(s0, nb0));
+                    }
+                    if cut_j > 0
+                        && let Some(x2_one) = x2_slice.get_mut(pos..two_start)
+                    {
+                        x2_one.fill(HuffEntryX2::new(u16::from(s0), nb0, 8));
+                    }
+                    let base0 = u32::from(s0) | (u32::from(nb0) << 16) | (16u32 << 24);
+                    if let Some(dst_two) = x2_slice.get_mut(two_start..end) {
+                        for (dst, &t) in dst_two.iter_mut().zip(src_tail.iter()) {
+                            *dst = HuffEntryX2(base0.wrapping_add(t));
+                        }
+                    }
+                    pos = end;
+                }
+            }
         }
 
         self.max_bits = max_bits;
@@ -292,19 +450,32 @@ impl HuffTable {
     }
 
     /// Decode the exact remaining tail of one reverse Huffman stream into `dst`, checking that the
-    /// stream terminates with zero trailing bits. Takes `br` by value so callers keep `br` in
-    /// registers throughout the fast loop (preserving LLVM SROA).
+    /// stream terminates with zero trailing bits. Drains any remaining `>= 8`-byte slack with
+    /// `X2` quads first (handling streams left behind when one of 4 streams ends early), then
+    /// finishes the final `< 8`-byte tail with exact `X1` checking.
     #[cold]
     #[inline(never)]
     fn decode_tail(&self, mut br: RevBitCursor<'_>, dst: &mut [u8]) -> bool {
+        let mut sw = SliceWriter::new(dst);
+        if sw.has_8() && br.has_slack8() {
+            let shift_r = 64u32 - u32::from(self.max_bits);
+            let mut bf = br.open_slack8();
+            while sw.has_8() {
+                let Some(b) = bf.reload_window_slack8() else {
+                    break;
+                };
+                self.decode_x2_quad(b, &mut bf, &mut sw, shift_r);
+            }
+            bf.commit_to(&mut br);
+        }
         let max_bits_u32 = u32::from(self.max_bits);
-        for slot in dst {
+        for slot in sw.into_rest() {
             let idx = br.peek_bits_padded(max_bits_u32).widen_to::<usize>();
             let entry = self.lookup_fast(idx);
-            if entry.num_bits == 0 || !br.consume_bits(u32::from(entry.num_bits)) {
+            if entry.num_bits() == 0 || !br.consume_bits(u32::from(entry.num_bits())) {
                 return false;
             }
-            *slot = entry.symbol;
+            *slot = entry.symbol();
         }
         br.is_empty()
     }
@@ -347,7 +518,9 @@ impl HuffTable {
 
         let e3 = self.lookup_x2((b >> shift_r).truncate_to::<usize>());
         bf.advance(e3.num_bits_u64());
-        out_word |= e3.packed_u64() << sh;
+        // Upper metadata bits of `e3.0` shift strictly past `sh + e3.sym_bits()` and are never
+        // committed by `write_u64_le_adv`, avoiding a redundant `0xFFFF` mask on the final lookup.
+        out_word |= u64::from(e3.0) << sh;
         sh += e3.sym_bits();
 
         let _ = sw.write_u64_le_adv(out_word, (sh >> 3).widen_to::<usize>());
@@ -386,18 +559,49 @@ impl HuffTable {
     }
 
     #[inline(always)]
-    fn decode_4_streams_loop(
-        &self,
-        st1: &[u8],
-        st2: &[u8],
-        st3: &[u8],
-        st4: &[u8],
-        d1: &mut [u8],
-        d2: &mut [u8],
-        d3: &mut [u8],
-        d4: &mut [u8],
-        shift_r: u32,
-    ) -> bool {
+    fn decode_4_streams_loop(&self, src: &[u8], dst: &mut [u8], shift_r: u32) -> bool {
+        let Some((jump, rest)) = src.split_at_checked(6) else {
+            return false;
+        };
+        let Some(&[a0, a1, b0, b1, c0, c1]) = jump.first_chunk::<6>() else {
+            return false;
+        };
+        let s1_len = usize::from(u16::from_le_bytes([a0, a1]));
+        let s2_len = usize::from(u16::from_le_bytes([b0, b1]));
+        let s3_len = usize::from(u16::from_le_bytes([c0, c1]));
+
+        let Some((st1, rest)) = rest.split_at_checked(s1_len) else {
+            return false;
+        };
+        let Some((st2, rest)) = rest.split_at_checked(s2_len) else {
+            return false;
+        };
+        let Some((st3, st4)) = rest.split_at_checked(s3_len) else {
+            return false;
+        };
+
+        let expected_len = dst.len();
+        let seg = expected_len.div_ceil(4);
+        let Some(three_segs) = seg.checked_mul(3) else {
+            return false;
+        };
+        let Some(last_seg) = expected_len.checked_sub(three_segs) else {
+            return false;
+        };
+
+        let Some((d1, rest)) = dst.split_at_mut_checked(seg) else {
+            return false;
+        };
+        let Some((d2, rest)) = rest.split_at_mut_checked(seg) else {
+            return false;
+        };
+        let Some((d3, d4)) = rest.split_at_mut_checked(seg) else {
+            return false;
+        };
+        if d4.len() != last_seg {
+            return false;
+        }
+
         let Some(mut br1) = RevBitCursor::new(st1) else {
             return false;
         };
@@ -429,22 +633,22 @@ impl HuffTable {
             let mut bf3 = br3.open_slack8();
             let mut bf4 = br4.open_slack8();
 
+            // 1x round-robin across the 4 independent streams (16..32 symbols per iteration):
+            // keeps all 4 stream states register-resident on AArch64 while `has_8()` statically
+            // proves `rem >= 8` for each `write_u64_le_adv` call (advances by `<= 8` bytes).
             while sw1.has_8() && sw2.has_8() && sw3.has_8() && sw4.has_8() {
                 let Some(b1) = bf1.reload_window_slack8() else {
                     break;
                 };
                 self.decode_x2_quad(b1, &mut bf1, &mut sw1, shift_r);
-
                 let Some(b2) = bf2.reload_window_slack8() else {
                     break;
                 };
                 self.decode_x2_quad(b2, &mut bf2, &mut sw2, shift_r);
-
                 let Some(b3) = bf3.reload_window_slack8() else {
                     break;
                 };
                 self.decode_x2_quad(b3, &mut bf3, &mut sw3, shift_r);
-
                 let Some(b4) = bf4.reload_window_slack8() else {
                     break;
                 };
@@ -457,7 +661,7 @@ impl HuffTable {
             bf4.commit_to(&mut br4);
         }
 
-        // Drain the exact remaining tail of each stream with X1 exact checking.
+        // Drain the exact remaining tail of each stream (X2 fast drain + X1 exact checking).
         self.decode_tail(br1, sw1.into_rest())
             && self.decode_tail(br2, sw2.into_rest())
             && self.decode_tail(br3, sw3.into_rest())
@@ -465,19 +669,13 @@ impl HuffTable {
     }
 
     #[inline(never)]
-    #[allow(clippy::too_many_arguments)]
-    fn decode_4_streams_11(
-        &self,
-        st1: &[u8],
-        st2: &[u8],
-        st3: &[u8],
-        st4: &[u8],
-        d1: &mut [u8],
-        d2: &mut [u8],
-        d3: &mut [u8],
-        d4: &mut [u8],
-    ) -> bool {
-        self.decode_4_streams_loop(st1, st2, st3, st4, d1, d2, d3, d4, 53)
+    fn decode_4_streams_11(&self, src: &[u8], dst: &mut [u8]) -> bool {
+        self.decode_4_streams_loop(src, dst, 53)
+    }
+
+    #[inline(never)]
+    fn decode_4_streams_var(&self, src: &[u8], dst: &mut [u8], shift_r: u32) -> bool {
+        self.decode_4_streams_loop(src, dst, shift_r)
     }
 
     /// Decode an RFC 8878 §4.2.2 4-stream Huffman literals payload directly into pre-sized `dst`
@@ -491,33 +689,11 @@ impl HuffTable {
         if self.max_bits == 0 || self.max_bits > MAX_HUFF_BITS {
             return Err(ZstdError::CorruptHuffman);
         }
-        let (jump, rest) = src.split_at_checked(6).ok_or(ZstdError::CorruptHuffman)?;
-        let &[a0, a1, b0, b1, c0, c1] = jump.first_chunk::<6>().ok_or(ZstdError::CorruptHuffman)?;
-        let s1_len = usize::from(u16::from_le_bytes([a0, a1]));
-        let s2_len = usize::from(u16::from_le_bytes([b0, b1]));
-        let s3_len = usize::from(u16::from_le_bytes([c0, c1]));
-
-        let (st1, rest) = rest.split_at_checked(s1_len).ok_or(ZstdError::CorruptHuffman)?;
-        let (st2, rest) = rest.split_at_checked(s2_len).ok_or(ZstdError::CorruptHuffman)?;
-        let (st3, st4) = rest.split_at_checked(s3_len).ok_or(ZstdError::CorruptHuffman)?;
-
-        let expected_len = dst.len();
-        let seg = expected_len.div_ceil(4);
-        let three_segs = seg.checked_mul(3).ok_or(ZstdError::CorruptHuffman)?;
-        let last_seg = expected_len.checked_sub(three_segs).ok_or(ZstdError::CorruptHuffman)?;
-
-        let (d1, rest) = dst.split_at_mut_checked(seg).ok_or(ZstdError::CorruptHuffman)?;
-        let (d2, rest) = rest.split_at_mut_checked(seg).ok_or(ZstdError::CorruptHuffman)?;
-        let (d3, d4) = rest.split_at_mut_checked(seg).ok_or(ZstdError::CorruptHuffman)?;
-        if d4.len() != last_seg {
-            return Err(ZstdError::CorruptHuffman);
-        }
-
         let ok = if self.max_bits == 11 {
-            self.decode_4_streams_11(st1, st2, st3, st4, d1, d2, d3, d4)
+            self.decode_4_streams_11(src, dst)
         } else {
             let shift_r = 64u32 - u32::from(self.max_bits);
-            self.decode_4_streams_loop(st1, st2, st3, st4, d1, d2, d3, d4, shift_r)
+            self.decode_4_streams_var(src, dst, shift_r)
         };
         if !ok {
             return Err(ZstdError::CorruptHuffman);
@@ -1049,9 +1225,9 @@ pub(crate) fn encode_huffman_literals_into<A: Allocator + Copy>(
 
     // Fast-mode zero-histogram Treeless reuse (`lit_type = 3`) on blocks 1..N:
     // encode directly with cached `packed_codes`, skipping the 4-way byte histogram completely.
-    // Accepts Treeless only when savings are >= 37.5% (`comp_size * 8 <= lit_len * 5`) OR the
-    // ratio stays within 6% of the trained block's ratio (`prev_lit_len`/`prev_comp_size`) and
-    // saves > 4 bytes; otherwise falls through to rebuild a fresh Huffman table immediately.
+    // Accepts Treeless when the ratio stays within 5% of the trained block's ratio
+    // (`prev_lit_len`/`prev_comp_size`) and saves at least the literals header; otherwise falls
+    // through to rebuild a fresh Huffman table immediately.
     if fast_mode && cache.valid && lit_len >= 64 {
         payload.clear();
         if encode_huff_streams_checked(literals, &cache.packed_codes, payload)? {
@@ -1063,16 +1239,14 @@ pub(crate) fn encode_huffman_literals_into<A: Allocator + Copy>(
             } else {
                 5
             };
-            let good_savings = comp_size.saturating_mul(8) <= lit_len.saturating_mul(5);
             let within_drift = cache.prev_lit_len > 0
                 && comp_size.widen_to::<u64>()
                     * u64::from(cache.prev_lit_len)
                     * 100u64
                     <= u64::from(cache.prev_comp_size)
                         * lit_len.widen_to::<u64>()
-                        * 106u64
-                && comp_size + 4 < lit_len;
-            if (good_savings || within_drift) && comp_size + hdr_len < lit_len {
+                        * 107u64;
+            if within_drift && comp_size + hdr_len < lit_len {
                 emit_compressed_literals(3, lit_len >= 256, lit_len, payload.as_slice(), out)?;
                 cache.has_pending = false;
                 return Ok(true);
@@ -1161,8 +1335,8 @@ pub(crate) fn encode_huffman_literals_into<A: Allocator + Copy>(
     let mut fresh_packed = [0u32; 256];
 
     if fast_mode {
-        // Seed printable ASCII + whitespace on block 0 so text/source blocks 1..N reuse
-        // block 0's Huffman table (`Treeless`) with zero rebuilds and <0.2% code overhead.
+        // Seed printable ASCII + whitespace whenever fast-mode builds a tree so subsequent
+        // source/text blocks take the 1-pass Treeless path without aborting on a rare punctuation byte.
         for (b, c) in counts.iter_mut().enumerate() {
             if *c == 0 && (b == 9 || b == 10 || b == 13 || (32..=126).contains(&b)) {
                 *c = 1;

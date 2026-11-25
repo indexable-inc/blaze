@@ -29,7 +29,7 @@ use blaze_tier::{
 use super::CallMode;
 use super::regalloc::{self, AllocLoc, ScratchOrder, is_fp_ty, is_gpr_pair_ty, is_vec128_ty, is_vec_mask_ty};
 use super::release_opts::{
-    MagicUdiv64, compute_block_order, compute_magic_udiv64, dense_switch_plan, detect_tail_calls,
+    MagicUdiv64, compute_magic_udiv64, dense_switch_plan, detect_tail_calls,
 };
 use crate::enc::{
     self, Barrier, Cond, FP, Ftype, LR, Lse, Reg, SP, Size, X0, X1, X2, X8, X9, X10, X11, X12, X13, X14, X16, ZR,
@@ -281,9 +281,9 @@ enum Fusion {
     /// `xor(a, not(b))` -> `eon rd, a, b`.
     Eon { a: u32, b: u32 },
     /// `br(icmp eq/ne (and(val, 1 << bit)), 0)` -> single `tbz`/`tbnz`.
-    TbzBr { val: u32, bit: u32, nonzero_is_then: bool, mask_imm: u32 },
+    TbzBr { val: u32, bit: u32, nonzero_is_then: bool, mask_imm: u32, zero_imm: u32 },
     /// `br(icmp eq/ne (and(a, mask)), 0)` -> `tst` + `b.eq`/`b.ne`.
-    TstBr { a: u32, rhs: u32, imm_nrs: Option<u32>, nonzero_is_then: bool },
+    TstBr { a: u32, rhs: u32, imm_nrs: Option<u32>, zero_imm: u32, wide: bool, nonzero_is_then: bool },
     /// `select(icmp, x, neg(x))` -> `cmp` + `csneg`.
     CsnegSelect { cond: IntCond, a: u32, b: u32, op_ty: Ty, x: u32, neg_when_false: bool },
     /// `select(icmp, rn, add(rm, 1))` or `select(icmp, add(rm, 1), rn)` -> `cmp` + `csinc`.
@@ -335,6 +335,173 @@ enum Fusion {
         swap: bool,
         imm_insts: [u32; 4],
     },
+    /// Variable 32/64-bit `shl`/`lshr`/`ashr`/`rotl`/`rotr` whose shift amount is `and(rhs, mask)`
+    /// (optionally wrapped in a single-use `zext`/`trunc`) where `(mask & (bits - 1)) == (bits - 1)`:
+    /// AArch64 `lslv`/`lsrv`/`asrv`/`rorv` already mask the shift amount modulo register width!
+    ShiftUnmasked { rhs: u32, mask_imm: u32 },
+    /// `add(base, zext(icmp(cond, a, b)))` or `add(base, select(icmp(cond, a, b), 1/0, 0/1))`
+    /// (commutative, 32-bit or 64-bit) -> `cmp` + `cinc rd, base, cond` (0 `cset`, 0 temp GPR).
+    CmpAddCinc {
+        base: u32,
+        cond: IntCond,
+        a: u32,
+        b: u32,
+        op_ty: Ty,
+        invert: bool,
+        sel_imm_a: u32,
+        sel_imm_b: u32,
+    },
+}
+
+/// Canonical operand of a hardware NZCV-setting integer comparison ([`LiveCmp`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CmpOperand {
+    Reg(u32),
+    Imm(u64),
+}
+
+/// Width & extension mode of a hardware NZCV-setting integer comparison ([`LiveCmp`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CmpWidth {
+    /// Native 32-bit `cmp w` (sets exact N, Z, C, V for all signed & unsigned 32-bit predicates).
+    W32,
+    /// Native 64-bit `cmp x` (sets exact N, Z, C, V for all signed & unsigned 64-bit predicates).
+    X64,
+    /// Zero-extended sub-64-bit `cmp x` (valid for unsigned / Eq / Ne on identical bit width).
+    ZextSub64(u8),
+    /// Sign-extended sub-64-bit `cmp x` (valid for signed predicates on identical bit width).
+    SextSub64(u8),
+}
+
+/// Hardware NZCV state produced by the most recent `emit_cmp` in the current basic block,
+/// enabling subsequent comparisons on the same `(lhs, rhs, width)` with a DIFFERENT predicate
+/// (e.g. `rep_code < 2` followed by `rep_code == 2`) to reuse NZCV directly without re-emitting `cmp`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct LiveCmp {
+    lhs: CmpOperand,
+    rhs: CmpOperand,
+    width: CmpWidth,
+}
+
+/// Matched single-use `add(base, zext/select(icmp))` -> `cinc` fusion plan.
+struct CmpAddCincMatch {
+    fusion: Fusion,
+    skips: [usize; 3],
+    n_skips: usize,
+    clear_select_fusion: Option<usize>,
+}
+
+/// Read-only Pass 2a context for matching `add(base, zext/select(icmp))` -> [`Fusion::CmpAddCinc`].
+struct CmpCincScan<'a, 'v> {
+    view: &'a View<'v>,
+    const_u64: &'a [Option<u64>],
+    use_count: &'a [u32],
+    inst_block: &'a [u32],
+    skip_emit: &'a [bool],
+    fusion: &'a [Fusion],
+}
+
+impl CmpCincScan<'_, '_> {
+    fn try_match(&self, b: u32, cand_v: u32, base_v: u32) -> Option<CmpAddCincMatch> {
+        if cand_v == base_v || at_opt(self.const_u64, to_idx(base_v)).and_then(is_addsub_imm12).is_some() {
+            return None;
+        }
+        let len = self.view.len();
+        let mut skips = [usize::MAX; 3];
+        let mut n_skips = 0usize;
+        let mut cur = to_idx(cand_v);
+        for _ in 0..2 {
+            if cur < len
+                && at_u32(self.use_count, cur) == 1
+                && at_u32(self.inst_block, cur) == b
+                && self.view.op(cur) == Op::Zext
+                && !at_bool(self.skip_emit, cur)
+                && at_fusion(self.fusion, cur) == Fusion::None
+            {
+                if let Some(slot) = skips.get_mut(n_skips) {
+                    *slot = cur;
+                    n_skips += 1;
+                }
+                cur = to_idx(at_u32(self.view.data, cur));
+            } else {
+                break;
+            }
+        }
+        if cur >= len
+            || at_u32(self.use_count, cur) != 1
+            || at_u32(self.inst_block, cur) != b
+            || at_bool(self.skip_emit, cur)
+        {
+            return None;
+        }
+        if self.view.op(cur) == Op::Icmp
+            && at_fusion(self.fusion, cur) == Fusion::None
+            && is_vec_mask_ty(ty_at(self.view.tys, cur)).is_none()
+        {
+            let cat = to_idx(at_u32(self.view.data, cur));
+            let cond = IntCond::from_word(at_u32(self.view.extra, cat))?;
+            let a = at_u32(self.view.extra, cat + 1);
+            let bv = at_u32(self.view.extra, cat + 2);
+            let op_ty = ty_at(self.view.tys, to_idx(a));
+            if op_ty == Ty::I128 {
+                return None;
+            }
+            if let Some(slot) = skips.get_mut(n_skips) {
+                *slot = cur;
+                n_skips += 1;
+            }
+            return Some(CmpAddCincMatch {
+                fusion: Fusion::CmpAddCinc {
+                    base: base_v,
+                    cond,
+                    a,
+                    b: bv,
+                    op_ty,
+                    invert: false,
+                    sel_imm_a: u32::MAX,
+                    sel_imm_b: u32::MAX,
+                },
+                skips,
+                n_skips,
+                clear_select_fusion: None,
+            });
+        }
+        if self.view.op(cur) == Op::Select
+            && let Fusion::CmpSelect { cond, a, b: bv, op_ty } = at_fusion(self.fusion, cur)
+        {
+            let sat = to_idx(at_u32(self.view.data, cur));
+            let t_val = at_u32(self.view.extra, sat + 1);
+            let f_val = at_u32(self.view.extra, sat + 2);
+            let invert = match (
+                at_opt(self.const_u64, to_idx(t_val)),
+                at_opt(self.const_u64, to_idx(f_val)),
+            ) {
+                (Some(1), Some(0)) => false,
+                (Some(0), Some(1)) => true,
+                _ => return None,
+            };
+            if let Some(slot) = skips.get_mut(n_skips) {
+                *slot = cur;
+                n_skips += 1;
+            }
+            return Some(CmpAddCincMatch {
+                fusion: Fusion::CmpAddCinc {
+                    base: base_v,
+                    cond,
+                    a,
+                    b: bv,
+                    op_ty,
+                    invert,
+                    sel_imm_a: t_val,
+                    sel_imm_b: f_val,
+                },
+                skips,
+                n_skips,
+                clear_select_fusion: Some(cur),
+            });
+        }
+        None
+    }
 }
 
 /// Branch patch site resolved once every block's word offset is known.
@@ -515,7 +682,7 @@ fn op_preserves_nzcv(op: Op, ty: Ty, fus: Fusion) -> bool {
                 | Op::Bswap
                 | Op::Bitrev
         )
-        && !matches!(fus, Fusion::AdcsChain { .. } | Fusion::SubsFlags))
+        && !matches!(fus, Fusion::AdcsChain { .. } | Fusion::SubsFlags | Fusion::CmpAddCinc { .. }))
 }
 
 /// True iff `op` is a pure, non-trapping, non-memory, non-synchronizing register/ALU operation
@@ -968,6 +1135,103 @@ fn value_fits_unsigned_bits(view: &View<'_>, const_u64: &[Option<u64>], v: u32, 
     }
 }
 
+/// Computes zero-cost value aliases for no-op scalar integer `Op::Trunc` and `Op::Zext`
+/// instructions (`alias_of[inst] = root`, or `u32::MAX` when not aliased).
+///
+/// Every aliased instruction is one whose emitted AArch64 sequence would otherwise be a pure
+/// 64-bit register identity copy (`emit_gpr_copy`):
+/// - Scalar `Op::Zext` (`<= 64`-bit int -> `<= 64`-bit int): every sub-64-bit scalar integer
+///   reaching `Op::Zext` already has zero upper bits (`val_needs_clean_upper32` marks operands
+///   of `Op::Zext`, so a dirty no-op `Trunc(I64->I32)` cannot feed `Op::Zext`).
+/// - Scalar `Op::Trunc` (`<= 64`-bit int -> `<= 64`-bit int) when `bits == 64`,
+///   `value_fits_unsigned_bits(src, bits)`, or `bits == 32 && !val_needs_clean_upper32[inst]`.
+///
+/// Multi-hop chains collapse to their single non-skipped root `Val`, eliminating both dead
+/// `mov`s and extra live GPRs in `regalloc`.
+fn compute_noop_cast_aliases<'a>(
+    view: &View<'_>,
+    skip_emit: &[bool],
+    fusion: &[Fusion],
+    const_u64: &[Option<u64>],
+    use_count: &[u32],
+    val_needs_clean_upper32: &[bool],
+    alloc: Alloc<'a>,
+) -> Vec<u32, Alloc<'a>> {
+    let len = view.len();
+    let mut direct: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(len, alloc);
+    for _ in 0..len {
+        direct.push(u32::MAX);
+    }
+    for inst in 0..len {
+        if at_bool(skip_emit, inst)
+            || at_fusion(fusion, inst) != Fusion::None
+            || at_u32(use_count, inst) == 0
+        {
+            continue;
+        }
+        let op = view.op(inst);
+        if !matches!(op, Op::Zext | Op::Trunc) {
+            continue;
+        }
+        let ty = ty_at(view.tys, inst);
+        if !(ty.is_scalar() && ty.is_int()) {
+            continue;
+        }
+        let bits = ty.bits(64);
+        if bits == 0 || bits > 64 {
+            continue;
+        }
+        let src_v = at_u32(view.data, inst);
+        let si = to_idx(src_v);
+        if si >= len || si == inst || at_bool(skip_emit, si) {
+            continue;
+        }
+        let src_ty = ty_at(view.tys, si);
+        if !(src_ty.is_scalar() && src_ty.is_int()) {
+            continue;
+        }
+        let src_bits = src_ty.bits(64);
+        if src_bits == 0 || src_bits > 64 {
+            continue;
+        }
+        let is_noop = match op {
+            Op::Zext => true,
+            Op::Trunc => {
+                bits == 64
+                    || value_fits_unsigned_bits(view, const_u64, src_v, bits)
+                    || (bits == 32 && !at_bool(val_needs_clean_upper32, inst))
+            }
+            _ => false,
+        };
+        if is_noop {
+            set_at(&mut direct, inst, src_v);
+        }
+    }
+    let mut alias_of: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(len, alloc);
+    for inst in 0..len {
+        let first = at_u32(&direct, inst);
+        if first == u32::MAX {
+            alias_of.push(u32::MAX);
+            continue;
+        }
+        let mut cur = first;
+        let mut resolved = u32::MAX;
+        for _ in 0..len {
+            let next = at_u32(&direct, to_idx(cur));
+            if next == u32::MAX {
+                resolved = cur;
+                break;
+            }
+            if to_idx(next) == inst {
+                break;
+            }
+            cur = next;
+        }
+        alias_of.push(resolved);
+    }
+    alias_of
+}
+
 #[inline]
 fn sign_extend_u64(val: u64, bits: u32) -> i64 {
     if bits >= 64 {
@@ -991,6 +1255,20 @@ fn is_low_bitmask(v: u64) -> Option<u32> {
         }
     }
     None
+}
+
+/// Encodes unsigned `v` as an AArch64 12-bit Add/Subtract immediate `(imm12, shift12)`:
+/// - `0..=0xfff` -> `Some((v, false))` (`lsl #0`)
+/// - `0x1000..=0xfff000` with `(v & 0xfff) == 0` -> `Some((v >> 12, true))` (`lsl #12`)
+#[inline]
+pub(crate) fn is_addsub_imm12(v: u64) -> Option<(u32, bool)> {
+    if v <= 0xfff {
+        Some((trunc_u32(v), false))
+    } else if (v & 0xfff) == 0 && (v >> 12) <= 0xfff {
+        Some((trunc_u32(v >> 12), true))
+    } else {
+        None
+    }
 }
 
 #[inline]
@@ -2450,6 +2728,523 @@ fn place_data_row<'a>(
     })
 }
 
+/// Loop-aware hot-fallthrough layout and per-block loop/cold metadata produced by
+/// [`compute_hot_emit_layout`] and reused during loop-header alignment and `Op::Br` backedge ordering.
+struct HotEmitLayout<'a> {
+    order: Vec<usize, Alloc<'a>>,
+    loop_depth: Vec<u32, Alloc<'a>>,
+    is_loop_hdr: Vec<bool, Alloc<'a>>,
+    is_cold: Vec<bool, Alloc<'a>>,
+    is_terminal_exit: Vec<bool, Alloc<'a>>,
+}
+
+/// Computes a deterministic, O(B + E) loop-aware hot-fallthrough basic-block emission order
+/// completely decoupled from `regalloc`'s RPO interval numbering:
+/// 1. Computes iterative-DFS RPO (`rpo`, `rpo_rank`) and exact loop nesting depth
+///    (`loop_depth`, `is_loop_hdr`) via backward BFS from back-edge latches (bounded to
+///    `blocks <= 4096`, with an O(B) RPO-interval fallback for mega-functions).
+/// 2. Classifies cold blocks (`BlockKind::Cold`, landing pads, `Trap`/`Unreachable`/`Resume`, and
+///    acyclic blocks whose every successor is cold), terminal exits (`Ret`/`TailCall`/`Trap`/
+///    `Unreachable` or a single `Jump` to one), forward `eff_depth` for outer loop preheaders,
+///    and `entry_depth` for conditionally-entered inner loop preheaders.
+/// 3. Greedily grows hot fallthrough traces starting from entry `0`, then highest-depth unplaced
+///    hot blocks in RPO order:
+///    - Inside a loop (`loop_depth[b] > 0`), only extends the trace to unplaced successors with
+///      `loop_depth[s] >= loop_depth[b]` so loop bodies stay contiguous and loop exits are pushed
+///      after the entire loop.
+///    - For conditional `Op::Br` inside a loop (`loop_depth[b] > 0`), prefers explicit branch hints
+///      (`EXPECT_TRUE`/`EXPECT_FALSE`), then outer-loop spine successors (`entry_depth == b_depth`,
+///      non-terminal) STRICTLY over conditionally-entered inner loops (`entry_depth > b_depth`,
+///      which are placed right after the outer spine), then loop exits, then terminal/cold blocks.
+/// 4. Sinks all cold blocks to the tail in RPO order; guarantees every block in `0..blocks`
+///    appears in the returned order exactly once.
+fn compute_hot_emit_layout<'a>(view: &View<'_>, alloc: Alloc<'a>) -> HotEmitLayout<'a> {
+    const EXACT_LOOP_MAX_BLOCKS: usize = 4096;
+
+    let blocks = view.blocks();
+    if blocks == 0 {
+        return HotEmitLayout {
+            order: Vec::new_in(alloc),
+            loop_depth: Vec::new_in(alloc),
+            is_loop_hdr: Vec::new_in(alloc),
+            is_cold: Vec::new_in(alloc),
+            is_terminal_exit: Vec::new_in(alloc),
+        };
+    }
+
+    // 1. Iterative-DFS RPO order over `0..blocks` (entry `0` first; unreachable blocks appended).
+    let mut dfs_state: Vec<u8, Alloc<'a>> = Vec::with_capacity_in(blocks, alloc);
+    for _ in 0..blocks {
+        dfs_state.push(0);
+    }
+    let mut rpo: Vec<usize, Alloc<'a>> = Vec::with_capacity_in(blocks, alloc);
+    let mut dfs_stack: Vec<usize, Alloc<'a>> = Vec::with_capacity_in(blocks.min(1024), alloc);
+    dfs_stack.push(0);
+    while let Some(b) = dfs_stack.pop() {
+        let st = at_u8(&dfs_state, b);
+        if st == 0 {
+            set_at(&mut dfs_state, b, 1);
+            dfs_stack.push(b);
+            let term = view.terminator(Block(u32_of(b)));
+            regalloc::for_each_edge(view, term, |target_block, _, _| {
+                let t = to_idx(target_block);
+                if t < blocks && at_u8(&dfs_state, t) == 0 {
+                    dfs_stack.push(t);
+                }
+            });
+        } else if st == 1 {
+            set_at(&mut dfs_state, b, 2);
+            rpo.push(b);
+        }
+    }
+    rpo.reverse();
+    for b in 0..blocks {
+        if at_u8(&dfs_state, b) == 0 {
+            rpo.push(b);
+        }
+    }
+    let mut rpo_rank: Vec<usize, Alloc<'a>> = Vec::with_capacity_in(blocks, alloc);
+    for _ in 0..blocks {
+        rpo_rank.push(0);
+    }
+    for (rank, &b) in rpo.iter().enumerate() {
+        set_at(&mut rpo_rank, b, rank);
+    }
+
+    // 2. Direct cold / direct exit classification.
+    let mut is_cold: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(blocks, alloc);
+    let mut is_direct_exit: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(blocks, alloc);
+    for b in 0..blocks {
+        let kind = view.block_kind(Block(u32_of(b)));
+        let term = view.terminator(Block(u32_of(b)));
+        let top = view.op(term);
+        let cold = b != 0
+            && (kind == BlockKind::Cold
+                || kind.is_landing()
+                || matches!(top, Op::Trap | Op::Unreachable | Op::Resume));
+        let direct_exit = b != 0
+            && (cold || matches!(top, Op::Return | Op::TailCall | Op::TailCallIndirect));
+        is_cold.push(cold);
+        is_direct_exit.push(direct_exit);
+    }
+    // Propagate coldness backward across acyclic blocks whose EVERY outgoing edge enters a cold block.
+    for &b in rpo.iter().rev() {
+        if b == 0 || at_bool(&is_cold, b) {
+            continue;
+        }
+        let term = view.terminator(Block(u32_of(b)));
+        let mut has_succ = false;
+        let mut all_cold = true;
+        let b_rank = at_usize(&rpo_rank, b);
+        regalloc::for_each_edge(view, term, |target_block, _, _| {
+            let t = to_idx(target_block);
+            if t < blocks {
+                has_succ = true;
+                if at_usize(&rpo_rank, t) <= b_rank || !at_bool(&is_cold, t) {
+                    all_cold = false;
+                }
+            }
+        });
+        if has_succ && all_cold {
+            set_at(&mut is_cold, b, true);
+            set_at(&mut is_direct_exit, b, true);
+        }
+    }
+
+    // 3. Exact loop depth and loop-header identification.
+    let mut loop_depth: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(blocks, alloc);
+    let mut is_loop_hdr: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(blocks, alloc);
+    for _ in 0..blocks {
+        loop_depth.push(0);
+        is_loop_hdr.push(false);
+    }
+    if blocks <= EXACT_LOOP_MAX_BLOCKS {
+        let mut pred_counts: Vec<usize, Alloc<'a>> = Vec::with_capacity_in(blocks, alloc);
+        let mut latch_head: Vec<usize, Alloc<'a>> = Vec::with_capacity_in(blocks, alloc);
+        for _ in 0..blocks {
+            pred_counts.push(0);
+            latch_head.push(usize::MAX);
+        }
+        let mut latch_src: Vec<usize, Alloc<'a>> = Vec::new_in(alloc);
+        let mut latch_next: Vec<usize, Alloc<'a>> = Vec::new_in(alloc);
+        let mut total_edges: usize = 0;
+
+        for &b in &rpo {
+            let b_rank = at_usize(&rpo_rank, b);
+            let term = view.terminator(Block(u32_of(b)));
+            regalloc::for_each_edge(view, term, |target_block, _, _| {
+                let t = to_idx(target_block);
+                if t >= blocks {
+                    return;
+                }
+                if let Some(cnt) = pred_counts.get_mut(t) {
+                    *cnt += 1;
+                    total_edges += 1;
+                }
+                if at_usize(&rpo_rank, t) <= b_rank && !at_bool(&is_direct_exit, t) {
+                    set_at(&mut is_loop_hdr, t, true);
+                    let prev_head = at_usize(&latch_head, t);
+                    let node = latch_src.len();
+                    latch_src.push(b);
+                    latch_next.push(prev_head);
+                    set_at(&mut latch_head, t, node);
+                }
+            });
+        }
+
+        let mut pred_starts: Vec<usize, Alloc<'a>> = Vec::with_capacity_in(blocks + 1, alloc);
+        let mut pred_cursor: Vec<usize, Alloc<'a>> = Vec::with_capacity_in(blocks, alloc);
+        let mut offset: usize = 0;
+        for b in 0..blocks {
+            pred_starts.push(offset);
+            pred_cursor.push(offset);
+            offset += at_usize(&pred_counts, b);
+        }
+        pred_starts.push(offset);
+
+        let mut pred_list: Vec<usize, Alloc<'a>> = Vec::with_capacity_in(total_edges, alloc);
+        for _ in 0..total_edges {
+            pred_list.push(0);
+        }
+        for &b in &rpo {
+            let term = view.terminator(Block(u32_of(b)));
+            regalloc::for_each_edge(view, term, |target_block, _, _| {
+                let t = to_idx(target_block);
+                if t < blocks
+                    && let Some(cur) = pred_cursor.get_mut(t)
+                {
+                    let pos = *cur;
+                    *cur += 1;
+                    set_at(&mut pred_list, pos, b);
+                }
+            });
+        }
+
+        let mut stamp: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(blocks, alloc);
+        for _ in 0..blocks {
+            stamp.push(0);
+        }
+        let mut work: Vec<usize, Alloc<'a>> = Vec::new_in(alloc);
+        let mut cur_stamp = 0u32;
+
+        for hdr in 0..blocks {
+            let mut node = at_usize(&latch_head, hdr);
+            if node == usize::MAX {
+                continue;
+            }
+            let hdr_rank = at_usize(&rpo_rank, hdr);
+            cur_stamp = cur_stamp.wrapping_add(1);
+            work.clear();
+            set_at(&mut stamp, hdr, cur_stamp);
+            if !at_bool(&is_direct_exit, hdr) {
+                inc_sat_u32(&mut loop_depth, hdr);
+            }
+            while node != usize::MAX {
+                let src = at_usize(&latch_src, node);
+                if src < blocks && at_u32(&stamp, src) != cur_stamp {
+                    set_at(&mut stamp, src, cur_stamp);
+                    if !at_bool(&is_direct_exit, src) {
+                        inc_sat_u32(&mut loop_depth, src);
+                    }
+                    work.push(src);
+                }
+                node = at_usize(&latch_next, node);
+            }
+            while let Some(u) = work.pop() {
+                let start = at_usize(&pred_starts, u);
+                let end = at_usize(&pred_starts, u + 1);
+                if let Some(preds) = pred_list.get(start..end) {
+                    for &p in preds {
+                        if p < blocks
+                            && at_usize(&rpo_rank, p) >= hdr_rank
+                            && at_u32(&stamp, p) != cur_stamp
+                        {
+                            set_at(&mut stamp, p, cur_stamp);
+                            if !at_bool(&is_direct_exit, p) {
+                                inc_sat_u32(&mut loop_depth, p);
+                            }
+                            work.push(p);
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        // O(B) RPO-interval loop depth for mega-functions (`blocks > 4096`).
+        let mut max_latch_rank: Vec<usize, Alloc<'a>> = Vec::with_capacity_in(blocks, alloc);
+        for _ in 0..blocks {
+            max_latch_rank.push(usize::MAX);
+        }
+        for (rank, &b) in rpo.iter().enumerate() {
+            let term = view.terminator(Block(u32_of(b)));
+            regalloc::for_each_edge(view, term, |target_block, _, _| {
+                let t = to_idx(target_block);
+                if t < blocks {
+                    let tr = at_usize(&rpo_rank, t);
+                    if tr <= rank && !at_bool(&is_direct_exit, t) {
+                        set_at(&mut is_loop_hdr, t, true);
+                        let cur = at_usize(&max_latch_rank, tr);
+                        if cur == usize::MAX || rank > cur {
+                            set_at(&mut max_latch_rank, tr, rank);
+                        }
+                    }
+                }
+            });
+        }
+        let mut depth_diff: Vec<i32, Alloc<'a>> = Vec::with_capacity_in(blocks + 1, alloc);
+        for _ in 0..=blocks {
+            depth_diff.push(0);
+        }
+        for (tr, &latch) in max_latch_rank.iter().enumerate() {
+            if latch != usize::MAX {
+                if let Some(s) = depth_diff.get_mut(tr) {
+                    *s = s.saturating_add(1);
+                }
+                if let Some(e) = depth_diff.get_mut(latch + 1) {
+                    *e = e.saturating_sub(1);
+                }
+            }
+        }
+        let mut cur_depth = 0i32;
+        for (rank, &b) in rpo.iter().enumerate() {
+            cur_depth = cur_depth.saturating_add(depth_diff.get(rank).copied().unwrap_or(0));
+            let d = if at_bool(&is_direct_exit, b) {
+                0
+            } else {
+                u32::try_from(cur_depth.max(0)).unwrap_or(u32::MAX)
+            };
+            set_at(&mut loop_depth, b, d);
+        }
+    }
+
+    // Terminal exit blocks: direct `Ret`/`TailCall`/`Trap`/`Unreachable`, or a single `Jump` to one.
+    let mut is_terminal_exit: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(blocks, alloc);
+    for b in 0..blocks {
+        let mut term_exit = at_bool(&is_direct_exit, b);
+        if !term_exit && b != 0 && at_u32(&loop_depth, b) == 0 {
+            let term = view.terminator(Block(u32_of(b)));
+            if view.op(term) == Op::Jump {
+                let tgt = to_idx(at_u32(view.extra, to_idx(at_u32(view.data, term))));
+                if tgt < blocks && at_bool(&is_direct_exit, tgt) {
+                    term_exit = true;
+                }
+            }
+        }
+        is_terminal_exit.push(term_exit);
+    }
+
+    // Forward effective loop depth so pre-loop checks fall straight through into loop preheaders
+    // instead of cold early-exit blocks.
+    let mut eff_depth: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(blocks, alloc);
+    for &d in &loop_depth {
+        eff_depth.push(d);
+    }
+    for &b in rpo.iter().rev() {
+        if at_u32(&loop_depth, b) == 0 && !at_bool(&is_cold, b) {
+            let b_rank = at_usize(&rpo_rank, b);
+            let term = view.terminator(Block(u32_of(b)));
+            let mut max_d = 0u32;
+            regalloc::for_each_edge(view, term, |target_block, _, _| {
+                let t = to_idx(target_block);
+                if t < blocks && at_usize(&rpo_rank, t) > b_rank && !at_bool(&is_cold, t) {
+                    max_d = max_d.max(at_u32(&eff_depth, t));
+                }
+            });
+            set_at(&mut eff_depth, b, max_d);
+        }
+    }
+
+    // Propagate deeper-loop entry depth backward across non-cold blocks whose EVERY non-cold
+    // successor moves forward into a strictly deeper loop (e.g. a conditionally-entered inner
+    // loop's preheader `if ml > 32 { dst += 32; while ... }`, with optional cold trap guard).
+    let mut entry_depth: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(blocks, alloc);
+    for &d in &loop_depth {
+        entry_depth.push(d);
+    }
+    for &b in rpo.iter().rev() {
+        if at_bool(&is_cold, b) {
+            continue;
+        }
+        let b_depth = at_u32(&loop_depth, b);
+        let b_rank = at_usize(&rpo_rank, b);
+        let term = view.terminator(Block(u32_of(b)));
+        let mut has_hot_succ = false;
+        let mut all_enter_deeper = true;
+        let mut min_d = u32::MAX;
+        regalloc::for_each_edge(view, term, |target_block, _, _| {
+            let t = to_idx(target_block);
+            if t < blocks && !at_bool(&is_cold, t) {
+                has_hot_succ = true;
+                let td = at_u32(&entry_depth, t);
+                if at_usize(&rpo_rank, t) <= b_rank || td <= b_depth {
+                    all_enter_deeper = false;
+                } else {
+                    min_d = min_d.min(td);
+                }
+            }
+        });
+        if has_hot_succ && all_enter_deeper && min_d != u32::MAX {
+            set_at(&mut entry_depth, b, min_d);
+        }
+    }
+
+    // 4. Bucket hot blocks by clamped loop entry depth `0..=4` in deterministic RPO order so
+    //    deferred inner-loop preheaders are seeded right before their inner loop header.
+    let mut buckets: [Vec<usize, Alloc<'a>>; 5] = [
+        Vec::new_in(alloc),
+        Vec::new_in(alloc),
+        Vec::new_in(alloc),
+        Vec::new_in(alloc),
+        Vec::new_in(alloc),
+    ];
+    for &b in &rpo {
+        if !at_bool(&is_cold, b) {
+            let d = to_idx(at_u32(&entry_depth, b).min(4));
+            if let Some(bucket) = buckets.get_mut(d) {
+                bucket.push(b);
+            }
+        }
+    }
+
+    let pick_best_succ = |b: usize, placed: &[bool]| -> Option<usize> {
+        let b_depth = at_u32(&loop_depth, b);
+        let term = view.terminator(Block(u32_of(b)));
+        let fl = Flags(at_u8(view.flags, term));
+        let eligible = |s: usize| -> bool {
+            s < blocks
+                && !at_bool(placed, s)
+                && !at_bool(&is_cold, s)
+                && at_u32(&loop_depth, s) >= b_depth
+        };
+        let score = |s: usize, hint_score: i8| {
+            let s_depth = at_u32(&loop_depth, s);
+            let s_entry_depth = at_u32(&entry_depth, s);
+            let s_not_term = !at_bool(&is_terminal_exit, s);
+            // Inside a loop (`b_depth > 0`), a conditional `Op::Br` to a deeper loop (or its
+            // preheader) is almost always a cold long-tail slow path (`if len > 32 { while ... }`),
+            // whereas the `entry_depth == b_depth` arm is the outer-loop fast-path spine leading
+            // straight into the latch. Unconditional inner loops use `Op::Jump` and naturally fall
+            // through without consulting `score`.
+            let tier: u8 = if !s_not_term {
+                0
+            } else if b_depth > 0 {
+                if s_entry_depth == b_depth {
+                    3
+                } else if s_entry_depth > b_depth {
+                    2
+                } else {
+                    1
+                }
+            } else if s_depth > 0 || at_u32(&eff_depth, s) > 0 {
+                3
+            } else {
+                2
+            };
+            let depth_tie = if b_depth > 0 {
+                u32::MAX - s_entry_depth
+            } else {
+                s_depth
+            };
+            let eff_tie = if b_depth > 0 { 0u32 } else { at_u32(&eff_depth, s) };
+            (
+                hint_score,
+                tier,
+                depth_tie,
+                eff_tie,
+                !at_bool(&is_loop_hdr, s),
+                core::cmp::Reverse(at_usize(&rpo_rank, s)),
+            )
+        };
+        match view.op(term) {
+            Op::Jump => {
+                let at = to_idx(at_u32(view.data, term));
+                let t = to_idx(at_u32(view.extra, at));
+                eligible(t).then_some(t)
+            }
+            Op::Invoke | Op::InvokeIndirect => {
+                let at = to_idx(at_u32(view.data, term));
+                let t = to_idx(at_u32(view.extra, at + 2));
+                eligible(t).then_some(t)
+            }
+            Op::Br => {
+                let at = to_idx(at_u32(view.data, term));
+                let t = to_idx(at_u32(view.extra, at + 1));
+                let t_argc = to_idx(at_u32(view.extra, at + 2));
+                let e = to_idx(at_u32(view.extra, at + 3 + t_argc));
+                let (t_hint, e_hint) = if fl.contains(Flags::EXPECT_TRUE) {
+                    (1i8, -1i8)
+                } else if fl.contains(Flags::EXPECT_FALSE) {
+                    (-1i8, 1i8)
+                } else {
+                    (0i8, 0i8)
+                };
+                let t_ok = eligible(t);
+                let e_ok = e != t && eligible(e);
+                match (t_ok, e_ok) {
+                    (true, true) => Some(if score(t, t_hint) >= score(e, e_hint) { t } else { e }),
+                    (true, false) => Some(t),
+                    (false, true) => Some(e),
+                    (false, false) => None,
+                }
+            }
+            _ => None,
+        }
+    };
+
+    let mut placed: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(blocks, alloc);
+    for _ in 0..blocks {
+        placed.push(false);
+    }
+    let mut order: Vec<usize, Alloc<'a>> = Vec::with_capacity_in(blocks, alloc);
+
+    // 4a. Grow hot fallthrough trace starting from entry block `0`.
+    let mut cur = Some(0usize);
+    while let Some(b) = cur {
+        set_at(&mut placed, b, true);
+        order.push(b);
+        cur = pick_best_succ(b, &placed);
+    }
+
+    // 4b. Place remaining unplaced hot blocks from highest loop depth down to `0` in RPO order,
+    //     extending each greedy hot fallthrough chain.
+    let mut cursors = [0usize; 5];
+    for d in (0..5usize).rev() {
+        let (Some(bucket), Some(cursor)) = (buckets.get(d), cursors.get_mut(d)) else {
+            continue;
+        };
+        while let Some(&seed) = bucket.get(*cursor) {
+            *cursor += 1;
+            if at_bool(&placed, seed) {
+                continue;
+            }
+            let mut cur_b = seed;
+            loop {
+                set_at(&mut placed, cur_b, true);
+                order.push(cur_b);
+                match pick_best_succ(cur_b, &placed) {
+                    Some(next) => cur_b = next,
+                    None => break,
+                }
+            }
+        }
+    }
+
+    // 4c. Sink all cold blocks to the tail in deterministic RPO order.
+    for &b in &rpo {
+        if !at_bool(&placed, b) {
+            set_at(&mut placed, b, true);
+            order.push(b);
+        }
+    }
+    assert_eq!(order.len(), blocks, "compute_hot_emit_layout must emit every block exactly once");
+    HotEmitLayout { order, loop_depth, is_loop_hdr, is_cold, is_terminal_exit }
+}
+
+#[cfg(test)]
+fn compute_hot_emit_order<'a>(view: &View<'_>, alloc: Alloc<'a>) -> Vec<usize, Alloc<'a>> {
+    compute_hot_emit_layout(view, alloc).order
+}
+
 /// Compiles verified, optimized `view` directly into fused AArch64 machine code in an `Emitted`.
 pub(crate) fn emit_sota_a64<'a>(
     view: View<'_>,
@@ -2545,7 +3340,12 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
     } else {
         detect_tail_calls(&view, call_mode == CallMode::DirectBl, os, alloc)
     };
-    let block_order = compute_block_order(&view, alloc);
+    let hot_layout = compute_hot_emit_layout(&view, alloc);
+    let block_order = hot_layout.order;
+    let block_loop_depth = hot_layout.loop_depth;
+    let block_is_loop_hdr = hot_layout.is_loop_hdr;
+    let block_is_cold = hot_layout.is_cold;
+    let block_is_terminal_exit = hot_layout.is_terminal_exit;
     let sole_switch_default = crate::pass::frame::sole_switch_defaults(view, alloc);
     // Functions past 64K LIR instructions can exceed ARM64's ±1 MiB `Imm19`/`adr` reach; emit
     // 2-instruction inverted conditional branches (`b.<!cond> +8; b target`, ±128 MiB reach) and
@@ -3035,6 +3835,28 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     set_at(&mut skip_emit, zi, true);
                     continue;
                 }
+                // Pattern 4: `add(base, zext(icmp))` / `add(base, select(icmp, 1/0, 0/1))` -> `cmp` + `cinc`.
+                let cinc_match = {
+                    let scan = CmpCincScan {
+                        view: &view,
+                        const_u64: &const_u64,
+                        use_count: &use_count,
+                        inst_block: &inst_block,
+                        skip_emit: &skip_emit,
+                        fusion: &fusion,
+                    };
+                    scan.try_match(b, rhs, lhs).or_else(|| scan.try_match(b, lhs, rhs))
+                };
+                if let Some(m) = cinc_match {
+                    if let Some(sel_i) = m.clear_select_fusion {
+                        set_at(&mut fusion, sel_i, Fusion::None);
+                    }
+                    for &si in m.skips.iter().take(m.n_skips) {
+                        set_at(&mut skip_emit, si, true);
+                    }
+                    set_at(&mut fusion, inst, m.fusion);
+                    continue;
+                }
             }
             Op::UaddOverflow if ty_at(view.tys, to_idx(at_u32(view.extra, to_idx(at_u32(view.data, inst))))).bits(64) == 64 => {
                 // Multi-limb `U256` intermediate carry-chain limb:
@@ -3225,6 +4047,28 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                 if let Some((a, x, ni)) = try_neg(rhs, lhs).or_else(|| try_neg(lhs, rhs)) {
                     set_at(&mut fusion, inst, Fusion::SubLsr { a, b: x, shift: 0, imm_inst: u32::MAX });
                     set_at(&mut skip_emit, ni, true);
+                    continue;
+                }
+                // Fuse 32-bit `add(base, zext(icmp))` / `add(base, select(icmp, 1/0, 0/1))` -> `cmp` + `cinc`.
+                let cinc_match = {
+                    let scan = CmpCincScan {
+                        view: &view,
+                        const_u64: &const_u64,
+                        use_count: &use_count,
+                        inst_block: &inst_block,
+                        skip_emit: &skip_emit,
+                        fusion: &fusion,
+                    };
+                    scan.try_match(b, rhs, lhs).or_else(|| scan.try_match(b, lhs, rhs))
+                };
+                if let Some(m) = cinc_match {
+                    if let Some(sel_i) = m.clear_select_fusion {
+                        set_at(&mut fusion, sel_i, Fusion::None);
+                    }
+                    for &si in m.skips.iter().take(m.n_skips) {
+                        set_at(&mut skip_emit, si, true);
+                    }
+                    set_at(&mut fusion, inst, m.fusion);
                     continue;
                 }
             }
@@ -4388,16 +5232,20 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                             if op_ty == Ty::I128 {
                                 continue;
                             }
-                            // Check `tbz`/`tbnz` and `tst` fusion for `icmp eq/ne (and(x, mask)), 0`!
+                            // Check `tbz`/`tbnz` and `tst` fusion for `icmp eq/ne (and(x, mask)), 0`
+                            // (both 64-bit `X` and 32-bit `W`, and both operand orders of `0`)!
                             let mut fused_bit_br = false;
-                            if then_argc == 0
-                                && else_argc == 0
-                                && matches!(cond, IntCond::Eq | IntCond::Ne)
-                                && at_opt(&const_u64, to_idx(bv)) == Some(0)
-                                && op_ty.bits(64) == 64
-                            {
-                                let ai = to_idx(a);
-                                if at_u32(&use_count, ai) == 1
+                            let op_bits = if op_ty.is_scalar() && op_ty.is_int() { op_ty.bits(64) } else { 0 };
+                            if matches!(cond, IntCond::Eq | IntCond::Ne) && (op_bits == 64 || op_bits == 32) {
+                                let and_zero = if at_opt(&const_u64, to_idx(bv)) == Some(0) {
+                                    Some((to_idx(a), bv))
+                                } else if at_opt(&const_u64, to_idx(a)) == Some(0) {
+                                    Some((to_idx(bv), a))
+                                } else {
+                                    None
+                                };
+                                if let Some((ai, zero_imm)) = and_zero
+                                    && at_u32(&use_count, ai) == 1
                                     && at_u32(&inst_block, ai) == b
                                     && view.op(ai) == Op::And
                                     && at_fusion(&fusion, ai) == Fusion::None
@@ -4407,6 +5255,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                                     let x = at_u32(view.extra, aat);
                                     let y = at_u32(view.extra, aat + 1);
                                     let nonzero_is_then = cond == IntCond::Ne;
+                                    let wide = op_bits == 64;
                                     let c_pair = if let Some(cv) = at_opt(&const_u64, to_idx(y)) {
                                         Some((x, y, cv))
                                     } else if let Some(cv) = at_opt(&const_u64, to_idx(x)) {
@@ -4415,21 +5264,36 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                                         None
                                     };
                                     if let Some((val, mask_imm, cv)) = c_pair {
-                                        if cv.is_power_of_two() && len < 2048 {
+                                        if then_argc == 0 && else_argc == 0 && cv.is_power_of_two() && len < 2048 {
                                             set_at(&mut fusion, inst, Fusion::TbzBr {
                                                 val,
                                                 bit: cv.trailing_zeros(),
                                                 nonzero_is_then,
                                                 mask_imm,
+                                                zero_imm,
                                             });
                                             set_at(&mut skip_emit, cond_v, true);
                                             set_at(&mut skip_emit, ai, true);
                                             fused_bit_br = true;
-                                        } else if let Some(nrs) = enc::logical_imm(cv, 64) {
+                                        } else if let Some(nrs) = enc::logical_imm(cv, op_bits) {
                                             set_at(&mut fusion, inst, Fusion::TstBr {
                                                 a: val,
                                                 rhs: mask_imm,
                                                 imm_nrs: Some(u32_of(nrs)),
+                                                zero_imm,
+                                                wide,
+                                                nonzero_is_then,
+                                            });
+                                            set_at(&mut skip_emit, cond_v, true);
+                                            set_at(&mut skip_emit, ai, true);
+                                            fused_bit_br = true;
+                                        } else {
+                                            set_at(&mut fusion, inst, Fusion::TstBr {
+                                                a: val,
+                                                rhs: mask_imm,
+                                                imm_nrs: None,
+                                                zero_imm,
+                                                wide,
                                                 nonzero_is_then,
                                             });
                                             set_at(&mut skip_emit, cond_v, true);
@@ -4441,6 +5305,8 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                                             a: x,
                                             rhs: y,
                                             imm_nrs: None,
+                                            zero_imm,
+                                            wide,
                                             nonzero_is_then,
                                         });
                                         set_at(&mut skip_emit, cond_v, true);
@@ -5046,6 +5912,110 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
         }
     }
 
+    // 2a-iv. Elide redundant shift-count bitmasks (`And(x, mask)` optionally wrapped in a
+    //        single-use `Zext`/`Trunc`) for 32-bit (`(mask & 31) == 31`) and 64-bit
+    //        (`(mask & 63) == 63`) variable shifts/rotates, since AArch64 `lslv`/`lsrv`/
+    //        `asrv`/`rorv` hardware-mask shift counts modulo register width.
+    {
+        let mut and_shift_uses: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(len, alloc);
+        for _ in 0..len {
+            and_shift_uses.push(0);
+        }
+        let mut shift_cands: Vec<(usize, u32, usize, u32, u32), Alloc<'a>> = Vec::new_in(alloc);
+        for inst in 0..len {
+            if at_bool(&skip_emit, inst) || at_fusion(&fusion, inst) != Fusion::None {
+                continue;
+            }
+            if !matches!(view.op(inst), Op::Shl | Op::Lshr | Op::Ashr | Op::Rotl | Op::Rotr) {
+                continue;
+            }
+            let ty = ty_at(view.tys, inst);
+            let required_mask: u64 = match ty {
+                Ty::I32 => 31,
+                Ty::I64 => 63,
+                _ => continue,
+            };
+            let at = to_idx(at_u32(view.data, inst));
+            let rhs = at_u32(view.extra, at + 1);
+            if at_opt(&const_u64, to_idx(rhs)).is_some() {
+                continue;
+            }
+            let mut cast_inst = u32::MAX;
+            let mut and_v = rhs;
+            let ri = to_idx(rhs);
+            if matches!(view.op(ri), Op::Zext | Op::Trunc)
+                && at_u32(&use_count, ri) == 1
+                && !at_bool(&skip_emit, ri)
+                && at_fusion(&fusion, ri) == Fusion::None
+            {
+                let cast_ty = ty_at(view.tys, ri);
+                let src_v = at_u32(view.data, ri);
+                let src_ty = ty_at(view.tys, to_idx(src_v));
+                if cast_ty.is_scalar()
+                    && cast_ty.is_int()
+                    && src_ty.is_scalar()
+                    && src_ty.is_int()
+                    && (8..=64).contains(&cast_ty.bits(64))
+                    && (8..=64).contains(&src_ty.bits(64))
+                {
+                    cast_inst = rhs;
+                    and_v = src_v;
+                }
+            }
+            let and_i = to_idx(and_v);
+            if view.op(and_i) != Op::And
+                || at_bool(&skip_emit, and_i)
+                || at_fusion(&fusion, and_i) != Fusion::None
+                || at_u32(&use_count, and_i) == 0
+            {
+                continue;
+            }
+            let and_ty = ty_at(view.tys, and_i);
+            if !(and_ty.is_scalar() && and_ty.is_int() && (8..=64).contains(&and_ty.bits(64))) {
+                continue;
+            }
+            let and_at = to_idx(at_u32(view.data, and_i));
+            let a0 = at_u32(view.extra, and_at);
+            let a1 = at_u32(view.extra, and_at + 1);
+            let (inner, mask_v) = if at_opt(&const_u64, to_idx(a1))
+                .is_some_and(|m| (m & required_mask) == required_mask)
+                && at_opt(&const_u64, to_idx(a0)).is_none()
+            {
+                (a0, a1)
+            } else if at_opt(&const_u64, to_idx(a0))
+                .is_some_and(|m| (m & required_mask) == required_mask)
+                && at_opt(&const_u64, to_idx(a1)).is_none()
+            {
+                (a1, a0)
+            } else {
+                continue;
+            };
+            let inner_ty = ty_at(view.tys, to_idx(inner));
+            if !(inner_ty.is_scalar() && inner_ty.is_int() && (8..=64).contains(&inner_ty.bits(64))) {
+                continue;
+            }
+            inc_u32(&mut and_shift_uses, and_i);
+            shift_cands.push((inst, cast_inst, and_i, inner, mask_v));
+        }
+        for &(shift_inst, cast_inst, and_i, inner, mask_v) in &shift_cands {
+            if at_u32(&and_shift_uses, and_i) == at_u32(&use_count, and_i) {
+                let first_fold = !at_bool(&skip_emit, and_i);
+                set_at(&mut skip_emit, and_i, true);
+                if cast_inst != u32::MAX {
+                    set_at(&mut skip_emit, to_idx(cast_inst), true);
+                }
+                set_at(
+                    &mut fusion,
+                    shift_inst,
+                    Fusion::ShiftUnmasked {
+                        rhs: inner,
+                        mask_imm: if first_fold { mask_v } else { u32::MAX },
+                    },
+                );
+            }
+        }
+    }
+
     // Any `slot_addr` whose EVERY use folded into `[sp, #off]` needs ZERO register & ZERO emission!
     for inst in 0..len {
         if view.op(inst) == Op::SlotAddr && at_u32(&use_count, inst) > 0 && at_u32(&slot_addr_folded_uses, inst) == at_u32(&use_count, inst) {
@@ -5059,6 +6029,19 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
     for _ in 0..len {
         imm_uses.push(0);
     }
+    let count_select_imm_arms = |imm_uses: &mut [u32], inst: usize, ty: Ty| {
+        if ty != Ty::I128 && is_fp_ty(ty).is_none() && is_vec128_ty(ty).is_none() {
+            let at = to_idx(at_u32(view.data, inst));
+            let tv = to_idx(at_u32(view.extra, at + 1));
+            let fv = to_idx(at_u32(view.extra, at + 2));
+            if at_opt(&const_u64, tv).is_some_and(|v| v == 0 || v == 1) {
+                inc_u32(imm_uses, tv);
+            }
+            if at_opt(&const_u64, fv).is_some_and(|v| v == 0 || v == 1) {
+                inc_u32(imm_uses, fv);
+            }
+        }
+    };
     for inst in 0..len {
         if at_bool(&skip_emit, inst) {
             continue;
@@ -5077,6 +6060,11 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
             Fusion::SubLsr { imm_inst, .. } => {
                 if imm_inst != u32::MAX {
                     inc_u32(&mut imm_uses, to_idx(imm_inst));
+                }
+            }
+            Fusion::ShiftUnmasked { mask_imm, .. } => {
+                if mask_imm != u32::MAX {
+                    inc_u32(&mut imm_uses, to_idx(mask_imm));
                 }
             }
             Fusion::MemBaseOff { imm_inst, .. } => {
@@ -5109,25 +6097,39 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     inc_u32(&mut imm_uses, to_idx(shift_imm));
                 }
             }
-            Fusion::TbzBr { mask_imm, .. } => {
+            Fusion::TbzBr { mask_imm, zero_imm, .. } => {
                 inc_u32(&mut imm_uses, to_idx(mask_imm));
+                inc_u32(&mut imm_uses, to_idx(zero_imm));
             }
-            Fusion::TstBr { rhs, imm_nrs: Some(_), .. } => {
-                inc_u32(&mut imm_uses, to_idx(rhs));
+            Fusion::TstBr { rhs, imm_nrs, zero_imm, .. } => {
+                if imm_nrs.is_some() {
+                    inc_u32(&mut imm_uses, to_idx(rhs));
+                }
+                inc_u32(&mut imm_uses, to_idx(zero_imm));
+            }
+            Fusion::CmpSelect { b: bv, op_ty, .. } => {
+                if (op_ty.bits(64) == 64 || op_ty.bits(64) == 32)
+                    && at_opt(&const_u64, to_idx(bv)).and_then(is_addsub_imm12).is_some()
+                {
+                    inc_u32(&mut imm_uses, to_idx(bv));
+                }
+                count_select_imm_arms(&mut imm_uses, inst, ty);
             }
             Fusion::CmpBr { b: bv, op_ty, .. }
-            | Fusion::CmpSelect { b: bv, op_ty, .. }
             | Fusion::CsnegSelect { b: bv, op_ty, .. }
             | Fusion::CsinvSelect { b: bv, op_ty, .. } => {
                 if (op_ty.bits(64) == 64 || op_ty.bits(64) == 32)
-                    && at_opt(&const_u64, to_idx(bv)).is_some_and(|v| v <= 4095)
+                    && at_opt(&const_u64, to_idx(bv)).and_then(is_addsub_imm12).is_some()
                 {
                     inc_u32(&mut imm_uses, to_idx(bv));
                 }
             }
+            Fusion::FcmpSelect { .. } | Fusion::ReuseFlagsSelect { .. } => {
+                count_select_imm_arms(&mut imm_uses, inst, ty);
+            }
             Fusion::CsincSelect { b: bv, op_ty, one_imm, .. } => {
                 if (op_ty.bits(64) == 64 || op_ty.bits(64) == 32)
-                    && at_opt(&const_u64, to_idx(bv)).is_some_and(|v| v <= 4095)
+                    && at_opt(&const_u64, to_idx(bv)).and_then(is_addsub_imm12).is_some()
                 {
                     inc_u32(&mut imm_uses, to_idx(bv));
                 }
@@ -5135,6 +6137,19 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
             }
             Fusion::ReuseFlagsCsinc { one_imm, .. } => {
                 inc_u32(&mut imm_uses, to_idx(one_imm));
+            }
+            Fusion::CmpAddCinc { b: bv, op_ty, sel_imm_a, sel_imm_b, .. } => {
+                if (op_ty.bits(64) == 64 || op_ty.bits(64) == 32)
+                    && at_opt(&const_u64, to_idx(bv)).and_then(is_addsub_imm12).is_some()
+                {
+                    inc_u32(&mut imm_uses, to_idx(bv));
+                }
+                if sel_imm_a != u32::MAX {
+                    inc_u32(&mut imm_uses, to_idx(sel_imm_a));
+                }
+                if sel_imm_b != u32::MAX {
+                    inc_u32(&mut imm_uses, to_idx(sel_imm_b));
+                }
             }
             Fusion::ReuseFlagsBr { zero_imm, .. } => {
                 if zero_imm != u32::MAX {
@@ -5144,7 +6159,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
             Fusion::SubsFlags => {
                 let at = to_idx(at_u32(view.data, inst));
                 let rhs = to_idx(at_u32(view.extra, at + 1));
-                if at_opt(&const_u64, rhs).is_some_and(|v| v <= 4095) {
+                if at_opt(&const_u64, rhs).and_then(is_addsub_imm12).is_some() {
                     inc_u32(&mut imm_uses, rhs);
                 }
             }
@@ -5181,14 +6196,11 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
             | Fusion::AdcsChain { .. }
             | Fusion::AdcsOverflowChain { .. }
             | Fusion::FcmpBr { .. }
-            | Fusion::FcmpSelect { .. }
-            | Fusion::ReuseFlagsSelect { .. }
             | Fusion::MemSpOff { .. }
             | Fusion::MemRegIdx { .. }
             | Fusion::Bic { .. }
             | Fusion::Orn { .. }
             | Fusion::Eon { .. }
-            | Fusion::TstBr { imm_nrs: None, .. }
             | Fusion::BlazeResultCallBr
             | Fusion::VecUadalp { .. }
             | Fusion::VecFmulElem { .. }
@@ -5201,16 +6213,16 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     let at = to_idx(at_u32(view.data, inst));
                     let lhs = to_idx(at_u32(view.extra, at));
                     let rhs = to_idx(at_u32(view.extra, at + 1));
-                    if at_opt(&const_u64, rhs).is_some_and(|v| v <= 4095) {
+                    if at_opt(&const_u64, rhs).and_then(is_addsub_imm12).is_some() {
                         inc_u32(&mut imm_uses, rhs);
-                    } else if at_opt(&const_u64, lhs).is_some_and(|v| v <= 4095) {
+                    } else if at_opt(&const_u64, lhs).and_then(is_addsub_imm12).is_some() {
                         inc_u32(&mut imm_uses, lhs);
                     }
                 }
                 Op::Sub => {
                     let at = to_idx(at_u32(view.data, inst));
                     let rhs = to_idx(at_u32(view.extra, at + 1));
-                    if at_opt(&const_u64, rhs).is_some_and(|v| v <= 4095) {
+                    if at_opt(&const_u64, rhs).and_then(is_addsub_imm12).is_some() {
                         inc_u32(&mut imm_uses, rhs);
                     }
                 }
@@ -5220,7 +6232,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     if let Some(cv) = at_opt(&const_u64, rhs) {
                         let by_bits = ty_at(view.tys, rhs).bits(64);
                         let delta = sign_extend_u64(cv, by_bits);
-                        if (-4095..=4095).contains(&delta) {
+                        if is_addsub_imm12(delta.unsigned_abs()).is_some() {
                             inc_u32(&mut imm_uses, rhs);
                         }
                     }
@@ -5295,9 +6307,14 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     let a = to_idx(at_u32(view.extra, at + 1));
                     let bv = to_idx(at_u32(view.extra, at + 2));
                     let abits = ty_at(view.tys, a).bits(64);
-                    if (abits == 64 || abits == 32) && at_opt(&const_u64, bv).is_some_and(|v| v <= 4095) {
+                    if (abits == 64 || abits == 32)
+                        && at_opt(&const_u64, bv).and_then(is_addsub_imm12).is_some()
+                    {
                         inc_u32(&mut imm_uses, bv);
                     }
+                }
+                Op::Select => {
+                    count_select_imm_arms(&mut imm_uses, inst, ty);
                 }
                 _ => {}
             },
@@ -5431,13 +6448,17 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                 mark_upper32(&mut val_needs_clean_upper32, b);
                 mark_br_edge_args(&mut val_needs_clean_upper32, inst);
             }
-            Fusion::TbzBr { val, .. } => {
-                mark_upper32(&mut val_needs_clean_upper32, val);
+            Fusion::TbzBr { val, bit, .. } => {
+                if bit >= 32 {
+                    mark_upper32(&mut val_needs_clean_upper32, val);
+                }
                 mark_br_edge_args(&mut val_needs_clean_upper32, inst);
             }
-            Fusion::TstBr { a, rhs, .. } => {
-                mark_upper32(&mut val_needs_clean_upper32, a);
-                mark_upper32(&mut val_needs_clean_upper32, rhs);
+            Fusion::TstBr { a, rhs, wide, .. } => {
+                if wide {
+                    mark_upper32(&mut val_needs_clean_upper32, a);
+                    mark_upper32(&mut val_needs_clean_upper32, rhs);
+                }
                 mark_br_edge_args(&mut val_needs_clean_upper32, inst);
             }
             Fusion::ReuseFlagsBr { .. } | Fusion::BlazeResultCallBr => {
@@ -5482,6 +6503,15 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
             Fusion::ReuseFlagsCsinc { rn, rm, .. } => {
                 mark_upper32(&mut val_needs_clean_upper32, rn);
                 mark_upper32(&mut val_needs_clean_upper32, rm);
+            }
+            Fusion::CmpAddCinc { base, a, b, op_ty, .. } => {
+                if op_ty != Ty::I32 {
+                    mark_upper32(&mut val_needs_clean_upper32, a);
+                    mark_upper32(&mut val_needs_clean_upper32, b);
+                }
+                if !is_i32 {
+                    mark_upper32(&mut val_needs_clean_upper32, base);
+                }
             }
             Fusion::MemSpOff { .. } => {
                 if op == Op::Store {
@@ -5539,6 +6569,12 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                 if !is_i32 {
                     mark_upper32(&mut val_needs_clean_upper32, a);
                     mark_upper32(&mut val_needs_clean_upper32, b);
+                }
+            }
+            Fusion::ShiftUnmasked { .. } => {
+                if !is_i32 {
+                    let at = to_idx(at_u32(view.data, inst));
+                    mark_upper32(&mut val_needs_clean_upper32, at_u32(view.extra, at));
                 }
             }
             Fusion::Eor3 { a, b, c } | Fusion::Bcax { a, b, c } => {
@@ -5608,6 +6644,24 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
         }
     }
 
+    // 2d. Zero-cost no-op `Op::Trunc` / `Op::Zext` value aliasing:
+    //     Aliased casts are skipped in both `regalloc` and emission and inherit their root value's
+    //     physical location directly (zero dead `mov`s, zero extra live GPR pressure).
+    let alias_of = compute_noop_cast_aliases(
+        &view,
+        &skip_emit,
+        &fusion,
+        &const_u64,
+        &use_count,
+        &val_needs_clean_upper32,
+        alloc,
+    );
+    for inst in 0..len {
+        if at_u32(&alias_of, inst) != u32::MAX {
+            set_at(&mut skip_emit, inst, true);
+        }
+    }
+
     // Inline small constant `Op::Memmove` (`<= 32 B`) uses only reserved scratch (`X16`/`X17`/`V30`/`V31`)
     // with zero call instructions and zero caller-saved clobbers; exclude those sites from regalloc's
     // call-clobber / `has_calls` tracking while preserving `tail_calls` for `Op::Call`.
@@ -5618,9 +6672,10 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
     }
 
     // 3. IPRA-aware Greedy Priority-Weighted Graph-Coloring Regalloc + True Constant Rematerialization!
-    let reg_alloc = regalloc::allocate_with_ipra_and_order(
+    let mut reg_alloc = regalloc::allocate_with_ipra_and_order(
         &view,
         &skip_emit,
+        &alias_of,
         &regalloc_no_call,
         max_spill_slots,
         os,
@@ -5700,6 +6755,15 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                 }
             };
             set_at(&mut remat_global_plan, g_inst, plan);
+        }
+    }
+    // Propagate each root's physical location to its zero-cost aliased `Op::Trunc`/`Op::Zext` values
+    // (after `remat_global_plan` has resolved genuine `DataAddr`/`FuncAddr` roots).
+    for inst in 0..len {
+        let root = at_u32(&alias_of, inst);
+        if root != u32::MAX {
+            let root_loc = at_loc(&reg_alloc.loc_of, to_idx(root));
+            set_at(&mut reg_alloc.loc_of, inst, root_loc);
         }
     }
     let remat_relocs: core::cell::RefCell<Vec<Reloc, Alloc<'a>>> = core::cell::RefCell::new(Vec::new_in(alloc));
@@ -6239,10 +7303,11 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
         let bits = op_ty.bits(64);
         let ra = load_gpr(words, a, X16);
         let signed = matches!(cond, IntCond::Slt | IntCond::Sle | IntCond::Sgt | IntCond::Sge);
-        if let Some(imm) = at_opt(&const_u64, to_idx(bv)).filter(|&v| bits == 64 && v <= 4095) {
-            words.push(enc::cmp_imm(ra, trunc_u32(imm)));
-        } else if let Some(imm) = at_opt(&const_u64, to_idx(bv)).filter(|&v| bits == 32 && v <= 4095) {
-            words.push(enc::sf(false, enc::cmp_imm(ra, trunc_u32(imm))));
+        if let Some((imm12, shift12)) = (bits == 64 || bits == 32)
+            .then(|| at_opt(&const_u64, to_idx(bv)).and_then(is_addsub_imm12))
+            .flatten()
+        {
+            words.push(enc::sf(bits == 64, enc::subs_imm(ZR, ra, imm12, shift12)));
         } else if bits == 32 {
             let rb = load_gpr(words, bv, X17);
             words.push(enc::sf(false, enc::cmp(ra, rb)));
@@ -6255,6 +7320,34 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
             let rb = load_gpr(words, bv, X17);
             words.push(enc::cmp(ra, rb));
         }
+    };
+
+    // Helper: canonical `LiveCmp` key matching `emit_cmp`'s exact NZCV semantics.
+    let make_live_cmp = |cond: IntCond, a: u32, bv: u32, op_ty: Ty| -> LiveCmp {
+        let bits = op_ty.bits(64);
+        let signed = matches!(cond, IntCond::Slt | IntCond::Sle | IntCond::Sgt | IntCond::Sge);
+        let width = if bits == 32 {
+            CmpWidth::W32
+        } else if bits == 64 {
+            CmpWidth::X64
+        } else if signed {
+            CmpWidth::SextSub64(u8_of(bits))
+        } else {
+            CmpWidth::ZextSub64(u8_of(bits))
+        };
+        let operand = |v: u32| -> CmpOperand {
+            let r = at_u32(&alias_of, to_idx(v));
+            let root = if r == u32::MAX { v } else { r };
+            if let Some(cv) = at_opt(&const_u64, to_idx(root)) {
+                let masked = if bits >= 64 { cv } else { cv & ((1u64 << bits) - 1) };
+                CmpOperand::Imm(masked)
+            } else if view.op(to_idx(root)) == Op::Null {
+                CmpOperand::Imm(0)
+            } else {
+                CmpOperand::Reg(root)
+            }
+        };
+        LiveCmp { lhs: operand(a), rhs: operand(bv), width }
     };
 
     // Helper: emit parallel moves for a branch/jump/switch target's block arguments.
@@ -6452,26 +7545,13 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
     let mut ptr_accesses: Vec<(usize, bool, PostAccessKind, i64), Alloc<'a>> = Vec::with_capacity_in(16, alloc);
     let mut skip_p_nexts: Vec<usize, Alloc<'a>> = Vec::with_capacity_in(8, alloc);
 
-    // Identify loop-header blocks (targets of backward edges in original or emitted block order)
-    // for 16-byte fetch-boundary alignment on Apple Silicon (full 8-wide fetch bandwidth).
+    // Map each block index to its emitted position in `block_order` for `Op::Br` target hotness.
     let mut block_pos: Vec<usize, Alloc<'a>> = Vec::with_capacity_in(blocks, alloc);
-    let mut is_loop_header: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(blocks, alloc);
     for _ in 0..blocks {
         block_pos.push(0);
-        is_loop_header.push(false);
     }
     for (pos, &blk) in block_order.iter().enumerate() {
         set_at(&mut block_pos, blk, pos);
-    }
-    for b in 0..blocks {
-        let b_pos = at_usize(&block_pos, b);
-        let term = view.terminator(Block(u32_of(b)));
-        regalloc::for_each_edge(&view, term, |target, _, _| {
-            let tb = to_idx(target);
-            if tb <= b || at_usize(&block_pos, tb) <= b_pos {
-                set_at(&mut is_loop_header, tb, true);
-            }
-        });
     }
 
     // Helper closure: extract `(base_reg_or_sp, byte_off, is_fp)` for a 64-bit non-volatile
@@ -6603,10 +7683,12 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
         }
     }
 
-    // Emit each block in hot-first order (cold/trap blocks sunk to tail; loop headers 16B-aligned)!
+    // Emit each block in hot-first order (cold/trap blocks sunk to tail). Only true RPO loop
+    // headers (`block_is_loop_hdr`) — never non-loop merge blocks jumped to from off-spine
+    // blocks — are 16-byte aligned for Apple Silicon fetch-boundary bandwidth.
     for (order_idx, &b) in block_order.iter().enumerate() {
         let next_block = block_order.get(order_idx + 1).copied();
-        if b != 0 && at_bool(&is_loop_header, b) {
+        if b != 0 && at_bool(&block_is_loop_hdr, b) {
             while words.len() % 4 != 0 {
                 words.push(enc::nop());
             }
@@ -7048,7 +8130,10 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
         };
         let range_preserves_rp = |start_i: usize, cand_i: usize, rp: Reg| -> bool {
             for k in start_i..=cand_i {
-                if k != cand_i && matches!(at_loc(&reg_alloc.loc_of, k), AllocLoc::Gpr(r) if u32::from(r) == rp) {
+                if k != cand_i
+                    && !at_bool(&skip_emit, k)
+                    && matches!(at_loc(&reg_alloc.loc_of, k), AllocLoc::Gpr(r) if u32::from(r) == rp)
+                {
                     return false;
                 }
                 if !at_bool(&skip_emit, k)
@@ -7279,6 +8364,8 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
             set_at(&mut skip_emit, pn, true);
         }
 
+        let mut live_cond: Option<(u32, Cond)> = None;
+        let mut live_cmp: Option<LiveCmp> = None;
         let mut inst = range.start;
         while inst < range.end {
             if at_bool(&skip_emit, inst) {
@@ -7350,6 +8437,8 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
             let fp_ty = is_fp_ty(ty);
             // 128-bit NEON vector lane-mask comparison (`Icmp` -> `<lanes x i1>` all-ones/all-zeros mask).
             if is_vec_mask_ty(ty).is_some() && op == Op::Icmp {
+                live_cond = None;
+                live_cmp = None;
                 let at = to_idx(at_u32(view.data, inst));
                 let cond = IntCond::from_word(at_u32(view.extra, at)).ok_or(TierError::Refused {
                     tier: TIER,
@@ -7422,6 +8511,19 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
             {
                 inst += 1;
                 continue;
+            }
+
+            // Snapshot NZCV state entering `inst`, then clear `live_cond`/`live_cmp` upfront for any op not
+            // strictly guaranteed to preserve hardware NZCV so early `continue`s can never leak stale flags.
+            let prev_live_cond = live_cond;
+            let prev_live_cmp = live_cmp;
+            if vec_ty.is_some()
+                || ty == Ty::I128
+                || ty.compound_row().is_some()
+                || !op_preserves_nzcv(op, ty, at_fusion(&fusion, inst))
+            {
+                live_cond = None;
+                live_cmp = None;
             }
 
             // 128-bit NEON SIMD vector fast path!
@@ -8611,17 +9713,31 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     Op::Select => {
                         let at = to_idx(at_u32(view.data, inst));
                         let (cv, tv, fv) = (at_u32(view.extra, at), at_u32(view.extra, at + 1), at_u32(view.extra, at + 2));
-                        let rc = load_gpr(&mut words, cv, X16);
-                        words.push(enc::cmp_imm(rc, 0));
+                        let cv_root = {
+                            let r = at_u32(&alias_of, to_idx(cv));
+                            if r == u32::MAX { cv } else { r }
+                        };
+                        let sel_cond = if let Some((live_v, live_c)) = prev_live_cond
+                            && live_v == cv_root
+                        {
+                            live_cond = Some((live_v, live_c));
+                            live_cmp = prev_live_cmp;
+                            live_c
+                        } else {
+                            let rc = load_gpr(&mut words, cv, X16);
+                            words.push(enc::cmp_imm(rc, 0));
+                            live_cond = Some((cv_root, Cond::Ne));
+                            Cond::Ne
+                        };
                         let t0 = load_half(&mut words, tv, false, X16);
                         let f0 = load_half(&mut words, fv, false, X17);
-                        words.push(enc::csel(dlo, t0, f0, Cond::Ne));
+                        words.push(enc::csel(dlo, t0, f0, sel_cond));
                         if let Some((s0, _)) = sp_pair {
                             emit_st_spill_gpr(&mut words, dlo, spill_base, s0);
                         }
                         let t1 = load_half(&mut words, tv, true, X16);
                         let f1 = load_half(&mut words, fv, true, X17);
-                        words.push(enc::csel(dhi, t1, f1, Cond::Ne));
+                        words.push(enc::csel(dhi, t1, f1, sel_cond));
                         if let Some((_, s1)) = sp_pair {
                             emit_st_spill_gpr(&mut words, dhi, spill_base, s1);
                         }
@@ -8947,10 +10063,12 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                             if let Some(cv) = at_opt(&const_u64, to_idx(by)) {
                                 let by_bits = ty_at(view.tys, to_idx(by)).bits(64);
                                 let delta = sign_extend_u64(cv, by_bits);
-                                if (0..=4095).contains(&delta) {
-                                    words.push(enc::add_imm(rd, rptr, u32_of(delta), false));
-                                } else if (-4095..0).contains(&delta) {
-                                    words.push(enc::sub_imm(rd, rptr, u32_of(-delta), false));
+                                if let Some((imm12, shift12)) = is_addsub_imm12(delta.unsigned_abs()) {
+                                    if delta >= 0 {
+                                        words.push(enc::add_imm(rd, rptr, imm12, shift12));
+                                    } else {
+                                        words.push(enc::sub_imm(rd, rptr, imm12, shift12));
+                                    }
                                 } else {
                                     emit_const_u64(&mut words, X17, delta.cast_unsigned());
                                     words.push(enc::add(rd, rptr, X17));
@@ -10140,17 +11258,49 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                             let rb = load_gpr(&mut words, mb, X17);
                             words.push(enc::adcs(rd, ra, rb));
                         }
+                        Fusion::CmpAddCinc { base, cond, a, b: bv, op_ty, invert, .. } => {
+                            let cur_cmp = make_live_cmp(cond, a, bv, op_ty);
+                            if prev_live_cmp == Some(cur_cmp) {
+                                live_cond = prev_live_cond;
+                                live_cmp = prev_live_cmp;
+                            } else {
+                                emit_cmp(&mut words, cond, a, bv, op_ty);
+                                live_cmp = Some(cur_cmp);
+                            }
+                            let r_base = load_gpr(&mut words, base, X16);
+                            let hw_cond = cond_of(cond);
+                            let csinc_cond = if invert { hw_cond } else { invert_cond(hw_cond) };
+                            words.push(enc::sf(bits != 32, enc::csinc(rd, r_base, r_base, csinc_cond)));
+                        }
                         _ => {
                             let at = to_idx(at_u32(view.data, inst));
                             let lhs = at_u32(view.extra, at);
                             let rhs = at_u32(view.extra, at + 1);
                             let w32 = bits == 32;
-                            if let Some(imm) = at_opt(&const_u64, to_idx(rhs)).filter(|&v| v <= 4095) {
+                            if let Some((imm12, shift12)) = at_opt(&const_u64, to_idx(rhs)).and_then(is_addsub_imm12) {
                                 let rl = load_gpr(&mut words, lhs, X16);
-                                words.push(enc::sf(!w32, enc::add_imm(rd, rl, trunc_u32(imm), false)));
-                            } else if let Some(imm) = at_opt(&const_u64, to_idx(lhs)).filter(|&v| v <= 4095) {
+                                words.push(enc::sf(!w32, enc::add_imm(rd, rl, imm12, shift12)));
+                            } else if let Some((imm12, shift12)) = at_opt(&const_u64, to_idx(lhs)).and_then(is_addsub_imm12) {
                                 let rr = load_gpr(&mut words, rhs, X16);
-                                words.push(enc::sf(!w32, enc::add_imm(rd, rr, trunc_u32(imm), false)));
+                                words.push(enc::sf(!w32, enc::add_imm(rd, rr, imm12, shift12)));
+                            } else if (bits == 32 || bits == 64)
+                                && lhs != rhs
+                                && let Some((live_v, live_c)) = prev_live_cond
+                                && matches!(view.op(to_idx(live_v)), Op::Icmp | Op::Fcmp)
+                                && is_vec_mask_ty(ty_at(view.tys, to_idx(live_v))).is_none()
+                                && {
+                                    let resolve = |v: u32| {
+                                        let r = at_u32(&alias_of, to_idx(v));
+                                        if r == u32::MAX { v } else { r }
+                                    };
+                                    resolve(rhs) == live_v || resolve(lhs) == live_v
+                                }
+                            {
+                                let r_rhs = at_u32(&alias_of, to_idx(rhs));
+                                let rhs_root = if r_rhs == u32::MAX { rhs } else { r_rhs };
+                                let base_v = if rhs_root == live_v { lhs } else { rhs };
+                                let rb = load_gpr(&mut words, base_v, X16);
+                                words.push(enc::sf(!w32, enc::csinc(rd, rb, rb, invert_cond(live_c))));
                             } else {
                                 let rl = load_gpr(&mut words, lhs, X16);
                                 let rr = load_gpr(&mut words, rhs, X17);
@@ -10217,9 +11367,9 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                             let rhs = at_u32(view.extra, at + 1);
                             let w32 = bits == 32;
                             let dst = if loc == AllocLoc::None { ZR } else { rd };
-                            if let Some(imm) = at_opt(&const_u64, to_idx(rhs)).filter(|&v| v <= 4095) {
+                            if let Some((imm12, shift12)) = at_opt(&const_u64, to_idx(rhs)).and_then(is_addsub_imm12) {
                                 let rl = load_gpr(&mut words, lhs, X16);
-                                words.push(enc::sf(!w32, enc::subs_imm(dst, rl, trunc_u32(imm), false)));
+                                words.push(enc::sf(!w32, enc::subs_imm(dst, rl, imm12, shift12)));
                             } else {
                                 let rl = load_gpr(&mut words, lhs, X16);
                                 let rr = load_gpr(&mut words, rhs, X17);
@@ -10231,9 +11381,9 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                             let lhs = at_u32(view.extra, at);
                             let rhs = at_u32(view.extra, at + 1);
                             let w32 = bits == 32;
-                            if let Some(imm) = at_opt(&const_u64, to_idx(rhs)).filter(|&v| v <= 4095) {
+                            if let Some((imm12, shift12)) = at_opt(&const_u64, to_idx(rhs)).and_then(is_addsub_imm12) {
                                 let rl = load_gpr(&mut words, lhs, X16);
-                                words.push(enc::sf(!w32, enc::sub_imm(rd, rl, trunc_u32(imm), false)));
+                                words.push(enc::sf(!w32, enc::sub_imm(rd, rl, imm12, shift12)));
                             } else {
                                 let rl = load_gpr(&mut words, lhs, X16);
                                 let rr = load_gpr(&mut words, rhs, X17);
@@ -10436,7 +11586,10 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                 Op::Shl => {
                     let at = to_idx(at_u32(view.data, inst));
                     let lhs = at_u32(view.extra, at);
-                    let rhs = at_u32(view.extra, at + 1);
+                    let rhs = match at_fusion(&fusion, inst) {
+                        Fusion::ShiftUnmasked { rhs, .. } => rhs,
+                        _ => at_u32(view.extra, at + 1),
+                    };
                     if (bits == 64 && at_opt(&const_u64, to_idx(rhs)).is_some_and(|k| (k & 63) == 0))
                         || (bits != 64 && bits != 32 && bits.trailing_zeros() == 0)
                     {
@@ -10478,7 +11631,10 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                 Op::Lshr => {
                     let at = to_idx(at_u32(view.data, inst));
                     let lhs = at_u32(view.extra, at);
-                    let rhs = at_u32(view.extra, at + 1);
+                    let rhs = match at_fusion(&fusion, inst) {
+                        Fusion::ShiftUnmasked { rhs, .. } => rhs,
+                        _ => at_u32(view.extra, at + 1),
+                    };
                     if (bits == 64 && at_opt(&const_u64, to_idx(rhs)).is_some_and(|k| (k & 63) == 0))
                         || (bits != 64 && bits != 32 && bits.trailing_zeros() == 0)
                     {
@@ -10520,7 +11676,10 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                 Op::Ashr => {
                     let at = to_idx(at_u32(view.data, inst));
                     let lhs = at_u32(view.extra, at);
-                    let rhs = at_u32(view.extra, at + 1);
+                    let rhs = match at_fusion(&fusion, inst) {
+                        Fusion::ShiftUnmasked { rhs, .. } => rhs,
+                        _ => at_u32(view.extra, at + 1),
+                    };
                     if (bits == 64 && at_opt(&const_u64, to_idx(rhs)).is_some_and(|k| (k & 63) == 0))
                         || (bits != 64 && bits != 32 && bits.trailing_zeros() == 0)
                     {
@@ -10563,7 +11722,10 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                 Op::Rotl | Op::Rotr => {
                     let at = to_idx(at_u32(view.data, inst));
                     let lhs = at_u32(view.extra, at);
-                    let rhs = at_u32(view.extra, at + 1);
+                    let rhs = match at_fusion(&fusion, inst) {
+                        Fusion::ShiftUnmasked { rhs, .. } => rhs,
+                        _ => at_u32(view.extra, at + 1),
+                    };
                     if bits == 1
                         || (bits == 64 && at_opt(&const_u64, to_idx(rhs)).is_some_and(|k| (k & 63) == 0))
                     {
@@ -11524,8 +12686,16 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                             }
                         }
                     } else {
-                        emit_cmp(&mut words, cond, a, bv, op_ty);
-                        words.push(enc::cset(rd, cond_of(cond)));
+                        let cur_cmp = make_live_cmp(cond, a, bv, op_ty);
+                        if prev_live_cmp == Some(cur_cmp) {
+                            live_cmp = prev_live_cmp;
+                        } else {
+                            emit_cmp(&mut words, cond, a, bv, op_ty);
+                            live_cmp = Some(cur_cmp);
+                        }
+                        let hw_cond = cond_of(cond);
+                        words.push(enc::cset(rd, hw_cond));
+                        live_cond = Some((u32_of(inst), hw_cond));
                     }
                     if let Some(s) = sp {
                         emit_st_spill_gpr(&mut words, rd, spill_base, s);
@@ -11571,6 +12741,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                                 what: "unsupported fcmp cond",
                             })?;
                             words.push(enc::cset(rd, fc));
+                            live_cond = Some((u32_of(inst), fc));
                         }
                     }
                     if let Some(s) = sp {
@@ -11593,8 +12764,17 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                             if is_abs_zero {
                                 let rx = load_gpr(&mut words, x, X16);
                                 words.push(enc::cssc_abs(rd, rx));
+                                live_cond = prev_live_cond;
+                                live_cmp = prev_live_cmp;
                             } else {
-                                emit_cmp(&mut words, cond, a, bv, op_ty);
+                                let cur_cmp = make_live_cmp(cond, a, bv, op_ty);
+                                if prev_live_cmp == Some(cur_cmp) {
+                                    live_cond = prev_live_cond;
+                                    live_cmp = prev_live_cmp;
+                                } else {
+                                    emit_cmp(&mut words, cond, a, bv, op_ty);
+                                    live_cmp = Some(cur_cmp);
+                                }
                                 let rx = load_gpr(&mut words, x, X16);
                                 let c = if neg_when_false { cond_of(cond) } else { invert_cond(cond_of(cond)) };
                                 words.push(enc::csneg(rd, rx, rx, c));
@@ -11607,7 +12787,14 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                         }
                         Fusion::CsincSelect { cond, a, b: bv, op_ty, rn, rm, inc_when_false, .. } => {
                             let (rd, sp) = dst_gpr(inst);
-                            emit_cmp(&mut words, cond, a, bv, op_ty);
+                            let cur_cmp = make_live_cmp(cond, a, bv, op_ty);
+                            if prev_live_cmp == Some(cur_cmp) {
+                                live_cond = prev_live_cond;
+                                live_cmp = prev_live_cmp;
+                            } else {
+                                emit_cmp(&mut words, cond, a, bv, op_ty);
+                                live_cmp = Some(cur_cmp);
+                            }
                             let r_n = load_gpr(&mut words, rn, X16);
                             let r_m = load_gpr(&mut words, rm, X17);
                             let c = if inc_when_false { cond_of(cond) } else { invert_cond(cond_of(cond)) };
@@ -11626,12 +12813,21 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                             if let Some(s) = sp {
                                 emit_st_spill_gpr(&mut words, rd, spill_base, s);
                             }
+                            live_cond = prev_live_cond;
+                            live_cmp = prev_live_cmp;
                             inst += 1;
                             continue;
                         }
                         Fusion::CsinvSelect { cond, a, b: bv, op_ty, x, inv_when_false } => {
                             let (rd, sp) = dst_gpr(inst);
-                            emit_cmp(&mut words, cond, a, bv, op_ty);
+                            let cur_cmp = make_live_cmp(cond, a, bv, op_ty);
+                            if prev_live_cmp == Some(cur_cmp) {
+                                live_cond = prev_live_cond;
+                                live_cmp = prev_live_cmp;
+                            } else {
+                                emit_cmp(&mut words, cond, a, bv, op_ty);
+                                live_cmp = Some(cur_cmp);
+                            }
                             let rx = load_gpr(&mut words, x, X16);
                             let c = if inv_when_false { cond_of(cond) } else { invert_cond(cond_of(cond)) };
                             words.push(enc::csinv(rd, rx, rx, c));
@@ -11645,7 +12841,14 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     }
                     let sel_cond = match at_fusion(&fusion, inst) {
                         Fusion::CmpSelect { cond, a, b: bv, op_ty } => {
-                            emit_cmp(&mut words, cond, a, bv, op_ty);
+                            let cur_cmp = make_live_cmp(cond, a, bv, op_ty);
+                            if prev_live_cmp == Some(cur_cmp) {
+                                live_cond = prev_live_cond;
+                                live_cmp = prev_live_cmp;
+                            } else {
+                                emit_cmp(&mut words, cond, a, bv, op_ty);
+                                live_cmp = Some(cur_cmp);
+                            }
                             cond_of(cond)
                         }
                         Fusion::FcmpSelect { cond, a, b: bv, double } => {
@@ -11654,11 +12857,27 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                             words.push(enc::fcmp(double, va, vb));
                             cond
                         }
-                        Fusion::ReuseFlagsSelect { cond } => cond,
+                        Fusion::ReuseFlagsSelect { cond } => {
+                            live_cond = prev_live_cond;
+                            live_cmp = prev_live_cmp;
+                            cond
+                        }
                         _ => {
-                            let rc = load_gpr(&mut words, at_u32(view.extra, at), X16);
-                            words.push(enc::cmp_imm(rc, 0));
-                            Cond::Ne
+                            let cond_v = at_u32(view.extra, at);
+                            let cond_root = {
+                                let r = at_u32(&alias_of, to_idx(cond_v));
+                                if r == u32::MAX { cond_v } else { r }
+                            };
+                            if let Some((live_v, live_c)) = prev_live_cond && live_v == cond_root {
+                                live_cond = Some((live_v, live_c));
+                                live_cmp = prev_live_cmp;
+                                live_c
+                            } else {
+                                let rc = load_gpr(&mut words, cond_v, X16);
+                                words.push(enc::cmp_imm(rc, 0));
+                                live_cond = Some((cond_root, Cond::Ne));
+                                Cond::Ne
+                            }
                         }
                     };
                     // `ldr` does not modify NZCV flags, so reloading `t`/`f` preserves `sel_cond`!
@@ -11672,9 +12891,46 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                         }
                     } else {
                         let (rd, sp) = dst_gpr(inst);
-                        let rt = load_gpr(&mut words, t, X16);
-                        let rf = load_gpr(&mut words, f, X17);
-                        words.push(enc::csel(rd, rt, rf, sel_cond));
+                        let arm_const01 = |v: u32| -> Option<u64> {
+                            let root = {
+                                let r = at_u32(&alias_of, to_idx(v));
+                                if r == u32::MAX { v } else { r }
+                            };
+                            if let Some(c) = at_opt(&const_u64, to_idx(root)) {
+                                (c == 0 || c == 1).then_some(c)
+                            } else if view.op(to_idx(root)) == Op::Null {
+                                Some(0)
+                            } else {
+                                None
+                            }
+                        };
+                        match (arm_const01(t), arm_const01(f)) {
+                            (Some(1), Some(0)) => words.push(enc::cset(rd, sel_cond)),
+                            (Some(0), Some(1)) => words.push(enc::cset(rd, invert_cond(sel_cond))),
+                            (Some(0), Some(0)) => words.push(enc::movz(rd, 0, 0)),
+                            (Some(1), Some(1)) => words.push(enc::movz(rd, 1, 0)),
+                            (Some(0), None) => {
+                                let rf = load_gpr(&mut words, f, X17);
+                                words.push(enc::csel(rd, ZR, rf, sel_cond));
+                            }
+                            (None, Some(0)) => {
+                                let rt = load_gpr(&mut words, t, X16);
+                                words.push(enc::csel(rd, rt, ZR, sel_cond));
+                            }
+                            (None, Some(1)) => {
+                                let rt = load_gpr(&mut words, t, X16);
+                                words.push(enc::csinc(rd, rt, ZR, sel_cond));
+                            }
+                            (Some(1), None) => {
+                                let rf = load_gpr(&mut words, f, X17);
+                                words.push(enc::csinc(rd, rf, ZR, invert_cond(sel_cond)));
+                            }
+                            _ => {
+                                let rt = load_gpr(&mut words, t, X16);
+                                let rf = load_gpr(&mut words, f, X17);
+                                words.push(enc::csel(rd, rt, rf, sel_cond));
+                            }
+                        }
                         if let Some(s) = sp {
                             emit_st_spill_gpr(&mut words, rd, spill_base, s);
                         }
@@ -12205,40 +13461,80 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     let then_nop = then_argc == 0 || edge_is_nop(then_block, at + 3, then_argc);
                     let else_nop = else_argc == 0 || edge_is_nop(else_block, else_at + 2, else_argc);
 
+                    // When neither target is `next_block`, decide whether `else_block` is the hotter
+                    // target (e.g. a backward loop-latch backedge while `then_block` is the loop exit)
+                    // so the hot iteration takes a SINGLE conditional branch (`b.<hot_cond> header`)
+                    // instead of falling past a not-taken conditional branch into an unconditional `b`!
+                    let prefer_else_first = {
+                        let fl = Flags(at_u8(view.flags, inst));
+                        if fl.contains(Flags::EXPECT_TRUE) {
+                            false
+                        } else if fl.contains(Flags::EXPECT_FALSE) {
+                            true
+                        } else {
+                            let cur_pos = order_idx;
+                            let cur_depth = at_u32(&block_loop_depth, b);
+                            let tb = to_idx(then_block);
+                            let eb = to_idx(else_block);
+                            let target_hotness = |t: usize| -> u8 {
+                                if at_bool(&block_is_cold, t) {
+                                    return 0;
+                                }
+                                let td = at_u32(&block_loop_depth, t);
+                                let tp = at_usize(&block_pos, t);
+                                if cur_depth > 0 && td >= cur_depth && tp <= cur_pos {
+                                    4
+                                } else if (cur_depth > 0 && td >= cur_depth) || td > cur_depth {
+                                    3
+                                } else if !at_bool(&block_is_terminal_exit, t) {
+                                    2
+                                } else {
+                                    1
+                                }
+                            };
+                            target_hotness(eb) > target_hotness(tb)
+                        }
+                    };
+
                     if then_nop && else_nop {
                         match at_fusion(&fusion, inst) {
                             Fusion::TbzBr { val, bit, nonzero_is_then, .. } => {
                                 let rv = load_gpr(&mut words, val, X16);
                                 if next_block == Some(to_idx(else_block)) {
                                     let kind = if nonzero_is_then { PatchKind::Tbnz(rv, bit) } else { PatchKind::Tbz(rv, bit) };
-                                    let widx = words.len();
-                                    words.push(enc::tbz(rv, bit, 0));
-                                    patches.push(BranchPatch { word_idx: widx, kind, target_block: then_block });
+                                    emit_branch_patch(&mut words, &mut patches, kind, then_block, false);
                                 } else if next_block == Some(to_idx(then_block)) {
                                     let kind = if nonzero_is_then { PatchKind::Tbz(rv, bit) } else { PatchKind::Tbnz(rv, bit) };
-                                    let widx = words.len();
-                                    words.push(enc::tbz(rv, bit, 0));
-                                    patches.push(BranchPatch { word_idx: widx, kind, target_block: else_block });
+                                    emit_branch_patch(&mut words, &mut patches, kind, else_block, false);
+                                } else if prefer_else_first {
+                                    let kind = if nonzero_is_then { PatchKind::Tbz(rv, bit) } else { PatchKind::Tbnz(rv, bit) };
+                                    emit_branch_patch(&mut words, &mut patches, kind, else_block, false);
+                                    emit_branch_patch(&mut words, &mut patches, PatchKind::B, then_block, false);
                                 } else {
                                     let kind = if nonzero_is_then { PatchKind::Tbnz(rv, bit) } else { PatchKind::Tbz(rv, bit) };
-                                    let w1 = words.len();
-                                    words.push(enc::tbz(rv, bit, 0));
-                                    patches.push(BranchPatch { word_idx: w1, kind, target_block: then_block });
-                                    let w2 = words.len();
-                                    words.push(enc::b(0));
-                                    patches.push(BranchPatch { word_idx: w2, kind: PatchKind::B, target_block: else_block });
+                                    emit_branch_patch(&mut words, &mut patches, kind, then_block, false);
+                                    emit_branch_patch(&mut words, &mut patches, PatchKind::B, else_block, false);
                                 }
                             }
-                            Fusion::TstBr { a, rhs, imm_nrs, nonzero_is_then } => {
+                            Fusion::TstBr { a, rhs, imm_nrs, wide, nonzero_is_then, .. } => {
                                 let ra = load_gpr(&mut words, a, X16);
                                 if let Some(nrs) = imm_nrs {
-                                    words.push(enc::ands_imm(ZR, ra, nrs));
+                                    words.push(enc::sf(wide, enc::ands_imm(ZR, ra, nrs)));
                                 } else {
                                     let rb = load_gpr(&mut words, rhs, X17);
-                                    words.push(enc::ands(ZR, ra, rb));
+                                    words.push(enc::sf(wide, enc::ands(ZR, ra, rb)));
                                 }
                                 let cond = if nonzero_is_then { Cond::Ne } else { Cond::Eq };
-                                emit_cond_branch_pair(&mut words, &mut patches, cond, then_block, else_block, next_block, far_branches);
+                                emit_cond_branch_pair(
+                                    &mut words,
+                                    &mut patches,
+                                    cond,
+                                    then_block,
+                                    else_block,
+                                    next_block,
+                                    prefer_else_first,
+                                    far_branches,
+                                );
                             }
                             Fusion::CmpBr { cond, a, b: bv, op_ty } => {
                                 let is_zero_cmp = at_opt(&const_u64, to_idx(bv)) == Some(0)
@@ -12260,6 +13556,14 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                                             PatchKind::Cbz { reg: ra, wide }
                                         };
                                         emit_branch_patch(&mut words, &mut patches, kind, else_block, far_branches);
+                                    } else if prefer_else_first {
+                                        let kind = if cond == IntCond::Eq {
+                                            PatchKind::Cbnz { reg: ra, wide }
+                                        } else {
+                                            PatchKind::Cbz { reg: ra, wide }
+                                        };
+                                        emit_branch_patch(&mut words, &mut patches, kind, else_block, far_branches);
+                                        emit_branch_patch(&mut words, &mut patches, PatchKind::B, then_block, false);
                                     } else {
                                         let kind = if cond == IntCond::Eq {
                                             PatchKind::Cbz { reg: ra, wide }
@@ -12270,38 +13574,111 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                                         emit_branch_patch(&mut words, &mut patches, PatchKind::B, else_block, false);
                                     }
                                 } else {
-                                    emit_cmp(&mut words, cond, a, bv, op_ty);
-                                    emit_cond_branch_pair(&mut words, &mut patches, cond_of(cond), then_block, else_block, next_block, far_branches);
+                                    let cur_cmp = make_live_cmp(cond, a, bv, op_ty);
+                                    if prev_live_cmp != Some(cur_cmp) {
+                                        emit_cmp(&mut words, cond, a, bv, op_ty);
+                                    }
+                                    emit_cond_branch_pair(
+                                        &mut words,
+                                        &mut patches,
+                                        cond_of(cond),
+                                        then_block,
+                                        else_block,
+                                        next_block,
+                                        prefer_else_first,
+                                        far_branches,
+                                    );
                                 }
                             }
                             Fusion::FcmpBr { cond, a, b: bv, double } => {
                                 let va = load_fp(&mut words, a, V30);
                                 let vb = load_fp(&mut words, bv, V31);
                                 words.push(enc::fcmp(double, va, vb));
-                                emit_cond_branch_pair(&mut words, &mut patches, cond, then_block, else_block, next_block, far_branches);
+                                emit_cond_branch_pair(
+                                    &mut words,
+                                    &mut patches,
+                                    cond,
+                                    then_block,
+                                    else_block,
+                                    next_block,
+                                    prefer_else_first,
+                                    far_branches,
+                                );
                             }
                             Fusion::BlazeResultCallBr => {
                                 // Single-instruction `b.cs err_blk` directly on the callee's Carry flag (`C=1` = Err)!
-                                emit_cond_branch_pair(&mut words, &mut patches, Cond::Hs, then_block, else_block, next_block, far_branches);
+                                emit_cond_branch_pair(
+                                    &mut words,
+                                    &mut patches,
+                                    Cond::Hs,
+                                    then_block,
+                                    else_block,
+                                    next_block,
+                                    prefer_else_first,
+                                    far_branches,
+                                );
                             }
                             Fusion::ReuseFlagsBr { cond, .. } => {
-                                emit_cond_branch_pair(&mut words, &mut patches, cond, then_block, else_block, next_block, far_branches);
+                                emit_cond_branch_pair(
+                                    &mut words,
+                                    &mut patches,
+                                    cond,
+                                    then_block,
+                                    else_block,
+                                    next_block,
+                                    prefer_else_first,
+                                    far_branches,
+                                );
                             }
                             _ => {
-                                let rc = load_gpr(&mut words, cond_v, X16);
-                                if next_block == Some(to_idx(else_block)) {
-                                    emit_branch_patch(&mut words, &mut patches, PatchKind::Cbnz { reg: rc, wide: true }, then_block, far_branches);
-                                } else if next_block == Some(to_idx(then_block)) {
-                                    emit_branch_patch(&mut words, &mut patches, PatchKind::Cbz { reg: rc, wide: true }, else_block, far_branches);
+                                let cond_root = {
+                                    let r = at_u32(&alias_of, to_idx(cond_v));
+                                    if r == u32::MAX { cond_v } else { r }
+                                };
+                                if let Some((live_v, live_c)) = prev_live_cond && live_v == cond_root {
+                                    emit_cond_branch_pair(
+                                        &mut words,
+                                        &mut patches,
+                                        live_c,
+                                        then_block,
+                                        else_block,
+                                        next_block,
+                                        prefer_else_first,
+                                        far_branches,
+                                    );
                                 } else {
-                                    emit_branch_patch(&mut words, &mut patches, PatchKind::Cbnz { reg: rc, wide: true }, then_block, far_branches);
-                                    emit_branch_patch(&mut words, &mut patches, PatchKind::B, else_block, false);
+                                    let rc = load_gpr(&mut words, cond_v, X16);
+                                    if next_block == Some(to_idx(else_block)) {
+                                        emit_branch_patch(&mut words, &mut patches, PatchKind::Cbnz { reg: rc, wide: true }, then_block, far_branches);
+                                    } else if next_block == Some(to_idx(then_block)) {
+                                        emit_branch_patch(&mut words, &mut patches, PatchKind::Cbz { reg: rc, wide: true }, else_block, far_branches);
+                                    } else if prefer_else_first {
+                                        emit_branch_patch(&mut words, &mut patches, PatchKind::Cbz { reg: rc, wide: true }, else_block, far_branches);
+                                        emit_branch_patch(&mut words, &mut patches, PatchKind::B, then_block, false);
+                                    } else {
+                                        emit_branch_patch(&mut words, &mut patches, PatchKind::Cbnz { reg: rc, wide: true }, then_block, far_branches);
+                                        emit_branch_patch(&mut words, &mut patches, PatchKind::B, else_block, false);
+                                    }
                                 }
                             }
                         }
                     } else {
                         let emit_br_cond = |words: &mut Vec<u32, Alloc<'a>>, branch_if_true: bool| -> (usize, PatchKind) {
                             match at_fusion(&fusion, inst) {
+                                Fusion::TstBr { a, rhs, imm_nrs, wide, nonzero_is_then, .. } => {
+                                    let ra = load_gpr(words, a, X16);
+                                    if let Some(nrs) = imm_nrs {
+                                        words.push(enc::sf(wide, enc::ands_imm(ZR, ra, nrs)));
+                                    } else {
+                                        let rb = load_gpr(words, rhs, X17);
+                                        words.push(enc::sf(wide, enc::ands(ZR, ra, rb)));
+                                    }
+                                    let base = if nonzero_is_then { Cond::Ne } else { Cond::Eq };
+                                    let c = if branch_if_true { base } else { invert_cond(base) };
+                                    let w = words.len();
+                                    words.push(enc::b_cond(c, 0));
+                                    (w, PatchKind::BCond(c))
+                                }
                                 Fusion::CmpBr { cond, a, b: bv, op_ty } => {
                                     if at_opt(&const_u64, to_idx(bv)) == Some(0) && matches!(cond, IntCond::Eq | IntCond::Ne) {
                                         let wide = op_ty.bits(64) != 32;
@@ -12317,7 +13694,10 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                                         };
                                         (w, k)
                                     } else {
-                                        emit_cmp(words, cond, a, bv, op_ty);
+                                        let cur_cmp = make_live_cmp(cond, a, bv, op_ty);
+                                        if prev_live_cmp != Some(cur_cmp) {
+                                            emit_cmp(words, cond, a, bv, op_ty);
+                                        }
                                         let c = if branch_if_true { cond_of(cond) } else { invert_cond(cond_of(cond)) };
                                         let w = words.len();
                                         words.push(enc::b_cond(c, 0));
@@ -12346,16 +13726,27 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                                     (w, PatchKind::BCond(c))
                                 }
                                 _ => {
-                                    let rc = load_gpr(words, cond_v, X16);
-                                    let w = words.len();
-                                    let k = if branch_if_true {
-                                        words.push(enc::cbnz(rc, 0));
-                                        PatchKind::Cbnz { reg: rc, wide: true }
-                                    } else {
-                                        words.push(enc::cbz(rc, 0));
-                                        PatchKind::Cbz { reg: rc, wide: true }
+                                    let cond_root = {
+                                        let r = at_u32(&alias_of, to_idx(cond_v));
+                                        if r == u32::MAX { cond_v } else { r }
                                     };
-                                    (w, k)
+                                    if let Some((live_v, live_c)) = prev_live_cond && live_v == cond_root {
+                                        let c = if branch_if_true { live_c } else { invert_cond(live_c) };
+                                        let w = words.len();
+                                        words.push(enc::b_cond(c, 0));
+                                        (w, PatchKind::BCond(c))
+                                    } else {
+                                        let rc = load_gpr(words, cond_v, X16);
+                                        let w = words.len();
+                                        let k = if branch_if_true {
+                                            words.push(enc::cbnz(rc, 0));
+                                            PatchKind::Cbnz { reg: rc, wide: true }
+                                        } else {
+                                            words.push(enc::cbz(rc, 0));
+                                            PatchKind::Cbz { reg: rc, wide: true }
+                                        };
+                                        (w, k)
+                                    }
                                 }
                             }
                         };
@@ -12418,27 +13809,57 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                                     patches.push(BranchPatch { word_idx: w_then, kind: PatchKind::B, target_block: then_block });
                                 }
                             }
-                        } else {
-                            let skip_then = emit_br_cond(&mut words, false);
+                        } else if next_block == Some(to_idx(then_block)) && len < 32_768 {
+                            // Hot `then` falls straight through into `next_block` after its edge moves;
+                            // sink cold `else` edge moves to a deferred stub at the tail of the function!
+                            let (widx, kind) = emit_br_cond(&mut words, false);
+                            cold_stubs.push(ColdEdgeStub {
+                                branch_word_idx: widx,
+                                branch_kind: kind,
+                                target_block: else_block,
+                                args_start: else_at + 2,
+                                args_len: else_argc,
+                            });
                             emit_edge_moves(&mut words, &mut gpr_moves, &mut fp_moves, &mut const_edge_writes, then_block, at + 3, then_argc);
-                            let w_then = words.len();
+                        } else if next_block == Some(to_idx(else_block)) && len < 32_768 {
+                            // Hot `else` falls straight through into `next_block` after its edge moves;
+                            // sink cold `then` edge moves to a deferred stub at the tail of the function!
+                            let (widx, kind) = emit_br_cond(&mut words, true);
+                            cold_stubs.push(ColdEdgeStub {
+                                branch_word_idx: widx,
+                                branch_kind: kind,
+                                target_block: then_block,
+                                args_start: at + 3,
+                                args_len: then_argc,
+                            });
+                            emit_edge_moves(&mut words, &mut gpr_moves, &mut fp_moves, &mut const_edge_writes, else_block, else_at + 2, else_argc);
+                        } else {
+                            let (first_blk, first_args, first_argc, second_blk, second_args, second_argc, skip_first_if_true) =
+                                if prefer_else_first && next_block != Some(to_idx(else_block)) {
+                                    (else_block, else_at + 2, else_argc, then_block, at + 3, then_argc, true)
+                                } else {
+                                    (then_block, at + 3, then_argc, else_block, else_at + 2, else_argc, false)
+                                };
+                            let skip_first = emit_br_cond(&mut words, skip_first_if_true);
+                            emit_edge_moves(&mut words, &mut gpr_moves, &mut fp_moves, &mut const_edge_writes, first_blk, first_args, first_argc);
+                            let w_first = words.len();
                             words.push(enc::b(0));
-                            patches.push(BranchPatch { word_idx: w_then, kind: PatchKind::B, target_block: then_block });
+                            patches.push(BranchPatch { word_idx: w_first, kind: PatchKind::B, target_block: first_blk });
 
-                            let else_start = words.len();
-                            let delta = i32_of(else_start - skip_then.0);
-                            let skip_word = match skip_then.1 {
+                            let second_start = words.len();
+                            let delta = i32_of(second_start - skip_first.0);
+                            let skip_word = match skip_first.1 {
                                 PatchKind::BCond(inv) => enc::b_cond(inv, delta),
                                 PatchKind::Cbz { reg: rc, wide } => enc::sf(wide, enc::cbz(rc, delta)),
                                 PatchKind::Cbnz { reg: rc, wide } => enc::sf(wide, enc::cbnz(rc, delta)),
                                 _ => return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "unexpected skip_then patch kind" }),
                             };
-                            set_at(&mut words, skip_then.0, skip_word);
-                            emit_edge_moves(&mut words, &mut gpr_moves, &mut fp_moves, &mut const_edge_writes, else_block, else_at + 2, else_argc);
-                            if next_block != Some(to_idx(else_block)) {
-                                let w_else = words.len();
+                            set_at(&mut words, skip_first.0, skip_word);
+                            emit_edge_moves(&mut words, &mut gpr_moves, &mut fp_moves, &mut const_edge_writes, second_blk, second_args, second_argc);
+                            if next_block != Some(to_idx(second_blk)) {
+                                let w_second = words.len();
                                 words.push(enc::b(0));
-                                patches.push(BranchPatch { word_idx: w_else, kind: PatchKind::B, target_block: else_block });
+                                patches.push(BranchPatch { word_idx: w_second, kind: PatchKind::B, target_block: second_blk });
                             }
                         }
                     }
@@ -12489,8 +13910,8 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                             pos += 2 + case_argc;
 
                             let sr_lo = load_h(&mut words, false);
-                            if lo <= 4095 {
-                                words.push(enc::cmp_imm(sr_lo, trunc_u32(lo)));
+                            if let Some((imm12, shift12)) = is_addsub_imm12(lo) {
+                                words.push(enc::subs_imm(ZR, sr_lo, imm12, shift12));
                             } else {
                                 emit_const_u64(&mut words, X17, lo);
                                 words.push(enc::cmp(sr_lo, X17));
@@ -12499,8 +13920,8 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                             words.push(enc::b_cond(Cond::Ne, 0));
 
                             let sr_hi = load_h(&mut words, true);
-                            if hi <= 4095 {
-                                words.push(enc::cmp_imm(sr_hi, trunc_u32(hi)));
+                            if let Some((imm12, shift12)) = is_addsub_imm12(hi) {
+                                words.push(enc::subs_imm(ZR, sr_hi, imm12, shift12));
                             } else {
                                 emit_const_u64(&mut words, X17, hi);
                                 words.push(enc::cmp(sr_hi, X17));
@@ -12573,8 +13994,8 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                         } else if min_v == 0 {
                             words.push(enc::mov(X16, sr));
                             X16
-                        } else if min_v <= 4095 {
-                            words.push(enc::sub_imm(X16, sr, trunc_u32(min_v), false));
+                        } else if let Some((imm12, shift12)) = is_addsub_imm12(min_v) {
+                            words.push(enc::sub_imm(X16, sr, imm12, shift12));
                             X16
                         } else {
                             emit_const_u64(&mut words, X17, min_v);
@@ -12711,8 +14132,8 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                         let case_args_start = pos + 2;
                         pos += 2 + case_argc;
 
-                        if case_val <= 4095 {
-                            words.push(enc::cmp_imm(sr, trunc_u32(case_val)));
+                        if let Some((imm12, shift12)) = is_addsub_imm12(case_val) {
+                            words.push(enc::subs_imm(ZR, sr, imm12, shift12));
                         } else {
                             emit_const_u64(&mut words, X17, case_val);
                             words.push(enc::cmp(sr, X17));
@@ -13184,12 +14605,16 @@ fn emit_cond_branch_pair<'a>(
     then_block: u32,
     else_block: u32,
     next_block: Option<usize>,
+    prefer_else_first: bool,
     far_branches: bool,
 ) {
     if next_block == Some(to_idx(else_block)) {
         emit_branch_patch(words, patches, PatchKind::BCond(cond), then_block, far_branches);
     } else if next_block == Some(to_idx(then_block)) {
         emit_branch_patch(words, patches, PatchKind::BCond(invert_cond(cond)), else_block, far_branches);
+    } else if prefer_else_first {
+        emit_branch_patch(words, patches, PatchKind::BCond(invert_cond(cond)), else_block, far_branches);
+        emit_branch_patch(words, patches, PatchKind::B, then_block, false);
     } else {
         emit_branch_patch(words, patches, PatchKind::BCond(cond), then_block, far_branches);
         emit_branch_patch(words, patches, PatchKind::B, else_block, false);
@@ -16267,6 +17692,1881 @@ mod tests {
             ] {
                 let want = a.wrapping_sub(x);
                 assert_eq!(f_add32(a, x), want, "Add32(Neg(x), a) failed for ({a:#x}, {x:#x})");
+            }
+        }
+    }
+
+    #[test]
+    fn noop_trunc_and_zext_alias_zero_mov_and_sound_chains() {
+        let alloc = test_alloc();
+        // `ubfx xd, xn, #0, #32` (`ubfm` with `immr = 0`, `imms = 31`).
+        let is_ubfx_32 = |w: u32| (w & 0xffff_fc00) == 0xd340_7c00;
+        // 64-bit register `mov xd, xm` (`orr xd, xzr, xm`).
+        let is_mov64_reg = |w: u32| (w & 0xffe0_ffe0) == 0xaa00_03e0;
+
+        // 1. Live `i64` inputs reused simultaneously as `Trunc(I64->I32)` feeding 32-bit ALU and
+        //    as `I64` after the 32-bit ALU, with 32-bit result `Zext(I32->I64)` back to `I64`:
+        //    must emit ZERO `ubfx #0,#32` and ZERO `mov xd, xm`!
+        let aliased = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[
+                    Param::of(Ty::I64),
+                    Param::of(Ty::I64),
+                    Param::of(Ty::I64),
+                    Param::of(Ty::I64),
+                ],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let a = b.param(Ty::I64);
+            let bv = b.param(Ty::I64);
+            let c = b.param(Ty::I64);
+            let d = b.param(Ty::I64);
+            let a32 = b.convert(Op::Trunc, Flags::NONE, Ty::I32, a);
+            let b32 = b.convert(Op::Trunc, Flags::NONE, Ty::I32, bv);
+            let c32 = b.convert(Op::Trunc, Flags::NONE, Ty::I32, c);
+            let d32 = b.convert(Op::Trunc, Flags::NONE, Ty::I32, d);
+            let s1 = b.binary(Op::Add, Flags::NONE, a32, b32);
+            let s2 = b.binary(Op::Xor, Flags::NONE, c32, d32);
+            let s3 = b.binary(Op::Add, Flags::NONE, s1, s2);
+            let z3 = b.convert(Op::Zext, Flags::NONE, Ty::I64, s3);
+            let k1 = b.binary(Op::Xor, Flags::NONE, a, bv);
+            let k2 = b.binary(Op::Xor, Flags::NONE, c, d);
+            let k3 = b.binary(Op::Add, Flags::NONE, k1, k2);
+            let out = b.binary(Op::Xor, Flags::NONE, k3, z3);
+            b.ret(&[out]);
+            let func = b.finish_checked().expect("aliased trunc/zext LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("aliased trunc/zext emits")
+        };
+
+        // 2. Dirty `Trunc(I64->I32)` feeding `Zext(I32->I64)`: `Trunc` MUST keep `ubfx #0,#32`,
+        //    while `Zext` aliases `Trunc` with ZERO `mov`!
+        let trunc_to_zext = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let t32 = b.convert(Op::Trunc, Flags::NONE, Ty::I32, x);
+            let z64 = b.convert(Op::Zext, Flags::NONE, Ty::I64, t32);
+            b.ret(&[z64]);
+            let func = b.finish_checked().expect("dirty trunc->zext LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("dirty trunc->zext emits")
+        };
+
+        {
+            let words = decode_words(&aliased.code, alloc);
+            assert_eq!(
+                words.iter().filter(|&&w| is_ubfx_32(w)).count(),
+                0,
+                "aliased trunc/zext must emit ZERO ubfx #0,#32, words={words:#x?}"
+            );
+            assert_eq!(
+                words.iter().filter(|&&w| is_mov64_reg(w)).count(),
+                0,
+                "aliased trunc/zext must emit ZERO dead mov xd, xm, words={words:#x?}"
+            );
+        }
+
+        {
+            let words = decode_words(&trunc_to_zext.code, alloc);
+            assert_eq!(
+                words.iter().filter(|&&w| is_ubfx_32(w)).count(),
+                1,
+                "dirty trunc->zext must preserve ubfx #0,#32 on trunc, words={words:#x?}"
+            );
+            assert_eq!(
+                words.iter().filter(|&&w| is_mov64_reg(w)).count(),
+                0,
+                "dirty trunc->zext must alias zext to trunc with ZERO mov, words={words:#x?}"
+            );
+        }
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let ex_alias = exec_leaf(aliased);
+            // SAFETY: `ex_alias` contains freshly emitted AArch64 code matching `(u64, u64, u64, u64) -> u64`.
+            let f_alias: extern "C" fn(u64, u64, u64, u64) -> u64 = unsafe { ex_alias.as_fn() };
+            let ex_tz = exec_leaf(trunc_to_zext);
+            // SAFETY: `ex_tz` contains freshly emitted AArch64 code matching `(u64) -> u64`.
+            let f_tz: extern "C" fn(u64) -> u64 = unsafe { ex_tz.as_fn() };
+
+            let min_i32_dirty = (0x5555_5555u64 << 32) | u64::from(i32::MIN.cast_unsigned());
+            let max_u32_dirty = (0xAAAA_AAAAu64 << 32) | u64::from(u32::MAX);
+            for &(a, bv, c, d) in &[
+                (0xFFFF_FFFF_0000_0001u64, 0x8000_0000_FFFF_FFFFu64, 0xDEAD_BEEF_8000_0000u64, 0xCAFE_BABE_7FFF_FFFFu64),
+                (min_i32_dirty, max_u32_dirty, 0x1234_5678_0000_0000, 0x8765_4321_FFFF_FFFE),
+                (0, 0, 0, 0),
+                (u64::MAX, u64::MAX, u64::MAX, 1),
+            ] {
+                let s1 = super::trunc_u32(a).wrapping_add(super::trunc_u32(bv));
+                let s2 = super::trunc_u32(c) ^ super::trunc_u32(d);
+                let s3 = u64::from(s1.wrapping_add(s2));
+                let want = ((a ^ bv).wrapping_add(c ^ d)) ^ s3;
+                assert_eq!(f_alias(a, bv, c, d), want, "aliased trunc/zext wrong for ({a:#x}, {bv:#x}, {c:#x}, {d:#x})");
+            }
+
+            for &x in &[
+                0u64,
+                0xFFFF_FFFF_0000_0001,
+                0x8000_0000_FFFF_FFFF,
+                min_i32_dirty,
+                max_u32_dirty,
+                u64::MAX,
+            ] {
+                assert_eq!(f_tz(x), x & 0xffff_ffff, "dirty trunc->zext wrong for {x:#x}");
+            }
+        }
+    }
+
+    #[test]
+    fn consecutive_selects_reuse_nzcv_flags_after_materialized_icmp() {
+        let alloc = test_alloc();
+        // 64-bit `cmp xn, #imm12` (`subs xzr, xn, #imm12`, `sh = 0`).
+        let is_cmp64_imm = |w: u32| (w & 0xffc0_001f) == 0xf100_001f;
+        // 64-bit `csel xd, xn, xm, cond`.
+        let is_csel64 = |w: u32| (w & 0xffe0_0c00) == 0x9a80_0000;
+
+        // 1. `is_rep0 = icmp(Eq, code, 0)` feeds 3 consecutive `Select`s AND a `Zext(I1->I64)`
+        //    (preventing `cset` elision): all 3 `Select`s must reuse live NZCV from `Icmp`,
+        //    emitting only ONE `cmp` (not 4)!
+        let materialized_three = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[
+                    Param::of(Ty::I64),
+                    Param::of(Ty::I64),
+                    Param::of(Ty::I64),
+                    Param::of(Ty::I64),
+                    Param::of(Ty::I64),
+                ],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let code = b.param(Ty::I64);
+            let r1 = b.param(Ty::I64);
+            let r2 = b.param(Ty::I64);
+            let r3 = b.param(Ty::I64);
+            let new_off = b.param(Ty::I64);
+            let zero = b.iconst(Ty::I64, 0);
+            let is_rep0 = b.icmp(IntCond::Eq, code, zero);
+            let n1 = b.select(Flags::NONE, is_rep0, r1, new_off);
+            let n2 = b.select(Flags::NONE, is_rep0, r2, r1);
+            let n3 = b.select(Flags::NONE, is_rep0, r3, r2);
+            let zflag = b.convert(Op::Zext, Flags::NONE, Ty::I64, is_rep0);
+            let s1 = b.binary(Op::Add, Flags::NONE, n1, n2);
+            let s2 = b.binary(Op::Add, Flags::NONE, n3, zflag);
+            let out = b.binary(Op::Add, Flags::NONE, s1, s2);
+            b.ret(&[out]);
+            let func = b.finish_checked().expect("multi-select materialized icmp LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("multi-select materialized icmp emits")
+        };
+
+        // 2. Intervening flag-clobbering `Umin` between two groups of `Select`s sharing `is_rep0`:
+        //    group 1 reuses `Icmp`'s NZCV (0 extra `cmp`), `Umin` invalidates `live_cond`,
+        //    `n4` re-emits ONE `cmp x_flag, #0`, and `n5` reuses `n4`'s NZCV (0 extra `cmp`)!
+        let clobber_then_reuse = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[
+                    Param::of(Ty::I64),
+                    Param::of(Ty::I64),
+                    Param::of(Ty::I64),
+                    Param::of(Ty::I64),
+                ],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let code = b.param(Ty::I64);
+            let a = b.param(Ty::I64);
+            let bv = b.param(Ty::I64);
+            let c = b.param(Ty::I64);
+            let zero = b.iconst(Ty::I64, 0);
+            let is_zero = b.icmp(IntCond::Eq, code, zero);
+            let s1 = b.select(Flags::NONE, is_zero, a, bv);
+            let s2 = b.select(Flags::NONE, is_zero, bv, c);
+            let m = b.binary(Op::Umin, Flags::NONE, s1, s2);
+            let s3 = b.select(Flags::NONE, is_zero, m, a);
+            let s4 = b.select(Flags::NONE, is_zero, c, m);
+            let out = b.binary(Op::Sub, Flags::NONE, s3, s4);
+            b.ret(&[out]);
+            let func = b.finish_checked().expect("select clobber-then-reuse LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("select clobber-then-reuse emits")
+        };
+
+        {
+            let words = decode_words(&materialized_three.code, alloc);
+            assert_eq!(
+                words.iter().filter(|&&w| is_cmp64_imm(w)).count(),
+                1,
+                "3 selects after materialized icmp must emit only 1 cmp #0 (zero redundant cmp), words={words:#x?}"
+            );
+            assert_eq!(
+                words.iter().filter(|&&w| is_csel64(w)).count(),
+                3,
+                "expected 3 csel instructions, words={words:#x?}"
+            );
+        }
+
+        {
+            let words = decode_words(&clobber_then_reuse.code, alloc);
+            assert_eq!(
+                words.iter().filter(|&&w| is_cmp64_imm(w)).count(),
+                2,
+                "expected exactly 2 cmp #0 (1 for icmp + 1 after umin clobber, reused by 4th select), words={words:#x?}"
+            );
+        }
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let ex3 = exec_leaf(materialized_three);
+            // SAFETY: `ex3` contains freshly emitted AArch64 code matching `(u64, u64, u64, u64, u64) -> u64`.
+            let f3: extern "C" fn(u64, u64, u64, u64, u64) -> u64 = unsafe { ex3.as_fn() };
+            let ex_clob = exec_leaf(clobber_then_reuse);
+            // SAFETY: `ex_clob` contains freshly emitted AArch64 code matching `(u64, u64, u64, u64) -> u64`.
+            let f_clob: extern "C" fn(u64, u64, u64, u64) -> u64 = unsafe { ex_clob.as_fn() };
+
+            // True branch (`code == 0`): n1=r1, n2=r2, n3=r3, zflag=1.
+            assert_eq!(f3(0, 10, 20, 30, 999), 10 + 20 + 30 + 1);
+            // False branch (`code != 0`): n1=new_off, n2=r1, n3=r2, zflag=0.
+            assert_eq!(f3(1, 10, 20, 30, 999), 999 + 10 + 20);
+            assert_eq!(f3(u64::MAX, 7, 13, 29, 100), 100 + 7 + 13);
+
+            // Clobber-then-reuse: asymmetric `s3.wrapping_sub(s4)` with both `s1 < s2` and `s1 > s2`
+            // catches any stale `Umin` flag leakage on both true and false arms.
+            for &(code, a, bv, c) in &[
+                (0u64, 5u64, 50u64, 777u64),
+                (0, 50, 5, 777),
+                (1, 5, 50, 777),
+                (1, 50, 5, 777),
+                (42, 1000, 10, 9999),
+            ] {
+                let s1 = if code == 0 { a } else { bv };
+                let s2 = if code == 0 { bv } else { c };
+                let m = s1.min(s2);
+                let s3 = if code == 0 { m } else { a };
+                let s4 = if code == 0 { c } else { m };
+                assert_eq!(
+                    f_clob(code, a, bv, c),
+                    s3.wrapping_sub(s4),
+                    "clobber-then-reuse failed for ({code}, {a}, {bv}, {c})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shift_elides_redundant_mod_mask_and_matches_hardware() {
+        let alloc = test_alloc();
+        // 32-bit or 64-bit `and wd/xd, wn/xn, #imm` (`opc = 00`, bits 28..23 = `100100`).
+        let is_and_imm = |w: u32| (w & 0x7f80_0000) == 0x1200_0000;
+        // 32-bit `lslv wd, wn, wm`.
+        let is_lslv_w = |w: u32| (w & 0xffe0_fc00) == 0x1ac0_2000;
+        // 64-bit `lsrv xd, xn, xm`.
+        let is_lsrv_x = |w: u32| (w & 0xffe0_fc00) == 0x9ac0_2400;
+
+        // 1. `Shl(I32, x, And(y, 31))` -> zero `and #0x1f`, single 32-bit `lslv w`.
+        let shl_i32 = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I32), Param::of(Ty::I32)],
+                &[Param::of(Ty::I32)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I32);
+            let y = b.param(Ty::I32);
+            let m31 = b.iconst(Ty::I32, 31);
+            let masked = b.binary(Op::And, Flags::NONE, y, m31);
+            let out = b.binary(Op::Shl, Flags::NONE, x, masked);
+            b.ret(&[out]);
+            let func = b.finish_checked().expect("shl i32 masked LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("shl i32 masked emits")
+        };
+
+        // 2. `Lshr(I64, x, And(y, 63))` -> zero `and #0x3f`, single 64-bit `lsrv x`.
+        let lshr_i64 = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let y = b.param(Ty::I64);
+            let m63 = b.iconst(Ty::I64, 63);
+            let masked = b.binary(Op::And, Flags::NONE, y, m63);
+            let out = b.binary(Op::Lshr, Flags::NONE, x, masked);
+            b.ret(&[out]);
+            let func = b.finish_checked().expect("lshr i64 masked LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("lshr i64 masked emits")
+        };
+
+        // 3. `Ashr(I32, x, And(y, 31))` -> zero `and #0x1f`.
+        let ashr_i32 = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I32), Param::of(Ty::I32)],
+                &[Param::of(Ty::I32)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I32);
+            let y = b.param(Ty::I32);
+            let m31 = b.iconst(Ty::I32, 31);
+            let masked = b.binary(Op::And, Flags::NONE, y, m31);
+            let out = b.binary(Op::Ashr, Flags::NONE, x, masked);
+            b.ret(&[out]);
+            let func = b.finish_checked().expect("ashr i32 masked LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("ashr i32 masked emits")
+        };
+
+        // 4. `Shl(I64, x, Zext(I32 -> I64, And(y, 63)))` -> zero `and #0x3f`.
+        let shl_i64_zext = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I32)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let y = b.param(Ty::I32);
+            let m63 = b.iconst(Ty::I32, 63);
+            let masked = b.binary(Op::And, Flags::NONE, y, m63);
+            let wide = b.convert(Op::Zext, Flags::NONE, Ty::I64, masked);
+            let out = b.binary(Op::Shl, Flags::NONE, x, wide);
+            b.ret(&[out]);
+            let func = b.finish_checked().expect("shl i64 zext masked LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("shl i64 zext masked emits")
+        };
+
+        // 5. Negative control: `Shl(I32, x, And(y, 15))` MUST keep `and #0xf`!
+        let shl_i32_narrow_mask = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I32), Param::of(Ty::I32)],
+                &[Param::of(Ty::I32)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I32);
+            let y = b.param(Ty::I32);
+            let m15 = b.iconst(Ty::I32, 15);
+            let masked = b.binary(Op::And, Flags::NONE, y, m15);
+            let out = b.binary(Op::Shl, Flags::NONE, x, masked);
+            b.ret(&[out]);
+            let func = b.finish_checked().expect("shl i32 narrow mask LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("shl i32 narrow mask emits")
+        };
+
+        {
+            let w = decode_words(&shl_i32.code, alloc);
+            assert_eq!(
+                w.iter().filter(|&&x| is_and_imm(x)).count(),
+                0,
+                "Shl(I32, x, And(y, 31)) must elide `and #0x1f`, words={w:#x?}"
+            );
+            assert_eq!(w.iter().filter(|&&x| is_lslv_w(x)).count(), 1, "expected 1 lslv w, words={w:#x?}");
+        }
+        {
+            let w = decode_words(&lshr_i64.code, alloc);
+            assert_eq!(
+                w.iter().filter(|&&x| is_and_imm(x)).count(),
+                0,
+                "Lshr(I64, x, And(y, 63)) must elide `and #0x3f`, words={w:#x?}"
+            );
+            assert_eq!(w.iter().filter(|&&x| is_lsrv_x(x)).count(), 1, "expected 1 lsrv x, words={w:#x?}");
+        }
+        {
+            let w = decode_words(&ashr_i32.code, alloc);
+            assert_eq!(
+                w.iter().filter(|&&x| is_and_imm(x)).count(),
+                0,
+                "Ashr(I32, x, And(y, 31)) must elide `and #0x1f`, words={w:#x?}"
+            );
+        }
+        {
+            let w = decode_words(&shl_i64_zext.code, alloc);
+            assert_eq!(
+                w.iter().filter(|&&x| is_and_imm(x)).count(),
+                0,
+                "Shl(I64, x, Zext(And(y, 63))) must elide `and #0x3f`, words={w:#x?}"
+            );
+        }
+        {
+            let w = decode_words(&shl_i32_narrow_mask.code, alloc);
+            assert_eq!(
+                w.iter().filter(|&&x| is_and_imm(x)).count(),
+                1,
+                "Shl(I32, x, And(y, 15)) must KEEP `and #0xf`, words={w:#x?}"
+            );
+        }
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let ex_shl32 = exec_leaf(shl_i32);
+            // SAFETY: `ex_shl32` contains freshly emitted AArch64 code matching `(u32, u32) -> u32`.
+            let f_shl32: extern "C" fn(u32, u32) -> u32 = unsafe { ex_shl32.as_fn() };
+            let ex_lshr64 = exec_leaf(lshr_i64);
+            // SAFETY: `ex_lshr64` contains freshly emitted AArch64 code matching `(u64, u64) -> u64`.
+            let f_lshr64: extern "C" fn(u64, u64) -> u64 = unsafe { ex_lshr64.as_fn() };
+            let ex_ashr32 = exec_leaf(ashr_i32);
+            // SAFETY: `ex_ashr32` contains freshly emitted AArch64 code matching `(i32, u32) -> i32`.
+            let f_ashr32: extern "C" fn(i32, u32) -> i32 = unsafe { ex_ashr32.as_fn() };
+            let ex_shl64z = exec_leaf(shl_i64_zext);
+            // SAFETY: `ex_shl64z` contains freshly emitted AArch64 code matching `(u64, u32) -> u64`.
+            let f_shl64z: extern "C" fn(u64, u32) -> u64 = unsafe { ex_shl64z.as_fn() };
+            let ex_narrow = exec_leaf(shl_i32_narrow_mask);
+            // SAFETY: `ex_narrow` contains freshly emitted AArch64 code matching `(u32, u32) -> u32`.
+            let f_narrow: extern "C" fn(u32, u32) -> u32 = unsafe { ex_narrow.as_fn() };
+
+            let x32 = 0xdead_beefu32;
+            let s32 = -0x1234_5678i32;
+            let x64 = 0xfedc_ba98_7654_3210u64;
+            for &amt in &[0u32, 1, 31, 32, 33, 63, 64, 99] {
+                assert_eq!(f_shl32(x32, amt), x32.wrapping_shl(amt), "shl32 amt={amt}");
+                assert_eq!(f_lshr64(x64, u64::from(amt)), x64.wrapping_shr(amt), "lshr64 amt={amt}");
+                assert_eq!(f_ashr32(s32, amt), s32.wrapping_shr(amt), "ashr32 amt={amt}");
+                assert_eq!(f_shl64z(x64, amt), x64.wrapping_shl(amt), "shl64z amt={amt}");
+                assert_eq!(f_narrow(x32, amt), x32.wrapping_shl(amt & 15), "narrow amt={amt}");
+            }
+        }
+    }
+
+    #[test]
+    fn select_zero_and_bool_uses_cset_and_xzr() {
+        let alloc = test_alloc();
+        // 64-bit `cset xd, cond` (`csinc xd, xzr, xzr, !cond`).
+        let is_cset64 = |w: u32| (w & 0xffff_0fe0) == 0x9a9f_07e0;
+        // 64-bit `csel xd, xn, xm, cond`.
+        let is_csel64 = |w: u32| (w & 0xffe0_0c00) == 0x9a80_0000;
+        let is_csel64_xzr = |w: u32| is_csel64(w) && (((w >> 5) & 31) == 31 || ((w >> 16) & 31) == 31);
+        // 64-bit `movz xd, #0` or `movz xd, #1`.
+        let is_movz_0_or_1 = |w: u32| (w & 0xffff_ffe0) == 0xd280_0000 || (w & 0xffff_ffe0) == 0xd280_0020;
+
+        // 1. `Select(a > b, 1, 0)` -> single `cset`, 0 `mov #0/#1`, 0 `csel`.
+        let sel_1_0 = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let a = b.param(Ty::I64);
+            let bv = b.param(Ty::I64);
+            let c1 = b.iconst(Ty::I64, 1);
+            let c0 = b.iconst(Ty::I64, 0);
+            let cmp = b.icmp(IntCond::Ugt, a, bv);
+            let out = b.select(Flags::NONE, cmp, c1, c0);
+            b.ret(&[out]);
+            let func = b.finish_checked().expect("select(cond, 1, 0) LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("select(cond, 1, 0) emits")
+        };
+
+        // 2. `Select(a > b, 0, 1)` -> single `cset` (inverted), 0 `mov #0/#1`, 0 `csel`.
+        let sel_0_1 = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let a = b.param(Ty::I64);
+            let bv = b.param(Ty::I64);
+            let c0 = b.iconst(Ty::I64, 0);
+            let c1 = b.iconst(Ty::I64, 1);
+            let cmp = b.icmp(IntCond::Ugt, a, bv);
+            let out = b.select(Flags::NONE, cmp, c0, c1);
+            b.ret(&[out]);
+            let func = b.finish_checked().expect("select(cond, 0, 1) LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("select(cond, 0, 1) emits")
+        };
+
+        // 3. `Select(a == b, x, 0)` -> `csel rd, x, xzr, eq`, 0 `mov #0`.
+        let sel_x_0 = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let a = b.param(Ty::I64);
+            let bv = b.param(Ty::I64);
+            let x = b.param(Ty::I64);
+            let c0 = b.iconst(Ty::I64, 0);
+            let cmp = b.icmp(IntCond::Eq, a, bv);
+            let out = b.select(Flags::NONE, cmp, x, c0);
+            b.ret(&[out]);
+            let func = b.finish_checked().expect("select(cond, x, 0) LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("select(cond, x, 0) emits")
+        };
+
+        // 4. `Select(a == b, 0, y)` -> `csel rd, xzr, y, eq`, 0 `mov #0`.
+        let sel_0_y = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let a = b.param(Ty::I64);
+            let bv = b.param(Ty::I64);
+            let y = b.param(Ty::I64);
+            let c0 = b.iconst(Ty::I64, 0);
+            let cmp = b.icmp(IntCond::Eq, a, bv);
+            let out = b.select(Flags::NONE, cmp, c0, y);
+            b.ret(&[out]);
+            let func = b.finish_checked().expect("select(cond, 0, y) LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("select(cond, 0, y) emits")
+        };
+
+        // 5. Shared `ReuseFlagsSelect`: `cmp = a < b`, then `s1 = select(cmp, 1, 0)` + `s2 = select(cmp, x, 0)`.
+        let sel_reuse = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let a = b.param(Ty::I64);
+            let bv = b.param(Ty::I64);
+            let x = b.param(Ty::I64);
+            let c0 = b.iconst(Ty::I64, 0);
+            let c1 = b.iconst(Ty::I64, 1);
+            let cmp = b.icmp(IntCond::Ult, a, bv);
+            let s1 = b.select(Flags::NONE, cmp, c1, c0);
+            let s2 = b.select(Flags::NONE, cmp, x, c0);
+            let out = b.binary(Op::Add, Flags::NONE, s1, s2);
+            b.ret(&[out]);
+            let func = b.finish_checked().expect("reuse-flags select LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("reuse-flags select emits")
+        };
+
+        for (label, code) in [("select(1, 0)", &sel_1_0.code), ("select(0, 1)", &sel_0_1.code)] {
+            let w = decode_words(code, alloc);
+            assert_eq!(w.iter().filter(|&&x| is_cset64(x)).count(), 1, "{label}: expected 1 cset, words={w:#x?}");
+            assert_eq!(w.iter().filter(|&&x| is_csel64(x)).count(), 0, "{label}: expected 0 csel, words={w:#x?}");
+            assert_eq!(
+                w.iter().filter(|&&x| is_movz_0_or_1(x)).count(),
+                0,
+                "{label}: must not materialize #0/#1, words={w:#x?}"
+            );
+        }
+        for (label, code) in [("select(x, 0)", &sel_x_0.code), ("select(0, y)", &sel_0_y.code)] {
+            let w = decode_words(code, alloc);
+            assert_eq!(
+                w.iter().filter(|&&x| is_csel64_xzr(x)).count(),
+                1,
+                "{label}: expected 1 csel with xzr, words={w:#x?}"
+            );
+            assert_eq!(
+                w.iter().filter(|&&x| is_movz_0_or_1(x)).count(),
+                0,
+                "{label}: must not materialize #0, words={w:#x?}"
+            );
+        }
+        {
+            let w = decode_words(&sel_reuse.code, alloc);
+            assert_eq!(w.iter().filter(|&&x| is_cset64(x)).count(), 1, "reuse: expected 1 cset, words={w:#x?}");
+            assert_eq!(
+                w.iter().filter(|&&x| is_csel64_xzr(x)).count(),
+                1,
+                "reuse: expected 1 csel with xzr, words={w:#x?}"
+            );
+            assert_eq!(
+                w.iter().filter(|&&x| is_movz_0_or_1(x)).count(),
+                0,
+                "reuse: must not materialize #0/#1, words={w:#x?}"
+            );
+        }
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let ex10 = exec_leaf(sel_1_0);
+            // SAFETY: `ex10` contains freshly emitted AArch64 code matching `(u64, u64) -> u64`.
+            let f10: extern "C" fn(u64, u64) -> u64 = unsafe { ex10.as_fn() };
+            let ex01 = exec_leaf(sel_0_1);
+            // SAFETY: `ex01` contains freshly emitted AArch64 code matching `(u64, u64) -> u64`.
+            let f01: extern "C" fn(u64, u64) -> u64 = unsafe { ex01.as_fn() };
+            let ex_x0 = exec_leaf(sel_x_0);
+            // SAFETY: `ex_x0` contains freshly emitted AArch64 code matching `(u64, u64, u64) -> u64`.
+            let f_x0: extern "C" fn(u64, u64, u64) -> u64 = unsafe { ex_x0.as_fn() };
+            let ex_0y = exec_leaf(sel_0_y);
+            // SAFETY: `ex_0y` contains freshly emitted AArch64 code matching `(u64, u64, u64) -> u64`.
+            let f_0y: extern "C" fn(u64, u64, u64) -> u64 = unsafe { ex_0y.as_fn() };
+            let ex_reuse = exec_leaf(sel_reuse);
+            // SAFETY: `ex_reuse` contains freshly emitted AArch64 code matching `(u64, u64, u64) -> u64`.
+            let f_reuse: extern "C" fn(u64, u64, u64) -> u64 = unsafe { ex_reuse.as_fn() };
+
+            for &(a, bv, val) in &[(10u64, 5u64, 42u64), (5, 10, 42), (7, 7, 99), (u64::MAX, 0, 123)] {
+                assert_eq!(f10(a, bv), u64::from(a > bv), "select(1, 0) ({a}, {bv})");
+                assert_eq!(f01(a, bv), u64::from(!(a > bv)), "select(0, 1) ({a}, {bv})");
+                assert_eq!(f_x0(a, bv, val), if a == bv { val } else { 0 }, "select(x, 0) ({a}, {bv})");
+                assert_eq!(f_0y(a, bv, val), if a == bv { 0 } else { val }, "select(0, y) ({a}, {bv})");
+                assert_eq!(
+                    f_reuse(a, bv, val),
+                    if a < bv { val + 1 } else { 0 },
+                    "reuse select ({a}, {bv}, {val})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hot_loop_layout_keeps_in_loop_fallthrough() {
+        let alloc = test_alloc();
+        // Construct a loop whose exit block (`exit_blk`) has an EARLIER block ID than `body`,
+        // mirroring `decode_exec_leaf_single`:
+        //   entry (0)    -> loop_hdr (2)
+        //   exit_blk (1) -> ret_blk (4)
+        //   loop_hdr (2) : br(i >= n, exit_blk (1), body (3))
+        //   body (3)     -> loop_hdr (2)
+        //   ret_blk (4)  : ret
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        let exit_blk = b.create_block(BlockKind::Normal);
+        let loop_hdr = b.create_block(BlockKind::Normal);
+        let body = b.create_block(BlockKind::Normal);
+        let ret_blk = b.create_block(BlockKind::Normal);
+        assert!(exit_blk.0 < loop_hdr.0 && loop_hdr.0 < body.0);
+
+        b.begin(entry);
+        let n = b.param(Ty::I64);
+        let c0 = b.iconst(Ty::I64, 0);
+        let c1 = b.iconst(Ty::I64, 1);
+        let c7 = b.iconst(Ty::I64, 7);
+        b.jump((loop_hdr, &[c0, c0]));
+
+        b.begin(exit_blk);
+        let exit_acc = b.param(Ty::I64);
+        let final_v = b.binary(Op::Add, Flags::NONE, exit_acc, c7);
+        b.jump((ret_blk, &[final_v]));
+
+        b.begin(loop_hdr);
+        let i = b.param(Ty::I64);
+        let acc = b.param(Ty::I64);
+        let done = b.icmp(IntCond::Uge, i, n);
+        b.br(Flags::NONE, done, (exit_blk, &[acc]), (body, &[]));
+
+        b.begin(body);
+        let i_next = b.binary(Op::Add, Flags::NONE, i, c1);
+        let acc_next = b.binary(Op::Add, Flags::NONE, acc, i_next);
+        b.jump((loop_hdr, &[i_next, acc_next]));
+
+        b.begin(ret_blk);
+        let rv = b.param(Ty::I64);
+        b.ret(&[rv]);
+
+        let func = b.finish_checked().expect("hot loop layout LIR builds");
+        let view = func.view();
+
+        let order = super::compute_hot_emit_order(&view, alloc);
+        assert_eq!(order.len(), 5, "all 5 blocks must be placed exactly once, order={order:?}");
+        let pos = |blk: blaze_lir::Block| {
+            let target = super::to_idx(blk.0);
+            order.iter().position(|&x| x == target).expect("block must appear in emit order")
+        };
+        assert_eq!(pos(entry), 0, "entry must be first, order={order:?}");
+        assert_eq!(pos(loop_hdr), 1, "loop_hdr must follow entry as fallthrough, order={order:?}");
+        assert_eq!(
+            pos(body),
+            pos(loop_hdr) + 1,
+            "in-loop body must immediately follow loop_hdr as fallthrough, order={order:?}"
+        );
+        assert!(
+            pos(exit_blk) > pos(body) && pos(ret_blk) > pos(body),
+            "loop exit blocks must be placed after the loop body, order={order:?}"
+        );
+
+        let emitted = emit_sota_a64(view, &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+            .expect("hot loop layout emits");
+        let words = decode_words(&emitted.code, alloc);
+
+        // Verify the emitted code branches forward to the exit block, falls straight through into
+        // the loop body ending in a backward `b` to `loop_hdr`, and places `ret` AFTER the loop!
+        let is_b_cond = |w: u32| (w & 0xff00_0010) == 0x5400_0000;
+        let b_cond_delta = |w: u32| -> i32 {
+            let imm19 = (w >> 5) & 0x7_ffff;
+            ((imm19 << 13).cast_signed()) >> 13
+        };
+        let is_b_uncond = |w: u32| (w & 0xfc00_0000) == 0x1400_0000;
+        let b_uncond_delta = |w: u32| -> i32 {
+            let imm26 = w & 0x3ff_ffff;
+            ((imm26 << 6).cast_signed()) >> 6
+        };
+        let exit_br_idx = words
+            .iter()
+            .position(|&w| is_b_cond(w) && b_cond_delta(w) > 1)
+            .expect("expected forward conditional branch to sunk exit block");
+        let back_br_idx = words
+            .iter()
+            .position(|&w| is_b_uncond(w) && b_uncond_delta(w) < 0)
+            .expect("expected backward loop latch branch");
+        let ret_idx = words
+            .iter()
+            .position(|&w| w == crate::enc::ret())
+            .expect("expected ret instruction");
+        assert!(
+            exit_br_idx < back_br_idx && back_br_idx < ret_idx,
+            "expected loop_hdr forward exit branch ({exit_br_idx}) < inline body back-edge ({back_br_idx}) < sunk exit ret ({ret_idx}), words={words:#x?}"
+        );
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let ex = exec_leaf(emitted);
+            // SAFETY: `ex` contains freshly emitted AArch64 code matching `(u64) -> u64`.
+            let f: extern "C" fn(u64) -> u64 = unsafe { ex.as_fn() };
+            for &nv in &[0u64, 1, 5, 17] {
+                let want = (nv * (nv + 1)) / 2 + 7;
+                assert_eq!(f(nv), want, "hot loop execution mismatch for n={nv}");
+            }
+        }
+    }
+
+    #[test]
+    fn hot_loop_layout_prefers_outer_spine_over_conditional_inner_loop() {
+        let alloc = test_alloc();
+        // Model `decode_exec_leaf_single`: an outer loop (`outer_hdr -> outer_latch`) with a
+        // conditionally-entered inner slow-path loop (`if match_len > 32 { while ... }`).
+        // Even though `inner_pre` and `inner_hdr` have earlier RPO rank and higher loop depth
+        // than `outer_latch`, the outer loop fast-path spine (`outer_hdr -> outer_latch`) must
+        // stay straight-line fallthrough with the conditional inner loop deferred right after.
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64), Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        let outer_hdr = b.create_block(BlockKind::Normal);
+        let inner_pre = b.create_block(BlockKind::Normal);
+        let inner_hdr = b.create_block(BlockKind::Normal);
+        let outer_latch = b.create_block(BlockKind::Normal);
+        let exit_blk = b.create_block(BlockKind::Normal);
+
+        b.begin(entry);
+        let seq_count = b.param(Ty::I64);
+        let match_len = b.param(Ty::I64);
+        let c0 = b.iconst(Ty::I64, 0);
+        let c1 = b.iconst(Ty::I64, 1);
+        let c3 = b.iconst(Ty::I64, 3);
+        let c32 = b.iconst(Ty::I64, 32);
+        let is_empty = b.icmp(IntCond::Eq, seq_count, c0);
+        b.br(Flags::NONE, is_empty, (exit_blk, &[c0]), (outer_hdr, &[seq_count, c0]));
+
+        b.begin(outer_hdr);
+        let rem_seq = b.param(Ty::I64);
+        let acc = b.param(Ty::I64);
+        let base_acc = b.binary(Op::Add, Flags::NONE, acc, match_len);
+        let is_long = b.icmp(IntCond::Ugt, match_len, c32);
+        b.br(Flags::NONE, is_long, (inner_pre, &[base_acc]), (outer_latch, &[base_acc]));
+
+        b.begin(inner_pre);
+        let pre_acc = b.param(Ty::I64);
+        let extra = b.binary(Op::Sub, Flags::NONE, match_len, c32);
+        b.jump((inner_hdr, &[extra, pre_acc]));
+
+        b.begin(inner_hdr);
+        let k = b.param(Ty::I64);
+        let in_acc = b.param(Ty::I64);
+        let in_acc2 = b.binary(Op::Add, Flags::NONE, in_acc, c3);
+        let k_next = b.binary(Op::Sub, Flags::NONE, k, c1);
+        let k_done = b.icmp(IntCond::Eq, k_next, c0);
+        b.br(Flags::NONE, k_done, (outer_latch, &[in_acc2]), (inner_hdr, &[k_next, in_acc2]));
+
+        b.begin(outer_latch);
+        let lat_acc = b.param(Ty::I64);
+        let rem_next = b.binary(Op::Sub, Flags::NONE, rem_seq, c1);
+        let seq_done = b.icmp(IntCond::Eq, rem_next, c0);
+        b.br(Flags::NONE, seq_done, (exit_blk, &[lat_acc]), (outer_hdr, &[rem_next, lat_acc]));
+
+        b.begin(exit_blk);
+        let res = b.param(Ty::I64);
+        b.ret(&[res]);
+
+        let func = b.finish_checked().expect("outer-spine + conditional inner loop LIR builds");
+        let view = func.view();
+
+        let order = super::compute_hot_emit_order(&view, alloc);
+        assert_eq!(order.len(), 6, "all 6 blocks must be placed exactly once, order={order:?}");
+        let pos = |blk: blaze_lir::Block| {
+            let target = super::to_idx(blk.0);
+            order.iter().position(|&x| x == target).expect("block must appear in emit order")
+        };
+        assert_eq!(pos(entry), 0, "entry must be first, order={order:?}");
+        assert_eq!(pos(outer_hdr), 1, "outer_hdr must follow entry as fallthrough, order={order:?}");
+        assert_eq!(
+            pos(outer_latch),
+            pos(outer_hdr) + 1,
+            "outer_latch must immediately follow outer_hdr as fast-path fallthrough, order={order:?}"
+        );
+        assert!(
+            pos(inner_pre) > pos(outer_latch),
+            "conditional inner loop preheader must be deferred after outer_latch, order={order:?}"
+        );
+        assert_eq!(
+            pos(inner_hdr),
+            pos(inner_pre) + 1,
+            "inner_hdr must immediately follow inner_pre as fallthrough, order={order:?}"
+        );
+        assert!(
+            pos(exit_blk) > pos(inner_hdr),
+            "exit_blk must be placed after the loop, order={order:?}"
+        );
+
+        let emitted = emit_sota_a64(view, &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+            .expect("outer-spine + conditional inner loop emits");
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let ex = exec_leaf(emitted);
+            // SAFETY: `ex` contains freshly emitted AArch64 code matching `(u64, u64) -> u64`.
+            let f: extern "C" fn(u64, u64) -> u64 = unsafe { ex.as_fn() };
+            for &(seqs, ml) in &[(0u64, 10u64), (1, 16), (5, 32), (1, 33), (7, 48), (12, 64)] {
+                let per_seq = ml + if ml > 32 { 3 * (ml - 32) } else { 0 };
+                assert_eq!(f(seqs, ml), seqs * per_seq, "mismatch for seqs={seqs} ml={ml}");
+            }
+        }
+    }
+
+    #[test]
+    fn loop_latch_emits_single_cond_backedge_branch() {
+        let alloc = test_alloc();
+        // Build a loop whose latch ends in `br(done, exit_blk, loop_hdr)` (exit in `then`,
+        // backedge in `else`), with a conditionally-entered inner loop placed between `latch`
+        // and `exit_blk` so NEITHER `exit_blk` NOR `loop_hdr` is `next_block`.
+        // Verify BOTH `SubsFlags + ReuseFlagsBr` (`use_subs = true`) AND `CmpBr` (`use_subs = false`)
+        // emit `b.<hot_cond> loop_hdr` FIRST followed by `b exit_blk` (1 branch per hot iteration!).
+        let build = |use_subs: bool| -> Emitted<'static> {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            let loop_hdr = b.create_block(BlockKind::Normal);
+            let slow_loop = b.create_block(BlockKind::Normal);
+            let latch = b.create_block(BlockKind::Normal);
+            let exit_blk = b.create_block(BlockKind::Normal);
+
+            b.begin(entry);
+            let n = b.param(Ty::I64);
+            let flag = b.param(Ty::I64);
+            let c0 = b.iconst(Ty::I64, 0);
+            let c1 = b.iconst(Ty::I64, 1);
+            let c7 = b.iconst(Ty::I64, 7);
+            let init_idx = if use_subs { n } else { c0 };
+            b.jump((loop_hdr, &[init_idx, c0]));
+
+            b.begin(loop_hdr);
+            let idx = b.param(Ty::I64);
+            let acc = b.param(Ty::I64);
+            let is_slow = b.icmp(IntCond::Ugt, flag, c7);
+            b.br(Flags::NONE, is_slow, (slow_loop, &[c7]), (latch, &[]));
+
+            b.begin(slow_loop);
+            let k = b.param(Ty::I64);
+            let k_next = b.binary(Op::Sub, Flags::NONE, k, c1);
+            let k_done = b.icmp(IntCond::Eq, k_next, c0);
+            b.br(Flags::NONE, k_done, (latch, &[]), (slow_loop, &[k_next]));
+
+            b.begin(latch);
+            let (idx_next, acc_next, done) = if use_subs {
+                let rem_next = b.binary(Op::Sub, Flags::NONE, idx, c1);
+                let acc2 = b.binary(Op::Add, Flags::NONE, acc, rem_next);
+                let is_done = b.icmp(IntCond::Eq, rem_next, c0);
+                (rem_next, acc2, is_done)
+            } else {
+                let i_next = b.binary(Op::Add, Flags::NONE, idx, c1);
+                let acc2 = b.binary(Op::Add, Flags::NONE, acc, i_next);
+                let is_done = b.icmp(IntCond::Uge, i_next, n);
+                (i_next, acc2, is_done)
+            };
+            // `exit_blk` has 0 params (reading `acc_next` by dominance), and `loop_hdr`'s params
+            // coalesce cleanly with `(idx_next, acc_next)` -> both edges are zero-move!
+            b.br(Flags::NONE, done, (exit_blk, &[]), (loop_hdr, &[idx_next, acc_next]));
+
+            b.begin(exit_blk);
+            b.ret(&[acc_next]);
+
+            let func = b.finish_checked().expect("single-branch latch LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("single-branch latch emits")
+        };
+
+        let is_b_cond = |w: u32| (w & 0xff00_0010) == 0x5400_0000;
+        let b_cond_delta = |w: u32| -> i32 {
+            let imm19 = (w >> 5) & 0x7_ffff;
+            ((imm19 << 13).cast_signed()) >> 13
+        };
+        let is_b_uncond = |w: u32| (w & 0xfc00_0000) == 0x1400_0000;
+        let b_uncond_delta = |w: u32| -> i32 {
+            let imm26 = w & 0x3ff_ffff;
+            ((imm26 << 6).cast_signed()) >> 6
+        };
+
+        for use_subs in [true, false] {
+            let emitted = build(use_subs);
+            let words = decode_words(&emitted.code, alloc);
+
+            // The outer latch must emit a BACKWARD `b.cond loop_hdr` immediately followed by a
+            // FORWARD `b exit_blk` — never `b.cond exit_blk; b loop_hdr`!
+            let latch_pair = words.iter().enumerate().find(|&(idx, &w)| {
+                is_b_cond(w)
+                    && b_cond_delta(w) < 0
+                    && words
+                        .get(idx + 1)
+                        .is_some_and(|&next_w| is_b_uncond(next_w) && b_uncond_delta(next_w) > 0)
+            });
+            let (back_idx, &back_w) = latch_pair.unwrap_or_else(|| {
+                panic!(
+                    "use_subs={use_subs}: expected `b.<cond> loop_hdr; b exit_blk` single-branch backedge, words={words:#x?}"
+                )
+            });
+            let target = back_idx
+                .checked_add_signed(isize::try_from(b_cond_delta(back_w)).unwrap_or(0))
+                .expect("valid backward branch target");
+            let uncond_b_in_hot_loop = words[target..=back_idx]
+                .iter()
+                .filter(|&&w| is_b_uncond(w))
+                .count();
+            assert_eq!(
+                uncond_b_in_hot_loop, 0,
+                "use_subs={use_subs}: hot outer loop spine must contain ZERO unconditional `b`, words={words:#x?}"
+            );
+
+            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            {
+                let ex = exec_leaf(emitted);
+                // SAFETY: `ex` contains freshly emitted AArch64 code matching `(u64, u64) -> u64`.
+                let f: extern "C" fn(u64, u64) -> u64 = unsafe { ex.as_fn() };
+                for &nv in &[1u64, 2, 5, 20] {
+                    let want = if use_subs { (nv * (nv - 1)) / 2 } else { (nv * (nv + 1)) / 2 };
+                    for &flag in &[0u64, 7, 10] {
+                        assert_eq!(f(nv, flag), want, "use_subs={use_subs} n={nv} flag={flag}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tst_br_fuses_i64_and_i32_logical_masks_zero_and_hardware_exec() {
+        let alloc = test_alloc();
+
+        // 1. I64 `and(x, 0x3f) == 0` with non-zero branch args -> `tst xn, #0x3f; b.eq/b.ne`
+        //    (zero `and`, zero `mov #0`, zero `mov #0x3f`).
+        let emit_i64_imm = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            let join = b.create_block(BlockKind::Normal);
+
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let a = b.param(Ty::I64);
+            let bv = b.param(Ty::I64);
+            let mask = b.iconst(Ty::I64, 0x3f);
+            let zero = b.iconst(Ty::I64, 0);
+            let masked = b.binary(Op::And, Flags::NONE, x, mask);
+            let is_zero = b.icmp(IntCond::Eq, masked, zero);
+            b.br(Flags::NONE, is_zero, (join, &[a]), (join, &[bv]));
+
+            b.begin(join);
+            let res = b.param(Ty::I64);
+            b.ret(&[res]);
+
+            let func = b.finish_checked().expect("i64 tst_br LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("i64 tst_br emits")
+        };
+
+        // 2. I32 commuted `0 == and(trunc(x), 0xff00)` -> 32-bit `tst wn, #0xff00; b.eq/b.ne`
+        //    (ignores dirty upper 32 bits, zero `and`, zero `mov #0`, zero `mov #0xff00`).
+        let emit_i32_commuted = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            let then_blk = b.create_block(BlockKind::Normal);
+            let else_blk = b.create_block(BlockKind::Normal);
+
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let x32 = b.convert(Op::Trunc, Flags::NONE, Ty::I32, x);
+            let mask = b.iconst(Ty::I32, 0xff00);
+            let zero = b.iconst(Ty::I32, 0);
+            let masked = b.binary(Op::And, Flags::NONE, x32, mask);
+            let is_zero = b.icmp(IntCond::Eq, zero, masked);
+            b.br(Flags::NONE, is_zero, (then_blk, &[]), (else_blk, &[]));
+
+            b.begin(then_blk);
+            let c10 = b.iconst(Ty::I64, 10);
+            b.ret(&[c10]);
+
+            b.begin(else_blk);
+            let c20 = b.iconst(Ty::I64, 20);
+            b.ret(&[c20]);
+
+            let func = b.finish_checked().expect("i32 commuted tst_br LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("i32 commuted tst_br emits")
+        };
+
+        // 3. I32 register-register `and(x32, m32) != 0` -> 32-bit `tst wn, wm; b.ne/b.eq`.
+        let emit_i32_reg = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            let then_blk = b.create_block(BlockKind::Normal);
+            let else_blk = b.create_block(BlockKind::Normal);
+
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let m = b.param(Ty::I64);
+            let x32 = b.convert(Op::Trunc, Flags::NONE, Ty::I32, x);
+            let m32 = b.convert(Op::Trunc, Flags::NONE, Ty::I32, m);
+            let zero = b.iconst(Ty::I32, 0);
+            let masked = b.binary(Op::And, Flags::NONE, x32, m32);
+            let nonzero = b.icmp(IntCond::Ne, masked, zero);
+            b.br(Flags::NONE, nonzero, (then_blk, &[]), (else_blk, &[]));
+
+            b.begin(then_blk);
+            let c1 = b.iconst(Ty::I64, 1);
+            b.ret(&[c1]);
+
+            b.begin(else_blk);
+            let c2 = b.iconst(Ty::I64, 2);
+            b.ret(&[c2]);
+
+            let func = b.finish_checked().expect("i32 reg tst_br LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("i32 reg tst_br emits")
+        };
+
+        let is_tst64_imm = |w: u32| (w & 0xff80_001f) == 0xf200_001f;
+        let is_tst32_imm = |w: u32| (w & 0xff80_001f) == 0x7200_001f;
+        let is_tst32_reg = |w: u32| (w & 0xffe0_fc1f) == 0x6a00_001f;
+        let is_plain_and = |w: u32| {
+            (w & 0x7f80_0000) == 0x1200_0000 || (w & 0x7fe0_0000) == 0x0a00_0000
+        };
+        let is_movz_imm = |w: u32, imm: u32| (w & 0xffe0_0000) == 0xd280_0000 && ((w >> 5) & 0xffff) == imm;
+
+        {
+            let w = decode_words(&emit_i64_imm.code, alloc);
+            assert_eq!(w.iter().filter(|&&x| is_tst64_imm(x)).count(), 1, "expected 1 64-bit tst #imm, words={w:#x?}");
+            assert_eq!(w.iter().filter(|&&x| is_plain_and(x)).count(), 0, "expected 0 plain `and`, words={w:#x?}");
+            assert_eq!(w.iter().filter(|&&x| is_movz_imm(x, 0)).count(), 0, "must not materialize #0, words={w:#x?}");
+            assert_eq!(w.iter().filter(|&&x| is_movz_imm(x, 0x3f)).count(), 0, "must not materialize #0x3f, words={w:#x?}");
+        }
+        {
+            let w = decode_words(&emit_i32_commuted.code, alloc);
+            assert_eq!(w.iter().filter(|&&x| is_tst32_imm(x)).count(), 1, "expected 1 32-bit tst #imm, words={w:#x?}");
+            assert_eq!(w.iter().filter(|&&x| is_plain_and(x)).count(), 0, "expected 0 plain `and`, words={w:#x?}");
+            assert_eq!(w.iter().filter(|&&x| is_movz_imm(x, 0)).count(), 0, "must not materialize #0, words={w:#x?}");
+            assert_eq!(w.iter().filter(|&&x| is_movz_imm(x, 0xff00)).count(), 0, "must not materialize #0xff00, words={w:#x?}");
+        }
+        {
+            let w = decode_words(&emit_i32_reg.code, alloc);
+            assert_eq!(w.iter().filter(|&&x| is_tst32_reg(x)).count(), 1, "expected 1 32-bit tst reg, words={w:#x?}");
+            assert_eq!(w.iter().filter(|&&x| is_plain_and(x)).count(), 0, "expected 0 plain `and`, words={w:#x?}");
+            assert_eq!(w.iter().filter(|&&x| is_movz_imm(x, 0)).count(), 0, "must not materialize #0, words={w:#x?}");
+        }
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let ex64 = exec_leaf(emit_i64_imm);
+            // SAFETY: `ex64` contains freshly emitted AArch64 code matching `(u64, u64, u64) -> u64`.
+            let f64: extern "C" fn(u64, u64, u64) -> u64 = unsafe { ex64.as_fn() };
+            for &x in &[0u64, 0x40, 0x3f, 0x100, 0x101, u64::MAX ^ 0x3f, u64::MAX] {
+                assert_eq!(f64(x, 111, 222), if (x & 0x3f) == 0 { 111 } else { 222 }, "i64 tst x={x:#x}");
+            }
+
+            let ex32 = exec_leaf(emit_i32_commuted);
+            // SAFETY: `ex32` contains freshly emitted AArch64 code matching `(u64) -> u64`.
+            let f32_comm: extern "C" fn(u64) -> u64 = unsafe { ex32.as_fn() };
+            for &x in &[
+                0u64,
+                0xdead_beef_0000_00ff,
+                0xdead_beef_0000_0100,
+                0x1234_5678_ffff_00ff,
+                0x0000_0000_0000_8000,
+            ] {
+                let want = if ((x & 0xffff_ffff) & 0xff00) == 0 { 10 } else { 20 };
+                assert_eq!(f32_comm(x), want, "i32 commuted tst x={x:#x}");
+            }
+
+            let ex32r = exec_leaf(emit_i32_reg);
+            // SAFETY: `ex32r` contains freshly emitted AArch64 code matching `(u64, u64) -> u64`.
+            let f32_reg: extern "C" fn(u64, u64) -> u64 = unsafe { ex32r.as_fn() };
+            for &(x, m) in &[
+                (0xffff_ffff_0000_0000u64, 0xffff_ffff_0000_0000u64),
+                (0xdead_beef_0000_0010, 0x1111_2222_0000_0030),
+                (0xdead_beef_0000_0005, 0x1111_2222_0000_000a),
+            ] {
+                let want = if ((x & m) & 0xffff_ffff) != 0 { 1 } else { 2 };
+                assert_eq!(f32_reg(x, m), want, "i32 reg tst x={x:#x} m={m:#x}");
+            }
+        }
+    }
+
+    #[test]
+    fn live_cmp_reuses_nzcv_across_different_predicates() {
+        let alloc = test_alloc();
+
+        // 1. Two distinct 32-bit comparisons on the same `(code32, #2)` with different predicates
+        //    (`Ult` feeding 2 `Select`s, followed by `Eq` feeding 2 `Select`s) must emit ONLY ONE
+        //    `cmp w, #2` (reusing live NZCV across `CmpSelect` + `ReuseFlagsSelect` + `CmpSelect`).
+        let reuse_same_width = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[
+                    Param::of(Ty::I64),
+                    Param::of(Ty::I64),
+                    Param::of(Ty::I64),
+                    Param::of(Ty::I64),
+                ],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let raw_code = b.param(Ty::I64);
+            let r1 = b.param(Ty::I64);
+            let r2 = b.param(Ty::I64);
+            let r3 = b.param(Ty::I64);
+            let code32 = b.convert(Op::Trunc, Flags::NONE, Ty::I32, raw_code);
+            let c2_a = b.iconst(Ty::I32, 2);
+            let c2_b = b.iconst(Ty::I32, 2);
+            let lt2 = b.icmp(IntCond::Ult, code32, c2_a);
+            let s1 = b.select(Flags::NONE, lt2, r1, r2);
+            let s2 = b.select(Flags::NONE, lt2, r2, r3);
+            let eq2 = b.icmp(IntCond::Eq, code32, c2_b);
+            let s3 = b.select(Flags::NONE, eq2, r2, s1);
+            let s4 = b.select(Flags::NONE, eq2, r1, s2);
+            let out = b.binary(Op::Add, Flags::NONE, s3, s4);
+            b.ret(&[out]);
+            let func = b.finish_checked().expect("live_cmp reuse LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("live_cmp reuse emits")
+        };
+
+        // 2. Width soundness guard: 32-bit `cmp w, #2` MUST NOT be reused for 64-bit `cmp x, #2`!
+        let width_mismatch = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let raw_x = b.param(Ty::I64);
+            let a = b.param(Ty::I64);
+            let bv = b.param(Ty::I64);
+            let x32 = b.convert(Op::Trunc, Flags::NONE, Ty::I32, raw_x);
+            let c2_32 = b.iconst(Ty::I32, 2);
+            let c2_64 = b.iconst(Ty::I64, 2);
+            let lt32 = b.icmp(IntCond::Ult, x32, c2_32);
+            let s1 = b.select(Flags::NONE, lt32, a, bv);
+            let eq64 = b.icmp(IntCond::Eq, raw_x, c2_64);
+            let s2 = b.select(Flags::NONE, eq64, a, s1);
+            b.ret(&[s2]);
+            let func = b.finish_checked().expect("live_cmp width guard LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("live_cmp width guard emits")
+        };
+
+        let is_cmp32_imm2 = |w: u32| (w & 0xffff_fc1f) == (0x7100_001f | (2 << 10));
+        let is_cmp64_imm2 = |w: u32| (w & 0xffff_fc1f) == (0xf100_001f | (2 << 10));
+        let is_csel64 = |w: u32| (w & 0xffe0_0c00) == 0x9a80_0000;
+
+        {
+            let w = decode_words(&reuse_same_width.code, alloc);
+            assert_eq!(
+                w.iter().filter(|&&x| is_cmp32_imm2(x)).count(),
+                1,
+                "Ult(x32, 2) + Eq(x32, 2) must emit ONLY ONE `cmp w, #2`, words={w:#x?}"
+            );
+            assert_eq!(
+                w.iter().filter(|&&x| is_csel64(x)).count(),
+                4,
+                "expected 4 csel instructions, words={w:#x?}"
+            );
+        }
+        {
+            let w = decode_words(&width_mismatch.code, alloc);
+            assert_eq!(
+                w.iter().filter(|&&x| is_cmp32_imm2(x)).count(),
+                1,
+                "expected 1 32-bit `cmp w, #2`, words={w:#x?}"
+            );
+            assert_eq!(
+                w.iter().filter(|&&x| is_cmp64_imm2(x)).count(),
+                1,
+                "must emit a separate 64-bit `cmp x, #2` when widths differ, words={w:#x?}"
+            );
+        }
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let ex_reuse = exec_leaf(reuse_same_width);
+            // SAFETY: `ex_reuse` contains freshly emitted AArch64 code matching `(u64, u64, u64, u64) -> u64`.
+            let f_reuse: extern "C" fn(u64, u64, u64, u64) -> u64 = unsafe { ex_reuse.as_fn() };
+            let (r1, r2, r3) = (100u64, 200u64, 300u64);
+            for &raw_code in &[
+                0u64,
+                1,
+                2,
+                3,
+                0xdead_beef_0000_0000,
+                0xdead_beef_0000_0001,
+                0xdead_beef_0000_0002,
+                0xdead_beef_0000_0003,
+                u64::MAX,
+            ] {
+                let c = raw_code & 0xffff_ffff;
+                let s1 = if c < 2 { r1 } else { r2 };
+                let s2 = if c < 2 { r2 } else { r3 };
+                let s3 = if c == 2 { r2 } else { s1 };
+                let s4 = if c == 2 { r1 } else { s2 };
+                assert_eq!(
+                    f_reuse(raw_code, r1, r2, r3),
+                    s3.wrapping_add(s4),
+                    "live_cmp reuse wrong for raw_code={raw_code:#x}"
+                );
+            }
+
+            let ex_width = exec_leaf(width_mismatch);
+            // SAFETY: `ex_width` contains freshly emitted AArch64 code matching `(u64, u64, u64) -> u64`.
+            let f_width: extern "C" fn(u64, u64, u64) -> u64 = unsafe { ex_width.as_fn() };
+            for &raw_x in &[
+                0u64,
+                1,
+                2,
+                3,
+                0x0000_0001_0000_0002,
+                0x0000_0001_0000_0001,
+                0xffff_ffff_0000_0002,
+            ] {
+                let s1 = if (raw_x & 0xffff_ffff) < 2 { 111 } else { 222 };
+                let want = if raw_x == 2 { 111 } else { s1 };
+                assert_eq!(f_width(raw_x, 111, 222), want, "width mismatch wrong for raw_x={raw_x:#x}");
+            }
+        }
+    }
+
+    #[test]
+    fn add_icmp_folds_to_cinc() {
+        let alloc = test_alloc();
+
+        // 1. 32-bit `x32 + u32::from(y32 == 0)` -> `cmp w, #0; cinc w, w, eq` (0 `cset`, 0 `add`).
+        let emit_i32 = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let raw_x = b.param(Ty::I64);
+            let raw_y = b.param(Ty::I64);
+            let x32 = b.convert(Op::Trunc, Flags::NONE, Ty::I32, raw_x);
+            let y32 = b.convert(Op::Trunc, Flags::NONE, Ty::I32, raw_y);
+            let z32 = b.iconst(Ty::I32, 0);
+            let is_z = b.icmp(IntCond::Eq, y32, z32);
+            let inc = b.convert(Op::Zext, Flags::NONE, Ty::I32, is_z);
+            let sum32 = b.binary(Op::Add, Flags::NONE, x32, inc);
+            let out = b.convert(Op::Zext, Flags::NONE, Ty::I64, sum32);
+            b.ret(&[out]);
+            let func = b.finish_checked().expect("i32 cinc LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("i32 cinc emits")
+        };
+
+        // 2. 64-bit commuted `u64::from(y64 == 0) + x64` -> `cmp x, #0; cinc x, x, eq` (0 `cset`, 0 `add`).
+        let emit_i64 = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let y = b.param(Ty::I64);
+            let z64 = b.iconst(Ty::I64, 0);
+            let is_z = b.icmp(IntCond::Eq, y, z64);
+            let inc = b.convert(Op::Zext, Flags::NONE, Ty::I64, is_z);
+            let out = b.binary(Op::Add, Flags::NONE, inc, x);
+            b.ret(&[out]);
+            let func = b.finish_checked().expect("i64 cinc LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("i64 cinc emits")
+        };
+
+        // 3. 64-bit `x + select(y == 0, 0, 1)` -> `cmp x, #0; cinc x, x, ne` (0 `cset`, 0 `add`, 0 `mov #0/#1`).
+        let emit_sel01 = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let y = b.param(Ty::I64);
+            let c0 = b.iconst(Ty::I64, 0);
+            let c1 = b.iconst(Ty::I64, 1);
+            let is_z = b.icmp(IntCond::Eq, y, c0);
+            let sel = b.select(Flags::NONE, is_z, c0, c1);
+            let out = b.binary(Op::Add, Flags::NONE, x, sel);
+            b.ret(&[out]);
+            let func = b.finish_checked().expect("select01 cinc LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("select01 cinc emits")
+        };
+
+        let is_cinc32 = |w: u32| {
+            (w & 0xffe0_0c00) == 0x1a80_0400
+                && ((w >> 5) & 0x1f) == ((w >> 16) & 0x1f)
+                && ((w >> 5) & 0x1f) != 31
+        };
+        let is_cinc64 = |w: u32| {
+            (w & 0xffe0_0c00) == 0x9a80_0400
+                && ((w >> 5) & 0x1f) == ((w >> 16) & 0x1f)
+                && ((w >> 5) & 0x1f) != 31
+        };
+        let is_cset = |w: u32| (w & 0x7fff_0fe0) == 0x1a9f_07e0;
+        let is_plain_add = |w: u32| (w & 0x7fe0_0000) == 0x0b00_0000;
+        let is_movz_0_or_1 = |w: u32| (w & 0xffe0_0000) == 0xd280_0000 && (((w >> 5) & 0xffff) <= 1);
+
+        {
+            let w = decode_words(&emit_i32.code, alloc);
+            assert_eq!(w.iter().filter(|&&x| is_cinc32(x)).count(), 1, "i32: expected 1 `cinc w`, words={w:#x?}");
+            assert_eq!(w.iter().filter(|&&x| is_cset(x)).count(), 0, "i32: expected 0 `cset`, words={w:#x?}");
+            assert_eq!(w.iter().filter(|&&x| is_plain_add(x)).count(), 0, "i32: expected 0 `add`, words={w:#x?}");
+        }
+        {
+            let w = decode_words(&emit_i64.code, alloc);
+            assert_eq!(w.iter().filter(|&&x| is_cinc64(x)).count(), 1, "i64: expected 1 `cinc x`, words={w:#x?}");
+            assert_eq!(w.iter().filter(|&&x| is_cset(x)).count(), 0, "i64: expected 0 `cset`, words={w:#x?}");
+            assert_eq!(w.iter().filter(|&&x| is_plain_add(x)).count(), 0, "i64: expected 0 `add`, words={w:#x?}");
+        }
+        {
+            let w = decode_words(&emit_sel01.code, alloc);
+            assert_eq!(w.iter().filter(|&&x| is_cinc64(x)).count(), 1, "sel01: expected 1 `cinc x`, words={w:#x?}");
+            assert_eq!(w.iter().filter(|&&x| is_cset(x)).count(), 0, "sel01: expected 0 `cset`, words={w:#x?}");
+            assert_eq!(w.iter().filter(|&&x| is_plain_add(x)).count(), 0, "sel01: expected 0 `add`, words={w:#x?}");
+            assert_eq!(
+                w.iter().filter(|&&x| is_movz_0_or_1(x)).count(),
+                0,
+                "sel01: must not materialize #0/#1, words={w:#x?}"
+            );
+        }
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let ex32 = exec_leaf(emit_i32);
+            // SAFETY: `ex32` contains freshly emitted AArch64 code matching `(u64, u64) -> u64`.
+            let f32: extern "C" fn(u64, u64) -> u64 = unsafe { ex32.as_fn() };
+            for &x in &[0u64, 10, u64::from(u32::MAX), 0x1234_5678_ffff_ffff] {
+                for &y in &[0u64, 1, u64::from(u32::MAX), 0xdead_beef_0000_0000, 0xdead_beef_0000_0001] {
+                    let x32 = u32::try_from(x & 0xffff_ffff).unwrap_or(0);
+                    let inc = u32::from((y & 0xffff_ffff) == 0);
+                    let want = u64::from(x32.wrapping_add(inc));
+                    assert_eq!(f32(x, y), want, "i32 cinc wrong for x={x:#x} y={y:#x}");
+                }
+            }
+
+            let ex64 = exec_leaf(emit_i64);
+            // SAFETY: `ex64` contains freshly emitted AArch64 code matching `(u64, u64) -> u64`.
+            let f64: extern "C" fn(u64, u64) -> u64 = unsafe { ex64.as_fn() };
+            for &x in &[0u64, 41, u64::MAX] {
+                for &y in &[0u64, 1, u64::from(u32::MAX), u64::MAX] {
+                    let want = x.wrapping_add(u64::from(y == 0));
+                    assert_eq!(f64(x, y), want, "i64 cinc wrong for x={x:#x} y={y:#x}");
+                }
+            }
+
+            let ex_sel = exec_leaf(emit_sel01);
+            // SAFETY: `ex_sel` contains freshly emitted AArch64 code matching `(u64, u64) -> u64`.
+            let f_sel: extern "C" fn(u64, u64) -> u64 = unsafe { ex_sel.as_fn() };
+            for &x in &[0u64, 99, u64::MAX] {
+                for &y in &[0u64, 1, u64::from(u32::MAX), u64::MAX] {
+                    let want = x.wrapping_add(u64::from(y != 0));
+                    assert_eq!(f_sel(x, y), want, "sel01 cinc wrong for x={x:#x} y={y:#x}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cmp_shifted_imm12_lsl12_avoids_movz_and_executes() {
+        let alloc = test_alloc();
+
+        // 1. 32-bit `Icmp(Ult, x32, 0x0040_0000)` + `Br` (exact `tag_matches` pattern!):
+        //    must emit 1-inst `cmp wN, #0x400, lsl #12` (`sh = 1`, bit 22 set) and NEVER materialize `0x400000`.
+        let emit_i32_ult_br = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            let then_blk = b.create_block(BlockKind::Normal);
+            let else_blk = b.create_block(BlockKind::Normal);
+
+            b.begin(entry);
+            let raw_x = b.param(Ty::I64);
+            let x32 = b.convert(Op::Trunc, Flags::NONE, Ty::I32, raw_x);
+            let bound = b.iconst(Ty::I32, 0x0040_0000);
+            let lt = b.icmp(IntCond::Ult, x32, bound);
+            b.br(Flags::NONE, lt, (then_blk, &[]), (else_blk, &[]));
+
+            b.begin(then_blk);
+            let c111 = b.iconst(Ty::I64, 111);
+            b.ret(&[c111]);
+
+            b.begin(else_blk);
+            let c222 = b.iconst(Ty::I64, 222);
+            b.ret(&[c222]);
+
+            let func = b.finish_checked().expect("i32 shifted-imm12 cmp+br LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("i32 shifted-imm12 cmp+br emits")
+        };
+
+        // 2. 64-bit `Icmp(Eq, x64, 0x00ff_f000)`:
+        //    must emit 1-inst `cmp xN, #0xfff, lsl #12` (`sh = 1`, bit 22 set) with 0 `movz`/`movk`/`orr #imm`.
+        let emit_i64_eq = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let c = b.iconst(Ty::I64, 0x00ff_f000);
+            let eq = b.icmp(IntCond::Eq, x, c);
+            let out = b.convert(Op::Zext, Flags::NONE, Ty::I64, eq);
+            b.ret(&[out]);
+
+            let func = b.finish_checked().expect("i64 shifted-imm12 icmp LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("i64 shifted-imm12 icmp emits")
+        };
+
+        // 3. 64-bit `Add(x, 0x0040_0000)` + 32-bit `Sub(y32, 0x00ff_f000)`:
+        //    must fold both into `add x, x, #0x400, lsl #12` and `sub w, w, #0xfff, lsl #12` with 0 `movz`/`orr #imm`.
+        let emit_add_sub = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let y = b.param(Ty::I64);
+            let c400 = b.iconst(Ty::I64, 0x0040_0000);
+            let a = b.binary(Op::Add, Flags::NONE, x, c400);
+            let y32 = b.convert(Op::Trunc, Flags::NONE, Ty::I32, y);
+            let cfff = b.iconst(Ty::I32, 0x00ff_f000);
+            let d32 = b.binary(Op::Sub, Flags::NONE, y32, cfff);
+            let d64 = b.convert(Op::Zext, Flags::NONE, Ty::I64, d32);
+            let out = b.binary(Op::Xor, Flags::NONE, a, d64);
+            b.ret(&[out]);
+
+            let func = b.finish_checked().expect("add/sub shifted-imm12 LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("add/sub shifted-imm12 emits")
+        };
+
+        // AArch64 Add/Subtract (immediate) encodings with `sh = 1` (bit 22):
+        // - 32-bit `cmp wN, #0x400, lsl #12`: `0x7140_001f | (0x400 << 10)`
+        // - 64-bit `cmp xN, #0xfff, lsl #12`: `0xf140_001f | (0xfff << 10)`
+        // - 64-bit `add xD, xN, #0x400, lsl #12`: `0x9140_0000 | (0x400 << 10)`
+        // - 32-bit `sub wD, wN, #0xfff, lsl #12`: `0x5140_0000 | (0xfff << 10)`
+        let is_cmp32_lsl12_400 = |w: u32| (w & 0xffff_fc1f) == (0x7140_001f | (0x400 << 10));
+        let is_cmp64_lsl12_fff = |w: u32| (w & 0xffff_fc1f) == (0xf140_001f | (0xfff << 10));
+        let is_add64_lsl12_400 = |w: u32| (w & 0xffff_fc00) == (0x9140_0000 | (0x400 << 10));
+        let is_sub32_lsl12_fff = |w: u32| (w & 0xffff_fc00) == (0x5140_0000 | (0xfff << 10));
+        let is_movz_shifted = |w: u32| (w & 0xff80_0000) == 0xd280_0000 && ((w >> 21) & 3) != 0;
+        let is_movz_or_movk = |w: u32| (w & 0xdf80_0000) == 0xd280_0000;
+        let is_orr_imm = |w: u32| (w & 0x7f80_0000) == 0x3200_0000;
+        let is_cmp_reg = |w: u32| (w & 0x7fe0_001f) == 0x6b00_001f;
+
+        {
+            let w = decode_words(&emit_i32_ult_br.code, alloc);
+            assert_eq!(
+                w.iter().filter(|&&x| is_cmp32_lsl12_400(x)).count(),
+                1,
+                "expected 1 `cmp wN, #0x400, lsl #12`, words={w:#x?}"
+            );
+            assert_eq!(
+                w.iter().filter(|&&x| is_movz_shifted(x)).count(),
+                0,
+                "must not materialize `0x400000` via shifted movz, words={w:#x?}"
+            );
+            assert_eq!(
+                w.iter().filter(|&&x| is_cmp_reg(x)).count(),
+                0,
+                "must not emit register `cmp w, w`, words={w:#x?}"
+            );
+        }
+        {
+            let w = decode_words(&emit_i64_eq.code, alloc);
+            assert_eq!(
+                w.iter().filter(|&&x| is_cmp64_lsl12_fff(x)).count(),
+                1,
+                "expected 1 `cmp xN, #0xfff, lsl #12`, words={w:#x?}"
+            );
+            assert_eq!(
+                w.iter().filter(|&&x| is_movz_or_movk(x)).count(),
+                0,
+                "must not materialize `0xfff000` via movz/movk, words={w:#x?}"
+            );
+            assert_eq!(
+                w.iter().filter(|&&x| is_orr_imm(x)).count(),
+                0,
+                "must not materialize `0xfff000` via orr #imm, words={w:#x?}"
+            );
+            assert_eq!(
+                w.iter().filter(|&&x| is_cmp_reg(x)).count(),
+                0,
+                "must not emit register `cmp x, x`, words={w:#x?}"
+            );
+        }
+        {
+            let w = decode_words(&emit_add_sub.code, alloc);
+            assert_eq!(
+                w.iter().filter(|&&x| is_add64_lsl12_400(x)).count(),
+                1,
+                "expected 1 `add xD, xN, #0x400, lsl #12`, words={w:#x?}"
+            );
+            assert_eq!(
+                w.iter().filter(|&&x| is_sub32_lsl12_fff(x)).count(),
+                1,
+                "expected 1 `sub wD, wN, #0xfff, lsl #12`, words={w:#x?}"
+            );
+            assert_eq!(
+                w.iter().filter(|&&x| is_movz_or_movk(x)).count(),
+                0,
+                "must not materialize shifted-12 add/sub immediates via movz/movk, words={w:#x?}"
+            );
+            assert_eq!(
+                w.iter().filter(|&&x| is_orr_imm(x)).count(),
+                0,
+                "must not materialize shifted-12 add/sub immediates via orr #imm, words={w:#x?}"
+            );
+        }
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let ex32 = exec_leaf(emit_i32_ult_br);
+            // SAFETY: `ex32` contains freshly emitted AArch64 code matching `(u64) -> u64`.
+            let f32_ult: extern "C" fn(u64) -> u64 = unsafe { ex32.as_fn() };
+            for &x in &[
+                0u64,
+                1,
+                0x3f_ffff,
+                0x40_0000,
+                0x40_0001,
+                0xff_f000,
+                u64::from(u32::MAX),
+                0xdead_beef_003f_ffff,
+                0xdead_beef_0040_0000,
+                0xdead_beef_0040_0001,
+                u64::MAX,
+            ] {
+                let want = if (x & 0xffff_ffff) < 0x0040_0000 { 111 } else { 222 };
+                assert_eq!(f32_ult(x), want, "i32 shifted-imm12 Ult mismatch for x={x:#x}");
+            }
+
+            let ex64 = exec_leaf(emit_i64_eq);
+            // SAFETY: `ex64` contains freshly emitted AArch64 code matching `(u64) -> u64`.
+            let f64_eq: extern "C" fn(u64) -> u64 = unsafe { ex64.as_fn() };
+            for &x in &[
+                0u64,
+                0x3f_ffff,
+                0x40_0000,
+                0x40_0001,
+                0xff_efff,
+                0xff_f000,
+                0xff_f001,
+                u64::from(u32::MAX),
+                0xdead_beef_00ff_f000,
+                0x0000_0001_00ff_f000,
+                u64::MAX,
+            ] {
+                let want = u64::from(x == 0x00ff_f000);
+                assert_eq!(f64_eq(x), want, "i64 shifted-imm12 Eq mismatch for x={x:#x}");
+            }
+
+            let ex_as = exec_leaf(emit_add_sub);
+            // SAFETY: `ex_as` contains freshly emitted AArch64 code matching `(u64, u64) -> u64`.
+            let f_as: extern "C" fn(u64, u64) -> u64 = unsafe { ex_as.as_fn() };
+            for &x in &[0u64, 0x3f_ffff, 0x40_0000, 0xff_f000, u64::from(u32::MAX), u64::MAX] {
+                for &y in &[
+                    0u64,
+                    0x40_0000,
+                    0xff_f000,
+                    u64::from(u32::MAX),
+                    0xdead_beef_00ff_f000,
+                    0xdead_beef_003f_ffff,
+                ] {
+                    let a = x.wrapping_add(0x0040_0000);
+                    let d = u64::from(super::trunc_u32(y).wrapping_sub(0x00ff_f000));
+                    assert_eq!(f_as(x, y), a ^ d, "add/sub shifted-imm12 mismatch for x={x:#x} y={y:#x}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn loop_diamond_merge_is_not_nop_aligned_only_true_rpo_loop_header() {
+        let alloc = test_alloc();
+        // Loop with an `if/else` diamond inside its body:
+        // `entry -> loop_hdr -> {then_blk, else_blk} -> merge_blk -> loop_hdr / exit_blk`.
+        // `compute_hot_emit_layout` places off-spine `else_blk` AFTER `merge_blk`, creating a
+        // backward jump in emitted layout (`else_blk -> merge_blk`) that is NOT an RPO backedge.
+        // Only `loop_hdr` (a true RPO loop header) may receive 16B `nop` alignment; `merge_blk`
+        // must NOT receive `nop` padding on the hot fallthrough path inside the loop!
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        let loop_hdr = b.create_block(BlockKind::Normal);
+        let then_blk = b.create_block(BlockKind::Normal);
+        let else_blk = b.create_block(BlockKind::Normal);
+        let merge_blk = b.create_block(BlockKind::Normal);
+        let exit_blk = b.create_block(BlockKind::Normal);
+
+        b.begin(entry);
+        let n = b.param(Ty::I64);
+        let mask = b.param(Ty::I64);
+        let seed = b.param(Ty::I64);
+        let c0 = b.iconst(Ty::I64, 0);
+        let c1 = b.iconst(Ty::I64, 1);
+        let c3 = b.iconst(Ty::I64, 3);
+        let c7 = b.iconst(Ty::I64, 7);
+        b.jump((loop_hdr, &[c0, seed]));
+
+        b.begin(loop_hdr);
+        let i = b.param(Ty::I64);
+        let acc = b.param(Ty::I64);
+        let masked = b.binary(Op::And, Flags::NONE, i, mask);
+        let is_zero = b.icmp(IntCond::Eq, masked, c0);
+        b.br(Flags::EXPECT_TRUE, is_zero, (then_blk, &[]), (else_blk, &[]));
+
+        b.begin(then_blk);
+        let acc_t = b.binary(Op::Add, Flags::NONE, acc, c3);
+        b.jump((merge_blk, &[acc_t]));
+
+        b.begin(else_blk);
+        let acc_e = b.binary(Op::Xor, Flags::NONE, acc, c7);
+        b.jump((merge_blk, &[acc_e]));
+
+        b.begin(merge_blk);
+        let acc_m = b.param(Ty::I64);
+        let i_next = b.binary(Op::Add, Flags::NONE, i, c1);
+        let cont = b.icmp(IntCond::Ult, i_next, n);
+        b.br(Flags::NONE, cont, (loop_hdr, &[i_next, acc_m]), (exit_blk, &[acc_m]));
+
+        b.begin(exit_blk);
+        let res = b.param(Ty::I64);
+        b.ret(&[res]);
+
+        let func = b.finish_checked().expect("loop diamond LIR builds");
+        let view = func.view();
+
+        let layout = super::compute_hot_emit_layout(&view, alloc);
+        let idx_of = |blk: blaze_lir::Block| super::to_idx(blk.0);
+        let pos_of = |blk: blaze_lir::Block| {
+            let target = idx_of(blk);
+            layout
+                .order
+                .iter()
+                .position(|&x| x == target)
+                .expect("block must appear in emit order")
+        };
+        assert!(
+            super::at_bool(&layout.is_loop_hdr, idx_of(loop_hdr)),
+            "loop_hdr must be marked as a true RPO loop header"
+        );
+        assert!(
+            !super::at_bool(&layout.is_loop_hdr, idx_of(merge_blk)),
+            "merge_blk is a diamond merge, NOT a loop header"
+        );
+        assert!(
+            pos_of(else_blk) > pos_of(merge_blk),
+            "off-spine else_blk must be placed after merge_blk, order={:?}",
+            layout.order
+        );
+
+        let emitted = emit_sota_a64(view, &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+            .expect("loop diamond emits");
+        let words = decode_words(&emitted.code, alloc);
+
+        let branch_delta = |w: u32| -> Option<i32> {
+            if (w & 0xfc00_0000) == 0x1400_0000 {
+                let imm26 = w & 0x3ff_ffff;
+                Some(((imm26 << 6).cast_signed()) >> 6)
+            } else if (w & 0xff00_0010) == 0x5400_0000 || (w & 0x7e00_0000) == 0x3400_0000 {
+                let imm19 = (w >> 5) & 0x7_ffff;
+                Some(((imm19 << 13).cast_signed()) >> 13)
+            } else if (w & 0x7e00_0000) == 0x3600_0000 {
+                let imm14 = (w >> 5) & 0x3fff;
+                Some(((imm14 << 18).cast_signed()) >> 18)
+            } else {
+                None
+            }
+        };
+
+        let loop_hdr_word = words
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, &w)| {
+                let d = branch_delta(w)?;
+                if d < 0 {
+                    idx.checked_add_signed(isize::try_from(d).ok()?)
+                } else {
+                    None
+                }
+            })
+            .min()
+            .expect("expected backward branch targeting loop_hdr");
+
+        assert!(loop_hdr_word > 0, "entry block must precede loop header, words={words:#x?}");
+        assert_eq!(
+            loop_hdr_word % 4,
+            0,
+            "true RPO loop header must be 16-byte (4-word) aligned, loop_hdr_word={loop_hdr_word}, words={words:#x?}"
+        );
+
+        let nop = super::enc::nop();
+        assert_eq!(nop, 0xd503_201f);
+        let nops_after_hdr = words[loop_hdr_word..].iter().filter(|&&w| w == nop).count();
+        assert_eq!(
+            nops_after_hdr, 0,
+            "expected ZERO nops after loop_hdr's first instruction, loop_hdr_word={loop_hdr_word}, words={words:#x?}"
+        );
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let ex = exec_leaf(emitted);
+            // SAFETY: `ex` contains freshly emitted AArch64 code matching `(u64, u64, u64) -> u64`.
+            let f: extern "C" fn(u64, u64, u64) -> u64 = unsafe { ex.as_fn() };
+            for &(n, mask, seed) in &[(1u64, 1u64, 10u64), (5, 1, 0), (16, 3, 42), (32, 0, 7)] {
+                let mut want = seed;
+                for i in 0..n {
+                    if (i & mask) == 0 {
+                        want = want.wrapping_add(3);
+                    } else {
+                        want ^= 7;
+                    }
+                }
+                assert_eq!(f(n, mask, seed), want, "n={n} mask={mask} seed={seed}");
             }
         }
     }

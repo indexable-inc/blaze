@@ -1,30 +1,30 @@
 //! RFC 8878 Zstandard frame and block compressor: reusable [`ZstdEncoder`] context,
-//! 1-way 10-bit-tagged `hash7` Fast (64 KiB table, 512 KiB window) and Double-Fast `hash8` +
-//! `hash4` (512 KiB tables, 2 MiB window) LZ77 scanners, Treeless-reusing 4-stream Huffman
-//! literals, custom/seeded/RLE FSE sequence tables, and zero-bounds-check reverse FSE bit-packing.
+//! 10-bit-tagged `hash7` Fast (`16K` = 64 KiB table, `minMatch = 7`, 1 MiB window) and
+//! 10-bit-tagged Double-Fast `hash8` + `hash5` (`64K` + `32K` = 384 KiB tables, 2 MiB window)
+//! LZ77 scanners, Treeless-reusing 4-stream Huffman literals, custom/RLE/predefined FSE sequence
+//! tables, and zero-bounds-check reverse FSE bit-packing.
 
 use core::alloc::Allocator;
 
 use blaze_own::{
-    FseSeqEncTables, Int, LZ77_DEF_BUCKETS, LZ77_FAST_HASH_SIZE, Pow2Array, SeqOp, Vec,
-    fse_pack_sequences_fast, lz77_scan_default, lz77_scan_fast,
+    FseSeqEncTables, Int, LZ77_DEF_BUCKETS, LZ77_FAST_HASH_SIZE, SeqOp, Vec,
+    count_seq_symbols_fast, fse_pack_sequences_fast, lz77_scan_default, lz77_scan_fast,
 };
 
 use crate::dict::ZstdDict;
 use crate::fse::{
-    FseDecTable, FseEncTable, LL_DEFAULT_LOG, LL_DEFAULT_NORM, LL_ENC_PACKED, LL_MAX_CODE,
-    ML_DEFAULT_LOG, ML_DEFAULT_NORM, ML_ENC_PACKED, ML_MAX_CODE, OF_DEFAULT_LOG, OF_DEFAULT_NORM,
-    OF_MAX_CODE, encode_ll_fast, encode_ml_fast, encode_of_fast, ll_code_raw, ml_code_raw,
-    normalize_fse_counts, of_code_raw, write_fse_header,
+    FseEncTable, LL_DEFAULT_LOG, LL_DEFAULT_NORM, LL_ENC_PACKED, LL_MAX_CODE, ML_DEFAULT_LOG,
+    ML_DEFAULT_NORM, ML_ENC_PACKED, ML_MAX_CODE, OF_DEFAULT_LOG, OF_DEFAULT_NORM, encode_ll_fast,
+    encode_ml_fast, encode_of_fast, normalize_fse_counts, write_fse_header,
 };
 use crate::huffman::{HuffEncCache, encode_huffman_literals_into};
 use crate::xxh64::xxh64;
 use crate::{CompressOpts, Level, MAX_BLOCK_SIZE, ZSTD_MAGIC, ZstdError};
 
-/// 512 KiB sliding window for `Level::Fast` (matches C `zstd -1`, `wlog = 19`).
-const MAX_WINDOW_FAST: usize = 1 << 19;
-/// Window_Descriptor for exact 512 KiB window: exponent = 9, mantissa = 0 (`1 << (10 + 9)`).
-const WINDOW_DESC_512K: u8 = 9u8 << 3;
+/// 1 MiB sliding window for `Level::Fast` (matches C `zstd -1`, `wlog = 20`).
+const MAX_WINDOW_FAST: usize = 1 << 20;
+/// Window_Descriptor for exact 1 MiB window: exponent = 10, mantissa = 0 (`1 << (10 + 10)`).
+const WINDOW_DESC_1M: u8 = 10u8 << 3;
 /// 2 MiB sliding window for `Level::Default` (matches C `zstd -3`, `wlog = 21`).
 const MAX_WINDOW_DEFAULT: usize = 1 << 21;
 /// Window_Descriptor for exact 2 MiB window: exponent = 11, mantissa = 0 (`1 << (10 + 11)`).
@@ -139,15 +139,14 @@ struct PredefinedEncTables {
 
 impl PredefinedEncTables {
     fn build() -> Result<Self, ZstdError> {
-        let mut dec = FseDecTable::new_empty();
-        dec.build_from_norm(&LL_DEFAULT_NORM, LL_DEFAULT_LOG)?;
-        let ll = FseEncTable::build_from_dec(&dec)?;
+        let mut ll = FseEncTable::new_empty();
+        ll.rebuild_from_norm(&LL_DEFAULT_NORM, LL_DEFAULT_LOG)?;
 
-        dec.build_from_norm(&OF_DEFAULT_NORM, OF_DEFAULT_LOG)?;
-        let of = FseEncTable::build_from_dec(&dec)?;
+        let mut of = FseEncTable::new_empty();
+        of.rebuild_from_norm(&OF_DEFAULT_NORM, OF_DEFAULT_LOG)?;
 
-        dec.build_from_norm(&ML_DEFAULT_NORM, ML_DEFAULT_LOG)?;
-        let ml = FseEncTable::build_from_dec(&dec)?;
+        let mut ml = FseEncTable::new_empty();
+        ml.rebuild_from_norm(&ML_DEFAULT_NORM, ML_DEFAULT_LOG)?;
 
         let mut packed = FseSeqEncTables::new_zeroed();
         ll.write_ll_into(&mut packed);
@@ -200,49 +199,35 @@ fn pack_raw_sequences_fse<A: Allocator>(
     Ok(())
 }
 
-/// Zero-spill leaf sequence symbol histogrammer using power-of-two masked counters so every
-/// counter pointer and LUT base stays register-resident across the entire block.
-#[inline(never)]
-fn count_seq_symbols(
-    raw_seqs: &[SeqOp],
-    ll_counts: &mut Pow2Array<u32, 64>,
-    of_counts: &mut Pow2Array<u32, 32>,
-    ml_counts: &mut Pow2Array<u32, 64>,
-) {
-    for raw in raw_seqs {
-        let ll_c = ll_code_raw(raw.lit_len);
-        let ml_c = ml_code_raw(raw.match_len);
-        let of_c = of_code_raw(raw.offset);
-        ll_counts.set_masked(ll_c, ll_counts.get_masked(ll_c).wrapping_add(1));
-        of_counts.set_masked(of_c, of_counts.get_masked(of_c).wrapping_add(1));
-        ml_counts.set_masked(ml_c, ml_counts.get_masked(ml_c).wrapping_add(1));
-    }
-}
-
-/// Choose between `RLE_Mode (1)`, `FSE_Compressed_Mode (2)`, or `Predefined_Mode (0)` for one
-/// sequence code stream (`LL`, `OF`, or `ML`).
+/// Choose between `Predefined_Mode (0)`, `RLE_Mode (1)`, `FSE_Compressed_Mode (2)`, or
+/// `Repeat_Mode (3)` for one sequence code stream (`LL`, `OF`, or `ML`).
 enum SeqTableChoice {
     Predefined,
     Rle(u8),
     Custom { norm: [i16; 64], max_sym: usize, log: u8 },
+    Repeat,
+}
+
+#[inline]
+fn symbol_mask(counts: &[u32]) -> u64 {
+    let mut mask: u64 = 0;
+    for (sym, &c) in counts.iter().take(64).enumerate() {
+        if c > 0 {
+            mask |= 1u64 << sym;
+        }
+    }
+    mask
 }
 
 fn plan_seq_table(
     counts: &[u32],
+    cur_mask: u64,
     total: u32,
     target_log: u8,
-    scratch_dec: &mut FseDecTable,
     custom_enc: &mut FseEncTable,
 ) -> SeqTableChoice {
-    let mut distinct: usize = 0;
-    let mut only_sym: u8 = 0;
-    for (sym, &c) in counts.iter().enumerate() {
-        if c > 0 {
-            distinct += 1;
-            only_sym = sym.truncate_to::<u8>();
-        }
-    }
-    if distinct == 1 {
+    if cur_mask.count_ones() == 1 {
+        let only_sym = cur_mask.trailing_zeros().truncate_to::<u8>();
         if custom_enc.set_rle(only_sym).is_ok() {
             return SeqTableChoice::Rle(only_sym);
         }
@@ -251,12 +236,24 @@ fn plan_seq_table(
     let mut norm = [0i16; 64];
     if let Some(max_sym) = normalize_fse_counts(counts, total, target_log, &mut norm)
         && let Some(norm_slice) = norm.get(..=max_sym)
-        && scratch_dec.build_from_norm(norm_slice, target_log).is_ok()
-        && custom_enc.rebuild_from_dec(scratch_dec).is_ok()
+        && custom_enc.rebuild_from_norm(norm_slice, target_log).is_ok()
     {
         return SeqTableChoice::Custom { norm, max_sym, log: target_log };
     }
     SeqTableChoice::Predefined
+}
+
+/// Bitmasks of symbols present in the last committed custom/RLE FSE table for each sequence stream.
+/// A zero mask indicates no reusable custom/RLE table is currently committed for that stream.
+#[derive(Copy, Clone)]
+struct SeqMasks {
+    ll: u64,
+    of: u64,
+    ml: u64,
+}
+
+impl SeqMasks {
+    const EMPTY: Self = Self { ll: 0, of: 0, ml: 0 };
 }
 
 /// Per-block entropy and scratch state split out of [`ZstdEncoder`] so the LZ77 hash-table array
@@ -264,12 +261,11 @@ fn plan_seq_table(
 /// [`BlockEncState::encode_compressed_block`].
 struct BlockEncState<A: Allocator + Copy> {
     predef: PredefinedEncTables,
-    scratch_dec: FseDecTable,
     custom_ll: FseEncTable,
     custom_of: FseEncTable,
     custom_ml: FseEncTable,
-    packed_custom: FseSeqEncTables,
     packed_active: FseSeqEncTables,
+    committed_fse: SeqMasks,
     literals_buf: Vec<u8, A>,
     raw_seqs: Vec<SeqOp, A>,
     comp_buf: Vec<u8, A>,
@@ -281,6 +277,12 @@ struct BlockEncState<A: Allocator + Copy> {
 enum ActiveTable<'a> {
     Fast(&'a mut [u32; LZ77_FAST_HASH_SIZE]),
     Default(&'a mut [u64; LZ77_DEF_BUCKETS]),
+}
+
+#[derive(Copy, Clone)]
+enum BlockFseMode {
+    Predefined { reuse: bool },
+    Custom { fast_mode: bool, allow_repeat: bool },
 }
 
 /// Reusable RFC 8878 Zstandard compressor context.
@@ -301,12 +303,11 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
         Ok(Self {
             block: BlockEncState {
                 predef: PredefinedEncTables::build()?,
-                scratch_dec: FseDecTable::new_empty(),
                 custom_ll: FseEncTable::new_empty(),
                 custom_of: FseEncTable::new_empty(),
                 custom_ml: FseEncTable::new_empty(),
-                packed_custom: FseSeqEncTables::new_zeroed(),
                 packed_active: FseSeqEncTables::new_zeroed(),
+                committed_fse: SeqMasks::EMPTY,
                 literals_buf: Vec::new_in(alloc),
                 raw_seqs: Vec::new_in(alloc),
                 comp_buf: Vec::new_in(alloc),
@@ -409,7 +410,7 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
         out.try_push(fhd).map_err(|r| r.why)?;
 
         if !single_segment {
-            let window_desc = if fast_mode { WINDOW_DESC_512K } else { WINDOW_DESC_2M };
+            let window_desc = if fast_mode { WINDOW_DESC_1M } else { WINDOW_DESC_2M };
             out.try_push(window_desc).map_err(|r| r.why)?;
         }
 
@@ -467,6 +468,7 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
                 0
             };
             self.block.huff_cache.reset();
+            self.block.committed_fse = SeqMasks::EMPTY;
 
             // Hoist the frame scan slice and fixed-length hash-table array borrow once per frame
             // so the per-block loop pays zero slice/array `Option`/`Result` checks.
@@ -491,11 +493,17 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
 
             let mut rep = [1usize, 4usize, 8usize];
             let mut emitted_predef_fse = false;
-            let mut has_fast_custom_fse = false;
+            let mut block_idx: usize = 0;
             let scan_end = dict_len.saturating_add(input.len());
             let mut block_start: usize = dict_len;
 
             while block_start < scan_end {
+                let allow_repeat = if fast_mode {
+                    (block_idx & 7) != 0
+                } else {
+                    (block_idx & 1) != 0
+                };
+                block_idx = block_idx.wrapping_add(1);
                 let block_end = block_start.saturating_add(MAX_BLOCK_SIZE).min(scan_end);
                 let last_block = block_end == scan_end;
                 let block_len = block_end.saturating_sub(block_start);
@@ -541,28 +549,24 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
                 }
 
                 if !self.block.raw_seqs.is_empty() {
-                    let use_custom_fse = !fast_mode && self.block.raw_seqs.len() >= 128;
-                    let built_fast_custom = self.block.encode_compressed_block(
-                        fast_mode,
-                        use_custom_fse,
-                        emitted_predef_fse && !use_custom_fse,
-                        has_fast_custom_fse,
-                    )?;
+                    let fse_mode = if self.block.raw_seqs.len() >= 128 {
+                        BlockFseMode::Custom { fast_mode, allow_repeat }
+                    } else {
+                        BlockFseMode::Predefined { reuse: emitted_predef_fse }
+                    };
+                    let next_fse = self.block.encode_compressed_block(fse_mode)?;
                     if self.block.comp_buf.len() < block_len {
                         write_block_header(out, last_block, 2, self.block.comp_buf.len())?;
                         out.try_extend_from_slice(self.block.comp_buf.as_slice())?;
                         rep = trial_rep;
                         self.block.huff_cache.commit();
-                        if built_fast_custom {
-                            has_fast_custom_fse = true;
-                            emitted_predef_fse = false;
-                        } else if !has_fast_custom_fse {
-                            emitted_predef_fse = !use_custom_fse;
-                        }
+                        self.block.committed_fse = next_fse;
+                        emitted_predef_fse = matches!(fse_mode, BlockFseMode::Predefined { .. });
                         block_start = block_end;
                         continue;
                     }
                     self.block.huff_cache.discard();
+                    self.block.committed_fse = SeqMasks::EMPTY;
                 }
 
                 write_block_header(out, last_block, 0, input_block.len())?;
@@ -582,13 +586,11 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
 }
 
 impl<A: Allocator + Copy> BlockEncState<A> {
-    fn encode_compressed_block(
-        &mut self,
-        fast_mode: bool,
-        use_custom_fse: bool,
-        reuse_predef_fse: bool,
-        has_fast_custom_fse: bool,
-    ) -> Result<bool, ZstdError> {
+    fn encode_compressed_block(&mut self, fse_mode: BlockFseMode) -> Result<SeqMasks, ZstdError> {
+        let (fast_mode, allow_repeat) = match fse_mode {
+            BlockFseMode::Custom { fast_mode, allow_repeat } => (fast_mode, allow_repeat),
+            BlockFseMode::Predefined { .. } => (false, false),
+        };
         self.comp_buf.clear();
         if !encode_huffman_literals_into(
             self.literals_buf.as_slice(),
@@ -602,119 +604,100 @@ impl<A: Allocator + Copy> BlockEncState<A> {
             self.comp_buf.try_extend_from_slice(self.literals_buf.as_slice())?;
         }
 
-        if fast_mode {
-            write_num_sequences(&mut self.comp_buf, self.raw_seqs.len())?;
-            if has_fast_custom_fse {
-                // Repeat all three block-0 seeded custom FSE tables (`0xFC`).
-                self.comp_buf.try_push(0xFC).map_err(|r| r.why)?;
+        match fse_mode {
+            BlockFseMode::Predefined { reuse } => {
+                write_num_sequences(&mut self.comp_buf, self.raw_seqs.len())?;
+                let mode_byte: u8 = if reuse { 0xFC } else { 0x00 };
+                self.comp_buf.try_push(mode_byte).map_err(|r| r.why)?;
                 pack_raw_sequences_fse(
                     self.raw_seqs.as_slice(),
-                    &self.custom_ll,
-                    &self.custom_of,
-                    &self.custom_ml,
-                    &self.packed_custom,
+                    &self.predef.ll,
+                    &self.predef.of,
+                    &self.predef.ml,
+                    &self.predef.packed,
                     &mut self.comp_buf,
                 )?;
-                return Ok(false);
+                return Ok(SeqMasks::EMPTY);
             }
-            if self.raw_seqs.len() >= 128
-                && self.try_build_fast_seeded_fse()?
-            {
-                pack_raw_sequences_fse(
-                    self.raw_seqs.as_slice(),
-                    &self.custom_ll,
-                    &self.custom_of,
-                    &self.custom_ml,
-                    &self.packed_custom,
-                    &mut self.comp_buf,
-                )?;
-                return Ok(true);
-            }
-            let mode_byte: u8 = if reuse_predef_fse { 0xFC } else { 0x00 };
-            self.comp_buf.try_push(mode_byte).map_err(|r| r.why)?;
-            pack_raw_sequences_fse(
-                self.raw_seqs.as_slice(),
-                &self.predef.ll,
-                &self.predef.of,
-                &self.predef.ml,
-                &self.predef.packed,
-                &mut self.comp_buf,
-            )?;
-            return Ok(false);
+            BlockFseMode::Custom { .. } => {}
         }
 
-        if !use_custom_fse {
-            write_num_sequences(&mut self.comp_buf, self.raw_seqs.len())?;
-            let mode_byte: u8 = if reuse_predef_fse { 0xFC } else { 0x00 };
-            self.comp_buf.try_push(mode_byte).map_err(|r| r.why)?;
-            pack_raw_sequences_fse(
-                self.raw_seqs.as_slice(),
-                &self.predef.ll,
-                &self.predef.of,
-                &self.predef.ml,
-                &self.predef.packed,
-                &mut self.comp_buf,
-            )?;
-            return Ok(false);
-        }
-
-        let mut ll_counts = Pow2Array::<u32, 64>::splat(0);
-        let mut of_counts = Pow2Array::<u32, 32>::splat(0);
-        let mut ml_counts = Pow2Array::<u32, 64>::splat(0);
+        let mut ll_counts = [0u32; 64];
+        let mut of_counts = [0u32; 32];
+        let mut ml_counts = [0u32; 64];
         let raw_seqs = self.raw_seqs.as_slice();
-        count_seq_symbols(raw_seqs, &mut ll_counts, &mut of_counts, &mut ml_counts);
+        count_seq_symbols_fast(
+            raw_seqs,
+            &LL_ENC_PACKED,
+            &ML_ENC_PACKED,
+            &mut ll_counts,
+            &mut of_counts,
+            &mut ml_counts,
+        );
 
         write_num_sequences(&mut self.comp_buf, raw_seqs.len())?;
 
-        let (ll_tbl, of_tbl, ml_tbl, packed): (
+        let (ll_tbl, of_tbl, ml_tbl, packed, next_masks): (
             &FseEncTable,
             &FseEncTable,
             &FseEncTable,
             &FseSeqEncTables,
+            SeqMasks,
         ) = {
             let total = u32::try_from(raw_seqs.len()).map_err(|_| ZstdError::CorruptSequences)?;
 
             let (ll_log, of_log, ml_log) =
                 if raw_seqs.len() >= 1_024 { (8, 7, 8) } else { (6, 6, 6) };
-            let ll_slice = ll_counts.as_slice().get(..=LL_MAX_CODE).unwrap_or(&[]);
-            let of_slice = of_counts.as_slice();
-            let ml_slice = ml_counts.as_slice().get(..=ML_MAX_CODE).unwrap_or(&[]);
-            let ll_choice = plan_seq_table(
-                ll_slice,
-                total,
-                ll_log,
-                &mut self.scratch_dec,
-                &mut self.custom_ll,
-            );
-            let of_choice = plan_seq_table(
-                of_slice,
-                total,
-                of_log,
-                &mut self.scratch_dec,
-                &mut self.custom_of,
-            );
-            let ml_choice = plan_seq_table(
-                ml_slice,
-                total,
-                ml_log,
-                &mut self.scratch_dec,
-                &mut self.custom_ml,
-            );
+            let ll_slice = ll_counts.get(..=LL_MAX_CODE).unwrap_or(&[]);
+            let of_slice: &[u32] = &of_counts;
+            let ml_slice = ml_counts.get(..=ML_MAX_CODE).unwrap_or(&[]);
+
+            let ll_mask = symbol_mask(ll_slice);
+            let of_mask = symbol_mask(of_slice);
+            let ml_mask = symbol_mask(ml_slice);
+
+            let ll_choice = if allow_repeat
+                && self.committed_fse.ll != 0
+                && (ll_mask & !self.committed_fse.ll) == 0
+            {
+                SeqTableChoice::Repeat
+            } else {
+                plan_seq_table(ll_slice, ll_mask, total, ll_log, &mut self.custom_ll)
+            };
+            let of_choice = if allow_repeat
+                && self.committed_fse.of != 0
+                && (of_mask & !self.committed_fse.of) == 0
+            {
+                SeqTableChoice::Repeat
+            } else {
+                plan_seq_table(of_slice, of_mask, total, of_log, &mut self.custom_of)
+            };
+            let ml_choice = if allow_repeat
+                && self.committed_fse.ml != 0
+                && (ml_mask & !self.committed_fse.ml) == 0
+            {
+                SeqTableChoice::Repeat
+            } else {
+                plan_seq_table(ml_slice, ml_mask, total, ml_log, &mut self.custom_ml)
+            };
 
             let ll_mode: u8 = match ll_choice {
                 SeqTableChoice::Predefined => 0,
                 SeqTableChoice::Rle(_) => 1,
                 SeqTableChoice::Custom { .. } => 2,
+                SeqTableChoice::Repeat => 3,
             };
             let of_mode: u8 = match of_choice {
                 SeqTableChoice::Predefined => 0,
                 SeqTableChoice::Rle(_) => 1,
                 SeqTableChoice::Custom { .. } => 2,
+                SeqTableChoice::Repeat => 3,
             };
             let ml_mode: u8 = match ml_choice {
                 SeqTableChoice::Predefined => 0,
                 SeqTableChoice::Rle(_) => 1,
                 SeqTableChoice::Custom { .. } => 2,
+                SeqTableChoice::Repeat => 3,
             };
             let mode_byte = (ll_mode << 6) | (of_mode << 4) | (ml_mode << 2);
             self.comp_buf.try_push(mode_byte).map_err(|r| r.why)?;
@@ -722,7 +705,7 @@ impl<A: Allocator + Copy> BlockEncState<A> {
             // Emit FSE / RLE table descriptions in RFC 8878 §3.1.1.3.2 order: LL, OF, ML.
             for choice in [&ll_choice, &of_choice, &ml_choice] {
                 match *choice {
-                    SeqTableChoice::Predefined => {}
+                    SeqTableChoice::Predefined | SeqTableChoice::Repeat => {}
                     SeqTableChoice::Rle(sym) => {
                         self.comp_buf.try_push(sym).map_err(|r| r.why)?;
                     }
@@ -735,98 +718,66 @@ impl<A: Allocator + Copy> BlockEncState<A> {
 
             let ll_t = match ll_choice {
                 SeqTableChoice::Predefined => &self.predef.ll,
-                SeqTableChoice::Rle(_) | SeqTableChoice::Custom { .. } => &self.custom_ll,
+                SeqTableChoice::Rle(_) | SeqTableChoice::Custom { .. } | SeqTableChoice::Repeat => {
+                    &self.custom_ll
+                }
             };
             let of_t = match of_choice {
                 SeqTableChoice::Predefined => &self.predef.of,
-                SeqTableChoice::Rle(_) | SeqTableChoice::Custom { .. } => &self.custom_of,
+                SeqTableChoice::Rle(_) | SeqTableChoice::Custom { .. } | SeqTableChoice::Repeat => {
+                    &self.custom_of
+                }
             };
             let ml_t = match ml_choice {
                 SeqTableChoice::Predefined => &self.predef.ml,
-                SeqTableChoice::Rle(_) | SeqTableChoice::Custom { .. } => &self.custom_ml,
+                SeqTableChoice::Rle(_) | SeqTableChoice::Custom { .. } | SeqTableChoice::Repeat => {
+                    &self.custom_ml
+                }
             };
+
+            let next_masks = SeqMasks {
+                ll: match ll_choice {
+                    SeqTableChoice::Predefined => 0,
+                    SeqTableChoice::Repeat => self.committed_fse.ll,
+                    SeqTableChoice::Rle(_) | SeqTableChoice::Custom { .. } => {
+                        self.custom_ll.present_mask()
+                    }
+                },
+                of: match of_choice {
+                    SeqTableChoice::Predefined => 0,
+                    SeqTableChoice::Repeat => self.committed_fse.of,
+                    SeqTableChoice::Rle(_) | SeqTableChoice::Custom { .. } => {
+                        self.custom_of.present_mask()
+                    }
+                },
+                ml: match ml_choice {
+                    SeqTableChoice::Predefined => 0,
+                    SeqTableChoice::Repeat => self.committed_fse.ml,
+                    SeqTableChoice::Rle(_) | SeqTableChoice::Custom { .. } => {
+                        self.custom_ml.present_mask()
+                    }
+                },
+            };
+
             let packed_ref: &FseSeqEncTables = if mode_byte == 0 {
                 &self.predef.packed
             } else {
-                ll_t.write_ll_into(&mut self.packed_active);
-                of_t.write_of_into(&mut self.packed_active);
-                ml_t.write_ml_into(&mut self.packed_active);
+                if !matches!(ll_choice, SeqTableChoice::Repeat) {
+                    ll_t.write_ll_into(&mut self.packed_active);
+                }
+                if !matches!(of_choice, SeqTableChoice::Repeat) {
+                    of_t.write_of_into(&mut self.packed_active);
+                }
+                if !matches!(ml_choice, SeqTableChoice::Repeat) {
+                    ml_t.write_ml_into(&mut self.packed_active);
+                }
                 &self.packed_active
             };
-            (ll_t, of_t, ml_t, packed_ref)
+            (ll_t, of_t, ml_t, packed_ref, next_masks)
         };
 
         pack_raw_sequences_fse(raw_seqs, ll_tbl, of_tbl, ml_tbl, packed, &mut self.comp_buf)?;
-        Ok(false)
-    }
-
-    /// Build block-0 custom FSE tables for `Level::Fast` with every valid `LL`, `OF` (512 KiB
-    /// window), and `ML` code seeded to at least 1 so blocks 1..N can unconditionally reuse them
-    /// via `Repeat` mode (`0xFC`) in a single zero-histogram pass.
-    fn try_build_fast_seeded_fse(&mut self) -> Result<bool, ZstdError> {
-        let mut ll_counts = Pow2Array::<u32, 64>::splat(0);
-        let mut of_counts = Pow2Array::<u32, 32>::splat(0);
-        let mut ml_counts = Pow2Array::<u32, 64>::splat(0);
-        const FAST_MAX_OF_CODE: usize = 20;
-        if let Some(s) = ll_counts.as_mut_slice().get_mut(..=LL_MAX_CODE) {
-            s.fill(1);
-        }
-        if let Some(s) = of_counts.as_mut_slice().get_mut(..=FAST_MAX_OF_CODE) {
-            s.fill(1);
-        }
-        if let Some(s) = ml_counts.as_mut_slice().get_mut(..=ML_MAX_CODE) {
-            s.fill(1);
-        }
-
-        count_seq_symbols(self.raw_seqs.as_slice(), &mut ll_counts, &mut of_counts, &mut ml_counts);
-
-        let seq_n = self.raw_seqs.len().saturate::<u32>();
-        let ll_total = seq_n.saturating_add((LL_MAX_CODE + 1).truncate_to::<u32>());
-        let of_total = seq_n.saturating_add((FAST_MAX_OF_CODE + 1).truncate_to::<u32>());
-        let ml_total = seq_n.saturating_add((ML_MAX_CODE + 1).truncate_to::<u32>());
-
-        let mut ll_norm = [0i16; LL_MAX_CODE + 1];
-        let mut of_norm = [0i16; OF_MAX_CODE + 1];
-        let mut ml_norm = [0i16; ML_MAX_CODE + 1];
-
-        let ll_log: u8 = 8;
-        let of_log: u8 = 7;
-        let ml_log: u8 = 8;
-
-        let ll_slice_c = ll_counts.as_slice().get(..=LL_MAX_CODE).unwrap_or(&[]);
-        let of_slice_c = of_counts.as_slice();
-        let ml_slice_c = ml_counts.as_slice().get(..=ML_MAX_CODE).unwrap_or(&[]);
-
-        let Some(ll_max) = normalize_fse_counts(ll_slice_c, ll_total, ll_log, &mut ll_norm) else {
-            return Ok(false);
-        };
-        let Some(of_max) = normalize_fse_counts(of_slice_c, of_total, of_log, &mut of_norm) else {
-            return Ok(false);
-        };
-        let Some(ml_max) = normalize_fse_counts(ml_slice_c, ml_total, ml_log, &mut ml_norm) else {
-            return Ok(false);
-        };
-
-        let ll_slice = ll_norm.get(..=ll_max).ok_or(ZstdError::CorruptFse)?;
-        let of_slice = of_norm.get(..=of_max).ok_or(ZstdError::CorruptFse)?;
-        let ml_slice = ml_norm.get(..=ml_max).ok_or(ZstdError::CorruptFse)?;
-
-        self.scratch_dec.build_from_norm(ll_slice, ll_log)?;
-        self.custom_ll.rebuild_from_dec(&self.scratch_dec)?;
-        self.custom_ll.write_ll_into(&mut self.packed_custom);
-        self.scratch_dec.build_from_norm(of_slice, of_log)?;
-        self.custom_of.rebuild_from_dec(&self.scratch_dec)?;
-        self.custom_of.write_of_into(&mut self.packed_custom);
-        self.scratch_dec.build_from_norm(ml_slice, ml_log)?;
-        self.custom_ml.rebuild_from_dec(&self.scratch_dec)?;
-        self.custom_ml.write_ml_into(&mut self.packed_custom);
-
-        // Mode byte: LL=FSE(2), OF=FSE(2), ML=FSE(2) -> (2<<6)|(2<<4)|(2<<2) = 0xA8.
-        self.comp_buf.try_push(0xA8).map_err(|r| r.why)?;
-        write_fse_header(ll_slice, ll_log, &mut self.comp_buf)?;
-        write_fse_header(of_slice, of_log, &mut self.comp_buf)?;
-        write_fse_header(ml_slice, ml_log, &mut self.comp_buf)?;
-        Ok(true)
+        Ok(next_masks)
     }
 }
 

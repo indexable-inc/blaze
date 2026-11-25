@@ -746,15 +746,19 @@ enum LeafStop {
 /// - Uses 3-word [`RevBitSlack8`] (no cached `container` live across the copy body, no aggregate
 ///   struct copy) and pointer-based [`blaze_own::SeqExecCtx`] specialized on `WINDOW_FULL`,
 ///   keeping 16 loop-carried GPRs across the loop.
-/// - Bails `actual_offset < 8` out-of-line before [`blaze_own::SeqExecCtx::exec_leaf_fast`] so
-///   LLVM statically dead-code-eliminates the cold `copy_short_overlap_ptrs` call inside
-///   `exec_leaf_fast`, keeping this function a true call-free leaf with all 26 AArch64 GPRs
-///   available (instead of 10 callee-saved GPRs) and zero stack spills/reloads.
-/// - Splits bit extraction into two tight sequential phases (extra bits, then FSE next states)
-///   shifting `bits` in-place and updating `bf.bits_consumed` directly, retiring `e_ll`, `e_ml`,
-///   and `e_of` + `bits` one entry at a time so peak live GPRs stay minimal and all loop
-///   invariants remain register-resident with zero spills; updates `ll_state`/`of_state`/`ml_state`
-///   and `[r0, r1, r2]` in-place before execution.
+/// - Handles all valid offsets (`offset >= 1`, including `1 <= offset < 8`) inline inside
+///   [`blaze_own::SeqExecCtx::exec_leaf_fast`] with zero calls, keeping this function a true
+///   call-free leaf with all 26 AArch64 GPRs available (instead of 10 callee-saved GPRs) and
+///   zero stack spills/reloads.
+/// - Computes the total sequence bit width upfront via a packed SWAR sum of the top 16 bits of
+///   `e_ll`, `e_of`, and `e_ml`, updating `bf.bits_consumed` immediately and forking `bits` into
+///   two independent parallel shift chains (`win_fse = bits << total_extra_bits` for FSE next
+///   states first, then `bits` for extra bits, each with shift depth `<= 2`) so the loop-carried
+///   FSE state updates overlap with extra-bit extraction while keeping peak live GPRs within leaf
+///   registers with zero spills.
+/// - Updates `[r0, r1, r2]` before execution using adjacent same-condition selects (reusing NZCV
+///   flags with zero `cset`) and retiring old `r0` early so `actual_offset` co-colors directly
+///   into `r0`'s GPR with zero loop-backedge `mov`.
 /// - Returns `None` when `rem == 0` or `< 8` unread bitstream bytes remain, or `Some(seq)` when a
 ///   sequence requires out-of-line validation/execution (committing `writer`, `st.lit_pos`, and
 ///   `st.seq_idx` BEFORE `seq`, and `st.br`/FSE states/`st.rep` AFTER decoding `seq`).
@@ -788,71 +792,74 @@ fn decode_exec_leaf_single<const WINDOW_FULL: bool, A: Allocator>(
     );
 
     let bail: Option<SeqOp> = loop {
-        if rem == 0 {
-            break None;
-        }
-        let Some(mut bits) = bf.reload_window_slack8() else {
+        let Some(bits) = bf.reload_window_slack8() else {
             break None;
         };
         let e_ll = tables.entry_flat(ll_state);
         let e_of = tables.entry_flat(of_state);
         let e_ml = tables.entry_flat(ml_state);
 
-        // Phase 1 (RFC 8878 §3.1.1.4): extra bits (`of_eb`, `ml_eb`, `ll_eb`), shifting `bits`
-        // in-place and advancing `bf` directly so no extra `total` register stays live.
+        // Sum all 6 bit widths via packed SWAR on the top 16 bits (`extra_bits | (num_bits << 8)`):
+        // low byte sums `<= 16 + 31 + 16 = 63 < 256` (no carry into high byte), high byte sums
+        // `<= 9 + 8 + 9 = 26`. Here `total <= 56`, so `total_extra_bits <= 56 < 64` always.
+        let b_sum = (e_ll.0 >> 48) + (e_of.0 >> 48) + (e_ml.0 >> 48);
+        let total_extra_bits = b_sum & 0xFF;
+        bf.advance(total_extra_bits + (b_sum >> 8));
+
+        // Parallel 2-chain bit extraction (RFC 8878 §3.1.1.4): fork `bits` into independent FSE
+        // next-state (`win_fse`) and extra-bit (`bits`) chains, each with shift depth `<= 2`.
+        // Chain B runs first so the loop-carried `ll_state`/`ml_state`/`of_state` updates start
+        // immediately after `bits` loads (`ll_nb + ml_nb <= 18 < 64`).
+        let win_fse = bits << total_extra_bits;
+        let ll_nb = e_ll.num_bits_u64();
+        ll_state =
+            e_ll.baseline().wrapping_add(extract_top_u64(win_fse, ll_nb).truncate_to::<usize>());
+        let ml_nb = e_ml.num_bits_u64();
+        let ll_ml_nb = ll_nb + ml_nb;
+        let win_fse_ml = win_fse << ll_nb;
+        let win_fse_of = win_fse << ll_ml_nb;
+        ml_state = e_ml
+            .baseline()
+            .wrapping_add(extract_top_u64(win_fse_ml, ml_nb).truncate_to::<usize>());
+        let of_nb = e_of.num_bits_u64();
+        of_state = e_of
+            .baseline()
+            .wrapping_add(extract_top_u64(win_fse_of, of_nb).truncate_to::<usize>());
+
+        // Chain A: extra bits (`of_eb`, `ml_eb`, `ll_eb`), retiring `e_of`, `e_ml`, `e_ll` as each
+        // field is decoded (`of_eb + ml_eb <= total_extra_bits <= 56 < 64`).
         let of_eb = e_of.extra_bits_u64();
         let offset_value =
             e_of.base().wrapping_add(extract_top_u64(bits, of_eb).truncate_to::<u32>());
-        bits <<= of_eb;
-        bf.advance(of_eb);
-
         let ml_eb = e_ml.extra_bits_u64();
+        let of_ml_eb = of_eb + ml_eb;
+        let win_ml = bits << of_eb;
+        let win_ll = bits << of_ml_eb;
         let match_len_u32 =
-            e_ml.base().wrapping_add(extract_top_u64(bits, ml_eb).truncate_to::<u32>());
-        bits <<= ml_eb;
-        bf.advance(ml_eb);
-
+            e_ml.base().wrapping_add(extract_top_u64(win_ml, ml_eb).truncate_to::<u32>());
         let ll_eb = e_ll.extra_bits_u64();
         let lit_len_u32 =
-            e_ll.base().wrapping_add(extract_top_u64(bits, ll_eb).truncate_to::<u32>());
-        bits <<= ll_eb;
-        bf.advance(ll_eb);
+            e_ll.base().wrapping_add(extract_top_u64(win_ll, ll_eb).truncate_to::<u32>());
 
-        // Phase 2 (RFC 8878 §3.1.1.4): FSE next states (`ll_nb`, `ml_nb`, `of_nb`), retiring each
-        // packed entry sequentially (`e_ll`, then `e_ml`, then `e_of` and `bits`) so peak live
-        // GPRs stay minimal with zero spills before repeat-offset resolution.
-        let ll_nb = e_ll.num_bits_u64();
-        ll_state =
-            e_ll.baseline().wrapping_add(extract_top_u64(bits, ll_nb).truncate_to::<usize>());
-        bits <<= ll_nb;
-        bf.advance(ll_nb);
-
-        let ml_nb = e_ml.num_bits_u64();
-        ml_state =
-            e_ml.baseline().wrapping_add(extract_top_u64(bits, ml_nb).truncate_to::<usize>());
-        bits <<= ml_nb;
-        bf.advance(ml_nb);
-
-        let of_nb = e_of.num_bits_u64();
-        of_state =
-            e_of.baseline().wrapping_add(extract_top_u64(bits, of_nb).truncate_to::<usize>());
-        bf.advance(of_nb);
-
-        // Branchless 2-level `csel` tree in 32-bit registers for repeat offsets, updating
-        // `[r0, r1, r2]` in-place before execution (`rep_code == 2` and `rep_code < 2` share
-        // a single `cmp #, #2` on AArch64).
+        // Branchless repeat-offset update with adjacent same-condition selects (reusing NZCV flags
+        // with zero `cset`) and early death of old `r0` so `actual_offset` co-colors into `r0`'s
+        // GPR with zero loop-backedge `mov`.
         let rep_code = offset_value.wrapping_sub(1).wrapping_add(u32::from(lit_len_u32 == 0));
-        let r0_sub = r0.wrapping_sub(1);
-        let r01 = if rep_code == 0 { r0 } else { r1 };
-        let r23 = if rep_code == 2 { r2 } else { r0_sub };
-        let rep_off = if rep_code < 2 { r01 } else { r23 };
+        let r0_m1 = r0.wrapping_sub(1);
+        let is_rep0 = rep_code == 0;
+        let rep_lo = if is_rep0 { r0 } else { r1 };
+        let next_r1 = if is_rep0 { r1 } else { r0 };
+        let rep_hi = if rep_code == 2 { r2 } else { r0_m1 };
+        let is_lt2 = rep_code < 2;
+        let rep_off = if is_lt2 { rep_lo } else { rep_hi };
+        let next_r2 = if is_lt2 { r2 } else { r1 };
         let new_off = offset_value.wrapping_sub(3);
         let actual_offset = if offset_value > 3 { new_off } else { rep_off };
-        r2 = if rep_code < 2 { r2 } else { r1 };
-        r1 = if rep_code == 0 { r1 } else { r0 };
+        r2 = next_r2;
+        r1 = next_r1;
         r0 = actual_offset;
 
-        // `exec_leaf_fast` is a true zero-call leaf that bails `offset < 8` upfront.
+        // `exec_leaf_fast` is a true zero-call leaf handling all `offset >= 1` inline.
         if !ctx.exec_leaf_fast(lit_len_u32, actual_offset, match_len_u32) {
             break Some(SeqOp {
                 lit_len: lit_len_u32,
@@ -861,6 +868,9 @@ fn decode_exec_leaf_single<const WINDOW_FULL: bool, A: Allocator>(
             });
         }
         rem -= 1;
+        if rem == 0 {
+            break None;
+        }
     };
 
     st.lit_pos = ctx.lit_pos();
@@ -878,8 +888,8 @@ fn decode_exec_leaf_single<const WINDOW_FULL: bool, A: Allocator>(
 /// `> 56` bits in a single sequence (`!single_reload`, common on `zstd -3` streams with wide
 /// offsets or literal lengths). Kept separate from [`decode_exec_leaf_single`] so the hot
 /// single-reload loop has zero `avail >= 16` / `total > 56` branches, while using the same
-/// 3-word [`RevBitSlack8`] (`reload_window_slack16`), packed-SWAR bit-width sum, and sequential
-/// entry retirement so peak live GPRs stay minimal with zero stack spills.
+/// 3-word [`RevBitSlack8`] (`reload_window_slack16`), packed-SWAR bit-width sum, parallel 2-chain
+/// bit extraction, and adjacent-condition repeat-offset update with zero stack spills.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn decode_exec_leaf_wide<const WINDOW_FULL: bool, A: Allocator>(
@@ -910,10 +920,7 @@ fn decode_exec_leaf_wide<const WINDOW_FULL: bool, A: Allocator>(
     );
 
     let stop = loop {
-        if rem == 0 {
-            break LeafStop::Done;
-        }
-        let Some(mut bits) = bf.reload_window_slack16() else {
+        let Some(bits) = bf.reload_window_slack16() else {
             break LeafStop::Done;
         };
         let e_ll = tables.entry_flat(ll_state);
@@ -922,59 +929,66 @@ fn decode_exec_leaf_wide<const WINDOW_FULL: bool, A: Allocator>(
 
         // Sum all 6 bit widths via packed SWAR on the top 16 bits (`extra_bits | (num_bits << 8)`):
         // low byte sums `<= 16 + 31 + 16 = 63 < 256` (no carry into high byte), high byte sums
-        // `<= 9 + 8 + 9 = 26`, keeping peak live GPRs minimal before advancing `bf`.
+        // `<= 9 + 8 + 9 = 26`. Guard `total <= 56` guarantees `total_extra_bits <= 56 < 64`.
         let b_sum = (e_ll.0 >> 48) + (e_of.0 >> 48) + (e_ml.0 >> 48);
-        let total = (b_sum & 0xFF) + (b_sum >> 8);
+        let total_extra_bits = b_sum & 0xFF;
+        let total = total_extra_bits + (b_sum >> 8);
         if total > 56 {
             break LeafStop::Wide;
         }
         bf.advance(total);
 
-        // Phase 1 (RFC 8878 §3.1.1.4): extra bits (`of_eb`, `ml_eb`, `ll_eb`), shifting `bits`
-        // in-place so zero offset accumulators stay live.
+        // Parallel 2-chain bit extraction (RFC 8878 §3.1.1.4): fork `bits` into independent FSE
+        // next-state (`win_fse`) and extra-bit (`bits`) chains, each with shift depth `<= 2`.
+        // Chain B runs first so the loop-carried `ll_state`/`ml_state`/`of_state` updates start
+        // immediately after `bits` loads (`ll_nb + ml_nb <= 18 < 64`).
+        let win_fse = bits << total_extra_bits;
+        let ll_nb = e_ll.num_bits_u64();
+        ll_state =
+            e_ll.baseline().wrapping_add(extract_top_u64(win_fse, ll_nb).truncate_to::<usize>());
+        let ml_nb = e_ml.num_bits_u64();
+        let ll_ml_nb = ll_nb + ml_nb;
+        let win_fse_ml = win_fse << ll_nb;
+        let win_fse_of = win_fse << ll_ml_nb;
+        ml_state = e_ml
+            .baseline()
+            .wrapping_add(extract_top_u64(win_fse_ml, ml_nb).truncate_to::<usize>());
+        let of_nb = e_of.num_bits_u64();
+        of_state = e_of
+            .baseline()
+            .wrapping_add(extract_top_u64(win_fse_of, of_nb).truncate_to::<usize>());
+
+        // Chain A: extra bits (`of_eb`, `ml_eb`, `ll_eb`), retiring `e_of`, `e_ml`, `e_ll` as each
+        // field is decoded (`of_eb + ml_eb <= total_extra_bits <= 56 < 64`).
         let of_eb = e_of.extra_bits_u64();
         let offset_value =
             e_of.base().wrapping_add(extract_top_u64(bits, of_eb).truncate_to::<u32>());
-        bits <<= of_eb;
-
         let ml_eb = e_ml.extra_bits_u64();
+        let of_ml_eb = of_eb + ml_eb;
+        let win_ml = bits << of_eb;
+        let win_ll = bits << of_ml_eb;
         let match_len_u32 =
-            e_ml.base().wrapping_add(extract_top_u64(bits, ml_eb).truncate_to::<u32>());
-        bits <<= ml_eb;
-
+            e_ml.base().wrapping_add(extract_top_u64(win_ml, ml_eb).truncate_to::<u32>());
         let ll_eb = e_ll.extra_bits_u64();
         let lit_len_u32 =
-            e_ll.base().wrapping_add(extract_top_u64(bits, ll_eb).truncate_to::<u32>());
-        bits <<= ll_eb;
+            e_ll.base().wrapping_add(extract_top_u64(win_ll, ll_eb).truncate_to::<u32>());
 
-        // Phase 2 (RFC 8878 §3.1.1.4): FSE next states (`ll_nb`, `ml_nb`, `of_nb`), retiring each
-        // packed entry sequentially (`e_ll`, then `e_ml`, then `e_of` and `bits`) so peak live
-        // GPRs stay minimal with zero spills before repeat-offset resolution.
-        let ll_nb = e_ll.num_bits_u64();
-        ll_state =
-            e_ll.baseline().wrapping_add(extract_top_u64(bits, ll_nb).truncate_to::<usize>());
-        bits <<= ll_nb;
-
-        let ml_nb = e_ml.num_bits_u64();
-        ml_state =
-            e_ml.baseline().wrapping_add(extract_top_u64(bits, ml_nb).truncate_to::<usize>());
-        bits <<= ml_nb;
-
-        let of_nb = e_of.num_bits_u64();
-        of_state =
-            e_of.baseline().wrapping_add(extract_top_u64(bits, of_nb).truncate_to::<usize>());
-
-        // Branchless 2-level `csel` tree in 32-bit registers for repeat offsets, updating
-        // `[r0, r1, r2]` in-place before execution.
+        // Branchless repeat-offset update with adjacent same-condition selects (reusing NZCV flags
+        // with zero `cset`) and early death of old `r0` so `actual_offset` co-colors into `r0`'s
+        // GPR with zero loop-backedge `mov`.
         let rep_code = offset_value.wrapping_sub(1).wrapping_add(u32::from(lit_len_u32 == 0));
-        let r0_sub = r0.wrapping_sub(1);
-        let r01 = if rep_code == 0 { r0 } else { r1 };
-        let r23 = if rep_code == 2 { r2 } else { r0_sub };
-        let rep_off = if rep_code < 2 { r01 } else { r23 };
+        let r0_m1 = r0.wrapping_sub(1);
+        let is_rep0 = rep_code == 0;
+        let rep_lo = if is_rep0 { r0 } else { r1 };
+        let next_r1 = if is_rep0 { r1 } else { r0 };
+        let rep_hi = if rep_code == 2 { r2 } else { r0_m1 };
+        let is_lt2 = rep_code < 2;
+        let rep_off = if is_lt2 { rep_lo } else { rep_hi };
+        let next_r2 = if is_lt2 { r2 } else { r1 };
         let new_off = offset_value.wrapping_sub(3);
         let actual_offset = if offset_value > 3 { new_off } else { rep_off };
-        r2 = if rep_code < 2 { r2 } else { r1 };
-        r1 = if rep_code == 0 { r1 } else { r0 };
+        r2 = next_r2;
+        r1 = next_r1;
         r0 = actual_offset;
 
         if !ctx.exec_leaf_fast(lit_len_u32, actual_offset, match_len_u32) {
@@ -985,6 +999,9 @@ fn decode_exec_leaf_wide<const WINDOW_FULL: bool, A: Allocator>(
             });
         }
         rem -= 1;
+        if rem == 0 {
+            break LeafStop::Done;
+        }
     };
 
     st.lit_pos = ctx.lit_pos();
