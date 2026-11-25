@@ -793,3 +793,40 @@ fn unsaved_extended_copy_temp_borrowed_before_await_ends_its_slot() {
     let laid = Laid::new((0, 0), &saved, 1, StatePlant::None);
     assert_ran(run_laid(&w, &progs, Script::Complete, Some(&laid)), Ran { value: 42, polls: 3, drops: 0, made: 1 });
 }
+
+/// Regression: `if let Some((a, b)) = pending` (`Expr::Let`) partially moves out of a local
+/// scrutinee, so `Walk::scan_flags` allocates a `rest` (field-flags) word for `pending`.
+/// `may_partial_move_bindings` must mark `pending` so `lay_state` gives it `rest: Some(..)`
+/// and `name_rest` names the `rest` slot across `.await`.
+#[test]
+fn may_partial_move_bindings_marks_expr_let_scrutinee() {
+    let mut w = open_world();
+    let item = async_fn(&mut w, "let_scrutinee_partial", "let_scrutinee_partial_future");
+    w.fx.finish();
+    let mut b = async_body();
+    let mut lits = StdVec::new();
+    let forty = lit(&mut b, &mut lits, 40);
+    let (s0, pending) = let_u64(&mut b, "pending", forty);
+    let local = b.local(pending);
+    let inner = b.bind("inner");
+    let let_expr = b.bool();
+    b.exprs[let_expr.ix()] = blaze_typeck::Expr::Let { pat: inner, init: local };
+    let inner_local = b.local(inner);
+    let then_blk = b.block(&[], Some(inner_local));
+    let zero = lit(&mut b, &mut lits, 0);
+    let else_blk = b.block(&[], Some(zero));
+    let cond = if_expr(&mut b, let_expr, then_blk, Some(else_blk));
+    let body = b.block(&[s0], Some(cond));
+    let root = b.async_block(body, Capture::Move);
+    let view = b.view(item, root);
+    let heap = blaze_own::testing::heap();
+    let a = heap.alloc();
+    let mut ty = blaze_typeck::InferCtx::new_in(a);
+    let checked = match blaze_typeck::check(&view, &w.fx, &mut ty, &blaze_typeck::Needs::new_in(a), a) {
+        Ok(blaze_typeck::Outcome::Done(c)) => c,
+        Ok(blaze_typeck::Outcome::Need(n)) => panic!("the check needed {:?}", n.questions),
+        Err(e) => panic!("the check failed: {e:?}"),
+    };
+    let flags = crate::coroutine_state::may_partial_move_bindings(&view, &checked, a);
+    assert!(flags[pending.ix()], "`Expr::Let` scrutinee local must be marked as partial-move");
+}
