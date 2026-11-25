@@ -1112,6 +1112,24 @@ fn v1_pack_index_parses_searches_and_reads_objects() {
     assert_eq!(db.read_object(&oid_b, &mut src, &mut out), Ok(Some(Kind::Blob)));
     assert_eq!(out.as_slice(), blob_b);
 
+    // Repeated reads of the same OID charge `most_objects` and `most_total` only once.
+    {
+        let tight = crate::PackLimits {
+            most_objects: 2,
+            most_object: 1024,
+            most_total: (blob_a.len() + blob_b.len()) as u64,
+            most_depth: 8,
+            most_cache: 0,
+        };
+        let mut tight_db = ObjectDb::new(&[(&idx, pack.len() as u64)], tight, heap()).expect("tight odb");
+        for _ in 0..4 {
+            assert_eq!(tight_db.read_object(&oid_a, &mut src, &mut out), Ok(Some(Kind::Blob)));
+            assert_eq!(out.as_slice(), blob_a);
+            assert_eq!(tight_db.read_object(&oid_b, &mut src, &mut out), Ok(Some(Kind::Blob)));
+            assert_eq!(out.as_slice(), blob_b);
+        }
+    }
+
     // Flipping a bit in a v1 .idx OID table is caught by ObjectDb::new via trailer SHA-1 verification.
     let mut flipped_v1 = idx.clone();
     flipped_v1[1024 + 4] ^= 0x01;

@@ -3,7 +3,11 @@
 //! `pread` directly into a caller's `Vec<u8, A>`.
 
 use core::{alloc::Allocator, mem::MaybeUninit};
-use std::{fs::File, io, path::Path};
+use std::{
+    fs::{self, File},
+    io,
+    path::Path,
+};
 
 use blaze_own::Share as _;
 
@@ -455,6 +459,7 @@ pub(crate) fn entries_confined(
     const CONFINED_LISTING_MOST: usize = 65_536;
     let mut found = crate::ListingBuilder::new(name.share());
     let mut seen: usize = 0;
+    let mut interrupted = 0;
     loop {
         // Clear errno before readdir so we distinguish end-of-stream (errno == 0) from IO error.
         #[cfg(target_os = "linux")]
@@ -471,11 +476,16 @@ pub(crate) fn entries_confined(
         let ent = unsafe { libc::readdir(guard.0) };
         if ent.is_null() {
             let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) && interrupted < INTERRUPTS_MOST {
+                interrupted += 1;
+                continue;
+            }
             if err.raw_os_error().is_some_and(|code| code != 0) {
                 return Err(err);
             }
             break;
         }
+        interrupted = 0;
         #[expect(unsafe_code, reason = "ent is non-null from readdir; d_name is NUL-terminated C string")]
         let cname = unsafe { core::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
         let bytes = cname.to_bytes();
@@ -492,6 +502,119 @@ pub(crate) fn entries_confined(
     Ok(found.finish()?)
 }
 
+/// Streams `readdir` over `rel` (or `root_dir` when `rel` is `None`) in O(1) memory without
+/// materializing a bounded [`crate::Listing`], unlinking any regular-file `<key>.part-<tag>`
+/// scratch entry for which `should_remove(name, tag)` returns `true`. Returns `Ok(0)` when the
+/// directory does not exist yet.
+#[cfg(unix)]
+pub(crate) fn sweep_parts_confined(
+    root_dir: &RootDir,
+    root: &Path,
+    rel: Option<&FileName>,
+    mut should_remove: impl FnMut(&str, u64) -> bool,
+) -> io::Result<u32> {
+    let dir_fd = match rel {
+        Some(rel) => match open_beneath_dir(root_dir, root, rel) {
+            Ok(fd) => fd,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(err) => return Err(err),
+        },
+        None => match open_dir_fd(root) {
+            Ok(fd) => fd,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(err) => return Err(err),
+        },
+    };
+    let raw_fd = dir_fd.into_raw_fd();
+    #[expect(unsafe_code, reason = "fdopendir takes ownership of the freshly opened directory fd")]
+    let dir_ptr = unsafe { libc::fdopendir(raw_fd) };
+    if dir_ptr.is_null() {
+        let err = io::Error::last_os_error();
+        #[expect(unsafe_code, reason = "fdopendir failed so raw_fd is still owned by us and must be closed")]
+        unsafe {
+            libc::close(raw_fd);
+        }
+        return Err(err);
+    }
+    struct DirGuard(*mut libc::DIR);
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            #[expect(unsafe_code, reason = "closing the DIR* opened by fdopendir")]
+            unsafe {
+                libc::closedir(self.0);
+            }
+        }
+    }
+    let guard = DirGuard(dir_ptr);
+    #[expect(unsafe_code, reason = "dirfd borrows the valid DIR* held by guard")]
+    let borrowed_raw = unsafe { libc::dirfd(guard.0) };
+    let mut removed = 0u32;
+    let mut interrupted = 0;
+    loop {
+        #[cfg(target_os = "linux")]
+        #[expect(unsafe_code, reason = "clearing thread-local errno before libc::readdir")]
+        unsafe {
+            *libc::__errno_location() = 0;
+        }
+        #[cfg(target_os = "macos")]
+        #[expect(unsafe_code, reason = "clearing thread-local errno before libc::readdir")]
+        unsafe {
+            *libc::__error() = 0;
+        }
+        #[expect(unsafe_code, reason = "readdir on our exclusively owned DIR*")]
+        let ent = unsafe { libc::readdir(guard.0) };
+        if ent.is_null() {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) && interrupted < INTERRUPTS_MOST {
+                interrupted += 1;
+                continue;
+            }
+            if err.raw_os_error().is_some_and(|code| code != 0) {
+                return Err(err);
+            }
+            break;
+        }
+        interrupted = 0;
+        #[expect(unsafe_code, reason = "ent is non-null from readdir; d_name is NUL-terminated C string")]
+        let cname = unsafe { core::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
+        let Ok(name) = cname.to_str() else {
+            continue;
+        };
+        let Some(tag) = crate::reserve::part_tag(name) else {
+            continue;
+        };
+        if !should_remove(name, tag) {
+            continue;
+        }
+        let mut st = MaybeUninit::<libc::stat>::uninit();
+        #[expect(unsafe_code, reason = "fstatat(AT_SYMLINK_NOFOLLOW) on our open directory fd")]
+        let rc = unsafe { libc::fstatat(borrowed_raw, cname.as_ptr(), st.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) };
+        if rc != 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::NotFound {
+                continue;
+            }
+            return Err(err);
+        }
+        #[expect(unsafe_code, reason = "fstatat succeeded and initialized st")]
+        let st = unsafe { st.assume_init() };
+        if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+            continue;
+        }
+        #[expect(unsafe_code, reason = "unlinkat on our open directory fd for a verified regular .part- scratch file")]
+        let urc = unsafe { libc::unlinkat(borrowed_raw, cname.as_ptr(), 0) };
+        if urc == 0 {
+            removed = removed.saturating_add(1);
+        } else {
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::NotFound {
+                return Err(err);
+            }
+        }
+    }
+    Ok(removed)
+}
+
 #[cfg(not(unix))]
 pub(crate) fn entries_confined(
     _root_dir: &RootDir,
@@ -500,4 +623,40 @@ pub(crate) fn entries_confined(
     name: &crate::DirName,
 ) -> io::Result<crate::Listing> {
     super::entries(&root.join(rel.as_str()), name)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn sweep_parts_confined(
+    _root_dir: &RootDir,
+    root: &Path,
+    rel: Option<&FileName>,
+    mut should_remove: impl FnMut(&str, u64) -> bool,
+) -> io::Result<u32> {
+    let dir = match rel {
+        Some(rel) => root.join(rel.as_str()),
+        None => root.to_path_buf(),
+    };
+    let read = match fs::read_dir(&dir) {
+        Ok(read) => read,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(err),
+    };
+    let mut removed = 0u32;
+    for entry in read {
+        let entry = entry?;
+        let fname = entry.file_name();
+        let Some(name) = fname.to_str() else { continue };
+        let Some(tag) = crate::reserve::part_tag(name) else { continue };
+        if !should_remove(name, tag) {
+            continue;
+        }
+        if entry.file_type()?.is_file() {
+            match fs::remove_file(entry.path()) {
+                Ok(()) => removed = removed.saturating_add(1),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
+        }
+    }
+    Ok(removed)
 }

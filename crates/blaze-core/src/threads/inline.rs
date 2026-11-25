@@ -77,6 +77,14 @@ pub enum Lent {
     At(u64),
 }
 
+/// Outcome of [`Inline::entries_confined`], preserving `OutOfMemory` separately from I/O errors.
+pub enum ConfinedEntries {
+    Listed(crate::Listing),
+    NotFound,
+    OutOfMemory,
+    Failed(IoError),
+}
+
 /// What a lent whole-file read ([`Inline::read_all_lent`]) found.
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: an outcome with an error's text
 pub enum LentRead {
@@ -241,16 +249,31 @@ impl Inline {
     }
 
     /// Kernel-confined directory listing strictly beneath this driver's root `dirfd` (never follows
-    /// symlinks along any path component; returns `Ok(None)` when absent).
-    pub fn entries_confined(&self, rel: &FileName, name: &crate::DirName) -> Result<Option<crate::Listing>, IoError> {
+    /// symlinks along any path component; preserves `NotFound` and `OutOfMemory`).
+    pub fn entries_confined(&self, rel: &FileName, name: &crate::DirName) -> ConfinedEntries {
         let done = crate::lock::io_wait("entries confined", rel.as_str(), || {
             crate::fs::beneath::entries_confined(&self.root_dir, &self.root, rel, name)
         });
         match done {
-            Ok(listing) => Ok(Some(listing)),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(IoError(error.to_string())),
+            Ok(listing) => ConfinedEntries::Listed(listing),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => ConfinedEntries::NotFound,
+            Err(error) if error.kind() == io::ErrorKind::OutOfMemory => ConfinedEntries::OutOfMemory,
+            Err(error) => ConfinedEntries::Failed(IoError(error.to_string())),
         }
+    }
+
+    /// Streams `readdir` over `rel` (or this driver's root when `None`) in O(1) memory, unlinking
+    /// regular `.part-<tag>` scratch files matching `should_remove`.
+    pub fn sweep_parts_confined(
+        &self,
+        rel: Option<&FileName>,
+        should_remove: impl FnMut(&str, u64) -> bool,
+    ) -> Result<u32, IoError> {
+        let label = rel.map_or(".", FileName::as_str);
+        let done = crate::lock::io_wait("sweep parts", label, || {
+            crate::fs::beneath::sweep_parts_confined(&self.root_dir, &self.root, rel, should_remove)
+        });
+        done.map_err(|error| IoError(error.to_string()))
     }
 
     /// A call's result as the driver's thread hands it back (`work_on`, kqueue.rs): its error

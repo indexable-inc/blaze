@@ -1,14 +1,21 @@
 // Writing a large record once, in place (`Dir::reserve`): backed by `blaze_core::reserve::Reserve`
 // over `Effect::MapWrite` so no whole record is materialized on the heap.
 
+use core::time::Duration;
+
 use blaze_core::{
-    Done, Effect, FileName, Tag,
+    Done, Effect, FileName, MappingWrite, Tag,
     reserve::{Next, Reserve, ReserveError, Why, part_tag},
+    wait::Deadline,
 };
 use blaze_own::Share as _;
 
-use super::{Dir, DirName, Durable, EntryKind, FsError, FsKind, FsOp, Meta, ReadWrite, answered_error, call, driver_error, stat};
-use crate::{cx::Cx, path::Path};
+use super::{Dir, DirName, Durable, EntryKind, FsError, FsKind, FsOp, Meta, ReadWrite, answered_error, driver_error, stat};
+use crate::{Stopped, cx::Cx, io::Io, path::Path};
+
+/// Bounded teardown window for settling an in-flight reservation effect or removing an abandoned
+/// scratch file even after the caller's `Cx` has stopped or panicked.
+const TEARDOWN_WAIT: Duration = Duration::from_secs(5);
 
 fn retag(effect: Effect, tag: Tag) -> Effect {
     match effect {
@@ -29,12 +36,97 @@ fn reserve_error(key: &FileName, err: ReserveError) -> FsError {
     }
 }
 
+/// Submits one reservation effect and waits under `cx`; if `cx` stops (cancel, deadline, stall)
+/// while the effect is in flight, settles that effect on `io` before returning so no `MapWrite`,
+/// `Truncate`, `Sync`, or `Rename` lands concurrently with teardown cleanup.
+fn submit_and_settle(io: &Io, cx: &Cx, key: &FileName, effect: Effect) -> Result<Done, FsError> {
+    if matches!(effect, Effect::Sync { .. }) && io.plant() == super::Plant::SyncSkipped {
+        return Ok(Done::Synced);
+    }
+    let began = io.now();
+    cx.stopped_by(began).map_err(|s| FsError::new(FsOp::Publish, key, FsKind::Stopped(s)))?;
+    let tag = io.submit(|tag| retag(effect, tag));
+    let deadline = cx.deadline();
+    let mut idle = 0;
+    loop {
+        if let Some(done) = io.take(tag) {
+            return Ok(done);
+        }
+        let stopped = if cx.cancelled() {
+            Some(Stopped::Cancelled { span: cx.name() })
+        } else if deadline.passed(io.now()) {
+            Some(Stopped::Deadline { span: cx.name(), at: deadline.get() })
+        } else if idle == io.limits().poll_fuel {
+            Some(Stopped::Stalled { span: cx.name(), polls: idle })
+        } else {
+            None
+        };
+        if let Some(stopped) = stopped {
+            let until = Deadline::after(io.now(), TEARDOWN_WAIT);
+            // Settle the in-flight effect (dropping any `MappingWrite` it produces) before cleanup.
+            let _ = io.settle(tag, until, "bstd::fs::Dir::reserve settle");
+            return Err(FsError::new(FsOp::Publish, key, FsKind::Stopped(stopped)));
+        }
+        match io.take_or_poll(tag, deadline) {
+            Ok(done) => return Ok(done),
+            Err(0) => idle += 1,
+            Err(_) => idle = 0,
+        }
+    }
+}
+
+/// Submits and settles an abandonment `Effect::Remove` through a teardown deadline independent of
+/// the caller's (possibly stopped or unwinding) `Cx`.
+fn teardown_remove(io: &Io, key: &FileName, cleanup: Effect) -> Result<Done, FsError> {
+    let tag = io.submit(|tag| retag(cleanup, tag));
+    let until = Deadline::after(io.now(), TEARDOWN_WAIT);
+    io.settle(tag, until, "bstd::fs::Dir::reserve cleanup")
+        .map_err(|s| FsError::new(FsOp::Publish, key, FsKind::Stopped(s)))
+}
+
+/// Unwind-safe owner of an in-flight [`Reserve`] and its active [`MappingWrite`]: if the write
+/// callback panics, `Drop` unmaps the mapping and settles `Effect::Remove` so no `.part-<tag>`
+/// scratch file leaks inside a live process.
+struct ReserveGuard<'a> {
+    io: &'a Io,
+    key: &'a FileName,
+    reserve: Reserve,
+    mapping: Option<MappingWrite>,
+    active: bool,
+}
+
+impl ReserveGuard<'_> {
+    fn abandon_now(&mut self) -> Result<(), FsError> {
+        self.active = false;
+        let mapping = self.mapping.take();
+        if let Some(cleanup) = self.reserve.abandon(mapping) {
+            let done = teardown_remove(self.io, self.key, cleanup)?;
+            self.reserve.answer(done).map_err(|err| reserve_error(self.key, err))?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ReserveGuard<'_> {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+        let mapping = self.mapping.take();
+        if let Some(cleanup) = self.reserve.abandon(mapping) {
+            let _ = teardown_remove(self.io, self.key, cleanup);
+        }
+    }
+}
+
 impl Dir<ReadWrite> {
     /// Reserves `room` bytes beside `path` via [`blaze_core::reserve::Reserve`] (`Effect::MapWrite`),
     /// lets `write` populate the writable mapping in place, and publishes it atomically at `path`
     /// (truncated to the written byte count, synced, and renamed) when `write` returns `Ok(len)`.
-    /// When `write` returns `Err(why)`, the mapping is unmapped, the scratch file is removed, and
-    /// `Ok(Err(why))` is returned with `path` untouched.
+    /// When `write` returns `Err(why)`, the mapping is unmapped, the scratch file is removed
+    /// (propagating any cleanup I/O error), and `Ok(Err(why))` is returned with `path` untouched.
+    /// If `write` panics, an unwind guard unmaps and removes the scratch file before unwinding.
     pub fn reserve<E>(
         &self,
         cx: &Cx,
@@ -54,88 +146,87 @@ impl Dir<ReadWrite> {
         } else {
             (u64::from(crate::rt::process_id()) << 32) | (fresh & 0xffff_ffff)
         };
-        let (mut reserve, first) = Reserve::new(key.share(), room, Tag(unique));
-        let submit = |effect: Effect| -> Result<Done, FsError> {
-            if matches!(effect, Effect::Sync { .. }) && self.io.plant() == super::Plant::SyncSkipped {
-                return Ok(Done::Synced);
-            }
-            call(&self.io, cx, FsOp::Publish, &key, |tag| retag(effect, tag))
+        let (reserve, first) = Reserve::new(key.share(), room, Tag(unique));
+        let mut guard = ReserveGuard {
+            io: &self.io,
+            key: &key,
+            reserve,
+            mapping: None,
+            active: true,
         };
         let mut write_fn = Some(write);
-        let mut done = match submit(first) {
+        let mut done = match submit_and_settle(&self.io, cx, &key, first) {
             Ok(done) => done,
             Err(error) => {
-                if let Some(cleanup) = reserve.abandon(None) {
-                    let _ = submit(cleanup);
-                }
+                let _ = guard.abandon_now();
                 return Err(error);
             }
         };
         loop {
-            match reserve.answer(done) {
-                Ok(Next::Write(mut mapping)) => {
+            match guard.reserve.answer(done) {
+                Ok(Next::Write(mapping)) => {
+                    guard.mapping = Some(mapping);
                     let outcome = match write_fn.take() {
-                        Some(f) => f(mapping.bytes_mut()),
+                        Some(f) => {
+                            let Some(buf) = guard.mapping.as_mut().map(MappingWrite::bytes_mut) else {
+                                let _ = guard.abandon_now();
+                                return Err(driver_error(FsOp::Publish, &key, &"reserve mapping missing"));
+                            };
+                            f(buf)
+                        }
                         None => {
-                            if let Some(cleanup) = reserve.abandon(Some(mapping)) {
-                                let _ = submit(cleanup);
-                            }
+                            let _ = guard.abandon_now();
                             return Err(driver_error(FsOp::Publish, &key, &"reserve write invoked twice"));
                         }
                     };
                     match outcome {
                         Ok(len) => {
-                            let effect = match reserve.finish(mapping, len) {
+                            let Some(mapping) = guard.mapping.take() else {
+                                let _ = guard.abandon_now();
+                                return Err(driver_error(FsOp::Publish, &key, &"reserve mapping missing"));
+                            };
+                            let effect = match guard.reserve.finish(mapping, len) {
                                 Ok(effect) => effect,
                                 Err(err) => {
-                                    if let Some(cleanup) = reserve.abandon(None) {
-                                        let _ = submit(cleanup);
-                                    }
+                                    let _ = guard.abandon_now();
                                     return Err(reserve_error(&key, err));
                                 }
                             };
-                            done = match submit(effect) {
+                            done = match submit_and_settle(&self.io, cx, &key, effect) {
                                 Ok(done) => done,
                                 Err(error) => {
-                                    if let Some(cleanup) = reserve.abandon(None) {
-                                        let _ = submit(cleanup);
-                                    }
+                                    let _ = guard.abandon_now();
                                     return Err(error);
                                 }
                             };
                         }
                         Err(user_err) => {
-                            if let Some(cleanup) = reserve.abandon(Some(mapping)) {
-                                let done = submit(cleanup)?;
-                                reserve.answer(done).map_err(|err| reserve_error(&key, err))?;
-                            }
+                            guard.abandon_now()?;
                             return Ok(Err(user_err));
                         }
                     }
                 }
                 Ok(Next::Ask(effect)) => {
-                    done = match submit(effect) {
+                    done = match submit_and_settle(&self.io, cx, &key, effect) {
                         Ok(done) => done,
                         Err(error) => {
-                            if let Some(cleanup) = reserve.abandon(None) {
-                                let _ = submit(cleanup);
-                            }
+                            let _ = guard.abandon_now();
                             return Err(error);
                         }
                     };
                 }
                 Ok(Next::Stored) => {
+                    guard.active = false;
                     self.io.waited_for_device();
                     self.io.names_synced();
                     return Ok(Ok(()));
                 }
                 Ok(Next::Abandoned) => {
+                    guard.active = false;
                     return Err(driver_error(FsOp::Publish, &key, &"reservation abandoned unexpectedly"));
                 }
                 Err(err) => {
-                    if let Some(cleanup) = reserve.abandon(None) {
-                        let _ = submit(cleanup);
-                    }
+                    let _ = guard.abandon_now();
                     return Err(reserve_error(&key, err));
                 }
             }
@@ -143,14 +234,28 @@ impl Dir<ReadWrite> {
     }
 
     /// Sweeps abandoned reservation scratch files (`<key>.part-<tag>`) directly inside this
-    /// directory whenever `should_remove(name, tag)` returns `true`. Ignores `NotFound` when the
-    /// directory does not exist yet or a scratch file disappears concurrently, and propagates all
-    /// other filesystem errors.
+    /// directory whenever `should_remove(name, tag)` returns `true`.
+    ///
+    /// On native worlds this streams `readdir` in O(1) memory without materializing a bounded
+    /// directory listing (scaling past `Listing`'s entry/name caps); on simulated worlds it falls
+    /// back to `stat` + `own_entries`. Ignores `NotFound` when the directory does not exist yet or
+    /// a scratch file disappears concurrently, and propagates all other filesystem errors.
     pub fn sweep_parts(
         &self,
         cx: &Cx,
         mut should_remove: impl FnMut(&str, u64) -> bool,
     ) -> Result<u32, FsError> {
+        let rel = match &self.base {
+            DirName::Root => None,
+            DirName::Named(name) => Some(name),
+        };
+        if let Some(swept) = self.io.sweep_parts_confined(cx, rel, &mut should_remove) {
+            return match swept {
+                Ok(Ok(count)) => Ok(count),
+                Ok(Err(err)) => Err(FsError::new(FsOp::Entries, &self.base, FsKind::Driver(err.0))),
+                Err(stopped) => Err(FsError::new(FsOp::Entries, &self.base, FsKind::Stopped(stopped))),
+            };
+        }
         if let DirName::Named(ref base) = self.base {
             match stat(&self.io, cx, FsOp::Entries, base)? {
                 None => return Ok(0),
@@ -534,25 +639,50 @@ mod tests {
         if !matches!(res, Ok(Ok(()))) {
             return Err(format!("reserve failed: {res:?}"));
         }
-        // Plant a simulated crashed orphan `.part-` file beside `k` and verify `sweep_parts` reclaims
-        // it after crash without disturbing `k`.
-        let orphan = Path::new("k.part-999").map_err(|e| format!("{e}"))?;
-        let planted: Result<Result<(), &str>, _> = dir.reserve(&cx, &orphan, 64, |buf| {
-            buf[..8].copy_from_slice(b"leftover");
-            Ok(8)
-        });
-        if !matches!(planted, Ok(Ok(()))) {
-            return Err(format!("plant orphan: {planted:?}"));
+        // Start a second REAL reservation (`records/inflight`) and stop mid-protocol right BEFORE
+        // `Effect::Rename` (after `MapWrite`, write, `Truncate`, `Sync`, and syncing the directory
+        // entry) without renaming or removing, then crash `io` to verify `sweep_parts` reclaims
+        // the real in-flight `<key>.part-<tag>` scratch file without publishing `inflight`.
+        let inflight_target = Path::new("inflight").map_err(|e| format!("{e}"))?;
+        let inflight_key = dir.beneath(&inflight_target);
+        let (mut inflight, first) = Reserve::new(inflight_key.share(), 4096, Tag(777));
+        let done = submit_and_settle(&io, &cx, &inflight_key, first).map_err(|e| format!("inflight map: {e}"))?;
+        let mapping = match inflight.answer(done) {
+            Ok(Next::Write(mut m)) => {
+                m.bytes_mut()[..12].copy_from_slice(b"half-written");
+                m
+            }
+            other => return Err(format!("expected Next::Write, got {other:?}")),
+        };
+        let trunc = inflight.finish(mapping, 12).map_err(|e| format!("inflight finish: {e}"))?;
+        let done = submit_and_settle(&io, &cx, &inflight_key, trunc).map_err(|e| format!("inflight trunc: {e}"))?;
+        let sync_eff = match inflight.answer(done) {
+            Ok(Next::Ask(eff)) => eff,
+            other => return Err(format!("expected Sync ask, got {other:?}")),
+        };
+        let done = submit_and_settle(&io, &cx, &inflight_key, sync_eff).map_err(|e| format!("inflight sync: {e}"))?;
+        match inflight.answer(done) {
+            Ok(Next::Ask(Effect::Rename { .. })) => {} // Drop before submitting Rename: simulate SIGKILL!
+            other => return Err(format!("expected Rename ask, got {other:?}")),
         }
+        // Sync directory so the in-flight scratch name is durable on the simulated disk before crash.
+        let dir_sync = Effect::SyncDir {
+            dir: DirName::Named(FileName::new("records").expect("records")),
+            tag: Tag(0),
+        };
+        let _ = submit_and_settle(&io, &cx, &inflight_key, dir_sync);
         if !io.crash() {
             return Err("not simulated".into());
         }
         let sweep_cx = io.cx(BUDGET, TASK_FRAME).map_err(|e| format!("sweep cx: {e}"))?;
+        if dir.stat(&sweep_cx, &inflight_target).map_err(|e| format!("stat inflight: {e}"))?.is_some() {
+            return Err("crashed pre-rename reservation must not publish target".into());
+        }
         let swept = dir.sweep_parts(&sweep_cx, |_, _| true).map_err(|e| format!("sweep_parts: {e}"))?;
         if swept == 0 {
-            return Err("sweep_parts did not remove crashed orphan .part- file".into());
+            return Err("sweep_parts did not remove real in-flight .part- scratch file".into());
         }
-        if dir.stat(&sweep_cx, &orphan).map_err(|e| format!("stat orphan: {e}"))?.is_some() {
+        if dir.sweep_parts(&sweep_cx, |_, _| true).map_err(|e| format!("sweep_parts 2: {e}"))? != 0 {
             return Err("orphan .part- file survived sweep_parts".into());
         }
         let got = read_bstd_target(&io, &dir, &target)?;

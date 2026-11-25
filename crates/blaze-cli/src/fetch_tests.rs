@@ -846,7 +846,52 @@ fn dir_reserve_crash_faults_and_interleaving_dst() {
         "planted skipped-sync bug must be caught by the crash oracle"
     );
 
-    // Also verify `bstd::fs::Dir::reserve` end-to-end across a simulated crash.
+    // Real mid-protocol crash right BEFORE `Effect::Rename`: leaves an actual `<key>.part-<tag>`
+    // scratch file on disk, never publishes `<key>`, and is reclaimed cleanly by the sweep.
+    {
+        let mut sim = Sim::new(42, Faults::default());
+        let dir_name = FileName::new("sources").expect("dir");
+        let inflight_key = FileName::new("sources/inflight").expect("key");
+        let (mut res, first) = Reserve::new(inflight_key.share(), 4096, Tag(777));
+        let done = ask_sim(&mut sim, first, false);
+        let mapping = match res.answer(done) {
+            Ok(Next::Write(mut m)) => {
+                m.bytes_mut()[..12].copy_from_slice(b"half-written");
+                m
+            }
+            other => panic!("expected Write, got {other:?}"),
+        };
+        let trunc = res.finish(mapping, 12).expect("finish");
+        let done = ask_sim(&mut sim, trunc, false);
+        let sync_eff = match res.answer(done) {
+            Ok(Next::Ask(eff)) => eff,
+            other => panic!("expected Sync, got {other:?}"),
+        };
+        let done = ask_sim(&mut sim, sync_eff, false);
+        assert!(matches!(res.answer(done), Ok(Next::Ask(Effect::Rename { .. }))));
+        let _ = ask_sim(&mut sim, Effect::SyncDir { dir: blaze_core::DirName::Named(dir_name.share()), tag: Tag(778) }, false);
+        sim.crash();
+        assert_eq!(read_sim(&mut sim, &inflight_key), None, "pre-rename crash must not publish target");
+        let listed = match ask_sim(&mut sim, Effect::List { dir: dir_name.share().into(), tag: Tag(779) }, false) {
+            Done::Listed(entries) => entries,
+            other => panic!("list failed: {other:?}"),
+        };
+        let orphans: std::vec::Vec<FileName> = listed
+            .into_iter()
+            .map(|(n, _)| n)
+            .filter(|n| blaze_core::reserve::part_tag(n.as_str()).is_some())
+            .collect();
+        assert_eq!(orphans.len(), 1, "real in-flight .part- scratch must exist after pre-rename crash");
+        assert!(matches!(ask_sim(&mut sim, Effect::Remove { file: orphans[0].share(), tag: Tag(780) }, false), Done::Removed));
+        let after = match ask_sim(&mut sim, Effect::List { dir: dir_name.share().into(), tag: Tag(781) }, false) {
+            Done::Listed(entries) => entries,
+            other => panic!("list after sweep failed: {other:?}"),
+        };
+        assert!(after.iter().all(|(n, _)| blaze_core::reserve::part_tag(n.as_str()).is_none()));
+    }
+
+    // Also verify `bstd::fs::Dir::reserve` end-to-end across a simulated crash AND panic unwind
+    // cleanup (leaving zero `.part-` scratch files when the write callback panics).
     for seed in 1u64..=8 {
         let io = Io::simulated(SimWorld::new(seed, Limits::USUAL));
         let cx = io.cx(BUDGET, TASK_FRAME).expect("root cx");
@@ -860,16 +905,19 @@ fn dir_reserve_crash_faults_and_interleaving_dst() {
             })
             .expect("reserve ok");
         assert_eq!(committed, Ok(()));
-        let orphan = Path::new("record_key.part-42").expect("orphan");
-        let planted: Result<Result<(), &str>, _> = dir.reserve(&cx, &orphan, 64, |buf| {
-            buf[..8].copy_from_slice(b"leftover");
-            Ok(8)
-        });
-        assert_eq!(planted.expect("plant orphan"), Ok(()));
+        // Panicking inside `Dir::reserve` callback must clean up the `.part-` scratch file via Drop guard.
+        let panic_target = Path::new("panic_key").expect("panic_key");
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: Result<Result<(), &str>, _> = dir.reserve(&cx, &panic_target, 4096, |buf| {
+                buf[..4].copy_from_slice(b"boom");
+                panic!("simulated callback panic");
+            });
+        }));
+        assert!(panicked.is_err(), "write callback panic propagated");
+        assert!(dir.stat(&cx, &panic_target).expect("stat panic target").is_none());
+        assert_eq!(dir.sweep_parts(&cx, |_, _| true).expect("no .part- left after panic"), 0);
         assert!(io.crash(), "simulated world crashes");
         let after_cx = io.cx(BUDGET, TASK_FRAME).expect("after crash cx");
-        assert_eq!(dir.sweep_parts(&after_cx, |_, _| true).expect("sweep"), 1);
-        assert!(dir.stat(&after_cx, &orphan).expect("stat orphan").is_none());
         let mut read = Bytes::new_in(after_cx.frame(), "read after crash");
         dir.read_all(&after_cx, &target, &mut read).expect("durable record survives crash");
         assert_eq!(read.as_slice(), p.as_slice());

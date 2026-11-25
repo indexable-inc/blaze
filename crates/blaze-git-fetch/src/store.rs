@@ -22,7 +22,7 @@
 use core::alloc::Allocator;
 
 use blaze_deflate::ZlibDecoder;
-use blaze_own::Vec;
+use blaze_own::{BTreeSet, Vec};
 
 use crate::{
     oid::{Kind, Oid},
@@ -465,6 +465,10 @@ pub struct ObjectDb<'i, A: Allocator> {
     limits: crate::PackLimits,
     resolved_objects: u32,
     resolved_bytes: u64,
+    /// Distinct object IDs already charged against `PackLimits::{most_objects, most_total}` so
+    /// multiple tree paths referencing the same blob OID are charged only once (matching the
+    /// network pack path), while distinct objects and their delta intermediates remain charged.
+    charged_oids: BTreeSet<Oid, A>,
     alloc: A,
 }
 
@@ -486,7 +490,14 @@ impl<'i, A: Allocator + Copy> ObjectDb<'i, A> {
             idx.verify_ordering()?;
             parsed.push(PackTable { idx, pack_end: pack_len - 20, sorted_offsets: None });
         }
-        Ok(ObjectDb { packs: parsed, limits, resolved_objects: 0, resolved_bytes: 0, alloc })
+        Ok(ObjectDb {
+            packs: parsed,
+            limits,
+            resolved_objects: 0,
+            resolved_bytes: 0,
+            charged_oids: BTreeSet::new_in(alloc),
+            alloc,
+        })
     }
 
     fn charge_object(&mut self, bytes: u64) -> Result<(), (u64, StoreWhy)> {
@@ -503,10 +514,15 @@ impl<'i, A: Allocator + Copy> ObjectDb<'i, A> {
         Ok(())
     }
 
+    fn record_charged_oid(&mut self, oid: Oid) -> Result<(), (u64, StoreWhy)> {
+        self.charged_oids.try_insert(oid).map_err(|r| (0, StoreWhy::Entry(PackWhy::Alloc(r.why))))?;
+        Ok(())
+    }
+
     /// Reads object `oid` into `out` (cleared first), checking loose objects first and then all
-    /// indexed packs. Verifies that the resolved bytes hash to `oid`, and charges the object
-    /// against `PackLimits::most_objects` and `PackLimits::most_total`. Returns `Ok(None)` when
-    /// no loose object or pack index holds `oid` (reading zero packfile bytes).
+    /// indexed packs. Verifies that the resolved bytes hash to `oid`, and charges each distinct
+    /// object (plus any delta intermediates on first resolution) against `PackLimits`. Returns
+    /// `Ok(None)` when no loose object or pack index holds `oid` (reading zero packfile bytes).
     pub fn read_object<S: ObjectSource<A>>(
         &mut self,
         oid: &Oid,
@@ -514,19 +530,26 @@ impl<'i, A: Allocator + Copy> ObjectDb<'i, A> {
         out: &mut Vec<u8, A>,
     ) -> Result<Option<Kind>, (u64, StoreWhy)> {
         out.clear();
+        let charge = !self.charged_oids.contains(oid);
         let mut raw = Vec::new_in(self.alloc);
         if source.read_loose(oid, &mut raw).map_err(|why| (0, why))? {
             let mut whole = Vec::new_in(self.alloc);
             let (kind, body) = loose(&raw, oid, self.limits.most_object, self.alloc, &mut whole)?;
             let slice = whole.get(body..).ok_or((0, StoreWhy::LooseHeader))?;
-            self.charge_object(u64::try_from(slice.len()).unwrap_or(u64::MAX))?;
+            if charge {
+                self.charge_object(u64::try_from(slice.len()).unwrap_or(u64::MAX))?;
+                self.record_charged_oid(*oid)?;
+            }
             out.try_extend_from_slice(slice).map_err(|e| (0, StoreWhy::Entry(PackWhy::Alloc(e))))?;
             return Ok(Some(kind));
         }
         let Some((pack_idx, found)) = self.find_in_packs(oid) else {
             return Ok(None);
         };
-        let kind = self.read_packed(pack_idx, found, oid, source, out)?;
+        let kind = self.read_packed(pack_idx, found, oid, charge, source, out)?;
+        if charge {
+            self.record_charged_oid(*oid)?;
+        }
         Ok(Some(kind))
     }
 
@@ -544,6 +567,7 @@ impl<'i, A: Allocator + Copy> ObjectDb<'i, A> {
         start_pack: usize,
         found: u32,
         oid: &Oid,
+        charge: bool,
         source: &mut S,
         out: &mut Vec<u8, A>,
     ) -> Result<Kind, (u64, StoreWhy)> {
@@ -561,7 +585,9 @@ impl<'i, A: Allocator + Copy> ObjectDb<'i, A> {
             match head.base {
                 Base::Whole(kind) => {
                     inflate_entry(&window, &head, self.limits.most_object, out).map_err(|why| (cur_at, why))?;
-                    self.charge_object(u64::try_from(out.len()).unwrap_or(u64::MAX))?;
+                    if charge {
+                        self.charge_object(u64::try_from(out.len()).unwrap_or(u64::MAX))?;
+                    }
                     break kind;
                 }
                 Base::Ofs { back } => {
@@ -590,7 +616,9 @@ impl<'i, A: Allocator + Copy> ObjectDb<'i, A> {
                         let slice = whole.get(body..).ok_or((cur_at, StoreWhy::LooseHeader))?;
                         out.clear();
                         out.try_extend_from_slice(slice).map_err(|e| (cur_at, StoreWhy::Entry(PackWhy::Alloc(e))))?;
-                        self.charge_object(u64::try_from(out.len()).unwrap_or(u64::MAX))?;
+                        if charge {
+                            self.charge_object(u64::try_from(out.len()).unwrap_or(u64::MAX))?;
+                        }
                         break kind;
                     }
                     let Some((base_pack, base_idx)) = self.find_in_packs(&base) else {
@@ -613,7 +641,9 @@ impl<'i, A: Allocator + Copy> ObjectDb<'i, A> {
             delta.clear();
             inflate_entry(&window, &head, self.limits.most_object, &mut delta).map_err(|why| (delta_at, why))?;
             apply_delta(out, &delta, self.limits.most_object, &mut next).map_err(|why| (delta_at, why))?;
-            self.charge_object(u64::try_from(next.len()).unwrap_or(u64::MAX))?;
+            if charge {
+                self.charge_object(u64::try_from(next.len()).unwrap_or(u64::MAX))?;
+            }
             core::mem::swap(out, &mut next);
         }
         if Oid::of(kind, out) != *oid {

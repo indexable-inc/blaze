@@ -455,7 +455,33 @@ impl Io {
         self.counted(|seen| &seen.inline);
         let ns = u64::try_from(self.now().saturating_sub(began).as_nanos()).unwrap_or(u64::MAX);
         cx.on_worker(|w| w.meter().call_took(kind, ns));
-        Some(Ok(listed))
+        match listed {
+            blaze_core::threads::inline::ConfinedEntries::Listed(listing) => Some(Ok(Ok(Some(listing)))),
+            blaze_core::threads::inline::ConfinedEntries::NotFound => Some(Ok(Ok(None))),
+            blaze_core::threads::inline::ConfinedEntries::OutOfMemory => {
+                Some(Err(Stopped::OutOfMemory { arena: "bstd::fs entries_confined", asked: 0 }))
+            }
+            blaze_core::threads::inline::ConfinedEntries::Failed(err) => Some(Ok(Err(err))),
+        }
+    }
+
+    /// Streaming O(1)-memory `.part-<tag>` sweep over `rel` (or this driver's root when `None`)
+    /// on native inline drivers. Returns `None` on simulated worlds.
+    pub(crate) fn sweep_parts_confined(
+        &self,
+        cx: &Cx,
+        rel: Option<&FileName>,
+        should_remove: impl FnMut(&str, u64) -> bool,
+    ) -> Option<Result<Result<u32, blaze_core::IoError>, Stopped>> {
+        let files = self.inline_files()?;
+        let began = self.now();
+        if let Err(stopped) = cx.stopped_by(began) {
+            return Some(Err(stopped));
+        }
+        let swept = files.sweep_parts_confined(rel, should_remove);
+        let ns = u64::try_from(self.now().saturating_sub(began).as_nanos()).unwrap_or(u64::MAX);
+        cx.on_worker(|w| w.meter().call_took(blaze_meter::Call::Attributes, ns));
+        Some(Ok(swept))
     }
 
     fn read_all_inline(

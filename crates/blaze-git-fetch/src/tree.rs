@@ -155,7 +155,7 @@ pub fn walk_with<B: Allocator + Copy>(
     limits: Limits,
     alloc: B,
     mut read_object: impl FnMut(Oid, Kind, &[u8], &mut Vec<u8, B>) -> Result<(), TreeError>,
-    mut visit: impl FnMut(&str, Mode, Oid),
+    mut visit: impl FnMut(&str, Mode, Oid) -> Result<(), TreeError>,
 ) -> Result<(), TreeError> {
     let at_root = |why| TreeError::new(b"", why);
     let mut body = Vec::new_in(alloc);
@@ -212,7 +212,7 @@ pub fn walk_with<B: Allocator + Copy>(
             return Err(refuse(TreeWhy::FilesOver { most: limits.most_files }));
         }
         let text = core::str::from_utf8(&path).map_err(|_| refuse(TreeWhy::Name))?;
-        visit(text, mode, oid);
+        visit(text, mode, oid)?;
     }
     Ok(())
 }

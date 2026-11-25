@@ -460,9 +460,6 @@ pub fn git_db_record_in<'a, D: ObjectSource<Alloc<'a>>, S: Sink>(
             }
         },
         |path, git_mode, oid| {
-            if alloc_err.is_some() || path_overflow {
-                return;
-            }
             let mode = match git_mode {
                 GitMode::File => Mode::File,
                 GitMode::Exec => Mode::Exec,
@@ -471,16 +468,35 @@ pub fn git_db_record_in<'a, D: ObjectSource<Alloc<'a>>, S: Sink>(
             };
             let (Ok(path_at), Ok(path_len)) = (u32::try_from(names.len()), u16::try_from(path.len())) else {
                 path_overflow = true;
-                return;
+                return Err(blaze_git_fetch::TreeError::new_for_store(
+                    path.as_bytes(),
+                    blaze_git_fetch::TreeWhy::PathOver { most: u16::MAX },
+                ));
             };
             let row = ListedOid { path_at, path_len, mode, oid };
             if let Err(why) = names.try_extend_from_slice(path.as_bytes()) {
                 alloc_err = Some(why);
-            } else if let Err(refused) = listed.try_push(row) {
-                alloc_err = Some(refused.why);
+                return Err(blaze_git_fetch::TreeError::new_for_store(
+                    path.as_bytes(),
+                    blaze_git_fetch::TreeWhy::Alloc(why),
+                ));
             }
+            if let Err(refused) = listed.try_push(row) {
+                alloc_err = Some(refused.why);
+                return Err(blaze_git_fetch::TreeError::new_for_store(
+                    path.as_bytes(),
+                    blaze_git_fetch::TreeWhy::Alloc(refused.why),
+                ));
+            }
+            Ok(())
         },
     );
+    if let Some(why) = alloc_err {
+        return Err(UnpackError::Alloc(why));
+    }
+    if path_overflow {
+        return Err(UnpackError::Pack(PackRefused::Form { why: "path table offset or length overflow" }));
+    }
     if no_commit {
         return Err(UnpackError::NoCommit);
     }
@@ -488,12 +504,6 @@ pub fn git_db_record_in<'a, D: ObjectSource<Alloc<'a>>, S: Sink>(
         return Err(UnpackError::GitStore(why));
     }
     walked.map_err(UnpackError::GitTree)?;
-    if path_overflow {
-        return Err(UnpackError::Pack(PackRefused::Form { why: "path table offset or length overflow" }));
-    }
-    if let Some(why) = alloc_err {
-        return Err(UnpackError::Alloc(why));
-    }
 
     let mut source_id = [0u8; 32];
     source_id[..20].copy_from_slice(&commit.0);
