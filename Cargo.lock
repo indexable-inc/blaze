@@ -1665,6 +1665,18 @@ name = "blaze-pins"
 version = "0.0.0"
 
 [[package]]
+name = "blaze-preview"
+version = "0.0.0"
+dependencies = [
+ "blaze-data",
+ "blaze-json",
+ "blaze-own",
+ "blaze-sim",
+ "blaze-sniff",
+ "blaze-toml",
+]
+
+[[package]]
 name = "blaze-proc-macro"
 version = "0.0.0"
 dependencies = [
@@ -2007,6 +2019,7 @@ dependencies = [
  "blaze-json",
  "blaze-own",
  "blaze-sim",
+ "blaze-sniff",
  "blaze-toml",
 ]
 
@@ -2045,6 +2058,14 @@ version = "0.0.0"
 dependencies = [
  "blaze-own",
  "blaze-site",
+]
+
+[[package]]
+name = "blaze-sniff"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
+ "blaze-sim",
 ]
 
 [[package]]
