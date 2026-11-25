@@ -60,20 +60,24 @@ impl<'n> Packs<'n> {
         }
     }
 
-    /// Reads UTF-8 text of `inner` in pack `k`. On [`Packs::SyncLazy`], serves from the shared
-    /// per-entry decompressed cache with zero `frame` allocation and zero repeat Zstd decode.
+    /// Reads UTF-8 text of `inner` in pack `k`. On [`Packs::SyncLazy`] and [`Packs::Shared`],
+    /// serves from the shared per-entry decompressed cache with zero `frame` allocation and zero
+    /// repeat Zstd decode.
     pub(crate) fn read_str(&self, cx: &Cx, frame: &'n Frame, k: usize, inner: &str) -> Option<&'n str> {
         match self {
             Packs::SyncLazy(lazy, fs) => lazy.read_str(cx, fs, frame, k, inner),
+            Packs::Shared(shared) => shared.read_str(cx, frame, k, inner),
             _ => self.tree(cx, frame, k)?.read_str_slice(inner, frame).ok()?,
         }
     }
 
-    /// Reads raw bytes of `inner` in pack `k`. On [`Packs::SyncLazy`], serves from the shared
-    /// per-entry decompressed cache with zero `frame` allocation and zero repeat Zstd decode.
+    /// Reads raw bytes of `inner` in pack `k`. On [`Packs::SyncLazy`] and [`Packs::Shared`],
+    /// serves from the shared per-entry decompressed cache with zero `frame` allocation and zero
+    /// repeat Zstd decode.
     pub(crate) fn read_slice(&self, cx: &Cx, frame: &'n Frame, k: usize, inner: &str) -> Option<&'n [u8]> {
         match self {
             Packs::SyncLazy(lazy, fs) => lazy.read_slice(cx, fs, frame, k, inner),
+            Packs::Shared(shared) => shared.read_slice(cx, frame, k, inner),
             _ => self.tree(cx, frame, k)?.read_slice(inner, frame).ok()?,
         }
     }

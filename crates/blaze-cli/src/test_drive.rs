@@ -1738,6 +1738,21 @@ const END_WAIT: Duration = CODE_WAIT;
 /// A maker dropped is made again cleanly (`Maker::of_start` reads nothing).
 const MOST_MAKERS: usize = 4;
 
+/// Soft frame budget per code worker: once a worker's `Frame` reaches this usage between makes,
+/// the worker drops its [`SuiteMakers`], resets and trims its `Frame` back to
+/// [`WORKER_FRAME_KEEP`], and rebuilds cleanly so multi-suite and heavy-suite test runs never
+/// exhaust `FRAME_RESERVE` (4 GiB) or accumulate unbounded RSS.
+const WORKER_FRAME_RESET_AT: usize = 512 << 20;
+
+/// Lower frame budget applied once [`Makers`] has evicted a suite at [`MOST_MAKERS`]: if the
+/// worker's `Frame` holds at least this much memory from evicted suites, reclaim it between
+/// makes instead of retaining dead suites' `NamesRecords` and `Front2` arenas.
+const WORKER_FRAME_EVICT_RESET_AT: usize = 128 << 20;
+
+/// Warm bytes kept in a code worker's `Frame` across resets; blocks past this are returned via
+/// `Frame::trim`.
+const WORKER_FRAME_KEEP: usize = 16 << 20;
+
 /// The scratch of a code worker's task (bstd `Scope::must_overlap`): its waits and spans; its
 /// names records and makers are in a frame of its own ([`work`]).
 const WORKER_SCRATCH: usize = 1 << 20;
@@ -1881,6 +1896,35 @@ pub(crate) trait KeptMakers {
     /// `Lazy::site_of`). A maker never made (the make refused before it) names nothing. Read
     /// only on a refusal's path.
     fn shown(&mut self, job: &Job<'static>, refusal: &mut CodeRefusal);
+    /// Whether the worker should drop this keeper, reset and trim its `Frame`, and rebuild
+    /// before the next make (after [`KeptMakers::forget`], LRU eviction past budget, or frame
+    /// growth past [`WORKER_FRAME_RESET_AT`]).
+    fn needs_reset(&self) -> bool {
+        false
+    }
+    /// Whether this keeper already holds frame allocations from prior makes, so a panic during
+    /// `make` (such as frame exhaustion) should be retried once on a freshly reset empty frame.
+    fn is_warm(&self) -> bool {
+        false
+    }
+}
+
+/// Builds a [`KeptMakers`] borrowing a worker's reusable [`Frame`], so [`WorkerLane::run_with_frame`]
+/// can drop the keeper, call `Frame::reset` + `Frame::trim` safely (`#![forbid(unsafe_code)]`),
+/// and rebuild on the reclaimed frame between makes or before retrying a warm-frame panic.
+pub(crate) trait MakerFactory {
+    type Makers<'f>: KeptMakers + 'f
+    where
+        Self: 'f;
+    fn build<'f>(&'f self, frame: &'f Frame) -> Self::Makers<'f>;
+}
+
+/// Result of attempting one make on a code worker.
+pub(crate) enum MakeOutcome {
+    Done(Result<SVec<'static, u8>, CodeRefusal>),
+    /// The make panicked while the worker's frame held allocations from prior makes; the worker
+    /// should drop its keeper, reset and trim its `Frame`, and retry this exact job ONCE.
+    RetryOnFreshFrame,
 }
 
 /// The one make of a worker (sans-IO, rule 14): `job` made into `scratch` by `makers`, copied
@@ -1889,22 +1933,49 @@ pub(crate) trait KeptMakers {
 /// `Lazy::refused`), and the suite's state is forgotten, as it may be half made. The refusal
 /// crosses as a [`CodeRefusal`] ([`crossing`]).
 pub(crate) fn make_one(makers: &mut dyn KeptMakers, job: &Job<'static>, scratch: &mut AVec<'_, u8>, alloc: SharedAlloc<'static>) -> Result<SVec<'static, u8>, CodeRefusal> {
+    match make_one_or_retry(makers, job, scratch, alloc, false) {
+        MakeOutcome::Done(result) => result,
+        MakeOutcome::RetryOnFreshFrame => Err(crossing(refused(job, PANICKED), alloc)),
+    }
+}
+
+/// [`make_one`] with optional single retry on a fresh frame when `allow_retry` is true and
+/// `makers.is_warm()` was true before the panic.
+pub(crate) fn make_one_or_retry(
+    makers: &mut dyn KeptMakers,
+    job: &Job<'static>,
+    scratch: &mut AVec<'_, u8>,
+    alloc: SharedAlloc<'static>,
+    allow_retry: bool,
+) -> MakeOutcome {
     scratch.clear();
+    let was_warm = allow_retry && makers.is_warm();
     match crate::work::unwinding(|| makers.make(job, scratch)) {
         Ok(Ok(())) => {
             let mut made = SVec::with_capacity_in(scratch.len(), alloc);
             made.extend_from_slice(scratch.as_slice());
-            Ok(made)
+            MakeOutcome::Done(Ok(made))
         }
         Ok(Err(why)) => {
             let mut refusal = crossing(why, alloc);
-            makers.shown(job, &mut refusal);
-            Err(refusal)
+            // `shown` walks the maker's records/loader, which may allocate into the worker frame
+            // (e.g. `StoreLoad::unserved`); isolate any panic here too (rule 20) so a refusal
+            // never crashes the code worker task.
+            if crate::work::unwinding(|| makers.shown(job, &mut refusal)).is_err() {
+                makers.forget(job.suite);
+            }
+            MakeOutcome::Done(Err(refusal))
         }
-        // The suite's makers are forgotten (half made): nothing names the instance but its fn.
+        // The suite's makers are forgotten (half made): if the frame was warm from prior makes
+        // (e.g. frame exhaustion after earlier suites), ask the worker loop to reset & trim its
+        // frame and retry once; otherwise fail this make alone as `PANICKED`.
         Err(_panicked) => {
             makers.forget(job.suite);
-            Err(crossing(refused(job, PANICKED), alloc))
+            if was_warm {
+                MakeOutcome::RetryOnFreshFrame
+            } else {
+                MakeOutcome::Done(Err(crossing(refused(job, PANICKED), alloc)))
+            }
         }
     }
 }
@@ -2002,47 +2073,67 @@ impl<'l, 'p> WorkerLane<'l, 'p> {
         self.lanes.inboxes.get(self.me.0).ok_or(WorkerEnd::NoLane { worker: self.me.0 })
     }
 
-    /// The worker's loop: each make waited for (named, until `cx`'s deadline, which is the
-    /// command's, and ended by the close), made and handed back; `Ok` once the command closed it.
-    pub(crate) fn run(self, cx: &Cx, clock: &bstd::clock::Clock, makers: &mut dyn KeptMakers, heap: &'static blaze_own::Heap) -> Result<(), WorkerEnd> {
+    /// The worker's loop over a reusable [`Frame`]: each make waited for (named, until `cx`'s
+    /// deadline, which is the command's, and ended by the close), made and handed back; `Ok`
+    /// once the command closed it. When `makers` requests a reset (after `forget`, LRU eviction
+    /// past budget, or frame growth past [`WORKER_FRAME_RESET_AT`]) or a warm-frame panic asks
+    /// for a single retry on a fresh frame, drops `makers`, calls `frame.reset()` and
+    /// `frame.trim(trim_keep)`, and rebuilds `makers` on the reclaimed frame.
+    pub(crate) fn run_with_frame<F: MakerFactory>(
+        self,
+        cx: &Cx,
+        clock: &bstd::clock::Clock,
+        frame: &mut Frame,
+        trim_keep: usize,
+        factory: &F,
+        heap: &'static blaze_own::Heap,
+    ) -> Result<(), WorkerEnd> {
         use bstd::sync::RecvError;
         let inbox = self.inbox()?;
-        let mut scratch: AVec<'static, u8> = Vec::new_in(heap.alloc());
-        loop {
-            let waiting = cx.span(WAIT_JOB);
-            let job = match inbox.recv(&waiting) {
-                Ok(job) => job,
-                Err(RecvError::Closed { .. }) => return Ok(()),
-                Err(RecvError::Empty { chan }) => return Err(WorkerEnd::Full { chan }),
-                Err(RecvError::Stopped(stopped)) => return Err(WorkerEnd::Stopped { what: WAIT_JOB, stopped }),
-            };
-            drop(waiting);
-            self.answer(cx, clock, makers, &job, &mut scratch, heap)?;
-        }
+        drive_with_frame(
+            frame,
+            trim_keep,
+            factory,
+            || {
+                let waiting = cx.span(WAIT_JOB);
+                match inbox.recv(&waiting) {
+                    Ok(job) => Ok(Some(job)),
+                    Err(RecvError::Closed { .. }) => Ok(None),
+                    Err(RecvError::Empty { chan }) => Err(WorkerEnd::Full { chan }),
+                    Err(RecvError::Stopped(stopped)) => Err(WorkerEnd::Stopped { what: WAIT_JOB, stopped }),
+                }
+            },
+            |made| self.send_done(cx, clock, made),
+            |job, makers, scratch, allow_retry| {
+                let _making = cx.span("blaze test: a code worker makes one entry");
+                make_one_or_retry(makers, job, scratch, heap.shared(), allow_retry)
+            },
+            heap,
+        )
     }
 
-    /// The seam test's turn of this worker (rule 78: the same make and hand-back as [`run`]'s,
-    /// driven inline): the make in its inbox now, if one is, made and handed back. Whether one
-    /// was.
+    /// The seam test's turn of this worker (rule 78: the same make and hand-back as
+    /// [`run_with_frame`]'s, driven inline): the make in its inbox now, if one is, made and
+    /// handed back. Whether one was.
     #[cfg_attr(not(test), expect(dead_code, reason = "the seam test's inline worker (run_parent_tests.rs `pooled_codes_equal_serial`)"))]
     pub(crate) fn step(self, cx: &Cx, clock: &bstd::clock::Clock, makers: &mut dyn KeptMakers, scratch: &mut AVec<'_, u8>, heap: &'static blaze_own::Heap) -> Result<bool, WorkerEnd> {
         match self.inbox()?.try_recv() {
             Ok(job) => {
-                self.answer(cx, clock, makers, &job, scratch, heap)?;
+                let made = {
+                    let _making = cx.span("blaze test: a code worker makes one entry");
+                    make_one(makers, &job, scratch, heap.shared())
+                };
+                self.send_done(cx, clock, made)?;
                 Ok(true)
             }
             Err(_) => Ok(false),
         }
     }
 
-    /// `job` made and handed back. A done channel closed is the command's end: what was made
+    /// Hands back a finished make. A done channel closed is the command's end: what was made
     /// is dropped (its asker is gone), by design and said here, never an error of the worker.
-    fn answer(self, cx: &Cx, clock: &bstd::clock::Clock, makers: &mut dyn KeptMakers, job: &Job<'static>, scratch: &mut AVec<'_, u8>, heap: &'static blaze_own::Heap) -> Result<(), WorkerEnd> {
+    fn send_done(self, cx: &Cx, clock: &bstd::clock::Clock, made: Result<SVec<'static, u8>, CodeRefusal>) -> Result<(), WorkerEnd> {
         use bstd::sync::SendError;
-        let made = {
-            let _making = cx.span("blaze test: a code worker makes one entry");
-            make_one(makers, job, scratch, heap.shared())
-        };
         let by = cx.until(Deadline::after(clock.now().since_start(), HAND_WAIT));
         let handing = by.span(WAIT_DONE);
         match self.lanes.done.send(&handing, (self.me, made)) {
@@ -2071,6 +2162,58 @@ impl<'l, 'p> WorkerLane<'l, 'p> {
     }
 }
 
+/// Sans-IO frame-epoch loop behind [`WorkerLane::run_with_frame`]: rebuilds `factory.build(frame)`
+/// after `frame.reset()` + `frame.trim(trim_keep)` whenever a keeper requests a reset (after
+/// `forget`, LRU suite eviction past budget, or frame growth past [`WORKER_FRAME_RESET_AT`]) or
+/// when a warm-frame panic triggers a single clean retry on a fresh empty frame.
+pub(crate) fn drive_with_frame<F: MakerFactory>(
+    frame: &mut Frame,
+    trim_keep: usize,
+    factory: &F,
+    mut next_job: impl FnMut() -> Result<Option<Job<'static>>, WorkerEnd>,
+    mut on_done: impl FnMut(Result<SVec<'static, u8>, CodeRefusal>) -> Result<(), WorkerEnd>,
+    mut run_make: impl FnMut(&Job<'static>, &mut dyn KeptMakers, &mut AVec<'_, u8>, bool) -> MakeOutcome,
+    heap: &'static blaze_own::Heap,
+) -> Result<(), WorkerEnd> {
+    let mut scratch: AVec<'static, u8> = Vec::new_in(heap.alloc());
+    let mut pending: Option<Job<'static>> = None;
+    loop {
+        let reset = {
+            let mut makers = factory.build(frame);
+            let mut want_reset = false;
+            loop {
+                let (job, allow_retry) = match pending.take() {
+                    Some(job) => (job, false),
+                    None => match next_job()? {
+                        Some(job) => (job, true),
+                        None => break,
+                    },
+                };
+                match run_make(&job, &mut makers, &mut scratch, allow_retry) {
+                    MakeOutcome::RetryOnFreshFrame => {
+                        pending = Some(job);
+                        want_reset = true;
+                        break;
+                    }
+                    MakeOutcome::Done(made) => {
+                        on_done(made)?;
+                        if makers.needs_reset() {
+                            want_reset = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            want_reset
+        };
+        if !reset {
+            return Ok(());
+        }
+        frame.reset();
+        frame.trim(trim_keep);
+    }
+}
+
 /// A worker's proc-macro runner by need (job_texts.rs `ProcsByNeed`): asked of the command
 /// thread at its first call, once (the same answer on every later call, as `MadeOnce`).
 pub(crate) struct WorkerProcs<'w, 'p> {
@@ -2080,8 +2223,8 @@ pub(crate) struct WorkerProcs<'w, 'p> {
     got: core::cell::OnceCell<crate::job_texts::MadeProcs<'p>>,
 }
 
-impl<'w, 'p: 'w> crate::job_texts::ProcsByNeed<'w> for WorkerProcs<'w, 'p> {
-    fn procs(&self) -> Result<&'static crate::proc_runner::ProcRunner<'static>, &'w str> {
+impl<'f, 'w, 'p: 'f> crate::job_texts::ProcsByNeed<'f> for WorkerProcs<'w, 'p> {
+    fn procs(&self) -> Result<&'static crate::proc_runner::ProcRunner<'static>, &'f str> {
         *self.got.get_or_init(|| self.lane.ask_procs(self.cx, self.clock))
     }
 }
@@ -2121,11 +2264,17 @@ pub(crate) enum MakersPlant {
 pub(crate) struct Makers<M> {
     kept: AVec<'static, (SuiteId, MakerKind, M)>,
     plant: MakersPlant,
+    evicted: bool,
 }
 
 impl<M: MadeFor> Makers<M> {
     pub(crate) fn new(alloc: Alloc<'static>, plant: MakersPlant) -> Makers<M> {
-        Makers { kept: Vec::new_in(alloc), plant }
+        Makers { kept: Vec::new_in(alloc), plant, evicted: false }
+    }
+
+    /// Whether any LRU eviction occurred since this `Makers` was constructed.
+    pub(crate) fn evicted(&self) -> bool {
+        self.evicted
     }
 
     /// The maker of `job`'s suite and start class: kept, or made by `make` and kept. A kept
@@ -2150,6 +2299,7 @@ impl<M: MadeFor> Makers<M> {
                 if self.kept.len() >= MOST_MAKERS {
                     // Least-recently-used first: at most `MOST_MAKERS` moved, once a maker is made.
                     drop(self.kept.remove_shift(0));
+                    self.evicted = true;
                 }
                 self.kept.push((job.suite, kind, maker));
                 self.kept.len() - 1
@@ -2207,6 +2357,9 @@ pub(crate) struct SuiteMakers<'w> {
     tables: Alloc<'static>,
     names: AVec<'static, Option<NamesRecords<'w>>>,
     makers: Makers<TestMaker<'w>>,
+    reset_needed: bool,
+    reset_at: usize,
+    evict_reset_at: usize,
 }
 
 impl<'w> SuiteMakers<'w> {
@@ -2221,7 +2374,20 @@ impl<'w> SuiteMakers<'w> {
     ) -> SuiteMakers<'w> {
         let mut names = Vec::with_capacity_in(sides.len(), heap.alloc());
         names.resize(sides.len(), None);
-        SuiteMakers { cx, root, sides, typed, procs, frame, tables: heap.alloc(), names, makers: Makers::new(heap.alloc(), MakersPlant::None) }
+        SuiteMakers {
+            cx,
+            root,
+            sides,
+            typed,
+            procs,
+            frame,
+            tables: heap.alloc(),
+            names,
+            makers: Makers::new(heap.alloc(), MakersPlant::None),
+            reset_needed: false,
+            reset_at: WORKER_FRAME_RESET_AT,
+            evict_reset_at: WORKER_FRAME_EVICT_RESET_AT,
+        }
     }
 }
 
@@ -2261,6 +2427,7 @@ impl KeptMakers for SuiteMakers<'_> {
         if let Some(slot) = self.names.get_mut(suite.0 as usize) {
             *slot = None;
         }
+        self.reset_needed = true;
     }
 
     fn shown(&mut self, job: &Job<'static>, refusal: &mut CodeRefusal) {
@@ -2268,30 +2435,66 @@ impl KeptMakers for SuiteMakers<'_> {
             shown_by(maker, job, refusal);
         }
     }
+
+    fn needs_reset(&self) -> bool {
+        let used = self.frame.used();
+        self.reset_needed || used >= self.reset_at || (self.makers.evicted() && used >= self.evict_reset_at)
+    }
+
+    fn is_warm(&self) -> bool {
+        self.frame.used() > 0
+    }
 }
 
-/// One code worker's task (D194 piece 2): its frame, its proc-macro runner by need, its
-/// makers over every suite, then its loop until the command closes its lane.
+struct SuiteMakersFactory<'w, 'p> {
+    cx: &'w Cx,
+    root: &'w Dir<ReadWrite>,
+    sides: &'w [SuiteSide<'w>],
+    typed: crate::engine_body_record::SyncTypedFrom<'w>,
+    procs: ProcsSide<'p>,
+    by_need: WorkerProcs<'w, 'p>,
+    heap: &'static blaze_own::Heap,
+}
+
+impl<'w, 'p: 'w> MakerFactory for SuiteMakersFactory<'w, 'p> {
+    type Makers<'f> = SuiteMakers<'f>
+    where
+        Self: 'f;
+
+    fn build<'f>(&'f self, frame: &'f Frame) -> SuiteMakers<'f> {
+        let procs = match self.procs {
+            ProcsSide::None => crate::job_texts::Procs::None,
+            ProcsSide::Made(made) => crate::job_texts::Procs::Made(made),
+            ProcsSide::ByNeed => crate::job_texts::Procs::ByNeed(&self.by_need),
+        };
+        SuiteMakers::new(self.cx, self.root, self.sides, self.typed, procs, frame, self.heap)
+    }
+}
+
+/// One code worker's task (D194 piece 2): its reusable frame, its proc-macro runner by need,
+/// its makers over every suite, then its loop until the command closes its lane.
 #[expect(clippy::too_many_arguments, reason = "worker task entry receives the shared read-only suite sides and typed lookup")]
-pub(crate) fn work(
+pub(crate) fn work<'p>(
     cx: &Cx,
-    lane: WorkerLane<'_, '_>,
+    lane: WorkerLane<'_, 'p>,
     clock: &bstd::clock::Clock,
     sides: &[SuiteSide<'_>],
     typed: crate::engine_body_record::SyncTypedFrom<'_>,
     root: &Dir<ReadWrite>,
-    procs: ProcsSide<'_>,
+    procs: ProcsSide<'p>,
     heap: &'static blaze_own::Heap,
 ) -> Result<(), WorkerEnd> {
-    let frame = Frame::new(bstd::mem::Tag::Other).map_err(WorkerEnd::Frame)?;
-    let by_need = WorkerProcs { cx, clock, lane, got: core::cell::OnceCell::new() };
-    let procs = match procs {
-        ProcsSide::None => crate::job_texts::Procs::None,
-        ProcsSide::Made(made) => crate::job_texts::Procs::Made(made),
-        ProcsSide::ByNeed => crate::job_texts::Procs::ByNeed(&by_need),
+    let mut frame = Frame::new(bstd::mem::Tag::Other).map_err(WorkerEnd::Frame)?;
+    let factory = SuiteMakersFactory {
+        cx,
+        root,
+        sides,
+        typed,
+        procs,
+        by_need: WorkerProcs { cx, clock, lane, got: core::cell::OnceCell::new() },
+        heap,
     };
-    let mut makers = SuiteMakers::new(cx, root, sides, typed, procs, &frame, heap);
-    lane.run(cx, clock, &mut makers, heap)
+    lane.run_with_frame(cx, clock, &mut frame, WORKER_FRAME_KEEP, &factory, heap)
 }
 
 /// THE [`CodeWorkers`] of the command (D194 piece 2), on the command thread: a make handed to
