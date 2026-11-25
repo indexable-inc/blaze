@@ -14,7 +14,7 @@ use std::vec::Vec as StdVec;
 
 use blaze_sim::{Broken, Config, NoPlant, Planted, Tape, check, controls};
 
-use crate::model::{LineRow, MCell, MRow, MStyle, Model, Op, cut_rows, logical_lines};
+use crate::model::{LineRow, MCell, MFg, MRow, MStyle, Model, Op, cut_rows, logical_lines};
 use crate::plant::VtPlant;
 use crate::style::Color;
 use crate::terminal::Terminal;
@@ -72,10 +72,12 @@ fn style_of<P: Planted<VtPlant>>(t: &Terminal<'_, P>, id: u16) -> MStyle {
     let st = t.screen().style(id);
     MStyle {
         bold: st.flags.bold,
+        italic: st.flags.italic,
         inverse: st.flags.inverse,
         fg: match st.fg {
-            Color::Palette(n) => Some(n),
-            _ => None,
+            Color::None => MFg::None,
+            Color::Palette(n) => MFg::Palette(n),
+            Color::Rgb(c) => MFg::Rgb(c.r, c.g, c.b),
         },
     }
 }

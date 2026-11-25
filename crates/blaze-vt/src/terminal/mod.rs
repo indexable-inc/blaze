@@ -495,7 +495,7 @@ impl<'a, P: Planted<VtPlant>> Terminal<'a, P> {
         }
     }
 
-    /// The screen shown, writable (the other lanes' hyperlink and prompt calls).
+    /// The screen shown, writable.
     pub fn screen_mut(&mut self) -> &mut Screen<'a, P> {
         match (self.active, &mut self.alternate) {
             (Which::Alternate, Some(alt)) => alt,
@@ -570,7 +570,7 @@ impl<'a, P: Planted<VtPlant>> Terminal<'a, P> {
         self.title_stack.len()
     }
 
-    /// Sets the title (OSC 0/2, the OSC lane's call), cut at the cap; empty clears.
+    /// Sets the title (what OSC 0/2 do), cut at the cap; empty clears.
     pub fn set_title(&mut self, title: &[u8]) {
         let n = title.len().min(self.opts.caps.title);
         self.title.clear();
@@ -580,7 +580,7 @@ impl<'a, P: Planted<VtPlant>> Terminal<'a, P> {
         self.effect(Effect::TitleChanged);
     }
 
-    /// Sets the working directory (OSC 7, the OSC lane's call).
+    /// Sets the working directory (OSC 7 sets it from a local URL's path).
     pub fn set_pwd(&mut self, pwd: &[u8]) {
         self.pwd.clear();
         if self.pwd.try_reserve(pwd.len()).is_ok() {

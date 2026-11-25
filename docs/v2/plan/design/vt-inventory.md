@@ -474,7 +474,7 @@ All sequences are from KE, FK, KT, ME, PS, and `terminal/focus.zig`.
 |---|---|---|
 | Kitty, flag 1 (disambiguate) | `CSI code[:shifted[:base]][;mods[:event]][;text]u`, or `~`, or `CSI 1;m X` for special keys | Functional codes in KT:27-111: Esc 27, Enter 13, Tab 9, BS 127, F13–F25 57376–57388, KP 57399–57427, Caps 57358, Scroll 57359, Num 57360, PrtSc 57361, Pause 57362, modifier keys 57441–57450 |
 | Kitty, no report-all | Enter/Tab/BS with no mods → legacy bytes | Unmodified printable text is sent as text |
-| Kitty, flag 2 (events) | `:2` repeat, `:3` release | Press `:1` is never sent; omitted when mods = 1 |
+| Kitty, flag 2 (events) | `:1` press, `:2` repeat, `:3` release | In the `u` and `~` forms press `:1` is never sent, and `;mods` is omitted when mods = 1 with no other event (KE:1029); special keys always send the event, press too: `CSI 1;m:1 X`, e.g. `CSI 1;1:1 A` (KE:1074) |
 | Kitty, flag 2 without flag 8 | Releases for Enter/Tab/BS are dropped | |
 | Kitty, flag 4 (alternates) | Shifted and base-layout alternates | Not for control codes |
 | Kitty, flag 8 (report all) | Everything as escapes, including modifier-only keys | |

@@ -1284,6 +1284,16 @@ impl<'a, P: Planted<VtPlant>> Screen<'a, P> {
         for r in top..=bottom {
             self.pages.row_mut(r).dirty = true;
         }
+        // The tracked pins in the region move up with their rows (Screen.zig:1183).
+        for p in self.pins.iter_mut() {
+            if p.r != LOST && p.r >= top && p.r <= bottom {
+                if p.r == 0 {
+                    p.x = 0;
+                } else {
+                    p.r -= 1;
+                }
+            }
+        }
     }
 
     /// Erases the scrollback (ED 3, ghostty's `eraseHistory`).

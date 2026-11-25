@@ -15,8 +15,18 @@ use blaze_sim::Tape;
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub(crate) struct MStyle {
     pub bold: bool,
+    pub italic: bool,
     pub inverse: bool,
-    pub fg: Option<u8>,
+    pub fg: MFg,
+}
+
+/// The foreground the model tracks.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum MFg {
+    #[default]
+    None,
+    Palette(u8),
+    Rgb(u8, u8, u8),
 }
 
 /// A cell: `None` is an empty cell (ghostty's codepoint 0).
@@ -104,6 +114,13 @@ pub(crate) enum Op {
     Stbm(u16, u16),
     Awm(bool),
     Sgr(u8),
+    /// SGR 38 direct colour, in the `;` form or ITU's `:` form (with the empty colour space).
+    SgrRgb {
+        r: u8,
+        g: u8,
+        b: u8,
+        colon: bool,
+    },
 }
 
 impl Op {
@@ -133,6 +150,8 @@ impl Op {
             Op::Stbm(t, b) => write!(out, "\x1b[{t};{b}r"),
             Op::Awm(on) => write!(out, "\x1b[?7{}", if *on { 'h' } else { 'l' }),
             Op::Sgr(p) => write!(out, "\x1b[{p}m"),
+            Op::SgrRgb { r, g, b, colon: false } => write!(out, "\x1b[38;2;{r};{g};{b}m"),
+            Op::SgrRgb { r, g, b, colon: true } => write!(out, "\x1b[38:2::{r}:{g}:{b}m"),
         };
     }
 
@@ -140,7 +159,7 @@ impl Op {
     /// over what was printed come most often, so cells are overwritten and lines wrap.
     pub(crate) fn draw(tape: &Tape, cols: u16, rows: u16) -> Op {
         let n = |tape: &Tape, most: u16| tape.int_in(0..=most, "count");
-        match tape.below(24, "op") {
+        match tape.below(25, "op") {
             0..=5 => {
                 let len = tape.int_in(1..=12usize, "print length");
                 let s = (0..len)
@@ -176,7 +195,13 @@ impl Op {
                 Op::Stbm(top, tape.int_in(top + 1..=rows, "bottom"))
             }
             22 => Op::Awm(tape.below(4, "awm") != 0),
-            _ => Op::Sgr(*tape.pick(&[0u8, 1, 7, 22, 27, 31, 32, 34, 39], "sgr").unwrap()),
+            23 => Op::SgrRgb {
+                r: tape.int_in(0..=255, "r"),
+                g: tape.int_in(0..=255, "g"),
+                b: tape.int_in(0..=255, "b"),
+                colon: tape.below(2, "colon") != 0,
+            },
+            _ => Op::Sgr(*tape.pick(&[0u8, 1, 3, 7, 22, 23, 27, 31, 32, 34, 39], "sgr").unwrap()),
         }
     }
 }
@@ -307,12 +332,15 @@ impl Model {
             Op::Sgr(p) => match p {
                 0 => self.style = MStyle::default(),
                 1 => self.style.bold = true,
+                3 => self.style.italic = true,
                 7 => self.style.inverse = true,
                 22 => self.style.bold = false,
+                23 => self.style.italic = false,
                 27 => self.style.inverse = false,
-                30..=37 => self.style.fg = Some(p - 30),
-                _ => self.style.fg = None,
+                30..=37 => self.style.fg = MFg::Palette(p - 30),
+                _ => self.style.fg = MFg::None,
             },
+            Op::SgrRgb { r, g, b, .. } => self.style.fg = MFg::Rgb(r, g, b),
         }
     }
 

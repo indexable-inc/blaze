@@ -62,5 +62,7 @@ mod sim_tests;
 mod terminal_tests;
 #[cfg(test)]
 mod test_support;
+#[cfg(test)]
+mod wire_tests;
 
 pub use parser::{Csi, Dcs, Esc, MAX_INTERMEDIATES, MAX_PARAMS, Parser, Sink, Terminator};
