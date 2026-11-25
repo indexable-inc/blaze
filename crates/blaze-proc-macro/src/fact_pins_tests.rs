@@ -92,7 +92,7 @@ fn fact_pins_reads_are_answered_again_under_todays_pins() {
     let read = sandbox.reads.iter().find(|read| read.subject == subject).expect("the fact is in the read list");
     let recorded = read.digest.expect("an answered fact has a digest");
 
-    let tree = Tree::Mem { files: std::sync::Arc::new(Vec::new()), git: None };
+    let tree = Tree::Mem { files: std::sync::Arc::new(Vec::new()), submodules: std::sync::Arc::from([]), git: None };
     assert_eq!(read_now(&tree, subject, today.pins.as_ref(), alloc), Some(Digest::Is(recorded)));
     let upgraded = setting("27.1", "26B12", "27.1.0");
     assert_ne!(read_now(&tree, subject, upgraded.pins.as_ref(), alloc), Some(Digest::Is(recorded)), "another userland misses");

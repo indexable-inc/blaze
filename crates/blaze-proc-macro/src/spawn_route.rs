@@ -566,9 +566,18 @@ impl ScriptSandbox {
                 return Err(self.refuse(Refusal::Spawn(SpawnRefusal::Executor(format!("`{program}`: the command names no guest userland for a Linux tool")))));
             }
         };
-        let Tree::Mem { files: tree, .. } = &script.tree else {
+        let Tree::Mem { files: tree, submodules, .. } = &script.tree else {
             return Err(self.refuse(Refusal::Spawn(SpawnRefusal::TreeOnDisk { program: program.to_owned(), args: args.to_vec() })));
         };
+        if let Some((sub, commit)) = submodules.first() {
+            let mut hex = blaze_own::AString::new_in(alloc);
+            for byte in commit {
+                let _ = core::fmt::Write::write_fmt(&mut hex, format_args!("{byte:02x}"));
+            }
+            return Err(self.refuse(Refusal::Spawn(SpawnRefusal::Executor(format!(
+                "`{program}`: package contains unpopulated git submodule `{sub}` at commit {hex}; executor spawns refuse unpopulated submodules"
+            )))));
+        }
         let out_dir = script.out_dir();
         let text = |value: &str| blaze_own::String::from_str_in(value, alloc);
 

@@ -782,6 +782,9 @@ fn git_origin(args: &Args, wanted: &Wanted, source: &str, alloc: blaze_own::Allo
     let root = args.work.join("git").join(commit);
     let mut found: Option<String> = None;
     for entry in view.entries() {
+        if entry.mode == blaze_fetch::Mode::Submodule {
+            continue;
+        }
         let out = root.join(entry.path);
         let is_manifest = entry.path == "Cargo.toml" || entry.path.ends_with("/Cargo.toml");
         if out.exists() && !is_manifest {
@@ -821,6 +824,22 @@ fn git_origin(args: &Args, wanted: &Wanted, source: &str, alloc: blaze_own::Allo
         }
     }
     let path = found.ok_or_else(|| refuse(format!("commit {commit} has no Cargo.toml naming the package")))?;
+    // Sibling submodules outside the selected package were skipped during manifest scanning;
+    // any unpopulated submodule inside the selected package fails closed before building it.
+    for entry in view.entries() {
+        if entry.mode != blaze_fetch::Mode::Submodule {
+            continue;
+        }
+        let inside = path.is_empty()
+            || entry.path == path.as_str()
+            || entry.path.strip_prefix(path.as_str()).is_some_and(|rest| rest.starts_with('/'));
+        if inside {
+            entry.read_in(alloc).map_err(|why| Failure::Manifest {
+                path: record.clone(),
+                why: format!("the record of commit {commit}: {}: {}", entry.path, blaze_text::Shown(&why)),
+            })?;
+        }
+    }
     let dir = if path.is_empty() { root.clone() } else { root.join(&path) };
     let manifest_path = dir.join("Cargo.toml");
     let manifest = inherit(&read(&manifest_path)?, &read(&root.join("Cargo.toml"))?, &root, &manifest_path)?;

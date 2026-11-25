@@ -2,14 +2,14 @@
 //! place ([`PackView`]). Little-endian:
 //!
 //! ```text
-//! 0..8     b"BLZFPK04"
+//! 0..8     b"BLZFPK05"
 //! 8        kind: 1 a registry crate, 2 a git commit, 3 a tree of blaze's toolchain
 //! 9..12    zero
 //! 12..16   files n
 //! 16..24   bytes of paths
 //! 24..32   bytes of stored data
 //! 32..64   the source's digest: the `.crate`'s SHA-256, or the commit id and 12 zeros
-//! 64..96   the BLAKE3 of the files' `blaze tree 2` listing (crate::tree): the tree's pin
+//! 64..96   the BLAKE3 of the files' `blaze tree 3` listing (crate::tree): the tree's pin
 //! 96..     the stored data, each file's bytes (raw or RFC 8878 Zstandard) in archive order
 //! then     the paths (uncompressed UTF-8)
 //! then     n rows of 64: path offset u32, path length u16, kind u8, codec u8,
@@ -46,7 +46,7 @@ use crate::digest::Blake3;
 pub use crate::tree::Kind as Mode;
 use crate::tree::{self, TreeRefused};
 
-pub const MAGIC: &[u8; 8] = b"BLZFPK04";
+pub const MAGIC: &[u8; 8] = b"BLZFPK05";
 pub const HEADER: usize = 96;
 pub const ROW: usize = 64;
 pub const FOOTER: usize = 32;
@@ -214,6 +214,10 @@ pub enum PackRefused {
     /// A record past the room reserved for it ([`Fixed`]): the bound it was reserved at was
     /// wrong, which is blaze's bug, refused rather than written past.
     RoomOver { room: u64 },
+    /// A read targeted a recorded git submodule (`0o160000` gitlink) or a path beneath it.
+    /// Submodule trees are not materialized into the parent commit's pack; reads fail closed
+    /// naming the submodule path and its pinned commit SHA-1.
+    Submodule { path: crate::unpack::Cut, submodule: crate::unpack::Cut, commit: [u8; 20] },
 }
 
 impl Show for PackRefused {
@@ -231,6 +235,14 @@ impl Show for PackRefused {
             PackRefused::RoomOver { room } => {
                 out.str("a record past the ").byte_count(*room).str(" reserved for it (blaze's bound is wrong)")
             }
+            PackRefused::Submodule { path, submodule, commit } => out
+                .str("the path ")
+                .show(path)
+                .str(" is inside unpopulated git submodule ")
+                .show(submodule)
+                .str(" (commit ")
+                .hex_bytes(commit)
+                .str(")"),
         };
     }
 }
@@ -442,12 +454,15 @@ impl<'a, S: Sink> Builder<'a, S> {
                     return Err(PackRefused::LinkOut { path: path.into() });
                 }
             }
+            if mode == Mode::Submodule && raw_usize != 20 {
+                return Err(PackRefused::Form { why: "a submodule entry must be a 20-byte commit id" });
+            }
             Blake3::of(raw).0
         };
 
         let mut codec = Codec::Raw;
         let mut stored_len = raw_len;
-        if raw_usize >= MIN_COMPRESS_LEN {
+        if mode != Mode::Submodule && raw_usize >= MIN_COMPRESS_LEN {
             let enc = match self.encoder.as_mut() {
                 Some(enc) => enc,
                 None => {
@@ -641,6 +656,7 @@ fn mode_byte(mode: Mode) -> u8 {
         Mode::File => 0,
         Mode::Exec => 1,
         Mode::Link => 2,
+        Mode::Submodule => 3,
     }
 }
 
@@ -759,8 +775,36 @@ pub struct File<'b, A: Allocator = Alloc<'b>> {
 }
 
 impl<'b> FileEntry<'b> {
+    /// If this entry is a recorded git submodule (`Mode::Submodule`), returns its 20-byte pinned
+    /// commit SHA-1; otherwise `None`.
+    pub fn submodule_commit(&self) -> Option<[u8; 20]> {
+        if self.mode != Mode::Submodule {
+            return None;
+        }
+        let oid = self.stored.get(..20)?;
+        if self.stored.len() != 20 {
+            return None;
+        }
+        let mut out = [0u8; 20];
+        out.copy_from_slice(oid);
+        Some(out)
+    }
+
+    fn submodule_err(&self, path: &str) -> PackRefused {
+        let commit = self.submodule_commit().unwrap_or([0u8; 20]);
+        PackRefused::Submodule {
+            path: crate::unpack::Cut::of(path.as_bytes()),
+            submodule: crate::unpack::Cut::of(self.path.as_bytes()),
+            commit,
+        }
+    }
+
     /// Reads this file's uncompressed bytes into `alloc` (zero-copy when `self.codec == Codec::Raw`).
+    /// Fails closed with [`PackRefused::Submodule`] when called on a gitlink submodule entry.
     pub fn read_in<A: Allocator + Copy>(&self, alloc: A) -> Result<FileBytes<'b, A>, PackRefused> {
+        if self.mode == Mode::Submodule {
+            return Err(self.submodule_err(self.path));
+        }
         match self.codec {
             Codec::Raw => Ok(FileBytes::Borrowed(self.stored)),
             Codec::Zstd | Codec::ZstdRustDict => {
@@ -886,7 +930,7 @@ impl<'b> PackView<'b> {
             let Some(r) = self.bytes.get(r_at..r_at + ROW) else {
                 return Err(form("a row outside its record"));
             };
-            if r[6] > 2 {
+            if r[6] > 3 {
                 return Err(form("an unknown mode"));
             }
             let Some(codec) = Codec::from_byte(r[7]) else {
@@ -900,6 +944,9 @@ impl<'b> PackView<'b> {
             }
             if codec == Codec::Raw && row.stored_len != row.raw_len {
                 return Err(form("raw row stored and raw lengths differ"));
+            }
+            if row.mode == Mode::Submodule && (codec != Codec::Raw || row.raw_len != 20) {
+                return Err(form("a submodule row must be 20 raw bytes"));
             }
             let start = self.paths_at + usize::try_from(row.path_at).map_err(|_| form("path offset overflow"))?;
             let end = start.checked_add(usize::from(row.path_len)).ok_or(form("path range overflow"))?;
@@ -921,7 +968,8 @@ impl<'b> PackView<'b> {
             mode: match r[6] {
                 0 => Mode::File,
                 1 => Mode::Exec,
-                _ => Mode::Link,
+                2 => Mode::Link,
+                _ => Mode::Submodule,
             },
             codec: Codec::from_byte(r[7]).unwrap_or(Codec::Raw),
             data_at: u64::from_le_bytes(r[8..16].try_into().expect("8 bytes")),
@@ -999,6 +1047,25 @@ impl<'b> PackView<'b> {
         self.find_index(path).map(|at| self.entry(at))
     }
 
+    /// If `path` is itself a recorded git submodule or lies beneath one (`<subpath>/...`),
+    /// returns that submodule's entry.
+    pub fn submodule_covering(&self, path: &str) -> Option<FileEntry<'b>> {
+        if let Some(entry) = self.find_entry(path)
+            && entry.mode == Mode::Submodule
+        {
+            return Some(entry);
+        }
+        for (slash, _) in path.match_indices('/') {
+            let Some(prefix) = path.get(..slash) else { continue };
+            if let Some(entry) = self.find_entry(prefix)
+                && entry.mode == Mode::Submodule
+            {
+                return Some(entry);
+            }
+        }
+        None
+    }
+
     /// Reads file `at`, decompressing into `alloc` if compressed (zero-copy if stored raw).
     pub fn read_at<A: Allocator + Copy>(&self, at: usize, alloc: A) -> Result<File<'b, A>, PackRefused> {
         let entry = self.entry(at);
@@ -1007,8 +1074,13 @@ impl<'b> PackView<'b> {
     }
 
     /// Finds and reads the file at `path`, decompressing into `alloc` if compressed.
+    /// Fails closed with [`PackRefused::Submodule`] if `path` is a recorded submodule or lies
+    /// beneath one.
     pub fn read<A: Allocator + Copy>(&self, path: &str, alloc: A) -> Result<Option<File<'b, A>>, PackRefused> {
         let Some(entry) = self.find_entry(path) else {
+            if let Some(sub) = self.submodule_covering(path) {
+                return Err(sub.submodule_err(path));
+            }
             return Ok(None);
         };
         let bytes = entry.read_in(alloc)?;
@@ -1016,12 +1088,17 @@ impl<'b> PackView<'b> {
     }
 
     /// Finds and reads the file at `path` into a bump slice `&'f [u8]` (zero-copy when raw).
+    /// Fails closed with [`PackRefused::Submodule`] if `path` is a recorded submodule or lies
+    /// beneath one.
     pub fn read_slice<'f, A>(&self, path: &str, bump: A) -> Result<Option<&'f [u8]>, PackRefused>
     where
         'b: 'f,
         A: blaze_own::BumpAlloc + Copy + 'f,
     {
         let Some(entry) = self.find_entry(path) else {
+            if let Some(sub) = self.submodule_covering(path) {
+                return Err(sub.submodule_err(path));
+            }
             return Ok(None);
         };
         entry.read_slice(bump).map(Some)

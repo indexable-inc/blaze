@@ -5,23 +5,24 @@
 //! is text, and lists each file by its BLAKE3 instead of inlining it, so each file is an object
 //! of its own in the store and two trees share the files they share.
 //!
-//! The encoding, `blaze tree 2`:
+//! The encoding, `blaze tree 3`:
 //!
 //! ```text
-//! blaze tree 2\n
+//! blaze tree 3\n
 //! <kind> <blake3 hex of the bytes> <length> <path>\n   one line a file, sorted by the path's bytes
 //! ```
 //!
 //! `length` is the file's length in decimal, with no leading zero: with it a lookup knows
 //! how large each file is without reading any file.
 //!
-//! `kind` is `file`, `exec` (a file with any executable bit) or `link` (a symlink, its bytes
-//! where it points). A path is `/`-separated UTF-8 with no empty, `.`, `..` or `.git` part and
+//! `kind` is `file`, `exec` (a file with any executable bit), `link` (a symlink, its bytes
+//! where it points) or `submodule` (a gitlink `0o160000`, its bytes its 20-byte pinned commit
+//! SHA-1). A path is `/`-separated UTF-8 with no empty, `.`, `..` or `.git` part and
 //! no newline; directories are not listed (an empty one is not in the tree), and no path is
 //! twice or both a file and a directory, compared without regard to ASCII case, so that no
 //! listing written out on a case-insensitive file system (APFS, NTFS) puts a file under
 //! another file or a symlink. [`parse`] refuses all of it as [`listing`] does. A change to any
-//! of this is `blaze tree 3`.
+//! of this is `blaze tree 4`.
 
 use alloc::{borrow::ToOwned, string::String, vec::Vec};
 use core::{fmt, fmt::Write as _};
@@ -31,7 +32,7 @@ use crate::digest::Blake3;
 /// The listing format's name and version, its first line. Every index record's key covers it
 /// (a pin names the format it was made in): a step's output under a new format is a new record, never a
 /// second value under the old one's key.
-pub(crate) const HEADER: &str = "blaze tree 2\n";
+pub(crate) const HEADER: &str = "blaze tree 3\n";
 
 /// What a listed path is.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -39,6 +40,8 @@ pub enum Kind {
     File,
     Exec,
     Link,
+    /// A git submodule (gitlink, mode `0o160000`): its bytes are its 20-byte pinned commit SHA-1.
+    Submodule,
 }
 
 impl Kind {
@@ -47,11 +50,12 @@ impl Kind {
             Kind::File => "file",
             Kind::Exec => "exec",
             Kind::Link => "link",
+            Kind::Submodule => "submodule",
         }
     }
 
     fn named(name: &str) -> Option<Kind> {
-        [Kind::File, Kind::Exec, Kind::Link].into_iter().find(|it| it.name() == name)
+        [Kind::File, Kind::Exec, Kind::Link, Kind::Submodule].into_iter().find(|it| it.name() == name)
     }
 }
 
@@ -161,7 +165,9 @@ pub(crate) fn fold(path: &str) -> String {
 /// no path under a file.
 fn check(entries: &[Entry]) -> Result<(), TreeRefused> {
     for entry in entries {
-        if let Some(why) = bad_path(&entry.path) {
+        let why = bad_path(&entry.path)
+            .or_else(|| (entry.kind == Kind::Submodule && entry.len != 20).then_some("is a submodule whose length is not 20 bytes"));
+        if let Some(why) = why {
             return Err(TreeRefused::Path { path: entry.path.clone(), why }); // clone: error path
         }
     }
@@ -230,7 +236,7 @@ pub fn parse(bytes: &[u8]) -> Result<Vec<Entry>, TreeRefused> {
         let kind = parts
             .next()
             .and_then(Kind::named)
-            .ok_or(refused("has no kind of file, exec or link"))?;
+            .ok_or(refused("has no kind of file, exec, link or submodule"))?;
         let hex = parts.next().ok_or(refused("has no BLAKE3"))?;
         let blake3 = blaze_format::hex::decode_lower::<32>(hex)
             .ok_or(refused("has no lower-case BLAKE3 of 64 digits"))?;
@@ -243,6 +249,9 @@ pub fn parse(bytes: &[u8]) -> Result<Vec<Entry>, TreeRefused> {
             return Err(refused("has no length in decimal digits with no leading zero"));
         }
         let len: u64 = len.parse().map_err(|_| refused("has a length past 64 bits"))?;
+        if kind == Kind::Submodule && len != 20 {
+            return Err(refused("is a submodule whose length is not 20 bytes"));
+        }
         if bad_path(path).is_some() {
             return Err(refused("has a path a tree can't have"));
         }

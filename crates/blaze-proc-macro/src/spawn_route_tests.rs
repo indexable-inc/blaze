@@ -53,7 +53,7 @@ pub(crate) fn shim(argv: &[&str], env_clear: bool, env_ops: &[(bool, &str, &str)
 pub(crate) fn script(c_mode: CMode, spawner: Option<Arc<dyn Executor + Send + Sync>>, spawn_setting: SpawnSetting) -> Arc<Script> {
     Arc::new(Script {
         package: "spawner 0.0.0".to_owned(),
-        tree: Tree::Mem { files: Arc::new(vec![("gen.pl".to_owned(), b"print \"ret\\n\";\n".to_vec())]), git: None },
+        tree: Tree::Mem { files: Arc::new(vec![("gen.pl".to_owned(), b"print \"ret\\n\";\n".to_vec())]), submodules: Arc::from([]), git: None },
         // The workspace's root package: its tree is served at `/workspace` (the model reads
         // `/workspace/gen.pl`).
         root: crate::script_sandbox::ScriptRoot::member("").expect("the root package"),

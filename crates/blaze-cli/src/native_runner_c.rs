@@ -625,11 +625,11 @@ fn lay_package<'s>(cx: &Cx, c: &mut CTasks<'_>, list: &CrateList<'_>, r: usize, 
         if rest.split('/').any(|part| part.is_empty() || part == "." || part == "..") {
             return Err(lay(format_args!("its pack names `{}`, which is not a path in a folder", entry.path)));
         }
+        let bytes = entry.read_in(scratch).map_err(|e| lay(format_args!("{}: {}", entry.path, blaze_text::Shown(&e))))?;
         let path = bstd::mem::format_in!(scratch, "{}/{rest}", part.as_str());
         if let Some((parent, _)) = path.as_str().rsplit_once('/') {
             std::fs::create_dir_all(parent).map_err(|e| lay(format_args!("{parent}: {e}")))?;
         }
-        let bytes = entry.read_in(scratch).map_err(|e| lay(format_args!("{}: {}", entry.path, blaze_text::Shown(&e))))?;
         std::fs::write(path.as_str(), bytes.as_slice()).map_err(|e| lay(format_args!("{}: {e}", path.as_str())))?;
         laid += 1;
     }
