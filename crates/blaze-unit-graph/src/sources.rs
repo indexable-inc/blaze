@@ -467,7 +467,8 @@ fn lay_out<'a>(view: &PackView<'_>, start: &str, package: &str, version: &Text<'
                     reader.manifest(path, text).map_err(refused)?;
                 }
                 Need::Listing(dir) => {
-                    let entries = listing(view, dir, alloc);
+                    let entries = listing(view, dir, alloc)
+                        .map_err(|why| SourceError::Refused { package: own(package, alloc), version: own(version.as_str(), alloc), why })?;
                     reader.listing(dir, entries.as_deref());
                 }
             }
@@ -479,7 +480,16 @@ fn lay_out<'a>(view: &PackView<'_>, start: &str, package: &str, version: &Text<'
 /// The entries of directory `dir` of a record (`""` is its root): the first path segment after
 /// `dir/` of each file under it. Files are sorted by path, so the files under one entry are
 /// together; `None` when no file is under `dir`.
-fn listing<'v, 'a>(view: &PackView<'v>, dir: &str, alloc: Alloc<'a>) -> Option<AVec<'a, Entry<'v>>> {
+fn listing<'v, 'a>(view: &PackView<'v>, dir: &str, alloc: Alloc<'a>) -> Result<Option<AVec<'a, Entry<'v>>>, blaze_fetch::PackRefused> {
+    if !dir.is_empty()
+        && let Some(sub) = view.submodule_covering(dir)
+    {
+        return Err(blaze_fetch::PackRefused::Submodule {
+            path: blaze_fetch::unpack::Cut::of(dir.as_bytes()),
+            submodule: blaze_fetch::unpack::Cut::of(sub.path.as_bytes()),
+            commit: sub.submodule_commit().unwrap_or([0; 20]),
+        });
+    }
     let mut prefix: String<Alloc<'a>> = String::new_in(alloc);
     if !dir.is_empty() {
         prefix.push_str(dir);
@@ -507,10 +517,10 @@ fn listing<'v, 'a>(view: &PackView<'v>, dir: &str, alloc: Alloc<'a>) -> Option<A
         }
         entries.push(Entry { name, is_dir });
     }
-    match entries.is_empty() && !dir.is_empty() {
+    Ok(match entries.is_empty() && !dir.is_empty() {
         true => None,
         false => Some(entries),
-    }
+    })
 }
 
 fn own<'a>(s: &str, alloc: Alloc<'a>) -> Text<'a> {
