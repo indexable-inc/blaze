@@ -1195,6 +1195,35 @@
         "stdout": "",
         "stderr": ""
       }
+    },
+    {
+      "clang": "25d814fda50d5fb0084b42be09605d8b1595d49d5e2e03a3345d7e112ff6f9f3",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "-m64",
+        "--target=x86_64-unknown-linux-gnu",
+        "-Wall",
+        "-Wextra",
+        "-Wno-incompatible-pointer-types",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
     }
   ]
 }
