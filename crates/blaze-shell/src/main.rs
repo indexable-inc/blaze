@@ -404,6 +404,20 @@ mod macos_app {
         // SAFETY: `window` stays alive for the duration of `run()`.
         unsafe { window.setReleasedWhenClosed(false) };
         window.setTitle(&NSString::from_str("blaze-shell"));
+        window.setTitlebarAppearsTransparent(true);
+        let bg_color = objc2_app_kit::NSColor::colorWithSRGBRed_green_blue_alpha(
+            0x09 as f64 / 255.0,
+            0x09 as f64 / 255.0,
+            0x0b as f64 / 255.0,
+            1.0,
+        );
+        window.setBackgroundColor(Some(&bg_color));
+        // SAFETY: `NSAppearanceNameDarkAqua` is a valid static AppKit constant.
+        let dark_name = unsafe { objc2_app_kit::NSAppearanceNameDarkAqua };
+        if let Some(app_dark) = objc2_app_kit::NSAppearance::appearanceNamed(dark_name) {
+            use objc2_app_kit::NSAppearanceCustomization as _;
+            window.setAppearance(Some(&app_dark));
+        }
         let view = window.contentView().expect("window contentView");
 
         let renderer = Renderer::new(MTLCreateSystemDefaultDevice().expect("no Metal GPU device"));

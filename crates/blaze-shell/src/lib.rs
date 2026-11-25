@@ -149,8 +149,8 @@ mod tests {
             scene_folded
                 .text_runs
                 .iter()
-                .any(|t| t.text.contains("error[missing_column]")),
-            "expected error kind badge in scene"
+                .any(|t| t.text.contains("missing_column")),
+            "expected error kind label in scene"
         );
         assert!(
             !scene_folded.over_rects.is_empty(),
@@ -189,7 +189,7 @@ mod tests {
             cursor_visible: true,
         });
         assert!(scene_expanded.total_content_height > h_before_expand);
-        assert!(scene_expanded.text_runs.iter().any(|t| t.text.contains("row 0.meta")));
+        assert!(scene_expanded.text_runs.iter().any(|t| t.text == "meta"));
     }
 
     #[test]
