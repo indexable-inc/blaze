@@ -594,11 +594,13 @@ struct Walk<'x, 'c, 't, A: Allocator + Copy> {
     /// drop scopes were open when it began (walk/temps.rs).
     temp_scopes: Vec<(u32, u32), A>,
     /// Non-dropping temporary slots (`SlotKind::Temp`) whose storage ends when their temporary
-    /// scope closes (`(temp_scope_index, slot)`, walk/temps.rs).
-    temp_slots: blaze_own::Vec<(usize, SlotId), A>,
-    /// Extended non-dropping temporary slots whose storage ends when their block's drop scope
-    /// closes (`(scope_depth, slot)`, walk/temps.rs).
-    scope_slots: blaze_own::Vec<(usize, SlotId), A>,
+    /// scope closes (`(temp_scope_index, slot, expr)`, walk/temps.rs). `expr` is `Some(e)` for
+    /// `hold_copy_temp` temporaries (which `end_dead_slots_before_await` may end early when
+    /// unsaved by the flow), and `None` for `super let` binding slots.
+    temp_slots: blaze_own::Vec<(usize, SlotId, Option<ExprId>), A>,
+    /// Extended non-dropping temporary and local slots whose storage ends when their block's drop
+    /// scope closes (`(scope_depth, slot, expr)`, walk/temps.rs).
+    scope_slots: blaze_own::Vec<(usize, SlotId, Option<ExprId>), A>,
     /// Per extending borrow under a branch, of a `let` being built: its temporary's drop flag
     /// (walk/temps.rs `ext_flags_for`).
     ext_flags: Vec<(u32, SlotId), A>,
@@ -624,10 +626,6 @@ struct Walk<'x, 'c, 't, A: Allocator + Copy> {
     /// Parallel to `targets`: running intersection of `definitely_uninit` across `break` edges
     /// reaching `targets[i].exit` (`None` until a live `break` jumps to that target).
     target_du: blaze_own::Vec<Option<blaze_own::Vec<bool, A>>, A>,
-    /// Per pattern: remaining unwalked `Expr::Local(p)` occurrences in `body.exprs` (from
-    /// `scan_flags`, decremented as `place_of` / `raw` visits them), so `end_moved_locals_before_await`
-    /// only ends a non-dropping binding proven both unsaved by `blaze-flow` and never read later.
-    uses_left: blaze_own::Vec<u32, A>,
     /// What needs drop, in declaration order, of every open drop scope.
     scope_pats: Vec<Held, A>,
     /// Per open drop scope (a fn's parameters first, then each block): where its bindings
@@ -968,11 +966,6 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         short_du: blaze_own::Vec::new_in(alloc),
         let_else_du: blaze_own::Vec::new_in(alloc),
         target_du: blaze_own::Vec::new_in(alloc),
-        uses_left: {
-            let mut ul = blaze_own::Vec::with_capacity_in(body.pats.len(), alloc);
-            ul.resize(body.pats.len(), 0);
-            ul
-        },
         scope_pats: Vec::new_in(alloc),
         scope_marks: Vec::new_in(alloc),
         moves: moves::Moves::new_in(alloc),
@@ -2425,9 +2418,9 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             Home::Indirect(..) => None,
         };
         if let Some(s) = slot
-            && self.scope_slots.scan_for(&(depth, s)).is_none()
+            && self.scope_slots.scan_for(&(depth, s, None)).is_none()
         {
-            self.scope_slots.push((depth, s));
+            self.scope_slots.push((depth, s, None));
         }
     }
 
@@ -2451,8 +2444,8 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         self.name_rest(slot, blaze_flow_lower::identity::Identity::Binding(p));
         if self.co.is_some() {
             let depth = self.scope_marks.len();
-            if depth > 0 && self.scope_slots.scan_for(&(depth, slot)).is_none() {
-                self.scope_slots.push((depth, slot));
+            if depth > 0 && self.scope_slots.scan_for(&(depth, slot, None)).is_none() {
+                self.scope_slots.push((depth, slot, None));
             }
         }
         let at = self.b.slot_addr(slot);
@@ -2717,7 +2710,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             && matches!(repr, Repr::Agg(_))
             && match v {
                 V::Place(p, _) => self.value_slot(p).is_some_and(|s| {
-                    self.scope_slots.iter().any(|&(d, x)| d >= depth && x == s)
+                    self.scope_slots.iter().any(|&(d, x, _)| d >= depth && x == s)
                         || self.scope_pats.get(mark..).is_some_and(|held| {
                             held.iter().any(|&h| match h {
                                 Held::Pat(pat) => match self.slots.get(pat.ix()).copied().flatten() {
@@ -2840,7 +2833,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         let Some(o) = self.owned.get(p.ix()).copied().and_then(LocalOwn::as_drop) else { return Ok(()) };
         if o.flag.is_some() {
             self.set_flag(p, false);
-            if self.live && o.rest.is_none()
+            if self.live
                 && let Some(du) = self.definitely_uninit.get_mut(p.ix())
             {
                 *du = true;
@@ -3047,46 +3040,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 self.mark_decl(p, i as u32, &mut decl)?;
             }
         }
-        let in_own_body = |mut cur: u32| -> bool {
-            for _ in 0..=n {
-                if cur == self.body.root.0 {
-                    return true;
-                }
-                let Ok(cur_ix) = usize::try_from(cur) else {
-                    return false;
-                };
-                let Some(&(up, _)) = parent.get(cur_ix) else {
-                    return false;
-                };
-                if up == NO_EXPR {
-                    return false;
-                }
-                let Ok(up_ix) = usize::try_from(up) else {
-                    return false;
-                };
-                if matches!(body.exprs.get(up_ix), Some(Expr::Closure { .. } | Expr::AsyncBlock { .. })) {
-                    return false;
-                }
-                cur = up;
-            }
-            false
-        };
         for (i, x) in body.exprs.iter().enumerate() {
-            if let Ok(i_u32) = u32::try_from(i) {
-                if matches!(*x, Expr::Closure { .. } | Expr::AsyncBlock { .. }) && in_own_body(i_u32) {
-                    for f in self.checked.env_fields_by::<crate::layout::BuildEnv>(ExprId(i_u32)) {
-                        if let Some(cnt) = self.uses_left.get_mut(f.base.ix()) {
-                            *cnt = cnt.saturating_add(1);
-                        }
-                    }
-                }
-                if let Expr::Local(p) = *x
-                    && in_own_body(i_u32)
-                    && let Some(cnt) = self.uses_left.get_mut(p.ix())
-                {
-                    *cnt = cnt.saturating_add(1);
-                }
-            }
             let Expr::Local(p) = *x else { continue };
             // The context: the parent of the outermost parenthesis around the use.
             let mut c = i as u32;
@@ -4232,6 +4186,26 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 let body = self.create();
                 self.br(c, (body, &[]), (next, &[]));
                 self.begin(body);
+                if let Ok(Expr::Match { arms, .. }) = self.expr(st.expr)
+                    && let Some(arm) = self
+                        .body
+                        .arms
+                        .get(arms.range())
+                        .and_then(|l| usize::try_from(i).ok().and_then(|ix| l.get(ix)))
+                        .copied()
+                    && !self.pat_has_ref(arm.pat)?
+                {
+                    let scrut_slot = if let Some(at) = st.tested {
+                        (!at.by_ref).then(|| self.whole_slot(at.at)).flatten()
+                    } else if st.by_ref.is_none() && matches!(st.owner, Owner::None) {
+                        st.of_enum.and_then(|(at, ..)| self.whole_slot(at))
+                    } else {
+                        None
+                    };
+                    if let Some(slot) = scrut_slot {
+                        self.end_temp_slot(slot);
+                    }
+                }
             }
             Task::GuardAlts { word, chains, n } => {
                 self.du_intersect_open_entries();
@@ -5995,9 +5969,6 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         }
         match self.expr(e)? {
             Expr::Local(p) => {
-                if let Some(cnt) = self.uses_left.get_mut(p.ix()) {
-                    *cnt = cnt.saturating_sub(1);
-                }
                 let (home, _) = self.slots.get(p.ix()).copied().flatten().ok_or(malformed("a local used before its binding"))?;
                 let at = self.home(home);
                 self.push_val(V::Place(at.0, at.1), None);
@@ -6087,9 +6058,6 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             Expr::Missing => return Err(unsupported(e, "a missing expression")),
             Expr::Lit(lit) => self.lit(e, lit)?,
             Expr::Local(p) => {
-                if let Some(cnt) = self.uses_left.get_mut(p.ix()) {
-                    *cnt = cnt.saturating_sub(1);
-                }
                 let (home, repr) = self.slots.get(p.ix()).copied().flatten().ok_or(malformed("a local used before its binding"))?;
                 // A use by value: a move, when its type needs drop (its memory is read where
                 // the value lands, before anything else runs that could drop it).

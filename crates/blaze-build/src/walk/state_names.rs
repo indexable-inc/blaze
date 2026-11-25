@@ -282,6 +282,17 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         self.names.as_ref().is_none_or(|n| n.table.get(Identity::Binding(p)).is_some())
     }
 
+    /// Whether any temporary local (value, borrow, or result) of expression `e` is saved in the
+    /// laid coroutine state (`StateNames`). Returns `true` outside a laid coroutine state so
+    /// callers only end slots proven unsaved by the flow.
+    pub(super) fn temp_is_saved(&self, e: ExprId) -> bool {
+        self.names.as_ref().is_none_or(|n| {
+            [Role::Value, Role::Borrow, Role::Result]
+                .into_iter()
+                .any(|role| n.table.get(Identity::Temp(e, role)).is_some())
+        })
+    }
+
     /// Names `slot` as saved local `id`'s drop flag byte (`own`).
     pub(super) fn name_flag(&mut self, slot: SlotId, id: Identity) {
         self.name(slot, id, SlotRole::Flag);

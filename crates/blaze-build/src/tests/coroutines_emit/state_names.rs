@@ -584,3 +584,212 @@ fn loop_break_before_await_ends_dropped_local_slot() {
         .unwrap_or_else(|e| panic!("loop break before await failed on cancel: {e}"));
     assert_eq!(cancelled, Ran { value: u64::MAX, polls: 1, drops: 1, made: 1 });
 }
+
+/// `&operand` (`Expr::Ref`).
+fn ref_expr(b: &mut blaze_typeck::fixture::Bb, mutbl: blaze_typeck::Mutbl, operand: ExprId) -> ExprId {
+    let e = b.int(None);
+    b.exprs[e.ix()] = blaze_typeck::Expr::Ref { mutbl, operand };
+    e
+}
+
+/// `*operand` (`Expr::Unary { op: UnOp::Deref, operand }`).
+fn deref_expr(b: &mut blaze_typeck::fixture::Bb, operand: ExprId) -> ExprId {
+    let e = b.int(None);
+    b.exprs[e.ix()] = blaze_typeck::Expr::Unary { op: blaze_typeck::UnOp::Deref, operand };
+    e
+}
+
+/// Checks a `run_laid` result equals `want`.
+fn assert_ran(got: Result<Ran, BuildError>, want: Ran) {
+    match got {
+        Ok(ran) => assert_eq!(ran, want),
+        Err(e) => assert_eq!(std::format!("Err({e})"), std::format!("Ok({want:?})")),
+    }
+}
+
+/// A `Copy` `sret` local (`big`) used before `.await` in one `if` branch and also used in the
+/// sibling `else` branch (which does not suspend) is unreachable after the awaiting branch's
+/// `.await`, so continuation reachability ends `big`'s slot before suspension without needing
+/// `big` in `StateNames`.
+#[test]
+fn copy_sret_local_used_in_sibling_branch_before_await_ends_its_slot() {
+    let mut w = open_world();
+    let item = async_fn(&mut w, "copy_sret_sibling", "copy_sret_sibling_future");
+    w.fx.finish();
+    let mut b = async_body();
+    let lits = StdVec::new();
+    // let big = mk_big();
+    let big = b.bind("big");
+    let mk_p = b.path(&["mk_big"]);
+    let mk_c = b.call(mk_p, &[]);
+    let s0 = b.let_(big, None, mk_c);
+    // if true { let y = sum_big(big); let r = twice().await; y + r } else { sum_big(big) }
+    let cond = bool_lit(&mut b, true);
+    let sum1 = b.path(&["sum_big"]);
+    let big1 = b.local(big);
+    let call_sum1 = b.call(sum1, &[big1]);
+    let (s_y, y) = let_u64(&mut b, "y", call_sum1);
+    let awaited = call_await(&mut b, "twice");
+    let (s_r, r) = let_u64(&mut b, "r", awaited);
+    let yl = b.local(y);
+    let rl = b.local(r);
+    let sum_yr = bin(&mut b, BinOp::Add, yl, rl);
+    let then_blk = b.block(&[s_y, s_r], Some(sum_yr));
+    let sum2 = b.path(&["sum_big"]);
+    let big2 = b.local(big);
+    let call_sum2 = b.call(sum2, &[big2]);
+    let else_blk = b.block(&[], Some(call_sum2));
+    let if_e = if_expr(&mut b, cond, then_blk, Some(else_blk));
+    let body = b.block(&[s0], Some(if_e));
+    let root = b.async_block(body, Capture::Move);
+    let progs = [Prog { item, b: &b, root, lits: &lits }];
+    // Only `y` and `awaited` cross the suspension — `big` is dead on the awaiting branch!
+    let saved = [
+        (Identity::Binding(y), (8, 3), false),
+        (Identity::Temp(awaited, Role::Awaitee), (16, 3), false),
+    ];
+    let laid = Laid::new((0, 0), &saved, 1, StatePlant::None);
+    assert_ran(run_laid(&w, &progs, Script::Complete, Some(&laid)), Ran { value: 42, polls: 3, drops: 0, made: 1 });
+}
+
+/// A flagged `Drop` local with a partial-move `rest` word (partially moved in one branch, whole-
+/// moved before `.await` in the other) ends its home slot, drop flag, and `rest` word before the
+/// suspension when not saved in `StateNames`, dropping both inner values once on completion and
+/// cancellation.
+#[test]
+fn moved_partial_local_before_await_ends_slot_and_rest_word() {
+    let mut w = open_world();
+    let item = async_fn(&mut w, "moved_partial_before_await", "moved_partial_before_await_future");
+    w.fx.finish();
+    let mut b = async_body();
+    let mut lits = StdVec::new();
+    // let pair = (mk_d(), mk_d());
+    let mk0 = b.path(&["mk_d"]);
+    let d0 = b.call(mk0, &[]);
+    let mk1 = b.path(&["mk_d"]);
+    let d1 = b.call(mk1, &[]);
+    let tup = b.tuple(&[d0, d1]);
+    let pair = b.bind("pair");
+    let s0 = b.let_(pair, None, tup);
+    // if false { consume_d(pair.0); return 99; } else { { let moved = pair; consume_d(moved.0); consume_d(moved.1); }; twice().await }
+    let cond = bool_lit(&mut b, false);
+    let c0 = b.path(&["consume_d"]);
+    let pl0 = b.local(pair);
+    let pf0 = tuple_field(&mut b, pl0, 0);
+    let c0_call = b.call(c0, &[pf0]);
+    let s_then = b.semi(c0_call);
+    let k99 = lit(&mut b, &mut lits, 99);
+    let ret99 = b.int(None);
+    b.exprs[ret99.ix()] = blaze_typeck::Expr::Return { value: Some(k99) };
+    let then_blk = b.block(&[s_then], Some(ret99));
+    let moved = b.bind("moved");
+    let pl1 = b.local(pair);
+    let s_mv = b.let_(moved, None, pl1);
+    let c1 = b.path(&["consume_d"]);
+    let ml0 = b.local(moved);
+    let mf0 = tuple_field(&mut b, ml0, 0);
+    let c1_call = b.call(c1, &[mf0]);
+    let s_c1 = b.semi(c1_call);
+    let c2 = b.path(&["consume_d"]);
+    let ml1 = b.local(moved);
+    let mf1 = tuple_field(&mut b, ml1, 1);
+    let c2_call = b.call(c2, &[mf1]);
+    let s_c2 = b.semi(c2_call);
+    let inner_blk = b.block(&[s_mv, s_c1, s_c2], None);
+    let s_inner = b.semi(inner_blk);
+    let awaited = call_await(&mut b, "twice");
+    let else_blk = b.block(&[s_inner], Some(awaited));
+    let if_e = if_expr(&mut b, cond, then_blk, Some(else_blk));
+    let body = b.block(&[s0], Some(if_e));
+    let root = b.async_block(body, Capture::Move);
+    let progs = [Prog { item, b: &b, root, lits: &lits }];
+    // Neither `pair` (nor its flag/rest) nor `moved` crosses the suspension — only `awaited`!
+    let saved = [(Identity::Temp(awaited, Role::Awaitee), (16, 3), false)];
+    let laid = Laid::new((0, 0), &saved, 1, StatePlant::None);
+    assert_ran(run_laid(&w, &progs, Script::Complete, Some(&laid)), Ran { value: 2, polls: 3, drops: 2, made: 1 });
+    assert_ran(run_laid(&w, &progs, Script::CancelAfter(1), Some(&laid)), Ran { value: u64::MAX, polls: 1, drops: 2, made: 1 });
+}
+
+/// A reference local (`r: &u64`) evaluated as an operand waiting across `.await` (`(r, twice().await)`)
+/// has no separate `Identity::Temp` in `blaze-flow-lower` (`settle_operand` skips `npos_d > 0`)
+/// and must reload cleanly from `r`'s named state slot on the Ready edge.
+#[test]
+fn waiting_ref_local_across_await_reloads_from_named_slot() {
+    let mut w = open_world();
+    let item = async_fn(&mut w, "waiting_ref_local", "waiting_ref_local_future");
+    w.fx.finish();
+    let mut b = async_body();
+    let mut lits = StdVec::new();
+    // let x: u64 = 40;
+    let forty = lit(&mut b, &mut lits, 40);
+    let (s0, x) = let_u64(&mut b, "x", forty);
+    // let r = &x;
+    let xl = b.local(x);
+    let ref_x = ref_expr(&mut b, blaze_typeck::Mutbl::Not, xl);
+    let r = b.bind("r");
+    let s1 = b.let_(r, None, ref_x);
+    // let pair = (r, twice().await);
+    let rl = b.local(r);
+    let awaited = call_await(&mut b, "twice");
+    let tup = b.tuple(&[rl, awaited]);
+    let pair = b.bind("pair");
+    let s2 = b.let_(pair, None, tup);
+    // *pair.0 + pair.1
+    let pl0 = b.local(pair);
+    let p0 = tuple_field(&mut b, pl0, 0);
+    let deref_p0 = deref_expr(&mut b, p0);
+    let pl1 = b.local(pair);
+    let p1 = tuple_field(&mut b, pl1, 1);
+    let total = bin(&mut b, BinOp::Add, deref_p0, p1);
+    let body = b.block(&[s0, s1, s2], Some(total));
+    let root = b.async_block(body, Capture::Move);
+    let progs = [Prog { item, b: &b, root, lits: &lits }];
+    // Only `x`, `r`, and `awaited` are saved — no `Identity::Temp(rl, Value)`!
+    let saved = [
+        (Identity::Binding(x), (8, 3), false),
+        (Identity::Binding(r), (8, 3), false),
+        (Identity::Temp(awaited, Role::Awaitee), (16, 3), false),
+    ];
+    let laid = Laid::new((0, 0), &saved, 1, StatePlant::None);
+    assert_ran(run_laid(&w, &progs, Script::Complete, Some(&laid)), Ran { value: 42, polls: 3, drops: 0, made: 1 });
+}
+
+/// An extended non-dropping `sret` temporary (`let r = &mk_big(); let v = sum_big(*r);`) whose
+/// borrow ends before `.await` is unsaved in `StateNames` and must end its `scope_slots` temp slot
+/// before the suspension.
+#[test]
+fn unsaved_extended_copy_temp_borrowed_before_await_ends_its_slot() {
+    let mut w = open_world();
+    let item = async_fn(&mut w, "unsaved_ext_copy_temp", "unsaved_ext_copy_temp_future");
+    w.fx.finish();
+    let mut b = async_body();
+    let lits = StdVec::new();
+    // let r = &mk_big();
+    let mk_p = b.path(&["mk_big"]);
+    let mk_c = b.call(mk_p, &[]);
+    let ref_big = ref_expr(&mut b, blaze_typeck::Mutbl::Not, mk_c);
+    let r = b.bind("r");
+    let s0 = b.let_(r, None, ref_big);
+    // let v = sum_big(*r);
+    let sum_p = b.path(&["sum_big"]);
+    let rl = b.local(r);
+    let deref_r = deref_expr(&mut b, rl);
+    let sum_c = b.call(sum_p, &[deref_r]);
+    let (s1, v) = let_u64(&mut b, "v", sum_c);
+    // let w = twice().await; v + w
+    let awaited = call_await(&mut b, "twice");
+    let (s2, wv) = let_u64(&mut b, "w", awaited);
+    let vl = b.local(v);
+    let wl = b.local(wv);
+    let total = bin(&mut b, BinOp::Add, vl, wl);
+    let body = b.block(&[s0, s1, s2], Some(total));
+    let root = b.async_block(body, Capture::Move);
+    let progs = [Prog { item, b: &b, root, lits: &lits }];
+    // Only `v` and `awaited` cross the suspension — neither `r` nor `mk_big()`!
+    let saved = [
+        (Identity::Binding(v), (8, 3), false),
+        (Identity::Temp(awaited, Role::Awaitee), (16, 3), false),
+    ];
+    let laid = Laid::new((0, 0), &saved, 1, StatePlant::None);
+    assert_ran(run_laid(&w, &progs, Script::Complete, Some(&laid)), Ran { value: 42, polls: 3, drops: 0, made: 1 });
+}

@@ -157,7 +157,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                     self.insert_held(pos, t, depth, h);
                     at += 1;
                 }
-                for (d, slot) in self.scope_slots.iter_mut() {
+                for (d, slot, _) in self.scope_slots.iter_mut() {
                     if kept_slots.scan_for(slot).is_some() && *d > depth {
                         *d = depth;
                     }
@@ -194,9 +194,9 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                     let mut j = self.scope_slots.len();
                     while j > 0 {
                         j -= 1;
-                        if self.scope_slots.get(j).is_some_and(|&(_, s)| kept_slots.scan_for(&s).is_some()) {
-                            let (_, slot) = self.scope_slots.remove_swap(j);
-                            self.temp_slots.push((t, slot));
+                        if self.scope_slots.get(j).is_some_and(|&(_, s, _)| kept_slots.scan_for(&s).is_some()) {
+                            let (_, slot, expr) = self.scope_slots.remove_swap(j);
+                            self.temp_slots.push((t, slot, expr));
                         }
                     }
                 }
