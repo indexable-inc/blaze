@@ -623,6 +623,12 @@ fn write_package(dir: &Path, view: &PackView<'_>, manifest: Option<&str>, checks
                     why: format!("{} is a link: a crate's link is not vendored yet (cargo's directory source checks files)", entry.path),
                 });
             }
+            Mode::Submodule => {
+                return Err(Failure::Manifest {
+                    path: record.to_owned(),
+                    why: format!("{} is an unpopulated git submodule: submodules are not vendored", entry.path),
+                });
+            }
         }
         if !files.is_empty() {
             files.push(',');
