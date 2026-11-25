@@ -1625,3 +1625,138 @@ fn dyn_trait_unsizing_coercions_produce_vtable_relocs() {
     let DataTarget::Vtable(vk_tail) = rec.data.allocs[0].relocs[1].target else { panic!("expected tail Vtable reloc") };
     assert_eq!(vk_tail, vk, "struct-tail unsizing `&Wrap<S> -> &Wrap<dyn Super>` carries `(S, Super)`'s vtable");
 }
+
+/// `offset_of!` through an enum variant (`offset_of_enum`): tuple variants, nested struct-in-enum
+/// and enum-in-struct paths, tagged `#[repr(u8)]` layout, niche-encoded layout (`NonNull`-like
+/// non-zero field), and a single-present-variant enum with an absent 1-ZST uninhabited variant.
+#[test]
+fn offset_of_through_enum_variants() {
+    let mut w = world();
+    w.strukt("Inner", &[("a", "u8"), ("b", "u32")]);
+    // Tagged `#[repr(u8)]` enum: tag byte at offset 0, `Inner` (align 4) starts at offset 4.
+    w.enum_("Tagged", Some("u8"), &[("Empty", &[], None), ("Pair", &["u8", "u32"], None), ("Wrap", &["Inner"], None)]);
+    // Outer struct holding `Tagged` after a `u8` (align 4 -> `Tagged` sits at offset 4).
+    w.strukt("Outer", &[("tag", "u8"), ("en", "Tagged")]);
+    // Uninhabited 1-ZST enum + single-present-variant enum (`Variants::Single { index: 0 }`).
+    w.enum_("Never", None, &[]);
+    w.enum_("LiveOrDead", None, &[("Live", &["u32"], None), ("Dead", &["Never"], None)]);
+    // Niche-encoded enum: `bool` has a niche so `MaybeBool` fits in 1 byte with `Some.0` at 0.
+    w.enum_("MaybeBool", None, &[("None", &[], None), ("Some", &["bool"], None)]);
+
+    w.konst("PAIR_0", "usize", "builtin # offset_of(Tagged, Pair.0)");
+    w.konst("PAIR_1", "usize", "builtin # offset_of(Tagged, Pair.1)");
+    w.konst("WRAP_A", "usize", "builtin # offset_of(Tagged, Wrap.0.a)");
+    w.konst("WRAP_B", "usize", "builtin # offset_of(Tagged, Wrap.0.b)");
+    w.konst("OUTER_WRAP_B", "usize", "builtin # offset_of(Outer, en.Wrap.0.b)");
+    w.konst("LIVE_0", "usize", "builtin # offset_of(LiveOrDead, Live.0)");
+    w.konst("DEAD_0", "usize", "builtin # offset_of(LiveOrDead, Dead.0)");
+    w.konst("MAYBE_BOOL_0", "usize", "builtin # offset_of(MaybeBool, Some.0)");
+    w.build();
+
+    // `Tagged` with `#[repr(u8)]`: tag at 0, `Pair(u8, u32)` places `u32` (align 4) at 4 and
+    // `u8` at 1 (decreasing-alignment order after 1-byte tag) — verify against `Tagged`'s actual
+    // variant layout and check nested additivity.
+    let pair_0 = eval_int(&mut w, "PAIR_0").expect("PAIR_0");
+    let pair_1 = eval_int(&mut w, "PAIR_1").expect("PAIR_1");
+    assert!(pair_0 >= 1 && pair_1 >= 4 && pair_0 != pair_1, "Tagged::Pair fields follow tag: pair_0={pair_0}, pair_1={pair_1}");
+
+    let wrap_a = eval_int(&mut w, "WRAP_A").expect("WRAP_A");
+    let wrap_b = eval_int(&mut w, "WRAP_B").expect("WRAP_B");
+    assert_eq!(wrap_a, 8, "Inner has b:u32 at 0 and a:u8 at 4, after 4-byte aligned start at 4 => 8");
+    assert_eq!(wrap_b, 4, "Inner::b (u32) at offset 0 inside Inner at offset 4 => 4");
+
+    let outer_wrap_b = eval_int(&mut w, "OUTER_WRAP_B").expect("OUTER_WRAP_B");
+    assert_eq!(outer_wrap_b, wrap_b, "Outer puts en:Tagged (align 4) at 0 and tag:u8 after it");
+
+    assert_eq!(eval_int(&mut w, "LIVE_0"), Ok(0));
+    assert_eq!(eval_int(&mut w, "DEAD_0"), Ok(0));
+    assert_eq!(eval_int(&mut w, "MAYBE_BOOL_0"), Ok(0));
+}
+
+/// Overloaded `Deref` and `DerefMut` in constants: explicit `*w`, `&*w`, `&mut *w` / `*w = v`,
+/// autoderef field access `w.x`, chained deref through `&Wrapper`, unsized target (`[u8]`),
+/// absent/pending trait refusals, and non-const `Deref::deref` refusal.
+#[test]
+fn overloaded_deref_and_deref_mut_in_constants() {
+    use blaze_typeck::{LangItem, Mutbl};
+
+    let mut w = world();
+    let deref_tr = w.fx.tr("Deref", 1, StdVec::new(), &["Target"]);
+    w.fx.lang(LangItem::Deref, deref_tr);
+    let p0 = w.fx.param(0);
+    let sup = w.fx.bound(deref_tr, &[p0]);
+    let deref_mut_tr = w.fx.tr("DerefMut", 1, StdVec::from([sup]), &[]);
+    w.fx.lang(LangItem::DerefMut, deref_mut_tr);
+    let r_p0 = w.fx.r(Mutbl::Not, p0);
+    let m_p0 = w.fx.r(Mutbl::Mut, p0);
+    let deref_tr_fn = w.fx.trait_fn(deref_tr, "deref", true, &[r_p0], r_p0);
+    let deref_mut_tr_fn = w.fx.trait_fn(deref_mut_tr, "deref_mut", true, &[m_p0], m_p0);
+
+    // `Point { x: u32, y: u32 }` wrapped by `Wrap { inner: Point }`.
+    let point_k = w.strukt("Point", &[("x", "u32"), ("y", "u32")]);
+    let point_ty = w.fx.adt(point_k, &[]);
+    let wrap_k = w.strukt("Wrap", &[("inner", "Point")]);
+    let wrap_ty = w.fx.adt(wrap_k, &[]);
+    w.fx.imp("impl Deref for Wrap", 0, wrap_ty, Some((deref_tr, &[])), &[("Target", point_ty)], StdVec::new());
+    w.fx.imp("impl DerefMut for Wrap", 0, wrap_ty, Some((deref_mut_tr, &[])), &[], StdVec::new());
+    let wrap_deref = w.const_fn("wrap_deref", &[("s", "&Wrap")], "&Point", "{ &s.inner }");
+    let wrap_deref_mut = w.const_fn("wrap_deref_mut", &[("s", "&mut Wrap")], "&mut Point", "{ &mut s.inner }");
+    w.resolve_to(deref_tr_fn, wrap_k, wrap_deref);
+    w.resolve_to(deref_mut_tr_fn, wrap_k, wrap_deref_mut);
+
+    // `SliceBox { data: [u8; 3] }` implementing `Deref<Target = [u8]>` (unsized target!).
+    let slice_box_k = w.strukt("SliceBox", &[("data", "[u8; 3]")]);
+    let slice_box_ty = w.fx.adt(slice_box_k, &[]);
+    let slice_u8_ty = w.ty("[u8]");
+    w.fx.imp("impl Deref for SliceBox", 0, slice_box_ty, Some((deref_tr, &[])), &[("Target", slice_u8_ty)], StdVec::new());
+    let slice_box_deref = w.const_fn("slice_box_deref", &[("s", "&SliceBox")], "&[u8]", "{ &s.data }");
+    w.resolve_to(deref_tr_fn, slice_box_k, slice_box_deref);
+
+    // `NonConstWrap { v: u32 }` whose `Deref::deref` is NOT `const fn`.
+    let nc_k = w.strukt("NonConstWrap", &[("v", "u32")]);
+    let nc_ty = w.fx.adt(nc_k, &[]);
+    let u32_ty = w.ty("u32");
+    w.fx.imp("impl Deref for NonConstWrap", 0, nc_ty, Some((deref_tr, &[])), &[("Target", u32_ty)], StdVec::new());
+    let nc_deref = w.plain_fn("nc_deref", &[("s", "&NonConstWrap")], "&u32", "{ &s.v }");
+    w.resolve_to(deref_tr_fn, nc_k, nc_deref);
+
+    // 1. Autoderef field access (`w.x + w.y`) and chained deref (`(&w).x`).
+    w.konst("AUTODEREF", "u32", "{ let x = Wrap { inner: Point { x: 10, y: 32 } }; let r = &x; x.x + r.y }");
+    // 2. Explicit `*w` (value copy) and `&*w` (place borrow).
+    w.konst("EXPLICIT_STAR", "u32", "{ let x = Wrap { inner: Point { x: 7, y: 8 } }; let p = *x; let rp = &*x; p.x + rp.y }");
+    // 3. Mutable overloaded deref: `&mut *x`, `x.y = ...`, `*x = ...`.
+    w.konst(
+        "DEREF_MUT",
+        "u32",
+        "{ let mut x = Wrap { inner: Point { x: 1, y: 2 } }; (*x).x = 20; (&mut *x).y = 22; x.x + x.y }",
+    );
+    // 4. Unsized target `[u8]` through `&*sb` and autoderef indexing `sb[2]`.
+    w.konst("UNSIZED_TARGET", "u8", "{ let sb = SliceBox { data: [4, 9, 15] }; (&*sb)[1] + sb[2] }");
+    // 5. Non-const `Deref::deref` refused as `NotConstFn`.
+    w.konst("NON_CONST", "u32", "{ let n = NonConstWrap { v: 5 }; *n }");
+    // 6. Separate constant to check `FnTraitMethod::Absent` (`Final` refusal caches its code).
+    w.konst("ABSENT_CHECK", "u32", "{ let x = Wrap { inner: Point { x: 1, y: 2 } }; x.x }");
+    w.build();
+
+    // First verify `FnTraitMethod::Absent` refuses cleanly.
+    let e = w.eval("ABSENT_CHECK").expect_err("absent deref_method must refuse");
+    assert!(matches!(e.refusal, Refusal::Unsupported { .. }), "expected Unsupported, got {:?}", e.refusal);
+
+    // Next verify `FnTraitMethod::Pending { trait_ }` returns `Refusal::Missing { item: trait_ }`
+    // and recompiles cleanly once loaded.
+    w.deref = crate::FnTraitMethod::Pending { trait_: deref_tr };
+    let e = w.eval("AUTODEREF").expect_err("pending deref_method must return Missing");
+    assert!(matches!(e.refusal, Refusal::Missing { item, .. } if item == deref_tr), "expected Missing(Deref), got {:?}", e.refusal);
+
+    // Now wire both `Deref::deref` and `DerefMut::deref_mut`.
+    w.deref_is(Mutbl::Not, deref_tr_fn);
+    w.deref_is(Mutbl::Mut, deref_mut_tr_fn);
+
+    assert_eq!(eval_int(&mut w, "AUTODEREF"), Ok(42));
+    assert_eq!(eval_int(&mut w, "EXPLICIT_STAR"), Ok(15));
+    assert_eq!(eval_int(&mut w, "DEREF_MUT"), Ok(42));
+    assert_eq!(eval_int(&mut w, "UNSIZED_TARGET"), Ok(24));
+
+    let e = w.eval("NON_CONST").expect_err("non-const Deref::deref must refuse");
+    assert!(matches!(e.refusal, Refusal::NotConstFn { item } if item == nc_deref), "expected NotConstFn, got {:?}", e.refusal);
+}

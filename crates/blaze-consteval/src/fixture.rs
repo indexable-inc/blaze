@@ -308,6 +308,11 @@ pub struct World {
     manually_drop: Option<ItemKey>,
     /// The fixture's answer for `FnOnce::call_once`.
     pub(crate) fn_once: FnTraitMethod,
+    /// The fixture's answer for `Deref::deref` and `DerefMut::deref_mut`.
+    pub(crate) deref: FnTraitMethod,
+    pub(crate) deref_mut: FnTraitMethod,
+    /// Trait-method resolution rows for [`ConstWorld::resolve`]: `(trait_fn, self_adt, impl_fn)`.
+    resolves: StdVec<(ItemKey, ItemKey, ItemKey)>,
     /// The unit's ground table and layouts, kept between evaluations.
     unit: Option<(PortableTys<'static>, Layouts<Alloc<'static>>, Codes<Alloc<'static>>)>,
     /// The statics declared ([`ConstWorld::is_static`]).
@@ -375,6 +380,9 @@ impl World {
             drop_impls: StdVec::new(),
             manually_drop: None,
             fn_once: FnTraitMethod::Absent,
+            deref: FnTraitMethod::Absent,
+            deref_mut: FnTraitMethod::Absent,
+            resolves: StdVec::new(),
             unit: None,
             statics: StdVec::new(),
             cells: StdVec::new(),
@@ -401,6 +409,19 @@ impl World {
     /// Item `item` is `FnOnce::call_once` in this world ([`ConstWorld::fn_trait_method`]).
     pub fn fn_once_is(&mut self, item: ItemKey) {
         self.fn_once = FnTraitMethod::Found(item);
+    }
+
+    /// Item `item` is `Deref::deref` (`Not`) or `DerefMut::deref_mut` (`Mut`) in this world.
+    pub fn deref_is(&mut self, mutbl: Mutbl, item: ItemKey) {
+        match mutbl {
+            Mutbl::Not => self.deref = FnTraitMethod::Found(item),
+            Mutbl::Mut => self.deref_mut = FnTraitMethod::Found(item),
+        }
+    }
+
+    /// Records that `trait_fn` resolved at `Self = self_adt` runs `impl_fn`.
+    pub fn resolve_to(&mut self, trait_fn: ItemKey, self_adt: ItemKey, impl_fn: ItemKey) {
+        self.resolves.push((trait_fn, self_adt, impl_fn));
     }
 
     /// The item declared as `name`.
@@ -1073,5 +1094,23 @@ impl ConstWorld for World {
             blaze_build::FnTrait::FnOnce => self.fn_once,
             blaze_build::FnTrait::Fn | blaze_build::FnTrait::FnMut => FnTraitMethod::Absent,
         }
+    }
+
+    fn deref_method(&self, mutbl: Mutbl) -> FnTraitMethod {
+        match mutbl {
+            Mutbl::Not => self.deref,
+            Mutbl::Mut => self.deref_mut,
+        }
+    }
+
+    fn resolve(&self, item: ItemKey, args: List, ground: &mut PortableTys<'_>, _scratch: Alloc<'_>) -> Option<(ItemKey, List)> {
+        if let Ok(list) = ground.view().list(args)
+            && let Some(&first) = list.first()
+            && let Ok(PNode::Adt(adt, _)) = ground.view().node(first)
+            && let Some(&(_, _, impl_fn)) = self.resolves.iter().find(|&&(tr_fn, a, _)| tr_fn == item && a == adt)
+        {
+            return Some((impl_fn, List::EMPTY));
+        }
+        Some((item, args))
     }
 }
