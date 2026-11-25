@@ -216,4 +216,21 @@ fn submodule_entries_commit_to_tree_digest_and_fail_closed_on_reads() {
     let mut bad = crate::pack::Builder::new(crate::pack::Kind::Git, [9u8; 32], limits, 64, alloc).expect("builder");
     bad.file("v8", crate::Mode::Submodule, b"short").expect("begin");
     assert!(matches!(bad.finish(), Err(crate::PackRefused::Form { .. })));
+
+    // Tree listing and parse reject non-20-byte submodule entries.
+    let mut bad_entries = [crate::tree::Entry {
+        path: alloc::string::String::from("v8"),
+        kind: crate::tree::Kind::Submodule,
+        blake3: crate::Blake3::of(&oid_a),
+        len: 1,
+    }];
+    assert!(matches!(
+        crate::tree::listing(&mut bad_entries),
+        Err(crate::tree::TreeRefused::Path { .. })
+    ));
+    let bad_listing = alloc::format!("blaze tree 3\nsubmodule {} 1 v8\n", crate::Blake3::of(&oid_a).hex());
+    assert!(matches!(
+        crate::tree::parse(bad_listing.as_bytes()),
+        Err(crate::tree::TreeRefused::Line { line: 2, .. })
+    ));
 }

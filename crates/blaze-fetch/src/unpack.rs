@@ -385,7 +385,12 @@ pub fn git_record_in<'a, S: Sink>(
             (GitMode::File, Some(object)) => (Mode::File, ListedPayload::Blob(object), object.size),
             (GitMode::Exec, Some(object)) => (Mode::Exec, ListedPayload::Blob(object), object.size),
             (GitMode::Symlink, Some(object)) => (Mode::Link, ListedPayload::Blob(object), object.size),
-            (GitMode::Submodule, None) => (Mode::Submodule, ListedPayload::Submodule(file.oid), 20),
+            (GitMode::Submodule, None) => {
+                if planted(Plant::DropSubmodule) {
+                    return;
+                }
+                (Mode::Submodule, ListedPayload::Submodule(file.oid), 20)
+            }
             // Unreachable from `blaze_git_fetch::files`, which only emits `None` for `Submodule`.
             (_, None) | (GitMode::Submodule, Some(_)) => return,
         };

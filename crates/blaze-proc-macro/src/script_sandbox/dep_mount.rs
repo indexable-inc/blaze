@@ -443,7 +443,7 @@ impl ScriptSandbox {
         let script = Arc::clone(&self.script);
         match &script.deps.mounts[mount].served {
             Served::Keyed(files) | Served::Stored { inline: files, .. } => {
-                let tree = Tree::Mem { files: Arc::clone(files), git: None };
+                let tree = Tree::Mem { files: Arc::clone(files), submodules: Arc::from([]), git: None };
                 match tree.node(&rel) {
                     Ok(found) => Ok(found.map(owned)),
                     Err(why) => Err(self.refuse(Refusal::Path(why.to_string()))),
@@ -523,7 +523,7 @@ mod tests {
     /// `zstd/lib/zstd.h`, which left `include/a.h` in its `OUT_DIR`.
     fn producer(header: &[u8]) -> DepProducer {
         DepProducer {
-            tree: Tree::Mem { files: files(&[("zstd/lib/zstd.h", b"the producer's zstd.h")]), git: None },
+            tree: Tree::Mem { files: files(&[("zstd/lib/zstd.h", b"the producer's zstd.h")]), submodules: Arc::from([]), git: None },
             root: ScriptRoot::package(),
             out_dir: SYS_OUT.to_owned(),
             out: files(&[("include/a.h", header)]),
@@ -540,7 +540,7 @@ mod tests {
         env.sort();
         Arc::new(Script {
             package: "reader 0.0.0".to_owned(),
-            tree: Tree::Mem { files: files(&[("zstd/lib/zstd.h", b"the reader's own zstd.h")]), git: None },
+            tree: Tree::Mem { files: files(&[("zstd/lib/zstd.h", b"the reader's own zstd.h")]), submodules: Arc::from([]), git: None },
             root: ScriptRoot::package(),
             env,
             target: "aarch64-apple-darwin".to_owned(),
@@ -653,7 +653,7 @@ mod tests {
         let made = producer(b"#define A 1\n");
         let include = format!("{SYS_OUT}/include");
         let deps = [DepMetadata { links: "x", key: "include", value: include.as_str() }, DepMetadata { links: "x", key: "root", value: "/package/zstd/lib" }];
-        let reader_tree = Tree::Mem { files: files(&[("zstd/lib/zstd.h", b"the reader's own zstd.h")]), git: None };
+        let reader_tree = Tree::Mem { files: files(&[("zstd/lib/zstd.h", b"the reader's own zstd.h")]), submodules: Arc::from([]), git: None };
         let viewed = view(&reader_tree, &[("x", &made)], &deps, alloc).unwrap_or_else(|e| panic!("{e}"));
         let values: Vec<&str> = viewed.values.iter().map(|v| v.as_str()).collect();
         assert_eq!(values, [include.as_str(), "/deps/x/zstd/lib"], "the producer's own mount is renamed for the reader");
@@ -721,7 +721,7 @@ mod tests {
         const B_OUT: &str = "/target/debug/build/b-3333333333333333/out";
         let alloc = blaze_own::testing::heap().alloc();
         let a = |header: &[u8]| DepProducer {
-            tree: Tree::Mem { files: files(&[]), git: None },
+            tree: Tree::Mem { files: files(&[]), submodules: Arc::from([]), git: None },
             root: ScriptRoot::package(),
             out_dir: A_OUT.to_owned(),
             out: files(&[("include/x.h", header)]),
@@ -730,7 +730,7 @@ mod tests {
             upstream: Arc::new(Vec::new()),
         };
         let b_over = |a: &DepProducer| {
-            DepProducer { tree: Tree::Mem { files: files(&[]), git: None }, root: ScriptRoot::package(), out_dir: B_OUT.to_owned(), out: files(&[]), stored: Arc::new(Vec::new()), stored_files: Arc::new(Vec::new()), upstream: Arc::new(Vec::new()) }
+            DepProducer { tree: Tree::Mem { files: files(&[]), submodules: Arc::from([]), git: None }, root: ScriptRoot::package(), out_dir: B_OUT.to_owned(), out: files(&[]), stored: Arc::new(Vec::new()), stored_files: Arc::new(Vec::new()), upstream: Arc::new(Vec::new()) }
                 .with_upstream(DepProducer::closure(&[("a", a)]))
         };
         let a_made = a(b"#define X 1\n");
@@ -739,7 +739,7 @@ mod tests {
 
         let forwarded = format!("{A_OUT}/include");
         let deps = [DepMetadata { links: "b", key: "include", value: forwarded.as_str() }];
-        let reader_tree = Tree::Mem { files: files(&[]), git: None };
+        let reader_tree = Tree::Mem { files: files(&[]), submodules: Arc::from([]), git: None };
         let viewed = view(&reader_tree, &[("b", &b)], &deps, alloc).unwrap_or_else(|e| panic!("a forwarded path: {e}"));
         let values: Vec<&str> = viewed.values.iter().map(|v| v.as_str()).collect();
         assert_eq!(values, [forwarded.as_str()], "an OUT_DIR path keeps its text");

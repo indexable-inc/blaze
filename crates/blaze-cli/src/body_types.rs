@@ -553,6 +553,9 @@ impl<'f> SyncLazyTrees<'f> {
     }
 
     fn record_pack_refusal(&self, why: &blaze_fetch::PackRefused) {
+        if self.refused.get().is_some() {
+            return;
+        }
         let mut msg = blaze_own::AString::new_in(self.heap.alloc());
         blaze_text::Writes::show(&mut msg, why);
         let leaked: &'static str = blaze_own::Box::leak_static(msg.into_boxed_str());

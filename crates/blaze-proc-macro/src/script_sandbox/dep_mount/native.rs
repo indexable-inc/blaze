@@ -270,7 +270,7 @@ mod tests {
         let mut record = AVec::new_in(alloc.clone());
         outputs.encode(&mut record);
         let opened = OutputsRef::open(&record).unwrap_or_else(|e| panic!("{e:?}"));
-        let tree = Tree::Mem { files: Arc::new(vec![("inc/b.h".to_owned(), b"int b;\n".to_vec())]), git: None };
+        let tree = Tree::Mem { files: Arc::new(vec![("inc/b.h".to_owned(), b"int b;\n".to_vec())]), submodules: Arc::from([]), git: None };
         let given = [GivenRun { script: UnitId(2), links: "lz4", outputs: opened, tree, root: ScriptRoot::package(), direct: true }];
 
         let served = served_links(&graph, UnitId(0), &given).unwrap_or_else(|e| panic!("{e}"));

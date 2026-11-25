@@ -165,7 +165,9 @@ pub(crate) fn fold(path: &str) -> String {
 /// no path under a file.
 fn check(entries: &[Entry]) -> Result<(), TreeRefused> {
     for entry in entries {
-        if let Some(why) = bad_path(&entry.path) {
+        let why = bad_path(&entry.path)
+            .or_else(|| (entry.kind == Kind::Submodule && entry.len != 20).then_some("is a submodule whose length is not 20 bytes"));
+        if let Some(why) = why {
             return Err(TreeRefused::Path { path: entry.path.clone(), why }); // clone: error path
         }
     }
@@ -247,6 +249,9 @@ pub fn parse(bytes: &[u8]) -> Result<Vec<Entry>, TreeRefused> {
             return Err(refused("has no length in decimal digits with no leading zero"));
         }
         let len: u64 = len.parse().map_err(|_| refused("has a length past 64 bits"))?;
+        if kind == Kind::Submodule && len != 20 {
+            return Err(refused("is a submodule whose length is not 20 bytes"));
+        }
         if bad_path(path).is_some() {
             return Err(refused("has a path a tree can't have"));
         }
