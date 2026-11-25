@@ -928,9 +928,64 @@ fn filled(regions: &List<Region>) -> Result<(), LifeRefusal> {
     Ok(())
 }
 
+/// The `Self` type a member fn belongs to, used to detect a receiver reference chain around `Self`.
+#[derive(Clone, Copy)]
+enum ReceiverSelf {
+    Impl(PTy),
+    Trait,
+}
+
+impl ReceiverSelf {
+    fn matches<'n, S: NamesSource<'n>>(self, r: &Reader<'_, 'n, S>, ty: PTy) -> bool {
+        match self {
+            ReceiverSelf::Impl(s) => ty == s,
+            ReceiverSelf::Trait => matches!(r.node(ty), Ok(PNode::Param(0))),
+        }
+    }
+}
+
+/// Whether a typed `self` parameter (`self: &Arc<Self>`, `self: Pin<&mut Self>`, `self: &Self`,
+/// ...) wraps `self_ty` in a pointer/reference chain with **exactly one** `&` / `&mut` and only
+/// zero-position wrapper ADTs before it (the Reference, "Lifetime elision in functions"; RFC 2394).
+fn receiver_has_single_ref<'n, S: NamesSource<'n>>(r: &mut Reader<'_, 'n, S>, mut ty: PTy, self_ty: ReceiverSelf) -> Result<bool, LifeRefusal> {
+    const MAX_DEPTH: usize = 16;
+    let mut refs = 0u32;
+    for _ in 0..MAX_DEPTH {
+        if self_ty.matches(r, ty) {
+            return Ok(refs == 1);
+        }
+        match r.node(ty)? {
+            PNode::Ref(_, inner) => {
+                refs += 1;
+                if refs > 1 {
+                    return Ok(false);
+                }
+                ty = inner;
+            }
+            PNode::Adt(adt, args) => {
+                if refs == 0 && r.adt_positions(adt)? != 0 {
+                    return Ok(false);
+                }
+                let list = r.list(args)?;
+                let Some(&first) = list.first() else { return Ok(false) };
+                ty = first;
+            }
+            _ => return Ok(false),
+        }
+    }
+    Ok(false)
+}
+
 /// A fn's lifetime part: `v` its own text's view, `inputs` and `output` its head's erased types,
 /// `container` its impl's or trait's part. `r` is new, with the fn's module set.
-fn read_fn<'n, S: NamesSource<'n>>(r: &mut Reader<'_, 'n, S>,v: &View<'_>, inputs: &[PTy], output: PTy, container: Option<&ContainerLife>) -> Result<FnLife, LifeRefusal> {
+fn read_fn<'n, S: NamesSource<'n>>(
+    r: &mut Reader<'_, 'n, S>,
+    v: &View<'_>,
+    inputs: &[PTy],
+    output: PTy,
+    container: Option<&ContainerLife>,
+    receiver_self: Option<ReceiverSelf>,
+) -> Result<FnLife, LifeRefusal> {
     let alloc = r.alloc;
     let mut bounds: List<(Region, Region)> = Vec::new_in(alloc);
     let mut container_named = 0u32;
@@ -978,14 +1033,10 @@ fn read_fn<'n, S: NamesSource<'n>>(r: &mut Reader<'_, 'n, S>,v: &View<'_>, input
             lf::SelfKind::Value => r.line_up(v, Pair { syn: Syn::SelfTy, ty, base, ctx: Ctx::Other }, Elide::Input, &mut regions)?,
             lf::SelfKind::No | lf::SelfKind::Typed => {
                 let t = prm.ty.ok_or(LifeRefusal::Unaligned { at })?;
-                let mut by_ref = false;
-                if j == 0
-                    && prm.self_kind == lf::SelfKind::Typed
-                    && let lf::TypeRef::Ref { inner, .. } = v.ty(t)?
-                    && let lf::TypeRef::Path(p) = v.ty(inner)?
-                {
-                    by_ref = is_self_path(v, p)?;
-                }
+                let by_ref = match (j, prm.self_kind, receiver_self) {
+                    (0, lf::SelfKind::Typed, Some(rs)) => receiver_has_single_ref(r, ty, rs)?,
+                    _ => false,
+                };
                 r.line_up(v, Pair { syn: Syn::Ty(t), ty, base, ctx: Ctx::Other }, Elide::Input, &mut regions)?;
                 if by_ref {
                     receiver = regions.get(base as usize).copied();
@@ -1376,7 +1427,7 @@ impl<'n> Store<'n> {
         if has_container {
             self.container_life(names, keys, lib)?;
         }
-        let Store { tys, fns, inferred_outputs, lives, locals, .. } = self;
+        let Store { tys, fns, impls, inferred_outputs, lives, locals, .. } = self;
         let Lives { counts, containers, alloc, .. } = lives;
         let h = fns.get(&key).ok_or(LifeRefusal::NoHead)?;
         let h_output = inferred_outputs.get(&key).copied().unwrap_or(h.output);
@@ -1389,13 +1440,21 @@ impl<'n> Store<'n> {
         } else {
             None
         };
+        let receiver_self = if has_container {
+            match impls.get(&checker_of(lib)) {
+                Some(i) => Some(ReceiverSelf::Impl(i.self_ty)),
+                None => Some(ReceiverSelf::Trait),
+            }
+        } else {
+            None
+        };
         super::heads::with_lowered(names, lib, h.text, |v| {
             let mut r = Reader::new(names, keys, locals, tys.view(), counts, h.module, *alloc);
             // The container's type parameters shadow items too: every name the head was read with.
             for &(name, _) in h.params.iter() {
                 r.params.push(name);
             }
-            read_fn(&mut r, v, &h.inputs[..], h_output, container)
+            read_fn(&mut r, v, &h.inputs[..], h_output, container, receiver_self)
         })
         .map_err(|_| LifeRefusal::Text)?
     }

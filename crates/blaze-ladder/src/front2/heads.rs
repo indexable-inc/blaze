@@ -2134,7 +2134,9 @@ struct FnSig<'s> {
     container: Option<&'s ContainerRegions>,
     /// How many fragments on the sink are inputs (the one after them is the return type's).
     inputs_laid: usize,
-    /// Input 0 is `&self`, `&mut self` or `self: &Self` (elision's receiver rule).
+    /// Input 0 is a `self` receiver whose wrapper chain around `Self` contains exactly one
+    /// reference (`&self`, `&mut self`, `self: &Self`, `self: &Arc<Self>`, `self: Pin<&mut Self>`,
+    /// ...: elision's receiver rule).
     receiver: bool,
     /// A fn (a constant's or static's type elides to `'static`).
     item_fn: bool,
@@ -2204,6 +2206,47 @@ impl FnSig<'_> {
             Used::None | Used::Many => Err(RegionRefusal::not_laid(NotLaidWhy::OpaqueElided, self.whole)),
         }
     }
+}
+
+/// Whether a `self` parameter's type `ty` wraps `self_ty` in a pointer/reference chain containing
+/// **exactly one** `&` / `&mut` (and only zero-lifetime wrapper ADTs like `Box`, `Rc`, `Arc`,
+/// `Pin` before that reference), so rustc's receiver lifetime elision rule applies (the Reference,
+/// "Lifetime elision in functions"; RFC 2394): `&self`, `&mut self`, `self: &Self`,
+/// `self: &Arc<Self>`, `self: Pin<&mut Self>`, `self: Box<&Self>`, `self: Pin<&Arc<Self>>`,
+/// `self: &Arc<S<'a>>`, etc.
+///
+/// Rejects zero references (`self`, `self: Box<Self>`, `self: Arc<S<'a>>`,
+/// `impl Tr for &T { fn f(self, ...) }`) and two or more references (`self: &'a &'b Self`,
+/// `self: &mut Pin<&mut Self>`). Because every wrapper ADT peeled before the reference has 0
+/// lifetime parameters, slot 0 of input 0's region fragment is guaranteed to be that single
+/// reference's lifetime.
+fn receiver_has_single_ref(tys: tc::PTys<'_>, mut ty: PTy, self_ty: PTy, arity: &dyn tc::regions::Arity) -> bool {
+    const MAX_DEPTH: usize = 16;
+    let mut refs = 0u32;
+    for _ in 0..MAX_DEPTH {
+        if ty == self_ty {
+            return refs == 1;
+        }
+        match tys.node(ty) {
+            Ok(PNode::Ref(_, inner)) => {
+                refs += 1;
+                if refs > 1 {
+                    return false;
+                }
+                ty = inner;
+            }
+            Ok(PNode::Adt(adt, args)) => {
+                if refs == 0 && !matches!(arity.adt_lifetimes(adt), tc::regions::Count::Known(0)) {
+                    return false;
+                }
+                let Ok(list) = tys.list(args) else { return false };
+                let Some(&first) = list.first() else { return false };
+                ty = first;
+            }
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// E0106, the one place it is the PROGRAM's error (a hard [`Why::Program`], the head refused):
@@ -4820,7 +4863,7 @@ impl<'n> Store<'n> {
                     ItemDetail::Const { .. } => DynMember::Const,
                     d => return Err(Why::Unsupported(crate::front::detail_name(d), whole)),
                 };
-                let shape = super::dyn_ty::member(&b.resolver, module, self.sized, &self.pointers, kind, mv)?;
+                let shape = super::dyn_ty::member(&b.resolver, module, self.sized, &self.pointers, b.marks, self.work_alloc(), kind, mv)?;
                 members.push(tc::dyn_compat::MemberFacts { name: Name::of(m.name), shape });
                 Ok(())
             })
@@ -6560,7 +6603,11 @@ impl<'n> Store<'n> {
         // How the signature elides (D148): numbered by `numbering`, the output rule over the
         // inputs' fragments. `fn_regions` below lays the signature by it, and a return opaque's
         // bounds take `'_` by it ([`FnSig::opaque_elided`]).
-        let receiver = self_param && matches!((inputs.first().map(|&t| self.tys.view().node(t)), self_ty), (Some(Ok(PNode::Ref(_, p))), Some(s)) if p == s);
+        let receiver = self_param
+            && matches!(
+                (inputs.first().copied(), self_ty),
+                (Some(t), Some(s)) if receiver_has_single_ref(self.tys.view(), t, s, &HeadsArity { heads: b.heads, opaques: &[], names: b.resolver.names })
+            );
         let sig = FnSig { numbering, own: &own_names, elided: &elided_ids, container: container_regions, inputs_laid, receiver, item_fn: matches!(detail, ItemDetail::Fn { .. }), is_async, whole };
         // A return opaque's scope: the fn's names, and `'_` (`-> impl Trait + '_`,
         // `-> impl Iterator<Item = &u8>`) by the output rule, or why it gives none (soft).
@@ -7087,6 +7134,52 @@ pub fn p(q: fn(&u8) -> &u8) {}
         assert!(refused.contains("E0106"), "ORACLE: `h`'s refusal names E0106: {refused}");
         let (sig, _) = sig_of("pub fn h(x: &u8) -> &u8 { x }\n", free("h")).unwrap_or_else(|e| panic!("CONTROL: one input refused: {e}"));
         assert_eq!(sig, [Region::Param(0), Region::Param(0)], "CONTROL: one input's lifetime is the output's");
+    }
+
+    /// Smart-pointer reference receivers (`self: &Arc<Self>`, `self: Pin<&mut Self>` — as in
+    /// `commonware-runtime`'s `Opens::open(self: &Arc<Self>, partition: &str, name: &[u8]) ->
+    /// Opened<'_>`) elide output lifetimes to that single receiver reference's lifetime (RFC 2394).
+    /// Controls: two references on the receiver spine (`self: &&Self`) or zero references
+    /// (`self: Box<Self>`) with multiple ref inputs MUST still report E0106.
+    #[test]
+    fn a_smart_pointer_ref_receiver_elides_output_to_self() {
+        const SRC: &str = "\
+pub struct Wrap<T>(T);
+pub struct Guard<'a>(&'a u8);
+pub struct Opens;
+impl Opens {
+    pub fn open_ref_wrap(self: &Wrap<Self>, a: &u8, b: &u8) -> Guard<'_> { loop {} }
+    pub fn open_wrap_ref(self: Wrap<&mut Self>, a: &u8, b: &u8) -> Guard<'_> { loop {} }
+    pub fn bad_double_ref(self: &&Self, a: &u8) -> Guard<'_> { loop {} }
+    pub fn bad_no_ref(self: Wrap<Self>, a: &u8, b: &u8) -> Guard<'_> { loop {} }
+}
+";
+        let method = |name: &'static str| {
+            move |names: crate::front2::tables::head_tests::Src| {
+                let mut found = None;
+                for w in cells(names).iter() {
+                    if let Want::MemberFn(lib, k) = *w
+                        && k == member_key_of(checker_of(lib), MemberKind::Fn, name)
+                    {
+                        found = Some((*w, k));
+                    }
+                }
+                found.unwrap_or_else(|| panic!("`Opens::{name}`'s cell"))
+            }
+        };
+        let (sig_rw, late_rw) = sig_of(SRC, method("open_ref_wrap")).unwrap_or_else(|e| panic!("`open_ref_wrap` refused: {e}"));
+        assert_eq!(sig_rw, [Region::Param(0), Region::Param(1), Region::Param(2), Region::Param(0)], "ORACLE: `&Wrap<Self>` elides output to receiver ref");
+        assert_eq!(late_rw, [true, true, true], "`open_ref_wrap` late-bound elided inputs");
+
+        let (sig_wr, late_wr) = sig_of(SRC, method("open_wrap_ref")).unwrap_or_else(|e| panic!("`open_wrap_ref` refused: {e}"));
+        assert_eq!(sig_wr, [Region::Param(0), Region::Param(1), Region::Param(2), Region::Param(0)], "ORACLE: `Wrap<&mut Self>` elides output to receiver ref");
+        assert_eq!(late_wr, [true, true, true], "`open_wrap_ref` late-bound elided inputs");
+
+        let err_double = sig_of(SRC, method("bad_double_ref")).expect_err("CONTROL: `&&Self` with extra ref input must be E0106");
+        assert!(err_double.contains("E0106"), "CONTROL: `&&Self` refusal names E0106: {err_double}");
+
+        let err_none = sig_of(SRC, method("bad_no_ref")).expect_err("CONTROL: `Wrap<Self>` with two ref inputs must be E0106");
+        assert!(err_none.contains("E0106"), "CONTROL: `Wrap<Self>` refusal names E0106: {err_none}");
     }
 
     /// A fn pointer argument `fn(&u8) -> &u8` binds its own lifetime: both slots are
