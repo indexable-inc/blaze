@@ -23,6 +23,8 @@ blaze-cad-mesh.workspace = true
 blaze-cad-out.workspace = true
 # Pictures of a solid.
 blaze-cad-picture.workspace = true
+# Standalone PBR material, HDRI IBL, smart-material & CC0 pack library.
+blaze-pbr.workspace = true
 # `Vec3`, `Aabb3`, `Interval`.
 blaze-math.workspace = true
 # Lengths, angles, densities, masses, volumes at the public boundary (D184).

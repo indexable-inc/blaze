@@ -33,6 +33,7 @@ const MATERIALS: [Material<'static>; 3] = [
         emissive_strength: None,
         clearcoat: None,
         double_sided: false,
+        ..
     },
     // 1: Brushed backing / silvered mirror panel
     Material {
@@ -44,6 +45,7 @@ const MATERIALS: [Material<'static>; 3] = [
         emissive_strength: None,
         clearcoat: None,
         double_sided: false,
+        ..
     },
     // 2: Machined hardwood/aluminum French cleats
     Material {
@@ -55,6 +57,7 @@ const MATERIALS: [Material<'static>; 3] = [
         emissive_strength: None,
         clearcoat: None,
         double_sided: false,
+        ..
     },
 ];
 

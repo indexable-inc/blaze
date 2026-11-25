@@ -645,6 +645,7 @@ fn mesh_preview_case(tape: &Tape, plant: impl Planted<MeshPicturePlant> + Copy) 
         emissive_strength: None,
         clearcoat: None,
         double_sided: false,
+        ..
     }];
     let v = View {
         eye: [Length::mm(shift_x_mm), Length::mm(-140.0), Length::mm(shift_z_mm)],
@@ -766,6 +767,7 @@ fn mesh_preview_case(tape: &Tape, plant: impl Planted<MeshPicturePlant> + Copy) 
         emissive_strength: None,
         clearcoat: None,
         double_sided: false,
+        ..
     }];
     let tex_rgba: [u8; 16] = [
         240, 20, 20, 255, 20, 40, 240, 255,
@@ -843,6 +845,7 @@ fn mesh_preview_matches_sdf_silhouette_and_draws_wireframe() {
         emissive_strength: None,
         clearcoat: None,
         double_sided: false,
+        ..
     }];
 
     let sdf_pic = render(&tape, v, PictureOpts { alloc: heap(), scratch: heap(), .. }).expect("sdf render");
@@ -1028,6 +1031,7 @@ fn zebra_mode_shows_smooth_stripes_on_sphere_and_kink_on_creased_box() {
         emissive_strength: None,
         clearcoat: None,
         double_sided: false,
+        ..
     }];
     let mesh_z1 = render_mesh(
         smooth.view(),
@@ -1163,6 +1167,7 @@ fn strip_lights_add_grazing_reflection_ribbons_deterministically() {
         emissive_strength: None,
         clearcoat: None,
         double_sided: false,
+        ..
     }];
     let base_mesh = render_mesh(
         smooth.view(),
@@ -1231,6 +1236,7 @@ fn mesh_renderer_samples_baked_base_roughness_and_normal_maps_and_catches_plant(
         emissive_strength: None,
         clearcoat: None,
         double_sided: false,
+        ..
     }];
 
     // 4×4 base-colour map: left 2 columns vivid red, right 2 columns vivid blue.
@@ -1486,4 +1492,182 @@ fn compare_diff_and_compose_side_by_side_and_grid() {
     }
     // Centre cross-gutter pixel equals grid background.
     assert_eq!(px_at(&grid, cell_w + 1, cell_h + 1), grid_bg);
+}
+
+#[test]
+fn pbr_shading_with_cc0_textures_smart_wear_and_ground_is_deterministic() {
+    use blaze_cad_mesh::{
+        BakeSurfaceOpts, MeshLimits, MeshOpts, ProjectUvOpts, TangentOpts, UvGrainAxis, UvMode, attach_tangents, auto_grid,
+        bake_sdf_surface, mesh, project_uvs,
+    };
+    use blaze_cad_out::Material;
+    use blaze_pbr::{ProceduralKind, synthesize_cc0_pack};
+
+    let mut g = Graph::new(GraphOpts { alloc: heap(), .. });
+    let s = g
+        .cuboid(BoxOpts { size: [Length::mm(120.0), Length::mm(80.0), Length::mm(60.0)], round: Length::mm(8.0), .. })
+        .unwrap();
+    let tape = compile(&g, s.id(), CompileOpts { alloc: heap(), .. }).unwrap();
+    let grid = auto_grid(&tape.aabb(), Length::mm(3.0), None);
+    let meshed = mesh(
+        &tape,
+        MeshOpts {
+            tolerance: Length::mm(3.0),
+            piece: grid.piece,
+            feature: grid.feature,
+            limits: MeshLimits::SHIPPED,
+            alloc: heap(),
+            scratch: heap(),
+            ..
+        },
+    )
+    .unwrap();
+    let uvd = project_uvs(
+        &meshed.mesh.view(),
+        ProjectUvOpts { mode: UvMode::BoxMetric { tile_size: Length::mm(80.0), grain: UvGrainAxis::Longest }, alloc: heap(), scratch: heap() },
+    )
+    .unwrap();
+    let tanned = attach_tangents(&uvd.view(), TangentOpts { alloc: heap(), scratch: heap() }).unwrap();
+    let baked = bake_sdf_surface(
+        &tanned.view(),
+        &tape,
+        BakeSurfaceOpts { ao_radius: Length::mm(30.0), curvature_radius: Length::mm(4.0), cavity_radius: Length::mm(6.0), alloc: heap(), scratch: heap(), .. },
+    )
+    .unwrap();
+
+    let pack = synthesize_cc0_pack(
+        ProceduralKind::HullPlating { base_rgb: [0.35, 0.42, 0.50], metallic: 0.75, roughness: 0.35, panels: 2 },
+        64,
+        heap(),
+        heap(),
+    )
+    .unwrap();
+    let look = [MaterialLook { textures: pack.view(1.0, false), smart: SmartMaterial::PAINTED_METAL }];
+    let mat = [Material { name: "hull", base_colour: [1.0, 1.0, 1.0, 1.0], metallic: 1.0, roughness: 1.0, .. }];
+    let view = View {
+        eye: [Length::mm(180.0), Length::mm(-180.0), Length::mm(130.0)],
+        target: [Length::ZERO; 3],
+        projection: Projection::Perspective { fov: Angle::degrees(40.0) },
+        width: 40,
+        height: 40,
+        ..
+    };
+
+    let p1 = render_mesh(
+        baked.view(),
+        &mat,
+        view,
+        MeshPictureOpts {
+            alloc: heap(),
+            scratch: heap(),
+            shading: Shading::Pbr(PbrOpts::HANGAR),
+            material_looks: &look,
+            ..
+        },
+    )
+    .expect("pbr render 1");
+    let p2 = render_mesh(
+        baked.view(),
+        &mat,
+        view,
+        MeshPictureOpts {
+            alloc: heap(),
+            scratch: heap(),
+            shading: Shading::Pbr(PbrOpts::HANGAR),
+            material_looks: &look,
+            ..
+        },
+    )
+    .expect("pbr render 2");
+    assert_eq!(p1.pixels[..], p2.pixels[..], "PBR render must be byte-for-byte deterministic");
+
+    let p_clean = render_mesh(
+        baked.view(),
+        &mat,
+        view,
+        MeshPictureOpts {
+            alloc: heap(),
+            scratch: heap(),
+            shading: Shading::Pbr(PbrOpts { instance_wear: 0.0, ..PbrOpts::HANGAR }),
+            material_looks: &look,
+            ..
+        },
+    )
+    .expect("pbr clean");
+    assert_ne!(p1.pixels[..], p_clean.pixels[..], "SDF smart-material wear must visibly modulate shaded pixels");
+}
+
+#[test]
+fn prepared_scene_tiled_bands_match_full_frame_bit_for_bit() {
+    use blaze_cad_mesh::{MeshOpts, mesh};
+    use blaze_cad_out::Material;
+    use blaze_own::Vec as OwnVec;
+
+    let mut g = Graph::new(GraphOpts { alloc: heap(), .. });
+    let cube = g.cuboid(BoxOpts { size: [Length::mm(70.0); 3], round: Length::mm(8.0), .. }).expect("cube");
+    let tape = compile(&g, cube.id(), CompileOpts { alloc: heap(), .. }).expect("compile");
+    let meshed = mesh(&tape, MeshOpts { alloc: heap(), scratch: heap(), tolerance: Length::mm(1.2), .. }).expect("mesh");
+
+    const MAT: [Material<'static>; 1] = [Material {
+        name: "titanium",
+        base_colour: [0.76, 0.78, 0.82, 1.0],
+        metallic: 0.90,
+        roughness: 0.28,
+        ..
+    }];
+    let parts = [MeshScenePart {
+        mesh: meshed.mesh.view(),
+        transform: blaze_cad_out::Transform::IDENTITY,
+        parent: None,
+        tint_override: None,
+    }];
+    let scene = PreparedMeshScene::new(&parts, &MAT, [180, 185, 192], heap()).expect("prepare scene");
+    let scene_ref = scene.as_ref();
+
+    let view = View {
+        eye: [Length::mm(170.0), Length::mm(-160.0), Length::mm(120.0)],
+        target: [Length::ZERO; 3],
+        projection: Projection::Perspective { fov: Angle::degrees(38.0) },
+        width: 32,
+        height: 24,
+        ..
+    };
+    let params = PbrRenderParams { supersample: 2, .. };
+    let pbr = PbrOpts { aperture_radius_mm: 2.5, denoise: true, ao_steps: 4, shadow_samples: 2, ..PbrOpts::STUDIO };
+    let n = (view.width * view.height) as usize;
+
+    let mut hdr_full = std::vec![[0.0f64; 3]; n];
+    let mut gbuf_full = std::vec![GBufferPixel::SKY; n];
+    let mut depth_full = std::vec![f64::INFINITY; n];
+    let st_full = scene_ref
+        .render_pbr_rows(view, &params, &pbr, 0, view.height, &mut hdr_full, &mut gbuf_full, &mut depth_full)
+        .expect("full band");
+    let mut d_full_own = OwnVec::try_with_capacity_in(n, heap()).unwrap();
+    for d in depth_full {
+        d_full_own.try_push(d).unwrap();
+    }
+    let pic_full = finish_pbr_frame(&mut hdr_full, &gbuf_full, d_full_own, view.width, view.height, &pbr, st_full, heap(), heap())
+        .expect("finish full");
+
+    let mid = view.height / 2;
+    let split = (mid * view.width) as usize;
+    let mut hdr_tiled = std::vec![[0.0f64; 3]; n];
+    let mut gbuf_tiled = std::vec![GBufferPixel::SKY; n];
+    let mut depth_tiled = std::vec![f64::INFINITY; n];
+    let (h0, h1) = hdr_tiled.split_at_mut(split);
+    let (g0, g1) = gbuf_tiled.split_at_mut(split);
+    let (d0, d1) = depth_tiled.split_at_mut(split);
+    let st0 = scene_ref.render_pbr_rows(view, &params, &pbr, 0, mid, h0, g0, d0).expect("band 0");
+    let st1 = scene_ref.render_pbr_rows(view, &params, &pbr, mid, view.height, h1, g1, d1).expect("band 1");
+    let mut st_sum = st0;
+    st_sum.rays += st1.rays;
+    st_sum.hits += st1.hits;
+    let mut d_tiled_own = OwnVec::try_with_capacity_in(n, heap()).unwrap();
+    for d in depth_tiled {
+        d_tiled_own.try_push(d).unwrap();
+    }
+    let pic_tiled = finish_pbr_frame(&mut hdr_tiled, &gbuf_tiled, d_tiled_own, view.width, view.height, &pbr, st_sum, heap(), heap())
+        .expect("finish tiled");
+
+    assert_eq!(pic_full.pixels[..], pic_tiled.pixels[..], "tiled parallel bands must match full frame bit-for-bit");
 }

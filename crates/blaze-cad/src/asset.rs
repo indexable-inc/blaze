@@ -6,17 +6,21 @@
 
 #![blaze::sans_io]
 
-use blaze_cad_field::{CadPlant, Detail, Graph, Name, Placement};
+use blaze_cad_field::{CadPlant, Detail, Graph, Name, Placement, Tape};
 use blaze_cad_mesh::{
-    COS_32_DEGREES, DecimateOpts, Decimated, DecomposeOpts, FeatureProtect, FeatureRegion, FeatureZone, GridSizing, HullOpts,
-    LodOpts, MaterialRole, Mesh, MeshLimits, MeshOpts, MeshView, Meshed, PieceCache, Source, Stop, Target, UvOpts, auto_grid,
-    convex_hull, decimate, decompose, lod_chain, mesh, mesh_cached, topology, unwrap_uvs,
+    BakeSurfaceOpts, COS_32_DEGREES, DecimateOpts, Decimated, DecomposeOpts, FeatureProtect, FeatureRegion, FeatureZone,
+    FieldTransform, GridSizing, HullOpts, LodOpts, MaterialRole, Mesh, MeshLimits, MeshOpts, MeshView, Meshed, PieceCache,
+    ProjectUvOpts, Source, Stop, SurfaceAlphaMode, TangentOpts, Target, UvGrainAxis, UvMode, UvOpts, attach_tangents,
+    auto_grid, bake_sdf_surface, convex_hull, decimate, decompose, lod_chain, mesh, mesh_cached, project_uvs, topology,
+    unwrap_uvs,
 };
 use blaze_cad_out::{
-    Collider, Encoding, GlbOpts, Limits, Lod, MassFacts, Material, MaterialTextures, TexturePack, Up, glb, glb_textured,
+    Collider, Encoding, FlecsOpts, GlbOpts, Limits, Lod, MassFacts, Material, MaterialTextures, Socket, TextureImage,
+    TexturePack, Up, flecs_prefab, glb, glb_textured,
 };
 use blaze_cad_picture::{
-    HighlightStyle, MaterialMaps, MeshHighlight, MeshPictureOpts, MeshScenePart, Picture, View, Wireframe, render_mesh_scene,
+    HighlightStyle, MaterialLook, MaterialMaps, MeshHighlight, MeshPictureOpts, MeshScenePart, PbrOpts, Picture,
+    PreparedMeshScene, Shading, View, Wireframe, render_mesh_scene,
 };
 use blaze_math::Aabb3;
 use blaze_own::planted::{NoPlant, Planted, Plants};
@@ -212,9 +216,62 @@ impl AssetBakeOpts {
     };
 }
 
+/// A named attachment socket / datum attached to a part by name (e.g. `"door.hinge"`,
+/// `"light.port"`). Exported to glTF `extras.sockets` and Flecs v4.2 `socket_*` child entities.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct PartSocket<'n> {
+    pub part: Name,
+    pub name: &'n str,
+    pub placement: Placement,
+}
+
+impl<'n> PartSocket<'n> {
+    #[inline]
+    pub fn new(part: &str, name: &'n str, placement: Placement) -> PartSocket<'n> {
+        PartSocket { part: Name::new(part), name, placement }
+    }
+}
+
+/// Opt-in PBR mesh preparation stage for [`build_game_asset`]: semantic metric UV projection,
+/// MikkTSpace-compatible orthonormal tangents, and analytic SDF `[AO, Curvature, Cavity, Height]`
+/// vertex intelligence baked into `COLOR_0`.
+#[blaze::args]
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct PbrMeshOpts {
+    /// How local positions map to `TEXCOORD_0` (defaults to 1 m grain-aligned metric box UVs).
+    pub uv_mode: UvMode = UvMode::BoxMetric { tile_size: Length::nm(1_000_000_000), grain: UvGrainAxis::Longest },
+    /// Compute glTF 2.0 `[tx, ty, tz, w]` `TANGENT` attributes from the projected UVs.
+    pub compute_tangents: bool = true,
+    /// Bake analytic SDF `[AO, Curvature, Cavity, Height]` into `COLOR_0` (`[u8; 4]`).
+    pub bake_sdf_surface: bool = true,
+    /// Ambient occlusion probe radius (`None` auto-scales to 6% of part extent, clamped `25..=250 mm`).
+    pub ao_radius: Option<Length> = None,
+    /// Mean curvature probe radius (`None` auto-scales to `2 × part_tolerance`, clamped `3..=18 mm`).
+    pub curvature_radius: Option<Length> = None,
+    /// Curvature contrast gain (`1.6` default).
+    pub curvature_gain: f64 = 1.6,
+    /// Short-range cavity probe radius (`None` auto-scales to `3.5 × part_tolerance`, clamped `5..=32 mm`).
+    pub cavity_radius: Option<Length> = None,
+    /// What to pack into `COLOR_0.a` (defaults to normalized local height).
+    pub alpha_mode: SurfaceAlphaMode = SurfaceAlphaMode::LocalHeight,
+}
+
+impl PbrMeshOpts {
+    pub const DEFAULT: PbrMeshOpts = PbrMeshOpts {
+        uv_mode: UvMode::BoxMetric { tile_size: Length::nm(1_000_000_000), grain: UvGrainAxis::Longest },
+        compute_tangents: true,
+        bake_sdf_surface: true,
+        ao_radius: None,
+        curvature_radius: None,
+        curvature_gain: 1.6,
+        cavity_radius: None,
+        alpha_mode: SurfaceAlphaMode::LocalHeight,
+    };
+}
+
 /// Options for [`build_game_asset`].
 #[blaze::args]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct GameAssetOpts<'a, 's, 'm, 'f> {
     /// Allocator for the returned GLB bytes, report, and retained preview meshes.
     pub alloc: Alloc<'a>,
@@ -231,10 +288,20 @@ pub struct GameAssetOpts<'a, 's, 'm, 'f> {
     pub min_part_triangles: u32 = 24,
     /// Material table indexed by each part's [`MaterialRole`].
     pub materials: &'m [Material<'m>] = STEEL_ONLY,
+    /// Embedded texture images referenced by [`Material::pbr_textures`] (`ImageId`).
+    pub images: &'m [TextureImage<'m>] = &[],
     /// Optional per-feature critical targets (keyholes, bevels, mating surfaces) bound by part
     /// name: preserved with extra geometry during meshing & decimation, checked per feature, and
     /// highlighted in the export preview when any misses tolerance.
     pub features: &'f [PartFeature] = &[],
+    /// Optional named attachment sockets attached to parts by name.
+    pub sockets: &'f [PartSocket<'f>] = &[],
+    /// Optional PBR mesh preparation: metric UVs, tangents, and analytic SDF wear/AO/cavity baking.
+    pub pbr_mesh: Option<PbrMeshOpts> = None,
+    /// Optional whole-assembly SDF tape (`Model::assembly_tape`): when set alongside `pbr_mesh`,
+    /// `bake_sdf_surface` evaluates AO/curvature/cavity against the full assembled model so
+    /// neighboring parts cast real contact occlusion and seam crevices onto each other.
+    pub assembly_tape: Option<&'f Tape<'f>> = None,
     /// Optional per-part multi-material regions applied before decimation so material boundaries
     /// survive simplification on one continuous shell.
     pub material_regions: &'f [PartMaterialRegion] = &[],
@@ -972,6 +1039,105 @@ impl GameAsset<'_> {
         render_mesh_scene(&scene_parts, materials, view, eff_opts).map_err(ModelError::Picture)
     }
 
+    /// Build an immutable [`PreparedMeshScene`] (SAH BVH + emissive NEE light table) once from
+    /// this asset's exported meshes so multi-view or multi-threaded parallel hosts can call
+    /// `PreparedMeshScene::render_pbr_rows` across disjoint image bands without rebuilding the BVH.
+    pub fn prepare_pbr_scene<'p>(
+        &self,
+        materials: &[Material<'_>],
+        alloc: Alloc<'p>,
+        scratch: Alloc<'_>,
+    ) -> Result<PreparedMeshScene<'p>, ModelError> {
+        let mut scene_parts: Vec<MeshScenePart<'_>, Alloc<'_>> = Vec::new_in(scratch);
+        scene_parts
+            .try_reserve(self.parts.len())
+            .map_err(|_| ModelError::Alloc { what: "asset prepared scene parts" })?;
+        for p in self.parts.iter() {
+            scene_parts
+                .try_push(MeshScenePart {
+                    mesh: p.mesh.view(),
+                    parent: p.parent.map(|id| id.0),
+                    transform: transform_of(&p.placement),
+                    tint_override: None,
+                })
+                .map_err(|_| ModelError::Alloc { what: "asset prepared scene parts" })?;
+        }
+        PreparedMeshScene::new(&scene_parts, materials, [168, 178, 192], alloc).map_err(ModelError::Picture)
+    }
+
+    /// Render a photoreal PBR preview using `blaze-pbr` (Cook-Torrance GGX, procedural HDRI IBL,
+    /// CC0 PBR texture packs, SDF smart-material wear/grime/dust, soft area shadows, bounce
+    /// reflections/refraction, and AgX/ACES tone mapping).
+    pub fn preview_pbr<'p>(
+        &self,
+        materials: &[Material<'_>],
+        looks: &[MaterialLook<'_>],
+        view: View,
+        pbr: PbrOpts,
+        supersample: u8,
+        alloc: Alloc<'p>,
+        scratch: Alloc<'_>,
+    ) -> Result<Picture<'p>, ModelError> {
+        self.preview(
+            materials,
+            view,
+            MeshPictureOpts {
+                alloc,
+                scratch,
+                shading: Shading::Pbr(pbr),
+                material_looks: looks,
+                supersample,
+                ..
+            },
+        )
+    }
+
+    /// Emit a standalone Flecs v4.2 `.flecs` prefab mirroring this asset's exact part hierarchy,
+    /// transforms, mesh indices, material roles (`cc0_pack`), and optional named sockets.
+    pub fn export_flecs_prefab<'p>(
+        &self,
+        materials: &[Material<'_>],
+        sockets: &[PartSocket<'_>],
+        opts: FlecsOpts<'p, '_, '_>,
+    ) -> Result<Vec<u8, Alloc<'p>>, ModelError> {
+        let s = opts.scratch;
+        let mut all_sockets: Vec<Socket<'_>, Alloc<'_>> = Vec::new_in(s);
+        let mut sock_ranges: Vec<(usize, usize), Alloc<'_>> = Vec::new_in(s);
+        sock_ranges.try_reserve(self.parts.len()).map_err(|_| ModelError::Alloc { what: "flecs socket ranges" })?;
+        for ep in self.parts.iter() {
+            let start = all_sockets.len();
+            for ps in sockets {
+                if ps.part == ep.name {
+                    all_sockets
+                        .try_push(Socket { name: ps.name, transform: transform_of(&ps.placement) })
+                        .map_err(|_| ModelError::Alloc { what: "flecs sockets" })?;
+                }
+            }
+            sock_ranges.try_push((start, all_sockets.len())).map_err(|_| ModelError::Alloc { what: "flecs socket ranges" })?;
+        }
+
+        let mut nodes: Vec<blaze_cad_out::Part<'_>, Alloc<'_>> = Vec::new_in(s);
+        nodes.try_reserve(self.parts.len()).map_err(|_| ModelError::Alloc { what: "flecs nodes" })?;
+        for (i, ep) in self.parts.iter().enumerate() {
+            let (ss, se) = sock_ranges[i];
+            nodes
+                .try_push(blaze_cad_out::Part {
+                    name: ep.name.as_str(),
+                    parent: ep.parent.map(|p| p.0),
+                    transform: transform_of(&ep.placement),
+                    mesh: Some(ep.mesh.view()),
+                    lods: &[],
+                    mass: None,
+                    joint: None,
+                    collider: None,
+                    sockets: &all_sockets[ss..se],
+                })
+                .map_err(|_| ModelError::Alloc { what: "flecs nodes" })?;
+        }
+        let scene = blaze_cad_out::Scene { parts: &nodes, materials, .. };
+        flecs_prefab(&scene, opts).map_err(ModelError::Flecs)
+    }
+
     /// Render a preview using the **actual exported meshes** tinted with one distinct colour per
     /// named part (ideal for verifying part boundaries, wireframe density, and budget allocation).
     pub fn preview_part_colors<'p>(&self, view: View, opts: MeshPictureOpts<'p, '_, '_>) -> Result<Picture<'p>, ModelError> {
@@ -1458,7 +1624,61 @@ pub fn build_game_asset_planted<'a, P: Planted<CadPlant>>(
             let opt = prepare_gpu_mesh(&unwrapped.mesh.view(), Some(brole), o.optimize_gpu, o.vertex_cache_size, o.alloc, s)?;
             (opt, Some(maps), Some(brole), Some(unwrapped.texels_per_metre))
         } else {
-            let opt = prepare_gpu_mesh(&base_view, stamp_role, o.optimize_gpu, o.vertex_cache_size, o.alloc, s)?;
+            let pbr_prepared = if let Some(pm) = o.pbr_mesh {
+                let uv_mode = part.uv_mode.unwrap_or(pm.uv_mode);
+                let uvd = project_uvs(&base_view, ProjectUvOpts { mode: uv_mode, alloc: s, scratch: s })?;
+                let tanned = if pm.compute_tangents {
+                    attach_tangents(&uvd.view(), TangentOpts { alloc: s, scratch: s })?
+                } else {
+                    uvd
+                };
+                let baked_v = if pm.bake_sdf_surface {
+                    let local_tape = part_tape(g, part, Detail::Full, s)?;
+                    let bounds = local_tape.aabb();
+                    let ext_mm = if bounds.is_empty() {
+                        200.0
+                    } else {
+                        let dim = bounds.hi - bounds.lo;
+                        (dim.x.max(dim.y).max(dim.z) * 1000.0).max(20.0)
+                    };
+                    let tol_mm = part_tols[i].as_mm().max(0.5);
+                    let ao_radius = pm.ao_radius.unwrap_or_else(|| Length::mm((ext_mm * 0.06).clamp(25.0, 250.0)));
+                    let curvature_radius = pm.curvature_radius.unwrap_or_else(|| Length::mm((tol_mm * 2.0).clamp(3.0, 18.0)));
+                    let cavity_radius = pm.cavity_radius.unwrap_or_else(|| Length::mm((tol_mm * 3.5).clamp(5.0, 32.0)));
+                    let (bake_tape, local_to_field) = match o.assembly_tape {
+                        Some(asm_tape) => (
+                            asm_tape,
+                            FieldTransform {
+                                linear: part.placement.linear().rows,
+                                translation: part.placement.shift_m().to_array(),
+                            },
+                        ),
+                        None => (&local_tape, FieldTransform::IDENTITY),
+                    };
+                    bake_sdf_surface(
+                        &tanned.view(),
+                        bake_tape,
+                        BakeSurfaceOpts {
+                            ao_radius,
+                            curvature_radius,
+                            curvature_gain: pm.curvature_gain,
+                            cavity_radius,
+                            alpha_mode: pm.alpha_mode,
+                            local_to_field,
+                            alloc: s,
+                            scratch: s,
+                            ..
+                        },
+                    )?
+                } else {
+                    tanned
+                };
+                Some(baked_v)
+            } else {
+                None
+            };
+            let gpu_input = pbr_prepared.as_ref().map(|m| m.view()).unwrap_or(base_view);
+            let opt = prepare_gpu_mesh(&gpu_input, stamp_role, o.optimize_gpu, o.vertex_cache_size, o.alloc, s)?;
             (opt, None, None, None)
         };
         let written_verts = opt_mesh.view().vertex_count();
@@ -1658,11 +1878,27 @@ pub fn build_game_asset_planted<'a, P: Planted<CadPlant>>(
         hull_views.try_push(hm.view()).map_err(|_| ModelError::Alloc { what: "asset hull views" })?;
     }
 
+    let mut all_sockets: Vec<Socket<'_>, Alloc<'_>> = Vec::new_in(s);
+    let mut sock_ranges: Vec<(usize, usize), Alloc<'_>> = Vec::new_in(s);
+    sock_ranges.try_reserve(exported_parts.len()).map_err(|_| ModelError::Alloc { what: "asset socket ranges" })?;
+    for ep in exported_parts.iter() {
+        let start = all_sockets.len();
+        for ps in o.sockets {
+            if ps.part == ep.name {
+                all_sockets
+                    .try_push(Socket { name: ps.name, transform: transform_of(&ps.placement) })
+                    .map_err(|_| ModelError::Alloc { what: "asset sockets" })?;
+            }
+        }
+        sock_ranges.try_push((start, all_sockets.len())).map_err(|_| ModelError::Alloc { what: "asset socket ranges" })?;
+    }
+
     let mut nodes: Vec<blaze_cad_out::Part<'_>, Alloc<'_>> = Vec::new_in(s);
     nodes.try_reserve(parts.len()).map_err(|_| ModelError::Alloc { what: "asset glb nodes" })?;
     for (i, (ep, m)) in exported_parts.iter().zip(meshes.iter()).enumerate() {
         let (ls, le) = lod_ranges[i];
         let (hs, he) = hull_ranges[i];
+        let (ss, se) = sock_ranges[i];
         let mass = o.density.map(|d| {
             let mp = mass_properties(&m.verified(), d);
             MassFacts {
@@ -1682,6 +1918,7 @@ pub fn build_game_asset_planted<'a, P: Planted<CadPlant>>(
                 mass,
                 joint: None,
                 collider,
+                sockets: &all_sockets[ss..se],
             })
             .map_err(|_| ModelError::Alloc { what: "asset glb nodes" })?;
     }
@@ -1715,12 +1952,12 @@ pub fn build_game_asset_planted<'a, P: Planted<CadPlant>>(
                     .map_err(|_| ModelError::Alloc { what: "asset material textures" })?;
             }
         }
-        let scene = blaze_cad_out::Scene { parts: &nodes, materials: &all_mats };
+        let scene = blaze_cad_out::Scene { parts: &nodes, materials: &all_mats, images: o.images };
         let pack = TexturePack { png_images: &png_images, material_textures: &mat_tex };
         glb_textured(&scene, &pack, GlbOpts { encoding: o.encoding, up: o.up, limits: o.limits, alloc: o.alloc, scratch: s })
             .map_err(ModelError::Glb)?
     } else {
-        let scene = blaze_cad_out::Scene { parts: &nodes, materials: o.materials };
+        let scene = blaze_cad_out::Scene { parts: &nodes, materials: o.materials, images: o.images };
         glb(&scene, GlbOpts { encoding: o.encoding, up: o.up, limits: o.limits, alloc: o.alloc, scratch: s })
             .map_err(ModelError::Glb)?
     };

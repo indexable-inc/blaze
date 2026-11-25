@@ -89,6 +89,7 @@ pub fn render_studio_preview_png<'a>(
             emissive_strength: None,
             clearcoat: None,
             double_sided: true,
+            ..
         },
     )?;
     push(
@@ -102,6 +103,7 @@ pub fn render_studio_preview_png<'a>(
             emissive_strength: None,
             clearcoat: None,
             double_sided: true,
+            ..
         },
     )?;
 
