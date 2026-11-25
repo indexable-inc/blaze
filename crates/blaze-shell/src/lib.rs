@@ -893,6 +893,20 @@ mod tests {
         assert_eq!(top[0].host, "hydra", "local host should rank ahead of remote");
         assert_eq!(top[1].host, "blaze-vm", "cross-server entry must appear");
 
+        // 1b. Native binary zoxide v3 `db.zo` decoder (zero subprocesses).
+        let mut zo = Vec::new();
+        zo.extend_from_slice(&3u32.to_le_bytes());
+        zo.extend_from_slice(&1u64.to_le_bytes());
+        let p = b"/tmp/hello-world";
+        zo.extend_from_slice(&(p.len() as u64).to_le_bytes());
+        zo.extend_from_slice(p);
+        zo.extend_from_slice(&142.0f64.to_le_bytes());
+        zo.extend_from_slice(&1_732_500_000i64.to_le_bytes());
+        let parsed = crate::zoxide::parse_zoxide_db_v3(&zo, "hydra");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].path, "/tmp/hello-world");
+        assert_eq!(parsed[0].visits, 142);
+
         // 2. Full-screen PTY keeps top tab bar AND renders Unicode block/box elements via SDF (zero font seams!).
         let alloc = Alloc::global();
         let state = EngineState::new("/tmp", &[], alloc);

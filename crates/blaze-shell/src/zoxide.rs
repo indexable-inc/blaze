@@ -61,11 +61,16 @@ impl FrecencyStore {
     }
 
     /// Load persistent CRDT log from `<home>/.local/share/blaze-shell/zoxide.jsonl`, merging all
-    /// rows through the semilattice join.
+    /// rows through the semilattice join, and import any existing system `zoxide` v3 database
+    /// (`~/Library/Application Support/zoxide/db.zo` / `~/.local/share/zoxide/db.zo`) directly
+    /// with zero subprocesses!
     pub fn load(&mut self, home: &str) {
         if home.is_empty() {
             return;
         }
+        let local_host = detect_local_hostname();
+        self.import_system_zoxide_db(home, &local_host);
+
         let dir = PathBuf::from(home).join(".local/share/blaze-shell");
         let path = dir.join("zoxide.jsonl");
         let _ = fs::create_dir_all(&dir);
@@ -77,6 +82,21 @@ impl FrecencyStore {
             }
         }
         self.store_file = Some(path);
+    }
+
+    /// Import existing native `zoxide` v3 binary database (`db.zo`) into our CRDT semilattice.
+    pub fn import_system_zoxide_db(&mut self, home: &str, local_host: &str) {
+        let candidates = [
+            PathBuf::from(home).join("Library/Application Support/zoxide/db.zo"),
+            PathBuf::from(home).join(".local/share/zoxide/db.zo"),
+        ];
+        for path in candidates {
+            if let Ok(bytes) = fs::read(&path) {
+                for entry in parse_zoxide_db_v3(&bytes, local_host) {
+                    self.join_entry(entry);
+                }
+            }
+        }
     }
 
     /// Record a directory visit on `host` at `now_ns` and append to the persistent CRDT log.
@@ -196,6 +216,130 @@ impl FrecencyStore {
         scored.truncate(limit);
         scored
     }
+}
+
+/// Decode zoxide's native bincode v3 database (`db.zo`) directly with zero subprocesses:
+/// `[u32 version == 3][u64 count]([u64 path_len][utf8 path][f64 rank][i64 last_accessed_secs])*`.
+pub fn parse_zoxide_db_v3(bytes: &[u8], host: &str) -> Vec<FrecencyEntry> {
+    let mut out = Vec::new();
+    if bytes.len() < 12 || host.is_empty() {
+        return out;
+    }
+    let version = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    if version != 3 {
+        return out;
+    }
+    let count = u64::from_le_bytes([
+        bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11],
+    ])
+    .min(20_000) as usize;
+    let mut pos = 12usize;
+    for _ in 0..count {
+        if pos + 8 > bytes.len() {
+            break;
+        }
+        let len = u64::from_le_bytes([
+            bytes[pos],
+            bytes[pos + 1],
+            bytes[pos + 2],
+            bytes[pos + 3],
+            bytes[pos + 4],
+            bytes[pos + 5],
+            bytes[pos + 6],
+            bytes[pos + 7],
+        ]) as usize;
+        pos += 8;
+        if len > 4096 || pos + len + 16 > bytes.len() {
+            break;
+        }
+        let path_bytes = &bytes[pos..pos + len];
+        pos += len;
+        let rank = f64::from_le_bytes([
+            bytes[pos],
+            bytes[pos + 1],
+            bytes[pos + 2],
+            bytes[pos + 3],
+            bytes[pos + 4],
+            bytes[pos + 5],
+            bytes[pos + 6],
+            bytes[pos + 7],
+        ]);
+        pos += 8;
+        let last_secs = i64::from_le_bytes([
+            bytes[pos],
+            bytes[pos + 1],
+            bytes[pos + 2],
+            bytes[pos + 3],
+            bytes[pos + 4],
+            bytes[pos + 5],
+            bytes[pos + 6],
+            bytes[pos + 7],
+        ]);
+        pos += 8;
+        if let Ok(path_str) = core::str::from_utf8(path_bytes) {
+            let clean = normalize_dir(path_str);
+            if !clean.is_empty() {
+                let visits = if rank.is_finite() && rank > 0.0 {
+                    rank.ceil().min(1_000_000.0) as u64
+                } else {
+                    1
+                };
+                out.push(FrecencyEntry {
+                    host: host.to_owned(),
+                    path: clean,
+                    visits,
+                    last_ns: last_secs.saturating_mul(1_000_000_000),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Bounded shallow breadth-first directory lookup (depth ≤ 2, max 200 dirs) when `cd <query>`
+/// matches neither a direct child nor any recorded zoxide entry yet.
+pub fn shallow_find_dir(root: &Path, query: &str) -> Option<PathBuf> {
+    let needle = query.trim().to_ascii_lowercase();
+    if needle.is_empty() {
+        return None;
+    }
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back((root.to_path_buf(), 0u8));
+    let mut visited = 0usize;
+    let mut partial: Option<PathBuf> = None;
+
+    while let Some((dir, depth)) = queue.pop_front() {
+        if depth >= 2 || visited >= 200 {
+            continue;
+        }
+        let Ok(rd) = fs::read_dir(&dir) else { continue };
+        for ent in rd.flatten() {
+            visited += 1;
+            if visited >= 200 {
+                break;
+            }
+            let Ok(ft) = ent.file_type() else { continue };
+            if !ft.is_dir() {
+                continue;
+            }
+            let name = ent.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') || matches!(name.as_str(), "target" | "node_modules" | "vendor") {
+                continue;
+            }
+            let lower = name.to_ascii_lowercase();
+            let p = ent.path();
+            if lower == needle {
+                return Some(p);
+            }
+            if partial.is_none() && lower.contains(&needle) {
+                partial = Some(p.clone());
+            }
+            if depth + 1 < 2 {
+                queue.push_back((p, depth + 1));
+            }
+        }
+    }
+    partial
 }
 
 /// Detect a concise, human-readable local host name (e.g. `hydra`) without spawning a subprocess.

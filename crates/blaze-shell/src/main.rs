@@ -759,6 +759,16 @@ mod macos_app {
                                 );
                                 return;
                             }
+                        } else if let Some(found) = blaze_shell::zoxide::shallow_find_dir(
+                            std::path::Path::new(&self.prompt.cwd),
+                            arg,
+                        ) {
+                            let p = found.to_string_lossy().into_owned();
+                            effective_cmd = if p.contains(' ') {
+                                format!("cd \"{p}\"")
+                            } else {
+                                format!("cd {p}")
+                            };
                         }
                     }
                 }
