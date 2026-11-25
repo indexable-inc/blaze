@@ -10,6 +10,9 @@
 //! | [`parser`] | the vt100.net state machine as ghostty runs it, UTF-8 in ground, events to a [`parser::Sink`] | built |
 //! | `utf8` | the decoder: one code point per call, U+FFFD for each maximal invalid subpart | built |
 //! | [`style`] | a cell's style: colours by source (unset, palette, RGB), underline styles, flags | built |
+//! | [`dcs`] | the DCS handler: DECRQSS, XTGETTCAP, tmux control mode ([`dcs::tmux`]), capped buffer | built |
+//! | [`terminfo`] | the terminfo entry XTGETTCAP answers from (ghostty's 268 capabilities, `TN`, `Co`, `RGB`) | built |
+//! | [`reply`] | every reply's exact bytes and terminator, as encoders over plain state | built |
 //!
 //! The screen, terminal, SGR, OSC, DCS, kitty and input modules are written in lanes against
 //! these interfaces (vt.md, "Modules").
@@ -23,8 +26,11 @@
 #[cfg(test)]
 extern crate std;
 
+pub mod dcs;
 pub mod parser;
+pub mod reply;
 pub mod style;
+pub mod terminfo;
 mod utf8;
 
 #[cfg(test)]
