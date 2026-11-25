@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-318 invariants, 43 refinements, 12 reference models.
-By level: 258 tested, 87 simulated, 1 model-checked, 15 proved.
+317 invariants, 42 refinements, 12 reference models.
+By level: 257 tested, 86 simulated, 1 model-checked, 15 proved.
 
 ## Invariants
 
@@ -763,8 +763,6 @@ By level: 258 tested, 87 simulated, 1 model-checked, 15 proved.
   Controls: `a_sealed_arena_skipping_its_borrows`, `ignored_borrows_of_a_sealed_arena`.
 - **`every_interleaving_answers_as_the_evaluator`** *simulated* (`crates/blaze-memo/tests/sim.rs`): under every simulated interleaving of workers, commits, claims, and snapshots, memoized queries answer identically to the reference evaluator without stale carries, duplicate runs, or dead-id lookups.
   Controls: `a_held_key_taken_for_the_askers_own`, `a_carried_changed_arena`, `a_carried_dependent`, `a_hit_that_does_not_replay`, `a_check_on_a_hit`, `a_member_run_twice`, `a_reader_that_looks_up_a_dead_id`.
-- **`every_name_an_expansion_binds_is_in_its_summary`** *tested* (`crates/blaze-names-source/tests/writes_sound.rs`): every name an expansion binds in its calling module (items and `use` bindings) is listed in its `writes` summary.
-  Controls: `a_summary_that_forgets_use`.
 - **`a_reader_that_closes_early_ends_the_command_quietly`** *tested* (`crates/blaze-report/tests/closed_pipe.rs`): a command that writes through `blaze_report::out` to a pipe whose reader closed ends with status 141 and says nothing on stderr.
   Controls: `a_print_that_panics_on_a_closed_pipe`.
 - **`the_region_fits_and_leaves_nothing_behind`** *tested* (`crates/blaze-screen/tests/properties.rs`): on a terminal of any size the live region fits (never taller than the terminal less a row, never wider than it less a column), every frame leaves exactly the lines that stay and the region with no stale row, a resize in the middle included, and the last frame leaves the lines that stay alone, the cursor shown and the progress report cleared.
@@ -861,11 +859,6 @@ By level: 258 tested, 87 simulated, 1 model-checked, 15 proved.
 
 - **`case`** *tested* (`crates/blaze-memchr/src/tests.rs`): each search on the vector `L` equals its byte-at-a-time model.
   Controls: `a_word_mask_that_drops_the_last_lane`, `a_native_mask_that_drops_the_last_lane`.
-
-### blaze-names-demand
-
-- **`demand_answers_equal_the_whole_world`** *simulated* (`crates/blaze-names-demand/src/sim_tests.rs`): for random generated module worlds and asks, demand-driven name resolution equals whole-world resolution.
-  Controls: `a_glob_that_beats_an_explicit_binding`, `an_expansion_ignored`, `a_fixpoint_cut_early`.
 
 ### blaze-own
 

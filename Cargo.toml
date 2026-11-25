@@ -485,8 +485,6 @@ blaze-memo-macros = { path = "crates/blaze-memo-macros" }
 blaze-reclaim = { path = "crates/blaze-reclaim" }
 blaze-mem = { path = "crates/blaze-mem" }
 blaze-meter = { path = "crates/blaze-meter" } # D169: each stretch's use (allocations, faults, instructions, effects, store, hashing, waits) from thread-local counters, read without a lock.
-blaze-names-demand = { path = "crates/blaze-names-demand" } # Names by demand: a sans-IO machine that asks a `Source` for one module's entries at a time.
-blaze-names-source = { path = "crates/blaze-names-source" } # blaze-names-demand's `Source` over real inputs (outlines, macro write summaries).
 blaze-malloc = { path = "crates/blaze-malloc" } # blaze's general-purpose allocator: a heap per thread, size-class spans, remote frees by queue (docs/v2/plan/design/malloc.md).
 blaze-own = { path = "crates/blaze-own" } # Vec, Box, Arc, Rc, ... with no default allocator, in place of `alloc`.
 blaze-int = { path = "crates/blaze-int" } # Integer conversions that say what they do (widen, narrow, truncate, saturate), in place of `as`.

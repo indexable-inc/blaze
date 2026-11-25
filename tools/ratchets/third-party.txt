@@ -102,8 +102,6 @@ blaze-math	0	0	1
 blaze-mem	1	0	1
 blaze-memo	1	0	65
 blaze-memo-macros	3	0	5
-blaze-names-demand	0	0	8
-blaze-names-source	0	0	86
 blaze-native	0	0	8
 blaze-new	1	0	87
 blaze-own	0	0	1

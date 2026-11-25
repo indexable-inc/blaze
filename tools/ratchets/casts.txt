@@ -87,7 +87,6 @@ blaze-math	15
 blaze-mem	170
 blaze-memo	62
 blaze-meter	35
-blaze-names-source	8
 blaze-native	233
 blaze-own	165
 blaze-pack	50

@@ -1567,37 +1567,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "blaze-names-demand"
-version = "0.0.0"
-dependencies = [
- "blaze-id",
- "blaze-ids",
- "blaze-mem",
- "blaze-own",
- "blaze-sim",
-]
-
-[[package]]
-name = "blaze-names-source"
-version = "0.0.0"
-dependencies = [
- "blaze-expand",
- "blaze-file-items",
- "blaze-format",
- "blaze-id",
- "blaze-ids",
- "blaze-mem",
- "blaze-names-demand",
- "blaze-own",
- "blaze-scope",
- "blaze-sim",
- "blaze-surface",
- "blaze-tokens",
- "blaze-unit-graph",
- "edition",
-]
-
-[[package]]
 name = "blaze-native"
 version = "0.0.0"
 dependencies = [
