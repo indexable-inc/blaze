@@ -150,6 +150,7 @@ dependencies = [
  "blaze-glob",
  "blaze-json",
  "blaze-own",
+ "blaze-sniff",
  "blaze-toml",
 ]
 

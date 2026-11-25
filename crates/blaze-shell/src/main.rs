@@ -2607,11 +2607,17 @@ mod macos_app {
                             let near_resize_edge = on_resize_edge(x, y, size.width as f32, size.height as f32);
                             let in_window = x >= 0.0 && y >= 0.0 && x <= size.width as f32 && y <= size.height as f32;
                             if in_window && !in_traffic_lights && !near_resize_edge {
-                                // Smooth native hover popover tracking (keeps popover alive while
-                                // pointer travels from anchor down into the interactive menu!).
+                                // Smooth native hover popover tracking:
+                                // - For interactive prompt menus (branches/dir/changes), keep alive while
+                                //   pointer travels from anchor into the menu.
+                                // - For read-only RHS file previews, ONLY keep alive while still over the
+                                //   hovered file row so gliding up & down switches previews instantaneously!
                                 let in_open_popover = active_popover.as_ref().is_some_and(|p| {
                                     if p.anchor.contains(x, y) {
                                         return true;
+                                    }
+                                    if matches!(p.kind, HoverKind::FilePreview { .. } | HoverKind::FileEntry { .. }) {
+                                        return false;
                                     }
                                     if let Some(pr) = shell.last_scene.popover_rect {
                                         if pr.contains(x, y) {

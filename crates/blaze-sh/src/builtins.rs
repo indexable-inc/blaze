@@ -1779,6 +1779,7 @@ fn builtin_open<'a>(
     let path = resolve_path(cwd.as_ref(), raw_path.as_str(), home.as_ref().map(|h| h.as_str()), alloc);
     let ext = ext_lowercase(path.as_str(), alloc);
 
+    let path_for_sniff = path.clone();
     let ans = eval.request(Request::ReadFile { path }, span)?;
     let Answer::FileBytes(bytes) = ans else {
         return Err(Control::Error(ShellError::new(
@@ -1790,32 +1791,57 @@ fn builtin_open<'a>(
     };
 
     if !raw_mode {
-        if let Some(ext) = &ext {
-            match ext.as_str() {
-                "json" => return from_json_bytes(bytes.as_slice(), span, alloc).map_err(Control::Error),
-                "toml" => {
-                    let text = core::str::from_utf8(bytes.as_slice()).map_err(|_| {
-                        Control::Error(ShellError::new(
-                            ErrorKind::Format,
-                            span,
-                            "TOML file is not valid UTF-8",
-                            alloc,
-                        ))
-                    })?;
-                    return from_toml_str(text, span, alloc).map_err(Control::Error);
+        let sniff = blaze_sniff::sniff_file(path_for_sniff.as_str(), bytes.as_slice());
+        match sniff.label {
+            "JSON" | "Node manifest" | "TS config" | "Nix lock" => {
+                return from_json_bytes(bytes.as_slice(), span, alloc).map_err(Control::Error);
+            }
+            "JSONL" => {
+                if let Ok(text) = core::str::from_utf8(bytes.as_slice()) {
+                    let mut list = PVec::new(alloc);
+                    for line in text.lines() {
+                        let t = line.trim();
+                        if t.is_empty() {
+                            continue;
+                        }
+                        if let Ok(val) = from_json_bytes(t.as_bytes(), span, alloc) {
+                            list.push(val);
+                        }
+                    }
+                    if let Some(tbl) = Table::try_from_list(&list, alloc) {
+                        return Ok(Value::Table(tbl));
+                    }
+                    if !list.is_empty() {
+                        return Ok(Value::List(list));
+                    }
                 }
-                "csv" => {
-                    let text = core::str::from_utf8(bytes.as_slice()).map_err(|_| {
-                        Control::Error(ShellError::new(
-                            ErrorKind::Format,
-                            span,
-                            "CSV file is not valid UTF-8",
-                            alloc,
-                        ))
-                    })?;
-                    return Ok(Value::Table(parse_csv(text, false, ',', alloc)));
-                }
-                _ => {}
+            }
+            "TOML" | "Cargo manifest" | "Cargo lock" | "uv lock" | "Blaze lock"
+            | "Clippy config" | "Rustfmt config" | "Python proj" | "Rust pin" => {
+                let text = core::str::from_utf8(bytes.as_slice()).map_err(|_| {
+                    Control::Error(ShellError::new(
+                        ErrorKind::Format,
+                        span,
+                        "TOML file is not valid UTF-8",
+                        alloc,
+                    ))
+                })?;
+                return from_toml_str(text, span, alloc).map_err(Control::Error);
+            }
+            "CSV" | "TSV" => {
+                let text = core::str::from_utf8(bytes.as_slice()).map_err(|_| {
+                    Control::Error(ShellError::new(
+                        ErrorKind::Format,
+                        span,
+                        "delimited file is not valid UTF-8",
+                        alloc,
+                    ))
+                })?;
+                let sep = if sniff.label == "TSV" { '\t' } else { ',' };
+                return Ok(Value::Table(parse_csv(text, false, sep, alloc)));
+            }
+            _ => {
+                let _ = &ext;
             }
         }
     }

@@ -1020,8 +1020,53 @@ fn layout_value(
         Value::Error(err) => {
             layout_error_panel(scene, &block.source, err, x0, y0, width, m, clip_id)
         }
+        Value::String(s) if depth == 0 && open_target_filename(&block.source).is_some() => {
+            let fname = open_target_filename(&block.source).unwrap_or("file");
+            let doc = blaze_preview::build_preview(
+                fname,
+                s.as_ref().as_bytes(),
+                s.as_ref().len() as u64,
+                blaze_preview::PreviewLimits::SHIPPED,
+                Alloc::global(),
+            );
+            let max_h = if block.folded { 520.0 } else { 2400.0 };
+            crate::yazi::render_rich_preview(scene, &doc, x0, y0, width, y0 + max_h, m, clip_id)
+                .max(m.ch)
+        }
+        Value::Binary(b) if depth == 0 && open_target_filename(&block.source).is_some() => {
+            let fname = open_target_filename(&block.source).unwrap_or("file");
+            let doc = blaze_preview::build_preview(
+                fname,
+                b.as_ref(),
+                b.as_ref().len() as u64,
+                blaze_preview::PreviewLimits::SHIPPED,
+                Alloc::global(),
+            );
+            crate::yazi::render_rich_preview(scene, &doc, x0, y0, width, y0 + 260.0, m, clip_id)
+                .max(m.ch)
+        }
         scalar => layout_scalar(scene, scalar, x0, y0, width, m, clip_id, now_ns),
     }
+}
+
+/// Extract `<file>` when a command line is a direct `open <file>` (without pipes), so `open`
+/// shares the exact same `blaze-preview` display engine as `y` and hover previews!
+fn open_target_filename(source: &str) -> Option<&str> {
+    let trimmed = source.trim();
+    if trimmed.contains('|') || trimmed.contains(';') {
+        return None;
+    }
+    let mut parts = trimmed.split_whitespace();
+    if parts.next()? != "open" {
+        return None;
+    }
+    for tok in parts {
+        if tok.starts_with('-') {
+            continue;
+        }
+        return Some(tok.trim_matches(|c| c == '"' || c == '\''));
+    }
+    None
 }
 
 /// True when `table` represents filesystem entries (has a `FileEntry` `name` column).
@@ -1287,12 +1332,12 @@ fn layout_table(
     }
 
     let total_rows = table.nrows();
-    let is_scrollable = depth == 0 && block.folded && total_rows > TABLE_FOLD_ROWS;
+    let is_scrollable = depth <= 1 && block.folded && total_rows > TABLE_FOLD_ROWS;
     let visible_rows = if is_scrollable { TABLE_FOLD_ROWS } else { total_rows };
 
     // Non-mutating row permutation when the user clicks a column header to sort!
     let mut row_order: Vec<usize> = (0..total_rows).collect();
-    if depth == 0
+    if depth <= 1
         && let Some((sort_col, desc)) = block.table_sort
         && sort_col < ncols
     {
@@ -3570,7 +3615,10 @@ fn layout_active_popover(
             let max_line_c = lines
                 .iter()
                 .take(shown)
-                .map(|l| l.chars().count() + 5)
+                .map(|l| {
+                    let chars: usize = l.spans.iter().map(|s| s.text.chars().count()).sum();
+                    chars + if l.line_no.is_some() { 5 } else { 1 }
+                })
                 .max()
                 .unwrap_or(28)
                 .max(name.chars().count() + meta.chars().count() + 6)
@@ -3583,15 +3631,29 @@ fn layout_active_popover(
         }
     };
 
-    // Place cleanly below anchor (or flip above when near viewport bottom), clamped inside window.
-    let x0 = pop.anchor.x0.clamp(12.0, (vw - pop_w - 12.0).max(12.0));
-    let x1 = x0 + pop_w;
-    let below_y0 = pop.anchor.y1 + gap;
-    let y0 = if below_y0 + pop_h <= vh - 10.0 {
-        below_y0
+    // Place file previews on the RIGHT-HAND SIDE (never above/below, so hovering up/down a file list
+    // glides smoothly row-by-row!); place prompt-capsule dropdown menus cleanly below their anchor.
+    let is_side_preview = matches!(pop.kind, HoverKind::FilePreview { .. } | HoverKind::FileEntry { .. });
+    let (x0, y0) = if is_side_preview {
+        let right_x0 = pop.anchor.x1 + 14.0;
+        let sx0 = if right_x0 + pop_w <= vw - 12.0 {
+            right_x0
+        } else {
+            (pop.anchor.x0 - 14.0 - pop_w).max(12.0)
+        };
+        let sy0 = (pop.anchor.y0 - 4.0).clamp(TOP_BAR_H + 8.0, (vh - pop_h - 10.0).max(TOP_BAR_H + 8.0));
+        (sx0, sy0)
     } else {
-        (pop.anchor.y0 - gap - pop_h).max(TOP_BAR_H + 6.0)
+        let sx0 = pop.anchor.x0.clamp(12.0, (vw - pop_w - 12.0).max(12.0));
+        let below_y0 = pop.anchor.y1 + gap;
+        let sy0 = if below_y0 + pop_h <= vh - 10.0 {
+            below_y0
+        } else {
+            (pop.anchor.y0 - gap - pop_h).max(TOP_BAR_H + 6.0)
+        };
+        (sx0, sy0)
     };
+    let x1 = x0 + pop_w;
     let y1 = y0 + pop_h;
 
     scene.popover_rect = Some(HitRect::new(x0, y0, x1, y1));
@@ -3827,25 +3889,25 @@ fn layout_active_popover(
 
             let mut ry = y0 + hdr_h + 6.0;
             let line_h = m.ch + 2.0;
-            let gutter_w = 3.5 * m.cw;
+            let has_gutter = lines.iter().any(|l| l.line_no.is_some());
+            let gutter_w = if has_gutter { 3.5 * m.cw } else { 0.0 };
             let max_c = ((pop_w - pad_x * 2.0 - gutter_w) / m.cw).floor().max(12.0) as usize;
-            for (li, line) in lines.iter().take(16).enumerate() {
-                let ln = format!("{:>2}", li + 1);
-                scene.overlay_text_run(x0 + pad_x, ry, ln, theme::INK_4, false, false, 0);
-                let col = if line.starts_with("//") || line.starts_with('#') {
-                    theme::INK_3
-                } else {
-                    theme::INK_2
-                };
-                scene.overlay_text_run(
-                    x0 + pad_x + gutter_w,
-                    ry,
-                    truncate_chars(line, max_c),
-                    col,
-                    false,
-                    false,
-                    0,
-                );
+            for pl in lines.iter().take(16) {
+                if let Some(ln) = pl.line_no {
+                    scene.overlay_text_run(x0 + pad_x, ry, format!("{ln:>2}"), theme::INK_4, false, false, 0);
+                }
+                let mut cx = x0 + pad_x + gutter_w;
+                let mut rem = max_c;
+                for sp in &pl.spans {
+                    if rem == 0 {
+                        break;
+                    }
+                    let txt = truncate_chars(&sp.text, rem);
+                    let len = txt.chars().count();
+                    scene.overlay_text_run(cx, ry, txt, sp.color, sp.bold, sp.italic, 0);
+                    cx += len as f32 * m.cw;
+                    rem = rem.saturating_sub(len);
+                }
                 ry += line_h;
             }
             if *truncated {

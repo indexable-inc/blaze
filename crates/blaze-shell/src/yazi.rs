@@ -22,7 +22,7 @@ use crate::layout::{TOP_BAR_H, layout_top_bar};
 use crate::prompt::PromptInfo;
 use crate::svg_icons::icon_name_for_file;
 use crate::theme;
-use crate::view::{CellMetrics, Scene, truncate_chars};
+use crate::view::{CellMetrics, PreviewLine, PreviewSpan, Scene, truncate_chars};
 
 const MAX_PREVIEW_BYTES: usize = 32 * 1024;
 const MAX_DIR_ENTRIES: usize = 512;
@@ -313,20 +313,29 @@ fn load_rich_preview(path: &Path, name: &str, size: u64) -> YaziPreview {
     YaziPreview::Rich(doc)
 }
 
-/// Read a bounded, clean file preview for `ls` hover popovers (powered by `blaze-sniff` + `blaze-preview`).
-pub fn load_file_preview_lines(path: &Path, max_lines: usize) -> (String, Vec<String>, bool) {
+/// Read a bounded, rich styled file preview for `ls`/`git status` hover popovers (powered by
+/// `blaze-sniff` + `blaze-preview`: full syntax highlighting, rendered Markdown, & tabular lockfiles!).
+pub fn load_file_preview_lines(path: &Path, max_lines: usize) -> (String, Vec<PreviewLine>, bool) {
+    let plain = |s: String, col: [f32; 4], italic: bool| PreviewLine {
+        line_no: None,
+        spans: vec![PreviewSpan { text: s, color: col, bold: false, italic }],
+    };
     let meta = match fs::metadata(path) {
         Ok(m) => m,
-        Err(e) => return ("unreadable".to_owned(), vec![format!("{e}")], false),
+        Err(e) => return ("unreadable".to_owned(), vec![plain(format!("{e}"), theme::DANGER, false)], false),
     };
     let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
     if meta.is_dir() {
         let entries = read_dir_entries(path, false);
         let total = entries.len();
-        let lines: Vec<String> = entries
+        let lines: Vec<PreviewLine> = entries
             .into_iter()
             .take(max_lines)
-            .map(|e| if e.is_dir { format!("{}/", e.name) } else { e.name })
+            .map(|e| {
+                let lbl = if e.is_dir { format!("{}/", e.name) } else { e.name };
+                let col = if e.is_dir { theme::INK_1 } else { theme::INK_2 };
+                plain(lbl, col, false)
+            })
             .collect();
         let meta_str = format!("dir · {total} items");
         return (meta_str, lines, total > max_lines);
@@ -340,22 +349,65 @@ pub fn load_file_preview_lines(path: &Path, max_lines: usize) -> (String, Vec<St
             match doc.body {
                 PreviewBody::Table(t) => {
                     let mut lines = Vec::new();
-                    let hdr = t.headers.iter().map(|h| h.as_str()).collect::<Vec<_>>().join("   ");
-                    lines.push(hdr);
+                    let hdr = t.headers.iter().map(|h| format!("{:<16}", h.as_str())).collect::<String>();
+                    lines.push(PreviewLine {
+                        line_no: None,
+                        spans: vec![PreviewSpan { text: hdr, color: theme::INK_3, bold: true, italic: false }],
+                    });
                     for row in t.rows.iter().take(max_lines.saturating_sub(1)) {
-                        let line = row.iter().map(|c| c.as_str()).collect::<Vec<_>>().join("   ");
-                        lines.push(line);
+                        let mut spans = Vec::new();
+                        for (ci, cell) in row.iter().enumerate() {
+                            let col = if ci == 0 {
+                                theme::INK_1
+                            } else if ci == 1 {
+                                theme::rgb(0x7c, 0xc9, 0x8b)
+                            } else {
+                                theme::INK_3
+                            };
+                            spans.push(PreviewSpan {
+                                text: format!("{:<16}", truncate_chars(cell.as_str(), 15)),
+                                color: col,
+                                bold: false,
+                                italic: false,
+                            });
+                        }
+                        lines.push(PreviewLine { line_no: None, spans });
                     }
                     (meta_str, lines, t.total_rows > max_lines)
                 }
                 PreviewBody::KeyValues(kv) => {
                     let mut lines = Vec::new();
                     for (k, v) in kv.pairs.iter().take(max_lines) {
-                        lines.push(format!("{:<14} {}", k.as_str(), v.as_str()));
+                        lines.push(PreviewLine {
+                            line_no: None,
+                            spans: vec![
+                                PreviewSpan {
+                                    text: format!("{:<14} ", truncate_chars(k.as_str(), 14)),
+                                    color: theme::INK_3,
+                                    bold: false,
+                                    italic: false,
+                                },
+                                PreviewSpan {
+                                    text: v.as_str().to_owned(),
+                                    color: theme::rgb(0x7c, 0xc9, 0x8b),
+                                    bold: false,
+                                    italic: false,
+                                },
+                            ],
+                        });
                     }
                     if let Some(t) = kv.table {
                         for row in t.rows.iter().take(max_lines.saturating_sub(lines.len())) {
-                            lines.push(row.iter().map(|c| c.as_str()).collect::<Vec<_>>().join("  "));
+                            let mut spans = Vec::new();
+                            for (ci, cell) in row.iter().enumerate() {
+                                spans.push(PreviewSpan {
+                                    text: format!("{:<14} ", truncate_chars(cell.as_str(), 14)),
+                                    color: if ci == 0 { theme::INK_1 } else { theme::INK_3 },
+                                    bold: false,
+                                    italic: false,
+                                });
+                            }
+                            lines.push(PreviewLine { line_no: None, spans });
                         }
                     }
                     (meta_str, lines, false)
@@ -363,43 +415,112 @@ pub fn load_file_preview_lines(path: &Path, max_lines: usize) -> (String, Vec<St
                 PreviewBody::Markdown { blocks, truncated } => {
                     let mut lines = Vec::new();
                     for b in blocks.iter().take(max_lines) {
-                        let s = match b {
-                            MdBlock::Heading { spans, .. }
-                            | MdBlock::Paragraph { spans }
-                            | MdBlock::Quote { spans } => {
-                                spans.iter().map(|sp| sp.text.as_str()).collect::<String>()
-                            }
+                        let pl = match b {
+                            MdBlock::Heading { spans, .. } => PreviewLine {
+                                line_no: None,
+                                spans: spans
+                                    .iter()
+                                    .map(|sp| PreviewSpan {
+                                        text: sp.text.as_str().to_owned(),
+                                        color: [1.0, 1.0, 1.0, 1.0],
+                                        bold: true,
+                                        italic: false,
+                                    })
+                                    .collect(),
+                            },
+                            MdBlock::Paragraph { spans } | MdBlock::Quote { spans } => PreviewLine {
+                                line_no: None,
+                                spans: spans
+                                    .iter()
+                                    .map(|sp| {
+                                        let (color, bold, italic) = match sp.style {
+                                            MdStyle::Bold => (theme::INK_1, true, false),
+                                            MdStyle::Italic => (theme::INK_2, false, true),
+                                            MdStyle::Code => (theme::rgb(0x7c, 0xc9, 0x8b), false, false),
+                                            MdStyle::Link => (theme::rgb(0x7c, 0xc4, 0xea), false, false),
+                                            MdStyle::Plain => (theme::INK_2, false, false),
+                                        };
+                                        PreviewSpan { text: sp.text.as_str().to_owned(), color, bold, italic }
+                                    })
+                                    .collect(),
+                            },
                             MdBlock::Bullet { marker, spans, .. } => {
-                                let body: String = spans.iter().map(|sp| sp.text.as_str()).collect();
-                                format!("{} {body}", marker.as_str())
+                                let mut out = vec![PreviewSpan {
+                                    text: format!("{} ", marker.as_str()),
+                                    color: theme::INK_3,
+                                    bold: true,
+                                    italic: false,
+                                }];
+                                for sp in spans.iter() {
+                                    let (color, bold, italic) = match sp.style {
+                                        MdStyle::Bold => (theme::INK_1, true, false),
+                                        MdStyle::Code => (theme::rgb(0x7c, 0xc9, 0x8b), false, false),
+                                        MdStyle::Italic => (theme::INK_2, false, true),
+                                        MdStyle::Link => (theme::rgb(0x7c, 0xc4, 0xea), false, false),
+                                        MdStyle::Plain => (theme::INK_2, false, false),
+                                    };
+                                    out.push(PreviewSpan { text: sp.text.as_str().to_owned(), color, bold, italic });
+                                }
+                                PreviewLine { line_no: None, spans: out }
                             }
-                            MdBlock::CodeFence { lang, .. } => format!("[code: {}]", lang.as_str()),
-                            MdBlock::Rule => "────────".to_owned(),
-                            MdBlock::Blank => String::new(),
+                            MdBlock::CodeFence { lang, .. } => plain(format!("[{}]", lang.as_str()), theme::INK_4, true),
+                            MdBlock::Rule => plain("────────────────".to_owned(), theme::LINE_STRONG, false),
+                            MdBlock::Blank => PreviewLine { line_no: None, spans: Vec::new() },
                         };
-                        lines.push(s);
+                        lines.push(pl);
                     }
                     (meta_str, lines, truncated)
                 }
                 PreviewBody::Code { lines: cl, truncated, .. } => {
-                    let out: Vec<String> = cl
+                    let out: Vec<PreviewLine> = cl
                         .iter()
                         .take(max_lines)
-                        .map(|l| l.spans.iter().map(|s| s.text.as_str()).collect())
+                        .map(|l| PreviewLine {
+                            line_no: Some(l.line_no),
+                            spans: l
+                                .spans
+                                .iter()
+                                .map(|s| {
+                                    let (color, bold, italic) = token_color(s.kind);
+                                    PreviewSpan {
+                                        text: s.text.as_str().replace('\t', "    "),
+                                        color,
+                                        bold,
+                                        italic,
+                                    }
+                                })
+                                .collect(),
+                        })
                         .collect();
                     (meta_str, out, truncated || cl.len() > max_lines)
                 }
                 PreviewBody::Summary { pairs } => {
-                    let out: Vec<String> = pairs
+                    let out: Vec<PreviewLine> = pairs
                         .iter()
-                        .map(|(k, v)| format!("{:<12} {}", k.as_str(), v.as_str()))
+                        .map(|(k, v)| PreviewLine {
+                            line_no: None,
+                            spans: vec![
+                                PreviewSpan {
+                                    text: format!("{:<12} ", k.as_str()),
+                                    color: theme::INK_4,
+                                    bold: false,
+                                    italic: false,
+                                },
+                                PreviewSpan {
+                                    text: v.as_str().to_owned(),
+                                    color: theme::INK_1,
+                                    bold: false,
+                                    italic: false,
+                                },
+                            ],
+                        })
                         .collect();
                     (meta_str, out, false)
                 }
             }
         }
-        YaziPreview::Error(e) => ("error".to_owned(), vec![e], false),
-        _ => (format_size_bytes(size as i64), vec!["(empty)".to_owned()], false),
+        YaziPreview::Error(e) => ("error".to_owned(), vec![plain(e, theme::DANGER, false)], false),
+        _ => (format_size_bytes(size as i64), vec![plain("(empty)".to_owned(), theme::INK_4, true)], false),
     }
 }
 
@@ -431,16 +552,17 @@ fn read_dir_entries(dir: &Path, show_hidden: bool) -> Vec<YaziEntry> {
     out
 }
 
-fn token_color(kind: TokenKind) -> ([f32; 4], bool, bool) {
+pub(crate) fn token_color(kind: TokenKind) -> ([f32; 4], bool, bool) {
     match kind {
         TokenKind::Plain => (theme::INK_2, false, false),
-        TokenKind::Keyword => (theme::INK_1, true, false),
-        TokenKind::Type => (theme::rgb(0x9a, 0xc2, 0xe8), false, false),
+        TokenKind::Keyword => (theme::rgb(0xc7, 0x9b, 0xf2), false, false),
+        TokenKind::Function => (theme::rgb(0xf2, 0xf1, 0xed), false, false),
+        TokenKind::Type => (theme::rgb(0x7c, 0xc4, 0xea), false, false),
         TokenKind::String => (theme::rgb(0x7c, 0xc9, 0x8b), false, false),
-        TokenKind::Number => (theme::rgb(0xd8, 0xc9, 0x9b), false, false),
+        TokenKind::Number => (theme::rgb(0xde, 0xc7, 0x92), false, false),
         TokenKind::Comment => (theme::INK_4, false, true),
         TokenKind::Attr => (theme::rgb(0xb4, 0xa2, 0xd8), false, false),
-        TokenKind::Key => (theme::INK_1, false, false),
+        TokenKind::Key => (theme::rgb(0x9a, 0xc2, 0xe8), false, false),
         TokenKind::Punct => (theme::INK_3, false, false),
     }
 }
@@ -612,7 +734,7 @@ pub fn layout_yazi_view(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn render_rich_preview(
+pub(crate) fn render_rich_preview(
     scene: &mut Scene,
     doc: &PreviewDoc<'_>,
     x0: f32,
@@ -621,19 +743,18 @@ fn render_rich_preview(
     max_y: f32,
     m: CellMetrics,
     clip: u32,
-) {
+) -> f32 {
     match &doc.body {
         PreviewBody::Table(tbl) => {
-            render_preview_table(scene, tbl, x0, y0, w, max_y, m, clip);
+            render_preview_table(scene, tbl, x0, y0, w, max_y, m, clip) - y0
         }
         PreviewBody::KeyValues(kv) => {
-            render_preview_kv(scene, kv, x0, y0, w, max_y, m, clip);
+            render_preview_kv(scene, kv, x0, y0, w, max_y, m, clip) - y0
         }
         PreviewBody::Markdown { blocks, truncated } => {
-            render_preview_markdown(scene, blocks.as_slice(), *truncated, x0, y0, w, max_y, m, clip);
+            render_preview_markdown(scene, blocks.as_slice(), *truncated, x0, y0, w, max_y, m, clip) - y0
         }
         PreviewBody::Code { lang, lines, truncated } => {
-            // Subtle language badge at top-right of code preview.
             let mut y = y0;
             scene.text(x0, y, *lang, theme::INK_3, true, false, clip);
             let sz = format_size_bytes(doc.file_size as i64);
@@ -641,9 +762,12 @@ fn render_rich_preview(
             y += m.ch + 6.0;
             scene.line(x0, y, x0 + w, y, 1.0, theme::LINE_FAINT, clip);
             y += 8.0;
-            render_code_lines(scene, lines.as_slice(), x0, y, w, max_y, m, clip, true);
-            if *truncated && y + (lines.len() as f32) * (m.ch + 2.0) < max_y {
-                scene.text(x0 + 4.0 * m.cw, max_y - m.ch, "… truncated", theme::INK_4, false, true, clip);
+            let end_y = render_code_lines(scene, lines.as_slice(), x0, y, w, max_y, m, clip, true);
+            if *truncated && end_y + m.ch <= max_y {
+                scene.text(x0 + 4.0 * m.cw, end_y + 2.0, "… truncated", theme::INK_4, false, true, clip);
+                (end_y + m.ch + 4.0) - y0
+            } else {
+                end_y - y0
             }
         }
         PreviewBody::Summary { pairs } => {
@@ -662,6 +786,7 @@ fn render_rich_preview(
                 scene.text(x0 + 14.0 * m.cw, y, v.as_str(), theme::INK_1, false, false, clip);
                 y += m.ch + 6.0;
             }
+            y - y0
         }
     }
 }
@@ -742,7 +867,7 @@ fn render_preview_kv(
     max_y: f32,
     m: CellMetrics,
     clip: u32,
-) {
+) -> f32 {
     scene.text(x0, y, kv.title.as_str(), theme::INK_1, true, false, clip);
     let sub_w = kv.subtitle.chars().count() as f32 * m.cw;
     scene.text(x0 + w - sub_w, y, kv.subtitle.as_str(), theme::INK_4, false, false, clip);
@@ -754,7 +879,7 @@ fn render_preview_kv(
     let val_max_c = ((w - key_w) / m.cw).floor().max(10.0) as usize;
     for (k, v) in kv.pairs.iter() {
         if y + m.ch > max_y {
-            return;
+            return y;
         }
         scene.text(x0, y, k.as_str(), theme::INK_3, false, false, clip);
         scene.text(x0 + key_w, y, truncate_chars(v.as_str(), val_max_c), theme::INK_1, false, false, clip);
@@ -764,8 +889,9 @@ fn render_preview_kv(
         && y + m.ch * 3.0 < max_y
     {
         y += 10.0;
-        render_preview_table(scene, tbl, x0, y, w, max_y, m, clip);
+        y = render_preview_table(scene, tbl, x0, y, w, max_y, m, clip);
     }
+    y
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -779,7 +905,7 @@ fn render_preview_markdown(
     max_y: f32,
     m: CellMetrics,
     clip: u32,
-) {
+) -> f32 {
     let max_cols = (w / m.cw).floor().max(16.0) as usize;
     for blk in blocks {
         if y + m.ch > max_y {
@@ -837,7 +963,9 @@ fn render_preview_markdown(
     }
     if truncated && y + m.ch <= max_y {
         scene.text(x0, y + 2.0, "… more content", theme::INK_4, false, true, clip);
+        y += m.ch + 4.0;
     }
+    y
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -895,7 +1023,7 @@ fn render_code_lines(
     m: CellMetrics,
     clip: u32,
     show_gutter: bool,
-) {
+) -> f32 {
     let line_step = m.ch + 2.0;
     let gutter_w = if show_gutter { 4.2 * m.cw } else { 0.0 };
     let max_cols = ((w - gutter_w) / m.cw).floor().max(8.0) as usize;
@@ -922,4 +1050,5 @@ fn render_code_lines(
         }
         y += line_step;
     }
+    y
 }

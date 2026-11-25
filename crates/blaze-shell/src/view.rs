@@ -93,8 +93,24 @@ pub struct HitRegion {
     pub action: HitAction,
 }
 
+/// One styled span inside a floating file preview popover (produced by `blaze-preview`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreviewSpan {
+    pub text: String,
+    pub color: [f32; 4],
+    pub bold: bool,
+    pub italic: bool,
+}
+
+/// One line inside a floating file preview popover (with optional 1-based line number gutter).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreviewLine {
+    pub line_no: Option<u32>,
+    pub spans: Vec<PreviewSpan>,
+}
+
 /// Rich interactive hover popover kind attached to prompt capsule segments, icon buttons, & files.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum HoverKind {
     Tooltip { title: String, subtitle: Option<String> },
     Directory { cwd: String },
@@ -104,13 +120,13 @@ pub enum HoverKind {
     Toolchains { items: Vec<(&'static str, &'static str, &'static str)> },
     /// Hovering a file entry in `ls` grid or table; lazily hydrated into `FilePreview` by the app loop.
     FileEntry { full_path: String, name: String, icon: Option<&'static str>, is_dir: bool },
-    /// Hydrated file preview popover rendered cleanly in dark glass without IO inside `layout.rs`.
+    /// Hydrated rich syntax-highlighted / tabular / markdown preview popover rendered in dark glass.
     FilePreview {
         full_path: String,
         name: String,
         icon: Option<&'static str>,
         meta: String,
-        lines: Vec<String>,
+        lines: Vec<PreviewLine>,
         truncated: bool,
     },
 }

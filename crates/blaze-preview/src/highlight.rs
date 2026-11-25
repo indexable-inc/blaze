@@ -9,6 +9,7 @@ use blaze_own::{AString, AVec, Alloc};
 pub enum TokenKind {
     Plain,
     Keyword,
+    Function,
     Type,
     String,
     Number,
@@ -229,14 +230,23 @@ fn tokenize_line<'a>(
             let is_kv_key = style == LangStyle::HashComment
                 && look < len
                 && (bytes[look] == b'=' || bytes[look] == b':');
+            let is_call = look < len && (bytes[look] == b'(' || bytes[look] == b'!');
+            let is_primitive_ty = lang == "Rust"
+                && matches!(
+                    word,
+                    "bool" | "char" | "str" | "u8" | "u16" | "u32" | "u64" | "u128" | "usize"
+                        | "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "f32" | "f64"
+                );
+            let is_pascal_type = word.as_bytes()[0].is_ascii_uppercase()
+                && (word.bytes().any(|c| c.is_ascii_lowercase()) || word.len() >= 2);
             let kind = if is_keyword(word, lang) {
                 TokenKind::Keyword
             } else if is_kv_key {
                 TokenKind::Key
-            } else if word.as_bytes()[0].is_ascii_uppercase()
-                && word.bytes().any(|c| c.is_ascii_lowercase())
-            {
+            } else if is_primitive_ty || is_pascal_type {
                 TokenKind::Type
+            } else if is_call {
+                TokenKind::Function
             } else {
                 TokenKind::Plain
             };
