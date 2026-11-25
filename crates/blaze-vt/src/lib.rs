@@ -10,6 +10,10 @@
 //! | [`parser`] | the vt100.net state machine as ghostty runs it, UTF-8 in ground, events to a [`parser::Sink`] | built |
 //! | `utf8` | the decoder: one code point per call, U+FFFD for each maximal invalid subpart | built |
 //! | [`style`] | a cell's style: colours by source (unset, palette, RGB), underline styles, flags | built |
+//! | [`page`] | 8-byte cells and rows in pages; the page list with byte-capped scrollback | built |
+//! | [`screen`] | a screen: interned styles, out-of-line graphemes and links, cursor, reflowing resize | built |
+//! | [`terminal`] | C0/C1, ESC, CSI and modes on two screens; replies as bytes, effects as data | built |
+//! | [`plant`] | the planted bugs the simulation tests must catch | built |
 //!
 //! The screen, terminal, SGR, OSC, DCS, kitty and input modules are written in lanes against
 //! these interfaces (vt.md, "Modules").
@@ -23,11 +27,27 @@
 #[cfg(test)]
 extern crate std;
 
+pub mod page;
 pub mod parser;
+pub mod plant;
+pub mod screen;
 pub mod style;
+pub mod terminal;
 mod utf8;
 
 #[cfg(test)]
+mod inventory_tests;
+#[cfg(test)]
+mod model;
+#[cfg(test)]
 mod parser_tests;
+#[cfg(test)]
+mod screen_tests;
+#[cfg(test)]
+mod sim_tests;
+#[cfg(test)]
+mod terminal_tests;
+#[cfg(test)]
+mod test_support;
 
 pub use parser::{Csi, Dcs, Esc, MAX_INTERMEDIATES, MAX_PARAMS, Parser, Sink, Terminator};
