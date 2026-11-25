@@ -992,10 +992,20 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
 
     /// Normalize an outer `PNode::Alias` subject when possible (e.g. `<<I as Iterator>::Item as
     /// IntoIterator>::IntoIter` -> `option::IterMut`), keeping `s` unchanged if it is rigid.
-    fn try_normalize_subject(&mut self, mut s: Side<'c>, depth: u32) -> Side<'c> {
+    fn try_normalize_subject(&mut self, s: Side<'c>, depth: u32) -> Side<'c> {
+        self.try_normalize_subject_flag(s, depth).0
+    }
+
+    /// Normalizes alias `s` through selected impls/bounds, also returning whether at least one
+    /// normalization step occurred. Tracking this flag (rather than comparing `PTy` alone) is
+    /// required because `<P as Tr>::Assoc` in a callee env (`P -> &Client`) and `<T as Tr>::Assoc`
+    /// in `impl<T: Tr> Tr for &T` (`T -> Client`) share the same interned `PTy` index in `sig_types`
+    /// while carrying different `EnvId`s.
+    fn try_normalize_subject_flag(&mut self, mut s: Side<'c>, depth: u32) -> (Side<'c>, bool) {
         if depth >= MOST_WALK_DEPTH / 2 {
-            return s;
+            return (s, false);
         }
+        let mut normalized = false;
         for step in 0..8u32 {
             let Ok(Resolved::Side(cur)) = self.resolve(s) else { break };
             s = cur;
@@ -1005,6 +1015,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 Ok(next) => {
                     (self.bound, self.bound_len, self.hr, self.hr_len, self.binder_v) = saved;
                     s = next;
+                    normalized = true;
                 }
                 Err(_) => {
                     (self.bound, self.bound_len, self.hr, self.hr_len, self.binder_v) = saved;
@@ -1012,7 +1023,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 }
             }
         }
-        s
+        (s, normalized)
     }
 
     /// The selected impl's (or bound's / builtin callable's) value for the alias `s` (its node `n`).
@@ -1922,11 +1933,15 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         let PNode::ExTrait(trait_, _) = self.node(trait_ref)? else { return Err(self.malformed(trait_ref.ty, Bad::NotOfKind)) };
         self.bound_len = 0;
         self.hr_len = 0;
-        let subject = match self.resolve(subject)? {
+        let raw_subject = match self.resolve(subject)? {
             Resolved::Side(s) => s,
             Resolved::Unbound { param, .. } => return Err(self.malformed(subject.ty, Bad::Unconstrained { index: param })),
         };
-        if self.try_prove_trait_non_impl(subject, trait_ref, false, trait_)? {
+        if self.try_prove_trait_non_impl(raw_subject, trait_ref, false, trait_)? {
+            return Ok(());
+        }
+        let (subject, normalized) = self.try_normalize_subject_flag(raw_subject, 0);
+        if (normalized || subject.ty != raw_subject.ty) && self.try_prove_trait_non_impl(subject, trait_ref, false, trait_)? {
             return Ok(());
         }
         let param_miss = matches!(self.node(subject)?, PNode::Param(_));
@@ -2420,7 +2435,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         if self.try_prove_trait_non_impl(raw_subject, trait_ref, true, trait_)? {
             return Ok(());
         }
-        let subject = self.try_normalize_subject(raw_subject, 0);
+        let (subject, normalized) = self.try_normalize_subject_flag(raw_subject, 0);
         // If normalizing the subject or any alias trait argument yields an all-inert goal
         // (e.g. `usize: Sum<<Map<Iter<'a, _>, C> as Iterator>::Item>` -> `usize: Sum<usize>`),
         // the normalized impls' own where-clauses have already been checked and the goal itself
@@ -2451,7 +2466,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 }
             }
         }
-        if subject.ty != raw_subject.ty && self.try_prove_trait_non_impl(subject, trait_ref, true, trait_)? {
+        if (normalized || subject.ty != raw_subject.ty) && self.try_prove_trait_non_impl(subject, trait_ref, true, trait_)? {
             return Ok(());
         }
         let param_miss = matches!(self.node(subject)?, PNode::Param(_));

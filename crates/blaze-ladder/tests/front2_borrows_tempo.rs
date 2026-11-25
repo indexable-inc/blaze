@@ -1438,6 +1438,29 @@ fn control_become_borrows_local() -> u8 {
     let local = 9u8;
     become become_sink(&local);
 }
+
+// Class T: `<&Client as ChainSpecProvider>::ChainSpec` normalizes through `impl<T> ... for &T`
+// to `<Client as ChainSpecProvider>::ChainSpec` (same interned `PTy`, different `EnvId`;
+// `tempo_transaction_pool::amm::AmmLiquidityCache::repopulate`).
+trait RepopHardforks {}
+trait RepopEthChainSpec { type Header; }
+trait RepopChainSpecProvider { type ChainSpec; }
+impl<T: RepopChainSpecProvider + ?Sized> RepopChainSpecProvider for &T {
+    type ChainSpec = T::ChainSpec;
+}
+trait RepopHeaderProvider { type Header; }
+struct RepopHeader;
+fn repop_on_new_blocks<P>(_client: P)
+where
+    P: RepopChainSpecProvider<ChainSpec: RepopHardforks>,
+{}
+fn repopulate_via_ref_chain_spec<Client>(client: &Client)
+where
+    Client: RepopHeaderProvider<Header = RepopHeader>
+        + RepopChainSpecProvider<ChainSpec: RepopEthChainSpec<Header = RepopHeader> + RepopHardforks>,
+{
+    repop_on_new_blocks(client)
+}
 "#;
     let heap = blaze_own::testing::heap();
     let tc = open_toolchain();
