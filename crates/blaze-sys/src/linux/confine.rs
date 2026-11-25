@@ -23,11 +23,11 @@
 use core::ffi::CStr;
 
 use super::{
-    AccessFs, CWD, EntryKind, Family, OpenFlags, OwnedFd, PathBeneath, RulesetAttr, SockFilter,
-    SockFlags, SockKind, Unlink, getdents64, landlock_abi, landlock_add_rule_path,
-    landlock_create_ruleset, mkdirat,
+    AccessFs, AtFlags, CWD, EntryKind, Family, OpenFlags, OwnedFd, PathBeneath, RulesetAttr,
+    SockFilter, SockFlags, SockKind, StatxMask, Unlink, getdents64, landlock_abi,
+    landlock_add_rule_path, landlock_create_ruleset, mkdirat,
     nr::{CAPSET, IOCTL, MOUNT_SETATTR, MOVE_MOUNT, OPEN_TREE, PRLIMIT64},
-    openat, raw, readlinkat, socket, symlinkat,
+    openat, raw, readlinkat, socket, statx, symlinkat,
     task::{MountFlags, Namespaces, UnmountFlags, chdir, mount, pivot_root, umount2, unshare},
     unlinkat, write,
 };
@@ -761,7 +761,20 @@ fn mirror_dir_into(
             let Some(dst_c) = make_prefixed_cstr(&mut dst_buf, dst_prefix, name) else {
                 return Err(TestConfineError::Mount { which: "mirror dst too long", errno: Errno::NameTooLong });
             };
-            match entry.kind {
+            let kind = match entry.kind {
+                EntryKind::Unknown => {
+                    let st = statx(src_fd.fd(), Path::new(name_c), AtFlags::NO_FOLLOW, StatxMask::TYPE)
+                        .map_err(|errno| TestConfineError::Mount { which: "statx mirror unknown", errno })?;
+                    match st.mode & 0o170_000 {
+                        0o040_000 => EntryKind::Dir,
+                        0o100_000 => EntryKind::Regular,
+                        0o120_000 => EntryKind::Link,
+                        _ => EntryKind::Other(0),
+                    }
+                }
+                other => other,
+            };
+            match kind {
                 EntryKind::Link => {
                     let target = readlinkat(src_fd.fd(), Path::new(name_c), &mut link_buf)
                         .map_err(|errno| TestConfineError::Mount { which: "readlink mirror", errno })?;

@@ -1131,6 +1131,12 @@ impl<'h> SuiteCache<'h> {
             if entry.lands && head.personality.is_none() {
                 continue;
             }
+            // Preflight byte budget BEFORE calling `gather_for_child` so we never mutate
+            // `child.sent_records` or `child.told` for a deferred entry.
+            if published > 0 && out.len().saturating_add(entry.bytes.len()) >= max_out_len {
+                next_cursor -= 1;
+                break;
+            }
             let mut any_unkeyed = false;
             let mut datums_purity = Ok(());
             let Some(entry) = self.gather_for_child(
@@ -1147,12 +1153,6 @@ impl<'h> SuiteCache<'h> {
             )? else {
                 continue;
             };
-            // Check estimated additional bytes before writing so one large entry cannot breach the cap.
-            let inline_bytes: usize = inline.iter().map(|(_, b)| b.len()).sum();
-            if published > 0 && out.len().saturating_add(inline_bytes) >= max_out_len {
-                next_cursor -= 1;
-                break;
-            }
             if needs.publish_precomputed(
                 sym,
                 entry.record,

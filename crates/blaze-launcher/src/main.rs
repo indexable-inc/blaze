@@ -357,9 +357,13 @@ fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::Shared
         let Ok(store_c) = CString::new(store.as_encoded_bytes()) else {
             stop(CANNOT_RUN, "BLAZE_LAUNCH_STORE holds a NUL byte");
         };
-        let cwd_c = std::env::current_dir()
-            .ok()
-            .and_then(|p| CString::new(p.into_os_string().into_vec()).ok());
+        let cwd_c = match std::env::current_dir() {
+            Ok(p) => match CString::new(p.into_os_string().into_vec()) {
+                Ok(c) => c,
+                Err(_) => stop(CANNOT_RUN, "current working directory holds a NUL byte"),
+            },
+            Err(why) => stop(CANNOT_RUN, &format!("current working directory could not be read: {why}")),
+        };
         let bins_c = match bins_dir {
             None => None,
             Some(raw) => match CString::new(raw.into_vec()) {
@@ -376,10 +380,8 @@ fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::Shared
         };
         let mut keep_ro_buf: [&core::ffi::CStr; 4] = [store_c.as_c_str(); 4];
         let mut keep_ro_len = 1usize;
-        if let Some(cwd) = cwd_c.as_ref()
-            && let Some(slot) = keep_ro_buf.get_mut(keep_ro_len)
-        {
-            *slot = cwd.as_c_str();
+        if let Some(slot) = keep_ro_buf.get_mut(keep_ro_len) {
+            *slot = cwd_c.as_c_str();
             keep_ro_len += 1;
         }
         if let Some(bins) = bins_c.as_ref()
@@ -398,7 +400,7 @@ fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::Shared
         let temp_mount = match blaze_sys::linux::confine::enter_test_sandbox(
             temp_c.as_c_str(),
             keep_ro,
-            cwd_c.as_deref(),
+            Some(cwd_c.as_c_str()),
             bins_c.as_deref(),
         ) {
             Ok(mount) => mount,

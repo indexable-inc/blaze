@@ -304,7 +304,14 @@ impl<'a, 'h> BinServer<'a, 'h> {
             let _ = writeln!(sidecar, "store={store}");
             let _ = writeln!(sidecar, "entry={}", head.line);
             if let Some(send) = bin.native {
-                let _ = writeln!(sidecar, "native={}", send.hex);
+                match send.load_mode {
+                    crate::engine_native::NativeLoadMode::Eager => {
+                        let _ = writeln!(sidecar, "native={}", send.hex);
+                    }
+                    crate::engine_native::NativeLoadMode::Lazy => {
+                        let _ = writeln!(sidecar, "native=lazy:{}", send.hex);
+                    }
+                }
                 #[cfg(target_os = "macos")]
                 if !natives.iter().any(|existing: &crate::engine_native::NativeSend<'_>| existing.hex == send.hex) {
                     natives.push(send);
@@ -684,7 +691,10 @@ fn service_conn_read<'a, 'h>(
         if owner_suite != u32::MAX && owner_row != u32::MAX {
             conn.owner = Some((owner_suite, owner_row));
         }
-        conn.keep = if bin.native.is_some() { Err(NotKept::Foreign) } else { Ok(()) };
+        let eager_native = bin
+            .native
+            .is_some_and(|send| send.load_mode == crate::engine_native::NativeLoadMode::Eager);
+        conn.keep = if eager_native { Err(NotKept::Foreign) } else { Ok(()) };
         let head = bin.roots.head();
         let make_err = |why| BinServeError {
             package: owned_text(bin.package, tables),
@@ -692,7 +702,11 @@ fn service_conn_read<'a, 'h>(
             why: BinServeWhy::Parent(why),
         };
         if let Some(send) = bin.native {
-            conn.needs.tell_native(send.library, send.words, &mut conn.outbox).map_err(make_err)?;
+            if eager_native {
+                conn.needs.tell_native(send.library, send.words, &mut conn.outbox).map_err(make_err)?;
+            } else {
+                conn.needs.arm_lazy_native(send.library, send.words);
+            }
         }
         conn.needs.name_personality(head.personality, &mut conn.outbox).map_err(make_err)?;
         // Pre-publish warm functions already compiled by earlier spawns ONLY when this binary is
@@ -802,6 +816,7 @@ fn service_conn_read<'a, 'h>(
                         && conn.child_sent.warm_cursor < warm_len
                         && (was_keep_ok || warm_len.saturating_sub(conn.child_sent.warm_cursor) >= 256)
                     {
+                        conn.needs.flush_pending_native(&mut conn.outbox).map_err(make_err)?;
                         let cap = conn.out_at.saturating_add(MAX_OUTBOX);
                         bin.suite_cache
                             .borrow()
