@@ -536,6 +536,8 @@ enum LookedGit {
         git: Dir<ReadOnly>,
         shown: blaze_own::String<Alloc<'static>>,
         folders: blaze_own::Vec<GitDbFolder, Alloc<'static>>,
+        /// Repository URL whose `.idx` tables are currently retained in `folders`.
+        cached_repo: blaze_own::String<Alloc<'static>>,
     },
 }
 
@@ -584,19 +586,28 @@ impl CargoCache {
             Some(looked) => looked,
             none => none.insert(LookedGit::open(cx, env)?),
         };
-        if let LookedGit::Open { git, folders, .. } = looked {
+        if let LookedGit::Open { git, folders, cached_repo, .. } = looked {
             let db = Path::new(CARGO_DB_IN_GIT)?;
             let objects = Path::new(CARGO_GIT_OBJECTS)?;
             let pack = Path::new(CARGO_GIT_PACK)?;
             let global = env.heap.alloc();
-            // Release previously cached indexes for unrelated repositories so command-wide retained
-            // `.idx` memory stays bounded to one repository's cap (`MOST_GIT_PACKS` /
-            // `MOST_GIT_IDX_TOTAL_BYTES`), independent of how many Git dependencies the lock holds.
+            // Evict cached indexes whenever the queried repository URL changes (including
+            // different repositories sharing the same URL stem) so command-wide retained `.idx`
+            // memory stays bounded to one repository's cap (`MOST_GIT_PACKS` /
+            // `MOST_GIT_IDX_TOTAL_BYTES`).
+            if cached_repo.as_str() != repo {
+                for folder in folders.iter_mut() {
+                    folder.odb = None;
+                }
+                cached_repo.clear();
+                cached_repo
+                    .try_push_str(repo)
+                    .map_err(|_| CliError::Text { what: "a repository url could not be allocated" })?;
+            }
             let mut repo_packs: usize = 0;
             let mut repo_idx_bytes: u64 = 0;
-            for folder in folders.iter_mut() {
+            for folder in folders.iter() {
                 if !local::git_db_folder(repo, folder.name()) {
-                    folder.odb = None;
                     continue;
                 }
                 if let Some(GitDbOdb::Ready { packs }) = &folder.odb {
@@ -758,7 +769,7 @@ impl LookedGit {
             shown.str(" (no repository folder in it)");
             return Ok(LookedGit::Closed { shown, miss: ClosedMiss::Absent });
         }
-        Ok(LookedGit::Open { git, shown, folders })
+        Ok(LookedGit::Open { git, shown, folders, cached_repo: blaze_own::String::new_in(global) })
     }
 }
 
@@ -906,6 +917,8 @@ struct CargoGitSource<'a> {
     most_loose_bytes: u64,
     /// Set when a confined loose or pack read fails due to OS I/O, symlink refusal, or truncation.
     io_failed: bool,
+    /// Set when reading a loose object or pack range fails due to frame/heap allocation exhaustion.
+    alloc_failed: Option<&'static str>,
 }
 
 impl local::GitObjectSource<Alloc<'static>> for CargoGitSource<'_> {
@@ -924,15 +937,18 @@ impl local::GitObjectSource<Alloc<'static>> for CargoGitSource<'_> {
         };
         let path = self.objects_dir.join(&dir_part).join(&file_part);
         let Ok(reserve) = usize::try_from(self.most_loose_bytes) else {
+            self.alloc_failed = Some("a cargo git loose object exceeds addressable memory");
             return Err(local::GitStoreWhy::LooseHeader);
         };
         let Ok(scratch) = Frame::with_reserve(reserve.saturating_add(1 << 16), bstd::mem::Tag::Other) else {
+            self.alloc_failed = Some("the frame a cargo git loose object is read in could not be reserved");
             return Err(local::GitStoreWhy::LooseHeader);
         };
         let mut bytes = Bytes::new_in(&scratch, "a cargo git loose object, confined read");
         match self.git.read_all_confined(self.cx, &path, &mut bytes) {
             Ok(_) => {
                 if out.try_extend_from_slice(bytes.as_slice()).is_err() {
+                    self.alloc_failed = Some("a cargo git loose object could not be allocated");
                     return Err(local::GitStoreWhy::LooseHeader);
                 }
                 Ok(true)
@@ -958,19 +974,19 @@ impl local::GitObjectSource<Alloc<'static>> for CargoGitSource<'_> {
             return Err(local::GitStoreWhy::IdxShort);
         };
         let Ok(len_usize) = usize::try_from(len) else {
-            self.io_failed = true;
+            self.alloc_failed = Some("a cargo git pack range exceeds addressable memory");
             return Err(local::GitStoreWhy::IdxShort);
         };
         let reserve = len_usize.saturating_mul(2).max(1 << 16).saturating_add(1 << 16);
         let Ok(scratch) = Frame::with_reserve(reserve, bstd::mem::Tag::Other) else {
-            self.io_failed = true;
+            self.alloc_failed = Some("the frame a cargo git pack range is read in could not be reserved");
             return Err(local::GitStoreWhy::IdxShort);
         };
         let mut bytes = Bytes::new_in(&scratch, "a cargo git pack range, confined read");
         match self.git.read_range_confined(self.cx, &pack.pack_path, offset, len_usize, &mut bytes) {
             Ok(read) if read == len_usize => {
                 if out.try_extend_from_slice(bytes.as_slice()).is_err() {
-                    self.io_failed = true;
+                    self.alloc_failed = Some("a cargo git pack range could not be allocated");
                     return Err(local::GitStoreWhy::IdxShort);
                 }
                 Ok(true)
@@ -1041,7 +1057,7 @@ fn adopt_local_git<'c>(
         let most_loose_bytes = most_obj.saturating_add(most_obj / 64).saturating_add(4096);
         let target = record_path(&unit.key())?;
         let room = blaze_fetch::unpack::git_room(&unpack_limits);
-        let mut source = CargoGitSource { cx, git, objects_dir, packs, most_loose_bytes, io_failed: false };
+        let mut source = CargoGitSource { cx, git, objects_dir, packs, most_loose_bytes, io_failed: false, alloc_failed: None };
         match root.reserve(cx, &target, room, |buf| {
             local::adopt_git_db_in(
                 unit,
@@ -1054,6 +1070,14 @@ fn adopt_local_git<'c>(
             .map(|(fixed, _)| fixed.written())
         })? {
             Ok(()) => return Ok(true),
+            Err(_) if source.alloc_failed.is_some() => {
+                if let Some(what) = source.alloc_failed {
+                    return Err(CliError::Text { what });
+                }
+            }
+            Err(local::AdoptRefused::Unpack(blaze_fetch::unpack::UnpackError::Alloc(_))) => {
+                return Err(CliError::Text { what: "a cargo git record could not be allocated" });
+            }
             Err(_) if source.io_failed => tries.push(Try { place, miss: Miss::Unreadable }),
             Err(refused) => tries.push(Try { place, miss: Miss::Refused(refused) }),
         }
