@@ -356,11 +356,12 @@ fn linux_sandbox_confines_writes_and_distinguishes_exit_101() {
     let source = r#"
 #[test]
 fn can_write_and_unix_socket_inside_tmpdir() {
-    let p = std::env::temp_dir().join("ok.txt");
+    let tmp = std::env::temp_dir();
+    let p = tmp.join("ok.txt");
     std::fs::write(&p, b"hello").expect("write inside TMPDIR");
     assert_eq!(std::fs::read(&p).expect("read back"), b"hello");
-    let sock = std::env::temp_dir().join("ok.sock");
-    let _listener = std::os::unix::net::UnixListener::bind(&sock).expect("AF_UNIX bind inside TMPDIR");
+    std::env::set_current_dir(&tmp).expect("chdir to TMPDIR");
+    let _listener = std::os::unix::net::UnixListener::bind("ok.sock").expect("AF_UNIX bind inside TMPDIR");
     let status = std::process::Command::new("/bin/true").status().expect("spawn helper");
     assert!(status.success());
 }
