@@ -362,12 +362,14 @@ mod tests {
         loose: std::collections::BTreeMap<[u8; 20], std::vec::Vec<u8>>,
         packs: std::vec::Vec<std::vec::Vec<u8>>,
         pack_bytes_read: u64,
+        loose_hits: u32,
     }
 
     impl ObjectSource<Alloc<'static>> for MemGitDb {
         fn read_loose(&mut self, oid: &Oid, out: &mut OwnVec<u8, Alloc<'static>>) -> Result<bool, StoreWhy> {
             out.clear();
             let Some(bytes) = self.loose.get(&oid.0) else { return Ok(false) };
+            self.loose_hits += 1;
             out.extend_from_slice(bytes);
             Ok(true)
         }
@@ -569,6 +571,7 @@ mod tests {
             loose: std::collections::BTreeMap::from([(commit.0, git_loose(GitKind::Commit, commit_bytes.as_bytes()).as_slice().to_vec())]),
             packs: vec![pack0.as_slice().to_vec(), pack1.as_slice().to_vec()],
             pack_bytes_read: 0,
+            loose_hits: 0,
         };
         let pack_tables = [
             (idx0.as_slice(), u64::try_from(pack0.len()).expect("len")),
@@ -578,12 +581,21 @@ mod tests {
             .expect("split loose + multi-pack git db is adopted");
         assert_eq!(record.as_slice(), network.as_slice(), "adopted git db record equals network path byte for byte");
         assert_eq!(made.files, 2);
+        assert_eq!(db.loose_hits, 1, "pinned commit must be read and verified exactly once");
         assert!(db.pack_bytes_read < 4096, "must not read unreachable pack objects: read {}", db.pack_bytes_read);
         let view = PackView::open_source(&unit.source(), record.as_slice()).expect("opens under git source id");
         assert_eq!(
             view.read("src/lib.rs", alloc).expect("read").map(|file| file.bytes.as_slice().to_vec()),
             Some(lib.to_vec())
         );
+
+        // Aggregate object count cap (`PackLimits::most_objects`) is enforced across the ODB walk.
+        let mut tight = limits;
+        tight.git_pack.most_objects = 3;
+        assert!(matches!(
+            adopt_git_db(&unit, &pack_tables, &mut db, &tight, alloc),
+            Err(AdoptRefused::Unpack(UnpackError::GitStore(StoreWhy::Entry(blaze_git_fetch::PackWhy::ObjectsOver { .. }))))
+        ));
 
         // Missing commit reads ZERO packfile bytes.
         let missing_unit = Unit::Git { repo: "https://github.com/example/g.git", commit: Oid([0x55; 20]), packages: 1 };
@@ -599,6 +611,7 @@ mod tests {
             loose: std::collections::BTreeMap::from([(commit.0, git_loose(GitKind::Commit, b"tree 0000000000000000000000000000000000000000\n").as_slice().to_vec())]),
             packs: vec![],
             pack_bytes_read: 0,
+            loose_hits: 0,
         };
         assert!(matches!(
             adopt_git_db(&unit, &[], &mut tampered_db, &limits, alloc),

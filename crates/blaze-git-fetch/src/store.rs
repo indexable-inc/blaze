@@ -382,6 +382,8 @@ impl<'i, A: Allocator + Copy> PackTable<'i, A> {
 pub struct ObjectDb<'i, A: Allocator> {
     packs: Vec<PackTable<'i, A>, A>,
     limits: crate::PackLimits,
+    resolved_objects: u32,
+    resolved_bytes: u64,
     alloc: A,
 }
 
@@ -401,12 +403,27 @@ impl<'i, A: Allocator + Copy> ObjectDb<'i, A> {
             let idx = Idx::parse(idx_bytes, limits.most_objects)?;
             parsed.push(PackTable { idx, pack_end: pack_len - 20, sorted_offsets: None });
         }
-        Ok(ObjectDb { packs: parsed, limits, alloc })
+        Ok(ObjectDb { packs: parsed, limits, resolved_objects: 0, resolved_bytes: 0, alloc })
+    }
+
+    fn charge_object(&mut self, bytes: u64) -> Result<(), (u64, StoreWhy)> {
+        let count = self.resolved_objects.saturating_add(1);
+        if count > self.limits.most_objects {
+            return Err((0, StoreWhy::Entry(PackWhy::ObjectsOver { count, most: self.limits.most_objects })));
+        }
+        let total = self.resolved_bytes.saturating_add(bytes);
+        if total > self.limits.most_total {
+            return Err((0, StoreWhy::Entry(PackWhy::TotalOver { most: self.limits.most_total })));
+        }
+        self.resolved_objects = count;
+        self.resolved_bytes = total;
+        Ok(())
     }
 
     /// Reads object `oid` into `out` (cleared first), checking loose objects first and then all
-    /// indexed packs. Verifies that the resolved bytes hash to `oid`. Returns `Ok(None)` when no
-    /// loose object or pack index holds `oid` (reading zero packfile bytes).
+    /// indexed packs. Verifies that the resolved bytes hash to `oid`, and charges the object
+    /// against `PackLimits::most_objects` and `PackLimits::most_total`. Returns `Ok(None)` when
+    /// no loose object or pack index holds `oid` (reading zero packfile bytes).
     pub fn read_object<S: ObjectSource<A>>(
         &mut self,
         oid: &Oid,
@@ -419,6 +436,7 @@ impl<'i, A: Allocator + Copy> ObjectDb<'i, A> {
             let mut whole = Vec::new_in(self.alloc);
             let (kind, body) = loose(&raw, oid, self.limits.most_object, self.alloc, &mut whole)?;
             let slice = whole.get(body..).ok_or((0, StoreWhy::LooseHeader))?;
+            self.charge_object(u64::try_from(slice.len()).unwrap_or(u64::MAX))?;
             out.try_extend_from_slice(slice).map_err(|e| (0, StoreWhy::Entry(PackWhy::Alloc(e))))?;
             return Ok(Some(kind));
         }
@@ -426,6 +444,7 @@ impl<'i, A: Allocator + Copy> ObjectDb<'i, A> {
             return Ok(None);
         };
         let kind = self.read_packed(pack_idx, found, oid, source, out)?;
+        self.charge_object(u64::try_from(out.len()).unwrap_or(u64::MAX))?;
         Ok(Some(kind))
     }
 

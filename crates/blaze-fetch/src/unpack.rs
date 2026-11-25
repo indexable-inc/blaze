@@ -381,17 +381,9 @@ pub fn git_db_record_in<'a, D: ObjectSource<Alloc<'a>>, S: Sink>(
     alloc: Alloc<'a>,
 ) -> Result<(S, Made), UnpackError> {
     let mut db = ObjectDb::new(packs, limits.git_pack, alloc).map_err(|(_, why)| UnpackError::GitStore(why))?;
-    // Verify the pinned commit exists in the object database before walking (zero pack reads on miss).
-    let mut probe = Vec::new_in(alloc);
-    match db.read_object(&commit, source, &mut probe) {
-        Ok(Some(GitKind::Commit)) => {}
-        Ok(Some(_) | None) => return Err(UnpackError::NoCommit),
-        Err((_, why)) => return Err(UnpackError::GitStore(why)),
-    }
-    drop(probe);
-
     let mut listed: Vec<ListedOid, Alloc<'a>> = Vec::new_in(alloc);
     let mut names: Vec<u8, Alloc<'a>> = Vec::new_in(alloc);
+    let mut no_commit = false;
     let mut store_err: Option<StoreWhy> = None;
     let mut alloc_err: Option<AllocFailure> = None;
 
@@ -401,6 +393,14 @@ pub fn git_db_record_in<'a, D: ObjectSource<Alloc<'a>>, S: Sink>(
         alloc,
         |oid, want, path, buf| match db.read_object(&oid, source, buf) {
             Ok(Some(kind)) if kind == want => Ok(()),
+            Ok(Some(_)) if want == GitKind::Commit && path.is_empty() => {
+                no_commit = true;
+                Err(blaze_git_fetch::TreeError::new_for_store(path, blaze_git_fetch::TreeWhy::NotKind { oid, want }))
+            }
+            Ok(None) if want == GitKind::Commit && path.is_empty() => {
+                no_commit = true;
+                Err(blaze_git_fetch::TreeError::new_for_store(path, blaze_git_fetch::TreeWhy::Missing { oid }))
+            }
             Ok(Some(_)) => Err(blaze_git_fetch::TreeError::new_for_store(path, blaze_git_fetch::TreeWhy::NotKind { oid, want })),
             Ok(None) => Err(blaze_git_fetch::TreeError::new_for_store(path, blaze_git_fetch::TreeWhy::Missing { oid })),
             Err((_, why)) => {
@@ -427,6 +427,9 @@ pub fn git_db_record_in<'a, D: ObjectSource<Alloc<'a>>, S: Sink>(
             }
         },
     );
+    if no_commit {
+        return Err(UnpackError::NoCommit);
+    }
     if let Some(why) = store_err {
         return Err(UnpackError::GitStore(why));
     }

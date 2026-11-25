@@ -478,8 +478,10 @@ const CARGO_GIT_OBJECTS: &str = "objects";
 const CARGO_GIT_PACK: &str = "pack";
 /// Maximum byte length of a single `.idx` file read from cargo's `git/db` (rule 18).
 const MOST_GIT_IDX_BYTES: u64 = 64 << 20;
-/// Maximum byte length of a single loose git object file read from cargo's `git/db` (rule 18).
-const MOST_GIT_LOOSE_BYTES: u64 = 64 << 20;
+/// Maximum cumulative `.idx` bytes retained across all packs of one repository (rule 18).
+const MOST_GIT_IDX_TOTAL_BYTES: u64 = 128 << 20;
+/// Maximum number of indexed packs retained for one repository (rule 18).
+const MOST_GIT_PACKS: usize = 1024;
 
 /// Cargo's local caches on this machine: `<cargo home>/registry/cache` for `.crate` archives
 /// (D78; fetch.md, "Where bytes come from", place 2) and `<cargo home>/git/db` for bare git
@@ -599,6 +601,7 @@ impl CargoCache {
                 let odb = match git.entries_confined(cx, &pack_dir) {
                     Ok(Some(entries)) => {
                         let mut packs = blaze_own::Vec::new_in(global);
+                        let mut idx_total = 0u64;
                         let mut failed = false;
                         for i in 0..entries.len() {
                             if entries.kind(i) != bstd::fs::EntryKind::File {
@@ -608,8 +611,13 @@ impl CargoCache {
                             if !local::git_idx_file(name) {
                                 continue;
                             }
+                            if packs.len() >= MOST_GIT_PACKS {
+                                failed = true;
+                                break;
+                            }
                             let idx_len = entries.len_of(i);
-                            if idx_len > MOST_GIT_IDX_BYTES {
+                            idx_total = idx_total.saturating_add(idx_len);
+                            if idx_len > MOST_GIT_IDX_BYTES || idx_total > MOST_GIT_IDX_TOTAL_BYTES {
                                 failed = true;
                                 break;
                             }
@@ -620,7 +628,7 @@ impl CargoCache {
                                 continue;
                             }
                             let pack_len = entries.len_of(pack_i);
-                            if pack_len > blaze_fetch::fetch::Limits::REAL.git_most {
+                            if pack_len < 32 {
                                 continue;
                             }
                             let (Ok(idx_leaf), Ok(pack_leaf)) = (Path::new(name), Path::new(pack_name_str.as_str())) else {
@@ -849,6 +857,9 @@ struct CargoGitSource<'a> {
     git: &'a Dir<ReadOnly>,
     objects_dir: Path,
     packs: &'a [GitPackEntry],
+    /// Upper bound for a single loose object file, derived from `git_pack.most_object` plus
+    /// worst-case zlib framing overhead.
+    most_loose_bytes: u64,
 }
 
 impl local::GitObjectSource<Alloc<'static>> for CargoGitSource<'_> {
@@ -866,7 +877,7 @@ impl local::GitObjectSource<Alloc<'static>> for CargoGitSource<'_> {
             return Err(local::GitStoreWhy::LooseHeader);
         };
         let path = self.objects_dir.join(&dir_part).join(&file_part);
-        let Ok(reserve) = usize::try_from(MOST_GIT_LOOSE_BYTES) else {
+        let Ok(reserve) = usize::try_from(self.most_loose_bytes) else {
             return Err(local::GitStoreWhy::LooseHeader);
         };
         let Ok(scratch) = Frame::with_reserve(reserve.saturating_add(1 << 16), bstd::mem::Tag::Other) else {
@@ -959,8 +970,11 @@ fn adopt_local_git<'c>(
         for entry in packs.iter() {
             tables.push((entry.idx_bytes.as_slice(), entry.pack_len));
         }
-        let mut source = CargoGitSource { cx, git, objects_dir, packs };
-        match local::adopt_git_db(unit, tables.as_slice(), &mut source, &blaze_fetch::fetch::Limits::REAL.unpack, env.heap.alloc()) {
+        let unpack_limits = &blaze_fetch::fetch::Limits::REAL.unpack;
+        let most_obj = unpack_limits.git_pack.most_object;
+        let most_loose_bytes = most_obj.saturating_add(most_obj / 64).saturating_add(4096);
+        let mut source = CargoGitSource { cx, git, objects_dir, packs, most_loose_bytes };
+        match local::adopt_git_db(unit, tables.as_slice(), &mut source, unpack_limits, env.heap.alloc()) {
             Ok((record, _)) => {
                 write_record(cx, root, &record_path(&unit.key())?, record.as_slice())?;
                 return Ok(true);
