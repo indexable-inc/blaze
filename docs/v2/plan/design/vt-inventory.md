@@ -1,3 +1,8 @@
+---
+status: plan
+summary: "Every sequence, mode, protocol and encoding ghostty's terminal core accepts (433 rows in 12 sections, each with ghostty's file:line), the bar crates/blaze-vt is held to: each row has a test (vt.md)."
+date: 2026-11-24
+---
 # Ghostty VT coverage inventory
 
 **Path aliases.** All are under `/Volumes/Projects/ghostty/src/`:
