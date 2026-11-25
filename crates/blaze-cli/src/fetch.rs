@@ -536,6 +536,9 @@ enum LookedGit {
         git: Dir<ReadOnly>,
         shown: blaze_own::String<Alloc<'static>>,
         folders: blaze_own::Vec<GitDbFolder, Alloc<'static>>,
+        /// Aggregate `.idx` packs and bytes loaded across all matching Cargo git/db folders.
+        packs_loaded: usize,
+        idx_bytes_loaded: u64,
     },
 }
 
@@ -584,7 +587,7 @@ impl CargoCache {
             Some(looked) => looked,
             none => none.insert(LookedGit::open(cx, env)?),
         };
-        if let LookedGit::Open { git, folders, .. } = looked {
+        if let LookedGit::Open { git, folders, packs_loaded, idx_bytes_loaded, .. } = looked {
             let db = Path::new(CARGO_DB_IN_GIT)?;
             let objects = Path::new(CARGO_GIT_OBJECTS)?;
             let pack = Path::new(CARGO_GIT_PACK)?;
@@ -601,7 +604,8 @@ impl CargoCache {
                 let odb = match git.entries_confined(cx, &pack_dir) {
                     Ok(Some(entries)) => {
                         let mut packs = blaze_own::Vec::new_in(global);
-                        let mut idx_total = 0u64;
+                        let mut folder_packs = *packs_loaded;
+                        let mut folder_idx_bytes = *idx_bytes_loaded;
                         let mut failed = false;
                         for i in 0..entries.len() {
                             if entries.kind(i) != bstd::fs::EntryKind::File {
@@ -611,13 +615,13 @@ impl CargoCache {
                             if !local::git_idx_file(name) {
                                 continue;
                             }
-                            if packs.len() >= MOST_GIT_PACKS {
+                            if folder_packs >= MOST_GIT_PACKS {
                                 failed = true;
                                 break;
                             }
                             let idx_len = entries.len_of(i);
-                            idx_total = idx_total.saturating_add(idx_len);
-                            if idx_len > MOST_GIT_IDX_BYTES || idx_total > MOST_GIT_IDX_TOTAL_BYTES {
+                            let next_idx_bytes = folder_idx_bytes.saturating_add(idx_len);
+                            if idx_len > MOST_GIT_IDX_BYTES || next_idx_bytes > MOST_GIT_IDX_TOTAL_BYTES {
                                 failed = true;
                                 break;
                             }
@@ -656,9 +660,17 @@ impl CargoCache {
                                 failed = true;
                                 break;
                             }
+                            folder_packs = folder_packs.saturating_add(1);
+                            folder_idx_bytes = next_idx_bytes;
                             packs.push(GitPackEntry { pack_path, idx_bytes, pack_len });
                         }
-                        if failed { GitDbOdb::Unreadable } else { GitDbOdb::Ready { packs } }
+                        if failed {
+                            GitDbOdb::Unreadable
+                        } else {
+                            *packs_loaded = folder_packs;
+                            *idx_bytes_loaded = folder_idx_bytes;
+                            GitDbOdb::Ready { packs }
+                        }
                     }
                     // No `objects/pack` directory yet: loose objects under `objects/` may still hold the commit.
                     Ok(None) => GitDbOdb::Ready { packs: blaze_own::Vec::new_in(global) },
@@ -714,7 +726,7 @@ impl LookedGit {
             shown.str(" (no repository folder in it)");
             return Ok(LookedGit::Closed { shown, miss: ClosedMiss::Absent });
         }
-        Ok(LookedGit::Open { git, shown, folders })
+        Ok(LookedGit::Open { git, shown, folders, packs_loaded: 0, idx_bytes_loaded: 0 })
     }
 }
 
@@ -942,7 +954,7 @@ fn adopt_local_git<'c>(
             tries.push(Try { place: shown.as_str(), miss: miss.to_miss() });
             return Ok(false);
         }
-        LookedGit::Open { git, shown, folders } => (git, shown, folders),
+        LookedGit::Open { git, shown, folders, .. } => (git, shown, folders),
     };
     let db = Path::new(CARGO_DB_IN_GIT)?;
     let objects = Path::new(CARGO_GIT_OBJECTS)?;

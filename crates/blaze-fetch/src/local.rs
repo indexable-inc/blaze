@@ -61,13 +61,25 @@ pub fn crates_io_folder(folder: &str) -> bool {
 
 /// Whether `folder`, a name listed in cargo's [`CARGO_GIT_DB`], is one cargo keeps `repo`'s
 /// bare repository in: `<name>-` followed by 16 lowercase hex digits, where `<name>` is the
-/// last non-empty path segment of `repo` with any trailing `.git` stripped (cargo's
-/// `GitSource::ident` shape). The commit id's SHA-1 binds the bytes regardless; filtering by
-/// repository name keeps the tries few and avoids indexing unrelated repositories' packs.
+/// last non-empty URL path segment of `repo` with any trailing `.git` stripped, or `_empty`
+/// when the URL has no path segment (cargo's `GitSource::ident` shape). The commit id's SHA-1
+/// binds the bytes regardless; filtering by repository name keeps the tries few and avoids
+/// indexing unrelated repositories' packs.
 pub fn git_db_folder(repo: &str, folder: &str) -> bool {
-    let raw = repo.trim_end_matches('/').rsplit('/').next().unwrap_or("");
-    let stem = raw.strip_suffix(".git").unwrap_or(raw);
-    if stem.is_empty() || stem == "." || stem == ".." || stem.contains('/') || stem.contains('\\') {
+    let without_query = repo.split(['?', '#']).next().unwrap_or(repo);
+    let url_path = match without_query.split_once("://") {
+        Some((_, after_scheme)) => after_scheme.split_once('/').map_or("", |(_, path)| path),
+        None => without_query,
+    };
+    let trimmed = url_path.trim_end_matches('/');
+    let stem = if trimmed.is_empty() {
+        "_empty"
+    } else {
+        let raw = trimmed.rsplit('/').next().unwrap_or("");
+        let stripped = raw.strip_suffix(".git").unwrap_or(raw);
+        if stripped.is_empty() { "_empty" } else { stripped }
+    };
+    if stem == "." || stem == ".." || stem.contains('/') || stem.contains('\\') {
         return false;
     }
     let Some(hash) = folder.strip_prefix(stem).and_then(|rest| rest.strip_prefix('-')) else {
@@ -510,6 +522,9 @@ mod tests {
         assert!(git_db_folder("https://github.com/indexable-inc/tieline", "tieline-21f4a75d056d557d"));
         assert!(git_db_folder("https://github.com/openai-oss-forks/rusty_v8.git", "rusty_v8-2d66e6cfa36ad61f"));
         assert!(git_db_folder("https://github.com/helix-editor/nucleo.git/", "nucleo-425d994cd74b3654"));
+        assert!(git_db_folder("https://git.example.com", "_empty-0123456789abcdef"));
+        assert!(git_db_folder("https://git.example.com/", "_empty-0123456789abcdef"));
+        assert!(!git_db_folder("https://git.example.com", "git.example.com-0123456789abcdef"));
         assert!(!git_db_folder("https://github.com/indexable-inc/tieline", "other-21f4a75d056d557d"));
         assert!(!git_db_folder("https://github.com/indexable-inc/tieline", "tieline-21F4A75D056D557D"));
         assert!(!git_db_folder("https://github.com/indexable-inc/tieline", "tieline-21f4a75d056d557"));
