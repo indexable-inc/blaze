@@ -335,6 +335,18 @@ impl Entries {
         self.listing.stamp(i).executable()
     }
 
+    /// Entry `i`'s full [`Look`] metadata from the directory listing (`getattrlistbulk` on macOS).
+    #[track_caller]
+    pub fn look(&self, i: usize) -> Look {
+        Look::of(&self.listing.stamp(i))
+    }
+
+    /// Entry `i`'s raw Unix mode bits from the directory listing (a link not followed).
+    #[track_caller]
+    pub fn mode(&self, i: usize) -> u32 {
+        self.listing.stamp(i).mode
+    }
+
     /// The kinds, in the names' order: a walk that wants the folders reads a byte each.
     pub fn kinds(&self) -> &[EntryKind] {
         self.listing.kinds()
@@ -1442,6 +1454,94 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
         self.list_one(cx, self.base.clone(), None)
     }
 
+    /// List many folders beneath this directory concurrently (`None` = this directory itself),
+    /// overlapping up to 128 `Effect::Entries` in flight at once without a serial `stat` before
+    /// each folder. A missing or non-directory folder returns `None` in its slot.
+    pub fn entries_many<'f>(
+        &self,
+        cx: &Cx,
+        dirs: &[Option<&Path>],
+        frame: &'f Frame,
+    ) -> Result<Vec<Option<Entries>, &'f Frame>, FsError> {
+        let mut out: Vec<Option<Entries>, &'f Frame> = Vec::new_in(frame);
+        out.try_reserve(dirs.len()).map_err(|_| {
+            FsError::new(
+                FsOp::Entries,
+                &self.base,
+                FsKind::Stopped(Stopped::OutOfMemory {
+                    arena: "bstd::fs::entries_many",
+                    asked: dirs.len() * size_of::<Option<Entries>>(),
+                }),
+            )
+        })?;
+        for _ in 0..dirs.len() {
+            out.push(None);
+        }
+        if dirs.is_empty() {
+            cx.check().map_err(|stopped| FsError::new(FsOp::Entries, &self.base, FsKind::Stopped(stopped)))?;
+            return Ok(out);
+        }
+        const WINDOW: usize = 128;
+        let cap = dirs.len().min(WINDOW);
+        let mut tags: Vec<Tag, &Frame> = Vec::new_in(frame);
+        let mut meta: Vec<(usize, DirName, Option<Path>), &Frame> = Vec::new_in(frame);
+        let _ = tags.try_reserve(cap);
+        let _ = meta.try_reserve(cap);
+
+        let submit_one = |io: &Io, base: &DirName, opt_path: Option<&Path>| {
+            let (dir_name, path_owned) = match opt_path {
+                Some(p) => (DirName::Named(self.beneath(p)), Some(p.clone())),
+                None => (base.clone(), None),
+            };
+            let asked = dir_name.clone();
+            let tag = io.submit(|tag| Effect::Entries { dir: asked, tag });
+            (tag, dir_name, path_owned)
+        };
+
+        let mut next = 0usize;
+        while next < dirs.len() && tags.len() < cap {
+            let (tag, dir_name, path_owned) = submit_one(&self.io, &self.base, dirs[next]);
+            tags.push(tag);
+            meta.push((next, dir_name, path_owned));
+            next += 1;
+        }
+
+        while !tags.is_empty() {
+            let (slot, done) = match cx.wait_any(&self.io, &tags) {
+                Ok(pair) => pair,
+                Err(stopped) => {
+                    for &t in &tags {
+                        self.io.forget(t, Ends::Once);
+                    }
+                    return Err(FsError::new(FsOp::Entries, &self.base, FsKind::Stopped(stopped)));
+                }
+            };
+            tags.swap_remove(slot);
+            let (idx, dir_name, path_owned) = meta.swap_remove(slot);
+            match done {
+                Done::Entries(listing) if listing.dir() == &dir_name => {
+                    out[idx] = Some(Entries { listing, path: path_owned });
+                }
+                Done::Failed(_) => {
+                    // Missing folder or non-directory: leave `None`.
+                }
+                other => {
+                    for &t in &tags {
+                        self.io.forget(t, Ends::Once);
+                    }
+                    return Err(unexpected(FsOp::Entries, &dir_name, other));
+                }
+            }
+            if next < dirs.len() {
+                let (tag, dn, po) = submit_one(&self.io, &self.base, dirs[next]);
+                tags.push(tag);
+                meta.push((next, dn, po));
+                next += 1;
+            }
+        }
+        Ok(out)
+    }
+
     /// The one listing of `dir` (named `path` beneath this directory, or this one).
     fn list_one(&self, cx: &Cx, dir: DirName, path: Option<Path>) -> Result<Entries, FsError> {
         // clone: the effect's name, a refcount.
@@ -1523,6 +1623,20 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
     /// The whole file at `path` added to `into`; how many bytes it added.
     pub fn read_all(&self, cx: &Cx, path: &Path, into: &mut Bytes<'_>) -> Result<usize, FsError> {
         self.open_read(cx, path)?.read_all(cx, into)
+    }
+
+    /// Target bytes of the symbolic link at `path` (not followed) added to `into`; how many bytes.
+    pub fn read_link(&self, cx: &Cx, path: &Path, into: &mut Bytes<'_>) -> Result<usize, FsError> {
+        let name = self.beneath(path);
+        let file = name.clone();
+        match call(&self.io, cx, FsOp::Read, &name, |tag| Effect::ReadLink { file, tag })? {
+            Done::Read(bytes) => {
+                into.try_extend(&bytes)
+                    .map_err(|stopped| FsError::new(FsOp::Read, &name, FsKind::Stopped(stopped)))?;
+                Ok(bytes.len())
+            }
+            other => Err(unexpected(FsOp::Read, &name, other)),
+        }
     }
 
     /// Kernel-confined whole-file read: opens `path` strictly beneath this directory without
