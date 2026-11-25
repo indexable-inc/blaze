@@ -46,8 +46,9 @@ standard library itself and behaves as that nightly does. Its linker still takes
 from the nightly the Rust project publishes (rustc, cargo and the standard library of the host and of wasm32-wasip1, 122 MB on
 macOS, 143 to 159 MB on Linux): WASI's C runtime and the sanitizer runtimes. It finds them in
 `~/.blaze` only, never in rustup's directory. The standard library's
-source comes from blaze's own release. v2's blaze does not download that copy itself yet (the installer asks for it with
-`blaze toolchain`, which v2 lacks: [toolchain.md](toolchain.md)). blaze builds your project with
+source comes from blaze's own release. A v2 release also publishes its checked
+`toolchain-<version>.tar.xz`; the installer verifies it against the same SHA256SUMS as the
+binary and unpacks the records into `~/.blaze/v2/toolchain`. blaze builds your project with
 that nightly whatever its `rust-toolchain.toml` says, so a project on a stable release or an
 older nightly builds as it is, and so does code that uses nightly features
 (`#![feature(...)]`). Code the pinned nightly cannot build, such as a feature it removed, fails
@@ -60,16 +61,14 @@ The installer downloads the build for your machine from blaze's releases
 the [GitHub releases](https://github.com/indexable-inc/blaze/releases) list the same ones with
 their notes), checks it against the checksums
 published with it, puts `blaze` and the programs it runs in `~/.cargo/bin`, and
-runs `blaze toolchain` to download its Rust, a command v2's blaze does not have, so on v2 this
-step fails. It asks nothing. Run it again to upgrade, or run `blaze update`
+runs `blaze toolchain` to name its Rust after the checked v2 toolchain shelf has been installed. It asks nothing. Run it again to upgrade, or run `blaze update`
 ([Updates](#updates)). Releases are dated, `0.YYYYMMDD.N`, and come in two channels
 ([release.md](release.md)): **stable**, the default, is releases that passed the heavy tests
 (real projects on macOS and Linux), and **canary** is the newest release, published as soon as
 it is built and promoted to stable, unchanged, once it passes them. End the line with
 `| sh -s -- --channel canary` (or set `BLAZE_CHANNEL=canary`) for canary, or with
 `| sh -s -- --version 0.YYYYMMDD.N` for a given release;
-`--no-toolchain` skips that download (v1 left it to the first build; v2's first build does not
-download it), and `--help` says what else it takes.
+`--no-toolchain` skips both the v1 download and the v2 toolchain shelf installation, and `--help` says what else it takes.
 Over a blaze from before 2026-10-28 it removes the programs with their old names and says so.
 
 ## Updates

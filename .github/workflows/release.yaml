@@ -1,7 +1,7 @@
 name: release
 
 # Builds and publishes `blaze` (`blaze-cli`) for macOS ARM64, Linux x86-64, and Linux ARM64.
-# Uploads all release assets + SHA256SUMS + B3SUMS + library archive to Cloudflare R2
+# Uploads all release assets + SHA256SUMS + B3SUMS + library/toolchain archives to Cloudflare R2
 # (`blaze-releases`, served at https://blaze-releases.ix.dev) and GitHub Releases, and updates
 # the `canary` (and optionally `stable`) channel pointers.
 on:
@@ -60,6 +60,26 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VER" >> "$GITHUB_OUTPUT"
           echo "promote_stable=$PROMOTE" >> "$GITHUB_OUTPUT"
+      - uses: ./.github/actions/toolchain
+      - uses: ./.github/actions/script
+        with:
+          job: cargo
+      - name: cut and archive the v2 toolchain shelf
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          pinned="$(tr -d '[:space:]' < crates/blaze-toolchain/PINNED)"
+          shelf="$RUNNER_TEMP/toolchain"
+          cargo +"$(cat pins/toolchain)" fetch --locked --quiet
+          reg="$(ls -d "${CARGO_HOME:-$HOME/.cargo}"/registry/cache/index.crates.io-* | head -n 1)"
+          "$BLAZE_SCRIPTS/toolchain_cut" "{\"tree\": \".\", \"targets\": [\"aarch64-apple-darwin\", \"aarch64-unknown-linux-gnu\", \"x86_64-unknown-linux-gnu\"], \"registry\": \"$reg\", \"shelf\": \"$shelf\", \"write_pin\": false, \"check\": false, \"macro_side\": true}"
+          test -s "$shelf/$pinned"
+          tar -C "$shelf" -cf - . | xz -9e -T0 > "$RUNNER_TEMP/toolchain-v$VERSION.tar.xz"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: toolchain
+          path: ${{ runner.temp }}/toolchain-v*.tar.xz
+          if-no-files-found: error
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: '0.13.5'
@@ -159,7 +179,7 @@ jobs:
           out = pathlib.Path("out")
           archives = sorted(
               p for p in out.iterdir()
-              if p.is_file() and p.name.startswith("blaze-") and (p.name.endswith(".tar.gz") or p.name.endswith(".tar.xz"))
+              if p.is_file() and (p.name.startswith("blaze-") or p.name.startswith("toolchain-")) and (p.name.endswith(".tar.gz") or p.name.endswith(".tar.xz"))
           )
           sha_lines = []
           b3_lines = []
