@@ -956,6 +956,11 @@ pub trait Load<'n> {
     fn names_verified(&self, _krate: usize) -> Option<Verified<'n>> {
         None
     }
+    /// An already-verified items record proof for crate `krate` (rule 74), avoiding redundant
+    /// `ItemsRecord::open` column and UTF-8 checks per job and stretch.
+    fn items_verified(&self, _krate: usize) -> Option<blaze_scope::items_record::VerifiedItems<'n>> {
+        None
+    }
     /// Whether crate `krate` is a proc-macro crate when known from the crate graph without
     /// opening its `ItemsRecord` (still recorded as `NameCell::Root` by `Tables::proc_macro`).
     fn proc_macro(&self, _krate: usize) -> Option<bool> {
@@ -1099,6 +1104,10 @@ impl<'n> LoadItems<'n> for Loader<'n> {
             self.log.put(SourceError::NoRecord { krate, name: self.log.name(krate), which: Which::Items });
         }
         bytes
+    }
+
+    fn load_verified(&self, krate: usize) -> Option<blaze_scope::items_record::VerifiedItems<'n>> {
+        self.load.items_verified(krate)
     }
 
     fn file(&self, krate: usize, path: PackagePath<'_>) -> Option<&'n str> {

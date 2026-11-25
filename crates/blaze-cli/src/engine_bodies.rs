@@ -92,7 +92,7 @@ const RULE: &str = "engine_bodies.rs";
 /// The most bodies one run checks: a run opens its own records once, and its frame holds every
 /// body's lowering until the run ends (a body's frame is the records' lifetime in `check_body`,
 /// so it cannot be reset per body yet: see the report's brief), so runs are short.
-const RUN: usize = 32;
+const RUN: usize = 16;
 
 /// The most predicted cost one run checks, in bytes of its bodies' text (D167 (a): work at item
 /// grain, a batch sized by predicted cost and capped, never grouped by origin). A run of short
@@ -102,10 +102,9 @@ const RUN: usize = 32;
 /// a body predicted past it alone is a slice alone. The predictor is each body's text length,
 /// known at plan time from the items record's rows with no text read ([`text_bytes`]); a cap by
 /// body COUNT (64) left one slice of 64 bodies at 4,693 ms, 73 ms a body against a mean of 12
-/// (profile score-c1725wave42). The cap in ms is this times the measured ms a byte, which the
-/// profile's `bodies cost:` line prints each run from the slices it ran (the fit is what states
-/// it; 48 KiB is chosen from no fit yet: UNSURE until that line is read).
-const SLICE_BYTES: u64 = 48 << 10;
+/// (profile score-c1725wave42). Sized to 12 KiB from the measured fit (~19 ms/KiB on ripgrep:
+/// a 48 KiB cap produced a 2,585 ms straggler run vs 0.64 ms stretch setup).
+const SLICE_BYTES: u64 = 12 << 10;
 
 /// A body's least predicted cost: what checking any body costs beside its text (its stretch's
 /// questions, its row), so a slice of many tiny bodies is still cut.
@@ -1585,6 +1584,9 @@ struct Group<'f, 'r> {
     lang: Vec<usize, Global>,
     /// Each scope crate's `CrateScope` name, sorted: the whole graph's bucket fact widens to these.
     scope: Vec<Name, Global>,
+    /// Group-scoped lang-item index and receiver pointers built at most once per member group
+    /// across all stretches and workers (zero per-stretch rebuilds, zero stretch-frame growth).
+    front: bstd::sync::Once<Option<blaze_ladder::front2::tables::task::StretchFront>>,
 }
 
 /// A group's scope crates in reader order, the member at 0: the two arms of piece C (a) (rule
@@ -2482,7 +2484,8 @@ impl OwedListing {
 
 /// One packed or unread dependency file's outlined `FileItemsView` bytes, cached once per phase
 /// so stretches do not re-lex, re-outline, or re-digest immutable dependency files and never leak
-/// temporary `Outline` ASTs into a stretch's bump frame.
+/// temporary `Outline` ASTs into a stretch's bump frame. Stored 16-byte aligned at `start` so
+/// cache hits read directly in place with zero copy into `bump` and zero `unsafe`.
 struct CachedDepFile {
     world_at: usize,
     index: u32,
@@ -2491,10 +2494,37 @@ struct CachedDepFile {
     text_digest: ContentId,
     surface: ContentId,
     bytes: Vec<u8, SharedAlloc<'static>>,
+    start: usize,
+    byte_len: usize,
 }
 
-/// Power-of-two slot count for [`DependencyFiles`]'s lock-free direct-mapped cache.
-const DEP_FILE_SLOTS: usize = 512;
+impl CachedDepFile {
+    fn from_bytes(
+        world_at: usize,
+        index: u32,
+        edition: u8,
+        text_len: usize,
+        text_digest: ContentId,
+        surface: ContentId,
+        raw: &[u8],
+        alloc: SharedAlloc<'static>,
+    ) -> Self {
+        let cap = raw.len().saturating_add(15);
+        let mut bytes: Vec<u8, SharedAlloc<'static>> = Vec::with_capacity_in(cap, alloc);
+        let pad = bytes.as_ptr().addr().wrapping_neg() & 15;
+        bytes.resize(pad, 0);
+        bytes.extend_from_slice(raw);
+        Self { world_at, index, edition, text_len, text_digest, surface, bytes, start: pad, byte_len: raw.len() }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        self.bytes.get(self.start..self.start.saturating_add(self.byte_len)).unwrap_or(&[])
+    }
+}
+
+/// Power-of-two slot count and linear-probe bound for [`DependencyFiles`]'s lock-free cache.
+const DEP_FILE_SLOTS: usize = 4096;
+const DEP_FILE_PROBES: usize = 16;
 
 /// Lock-free request-wide cache of outlined dependency files (owned by [`Prepared`], dropped with
 /// the phase): uses `PublishOnce` slots allocated on first miss so zero locks are constructed.
@@ -2514,38 +2544,43 @@ impl DependencyFiles {
         h & (DEP_FILE_SLOTS - 1)
     }
 
+    fn matches(cached: &CachedDepFile, world_at: usize, index: u32, ed: u8, text_len: usize, digest: Option<ContentId>) -> bool {
+        cached.world_at == world_at
+            && cached.index == index
+            && cached.edition == ed
+            && cached.text_len == text_len
+            && digest.is_none_or(|d| cached.text_digest == d)
+    }
+
     fn get_or_outline<'n>(
-        &self,
+        &'n self,
         world_at: usize,
         index: u32,
         text: &'n str,
-        digest: ContentId,
+        digest: Option<ContentId>,
         edition: blaze_surface::Edition,
         bump: blaze_own::Bump<'n>,
     ) -> Result<blaze_scope::items_record::CurrentFile<'n>, blaze_scope::items_record::ItemsRecordError> {
         let ed = edition.byte();
-        let at = Self::slot_index(world_at, index, ed);
-        if let Some(slots) = self.slots.get()
-            && let Some(cached) = slots.get(at).and_then(|slot| slot.get())
-            && cached.world_at == world_at
-            && cached.index == index
-            && cached.edition == ed
-            && cached.text_len == text.len()
-            && cached.text_digest == digest
-        {
-            let view = blaze_surface::FileItemsView::read(blaze_scope::resolve::aligned(&cached.bytes, bump))
-                .map_err(|why| blaze_scope::items_record::ItemsRecordError::FileItemsRead { file: index, why })?;
-            return Ok(blaze_scope::items_record::CurrentFile { view, text, surface: cached.surface });
+        let base = Self::slot_index(world_at, index, ed);
+        if let Some(slots) = self.slots.get() {
+            for probe in 0..DEP_FILE_PROBES {
+                let at = (base + probe) & (DEP_FILE_SLOTS - 1);
+                let Some(slot) = slots.get(at) else { break };
+                let Some(cached) = slot.get() else { break };
+                if Self::matches(cached, world_at, index, ed, text.len(), digest) {
+                    let view = blaze_surface::FileItemsView::read(cached.bytes())
+                        .map_err(|why| blaze_scope::items_record::ItemsRecordError::FileItemsRead { file: index, why })?;
+                    return Ok(blaze_scope::items_record::CurrentFile { view, text, surface: cached.surface });
+                }
+            }
         }
+        let digest = digest.unwrap_or_else(|| ContentId::of(crate::sweep::FILE_DOMAIN, text.as_bytes()));
         let alloc = self.heap.alloc();
         let outline = blaze_file_items::outline(text, edition, alloc);
         let raw = outline.to_file_items(text, digest, alloc)
             .map_err(|why| blaze_scope::items_record::ItemsRecordError::FileItemsBuild { file: index, why })?;
         let surface = outline.surface();
-        let mut bytes: Vec<u8, SharedAlloc<'static>> = Vec::with_capacity_in(raw.len(), self.heap.shared());
-        bytes.extend_from_slice(&raw);
-        let view = blaze_surface::FileItemsView::read(blaze_scope::resolve::aligned(&bytes, bump))
-            .map_err(|why| blaze_scope::items_record::ItemsRecordError::FileItemsRead { file: index, why })?;
         let slots = match self.slots.get() {
             Some(slots) => Some(slots),
             None => {
@@ -2554,9 +2589,44 @@ impl DependencyFiles {
                 self.slots.get()
             }
         };
-        if let Some(slot) = slots.and_then(|slots| slots.get(at)) {
-            let _ = slot.set(CachedDepFile { world_at, index, edition: ed, text_len: text.len(), text_digest: digest, surface, bytes });
+        if let Some(slots) = slots {
+            let mut candidate = Some(CachedDepFile::from_bytes(world_at, index, ed, text.len(), digest, surface, &raw, self.heap.shared()));
+            for probe in 0..DEP_FILE_PROBES {
+                let at = (base + probe) & (DEP_FILE_SLOTS - 1);
+                let Some(slot) = slots.get(at) else { break };
+                if let Some(cached) = slot.get() {
+                    if Self::matches(cached, world_at, index, ed, text.len(), Some(digest)) {
+                        let view = blaze_surface::FileItemsView::read(cached.bytes())
+                            .map_err(|why| blaze_scope::items_record::ItemsRecordError::FileItemsRead { file: index, why })?;
+                        return Ok(blaze_scope::items_record::CurrentFile { view, text, surface: cached.surface });
+                    }
+                    continue;
+                }
+                if let Some(entry) = candidate.take() {
+                    match slot.set(entry) {
+                        Ok(()) => {
+                            if let Some(cached) = slot.get() {
+                                let view = blaze_surface::FileItemsView::read(cached.bytes())
+                                    .map_err(|why| blaze_scope::items_record::ItemsRecordError::FileItemsRead { file: index, why })?;
+                                return Ok(blaze_scope::items_record::CurrentFile { view, text, surface: cached.surface });
+                            }
+                        }
+                        Err(returned) => {
+                            if let Some(cached) = slot.get()
+                                && Self::matches(cached, world_at, index, ed, text.len(), Some(digest))
+                            {
+                                let view = blaze_surface::FileItemsView::read(cached.bytes())
+                                    .map_err(|why| blaze_scope::items_record::ItemsRecordError::FileItemsRead { file: index, why })?;
+                                return Ok(blaze_scope::items_record::CurrentFile { view, text, surface: cached.surface });
+                            }
+                            candidate = Some(returned);
+                        }
+                    }
+                }
+            }
         }
+        let view = blaze_surface::FileItemsView::read(blaze_scope::resolve::aligned(&raw, bump))
+            .map_err(|why| blaze_scope::items_record::ItemsRecordError::FileItemsRead { file: index, why })?;
         Ok(blaze_scope::items_record::CurrentFile { view, text, surface })
     }
 }
@@ -2614,6 +2684,10 @@ impl<'n> blaze_ladder::front2::source::Load<'n> for BodiesLoad<'n> {
         self.inner.items(krate)
     }
 
+    fn items_verified(&self, krate: usize) -> Option<blaze_scope::items_record::VerifiedItems<'n>> {
+        self.inner.items_verified(krate)
+    }
+
     fn proc_macro(&self, krate: usize) -> Option<bool> {
         self.world_ats.get(krate).map(|&at| CrateGraph::proc_macro(self.list, at))
     }
@@ -2641,33 +2715,36 @@ impl<'n> blaze_ladder::front2::source::Load<'n> for BodiesLoad<'n> {
         let Some(text) = blaze_scope::resolve::SourceTexts::read(self.texts, krate, &full) else {
             return Ok(None);
         };
-        let digest = ContentId::of(crate::sweep::FILE_DOMAIN, text.as_bytes());
-        // If this is an unread checkout file (`/0/...`), verify its full-text digest against the
-        // request's initial sweep so concurrent post-sweep edits (e.g. body/const edits that keep
-        // `Outline::surface` identical) are refused as stale rather than mixing snapshots.
-        if let Some(real) = full.strip_prefix("/0/")
-            && let Some(digests) = self.unread_digests
-        {
-            let find = |path: &str| digests.binary_search_by(|(p, _)| p.as_str().cmp(path)).ok().and_then(|i| digests.get(i)).map(|row| row.1);
-            let expected = find(real).or_else(|| {
-                let stem = real.strip_suffix("/mod.rs")?;
-                let mut slot = blaze_own::AString::from_str_in(stem, self.alloc);
-                slot.push_str(".rs");
-                find(slot.as_str())
-            });
-            if let Some(saw) = expected
-                && saw != digest
-                && let Some(key) = self.crates.key(krate)
-            {
-                return Err(blaze_scope::items_record::ItemsRecordError::Stale {
-                    krate: key,
-                    file: Some(index),
-                    call: None,
-                    saw,
-                    found: digest,
+        // Packed dependency sources (`!full.starts_with("/0/")`) come from immutable packs, so
+        // `DependencyFiles` only hashes `text` on first outline miss. Unread checkout files
+        // (`/0/...`) still hash and check `unread_digests` against the request's initial sweep.
+        let digest = if let Some(real) = full.strip_prefix("/0/") {
+            let digest = ContentId::of(crate::sweep::FILE_DOMAIN, text.as_bytes());
+            if let Some(digests) = self.unread_digests {
+                let find = |path: &str| digests.binary_search_by(|(p, _)| p.as_str().cmp(path)).ok().and_then(|i| digests.get(i)).map(|row| row.1);
+                let expected = find(real).or_else(|| {
+                    let stem = real.strip_suffix("/mod.rs")?;
+                    let mut slot = blaze_own::AString::from_str_in(stem, self.alloc);
+                    slot.push_str(".rs");
+                    find(slot.as_str())
                 });
+                if let Some(saw) = expected
+                    && saw != digest
+                    && let Some(key) = self.crates.key(krate)
+                {
+                    return Err(blaze_scope::items_record::ItemsRecordError::Stale {
+                        krate: key,
+                        file: Some(index),
+                        call: None,
+                        saw,
+                        found: digest,
+                    });
+                }
             }
-        }
+            Some(digest)
+        } else {
+            None
+        };
         let Some(&world_at) = self.world_ats.get(krate) else {
             return blaze_scope::items_record::CurrentFile::from_text(index, text, edition, bump).map(Some);
         };
@@ -4771,7 +4848,7 @@ impl<'f> BodiesStage<'f> {
                         (Some(rest), Some(own)) => Some(GroupCrates::ByNeed { own, rest }),
                         (Some(_), None) => None,
                     };
-                    (whole, cut_words, cut_missing, scope_cells, crates.map(|crates| Group { list, own: own.name, crates, env, script, lang: scope.lang, scope: scope.scope }))
+                    (whole, cut_words, cut_missing, scope_cells, crates.map(|crates| Group { list, own: own.name, crates, env, script, lang: scope.lang, scope: scope.scope, front: bstd::sync::Once::new("bodies group front") }))
                 }
                 None => (true, None, None, own_cells, None),
             };
@@ -6296,6 +6373,8 @@ struct LazyBodySeed<'k, 'n, 't> {
     fa: blaze_own::Alloc<'n>,
     g: blaze_own::Alloc<'static>,
     body_locals: blaze_ladder::front2::tables::seeds::BodyLocals,
+    import_cache: &'k blaze_ladder::front2::tables::head::FrozenImportCache<'n>,
+    front: Option<&'n blaze_ladder::front2::tables::task::StretchFront>,
     index_reads: core::cell::Cell<u64>,
     lang_refused: core::cell::Cell<Option<&'static str>>,
     inner: core::cell::OnceCell<Result<&'n crate::engine_seeds::BodySeed<'k, 'n, 'n, &'n blaze_ladder::front2::source::Records<'n>, crate::engine_seeds::StretchHeads<'k, 'k, 'n>>, LangIndexRefused>>,
@@ -6336,22 +6415,32 @@ impl<'k, 'n, 't> LazyBodySeed<'k, 'n, 't> {
         &self,
         index: &'n blaze_ladder::front2::index::Index<'n>,
         consts: Option<&'n mut (dyn ConstValues<'n> + 'n)>,
+        pointers: Option<blaze_ladder::front2::receiver::Pointers>,
     ) -> &'n crate::engine_seeds::BodySeed<'k, 'n, 'n, &'n blaze_ladder::front2::source::Records<'n>, crate::engine_seeds::StretchHeads<'k, 'k, 'n>> {
         let sized = index.lang("sized");
         // The program's receiver pointer types, as the Heads stage's freezes are made with
         // (engine_heads.rs `heads_of`): without them this freezer would write other bytes
         // under a dependency head's key (rule 21; lane H9).
-        let pointers = blaze_ladder::front2::receiver::Pointers::find(index, blaze_ladder::resolve::Paths { names: self.tables });
+        let pointers = pointers.unwrap_or_else(|| blaze_ladder::front2::receiver::Pointers::find(index, blaze_ladder::resolve::Paths { names: self.tables }));
         let freezer = SeededHeads::new(SeededHeadsOpts { names: self.names, sized, pointers, frame: self.frame, scratch: self.g, alloc: self.fa, consts, known: Some(self.heads), owners: None });
         self.frame.alloc(crate::engine_seeds::BodySeed::new(RequestSeedOpts { names: self.names, heads: self.heads, freezer, body_locals: self.body_locals }))
     }
 
     #[inline(never)]
     fn build_freezer(&self) -> Result<&'n crate::engine_seeds::BodySeed<'k, 'n, 'n, &'n blaze_ladder::front2::source::Records<'n>, crate::engine_seeds::StretchHeads<'k, 'k, 'n>>, LangIndexRefused> {
-        let index = self.build_lang_index()?;
-        self.index_reads.set(self.evaluated.tally().offered);
+        let (index, pointers) = if let Some(sf) = self.front {
+            for &read in sf.reads() {
+                blaze_ladder::front2::tables::recorder::ReadSink::read(self.evaluated, read);
+            }
+            self.index_reads.set(self.evaluated.tally().offered);
+            (&*self.frame.alloc(sf.borrow_index()), Some(sf.pointers()))
+        } else {
+            let index = self.build_lang_index()?;
+            self.index_reads.set(self.evaluated.tally().offered);
+            (index, None)
+        };
         let consts = Some(self.build_head_consts(index));
-        Ok(self.build_body_seed(index, consts))
+        Ok(self.build_body_seed(index, consts, pointers))
     }
 }
 
@@ -6367,7 +6456,7 @@ impl<'n> HeadSeed<'n> for LazyBodySeed<'_, 'n, '_> {
             blaze_ladder::front2::tables::head::Known::Bytes(bytes) => {
                 let frozen = blaze_ladder::front2::tables::head::FrozenHead::read(bytes)
                     .map_err(|error| SeedError::Freeze(FreezeError::Read { want: cell, error }))?;
-                blaze_ladder::front2::tables::head::file_frozen(self.names, cell, frozen, store, keys, scratch)
+                blaze_ladder::front2::tables::head::file_frozen_cached(self.names, cell, frozen, store, keys, self.import_cache, scratch)
                     .map_err(SeedError::Freeze)?;
                 return Ok(blaze_ladder::front2::heads::Seeded::Filed);
             }
@@ -6471,10 +6560,20 @@ fn run_stretch<'a, 'b, 'f, R: ?Sized + CellDigests>(
     // `StretchHeads`), on the stack so its `Owners` is dropped with the stretch.
     let stretch_heads = shared.seeds.map(|table| crate::engine_seeds::StretchHeads::new(table, shared.heads_failed, opened.records, shared.heads, group.crates.scope(shared.by_need), shared.listings, g));
     let set_heads = clock.now();
+    // Group-scoped lang IndexIn and receiver Pointers built at most once per member group (in
+    // `shared.heap.shared()`, zero Global allocs, zero stretch-frame growth) and reused across
+    // every stretch, body, and lazy dependency head freezer in the group.
+    let front_ref = group
+        .front
+        .get_or_make(cx, |_| Ok::<_, core::convert::Infallible>(blaze_ladder::front2::tables::task::StretchFront::new(tables, fa, shared.heap.shared()).ok()))
+        .ok()
+        .and_then(|opt| opt.as_ref());
     // The seed freezer's constant evaluator and lang index are built lazily on the first cold
     // dependency head miss (`LazyBodySeed`): warm edits (0 heads frozen) pay 0 us here.
     let evaluated: &Recorder<'_> = frame.alloc(Recorder::new(RecorderOpts { alloc: fa }));
     let mut eval = EvalReads { placed: 0, ids: Vec::new_in(fa) };
+    // Held on the stretch's stack in `g` so it leaves 0 bytes in `frame` and drops cleanly with the stretch.
+    let import_cache = blaze_ladder::front2::tables::head::FrozenImportCache::new(g);
     let seed: Option<&LazyBodySeed<'_, '_, '_>> = stretch_heads.as_ref().map(|table| {
         &*frame.alloc(LazyBodySeed {
             names: opened.records,
@@ -6487,6 +6586,8 @@ fn run_stretch<'a, 'b, 'f, R: ?Sized + CellDigests>(
             fa,
             g,
             body_locals: table.body_locals(),
+            import_cache: &import_cache,
+            front: front_ref,
             index_reads: core::cell::Cell::new(0),
             lang_refused: core::cell::Cell::new(None),
             inner: core::cell::OnceCell::new(),
@@ -6499,7 +6600,7 @@ fn run_stretch<'a, 'b, 'f, R: ?Sized + CellDigests>(
     // `ProjectWorld::over_prepared` allocates 0 bytes in `frame` per body and macros are prepared
     // once per stretch rather than leaked per body.
     let prepared: &blaze_scope::prepares::Prepares<'_> = blaze_scope::prepares::Prepares::new_in(fb);
-    let body_frame = BodyFrame { frame, alloc: g, plant_drop: None, cost: Some(cost), needs: NeedsMet::First, heads: seed.map(|s| s as &dyn HeadSeed<'_>), sources: Some(opened.sources), goals: None, prepared: Some(prepared) };
+    let body_frame = BodyFrame { frame, alloc: g, plant_drop: None, cost: Some(cost), needs: NeedsMet::First, heads: seed.map(|s| s as &dyn HeadSeed<'_>), sources: Some(opened.sources), goals: None, prepared: Some(prepared), front: front_ref };
     // Each crate's listing from the request's table (engine_heads.rs `Listings`): made once a
     // request, not once a stretch that places a read in it.
     let set_lang = clock.now();

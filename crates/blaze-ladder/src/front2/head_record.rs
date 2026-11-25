@@ -2441,6 +2441,12 @@ pub fn decode_with_origins_boxed<'n>(
     Ok(record.head)
 }
 
+/// Verifies that `text` matches a frozen `FnHead`'s recorded length and `TEXT_DOMAIN` digest.
+pub fn verify_fn_text(text: &str, want_len: u32, text_prefix: Option<u32>, want: [u8; 32]) -> bool {
+    fn_record_text(text, text_prefix)
+        .is_some_and(|part| u32::try_from(part.len()) == Ok(want_len) && ContentId::of(TEXT_DOMAIN, part).0 == want)
+}
+
 /// As [`decode_with_origins_boxed`], using `keep_text` to retain inline synthetic text (such as
 /// RFC 3681 field defaults) into the store's `'n` text frame.
 pub fn decode_with_origins_boxed_inline<'n>(
@@ -2451,7 +2457,25 @@ pub fn decode_with_origins_boxed_inline<'n>(
     keep_text: &mut dyn FnMut(&str) -> &'n str,
     register: &mut dyn FnMut(ItemKey, OpaqueOrigin) -> Result<(), HeadRecordError>,
 ) -> Result<blaze_own::Box<Head<'n>, Mem>, HeadRecordError> {
-    let record = decode_retaining_with(bytes, text, tys, alloc, Some(keep_text))?;
+    let record = decode_retaining_with(bytes, text, tys, alloc, Some(keep_text), None)?;
+    for &(key, origin) in record.origins.iter() {
+        register(key, origin)?;
+    }
+    Ok(record.head)
+}
+
+/// As [`decode_with_origins_boxed_inline`], delegating fn-text digest verification to
+/// `verify_text` so a stretch can verify each immutable `(key, prefix, want, text)` once (rule 74).
+pub fn decode_with_origins_boxed_inline_verified<'n>(
+    bytes: &[u8],
+    text: Option<&'n str>,
+    tys: &PortableTys<'_>,
+    alloc: Mem,
+    keep_text: &mut dyn FnMut(&str) -> &'n str,
+    verify_text: &mut dyn FnMut(ItemKey, u32, Option<u32>, [u8; 32], &'n str) -> bool,
+    register: &mut dyn FnMut(ItemKey, OpaqueOrigin) -> Result<(), HeadRecordError>,
+) -> Result<blaze_own::Box<Head<'n>, Mem>, HeadRecordError> {
+    let record = decode_retaining_with(bytes, text, tys, alloc, Some(keep_text), Some(verify_text))?;
     for &(key, origin) in record.origins.iter() {
         register(key, origin)?;
     }
@@ -2481,7 +2505,7 @@ impl<'n> DecodedHead<'n> {
 /// Open a head for standalone inspection or byte-exact rewriting. A store imports with
 /// [`decode_with_origins`] so it also has the routes when another type exposes an opaque.
 pub fn decode_retaining<'n>(bytes: &[u8], text: Option<&'n str>, tys: &PortableTys<'_>, alloc: Mem) -> Result<DecodedHead<'n>, HeadRecordError> {
-    decode_retaining_with(bytes, text, tys, alloc, None)
+    decode_retaining_with(bytes, text, tys, alloc, None, None)
 }
 
 fn decode_retaining_with<'n>(
@@ -2490,6 +2514,7 @@ fn decode_retaining_with<'n>(
     tys: &PortableTys<'_>,
     alloc: Mem,
     keep_text: Option<&mut dyn FnMut(&str) -> &'n str>,
+    verify_text: Option<&mut dyn FnMut(ItemKey, u32, Option<u32>, [u8; 32], &'n str) -> bool>,
 ) -> Result<DecodedHead<'n>, HeadRecordError> {
     let mut r = In { bytes, at: 0, tys, locals: Vec::new_in(alloc), scratch: Vec::new_in(alloc), origins: Vec::new_in(alloc), alloc };
     if r.take(4, "the magic")? != &MAGIC[..] {
@@ -2504,7 +2529,7 @@ fn decode_retaining_with<'n>(
     for _ in 0..terms {
         r.node()?;
     }
-    let head = r.decode_head_kind(kind, text, keep_text)?;
+    let head = r.decode_head_kind(kind, text, keep_text, verify_text)?;
     let mut head = head;
     // Form 22: the regions section, every column laid again over its type here, once.
     if let Some(filed) = r.opt("a head's regions section", |r| r.regions_section())? {
@@ -2541,9 +2566,10 @@ impl<'r> In<'r, '_, '_> {
         kind: u8,
         text: Option<&'n str>,
         keep_text: Option<&mut dyn FnMut(&str) -> &'n str>,
+        verify_text: Option<&mut dyn FnMut(ItemKey, u32, Option<u32>, [u8; 32], &'n str) -> bool>,
     ) -> Result<blaze_own::Box<Head<'n>, Mem>, E> {
         match kind {
-            K_FN => self.fn_head(text, keep_text),
+            K_FN => self.fn_head(text, keep_text, verify_text),
             K_ADT => self.adt(),
             K_CTOR => self.ctor(),
             K_TRAIT => self.trait_(),
@@ -3209,8 +3235,9 @@ impl<'r> In<'r, '_, '_> {
         &mut self,
         text: Option<&'n str>,
         keep_text: Option<&mut dyn FnMut(&str) -> &'n str>,
+        verify_text: Option<&mut dyn FnMut(ItemKey, u32, Option<u32>, [u8; 32], &'n str) -> bool>,
     ) -> Result<blaze_own::Box<Head<'n>, Mem>, E> {
-        let (key, head) = self.fn_head_core(text, keep_text)?;
+        let (key, head) = self.fn_head_core(text, keep_text, verify_text)?;
         let preds = self.opt("a fn's where-clauses", |r| r.preds())?;
         let static_ = self.opt("a static's mutability", |r| mutbl_of(r.u8("a static's mutability")?))?;
         let misses = self.fn_head_misses(head.text.len())?;
@@ -3222,6 +3249,7 @@ impl<'r> In<'r, '_, '_> {
         &mut self,
         text: Option<&'n str>,
         keep_text: Option<&mut dyn FnMut(&str) -> &'n str>,
+        verify_text: Option<&mut dyn FnMut(ItemKey, u32, Option<u32>, [u8; 32], &'n str) -> bool>,
     ) -> Result<(ItemKey, FnHead<'n>), E> {
         let key = self.key("a fn's key")?;
         let mode = self.u8("a fn text's mode")?;
@@ -3232,7 +3260,11 @@ impl<'r> In<'r, '_, '_> {
                 let want: [u8; 32] = self.array("a fn text's digest")?;
                 let text = text.ok_or(E::NoText)?;
                 let text_prefix = prefix.then_some(want_len);
-                if !fn_record_text(text, text_prefix).is_some_and(|part| u32::try_from(part.len()) == Ok(want_len) && ContentId::of(TEXT_DOMAIN, part).0 == want) {
+                let ok = match verify_text {
+                    Some(check) => check(key, want_len, text_prefix, want, text),
+                    None => verify_fn_text(text, want_len, text_prefix, want),
+                };
+                if !ok {
                     return Err(E::Text { key, want_len, got_len: text.len() });
                 }
                 (text, text_prefix, false)

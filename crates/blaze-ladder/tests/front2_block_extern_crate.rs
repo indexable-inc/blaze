@@ -293,7 +293,7 @@ fn run(records: &'static Records<'static>, key: ItemKey) -> BodyOut<'static> {
     let unused = Recorder::new(RecorderOpts { alloc: g });
     let tables = Tables::new(TablesOpts { records, impls: None, lang_crates: LANG, reads: &unused });
     let frame: &'static blaze_mem::Frame = Box::leak(Box::new(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the body's frame")));
-    let body = BodyFrame { frame, alloc: a(), plant_drop: None, cost: None, needs: blaze_ladder::front2::heads::NeedsMet::All, heads: None, sources: None, goals: None, prepared: None };
+    let body = BodyFrame { frame, alloc: a(), plant_drop: None, cost: None, needs: blaze_ladder::front2::heads::NeedsMet::All, heads: None, sources: None, goals: None, prepared: None, front: None };
     let task = Task { planned: Planned { name: Name::new(Kind::BodyCheck, key.0), phase: Phase::new(Stage::Bodies, 0), source: ABSENT, file: Name::new(Kind::FileItems, ABSENT) }, key: Key(ABSENT) };
     check_body(tables, &task, &body, &NoEdit, blaze_own::testing::heap().shared()).unwrap_or_else(|e| panic!("the body task of {key:x}: {e}"))
 }

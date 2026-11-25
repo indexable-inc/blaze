@@ -20,6 +20,7 @@ use bstd::cx::Cx;
 use bstd::fs::{Dir, ReadOnly, ReadWrite};
 use bstd::mem::Frame;
 use bstd::path::Path;
+use bstd::sync::Once;
 use std::alloc::Global;
 
 use crate::CliError;
@@ -136,43 +137,108 @@ impl Kept {
     }
 }
 
-/// Thread-safe, lock-free on-demand pack opener: each tree `k` (1-based) is mapped and verified
-/// on first read and published via `PublishOnce`.
+/// One pack entry materialized once on demand across all workers and stretches (rule 74:
+/// decompress and check UTF-8 at most once per unique file in a pack).
+enum CachedPackEntry {
+    BorrowedStr(&'static str),
+    BorrowedBytes(&'static [u8]),
+    OwnedStr(blaze_own::String<blaze_own::SharedAlloc<'static>>),
+    OwnedBytes(Vec<u8, blaze_own::SharedAlloc<'static>>),
+    Failed,
+}
+
+impl CachedPackEntry {
+    fn of(entry: blaze_fetch::pack::FileEntry<'static>, alloc: blaze_own::SharedAlloc<'static>) -> CachedPackEntry {
+        match entry.read_in(alloc) {
+            Ok(blaze_fetch::pack::FileBytes::Borrowed(bytes)) => match core::str::from_utf8(bytes) {
+                Ok(text) => CachedPackEntry::BorrowedStr(text),
+                Err(_) => CachedPackEntry::BorrowedBytes(bytes),
+            },
+            Ok(blaze_fetch::pack::FileBytes::Owned(bytes)) => match blaze_own::String::from_utf8(bytes) {
+                Ok(text) => CachedPackEntry::OwnedStr(text),
+                Err(error) => CachedPackEntry::OwnedBytes(error.into_bytes()),
+            },
+            Err(_) => CachedPackEntry::Failed,
+        }
+    }
+
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            CachedPackEntry::BorrowedStr(s) => Some(s),
+            CachedPackEntry::OwnedStr(s) => Some(s.as_str()),
+            CachedPackEntry::BorrowedBytes(_) | CachedPackEntry::OwnedBytes(_) | CachedPackEntry::Failed => None,
+        }
+    }
+
+    fn as_bytes(&self) -> Option<&[u8]> {
+        match self {
+            CachedPackEntry::BorrowedStr(s) => Some(s.as_bytes()),
+            CachedPackEntry::BorrowedBytes(b) => Some(b),
+            CachedPackEntry::OwnedStr(s) => Some(s.as_bytes()),
+            CachedPackEntry::OwnedBytes(b) => Some(b.as_slice()),
+            CachedPackEntry::Failed => None,
+        }
+    }
+}
+
+/// One opened pack and its per-entry lazy cache of decompressed file bytes/UTF-8 text.
+struct CachedPack {
+    view: PackView<'static>,
+    entries: Vec<Once<CachedPackEntry>, blaze_own::SharedAlloc<'static>>,
+}
+
+impl CachedPack {
+    fn new(view: PackView<'static>, alloc: blaze_own::SharedAlloc<'static>) -> CachedPack {
+        let mut entries = Vec::with_capacity_in(view.len(), alloc);
+        entries.resize_with(view.len(), || Once::new("pack file entry"));
+        CachedPack { view, entries }
+    }
+
+    fn get_or_load(&self, cx: &Cx, path: &str, alloc: blaze_own::SharedAlloc<'static>) -> Option<&CachedPackEntry> {
+        let at = self.view.find_index(path)?;
+        let slot = self.entries.get(at)?;
+        slot.get_or_make(cx, |_| Ok::<_, core::convert::Infallible>(CachedPackEntry::of(self.view.entry(at), alloc))).ok()
+    }
+}
+
+/// Thread-safe, on-demand pack opener and per-entry decompressed file cache: each tree `k`
+/// (1-based) is mapped and verified once, and each compressed file inside it is decompressed and
+/// UTF-8 checked at most once across all workers, jobs, and stretches.
 pub(crate) struct SyncLazyTrees<'f> {
     home: Option<&'f str>,
     heap: &'static blaze_own::Heap,
     list: CrateList<'static>,
-    slots: &'f [bstd::sync::PublishOnce<Result<PackView<'static>, &'static str>>],
+    slots: Vec<Once<Result<CachedPack, &'static str>>, blaze_own::SharedAlloc<'static>>,
     refused: bstd::sync::PublishOnce<&'static str>,
 }
 
 impl<'f> SyncLazyTrees<'f> {
     pub(crate) fn new(home: Option<&str>, heap: &'static blaze_own::Heap, list: CrateList<'static>, frame: &'f Frame) -> SyncLazyTrees<'f> {
-        let mut slots: Vec<bstd::sync::PublishOnce<Result<PackView<'static>, &'static str>>, &'f Frame> = Vec::with_capacity_in(list.trees(), frame);
-        slots.extend((0..list.trees()).map(|_| bstd::sync::PublishOnce::new()));
+        let mut slots: Vec<Once<Result<CachedPack, &'static str>>, blaze_own::SharedAlloc<'static>> = Vec::with_capacity_in(list.trees(), heap.shared());
+        slots.resize_with(list.trees(), || Once::new("source pack"));
         let home = home.map(|h| crate::work::held_str(h, frame));
         SyncLazyTrees {
             home,
             heap,
             list,
-            slots: slots.into_bump_slice(),
+            slots,
             refused: bstd::sync::PublishOnce::new(),
         }
     }
 
     pub(crate) fn new_in_heap(home: Option<&str>, heap: &'static blaze_own::Heap, list: CrateList<'static>) -> Result<&'static SyncLazyTrees<'static>, &'static str> {
         let g = heap.alloc();
-        let mut slots: AVec<'static, bstd::sync::PublishOnce<Result<PackView<'static>, &'static str>>> = AVec::new_in(g);
+        let mut slots: Vec<Once<Result<CachedPack, &'static str>>, blaze_own::SharedAlloc<'static>> = Vec::new_in(heap.shared());
         if slots.try_reserve_exact(list.trees()).is_err() {
             return Err(TREES_REFUSED);
         }
-        slots.extend((0..list.trees()).map(|_| bstd::sync::PublishOnce::new()));
+        slots.resize_with(list.trees(), || Once::new("source pack"));
         let home: Option<&'static str> = home.map(|h| &*blaze_own::Box::leak_static(blaze_own::AString::from_str_in(h, g).into_boxed_str()));
         let lazy = SyncLazyTrees {
             home,
             heap,
             list,
-            slots: slots.leak_static(),
+            slots,
             refused: bstd::sync::PublishOnce::new(),
         };
         Ok(blaze_own::Box::leak_static(blaze_own::Box::new_in(lazy, g)))
@@ -180,6 +246,37 @@ impl<'f> SyncLazyTrees<'f> {
 
     pub(crate) fn trees_len(&self) -> usize {
         self.slots.len()
+    }
+
+    fn open_cached(
+        &self,
+        cx: &Cx,
+        fs: &bstd::fs::Fs,
+        dirs: Option<&SyncPackDirs>,
+        scratch: &Frame,
+        k: usize,
+    ) -> Option<(&CachedPack, bool)> {
+        let slot = self.slots.get(k.checked_sub(1)?)?;
+        let mut newly_opened = false;
+        let got = slot.get_or_make(cx, |cx| {
+            newly_opened = true;
+            let from = PackHome { home: self.home, fs, heap: self.heap };
+            let opened = match dirs {
+                Some(shared) => open_tree_shared(cx, from, &self.list, k, shared, scratch).map_err(|r| r.0),
+                None => {
+                    let mut local = PackDirs::default();
+                    open_tree(cx, from, &self.list, k, &mut local, scratch)
+                }
+            };
+            Ok::<_, core::convert::Infallible>(opened.map(|view| CachedPack::new(view, self.heap.shared())))
+        }).ok()?;
+        match got {
+            Ok(pack) => Some((pack, newly_opened)),
+            Err(why) => {
+                let _ = self.refused.set(*why);
+                None
+            }
+        }
     }
 
     pub(crate) fn open_tree_with(
@@ -190,39 +287,27 @@ impl<'f> SyncLazyTrees<'f> {
         scratch: &Frame,
         k: usize,
     ) -> Option<(PackView<'static>, bool)> {
-        let slot = self.slots.get(k.checked_sub(1)?)?;
-        let (got, newly_opened) = match slot.get() {
-            Some(got) => (*got, false),
-            None => {
-                let from = PackHome { home: self.home, fs, heap: self.heap };
-                let opened = match dirs {
-                    Some(shared) => open_tree_shared(cx, from, &self.list, k, shared, scratch).map_err(|r| r.0),
-                    None => {
-                        let mut local = PackDirs::default();
-                        open_tree(cx, from, &self.list, k, &mut local, scratch)
-                    }
-                };
-                // `PublishOnce::set` returns `Err(mine)` if another thread is currently in
-                // `WRITING` (not yet `READY`); in that window `slot.get()` is `None`, so fall
-                // back to `mine` rather than returning `None` (`Gone`).
-                match slot.set(opened) {
-                    Ok(()) => (opened, true),
-                    Err(mine) => (slot.get().copied().unwrap_or(mine), false),
-                }
-            }
-        };
-        match got {
-            Ok(view) => Some((view, newly_opened)),
-            Err(why) => {
-                let _ = self.refused.set(why);
-                None
-            }
-        }
+        let (pack, newly_opened) = self.open_cached(cx, fs, dirs, scratch, k)?;
+        Some((pack.view, newly_opened))
     }
 
     pub(crate) fn tree(&self, cx: &Cx, fs: &bstd::fs::Fs, scratch: &Frame, k: usize) -> Option<PackView<'static>> {
-        let (view, _) = self.open_tree_with(cx, fs, None, scratch, k)?;
-        Some(view)
+        let (pack, _) = self.open_cached(cx, fs, None, scratch, k)?;
+        Some(pack.view)
+    }
+
+    /// Reads file `path` of pack `k` as UTF-8 text, decompressing and verifying UTF-8 at most
+    /// once across all workers and stretches (zero bytes allocated in `scratch`).
+    pub(crate) fn read_str(&self, cx: &Cx, fs: &bstd::fs::Fs, scratch: &Frame, k: usize, path: &str) -> Option<&str> {
+        let (pack, _) = self.open_cached(cx, fs, None, scratch, k)?;
+        pack.get_or_load(cx, path, self.heap.shared())?.as_str()
+    }
+
+    /// Reads file `path` of pack `k` as raw bytes, decompressing at most once across all workers
+    /// and stretches (zero bytes allocated in `scratch`).
+    pub(crate) fn read_slice(&self, cx: &Cx, fs: &bstd::fs::Fs, scratch: &Frame, k: usize, path: &str) -> Option<&[u8]> {
+        let (pack, _) = self.open_cached(cx, fs, None, scratch, k)?;
+        pack.get_or_load(cx, path, self.heap.shared())?.as_bytes()
     }
 
     pub(crate) fn refused(&self) -> Option<&'static str> {

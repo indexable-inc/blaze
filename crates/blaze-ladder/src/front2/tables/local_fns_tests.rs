@@ -41,7 +41,7 @@ fn run(records: Src, frame: &'static blaze_mem::Frame, coverage: Coverage) -> Bo
     let task = Task { planned, key: Key(ABSENT) };
     let recorder = Recorder::new(RecorderOpts { alloc: a() });
     let tables = Tables::new(TablesOpts { records, impls: None, lang_crates: &[CORE_AT], reads: &recorder });
-    let body = BodyFrame { frame, alloc: a(), plant_drop: None, cost: None, needs: NeedsMet::All, heads: None, sources: None, goals: None, prepared: None };
+    let body = BodyFrame { frame, alloc: a(), plant_drop: None, cost: None, needs: NeedsMet::All, heads: None, sources: None, goals: None, prepared: None, front: None };
     let shared = blaze_own::testing::heap().shared();
     match coverage {
         Coverage::WithLocals => check_body(tables, &task, &body, &Unchanged, shared),

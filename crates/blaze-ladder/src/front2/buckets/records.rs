@@ -711,6 +711,33 @@ impl fmt::Display for AdmitError {
 
 impl core::error::Error for AdmitError {}
 
+/// Builds a 256-way first-byte prefix offset table over a sorted slice of uniform hash keys
+/// (`ContentId` / `CrateItemKey`), narrowing lookups to ~`len / 256` entries in one L1 load with
+/// zero heap allocation.
+fn prefix_index(len: usize, first_byte: impl Fn(usize) -> u8) -> [u32; 257] {
+    let mut offsets = [0u32; 257];
+    let mut i = 0usize;
+    for b in 0..=255usize {
+        if let Some(slot) = offsets.get_mut(b) {
+            *slot = u32::try_from(i).unwrap_or(u32::MAX);
+        }
+        while i < len && usize::from(first_byte(i)) <= b {
+            i += 1;
+        }
+    }
+    if let Some(end) = offsets.get_mut(256) {
+        *end = u32::try_from(len).unwrap_or(u32::MAX);
+    }
+    offsets
+}
+
+fn prefix_range(prefix: &[u32; 257], byte: u8, len: usize) -> core::ops::Range<usize> {
+    let b = usize::from(byte);
+    let lo = prefix.get(b).and_then(|&v| usize::try_from(v).ok()).unwrap_or(0).min(len);
+    let hi = prefix.get(b + 1).and_then(|&v| usize::try_from(v).ok()).unwrap_or(len).min(len);
+    lo..hi.max(lo)
+}
+
 /// Every crate's impl tables of one request, made ONCE by the Heads stage's tasks and read in
 /// place by every body on every worker (engine.md, "The design" 1): each record's bytes held in
 /// `Global`, because a task's `Alloc` is not `Sync`; immutable once the stage has put them, so
@@ -718,6 +745,8 @@ impl core::error::Error for AdmitError {}
 pub struct ImplShelf {
     /// Sorted by crate key, one each.
     tables: std::vec::Vec<Shelved, Global>,
+    /// 256-way first-byte index into `tables` by `krate.0.0[0]`.
+    prefix: [u32; 257],
 }
 
 /// One crate's tables on an [`ImplShelf`].
@@ -727,6 +756,8 @@ struct Shelved {
     no_impls_of: std::vec::Vec<u8, Global>,
     /// Each bucket record by its content id, sorted.
     buckets: std::vec::Vec<(ContentId, std::vec::Vec<u8, Global>), Global>,
+    /// 256-way first-byte index into `buckets` by `id.0[0]`.
+    prefix: [u32; 257],
 }
 
 /// [`ImplShelf::new`]'s choices: none yet (rule 83).
@@ -801,6 +832,8 @@ struct Opened<'a> {
     no_impls_of: &'a [u8],
     /// Each bucket by its content id, sorted (the form's own order).
     buckets: Option<AVec<'a, (ContentId, &'a [u8])>>,
+    /// 256-way first-byte index into `buckets` by `id.0[0]`.
+    prefix: [u32; 257],
 }
 
 /// [`ImplShelf::put_framed`]'s reading without its copies: the same checks in the same order,
@@ -845,7 +878,11 @@ fn open_framed<'a>(krate: CrateItemKey, bytes: &'a [u8], alloc: Option<Alloc<'a>
     if !bytes.as_ptr().addr().is_multiple_of(FRAMED_ALIGN) {
         return Err(ShelfError::Unaligned { krate });
     }
-    Ok(Opened { krate, directory, no_impls_of, buckets })
+    let prefix = match buckets.as_ref() {
+        Some(list) => prefix_index(list.len(), |i| list.get(i).map_or(0, |(id, _)| id.0[0])),
+        None => [0u32; 257],
+    };
+    Ok(Opened { krate, directory, no_impls_of, buckets, prefix })
 }
 
 /// Where each part of [`framed`]'s form starts: a multiple of this from the payload's first
@@ -958,7 +995,7 @@ impl<'b> Unframe<'b> {
 
 impl ImplShelf {
     pub fn new(_opts: ImplShelfOpts) -> ImplShelf {
-        ImplShelf { tables: std::vec::Vec::new_in(Global) }
+        ImplShelf { tables: Default::default(), prefix: [0u32; 257] }
     }
 
     /// Holds crate `krate`'s three kinds of record, copied once.
@@ -1003,13 +1040,16 @@ impl ImplShelf {
         if r.at != bytes.len() || !buckets.is_sorted_by_key(|(id, _)| *id) {
             return Err(malformed(&r));
         }
-        self.tables.insert(at, Shelved { krate, directory, no_impls_of, buckets });
+        let bucket_prefix = prefix_index(buckets.len(), |i| buckets.get(i).map_or(0, |(id, _)| id.0[0]));
+        self.tables.insert(at, Shelved { krate, directory, no_impls_of, buckets, prefix: bucket_prefix });
+        self.prefix = prefix_index(self.tables.len(), |i| self.tables.get(i).map_or(0, |t| t.krate.0.0[0]));
         Ok(())
     }
 
     /// Whether crate `krate`'s tables are on the shelf.
     pub fn holds(&self, krate: CrateItemKey) -> bool {
-        self.tables.binary_search_by_key(&krate, |t| t.krate).is_ok()
+        let range = prefix_range(&self.prefix, krate.0.0[0], self.tables.len());
+        self.tables.get(range).is_some_and(|slice| slice.binary_search_by_key(&krate, |t| t.krate).is_ok())
     }
 
     /// How many crates' tables it holds.
@@ -1022,7 +1062,17 @@ impl ImplShelf {
     }
 
     fn of(&self, krate: CrateItemKey, record: RecordKind) -> Result<&Shelved, NoTables> {
-        self.tables.binary_search_by_key(&krate, |t| t.krate).map(|at| &self.tables[at]).map_err(|_| NoTables { krate, record })
+        let range = prefix_range(&self.prefix, krate.0.0[0], self.tables.len());
+        let slice = self.tables.get(range).ok_or(NoTables { krate, record })?;
+        slice.binary_search_by_key(&krate, |t| t.krate).ok().and_then(|at| slice.get(at)).ok_or(NoTables { krate, record })
+    }
+}
+
+impl Shelved {
+    fn bucket(&self, bucket: ContentId) -> Option<&[u8]> {
+        let range = prefix_range(&self.prefix, bucket.0[0], self.buckets.len());
+        let slice = self.buckets.get(range)?;
+        slice.binary_search_by_key(&bucket, |(id, _)| *id).ok().and_then(|at| slice.get(at)).map(|(_, bytes)| bytes.as_slice())
     }
 }
 
@@ -1150,7 +1200,12 @@ impl<'a> TableSet<'a> {
         };
         let one = &held[at];
         let found = match (bucket, one.buckets.as_ref()) {
-            (Some(id), Some(buckets)) => Some(buckets.binary_search_by_key(&id, |(one, _)| *one).map(|place| buckets[place].1).map_err(|_| missing)?),
+            (Some(id), Some(buckets)) => {
+                let range = prefix_range(&one.prefix, id.0[0], buckets.len());
+                let slice = buckets.get(range).ok_or(missing)?;
+                let bytes = slice.binary_search_by_key(&id, |(one, _)| *one).ok().and_then(|place| slice.get(place)).map(|(_, b)| *b).ok_or(missing)?;
+                Some(bytes)
+            }
             _ => None,
         };
         Ok((one.directory, one.no_impls_of, found))
@@ -1382,16 +1437,9 @@ impl<'a> ImplRecords for TableSet<'a> {
                 let place = ids.binary_search_by_key(&bucket, |it| it.0).map_err(|_| missing)?;
                 Ok(&tables[at].records.buckets[ids[place].1 as usize].bytes)
             }
-            Held::Lent(shelf) => {
-                let one = shelf.of(krate, RecordKind::Bucket)?;
-                let place = one.buckets.binary_search_by_key(&bucket, |(id, _)| *id).map_err(|_| missing)?;
-                Ok(&one.buckets[place].1)
-            }
+            Held::Lent(shelf) => shelf.of(krate, RecordKind::Bucket)?.bucket(bucket).ok_or(missing),
             Held::Paged { shelf, source, opened } => match shelf.of(krate, RecordKind::Bucket) {
-                Ok(one) => {
-                    let place = one.buckets.binary_search_by_key(&bucket, |(id, _)| *id).map_err(|_| missing)?;
-                    Ok(&one.buckets[place].1)
-                }
+                Ok(one) => one.bucket(bucket).ok_or(missing),
                 Err(_) => self.paged_of(*source, opened, krate, Some(bucket), missing).and_then(|(_, _, found)| found.ok_or(missing)),
             },
         }
@@ -1753,9 +1801,16 @@ impl BucketIndex {
             // The first width has already filed and recorded the blanket, unread-at-any
             // and blind buckets. Every following width adds only its shaped buckets.
             let found = if width == 0 { found } else { found.only_at_shape() };
+            let mut last_at = 0usize;
             for row in found.recording(&note) {
                 let row = row.map_err(TablesReadError::Lookup)?;
-                let at = crates.iter().position(|c| row.impl_.is_of(*c)).ok_or(TablesReadError::Crate { impl_: row.impl_ })?;
+                let at = if crates.get(last_at).is_some_and(|c| row.impl_.is_of(*c)) {
+                    last_at
+                } else {
+                    let found_at = crates.iter().position(|c| row.impl_.is_of(*c)).ok_or(TablesReadError::Crate { impl_: row.impl_ })?;
+                    last_at = found_at;
+                    found_at
+                };
                 let filing = filing_of(names, &row)?;
                 ix.borrow_mut().take(names, indexes[at], filing);
                 filed += 1;

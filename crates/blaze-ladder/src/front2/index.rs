@@ -64,15 +64,103 @@ fn keys_of<'n, A: core::alloc::Allocator + Copy>(
     (langs, lang_by_key)
 }
 
-/// Every impl, and every lang item of ONE program by its name.
-pub struct Index<'n> {
-    pub impls: Vec<ImplAt<'n>, Global>,
+/// Collects every `#[lang]` item declared by `lang_crates` (skipping proc-macro units) into `alloc`.
+fn collect_source_langs<'n, S: super::source::NamesSource<'n>, A: core::alloc::Allocator + Copy>(
+    names: S,
+    lang_crates: &[usize],
+    alloc: A,
+) -> Result<HashMap<&'n str, (LibKey, usize), A>, LangTwice> {
+    let mut langs: HashMap<&'n str, (LibKey, usize), A> = HashMap::new_in(alloc);
+    let mut twice: Option<LangTwice> = None;
+    // A source of names by records holds no crate's name: its crate key and index name it.
+    let named = |krate: usize| (std::format!("{:?}", names.crate_key(krate)), std::format!("crate {krate} of the records"));
+    for &krate in lang_crates {
+        if names.proc_macro(krate) == Some(true) {
+            continue;
+        }
+        names.each_lang(krate, &mut |name, key| match langs.get(name) {
+            Some(&(first, in_crate)) if first != key => {
+                if twice.is_none() {
+                    twice = Some(LangTwice { name: name.into(), first, second: key, crates: [named(in_crate), named(krate)] });
+                }
+            }
+            Some(_) => {}
+            None => {
+                langs.insert(name, (key, krate));
+            }
+        });
+        if let Some(twice) = twice {
+            return Err(twice);
+        }
+    }
+    Ok(langs)
+}
+
+/// Thread-safe, group-scoped lang-item index allocated in [`blaze_own::SharedAlloc<'static>`]
+/// so a member group can build it once across all stretches with zero `Global` allocations and
+/// lend it to every body and lazy head freezer via [`IndexIn::borrow`].
+pub struct IndexIn {
+    langs: HashMap<blaze_own::String<blaze_own::SharedAlloc<'static>>, LibKey, blaze_own::SharedAlloc<'static>>,
+    lang_by_key: HashMap<LibKey, blaze_own::String<blaze_own::SharedAlloc<'static>>, blaze_own::SharedAlloc<'static>>,
+    scope: blaze_own::Vec<usize, blaze_own::SharedAlloc<'static>>,
+}
+
+impl IndexIn {
+    pub fn from_source_in<'n, S: super::source::NamesSource<'n>>(
+        names: S,
+        lang_crates: &[usize],
+        alloc: blaze_own::SharedAlloc<'static>,
+    ) -> Result<IndexIn, LangTwice> {
+        let found = collect_source_langs(names, lang_crates, alloc)?;
+        let mut scope = blaze_own::Vec::with_capacity_in(lang_crates.len(), alloc);
+        scope.extend_from_slice(lang_crates);
+        scope.sort_unstable();
+        scope.dedup();
+        let mut langs = HashMap::with_capacity_in(found.len(), alloc);
+        let mut lang_by_key: HashMap<LibKey, blaze_own::String<blaze_own::SharedAlloc<'static>>, blaze_own::SharedAlloc<'static>> =
+            HashMap::with_capacity_in(found.len(), alloc);
+        for (name, (key, _)) in found {
+            langs.insert(blaze_own::String::from_str_in(name, alloc), key);
+            // Pick the lexicographically smallest name if two lang names ever alias one LibKey so
+            // the reverse map is independent of HashMap iteration order.
+            match lang_by_key.get_mut(&key) {
+                Some(prev) if name < prev.as_str() => {
+                    prev.clear();
+                    prev.push_str(name);
+                }
+                Some(_) => {}
+                None => {
+                    lang_by_key.insert(key, blaze_own::String::from_str_in(name, alloc));
+                }
+            }
+        }
+        Ok(IndexIn { langs, lang_by_key, scope })
+    }
+
+    /// Borrows this shared index as an [`Index<'n>`] with zero heap allocation.
+    pub fn borrow<'n>(&'n self) -> Index<'n> {
+        Index { impls: Default::default(), data: IndexData::Borrowed(self) }
+    }
+}
+
+struct IndexOwned<'n> {
     langs: HashMap<&'n str, LibKey, Global>,
     lang_by_key: HashMap<LibKey, &'n str, Global>,
     /// What the lang rows are a function of (with the names; rule 21): the roots of the
     /// program they were filed for ([`Linked::roots`]), or, from records, the lang crates
     /// given, sorted. Two indexes of different scope are two programs' and never shared.
     scope: Vec<usize, Global>,
+}
+
+enum IndexData<'n> {
+    Owned(IndexOwned<'n>),
+    Borrowed(&'n IndexIn),
+}
+
+/// Every impl, and every lang item of ONE program by its name.
+pub struct Index<'n> {
+    pub impls: Vec<ImplAt<'n>, Global>,
+    data: IndexData<'n>,
 }
 
 impl<'n> Index<'n> {
@@ -119,13 +207,16 @@ impl<'n> Index<'n> {
         let mut scope = Vec::with_capacity_in(linked.roots().len(), Global);
         scope.extend_from_slice(linked.roots());
         let (langs, lang_by_key) = keys_of(langs);
-        Ok(Index { impls, langs, lang_by_key, scope })
+        Ok(Index { impls, data: IndexData::Owned(IndexOwned { langs, lang_by_key, scope }) })
     }
 
     /// What the lang rows are a function of: the program's roots (or, from records, the lang
     /// crates given), sorted.
     pub fn scope(&self) -> &[usize] {
-        &self.scope
+        match &self.data {
+            IndexData::Owned(owned) => &owned.scope,
+            IndexData::Borrowed(shared) => &shared.scope,
+        }
     }
 
     /// The lang items the crates `lang_crates` declare, from any source of names, and no impl
@@ -134,40 +225,21 @@ impl<'n> Index<'n> {
     /// are skipped as [`Index::new`] skips the unit. Crates are read in the order given, so
     /// which of two clashing declarations is `first` is a function of that order alone.
     pub fn from_source<S: super::source::NamesSource<'n>>(names: S, lang_crates: &[usize]) -> Result<Index<'n>, LangTwice> {
-        let mut langs: HashMap<&'n str, (LibKey, usize), Global> = HashMap::new_in(Global);
-        let mut twice: Option<LangTwice> = None;
-        // A source of names by records holds no crate's name: its crate key and index name it.
-        let named = |krate: usize| (std::format!("{:?}", names.crate_key(krate)), std::format!("crate {krate} of the records"));
-        for &krate in lang_crates {
-            if names.proc_macro(krate) == Some(true) {
-                continue;
-            }
-            names.each_lang(krate, &mut |name, key| match langs.get(name) {
-                Some(&(first, in_crate)) if first != key => {
-                    if twice.is_none() {
-                        twice = Some(LangTwice { name: name.into(), first, second: key, crates: [named(in_crate), named(krate)] });
-                    }
-                }
-                Some(_) => {}
-                None => {
-                    langs.insert(name, (key, krate));
-                }
-            });
-            if let Some(twice) = twice {
-                return Err(twice);
-            }
-        }
+        let langs = collect_source_langs(names, lang_crates, Global)?;
         let mut scope = Vec::with_capacity_in(lang_crates.len(), Global);
         scope.extend_from_slice(lang_crates);
         scope.sort_unstable();
         scope.dedup();
         let (langs, lang_by_key) = keys_of(langs);
-        Ok(Index { impls: Vec::new_in(Global), langs, lang_by_key, scope })
+        Ok(Index { impls: Default::default(), data: IndexData::Owned(IndexOwned { langs, lang_by_key, scope }) })
     }
 
     /// The item `#[lang = "name"]` declares.
     pub fn lang(&self, name: &str) -> Option<LibKey> {
-        self.langs.get(name).copied()
+        match &self.data {
+            IndexData::Owned(owned) => owned.langs.get(name).copied(),
+            IndexData::Borrowed(shared) => shared.langs.get(name).copied(),
+        }
     }
 
     /// The fn the back half calls on its own account as `l`, under any of the names a library
@@ -189,10 +261,16 @@ impl<'n> Index<'n> {
 
     /// The `#[lang]` name `key` is declared under, if any (O(1) reverse map lookup).
     pub fn lang_name_of(&self, key: LibKey) -> Option<&'n str> {
-        self.lang_by_key.get(&key).copied()
+        match &self.data {
+            IndexData::Owned(owned) => owned.lang_by_key.get(&key).copied(),
+            IndexData::Borrowed(shared) => shared.lang_by_key.get(&key).map(|s| s.as_str()),
+        }
     }
 
     pub fn lang_count(&self) -> usize {
-        self.langs.len()
+        match &self.data {
+            IndexData::Owned(owned) => owned.langs.len(),
+            IndexData::Borrowed(shared) => shared.langs.len(),
+        }
     }
 }

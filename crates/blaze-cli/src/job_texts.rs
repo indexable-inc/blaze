@@ -59,6 +59,24 @@ impl<'n> Packs<'n> {
             Packs::SyncLazy(lazy, fs) => lazy.tree(cx, fs, frame, k),
         }
     }
+
+    /// Reads UTF-8 text of `inner` in pack `k`. On [`Packs::SyncLazy`], serves from the shared
+    /// per-entry decompressed cache with zero `frame` allocation and zero repeat Zstd decode.
+    pub(crate) fn read_str(&self, cx: &Cx, frame: &'n Frame, k: usize, inner: &str) -> Option<&'n str> {
+        match self {
+            Packs::SyncLazy(lazy, fs) => lazy.read_str(cx, fs, frame, k, inner),
+            _ => self.tree(cx, frame, k)?.read_str_slice(inner, frame).ok()?,
+        }
+    }
+
+    /// Reads raw bytes of `inner` in pack `k`. On [`Packs::SyncLazy`], serves from the shared
+    /// per-entry decompressed cache with zero `frame` allocation and zero repeat Zstd decode.
+    pub(crate) fn read_slice(&self, cx: &Cx, frame: &'n Frame, k: usize, inner: &str) -> Option<&'n [u8]> {
+        match self {
+            Packs::SyncLazy(lazy, fs) => lazy.read_slice(cx, fs, frame, k, inner),
+            _ => self.tree(cx, frame, k)?.read_slice(inner, frame).ok()?,
+        }
+    }
 }
 
 impl<'a: 'n, 'p: 'a, 'n> From<&'a [PackView<'p>]> for Packs<'n> {
@@ -312,7 +330,7 @@ impl<'n> SourceTexts<'n> for JobTexts<'n> {
             return Some(text);
         }
         if tree != 0 {
-            return self.packs.tree(self.cx, self.frame, tree)?.read_str_slice(inner, self.frame).ok()?;
+            return self.packs.read_str(self.cx, self.frame, tree, inner);
         }
         if let Some((_, text)) = self.read.borrow().iter().find(|(p, _)| *p == inner) {
             return *text;
@@ -370,7 +388,7 @@ impl<'n> SourceTexts<'n> for JobTexts<'n> {
         let (tree, inner) = rest.split_once('/')?;
         let tree: usize = tree.parse().ok()?;
         if tree != 0 {
-            return self.packs.tree(self.cx, self.frame, tree)?.read_slice(inner, self.frame).ok()?;
+            return self.packs.read_slice(self.cx, self.frame, tree, inner);
         }
         let bytes = self.checkout_bytes(inner);
         let from = from.strip_prefix("/0/").unwrap_or(from);

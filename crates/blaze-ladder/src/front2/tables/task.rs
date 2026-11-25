@@ -112,6 +112,51 @@ pub struct BodyFrame<'n> {
     /// each body allocates 0 bytes in `frame` for `Prepares`. `None`: `ProjectWorld::over`
     /// allocates a fresh one in `frame`.
     pub prepared: Option<&'n blaze_lower::scoped::Prepares<'n>>,
+    /// Group-scoped lang-item [`Index`] and receiver [`Pointers`] with their exact recorded
+    /// reads, shared across stretches and bodies of a member group so each body replays ~10 reads
+    /// instead of rebuilding two `Global` hash maps and scanning all lang items from scratch.
+    pub front: Option<&'n StretchFront>,
+}
+
+/// Thread-safe, group-scoped lang-item [`Index`] and receiver
+/// [`super::super::receiver::Pointers`] built once per member group alongside the exact
+/// `TableRead`s their construction performed, replayed into each body's recorder so read lists
+/// remain identical (rule 21).
+pub struct StretchFront {
+    index: super::super::index::IndexIn,
+    pointers: super::super::receiver::Pointers,
+    reads: blaze_own::Vec<TableRead, blaze_own::SharedAlloc<'static>>,
+}
+
+impl StretchFront {
+    pub fn new(tables: Tables<'_, '_>, scratch: Alloc<'_>, alloc: blaze_own::SharedAlloc<'static>) -> Result<Self, TaskError> {
+        let mut recorder = Recorder::new(RecorderOpts { alloc: scratch });
+        let view = tables.reading_into(&recorder);
+        let lang_crates = view.lang_crates();
+        let index = super::super::index::IndexIn::from_source_in(view, lang_crates, alloc).map_err(TaskError::Lang)?;
+        view.records().name_lang_crates(lang_crates);
+        let borrowed = index.borrow();
+        let pointers = super::super::receiver::Pointers::find(&borrowed, crate::resolve::Paths { names: view });
+        let (recorded, _) = recorder.take_item().map_err(TaskError::Full)?;
+        let mut reads = blaze_own::Vec::with_capacity_in(recorded.len(), alloc);
+        reads.extend_from_slice(&recorded);
+        Ok(Self { index, pointers, reads })
+    }
+
+    /// Borrows the shared lang-item index with zero heap allocation.
+    pub fn borrow_index<'n>(&'n self) -> Index<'n> {
+        self.index.borrow()
+    }
+
+    /// The pre-resolved receiver pointer types (`Box`, `Rc`, `Arc`, `Pin`, `NonNull`, ...).
+    pub fn pointers(&self) -> super::super::receiver::Pointers {
+        self.pointers
+    }
+
+    /// The exact table reads performed while building [`Self`], to replay into a recorder.
+    pub fn reads(&self) -> &[TableRead] {
+        &self.reads
+    }
 }
 
 /// The ask a failed cell belonged to. At import time the checker may have made several
@@ -589,7 +634,7 @@ fn asks_agree(a: &BodyReads<'_>, o: &BodyReads<'_>) -> bool {
 pub fn compare_asks<'n, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame<'n>, work: Alloc<'w>, plant: super::super::asks::AsksPlant) -> Result<(), AsksDiffer<'w>> {
     use super::super::asks::AsksMet;
     let run = |met: AsksMet, heads: Option<&'n dyn HeadSeed<'n>>| {
-        let shadow = BodyFrame { frame: frame.frame, alloc: frame.alloc, plant_drop: frame.plant_drop, cost: None, needs: frame.needs, heads, sources: frame.sources, goals: None, prepared: frame.prepared };
+        let shadow = BodyFrame { frame: frame.frame, alloc: frame.alloc, plant_drop: frame.plant_drop, cost: None, needs: frame.needs, heads, sources: frame.sources, goals: None, prepared: frame.prepared, front: frame.front };
         let mut recorder = Recorder::new(RecorderOpts { alloc: work });
         record_body_as(tables, task, &shadow, work, &mut recorder, None, Coverage::WithLocals, ReadReport::Sorted, met)
     };
@@ -814,7 +859,7 @@ impl core::fmt::Debug for RepeatsDiffer<'_> {
 /// two sides' tallies, `Offer`'s then `Quiet`'s (zero for two equal refusals).
 pub fn compare_repeats<'n, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame<'n>, work: Alloc<'w>, plant: RepeatsPlant) -> Result<(super::recorder::ReadTally, super::recorder::ReadTally), RepeatsDiffer<'w>> {
     use super::recorder::Repeats;
-    let shadow = BodyFrame { frame: frame.frame, alloc: frame.alloc, plant_drop: frame.plant_drop, cost: None, needs: frame.needs, heads: frame.heads, sources: frame.sources, goals: None, prepared: frame.prepared };
+    let shadow = BodyFrame { frame: frame.frame, alloc: frame.alloc, plant_drop: frame.plant_drop, cost: None, needs: frame.needs, heads: frame.heads, sources: frame.sources, goals: None, prepared: frame.prepared, front: frame.front };
     let run = |repeats: Repeats, drop: Option<NameCell>| {
         let mut recorder = Recorder::new(RecorderOpts { alloc: work });
         recorder.set_repeats(repeats);
@@ -857,12 +902,26 @@ pub fn compare_repeats<'n, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &Body
 /// bytes, the deepest of front2's): made there, the index, `Front2` and the world's value
 /// would ride under it; made here, only the box's pointer does.
 #[inline(never)]
-fn body_world<'v, 'n, 'w>(view: Tables<'v, 'n>, name: Name, frame: &BodyFrame<'n>, asks: super::super::asks::AsksMet, alloc: Alloc<'w>) -> Result<blaze_own::Box<ProjectWorld<'n, Tables<'v, 'n>>, Alloc<'w>>, TaskError> {
-    let lang_crates = view.lang_crates();
-    let index = Index::from_source(view, lang_crates).map_err(TaskError::Lang)?;
-    view.records().name_lang_crates(lang_crates);
+fn body_world<'v, 'n, 'w>(view: Tables<'v, 'n>, sink: &dyn ReadSink, name: Name, frame: &BodyFrame<'n>, asks: super::super::asks::AsksMet, alloc: Alloc<'w>) -> Result<blaze_own::Box<ProjectWorld<'n, Tables<'v, 'n>>, Alloc<'w>>, TaskError> {
+    let (index, pointers) = match frame.front {
+        Some(sf) => {
+            for &read in sf.reads.iter() {
+                sink.read(read);
+            }
+            // Per-stretch incoherent-crate registration is idempotent (early-returns after first
+            // body in the stretch) and must still run when `StretchFront` is shared across stretches.
+            view.records().name_lang_crates(view.lang_crates());
+            (sf.index.borrow(), Some(sf.pointers))
+        }
+        None => {
+            let lang_crates = view.lang_crates();
+            let index = Index::from_source(view, lang_crates).map_err(TaskError::Lang)?;
+            view.records().name_lang_crates(lang_crates);
+            (index, None)
+        }
+    };
     let front = Front2 { names: view, resolver: crate::resolve::Paths { names: view }, texts: Texts::empty(), keys: Keys::new(), index, frame: frame.frame };
-    let mut world = blaze_own::Box::new_in(ProjectWorld::over_with(front, frame.prepared, frame.alloc), alloc);
+    let mut world = blaze_own::Box::new_in(ProjectWorld::over_with_pointers(front, frame.prepared, pointers, frame.alloc), alloc);
     world.record_const_texts();
     world.set_cost(frame.cost);
     world.set_needs(frame.needs);
@@ -898,7 +957,7 @@ fn record_body_as<'n, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame
     };
     // In its own frame and behind a box: this frame rides under the whole check (the guard:
     // tests/front2_alias_opaques.rs `a_seeded_body_checks_on_a_small_stack`).
-    let mut world = body_world(view, name, frame, asks, alloc)?;
+    let mut world = body_world(view, &observed, name, frame, asks, alloc)?;
     drop(setup);
     let root = Listed { body, at: None, entry: None };
     let mut goal_hits = AVec::new_in(alloc);
@@ -1794,7 +1853,7 @@ mod read_id_tests {
         let (records, _, frame) = world_of("#![no_std]\npub fn base() -> u8 { 1u8 }\npub fn left() -> u8 { base() }\npub fn right() -> u16 { base() }");
         let unused = Recorder::new(RecorderOpts { alloc: a() });
         let tables = Tables::new(TablesOpts { records, impls: None, lang_crates: &[CORE_AT], reads: &unused });
-        let frame = BodyFrame { frame, alloc: a(), plant_drop: None, cost: None, needs: NeedsMet::All, heads: None, sources: None, goals: None, prepared: None };
+        let frame = BodyFrame { frame, alloc: a(), plant_drop: None, cost: None, needs: NeedsMet::All, heads: None, sources: None, goals: None, prepared: None, front: None };
         let heads = cells(records);
         let mut entry = Recorder::new(RecorderOpts { alloc: a() });
         let mut encoding = AString::new_in(a());

@@ -267,8 +267,19 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
     /// are compiled once per stretch instead of leaked per body. When `prepared` is `None`,
     /// allocates a fresh `Prepares` in `front.frame`.
     pub fn over_with(front: Front2<'n, S>, prepared: Option<&'n Prepares<'n>>, alloc: Alloc<'static>) -> ProjectWorld<'n, S> {
+        Self::over_with_pointers(front, prepared, None, alloc)
+    }
+
+    /// As [`ProjectWorld::over_with`], reusing pre-resolved [`super::receiver::Pointers`] across
+    /// bodies in a stretch so `Box`/`Rc`/`Arc`/`Pin` are not resolved from scratch per body.
+    pub fn over_with_pointers(
+        front: Front2<'n, S>,
+        prepared: Option<&'n Prepares<'n>>,
+        pointers: Option<super::receiver::Pointers>,
+        alloc: Alloc<'static>,
+    ) -> ProjectWorld<'n, S> {
         let mut store = Store::new(front.index.lang("sized"), front.frame, alloc);
-        store.pointers = super::receiver::Pointers::find(&front.index, front.resolver);
+        store.pointers = pointers.unwrap_or_else(|| super::receiver::Pointers::find(&front.index, front.resolver));
         let prepared = match prepared {
             Some(prepared) => prepared,
             None => {

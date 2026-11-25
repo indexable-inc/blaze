@@ -313,18 +313,40 @@ pub fn import_with_opaque_origins_boxed<'n, 'a, N: NamesSource<'n>>(
     names: N, keys: &Keys, store: &Store<'n>, frozen: &FrozenHead<'_>,
     text_of: &mut dyn FnMut(HeadAt) -> Option<&'n str>, alloc: Alloc<'static>, out: Alloc<'a>,
 ) -> Result<AVec<'a, (HeadAt, blaze_own::Box<Head<'n>, Alloc<'static>>)>, FreezeError> {
+    import_with_opaque_origins_boxed_verified(
+        names,
+        keys,
+        store,
+        frozen,
+        text_of,
+        &mut |_, want_len, text_prefix, want, text| head_record::verify_fn_text(text, want_len, text_prefix, want),
+        alloc,
+        out,
+    )
+}
+
+/// As [`import_with_opaque_origins_boxed`], delegating fn-text verification to `verify_text` so a
+/// stretch can verify each immutable `(key, prefix, want, text)` once (rule 74).
+#[expect(clippy::too_many_arguments, reason = "verified variant of import_with_opaque_origins_boxed")]
+pub fn import_with_opaque_origins_boxed_verified<'n, 'a, N: NamesSource<'n>>(
+    names: N, keys: &Keys, store: &Store<'n>, frozen: &FrozenHead<'_>,
+    text_of: &mut dyn FnMut(HeadAt) -> Option<&'n str>,
+    verify_text: &mut dyn FnMut(ItemKey, u32, Option<u32>, [u8; 32], &'n str) -> bool,
+    alloc: Alloc<'static>, out: Alloc<'a>,
+) -> Result<AVec<'a, (HeadAt, blaze_own::Box<Head<'n>, Alloc<'static>>)>, FreezeError> {
     let want = frozen.want();
     let mut heads = AVec::new_in(out);
     let mut origins = AVec::new_in(alloc);
     for entry in frozen.heads() {
         let rec = |error| FreezeError::Record { want, at: entry.at, error };
         let text = match entry.at { HeadAt::Fn(_) => text_of(entry.at), _ => None };
-        let head = head_record::decode_with_origins_boxed_inline(
+        let head = head_record::decode_with_origins_boxed_inline_verified(
             entry.record,
             text,
             &store.tys,
             alloc,
             &mut |s| store.locals.keep_text(s),
+            verify_text,
             &mut |key, origin| {
                 origins.push((key, origin, false));
                 Ok(())
