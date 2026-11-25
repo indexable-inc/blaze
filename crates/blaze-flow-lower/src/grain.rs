@@ -428,24 +428,36 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
         self.body_slots(body_t, &mut table, e)?;
         let body = BodyTypes::new(Columns::new(self.tys, &arity, &arity), &table);
 
+        enum FrameKind {
+            Root,
+            /// A substituted impl type parameter (`Param(p)` inside an impl's associated type):
+            /// returns to its parent frame on completion, propagating `!ok` up to the parent
+            /// instead of returning from `lay_slots` early.
+            ParamSub,
+            /// An impl associated-type value laid through a projection (`(trait_, body_ty, before)`).
+            ImplProj { trait_: ItemKey, body_ty: PTy, before: usize },
+        }
+
         struct Frame<'s, Al: Allocator> {
             slots: FrameSlots<'s, Al>,
             at: usize,
             binds: Option<ImplBinds<Al>>,
             stack: Vec<(PTy, PTy), Al>,
             steps: u32,
-            /// `Some((trait_, body_ty, before))` for an impl value laid through a projection.
-            impl_ctx: Option<(ItemKey, PTy, usize)>,
+            failed: bool,
+            kind: FrameKind,
         }
 
         let mut root_stack: Vec<(PTy, PTy), A> = Vec::new_in(self.alloc);
         root_stack.push((declared, body_t));
         let mut frames: Vec<Frame<'_, A>, A> = Vec::new_in(self.alloc);
-        frames.push(Frame { slots: FrameSlots::Borrowed(slots), at: 0, binds: None, stack: root_stack, steps: 0, impl_ctx: None });
+        frames.push(Frame { slots: FrameSlots::Borrowed(slots), at: 0, binds: None, stack: root_stack, steps: 0, failed: false, kind: FrameKind::Root });
 
         'frames: while let Some(mut frame) = frames.pop() {
-            let mut aligned = true;
-            while let Some((d, b)) = frame.stack.pop() {
+            let mut aligned = !frame.failed;
+            while aligned
+                && let Some((d, b)) = frame.stack.pop()
+            {
                 frame.steps += 1;
                 if frame.steps > MOST_POSITIONS || out.len() as u32 > MOST_POSITIONS {
                     return self.refuse(Form::Bound, e);
@@ -474,7 +486,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                             binds: None,
                             stack: child_stack,
                             steps: 0,
-                            impl_ctx: None,
+                            failed: false,
+                            kind: FrameKind::ParamSub,
                         });
                         continue 'frames;
                     }
@@ -526,7 +539,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                                 binds: Some(bound),
                                 stack: child_stack,
                                 steps: 0,
-                                impl_ctx: Some((trait_, b, before)),
+                                failed: false,
+                                kind: FrameKind::ImplProj { trait_, body_ty: b, before },
                             });
                             continue 'frames;
                         }
@@ -574,9 +588,18 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                 }
             }
             let ok = aligned && frame.at == frame.slots.len();
-            match frame.impl_ctx {
-                None => return Ok(ok),
-                Some((trait_, b, before)) => {
+            match frame.kind {
+                FrameKind::Root => return Ok(ok),
+                FrameKind::ParamSub => {
+                    if !ok {
+                        if let Some(parent) = frames.last_mut() {
+                            parent.failed = true;
+                        } else {
+                            return Ok(false);
+                        }
+                    }
+                }
+                FrameKind::ImplProj { trait_, body_ty: b, before } => {
                     if !ok {
                         out.truncate(before);
                         if let Some(rp) = rpit.as_deref_mut() {

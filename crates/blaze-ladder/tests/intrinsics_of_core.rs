@@ -69,7 +69,6 @@ const KNOWN_UNBUILT: &[(&str, &str)] = &[
     ("sve_tuple_create4", "SVE scalable vector tuples: blaze lays out no scalable vector"),
     ("sve_tuple_get", "SVE scalable vector tuples: blaze lays out no scalable vector"),
     ("sve_tuple_set", "SVE scalable vector tuples: blaze lays out no scalable vector"),
-    ("va_arg", "C variadics: blaze-build has no row reading a `VaList` yet"),
     ("vtable_align", "a vtable's alignment word; no row yet"),
     ("vtable_size", "a vtable's size word; no row yet"),
 ];

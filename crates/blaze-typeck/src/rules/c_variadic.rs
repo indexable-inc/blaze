@@ -69,8 +69,17 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             Some(sig) => sig.c_variadic,
             None => false,
         };
+        if !variadic {
+            return Ok(inputs);
+        }
+        self.c_variadic_extra_inputs(inputs, n)
+    }
+
+    /// Extends a C-variadic callee's declared `inputs` with one fresh variable per extra argument
+    /// past `inputs.len()` up to `n` (fewer than declared stays E0061 in `start_args`).
+    pub(crate) fn c_variadic_extra_inputs(&mut self, inputs: TyList, n: usize) -> Result<TyList, Stop> {
         let declared = self.ty.list_len(inputs) as usize;
-        if !variadic || n <= declared {
+        if n <= declared {
             return Ok(inputs);
         }
         let mut all: Vec<Ty, _> = Vec::with_capacity_in(n, self.alloc);
@@ -84,17 +93,32 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         self.mk_list(&all)
     }
 
-    /// After every argument of call `e` is checked: if its callee is a C-variadic fn item,
-    /// each argument past the declared ones is held to C's default argument promotions
-    /// ([`promotion_refusal`]); a refused one is E0617 at that argument, its type the found
-    /// type. Nothing else changes: the argument keeps its type (no implicit promotion).
-    pub(crate) fn check_c_variadic_args(&mut self, e: ExprId, args: &[ExprId]) -> Result<(), Stop> {
-        let Some(&(_, k, _)) = self.callees.iter().rev().find(|c| c.0 == e) else {
-            return Ok(());
-        };
-        let declared = match self.reads.fn_sig(k)? {
-            Some(sig) if sig.c_variadic => sig.inputs.len(),
-            _ => return Ok(()),
+    /// After every argument of call `e` is checked: if its callee is a C-variadic fn item or
+    /// C-variadic fn pointer, each argument past the declared ones is held to C's default
+    /// argument promotions ([`promotion_refusal`]); a refused one is E0617 at that argument, its
+    /// type the found type. Nothing else changes: the argument keeps its type (no implicit promotion).
+    pub(crate) fn check_c_variadic_args(&mut self, e: ExprId, callee: ExprId, args: &[ExprId]) -> Result<(), Stop> {
+        let declared = if let Some(&(_, k, _)) = self.callees.iter().rev().find(|c| c.0 == e) {
+            match self.reads.fn_sig(k)? {
+                Some(sig) if sig.c_variadic => sig.inputs.len(),
+                _ => return Ok(()),
+            }
+        } else {
+            let Some(ct) = self
+                .adjust
+                .iter()
+                .rev()
+                .find(|(ex, _, _)| **ex == callee)
+                .map(|(_, _, &t)| t)
+                .or_else(|| self.expr_ty.get(callee.ix()).copied())
+            else {
+                return Ok(());
+            };
+            let ct = self.try_structurally_resolve(ct)?;
+            match self.view(ct) {
+                TyView::FnPtr(l, h) if h.c_variadic => usize::try_from(self.ty.list_len(l)).ok().unwrap_or(0).saturating_sub(1),
+                _ => return Ok(()),
+            }
         };
         for &arg in args.iter().skip(declared) {
             let t = self.expr_ty[arg.ix()];

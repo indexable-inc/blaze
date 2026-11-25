@@ -1134,7 +1134,7 @@ fn tables_of(
     let frame = cx.frame();
     let g = heap.alloc();
     let scope_crates = job.scope_crates(scope_records);
-    let opened = open_scope_by_need(cx, root, fs, outlined, scope_crates, packs, corrected, procs, frame, g, snapshot).map_err(OpenScopeRefused::message)?;
+    let opened = open_scope_by_need(cx, root, fs, outlined, scope_crates, packs, corrected, procs, crate::run_names::Envs { owner: None, rest: None }, frame, g, snapshot).map_err(OpenScopeRefused::message)?;
     let records = opened.records;
     let mut rows = Vec::new_in(g);
     if !NamesSource::each_impl_row(records, 0, &mut |row| rows.push(row)) {
@@ -1205,7 +1205,7 @@ fn tables_of(
                     let g = heap.alloc();
                     let chunk_frame = cx.frame();
                     let chunk_crates = job.scope_crates(scope_records);
-                    let opened_chunk = match open_scope_by_need(cx, root, fs, outlined, chunk_crates, packs, corrected, procs, chunk_frame, g, snapshot) {
+                    let opened_chunk = match open_scope_by_need(cx, root, fs, outlined, chunk_crates, packs, corrected, procs, crate::run_names::Envs { owner: None, rest: None }, chunk_frame, g, snapshot) {
                         Ok(opened_chunk) => opened_chunk,
                         Err(err) => return Ok(Err(err.message())),
                     };
@@ -3671,7 +3671,7 @@ impl HeadsStage {
                     scope.may_overlap("engine heads", HEADS_FRAME, move |cx: &Cx| {
                         let began = clock.now();
                         let on_board = OnBoard { board, clock, shows };
-                        let made = work::unwinding(|| heads_of(cx, root, fs, outlined, packs, corrected, procs, job, scope_records, setup, tasks, subjects, view, expansion_reads, heap, once, listings, head_jobs.listings, on_board, snapshot));
+                        let made = work::unwinding(|| heads_of(cx, root, fs, outlined, packs, corrected, procs, &list, job, scope_records, setup, tasks, subjects, view, expansion_reads, heap, once, listings, head_jobs.listings, on_board, snapshot));
                         Ok::<_, Infallible>((made, clock.now().since(began).map_or(0, crate::engine_times::ns), crate::engine_times::ns(began.since_start())))
                     }),
                 ));
@@ -3990,6 +3990,43 @@ impl core::fmt::Display for OpenScopeRefused {
     }
 }
 
+/// Lazy `CrateEnv` table for head constant evaluation (`include_str!`/`include_bytes!`/`env!`):
+/// builds `row_env` on demand for any crate in the split's scope that has no build script.
+struct HeadEnvs<'n> {
+    list: &'n blaze_world::crate_list::CrateList<'static>,
+    own: usize,
+    rest: &'n [crate::front_load::Unopened],
+    frame: &'n Frame,
+    made: Vec<core::cell::OnceCell<Option<&'n blaze_scope::crate_env::CrateEnv<'n>>>, &'n Frame>,
+}
+
+impl<'n> HeadEnvs<'n> {
+    fn new(
+        list: &'n blaze_world::crate_list::CrateList<'static>,
+        own: usize,
+        rest: &'n [crate::front_load::Unopened],
+        frame: &'n Frame,
+    ) -> HeadEnvs<'n> {
+        let mut made = Vec::with_capacity_in(1 + rest.len(), frame);
+        made.resize_with(1 + rest.len(), core::cell::OnceCell::new);
+        HeadEnvs { list, own, rest, frame, made }
+    }
+}
+
+impl<'n> crate::job_texts::EnvsByNeed<'n> for HeadEnvs<'n> {
+    fn env_of(&self, krate: usize) -> Option<&'n blaze_scope::crate_env::CrateEnv<'n>> {
+        let slot = self.made.get(krate)?;
+        let world_at = if krate == 0 { self.own } else { self.rest.get(krate - 1)?.world_at };
+        *slot.get_or_init(|| {
+            if matches!(crate::body_types::owner_script(self.list, world_at), Ok(None)) {
+                crate::body_types::row_env(self.list, world_at, None, None, self.frame).ok()
+            } else {
+                None
+            }
+        })
+    }
+}
+
 /// A job's scope's records opened by need in `frame` (run_names.rs `names_records_over`): what
 /// the setup, each split, and each impl tables job open, the one place a head job opens them.
 #[expect(clippy::too_many_arguments, reason = "the names records' edge: each argument one input of them")]
@@ -4002,12 +4039,13 @@ fn open_scope_by_need<'n>(
     packs: &'static crate::body_types::SyncLazyTrees<'static>,
     corrected: &'static [(u32, &'static str, &'static str)],
     procs: Option<&'static crate::proc_runner::ProcRunner<'static>>,
+    envs: crate::run_names::Envs<'n>,
     frame: &'n Frame,
     g: Alloc<'static>,
     snapshot: &'n crate::store::StoreSnapshot,
 ) -> Result<crate::run_names::Opened<'n>, OpenScopeRefused> {
     let packs = ((packs, fs), Some(outlined));
-    crate::run_names::names_records_over(cx, root, crates, packs, corrected, procs, std::vec::Vec::new_in(Global), None, Some(snapshot), None, frame, g)
+    crate::run_names::names_records_envs(cx, root, crates, packs, corrected, crate::job_texts::Procs::of(procs), std::vec::Vec::new_in(Global), envs, Some(snapshot), None, frame, g)
         .map_err(|_| OpenScopeRefused)
 }
 
@@ -4034,7 +4072,7 @@ fn crate_setup(
 ) -> Result<CrateSetup, &'static str> {
     let frame = cx.frame();
     let g = heap.alloc();
-    let opened = open_scope_by_need(cx, root, fs, outlined, job.scope_crates(scope_records), packs, corrected, procs, frame, g, snapshot).map_err(OpenScopeRefused::message)?;
+    let opened = open_scope_by_need(cx, root, fs, outlined, job.scope_crates(scope_records), packs, corrected, procs, crate::run_names::Envs { owner: None, rest: None }, frame, g, snapshot).map_err(OpenScopeRefused::message)?;
     let records = opened.records;
     let mut lang: Vec<usize, Alloc<'static>> = Vec::with_capacity_in(job.lang.len(), g);
     lang.extend_from_slice(&job.lang);
@@ -4133,6 +4171,7 @@ fn heads_of(
     packs: &'static crate::body_types::SyncLazyTrees<'static>,
     corrected: &'static [(u32, &'static str, &'static str)],
     procs: Option<&'static crate::proc_runner::ProcRunner<'static>>,
+    list: &blaze_world::crate_list::CrateList<'static>,
     job: &ItemJob<'_>,
     scope_records: &dyn crate::front_load::OpenByNeed,
     setup: &CrateSetup,
@@ -4150,8 +4189,11 @@ fn heads_of(
     let frame = cx.frame();
     let g = heap.alloc();
     let scope_crates = job.scope_crates(scope_records);
-    let opened = open_scope_by_need(cx, root, fs, outlined, scope_crates, packs, corrected, procs, frame, g, snapshot).map_err(OpenScopeRefused::message)?;
+    let head_envs = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(HeadEnvs::new(list, job.own.world_at, &job.rest, frame), frame));
+    let envs = crate::run_names::Envs { owner: crate::job_texts::EnvsByNeed::env_of(head_envs, 0), rest: Some(head_envs) };
+    let opened = open_scope_by_need(cx, root, fs, outlined, scope_crates, packs, corrected, procs, envs, frame, g, snapshot).map_err(OpenScopeRefused::message)?;
     let records = opened.records;
+    let body_sources: Option<&dyn blaze_ladder::front2::body_host::BodySources> = Some(opened.sources);
     let CrateSetup { lang, sized, pointers, lang_reads, pointer_reads, members, listing, ref index } = *setup;
     let unused = Recorder::new(RecorderOpts { alloc: g });
     let base = Tables::new(TablesOpts { records, impls: None, lang_crates: lang, reads: &unused });
@@ -4169,7 +4211,7 @@ fn heads_of(
     let both = blaze_ladder::front2::tables::owned_reads::BothOwners { names: &freeze_names, evals: &eval_names };
     let shared = base.reading_into(&freeze_names);
     let bump = frame.alloc(blaze_own::Erased::new(frame)).bump();
-    let mut once_consts = crate::engine_heads_once::OnceConsts::new(base.reading_into(&eval_names), &index, bump, once, job.prefix);
+    let mut once_consts = crate::engine_heads_once::OnceConsts::new(base.reading_into(&eval_names), &index, bump, once, job.prefix).with_sources(body_sources);
     let mut source = SeededHeads::new(SeededHeadsOpts { names: shared, sized, pointers, frame, scratch: g, alloc: g, consts: Some(&mut once_consts as &mut dyn ConstValues<'_>), known: Some(once), owners: Some(&both) });
     let mut crate_scopes: blaze_own::Vec<crate::engine_heads_once::ScopeCrate, Alloc<'static>> =
         blaze_own::Vec::with_capacity_in(NamesSource::crate_count(records), g);
@@ -4201,6 +4243,8 @@ fn heads_of(
         engine_refusal: core::cell::Cell::new(None),
         members,
         crate_scopes: &crate_scopes,
+        sources: body_sources,
+        texts: opened.sources.0,
     };
     let mut done = std::vec::Vec::with_capacity_in(tasks.len(), Global);
     for (at_task, task) in tasks.iter().enumerate() {

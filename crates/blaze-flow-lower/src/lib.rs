@@ -1267,6 +1267,16 @@ struct PInfo {
 
 /// Which aggregate `Lower::aggregate` builds: a constructor call (`Some(x)`, `S(a, b)`), a
 /// literal (a tuple, a struct, an array), or `format_args!`'s arguments.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UnsizeDone {
+    /// Exact closure-to-`dyn Fn*` unsizing that equated every owner signature slot onto the object.
+    ClosureSigTied,
+    /// Exact object unsizing that did not equate a closure's owner signature slots.
+    Handled,
+    /// Not handled here; fall back to `relate`.
+    Fallback,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Agg {
     Ctor,
@@ -3739,15 +3749,20 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
     /// Reference, "Async functions": the future "holds its arguments"; "Impl trait",
     /// "Capturing"), and no relation between two captured lifetimes.
     fn signature(&mut self, sig: SigLife<'_>, nparams: u32, root: ExprId) -> Result<(), Refusal> {
-        if !sig.well_formed() || sig.inputs() != nparams || self.body.params.len() != nparams as usize {
-            return self.refuse(Form::SigPositionsUnaligned { positions: nparams as usize, regions: sig.inputs() as usize, site: SigSite::Arity }, root);
+        let facts: &'b F = self.facts;
+        let c_variadic = facts.callee(self.body.owner).is_some_and(|c| c.c_variadic);
+        let sig_inputs = sig.inputs();
+        let expected_params = if c_variadic { sig_inputs.saturating_add(1) } else { sig_inputs };
+        let nparams_usize = usize::try_from(nparams).unwrap_or(usize::MAX);
+        let sig_inputs_usize = usize::try_from(sig_inputs).unwrap_or(usize::MAX);
+        if !sig.well_formed() || expected_params != nparams || self.body.params.len() != nparams_usize {
+            return self.refuse(Form::SigPositionsUnaligned { positions: nparams_usize, regions: sig_inputs_usize, site: SigSite::Arity }, root);
         }
         // The signature is laid: its types' implied bounds on the type parameters are read
         // below (`sig_param_bounds` sets this again where it cannot read them).
         self.param_all_unsure = false;
         // The bounds the signature's and the impl header's types imply, whole (front2
         // adt_facts.rs): `'long: 'short` known, `T: 'r` taken by `param_origin`.
-        let facts: &'b F = self.facts;
         self.implied_given = false;
         if let Some((params, regions)) = facts.implied_bounds() {
             for &(long, short) in regions {
@@ -3766,11 +3781,47 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         let mut laid: Vec<Option<Region>, A> = Vec::new_in(self.alloc);
         for i in 0..=nparams {
             let is_out = i == nparams;
+            // The trailing `...` parameter of a C-variadic fn definition has type `VaList<'_>`
+            // inside the body but no slot in the external C signature column: give each of its
+            // lifetime positions a fresh placeholder unrelated to `'static` or other parameters.
+            if c_variadic && i == sig_inputs {
+                let p = match usize::try_from(i).ok().and_then(|idx| self.body.params.get(idx)) {
+                    Some(&p) => p,
+                    None => return self.refuse(Form::Malformed, root),
+                };
+                let pat_ty = match self.ck.pat_ty.get(p.ix()) {
+                    Some(&t) => t,
+                    None => return self.refuse_pat(Form::Malformed, p),
+                };
+                let t = TyD::of(pat_ty);
+                let l = Local(1 + i);
+                let n = self.npos_d(t, root)?;
+                let start = match u32::try_from(self.origs.len()) {
+                    Ok(s) => s,
+                    Err(_) => return self.refuse(Form::Bound, root),
+                };
+                let mut live_mask: Vec<OriginLive, A> = Vec::new_in(self.alloc);
+                if n > 0 {
+                    self.origin_live_mask(t, &mut live_mask, root)?;
+                }
+                for k in 0..n {
+                    let o = self.hidden_placeholder();
+                    match usize::try_from(k).ok().and_then(|ki| live_mask.get(ki)).copied().unwrap_or(OriginLive::Full) {
+                        OriginLive::Full => self.b.mentions(l.0, o),
+                        OriginLive::NoDrop => self.b.mentions_no_drop(l.0, o),
+                        OriginLive::None => {}
+                    }
+                    self.origs.push(o);
+                }
+                self.set_local(l, t, start, n);
+                self.vars.push(l);
+                continue;
+            }
             let Some(regions) = (if is_out { sig.output() } else { sig.input(i) }) else {
                 let site = SigSite::NoChild { input: (!is_out).then_some(i) };
-                return self.refuse(Form::SigPositionsUnaligned { positions: nparams as usize, regions: sig.inputs() as usize, site }, root);
+                return self.refuse(Form::SigPositionsUnaligned { positions: nparams_usize, regions: sig_inputs_usize, site }, root);
             };
-            let declared = self.sig_declared(sig, i, root)?;
+            let declared = self.sig_declared(sig, if is_out { sig_inputs } else { i }, root)?;
             let (l, t) = if is_out {
                 (Local(0), TyD::of(self.adjusted_ty(root)?))
             } else {
@@ -5980,17 +6031,27 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 | AdjustKind::UnsafeFnPointer
                 | AdjustKind::MutToConstPointer
                 | AdjustKind::Unsize => {
-                    if matches!(kind, AdjustKind::ClosureFnPointer | AdjustKind::Unsize) {
+                    if kind == AdjustKind::ClosureFnPointer {
                         self.closure_sig_kept(v.ty.ty, e)?;
                     }
                     let op = self.operand(v, e)?;
                     let t = self.temp(out, e)?;
                     let tp = self.place_of(t);
                     self.b.aggregate(tp, &[op], self.span(e));
-                    if let At::Place(p) = v.at
-                        && !(kind == AdjustKind::Unsize && self.unsize_to_object(p, v.ty, tp, out, e)?)
-                    {
-                        self.relate(p, tp, out, e)?;
+                    let mut closure_sig_tied = false;
+                    if let At::Place(p) = v.at {
+                        if kind == AdjustKind::Unsize {
+                            match self.unsize_to_object(p, v.ty, tp, out, e)? {
+                                UnsizeDone::ClosureSigTied => closure_sig_tied = true,
+                                UnsizeDone::Handled => {}
+                                UnsizeDone::Fallback => self.relate(p, tp, out, e)?,
+                            }
+                        } else {
+                            self.relate(p, tp, out, e)?;
+                        }
+                    }
+                    if kind == AdjustKind::Unsize && !closure_sig_tied {
+                        self.closure_sig_kept(v.ty.ty, e)?;
                     }
                     Val { at: At::Place(tp), ty: out }
                 }
@@ -6074,9 +6135,17 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             && let Some(slots) = self.map_impl_assoc_slots(imp, Name::of("Target"), v.ty.ty, bi.len - 1, ri.len - 1, e)?
         {
             for (k, slot) in slots.iter().enumerate() {
-                let to = self.origs[(ri.start + 1 + k as u32) as usize];
+                let to_idx = usize::try_from(ri.start).ok().and_then(|s| s.checked_add(1)).and_then(|s| s.checked_add(k));
+                let Some(&to) = to_idx.and_then(|i| self.origs.get(i)) else { continue };
                 let b = match *slot {
-                    generic_call::ImplAssocSlot::SelfPos(pos) => self.origs[(bi.start + 1 + pos) as usize],
+                    generic_call::ImplAssocSlot::SelfPos(pos) => {
+                        let b_idx = usize::try_from(bi.start)
+                            .ok()
+                            .and_then(|s| s.checked_add(1))
+                            .and_then(|s| usize::try_from(pos).ok().and_then(|p| s.checked_add(p)));
+                        let Some(&orig) = b_idx.and_then(|i| self.origs.get(i)) else { continue };
+                        orig
+                    }
                     generic_call::ImplAssocSlot::Static => self.universal(Region::Static),
                 };
                 self.b.subset(b, to);
@@ -6117,30 +6186,30 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
     /// E, a derived `Debug`: E0597 and a placeholder error). `false`, relating nothing: not
     /// such a coercion, and `relate` applies (a trait with lifetimes keeps the object lifetime
     /// standing for them, every position equal).
-    fn unsize_to_object(&mut self, src: Place, from: TyD, dst: Place, to: TyD, e: ExprId) -> Result<bool, Refusal> {
+    fn unsize_to_object(&mut self, src: Place, from: TyD, dst: Place, to: TyD, e: ExprId) -> Result<UnsizeDone, Refusal> {
         let (s, d) = (self.info(src), self.info(dst));
         if !s.exact || !d.exact || s.len == 0 || d.len < 2 {
-            return Ok(false);
+            return Ok(UnsizeDone::Fallback);
         }
         if !(from.wrap.is_some() || matches!(self.node(from.ty, e)?, PNode::Ref(..))) {
-            return Ok(false);
+            return Ok(UnsizeDone::Fallback);
         }
         let obj = match to.wrap {
             Some(_) => to.ty,
             None => match self.node(to.ty, e)? {
                 PNode::Ref(_, i) => i,
-                _ => return Ok(false),
+                _ => return Ok(UnsizeDone::Fallback),
             },
         };
         let PNode::Dynamic(preds) = self.node(obj, e)? else {
-            return Ok(false);
+            return Ok(UnsizeDone::Fallback);
         };
         let facts: &'b F = self.facts;
         let from_inner = match from.wrap {
             Some(_) => from.ty,
             None => match self.node(from.ty, e)? {
                 PNode::Ref(_, i) => i,
-                _ => return Ok(false),
+                _ => return Ok(UnsizeDone::Fallback),
             },
         };
         // Exact closure-to-`dyn Fn*(Args) -> Ret + 'q` unsizing (both HRTB and non-HRTB):
@@ -6201,6 +6270,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                         for j in 0..ncap {
                             self.b.subset(self.origs[(s.start + 1 + j) as usize], q);
                         }
+                        let nsig_usize = usize::try_from(nsig).unwrap_or(0);
+                        let mut tied: Vec<bool, A> = Vec::with_capacity_in(nsig_usize, self.alloc);
+                        tied.resize(nsig_usize, false);
                         for &(dyn_off, sig_base, count) in ties.iter() {
                             for i in 0..count {
                                 let d_orig = self.origs[(d.start + dyn_off + i) as usize];
@@ -6209,6 +6281,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                                         let c_orig = self.origs[(s.start + 1 + ncap + k) as usize];
                                         self.b.subset(c_orig, d_orig);
                                         self.b.subset(d_orig, c_orig);
+                                        if let Some(slot) = usize::try_from(k).ok().and_then(|ki| tied.get_mut(ki)) {
+                                            *slot = true;
+                                        }
                                     }
                                     closure::SigSlot::Static => {
                                         let st = self.universal(Region::Static);
@@ -6220,31 +6295,31 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                                 }
                             }
                         }
-                        return Ok(true);
+                        return Ok(if tied.iter().all(|&b| b) { UnsizeDone::ClosureSigTied } else { UnsizeDone::Handled });
                     }
                 }
             }
         }
         if d.len != 2 {
-            return Ok(false);
+            return Ok(UnsizeDone::Fallback);
         }
         let mut held: Vec<u32, A> = Vec::new_in(self.alloc);
         for &p in self.list(preds, e)? {
             let (args, term) = match self.node(p, e)? {
                 PNode::ExTrait(k, args) => {
                     if facts.object_trait_lifetimes(k) != Some(false) {
-                        return Ok(false);
+                        return Ok(UnsizeDone::Fallback);
                     }
                     (args, None)
                 }
                 PNode::ExProj { args, term, .. } => (args, Some(term)),
                 PNode::ExAuto(_) => continue,
-                _ => return Ok(false),
+                _ => return Ok(UnsizeDone::Fallback),
             };
             for &t in self.list(args, e)?.iter().chain(term.as_ref()) {
                 held.clear();
                 if self.npos(t, e)? > 0 || self.unplaced(t, e, &mut held)? || !held.is_empty() {
-                    return Ok(false);
+                    return Ok(UnsizeDone::Fallback);
                 }
             }
         }
@@ -6253,7 +6328,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         for j in s.start + 1..s.start + s.len {
             self.b.subset(self.origs[j as usize], q);
         }
-        Ok(true)
+        Ok(UnsizeDone::Handled)
     }
 
     fn target_flow(&mut self, from: PInfo, skip: u32, r: PInfo, m: bool) {
@@ -6779,15 +6854,49 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         let (bi, ri) = (self.info(btp), self.info(rp));
         let (ob, or) = (self.origs[bi.start as usize], self.origs[ri.start as usize]);
         self.b.subset(ob, or);
-        self.target_flow(bi, 1, ri, m);
-        let mut inputs = bi.len.saturating_sub(1);
-        if let At::Place(ip) = idx.at {
-            let ii = self.info(ip);
-            inputs += ii.len;
-            self.target_flow(ii, 0, ri, m);
-        }
-        if inputs > 1 && ri.len > 1 {
-            self.coarse_step(Form::Unified { why: Unified::DerefTarget }, e);
+        let idx_len = match idx.at {
+            At::Place(ip) => self.info(ip).len,
+            At::Const => 0,
+        };
+        let mapped_index = if idx_len == 0
+            && ri.len > 1
+            && bi.len > 1
+            && let Some(slots) = self.map_index_output_slots(e, base.ty.ty, idx.ty.ty, bi.len - 1, ri.len - 1)?
+        {
+            for (k, slot) in slots.iter().enumerate() {
+                let to_idx = usize::try_from(ri.start).ok().and_then(|s| s.checked_add(1)).and_then(|s| s.checked_add(k));
+                let Some(&to) = to_idx.and_then(|i| self.origs.get(i)) else { continue };
+                let b = match *slot {
+                    generic_call::ImplAssocSlot::SelfPos(pos) => {
+                        let b_idx = usize::try_from(bi.start)
+                            .ok()
+                            .and_then(|s| s.checked_add(1))
+                            .and_then(|s| usize::try_from(pos).ok().and_then(|p| s.checked_add(p)));
+                        let Some(&orig) = b_idx.and_then(|i| self.origs.get(i)) else { continue };
+                        orig
+                    }
+                    generic_call::ImplAssocSlot::Static => self.universal(Region::Static),
+                };
+                self.b.subset(b, to);
+                if m {
+                    self.b.subset(to, b);
+                }
+            }
+            true
+        } else {
+            false
+        };
+        if !mapped_index {
+            self.target_flow(bi, 1, ri, m);
+            let mut inputs = bi.len.saturating_sub(1);
+            if let At::Place(ip) = idx.at {
+                let ii = self.info(ip);
+                inputs += ii.len;
+                self.target_flow(ii, 0, ri, m);
+            }
+            if inputs > 1 && ri.len > 1 {
+                self.coarse_step(Form::Unified { why: Unified::DerefTarget }, e);
+            }
         }
         let p = self.project(rp, self.local_ty[rt.0 as usize], Proj::Deref, ty, false, e)?;
         self.push_place(p, ty);
@@ -6991,7 +7100,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             && parts.len() == 1
             && matches!(self.expr(e)?, Expr::Cast { .. })
             && let At::Place(p) = parts[0].at
-            && self.unsize_to_object(p, parts[0].ty, tp, ty, e)?
+            && self.unsize_to_object(p, parts[0].ty, tp, ty, e)? != UnsizeDone::Fallback
         {
             self.push_place(tp, ty);
             return Ok(());

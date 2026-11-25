@@ -17,6 +17,7 @@ use alloc::alloc::Allocator;
 use blaze_lir::Op;
 
 use super::{EmitError, Pass, unsupported};
+use crate::enc::{self, FP, X9};
 
 /// The base word of each target intrinsic and the most its immediate may be, with its shift.
 struct Encoding {
@@ -47,11 +48,33 @@ fn word(name: &[u8], imm: u64) -> Result<u32, &'static str> {
 }
 
 impl<A: Allocator> Pass<'_, '_, A> {
-    /// Target intrinsic `inst`: its one operand an `iconst`, encoded into the instruction.
+    /// Target intrinsic `inst`: `blaze.va_start` returns the address of the first stacked
+    /// variadic argument (`fp + va_start_offset` on Apple arm64); every other entry takes one
+    /// `iconst` immediate encoded into the instruction.
     pub(super) fn target_intrinsic(&mut self, inst: usize, op: Op) -> Result<(), EmitError> {
         let mut o = self.view.operands(inst);
         let name = self.view.intrinsic_name(o.intrinsic());
         let args = o.values();
+        if name == b"blaze.va_start" {
+            if !args.is_empty() {
+                return Err(unsupported(inst, op, "`blaze.va_start` with arguments"));
+            }
+            let Some(off) = self.va_start_offset else {
+                return Err(unsupported(inst, op, "`blaze.va_start` outside a C-variadic function"));
+            };
+            let (hi, lo) = (off >> 12, off & 0xfff);
+            match hi {
+                0 => self.put(enc::add_imm(X9, FP, lo, false)),
+                _ => {
+                    self.put(enc::add_imm(X9, FP, hi, true));
+                    if lo != 0 {
+                        self.put(enc::add_imm(X9, X9, lo, false));
+                    }
+                }
+            }
+            self.st(X9, inst);
+            return Ok(());
+        }
         if args.len() != 1 {
             return Err(unsupported(inst, op, "a target intrinsic of other than one immediate operand"));
         }

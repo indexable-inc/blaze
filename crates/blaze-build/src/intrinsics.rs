@@ -189,6 +189,8 @@ pub enum Which {
     PtrMask,
     /// `variant_count::<T>()`: the number of variants of an enum type (0 for any other type).
     VariantCount,
+    /// `va_arg::<T>(ap: &mut VaList<'_>) -> T`: reads the next C-variadic argument and advances `ap`.
+    VaArg,
     /// `raw_eq::<T>(a, b)`: whether the `size_of::<T>()` bytes behind both are equal
     /// ([`byte_order`] the rule the constant evaluator computes).
     RawEq,
@@ -343,6 +345,7 @@ pub const TABLE: &[Entry] = &[
     e("unchecked_sub", Which::UncheckedSub, "Returns the result of an unchecked subtraction, resulting in undefined behavior when `x - y > T::MAX` or `x - y < T::MIN`.", "`sub nsw`/`sub nuw`"),
     e("unlikely", Which::Unlikely, "Hints to the compiler that branch condition is likely to be false. Returns the value passed to it.", "its argument"),
     e("unreachable", Which::Unreachable, "Informs the optimizer that this point in the code is not reachable, enabling further optimizations.", "`unreachable`"),
+    e("va_arg", Which::VaArg, "Reads the next argument from a C variable argument list (`VaList`) and advances the cursor.", "loads the `VaList` pointer, advances it by 8 bytes (16 aligned for 128-bit), stores back, and loads `T`"),
     e("variant_count", Which::VariantCount, "Returns the number of variants of the type `T`, or `0` if `T` is not an enum.", "a constant from the ADT's variants"),
     e("volatile_copy_memory", Which::VolatileCopyMemory, "Equivalent to the appropriate `llvm.memmove.p0i8.0i8.*` intrinsic, with a size of `count * size_of::<T>()` and an alignment of `align_of::<T>()`.", "`memmove volatile`"),
     e("volatile_copy_nonoverlapping_memory", Which::VolatileCopyNonoverlappingMemory, "Equivalent to the appropriate `llvm.memcpy.p0i8.0i8.*` intrinsic, with a size of `count` * `size_of::<T>()` and an alignment of `align_of::<T>()`.", "`memcpy volatile`"),
@@ -606,6 +609,36 @@ pub fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
                 FieldCountError::NoAdt(adt) => IntrinsicError::Layout(LayoutError { ty: t, why: crate::layout::Refusal::NoAdt(adt) }),
             })?;
             Out::Scalar(s.usize(count))
+        }
+        W::VaArg => {
+            let t = t0.ok_or_else(need_t)?;
+            let ap = scalar(0).ok_or_else(shape)?;
+            let id = s.layout(t)?;
+            let l = *s.cx.layouts.get(id);
+            let Some(sc) = l.scalar else {
+                return Err(IntrinsicError::Unsupported { which: c.which, why: "a non-scalar `va_arg` type" });
+            };
+            if !matches!(l.size, 4 | 8 | 16) || matches!(sc.prim, Prim::F32 | Prim::F16) {
+                return Err(IntrinsicError::Unsupported { which: c.which, why: "an unpromoted or unsupported scalar `va_arg` type" });
+            }
+            let (tty, _) = lir(sc.prim);
+            let mut cur = s.b.load(Ty::PTR, Flags::NONE, ap, 0, MemAttrs::aligned(3));
+            let step = if l.size == 16 {
+                let addr = s.b.convert(Op::Expose, Flags::NONE, Ty::I64, cur);
+                let fifteen = s.b.iconst(Ty::I64, 15);
+                let mask = s.b.iconst(Ty::I64, u128::from(!15u64));
+                let bumped = s.b.binary(Op::Add, Flags::NONE, addr, fifteen);
+                let aligned = s.b.binary(Op::And, Flags::NONE, bumped, mask);
+                cur = s.b.convert(Op::FromExposed, Flags::NONE, Ty::PTR, aligned);
+                16u128
+            } else {
+                8u128
+            };
+            let step_val = s.b.iconst(Ty::I64, step);
+            let next = s.b.ptr_add(Flags::NONE, cur, step_val);
+            s.b.store(Flags::NONE, next, ap, 0, MemAttrs::aligned(3));
+            let val = s.b.load(tty, Flags::NONE, cur, 0, MemAttrs::aligned(l.align));
+            Out::Scalar(val)
         }
         W::SizeOfVal | W::AlignOfVal => {
             let id = s.layout(t0.ok_or_else(need_t)?)?;

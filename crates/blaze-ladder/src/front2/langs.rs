@@ -266,6 +266,7 @@ pub fn mark(item: LangItem) -> Mark {
         LangItem::Enum => "blaze_enum",
         LangItem::UnitEnum => "blaze_unit_enum",
         LangItem::TryAsDyn => "try_as_dyn",
+        LangItem::VaList => "va_list",
     })
 }
 
@@ -274,4 +275,4 @@ pub fn mark(item: LangItem) -> Mark {
 /// `core::mem::variant_count::<LangItem>()` and its order, so a new variant cannot be left out).
 /// The list's one home is blaze-typeck's `LangItem::ALL` (the checked-body record decodes a
 /// lang item by it).
-pub const ALL: [LangItem; 102] = LangItem::ALL;
+pub const ALL: [LangItem; 103] = LangItem::ALL;

@@ -6432,9 +6432,6 @@ impl<'n> Store<'n> {
             return Err(Why::Unsupported("a `gen fn`", whole));
         }
         let c_variadic = flags & sig::VARIADIC != 0;
-        if c_variadic && flags & sig::HAS_BODY != 0 {
-            return Err(Why::Unsupported("a C-variadic fn definition (`unsafe extern \"C\" fn f(x: i32, mut args: ...)`: the unstable `c_variadic` feature)", whole));
-        }
         // Each opaque's bounds as written, with the opaque type as `Self`, are its own
         // predicates (the checker's `Predicates(k)`); the written ones' bounds are made after
         // the fn's own bounds are known (a bound may name `T::Item`).

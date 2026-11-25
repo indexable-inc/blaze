@@ -1054,18 +1054,24 @@ pub(crate) struct OnceConsts<'r, 'n, S> {
     bump: blaze_own::Bump<'n>,
     once: &'r HeadsOnce,
     unit: [u8; 8],
+    sources: Option<&'n dyn blaze_ladder::front2::body_host::BodySources>,
 }
 
 impl<'r, 'n, S> OnceConsts<'r, 'n, S> {
     pub(crate) fn new(names: S, index: &'r Index<'n>, bump: blaze_own::Bump<'n>, once: &'r HeadsOnce, unit: [u8; 8]) -> OnceConsts<'r, 'n, S> {
-        OnceConsts { names, index, bump, once, unit }
+        OnceConsts { names, index, bump, once, unit, sources: None }
+    }
+
+    pub(crate) fn with_sources(mut self, sources: Option<&'n dyn blaze_ladder::front2::body_host::BodySources>) -> OnceConsts<'r, 'n, S> {
+        self.sources = sources;
+        self
     }
 }
 
 impl<'n, S: NamesSource<'n>> ConstValues<'n> for OnceConsts<'_, 'n, S> {
     fn eval(&mut self, store: &mut Store<'n>, keys: &mut Keys, c: LibKey) -> Result<(), ConstFail> {
         self.once.evaluated_one(c, self.unit);
-        HeadConsts::new(self.names, self.index, self.bump).eval(store, keys, c)
+        HeadConsts::new(self.names, self.index, self.bump).with_sources(self.sources).eval(store, keys, c)
     }
 }
 
@@ -1115,6 +1121,10 @@ pub(crate) struct JobCx<'j, 't, 'n, 'v, 'w> {
     pub(crate) members: &'j [Name],
     /// Precomputed scope metadata for each crate in `records`, sorted by 8-byte crate prefix.
     pub(crate) crate_scopes: &'j [ScopeCrate],
+    /// Body expansion sources (`include_str!`, `include_bytes!`, `env!`) for head constant evaluation.
+    pub(crate) sources: Option<&'n dyn blaze_ladder::front2::body_host::BodySources>,
+    /// Underlying `JobTexts` recording data-file reads made during head constant evaluation (rule 21).
+    pub(crate) texts: &'n crate::job_texts::JobTexts<'n>,
 }
 
 /// Whether `want`'s item is a member crate's: its key's crate prefix is a member unit's (one of
@@ -1156,13 +1166,24 @@ pub(crate) fn one_head<'n, 's: 'n>(
     }
     let mark = source.kept_len();
     let fail_mark = source.failed_len();
+    let data_mark = job.texts.data.borrow().len();
     // The task's own lookups (its item's text, `cell_of`) are its cell's.
     job.names.enter(want);
     job.evals.enter(want);
     let made = head_task_with_key(job.shared, source, want, task.key, job.g);
     job.names.leave();
     job.evals.leave();
-    if let Err(why) = publish_since(job, owners, source, mark, fail_mark) {
+    let data_cells = match data_read_cells(job, data_mark) {
+        Some(cells) => cells,
+        None => {
+            failed.get_or_insert(UNPLANNED_DATA_CELL);
+            Vec::new_in(job.g)
+        }
+    };
+    for &id in data_cells.iter() {
+        push(id);
+    }
+    if let Err(why) = publish_since(job, owners, source, mark, fail_mark, &data_cells) {
         failed.get_or_insert(why);
     }
     let result = head_result(job, source, want, made);
@@ -1192,10 +1213,37 @@ pub(crate) fn one_head<'n, 's: 'n>(
     result
 }
 
+const UNPLANNED_DATA_CELL: &str = "a data file read while evaluating a head's constant has no planned cell in this request (rule 21)";
+
+/// Data-file cells read via `include_str!`/`include_bytes!` while evaluating a head's constant
+/// since `from` in `job.texts.data` (rule 21: every read file enters the cell's read list).
+fn data_read_cells<'n>(job: &JobCx<'_, '_, 'n, '_, '_>, from: usize) -> Option<Vec<CellId, Alloc<'static>>> {
+    let data = job.texts.data.borrow();
+    let slice = data.get(from..).unwrap_or(&[]);
+    let mut out: Vec<CellId, Alloc<'static>> = Vec::with_capacity_in(slice.len(), job.g);
+    for &(path, _, bytes) in slice {
+        let file = CellId { of: Name::file(path.as_bytes()), cell: WHOLE };
+        let seen = bytes.map_or_else(crate::data_include::absent_out, crate::data_include::data_out);
+        if job.view.cell(&file) == seen {
+            out.push(file);
+            continue;
+        }
+        let data_cell = CellId { of: file.of, cell: crate::engine_tasks::DATA };
+        if job.view.cell(&data_cell) == seen {
+            out.push(data_cell);
+            continue;
+        }
+        return None;
+    }
+    out.sort_unstable();
+    out.dedup();
+    Some(out)
+}
+
 /// Every cell `source` froze itself from its kept index `mark` on, and every cell that failed in
 /// it from its failure mark `fail_mark` on (lane HF1), put into the table with its own reads
 /// (taken by owner from the job's recorders).
-fn publish_since<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &mut Owners<'s>, source: &mut SeededHeads<'n, '_, Tables<'_, 'n>>, mark: usize, fail_mark: usize) -> Result<(), &'static str> {
+fn publish_since<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &mut Owners<'s>, source: &mut SeededHeads<'n, '_, Tables<'_, 'n>>, mark: usize, fail_mark: usize, data_cells: &[CellId]) -> Result<(), &'static str> {
     let g = job.g;
     let mut gave_up: Vec<(Want, Cause, Option<Want>, Vec<Want, Alloc<'static>>), Alloc<'static>> = Vec::new_in(g);
     for (w, failure, heads) in source.failures_from(fail_mark) {
@@ -1205,7 +1253,12 @@ fn publish_since<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &mut Owner
         gave_up.push((w, cause, needs, owned_heads));
     }
     for (want, cause, needs, heads) in gave_up.iter() {
-        let reads = cell_reads(job, owners, *want, &[])?;
+        let mut reads = cell_reads(job, owners, *want, &[])?;
+        if !data_cells.is_empty() {
+            reads.extend_from_slice(data_cells);
+            reads.sort_unstable();
+            reads.dedup();
+        }
         let entry = FailedEntry { want: *want, cause: *cause, needs: *needs, reads: &reads, heads };
         job.once.put_failed(entry).map_err(|e| leak(g, format_args!("{e}")))?;
     }
@@ -1219,7 +1272,12 @@ fn publish_since<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &mut Owner
             job.once.put_closed(w, frozen.bytes(), frozen.meaning(), key, names_at).map_err(|e| leak(g, format_args!("{e}")))?;
             continue;
         }
-        let reads = cell_reads(job, owners, w, read.consts)?;
+        let mut reads = cell_reads(job, owners, w, read.consts)?;
+        if !data_cells.is_empty() {
+            reads.extend_from_slice(data_cells);
+            reads.sort_unstable();
+            reads.dedup();
+        }
         let entry = Entry {
             want: w,
             member: is_member(job.subjects, w),
@@ -1474,10 +1532,21 @@ fn alone<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &mut Owners<'s>, w
     // The evaluator reads through a recorder of its own (engine_head_consts.rs).
     let evaluated = Recorder::new(RecorderOpts { alloc: g });
     let bump = job.frame.alloc(blaze_own::Erased::new(job.frame)).bump();
-    let mut consts = HeadConsts::new(job.base.reading_into(&evaluated), job.index, bump);
+    let mut consts = HeadConsts::new(job.base.reading_into(&evaluated), job.index, bump).with_sources(job.sources);
+    let data_mark = job.texts.data.borrow().len();
     job.once.alone.fetch_add(1, Ordering::Relaxed);
     let mut source = SeededHeads::new(SeededHeadsOpts { names, sized: job.sized, pointers: job.pointers, frame: job.frame, scratch: g, alloc: g, consts: Some(&mut consts as &mut dyn ConstValues<'_>), known: None, owners: None });
     let made = head_task_with_key(names, &mut source, want, task.key, g);
+    match data_read_cells(job, data_mark) {
+        Some(cells) => {
+            for &id in cells.iter() {
+                push(id);
+            }
+        }
+        None => {
+            failed.get_or_insert(UNPLANNED_DATA_CELL);
+        }
+    }
     let result = head_result(job, &source, want, made);
     for id in job.pointer_reads.iter() {
         push(*id);

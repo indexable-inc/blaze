@@ -712,6 +712,131 @@ impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
     fn takes_const_gaps(&self) -> bool {
         true
     }
+
+    fn closure_param_regions(
+        &mut self,
+        view: &View<'_>,
+        t: lf::TypeId,
+        tys: &mut PortableTys<'_>,
+        closure: blaze_typeck::ExprId,
+        param: u32,
+        out: &mut dyn FnMut(blaze_typeck::ClosureParamRegion),
+    ) -> bool {
+        let Ok(range) = view.type_range(t) else { return false };
+        let mut env = self.env;
+        if let Some(r) = view.item_relative(range)
+            && let Some(body) = self.locals.body(self.owner)
+            && let Some(block) = body.blocks.iter().rev().find(|b| b.open <= r.start && r.start < b.close)
+        {
+            env.module = block.module;
+        }
+        let mut sink = super::types::RegionSink::new_in(self.mark_alloc);
+        let Ok(made) = self.builder.ty_regions(tys, &env, view, t, &mut sink) else {
+            return false;
+        };
+        if sink.refused().is_some() {
+            return false;
+        }
+        let &[frag] = sink.frags() else { return false };
+        let slots = sink.slots_of(frag);
+        let tys = tys.view();
+        let mut cursor = 0usize;
+        let mut stack: [(PTy, u64); 64] = [(PTy(0), 0); 64];
+        let mut sp = 1usize;
+        if let Some(s) = stack.get_mut(0) {
+            *s = (made, blaze_typeck::ClosureParamRegion::ROOT);
+        }
+        let mut steps = 0u32;
+        let kind_of = |slot: super::types::Slot| match slot.kind {
+            super::types::SlotKind::Static | super::types::SlotKind::Given(blaze_typeck::regions::Region::Static) => {
+                Some(blaze_typeck::WrittenRegion::Static)
+            }
+            super::types::SlotKind::Named(..) | super::types::SlotKind::Given(blaze_typeck::regions::Region::Param(_)) => {
+                Some(blaze_typeck::WrittenRegion::Named)
+            }
+            _ => None,
+        };
+        while let Some(top) = sp.checked_sub(1) {
+            sp = top;
+            steps += 1;
+            if steps > 128 {
+                return false;
+            }
+            let Some(&(ty, path)) = stack.get(top) else { return false };
+            let Ok(node) = tys.node(ty) else { return false };
+            match node {
+                blaze_typeck::PNode::Ref(_, inner) => {
+                    let Some(&slot) = slots.get(cursor) else { return false };
+                    cursor += 1;
+                    if let Some(kind) = kind_of(slot) {
+                        out(blaze_typeck::ClosureParamRegion { closure, param, path, own: 0, kind });
+                    }
+                    let Some(next) = blaze_typeck::ClosureParamRegion::push_step(path, 0) else { return false };
+                    let Some(dst) = stack.get_mut(sp) else { return false };
+                    *dst = (inner, next);
+                    sp += 1;
+                }
+                blaze_typeck::PNode::Ptr(_, inner)
+                | blaze_typeck::PNode::Slice(inner)
+                | blaze_typeck::PNode::Array(inner, _)
+                | blaze_typeck::PNode::Pat(inner, _) => {
+                    let Some(next) = blaze_typeck::ClosureParamRegion::push_step(path, 0) else { return false };
+                    let Some(dst) = stack.get_mut(sp) else { return false };
+                    *dst = (inner, next);
+                    sp += 1;
+                }
+                blaze_typeck::PNode::Tuple(l) => {
+                    let Ok(elems) = tys.list(l) else { return false };
+                    for (ci, &child) in elems.iter().enumerate().rev() {
+                        let Ok(ci_u32) = u32::try_from(ci) else { return false };
+                        let Some(next) = blaze_typeck::ClosureParamRegion::push_step(path, ci_u32) else { return false };
+                        let Some(dst) = stack.get_mut(sp) else { return false };
+                        *dst = (child, next);
+                        sp += 1;
+                    }
+                }
+                blaze_typeck::PNode::Adt(k, l) => {
+                    let Some(nl) = super::types::declared_lifetimes(
+                        self.builder.heads,
+                        self.builder.resolver.names,
+                        k,
+                        super::types::Declared::Adt,
+                    ) else {
+                        return false;
+                    };
+                    for own in 0..nl {
+                        let Some(&slot) = slots.get(cursor) else { return false };
+                        cursor += 1;
+                        if let Some(kind) = kind_of(slot) {
+                            out(blaze_typeck::ClosureParamRegion { closure, param, path, own, kind });
+                        }
+                    }
+                    let Ok(args) = tys.list(l) else { return false };
+                    for (ci, &child) in args.iter().enumerate().rev() {
+                        let Ok(ci_u32) = u32::try_from(ci) else { return false };
+                        let Some(next) = blaze_typeck::ClosureParamRegion::push_step(path, ci_u32) else { return false };
+                        let Some(dst) = stack.get_mut(sp) else { return false };
+                        *dst = (child, next);
+                        sp += 1;
+                    }
+                }
+                blaze_typeck::PNode::Bool
+                | blaze_typeck::PNode::Char
+                | blaze_typeck::PNode::Int(_)
+                | blaze_typeck::PNode::Uint(_)
+                | blaze_typeck::PNode::Float(_)
+                | blaze_typeck::PNode::Str
+                | blaze_typeck::PNode::Never
+                | blaze_typeck::PNode::Param(_)
+                | blaze_typeck::PNode::ConstValue { .. }
+                | blaze_typeck::PNode::ConstParam(_)
+                | blaze_typeck::PNode::Infer
+                | blaze_typeck::PNode::Error => {}
+                _ => return false,
+            }
+        }
+        cursor == slots.len()
+    }
 }
 
 /// The gap a refused const term of a BODY is, when blaze cannot value it yet (the body goes
