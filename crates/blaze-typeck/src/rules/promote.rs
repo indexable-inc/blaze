@@ -19,7 +19,9 @@
 //! - its operand is promotable: a literal; a path to a `const`, a fn item or a unit or tuple
 //!   ctor; a tuple, array or struct literal (no `..base`) of promotable operands; a call of a
 //!   fn item whose attributes carry `#[rustc_promotable]` ([`TypeAttrs::PROMOTABLE`]), or of a
-//!   tuple ctor, with promotable arguments; parentheses around one of these;
+//!   tuple ctor, with promotable arguments; a direct field or tuple-field projection of a
+//!   promotable non-union `Freeze`-and-no-drop base (no `Deref` adjustment, e.g. hashbrown's
+//!   `&ALIGNED_BYTES.bytes`); parentheses around one of these;
 //! - and the operand's type is `Freeze` with no drop glue, decided structurally where the type
 //!   says so (scalars, `&T`, raw and fn pointers, fn items, tuples and arrays of such) and by
 //!   the lang `freeze` trait (`may_hold`, an auto trait: core/src/marker.rs `pub unsafe auto
@@ -59,11 +61,18 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         // the expression's own rvalue, and is promoted by the same rule as `&operand`.
         let mut first_adjust: Vec<Option<AdjustKind>, Alloc<'a>> = Vec::with_capacity_in(self.body.exprs.len(), self.alloc);
         first_adjust.resize(self.body.exprs.len(), None);
+        let mut has_deref: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(self.body.exprs.len(), self.alloc);
+        has_deref.resize(self.body.exprs.len(), false);
         for (&e, &k) in self.adjust.column::<0>().iter().zip(self.adjust.column::<1>().iter()) {
             if let Some(slot) = first_adjust.get_mut(e.ix())
                 && slot.is_none()
             {
                 *slot = Some(k);
+            }
+            if matches!(k, AdjustKind::Deref { .. })
+                && let Some(slot) = has_deref.get_mut(e.ix())
+            {
+                *slot = true;
             }
         }
         // The whole tree from the root, each expression with whether it is under a const block.
@@ -83,7 +92,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             if !in_const {
                 match node {
                     Expr::Ref { mutbl: Mutbl::Not, operand } => {
-                        if self.promotable(operand)? && self.freeze_without_drop(self.expr_ty[operand.ix()])? {
+                        if self.promotable(operand, &has_deref)? && self.freeze_without_drop(self.expr_ty[operand.ix()])? {
                             found.push(x);
                         }
                     }
@@ -93,7 +102,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                             first_adjust.get(x.ix()).copied().flatten(),
                             Some(AdjustKind::Borrow { mutbl: Mutbl::Not, raw: false, .. })
                         ) && let Some(&ty) = self.expr_ty.get(x.ix())
-                            && self.promotable(x)?
+                            && self.promotable(x, &has_deref)?
                             && self.freeze_without_drop(ty)?
                         {
                             found.push(x);
@@ -120,7 +129,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     }
 
     /// Whether `op` is a promotable operand (the module doc's list), by a work list.
-    fn promotable(&mut self, op: ExprId) -> Result<bool, Stop> {
+    fn promotable(&mut self, op: ExprId, has_deref: &[bool]) -> Result<bool, Stop> {
         let bound = self.body.exprs.len() + 1;
         let mut work: Vec<ExprId, Alloc<'a>> = Vec::new_in(self.alloc);
         work.push(op);
@@ -138,6 +147,24 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     Some(Def::Ctor { kind: CtorKind::Unit | CtorKind::Tuple, .. }) => {}
                     _ => return Ok(false),
                 },
+                Expr::Field { base, .. } | Expr::TupleField { base, .. } => {
+                    if has_deref.get(base.ix()).copied().unwrap_or(false) {
+                        return Ok(false);
+                    }
+                    let Some(&bt) = self.expr_ty.get(base.ix()) else {
+                        return Ok(false);
+                    };
+                    let bt_res = self.ty.resolve(bt)?;
+                    if let TyView::Adt(k, _) = self.view(bt_res)
+                        && self.reads.adt(k)?.is_none_or(|adt| adt.kind == AdtKind::Union)
+                    {
+                        return Ok(false);
+                    }
+                    if !self.freeze_without_drop(bt_res)? {
+                        return Ok(false);
+                    }
+                    work.push(base);
+                }
                 Expr::Tuple { elems } | Expr::Array { elems } => work.extend_from_slice(self.body.expr_list(elems)?),
                 Expr::Repeat { elem, .. } => work.push(elem),
                 Expr::Struct { fields, base: crate::body::StructBase::None, .. } => {

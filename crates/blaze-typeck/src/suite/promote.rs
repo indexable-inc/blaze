@@ -176,3 +176,87 @@ fn shared_autoref_of_unit_variant_is_promoted() {
     assert!(c.diags.is_empty(), "f_cell checks clean: {:?}", c.diags);
     assert!(c.promoted.is_empty(), "a `!Freeze` autoref is never promoted: {:?}", c.promoted);
 }
+
+/// CONST FIELD PROMOTION: `&ALIGNED_BYTES.bytes` (hashbrown's `Group::static_empty`) and `&PAIR.0`
+/// are promoted when the base is a promotable `Freeze` rvalue without drop glue and without a
+/// `Deref` adjustment. A field of a `!Freeze` base (`&CELL_PAIR.1`) or through a reference deref
+/// (`&REF_CONST.bytes`) is never promoted.
+#[test]
+fn const_field_projection_is_promoted_when_base_is_promotable_freeze() {
+    let mut fx = Fx::new();
+    let sized = fx.tr("Sized", 1, Default::default(), &[]);
+    fx.lang(LangItem::Sized, sized);
+    let freeze = fx.tr("Freeze", 1, Default::default(), &[]);
+    fx.auto(freeze);
+    fx.lang(LangItem::Freeze, freeze);
+    let u8_ = fx.u8();
+    let u64_ = fx.ty(PNode::Uint(UintTy::U64));
+    let align_arr = fx.array(u64_, 0);
+    let bytes_arr = fx.array(u8_, 8);
+    let aligned = fx.strukt("AlignedBytes", 0, &[("_align", align_arr), ("bytes", bytes_arr)]);
+    let aligned_ty = fx.adt(aligned, &[]);
+    fx.konst("ALIGNED_BYTES", aligned_ty);
+
+    let pair_ty = fx.tuple(&[u8_, u64_]);
+    fx.konst("PAIR", pair_ty);
+
+    let p0 = fx.param(0);
+    let uc = fx.strukt("UnsafeCell", 1, &[("value", p0)]);
+    let uc_p0 = fx.adt(uc, &[p0]);
+    let neg = fx.imp("!Freeze for UnsafeCell<T>", 1, uc_p0, Some((freeze, &[])), &[], Default::default());
+    fx.set_polarity(neg, ImplPolarity::Negative);
+    let uc_u8 = fx.adt(uc, &[u8_]);
+    let cell_pair_ty = fx.tuple(&[uc_u8, u8_]);
+    fx.konst("CELL_PAIR", cell_pair_ty);
+
+    let aligned_ref = fx.r(Mutbl::Not, aligned_ty);
+    fx.konst("REF_CONST", aligned_ref);
+
+    let bytes_ref = fx.r(Mutbl::Not, bytes_arr);
+    let u8_ref = fx.r(Mutbl::Not, u8_);
+    let f_bytes = fx.func("f_bytes", 0, &[], bytes_ref, Default::default());
+    let f_pair = fx.func("f_pair", 0, &[], u8_ref, Default::default());
+    let f_cell = fx.func("f_cell", 0, &[], u8_ref, Default::default());
+    let f_deref = fx.func("f_deref", 0, &[], bytes_ref, Default::default());
+    fx.finish();
+
+    // Case 1: `&ALIGNED_BYTES.bytes` -> promoted.
+    let mut bb = Bb::new();
+    let base = bb.path(&["ALIGNED_BYTES"]);
+    let field = bb.e(crate::body::Expr::Field { base, name: crate::ids::Name::of("bytes") });
+    let r = bb.borrow(Mutbl::Not, field);
+    let root = bb.block(&[], Some(r));
+    let c = check_body(&fx, &bb, f_bytes, root, Plant::None, InferPlant::None);
+    assert!(c.diags.is_empty(), "f_bytes checks clean: {:?}", c.diags);
+    assert_eq!(&c.promoted[..], &[r][..], "`&ALIGNED_BYTES.bytes` must be promoted");
+
+    // Case 2: `&PAIR.0` -> promoted.
+    let mut bb = Bb::new();
+    let base = bb.path(&["PAIR"]);
+    let field = bb.e(crate::body::Expr::TupleField { base, index: 0 });
+    let r = bb.borrow(Mutbl::Not, field);
+    let root = bb.block(&[], Some(r));
+    let c = check_body(&fx, &bb, f_pair, root, Plant::None, InferPlant::None);
+    assert!(c.diags.is_empty(), "f_pair checks clean: {:?}", c.diags);
+    assert_eq!(&c.promoted[..], &[r][..], "`&PAIR.0` must be promoted");
+
+    // Case 3: `&CELL_PAIR.1` -> base is `!Freeze`, NOT promoted.
+    let mut bb = Bb::new();
+    let base = bb.path(&["CELL_PAIR"]);
+    let field = bb.e(crate::body::Expr::TupleField { base, index: 1 });
+    let r = bb.borrow(Mutbl::Not, field);
+    let root = bb.block(&[], Some(r));
+    let c = check_body(&fx, &bb, f_cell, root, Plant::None, InferPlant::None);
+    assert!(c.diags.is_empty(), "f_cell checks clean: {:?}", c.diags);
+    assert!(c.promoted.is_empty(), "field of `!Freeze` base must not be promoted: {:?}", c.promoted);
+
+    // Case 4: `&REF_CONST.bytes` -> auto-derefs `&AlignedBytes`, NOT promoted.
+    let mut bb = Bb::new();
+    let base = bb.path(&["REF_CONST"]);
+    let field = bb.e(crate::body::Expr::Field { base, name: crate::ids::Name::of("bytes") });
+    let r = bb.borrow(Mutbl::Not, field);
+    let root = bb.block(&[], Some(r));
+    let c = check_body(&fx, &bb, f_deref, root, Plant::None, InferPlant::None);
+    assert!(c.diags.is_empty(), "f_deref checks clean: {:?}", c.diags);
+    assert!(c.promoted.is_empty(), "field through deref must not be promoted: {:?}", c.promoted);
+}
