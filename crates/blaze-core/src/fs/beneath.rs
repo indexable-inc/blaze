@@ -452,7 +452,9 @@ pub(crate) fn entries_confined(
     let borrowed_raw = unsafe { libc::dirfd(guard.0) };
     #[expect(unsafe_code, reason = "borrowed_raw is the valid fd owned by guard for the loop duration")]
     let borrowed = unsafe { BorrowedFd::borrow_raw(borrowed_raw) };
+    const CONFINED_LISTING_MOST: usize = 65_536;
     let mut found = crate::ListingBuilder::new(name.share());
+    let mut seen: usize = 0;
     loop {
         // Clear errno before readdir so we distinguish end-of-stream (errno == 0) from IO error.
         #[cfg(target_os = "linux")]
@@ -480,6 +482,10 @@ pub(crate) fn entries_confined(
         if bytes == b"." || bytes == b".." {
             continue;
         }
+        if seen >= CONFINED_LISTING_MOST {
+            return Err(io::Error::other("confined directory listing exceeds entry limit"));
+        }
+        seen += 1;
         let stamp = super::stamp_at(borrowed.as_fd(), cname);
         found.push(bytes, stamp)?;
     }

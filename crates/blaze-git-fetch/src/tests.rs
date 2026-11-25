@@ -1083,6 +1083,14 @@ fn v1_pack_index_parses_searches_and_reads_objects() {
     assert_eq!(db.read_object(&oid_b, &mut src, &mut out), Ok(Some(Kind::Blob)));
     assert_eq!(out.as_slice(), blob_b);
 
+    // Flipping a bit in a v1 .idx OID table is caught by ObjectDb::new via trailer SHA-1 verification.
+    let mut flipped_v1 = idx.clone();
+    flipped_v1[1024 + 4] ^= 0x01;
+    assert!(matches!(
+        ObjectDb::new(&[(&flipped_v1, pack.len() as u64)], PACK, heap()),
+        Err((_, StoreWhy::Id { .. }))
+    ));
+
     // Non-v1 garbage of >= 1064 bytes with monotonic zeros (0 objects) + trailing extra bytes is rejected as IdxMagic.
     let mut bad = vec![0u8; 1065];
     bad[0] = 0;

@@ -128,6 +128,23 @@ impl<'i> Idx<'i> {
         self.count == 0
     }
 
+    /// Verifies the trailing 20-byte SHA-1 checksum over all preceding bytes of this index.
+    pub fn verify_checksum(&self) -> Result<(), (u64, StoreWhy)> {
+        let Some(body_len) = self.bytes.len().checked_sub(20) else {
+            return Err((0, StoreWhy::IdxShort));
+        };
+        let (Some(body), Some(trailer)) = (self.bytes.get(..body_len), self.bytes.get(body_len..)) else {
+            return Err((0, StoreWhy::IdxShort));
+        };
+        let Ok(want) = <[u8; 20]>::try_from(trailer) else {
+            return Err((0, StoreWhy::IdxShort));
+        };
+        if crate::sha1::sha1(body) != want {
+            return Err((u64::try_from(body_len).unwrap_or(u64::MAX), StoreWhy::Id { want: Oid(want) }));
+        }
+        Ok(())
+    }
+
     /// The `at`-th id in sorted order.
     pub fn id(&self, at: u32) -> &'i [u8] {
         if self.version == 1 {
@@ -437,6 +454,7 @@ impl<'i, A: Allocator + Copy> ObjectDb<'i, A> {
                 return Err((0, StoreWhy::Entry(PackWhy::Short)));
             }
             let idx = Idx::parse(idx_bytes, limits.most_objects)?;
+            idx.verify_checksum()?;
             parsed.push(PackTable { idx, pack_end: pack_len - 20, sorted_offsets: None });
         }
         Ok(ObjectDb { packs: parsed, limits, resolved_objects: 0, resolved_bytes: 0, alloc })
