@@ -153,7 +153,8 @@ fn a_struct_with_a_slice_tail_is_read_through_its_wide_pointer() {
         });
     }
     let croot = c.block(&[], sum);
-    let mut g = PortableTys::new_in(Alloc::global());
+    let heap = blaze_own::testing::heap();
+    let mut g = PortableTys::new_in(heap.alloc());
     let sum4 = build_instance(&w, &c, SUM4, croot, &[], &mut g).unwrap_or_else(|e| panic!("{e}"));
 
     let mut b = BodyBuf::new();
@@ -224,4 +225,79 @@ fn a_struct_with_a_slice_tail_is_read_through_its_wide_pointer() {
         assert_eq!(run_native_with(&host, &[(SUM4, None, &sum4), (MAIN, None, &built)]), 14437);
     }
     let _ = (built, sum4);
+}
+
+/// Nested unsized-tail struct field projection (`triomphe::HeaderSliceWithLengthProtected::length`):
+/// `#[repr(transparent)] struct Protected { inner: HeaderSlice }` where
+/// `#[repr(C)] struct HeaderSlice { header: HeaderWithLength, slice: [u8] }` and
+/// `#[repr(C)] struct HeaderWithLength { length: usize }`.
+/// Reading `self.inner.header.length` walks `self.inner` as an intermediate field base with no
+/// adjustments of its own; `walk/moves/boxes.rs` `path_steps` and `walk/moves.rs`
+/// `temp_field_path` must stop before asking `repr` of the unsized `self.inner` base (otherwise
+/// `scan_part_moves` refuses `self.inner.header.length` with `UNSIZED_BY_VALUE`).
+#[test]
+fn a_nested_unsized_tail_struct_field_projection_is_read_without_by_value_refusal() {
+    const HEADER: ItemKey = ItemKey(41);
+    const SLICE_HDR: ItemKey = ItemKey(42);
+    const PROTECTED: ItemKey = ItemKey(43);
+    const LENGTH: ItemKey = ItemKey(8);
+
+    let mut w = TestWorld::new();
+    w.func(1, "main", &[], USIZE);
+    w.generic_func(6, "transmute", 2, &[PNode::Param(0)], PNode::Param(1));
+    w.intrinsics.push((ItemKey(6), Intrinsic::Table(crate::intrinsics::Which::Transmute)));
+    w.strukt(41, "HeaderWithLength", &[("length", USIZE)]);
+    w.reprs.push((HEADER, ReprAttrs { c: true, ..ReprAttrs::RUST }));
+    let u8_w = w.ty(U8);
+    w.strukt(42, "HeaderSlice", &[("header", PNode::Adt(HEADER, List::EMPTY)), ("slice", PNode::Slice(u8_w))]);
+    w.reprs.push((SLICE_HDR, ReprAttrs { c: true, ..ReprAttrs::RUST }));
+    w.strukt(43, "Protected", &[("inner", PNode::Adt(SLICE_HDR, List::EMPTY))]);
+    w.reprs.push((PROTECTED, ReprAttrs { transparent: true, ..ReprAttrs::RUST }));
+    let ref_prot_w = w.ref_(Mutbl::Not, PNode::Adt(PROTECTED, List::EMPTY));
+    w.func(8, "length", &[ref_prot_w], USIZE);
+
+    // fn length(p: &Protected) -> usize { p.inner.header.length }
+    let mut lf = BodyBuf::new();
+    let p_pat = lf.bind("p");
+    lf.params.push(p_pat);
+    let p_e = lf.local(p_pat);
+    let inner = lf.field(p_e, "inner");
+    let hdr = lf.field(inner, "header");
+    let len = lf.field(hdr, "length");
+    let lroot = lf.block(&[], Some(len));
+    let heap = blaze_own::testing::heap();
+    let mut g = PortableTys::new_in(heap.alloc());
+    let length_built = build_instance(&w, &lf, LENGTH, lroot, &[], &mut g).unwrap_or_else(|e| panic!("{e}"));
+
+    // fn main() -> usize { let raw = [42usize, 0]; let p: &Protected = transmute((&raw as *const usize, 4usize)); length(p) }
+    let mut b = BodyBuf::new();
+    let usize_ty = b.types.intern(USIZE).expect("a type interns");
+    let p_usize = b.types.intern(PNode::Ptr(Mutbl::Not, usize_ty)).expect("a type interns");
+    let prot = b.types.intern(PNode::Adt(PROTECTED, List::EMPTY)).expect("a type interns");
+    let ref_prot = b.types.intern(PNode::Ref(Mutbl::Not, prot)).expect("a type interns");
+    let (raw, q, p) = (b.bind("raw"), b.bind("q"), b.bind("p"));
+    let e0 = b.int(42, Some(IntSuffix::Uint(UintTy::Usize)));
+    let e1 = b.int(0, Some(IntSuffix::Uint(UintTy::Usize)));
+    let arr = b.array(&[e0, e1]);
+    let raw_e = b.local(raw);
+    let ref_raw = b.e(Expr::Ref { mutbl: Mutbl::Not, operand: raw_e });
+    let q_init = b.call("transmute", &[ref_raw]);
+    let q_e = b.local(q);
+    let four = b.int(4, Some(IntSuffix::Uint(UintTy::Usize)));
+    let pair = b.tuple(&[q_e, four]);
+    let p_init = b.call("transmute", &[pair]);
+    let p_e = b.local(p);
+    let res = b.call("length", &[p_e]);
+    let root = b.block(
+        &[
+            Stmt::Let { pat: raw, ty: None, init: Some(arr), else_: None },
+            Stmt::Let { pat: q, ty: Some(p_usize), init: Some(q_init), else_: None },
+            Stmt::Let { pat: p, ty: Some(ref_prot), init: Some(p_init), else_: None },
+        ],
+        Some(res),
+    );
+    let built = build(&w, &b, root).unwrap_or_else(|e| panic!("{e}"));
+    #[cfg(target_arch = "aarch64")]
+    assert_eq!(run_native_with(&[], &[(LENGTH, None, &length_built), (MAIN, None, &built)]), 42);
+    let _ = (built, length_built);
 }

@@ -799,7 +799,15 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                     let col = self.checked.fields.column::<0>();
                     let row = col.binary_search(&cur).map_err(|_| malformed("a field access without its record row"))?;
                     let k = self.checked.fields.column::<2>()[row];
-                    let Repr::Agg(l) = self.adjusted_repr(base)? else { break None };
+                    // A temporary cannot be unsized; stop before `repr` refuses a nested DST
+                    // field base (`self.inner.header.owned`) with `UNSIZED_BY_VALUE`.
+                    let base_ty = self.adjusted_ty(base)?;
+                    let base_g = self.ground_ty(base_ty).map_err(|error| Self::ty_err(base, error))?;
+                    let base_ls = self.ls_of(base_g).map_err(|error| Self::ty_err(base, error))?;
+                    if self.ls.get(base_ls).tail != crate::layout::Tail::Sized {
+                        break None;
+                    }
+                    let Repr::Agg(l) = self.repr(base_g).map_err(|error| Self::ty_err(base, error))? else { break None };
                     if self.layouts[l as usize].is_union {
                         break None;
                     }

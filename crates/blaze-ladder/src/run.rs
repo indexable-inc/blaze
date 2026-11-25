@@ -525,13 +525,28 @@ impl ClosureTable {
 /// taken again: an instance question's `Missing` (an answer no check made), or an ADT whose
 /// row is not made (`NoAdt`: the lazy program's `adt` noted its head). A front end that noted
 /// nothing makes nothing, and `e` is the refusal.
+fn build_error_asks_again(error: &BuildError) -> bool {
+    matches!(error, BuildError::Select(blaze_typeck::ResolveError::Missing(_)) | BuildError::NoAdt { .. })
+}
+
+fn layout_refusal_asks_again(why: &blaze_build::layout::Refusal) -> bool {
+    use blaze_build::layout::Refusal;
+    match why {
+        Refusal::NoAdt(_) | Refusal::Missing(_) => true,
+        Refusal::Ground(error) | Refusal::FieldGround { error, .. } => build_error_asks_again(error),
+        _ => false,
+    }
+}
+
 fn asks_again(e: &RunError) -> bool {
-    matches!(
-        e,
-        RunError::Build { error: BuildError::Select(blaze_typeck::ResolveError::Missing(_)) | BuildError::NoAdt { .. }, .. }
-            | RunError::Resolve { error: blaze_typeck::ResolveError::Missing(_), .. }
-            | RunError::NoAdt { .. }
-    )
+    match e {
+        RunError::Build { error, .. } => build_error_asks_again(error),
+        RunError::Resolve { error: blaze_typeck::ResolveError::Missing(_), .. } => true,
+        RunError::NoAdt { .. } => true,
+        RunError::Vtable { why: VtableFail::Layout(error), .. } => layout_refusal_asks_again(&error.why),
+        RunError::Vtable { why: VtableFail::Build(error), .. } => build_error_asks_again(error),
+        _ => false,
+    }
 }
 
 fn normalized<P: FrontEnd>(program: &P, trait_: ItemKey, name: blaze_typeck::Name, args: &[PTy], ground: &mut PortableTys<'_>) -> Result<PTy, BuildError> {

@@ -1885,6 +1885,147 @@ pub extern \"C-unwind\" fn main() -> i32 {
     assert_eq!(declared_count, 1, "META declares the vtable's Callsite::id method instance");
 }
 
+/// A fresh pooled `Maker` whose first job is a static holding `&dyn Trait` (`entry = None`, so
+/// `program.fn_count() == 0` and the concrete ADT + nested field ADTs have never been loaded by
+/// any checked fn) MUST:
+/// 1. Seed a fn row and build the carried vtable datum (never skipping `vtable_rows` and emitting
+///    an entry with `Space::Vtable` + 0 carried datums, which poisons CAS -> `StaticUnsent`), and
+/// 2. Retry `VtableFail::Layout(NoAdt)` via `asks_again` / `make_asked` until all ADTs in the
+///    concrete type's layout are loaded.
+#[test]
+fn a_fresh_maker_with_no_fns_builds_static_dyn_vtable_and_loads_missing_adts() {
+    use blaze_code::datum::Place;
+    use blaze_code::record::Space;
+    use blaze_ladder::body_ids::{Fixture as GrantFixture, Make};
+    use blaze_ladder::code_records::statics::{StaticEntryView, each_vtable_datum};
+
+    const FRESH_STATIC_DYN: &str = "#![feature(no_core, lang_items)]
+#![no_core]
+#![no_main]
+#![allow(internal_features)]
+
+#[lang = \"pointee_sized\"]
+trait PointeeSized {}
+#[lang = \"meta_sized\"]
+trait MetaSized: PointeeSized {}
+#[lang = \"sized\"]
+trait Sized: MetaSized {}
+#[lang = \"legacy_receiver\"]
+trait LegacyReceiver: PointeeSized {}
+impl<T: PointeeSized> LegacyReceiver for &T {}
+#[lang = \"copy\"]
+trait Copy {}
+impl Copy for u32 {}
+impl<T: PointeeSized> Copy for &T {}
+#[lang = \"unsize\"]
+trait Unsize<T: PointeeSized>: PointeeSized {}
+#[lang = \"coerce_unsized\"]
+trait CoerceUnsized<T: PointeeSized> {}
+impl<'a, 'b: 'a, T: PointeeSized + Unsize<U>, U: PointeeSized> CoerceUnsized<&'a U> for &'b T {}
+#[lang = \"dispatch_from_dyn\"]
+trait DispatchFromDyn<T> {}
+impl<'a, T: PointeeSized + Unsize<U>, U: PointeeSized> DispatchFromDyn<&'a U> for &'a T {}
+
+trait Callsite {
+    fn id(&self) -> u32;
+}
+
+struct Inner {
+    val: u32,
+}
+
+struct MyCallsite {
+    inner: Inner,
+}
+
+struct Meta<'a> {
+    callsite: &'a dyn Callsite,
+}
+
+impl Callsite for MyCallsite {
+    fn id(&self) -> u32 {
+        self.inner.val
+    }
+}
+
+static CALLSITE: MyCallsite = MyCallsite { inner: Inner { val: 7 } };
+static META: Meta<'static> = Meta { callsite: &CALLSITE };
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    META.callsite.id() as i32
+}
+";
+
+    struct FreshStaticMaker<'n> {
+        names: NamesRecords<'n>,
+        fns: Maker<'n>,
+        b: Builder,
+    }
+    impl Make for FreshStaticMaker<'static> {
+        type Error = blaze_ladder::run::RunError;
+        type Grant = GrantFixture;
+        fn make(&mut self, grant: &Self::Grant, tabled: ItemKey, name: &[u8], entry: &mut blaze_own::Vec<u8, Alloc<'_>>) -> Result<(), Self::Error> {
+            self.fns.make(grant, tabled, name, entry)
+        }
+        fn make_static(&mut self, grant: &Self::Grant, item: ItemKey, entry: &mut blaze_own::Vec<u8, Alloc<'_>>) -> Result<(), Self::Error> {
+            // Fresh pooled worker: `entry = None` -> `program.fn_count() == 0` and no ADTs loaded yet.
+            let mut fresh = Maker::new(self.names, None, &self.b, alloc());
+            fresh.make_static(grant, item, entry)
+        }
+        fn make_thread_local(&mut self, grant: &Self::Grant, item: ItemKey, entry: &mut blaze_own::Vec<u8, Alloc<'_>>) -> Result<(), Self::Error> {
+            self.fns.make_thread_local(grant, item, entry)
+        }
+        fn verify_keyed(&mut self, key: blaze_ladder::code_records::CodeKey, under: blaze_ladder::code_records::CodeKey, tabled: ItemKey, name: &[u8], entry: &[u8]) -> Result<Option<blaze_ladder::code_records::reads::Verdict>, Self::Error> {
+            self.fns.verify_keyed(key, under, tabled, name, entry)
+        }
+    }
+
+    let f = fixture(FRESH_STATIC_DYN);
+    let main = fn_named(&f, "main");
+    let meta_key = {
+        let records = reader(&f).records;
+        let mut found = None;
+        assert!(records.each_item(0, &mut |key, _| {
+            if records.name_of(key) == Some("META") {
+                found = Some(checker_of(key));
+            }
+        }));
+        found.expect("META item key")
+    };
+    let mut store = MemoryStore::new_in(alloc());
+    let names = reader(&f);
+    let mut maker = FreshStaticMaker { names, fns: Maker::new(names, Some(main), &builder(), alloc()), b: builder() };
+    let (walk, _) = walk_records(main, &EveryItem, &mut store, &builder(), &producer(), &mut maker, alloc()).unwrap_or_else(|e| {
+        panic!("walk_records with fresh static Maker failed: {e}");
+    });
+    let meta_row = (0..walk.len()).find(|&r| walk.tabled(r) == meta_key).expect("META reached");
+    let meta_bytes = store.get(walk.key(meta_row).expect("META keyed")).expect("store reads").expect("META put");
+    let view = StaticEntryView::read(meta_bytes).expect("META static entry reads");
+    let mut vtable_sym = None;
+    for i in 0..view.datum.targets() {
+        let t = view.datum.target(i);
+        if t.space == Space::Vtable {
+            vtable_sym = Some(t.symbol);
+        }
+    }
+    let vtable_sym = vtable_sym.expect("META datum targets a vtable");
+    let mut carried = 0usize;
+    each_vtable_datum(
+        meta_bytes,
+        |sym, bytes| -> Result<(), ()> {
+            let dv = blaze_code::datum::DatumView::read(bytes).expect("vtable datum reads");
+            assert_eq!(sym, vtable_sym);
+            assert_eq!((dv.place(), dv.bytes().len(), dv.words()), (Place::ReadOnly, 32, 1));
+            carried += 1;
+            Ok(())
+        },
+        |e| panic!("META vtables: {e}"),
+    )
+    .expect("read META vtables");
+    assert_eq!(carried, 1, "META static entry carries its vtable datum even on a fresh Maker with fn_count == 0");
+}
+
 /// The pinned std's `panicking::catch_unwind` in miniature (library/std/src/panicking.rs): a
 /// cfg'd-out twin of the same name before it, then a body declaring `union Data<F, R>` with
 /// `ManuallyDrop` fields, writing `Data { f: ManuallyDrop::new(f) }`, passing `&raw mut data` to

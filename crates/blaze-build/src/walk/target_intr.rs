@@ -219,12 +219,15 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     fn neon_intrinsic(&mut self, e: ExprId, list: &[ExprId], t: Target, call: NeonCall) -> Result<(), BuildError> {
         let operands = call.operands();
         let spec = VectorIntrinsic {
-            operands: &operands,
+            operands,
             result: call.shape(),
             takes_imm: false,
-            arity_why: "a call with other than its function's two operands",
+            arity_why: "a call with other than its function's number of operands",
         };
-        self.vector_intrinsic(e, list, t, spec, |b, v, _| Ok(intrinsics::target::neon::build(b, call, v[0], v[1])))
+        self.vector_intrinsic(e, list, t, spec, |b, v, _| {
+            intrinsics::target::neon::build(b, call, v)
+                .ok_or(malformed("a NEON call built with other than its operand count (a build bug)"))
+        })
     }
 
     /// SHA3 call `e` (`t` is `Target::Sha3(call)`): each vector operand loaded whole as the LIR

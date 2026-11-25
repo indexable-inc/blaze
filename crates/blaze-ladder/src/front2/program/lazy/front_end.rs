@@ -350,14 +350,16 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
     fn caller_site(&self, owner: ItemKey, expr: ExprId) -> Result<blaze_build::CallerSite<'_>, blaze_build::SiteGap> {
         let live = self.live_by_key(owner).ok_or(blaze_build::SiteGap::NotLive { owner })?;
         let anchor_owner = live.made.param_subst.as_ref().map_or(owner, |(orig, _)| *orig);
-        super::seam_rules::caller_site(self.front.names, &self.front.keys, &self.store, anchor_owner, &live.made, expr)
+        let mut cache = self.site_cache.borrow_mut();
+        super::seam_rules::caller_site(self.front.names, &self.front.keys, &self.store, anchor_owner, &live.made, expr, Some(&mut cache))
     }
 
     /// By program/seam_rules.rs `def_site`, from `item`'s head and the names source: no body
     /// is read (a `Fn*` method has none).
     fn def_site(&self, item: ItemKey) -> Result<blaze_build::CallerSite<'_>, blaze_build::SiteGap> {
         let anchor = self.spec_orig(item).unwrap_or(item);
-        super::seam_rules::def_site(self.front.names, &self.front.keys, &self.store, anchor)
+        let mut cache = self.site_cache.borrow_mut();
+        super::seam_rules::def_site(self.front.names, &self.front.keys, &self.store, anchor, Some(&mut cache))
     }
 
     /// From `owner`'s live body by program/seam_rules.rs `expr_offset`: no file asked, so a
@@ -370,7 +372,8 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
     /// program/seam_rules.rs `source_position`: the item's first byte today and today's text of
     /// its file, from the names source (over records, item_grain.rs `row_now` and `file_now`).
     fn source_position(&self, item: ItemKey, site: u32) -> Result<(u32, u32), crate::seam::PositionGap> {
-        super::seam_rules::source_position(self.front.names, &self.front.keys, &self.store, item, site)
+        let mut cache = self.site_cache.borrow_mut();
+        super::seam_rules::source_position(self.front.names, &self.front.keys, &self.store, item, site, Some(&mut cache))
     }
 
     /// The start [`LazyProgram::decide_start`] decided, when it is a Rust start.

@@ -39,28 +39,34 @@ fn call(name: &str) -> NeonCall {
     }
 }
 
-/// The result of `call` of the 16 bytes `a` and `x` (an 8-byte operand reads their first 8),
+/// The result of `call` of the 16-byte operands `ops` (an 8-byte operand reads its first 8),
 /// as its 16 bytes (an 8-byte result: its first 8, the rest 0).
-fn run(call: NeonCall, a: [u8; 16], x: [u8; 16]) -> [u8; 16] {
+fn run_ops(call: NeonCall, ops: &[[u8; 16]]) -> [u8; 16] {
     let mut out = [0u8; 16];
     let words = (call.shape().bytes() / 8) as usize;
     for word in 0..words {
-        let bits = word_of(call, a, x, (word * 8) as i32);
+        let bits = word_of_ops(call, ops, (word * 8) as i32);
         out[word * 8..word * 8 + 8].copy_from_slice(&bits.to_le_bytes());
     }
     out
 }
 
-/// The 8 bytes at `at` of the result of `call` of `a` and `x`.
-fn word_of(call: NeonCall, a: [u8; 16], x: [u8; 16], at: i32) -> u64 {
+/// The result of `call` of the 16 bytes `a` and `x` (an 8-byte operand reads their first 8),
+/// as its 16 bytes (an 8-byte result: its first 8, the rest 0).
+fn run(call: NeonCall, a: [u8; 16], x: [u8; 16]) -> [u8; 16] {
+    run_ops(call, &[a, x])
+}
+
+/// The 8 bytes at `at` of the result of `call` of `ops`.
+fn word_of_ops(call: NeonCall, ops: &[[u8; 16]], at: i32) -> u64 {
     let heap = blaze_own::testing::heap();
     let mut b = Builder::<Global, Full>::new_in(64, Global);
     let sig = b.sig(Conv::C, Variadic::No, &[], &[Param::of(Ty::I64)]);
     b.set_signature(sig);
     let entry = b.create_block(BlockKind::Normal);
     b.begin(entry);
-    let mut operands = [None; 2];
-    for (k, (bytes, shape)) in [a, x].iter().zip(call.operands()).enumerate() {
+    let mut operands = Vec::new();
+    for (bytes, &shape) in ops.iter().zip(call.operands()) {
         // 16 bytes at a 16-byte alignment (log2 4): every shape's load is aligned.
         let slot = b.slot(16, 4, SlotKind::Temp);
         let addr = b.slot_addr(slot);
@@ -68,10 +74,9 @@ fn word_of(call: NeonCall, a: [u8; 16], x: [u8; 16], at: i32) -> u64 {
             let v = b.iconst(Ty::I8, u128::from(byte));
             b.store(Flags::NONE, v, addr, i as i32, MemAttrs::aligned(0));
         }
-        operands[k] = Some(b.load(shape.ty(), Flags::NONE, addr, 0, MemAttrs::aligned(4)));
+        operands.push(b.load(shape.ty(), Flags::NONE, addr, 0, MemAttrs::aligned(4)));
     }
-    let [Some(va), Some(vx)] = operands else { panic!("two operands") };
-    let r = super::neon::build(&mut b, call, va, vx);
+    let r = super::neon::build(&mut b, call, &operands).expect("matching operand count");
     let slot = b.slot(16, 4, SlotKind::Temp);
     let addr = b.slot_addr(slot);
     b.store(Flags::NONE, r, addr, 0, MemAttrs::aligned(4));
@@ -115,19 +120,23 @@ fn every_neon_name_round_trips() {
         let name = c.link_name();
         assert_eq!(named(name), Ok(Target::Neon(c)), "{name}");
         assert_eq!(Target::Neon(c).link_name(), name);
-        let [a, x] = c.operands();
-        assert!(a.bytes() == 8 || a.bytes() == 16, "{name}");
-        assert!(x.bytes() == 8 || x.bytes() == 16, "{name}");
+        for &op in c.operands() {
+            assert!(op.bytes() == 8 || op.bytes() == 16, "{name}");
+        }
         seen += 1;
     }
-    assert_eq!(seen, 42);
+    assert_eq!(seen, 46);
     let tbl = call("llvm.aarch64.neon.tbl1.v16i8");
     assert_eq!((tbl.func(), tbl.shape()), (NeonFn::Tbl1, IntShape::V16I8));
+    let tbx = call("llvm.aarch64.neon.tbx1.v16i8");
+    assert_eq!((tbx.func(), tbx.shape()), (NeonFn::Tbx1, IntShape::V16I8));
+    let tbl2 = call("llvm.aarch64.neon.tbl2.v16i8");
+    assert_eq!((tbl2.func(), tbl2.shape()), (NeonFn::Tbl2, IntShape::V16I8));
     let ushl = call("llvm.aarch64.neon.ushl.v2i64");
     assert_eq!((ushl.func(), ushl.shape(), ushl.shape().lanes(), ushl.shape().width()), (NeonFn::Ushl, IntShape::V2I64, 2, 64));
     let refused = named("llvm.aarch64.neon.tbl1.v4i16").expect_err("tbl1 is declared at v8i8 and v16i8 only");
     assert_eq!(refused.to_string(), "`llvm.aarch64.neon.tbl1.v4i16` is not a target intrinsic blaze knows");
-    assert!(named("llvm.aarch64.neon.tbl2.v16i8").is_err(), "a two-register table is not in the set");
+    assert!(named("llvm.aarch64.neon.tbl3.v16i8").is_err(), "a three-register table is not in the set");
     println!("{seen} NEON names, each its own; llvm.aarch64.neon.tbl1.v4i16 refused");
 }
 
@@ -177,7 +186,7 @@ fn table_lookup_and_register_shifts() {
     let slot = b.slot(16, 4, SlotKind::Temp);
     let addr = b.slot_addr(slot);
     let v = b.load(IntShape::V16I8.ty(), Flags::NONE, addr, 0, MemAttrs::aligned(4));
-    let r = super::neon::build(&mut b, call("llvm.aarch64.neon.tbl1.v16i8"), v, v);
+    let r = super::neon::build(&mut b, call("llvm.aarch64.neon.tbl1.v16i8"), &[v, v]).expect("two operands");
     b.store(Flags::NONE, r, addr, 0, MemAttrs::aligned(4));
     b.ret(&[]);
     let f: Func<Global> = b.finish_checked().expect("the built function verifies");
@@ -224,4 +233,27 @@ fn pairwise_maximum_and_minimum() {
     let s = run(call("llvm.aarch64.neon.sminp.v16i8"), a, x);
     assert_eq!((u[0], s[0], u[8]), (0x80, 0x80, 37));
     println!("umaxp.v16i8 = {u:?}; sminp.v16i8 = {s:?}");
+}
+
+/// `tbx1` keeps the corresponding lane of `default` for out-of-range indices (`>= 16`), and
+/// `tbl2` indexes a 32-byte table across two registers (`0..16` in `table0`, `16..32` in `table1`,
+/// `>= 32` -> 0).
+#[test]
+fn table_lookup_ext_and_two_register_table() {
+    let default: [u8; 16] = core::array::from_fn(|i| 0xa0 + i as u8);
+    let table0: [u8; 16] = core::array::from_fn(|i| 10 + i as u8);
+    let table1: [u8; 16] = core::array::from_fn(|i| 50 + i as u8);
+    let index: [u8; 16] = [0, 15, 16, 255, 3, 17, 31, 32, 128, 7, 20, 0, 16, 31, 32, 15];
+
+    let tbx16 = run_ops(call("llvm.aarch64.neon.tbx1.v16i8"), &[default, table0, index]);
+    assert_eq!(tbx16, [10, 25, 0xa2, 0xa3, 13, 0xa5, 0xa6, 0xa7, 0xa8, 17, 0xaa, 10, 0xac, 0xad, 0xae, 25]);
+
+    let tbx8 = run_ops(call("llvm.aarch64.neon.tbx1.v8i8"), &[default, table0, index]);
+    assert_eq!(tbx8, [10, 25, 0xa2, 0xa3, 13, 0xa5, 0xa6, 0xa7, 0, 0, 0, 0, 0, 0, 0, 0]);
+
+    let tbl2_16 = run_ops(call("llvm.aarch64.neon.tbl2.v16i8"), &[table0, table1, index]);
+    assert_eq!(tbl2_16, [10, 25, 50, 0, 13, 51, 65, 0, 0, 17, 54, 10, 50, 65, 0, 25]);
+
+    let tbl2_8 = run_ops(call("llvm.aarch64.neon.tbl2.v8i8"), &[table0, table1, index]);
+    assert_eq!(tbl2_8, [10, 25, 50, 0, 13, 51, 65, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
 }

@@ -493,9 +493,12 @@ fn take<'a>(
     }
 }
 
-/// An input, once: a second mention keeps the first position.
+/// An input, once per outputs record: a second mention of the same archive from the same crate's
+/// script outputs keeps the first position, whereas two distinct versions of a crate sharing a
+/// bare package name and archive filename (e.g. `secp256k1-sys` 0.10 and 0.14 both producing
+/// `libsecp256k1.a`) have different `outputs` record IDs and must both stay on the link line.
 fn add_input<'a>(line: &mut LinkLine<'a>, input: LineInput<'a>) -> Result<(), NativeError<'a>> {
-    if let Some(first) = line.inputs.iter_mut().find(|first| first.from == input.from) {
+    if let Some(first) = line.inputs.iter_mut().find(|first| first.outputs == input.outputs && first.from == input.from) {
         first.whole |= input.whole;
         return Ok(());
     }
@@ -914,5 +917,39 @@ mod tests {
         let installs = linked(&[("c", LIBSYSTEM)], alloc);
         let got = native_key(&NativeInputs { platform: Platform::MacosArm64, producer, crates: &crates, installs: &installs }, alloc).err();
         assert_eq!(got, expected);
+    }
+
+    /// Two semver-distinct copies of a crate (e.g. `secp256k1-sys` 0.10 and 0.14) share the same
+    /// bare crate name (`secp256k1_sys`) and archive filename (`libsecp256k1.a`), but each has its
+    /// own build-script `outputs` `ContentId`. Both archives must stay on the link line, while a
+    /// duplicate link request for the same outputs record still collapses into one input.
+    #[test]
+    fn two_versions_of_same_crate_keep_distinct_archives() {
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let bump = erased.bump();
+        let alloc = bump.alloc();
+        let producers = Producers::for_tests(b"natives");
+        let producer = producers.get::<Whole>();
+        let links = links("", bump);
+        let stdout = "cargo:rustc-link-lib=static=secp256k1\ncargo:rustc-link-search=native=/out\n";
+        let dup_stdout = "cargo:rustc-link-lib=static=secp256k1\ncargo:rustc-link-lib=static:+whole-archive=secp256k1\ncargo:rustc-link-search=native=/out\n";
+        let v10 = record(stdout, &[("libsecp256k1.a", b"!<arch>\nv10")], alloc);
+        let v14 = record(dup_stdout, &[("libsecp256k1.a", b"!<arch>\nv14")], alloc);
+        let out10 = OutputsRef::open(&v10).unwrap_or_else(|e| panic!("{e:?}"));
+        let out14 = OutputsRef::open(&v14).unwrap_or_else(|e| panic!("{e:?}"));
+        let crates = [
+            CrateNative { package: "secp256k1_sys", outputs: Some((ContentId([10; 32]), out10)), links: &links },
+            CrateNative { package: "secp256k1_sys", outputs: Some((ContentId([14; 32]), out14)), links: &links },
+        ];
+        let line = link_line(&NativeInputs { platform: Platform::MacosArm64, producer: &producer, crates: &crates, installs: &[] }, alloc)
+            .unwrap_or_else(|e| panic!("link_line refused: {e:?}"));
+        assert_eq!(line.inputs.len(), 2, "both secp256k1_sys versions' archives must stay on the link line");
+        assert_eq!(line.inputs[0].outputs, ContentId([10; 32]));
+        assert_eq!(line.inputs[0].bytes, b"!<arch>\nv10");
+        assert!(!line.inputs[0].whole);
+        assert_eq!(line.inputs[1].outputs, ContentId([14; 32]));
+        assert_eq!(line.inputs[1].bytes, b"!<arch>\nv14");
+        assert!(line.inputs[1].whole, "duplicate mention from the same outputs record still merges +whole-archive");
     }
 }
