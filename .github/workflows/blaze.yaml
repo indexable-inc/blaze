@@ -160,9 +160,9 @@ jobs:
           cargo +"$tc" fetch --locked --quiet
           reg="$(ls -d "${CARGO_HOME:-$HOME/.cargo}"/registry/cache/index.crates.io-* | head -n 1)"
           if [ -f "$shelf/$pinned" ]; then
-            "$BLAZE_SCRIPTS/toolchain_cut" "{\"tree\": \".\", \"targets\": [\"aarch64-apple-darwin\", \"aarch64-unknown-linux-gnu\"], \"registry\": \"$reg\", \"shelf\": \"$shelf\", \"write_pin\": false, \"check\": true, \"macro_side\": true}"
+            "$BLAZE_SCRIPTS/toolchain_cut" "{\"tree\": \".\", \"targets\": [\"aarch64-apple-darwin\", \"aarch64-unknown-linux-gnu\", \"x86_64-unknown-linux-gnu\"], \"registry\": \"$reg\", \"shelf\": \"$shelf\", \"write_pin\": false, \"check\": true, \"macro_side\": true}"
           else
-            "$BLAZE_SCRIPTS/toolchain_cut" "{\"tree\": \".\", \"targets\": [\"aarch64-apple-darwin\", \"aarch64-unknown-linux-gnu\"], \"registry\": \"$reg\", \"shelf\": \"$shelf\", \"write_pin\": false, \"check\": false, \"macro_side\": true}"
+            "$BLAZE_SCRIPTS/toolchain_cut" "{\"tree\": \".\", \"targets\": [\"aarch64-apple-darwin\", \"aarch64-unknown-linux-gnu\", \"x86_64-unknown-linux-gnu\"], \"registry\": \"$reg\", \"shelf\": \"$shelf\", \"write_pin\": false, \"check\": false, \"macro_side\": true}"
             if [ ! -f "$shelf/$pinned" ]; then
               echo "::error::crates/blaze-toolchain/PINNED ($pinned) does not match toolchain_cut output" >&2
               exit 1

@@ -42,7 +42,7 @@ IMMUTABLE = "public,max-age=31536000,immutable"
 FRESH = "public,max-age=60"
 TAG = re.compile(r"v\d+\.\d+\.\d+")
 # What a release publishes (release.yaml's `publish`), by name: nothing else in its directory is put.
-RELEASE_ASSET = re.compile(r"blaze-v\d+\.\d+\.\d+-[a-z0-9_]+-[a-z0-9_-]+\.tar\.(gz|xz)(\.sha256)?|SHA256SUMS|B3SUMS|library-[0-9a-f]{64}\.tar\.xz")
+RELEASE_ASSET = re.compile(r"blaze-v\d+\.\d+\.\d+-[a-z0-9_]+-[a-z0-9_-]+\.tar\.(gz|xz)(\.sha256)?|SHA256SUMS|B3SUMS|library-[0-9a-f]{64}\.tar\.xz|toolchain-v\d+\.\d+\.\d+\.tar\.xz")
 # A native archive's name ends in its sha256's first 16 hex digits (llvm.py archive_stem).
 NATIVE = re.compile(r"[A-Za-z0-9._-]+-[0-9a-f]{16}\.tar\.xz")
 CHANNELS = ("stable", "canary")

@@ -309,6 +309,40 @@ fi
 # earlier `blaze update` installed goes; and a canary install has `blaze update` follow canary,
 # unless its settings name a channel already.
 blaze_home="${BLAZE_HOME:-$HOME/.blaze}"
+
+# v2 releases publish the content-addressed standard-library toolchain beside
+# the binary. Install it before the first command; `blaze toolchain` only names
+# the pinned nightly and cannot manufacture these records.
+if [ -z "$NO_TOOLCHAIN" ] && [ -n "$tag" ] && [ -f "$tmp/SHA256SUMS" ]; then
+    toolchain_asset="toolchain-$tag.tar.xz"
+    if awk -v n="$toolchain_asset" '$2 == n || $2 == "*" n { found = 1 } END { exit !found }' "$tmp/SHA256SUMS"; then
+        step "downloading $toolchain_asset"
+        fetch "$RELEASES/$tag/$toolchain_asset" "$tmp/$toolchain_asset" 2>"$tmp/error" ||
+            fail "the toolchain download stopped before it finished; nothing was installed from it." "$(cat "$tmp/error")"
+        want=$(awk -v n="$toolchain_asset" '$2 == n || $2 == "*" n { print $1; exit }' "$tmp/SHA256SUMS")
+        got=$(sha256 "$tmp/$toolchain_asset")
+        [ "$got" = "$want" ] || fail "the toolchain archive failed its release checksum." "$toolchain_asset: sha256 $got, expected $want"
+        mkdir "$tmp/toolchain-shelf"
+        tar -xof "$tmp/$toolchain_asset" -C "$tmp/toolchain-shelf" 2>"$tmp/error" ||
+            fail "the toolchain archive could not be unpacked." "$(cat "$tmp/error")"
+        shelf="$blaze_home/v2/toolchain"
+        mkdir -p "$shelf"
+        for record in "$tmp/toolchain-shelf"/*; do
+            [ -f "$record" ] || fail "the toolchain archive holds a non-file entry." "$record"
+            name=$(basename "$record")
+            [ "${#name}" -eq 64 ] || fail "the toolchain archive holds an invalid record name." "$name"
+            case "$name" in *[!0-9a-f]*) fail "the toolchain archive holds an invalid record name." "$name" ;; esac
+            if [ -f "$shelf/$name" ]; then
+                [ "$(sha256 "$shelf/$name")" = "$(sha256 "$record")" ] ||
+                    fail "an installed toolchain record differs from the release's write-once record." "$shelf/$name"
+            else
+                cp "$record" "$shelf/.$name.blaze-new"
+                mv -f "$shelf/.$name.blaze-new" "$shelf/$name"
+            fi
+        done
+        step "installed the v2 toolchain records in $shelf"
+    fi
+fi
 rm -f "$blaze_home/default"
 # config.toml read as TOML enough for this: a table header (comments after it allowed), and the key
 # `channel` in the table [update] (or `update.channel` before any table); a commented line is no key.
