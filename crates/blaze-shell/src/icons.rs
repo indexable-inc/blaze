@@ -26,6 +26,7 @@ pub enum Icon {
     Grid,
     Table,
     Search,
+    Stash,
 }
 
 /// Infer the best semantic icon and restrained `ix.dev/blaze` accent color for a filesystem entry.
@@ -369,6 +370,14 @@ pub fn draw_icon(
             let my = y + s * 0.43;
             scene.over_ring(mx, my, r, t, color, clip_id);
             scene.line(mx + r * 0.72, my + r * 0.72, x + s * 0.88, y + s * 0.88, t * 1.15, color, clip_id);
+        }
+        Icon::Stash => {
+            // Crisp stacked layers icon representing git stash entries (replaces ANSI `[$N]`).
+            let lx0 = x + s * 0.14;
+            let lx1 = x + s * 0.86;
+            scene.line(lx0, y + s * 0.28, lx1, y + s * 0.28, t * 1.05, color, clip_id);
+            scene.line(lx0 + s * 0.06, y + s * 0.52, lx1 - s * 0.06, y + s * 0.52, t * 1.05, color, clip_id);
+            scene.line(lx0 + s * 0.12, y + s * 0.76, lx1 - s * 0.12, y + s * 0.76, t * 1.05, color, clip_id);
         }
     }
 }

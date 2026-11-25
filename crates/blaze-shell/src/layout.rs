@@ -82,21 +82,18 @@ pub fn build_scene(input: &LayoutInput<'_>) -> Scene {
     let blocks = input.store.active_blocks();
 
     let mut content_y = 8.0f32;
-    let mut prev_cwd: Option<&str> = None;
     for (idx, blk) in blocks.iter().enumerate() {
         if idx > 0 {
             let sep_y = feed_top + content_y - input.scroll_y;
             scene.line(col_x0, sep_y, col_x1, sep_y, 1.0, theme::LINE_FAINT, feed_clip);
             content_y += BLOCK_PAD_Y;
         }
-        let show_context = prev_cwd != Some(blk.prompt_snapshot.cwd_display.as_str());
-        prev_cwd = Some(blk.prompt_snapshot.cwd_display.as_str());
-
+        // Always keep the context capsule on every command block (never vanishes after running).
         let draw_y = feed_top + content_y - input.scroll_y;
         let h = layout_block(
             &mut scene,
             blk,
-            show_context,
+            true,
             col_x0,
             draw_y,
             col_x1,
@@ -246,9 +243,9 @@ fn layout_top_bar(
         ix += dir_txt.chars().count() as f32 * m.cw;
         if !branch_part.is_empty() {
             ix += 14.0;
-            draw_icon(scene, Icon::Branch, ix, icon_y, icon_s, theme::PROMPT_BRANCH, 0);
+            draw_icon(scene, Icon::Branch, ix, icon_y, icon_s, theme::INK_3, 0);
             ix += icon_s + 5.0;
-            scene.text(ix, mid_y, branch_part, theme::PROMPT_BRANCH, false, false, 0);
+            scene.text(ix, mid_y, branch_part, theme::INK_2, false, false, 0);
             ix += branch_part.chars().count() as f32 * m.cw;
             if shown_top_icons > 0 {
                 ix += 8.0;
@@ -258,7 +255,7 @@ fn layout_top_bar(
                     ix += mini_icon_s + 2.5;
                 }
                 if !dirty_count_str.is_empty() {
-                    scene.text(ix + 2.0, mid_y, &dirty_count_str, theme::PROMPT_STATUS, false, false, 0);
+                    scene.text(ix + 2.0, mid_y, &dirty_count_str, theme::INK_3, false, false, 0);
                 }
             }
         }
@@ -296,8 +293,9 @@ fn layout_top_bar(
     }
 }
 
-/// Draw an upgraded Starship context line (`folder dir on  branch [🦀 🇹 6] · 🦀`) powered by
-/// `blaze-git` + custom IntelliJ SVG icons for uncommitted file types & detected project toolchains.
+/// Draw a bespoke, monochrome-first native GPU prompt capsule with 1px hairline dividers,
+/// Retina IntelliJ file icons for uncommitted files, SDF stash/divergence marks, and project
+/// toolchain icons — replacing primitive ANSI rainbow Starship text.
 #[allow(clippy::too_many_arguments)]
 fn layout_starship_line(
     scene: &mut Scene,
@@ -307,134 +305,206 @@ fn layout_starship_line(
     max_w: f32,
     m: CellMetrics,
     clip_id: u32,
-) {
-    let icon_s = 13.5;
-    let mut cx = x0;
-    let iy = y + (m.ch - icon_s) * 0.5;
-    scene.svg_icon(cx, iy, icon_s, "folder_macos", clip_id);
-    cx += icon_s + 6.0;
+    is_live: bool,
+) -> f32 {
+    let cap_h = m.ch + 4.0;
+    let ty = y + 2.0;
+    let pad_x = 8.0;
+    let sep_pad = 8.0;
+    let folder_s = 12.5;
+    let branch_s = 11.0;
+    let file_s = 12.0;
+    let tool_s = 11.5;
+
+    let (cap_bg, cap_bd, sep_col, dir_col, branch_col, meta_col, icon_alpha) = if is_live {
+        (
+            theme::rgb(0x16, 0x16, 0x18),
+            theme::rgb(0x28, 0x28, 0x2c),
+            theme::rgb(0x26, 0x26, 0x2a),
+            theme::INK_1,
+            theme::INK_2,
+            theme::INK_3,
+            1.0f32,
+        )
+    } else {
+        (
+            theme::rgb(0x13, 0x13, 0x15),
+            theme::rgb(0x1e, 0x1e, 0x21),
+            theme::rgb(0x1f, 0x1f, 0x22),
+            theme::INK_2,
+            theme::INK_3,
+            theme::INK_4,
+            0.82f32,
+        )
+    };
+
+    // Reserve outer capsule rect slot so we can patch exact width after laying out segments.
+    let cap_idx = scene.rects.len();
+    scene.round_rect(x0, y, x0 + 60.0, y + cap_h, 6.0, cap_bg, 1.0, cap_bd, clip_id);
+
+    let mut cx = x0 + pad_x;
+    let draw_divider = |scene: &mut Scene, x: f32| {
+        scene.line(x, y + 4.0, x, y + cap_h - 4.0, 1.0, sep_col, clip_id);
+    };
+
+    // Segment 1: Location (macOS folder SVG + quiet parent path + crisp leaf dir).
+    scene.svg_icon_alpha(cx, ty + (m.ch - folder_s) * 0.5, folder_s, "folder_macos", icon_alpha, clip_id);
+    cx += folder_s + 6.0;
 
     let max_dir = ((max_w * 0.42) / m.cw).floor().max(12.0) as usize;
     let dir_lbl = truncate_chars(
         if prompt.dir_short.is_empty() { &prompt.cwd_display } else { &prompt.dir_short },
         max_dir,
     );
-    scene.text(cx, y, &dir_lbl, theme::PROMPT_DIR, true, false, clip_id);
-    cx += dir_lbl.chars().count() as f32 * m.cw;
+    if let Some(slash) = dir_lbl.rfind('/')
+        && slash + 1 < dir_lbl.len()
+    {
+        let parent = &dir_lbl[..=slash];
+        let leaf = &dir_lbl[slash + 1..];
+        scene.text(cx, ty, parent, meta_col, false, false, clip_id);
+        cx += parent.chars().count() as f32 * m.cw;
+        scene.text(cx, ty, leaf, dir_col, is_live, false, clip_id);
+        cx += leaf.chars().count() as f32 * m.cw;
+    } else {
+        scene.text(cx, ty, &dir_lbl, dir_col, is_live, false, clip_id);
+        cx += dir_lbl.chars().count() as f32 * m.cw;
+    }
 
+    // Segment 2: Git branch + in-progress state (separated by crisp 1px vertical hairline).
     if let Some(branch) = &prompt.git_branch {
-        scene.text(cx, y, " on ", theme::INK_3, false, false, clip_id);
-        cx += 4.0 * m.cw;
-        let b_s = 12.0;
-        draw_icon(scene, Icon::Branch, cx, y + (m.ch - b_s) * 0.5, b_s, theme::PROMPT_BRANCH, clip_id);
-        cx += b_s + 4.0;
+        cx += sep_pad;
+        draw_divider(scene, cx);
+        cx += sep_pad;
+
+        let branch_icon_col = if prompt.git_detached {
+            theme::FIRE
+        } else if is_live {
+            theme::INK_3
+        } else {
+            theme::INK_4
+        };
+        draw_icon(scene, Icon::Branch, cx, ty + (m.ch - branch_s) * 0.5, branch_s, branch_icon_col, clip_id);
+        cx += branch_s + 5.0;
 
         let branch_lbl = if prompt.git_detached {
             format!("@{branch}")
         } else {
             branch.clone()
         };
-        scene.text(cx, y, &branch_lbl, theme::PROMPT_BRANCH, true, false, clip_id);
+        scene.text(cx, ty, &branch_lbl, branch_col, false, false, clip_id);
         cx += branch_lbl.chars().count() as f32 * m.cw;
 
         if let Some(st) = &prompt.git_status {
             if let Some(state_lbl) = &st.state_label {
-                let s_txt = format!(" ({state_lbl})");
-                scene.text(cx, y, &s_txt, theme::FIRE, true, false, clip_id);
-                cx += s_txt.chars().count() as f32 * m.cw;
+                cx += 6.0;
+                scene.text(cx, ty, state_lbl, theme::FIRE, true, false, clip_id);
+                cx += state_lbl.chars().count() as f32 * m.cw;
             }
 
+            // Segment 3: Uncommitted files (IntelliJ SVG file icons + quiet ember/green count).
             let total_dirty = st.conflicted + st.staged + st.modified + st.deleted + st.untracked;
             if !st.changed_icons.is_empty() {
-                // Visual file-type pill showing custom IntelliJ SVG icons of uncommitted files!
+                cx += sep_pad;
+                draw_divider(scene, cx);
+                cx += sep_pad;
+
                 let shown_icons = st.changed_icons.len().min(4);
-                let count_txt = if total_dirty > 1 {
-                    format!("{total_dirty}")
-                } else {
-                    String::new()
-                };
-                let f_icon = 12.5;
-                let pill_pad_x = 6.0;
-                let icons_w = shown_icons as f32 * (f_icon + 3.0) - 3.0;
-                let count_w = if count_txt.is_empty() {
-                    0.0
-                } else {
-                    5.0 + count_txt.len() as f32 * m.cw
-                };
-                let pill_w = pill_pad_x * 2.0 + icons_w + count_w;
-                cx += 7.0;
-                let px0 = cx;
-                let py0 = y - 1.0;
-                let py1 = y + m.ch + 1.0;
-                let bd_col = if st.conflicted > 0 {
-                    theme::DANGER
-                } else if st.staged > 0 && st.modified == 0 && st.untracked == 0 {
-                    theme::OK
-                } else {
-                    theme::LINE_STRONG
-                };
-                scene.round_rect(px0, py0, px0 + pill_w, py1, 5.0, theme::BG_CHIP, 1.0, bd_col, clip_id);
-                let mut ix = px0 + pill_pad_x;
-                let f_iy = y + (m.ch - f_icon) * 0.5;
+                let f_iy = ty + (m.ch - file_s) * 0.5;
                 for &(icon_name, _) in st.changed_icons.iter().take(shown_icons) {
-                    scene.svg_icon(ix, f_iy, f_icon, icon_name, clip_id);
-                    ix += f_icon + 3.0;
+                    scene.svg_icon_alpha(cx, f_iy, file_s, icon_name, icon_alpha, clip_id);
+                    cx += file_s + 3.0;
                 }
-                if !count_txt.is_empty() {
-                    let count_col = if st.conflicted > 0 {
+                if total_dirty > 0 {
+                    let cnt = format!("{total_dirty}");
+                    let cnt_col = if st.conflicted > 0 {
                         theme::DANGER
-                    } else if st.modified > 0 || st.deleted > 0 {
+                    } else if st.staged > 0 && st.modified == 0 && st.untracked == 0 && st.deleted == 0 {
+                        theme::OK
+                    } else if is_live {
                         theme::FIRE
                     } else {
-                        theme::PROMPT_STATUS
+                        meta_col
                     };
-                    scene.text(ix + 2.0, y, &count_txt, count_col, true, false, clip_id);
+                    cx += 2.0;
+                    scene.text(cx, ty, &cnt, cnt_col, is_live, false, clip_id);
+                    cx += cnt.len() as f32 * m.cw;
                 }
-                cx = px0 + pill_w;
+            } else if st.staged > 0 || st.conflicted > 0 {
+                // Staged-only or conflict-only state (clean subtle dot + count, never ANSI brackets).
+                cx += sep_pad;
+                draw_divider(scene, cx);
+                cx += sep_pad;
+                let dot_col = if st.conflicted > 0 { theme::DANGER } else { theme::OK };
+                scene.over_circle(cx + 3.0, ty + m.ch * 0.5, 2.6, dot_col, clip_id);
+                cx += 9.0;
+                let n = if st.conflicted > 0 { st.conflicted } else { st.staged };
+                let cnt = format!("{n}");
+                scene.text(cx, ty, &cnt, meta_col, false, false, clip_id);
+                cx += cnt.len() as f32 * m.cw;
+            }
 
-                // Compact ahead / behind / stash indicators alongside the file-icon pill.
-                let mut extras = String::new();
+            // Segment 4: Ahead/behind & stash count (crisp SDF layers icon, never pink `[$3]`).
+            if st.ahead > 0 || st.behind > 0 || st.stashed > 0 {
+                cx += sep_pad;
+                draw_divider(scene, cx);
+                cx += sep_pad;
+
+                let mut need_gap = false;
                 if st.ahead > 0 {
-                    extras.push_str(&format!(" ⇡{}", st.ahead));
+                    let s = format!("↑{}", st.ahead);
+                    scene.text(cx, ty, &s, meta_col, false, false, clip_id);
+                    cx += s.chars().count() as f32 * m.cw;
+                    need_gap = true;
                 }
                 if st.behind > 0 {
-                    extras.push_str(&format!(" ⇣{}", st.behind));
+                    if need_gap {
+                        cx += 5.0;
+                    }
+                    let s = format!("↓{}", st.behind);
+                    scene.text(cx, ty, &s, meta_col, false, false, clip_id);
+                    cx += s.chars().count() as f32 * m.cw;
+                    need_gap = true;
                 }
                 if st.stashed > 0 {
-                    extras.push_str(&format!(" ≡{}", st.stashed));
+                    if need_gap {
+                        cx += 6.0;
+                    }
+                    let st_s = 11.0;
+                    draw_icon(scene, Icon::Stash, cx, ty + (m.ch - st_s) * 0.5, st_s, meta_col, clip_id);
+                    cx += st_s + 3.5;
+                    let s = format!("{}", st.stashed);
+                    scene.text(cx, ty, &s, meta_col, false, false, clip_id);
+                    cx += s.len() as f32 * m.cw;
                 }
-                if !extras.is_empty() {
-                    scene.text(cx, y, &extras, theme::INK_3, false, false, clip_id);
-                    cx += extras.chars().count() as f32 * m.cw;
-                }
-            } else if !st.status_badge.is_empty() {
-                cx += 0.8 * m.cw;
-                scene.text(cx, y, &st.status_badge, theme::PROMPT_STATUS, true, false, clip_id);
-                cx += st.status_badge.chars().count() as f32 * m.cw;
             }
         }
     }
 
-    // Project toolchain SVG icons (`rust_dark`, `typeScript_dark`, `nix_dark`, ...) or subtle `✦`.
+    // Segment 5: Detected project toolchain SVG icons (quietly separated inside the capsule).
     if !prompt.project_icons.is_empty() {
-        cx += 8.0;
-        let p_s = 13.0;
-        let p_iy = y + (m.ch - p_s) * 0.5;
-        for &icon_name in prompt.project_icons.iter().take(3) {
-            scene.svg_icon(cx, p_iy, p_s, icon_name, clip_id);
-            cx += p_s + 4.0;
+        cx += sep_pad;
+        draw_divider(scene, cx);
+        cx += sep_pad;
+        let t_iy = ty + (m.ch - tool_s) * 0.5;
+        for (i, &icon_name) in prompt.project_icons.iter().take(3).enumerate() {
+            if i > 0 {
+                cx += 4.0;
+            }
+            scene.svg_icon_alpha(cx, t_iy, tool_s, icon_name, icon_alpha * 0.9, clip_id);
+            cx += tool_s;
         }
-    } else if prompt.git_branch.is_some() {
-        cx += 0.9 * m.cw;
-        scene.text(cx, y, "✦", theme::PROMPT_SPARK, false, false, clip_id);
-        cx += m.cw;
     }
 
-    // Starship-style elapsed duration badge when the previous command took >= 1s.
-    if prompt.last_duration_ms >= 1000 {
-        let took = format!(" took {}", format_duration_ms(prompt.last_duration_ms));
-        scene.text(cx, y, &took, theme::FIRE, false, false, clip_id);
+    let cap_x1 = (cx + pad_x).min(x0 + max_w);
+    scene.rects[cap_idx].rect[2] = cap_x1;
+
+    // Quiet elapsed time outside the capsule when the previous command took >= 1s.
+    if prompt.last_duration_ms >= 1000 && cap_x1 + 70.0 < x0 + max_w {
+        let took = format!("took {}", format_duration_ms(prompt.last_duration_ms));
+        scene.text(cap_x1 + 10.0, ty, &took, meta_col, false, false, clip_id);
     }
+
+    cap_h
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -452,10 +522,10 @@ fn layout_block(
 ) -> f32 {
     let mut cur_y = y0;
 
-    // Starship context line (`folder dir on  branch [?] ✦`) powered by `blaze-git`.
+    // Native segmented prompt capsule (always kept on every command block, calmer than live).
     if show_context {
-        layout_starship_line(scene, &block.prompt_snapshot, x0, cur_y, x1 - x0, m, clip_id);
-        cur_y += m.ch + 2.0;
+        let cap_h = layout_starship_line(scene, &block.prompt_snapshot, x0, cur_y, x1 - x0, m, clip_id, false);
+        cur_y += cap_h + 4.0;
     }
 
     // Right-aligned quiet icon buttons on the command row: fork icon, optional grid/table icon, duration, exit.
@@ -508,12 +578,12 @@ fn layout_block(
         }
     }
 
-    // Command row: Starship `❯` prompt + syntax-highlighted command source.
+    // Command row: clean monochrome `❯` prompt (with `--fire` for Rust cells, red for errors).
     let prompt_col = match &block.body {
         BlockBody::Error { .. } | BlockBody::Value(Value::Error(_)) => theme::DANGER,
         BlockBody::RustCell { .. } => theme::FIRE,
         _ if block.exit_code != 0 => theme::DANGER,
-        _ => theme::PROMPT_OK,
+        _ => theme::INK_3,
     };
     scene.text(x0, cur_y, "❯", prompt_col, true, false, clip_id);
 
@@ -1889,8 +1959,9 @@ fn layout_inline_prompt(
     let vim_mode = editor.vim_mode();
     let vim_pending = editor.vim_pending();
 
-    // Line 1: Starship context header (`folder dir on  branch [$3] ✦`) + quiet right metadata.
-    layout_starship_line(scene, prompt, x0, y0, (x1 - x0) * 0.72, m, clip_id);
+    // Line 1: Bespoke segmented native prompt capsule (elevated live styling) + quiet right metadata.
+    let cap_h = layout_starship_line(scene, prompt, x0, y0, (x1 - x0) * 0.78, m, clip_id, true);
+    let meta_y = y0 + 2.0;
 
     let mut rx = x1;
     // Sleek Vim mode indicator when in Normal / Visual / VisualLine (plus pending keys like `ci`, `2d`).
@@ -1904,11 +1975,11 @@ fn layout_inline_prompt(
         let mx0 = rx - mw;
         let (pill_bg, pill_fg) = match vim_mode {
             VimMode::Normal => (theme::BG_CHIP, theme::INK_2),
-            VimMode::Visual | VimMode::VisualLine => (theme::rgba(0x6e, 0xd8, 0xce, 0.16), theme::PROMPT_DIR),
+            VimMode::Visual | VimMode::VisualLine => (theme::rgba(0xe0, 0x46, 0x1a, 0.14), theme::FIRE),
             VimMode::Insert => (theme::FIRE_FAINT, theme::FIRE),
         };
-        scene.round_rect(mx0, y0 - 1.0, rx, y0 + m.ch + 1.0, 4.0, pill_bg, 1.0, theme::LINE, clip_id);
-        scene.text(mx0 + 6.0, y0, mode_lbl, pill_fg, true, false, clip_id);
+        scene.round_rect(mx0, y0, rx, y0 + cap_h, 5.0, pill_bg, 1.0, theme::LINE, clip_id);
+        scene.text(mx0 + 6.0, meta_y, mode_lbl, pill_fg, true, false, clip_id);
         rx = mx0 - 10.0;
     }
 
@@ -1932,11 +2003,11 @@ fn layout_inline_prompt(
             theme::INK_4
         };
         let rw = right_txt.chars().count() as f32 * m.cw;
-        scene.text(rx - rw, y0, right_txt, right_col, false, false, clip_id);
+        scene.text(rx - rw, meta_y, right_txt, right_col, false, false, clip_id);
     }
 
     // Line 2+: `❯` prompt + editable syntax-highlighted text + Fish ghost text directly inline.
-    let input_y = y0 + m.ch + 2.0;
+    let input_y = y0 + cap_h + 4.0;
     let line_step = m.ch + 2.0;
     let num_lines = editor.text.split('\n').count().max(1);
     let text_h = (num_lines as f32 * line_step - 2.0).max(m.ch);
@@ -1959,16 +2030,14 @@ fn layout_inline_prompt(
         );
     }
 
-    let prompt_col = if is_rust_mode {
+    let prompt_col = if is_rust_mode || matches!(vim_mode, VimMode::Visual | VimMode::VisualLine) {
         theme::FIRE
     } else if vim_mode == VimMode::Normal {
-        theme::PROMPT_BRANCH
-    } else if matches!(vim_mode, VimMode::Visual | VimMode::VisualLine) {
-        theme::PROMPT_DIR
+        theme::INK_3
     } else if prompt.last_exit != 0 {
         theme::DANGER
     } else {
-        theme::PROMPT_OK
+        theme::INK_1
     };
     scene.text(x0, input_y, "❯", prompt_col, true, false, clip_id);
 

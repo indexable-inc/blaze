@@ -569,6 +569,19 @@ impl Scene {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn svg_icon_alpha(
+        &mut self,
+        x: f32,
+        y: f32,
+        size: f32,
+        name: &'static str,
+        alpha: f32,
+        clip_id: u32,
+    ) {
+        self.icon_quads.push(IconQuad { x, y, w: size, h: size, name, alpha, clip_id });
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn overlay_svg_icon(
         &mut self,
         x: f32,
