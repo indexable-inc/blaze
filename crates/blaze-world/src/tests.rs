@@ -376,6 +376,19 @@ fn std_carries_its_build_script_cfg() {
     assert!(!core.cfg.contains(&("backtrace_in_libstd", None)), "core's cfg: {:?}", core.cfg);
 }
 
+/// Every host a release is built for (release.yaml's build matrix) has std's row: with none for
+/// `x86_64-unknown-linux-gnu`, every check there was refused before a name resolved, as "std's
+/// build-script cfg is not known for `x86_64-unknown-linux-gnu`".
+/// Expected: `test tests::every_released_host_has_stds_build_script_cfg ... ok`.
+/// Control: drop the x86_64 row of `STD_SCRIPT_CFG`: "no std script cfg for x86_64-unknown-linux-gnu".
+#[test]
+fn every_released_host_has_stds_build_script_cfg() {
+    for triple in ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"] {
+        let atoms = crate::toolchain::std_script_cfg(triple).unwrap_or_else(|_| panic!("no std script cfg for {triple}"));
+        assert_eq!(atoms, ["backtrace_in_libstd"], "{triple}");
+    }
+}
+
 /// D115 (B): a script's outputs are a READ of the crate's task (its `Script` record and out in
 /// the read list), never in the crate's key: two outputs that differ in a generated file or an
 /// env value join to two inputs under ONE key; what moves is the joined input the task reads.
