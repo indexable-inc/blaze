@@ -153,7 +153,7 @@ impl<'f> Lockfile<'f> {
             lock,
             units,
             index: fetch_task::index(units, heap.alloc()),
-            cargo: CargoCache { looked: None },
+            cargo: CargoCache::new(),
             sources: None,
             #[cfg(feature = "fetch")]
             net: None,
@@ -470,15 +470,30 @@ const STORE_PLACE: &str = "blaze's sources store";
 const CARGO_REGISTRY: &str = "registry";
 const CARGO_CACHE_IN_REGISTRY: &str = "cache";
 
-/// Cargo's archive cache on this machine, `<cargo home>/registry/cache` (D78; fetch.md, "Where
-/// bytes come from", place 2): looked at once a command, at the first unit the sources store
-/// lacks, through the effect layer's second tree (`Fs::home`), never `std::fs`. Nothing of it is
-/// believed but an archive's bytes, and those only when their SHA-256 is the lock's.
+/// Cargo's bare git clones under its home (`local::CARGO_GIT_DB`), opened through the parent
+/// folder `git` so a cargo home without `git/db` is a miss named "absent", not an error.
+const CARGO_GIT: &str = "git";
+const CARGO_DB_IN_GIT: &str = "db";
+const CARGO_GIT_OBJECTS: &str = "objects";
+const CARGO_GIT_PACK: &str = "pack";
+
+/// Cargo's local caches on this machine: `<cargo home>/registry/cache` for `.crate` archives
+/// (D78; fetch.md, "Where bytes come from", place 2) and `<cargo home>/git/db` for bare git
+/// repositories (fetch.md, piece 14). Each is looked at once a command, lazily on the first
+/// missing unit of its kind, through the effect layer's second tree (`Fs::home`), never `std::fs`.
+/// Nothing is believed of the place: only a `.crate`'s SHA-256 or a git pack's pinned commit SHA-1.
 pub(crate) struct CargoCache {
     looked: Option<Looked>,
+    git: Option<LookedGit>,
 }
 
-/// What looking at cargo's cache found.
+impl CargoCache {
+    pub(crate) fn new() -> CargoCache {
+        CargoCache { looked: None, git: None }
+    }
+}
+
+/// What looking at cargo's crate cache found.
 enum Looked {
     /// No archive can come from it: the one place a finding names, and why (no cargo home, the
     /// home not opened, no cache, or no crates.io folder in it).
@@ -490,13 +505,148 @@ enum Looked {
     Open { registry: Dir<ReadOnly>, folders: blaze_own::Vec<(blaze_own::String<Alloc<'static>>, usize), Alloc<'static>> },
 }
 
+/// Why a local cargo cache folder could not be searched (Copy so borrowing never calls `.clone()`).
+#[derive(Clone, Copy)]
+enum ClosedMiss {
+    Absent,
+    Unreadable,
+}
+
+impl ClosedMiss {
+    fn to_miss(self) -> Miss {
+        match self {
+            ClosedMiss::Absent => Miss::Absent,
+            ClosedMiss::Unreadable => Miss::Unreadable,
+        }
+    }
+}
+
+/// What looking at cargo's bare git db (`<cargo home>/git/db`) found.
+enum LookedGit {
+    Closed { shown: blaze_own::String<Alloc<'static>>, miss: ClosedMiss },
+    Open {
+        git: Dir<ReadOnly>,
+        shown: blaze_own::String<Alloc<'static>>,
+        folders: blaze_own::Vec<GitDbFolder, Alloc<'static>>,
+    },
+}
+
+struct GitDbFolder {
+    /// `<cargo home>/git/db/<folder>` and byte offset where `<folder>` starts.
+    shown: blaze_own::String<Alloc<'static>>,
+    name_at: usize,
+    /// Packfiles inside `db/<folder>/objects/pack`, listed lazily once a unit's repo matches.
+    packs: Option<GitDbPacks>,
+}
+
+impl GitDbFolder {
+    fn name(&self) -> &str {
+        self.shown.as_str().get(self.name_at..).unwrap_or("")
+    }
+}
+
+enum GitDbPacks {
+    Closed { miss: ClosedMiss },
+    /// Each entry: (`<cargo home>/git/db/<folder>/objects/pack/<pack>`, byte offset where `<pack>` starts).
+    Open(blaze_own::Vec<(blaze_own::String<Alloc<'static>>, usize), Alloc<'static>>),
+}
+
 impl CargoCache {
-    /// What the cache holds, looked at on the first call of the command.
+    /// What the crate cache holds, looked at on the first crate miss of the command.
     fn looked(&mut self, cx: &Cx, env: &FetchEnv<'_>) -> Result<&Looked, CliError> {
         Ok(match &mut self.looked {
             Some(looked) => &*looked,
             none => &*none.insert(Looked::open(cx, env)?),
         })
+    }
+
+    /// Opens cargo's `git/db` on the first git miss and lazily lists `objects/pack` for folders
+    /// matching `repo`, then returns an immutable view for borrowing try place names.
+    fn looked_git(&mut self, cx: &Cx, env: &FetchEnv<'_>, repo: &str) -> Result<&LookedGit, CliError> {
+        let looked = match &mut self.git {
+            Some(looked) => looked,
+            none => none.insert(LookedGit::open(cx, env)?),
+        };
+        if let LookedGit::Open { git, folders, .. } = looked {
+            let db = Path::new(CARGO_DB_IN_GIT)?;
+            let objects = Path::new(CARGO_GIT_OBJECTS)?;
+            let pack = Path::new(CARGO_GIT_PACK)?;
+            let global = env.heap.alloc();
+            for folder in folders.iter_mut() {
+                if folder.packs.is_some() || !local::git_db_folder(repo, folder.name()) {
+                    continue;
+                }
+                let Ok(folder_path) = Path::new(folder.name()) else {
+                    folder.packs = Some(GitDbPacks::Closed { miss: ClosedMiss::Unreadable });
+                    continue;
+                };
+                let pack_dir = db.join(&folder_path).join(&objects).join(&pack);
+                let listed = match git.entries(cx, &pack_dir) {
+                    Ok(Some(entries)) => {
+                        let mut packs = blaze_own::Vec::new_in(global);
+                        for (name, _) in entries.iter().filter(|(name, _)| local::git_pack_file(name)) {
+                            let mut place = blaze_own::String::new_in(global);
+                            place.str(folder.shown.as_str()).str("/objects/pack/");
+                            let at = place.as_str().len();
+                            place.str(name);
+                            packs.push((place, at));
+                        }
+                        if packs.is_empty() {
+                            GitDbPacks::Closed { miss: ClosedMiss::Absent }
+                        } else {
+                            GitDbPacks::Open(packs)
+                        }
+                    }
+                    Ok(None) => GitDbPacks::Closed { miss: ClosedMiss::Absent },
+                    Err(_) => GitDbPacks::Closed { miss: ClosedMiss::Unreadable },
+                };
+                folder.packs = Some(listed);
+            }
+        }
+        Ok(&*looked)
+    }
+}
+
+impl LookedGit {
+    fn open(cx: &Cx, env: &FetchEnv<'_>) -> Result<LookedGit, CliError> {
+        let global = env.heap.alloc();
+        let mut shown = blaze_own::String::new_in(global);
+        let Some(home) = env.cargo_home else {
+            shown.str("cargo's git db (neither CARGO_HOME nor HOME is set)");
+            return Ok(LookedGit::Closed { shown, miss: ClosedMiss::Absent });
+        };
+        shown.str(home.trim_end_matches('/')).str("/").str(local::CARGO_GIT_DB);
+        let said = |shown: &mut blaze_own::String<Alloc<'static>>, error: &dyn core::fmt::Display| {
+            core::fmt::Write::write_fmt(shown, format_args!(" ({error})")).map_err(|_| CliError::Text { what: "a place's words could not be written" })
+        };
+        let git = match env.fs.home(cx, home, &Path::new(CARGO_GIT)?) {
+            Ok(git) => git.read_only(),
+            Err(error) => {
+                said(&mut shown, &error)?;
+                return Ok(LookedGit::Closed { shown, miss: ClosedMiss::Unreadable });
+            }
+        };
+        let entries = match git.entries(cx, &Path::new(CARGO_DB_IN_GIT)?) {
+            Ok(Some(entries)) => entries,
+            Ok(None) => return Ok(LookedGit::Closed { shown, miss: ClosedMiss::Absent }),
+            Err(error) => {
+                said(&mut shown, &error)?;
+                return Ok(LookedGit::Closed { shown, miss: ClosedMiss::Unreadable });
+            }
+        };
+        let mut folders = blaze_own::Vec::new_in(global);
+        for (name, _) in entries.iter() {
+            let mut place = blaze_own::String::new_in(global);
+            place.str(shown.as_str()).str("/");
+            let name_at = place.as_str().len();
+            place.str(name);
+            folders.push(GitDbFolder { shown: place, name_at, packs: None });
+        }
+        if folders.is_empty() {
+            shown.str(" (no repository folder in it)");
+            return Ok(LookedGit::Closed { shown, miss: ClosedMiss::Absent });
+        }
+        Ok(LookedGit::Open { git, shown, folders })
     }
 }
 
@@ -545,14 +695,32 @@ impl Looked {
     }
 }
 
-/// The second place of fetch.md's order for `unit`, after the sources store lacked it: its
-/// archive in cargo's cache, tried in each crates.io folder in order, adopted only when its
-/// SHA-256 is the lock's (`local::adopt`, D78) and then written at the unit's key exactly as the
-/// network path's record is ([`write_record`]): the same bytes at the same key, so no reader can
-/// tell which place gave them. `true` when adopted; else every place tried, and what it gave, is
-/// pushed on `tries` for the finding. An archive refused in one folder is named and the next
-/// folder tried: it is never adopted, and never passed over in silence.
+/// The second place of fetch.md's order for `unit`, after the sources store lacked it:
+/// - for a registry crate, its archive in `<cargo home>/registry/cache`, adopted only when its
+///   SHA-256 is the lock's (`local::adopt`, D78);
+/// - for a git commit, packfiles in matching `<cargo home>/git/db/<repo>-<16hex>/objects/pack`,
+///   adopted only when an object hashes to the lock's pinned commit SHA-1 (`local::adopt_git_pack`,
+///   fetch.md piece 14).
+///
+/// The record is written at the unit's key exactly as the network path's record is
+/// ([`write_record`]): the same bytes at the same key, so no reader can tell which place gave
+/// them. `true` when adopted; else every place tried, and what it gave, is pushed on `tries` for
+/// the finding. Nothing is adopted without the pin, and nothing refused is passed over in silence.
 fn adopt_local<'c>(
+    cx: &Cx,
+    root: &Dir<ReadWrite>,
+    cargo: &'c mut CargoCache,
+    env: &FetchEnv<'_>,
+    unit: &Unit<'_, '_>,
+    tries: &mut blaze_own::Vec<Try<'c>, Alloc<'static>>,
+) -> Result<bool, CliError> {
+    match unit {
+        Unit::Crate { .. } => adopt_local_crate(cx, root, cargo, env, unit, tries),
+        Unit::Git { repo, .. } => adopt_local_git(cx, root, cargo, env, unit, repo, tries),
+    }
+}
+
+fn adopt_local_crate<'c>(
     cx: &Cx,
     root: &Dir<ReadWrite>,
     cargo: &'c mut CargoCache,
@@ -609,6 +777,102 @@ fn adopt_local<'c>(
             }
             Err(refused) => tries.push(Try { place, miss: Miss::Refused(refused) }),
         }
+    }
+    Ok(false)
+}
+
+fn adopt_local_git<'c>(
+    cx: &Cx,
+    root: &Dir<ReadWrite>,
+    cargo: &'c mut CargoCache,
+    env: &FetchEnv<'_>,
+    unit: &Unit<'_, '_>,
+    repo: &str,
+    tries: &mut blaze_own::Vec<Try<'c>, Alloc<'static>>,
+) -> Result<bool, CliError> {
+    let looked: &'c LookedGit = cargo.looked_git(cx, env, repo)?;
+    let (git, db_shown, folders) = match looked {
+        LookedGit::Closed { shown, miss } => {
+            tries.push(Try { place: shown.as_str(), miss: miss.to_miss() });
+            return Ok(false);
+        }
+        LookedGit::Open { git, shown, folders } => (git, shown, folders),
+    };
+    let db = Path::new(CARGO_DB_IN_GIT)?;
+    let objects = Path::new(CARGO_GIT_OBJECTS)?;
+    let pack_dir_name = Path::new(CARGO_GIT_PACK)?;
+    let mut matched = false;
+    for folder in folders.iter() {
+        let folder_name = folder.name();
+        if !local::git_db_folder(repo, folder_name) {
+            continue;
+        }
+        matched = true;
+        let packs = match &folder.packs {
+            Some(GitDbPacks::Open(packs)) => packs,
+            Some(GitDbPacks::Closed { miss }) => {
+                tries.push(Try { place: folder.shown.as_str(), miss: miss.to_miss() });
+                continue;
+            }
+            None => {
+                tries.push(Try { place: folder.shown.as_str(), miss: Miss::Absent });
+                continue;
+            }
+        };
+        let Ok(folder_path) = Path::new(folder_name) else {
+            tries.push(Try { place: folder.shown.as_str(), miss: Miss::Unreadable });
+            continue;
+        };
+        let pack_dir = db.join(&folder_path).join(&objects).join(&pack_dir_name);
+        for (pack_shown, pack_at) in packs.iter() {
+            let place = pack_shown.as_str();
+            let Some(pack_name) = place.get(*pack_at..) else {
+                tries.push(Try { place, miss: Miss::Unreadable });
+                continue;
+            };
+            let Ok(pack_file) = Path::new(pack_name) else {
+                tries.push(Try { place, miss: Miss::Unreadable });
+                continue;
+            };
+            let path = pack_dir.join(&pack_file);
+            let len = match git.stat(cx, &path) {
+                Ok(Some(meta)) if !meta.dir => meta.len,
+                Ok(_) => {
+                    tries.push(Try { place, miss: Miss::Absent });
+                    continue;
+                }
+                Err(_) => {
+                    tries.push(Try { place, miss: Miss::Unreadable });
+                    continue;
+                }
+            };
+            if len > blaze_fetch::fetch::Limits::REAL.git_most {
+                tries.push(Try { place, miss: Miss::Unreadable });
+                continue;
+            }
+            let Ok(len) = usize::try_from(len) else {
+                tries.push(Try { place, miss: Miss::Unreadable });
+                continue;
+            };
+            let reserve = len.saturating_mul(2).max(1 << 16).saturating_add(1 << 16);
+            let scratch = Frame::with_reserve(reserve, bstd::mem::Tag::Other)
+                .map_err(|_| CliError::Text { what: "the frame a cargo git pack is read in could not be reserved" })?;
+            let mut bytes = Bytes::new_in(&scratch, "a git pack in cargo's git/db, checked against the lock");
+            if git.read_all(cx, &path, &mut bytes).is_err() {
+                tries.push(Try { place, miss: Miss::Unreadable });
+                continue;
+            }
+            match local::adopt_git_pack(unit, bytes.as_slice(), &blaze_fetch::fetch::Limits::REAL.unpack, env.heap.alloc()) {
+                Ok((record, _)) => {
+                    write_record(cx, root, &record_path(&unit.key())?, record.as_slice())?;
+                    return Ok(true);
+                }
+                Err(refused) => tries.push(Try { place, miss: Miss::Refused(refused) }),
+            }
+        }
+    }
+    if !matched {
+        tries.push(Try { place: db_shown.as_str(), miss: Miss::Absent });
     }
     Ok(false)
 }

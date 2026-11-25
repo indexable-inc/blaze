@@ -33,6 +33,13 @@ use crate::unpack::{self, Limits, Made, UnpackError};
 /// command reads both at its edge, rule 75).
 pub const CARGO_CACHE: &str = "registry/cache";
 
+/// Where cargo keeps bare git clones, under its home (fetch.md, piece 14).
+pub const CARGO_GIT_DB: &str = "git/db";
+
+fn is_lower_hex(text: &str, len: usize) -> bool {
+    text.len() == len && text.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// Whether `folder`, a name listed in cargo's [`CARGO_CACHE`], is one cargo keeps crates.io's
 /// archives in: `index.crates.io-` (the sparse index) or `github.com-` (the git index), then 16
 /// lowercase hex digits (cargo's hash of the source id, which differs between cargo versions:
@@ -44,7 +51,34 @@ pub fn crates_io_folder(folder: &str) -> bool {
         Some(hash) => hash,
         None => return false,
     };
-    hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    is_lower_hex(hash, 16)
+}
+
+/// Whether `folder`, a name listed in cargo's [`CARGO_GIT_DB`], is one cargo keeps `repo`'s
+/// bare repository in: `<name>-` followed by 16 lowercase hex digits, where `<name>` is the
+/// last non-empty path segment of `repo` with any trailing `.git` stripped (cargo's
+/// `GitSource::ident` shape). The commit id's SHA-1 binds the bytes regardless; filtering by
+/// repository name keeps the tries few and avoids indexing unrelated repositories' packs.
+pub fn git_db_folder(repo: &str, folder: &str) -> bool {
+    let raw = repo.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+    let stem = raw.strip_suffix(".git").unwrap_or(raw);
+    if stem.is_empty() || stem == "." || stem == ".." || stem.contains('/') || stem.contains('\\') {
+        return false;
+    }
+    let Some(hash) = folder.strip_prefix(stem).and_then(|rest| rest.strip_prefix('-')) else {
+        return false;
+    };
+    is_lower_hex(hash, 16)
+}
+
+/// Whether `name`, a file listed in `<cargo home>/git/db/<folder>/objects/pack`, is a git
+/// packfile (`pack-<40 lowercase hex digits>.pack`). Excludes `.idx`, `.rev`, `.bitmap`, and
+/// in-progress temporary packs (`tmp_pack_*`), and ensures a single safe path component.
+pub fn git_pack_file(name: &str) -> bool {
+    let Some(hex) = name.strip_prefix("pack-").and_then(|rest| rest.strip_suffix(".pack")) else {
+        return false;
+    };
+    is_lower_hex(hex, 40)
 }
 
 /// The longest crate name and version the plan lets through (plan.rs: `{1,64}` each).
@@ -78,6 +112,8 @@ impl core::fmt::Debug for ArchiveName {
 pub enum AdoptRefused {
     /// The unit is a git commit: cargo's `.crate` cache holds registry archives only.
     NotACrate,
+    /// The unit is a registry crate: cargo's `git/db` holds bare git packs only.
+    NotGit,
     /// The unit's name or version is longer than the plan allows or holds a character outside
     /// its alphabet: no file name is made of it.
     Name,
@@ -92,6 +128,7 @@ impl Show for AdoptRefused {
     fn show<P: Put + ?Sized>(&self, out: &mut P) {
         match self {
             AdoptRefused::NotACrate => out.str("a git commit is not a registry archive"),
+            AdoptRefused::NotGit => out.str("a registry crate is not a git commit"),
             AdoptRefused::Name => out.str("its name or version is not one a file name is made of"),
             AdoptRefused::Mismatch { want, got } => {
                 out.str("its sha256 is ").hex_bytes(got).str(", not the lock's ").hex_bytes(want)
@@ -155,6 +192,34 @@ pub fn adopt<'a>(
     adopt_in(unit, archive, limits, Vec::new_in(alloc), alloc)
 }
 
+/// `unit`'s record made from `pack`, raw git packfile bytes found on this machine (for example
+/// under cargo's [`CARGO_GIT_DB`]), written into `out`: only when an object of `pack` hashes to
+/// the lock's pinned commit SHA-1 and its tree walks cleanly under `limits`. The record equals,
+/// byte for byte, the one the network path ([`unpack::git_record_in`]) makes for the same commit,
+/// and is filed at the same key.
+pub fn adopt_git_pack_in<'a, S: Sink>(
+    unit: &Unit<'_, '_>,
+    pack: &[u8],
+    limits: &Limits,
+    out: S,
+    alloc: Alloc<'a>,
+) -> Result<(S, Made), AdoptRefused> {
+    let Unit::Git { commit, .. } = unit else {
+        return Err(AdoptRefused::NotGit);
+    };
+    unpack::git_pack_record_in(*commit, pack, limits, out, alloc).map_err(AdoptRefused::Unpack)
+}
+
+/// [`adopt_git_pack_in`], into the heap.
+pub fn adopt_git_pack<'a>(
+    unit: &Unit<'_, '_>,
+    pack: &[u8],
+    limits: &Limits,
+    alloc: Alloc<'a>,
+) -> Result<(Vec<u8, Alloc<'a>>, Made), AdoptRefused> {
+    adopt_git_pack_in(unit, pack, limits, Vec::new_in(alloc), alloc)
+}
+
 /// What one place gave for a unit.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Miss {
@@ -201,15 +266,107 @@ impl Show for Tried<'_, '_, '_, '_> {
 
 #[cfg(test)]
 mod tests {
+    use blaze_git_fetch::{Kind as GitKind, Oid, PackWhy};
     use blaze_manifest::lock::LockId;
     use blaze_own::{Alloc, String as OwnString, Vec as OwnVec};
     use blaze_tar::{Make, Writer};
     use blaze_text::Writes as _;
 
-    use super::{AdoptRefused, Miss, Tried, Try, adopt, archive_name, crates_io_folder};
+    use super::{
+        AdoptRefused, Miss, Tried, Try, adopt, adopt_git_pack, archive_name, crates_io_folder, git_db_folder, git_pack_file,
+    };
     use crate::pack::PackView;
     use crate::plan::Unit;
-    use crate::unpack::{self, Limits};
+    use crate::unpack::{self, Limits, UnpackError};
+
+    fn git_zlib(bytes: &[u8]) -> OwnVec<u8, Alloc<'static>> {
+        let mut out = OwnVec::new_in(blaze_own::testing::heap().alloc());
+        blaze_deflate::zlib(bytes, blaze_deflate::Level::Fast, blaze_own::testing::heap().alloc(), &mut out).expect("zlib");
+        out
+    }
+
+    fn git_pack_of(objects: &[(GitKind, &[u8])]) -> OwnVec<u8, Alloc<'static>> {
+        let mut out = OwnVec::new_in(blaze_own::testing::heap().alloc());
+        out.extend_from_slice(b"PACK");
+        out.extend_from_slice(&2u32.to_be_bytes());
+        out.extend_from_slice(&u32::try_from(objects.len()).expect("count").to_be_bytes());
+        for (kind, bytes) in objects {
+            let number: u8 = match kind {
+                GitKind::Commit => 1,
+                GitKind::Tree => 2,
+                GitKind::Blob => 3,
+                GitKind::Tag => 4,
+            };
+            let mut size = u64::try_from(bytes.len()).expect("len");
+            let mut byte = (number << 4) | u8::try_from(size & 15).expect("low4");
+            size >>= 4;
+            while size > 0 {
+                out.push(byte | 0x80);
+                byte = u8::try_from(size & 0x7f).expect("low7");
+                size >>= 7;
+            }
+            out.push(byte);
+            let z = git_zlib(bytes);
+            out.extend_from_slice(z.as_slice());
+        }
+        let trailer = blaze_git_fetch::sha1::sha1(out.as_slice());
+        out.extend_from_slice(&trailer);
+        out
+    }
+
+    fn git_tree_of(entries: &mut [(&str, u32, Oid)]) -> OwnVec<u8, Alloc<'static>> {
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        let mut out = OwnVec::new_in(blaze_own::testing::heap().alloc());
+        for (name, mode, oid) in entries.iter() {
+            let header = alloc::format!("{mode:o} {name}\0");
+            out.extend_from_slice(header.as_bytes());
+            out.extend_from_slice(&oid.0);
+        }
+        out
+    }
+
+    fn git_pkt(payload: &[u8], out: &mut OwnVec<u8, Alloc<'static>>) {
+        let len = alloc::format!("{:04x}", payload.len() + 4);
+        out.extend_from_slice(len.as_bytes());
+        out.extend_from_slice(payload);
+    }
+
+    fn git_answer_of(commit: Oid, pack: &[u8]) -> OwnVec<u8, Alloc<'static>> {
+        let mut out = OwnVec::new_in(blaze_own::testing::heap().alloc());
+        git_pkt(b"shallow-info\n", &mut out);
+        let shallow = alloc::format!("shallow {commit}\n");
+        git_pkt(shallow.as_bytes(), &mut out);
+        out.extend_from_slice(b"0001");
+        git_pkt(b"packfile\n", &mut out);
+        for piece in pack.chunks(4096) {
+            let mut line = OwnVec::new_in(blaze_own::testing::heap().alloc());
+            line.push(1u8);
+            line.extend_from_slice(piece);
+            git_pkt(line.as_slice(), &mut out);
+        }
+        out.extend_from_slice(b"0000");
+        out
+    }
+
+    fn make_git_commit_pack(lib: &[u8]) -> (Oid, OwnVec<u8, Alloc<'static>>) {
+        let manifest = b"[package]\nname = \"g\"\nversion = \"0.1.0\"\n";
+        let lib_oid = Oid::of(GitKind::Blob, lib);
+        let manifest_oid = Oid::of(GitKind::Blob, manifest);
+        let src_tree = git_tree_of(&mut [("lib.rs", 0o100644, lib_oid)]);
+        let src_oid = Oid::of(GitKind::Tree, src_tree.as_slice());
+        let root_tree = git_tree_of(&mut [("Cargo.toml", 0o100644, manifest_oid), ("src", 0o40000, src_oid)]);
+        let root_oid = Oid::of(GitKind::Tree, root_tree.as_slice());
+        let commit_bytes = alloc::format!("tree {root_oid}\nauthor a <a> 0 +0000\ncommitter a <a> 0 +0000\n\ninit\n");
+        let commit_oid = Oid::of(GitKind::Commit, commit_bytes.as_bytes());
+        let pack = git_pack_of(&[
+            (GitKind::Blob, lib),
+            (GitKind::Blob, manifest),
+            (GitKind::Tree, src_tree.as_slice()),
+            (GitKind::Tree, root_tree.as_slice()),
+            (GitKind::Commit, commit_bytes.as_bytes()),
+        ]);
+        (commit_oid, pack)
+    }
 
     /// A `.crate`: a gzip of a tar whose every entry is under `c-1.0.0/`.
     fn archive(lib: &[u8]) -> OwnVec<u8, Alloc<'static>> {
@@ -297,5 +454,72 @@ mod tests {
         version.str("1.0.0/../x");
         let escape = Unit::Crate { package: LockId(0), name: "c", version, sha256: [0; 32] };
         assert_eq!(archive_name(&escape).map(|name| name.len), Err(AdoptRefused::Name));
+
+        assert!(git_db_folder("https://github.com/indexable-inc/tieline", "tieline-21f4a75d056d557d"));
+        assert!(git_db_folder("https://github.com/openai-oss-forks/rusty_v8.git", "rusty_v8-2d66e6cfa36ad61f"));
+        assert!(git_db_folder("https://github.com/helix-editor/nucleo.git/", "nucleo-425d994cd74b3654"));
+        assert!(!git_db_folder("https://github.com/indexable-inc/tieline", "other-21f4a75d056d557d"));
+        assert!(!git_db_folder("https://github.com/indexable-inc/tieline", "tieline-21F4A75D056D557D"));
+        assert!(!git_db_folder("https://github.com/indexable-inc/tieline", "tieline-21f4a75d056d557"));
+        assert!(!git_db_folder("https://github.com/indexable-inc/tieline", "tieline-21f4a75d056d557d/.."));
+
+        assert!(git_pack_file("pack-deb4c32aa0c0c0d5e3c055beea5b005e51329808.pack"));
+        assert!(!git_pack_file("pack-deb4c32aa0c0c0d5e3c055beea5b005e51329808.idx"));
+        assert!(!git_pack_file("pack-DEB4C32AA0C0C0D5E3C055BEEA5B005E51329808.pack"));
+        assert!(!git_pack_file("tmp_pack_123456.pack"));
+        assert!(!git_pack_file("pack-short.pack"));
+    }
+
+    /// Piece 14: a bare git packfile on the machine is adopted only when an object hashes to the
+    /// lock's pinned commit SHA-1 and its tree walks cleanly; the record equals the HTTPS path's
+    /// byte for byte, while another commit's pack or a tampered pack is refused.
+    ///
+    /// Expected: `test local::tests::a_git_pack_on_the_machine_is_adopted_only_by_the_locks_commit ... ok`
+    #[test]
+    fn a_git_pack_on_the_machine_is_adopted_only_by_the_locks_commit() {
+        let (commit, pack) = make_git_commit_pack(b"pub fn g() -> u32 { 7 }\n");
+        let (other_commit, other_pack) = make_git_commit_pack(b"pub fn g() -> u32 { 8 }\n");
+        assert_ne!(commit, other_commit);
+        let unit = Unit::Git { repo: "https://github.com/example/g.git", commit, packages: 1 };
+        let limits = Limits::REAL;
+
+        let (record, made) = adopt_git_pack(&unit, pack.as_slice(), &limits, blaze_own::testing::heap().alloc())
+            .expect("the pinned commit's pack is adopted");
+        let answer = git_answer_of(commit, pack.as_slice());
+        let (network, _) = unpack::git_record(commit, answer.as_slice(), 1 << 20, &limits, blaze_own::testing::heap().alloc())
+            .expect("the network path's record of the same commit");
+        assert_eq!(record.as_slice(), network.as_slice(), "adopted git record equals network path byte for byte");
+        assert_eq!(made.files, 2);
+        let view = PackView::open_source(&unit.source(), record.as_slice()).expect("opens under the lock's git source id");
+        assert_eq!(
+            view.read("src/lib.rs", blaze_own::testing::heap().alloc()).expect("reads src/lib.rs").map(|file| file.bytes.as_slice().to_vec()),
+            Some(b"pub fn g() -> u32 { 7 }\n".to_vec())
+        );
+
+        assert_eq!(
+            adopt_git_pack(&unit, other_pack.as_slice(), &limits, blaze_own::testing::heap().alloc()).map(|(_, m)| m),
+            Err(AdoptRefused::Unpack(UnpackError::NoCommit)),
+            "a pack without the pinned commit is refused"
+        );
+
+        let mut tampered = OwnVec::new_in(blaze_own::testing::heap().alloc());
+        tampered.extend_from_slice(pack.as_slice());
+        let last = tampered.len() - 1;
+        tampered[last] ^= 1;
+        assert!(
+            matches!(
+                adopt_git_pack(&unit, tampered.as_slice(), &limits, blaze_own::testing::heap().alloc()),
+                Err(AdoptRefused::Unpack(UnpackError::GitPack(e))) if e.why == PackWhy::Checksum
+            ),
+            "a pack with a corrupted trailer is refused"
+        );
+
+        let mut version = OwnString::new_in(blaze_own::testing::heap().alloc());
+        version.str("1.0.0");
+        let krate = Unit::Crate { package: LockId(0), name: "c", version, sha256: [0; 32] };
+        assert_eq!(
+            adopt_git_pack(&krate, pack.as_slice(), &limits, blaze_own::testing::heap().alloc()).map(|(_, m)| m),
+            Err(AdoptRefused::NotGit)
+        );
     }
 }

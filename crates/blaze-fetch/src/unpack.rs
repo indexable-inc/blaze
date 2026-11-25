@@ -331,29 +331,26 @@ struct Listed {
     object: Found,
 }
 
-/// The record of `commit` from `answer`, the body of git's `fetch` answer for it.
-pub fn git_record<'a>(
+/// The record of `commit` from `pack`, raw git packfile bytes (either stripped from an HTTPS
+/// `fetch` side band or read from a local bare repository such as cargo's `git/db`).
+pub fn git_pack_record<'a>(
     commit: Oid,
-    answer: &[u8],
-    most_pack: u64,
+    pack: &[u8],
     limits: &Limits,
     alloc: Alloc<'a>,
 ) -> Result<(Vec<u8, Alloc<'a>>, Made), UnpackError> {
-    git_record_in(commit, answer, most_pack, limits, Vec::new_in(alloc), alloc)
+    git_pack_record_in(commit, pack, limits, Vec::new_in(alloc), alloc)
 }
 
-/// [`git_record`], written into `out`: a reservation's bytes ([`pack::Fixed`]) or the heap.
-pub fn git_record_in<'a, S: Sink>(
+/// [`git_pack_record`], written into `out`: a reservation's bytes ([`pack::Fixed`]) or the heap.
+pub fn git_pack_record_in<'a, S: Sink>(
     commit: Oid,
-    answer: &[u8],
-    most_pack: u64,
+    pack: &[u8],
     limits: &Limits,
     out: S,
     alloc: Alloc<'a>,
 ) -> Result<(S, Made), UnpackError> {
-    let mut bytes = Vec::new_in(alloc);
-    blaze_git_fetch::fetched_pack(answer, most_pack, &mut bytes).map_err(UnpackError::GitAnswer)?;
-    let mut index = Index::new_in(&bytes, limits.git_pack, alloc).map_err(UnpackError::GitPack)?;
+    let mut index = Index::new_in(pack, limits.git_pack, alloc).map_err(UnpackError::GitPack)?;
     // The commit is the lock's id, found only if an object of the pack hashes to it.
     let root = if planted(Plant::CommitFromServer) {
         index.objects().find(|object| object.kind == GitKind::Commit).map(|object| object.oid)
@@ -402,10 +399,36 @@ pub fn git_record_in<'a, S: Sink>(
     }
     let cache = index.stats();
     drop(index);
-    drop(bytes);
     drop(listed);
     drop(names);
     let (files, data) = builder.counts();
     let record = builder.finish().map_err(UnpackError::Pack)?;
     Ok((record, Made { files, bytes: data, cache: Some(cache) }))
+}
+
+/// The record of `commit` from `answer`, the body of git's `fetch` answer for it.
+pub fn git_record<'a>(
+    commit: Oid,
+    answer: &[u8],
+    most_pack: u64,
+    limits: &Limits,
+    alloc: Alloc<'a>,
+) -> Result<(Vec<u8, Alloc<'a>>, Made), UnpackError> {
+    git_record_in(commit, answer, most_pack, limits, Vec::new_in(alloc), alloc)
+}
+
+/// [`git_record`], written into `out`: a reservation's bytes ([`pack::Fixed`]) or the heap.
+pub fn git_record_in<'a, S: Sink>(
+    commit: Oid,
+    answer: &[u8],
+    most_pack: u64,
+    limits: &Limits,
+    out: S,
+    alloc: Alloc<'a>,
+) -> Result<(S, Made), UnpackError> {
+    let mut bytes = Vec::new_in(alloc);
+    blaze_git_fetch::fetched_pack(answer, most_pack, &mut bytes).map_err(UnpackError::GitAnswer)?;
+    let made = git_pack_record_in(commit, &bytes, limits, out, alloc);
+    drop(bytes);
+    made
 }

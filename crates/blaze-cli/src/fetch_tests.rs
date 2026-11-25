@@ -208,7 +208,7 @@ fn a_tampered_archive_in_cargos_cache_is_refused_and_named() {
     };
     let unit = unit_c(lockfile.units);
     let env = env(&io, CHECKOUT);
-    let mut cargo = CargoCache { looked: None };
+    let mut cargo = CargoCache::new();
     let mut tries = OwnVec::new_in(Alloc::global());
     tries.push(Try { place: STORE_PLACE, miss: Miss::Absent });
     let adopted = adopt_local(&cx, &root, &mut cargo, &env, unit, &mut tries).expect("no error of the tool's");
@@ -280,4 +280,179 @@ fn a_second_worktree_fetches_and_adopts_nothing() {
     fs.root().remove(&cx, &Path::new(ARCHIVE_AT).expect("a path"), Durable::No).expect("cargo's archive deleted");
     let (did, subject) = fetch_c(&io, &cx, "two", lock.as_str().as_bytes(), cx.frame());
     assert!(answered_held(&did, subject), "worktree two answers `c` from the home's store, with no place left to adopt or fetch it from");
+}
+
+fn git_pack_of(objects: &[(blaze_git_fetch::Kind, &[u8])]) -> OwnVec<u8, Alloc<'static>> {
+    let mut out = OwnVec::new_in(Alloc::global());
+    out.extend_from_slice(b"PACK");
+    out.extend_from_slice(&2u32.to_be_bytes());
+    out.extend_from_slice(&u32::try_from(objects.len()).unwrap_or(0).to_be_bytes());
+    for (kind, bytes) in objects {
+        let number: u8 = match kind {
+            blaze_git_fetch::Kind::Commit => 1,
+            blaze_git_fetch::Kind::Tree => 2,
+            blaze_git_fetch::Kind::Blob => 3,
+            blaze_git_fetch::Kind::Tag => 4,
+        };
+        let mut size = u64::try_from(bytes.len()).unwrap_or(0);
+        let mut byte = (number << 4) | u8::try_from(size & 15).unwrap_or(0);
+        size >>= 4;
+        while size > 0 {
+            out.push(byte | 0x80);
+            byte = u8::try_from(size & 0x7f).unwrap_or(0);
+            size >>= 7;
+        }
+        out.push(byte);
+        let mut z = OwnVec::new_in(Alloc::global());
+        assert!(blaze_deflate::zlib(bytes, blaze_deflate::Level::Fast, Alloc::global(), &mut z).is_ok());
+        out.extend_from_slice(z.as_slice());
+    }
+    let trailer = blaze_git_fetch::sha1::sha1(out.as_slice());
+    out.extend_from_slice(&trailer);
+    out
+}
+
+fn git_tree_of(entries: &mut [(&str, u32, blaze_git_fetch::Oid)]) -> OwnVec<u8, Alloc<'static>> {
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    let mut out = OwnVec::new_in(Alloc::global());
+    for (name, mode, oid) in entries.iter() {
+        let header = std::format!("{mode:o} {name}\0");
+        out.extend_from_slice(header.as_bytes());
+        out.extend_from_slice(&oid.0);
+    }
+    out
+}
+
+fn make_git_pack(lib: &[u8]) -> (blaze_git_fetch::Oid, OwnVec<u8, Alloc<'static>>) {
+    use blaze_git_fetch::{Kind as GitKind, Oid};
+    let manifest = b"[package]\nname = \"g\"\nversion = \"0.1.0\"\n";
+    let lib_oid = Oid::of(GitKind::Blob, lib);
+    let manifest_oid = Oid::of(GitKind::Blob, manifest);
+    let src_tree = git_tree_of(&mut [("lib.rs", 0o100644, lib_oid)]);
+    let src_oid = Oid::of(GitKind::Tree, src_tree.as_slice());
+    let root_tree = git_tree_of(&mut [("Cargo.toml", 0o100644, manifest_oid), ("src", 0o40000, src_oid)]);
+    let root_oid = Oid::of(GitKind::Tree, root_tree.as_slice());
+    let commit = std::format!("tree {root_oid}\nauthor a <a> 0 +0000\ncommitter a <a> 0 +0000\n\ninit\n");
+    let commit_oid = Oid::of(GitKind::Commit, commit.as_bytes());
+    let pack = git_pack_of(&[
+        (GitKind::Blob, lib),
+        (GitKind::Blob, manifest),
+        (GitKind::Tree, src_tree.as_slice()),
+        (GitKind::Tree, root_tree.as_slice()),
+        (GitKind::Commit, commit.as_bytes()),
+    ]);
+    (commit_oid, pack)
+}
+
+fn git_lock_text(commit: blaze_git_fetch::Oid) -> OwnString<Alloc<'static>> {
+    let mut text = OwnString::new_in(Alloc::global());
+    let s = std::format!(
+        "version = 4\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \"g\",\n]\n\n[[package]]\nname = \"g\"\nversion = \"0.1.0\"\nsource = \"git+https://github.com/example/g.git?rev={commit}#{commit}\"\n"
+    );
+    text.str(s.as_str());
+    text
+}
+
+fn unit_g<'f>(units: &'f [Unit<'f, 'static>]) -> Option<&'f Unit<'f, 'static>> {
+    units.iter().find(|unit| matches!(unit, Unit::Git { .. }))
+}
+
+/// Piece 14: a git commit in `<cargo home>/git/db/<repo>-<16hex>/objects/pack/pack-<40hex>.pack`
+/// is adopted only when an object hashes to the lock's pinned commit SHA-1; the record equals
+/// `unpack::git_pack_record` byte for byte and is kept in the home's sources store so deleting
+/// cargo's pack leaves a second command answered from the store with no network.
+///
+/// Expected: `test fetch::tests::a_git_commit_in_cargos_git_db_is_adopted_by_the_locks_commit_and_held ... ok`
+#[test]
+fn a_git_commit_in_cargos_git_db_is_adopted_by_the_locks_commit_and_held() {
+    let io = Io::simulated(SimWorld::new(29, Limits::USUAL));
+    let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+    let (commit, pack) = make_git_pack(b"pub fn g() -> u32 { 42 }\n");
+    let lock = git_lock_text(commit);
+    let pack_at = "c/git/db/g-0123456789abcdef/objects/pack/pack-0000000000000000000000000000000000000001.pack";
+    write(&io, &cx, pack_at, pack.as_slice());
+    write(&io, &cx, "one/Cargo.lock", lock.as_str().as_bytes());
+
+    let fetch_g = |checkout: &'static str| {
+        let mut lockfile = match Lockfile::read(lock.as_str().as_bytes(), blaze_own::testing::heap(), cx.frame()) {
+            Ok(lockfile) => lockfile,
+            Err(words) => panic!("the lock is refused: {}", words.as_str()),
+        };
+        let name = fetch_task::name(unit_g(lockfile.units).expect("the lock's git unit"));
+        match run(&cx, &mut lockfile, &env(&io, checkout), name, cx.frame()) {
+            Ok(did) => (did, name.subject),
+            Err(error) => panic!("the task stopped the command: {error:?}"),
+        }
+    };
+
+    let (did, subject) = fetch_g(CHECKOUT);
+    assert!(answered_held(&did, subject), "the git unit is adopted from cargo's git/db");
+
+    let lockfile = match Lockfile::read(lock.as_str().as_bytes(), blaze_own::testing::heap(), cx.frame()) {
+        Ok(lockfile) => lockfile,
+        Err(words) => panic!("the lock is refused: {}", words.as_str()),
+    };
+    let unit = unit_g(lockfile.units).expect("the lock's git unit");
+    let held = held_bytes(&cx, &store(&io, &cx), unit).expect("the adopted git record is in the sources store");
+    let (direct, _) = blaze_fetch::unpack::git_pack_record(commit, pack.as_slice(), &blaze_fetch::fetch::Limits::REAL.unpack, Alloc::global())
+        .expect("direct git_pack_record");
+    assert_eq!(held.as_slice(), direct.as_slice(), "adopted git record equals git_pack_record byte for byte");
+
+    io.need_fs().expect("files").root().remove(&cx, &Path::new(pack_at).expect("a path"), Durable::No).expect("pack deleted");
+    let (did, subject) = fetch_g(CHECKOUT);
+    assert!(answered_held(&did, subject), "second command serves the git unit from the sources store");
+}
+
+/// Piece 14: a pack in cargo's `git/db` that lacks the pinned commit or has a tampered trailer is
+/// refused, named in `Tried`, and never adopted; a second pack in the same folder holding the
+/// pinned commit still succeeds.
+///
+/// Expected: `test fetch::tests::a_git_pack_without_the_pinned_commit_or_tampered_is_refused_and_named ... ok`
+#[test]
+fn a_git_pack_without_the_pinned_commit_or_tampered_is_refused_and_named() {
+    let io = Io::simulated(SimWorld::new(31, Limits::USUAL));
+    let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+    let (commit, pack) = make_git_pack(b"pub fn g() -> u32 { 1 }\n");
+    let (_other_commit, other_pack) = make_git_pack(b"pub fn g() -> u32 { 2 }\n");
+    let mut tampered = OwnVec::new_in(Alloc::global());
+    tampered.extend_from_slice(pack.as_slice());
+    let last = tampered.len() - 1;
+    tampered[last] ^= 1;
+    let lock = git_lock_text(commit);
+
+    let wrong_at = "c/git/db/g-0123456789abcdef/objects/pack/pack-0000000000000000000000000000000000000001.pack";
+    let bad_at = "c/git/db/g-0123456789abcdef/objects/pack/pack-0000000000000000000000000000000000000002.pack";
+    write(&io, &cx, wrong_at, other_pack.as_slice());
+    write(&io, &cx, bad_at, tampered.as_slice());
+    write(&io, &cx, "one/Cargo.lock", lock.as_str().as_bytes());
+
+    let root = store(&io, &cx);
+    let lockfile = match Lockfile::read(lock.as_str().as_bytes(), blaze_own::testing::heap(), cx.frame()) {
+        Ok(lockfile) => lockfile,
+        Err(words) => panic!("the lock is refused: {}", words.as_str()),
+    };
+    let unit = unit_g(lockfile.units).expect("the lock's git unit");
+    let env = env(&io, CHECKOUT);
+    let mut cargo = CargoCache::new();
+    let mut tries = OwnVec::new_in(Alloc::global());
+    tries.push(Try { place: STORE_PLACE, miss: Miss::Absent });
+    let adopted = adopt_local(&cx, &root, &mut cargo, &env, unit, &mut tries).expect("no tool error");
+    assert!(!adopted, "wrong and tampered git packs are never adopted");
+    assert!(held_bytes(&cx, &root, unit).is_none(), "nothing written to sources store");
+    let mut words = OwnString::new_in(Alloc::global());
+    words.show(&Tried { unit, tries: tries.as_slice() });
+    let said = words.as_str();
+    assert!(said.contains("pack-0000000000000000000000000000000000000001.pack"), "names wrong pack: {said}");
+    assert!(said.contains("the pack holds no commit of the pinned id"), "names NoCommit: {said}");
+    assert!(said.contains("pack-0000000000000000000000000000000000000002.pack"), "names tampered pack: {said}");
+    assert!(said.contains("the trailer is not the SHA-1 of the pack"), "names checksum failure: {said}");
+
+    // Adding a third pack with the pinned commit lets adoption succeed after refusing the first two.
+    let good_at = "c/git/db/g-0123456789abcdef/objects/pack/pack-0000000000000000000000000000000000000003.pack";
+    write(&io, &cx, good_at, pack.as_slice());
+    let mut cargo2 = CargoCache::new();
+    let mut tries2 = OwnVec::new_in(Alloc::global());
+    let adopted2 = adopt_local(&cx, &root, &mut cargo2, &env, unit, &mut tries2).expect("no tool error");
+    assert!(adopted2, "third pack with pinned commit is adopted");
+    assert!(held_bytes(&cx, &root, unit).is_some(), "adopted record written");
 }
