@@ -38,9 +38,6 @@
 //! `test result: ok. ran 2: 2 passed, 0 failed` with status 0) for the package with `fails`: the
 //! check must refuse it. A judge that passed it would pass a driver that runs nothing.
 //!
-//! macOS only: Linux has no test sandbox, and every run there is `NOT RUN` (test_run.rs
-//! `Host::has_sandbox`); that is its own case, below, which asserts exactly that line.
-//!
 //! Run: `cargo test -p blaze-cli --test test_command_runs` (needs the toolchain's shelf in the
 //! owner's home, as tests/command_rungs.rs does). Expected: `test a_pass_and_a_failure ... ok`,
 //! `test a_pass_alone ... ok`, `test every_test_passes_is_caught ... ok`.
@@ -264,7 +261,7 @@ fn judge(said: &Said, failing: bool) -> Result<(), String> {
 }
 
 #[test]
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn a_pass_and_a_failure() {
     let lib = format!("{PASS}\n{FAIL}");
     let (said, stderr, stdout) = fixture("test_command_runs_both", &[("Cargo.toml", MANIFEST), ("src/lib.rs", &lib)], |dir, home| {
@@ -299,7 +296,7 @@ fn a_pass_and_a_failure() {
 }
 
 #[test]
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn a_pass_alone() {
     let said = blaze_test("test_command_runs_pass", PASS);
     if let Err(why) = judge(&said, false) {
@@ -308,7 +305,7 @@ fn a_pass_alone() {
 }
 
 #[test]
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn pinned_core_transparent_arguments_and_results() {
     let source = r#"
 use core::{mem::{ManuallyDrop, transmute}, num::NonZeroU32, ptr::NonNull};
@@ -346,13 +343,56 @@ fn passes() {
     }
 }
 
+/// Linux test sandbox (Landlock + seccomp, `test.md` piece 9):
+/// - writes inside `$TMPDIR` succeed;
+/// - writes outside `$TMPDIR` (e.g. the package manifest) are refused with `PermissionDenied`;
+/// - `#[should_panic(expected = ...)]` succeeds via the pre-created `unwound-<row>` marker;
+/// - `std::process::exit(101)` without unwinding is NOT misclassified as a panic (control against
+///   treating the pre-created 0-byte marker file as an unwind).
 #[test]
 #[cfg(target_os = "linux")]
-fn no_sandbox_runs_nothing() {
-    let said = blaze_test("test_command_runs_linux", PASS);
-    let line = "NOT RUN passes: cannot be run yet: no test sandbox is built for Linux yet, and blaze runs no test unsandboxed (rule 9; test.md, piece 9)";
-    assert!(said.stdout.lines().any(|l| l == line), "{}", evidence(line, &said));
-    assert_ne!(said.code, Some(0), "a suite that ran nothing is not a pass\n{}", said.stdout);
+fn linux_sandbox_confines_writes_and_distinguishes_exit_101() {
+    let source = r#"
+#[test]
+fn can_write_inside_tmpdir() {
+    let p = std::env::temp_dir().join("ok.txt");
+    std::fs::write(&p, b"hello").expect("write inside TMPDIR");
+    assert_eq!(std::fs::read(&p).expect("read back"), b"hello");
+}
+
+#[test]
+fn cannot_write_outside_tmpdir() {
+    let cwd = std::env::current_dir().expect("current dir");
+    let escaped = cwd.join("escaped.txt");
+    let err = std::fs::write(&escaped, b"nope").expect_err("creating file outside TMPDIR must be denied by Landlock");
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "expected EACCES/PermissionDenied creating file, got {err:?}");
+    let err2 = std::fs::OpenOptions::new()
+        .write(true)
+        .open(cwd.join("Cargo.toml"))
+        .expect_err("opening existing file for write outside TMPDIR must be denied by Landlock");
+    assert_eq!(err2.kind(), std::io::ErrorKind::PermissionDenied, "expected EACCES/PermissionDenied writing Cargo.toml, got {err2:?}");
+}
+
+#[test]
+#[should_panic(expected = "expected boom")]
+fn should_panic_works_with_precreated_marker() {
+    panic!("expected boom");
+}
+
+#[test]
+fn exit_101_without_unwind_is_not_panic() {
+    std::process::exit(101);
+}
+"#;
+    let said = blaze_test("test_command_runs_linux_sandbox", source);
+    assert_eq!(said.code, Some(1), "{}", evidence("only exit_101 test should fail", &said));
+    assert!(
+        said.stdout.contains("FAILED exit_101_without_unwind_is_not_panic")
+            && !said.stdout.contains("FAILED exit_101_without_unwind_is_not_panic: panicked")
+            && said.stdout.contains("3 passed, 1 failed"),
+        "{}",
+        evidence("3 sandbox/should_panic tests pass; exit(101) fails without being classified as panicked", &said)
+    );
 }
 
 // Deliberately put beta first in the manifest. The command orders results by owner and path.
@@ -439,7 +479,7 @@ fn only_dependent_test_refused(stdout: &str, code: Option<i32>) -> bool {
 }
 
 #[test]
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn refused_first_call_does_not_hide_the_next_test() {
     // A `let` binding with an `@` subpattern is refused in walk.rs `plain_binding` with
     // `REFUSED`. Keep it in the *callee* so the launcher first enters a successfully built test.
@@ -464,7 +504,7 @@ fn the_refusal_oracle_catches_one_stopped_and_not_run_as_pass() {
 }
 
 #[test]
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn runs_both_workspace_packages() {
     let lock = format!("{LOCK_ALPHA}{LOCK_BETA}");
     let manifest = format!("{WORKSPACE}\n[profile.dev]\npanic = \"abort\"\n");
@@ -498,7 +538,7 @@ fn runs_both_workspace_packages() {
 /// workspace without the setting is not refused; `runs_both_workspace_packages` (abort, no
 /// dependency) runs its 2 tests.
 #[test]
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn tests_over_a_dependency_built_to_abort_stop_up_front() {
     const ALPHA_ON_BETA: &str = "[package]\nname = \"alpha\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nbeta = { path = \"../beta\" }\n";
     const LOCK: &str = "version = 4\n\n[[package]]\nname = \"alpha\"\nversion = \"0.1.0\"\ndependencies = [\n \"beta\",\n]\n\n[[package]]\nname = \"beta\"\nversion = \"0.1.0\"\n";
@@ -557,7 +597,7 @@ fn every_test_passes_is_caught() {
 }
 
 #[test]
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn incremental_reruns_only_changed_test_and_reuses_unchanged() {
     let make_lib = |a_expr: &str, b_expr: &str| {
         format!(
@@ -624,7 +664,7 @@ fn incremental_reruns_only_changed_test_and_reuses_unchanged() {
 }
 
 #[test]
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn impure_test_is_not_kept_and_reruns() {
     let source = "#[test]\nfn reads_clock() {\n    let _ = std::time::SystemTime::now();\n}\n";
     fixture("test_command_impure_clock", &[("Cargo.toml", MANIFEST), ("src/lib.rs", source)], |dir, home| {
@@ -651,7 +691,7 @@ fn impure_test_is_not_kept_and_reruns() {
 }
 
 #[test]
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn termination_returning_tests_pass_fail_and_cache() {
     let source = r#"
 use std::process::ExitCode;
@@ -712,7 +752,7 @@ fn exit_code_42() -> ExitCode {
 }
 
 #[test]
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn scoped_test_checks_only_selected_member_and_its_deps() {
     let files: &[(&str, &str)] = &[
         ("Cargo.toml", "[workspace]\nmembers = [\"dep\", \"a\", \"b\"]\nresolver = \"2\"\n"),
@@ -777,11 +817,11 @@ fn scoped_test_checks_only_selected_member_and_its_deps() {
 /// per-row 8-byte `micros` wall-time field so every `TestId`, outcome tag, `NotKept` reason,
 /// 32-byte `BZTR` address, asks table, and read table are compared byte-for-byte) and counts
 /// kept `BZTR` pass records (`kept == 0`).
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn collect_bzth_and_bztr(store_root: &Path) -> (blaze_own::AVec<'static, blaze_own::AVec<'static, u8>>, usize) {
     let alloc = blaze_own::testing::heap().alloc();
     let mut heads = blaze_own::AVec::new_in(alloc);
-    let mut bztr_kept_passes = 0usize;
+    let mut bztr_kept = blaze_own::AVec::new_in(alloc);
     let listed = Command::new("/usr/bin/find").arg(store_root).args(["-type", "f"]).output().expect("list store files");
     assert!(listed.status.success(), "find store files failed");
     let paths = core::str::from_utf8(&listed.stdout).expect("utf8 store paths");
@@ -818,18 +858,25 @@ fn collect_bzth_and_bztr(store_root: &Path) -> (blaze_own::AVec<'static, blaze_o
                 && bytes[i + 6..i + 16] == [0u8; 10]
                 && bytes[i + 56..i + 64] == [0u8; 8]
             {
-                bztr_kept_passes += 1;
+                let mut rec = [0u8; 64];
+                rec.copy_from_slice(&bytes[i..i + 64]);
+                bztr_kept.push(rec);
                 i += 64;
                 continue;
             }
             i += 1;
         }
     }
+    // Background GC compaction may copy records into a newer segment while the superseded
+    // segment is still within its retention grace window; deduplicate identical records.
     heads.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
-    (heads, bztr_kept_passes)
+    heads.dedup_by(|a, b| a.as_slice() == b.as_slice());
+    bztr_kept.sort();
+    bztr_kept.dedup();
+    (heads, bztr_kept.len())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn copy_dir_files(src: &Path, dst: &Path) {
     let status = Command::new("/bin/cp").arg("-R").arg(src).arg(dst).status().expect("cp -R store");
     assert!(status.success(), "cp -R store failed");
@@ -842,7 +889,7 @@ fn copy_dir_files(src: &Path, dst: &Path) {
 /// - produces byte-for-byte identical `BZTR` test-result records as `--workers 1` (`Codes::Serial`),
 ///   and cross-reuses kept results in both directions (`Pooled -> Serial` and `Serial -> Pooled`).
 #[test]
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn pooled_workers_match_serial_bztr_and_purity() {
     let lib = r#"
 static BASE: u64 = 17;

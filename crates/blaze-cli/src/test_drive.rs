@@ -97,6 +97,7 @@ pub(crate) mod suite_cache;
 /// The system's launcher of `sandbox_init` (blaze-proc-macro native_sandbox.rs uses the same):
 /// it applies the profile, then executes the launcher in its place, so the launcher's process is
 /// the test's and its end is the test's end.
+#[cfg(target_os = "macos")]
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 /// How often a running test's pipes are emptied while its channel is quiet: a writer blocks on
 /// a full pipe (64 KiB) for at most this long.
@@ -247,7 +248,10 @@ impl fmt::Display for OneError {
             ),
             OneError::LauncherNotLooked { launcher, why } => write!(f, "whether the launcher is at `{launcher}` could not be looked at: {why}"),
             OneError::Profile { why } => write!(f, "a test's sandbox profile: {why}"),
+            #[cfg(target_os = "macos")]
             OneError::Start(error) => write!(f, "a test's launcher did not start under {SANDBOX_EXEC}: {error}"),
+            #[cfg(not(target_os = "macos"))]
+            OneError::Start(error) => write!(f, "a test's launcher did not start in its sandbox: {error}"),
             OneError::Pipe(error) => write!(f, "a test's output: {error}"),
             OneError::MissingPipe { stream } => write!(f, "the test launcher was started with piped {stream} but supplied no read end"),
             OneError::Capture(error) => write!(f, "the test's stderr capture: {error}"),
@@ -2684,6 +2688,7 @@ pub(crate) struct Launched<'c, 'h, 'a> {
 /// The test profile with the one grant a native image needs: `dlopen` maps `<store>/<64 hex>`
 /// executable, which `(deny default)` refuses (blaze-launch-rt native_lib.rs, step 2). That one
 /// file, by its literal path, nothing else: it is the parent's own record, named by its key.
+#[cfg(any(target_os = "macos", test))]
 fn with_native<'a>(mut profile: AString<'a>, store: &str, native: Option<crate::engine_native::NativeSend<'_>>) -> Result<AString<'a>, OneError> {
     let Some(send) = native else { return Ok(profile) };
     if store.contains(['"', '\\', '\n']) || !send.hex.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -2699,6 +2704,7 @@ fn with_native<'a>(mut profile: AString<'a>, store: &str, native: Option<crate::
 
 /// Allows the launcher to create the single per-row unwind marker file beside `stderr-<row>`
 /// (outside the test's `$TMPDIR`) when a harnessed test unwinds out of its entry.
+#[cfg(any(target_os = "macos", test))]
 fn with_unwound<'a>(mut profile: AString<'a>, unwound: Option<&str>) -> Result<AString<'a>, OneError> {
     let Some(path) = unwound else { return Ok(profile) };
     if path.contains(['"', '\\', '\n']) {
@@ -2985,14 +2991,39 @@ impl<'c> Launched<'c, '_, '_> {
         if let Some(unwound) = unwound_full.as_ref() {
             vars.push(("BLAZE_LAUNCH_UNWOUND_FILE", unwound.as_str()));
         }
-        // 4. Seatbelt profile + spawn.
-        let profile = seatbelt_profile(temp.as_str(), self.store, self.native, unwound_full.as_ref().map(|s| s.as_str()), frame, alloc)?;
-        let mut args = Vec::with_capacity_in(self.args.len() + 3, frame);
-        args.extend_from_slice(&["-p", profile.as_str(), self.launcher]);
-        args.extend_from_slice(self.args);
-        let spec = RunSpec { program: SANDBOX_EXEC, arg0: None, args: args.as_slice(), env: vars.as_slice(), dir: self.place.dir, streams: Streams::PIPED, own_group: true, parent_death: ParentDeath::STRONGEST };
-        signals.begin(Doing::Starting);
-        let Started { child: mut run, pipes: given } = self.spawner.start_served(cx, &spec).map_err(OneError::Start)?;
+        // 4. Sandbox + spawn.
+        #[cfg(target_os = "macos")]
+        let Started { child: mut run, pipes: given } = {
+            let profile = seatbelt_profile(temp.as_str(), self.store, self.native, unwound_full.as_ref().map(|s| s.as_str()), frame, alloc)?;
+            let mut args = Vec::with_capacity_in(self.args.len() + 3, frame);
+            args.extend_from_slice(&["-p", profile.as_str(), self.launcher]);
+            args.extend_from_slice(self.args);
+            let spec = RunSpec { program: SANDBOX_EXEC, arg0: None, args: args.as_slice(), env: vars.as_slice(), dir: self.place.dir, streams: Streams::PIPED, own_group: true, parent_death: ParentDeath::STRONGEST };
+            signals.begin(Doing::Starting);
+            self.spawner.start_served(cx, &spec).map_err(OneError::Start)?
+        };
+        #[cfg(target_os = "linux")]
+        let Started { child: mut run, pipes: given } = {
+            if unwound_full.is_some() {
+                // Pre-create the empty marker so Landlock can grant file-only WRITE_FILE|TRUNCATE
+                // on this single inode without opening `suite_dir` (and sibling `stderr-<row>`)
+                // for writes.
+                let marker = suite_dir.create(cx, unwound_path).map_err(OneError::Capture)?;
+                marker.close(cx, Durable::No).map_err(OneError::Capture)?;
+            }
+            let spec = RunSpec { program: self.launcher, arg0: None, args: self.args, env: vars.as_slice(), dir: self.place.dir, streams: Streams::PIPED, own_group: true, parent_death: ParentDeath::STRONGEST };
+            let sandbox = bstd::procs::TestSandbox {
+                temp: temp.as_str(),
+                unwound: unwound_full.as_ref().map(|s| s.as_str()),
+            };
+            signals.begin(Doing::Starting);
+            self.spawner.start_served_test(cx, &spec, &sandbox).map_err(OneError::Start)?
+        };
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let Started { child: mut run, pipes: given } = {
+            let _ = (vars, unwound_full, signals);
+            return Err(OneError::Profile { why: Box::from("no test sandbox is built for this host") });
+        };
         let started_at = run.now();
         signals.started.set(true);
         signals.progress.set(true);
@@ -3375,18 +3406,22 @@ impl<'c> Launched<'c, '_, '_> {
         if self.tests.harnessed() && matches!(ended, How::NoReport { code: 101, torn: 0 }) {
             match suite_dir.open_read(cx, unwound_path) {
                 Ok(marker) => {
+                    let mut byte = [0u8; 1];
+                    let n = marker.read_into(&mut byte, 0).wait(cx).map_err(OneError::Capture)?;
                     drop(marker);
                     let _ = suite_dir.remove(cx, unwound_path, Durable::No);
-                    ended = How::Reported(Said::Panicked { at: None });
-                    let tail = stderr.tail_bytes(cx, frame)?;
-                    let mut lossy = String::new_in(alloc);
-                    for chunk in tail.utf8_chunks() {
-                        lossy.push_str(chunk.valid());
-                        if !chunk.invalid().is_empty() {
-                            lossy.push('\u{FFFD}');
+                    if n > 0 && byte[0] == b'1' {
+                        ended = How::Reported(Said::Panicked { at: None });
+                        let tail = stderr.tail_bytes(cx, frame)?;
+                        let mut lossy = String::new_in(alloc);
+                        for chunk in tail.utf8_chunks() {
+                            lossy.push_str(chunk.valid());
+                            if !chunk.invalid().is_empty() {
+                                lossy.push('\u{FFFD}');
+                            }
                         }
+                        panic_text.push_str(extract_panic_message(lossy.as_str()));
                     }
-                    panic_text.push_str(extract_panic_message(lossy.as_str()));
                 }
                 Err(error) if error.kind == FsKind::NotFound => {}
                 Err(error) => return Err(OneError::Capture(error)),
@@ -3586,6 +3621,7 @@ impl<'c> Launched<'c, '_, '_> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn seatbelt_profile<'a>(
     temp: &str,
     store: &str,

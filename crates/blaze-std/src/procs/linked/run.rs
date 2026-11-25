@@ -68,6 +68,15 @@ pub struct RunSpec<'a> {
     pub parent_death: ParentDeath,
 }
 
+/// The Linux test sandbox's writable paths ([`Spawner::start_served_test`]; test.md, piece 9):
+/// the test's own `$TMPDIR` (full writable subtree) and, when harnessed, the pre-created unwind
+/// marker file (file-only write + truncate, leaving sibling files in its directory read-only).
+#[cfg(target_os = "linux")]
+pub struct TestSandbox<'a> {
+    pub temp: &'a str,
+    pub unwound: Option<&'a str>,
+}
+
 /// What to start detached in a new session ([`Spawner::start_detached`]): the program, its
 /// arguments, its whole environment (nothing of this process's is inherited), and its directory.
 /// Standard streams are `/dev/null` and every other descriptor is closed on exec, so the parent
@@ -302,6 +311,47 @@ impl Spawner {
         let Started { child: run, pipes } = self.start_with(cx, spec, &given, None)?;
         // The child's end is dropped here: from now on the child holds the only copy, so its
         // exit closes the channel for this end's reads.
+        drop(child_end);
+        Ok(Started { child: Served { run, channel: parent }, pipes })
+    }
+
+    /// `spec` started with its channel as [`CHILD_FD`] inside the Linux test sandbox
+    /// (`blaze_sys::linux::confine::TestConfine`: Landlock + seccomp + `PR_SET_NO_NEW_PRIVS`,
+    /// entered in the child before `execve`). Refused steps are [`RunFault::Host`]; the program
+    /// never runs unsandboxed (rule 9).
+    #[cfg(target_os = "linux")]
+    pub fn start_served_test(&self, cx: &Cx, spec: &RunSpec<'_>, sandbox: &TestSandbox<'_>) -> Result<Started<Served>, RunError> {
+        fn c_path<'a>(path: &str, buf: &'a mut [u8; 4096], what: &'static str) -> Result<&'a core::ffi::CStr, RunError> {
+            let bytes = path.as_bytes();
+            if bytes.len() + 1 > buf.len() || bytes.contains(&0) {
+                return Err(RunError { step: RunStep::Start, proc: None, fault: RunFault::Host { what, os: 0 } });
+            }
+            buf[..bytes.len()].copy_from_slice(bytes);
+            buf[bytes.len()] = 0;
+            core::ffi::CStr::from_bytes_with_nul(&buf[..=bytes.len()])
+                .map_err(|_| RunError { step: RunStep::Start, proc: None, fault: RunFault::Host { what, os: 0 } })
+        }
+        let refuse = |fault| RunError { step: RunStep::Start, proc: None, fault };
+        let mut temp_buf = [0u8; 4096];
+        let temp_c = c_path(sandbox.temp, &mut temp_buf, "test sandbox temp path")?;
+        let mut unwound_buf = [0u8; 4096];
+        let unwound_c = match sandbox.unwound {
+            Some(path) => Some(c_path(path, &mut unwound_buf, "test sandbox unwound path")?),
+            None => None,
+        };
+        let prepared = blaze_sys::linux::confine::TestConfine::prepare(temp_c, unwound_c).map_err(|err| {
+            let (what, os) = match err {
+                blaze_sys::linux::confine::TestConfineError::AbiProbe(errno) => ("landlock ABI probe", i32::from(errno.raw())),
+                blaze_sys::linux::confine::TestConfineError::AbiTooOld { .. } => ("landlock ABI is older than 3", 0),
+                blaze_sys::linux::confine::TestConfineError::CreateRuleset(errno) => ("landlock_create_ruleset", i32::from(errno.raw())),
+                blaze_sys::linux::confine::TestConfineError::OpenPath { which, errno } => (which, i32::from(errno.raw())),
+                blaze_sys::linux::confine::TestConfineError::AddRule { which, errno } => (which, i32::from(errno.raw())),
+            };
+            refuse(RunFault::Host { what, os })
+        })?;
+        let (parent, child_end) = channel::pair().map_err(|error| refuse(RunFault::Channel(error)))?;
+        let given = [(child_end.fd(), CHILD_FD)];
+        let Started { child: run, pipes } = self.start_with(cx, spec, &given, Some(&prepared.confine()))?;
         drop(child_end);
         Ok(Started { child: Served { run, channel: parent }, pipes })
     }

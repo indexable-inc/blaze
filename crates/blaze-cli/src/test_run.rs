@@ -92,17 +92,25 @@ pub(crate) const END_DEADLINE: Nanos = Nanos(5_000_000_000);
 pub(crate) enum Host {
     Macos,
     Linux,
+    Other,
 }
 
 impl Host {
     /// The host this blaze was built for.
-    pub(crate) const THIS: Host = if cfg!(target_os = "linux") { Host::Linux } else { Host::Macos };
+    pub(crate) const THIS: Host = if cfg!(target_os = "linux") {
+        Host::Linux
+    } else if cfg!(target_os = "macos") {
+        Host::Macos
+    } else {
+        Host::Other
+    };
 
-    /// A test sandbox exists here (macOS `sandbox_init`; Linux's is not built: test.md piece 9).
+    /// A test sandbox exists here (macOS `sandbox_init` / Seatbelt; Linux Landlock + seccomp:
+    /// test.md piece 9).
     pub(crate) const fn has_sandbox(self) -> bool {
         match self {
-            Host::Macos => true,
-            Host::Linux => false,
+            Host::Macos | Host::Linux => true,
+            Host::Other => false,
         }
     }
 }

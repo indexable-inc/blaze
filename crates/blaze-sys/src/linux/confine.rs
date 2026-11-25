@@ -20,8 +20,13 @@
 //! `RunLink::confine` and runs [`enter`] in its `clone(CLONE_VM|CLONE_VFORK)` child last before
 //! `execve` (`process/spawn.rs`), and bstd, which prepares it from a hermetic run's plan.
 
-use super::{SockFilter, nr::PRLIMIT64, raw};
-use crate::{Errno, Fd};
+use core::ffi::CStr;
+
+use super::{
+    AccessFs, CWD, OpenFlags, OwnedFd, PathBeneath, RulesetAttr, SockFilter,
+    landlock_abi, landlock_add_rule_path, landlock_create_ruleset, nr::PRLIMIT64, openat, raw,
+};
+use crate::{Errno, Fd, Path};
 
 /// `struct rlimit64`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -152,6 +157,16 @@ const AUDIT_ARCH: u32 = 0xC000_00B7;
 /// (the host's counters), `io_uring_setup` (a second path for every call above),
 /// `keyctl`, `add_key`, `request_key`.
 pub mod deny {
+    /// `socket`.
+    #[cfg(target_arch = "x86_64")]
+    pub const SOCKET: u32 = 41;
+    #[cfg(target_arch = "aarch64")]
+    pub const SOCKET: u32 = 198;
+    /// Non-socket syscalls denied with `EPERM` in both hermetic and test sandboxes.
+    #[cfg(target_arch = "x86_64")]
+    pub const NON_SOCKET_EPERM: [u32; 18] = [101, 310, 311, 165, 166, 155, 272, 308, 428, 429, 430, 432, 321, 298, 425, 250, 248, 249];
+    #[cfg(target_arch = "aarch64")]
+    pub const NON_SOCKET_EPERM: [u32; 18] = [117, 270, 271, 40, 39, 41, 97, 268, 428, 429, 430, 432, 280, 241, 425, 219, 217, 218];
     #[cfg(target_arch = "x86_64")]
     pub const EPERM: [u32; 19] = [41, 101, 310, 311, 165, 166, 155, 272, 308, 428, 429, 430, 432, 321, 298, 425, 250, 248, 249];
     #[cfg(target_arch = "aarch64")]
@@ -222,23 +237,165 @@ pub fn build(filter: Filter, out: &mut [SockFilter; MOST_FILTER]) -> &[SockFilte
     &out[..at]
 }
 
+const AF_UNIX: u32 = 1;
+const AF_INET: u32 = 2;
+const AF_INET6: u32 = 10;
+
+/// Seccomp filter for a sandboxed test child (`docs/v2/plan/design/test.md`, piece 9): denies all
+/// non-socket dangerous syscalls (`ptrace`, mounts, namespaces, `bpf`, `perf_event_open`,
+/// `io_uring_setup`, keyrings) and restricts `socket(domain, ..)` to `AF_UNIX`, `AF_INET`, and
+/// `AF_INET6`. Processes (`fork`/`clone`/`exec`) remain allowed so tests can spawn helpers.
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn build_test(out: &mut [SockFilter; MOST_FILTER]) -> &[SockFilter] {
+    let mut at = 0;
+    let mut put = |instruction: SockFilter| {
+        out[at] = instruction;
+        at += 1;
+    };
+    put(stmt(LD_W_ABS, DATA_ARCH));
+    put(jump(JEQ_K, AUDIT_ARCH, 1, 0));
+    put(stmt(RET_K, RET_KILL_PROCESS));
+    put(stmt(LD_W_ABS, DATA_NR));
+    if let Some(bit) = deny::X32_BIT {
+        put(jump(JGE_K, bit, 0, 1));
+        put(stmt(RET_K, RET_KILL_PROCESS));
+    }
+    for nr in deny::NON_SOCKET_EPERM {
+        put(jump(JEQ_K, nr, 0, 1));
+        put(stmt(RET_K, RET_ERRNO | EPERM));
+    }
+    // `socket(domain, ..)`: allow only AF_UNIX, AF_INET, AF_INET6; deny other families with EPERM.
+    put(jump(JEQ_K, deny::SOCKET, 0, 5));
+    put(stmt(LD_W_ABS, DATA_ARG0));
+    put(jump(JEQ_K, AF_UNIX, 3, 0));
+    put(jump(JEQ_K, AF_INET, 2, 0));
+    put(jump(JEQ_K, AF_INET6, 1, 0));
+    put(stmt(RET_K, RET_ERRNO | EPERM));
+    put(stmt(RET_K, RET_ALLOW));
+    &out[..at]
+}
+
+/// Minimum Landlock ABI required to confine a Linux test process (ABI 3 adds `TRUNCATE`).
+pub const LEAST_TEST_ABI: u32 = 3;
+
+/// `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET | LANDLOCK_SCOPE_SIGNAL` (ABI 6).
+const TEST_SCOPES: u64 = 0b11;
+
+/// Why a Linux test sandbox could not be prepared (rule 9: never falls back to unsandboxed).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TestConfineError {
+    /// `landlock_create_ruleset(VERSION)` failed (`ENOSYS`/`EOPNOTSUPP`).
+    AbiProbe(Errno),
+    /// Kernel Landlock ABI is older than [`LEAST_TEST_ABI`].
+    AbiTooOld { abi: u32, least: u32 },
+    /// Creating the Landlock ruleset failed.
+    CreateRuleset(Errno),
+    /// Opening one of the fixed paths (`/`, `temp`, `/dev/null`, or `unwound`) failed.
+    OpenPath { which: &'static str, errno: Errno },
+    /// Adding a Landlock rule for `which` failed.
+    AddRule { which: &'static str, errno: Errno },
+}
+
+/// Prepared Linux test sandbox (Landlock ruleset + seccomp filter), ready to hand to
+/// [`enter`] in the child before `execve` (or after `fork` in a zygote).
+pub struct TestConfine {
+    ruleset: OwnedFd,
+    filter: [SockFilter; MOST_FILTER],
+    filter_len: usize,
+}
+
+impl TestConfine {
+    /// Builds the Linux test sandbox matching macOS Seatbelt's test policy (`blaze-run child.rs`):
+    /// - Read + execute anywhere under `/` (so checkout fixtures, system libraries, and the code
+    ///   store are readable, and child binaries can exec).
+    /// - Write + create + remove + rename + socket + exec beneath `temp` (`$TMPDIR`).
+    /// - Write + truncate (+ ioctl on ABI >= 5) on `/dev/null`.
+    /// - Write + truncate on the pre-created `unwound` marker file when harnessed (no directory
+    ///   write permission on its parent, so sibling `stderr-<row>` cannot be tampered with).
+    /// - Signals and abstract Unix sockets scoped to the sandbox on ABI >= 6.
+    /// - Seccomp filter from [`build_test`].
+    #[blaze::noalloc]
+    #[blaze::nopanic]
+    pub fn prepare(temp: &CStr, unwound: Option<&CStr>) -> Result<TestConfine, TestConfineError> {
+        let abi = landlock_abi().map_err(TestConfineError::AbiProbe)?;
+        if abi < LEAST_TEST_ABI {
+            return Err(TestConfineError::AbiTooOld { abi, least: LEAST_TEST_ABI });
+        }
+        let base_fs = AccessFs::ALL_ABI1.with(AccessFs::REFER).with(AccessFs::TRUNCATE);
+        let handled_fs = if abi >= 5 { base_fs.with(AccessFs::IOCTL_DEV) } else { base_fs };
+        let attr = RulesetAttr {
+            handled_access_fs: handled_fs.bits(),
+            handled_access_net: 0,
+            scoped: if abi >= 6 { TEST_SCOPES } else { 0 },
+        };
+        let ruleset = landlock_create_ruleset(&attr).map_err(TestConfineError::CreateRuleset)?;
+
+        let path_flags = OpenFlags::PATH.with(OpenFlags::CLOSE_ON_EXEC);
+        let dir_flags = path_flags.with(OpenFlags::DIRECTORY);
+
+        let add_path = |which: &'static str, path: &CStr, flags: OpenFlags, access: AccessFs| -> Result<(), TestConfineError> {
+            let fd = openat(CWD, Path::new(path), flags, 0).map_err(|errno| TestConfineError::OpenPath { which, errno })?;
+            let rule = PathBeneath { allowed_access: access.bits(), parent_fd: fd.fd().raw() };
+            landlock_add_rule_path(ruleset.fd(), &rule).map_err(|errno| TestConfineError::AddRule { which, errno })
+        };
+
+        // 1. Read + execute anywhere under `/`.
+        let read_exec = AccessFs::READ_FILE.with(AccessFs::READ_DIR).with(AccessFs::EXECUTE);
+        add_path("/", c"/", dir_flags, read_exec)?;
+
+        // 2. Full writable subtree under the test's own `$TMPDIR` (no char/block device creation).
+        let temp_access = AccessFs::from_bits(
+            base_fs.bits() & !(AccessFs::MAKE_CHAR.with(AccessFs::MAKE_BLOCK).bits()),
+        );
+        add_path("temp", temp, dir_flags, temp_access)?;
+
+        // 3. `/dev/null`: file-only write + read + truncate (+ ioctl on ABI >= 5).
+        let null_base = AccessFs::READ_FILE.with(AccessFs::WRITE_FILE).with(AccessFs::TRUNCATE);
+        let null_access = if abi >= 5 { null_base.with(AccessFs::IOCTL_DEV) } else { null_base };
+        add_path("/dev/null", c"/dev/null", path_flags, null_access)?;
+
+        // 4. Optional pre-created unwind marker file: file-only write + truncate.
+        if let Some(marker) = unwound {
+            let marker_access = AccessFs::READ_FILE.with(AccessFs::WRITE_FILE).with(AccessFs::TRUNCATE);
+            add_path("unwound", marker, path_flags, marker_access)?;
+        }
+
+        let mut filter = [SockFilter { code: 0, jt: 0, jf: 0, k: 0 }; MOST_FILTER];
+        let filter_len = build_test(&mut filter).len();
+        Ok(TestConfine { ruleset, filter, filter_len })
+    }
+
+    /// Borrows this prepared confinement for [`enter`] or `RunLink::confine`.
+    #[blaze::noalloc]
+    #[blaze::nopanic]
+    pub fn confine(&self) -> ChildConfine<'_> {
+        ChildConfine { ruleset: self.ruleset.fd(), filter: &self.filter[..self.filter_len], limits: &[] }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Filter, MOST_FILTER, RET_ALLOW, SockFilter, build};
+    use super::{Filter, MOST_FILTER, RET_ALLOW, SockFilter, build, build_test};
+
+    fn check_well_formed(filter: &[SockFilter]) {
+        let last = filter.last().copied().expect("a filter");
+        assert_eq!((last.code, last.k), (0x06, RET_ALLOW));
+        for (at, instruction) in filter.iter().enumerate() {
+            if instruction.code & 0x07 == 0x05 {
+                assert!(at + 1 + usize::from(instruction.jt.max(instruction.jf)) < filter.len(), "jump at {at} leaves the filter");
+            }
+        }
+    }
 
     /// The filter ends in its allow, fits its cap both ways, and every jump lands inside it.
     #[test]
     fn the_filter_is_well_formed_with_and_without_processes() {
         for processes in [false, true] {
             let mut out = [SockFilter { code: 0, jt: 0, jf: 0, k: 0 }; MOST_FILTER];
-            let filter = build(Filter { processes }, &mut out);
-            let last = filter.last().copied().expect("a filter");
-            assert_eq!((last.code, last.k), (0x06, RET_ALLOW));
-            for (at, instruction) in filter.iter().enumerate() {
-                if instruction.code & 0x07 == 0x05 {
-                    assert!(at + 1 + usize::from(instruction.jt.max(instruction.jf)) < filter.len(), "jump at {at} leaves the filter");
-                }
-            }
+            check_well_formed(build(Filter { processes }, &mut out));
         }
+        let mut test_out = [SockFilter { code: 0, jt: 0, jf: 0, k: 0 }; MOST_FILTER];
+        check_well_formed(build_test(&mut test_out));
     }
 }
