@@ -72,6 +72,8 @@ pub enum Plant {
     /// A git answer's commit is the first commit object of its pack, not the one whose id the
     /// lock pins: the server's word taken.
     CommitFromServer,
+    /// A git tree's submodule (`0o160000`) row is silently dropped while packing.
+    DropSubmodule,
 }
 
 #[cfg(test)]

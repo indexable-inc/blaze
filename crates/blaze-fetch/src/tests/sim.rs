@@ -104,6 +104,8 @@ struct Git {
     advert: std::vec::Vec<u8>,
     /// Another commit's `fetch` answer: what an origin serving the wrong commit sends.
     decoy: std::vec::Vec<u8>,
+    /// Gitlink submodules (`0o160000`) present in this commit's tree.
+    submodules: std::vec::Vec<(std::string::String, Oid)>,
 }
 
 fn limits(tape: &Tape) -> Limits {
@@ -220,8 +222,12 @@ fn answer_of(commit: Oid, pack: &[u8]) -> std::vec::Vec<u8> {
     out
 }
 
-/// A random commit, `hostile` as asked: its id, its honest answer and a tampered one.
-fn build_commit(tape: &Tape, tag: &str, hostile: Hostile) -> (Oid, std::vec::Vec<u8>, std::vec::Vec<u8>) {
+/// A random commit, `hostile` as asked: its id, its honest answer, a tampered one, and any submodules.
+fn build_commit(
+    tape: &Tape,
+    tag: &str,
+    hostile: Hostile,
+) -> (Oid, std::vec::Vec<u8>, std::vec::Vec<u8>, std::vec::Vec<(std::string::String, Oid)>) {
     let mut blobs: std::vec::Vec<(std::string::String, std::vec::Vec<u8>, u32)> = (0..1 + tape.below(3, "git files"))
         .map(|f| {
             let mut bytes = vec![0u8; tape.below(600, "git file len") as usize];
@@ -233,6 +239,12 @@ fn build_commit(tape: &Tape, tag: &str, hostile: Hostile) -> (Oid, std::vec::Vec
     if hostile == Hostile::BigBlob {
         blobs.push(("big.rs".into(), vec![0u8; 8 << 20], 0o100644));
     }
+    let mut submodules: std::vec::Vec<(std::string::String, Oid)> = std::vec::Vec::new();
+    if tape.one_in(2, "git submodule") {
+        let mut oid = [0u8; 20];
+        tape.fill(&mut oid, "git submodule oid");
+        submodules.push(("sub".to_string(), Oid(oid)));
+    }
     let manifest = format!("[package]\nname = \"{tag}\"\n").into_bytes();
     let objects_with = |blobs: &[(std::string::String, std::vec::Vec<u8>, u32)], changed: bool| {
         let mut src: std::vec::Vec<_> =
@@ -240,6 +252,9 @@ fn build_commit(tape: &Tape, tag: &str, hostile: Hostile) -> (Oid, std::vec::Vec
         let src = tree_of(&mut src);
         let src_id = Oid::of(GitKind::Tree, &src);
         let mut root = vec![("Cargo.toml".to_string(), 0o100644, Oid::of(GitKind::Blob, &manifest)), ("src".to_string(), 0o40000, src_id)];
+        for (name, oid) in submodules.iter() {
+            root.push((name.clone(), 0o160000, *oid));
+        }
         if hostile == Hostile::Escape {
             root.push(("..".to_string(), 0o40000, src_id));
         }
@@ -261,7 +276,7 @@ fn build_commit(tape: &Tape, tag: &str, hostile: Hostile) -> (Oid, std::vec::Vec
     };
     let (id, answer) = objects_with(&blobs, false);
     let (_, tampered) = objects_with(&blobs, true);
-    (id, answer, tampered)
+    (id, answer, tampered, submodules)
 }
 
 fn draw_git(tape: &Tape, at: usize, limits: &Limits) -> Crate {
@@ -271,8 +286,8 @@ fn draw_git(tape: &Tape, at: usize, limits: &Limits) -> Crate {
         1 => Hostile::BigBlob,
         _ => Hostile::No,
     };
-    let (commit, archive, tampered) = build_commit(tape, &name, hostile);
-    let (_, decoy, _) = build_commit(tape, "decoy", Hostile::No);
+    let (commit, archive, tampered, submodules) = build_commit(tape, &name, hostile);
+    let (_, decoy, _, _) = build_commit(tape, "decoy", Hostile::No);
     let truth = (hostile == Hostile::No).then(|| {
         let (record, _) = unpack::git_record(commit, &archive, limits.git_most, &limits.unpack, blaze_own::testing::heap().alloc()).unwrap();
         record.as_slice().to_vec()
@@ -286,7 +301,7 @@ fn draw_git(tape: &Tape, at: usize, limits: &Limits) -> Crate {
         tampered,
         sha256: [0; 32],
         truth,
-        git: Some(Git { repo, commit, advert: advert(), decoy }),
+        git: Some(Git { repo, commit, advert: advert(), decoy, submodules }),
     }
 }
 
@@ -615,8 +630,27 @@ fn run(
 fn judge_store(units: &[Unit<'_, '_>], crates: &[Crate], store: &BTreeMap<ContentId, std::vec::Vec<u8>>) -> Result<(), Broke> {
     for (unit, krate) in units.iter().zip(crates) {
         let Some(held) = store.get(&unit.key()) else { continue };
-        if PackView::open(held).is_err() {
+        let Ok(view) = PackView::open(held) else {
             return Err(Broke::Oracle(format!("wrong bytes: the record of {} does not open", krate.name)));
+        };
+        if krate.hostile == Hostile::No
+            && let Some(git) = &krate.git
+        {
+            for (path, oid) in git.submodules.iter() {
+                let Some(entry) = view.find_entry(path) else {
+                    return Err(Broke::Oracle(format!("missing submodule `{path}` in {}", krate.name)));
+                };
+                if entry.mode != crate::Mode::Submodule || entry.submodule_commit() != Some(oid.0) {
+                    return Err(Broke::Oracle(format!("wrong submodule `{path}` metadata in {}", krate.name)));
+                }
+                let nested = format!("{path}/lib.rs");
+                if !matches!(
+                    view.read(&nested, blaze_own::testing::heap().alloc()),
+                    Err(crate::PackRefused::Submodule { commit, .. }) if commit == oid.0
+                ) {
+                    return Err(Broke::Oracle(format!("submodule `{path}` in {} did not fail closed on reads", krate.name)));
+                }
+            }
         }
         match (&krate.truth, krate.hostile) {
             (Some(truth), _) if truth != held => {
@@ -761,6 +795,11 @@ fn the_oracle_catches_a_commit_taken_from_the_server() {
 #[test]
 fn the_oracle_catches_a_size_from_the_wire_allocated_unchecked() {
     blaze_sim::control(Config::cases(300), Plant::None, Plant::SizeFromWire, "allocated past its bound", case);
+}
+
+#[test]
+fn the_oracle_catches_a_dropped_submodule() {
+    blaze_sim::control(Config::cases(300), Plant::None, Plant::DropSubmodule, "missing submodule", case);
 }
 
 /// A gzip trailer that lies about the tar's size, either way, is a typed refusal (the gzip

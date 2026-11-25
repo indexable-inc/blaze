@@ -12,7 +12,9 @@
 //!   side band and indexed in place (each object's id computed from its bytes, the trailer's
 //!   SHA-1 checked, sizes and the base cache bounded), the tree of the pinned commit walked, so
 //!   every file is bound to the commit id the lock names, and each blob read straight into its
-//!   place in a record sized exactly before a byte is written. A submodule is refused by name.
+//!   place in a record sized exactly before a byte is written. Submodule gitlinks (`0o160000`)
+//!   are recorded as [`Mode::Submodule`] entries carrying their 20-byte pinned commit id so they
+//!   are covered by the tree digest and any read beneath them fails closed.
 
 #![blaze::sans_io]
 
@@ -322,13 +324,19 @@ pub fn crate_record_in<'a, S: Sink>(
     Ok((record, Made { files, bytes, cache: None }))
 }
 
-/// One file of a git commit, listed before the record is sized.
+#[derive(Clone, Copy)]
+enum ListedPayload {
+    Blob(Found),
+    Submodule(Oid),
+}
+
+/// One file (or gitlink submodule) of a git commit, listed before the record is sized.
 #[derive(Clone, Copy)]
 struct Listed {
     path_at: u32,
     path_len: u16,
     mode: Mode,
-    object: Found,
+    payload: ListedPayload,
 }
 
 /// The record of `commit` from `answer`, the body of git's `fetch` answer for it.
@@ -373,13 +381,21 @@ pub fn git_record_in<'a, S: Sink>(
         if failed.is_some() {
             return;
         }
-        let mode = match file.mode {
-            GitMode::File => Mode::File,
-            GitMode::Exec => Mode::Exec,
-            GitMode::Symlink => Mode::Link,
+        let (mode, payload, size) = match (file.mode, file.object) {
+            (GitMode::File, Some(object)) => (Mode::File, ListedPayload::Blob(object), object.size),
+            (GitMode::Exec, Some(object)) => (Mode::Exec, ListedPayload::Blob(object), object.size),
+            (GitMode::Symlink, Some(object)) => (Mode::Link, ListedPayload::Blob(object), object.size),
+            (GitMode::Submodule, None) => {
+                if planted(Plant::DropSubmodule) {
+                    return;
+                }
+                (Mode::Submodule, ListedPayload::Submodule(file.oid), 20)
+            }
+            // Unreachable from `blaze_git_fetch::files`, which only emits `None` for `Submodule`.
+            (_, None) | (GitMode::Submodule, Some(_)) => return,
         };
-        let row = Listed { path_at: names.len() as u32, path_len: file.path.len() as u16, mode, object: file.object };
-        total = total.saturating_add(file.object.size);
+        let row = Listed { path_at: names.len() as u32, path_len: file.path.len() as u16, mode, payload };
+        total = total.saturating_add(size);
         if let Err(why) = names.try_extend_from_slice(file.path.as_bytes()) {
             failed = Some(why);
         } else if let Err(refused) = listed.try_push(row) {
@@ -397,8 +413,15 @@ pub fn git_record_in<'a, S: Sink>(
     for row in listed.iter() {
         let at = row.path_at as usize;
         let path = core::str::from_utf8(&names[at..at + usize::from(row.path_len)]).expect("joined `str`s, cut at their ends");
-        let slot = builder.slot(path, row.mode, row.object.size).map_err(UnpackError::Pack)?;
-        index.read(row.object, slot).map_err(UnpackError::GitPack)?;
+        match row.payload {
+            ListedPayload::Blob(object) => {
+                let slot = builder.slot(path, row.mode, object.size).map_err(UnpackError::Pack)?;
+                index.read(object, slot).map_err(UnpackError::GitPack)?;
+            }
+            ListedPayload::Submodule(oid) => {
+                builder.file(path, Mode::Submodule, &oid.0).map_err(UnpackError::Pack)?;
+            }
+        }
     }
     let cache = index.stats();
     drop(index);

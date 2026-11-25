@@ -58,9 +58,13 @@ pub fn sandbox_files(at: PackageAt<'_>) -> Files {
                 .entries()
                 .filter_map(|entry| {
                     let rel = entry.path.strip_prefix(prefix.as_str())?;
-                    let bytes = match entry.read_in(alloc).ok()? {
-                        FileBytes::Borrowed(s) => ListedBytes::Static(s),
-                        FileBytes::Owned(v) => ListedBytes::Owned(v),
+                    let bytes = if entry.mode == blaze_fetch::Mode::Submodule {
+                        ListedBytes::Submodule(entry.submodule_commit()?)
+                    } else {
+                        match entry.read_in(alloc).ok()? {
+                            FileBytes::Borrowed(s) => ListedBytes::Static(s),
+                            FileBytes::Owned(v) => ListedBytes::Owned(v),
+                        }
                     };
                     Some((rel.to_string(), bytes))
                 })

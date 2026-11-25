@@ -17,9 +17,9 @@ use blaze_text::{Put, PutDisplay as _, Show, Writes as _};
 
 /// The record key's domain of a registry crate's files. A change to the record's form
 /// ([`crate::pack`]) or to what is stripped is a new domain.
-pub const CRATE_DOMAIN: &str = "blaze-fetch: a registry crate's files, pack v3";
+pub const CRATE_DOMAIN: &str = "blaze-fetch: a registry crate's files, pack v4";
 /// The record key's domain of a git commit's files.
-pub const GIT_DOMAIN: &str = "blaze-fetch: a git commit's files, pack v3";
+pub const GIT_DOMAIN: &str = "blaze-fetch: a git commit's files, pack v4";
 
 /// One thing to fetch.
 #[derive(Clone, Debug)]

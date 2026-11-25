@@ -56,7 +56,7 @@ use blaze_manifest::lock::{Lock, LockId, LockSource};
 use blaze_own::{AVec, Alloc, Erased};
 use blaze_proc_macro::native_unit::{NativeSetting, placed};
 use blaze_proc_macro::script::ScriptRuntime;
-use blaze_proc_macro::script_sandbox::{ScriptRoot, Tree, dir_tree, mem_tree};
+use blaze_proc_macro::script_sandbox::{ScriptRoot, Tree, dir_tree, mem_tree_with_submodules};
 use blaze_proc_macro::script_unit::{self, Setting, links_closure};
 use blaze_proc_macro::spawn_route::SpawnSetting;
 use blaze_unit_graph::{CfgAtom, Records, StoreSources, Unit, UnitGraph, UnitId, UnitKind};
@@ -767,13 +767,28 @@ fn tree_of(files: &Files<'_>, checkout: crate::engine_script_reads::Served<'_>, 
             };
             let mut decoded: blaze_own::Vec<(&str, blaze_fetch::FileBytes<'_, &bstd::mem::Frame>), &bstd::mem::Frame> =
                 blaze_own::Vec::with_capacity_in(view.len(), &frame);
+            let mut submodules: blaze_own::Vec<(&str, [u8; 20]), &bstd::mem::Frame> = blaze_own::Vec::new_in(&frame);
             for entry in view.entries() {
+                if entry.mode == blaze_fetch::Mode::Submodule {
+                    if let Some(commit) = entry.submodule_commit() {
+                        submodules.push((entry.path, commit));
+                    }
+                    continue;
+                }
                 let bytes = entry.read_in(&frame).map_err(|why| {
                     failed("a build script's pack entry failed to decode", format_args!("the build script of {package}: {}: {}", entry.path, blaze_text::Shown(&why)), false)
                 })?;
                 decoded.push((entry.path, bytes));
             }
-            Ok((mem_tree(decoded.iter().map(|(p, b)| (*p, b.as_slice())), dir, *git), ScriptRoot::package()))
+            Ok((
+                mem_tree_with_submodules(
+                    decoded.iter().map(|(p, b)| (*p, b.as_slice())),
+                    submodules.iter().copied(),
+                    dir,
+                    *git,
+                ),
+                ScriptRoot::package(),
+            ))
         }
     }
 }

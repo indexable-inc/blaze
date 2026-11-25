@@ -133,7 +133,19 @@ pub fn lay_with_area<'a>(work: &str, rel: &str, file_area: Option<&Path>, produc
                 (producer.out.as_slice(), producer.stored_files.as_slice())
             }
             DepMount::Tree { .. } => match &producer.tree {
-                Tree::Mem { files, .. } => (files.as_slice(), &[]),
+                Tree::Mem { files, submodules, .. } => {
+                    if let Some((sub, commit)) = submodules.first() {
+                        let mut hex = AString::new_in(alloc);
+                        for byte in commit {
+                            let _ = core::fmt::Write::write_fmt(&mut hex, format_args!("{byte:02x}"));
+                        }
+                        return Err(LayError::Files {
+                            folder: sub.as_str().to_owned(),
+                            why: format!("dependency `links = \"{links}\"` contains unpopulated git submodule `{sub}` at commit {hex}"),
+                        });
+                    }
+                    (files.as_slice(), &[])
+                }
                 // The wasm sight serves a member's workspace as the reader's own tree; a
                 // native run is not given a workspace folder (not built).
                 Tree::Dir(_) => return Err(LayError::MemberTree { links: links.to_owned() }),
@@ -270,7 +282,7 @@ mod tests {
         let mut record = AVec::new_in(alloc.clone());
         outputs.encode(&mut record);
         let opened = OutputsRef::open(&record).unwrap_or_else(|e| panic!("{e:?}"));
-        let tree = Tree::Mem { files: Arc::new(vec![("inc/b.h".to_owned(), b"int b;\n".to_vec())]), git: None };
+        let tree = Tree::Mem { files: Arc::new(vec![("inc/b.h".to_owned(), b"int b;\n".to_vec())]), submodules: Arc::from([]), git: None };
         let given = [GivenRun { script: UnitId(2), links: "lz4", outputs: opened, tree, root: ScriptRoot::package(), direct: true }];
 
         let served = served_links(&graph, UnitId(0), &given).unwrap_or_else(|e| panic!("{e}"));
