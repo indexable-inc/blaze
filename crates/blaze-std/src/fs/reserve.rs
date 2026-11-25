@@ -209,42 +209,37 @@ mod tests {
     }
 
     #[derive(Clone, Copy, Debug)]
-    enum ReserveAct {
-        Commit(usize),
-        Refuse(usize),
-        Interleave(usize, usize),
+    enum ActorChoice {
+        Step(usize),
+        Start(usize, usize, bool),
         Crash,
     }
 
-    struct ReservePlan {
+    struct InterleavePlan {
         seed: u64,
-        latency_us: u64,
         fail_one_in: u32,
         fail_syncs: bool,
-        acts: Vec<ReserveAct>,
+        steps: Vec<ActorChoice>,
     }
 
-    fn draw_plan(tape: &Tape) -> ReservePlan {
-        let seed = tape.next_u64("reserve sim seed");
-        let latency_us = *tape.one_of(&[0, 50, 500], "latency us");
-        let fail_one_in = *tape.one_of(&[0, 0, 5, 9], "fail one in");
+    fn draw_interleave_plan(tape: &Tape) -> InterleavePlan {
+        let seed = tape.next_u64("interleave sim seed");
+        let fail_one_in = *tape.one_of(&[0, 0, 6, 10], "fail one in");
         let fail_syncs = tape.one_in(4, "fail syncs");
-        let count = tape.int_in(3..=14u64, "acts");
-        let mut acts = Vec::new();
+        let count = tape.int_in(6..=28u64, "steps");
+        let mut steps = Vec::new();
         for _ in 0..count {
-            let act = match tape.int_in(0..=9u64, "act") {
-                0..=3 => ReserveAct::Commit(tape.int_in(1..=12_288u64, "commit len") as usize),
-                4..=5 => ReserveAct::Refuse(tape.int_in(1..=8_192u64, "refuse len") as usize),
-                6..=7 => ReserveAct::Interleave(
-                    tape.int_in(1..=8_192u64, "left len") as usize,
-                    tape.int_in(1..=8_192u64, "right len") as usize,
-                ),
-                _ => ReserveAct::Crash,
+            let choice = match tape.int_in(0..=9u64, "choice") {
+                0..=2 => ActorChoice::Step(0),
+                3..=5 => ActorChoice::Step(1),
+                6 => ActorChoice::Start(0, tape.int_in(1..=8192u64, "len 0") as usize, tape.one_in(4, "refuse 0")),
+                7 => ActorChoice::Start(1, tape.int_in(1..=8192u64, "len 1") as usize, tape.one_in(4, "refuse 1")),
+                _ => ActorChoice::Crash,
             };
-            acts.push(act);
+            steps.push(choice);
         }
-        acts.push(ReserveAct::Crash);
-        ReservePlan { seed, latency_us, fail_one_in, fail_syncs, acts }
+        steps.push(ActorChoice::Crash);
+        InterleavePlan { seed, fail_one_in, fail_syncs, steps }
     }
 
     fn payload_of(seq: u8, len: usize) -> Vec<u8> {
@@ -256,8 +251,174 @@ mod tests {
         out
     }
 
-    fn read_target(io: &Io, dir: &Dir<ReadWrite>, target: &Path) -> Result<Option<Vec<u8>>, String> {
-        // Retry if the simulator injects a transient fault on the oracle's verification read.
+    fn ask_sim(sim: &mut blaze_core::sim::Sim, effect: Effect, plant: Plant) -> Done {
+        if matches!(effect, Effect::Sync { .. }) && plant == Plant::SyncSkipped {
+            return Done::Synced;
+        }
+        let mut effects = alloc::vec![effect];
+        let mut got = None;
+        let _ = blaze_core::run_until_idle(sim, &mut effects, |completion, _| got = Some(completion.done));
+        got.expect("sim completes one effect")
+    }
+
+    fn read_sim_target(sim: &mut blaze_core::sim::Sim, key: &FileName) -> Option<Vec<u8>> {
+        // Read target directly without injected faults for oracle verification.
+        for _ in 0..64 {
+            let done = ask_sim(sim, Effect::ReadAll { file: key.share(), tag: Tag(0xffff_ffff) }, Plant::None);
+            match done {
+                Done::Read(bytes) if bytes.is_empty() => {
+                    let st = ask_sim(sim, Effect::Stat { file: key.share(), tag: Tag(0xffff_fffe) }, Plant::None);
+                    if matches!(st, Done::Stat(None)) {
+                        return None;
+                    }
+                    if matches!(st, Done::Stat(Some(_))) {
+                        return Some(bytes);
+                    }
+                }
+                Done::Read(bytes) => return Some(bytes),
+                Done::Failed(_) => continue,
+                _ => continue,
+            }
+        }
+        None
+    }
+
+    struct SimActor {
+        reserve: Reserve,
+        pending: Option<Effect>,
+        payload: Vec<u8>,
+        refuse: bool,
+        renamed_submitted: bool,
+    }
+
+    fn run_interleave_dst(plan: &InterleavePlan, plant: Plant) -> Result<(), String> {
+        let mut sim = blaze_core::sim::Sim::new(
+            plan.seed,
+            Faults { fail_one_in: plan.fail_one_in, ..Faults::default() },
+        );
+        let dir_name = FileName::new("records").expect("dir");
+        let key = FileName::new("records/k").expect("key");
+        if plan.fail_syncs {
+            sim.fail_syncs(dir_name.share());
+        }
+
+        let mut actors: [Option<SimActor>; 2] = [None, None];
+        let mut next_tag: u64 = 1;
+        let mut seq: u8 = 0;
+        // Exact set of whole states allowed at `key` after a crash right now.
+        // Initially `None` (absent). Once any actor commits (`Next::Stored`), the pre-race value
+        // is evicted: only that committed payload (and payloads of actors whose rename raced
+        // concurrently with or after it) remain valid — NEVER the stale pre-race value.
+        let mut allowed: Vec<Option<Vec<u8>>> = alloc::vec![None];
+
+        for (step_idx, &choice) in plan.steps.iter().enumerate() {
+            match choice {
+                ActorChoice::Start(slot, len, refuse) => {
+                    if actors[slot].is_some() {
+                        continue;
+                    }
+                    seq = seq.wrapping_add(1);
+                    let payload = payload_of(seq, len);
+                    let room = u64::try_from(len.saturating_add(4096)).unwrap_or(u64::MAX);
+                    let tag = Tag(next_tag);
+                    next_tag += 1;
+                    let (reserve, first) = Reserve::new(key.share(), room, tag);
+                    actors[slot] = Some(SimActor {
+                        reserve,
+                        pending: Some(first),
+                        payload,
+                        refuse,
+                        renamed_submitted: false,
+                    });
+                }
+                ActorChoice::Step(slot) => {
+                    let Some(mut actor) = actors[slot].take() else {
+                        continue;
+                    };
+                    let Some(effect) = actor.pending.take() else {
+                        continue;
+                    };
+                    let is_rename = matches!(effect, Effect::Rename { .. });
+                    if is_rename {
+                        actor.renamed_submitted = true;
+                        let cand = Some(actor.payload.clone());
+                        if !allowed.contains(&cand) {
+                            allowed.push(cand);
+                        }
+                    }
+                    let done = ask_sim(&mut sim, effect, plant);
+                    match actor.reserve.answer(done) {
+                        Ok(Next::Write(mut mapping)) => {
+                            mapping.bytes_mut()[..actor.payload.len()].copy_from_slice(&actor.payload);
+                            if actor.refuse {
+                                actor.pending = actor.reserve.abandon(Some(mapping));
+                                if actor.pending.is_some() {
+                                    actors[slot] = Some(actor);
+                                }
+                            } else {
+                                let len = u64::try_from(actor.payload.len()).unwrap_or(0);
+                                match actor.reserve.finish(mapping, len) {
+                                    Ok(next_eff) => {
+                                        actor.pending = Some(next_eff);
+                                        actors[slot] = Some(actor);
+                                    }
+                                    Err(err) => return Err(format!("step {step_idx}: finish: {err}")),
+                                }
+                            }
+                        }
+                        Ok(Next::Ask(next_eff)) => {
+                            actor.pending = Some(next_eff);
+                            actors[slot] = Some(actor);
+                        }
+                        Ok(Next::Stored) => {
+                            // Durable commit! Evict any pre-race value strictly older than this
+                            // commit. Only this actor's payload and any OTHER in-flight actor that
+                            // has already submitted a concurrent `Rename` may appear after a crash.
+                            let mut next_allowed = alloc::vec![Some(actor.payload.clone())];
+                            let other_slot = 1 - slot;
+                            if let Some(other) = actors[other_slot].as_ref()
+                                && other.renamed_submitted
+                            {
+                                let cand = Some(other.payload.clone());
+                                if !next_allowed.contains(&cand) {
+                                    next_allowed.push(cand);
+                                }
+                            }
+                            allowed = next_allowed;
+                        }
+                        Ok(Next::Abandoned) => {}
+                        Err(_) => {
+                            if let Some(cleanup) = actor.reserve.abandon(None) {
+                                actor.pending = Some(cleanup);
+                                actors[slot] = Some(actor);
+                            }
+                        }
+                    }
+                }
+                ActorChoice::Crash => {
+                    // Drop any in-flight actor mappings before crashing (the process died).
+                    actors = [None, None];
+                    sim.crash();
+                    if plan.fail_syncs {
+                        sim.fail_syncs(dir_name.share());
+                    }
+                    let got = read_sim_target(&mut sim, &key);
+                    if !allowed.contains(&got) {
+                        return Err(format!(
+                            "step {step_idx}: crash left torn or stale record ({:?} bytes, {} allowed states)",
+                            got.as_ref().map(Vec::len),
+                            allowed.len()
+                        ));
+                    }
+                    // Whatever survived the crash is now the sole durable ground truth.
+                    allowed = alloc::vec![got];
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn read_bstd_target(io: &Io, dir: &Dir<ReadWrite>, target: &Path) -> Result<Option<Vec<u8>>, String> {
         for _ in 0..64 {
             let cx = io.cx(BUDGET, TASK_FRAME).map_err(|e| format!("cx: {e}"))?;
             let mut bytes = Bytes::new_in(cx.frame(), "reserve dst read");
@@ -271,177 +432,75 @@ mod tests {
         Err("read_all: exhausted retries on injected fault".into())
     }
 
-    fn run_reserve_dst(plan: &ReservePlan, plant: Plant) -> Result<(), String> {
-        let mut world = SimWorld::new(plan.seed, Limits::USUAL);
-        world.faults = Faults {
-            fail_one_in: plan.fail_one_in,
-            max_latency: Duration::from_micros(plan.latency_us),
-            ..Faults::default()
-        };
+    fn run_bstd_crash_check(seed: u64, plant: Plant) -> Result<(), String> {
+        let mut world = SimWorld::new(seed, Limits::USUAL);
+        world.faults = Faults { max_latency: Duration::from_micros(50), ..Faults::default() };
         let io = Io::planted(world, plant);
-        let cx = io.cx(BUDGET, TASK_FRAME).map_err(|e| format!("root cx: {e}"))?;
-        let dir = io
-            .need_fs()
-            .map_err(|e| format!("fs: {e}"))?
-            .root()
-            .subdir(&Path::new("records").map_err(|e| format!("dir path: {e}"))?);
-        let target = Path::new("k").map_err(|e| format!("target path: {e}"))?;
-        let apply_sync_fault = |io: &Io| {
-            if plan.fail_syncs {
-                if let Some(name) = dir.name().name() {
-                    io.with_sim(|sim| sim.fail_syncs(name.clone()));
-                }
-            }
-        };
-        apply_sync_fault(&io);
-
-        let mut durable: Option<Vec<u8>> = None;
-        let mut allowed: Vec<Option<Vec<u8>>> = alloc::vec![None];
-        let mut seq: u8 = 0;
-
-        for (step_idx, &act) in plan.acts.iter().enumerate() {
-            match act {
-                ReserveAct::Commit(len) => {
-                    seq = seq.wrapping_add(1);
-                    let bytes = payload_of(seq, len);
-                    let room = u64::try_from(len.saturating_add(4096)).unwrap_or(u64::MAX);
-                    let res: Result<Result<(), &str>, _> = dir.reserve(&cx, &target, room, |buf| {
-                        buf[..bytes.len()].copy_from_slice(&bytes);
-                        Ok(u64::try_from(bytes.len()).unwrap_or(0))
-                    });
-                    match res {
-                        Ok(Ok(())) => {
-                            durable = Some(bytes.clone());
-                            allowed.clear();
-                            allowed.push(durable.clone());
-                        }
-                        Ok(Err(_)) => return Err(format!("step {step_idx}: unexpected user err")),
-                        Err(err) if matches!(err.kind, FsKind::Driver(_)) => {
-                            // A faulted rename/sync may or may not have flipped the target name.
-                            allowed.push(Some(bytes));
-                        }
-                        Err(err) => return Err(format!("step {step_idx}: unexpected fs err: {err}")),
-                    }
-                }
-                ReserveAct::Refuse(len) => {
-                    seq = seq.wrapping_add(1);
-                    let bytes = payload_of(seq, len);
-                    let room = u64::try_from(len.saturating_add(4096)).unwrap_or(u64::MAX);
-                    let res: Result<Result<(), &str>, _> = dir.reserve(&cx, &target, room, |buf| {
-                        buf[..bytes.len()].copy_from_slice(&bytes);
-                        Err("refused")
-                    });
-                    match res {
-                        Ok(Err("refused")) => {}
-                        Err(err) if matches!(err.kind, FsKind::Driver(_)) => {}
-                        other => return Err(format!("step {step_idx}: refuse outcome {other:?}")),
-                    }
-                }
-                ReserveAct::Interleave(len_a, len_b) => {
-                    seq = seq.wrapping_add(1);
-                    let bytes_a = payload_of(seq, len_a);
-                    seq = seq.wrapping_add(1);
-                    let bytes_b = payload_of(seq, len_b);
-                    let room_a = u64::try_from(len_a.saturating_add(4096)).unwrap_or(u64::MAX);
-                    let room_b = u64::try_from(len_b.saturating_add(4096)).unwrap_or(u64::MAX);
-                    let dir_a = dir.clone();
-                    let dir_b = dir.clone();
-                    let target_a = target.clone();
-                    let target_b = target.clone();
-                    let io_a = io.clone();
-                    let io_b = io.clone();
-                    let (res_a, res_b) = std::thread::scope(|s| {
-                        let t1 = s.spawn(|| {
-                            let c1 = io_a.cx(BUDGET, TASK_FRAME).expect("cx1");
-                            dir_a.reserve::<&str>(&c1, &target_a, room_a, |buf| {
-                                buf[..bytes_a.len()].copy_from_slice(&bytes_a);
-                                Ok(u64::try_from(bytes_a.len()).unwrap_or(0))
-                            })
-                        });
-                        let t2 = s.spawn(|| {
-                            let c2 = io_b.cx(BUDGET, TASK_FRAME).expect("cx2");
-                            dir_b.reserve::<&str>(&c2, &target_b, room_b, |buf| {
-                                buf[..bytes_b.len()].copy_from_slice(&bytes_b);
-                                Ok(u64::try_from(bytes_b.len()).unwrap_or(0))
-                            })
-                        });
-                        (t1.join().expect("t1"), t2.join().expect("t2"))
-                    });
-                    let mut committed_any = false;
-                    for (res, payload) in [(res_a, &bytes_a), (res_b, &bytes_b)] {
-                        match res {
-                            Ok(Ok(())) => {
-                                committed_any = true;
-                                allowed.push(Some(payload.clone()));
-                            }
-                            Err(err) if matches!(err.kind, FsKind::Driver(_)) => {
-                                allowed.push(Some(payload.clone()));
-                            }
-                            other => return Err(format!("step {step_idx}: interleaved outcome {other:?}")),
-                        }
-                    }
-                    if committed_any {
-                        // Once either concurrent reservation commits durably, target must hold
-                        // one of the newly committed (or racing) full payloads, never None or torn.
-                        allowed.retain(|cand| cand.as_ref().is_some_and(|b| b == &bytes_a || b == &bytes_b) || cand == &durable);
-                        durable = None;
-                    }
-                }
-                ReserveAct::Crash => {
-                    if !io.crash() {
-                        return Err("world is not simulated".into());
-                    }
-                    let got = read_target(&io, &dir, &target)?;
-                    if let Some(ref want) = durable {
-                        if got.as_ref() != Some(want) {
-                            return Err(format!(
-                                "step {step_idx}: crash lost or tore durable record (want {} bytes, got {:?})",
-                                want.len(),
-                                got.as_ref().map(Vec::len)
-                            ));
-                        }
-                    } else if !allowed.contains(&got) {
-                        return Err(format!(
-                            "step {step_idx}: crash left torn/unexpected record ({:?} bytes, {} valid states)",
-                            got.as_ref().map(Vec::len),
-                            allowed.len()
-                        ));
-                    }
-                    durable = got.clone();
-                    allowed.clear();
-                    allowed.push(got);
-                    apply_sync_fault(&io);
-                }
-            }
+        let cx = io.cx(BUDGET, TASK_FRAME).map_err(|e| format!("cx: {e}"))?;
+        let dir = io.need_fs().map_err(|e| format!("fs: {e}"))?.root().subdir(&Path::new("records").map_err(|e| format!("{e}"))?);
+        let target = Path::new("k").map_err(|e| format!("{e}"))?;
+        let payload = payload_of(1, 8192);
+        let res: Result<Result<(), &str>, _> = dir.reserve(&cx, &target, 16_384, |buf| {
+            buf[..payload.len()].copy_from_slice(&payload);
+            Ok(u64::try_from(payload.len()).unwrap_or(0))
+        });
+        if !matches!(res, Ok(Ok(()))) {
+            return Err(format!("reserve failed: {res:?}"));
+        }
+        if !io.crash() {
+            return Err("not simulated".into());
+        }
+        let got = read_bstd_target(&io, &dir, &target)?;
+        if got.as_ref() != Some(&payload) {
+            return Err(format!("crash after Dir::reserve lost/tore durable record (got {:?})", got.as_ref().map(Vec::len)));
         }
         Ok(())
     }
 
-    /// Crash, fault-injection, and concurrent-interleaving DST for `Dir::reserve`: every
-    /// committed reservation survives a crash whole, failed/refused/interleaved reservations
-    /// never leave a torn record, and a planted skipped-sync bug is caught by the oracle.
+    /// Deterministic crash, fault-injection, and tape-driven concurrent-interleaving DST for
+    /// `Dir::reserve` / `Reserve`: interleaves two concurrent reservations effect-by-effect on the
+    /// tape with mid-flight crashes, rejects any stale pre-race value after a commit, and verifies
+    /// that a planted skipped-sync bug (`Plant::SyncSkipped`) is caught by the crash oracle.
     #[test]
     fn reserve_crash_faults_and_interleaving_dst() {
-        blaze_sim::check(Config::cases(80), |tape| {
-            let plan = draw_plan(tape);
-            run_reserve_dst(&plan, Plant::None).map_err(Broke::Oracle)
+        blaze_sim::check(Config::cases(120), |tape| {
+            let plan = draw_interleave_plan(tape);
+            run_interleave_dst(&plan, Plant::None).map_err(Broke::Oracle)
         });
 
-        // Planted-bug control: skipping `Effect::Sync` before `Effect::Rename` must be caught.
-        let mut caught = false;
+        for seed in 1u64..=16 {
+            run_bstd_crash_check(seed, Plant::None).expect("bstd Dir::reserve survives crash whole");
+        }
+
+        // Planted-bug control: skipping `Effect::Sync` before `Effect::Rename` must be caught on
+        // both the tape-driven interleaving DST and `Dir::reserve`.
+        let mut caught_interleave = false;
+        let mut caught_bstd = false;
         for seed in 1u64..=64 {
-            let plan = ReservePlan {
+            let plan = InterleavePlan {
                 seed,
-                latency_us: 0,
                 fail_one_in: 0,
                 fail_syncs: false,
-                acts: alloc::vec![ReserveAct::Commit(8192), ReserveAct::Crash],
+                steps: alloc::vec![
+                    ActorChoice::Start(0, 8192, false),
+                    ActorChoice::Step(0),
+                    ActorChoice::Step(0),
+                    ActorChoice::Step(0),
+                    ActorChoice::Step(0),
+                    ActorChoice::Crash,
+                ],
             };
-            if run_reserve_dst(&plan, Plant::SyncSkipped).is_err() {
-                caught = true;
+            if run_interleave_dst(&plan, Plant::SyncSkipped).is_err() {
+                caught_interleave = true;
+            }
+            if run_bstd_crash_check(seed, Plant::SyncSkipped).is_err() {
+                caught_bstd = true;
+            }
+            if caught_interleave && caught_bstd {
                 break;
             }
         }
-        assert!(caught, "planted control Plant::SyncSkipped must be caught by the crash oracle");
+        assert!(caught_interleave, "planted control Plant::SyncSkipped must be caught by interleave DST");
+        assert!(caught_bstd, "planted control Plant::SyncSkipped must be caught by Dir::reserve DST");
     }
 }

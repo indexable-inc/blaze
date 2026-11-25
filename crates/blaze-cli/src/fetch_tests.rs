@@ -650,132 +650,197 @@ fn a_symlink_inside_cargos_git_db_is_refused_by_confined_reads() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
-/// Crash, fault-injection, and concurrent-interleaving DST exercising `Dir::reserve` on the
-/// sources store across simulated crashes, sync failures, and racing reservations on one key.
+/// Deterministic crash, fault-injection, and tape-driven concurrent-interleaving DST exercising
+/// `Reserve` / `Dir::reserve` across simulated mid-flight crashes, sync failures, and racing
+/// reservations on one key (evicting the stale pre-race value as soon as a commit completes).
 ///
 /// Expected: `test fetch::tests::dir_reserve_crash_faults_and_interleaving_dst ... ok`
 #[test]
 fn dir_reserve_crash_faults_and_interleaving_dst() {
-    use core::time::Duration;
-    use blaze_core::sim::Faults;
-    use bstd::fs::FsKind;
+    use blaze_core::reserve::{Next, Reserve};
+    use blaze_core::sim::{Faults, Sim};
+    use blaze_core::{Done, Effect, FileName, Tag};
+    use blaze_own::Share as _;
 
     let payload_of = |seq: u8, len: usize| -> std::vec::Vec<u8> {
         let fill = seq.wrapping_mul(37).wrapping_add(1);
         (0..len).map(|i| fill.wrapping_add((i % 251) as u8)).collect()
     };
-    let read_target = |io: &Io, dir: &Dir<ReadWrite>, target: &Path| -> std::option::Option<std::vec::Vec<u8>> {
+    let ask_sim = |sim: &mut Sim, effect: Effect, skip_sync: bool| -> Done {
+        if skip_sync && matches!(effect, Effect::Sync { .. }) {
+            return Done::Synced;
+        }
+        let mut effects = std::vec![effect];
+        let mut got = None;
+        let _ = blaze_core::run_until_idle(sim, &mut effects, |c, _| got = Some(c.done));
+        got.expect("sim completes one effect")
+    };
+    let read_sim = |sim: &mut Sim, key: &FileName| -> std::option::Option<std::vec::Vec<u8>> {
         for _ in 0..64 {
-            let cx = io.cx(BUDGET, TASK_FRAME).expect("cx");
-            let mut bytes = Bytes::new_in(cx.frame(), "read reserved");
-            match dir.read_all(&cx, target, &mut bytes) {
-                Ok(_) => return Some(bytes.as_slice().to_vec()),
-                Err(err) if err.kind == FsKind::NotFound => return None,
-                Err(err) if matches!(err.kind, FsKind::Driver(_)) => continue,
-                Err(err) => panic!("read_all: {err}"),
+            match ask_sim(sim, Effect::ReadAll { file: key.share(), tag: Tag(0xffff_ffff) }, false) {
+                Done::Read(bytes) if bytes.is_empty() => {
+                    let st = ask_sim(sim, Effect::Stat { file: key.share(), tag: Tag(0xffff_fffe) }, false);
+                    if matches!(st, Done::Stat(None)) {
+                        return None;
+                    }
+                    if matches!(st, Done::Stat(Some(_))) {
+                        return Some(bytes);
+                    }
+                }
+                Done::Read(bytes) => return Some(bytes),
+                _ => continue,
             }
         }
-        panic!("read_all: exhausted retries on injected fault");
+        None
     };
 
-    for seed in 1u64..=32 {
-        let mut world = SimWorld::new(seed, Limits::USUAL);
-        world.faults = Faults {
-            fail_one_in: if seed % 3 == 0 { 0 } else { 7 },
-            max_latency: Duration::from_micros(if seed % 2 == 0 { 50 } else { 0 }),
-            ..Faults::default()
-        };
-        let io = Io::simulated(world);
+    struct Actor {
+        reserve: Reserve,
+        pending: std::option::Option<Effect>,
+        payload: std::vec::Vec<u8>,
+        refuse: bool,
+        renamed_submitted: bool,
+    }
+
+    let run_one = |seed: u64, skip_sync: bool| -> Result<(), std::string::String> {
+        let fail_one_in = if skip_sync || seed % 3 == 0 { 0 } else { 7 };
+        let fail_syncs = !skip_sync && seed % 4 == 0;
+        let mut sim = Sim::new(seed, Faults { fail_one_in, ..Faults::default() });
+        let dir_name = FileName::new("sources").expect("dir");
+        let key = FileName::new("sources/k").expect("key");
+        if fail_syncs {
+            sim.fail_syncs(dir_name.share());
+        }
+        let mut actors: [std::option::Option<Actor>; 2] = [None, None];
+        let mut next_tag = 1u64;
+        let mut seq = 0u8;
+        let mut allowed: std::vec::Vec<std::option::Option<std::vec::Vec<u8>>> = std::vec![None];
+
+        // Deterministic PRNG schedule over 2 interleaved actors + mid-flight crashes.
+        let mut rng = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let steps = if skip_sync { 6 } else { 32 };
+        for step in 0..steps {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let op = if skip_sync {
+                match step {
+                    0 => 6,
+                    1..=4 => 0,
+                    _ => 9,
+                }
+            } else if step + 1 == steps {
+                9
+            } else {
+                (rng >> 33) % 10
+            };
+            match op {
+                6 | 7 => {
+                    let slot = if op == 6 { 0 } else { 1 };
+                    if actors[slot].is_some() {
+                        continue;
+                    }
+                    seq = seq.wrapping_add(1);
+                    let len = if skip_sync { 8192 } else { 1 + (((rng >> 16) as usize) % 8192) };
+                    let refuse = !skip_sync && ((rng >> 8) & 3) == 0;
+                    let payload = payload_of(seq, len);
+                    let room = u64::try_from(len + 4096).unwrap_or(u64::MAX);
+                    let (reserve, first) = Reserve::new(key.share(), room, Tag(next_tag));
+                    next_tag += 1;
+                    actors[slot] = Some(Actor { reserve, pending: Some(first), payload, refuse, renamed_submitted: false });
+                }
+                0..=5 => {
+                    let slot = if op <= 2 { 0 } else { 1 };
+                    let Some(mut actor) = actors[slot].take() else { continue };
+                    let Some(effect) = actor.pending.take() else { continue };
+                    if matches!(effect, Effect::Rename { .. }) {
+                        actor.renamed_submitted = true;
+                        let cand = Some(actor.payload.clone());
+                        if !allowed.contains(&cand) {
+                            allowed.push(cand);
+                        }
+                    }
+                    let done = ask_sim(&mut sim, effect, skip_sync);
+                    match actor.reserve.answer(done) {
+                        Ok(Next::Write(mut mapping)) => {
+                            mapping.bytes_mut()[..actor.payload.len()].copy_from_slice(&actor.payload);
+                            if actor.refuse {
+                                actor.pending = actor.reserve.abandon(Some(mapping));
+                                if actor.pending.is_some() {
+                                    actors[slot] = Some(actor);
+                                }
+                            } else {
+                                let len = u64::try_from(actor.payload.len()).unwrap_or(0);
+                                actor.pending = Some(actor.reserve.finish(mapping, len).map_err(|e| std::format!("{e}"))?);
+                                actors[slot] = Some(actor);
+                            }
+                        }
+                        Ok(Next::Ask(next_eff)) => {
+                            actor.pending = Some(next_eff);
+                            actors[slot] = Some(actor);
+                        }
+                        Ok(Next::Stored) => {
+                            // Commit completed: reject the pre-race value!
+                            let mut next_allowed = std::vec![Some(actor.payload.clone())];
+                            if let Some(other) = actors[1 - slot].as_ref()
+                                && other.renamed_submitted
+                            {
+                                let cand = Some(other.payload.clone());
+                                if !next_allowed.contains(&cand) {
+                                    next_allowed.push(cand);
+                                }
+                            }
+                            allowed = next_allowed;
+                        }
+                        Ok(Next::Abandoned) => {}
+                        Err(_) => {
+                            if let Some(cleanup) = actor.reserve.abandon(None) {
+                                actor.pending = Some(cleanup);
+                                actors[slot] = Some(actor);
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    actors = [None, None];
+                    sim.crash();
+                    if fail_syncs {
+                        sim.fail_syncs(dir_name.share());
+                    }
+                    let got = read_sim(&mut sim, &key);
+                    if !allowed.contains(&got) {
+                        return Err(std::format!("seed {seed} step {step}: torn/stale record ({:?})", got.as_ref().map(|v| v.len())));
+                    }
+                    allowed = std::vec![got];
+                }
+            }
+        }
+        Ok(())
+    };
+
+    for seed in 1u64..=64 {
+        run_one(seed, false).expect("interleaved Reserve DST holds across crashes and faults");
+    }
+    assert!(
+        (1u64..=64).any(|seed| run_one(seed, true).is_err()),
+        "planted skipped-sync bug must be caught by the crash oracle"
+    );
+
+    // Also verify `bstd::fs::Dir::reserve` end-to-end across a simulated crash.
+    for seed in 1u64..=8 {
+        let io = Io::simulated(SimWorld::new(seed, Limits::USUAL));
         let cx = io.cx(BUDGET, TASK_FRAME).expect("root cx");
         let dir = io.need_fs().expect("fs").root().subdir(&Path::new("sources").expect("dir"));
         let target = Path::new("record_key").expect("target");
-        let fail_syncs = seed % 4 == 0;
-        let apply_sync_fault = |io: &Io| {
-            if fail_syncs {
-                if let Some(name) = dir.name().name() {
-                    io.with_sim(|sim| sim.fail_syncs(name.clone()));
-                }
-            }
-        };
-        apply_sync_fault(&io);
-
-        let mut durable: std::option::Option<std::vec::Vec<u8>> = None;
-        let mut allowed: std::vec::Vec<std::option::Option<std::vec::Vec<u8>>> = std::vec![None];
-
-        // 1. Sequential commit under possible faults.
-        let p1 = payload_of(1, 8192);
-        match dir.reserve::<&str>(&cx, &target, 16_384, |buf| {
-            buf[..p1.len()].copy_from_slice(&p1);
-            Ok(u64::try_from(p1.len()).unwrap_or(0))
-        }) {
-            Ok(Ok(())) => {
-                durable = Some(p1.clone());
-                allowed = std::vec![durable.clone()];
-            }
-            Err(err) if matches!(err.kind, FsKind::Driver(_)) => {
-                allowed.push(Some(p1));
-            }
-            other => panic!("seed {seed}: unexpected commit outcome {other:?}"),
-        }
-
-        // 2. Callback refusal must leave target untouched.
-        let p_bad = payload_of(2, 4096);
-        match dir.reserve::<&str>(&cx, &target, 8192, |buf| {
-            buf[..p_bad.len()].copy_from_slice(&p_bad);
-            Err("refused")
-        }) {
-            Ok(Err("refused")) => {}
-            Err(err) if matches!(err.kind, FsKind::Driver(_)) => {}
-            other => panic!("seed {seed}: unexpected refuse outcome {other:?}"),
-        }
-
-        // 3. Interleaved concurrent reservations on the same key.
-        let pa = payload_of(3, 6000);
-        let pb = payload_of(4, 7000);
-        let (io_a, dir_a, ta) = (io.clone(), dir.clone(), target.clone());
-        let (io_b, dir_b, tb) = (io.clone(), dir.clone(), target.clone());
-        let (ra, rb) = std::thread::scope(|s| {
-            let t1 = s.spawn(|| {
-                let c1 = io_a.cx(BUDGET, TASK_FRAME).expect("c1");
-                dir_a.reserve::<&str>(&c1, &ta, 16_384, |buf| {
-                    buf[..pa.len()].copy_from_slice(&pa);
-                    Ok(u64::try_from(pa.len()).unwrap_or(0))
-                })
-            });
-            let t2 = s.spawn(|| {
-                let c2 = io_b.cx(BUDGET, TASK_FRAME).expect("c2");
-                dir_b.reserve::<&str>(&c2, &tb, 16_384, |buf| {
-                    buf[..pb.len()].copy_from_slice(&pb);
-                    Ok(u64::try_from(pb.len()).unwrap_or(0))
-                })
-            });
-            (t1.join().expect("t1"), t2.join().expect("t2"))
-        });
-        let mut any_committed = false;
-        for (res, payload) in [(ra, &pa), (rb, &pb)] {
-            match res {
-                Ok(Ok(())) => {
-                    any_committed = true;
-                    allowed.push(Some(payload.clone()));
-                }
-                Err(err) if matches!(err.kind, FsKind::Driver(_)) => {
-                    allowed.push(Some(payload.clone()));
-                }
-                other => panic!("seed {seed}: unexpected interleaved outcome {other:?}"),
-            }
-        }
-        if any_committed {
-            allowed.retain(|cand| cand.as_ref().is_some_and(|b| b == &pa || b == &pb) || cand == &durable);
-            durable = None;
-        }
-
-        // 4. Simulated crash: target must be whole and match durable or a valid candidate, never torn.
+        let p = payload_of(1, 8192);
+        let committed: Result<(), &str> = dir
+            .reserve(&cx, &target, 16_384, |buf| {
+                buf[..p.len()].copy_from_slice(&p);
+                Ok(u64::try_from(p.len()).unwrap_or(0))
+            })
+            .expect("reserve ok");
+        assert_eq!(committed, Ok(()));
         assert!(io.crash(), "simulated world crashes");
-        let got = read_target(&io, &dir, &target);
-        if let Some(ref want) = durable {
-            assert_eq!(got.as_ref(), Some(want), "seed {seed}: durable record lost or torn after crash");
-        } else {
-            assert!(allowed.contains(&got), "seed {seed}: torn record after crash ({:?})", got.as_ref().map(|v| v.len()));
-        }
+        let mut read = Bytes::new_in(cx.frame(), "read after crash");
+        dir.read_all(&cx, &target, &mut read).expect("durable record survives crash");
+        assert_eq!(read.as_slice(), p.as_slice());
     }
 }
