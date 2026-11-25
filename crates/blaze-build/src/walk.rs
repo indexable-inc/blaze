@@ -336,6 +336,9 @@ struct Target {
     res: Option<SlotId>,
     /// The drop scopes open outside it: leaving it drops every scope from this depth on.
     depth: u32,
+    /// The temporary scopes open outside it: leaving it also drops every temporary scope
+    /// opened inside it (a `loop` body's temporary scope opens before its block's drop scope).
+    temp_depth: u32,
 }
 
 /// A match being built: its arms' blocks are `arm_blocks[first..first + arms + 1]`, the last
@@ -2672,9 +2675,22 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         Ok(())
     }
 
-    /// Where drop scope `depth` starts in `scope_pats` (its end when it is not open).
-    fn scope_start(&self, depth: u32) -> usize {
-        self.scope_marks.get(depth as usize).map_or(self.scope_pats.len(), |&m| m as usize)
+    /// Where leaving `t` (`break` or `continue`) starts dropping in `scope_pats`: the earliest
+    /// drop scope or temporary scope opened inside `t` (a `loop` body's temporary scope opens
+    /// before its block's drop scope, so `insert_held` places its temporaries before
+    /// `scope_marks[t.depth]`).
+    fn target_start(&self, t: Target) -> Result<usize, BuildError> {
+        let scope_depth = usize::try_from(t.depth).map_err(|_| malformed("a target depth past `usize`"))?;
+        let temp_depth = usize::try_from(t.temp_depth).map_err(|_| malformed("a target temporary depth past `usize`"))?;
+        let scope = match self.scope_marks.get(scope_depth) {
+            Some(&m) => usize::try_from(m).map_err(|_| malformed("a scope mark past `usize`"))?,
+            None => self.scope_pats.len(),
+        };
+        let temp = match self.temp_marks.get(temp_depth) {
+            Some(&m) => usize::try_from(m).map_err(|_| malformed("a temporary mark past `usize`"))?,
+            None => self.scope_pats.len(),
+        };
+        Ok(scope.min(temp))
     }
 
     /// Whether a binding from `start` of `scope_pats` on may be dropped here.
@@ -4175,15 +4191,16 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     return Ok(());
                 }
                 self.du_record_break(ti);
-                let start = self.scope_start(t.depth);
-                let depth = usize::try_from(t.depth).map_err(|_| malformed("a target depth past `usize`"))?;
+                let start = self.target_start(t)?;
+                let scope_depth = usize::try_from(t.depth).map_err(|_| malformed("a target depth past `usize`"))?.saturating_add(1);
+                let temp_depth = usize::try_from(t.temp_depth).map_err(|_| malformed("a target temporary depth past `usize`"))?;
                 match t.res {
                     Some(slot) => {
                         let to = (self.b.slot_addr(slot), 0);
                         self.store(v, t.repr, to)?;
                         self.end_temp_val(v);
                         self.drop_from(start)?;
-                        self.end_scope_slots_peek_except(start, depth, Some(slot));
+                        self.end_scope_slots_peek_except(start, scope_depth, Some(temp_depth), Some(slot));
                         self.jump(t.exit, &[]);
                     }
                     None => {
@@ -4191,7 +4208,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                         let arg = self.arg(v, t.repr)?;
                         let kept = arg.and_then(|p| self.value_slot(p));
                         self.drop_from(start)?;
-                        self.end_scope_slots_peek_except(start, depth, kept);
+                        self.end_scope_slots_peek_except(start, scope_depth, Some(temp_depth), kept);
                         self.jump(t.exit, arg.as_slice());
                     }
                 }
@@ -6147,11 +6164,12 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             Expr::Block { stmts, tail, .. } => {
                 let list = self.body.stmt_lists.get(stmts.range()).ok_or(malformed("a block's statements past `stmt_lists`"))?;
                 let depth = self.scope_marks.len() as u32;
+                let temp_depth = u32::try_from(self.temp_marks.len()).map_err(|_| malformed("temporary scope depth past `u32`"))?;
                 if self.break_target[e.ix()] {
                     let repr = self.expr_repr(e)?;
                     let res = self.join_slot(repr);
                     let exit = self.create();
-                    self.targets.push(Target { expr: e, header: None, exit, repr, res, depth });
+                    self.targets.push(Target { expr: e, header: None, exit, repr, res, depth, temp_depth });
                     self.target_du.push(None);
                     self.work.push(Task::BlockExit(e));
                 }
@@ -6250,7 +6268,8 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 // A back-edge may re-initialize any outer flagged binding on a later iteration.
                 self.definitely_uninit.fill(false);
                 let depth = self.scope_marks.len() as u32;
-                self.targets.push(Target { expr: e, header: Some(header), exit, repr, res, depth });
+                let temp_depth = u32::try_from(self.temp_marks.len()).map_err(|_| malformed("temporary scope depth past `u32`"))?;
+                self.targets.push(Target { expr: e, header: Some(header), exit, repr, res, depth, temp_depth });
                 self.target_du.push(None);
                 self.work.push(Task::LoopEnd(e));
                 self.work.push(Task::Discard);
@@ -6270,10 +6289,11 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     .find(|t| t.expr == target)
                     .ok_or(malformed("a `continue` whose loop is not around it"))?;
                 let header = t.header.ok_or(malformed("a `continue` of a block"))?;
-                let start = self.scope_start(t.depth);
-                let depth = usize::try_from(t.depth).map_err(|_| malformed("a target depth past `usize`"))?;
+                let start = self.target_start(t)?;
+                let scope_depth = usize::try_from(t.depth).map_err(|_| malformed("a target depth past `usize`"))?.saturating_add(1);
+                let temp_depth = usize::try_from(t.temp_depth).map_err(|_| malformed("a target temporary depth past `usize`"))?;
                 self.drop_from(start)?;
-                self.end_scope_slots_peek(start, depth);
+                self.end_scope_slots_peek_except(start, scope_depth, Some(temp_depth), None);
                 self.jump(header, &[]);
                 self.dead_block();
                 self.push_val(V::None, None);

@@ -857,14 +857,21 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     }
 
     /// Emits `slot_dead` on slots owned by `self.scope_pats[mark..]`, `self.scope_slots` at
-    /// depth `>= depth`, and `self.temp_slots` whose enclosing drop depth is `>= depth`, WITHOUT
-    /// modifying `scope_pats`, `scope_slots`, or `temp_slots` (for a failed `if let` link,
-    /// `let`-`else` miss path, `break`, or `continue`).
+    /// depth `>= depth`, and `self.temp_slots` inside `temp_depth` (or whose enclosing drop
+    /// depth is `>= depth` when `temp_depth` is `None`), WITHOUT modifying `scope_pats`,
+    /// `scope_slots`, or `temp_slots` (for a failed `if let` link, `let`-`else` miss path,
+    /// `break`, or `continue`).
     pub(super) fn end_scope_slots_peek(&mut self, mark: usize, depth: usize) {
-        self.end_scope_slots_peek_except(mark, depth, None);
+        self.end_scope_slots_peek_except(mark, depth, None, None);
     }
 
-    pub(super) fn end_scope_slots_peek_except(&mut self, mark: usize, depth: usize, except: Option<SlotId>) {
+    pub(super) fn end_scope_slots_peek_except(
+        &mut self,
+        mark: usize,
+        depth: usize,
+        temp_depth: Option<usize>,
+        except: Option<SlotId>,
+    ) {
         if !self.live {
             return;
         }
@@ -876,7 +883,11 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             }
         }
         for &(td, slot) in self.temp_slots.iter() {
-            if self.temp_scopes.get(td).is_some_and(|&(_, sd)| usize::try_from(sd).is_ok_and(|d| d >= depth)) {
+            let inside = match temp_depth {
+                Some(t) => td >= t,
+                None => self.temp_scopes.get(td).is_some_and(|&(_, sd)| usize::try_from(sd).is_ok_and(|d| d >= depth)),
+            };
+            if inside {
                 dead.push(slot);
             }
         }
