@@ -245,7 +245,7 @@ pub use self::arena::Visibility;
 pub use self::lent::{Aligned16, CommittedLend, Lend, Lent, LentCounts, LentError, Misaligned, NotInPlace, PutTally, first_difference};
 pub use self::snapshot::{Proved, SNAPSHOT_SEGMENTS_MOST, Snapshot, SnapshotError};
 pub use self::driven::{Driven, ExclusiveLock, HeadIdentity, LocalDir, lower_this_thread};
-pub use self::format::{Described, Entry, FORMAT, FORMS, PlaceName, SEGMENT_FORMAT, Segment, check_segment, describe, find_many, record_crc, seal_segment};
+pub use self::format::{Described, Entry, FORMAT, FORMS, PlaceName, SEGMENT_DIGEST, SEGMENT_FORMAT, Segment, check_segment, describe, find_many, record_crc, seal_segment};
 pub use self::handle::{LANES_MOST, LaneId, PlainStore};
 pub use self::image::{ImageError, Placement, StartupImage};
 pub use self::settings::Settings;

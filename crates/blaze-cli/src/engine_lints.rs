@@ -500,11 +500,12 @@ impl LintsStage {
                     }
                 }
             }
-            // 2. Each file's job: run a single-file edit inline to avoid spawning a worker and
-            // reserving a 256 MiB `LINTS_FRAME`; fan out multi-file phases across the pool.
+            // 2. Each file's job: run a normal single-file edit inline to avoid spawning a worker
+            // and reserving a 256 MiB `LINTS_FRAME`; fan out multi-file phases (or massive single
+            // files whose unit list would overflow the caller's frame) across the pool.
             type Ran = Result<FileLinted, Why>;
             let mut worked: std::vec::Vec<(Ran, u64), Global> = std::vec::Vec::with_capacity_in(jobs.len(), Global);
-            if jobs.len() <= 1 {
+            if jobs.len() <= 1 && jobs.first().is_none_or(|job| job.units.len() <= 2048) {
                 for job in jobs.iter() {
                     let began = clock.now();
                     let ran = stage.run_job(&cx, root, job);

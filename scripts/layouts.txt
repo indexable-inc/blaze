@@ -90,7 +90,7 @@ crates/blaze-drive/src/record.rs	MAGIC	none
 crates/blaze-emit/src/sota/bolt.rs	BPG2_MAGIC	none
 crates/blaze-emit/src/sota/bolt.rs	BPG2_VERSION	none
 crates/blaze-engine/src/pages.rs	FILE_SHARD_MAGIC	none
-crates/blaze-engine/src/pages.rs	PAGE_MAGIC	none
+crates/blaze-engine/src/pages.rs	PAGE_MAGIC	test previous_page_magic_bep5_is_rejected
 crates/blaze-engine/src/pages.rs	PLACES_MAGIC	none
 crates/blaze-engine/src/pages.rs	RADIX_SHARD_MAGIC	none
 crates/blaze-engine/src/pages.rs	ROOT_MAGIC	test previous_root_magic_ber3_is_rejected

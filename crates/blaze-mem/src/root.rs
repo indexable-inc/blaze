@@ -262,7 +262,14 @@ pub struct RootUsed {
     pub reserved: usize,
 }
 
-/// One class's free blocks.
+/// Cache-line padded wrapper (128 bytes for ARM64/x86-64 spatial prefetcher pairs, rule 86)
+/// so hot atomics and spinlocks never false-share across cores on 128-core machines.
+#[repr(align(128))]
+struct Padded<T>(T);
+
+/// One class's free blocks, padded to its own 128-byte cache line so concurrent alloc/dealloc
+/// across adjacent size classes never false-share spinlocks or free-list heads.
+#[repr(align(128))]
 struct List {
     /// Its lock (see the module).
     held: AtomicBool,
@@ -325,30 +332,49 @@ fn stuck(class: usize, tag: Tag) -> ! {
     )
 }
 
+/// Cold error-reporting slots for [`Root::refusal`], grouped on their own 128-byte cache line
+/// so cold refusal state never shares a line with hot allocation atomics or free lists.
+struct RefusalSlots {
+    kind: AtomicU8,
+    wanted: AtomicUsize,
+    errno: AtomicI32,
+}
+
 /// The root heap (see the module): made once at a program's or a test's top, handed down as
 /// `&Root`, [`Alloc`] or [`SharedAlloc`].
 ///
 /// `#[repr(C)]` with its [`Header`] first, so a handle is its address ([`Headed`]).
+/// Hot atomics (`carved`, `live_blocks`, `live_bytes`, `allocations`) and every per-class
+/// [`List`] spinlock are isolated onto distinct 128-byte cache lines (rule 86) to eliminate
+/// cross-core false sharing on 128-core ARM64/x86-64 machines.
 #[repr(C)]
 pub struct Root {
     /// First: the handle's table (blaze-own's invariant 1).
     header: Header,
     region: Region,
-    /// The end of the carved part, an offset into the reservation.
-    carved: AtomicUsize,
-    live_blocks: AtomicUsize,
-    live_bytes: AtomicUsize,
-    allocations: AtomicUsize,
+    /// The maker's choice for blocks live at the drop ([`RootOpts::live_at_drop`]).
+    live_at_drop: LiveAtDrop,
+    /// The end of the carved part, an offset into the reservation (hot CAS on carve/uncarve).
+    carved: Padded<AtomicUsize>,
+    live_blocks: Padded<AtomicUsize>,
+    live_bytes: Padded<AtomicUsize>,
+    allocations: Padded<AtomicUsize>,
     /// The last refusal, for [`Root::refusal`]: its kind ([`Refused`]'s codes), the size it
     /// named and the kernel's error number. Written by the refusing thread, read whole only by
     /// the caller it refused (another thread's refusal at once may mix the fields).
-    refused: AtomicU8,
-    refused_wanted: AtomicUsize,
-    refused_errno: AtomicI32,
+    refusal: Padded<RefusalSlots>,
     lists: [List; CLASSES],
-    /// The maker's choice for blocks live at the drop ([`RootOpts::live_at_drop`]).
-    live_at_drop: LiveAtDrop,
 }
+
+const _: () = assert!(core::mem::offset_of!(Root, header) == 0);
+const _: () = assert!(align_of::<List>() == 128);
+const _: () = assert!(align_of::<Root>() == 128);
+const _: () = assert!(core::mem::offset_of!(Root, carved) % 128 == 0);
+const _: () = assert!(core::mem::offset_of!(Root, live_blocks) % 128 == 0);
+const _: () = assert!(core::mem::offset_of!(Root, live_bytes) % 128 == 0);
+const _: () = assert!(core::mem::offset_of!(Root, allocations) % 128 == 0);
+const _: () = assert!(core::mem::offset_of!(Root, refusal) % 128 == 0);
+const _: () = assert!(core::mem::offset_of!(Root, lists) % 128 == 0);
 
 impl Root {
     /// A root reserving `opts.reserve` bytes of address space for `opts.tag`, committing nothing
@@ -365,15 +391,17 @@ impl Root {
         Ok(Root {
             header: Header::of::<Root>(),
             region,
-            carved: AtomicUsize::new(0),
-            live_blocks: AtomicUsize::new(0),
-            live_bytes: AtomicUsize::new(0),
-            allocations: AtomicUsize::new(0),
-            refused: AtomicU8::new(Refused::NONE),
-            refused_wanted: AtomicUsize::new(0),
-            refused_errno: AtomicI32::new(0),
-            lists: [const { List::EMPTY }; CLASSES],
             live_at_drop: opts.live_at_drop,
+            carved: Padded(AtomicUsize::new(0)),
+            live_blocks: Padded(AtomicUsize::new(0)),
+            live_bytes: Padded(AtomicUsize::new(0)),
+            allocations: Padded(AtomicUsize::new(0)),
+            refusal: Padded(RefusalSlots {
+                kind: AtomicU8::new(Refused::NONE),
+                wanted: AtomicUsize::new(0),
+                errno: AtomicI32::new(0),
+            }),
+            lists: [const { List::EMPTY }; CLASSES],
         })
     }
 
@@ -416,10 +444,10 @@ impl Root {
     /// What it holds now.
     pub fn used(&self) -> RootUsed {
         RootUsed {
-            live_blocks: self.live_blocks.load(Ordering::Acquire),
-            live_bytes: self.live_bytes.load(Ordering::Acquire),
-            allocations: self.allocations.load(Ordering::Acquire),
-            carved: self.carved.load(Ordering::Acquire),
+            live_blocks: self.live_blocks.0.load(Ordering::Acquire),
+            live_bytes: self.live_bytes.0.load(Ordering::Acquire),
+            allocations: self.allocations.0.load(Ordering::Acquire),
+            carved: self.carved.0.load(Ordering::Acquire),
             committed: self.region.committed(),
             reserved: self.region.reserved(),
         }
@@ -432,11 +460,11 @@ impl Root {
 
     /// Checks [`LiveAtDrop::Refused`] when the root ends or resets.
     fn check_live_at_end(&mut self, doing: &str) {
-        let live = *self.live_blocks.get_mut();
+        let live = *self.live_blocks.0.get_mut();
         // A test's (debug) build: a block still live is a leak, the test's failure. Not while a
         // panic unwinds, which leaves blocks live by design and would abort on a second panic.
         if cfg!(debug_assertions) && self.live_at_drop == LiveAtDrop::Refused && live != 0 && !std::thread::panicking() {
-            let bytes = *self.live_bytes.get_mut();
+            let bytes = *self.live_bytes.0.get_mut();
             panic!(
                 "blaze_mem::Root ({}, {} bytes reserved) {doing} with {live} blocks ({bytes} bytes) still live: their \
                  owners leaked them (`mem::forget`, `Vec::leak`, `Box::leak`, a cycle of counted pointers)",
@@ -455,13 +483,13 @@ impl Root {
     pub fn reset(&mut self) -> usize {
         self.check_live_at_end("reset");
         let committed = self.region.committed();
-        *self.carved.get_mut() = 0;
-        *self.live_blocks.get_mut() = 0;
-        *self.live_bytes.get_mut() = 0;
-        *self.allocations.get_mut() = 0;
-        *self.refused.get_mut() = Refused::NONE;
-        *self.refused_wanted.get_mut() = 0;
-        *self.refused_errno.get_mut() = 0;
+        *self.carved.0.get_mut() = 0;
+        *self.live_blocks.0.get_mut() = 0;
+        *self.live_bytes.0.get_mut() = 0;
+        *self.allocations.0.get_mut() = 0;
+        *self.refusal.0.kind.get_mut() = Refused::NONE;
+        *self.refusal.0.wanted.get_mut() = 0;
+        *self.refusal.0.errno.get_mut() = 0;
         for list in self.lists.iter_mut() {
             *list.held.get_mut() = false;
             *list.top.get_mut() = 0;
@@ -477,10 +505,10 @@ impl Root {
     /// the kernel refused, a size or alignment past what a root gives); `None` if none was.
     /// The allocator's error, `AllocError`, carries nothing, so this is where it is named.
     pub fn refusal(&self) -> Option<MemError> {
-        let wanted = self.refused_wanted.load(Ordering::Acquire);
-        let why = match self.refused.load(Ordering::Acquire) {
+        let wanted = self.refusal.0.wanted.load(Ordering::Acquire);
+        let why = match self.refusal.0.kind.load(Ordering::Acquire) {
             Refused::EXHAUSTED => Refused::Exhausted { wanted },
-            Refused::COMMIT => Refused::Commit { bytes: wanted, errno: self.refused_errno.load(Ordering::Acquire) },
+            Refused::COMMIT => Refused::Commit { bytes: wanted, errno: self.refusal.0.errno.load(Ordering::Acquire) },
             Refused::TOO_LARGE => Refused::TooLarge { wanted },
             Refused::ALIGN => Refused::Align { wanted },
             _ => return None,
@@ -504,9 +532,9 @@ impl Root {
             Refused::TooLarge { wanted } => (Refused::TOO_LARGE, wanted, 0),
             Refused::Align { wanted } => (Refused::ALIGN, wanted, 0),
         };
-        self.refused_wanted.store(wanted, Ordering::Release);
-        self.refused_errno.store(errno, Ordering::Release);
-        self.refused.store(kind, Ordering::Release);
+        self.refusal.0.wanted.store(wanted, Ordering::Release);
+        self.refusal.0.errno.store(errno, Ordering::Release);
+        self.refusal.0.kind.store(kind, Ordering::Release);
         AllocError
     }
 
@@ -546,14 +574,14 @@ impl Root {
         let (size, align) = (class_size(class), class_align(class));
         let reserved = self.region.reserved();
         // Acquire: a block uncarved by another thread was given back after its last use there.
-        let mut from = self.carved.load(Ordering::Acquire);
+        let mut from = self.carved.0.load(Ordering::Acquire);
         // Lock-free: each turn that fails saw another thread move the end.
         loop {
             let start = crate::align::checked_align_up(from, align).ok_or(Refused::Exhausted { wanted: size })?;
             let end = start.checked_add(size).filter(|&end| end <= reserved).ok_or(Refused::Exhausted { wanted: size })?;
             // Committed before the end is published, so a block is backed once it is anyone's.
             self.region.ensure(end).map_err(|error| Refused::of_mem(&error, end))?;
-            match self.carved.compare_exchange_weak(from, end, Ordering::AcqRel, Ordering::Acquire) {
+            match self.carved.0.compare_exchange_weak(from, end, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => return Ok(start),
                 Err(now) => from = now,
             }
@@ -597,14 +625,14 @@ impl Root {
     /// resized in place. `false` when it is not the last block or there is no room.
     fn resize_last(&self, at: usize, old: usize, new: usize) -> bool {
         let (old_end, Some(new_end)) = (at + old, at.checked_add(new)) else { return false };
-        if new_end > self.region.reserved() || self.carved.load(Ordering::Acquire) != old_end {
+        if new_end > self.region.reserved() || self.carved.0.load(Ordering::Acquire) != old_end {
             return false;
         }
         if self.region.ensure(new_end).is_err() {
             // Not refused here: the move that follows takes its own block, and names a refusal.
             return false;
         }
-        self.carved.compare_exchange(old_end, new_end, Ordering::AcqRel, Ordering::Relaxed).is_ok()
+        self.carved.0.compare_exchange(old_end, new_end, Ordering::AcqRel, Ordering::Relaxed).is_ok()
     }
 
     /// [`Allocator::grow`] and [`Allocator::shrink`]: in place when the class stays or the
@@ -621,9 +649,9 @@ impl Root {
             || (crate::align::is_aligned(at, class_align(to)) && self.resize_last(at, class_size(from), class_size(to)));
         if stays {
             if new.size() >= old.size() {
-                self.live_bytes.fetch_add(new.size() - old.size(), Ordering::Relaxed);
+                self.live_bytes.0.fetch_add(new.size() - old.size(), Ordering::Relaxed);
             } else {
-                self.live_bytes.fetch_sub(old.size() - new.size(), Ordering::Relaxed);
+                self.live_bytes.0.fetch_sub(old.size() - new.size(), Ordering::Relaxed);
             }
             return Ok(NonNull::slice_from_raw_parts(ptr, new.size()));
         }
@@ -658,21 +686,21 @@ unsafe impl Allocator for Root {
             Some(at) => at,
             None => self.carve(class).map_err(|why| self.refuse(why))?,
         };
-        self.live_blocks.fetch_add(1, Ordering::Relaxed);
-        self.live_bytes.fetch_add(layout.size(), Ordering::Relaxed);
-        self.allocations.fetch_add(1, Ordering::Relaxed);
+        self.live_blocks.0.fetch_add(1, Ordering::Relaxed);
+        self.live_bytes.0.fetch_add(layout.size(), Ordering::Relaxed);
+        self.allocations.0.fetch_add(1, Ordering::Relaxed);
         Ok(NonNull::slice_from_raw_parts(self.region.at(at), layout.size()))
     }
 
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
         let class = self.class_of_block(layout);
         let at = self.block_at(ptr);
-        self.live_blocks.fetch_sub(1, Ordering::Relaxed);
-        self.live_bytes.fetch_sub(layout.size(), Ordering::Relaxed);
+        self.live_blocks.0.fetch_sub(1, Ordering::Relaxed);
+        self.live_bytes.0.fetch_sub(layout.size(), Ordering::Relaxed);
         // The last block carved is uncarved; any other goes on its class's list. Release: its
         // owner's last writes come before the thread that carves those bytes again.
         let end = at + class_size(class);
-        if self.carved.compare_exchange(end, at, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+        if self.carved.0.compare_exchange(end, at, Ordering::AcqRel, Ordering::Relaxed).is_err() {
             self.push(class, at);
         }
     }

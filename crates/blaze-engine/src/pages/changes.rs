@@ -589,30 +589,33 @@ fn row_byte_len(row: &Row<'_>) -> usize {
     ROW_FIXED + DEFINE * row.defines.len() + READ * row.reads.len() + if indexed { 4 * row.by_cell.len() } else { 0 }
 }
 
-/// Fast upper bound on bytes added by `work` and `kept` (used to decide whether the merged
+/// Fast upper bound on `BEP6` bytes added by `work` and `kept` (used to decide whether the merged
 /// answer might outgrow `last.bits`).
 fn estimate_added_bytes(kept: &Kept<'_>, work: &Work<'_>) -> u64 {
     let mut added: u64 = 0;
     for row in work.rows.values().flatten() {
-        added = added.saturating_add(u64::try_from(row_byte_len(row)).unwrap_or(u64::MAX));
+        added = added.saturating_add(bep6::estimate_row_v6(row.defines.len(), row.reads.len()));
     }
     let cells = work.cells.iter().filter(|(_, v)| v.is_some()).count();
-    added = added.saturating_add(u64::try_from(CELL_ENTRY.saturating_mul(cells)).unwrap_or(u64::MAX));
-    let owed = OWED_CELL.saturating_mul(work.owed_cells.len()).saturating_add(OWED_TASK.saturating_mul(work.owed_tasks.len()));
+    added = added.saturating_add(u64::try_from((bep6::CELL_ENTRY_V6 + bep6::DICT_CELL).saturating_mul(cells)).unwrap_or(u64::MAX));
+    let owed = (bep6::OWED_CELL_V6 + bep6::DICT_CELL)
+        .saturating_mul(work.owed_cells.len())
+        .saturating_add((bep6::OWED_TASK_V6 + NAME).saturating_mul(work.owed_tasks.len()));
     added = added.saturating_add(u64::try_from(owed).unwrap_or(u64::MAX));
     for names in work.by_file.values().flatten() {
-        let len = NAME.saturating_add(4).saturating_add(FILE_MEMBER.saturating_mul(names.len()));
+        let len = NAME.saturating_add(4).saturating_add(bep6::FILE_MEMBER_V6.saturating_mul(names.len()));
         added = added.saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
     }
     for (_, changes) in work.readers.iter() {
         let adds = changes.iter().filter(|&(_, &add)| add).count();
         if adds > 0 {
-            let len = CELL_ID.saturating_add(4).saturating_add(NAME.saturating_mul(adds));
+            let len = bep6::IDX.saturating_add(4).saturating_add(bep6::IDX.saturating_mul(adds));
             added = added.saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
         }
     }
-    let extra = CAUSE.saturating_mul(kept.causes.len()).saturating_add((NAME + ID).saturating_mul(kept.records.len()));
-    added.saturating_add(u64::try_from(extra).unwrap_or(u64::MAX))
+    let causes: usize = kept.causes.values().map(|&(_, c)| bep6::cause_len_v6(c)).sum();
+    let recs = (bep6::RECORD_V6 + ID).saturating_mul(kept.records.len());
+    added.saturating_add(u64::try_from(causes.saturating_add(recs)).unwrap_or(u64::MAX))
 }
 
 /// A synthetic [`Name`] whose [`page_of`] at `bits` is `index`.
@@ -626,21 +629,32 @@ fn page_witness(index: usize, bits: u8) -> Name {
     Name::new(Kind::Units, ContentId(subject))
 }
 
-fn collect_old_entries<'a, 'p>(old_pages: &[&'p VerifiedPage<'_>], section: usize, alloc: SharedAlloc<'a>) -> SVec<'a, (CellId, &'p [u8])> {
+fn collect_old_entries<'a, 'p>(
+    old_pages: &[&'p VerifiedPage<'p>],
+    section: usize,
+    alloc: SharedAlloc<'a>,
+) -> SVec<'a, (CellId, &'p VerifiedPage<'p>, &'p [u8])> {
     let mut out = SVec::new_in(alloc);
-    for page in old_pages {
+    for &page in old_pages {
         for bytes in page.entries(section) {
-            out.push((key_of_entry(bytes, section), bytes));
+            out.push((page.entry_key(section, bytes), page, bytes));
         }
     }
-    out.sort_unstable_by_key(|(k, _)| *k);
+    out.sort_unstable_by_key(|(k, _, _)| *k);
     out
 }
 
-fn write_at<'a>(bufs: &mut [PageBuf<'a>], bits: u8, name: Name, section: usize, write: impl FnOnce(&mut SVec<'a, u8>)) {
+fn write_flat_at<'p, 'a>(bufs: &mut [PageBuf<'p, 'a>], bits: u8, name: Name, section: usize, write: impl FnOnce(&mut SVec<'a, u8>)) {
     let idx = usize::try_from(page_of(name, bits)).unwrap_or(0);
     if let Some(buf) = bufs.get_mut(idx) {
-        write(buf.entry(section));
+        buf.push_flat(section, write);
+    }
+}
+
+fn write_dict_at<'p, 'a>(bufs: &mut [PageBuf<'p, 'a>], bits: u8, name: Name, section: usize, page: &'p VerifiedPage<'p>, bytes: &'p [u8]) {
+    let idx = usize::try_from(page_of(name, bits)).unwrap_or(0);
+    if let Some(buf) = bufs.get_mut(idx) {
+        buf.push_dict(section, page, bytes);
     }
 }
 
@@ -771,17 +785,19 @@ where
         if replacement.is_none() && !last.files.contains_key(&file) { continue; }
         let base = source.page_for(file, Ask::File)?;
         let old_members = base.map_or(&[][..], |page| page.file_members(file));
-        let count = replacement.and_then(|s| s.as_ref()).map_or(old_members.len() / FILE_MEMBER, |names| names.len());
+        let count = replacement
+            .and_then(|s| s.as_ref())
+            .map_or(old_members.len() / bep6::FILE_MEMBER_V6, |names| names.len());
         let mut record = SVec::with_capacity_in(NAME + 4 + count * FILE_MEMBER, alloc);
         put_name(&mut record, file);
         put_u32(&mut record, count);
         let mut all_stand = true;
         let mut member = |name: Name| -> Result<(), PagesError> {
             if !work.rows.contains_key(&name) && last.owed_tasks.get(&name) == work.owed_tasks.get(&name)
-                && let Some(saved) = VerifiedPage::member(old_members, name)
+                && let Some(base_page) = base
+                && let Some(saved) = base_page.member_v6(old_members, name)
             {
-                all_stand &= saved.get(NAME).copied() == Some(1);
-                record.extend_from_slice(saved);
+                all_stand &= bep6::write_flat_file_member_from_v6(base_page.dicts(), saved, &mut record);
                 return Ok(());
             }
             let claim = if work.owed_tasks.contains_key(&name) {
@@ -808,7 +824,7 @@ where
     let planned = &root.files;
     root.places.retain(|file, _| planned.contains_key(file));
 
-    // Collect old entries per section and compute exact merged byte total (matching `pages::encode`).
+    // Collect old entries per section and compute exact merged BEP6 byte estimate (matching `pages::encode`).
     let old_rows = collect_old_entries(&old_pages, ROWS, alloc);
     let old_cells = collect_old_entries(&old_pages, CELLS, alloc);
     let old_files = collect_old_entries(&old_pages, FILES, alloc);
@@ -817,51 +833,64 @@ where
     let old_readers = collect_old_entries(&old_pages, READERS, alloc);
 
     let mut total: u64 = 0;
-    for &(k, b) in old_rows.iter() {
+    for &(k, _, b) in old_rows.iter() {
         if !work.rows.contains_key(&k.of) {
-            total = total.saturating_add(u64::try_from(b.len()).unwrap_or(u64::MAX));
+            let defs = usize::try_from(view::word(b.get(bep6::ROW_FIXED_V6 - 8..).unwrap_or(&[]))).unwrap_or(0);
+            let reads = usize::try_from(view::word(b.get(bep6::ROW_FIXED_V6 - 4..).unwrap_or(&[]))).unwrap_or(0);
+            total = total.saturating_add(bep6::estimate_row_v6(defs, reads));
         }
     }
     for row in work.rows.values().flatten() {
-        let len = ROW_FIXED + DEFINE * row.defines.len() + READ * row.reads.len();
-        total = total.saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
+        total = total.saturating_add(bep6::estimate_row_v6(row.defines.len(), row.reads.len()));
     }
-    let kept_old_cells = old_cells.iter().filter(|(k, _)| !work.cells.contains_key(k)).count();
+    let kept_old_cells = old_cells.iter().filter(|(k, _, _)| !work.cells.contains_key(k)).count();
     let new_cells = work.cells.iter().filter(|(_, v)| v.is_some()).count();
-    total = total.saturating_add(u64::try_from(CELL_ENTRY * (kept_old_cells + new_cells) + OWED_CELL * root.owed_cells.len() + OWED_TASK * root.owed_tasks.len()).unwrap_or(u64::MAX));
-    for &(k, b) in old_files.iter() {
+    let fixed = (bep6::CELL_ENTRY_V6 + bep6::DICT_CELL) * (kept_old_cells + new_cells)
+        + (bep6::OWED_CELL_V6 + bep6::DICT_CELL) * root.owed_cells.len()
+        + (bep6::OWED_TASK_V6 + NAME) * root.owed_tasks.len();
+    total = total.saturating_add(u64::try_from(fixed).unwrap_or(u64::MAX));
+    for &(k, _, b) in old_files.iter() {
         if !file_updates.contains_key(&k) {
-            total = total.saturating_add(u64::try_from(b.len()).unwrap_or(u64::MAX));
+            let members = b.len().saturating_sub(8) / bep6::FILE_MEMBER_V6;
+            let len = NAME + 4 + bep6::FILE_MEMBER_V6 * members;
+            total = total.saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
         }
     }
     for rec in file_updates.values().flatten() {
-        total = total.saturating_add(u64::try_from(rec.len()).unwrap_or(u64::MAX));
+        let members = rec.len().saturating_sub(NAME + 4) / FILE_MEMBER;
+        let len = NAME + 4 + bep6::FILE_MEMBER_V6 * members;
+        total = total.saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
     }
-    let kept_old_causes = old_causes.iter().filter(|(k, _)| !cause_updates.contains_key(k)).count();
-    let new_causes = cause_updates.values().filter(|v| v.is_some()).count();
-    total = total.saturating_add(u64::try_from(CAUSE * (kept_old_causes + new_causes)).unwrap_or(u64::MAX));
-    let kept_old_records = old_records.iter().filter(|(k, _)| !record_updates.contains_key(k)).count();
+    for &(k, _, b) in old_causes.iter() {
+        if !cause_updates.contains_key(&k) {
+            total = total.saturating_add(u64::try_from(b.len()).unwrap_or(u64::MAX));
+        }
+    }
+    for val in cause_updates.values().flatten() {
+        total = total.saturating_add(u64::try_from(bep6::cause_len_v6(val.1)).unwrap_or(u64::MAX));
+    }
+    let kept_old_records = old_records.iter().filter(|(k, _, _)| !record_updates.contains_key(k)).count();
     let new_records = record_updates.values().filter(|v| v.is_some()).count();
-    total = total.saturating_add(u64::try_from((NAME + ID) * (kept_old_records + new_records)).unwrap_or(u64::MAX));
+    total = total.saturating_add(u64::try_from((bep6::RECORD_V6 + ID) * (kept_old_records + new_records)).unwrap_or(u64::MAX));
     let mut old_reader_iter = old_readers.iter().peekable();
     for (&id, changes) in work.readers.iter() {
-        while let Some(&&(ok, ob)) = old_reader_iter.peek() && ok < id {
+        while let Some(&&(ok, _, ob)) = old_reader_iter.peek() && ok < id {
             total = total.saturating_add(u64::try_from(ob.len()).unwrap_or(u64::MAX));
             old_reader_iter.next();
         }
         let mut old_count = 0usize;
-        if let Some(&&(ok, ob)) = old_reader_iter.peek() && ok == id {
-            old_count = (ob.len().saturating_sub(CELL_ID + 4)) / NAME;
+        if let Some(&&(ok, _, ob)) = old_reader_iter.peek() && ok == id {
+            old_count = ob.len().saturating_sub(8) / bep6::IDX;
             old_reader_iter.next();
         }
         let adds = changes.iter().filter(|&(_, &add)| add).count();
         let removes = changes.iter().filter(|&(_, &add)| !add).count();
         let est = old_count.saturating_add(adds).saturating_sub(removes);
         if est > 0 {
-            total = total.saturating_add(u64::try_from(CELL_ID + 4 + NAME * est).unwrap_or(u64::MAX));
+            total = total.saturating_add(u64::try_from(bep6::IDX + 4 + bep6::IDX * est).unwrap_or(u64::MAX));
         }
     }
-    for &(_, ob) in old_reader_iter {
+    for &(_, _, ob) in old_reader_iter {
         total = total.saturating_add(u64::try_from(ob.len()).unwrap_or(u64::MAX));
     }
 
@@ -871,7 +900,7 @@ where
     }
 
     let count = 1usize << new_bits;
-    let mut bufs: SVec<'a, PageBuf<'a>> = SVec::with_capacity_in(count, alloc);
+    let mut bufs: SVec<'_, PageBuf<'_, 'a>> = SVec::with_capacity_in(count, alloc);
     for _ in 0..count {
         bufs.push(PageBuf::new_in(alloc));
     }
@@ -879,25 +908,25 @@ where
     // 1. ROWS
     {
         let mut updates = work.rows.iter().peekable();
-        for &(k, old_bytes) in old_rows.iter() {
+        for &(k, page, old_bytes) in old_rows.iter() {
             while let Some(&(&name, val)) = updates.peek() && named(name) < k {
                 updates.next();
                 if let Some(row) = val {
-                    write_at(&mut bufs, new_bits, name, ROWS, |out| put_row(out, name, row));
+                    write_flat_at(&mut bufs, new_bits, name, ROWS, |out| put_row(out, name, row));
                 }
             }
             if let Some(&(&name, val)) = updates.peek() && named(name) == k {
                 updates.next();
                 if let Some(row) = val {
-                    write_at(&mut bufs, new_bits, name, ROWS, |out| put_row(out, name, row));
+                    write_flat_at(&mut bufs, new_bits, name, ROWS, |out| put_row(out, name, row));
                 }
             } else {
-                write_at(&mut bufs, new_bits, k.of, ROWS, |out| out.extend_from_slice(old_bytes));
+                write_dict_at(&mut bufs, new_bits, k.of, ROWS, page, old_bytes);
             }
         }
         for (&name, val) in updates {
             if let Some(row) = val {
-                write_at(&mut bufs, new_bits, name, ROWS, |out| put_row(out, name, row));
+                write_flat_at(&mut bufs, new_bits, name, ROWS, |out| put_row(out, name, row));
             }
         }
     }
@@ -905,11 +934,11 @@ where
     // 2. CELLS
     {
         let mut updates = work.cells.iter().peekable();
-        for &(k, old_bytes) in old_cells.iter() {
+        for &(k, page, old_bytes) in old_cells.iter() {
             while let Some(&(&id, val)) = updates.peek() && id < k {
                 updates.next();
                 if let Some((digest, moved)) = val {
-                    write_at(&mut bufs, new_bits, id.of, CELLS, |out| {
+                    write_flat_at(&mut bufs, new_bits, id.of, CELLS, |out| {
                         put_cell_id(out, &id);
                         put_id(out, digest);
                         out.extend_from_slice(&moved.0.to_le_bytes());
@@ -919,19 +948,19 @@ where
             if let Some(&(&id, val)) = updates.peek() && id == k {
                 updates.next();
                 if let Some((digest, moved)) = val {
-                    write_at(&mut bufs, new_bits, id.of, CELLS, |out| {
+                    write_flat_at(&mut bufs, new_bits, id.of, CELLS, |out| {
                         put_cell_id(out, &id);
                         put_id(out, digest);
                         out.extend_from_slice(&moved.0.to_le_bytes());
                     });
                 }
             } else {
-                write_at(&mut bufs, new_bits, k.of, CELLS, |out| out.extend_from_slice(old_bytes));
+                write_dict_at(&mut bufs, new_bits, k.of, CELLS, page, old_bytes);
             }
         }
         for (&id, val) in updates {
             if let Some((digest, moved)) = val {
-                write_at(&mut bufs, new_bits, id.of, CELLS, |out| {
+                write_flat_at(&mut bufs, new_bits, id.of, CELLS, |out| {
                     put_cell_id(out, &id);
                     put_id(out, digest);
                     out.extend_from_slice(&moved.0.to_le_bytes());
@@ -942,37 +971,37 @@ where
 
     // 3. OWED_CELLS & 4. OWED_TASKS (complete sets live in `root`)
     for (id, moved) in root.owed_cells.iter() {
-        write_at(&mut bufs, new_bits, id.of, OWED_CELLS, |out| {
+        write_flat_at(&mut bufs, new_bits, id.of, OWED_CELLS, |out| {
             put_cell_id(out, id);
             out.extend_from_slice(&moved.0.to_le_bytes());
         });
     }
     for (&name, plan) in root.owed_tasks.iter() {
-        write_at(&mut bufs, new_bits, name, OWED_TASKS, |out| put_plan(out, plan));
+        write_flat_at(&mut bufs, new_bits, name, OWED_TASKS, |out| put_plan(out, plan));
     }
 
     // 5. FILES
     {
         let mut updates = file_updates.iter().peekable();
-        for &(k, old_bytes) in old_files.iter() {
+        for &(k, page, old_bytes) in old_files.iter() {
             while let Some(&(&uk, val)) = updates.peek() && uk < k {
                 updates.next();
                 if let Some(rec) = val {
-                    write_at(&mut bufs, new_bits, uk.of, FILES, |out| out.extend_from_slice(rec));
+                    write_flat_at(&mut bufs, new_bits, uk.of, FILES, |out| out.extend_from_slice(rec));
                 }
             }
             if let Some(&(&uk, val)) = updates.peek() && uk == k {
                 updates.next();
                 if let Some(rec) = val {
-                    write_at(&mut bufs, new_bits, uk.of, FILES, |out| out.extend_from_slice(rec));
+                    write_flat_at(&mut bufs, new_bits, uk.of, FILES, |out| out.extend_from_slice(rec));
                 }
             } else {
-                write_at(&mut bufs, new_bits, k.of, FILES, |out| out.extend_from_slice(old_bytes));
+                write_dict_at(&mut bufs, new_bits, k.of, FILES, page, old_bytes);
             }
         }
         for (&uk, val) in updates {
             if let Some(rec) = val {
-                write_at(&mut bufs, new_bits, uk.of, FILES, |out| out.extend_from_slice(rec));
+                write_flat_at(&mut bufs, new_bits, uk.of, FILES, |out| out.extend_from_slice(rec));
             }
         }
     }
@@ -980,25 +1009,25 @@ where
     // 6. CAUSES
     {
         let mut updates = cause_updates.iter().peekable();
-        for &(k, old_bytes) in old_causes.iter() {
+        for &(k, page, old_bytes) in old_causes.iter() {
             while let Some(&(&uk, val)) = updates.peek() && uk < k {
                 updates.next();
                 if let Some((serial, cause)) = val {
-                    write_at(&mut bufs, new_bits, uk.of, CAUSES, |out| put_cause(out, uk.of, *serial, *cause));
+                    write_flat_at(&mut bufs, new_bits, uk.of, CAUSES, |out| put_cause(out, uk.of, *serial, *cause));
                 }
             }
             if let Some(&(&uk, val)) = updates.peek() && uk == k {
                 updates.next();
                 if let Some((serial, cause)) = val {
-                    write_at(&mut bufs, new_bits, uk.of, CAUSES, |out| put_cause(out, uk.of, *serial, *cause));
+                    write_flat_at(&mut bufs, new_bits, uk.of, CAUSES, |out| put_cause(out, uk.of, *serial, *cause));
                 }
             } else {
-                write_at(&mut bufs, new_bits, k.of, CAUSES, |out| out.extend_from_slice(old_bytes));
+                write_dict_at(&mut bufs, new_bits, k.of, CAUSES, page, old_bytes);
             }
         }
         for (&uk, val) in updates {
             if let Some((serial, cause)) = val {
-                write_at(&mut bufs, new_bits, uk.of, CAUSES, |out| put_cause(out, uk.of, *serial, *cause));
+                write_flat_at(&mut bufs, new_bits, uk.of, CAUSES, |out| put_cause(out, uk.of, *serial, *cause));
             }
         }
     }
@@ -1006,11 +1035,11 @@ where
     // 7. RECORDS
     {
         let mut updates = record_updates.iter().peekable();
-        for &(k, old_bytes) in old_records.iter() {
+        for &(k, page, old_bytes) in old_records.iter() {
             while let Some(&(&uk, val)) = updates.peek() && uk < k {
                 updates.next();
                 if let Some(key) = val {
-                    write_at(&mut bufs, new_bits, uk.of, RECORDS, |out| {
+                    write_flat_at(&mut bufs, new_bits, uk.of, RECORDS, |out| {
                         put_name(out, uk.of);
                         put_id(out, &key.0);
                     });
@@ -1019,18 +1048,18 @@ where
             if let Some(&(&uk, val)) = updates.peek() && uk == k {
                 updates.next();
                 if let Some(key) = val {
-                    write_at(&mut bufs, new_bits, uk.of, RECORDS, |out| {
+                    write_flat_at(&mut bufs, new_bits, uk.of, RECORDS, |out| {
                         put_name(out, uk.of);
                         put_id(out, &key.0);
                     });
                 }
             } else {
-                write_at(&mut bufs, new_bits, k.of, RECORDS, |out| out.extend_from_slice(old_bytes));
+                write_dict_at(&mut bufs, new_bits, k.of, RECORDS, page, old_bytes);
             }
         }
         for (&uk, val) in updates {
             if let Some(key) = val {
-                write_at(&mut bufs, new_bits, uk.of, RECORDS, |out| {
+                write_flat_at(&mut bufs, new_bits, uk.of, RECORDS, |out| {
                     put_name(out, uk.of);
                     put_id(out, &key.0);
                 });
@@ -1041,15 +1070,17 @@ where
     // 8. READERS (using one reusable scratch buffer across all changed cells)
     {
         let mut scratch: SVec<'a, u8> = SVec::new_in(alloc);
-        let write_merged = |bufs: &mut [PageBuf<'a>], scratch: &mut SVec<'a, u8>, id: CellId, old_bytes: Option<&[u8]>, changes: crate::readers::Edits<'_>| {
+        let write_merged = |bufs: &mut [PageBuf<'_, 'a>], scratch: &mut SVec<'a, u8>, id: CellId, old: Option<(&VerifiedPage<'_>, &[u8])>, changes: crate::readers::Edits<'_>| {
             scratch.clear();
             put_cell_id(scratch, &id);
             put_u32(scratch, 0);
             let mut ch = changes.iter().peekable();
-            if let Some(tail) = old_bytes.and_then(|bytes| bytes.get(CELL_ID + 4..)) {
-                for chunk in tail.chunks_exact(NAME) {
-                    let mut r = Rd { bytes: chunk, at: 0, page: 0 };
-                    let Ok(reader) = r.name() else { continue };
+            if let Some((old_page, old_bytes)) = old
+                && let Some(tail) = old_bytes.get(8..)
+            {
+                let old_dicts = old_page.dicts();
+                for chunk in tail.chunks_exact(bep6::IDX) {
+                    let reader = old_dicts.name(view::word(chunk));
                     while ch.peek().is_some_and(|item| *item.0 < reader) {
                         if let Some((&name, &true)) = ch.next() { put_name(scratch, name); }
                     }
@@ -1069,20 +1100,20 @@ where
                 if let Some(slot) = scratch.get_mut(CELL_ID..CELL_ID + 4) {
                     slot.copy_from_slice(&count_u32.to_le_bytes());
                 }
-                write_at(bufs, new_bits, readers_slot(&id), READERS, |out| out.extend_from_slice(scratch));
+                write_flat_at(bufs, new_bits, readers_slot(&id), READERS, |out| out.extend_from_slice(scratch));
             }
         };
         let mut updates = work.readers.iter().peekable();
-        for &(k, old_bytes) in old_readers.iter() {
+        for &(k, page, old_bytes) in old_readers.iter() {
             while let Some(&(&id, changes)) = updates.peek() && id < k {
                 updates.next();
                 write_merged(&mut bufs, &mut scratch, id, None, changes);
             }
             if let Some(&(&id, changes)) = updates.peek() && id == k {
                 updates.next();
-                write_merged(&mut bufs, &mut scratch, id, Some(old_bytes), changes);
+                write_merged(&mut bufs, &mut scratch, id, Some((page, old_bytes)), changes);
             } else {
-                write_at(&mut bufs, new_bits, readers_slot(&k), READERS, |out| out.extend_from_slice(old_bytes));
+                write_dict_at(&mut bufs, new_bits, readers_slot(&k), READERS, page, old_bytes);
             }
         }
         for (&id, changes) in updates {
@@ -1121,117 +1152,56 @@ where
     Ok(Some(root.finish_whole(flat_pages, None, puts, records, PagesPlant::None, alloc)))
 }
 
-fn key_of_entry(bytes: &[u8], section: usize) -> CellId {
-    let mut r = Rd { bytes, at: 0, page: 0 };
-    if view::key_width(section) == NAME {
-        named(r.name().expect("the writer merges authenticated entries"))
-    } else {
-        r.cell_id().expect("the writer merges authenticated entries")
-    }
-}
-
-fn merge_section<'b, 'c>(
-    base: Option<&'b VerifiedPage<'b>>,
-    changes: &'c Writes<'c>,
+fn merge_section_sources<'p, A: core::alloc::Allocator + Copy>(
+    base: Option<&'p VerifiedPage<'p>>,
+    changes: &'p Writes<'p>,
     section: usize,
-    mut emit: impl FnMut(&[u8]),
+    out: &mut blaze_own::Vec<bep6::EntrySource<'p>, A>,
 ) {
     let mut edits = changes.iter().peekable();
-    for bytes in base.into_iter().flat_map(|p| p.entries(section)) {
-        let key = key_of_entry(bytes, section);
-        while edits.peek().is_some_and(|item| *item.0 < key) {
-            if let Some((_, Some(replacement))) = edits.next() {
-                emit(replacement);
+    if let Some(base_page) = base {
+        for bytes in base_page.entries(section) {
+            let key = base_page.entry_key(section, bytes);
+            while edits.peek().is_some_and(|item| *item.0 < key) {
+                if let Some((_, Some(replacement))) = edits.next() {
+                    out.push(bep6::EntrySource::Flat(replacement));
+                }
             }
-        }
-        if edits.peek().is_some_and(|item| *item.0 == key) {
-            if let Some((_, Some(replacement))) = edits.next() {
-                emit(replacement);
+            if edits.peek().is_some_and(|item| *item.0 == key) {
+                if let Some((_, Some(replacement))) = edits.next() {
+                    out.push(bep6::EntrySource::Flat(replacement));
+                }
+            } else {
+                out.push(bep6::EntrySource::from_page(base_page, bytes));
             }
-        } else {
-            emit(bytes);
         }
     }
     for (_, value) in edits {
         if let Some(replacement) = value {
-            emit(replacement);
+            out.push(bep6::EntrySource::Flat(replacement));
         }
     }
 }
 
-/// Merge the old page's entries with sorted replacements and deletions in each column.
-/// Unchanged sections are copied in one contiguous slice; changed sections are merged directly
-/// into one exact-sized output buffer without intermediate `PageBuf` reallocations.
-fn merge_page<'a>(base: Option<&VerifiedPage<'_>>, change: &ChangedPage<'_>, bits: u8, index: u32, alloc: SharedAlloc<'a>) -> (SVec<'a, u8>, SVec<'a, (Name, Key)>) {
-    let mut counts = [0usize; SECTIONS];
-    let mut body_len = 0usize;
-    for (section, (section_changes, count_slot)) in change.sections.iter().zip(counts.iter_mut()).enumerate() {
-        if section_changes.is_empty() {
-            if let Some(base) = base {
-                *count_slot = base.section_count(section);
-                body_len += base.section_bytes(section).len();
-            }
-        } else {
-            merge_section(base, section_changes, section, |bytes| {
-                *count_slot += 1;
-                body_len += bytes.len();
-            });
-        }
-    }
-    let entries: usize = counts.iter().sum();
-    if entries == 0 {
-        return (SVec::new_in(alloc), SVec::new_in(alloc));
-    }
-    let body_at = starts_end(entries);
-    let total_len = body_at + body_len;
-    let mut page: SVec<'a, u8> = SVec::with_capacity_in(total_len, alloc);
-    page.extend_from_slice(PAGE_MAGIC);
-    page.push(bits);
-    page.extend_from_slice(&index.to_le_bytes());
-    for count in counts {
-        put_u32(&mut page, count);
-    }
-    let mut at = body_at;
+/// Merge the old `BEP6` page's entries with sorted replacements and deletions in each column,
+/// rebuilding canonical per-page sorted dictionaries so the resulting `BEP6` page is bit-for-bit
+/// identical to a cold `encode` (Rule 25).
+fn merge_page<'a, A: core::alloc::Allocator + Copy>(
+    base: Option<&VerifiedPage<'_>>,
+    change: &ChangedPage<'_>,
+    bits: u8,
+    index: u32,
+    alloc: SharedAlloc<'a>,
+    scratch: A,
+) -> (SVec<'a, u8>, SVec<'a, (Name, Key)>) {
+    let mut sections: [blaze_own::Vec<bep6::EntrySource<'_>, A>; SECTIONS] =
+        core::array::from_fn(|_| blaze_own::Vec::new_in(scratch));
     for (section, section_changes) in change.sections.iter().enumerate() {
-        if section_changes.is_empty() {
-            if let Some(base) = base {
-                let count = base.section_count(section);
-                if count > 0 {
-                    let base_start = base.section_start(section);
-                    for j in 0..count {
-                        put_u32(&mut page, at + (base.section_entry_start(section, j) - base_start));
-                    }
-                    at += base.section_bytes(section).len();
-                }
-            }
-        } else {
-            merge_section(base, section_changes, section, |bytes| {
-                put_u32(&mut page, at);
-                at += bytes.len();
-            });
-        }
+        merge_section_sources(base, section_changes, section, &mut sections[section]);
     }
-    put_u32(&mut page, total_len);
-    let mut records: SVec<'a, (Name, Key)> = SVec::with_capacity_in(counts.get(RECORDS).copied().unwrap_or(0), alloc);
-    for (section, section_changes) in change.sections.iter().enumerate() {
-        if section_changes.is_empty() {
-            if let Some(base) = base {
-                page.extend_from_slice(base.section_bytes(section));
-                if section == RECORDS {
-                    records.extend(base.records());
-                }
-            }
-        } else {
-            merge_section(base, section_changes, section, |bytes| {
-                page.extend_from_slice(bytes);
-                if section == RECORDS && let Some(rest) = bytes.get(NAME..) {
-                    records.push((view::name(bytes), Key(view::id(rest))));
-                }
-            });
-        }
-    }
-    debug_assert_eq!(page.len(), total_len, "a merged page's start table ends at its length");
-    (page, records)
+    let slices: [&[bep6::EntrySource<'_>]; SECTIONS] =
+        core::array::from_fn(|s| sections[s].as_slice());
+    bep6::encode_page_from_sources(bits, index, slices, alloc, scratch)
 }
 
 enum PageJobKind<'b, 'c> {
@@ -1241,7 +1211,7 @@ enum PageJobKind<'b, 'c> {
         last_key: Key,
     },
     Repage {
-        buf: &'c PageBuf<'c>,
+        buf: &'c PageBuf<'b, 'c>,
     },
 }
 
@@ -1267,10 +1237,16 @@ pub struct PageBuilt<'a> {
 impl PageJob<'_, '_> {
     /// Merge or finalize this page and compute its content key.
     pub fn run<'a>(&self, alloc: SharedAlloc<'a>) -> PageBuilt<'a> {
+        self.run_in(alloc, alloc)
+    }
+
+    /// [`PageJob::run`] with a separate reusable `scratch` allocator (e.g. a per-worker bump
+    /// `Frame`) for temporary dictionary tables and merge lists.
+    pub fn run_in<'a, A: core::alloc::Allocator + Copy>(&self, alloc: SharedAlloc<'a>, scratch: A) -> PageBuilt<'a> {
         match self.kind {
             PageJobKind::Merge { base, change, last_key } => {
                 let base_len = base.map_or(0, |p| u64::try_from(p.len()).unwrap_or(u64::MAX));
-                let (bytes, records) = merge_page(base, change, self.bits, self.index, alloc);
+                let (bytes, records) = merge_page(base, change, self.bits, self.index, alloc, scratch);
                 let new_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
                 let key = if bytes.is_empty() { Key::default() } else { content_key(&bytes) };
                 let changed = key != Key::default() && key != last_key;
@@ -1281,12 +1257,10 @@ impl PageJob<'_, '_> {
                 };
                 PageBuilt { index: self.index, base_len, new_len, key, bytes, records, changed }
             }
-            PageJobKind::Repage { buf } => match buf.finish(self.bits, self.index, alloc) {
-                Some(bytes) => {
+            PageJobKind::Repage { buf } => match buf.finish_in(self.bits, self.index, alloc, scratch) {
+                Some((bytes, records)) => {
                     let new_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
                     let key = content_key(&bytes);
-                    let rec_bytes = buf.parts.get(RECORDS).map_or(&[][..], |part| part.as_slice());
-                    let records = view::page_records(rec_bytes, alloc);
                     PageBuilt { index: self.index, base_len: 0, new_len, key, bytes, records, changed: true }
                 }
                 None => PageBuilt {
@@ -1355,17 +1329,19 @@ fn file_changes<'a>(root: &mut Root<'a>, last: &Root<'_>, work: &Work<'_>, sourc
         if replacement.is_none() && !last.files.contains_key(&file) { continue; }
         let base = source.page_for(file, Ask::File)?;
         let old_members = base.map_or(&[][..], |page| page.file_members(file));
-        let count = replacement.and_then(|s| s.as_ref()).map_or(old_members.len() / FILE_MEMBER, |names| names.len());
+        let count = replacement
+            .and_then(|s| s.as_ref())
+            .map_or(old_members.len() / bep6::FILE_MEMBER_V6, |names| names.len());
         let mut record = Vec::with_capacity_in(NAME + 4 + count * FILE_MEMBER, delta.alloc);
         put_name(&mut record, file);
         put_u32(&mut record, count);
         let mut all_stand = true;
         let mut member = |name: Name| -> Result<(), PagesError> {
             if !work.rows.contains_key(&name) && last.owed_tasks.get(&name) == work.owed_tasks.get(&name)
-                && let Some(saved) = VerifiedPage::member(old_members, name)
+                && let Some(base_page) = base
+                && let Some(saved) = base_page.member_v6(old_members, name)
             {
-                all_stand &= saved[NAME] == 1;
-                record.extend_from_slice(saved);
+                all_stand &= bep6::write_flat_file_member_from_v6(base_page.dicts(), saved, &mut record);
                 return Ok(());
             }
             let claim = if work.owed_tasks.contains_key(&name) {
@@ -1389,7 +1365,9 @@ fn file_changes<'a>(root: &mut Root<'a>, last: &Root<'_>, work: &Work<'_>, sourc
         if root.files.insert(file, next_digest) != Some(next_digest) {
             changed_shards |= 1u16 << file_shard_of(file);
         }
-        if !last.files.contains_key(&file) || old_members != &record[NAME + 4..] {
+        let unchanged = last.files.contains_key(&file)
+            && base.is_some_and(|p| p.file_members_match_flat(file, record.get(NAME + 4..).unwrap_or(&[])));
+        if !unchanged {
             delta.set(FILES, named(file), Some(record));
         }
     }
@@ -1399,10 +1377,11 @@ fn file_changes<'a>(root: &mut Root<'a>, last: &Root<'_>, work: &Work<'_>, sourc
 fn reader_changes<'a>(work: &Work<'_>, source: &dyn StoredPages, delta: &mut Changed<'a>) -> Result<(), PagesError> {
     for (&id, changes) in work.readers.iter() {
         let old_page = source.page_for(readers_slot(&id), Ask::Readers)?;
-        let old_raw = old_page.and_then(|p| p.readers_raw(&id));
+        let old_present = old_page.is_some_and(|p| p.readers_present(&id));
+        let old_count = old_page.map_or(0, |p| p.readers(&id).len());
         let adds = changes.iter().filter(|&(_, &add)| add).count();
         let mut changes = changes.iter().peekable();
-        let cap = old_raw.map_or(CELL_ID + 4, |raw| raw.len()).saturating_add(NAME * adds);
+        let cap = (CELL_ID + 4).saturating_add(NAME.saturating_mul(old_count.saturating_add(adds)));
         let mut readers = SVec::with_capacity_in(cap, delta.alloc);
         put_cell_id(&mut readers, &id);
         put_u32(&mut readers, 0);
@@ -1418,13 +1397,19 @@ fn reader_changes<'a>(work: &Work<'_>, source: &dyn StoredPages, delta: &mut Cha
         }
         for (&name, &add) in changes { if add { put_name(&mut readers, name); } }
         let count = (readers.len() - CELL_ID - 4) / NAME;
-        let count = u32::try_from(count).expect("a cell's readers fit the section count");
-        readers[CELL_ID..CELL_ID + 4].copy_from_slice(&count.to_le_bytes());
-        // Skip dirtying the page if the merged readers entry is byte-identical to the old one.
-        let unchanged = match (count == 0, old_raw) {
-            (true, None) => true,
-            (false, Some(raw)) => raw == readers.as_slice(),
-            _ => false,
+        let count_u32 = u32::try_from(count).unwrap_or(u32::MAX);
+        if let Some(slot) = readers.get_mut(CELL_ID..CELL_ID + 4) {
+            slot.copy_from_slice(&count_u32.to_le_bytes());
+        }
+        // Skip dirtying the page if the merged readers entry is identical to the old one.
+        let unchanged = if count == 0 {
+            !old_present
+        } else {
+            old_present
+                && old_count == count
+                && old_page.is_some_and(|p| {
+                    p.readers(&id).eq(readers.get(CELL_ID + 4..).unwrap_or(&[]).chunks_exact(NAME).map(view::name))
+                })
         };
         if !unchanged {
             delta.set(READERS, id, (count > 0).then_some(readers));

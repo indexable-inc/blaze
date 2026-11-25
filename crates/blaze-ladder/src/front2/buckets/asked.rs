@@ -64,7 +64,7 @@ pub struct BucketRead {
 pub(super) struct TraitReads {
     /// Question-specific reads (all reads for `admit_asked` and non-`Home::Any` `admit_tables`;
     /// shape-specific reads only when `uses_any_filter` is true).
-    pub(super) own: Vec<BucketRead, Global>,
+    pub(super) own: blaze_own::AVec<'static, BucketRead>,
     /// When true, this question also read the per-body `TablesCache` (`all_unread_reads` and
     /// `trait_any_filter[&trait_]`).
     pub(super) uses_any_filter: bool,
@@ -72,7 +72,7 @@ pub(super) struct TraitReads {
 
 /// What [`Buckets::admit_asked`] keeps: which buckets are filed, and what each question read.
 pub(super) struct Indexed {
-    alloc: blaze_own::Alloc<'static>,
+    pub(super) alloc: blaze_own::Alloc<'static>,
     /// Each (crate, bucket) filed, with its digest.
     filed: HashMap<(usize, BucketKey), u64, blaze_own::Alloc<'static>>,
     /// Each crate whose unfiled list is filed, with the list's digest.
@@ -80,7 +80,7 @@ pub(super) struct Indexed {
     /// The incoherent fact's digest, once `BucketIndex::crate_state` holds it.
     pub(super) incoherent: Option<u64>,
     pub(super) trait_reads: HashMap<(ItemKey, Shape), TraitReads, blaze_own::Alloc<'static>>,
-    pub(super) inherent_reads: HashMap<Shape, Vec<BucketRead, Global>, blaze_own::Alloc<'static>>,
+    pub(super) inherent_reads: HashMap<Shape, blaze_own::AVec<'static, BucketRead>, blaze_own::Alloc<'static>>,
     /// How many impls were filed from a bucket: no impl row decoded, no text opened.
     pub(super) from_index: u32,
     /// How many (crate, bucket) were looked up in a crate's record ([`Buckets::bucket_lookups`]).
@@ -181,7 +181,8 @@ impl BucketIndex {
         // Every field: a new kind of home is a compile error here, not a crate left unasked.
         // `local` judges filed impls, never which crates are asked.
         let Homes { all, bare, blanket, local: _ } = home;
-        let mut reads: Vec<BucketRead, Global> = Vec::new_in(Global);
+        let alloc = self.indexed.alloc;
+        let mut reads: blaze_own::AVec<'static, BucketRead> = blaze_own::AVec::new_in(alloc);
         if [all, bare, blanket].contains(&Home::Incoherent) {
             if let Some(digest) = self.indexed.incoherent {
                 reads.push(BucketRead { krate: 0, bucket: INCOHERENT_FACT, answer: digest });
@@ -204,7 +205,6 @@ impl BucketIndex {
         // The buckets asked of each crate, how an impl found in each is filed, and whether the
         // bucket is the "any" head's (where a self path the writer read to no constructor is:
         // `PathSelf`).
-        let alloc = self.indexed.alloc;
         let mut wanted: blaze_own::Vec<(BucketKey, Under, bool), blaze_own::Alloc<'static>> = blaze_own::Vec::new_in(alloc);
         // The asked trait's crate (`PathSelf::Trait`).
         let mut trait_krate = None;

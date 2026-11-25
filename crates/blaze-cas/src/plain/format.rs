@@ -381,7 +381,7 @@ pub(crate) const SEGMENT_MAGIC: [u8; 4] = *b"BLPS";
 pub(crate) const FOOTER_MAGIC: [u8; 4] = *b"BLPE";
 
 /// The BLAKE3 domain of a segment's digest: its name in a bucket, what a signed statement binds.
-pub(crate) const SEGMENT_DIGEST: &str = "blaze plain store segment 1";
+pub const SEGMENT_DIGEST: &str = "blaze plain store segment 1";
 
 /// What a segment's header and footer say, read and checked ([`check_segment`]), or read by
 /// range and not yet checked ([`describe`]).

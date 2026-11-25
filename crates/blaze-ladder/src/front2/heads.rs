@@ -1031,10 +1031,20 @@ fn discriminants<'a, 'n, S: NamesSource<'n>>(b: &Builder<'_, Maps, S>, tys: &mut
     Ok(out)
 }
 
+/// Copies `src` into an exact-sized `Global` vector (zero allocation when empty).
+fn exact_global<T: Clone>(src: &[T]) -> Vec<T, Global> {
+    if src.is_empty() {
+        return Vec::new_in(Global);
+    }
+    let mut out = Vec::with_capacity_in(src.len(), Global);
+    out.extend_from_slice(src);
+    out
+}
+
 /// `#[rustc_legacy_const_generics(..)]`'s arguments (`args`, the parenthesized list): the
 /// unsuffixed decimal positions, comma separated, appended to `out` in written order (the
 /// checker binds them to the own const parameters in that order). Any other form is refused.
-fn legacy_positions(args: &str, r: Range, out: &mut Vec<u32, Global>) -> Result<(), Why> {
+fn legacy_positions<A: core::alloc::Allocator>(args: &str, r: Range, out: &mut blaze_own::Vec<u32, A>) -> Result<(), Why> {
     let inner = args.trim().strip_prefix('(').and_then(|a| a.strip_suffix(')')).ok_or(Why::Unsupported("a `rustc_legacy_const_generics` attribute without a parenthesized list", r))?;
     for part in inner.split(',').map(str::trim).filter(|p| !p.is_empty()) {
         if !part.bytes().all(|b| b.is_ascii_digit()) {
@@ -2690,6 +2700,10 @@ pub struct Store<'n> {
     pub asked: core::cell::RefCell<blaze_ask::Counts>,
     /// The gate of the body being checked (front2 asks.rs [`Gate`](super::asks::Gate)).
     pub gate: core::cell::RefCell<super::asks::Gate>,
+    /// Stretch-reused [`tc::infer::FactCache`] attached by `StretchStore` (strictly single-threaded
+    /// inside one worker's stretch; moved into `RoundCx` during each round and restored afterward,
+    /// so recursive `check_rounds_as` sees `None` and uses a fresh cache with zero TLS/statics).
+    pub(crate) stretch_facts: Option<tc::infer::FactCache<'static>>,
 }
 
 /// How [`Store::ensure`] meets the needs of a trait's members (front2_tables_cost.rs runs
@@ -3141,6 +3155,7 @@ impl<'n> Store<'n> {
             asks: super::asks::Asks::Again,
             asked: core::cell::RefCell::new(blaze_ask::Counts::default()),
             gate: core::cell::RefCell::new(super::asks::Gate::Off),
+            stretch_facts: None,
         }
     }
 
@@ -3215,7 +3230,9 @@ impl<'n> Store<'n> {
             asks,
             asked,
             gate,
+            stretch_facts,
         } = self;
+        *stretch_facts = None;
         *work = heads_alloc;
         tys.clear();
         maps.clear();
@@ -5461,10 +5478,12 @@ impl<'n> Store<'n> {
                 let value_text = v.text_at(at)?.trim();
                 // Keyed by the ADT, the field's place and the default's text (rule 21: the
                 // text is the value's input; the ADT's generics are its head's).
+                let label = blaze_own::format_in!(alloc, "field default {vi}.{j}: {ty_text} = {value_text}");
                 let dk = keys
-                    .member(ck, MemberKind::Anon, &format!("field default {vi}.{j}: {ty_text} = {value_text}"))
+                    .member(ck, MemberKind::Anon, label.as_str())
                     .map_err(|c| Why::Program(format!("{c}").into_boxed_str(), r))?;
-                let text: &'n str = self.locals.keep_text(&format!("const _: {ty_text} = {value_text};"));
+                let src = blaze_own::format_in!(alloc, "const _: {ty_text} = {value_text};");
+                let text: &'n str = self.locals.keep_text(src.as_str());
                 defaults.push(Some(dk));
                 default_heads.push((dk, text, ty));
             }
@@ -6391,9 +6410,9 @@ impl<'n> Store<'n> {
     #[expect(clippy::too_many_arguments, reason = "the fn's parts and its container's")]
     fn fn_head<S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, lib: LibKey, key: ItemKey, container: Option<ItemKey>, outer: &Env<'_>, parent: u32, inherited: &[PClause], v: &View<'_>, text: &'n str, detail: ItemDetail, marks: Option<TextMarks<'n>>, container_const: bool) -> Result<(), Why> {
         let alloc = self.tys.alloc();
-        let mut ps = Vec::new_in(Global);
+        let mut ps = blaze_own::Vec::with_capacity_in(outer.params.len(), alloc);
         ps.extend_from_slice(outer.params);
-        let mut cs = Vec::new_in(Global);
+        let mut cs = blaze_own::Vec::with_capacity_in(outer.consts.len(), alloc);
         cs.extend_from_slice(outer.consts);
         let declared = {
             let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
@@ -6463,11 +6482,10 @@ impl<'n> Store<'n> {
             let k = super::keys::opaque_key(key, first + j as u32);
             opaques.push((t, intern(&mut self.tys, PNode::Opaque(k, ident))?));
         }
-        let mut bounds = Vec::new_in(Global);
         let Bounds::Done(outer_bounds) = outer.bounds else {
             return Err(Why::Program("a fn's container's bounds were not lowered before the fn".into(), Range::new(0, 0)));
         };
-        bounds.extend_from_slice(outer_bounds);
+        let mut bounds = exact_global(outer_bounds);
         let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
         // The return type's builder: an expanded return type is a text of its own, read at the
         // fn's module; the item's marks are not its tokens'.
@@ -6500,7 +6518,7 @@ impl<'n> Store<'n> {
             SelfTy::Ty(t, _) => Some(t),
             SelfTy::None => None,
         };
-        let mut inputs = Vec::new_in(Global);
+        let mut inputs = blaze_own::Vec::new_in(alloc);
         let mut self_param = false;
         // The signature's written types that name nothing (E0412): each the error type here.
         let mut misses: blaze_own::Vec<TypeMiss, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
@@ -6817,9 +6835,7 @@ impl<'n> Store<'n> {
             self.type_misses.insert(key, kept);
         }
         self.preds.insert(key, preds);
-        let mut self_assoc = Vec::with_capacity_in(env.self_assoc.len(), Global);
-        self_assoc.extend_from_slice(env.self_assoc);
-        let (module, self_) = (env.module, env.self_);
+        let (module, self_, self_assoc_slice) = (outer.module, outer.self_, outer.self_assoc);
         // A free fn's const parameters are filed under its own key. A member's `lib` is its
         // CONTAINER's key (a member has no library key): filing there replaced the trait's or
         // impl's row with the container's plus this member's, so after `Iterator::next_chunk<const
@@ -6833,7 +6849,7 @@ impl<'n> Store<'n> {
         }
         // `#[rustc_legacy_const_generics(1)]` (stdarch's `vget_lane_u64(v, 0)`): the positions
         // of the call arguments that are the fn's own const generic arguments.
-        let mut legacy_const_generics = Vec::new_in(Global);
+        let mut legacy_const_generics = blaze_own::Vec::new_in(alloc);
         let mut qualifiers = FnQualifiers::of_flags(flags).note_lifetimes(text);
         if container_const {
             qualifiers.0 |= FnQualifiers::CONST.0;
@@ -6968,10 +6984,36 @@ impl<'n> Store<'n> {
         }
         file_regions(self, key, filed);
         if Self::view_has_record_type(v) {
-            let rec_env = Env { module, params: &ps, bounds: Bounds::Done(&bounds), self_, self_assoc: &self_assoc, anon: &anon, consts: &cs, body: None };
+            let rec_env = Env { module, params: &ps, bounds: Bounds::Done(&bounds), self_, self_assoc: self_assoc_slice, anon: &anon, consts: &cs, body: None };
             self.register_record_defaults(names, keys, lib, &rec_env, marks, v)?;
         }
-        self.fns.insert(key, FnHead { lib, text, text_prefix, text_inline: false, container, parent, own, declared, self_param, header, c_variadic, qualifiers, legacy_const_generics, inputs, output, has_body, module, params: ps, consts: cs, bounds, self_, self_assoc });
+        self.fns.insert(
+            key,
+            FnHead {
+                lib,
+                text,
+                text_prefix,
+                text_inline: false,
+                container,
+                parent,
+                own,
+                declared,
+                self_param,
+                header,
+                c_variadic,
+                qualifiers,
+                legacy_const_generics: exact_global(&legacy_const_generics),
+                inputs: exact_global(&inputs),
+                output,
+                has_body,
+                module,
+                params: exact_global(&ps),
+                consts: exact_global(&cs),
+                bounds,
+                self_,
+                self_assoc: exact_global(self_assoc_slice),
+            },
+        );
         Ok(())
     }
 }

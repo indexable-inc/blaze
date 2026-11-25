@@ -175,6 +175,8 @@ pub struct StretchStoreOpts {
 struct StretchStoreInner<'n> {
     store: super::super::heads::Store<'n>,
     keys: Keys,
+    facts: blaze_typeck::infer::FactCache<'static>,
+    facts_crate: Option<usize>,
     heads_alloc: Alloc<'static>,
 }
 
@@ -272,7 +274,8 @@ impl<'n> StretchStore<'n> {
         let mut store = super::super::heads::Store::new(sized, body_frame, heads_alloc);
         store.pointers = pointers;
         let keys = Keys::new_in(heads_alloc);
-        StretchStoreInner { store, keys, heads_alloc }
+        let facts = blaze_typeck::infer::FactCache::new_in(heads_alloc);
+        StretchStoreInner { store, keys, facts, facts_crate: None, heads_alloc }
     }
 
     #[inline(never)]
@@ -385,14 +388,8 @@ impl ReadSink for ObservedReads<'_, '_, '_, '_, '_> {
             ReadSink::binding(self.recorder, module, ns, name);
             return;
         };
-        if let Some(read) = self.recorder.first_binding(module, ns, name) {
-            match keyer.key(self.tables, read) {
-                Ok(cell) => self.recorder.keep(read, cell),
-                Err(error) => {
-                    self.recorder.keep(read, None);
-                    self.error.borrow_mut().get_or_insert(error);
-                }
-            }
+        if let Err(error) = self.recorder.binding_mapped(module, ns, name, |read| keyer.key(self.tables, read)) {
+            self.error.borrow_mut().get_or_insert(error);
         }
     }
 }
@@ -1068,19 +1065,36 @@ unsafe fn body_world_alloc<'w>(work: Alloc<'w>) -> Alloc<'static> {
 /// `record_body_as` returns and BEFORE `BODY_SCRATCH` resets. Only [`Self::finish`] (invoked on
 /// clean `Ok` completion) calls `StretchStore::put_back`; `Drop` always drops `Store` + `Keys`
 /// and resets `heads_frame`.
+struct ReuseHold<'n, 's> {
+    ss: &'s mut StretchStore<'n>,
+    heads_alloc: Alloc<'static>,
+    snapshot: super::super::heads::ReuseSnapshot,
+    facts_crate: Option<usize>,
+}
+
 struct BodyWorldGuard<'v, 'n, 'w, 's> {
     world: Option<blaze_own::Box<ProjectWorld<'n, Tables<'v, 'n>>, Alloc<'w>>>,
-    reuse: Option<(&'s mut StretchStore<'n>, Alloc<'static>, super::super::heads::ReuseSnapshot)>,
+    reuse: Option<ReuseHold<'n, 's>>,
 }
 
 impl<'v, 'n, 'w, 's> BodyWorldGuard<'v, 'n, 'w, 's> {
     #[inline(never)]
     fn finish(mut self) {
         let Some(world) = self.world.take() else { return };
-        if let Some((ss, heads_alloc, snapshot)) = self.reuse.take() {
+        if let Some(hold) = self.reuse.take() {
             let (mut store, mut keys) = blaze_own::Box::into_inner(world).into_store_and_keys();
-            let status = store.end_body_reuse(snapshot, &mut keys);
-            ss.put_back(StretchStoreInner { store, keys, heads_alloc }, status);
+            let facts = store.stretch_facts.take().unwrap_or_else(|| blaze_typeck::infer::FactCache::new_in(hold.heads_alloc));
+            let status = store.end_body_reuse(hold.snapshot, &mut keys);
+            hold.ss.put_back(
+                StretchStoreInner {
+                    store,
+                    keys,
+                    facts,
+                    facts_crate: hold.facts_crate,
+                    heads_alloc: hold.heads_alloc,
+                },
+                status,
+            );
         }
     }
 }
@@ -1088,10 +1102,11 @@ impl<'v, 'n, 'w, 's> BodyWorldGuard<'v, 'n, 'w, 's> {
 #[inline(never)]
 fn detach_and_reset_reuse<'v, 'n, 'w>(
     world: blaze_own::Box<ProjectWorld<'n, Tables<'v, 'n>>, Alloc<'w>>,
-    ss: &mut StretchStore<'n>,
-    snapshot: super::super::heads::ReuseSnapshot,
+    hold: ReuseHold<'n, '_>,
 ) {
+    let ReuseHold { ss, heads_alloc: _, snapshot, facts_crate: _ } = hold;
     let (mut store, mut keys) = blaze_own::Box::into_inner(world).into_store_and_keys();
+    let _ = store.stretch_facts.take();
     let _ = store.end_body_reuse(snapshot, &mut keys);
     drop(store);
     drop(keys);
@@ -1101,9 +1116,9 @@ fn detach_and_reset_reuse<'v, 'n, 'w>(
 impl Drop for BodyWorldGuard<'_, '_, '_, '_> {
     fn drop(&mut self) {
         if let Some(world) = self.world.take()
-            && let Some((ss, _heads_alloc, snapshot)) = self.reuse.take()
+            && let Some(hold) = self.reuse.take()
         {
-            detach_and_reset_reuse(world, ss, snapshot);
+            detach_and_reset_reuse(world, hold);
         }
     }
 }
@@ -1116,13 +1131,16 @@ impl Drop for BodyWorldGuard<'_, '_, '_, '_> {
 /// would ride under it; made here, only the box's pointer does.
 ///
 /// When `stretch_store` is `Some` and `frame.heads` is `Some` (seeded body), reuses the stretch's
-/// persistent `Store` + `Keys` in `HEADS_STRETCH_FRAME` while binding all per-body scratch tables
-/// to `world_alloc` (`BODY_SCRATCH`); otherwise allocates everything in `world_alloc`.
+/// persistent `Store` + `Keys` + `FactCache` in `HEADS_STRETCH_FRAME` while binding all per-body
+/// scratch tables to `world_alloc` (`BODY_SCRATCH`); otherwise allocates everything in
+/// `world_alloc`.
 #[inline(never)]
+#[allow(clippy::too_many_arguments)]
 fn body_world<'v, 'n, 'w, 's>(
     view: Tables<'v, 'n>,
     sink: &dyn ReadSink,
     name: Name,
+    own: ItemKey,
     frame: &BodyFrame<'n>,
     asks: super::super::asks::AsksMet,
     alloc: Alloc<'w>,
@@ -1156,11 +1174,23 @@ fn body_world<'v, 'n, 'w, 's>(
             // Always resolve receiver pointers when `front` is `None` so read lists match a fresh
             // world even without a precomputed `StretchFront` (rule 21).
             let resolved_pointers = pointers.unwrap_or_else(|| super::super::receiver::Pointers::find(&index, crate::resolve::Paths { names: view }));
-            let StretchStoreInner { mut store, mut keys, heads_alloc } = ss.take_or_init(index.lang("sized"), resolved_pointers, frame.frame);
+            let StretchStoreInner { mut store, mut keys, mut facts, mut facts_crate, heads_alloc } =
+                ss.take_or_init(index.lang("sized"), resolved_pointers, frame.frame);
+            // Impl visibility (`Seen::of_checked_body`) is a function of the body's crate:
+            // never share cached `ImplsOf` answers across bodies from different crates.
+            let body_crate = view.crate_of(own);
+            if facts_crate != body_crate {
+                facts = blaze_typeck::infer::FactCache::new_in(heads_alloc);
+                facts_crate = body_crate;
+            }
+            store.stretch_facts = Some(facts);
             let snapshot = store.begin_body_reuse(world_alloc, &mut keys);
             let front = Front2 { names: view, resolver: crate::resolve::Paths { names: view }, texts: Texts::empty(), keys, index, frame: frame.frame };
             let world = blaze_own::Box::new_in(ProjectWorld::over_with_store(front, store, frame.prepared, world_alloc), alloc);
-            BodyWorldGuard { world: Some(world), reuse: Some((ss, heads_alloc, snapshot)) }
+            BodyWorldGuard {
+                world: Some(world),
+                reuse: Some(ReuseHold { ss, heads_alloc, snapshot, facts_crate }),
+            }
         }
         _ => {
             let front = Front2 { names: view, resolver: crate::resolve::Paths { names: view }, texts: Texts::empty(), keys: Keys::new_in(world_alloc), index, frame: frame.frame };
@@ -1216,7 +1246,7 @@ fn record_body_as<'n, 'w>(
     };
     // In its own frame and behind a box: this frame rides under the whole check (the guard:
     // tests/front2_alias_opaques.rs `a_seeded_body_checks_on_a_small_stack`).
-    let mut guard = body_world(view, &observed, name, frame, asks, alloc, stretch_store)?;
+    let mut guard = body_world(view, &observed, name, own, frame, asks, alloc, stretch_store)?;
     drop(setup);
     let root = Listed { body, at: None, entry: None };
     let mut goal_hits = AVec::new_in(alloc);
@@ -4681,6 +4711,230 @@ pub fn gamma_err() -> u16 {
             assert_eq!(capped.used(), 0, "heads_frame must be reset after cap rollover on {label}");
         }
         assert_eq!(capped.rollovers(), 3, "each body past 1-byte cap must trigger rollover");
+    }
+
+    /// Determinism oracle for stretch-reused [`blaze_typeck::infer::FactCache`] inside
+    /// [`StretchStore`] (rule 25, rule 78): exercises supertraits, associated types, concrete and
+    /// blanket impls, ADTs, fn sigs, lang items, body-local (`INNER`) structs/impls, opaque return
+    /// types, and diagnostics under BOTH `impls: None` AND a real `TableSet` (`impls: Some(...)`),
+    /// proving 100% identical outputs, findings, locals, typed records, and sorted read lists in
+    /// forward and reversed execution orders (also exercising `SharedBindingKeys`).
+    #[test]
+    fn stretch_store_fact_cache_reuse_determinism_oracle() {
+        use blaze_drive::key::Key;
+        use blaze_engine::{Phase, Planned, Stage};
+        use super::super::head_tests::cells;
+        use super::super::recorder::SharedBindingKeys;
+
+        let src = "\
+#![no_std]
+pub trait Base {
+    fn base_val(&self) -> u8;
+}
+pub trait Sub: Base {
+    type Out;
+    fn sub_val(&self) -> Self::Out;
+}
+pub struct Wrap<T> {
+    pub inner: T,
+}
+pub enum Choice {
+    Left(u8),
+    Right(u8),
+}
+impl Base for u8 {
+    fn base_val(&self) -> u8 {
+        *self
+    }
+}
+impl<T: Base> Base for Wrap<T> {
+    fn base_val(&self) -> u8 {
+        self.inner.base_val()
+    }
+}
+impl<T: Base> Sub for Wrap<T> {
+    type Out = u8;
+    fn sub_val(&self) -> u8 {
+        self.base_val()
+    }
+}
+pub fn via_sub<T: Sub>(x: &T) -> T::Out {
+    x.sub_val()
+}
+pub fn mk_opaque(v: u8) -> impl Base {
+    Wrap { inner: v }
+}
+pub fn body_wrap() -> u8 {
+    let w = Wrap { inner: 7u8 };
+    via_sub(&w)
+}
+pub fn body_enum(c: Choice) -> u8 {
+    let v = match c {
+        Choice::Left(a) => a,
+        Choice::Right(b) => b,
+    };
+    let w = Wrap { inner: v };
+    via_sub(&w)
+}
+pub fn body_with_inner() -> u8 {
+    struct Local(u8);
+    impl Base for Local {
+        fn base_val(&self) -> u8 {
+            self.0
+        }
+    }
+    let w = Wrap { inner: Local(9u8) };
+    via_sub(&w)
+}
+pub fn body_opaque() -> u8 {
+    let o = mk_opaque(4u8);
+    o.base_val()
+}
+pub fn body_diag() -> u16 {
+    let w = Wrap { inner: 1u8 };
+    via_sub(&w)
+}";
+        let (records, _, body_frame) = world_of(src);
+        let unused = Recorder::new(RecorderOpts { alloc: a() });
+        let base_tables = Tables::new(TablesOpts { records, impls: None, lang_crates: &[CORE_AT], reads: &unused });
+        let base_frame = BodyFrame { frame: body_frame, alloc: a(), plant_drop: None, cost: None, needs: NeedsMet::First, heads: None, sources: None, goals: None, prepared: None, front: None };
+        let seed: &'static _ = body_frame.alloc(super::super::seeds::Freezing::new(records, oracle_heads(base_tables, &base_frame)));
+        let mut table_set = crate::front2::buckets::TableSet::new(a());
+        for krate in 0..records.crate_count() {
+            let mut rows = blaze_own::Vec::new_in(a());
+            if NamesSource::each_impl_row(records, krate, &mut |r| rows.push(r)) {
+                let written = crate::front2::buckets::write_impl_tables(records, krate, &rows, a()).expect("fixture impl tables");
+                table_set.put(written);
+            }
+        }
+        let table_set: &'static crate::front2::buckets::TableSet<'static> = body_frame.alloc(table_set);
+        let heads = cells(records);
+        let names = ["via_sub", "mk_opaque", "body_wrap", "body_enum", "body_with_inner", "body_opaque", "body_diag"];
+        let mut tasks: blaze_own::Vec<(&str, Task), Alloc<'static>> = blaze_own::Vec::new_in(a());
+        for label in names {
+            let Some(key) = heads.iter().map(|want| want.key()).find(|&key| records.name_of(key) == Some(label)) else {
+                panic!("missing fixture function {label}");
+            };
+            tasks.push((
+                label,
+                Task { planned: Planned { name: Name::new(Kind::BodyCheck, key.0), phase: Phase::new(Stage::Bodies, 0), source: ABSENT, file: Name::new(Kind::FileItems, ABSENT) }, key: Key(ABSENT) },
+            ));
+        }
+
+        #[allow(clippy::type_complexity)]
+        fn run_one<'n>(
+            records: &'n super::super::super::source::Records<'n>,
+            impls: Option<&'n crate::front2::buckets::TableSet<'n>>,
+            unused: &Recorder<'_>,
+            frame: &BodyFrame<'n>,
+            task: &Task,
+            scratch: &mut blaze_mem::Frame,
+            reuse: Option<&mut StretchStore<'n>>,
+            shared_bindings: Option<&SharedBindingKeys>,
+        ) -> (ContentId, bool, u32, blaze_own::Vec<TableRead, Alloc<'static>>, blaze_own::Vec<ItemKey, Alloc<'static>>, Option<blaze_own::Vec<u8, Alloc<'static>>>) {
+            let tables = Tables::new(TablesOpts { records, impls, lang_crates: &[CORE_AT], reads: unused });
+            scratch.reset();
+            let erased = blaze_own::Erased::new(&*scratch);
+            let w = erased.handle();
+            let mut rec = match shared_bindings {
+                Some(shared) => Recorder::with_shared_bindings(RecorderOpts { alloc: w }, shared),
+                None => Recorder::new(RecorderOpts { alloc: w }),
+            };
+            let mut enc = AString::new_in(w);
+            let got = match check_body_item(tables, task, frame, w, &mut rec, None, &mut enc, reuse) {
+                Ok(got) => got,
+                Err(error) => panic!("fixture body check failed: {error}"),
+            };
+            let mut reads: blaze_own::Vec<TableRead, Alloc<'static>> = blaze_own::Vec::with_capacity_in(got.reads.len(), a());
+            reads.extend_from_slice(got.reads.as_slice());
+            reads.sort_unstable();
+            let mut locals: blaze_own::Vec<ItemKey, Alloc<'static>> = blaze_own::Vec::with_capacity_in(got.locals.len(), a());
+            locals.extend_from_slice(got.locals.as_slice());
+            let typed = got.typed.as_ref().map(|b| {
+                let mut v = blaze_own::Vec::with_capacity_in(b.len(), a());
+                v.extend_from_slice(b.as_slice());
+                v
+            });
+            (got.out, got.failed, got.findings, reads, locals, typed)
+        }
+
+        let frame = BodyFrame { frame: body_frame, alloc: a(), plant_drop: None, cost: None, needs: NeedsMet::First, heads: Some(seed), sources: None, goals: None, prepared: None, front: None };
+        let Ok(mut scratch) = blaze_mem::Frame::with_reserve(32 << 20, blaze_mem::Tag::Diagnostics) else {
+            panic!("test scratch frame reservation failed");
+        };
+
+        fn assert_reads_sound_and_equal(
+            got: &[TableRead],
+            expected: &[TableRead],
+            context: &str,
+        ) {
+            // Every read recorded under reuse must also be in the fresh oracle (no cross-body
+            // read leakage).
+            for r in got {
+                assert!(
+                    expected.binary_search(r).is_ok(),
+                    "{context}: unexpected extra read under StretchStore+FactCache reuse: {r:?}"
+                );
+            }
+            // Every read in the fresh oracle must be present under reuse, except a cold-miss
+            // `Names(Item { key })` probe whose strictly stronger `Head { item: key, .. }` read
+            // is already present (StretchStore holds the already-imported head so `detail(lib)`
+            // does not need to probe `Names` before `want`).
+            for r in expected {
+                if got.binary_search(r).is_ok() {
+                    continue;
+                }
+                let covered_by_head = match r {
+                    TableRead::Names(blaze_scope::names_cells::NameCell::Item { key })
+                    | TableRead::Names(blaze_scope::names_cells::NameCell::Members { owner: key })
+                    | TableRead::Text { key } => {
+                        let bytes = crate::front2::keys::checker_of(*key).0.to_be_bytes();
+                        got.iter().any(|g| matches!(g, TableRead::Head { item, .. } if *item == bytes))
+                    }
+                    _ => false,
+                };
+                assert!(
+                    covered_by_head,
+                    "{context}: missing read under StretchStore+FactCache reuse (not covered by Head): {r:?}"
+                );
+            }
+        }
+
+        for (mode, impls) in [("unindexed", None), ("table_set", Some(table_set))] {
+            let mut fresh = blaze_own::Vec::new_in(a());
+            for &(label, ref task) in tasks.iter() {
+                fresh.push((label, run_one(records, impls, &unused, &frame, task, &mut scratch, None, None)));
+            }
+            let shared_fwd_bindings = SharedBindingKeys::new(a());
+            let Ok(mut fwd_store) = StretchStore::new(StretchStoreOpts { reserve: 64 << 20, cap: 16 << 20, keep: 1 << 20, alloc: a() }) else {
+                panic!("forward StretchStore reservation failed");
+            };
+            for ((label, task), (_, expected)) in tasks.iter().zip(fresh.iter()) {
+                let got = run_one(records, impls, &unused, &frame, task, &mut scratch, Some(&mut fwd_store), Some(&shared_fwd_bindings));
+                assert_eq!(got.0, expected.0, "{mode} forward out mismatch on {label}");
+                assert_eq!(got.1, expected.1, "{mode} forward failed mismatch on {label}");
+                assert_eq!(got.2, expected.2, "{mode} forward findings mismatch on {label}");
+                assert_reads_sound_and_equal(&got.3, &expected.3, label);
+                assert_eq!(got.4, expected.4, "{mode} forward locals mismatch on {label}");
+                assert_eq!(got.5, expected.5, "{mode} forward typed mismatch on {label}");
+            }
+            assert_eq!(fwd_store.rollovers(), 0, "{mode} forward reuse must not rollover");
+
+            let shared_rev_bindings = SharedBindingKeys::new(a());
+            let Ok(mut rev_store) = StretchStore::new(StretchStoreOpts { reserve: 64 << 20, cap: 16 << 20, keep: 1 << 20, alloc: a() }) else {
+                panic!("reverse StretchStore reservation failed");
+            };
+            for ((label, task), (_, expected)) in tasks.iter().rev().zip(fresh.iter().rev()) {
+                let got = run_one(records, impls, &unused, &frame, task, &mut scratch, Some(&mut rev_store), Some(&shared_rev_bindings));
+                assert_eq!(got.0, expected.0, "{mode} reversed out mismatch on {label}");
+                assert_eq!(got.1, expected.1, "{mode} reversed failed mismatch on {label}");
+                assert_eq!(got.2, expected.2, "{mode} reversed findings mismatch on {label}");
+                assert_reads_sound_and_equal(&got.3, &expected.3, label);
+                assert_eq!(got.4, expected.4, "{mode} reversed locals mismatch on {label}");
+                assert_eq!(got.5, expected.5, "{mode} reversed typed mismatch on {label}");
+            }
+            assert_eq!(rev_store.rollovers(), 0, "{mode} reversed reuse must not rollover");
+        }
     }
 }
 
