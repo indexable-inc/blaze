@@ -4372,9 +4372,12 @@ enum KeepAs {
 /// What [`ExpandNote`]s and part marks name a proc-macro harness's expansion by.
 const HARNESS_NAME: &str = "proc-macro harness";
 
-/// The most bodies deep (with expansions) a block's module is made: a body in a block of a
-/// body in a block, each level one more (rule 18).
-const MAX_BLOCK_DEPTH: u16 = 64;
+/// The most bodies deep (past macro expansions up to [`crate::RECURSION_LIMIT`]) a block's module
+/// is made: `body.depth` accumulates both macro-expansion depth (e.g. `pin_project!` peeling 90+
+/// doc-comment attributes on `tokio::time::Sleep` before emitting `const _: () = { impl Sleep .. }`)
+/// and block-in-block nesting, so a block written at expansion depth `< RECURSION_LIMIT` must still
+/// be allowed to make its block module (rule 18).
+const MAX_BLOCK_DEPTH: u16 = crate::RECURSION_LIMIT + 64;
 
 /// Makes the modules of the blocks of `bodies` that hold an `impl` ([`crate::blocks`]): each
 /// body's text is scanned once by syntax; one that writes an impl in a block gets a fragment
