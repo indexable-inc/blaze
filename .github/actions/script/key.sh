@@ -89,7 +89,7 @@ digest=$({
   printf 'host %s %s\n' "$(uname -s)" "$(uname -m)"
   printf 'checkout %s\n' "$(pwd -P)"
   printf 'direct %s\n' "$direct"
-  find scripts crates/blaze-script crates/blaze-pins pins .github/actions/script -type f ! -path '*/target/*' | sort | while read -r f; do
+  find scripts crates/blaze-script crates/blaze-pins crates/blaze-fetch crates/blaze-git-fetch pins .github/actions/script -type f ! -path '*/target/*' | sort | while read -r f; do
     printf 'file %s %s\n' "$f" "$(sha < "$f" | cut -d' ' -f1)"
   done
   printf '%s\n' "$closure" "$manifest"
