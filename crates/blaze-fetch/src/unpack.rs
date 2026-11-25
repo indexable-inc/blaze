@@ -142,7 +142,11 @@ impl UnpackError {
             UnpackError::GitPack(e) => is_pack_alloc(&e.why),
             UnpackError::GitStore(StoreWhy::Entry(why)) => is_pack_alloc(why),
             UnpackError::GitStore(StoreWhy::Loose(e)) => matches!(e.why, blaze_deflate::Why::Alloc(_)),
-            UnpackError::GitTree(e) => matches!(e.why, TreeWhy::Alloc(_)),
+            UnpackError::GitTree(e) => match &e.why {
+                TreeWhy::Alloc(_) => true,
+                TreeWhy::Read(why) => is_pack_alloc(why),
+                _ => false,
+            },
             UnpackError::AfterGzip { .. }
             | UnpackError::Outside { .. }
             | UnpackError::HardLink { .. }
