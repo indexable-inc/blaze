@@ -208,7 +208,13 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
 
     /// Whether the checker promoted borrow or autoref `e` (`Checked::promoted`, sorted).
     pub(crate) fn is_promoted(&self, e: ExprId) -> bool {
-        self.ck.promoted.binary_search_by_key(&e.0, |x| x.0).is_ok()
+        !self.facts.constant_initializer() && self.ck.promoted.binary_search_by_key(&e.0, |x| x.0).is_ok()
+    }
+
+    /// Whether `e` is a promoted borrow inside a `const`/`static` initializer whose temporary
+    /// gets `'static` lifetime (stays alive until root return interns it into `Origin::Data`).
+    fn is_const_promoted(&self, e: ExprId) -> bool {
+        self.facts.constant_initializer() && self.ck.promoted.binary_search_by_key(&e.0, |x| x.0).is_ok()
     }
 
     fn val_inner(&mut self, e: ExprId) -> Result<Val, LowerError> {
@@ -1468,6 +1474,15 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
     /// (`Checked::promoted`) is the promoted constant, and its operand's code does not run here.
     fn ref_into(&mut self, dest: Place, e: ExprId, mutbl: Mutbl, operand: ExprId) -> Result<(), LowerError> {
         let span = self.span(e);
+        if mutbl == Mutbl::Not && self.is_const_promoted(e) {
+            let oty = self.adjusted_ty(operand)?;
+            let l = self.b.new_local(LocalDecl { ty: oty, kind: LocalKind::Temp(operand, Role::Value), mutbl: Mutbl::Mut });
+            let p = self.b.local_place(l);
+            self.lower_into(p, operand)?;
+            let o = self.b.origin(false);
+            self.b.borrow(dest, BorrowKind::Shared, p, o, span);
+            return Ok(());
+        }
         if mutbl == Mutbl::Not && self.is_promoted(e) {
             let ty = self.expr_ty(e)?;
             let c = self.b.new_const(ConstDecl { kind: ConstKind::Promoted(e.0), ty });

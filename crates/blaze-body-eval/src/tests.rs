@@ -1959,3 +1959,55 @@ bb6:
         .with(ROOT, &body);
     assert_eq!(u32_value(&tw), 76);
 }
+
+#[test]
+fn intern_live_root_local_and_refuse_dangling_local() {
+    let (mut tw, t) = world();
+    let ref_u32 = tw.w.ty("&u32").0;
+
+    // Live unscoped root local (e.g., promoted borrow `&42` in a constant initializer) interns as
+    // a second allocation pointed to by `_0`.
+    let live_body = format!(
+        "\
+local _0: t{r} return mut
+local _1: t{u} temp e0 value
+origin 'o0
+const c0 = scalar 0x2a: t{u}
+bb0:
+  _1 = const c0
+  _0 = borrow shared _1 L0 'o0
+  return
+",
+        r = ref_u32,
+        u = t.u32,
+    );
+    let tw_live = tw.with(ROOT, &live_body);
+    let rec = run(&tw_live, Limits::DEFAULT).expect("expected Done for live root local borrow");
+    assert_eq!(rec.allocs.len(), 2);
+    assert_eq!(rec.allocs[0].relocs.len(), 1);
+    assert_eq!(rec.allocs[0].relocs[0].target, DataTarget::Local(1));
+    assert_eq!(rec.allocs[1].bytes.as_slice(), &42u32.to_le_bytes());
+
+    // Scoped local whose storage ends before `return` must be refused as `Dangling`.
+    let (mut tw2, t2) = world();
+    let ref_u32_2 = tw2.w.ty("&u32").0;
+    let dead_body = format!(
+        "\
+local _0: t{r} return mut
+local _1: t{u} temp e0 value
+origin 'o0
+const c0 = scalar 0x2a: t{u}
+bb0:
+  live _1
+  _1 = const c0
+  _0 = borrow shared _1 L0 'o0
+  dead _1
+  return
+",
+        r = ref_u32_2,
+        u = t2.u32,
+    );
+    tw2 = tw2.with(ROOT, &dead_body);
+    let e = refused(&tw2, Limits::DEFAULT);
+    assert!(matches!(e.fault, Fault::Refused(Refusal::Dangling)), "{e:?}");
+}
