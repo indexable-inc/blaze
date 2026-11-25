@@ -67,14 +67,10 @@ pub(crate) fn referenced_coroutines<'a>(
 enum Walk {
     /// Syntactic-only scan of type constructors and generic arguments (never calls `facts.adt`
     /// or `facts.closure`, guaranteeing termination on recursive pointer ADTs and avoiding huge
-    /// transitive `Arc<...>` graph walks).
+    /// transitive `Arc<...>` / `Box<...>` / `Vec<...>` / `&Provider` graph walks).
     Syntactic = 0,
-    /// Reached across one `Ref`/`Ptr`/`Slice` hop: expands by-value fields of the pointee ADT
-    /// (so `&mut Holder` finds a non-generic TAIT coroutine field), while any further pointer hop
-    /// degrades to `Syntactic`.
-    Pointee = 1,
     /// By-value traversal from the root types.
-    Inline = 2,
+    Inline = 1,
 }
 
 fn is_lazy_need(err: &BuildError) -> bool {
@@ -85,6 +81,50 @@ fn is_lazy_need(err: &BuildError) -> bool {
             | BuildError::OpaqueOwnerUnchecked { .. }
             | BuildError::Select(_)
     )
+}
+
+/// Fast local check on an ADT's type table: returns `true` only if `ty` (within `types`,
+/// without touching `facts` or the trait solver) directly mentions an `Opaque`, `Coroutine`,
+/// or `Future` node. Used so `Walk::Syntactic` behind `&T`/`*mut T` still catches non-generic
+/// TAIT coroutine fields without expanding arbitrary `Provider`/`ArcInner`/`BTreeNode` structs.
+fn adt_field_mentions_opaque_or_coro(types: blaze_typeck::PTys<'_>, ty: PTy) -> bool {
+    let mut stack = [PTy(0); 32];
+    let mut len = 1usize;
+    stack[0] = ty;
+    while len > 0 {
+        len -= 1;
+        let cur = stack[len];
+        let Ok(node) = types.node(cur) else { continue };
+        match node {
+            PNode::Opaque(..) | PNode::Coroutine { .. } | PNode::Future(..) => return true,
+            PNode::Tuple(l)
+            | PNode::Record(_, l)
+            | PNode::Union(l)
+            | PNode::Adt(_, l)
+            | PNode::Closure { args: l, .. }
+            | PNode::FnDef(_, l)
+            | PNode::FnPtr(l, _)
+            | PNode::Dynamic(l)
+            | PNode::ExTrait(_, l) => {
+                if let Ok(elems) = types.list(l) {
+                    for &e in elems {
+                        if len < stack.len() {
+                            stack[len] = e;
+                            len += 1;
+                        }
+                    }
+                }
+            }
+            PNode::Array(inner, _) | PNode::Pat(inner, _) | PNode::Ref(_, inner) | PNode::Ptr(_, inner) | PNode::Slice(inner) => {
+                if len < stack.len() {
+                    stack[len] = inner;
+                    len += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 fn collect_coroutines<'a>(
@@ -128,8 +168,29 @@ fn collect_coroutines<'a>(
             | PNode::ConstValue { .. } => {}
             PNode::Ref(_, inner) | PNode::Ptr(_, inner) | PNode::Slice(inner) => {
                 if through_ptrs {
-                    let next = if mode == Walk::Inline { Walk::Pointee } else { Walk::Syntactic };
-                    todo.push((inner, next));
+                    todo.push((inner, Walk::Syntactic));
+                    // For a direct pointer/reference to a non-generic ADT holding a TAIT
+                    // (`Opaque`) coroutine field (e.g. `Pin<&mut ConcreteHolder>`), ground ONLY
+                    // fields whose own ADT definition mentions `Opaque`/`Coroutine`/`Future`.
+                    // Ordinary data structs (`Provider`, `ArcInner`, `BTreeNode`, `Timeout<F>`)
+                    // never pay any `blaze_build::ground` or trait-solver cost here.
+                    if mode == Walk::Inline
+                        && let Ok(PNode::Adt(key, l)) = ground.view().node(inner)
+                        && let Some(adt) = facts.adt(key)
+                    {
+                        args.clear();
+                        args.extend_from_slice(ground.view().list(l).map_err(past)?);
+                        for field in adt.fields {
+                            if !adt_field_mentions_opaque_or_coro(adt.types, field.ty) {
+                                continue;
+                            }
+                            match blaze_build::ground(adt.types, field.ty, &args, ground, alloc, facts) {
+                                Ok(g) => todo.push((g, Walk::Syntactic)),
+                                Err(e) if !is_lazy_need(&e) => {}
+                                Err(e) => return Err(e),
+                            }
+                        }
+                    }
                 }
             }
             PNode::FnDef(_, l) | PNode::FnPtr(l, _) | PNode::Dynamic(l) | PNode::ExTrait(_, l) => {
@@ -173,11 +234,32 @@ fn collect_coroutines<'a>(
                 // `Adt::fields` holds every variant's fields: an enum holds each by value in
                 // its variant, a union each in its one place.
                 for field in adt.fields {
-                    match blaze_build::ground(adt.types, field.ty, &args, ground, alloc, facts) {
-                        Ok(g) => todo.push((g, mode)),
-                        Err(e) if mode == Walk::Pointee && !is_lazy_need(&e) => {}
-                        Err(e) => return Err(e),
+                    // Fast-path primitive fields, direct generic parameters, and pointers when
+                    // `!through_ptrs` without allocating or invoking `blaze_build::ground`.
+                    match adt.types.node(field.ty) {
+                        Ok(
+                            PNode::Bool
+                            | PNode::Char
+                            | PNode::Int(_)
+                            | PNode::Uint(_)
+                            | PNode::Float(_)
+                            | PNode::Str
+                            | PNode::Never
+                            | PNode::ExAuto(_)
+                            | PNode::Foreign(_)
+                            | PNode::ConstValue { .. },
+                        ) => continue,
+                        Ok(PNode::Ref(..) | PNode::Ptr(..) | PNode::Slice(_)) if !through_ptrs => continue,
+                        Ok(PNode::Param(idx)) => {
+                            if let Some(&arg) = args.get(idx as usize) {
+                                todo.push((arg, mode));
+                                continue;
+                            }
+                        }
+                        _ => {}
                     }
+                    let g = blaze_build::ground(adt.types, field.ty, &args, ground, alloc, facts)?;
+                    todo.push((g, mode));
                 }
             }
             PNode::Closure { owner, ordinal, args: l } => {
@@ -192,18 +274,12 @@ fn collect_coroutines<'a>(
                     continue;
                 }
                 let Some(closure) = facts.closure(owner, ordinal) else {
-                    if mode == Walk::Pointee {
-                        continue;
-                    }
                     return Err(BuildError::UnsupportedSig {
                         what: "a closure whose facts the world did not answer (`LayoutFacts::closure`), met while listing the coroutines a value holds",
                     });
                 };
-                match blaze_build::ground(closure.types, closure.env, &args, ground, alloc, facts) {
-                    Ok(env) => todo.push((env, mode)),
-                    Err(e) if mode == Walk::Pointee && !is_lazy_need(&e) => {}
-                    Err(e) => return Err(e),
-                }
+                let env = blaze_build::ground(closure.types, closure.env, &args, ground, alloc, facts)?;
+                todo.push((env, mode));
             }
             PNode::Coroutine { args: l, .. } => {
                 let of = coroutine_of(ground.view(), t).ok_or(BuildError::Malformed {
