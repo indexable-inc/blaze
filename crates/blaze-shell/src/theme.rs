@@ -1,8 +1,9 @@
-//! Minimal dark design tokens for `blaze-shell`.
+//! Design tokens matching `ix.dev/blaze` (`site/styles/tokens.css`).
 //!
-//! Neutral pitch-dark carbon surfaces (`#09090b`), hairline translucent dividers,
-//! high-contrast monochrome typography, and restrained desaturated accents only
-//! where semantic distinction earns them.
+//! Warm neutral charcoal grayscale ladder (`--g-0`..`--g-13`), monochrome-first
+//! typography (`--ink-1`..`--ink-4`), and colour reserved strictly for meaning:
+//! `--fire` (`#e0461a`), `--ok` (`#4cc27a`), `--danger` (`#ff7168`), and the
+//! validated chart/icon series (`--series-1..3`).
 
 use blaze_sh::Value;
 use blaze_sh::lex::HighlightKind;
@@ -19,88 +20,108 @@ pub const fn rgb(r: u8, g: u8, b: u8) -> [f32; 4] {
     rgba(r, g, b, 1.0)
 }
 
-/// Pitch-dark neutral obsidian canvas `#09090b`.
-pub const BG_CANVAS: [f32; 4] = rgb(0x09, 0x09, 0x0b);
-pub const BG_CANVAS_RGB: [f32; 3] = [0x09 as f32 / 255.0, 0x09 as f32 / 255.0, 0x0b as f32 / 255.0];
+// =============================================================================
+// Exact `ix.dev/blaze` grayscale ladder (`site/styles/tokens.css`)
+// =============================================================================
 
-/// Seamless top bar (matches canvas).
-pub const BG_TOPBAR: [f32; 4] = rgb(0x09, 0x09, 0x0b);
-/// Barely-lifted composer / input dock `#0d0d10`.
-pub const BG_COMPOSER: [f32; 4] = rgb(0x0d, 0x0d, 0x10);
-/// Subtle embedded well (terminal output / code preview) `#0d0d10`.
-pub const BG_WELL: [f32; 4] = rgb(0x0d, 0x0d, 0x10);
-/// Floating popup surface `#121216`.
-pub const BG_POPUP: [f32; 4] = rgb(0x12, 0x12, 0x16);
-/// Subtle selection / hover row tint.
-pub const BG_SELECTED: [f32; 4] = rgba(0xff, 0xff, 0xff, 0.07);
-/// Whisper-quiet chip background (nested expandable pills only).
-pub const BG_CHIP: [f32; 4] = rgba(0xff, 0xff, 0xff, 0.045);
+/// `--bg` (`--g-1`): `#101011`
+pub const BG_CANVAS: [f32; 4] = rgb(0x10, 0x10, 0x11);
+pub const BG_CANVAS_RGB: [f32; 3] = [0x10 as f32 / 255.0, 0x10 as f32 / 255.0, 0x11 as f32 / 255.0];
 
-/// Ultra-subtle translucent hairline dividers.
-pub const HAIRLINE: [f32; 4] = rgba(0xff, 0xff, 0xff, 0.065);
-pub const HAIRLINE_FAINT: [f32; 4] = rgba(0xff, 0xff, 0xff, 0.042);
-pub const HAIRLINE_STRONG: [f32; 4] = rgba(0xff, 0xff, 0xff, 0.12);
+/// Seamless top bar (`--bg`).
+pub const BG_TOPBAR: [f32; 4] = rgb(0x10, 0x10, 0x11);
+/// `--bg-2` (`--g-2`): `#141415` — recessed command box & terminal well (like `$ curl ... | sh`).
+pub const BG_SURFACE: [f32; 4] = rgb(0x14, 0x14, 0x15);
+/// `--bg-3` (`--g-3`): `#19191a` — inline file/folder/code chips (like `target/`, `build.rs`).
+pub const BG_CHIP: [f32; 4] = rgb(0x19, 0x19, 0x1a);
+/// `--bg-4` (`--g-4`): `#1f1f20` — subtle button & progress track fill.
+pub const BG_TRACK: [f32; 4] = rgb(0x1f, 0x1f, 0x20);
+/// Floating popup surface `#161617`.
+pub const BG_POPUP: [f32; 4] = rgb(0x16, 0x16, 0x17);
+/// Selection / hover highlight (`--s-tint`).
+pub const BG_SELECTED: [f32; 4] = rgba(0xeb, 0xea, 0xe6, 0.06);
+pub const BG_SELECTION: [f32; 4] = rgba(0xeb, 0xea, 0xe6, 0.14);
+
+/// `--line` (`--g-5`): `#28282a`
+pub const LINE: [f32; 4] = rgb(0x28, 0x28, 0x2a);
+/// Subtle separator between blocks (`#1c1c1e`).
+pub const LINE_FAINT: [f32; 4] = rgb(0x1c, 0x1c, 0x1e);
+/// `--line-2` (`--g-6`): `#333335`
+pub const LINE_STRONG: [f32; 4] = rgb(0x33, 0x33, 0x35);
 
 /// Soft drop shadow for floating popups only.
 pub const SHADOW_SOFT: [f32; 4] = rgba(0x00, 0x00, 0x00, 0.55);
 
-/// Crisp off-white primary text `#f2f2f5`.
-pub const FG_BRIGHT: [f32; 4] = rgb(0xf2, 0xf2, 0xf5);
-/// Calm readable body text `#d4d4dc`.
-pub const FG_PRIMARY: [f32; 4] = rgb(0xd4, 0xd4, 0xdc);
-/// Secondary text (headers, keys, paths, flags) `#7c7c88`.
-pub const FG_MUTED: [f32; 4] = rgb(0x7c, 0x7c, 0x88);
-/// Whisper-dim metadata (indices, durations, separators) `#4b4b55`.
-pub const FG_DIM: [f32; 4] = rgb(0x4b, 0x4b, 0x55);
+// =============================================================================
+// Exact `ix.dev/blaze` warm-stone ink ladder
+// =============================================================================
 
-/// Restrained desaturated accents.
-pub const ACCENT_WHITE: [f32; 4] = rgb(0xf4, 0xf4, 0xf7);
-pub const ACCENT_ICE: [f32; 4] = rgb(0x9b, 0xba, 0xd8);
-pub const ACCENT_SAGE: [f32; 4] = rgb(0x7d, 0xbe, 0x94);
-pub const ACCENT_SAND: [f32; 4] = rgb(0xd4, 0xb7, 0x8c);
-pub const ACCENT_SEAFOAM: [f32; 4] = rgb(0x88, 0xb8, 0xae);
-pub const ACCENT_COPPER: [f32; 4] = rgb(0xcf, 0x97, 0x72);
-pub const ACCENT_CORAL: [f32; 4] = rgb(0xdf, 0x6c, 0x75);
-pub const ACCENT_CORAL_FAINT: [f32; 4] = rgba(0xdf, 0x6c, 0x75, 0.06);
+/// `--ink-1` (`--g-13`): `#ebeae6` — warm paper-white primary ink.
+pub const INK_1: [f32; 4] = rgb(0xeb, 0xea, 0xe6);
+/// `--ink-2` (`--g-11`): `#b3b2af` — secondary body & values.
+pub const INK_2: [f32; 4] = rgb(0xb3, 0xb2, 0xaf);
+/// `--ink-3`: `#878684` — headers, flags, timestamps, keys.
+pub const INK_3: [f32; 4] = rgb(0x87, 0x86, 0x84);
+/// `--ink-4` (`--g-8`): `#57575a` — `$`, `#`, dim metadata.
+pub const INK_4: [f32; 4] = rgb(0x57, 0x57, 0x5a);
 
-/// Selection highlight inside the input editor.
-pub const BG_SELECTION: [f32; 4] = rgba(0xff, 0xff, 0xff, 0.14);
+// =============================================================================
+// Semantic colours only (`site/styles/tokens.css`)
+// =============================================================================
 
-/// Map a lexer [`HighlightKind`] to a restrained, cohesive syntax palette.
+/// `--fire`: `#e0461a` — the brand's fire: the one accent for what matters now.
+pub const FIRE: [f32; 4] = rgb(0xe0, 0x46, 0x1a);
+pub const FIRE_FAINT: [f32; 4] = rgba(0xe0, 0x46, 0x1a, 0.14);
+/// `--ok`: `#4cc27a`
+pub const OK: [f32; 4] = rgb(0x4c, 0xc2, 0x7a);
+/// `--danger`: `#ff7168`
+pub const DANGER: [f32; 4] = rgb(0xff, 0x71, 0x68);
+pub const DANGER_FAINT: [f32; 4] = rgba(0xff, 0x71, 0x68, 0.06);
+
+/// `--series-1`: `#d95926` (Rust / crate icon)
+pub const SERIES_ORANGE: [f32; 4] = rgb(0xd9, 0x59, 0x26);
+/// `--series-2`: `#3987e5` (Folder / symlink icon, matching `target/`)
+pub const SERIES_BLUE: [f32; 4] = rgb(0x39, 0x87, 0xe5);
+/// `--series-3`: `#199e70` (Config / duration accent)
+pub const SERIES_AQUA: [f32; 4] = rgb(0x19, 0x9e, 0x70);
+
+/// Monochrome-first syntax highlighting matching `ix.dev/blaze`'s `$ curl -fsSL ... | sh`:
+/// commands and args in warm paper-white (`INK_1`), flags/pipes/operators in quiet stone,
+/// colour reserved for errors and Rust cells.
 pub fn highlight_color(kind: HighlightKind) -> [f32; 4] {
     match kind {
-        HighlightKind::Command => FG_BRIGHT,
-        HighlightKind::Keyword => rgb(0xa8, 0xa8, 0xb8),
-        HighlightKind::Flag => rgb(0x8c, 0x90, 0x9e),
-        HighlightKind::String => ACCENT_SAGE,
-        HighlightKind::Number => ACCENT_SAND,
-        HighlightKind::Unit => rgb(0xb8, 0x9e, 0x78),
-        HighlightKind::Var => ACCENT_ICE,
-        HighlightKind::Operator => FG_MUTED,
-        HighlightKind::Pipe => rgb(0x64, 0x64, 0x72),
-        HighlightKind::Punct => FG_DIM,
-        HighlightKind::Comment => FG_DIM,
-        HighlightKind::RustCode => ACCENT_COPPER,
-        HighlightKind::Error => ACCENT_CORAL,
+        HighlightKind::Command => INK_1,
+        HighlightKind::Keyword => INK_2,
+        HighlightKind::Flag => INK_3,
+        HighlightKind::String => rgb(0xd4, 0xd3, 0xcf),
+        HighlightKind::Number => INK_1,
+        HighlightKind::Unit => INK_3,
+        HighlightKind::Var => INK_2,
+        HighlightKind::Operator => INK_3,
+        HighlightKind::Pipe => INK_4,
+        HighlightKind::Punct => INK_4,
+        HighlightKind::Comment => INK_4,
+        HighlightKind::RustCode => INK_1,
+        HighlightKind::Error => DANGER,
     }
 }
 
-/// Restrained semantic foreground color for a structured [`Value`].
+/// Restrained `ix.dev/blaze` semantic color for structured [`Value`] cells.
 pub fn value_color(val: &Value<'_>) -> [f32; 4] {
     match val {
-        Value::Nothing => FG_DIM,
-        Value::Bool(true) => ACCENT_SAGE,
-        Value::Bool(false) => ACCENT_CORAL,
-        Value::Int(_) | Value::Float(_) => ACCENT_SAND,
-        Value::String(_) => FG_BRIGHT,
-        Value::Size(_) => ACCENT_ICE,
-        Value::Duration(_) => ACCENT_SEAFOAM,
-        Value::Date(_) => FG_MUTED,
-        Value::Range(_) => ACCENT_SAND,
-        Value::Binary(_) => FG_MUTED,
-        Value::List(_) | Value::Record(_) | Value::Table(_) => ACCENT_ICE,
-        Value::Closure(_) | Value::CellPath(_) => FG_MUTED,
-        Value::Error(_) => ACCENT_CORAL,
+        Value::Nothing => INK_4,
+        Value::Bool(true) => OK,
+        Value::Bool(false) => INK_3,
+        Value::Int(_) | Value::Float(_) => INK_1,
+        Value::String(_) => INK_1,
+        Value::Size(_) => INK_2,
+        Value::Duration(_) => INK_2,
+        Value::Date(_) => INK_3,
+        Value::Range(_) => INK_2,
+        Value::Binary(_) => INK_3,
+        Value::List(_) | Value::Record(_) | Value::Table(_) => INK_2,
+        Value::Closure(_) | Value::CellPath(_) => INK_3,
+        Value::Error(_) => DANGER,
     }
 }
 

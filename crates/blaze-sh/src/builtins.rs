@@ -1641,6 +1641,12 @@ fn builtin_ls<'a>(
     } else {
         Table::from_col_names(&["name", "type", "size", "modified"], alloc)
     };
+    table.set_col_display("name", crate::value::ColDisplay::FileEntry);
+    table.set_col_display("size", crate::value::ColDisplay::FileSize);
+    table.set_col_display("modified", crate::value::ColDisplay::HumanTime);
+    if long {
+        table.set_col_display("readonly", crate::value::ColDisplay::Status);
+    }
     for e in entries.iter() {
         eval.charge(1, span)?;
         if long {
@@ -2001,6 +2007,10 @@ fn builtin_ps<'a>(eval: &mut Evaluator<'a, '_>, span: Span) -> Result<Value<'a>,
         )));
     };
     let mut table = Table::from_col_names(&["pid", "ppid", "name", "status", "cpu", "mem"], alloc);
+    table.set_col_display("name", crate::value::ColDisplay::Process);
+    table.set_col_display("status", crate::value::ColDisplay::Status);
+    table.set_col_display("cpu", crate::value::ColDisplay::Percent);
+    table.set_col_display("mem", crate::value::ColDisplay::FileSize);
     for p in procs.iter() {
         eval.charge(1, span)?;
         let row = [
@@ -2132,7 +2142,7 @@ fn builtin_where<'a>(
 
     match input {
         Value::Table(t) => {
-            let mut out = Table::new(t.columns.share(), alloc);
+            let mut out = t.empty_like();
             for r in 0..t.nrows() {
                 eval.charge(1, span)?;
                 let rec = t.row_record(r).unwrap();
@@ -2187,7 +2197,7 @@ fn builtin_select<'a>(
     if all_ints {
         return match input {
             Value::Table(t) => {
-                let mut out = Table::new(t.columns.share(), alloc);
+                let mut out = t.empty_like();
                 for (v, s) in args.pos.iter() {
                     let idx = require_int(v, "index", *s, alloc).map_err(Control::Error)?;
                     if idx < 0 || (idx as usize) >= t.nrows() {
@@ -2313,7 +2323,7 @@ fn builtin_reject<'a>(
         }
         return match input {
             Value::Table(t) => {
-                let mut out = Table::new(t.columns.share(), alloc);
+                let mut out = t.empty_like();
                 for r in 0..t.nrows() {
                     eval.charge(1, span)?;
                     if !drops.iter().any(|&d| d >= 0 && d as usize == r) {
@@ -2545,7 +2555,7 @@ fn builtin_sort_by<'a>(
                 ia.cmp(ib)
             });
 
-            let mut out = Table::new(t.columns.share(), alloc);
+            let mut out = t.empty_like();
             for (r, _) in keys.iter() {
                 eval.charge(1, span)?;
                 out.push_record(&t.row_record(*r).unwrap());
@@ -2612,7 +2622,7 @@ fn builtin_reverse<'a>(
     let alloc = eval.alloc();
     match input {
         Value::Table(t) => {
-            let mut out = Table::new(t.columns.share(), alloc);
+            let mut out = t.empty_like();
             for r in (0..t.nrows()).rev() {
                 eval.charge(1, span)?;
                 out.push_record(&t.row_record(r).unwrap());
@@ -2752,7 +2762,7 @@ fn take_n<'a>(
     match input {
         Value::Table(t) => {
             let count = n.min(t.nrows());
-            let mut out = Table::new(t.columns.share(), alloc);
+            let mut out = t.empty_like();
             for r in 0..count {
                 eval.charge(1, span)?;
                 out.push_record(&t.row_record(r).unwrap());
@@ -2800,7 +2810,7 @@ fn builtin_last<'a>(
         return match input {
             Value::Table(t) => {
                 let start = t.nrows().saturating_sub(n);
-                let mut out = Table::new(t.columns.share(), alloc);
+                let mut out = t.empty_like();
                 for r in start..t.nrows() {
                     eval.charge(1, span)?;
                     out.push_record(&t.row_record(r).unwrap());
@@ -2865,7 +2875,7 @@ fn builtin_skip<'a>(
     let n = require_int(v, "count", *s, alloc).map_err(Control::Error)?.max(0) as usize;
     match input {
         Value::Table(t) => {
-            let mut out = Table::new(t.columns.share(), alloc);
+            let mut out = t.empty_like();
             for r in n.min(t.nrows())..t.nrows() {
                 eval.charge(1, span)?;
                 out.push_record(&t.row_record(r).unwrap());
@@ -2973,7 +2983,7 @@ fn builtin_uniq<'a>(
                 }
                 Ok(Value::Table(table))
             } else {
-                let mut out = Table::new(t.columns.share(), alloc);
+                let mut out = t.empty_like();
                 for (sr, _) in seen.iter() {
                     out.push_record(sr);
                 }
@@ -3077,7 +3087,7 @@ fn builtin_compact<'a>(
                 };
                 col_idxs.push(ci);
             }
-            let mut out = Table::new(t.columns.share(), alloc);
+            let mut out = t.empty_like();
             for r in 0..t.nrows() {
                 eval.charge(1, span)?;
                 let keep = if col_idxs.is_empty() {
@@ -3587,7 +3597,7 @@ fn builtin_filter<'a>(
     let closure = require_closure(cval, "filter", *cspan, alloc).map_err(Control::Error)?;
     match input {
         Value::Table(t) => {
-            let mut out = Table::new(t.columns.share(), alloc);
+            let mut out = t.empty_like();
             for r in 0..t.nrows() {
                 eval.charge(1, span)?;
                 let rec = t.row_record(r).unwrap();

@@ -6,6 +6,7 @@
 pub mod blocks;
 pub mod editor;
 pub mod host;
+pub mod icons;
 pub mod layout;
 pub mod prompt;
 pub mod rust_cell;
@@ -122,6 +123,7 @@ mod tests {
             metrics: CellMetrics::default(),
             scroll_y: 0.0,
             cursor_visible: true,
+            now_ns: 1_732_500_000_000_000_000,
         });
 
         // Fold toggle hit region must be present, and every block must have a ForkBlock hit target.
@@ -169,6 +171,7 @@ mod tests {
             metrics: CellMetrics::default(),
             scroll_y: 0.0,
             cursor_visible: true,
+            now_ns: 1_732_500_000_000_000_000,
         });
         assert!(
             scene_unfolded.total_content_height > h_folded,
@@ -187,6 +190,7 @@ mod tests {
             metrics: CellMetrics::default(),
             scroll_y: 0.0,
             cursor_visible: true,
+            now_ns: 1_732_500_000_000_000_000,
         });
         assert!(scene_expanded.total_content_height > h_before_expand);
         assert!(scene_expanded.text_runs.iter().any(|t| t.text == "meta"));

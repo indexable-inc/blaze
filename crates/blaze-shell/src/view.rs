@@ -272,6 +272,41 @@ impl Scene {
         });
     }
 
+    pub fn over_circle(
+        &mut self,
+        cx: f32,
+        cy: f32,
+        radius: f32,
+        fill: [f32; 4],
+        clip_id: u32,
+    ) {
+        self.over_rects.push(RectInst {
+            rect: [cx - radius, cy - radius, cx + radius, cy + radius],
+            color: fill,
+            border_color: [0.0; 4],
+            params: [radius, 0.0, 0.0, prim_kind::CIRCLE],
+            clip_info: [clip_id, 0, 0, 0],
+        });
+    }
+
+    pub fn over_ring(
+        &mut self,
+        cx: f32,
+        cy: f32,
+        radius: f32,
+        ring_width: f32,
+        color: [f32; 4],
+        clip_id: u32,
+    ) {
+        self.over_rects.push(RectInst {
+            rect: [cx - radius, cy - radius, cx + radius, cy + radius],
+            color,
+            border_color: [0.0; 4],
+            params: [radius, ring_width, 0.0, prim_kind::CIRCLE],
+            clip_info: [clip_id, 0, 0, 0],
+        });
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn text(
         &mut self,
@@ -348,11 +383,26 @@ impl Default for Scene {
 
 /// Compact cell representation of a `Value` for table cells and badges.
 pub fn format_value_cell(val: &Value<'_>) -> String {
+    format_value_cell_at(val, None)
+}
+
+/// Compact cell representation, formatting [`Value::Date`] as human relative time
+/// (`3m ago`, `2h ago`, `Nov 24`) when `now_ns` is supplied.
+pub fn format_value_cell_at(val: &Value<'_>, now_ns: Option<i64>) -> String {
     match val {
         Value::List(l) => format!("[list {}]", l.len()),
         Value::Record(r) => format!("{{record {}}}", r.len()),
         Value::Table(t) => format!("[table {}x{}]", t.nrows(), t.ncols()),
         Value::Nothing => "—".to_owned(),
+        Value::Date(dt) => {
+            let mut out = String::new();
+            if let Some(now) = now_ns {
+                let _ = blaze_sh::format_relative_time(*dt, now, &mut out);
+            } else {
+                let _ = val.format_cell(&mut out);
+            }
+            out
+        }
         _ => {
             let mut out = String::new();
             let _ = val.format_cell(&mut out);

@@ -193,6 +193,31 @@ impl PartialEq for Record<'_> {
     }
 }
 
+/// Semantic display type for a dataframe [`Table`] column so renderers draw
+/// rich custom representations (file/folder icons, proportional size bars, human
+/// relative timestamps, process status dots, crate badges) without losing raw values.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum ColDisplay {
+    #[default]
+    Auto,
+    /// File or directory entry (renders with file-type / folder icon).
+    FileEntry,
+    /// Byte size with proportional bar.
+    FileSize,
+    /// Duration column.
+    Duration,
+    /// Timestamp rendered as human relative time (`3m ago`, `2h ago`, `Nov 24`).
+    HumanTime,
+    /// Live status / boolean indicator dot.
+    Status,
+    /// OS process name.
+    Process,
+    /// Percentage with proportional bar.
+    Percent,
+    /// Rust crate / package name.
+    Crate,
+}
+
 /// Columnar persistent table: a list of records sharing column headers, stored column-wise
 /// so `select`, `reject`, `sort-by`, `where`, and rendering touch only needed columns and
 /// O(1) cloning shares every column vector.
@@ -200,6 +225,7 @@ impl PartialEq for Record<'_> {
 pub struct Table<'a> {
     pub columns: PVec<'a, ARc<'a, str>>,
     pub cols: PVec<'a, PVec<'a, Value<'a>>>,
+    pub col_display: PVec<'a, ColDisplay>,
     pub nrows: usize,
 }
 
@@ -208,10 +234,39 @@ impl<'a> Share for Table<'a> {}
 impl<'a> Table<'a> {
     pub fn new(columns: PVec<'a, ARc<'a, str>>, alloc: Alloc<'a>) -> Table<'a> {
         let mut cols = PVec::new(alloc);
+        let mut col_display = PVec::new(alloc);
         for _ in 0..columns.len() {
             cols.push(PVec::new(alloc));
+            col_display.push(ColDisplay::Auto);
         }
-        Table { columns, cols, nrows: 0 }
+        Table { columns, cols, col_display, nrows: 0 }
+    }
+
+    /// Create an empty table with identical columns and [`ColDisplay`] metadata.
+    pub fn empty_like(&self) -> Table<'a> {
+        let alloc = self.alloc();
+        let mut cols = PVec::new(alloc);
+        for _ in 0..self.columns.len() {
+            cols.push(PVec::new(alloc));
+        }
+        Table {
+            columns: self.columns.share(),
+            cols,
+            col_display: self.col_display.share(),
+            nrows: 0,
+        }
+    }
+
+    /// Tag column `name` with a custom [`ColDisplay`] type.
+    pub fn set_col_display(&mut self, name: &str, display: ColDisplay) {
+        if let Some(ci) = self.col_index(name) {
+            self.col_display.set(ci, display);
+        }
+    }
+
+    #[inline]
+    pub fn col_display(&self, col: usize) -> ColDisplay {
+        self.col_display.get(col).copied().unwrap_or(ColDisplay::Auto)
     }
 
     pub fn from_col_names(names: &[&str], alloc: Alloc<'a>) -> Table<'a> {
@@ -284,6 +339,7 @@ impl<'a> Table<'a> {
                 }
                 self.columns.push(Rc::from_str_in(k, alloc));
                 self.cols.push(new_col);
+                self.col_display.push(ColDisplay::Auto);
             }
         }
         let ncols = self.columns.len();
@@ -316,6 +372,7 @@ impl<'a> Table<'a> {
         let alloc = self.alloc();
         let mut columns = PVec::new(alloc);
         let mut cols = PVec::new(alloc);
+        let mut col_display = PVec::new(alloc);
         for &n in names {
             let Some(ci) = self.col_index(n) else {
                 let mut msg = AString::from_str_in("table has no column `", alloc);
@@ -325,8 +382,9 @@ impl<'a> Table<'a> {
             };
             columns.push(self.columns.get(ci).unwrap().share());
             cols.push(self.cols.get(ci).unwrap().share());
+            col_display.push(self.col_display(ci));
         }
-        Ok(Table { columns, cols, nrows: self.nrows })
+        Ok(Table { columns, cols, col_display, nrows: self.nrows })
     }
 
     /// Drop named columns in O(ncols), sharing every surviving column's persistent vector.
@@ -334,14 +392,16 @@ impl<'a> Table<'a> {
         let alloc = self.alloc();
         let mut columns = PVec::new(alloc);
         let mut cols = PVec::new(alloc);
+        let mut col_display = PVec::new(alloc);
         for c in 0..self.columns.len() {
             let cname = self.columns.get(c).unwrap();
             if !names.iter().any(|&drop| drop == cname.as_ref()) {
                 columns.push(cname.share());
                 cols.push(self.cols.get(c).unwrap().share());
+                col_display.push(self.col_display(c));
             }
         }
-        Table { columns, cols, nrows: self.nrows }
+        Table { columns, cols, col_display, nrows: self.nrows }
     }
 
     /// Build a table from a list of records if all elements are records (or empty).
@@ -866,6 +926,53 @@ pub fn format_date(dt: DateTime, out: &mut impl fmt::Write) -> fmt::Result {
         let sign = if dt.offset_secs < 0 { '-' } else { '+' };
         let abs = dt.offset_secs.unsigned_abs();
         write!(out, "{sign}{:02}:{:02}", abs / 3600, (abs % 3600) / 60)
+    }
+}
+
+/// Format a [`DateTime`] as concise human relative time against `now_ns` (UTC nanoseconds,
+/// passed in explicitly — never reads an ambient clock).
+pub fn format_relative_time(dt: DateTime, now_ns: i64, out: &mut impl fmt::Write) -> fmt::Result {
+    let diff_secs = (now_ns.saturating_sub(dt.utc_ns)) / 1_000_000_000;
+    if diff_secs < 0 {
+        let ahead = diff_secs.unsigned_abs();
+        return if ahead < 60 {
+            write!(out, "in {ahead}s")
+        } else if ahead < 3_600 {
+            write!(out, "in {}m", ahead / 60)
+        } else if ahead < 86_400 {
+            write!(out, "in {}h", ahead / 3_600)
+        } else {
+            write!(out, "in {}d", ahead / 86_400)
+        };
+    }
+    let s = diff_secs as u64;
+    if s < 10 {
+        out.write_str("just now")
+    } else if s < 60 {
+        write!(out, "{s}s ago")
+    } else if s < 3_600 {
+        write!(out, "{}m ago", s / 60)
+    } else if s < 86_400 {
+        write!(out, "{}h ago", s / 3_600)
+    } else if s < 172_800 {
+        out.write_str("yesterday")
+    } else if s < 14 * 86_400 {
+        write!(out, "{}d ago", s / 86_400)
+    } else {
+        let local_secs = dt.utc_ns.div_euclid(1_000_000_000) + i64::from(dt.offset_secs);
+        let days = local_secs.div_euclid(86_400);
+        let (year, month, day) = civil_from_days(days);
+        let now_local = now_ns.div_euclid(1_000_000_000) + i64::from(dt.offset_secs);
+        let (now_year, _, _) = civil_from_days(now_local.div_euclid(86_400));
+        const MONTHS: [&str; 12] = [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ];
+        let mon = MONTHS[(month.saturating_sub(1) as usize).min(11)];
+        if year == now_year {
+            write!(out, "{mon} {day}")
+        } else {
+            write!(out, "{mon} {day}, {year}")
+        }
     }
 }
 

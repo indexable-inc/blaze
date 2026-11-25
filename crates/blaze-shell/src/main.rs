@@ -325,9 +325,9 @@ mod macos_app {
         }
 
         fn populate_demo(&mut self, cols: u16, rows: u16, cell_px: (u32, u32), scroll_bottom: bool) {
-            self.submit_command("ls | sort-by size -r | take 6", cols, rows, cell_px);
+            self.submit_command("ls | take 7", cols, rows, cell_px);
+            self.submit_command("ls crates/blaze-sh/src | sort-by size -r | take 5", cols, rows, cell_px);
             self.submit_command("sys", cols, rows, cell_px);
-            self.submit_command("let x = 21", cols, rows, cell_px);
 
             // Demonstrate O(1) CoW session fork in the top branch bar.
             let _ = self.store.fork_active_branch(Some("experiment"));
@@ -351,6 +351,13 @@ mod macos_app {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    fn now_ns() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos().min(i64::MAX as u128) as i64)
             .unwrap_or(0)
     }
 
@@ -406,9 +413,9 @@ mod macos_app {
         window.setTitle(&NSString::from_str("blaze-shell"));
         window.setTitlebarAppearsTransparent(true);
         let bg_color = objc2_app_kit::NSColor::colorWithSRGBRed_green_blue_alpha(
-            0x09 as f64 / 255.0,
-            0x09 as f64 / 255.0,
-            0x0b as f64 / 255.0,
+            0x10 as f64 / 255.0,
+            0x10 as f64 / 255.0,
+            0x11 as f64 / 255.0,
             1.0,
         );
         window.setBackgroundColor(Some(&bg_color));
@@ -451,6 +458,7 @@ mod macos_app {
         // Offscreen deterministic screenshot mode: render 2 frames (warming glyph atlas) and exit.
         if let Some(shot_path) = cli.screenshot {
             let metrics = fonts.cell_metrics(scale);
+            let frame_now = now_ns();
             let mut scene = build_scene(&LayoutInput {
                 store: &shell.store,
                 editor: &shell.editor,
@@ -460,6 +468,7 @@ mod macos_app {
                 metrics,
                 scroll_y: shell.scroll_y,
                 cursor_visible: true,
+                now_ns: frame_now,
             });
             let max_s = (scene.total_content_height - scene.scroll_viewport_height).max(0.0);
             if shell.auto_scroll_bottom && max_s > 0.0 {
@@ -473,6 +482,7 @@ mod macos_app {
                     metrics,
                     scroll_y: shell.scroll_y,
                     cursor_visible: true,
+                    now_ns: frame_now,
                 });
             }
             let glyphs = fonts.rasterize_runs(&scene.text_runs, scale);
@@ -934,6 +944,7 @@ mod macos_app {
                         cursor_vis,
                     )
                 } else {
+                    let frame_now = now_ns();
                     let first = build_scene(&LayoutInput {
                         store: &shell.store,
                         editor: &shell.editor,
@@ -943,6 +954,7 @@ mod macos_app {
                         metrics,
                         scroll_y: shell.scroll_y,
                         cursor_visible: cursor_vis,
+                        now_ns: frame_now,
                     });
                     let max_s = (first.total_content_height - first.scroll_viewport_height).max(0.0);
                     let target_scroll = if shell.auto_scroll_bottom {
@@ -962,6 +974,7 @@ mod macos_app {
                             metrics,
                             scroll_y: shell.scroll_y,
                             cursor_visible: cursor_vis,
+                            now_ns: frame_now,
                         })
                     } else {
                         first

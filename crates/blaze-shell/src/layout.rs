@@ -1,11 +1,12 @@
-//! GPU-independent minimal layout engine turning `(BlockStore, Editor, PromptInfo, viewport)`
-//! into a layered [`Scene`] of hairlines, subtle surfaces, clips, text runs, and clickable
-//! [`HitRegion`]s. Borderless editorial typography over a pitch-dark canvas — zero noisy
-//! nested boxes or pill clutter.
+//! GPU-independent minimal layout engine following the `ix.dev/blaze` aesthetic:
+//! warm charcoal surfaces (`#101011`), monochrome-first typography (`#ebeae6`..`#57575a`),
+//! `--fire` (`#e0461a`) as the one brand accent, crisp GPU SDF icons next to every semantic
+//! entity, custom typed dataframe column renderers (file/folder icons, proportional size bars,
+//! human relative times, status dots), and an inline `$ ...` recessed composer.
 
 use blaze_own::Alloc;
 use blaze_sh::lex::{HighlightSpan, highlight};
-use blaze_sh::{Record, ShellError, Table, Value, line_col};
+use blaze_sh::{Bytes, ColDisplay, Record, ShellError, Table, Value, line_col};
 use blaze_vt::color::Colors;
 use blaze_vt::page::Wide;
 use blaze_vt::style::{Color as VtColor, Rgb as VtRgb, Underline as VtUnderline};
@@ -13,20 +14,22 @@ use blaze_vt::terminal::{Mode as VtMode, Terminal};
 
 use crate::blocks::{Block, BlockBody, BlockStore, TABLE_FOLD_ROWS};
 use crate::editor::{CompletionKind, Editor};
+use crate::icons::{Icon, draw_icon, icon_for_file, icon_for_record_key};
 use crate::prompt::PromptInfo;
 use crate::theme;
 use crate::view::{
-    CellMetrics, HitAction, HitRect, Scene, format_duration_ms, format_value_cell,
+    CellMetrics, HitAction, HitRect, Scene, format_duration_ms, format_value_cell_at,
     is_expandable_cell, truncate_chars, wrap_lines,
 };
 
-const TOP_BAR_H: f32 = 34.0;
+const TOP_BAR_H: f32 = 36.0;
 const OUTER_PAD_X: f32 = 28.0;
 const BLOCK_PAD_Y: f32 = 16.0;
-const TABLE_ROW_PAD_Y: f32 = 4.0;
+const TABLE_ROW_PAD_Y: f32 = 4.5;
 const MAX_POPUP_ROWS: usize = 8;
+const SIZE_BAR_W: f32 = 42.0;
 
-/// All inputs required to lay out one frame of `blaze-shell`.
+/// All inputs required to lay out one frame of `blaze-shell` (deterministic: `now_ns` injected).
 pub struct LayoutInput<'a> {
     pub store: &'a BlockStore,
     pub editor: &'a Editor,
@@ -36,10 +39,11 @@ pub struct LayoutInput<'a> {
     pub metrics: CellMetrics,
     pub scroll_y: f32,
     pub cursor_visible: bool,
+    /// Current UTC timestamp in nanoseconds for human relative time formatting (`3m ago`).
+    pub now_ns: i64,
 }
 
-/// Lay out the full minimal shell interface: hairline branch strip, open borderless block
-/// stream separated by hairlines, sleek docked bottom composer, and floating overlays.
+/// Lay out the full `ix.dev/blaze`-styled shell interface.
 pub fn build_scene(input: &LayoutInput<'_>) -> Scene {
     let mut scene = Scene::new();
     let vw = input.viewport_w.max(320.0);
@@ -53,8 +57,9 @@ pub fn build_scene(input: &LayoutInput<'_>) -> Scene {
         input.editor.text.split('\n').collect()
     };
     let visible_input_lines = editor_lines.len().clamp(1, 8);
-    let composer_h = (28.0 + visible_input_lines as f32 * (m.ch + 4.0) + 22.0).clamp(74.0, 240.0);
-    let input_top_y = (vh - composer_h).max(TOP_BAR_H + 40.0);
+    let box_h = (visible_input_lines as f32 * (m.ch + 4.0) + 22.0).clamp(44.0, 210.0);
+    let composer_total_h = 26.0 + box_h + 16.0;
+    let input_top_y = (vh - composer_total_h).max(TOP_BAR_H + 40.0);
     scene.input_top_y = input_top_y;
 
     // 2. Scrollable block feed clip region (clip_id = 1).
@@ -83,7 +88,7 @@ pub fn build_scene(input: &LayoutInput<'_>) -> Scene {
         for (idx, blk) in blocks.iter().enumerate() {
             if idx > 0 {
                 let sep_y = feed_top + content_y - input.scroll_y;
-                scene.line(col_x0, sep_y, col_x1, sep_y, 1.0, theme::HAIRLINE_FAINT, feed_clip);
+                scene.line(col_x0, sep_y, col_x1, sep_y, 1.0, theme::LINE_FAINT, feed_clip);
                 content_y += BLOCK_PAD_Y;
             }
             let show_context = prev_cwd != Some(blk.prompt_snapshot.cwd_display.as_str());
@@ -100,16 +105,17 @@ pub fn build_scene(input: &LayoutInput<'_>) -> Scene {
                 m,
                 feed_clip,
                 input.cursor_visible,
+                input.now_ns,
             );
             content_y += h + BLOCK_PAD_Y;
         }
     }
-    scene.total_content_height = content_y + 12.0;
+    scene.total_content_height = content_y + 14.0;
 
     // 4. Minimal top branch strip (clip 0).
     layout_top_bar(&mut scene, input.store, vw, m);
 
-    // 5. Sleek docked bottom composer (clip 0).
+    // 5. Sleek `ix.dev/blaze` bottom composer (clip 0).
     layout_composer(
         &mut scene,
         input.editor,
@@ -117,15 +123,16 @@ pub fn build_scene(input: &LayoutInput<'_>) -> Scene {
         vw,
         input_top_y,
         vh,
+        box_h,
         m,
         input.cursor_visible,
     );
 
     // 6. Floating overlays (completion popup and Ctrl+R reverse search).
     if let Some(rs) = &input.editor.reverse_search {
-        layout_reverse_search_overlay(&mut scene, rs, col_x0, input_top_y - 10.0, col_x1, m);
+        layout_reverse_search_overlay(&mut scene, rs, col_x0, input_top_y - 8.0, col_x1, m);
     } else if !input.editor.completions.is_empty() {
-        layout_completion_popup(&mut scene, input.editor, col_x0, input_top_y - 10.0, col_x1, m);
+        layout_completion_popup(&mut scene, input.editor, col_x0, input_top_y - 8.0, col_x1, m);
     }
 
     scene
@@ -133,20 +140,26 @@ pub fn build_scene(input: &LayoutInput<'_>) -> Scene {
 
 fn layout_top_bar(scene: &mut Scene, store: &BlockStore, vw: f32, m: CellMetrics) {
     scene.round_rect(0.0, 0.0, vw, TOP_BAR_H, 0.0, theme::BG_TOPBAR, 0.0, [0.0; 4], 0);
-    scene.line(0.0, TOP_BAR_H - 0.5, vw, TOP_BAR_H - 0.5, 1.0, theme::HAIRLINE, 0);
+    scene.line(0.0, TOP_BAR_H - 0.5, vw, TOP_BAR_H - 0.5, 1.0, theme::LINE, 0);
 
     let mid_y = (TOP_BAR_H - m.ch) * 0.5;
+    let icon_s = 11.5;
+    let icon_y = (TOP_BAR_H - icon_s) * 0.5;
     let mut x = OUTER_PAD_X;
 
-    // Right-aligned minimal `+ fork` text action (no heavy box).
-    let fork_label = "+ fork";
-    let fork_w = fork_label.len() as f32 * m.cw + 12.0;
+    // Right-aligned minimal `fork` button with branch icon (subtle bordered pill like `Copy`).
+    let fork_label = "fork";
+    let fork_w = icon_s + 6.0 + fork_label.len() as f32 * m.cw + 18.0;
     let fork_x1 = vw - OUTER_PAD_X;
     let fork_x0 = (fork_x1 - fork_w).max(x + 20.0);
-    scene.text(fork_x0 + 6.0, mid_y, fork_label, theme::FG_MUTED, false, false, 0);
-    scene.push_hit(HitRect::new(fork_x0, 2.0, fork_x1, TOP_BAR_H - 2.0), HitAction::ForkActiveBranch);
+    let btn_y0 = 6.0;
+    let btn_y1 = TOP_BAR_H - 6.0;
+    scene.round_rect(fork_x0, btn_y0, fork_x1, btn_y1, 6.0, theme::BG_CHIP, 1.0, theme::LINE, 0);
+    draw_icon(scene, Icon::Branch, fork_x0 + 8.0, icon_y, icon_s, theme::INK_3, 0);
+    scene.text(fork_x0 + 8.0 + icon_s + 6.0, mid_y, fork_label, theme::INK_2, false, false, 0);
+    scene.push_hit(HitRect::new(fork_x0, btn_y0, fork_x1, btn_y1), HitAction::ForkActiveBranch);
 
-    // Clean minimal underline tabs for session branches.
+    // Clean minimal underline tabs with branch icons; active tab carries the one `--fire` bar.
     let active_id = store.active_branch_id();
     for branch in store.branches() {
         let is_active = branch.id == active_id;
@@ -154,41 +167,35 @@ fn layout_top_bar(scene: &mut Scene, store: &BlockStore, vw: f32, m: CellMetrics
         let count_str = format!(" {}", branch.blocks.len());
         let name_w = name.chars().count() as f32 * m.cw;
         let count_w = count_str.chars().count() as f32 * m.cw;
-        let tab_w = name_w + count_w + 6.0;
+        let tab_w = icon_s + 6.0 + name_w + count_w;
         if x + tab_w > fork_x0 - 16.0 {
             break;
         }
-        let name_col = if is_active { theme::FG_BRIGHT } else { theme::FG_MUTED };
-        let count_col = if is_active { theme::FG_MUTED } else { theme::FG_DIM };
-        scene.text(x, mid_y, name, name_col, is_active, false, 0);
-        scene.text(x + name_w, mid_y, count_str, count_col, false, false, 0);
+        let icon_col = if is_active { theme::FIRE } else { theme::INK_4 };
+        let name_col = if is_active { theme::INK_1 } else { theme::INK_3 };
+        let count_col = if is_active { theme::INK_3 } else { theme::INK_4 };
+        draw_icon(scene, Icon::Branch, x, icon_y, icon_s, icon_col, 0);
+        scene.text(x + icon_s + 6.0, mid_y, name, name_col, is_active, false, 0);
+        scene.text(x + icon_s + 6.0 + name_w, mid_y, count_str, count_col, false, false, 0);
         if is_active {
-            // Crisp 1.5px pure-white active indicator sitting on the bottom hairline.
-            scene.over_round_rect(
-                x,
-                TOP_BAR_H - 1.5,
-                x + name_w + count_w,
-                TOP_BAR_H,
-                0.75,
-                theme::ACCENT_WHITE,
-                0,
-            );
+            scene.over_round_rect(x, TOP_BAR_H - 1.8, x + tab_w, TOP_BAR_H, 0.9, theme::FIRE, 0);
         }
         scene.push_hit(
             HitRect::new(x - 4.0, 0.0, x + tab_w + 4.0, TOP_BAR_H),
             HitAction::SwitchBranch(branch.id),
         );
-        x += tab_w + 20.0;
+        x += tab_w + 22.0;
     }
 }
 
 fn layout_welcome(scene: &mut Scene, x0: f32, y0: f32, m: CellMetrics, clip_id: u32) -> f32 {
-    scene.text(x0, y0 + 8.0, "blaze-shell", theme::FG_BRIGHT, true, false, clip_id);
+    draw_icon(scene, Icon::Blaze, x0, y0 + 10.0, 12.0, theme::FIRE, clip_id);
+    scene.text(x0 + 18.0, y0 + 8.0, "blaze-shell", theme::INK_1, true, false, clip_id);
     scene.text(
         x0,
         y0 + 8.0 + m.ch + 8.0,
-        "ls | sort-by size -r | take 8    ·    sys    ·    rust { (1..=10).sum::<i64>() }",
-        theme::FG_MUTED,
+        "ls | take 8    ·    sys    ·    rust { (1..=10).sum::<i64>() }",
+        theme::INK_3,
         false,
         false,
         clip_id,
@@ -197,7 +204,7 @@ fn layout_welcome(scene: &mut Scene, x0: f32, y0: f32, m: CellMetrics, clip_id: 
         x0,
         y0 + 8.0 + (m.ch + 8.0) * 2.0,
         "tab complete  ·  ctrl+r history  ·  cmd+b fork  ·  cmd+k clear",
-        theme::FG_DIM,
+        theme::INK_4,
         false,
         false,
         clip_id,
@@ -216,36 +223,40 @@ fn layout_block(
     m: CellMetrics,
     clip_id: u32,
     cursor_visible: bool,
+    now_ns: i64,
 ) -> f32 {
     let mut cur_y = y0;
+    let icon_s = 12.0;
 
-    // Optional quiet context line (only shown on first block or when cwd changes).
+    // Quiet context line with crisp folder & git-branch icons (only at top or on cwd change).
     if show_context {
         let mut cx = x0;
+        let iy = cur_y + (m.ch - icon_s) * 0.5;
+        draw_icon(scene, Icon::Folder, cx, iy, icon_s, theme::SERIES_BLUE, clip_id);
+        cx += icon_s + 7.0;
         let max_cwd = (((x1 - x0) * 0.55) / m.cw).floor().max(16.0) as usize;
         let cwd_lbl = truncate_chars(&block.prompt_snapshot.cwd_display, max_cwd);
-        scene.text(cx, cur_y, &cwd_lbl, theme::FG_DIM, false, false, clip_id);
+        scene.text(cx, cur_y, &cwd_lbl, theme::INK_3, false, false, clip_id);
         cx += cwd_lbl.chars().count() as f32 * m.cw;
 
         if let Some(branch) = &block.prompt_snapshot.git_branch {
             let dirty = block.prompt_snapshot.git_dirty.map(|d| d.dirty).unwrap_or(false);
-            let sep = "  ";
-            cx += sep.len() as f32 * m.cw;
-            let dot_c = if dirty { theme::ACCENT_SAND } else { theme::ACCENT_SAGE };
-            scene.circle(cx + 3.0, cur_y + m.ch * 0.5, 2.2, dot_c, clip_id);
-            cx += 10.0;
+            cx += 16.0;
+            let bcol = if dirty { theme::FIRE } else { theme::INK_4 };
+            draw_icon(scene, Icon::Branch, cx, iy + 0.5, icon_s - 1.0, bcol, clip_id);
+            cx += icon_s + 5.0;
             let git_lbl = if dirty { format!("{branch}*") } else { branch.clone() };
-            scene.text(cx, cur_y, git_lbl, theme::FG_MUTED, false, false, clip_id);
+            scene.text(cx, cur_y, git_lbl, theme::INK_3, false, false, clip_id);
         }
-        cur_y += m.ch + 6.0;
+        cur_y += m.ch + 8.0;
     }
 
-    // Right-aligned quiet inline metadata on the command row: duration, optional exit, `fork`.
+    // Right-aligned quiet inline metadata on the command row: exit, duration, `fork`.
     let mut rx = x1;
     let fork_lbl = "fork";
     let fork_w = fork_lbl.len() as f32 * m.cw;
     let fx0 = rx - fork_w;
-    scene.text(fx0, cur_y, fork_lbl, theme::FG_DIM, false, false, clip_id);
+    scene.text(fx0, cur_y, fork_lbl, theme::INK_4, false, false, clip_id);
     scene.push_hit_clipped(
         HitRect::new(fx0 - 4.0, cur_y - 2.0, rx + 4.0, cur_y + m.ch + 2.0),
         clip_id,
@@ -255,29 +266,29 @@ fn layout_block(
 
     let dur_lbl = format_duration_ms(block.duration_ms);
     let dur_w = dur_lbl.len() as f32 * m.cw;
-    scene.text(rx - dur_w, cur_y, dur_lbl, theme::FG_DIM, false, false, clip_id);
+    scene.text(rx - dur_w, cur_y, dur_lbl, theme::INK_4, false, false, clip_id);
     rx -= dur_w + 12.0;
 
     if matches!(&block.body, BlockBody::Terminal { running: true, .. }) {
         let lbl = "running";
         let w = lbl.len() as f32 * m.cw;
-        scene.text(rx - w, cur_y, lbl, theme::ACCENT_SAND, false, false, clip_id);
+        scene.text(rx - w, cur_y, lbl, theme::FIRE, false, false, clip_id);
         rx -= w + 12.0;
     } else if block.exit_code != 0 {
         let lbl = format!("exit {}", block.exit_code);
         let w = lbl.len() as f32 * m.cw;
-        scene.text(rx - w, cur_y, lbl, theme::ACCENT_CORAL, false, false, clip_id);
+        scene.text(rx - w, cur_y, lbl, theme::DANGER, false, false, clip_id);
         rx -= w + 12.0;
     }
 
-    // Command line: subtle chevron + syntax-highlighted source.
-    let chev_color = match &block.body {
-        BlockBody::Error { .. } | BlockBody::Value(Value::Error(_)) => theme::ACCENT_CORAL,
-        BlockBody::RustCell { .. } => theme::ACCENT_COPPER,
-        _ if block.exit_code != 0 => theme::ACCENT_CORAL,
-        _ => theme::FG_MUTED,
+    // Command row: `$` prompt matching `ix.dev/blaze` (`$ curl ... | sh`) + command source.
+    let prompt_col = match &block.body {
+        BlockBody::Error { .. } | BlockBody::Value(Value::Error(_)) => theme::DANGER,
+        BlockBody::RustCell { .. } => theme::FIRE,
+        _ if block.exit_code != 0 => theme::DANGER,
+        _ => theme::INK_4,
     };
-    scene.text(x0, cur_y, "❯", chev_color, false, false, clip_id);
+    scene.text(x0, cur_y, "$", prompt_col, false, false, clip_id);
 
     let cmd_x = x0 + 2.2 * m.cw;
     let cmd_max_x = (rx - 8.0).max(cmd_x + 100.0);
@@ -297,27 +308,27 @@ fn layout_block(
     );
     cur_y += cmd_h;
 
-    // Body aligned directly under `cmd_x` for razor-clean vertical grid alignment.
+    // Body aligned cleanly under `cmd_x`.
     let has_body = !matches!(&block.body, BlockBody::Value(Value::Nothing));
     if has_body {
-        cur_y += 10.0;
+        cur_y += 11.0;
         let body_w = (x1 - cmd_x).max(120.0);
         let body_h = match &block.body {
             BlockBody::Value(val) => {
-                layout_value(scene, block, val, cmd_x, cur_y, body_w, m, clip_id, 0)
+                layout_value(scene, block, val, cmd_x, cur_y, body_w, m, clip_id, 0, now_ns)
             }
             BlockBody::StreamAndValue { lines, value } => {
                 let mut sy = cur_y;
                 let max_cols = (body_w / m.cw).floor().max(20.0) as usize;
                 for line in lines {
                     for wrapped in wrap_lines(line, max_cols) {
-                        scene.text(cmd_x, sy, wrapped, theme::FG_PRIMARY, false, false, clip_id);
+                        scene.text(cmd_x, sy, wrapped, theme::INK_2, false, false, clip_id);
                         sy += m.ch + 2.0;
                     }
                 }
                 if !matches!(value, Value::Nothing) {
                     sy += 6.0;
-                    sy += layout_value(scene, block, value, cmd_x, sy, body_w, m, clip_id, 0);
+                    sy += layout_value(scene, block, value, cmd_x, sy, body_w, m, clip_id, 0, now_ns);
                 }
                 sy - cur_y
             }
@@ -337,6 +348,7 @@ fn layout_block(
                     body_w,
                     m,
                     clip_id,
+                    now_ns,
                 )
             }
             BlockBody::Terminal { term, running, .. } => {
@@ -358,7 +370,6 @@ fn layout_block(
     (cur_y - y0).max(m.ch)
 }
 
-/// Draw syntax-highlighted source text across one or more lines, returning total height.
 #[allow(clippy::too_many_arguments)]
 fn layout_highlighted_source(
     scene: &mut Scene,
@@ -376,7 +387,7 @@ fn layout_highlighted_source(
     let max_cols = ((x1 - x0) / m.cw).floor().max(10.0) as usize;
     let line_step = m.ch + 4.0;
 
-    let mut byte_colors: Vec<[f32; 4]> = vec![theme::FG_PRIMARY; source.len()];
+    let mut byte_colors: Vec<[f32; 4]> = vec![theme::INK_1; source.len()];
     for sp in spans {
         let s = (sp.span.start as usize).min(source.len());
         let e = (sp.span.end as usize).min(source.len());
@@ -395,7 +406,7 @@ fn layout_highlighted_source(
 
         let mut col = 0usize;
         let mut run_start_col = 0usize;
-        let mut run_color = theme::FG_PRIMARY;
+        let mut run_color = theme::INK_1;
         let mut run_buf = String::new();
 
         for (rel_idx, ch) in raw_line.char_indices() {
@@ -415,10 +426,7 @@ fn layout_highlighted_source(
                 col = 0;
                 run_start_col = 0;
             }
-            let c = byte_colors
-                .get(line_start + rel_idx)
-                .copied()
-                .unwrap_or(theme::FG_PRIMARY);
+            let c = byte_colors.get(line_start + rel_idx).copied().unwrap_or(theme::INK_1);
             if !run_buf.is_empty() && c != run_color {
                 scene.text(
                     x0 + run_start_col as f32 * m.cw,
@@ -466,21 +474,59 @@ fn layout_value(
     m: CellMetrics,
     clip_id: u32,
     depth: usize,
+    now_ns: i64,
 ) -> f32 {
     match val {
         Value::Nothing => 0.0,
-        Value::Table(t) => layout_table(scene, block, t, x0, y0, width, m, clip_id, depth),
-        Value::Record(r) => layout_record(scene, block, r, x0, y0, width, m, clip_id, depth),
-        Value::List(items) => layout_list(scene, block, items, x0, y0, width, m, clip_id, depth),
+        Value::Table(t) => layout_table(scene, block, t, x0, y0, width, m, clip_id, depth, now_ns),
+        Value::Record(r) => layout_record(scene, block, r, x0, y0, width, m, clip_id, depth, now_ns),
+        Value::List(items) => layout_list(scene, block, items, x0, y0, width, m, clip_id, depth, now_ns),
         Value::Error(err) => {
             layout_error_panel(scene, &block.source, err, x0, y0, width, m, clip_id)
         }
-        scalar => layout_scalar(scene, scalar, x0, y0, width, m, clip_id),
+        scalar => layout_scalar(scene, scalar, x0, y0, width, m, clip_id, now_ns),
     }
 }
 
-/// Editorial borderless table: clean muted header + single bottom hairline, airy columns,
-/// zero outer box clutter.
+/// Resolve the effective semantic display type of column `c` in `table` (using explicit
+/// `ColDisplay` from builtins like `ls`/`ps`, or inferring cleanly for user tables).
+fn effective_col_display(table: &Table<'_>, c: usize, visible_rows: usize) -> ColDisplay {
+    let explicit = table.col_display(c);
+    if explicit != ColDisplay::Auto {
+        return explicit;
+    }
+    let name = table.columns.get(c).map(|s| s.as_ref()).unwrap_or("");
+    let lower = name.to_ascii_lowercase();
+    if lower == "crate" || lower == "package" {
+        return ColDisplay::Crate;
+    }
+    if lower == "file" || lower == "path" || (lower == "name" && table.col_index("type").is_some()) {
+        return ColDisplay::FileEntry;
+    }
+    if lower == "status" || lower == "ok" || lower == "ready" {
+        return ColDisplay::Status;
+    }
+    if lower == "modified" || lower == "updated" || lower == "created" {
+        return ColDisplay::HumanTime;
+    }
+    // Inspect first non-nothing cell value for automatic typing.
+    for r in 0..visible_rows {
+        if let Some(cell) = table.cell(r, c) {
+            match cell {
+                Value::Nothing => continue,
+                Value::Size(_) => return ColDisplay::FileSize,
+                Value::Date(_) => return ColDisplay::HumanTime,
+                Value::Duration(_) => return ColDisplay::Duration,
+                Value::Bool(_) => return ColDisplay::Status,
+                _ => break,
+            }
+        }
+    }
+    ColDisplay::Auto
+}
+
+/// Typed editorial dataframe renderer: custom icons per column type, inline folder/rust chips,
+/// proportional micro-bars for byte sizes, human relative time for timestamps, and status dots.
 #[allow(clippy::too_many_arguments)]
 fn layout_table(
     scene: &mut Scene,
@@ -492,10 +538,11 @@ fn layout_table(
     m: CellMetrics,
     clip_id: u32,
     depth: usize,
+    now_ns: i64,
 ) -> f32 {
     let ncols = table.ncols();
     if ncols == 0 {
-        scene.text(x0, y0, "empty table", theme::FG_DIM, false, true, clip_id);
+        scene.text(x0, y0, "empty table", theme::INK_4, false, true, clip_id);
         return m.ch;
     }
 
@@ -505,53 +552,86 @@ fn layout_table(
         table.nrows()
     };
 
+    let type_col_idx = table.col_index("type");
+    let icon_s = 12.0;
+    let icon_pad = icon_s + 7.0;
+
     let idx_chars = table.nrows().max(1).to_string().len().max(2);
-    let idx_w = idx_chars as f32 * m.cw + 18.0;
-    let col_gap = 20.0;
+    let idx_w = idx_chars as f32 * m.cw + 16.0;
+    let col_gap = 22.0;
     let avail_w = (width - idx_w).max(80.0);
 
+    let mut col_displays: Vec<ColDisplay> = Vec::with_capacity(ncols);
     let mut col_chars: Vec<usize> = Vec::with_capacity(ncols);
     let mut col_right_align: Vec<bool> = Vec::with_capacity(ncols);
+    let mut col_extra_px: Vec<f32> = Vec::with_capacity(ncols);
+    let mut col_max_num: Vec<f64> = Vec::with_capacity(ncols);
 
     for c in 0..ncols {
+        let disp = effective_col_display(table, c, visible_rows);
+        col_displays.push(disp);
+
         let hdr = table.columns.get(c).map(|s| s.as_ref()).unwrap_or("");
         let mut max_c = hdr.chars().count().max(3);
         let mut numeric_votes = 0usize;
         let mut non_empty = 0usize;
+        let mut max_num = 0.0f64;
+
         for r in 0..visible_rows {
             if let Some(cell) = table.cell(r, c) {
-                let txt = format_value_cell(cell);
+                let mut txt = format_value_cell_at(cell, Some(now_ns));
+                if disp == ColDisplay::FileEntry
+                    && type_col_idx.and_then(|ti| table.cell(r, ti)).and_then(Value::as_str) == Some("dir")
+                    && !txt.ends_with('/')
+                {
+                    txt.push('/');
+                }
                 max_c = max_c.max(txt.chars().count());
                 if !matches!(cell, Value::Nothing) {
                     non_empty += 1;
                     if theme::is_right_aligned(cell) {
                         numeric_votes += 1;
                     }
+                    match cell {
+                        Value::Size(Bytes(b)) => max_num = max_num.max((*b).max(0) as f64),
+                        Value::Float(f) if disp == ColDisplay::Percent => max_num = max_num.max(f.max(0.0)),
+                        _ => {}
+                    }
                 }
             }
         }
-        col_chars.push(max_c.min(44));
-        col_right_align.push(non_empty > 0 && numeric_votes * 2 >= non_empty);
+        col_chars.push(max_c.min(40));
+        col_right_align.push(
+            matches!(disp, ColDisplay::FileSize | ColDisplay::Percent | ColDisplay::HumanTime)
+                || (non_empty > 0 && numeric_votes * 2 >= non_empty),
+        );
+        let extra = match disp {
+            ColDisplay::FileEntry | ColDisplay::Crate | ColDisplay::Process => icon_pad + 10.0,
+            ColDisplay::Status => 14.0,
+            ColDisplay::FileSize | ColDisplay::Percent if max_num > 0.0 => SIZE_BAR_W + 10.0,
+            _ => 0.0,
+        };
+        col_extra_px.push(extra);
+        col_max_num.push(max_num);
     }
 
-    let mut col_widths: Vec<f32> = col_chars
-        .iter()
-        .map(|&ch| ch as f32 * m.cw + col_gap)
+    let mut col_widths: Vec<f32> = (0..ncols)
+        .map(|c| col_chars[c] as f32 * m.cw + col_extra_px[c] + col_gap)
         .collect();
     let total_w: f32 = col_widths.iter().sum();
     if total_w > avail_w && total_w > 0.0 {
         let scale = avail_w / total_w;
         for w in &mut col_widths {
-            *w = (*w * scale).max(48.0);
+            *w = (*w * scale).max(52.0);
         }
     }
-    let table_w = (idx_w + col_widths.iter().sum::<f32>() - col_gap * 0.5).min(width);
+    let table_w = (idx_w + col_widths.iter().sum::<f32>() - col_gap * 0.4).min(width);
     let x1 = x0 + table_w;
 
     let row_h = m.ch + TABLE_ROW_PAD_Y * 2.0;
 
     // Minimal column headers + one crisp hairline underneath.
-    scene.text(x0, y0, "#", theme::FG_DIM, false, false, clip_id);
+    scene.text(x0, y0, "#", theme::INK_4, false, false, clip_id);
     let mut cx = x0 + idx_w;
     for c in 0..ncols {
         let cw = col_widths[c];
@@ -563,41 +643,52 @@ fn layout_table(
         } else {
             cx
         };
-        scene.text(tx, y0, hdr, theme::FG_MUTED, false, false, clip_id);
+        scene.text(tx, y0, hdr, theme::INK_3, false, false, clip_id);
         cx += cw;
     }
 
     let hdr_line_y = y0 + m.ch + 6.0;
-    scene.line(x0, hdr_line_y, x1, hdr_line_y, 1.0, theme::HAIRLINE, clip_id);
+    scene.line(x0, hdr_line_y, x1, hdr_line_y, 1.0, theme::LINE, clip_id);
 
     let mut cur_y = hdr_line_y + 5.0;
 
     if visible_rows == 0 {
-        scene.text(x0, cur_y + TABLE_ROW_PAD_Y, "0 rows", theme::FG_DIM, false, true, clip_id);
+        scene.text(x0, cur_y + TABLE_ROW_PAD_Y, "0 rows", theme::INK_4, false, true, clip_id);
         cur_y += row_h;
     } else {
         for r in 0..visible_rows {
             let ty = cur_y + TABLE_ROW_PAD_Y;
-            scene.text(x0, ty, r.to_string(), theme::FG_DIM, false, false, clip_id);
+            let iy = ty + (m.ch - icon_s) * 0.5;
+            scene.text(x0, ty, r.to_string(), theme::INK_4, false, false, clip_id);
+
+            let row_file_kind = type_col_idx
+                .and_then(|ti| table.cell(r, ti))
+                .and_then(Value::as_str);
 
             let mut expanded_for_row: Vec<(usize, &Value<'_>)> = Vec::new();
             let mut rx = x0 + idx_w;
             for c in 0..ncols {
                 let cw = col_widths[c];
                 let content_w = (cw - col_gap).max(m.cw * 2.0);
-                let max_ch = (content_w / m.cw).floor().max(2.0) as usize;
+                let disp = col_displays[c];
+
                 if let Some(cell) = table.cell(r, c) {
-                    let raw = format_value_cell(cell);
-                    let txt = truncate_chars(&raw, max_ch);
                     if depth == 0 && is_expandable_cell(cell) {
+                        let raw = format_value_cell_at(cell, Some(now_ns));
+                        let max_ch = (content_w / m.cw).floor().max(2.0) as usize;
+                        let txt = truncate_chars(&raw, max_ch);
                         let expanded = block.is_cell_expanded(r, c);
                         let badge_w = (txt.chars().count() as f32 * m.cw + 12.0).min(content_w + 4.0);
                         let bx0 = rx - 4.0;
                         let by0 = cur_y + 2.0;
                         let by1 = cur_y + row_h - 2.0;
-                        let bg = if expanded { theme::BG_SELECTED } else { theme::BG_CHIP };
-                        scene.round_rect(bx0, by0, bx0 + badge_w, by1, 4.0, bg, 0.0, [0.0; 4], clip_id);
-                        scene.text(bx0 + 6.0, ty, txt, theme::ACCENT_ICE, false, false, clip_id);
+                        let (bg, bd) = if expanded {
+                            (theme::BG_TRACK, theme::LINE_STRONG)
+                        } else {
+                            (theme::BG_CHIP, theme::LINE)
+                        };
+                        scene.round_rect(bx0, by0, bx0 + badge_w, by1, 4.0, bg, 1.0, bd, clip_id);
+                        scene.text(bx0 + 6.0, ty, txt, theme::INK_1, false, false, clip_id);
                         scene.push_hit_clipped(
                             HitRect::new(bx0, by0, bx0 + badge_w, by1),
                             clip_id,
@@ -607,52 +698,142 @@ fn layout_table(
                             expanded_for_row.push((c, cell));
                         }
                     } else {
-                        // Subtle tonal distinction: strings in crisp bright white, secondary text calm.
-                        let color = if c == 0 && matches!(cell, Value::String(_)) {
-                            theme::FG_BRIGHT
-                        } else if matches!(cell, Value::String(_)) {
-                            theme::FG_MUTED
-                        } else {
-                            theme::value_color(cell)
-                        };
-                        let tx = if col_right_align[c] {
-                            rx + content_w - txt.chars().count() as f32 * m.cw
-                        } else {
-                            rx
-                        };
-                        scene.text(tx, ty, txt, color, false, false, clip_id);
+                        match disp {
+                            ColDisplay::FileEntry => {
+                                let raw_name = format_value_cell_at(cell, Some(now_ns));
+                                let (icon, icol) = icon_for_file(&raw_name, row_file_kind);
+                                let is_dir = matches!(icon, Icon::Folder);
+                                let display_name = if is_dir && !raw_name.ends_with('/') {
+                                    format!("{raw_name}/")
+                                } else {
+                                    raw_name
+                                };
+                                let max_ch = ((content_w - icon_pad - 8.0) / m.cw).floor().max(3.0) as usize;
+                                let txt = truncate_chars(&display_name, max_ch);
+
+                                // Sleek `ix.dev/blaze` inline chip for folders and `.rs` files!
+                                if is_dir || matches!(icon, Icon::Rust) {
+                                    let chip_w = (icon_pad + txt.chars().count() as f32 * m.cw + 10.0)
+                                        .min(content_w + 2.0);
+                                    let bx0 = rx - 5.0;
+                                    let by0 = cur_y + 2.0;
+                                    let by1 = cur_y + row_h - 2.0;
+                                    scene.round_rect(bx0, by0, bx0 + chip_w, by1, 4.0, theme::BG_CHIP, 0.0, [0.0; 4], clip_id);
+                                    draw_icon(scene, icon, rx, iy, icon_s, icol, clip_id);
+                                    scene.text(rx + icon_pad, ty, txt, theme::INK_1, false, false, clip_id);
+                                } else {
+                                    draw_icon(scene, icon, rx, iy, icon_s, icol, clip_id);
+                                    scene.text(rx + icon_pad, ty, txt, theme::INK_1, false, false, clip_id);
+                                }
+                            }
+                            ColDisplay::Crate => {
+                                let raw = format_value_cell_at(cell, Some(now_ns));
+                                let max_ch = ((content_w - icon_pad) / m.cw).floor().max(3.0) as usize;
+                                let txt = truncate_chars(&raw, max_ch);
+                                draw_icon(scene, Icon::Crate, rx, iy, icon_s, theme::SERIES_ORANGE, clip_id);
+                                scene.text(rx + icon_pad, ty, txt, theme::INK_1, false, false, clip_id);
+                            }
+                            ColDisplay::Process => {
+                                let raw = format_value_cell_at(cell, Some(now_ns));
+                                let max_ch = ((content_w - icon_pad) / m.cw).floor().max(3.0) as usize;
+                                let txt = truncate_chars(&raw, max_ch);
+                                draw_icon(scene, Icon::Terminal, rx, iy, icon_s, theme::INK_3, clip_id);
+                                scene.text(rx + icon_pad, ty, txt, theme::INK_1, false, false, clip_id);
+                            }
+                            ColDisplay::Status => {
+                                let raw = format_value_cell_at(cell, Some(now_ns));
+                                let is_ok = matches!(cell, Value::Bool(true))
+                                    || raw.eq_ignore_ascii_case("running")
+                                    || raw.eq_ignore_ascii_case("ok")
+                                    || raw == "R"
+                                    || raw == "S";
+                                let dot_y = ty + m.ch * 0.5;
+                                if is_ok {
+                                    scene.over_circle(rx + 4.0, dot_y, 3.0, theme::OK, clip_id);
+                                } else {
+                                    scene.over_ring(rx + 4.0, dot_y, 3.2, 1.1, theme::INK_4, clip_id);
+                                }
+                                let max_ch = ((content_w - 14.0) / m.cw).floor().max(2.0) as usize;
+                                let txt = truncate_chars(&raw, max_ch);
+                                let col = if is_ok { theme::INK_2 } else { theme::INK_3 };
+                                scene.text(rx + 13.0, ty, txt, col, false, false, clip_id);
+                            }
+                            ColDisplay::FileSize => {
+                                let raw = format_value_cell_at(cell, Some(now_ns));
+                                let bar_on = col_max_num[c] > 0.0;
+                                let text_area_w = if bar_on {
+                                    (content_w - SIZE_BAR_W - 10.0).max(m.cw * 3.0)
+                                } else {
+                                    content_w
+                                };
+                                let max_ch = (text_area_w / m.cw).floor().max(2.0) as usize;
+                                let txt = truncate_chars(&raw, max_ch);
+                                let tx = rx + text_area_w - txt.chars().count() as f32 * m.cw;
+                                scene.text(tx, ty, txt, theme::INK_2, false, false, clip_id);
+
+                                if bar_on && let Value::Size(Bytes(b)) = cell {
+                                    let frac = ((*b).max(0) as f64 / col_max_num[c]).clamp(0.0, 1.0) as f32;
+                                    let bx0 = rx + text_area_w + 10.0;
+                                    let by0 = ty + m.ch * 0.5 - 2.0;
+                                    let by1 = by0 + 4.0;
+                                    scene.round_rect(bx0, by0, bx0 + SIZE_BAR_W, by1, 2.0, theme::BG_TRACK, 0.0, [0.0; 4], clip_id);
+                                    if frac > 0.01 {
+                                        let fill_w = (SIZE_BAR_W * frac).max(3.0);
+                                        let fill_col = if frac >= 0.99 { theme::FIRE } else { theme::INK_4 };
+                                        scene.round_rect(bx0, by0, bx0 + fill_w, by1, 2.0, fill_col, 0.0, [0.0; 4], clip_id);
+                                    }
+                                }
+                            }
+                            ColDisplay::HumanTime => {
+                                let raw = format_value_cell_at(cell, Some(now_ns));
+                                let max_ch = (content_w / m.cw).floor().max(2.0) as usize;
+                                let txt = truncate_chars(&raw, max_ch);
+                                let tx = rx + content_w - txt.chars().count() as f32 * m.cw;
+                                scene.text(tx, ty, txt, theme::INK_3, false, false, clip_id);
+                            }
+                            _ => {
+                                let raw = format_value_cell_at(cell, Some(now_ns));
+                                let max_ch = (content_w / m.cw).floor().max(2.0) as usize;
+                                let txt = truncate_chars(&raw, max_ch);
+                                let color = if c == 0 && matches!(cell, Value::String(_)) {
+                                    theme::INK_1
+                                } else if matches!(cell, Value::String(_)) {
+                                    theme::INK_3
+                                } else {
+                                    theme::value_color(cell)
+                                };
+                                let tx = if col_right_align[c] {
+                                    rx + content_w - txt.chars().count() as f32 * m.cw
+                                } else {
+                                    rx
+                                };
+                                scene.text(tx, ty, txt, color, false, false, clip_id);
+                            }
+                        }
                     }
                 }
                 rx += cw;
             }
             cur_y += row_h;
 
-            // Inline expansion drawer for clicked nested cells.
             for (col_idx, nested) in expanded_for_row {
                 let col_name = table.columns.get(col_idx).map(|s| s.as_ref()).unwrap_or("cell");
                 let drawer_x0 = x0 + idx_w;
                 let drawer_w = (width - idx_w).max(120.0);
                 let rail_top = cur_y + 2.0;
-                scene.text(
-                    drawer_x0 + 10.0,
-                    cur_y + 2.0,
-                    format!("{col_name}"),
-                    theme::FG_MUTED,
-                    false,
-                    false,
-                    clip_id,
-                );
+                scene.text(drawer_x0 + 12.0, cur_y + 2.0, col_name, theme::INK_3, false, false, clip_id);
                 cur_y += m.ch + 6.0;
                 let sub_h = layout_value(
                     scene,
                     block,
                     nested,
-                    drawer_x0 + 10.0,
+                    drawer_x0 + 12.0,
                     cur_y,
-                    (drawer_w - 10.0).max(80.0),
+                    (drawer_w - 12.0).max(80.0),
                     m,
                     clip_id,
                     depth + 1,
+                    now_ns,
                 );
                 cur_y += sub_h + 6.0;
                 scene.over_round_rect(
@@ -661,14 +842,13 @@ fn layout_table(
                     drawer_x0 + 1.5,
                     cur_y - 4.0,
                     0.75,
-                    theme::HAIRLINE_STRONG,
+                    theme::LINE_STRONG,
                     clip_id,
                 );
             }
         }
     }
 
-    // Minimal inline fold toggle link.
     if depth == 0 && table.nrows() > TABLE_FOLD_ROWS {
         cur_y += 4.0;
         let lbl = if block.folded {
@@ -677,7 +857,7 @@ fn layout_table(
             format!("− collapse to {TABLE_FOLD_ROWS} rows")
         };
         let pw = lbl.chars().count() as f32 * m.cw + 8.0;
-        scene.text(x0 + idx_w, cur_y, lbl, theme::FG_MUTED, false, false, clip_id);
+        scene.text(x0 + idx_w, cur_y, lbl, theme::INK_3, false, false, clip_id);
         scene.push_hit_clipped(
             HitRect::new(x0 + idx_w - 4.0, cur_y - 2.0, x0 + idx_w + pw, cur_y + m.ch + 2.0),
             clip_id,
@@ -689,7 +869,7 @@ fn layout_table(
     cur_y - y0
 }
 
-/// Editorial borderless two-column record.
+/// Editorial borderless record with semantic SDF icons per known key + live memory bar.
 #[allow(clippy::too_many_arguments)]
 fn layout_record(
     scene: &mut Scene,
@@ -701,34 +881,50 @@ fn layout_record(
     m: CellMetrics,
     clip_id: u32,
     depth: usize,
+    now_ns: i64,
 ) -> f32 {
     if rec.is_empty() {
-        scene.text(x0, y0, "{}", theme::FG_DIM, false, false, clip_id);
+        scene.text(x0, y0, "{}", theme::INK_4, false, false, clip_id);
         return m.ch;
     }
+    let has_any_icon = rec.iter().any(|(k, _)| icon_for_record_key(k).is_some());
+    let icon_s = 12.0;
+    let icon_gutter = if has_any_icon { icon_s + 8.0 } else { 0.0 };
+
     let max_key_chars = rec
         .iter()
         .map(|(k, _)| k.chars().count())
         .max()
         .unwrap_or(4)
         .clamp(4, 28);
-    let key_col_w = (max_key_chars as f32 * m.cw + 24.0).min(width * 0.36);
+    let key_col_w = (icon_gutter + max_key_chars as f32 * m.cw + 22.0).min(width * 0.38);
     let val_x = x0 + key_col_w;
     let val_w = (width - key_col_w).max(80.0);
     let max_val_cols = (val_w / m.cw).floor().max(12.0) as usize;
+
+    let mem_total_bytes = match rec.get("mem_total") {
+        Some(Value::Size(Bytes(b))) if *b > 0 => Some(*b as f64),
+        _ => None,
+    };
 
     let row_h = m.ch + TABLE_ROW_PAD_Y * 2.0;
     let mut cur_y = y0;
     for (k, v) in rec.iter() {
         let start_y = cur_y;
+        let ty = cur_y + TABLE_ROW_PAD_Y;
         let is_nested = depth < 2 && matches!(v, Value::Table(_) | Value::Record(_) | Value::List(_));
+
+        if let Some((icon, icol)) = icon_for_record_key(k) {
+            draw_icon(scene, icon, x0, ty + (m.ch - icon_s) * 0.5, icon_s, icol, clip_id);
+        }
         let k_lbl = truncate_chars(k, max_key_chars);
-        scene.text(x0, cur_y + TABLE_ROW_PAD_Y, k_lbl, theme::FG_MUTED, false, false, clip_id);
+        scene.text(x0 + icon_gutter, ty, k_lbl, theme::INK_3, false, false, clip_id);
+
         if is_nested {
-            let sub_h = layout_value(scene, block, v, val_x, cur_y + 2.0, val_w, m, clip_id, depth + 1);
+            let sub_h = layout_value(scene, block, v, val_x, cur_y + 2.0, val_w, m, clip_id, depth + 1, now_ns);
             cur_y += (sub_h + 8.0).max(row_h);
         } else {
-            let formatted = format_value_cell(v);
+            let formatted = format_value_cell_at(v, Some(now_ns));
             let lines = wrap_lines(&formatted, max_val_cols);
             let color = theme::value_color(v);
             for (li, line) in lines.iter().enumerate() {
@@ -742,6 +938,33 @@ fn layout_record(
                     clip_id,
                 );
             }
+            // Live proportional usage bar right beside `mem_used` when `mem_total` is present.
+            if k == "mem_used"
+                && let (Some(total), Value::Size(Bytes(used))) = (mem_total_bytes, v)
+                && *used > 0
+            {
+                let frac = (*used as f64 / total).clamp(0.0, 1.0) as f32;
+                let bar_x0 = val_x + (formatted.chars().count() as f32 * m.cw) + 14.0;
+                let bar_w = 88.0f32.min((val_w - (bar_x0 - val_x) - 42.0).max(0.0));
+                if bar_w >= 24.0 {
+                    let by0 = ty + m.ch * 0.5 - 2.5;
+                    scene.round_rect(bar_x0, by0, bar_x0 + bar_w, by0 + 5.0, 2.5, theme::BG_TRACK, 0.0, [0.0; 4], clip_id);
+                    let fill_col = if frac > 0.85 { theme::FIRE } else { theme::INK_3 };
+                    scene.round_rect(
+                        bar_x0,
+                        by0,
+                        bar_x0 + (bar_w * frac).max(3.0),
+                        by0 + 5.0,
+                        2.5,
+                        fill_col,
+                        0.0,
+                        [0.0; 4],
+                        clip_id,
+                    );
+                    let pct = format!("{:.0}%", frac * 100.0);
+                    scene.text(bar_x0 + bar_w + 8.0, ty, pct, theme::INK_4, false, false, clip_id);
+                }
+            }
             let text_h = lines.len() as f32 * (m.ch + 2.0) + TABLE_ROW_PAD_Y * 2.0 - 2.0;
             cur_y += text_h.max(row_h);
         }
@@ -749,7 +972,6 @@ fn layout_record(
     cur_y - y0
 }
 
-/// Editorial borderless indexed list.
 #[allow(clippy::too_many_arguments)]
 fn layout_list(
     scene: &mut Scene,
@@ -761,9 +983,10 @@ fn layout_list(
     m: CellMetrics,
     clip_id: u32,
     depth: usize,
+    now_ns: i64,
 ) -> f32 {
     if items.is_empty() {
-        scene.text(x0, y0, "[]", theme::FG_DIM, false, false, clip_id);
+        scene.text(x0, y0, "[]", theme::INK_4, false, false, clip_id);
         return m.ch;
     }
     let show = if depth == 0 && block.folded && items.len() > TABLE_FOLD_ROWS {
@@ -771,16 +994,16 @@ fn layout_list(
     } else {
         items.len()
     };
-    let idx_w = (items.len().to_string().len().max(2) as f32 * m.cw + 18.0).max(32.0);
+    let idx_w = (items.len().to_string().len().max(2) as f32 * m.cw + 16.0).max(32.0);
     let val_x = x0 + idx_w;
     let max_val_cols = ((width - idx_w) / m.cw).floor().max(12.0) as usize;
 
     let row_h = m.ch + TABLE_ROW_PAD_Y * 2.0;
     let mut cur_y = y0;
     for i in 0..show {
-        scene.text(x0, cur_y + TABLE_ROW_PAD_Y, i.to_string(), theme::FG_DIM, false, false, clip_id);
+        scene.text(x0, cur_y + TABLE_ROW_PAD_Y, i.to_string(), theme::INK_4, false, false, clip_id);
         if let Some(val) = items.get(i) {
-            let txt = truncate_chars(&format_value_cell(val), max_val_cols);
+            let txt = truncate_chars(&format_value_cell_at(val, Some(now_ns)), max_val_cols);
             scene.text(val_x, cur_y + TABLE_ROW_PAD_Y, txt, theme::value_color(val), false, false, clip_id);
         }
         cur_y += row_h;
@@ -793,7 +1016,7 @@ fn layout_list(
             format!("− collapse to {TABLE_FOLD_ROWS} items")
         };
         let pw = lbl.chars().count() as f32 * m.cw + 8.0;
-        scene.text(val_x, cur_y, lbl, theme::FG_MUTED, false, false, clip_id);
+        scene.text(val_x, cur_y, lbl, theme::INK_3, false, false, clip_id);
         scene.push_hit_clipped(
             HitRect::new(val_x - 4.0, cur_y - 2.0, val_x + pw, cur_y + m.ch + 2.0),
             clip_id,
@@ -813,27 +1036,30 @@ fn layout_scalar(
     width: f32,
     m: CellMetrics,
     clip_id: u32,
+    now_ns: i64,
 ) -> f32 {
     let type_lbl = val.type_name();
     let type_w = type_lbl.len() as f32 * m.cw;
     let text_w = (width - type_w - 20.0).max(80.0);
     let max_cols = (text_w / m.cw).floor().max(10.0) as usize;
-    let formatted = format_value_cell(val);
+    let formatted = format_value_cell_at(val, Some(now_ns));
     let lines = wrap_lines(&formatted, max_cols);
     let color = theme::value_color(val);
 
-    // Whisper-quiet right-aligned type hint (no bordered pill box).
-    scene.text(x0 + width - type_w, y0, type_lbl, theme::FG_DIM, false, false, clip_id);
+    // Subtle pill-outlined type tag matching `Opt-in` in `ix.dev/blaze`!
+    let pill_w = type_w + 14.0;
+    let bx0 = x0 + width - pill_w;
+    scene.round_rect(bx0, y0 - 1.0, x0 + width, y0 + m.ch + 1.0, (m.ch + 2.0) * 0.5, [0.0; 4], 1.0, theme::LINE, clip_id);
+    scene.text(bx0 + 7.0, y0, type_lbl, theme::INK_3, false, false, clip_id);
 
     let mut cur_y = y0;
     for line in &lines {
         scene.text(x0, cur_y, line, color, false, false, clip_id);
         cur_y += m.ch + 2.0;
     }
-    (cur_y - y0).max(m.ch)
+    (cur_y - y0).max(m.ch + 2.0)
 }
 
-/// Minimal crimson-rail error block with exact span underline (zero bulky red boxes).
 #[allow(clippy::too_many_arguments)]
 fn layout_error_panel(
     scene: &mut Scene,
@@ -847,26 +1073,28 @@ fn layout_error_panel(
 ) -> f32 {
     let x1 = x0 + width;
     let bg_idx = scene.rects.len();
-    scene.round_rect(x0, y0, x1, y0 + 24.0, 4.0, theme::ACCENT_CORAL_FAINT, 0.0, [0.0; 4], clip_id);
+    scene.round_rect(x0, y0, x1, y0 + 24.0, 6.0, theme::DANGER_FAINT, 0.0, [0.0; 4], clip_id);
     let rail_idx = scene.rects.len();
-    scene.round_rect(x0, y0, x0 + 2.0, y0 + 24.0, 1.0, theme::ACCENT_CORAL, 0.0, [0.0; 4], clip_id);
+    scene.round_rect(x0, y0, x0 + 2.0, y0 + 24.0, 1.0, theme::DANGER, 0.0, [0.0; 4], clip_id);
 
     let px = x0 + 14.0;
     let mut cur_y = y0 + 8.0;
+    let icon_s = 12.0;
 
-    // Clean inline error label + crisp message.
+    draw_icon(scene, Icon::Error, px, cur_y + (m.ch - icon_s) * 0.5, icon_s, theme::DANGER, clip_id);
+    let kind_x = px + icon_s + 7.0;
     let kind_lbl = err.kind.as_str();
-    scene.text(px, cur_y, kind_lbl, theme::ACCENT_CORAL, true, false, clip_id);
-    let msg_x = px + (kind_lbl.len() as f32 + 2.0) * m.cw;
+    scene.text(kind_x, cur_y, kind_lbl, theme::DANGER, true, false, clip_id);
+
+    let msg_x = kind_x + (kind_lbl.len() as f32 + 2.0) * m.cw;
     let msg_cols = ((x1 - 12.0 - msg_x) / m.cw).floor().max(14.0) as usize;
     let msg_lines = wrap_lines(err.message.as_str(), msg_cols);
     for (i, line) in msg_lines.iter().enumerate() {
         let tx = if i == 0 { msg_x } else { px };
-        scene.text(tx, cur_y, line, theme::FG_BRIGHT, false, false, clip_id);
+        scene.text(tx, cur_y, line, theme::INK_1, false, false, clip_id);
         cur_y += m.ch + 3.0;
     }
 
-    // Offending source line with crisp crimson underline directly beneath `err.span`.
     if !source.is_empty() {
         cur_y += 3.0;
         let lc = line_col(source, err.span.start);
@@ -874,8 +1102,8 @@ fn layout_error_panel(
         let gutter = format!("{} │ ", lc.line);
         let gutter_w = gutter.chars().count() as f32 * m.cw;
 
-        scene.text(px, cur_y, gutter, theme::FG_DIM, false, false, clip_id);
-        scene.text(px + gutter_w, cur_y, line_text, theme::FG_MUTED, false, false, clip_id);
+        scene.text(px, cur_y, gutter, theme::INK_4, false, false, clip_id);
+        scene.text(px + gutter_w, cur_y, line_text, theme::INK_2, false, false, clip_id);
 
         let start_b = (err.span.start as usize).clamp(lc.line_start, lc.line_end);
         let end_b = (err.span.end as usize).clamp(start_b, lc.line_end);
@@ -884,18 +1112,18 @@ fn layout_error_panel(
         let ux0 = px + gutter_w + col0 as f32 * m.cw;
         let ux1 = (ux0 + span_chars as f32 * m.cw).min(x1 - 12.0);
         let uy = cur_y + m.ch + 1.0;
-        scene.over_round_rect(ux0, uy, ux1.max(ux0 + m.cw), uy + 2.0, 1.0, theme::ACCENT_CORAL, clip_id);
+        scene.over_round_rect(ux0, uy, ux1.max(ux0 + m.cw), uy + 2.0, 1.0, theme::DANGER, clip_id);
 
         cur_y += m.ch + 8.0;
     }
 
     if let Some(help) = &err.help {
         let help_lbl = "help  ";
-        scene.text(px, cur_y, help_lbl, theme::FG_MUTED, false, false, clip_id);
+        scene.text(px, cur_y, help_lbl, theme::INK_3, false, false, clip_id);
         let hx = px + help_lbl.len() as f32 * m.cw;
         let h_cols = ((x1 - 12.0 - hx) / m.cw).floor().max(16.0) as usize;
         for (i, line) in wrap_lines(help.as_str(), h_cols).iter().enumerate() {
-            scene.text(if i == 0 { hx } else { px }, cur_y, line, theme::FG_PRIMARY, false, false, clip_id);
+            scene.text(if i == 0 { hx } else { px }, cur_y, line, theme::INK_2, false, false, clip_id);
             cur_y += m.ch + 2.0;
         }
     }
@@ -906,7 +1134,6 @@ fn layout_error_panel(
     cur_y - y0
 }
 
-/// Minimal copper-rail Rust REPL cell output.
 #[allow(clippy::too_many_arguments)]
 fn layout_rust_cell_body(
     scene: &mut Scene,
@@ -920,37 +1147,40 @@ fn layout_rust_cell_body(
     width: f32,
     m: CellMetrics,
     clip_id: u32,
+    now_ns: i64,
 ) -> f32 {
     let rail_idx = scene.rects.len();
-    scene.round_rect(x0, y0, x0 + 2.0, y0 + 20.0, 1.0, theme::ACCENT_COPPER, 0.0, [0.0; 4], clip_id);
+    scene.round_rect(x0, y0, x0 + 2.0, y0 + 20.0, 1.0, theme::FIRE, 0.0, [0.0; 4], clip_id);
 
     let px = x0 + 14.0;
     let inner_w = (width - 14.0).max(80.0);
     let mut cur_y = y0;
+    let icon_s = 12.0;
 
+    draw_icon(scene, Icon::Rust, px, cur_y + (m.ch - icon_s) * 0.5, icon_s, theme::SERIES_ORANGE, clip_id);
     let timing = if run_ms > 0 {
         format!(
-            "rust · blaze run · {} / {}",
+            "blaze run · {} / {}",
             format_duration_ms(compile_ms),
             format_duration_ms(run_ms)
         )
     } else {
-        format!("rust · blaze run · {}", format_duration_ms(compile_ms))
+        format!("blaze run · {}", format_duration_ms(compile_ms))
     };
-    scene.text(px, cur_y, timing, theme::FG_DIM, false, false, clip_id);
-    cur_y += m.ch + 6.0;
+    scene.text(px + icon_s + 7.0, cur_y, timing, theme::INK_3, false, false, clip_id);
+    cur_y += m.ch + 7.0;
 
     if !stdout.is_empty() {
         let max_cols = (inner_w / m.cw).floor().max(16.0) as usize;
         for line in wrap_lines(stdout, max_cols) {
-            scene.text(px, cur_y, line, theme::FG_MUTED, false, false, clip_id);
+            scene.text(px, cur_y, line, theme::INK_2, false, false, clip_id);
             cur_y += m.ch + 2.0;
         }
         cur_y += 4.0;
     }
 
     if !matches!(value, Value::Nothing) {
-        cur_y += layout_value(scene, block, value, px, cur_y, inner_w, m, clip_id, 0);
+        cur_y += layout_value(scene, block, value, px, cur_y, inner_w, m, clip_id, 0, now_ns);
     }
 
     let end_y = cur_y.max(y0 + m.ch);
@@ -985,8 +1215,8 @@ fn layout_inline_terminal(
     let total_h = show_rows as f32 * m.ch + pad * 2.0;
     let x1 = x0 + width;
 
-    scene.round_rect(x0, y0, x1, y0 + total_h, 6.0, theme::BG_WELL, 1.0, theme::HAIRLINE, clip_id);
-    let inner_clip = scene.push_clip(x0 + 1.0, y0 + 1.0, x1 - 1.0, y0 + total_h - 1.0, 5.0);
+    scene.round_rect(x0, y0, x1, y0 + total_h, 8.0, theme::BG_SURFACE, 1.0, theme::LINE, clip_id);
+    let inner_clip = scene.push_clip(x0 + 1.0, y0 + 1.0, x1 - 1.0, y0 + total_h - 1.0, 7.0);
     draw_terminal_rows(
         scene,
         term,
@@ -1013,7 +1243,7 @@ pub fn layout_fullscreen_terminal(
     let bg0 = colors
         .background
         .get()
-        .unwrap_or(VtRgb { r: 0x09, g: 0x09, b: 0x0b });
+        .unwrap_or(VtRgb { r: 0x10, g: 0x10, b: 0x11 });
     scene.clear_color = [
         f32::from(bg0.r) / 255.0,
         f32::from(bg0.g) / 255.0,
@@ -1043,12 +1273,12 @@ fn draw_terminal_rows(
     let fg0 = colors
         .foreground
         .get()
-        .unwrap_or(VtRgb { r: 0xd4, g: 0xd4, b: 0xdc });
+        .unwrap_or(VtRgb { r: 0xeb, g: 0xea, b: 0xe6 });
     let bg0 = colors
         .background
         .get()
-        .unwrap_or(VtRgb { r: 0x0d, g: 0x0d, b: 0x10 });
-    let cursor_c = colors.cursor.get().unwrap_or(VtRgb { r: 0xf4, g: 0xf4, b: 0xf7 });
+        .unwrap_or(VtRgb { r: 0x14, g: 0x14, b: 0x15 });
+    let cursor_c = colors.cursor.get().unwrap_or(VtRgb { r: 0xeb, g: 0xea, b: 0xe6 });
     let screen = term.screen();
     let top = screen.pages.active_top();
     let (cx, cy) = (screen.cursor.x, screen.cursor.y);
@@ -1130,7 +1360,8 @@ fn resolve_vt_color(c: VtColor, colors: &Colors, fallback: VtRgb, bold_bright: b
     }
 }
 
-/// Sleek full-width docked bottom composer separated by a single razor hairline.
+/// Sleek `ix.dev/blaze` bottom composer: quiet path + git-branch label above a recessed
+/// rounded `$ ...` input bar (`#141415` fill, `1px solid #28282a`, `radius: 10px`).
 #[allow(clippy::too_many_arguments)]
 fn layout_composer(
     scene: &mut Scene,
@@ -1139,37 +1370,37 @@ fn layout_composer(
     vw: f32,
     y0: f32,
     y1: f32,
+    box_h: f32,
     m: CellMetrics,
     cursor_visible: bool,
 ) {
     let trimmed = editor.text.trim_start();
     let is_rust_mode = trimmed.starts_with("rust") || trimmed.starts_with(":rs");
 
-    scene.round_rect(0.0, y0, vw, y1, 0.0, theme::BG_COMPOSER, 0.0, [0.0; 4], 0);
-    let top_line_col = if is_rust_mode {
-        theme::rgba(0xcf, 0x97, 0x72, 0.35)
-    } else {
-        theme::HAIRLINE
-    };
-    scene.line(0.0, y0 + 0.5, vw, y0 + 0.5, 1.0, top_line_col, 0);
+    scene.round_rect(0.0, y0, vw, y1, 0.0, theme::BG_CANVAS, 0.0, [0.0; 4], 0);
+    scene.line(0.0, y0 + 0.5, vw, y0 + 0.5, 1.0, theme::LINE_FAINT, 0);
 
     let px = OUTER_PAD_X;
     let x1 = (vw - OUTER_PAD_X).max(px + 160.0);
-    let prompt_y = y0 + 11.0;
+    let label_y = y0 + 6.0;
+    let icon_s = 11.5;
 
-    // Quiet prompt context row: path + git branch (no boxes).
+    // Quiet prompt metadata above the input box (matching `Install blaze · 13 MiB`).
     let mut cx = px;
+    let iy = label_y + (m.ch - icon_s) * 0.5;
+    draw_icon(scene, Icon::Folder, cx, iy, icon_s, theme::SERIES_BLUE, 0);
+    cx += icon_s + 6.0;
     let max_cwd = (((x1 - px) * 0.55) / m.cw).floor().max(16.0) as usize;
     let cwd_lbl = truncate_chars(&prompt.cwd_display, max_cwd);
-    scene.text(cx, prompt_y, &cwd_lbl, theme::FG_MUTED, false, false, 0);
+    scene.text(cx, label_y, &cwd_lbl, theme::INK_3, false, false, 0);
     cx += cwd_lbl.chars().count() as f32 * m.cw;
 
     if let Some(branch) = &prompt.git_branch {
         let dirty = prompt.git_dirty.map(|d| d.dirty).unwrap_or(false);
         cx += 16.0;
-        let dot_c = if dirty { theme::ACCENT_SAND } else { theme::ACCENT_SAGE };
-        scene.circle(cx + 3.0, prompt_y + m.ch * 0.5, 2.5, dot_c, 0);
-        cx += 11.0;
+        let bcol = if dirty { theme::FIRE } else { theme::INK_4 };
+        draw_icon(scene, Icon::Branch, cx, iy + 0.5, icon_s - 0.5, bcol, 0);
+        cx += icon_s + 5.0;
         let lbl = if prompt.git_detached {
             format!("@{branch}")
         } else if dirty {
@@ -1177,11 +1408,10 @@ fn layout_composer(
         } else {
             branch.clone()
         };
-        let txt_c = if dirty { theme::ACCENT_SAND } else { theme::FG_MUTED };
-        scene.text(cx, prompt_y, lbl, txt_c, false, false, 0);
+        let txt_c = if dirty { theme::FIRE } else { theme::INK_3 };
+        scene.text(cx, label_y, lbl, txt_c, false, false, 0);
     }
 
-    // Quiet right-aligned status.
     let right_txt = if is_rust_mode {
         "rust · blaze run".to_owned()
     } else if prompt.last_exit != 0 {
@@ -1193,29 +1423,35 @@ fn layout_composer(
     };
     if !right_txt.is_empty() {
         let right_col = if is_rust_mode {
-            theme::ACCENT_COPPER
+            theme::FIRE
         } else if prompt.last_exit != 0 {
-            theme::ACCENT_CORAL
+            theme::DANGER
         } else {
-            theme::FG_DIM
+            theme::INK_4
         };
         let rw = right_txt.chars().count() as f32 * m.cw;
-        scene.text(x1 - rw, prompt_y, right_txt, right_col, false, false, 0);
+        scene.text(x1 - rw, label_y, right_txt, right_col, false, false, 0);
     }
 
-    // Active command input row.
-    let input_y = y0 + 36.0;
-    let chev_col = if is_rust_mode {
-        theme::ACCENT_COPPER
-    } else if prompt.last_exit != 0 {
-        theme::ACCENT_CORAL
-    } else {
-        theme::FG_BRIGHT
-    };
-    scene.text(px, input_y, "❯", chev_col, false, false, 0);
+    // Recessed rounded command box (`#141415` + `1px solid #28282a`, radius 10px).
+    let box_y0 = y0 + 28.0;
+    let box_y1 = (box_y0 + box_h).min(y1 - 12.0);
+    let box_border = if is_rust_mode { theme::FIRE } else { theme::LINE };
+    scene.round_rect(px, box_y0, x1, box_y1, 10.0, theme::BG_SURFACE, 1.0, box_border, 0);
 
-    let text_x = px + 2.2 * m.cw;
-    let text_clip = scene.push_clip(text_x - 2.0, input_y - 2.0, x1, y1 - 6.0, 0.0);
+    let input_y = box_y0 + 11.0;
+    let inner_x = px + 16.0;
+    let prompt_col = if is_rust_mode {
+        theme::FIRE
+    } else if prompt.last_exit != 0 {
+        theme::DANGER
+    } else {
+        theme::INK_4
+    };
+    scene.text(inner_x, input_y, "$", prompt_col, false, false, 0);
+
+    let text_x = inner_x + 2.2 * m.cw;
+    let text_clip = scene.push_clip(text_x - 2.0, box_y0 + 2.0, x1 - 14.0, box_y1 - 2.0, 0.0);
     let line_step = m.ch + 4.0;
 
     if let Some((sel_s, sel_e)) = editor.selection_range() {
@@ -1241,22 +1477,22 @@ fn layout_composer(
             text_x,
             input_y,
             "command, pipeline, or rust { ... }",
-            theme::FG_DIM,
+            theme::INK_4,
             false,
             false,
             text_clip,
         );
     } else {
         let spans = editor.highlight_spans();
-        layout_highlighted_source(scene, &editor.text, &spans, text_x, input_y, x1, m, text_clip);
+        layout_highlighted_source(scene, &editor.text, &spans, text_x, input_y, x1 - 16.0, m, text_clip);
     }
 
-    // Crisp 1.5px pure-white vertical beam cursor.
     if cursor_visible {
         let (cline, ccol) = editor.cursor_line_col();
         let cur_x = text_x + ccol as f32 * m.cw;
         let cur_y = input_y + cline as f32 * line_step;
-        scene.over_round_rect(cur_x, cur_y + 1.0, cur_x + 1.5, cur_y + m.ch - 1.0, 0.75, theme::ACCENT_WHITE, text_clip);
+        let cur_col = if is_rust_mode { theme::FIRE } else { theme::INK_1 };
+        scene.over_round_rect(cur_x, cur_y + 1.0, cur_x + 1.6, cur_y + m.ch - 1.0, 0.8, cur_col, text_clip);
     }
 }
 
@@ -1293,7 +1529,7 @@ fn layout_completion_popup(
         8.0,
         theme::BG_POPUP,
         1.0,
-        theme::HAIRLINE_STRONG,
+        theme::LINE_STRONG,
         0,
     );
 
@@ -1316,13 +1552,13 @@ fn layout_completion_popup(
             );
         }
         let (tag, tag_col) = match item.kind {
-            CompletionKind::Builtin => ("cmd", theme::FG_MUTED),
-            CompletionKind::Def => ("def", theme::ACCENT_ICE),
-            CompletionKind::Keyword => ("kw ", theme::FG_MUTED),
-            CompletionKind::Flag => ("flg", theme::ACCENT_SAND),
-            CompletionKind::Variable => ("var", theme::ACCENT_ICE),
-            CompletionKind::Dir => ("dir", theme::ACCENT_SAGE),
-            CompletionKind::File => ("fil", theme::FG_DIM),
+            CompletionKind::Builtin => ("cmd", theme::INK_3),
+            CompletionKind::Def => ("def", theme::FIRE),
+            CompletionKind::Keyword => ("kw ", theme::INK_3),
+            CompletionKind::Flag => ("flg", theme::INK_3),
+            CompletionKind::Variable => ("var", theme::INK_2),
+            CompletionKind::Dir => ("dir", theme::SERIES_BLUE),
+            CompletionKind::File => ("fil", theme::INK_3),
         };
         let ty = ry + (row_h - m.ch) * 0.5;
         scene.overlay_text_run(x0 + 12.0, ty, tag, tag_col, false, false, 0);
@@ -1332,7 +1568,7 @@ fn layout_completion_popup(
             label_x,
             ty,
             &label_txt,
-            if is_sel { theme::FG_BRIGHT } else { theme::FG_PRIMARY },
+            if is_sel { theme::INK_1 } else { theme::INK_2 },
             is_sel,
             false,
             0,
@@ -1341,7 +1577,7 @@ fn layout_completion_popup(
         let detail_x = x0 + 12.0 + 29.0 * m.cw;
         let detail_max = ((x0 + popup_w - 12.0 - detail_x) / m.cw).floor().max(6.0) as usize;
         let detail_txt = truncate_chars(&item.detail, detail_max);
-        scene.overlay_text_run(detail_x, ty, detail_txt, theme::FG_DIM, false, false, 0);
+        scene.overlay_text_run(detail_x, ty, detail_txt, theme::INK_4, false, false, 0);
 
         scene.push_hit(
             HitRect::new(x0 + 5.0, ry, x0 + popup_w - 5.0, ry + row_h),
@@ -1371,20 +1607,20 @@ fn layout_reverse_search_overlay(
         8.0,
         theme::BG_POPUP,
         1.0,
-        theme::HAIRLINE_STRONG,
+        theme::LINE_STRONG,
         0,
     );
     let ty = py0 + (h - m.ch) * 0.5;
     let prefix = format!("history  {}  │  ", rs.query);
-    scene.overlay_text_run(x0 + 14.0, ty, &prefix, theme::FG_MUTED, false, false, 0);
+    scene.overlay_text_run(x0 + 14.0, ty, &prefix, theme::INK_3, false, false, 0);
     let mx = x0 + 14.0 + prefix.chars().count() as f32 * m.cw;
     let max_m = ((x1 - 14.0 - mx) / m.cw).floor().max(8.0) as usize;
     match &rs.matched_text {
         Some(matched) => {
-            scene.overlay_text_run(mx, ty, truncate_chars(matched, max_m), theme::FG_BRIGHT, false, false, 0);
+            scene.overlay_text_run(mx, ty, truncate_chars(matched, max_m), theme::INK_1, false, false, 0);
         }
         None => {
-            scene.overlay_text_run(mx, ty, "no match", theme::FG_DIM, false, true, 0);
+            scene.overlay_text_run(mx, ty, "no match", theme::INK_4, false, true, 0);
         }
     }
 }
