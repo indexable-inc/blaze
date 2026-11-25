@@ -24,6 +24,7 @@ extern crate std;
 
 mod error;
 mod eval;
+mod intrinsics;
 mod world;
 
 #[cfg(test)]

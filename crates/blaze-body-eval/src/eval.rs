@@ -18,19 +18,21 @@ use blaze_body::{
     AggregateKind, AssertKind, BinOp, Block, Callee, CalleeId, CastKind, Const, ConstKind, Local, Operand, Ops,
     Place, Proj, Stmt, StmtKind, UnOp, Value, Verified,
 };
-use blaze_build::{BuildError, ground, instance_key};
+use blaze_build::vtable::{VtableKey, VtableRef, vtable_key};
+use blaze_build::{BuildError, FnTrait, Instance, InstanceKey, closure_method_key_args, ground, instance_key};
 use blaze_consteval::arith::{self, Plant};
 use blaze_consteval::layout::{Stop as LayoutStop, Tag};
 use blaze_consteval::mem::{AllocId, Memory, Origin, PTR, Pointer, Scalar};
 use blaze_consteval::{
-    Answer, DataAlloc, DataRecord, DataReloc, DataTarget, FnKind, Intrinsic, Layout, LayoutCx,
-    LayoutFacts, Limits, Need, NeedKind, Op, RecordKey, Refusal, eval_discriminant,
+    Answer, ConstFn, ConstRecord, ConstVtable, DataAlloc, DataRecord, DataReloc, DataTarget, FnKind,
+    FnTraitMethod, Intrinsic, Layout, LayoutCx, LayoutFacts, Limits, Need, NeedKind, Op, RecordKey, Refusal,
+    eval_discriminant,
 };
 use blaze_own::{Alloc, Vec};
-use blaze_typeck::{FloatTy, ItemKey, List, PNode, PTy, PTys, PortableTys};
+use blaze_typeck::{AdtKind, ExprId, FloatTy, ItemKey, List, Mutbl, PNode, PTy, PTys, PortableTys};
 
 use crate::error::{EvalError, Fault, Row};
-use crate::world::{BodyWorld, DropGlue};
+use crate::world::{Bodied, BodyWorld, DropGlue};
 
 /// Evaluates the body of `item` at `args` (a list of `ground`; empty for a constant with no
 /// generics) to its value, interned in blaze-build's data form: allocation 0 is the value,
@@ -54,6 +56,13 @@ pub fn eval_body<'w, 'a, W: BodyWorld, L: Layout>(
         mem: Memory::new_in(limits.memory, alloc),
         frames: Vec::new_in(alloc),
         consts: Vec::new_in(alloc),
+        promoted: Vec::new_in(alloc),
+        anons: Vec::new_in(alloc),
+        statics: Vec::new_in(alloc),
+        fns: Vec::new_in(alloc),
+        vtables: Vec::new_in(alloc),
+        type_names: Vec::new_in(alloc),
+        type_ids: Vec::new_in(alloc),
         bytes_consts: Vec::new_in(alloc),
         proj_scratch: Vec::new_in(alloc),
         body_live: Vec::new_in(alloc),
@@ -69,13 +78,21 @@ pub fn eval_body<'w, 'a, W: BodyWorld, L: Layout>(
         Ok(rec) => Ok(Answer::Done(rec)),
         Err(Stop::Need(n)) => Ok(Answer::Need(n)),
         Err(Stop::Fault(fault)) => Err(EvalError { constant: item, at: m.at, fault }),
+        Err(Stop::SubFrame) => Err(EvalError {
+            constant: item,
+            at: m.at,
+            fault: Fault::Refused(malformed("unhandled sub-body frame transition")),
+        }),
     }
 }
 
 /// How a step stopped the run.
-enum Stop<'a> {
+pub(crate) enum Stop<'a> {
     Fault(Fault<'a>),
     Need(Need),
+    /// A sub-body (`Promoted` / `Anon`) was pushed onto the frame stack; resume the main loop
+    /// without advancing the caller's row so it retries once the sub-body caches its value.
+    SubFrame,
 }
 
 impl<'a, 'b: 'a> From<Refusal<'b>> for Stop<'a> {
@@ -84,17 +101,17 @@ impl<'a, 'b: 'a> From<Refusal<'b>> for Stop<'a> {
     }
 }
 
-type R<'a, T> = Result<T, Stop<'a>>;
+pub(crate) type R<'a, T> = Result<T, Stop<'a>>;
 
-fn malformed(what: &'static str) -> Refusal<'static> {
+pub(crate) fn malformed(what: &'static str) -> Refusal<'static> {
     Refusal::Malformed { what }
 }
 
-fn unsupported(what: &'static str) -> Refusal<'static> {
+pub(crate) fn unsupported(what: &'static str) -> Refusal<'static> {
     Refusal::Unsupported { what }
 }
 
-fn layout_stop<'a>(s: LayoutStop) -> Stop<'a> {
+pub(crate) fn layout_stop<'a>(s: LayoutStop) -> Stop<'a> {
     match s {
         LayoutStop::Refused(r) => r.into(),
         // An explicit discriminant's constant: its record first.
@@ -102,7 +119,7 @@ fn layout_stop<'a>(s: LayoutStop) -> Stop<'a> {
     }
 }
 
-fn build_refusal(e: BuildError) -> Refusal<'static> {
+pub(crate) fn build_refusal(e: BuildError) -> Refusal<'static> {
     match e {
         BuildError::Projection { trait_, name } => Refusal::Projection { trait_, name },
         _ => malformed("a body's type that does not ground at the frame's arguments"),
@@ -303,84 +320,124 @@ fn ground_own_list(cx: &mut GroundCx<'_, '_, '_>, l: List, depth: u32) -> Result
     cx.g.intern_list(&out).map_err(|_| malformed("a ground list the table cannot hold"))
 }
 
-/// Where a call returns to: the caller's destination, and the block after the call.
+/// Identity of a verified body for caching `StorageLive` scans and grounded local types.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BodyId {
+    Item(ItemKey),
+    Promoted(ItemKey, ExprId),
+    Anon(ItemKey, ExprId),
+}
+
+/// What a frame returns to when it hits `StmtKind::Return`.
 #[derive(Clone, Copy)]
-struct Ret {
-    dest: Option<Pointer>,
-    target: Option<Block>,
+enum Ret {
+    Call { dest: Option<Pointer>, target: Option<Block> },
+    Promoted { owner: ItemKey, borrow: ExprId, args: List },
+    Anon { owner: ItemKey, block: ExprId, args: List },
 }
 
 /// One activation.
-struct Frame<'w, 'a> {
-    item: ItemKey,
-    body: Verified<'w>,
-    types: PTys<'w>,
+pub(crate) struct Frame<'w, 'a> {
+    pub(crate) item: ItemKey,
+    pub(crate) body: Verified<'w>,
+    pub(crate) types: PTys<'w>,
+    /// The ground arguments list handle in `ground`.
+    pub(crate) args_list: List,
     /// The ground arguments, a copy of the list `ground` holds.
-    args: Vec<PTy, Alloc<'a>>,
+    pub(crate) args: Vec<PTy, Alloc<'a>>,
     /// Slice `(start, len)` in `Machine::cached_tys` holding each local's ground type.
-    tys: (u32, u32),
+    pub(crate) tys: (u32, u32),
     /// Each local's allocation while it is live.
-    locals: Vec<Option<AllocId>, Alloc<'a>>,
+    pub(crate) locals: Vec<Option<AllocId>, Alloc<'a>>,
     /// The row run next.
-    at: Stmt,
+    pub(crate) at: Stmt,
     ret: Ret,
 }
 
-/// A place: where it is, its metadata if unsized, its ground type, the variant a downcast
-/// selected (0 otherwise).
+/// A place: where it is, its metadata if unsized (slice length or vtable pointer), its ground
+/// type, the variant a downcast selected (0 otherwise).
 #[derive(Clone, Copy)]
-struct Pl {
-    ptr: Pointer,
-    meta: Option<u64>,
-    ty: PTy,
-    variant: u32,
+pub(crate) struct Pl {
+    pub(crate) ptr: Pointer,
+    pub(crate) meta: Option<Scalar>,
+    pub(crate) ty: PTy,
+    pub(crate) variant: u32,
 }
 
 /// An operand's value: in memory (a place's bytes, or a temporary made for a constant), or
 /// a scalar constant's bits.
 #[derive(Clone, Copy)]
-enum Src {
+pub(crate) enum Src {
     At(Pointer),
     Temp(AllocId),
     Imm(u128),
 }
 
 #[derive(Clone, Copy)]
-struct Opnd {
-    src: Src,
-    ty: PTy,
+pub(crate) struct Opnd {
+    pub(crate) src: Src,
+    pub(crate) ty: PTy,
 }
 
-struct Machine<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> {
-    world: &'w W,
-    layout: &'g mut L,
-    ground: &'g mut PortableTys<'t>,
-    mem: Memory<Alloc<'a>>,
-    frames: Vec<Frame<'w, 'a>, Alloc<'a>>,
+#[derive(Clone, Copy)]
+pub(crate) struct StaticSlot {
+    pub(crate) id: AllocId,
+    pub(crate) loaded: bool,
+    pub(crate) mut_static: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum TypeIdTarget {
+    Ty(PTy),
+    Field { base: PTy, variant: u32, field: u32 },
+}
+
+pub(crate) struct Machine<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> {
+    pub(crate) world: &'w W,
+    pub(crate) layout: &'g mut L,
+    pub(crate) ground: &'g mut PortableTys<'t>,
+    pub(crate) mem: Memory<Alloc<'a>>,
+    pub(crate) frames: Vec<Frame<'w, 'a>, Alloc<'a>>,
     /// Constants' records loaded into memory this run, by item and ground arguments: a
     /// constant read in a loop is loaded once (rule 77).
-    consts: Vec<(ItemKey, List, AllocId), Alloc<'a>>,
+    pub(crate) consts: Vec<(ItemKey, List, AllocId), Alloc<'a>>,
+    /// Promoted borrows cached by `(owner, borrow, args)`: `(data_alloc, body_ret_ty)`.
+    /// `body_ret_ty` is `Some(t)` when produced by a promoted body so `konst` knows whether `_0`
+    /// already holds the reference or the pointee value; `None` for a `promoted_record`.
+    pub(crate) promoted: Vec<(ItemKey, ExprId, List, AllocId, Option<PTy>), Alloc<'a>>,
+    /// Inline `const { .. }` blocks cached by `(owner, block, args)`.
+    pub(crate) anons: Vec<(ItemKey, ExprId, List, AllocId), Alloc<'a>>,
+    /// Static allocations cached by item, tracking load status and `static mut`.
+    pub(crate) statics: Vec<(ItemKey, StaticSlot), Alloc<'a>>,
+    /// Deduplicated fn pointer allocations and their known `ConstFn` targets.
+    pub(crate) fns: Vec<(InstanceKey, Option<ConstFn>, AllocId), Alloc<'a>>,
+    /// Deduplicated vtable allocations and their known `ConstVtable` metadata.
+    pub(crate) vtables: Vec<(VtableKey, Option<ConstVtable>, AllocId), Alloc<'a>>,
+    /// Cached `type_name::<T>()` data allocations.
+    pub(crate) type_names: Vec<(PTy, AllocId, u64), Alloc<'a>>,
+    /// Recorded `TypeId` and `FieldRepresentingType` hashes for reflection intrinsics.
+    pub(crate) type_ids: Vec<(u128, TypeIdTarget), Alloc<'a>>,
     /// Byte-string / string literal data allocations cached by `(item, const_id)` so loops
     /// never leak `Origin::Data` allocations.
-    bytes_consts: Vec<(ItemKey, Const, AllocId), Alloc<'a>>,
+    pub(crate) bytes_consts: Vec<(ItemKey, Const, AllocId), Alloc<'a>>,
     /// Reused projection scratch stack for `place()` (zero per-call heap allocations).
-    proj_scratch: Vec<Proj, Alloc<'a>>,
-    /// Cached per-body `StorageLive` scan: `(item, start, len)` indexing `live_bits`.
-    body_live: Vec<(ItemKey, u32, u32), Alloc<'a>>,
+    pub(crate) proj_scratch: Vec<Proj, Alloc<'a>>,
+    /// Cached per-body `StorageLive` scan: `(body_id, start, len)` indexing `live_bits`.
+    body_live: Vec<(BodyId, u32, u32), Alloc<'a>>,
     live_bits: Vec<bool, Alloc<'a>>,
-    /// Cached per-instance grounded local types: `(item, args, start, len)` indexing `cached_tys`.
-    inst_tys: Vec<(ItemKey, List, u32, u32), Alloc<'a>>,
+    /// Cached per-instance grounded local types: `(body_id, args, start, len)` indexing `cached_tys`.
+    inst_tys: Vec<(BodyId, List, u32, u32), Alloc<'a>>,
     cached_tys: Vec<PTy, Alloc<'a>>,
-    limits: Limits,
-    steps: u64,
-    alloc: Alloc<'a>,
+    pub(crate) limits: Limits,
+    pub(crate) steps: u64,
+    pub(crate) alloc: Alloc<'a>,
     /// The row running: what an error names.
-    at: Option<Row>,
+    pub(crate) at: Option<Row>,
 }
 
 impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
     fn run(&mut self, item: ItemKey, args: List) -> R<'a, DataRecord<Alloc<'a>>> {
-        let root = self.frame(item, args, Ret { dest: None, target: None })?;
+        let root = self.frame(item, args, Ret::Call { dest: None, target: None })?;
         if root.body.args() != 0 {
             return Err(malformed("a constant's body that takes arguments").into());
         }
@@ -391,8 +448,10 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
             let (body, item, at) = (f.body, f.item, f.at);
             let row = body.stmt(at);
             self.at = Some(Row { body: item, stmt: at, span: row.span });
-            if let Some(done) = self.step(row.kind)? {
-                return Ok(done);
+            match self.step(row.kind) {
+                Ok(Some(done)) => return Ok(done),
+                Ok(None) | Err(Stop::SubFrame) => {}
+                Err(e) => return Err(e),
             }
         }
     }
@@ -405,12 +464,67 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
         Ok(())
     }
 
-    fn top(&self) -> R<'a, &Frame<'w, 'a>> {
+    pub(crate) fn top(&self) -> R<'a, &Frame<'w, 'a>> {
         self.frames.last().ok_or(Stop::from(malformed("a row run with no frame")))
     }
 
     fn top_mut(&mut self) -> R<'a, &mut Frame<'w, 'a>> {
         self.frames.last_mut().ok_or(Stop::from(malformed("a row run with no frame")))
+    }
+
+    // ---- Checked memory helpers (static load & mut_static guards) ----
+
+    pub(crate) fn is_mut_static_alloc(&self, id: AllocId) -> bool {
+        self.statics.iter().any(|(_, s)| s.id == id && s.mut_static)
+    }
+
+    pub(crate) fn ensure_loaded(&self, id: AllocId) -> R<'a, ()> {
+        if let Some(&(item, slot)) = self.statics.iter().find(|(_, s)| s.id == id) {
+            if slot.mut_static {
+                return Err(Refusal::MutableStatic { item }.into());
+            }
+            if !slot.loaded {
+                return Err(Stop::Need(Need { kind: NeedKind::Value, item, args: List::EMPTY }));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn alloc_len(&self, id: AllocId) -> R<'a, u64> {
+        self.ensure_loaded(id)?;
+        let bytes = self.mem.bytes(id)?;
+        u64::try_from(bytes.len()).map_err(|_| malformed("allocation length past u64").into())
+    }
+
+    pub(crate) fn mem_read(&self, p: Pointer, size: u64) -> R<'a, Scalar> {
+        self.ensure_loaded(p.alloc)?;
+        Ok(self.mem.read(p, size)?)
+    }
+
+    pub(crate) fn mem_read_bytes(&self, p: Pointer, size: u64) -> R<'a, &[u8]> {
+        self.ensure_loaded(p.alloc)?;
+        Ok(self.mem.read_bytes(p, size)?)
+    }
+
+    pub(crate) fn mem_write(&mut self, p: Pointer, size: u64, v: Scalar) -> R<'a, ()> {
+        self.ensure_loaded(p.alloc)?;
+        Ok(self.mem.write(p, size, v)?)
+    }
+
+    pub(crate) fn mem_copy(&mut self, src: Pointer, dst: Pointer, size: u64) -> R<'a, ()> {
+        self.ensure_loaded(src.alloc)?;
+        self.ensure_loaded(dst.alloc)?;
+        Ok(self.mem.copy(src, dst, size)?)
+    }
+
+    pub(crate) fn mem_deinit(&mut self, p: Pointer, size: u64) -> R<'a, ()> {
+        self.ensure_loaded(p.alloc)?;
+        Ok(self.mem.deinit(p, size)?)
+    }
+
+    pub(crate) fn mem_memset(&mut self, p: Pointer, size: u64, byte: u8) -> R<'a, ()> {
+        self.ensure_loaded(p.alloc)?;
+        Ok(self.mem.memset(p, size, byte)?)
     }
 
     // ---- Rows ----
@@ -446,7 +560,7 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
                     return Err(unsupported("`deinit` of an unsized place").into());
                 }
                 let size = self.size(d.ty)?;
-                self.mem.deinit(d.ptr, size)?;
+                self.mem_deinit(d.ptr, size)?;
                 self.next()?;
             }
             StmtKind::Goto(b) => self.jump(b)?,
@@ -508,7 +622,8 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
                 let (Some(len), Some(index)) = (ops.next(), ops.next()) else {
                     return Err(malformed("a bounds assert without its length and index").into());
                 };
-                let (len, index) = (self.int(len)? as u64, self.int(index)? as u64);
+                let len = u64::try_from(self.int(len)?).map_err(|_| malformed("a bounds assert length past u64"))?;
+                let index = u64::try_from(self.int(index)?).map_err(|_| malformed("a bounds assert index past u64"))?;
                 Refusal::IndexOutOfBounds { index, len }
             }
             AssertKind::ResumedAfterReturn | AssertKind::ResumedAfterPanic => {
@@ -523,69 +638,97 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
     /// A frame for `item` at `args` (a list of the ground table), its locals allocated but
     /// for those the body makes live itself.
     fn frame(&mut self, item: ItemKey, args: List, ret: Ret) -> R<'a, Frame<'w, 'a>> {
-        if self.frames.len() >= self.limits.depth as usize {
-            return Err(Refusal::CallDepth { limit: self.limits.depth }.into());
-        }
         let b = match self.world.verified(item) {
             Ok(Some(b)) => b,
             Ok(None) => return Err(Refusal::NotConstFn { item }.into()),
             Err(_) => return Err(Stop::Need(Need { kind: NeedKind::Body, item, args })),
         };
+        self.frame_from_bodied(BodyId::Item(item), b, args, ret)
+    }
+
+    fn frame_from_bodied(&mut self, body_id: BodyId, b: Bodied<'w>, args: List, ret: Ret) -> R<'a, Frame<'w, 'a>> {
+        if self.frames.len() >= usize::try_from(self.limits.depth).unwrap_or(usize::MAX) {
+            return Err(Refusal::CallDepth { limit: self.limits.depth }.into());
+        }
         let mut argv: Vec<PTy, Alloc<'a>> = Vec::new_in(self.alloc);
         argv.extend_from_slice(self.ground.view().list(args).map_err(|_| malformed("a call's arguments past the ground table"))?);
-        let n = b.body.locals() as usize;
+        let n = usize::try_from(b.body.locals()).map_err(|_| malformed("local count overflow"))?;
         // Scan StorageLive statements once per body (avoids O(stmts) scan on every recursive call).
-        let (live_start, live_len) = match self.body_live.iter().find(|&&(k, _, _)| k == item) {
-            Some(&(_, s, l)) => (s as usize, l as usize),
+        let (live_start, live_len) = match self.body_live.iter().find(|&&(k, _, _)| k == body_id) {
+            Some(&(_, s, l)) => (usize::try_from(s).unwrap_or(0), usize::try_from(l).unwrap_or(0)),
             None => {
                 let s = self.live_bits.len();
                 self.live_bits.resize(s + n, false);
                 for st in 0..b.body.stmts() {
                     if let StmtKind::StorageLive(l) = b.body.stmt(Stmt(st)).kind
-                        && let Some(bit) = self.live_bits.get_mut(s + l.0 as usize)
+                        && let Ok(li) = usize::try_from(l.0)
+                        && let Some(bit) = self.live_bits.get_mut(s + li)
                     {
                         *bit = true;
                     }
                 }
-                self.body_live.push((item, s as u32, n as u32));
+                let s32 = u32::try_from(s).map_err(|_| malformed("live_bits overflow"))?;
+                let n32 = u32::try_from(n).map_err(|_| malformed("locals overflow"))?;
+                self.body_live.push((body_id, s32, n32));
                 (s, n)
             }
         };
-        // Ground local types once per `(item, args)` instance.
-        let (tys_start, tys_len) = match self.inst_tys.iter().find(|&&(k, a, _, _)| k == item && a == args) {
+        // Ground local types once per `(body_id, args)` instance.
+        let (tys_start, tys_len) = match self.inst_tys.iter().find(|&&(k, a, _, _)| k == body_id && a == args) {
             Some(&(_, _, s, l)) => (s, l),
             None => {
-                let s = self.cached_tys.len() as u32;
-                for l in 0..n {
-                    let decl = b.body.local(Local(l as u32));
+                let s = u32::try_from(self.cached_tys.len()).map_err(|_| malformed("cached_tys overflow"))?;
+                for l in 0..b.body.locals() {
+                    let decl = b.body.local(Local(l));
                     let gty = ground_in(b.body, b.types, &argv, decl.ty, &mut *self.ground, self.alloc, self.world)?;
                     self.cached_tys.push(gty);
                 }
-                self.inst_tys.push((item, args, s, n as u32));
-                (s, n as u32)
+                let n32 = b.body.locals();
+                self.inst_tys.push((body_id, args, s, n32));
+                (s, n32)
             }
         };
+        let tys_start_usize = usize::try_from(tys_start).unwrap_or(0);
         let mut locals: Vec<Option<AllocId>, Alloc<'a>> = Vec::with_capacity_in(n, self.alloc);
         for l in 0..n {
             let needs_live = l < live_len && self.live_bits.get(live_start + l).copied().unwrap_or(false);
             if l < live_len && !needs_live {
-                let Some(&ty) = self.cached_tys.get(tys_start as usize + l) else {
+                let Some(&ty) = self.cached_tys.get(tys_start_usize + l) else {
                     return Err(malformed("a local past the frame").into());
                 };
-                locals.push(Some(self.allocate_local(ty)?));
+                match self.allocate_local(ty) {
+                    Ok(id) => locals.push(Some(id)),
+                    Err(e) => {
+                        for lid in locals.iter().flatten() {
+                            self.mem.kill(*lid);
+                        }
+                        return Err(e);
+                    }
+                }
             } else {
                 locals.push(None);
             }
         }
-        Ok(Frame { item, body: b.body, types: b.types, args: argv, tys: (tys_start, tys_len), locals, at: b.body.entry(), ret })
+        Ok(Frame {
+            item: b.item,
+            body: b.body,
+            types: b.types,
+            args_list: args,
+            args: argv,
+            tys: (tys_start, tys_len),
+            locals,
+            at: b.body.entry(),
+            ret,
+        })
     }
 
     fn local_ty(&self, f: &Frame<'w, 'a>, i: usize) -> R<'a, PTy> {
-        if i >= f.tys.1 as usize {
+        if i >= usize::try_from(f.tys.1).unwrap_or(0) {
             return Err(malformed("a local past the frame").into());
         }
+        let base = usize::try_from(f.tys.0).unwrap_or(0);
         self.cached_tys
-            .get(f.tys.0 as usize + i)
+            .get(base + i)
             .copied()
             .ok_or_else(|| malformed("a local past the frame").into())
     }
@@ -596,24 +739,52 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
     }
 
     fn storage_live(&mut self, l: Local) -> R<'a, ()> {
+        let idx = usize::try_from(l.0).map_err(|_| malformed("a local past the frame"))?;
         let f = self.top()?;
-        let ty = self.local_ty(f, l.0 as usize)?;
+        let ty = self.local_ty(f, idx)?;
         let id = self.allocate_local(ty)?;
         let slot = self
             .top_mut()?
             .locals
-            .get_mut(l.0 as usize)
+            .get_mut(idx)
             .ok_or(Stop::from(malformed("a local past the frame")))?;
         *slot = Some(id);
         Ok(())
     }
 
     fn storage_dead(&mut self, l: Local) -> R<'a, ()> {
-        let slot = self.top_mut()?.locals.get_mut(l.0 as usize).ok_or(Stop::from(malformed("a local past the frame")))?;
+        let idx = usize::try_from(l.0).map_err(|_| malformed("a local past the frame"))?;
+        let slot = self.top_mut()?.locals.get_mut(idx).ok_or(Stop::from(malformed("a local past the frame")))?;
         if let Some(id) = slot.take() {
             self.mem.kill(id);
         }
         Ok(())
+    }
+
+    fn callee_of_value(&mut self, op: Operand) -> R<'a, (ItemKey, List)> {
+        let o = self.operand(op)?;
+        let res = match self.node(o.ty)? {
+            // A fn item's value is zero-sized: its type names the callee.
+            PNode::FnDef(k, l) => Ok((k, l)),
+            PNode::FnPtr(..) => match self.read(o)? {
+                Scalar::Ptr(p) => {
+                    if p.offset != 0 {
+                        Err(unsupported("a call through an offset fn pointer in a constant").into())
+                    } else if let Origin::Fn(inst) = self.mem.get(p.alloc)?.origin {
+                        match self.fns.iter().find(|&&(k, _, _)| k == inst).and_then(|&(_, cf, _)| cf) {
+                            Some(cf) => Ok((cf.instance.item, cf.instance.args)),
+                            None => Err(unsupported("a call through a fn pointer whose instance is not known").into()),
+                        }
+                    } else {
+                        Err(unsupported("a call through a pointer that is not a fn pointer in a constant").into())
+                    }
+                }
+                Scalar::Int(_) => Err(Refusal::IntAsPointer.into()),
+            },
+            _ => Err(unsupported("a call through a fn pointer in a constant").into()),
+        };
+        self.release(o);
+        res
     }
 
     fn call(&mut self, callee: CalleeId, args: Ops, dest: Option<Place>, target: Option<Block>) -> R<'a, ()> {
@@ -622,15 +793,7 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
             Callee::FnItem { key, args } | Callee::Method { key, args } | Callee::Intrinsic { key, args } => {
                 (key, self.ground_list(args)?)
             }
-            Callee::Value(op) => {
-                let o = self.operand(op)?;
-                self.release(o);
-                match self.node(o.ty)? {
-                    // A fn item's value is zero-sized: its type names the callee.
-                    PNode::FnDef(k, l) => (k, l),
-                    _ => return Err(unsupported("a call through a fn pointer in a constant").into()),
-                }
-            }
+            Callee::Value(op) => self.callee_of_value(op)?,
         };
         // The same two questions the old evaluator asks (machine/code.rs `call`).
         let (item, iargs) = self.resolve(key, gargs)?;
@@ -640,14 +803,27 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
         };
         match self.world.fn_kind(item) {
             FnKind::Const => {
-                let f = self.frame(item, iargs, Ret { dest: d.map(|d| d.ptr), target })?;
+                let f = self.frame(item, iargs, Ret::Call { dest: d.map(|d| d.ptr), target })?;
                 let mut k = 1usize;
                 for op in body.ops(args) {
-                    let id = f.locals.get(k).copied().flatten().ok_or(Stop::from(malformed("a call with more arguments than its callee takes")))?;
-                    self.operand_into(op, Pointer { alloc: id, offset: 0 })?;
+                    let Some(id) = f.locals.get(k).copied().flatten() else {
+                        for lid in f.locals.iter().flatten() {
+                            self.mem.kill(*lid);
+                        }
+                        return Err(malformed("a call with more arguments than its callee takes").into());
+                    };
+                    if let Err(e) = self.operand_into(op, Pointer { alloc: id, offset: 0 }) {
+                        for lid in f.locals.iter().flatten() {
+                            self.mem.kill(*lid);
+                        }
+                        return Err(e);
+                    }
                     k += 1;
                 }
-                if k != f.body.args() as usize + 1 {
+                if k != usize::try_from(f.body.args()).unwrap_or(0) + 1 {
+                    for lid in f.locals.iter().flatten() {
+                        self.mem.kill(*lid);
+                    }
                     return Err(malformed("a call with fewer arguments than its callee takes").into());
                 }
                 self.frames.push(f);
@@ -664,11 +840,80 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
             }
             // The panic's message is not formatted yet (see the report: NOT DONE).
             FnKind::Panic => Err(Refusal::Panic { parts: Vec::new_in(self.alloc) }.into()),
+            FnKind::Intrinsic(Intrinsic::ConstEvalSelect) => self.call_const_eval_select(args, d, target),
             FnKind::Intrinsic(i) => {
                 self.intrinsic(i, iargs, args, d)?;
                 self.jump_opt(target)
             }
         }
+    }
+
+    fn call_const_eval_select(&mut self, args: Ops, d: Option<Pl>, target: Option<Block>) -> R<'a, ()> {
+        let body = self.top()?.body;
+        let mut ops = body.ops(args);
+        let (Some(tuple_op), Some(const_fn_op)) = (ops.next(), ops.next()) else {
+            return Err(malformed("`const_eval_select` arguments").into());
+        };
+        let (key, gargs) = self.callee_of_value(const_fn_op)?;
+        let (item, iargs) = self.resolve(key, gargs)?;
+        let tuple = self.operand(tuple_op)?;
+        let res = (|| -> R<'a, ()> {
+            let PNode::Tuple(parts) = self.node(tuple.ty)? else {
+                return Err(malformed("`const_eval_select` arguments that are not a tuple").into());
+            };
+            let n = usize::try_from(parts.len).map_err(|_| malformed("tuple length overflow"))?;
+            match self.world.fn_kind(item) {
+                FnKind::Const => {
+                    let f = self.frame(item, iargs, Ret::Call { dest: d.map(|d| d.ptr), target })?;
+                    if n != usize::try_from(f.body.args()).unwrap_or(0) {
+                        for lid in f.locals.iter().flatten() {
+                            self.mem.kill(*lid);
+                        }
+                        return Err(malformed("`const_eval_select` argument count mismatch").into());
+                    }
+                    let base_ptr = match tuple.src {
+                        Src::At(p) => Some(p),
+                        Src::Temp(id) => Some(Pointer { alloc: id, offset: 0 }),
+                        Src::Imm(_) => None,
+                    };
+                    for idx in 0..n {
+                        let Some(id) = f.locals.get(idx + 1).copied().flatten() else {
+                            for lid in f.locals.iter().flatten() {
+                                self.mem.kill(*lid);
+                            }
+                            return Err(malformed("`const_eval_select` argument slot missing").into());
+                        };
+                        let fi = u32::try_from(idx).map_err(|_| malformed("tuple index overflow"))?;
+                        let fty = self.field_ty(tuple.ty, 0, fi)?;
+                        let fsize = self.size(fty)?;
+                        if fsize != 0 {
+                            let off = self.field_offset(tuple.ty, 0, fi)?;
+                            let Some(p) = base_ptr else {
+                                for lid in f.locals.iter().flatten() {
+                                    self.mem.kill(*lid);
+                                }
+                                return Err(malformed("`const_eval_select` non-empty tuple as immediate").into());
+                            };
+                            if let Err(e) = self.mem_copy(p.at(off), Pointer { alloc: id, offset: 0 }, fsize) {
+                                for lid in f.locals.iter().flatten() {
+                                    self.mem.kill(*lid);
+                                }
+                                return Err(e);
+                            }
+                        }
+                    }
+                    self.frames.push(f);
+                    Ok(())
+                }
+                FnKind::NotConst => Err(Refusal::NotConstFn { item }.into()),
+                FnKind::UnknownIntrinsic => Err(Refusal::UnknownIntrinsic { item }.into()),
+                FnKind::Missing(fact) => Err(Refusal::FnFact { item, fact }.into()),
+                FnKind::Panic => Err(Refusal::Panic { parts: Vec::new_in(self.alloc) }.into()),
+                _ => Err(unsupported("`const_eval_select` targeting a constructor or intrinsic").into()),
+            }
+        })();
+        self.release(tuple);
+        res
     }
 
     fn resolve(&mut self, item: ItemKey, args: List) -> R<'a, (ItemKey, List)> {
@@ -685,13 +930,33 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
                 if pl.meta.is_some() {
                     return Err(unsupported("a drop of an unsized place in a constant").into());
                 }
-                let f = self.frame(item, args, Ret { dest: None, target: Some(target) })?;
+                let f = self.frame(item, args, Ret::Call { dest: None, target: Some(target) })?;
                 let one = f.locals.get(1).copied().flatten().ok_or(Stop::from(malformed("drop glue that takes no argument")))?;
-                self.mem.write(Pointer { alloc: one, offset: 0 }, PTR, Scalar::Ptr(pl.ptr))?;
+                self.mem_write(Pointer { alloc: one, offset: 0 }, PTR, Scalar::Ptr(pl.ptr))?;
                 self.frames.push(f);
                 Ok(())
             }
         }
+    }
+
+    /// Freezes a sub-body's `_0` allocation into an immutable `Origin::Data` allocation, zeroing
+    /// unwritten padding and verifying that no pointer dangles into a dead local of `f`.
+    fn freeze_sub_result(&mut self, r0: AllocId) -> R<'a, AllocId> {
+        let align = self.mem.get(r0)?.align_log2;
+        let mut bytes: Vec<u8, Alloc<'a>> = Vec::new_in(self.alloc);
+        bytes.extend_from_slice(self.mem.bytes(r0)?);
+        self.mem.zero_unwritten(r0, &mut bytes);
+        let mut relocs: Vec<(u64, AllocId), Alloc<'a>> = Vec::new_in(self.alloc);
+        for &(off, to) in self.mem.relocs(r0)? {
+            if matches!(self.mem.get(to)?.origin, Origin::Local) {
+                return Err(Refusal::Dangling.into());
+            }
+            relocs.push((off, to));
+        }
+        let len = u64::try_from(bytes.len()).map_err(|_| malformed("allocation length overflow"))?;
+        let data_id = self.mem.allocate(len, align, false, Origin::Data)?;
+        self.mem.fill(data_id, &bytes, &relocs)?;
+        Ok(data_id)
     }
 
     /// `return`: the callee's `_0` to the caller's destination, its locals released; the
@@ -702,17 +967,36 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
         if self.frames.is_empty() {
             return Ok(Some(self.intern(r0)?));
         }
-        if let Some(dst) = f.ret.dest {
-            let ty0 = self.local_ty(&f, 0)?;
-            let size = self.size(ty0)?;
-            if size != 0 {
-                self.mem.copy(Pointer { alloc: r0, offset: 0 }, dst, size)?;
+        match f.ret {
+            Ret::Call { dest, target } => {
+                if let Some(dst) = dest {
+                    let ty0 = self.local_ty(&f, 0)?;
+                    let size = self.size(ty0)?;
+                    if size != 0 {
+                        self.mem_copy(Pointer { alloc: r0, offset: 0 }, dst, size)?;
+                    }
+                }
+                for id in f.locals.iter().flatten() {
+                    self.mem.kill(*id);
+                }
+                self.jump_opt(target)?;
+            }
+            Ret::Promoted { owner, borrow, args } => {
+                let ty0 = self.local_ty(&f, 0)?;
+                let data_id = self.freeze_sub_result(r0)?;
+                for id in f.locals.iter().flatten() {
+                    self.mem.kill(*id);
+                }
+                self.promoted.push((owner, borrow, args, data_id, Some(ty0)));
+            }
+            Ret::Anon { owner, block, args } => {
+                let data_id = self.freeze_sub_result(r0)?;
+                for id in f.locals.iter().flatten() {
+                    self.mem.kill(*id);
+                }
+                self.anons.push((owner, block, args, data_id));
             }
         }
-        for id in f.locals.iter().flatten() {
-            self.mem.kill(*id);
-        }
-        self.jump_opt(f.ret.target)?;
         Ok(None)
     }
 
@@ -722,7 +1006,7 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
         let f = self.top()?;
         let row = f.body.place(p);
         if row.parent.is_none() {
-            let i = row.local.0 as usize;
+            let i = usize::try_from(row.local.0).map_err(|_| malformed("a local past the frame"))?;
             let ty = self.local_ty(f, i)?;
             // A local read outside its storage is undefined behaviour.
             let id = f.locals.get(i).copied().flatten().ok_or(Stop::from(Refusal::Dangling))?;
@@ -736,7 +1020,7 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
             cur = body.place(parent);
         }
         let f = self.top()?;
-        let i = cur.local.0 as usize;
+        let i = usize::try_from(cur.local.0).map_err(|_| malformed("a local past the frame"))?;
         let ty = self.local_ty(f, i)?;
         let id = f.locals.get(i).copied().flatten().ok_or(Stop::from(Refusal::Dangling))?;
         let mut pl = Pl { ptr: Pointer { alloc: id, offset: 0 }, meta: None, ty, variant: 0 };
@@ -750,7 +1034,13 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
         match proj {
             Proj::Field { index, ty } => {
                 let fty = self.ground_ty(ty)?;
-                let off = self.field_offset(pl.ty, pl.variant, index)?;
+                let off = match self.node(pl.ty)? {
+                    PNode::Closure { .. } => {
+                        let env = self.closure_env_ty(pl.ty)?;
+                        self.field_offset(env, 0, index)?
+                    }
+                    _ => self.field_offset(pl.ty, pl.variant, index)?,
+                };
                 // The unsized tail field keeps the place's metadata.
                 let meta = if self.is_unsized(fty)? { pl.meta } else { None };
                 Ok(Pl { ptr: pl.ptr.at(off), meta, ty: fty, variant: 0 })
@@ -768,41 +1058,64 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
                 self.deref(pl.ptr, t)
             }
             Proj::Index(l) => {
+                let idx = usize::try_from(l.0).map_err(|_| malformed("a local past the frame"))?;
                 let f = self.top()?;
-                let id = f.locals.get(l.0 as usize).copied().flatten().ok_or(Stop::from(Refusal::Dangling))?;
-                let i = self.uint(self.mem.read(Pointer { alloc: id, offset: 0 }, PTR)?)? as u64;
+                let id = f.locals.get(idx).copied().flatten().ok_or(Stop::from(Refusal::Dangling))?;
+                let raw = self.uint(self.mem_read(Pointer { alloc: id, offset: 0 }, PTR)?)?;
+                let i = u64::try_from(raw).map_err(|_| malformed("an index past u64"))?;
                 self.index(pl, i)
             }
-            Proj::ConstIndex { offset, min_length: _, from_end } => {
+            Proj::ConstIndex { offset, min_length, from_end } => {
                 let (_, len) = self.elem(pl)?;
-                let i = if from_end { len - offset as u64 } else { offset as u64 };
+                let off = u64::from(offset);
+                let min_len = u64::from(min_length);
+                if len < min_len {
+                    return Err(Refusal::IndexOutOfBounds { index: off, len }.into());
+                }
+                let i = if from_end {
+                    if offset == 0 {
+                        return Err(Refusal::IndexOutOfBounds { index: len, len }.into());
+                    }
+                    len.checked_sub(off).ok_or(Stop::from(Refusal::IndexOutOfBounds { index: off, len }))?
+                } else {
+                    off
+                };
                 self.index(pl, i)
             }
             Proj::Subslice { from, to, from_end } => {
                 let (elem, len) = self.elem(pl)?;
-                let (from, to) = (from as u64, to as u64);
-                let n = if from_end { len - to - from } else { to - from };
+                let (from, to) = (u64::from(from), u64::from(to));
+                let n = if from_end {
+                    let trim = from.checked_add(to).ok_or(Stop::from(malformed("a subslice trim overflow")))?;
+                    len.checked_sub(trim).ok_or(Stop::from(Refusal::IndexOutOfBounds { index: trim, len }))?
+                } else {
+                    if to > len {
+                        return Err(Refusal::IndexOutOfBounds { index: to, len }.into());
+                    }
+                    to.checked_sub(from).ok_or(Stop::from(malformed("a subslice with `to < from`")))?
+                };
                 let stride = self.size(elem)?;
-                let ptr = pl.ptr.at(from * stride);
+                let byte_off = from.checked_mul(stride).ok_or(Stop::from(Refusal::OutOfBounds { offset: u64::MAX, size: 0, len }))?;
+                let ptr = pl.ptr.at(byte_off);
                 match self.node(pl.ty)? {
                     PNode::Array(..) => {
                         let count = self.ground.usize_value(n).map_err(|_| malformed("a subslice's length"))?;
                         let ty = self.ground.intern(PNode::Array(elem, count)).map_err(|_| malformed("a subslice's type"))?;
                         Ok(Pl { ptr, meta: None, ty, variant: 0 })
                     }
-                    _ => Ok(Pl { ptr, meta: Some(n), ty: pl.ty, variant: 0 }),
+                    _ => Ok(Pl { ptr, meta: Some(Scalar::Int(u128::from(n))), ty: pl.ty, variant: 0 }),
                 }
             }
             Proj::Downcast(v) => Ok(Pl { variant: v, ..pl }),
         }
     }
 
-    fn deref(&mut self, at: Pointer, pointee: PTy) -> R<'a, Pl> {
-        let ptr = match self.mem.read(at, PTR)? {
+    pub(crate) fn deref(&mut self, at: Pointer, pointee: PTy) -> R<'a, Pl> {
+        let ptr = match self.mem_read(at, PTR)? {
             Scalar::Ptr(p) => p,
             Scalar::Int(_) => return Err(Refusal::IntAsPointer.into()),
         };
-        let meta = if self.is_unsized(pointee)? { Some(self.uint(self.mem.read(at.at(PTR), PTR)?)? as u64) } else { None };
+        let meta = if self.is_unsized(pointee)? { Some(self.mem_read(at.at(PTR), PTR)?) } else { None };
         Ok(Pl { ptr, meta, ty: pointee, variant: 0 })
     }
 
@@ -810,29 +1123,41 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
     fn elem(&mut self, pl: Pl) -> R<'a, (PTy, u64)> {
         match self.node(pl.ty)? {
             PNode::Array(e, n) => Ok((e, self.ground.view().value_u64(n).ok_or(Stop::from(malformed("an array length that is no value")))?)),
-            PNode::Slice(e) => Ok((e, pl.meta.ok_or(Stop::from(malformed("a slice place with no length")))?)),
+            PNode::Slice(e) => {
+                let m = pl.meta.ok_or(Stop::from(malformed("a slice place with no length")))?;
+                let raw = self.uint(m)?;
+                let len = u64::try_from(raw).map_err(|_| malformed("a slice length past u64"))?;
+                Ok((e, len))
+            }
             _ => Err(malformed("an index of a place that is no array or slice").into()),
         }
     }
 
-    /// Element `i`; the bounds were checked by the body's `assert` (and memory refuses an
-    /// access past the allocation regardless).
+    /// Element `i` of an array or slice place.
     fn index(&mut self, pl: Pl, i: u64) -> R<'a, Pl> {
-        let (e, _) = self.elem(pl)?;
+        let (e, len) = self.elem(pl)?;
+        if i >= len {
+            return Err(Refusal::IndexOutOfBounds { index: i, len }.into());
+        }
         let stride = self.size(e)?;
-        Ok(Pl { ptr: pl.ptr.at(i * stride), meta: None, ty: e, variant: 0 })
+        let byte_off = i.checked_mul(stride).ok_or(Stop::from(Refusal::OutOfBounds { offset: u64::MAX, size: 0, len }))?;
+        Ok(Pl { ptr: pl.ptr.at(byte_off), meta: None, ty: e, variant: 0 })
     }
 
     fn len_of(&mut self, pl: Pl) -> R<'a, u64> {
         match self.node(pl.ty)? {
-            PNode::Str => pl.meta.ok_or(Stop::from(malformed("a str place with no length"))),
+            PNode::Str => {
+                let m = pl.meta.ok_or(Stop::from(malformed("a str place with no length")))?;
+                let raw = self.uint(m)?;
+                u64::try_from(raw).map_err(|_| malformed("a str length past u64").into())
+            }
             _ => Ok(self.elem(pl)?.1),
         }
     }
 
     // ---- Operands ----
 
-    fn operand(&mut self, op: Operand) -> R<'a, Opnd> {
+    pub(crate) fn operand(&mut self, op: Operand) -> R<'a, Opnd> {
         match op {
             Operand::Copy(p) | Operand::Move(p) => {
                 let pl = self.place(p)?;
@@ -842,8 +1167,48 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
         }
     }
 
+    /// Wraps a data allocation in a pointer/fat-pointer temporary when `ty` is a ref/ptr to it,
+    /// or returns `Src::At(data)` directly when `ty` matches the allocation's own value.
+    fn ptr_or_data(&mut self, data: AllocId, ty: PTy, body_ret_ty: Option<PTy>) -> R<'a, Src> {
+        if body_ret_ty == Some(ty) {
+            return Ok(Src::At(Pointer { alloc: data, offset: 0 }));
+        }
+        match self.node(ty)? {
+            PNode::Ref(_, t) | PNode::Ptr(_, t) => {
+                let unsized_ = self.is_unsized(t)?;
+                let tmp = self.mem.allocate(if unsized_ { 2 * PTR } else { PTR }, 3, true, Origin::Data)?;
+                let at = Pointer { alloc: tmp, offset: 0 };
+                self.mem.write(at, PTR, Scalar::Ptr(Pointer { alloc: data, offset: 0 }))?;
+                if unsized_ {
+                    let byte_len = self.alloc_len(data)?;
+                    let meta_len = match self.node(t)? {
+                        PNode::Str => byte_len,
+                        PNode::Slice(elem) => {
+                            let esize = self.size(elem)?;
+                            if esize == 0 {
+                                0
+                            } else {
+                                byte_len / esize
+                            }
+                        }
+                        _ => {
+                            self.mem.kill(tmp);
+                            return Err(unsupported("a promoted unsized borrow that is neither a slice nor `str`").into());
+                        }
+                    };
+                    self.mem.write(at.at(PTR), PTR, Scalar::Int(u128::from(meta_len)))?;
+                }
+                Ok(Src::Temp(tmp))
+            }
+            _ => Ok(Src::At(Pointer { alloc: data, offset: 0 })),
+        }
+    }
+
     fn konst(&mut self, c: Const) -> R<'a, Opnd> {
-        let body = self.top()?.body;
+        let f = self.top()?;
+        let body = f.body;
+        let owner = f.item;
+        let owner_args = f.args_list;
         let decl = body.konst(c);
         let ty = self.ground_ty(decl.ty)?;
         let src = match decl.kind {
@@ -851,48 +1216,262 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
             // A fn item is zero-sized.
             ConstKind::FnItem { .. } => Src::Imm(0),
             ConstKind::Param(n) => {
-                let a = *self.top()?.args.get(n as usize).ok_or(Stop::from(malformed("a const parameter past the frame's arguments")))?;
+                let idx = usize::try_from(n).map_err(|_| malformed("a const parameter past the frame's arguments"))?;
+                let a = *self.top()?.args.get(idx).ok_or(Stop::from(malformed("a const parameter past the frame's arguments")))?;
                 match self.node(a)? {
                     PNode::ConstValue { bits, .. } => Src::Imm(bits),
                     _ => return Err(malformed("a const parameter whose argument is no value").into()),
                 }
             }
             ConstKind::Bytes { .. } => {
-                let item = self.top()?.item;
                 let bytes = body.bytes(c).ok_or(Stop::from(malformed("a bytes constant with no bytes")))?;
-                let data = match self.bytes_consts.iter().find(|&&(it, kc, _)| it == item && kc == c) {
+                let data = match self.bytes_consts.iter().find(|&&(it, kc, _)| it == owner && kc == c) {
                     Some(&(_, _, id)) => id,
                     None => {
-                        let id = self.mem.allocate(bytes.len() as u64, 0, false, Origin::Data)?;
+                        let len = u64::try_from(bytes.len()).map_err(|_| malformed("bytes constant length overflow"))?;
+                        let id = self.mem.allocate(len, 0, false, Origin::Data)?;
                         self.mem.fill(id, bytes, &[])?;
-                        self.bytes_consts.push((item, c, id));
+                        self.bytes_consts.push((owner, c, id));
                         id
                     }
                 };
-                match self.node(ty)? {
-                    PNode::Ref(_, t) | PNode::Ptr(_, t) => {
-                        let unsized_ = self.is_unsized(t)?;
-                        let tmp = self.mem.allocate(if unsized_ { 2 * PTR } else { PTR }, 3, true, Origin::Data)?;
-                        let at = Pointer { alloc: tmp, offset: 0 };
-                        self.mem.write(at, PTR, Scalar::Ptr(Pointer { alloc: data, offset: 0 }))?;
-                        if unsized_ {
-                            self.mem.write(at.at(PTR), PTR, Scalar::Int(bytes.len() as u128))?;
-                        }
-                        Src::Temp(tmp)
-                    }
-                    // An array by value.
-                    _ => Src::At(Pointer { alloc: data, offset: 0 }),
-                }
+                self.ptr_or_data(data, ty, None)?
             }
             ConstKind::Item { key, args } => {
                 let args = self.ground_list(args)?;
                 Src::At(Pointer { alloc: self.load_const(key, args)?, offset: 0 })
             }
-            ConstKind::Promoted(_) => return Err(unsupported("a promoted constant (its body is not asked of the world yet)").into()),
-            ConstKind::Anon(_) => return Err(unsupported("an inline `const` block (its body is not asked of the world yet)").into()),
-            ConstKind::StaticAddr(_) => return Err(unsupported("a static's address in a constant").into()),
+            ConstKind::Promoted(id) => {
+                let borrow = ExprId(id);
+                if let Some(&(_, _, _, data, ret_ty)) =
+                    self.promoted.iter().find(|&&(o, b, a, _, _)| o == owner && b == borrow && a == owner_args)
+                {
+                    self.ptr_or_data(data, ty, ret_ty)?
+                } else {
+                    match self.world.promoted(owner, borrow) {
+                        Ok(Some(b)) => {
+                            let sub = self.frame_from_bodied(
+                                BodyId::Promoted(owner, borrow),
+                                b,
+                                owner_args,
+                                Ret::Promoted { owner, borrow, args: owner_args },
+                            )?;
+                            if sub.body.args() != 0 {
+                                for lid in sub.locals.iter().flatten() {
+                                    self.mem.kill(*lid);
+                                }
+                                return Err(malformed("a promoted constant's body that takes arguments").into());
+                            }
+                            self.frames.push(sub);
+                            return Err(Stop::SubFrame);
+                        }
+                        Err(_) => {
+                            return Err(Stop::Need(Need { kind: NeedKind::Body, item: owner, args: owner_args }));
+                        }
+                        Ok(None) => {
+                            let args_slice = self.ground.view().list(owner_args).map_err(|_| malformed("frame arguments past ground table"))?;
+                            let mut argv: Vec<PTy, Alloc<'a>> = Vec::with_capacity_in(args_slice.len(), self.alloc);
+                            argv.extend_from_slice(args_slice);
+                            match self.world.promoted_record(owner, borrow, &argv) {
+                                Ok(Some(rec)) => {
+                                    let data = self.decode_record_into(rec, None)?;
+                                    self.promoted.push((owner, borrow, owner_args, data, None));
+                                    self.ptr_or_data(data, ty, None)?
+                                }
+                                Err(_) => {
+                                    return Err(Stop::Need(Need { kind: NeedKind::Value, item: owner, args: owner_args }));
+                                }
+                                Ok(None) => {
+                                    return Err(unsupported("a promoted constant whose world provides neither body nor record").into());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            ConstKind::Anon(block) => {
+                if let Some(&(_, _, _, data)) =
+                    self.anons.iter().find(|&&(o, b, a, _)| o == owner && b == block && a == owner_args)
+                {
+                    Src::At(Pointer { alloc: data, offset: 0 })
+                } else {
+                    match self.world.anon(owner, block) {
+                        Ok(Some(b)) => {
+                            let sub = self.frame_from_bodied(
+                                BodyId::Anon(owner, block),
+                                b,
+                                owner_args,
+                                Ret::Anon { owner, block, args: owner_args },
+                            )?;
+                            if sub.body.args() != 0 {
+                                for lid in sub.locals.iter().flatten() {
+                                    self.mem.kill(*lid);
+                                }
+                                return Err(malformed("an inline `const` block's body that takes arguments").into());
+                            }
+                            self.frames.push(sub);
+                            return Err(Stop::SubFrame);
+                        }
+                        Err(_) => {
+                            return Err(Stop::Need(Need { kind: NeedKind::Body, item: owner, args: owner_args }));
+                        }
+                        Ok(None) => {
+                            let args_slice = self.ground.view().list(owner_args).map_err(|_| malformed("frame arguments past ground table"))?;
+                            let mut argv: Vec<PTy, Alloc<'a>> = Vec::with_capacity_in(args_slice.len(), self.alloc);
+                            argv.extend_from_slice(args_slice);
+                            match self.world.anon_record(owner, block, &argv) {
+                                Ok(Some(rec)) => {
+                                    let data = self.decode_record_into(rec, None)?;
+                                    self.anons.push((owner, block, owner_args, data));
+                                    Src::At(Pointer { alloc: data, offset: 0 })
+                                }
+                                Err(_) => {
+                                    return Err(Stop::Need(Need { kind: NeedKind::Value, item: owner, args: owner_args }));
+                                }
+                                Ok(None) => {
+                                    return Err(unsupported("an inline `const` block whose world provides neither body nor record").into());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            ConstKind::StaticAddr(item) => {
+                let is_mut = matches!(self.node(ty)?, PNode::Ptr(Mutbl::Mut, _));
+                let id = self.static_alloc(item, is_mut)?;
+                let tmp = self.mem.allocate(PTR, 3, true, Origin::Data)?;
+                self.mem.write(Pointer { alloc: tmp, offset: 0 }, PTR, Scalar::Ptr(Pointer { alloc: id, offset: 0 }))?;
+                Src::Temp(tmp)
+            }
         };
         Ok(Opnd { src, ty })
+    }
+
+    pub(crate) fn fn_alloc(&mut self, inst: InstanceKey, named: Option<ConstFn>) -> R<'a, AllocId> {
+        if let Some((_, existing, id)) = self.fns.iter_mut().find(|(k, _, _)| *k == inst) {
+            if existing.is_none() && named.is_some() {
+                *existing = named;
+            }
+            return Ok(*id);
+        }
+        let id = self.mem.allocate(0, 0, false, Origin::Fn(inst))?;
+        self.fns.push((inst, named, id));
+        Ok(id)
+    }
+
+    pub(crate) fn vtable_alloc(&mut self, key: VtableKey, named: Option<ConstVtable>) -> R<'a, AllocId> {
+        if let Some((_, existing, id)) = self.vtables.iter_mut().find(|(k, _, _)| *k == key) {
+            if existing.is_none() && named.is_some() {
+                *existing = named;
+            }
+            return Ok(*id);
+        }
+        let id = self.mem.allocate(0, 0, false, Origin::Vtable(key))?;
+        self.vtables.push((key, named, id));
+        Ok(id)
+    }
+
+    fn static_alloc(&mut self, item: ItemKey, mutable: bool) -> R<'a, AllocId> {
+        let is_mut = mutable || self.world.is_mut_static(item);
+        if let Some((_, slot)) = self.statics.iter_mut().find(|(k, _)| *k == item) {
+            if is_mut {
+                slot.mut_static = true;
+            }
+            return Ok(slot.id);
+        }
+        if is_mut {
+            let id = self.mem.allocate(0, 0, false, Origin::Static(item))?;
+            self.statics.push((item, StaticSlot { id, loaded: false, mut_static: true }));
+            return Ok(id);
+        }
+        let code = self.world.code_id(item);
+        let inst = instance_key(code, List::EMPTY, self.ground.view(), self.alloc).map_err(build_refusal)?;
+        match self.world.record(RecordKey::of(inst)) {
+            Ok(rec) => {
+                let first = rec.data.allocs.first().ok_or(Stop::from(malformed("a record with no allocation")))?;
+                let len = u64::try_from(first.bytes.len()).map_err(|_| malformed("static record length overflow"))?;
+                let id = self.mem.allocate(len, first.align, false, Origin::Static(item))?;
+                self.statics.push((item, StaticSlot { id, loaded: true, mut_static: false }));
+                self.decode_record_into(rec, Some(id))?;
+                Ok(id)
+            }
+            Err(_) => {
+                let id = self.mem.allocate(0, 0, false, Origin::Static(item))?;
+                self.statics.push((item, StaticSlot { id, loaded: false, mut_static: false }));
+                Ok(id)
+            }
+        }
+    }
+
+    /// Iteratively decodes `rec` (and any static records reachable from its relocations whose
+    /// records are already present in `world`) into `self.mem` with zero host recursion.
+    fn decode_record_into(&mut self, rec: &'w ConstRecord<Alloc<'_>>, root: Option<AllocId>) -> R<'a, AllocId> {
+        let first_id = match root {
+            Some(id) => id,
+            None => {
+                let first = rec.data.allocs.first().ok_or(Stop::from(malformed("a record with no allocation")))?;
+                let len = u64::try_from(first.bytes.len()).map_err(|_| malformed("record allocation length overflow"))?;
+                self.mem.allocate(len, first.align, false, Origin::Data)?
+            }
+        };
+        let mut work: Vec<(AllocId, &'w ConstRecord<Alloc<'_>>), Alloc<'a>> = Vec::new_in(self.alloc);
+        work.push((first_id, rec));
+        while let Some((root_id, cur)) = work.pop() {
+            let mut ids: Vec<AllocId, Alloc<'a>> = Vec::with_capacity_in(cur.data.allocs.len(), self.alloc);
+            for (i, a) in cur.data.allocs.iter().enumerate() {
+                if i == 0 {
+                    ids.push(root_id);
+                } else {
+                    let len = u64::try_from(a.bytes.len()).map_err(|_| malformed("record allocation length overflow"))?;
+                    ids.push(self.mem.allocate(len, a.align, false, Origin::Data)?);
+                }
+            }
+            let mut relocs: Vec<(u64, AllocId), Alloc<'a>> = Vec::new_in(self.alloc);
+            for (k, a) in cur.data.allocs.iter().enumerate() {
+                relocs.clear();
+                for r in a.relocs.iter() {
+                    let to = match r.target {
+                        DataTarget::Local(n) => {
+                            let idx = usize::try_from(n).map_err(|_| malformed("a record's relocation past its allocations"))?;
+                            *ids.get(idx).ok_or(Stop::from(malformed("a record's relocation past its allocations")))?
+                        }
+                        DataTarget::Fn(i) => self.fn_alloc(i, cur.fn_named(i))?,
+                        DataTarget::Vtable(v) => self.vtable_alloc(v, cur.vtable_named(v))?,
+                        DataTarget::Static(s) => {
+                            if let Some(&(_, slot)) = self.statics.iter().find(|&&(k, _)| k == s) {
+                                slot.id
+                            } else if self.world.is_mut_static(s) {
+                                let sid = self.mem.allocate(0, 0, false, Origin::Static(s))?;
+                                self.statics.push((s, StaticSlot { id: sid, loaded: false, mut_static: true }));
+                                sid
+                            } else {
+                                let code = self.world.code_id(s);
+                                let inst = instance_key(code, List::EMPTY, self.ground.view(), self.alloc).map_err(build_refusal)?;
+                                match self.world.record(RecordKey::of(inst)) {
+                                    Ok(srec) => {
+                                        let sfirst = srec.data.allocs.first().ok_or(Stop::from(malformed("a static record with no allocation")))?;
+                                        let slen = u64::try_from(sfirst.bytes.len()).map_err(|_| malformed("static record length overflow"))?;
+                                        let sid = self.mem.allocate(slen, sfirst.align, false, Origin::Static(s))?;
+                                        self.statics.push((s, StaticSlot { id: sid, loaded: true, mut_static: false }));
+                                        work.push((sid, srec));
+                                        sid
+                                    }
+                                    Err(_) => {
+                                        let sid = self.mem.allocate(0, 0, false, Origin::Static(s))?;
+                                        self.statics.push((s, StaticSlot { id: sid, loaded: false, mut_static: false }));
+                                        sid
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    relocs.push((u64::from(r.offset), to));
+                }
+                let id = *ids.get(k).ok_or(Stop::from(malformed("a record's allocation past its ids")))?;
+                self.mem.fill(id, &a.bytes, &relocs)?;
+            }
+        }
+        Ok(first_id)
     }
 
     /// The value of constant `key` at `args`, from its record, in memory: one load per run.
@@ -905,36 +1484,18 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
         let Ok(rec) = self.world.record(RecordKey::of(inst)) else {
             return Err(Stop::Need(Need { kind: NeedKind::Value, item: key, args }));
         };
-        let mut ids: Vec<AllocId, Alloc<'a>> = Vec::new_in(self.alloc);
-        for a in rec.data.allocs.iter() {
-            ids.push(self.mem.allocate(a.bytes.len() as u64, a.align, false, Origin::Data)?);
-        }
-        for (k, a) in rec.data.allocs.iter().enumerate() {
-            let mut relocs: Vec<(u64, AllocId), Alloc<'a>> = Vec::new_in(self.alloc);
-            for r in a.relocs.iter() {
-                let to = match r.target {
-                    DataTarget::Local(n) => *ids.get(n as usize).ok_or(Stop::from(malformed("a record's relocation past its allocations")))?,
-                    DataTarget::Fn(i) => self.mem.allocate(0, 0, false, Origin::Fn(i))?,
-                    DataTarget::Static(_) => return Err(unsupported("a constant's value that points to a static").into()),
-                    DataTarget::Vtable(_) => return Err(unsupported("a constant's value that holds a vtable").into()),
-                };
-                relocs.push((r.offset as u64, to));
-            }
-            let id = *ids.get(k).ok_or(Stop::from(malformed("a record's allocation past its ids")))?;
-            self.mem.fill(id, &a.bytes, &relocs)?;
-        }
-        let id = *ids.first().ok_or(Stop::from(malformed("a record with no allocation")))?;
+        let id = self.decode_record_into(rec, None)?;
         self.consts.push((key, args, id));
         Ok(id)
     }
 
-    fn release(&mut self, o: Opnd) {
+    pub(crate) fn release(&mut self, o: Opnd) {
         if let Src::Temp(id) = o.src {
             self.mem.kill(id);
         }
     }
 
-    fn check_scalar_valid(&self, ty: PTy, s: Scalar) -> R<'a, ()> {
+    pub(crate) fn check_scalar_valid(&self, ty: PTy, s: Scalar) -> R<'a, ()> {
         match (self.node(ty)?, s) {
             (PNode::Bool, Scalar::Int(v)) if v > 1 => Err(Refusal::InvalidBool { value: v }.into()),
             (PNode::Bool, Scalar::Ptr(_)) => Err(Refusal::PointerAsInt.into()),
@@ -942,40 +1503,44 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
                 Err(Refusal::InvalidChar { value: v }.into())
             }
             (PNode::Char, Scalar::Ptr(_)) => Err(Refusal::PointerAsInt.into()),
+            (PNode::Int(_) | PNode::Uint(_) | PNode::Float(_), Scalar::Ptr(_)) => Err(Refusal::PointerAsInt.into()),
             _ => Ok(()),
         }
     }
 
-    fn read(&mut self, o: Opnd) -> R<'a, Scalar> {
+    pub(crate) fn read(&mut self, o: Opnd) -> R<'a, Scalar> {
         let size = self.size(o.ty)?;
         let s = match o.src {
-            Src::At(p) => self.mem.read(p, size)?,
-            Src::Temp(id) => self.mem.read(Pointer { alloc: id, offset: 0 }, size)?,
+            Src::At(p) => self.mem_read(p, size)?,
+            Src::Temp(id) => self.mem_read(Pointer { alloc: id, offset: 0 }, size)?,
             Src::Imm(b) => Scalar::Int(b),
         };
         self.check_scalar_valid(o.ty, s)?;
         Ok(s)
     }
 
-    fn copy_out(&mut self, o: Opnd, dst: Pointer, size: u64) -> R<'a, ()> {
+    pub(crate) fn copy_out(&mut self, o: Opnd, dst: Pointer, size: u64) -> R<'a, ()> {
         if size == 0 {
             return Ok(());
         }
         match o.src {
-            Src::At(p) => self.mem.copy(p, dst, size)?,
-            Src::Temp(id) => self.mem.copy(Pointer { alloc: id, offset: 0 }, dst, size)?,
-            Src::Imm(b) => self.mem.write(dst, size, Scalar::Int(b))?,
+            Src::At(p) => self.mem_copy(p, dst, size)?,
+            Src::Temp(id) => self.mem_copy(Pointer { alloc: id, offset: 0 }, dst, size)?,
+            Src::Imm(b) => self.mem_write(dst, size, Scalar::Int(b))?,
         }
         Ok(())
     }
 
-    fn operand_into(&mut self, op: Operand, dst: Pointer) -> R<'a, ()> {
+    pub(crate) fn operand_into(&mut self, op: Operand, dst: Pointer) -> R<'a, ()> {
         let o = self.operand(op)?;
         let res = (|| -> R<'a, ()> {
-            if matches!(self.node(o.ty)?, PNode::Bool | PNode::Char) {
+            if matches!(
+                self.node(o.ty)?,
+                PNode::Bool | PNode::Char | PNode::Int(_) | PNode::Uint(_) | PNode::Float(_)
+            ) {
                 let s = self.read(o)?;
                 let size = self.size(o.ty)?;
-                self.mem.write(dst, size, s)?;
+                self.mem_write(dst, size, s)?;
                 return Ok(());
             }
             let size = self.size(o.ty)?;
@@ -985,7 +1550,7 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
         res
     }
 
-    fn uint(&self, s: Scalar) -> R<'a, u128> {
+    pub(crate) fn uint(&self, s: Scalar) -> R<'a, u128> {
         match s {
             Scalar::Int(v) => Ok(v),
             Scalar::Ptr(_) => Err(Refusal::PointerAsInt.into()),
@@ -993,18 +1558,19 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
     }
 
     /// An operand's bits as an integer.
-    fn int(&mut self, op: Operand) -> R<'a, u128> {
+    pub(crate) fn int(&mut self, op: Operand) -> R<'a, u128> {
         let o = self.operand(op)?;
-        let s = self.read(o)?;
+        let s = self.read(o);
         self.release(o);
-        self.uint(s)
+        self.uint(s?)
     }
 
     /// `v` written at `d` in `d`'s size.
-    fn put(&mut self, d: Pl, v: u128) -> R<'a, ()> {
+    pub(crate) fn put(&mut self, d: Pl, v: u128) -> R<'a, ()> {
         let size = self.size(d.ty)?;
         if size != 0 {
-            self.mem.write(d.ptr, size, Scalar::Int(arith::mask(v, (size * 8) as u32)))?;
+            let bits = u32::try_from(size.saturating_mul(8)).unwrap_or(128);
+            self.mem_write(d.ptr, size, Scalar::Int(arith::mask(v, bits)))?;
         }
         Ok(())
     }
@@ -1016,16 +1582,16 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
             Value::Use(op) => self.operand_into(op, d.ptr),
             Value::Borrow { place, .. } | Value::RawAddr { place, .. } => {
                 let p = self.place(place)?;
-                self.mem.write(d.ptr, PTR, Scalar::Ptr(p.ptr))?;
+                self.mem_write(d.ptr, PTR, Scalar::Ptr(p.ptr))?;
                 if let Some(m) = p.meta {
-                    self.mem.write(d.ptr.at(PTR), PTR, Scalar::Int(m as u128))?;
+                    self.mem_write(d.ptr.at(PTR), PTR, m)?;
                 }
                 Ok(())
             }
             Value::Binary { op, lhs, rhs } => {
                 let (s, _) = self.binary(op, lhs, rhs, false)?;
                 let size = self.size(d.ty)?;
-                self.mem.write(d.ptr, size, s)?;
+                self.mem_write(d.ptr, size, s)?;
                 Ok(())
             }
             Value::CheckedBinary { op, lhs, rhs } => {
@@ -1039,6 +1605,11 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
                 match kind {
                     AggregateKind::Tuple => self.fields(d.ptr, d.ty, 0, body.ops(operands)),
                     AggregateKind::Adt(variant) => {
+                        if let PNode::Adt(adt_key, _) = self.node(d.ty)?
+                            && self.world.adt(adt_key).is_some_and(|a| a.kind == AdtKind::Union)
+                        {
+                            return self.write_union(d, variant, body.ops(operands));
+                        }
                         self.fields(d.ptr, d.ty, variant, body.ops(operands))?;
                         self.set_tag(d.ptr, d.ty, variant)
                     }
@@ -1046,20 +1617,25 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
                         let (e, _) = self.elem(d)?;
                         let stride = self.size(e)?;
                         for (k, op) in body.ops(operands).enumerate() {
-                            self.operand_into(op, d.ptr.at(k as u64 * stride))?;
+                            let idx = u64::try_from(k).map_err(|_| malformed("array operand index overflow"))?;
+                            let off = idx.checked_mul(stride).ok_or(Stop::from(malformed("array offset overflow")))?;
+                            self.operand_into(op, d.ptr.at(off))?;
                         }
                         Ok(())
                     }
-                    AggregateKind::Closure => Err(unsupported("a closure built in a constant").into()),
+                    AggregateKind::Closure => {
+                        let env = self.closure_env_ty(d.ty)?;
+                        self.fields(d.ptr, env, 0, body.ops(operands))
+                    }
                     AggregateKind::Coroutine => Err(unsupported("a coroutine built in a constant").into()),
                 }
             }
             Value::Repeat { operand, count } => {
                 let n = {
                     let o = self.konst(count)?;
-                    let s = self.read(o)?;
+                    let s = self.read(o);
                     self.release(o);
-                    self.uint(s)? as u64
+                    u64::try_from(self.uint(s?)?).map_err(|_| malformed("repeat count past u64"))?
                 };
                 let (e, _) = self.elem(d)?;
                 let stride = self.size(e)?;
@@ -1075,7 +1651,7 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
                         if matches!(self.node(o.ty)?, PNode::Bool | PNode::Char) {
                             let s = self.read(o)?;
                             for k in 0..n {
-                                self.mem.write(d.ptr.at(k * stride), size, s)?;
+                                self.mem_write(d.ptr.at(k * stride), size, s)?;
                             }
                         } else {
                             for k in 0..n {
@@ -1091,17 +1667,17 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
             Value::Len(p) => {
                 let pl = self.place(p)?;
                 let n = self.len_of(pl)?;
-                self.put(d, n as u128)
+                self.put(d, u128::from(n))
             }
             Value::Discriminant(p) => {
                 let pl = self.place(p)?;
                 let v = self.discriminant(pl)?;
-                self.put(d, v as u128)
+                self.put(d, u128::from_le_bytes(v.to_le_bytes()))
             }
             Value::SizeOf(t) => {
                 let t = self.ground_ty(t)?;
                 let (size, _) = self.size_align(t)?;
-                self.put(d, size as u128)
+                self.put(d, u128::from(size))
             }
             Value::AlignOf(t) => {
                 let t = self.ground_ty(t)?;
@@ -1112,88 +1688,139 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
         }
     }
 
+    fn write_union(&mut self, d: Pl, field_idx: u32, mut ops: impl Iterator<Item = Operand>) -> R<'a, ()> {
+        let Some(op) = ops.next() else {
+            return Err(malformed("a union aggregate without its active field operand").into());
+        };
+        if ops.next().is_some() {
+            return Err(malformed("a union aggregate with more than one operand").into());
+        }
+        let off = self.field_offset(d.ty, 0, field_idx)?;
+        let union_size = self.size(d.ty)?;
+        let o = self.operand(op)?;
+        let res = (|| -> R<'a, ()> {
+            let op_size = self.size(o.ty)?;
+            if matches!(self.node(o.ty)?, PNode::Bool | PNode::Char) {
+                let s = self.read(o)?;
+                self.mem_deinit(d.ptr, union_size)?;
+                self.mem_write(d.ptr.at(off), op_size, s)?;
+                return Ok(());
+            }
+            let aliases = matches!(o.src, Src::At(p) if p.alloc == d.ptr.alloc);
+            if aliases && op_size != 0 {
+                let (_, op_align) = self.size_align(o.ty)?;
+                let tmp = self.mem.allocate(op_size, op_align, true, Origin::Data)?;
+                let copy_res = (|| -> R<'a, ()> {
+                    self.copy_out(o, Pointer { alloc: tmp, offset: 0 }, op_size)?;
+                    self.mem_deinit(d.ptr, union_size)?;
+                    self.mem_copy(Pointer { alloc: tmp, offset: 0 }, d.ptr.at(off), op_size)
+                })();
+                self.mem.kill(tmp);
+                return copy_res;
+            }
+            self.mem_deinit(d.ptr, union_size)?;
+            self.copy_out(o, d.ptr.at(off), op_size)
+        })();
+        self.release(o);
+        res
+    }
+
     /// A `(value, overflowed)` pair written at `d`, a two-field tuple.
-    fn write_checked(&mut self, d: Pl, s: Scalar, overflowed: bool) -> R<'a, ()> {
+    pub(crate) fn write_checked(&mut self, d: Pl, s: Scalar, overflowed: bool) -> R<'a, ()> {
         let PNode::Tuple(parts) = self.node(d.ty)? else {
             return Err(malformed("a checked operation into a place that is no pair").into());
         };
         let t0 = *self.ground.view().list(parts).map_err(|_| malformed("a pair's fields"))?.first().ok_or(Stop::from(malformed("a pair with no fields")))?;
         let (off0, off1) = (self.field_offset(d.ty, 0, 0)?, self.field_offset(d.ty, 0, 1)?);
         let size0 = self.size(t0)?;
-        self.mem.write(d.ptr.at(off0), size0, s)?;
-        self.mem.write(d.ptr.at(off1), 1, Scalar::Int(overflowed as u128))?;
+        self.mem_write(d.ptr.at(off0), size0, s)?;
+        self.mem_write(d.ptr.at(off1), 1, Scalar::Int(u128::from(overflowed)))?;
         Ok(())
     }
 
     fn fields(&mut self, at: Pointer, ty: PTy, variant: u32, ops: impl Iterator<Item = Operand>) -> R<'a, ()> {
         for (k, op) in ops.enumerate() {
-            let off = self.field_offset(ty, variant, k as u32)?;
+            let fi = u32::try_from(k).map_err(|_| malformed("field index overflow"))?;
+            let off = self.field_offset(ty, variant, fi)?;
             self.operand_into(op, at.at(off))?;
         }
         Ok(())
     }
 
-    fn set_tag(&mut self, at: Pointer, ty: PTy, variant: u32) -> R<'a, ()> {
+    pub(crate) fn set_tag(&mut self, at: Pointer, ty: PTy, variant: u32) -> R<'a, ()> {
         let mut cx = LayoutCx { ground: &mut *self.ground, facts: self.world, scratch: self.alloc };
         if let Some(w) = self.layout.tag_write(ty, variant, &mut cx).map_err(layout_stop)? {
-            self.mem.write(at.at(w.offset), w.size, Scalar::Int(w.value))?;
+            self.mem_write(at.at(w.offset), w.size, Scalar::Int(w.value))?;
         }
         Ok(())
     }
 
-    fn discriminant(&mut self, pl: Pl) -> R<'a, i128> {
-        let PNode::Adt(adt, _) = self.node(pl.ty)? else {
-            return Err(malformed("a discriminant of a place that is no enum").into());
-        };
+    pub(crate) fn discriminant(&mut self, pl: Pl) -> R<'a, i128> {
+        let mut discrs: Vec<i128, Alloc<'a>> = Vec::new_in(self.alloc);
+        match self.node(pl.ty)? {
+            PNode::Adt(adt, _) => {
+                let variants = self
+                    .world
+                    .adt(adt)
+                    .ok_or(Stop::from(Refusal::Missing { what: "an enum's definition", item: adt }))?
+                    .variants
+                    .len();
+                let count = u32::try_from(variants).map_err(|_| malformed("variant count overflow"))?;
+                for v in 0..count {
+                    match eval_discriminant(self.world, adt, v, self.alloc) {
+                        Ok(Answer::Done(d)) => discrs.push(d),
+                        Ok(Answer::Need(n)) => return Err(Stop::Need(n)),
+                        Err(e) => return Err(e.refusal.into()),
+                    }
+                }
+            }
+            PNode::Union(ul) => {
+                for v in 0..ul.len {
+                    discrs.push(i128::from(v));
+                }
+            }
+            _ => return Err(malformed("a discriminant of a place that is no enum").into()),
+        }
         let tag: Tag = {
             let mut cx = LayoutCx { ground: &mut *self.ground, facts: self.world, scratch: self.alloc };
             self.layout.tag(pl.ty, &mut cx).map_err(layout_stop)?
         };
-        let bits = match tag.at {
-            None => 0,
-            Some((off, size)) => self.uint(self.mem.read(pl.ptr.at(off), size)?)?,
-        };
-        let variants = self.world.adt(adt).ok_or(Stop::from(Refusal::Missing { what: "an enum's definition", item: adt }))?.variants.len();
-        let mut discrs: Vec<i128, Alloc<'a>> = Vec::new_in(self.alloc);
-        for v in 0..variants as u32 {
-            match eval_discriminant(self.world, adt, v, self.alloc) {
-                Ok(Answer::Done(d)) => discrs.push(d),
-                Ok(Answer::Need(n)) => return Err(Stop::Need(n)),
-                Err(e) => return Err(e.refusal.into()),
+        let v = match tag.at {
+            None => {
+                self.ensure_loaded(pl.ptr.alloc)?;
+                tag.variant(0, &discrs)?
             }
-        }
-        let v = tag.variant(bits, &discrs)?;
-        discrs.get(v as usize).copied().ok_or(Stop::from(Refusal::InvalidTag { bits }))
+            Some((off, size)) => match self.mem_read(pl.ptr.at(off), size)? {
+                Scalar::Int(bits) => tag.variant(bits, &discrs)?,
+                Scalar::Ptr(p) => {
+                    let in_bounds = if self.is_mut_static_alloc(p.alloc) {
+                        p.offset == 0
+                    } else {
+                        p.offset <= self.alloc_len(p.alloc)?
+                    };
+                    if in_bounds && let Some(v) = tag.ptr_variant() {
+                        v
+                    } else {
+                        return Err(Refusal::PointerAsInt.into());
+                    }
+                }
+            },
+        };
+        let idx = usize::try_from(v).map_err(|_| malformed("variant index overflow"))?;
+        discrs.get(idx).copied().ok_or(Stop::from(Refusal::InvalidTag { bits: u128::from(v) }))
     }
 
     fn unary(&mut self, d: Pl, op: UnOp, operand: Operand) -> R<'a, ()> {
         let o = self.operand(operand)?;
         let n = self.node(o.ty)?;
         if op == UnOp::PtrMetadata {
-            // A pointer's metadata: its second word if the pointee is unsized, else `()`.
-            let (PNode::Ref(_, t) | PNode::Ptr(_, t)) = n else {
-                self.release(o);
-                return Err(malformed("metadata of a value that is no pointer").into());
-            };
-            let res = if self.is_unsized(t)? {
-                let p = match o.src {
-                    Src::At(p) => p,
-                    Src::Temp(id) => Pointer { alloc: id, offset: 0 },
-                    Src::Imm(_) => {
-                        self.release(o);
-                        return Err(malformed("metadata of a pointer constant").into());
-                    }
-                };
-                self.mem.copy(p.at(PTR), d.ptr, PTR).map_err(Stop::from)
-            } else {
-                Ok(())
-            };
+            let res = self.ptr_metadata_into(d, o);
             self.release(o);
             return res;
         }
-        let s = self.read(o)?;
+        let s = self.read(o);
         self.release(o);
-        let v = self.uint(s)?;
+        let v = self.uint(s?)?;
         let r = match (op, n) {
             (UnOp::Not, PNode::Bool) => v ^ 1,
             (UnOp::Neg, PNode::Float(f)) => v ^ (1u128 << (float_bits(f) - 1)),
@@ -1206,79 +1833,343 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
         self.put(d, r)
     }
 
-    fn cast(&mut self, d: Pl, kind: CastKind, operand: Operand) -> R<'a, ()> {
-        let o = self.operand(operand)?;
-        let (from, to) = (self.node(o.ty)?, self.node(d.ty)?);
-        match kind {
-            CastKind::IntToInt | CastKind::IntToFloat | CastKind::FloatToInt | CastKind::FloatToFloat => {
-                let v = self.read(o)?;
-                let v = self.uint(v)?;
-                let r = arith::num_cast(from, to, v)?;
-                self.put(d, r)?;
+    pub(crate) fn ptr_metadata_into(&mut self, d: Pl, o: Opnd) -> R<'a, ()> {
+        let (PNode::Ref(_, t) | PNode::Ptr(_, t)) = self.node(o.ty)? else {
+            return Err(malformed("metadata of a value that is no pointer").into());
+        };
+        if self.is_unsized(t)? {
+            let p = match o.src {
+                Src::At(p) => p,
+                Src::Temp(id) => Pointer { alloc: id, offset: 0 },
+                Src::Imm(_) => return Err(malformed("metadata of a pointer constant").into()),
+            };
+            self.mem_copy(p.at(PTR), d.ptr, PTR)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn transmute_into(&mut self, d: Pl, o: Opnd) -> R<'a, ()> {
+        let (fs, ts) = (self.size(o.ty)?, self.size(d.ty)?);
+        if fs != ts {
+            return Err(Refusal::TransmuteSize { from: fs, to: ts }.into());
+        }
+        self.copy_out(o, d.ptr, ts)?;
+        if matches!(self.node(d.ty)?, PNode::Bool | PNode::Char | PNode::Int(_) | PNode::Uint(_) | PNode::Float(_)) {
+            let s = self.mem_read(d.ptr, ts)?;
+            self.check_scalar_valid(d.ty, s)?;
+        }
+        Ok(())
+    }
+
+    fn principal_of(&self, t: PTy) -> R<'a, Option<(ItemKey, List)>> {
+        let view = self.ground.view();
+        let PNode::Dynamic(l) = view.node(t).map_err(|_| malformed("a type past the ground table"))? else {
+            return Err(malformed("a trait object's principal asked of another type").into());
+        };
+        let preds = view.list(l).map_err(|_| malformed("a trait object's predicates past the ground table"))?;
+        let Some(&first) = preds.first() else {
+            return Err(unsupported("a trait object with no predicates").into());
+        };
+        Ok(match view.node(first).map_err(|_| malformed("a type past the ground table"))? {
+            PNode::ExTrait(k, args) => Some((k, args)),
+            _ => None,
+        })
+    }
+
+    fn vtable_key_of(&mut self, concrete: PTy, principal: ItemKey, args: List) -> R<'a, VtableKey> {
+        let mut args_buf: Vec<PTy, Alloc<'a>> = Vec::new_in(self.alloc);
+        args_buf.extend_from_slice(
+            self.ground
+                .view()
+                .list(args)
+                .map_err(|_| malformed("a trait object's arguments past the ground table"))?,
+        );
+        let shape = self.world.code_id(principal);
+        vtable_key(concrete, principal, &args_buf, shape, &mut *self.ground, self.alloc)
+            .map_err(|_| malformed("a vtable's types past the ground table").into())
+    }
+
+    fn unsize_tails(&mut self, mut f: PTy, mut g: PTy) -> R<'a, (PTy, PTy)> {
+        const UNSIZE_DEPTH: u32 = 16;
+        for _ in 0..UNSIZE_DEPTH {
+            if f == g {
+                return Ok((f, g));
             }
-            // Same bytes; a wide pointer cast to a thin one keeps its first word.
-            CastKind::PtrToPtr
-            | CastKind::MutToConstPointer
-            | CastKind::UnsafeFnPointer
-            | CastKind::FnPtrToPtr
-            | CastKind::ArrayToPointer
-            | CastKind::FromExposedAddr => {
-                let size = self.size(d.ty)?;
-                self.copy_out(o, d.ptr, size)?;
-            }
-            CastKind::ExposeAddr => {
-                let v = self.read(o)?;
-                let v = self.uint(v)?;
-                self.put(d, v)?;
-            }
-            CastKind::Transmute => {
-                let (fs, ts) = (self.size(o.ty)?, self.size(d.ty)?);
-                if fs != ts {
-                    self.release(o);
-                    return Err(Refusal::TransmuteSize { from: fs, to: ts }.into());
+            let nfields = match (self.node(f)?, self.node(g)?) {
+                (PNode::Adt(k, _), PNode::Adt(k2, _)) if k == k2 => {
+                    let adt = self
+                        .world
+                        .adt(k)
+                        .ok_or(Stop::from(Refusal::Missing { what: "ADT definition", item: k }))?;
+                    if adt.kind != AdtKind::Struct || adt.variants.len() != 1 {
+                        return Err(unsupported("an unsizing of a pointee that is an enum or a union").into());
+                    }
+                    let Some(v) = adt.variants.first() else {
+                        return Err(unsupported("an unsizing of a pointee struct without fields").into());
+                    };
+                    if v.fields.len == 0 {
+                        return Err(unsupported("an unsizing of a pointee struct without fields").into());
+                    }
+                    v.fields.len
                 }
-                self.copy_out(o, d.ptr, ts)?;
-                if matches!(to, PNode::Bool | PNode::Char) {
-                    let s = self.mem.read(d.ptr, ts)?;
-                    if let Err(e) = self.check_scalar_valid(d.ty, s) {
-                        self.release(o);
-                        return Err(e);
+                _ => return Ok((f, g)),
+            };
+            let last = nfields - 1;
+            f = self.field_ty(f, 0, last)?;
+            g = self.field_ty(g, 0, last)?;
+        }
+        Err(unsupported("an unsizing whose pointee passes through more struct tails than the bound").into())
+    }
+
+    fn unsize_into(&mut self, d: Pl, o: Opnd) -> R<'a, ()> {
+        const UNSIZE_DEPTH: u32 = 16;
+        let mut src = o.src;
+        let mut dst = d.ptr;
+        let mut ty = o.ty;
+        let mut next = d.ty;
+        for _ in 0..UNSIZE_DEPTH {
+            if ty == next {
+                let sz = self.size(ty)?;
+                return self.copy_out(Opnd { src, ty }, dst, sz);
+            }
+            match (self.node(ty)?, self.node(next)?) {
+                (PNode::Ref(_, f) | PNode::Ptr(_, f), PNode::Ref(_, g) | PNode::Ptr(_, g)) => {
+                    let (from, to) = self.unsize_tails(f, g)?;
+                    match (self.node(from)?, self.node(to)?) {
+                        (PNode::Array(_, n), PNode::Slice(_)) => {
+                            let len = self
+                                .ground
+                                .view()
+                                .value_u64(n)
+                                .ok_or(Stop::from(malformed("an array length that is no value")))?;
+                            self.copy_out(Opnd { src, ty }, dst, PTR)?;
+                            self.mem_write(dst.at(PTR), PTR, Scalar::Int(u128::from(len)))?;
+                            return Ok(());
+                        }
+                        (PNode::Dynamic(_), PNode::Dynamic(_)) => {
+                            let Some((principal, args)) = self.principal_of(to)? else {
+                                return Err(unsupported("an unsizing to a trait object of auto traits alone (no principal trait)").into());
+                            };
+                            let sp = match src {
+                                Src::At(p) => p,
+                                Src::Temp(id) => Pointer { alloc: id, offset: 0 },
+                                Src::Imm(_) => return Err(malformed("a trait-object upcast of an immediate").into()),
+                            };
+                            let data_word = self.mem_read(sp, PTR)?;
+                            let meta_word = self.mem_read(sp.at(PTR), PTR)?;
+                            let Scalar::Ptr(vp) = meta_word else {
+                                return Err(malformed("a trait-object upcast whose metadata is not a vtable pointer").into());
+                            };
+                            let Origin::Vtable(old_key) = self.mem.get(vp.alloc)?.origin else {
+                                return Err(malformed("a trait-object upcast whose metadata does not point to a vtable").into());
+                            };
+                            let Some(old) = self.vtables.iter().find(|&&(k, _, _)| k == old_key).and_then(|&(_, v, _)| v) else {
+                                return Err(malformed("a trait-object upcast whose vtable was not registered").into());
+                            };
+                            let new_vt_ptr = if old.vtable.principal == principal && old.vtable.args == args {
+                                vp
+                            } else {
+                                let concrete = old.vtable.concrete;
+                                let key = self.vtable_key_of(concrete, principal, args)?;
+                                let named = ConstVtable { key, vtable: VtableRef { concrete, principal, args } };
+                                let vt_id = self.vtable_alloc(key, Some(named))?;
+                                Pointer { alloc: vt_id, offset: 0 }
+                            };
+                            self.mem_write(dst, PTR, data_word)?;
+                            self.mem_write(dst.at(PTR), PTR, Scalar::Ptr(new_vt_ptr))?;
+                            return Ok(());
+                        }
+                        (_, PNode::Dynamic(_)) => {
+                            let Some((principal, args)) = self.principal_of(to)? else {
+                                return Err(unsupported("an unsizing to a trait object of auto traits alone (no principal trait)").into());
+                            };
+                            let key = self.vtable_key_of(from, principal, args)?;
+                            let named = ConstVtable { key, vtable: VtableRef { concrete: from, principal, args } };
+                            let vt_id = self.vtable_alloc(key, Some(named))?;
+                            self.copy_out(Opnd { src, ty }, dst, PTR)?;
+                            self.mem_write(dst.at(PTR), PTR, Scalar::Ptr(Pointer { alloc: vt_id, offset: 0 }))?;
+                            return Ok(());
+                        }
+                        _ if from == to => {
+                            let sz = self.size(next)?;
+                            return self.copy_out(Opnd { src, ty }, dst, sz);
+                        }
+                        _ => return Err(unsupported("an unsizing coercion other than to a slice or a trait object").into()),
                     }
                 }
+                (PNode::Pat(bs, ps), PNode::Pat(bt, pt)) => {
+                    let view = self.ground.view();
+                    let lps = view.list(ps).map_err(|_| malformed("a pattern type's ranges past the ground table"))?;
+                    let lpt = view.list(pt).map_err(|_| malformed("a pattern type's ranges past the ground table"))?;
+                    if lps != lpt {
+                        return Err(unsupported("an unsizing between two pattern types of different patterns").into());
+                    }
+                    ty = bs;
+                    next = bt;
+                }
+                (PNode::Adt(k, _), PNode::Adt(k2, _)) if k == k2 => {
+                    let adt = self
+                        .world
+                        .adt(k)
+                        .ok_or(Stop::from(Refusal::Missing { what: "ADT definition", item: k }))?;
+                    if adt.kind != AdtKind::Struct || adt.variants.len() != 1 {
+                        return Err(unsupported("an unsizing coercion through an enum or a union").into());
+                    }
+                    let Some(v) = adt.variants.first() else {
+                        return Err(unsupported("an unsizing coercion through an empty struct").into());
+                    };
+                    let nfields = v.fields.len;
+                    let sp = match src {
+                        Src::At(p) => p,
+                        Src::Temp(id) => Pointer { alloc: id, offset: 0 },
+                        Src::Imm(_) => return Err(malformed("a struct unsizing of an immediate").into()),
+                    };
+                    let mut next_step: Option<(u64, u64, PTy, PTy)> = None;
+                    for fi in 0..nfields {
+                        let fty_s = self.field_ty(ty, 0, fi)?;
+                        let fty_t = self.field_ty(next, 0, fi)?;
+                        if fty_s == fty_t {
+                            let fsz = self.size(fty_s)?;
+                            if fsz != 0 {
+                                let soff = self.field_offset(ty, 0, fi)?;
+                                let doff = self.field_offset(next, 0, fi)?;
+                                self.mem_copy(sp.at(soff), dst.at(doff), fsz)?;
+                            }
+                        } else if self.size(fty_s)? == 0 && self.size(fty_t)? == 0 {
+                            continue;
+                        } else {
+                            if next_step.is_some() {
+                                return Err(unsupported("an unsizing coercion through a struct where more than one field differs").into());
+                            }
+                            let soff = self.field_offset(ty, 0, fi)?;
+                            let doff = self.field_offset(next, 0, fi)?;
+                            next_step = Some((soff, doff, fty_s, fty_t));
+                        }
+                    }
+                    let Some((soff, doff, fty_s, fty_t)) = next_step else {
+                        return Err(unsupported("an unsizing coercion through a struct where no field holding bytes differs").into());
+                    };
+                    src = Src::At(sp.at(soff));
+                    dst = dst.at(doff);
+                    ty = fty_s;
+                    next = fty_t;
+                }
+                _ => return Err(unsupported("an unsizing coercion of a value that is not a pointer or a struct holding one").into()),
             }
-            CastKind::Unsize => {
-                let (PNode::Ref(_, s) | PNode::Ptr(_, s), PNode::Ref(_, t) | PNode::Ptr(_, t)) = (from, to) else {
-                    return Err(unsupported("an unsizing of a value that is no reference or pointer, in a constant").into());
-                };
-                let (PNode::Array(_, n), PNode::Slice(_)) = (self.node(s)?, self.node(t)?) else {
-                    return Err(unsupported("an unsizing to a trait object (a vtable) in a constant").into());
-                };
-                let len = self.ground.view().value_u64(n).ok_or(Stop::from(malformed("an array length that is no value")))?;
-                self.copy_out(o, d.ptr, PTR)?;
-                self.mem.write(d.ptr.at(PTR), PTR, Scalar::Int(len as u128))?;
-            }
-            CastKind::ReifyFnPointer => {
-                let PNode::FnDef(k, l) = from else {
-                    return Err(malformed("a fn pointer made of a value that is no fn item").into());
-                };
-                let (k, l) = self.resolve(k, l)?;
-                let inst = instance_key(self.world.code_id(k), l, self.ground.view(), self.alloc).map_err(build_refusal)?;
-                let f = self.mem.allocate(0, 0, false, Origin::Fn(inst))?;
-                self.mem.write(d.ptr, PTR, Scalar::Ptr(Pointer { alloc: f, offset: 0 }))?;
-            }
-            CastKind::ClosureFnPointer => return Err(unsupported("a closure cast to a fn pointer in a constant").into()),
         }
+        Err(unsupported("an unsizing coercion through more nested structs than the bound").into())
+    }
+
+    fn cast(&mut self, d: Pl, kind: CastKind, operand: Operand) -> R<'a, ()> {
+        let o = self.operand(operand)?;
+        let res = (|| -> R<'a, ()> {
+            let (from, to) = (self.node(o.ty)?, self.node(d.ty)?);
+            match kind {
+                CastKind::IntToInt | CastKind::IntToFloat | CastKind::FloatToInt | CastKind::FloatToFloat => {
+                    let v = self.read(o)?;
+                    let v = self.uint(v)?;
+                    let r = arith::num_cast(from, to, v)?;
+                    self.put(d, r)?;
+                }
+                // Same bytes; a wide pointer cast to a thin one keeps its first word.
+                CastKind::PtrToPtr
+                | CastKind::MutToConstPointer
+                | CastKind::UnsafeFnPointer
+                | CastKind::FnPtrToPtr
+                | CastKind::ArrayToPointer
+                | CastKind::FromExposedAddr => {
+                    let size = self.size(d.ty)?;
+                    self.copy_out(o, d.ptr, size)?;
+                }
+                CastKind::ExposeAddr => {
+                    let v = self.read(o)?;
+                    let v = self.uint(v)?;
+                    self.put(d, v)?;
+                }
+                CastKind::Transmute => self.transmute_into(d, o)?,
+                CastKind::Unsize => self.unsize_into(d, o)?,
+                CastKind::ReifyFnPointer => {
+                    let PNode::FnDef(k, l) = from else {
+                        return Err(malformed("a fn pointer made of a value that is no fn item").into());
+                    };
+                    let (k, l) = self.resolve(k, l)?;
+                    let inst = instance_key(self.world.code_id(k), l, self.ground.view(), self.alloc).map_err(build_refusal)?;
+                    let named = ConstFn { key: inst, instance: Instance { item: k, args: l } };
+                    let f = self.fn_alloc(inst, Some(named))?;
+                    self.mem_write(d.ptr, PTR, Scalar::Ptr(Pointer { alloc: f, offset: 0 }))?;
+                }
+                CastKind::ClosureFnPointer => {
+                    let PNode::Closure { owner, .. } = from else {
+                        return Err(malformed("a closure's fn pointer made of a value that is not a closure").into());
+                    };
+                    if self.size(o.ty)? != 0 {
+                        return Err(unsupported("a closure with captures coerced to a fn pointer").into());
+                    }
+                    let PNode::FnPtr(sig, _) = to else {
+                        return Err(malformed("a closure coerced to a type that is not a fn pointer").into());
+                    };
+                    let call_once = match self.world.fn_trait_method(FnTrait::FnOnce) {
+                        FnTraitMethod::Found(item) => item,
+                        FnTraitMethod::Absent => {
+                            return Err(unsupported(
+                                "a closure as a fn pointer in a world that names no `FnOnce::call_once` (ConstWorld::fn_trait_method)",
+                            )
+                            .into());
+                        }
+                        FnTraitMethod::Pending { trait_ } => {
+                            return Err(Refusal::Missing {
+                                what: "the trait members for `FnOnce::call_once` (ConstWorld::fn_trait_method)",
+                                item: trait_,
+                            }
+                            .into());
+                        }
+                    };
+                    let mut inputs: Vec<PTy, Alloc<'a>> = Vec::new_in(self.alloc);
+                    let all = self.ground.view().list(sig).map_err(|_| malformed("a list past the ground table"))?;
+                    let (_, ins) = all.split_last().ok_or(Stop::from(malformed("a fn pointer type without its output")))?;
+                    inputs.extend_from_slice(ins);
+                    let list = self.ground.intern_list(&inputs).map_err(|_| malformed("the ground table is full"))?;
+                    let tuple = self.ground.intern(PNode::Tuple(list)).map_err(|_| malformed("the ground table is full"))?;
+                    let own = self.ground.intern_list(&[o.ty, tuple]).map_err(|_| malformed("the ground table is full"))?;
+                    let method = Instance { item: call_once, args: own };
+                    let key_args = closure_method_key_args(method, &mut *self.ground, self.alloc)
+                        .map_err(|_| malformed("a closure's `call_once` instance past the ground table"))?;
+                    let inst = instance_key(self.world.code_id(owner), key_args, self.ground.view(), self.alloc).map_err(build_refusal)?;
+                    let named = ConstFn { key: inst, instance: method };
+                    let f = self.fn_alloc(inst, Some(named))?;
+                    self.mem_write(d.ptr, PTR, Scalar::Ptr(Pointer { alloc: f, offset: 0 }))?;
+                }
+            }
+            Ok(())
+        })();
         self.release(o);
-        Ok(())
+        res
     }
 
     /// `lhs op rhs`: the result and whether it overflowed. A wrapping operator's result is
     /// the wrapped value; `checked` makes a shift past the width an overflow, not a refusal.
-    fn binary(&mut self, op: BinOp, lhs: Operand, rhs: Operand, checked: bool) -> R<'a, (Scalar, bool)> {
-        let (a, b) = (self.operand(lhs)?, self.operand(rhs)?);
-        let (x, y) = (self.read(a)?, self.read(b)?);
+    pub(crate) fn binary(&mut self, op: BinOp, lhs: Operand, rhs: Operand, checked: bool) -> R<'a, (Scalar, bool)> {
+        let a = self.operand(lhs)?;
+        let b = match self.operand(rhs) {
+            Ok(b) => b,
+            Err(e) => {
+                self.release(a);
+                return Err(e);
+            }
+        };
+        let x = match self.read(a) {
+            Ok(x) => x,
+            Err(e) => {
+                self.release(a);
+                self.release(b);
+                return Err(e);
+            }
+        };
+        let y = self.read(b);
         self.release(a);
         self.release(b);
+        let y = y?;
         let (na, nb) = (self.node(a.ty)?, self.node(b.ty)?);
         match (x, y) {
             (Scalar::Int(x), Scalar::Int(y)) => self.arith(op, na, nb, x, y, checked),
@@ -1287,7 +2178,11 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
                     return Err(malformed("an offset of a value that is no pointer").into());
                 };
                 let size = self.size(t)?;
-                Ok((Scalar::Ptr(p.at((n as u64).wrapping_mul(size))), false))
+                let n64 = u64::from_le_bytes({
+                    let bytes = n.to_le_bytes();
+                    [bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]]
+                });
+                Ok((Scalar::Ptr(p.at(n64.wrapping_mul(size))), false))
             }
             (Scalar::Ptr(p), Scalar::Ptr(q)) => {
                 // Two pointers compare only within one allocation in a constant.
@@ -1296,7 +2191,7 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
                 }
                 let o = p.offset.cmp(&q.offset);
                 let holds = holds(op, Some(o)).ok_or(Stop::from(Refusal::PointerAsInt))?;
-                Ok((Scalar::Int(holds as u128), false))
+                Ok((Scalar::Int(u128::from(holds)), false))
             }
             _ => Err(Refusal::PointerAsInt.into()),
         }
@@ -1305,7 +2200,7 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
     fn arith(&mut self, op: BinOp, na: PNode, nb: PNode, x: u128, y: u128, checked: bool) -> R<'a, (Scalar, bool)> {
         if let PNode::Float(f) = na {
             if let Some(h) = holds(op, arith::float_cmp(f, x, y)) {
-                return Ok((Scalar::Int(h as u128), false));
+                return Ok((Scalar::Int(u128::from(h)), false));
             }
             if op == BinOp::Cmp {
                 return Err(malformed("a three-way compare of floats").into());
@@ -1316,7 +2211,7 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
         let rhs = arith::int_info(nb).ok_or(Stop::from(malformed("a right operand that is no integer")))?;
         let ord = if signed { arith::sext(x, bits).cmp(&arith::sext(y, bits)) } else { x.cmp(&y) };
         if let Some(h) = holds(op, Some(ord)) {
-            return Ok((Scalar::Int(h as u128), false));
+            return Ok((Scalar::Int(u128::from(h)), false));
         }
         match op {
             // `Ordering` as `i8`; `put` masks it to the destination.
@@ -1334,95 +2229,19 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
                 Err(e) => Err(e.into()),
             },
             BinOp::Shl | BinOp::Shr => {
-                let amount = if rhs.1 { arith::sext(y, rhs.0) } else { y as i128 };
-                let far = amount < 0 || amount >= bits as i128;
+                let amount = if rhs.1 { arith::sext(y, rhs.0) } else { i128::try_from(y).unwrap_or(i128::MAX) };
+                let far = amount < 0 || amount >= i128::from(bits);
                 if far && !checked {
                     return Err(Refusal::ShiftTooFar { amount, bits }.into());
                 }
                 // A checked shift past the width shifts by the amount masked (`overflowing_shl`).
-                let y = if far { y & (bits as u128 - 1) } else { y };
+                let y = if far { y & (u128::from(bits) - 1) } else { y };
                 Ok((Scalar::Int(arith::int_binop(typeck_op(op)?, x, y, bits, signed, rhs, Plant::None)?), far))
             }
             BinOp::Div | BinOp::Rem | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
                 Ok((Scalar::Int(arith::int_binop(typeck_op(op)?, x, y, bits, signed, rhs, Plant::None)?), false))
             }
             _ => Err(malformed("an operator with no integer meaning").into()),
-        }
-    }
-
-    /// The intrinsics answered from the rows alone; the rest wait for the lift of
-    /// `Machine::intrinsic` (see the report).
-    fn intrinsic(&mut self, i: Intrinsic, iargs: List, args: Ops, d: Option<Pl>) -> R<'a, ()> {
-        let body = self.top()?.body;
-        let mut ops = body.ops(args);
-        let op0 = ops.next();
-        let op1 = ops.next();
-        let need_dest = |d: Option<Pl>| d.ok_or(Stop::from(malformed("an intrinsic call with no destination")));
-        let two = || match (op0, op1) {
-            (Some(a), Some(b)) => Ok((a, b)),
-            _ => Err(Stop::from(malformed("a two-operand intrinsic without two operands"))),
-        };
-        match i {
-            Intrinsic::SizeOf | Intrinsic::AlignOf => {
-                let t = *self.ground.view().list(iargs).map_err(|_| malformed("an intrinsic's arguments"))?.first().ok_or(Stop::from(malformed("`size_of` with no type")))?;
-                let (size, align) = self.size_align(t)?;
-                let v = if i == Intrinsic::SizeOf { size as u128 } else { 1u128 << align };
-                self.put(need_dest(d)?, v)
-            }
-            Intrinsic::VariantCount => {
-                let t = *self.ground.view().list(iargs).map_err(|_| malformed("an intrinsic's arguments"))?.first().ok_or(Stop::from(malformed("`variant_count` with no type")))?;
-                let n = match self.ground.view().node(t).map_err(|_| malformed("`variant_count` type"))? {
-                    blaze_typeck::PNode::Adt(key, _) => {
-                        let adt = self.world.adt(key).ok_or(Stop::from(Refusal::Missing { what: "ADT definition", item: key }))?;
-                        match adt.kind {
-                            blaze_typeck::AdtKind::Enum => u128::try_from(adt.variants.len()).unwrap_or(0),
-                            blaze_typeck::AdtKind::Struct | blaze_typeck::AdtKind::Union => 0,
-                        }
-                    }
-                    _ => 0,
-                };
-                self.put(need_dest(d)?, n)
-            }
-            // `true` in a constant, as the old evaluator answers.
-            Intrinsic::UbChecks => self.put(need_dest(d)?, 1),
-            Intrinsic::Likely | Intrinsic::Unlikely | Intrinsic::BlackBox => {
-                let a = op0.ok_or(Stop::from(malformed("a one-operand intrinsic with none")))?;
-                self.operand_into(a, need_dest(d)?.ptr)
-            }
-            Intrinsic::Assume => {
-                let a = op0.ok_or(Stop::from(malformed("`assume` with no argument")))?;
-                if self.int(a)? == 0 {
-                    return Err(Refusal::Unreachable.into());
-                }
-                Ok(())
-            }
-            Intrinsic::ColdPath => Ok(()),
-            Intrinsic::Unreachable => Err(Refusal::Unreachable.into()),
-            Intrinsic::AbortImmediate => Err(Stop::Fault(Fault::Abort)),
-            Intrinsic::WrappingAdd | Intrinsic::WrappingSub | Intrinsic::WrappingMul => {
-                let (a, b) = two()?;
-                let op = match i {
-                    Intrinsic::WrappingAdd => BinOp::Add,
-                    Intrinsic::WrappingSub => BinOp::Sub,
-                    _ => BinOp::Mul,
-                };
-                let (s, _) = self.binary(op, a, b, true)?;
-                let d = need_dest(d)?;
-                let size = self.size(d.ty)?;
-                self.mem.write(d.ptr, size, s)?;
-                Ok(())
-            }
-            Intrinsic::AddWithOverflow | Intrinsic::SubWithOverflow | Intrinsic::MulWithOverflow => {
-                let (a, b) = two()?;
-                let op = match i {
-                    Intrinsic::AddWithOverflow => BinOp::Add,
-                    Intrinsic::SubWithOverflow => BinOp::Sub,
-                    _ => BinOp::Mul,
-                };
-                let (s, o) = self.binary(op, a, b, true)?;
-                self.write_checked(need_dest(d)?, s, o)
-            }
-            _ => Err(unsupported("an intrinsic not lifted from blaze-consteval's `Machine::intrinsic` yet").into()),
         }
     }
 
@@ -1449,6 +2268,7 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
                 let target = match self.mem.get(to)?.origin {
                     Origin::Static(s) => DataTarget::Static(s),
                     Origin::Fn(i) => DataTarget::Fn(i),
+                    Origin::Vtable(v) => DataTarget::Vtable(v),
                     Origin::Local if to != root => return Err(Refusal::Dangling.into()),
                     _ => {
                         let n = match order.iter().position(|&x| x == to) {
@@ -1458,10 +2278,11 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
                                 order.len() - 1
                             }
                         };
-                        DataTarget::Local(n as u32)
+                        DataTarget::Local(u32::try_from(n).map_err(|_| malformed("allocation index overflow"))?)
                     }
                 };
-                relocs.push(DataReloc { offset: offset as u32, target });
+                let off32 = u32::try_from(offset).map_err(|_| unsupported("a pointer past 4 GiB in a constant"))?;
+                relocs.push(DataReloc { offset: off32, target });
             }
             allocs.push(DataAlloc { bytes, align, mutable: false, relocs });
         }
@@ -1483,24 +2304,103 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
         Ok(ground_own_list(&mut cx, l, 0)?)
     }
 
-    fn node(&self, ty: PTy) -> R<'a, PNode> {
+    pub(crate) fn closure_env_ty(&mut self, ty: PTy) -> R<'a, PTy> {
+        let PNode::Closure { owner, ordinal, args } = self.node(ty)? else {
+            return Err(malformed("a closure's environment asked of another type").into());
+        };
+        let c = self
+            .world
+            .closure(owner, ordinal)
+            .ok_or(Stop::from(unsupported("a closure whose facts the world did not answer")))?;
+        let mut argv: Vec<PTy, Alloc<'a>> = Vec::new_in(self.alloc);
+        argv.extend_from_slice(
+            self.ground
+                .view()
+                .list(args)
+                .map_err(|_| malformed("a closure's arguments past the ground table"))?,
+        );
+        Ok(ground(c.types, c.env, &argv, &mut *self.ground, self.alloc, self.world).map_err(build_refusal)?)
+    }
+
+    pub(crate) fn field_ty(&mut self, ty: PTy, variant: u32, field: u32) -> R<'a, PTy> {
+        match self.node(ty)? {
+            PNode::Tuple(l) | PNode::Record(_, l) => {
+                let idx = usize::try_from(field).map_err(|_| malformed("a tuple field past its tuple"))?;
+                self.ground
+                    .view()
+                    .list(l)
+                    .ok()
+                    .and_then(|s| s.get(idx).copied())
+                    .ok_or(Stop::from(malformed("a tuple field past its tuple")))
+            }
+            PNode::Union(l) => {
+                if field != 0 {
+                    return Err(malformed("a union variant field other than 0").into());
+                }
+                let idx = usize::try_from(variant).map_err(|_| malformed("a union variant past its union"))?;
+                self.ground
+                    .view()
+                    .list(l)
+                    .ok()
+                    .and_then(|s| s.get(idx).copied())
+                    .ok_or(Stop::from(malformed("a union variant past its union")))
+            }
+            PNode::Adt(key, args) => {
+                let adt = self
+                    .world
+                    .adt(key)
+                    .ok_or(Stop::from(Refusal::Missing { what: "ADT definition", item: key }))?;
+                let v_idx = usize::try_from(variant).map_err(|_| malformed("a variant past its ADT"))?;
+                let v = adt.variants.get(v_idx).ok_or(Stop::from(malformed("a variant past its ADT")))?;
+                if field >= v.fields.len {
+                    return Err(malformed("a field past its variant").into());
+                }
+                let f_idx = usize::try_from(v.fields.start + field).map_err(|_| malformed("a field past its ADT"))?;
+                let f = adt.fields.get(f_idx).ok_or(Stop::from(malformed("a field past its ADT")))?;
+                let mut argv: Vec<PTy, Alloc<'a>> = Vec::new_in(self.alloc);
+                argv.extend_from_slice(
+                    self.ground
+                        .view()
+                        .list(args)
+                        .map_err(|_| malformed("an ADT's arguments past the ground table"))?,
+                );
+                Ok(ground(adt.types, f.ty, &argv, &mut *self.ground, self.alloc, self.world).map_err(build_refusal)?)
+            }
+            PNode::Closure { .. } => {
+                let env = self.closure_env_ty(ty)?;
+                let PNode::Tuple(l) = self.node(env)? else {
+                    return Err(malformed("a closure's environment that is not a tuple").into());
+                };
+                let idx = usize::try_from(field).map_err(|_| malformed("a closure capture past its environment"))?;
+                self.ground
+                    .view()
+                    .list(l)
+                    .ok()
+                    .and_then(|s| s.get(idx).copied())
+                    .ok_or(Stop::from(malformed("a closure capture past its environment")))
+            }
+            _ => Err(malformed("a field type asked of a type without fields").into()),
+        }
+    }
+
+    pub(crate) fn node(&self, ty: PTy) -> R<'a, PNode> {
         Ok(self.ground.view().node(ty).map_err(|_| malformed("a type past the ground table"))?)
     }
 
-    fn is_unsized(&mut self, ty: PTy) -> R<'a, bool> {
+    pub(crate) fn is_unsized(&mut self, ty: PTy) -> R<'a, bool> {
         Ok(blaze_consteval::layout::is_unsized(self.world, &mut *self.ground, ty, self.alloc)?)
     }
 
-    fn size_align(&mut self, ty: PTy) -> R<'a, (u64, u8)> {
+    pub(crate) fn size_align(&mut self, ty: PTy) -> R<'a, (u64, u8)> {
         let mut cx = LayoutCx { ground: &mut *self.ground, facts: self.world, scratch: self.alloc };
         self.layout.size_align(ty, &mut cx).map_err(layout_stop)
     }
 
-    fn size(&mut self, ty: PTy) -> R<'a, u64> {
+    pub(crate) fn size(&mut self, ty: PTy) -> R<'a, u64> {
         Ok(self.size_align(ty)?.0)
     }
 
-    fn field_offset(&mut self, ty: PTy, variant: u32, field: u32) -> R<'a, u64> {
+    pub(crate) fn field_offset(&mut self, ty: PTy, variant: u32, field: u32) -> R<'a, u64> {
         let mut cx = LayoutCx { ground: &mut *self.ground, facts: self.world, scratch: self.alloc };
         self.layout.field_offset(ty, variant, field, &mut cx).map_err(layout_stop)
     }
