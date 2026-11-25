@@ -54,6 +54,11 @@ impl Copy for bool {}
 unsafe fn uf() {}
 fn sf() {}
 
+// std's `env::set_var`/`remove_var` shape: `#[rustc_deprecated_safe_2024]`, unsafe from
+// edition 2024, safe before it (the `deprecated_safe_2024` lint is allow there).
+#[rustc_deprecated_safe_2024]
+unsafe fn dsv() {}
+
 struct S;
 impl S {
     unsafe fn um(&self) {}
@@ -171,6 +176,8 @@ fn check_fns(edition: &'static str, text: &str, fns: &[&str]) -> Vec<(String, St
 const CASES: &str = r#"
 fn call_unsafe() { uf() }
 fn call_unsafe_ok() { unsafe { uf() } }
+fn call_dsv() { dsv() }
+fn call_dsv_ok() { unsafe { dsv() } }
 fn call_safe() { sf() }
 unsafe fn call_in_unsafe_fn() { uf() }
 unsafe fn call_in_unsafe_fn_block() { unsafe { uf() } }
@@ -229,6 +236,8 @@ fn nested_closure_block(p: *const u8) { let _c = || unsafe { *p }; }
 const WANT: &[(&str, &str)] = &[
     ("call_unsafe", "E0133 call to unsafe function `uf` is unsafe and requires unsafe block (E0133 RequiresUnsafe)"),
     ("call_unsafe_ok", "clean"),
+    ("call_dsv", "E0133 call to unsafe function `dsv` is unsafe and requires unsafe block (E0133 RequiresUnsafe)"),
+    ("call_dsv_ok", "clean"),
     ("call_safe", "clean"),
     // `unsafe_op_in_unsafe_fn`, edition 2024: a lint finding (no error), at the call.
     ("call_in_unsafe_fn", "lint [\"unsafe-op-in-unsafe-fn at *"),
@@ -304,6 +313,21 @@ fn unsafe_operations_need_unsafe() {
     }
     println!("{} of {} cases as wanted", WANT.len() - wrong.len(), WANT.len());
     assert!(wrong.is_empty(),"{} of {} cases wrong:\n{}", wrong.len(), WANT.len(), wrong.join("\n"));
+}
+
+/// Before 2024 an `unsafe fn`'s body is itself unsafe context and the words say so
+/// ("requires unsafe function or block"); the same call inside `unsafe` is clean.
+#[test]
+fn deprecated_safe_2024_is_safe_before_2024() {
+    let text = "fn call_dsv_2021() { dsv() }\nfn call_dsv_2021_ok() { unsafe { dsv() } }\n";
+    let got = check_fns("2021", text, &["call_dsv_2021", "call_dsv_2021_ok"]);
+    assert_eq!(
+        got,
+        vec![
+            ("call_dsv_2021".to_string(), "clean".to_string()),
+            ("call_dsv_2021_ok".to_string(), "clean".to_string()),
+        ]
+    );
 }
 
 /// Before 2024 an `unsafe fn`'s body is itself unsafe context and the words say so
