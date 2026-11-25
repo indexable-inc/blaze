@@ -660,6 +660,7 @@ dependencies = [
  "blaze-export",
  "blaze-fetch",
  "blaze-file-items",
+ "blaze-git-fetch",
  "blaze-h1",
  "blaze-hash",
  "blaze-http",
