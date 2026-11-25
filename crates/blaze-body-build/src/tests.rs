@@ -2005,3 +2005,638 @@ fn inline_asm_aarch64_in_out_inout_const_sym_label_builds_and_verifies() {
     let llir = printed(&lbuilt);
     assert!(llir.contains("asm_br "), "InlineAsm with label must emit LIR asm_br:\n{llir}");
 }
+
+/// End-to-end coroutine build + LIR execution tests in `blaze-body-build`:
+/// 1. Multi-await coroutine with captured upvar (`AggregateKind::Coroutine`) + non-`Copy` droppable
+///    local live across `.await`: executes `poll` -> `Pending` -> `Pending` -> `Ready(sum)` AND
+///    executes cancel drop while suspended (`BuiltCoroutine::drop`), verifying exact drop counts!
+/// 2. `Poll<!>` diverging await coroutine builds, verifies, and suspends cleanly.
+/// 3. `AssertKind::ResumedAfterReturn` and `AssertKind::ResumedAfterPanic` emit calls to the
+///    corresponding `panic_const_async_fn_resumed*` lang fns, and `build_drop_glue` refuses
+///    `PNode::Coroutine` cleanly.
+#[test]
+fn coroutine_state_machine_executes_poll_resume_cancel_and_panics() {
+    use blaze_body::{
+        BlockKind as BodyBlockKind, BodyBuilder, Callee, ConstDecl, ConstKind, LocalDecl, LocalKind,
+        Operand, Proj, Role, Span, StmtKind, Unwind, Value,
+    };
+    use blaze_build::{AsyncItems, CoroutineFacts, StateShape};
+    use blaze_lir::eval::{Bodies, BodyId, Val};
+    use blaze_lir::func::RefId;
+    use blaze_typeck::{AdtKind, CtorKind, ExprId, Field, List, Name, PatId, UintTy, Variant};
+
+    const CORO_OWNER: ItemKey = ItemKey(0xc001);
+    const NEVER_OWNER: ItemKey = ItemKey(0xc002);
+    const POLL_ADT: ItemKey = ItemKey(0xc010);
+    const PIN_ADT: ItemKey = ItemKey(0xc011);
+    const GUARD_ADT: ItemKey = ItemKey(0xc012);
+    const SUB_FUT_ADT: ItemKey = ItemKey(0xc013);
+    const INTO_FUT_FN: ItemKey = ItemKey(0xc020);
+    const FUTURE_POLL_FN: ItemKey = ItemKey(0xc021);
+    const RESUME_FN: ItemKey = ItemKey(0xc022);
+    const DROP_IN_PLACE_FN: ItemKey = ItemKey(0xc023);
+    const GUARD_DROP_FN: ItemKey = ItemKey(0xc024);
+    const RESUMED_PANIC_FN: ItemKey = ItemKey(0xc025);
+    const RESUMED_AFTER_PANIC_FN: ItemKey = ItemKey(0xc026);
+    const CREATOR_FN: ItemKey = ItemKey(0xc027);
+
+    // Build shared ADT/coroutine type table.
+    let mut adt_tys = PortableTys::new_in(heap());
+    let p0 = adt_tys.intern(PNode::Param(0)).unwrap();
+    let empty_a = adt_tys.intern_list(&[]).unwrap();
+    let i64_a = adt_tys.intern(PNode::Int(IntTy::I64)).unwrap();
+    let ptr_i64_a = adt_tys.intern(PNode::Ptr(Mutbl::Mut, i64_a)).unwrap();
+    let guard_a = adt_tys.intern(PNode::Adt(GUARD_ADT, empty_a)).unwrap();
+    let never_a = adt_tys.intern(PNode::Never).unwrap();
+    let env_list = adt_tys.intern_list(&[i64_a, ptr_i64_a]).unwrap();
+    let env_tuple_a = adt_tys.intern(PNode::Tuple(env_list)).unwrap();
+    let never_env_a = adt_tys.intern(PNode::Tuple(empty_a)).unwrap();
+
+    let poll_variants = [
+        Variant { key: ItemKey(0xc101), name: Name::of("Ready"), ctor: CtorKind::Tuple, fields: List { start: 0, len: 1 } },
+        Variant { key: ItemKey(0xc102), name: Name::of("Pending"), ctor: CtorKind::Unit, fields: List { start: 1, len: 0 } },
+    ];
+    let poll_fields = [Field { name: Name::of("0"), ty: p0 }];
+    let pin_variants = [
+        Variant { key: ItemKey(0xc103), name: Name::of("Pin"), ctor: CtorKind::Braces, fields: List { start: 0, len: 1 } },
+    ];
+    let pin_fields = [Field { name: Name::of("pointer"), ty: p0 }];
+    // `struct Guard(*mut i64)` — dropping increments the counter at `*self.0`.
+    let guard_variants = [
+        Variant { key: ItemKey(0xc104), name: Name::of("Guard"), ctor: CtorKind::Tuple, fields: List { start: 0, len: 1 } },
+    ];
+    let guard_fields = [Field { name: Name::of("0"), ty: ptr_i64_a }];
+    // `struct SubFut(i64)` — dummy sub-future storing step id.
+    let sub_variants = [
+        Variant { key: ItemKey(0xc105), name: Name::of("SubFut"), ctor: CtorKind::Tuple, fields: List { start: 0, len: 1 } },
+    ];
+    let sub_fields = [Field { name: Name::of("0"), ty: i64_a }];
+
+    struct CoroWorld<'a> {
+        adt_tys: &'a PortableTys<'static>,
+        poll_variants: &'a [Variant],
+        poll_fields: &'a [Field],
+        pin_variants: &'a [Variant],
+        pin_fields: &'a [Field],
+        guard_variants: &'a [Variant],
+        guard_fields: &'a [Field],
+        sub_variants: &'a [Variant],
+        sub_fields: &'a [Field],
+        env_tuple: PTy,
+        output_i64: PTy,
+        never_env: PTy,
+        output_never: PTy,
+        state_shape: Option<StateShape>,
+    }
+
+    impl LayoutFacts for CoroWorld<'_> {
+        fn adt(&self, k: ItemKey) -> Option<Adt<'_>> {
+            match k {
+                POLL_ADT => Some(Adt { kind: AdtKind::Enum, generics: 1, variants: self.poll_variants, fields: self.poll_fields, types: self.adt_tys.view() }),
+                PIN_ADT => Some(Adt { kind: AdtKind::Struct, generics: 1, variants: self.pin_variants, fields: self.pin_fields, types: self.adt_tys.view() }),
+                GUARD_ADT => Some(Adt { kind: AdtKind::Struct, generics: 0, variants: self.guard_variants, fields: self.guard_fields, types: self.adt_tys.view() }),
+                SUB_FUT_ADT => Some(Adt { kind: AdtKind::Struct, generics: 0, variants: self.sub_variants, fields: self.sub_fields, types: self.adt_tys.view() }),
+                _ => None,
+            }
+        }
+        fn repr(&self, k: ItemKey) -> Result<ReprAttrs, Missing> {
+            if k == PIN_ADT {
+                let mut r = ReprAttrs::RUST;
+                r.transparent = true;
+                return Ok(r);
+            }
+            Ok(ReprAttrs::RUST)
+        }
+        fn discriminant(&self, _: ItemKey, _: u32) -> Result<Option<i128>, Missing> { Ok(None) }
+        fn valid_range(&self, _: ItemKey) -> Result<ValidRange, Missing> { Ok(ValidRange::default()) }
+        fn coroutine(&self, owner: ItemKey, ordinal: u32) -> Option<CoroutineFacts<'_>> {
+            if owner == CORO_OWNER && ordinal == 0 {
+                Some(CoroutineFacts { types: self.adt_tys.view(), env: self.env_tuple, output: self.output_i64 })
+            } else if owner == NEVER_OWNER && ordinal == 0 {
+                Some(CoroutineFacts { types: self.adt_tys.view(), env: self.never_env, output: self.output_never })
+            } else {
+                None
+            }
+        }
+        fn coroutine_state(&self, owner: ItemKey, ordinal: u32, _: &[PTy], _: blaze_typeck::PTys<'_>) -> Result<Option<StateShape>, Missing> {
+            if owner == CORO_OWNER && ordinal == 0 {
+                Ok(self.state_shape)
+            } else {
+                Ok(None)
+            }
+        }
+    }
+
+    impl Adts for CoroWorld<'_> {
+        fn adt(&self, k: ItemKey) -> Option<Adt<'_>> { LayoutFacts::adt(self, k) }
+        fn facts(&self) -> &dyn LayoutFacts { self }
+        fn panic(&self) -> Panic { Panic::Abort }
+        fn overflow_checks(&self) -> OverflowChecks { OverflowChecks::On }
+        fn ub_checks(&self) -> blaze_build::UbChecks { blaze_build::UbChecks::Off }
+        fn drop_impl(&self, ty: PTy, g: &mut PortableTys<'_>) -> Result<Option<ItemKey>, blaze_build::BuildError> {
+            Ok(match g.view().node(ty) {
+                Ok(PNode::Adt(GUARD_ADT, _)) => Some(GUARD_DROP_FN),
+                _ => None,
+            })
+        }
+        fn abi(&self, _: ItemKey) -> Option<Abi> { Some(Abi::Rust) }
+        fn lang_fn(&self, name: &str) -> Option<ItemKey> {
+            match name {
+                "drop_in_place" => Some(DROP_IN_PLACE_FN),
+                "panic_const_async_fn_resumed" => Some(RESUMED_PANIC_FN),
+                "panic_const_async_fn_resumed_panic" => Some(RESUMED_AFTER_PANIC_FN),
+                "panic_cannot_unwind" => Some(CANNOT_UNWIND),
+                _ => None,
+            }
+        }
+        fn future_poll(&self) -> Option<ItemKey> { Some(FUTURE_POLL_FN) }
+        fn async_items(&self) -> Option<AsyncItems> {
+            Some(AsyncItems {
+                into_future: INTO_FUT_FN,
+                poll: POLL_ADT,
+                ready: 0,
+                pending: 1,
+                pin: PIN_ADT,
+                resume: RESUME_FN,
+            })
+        }
+    }
+
+    let mut cw = CoroWorld {
+        adt_tys: &adt_tys,
+        poll_variants: &poll_variants,
+        poll_fields: &poll_fields,
+        pin_variants: &pin_variants,
+        pin_fields: &pin_fields,
+        guard_variants: &guard_variants,
+        guard_fields: &guard_fields,
+        sub_variants: &sub_variants,
+        sub_fields: &sub_fields,
+        env_tuple: env_tuple_a,
+        output_i64: i64_a,
+        never_env: never_env_a,
+        output_never: never_a,
+        state_shape: None,
+    };
+
+    // Build a 2-await coroutine body:
+    //   upvars: _1 = base: i64, _2 = drop_counter_ptr: *mut i64
+    //   local _3 = guard: Guard(_2)  (live across BOTH awaits, dropped on normal exit AND cancel!)
+    //   await 1 -> a: i64 (stored in _4, live across await 2!)
+    //   await 2 -> b: i64 (stored in _5)
+    //   drop _3; _0 = _1 + _4 + _5; return
+    let mut from = PortableTys::new_in(heap());
+    let f_empty = from.intern_list(&[]).unwrap();
+    let f_i64 = from.intern(PNode::Int(IntTy::I64)).unwrap();
+    let f_u8 = from.intern(PNode::Uint(UintTy::U8)).unwrap();
+    let f_ptr_i64 = from.intern(PNode::Ptr(Mutbl::Mut, f_i64)).unwrap();
+    let f_guard = from.intern(PNode::Adt(GUARD_ADT, f_empty)).unwrap();
+    let f_sub = from.intern(PNode::Adt(SUB_FUT_ADT, f_empty)).unwrap();
+    let f_sub_l = from.intern_list(&[f_sub]).unwrap();
+    let f_mut_sub = from.intern(PNode::Ref(Mutbl::Mut, f_sub)).unwrap();
+    let f_pin_l = from.intern_list(&[f_mut_sub]).unwrap();
+    let f_pin = from.intern(PNode::Adt(PIN_ADT, f_pin_l)).unwrap();
+    let f_poll_l = from.intern_list(&[f_i64]).unwrap();
+    let f_poll_i64 = from.intern(PNode::Adt(POLL_ADT, f_poll_l)).unwrap();
+    let f_coro = from.intern(PNode::Coroutine { owner: CORO_OWNER, ordinal: 0, args: f_empty }).unwrap();
+    let f_never = from.intern(PNode::Never).unwrap();
+    let f_poll_never_l = from.intern_list(&[f_never]).unwrap();
+    let f_poll_never = from.intern(PNode::Adt(POLL_ADT, f_poll_never_l)).unwrap();
+
+    let mut b = BodyBuilder::new_in(heap());
+    let l0 = b.new_local(LocalDecl { ty: f_i64, kind: LocalKind::Return, mutbl: Mutbl::Mut });
+    let l1 = b.new_local(LocalDecl { ty: f_i64, kind: LocalKind::Arg(0), mutbl: Mutbl::Not });
+    let l2 = b.new_local(LocalDecl { ty: f_ptr_i64, kind: LocalKind::Arg(1), mutbl: Mutbl::Not });
+    let l_guard = b.new_local(LocalDecl { ty: f_guard, kind: LocalKind::Binding(PatId(0)), mutbl: Mutbl::Mut });
+    let l_a = b.new_local(LocalDecl { ty: f_i64, kind: LocalKind::Binding(PatId(1)), mutbl: Mutbl::Mut });
+    let l_b = b.new_local(LocalDecl { ty: f_i64, kind: LocalKind::Binding(PatId(2)), mutbl: Mutbl::Mut });
+    let l_sum1 = b.new_local(LocalDecl { ty: f_i64, kind: LocalKind::Temp(ExprId(9), Role::Value), mutbl: Mutbl::Mut });
+
+    let (p0, p1, p2) = (b.local_place(l0), b.local_place(l1), b.local_place(l2));
+    let (pg, pa, pb, psum1) = (b.local_place(l_guard), b.local_place(l_a), b.local_place(l_b), b.local_place(l_sum1));
+
+    // Helper to emit one `.await` of `SubFut(step_id)` into `dest_place`, dropping `pg` on cancel.
+    let emit_await = |b: &mut BodyBuilder<Alloc<'static>>, step_id: u128, e_id: u32, dest_place: blaze_body::Place| {
+        let k_step = b.new_const(ConstDecl { kind: ConstKind::Scalar { bits: step_id }, ty: f_i64 });
+        let fut = b.new_local(LocalDecl { ty: f_sub, kind: LocalKind::Temp(ExprId(e_id), Role::Awaitee), mutbl: Mutbl::Mut });
+        let pin_ref = b.new_local(LocalDecl { ty: f_mut_sub, kind: LocalKind::Temp(ExprId(e_id), Role::Borrow), mutbl: Mutbl::Mut });
+        let pin = b.new_local(LocalDecl { ty: f_pin, kind: LocalKind::Temp(ExprId(e_id), Role::Pin), mutbl: Mutbl::Mut });
+        let poll_res = b.new_local(LocalDecl { ty: f_poll_i64, kind: LocalKind::Temp(ExprId(e_id), Role::Result), mutbl: Mutbl::Mut });
+        let discr = b.new_local(LocalDecl { ty: f_u8, kind: LocalKind::Temp(ExprId(e_id), Role::Value), mutbl: Mutbl::Mut });
+        let (pfut, ppref, ppin, ppol, pdiscr) = (
+            b.local_place(fut), b.local_place(pin_ref), b.local_place(pin), b.local_place(poll_res), b.local_place(discr),
+        );
+        let head = b.new_block(BodyBlockKind::Normal);
+        let check = b.new_block(BodyBlockKind::Normal);
+        let pending = b.new_block(BodyBlockKind::Normal);
+        let cancel = b.new_block(BodyBlockKind::Normal);
+        let cancel_done = b.new_block(BodyBlockKind::Normal);
+        let ready = b.new_block(BodyBlockKind::Normal);
+
+        b.push(StmtKind::StorageLive(fut), Span::default());
+        let sf_ops = b.operands(&[Operand::Const(k_step)]);
+        b.assign(pfut, Value::Aggregate { kind: blaze_body::AggregateKind::Adt(0), ty: f_sub, operands: sf_ops }, Span::default());
+        b.terminate(StmtKind::Goto(head), Span::default());
+
+        b.start(head);
+        b.push(StmtKind::StorageLive(pin_ref), Span::default());
+        let o = b.origin(false);
+        b.borrow(ppref, blaze_body::BorrowKind::Mut, pfut, o, Span::default());
+        b.push(StmtKind::StorageLive(pin), Span::default());
+        let pin_ops = b.operands(&[Operand::Move(ppref)]);
+        b.assign(ppin, Value::Aggregate { kind: blaze_body::AggregateKind::Adt(0), ty: f_pin, operands: pin_ops }, Span::default());
+        b.push(StmtKind::StorageDead(pin_ref), Span::default());
+        b.push(StmtKind::StorageLive(poll_res), Span::default());
+        let poll_c = b.callee(Callee::Method { key: FUTURE_POLL_FN, args: f_sub_l });
+        let poll_args = b.operands(&[Operand::Move(ppin)]);
+        b.terminate(StmtKind::Call { callee: poll_c, args: poll_args, dest: Some(ppol), target: Some(check), unwind: Unwind::Continue }, Span::default());
+
+        b.start(check);
+        b.push(StmtKind::StorageDead(pin), Span::default());
+        b.push(StmtKind::StorageLive(discr), Span::default());
+        b.assign(pdiscr, Value::Discriminant(ppol), Span::default());
+        let cases = b.cases(&[(0, ready)]);
+        b.terminate(StmtKind::Switch { on: Operand::Copy(pdiscr), cases, otherwise: pending }, Span::default());
+
+        b.start(pending);
+        b.push(StmtKind::StorageDead(discr), Span::default());
+        b.push(StmtKind::StorageDead(poll_res), Span::default());
+        b.terminate(StmtKind::Suspend { resume: head, cancel }, Span::default());
+
+        b.start(cancel);
+        b.push(StmtKind::StorageDead(fut), Span::default());
+        b.terminate(StmtKind::Drop { place: pg, target: cancel_done, unwind: Unwind::Continue }, Span::default());
+        b.start(cancel_done);
+        b.push(StmtKind::StorageDead(l_guard), Span::default());
+        b.terminate(StmtKind::Cancelled, Span::default());
+
+        b.start(ready);
+        b.push(StmtKind::StorageDead(discr), Span::default());
+        let dc = b.project(ppol, Proj::Downcast(0));
+        let fld = b.project(dc, Proj::Field { index: 0, ty: f_i64 });
+        b.assign(dest_place, Value::Use(Operand::Copy(fld)), Span::default());
+        b.push(StmtKind::StorageDead(poll_res), Span::default());
+        b.push(StmtKind::StorageDead(fut), Span::default());
+    };
+
+    let bb0 = b.new_block(BodyBlockKind::Normal);
+    b.start(bb0);
+    b.push(StmtKind::StorageLive(l_guard), Span::default());
+    let gops = b.operands(&[Operand::Copy(p2)]);
+    b.assign(pg, Value::Aggregate { kind: blaze_body::AggregateKind::Adt(0), ty: f_guard, operands: gops }, Span::default());
+    b.push(StmtKind::StorageLive(l_a), Span::default());
+    emit_await(&mut b, 1, 10, pa);
+    b.push(StmtKind::StorageLive(l_b), Span::default());
+    emit_await(&mut b, 2, 20, pb);
+
+    let after_drop = b.new_block(BodyBlockKind::Normal);
+    b.assign(psum1, Value::Binary { op: blaze_body::BinOp::Add, lhs: Operand::Copy(p1), rhs: Operand::Copy(pa) }, Span::default());
+    b.assign(p0, Value::Binary { op: blaze_body::BinOp::Add, lhs: Operand::Copy(psum1), rhs: Operand::Copy(pb) }, Span::default());
+    b.push(StmtKind::StorageDead(l_b), Span::default());
+    b.push(StmtKind::StorageDead(l_a), Span::default());
+    b.terminate(StmtKind::Drop { place: pg, target: after_drop, unwind: Unwind::Continue }, Span::default());
+    b.start(after_drop);
+    b.push(StmtKind::StorageDead(l_guard), Span::default());
+    b.terminate(StmtKind::Return, Span::default());
+
+    let coro_body = b.finish().expect("build coro body");
+    let coro_ver = blaze_body::verify(&coro_body).expect("verify coro body");
+    let mut g = PortableTys::new_in(heap());
+    let built_co = crate::build_coroutine(
+        coro_ver,
+        from.view(),
+        CORO_OWNER,
+        0,
+        &mut Subst { args: &[], ground: &mut g, scratch: heap() },
+        &cw,
+        None,
+        heap(),
+    )
+    .expect("build_coroutine succeeds");
+
+    // Verify `resume` has finished-tag panic calls wired to `RESUMED_PANIC_FN` and `RESUMED_AFTER_PANIC_FN`!
+    assert!(built_co.resume.refs.iter().any(|r| r.item == RESUMED_PANIC_FN), "resume must wire panic_const_async_fn_resumed");
+    assert!(built_co.resume.refs.iter().any(|r| r.item == RESUMED_AFTER_PANIC_FN), "resume must wire panic_const_async_fn_resumed_panic");
+
+    // Now populate `cw.state_shape` and build the creator function using `AggregateKind::Coroutine`!
+    cw.state_shape = Some(built_co.state);
+    let mut cb = BodyBuilder::new_in(heap());
+    let cl0 = cb.new_local(LocalDecl { ty: f_coro, kind: LocalKind::Return, mutbl: Mutbl::Mut });
+    let cl1 = cb.new_local(LocalDecl { ty: f_i64, kind: LocalKind::Arg(0), mutbl: Mutbl::Not });
+    let cl2 = cb.new_local(LocalDecl { ty: f_ptr_i64, kind: LocalKind::Arg(1), mutbl: Mutbl::Not });
+    let (cp0, cp1, cp2) = (cb.local_place(cl0), cb.local_place(cl1), cb.local_place(cl2));
+    let cbb0 = cb.new_block(BodyBlockKind::Normal);
+    cb.start(cbb0);
+    let cops = cb.operands(&[Operand::Copy(cp1), Operand::Copy(cp2)]);
+    cb.assign(cp0, Value::Aggregate { kind: blaze_body::AggregateKind::Coroutine, ty: f_coro, operands: cops }, Span::default());
+    cb.terminate(StmtKind::Return, Span::default());
+    let creator_body = cb.finish().expect("creator body");
+    let creator_ver = blaze_body::verify(&creator_body).expect("verify creator");
+    let built_creator = build(
+        creator_ver,
+        from.view(),
+        CREATOR_FN,
+        &mut Subst { args: &[], ground: &mut g, scratch: heap() },
+        &cw,
+        heap(),
+    )
+    .expect("creator builds with AggregateKind::Coroutine");
+
+    // Build `drop_in_place::<Guard>` shim + `Guard::drop` LIR body that increments `*(guard.0)`!
+    let g_empty = g.intern_list(&[]).unwrap();
+    let guard_g = g.intern(PNode::Adt(GUARD_ADT, g_empty)).unwrap();
+    let built_guard_dip = crate::build_drop_glue(&mut Subst { args: &[guard_g], ground: &mut g, scratch: heap() }, &cw, heap())
+        .expect("Guard drop_in_place builds");
+    let guard_drop_lir = {
+        let mut lb: Builder<Alloc<'static>, Full> = Builder::new_in(64, heap());
+        let sig = lb.sig(Conv::C, Variadic::No, &[blaze_lir::builder::Param::of(blaze_lir::Ty::PTR)], &[]);
+        lb.set_signature(sig);
+        let bb = lb.create_block(BlockKind::Normal);
+        lb.begin(bb);
+        let self_ptr = lb.param(blaze_lir::Ty::PTR);
+        let ctr_ptr = lb.load(blaze_lir::Ty::PTR, blaze_lir::Flags::NONE, self_ptr, 0, blaze_lir::builder::MemAttrs::aligned(3));
+        let cur = lb.load(blaze_lir::Ty::I64, blaze_lir::Flags::NONE, ctr_ptr, 0, blaze_lir::builder::MemAttrs::aligned(3));
+        let one = lb.iconst(blaze_lir::Ty::I64, 1);
+        let next = lb.binary(blaze_lir::Op::Add, blaze_lir::Flags::NONE, cur, one);
+        lb.store(blaze_lir::Flags::NONE, next, ctr_ptr, 0, blaze_lir::builder::MemAttrs::aligned(3));
+        lb.ret(&[]);
+        lb.finish_checked().unwrap()
+    };
+
+    // Build `SubFut::poll(pin: ptr, cx: ptr) -> Poll<i64>`:
+    // `cx` points to a `[poll_count: i64, ready_on: i64]` control block!
+    // Each call increments `*cx`; if `new_count >= ready_on`, returns `Poll::Ready(step_id * 10)`,
+    // else returns `Poll::Pending`!
+    // Poll<i64> layout: 16 bytes (tag at 0, payload at 8) -> passed via sret `result: ptr` (param 0)!
+    let sub_poll_lir = {
+        let mut lb: Builder<Alloc<'static>, Full> = Builder::new_in(64, heap());
+        let sig = lb.sig(Conv::C, Variadic::No, &[blaze_lir::builder::Param::of(blaze_lir::Ty::PTR); 3], &[]);
+        lb.set_signature(sig);
+        let entry = lb.create_block(BlockKind::Normal);
+        let b_ready = lb.create_block(BlockKind::Normal);
+        let b_pend = lb.create_block(BlockKind::Normal);
+        lb.begin(entry);
+        let res = lb.param(blaze_lir::Ty::PTR);
+        let fut_ptr = lb.param(blaze_lir::Ty::PTR);
+        let cx_ptr = lb.param(blaze_lir::Ty::PTR);
+        let step_id = lb.load(blaze_lir::Ty::I64, blaze_lir::Flags::NONE, fut_ptr, 0, blaze_lir::builder::MemAttrs::aligned(3));
+        let cnt = lb.load(blaze_lir::Ty::I64, blaze_lir::Flags::NONE, cx_ptr, 0, blaze_lir::builder::MemAttrs::aligned(3));
+        let one = lb.iconst(blaze_lir::Ty::I64, 1);
+        let cnt1 = lb.binary(blaze_lir::Op::Add, blaze_lir::Flags::NONE, cnt, one);
+        lb.store(blaze_lir::Flags::NONE, cnt1, cx_ptr, 0, blaze_lir::builder::MemAttrs::aligned(3));
+        let need = lb.load(blaze_lir::Ty::I64, blaze_lir::Flags::NONE, cx_ptr, 8, blaze_lir::builder::MemAttrs::aligned(3));
+        let is_ready = lb.icmp(blaze_lir::IntCond::Sge, cnt1, need);
+        lb.br(blaze_lir::Flags::NONE, is_ready, (b_ready, &[]), (b_pend, &[]));
+
+        lb.begin(b_ready);
+        let ten = lb.iconst(blaze_lir::Ty::I64, 10);
+        let val = lb.binary(blaze_lir::Op::Mul, blaze_lir::Flags::NONE, step_id, ten);
+        let tag0 = lb.iconst(blaze_lir::Ty::I64, 0);
+        lb.store(blaze_lir::Flags::NONE, tag0, res, 0, blaze_lir::builder::MemAttrs::aligned(3));
+        lb.store(blaze_lir::Flags::NONE, val, res, 8, blaze_lir::builder::MemAttrs::aligned(3));
+        lb.ret(&[]);
+
+        lb.begin(b_pend);
+        let tag1 = lb.iconst(blaze_lir::Ty::I64, 1);
+        lb.store(blaze_lir::Flags::NONE, tag1, res, 0, blaze_lir::builder::MemAttrs::aligned(3));
+        lb.ret(&[]);
+        lb.finish_checked().unwrap()
+    };
+
+    // Build a harness LIR driver function that runs BOTH:
+    //   Run A (normal completion): create(100, &ctr_a), poll x3 (Pending, Pending, Ready(130)), drop (no-op)
+    //   Run B (cancel while suspended): create(50, &ctr_b), poll x1 (Pending), drop (cancel drops Guard -> ctr_b == 1!)
+    // Returns `(ready_val << 16) | (ctr_a << 8) | ctr_b`!
+    const ID_DRIVER: BodyId = BodyId([0; 32]);
+    const ID_CREATOR: BodyId = BodyId([1; 32]);
+    const ID_POLL: BodyId = BodyId([2; 32]);
+    const ID_RESUME: BodyId = BodyId([3; 32]);
+    const ID_DROP: BodyId = BodyId([4; 32]);
+    const ID_SUB_POLL: BodyId = BodyId([5; 32]);
+    const ID_GUARD_DIP: BodyId = BodyId([6; 32]);
+    const ID_GUARD_DROP: BodyId = BodyId([7; 32]);
+    const ID_TRAP: BodyId = BodyId([8; 32]);
+
+    let trap_lir = trapping();
+    let driver_lir = {
+        let mut lb: Builder<Alloc<'static>, Full> = Builder::new_in(64, heap());
+        let sig = lb.sig(Conv::C, Variadic::No, &[], &[blaze_lir::builder::Param::of(blaze_lir::Ty::I64)]);
+        lb.set_signature(sig);
+        let bb = lb.create_block(BlockKind::Normal);
+        lb.begin(bb);
+        let r_creator = lb.reference(blaze_lir::func::RefKind::Func, 0);
+        let r_poll = lb.reference(blaze_lir::func::RefKind::Func, 1);
+        let r_drop = lb.reference(blaze_lir::func::RefKind::Func, 2);
+
+        let st_a = lb.slot(built_co.state.size, built_co.state.align, blaze_lir::func::SlotKind::Temp);
+        let st_a_ptr = lb.slot_addr(st_a);
+        let st_b = lb.slot(built_co.state.size, built_co.state.align, blaze_lir::func::SlotKind::Temp);
+        let st_b_ptr = lb.slot_addr(st_b);
+        let ctr_a_slot = lb.slot(8, 3, blaze_lir::func::SlotKind::Temp);
+        let ctr_a_ptr = lb.slot_addr(ctr_a_slot);
+        let ctr_b_slot = lb.slot(8, 3, blaze_lir::func::SlotKind::Temp);
+        let ctr_b_ptr = lb.slot_addr(ctr_b_slot);
+        let cx_slot = lb.slot(16, 3, blaze_lir::func::SlotKind::Temp);
+        let cx_ptr = lb.slot_addr(cx_slot);
+        let poll_out = lb.slot(16, 3, blaze_lir::func::SlotKind::Temp);
+        let poll_out_ptr = lb.slot_addr(poll_out);
+
+        let z = lb.iconst(blaze_lir::Ty::I64, 0);
+        lb.store(blaze_lir::Flags::NONE, z, ctr_a_ptr, 0, blaze_lir::builder::MemAttrs::aligned(3));
+        lb.store(blaze_lir::Flags::NONE, z, ctr_b_ptr, 0, blaze_lir::builder::MemAttrs::aligned(3));
+
+        // Run A: create(100, &ctr_a); cx = [0, 2] -> poll 1 Pending (cnt=1), poll 2 Ready(10) + await2 Pending (cnt=1 after reset? No: set need=2 for await1 then cnt=2 >= 2 so await1 ready on poll 2; let's set need=2 -> poll1: cnt=1 Pending; poll2: cnt=2 Ready(10) then await2 cnt=3 >= 2 Ready(20) -> Ready(130)!)
+        // Wait: set need=3 -> poll1: cnt=1 (await1 Pending); poll2: cnt=2 (await1 Pending); poll3: cnt=3 (await1 Ready(10)), await2 cnt=4 (Ready(20)) -> Ready(130)!
+        let sig_creator = lb.sig(
+            Conv::C,
+            Variadic::No,
+            &[
+                blaze_lir::builder::Param::of(blaze_lir::Ty::PTR),
+                blaze_lir::builder::Param::of(blaze_lir::Ty::I64),
+                blaze_lir::builder::Param::of(blaze_lir::Ty::PTR),
+            ],
+            &[],
+        );
+        let sig_poll = lb.sig(Conv::C, Variadic::No, &[blaze_lir::builder::Param::of(blaze_lir::Ty::PTR); 3], &[]);
+        let sig_drop = lb.sig(Conv::C, Variadic::No, &[blaze_lir::builder::Param::of(blaze_lir::Ty::PTR)], &[]);
+
+        let c100 = lb.iconst(blaze_lir::Ty::I64, 100);
+        lb.call(blaze_lir::Flags::NONE, r_creator, sig_creator, &[st_a_ptr, c100, ctr_a_ptr]);
+        let need3 = lb.iconst(blaze_lir::Ty::I64, 3);
+        lb.store(blaze_lir::Flags::NONE, z, cx_ptr, 0, blaze_lir::builder::MemAttrs::aligned(3));
+        lb.store(blaze_lir::Flags::NONE, need3, cx_ptr, 8, blaze_lir::builder::MemAttrs::aligned(3));
+
+        lb.call(blaze_lir::Flags::NONE, r_poll, sig_poll, &[poll_out_ptr, st_a_ptr, cx_ptr]);
+        lb.call(blaze_lir::Flags::NONE, r_poll, sig_poll, &[poll_out_ptr, st_a_ptr, cx_ptr]);
+        lb.call(blaze_lir::Flags::NONE, r_poll, sig_poll, &[poll_out_ptr, st_a_ptr, cx_ptr]);
+        let ready_val = lb.load(blaze_lir::Ty::I64, blaze_lir::Flags::NONE, poll_out_ptr, 8, blaze_lir::builder::MemAttrs::aligned(3));
+        // Drop after completion: must be a no-op (Guard already dropped once!).
+        lb.call(blaze_lir::Flags::NONE, r_drop, sig_drop, &[st_a_ptr]);
+
+        // Run B: create(50, &ctr_b); poll once -> Pending; drop while suspended -> cancel drops Guard!
+        let c50 = lb.iconst(blaze_lir::Ty::I64, 50);
+        lb.call(blaze_lir::Flags::NONE, r_creator, sig_creator, &[st_b_ptr, c50, ctr_b_ptr]);
+        lb.store(blaze_lir::Flags::NONE, z, cx_ptr, 0, blaze_lir::builder::MemAttrs::aligned(3));
+        lb.store(blaze_lir::Flags::NONE, need3, cx_ptr, 8, blaze_lir::builder::MemAttrs::aligned(3));
+        lb.call(blaze_lir::Flags::NONE, r_poll, sig_poll, &[poll_out_ptr, st_b_ptr, cx_ptr]);
+        lb.call(blaze_lir::Flags::NONE, r_drop, sig_drop, &[st_b_ptr]);
+
+        let ctr_a = lb.load(blaze_lir::Ty::I64, blaze_lir::Flags::NONE, ctr_a_ptr, 0, blaze_lir::builder::MemAttrs::aligned(3));
+        let ctr_b = lb.load(blaze_lir::Ty::I64, blaze_lir::Flags::NONE, ctr_b_ptr, 0, blaze_lir::builder::MemAttrs::aligned(3));
+        let s16 = lb.iconst(blaze_lir::Ty::I64, 16);
+        let s8 = lb.iconst(blaze_lir::Ty::I64, 8);
+        let p_hi = lb.binary(blaze_lir::Op::Shl, blaze_lir::Flags::NONE, ready_val, s16);
+        let p_mid = lb.binary(blaze_lir::Op::Shl, blaze_lir::Flags::NONE, ctr_a, s8);
+        let p1 = lb.binary(blaze_lir::Op::Or, blaze_lir::Flags::NONE, p_hi, p_mid);
+        let packed = lb.binary(blaze_lir::Op::Or, blaze_lir::Flags::NONE, p1, ctr_b);
+        lb.ret(&[packed]);
+        lb.finish_checked().unwrap()
+    };
+
+    struct CoroBodies<'a> {
+        driver: View<'a>,
+        creator: &'a Built<Alloc<'static>>,
+        poll: &'a Built<Alloc<'static>>,
+        resume: &'a Built<Alloc<'static>>,
+        drop: &'a Built<Alloc<'static>>,
+        sub_poll: View<'a>,
+        guard_dip: &'a Built<Alloc<'static>>,
+        guard_drop: View<'a>,
+        trap: View<'a>,
+    }
+    impl<'a> CoroBodies<'a> {
+        fn resolve_inst(&self, inst: blaze_build::Instance) -> Option<(BodyId, View<'a>)> {
+            match inst.item {
+                RESUME_FN => Some((ID_RESUME, self.resume.func.view())),
+                FUTURE_POLL_FN => Some((ID_SUB_POLL, self.sub_poll)),
+                DROP_IN_PLACE_FN => Some((ID_GUARD_DIP, self.guard_dip.func.view())),
+                GUARD_DROP_FN => Some((ID_GUARD_DROP, self.guard_drop)),
+                RESUMED_PANIC_FN | RESUMED_AFTER_PANIC_FN => Some((ID_TRAP, self.trap)),
+                _ => None,
+            }
+        }
+    }
+    impl Bodies for CoroBodies<'_> {
+        fn callee(&self, caller: BodyId, r: RefId) -> Option<(BodyId, View<'_>)> {
+            let idx = r.0 as usize;
+            if caller == ID_DRIVER {
+                return match idx {
+                    0 => Some((ID_CREATOR, self.creator.func.view())),
+                    1 => Some((ID_POLL, self.poll.func.view())),
+                    2 => Some((ID_DROP, self.drop.func.view())),
+                    _ => None,
+                };
+            }
+            let refs = match caller {
+                ID_CREATOR => &self.creator.refs,
+                ID_POLL => &self.poll.refs,
+                ID_RESUME => &self.resume.refs,
+                ID_DROP => &self.drop.refs,
+                ID_GUARD_DIP => &self.guard_dip.refs,
+                _ => return None,
+            };
+            self.resolve_inst(*refs.get(idx)?)
+        }
+        fn target(&self, caller: BodyId, r: RefId) -> Option<blaze_lir::body::Target> {
+            self.callee(caller, r).map(|(id, _)| blaze_lir::body::Target::Func(id))
+        }
+        fn body(&self, id: BodyId) -> Option<View<'_>> {
+            match id {
+                ID_DRIVER => Some(self.driver),
+                ID_CREATOR => Some(self.creator.func.view()),
+                ID_POLL => Some(self.poll.func.view()),
+                ID_RESUME => Some(self.resume.func.view()),
+                ID_DROP => Some(self.drop.func.view()),
+                ID_SUB_POLL => Some(self.sub_poll),
+                ID_GUARD_DIP => Some(self.guard_dip.func.view()),
+                ID_GUARD_DROP => Some(self.guard_drop),
+                ID_TRAP => Some(self.trap),
+                _ => None,
+            }
+        }
+    }
+
+    let bodies = CoroBodies {
+        driver: driver_lir.view(),
+        creator: &built_creator,
+        poll: &built_co.poll,
+        resume: &built_co.resume,
+        drop: &built_co.drop,
+        sub_poll: sub_poll_lir.view(),
+        guard_dip: &built_guard_dip,
+        guard_drop: guard_drop_lir.view(),
+        trap: trap_lir.view(),
+    };
+    let out = blaze_lir::eval::run_calls_in(driver_lir.view(), ID_DRIVER, &[], 100_000, &bodies, heap()).expect("driver runs cleanly");
+    let vals = returned(out);
+    assert_eq!(vals.len(), 1);
+    let packed = match vals[0] {
+        Val::Int(n) => n,
+        other => panic!("expected packed int result, got {other:?}"),
+    };
+    let ready_val = packed >> 16;
+    let ctr_a = (packed >> 8) & 0xff;
+    let ctr_b = packed & 0xff;
+    assert_eq!(ready_val, 130, "expected 100 + 10 + 20 == 130 across 2 awaits");
+    assert_eq!(ctr_a, 1, "Guard must drop exactly once on normal completion (and not again on post-Return drop)");
+    assert_eq!(ctr_b, 1, "Guard must drop exactly once on cancel while suspended");
+
+    // 2. `Poll<!>` diverging coroutine builds and verifies cleanly with zero-sized `Poll<!>`.
+    let mut nb = BodyBuilder::new_in(heap());
+    let _nl0 = nb.new_local(LocalDecl { ty: f_never, kind: LocalKind::Return, mutbl: Mutbl::Mut });
+    let _npoll = nb.new_local(LocalDecl { ty: f_poll_never, kind: LocalKind::Temp(ExprId(0), Role::Result), mutbl: Mutbl::Mut });
+    let nbb0 = nb.new_block(BodyBlockKind::Normal);
+    let ncancel = nb.new_block(BodyBlockKind::Normal);
+    nb.start(nbb0);
+    nb.terminate(StmtKind::Suspend { resume: nbb0, cancel: ncancel }, Span::default());
+    nb.start(ncancel);
+    nb.terminate(StmtKind::Cancelled, Span::default());
+    let never_body = nb.finish().expect("never coro body");
+    let never_ver = blaze_body::verify(&never_body).expect("verify never coro");
+    let built_never = crate::build_coroutine(
+        never_ver,
+        from.view(),
+        NEVER_OWNER,
+        0,
+        &mut Subst { args: &[], ground: &mut g, scratch: heap() },
+        &cw,
+        None,
+        heap(),
+    )
+    .expect("Poll<!> coroutine builds cleanly");
+    assert!(printed(&built_never.resume).contains("switch "), "split Poll<!> resume must switch on state tag");
+    assert!(printed(&built_never.drop).contains("switch "), "split Poll<!> drop must switch on state tag");
+
+    // 3. `AssertKind::ResumedAfterReturn` and `AssertKind::ResumedAfterPanic` emit the right lang calls!
+    for (kind, want_item) in [
+        (blaze_body::AssertKind::ResumedAfterReturn, RESUMED_PANIC_FN),
+        (blaze_body::AssertKind::ResumedAfterPanic, RESUMED_AFTER_PANIC_FN),
+    ] {
+        let mut ab = BodyBuilder::new_in(heap());
+        let al0 = ab.new_local(LocalDecl { ty: f_i64, kind: LocalKind::Return, mutbl: Mutbl::Mut });
+        let al1 = ab.new_local(LocalDecl { ty: f_u8, kind: LocalKind::Arg(0), mutbl: Mutbl::Not });
+        let (ap0, ap1) = (ab.local_place(al0), ab.local_place(al1));
+        let k0 = ab.new_const(ConstDecl { kind: ConstKind::Scalar { bits: 0 }, ty: f_i64 });
+        let abb0 = ab.new_block(BodyBlockKind::Normal);
+        let abb1 = ab.new_block(BodyBlockKind::Normal);
+        let empty_msg = ab.operands(&[]);
+        ab.start(abb0);
+        ab.terminate(
+            StmtKind::Assert { cond: Operand::Copy(ap1), expected: true, kind, msg: empty_msg, target: abb1, unwind: Unwind::Continue },
+            Span::default(),
+        );
+        ab.start(abb1);
+        ab.assign(ap0, Value::Use(Operand::Const(k0)), Span::default());
+        ab.terminate(StmtKind::Return, Span::default());
+        let abody = ab.finish().unwrap();
+        let aver = blaze_body::verify(&abody).unwrap();
+        let abuilt = build(aver, from.view(), ITEM, &mut Subst { args: &[], ground: &mut g, scratch: heap() }, &cw, heap()).unwrap();
+        assert!(abuilt.refs.iter().any(|r| r.item == want_item), "assert {kind:?} must call {want_item:?}");
+    }
+
+    // 4. `build_drop_glue` explicitly refuses `PNode::Coroutine` (its drop glue is `BuiltCoroutine::drop`).
+    let coro_g = g.intern(PNode::Coroutine { owner: CORO_OWNER, ordinal: 0, args: g_empty }).unwrap();
+    let drop_err = crate::build_drop_glue(&mut Subst { args: &[coro_g], ground: &mut g, scratch: heap() }, &cw, heap());
+    assert!(drop_err.is_err(), "build_drop_glue must refuse PNode::Coroutine rather than silently emitting a no-op");
+    let _ = guard_a;
+}

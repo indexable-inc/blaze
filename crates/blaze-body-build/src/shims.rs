@@ -1083,6 +1083,11 @@ impl<'a, 'g, 't, A: Allocator + Copy> ShimCx<'a, 'g, 't, A> {
         }
 
         match self.node(g)? {
+            PNode::Coroutine { .. } => {
+                return Err(self.malformed(
+                    "a coroutine's `drop_in_place` glue is built by `build_coroutine` (`BuiltCoroutine::drop`), not `build_drop_glue`",
+                ));
+            }
             PNode::Dynamic(_) => {
                 let &[data, vt] = vals.as_slice() else {
                     return Err(self.malformed("`drop_in_place::<dyn T>` without wide pointer parameters"));

@@ -593,7 +593,7 @@ pub fn check_refs(body: &BodyRef<'_>, at: Stmt, kind: &StmtKind) -> Result<(), V
             r.within(Table::Callees, callee.0, body.callees())?;
             r.ops(args)
         }
-        StmtKind::Return | StmtKind::Unreachable | StmtKind::Resume | StmtKind::Terminate => Ok(()),
+        StmtKind::Return | StmtKind::Cancelled | StmtKind::Unreachable | StmtKind::Resume | StmtKind::Terminate => Ok(()),
     }
 }
 

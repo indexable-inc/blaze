@@ -38,11 +38,13 @@ extern crate alloc;
 use alloc::vec::Vec as AllocVec;
 use blaze_own::Vec;
 mod asm;
+mod coroutine;
 mod frame;
 mod shims;
 mod term;
 mod value;
 
+pub use coroutine::{CoroutinePlan, build_coroutine};
 pub use shims::{
     build_builtin_clone, build_builtin_from, build_closure_shim, build_ctor_fn, build_drop_glue, build_fn_shim,
     build_reify_shim, build_test_report_shim, build_vtable_shim,
@@ -108,6 +110,8 @@ pub enum BuildError {
     NoConstVtable { stmt: Stmt, key: VtableKey },
     /// The LIR builder or its verifier refused the function.
     Lir(blaze_lir::BuildError),
+    /// The LIR coroutine split pass refused the coroutine body.
+    Coroutine(blaze_lir::coroutine::CoroutineError),
 }
 
 impl fmt::Display for BuildError {
@@ -133,6 +137,7 @@ impl fmt::Display for BuildError {
             BuildError::NoConstFnInstance { stmt, key } => write!(f, "row {} of the body: no fn instance for const reloc {:?}", stmt.0, key.0),
             BuildError::NoConstVtable { stmt, key } => write!(f, "row {} of the body: no vtable for const reloc {:?}", stmt.0, key.0),
             BuildError::Lir(error) => write!(f, "the LIR function: {error}"),
+            BuildError::Coroutine(error) => write!(f, "the coroutine split pass: {error}"),
         }
     }
 }
@@ -153,6 +158,8 @@ pub(crate) enum Held {
     /// Memory at a pointer the function was given: a parameter's caller's copy, or the hidden
     /// result pointer.
     At(Value),
+    /// Memory at a fixed byte offset from an entry pointer (e.g. a coroutine upvar inside `state`).
+    AtOff(Value, i32),
 }
 
 impl Held {
@@ -202,6 +209,8 @@ pub(crate) struct Cx<'a, 'g, 't, A: Allocator + Copy> {
     pub(crate) b: Builder<A, Full>,
     pub(crate) layouts: Layouts<A>,
     pub(crate) panic: Panic,
+    /// Coroutine build state (`Some` only inside [`build_coroutine`]).
+    pub(crate) co: Option<coroutine::Co>,
     /// By local: its ground type, its layout and how it is held.
     pub(crate) tys: Vec<PTy, A>,
     pub(crate) lays: Vec<LayoutId, A>,
@@ -287,6 +296,7 @@ fn build_with_abi<A: Allocator + Copy>(
         b: Builder::new_in(PTR_BITS, alloc),
         layouts: Layouts::new_in(alloc),
         panic: adts.panic(),
+        co: None,
         tys: Vec::new_in(alloc),
         lays: Vec::new_in(alloc),
         held: Vec::new_in(alloc),

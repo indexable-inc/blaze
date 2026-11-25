@@ -433,6 +433,8 @@ pub enum StmtKind {
     /// Terminator: an `.await`'s suspension: polled again, go on at `resume`; dropped while
     /// parked here, go to `cancel` (coroutines.md D2).
     Suspend { resume: Block, cancel: Block },
+    /// Terminator: end of a coroutine cancel path after dropping all live values while suspended.
+    Cancelled,
     /// Terminator: return `_0` to the caller.
     Return,
     /// Terminator: this point is never reached.
@@ -1101,6 +1103,7 @@ impl<'b> BodyRef<'b> {
                 f(cancel, Edge::Normal);
             }
             StmtKind::Return
+            | StmtKind::Cancelled
             | StmtKind::TailCall { .. }
             | StmtKind::Unreachable
             | StmtKind::Resume

@@ -589,6 +589,15 @@ impl<A: Allocator + Copy> Emit<'_, A> {
                 self.primary(row);
                 self.b.ret(sp);
             }
+            StmtKind::Cancelled => {
+                // Cancel paths return no output value; write a dummy constant to `_0` so
+                // `blaze-flow`'s move check does not report `_0` uninitialized at `return`
+                // (matching `blaze-flow-lower`'s `coroutine.rs`).
+                self.primary(row);
+                self.b.assign(fl::Place(0), fl::Operand::Const, sp);
+                self.extra(row);
+                self.b.ret(sp);
+            }
             StmtKind::TailCall { callee, args } => {
                 self.ops.clear();
                 if let Callee::Value(o) = body.callee(callee) {

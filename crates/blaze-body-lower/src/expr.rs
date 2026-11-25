@@ -115,7 +115,8 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
 
     /// A new temporary of `ty` made for `e`, its storage begun and scheduled for drop.
     pub(crate) fn temp_local(&mut self, e: ExprId, ty: PTy, role: Role) -> Result<(Local, Place), LowerError> {
-        let local = self.b.new_local(LocalDecl { ty, kind: LocalKind::Temp(e, role), mutbl: Mutbl::Mut });
+        let cty = self.canonical_ty(ty, At::Expr(e))?;
+        let local = self.b.new_local(LocalDecl { ty: cty, kind: LocalKind::Temp(e, role), mutbl: Mutbl::Mut });
         let place = self.b.local_place(local);
         let drops = self.needs_drop(ty, At::Expr(e))?;
         let span = self.span(e);
@@ -130,7 +131,8 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
     /// A temporary read at once by the row after it (a condition, a length, a checked pair, a
     /// discriminant): no storage rows, not scheduled; its type never needs drop.
     pub(crate) fn scratch(&mut self, e: ExprId, ty: PTy) -> Place {
-        let local = self.b.new_local(LocalDecl { ty, kind: LocalKind::Temp(e, Role::Value), mutbl: Mutbl::Mut });
+        let cty = self.canonical_ty(ty, At::Expr(e)).unwrap_or(ty);
+        let local = self.b.new_local(LocalDecl { ty: cty, kind: LocalKind::Temp(e, Role::Value), mutbl: Mutbl::Mut });
         self.b.local_place(local)
     }
 
@@ -872,8 +874,8 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
             Expr::Record { fields, base } => self.record_into(dest, e, fields, base),
             Expr::Closure { .. } => self.closure_into(dest, e),
             Expr::FormatArgs { .. } => self.refuse(Construct::FormatArgs, e),
-            Expr::Await(_) => self.refuse(Construct::Await, e),
-            Expr::AsyncBlock { .. } => self.refuse(Construct::AsyncBlock, e),
+            Expr::Await(operand) => self.await_into(dest, e, operand),
+            Expr::AsyncBlock { .. } => self.coroutine_into(dest, e),
             Expr::OffsetOf { .. } => self.refuse(Construct::OffsetOf, e),
             Expr::Asm { arch, pieces, operands, options, clobber_abis } => {
                 self.asm_into(dest, e, arch, pieces, operands, options, clobber_abis)
@@ -886,7 +888,8 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
     // Calls.
 
     /// The callee of a fn item: a trait's method is resolved per instance.
-    fn item_callee(&self, key: ItemKey, args: List, e: ExprId) -> Result<Callee, LowerError> {
+    pub(crate) fn item_callee(&mut self, key: ItemKey, args: List, e: ExprId) -> Result<Callee, LowerError> {
+        let args = self.canonical_list(args, At::Expr(e))?;
         match self.facts.trait_item(key) {
             Some(true) => Ok(Callee::Method { key, args }),
             Some(false) => Ok(Callee::FnItem { key, args }),

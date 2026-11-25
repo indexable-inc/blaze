@@ -26,7 +26,8 @@ use crate::code::{
 /// 3: the type tag 31 (`FOREIGN`, an extern type: `PNode::Foreign`) is new.
 /// 4: the statement tag 51 (`TAIL_CALL`) and inline assembly tables (`asms`, `asm_pieces`,
 /// `asm_ops`) are new.
-pub const VERSION: u32 = 4;
+/// 5: the statement tag 52 (`CANCELLED`) is new.
+pub const VERSION: u32 = 5;
 
 blaze_format_core::record! {
     /// A body record's root: the version, the overlay's bases, then one slice per table of

@@ -77,7 +77,7 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
     /// The address-taken locals, by one pass over the rows: a borrow or raw borrow of a place
     /// of the local's own bytes, a projection written through, a drop, or an indexed/subsliced
     /// local.
-    fn address_taken(&self) -> Result<Vec<bool, A>, BuildError> {
+    pub(crate) fn address_taken(&self) -> Result<Vec<bool, A>, BuildError> {
         let mut taken = Vec::new_in(self.alloc);
         taken.resize(self.v.locals() as usize, false);
         for s in 0..self.v.stmts() {
@@ -540,7 +540,7 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
             let align = self.layouts.get(lay).align;
             let held = *self.held.get(a.index()).ok_or(self.malformed("an argument local past the frame"))?;
             let (ptr, is_temp) = match held {
-                Held::Slot(_) | Held::At(_) => (self.base(a)?, false),
+                Held::Slot(_) | Held::At(_) | Held::AtOff(..) => (self.base(a)?, false),
                 _ => {
                     let slot = self.new_slot(lay, SlotKind::Temp)?;
                     (self.b.slot_addr(slot), true)
@@ -626,21 +626,28 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                     _ => Err(self.malformed("a value of another shape written to a two-value local")),
                 }
             }
-            Held::Slot(_) | Held::At(_) => {
-                let base = self.base(l)?;
-                self.store_v(base, 0, lay, x)
+            Held::Slot(_) | Held::At(_) | Held::AtOff(..) => {
+                let (ptr, off) = self.base_at(l)?;
+                self.store_v(ptr, off, lay, x)
             }
+        }
+    }
+
+    /// Base pointer and constant byte offset of memory-held local `l`.
+    pub(crate) fn base_at(&mut self, l: Local) -> Result<(Value, i32), BuildError> {
+        let i = self.ix(l)?;
+        match *self.held.get(i).ok_or(self.malformed("a local past the frame"))? {
+            Held::Slot(slot) => Ok((self.b.slot_addr(slot), 0)),
+            Held::At(ptr) => Ok((ptr, 0)),
+            Held::AtOff(ptr, off) => Ok((ptr, off)),
+            Held::None | Held::One(_) | Held::Two(..) => Err(self.malformed("the address of a value local")),
         }
     }
 
     /// The address of memory-held local `l`.
     pub(crate) fn base(&mut self, l: Local) -> Result<Value, BuildError> {
-        let i = self.ix(l)?;
-        match *self.held.get(i).ok_or(self.malformed("a local past the frame"))? {
-            Held::Slot(slot) => Ok(self.b.slot_addr(slot)),
-            Held::At(ptr) => Ok(ptr),
-            Held::None | Held::One(_) | Held::Two(..) => Err(self.malformed("the address of a value local")),
-        }
+        let (ptr, off) = self.base_at(l)?;
+        Ok(self.addr(ptr, off))
     }
 
     /// The values every value local holds now, in local order: what an edge passes. One not
@@ -665,7 +672,7 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                         out.push(x);
                     }
                 }
-                Held::None | Held::Slot(_) | Held::At(_) => {}
+                Held::None | Held::Slot(_) | Held::At(_) | Held::AtOff(..) => {}
             }
         }
         Ok(out)
@@ -699,7 +706,7 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                     let a = self.b.param(t);
                     [Some(a), Some(self.b.param(u))]
                 }
-                Held::None | Held::Slot(_) | Held::At(_) => [None, None],
+                Held::None | Held::Slot(_) | Held::At(_) | Held::AtOff(..) => [None, None],
             };
         }
         Ok(())
@@ -746,7 +753,7 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                         let err = self.malformed("a local past the frame");
                         *self.cur.get_mut(i).ok_or(err)? = [None, None];
                     }
-                    Held::None | Held::At(_) => {}
+                    Held::None | Held::At(_) | Held::AtOff(..) => {}
                 }
                 Ok(())
             }
