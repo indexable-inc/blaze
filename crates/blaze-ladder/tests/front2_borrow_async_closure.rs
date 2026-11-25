@@ -144,6 +144,22 @@ fn simulate_rc() {
     });
 }
 
+// Foreign-body caller checking `Send` on an `async fn` that awaits an async closure
+// (mirrors `reth_e2e_test_utils::E2ETestSetupBuilder::build`'s `(0..n).map(async |idx| ..)`).
+async fn build_with_async_closure(n: usize) -> usize {
+    let f = async |idx: usize| {
+        let tmp = Rc::new(idx);
+        drop(tmp);
+        other().await;
+        idx
+    };
+    f(n).await
+}
+
+fn call_build_send() {
+    require_send(build_with_async_closure(1));
+}
+
 fn main() {}
 "#;
 
@@ -220,20 +236,24 @@ fn an_async_closure_is_a_stored_closure_value() {
         );
     }
 
-    // 4: the FUTURE an async closure's call returns, never decided from the closure value's
-    // captures (see the module doc, case 4). Not clean: E0277 or a named gap.
+    // 4: the FUTURE an async closure's call returns: its exact interior is lowered by
+    // `lower_async_witness`, so `Rc<u8>` held across `.await` is E0277 and dropped before `.await`
+    // is clean with zero gaps.
     for name in ["returned_rc", "simulate_rc"] {
         let got = world.check(BodyRef::Free(key_of(name)), alloc);
         std::println!("{name}: {got:?}");
-        let e0277 = got.diagnostics.iter().any(|d| d.code == "E0277");
-        let gap = got.refused.is_some() || !got.gaps.is_empty() || !got.undecided.is_empty();
-        assert!(e0277 || gap, "TWIN `{name}`: rustc refuses it (E0277: `Rc<u8>` held across the body's `.await`); never clean: {got:?}");
+        assert!(
+            got.diagnostics.iter().any(|d| d.code == "E0277") && got.gaps.is_empty(),
+            "TWIN `{name}`: rustc refuses it (E0277: `Rc<u8>` held across the body's `.await`): {got:?}"
+        );
     }
-    // Its oracle: no `Rc` held across the `.await`. Rust accepts it; blaze has no exact interior
-    // of the closure's body yet, so a gap is allowed, a false E0277 is not.
     let got = world.check(BodyRef::Free(key_of("returned_dropped")), alloc);
     std::println!("returned_dropped: {got:?}");
-    assert!(!got.diagnostics.iter().any(|d| d.code == "E0277"), "returned_dropped: no false E0277: {got:?}");
+    assert!(got.is_clean() && got.gaps.is_empty() && got.undecided.is_empty(), "returned_dropped: clean with zero gaps: {got:?}");
+
+    let got = world.check(BodyRef::Free(key_of("call_build_send")), alloc);
+    std::println!("call_build_send: {got:?}");
+    assert!(got.is_clean() && got.gaps.is_empty() && got.undecided.is_empty(), "call_build_send: foreign async closure exact interior is Send with zero gaps: {got:?}");
 
     // 3: CONTROL, the borrow lowering: refused by name.
     let (types, borrows) = world.check_borrows(BodyRef::Free(key_of("hold")), alloc);
