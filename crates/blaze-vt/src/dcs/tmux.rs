@@ -21,40 +21,66 @@ pub struct WindowId(pub u64);
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct SessionId(pub u64);
 
-/// What tmux said (control.zig:498 `Notification`).
+/// What tmux said (control.zig:498 `Notification`). `B` is how the text is held: borrowed
+/// bytes as the parser gives them, or anything [`Notification::map`] makes of them (the
+/// terminal's effects hold spans of a buffer).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Notification<'a> {
+pub enum Notification<B> {
     /// Control mode began (`DCS 1000 p`); ours, not tmux's.
     Enter,
     /// Control mode ended: the DCS ended, or a line did not start with `%`.
     Exit,
     /// A `%begin` block's lines ended by `%end`, trailing CR/LF trimmed.
-    BlockEnd(&'a [u8]),
+    BlockEnd(B),
     /// A `%begin` block's lines ended by `%error`.
-    BlockErr(&'a [u8]),
+    BlockErr(B),
     /// `%output %pane data` (data still octal-escaped, as tmux sent it).
-    Output { pane: PaneId, data: &'a [u8] },
+    Output { pane: PaneId, data: B },
     /// `%session-changed $id name`.
-    SessionChanged { session: SessionId, name: &'a [u8] },
+    SessionChanged { session: SessionId, name: B },
     /// `%sessions-changed`.
     SessionsChanged,
     /// `%layout-change @window layout visible-layout flags`.
-    LayoutChange {
-        window: WindowId,
-        layout: &'a [u8],
-        visible_layout: &'a [u8],
-        raw_flags: &'a [u8],
-    },
+    LayoutChange { window: WindowId, layout: B, visible_layout: B, raw_flags: B },
     /// `%window-add @window`.
     WindowAdd { window: WindowId },
     /// `%window-renamed @window name`.
-    WindowRenamed { window: WindowId, name: &'a [u8] },
+    WindowRenamed { window: WindowId, name: B },
     /// `%window-pane-changed @window %pane`.
     WindowPaneChanged { window: WindowId, pane: PaneId },
     /// `%client-detached client`.
-    ClientDetached { client: &'a [u8] },
+    ClientDetached { client: B },
     /// `%client-session-changed client $id name`.
-    ClientSessionChanged { client: &'a [u8], session: SessionId, name: &'a [u8] },
+    ClientSessionChanged { client: B, session: SessionId, name: B },
+}
+
+impl<B> Notification<B> {
+    /// The same notification with each text `f` of it, in field order.
+    pub fn map<C>(self, mut f: impl FnMut(B) -> C) -> Notification<C> {
+        use Notification as N;
+        match self {
+            N::Enter => N::Enter,
+            N::Exit => N::Exit,
+            N::BlockEnd(b) => N::BlockEnd(f(b)),
+            N::BlockErr(b) => N::BlockErr(f(b)),
+            N::Output { pane, data } => N::Output { pane, data: f(data) },
+            N::SessionChanged { session, name } => N::SessionChanged { session, name: f(name) },
+            N::SessionsChanged => N::SessionsChanged,
+            N::LayoutChange { window, layout, visible_layout, raw_flags } => {
+                let layout = f(layout);
+                let visible_layout = f(visible_layout);
+                N::LayoutChange { window, layout, visible_layout, raw_flags: f(raw_flags) }
+            }
+            N::WindowAdd { window } => N::WindowAdd { window },
+            N::WindowRenamed { window, name } => N::WindowRenamed { window, name: f(name) },
+            N::WindowPaneChanged { window, pane } => N::WindowPaneChanged { window, pane },
+            N::ClientDetached { client } => N::ClientDetached { client: f(client) },
+            N::ClientSessionChanged { client, session, name } => {
+                let client = f(client);
+                N::ClientSessionChanged { client, session, name: f(name) }
+            }
+        }
+    }
 }
 
 pub use super::Refusal;
@@ -115,7 +141,7 @@ impl<'a> ControlParser<'a> {
     }
 
     /// One byte of control-mode output (control.zig:64 `put`).
-    pub fn put(&mut self, byte: u8) -> Result<Option<Notification<'_>>, Refusal> {
+    pub fn put(&mut self, byte: u8) -> Result<Option<Notification<&[u8]>>, Refusal> {
         Ok(self.step(byte)?.map(|ev| self.view(ev)))
     }
 
@@ -199,7 +225,7 @@ impl<'a> ControlParser<'a> {
     }
 
     /// The notification an [`Event`] from the last [`ControlParser::step`] stands for.
-    pub(crate) fn view(&self, ev: Event) -> Notification<'_> {
+    pub(crate) fn view(&self, ev: Event) -> Notification<&[u8]> {
         let b = &self.buf[..];
         let s = |sp: Span| &b[sp.0..sp.1];
         let parsed = match ev {

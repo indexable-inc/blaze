@@ -21,8 +21,9 @@ pub struct PlaceholderCell<'c> {
     pub codepoint: char,
     pub fg: Color,
     pub underline: Color,
-    /// The code points after the first in the cell's grapheme (combining marks).
-    pub marks: &'c [char],
+    /// The code points after the first in the cell's grapheme (combining marks), as the
+    /// screen keeps them.
+    pub marks: &'c [u32],
 }
 
 /// The screen's cells, for the placeholder scan.
@@ -194,14 +195,15 @@ impl Incomplete {
             width: 1,
         };
         // An unknown mark is read as absent (ghostty logs it).
+        let index = |m: u32| DIACRITICS.binary_search(&m).ok().map(|i| i as u32);
         if let Some(&m) = cell.marks.first() {
-            r.row = diacritic_index(m);
+            r.row = index(m);
         }
         if let Some(&m) = cell.marks.get(1) {
-            r.col = diacritic_index(m);
+            r.col = index(m);
         }
         if let Some(&m) = cell.marks.get(2) {
-            r.image_id_high = diacritic_index(m).and_then(|h| u8::try_from(h).ok());
+            r.image_id_high = index(m).and_then(|h| u8::try_from(h).ok());
         }
         r
     }
@@ -422,7 +424,7 @@ mod tests {
     /// A grid of cells written as strings: each string is one cell's grapheme.
     struct Cells {
         cols: u16,
-        rows: Vec<Vec<(Vec<char>, Color, Color)>>,
+        rows: Vec<Vec<(Vec<u32>, Color, Color)>>,
     }
 
     impl Cells {
@@ -436,8 +438,8 @@ mod tests {
                 let is_mark = DIACRITICS.binary_search(&(c as u32)).is_ok();
                 let r = &mut self.rows[row];
                 match r.last_mut() {
-                    Some(cell) if is_mark => cell.0.push(c),
-                    _ => r.push((std::vec![c], fg, underline)),
+                    Some(cell) if is_mark => cell.0.push(c as u32),
+                    _ => r.push((std::vec![c as u32], fg, underline)),
                 }
             }
         }
@@ -448,13 +450,16 @@ mod tests {
             self.cols
         }
         fn row_flagged(&self, row: u64) -> bool {
-            self.rows[row as usize].iter().any(|c| c.0[0] == PLACEHOLDER)
+            self.rows[row as usize].iter().any(|c| c.0[0] == PLACEHOLDER as u32)
         }
         fn cell(&self, at: ScreenPoint) -> PlaceholderCell<'_> {
             match self.rows[at.row as usize].get(usize::from(at.col)) {
-                Some((cps, fg, ul)) => {
-                    PlaceholderCell { codepoint: cps[0], fg: *fg, underline: *ul, marks: &cps[1..] }
-                }
+                Some((cps, fg, ul)) => PlaceholderCell {
+                    codepoint: char::from_u32(cps[0]).unwrap_or(' '),
+                    fg: *fg,
+                    underline: *ul,
+                    marks: &cps[1..],
+                },
                 None => PlaceholderCell {
                     codepoint: ' ',
                     fg: Color::None,

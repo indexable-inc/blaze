@@ -4,26 +4,43 @@
 //! §11, §12).
 //!
 //! Sans-IO: [`Terminal::feed`] takes bytes and returns nothing. What the program asked to have
-//! written back (device attributes, cursor reports, mode reports) is bytes in a reply buffer
-//! ([`Terminal::take_replies`]); what the host is asked to do (ring the bell, retitle the
-//! window) is an [`Effect`] list ([`Terminal::take_effects`]). Both are capped by
-//! [`Caps`]: past a cap a reply or effect is refused and counted in [`Stats`].
+//! written back (device attributes, cursor reports, mode reports, colour and kitty replies) is
+//! bytes in a reply buffer ([`Terminal::take_replies`]); what the host is asked to do (ring the
+//! bell, retitle the window, write the clipboard, read a kitty image file) is an [`Effect`] list
+//! ([`Terminal::take_effects`]), whose text is [`Span`]s of the list's byte buffer. Both are
+//! capped by [`Caps`]: past a cap a reply or effect is refused and counted in [`Stats`].
 
 mod dispatch;
+pub mod kitty;
 pub mod modes;
 mod ops;
+mod osc;
 mod print;
 
 use blaze_own::planted::{NoPlant, Planted};
 use blaze_own::{Alloc, AllocFailure, Vec};
 
+use crate::color::Colors;
+use crate::dcs::tmux::Notification;
+use crate::dcs::{DcsHandler, DcsOpts};
+use crate::kitty::apc::{Apc, ApcOpts};
+use crate::kitty::exec::{Answer, GraphicsOpts, KittyGraphics, Request, ScreenKey, UnaskedAnswer};
+use crate::osc::{Clipboard, MouseShape, ProgressReport};
 use crate::parser::Parser;
 use crate::plant::VtPlant;
 use crate::screen::{Screen, ScreenStats};
 
+pub use kitty::{KittyCells, KittyScreen};
 pub use modes::{Mode, ModeState, MouseEvents, MouseFormat};
 
-/// What the host is asked to do. The other lanes add variants (clipboard, notifications, …).
+/// Bytes of an [`Effects`] list's buffer ([`Effects::bytes`]).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub struct Span {
+    pub start: u32,
+    pub len: u32,
+}
+
+/// What the host is asked to do. Text is a [`Span`] of the [`Effects`] the effect came in.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[non_exhaustive]
 pub enum Effect {
@@ -39,6 +56,103 @@ pub enum Effect {
     EnableMode3(bool),
     /// Mode 5 (reverse colors) changed: everything needs drawing.
     ReverseColors(bool),
+    /// OSC 7 set a local working directory, or cleared it: read it with [`Terminal::pwd`]
+    /// (termio's `pwd_change`).
+    PwdChanged,
+    /// OSC 52 `?`: the program asks for the clipboard. Answer with
+    /// [`Terminal::clipboard_reply`] (termio's `clipboard_read`; the host decides whether to).
+    ClipboardRead(Clipboard),
+    /// OSC 52 with data: write these bytes (base64-decoded) to the clipboard; empty clears it.
+    ClipboardWrite { clipboard: Clipboard, contents: Span },
+    /// OSC 9 and OSC 777 `notify`.
+    DesktopNotification { title: Span, body: Span },
+    /// OSC 9;4.
+    Progress(ProgressReport),
+    /// OSC 22: the pointer's shape, also kept ([`Terminal::mouse_shape`]).
+    MouseShape(MouseShape),
+    /// OSC 4/104 or OSC 21 set or reset a palette entry ([`Terminal::colors`]): cells drawn in
+    /// palette colours need drawing (ghostty's `dirty.palette`).
+    PaletteChanged,
+    /// OSC 133;C: the command line is entered and its output starts (termio's `start_command`).
+    CommandStarted,
+    /// OSC 133;D: the command ended with this code (termio: the option as a byte, 1 when it
+    /// does not fit one, 0 when absent).
+    CommandFinished { exit_code: u8 },
+    /// A tmux control-mode notification (`DCS 1000 p`, [`Opts::tmux_control_mode`]).
+    Tmux(Notification<Span>),
+    /// A kitty graphics load waits on host IO: [`Terminal::kitty_pending`] says what,
+    /// [`Terminal::kitty_answer`] gives it.
+    KittyIo,
+}
+
+/// The effects taken ([`Terminal::take_effects`]): the list and the bytes its spans name.
+pub struct Effects<'a> {
+    list: Vec<Effect, Alloc<'a>>,
+    bytes: Vec<u8, Alloc<'a>>,
+}
+
+impl<'a> Effects<'a> {
+    fn new_in(alloc: Alloc<'a>) -> Effects<'a> {
+        Effects { list: Vec::new_in(alloc), bytes: Vec::new_in(alloc) }
+    }
+
+    pub fn as_slice(&self) -> &[Effect] {
+        &self.list
+    }
+
+    pub fn iter(&self) -> core::slice::Iter<'_, Effect> {
+        self.list.iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.list.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.list.is_empty()
+    }
+
+    /// The bytes a span of one of these effects names.
+    pub fn bytes(&self, span: Span) -> &[u8] {
+        let start = span.start as usize;
+        self.bytes.get(start..start + span.len as usize).unwrap_or_default()
+    }
+
+    /// Copies `bytes` into the buffer, if they fit under `cap`.
+    fn stash(&mut self, bytes: &[u8], cap: usize) -> Option<Span> {
+        let start = self.bytes.len();
+        if start + bytes.len() > cap || self.bytes.try_reserve(bytes.len()).is_err() {
+            return None;
+        }
+        self.bytes.extend_from_slice(bytes);
+        Some(Span { start: start as u32, len: bytes.len() as u32 })
+    }
+
+    /// Queues `e`, if the list is under `cap`.
+    fn push(&mut self, e: Effect, cap: usize) -> bool {
+        if self.list.len() >= cap || self.list.try_reserve(1).is_err() {
+            return false;
+        }
+        self.list.push(e);
+        true
+    }
+
+    /// Queues a tmux notification with its text copied in, whole or not at all.
+    fn tmux(&mut self, n: Notification<&[u8]>, caps: &Caps) -> bool {
+        let mark = self.bytes.len();
+        let mut fits = true;
+        let n = n.map(|b| {
+            self.stash(b, caps.effect_bytes).unwrap_or_else(|| {
+                fits = false;
+                Span::default()
+            })
+        });
+        if fits && self.push(Effect::Tmux(n), caps.effects) {
+            return true;
+        }
+        self.bytes.truncate(mark);
+        false
+    }
 }
 
 /// A cell's pixel size, for the size reports (CSI 14/16 t, mode 2048): the mouse encoder's
@@ -72,32 +186,36 @@ pub struct Caps {
     pub replies: usize,
     /// Effects not yet taken.
     pub effects: usize,
-    /// An OSC's bytes.
+    /// The bytes those effects carry (clipboard contents, notification text, tmux output).
+    pub effect_bytes: usize,
+    /// An OSC's bytes. Only OSC 52, 66, 72 and 5522 come near it: ghostty bounds the others at
+    /// [`crate::osc::MAX_BUF`], and so does the capture here.
     pub osc: usize,
-    /// A DCS's bytes.
+    /// A DCS request's bytes (an XTGETTCAP payload, a tmux line or block; ghostty: 1 MiB).
     pub dcs: usize,
-    /// An APC's bytes (kitty graphics send images in them).
-    pub apc: usize,
     /// The title's bytes (ghostty truncates at 1024, stream_terminal.zig `windowTitle`).
     pub title: usize,
     /// Titles CSI 22 t can push.
     pub title_stack: usize,
+    /// OSC 7's URL (ghostty truncates at 4096, stream_terminal.zig `reportPwd`).
+    pub pwd: usize,
 }
 
 impl Caps {
     pub const DEFAULT: Caps = Caps {
         replies: 64 << 10,
         effects: 1024,
-        osc: 64 << 10,
-        dcs: 64 << 10,
-        apc: 16 << 20,
+        effect_bytes: 8 << 20,
+        osc: 8 << 20,
+        dcs: DcsOpts::MAX_BYTES,
         title: 1024,
         title_stack: 10,
+        pwd: 4096,
     };
 }
 
 /// How to make a terminal: the size and scrollback are the caller's choice; the rest defaults.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct Opts<'a> {
     pub cols: u16,
     pub rows: u16,
@@ -114,6 +232,15 @@ pub struct Opts<'a> {
     pub xtversion: &'a [u8],
     /// The reply to ENQ; empty: none.
     pub enquiry: &'a [u8],
+    /// This machine's name (`gethostname`): an OSC 7 URL must name it or `localhost`
+    /// (termio's `isLocal`); empty: only `localhost`.
+    pub hostname: &'a [u8],
+    /// Whether `DCS 1000 p` enters tmux control mode ([`Effect::Tmux`]); ghostty's app has it.
+    pub tmux_control_mode: bool,
+    /// The APC protocols (kitty graphics, glyphs) and their byte caps.
+    pub apc: ApcOpts,
+    /// Kitty graphics storage: each screen's byte cap (0 disables), media, PNG decoder.
+    pub graphics: GraphicsOpts,
     pub caps: Caps,
 }
 
@@ -129,6 +256,10 @@ impl<'a> Opts<'a> {
             device: DeviceAttributes::LIB,
             xtversion: b"",
             enquiry: b"",
+            hostname: b"",
+            tmux_control_mode: false,
+            apc: ApcOpts::DEFAULT,
+            graphics: GraphicsOpts::DEFAULT,
             caps: Caps::DEFAULT,
         }
     }
@@ -196,17 +327,7 @@ impl Flags {
     };
 }
 
-/// A DCS's hook, kept until it is unhooked.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct DcsHead {
-    pub intermediates: [u8; crate::parser::MAX_INTERMEDIATES],
-    pub n_intermediates: u8,
-    pub params: [u16; crate::parser::MAX_PARAMS],
-    pub n_params: u8,
-    pub final_byte: u8,
-}
-
-/// A string sequence being gathered (OSC, DCS, APC), capped.
+/// An OSC being gathered, capped.
 struct StringBuf<'a> {
     bytes: Vec<u8, Alloc<'a>>,
     cap: usize,
@@ -258,11 +379,13 @@ pub struct Terminal<'a, P: Planted<VtPlant> = NoPlant> {
     color_scheme: Option<ColorScheme>,
     focused: bool,
     replies: Vec<u8, Alloc<'a>>,
-    effects: Vec<Effect, Alloc<'a>>,
+    effects: Effects<'a>,
+    /// The dynamic colours and palette OSC 4/10–19/21 set (ghostty's `Terminal.colors`).
+    colors: Colors,
+    mouse_shape: MouseShape,
     osc: StringBuf<'a>,
-    dcs: StringBuf<'a>,
-    dcs_head: Option<DcsHead>,
-    apc: StringBuf<'a>,
+    dcs: DcsHandler<'a>,
+    apc: Apc<'a>,
     stats: Stats,
     plant: P,
 }
@@ -316,11 +439,15 @@ impl<'a, P: Planted<VtPlant>> Terminal<'a, P> {
             color_scheme: None,
             focused: true,
             replies: Vec::new_in(alloc),
-            effects: Vec::new_in(alloc),
+            effects: Effects::new_in(alloc),
+            colors: Colors::default(),
+            mouse_shape: MouseShape::Text,
             osc: StringBuf::new(opts.caps.osc, alloc),
-            dcs: StringBuf::new(opts.caps.dcs, alloc),
-            dcs_head: None,
-            apc: StringBuf::new(opts.caps.apc, alloc),
+            dcs: DcsHandler::new_in(
+                DcsOpts { tmux_control_mode: opts.tmux_control_mode, max_bytes: opts.caps.dcs },
+                alloc,
+            ),
+            apc: Apc::new(opts.apc, KittyGraphics::new(opts.graphics, alloc), alloc),
             stats: Stats::default(),
             plant,
         };
@@ -347,9 +474,9 @@ impl<'a, P: Planted<VtPlant>> Terminal<'a, P> {
         core::mem::replace(&mut self.replies, Vec::new_in(self.alloc))
     }
 
-    /// The effects asked for since the last take, in order.
-    pub fn take_effects(&mut self) -> Vec<Effect, Alloc<'a>> {
-        core::mem::replace(&mut self.effects, Vec::new_in(self.alloc))
+    /// The effects asked for since the last take, in order, with the bytes they carry.
+    pub fn take_effects(&mut self) -> Effects<'a> {
+        core::mem::replace(&mut self.effects, Effects::new_in(self.alloc))
     }
 
     pub fn cols(&self) -> usize {
@@ -475,9 +602,96 @@ impl<'a, P: Planted<VtPlant>> Terminal<'a, P> {
         self.focused = focused;
     }
 
-    /// The cell pixel size, for the size reports.
+    /// The cell pixel size, for the size reports and kitty graphics.
     pub fn set_cell_px(&mut self, px: Option<Pixels>) {
         self.opts.cell_px = px;
+    }
+
+    /// The palette and dynamic colours (the renderer resolves SGR palette colours with them).
+    pub fn colors(&self) -> &Colors {
+        &self.colors
+    }
+
+    /// The colours, for the host's defaults (the config's palette, foreground, background).
+    pub fn colors_mut(&mut self) -> &mut Colors {
+        &mut self.colors
+    }
+
+    /// The pointer shape OSC 22 last set (ghostty's `Terminal.mouse_shape`, `text` at first).
+    pub fn mouse_shape(&self) -> MouseShape {
+        self.mouse_shape
+    }
+
+    /// The APC state: kitty graphics ([`Apc::graphics`]) and the glyph glossary.
+    pub fn apc(&self) -> &Apc<'a> {
+        &self.apc
+    }
+
+    /// The APC state, for the renderer to clear `dirty` marks.
+    pub fn apc_mut(&mut self) -> &mut Apc<'a> {
+        &mut self.apc
+    }
+
+    /// Which kitty storage belongs to the screen shown.
+    pub fn screen_key(&self) -> ScreenKey {
+        match self.active {
+            Which::Primary => ScreenKey::Primary,
+            Which::Alternate => ScreenKey::Alternate,
+        }
+    }
+
+    /// The screen shown's cells as the kitty placeholder scan reads them
+    /// ([`crate::kitty::unicode::placements`]).
+    pub fn kitty_cells(&self) -> KittyCells<'_, 'a, P> {
+        KittyCells { screen: self.screen() }
+    }
+
+    /// The host IO a kitty load waits on ([`Effect::KittyIo`]).
+    pub fn kitty_pending(&self) -> Option<Request<'_>> {
+        self.apc.graphics().pending()
+    }
+
+    /// The host's answer to [`Terminal::kitty_pending`]: the load goes on, and its reply and
+    /// cursor movement happen as if the command had just run.
+    pub fn kitty_answer(&mut self, answer: Answer<'_>) -> Result<(), UnaskedAnswer> {
+        let which = self.apc.graphics().pending_screen().ok_or(UnaskedAnswer)?;
+        let cell_px = self.opts.cell_px;
+        let screen = match which {
+            ScreenKey::Primary => &mut self.primary,
+            ScreenKey::Alternate => self.alternate.as_mut().ok_or(UnaskedAnswer)?,
+        };
+        let out = self.apc.graphics_mut().answer(answer, &mut KittyScreen { screen, cell_px })?;
+        let on_active = which == self.screen_key();
+        self.kitty_outcome(
+            out.reply.map(crate::kitty::apc::Reply::Kitty),
+            if on_active { out.cursor } else { None },
+            out.waits_on_host,
+        );
+        Ok(())
+    }
+
+    /// The host's answer to [`Effect::ClipboardRead`]: the contents, which are sent base64-encoded
+    /// (`OSC 52 ; kind ; base64 ST`).
+    pub fn clipboard_reply(&mut self, clipboard: Clipboard, contents: &[u8]) {
+        let engine = blaze_base64::STANDARD;
+        let Some(n) = engine.encoded_len(contents.len()) else {
+            self.stats.replies_dropped += 1;
+            return;
+        };
+        let mut enc: Vec<u8, Alloc<'a>> = Vec::new_in(self.alloc);
+        if enc.try_reserve(n).is_err() {
+            self.stats.replies_dropped += 1;
+            return;
+        }
+        enc.resize(n, 0);
+        match engine.encode_into(contents, &mut enc) {
+            Ok(w) => enc.truncate(w),
+            Err(_) => {
+                self.stats.replies_dropped += 1;
+                return;
+            }
+        }
+        self.reply(|o| crate::reply::osc52(o, clipboard, &enc));
     }
 
     // ---- input options ---------------------------------------------------------------------
@@ -549,11 +763,34 @@ impl<'a, P: Planted<VtPlant>> Terminal<'a, P> {
     // ---- what goes out ---------------------------------------------------------------------
 
     fn effect(&mut self, e: Effect) {
-        if self.effects.len() >= self.opts.caps.effects || self.effects.try_reserve(1).is_err() {
+        if !self.effects.push(e, self.opts.caps.effects) {
             self.stats.effects_dropped += 1;
-            return;
         }
-        self.effects.push(e);
+    }
+
+    /// Queues an effect made from text copied into the effect buffer, whole or not at all.
+    fn effect_with<const N: usize>(
+        &mut self,
+        parts: [&[u8]; N],
+        make: impl FnOnce([Span; N]) -> Effect,
+    ) {
+        let caps = self.opts.caps;
+        let mark = self.effects.bytes.len();
+        let mut spans = [Span::default(); N];
+        for (s, p) in spans.iter_mut().zip(parts) {
+            match self.effects.stash(p, caps.effect_bytes) {
+                Some(span) => *s = span,
+                None => {
+                    self.effects.bytes.truncate(mark);
+                    self.stats.effects_dropped += 1;
+                    return;
+                }
+            }
+        }
+        if !self.effects.push(make(spans), caps.effects) {
+            self.effects.bytes.truncate(mark);
+            self.stats.effects_dropped += 1;
+        }
     }
 
     /// Writes a reply with one of [`crate::reply`]'s encoders, whole or not at all: refused by
@@ -562,11 +799,7 @@ impl<'a, P: Planted<VtPlant>> Terminal<'a, P> {
         &mut self,
         encode: impl FnOnce(crate::reply::Out<'_, 'a>) -> Result<(), AllocFailure>,
     ) {
-        let start = self.replies.len();
-        if encode(&mut self.replies).is_err() || self.replies.len() > self.opts.caps.replies {
-            self.replies.truncate(start);
-            self.stats.replies_dropped += 1;
-        }
+        reply_into(&mut self.replies, self.opts.caps.replies, &mut self.stats, encode);
     }
 
     /// Raw reply bytes (a focus report, a colour report written by [`crate::osc::run_colors`]).
@@ -589,5 +822,76 @@ impl<'a, P: Planted<VtPlant>> Terminal<'a, P> {
 
     fn scr(&mut self) -> &mut Screen<'a, P> {
         self.screen_mut()
+    }
+
+    /// The APC state and the screen shown, as kitty graphics takes it.
+    fn kitty_split(&mut self) -> (&mut Apc<'a>, KittyScreen<'_, 'a, P>, ScreenKey) {
+        let key = self.screen_key();
+        let screen = match (self.active, &mut self.alternate) {
+            (Which::Alternate, Some(alt)) => alt,
+            _ => &mut self.primary,
+        };
+        (&mut self.apc, KittyScreen { screen, cell_px: self.opts.cell_px }, key)
+    }
+
+    /// A screen's kitty storage reset (Screen.zig:396 `reset`).
+    fn kitty_reset_screen(&mut self, which: ScreenKey) {
+        let cell_px = self.opts.cell_px;
+        let screen = match which {
+            ScreenKey::Primary => &mut self.primary,
+            ScreenKey::Alternate => match self.alternate.as_mut() {
+                Some(alt) => alt,
+                None => return,
+            },
+        };
+        self.apc.graphics_mut().reset_screen(which, &mut KittyScreen { screen, cell_px });
+    }
+
+    /// ED 2 and 22: every placement of the screen shown goes (Terminal.zig:3166).
+    fn kitty_erase_display(&mut self) {
+        let (apc, mut screen, which) = self.kitty_split();
+        apc.graphics_mut().erase_display(which, &mut screen);
+    }
+
+    /// What an APC command (or a kitty answer) asked: the reply, then the cursor movement
+    /// (stream_terminal.zig `apcEnd`, kitty graphics `display`), then whether it waits.
+    fn kitty_outcome(
+        &mut self,
+        reply: Option<crate::kitty::apc::Reply>,
+        cursor: Option<crate::kitty::exec::CursorAfter>,
+        waits_on_host: bool,
+    ) {
+        if let Some(r) = reply {
+            let wire = r.encode();
+            // ghostty drops a reply of three bytes or fewer (`final.len > 3`).
+            if wire.as_bytes().len() > 3 {
+                self.reply_bytes(&[wire.as_bytes()]);
+            }
+        }
+        if let Some(c) = cursor {
+            for _ in 0..c.index {
+                self.index();
+            }
+            let y = self.scr().cursor.y;
+            // ghostty passes the 0-based row as the 1-based one (graphics_exec.zig `display`).
+            self.set_cursor_pos(y, c.col_1based as usize);
+        }
+        if waits_on_host {
+            self.effect(Effect::KittyIo);
+        }
+    }
+}
+
+/// [`Terminal::reply`] on the reply buffer alone, for a caller that borrows another field.
+fn reply_into<'a>(
+    replies: &mut Vec<u8, Alloc<'a>>,
+    cap: usize,
+    stats: &mut Stats,
+    encode: impl FnOnce(crate::reply::Out<'_, 'a>) -> Result<(), AllocFailure>,
+) {
+    let start = replies.len();
+    if encode(replies).is_err() || replies.len() > cap {
+        replies.truncate(start);
+        stats.replies_dropped += 1;
     }
 }

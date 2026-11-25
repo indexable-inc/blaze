@@ -508,6 +508,7 @@ impl<'a, P: Planted<VtPlant>> Terminal<'a, P> {
             EraseDisplay::ScrollComplete => {
                 s.scroll_clear();
                 s.cursor.pending_wrap = false;
+                self.kitty_erase_display();
             }
             EraseDisplay::Complete => {
                 // ^L at a prompt keeps the screen in scrollback (ghostty #905): the bottom row
@@ -521,6 +522,7 @@ impl<'a, P: Planted<VtPlant>> Terminal<'a, P> {
                 s.clear_rows(0, rows - 1, protected);
                 s.cursor.pending_wrap = false;
                 s.all_dirty = true;
+                self.kitty_erase_display();
             }
             EraseDisplay::Below => {
                 self.erase_line(EraseLine::Right, protected_req);
@@ -809,6 +811,11 @@ impl<'a, P: Planted<VtPlant>> Terminal<'a, P> {
 
     /// RIS (fullReset, 3885).
     pub(super) fn full_reset(&mut self) {
+        // The alternate screen goes, its kitty images with it; the primary's are reset
+        // (Screen.zig:396); the APC state and glyph glossary too.
+        self.kitty_reset_screen(crate::kitty::exec::ScreenKey::Alternate);
+        self.kitty_reset_screen(crate::kitty::exec::ScreenKey::Primary);
+        self.apc.full_reset();
         self.active = Which::Primary;
         self.alternate = None;
         self.primary.reset();

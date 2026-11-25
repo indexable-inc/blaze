@@ -702,7 +702,30 @@ pub struct Screen<'a, P> {
     /// Every row needs drawing (ghostty's `dirty.clear`).
     pub all_dirty: bool,
     pub stats: ScreenStats,
+    /// OSC 133 state (ghostty's `Screen.semantic_prompt`).
+    pub semantic_prompt: SemanticPromptState,
+    /// Pins others hold (kitty placements), moved with their cells.
+    pins: Vec<TrackedPin, Alloc<'a>>,
+    next_pin: u64,
     plant: P,
+}
+
+/// How clicks in a prompt are handled, from the last OSC 133 `A` that said
+/// (ghostty's `SemanticPrompt.SemanticClick`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum PromptClick {
+    #[default]
+    None,
+    ClickEvents(crate::osc::ClickEvents),
+    Cl(crate::osc::Click),
+}
+
+/// OSC 133 state of a screen (Screen.zig:96 `SemanticPrompt`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct SemanticPromptState {
+    /// A prompt was ever marked on this screen.
+    pub seen: bool,
+    pub click: PromptClick,
 }
 
 /// Where a pin sits through a resize: a row and column of the page list.
@@ -713,6 +736,18 @@ struct Pin {
     /// Moved into the new rows already (a reflow moves each pin once).
     moved: bool,
 }
+
+/// A pin [`Screen::track_pin`] gave out: a page-list row and column. Rows leaving the front
+/// move it up; a pin whose row is gone is [`LOST`] (ghostty moves such a pin to the top left).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct TrackedPin {
+    id: u64,
+    r: usize,
+    x: usize,
+}
+
+/// A tracked pin's row once its row is gone.
+const LOST: usize = usize::MAX - 1;
 
 impl<'a, P: Planted<VtPlant>> Screen<'a, P> {
     /// A screen of `rows` × `cols` blank cells.
@@ -739,8 +774,49 @@ impl<'a, P: Planted<VtPlant>> Screen<'a, P> {
             no_scrollback,
             all_dirty: true,
             stats: ScreenStats::default(),
+            semantic_prompt: SemanticPromptState::default(),
+            pins: Vec::new_in(alloc),
+            next_pin: 0,
             plant,
         })
+    }
+
+    // ---- tracked pins ----------------------------------------------------------------------
+
+    /// Tracks the cell at page-list row `r`, column `x` (ghostty's `trackPin`): the id names it
+    /// until [`untrack_pin`](Self::untrack_pin).
+    pub fn track_pin(&mut self, r: usize, x: usize) -> Result<u64, AllocFailure> {
+        self.pins.try_reserve(1)?;
+        let id = self.next_pin;
+        self.next_pin += 1;
+        self.pins.push(TrackedPin { id, r, x });
+        Ok(id)
+    }
+
+    pub fn untrack_pin(&mut self, id: u64) {
+        if let Some(i) = self.pins.iter().position(|p| p.id == id) {
+            self.pins.remove_swap(i);
+        }
+    }
+
+    /// Where a tracked pin is: its page-list row and column, the top left once its row is gone.
+    pub fn pin(&self, id: u64) -> Option<(usize, usize)> {
+        let p = self.pins.iter().find(|p| p.id == id)?;
+        Some(if p.r == LOST { (0, 0) } else { (p.r, p.x) })
+    }
+
+    /// Pins tracked.
+    pub fn pins_tracked(&self) -> usize {
+        self.pins.len()
+    }
+
+    /// `n` rows left the front of the page list.
+    fn pins_shift(&mut self, n: usize) {
+        for p in self.pins.iter_mut() {
+            if p.r != LOST {
+                p.r = p.r.checked_sub(n).unwrap_or(LOST);
+            }
+        }
     }
 
     pub fn cols(&self) -> usize {
@@ -1132,7 +1208,12 @@ impl<'a, P: Planted<VtPlant>> Screen<'a, P> {
             self.zero_cells(r, 0, cols);
         }
         match self.pages.grow() {
-            Ok(g) => g.pruned,
+            Ok(g) => {
+                if g.pruned > 0 {
+                    self.pins_shift(g.pruned);
+                }
+                g.pruned
+            }
             Err(f) => {
                 self.note(Refused::Alloc(f));
                 0
@@ -1154,6 +1235,12 @@ impl<'a, P: Planted<VtPlant>> Screen<'a, P> {
                 let top = self.r(0);
                 self.zero_cells(top, 0, cols);
                 self.pages.rotate_up(top, top + rows - 1);
+                // ghostty erases the top row: the pins below move up with their rows.
+                for p in self.pins.iter_mut() {
+                    if p.r != LOST && p.r > top && p.r < top + rows {
+                        p.r -= 1;
+                    }
+                }
                 for y in 0..rows {
                     let r = self.r(y);
                     self.pages.row_mut(r).dirty = true;
@@ -1207,6 +1294,7 @@ impl<'a, P: Planted<VtPlant>> Screen<'a, P> {
             self.zero_cells(r, 0, cols);
         }
         self.pages.erase_front(n);
+        self.pins_shift(n);
     }
 
     /// Pushes the active area up to its last non-empty row into scrollback (ED 22, ghostty's
@@ -1265,6 +1353,10 @@ impl<'a, P: Planted<VtPlant>> Screen<'a, P> {
         self.charset = Charsets::default();
         self.kitty = KittyFlagStack::default();
         self.protected_mode = ProtectedMode::Off;
+        self.semantic_prompt = SemanticPromptState::default();
+        for p in self.pins.iter_mut() {
+            p.r = LOST;
+        }
         self.all_dirty = true;
     }
 
@@ -1306,6 +1398,7 @@ impl<'a, P: Planted<VtPlant>> Screen<'a, P> {
             SemanticSet::Output => (SemanticContent::Output, false),
             SemanticSet::Input { clear_eol } => (SemanticContent::Input, clear_eol),
             SemanticSet::Prompt { continuation } => {
+                self.semantic_prompt.seen = true;
                 let r = self.cursor_r();
                 self.pages.row_mut(r).prompt =
                     if continuation { RowPrompt::Continuation } else { RowPrompt::Prompt };
@@ -1329,26 +1422,42 @@ impl<'a, P: Planted<VtPlant>> Screen<'a, P> {
         {
             self.clear_prompt_for_redraw(opts.prompt_redraw);
         }
-        let mut pins = [
-            Pin { r: self.cursor_r(), x: self.cursor.x, moved: false },
-            Pin { r: usize::MAX, x: 0, moved: false },
-        ];
+        // The cursor, the saved cursor, then the tracked pins.
+        let mut pins: Vec<Pin, Alloc<'a>> = Vec::new_in(self.alloc);
+        if let Err(f) = pins.try_reserve(2 + self.pins.len()) {
+            self.note(Refused::Alloc(f));
+            for p in self.pins.iter_mut() {
+                p.r = LOST;
+            }
+            if pins.try_reserve(2).is_err() {
+                return;
+            }
+        }
+        pins.push(Pin { r: self.cursor_r(), x: self.cursor.x, moved: false });
+        pins.push(Pin { r: usize::MAX, x: 0, moved: false });
         if let Some(sc) = self.saved
             && sc.x < self.cols()
             && sc.y < self.rows()
         {
             pins[1] = Pin { r: self.r(sc.y), x: sc.x, moved: false };
         }
+        if pins.capacity() >= 2 + self.pins.len() {
+            for p in self.pins.iter() {
+                let r = if p.r == LOST { usize::MAX } else { p.r };
+                pins.push(Pin { r, x: p.x, moved: false });
+            }
+        }
+        let pins = &mut pins[..];
         let cursor_y = self.cursor.y;
         if !opts.reflow || opts.cols == self.cols() {
-            self.resize_without_reflow(opts.cols, opts.rows, &mut pins);
+            self.resize_without_reflow(opts.cols, opts.rows, pins);
         } else if opts.cols > self.cols() {
-            self.resize_cols(opts.cols, cursor_y, &mut pins);
-            self.resize_without_reflow(opts.cols, opts.rows, &mut pins);
+            self.resize_cols(opts.cols, cursor_y, pins);
+            self.resize_without_reflow(opts.cols, opts.rows, pins);
         } else {
             let cols = self.cols();
-            self.resize_without_reflow(cols, opts.rows, &mut pins);
-            self.resize_cols(opts.cols, cursor_y, &mut pins);
+            self.resize_without_reflow(cols, opts.rows, pins);
+            self.resize_cols(opts.cols, cursor_y, pins);
         }
         if self.no_scrollback {
             let cols = self.cols();
@@ -1387,6 +1496,17 @@ impl<'a, P: Planted<VtPlant>> Screen<'a, P> {
                 sc.x = 0;
                 sc.y = 0;
                 sc.pending_wrap = false;
+            }
+        }
+        if pins.len() == 2 + self.pins.len() {
+            let total = self.pages.total();
+            for (t, p) in self.pins.iter_mut().zip(&pins[2..]) {
+                if p.r < total {
+                    t.r = p.r;
+                    t.x = p.x.min(opts.cols.max(1) - 1);
+                } else {
+                    t.r = LOST;
+                }
             }
         }
         self.all_dirty = true;
@@ -1431,7 +1551,7 @@ impl<'a, P: Planted<VtPlant>> Screen<'a, P> {
     /// Resize with no reflow (PageList.zig:2316): columns cut or padded, rows trimmed from the
     /// blank bottom or pushed into scrollback, or added below (keeping the cursor's row when it
     /// is not at the bottom) or pulled down from scrollback.
-    fn resize_without_reflow(&mut self, cols: usize, rows: usize, pins: &mut [Pin; 2]) {
+    fn resize_without_reflow(&mut self, cols: usize, rows: usize, pins: &mut [Pin]) {
         let old_cols = self.cols();
         if cols != old_cols {
             self.rebuild_cols(cols);
@@ -1488,7 +1608,7 @@ impl<'a, P: Planted<VtPlant>> Screen<'a, P> {
     }
 
     /// Grows by a row, keeping pins on their rows through a prune.
-    fn grow_tracking(&mut self, pins: &mut [Pin; 2]) {
+    fn grow_tracking(&mut self, pins: &mut [Pin]) {
         let pruned = self.grow();
         if pruned > 0 {
             for p in pins.iter_mut() {
@@ -1522,7 +1642,7 @@ impl<'a, P: Planted<VtPlant>> Screen<'a, P> {
     }
 
     /// Reflow to `cols` columns (ghostty's `resizeCols`, PageList.zig:1294).
-    fn resize_cols(&mut self, cols: usize, cursor_y: usize, pins: &mut [Pin; 2]) {
+    fn resize_cols(&mut self, cols: usize, cursor_y: usize, pins: &mut [Pin]) {
         let rows = self.rows();
         // The wraps above the cursor in the active area, before.
         let (remaining, wrapped_before) = {

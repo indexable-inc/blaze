@@ -124,7 +124,7 @@ impl<'h> Iterator for Keys<'h> {
 pub enum DcsCommand<'h> {
     XtGetTcap(XtGetTcap<'h>),
     Decrqss(Decrqss),
-    Tmux(Notification<'h>),
+    Tmux(Notification<&'h [u8]>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

@@ -9,6 +9,9 @@ use super::tmux::{ControlParser, Notification, PaneId, SessionId, WindowId};
 use super::{DcsCommand, DcsHandler, DcsOpts, DcsStats, Decrqss, Refusal};
 use crate::parser::{Csi, Dcs, Esc, Parser, Sink, Terminator};
 
+/// The parser's notifications: borrowed bytes, so byte-string literals coerce.
+type Note<'a> = Notification<&'a [u8]>;
+
 const OPTS: DcsOpts = DcsOpts { tmux_control_mode: true, max_bytes: DcsOpts::MAX_BYTES };
 
 fn handler() -> DcsHandler<'static> {
@@ -111,8 +114,8 @@ fn decrqss_invalid_command() {
 fn tmux_enter_and_implicit_exit() {
     // dcs.zig:408 "tmux enter and implicit exit"
     let mut h = handler();
-    assert_eq!(hook(&mut h, b"", &[1000], b'p'), Some(DcsCommand::Tmux(Notification::Enter)));
-    assert_eq!(h.unhook(), Some(DcsCommand::Tmux(Notification::Exit)));
+    assert_eq!(hook(&mut h, b"", &[1000], b'p'), Some(DcsCommand::Tmux(Note::Enter)));
+    assert_eq!(h.unhook(), Some(DcsCommand::Tmux(Note::Exit)));
 }
 
 // --- vt-inventory.md §8, a test per row ---
@@ -140,13 +143,10 @@ fn inventory_8_tmux_notifications_come_mid_string() {
     let mut h = handler();
     hook(&mut h, b"", &[1000], b'p');
     put_all(&mut h, b"%window-add @3");
-    assert_eq!(
-        h.put(b'\n'),
-        Some(DcsCommand::Tmux(Notification::WindowAdd { window: WindowId(3) }))
-    );
+    assert_eq!(h.put(b'\n'), Some(DcsCommand::Tmux(Note::WindowAdd { window: WindowId(3) })));
     put_all(&mut h, b"%begin 1 2 0\nok\n%end 1 2 0");
-    assert_eq!(h.put(b'\n'), Some(DcsCommand::Tmux(Notification::BlockEnd(b"ok"))));
-    assert_eq!(h.unhook(), Some(DcsCommand::Tmux(Notification::Exit)));
+    assert_eq!(h.put(b'\n'), Some(DcsCommand::Tmux(Note::BlockEnd(b"ok"))));
+    assert_eq!(h.unhook(), Some(DcsCommand::Tmux(Note::Exit)));
 }
 
 #[test]
@@ -155,9 +155,9 @@ fn inventory_8_tmux_stray_line_exits_then_unhook_exits_again() {
     // stays hooked, so its end sends another exit (dcs.zig:163).
     let mut h = handler();
     hook(&mut h, b"", &[1000], b'p');
-    assert_eq!(h.put(b'x'), Some(DcsCommand::Tmux(Notification::Exit)));
+    assert_eq!(h.put(b'x'), Some(DcsCommand::Tmux(Note::Exit)));
     put_all(&mut h, b"%sessions-changed\n");
-    assert_eq!(h.unhook(), Some(DcsCommand::Tmux(Notification::Exit)));
+    assert_eq!(h.unhook(), Some(DcsCommand::Tmux(Note::Exit)));
 }
 
 #[test]
@@ -332,7 +332,7 @@ fn tmux_begin_end_empty() {
     let mut c = parser();
     feed_none(&mut c, b"%begin 1578922740 269 1\n");
     feed_none(&mut c, b"%end 1578922740 269 1");
-    assert_eq!(c.put(b'\n'), Ok(Some(Notification::BlockEnd(b""))));
+    assert_eq!(c.put(b'\n'), Ok(Some(Note::BlockEnd(b""))));
 }
 
 #[test]
@@ -341,7 +341,7 @@ fn tmux_begin_error_empty() {
     let mut c = parser();
     feed_none(&mut c, b"%begin 1578922740 269 1\n");
     feed_none(&mut c, b"%error 1578922740 269 1");
-    assert_eq!(c.put(b'\n'), Ok(Some(Notification::BlockErr(b""))));
+    assert_eq!(c.put(b'\n'), Ok(Some(Note::BlockErr(b""))));
 }
 
 #[test]
@@ -351,7 +351,7 @@ fn tmux_begin_end_data() {
     feed_none(&mut c, b"%begin 1578922740 269 1\n");
     feed_none(&mut c, b"hello\nworld\n");
     feed_none(&mut c, b"%end 1578922740 269 1");
-    assert_eq!(c.put(b'\n'), Ok(Some(Notification::BlockEnd(b"hello\nworld"))));
+    assert_eq!(c.put(b'\n'), Ok(Some(Note::BlockEnd(b"hello\nworld"))));
 }
 
 #[test]
@@ -359,7 +359,7 @@ fn tmux_block_payload_may_start_with_end() {
     // control.zig:639 "tmux block payload may start with %end"
     let mut c = parser();
     feed_none(&mut c, b"%begin 1 1 1\n%end not really\nhello\n%end 1 1 1");
-    assert_eq!(c.put(b'\n'), Ok(Some(Notification::BlockEnd(b"%end not really\nhello"))));
+    assert_eq!(c.put(b'\n'), Ok(Some(Note::BlockEnd(b"%end not really\nhello"))));
 }
 
 #[test]
@@ -367,7 +367,7 @@ fn tmux_block_payload_may_start_with_error() {
     // control.zig:654 "tmux block payload may start with %error"
     let mut c = parser();
     feed_none(&mut c, b"%begin 1 1 1\n%error not really\nhello\n%end 1 1 1");
-    assert_eq!(c.put(b'\n'), Ok(Some(Notification::BlockEnd(b"%error not really\nhello"))));
+    assert_eq!(c.put(b'\n'), Ok(Some(Note::BlockEnd(b"%error not really\nhello"))));
 }
 
 #[test]
@@ -375,7 +375,7 @@ fn tmux_block_may_terminate_with_real_error_after_misleading_payload() {
     // control.zig:669 "tmux block may terminate with real %error after misleading payload"
     let mut c = parser();
     feed_none(&mut c, b"%begin 1 1 1\n%error not really\nhello\n%error 1 1 1");
-    assert_eq!(c.put(b'\n'), Ok(Some(Notification::BlockErr(b"%error not really\nhello"))));
+    assert_eq!(c.put(b'\n'), Ok(Some(Note::BlockErr(b"%error not really\nhello"))));
 }
 
 #[test]
@@ -383,7 +383,7 @@ fn tmux_block_terminator_requires_exact_token_count() {
     // control.zig:684 "tmux block terminator requires exact token count"
     let mut c = parser();
     feed_none(&mut c, b"%begin 1 1 1\n%end 1 1 1 trailing\nhello\n%end 1 1 1");
-    assert_eq!(c.put(b'\n'), Ok(Some(Notification::BlockEnd(b"%end 1 1 1 trailing\nhello"))));
+    assert_eq!(c.put(b'\n'), Ok(Some(Note::BlockEnd(b"%end 1 1 1 trailing\nhello"))));
 }
 
 #[test]
@@ -391,7 +391,7 @@ fn tmux_block_terminator_requires_numeric_metadata() {
     // control.zig:699 "tmux block terminator requires numeric metadata"
     let mut c = parser();
     feed_none(&mut c, b"%begin 1 1 1\n%end foo bar baz\nhello\n%end 1 1 1");
-    assert_eq!(c.put(b'\n'), Ok(Some(Notification::BlockEnd(b"%end foo bar baz\nhello"))));
+    assert_eq!(c.put(b'\n'), Ok(Some(Note::BlockEnd(b"%end foo bar baz\nhello"))));
 }
 
 #[test]
@@ -399,10 +399,7 @@ fn tmux_output() {
     // control.zig:714 "tmux output"
     let mut c = parser();
     feed_none(&mut c, b"%output %42 foo bar baz");
-    assert_eq!(
-        c.put(b'\n'),
-        Ok(Some(Notification::Output { pane: PaneId(42), data: b"foo bar baz" }))
-    );
+    assert_eq!(c.put(b'\n'), Ok(Some(Note::Output { pane: PaneId(42), data: b"foo bar baz" })));
 }
 
 #[test]
@@ -412,7 +409,7 @@ fn tmux_session_changed() {
     feed_none(&mut c, b"%session-changed $42 foo");
     assert_eq!(
         c.put(b'\n'),
-        Ok(Some(Notification::SessionChanged { session: SessionId(42), name: b"foo" }))
+        Ok(Some(Note::SessionChanged { session: SessionId(42), name: b"foo" }))
     );
 }
 
@@ -421,7 +418,7 @@ fn tmux_sessions_changed() {
     // control.zig:740 "tmux sessions-changed"
     let mut c = parser();
     feed_none(&mut c, b"%sessions-changed");
-    assert_eq!(c.put(b'\n'), Ok(Some(Notification::SessionsChanged)));
+    assert_eq!(c.put(b'\n'), Ok(Some(Note::SessionsChanged)));
 }
 
 #[test]
@@ -429,7 +426,7 @@ fn tmux_sessions_changed_carriage_return() {
     // control.zig:751 "tmux sessions-changed carriage return"
     let mut c = parser();
     feed_none(&mut c, b"%sessions-changed\r");
-    assert_eq!(c.put(b'\n'), Ok(Some(Notification::SessionsChanged)));
+    assert_eq!(c.put(b'\n'), Ok(Some(Note::SessionsChanged)));
 }
 
 #[test]
@@ -442,7 +439,7 @@ fn tmux_layout_change() {
     );
     assert_eq!(
         c.put(b'\n'),
-        Ok(Some(Notification::LayoutChange {
+        Ok(Some(Note::LayoutChange {
             window: WindowId(2),
             layout: b"1234x791,0,0{617x791,0,0,0,617x791,618,0,1}",
             visible_layout: b"1234x791,0,0{617x791,0,0,0,617x791,618,0,1}",
@@ -456,7 +453,7 @@ fn tmux_window_add() {
     // control.zig:777 "tmux window-add"
     let mut c = parser();
     feed_none(&mut c, b"%window-add @14");
-    assert_eq!(c.put(b'\n'), Ok(Some(Notification::WindowAdd { window: WindowId(14) })));
+    assert_eq!(c.put(b'\n'), Ok(Some(Note::WindowAdd { window: WindowId(14) })));
 }
 
 #[test]
@@ -464,10 +461,7 @@ fn tmux_window_renamed() {
     // control.zig:789 "tmux window-renamed"
     let mut c = parser();
     feed_none(&mut c, b"%window-renamed @42 bar");
-    assert_eq!(
-        c.put(b'\n'),
-        Ok(Some(Notification::WindowRenamed { window: WindowId(42), name: b"bar" }))
-    );
+    assert_eq!(c.put(b'\n'), Ok(Some(Note::WindowRenamed { window: WindowId(42), name: b"bar" })));
 }
 
 #[test]
@@ -477,7 +471,7 @@ fn tmux_window_pane_changed() {
     feed_none(&mut c, b"%window-pane-changed @42 %2");
     assert_eq!(
         c.put(b'\n'),
-        Ok(Some(Notification::WindowPaneChanged { window: WindowId(42), pane: PaneId(2) }))
+        Ok(Some(Note::WindowPaneChanged { window: WindowId(42), pane: PaneId(2) }))
     );
 }
 
@@ -486,7 +480,7 @@ fn tmux_client_detached() {
     // control.zig:815 "tmux client-detached"
     let mut c = parser();
     feed_none(&mut c, b"%client-detached /dev/pts/1");
-    assert_eq!(c.put(b'\n'), Ok(Some(Notification::ClientDetached { client: b"/dev/pts/1" })));
+    assert_eq!(c.put(b'\n'), Ok(Some(Note::ClientDetached { client: b"/dev/pts/1" })));
 }
 
 #[test]
@@ -496,7 +490,7 @@ fn tmux_client_session_changed() {
     feed_none(&mut c, b"%client-session-changed /dev/pts/1 $2 mysession");
     assert_eq!(
         c.put(b'\n'),
-        Ok(Some(Notification::ClientSessionChanged {
+        Ok(Some(Note::ClientSessionChanged {
             client: b"/dev/pts/1",
             session: SessionId(2),
             name: b"mysession"
@@ -518,12 +512,7 @@ fn tmux_greedy_groups_split_where_the_regex_splits() {
     let n = |l: &[u8], v: &[u8], f: &[u8]| {
         std::format!(
             "{:?}",
-            Notification::LayoutChange {
-                window: WindowId(1),
-                layout: l,
-                visible_layout: v,
-                raw_flags: f
-            }
+            Note::LayoutChange { window: WindowId(1), layout: l, visible_layout: v, raw_flags: f }
         )
         .into_bytes()
     };
@@ -537,11 +526,7 @@ fn tmux_greedy_groups_split_where_the_regex_splits() {
         Some(
             std::format!(
                 "{:?}",
-                Notification::ClientSessionChanged {
-                    client: b"a $1 b",
-                    session: SessionId(2),
-                    name: b"c"
-                }
+                Note::ClientSessionChanged { client: b"a $1 b", session: SessionId(2), name: b"c" }
             )
             .into_bytes()
         )
@@ -551,7 +536,7 @@ fn tmux_greedy_groups_split_where_the_regex_splits() {
         Some(
             std::format!(
                 "{:?}",
-                Notification::ClientSessionChanged {
+                Note::ClientSessionChanged {
                     client: b"a",
                     session: SessionId(1),
                     name: b"b $2x c"
@@ -581,7 +566,7 @@ fn tmux_unmatched_and_unknown_lines_give_nothing_and_stay_idle() {
         assert_eq!(c.put(b'\n'), Ok(None), "{}", std::string::String::from_utf8_lossy(l));
         assert!(!c.is_broken());
         feed_none(&mut c, b"%sessions-changed");
-        assert_eq!(c.put(b'\n'), Ok(Some(Notification::SessionsChanged)), "still parses after");
+        assert_eq!(c.put(b'\n'), Ok(Some(Note::SessionsChanged)), "still parses after");
     }
 }
 
@@ -624,7 +609,7 @@ fn tmux_cap_checks_the_newline_too() {
     assert_eq!(c.put(b'\n'), Err(Refusal::OverCap { max_bytes: 14 }));
     let mut c = ControlParser::new_in(15, testing::heap().alloc());
     feed_none(&mut c, b"%output %1 abc");
-    assert_eq!(c.put(b'\n'), Ok(Some(Notification::Output { pane: PaneId(1), data: b"abc" })));
+    assert_eq!(c.put(b'\n'), Ok(Some(Note::Output { pane: PaneId(1), data: b"abc" })));
     assert_eq!(c.put(b'%'), Ok(None), "the next line starts");
 }
 
@@ -650,8 +635,8 @@ fn any_dcs_bytes_hold_the_cap_and_never_panic() {
         for &b in &bytes {
             if let Some(DcsCommand::Tmux(n)) = h.put(b) {
                 let held = match n {
-                    Notification::BlockEnd(d) | Notification::BlockErr(d) => d.len(),
-                    Notification::Output { data, .. } => data.len(),
+                    Note::BlockEnd(d) | Note::BlockErr(d) => d.len(),
+                    Note::Output { data, .. } => data.len(),
                     _ => 0,
                 };
                 assert!(held <= max, "a notification larger than the cap");

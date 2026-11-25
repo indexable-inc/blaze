@@ -4,12 +4,12 @@
 use blaze_own::planted::Planted;
 
 use super::ops::{EraseDisplay, EraseLine};
-use super::{DcsHead, Effect, Mode, StatusDisplay, Terminal};
+use super::{Effect, Mode, StatusDisplay, Terminal};
+use crate::dcs::DcsCommand;
 use crate::parser::{Csi, Dcs, Esc, Sink, Terminator};
 use crate::plant::VtPlant;
 use crate::reply;
 use crate::screen::{Charset, CursorShape, KittySet, ProtectedMode, Slot};
-use crate::style::{Color, Style};
 
 /// "def1": no parameter is 1, one is itself, more is invalid (stream.zig).
 fn def1(csi: &Csi<'_>) -> Option<usize> {
@@ -98,6 +98,14 @@ impl<P: Planted<VtPlant>> Sink for Terminal<'_, P> {
     }
 
     fn osc_put(&mut self, b: u8) {
+        // ghostty captures at most `MAX_BUF` bytes after the number's `;` but for the unbounded
+        // commands: past that (and the longest number, `5522;`) the OSC is invalid, so the
+        // capture stops there rather than at the cap.
+        let len = self.osc.bytes.len();
+        if len >= crate::osc::MAX_BUF + 5 && !crate::osc::unbounded(&self.osc.bytes) {
+            self.osc.overflow = true;
+            return;
+        }
         self.osc.put(&[b]);
     }
 
@@ -113,33 +121,39 @@ impl<P: Planted<VtPlant>> Sink for Terminal<'_, P> {
     }
 
     fn dcs_hook(&mut self, dcs: &Dcs<'_>) {
-        let mut head = DcsHead {
-            intermediates: [0; crate::parser::MAX_INTERMEDIATES],
-            n_intermediates: dcs.intermediates.len() as u8,
-            params: [0; crate::parser::MAX_PARAMS],
-            n_params: dcs.params.len() as u8,
-            final_byte: dcs.final_byte,
-        };
-        head.intermediates[..dcs.intermediates.len()].copy_from_slice(dcs.intermediates);
-        head.params[..dcs.params.len()].copy_from_slice(dcs.params);
-        self.dcs_head = Some(head);
-        self.dcs.start();
+        if let Some(DcsCommand::Tmux(n)) = self.dcs.hook(dcs)
+            && !self.effects.tmux(n, &self.opts.caps)
+        {
+            self.stats.effects_dropped += 1;
+        }
     }
 
     fn dcs_put(&mut self, b: u8) {
-        self.dcs.put(&[b]);
+        if let Some(DcsCommand::Tmux(n)) = self.dcs.put(b)
+            && !self.effects.tmux(n, &self.opts.caps)
+        {
+            self.stats.effects_dropped += 1;
+        }
     }
 
     fn dcs_unhook(&mut self) {
-        let Some(head) = self.dcs_head.take() else { return };
-        if self.dcs.overflow {
-            self.stats.strings_truncated += 1;
-            return;
+        match self.dcs.unhook() {
+            None => {}
+            Some(DcsCommand::Tmux(n)) => {
+                if !self.effects.tmux(n, &self.opts.caps) {
+                    self.stats.effects_dropped += 1;
+                }
+            }
+            Some(DcsCommand::XtGetTcap(req)) => {
+                super::reply_into(
+                    &mut self.replies,
+                    self.opts.caps.replies,
+                    &mut self.stats,
+                    |o| reply::xtgettcap(o, &req),
+                );
+            }
+            Some(DcsCommand::Decrqss(req)) => self.decrqss(req),
         }
-        let buf = core::mem::replace(&mut self.dcs.bytes, blaze_own::Vec::new_in(self.alloc));
-        self.dcs(&head, &buf);
-        self.dcs.bytes = buf;
-        self.dcs.bytes.clear();
     }
 
     fn apc_start(&mut self) {
@@ -151,55 +165,41 @@ impl<P: Planted<VtPlant>> Sink for Terminal<'_, P> {
     }
 
     fn apc_end(&mut self) {
-        if self.apc.overflow {
-            self.stats.strings_truncated += 1;
-            return;
-        }
-        let buf = core::mem::replace(&mut self.apc.bytes, blaze_own::Vec::new_in(self.alloc));
-        self.apc(&buf);
-        self.apc.bytes = buf;
-        self.apc.bytes.clear();
+        let (apc, mut screen, which) = self.kitty_split();
+        let out = apc.end(which, &mut screen);
+        self.kitty_outcome(out.reply, out.cursor, out.waits_on_host);
     }
 }
 
 impl<P: Planted<VtPlant>> Terminal<'_, P> {
-    // sgr lane replaces
-    /// SGR, the attributes this lane needs to test with: 0, 1, 7, 22, 27, 30–37, 39, 40–47,
-    /// 49. The SGR lane's parser takes its place.
+    /// SGR (stream.zig:1381): every attribute onto the cursor's pen, interned in the screen's
+    /// style set (the cursor holds one reference).
     fn sgr(&mut self, csi: &Csi<'_>) {
         let mut st = self.scr().cursor.style;
-        let params: &[u16] = if csi.params.is_empty() { &[0] } else { csi.params };
-        for &p in params {
-            match p {
-                0 => st = Style::default(),
-                1 => st.flags.bold = true,
-                7 => st.flags.inverse = true,
-                22 => {
-                    st.flags.bold = false;
-                    st.flags.faint = false;
-                }
-                27 => st.flags.inverse = false,
-                30..=37 => st.fg = Color::Palette((p - 30) as u8),
-                39 => st.fg = Color::None,
-                40..=47 => st.bg = Color::Palette((p - 40) as u8),
-                49 => st.bg = Color::None,
-                _ => self.stats.unsupported += 1,
-            }
-        }
+        crate::sgr::apply_all(csi, &mut st);
         self.scr().set_cursor_style(st);
     }
 
-    // osc lane replaces
-    /// An OSC's bytes. Records nothing yet: the OSC lane's parser takes its place.
-    fn osc(&mut self, _data: &[u8], _end: Terminator) {}
-
-    // dcs lane replaces
-    /// A DCS's hook and bytes. Records nothing yet: the DCS lane takes its place.
-    fn dcs(&mut self, _head: &DcsHead, _data: &[u8]) {}
-
-    // apc lane replaces
-    /// An APC's bytes. Records nothing yet: the kitty graphics lane takes its place.
-    fn apc(&mut self, _data: &[u8]) {}
+    /// DECRQSS (stream_handler.zig `dcsCommand`): the setting from the screen shown.
+    fn decrqss(&mut self, req: crate::dcs::Decrqss) {
+        let region = self.region;
+        let lr = self.modes.get(Mode::EnableLeftRightMargin);
+        let blink = self.modes.get(Mode::CursorBlinking);
+        let s = self.screen();
+        let style = s.cursor.style;
+        let shape = s.cursor.shape;
+        let state = reply::DecrqssState {
+            style: &style,
+            top: region.top as u32,
+            bottom: region.bottom as u32,
+            left: region.left as u32,
+            right: region.right as u32,
+            left_right_margins: lr,
+            cursor_shape: shape,
+            cursor_blink: blink,
+        };
+        self.reply(|o| reply::decrqss(o, req, &state));
+    }
 
     /// DA1 (0), DA2 (1), DA3 (2).
     fn device_attributes(&mut self, which: u8) {
