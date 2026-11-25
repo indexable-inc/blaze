@@ -309,6 +309,13 @@ pub fn c_env<'a>(c: &CInputs<'_>, alloc: Alloc<'a>) -> AVec<'a, (AString<'a>, AS
         put("SDKROOT", text(&[c.sysroot]));
     }
     put("SOURCE_DATE_EPOCH", text(&["0"]));
+    if !c.apple() {
+        // A pinned ONNX Runtime in the sysroot, pre-provisioned (D69): ort-sys's build script
+        // reads `ORT_LIB_PATH`/`ORT_LIB_LOCATION` (its `SYSTEM_LIB_PATH`) before its download
+        // fallback, and static-links `libonnxruntime.a` from it — no network, and the archive
+        // is part of the pinned sysroot, so its bytes are in the run key's sysroot line.
+        put("ORT_LIB_PATH", text(&[c.sysroot, "/usr/lib/x86_64-linux-gnu"]));
+    }
     env
 }
 

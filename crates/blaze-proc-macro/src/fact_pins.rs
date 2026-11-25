@@ -144,6 +144,13 @@ pub fn pinned_setting<'a>(host: &str, text: &UserlandText<'_>, alloc: Alloc<'a>)
 /// the command naming it. Any other host declares no Apple userland (READINESS Q1 is open), so it
 /// gets [`SpawnSetting::off`] and each fact is refused by name at its spawn.
 pub fn command_spawn_setting<'a>(host: &str, alloc: Alloc<'a>) -> Result<SpawnSetting, CommandPinsError<'a>> {
+    if host.ends_with("-linux-gnu") {
+        // D69: a Linux host has no Apple userland; its pins are the pinned clang's `--version`
+        // alone (the `sw_vers` facts are never answered there: no such tool in its base set).
+        let userland = fact_pins::AppleUserland { product_version: "", build_version: "", darwin_release: "" };
+        let pins = fact_pins::fact_pins(CLANG_JSON, host, &userland, CLANG_GUEST_DIR, alloc).map_err(|e| owned_pin(e, alloc))?;
+        return Ok(SpawnSetting::facts_only(FactPins::from_owned(&pins)));
+    }
     if !host.ends_with("-apple-darwin") {
         return Ok(SpawnSetting::off());
     }

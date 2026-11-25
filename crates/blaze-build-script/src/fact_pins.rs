@@ -174,6 +174,10 @@ pub fn apple_userland<'t>(plist: &'t str, darwin_release: &'t str) -> Result<App
 fn triple_stem(target: &str) -> Option<&'static str> {
     match target {
         "aarch64-apple-darwin" => Some("arm64-apple-darwin"),
+        // Linux clang appends no OS version to its default triple (Host.cpp's
+        // `updateTripleOSVersion` is Darwin's), so the stem is the whole triple.
+        "aarch64-unknown-linux-gnu" => Some("aarch64-unknown-linux-gnu"),
+        "x86_64-unknown-linux-gnu" => Some("x86_64-unknown-linux-gnu"),
         _ => None,
     }
 }

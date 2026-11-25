@@ -134,7 +134,7 @@ pub(super) fn asked(text: &str) -> bool {
 }
 
 /// Copies the folder `from` to `to`, walked with a stack.
-fn copy_tree(from: &Path, to: &Path) -> Result<(), Failure> {
+pub(super) fn copy_tree(from: &Path, to: &Path) -> Result<(), Failure> {
     let mut stack = vec![(from.to_owned(), to.to_owned())];
     while let Some((from, to)) = stack.pop() {
         std::fs::create_dir_all(&to).map_err(io(&to))?;
@@ -514,7 +514,11 @@ impl Plan<'_> {
         write(&ws.join("Cargo.toml"), "[workspace]\nmembers = [\"script\"]\nresolver = \"2\"\n\n[profile.release]\ndebug = false\nincremental = false\npanic = \"abort\"\ncodegen-units = 16\n")?;
         let path = source.join("Cargo.toml");
         let manifest = super::member_dependencies::filtered_manifest(&script_only(&original), &path, &features, alloc)?;
-        write(&ws.join("script/Cargo.toml"), script_manifest(manifest.as_str(), &path, &script, &wanted.name, &wanted.version, &features, alloc)?)?;
+        let manifest = script_manifest(manifest.as_str(), &path, &script, &wanted.name, &wanted.version, &features, alloc)?;
+        // The script's path dependencies resolve at their staged folders (the fetch staged
+        // them), not relative to this workspace.
+        let manifest = self.restaged_manifest_paths(&manifest, &source);
+        write(&ws.join("script/Cargo.toml"), &manifest)?;
         write(&ws.join("Cargo.lock"), member_lock(&read(&self.work.join("fetch/Cargo.lock"))?, &wanted.name, &wanted.version))?;
         write(
             &ws.join(".cargo/config.toml"),
@@ -640,6 +644,20 @@ impl Plan<'_> {
                     env.push(("SDKROOT".to_owned(), native.sdk.clone().into_os_string()));
                     env.push(("MACOSX_DEPLOYMENT_TARGET".to_owned(), "11.0".into()));
                 } else {
+                    // The build scripts that run at build time (ring's) spawn `cc` by name:
+                    // the pinned clang, its C++ driver and its `ar`, with the sysroot in the
+                    // flags, are the only C toolchain they find (D69: never the machine's).
+                    env.push(("CC".to_owned(), native.clang.join("bin/clang").into_os_string()));
+                    env.push(("CXX".to_owned(), native.clang.join("bin/clang++").into_os_string()));
+                    env.push(("AR".to_owned(), native.clang.join("bin/llvm-ar").into_os_string()));
+                    let cflags: OsString = format!("--sysroot={}", native.sdk.display()).into();
+                    env.push(("CFLAGS".to_owned(), cflags.clone()));
+                    env.push(("CXXFLAGS".to_owned(), cflags));
+                    // OpenSSL probes the sysroot's pinned libssl (the unit's tls-native):
+                    // the multiarch folder, since openssl-sys looks only in `<dir>/lib64` and
+                    // `<dir>/lib` by itself.
+                    env.push(("OPENSSL_DIR".to_owned(), native.sdk.join("usr").into_os_string()));
+                    env.push(("OPENSSL_LIB_DIR".to_owned(), native.sdk.join("usr/lib/x86_64-linux-gnu").into_os_string()));
                     // Linux: clang finds the sysroot's headers, crt and libs only through
                     // `--sysroot`, and `ld.lld` only through `-fuse-ld=lld` (the shelf holds no
                     // `clang.cfg`); both ride the encoded rustflags beside the path remaps.
@@ -886,11 +904,16 @@ fn linux_confined_argv(
     .collect();
     let mut reads: Vec<String> = vec![
         text(&plan.work.join("vendor")),
+        // A path package's staged dependencies (the fetch's `<work>/path`).
+        text(&plan.work.join("path")),
         text(&plan.tool.sysroot),
         text(&native.clang),
         text(&native.sdk),
     ];
     reads.extend(own_source.map(|dir| text(dir)));
+    // The hermetic plan opens every read with `O_PATH`: a folder that is not there (a crate
+    // with no staged path dependencies) is dropped, never a refusal of the whole build.
+    reads.retain(|dir| Path::new(dir).is_dir());
     let env_pairs: Vec<String> = env.iter().map(|(k, v)| format!("{k}\u{1f}{}", v.to_string_lossy())).collect();
     let args: Vec<String> = argv.iter().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
     let spec = serde_json::json!({

@@ -1040,6 +1040,8 @@ fn member_manifest(original: &str, source: &Path, path: &Path, features: &[Strin
     // `autobins` belongs in [package]: put the auto flags right after the [package] header.
     let out = out.replacen("autobins = false\n\n[package.metadata.blaze]", "\n[package.metadata.blaze]", 1);
     let out = out.replacen("[package]\n", "[package]\nautobins = false\nautoexamples = false\nautotests = false\nautobenches = false\n", 1);
+    // `[lints] workspace = true` (skipped above): the root's `workspace.lints` tables,
+    // renamed `lints.*`, written in (a staged manifest has no workspace root).
     Ok(out)
 }
 
@@ -1156,6 +1158,12 @@ fn inherit(member: &str, root: &str, root_dir: &Path, path: &Path) -> Result<Str
             || section.ends_with(".build-dependencies")
             || section == "dev-dependencies"
             || section.ends_with(".dev-dependencies");
+        if section == "lints" && key == "workspace" && value == "true" {
+            // D52's staged manifests have no workspace root beside them: the lints the
+            // root's `workspace.lints` holds are written in here (appended at the end, the
+            // table's own line dropped).
+            continue;
+        }
         if section == "package" && key.ends_with(".workspace") {
             let name = key.trim_end_matches(".workspace");
             let inherited = table_value(root, "workspace.package", name)
@@ -1207,6 +1215,32 @@ fn inherit(member: &str, root: &str, root_dir: &Path, path: &Path) -> Result<Str
             out.push('\n');
         }
     }
+    // `[lints] workspace = true` (dropped above): the root's `workspace.lints` tables,
+    // renamed `lints.*`, written in (a staged manifest has no workspace root beside it).
+    if member.contains("[lints]") {
+        let mut lints = String::new();
+        let mut in_lints = false;
+        for line in root.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') {
+                in_lints = trimmed == "[workspace.lints]" || trimmed.starts_with("[workspace.lints.");
+                if in_lints {
+                    lints.push_str(&line.replacen("[workspace.lints", "[lints", 1));
+                    lints.push('\n');
+                }
+                continue;
+            }
+            if in_lints {
+                lints.push_str(line);
+                lints.push('\n');
+            }
+        }
+        if !lints.is_empty() {
+            out.push('\n');
+            out.push_str(&lints);
+        }
+    }
+
     Ok(out)
 }
 
@@ -1328,8 +1362,11 @@ fn sandboxed(argv: Vec<OsString>, work: &Path) -> Result<Vec<OsString>, String> 
         out.extend(argv);
         Ok(out)
     } else if cfg!(target_os = "linux") {
-        let bwrap = ["/usr/bin/bwrap", "/bin/bwrap"].into_iter().map(Path::new).find(|it| it.exists());
-        let Some(bwrap) = bwrap else { return Err("no bwrap at /usr/bin or /bin".to_owned()) };
+        let bwrap = std::env::var_os("BLAZE_BWRAP")
+            .map(PathBuf::from)
+            .filter(|it| it.exists())
+            .or_else(|| ["/usr/bin/bwrap", "/bin/bwrap"].into_iter().map(Path::new).find(|it| it.exists()).map(Path::to_path_buf));
+        let Some(bwrap) = bwrap else { return Err("no bwrap at BLAZE_BWRAP, /usr/bin or /bin".to_owned()) };
         let mut out: Vec<OsString> = vec![bwrap.as_os_str().to_owned()];
         for arg in ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--unshare-net", "--die-with-parent", "--bind"] {
             out.push(arg.into());
@@ -1599,9 +1636,134 @@ struct Plan<'a> {
 }
 
 impl Plan<'_> {
-    /// The folder of a path package's manifest as the fetch depends on it.
-    fn path_member(&self, wanted: &Wanted) -> PathBuf {
-        self.work.join("path").join(format!("{}-{}", wanted.name, wanted.version))
+    /// Where `dir` (a path or git package's source folder) is staged for the fetch: under
+    /// `<work>/path/`, keeping its path relative to the checkout (or to `<work>/git`), so a
+    /// sibling dependency's relative `path = "../x"` resolves exactly as it does in the
+    /// checkout (D52's path-workspace support: a workspace member's module is built from the
+    /// checkout's own sources, its path dependencies staged beside it).
+    fn staged_dir(&self, dir: &Path) -> PathBuf {
+        let rel = dir
+            .strip_prefix(&self.args.checkout)
+            .or_else(|_| dir.strip_prefix(&self.work))
+            .unwrap_or(dir);
+        self.work.join("path").join(rel)
+    }
+
+    /// `manifest`'s path dependencies rewritten to their staged spellings (the build's
+    /// workspace resolves them there): a relative `path = "…"` (relative to `dir`, the
+    /// package's original folder) becomes the staged folder's absolute path; an absolute one
+    /// under the checkout becomes its staged folder.
+    fn restaged_manifest_paths(&self, manifest: &str, dir: &Path) -> String {
+        let mut out = manifest.to_owned();
+        let mut section = String::new();
+        for line in manifest.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') {
+                section = trimmed.trim_matches(|c| c == '[' || c == ']').trim().to_owned();
+                continue;
+            }
+            let dependencies = section == "dependencies"
+                || section == "build-dependencies"
+                || section.ends_with(".dependencies")
+                || section.ends_with(".build-dependencies");
+            if !dependencies {
+                continue;
+            }
+            let Some((key, value)) = trimmed.split_once('=') else { continue };
+            let value = value.trim();
+            let dep_path = if key.trim() == "path" {
+                value.trim_matches('"').to_owned()
+            } else if let Some(entries) = inline_entries(value) {
+                match entries.iter().find(|entry| entry.trim_start().starts_with("path")) {
+                    Some(entry) => entry.split_once('=').map(|(_, v)| v.trim().trim_matches('"').to_owned()).unwrap_or_default(),
+                    None => continue,
+                }
+            } else {
+                continue;
+            };
+            if dep_path.is_empty() {
+                continue;
+            }
+            let staged = if dep_path.starts_with('/') {
+                let absolute = PathBuf::from(&dep_path);
+                if absolute.strip_prefix(&self.args.checkout).is_err() {
+                    continue;
+                }
+                self.staged_dir(&absolute)
+            } else {
+                self.staged_dir(&dir.join(&dep_path))
+            };
+            out = out.replace(&format!("path = {dep_path:?}"), &format!("path = {:?}", staged.display().to_string()));
+        }
+        out
+    }
+
+    /// Stage `manifest`'s path dependencies (a staged package at `staged`, its original
+    /// folder `dir`) and return the manifest with every checkout path rewritten to its staged
+    /// spelling: each relative `path = "…"` of a dependency table resolves beside the staged
+    /// folder exactly as beside the original; an absolute one under the checkout (a
+    /// workspace-inherited path, [`inherit`]) is rewritten to its staged folder. Each is
+    /// copied with the workspace's inheritance written in and is itself staged, recursively.
+    fn stage_path_deps(&self, staged: &Path, manifest: &str, dir: &Path, depth: usize) -> Result<String, Failure> {
+        const MOST: usize = 8;
+        let refuse = |why: String| Failure::Manifest { path: dir.join("Cargo.toml"), why };
+        if depth > MOST {
+            return Err(refuse(format!("path dependencies more than {MOST} deep")));
+        }
+        let root_manifest = read(&self.args.checkout.join("Cargo.toml"))?;
+        let mut out = manifest.to_owned();
+        let mut section = String::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for line in manifest.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') {
+                section = trimmed.trim_matches(|c| c == '[' || c == ']').trim().to_owned();
+                continue;
+            }
+            let dependencies = section == "dependencies"
+                || section == "build-dependencies"
+                || section.ends_with(".dependencies")
+                || section.ends_with(".build-dependencies");
+            if !dependencies {
+                continue;
+            }
+            let Some((key, value)) = trimmed.split_once('=') else { continue };
+            let value = value.trim();
+            let dep_path = if key.trim() == "path" {
+                value.trim_matches('"').to_owned()
+            } else if let Some(entries) = inline_entries(value) {
+                match entries.iter().find(|entry| entry.trim_start().starts_with("path")) {
+                    Some(entry) => entry.split_once('=').map(|(_, v)| v.trim().trim_matches('"').to_owned()).unwrap_or_default(),
+                    None => continue,
+                }
+            } else {
+                continue;
+            };
+            if dep_path.is_empty() {
+                continue;
+            }
+            let (original_dep, staged_dep) = if dep_path.starts_with('/') {
+                let absolute = PathBuf::from(&dep_path);
+                if absolute.strip_prefix(&self.args.checkout).is_err() {
+                    continue;
+                }
+                let staged = self.staged_dir(&absolute);
+                (absolute, staged)
+            } else {
+                (dir.join(&dep_path), staged.join(&dep_path))
+            };
+            if seen.insert(staged_dep.clone()) && !staged_dep.exists() {
+                let dep_manifest_path = original_dep.join("Cargo.toml");
+                let dep_manifest = read(&dep_manifest_path)?;
+                let inherited = inherit(&dep_manifest, &root_manifest, &self.args.checkout, &dep_manifest_path)?;
+                build_scripts::copy_tree(&original_dep, &staged_dep)?;
+                let inherited = self.stage_path_deps(&staged_dep, &inherited, &original_dep, depth + 1)?;
+                write(&staged_dep.join("Cargo.toml"), &inherited)?;
+            }
+            // The staged manifest names the staged folder, never the checkout's.
+            out = out.replace(&format!("path = {dep_path:?}"), &format!("path = {:?}", staged_dep.display().to_string()));
+        }
+        Ok(out)
     }
 
     /// The manifest of the `at`th crate as written: the vendored one, or a path package's with
@@ -1672,8 +1834,8 @@ impl Plan<'_> {
                     .collect();
                 let from = match origin {
                     Origin::Registry { .. } => format!("package = {:?}, version = \"={}\"", wanted.name, wanted.version),
-                    Origin::Path { .. } | Origin::Git { .. } => {
-                        format!("package = {:?}, path = {:?}", wanted.name, self.path_member(wanted).display().to_string())
+                    Origin::Path { dir, .. } | Origin::Git { dir, .. } => {
+                        format!("package = {:?}, path = {:?}", wanted.name, self.staged_dir(dir).display().to_string())
                     }
                 };
                 manifest.push_str(&format!("m{at} = {{ {from}, default-features = {default}, features = {named:?} }}\n"));
@@ -1684,13 +1846,17 @@ impl Plan<'_> {
         // so the fetch vendors what it depends on.
         for (_, wanted, origin) in self.located() {
             if let Origin::Path { dir, manifest, .. } | Origin::Git { dir, manifest, .. } = origin {
-                // The member's `../shim`, as in the build's workspace.
-                let shim = self.work.join("path/shim");
-                write(&shim.join("Cargo.toml"), SHIM_MANIFEST)?;
-                write(&shim.join("shim.rs"), &self.shim_text)?;
                 let path = dir.join("Cargo.toml");
                 let features = wanted.features.clone().unwrap_or_else(|| vec!["default".to_owned()]);
-                write(&self.path_member(wanted).join("Cargo.toml"), member_manifest(manifest, dir, &path, &features, alloc)?)?;
+                let staged = self.staged_dir(dir);
+                // The member's `../shim`, as in the build's workspace: beside the staged
+                // folder, so the staged manifest's `path = "../shim"` resolves.
+                let shim = staged.parent().map(|parent| parent.join("shim")).unwrap_or_else(|| self.work.join("path/shim"));
+                write(&shim.join("Cargo.toml"), SHIM_MANIFEST)?;
+                write(&shim.join("shim.rs"), &self.shim_text)?;
+                let member = member_manifest(manifest, dir, &path, &features, alloc)?;
+                let member = self.stage_path_deps(&staged, &member, dir, 0)?;
+                write(&staged.join("Cargo.toml"), &member)?;
             }
         }
         let mut manifest = manifest_with(&[]);

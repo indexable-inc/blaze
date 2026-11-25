@@ -25,15 +25,15 @@
   "sysroots": {
     "aarch64-apple-darwin": "macos-sdk",
     "aarch64-unknown-linux-gnu": null,
-    "x86_64-unknown-linux-gnu": "9111b9f18ba1e036f109f15523d428b62e6f225079d5a7c2675a561b10e57e5e"
+    "x86_64-unknown-linux-gnu": "58efb75c49924ce29a4235af6c0f4d93ab1a5398626093d0b9645c147af2490c"
   },
   "sysroot_blobs_comment": "D69: where a pinned sysroot's bytes come from. The blob is a deterministic tar (sorted, mtime 0, owner 0) of the sysroot folder; its SHA-256 is the sysroots row above and the folder's name on the shelf (<home>/.blaze/v2/toolchain/sysroot/<sha256>). `source` names the inputs (pinned Ubuntu noble .debs, their own SHA-256s in the run's evidence); the assembled blob is fetched by an explicit path or URL, never searched for.",
   "sysroot_blobs": {
     "x86_64-unknown-linux-gnu": {
       "name": "glibc-sysroot-x86_64-unknown-linux-gnu.tar",
-      "size": 35758080,
-      "sha256": "9111b9f18ba1e036f109f15523d428b62e6f225079d5a7c2675a561b10e57e5e",
-      "source": "Ubuntu 24.04 (noble) .debs: libc6 2.39-0ubuntu8.12, libc6-dev 2.39-0ubuntu8.12, linux-libc-dev 6.8.0-151.151, libgcc-13-dev 13.3.0-6ubuntu2~24.04.1, libgcc-s1 14.2.0-4ubuntu2~24.04.1"
+      "size": 166809600,
+      "sha256": "58efb75c49924ce29a4235af6c0f4d93ab1a5398626093d0b9645c147af2490c",
+      "source": "Ubuntu 24.04 (noble) .debs: libc6 2.39-0ubuntu8.12, libc6-dev 2.39-0ubuntu8.12, linux-libc-dev 6.8.0-151.151, libgcc-13-dev 13.3.0-6ubuntu2~24.04.1, libgcc-s1 14.2.0-4ubuntu2~24.04.1, libssl-dev 3.0.13-0ubuntu3.16, libssl3t64 3.0.13-0ubuntu3.16; ONNX Runtime 1.31.0 libonnxruntime.a (pyke ms@1.31.0 x86_64-unknown-linux-gnu.tar.lzma2, sha256 02aac0d3b4927026292088986d7a377c657c88761b1c068be217a67b35447678, ort-sys 2.0.0-rc.14 dist.tsv's own pin)"
     }
   },
   "shelf_programs_comment": "shelf-pins: each program placed on a host's shelf, pinned one by one beside the archive's digest: per program row, `member` is its path in the archive and `sha256` the member's own SHA-256; its place on the shelf is the member without the archive's top folder (one of blaze_build_script::toolchain::SHELF_MEMBERS). The step that places a program checks the extracted member against its row and refuses it by name when no row pins it or the digest differs (blaze_build_script::shelf_pins::place_member). A host tool's `shelf` names one of these rows. `names` is sorted and each row's last field.",

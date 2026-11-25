@@ -29,7 +29,12 @@ pub const TOOLCHAIN_CLASS: [&str; 5] = ["bindgen", "cc", "clang-sys", "cmake", "
 /// build as wasm at clang-sys (`cannot find Library in libloading`), though turso_sdk_kit's
 /// build.rs never calls bindgen on macOS: the class is what the closure compiles, not what the
 /// script does. Sorted.
-pub const NO_WASM_CLASS: [&str; 3] = ["bindgen", "clang-sys", "libloading"];
+/// ring's build script compiles C at module-build time (cc-rs needs a C compiler, which the
+/// wasm-module build's sandbox has no `clang` for), and openssl-sys's build script probes
+/// for an installed OpenSSL, which wasi has none of: like `libloading`, a build script whose
+/// closure holds one has no `wasm32-wasip1` module anywhere (proven by the omt green run's
+/// module builds failing on them; D69 Linux native path runs them). Sorted.
+pub const NO_WASM_CLASS: [&str; 5] = ["bindgen", "clang-sys", "libloading", "openssl-sys", "ring"];
 
 /// What a script's dependency closure says of where it can run ([`closure`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
