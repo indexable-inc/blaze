@@ -367,7 +367,7 @@ fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::Shared
     // span_exit frames). When `BLAZE_LAUNCH_TELEMETRY` is set, `ObservedBind` layers zero-touch
     // alloc/IO/mutex telemetry on top; otherwise plain `LauncherOwn<Dlsym>` pays zero overhead.
     let ordinary = |socket, handed| {
-        let end = if unwound_sink.is_some() { End::Return } else { End::Exit };
+        let end = if unwound_sink.is_some() { End::ExitOrReturnUnwound } else { End::Exit };
         let ran = if telemetry_on {
             run_mode::run(
                 socket,
@@ -392,11 +392,7 @@ fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::Shared
             )
         };
         match ran {
-            Ok(status) if unwound_sink.is_some() => {
-                // SAFETY: ends the process as a return from the entry does, flushing stdio streams.
-                unsafe { libc::exit(status) }
-            }
-            Ok(status) => stop(STOPPED, &format!("the run returned status {status} where it ends the process (End::Exit)")),
+            Ok(status) => stop(STOPPED, &format!("the run returned status {status} where it ends the process")),
             Err(run_mode::RunModeError::Unwound) => {
                 if let Some(sink) = unwound_sink.as_ref() {
                     match sink {
@@ -411,9 +407,12 @@ fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::Shared
                             let _ = unsafe { libc::write(fd.as_raw_fd(), frame.as_ptr().cast(), frame.len()) };
                         }
                     }
-                    // SAFETY: ends the process with Rust's standard panic exit code (101) after
-                    // recording the unwind marker for `blaze test`.
-                    unsafe { libc::exit(101) }
+                    // SAFETY: flush stdio buffers and exit directly with `_exit(101)` so dyld TLS
+                    // destructors cannot attempt JIT stub resolution after the control thread stopped.
+                    unsafe {
+                        libc::fflush(core::ptr::null_mut());
+                        libc::_exit(101);
+                    }
                 }
                 stop(STOPPED, "an uncaught panic unwound out of the program's entry")
             }
