@@ -3274,8 +3274,11 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     // The function.
 
     fn run(&mut self, sig: &FnSig<'_>, kind: Kind) -> Result<(), BuildError> {
+        let owner = self.body.owner;
+        let c_variadic = kind == Kind::Body && self.adts.c_variadic(owner).is_some();
         // A method's `self` is its first input and its body's first parameter, like any other.
-        if sig.inputs.len() != self.body.params.len() {
+        // A C-variadic fn definition carries one extra body parameter (`mut rest: ...` -> `VaList`).
+        if sig.inputs.len() + usize::from(c_variadic) != self.body.params.len() {
             return Err(malformed("a signature and a body with other numbers of parameters"));
         }
         let sig_err = |error: TyErr| match error {
@@ -3284,7 +3287,6 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             TyErr::Other(error) => error,
         };
         // Drop glue is of the Rust ABI; a body is of its fn's.
-        let owner = self.body.owner;
         let abi = match kind {
             Kind::DropGlue => Abi::Rust,
             Kind::Body => self.adts.abi(owner).ok_or(BuildError::NoAbi { item: owner })?,
@@ -3325,7 +3327,8 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             ptr_facts.push(0);
         }
         let (params, rets) = self.sig_of_with_ptr_facts(&passes, &ptr_facts, self.ret_pass);
-        let own = self.b.sig(Conv::C, Variadic::No, &params, &rets);
+        let variadic = if c_variadic { Variadic::Yes } else { Variadic::No };
+        let own = self.b.sig(Conv::C, variadic, &params, &rets);
         self.b.set_signature(own);
         self.mark_nounwind(owner, abi, kind == Kind::Body)?;
         let entry = self.create();
@@ -3435,6 +3438,38 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     let g = self.ground_in(sig.types, sig.inputs[i]).map_err(sig_err)?;
                     self.bind_param(p, v, g)?
                 }
+            }
+        }
+        if c_variadic {
+            let &p = self.body.params.get(sig.inputs.len()).ok_or(malformed("a C-variadic function missing its trailing `...` parameter"))?;
+            let pt = *self.checked.pat_ty.get(p.ix()).ok_or(malformed("a C-variadic parameter missing its type"))?;
+            let g = self.ground_ty(pt).map_err(sig_err)?;
+            let repr = self.repr(g).map_err(sig_err)?;
+            let va_id = self.ls_of(g).map_err(sig_err)?;
+            let l = *self.ls.get(va_id);
+            if l.size != 8 || l.scalar.map(|s| s.prim) != Some(crate::layout::Prim::Ptr) {
+                return Err(BuildError::UnsupportedSig {
+                    what: "a C-variadic definition on a target whose `VaList` is not a single pointer (Linux AAPCS64 register save area)",
+                });
+            }
+            let va_sig = self.b.sig(Conv::C, Variadic::No, &[], &[blaze_lir::builder::Param::of(Ty::PTR)]);
+            let va_intr = self.b.intrinsic("blaze.va_start", va_sig);
+            let va_ptr = self.b.target_intrinsic(va_intr, &[]);
+            let v = match repr {
+                Repr::Ptr => V::Scalar(va_ptr),
+                Repr::Agg(_) => {
+                    let at = self.temp(repr);
+                    self.b.store(Flags::NONE, va_ptr, at.0, at.1, MemAttrs::aligned(3));
+                    V::Place(at.0, at.1)
+                }
+                _ => return Err(malformed("a pointer-sized `VaList` with a non-pointer representation")),
+            };
+            match v {
+                V::Place(at, off) if matches!(self.pat(p)?, Pat::Bind { .. }) => {
+                    self.bind_at(p, (at, off))?;
+                    self.own_pat(p)?;
+                }
+                v => self.bind_param(p, v, g)?,
             }
         }
         self.walk_root()
@@ -5502,6 +5537,16 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             }
             let at = self.adjusted_ty(a)?;
             let g = self.ground_ty(at).map_err(|error| Self::ty_err(a, error))?;
+            if which == Which::VaArg && i == 0 {
+                let PNode::Ref(_, va_ty) = self.ground_node(g).map_err(|error| Self::ty_err(a, error))? else {
+                    return Err(BuildError::Intrinsic { expr: e, which, why: "`va_arg` whose argument is not `&mut VaList`", unsupported: false });
+                };
+                let va_id = self.ls_of(va_ty).map_err(|error| Self::ty_err(a, error))?;
+                let va_l = *self.ls.get(va_id);
+                if va_l.size != 8 || va_l.scalar.map(|s| s.prim) != Some(crate::layout::Prim::Ptr) {
+                    return Err(BuildError::Intrinsic { expr: e, which, why: "a non-pointer `VaList` layout (Linux AAPCS64 register save area)", unsupported: true });
+                }
+            }
             let repr = self.repr_at(a, at)?;
             // `simd_shuffle`'s indices ("`U` must be a **const** vector of `u32`s", stdarch's
             // `const { SimdShuffleIdx(..) }`): the address of the constant's own data row, which
@@ -6823,9 +6868,15 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                         list.extend(written.iter().enumerate().filter(|&(k, _)| !listed.contains(&(k as u32))).map(|(_, &a)| a));
                         Instance { item, args }
                     }
-                    PNode::FnPtr(_, header) => {
+                    PNode::FnPtr(sig_list, header) => {
                         list.extend_from_slice(written);
-                        return self.call_pointer(e, &list, header.abi);
+                        let declared = if header.c_variadic {
+                            let len = self.types.list(sig_list).map_err(|_| malformed("a fn pointer past the record's types"))?.len();
+                            Some(len.saturating_sub(1))
+                        } else {
+                            None
+                        };
+                        return self.call_pointer(e, &list, header.abi, declared);
                     }
                     // A closure called directly (closure.rs `push_closure_call`).
                     PNode::Closure { .. } if !self.through_fn_trait(e) => return self.closure_call(e, callee, written),
@@ -7074,17 +7125,22 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     /// Call `e` through a fn pointer of ABI `abi`: the pointer under the arguments `list` on
     /// the stack; the signature lowered from the arguments' and the result's types, by the
     /// pointer's ABI (lib.rs, "Fn pointers").
-    fn call_pointer(&mut self, e: ExprId, list: &[ExprId], abi: blaze_typeck::Abi) -> Result<(), BuildError> {
-        let abi = pointer_abi(abi).ok_or_else(|| unsupported(e, "a fn pointer outside the Rust, rust-call and C-family calling conventions"))?;
+    fn call_pointer(&mut self, e: ExprId, list: &[ExprId], raw_abi: blaze_typeck::Abi, declared: Option<usize>) -> Result<(), BuildError> {
+        let abi = pointer_abi(raw_abi).ok_or_else(|| unsupported(e, "a fn pointer outside the Rust, rust-call and C-family calling conventions"))?;
+        let nounwind = matches!(raw_abi, blaze_typeck::Abi::C | blaze_typeck::Abi::System);
+        if declared.is_some() {
+            Self::c_variadic_abi(e, abi, Some(nounwind))?;
+        }
         let n = list.len();
         let mut reprs = Vec::with_capacity_in(n, self.alloc);
         let mut passes = Vec::with_capacity_in(n, self.alloc);
-        for &a in list.iter() {
+        for (i, &a) in list.iter().enumerate() {
             let t = self.adjusted_ty(a)?;
             let g = self.ground_ty(t).map_err(|error| Self::ty_err(a, error))?;
             let repr = self.repr_at(a, t)?;
             reprs.push(repr);
-            passes.push(self.pass(g, repr, abi, None)?);
+            let pass = if declared.is_some_and(|d| i >= d) { Self::vararg_pass(a, repr)? } else { self.pass(g, repr, abi, None)? };
+            passes.push(pass);
         }
         if abi == Abi::RustCall {
             self.spread_tuple(&mut reprs, &mut passes)?;
@@ -7097,7 +7153,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         let at = self.vals.len().checked_sub(reprs.len() + 1).ok_or(malformed("a call's pointer missing from the value stack (a build bug)"))?;
         let p = self.remove_val(at);
         let p = self.scalar(p, Ty::PTR)?;
-        self.emit_call(Callee::Pointer(p), &reprs, &passes, rrepr, rpass)?;
+        self.emit_call_from(Callee::Pointer(p), &reprs, &passes, declared, nounwind, rrepr, rpass)?;
         if let PNode::Never = self.node_at(e, ty)? {
             self.pop_val();
             self.unreachable_of(TrapKind::AfterDivergingCall, Some(e));

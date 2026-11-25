@@ -159,6 +159,10 @@ struct Pass<'a, 'c, A: Allocator> {
     block: Block,
     /// The short fields still to be placed in reach, and the islands' rows (pass/reach.rs).
     far: reach::Far<'c>,
+    /// For a C-variadic fn definition on Apple arm64 (`Os::Mac`), the offset from `fp` to the
+    /// first stacked variadic argument (`16 + nsaa.end().next_multiple_of(8)`), read by
+    /// `blaze.va_start` (pass/target.rs). `None` for non-variadic functions.
+    va_start_offset: Option<u32>,
 }
 
 /// Runs the pass (see [`crate::emit`]).
@@ -180,7 +184,8 @@ pub(crate) fn run<A: Allocator>(
     }
     let sig = view.sigs.get(view.head.sig as usize).map(|_| view.sig(SigId(view.head.sig)));
     let Some(sig) = sig else { return Err(EmitError::Signature { why: "no signature row" }) };
-    if view.sigs[view.head.sig as usize].bits & SigRec::VARIADIC != 0 {
+    let is_variadic = view.sigs[view.head.sig as usize].bits & SigRec::VARIADIC != 0;
+    if is_variadic && isa.os != crate::Os::MacOs {
         return Err(EmitError::Signature { why: variadic::VARIADIC_DEFINITION });
     }
     check_sig(view, isa, view.sigs[view.head.sig as usize], sig.params, sig.rets)
@@ -235,6 +240,7 @@ pub(crate) fn run<A: Allocator>(
         sole_switch_default,
         block: Block(0),
         far: reach::Far::new(reach, view, scratch),
+        va_start_offset: None,
     };
 
     // The prologue; the frame's size is patched in at the end, when the staging is known.
@@ -287,6 +293,9 @@ pub(crate) fn run<A: Allocator>(
             }
             false => pass.st(reg, inst),
         }
+    }
+    if is_variadic {
+        pass.va_start_offset = Some(16 + nsaa.end().next_multiple_of(8));
     }
 
     pass.unwind_begin()?;

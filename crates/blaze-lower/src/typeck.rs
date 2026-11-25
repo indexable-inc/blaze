@@ -167,6 +167,23 @@ pub trait Types {
         let _ = (view, path, position, arg, tys);
         Ok(None)
     }
+
+    /// Records explicitly written non-elided lifetimes (`'static` or a named enclosing lifetime)
+    /// of a closure parameter type `t` after expanding any type aliases (`Text<'a>` ->
+    /// `String<Alloc<'a>>`), in structural `(path, own)` order matching `lay_written_param`.
+    /// Returns `true` when handled; `false` falls back to syntactic `record_closure_param_regions`.
+    fn closure_param_regions(
+        &mut self,
+        view: &View<'_>,
+        t: TypeId,
+        tys: &mut PortableTys<'_>,
+        closure: tc::ExprId,
+        param: u32,
+        out: &mut dyn FnMut(tc::ClosureParamRegion),
+    ) -> bool {
+        let _ = (view, t, tys, closure, param, out);
+        false
+    }
 }
 
 impl ConstGapWhy {
@@ -1423,10 +1440,18 @@ impl Conv<'_, '_, '_, '_, '_> {
                 for (pi, &n) in self.v.rows(c.params)?.iter().enumerate() {
                     let p = Param::decode(n)?;
                     let Some(pat) = p.pat else { return self.refuse("a closure parameter with no pattern", r) };
-                    if let Some(tid) = p.ty {
-                        self.record_closure_param_regions(e, len(pi), tid)?;
-                    }
                     let ty = self.opt_ty(p.ty)?;
+                    if let Some(tid) = p.ty {
+                        let p_idx = len(pi);
+                        let before = self.out.closure_param_regions.len();
+                        let handled = self.types.closure_param_regions(self.v, tid, self.tys, e, p_idx, &mut |r| {
+                            self.out.closure_param_regions.push(r);
+                        });
+                        if !handled {
+                            self.out.closure_param_regions.truncate(before);
+                            self.record_closure_param_regions(e, p_idx, tid)?;
+                        }
+                    }
                     self.out.pat_lists.push(pat);
                     self.out.opt_types.push(ty);
                 }

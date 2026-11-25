@@ -950,12 +950,17 @@ fn read_fn<'n, S: NamesSource<'n>>(r: &mut Reader<'_, 'n, S>,v: &View<'_>, input
     let mut ends: List<u32> = Vec::new_in(alloc);
     let list = v.list(head::PARAMS);
     let rows = v.rows(list)?;
-    if rows.len() != inputs.len() {
-        return Err(LifeRefusal::ParamCount { text: rows.len() as u32, head: inputs.len() as u32 });
+    // Skip the trailing `...` parameter of a C-variadic fn: `inputs` holds only the fixed ones.
+    let fixed_len = match rows.last().and_then(|&row| lf::Param::decode(row).ok()) {
+        Some(p) if p.variadic => rows.len() - 1,
+        _ => rows.len(),
+    };
+    if fixed_len != inputs.len() {
+        return Err(LifeRefusal::ParamCount { text: fixed_len as u32, head: inputs.len() as u32 });
     }
     // The receiver's reference, when it is `&self`, `&mut self`, `self: &Self` or `self: &mut Self`.
     let mut receiver: Option<Region> = None;
-    for (j, &row) in rows.iter().enumerate() {
+    for (j, &row) in rows.iter().take(fixed_len).enumerate() {
         let prm = lf::Param::decode(row)?;
         let ty = inputs[j];
         let at = v.site(v.row_range(list.start + j as u32)?)?;

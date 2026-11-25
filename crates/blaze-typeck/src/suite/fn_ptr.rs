@@ -202,3 +202,32 @@ fn a_closure_that_captures_nothing_is_a_fn_pointer() {
     let (d, _) = closure_to(C, false);
     assert_eq!(d, std::vec![DiagCode::Mismatch]);
 }
+
+/// Calling an `unsafe extern "C" fn(i32, ...) -> i32` fn pointer accepts promoted extra
+/// arguments (`i32`) and reports `DiagCode::VariadicArg` (E0617) on unpromoted ones (`u8`).
+#[test]
+fn a_c_variadic_fn_pointer_call_checks_default_promotions() {
+    let mut fx = Fx::new();
+    let i32_ = fx.ty(PNode::Int(crate::ids::IntTy::I32));
+    let u8_ = fx.ty(PNode::Uint(UintTy::U8));
+    let list = fx.list(&[i32_, i32_]);
+    let var_fn = fx.ty(PNode::FnPtr(list, FnPtrHeader { abi: Abi::C, safety: Safety::Unsafe, c_variadic: true }));
+    let main = fx.func("main", 0, &[var_fn, i32_, u8_], i32_, Default::default());
+    fx.finish();
+
+    let run = |bad: bool| {
+        let mut b = Bb::new();
+        let pf = b.param("f");
+        let px = b.param("x");
+        let py = b.param("y");
+        let lf = b.local(pf);
+        let lx = b.local(px);
+        let extra = if bad { b.local(py) } else { b.local(px) };
+        let call = b.call(lf, &[lx, extra]);
+        let root = b.block(&[], Some(call));
+        let c = check_body(&fx, &b, main, root, Plant::None, InferPlant::None);
+        (c.diags.len(), c.diags.first().map(|d| d.code))
+    };
+    assert_eq!(run(false), (0, None));
+    assert_eq!(run(true), (1, Some(DiagCode::VariadicArg)));
+}

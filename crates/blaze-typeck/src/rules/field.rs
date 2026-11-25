@@ -233,7 +233,9 @@ impl<'b, 'w, 'c, W: World, C: TypeCtx> Machine<'b, 'w, 'c, '_, W, C> {
                         if self.ty.may_hold(Goal::Trait { trait_: tr, args }, &mut self.reads)? {
                             self.adjust_autoderef(base, &steps, i);
                             self.register_trait(tr, args, Cause::Expr(e))?;
-                            let out = self.project(tr, args, Name::of("Output"), Cause::Expr(e))?;
+                            let out_name = Name::of("Output");
+                            let out = self.project(tr, args, out_name, Cause::Expr(e))?;
+                            self.projected.push((e, tr, Some(out_name), args));
                             return Ok(Flow::Done(out));
                         }
                     }
