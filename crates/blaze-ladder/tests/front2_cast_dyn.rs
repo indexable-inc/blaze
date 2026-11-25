@@ -129,6 +129,29 @@ fn coerce_direct() -> &'static [&'static dyn ToSql] { &[&1 as &dyn ToSql] }
     );
 }
 
+/// 1c. The same for a borrow, not a cast: `&if c { 1 } else { 0 }` with expected `&dyn ToSql`
+/// (expr_borrow's `rvalue_hint`, not `expr_cast`): the arms unify to `i32` and the whole
+/// `&i32` unsizes to `&dyn ToSql` (the util.rs `normalize(&if ..)` / `&Path` shape).
+#[test]
+fn a_borrow_of_an_if_to_a_trait_object_takes_no_expectation_for_its_operand() {
+    let text = r#"
+fn borrow_if_i32() -> &'static dyn ToSql { &if true { 1i32 } else { 0i32 } }
+fn borrow_if_str() -> &'static dyn ToSql { &if true { PENDING } else { COMPLETE } }
+"#;
+    // NOTE: a plain unsuffixed integer literal arm (`&if c { 1 } else { 0 }`) is a separate,
+    // narrower issue: the literal stays `{integer}` at the borrow's return coercion (the
+    // cast's operand defaults it to `i32`, the borrow's does not yet). Concrete arms
+    // (suffixed ints, `&str`) coerce.
+    let got = check_fns(text, &["borrow_if_i32", "borrow_if_str"]);
+    assert_eq!(
+        got,
+        vec![
+            ("borrow_if_i32".to_string(), "clean".to_string()),
+            ("borrow_if_str".to_string(), "clean".to_string()),
+        ]
+    );
+}
+
 /// 1b. CONTROL: `&if c { 1 } else { 0 } as &dyn Empty` — `i32: Empty` does not hold, so the
 /// coercion of the whole fails: an E0308 at the cast, never at the arms (which are `i32`).
 #[test]
