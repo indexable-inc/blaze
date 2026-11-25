@@ -373,16 +373,16 @@ pub fn answer_now(package: &Package, subject: &str) -> Result<Option<ContentId>,
             EnvAnswer::Unset => None,
             EnvAnswer::Unknown => return Err(unknown()),
         },
-        "file" => files.bytes(rest).ok().flatten().map(|bytes| digest(&bytes)),
-        "dir" => match files.find(rest) {
-            Ok(Some(Found::Folder)) => files.listing(rest).ok().map(|entries| listing_digest(&entries)),
+        "file" => files.bytes(rest).map_err(UnknownSubject)?.map(|bytes| digest(&bytes)),
+        "dir" => match files.find(rest).map_err(UnknownSubject)? {
+            Some(Found::Folder) => Some(listing_digest(&files.listing(rest).map_err(UnknownSubject)?)),
             _ => None,
         },
         "stat" if rest.is_empty() => Some(stat_digest(Filetype::Directory, 0)),
-        "stat" => match files.find(rest) {
-            Ok(Some(Found::Folder)) => Some(stat_digest(Filetype::Directory, 0)),
-            Ok(Some(Found::File(size))) => Some(stat_digest(Filetype::RegularFile, size)),
-            _ => None,
+        "stat" => match files.find(rest).map_err(UnknownSubject)? {
+            Some(Found::Folder) => Some(stat_digest(Filetype::Directory, 0)),
+            Some(Found::File(size)) => Some(stat_digest(Filetype::RegularFile, size)),
+            None => None,
         },
         _ => return Err(unknown()),
     })
@@ -703,6 +703,10 @@ mod seen_tests {
             assert!(with_sub.bytes(bad).is_err(), "{bad} bytes must fail closed");
             assert!(with_sub.listing(bad).is_err(), "{bad} listing must fail closed");
         }
+        let sub_pkg = Package::new(with_sub, PackageEnv::default()).unwrap_or_else(|e| panic!("{e}"));
+        assert!(super::answer_now(&sub_pkg, "file:v8/include/v8.h").is_err(), "answer_now file must propagate submodule refusal");
+        assert!(super::answer_now(&sub_pkg, "dir:v8").is_err(), "answer_now dir must propagate submodule refusal");
+        assert!(super::answer_now(&sub_pkg, "stat:v8").is_err(), "answer_now stat must propagate submodule refusal");
     }
 
     /// MX (2026-11-17): every proc-macro call written in a workspace member at a non-empty dir
