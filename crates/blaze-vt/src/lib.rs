@@ -20,6 +20,7 @@
 //! | [`dcs`] | the DCS handler: DECRQSS, XTGETTCAP, tmux control mode ([`dcs::tmux`]), capped buffer | built |
 //! | [`terminfo`] | the terminfo entry XTGETTCAP answers from (ghostty's 268 capabilities, `TN`, `Co`, `RGB`) | built |
 //! | [`reply`] | every reply's exact bytes and terminator, as encoders over plain state | built |
+//! | [`kitty`] | APC: kitty graphics (parse, transmit, store, place, delete, reply, virtual placements) and the glyph protocol | built |
 //! | [`input`] | key (legacy, modifyOtherKeys 2, kitty flags 1–16), mouse (9/1000/1002/1003; X10, 1005, 1006, 1015, 1016), paste (2004, unsafe bytes) and focus (1004) encoding into the caller's buffer | built |
 
 #![no_std]
@@ -34,6 +35,7 @@ extern crate std;
 pub mod color;
 pub mod dcs;
 pub mod input;
+pub mod kitty;
 pub mod osc;
 pub mod page;
 pub mod parser;

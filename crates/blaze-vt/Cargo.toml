@@ -18,6 +18,10 @@ doctest = false
 blaze-own.workspace = true
 # Display width and grapheme clusters of what is printed.
 blaze-unicode.workspace = true
+# Kitty graphics `o=z` payloads (zlib).
+blaze-deflate.workspace = true
+# The glyph protocol's strict base64 payload; kitty test payloads.
+blaze-base64.workspace = true
 
 [dev-dependencies]
 # Property tests against the reference model, and planted-bug controls.
