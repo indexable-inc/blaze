@@ -131,8 +131,6 @@ impl fmt::Display for Refused {
 pub(crate) enum JournalUse {
     /// Every unit replayed from its saved place.
     Used,
-    /// The resident daemon's synchronous `kqueue` vnode watcher vouched for the checkout.
-    Kqueue,
     /// At least one unit's rows were all statted: the first one's why.
     Refused(Refused),
     /// The system keeps no journal across a restart: every row is statted.
@@ -143,7 +141,6 @@ impl fmt::Display for JournalUse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             JournalUse::Used => f.write_str("used"),
-            JournalUse::Kqueue => f.write_str("kqueue"),
             JournalUse::Refused(why) => write!(f, "refused: {why}"),
             JournalUse::NoneOnThisOs => f.write_str("none on this OS"),
         }
@@ -374,7 +371,6 @@ impl fmt::Display for SweepCounts {
             (JournalUse::NoneOnThisOs, _) => f.write_str(
                 "full: none on this OS: the system keeps no journal of changes across a restart, so every row is statted until a helper with an expiry carries an inotify set",
             )?,
-            (JournalUse::Kqueue, _) => write!(f, "by kqueue vnode; {} event(s) in {} folder(s)", self.events, self.streams)?,
             (JournalUse::Used, Some(id)) => write!(f, "by events since id {id}; {} event(s) in {} folder(s)", self.events, self.streams)?,
             (JournalUse::Used, None) => f.write_str("full: the checkout's journal was not replayed")?,
             (JournalUse::Refused(why), Some(id)) => write!(f, "by events since id {id}; {} event(s) in {} folder(s); a folder full, refused: {why}", self.events, self.streams)?,
@@ -480,12 +476,9 @@ pub(crate) struct Taken<'f> {
     helper_place: Option<[u8; HELPER_PLACE]>,
     /// What the helper said, for the `sweep:` line.
     helper: Option<HelperRow>,
-    /// True when the resident daemon's `kqueue` watcher saw a `.git` change or has unwatched
-    /// script/git leaves, forcing `ServedReach::told = true` even when checkout `dirty_paths` is empty.
+    /// True for a linked git worktree where `.git` is a file outside the checkout watch root,
+    /// forcing `ServedReach::told = true` even when checkout changes are empty.
     force_script_asks: bool,
-    /// True when the resident daemon's `kqueue` watcher verified and watched all `FACT_MOUNT`
-    /// inputs with 0 events since arming.
-    facts_vouched: bool,
 }
 
 /// Bytes of a helper's place kept beside the checkout unit's (blaze-watch since.rs
@@ -828,65 +821,12 @@ impl<'t> Taken<'t> {
             helper_place: None,
             helper: None,
             force_script_asks: git_worktree,
-            facts_vouched: false,
         })
-    }
-
-    /// Whether the resident daemon's `kqueue` watcher proved all `FACT_MOUNT` inputs unchanged.
-    pub(crate) fn facts_vouched(&self) -> bool {
-        self.facts_vouched
     }
 
     /// The checkout's own folder replayed from its place in `stored` ([`take`]'s one unit).
     pub(crate) fn replay_checkout(&mut self, cx: &Cx, clock: &Clock, root: &Dir<ReadWrite>, stored: Stored<'_>) {
         self.replay(cx, clock, root, Where::Checkout, "", stored);
-    }
-
-    /// The checkout's own folder answered by the resident daemon's synchronous `kqueue` vnode
-    /// watcher: `dirty_paths` is the exact proven dirty set (possibly empty), and `crash_cursor`
-    /// is the passive in-process FSEvents cursor (`<=` edit time) persisted for `SIGKILL` recovery
-    /// (rule 70). Because `kqueue` proves the dirty set directly from the kernel without relying on
-    /// FSEvents ordering, `judge` is not invoked to reject on FSEvents lag.
-    pub(crate) fn vouched_kqueue(
-        &mut self,
-        dirty_paths: &'t [&'t str],
-        crash_cursor: Option<Cursor>,
-        force_script_asks: bool,
-        facts_vouched: bool,
-    ) {
-        let name_at = self.names.push("");
-        let target_tagged = self.target_tagged;
-        let told = dirty_paths.iter().filter(|it| !own(it, target_tagged)).count();
-        self.journal = JournalUse::Kqueue;
-        self.events = self.events.saturating_add(u64::try_from(told).unwrap_or(u64::MAX));
-        self.streams = self.streams.saturating_add(1);
-        self.force_script_asks |= force_script_asks;
-        self.facts_vouched = facts_vouched;
-        let heard = Heard { replayed: None, asked: dirty_paths };
-        self.units.push(Unit { at: Where::Checkout, name: name_at, cursor: crash_cursor, since: None, heard: Some(heard) });
-    }
-
-    /// The resident daemon's watcher requested a full sweep (unarmed watcher or root change),
-    /// while still persisting `crash_cursor` when available.
-    pub(crate) fn full_rescan_daemon(&mut self, crash_cursor: Option<Cursor>) {
-        let name_at = self.names.push("");
-        self.refuse(Refused::NoCursor);
-        self.units.push(Unit { at: Where::Checkout, name: name_at, cursor: crash_cursor, since: None, heard: None });
-    }
-
-    /// The resident daemon's `FsEventsHeld` fallback backend: an in-process `HeldChanges::flush`
-    /// result judged by the same [`judge`] rule as [`Taken::replay_checkout`], and accepted only
-    /// when `valid_since` proves this stream's previous flush matches the stored cursor (never
-    /// missing edits made before the daemon started or drained by `take()`).
-    pub(crate) fn in_process_fsevents(&mut self, stored: Stored<'_>, valid_since: Option<Cursor>, changes: Changes, cursor: Cursor) {
-        let name_at = self.names.push("");
-        let since = stored.cursor_of(Where::Checkout, "");
-        let whole = if since.is_some() && valid_since != since {
-            Some(Lost::Reset)
-        } else {
-            changes.lost().find(|(under, _)| under.is_empty()).map(|(_, why)| why)
-        };
-        self.heard(Where::Checkout, "", name_at, since, cursor, whole, Heard::replayed(changes));
     }
 
     /// The checkout's own folder answered by the journal helper (journal_ask.rs `Asked`): it
@@ -1086,12 +1026,7 @@ impl<'t> Taken<'t> {
         for (i, mark) in marks.iter_mut().enumerate() {
             let row = last.row(i);
             let path = last.path(i);
-            // The fact mount's files are the runner's, absolute, in no unit: as `marks` has them,
-            // unless the resident daemon's vnode watcher vouched all FACT_MOUNT inputs unchanged.
             let fact_file = row.kind == LeafKind::ScriptFile && path.starts_with(sweep::FACT_MOUNT);
-            if fact_file && self.facts_vouched {
-                *mark = false;
-            }
             let script_asks = script_row_uses_asks(row.kind, row.flags, path, self.target_tagged);
             if script_asks {
                 *mark = reach.asks();

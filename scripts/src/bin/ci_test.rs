@@ -1,6 +1,6 @@
 //! ci_test: builds and runs the workspace's cargo test binaries in parallel with bounded per-binary
 //! timeouts, keeping TMPDIR on `$HOME`'s filesystem (so shelf hard-links avoid EXDEV copies) and
-//! disabling orphan daemons in non-daemon tests (`BLAZE_NO_DAEMON=1`). Replaces inline `jq` and
+//! Runs the test suite via cargo-nextest. Replaces inline `jq` and
 //! `xargs` shell pipelines in `.github/workflows/blaze.yaml`.
 //!
 //!     "$BLAZE_SCRIPTS/ci_test" '{"exclude": ["blaze-std"]}'
@@ -189,7 +189,7 @@ fn main_with(args: &Args) {
     };
     base_env.insert(lib_var.to_owned(), combined_lib);
     base_env.insert("TMPDIR".to_owned(), tmp.0.to_string_lossy().into_owned());
-    base_env.insert("BLAZE_NO_DAEMON".to_owned(), "1".to_owned());
+    // No resident daemon env override needed.
     base_env.insert("RUST_TEST_THREADS".to_owned(), args.threads.to_string());
 
     let jobs = if args.jobs > 0 {

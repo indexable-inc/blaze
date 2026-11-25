@@ -38,7 +38,6 @@ fn a_bad_discriminant_is_said_by_its_value_and_the_enum() {
         .current_dir(&dir)
         .env("HOME", &home)
         .env("CARGO_HOME", home.join(".cargo"))
-        .env("BLAZE_NO_DAEMON", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

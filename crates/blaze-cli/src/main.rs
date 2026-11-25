@@ -95,10 +95,7 @@ mod journal_checkpoint;
 // The checkout's journal helper: a command's ask (journal_ask.rs) and the helper (journal_helper.rs).
 mod journal_ask;
 mod journal_helper;
-// Wave 7 resident per-checkout daemon: synchronous kernel vnode watcher, server, and pre-runtime client.
-mod daemon_client;
-mod daemon_server;
-mod daemon_watch;
+// Resident daemon removed; cold-process commands use the lightweight `journal-helper`.
 mod graph;
 mod graph_payload;
 mod test_args;
@@ -568,15 +565,9 @@ fn choice(word: &str) -> Result<Choice, CliError> {
 static HEAP: blaze_mem::counted::Counted = blaze_mem::counted::Counted;
 
 fn main() -> bstd::entry::Exit {
-    // Wave 7: try the resident per-checkout daemon BEFORE initializing `bstd::rt` so warm
-    // `blaze check` commands skip the runtime, worker pool, and driver startup/teardown tax.
-    let spawn_daemon = match daemon_client::try_run() {
-        daemon_client::ClientOutcome::Exit(status) => return bstd::entry::Exit(status),
-        daemon_client::ClientOutcome::Fallthrough { spawn_daemon } => spawn_daemon,
-    };
     // The process's heap is a grant bstd's entry hands `main` (D102, D120), never reached for
     // here or below: every allocator under the command is its handle, a frame, or an arena.
-    bstd::entry::run_with_heap_at(bstd::entry::Os::process(), telemetry_level, |cx, io, heap| run(cx, io, heap, spawn_daemon))
+    bstd::entry::run_with_heap_at(bstd::entry::Os::process(), telemetry_level, |cx, io, heap| run(cx, io, heap))
 }
 
 /// The run's telemetry level, chosen before the runtime starts (D178): `--stats` among the
@@ -591,7 +582,7 @@ fn telemetry_level(args: &bstd::args::Args) -> bstd::telemetry::Level {
 }
 
 /// The status: 0 for a check that passed; `blaze run`'s, the status its program's `main` ended with.
-fn run(cx: &Cx, io: Io, heap: bstd::mem::Heap, spawn_daemon: bool) -> Result<Status, Error> {
+fn run(cx: &Cx, io: Io, heap: bstd::mem::Heap) -> Result<Status, Error> {
     let heap = heap.root();
     let clock = io.need_clock()?;
     let mut phases = Phases::new(clock.clone());
@@ -615,7 +606,7 @@ fn run(cx: &Cx, io: Io, heap: bstd::mem::Heap, spawn_daemon: bool) -> Result<Sta
     // (A `Ran` holding `RunError::Trapped` was matched here: no constructor ever made one, as
     // `Ran` is made only from `Program`, whose every constructor is a manifest refusal; a trap
     // in the program's own process is the run loop's words, run_loop.rs `LoopError`.)
-    match command(cx, &args, &fs, env.as_ref(), net.as_ref(), &host, clock, &mut rng, &out, &err, &mut phases, heap, spawn_daemon) {
+    match command(cx, &args, &fs, env.as_ref(), net.as_ref(), &host, clock, &mut rng, &out, &err, &mut phases, heap) {
         // D86 and the ladder's L6: any failure of `run` or `test` before the program starts
         // (manifest, check, build, start, or a stub that stopped it) exits `program::NOT_RUN`,
         // never 1, which a program's `main` returning `Err` also exits with (std's
@@ -655,13 +646,12 @@ fn command(
     err: &Out,
     phases: &mut Phases,
     heap: &'static blaze_own::Heap,
-    spawn_daemon: bool,
 ) -> Result<Status, CliError> {
     match args.get(1) {
         // `check` IS the execution engine (check_command.rs over engine_check.rs): one checker
         // (rule 30). `engine-check` is its old name, an alias until the scripts that type it
         // are moved.
-        Some("check" | "engine-check") => check_command::run(cx, args, fs, env, net, host, &clock, rng, out, err, phases, heap, spawn_daemon),
+        Some("check" | "engine-check") => check_command::run(cx, args, fs, env, net, host, &clock, rng, out, err, phases, heap),
         Some("ci") => ci_command::run(cx, args, fs, env, net, host, &clock, rng, out, err, phases, heap),
         Some("inspect") => inspect_command::run(cx, args, fs, out, err, heap),
         Some("why") => engine_check::why(cx, args, fs, env, net, host, &clock, rng, out, err, phases, heap),
@@ -684,8 +674,6 @@ fn command(
         // Hidden: the checkout's journal helper, run by hand until a command starts one
         // (journal_ask.rs `HelperStart`): one stream held open, asks answered on its socket.
         Some("journal-helper") => journal_helper::run(cx, fs, &clock, host, rng, env, args, out),
-        // Hidden: resident per-checkout daemon (Wave 7, daemon_server.rs).
-        Some("daemon") => daemon_server::run(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap),
         Some("--version" | "-V" | "version") => {
             let ver = option_env!("BLAZE_RELEASE").unwrap_or(env!("CARGO_PKG_VERSION"));
             let tc = include_str!("../../../pins/toolchain").trim();
