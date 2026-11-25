@@ -8,15 +8,15 @@ publish = false
 doctest = false
 
 [dependencies]
-blaze-own = { path = "../blaze-own" }
-blaze-data = { path = "../blaze-data" }
-blaze-json = { path = "../blaze-json" }
-blaze-toml = { path = "../blaze-toml" }
-blaze-sniff = { path = "../blaze-sniff" }
+blaze-own.workspace = true
+blaze-data.workspace = true
+blaze-json.workspace = true
+blaze-toml.workspace = true
+blaze-sniff.workspace = true
 
 [dev-dependencies]
-blaze-own = { path = "../blaze-own", features = ["testing"] }
-blaze-sim = { path = "../blaze-sim" }
+blaze-own = { workspace = true, features = ["testing"] }
+blaze-sim.workspace = true
 
 [lints]
 workspace = true

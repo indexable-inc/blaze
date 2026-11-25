@@ -5,11 +5,11 @@ edition = "2024"
 publish = false
 
 [dependencies]
-blaze-own = { path = "../blaze-own" }
+blaze-own.workspace = true
 
 [dev-dependencies]
-blaze-own = { path = "../blaze-own", features = ["testing"] }
-blaze-sim = { path = "../blaze-sim" }
+blaze-own = { workspace = true, features = ["testing"] }
+blaze-sim.workspace = true
 
 [lints]
 workspace = true

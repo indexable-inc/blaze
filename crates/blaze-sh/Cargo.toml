@@ -19,7 +19,7 @@ blaze-data.workspace = true
 blaze-json.workspace = true
 blaze-toml.workspace = true
 blaze-glob.workspace = true
-blaze-sniff = { path = "../blaze-sniff" }
+blaze-sniff.workspace = true
 
 [dev-dependencies]
 blaze-sim.workspace = true
