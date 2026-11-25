@@ -35,6 +35,8 @@ jobs:
       - name: cargo baseline and Blaze cold/warm/selected tests
         env:
           HOME: ${{ github.workspace }}/.home
+          RUSTUP_HOME: /home/runner/.rustup
+          CARGO_HOME: /home/runner/.cargo
           BLAZE: ${{ github.workspace }}/target/release/blaze
         run: |
           set -euo pipefail
