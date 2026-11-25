@@ -1,782 +1,1200 @@
 {
- "comment": "What the pinned clang answers to the compiler probes a wasm build script makes (cc 1.6.0's family detection `cc -E <OUT_DIR>/<n>detect_compiler_family.c`, its `cc -?`, and every is_flag_supported compile of `flag_check.c`), so a script that probes is answered without a compiler and a check never pays for C. A row is keyed by all of a probe's input: `clang` (this host's clang archive sha256 in pins/clang.json), `program` (the name the script spawned), `args` (as spawned, the guest OUT_DIR spelled `$OUT_DIR`, the SDK `$SDKROOT`, and cc's random digits before an OUT_DIR file's name dropped), `env` (the spawn's variables clang reads: blaze_build_script::c_tasks_probe::CLANG_ENV) and `files` (each OUT_DIR file the args name, by sha256; its text under `sources`). `answer` is PENDING until scripts/src/bin/clang_answers.rs runs the shelf's clang on the row and writes {code, stdout, stderr} with the same spellings. A probe with no row, or a PENDING one, is a typed refusal that prints the row to add (c_tasks_probe::ProbeRefused). The rows below were written from cc 1.6.0's source and are checked by the first run: a row that does not match what a script spawns is refused with the exact row.",
- "form": 1,
- "made_by": "scripts/src/bin/clang_answers.rs",
- "sources": {
-  "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a": "int main(void) { return 0; }",
-  "97ca4b021495611e828becea6187add37414186a16dfedd26c2947cbce6e8b2f": "#ifdef __clang__\n#pragma message \"clang\"\n#endif\n\n#ifdef __GNUC__\n#pragma message \"gcc\"\n#endif\n\n#ifdef __EMSCRIPTEN__\n#pragma message \"emscripten\"\n#endif\n\n#ifdef __VXWORKS__\n#pragma message \"VxWorks\"\n#endif\n"
- },
- "rows": [
-  {
-   "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
-   "program": "cc",
-   "args": [
-    "-?"
-   ],
-   "env": {
-    "MACOSX_DEPLOYMENT_TARGET": "11.0"
-   },
-   "files": {},
-   "answer": {
-    "code": 1,
-    "stdout": "",
-    "stderr": "clang-23: error: unknown argument: '-?'\nclang-23: error: no input files\n"
-   }
+  "comment": "What the pinned clang answers to the compiler probes a wasm build script makes (cc 1.6.0's family detection `cc -E <OUT_DIR>/<n>detect_compiler_family.c`, its `cc -?`, and every is_flag_supported compile of `flag_check.c`), so a script that probes is answered without a compiler and a check never pays for C. A row is keyed by all of a probe's input: `clang` (this host's clang archive sha256 in pins/clang.json), `program` (the name the script spawned), `args` (as spawned, the guest OUT_DIR spelled `$OUT_DIR`, the SDK `$SDKROOT`, and cc's random digits before an OUT_DIR file's name dropped), `env` (the spawn's variables clang reads: blaze_build_script::c_tasks_probe::CLANG_ENV) and `files` (each OUT_DIR file the args name, by sha256; its text under `sources`). `answer` is PENDING until scripts/src/bin/clang_answers.rs runs the shelf's clang on the row and writes {code, stdout, stderr} with the same spellings. A probe with no row, or a PENDING one, is a typed refusal that prints the row to add (c_tasks_probe::ProbeRefused). The rows below were written from cc 1.6.0's source and are checked by the first run: a row that does not match what a script spawns is refused with the exact row.",
+  "form": 1,
+  "made_by": "scripts/src/bin/clang_answers.rs",
+  "sources": {
+    "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a": "int main(void) { return 0; }",
+    "97ca4b021495611e828becea6187add37414186a16dfedd26c2947cbce6e8b2f": "#ifdef __clang__\n#pragma message \"clang\"\n#endif\n\n#ifdef __GNUC__\n#pragma message \"gcc\"\n#endif\n\n#ifdef __EMSCRIPTEN__\n#pragma message \"emscripten\"\n#endif\n\n#ifdef __VXWORKS__\n#pragma message \"VxWorks\"\n#endif\n",
+    "b2ef811b2eaec1bfa305241d3a2ba26ed4c9898dc3a5a076a4ec6fcab8410540": "#include <cstddef>\n\n#ifdef _LIBCPP_VERSION\n#pragma message \"libcxx\"\n#endif\n"
   },
-  {
-   "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
-   "program": "c++",
-   "args": [
-    "-?"
-   ],
-   "env": {
-    "MACOSX_DEPLOYMENT_TARGET": "11.0"
-   },
-   "files": {},
-   "answer": {
-    "code": 1,
-    "stdout": "",
-    "stderr": "clang-23: error: unknown argument: '-?'\nclang-23: error: no input files\n"
-   }
-  },
-  {
-   "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
-   "program": "cc",
-   "args": [
-    "-E",
-    "$IN0.c"
-   ],
-   "env": {
-    "MACOSX_DEPLOYMENT_TARGET": "11.0"
-   },
-   "files": {
-    "$IN0.c": "97ca4b021495611e828becea6187add37414186a16dfedd26c2947cbce6e8b2f"
-   },
-   "answer": {
-    "code": 0,
-    "stdout": "# 1 \"$IN0.c\"\n# 1 \"<built-in>\" 1\n# 1 \"<built-in>\" 3\n# 477 \"<built-in>\" 3\n# 1 \"<command line>\" 1\n# 1 \"<built-in>\" 2\n# 1 \"$IN0.c\" 2\n\n#pragma message(\"clang\")\n\n\n\n#pragma message(\"gcc\")\n",
-    "stderr": "$IN0.c:2:9: warning: clang [-W#pragma-messages]\n    2 | #pragma message \"clang\"\n      |         ^\n$IN0.c:6:9: warning: gcc [-W#pragma-messages]\n    6 | #pragma message \"gcc\"\n      |         ^\n2 warnings generated.\n"
-   }
-  },
-  {
-   "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
-   "program": "c++",
-   "args": [
-    "-E",
-    "$IN0.c"
-   ],
-   "env": {
-    "MACOSX_DEPLOYMENT_TARGET": "11.0"
-   },
-   "files": {
-    "$IN0.c": "97ca4b021495611e828becea6187add37414186a16dfedd26c2947cbce6e8b2f"
-   },
-   "answer": {
-    "code": 0,
-    "stdout": "# 1 \"$IN0.c\"\n# 1 \"<built-in>\" 1\n# 1 \"<built-in>\" 3\n# 546 \"<built-in>\" 3\n# 1 \"<command line>\" 1\n# 1 \"<built-in>\" 2\n# 1 \"$IN0.c\" 2\n\n#pragma message(\"clang\")\n\n\n\n#pragma message(\"gcc\")\n",
-    "stderr": "clang-23: warning: treating 'c' input as 'c++' when in C++ mode, this behavior is deprecated [-Wdeprecated]\n$IN0.c:2:9: warning: clang [-W#pragma-messages]\n    2 | #pragma message \"clang\"\n      |         ^\n$IN0.c:6:9: warning: gcc [-W#pragma-messages]\n    6 | #pragma message \"gcc\"\n      |         ^\n2 warnings generated.\n"
-   }
-  },
-  {
-   "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
-   "program": "cc",
-   "args": [
-    "-O0",
-    "-ffunction-sections",
-    "-fdata-sections",
-    "-fPIC",
-    "--target=arm64-apple-macosx",
-    "-mmacosx-version-min=11.0",
-    "-Wall",
-    "-Wextra",
-    "-Wno-overriding-option",
-    "-Wno-unused-command-line-argument",
-    "-o",
-    "$OUT0",
-    "-c",
-    "$IN0.c"
-   ],
-   "env": {
-    "MACOSX_DEPLOYMENT_TARGET": "11.0"
-   },
-   "files": {
-    "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
-   },
-   "answer": {
-    "code": 0,
-    "stdout": "",
-    "stderr": ""
-   }
-  },
-  {
-   "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
-   "program": "cc",
-   "args": [
-    "-O0",
-    "-ffunction-sections",
-    "-fdata-sections",
-    "-fPIC",
-    "--target=arm64-apple-macosx",
-    "-mmacosx-version-min=11.0",
-    "-Wall",
-    "-Wextra",
-    "-Wno-overriding-t-option",
-    "-Wno-unused-command-line-argument",
-    "-o",
-    "$OUT0",
-    "-c",
-    "$IN0.c"
-   ],
-   "env": {
-    "MACOSX_DEPLOYMENT_TARGET": "11.0"
-   },
-   "files": {
-    "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
-   },
-   "answer": {
-    "code": 0,
-    "stdout": "",
-    "stderr": "warning: unknown warning option '-Wno-overriding-t-option'; did you mean '-Wno-overriding-option'? [-Wunknown-warning-option]\n1 warning generated.\n"
-   }
-  },
-  {
-   "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
-   "program": "cc",
-   "args": [
-    "-O0",
-    "-ffunction-sections",
-    "-fdata-sections",
-    "-fPIC",
-    "--target=arm64-apple-macosx",
-    "-mmacosx-version-min=11.0",
-    "-Wall",
-    "-Wextra",
-    "-Wno-unused-command-line-argument",
-    "-Wno-unused-command-line-argument",
-    "-o",
-    "$OUT0",
-    "-c",
-    "$IN0.c"
-   ],
-   "env": {
-    "MACOSX_DEPLOYMENT_TARGET": "11.0"
-   },
-   "files": {
-    "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
-   },
-   "answer": {
-    "code": 0,
-    "stdout": "",
-    "stderr": ""
-   }
-  },
-  {
-   "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
-   "program": "cc",
-   "args": [
-    "-O0",
-    "-ffunction-sections",
-    "-fdata-sections",
-    "-fPIC",
-    "--target=arm64-apple-macosx",
-    "-mmacosx-version-min=11.0",
-    "-Wall",
-    "-Wextra",
-    "-Wno-unused-function",
-    "-Wno-unused-command-line-argument",
-    "-o",
-    "$OUT0",
-    "-c",
-    "$IN0.c"
-   ],
-   "env": {
-    "MACOSX_DEPLOYMENT_TARGET": "11.0"
-   },
-   "files": {
-    "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
-   },
-   "answer": {
-    "code": 0,
-    "stdout": "",
-    "stderr": ""
-   }
-  },
-  {
-   "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
-   "program": "cc",
-   "args": [
-    "-O0",
-    "-ffunction-sections",
-    "-fdata-sections",
-    "-fPIC",
-    "--target=arm64-apple-macosx",
-    "-mmacosx-version-min=11.0",
-    "-Wall",
-    "-Wextra",
-    "-Wno-unused-parameter",
-    "-Wno-unused-command-line-argument",
-    "-o",
-    "$OUT0",
-    "-c",
-    "$IN0.c"
-   ],
-   "env": {
-    "MACOSX_DEPLOYMENT_TARGET": "11.0"
-   },
-   "files": {
-    "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
-   },
-   "answer": {
-    "code": 0,
-    "stdout": "",
-    "stderr": ""
-   }
-  },
-  {
-   "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
-   "program": "cc",
-   "args": [
-    "-O0",
-    "-ffunction-sections",
-    "-fdata-sections",
-    "-fPIC",
-    "--target=arm64-apple-macosx",
-    "-mmacosx-version-min=11.0",
-    "-Wall",
-    "-Wextra",
-    "-fdata-sections",
-    "-Wno-unused-command-line-argument",
-    "-o",
-    "$OUT0",
-    "-c",
-    "$IN0.c"
-   ],
-   "env": {
-    "MACOSX_DEPLOYMENT_TARGET": "11.0"
-   },
-   "files": {
-    "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
-   },
-   "answer": {
-    "code": 0,
-    "stdout": "",
-    "stderr": ""
-   }
-  },
-  {
-   "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
-   "program": "cc",
-   "args": [
-    "-O0",
-    "-ffunction-sections",
-    "-fdata-sections",
-    "-fPIC",
-    "--target=arm64-apple-macosx",
-    "-mmacosx-version-min=11.0",
-    "-Wall",
-    "-Wextra",
-    "-ffunction-sections",
-    "-Wno-unused-command-line-argument",
-    "-o",
-    "$OUT0",
-    "-c",
-    "$IN0.c"
-   ],
-   "env": {
-    "MACOSX_DEPLOYMENT_TARGET": "11.0"
-   },
-   "files": {
-    "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
-   },
-   "answer": {
-    "code": 0,
-    "stdout": "",
-    "stderr": ""
-   }
-  },
-  {
-   "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
-   "program": "cc",
-   "args": [
-    "-O0",
-    "-ffunction-sections",
-    "-fdata-sections",
-    "-fPIC",
-    "--target=arm64-apple-macosx",
-    "-mmacosx-version-min=11.0",
-    "-Wall",
-    "-Wextra",
-    "-fmerge-all-constants",
-    "-Wno-unused-command-line-argument",
-    "-o",
-    "$OUT0",
-    "-c",
-    "$IN0.c"
-   ],
-   "env": {
-    "MACOSX_DEPLOYMENT_TARGET": "11.0"
-   },
-   "files": {
-    "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
-   },
-   "answer": {
-    "code": 0,
-    "stdout": "",
-    "stderr": ""
-   }
-  },
-  {
-   "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
-   "program": "cc",
-   "args": [
-    "-O0",
-    "-ffunction-sections",
-    "-fdata-sections",
-    "-fPIC",
-    "--target=arm64-apple-macosx",
-    "-mmacosx-version-min=11.0",
-    "-Wall",
-    "-Wextra",
-    "-fno-builtin",
-    "-Wno-unused-command-line-argument",
-    "-o",
-    "$OUT0",
-    "-c",
-    "$IN0.c"
-   ],
-   "env": {
-    "MACOSX_DEPLOYMENT_TARGET": "11.0"
-   },
-   "files": {
-    "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
-   },
-   "answer": {
-    "code": 0,
-    "stdout": "",
-    "stderr": ""
-   }
-  },
-  {
-   "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
-   "program": "cc",
-   "args": [
-    "-O0",
-    "-ffunction-sections",
-    "-fdata-sections",
-    "-fPIC",
-    "--target=arm64-apple-macosx",
-    "-mmacosx-version-min=11.0",
-    "-Wall",
-    "-Wextra",
-    "-fsanitize-undefined-strip-path-components=-1",
-    "-Wno-unused-command-line-argument",
-    "-o",
-    "$OUT0",
-    "-c",
-    "$IN0.c"
-   ],
-   "env": {
-    "MACOSX_DEPLOYMENT_TARGET": "11.0"
-   },
-   "files": {
-    "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
-   },
-   "answer": {
-    "code": 0,
-    "stdout": "",
-    "stderr": ""
-   }
-  },
-  {
-   "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
-   "program": "cc",
-   "args": [
-    "-O0",
-    "-ffunction-sections",
-    "-fdata-sections",
-    "-fPIC",
-    "--target=arm64-apple-macosx",
-    "-mmacosx-version-min=11.0",
-    "-Wall",
-    "-Wextra",
-    "-fstack-clash-protection",
-    "-Wno-unused-command-line-argument",
-    "-o",
-    "$OUT0",
-    "-c",
-    "$IN0.c"
-   ],
-   "env": {
-    "MACOSX_DEPLOYMENT_TARGET": "11.0"
-   },
-   "files": {
-    "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
-   },
-   "answer": {
-    "code": 0,
-    "stdout": "",
-    "stderr": ""
-   }
-  },
-  {
-   "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
-   "program": "cc",
-   "args": [
-    "-O0",
-    "-ffunction-sections",
-    "-fdata-sections",
-    "-fPIC",
-    "--target=arm64-apple-macosx",
-    "-mmacosx-version-min=11.0",
-    "-Wall",
-    "-Wextra",
-    "-ftls-model=initial-exec",
-    "-Wno-unused-command-line-argument",
-    "-o",
-    "$OUT0",
-    "-c",
-    "$IN0.c"
-   ],
-   "env": {
-    "MACOSX_DEPLOYMENT_TARGET": "11.0"
-   },
-   "files": {
-    "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
-   },
-   "answer": {
-    "code": 0,
-    "stdout": "",
-    "stderr": ""
-   }
-  },
-  {
-   "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
-   "program": "cc",
-   "args": [
-    "-O0",
-    "-ffunction-sections",
-    "-fdata-sections",
-    "-fPIC",
-    "--target=arm64-apple-macosx",
-    "-mmacosx-version-min=11.0",
-    "-Wall",
-    "-Wextra",
-    "-march=armv8-a+crc",
-    "-Wno-unused-command-line-argument",
-    "-o",
-    "$OUT0",
-    "-c",
-    "$IN0.c"
-   ],
-   "env": {
-    "MACOSX_DEPLOYMENT_TARGET": "11.0"
-   },
-   "files": {
-    "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
-   },
-   "answer": {
-    "code": 0,
-    "stdout": "",
-    "stderr": ""
-   }
-  },
-  {
-   "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
-   "program": "cc",
-   "args": [
-    "-O0",
-    "-ffunction-sections",
-    "-fdata-sections",
-    "-fPIC",
-    "--target=arm64-apple-macosx",
-    "-mmacosx-version-min=11.0",
-    "-Wall",
-    "-Wextra",
-    "-mno-avx",
-    "-Wno-unused-command-line-argument",
-    "-o",
-    "$OUT0",
-    "-c",
-    "$IN0.c"
-   ],
-   "env": {
-    "MACOSX_DEPLOYMENT_TARGET": "11.0"
-   },
-   "files": {
-    "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
-   },
-   "answer": {
-    "code": 1,
-    "stdout": "",
-    "stderr": "clang-23: error: unsupported option '-mno-avx' for target 'arm64-apple-macosx'\n"
-   }
-  },
-  {
-   "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
-   "program": "cc",
-   "args": [
-    "-O0",
-    "-ffunction-sections",
-    "-fdata-sections",
-    "-fPIC",
-    "--target=arm64-apple-macosx",
-    "-mmacosx-version-min=11.0",
-    "-Wall",
-    "-Wextra",
-    "-mno-omit-leaf-frame-pointer",
-    "-Wno-unused-command-line-argument",
-    "-o",
-    "$OUT0",
-    "-c",
-    "$IN0.c"
-   ],
-   "env": {
-    "MACOSX_DEPLOYMENT_TARGET": "11.0"
-   },
-   "files": {
-    "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
-   },
-   "answer": {
-    "code": 0,
-    "stdout": "",
-    "stderr": ""
-   }
-  },
-  {
-   "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
-   "program": "cc",
-   "args": [
-    "-O0",
-    "-ffunction-sections",
-    "-fdata-sections",
-    "-fPIC",
-    "--target=arm64-apple-macosx",
-    "-mmacosx-version-min=11.0",
-    "-Wall",
-    "-Wextra",
-    "-pedantic",
-    "-Wno-unused-command-line-argument",
-    "-o",
-    "$OUT0",
-    "-c",
-    "$IN0.c"
-   ],
-   "env": {
-    "MACOSX_DEPLOYMENT_TARGET": "11.0"
-   },
-   "files": {
-    "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
-   },
-   "answer": {
-    "code": 0,
-    "stdout": "",
-    "stderr": ""
-   }
-  },
-  {
-   "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
-   "program": "c++",
-   "args": [
-    "-O0",
-    "-ffunction-sections",
-    "-fdata-sections",
-    "-fPIC",
-    "--target=arm64-apple-macosx",
-    "-mmacosx-version-min=11.0",
-    "-Wall",
-    "-Wextra",
-    "-mno-omit-leaf-frame-pointer",
-    "-Wno-unused-command-line-argument",
-    "-o",
-    "$OUT0",
-    "-c",
-    "$IN0.cpp"
-   ],
-   "env": {
-    "MACOSX_DEPLOYMENT_TARGET": "11.0"
-   },
-   "files": {
-    "$IN0.cpp": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
-   },
-   "answer": {
-    "code": 0,
-    "stdout": "",
-    "stderr": ""
-   }
-  },
-  {
-   "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
-   "program": "c++",
-   "args": [
-    "-O0",
-    "-ffunction-sections",
-    "-fdata-sections",
-    "-fPIC",
-    "--target=arm64-apple-macosx",
-    "-mmacosx-version-min=11.0",
-    "-Wall",
-    "-Wextra",
-    "-std=c++17",
-    "-Wno-unused-command-line-argument",
-    "-o",
-    "$OUT0",
-    "-c",
-    "$IN0.cpp"
-   ],
-   "env": {
-    "MACOSX_DEPLOYMENT_TARGET": "11.0"
-   },
-   "files": {
-    "$IN0.cpp": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
-   },
-   "answer": {
-    "code": 0,
-    "stdout": "",
-    "stderr": ""
-   }
-  },
-  {
-   "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
-   "program": "cc",
-   "args": [
-    "-O0",
-    "-ffunction-sections",
-    "-fdata-sections",
-    "-fPIC",
-    "--target=arm64-apple-macosx",
-    "-mmacosx-version-min=11.0",
-    "-Wall",
-    "-Wextra",
-    "-ffile-prefix-map=/package=",
-    "-Wno-unused-command-line-argument",
-    "-o",
-    "$OUT0",
-    "-c",
-    "$IN0.c"
-   ],
-   "env": {
-    "MACOSX_DEPLOYMENT_TARGET": "11.0"
-   },
-   "files": {
-    "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
-   },
-   "answer": {
-    "code": 0,
-    "stdout": "",
-    "stderr": ""
-   }
-  },
-  {
-   "clang": "25d814fda50d5fb0084b42be09605d8b1595d49d5e2e03a3345d7e112ff6f9f3",
-   "program": "cc",
-   "args": [
-    "-E",
-    "$IN0.c"
-   ],
-   "env": {},
-   "files": {
-    "$IN0.c": "97ca4b021495611e828becea6187add37414186a16dfedd26c2947cbce6e8b2f"
-   },
-   "answer": {
-    "code": 0,
-    "stdout": "# 1 \"$IN0.c\"\n# 1 \"<built-in>\" 1\n# 1 \"<built-in>\" 3\n# 416 \"<built-in>\" 3\n# 1 \"<command line>\" 1\n# 1 \"<built-in>\" 2\n# 1 \"$IN0.c\" 2\n\n#pragma message(\"clang\")\n\n\n\n#pragma message(\"gcc\")\n",
-    "stderr": "$IN0.c:2:9: warning: clang [-W#pragma-messages]\n    2 | #pragma message \"clang\"\n      |         ^\n$IN0.c:6:9: warning: gcc [-W#pragma-messages]\n    6 | #pragma message \"gcc\"\n      |         ^\n2 warnings generated.\n"
-   }
-  },
-  {
-   "clang": "25d814fda50d5fb0084b42be09605d8b1595d49d5e2e03a3345d7e112ff6f9f3",
-   "program": "c++",
-   "args": [
-    "-E",
-    "$IN0.c"
-   ],
-   "env": {},
-   "files": {
-    "$IN0.c": "97ca4b021495611e828becea6187add37414186a16dfedd26c2947cbce6e8b2f"
-   },
-   "answer": {
-    "code": 0,
-    "stdout": "# 1 \"$IN0.c\"\n# 1 \"<built-in>\" 1\n# 1 \"<built-in>\" 3\n# 486 \"<built-in>\" 3\n# 1 \"<command line>\" 1\n# 1 \"<built-in>\" 2\n# 1 \"$IN0.c\" 2\n\n#pragma message(\"clang\")\n\n\n\n#pragma message(\"gcc\")\n",
-    "stderr": "clang-23: warning: treating 'c' input as 'c++' when in C++ mode, this behavior is deprecated [-Wdeprecated]\n$IN0.c:2:9: warning: clang [-W#pragma-messages]\n    2 | #pragma message \"clang\"\n      |         ^\n$IN0.c:6:9: warning: gcc [-W#pragma-messages]\n    6 | #pragma message \"gcc\"\n      |         ^\n2 warnings generated.\n"
-   }
-  },
-  {
-   "clang": "25d814fda50d5fb0084b42be09605d8b1595d49d5e2e03a3345d7e112ff6f9f3",
-   "program": "cc",
-   "args": [
-    "-?"
-   ],
-   "env": {},
-   "files": {},
-   "answer": {
-    "code": 1,
-    "stdout": "",
-    "stderr": "clang-23: error: unknown argument: '-?'\nclang-23: error: no input files\n"
-   }
-  },
-  {
-   "clang": "25d814fda50d5fb0084b42be09605d8b1595d49d5e2e03a3345d7e112ff6f9f3",
-   "program": "c++",
-   "args": [
-    "-?"
-   ],
-   "env": {},
-   "files": {},
-   "answer": {
-    "code": 1,
-    "stdout": "",
-    "stderr": "clang-23: error: unknown argument: '-?'\nclang-23: error: no input files\n"
-   }
-  },
-  {
-   "clang": "25d814fda50d5fb0084b42be09605d8b1595d49d5e2e03a3345d7e112ff6f9f3",
-   "program": "cc",
-   "args": [
-    "-O0",
-    "-ffunction-sections",
-    "-fdata-sections",
-    "-fPIC",
-    "-m64",
-    "--target=x86_64-unknown-linux-gnu",
-    "-Wall",
-    "-Wextra",
-    "-mno-omit-leaf-frame-pointer",
-    "-Wno-unused-command-line-argument",
-    "-o",
-    "$OUT0",
-    "-c",
-    "$IN0.c"
-   ],
-   "env": {},
-   "files": {
-    "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
-   },
-   "answer": "PENDING"
-  },
-  {
-   "clang": "25d814fda50d5fb0084b42be09605d8b1595d49d5e2e03a3345d7e112ff6f9f3",
-   "program": "c++",
-   "args": [
-    "-O0",
-    "-ffunction-sections",
-    "-fdata-sections",
-    "-fPIC",
-    "-m64",
-    "--target=x86_64-unknown-linux-gnu",
-    "-Wall",
-    "-Wextra",
-    "-mno-omit-leaf-frame-pointer",
-    "-Wno-unused-command-line-argument",
-    "-o",
-    "$OUT0",
-    "-c",
-    "$IN0.cpp"
-   ],
-   "env": {},
-   "files": {
-    "$IN0.cpp": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
-   },
-   "answer": "PENDING"
-  }
- ]
+  "rows": [
+    {
+      "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
+      "program": "cc",
+      "args": [
+        "-?"
+      ],
+      "env": {
+        "MACOSX_DEPLOYMENT_TARGET": "11.0"
+      },
+      "files": {},
+      "answer": {
+        "code": 1,
+        "stdout": "",
+        "stderr": "clang-23: error: unknown argument: '-?'\nclang-23: error: no input files\n"
+      }
+    },
+    {
+      "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
+      "program": "c++",
+      "args": [
+        "-?"
+      ],
+      "env": {
+        "MACOSX_DEPLOYMENT_TARGET": "11.0"
+      },
+      "files": {},
+      "answer": {
+        "code": 1,
+        "stdout": "",
+        "stderr": "clang-23: error: unknown argument: '-?'\nclang-23: error: no input files\n"
+      }
+    },
+    {
+      "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
+      "program": "cc",
+      "args": [
+        "-E",
+        "$IN0.c"
+      ],
+      "env": {
+        "MACOSX_DEPLOYMENT_TARGET": "11.0"
+      },
+      "files": {
+        "$IN0.c": "97ca4b021495611e828becea6187add37414186a16dfedd26c2947cbce6e8b2f"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "# 1 \"$IN0.c\"\n# 1 \"<built-in>\" 1\n# 1 \"<built-in>\" 3\n# 477 \"<built-in>\" 3\n# 1 \"<command line>\" 1\n# 1 \"<built-in>\" 2\n# 1 \"$IN0.c\" 2\n\n#pragma message(\"clang\")\n\n\n\n#pragma message(\"gcc\")\n",
+        "stderr": "$IN0.c:2:9: warning: clang [-W#pragma-messages]\n    2 | #pragma message \"clang\"\n      |         ^\n$IN0.c:6:9: warning: gcc [-W#pragma-messages]\n    6 | #pragma message \"gcc\"\n      |         ^\n2 warnings generated.\n"
+      }
+    },
+    {
+      "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
+      "program": "c++",
+      "args": [
+        "-E",
+        "$IN0.c"
+      ],
+      "env": {
+        "MACOSX_DEPLOYMENT_TARGET": "11.0"
+      },
+      "files": {
+        "$IN0.c": "97ca4b021495611e828becea6187add37414186a16dfedd26c2947cbce6e8b2f"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "# 1 \"$IN0.c\"\n# 1 \"<built-in>\" 1\n# 1 \"<built-in>\" 3\n# 546 \"<built-in>\" 3\n# 1 \"<command line>\" 1\n# 1 \"<built-in>\" 2\n# 1 \"$IN0.c\" 2\n\n#pragma message(\"clang\")\n\n\n\n#pragma message(\"gcc\")\n",
+        "stderr": "clang-23: warning: treating 'c' input as 'c++' when in C++ mode, this behavior is deprecated [-Wdeprecated]\n$IN0.c:2:9: warning: clang [-W#pragma-messages]\n    2 | #pragma message \"clang\"\n      |         ^\n$IN0.c:6:9: warning: gcc [-W#pragma-messages]\n    6 | #pragma message \"gcc\"\n      |         ^\n2 warnings generated.\n"
+      }
+    },
+    {
+      "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=arm64-apple-macosx",
+        "-mmacosx-version-min=11.0",
+        "-Wall",
+        "-Wextra",
+        "-Wno-overriding-option",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {
+        "MACOSX_DEPLOYMENT_TARGET": "11.0"
+      },
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=arm64-apple-macosx",
+        "-mmacosx-version-min=11.0",
+        "-Wall",
+        "-Wextra",
+        "-Wno-overriding-t-option",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {
+        "MACOSX_DEPLOYMENT_TARGET": "11.0"
+      },
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": "warning: unknown warning option '-Wno-overriding-t-option'; did you mean '-Wno-overriding-option'? [-Wunknown-warning-option]\n1 warning generated.\n"
+      }
+    },
+    {
+      "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=arm64-apple-macosx",
+        "-mmacosx-version-min=11.0",
+        "-Wall",
+        "-Wextra",
+        "-Wno-unused-command-line-argument",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {
+        "MACOSX_DEPLOYMENT_TARGET": "11.0"
+      },
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=arm64-apple-macosx",
+        "-mmacosx-version-min=11.0",
+        "-Wall",
+        "-Wextra",
+        "-Wno-unused-function",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {
+        "MACOSX_DEPLOYMENT_TARGET": "11.0"
+      },
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=arm64-apple-macosx",
+        "-mmacosx-version-min=11.0",
+        "-Wall",
+        "-Wextra",
+        "-Wno-unused-parameter",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {
+        "MACOSX_DEPLOYMENT_TARGET": "11.0"
+      },
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=arm64-apple-macosx",
+        "-mmacosx-version-min=11.0",
+        "-Wall",
+        "-Wextra",
+        "-fdata-sections",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {
+        "MACOSX_DEPLOYMENT_TARGET": "11.0"
+      },
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=arm64-apple-macosx",
+        "-mmacosx-version-min=11.0",
+        "-Wall",
+        "-Wextra",
+        "-ffunction-sections",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {
+        "MACOSX_DEPLOYMENT_TARGET": "11.0"
+      },
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=arm64-apple-macosx",
+        "-mmacosx-version-min=11.0",
+        "-Wall",
+        "-Wextra",
+        "-fmerge-all-constants",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {
+        "MACOSX_DEPLOYMENT_TARGET": "11.0"
+      },
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=arm64-apple-macosx",
+        "-mmacosx-version-min=11.0",
+        "-Wall",
+        "-Wextra",
+        "-fno-builtin",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {
+        "MACOSX_DEPLOYMENT_TARGET": "11.0"
+      },
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=arm64-apple-macosx",
+        "-mmacosx-version-min=11.0",
+        "-Wall",
+        "-Wextra",
+        "-fsanitize-undefined-strip-path-components=-1",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {
+        "MACOSX_DEPLOYMENT_TARGET": "11.0"
+      },
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=arm64-apple-macosx",
+        "-mmacosx-version-min=11.0",
+        "-Wall",
+        "-Wextra",
+        "-fstack-clash-protection",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {
+        "MACOSX_DEPLOYMENT_TARGET": "11.0"
+      },
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=arm64-apple-macosx",
+        "-mmacosx-version-min=11.0",
+        "-Wall",
+        "-Wextra",
+        "-ftls-model=initial-exec",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {
+        "MACOSX_DEPLOYMENT_TARGET": "11.0"
+      },
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=arm64-apple-macosx",
+        "-mmacosx-version-min=11.0",
+        "-Wall",
+        "-Wextra",
+        "-march=armv8-a+crc",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {
+        "MACOSX_DEPLOYMENT_TARGET": "11.0"
+      },
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=arm64-apple-macosx",
+        "-mmacosx-version-min=11.0",
+        "-Wall",
+        "-Wextra",
+        "-mno-avx",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {
+        "MACOSX_DEPLOYMENT_TARGET": "11.0"
+      },
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 1,
+        "stdout": "",
+        "stderr": "clang-23: error: unsupported option '-mno-avx' for target 'arm64-apple-macosx'\n"
+      }
+    },
+    {
+      "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=arm64-apple-macosx",
+        "-mmacosx-version-min=11.0",
+        "-Wall",
+        "-Wextra",
+        "-mno-omit-leaf-frame-pointer",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {
+        "MACOSX_DEPLOYMENT_TARGET": "11.0"
+      },
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=arm64-apple-macosx",
+        "-mmacosx-version-min=11.0",
+        "-Wall",
+        "-Wextra",
+        "-pedantic",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {
+        "MACOSX_DEPLOYMENT_TARGET": "11.0"
+      },
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
+      "program": "c++",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=arm64-apple-macosx",
+        "-mmacosx-version-min=11.0",
+        "-Wall",
+        "-Wextra",
+        "-mno-omit-leaf-frame-pointer",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.cpp"
+      ],
+      "env": {
+        "MACOSX_DEPLOYMENT_TARGET": "11.0"
+      },
+      "files": {
+        "$IN0.cpp": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
+      "program": "c++",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=arm64-apple-macosx",
+        "-mmacosx-version-min=11.0",
+        "-Wall",
+        "-Wextra",
+        "-std=c++17",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.cpp"
+      ],
+      "env": {
+        "MACOSX_DEPLOYMENT_TARGET": "11.0"
+      },
+      "files": {
+        "$IN0.cpp": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=arm64-apple-macosx",
+        "-mmacosx-version-min=11.0",
+        "-Wall",
+        "-Wextra",
+        "-ffile-prefix-map=/package=",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {
+        "MACOSX_DEPLOYMENT_TARGET": "11.0"
+      },
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "25d814fda50d5fb0084b42be09605d8b1595d49d5e2e03a3345d7e112ff6f9f3",
+      "program": "cc",
+      "args": [
+        "-E",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "97ca4b021495611e828becea6187add37414186a16dfedd26c2947cbce6e8b2f"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "# 1 \"$IN0.c\"\n# 1 \"<built-in>\" 1\n# 1 \"<built-in>\" 3\n# 416 \"<built-in>\" 3\n# 1 \"<command line>\" 1\n# 1 \"<built-in>\" 2\n# 1 \"$IN0.c\" 2\n\n#pragma message(\"clang\")\n\n\n\n#pragma message(\"gcc\")\n",
+        "stderr": "$IN0.c:2:9: warning: clang [-W#pragma-messages]\n    2 | #pragma message \"clang\"\n      |         ^\n$IN0.c:6:9: warning: gcc [-W#pragma-messages]\n    6 | #pragma message \"gcc\"\n      |         ^\n2 warnings generated.\n"
+      }
+    },
+    {
+      "clang": "25d814fda50d5fb0084b42be09605d8b1595d49d5e2e03a3345d7e112ff6f9f3",
+      "program": "c++",
+      "args": [
+        "-E",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "97ca4b021495611e828becea6187add37414186a16dfedd26c2947cbce6e8b2f"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "# 1 \"$IN0.c\"\n# 1 \"<built-in>\" 1\n# 1 \"<built-in>\" 3\n# 486 \"<built-in>\" 3\n# 1 \"<command line>\" 1\n# 1 \"<built-in>\" 2\n# 1 \"$IN0.c\" 2\n\n#pragma message(\"clang\")\n\n\n\n#pragma message(\"gcc\")\n",
+        "stderr": "clang-23: warning: treating 'c' input as 'c++' when in C++ mode, this behavior is deprecated [-Wdeprecated]\n$IN0.c:2:9: warning: clang [-W#pragma-messages]\n    2 | #pragma message \"clang\"\n      |         ^\n$IN0.c:6:9: warning: gcc [-W#pragma-messages]\n    6 | #pragma message \"gcc\"\n      |         ^\n2 warnings generated.\n"
+      }
+    },
+    {
+      "clang": "25d814fda50d5fb0084b42be09605d8b1595d49d5e2e03a3345d7e112ff6f9f3",
+      "program": "cc",
+      "args": [
+        "-?"
+      ],
+      "env": {},
+      "files": {},
+      "answer": {
+        "code": 1,
+        "stdout": "",
+        "stderr": "clang-23: error: unknown argument: '-?'\nclang-23: error: no input files\n"
+      }
+    },
+    {
+      "clang": "25d814fda50d5fb0084b42be09605d8b1595d49d5e2e03a3345d7e112ff6f9f3",
+      "program": "c++",
+      "args": [
+        "-?"
+      ],
+      "env": {},
+      "files": {},
+      "answer": {
+        "code": 1,
+        "stdout": "",
+        "stderr": "clang-23: error: unknown argument: '-?'\nclang-23: error: no input files\n"
+      }
+    },
+    {
+      "clang": "25d814fda50d5fb0084b42be09605d8b1595d49d5e2e03a3345d7e112ff6f9f3",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "-m64",
+        "--target=x86_64-unknown-linux-gnu",
+        "-Wall",
+        "-Wextra",
+        "-mno-omit-leaf-frame-pointer",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "25d814fda50d5fb0084b42be09605d8b1595d49d5e2e03a3345d7e112ff6f9f3",
+      "program": "c++",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "-m64",
+        "--target=x86_64-unknown-linux-gnu",
+        "-Wall",
+        "-Wextra",
+        "-mno-omit-leaf-frame-pointer",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.cpp"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.cpp": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "25d814fda50d5fb0084b42be09605d8b1595d49d5e2e03a3345d7e112ff6f9f3",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "-m64",
+        "--target=x86_64-unknown-linux-gnu",
+        "-Wall",
+        "-Wextra",
+        "-Wno-unused-but-set-variable",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "25d814fda50d5fb0084b42be09605d8b1595d49d5e2e03a3345d7e112ff6f9f3",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "-m64",
+        "--target=x86_64-unknown-linux-gnu",
+        "-Wall",
+        "-Wextra",
+        "-Wno-sign-compare",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "25d814fda50d5fb0084b42be09605d8b1595d49d5e2e03a3345d7e112ff6f9f3",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "-m64",
+        "--target=x86_64-unknown-linux-gnu",
+        "-Wall",
+        "-Wextra",
+        "-Wno-unused-value",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "25d814fda50d5fb0084b42be09605d8b1595d49d5e2e03a3345d7e112ff6f9f3",
+      "program": "c++",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "-g",
+        "-gdwarf-4",
+        "-fno-omit-frame-pointer",
+        "-mno-omit-leaf-frame-pointer",
+        "-m64",
+        "--target=x86_64-unknown-linux-gnu",
+        "-I",
+        "src",
+        "-Wall",
+        "-Wextra",
+        "-std=c++11",
+        "-E",
+        "$IN0.cpp"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.cpp": "b2ef811b2eaec1bfa305241d3a2ba26ed4c9898dc3a5a076a4ec6fcab8410540"
+      },
+      "answer": {
+        "code": 1,
+        "stdout": "# 1 \"$IN0.cpp\"\n# 1 \"<built-in>\" 1\n# 1 \"<built-in>\" 3\n# 454 \"<built-in>\" 3\n# 1 \"<command line>\" 1\n# 1 \"<built-in>\" 2\n# 1 \"$IN0.cpp\" 2\n\n",
+        "stderr": "$IN0.cpp:1:10: fatal error: 'cstddef' file not found\n    1 | #include <cstddef>\n      |          ^~~~~~~~~\n1 error generated.\n"
+      }
+    },
+    {
+      "clang": "25d814fda50d5fb0084b42be09605d8b1595d49d5e2e03a3345d7e112ff6f9f3",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "-m64",
+        "--target=x86_64-unknown-linux-gnu",
+        "-Wall",
+        "-Wextra",
+        "-ftls-model=initial-exec",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "25d814fda50d5fb0084b42be09605d8b1595d49d5e2e03a3345d7e112ff6f9f3",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "-m64",
+        "--target=x86_64-unknown-linux-gnu",
+        "-Wall",
+        "-Wextra",
+        "-Wno-unused-parameter",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "25d814fda50d5fb0084b42be09605d8b1595d49d5e2e03a3345d7e112ff6f9f3",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "-m64",
+        "--target=x86_64-unknown-linux-gnu",
+        "-Wall",
+        "-Wextra",
+        "-std=c11",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "25d814fda50d5fb0084b42be09605d8b1595d49d5e2e03a3345d7e112ff6f9f3",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "-m64",
+        "--target=x86_64-unknown-linux-gnu",
+        "-Wall",
+        "-Wextra",
+        "-ffunction-sections",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "25d814fda50d5fb0084b42be09605d8b1595d49d5e2e03a3345d7e112ff6f9f3",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "-m64",
+        "--target=x86_64-unknown-linux-gnu",
+        "-Wall",
+        "-Wextra",
+        "-Wno-implicit-fallthrough",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "25d814fda50d5fb0084b42be09605d8b1595d49d5e2e03a3345d7e112ff6f9f3",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "-m64",
+        "--target=x86_64-unknown-linux-gnu",
+        "-Wall",
+        "-Wextra",
+        "-fvisibility=hidden",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "25d814fda50d5fb0084b42be09605d8b1595d49d5e2e03a3345d7e112ff6f9f3",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "-m64",
+        "--target=x86_64-unknown-linux-gnu",
+        "-Wall",
+        "-Wextra",
+        "-Wno-trigraphs",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "25d814fda50d5fb0084b42be09605d8b1595d49d5e2e03a3345d7e112ff6f9f3",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "-m64",
+        "--target=x86_64-unknown-linux-gnu",
+        "-Wall",
+        "-Wextra",
+        "-fdata-sections",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "25d814fda50d5fb0084b42be09605d8b1595d49d5e2e03a3345d7e112ff6f9f3",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "-m64",
+        "--target=x86_64-unknown-linux-gnu",
+        "-Wall",
+        "-Wextra",
+        "-Wshadow",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "25d814fda50d5fb0084b42be09605d8b1595d49d5e2e03a3345d7e112ff6f9f3",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "-m64",
+        "--target=x86_64-unknown-linux-gnu",
+        "-Wall",
+        "-Wextra",
+        "-fmerge-all-constants",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    }
+  ]
 }
