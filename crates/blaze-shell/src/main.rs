@@ -1053,6 +1053,7 @@ mod macos_app {
                                             }
                                             shell.editor.insert_str(&text);
                                             popup_engaged = false;
+                                            shell.auto_scroll_bottom = true;
                                             shell.refresh_editor_assist(true);
                                         }
                                     }
@@ -1234,7 +1235,9 @@ mod macos_app {
                                     d.active = true;
                                 }
                                 if d.active {
-                                    d.over_composer = shell.last_scene.composer_rect.contains(x, y);
+                                    let cr = shell.last_scene.composer_rect;
+                                    d.over_composer = cr.contains(x, y)
+                                        || (y >= cr.y0 && y <= size.height as f32 && x >= cr.x0 && x <= cr.x1);
                                     apply_cursor(&mut cur_cursor, CursorKind::ClosedHand);
                                     dirty = true;
                                 }
@@ -1258,9 +1261,13 @@ mod macos_app {
                             let y = (size.height - pt.y) as f32;
                             last_mouse = Some((x, y));
                             if let Some(d) = pending_drag.take() {
-                                if d.active && shell.last_scene.composer_rect.contains(x, y) {
+                                let cr = shell.last_scene.composer_rect;
+                                let dropped_in_prompt = cr.contains(x, y)
+                                    || (y >= cr.y0 && y <= size.height as f32 && x >= cr.x0 && x <= cr.x1);
+                                if d.active && dropped_in_prompt {
                                     shell.editor.insert_dropped_token(&d.payload.insert_text);
                                     popup_engaged = false;
+                                    shell.auto_scroll_bottom = true;
                                     shell.refresh_editor_assist(false);
                                     blink_on = true;
                                     last_blink = Instant::now();

@@ -51,74 +51,77 @@ pub struct LayoutInput<'a> {
     pub drag: Option<&'a ActiveDrag>,
 }
 
-/// Lay out the full `ix.dev/blaze`-styled shell interface.
+/// Lay out the full `ix.dev/blaze` + Starship inline-stream shell interface.
+///
+/// The live prompt flows directly underneath the last command output (like a native
+/// terminal / TUI), with zero separate docked bottom pane.
 pub fn build_scene(input: &LayoutInput<'_>) -> Scene {
     let mut scene = Scene::new();
     let vw = input.viewport_w.max(320.0);
     let vh = input.viewport_h.max(240.0);
     let m = input.metrics;
 
-    // 1. Docked bottom composer height.
-    let editor_lines: Vec<&str> = if input.editor.text.is_empty() {
-        vec![""]
-    } else {
-        input.editor.text.split('\n').collect()
-    };
-    let visible_input_lines = editor_lines.len().clamp(1, 8);
-    let box_h = (visible_input_lines as f32 * (m.ch + 4.0) + 22.0).clamp(44.0, 210.0);
-    let composer_total_h = 26.0 + box_h + 16.0;
-    let input_top_y = (vh - composer_total_h).max(TOP_BAR_H + 40.0);
-    scene.input_top_y = input_top_y;
-
-    // 2. Scrollable block feed clip region (clip_id = 1).
+    // 1. Full-height scrollable stream below the unified inline titlebar (`clip_id = 1`).
     let feed_top = TOP_BAR_H;
-    let feed_bottom = input_top_y.max(feed_top + 1.0);
+    let feed_bottom = vh.max(feed_top + 1.0);
     let feed_clip = scene.push_clip(0.0, feed_top, vw, feed_bottom, 0.0);
     scene.scroll_viewport_height = (feed_bottom - feed_top).max(1.0);
 
-    // 3. Open borderless block stream.
+    // 2. Open borderless command & output stream.
     let col_x0 = OUTER_PAD_X;
     let col_x1 = (vw - OUTER_PAD_X).max(col_x0 + 200.0);
     let blocks = input.store.active_blocks();
 
     let mut content_y = 14.0f32;
-    if blocks.is_empty() {
-        let h = layout_welcome(
+    let mut prev_cwd: Option<&str> = None;
+    for (idx, blk) in blocks.iter().enumerate() {
+        if idx > 0 {
+            let sep_y = feed_top + content_y - input.scroll_y;
+            scene.line(col_x0, sep_y, col_x1, sep_y, 1.0, theme::LINE_FAINT, feed_clip);
+            content_y += BLOCK_PAD_Y;
+        }
+        let show_context = prev_cwd != Some(blk.prompt_snapshot.cwd_display.as_str());
+        prev_cwd = Some(blk.prompt_snapshot.cwd_display.as_str());
+
+        let draw_y = feed_top + content_y - input.scroll_y;
+        let h = layout_block(
             &mut scene,
+            blk,
+            show_context,
             col_x0,
-            feed_top + content_y - input.scroll_y,
+            draw_y,
+            col_x1,
             m,
             feed_clip,
+            input.cursor_visible,
+            input.now_ns,
         );
-        content_y += h + 16.0;
-    } else {
-        let mut prev_cwd: Option<&str> = None;
-        for (idx, blk) in blocks.iter().enumerate() {
-            if idx > 0 {
-                let sep_y = feed_top + content_y - input.scroll_y;
-                scene.line(col_x0, sep_y, col_x1, sep_y, 1.0, theme::LINE_FAINT, feed_clip);
-                content_y += BLOCK_PAD_Y;
-            }
-            let show_context = prev_cwd != Some(blk.prompt_snapshot.cwd_display.as_str());
-            prev_cwd = Some(blk.prompt_snapshot.cwd_display.as_str());
-
-            let draw_y = feed_top + content_y - input.scroll_y;
-            let h = layout_block(
-                &mut scene,
-                blk,
-                show_context,
-                col_x0,
-                draw_y,
-                col_x1,
-                m,
-                feed_clip,
-                input.cursor_visible,
-                input.now_ns,
-            );
-            content_y += h + BLOCK_PAD_Y;
-        }
+        content_y += h + BLOCK_PAD_Y;
     }
-    scene.total_content_height = content_y + 14.0;
+
+    // 3. Live inline Starship prompt directly underneath the last command output!
+    if !blocks.is_empty() {
+        let sep_y = feed_top + content_y - input.scroll_y;
+        scene.line(col_x0, sep_y, col_x1, sep_y, 1.0, theme::LINE_FAINT, feed_clip);
+        content_y += BLOCK_PAD_Y;
+    }
+    let prompt_y0 = feed_top + content_y - input.scroll_y;
+    scene.input_top_y = prompt_y0;
+    let prompt_h = layout_inline_prompt(
+        &mut scene,
+        input.editor,
+        input.prompt,
+        col_x0,
+        prompt_y0,
+        col_x1,
+        m,
+        feed_clip,
+        input.cursor_visible,
+        input.drag,
+    );
+    let prompt_y1 = prompt_y0 + prompt_h;
+    content_y += prompt_h + 24.0;
+    scene.total_content_height = content_y;
 
     // 4. Unified inline macOS titlebar (branch tabs, cwd/git pill, zoom, fork button).
     layout_top_bar(
@@ -131,25 +134,11 @@ pub fn build_scene(input: &LayoutInput<'_>) -> Scene {
         input.inline_titlebar,
     );
 
-    // 5. Sleek Starship + `ix.dev/blaze` bottom composer (clip 0).
-    layout_composer(
-        &mut scene,
-        input.editor,
-        input.prompt,
-        vw,
-        input_top_y,
-        vh,
-        box_h,
-        m,
-        input.cursor_visible,
-        input.drag,
-    );
-
-    // 6. Floating overlays (IntelliJ completion popup, Ctrl+R reverse search, drag chip).
+    // 5. Floating overlays anchored directly below (or flipped above) the live inline prompt.
     if let Some(rs) = &input.editor.reverse_search {
-        layout_reverse_search_overlay(&mut scene, rs, col_x0, input_top_y - 8.0, col_x1, m);
+        layout_reverse_search_overlay(&mut scene, rs, col_x0, prompt_y0, prompt_y1, vh, col_x1, m);
     } else if !input.editor.completions.is_empty() {
-        layout_completion_popup(&mut scene, input.editor, col_x0, input_top_y - 8.0, col_x1, m);
+        layout_completion_popup(&mut scene, input.editor, col_x0, prompt_y0, prompt_y1, vh, col_x1, m);
     }
     if let Some(drag) = input.drag {
         layout_drag_overlay(&mut scene, drag, m);
@@ -327,30 +316,6 @@ fn layout_starship_line(
         cx += 0.9 * m.cw;
         scene.text(cx, y, "✦", theme::PROMPT_SPARK, false, false, clip_id);
     }
-}
-
-fn layout_welcome(scene: &mut Scene, x0: f32, y0: f32, m: CellMetrics, clip_id: u32) -> f32 {
-    draw_icon(scene, Icon::Blaze, x0, y0 + 10.0, 12.0, theme::FIRE, clip_id);
-    scene.text(x0 + 18.0, y0 + 8.0, "blaze-shell", theme::INK_1, true, false, clip_id);
-    scene.text(
-        x0,
-        y0 + 8.0 + m.ch + 8.0,
-        "ls | take 8    ·    sys    ·    rust { (1..=10).sum::<i64>() }",
-        theme::INK_3,
-        false,
-        false,
-        clip_id,
-    );
-    scene.text(
-        x0,
-        y0 + 8.0 + (m.ch + 8.0) * 2.0,
-        "tab complete  ·  ctrl+r history  ·  cmd+b fork  ·  cmd+k clear",
-        theme::INK_4,
-        false,
-        false,
-        clip_id,
-    );
-    (m.ch + 8.0) * 3.0 + 12.0
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1698,34 +1663,28 @@ fn resolve_vt_color(c: VtColor, colors: &Colors, fallback: VtRgb, bold_bright: b
     }
 }
 
-/// Sleek Starship + `ix.dev/blaze` bottom composer: `dir on  branch [?] ✦` above a
-/// recessed rounded `❯ ...` input bar with Fish ghost text and drag-drop highlight.
+/// Live inline Starship prompt flowing directly underneath the last command output:
+/// `folder dir on  branch [?] ✦` followed directly by `❯ <editable input + Fish ghost>`.
+/// Zero separate bottom box; lights up softly as a drop target only when dragging an item.
 #[allow(clippy::too_many_arguments)]
-fn layout_composer(
+fn layout_inline_prompt(
     scene: &mut Scene,
     editor: &Editor,
     prompt: &PromptInfo,
-    vw: f32,
+    x0: f32,
     y0: f32,
-    y1: f32,
-    box_h: f32,
+    x1: f32,
     m: CellMetrics,
+    clip_id: u32,
     cursor_visible: bool,
     drag: Option<&ActiveDrag>,
-) {
+) -> f32 {
     let trimmed = editor.text.trim_start();
     let is_rust_mode = trimmed.starts_with("rust") || trimmed.starts_with(":rs");
     let drop_hover = drag.is_some_and(|d| d.over_composer);
 
-    scene.round_rect(0.0, y0, vw, y1, 0.0, theme::BG_CANVAS, 0.0, [0.0; 4], 0);
-    scene.line(0.0, y0 + 0.5, vw, y0 + 0.5, 1.0, theme::LINE_FAINT, 0);
-
-    let px = OUTER_PAD_X;
-    let x1 = (vw - OUTER_PAD_X).max(px + 160.0);
-    let label_y = y0 + 6.0;
-
-    // Starship prompt line powered by `blaze-git`.
-    layout_starship_line(scene, prompt, px, label_y, (x1 - px) * 0.72, m, 0);
+    // Line 1: Starship context header (`folder dir on  branch [$3] ✦`) + quiet right metadata.
+    layout_starship_line(scene, prompt, x0, y0, (x1 - x0) * 0.72, m, clip_id);
 
     let right_txt = if drop_hover {
         format!("drop `{}` to insert", drag.unwrap().payload.label)
@@ -1747,26 +1706,33 @@ fn layout_composer(
             theme::INK_4
         };
         let rw = right_txt.chars().count() as f32 * m.cw;
-        scene.text(x1 - rw, label_y, right_txt, right_col, false, false, 0);
+        scene.text(x1 - rw, y0, right_txt, right_col, false, false, clip_id);
     }
 
-    // Recessed rounded command box (`#141415` + `1px solid #28282a`, radius 10px).
-    let box_y0 = y0 + 28.0;
-    let box_y1 = (box_y0 + box_h).min(y1 - 12.0);
-    let box_fill = if drop_hover { theme::BG_CHIP } else { theme::BG_SURFACE };
-    let box_border = if drop_hover || is_rust_mode {
-        theme::FIRE
-    } else if drag.is_some() {
-        theme::LINE_STRONG
-    } else {
-        theme::LINE
-    };
-    let border_w = if drop_hover { 1.5 } else { 1.0 };
-    scene.round_rect(px, box_y0, x1, box_y1, 10.0, box_fill, border_w, box_border, 0);
-    scene.composer_rect = HitRect::new(px, box_y0, x1, box_y1);
+    // Line 2+: `❯` prompt + editable syntax-highlighted text + Fish ghost text directly inline.
+    let input_y = y0 + m.ch + 7.0;
+    let line_step = m.ch + 4.0;
+    let num_lines = editor.text.split('\n').count().max(1);
+    let text_h = (num_lines as f32 * line_step - 4.0).max(m.ch);
 
-    let input_y = box_y0 + 11.0;
-    let inner_x = px + 16.0;
+    // Subtle inline drop halo ONLY when dragging an item (`Cargo.lock`, etc.) into the prompt.
+    if drag.is_some() {
+        let halo_border = if drop_hover { theme::FIRE } else { theme::LINE };
+        let halo_fill = if drop_hover { theme::BG_SURFACE } else { [0.0; 4] };
+        let bw = if drop_hover { 1.4 } else { 1.0 };
+        scene.round_rect(
+            x0 - 10.0,
+            input_y - 6.0,
+            x1 + 10.0,
+            input_y + text_h + 6.0,
+            8.0,
+            halo_fill,
+            bw,
+            halo_border,
+            clip_id,
+        );
+    }
+
     let prompt_col = if is_rust_mode {
         theme::FIRE
     } else if prompt.last_exit != 0 {
@@ -1774,12 +1740,16 @@ fn layout_composer(
     } else {
         theme::PROMPT_OK
     };
-    scene.text(inner_x, input_y, "❯", prompt_col, true, false, 0);
+    scene.text(x0, input_y, "❯", prompt_col, true, false, clip_id);
 
-    let text_x = inner_x + 2.2 * m.cw;
+    let text_x = x0 + 2.2 * m.cw;
+    scene.composer_rect = HitRect::new(
+        (x0 - 10.0).max(0.0),
+        input_y - 6.0,
+        x1 + 10.0,
+        input_y + text_h + 8.0,
+    );
     scene.composer_text_origin = [text_x, input_y];
-    let text_clip = scene.push_clip(text_x - 2.0, box_y0 + 2.0, x1 - 14.0, box_y1 - 2.0, 0.0);
-    let line_step = m.ch + 4.0;
 
     if let Some((sel_s, sel_e)) = editor.selection_range() {
         let mut line_start_b = 0usize;
@@ -1793,25 +1763,26 @@ fn layout_composer(
                 let sx0 = text_x + col_s as f32 * m.cw;
                 let sx1 = text_x + col_e as f32 * m.cw;
                 let sy0 = input_y + li as f32 * line_step;
-                scene.round_rect(sx0, sy0, sx1, sy0 + m.ch, 2.0, theme::BG_SELECTION, 0.0, [0.0; 4], text_clip);
+                scene.round_rect(sx0, sy0, sx1, sy0 + m.ch, 2.0, theme::BG_SELECTION, 0.0, [0.0; 4], clip_id);
             }
             line_start_b = line_end_b + 1;
         }
     }
 
-    if editor.text.is_empty() {
+    let rendered_h = if editor.text.is_empty() {
         scene.text(
             text_x,
             input_y,
             "command, pipeline, or rust { ... }",
-            theme::INK_4,
+            theme::GHOST_INK,
             false,
             false,
-            text_clip,
+            clip_id,
         );
+        m.ch
     } else {
         let spans = editor.highlight_spans();
-        layout_highlighted_source(scene, &editor.text, &spans, text_x, input_y, x1 - 16.0, m, text_clip);
+        let h = layout_highlighted_source(scene, &editor.text, &spans, text_x, input_y, x1, m, clip_id);
 
         // Fish/Nushell inline ghost autosuggestion directly after the cursor on single-line input.
         if let Some(ghost) = &editor.ghost
@@ -1819,30 +1790,36 @@ fn layout_composer(
             && editor.cursor == editor.text.len()
         {
             let gx = text_x + editor.text.chars().count() as f32 * m.cw;
-            let avail_ch = ((x1 - 16.0 - gx) / m.cw).floor().max(0.0) as usize;
+            let avail_ch = ((x1 - gx) / m.cw).floor().max(0.0) as usize;
             if avail_ch > 0 {
                 let gtxt = truncate_chars(ghost, avail_ch);
-                scene.text(gx, input_y, gtxt, theme::GHOST_INK, false, false, text_clip);
+                scene.text(gx, input_y, gtxt, theme::GHOST_INK, false, false, clip_id);
             }
         }
-    }
+        h
+    };
 
     if cursor_visible {
         let (cline, ccol) = editor.cursor_line_col();
         let cur_x = text_x + ccol as f32 * m.cw;
         let cur_y = input_y + cline as f32 * line_step;
         let cur_col = if is_rust_mode || drop_hover { theme::FIRE } else { theme::INK_1 };
-        scene.over_round_rect(cur_x, cur_y + 1.0, cur_x + 1.6, cur_y + m.ch - 1.0, 0.8, cur_col, text_clip);
+        scene.over_round_rect(cur_x, cur_y + 1.0, cur_x + 1.8, cur_y + m.ch - 1.0, 0.9, cur_col, clip_id);
     }
+
+    (input_y + rendered_h.max(text_h) - y0) + 4.0
 }
 
-/// IntelliJ-style live autocomplete popup: Retina SVG file/folder icons, typed kind badges,
-/// matched-character highlighting, right-aligned type/size detail, and bottom Quick-Doc strip.
+/// IntelliJ-style live autocomplete popup anchored directly below the inline prompt
+/// (or flipped above it automatically when the prompt is near the bottom of the viewport).
+#[allow(clippy::too_many_arguments)]
 fn layout_completion_popup(
     scene: &mut Scene,
     editor: &Editor,
     x0: f32,
-    anchor_bottom_y: f32,
+    prompt_y0: f32,
+    prompt_y1: f32,
+    vh: f32,
     x1: f32,
     m: CellMetrics,
 ) {
@@ -1866,7 +1843,14 @@ fn layout_completion_popup(
     let desired_x = scene.composer_text_origin[0] + (ccol as f32 * m.cw) - 36.0;
     let px0 = desired_x.clamp(x0, (x1 - popup_w).max(x0));
     let px1 = px0 + popup_w;
-    let py0 = (anchor_bottom_y - popup_h).max(TOP_BAR_H + 8.0);
+
+    // Prefer opening directly BELOW the inline prompt line; flip ABOVE if near window bottom.
+    let below_y0 = prompt_y1 + 6.0;
+    let py0 = if below_y0 + popup_h <= vh - 12.0 {
+        below_y0.max(TOP_BAR_H + 8.0)
+    } else {
+        (prompt_y0 - 8.0 - popup_h).max(TOP_BAR_H + 8.0)
+    };
     let py1 = py0 + popup_h;
 
     scene.overlay_shadow(px0, py0 + 4.0, px1, py1 + 4.0, 8.0, 18.0, theme::SHADOW_SOFT, 0);
@@ -2047,16 +2031,24 @@ fn layout_drag_overlay(scene: &mut Scene, drag: &ActiveDrag, m: CellMetrics) {
     scene.overlay_text_run(cx, y0 + (pill_h - m.ch) * 0.5, label, theme::INK_1, false, false, 0);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn layout_reverse_search_overlay(
     scene: &mut Scene,
     rs: &crate::editor::ReverseSearch,
     x0: f32,
-    anchor_bottom_y: f32,
+    prompt_y0: f32,
+    prompt_y1: f32,
+    vh: f32,
     x1: f32,
     m: CellMetrics,
 ) {
     let h = 36.0;
-    let py0 = (anchor_bottom_y - h).max(TOP_BAR_H + 8.0);
+    let below_y0 = prompt_y1 + 6.0;
+    let py0 = if below_y0 + h <= vh - 12.0 {
+        below_y0.max(TOP_BAR_H + 8.0)
+    } else {
+        (prompt_y0 - 8.0 - h).max(TOP_BAR_H + 8.0)
+    };
     let py1 = py0 + h;
     scene.overlay_shadow(x0, py0 + 4.0, x1, py1 + 4.0, 8.0, 14.0, theme::SHADOW_SOFT, 0);
     scene.overlay_round_rect(
