@@ -751,14 +751,15 @@ fn dir_reserve_crash_faults_and_interleaving_dst() {
                     let slot = if op <= 2 { 0 } else { 1 };
                     let Some(mut actor) = actors[slot].take() else { continue };
                     let Some(effect) = actor.pending.take() else { continue };
-                    if matches!(effect, Effect::Rename { .. }) {
+                    let is_rename = matches!(effect, Effect::Rename { .. });
+                    let done = ask_sim(&mut sim, effect, skip_sync);
+                    if is_rename && matches!(done, Done::Renamed) {
                         actor.renamed_submitted = true;
                         let cand = Some(actor.payload.clone());
                         if !allowed.contains(&cand) {
                             allowed.push(cand);
                         }
                     }
-                    let done = ask_sim(&mut sim, effect, skip_sync);
                     match actor.reserve.answer(done) {
                         Ok(Next::Write(mut mapping)) => {
                             mapping.bytes_mut()[..actor.payload.len()].copy_from_slice(&actor.payload);

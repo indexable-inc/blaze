@@ -1665,7 +1665,10 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
             let Ok(sub) = Path::new(prefix) else {
                 return Err(FsError::new(op, name, FsKind::Driver("invalid path prefix".into())));
             };
-            let _ = prefixes.try_reserve(1);
+            prefixes.try_reserve(1).map_err(|_| {
+                let stopped = Stopped::OutOfMemory { arena: "bstd::fs confined prefixes", asked: size_of::<Path>() };
+                FsError::new(op, name, FsKind::Stopped(stopped))
+            })?;
             prefixes.push(sub);
         }
         let looks = self.looks(cx, prefixes.iter().chain(core::iter::once(path)))?;

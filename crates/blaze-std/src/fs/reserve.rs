@@ -339,14 +339,14 @@ mod tests {
                         continue;
                     };
                     let is_rename = matches!(effect, Effect::Rename { .. });
-                    if is_rename {
+                    let done = ask_sim(&mut sim, effect, plant);
+                    if is_rename && matches!(done, Done::Renamed) {
                         actor.renamed_submitted = true;
                         let cand = Some(actor.payload.clone());
                         if !allowed.contains(&cand) {
                             allowed.push(cand);
                         }
                     }
-                    let done = ask_sim(&mut sim, effect, plant);
                     match actor.reserve.answer(done) {
                         Ok(Next::Write(mut mapping)) => {
                             mapping.bytes_mut()[..actor.payload.len()].copy_from_slice(&actor.payload);
