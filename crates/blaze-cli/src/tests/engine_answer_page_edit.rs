@@ -30,7 +30,8 @@ fn file(group: u32) -> Name {
 fn editing_one_of_fifty_thousand_rows_reads_only_its_file_and_row_pages() {
     let io = Io::simulated(SimWorld::new(31, Limits::USUAL));
     let cx = io.cx(BUDGET, TASK_FRAME).expect("root context");
-    let home = crate::store::Home::of(&cx, &io.need_fs().expect("filesystem"), Some("/h")).expect("home");
+    let fs = io.need_fs().expect("filesystem");
+    let home = crate::store::Home::of(&cx, &fs, Some("/h")).expect("home");
     let heap = blaze_own::testing::heap();
     let alloc = heap.shared();
     let frame = cx.frame();
@@ -39,7 +40,7 @@ fn editing_one_of_fifty_thousand_rows_reads_only_its_file_and_row_pages() {
     let err = io.need_err().expect("stderr");
     let lent = home.open_store(&Settings::default(), crate::store::Facts { boot: Some(1), nonce: 31 }, heap.alloc()).expect("store");
     let mut store = CommandStore::new(&cx, &lent, false, 0, None, clock.clone(), &err, erased.handle()).expect("command store");
-    let journal = crate::journal_sweep::take(&cx, home.dir(), home.dir(), &clock, crate::journal_sweep::Stored::NONE, frame).expect("journal");
+    let journal = crate::journal_sweep::take(&cx, &fs, home.dir(), home.dir(), &clock, crate::journal_sweep::Stored::NONE, frame).expect("journal");
     let lines = crate::engine_lines::Lines::new_in(alloc).record();
     let leaves = Rows::new_in(frame);
     let tools = Tools([Tool(ContentId([3; 32])); blaze_drive::key::KINDS]);

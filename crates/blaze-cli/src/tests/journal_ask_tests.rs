@@ -172,9 +172,10 @@ fn refused_with_helper_place_pairs_cursor_without_replay() {
 
     let io = bstd::io::Io::simulated(bstd::io::SimWorld::new(11, bstd::io::Limits::USUAL));
     let cx = io.cx(bstd::test::BUDGET, 4 << 20).expect("a root context");
-    let root = io.need_fs().expect("fs").root();
+    let fs = io.need_fs().expect("fs");
+    let root = fs.root();
     let clock = io.need_clock().expect("clock");
-    let mut taken = Taken::begin(&cx, &root, &clock, &frame).expect("begin");
+    let mut taken = Taken::begin(&cx, &fs, &root, &clock, &frame).expect("begin");
     taken.refused_with_helper_place(cursor, place.encode());
     assert!(matches!(taken.journal, crate::journal_sweep::JournalUse::Refused(crate::journal_sweep::Refused::NoCursor)));
     let mut out = Vec::new_in(&frame);

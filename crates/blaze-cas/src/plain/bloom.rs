@@ -748,20 +748,8 @@ impl BloomIndex {
         }
     }
 
-    /// Pre-verifies mapped Bloom records for all live local `segments` and `roots` outside the
-    /// exclusive flip lock so compact sidecar rewrites inside `Plain::build` do zero CRC-32C work.
-    pub(crate) fn verify_live(&self, segments: &[Segment], roots: &[Root]) {
-        for seg in segments.iter().filter(|it| it.local) {
-            let _ = self.raw_record(seg);
-        }
-        for root in roots {
-            let want = root_bloom_digest(&root.key);
-            let _ = self.raw_record_digest(&want);
-        }
-    }
-
-    /// Total live byte size of Bloom records for `segments` and `roots` currently indexed.
-    fn live_bytes(&self, segments: &[Segment], roots: &[Root]) -> u64 {
+    /// Total live byte size of Bloom records for `segments` and `root_keys` currently indexed.
+    pub(crate) fn live_bytes_for_keys(&self, segments: &[Segment], root_keys: &[ContentId]) -> u64 {
         let mut live = 0u64;
         for seg in segments.iter().filter(|it| it.local) {
             if let Some(slot) = self.entries.get(&seg.id) {
@@ -773,8 +761,8 @@ impl BloomIndex {
                 live = live.saturating_add(RECORD_HEADER_U64.saturating_add(u64::from(blocks).saturating_mul(BLOCK_BYTES_U64)));
             }
         }
-        for root in roots {
-            let want = root_bloom_digest(&root.key);
+        for root_key in root_keys {
+            let want = root_bloom_digest(root_key);
             if let Some(slot) = self.entries.get(&segment_id_of(&want)) {
                 let blocks = match slot {
                     BloomSlot::Mapped { digest, blocks, .. } if *digest == want => *blocks,
@@ -788,17 +776,29 @@ impl BloomIndex {
     }
 
     /// Whether the on-disk `bloom` file has accumulated enough dead bytes from retired segments
-    /// and roots (more than 2x live + 64 KiB) to warrant rewriting compactly during GC/compaction.
-    pub(crate) fn needs_compact(&self, segments: &[Segment], roots: &[Root]) -> bool {
-        let live = self.live_bytes(segments, roots);
+    /// and roots (more than 2x live + 64 KiB) to warrant rewriting compactly during GC/compaction,
+    /// accounting for `pending_bytes` of newly built records not yet inserted into `self.entries`.
+    pub(crate) fn needs_compact_for(&self, segments: &[Segment], root_keys: &[ContentId], pending_bytes: u64) -> bool {
+        let live = self.live_bytes_for_keys(segments, root_keys).saturating_add(pending_bytes);
         self.mapped_bytes > live.saturating_mul(2).saturating_add(64 << 10)
     }
 
     /// Higher threshold for foreground commits (4x live + 1 MiB) so normal foreground commits
-    /// perform tiny O(1) appends and leave routine `bloom` sidecar compaction to background GC.
-    pub(crate) fn needs_urgent_compact(&self, segments: &[Segment], roots: &[Root]) -> bool {
-        let live = self.live_bytes(segments, roots);
+    /// perform tiny O(1) appends and leave routine `bloom` sidecar compaction to background GC,
+    /// accounting for `pending_bytes` of newly built records not yet inserted into `self.entries`.
+    pub(crate) fn needs_urgent_compact_for(&self, segments: &[Segment], root_keys: &[ContentId], pending_bytes: u64) -> bool {
+        let live = self.live_bytes_for_keys(segments, root_keys).saturating_add(pending_bytes);
         self.mapped_bytes > live.saturating_mul(4).saturating_add(1 << 20)
+    }
+
+    /// Whether the on-disk `bloom` file needs compaction (test convenience wrapper).
+    #[cfg(test)]
+    pub(crate) fn needs_compact(&self, segments: &[Segment], roots: &[Root]) -> bool {
+        let mut keys = Vec::with_capacity_in(roots.len(), BLOOM_ALLOC);
+        for root in roots {
+            keys.push(root.key);
+        }
+        self.needs_compact_for(segments, &keys, 0)
     }
 }
 

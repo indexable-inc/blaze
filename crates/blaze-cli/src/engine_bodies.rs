@@ -178,9 +178,11 @@ fn member_lens(items: &ItemsRecord<'_>, g: blaze_own::Alloc<'static>) -> Vec<(It
 /// A run's frame: its records' decoded parts and its bodies' lowerings (reserved, not touched).
 const BODIES_FRAME: usize = 1 << 30;
 
-/// Direct single-pass listing of a member crate's owed files from `items`, identical in output to
-/// `list_files_with(records, Listing::FnsAndInitializers, owed_files, alloc)` without doing 3
-/// binary searches per item across the entire crate (skips non-owed items in 1 column load).
+/// Direct single-pass listing of a member crate's owed files' file-entry bodies from `items`,
+/// sorted by `(file, body)`: identical to filtering `list_files_with(records,
+/// Listing::FnsAndInitializers, owed_files, alloc)` to `entry.is_some()` and sorting by file,
+/// without redundant `place_of` binary searches or a second copy/sort (`owed_files` must be
+/// sorted ascending).
 fn list_owed_files<'n, 'a>(
     records: &'n blaze_ladder::front2::source::Records<'n>,
     items: &ItemsRecord<'_>,
@@ -193,6 +195,7 @@ fn list_owed_files<'n, 'a>(
     use blaze_scope::resolve::At;
     use blaze_surface::ItemKind;
 
+    let single_file = if owed_files.len() == 1 { owed_files.first().copied() } else { None };
     let mut files: blaze_own::AVec<'a, (u32, Option<&'n str>)> = blaze_own::AVec::with_capacity_in(owed_files.len(), alloc);
     let mut start_in = |file: u32, text: &str| -> Option<u32> {
         let base = match files.iter().find(|(f, _)| *f == file) {
@@ -219,7 +222,11 @@ fn list_owed_files<'n, 'a>(
     for idx in 0..items.items() {
         let Ok(Some(id)) = items.identity_at(idx) else { continue };
         let Some(At::File(file)) = id.at else { continue };
-        if !owed_files.contains(&file) {
+        let wanted = match single_file {
+            Some(only) => file == only,
+            None => owed_files.binary_search(&file).is_ok(),
+        };
+        if !wanted {
             continue;
         }
         let key = id.key;
@@ -230,38 +237,30 @@ fn list_owed_files<'n, 'a>(
                 if !value && it.text.trim_end().ends_with(';') {
                     continue;
                 }
-                let place = NamesSource::place_of(records, key);
-                let file_entry = place.and_then(|p| match p.at {
-                    At::File(f) => Some((f, p.item)),
-                    At::Expansion(_) => None,
-                });
-                let at = file_entry.and_then(|(f, _)| start_in(f, it.text).map(|start| BodyAt { file: f, start }));
-                let entry = if at.is_some() { file_entry } else { None };
-                out.push(Listed { body: BodyRef::Free(key), at, entry });
+                let Some(start) = start_in(file, it.text) else { continue };
+                out.push(Listed { body: BodyRef::Free(key), at: Some(BodyAt { file, start }), entry: Some((file, it.item)) });
             }
             ItemKind::Impl | ItemKind::Trait => {
-                let container_file = NamesSource::place_of(records, key).and_then(|p| match p.at {
-                    At::File(f) => Some(f),
-                    At::Expansion(_) => None,
-                });
                 let is_trait = id.kind == ItemKind::Trait;
                 NamesSource::each_member(records, key, &mut |m| {
                     members.push(m.key);
-                    let member = match (m.kind, m.name) {
+                    if m.written_by.is_some() {
+                        return;
+                    }
+                    let (kind, name) = match (m.kind, m.name) {
                         (ItemKind::Function, Some(name)) => (MemberKind::Fn, name),
                         (ItemKind::Const, Some(name)) => (MemberKind::Const, name),
                         _ => return,
                     };
-                    let (kind, name) = member;
                     if is_trait && kind == MemberKind::Fn && m.text.trim_end().ends_with(';') {
                         return;
                     }
-                    let at = container_file.and_then(|f| start_in(f, m.text).map(|start| BodyAt { file: f, start }));
-                    let entry = match (at, m.written_by) {
-                        (Some(at), None) => Some((at.file, m.item)),
-                        _ => None,
-                    };
-                    out.push(Listed { body: BodyRef::Member { container: key, is_trait, kind, name }, at, entry });
+                    let Some(start) = start_in(file, m.text) else { return };
+                    out.push(Listed {
+                        body: BodyRef::Member { container: key, is_trait, kind, name },
+                        at: Some(BodyAt { file, start }),
+                        entry: Some((file, m.item)),
+                    });
                 });
             }
             _ => {}
@@ -269,7 +268,7 @@ fn list_owed_files<'n, 'a>(
     }
     members.sort_unstable();
     out.retain(|l| !matches!(l.body, BodyRef::Free(k) if members.binary_search(&k).is_ok()));
-    out.sort_unstable_by(|a, b| a.body.cmp(&b.body));
+    out.sort_unstable_by(|a, b| a.entry.map(|(f, _)| f).cmp(&b.entry.map(|(f, _)| f)).then_with(|| a.body.cmp(&b.body)));
     out
 }
 
@@ -3270,11 +3269,26 @@ impl<'s, 'f, 'r> Prepared<'s, 'f, 'r> {
         }
         let mut entries: SVec<'a, &[One<'f>]> = SVec::with_capacity_in(runs.len(), alloc);
         let mut buffers: SVec<'a, (Buffer<'a>, SVec<'a, Ran<'f>>, RunOut<'a>)> = SVec::with_capacity_in(runs.len(), alloc);
+        let ones_by_name: Option<SVec<'a, (Name, usize)>> = if self.ones.len() > 8 && runs.len() > 1 {
+            let mut idx: SVec<'a, (Name, usize)> = SVec::with_capacity_in(self.ones.len(), alloc);
+            idx.extend(self.ones.iter().enumerate().map(|(at, one)| (one.task.planned.name, at)));
+            idx.sort_unstable_by_key(|&(name, _)| name);
+            Some(idx)
+        } else {
+            None
+        };
         for run in runs.into_iter() {
             stage.seeds.add(&run.tally);
             times.job(crate::engine_times::Step::BodiesRun, run.span.0, run.span.1);
             // The run's one entry: its body's `One` (`run_body` runs one, never a slice).
-            let one = run.ran.first().and_then(|ran| self.ones.iter().find(|one| one.task.planned.name == ran.name));
+            let one = run.ran.first().and_then(|ran| match ones_by_name.as_ref() {
+                Some(idx) => idx
+                    .binary_search_by_key(&ran.name, |&(name, _)| name)
+                    .ok()
+                    .and_then(|pos| idx.get(pos))
+                    .and_then(|&(_, at)| self.ones.get(at)),
+                None => self.ones.iter().find(|one| one.task.planned.name == ran.name),
+            });
             entries.push(one.map_or(&[][..], core::slice::from_ref));
             buffers.push((run.out, run.ran, run.findings));
         }
@@ -4363,9 +4377,19 @@ impl<'f> BodiesStage<'f> {
             // and each fn declared in a body its check reached (`RunOut::locals`, in run order).
             for (at, one) in ran.iter().enumerate() {
                 // Its bodies as a program calls them ([`asked_keys`]: a method by its member
-                // key), not each library key's first 16 bytes.
-                let asked: &[blaze_typeck::ItemKey] = runs[run_at].iter().find(|task| task.task.planned.name == one.name).map_or(&[], |task| task.asked);
-                let rules = run_out.found.iter().filter(|found| found.0 == at).map(|found| found.1);
+                // key), not each library key's first 16 bytes. Each run appends `Ran` rows in
+                // exact `runs[run_at]` index order (0..len), so `runs[run_at][at]` is O(1).
+                let run_tasks = runs.get(run_at).copied().unwrap_or(&[]);
+                let matched = run_tasks.get(at).filter(|task| task.task.planned.name == one.name);
+                debug_assert!(
+                    matched.is_some() || run_tasks.iter().all(|task| task.task.planned.name != one.name),
+                    "join_runs expected ran[{at}] ({:?}) to match runs[{run_at}][{at}]",
+                    one.name,
+                );
+                let asked: &[blaze_typeck::ItemKey] = matched.map_or(&[], |task| task.asked);
+                let found_from = run_out.found.partition_point(|found| found.0 < at);
+                let found_to = run_out.found.partition_point(|found| found.0 <= at);
+                let rules = run_out.found.get(found_from..found_to).unwrap_or(&[]).iter().map(|found| found.1);
                 let rule = note_rule(one.said(), true);
                 let class = crate::engine_body_facts::class_of(rule.into_iter().chain(rules));
                 let from = run_out.locals.partition_point(|local| local.0 < at);
@@ -4601,6 +4625,16 @@ impl<'f> BodiesStage<'f> {
                 (_, crate::engine_member_rows::FileHead::Text(_) | crate::engine_member_rows::FileHead::NotOutlined) => None,
             }
         };
+        // Precomputed `(slot, outline_at)` pairs for the owed files, sorted by `slot`, so a
+        // member stood below its heads (`kept_below`) intersects its recorded held files with
+        // `owed` in O(held * log(owed)) without scanning `items.files()`.
+        let mut owed_slots: Vec<(Name, u32), blaze_own::Alloc<'static>> = Vec::with_capacity_in(owed.len(), g);
+        for &outline_at in owed.iter() {
+            if let Some(one) = usize::try_from(outline_at).ok().and_then(|at| handles.outlined.get(at)) {
+                owed_slots.push((one.name, outline_at));
+            }
+        }
+        owed_slots.sort_unstable_by_key(|&(slot, _)| slot);
         loop {
             if handles.board.stopping().is_some() {
                 return Ok(Err(("stopped by signal", &[])));
@@ -4704,39 +4738,80 @@ impl<'f> BodiesStage<'f> {
                     }
                 }
             }
-            // The member's files: what its module tree reaches from its root under what plan
-            // time knows of its `test` (engine_body_plan.rs `reached_under`), the walk the
-            // planner took (the `Owners` fact `check` reads, blaze-drive owners.rs): each is
-            // this member's, checked or refused by name, never in "no crate holds" (rule 3). The
-            // atom is the plan's (engine_plan_cfg.rs `test_atom`), not the script run's answer
-            // this stage has: the walk must be the plan's reach (below).
-            let cuts = plan_cuts.get_or_insert_with(|| crate::engine_plan_cfg::PlanCuts::of(handles.outlined, g));
             // Its found files beside its root (engine_body_plan.rs `FoundEdge`), as the plan's walk took them.
             let found = plan_reach.map_or(&[][..], |plan| plan.found_of(own_name));
-            let reach = crate::engine_body_plan::reached_under(handles.outlined, cuts, crate::engine_body_plan::root_file(&list, member), crate::engine_plan_cfg::test_atom(&list, member), found, g).map_err(EngineCheckError::Unoutlined)?;
-            // The plan named this unit's rows from its reach (engine_body_plan.rs `Reach`): the
-            // walk today must be that reach, or a row would be planned for a file it does not
-            // reach, or none for one it does (the ready plan's reach is the last members
-            // record's: a `mod` the edit moved is this stop, named, rule 3).
-            if let Some(file) = plan_reach.and_then(|plan| plan.disagrees(own_name, &reach)) {
-                return Err(EngineCheckError::ReadyHost {
-                    task: file,
-                    what: "a member's module tree reaches this file, or no longer reaches it, unlike the reach the plan named its body rows from (a `mod` moved since the reach was read: engine_body_plan.rs `Reach`)",
+            // When a member stood below its heads on turn 1 (`again.is_some()`), `stands_below`
+            // already proved its unit, tool, `CrateScope` record, and every moved file's
+            // `entries_of` (including `surface`, every `mod`, and every `#[cfg]`) match the
+            // members record. Unless `row_key_unit_only` is planted or `found` carries an edge
+            // outside the record, verify each recorded slot is outlined (preserving
+            // `ReadsNoVisitedTree`) and reuse the record's reach, held file map, and `row_key`
+            // instead of walking `reached_under` and scanning all `0..items.files()`.
+            let kept_below = match (again.is_some() && !row_key_unit_only, stood_view.as_ref().and_then(|view| view.member(place))) {
+                (true, Some(kept)) => match &kept.state {
+                    rec::MemberState::Held(held)
+                        if found.iter().all(|edge| held.held.iter().any(|h| h.slot == edge.file) || kept.not_held.iter().any(|slot| *slot == edge.file)) =>
+                    {
+                        Some((held, kept.not_held.as_slice()))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            let reach = if let Some((held, not_held)) = kept_below {
+                let root = crate::engine_body_plan::root_file(&list, member);
+                for h in held.held.iter() {
+                    if handles.outlined.binary_search_by(|one| one.name.cmp(&h.slot)).is_err() {
+                        return Err(EngineCheckError::Unoutlined(crate::engine_body_plan::Unoutlined { file: h.slot, root }).into());
+                    }
                 }
-                .into());
-            }
+                for &slot in not_held.iter() {
+                    if handles.outlined.binary_search_by(|one| one.name.cmp(&slot)).is_err() {
+                        return Err(EngineCheckError::Unoutlined(crate::engine_body_plan::Unoutlined { file: slot, root }).into());
+                    }
+                }
+                Vec::new_in(g)
+            } else {
+                // The member's files: what its module tree reaches from its root under what plan
+                // time knows of its `test` (engine_body_plan.rs `reached_under`), the walk the
+                // planner took (the `Owners` fact `check` reads, blaze-drive owners.rs): each is
+                // this member's, checked or refused by name, never in "no crate holds" (rule 3). The
+                // atom is the plan's (engine_plan_cfg.rs `test_atom`), not the script run's answer
+                // this stage has: the walk must be the plan's reach (below).
+                let cuts = plan_cuts.get_or_insert_with(|| crate::engine_plan_cfg::PlanCuts::of(handles.outlined, g));
+                let reach = crate::engine_body_plan::reached_under(handles.outlined, cuts, crate::engine_body_plan::root_file(&list, member), crate::engine_plan_cfg::test_atom(&list, member), found, g).map_err(EngineCheckError::Unoutlined)?;
+                // The plan named this unit's rows from its reach (engine_body_plan.rs `Reach`): the
+                // walk today must be that reach, or a row would be planned for a file it does not
+                // reach, or none for one it does (the ready plan's reach is the last members
+                // record's: a `mod` the edit moved is this stop, named, rule 3).
+                if let Some(file) = plan_reach.and_then(|plan| plan.disagrees(own_name, &reach)) {
+                    return Err(EngineCheckError::ReadyHost {
+                        task: file,
+                        what: "a member's module tree reaches this file, or no longer reaches it, unlike the reach the plan named its body rows from (a `mod` moved since the reach was read: engine_body_plan.rs `Reach`)",
+                    }
+                    .into());
+                }
+                reach
+            };
             // What the members record keeps of a visit: each held file's head parts and each
             // reached file it does not hold, in the order the claims are made.
             let mut held_kept: Vec<rec::Held<'_>, blaze_own::Alloc<'static>> = Vec::new_in(g);
             let mut not_held_kept: Vec<Name, blaze_own::Alloc<'static>> = Vec::new_in(g);
-            let mut refuse_all = |files: &[Name], why: &'static str, reads: &'f [CellId]| member_files.extend(files.iter().map(|file| FileClaim { file: *file, unit, is: FileIs::Refused(why), reads }));
+            let mut refuse_all = |kept_below: Option<(&rec::HeldMember<'_>, &[Name])>, files: &[Name], why: &'static str, reads: &'f [CellId]| {
+                if let Some((held, not_held)) = kept_below {
+                    member_files.extend(held.held.iter().map(|h| FileClaim { file: h.slot, unit, is: FileIs::Refused(why), reads }));
+                    member_files.extend(not_held.iter().map(|&file| FileClaim { file, unit, is: FileIs::Refused(why), reads }));
+                } else {
+                    member_files.extend(files.iter().map(|file| FileClaim { file: *file, unit, is: FileIs::Refused(why), reads }));
+                }
+            };
             let Some(own) = input_at(member) else {
                 // Its crate's own names failed (a build script, its resolution): that failure
                 // is the crate's `CrateScope` row, reported there once; its bodies say so. Read
                 // as it is today: no task defines the crate's names cell (ABSENT), or its task
                 // failed and defines none; the task that comes, or its fix, moves it.
                 let why = if names.failed(own_name) { rec::RefusedWhy::ScopeFailed } else { rec::RefusedWhy::NoNamesTask };
-                refuse_all(&reach, why.words().unwrap_or("its crate has no `Names` task this command (engine_names.rs `plan`)"), own_cells);
+                refuse_all(kept_below, &reach, why.words().unwrap_or("its crate has no `Names` task this command (engine_names.rs `plan`)"), own_cells);
                 if again.is_none() {
                     members_out.member(&rec::Member { at: place, unit: unit_val, state: rec::MemberState::Refused(why), not_held: reach });
                 }
@@ -4761,7 +4836,7 @@ impl<'f> BodiesStage<'f> {
                     Ok(records) => records,
                     Err(error) => {
                         let cause = ScopeRefusal::Records { krate, at: member, error };
-                        refuse_all(&reach, crate::engine_head_notes::leak(heap.alloc(), format_args!("its crate's check scope was not read: {cause}")), own_cells);
+                        refuse_all(kept_below, &reach, crate::engine_head_notes::leak(heap.alloc(), format_args!("its crate's check scope was not read: {cause}")), own_cells);
                         if again.is_none() {
                             members_out.member(&rec::Member { at: place, unit: unit_val, state: rec::MemberState::Refused(rec::RefusedWhy::Unstood), not_held: reach });
                         }
@@ -4776,7 +4851,7 @@ impl<'f> BodiesStage<'f> {
                         own_records
                     }
                     Err(cause) => {
-                        refuse_all(&reach, crate::engine_head_notes::leak(heap.alloc(), format_args!("its crate's check scope was not read: {cause}")), own_cells);
+                        refuse_all(kept_below, &reach, crate::engine_head_notes::leak(heap.alloc(), format_args!("its crate's check scope was not read: {cause}")), own_cells);
                         if again.is_none() {
                             members_out.member(&rec::Member { at: place, unit: unit_val, state: rec::MemberState::Refused(rec::RefusedWhy::Unstood), not_held: reach });
                         }
@@ -4805,54 +4880,71 @@ impl<'f> BodiesStage<'f> {
             let mut files: Vec<(u32, u32), Global> = Vec::new_in(Global);
             // Each file row's head, by index: what the member's listing row is keyed by besides
             // its names record (engine_member_rows.rs `row_key`).
-            let mut file_heads: Vec<crate::engine_member_rows::FileHead, blaze_own::Alloc<'static>> = Vec::with_capacity_in(items.files(), g);
-            for file in 0..u32::try_from(items.files()).unwrap_or(u32::MAX) {
-                if (file & 15) == 0 && handles.board.stopping().is_some() {
-                    return Ok(Err(("stopped by signal", &[])));
-                }
-                let head = 'head: {
-                    let Ok(Some(row)) = items.file_surface(file) else { break 'head crate::engine_member_rows::FileHead::NotOutlined };
-                    let Some(path) = row.path.in_package(list.shown_from(member), g) else { break 'head crate::engine_member_rows::FileHead::NotOutlined };
-                    let Some(path) = path.strip_prefix("/0/") else { break 'head crate::engine_member_rows::FileHead::NotOutlined };
-                    // The outline this unit reaches, of the file's outlines (one a name it is
-                    // planned by: a `mod x;` slot and a `#[path]` to `x/mod.rs` are two).
-                    let Some(at) = crate::engine_body_plan::outline_at_path(handles.outlined, path.as_bytes(), &reach) else {
-                        // A file the request has an outline of but did not read back (the ready
-                        // setup's, [`BodiesStage::unread_outlines`]): the phase path would match
-                        // it, so a `NotOutlined` head here would key the member's row apart from
-                        // the phase path's. The setup's typed refusal, never that row (rule 3).
-                        if S::STANDING
-                            && let Some(unread) = self.unread.as_ref()
-                            && let Some(file) = slot_names(path, g).into_iter().flatten().find(|name| unread.binary_search(name).is_ok())
-                        {
-                            let root = Name::file(list.root(member).strip_prefix("/0/").unwrap_or(list.root(member)).as_bytes());
-                            return Err(EngineCheckError::Unoutlined(crate::engine_body_plan::Unoutlined { file, root }).into());
-                        }
-                        break 'head crate::engine_member_rows::FileHead::NotOutlined
-                    };
-                    files.push((file, u32::try_from(at).unwrap_or(u32::MAX)));
-                    // A member visited at need (piece A) gave its head subjects at its first
-                    // turn, from the record: equal to these (its files' listing facts are).
-                    if again.is_none() {
-                        heads.push(crate::engine_heads::Subject::new(list.key(member).prefix(), file, &handles.outlined[at]));
-                    }
-                    crate::engine_member_rows::FileHead::of(&handles.outlined[at])
-                };
-                file_heads.push(head);
-            }
+            let mut file_heads: Vec<crate::engine_member_rows::FileHead, blaze_own::Alloc<'static>> = Vec::new_in(g);
             // The member's files this phase owes: the only ones outlined and keyed below.
             let mut owed_files: Vec<(u32, u32), blaze_own::Alloc<'static>> = Vec::new_in(g);
-            owed_files.extend(files.iter().copied().filter(|(_, outline)| owed.binary_search(outline).is_ok()));
             // THE MEMBER'S LISTING ROW (engine_member_rows.rs, D149 piece I1): what the rest of
             // its whole listing was for (the bodies a macro wrote, of blocks, the uncovered
             // note), keyed by its unit, its names record, its files' texts and the tool: all
             // known from its own names record, so its stored row is read before its scope is
             // asked for. Its snapshot's refusal is raised below, only where the row is asked of.
-            let row_key = if row_key_unit_only {
-                // The planted control: no names record's `out`, no file's head.
-                crate::engine_member_rows::row_key(&crate::engine_member_rows::RowKey { unit: own_name, names: Input { out: blaze_drive::key::ABSENT, ..own }, files: &[], tool: handles.tool })
+            let row_key = if let Some((held, _)) = kept_below {
+                for h in held.held.iter() {
+                    if let Ok(idx) = owed_slots.binary_search_by_key(&h.slot, |&(slot, _)| slot)
+                        && let Some(&(_, outline_at)) = owed_slots.get(idx)
+                    {
+                        owed_files.push((h.file, outline_at));
+                    }
+                }
+                held.row
             } else {
-                crate::engine_member_rows::row_key(&crate::engine_member_rows::RowKey { unit: own_name, names: own, files: &file_heads, tool: handles.tool })
+                file_heads.reserve(items.files());
+                for file in 0..u32::try_from(items.files()).unwrap_or(u32::MAX) {
+                    if (file & 15) == 0 && handles.board.stopping().is_some() {
+                        return Ok(Err(("stopped by signal", &[])));
+                    }
+                    let head = 'head: {
+                        let Ok(Some(row)) = items.file_surface(file) else { break 'head crate::engine_member_rows::FileHead::NotOutlined };
+                        let Some(path) = row.path.in_package(list.shown_from(member), g) else { break 'head crate::engine_member_rows::FileHead::NotOutlined };
+                        let Some(path) = path.strip_prefix("/0/") else { break 'head crate::engine_member_rows::FileHead::NotOutlined };
+                        // The outline this unit reaches, of the file's outlines (one a name it is
+                        // planned by: a `mod x;` slot and a `#[path]` to `x/mod.rs` are two).
+                        let Some(at) = crate::engine_body_plan::outline_at_path(handles.outlined, path.as_bytes(), &reach) else {
+                            // A file the request has an outline of but did not read back (the ready
+                            // setup's, [`BodiesStage::unread_outlines`]): the phase path would match
+                            // it, so a `NotOutlined` head here would key the member's row apart from
+                            // the phase path's. The setup's typed refusal, never that row (rule 3).
+                            if S::STANDING
+                                && let Some(unread) = self.unread.as_ref()
+                                && let Some(file) = slot_names(path, g).into_iter().flatten().find(|name| unread.binary_search(name).is_ok())
+                            {
+                                let root = Name::file(list.root(member).strip_prefix("/0/").unwrap_or(list.root(member)).as_bytes());
+                                return Err(EngineCheckError::Unoutlined(crate::engine_body_plan::Unoutlined { file, root }).into());
+                            }
+                            break 'head crate::engine_member_rows::FileHead::NotOutlined
+                        };
+                        files.push((file, u32::try_from(at).unwrap_or(u32::MAX)));
+                        // A member visited at need (piece A) gave its head subjects at its first
+                        // turn, from the record: equal to these (its files' listing facts are).
+                        if again.is_none()
+                            && let Some(one) = handles.outlined.get(at)
+                        {
+                            heads.push(crate::engine_heads::Subject::new(list.key(member).prefix(), file, one));
+                        }
+                        match handles.outlined.get(at) {
+                            Some(one) => crate::engine_member_rows::FileHead::of(one),
+                            None => crate::engine_member_rows::FileHead::NotOutlined,
+                        }
+                    };
+                    file_heads.push(head);
+                }
+                owed_files.extend(files.iter().copied().filter(|(_, outline)| owed.binary_search(outline).is_ok()));
+                if row_key_unit_only {
+                    // The planted control: no names record's `out`, no file's head.
+                    crate::engine_member_rows::row_key(&crate::engine_member_rows::RowKey { unit: own_name, names: Input { out: blaze_drive::key::ABSENT, ..own }, files: &[], tool: handles.tool })
+                } else {
+                    crate::engine_member_rows::row_key(&crate::engine_member_rows::RowKey { unit: own_name, names: own, files: &file_heads, tool: handles.tool })
+                }
             };
             let probed = snapshot.get(row_key).map(|got| got.map(|bytes| crate::engine_member_rows::open(bytes, g)));
             tally.parts.files_ns = tally.parts.files_ns.saturating_add(lap(handles.clock, &mut member_mark));
@@ -4887,7 +4979,7 @@ impl<'f> BodiesStage<'f> {
                     Err(cause) => {
                         // As the oracle arm refuses it: before any claim or head subject of it.
                         heads.truncate(heads_at);
-                        refuse_all(&reach, crate::engine_head_notes::leak(heap.alloc(), format_args!("its crate's check scope was not read: {cause}")), own_cells);
+                        refuse_all(kept_below, &reach, crate::engine_head_notes::leak(heap.alloc(), format_args!("its crate's check scope was not read: {cause}")), own_cells);
                         if again.is_none() {
                             members_out.member(&rec::Member { at: place, unit: unit_val, state: rec::MemberState::Refused(rec::RefusedWhy::Unstood), not_held: reach });
                         }
@@ -4944,11 +5036,11 @@ impl<'f> BodiesStage<'f> {
                 member_files.push(FileClaim { file: *file, unit, is: FileIs::NotHeld, reads: own_cells });
                 not_held_kept.push(*file);
             }
-            held_kept.extend(files.iter().map(|&(file, at)| {
-                let one = &handles.outlined[at as usize];
-                rec::Held { file, slot: one.name, path: one.path.as_slice(), entries: crate::engine_listing_record::entries_of(one) }
-            }));
             if again.is_none() {
+                held_kept.extend(files.iter().filter_map(|&(file, at)| {
+                    let one = usize::try_from(at).ok().and_then(|idx| handles.outlined.get(idx))?;
+                    Some(rec::Held { file, slot: one.name, path: one.path.as_slice(), entries: crate::engine_listing_record::entries_of(one) })
+                }));
                 tally.files = tally.files.saturating_add(u32::try_from(files.len()).unwrap_or(u32::MAX));
             }
             tally.files_owed =tally.files_owed.saturating_add(u32::try_from(owed_files.len()).unwrap_or(u32::MAX));
@@ -5152,10 +5244,10 @@ impl<'f> BodiesStage<'f> {
                 // below, in the walk's one outline of the file).
                 let mut owed_in: Vec<u32, blaze_own::Alloc<'static>> = Vec::with_capacity_in(owed_files.len(), g);
                 owed_in.extend(owed_files.iter().map(|(file, _)| *file));
-                let listed = list_owed_files(records, &items, &owed_in, g);
-                let mut mine: blaze_own::AVec<'_, blaze_ladder::front2::project_records::Listed<'_>> = blaze_own::AVec::new_in(g);
-                mine.extend(listed.iter().copied().filter(|l| l.entry.is_some_and(|(f, _)| owed_in.contains(&f))));
-                mine.sort_unstable_by_key(|l| l.entry.map(|(f, _)| f));
+                if owed_in.len() > 1 {
+                    owed_in.sort_unstable();
+                }
+                let mine = list_owed_files(records, &items, &owed_in, g);
                 // The unit's cfg, as the names library lowered the crate (body_types.rs
                 // `Checker::holds`): what tells an entry a `cfg` left out from one the records
                 // lost ([`absent_entry`]).
@@ -6361,6 +6453,39 @@ impl<'d, 'a, 'b, 'f> StretchDriver<'d, 'a, 'b, 'f> {
         }
     }
 
+    /// Whether this stretch can check 2 or more body items and therefore benefits from reserving
+    /// [`HEADS_STRETCH_FRAME`] (`StretchStore`) to reuse frozen heads across bodies. A 1-body
+    /// incremental edit (`items <= 1`) skips the 512 MiB `mmap`/`munmap` completely.
+    fn wants_stretch_store(&self, group_bodies: u32) -> bool {
+        match self {
+            StretchDriver::Fixed { run, at, .. } => {
+                let mut count = 0usize;
+                for one in run.get(*at..).unwrap_or(&[]) {
+                    count = count.saturating_add(one.items.len());
+                    if count >= 2 {
+                        return true;
+                    }
+                }
+                false
+            }
+            StretchDriver::Stealing { runs, current, .. } => {
+                if group_bodies >= 2 {
+                    return true;
+                }
+                let Some((item, offset)) = current.as_ref() else { return false };
+                let Some(run) = runs.get(item.at) else { return false };
+                let mut count = 0usize;
+                for one in run.get(*offset..).unwrap_or(&[]) {
+                    count = count.saturating_add(one.items.len());
+                    if count >= 2 {
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+    }
+
     fn refuse_current<R: ?Sized + CellDigests>(
         &mut self,
         why: &'static str,
@@ -7082,7 +7207,7 @@ fn run_stretch_with<'d, 'a, 'b, 'f, R: ?Sized + CellDigests>(
         lang_ns: ns_between(set_heads, set_lang),
         owners_ns: ns_between(set_lang, set_done),
     });
-    let mut stretch_store = if body_frame.heads.is_some() {
+    let mut stretch_store = if body_frame.heads.is_some() && driver.wants_stretch_store(group.bodies) {
         match StretchStore::new(StretchStoreOpts {
             reserve: HEADS_STRETCH_FRAME,
             cap: HEADS_STRETCH_CAP,

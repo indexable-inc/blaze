@@ -271,6 +271,9 @@ impl<'a> ReadGrains<'a> {
         let mut record = blaze_own::Vec::with_capacity_in(GRAINS_HEAD + n, alloc.local());
         record.extend_from_slice(GRAINS_MAGIC);
         record.extend_from_slice(&from.graph_out.0);
+        // `made_at` must advance with every saved answer serial so the next request's
+        // `stored_facts` (`made == from.last_serial`) still rejects a BRG2 record left stale by an
+        // intervening request that modified `CrateScope`/`ImplBucket` and saved without running `Bodies`.
         record.extend_from_slice(&from.last_serial.saturating_add(1).to_le_bytes());
         record.extend_from_slice(&line.crates.to_le_bytes());
         // The crate cells byte, set below once it is known.
@@ -279,13 +282,17 @@ impl<'a> ReadGrains<'a> {
         let mut crates = blaze_own::Vec::with_capacity_in(n, alloc.local());
         let mut prefixes = blaze_own::Vec::with_capacity_in(n, alloc.local());
         let no_entered = from.entered.is_empty();
-        for at in 0..n {
-            let key = list.key(at);
-            let is_member = list.member(at);
-            // Of the graph's record alone: whether the graph could settle this crate. Short-circuit
-            // members, refused crates, build-script crates and proc macros before parsing the root
-            // tree index string.
-            let candidate = !is_member && !list.refused(at) && list.script(at).is_none() && !list.proc_macro(at) && {
+        let copy_held = no_entered && stored.is_ok();
+        if let Ok((_, held)) = stored
+            && copy_held
+        {
+            record.extend_from_slice(held);
+        }
+        // Of the graph's record alone: whether the graph could settle crate `at`. Short-circuits
+        // members, refused crates, build-script crates and proc macros before parsing the root
+        // tree index string.
+        let is_candidate = |at: usize, is_member: bool| -> bool {
+            !is_member && !list.refused(at) && list.script(at).is_none() && !list.proc_macro(at) && {
                 // A tree is one-based in the checked crate list. The pack's kind distinguishes
                 // registry archives from git records (both have PackOrigin::Source); it is the tree
                 // row's (crate_list.rs `TreeRow::kind`, version 7), so no pack is mapped here.
@@ -295,17 +302,22 @@ impl<'a> ReadGrains<'a> {
                 matches!((list.toolchain(at), origin),
                     (true, Some((PackOrigin::Shelf { .. }, blaze_fetch::pack::Kind::Tree)))
                     | (false, Some((PackOrigin::Source { .. }, blaze_fetch::pack::Kind::Crate))))
-            };
+            }
+        };
+        let mut any_settled = false;
+        for at in 0..n {
+            let key = list.key(at);
+            let is_member = list.member(at);
             let mut cached_names: Option<(Name, Name)> = None;
-            let facts = match stored {
-                Ok((_, held)) if no_entered => held.get(at).copied().unwrap_or(0),
+            let (facts, candidate_opt) = match stored {
+                Ok((_, held)) if no_entered => (held.get(at).copied().unwrap_or(0), None),
                 _ => {
                     let scope = crate_scope_name(&key);
                     let tables = blaze_ladder::front2::buckets::impl_tables_name(key);
                     cached_names = Some((scope, tables));
                     let moved = |name: &Name| from.entered.binary_search(name).is_ok();
                     match stored {
-                        Ok((_, held)) if !moved(&scope) && !moved(&tables) => held.get(at).copied().unwrap_or(0),
+                        Ok((_, held)) if !moved(&scope) && !moved(&tables) => (held.get(at).copied().unwrap_or(0), None),
                         _ => {
                             line.refreshed += 1;
                             let mut facts = 0u8;
@@ -313,48 +325,60 @@ impl<'a> ReadGrains<'a> {
                             if view.cell(&CellId { of: scope, cell: CELLS }) != ABSENT {
                                 facts |= CELL_TABLE;
                             }
-                            if candidate && facts & CELL_TABLE == 0 {
-                                line.answer_reads += 1;
-                                if view.row_failed(scope) == Some(false) {
-                                    facts |= NAMES_STAND;
-                                    // Read wherever the graph could settle the crate (not only where it
-                                    // does): a dependency's facts moving settles or unsettles this one
-                                    // with no task of its own entered.
+                            let candidate = if facts & CELL_TABLE == 0 {
+                                let cand = is_candidate(at, is_member);
+                                if cand {
                                     line.answer_reads += 1;
-                                    if view.row_failed(tables) == Some(false) {
-                                        facts |= TABLES_STAND;
+                                    if view.row_failed(scope) == Some(false) {
+                                        facts |= NAMES_STAND;
+                                        // Read wherever the graph could settle the crate (not only where it
+                                        // does): a dependency's facts moving settles or unsettles this one
+                                        // with no task of its own entered.
+                                        line.answer_reads += 1;
+                                        if view.row_failed(tables) == Some(false) {
+                                            facts |= TABLES_STAND;
+                                        }
                                     }
                                 }
-                            }
-                            facts
+                                Some(cand)
+                            } else {
+                                Some(false)
+                            };
+                            (facts, candidate)
                         }
                     }
                 }
             };
-            record.push(facts);
+            if !copy_held {
+                record.push(facts);
+            }
             let cells = facts & CELL_TABLE != 0;
+            let is_settled = !cells && facts & NAMES_STAND != 0 && candidate_opt.unwrap_or_else(|| is_candidate(at, is_member));
+            any_settled |= is_settled;
             crates.push((key, cached_names, is_member, cells, facts & TABLES_STAND != 0));
-            settled.push(candidate && !cells && facts & NAMES_STAND != 0);
+            settled.push(is_settled);
             prefixes.push((u64::from_ne_bytes(key.prefix()), at));
         }
         // An immutable archive can resolve a path through a patched dependency or import
         // names generated by its build script. Its derived records then have a mutable input.
         // Each changing pass removes at least one of the n candidates.
-        for _ in 0..n {
-            let mut changed = false;
-            let sysroot_settled = list.sysroot().into_iter().flatten().all(|dep| settled.get(dep).copied().unwrap_or(false));
-            for at in 0..n {
-                if settled.get(at).copied().unwrap_or(false)
-                    && (list.deps(at).any(|dep| !settled.get(dep).copied().unwrap_or(false))
-                        || (list.side(at) == Side::Target && !sysroot_settled))
-                {
-                    if let Some(slot) = settled.get_mut(at) {
-                        *slot = false;
+        if any_settled {
+            for _ in 0..n {
+                let mut changed = false;
+                let sysroot_settled = list.sysroot().into_iter().flatten().all(|dep| settled.get(dep).copied().unwrap_or(false));
+                for at in 0..n {
+                    if settled.get(at).copied().unwrap_or(false)
+                        && (list.deps(at).any(|dep| !settled.get(dep).copied().unwrap_or(false))
+                            || (list.side(at) == Side::Target && !sysroot_settled))
+                    {
+                        if let Some(slot) = settled.get_mut(at) {
+                            *slot = false;
+                        }
+                        changed = true;
                     }
-                    changed = true;
                 }
+                if !changed { break }
             }
-            if !changed { break }
         }
         // Whether the graph defines a cell per crate (engine_units.rs `CRATE_CELLS`): a function
         // of the graph's record alone, so taken from the stored record with the facts (that

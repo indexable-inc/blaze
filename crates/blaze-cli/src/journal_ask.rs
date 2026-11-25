@@ -262,10 +262,40 @@ fn paired_place(stored: Stored<'_>) -> Option<Place> {
     checkout.then(|| stored.helper_place()).flatten().and_then(|bytes| Place::decode(&bytes))
 }
 
+/// Maximum stored leaf-table rows for which a direct batched `getattrlistbulk` sweep (`0.2–3 ms`)
+/// is strictly faster than opening a cold `FSEventStream` (`26–160 ms` waiting on `fseventsd`
+/// `HistoryDone`) when no journal helper vouched. Above this count, a fallback journal replay
+/// beats statting every leaf.
+pub(crate) const SMALL_CHECKOUT_LEAVES: usize = 1024;
+
+/// Whether a fallback OS journal replay (`FSEventStream`) should be skipped in favor of a direct
+/// batched stat sweep when the journal helper did not vouch.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ReplayPolicy {
+    /// Always replay on fallback (simulated worlds and explicit replay tests).
+    Always,
+    /// Real OS checkout: `Some(n)` stored leaves from the loaded pointer, or `None` on a cold
+    /// check with no stored pointer yet.
+    Auto { stored_leaves: Option<usize> },
+}
+
+impl ReplayPolicy {
+    /// Pure sans-IO decision: whether to skip `Taken::replay_checkout` when the helper did not
+    /// vouch.
+    pub(crate) fn skip_fallback_replay(self, has_stored_cursor: bool, started_helper: bool) -> bool {
+        match self {
+            ReplayPolicy::Always => false,
+            ReplayPolicy::Auto { stored_leaves: Some(leaves) } => leaves <= SMALL_CHECKOUT_LEAVES,
+            ReplayPolicy::Auto { stored_leaves: None } => !has_stored_cursor && started_helper,
+        }
+    }
+}
+
 /// The command asks the helper ([`ChangedSince`]): the module's `Asked`.
 pub(crate) struct Asked<'a> {
     pub(crate) me: Me,
     pub(crate) start: HelperStart<'a>,
+    pub(crate) replay: ReplayPolicy,
 }
 
 /// The command asks the helper, then replays, and compares: the module's `Both`.
@@ -276,22 +306,28 @@ pub(crate) struct Both<'a> {
 }
 
 /// The strategy the command ships with: ask the detached helper directly, falling back to a
-/// replay only when no helper vouches.
+/// replay only when no helper vouches and the checkout is large enough to beat a direct sweep.
 pub(crate) type Shipped<'a> = Asked<'a>;
 
 impl ChangedSince for Asked<'_> {
     const NAME: &'static str = "asked";
 
     fn changed_since<'f>(
-        &self, cx: &Cx, root: &Dir<ReadWrite>, home: &Dir<ReadWrite>, clock: &Clock, stored: Stored<'_>, frame: &'f Frame,
+        &self, cx: &Cx, fs: &bstd::fs::Fs, root: &Dir<ReadWrite>, home: &Dir<ReadWrite>, clock: &Clock, stored: Stored<'_>, frame: &'f Frame,
     ) -> Result<Taken<'f>, CliError> {
         let cx = cx.span("sweep: the changes since the stored answer's place, asked of the journal helper");
         let cx = cx.until(clock.after(JOURNAL_WAIT));
-        let mut taken = Taken::begin(&cx, root, clock, frame)?;
+        let mut taken = Taken::begin_for(&cx, fs, root, clock, stored, frame)?;
         let asked = ask(&cx, home, clock, self.me, paired_place(stored), frame)?;
         // Spawn a detached helper before any fallback replay so helper startup overlaps with the
         // replay instead of running serially after it.
         let started = self.start.maybe_start(&cx, &asked.outcome);
+        #[cfg(unix)]
+        let started_helper = matches!(started, StartedHelper::Started(_));
+        #[cfg(not(unix))]
+        let started_helper = false;
+        let skip_replay = self.replay.skip_fallback_replay(stored.has_checkout_cursor(), started_helper);
+        let mut replayed = false;
         let names = match asked.outcome {
             Outcome::Answered { answer: AskAnswer::Vouched { place, journal, .. }, names } => match Cursor::decode(journal.as_bytes()) {
                 Some(cursor) => {
@@ -301,31 +337,45 @@ impl ChangedSince for Asked<'_> {
                 }
                 None => {
                     // A journal place that is not a cursor: the answer cannot be paired.
-                    taken.replay_checkout(&cx, clock, root, stored);
+                    if skip_replay {
+                        taken.refused_without_replay();
+                    } else {
+                        taken.replay_checkout(&cx, clock, root, stored);
+                        replayed = true;
+                    }
                     None
                 }
             },
             Outcome::Answered { answer: AskAnswer::CannotVouch { place, journal, .. }, .. } => {
-                // When no checkout cursor was stored and the helper already flushed its stream to a
-                // valid `(place, cursor)` pair, replaying from `Cursor::None` would unconditionally
-                // refuse with `NoCursor` and immediately overwrite the cursor with `pair_refused`.
-                if !stored.has_checkout_cursor()
+                // When no checkout cursor was stored (or the checkout is small enough that a
+                // direct batched stat sweep beats a 26–160 ms FSEvents stream) and the helper
+                // already flushed its stream to a valid `(place, cursor)` pair, save that pair
+                // directly without opening a redundant OS journal stream.
+                if (!stored.has_checkout_cursor() || skip_replay)
                     && let (Some(place), Some(cursor)) = (place, Cursor::decode(journal.as_bytes()))
                 {
                     taken.refused_with_helper_place(cursor, place.encode());
+                } else if skip_replay {
+                    taken.refused_without_replay();
                 } else {
                     taken.replay_checkout(&cx, clock, root, stored);
+                    replayed = true;
                     pair_refused(&mut taken, place, journal);
                 }
                 None
             }
             Outcome::NotAsked { .. } | Outcome::NotPrivate(_) | Outcome::TooLong(_) => {
-                taken.replay_checkout(&cx, clock, root, stored);
+                if skip_replay {
+                    taken.refused_without_replay();
+                } else {
+                    taken.replay_checkout(&cx, clock, root, stored);
+                    replayed = true;
+                }
                 None
             }
         };
         let counted = names.map(|names| u32::try_from(names.len()).unwrap_or(u32::MAX));
-        taken.said(HelperRow { by: Self::NAME, ask_ns: asked.ns, names: counted, differ: None, said: said_of(&asked, &started, None) });
+        taken.said(HelperRow { by: Self::NAME, ask_ns: asked.ns, names: counted, differ: None, said: said_of(&asked, &started, None, replayed) });
         Ok(taken)
     }
 }
@@ -334,11 +384,11 @@ impl ChangedSince for Both<'_> {
     const NAME: &'static str = "both: asked, then replayed";
 
     fn changed_since<'f>(
-        &self, cx: &Cx, root: &Dir<ReadWrite>, home: &Dir<ReadWrite>, clock: &Clock, stored: Stored<'_>, frame: &'f Frame,
+        &self, cx: &Cx, fs: &bstd::fs::Fs, root: &Dir<ReadWrite>, home: &Dir<ReadWrite>, clock: &Clock, stored: Stored<'_>, frame: &'f Frame,
     ) -> Result<Taken<'f>, CliError> {
         let cx = cx.span("sweep: the changes since the stored answer's place, asked of the journal helper and replayed");
         let cx = cx.until(clock.after(JOURNAL_WAIT));
-        let mut taken = Taken::begin(&cx, root, clock, frame)?;
+        let mut taken = Taken::begin_for(&cx, fs, root, clock, stored, frame)?;
         // The ask FIRST: the replay then ends after the helper's journal place (the module's
         // doc), so the union covers every write up to the place saved.
         let asked = ask(&cx, home, clock, self.me, paired_place(stored), frame)?;
@@ -353,7 +403,7 @@ impl ChangedSince for Both<'_> {
         let (differ_counts, said) = {
             let differs = vouched.zip(taken.replayed_names()).map(|(names, replayed)| differ(names, replayed, frame));
             let counts = differs.as_ref().map(|it| (u32::try_from(it.only_helper.len()).unwrap_or(u32::MAX), u32::try_from(it.only_replay.len()).unwrap_or(u32::MAX)));
-            (counts, said_of(&asked, &started, differs.as_ref()))
+            (counts, said_of(&asked, &started, differs.as_ref(), true))
         };
         match asked.outcome {
             Outcome::Answered { answer: AskAnswer::Vouched { place, journal, .. }, names } => {
@@ -647,29 +697,34 @@ fn covered(sorted: &[&str], path: &str) -> bool {
 const SHOWN: usize = 3;
 
 /// What the line says of one ask.
-fn said_of(asked: &AskedOnce<'_>, started: &StartedHelper, differs: Option<&Differ<'_, '_>>) -> Said {
+fn said_of(asked: &AskedOnce<'_>, started: &StartedHelper, differs: Option<&Differ<'_, '_>>, replayed: bool) -> Said {
     let mut said = Said::of(format_args!(""));
-    let _cut = write_said(&mut said, asked, started, differs);
+    let _cut = write_said(&mut said, asked, started, differs, replayed);
     said
 }
 
-fn write_said(out: &mut Said, asked: &AskedOnce<'_>, started: &StartedHelper, differs: Option<&Differ<'_, '_>>) -> core::fmt::Result {
+fn write_said(out: &mut Said, asked: &AskedOnce<'_>, started: &StartedHelper, differs: Option<&Differ<'_, '_>>, replayed: bool) -> core::fmt::Result {
     use core::fmt::Write as _;
+    let fallback = if replayed { "replayed" } else { "skipped replay (direct sweep)" };
     match &asked.outcome {
         Outcome::Answered { answer: AskAnswer::Vouched { since: from, place, journal }, .. } => {
             write!(out, "from place {from} to {place} (its journal's place {} bytes)", journal.as_bytes().len())?
         }
         Outcome::Answered { answer: AskAnswer::CannotVouch { why, place, .. }, .. } => {
-            write!(out, "{why}; replayed from the journal's place kept beside the helper's")?;
+            if replayed {
+                write!(out, "{why}; replayed from the journal's place kept beside the helper's")?;
+            } else {
+                write!(out, "{why}; skipped replay (direct sweep)")?;
+            }
             if let Some(place) = place {
                 write!(out, "; saved its new place {place}")?;
             }
         }
         Outcome::NotAsked { why, .. } => {
-            write!(out, "not asked: {why}; replayed")?;
+            write!(out, "not asked: {why}; {fallback}")?;
         }
-        Outcome::NotPrivate(why) => write!(out, "not asked: {why}; replayed")?,
-        Outcome::TooLong(fits) => write!(out, "not asked: {fits}; replayed (no helper can listen there)")?,
+        Outcome::NotPrivate(why) => write!(out, "not asked: {why}; {fallback}")?,
+        Outcome::TooLong(fits) => write!(out, "not asked: {fits}; {fallback} (no helper can listen there)")?,
     }
     match started {
         StartedHelper::NotWanted => {}
@@ -708,3 +763,44 @@ fn write_said(out: &mut Said, asked: &AskedOnce<'_>, started: &StartedHelper, di
 #[cfg(test)]
 #[path = "tests/journal_ask_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod replay_policy_tests {
+    use super::*;
+
+    #[test]
+    fn small_checkouts_skip_fallback_replay_while_large_and_simulated_keep_it() {
+        assert!(!ReplayPolicy::Always.skip_fallback_replay(false, true));
+        assert!(!ReplayPolicy::Always.skip_fallback_replay(true, false));
+
+        let small = ReplayPolicy::Auto { stored_leaves: Some(SMALL_CHECKOUT_LEAVES) };
+        assert!(small.skip_fallback_replay(true, false));
+        assert!(small.skip_fallback_replay(false, false));
+
+        let large = ReplayPolicy::Auto { stored_leaves: Some(SMALL_CHECKOUT_LEAVES + 1) };
+        assert!(!large.skip_fallback_replay(true, false));
+        assert!(!large.skip_fallback_replay(false, true));
+
+        let cold = ReplayPolicy::Auto { stored_leaves: None };
+        assert!(cold.skip_fallback_replay(false, true));
+        assert!(!cold.skip_fallback_replay(false, false));
+        assert!(!cold.skip_fallback_replay(true, true));
+    }
+
+    #[test]
+    fn refused_without_replay_leaves_empty_cursor_and_refused_journal() {
+        let frame = Frame::with_reserve(crate::engine_check::REQUEST_FRAME, bstd::mem::Tag::Other).expect("frame");
+        let io = bstd::io::Io::simulated(bstd::io::SimWorld::new(17, bstd::io::Limits::USUAL));
+        let cx = io.cx(bstd::test::BUDGET, 4 << 20).expect("root cx");
+        let fs = io.need_fs().expect("fs");
+        let root = fs.root();
+        let clock = io.need_clock().expect("clock");
+        let mut taken = Taken::begin(&cx, &fs, &root, &clock, &frame).expect("begin");
+        taken.refused_without_replay();
+        assert!(matches!(taken.journal, crate::journal_sweep::JournalUse::Refused(crate::journal_sweep::Refused::NoCursor)));
+        let mut out = Vec::new_in(&frame);
+        taken.encode(&mut out);
+        let stored = Stored::of(&out).expect("encoded");
+        assert!(!stored.has_checkout_cursor());
+    }
+}

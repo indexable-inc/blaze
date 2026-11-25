@@ -12,10 +12,10 @@ use bstd::path::Path;
 use bstd::test::BUDGET;
 
 use super::{
-    AUX_EXPIRY_NS, AuxSweepPlant, CACHE_EXPIRY_NS, DEFAULT_BUDGET, GcError, GcOpts, ORPHAN_GRACE_NS,
-    PidProbe, PidState, VIEWER_DEAD_GRACE_NS, parse_args, parse_budget_values, parse_hex_32,
-    parse_meta_pid, parse_pid_prefix, run_with, should_sweep_run, sweep_aux_with,
-    sweep_toolchain_packs, try_acquire_gc_lock,
+    AUX_EXPIRY_NS, AuxCaps, AuxSweepPlant, CACHE_EXPIRY_NS, DEFAULT_BUDGET, GcError, GcOpts,
+    ORPHAN_GRACE_NS, PidProbe, PidState, VIEWER_DEAD_GRACE_NS, parse_args, parse_budget_values,
+    parse_hex_32, parse_meta_pid, parse_pid_prefix, run_with, should_sweep_run, sweep_aux_with,
+    sweep_aux_with_caps, sweep_toolchain_packs, try_acquire_gc_lock,
 };
 use crate::CliError;
 use crate::store::plain_place::{Facts, STORE_DIR, STORE_ROOT};
@@ -445,4 +445,65 @@ fn gc_sweeps_native_work_caches_and_superseded_toolchain_packs_preserving_active
     // 4. Planted bug control (rule 43): ignoring active toolchain pack set deletes active pack + manifest.
     let planted = sweep_toolchain_packs(&cx, home.dir(), pinned, after_30d, false, AuxSweepPlant::IgnoreActiveToolchain);
     assert_eq!(planted.files, 2, "planted bug must delete pinned manifest + active pack to prove oracle");
+}
+
+#[test]
+fn gc_aux_size_budget_lru_evicts_oldest_and_preserves_newest_and_live_jobs() {
+    use core::time::Duration;
+    use bstd::fs::{Content, Durable};
+
+    let io = Io::simulated(SimWorld::new(76, Limits::USUAL));
+    let cx = io.cx(BUDGET, TASK_FRAME).expect("root cx");
+    let fs = io.need_fs().expect("fs");
+    let clock = io.need_clock().expect("clock");
+    let home = Home::of(&cx, &fs, Some("/h")).expect("home");
+    let put = |rel: &str, bytes: &[u8]| {
+        home.dir().publish(&cx, &Path::new(rel).expect("path"), Content::bytes(bytes), Durable::No).expect("publish");
+    };
+
+    // Seed 3 age-ordered entries (100 bytes each = 300 bytes total) in each of the 3 capped aux
+    // directories, all fresh (< 7 days old), plus a live jobserver FIFO under `native-work/.../jobs`.
+    put("v2/build-script/files/dir-old/a.bin", &[1u8; 100]);
+    put("v2/native-work/build-script/out/oldkey/a.o", &[2u8; 100]);
+    put("v2/run/records/rec-old", &[3u8; 100]);
+    clock.sleep(&cx, Duration::from_millis(50)).expect("sleep 1");
+
+    put("v2/build-script/files/dir-mid/b.bin", &[4u8; 100]);
+    put("v2/native-work/build-script/out/midkey/b.o", &[5u8; 100]);
+    put("v2/run/records/rec-mid", &[6u8; 100]);
+    clock.sleep(&cx, Duration::from_millis(50)).expect("sleep 2");
+
+    put("v2/build-script/files/dir-new/c.bin", &[7u8; 100]);
+    put("v2/native-work/build-script/out/newkey/c.o", &[8u8; 100]);
+    put("v2/run/records/rec-new", &[9u8; 100]);
+    put("v2/native-work/build-script/jobs/1001", b"");
+
+    let now_ns = clock.wall().as_ns();
+    let probe = FixedPids(&[1001]);
+    // Cap = 200 bytes -> 75% low watermark = 150 bytes; 300 bytes > 200 evicts oldest 2 entries
+    // (200 bytes) per directory, leaving the newest 100-byte entry (<= 150) and live FIFO intact.
+    let caps = AuxCaps { build_script_files: 200, native_work: 200, run_records: 200 };
+
+    // Dry-run plans all 6 evictions without deleting anything.
+    let dry = sweep_aux_with_caps(&cx, home.dir(), now_ns, caps, &probe, true, AuxSweepPlant::None);
+    assert_eq!(dry.files, 6, "dry-run must plan 2 oldest entries from each of the 3 capped dirs");
+    assert_eq!(dry.bytes, 600);
+    assert!(home.dir().stat(&cx, &Path::new("v2/run/records/rec-old").expect("p")).expect("s").is_some());
+
+    // Live sweep evicts oldest + mid in all 3 directories and keeps newest + live jobserver FIFO.
+    let swept = sweep_aux_with_caps(&cx, home.dir(), now_ns, caps, &probe, false, AuxSweepPlant::None);
+    assert_eq!(swept.files, 6);
+    assert_eq!(swept.bytes, 600);
+    assert!(home.dir().stat(&cx, &Path::new("v2/build-script/files/dir-old").expect("p")).expect("s").is_none());
+    assert!(home.dir().stat(&cx, &Path::new("v2/build-script/files/dir-mid").expect("p")).expect("s").is_none());
+    assert!(home.dir().stat(&cx, &Path::new("v2/build-script/files/dir-new/c.bin").expect("p")).expect("s").is_some());
+
+    assert!(home.dir().stat(&cx, &Path::new("v2/native-work/build-script/out/oldkey").expect("p")).expect("s").is_none());
+    assert!(home.dir().stat(&cx, &Path::new("v2/native-work/build-script/out/midkey").expect("p")).expect("s").is_none());
+    assert!(home.dir().stat(&cx, &Path::new("v2/native-work/build-script/out/newkey/c.o").expect("p")).expect("s").is_some());
+    assert!(home.dir().stat(&cx, &Path::new("v2/native-work/build-script/jobs/1001").expect("p")).expect("s").is_some(), "live jobserver FIFO must never be LRU-evicted");
+
+    assert!(home.dir().stat(&cx, &Path::new("v2/run/records/rec-old").expect("p")).expect("s").is_none());
+    assert!(home.dir().stat(&cx, &Path::new("v2/run/records/rec-mid").expect("p")).expect("s").is_none());
+    assert!(home.dir().stat(&cx, &Path::new("v2/run/records/rec-new").expect("p")).expect("s").is_some());
 }

@@ -897,7 +897,7 @@ pub fn after_answer_printed(cx: &Cx, lent: CommandLent, home: &Home, stats: bool
     // barriers, full foreground QoS) and spawn detached `blaze gc --background`
     // (QOS_CLASS_BACKGROUND + non-blocking gc.lock) so CLI exit is never delayed. In simulated
     // worlds without a spawner, run inline slices (including exit-tail seal).
-    let slices = if needs_hk && !bg_detached { AFTER_ANSWER_SLICES } else { 0 };
+    let slices = if needs_hk && !bg_detached && lent.needs_commit() { AFTER_ANSWER_SLICES } else { 0 };
     let has_work = slices > 0 || lent.needs_commit();
     let (after, commit_ns, spawn_bg) = if !has_work {
         let named = lent.named();

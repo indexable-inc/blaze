@@ -2273,15 +2273,15 @@ fn a_write_after_the_replay_is_seen_by_the_next() {
         taken.encode(&mut bytes);
         bytes
     };
-    let first = journal_sweep::take(&cx, &root, &home, &clock, journal_sweep::Stored::NONE, frame).expect("the replay");
+    let first = journal_sweep::take(&cx, &fs, &root, &home, &clock, journal_sweep::Stored::NONE, frame).expect("the replay");
     let first_bytes = saved(&first);
     // CONTROL: nothing written since the place.
     let stored = journal_sweep::Stored::of(&first_bytes).expect("the places read back whole");
-    let quiet = journal_sweep::take(&cx, &root, &home, &clock, stored, frame).expect("the replay");
+    let quiet = journal_sweep::take(&cx, &fs, &root, &home, &clock, stored, frame).expect("the replay");
     assert_eq!((quiet.journal.clone(), quiet.events), (journal_sweep::JournalUse::Used, 0), "nothing written: nothing named");
     // The write a request's reads would race: after the place, before the read.
     write(&io, "a/src/lib.rs", "pub fn one() -> u8 {\n    1\n}\n// late\n");
-    let next = journal_sweep::take(&cx, &root, &home, &clock, stored, frame).expect("the replay");
+    let next = journal_sweep::take(&cx, &fs, &root, &home, &clock, stored, frame).expect("the replay");
     println!("a write after the place: {} event(s)", next.events);
     assert_eq!(next.journal, journal_sweep::JournalUse::Used);
     assert!(next.events >= 1, "the late write is named by the next replay");
@@ -2536,6 +2536,11 @@ fn missing_stored_answer_page_rebuilds_visibly_and_unwedges_checkout() {
         let lent = store_home.open_store(&Settings::default(), facts, heap.alloc()).expect("open store");
         assert!(lent.has_root(reach_root.as_str()), "cold check must have pinned reach root");
         lent.unroot(reach_root.as_str());
+        for (name, _) in lent.roots() {
+            if name.starts_with("engine.bases.slot.") {
+                lent.unroot(name.as_str());
+            }
+        }
         assert!(lent.renew_root(answer_root.as_str(), ROOT_LIFE_NS).is_live());
         assert!(lent.renew_root(answer_index_root.as_str(), ROOT_LIFE_NS).is_live());
         lent.commit().expect("commit unroot of reach");

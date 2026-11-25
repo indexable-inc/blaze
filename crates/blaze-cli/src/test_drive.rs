@@ -695,30 +695,24 @@ impl<D: blaze_core::Driver> Answers for CacheAnswers<'_, '_, '_, D> {
     }
 }
 
-/// Drive the selected rows through one bounded pool, retaining their owning suites.
+/// Continue driving an already-begun [`TestLoop`] whose initial `Effect::Look`s have been
+/// resolved and whose pending `Effect::Run`s are in `out`.
 #[expect(clippy::too_many_arguments, reason = "the driver's edge: each argument one seam of it")]
-fn drive<'a, 'r, 'm, Z: Zygotes, D: blaze_core::Driver>(
-    config: LoopConfig<'r>,
-    asked: AVec<'a, blaze_run::plan::Asked<'r>>,
-    owners: &'r [SuiteId],
-    suite_heads: &'r [Head<'r>],
-    postings: Postings<'r>,
-    moved: &[Ask],
-    filtered: u32,
-    runner: &mut Runner<'a, Z>,
+fn drive_pending<'a, 'r, 'm, 'z, Z: Zygotes, D: blaze_core::Driver>(
+    machine: &mut TestLoop<'a, 'r>,
+    mut out: AVec<'a, Effect<'a>>,
+    steps_left: usize,
+    most: usize,
+    runner: &mut Runner<'z, Z>,
     refuse: &mut dyn Refuse,
     cache: &mut crate::test_cache::TestCache<'a, 'm, D>,
     entered_sink: &RefCell<AVec<'a, (SuiteId, crate::test_cache::EnteredFn<'a>)>>,
+    on_run: &mut dyn FnMut(u32, &mut crate::test_cache::TestCache<'a, 'm, D>),
     print: &mut dyn FnMut(&[u8]) -> Result<(), DriveError>,
     alloc: Alloc<'a>,
 ) -> Result<Status, DriveError> {
-    let most = STEPS_FIXED.saturating_add(STEPS_PER_TEST.saturating_mul(asked.len()));
-    let mut machine = TestLoop::new(config, alloc)?;
-    let mut out: AVec<'a, Effect<'a>> = Vec::new_in(alloc);
     let mut effects: AVec<'a, Effect<'a>> = Vec::new_in(alloc);
-    machine.begin_inventory(asked, owners, suite_heads, postings, moved, filtered, runner.zygotes().now(), &mut out)?;
-    machine.step(Event::Checked { errors: 0 }, runner.zygotes().now(), &mut out)?;
-    for _ in 0..most {
+    for _ in 0..steps_left {
         core::mem::swap(&mut out, &mut effects);
         let mut done = None;
         for effect in effects.drain(..) {
@@ -736,7 +730,10 @@ fn drive<'a, 'r, 'm, Z: Zygotes, D: blaze_core::Driver>(
                         machine.row_detail(*row, line.into_bytes());
                         machine.step(Event::CannotRun { test: *test, why: CannotRun::EntryRefused }, runner.zygotes().now(), &mut out)?;
                     }
-                    None => runner.effect(&effect)?,
+                    None => {
+                        on_run(*row, cache);
+                        runner.effect(&effect)?;
+                    }
                 },
                 Effect::Kill { .. } => runner.effect(&effect)?,
                 Effect::File { suite, test, address, slot, bytes } => cache.file(*suite, *test, *address, *slot, bytes.as_slice())?,
@@ -758,7 +755,7 @@ fn drive<'a, 'r, 'm, Z: Zygotes, D: blaze_core::Driver>(
             return Err(DriveError::Stalled);
         }
         let mut answers = CacheAnswers { cache, sink: entered_sink };
-        runner.step(&mut machine, &mut answers, &mut out)?;
+        runner.step(machine, &mut answers, &mut out)?;
     }
     Err(DriveError::Steps { most })
 }
@@ -2601,6 +2598,30 @@ enum Came {
     Late { waited: u64 },
 }
 
+/// Per-suite temporary folder created lazily on the first test run in that suite so clean suites
+/// (all tests cached, filtered, or ignored) perform zero directory syscalls.
+pub(crate) struct LazySuiteDir<'c> {
+    parent: &'c Dir<ReadWrite>,
+    index: usize,
+    dir: core::cell::OnceCell<Dir<ReadWrite>>,
+}
+
+impl<'c> LazySuiteDir<'c> {
+    fn new(parent: &'c Dir<ReadWrite>, index: usize) -> LazySuiteDir<'c> {
+        LazySuiteDir { parent, index, dir: core::cell::OnceCell::new() }
+    }
+
+    fn get_or_create(&self, cx: &Cx, frame: &Frame) -> Result<&Dir<ReadWrite>, OneError> {
+        if let Some(dir) = self.dir.get() {
+            return Ok(dir);
+        }
+        let named = bstd::mem::format_in!(frame, "{}", self.index);
+        let suite_path = Path::new(named.as_str()).map_err(OneError::Path)?;
+        let made = self.parent.make_dir(cx, &suite_path, Durable::No).map_err(OneError::Temp)?;
+        Ok(self.dir.get_or_init(|| made))
+    }
+}
+
 /// A test's run under the lazy parent, as `blaze run`'s program runs (own_process.rs
 /// `run_own`), with the test's roots, its own folder and profile, piped output and a deadline.
 pub(crate) struct Launched<'c, 'h, 'a> {
@@ -2614,8 +2635,8 @@ pub(crate) struct Launched<'c, 'h, 'a> {
     /// Absolute path of the records folder (run_parent.rs `RECORDS` under the home): the
     /// launcher's `BLAZE_LAUNCH_STORE`.
     pub store: &'c str,
-    /// This command's folder of test folders, and its absolute path.
-    pub temps: &'c Dir<ReadWrite>,
+    /// This suite's lazy folder of per-test temporary folders, and its absolute path.
+    pub temps: &'c LazySuiteDir<'c>,
     pub temp: &'c str,
     /// The command's environment.
     pub env: &'c [(&'c str, &'c str)],
@@ -2672,12 +2693,13 @@ fn with_native<'a>(mut profile: AString<'a>, store: &str, native: Option<crate::
 impl RunOne for Launched<'_, '_, '_> {
     async fn run(&self, row: u32, budget: Nanos, output: &mut Output<'_>, signals: &Signals) -> Result<RunOutcome, OneError> {
         let frame = Frame::new(bstd::mem::Tag::Other).map_err(OneError::Frame)?;
+        let suite_dir = self.temps.get_or_create(self.cx, &frame)?;
         let name = bstd::mem::format_in!(&frame, "stderr-{row}");
         let path = Path::new(name.as_str()).map_err(OneError::Path)?;
         // The parent owns this file beside the child's writable directory. A child cannot
         // replace the evidence. Quiet tests create no file.
-        let mut stderr = StderrCapture { dir: self.temps, path, prefix: Vec::new_in(&frame), spilled: false, bytes: 0 };
-        let result = self.run_captured(row, budget, output, signals, &mut stderr, &frame).await;
+        let mut stderr = StderrCapture { dir: suite_dir, path, prefix: Vec::new_in(&frame), spilled: false, bytes: 0 };
+        let result = self.run_captured(row, budget, output, signals, suite_dir, &mut stderr, &frame).await;
         if stderr.spilled {
             stderr.dir.remove(self.cx, &stderr.path, Durable::No).map_err(OneError::Capture)?;
         }
@@ -2796,7 +2818,8 @@ impl<'c> Launched<'c, '_, '_> {
     /// - Under `Codes::Pooled`, cold misses dispatch to off-thread `CodePool` workers in parallel
     ///   via `CodeRelay` (deduplicating in-flight symbols across children and suites), parking
     ///   this child with its execution allowance paused until the worker finishes.
-    async fn run_captured(&self, row: u32, budget: Nanos, output: &mut Output<'_>, signals: &Signals, stderr: &mut StderrCapture<'_>, frame: &Frame) -> Result<RunOutcome, OneError> {
+    #[expect(clippy::too_many_arguments, reason = "runs one sandboxed test child with its suite dir and captures")]
+    async fn run_captured(&self, row: u32, budget: Nanos, output: &mut Output<'_>, signals: &Signals, suite_dir: &Dir<ReadWrite>, stderr: &mut StderrCapture<'_>, frame: &Frame) -> Result<RunOutcome, OneError> {
         use suite_cache::{ChildAnswer, ChildResolver, ChildSent, NeedCode};
 
         let cx = self.cx;
@@ -2806,7 +2829,7 @@ impl<'c> Launched<'c, '_, '_> {
         // 1. Per-test temporary folder.
         let name = bstd::mem::format_in!(frame, "{row}");
         let named = Path::new(name.as_str()).map_err(OneError::Path)?;
-        self.temps.make_dir(cx, &named, Durable::No).map_err(OneError::Temp)?;
+        suite_dir.make_dir(cx, &named, Durable::No).map_err(OneError::Temp)?;
         let temp = bstd::mem::format_in!(frame, "{}/{row}", self.temp);
         // 2. Per-test roots rooted into the suite's single shared walk.
         let exports = self.native.map_or(&[][..], |send| send.items);
@@ -3810,6 +3833,11 @@ impl RunOne for Selected<'_, Launched<'_, '_, '_>> {
 /// to every test's run. `root` is the checkout's (each worker's names records read its trees
 /// through it); `procs` is the command's proc-macro runner (by need: a worker asks for it,
 /// [`CodePool`]); `heap` is the command's, the relay's and the workers' tables in it.
+///
+/// Opens `TestCache` and resolves pure `Effect::Look` cache checks BEFORE spawning code workers
+/// or creating `$TMPDIR` folders: an all-cached run spawns zero worker threads and creates zero
+/// temporary directories; a partial run sizes its worker pool to the actual dirty test count and
+/// lazily creates `$TMPDIR` / loads `BZTV` only for suites that actually execute a test.
 #[expect(clippy::too_many_arguments, reason = "the command supplies the selected records and specific runtime capabilities")]
 pub(crate) fn run_suites<'h>(
     cx: &Cx,
@@ -3820,26 +3848,161 @@ pub(crate) fn run_suites<'h>(
     rng: &mut bstd::rng::Rng,
     out: &bstd::out::Out,
     err: &bstd::out::Out,
-    suites: &[Suite<'_, 'h>], ids: &RunIds<'h>, typed: crate::engine_body_record::TypedFrom<'h>, certificate: crate::start_list::Certificate, config: LoopConfig<'_>,
+    suites: &[Suite<'_, 'h>], ids: &RunIds<'h>, typed: crate::engine_body_record::TypedFrom<'h>, certificate: crate::start_list::Certificate, tools_digest: [u8; 32], config: LoopConfig<'_>,
     args: &[&str], lent: &CommandLent, root: &Dir<ReadWrite>, procs: crate::job_texts::Procs<'_>, heap: &'static blaze_own::Heap, watch: &dyn Watch, frame: &Frame,
 ) -> Result<Status, DriveError> {
+    let sel_cx = cx.span("blaze test: selected suites");
     let tables = heap.alloc();
+    let erased = blaze_own::Erased::new(frame);
+    let alloc = erased.handle();
+    let mut suite_specs = Vec::with_capacity_in(suites.len(), alloc);
+    for suite in suites {
+        suite_specs.push((suite.unit, suite.builder));
+    }
+    let (mut cache, heads, postings_list, moved) =
+        crate::test_cache::TestCache::open(lent, suite_specs.as_slice(), ids, &certificate, tools_digest, alloc);
+    let merged_postings_bytes: AVec<'_, u8>;
+    let postings = if postings_list.len() == 1 {
+        postings_list.first().copied().unwrap_or(Postings::EMPTY)
+    } else if postings_list.is_empty() {
+        Postings::EMPTY
+    } else {
+        let mut pairs: AVec<'_, (Ask, TestId)> = Vec::new_in(alloc);
+        for head in heads.iter() {
+            for row in head.rows() {
+                for ask in head.asks(row) {
+                    pairs.push((ask, row.kept.test));
+                }
+            }
+        }
+        if pairs.is_empty() {
+            Postings::EMPTY
+        } else {
+            merged_postings_bytes = blaze_run::postings::encode(pairs.as_slice(), alloc)
+                .map_err(|error| LoopError::Postings { suite: SuiteId(u32::MAX), error })?;
+            Postings::open(merged_postings_bytes.as_slice())
+                .map_err(|error| LoopError::Postings { suite: SuiteId(u32::MAX), error })?
+        }
+    };
+    let select = blaze_run::plan::Plan::new(config.plan, alloc).map_err(LoopError::from)?;
+    let mut locations = Vec::new_in(alloc);
+    let mut owners = Vec::new_in(alloc);
+    let mut rows = Vec::new_in(alloc);
+    let mut filtered = 0u32;
+    for (index, suite) in suites.iter().enumerate() {
+        let unit = suite.unit;
+        let tests = unit.tests;
+        let suite_id = SuiteId(u32::try_from(index).map_err(|_| DriveError::TooManyRows { count: suites.len() })?);
+        for at in 0..tests.len() {
+            let mut row = asked(unit, record_row(tests, at)?, &suite.builder, args);
+            // Custom harnesses receive the raw arguments themselves.
+            if tests.harnessed() && !select.lets_through(&row) {
+                filtered = filtered
+                    .checked_add(1)
+                    .ok_or(DriveError::TooManyRows { count: usize::try_from(u32::MAX).unwrap_or(usize::MAX).saturating_add(1) })?;
+                continue;
+            }
+            if suites.len() > 1 {
+                let path = bstd::mem::format_in!(frame, "{}/{}/{}", unit.package, unit.target, row.path);
+                row.path = crate::work::held_str(path.as_str(), frame);
+            }
+            rows.push(row);
+            owners.push(suite_id);
+            locations.push(Location { suite: suite_id, row: u32::try_from(at).map_err(|_| DriveError::TooManyRows { count: tests.len() })? });
+        }
+    }
+    cache.set_owners(rows.as_slice(), owners.as_slice());
+
+    let now = || Nanos(u64::try_from(clock.now().since_start().as_nanos()).unwrap_or(u64::MAX));
+    let mut print = |bytes: &[u8]| -> Result<(), DriveError> {
+        watch.see(blaze_screen::Step::Says);
+        for chunk in bytes.utf8_chunks() {
+            out.write(&sel_cx, chunk.valid()).map_err(|_| DriveError::Print)?;
+            if !chunk.invalid().is_empty() {
+                out.write(&sel_cx, "\u{FFFD}").map_err(|_| DriveError::Print)?;
+            }
+        }
+        Ok(())
+    };
+    watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Testing));
+
+    let most = STEPS_FIXED.saturating_add(STEPS_PER_TEST.saturating_mul(rows.len()));
+    let mut machine = TestLoop::new(config, alloc)?;
+    let mut out_effects: AVec<'_, Effect<'_>> = Vec::new_in(alloc);
+    let mut effects: AVec<'_, Effect<'_>> = Vec::new_in(alloc);
+    let mut pending_runs: AVec<'_, Effect<'_>> = Vec::new_in(alloc);
+    machine.begin_inventory(rows, &owners, heads.as_slice(), postings, moved.as_slice(), filtered, now(), &mut out_effects)?;
+    machine.step(Event::Checked { errors: 0 }, now(), &mut out_effects)?;
+    let mut steps_used = 0usize;
+    let mut done = None;
+    while !out_effects.is_empty() {
+        if steps_used >= most {
+            return Err(DriveError::Steps { most });
+        }
+        steps_used += 1;
+        core::mem::swap(&mut out_effects, &mut effects);
+        for effect in effects.drain(..) {
+            match effect {
+                Effect::Open { suite } => return Err(DriveError::NoSuite { suite }),
+                Effect::Moved { .. } => return Err(DriveError::NoHead { effect: "the moved asks" }),
+                Effect::Look { suite, test, .. } => {
+                    let found = cache.look(suite, test)?;
+                    machine.step(Event::Looked { test, found }, now(), &mut out_effects)?;
+                }
+                Effect::Run { .. } | Effect::Kill { .. } => pending_runs.push(effect),
+                Effect::File { suite, test, address, slot, bytes } => {
+                    cache.file(suite, test, address, slot, bytes.as_slice())?;
+                }
+                Effect::Flaky { suite, finding } => cache.flaky(suite, finding.flaky.test)?,
+                Effect::WriteHead { suite, bytes } => cache.head(suite, bytes.as_slice())?,
+                Effect::WritePostings { suite, bytes } => cache.postings(suite, bytes.as_slice())?,
+                Effect::Print { text } => print(text.as_slice())?,
+                Effect::Done { status } => done = Some(status),
+            }
+        }
+    }
+    if let Some(status) = done {
+        watch.see(blaze_screen::Step::Says);
+        cache.commit(ids)?;
+        return Ok(status);
+    }
+    if pending_runs.is_empty() {
+        return Err(DriveError::Stalled);
+    }
+
     // The command's one make watch (rule 75: its clock started here, at the edge), handed to
     // every maker, the serial turns' and each code worker's (rule 16: a large or slow make's line).
     let make_watch = crate::run_parent::command_make_watch();
-    let total_tests: usize = suites.iter().map(|suite| suite.unit.tests.len()).sum();
-    let want_workers = usize::try_from(config.plan.width).unwrap_or(MAX_CODE_WORKERS).min(total_tests).min(MAX_CODE_WORKERS);
-    match CODES {
+    let want_workers = if TestHost::THIS.has_sandbox() {
+        usize::try_from(config.plan.width)
+            .unwrap_or(MAX_CODE_WORKERS)
+            .min(pending_runs.len())
+            .min(MAX_CODE_WORKERS)
+    } else {
+        0
+    };
+    let steps_left = most.saturating_sub(steps_used);
+    let status = match CODES {
         Codes::Pooled if want_workers > 1 && cx.workers() > 1 => {
             let sync_typed = typed.sync_over(*ids);
             pooled(cx, clock, rng, suites, sync_typed, want_workers, root, procs, heap, make_watch, |relay| {
-                run_selected(cx, fs, env, host, clock, out, err, suites, ids, typed, certificate, config, args, lent, tables, watch, make_watch, frame, Some(relay))
+                run_dirty(
+                    &sel_cx, fs, env, host, clock, err, suites, ids, typed, certificate, config, args, lent,
+                    tables, watch, make_watch, frame, alloc, Some(relay), &mut machine, pending_runs,
+                    steps_left, most, locations.as_slice(), &mut cache, &mut print,
+                )
             })
         }
         Codes::Serial | Codes::Pooled => {
-            run_selected(cx, fs, env, host, clock, out, err, suites, ids, typed, certificate, config, args, lent, tables, watch, make_watch, frame, None)
+            run_dirty(
+                &sel_cx, fs, env, host, clock, err, suites, ids, typed, certificate, config, args, lent,
+                tables, watch, make_watch, frame, alloc, None, &mut machine, pending_runs,
+                steps_left, most, locations.as_slice(), &mut cache, &mut print,
+            )
         }
-    }
+    }?;
+    cache.commit(ids)?;
+    Ok(status)
 }
 
 /// [`run_suites`] under `Codes::Pooled` (D194 piece 2): spawns up to `want_workers` code workers
@@ -3922,116 +4085,69 @@ fn pooled<'h>(
     Ok(status)
 }
 
-#[expect(clippy::too_many_arguments, reason = "the command supplies the selected records and specific runtime capabilities")]
-fn run_selected<'h>(
+#[expect(clippy::too_many_arguments, reason = "the command supplies the dirty test loop, records, and specific runtime capabilities")]
+fn run_dirty<'a, 'r, 'm, 'h, D: blaze_core::Driver>(
     cx: &Cx,
     fs: &bstd::fs::Fs,
     env: Option<&bstd::env::Env>,
     host: &bstd::host::Host,
     clock: &bstd::clock::Clock,
-    out: &bstd::out::Out,
     err: &bstd::out::Out,
-    suites: &[Suite<'_, 'h>], ids: &RunIds<'h>, typed: crate::engine_body_record::TypedFrom<'h>, certificate: crate::start_list::Certificate, config: LoopConfig<'_>,
+    suites: &[Suite<'_, 'h>], ids: &RunIds<'h>, typed: crate::engine_body_record::TypedFrom<'h>, certificate: crate::start_list::Certificate, config: LoopConfig<'r>,
     args: &[&str], lent: &CommandLent, tables: Alloc<'static>, watch: &dyn Watch, make_watch: blaze_ladder::run::make_one::MakeWatch<'static>, frame: &Frame,
-    relay: Option<&CodeRelay<'_>>,
+    alloc: Alloc<'a>, relay: Option<&CodeRelay<'_>>, machine: &mut TestLoop<'a, 'r>, pending_runs: AVec<'a, Effect<'a>>,
+    steps_left: usize, most: usize, locations: &[Location], cache: &mut crate::test_cache::TestCache<'a, 'm, D>,
+    print: &mut dyn FnMut(&[u8]) -> Result<(), DriveError>,
 ) -> Result<Status, DriveError> {
-    let cx = cx.span("blaze test: selected suites");
     let env = env.ok_or(DriveError::Missing(bstd::io::Missing { capability: "env" }))?;
-    let erased = blaze_own::Erased::new(frame);
-    let alloc = erased.handle();
     let one = DriveError::One;
-    // 1. The records folder and this command's test folders, under the command's own home
-    // (rule 75: read here, at the edge).
+    // 1. The records folder and this command's test folder, under the command's own home
+    // (rule 75: read here, at the edge). Per-suite subfolders are created lazily on first run.
     let home_name = bstd::env::VarName::new("HOME").map_err(|_| one(OneError::NoHome))?;
     let home = env.get(&home_name).ok().flatten().ok_or(one(OneError::NoHome))?;
     let home = home.trim_end_matches('/');
-    // The test folders, each level made or taken as it is beneath the home's `.blaze/v2` (which
-    // holds the toolchain this command has read, so it is there): a home folder's handle makes
-    // nothing until a file is made in it (bstd fs.rs `home`), and `make_dir` makes one level
-    // (first real run, 2026-11-18: "make_dir of .blaze/v2/test/tmp/<pid>: No such file").
-    let v2 = fs.home(&cx, home, &Path::new(".blaze/v2").map_err(|why| one(OneError::Path(why)))?).map_err(|why| one(OneError::Home(why)))?;
-    let test = made_or_there(&cx, &v2, "test").map_err(one)?;
-    let temps = made_or_there(&cx, &test, "tmp").map_err(one)?;
+    let v2 = fs.home(cx, home, &Path::new(".blaze/v2").map_err(|why| one(OneError::Path(why)))?).map_err(|why| one(OneError::Home(why)))?;
+    let test = made_or_there(cx, &v2, "test").map_err(one)?;
+    let temps = made_or_there(cx, &test, "tmp").map_err(one)?;
     let command = bstd::mem::format_in!(frame, "{}-{}", host.pid(), clock.now().since_start().as_nanos());
     let command_path = Path::new(command.as_str()).map_err(|why| one(OneError::Path(why)))?;
-    let mine = temps.make_dir(&cx, &command_path, Durable::No).map_err(|why| one(OneError::Temp(why)))?;
+    let mine = temps.make_dir(cx, &command_path, Durable::No).map_err(|why| one(OneError::Temp(why)))?;
     let store = bstd::mem::format_in!(frame, "{home}/{RECORDS}");
     // 2. The launcher beside this binary, the spawner, the command's environment.
     let exe = host.exe().map_err(DriveError::Missing)?;
     let launcher = crate::own_process::launcher_beside(&exe, frame).map_err(|why| one(OneError::Launcher(why)))?;
-    // Looked at once, before any test starts: a missing launcher under `sandbox-exec` is the
-    // sandbox's own exit 71 for every test, which names no cause (rule 19; seen 2026-11-21 in a
-    // cargo target folder holding `blaze` and no `blaze-launcher`, rounds/wave-1119/t82). A host
-    // with no test sandbox starts no test (each is NOT RUN: test_run.rs `Host::has_sandbox`).
-    if crate::test_run::Host::THIS.has_sandbox() && !launcher_there(&cx, &fs, launcher.as_str(), frame).map_err(one)? {
+    if crate::test_run::Host::THIS.has_sandbox() && !launcher_there(cx, fs, launcher.as_str(), frame).map_err(one)? {
         return Err(one(OneError::NoLauncher { launcher: Box::from(launcher.as_str()), exe: Box::from(&*exe) }));
     }
     let spawner = host.spawner().map_err(DriveError::Missing)?;
     let mut vars: Vec<(&str, &str), &Frame> = Vec::new_in(frame);
     vars.extend(env.each());
-    let select = blaze_run::plan::Plan::new(config.plan, alloc).map_err(LoopError::from)?;
     let mut dirs = Vec::with_capacity_in(suites.len(), frame);
     for index in 0..suites.len() {
-        let named = bstd::mem::format_in!(frame, "{index}");
-        let suite_path = Path::new(named.as_str()).map_err(|why| one(OneError::Path(why)))?;
-        let dir = mine.make_dir(&cx, &suite_path, Durable::No).map_err(|why| one(OneError::Temp(why)))?;
+        let dir = LazySuiteDir::new(&mine, index);
         let temp = bstd::mem::format_in!(frame, "{home}/{TEMPS}/{}/{index}", command.as_str());
         dirs.push((dir, temp));
     }
-    // THE seam of D194 ([`CODES`]): `None` makes each test's code in its own turn; `Some`, the
-    // command's relay over its code workers ([`pooled`]), which lives in the caller's frame and
-    // outlives every run borrowing it (`Launched::codes`; E0597 when it was owned here, a1850).
+    // 3. Lazy per-suite `SuiteCache` shells (`load_verified` deferred until a suite runs a test).
     let mut child_base = 0usize;
-    let entered_sink: RefCell<AVec<'_, (SuiteId, crate::test_cache::EnteredFn<'_>)>> = RefCell::new(Vec::new_in(alloc));
-    let mut suite_specs = Vec::with_capacity_in(suites.len(), alloc);
-    for suite in suites {
-        suite_specs.push((suite.unit, suite.builder));
-    }
-    let (mut cache, heads, postings_list, moved) = crate::test_cache::TestCache::open(lent, suite_specs.as_slice(), ids, alloc);
-    let merged_postings_bytes: AVec<'_, u8>;
-    let postings = if postings_list.len() == 1 {
-        postings_list[0]
-    } else if postings_list.is_empty() {
-        Postings::EMPTY
-    } else {
-        let mut pairs: AVec<'_, (Ask, TestId)> = Vec::new_in(alloc);
-        for head in heads.iter() {
-            for row in head.rows() {
-                for ask in head.asks(row) {
-                    pairs.push((ask, row.kept.test));
-                }
-            }
-        }
-        if pairs.is_empty() {
-            Postings::EMPTY
-        } else {
-            merged_postings_bytes = blaze_run::postings::encode(pairs.as_slice(), alloc)
-                .map_err(|error| LoopError::Postings { suite: SuiteId(u32::MAX), error })?;
-            Postings::open(merged_postings_bytes.as_slice())
-                .map_err(|error| LoopError::Postings { suite: SuiteId(u32::MAX), error })?
-        }
-    };
+    let entered_sink: RefCell<AVec<'a, (SuiteId, crate::test_cache::EnteredFn<'a>)>> = RefCell::new(Vec::new_in(alloc));
     let mut suite_caches = Vec::with_capacity_in(suites.len(), alloc);
-    for (index, suite) in suites.iter().enumerate() {
-        let suite_id = SuiteId(u32::try_from(index).map_err(|_| DriveError::TooManyRows { count: suites.len() })?);
-        let mut sc = suite_cache::SuiteCache::new(suite.names, suite.builder, typed, tables, make_watch);
-        let _ = cache.load_verified(suite_id, &certificate, sc.verified_mut());
+    for suite in suites {
+        let sc = suite_cache::SuiteCache::new(suite.names, suite.builder, typed, tables, make_watch);
         suite_caches.push(RefCell::new(sc));
     }
     let mut launches = Vec::with_capacity_in(suites.len(), alloc);
     let mut checks = Vec::with_capacity_in(suites.len(), alloc);
-    let mut locations = Vec::new_in(alloc);
-    let mut owners = Vec::new_in(alloc);
-    let mut rows = Vec::new_in(alloc);
-    let mut filtered = 0u32;
     for (index, (suite, suite_cache)) in suites.iter().zip(suite_caches.iter()).enumerate() {
         let unit = suite.unit;
         let tests = unit.tests;
-        let (dir, temp) = &dirs[index];
         let suite_id = SuiteId(u32::try_from(index).map_err(|_| DriveError::TooManyRows { count: suites.len() })?);
+        let Some((dir, temp)) = dirs.get(index) else {
+            return Err(DriveError::NoSuite { suite: suite_id });
+        };
         launches.push(Launched {
-            err: &err, package: unit.package, target: unit.target,
-            cx: &cx, spawner: &spawner, launcher: launcher.as_str(), store: store.as_str(),
+            err, package: unit.package, target: unit.target,
+            cx, spawner: &spawner, launcher: launcher.as_str(), store: store.as_str(),
             temps: dir, temp: temp.as_str(), env: vars.as_slice(), place: suite.place, tests, names: suite.names, ids,
             builder: suite.builder, lent, tables, watch,
             args: if tests.harnessed() { &[] } else { args },
@@ -4045,79 +4161,67 @@ fn run_selected<'h>(
         });
         child_base += tests.len();
         checks.push(EntryCheck { tests, names: suite.names, builder: suite.builder, tables, image: suite.native.map(|native| native.map_or(&[][..], |send| send.items)), said: String::new_in(alloc) });
-        for at in 0..tests.len() {
-            let mut row = asked(unit, record_row(tests, at)?, &suite.builder, args);
-            // Custom harnesses receive the raw arguments themselves.
-            if tests.harnessed() && !select.lets_through(&row) {
-                filtered = filtered.checked_add(1).ok_or(DriveError::TooManyRows { count: u32::MAX as usize + 1 })?;
-                continue;
-            }
-            if suites.len() > 1 {
-                let path = bstd::mem::format_in!(frame, "{}/{}/{}", unit.package, unit.target, row.path);
-                row.path = crate::work::held_str(path.as_str(), frame);
-            }
-            rows.push(row);
-            owners.push(suite_id);
-            locations.push(Location { suite: suite_id, row: u32::try_from(at).map_err(|_| DriveError::TooManyRows { count: tests.len() })? });
-        }
     }
-    cache.set_owners(rows.as_slice(), owners.as_slice());
     let now = || Nanos(u64::try_from(clock.now().since_start().as_nanos()).unwrap_or(u64::MAX));
-    let launched = Selected { suites: launches.as_mut_slice(), rows: &locations };
-    let mut refuse = Selected { suites: checks.as_mut_slice(), rows: &locations };
+    let launched = Selected { suites: launches.as_mut_slice(), rows: locations };
+    let mut refuse = Selected { suites: checks.as_mut_slice(), rows: locations };
     let signals = Signals::default();
     let zygotes = OneEach::new(&launched, &signals, now, alloc, tables)?;
     let mut runner = Runner::new(zygotes, &config.plan, TestHost::THIS, alloc);
-    let mut print = |bytes: &[u8]| -> Result<(), DriveError> {
-        watch.see(blaze_screen::Step::Says);
-        for chunk in bytes.utf8_chunks() {
-            out.write(&cx, chunk.valid()).map_err(|_| DriveError::Print)?;
-            if !chunk.invalid().is_empty() {
-                out.write(&cx, "\u{FFFD}").map_err(|_| DriveError::Print)?;
+    let mut verified_loaded: AVec<'_, bool> = Vec::with_capacity_in(suites.len(), alloc);
+    verified_loaded.resize(suites.len(), false);
+    let mut on_run = |flat: u32, active_cache: &mut crate::test_cache::TestCache<'a, 'm, D>| {
+        if !TestHost::THIS.has_sandbox() {
+            return;
+        }
+        if let Ok(flat_idx) = usize::try_from(flat)
+            && let Some(loc) = locations.get(flat_idx)
+            && let Ok(suite_idx) = usize::try_from(loc.suite.0)
+            && let Some(loaded) = verified_loaded.get_mut(suite_idx)
+            && !*loaded
+        {
+            *loaded = true;
+            if let Some(sc) = suite_caches.get(suite_idx) {
+                let _ = active_cache.load_verified(loc.suite, &certificate, sc.borrow_mut().verified_mut());
             }
         }
-        Ok(())
     };
-    watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Testing));
-    let status = drive(
-        config,
-        rows,
-        &owners,
-        heads.as_slice(),
-        postings,
-        moved.as_slice(),
-        filtered,
+    let status = drive_pending(
+        machine,
+        pending_runs,
+        steps_left,
+        most,
         &mut runner,
         &mut refuse,
-        &mut cache,
+        cache,
         &entered_sink,
-        &mut print,
+        &mut on_run,
+        print,
         alloc,
     );
     watch.see(blaze_screen::Step::Says);
     // Clean up this command's per-run `$TMPDIR` tree (`v2/test/tmp/<pid>-<ns>`) on both Ok and Err
     // paths now that all child test processes have exited.
-    let _ = crate::gc::remove_tree_best_effort(&cx, &temps, &command_path);
-    // A run that stopped in blaze: ONE line naming the test, what failed and its cause, then
-    // the command's own error (`OneStopped`) says the line above is why (rule 19). The
-    // runner's `Seam` error says only that one stopped, so it is not shown.
+    let _ = crate::gc::remove_tree_best_effort(cx, &temps, &command_path);
     if let (Err(DriveError::Run(_)), Some((row, failed))) = (&status, runner.zygotes().failed.as_ref()) {
-        let location = locations.get(*row as usize).ok_or(one(OneError::NoRow { row: *row }))?;
-        let unit = suites[location.suite.0 as usize].unit;
+        let row_idx = usize::try_from(*row).map_err(|_| one(OneError::NoRow { row: *row }))?;
+        let location = locations.get(row_idx).ok_or(one(OneError::NoRow { row: *row }))?;
+        let suite_idx = usize::try_from(location.suite.0).map_err(|_| DriveError::NoSuite { suite: location.suite })?;
+        let unit = suites.get(suite_idx).ok_or(DriveError::NoSuite { suite: location.suite })?.unit;
         let tests = unit.tests;
-        let path = record_row(tests, location.row as usize)?.path;
-        err.line(&cx, format_args!("blaze test: the test `{}/{}/{path}` could not be run: {failed}", unit.package, unit.target)).map_err(|_| DriveError::Print)?;
+        let loc_row = usize::try_from(location.row).map_err(|_| one(OneError::NoRow { row: location.row }))?;
+        let path = record_row(tests, loc_row)?.path;
+        err.line(cx, format_args!("blaze test: the test `{}/{}/{path}` could not be run: {failed}", unit.package, unit.target)).map_err(|_| DriveError::Print)?;
         return Err(DriveError::OneStopped);
     }
-    // A zygote "silent" past a run's allowance: what held the command thread, which serves every
-    // child, said before the runner's own line (stop 3 of the first real run: tempo's
-    // `tempo-precompiles-macros` row 7, five runs in a row). The longest turn names its test,
-    // its length and what it was doing; it may be another test's turn than the silent row's.
     if let (Err(DriveError::Run(RunError::ZygoteSilent { .. })), Some(turn)) = (&status, runner.zygotes().longest) {
-        let location = locations.get(turn.row as usize).ok_or(one(OneError::NoRow { row: turn.row }))?;
-        let unit = suites[location.suite.0 as usize].unit;
-        let path = record_row(unit.tests, location.row as usize)?.path;
-        err.line(&cx, format_args!(
+        let row_idx = usize::try_from(turn.row).map_err(|_| one(OneError::NoRow { row: turn.row }))?;
+        let location = locations.get(row_idx).ok_or(one(OneError::NoRow { row: turn.row }))?;
+        let suite_idx = usize::try_from(location.suite.0).map_err(|_| DriveError::NoSuite { suite: location.suite })?;
+        let unit = suites.get(suite_idx).ok_or(DriveError::NoSuite { suite: location.suite })?.unit;
+        let loc_row = usize::try_from(location.row).map_err(|_| one(OneError::NoRow { row: location.row }))?;
+        let path = record_row(unit.tests, loc_row)?.path;
+        err.line(cx, format_args!(
             "blaze test: the command thread, which serves every test's process, was held {}.{} s in one turn of `{}/{}/{path}` (row {}): {}; while a turn runs no test is answered (test_drive.rs `OneEach`)",
             turn.nanos / 1_000_000_000, turn.nanos % 1_000_000_000 / 100_000_000, unit.package, unit.target, turn.row, turn.doing,
         )).map_err(|_| DriveError::Print)?;
@@ -4130,7 +4234,6 @@ fn run_selected<'h>(
             cache.record_verified(suite_id, certificate, sc.verified_pairs());
         }
     }
-    cache.commit()?;
     Ok(status)
 }
 

@@ -248,19 +248,6 @@ impl Prior {
         }
         Ok(Prior { under, units, found })
     }
-
-    /// Whether unit `name` of key `key` is kept by its key under `under`, and its findings when
-    /// it has any: `None` when it is to be linted.
-    fn kept(&self, under: &Under, name: Name, key: ContentId) -> Option<Option<&Found>> {
-        if self.under != *under {
-            return None;
-        }
-        let at = self.units.binary_search_by_key(&name, |unit| unit.0).ok()?;
-        if self.units[at].1 != key {
-            return None;
-        }
-        Some(self.found.binary_search_by_key(&name, |one| one.name).ok().map(|at| &self.found[at]))
-    }
 }
 
 /// A file's lint record, named `name`, made under `under` over its `units` (name order) and the
@@ -327,7 +314,7 @@ pub(crate) struct Made {
     /// Each found unit's item chain and the run of its findings in the record ([`file_record`]).
     placed: std::vec::Vec<(Option<u64>, usize, usize), Global>,
     /// Each unit this request linted, its item's name as written (`None` for the file's unit).
-    relinted: std::vec::Vec<Option<blaze_own::String<Global>>, Global>,
+    relinted: blaze_own::Vec<Option<blaze_own::String<Global>>, Global>,
     /// The units the record lists.
     units: usize,
     /// What the relinted units' passes cost: their own tokens and each rule's sites.
@@ -340,7 +327,7 @@ pub(crate) struct Made {
 pub(crate) struct FileLinted {
     pub(crate) record: Record<Global>,
     placed: std::vec::Vec<(Option<u64>, usize, usize), Global>,
-    pub(crate) relinted: std::vec::Vec<Option<blaze_own::String<Global>>, Global>,
+    pub(crate) relinted: blaze_own::Vec<Option<blaze_own::String<Global>>, Global>,
     units: usize,
     cost: (u64, Cost),
 }
@@ -513,10 +500,17 @@ impl LintsStage {
                     }
                 }
             }
-            // 2. Each file's job, at once, on the workers.
+            // 2. Each file's job: run a single-file edit inline to avoid spawning a worker and
+            // reserving a 256 MiB `LINTS_FRAME`; fan out multi-file phases across the pool.
             type Ran = Result<FileLinted, Why>;
             let mut worked: std::vec::Vec<(Ran, u64), Global> = std::vec::Vec::with_capacity_in(jobs.len(), Global);
-            {
+            if jobs.len() <= 1 {
+                for job in jobs.iter() {
+                    let began = clock.now();
+                    let ran = stage.run_job(&cx, root, job);
+                    worked.push((ran, clock.now().since(began).map_or(0, crate::engine_times::ns)));
+                }
+            } else {
                 let scope = cx.scope();
                 scope.narrow_workers(workers, Class::Foreground);
                 let mut running = std::vec::Vec::with_capacity_in(jobs.len(), Global);
@@ -785,42 +779,62 @@ pub(crate) fn lint_text(
     let mut entries: blaze_own::AVec<'_, blaze_surface::Item> = blaze_own::AVec::with_capacity_in(view.len(), alloc);
     entries.extend(view.items().map(|one| one.item));
     let chain_of = |at: usize| work::stored_item_chain(view, blaze_surface::ItemIndex(at as u32));
-    // 1. Each unit kept by its key, or asked.
+    // 1. Each unit kept by its key, or asked (linear merge over sorted `units` and `prior`).
     let mut found: std::vec::Vec<Found, Global> = std::vec::Vec::new_in(Global);
     let mut asked: blaze_own::AVec<'_, AskedUnit> = blaze_own::AVec::new_in(alloc);
-    for unit in units.iter() {
-        match prior.and_then(|prior| prior.kept(under, unit.name, unit.key)) {
-            Some(Some(kept)) => found.push(kept.clone()),
-            Some(None) => {}
-            None => asked.push((unit.name, unit.place)),
+    if let Some(prior) = prior.filter(|prior| prior.under == *under) {
+        let mut pu = 0usize;
+        let mut pf = 0usize;
+        for unit in units.iter() {
+            while let Some(entry) = prior.units.get(pu)
+                && entry.0 < unit.name
+            {
+                pu += 1;
+            }
+            if prior.units.get(pu).is_some_and(|entry| entry.0 == unit.name && entry.1 == unit.key) {
+                while let Some(entry) = prior.found.get(pf)
+                    && entry.name < unit.name
+                {
+                    pf += 1;
+                }
+                if let Some(kept) = prior.found.get(pf).filter(|entry| entry.name == unit.name) {
+                    found.push(kept.clone());
+                }
+            } else {
+                asked.push((unit.name, unit.place));
+            }
         }
+    } else {
+        asked.extend(units.iter().map(|unit| (unit.name, unit.place)));
     }
     // 2. The asked units linted. The same marks the outline's parts were keyed with (work.rs
     // `outline_file`): the file stands as its own crate root, as there.
-    let subject = crate::signature::file_subject(path);
-    let marks = crate::lints::marks_of(text, text);
-    let mut did: blaze_own::AVec<'_, Result<crate::lints::SparseUnit<Global>, Why>> = blaze_own::AVec::with_capacity_in(asked.len(), alloc);
-    crate::lints::lint_units_sparse::<crate::lints::Splitting, _>(cx, &entries, &chain_of, text, path, subject, &asked, rules, marks, alloc, Global, counts, &mut did)
-        .map_err(|err| refused(err.as_str()))?;
-    // 3. Each linted unit's findings, its item named for the profile and the tests.
-    let mut relinted = std::vec::Vec::with_capacity_in(did.len(), Global);
+    let mut relinted = blaze_own::Vec::with_capacity_in(asked.len(), Global);
     let mut cost = (0u64, Cost::NONE);
-    for one in did {
-        let sparse = one?;
-        let entry = sparse.unit.checked_sub(1).and_then(|at| entries.get(at).map(|item| (at, item)));
-        relinted.push(entry.map(|(_, item)| blaze_own::String::from_str_in(crate::item_name::shown_name(item, text), Global)));
-        cost.0 += u64::from(sparse.tokens);
-        cost.1.add_all(&sparse.cost);
-        let Some(unit_found) = sparse.found else {
-            continue;
-        };
-        found.push(Found {
-            name: sparse.name,
-            chain: entry.map(|(at, _)| chain_of(at)),
-            findings: unit_found.findings,
-            words: unit_found.words,
-            fixes: unit_found.fixes,
-        });
+    if !asked.is_empty() {
+        let subject = crate::signature::file_subject(path);
+        let marks = crate::lints::marks_of(text, text);
+        let mut did: blaze_own::AVec<'_, Result<crate::lints::SparseUnit<Global>, Why>> = blaze_own::AVec::with_capacity_in(asked.len(), alloc);
+        crate::lints::lint_units_sparse::<crate::lints::Splitting, _>(cx, &entries, &chain_of, text, path, subject, &asked, rules, marks, alloc, Global, counts, &mut did)
+            .map_err(|err| refused(err.as_str()))?;
+        // 3. Each linted unit's findings, its item named for the profile and the tests.
+        for one in did {
+            let sparse = one?;
+            let entry = sparse.unit.checked_sub(1).and_then(|at| entries.get(at).map(|item| (at, item)));
+            relinted.push(entry.map(|(_, item)| blaze_own::String::from_str_in(crate::item_name::shown_name(item, text), Global)));
+            cost.0 += u64::from(sparse.tokens);
+            cost.1.add_all(&sparse.cost);
+            let Some(unit_found) = sparse.found else {
+                continue;
+            };
+            found.push(Found {
+                name: sparse.name,
+                chain: entry.map(|(at, _)| chain_of(at)),
+                findings: unit_found.findings,
+                words: unit_found.words,
+                fixes: unit_found.fixes,
+            });
+        }
     }
     // 4. The file's record, its found units in name order (kept or linted, the same bytes).
     found.sort_unstable_by_key(|one| one.name);

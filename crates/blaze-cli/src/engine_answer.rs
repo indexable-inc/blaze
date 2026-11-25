@@ -209,6 +209,8 @@ pub(crate) fn unroot_checkout<D: Driver>(
         for base in bases.iter() {
             if removed_pointers.scan_for(&base.pointer).is_none() {
                 kept.push(*base);
+            } else {
+                unroot_base_slot(lent, base.workspace, base.layout, frame);
             }
         }
         if kept.len() != bases.len() {
@@ -227,9 +229,12 @@ pub(crate) fn unroot_checkout<D: Driver>(
                     &[bytes.as_slice()],
                 ).map_err(crate::store::PlaceError::from)?;
                 lent.root_for(BASES_ROOT, &[record], blaze_cas::plain::ROOT_LIFE_NS).map_err(crate::store::PlaceError::from)?;
-                let mut pointers: blaze_own::Vec<blaze_cas::Key, &Frame> = blaze_own::Vec::with_capacity_in(kept.len(), frame);
-                pointers.extend(kept.iter().map(|it| blaze_cas::Key(it.pointer.0)));
-                lent.root_for(BASES_KEPT_ROOT, &pointers, blaze_cas::plain::ROOT_LIFE_NS).map_err(crate::store::PlaceError::from)?;
+                let mut kept_indexes: blaze_own::Vec<blaze_cas::Key, &Frame> = blaze_own::Vec::with_capacity_in(kept.len(), frame);
+                for base in kept.iter() {
+                    kept_indexes.push(kept_index_for_base(lent, base.pointer)?);
+                    renew_base_slot(lent, base.workspace, base.layout, frame);
+                }
+                lent.root_through(BASES_KEPT_ROOT, &kept_indexes, blaze_cas::plain::ROOT_LIFE_NS).map_err(crate::store::PlaceError::from)?;
             }
         }
     }
@@ -1860,6 +1865,11 @@ fn save<'m, D: Driver, S: Sharing>(
     }
     let reach_name = bstd::mem::format_in!(frame, "{name}.{REACH_ROOT}");
     let answer_name = bstd::mem::format_in!(frame, "{name}.{ANSWER_ROOT}");
+    let last_info = match (last, last_root) {
+        (Some(base), Some(key)) => Some((base.root.page_count(), key)),
+        _ => None,
+    };
+    let mut unsharded_indexes: Option<blaze_own::Vec<blaze_cas::Key, SharedAlloc<'_>>> = None;
     let (pages_live, rekeyed) = if !encoded.is_radix() {
         let last_pages = match (last, last_root) {
             (Some(base), Some(key)) if !base.root.is_radix() => Some((&base.root.pages[..], key)),
@@ -1871,15 +1881,12 @@ fn save<'m, D: Driver, S: Sharing>(
         // Retire any stale sharded reach roots left over if this answer previously exceeded the
         // radix threshold and shrank back to unsharded, so certified no-ops never renew them.
         unroot_reach_shards(lent, name, 0, true, frame);
+        unsharded_indexes = Some(indexes);
         (count, rekeyed)
     } else {
         if lent.has_root(reach_name.as_str()) {
             lent.unroot(reach_name.as_str());
         }
-        let last_info = match (last, last_root) {
-            (Some(base), Some(key)) => Some((base.root.page_count(), key)),
-            _ => None,
-        };
         publish_reach_shards_from(
             lent,
             name,
@@ -1893,14 +1900,20 @@ fn save<'m, D: Driver, S: Sharing>(
     };
     saved.pages = pages_live;
     saved.rekeyed = rekeyed;
-    let mut direct = blaze_own::Vec::new_in(alloc);
-    direct.push(blaze_cas::Key(encoded.root.0));
-    // Pin every live radix leaf shard (`<= 256`), file shard (`<= 16`), places, and summary
-    // sub-record directly under `{name}.answer` so `blaze gc` always retains the whole root tree.
-    direct.extend(encoded.tree_keys().iter().map(|key| blaze_cas::Key(key.0)));
-    direct.push(blaze_cas::Key(lines.0.0));
+    let mut base_direct = blaze_own::Vec::with_capacity_in(2 + encoded.tree_keys().len() + HeaderPages::COUNT, alloc);
+    base_direct.push(blaze_cas::Key(key.0));
+    base_direct.push(blaze_cas::Key(encoded.root.0));
+    base_direct.extend(encoded.tree_keys().iter().map(|k| blaze_cas::Key(k.0)));
+    base_direct.push(blaze_cas::Key(lines.0.0));
     if let Some(keys) = headers.current() {
-        direct.extend(keys.keys.iter().filter(|key| **key != Key::default()).map(|key| blaze_cas::Key(key.0)));
+        base_direct.extend(keys.keys.iter().filter(|k| **k != Key::default()).map(|k| blaze_cas::Key(k.0)));
+    }
+    // Pure function of `key` (every entry is embedded in or content-addressed by the sealed
+    // pointer): pinned under `BASES_KEPT_ROOT` and reused by cross-worktree `adopt_certified`.
+    let base_direct_index = lent.index_beside(blaze_cas::Key(key.0), &base_direct).map_err(crate::store::PlaceError::from)?;
+    let mut direct = blaze_own::Vec::with_capacity_in(base_direct.len() + row_keys.len(), alloc);
+    if let Some(rest) = base_direct.get(1..) {
+        direct.extend_from_slice(rest);
     }
     // The member listing rows this request read or put (engine_bodies.rs `member_row_keys`,
     // engine_member_rows.rs): named here so they live while the answer does, and the next
@@ -1935,39 +1948,336 @@ fn save<'m, D: Driver, S: Sharing>(
         store.pin(LATEST_ROOT, &[key])?;
         return Ok(saved);
     }
-    saved.base = keep_base(cx, store, rows, key, frame)?;
+    saved.base = keep_base(
+        cx,
+        store,
+        lent,
+        rows,
+        key,
+        base_direct_index,
+        &encoded,
+        &indexed_beside,
+        unsharded_indexes.as_deref(),
+        last_info,
+        rekey,
+        alloc,
+        frame,
+    )?;
     Ok(saved)
     })();
     drop(save_mem);
     result
 }
 
+/// Prefix for a kept workspace base's own reach and answer roots:
+/// `engine.bases.slot.<16 hex of workspace>.<16 hex of layout>`.
+/// Each entry in [`BASES_ROOT`] has a unique `(workspace, layout)` pair (bounded by
+/// [`BASES_MOST`] = 32), so incremental edits in the same layout reuse the sharded reach fast
+/// path in O(1) while older kept layouts retain all of their pages across GC and `blaze clean`.
+fn base_slot_prefix<'f>(workspace: ContentId, layout: ContentId, frame: &'f Frame) -> blaze_own::String<&'f Frame> {
+    let mut name = blaze_own::String::new_in(frame);
+    name.push_str("engine.bases.slot.");
+    for byte in workspace.0.iter().take(8) {
+        let _ = write!(name, "{byte:02x}");
+    }
+    name.push('.');
+    for byte in layout.0.iter().take(8) {
+        let _ = write!(name, "{byte:02x}");
+    }
+    name
+}
+
+/// Unroots every GC reach root owned by an evicted or pruned workspace base slot.
+fn unroot_base_slot<D: Driver>(
+    lent: &blaze_cas::plain::Lent<D, crate::store::StoreAlloc>,
+    workspace: ContentId,
+    layout: ContentId,
+    frame: &Frame,
+) {
+    let prefix = base_slot_prefix(workspace, layout, frame);
+    let answer_name = bstd::mem::format_in!(frame, "{}.{ANSWER_ROOT}", prefix.as_str());
+    let reach_name = bstd::mem::format_in!(frame, "{}.{REACH_ROOT}", prefix.as_str());
+    if lent.has_root(answer_name.as_str()) {
+        lent.unroot(answer_name.as_str());
+    }
+    if lent.has_root(reach_name.as_str()) {
+        lent.unroot(reach_name.as_str());
+    }
+    unroot_reach_shards(lent, prefix.as_str(), 0, true, frame);
+}
+
+/// Renews an already-kept workspace base slot's answer and reach roots in O(1) so surviving
+/// entries in [`BASES_ROOT`] do not expire while another checkout keeps updating the list.
+fn renew_base_slot<D: Driver>(
+    lent: &blaze_cas::plain::Lent<D, crate::store::StoreAlloc>,
+    workspace: ContentId,
+    layout: ContentId,
+    frame: &Frame,
+) {
+    let prefix = base_slot_prefix(workspace, layout, frame);
+    let answer_name = bstd::mem::format_in!(frame, "{}.{ANSWER_ROOT}", prefix.as_str());
+    let _ = lent.renew_root(answer_name.as_str(), blaze_cas::plain::ROOT_LIFE_NS);
+    let reach_name = bstd::mem::format_in!(frame, "{}.{REACH_ROOT}", prefix.as_str());
+    if lent.renew_root(reach_name.as_str(), blaze_cas::plain::ROOT_LIFE_NS).is_live() {
+        return;
+    }
+    let first = bstd::mem::format_in!(frame, "{}.{REACH_ROOT}.00", prefix.as_str());
+    if !lent.renew_root(first.as_str(), blaze_cas::plain::ROOT_LIFE_NS).is_live() {
+        return;
+    }
+    let mut shard_name = blaze_own::String::new_in(frame);
+    for shard in 1..REACH_SHARDS_MOST {
+        shard_name.clear();
+        let _ = write!(shard_name, "{}.{REACH_ROOT}.{shard:02x}", prefix.as_str());
+        if !lent.renew_root(shard_name.as_str(), blaze_cas::plain::ROOT_LIFE_NS).is_live() {
+            break;
+        }
+    }
+    let delta_name = bstd::mem::format_in!(frame, "{}.{REACH_ROOT}.{REACH_DELTA_SUFFIX}", prefix.as_str());
+    let _ = lent.renew_root(delta_name.as_str(), blaze_cas::plain::ROOT_LIFE_NS);
+}
+
+/// Resolves the `Index` record to pin under [`BASES_KEPT_ROOT`] for `pointer`: uses the
+/// deterministic `beside_key(pointer)` index holding `[pointer, root, tree_keys..., lines,
+/// headers...]` when present in `lent`, else falls back to a single-key index `[pointer]`.
+fn kept_index_for_base<D: Driver>(
+    lent: &blaze_cas::plain::Lent<D, crate::store::StoreAlloc>,
+    pointer: Key,
+) -> Result<blaze_cas::Key, CliError> {
+    let cas_ptr = blaze_cas::Key(pointer.0);
+    let beside = blaze_cas::plain::beside_key(cas_ptr);
+    if let Some(held) = lent.get(&beside).map_err(crate::store::PlaceError::from)?
+        && blaze_keyed::kind::ReservedTag::Index.is(held.tag)
+        && held.bytes.len() % 32 == 0
+    {
+        return Ok(beside);
+    }
+    Ok(lent.index(&[cas_ptr]).map_err(crate::store::PlaceError::from)?)
+}
+
 /// The bases with `pointer` as its workspace's newest ([`with_base`]), rewritten and pinned
-/// with every pointer they list under [`BASES_ROOT`]. The workspace is the one this request
-/// read ([`Rows::workspace`]), else the one an entry of its layout or lock names
-/// ([`workspace_of_rows`]).
-fn keep_base<'m, D: Driver, S: Sharing>(cx: &Cx, store: &mut CommandStore<'m, '_, D, S>, rows: &Rows<'_>, pointer: Key, frame: &Frame) -> Result<BaseKept, CliError> {
+/// alongside each base's answer root, lines, header shards, and page reach indexes so GC or
+/// `blaze clean` in another worktree cannot leave any base in [`BASES_ROOT`] dangling.
+#[expect(clippy::too_many_arguments, reason = "base publish edge: each argument one handle or reach input")]
+fn keep_base<'m, D: Driver, S: Sharing>(
+    cx: &Cx,
+    store: &mut CommandStore<'m, '_, D, S>,
+    lent: &'m blaze_cas::plain::Lent<D, crate::store::StoreAlloc>,
+    rows: &Rows<'_>,
+    pointer: Key,
+    base_direct_index: blaze_cas::Key,
+    encoded: &pages::Encoded<'_>,
+    indexed_beside: &BesideCache<'_>,
+    unsharded_indexes: Option<&[blaze_cas::Key]>,
+    last_info: Option<(usize, Key)>,
+    rekey: Rekey,
+    alloc: SharedAlloc<'_>,
+    frame: &Frame,
+) -> Result<BaseKept, CliError> {
     let Some(layout) = layout_of(rows, frame) else { return Ok(BaseKept::NoWorkspace) };
     let lock = rows.lock_id().unwrap_or(NO_LOCK);
-    let (bases, replaced) = match read_bases(cx, store, frame)? {
+    let (old_bases, replaced) = match read_bases(cx, store, frame)? {
         Some(Some(bases)) => (bases, false),
         Some(None) => (blaze_own::Vec::new_in(frame), true),
         None => (blaze_own::Vec::new_in(frame), false),
     };
-    let Some(workspace) = workspace_of_rows(&bases, rows.workspace, layout, lock) else { return Ok(BaseKept::Unknown) };
+    let Some(workspace) = workspace_of_rows(&old_bases, rows.workspace, layout, lock) else { return Ok(BaseKept::Unknown) };
     let now = Base { workspace: workspace.id, lock, layout, root: root_of(rows), pointer, seq: 0 };
-    let bases = with_base(&bases, now, frame);
+    let bases = with_base(&old_bases, now, frame);
     let bytes = encode_bases(&bases, frame);
     let record = Key(ContentId::of(BASES_DOMAIN, &bytes));
     store.put_local(cx, record, &bytes)?;
     store.pin(BASES_ROOT, &[record])?;
-    let mut pointers = blaze_own::Vec::with_capacity_in(bases.len(), frame);
-    pointers.extend(bases.iter().map(|it| it.pointer));
-    store.pin(BASES_KEPT_ROOT, &pointers)?;
+
+    // Pin this base's page reach roots under its `(workspace, layout)` slot so pages remain live
+    // even if this checkout later moves to another layout or expires.
+    let prefix = base_slot_prefix(now.workspace, now.layout, frame);
+    let base_answer = bstd::mem::format_in!(frame, "{}.{ANSWER_ROOT}", prefix.as_str());
+    let base_reach = bstd::mem::format_in!(frame, "{}.{REACH_ROOT}", prefix.as_str());
+    if let Some(indexes) = unsharded_indexes {
+        lent.root_through(base_reach.as_str(), indexes, blaze_cas::plain::ROOT_LIFE_NS)
+            .map_err(crate::store::PlaceError::from)?;
+        unroot_reach_shards(lent, prefix.as_str(), 0, true, frame);
+    } else {
+        if lent.has_root(base_reach.as_str()) {
+            lent.unroot(base_reach.as_str());
+        }
+        let _ = publish_reach_shards_from(
+            lent,
+            prefix.as_str(),
+            base_answer.as_str(),
+            ReachSource::Radix { last: last_info, encoded },
+            rekey,
+            Some(indexed_beside),
+            alloc,
+            frame,
+        )?;
+    }
+    lent.root_through(base_answer.as_str(), &[base_direct_index], blaze_cas::plain::ROOT_LIFE_NS)
+        .map_err(crate::store::PlaceError::from)?;
+
+    // Unroot evicted base slots and renew surviving base slots in O(1).
+    for old in old_bases.iter() {
+        if !bases.iter().any(|it| it.workspace == old.workspace && it.layout == old.layout) {
+            unroot_base_slot(lent, old.workspace, old.layout, frame);
+        }
+    }
+    let mut kept_indexes: blaze_own::Vec<blaze_cas::Key, &Frame> = blaze_own::Vec::with_capacity_in(bases.len(), frame);
+    for base in bases.iter() {
+        if base.workspace == now.workspace && base.layout == now.layout {
+            kept_indexes.push(base_direct_index);
+        } else {
+            renew_base_slot(lent, base.workspace, base.layout, frame);
+            kept_indexes.push(kept_index_for_base(lent, base.pointer)?);
+        }
+    }
+    lent.root_through(BASES_KEPT_ROOT, &kept_indexes, blaze_cas::plain::ROOT_LIFE_NS)
+        .map_err(crate::store::PlaceError::from)?;
     Ok(match replaced {
         true => BaseKept::Replaced,
         false => BaseKept::Kept { entries: u32::try_from(bases.len()).unwrap_or(u32::MAX) },
     })
+}
+
+/// Adopts an identical stored answer from another checkout (`StoredBase::OtherCheckout`, zero
+/// moved leaves, matching tools, replayable, 0 owed) under this checkout's own root `name`
+/// without re-running the `Phases` driver.
+///
+/// Writes a fresh sealed pointer carrying this checkout's leaf stamps (`rows`) and journal cursor
+/// (`journal`), and pins `{name}`, `{name}.journal`, `{name}.answer`, and `{name}.reach` (or
+/// sharded reach roots) so this checkout's answer is completely independent of the source
+/// checkout under GC and `blaze clean`.
+///
+/// Returns `Ok(Some(new_pointer_key))` when adopted, or `Ok(None)` if a legacy radix base lacks
+/// its `beside_key(pointer)` root-tree index (caller falls through to `Phases`).
+#[expect(clippy::too_many_arguments, reason = "cross-worktree adoption edge: each argument one handle")]
+pub(crate) fn adopt_certified<'m, D: Driver, S: Sharing>(
+    cx: &Cx,
+    store: &mut CommandStore<'m, '_, D, S>,
+    lent: &'m blaze_cas::plain::Lent<D, crate::store::StoreAlloc>,
+    name: &str,
+    pointer: &Pointer<'_>,
+    root_dir: &Root<'_>,
+    rows: &Rows<'_>,
+    journal: &crate::journal_sweep::Taken<'_>,
+    alloc: SharedAlloc<'_>,
+    frame: &Frame,
+) -> Result<Option<Key>, CliError> {
+    let old_cas_ptr = blaze_cas::Key(pointer.key.0);
+    let old_beside = blaze_cas::plain::beside_key(old_cas_ptr);
+    let mut direct: blaze_own::Vec<blaze_cas::Key, SharedAlloc<'_>> = blaze_own::Vec::new_in(alloc);
+    if let Some(held) = lent.get(&old_beside).map_err(crate::store::PlaceError::from)?
+        && blaze_keyed::kind::ReservedTag::Index.is(held.tag)
+        && held.bytes.len() % 32 == 0
+    {
+        let count = held.bytes.len() / 32;
+        direct.reserve(count);
+        for i in 0..count {
+            let k = cas_key_at(held.bytes, i);
+            if k != old_cas_ptr {
+                direct.push(k);
+            }
+        }
+    } else if !root_dir.is_radix() {
+        direct.push(blaze_cas::Key(pointer.root.0));
+        direct.push(blaze_cas::Key(pointer.lines.0));
+        if let Some(keys) = pointer.headers.current() {
+            direct.extend(keys.keys.iter().filter(|k| **k != Key::default()).map(|k| blaze_cas::Key(k.0)));
+        }
+    } else {
+        return Ok(None);
+    }
+
+    let leaves = Leaves::bytes_in(rows, frame)?;
+    let mut ptr_bytes: blaze_own::Vec<u8, &Frame> = blaze_own::Vec::with_capacity_in(POINTER_BYTES, frame);
+    ptr_bytes.extend_from_slice(POINTER_MAGIC);
+    ptr_bytes.extend_from_slice(&pointer.root.0.0);
+    ptr_bytes.extend_from_slice(&pointer.lines.0.0);
+    ptr_bytes.extend_from_slice(&pointer.facts.files.to_le_bytes());
+    ptr_bytes.push(pointer.facts.printed.byte());
+    ptr_bytes.extend_from_slice(&pointer.facts.findings.to_le_bytes());
+    ptr_bytes.extend_from_slice(&pointer.facts.owed.to_le_bytes());
+    ptr_bytes.extend_from_slice(&pointer.tools.0);
+    match &pointer.headers {
+        Headers::Current(keys) => {
+            ptr_bytes.push(HEADERS_CURRENT);
+            ptr_bytes.extend_from_slice(&0u64.to_le_bytes());
+            for key in &keys.keys {
+                ptr_bytes.extend_from_slice(&key.0.0);
+            }
+        }
+        Headers::Absent { since } => {
+            ptr_bytes.push(HEADERS_ABSENT);
+            ptr_bytes.extend_from_slice(&since.0.to_le_bytes());
+            ptr_bytes.extend_from_slice(&[0u8; 32 * HeaderPages::COUNT]);
+        }
+    }
+    journal.encode(&mut ptr_bytes);
+    let sealed = seal::seal(&ptr_bytes, &leaves, frame)?;
+    let new_key = Key(ContentId::of(POINTER_DOMAIN, &sealed));
+    store.put_local(cx, new_key, &sealed)?;
+
+    let reach_name = bstd::mem::format_in!(frame, "{name}.{REACH_ROOT}");
+    let answer_name = bstd::mem::format_in!(frame, "{name}.{ANSWER_ROOT}");
+    if !root_dir.is_radix() {
+        let mut indexes: blaze_own::Vec<blaze_cas::Key, SharedAlloc<'_>> = blaze_own::Vec::new_in(alloc);
+        indexes.extend(
+            root_dir
+                .pages
+                .iter()
+                .filter(|p| **p != Key::default())
+                .map(|p| blaze_cas::plain::beside_key(blaze_cas::Key(p.0))),
+        );
+        indexes.sort_unstable();
+        lent.root_through(reach_name.as_str(), &indexes, blaze_cas::plain::ROOT_LIFE_NS)
+            .map_err(crate::store::PlaceError::from)?;
+        unroot_reach_shards(lent, name, 0, true, frame);
+    } else {
+        if lent.has_root(reach_name.as_str()) {
+            lent.unroot(reach_name.as_str());
+        }
+        let num_shards = root_dir.page_count().div_ceil(REACH_SHARD_PAGES);
+        let leaves_per_reach = REACH_SHARD_PAGES / pages::RADIX_LEAF_PAGES;
+        let mut shard_name = blaze_own::String::new_in(frame);
+        let mut scratch: blaze_own::Vec<blaze_cas::Key, SharedAlloc<'_>> = blaze_own::Vec::with_capacity_in(REACH_SHARD_PAGES, alloc);
+        for shard in 0..num_shards {
+            shard_name.clear();
+            let _ = write!(shard_name, "{name}.{REACH_ROOT}.{shard:02x}");
+            scratch.clear();
+            let from_leaf = shard * leaves_per_reach;
+            let to_leaf = (from_leaf + leaves_per_reach).min(root_dir.page_shards.len());
+            for leaf_idx in from_leaf..to_leaf {
+                let shard_key = root_dir.page_shards.get(leaf_idx).copied().unwrap_or_default();
+                if shard_key == Key::default() {
+                    continue;
+                }
+                let leaf = decode_lent_radix_shard(lent, shard_key, leaf_idx, root_dir.bits, alloc)?;
+                scratch.extend(
+                    leaf.keys
+                        .iter()
+                        .filter(|p| **p != Key::default())
+                        .map(|p| blaze_cas::plain::beside_key(blaze_cas::Key(p.0))),
+                );
+            }
+            scratch.sort_unstable();
+            lent.root_through(shard_name.as_str(), &scratch, blaze_cas::plain::ROOT_LIFE_NS)
+                .map_err(crate::store::PlaceError::from)?;
+        }
+        let delta_name = bstd::mem::format_in!(frame, "{name}.{REACH_ROOT}.{REACH_DELTA_SUFFIX}");
+        lent.root_through(delta_name.as_str(), &[], blaze_cas::plain::ROOT_LIFE_NS)
+            .map_err(crate::store::PlaceError::from)?;
+        unroot_reach_shards(lent, name, num_shards, false, frame);
+    }
+    let answer_index = lent.index(&direct).map_err(crate::store::PlaceError::from)?;
+    lent.root_through(answer_name.as_str(), &[answer_index], blaze_cas::plain::ROOT_LIFE_NS)
+        .map_err(crate::store::PlaceError::from)?;
+    let mut base_direct: blaze_own::Vec<blaze_cas::Key, SharedAlloc<'_>> = blaze_own::Vec::with_capacity_in(direct.len() + 1, alloc);
+    base_direct.push(blaze_cas::Key(new_key.0));
+    base_direct.extend_from_slice(&direct);
+    let _ = lent.index_beside(blaze_cas::Key(new_key.0), &base_direct).map_err(crate::store::PlaceError::from)?;
+    store.pin(name, &[new_key])?;
+    store.pin(crate::journal_checkpoint::name(name, frame).as_str(), &[new_key])?;
+    Ok(Some(new_key))
 }
 
 /// The bases the home keeps: `None` with no [`BASES_ROOT`]; `Some(None)` for a root or record
@@ -2680,10 +2990,10 @@ fn merge_sorted_keys<'h>(carried: &[u8], added: &[blaze_cas::Key], alloc: Shared
 /// Source of page keys for [`publish_reach_shards_from`]: either a flat slice (unit tests) or a
 /// 2-level radix [`pages::Encoded`] whose leaf shards live in `lent` and whose incremental deltas
 /// avoid scanning all `1 << bits` slots.
-enum ReachSource<'a> {
+enum ReachSource<'a, 'e> {
     #[cfg(test)]
     Flat { last: Option<(&'a [Key], Key)>, now: &'a [Key] },
-    Radix { last: Option<(usize, Key)>, encoded: &'a pages::Encoded<'a> },
+    Radix { last: Option<(usize, Key)>, encoded: &'a pages::Encoded<'e> },
 }
 
 /// Sharded reach roots (`{name}.reach.00`..`{name}.reach.7f`, [`REACH_SHARD_PAGES`] page slots per
@@ -2701,7 +3011,7 @@ fn publish_reach_shards_from<D: Driver>(
     lent: &blaze_cas::plain::Lent<D, crate::store::StoreAlloc>,
     name: &str,
     answer_name: &str,
-    source: ReachSource<'_>,
+    source: ReachSource<'_, '_>,
     rekey: Rekey,
     known_beside: Option<&BesideCache<'_>>,
     alloc: SharedAlloc<'_>,
