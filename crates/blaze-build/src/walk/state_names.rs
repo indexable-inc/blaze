@@ -269,6 +269,13 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         self.names.as_ref().is_some_and(|n| n.named.iter().any(|r| r.0 == slot))
     }
 
+    /// The flow identity that named `slot` as its value field, if any.
+    pub(super) fn slot_identity(&self, slot: SlotId) -> Option<Identity> {
+        self.names
+            .as_ref()
+            .and_then(|n| n.named.iter().find(|r| r.0 == slot && r.2 == SlotRole::Value).map(|r| r.1))
+    }
+
     /// Whether binding `p` is saved in the laid coroutine state (`StateNames`). Returns `true`
     /// outside a laid coroutine state so callers only end slots proven unsaved by the flow.
     pub(super) fn binding_is_saved(&self, p: blaze_typeck::PatId) -> bool {

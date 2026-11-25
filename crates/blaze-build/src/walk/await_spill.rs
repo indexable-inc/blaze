@@ -55,10 +55,123 @@ enum Form {
 }
 
 impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
-    /// Whether `x` is made again after a resume (blaze-lir coroutine.rs `plan`'s `remade`).
+    /// Whether `x` is made again after a resume (blaze-lir coroutine.rs `can_remat`).
     fn remade(&self, x: Value) -> bool {
+        const MAX_DEPTH: u8 = 16;
+        const MAX_NODES: usize = 64;
         let view = self.b.func().view();
-        matches!(view.op(x.index()), Op::SlotAddr | Op::Iconst | Op::Null | Op::FuncAddr | Op::DataAddr)
+        let mut stack = [(0usize, 0u8); MAX_NODES];
+        let Some(first) = stack.get_mut(0) else { return false };
+        *first = (x.index(), MAX_DEPTH);
+        let mut len = 1usize;
+        let mut visited = 0usize;
+        while len > 0 {
+            len -= 1;
+            let Some(&(v, depth)) = stack.get(len) else { return false };
+            if v >= view.len() {
+                return false;
+            }
+            // Entry parameter 1 is the coroutine's `state` pointer (available in every poll & drop).
+            if v == 1 && view.op(v) == Op::Param {
+                continue;
+            }
+            visited += 1;
+            if depth == 0 || visited > MAX_NODES {
+                return false;
+            }
+            match view.op(v) {
+                Op::SlotAddr
+                | Op::Iconst
+                | Op::IconstWide
+                | Op::Fconst
+                | Op::FconstWide
+                | Op::Vconst
+                | Op::Null
+                | Op::Uninit
+                | Op::FuncAddr
+                | Op::DataAddr => {}
+                Op::PtrAdd
+                | Op::PtrAddr
+                | Op::Expose
+                | Op::FromExposed
+                | Op::PtrWithAddr
+                | Op::Zext
+                | Op::Sext
+                | Op::Trunc
+                | Op::Bitcast
+                | Op::Fpext
+                | Op::Fptrunc
+                | Op::UitoFp
+                | Op::SitoFp
+                | Op::Add
+                | Op::Sub
+                | Op::Mul
+                | Op::Neg
+                | Op::And
+                | Op::Or
+                | Op::Xor
+                | Op::Not
+                | Op::Shl
+                | Op::Lshr
+                | Op::Ashr
+                | Op::Rotl
+                | Op::Rotr
+                | Op::Umin
+                | Op::Umax
+                | Op::Smin
+                | Op::Smax
+                | Op::UaddSat
+                | Op::SaddSat
+                | Op::UsubSat
+                | Op::SsubSat
+                | Op::Clz
+                | Op::Ctz
+                | Op::Popcnt
+                | Op::Bswap
+                | Op::Bitrev
+                | Op::Icmp
+                | Op::Fcmp
+                | Op::Select => match view.op(v).info().layout {
+                    blaze_lir::op::Layout::Data(blaze_lir::op::Field::Value) => {
+                        let Some(op_ix) = view.data.get(v).copied().and_then(|d| usize::try_from(d).ok()) else {
+                            return false;
+                        };
+                        let Some(dst) = stack.get_mut(len) else { return false };
+                        *dst = (op_ix, depth - 1);
+                        len += 1;
+                    }
+                    blaze_lir::op::Layout::None | blaze_lir::op::Layout::Data(_) => {}
+                    blaze_lir::op::Layout::Extra(fields) => {
+                        let Some(off) = view.data.get(v).copied().and_then(|d| usize::try_from(d).ok()) else {
+                            return false;
+                        };
+                        let Some(words) = view.extra.get(off..) else { return false };
+                        let Some(&raw_ty) = view.tys.get(v) else { return false };
+                        let mut ok = true;
+                        let _ = blaze_lir::op::walk(words, fields, Ty(raw_ty), view.tys, &mut |w| {
+                            if let blaze_lir::op::Word::Value(u) = w {
+                                let Ok(op_ix) = usize::try_from(u) else {
+                                    ok = false;
+                                    return Ok::<(), ()>(());
+                                };
+                                if let Some(dst) = stack.get_mut(len) {
+                                    *dst = (op_ix, depth - 1);
+                                    len += 1;
+                                } else {
+                                    ok = false;
+                                }
+                            }
+                            Ok::<(), ()>(())
+                        });
+                        if !ok {
+                            return false;
+                        }
+                    }
+                },
+                _ => return false,
+            }
+        }
+        true
     }
 
     /// Whether waiting value `at` is an unadjusted pure constant aggregate (`At::Const` in

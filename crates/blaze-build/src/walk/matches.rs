@@ -280,6 +280,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             owner: Owner::None,
             tested,
         });
+        self.du_match_enter();
         let m = (self.matches.len() - 1) as u32;
         self.work.push(Task::MatchEnd);
         for i in (0..n).rev() {

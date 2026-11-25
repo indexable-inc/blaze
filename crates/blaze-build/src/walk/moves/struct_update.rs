@@ -204,10 +204,7 @@ impl<'x, A: Allocator + Copy> Walk<'x, '_, '_, A> {
             _ => {
                 let t = self.adjusted_ty(base)?;
                 let g = self.ground_ty(t).map_err(|error| Self::ty_err(base, error))?;
-                let slot = self.b.slot(8, 3, SlotKind::Named);
-                let fa = self.b.slot_addr(slot);
-                let all = self.b.iconst(Ty::I64, u128::from(u64::MAX));
-                self.b.store(Flags::NONE, all, fa, 0, MemAttrs::aligned(3));
+                let slot = self.new_temp_mask(src, base);
                 self.scope_pats[i] = Held::Moved { at: src, g, mask: slot };
                 slot
             }

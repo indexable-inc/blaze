@@ -1187,6 +1187,72 @@ fn await_of_zero_sized_future_completes_without_state_slot() {
     assert_eq!(ran_laid, ran);
 }
 
+/// A non-`move` nested `async { ... }` block (`Capture::Ref`) capturing an immutable local
+/// `ByRef`, a mutable local `ByMutRef`, and a dropping local (`D`) by ref across `.await` reloads
+/// each capture pointer from its state environment on demand instead of holding a block-0 `load`
+/// SSA value live across the suspension (`vN is live across a suspend`).
+#[test]
+fn nested_borrow_async_block_reloads_by_ref_and_by_mut_ref_across_await() {
+    let mut w = open_world();
+    let owner = async_fn(&mut w, "borrow_owner", "borrow_owner_future");
+    w.fx.finish();
+    let mut b = async_body();
+    let mut lits = StdVec::new();
+    let u64_ = b.ty(PNode::Uint(UintTy::U64));
+    // let base: u64 = 10;
+    let base = b.bind("base");
+    let k10 = lit(&mut b, &mut lits, 10);
+    let s_base = b.let_(base, Some(u64_), k10);
+    // let mut acc: u64 = 3;
+    let acc = b.bind_mut("acc");
+    let k3 = lit(&mut b, &mut lits, 3);
+    let s_acc = b.let_(acc, Some(u64_), k3);
+    // let d = mk_d();
+    let d = b.bind("d");
+    let mk = b.path(&["mk_d"]);
+    let d_val = b.call(mk, &[]);
+    let s_d = b.let_(d, None, d_val);
+
+    // Inner `async { let r = twice().await; acc = acc + r + base + d.x; acc }`
+    let awaited = call_await(&mut b, "twice");
+    let (s_r, r) = let_u64(&mut b, "r", awaited);
+    let acc_r = b.local(acc);
+    let r_e = b.local(r);
+    let base_e = b.local(base);
+    let d_e = b.local(d);
+    let dx = named_field(&mut b, d_e, "x");
+    let sum1 = bin(&mut b, BinOp::Add, acc_r, r_e);
+    let sum2 = bin(&mut b, BinOp::Add, sum1, base_e);
+    let sum3 = bin(&mut b, BinOp::Add, sum2, dx);
+    let acc_l = b.local(acc);
+    let assign = b.int(None);
+    b.exprs[assign.ix()] = Expr::Assign { lhs: acc_l, rhs: sum3 };
+    let s_assign = b.semi(assign);
+    let acc_out = b.local(acc);
+    let inner_body = b.block(&[s_r, s_assign], Some(acc_out));
+    let blk_e = b.async_block(inner_body, Capture::Ref);
+
+    let blk = b.bind("blk");
+    let s_blk = b.let_(blk, None, blk_e);
+    let blk_ref = b.local(blk);
+    let inner_waited = b.await_(blk_ref);
+    let (s_v, v) = let_u64(&mut b, "v", inner_waited);
+    let v_e = b.local(v);
+    let acc_after = b.local(acc);
+    let total = bin(&mut b, BinOp::Add, v_e, acc_after);
+    let body = b.block(&[s_base, s_acc, s_d, s_blk, s_v], Some(total));
+    let root = b.async_block(body, Capture::Move);
+    let progs = [Prog { item: owner, b: &b, root, lits: &lits }];
+
+    // `acc = 3 + 2 + 10 + 5 = 20`; outer returns `v + acc = 20 + 20 = 40`, with 1 drop of `d`.
+    let done = run(&w, &progs, Script::Complete);
+    assert_eq!(done, Ran { value: 40, polls: 3, drops: 1, made: 1 });
+
+    // Cancelled while suspended inside the inner `async { ... }` block: `d` still drops once.
+    let cancelled = run(&w, &progs, Script::CancelAfter(1));
+    assert_eq!(cancelled, Ran { value: u64::MAX, polls: 1, drops: 1, made: 1 });
+}
+
 mod async_unwind;
 
 /// Every slot kept across a suspension names a flow local (walk/state_names.rs; ASYNC.md P8).

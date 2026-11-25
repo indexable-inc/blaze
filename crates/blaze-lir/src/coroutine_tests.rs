@@ -250,6 +250,12 @@ fn run(world: &mut World, view: View<'_>, frame: &mut Frame, mut block: Block) -
                     let word = o.imm();
                     Some(Val::Int(if ty.bits(64) > 32 { word as i32 as i64 as u64 } else { u64::from(word) }))
                 }
+                Op::IconstWide => {
+                    let words = o.constant();
+                    let lo = u64::from(words.first().copied().unwrap_or(0));
+                    let hi = u64::from(words.get(1).copied().unwrap_or(0));
+                    Some(Val::Int(lo | (hi << 32)))
+                }
                 Op::Uninit => Some(Val::Undef),
                 Op::Add | Op::Sub => {
                     let (a, b) = (int(frame, o.value())?, int(frame, o.value())?);

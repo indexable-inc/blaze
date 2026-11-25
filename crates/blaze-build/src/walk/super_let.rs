@@ -86,6 +86,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                         let s = match home {
                             super::Home::Slot(s) => Some(s),
                             super::Home::At(v, off) => self.whole_slot((v, off)),
+                            super::Home::Indirect(..) => None,
                         };
                         if let Some(s) = s {
                             slots.push(s);

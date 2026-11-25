@@ -454,6 +454,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 self.scope_pats.remove(i);
                 if self.live {
                     self.b.slot_dead(mask);
+                    self.release_dead_slot(mask);
                 }
                 if let Some(slot) = self.whole_slot(at) {
                     self.end_temp_slot(slot);
@@ -555,7 +556,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 let home_hit = match self.slots.get(p.ix()).copied().flatten() {
                     Some((Home::Slot(s), _)) => s == slot,
                     Some((Home::At(v, _), _)) => self.value_slot(v) == Some(slot),
-                    None => false,
+                    Some((Home::Indirect(..), _)) | None => false,
                 };
                 let own_hit = match self.owned.get(p.ix()).copied() {
                     Some(LocalOwn::Drop(o)) => o.flag == Some(slot) || o.rest == Some(slot),
@@ -573,7 +574,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         self.slots.iter().any(|s| match *s {
             Some((Home::Slot(s), _)) => s == slot,
             Some((Home::At(v, _), _)) => self.value_slot(v) == Some(slot),
-            None => false,
+            Some((Home::Indirect(..), _)) | None => false,
         })
     }
 
@@ -595,18 +596,15 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
 
     /// Before an `.await`'s suspension loop: ends the storage of:
     /// 1. any statically moved-out dropping local binding (either unflagged with `!self.init[p]`,
-    ///    or flagged with `self.definitely_uninit[p]` after an unconditional move in its declaring
-    ///    expression), and
-    /// 2. in a laid coroutine state (`self.names.is_some()`), any non-dropping (`LocalOwn::None`)
-    ///    local binding whose `Identity::Binding(p)` is NOT saved by `blaze-flow::saved()` (so it
-    ///    is neither live by use nor maybe borrowed across any suspension, and is not dropped on
-    ///    the cancel path).
-    ///
-    /// Ending such a slot before the suspend prevents an `sret`- or call-escaped local (such as a
-    /// `Copy` struct returned via `sret` and dead before `.await`) from falsely remaining live
-    /// across the suspension; if the binding is re-assigned after resume, `Home::Slot(slot)` emits
-    /// a fresh `slot_addr` that re-opens its stack storage.
-    pub(super) fn end_moved_locals_before_await(&mut self) {
+    ///    or flagged with path-sensitive `self.definitely_uninit[p]`), plus its drop flag slot when
+    ///    the flow does not save `p` (so `drop_local` skips it on the cancel path too),
+    /// 2. in a laid coroutine state (`self.names.is_some()`), any non-dropping (`LocalOwn::None`
+    ///    or `LocalOwn::Kept`) local binding whose `Identity::Binding(p)` is NOT saved by
+    ///    `blaze-flow::saved()` and has no remaining unwalked uses, and
+    /// 3. in a laid coroutine state, any unnamed `SlotKind::Temp` slot unreachable from every
+    ///    live root of `Walk` (completed pre-await temporaries whose storage never explicitly
+    ///    ended before the suspension).
+    pub(super) fn end_dead_slots_before_await(&mut self, fut_slot: Option<SlotId>) {
         if !self.live {
             return;
         }
@@ -628,9 +626,16 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             }
             if let Some((Home::Slot(slot), _)) = self.slots.get(p.ix()).copied().flatten()
                 && !self.vals_use_slot(slot)
+                && !self.slot_is_named(slot)
             {
                 self.b.slot_dead(slot);
-                self.release_dead_slot(slot);
+            }
+            if let Some(flag_slot) = o.flag
+                && self.names.is_some()
+                && !self.binding_is_saved(p)
+                && !self.slot_is_named(flag_slot)
+            {
+                self.b.slot_dead(flag_slot);
             }
         }
         if self.names.is_some() {
@@ -658,6 +663,128 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 }
                 self.b.slot_dead(slot);
             }
+            // Live-root sweep over unnamed `SlotKind::Temp` slots: any temp slot not referenced
+            // by any live walk state or named in `StateNames` cannot be read after this suspend.
+            let num_slots = self.b.func().view().slots.len();
+            let mut keep: Vec<bool, A> = Vec::with_capacity_in(num_slots, self.alloc);
+            keep.resize(num_slots, false);
+            let mut mark = |slot: SlotId| {
+                if let Some(b) = keep.get_mut(slot.index()) {
+                    *b = true;
+                }
+            };
+            if let Some(s) = fut_slot {
+                mark(s);
+            }
+            if let Some(s) = self.co.and_then(|c| c.pin) {
+                mark(s);
+            }
+            for &v in self.vals.iter() {
+                if let V::Place(p, _) | V::Unsized(p, _) | V::Scalar(p) = v
+                    && let Some(s) = self.value_slot(p)
+                {
+                    mark(s);
+                }
+            }
+            for held_list in [&self.scope_pats, &self.let_else_held] {
+                for &h in held_list.iter() {
+                    match h {
+                        Held::Rest { at, .. } => {
+                            if let Some(s) = self.value_slot(at.0) {
+                                mark(s);
+                            }
+                        }
+                        Held::Moved { at, mask, .. } => {
+                            mark(mask);
+                            if let Some(s) = self.value_slot(at.0) {
+                                mark(s);
+                            }
+                        }
+                        Held::Temp { at, flag, .. } => {
+                            if let Some(s) = self.value_slot(at.0) {
+                                mark(s);
+                            }
+                            if let Some((f, home)) = flag {
+                                mark(f);
+                                mark(home);
+                            }
+                        }
+                        Held::Pat(_) | Held::EnvPlace(_) => {}
+                    }
+                }
+            }
+            for s in self.slots.iter().flatten() {
+                match s.0 {
+                    Home::Slot(slot) => mark(slot),
+                    Home::At(v, _) => {
+                        if let Some(slot) = self.value_slot(v) {
+                            mark(slot);
+                        }
+                    }
+                    Home::Indirect(..) => {}
+                }
+            }
+            for &own in self.owned.iter() {
+                match own {
+                    LocalOwn::Drop(o) => {
+                        if let Some(f) = o.flag {
+                            mark(f);
+                        }
+                        if let Some(r) = o.rest {
+                            mark(r);
+                        }
+                    }
+                    LocalOwn::KeptFlags(r) => mark(r),
+                    _ => {}
+                }
+            }
+            for &(_, s) in self.temp_slots.iter() {
+                mark(s);
+            }
+            for &(_, s) in self.scope_slots.iter() {
+                mark(s);
+            }
+            for &(_, s) in self.ext_flags.iter() {
+                mark(s);
+            }
+            for t in self.targets.iter() {
+                if let Some(s) = t.res {
+                    mark(s);
+                }
+            }
+            for m in self.matches.iter() {
+                if let Some(s) = m.res {
+                    mark(s);
+                }
+                if let Some((at, ..)) = m.of_enum
+                    && let Some(s) = self.value_slot(at.0)
+                {
+                    mark(s);
+                }
+                if let Some(at) = m.tested
+                    && let Some(s) = self.value_slot(at.at.0)
+                {
+                    mark(s);
+                }
+            }
+            for task in self.work.iter() {
+                match *task {
+                    Task::IfThen { res: Some(s), .. } | Task::IfElse { res: Some(s), .. } => mark(s),
+                    Task::GuardAlts { word, .. } => mark(word),
+                    _ => {}
+                }
+            }
+            self.moves.for_each_live_slot(&mut mark, |v| self.value_slot(v));
+            for (i, &kept) in keep.iter().enumerate() {
+                if kept {
+                    continue;
+                }
+                let Ok(id) = u32::try_from(i) else { continue };
+                let slot = SlotId(id);
+                if self.is_temp_slot(slot) && !self.slot_is_named(slot) {
+                    self.b.slot_dead(slot);
+                }
+            }
         }
     }
 
@@ -683,7 +810,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                                 dead.push(s);
                             }
                         }
-                        None => {}
+                        Some((Home::Indirect(..), _)) | None => {}
                     }
                     match self.owned.get(p.ix()).copied() {
                         Some(LocalOwn::Drop(o)) => {
@@ -729,10 +856,15 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         }
     }
 
-    /// Emits `slot_dead` on slots owned by `self.scope_pats[mark..]` and `self.scope_slots` at
-    /// depth `>= depth` WITHOUT modifying `scope_pats` or `scope_slots` (for a failed `if let`
-    /// link or `let`-`else` miss path, where the matched path still owns them).
+    /// Emits `slot_dead` on slots owned by `self.scope_pats[mark..]`, `self.scope_slots` at
+    /// depth `>= depth`, and `self.temp_slots` whose enclosing drop depth is `>= depth`, WITHOUT
+    /// modifying `scope_pats`, `scope_slots`, or `temp_slots` (for a failed `if let` link,
+    /// `let`-`else` miss path, `break`, or `continue`).
     pub(super) fn end_scope_slots_peek(&mut self, mark: usize, depth: usize) {
+        self.end_scope_slots_peek_except(mark, depth, None);
+    }
+
+    pub(super) fn end_scope_slots_peek_except(&mut self, mark: usize, depth: usize, except: Option<SlotId>) {
         if !self.live {
             return;
         }
@@ -743,8 +875,13 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 dead.push(slot);
             }
         }
+        for &(td, slot) in self.temp_slots.iter() {
+            if self.temp_scopes.get(td).is_some_and(|&(_, sd)| usize::try_from(sd).is_ok_and(|d| d >= depth)) {
+                dead.push(slot);
+            }
+        }
         for slot in dead {
-            if !self.vals_use_slot(slot) {
+            if Some(slot) != except && !self.vals_use_slot(slot) {
                 self.b.slot_dead(slot);
             }
         }

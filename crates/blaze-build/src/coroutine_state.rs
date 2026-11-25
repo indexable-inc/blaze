@@ -337,3 +337,69 @@ pub fn may_partial_move_bindings<'a>(body: &blaze_typeck::BodyView<'_>, checked:
     }
     out
 }
+
+/// Conservative syntactic scan over `body`: returns a bit per `ExprId` that is `true` whenever
+/// the walk (`own_scrutinee`, `move_temp_field`, `move_temp_box`, `take_temp_field`) may allocate
+/// an 8-byte partial-move field-flags word (`rest` / `Held::Moved`) for a temporary value of that
+/// expression.
+pub fn may_partial_move_temps<'a>(body: &blaze_typeck::BodyView<'_>, alloc: Alloc<'a>) -> Vec<bool, Alloc<'a>> {
+    use blaze_typeck::{Expr, ExprId, Pat, Stmt, UnOp};
+
+    let mut out = Vec::with_capacity_in(body.exprs.len(), alloc);
+    out.resize(body.exprs.len(), false);
+    let peel_parens = |mut cur: ExprId| -> ExprId {
+        for _ in 0..=body.exprs.len() {
+            match body.exprs.get(cur.ix()) {
+                Some(&Expr::Paren(inner)) => cur = inner,
+                _ => break,
+            }
+        }
+        cur
+    };
+    let root_temp = |mut cur: ExprId| -> Option<ExprId> {
+        for _ in 0..=body.exprs.len() {
+            match *body.exprs.get(cur.ix())? {
+                Expr::Local(_) => return None,
+                Expr::Paren(inner)
+                | Expr::Field { base: inner, .. }
+                | Expr::TupleField { base: inner, .. }
+                | Expr::Unary { op: UnOp::Deref, operand: inner } => cur = inner,
+                _ => return Some(cur),
+            }
+        }
+        None
+    };
+    let mark_expr = |out: &mut Vec<bool, Alloc<'a>>, e: ExprId| {
+        if let Some(slot) = out.get_mut(e.ix()) {
+            *slot = true;
+        }
+    };
+    for x in body.exprs.iter() {
+        match *x {
+            Expr::Match { scrutinee, .. } => mark_expr(&mut out, peel_parens(scrutinee)),
+            Expr::Let { init, .. } => mark_expr(&mut out, peel_parens(init)),
+            Expr::Field { base, .. } | Expr::TupleField { base, .. } | Expr::Unary { op: UnOp::Deref, operand: base } => {
+                if let Some(root) = root_temp(base) {
+                    mark_expr(&mut out, root);
+                }
+            }
+            Expr::Struct { base: blaze_typeck::StructBase::Expr(base), .. }
+            | Expr::Record { base: blaze_typeck::StructBase::Expr(base), .. } => {
+                mark_expr(&mut out, peel_parens(base));
+                if let Some(root) = root_temp(base) {
+                    mark_expr(&mut out, root);
+                }
+            }
+            _ => {}
+        }
+    }
+    for s in body.stmts.iter() {
+        if let Stmt::Let { pat, init: Some(init), else_, .. } = *s {
+            let plain = matches!(body.pats.get(pat.ix()), Some(Pat::Bind { sub: None, .. } | Pat::Wild));
+            if else_.is_some() || !plain {
+                mark_expr(&mut out, peel_parens(init));
+            }
+        }
+    }
+    out
+}

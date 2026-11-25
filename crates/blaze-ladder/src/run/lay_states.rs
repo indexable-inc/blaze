@@ -29,7 +29,7 @@
 
 use core::cell::Cell;
 
-use blaze_build::coroutine_state::{LaidState, StateName, StateNames, StatePlan, StatePlant, lay_state_with_flags, may_partial_move_bindings};
+use blaze_build::coroutine_state::{LaidState, StateName, StateNames, StatePlan, StatePlant, lay_state_with_flags, may_partial_move_bindings, may_partial_move_temps};
 use blaze_build::layout::{LayoutCx, Layouts};
 use blaze_build::{CoroutineOf, coroutines_in};
 use blaze_own::AVec;
@@ -621,9 +621,11 @@ fn lay_one<P: FrontEnd, L: core::alloc::Allocator + Clone>(
     let mut upvar_has_flag: AVec<'_, bool> = AVec::new_in(alloc);
     let mut upvar_has_rest: AVec<'_, bool> = AVec::new_in(alloc);
     let mut partial: Option<AVec<'_, bool>> = None;
+    let mut temp_partial: Option<AVec<'_, bool>> = None;
     if let (Some((body, _)), Some(done)) = (program.function(ci).body, bodies.checked.get(ci).and_then(Option::as_ref)) {
         let view = body.view(program.body_types(ci));
         let p_bits = may_partial_move_bindings(&view, done, alloc);
+        let t_bits = may_partial_move_temps(&view, alloc);
         if let Some(block) = coroutines_in(&view).find(|x| x.0 == c.ordinal).map(|x| x.1)
             && let Ok(PNode::Tuple(env_list)) = ground.view().node(types[0])
             && let Ok(env_slice) = ground.view().list(env_list)
@@ -654,6 +656,7 @@ fn lay_one<P: FrontEnd, L: core::alloc::Allocator + Clone>(
             }
         }
         partial = Some(p_bits);
+        temp_partial = Some(t_bits);
     }
     let (env, saved) = match sizes.split_first() {
         Some((env, saved)) => (*env, saved),
@@ -663,9 +666,10 @@ fn lay_one<P: FrontEnd, L: core::alloc::Allocator + Clone>(
         return Err(BuildError::Malformed { what: "a coroutine state's held types not one per saved local of its recipe" });
     }
     let mut needs_rest: AVec<'_, bool> = AVec::with_capacity_in(recipe.saved.len(), alloc);
-    for s in recipe.saved.iter() {
-        let want = match (s.identity, partial.as_deref()) {
-            (blaze_flow_lower::identity::Identity::Binding(p), Some(bits)) => bits.get(p.ix()).copied().unwrap_or(false),
+    for (s, &needs_flag) in recipe.saved.iter().zip(flags.iter()) {
+        let want = match s.identity {
+            blaze_flow_lower::identity::Identity::Binding(p) => partial.as_deref().and_then(|bits| bits.get(p.ix()).copied()).unwrap_or(false),
+            blaze_flow_lower::identity::Identity::Temp(e, _) => needs_flag && temp_partial.as_deref().and_then(|bits| bits.get(e.ix()).copied()).unwrap_or(false),
             _ => false,
         };
         needs_rest.push(want);
