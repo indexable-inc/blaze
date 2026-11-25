@@ -1262,12 +1262,32 @@ enum Placed {
     OfTheBody,
 }
 
+/// One stretch-memoized answer for a cell ([`StretchHeads::memo`]): verified once per stretch
+/// (`FrozenHead::read`, rule 74) so later bodies skip `Owners::place`, BLAKE3 keys, `SharedMap`
+/// pins, `snapshot.get`, and `BZFZ` re-validation. `Known::Freeze` is never cached so a newly
+/// published dependency head becomes a hit on the next body.
+#[derive(Clone, Copy)]
+enum CachedKnown<'k> {
+    Head(FrozenHead<'k>),
+    Refused(NotTheirs),
+}
+
+/// What [`StretchHeads::known_frozen`] returns to [`crate::engine_bodies`]'s stretch seed: a
+/// pre-verified [`FrozenHead`] on hit, a typed refusal, or a cold dependency miss to freeze.
+#[derive(Clone, Copy)]
+pub(crate) enum KnownFrozen<'k> {
+    Head(FrozenHead<'k>),
+    Freeze,
+    Refused(NotTheirs),
+}
+
 /// One stretch's view of the request's frozen heads (front2 tables/seeds.rs `RequestHeads`):
 /// a want placed ONE way, by the stretch's own names, the way a body's read of the head is
 /// placed (engine_heads.rs `Owners::place`, engine_bodies.rs `widen`) and a head task names its
 /// cells (`heads_of_crate`, `head_cell`): a member's head is its entry's task's cell, named by
 /// the item's name, never by a key of the reader's unit; a dependency's is its record under
-/// [`dependency_key`]. One worker's (its `Owners` fills on first ask), over the shared table.
+/// [`dependency_key`]. One worker's (its `Owners` and `memo` fill on first ask), over the shared
+/// table.
 pub(crate) struct StretchHeads<'t, 's: 'n, 'n> {
     table: &'t RequestTable<'t>,
     /// The heads the Heads stage could not freeze, each with its own reason
@@ -1275,6 +1295,9 @@ pub(crate) struct StretchHeads<'t, 's: 'n, 'n> {
     failed: &'t Failed,
     names: &'n Records<'n>,
     owners: RefCell<Owners<'s>>,
+    /// Stretch-local memo of resolved cells in `g` (0 bytes in stretch `frame`, dropped with the
+    /// stretch, capped at [`MOST_CELLS`] per rule 18).
+    memo: RefCell<blaze_hash::Map<[u8; WANT_BYTES], CachedKnown<'t>, blaze_hash::FixedState, Alloc<'static>>>,
     g: Alloc<'static>,
 }
 
@@ -1284,7 +1307,14 @@ impl<'t, 's, 'n> StretchHeads<'t, 's, 'n> {
     /// expansion directories place a written head); `failed`: the heads the Heads stage could
     /// not freeze.
     pub(crate) fn new(table: &'t RequestTable<'t>, failed: &'t Failed, names: &'n Records<'n>, subjects: &'s Subjects, over: crate::run_names::ScopeCrates<'s, 's>, listings: &'s crate::engine_heads::Listings, g: Alloc<'static>) -> StretchHeads<'t, 's, 'n> {
-        StretchHeads { table, failed, names, owners: RefCell::new(Owners::new(subjects, over, listings, g)), g }
+        StretchHeads {
+            table,
+            failed,
+            names,
+            owners: RefCell::new(Owners::new(subjects, over, listings, g)),
+            memo: RefCell::new(blaze_hash::Map::new(blaze_hash::MapOpts { hasher: blaze_hash::FixedState, alloc: g, capacity: None })),
+            g,
+        }
     }
 
     /// Where this stretch's bodies make a need of an item declared in the body (the request's:
@@ -1417,12 +1447,10 @@ fn kind_words(cell: Want) -> &'static str {
     }
 }
 
-impl KnownHeads for StretchHeads<'_, '_, '_> {
-    /// A MEMBER crate's head is its head task's run for the requested defining unit, or the body is
-    /// refused, typed (`Known::Refused`): a body never freezes a member's head (rule 3; the
-    /// lazy freeze the table replaced). Only a DEPENDENCY's head is frozen by the asker when
-    /// neither the store nor another worker holds it (one unit, frozen once a machine).
-    fn known(&self, cell: Want) -> Known<'_> {
+impl<'t, 's, 'n> StretchHeads<'t, 's, 'n> {
+    /// Uncached resolution of `cell` against the request table (called at most once per cell per
+    /// stretch for hits and refusals).
+    fn resolve(&self, cell: Want) -> Known<'t> {
         let table = self.table;
         match self.place(cell) {
             Placed::Member { id, slot } => match table.member(id, unit_of(cell)) {
@@ -1451,9 +1479,75 @@ impl KnownHeads for StretchHeads<'_, '_, '_> {
             }
         }
     }
+
+    /// Memoized resolution returning a pre-verified [`FrozenHead`] (verified once per stretch,
+    /// rule 74) so warm body checks in a stretch skip placement, BLAKE3 keys, `SharedMap` pins,
+    /// `snapshot.get`, and `BZFZ` re-validation on repeat asks.
+    pub(crate) fn known_frozen(&self, cell: Want) -> Result<KnownFrozen<'t>, FreezeError> {
+        let key = want_bytes(cell);
+        if let Some(&hit) = self.memo.borrow().get(&key) {
+            return Ok(match hit {
+                CachedKnown::Head(frozen) => KnownFrozen::Head(frozen),
+                CachedKnown::Refused(why) => KnownFrozen::Refused(why),
+            });
+        }
+        match self.resolve(cell) {
+            Known::Bytes(bytes) => {
+                let frozen = FrozenHead::read(bytes).map_err(|error| FreezeError::Read { want: cell, error })?;
+                let mut memo = self.memo.borrow_mut();
+                if memo.len() < MOST_CELLS {
+                    memo.insert(key, CachedKnown::Head(frozen));
+                }
+                Ok(KnownFrozen::Head(frozen))
+            }
+            Known::Refused(why) => {
+                let mut memo = self.memo.borrow_mut();
+                if memo.len() < MOST_CELLS {
+                    memo.insert(key, CachedKnown::Refused(why));
+                }
+                Ok(KnownFrozen::Refused(why))
+            }
+            Known::Freeze => Ok(KnownFrozen::Freeze),
+        }
+    }
 }
 
-impl RequestHeads for StretchHeads<'_, '_, '_> {
+impl<'t> KnownHeads for StretchHeads<'t, '_, '_> {
+    /// A MEMBER crate's head is its head task's run for the requested defining unit, or the body is
+    /// refused, typed (`Known::Refused`): a body never freezes a member's head (rule 3; the
+    /// lazy freeze the table replaced). Only a DEPENDENCY's head is frozen by the asker when
+    /// neither the store nor another worker holds it (one unit, frozen once a machine).
+    fn known(&self, cell: Want) -> Known<'_> {
+        let key = want_bytes(cell);
+        if let Some(&hit) = self.memo.borrow().get(&key) {
+            return match hit {
+                CachedKnown::Head(frozen) => Known::Bytes(frozen.bytes()),
+                CachedKnown::Refused(why) => Known::Refused(why),
+            };
+        }
+        let resolved = self.resolve(cell);
+        match resolved {
+            Known::Bytes(bytes) => {
+                if let Ok(frozen) = FrozenHead::read(bytes) {
+                    let mut memo = self.memo.borrow_mut();
+                    if memo.len() < MOST_CELLS {
+                        memo.insert(key, CachedKnown::Head(frozen));
+                    }
+                }
+            }
+            Known::Refused(why) => {
+                let mut memo = self.memo.borrow_mut();
+                if memo.len() < MOST_CELLS {
+                    memo.insert(key, CachedKnown::Refused(why));
+                }
+            }
+            Known::Freeze => {}
+        }
+        resolved
+    }
+}
+
+impl<'t> RequestHeads for StretchHeads<'t, '_, '_> {
     fn publish(&self, cell: Want, krate: Option<blaze_id::CrateItemKey>, bytes: &[u8]) -> Result<(), SeedError> {
         match self.place(cell) {
             // `known` refuses every member head the table lacks before a freeze, so a member's
@@ -1461,7 +1555,18 @@ impl RequestHeads for StretchHeads<'_, '_, '_> {
             Placed::Member { .. } | Placed::Unlisted(_) | Placed::OfTheBody => {
                 Err(SeedError::NoMemberCell { cell, said: self.no_cell(cell, "a body's freeze reached it though a member's head is only its head task's (engine_seeds.rs `StretchHeads::known`)") })
             }
-            Placed::Dependency => self.table.publish(cell, krate, bytes),
+            Placed::Dependency => {
+                self.table.publish(cell, krate, bytes)?;
+                if let Some(lent) = self.table.fresh_of(cell)
+                    && let Ok(frozen) = FrozenHead::read(lent)
+                {
+                    let mut memo = self.memo.borrow_mut();
+                    if memo.len() < MOST_CELLS {
+                        memo.insert(want_bytes(cell), CachedKnown::Head(frozen));
+                    }
+                }
+                Ok(())
+            }
         }
     }
 

@@ -305,116 +305,6 @@ impl From<EngineCheckError> for CliError {
     }
 }
 
-/// Cached `UnitGraph` crate-list & pre-indexed `Names` tables held by the resident daemon across
-/// incremental edits so `ready_setup` skips `stored_graph_at`, `CrateList::open`, and ~3,300
-/// BLAKE3 digests in `Names::of_list` (Wave 7).
-pub(crate) struct HotGraph {
-    pub(crate) key: blaze_drive::Key,
-    pub(crate) out: blaze_ids::ContentId,
-    pub(crate) hot_list: crate::names::HotList,
-}
-
-/// Outcome returned from [`check_in_daemon`] to the resident daemon server so it can update
-/// `DaemonCore`, arm/refresh `KqueueVnode`, and schedule post-`Done` reclaim/bg-GC.
-#[derive(Default)]
-pub(crate) struct DaemonCheckOut {
-    pub(crate) was_phase_rebuild: bool,
-    pub(crate) spawn_bg: bool,
-    pub(crate) wrote_pointer: bool,
-    pub(crate) leaf_set_changed: bool,
-    pub(crate) certified: bool,
-    pub(crate) lint_step: Option<blaze_lint::Step>,
-    pub(crate) certified_facts: Option<(blaze_drive::Key, blaze_drive::Key, crate::engine_answer::Facts)>,
-}
-
-/// Per-request context passed from `daemon_server.rs` into [`check_in_daemon`] so the daemon
-/// reuses its open store, feeds its synchronous `kqueue` dirty set (bypassing `journal-helper`),
-/// reuses its cached [`HotGraph`], and defers arena reclamation / background GC until after
-/// `ServerFrame::Done` is sent to the client.
-pub(crate) struct DaemonCheckCtx<'d> {
-    pub(crate) opened: &'d crate::store::Opened,
-    pub(crate) watch: Option<crate::daemon_watch::PollOutcome<'d>>,
-    pub(crate) hot_graph: &'d mut Option<HotGraph>,
-    pub(crate) requests: Option<&'d bstd::procs::Requests>,
-    pub(crate) out: DaemonCheckOut,
-}
-
-/// Runs one `blaze check` request inside the resident per-checkout daemon, reusing the daemon's
-/// open store, watcher poll result, and `HotGraph`, without installing per-request signal handlers.
-#[expect(clippy::too_many_arguments, reason = "the daemon check edge: each argument one specific capability")]
-pub(crate) fn check_in_daemon<'d>(
-    cx: &Cx,
-    args: &bstd::args::Args,
-    fs: &bstd::fs::Fs,
-    env: Option<&bstd::env::Env>,
-    net: Option<&bstd::net::Net>,
-    host: &bstd::host::Host,
-    clock: &bstd::clock::Clock,
-    rng: &mut bstd::rng::Rng,
-    out: &Out,
-    err: &Out,
-    phases: &mut Phases,
-    heap: &'static blaze_own::Heap,
-    checkout_root: Dir<ReadWrite>,
-    checkout_root_abs: &str,
-    sdk_override: Option<blaze_apple_sdk::Sdk<'_>>,
-    daemon: &mut DaemonCheckCtx<'d>,
-) -> Result<Status, CliError> {
-    let flags = crate::flags(args)?;
-    crate::check_command::refuse_not_taken(&flags)?;
-    let request = request_frame()?;
-    let located = crate::run_package::Located {
-        root: checkout_root,
-        at: work::held_str(checkout_root_abs, &request),
-        member: "",
-    };
-    let daemon_requests = daemon.requests;
-    edge_at(cx, fs, env, net, host, out, err, phases, heap, &flags, None, Some(located), true, daemon_requests, sdk_override.map(Ok), &request, |edge, phases| {
-        let Edge { root, opts, mut shown, err, caps, view, shown_root, frame, .. } = edge;
-        let checked = match flags.fix {
-            None => {
-                let line = crate::run_line::LineOpts::from_env(
-                    env,
-                    err,
-                    flags.color,
-                    blaze_screen::Command::Check,
-                    view,
-                    flags.status_every.is_some(),
-                );
-                let ran = crate::run_line::watched(cx, err, clock, line, |watch, bg| {
-                    watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Checking));
-                    let live = line.live.then_some(bg);
-                    let res = check_live_with_daemon(cx, fs, host, rng, Some(args), net, root, opts(), &mut shown, phases, out, err, live, Some(daemon));
-                    watch.see(blaze_screen::Step::Says);
-                    res
-                }).map_err(CliError::RunLine)??;
-                Some(ran)
-            }
-            Some((start, end)) => {
-                let cap = (end - start).max(1);
-                let mut selectors: blaze_own::Vec<&str, &Frame> = blaze_own::Vec::with_capacity_in(cap, frame);
-                selectors.extend((start..end).filter_map(|at| args.get(at)));
-                if selectors.is_empty() {
-                    selectors.push("all");
-                }
-                let mut ask = |mut shown| {
-                    daemon.opened.lent.rearm_lease();
-                    check_live_with_daemon(cx, fs, host, rng, Some(args), net, root, opts(), &mut shown, phases, out, err, None, Some(&mut *daemon)).map(|checked| (checked, shown))
-                };
-                match crate::fix_then_check::<crate::fix::Atomic, Checked>(cx, root, &selectors, (caps, view, shown_root), frame, out, &mut ask)? {
-                    crate::Fixed::Refused => None,
-                    crate::Fixed::Checked(checked, _) => Some(checked),
-                }
-            }
-        };
-        let Some(checked) = checked else { return Ok(Status::FAILED) };
-        if flags.stats {
-            err.line(cx, format_args!("{}", stats_line(&checked, phases.in_main(), frame)))?;
-        }
-        Ok(checked.status)
-    })
-}
-
 /// The command: its arguments are `check`'s.
 #[expect(clippy::too_many_arguments, reason = "the command's edge: each argument one specific capability")]
 pub(crate) fn run(
@@ -557,7 +447,7 @@ pub(crate) fn warm_toolchain(
         None => bstd::mem::format_in!(&request, ".blaze/{rel_ws}"),
     };
     let located = crate::run_package::Located { root: ws_dir, at: work::held_str(abs_at.as_str(), &request), member: "" };
-    edge_at(cx, fs, env, net, host, out, err, phases, heap, &flags, None, Some(located), false, None, None, &request, |edge, phases| {
+    edge_at(cx, fs, env, net, host, out, err, phases, heap, &flags, None, Some(located), &request, |edge, phases| {
         let Edge { root, opts, mut shown, err, frame, .. } = edge;
         shown.quiet = true;
         let mut check_opts = opts();
@@ -702,7 +592,7 @@ fn edge<R>(
     frame: &Frame,
     then: impl for<'f> FnOnce(Edge<'f>, &mut Phases) -> Result<R, CliError>,
 ) -> Result<R, CliError> {
-    edge_at(cx, fs, env, net, host, out, err, phases, heap, flags, why, None, false, None, None, frame, then)
+    edge_at(cx, fs, env, net, host, out, err, phases, heap, flags, why, None, frame, then)
 }
 
 #[expect(clippy::too_many_arguments, reason = "the command's edge: each argument one handle of it")]
@@ -719,9 +609,6 @@ fn edge_at<'l, R>(
     flags: &crate::Flags<'_>,
     why: Option<&str>,
     located_override: Option<crate::run_package::Located<'l>>,
-    skip_signals: bool,
-    daemon_requests: Option<&bstd::procs::Requests>,
-    sdk_override: Option<Result<blaze_apple_sdk::Sdk<'l>, blaze_apple_sdk::SdkRefused<'l>>>,
     frame: &'l Frame,
     then: impl for<'f> FnOnce(Edge<'f>, &mut Phases) -> Result<R, CliError>,
 ) -> Result<R, CliError> {
@@ -772,25 +659,16 @@ fn edge_at<'l, R>(
             None => Err(crate::fetch::ExeDirWhy::NotUtf8),
         },
     };
-    let sdk = match sdk_override {
-        Some(sdk) => {
-            phases.mark_cx(cx, "open checkout: cached macOS SDK", frame);
-            sdk
-        }
-        None => {
-            let (sdk, sdk_how) = crate::sdk::resolve_how(
-                cx,
-                &fs,
-                var("SDKROOT"),
-                &crate::sdk::XcrunEnv { path: var("PATH"), developer_dir: var("DEVELOPER_DIR"), home: var("HOME"), toolchains: var("TOOLCHAINS") },
-                crate::sdk::SHIPPED,
-                phases.clock(),
-                frame,
-            );
-            phases.mark_cx(cx, sdk_how.phase(), frame);
-            sdk
-        }
-    };
+    let (sdk, sdk_how) = crate::sdk::resolve_how(
+        cx,
+        &fs,
+        var("SDKROOT"),
+        &crate::sdk::XcrunEnv { path: var("PATH"), developer_dir: var("DEVELOPER_DIR"), home: var("HOME"), toolchains: var("TOOLCHAINS") },
+        crate::sdk::SHIPPED,
+        phases.clock(),
+        frame,
+    );
+    phases.mark_cx(cx, sdk_how.phase(), frame);
     // The checkout's absolute root: the one resolution of the start folder a command makes
     // (one realpath), never `PWD` (rule 75: `env -i` leaves it unset, a shell can leave it
     // stale). Every served read takes it from `place`.
@@ -838,17 +716,14 @@ fn edge_at<'l, R>(
     // The check's stop and status signals, caught until it answers (engine_status.rs);
     // `why` answers from the stored answer at once, and keeps the default ones.
     #[cfg(unix)]
-    let asked = match (why, skip_signals) {
-        (None, false) => Some(bstd::procs::Asked::hold().map_err(EngineCheckError::Signals)?),
-        _ => None,
+    let asked = match why {
+        None => Some(bstd::procs::Asked::hold().map_err(EngineCheckError::Signals)?),
+        Some(_) => None,
     };
     #[cfg(unix)]
-    let requests = match asked.as_ref() {
-        Some(a) => Some(a.requests()),
-        None => daemon_requests,
-    };
+    let requests = asked.as_ref().map(bstd::procs::Asked::requests);
     #[cfg(not(unix))]
-    let requests = daemon_requests;
+    let requests = None;
     let status = crate::engine_status::Asking {
         requests,
         every: flags.status_every.map(|seconds| core::time::Duration::from_secs(u64::from(seconds.get()))),
@@ -1584,25 +1459,6 @@ pub(crate) fn check<'f>(
     check_live(cx, fs, host, rng, args, net, root, opts, shown, phases, out, err, None)
 }
 
-#[expect(clippy::too_many_arguments, reason = "the command's edge: each argument one handle of it")]
-fn check_live<'f>(
-    cx: &'f Cx,
-    fs: &bstd::fs::Fs,
-    host: &bstd::host::Host,
-    rng: &mut bstd::rng::Rng,
-    args: Option<&bstd::args::Args>,
-    net: Option<&bstd::net::Net>,
-    root: &Dir<ReadWrite>,
-    opts: Opts<'f>,
-    shown: &mut print::Shown<'f>,
-    phases: &mut Phases,
-    out: &Out,
-    err: &Out,
-    live: Option<&(dyn blaze_screen::Watch + Sync)>,
-) -> Result<Checked, CliError> {
-    check_live_with_daemon(cx, fs, host, rng, args, net, root, opts, shown, phases, out, err, live, None)
-}
-
 /// Extracts an [`crate::engine_answer::Unreadable`] reason when reading a lazy page or standing
 /// outline record of a prior stored answer fails because that record is no longer in the store
 /// (e.g. a shared workspace base whose writer moved on and compacted old pages, or an interrupted
@@ -1636,7 +1492,7 @@ enum StoredRecovery {
 }
 
 #[expect(clippy::too_many_arguments, reason = "the command's edge: each argument one handle of it")]
-fn check_live_with_daemon<'f, 'd>(
+fn check_live<'f>(
     cx: &'f Cx,
     fs: &bstd::fs::Fs,
     host: &bstd::host::Host,
@@ -1650,7 +1506,6 @@ fn check_live_with_daemon<'f, 'd>(
     out: &Out,
     err: &Out,
     live: Option<&(dyn blaze_screen::Watch + Sync)>,
-    mut daemon: Option<&mut DaemonCheckCtx<'d>>,
 ) -> Result<Checked, CliError> {
     #[cfg(test)]
     stack_probe::at("check");
@@ -1659,15 +1514,6 @@ fn check_live_with_daemon<'f, 'd>(
     let asking = opts.status;
     let clock = phases.clock().clone();
     let heap = opts.heap;
-    let stop_host = daemon.is_none().then_some(host);
-    // Preserve the daemon watcher's crash cursor in case a lazy missing stored-answer page forces
-    // a single full rebuild after `daemon.watch` is consumed on the incremental attempt.
-    let daemon_crash_cursor = daemon.as_ref().and_then(|ctx| ctx.watch.as_ref()).map(|watch| match watch {
-        crate::daemon_watch::PollOutcome::Clean { crash_cursor }
-        | crate::daemon_watch::PollOutcome::Dirty { crash_cursor, .. }
-        | crate::daemon_watch::PollOutcome::FullRescan { crash_cursor, .. } => *crash_cursor,
-        crate::daemon_watch::PollOutcome::FsEvents { cursor, .. } => Some(*cursor),
-    });
     // Boxed, made in its own call ([`board_in`]): by value its task slots sat twice in this
     // frame (~79 KiB, bt4 2026-11-20) under every stage's (rule 54).
     let mut board = board_in(heap, &asking, phases.now().since_start());
@@ -1685,7 +1531,7 @@ fn check_live_with_daemon<'f, 'd>(
             let board_ref: &crate::engine_status::Board<'_> = &board;
             let prior = prior_unreadable.take();
             work::unwinding(|| {
-                crate::engine_status::watched(cx, stop_host, root, err, &clock, board_ref, asking.every, live, || {
+                crate::engine_status::watched(cx, Some(host), root, err, &clock, board_ref, asking.every, live, || {
                     checking(
                         cx,
                         fs,
@@ -1706,7 +1552,6 @@ fn check_live_with_daemon<'f, 'd>(
                         board_ref,
                         &mut active,
                         live,
-                        daemon.as_deref_mut(),
                     )
                 }).map_err(EngineCheckError::Watcher)?
             })
@@ -1731,11 +1576,6 @@ fn check_live_with_daemon<'f, 'd>(
         let Some((next, unreadable)) = next_recovery else {
             break attempt;
         };
-        if let Some(ctx) = daemon.as_deref_mut()
-            && let Some(crash_cursor) = daemon_crash_cursor
-        {
-            ctx.watch = Some(crate::daemon_watch::PollOutcome::FullRescan { crash_cursor, needs_refresh: true });
-        }
         board = board_in(heap, &asking, phases.now().since_start());
         active = None;
         recovery = next;
@@ -1799,7 +1639,7 @@ fn made_boxed<T>(heap: &'static blaze_own::Heap, make: impl FnOnce() -> T) -> bl
 
 /// [`check`] under its board.
 #[expect(clippy::too_many_arguments, reason = "the command's edge: each argument one handle of it")]
-fn checking<'f, 'd>(
+fn checking<'f>(
     cx: &'f Cx,
     fs: &bstd::fs::Fs,
     host: &bstd::host::Host,
@@ -1819,7 +1659,6 @@ fn checking<'f, 'd>(
     board: &crate::engine_status::Board<'_>,
     active: &mut Option<Phase>,
     live: Option<&(dyn blaze_screen::Watch + Sync)>,
-    daemon: Option<&mut DaemonCheckCtx<'d>>,
 ) -> Result<BoxedChecked, CliError> {
     #[cfg(test)]
     stack_probe::at("checking");
@@ -1835,23 +1674,9 @@ fn checking<'f, 'd>(
     let request = request_mem.shared();
     // The phases' arenas and the heap kept past each, by stage.
     let mut phase_mem = made_boxed(heap, crate::engine_phase_mem::PhaseLedger::new);
-    let (daemon_opened, daemon_watch, mut daemon_hot_graph, mut daemon_out) = match daemon {
-        Some(ctx) => (Some(ctx.opened), ctx.watch.take(), Some(&mut *ctx.hot_graph), Some(&mut ctx.out)),
-        None => (None, None, None, None),
-    };
     // The one store, opened as `check` opens it (main.rs), committed after the answer.
-    // Inside the resident daemon, reuse the already-open store without reopening segments.
-    let owned_opened = match daemon_opened {
-        Some(_) => None,
-        None => {
-            let opened = crate::store::open_for_command(cx, fs, host, rng, place.home, place.max_store_bytes, root, place.checkout, phases.clock(), err, heap)?;
-            Some(opened)
-        }
-    };
-    let Some(opened) = daemon_opened.or(owned_opened.as_ref()) else {
-        return Err(CliError::Text { what: "store must be opened either standalone or by daemon" });
-    };
-    crate::store::take::before_first_phase(cx, args, fs, net, opened, toolchain, phases, err)?;
+    let opened = crate::store::open_for_command(cx, fs, host, rng, place.home, place.max_store_bytes, root, place.checkout, phases.clock(), err, heap)?;
+    crate::store::take::before_first_phase(cx, args, fs, net, &opened, toolchain, phases, err)?;
     let mut store = crate::store::CommandStore::new(cx, &opened.lent, false, opened.open_ns, origin, phases.clock().clone(), err, erased.handle())?;
     phases.mark_cx(cx, "store open", frame);
     // 0. The stored answer (engine_answer.rs): its pointer, then the sweep of what it read.
@@ -2032,39 +1857,13 @@ fn checking<'f, 'd>(
     // checkout is read (journal_sweep.rs): a write after this and before its file's read is
     // after the place this request saves, so the next request's replay names it. Moved below
     // the sweep or the plan's reads, such a write would be missed for good.
-    // Inside the resident daemon, feed the synchronous `kqueue` dirty set (or in-process
-    // `HeldChanges::flush` fallback) directly into `Taken`, bypassing `journal-helper`.
-    let journal = match daemon_watch {
-        Some(watch) => {
-            let mut taken = crate::journal_sweep::Taken::begin(cx, root, phases.clock(), frame)?;
-            match watch {
-                crate::daemon_watch::PollOutcome::Clean { crash_cursor } => {
-                    taken.vouched_kqueue(&[], crash_cursor, false, true);
-                }
-                crate::daemon_watch::PollOutcome::Dirty { paths, crash_cursor, force_script_asks, facts_clean, .. } => {
-                    let mut copied: blaze_own::Vec<&str, &Frame> = blaze_own::Vec::with_capacity_in(paths.len(), frame);
-                    for path in paths.iter() {
-                        copied.push(frame.alloc_str(path));
-                    }
-                    taken.vouched_kqueue(copied.into_bump_slice(), crash_cursor, force_script_asks, facts_clean);
-                }
-                crate::daemon_watch::PollOutcome::FullRescan { crash_cursor, .. } => {
-                    taken.full_rescan_daemon(crash_cursor);
-                }
-                crate::daemon_watch::PollOutcome::FsEvents { changes, cursor, valid_since } => {
-                    taken.in_process_fsevents(chosen.places(), valid_since, changes, cursor);
-                }
-            }
-            taken
-        }
-        None => {
-            use crate::journal_sweep::ChangedSince as _;
-            let me = crate::journal_ask::Me::of(&host.build_id()?, place.served.root_text(), place.home, frame);
-            let exe = (!cfg!(test) && !cx.is_simulated()).then(|| host.exe().ok()).flatten();
-            let start = crate::journal_ask::HelperStart::detached(host, exe.as_deref(), place.served.root_text(), place.home);
-            let strategy = crate::journal_ask::Shipped { me, start };
-            strategy.changed_since(cx, root, opened.home.dir(), phases.clock(), chosen.places(), frame)?
-        }
+    let journal = {
+        use crate::journal_sweep::ChangedSince as _;
+        let me = crate::journal_ask::Me::of(&host.build_id()?, place.served.root_text(), place.home, frame);
+        let exe = (!cfg!(test) && !cx.is_simulated()).then(|| host.exe().ok()).flatten();
+        let start = crate::journal_ask::HelperStart::detached(host, exe.as_deref(), place.served.root_text(), place.home);
+        let strategy = crate::journal_ask::Shipped { me, start };
+        strategy.changed_since(cx, root, opened.home.dir(), phases.clock(), chosen.places(), frame)?
     };
     let now_places = crate::journal_checkpoint::Places::of_taken(&journal, frame);
     // The lint step and rules the root manifest names, as `check` reads them (lints.rs
@@ -2095,8 +1894,7 @@ fn checking<'f, 'd>(
         };
         let follow = sweep::Follow { stamps: FromMeta::now(phases.clock()), plant: sweep::Plant::None };
         let follow_began = phases.clock().now();
-        let facts_vouched = base != crate::engine_ready_edit::StoredBase::OtherCheckout && journal.facts_vouched();
-        let (followed, statted) = follow.follow_served_with_facts(cx, root, Some(opened.home.dir()), &pointer.leaves, marked.as_deref(), script_sweep.as_mut(), facts_vouched, frame)?;
+        let (followed, statted) = follow.follow_served(cx, root, Some(opened.home.dir()), &pointer.leaves, marked.as_deref(), script_sweep.as_mut(), frame)?;
         let follow_ns = phases.clock().now().since(follow_began).map_or(0, |it| u64::try_from(it.as_nanos()).unwrap_or(u64::MAX));
         sweep_counts = journal.counts(statted, u32::try_from(pointer.leaves.len()).unwrap_or(u32::MAX)).with_parts(journal.parts(&pointer.leaves, frame)).with_looks(followed.looks, follow_ns);
         // Set, then borrowed SHARED: `Option::insert` hands back a `&mut`, and `today_slots` below
@@ -2118,25 +1916,10 @@ fn checking<'f, 'd>(
             if let Some(live) = live {
                 live.see(blaze_screen::Step::Says);
             }
-            let certified_key = (pointer.key, pointer.lines, pointer.facts);
             *printed_out = true;
             let stood = certified(cx, root, &view_slot, pointer, lines, answer_root.as_str(), journal, &mut store, (&tools, toolchain), shown, phases, began, request, frame, out)?;
             drop(store);
-            let cleanup = match owned_opened {
-                Some(owned) => crate::store::after_answer_printed(cx, owned.lent, &owned.home, false, phases.clock(), err)?,
-                None => {
-                    let (cleanup, spawn_bg) = crate::store::after_answer_for_daemon(cx, &opened.lent, &opened.home)?;
-                    if let Some(dout) = daemon_out.as_deref_mut() {
-                        dout.was_phase_rebuild = false;
-                        dout.spawn_bg = spawn_bg;
-                        dout.wrote_pointer = false;
-                        dout.certified = true;
-                        dout.lint_step = Some(linting.step);
-                        dout.certified_facts = Some(certified_key);
-                    }
-                    cleanup
-                }
-            };
+            let cleanup = crate::store::after_answer_printed(cx, opened.lent, &opened.home, false, phases.clock(), err)?;
             phases.mark_cx(cx, "store committed", frame);
             return certificate_checked(cx, root, stood, sweep_counts, &journal_counts, &cleanup, phases, heap, frame);
         }
@@ -2166,7 +1949,7 @@ fn checking<'f, 'd>(
                     if let Some(new_ptr) = &pointer {
                         let follow = sweep::Follow { stamps: FromMeta::now(phases.clock()), plant: sweep::Plant::None };
                         let follow_began = phases.clock().now();
-                        let (followed, statted) = follow.follow_served_with_facts(cx, root, Some(opened.home.dir()), &new_ptr.leaves, None, script_sweep.as_mut(), false, frame)?;
+                        let (followed, statted) = follow.follow_served(cx, root, Some(opened.home.dir()), &new_ptr.leaves, None, script_sweep.as_mut(), frame)?;
                         let follow_ns = phases.clock().now().since(follow_began).map_or(0, |it| u64::try_from(it.as_nanos()).unwrap_or(u64::MAX));
                         sweep_counts = journal.counts(statted, u32::try_from(new_ptr.leaves.len()).unwrap_or(u32::MAX)).with_parts(journal.parts(&new_ptr.leaves, frame)).with_looks(followed.looks, follow_ns);
                         followed_kept = Some(followed);
@@ -2292,7 +2075,7 @@ fn checking<'f, 'd>(
             let Some(lines) = last_lines.as_ref() else { return Ok(Err(ReadyRefused::Root(PhasesWhy::NoAnswer))) };
             let pre_start = last_stored.answer();
             let pre_records = RecordKeys { base: Some(last_stored as &dyn StoredPages), changes: SMap::new_in(alloc) };
-            let setup = match ready_setup(cx, root, &stamps, stood, followed, last, lines, &pre_start, &pre_records, &tools, &mut store, &env, workers, Some(linting.rules), daemon_hot_graph.as_deref_mut(), alloc, frame)? {
+            let setup = match ready_setup(cx, root, &stamps, stood, followed, last, lines, last_stored, &pre_start, &pre_records, &tools, &mut store, &env, workers, Some(linting.rules), alloc, frame)? {
                 Ok(setup) => setup,
                 Err(why) => return Ok(Err(why)),
             };
@@ -3053,25 +2836,7 @@ fn checking<'f, 'd>(
         Ok(blaze_own::Box::new_in((finished.causes, report, saved, stored_keys, (task_pages_read, header_pages_read, pages_read), (tally, status, oracle), accounts, macro_modules, (heap_engine, heap_lines_made, heap_printed, heap_stored), driver_line, signatures_entered, audited, leaf_set_changed), heap.alloc()))
     })?;
     // The whole cleanup line: this profile is written after the commit (store.rs).
-    let is_phase_rebuild = matches!(answered.9, DriverLine::Phases(_));
-    let leaf_set_changed = answered.12;
-    let new_pointer_facts = (answered.2.pointer_key, answered.2.lines_key, answered.2.facts);
-    let cleanup = match owned_opened {
-        Some(owned) => crate::store::after_answer_printed(cx, owned.lent, &owned.home, false, phases.clock(), err)?,
-        None => {
-            let (cleanup, spawn_bg) = crate::store::after_answer_for_daemon(cx, &opened.lent, &opened.home)?;
-            if let Some(dout) = daemon_out.as_deref_mut() {
-                dout.was_phase_rebuild = is_phase_rebuild;
-                dout.spawn_bg = spawn_bg;
-                dout.wrote_pointer = true;
-                dout.leaf_set_changed = leaf_set_changed;
-                dout.certified = false;
-                dout.lint_step = Some(linting.step);
-                dout.certified_facts = Some(new_pointer_facts);
-            }
-            cleanup
-        }
-    };
+    let cleanup = crate::store::after_answer_printed(cx, opened.lent, &opened.home, false, phases.clock(), err)?;
     phases.mark_cx(cx, "store committed", frame);
     own_frame(|| -> Result<BoxedChecked, CliError> {
         let (causes, report, saved, stored_keys, (task_pages_read, header_pages_read, pages_read), (tally, status, oracle), accounts, macro_modules, (heap_engine, heap_lines_made, heap_printed, heap_stored), driver_line, signatures_entered, audited, _leaf_set_changed) = blaze_own::Box::into_inner(answered);
@@ -4888,6 +4653,7 @@ fn ready_setup<'f, 'h, 'a>(
     last: &blaze_engine::pages::Root<'_>,
     // The last request's lines: each skipped target's note is carried from it.
     last_lines: &crate::engine_lines::Last<'_, '_>,
+    stored: &crate::engine_answer::Stored<'_>,
     start: &Answer<'a>,
     records: &RecordKeys<'a>,
     tools: &blaze_engine::Tools,
@@ -4896,7 +4662,6 @@ fn ready_setup<'f, 'h, 'a>(
     workers: NonZeroU32,
     // The rule set the request lints with: an edited file is outlined for it ([`outline_one`]).
     lints: Option<blaze_lint::RuleSet>,
-    hot_graph: Option<&mut Option<HotGraph>>,
     alloc: SharedAlloc<'h>,
     frame: &'f Frame,
 ) -> Result<Result<ReadySetup<'f, 'h>, crate::engine_ready_edit::ReadyRefused>, CliError> {
@@ -4904,59 +4669,29 @@ fn ready_setup<'f, 'h, 'a>(
     let cx = cx.span(READY_SETUP_SPAN);
     // 1. The graph's row, its record and the crate list sealed in it.
     let name = Name::unit_graph();
-    let Some(row) = start.row_facts(name).map_err(EngineError::from)? else { return Ok(Err(ReadyRefused::NoRow { name })) };
-    let Some(key) = records.get(name)? else { return Ok(Err(ReadyRefused::Graph(crate::engine_units::BackRefused::NoKey))) };
-    let (names, cached_listed_roots) = {
+    let Some(header) = stored.header(name).map_err(crate::engine_answer::page_error)? else { return Ok(Err(ReadyRefused::NoRow { name })) };
+    let row = header.facts;
+    let Some(key) = header.record else { return Ok(Err(ReadyRefused::Graph(crate::engine_units::BackRefused::NoKey))) };
+    let names = {
         let _cx = cx.span("names: the crate list read back");
-        let load_fresh = |store: &mut dyn crate::store::Store<'_>| -> Result<Result<(crate::names::Names<'_>, blaze_ids::ContentId), ReadyRefused>, CliError> {
-            let (view, sections) = match crate::engine_units::stored_graph_at(&cx, store, key)? {
-                Ok(found) => found,
-                Err(why) => return Ok(Err(ReadyRefused::Graph(why))),
-            };
-            if view.out != row.out {
-                return Ok(Err(ReadyRefused::Graph(crate::engine_units::BackRefused::Out { key })));
-            }
-            if sections.list.is_empty() {
-                return Ok(Err(ReadyRefused::NoList));
-            }
-            let mut held = Vec::with_capacity_in(sections.list.len(), env.heap.alloc());
-            held.extend_from_slice(sections.list);
-            let leaked: &'static [u8] = held.leak_static();
-            let names = match crate::names::Names::of_list(leaked, None, env.heap.alloc()) {
-                Ok(names) => names,
-                Err(crate::names::NamesError::List(why)) => return Ok(Err(ReadyRefused::Graph(crate::engine_units::BackRefused::List { key, why }))),
-                Err(crate::names::NamesError::ListFact { row: at, what }) => return Ok(Err(ReadyRefused::ListFact { row: at, what })),
-                Err(_) => return Err(CliError::Text { what: "names.rs `of_list` refused the crate list by neither `List` nor `ListFact` (engine_check.rs `ready_setup`)" }),
-            };
-            Ok(Ok((names, view.out)))
+        let (view, sections) = match crate::engine_units::stored_graph_at(&cx, store, key)? {
+            Ok(found) => found,
+            Err(why) => return Ok(Err(ReadyRefused::Graph(why))),
         };
-        match hot_graph {
-            Some(slot) => {
-                let hit = slot.as_ref().is_some_and(|cached| cached.key == key && cached.out == row.out);
-                let names = if hit {
-                    let Some(cached) = slot.as_ref() else {
-                        return Err(CliError::Text { what: "hot_graph cache unexpectedly empty" });
-                    };
-                    crate::names::Names::from_hot_list(&cached.hot_list, env.heap.alloc())
-                } else {
-                    let (names, out) = match load_fresh(store)? {
-                        Ok(pair) => pair,
-                        Err(why) => return Ok(Err(why)),
-                    };
-                    let hot_list = names.to_hot_list(env.heap.alloc());
-                    *slot = Some(HotGraph { key, out, hot_list });
-                    names
-                };
-                let roots = slot.as_ref().map(|cached| cached.hot_list.listed_roots.as_slice());
-                (names, roots)
-            }
-            None => {
-                let (names, _) = match load_fresh(store)? {
-                    Ok(pair) => pair,
-                    Err(why) => return Ok(Err(why)),
-                };
-                (names, None)
-            }
+        if view.out != row.out {
+            return Ok(Err(ReadyRefused::Graph(crate::engine_units::BackRefused::Out { key })));
+        }
+        if sections.list.is_empty() {
+            return Ok(Err(ReadyRefused::NoList));
+        }
+        let mut held = Vec::with_capacity_in(sections.list.len(), env.heap.alloc());
+        held.extend_from_slice(sections.list);
+        let leaked: &'static [u8] = held.leak_static();
+        match crate::names::Names::of_list(leaked, None, env.heap.alloc()) {
+            Ok(names) => names,
+            Err(crate::names::NamesError::List(why)) => return Ok(Err(ReadyRefused::Graph(crate::engine_units::BackRefused::List { key, why }))),
+            Err(crate::names::NamesError::ListFact { row: at, what }) => return Ok(Err(ReadyRefused::ListFact { row: at, what })),
+            Err(_) => return Err(CliError::Text { what: "names.rs `of_list` refused the crate list by neither `List` nor `ListFact` (engine_check.rs `ready_setup`)" }),
         }
     };
     crate::names::tell_public(store, &names);
@@ -4965,7 +4700,7 @@ fn ready_setup<'f, 'h, 'a>(
     // targets as [`plan`] finds them: a target root (a place that is its own crate root, as
     // every member target's root is: they are the first wave) the crate list does not list.
     let mut listed: SSet<'h, Name> = SSet::new_in(alloc);
-    if cached_listed_roots.is_none() {
+    {
         let list = names.list();
         for r in 0..blaze_world::crate_list::CrateGraph::len(list) {
             if let Some(file) = list.root(r).strip_prefix("/0/") {
@@ -4980,10 +4715,7 @@ fn ready_setup<'f, 'h, 'a>(
     let mut external_files: SVec<'h, Name> = SVec::new_in(alloc);
     let mut unnoted = 0usize;
     for (&file, place) in last.places.iter() {
-        let is_listed = match cached_listed_roots {
-            Some(roots) => roots.binary_search(&file).is_ok(),
-            None => listed.contains(&file),
-        };
+        let is_listed = listed.contains(&file);
         if place.unit == file && !is_listed {
             let noted = match last_lines.block(file) {
                 Some(block) => crate::engine_lines::has_told(block).map_err(EngineCheckError::Lines)?,
@@ -5010,7 +4742,7 @@ fn ready_setup<'f, 'h, 'a>(
     let mut deferred: SVec<'h, (Want<'h>, sweep::Probed)> = SVec::new_in(alloc);
     let mut slots = 0u32;
     let mut files = Files::default();
-    let kept = Kept { slots: &[], answer: start, records, stored: None, tools, read: core::sync::atomic::AtomicU32::new(0) };
+    let kept = Kept { slots: &[], answer: start, records, stored: Some(stored), tools, read: core::sync::atomic::AtomicU32::new(0) };
     for (at, leaf) in followed.now.rows.iter().enumerate() {
         let slot = followed.now.path(leaf);
         // Script/data read rows (`by_script`) are appended by `scripts.script_rows` in the tail
@@ -7005,7 +6737,16 @@ impl Kept<'_, '_, '_> {
             return Ok(None);
         }
         self.read.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        let Some(row) = self.answer.row_facts(want.name).map_err(EngineError::from)? else { return Ok(None) };
+        let (row, record) = match self.answer.stored() {
+            Some(base) if self.answer.work().is_none() && self.answer.rows.is_empty() && self.records.changes.is_empty() => {
+                let Some(header) = base.header(want.name).map_err(crate::engine_answer::page_error)? else { return Ok(None) };
+                (header.facts, Some(header.record))
+            }
+            _ => {
+                let Some(row) = self.answer.row_facts(want.name).map_err(EngineError::from)? else { return Ok(None) };
+                (row, None)
+            }
+        };
         if row.phase.stage != Stage::Outlines || row.failed {
             return Ok(None);
         }
@@ -7016,7 +6757,11 @@ impl Kept<'_, '_, '_> {
         if row.source != outline_source || row.key != self.tools.key(want.name, &outline_source) {
             return Ok(None);
         }
-        let key = self.records.get(want.name)?.ok_or(EngineCheckError::MissingRecord { name: want.name })?;
+        let key = match record {
+            Some(record) => record,
+            None => self.records.get(want.name)?,
+        }
+        .ok_or(EngineCheckError::MissingRecord { name: want.name })?;
         Ok(Some((key, source, outline_source)))
     }
 }

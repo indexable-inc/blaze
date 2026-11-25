@@ -431,6 +431,19 @@ impl<'b> VerifiedPage<'b> {
         StoredNames(self.file_members(wanted).chunks_exact(FILE_MEMBER))
     }
 
+    /// All members of `wanted`'s stored file plan with each standing member's certified key,
+    /// sorted ascending by `Name`, in a single lookup of the `FILES` section.
+    pub fn file_member_keys(&self, wanted: Name) -> impl ExactSizeIterator<Item = (Name, Option<Key>)> + '_ {
+        self.file_members(wanted).chunks_exact(FILE_MEMBER).map(|b| {
+            let standing = if b.get(NAME).copied() == Some(1) {
+                b.get(NAME + 1..NAME + 1 + ID).map(|k| Key(id(k)))
+            } else {
+                None
+            };
+            (name(b), standing)
+        })
+    }
+
     pub(super) fn file_members(&self, wanted: Name) -> &'b [u8] {
         self.find(FILES, &wanted, name).map_or(&[][..], |b| &b[NAME + 4..])
     }

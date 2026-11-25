@@ -38,8 +38,13 @@ extern crate alloc;
 use alloc::vec::Vec as AllocVec;
 use blaze_own::Vec;
 mod frame;
+mod shims;
 mod term;
 mod value;
+
+pub use shims::{
+    build_closure_shim, build_ctor_fn, build_drop_glue, build_fn_shim, build_reify_shim, build_vtable_shim,
+};
 
 #[cfg(test)]
 mod tests;
@@ -237,12 +242,38 @@ pub fn build<A: Allocator + Copy>(
     alloc: A,
 ) -> Result<Built<A>, BuildError> {
     let abi = adts.abi(item).ok_or(BuildError::NoAbi { item })?;
+    build_with_abi(body, from, item, abi, false, subst, adts, alloc)
+}
+
+/// Builds a closure's own lowered + drop-elaborated body (from `blaze_body_lower::lower_closure`)
+/// using `Abi::Rust` (independent of its enclosing `owner` item's ABI, which may be `extern "C"`).
+pub fn build_closure_body<A: Allocator + Copy>(
+    body: Verified<'_>,
+    from: PTys<'_>,
+    owner: ItemKey,
+    subst: &mut Subst<'_, '_>,
+    adts: &dyn Adts,
+    alloc: A,
+) -> Result<Built<A>, BuildError> {
+    build_with_abi(body, from, owner, Abi::Rust, true, subst, adts, alloc)
+}
+
+fn build_with_abi<A: Allocator + Copy>(
+    body: Verified<'_>,
+    from: PTys<'_>,
+    item: ItemKey,
+    abi: Abi,
+    is_closure: bool,
+    subst: &mut Subst<'_, '_>,
+    adts: &dyn Adts,
+    alloc: A,
+) -> Result<Built<A>, BuildError> {
     let mut cx = Cx {
         v: body,
         from,
         item,
         abi,
-        track: Track::Unsaid,
+        track: if is_closure { Track::No } else { Track::Unsaid },
         subst,
         adts,
         alloc: alloc,
@@ -266,8 +297,10 @@ pub fn build<A: Allocator + Copy>(
         vtable_ids: Vec::new_in(alloc),
         stmt: None,
     };
-    cx.b.set_attrs(adts.fn_attrs(item));
-    cx.frame()?;
+    if !is_closure {
+        cx.b.set_attrs(adts.fn_attrs(item));
+    }
+    cx.frame_inner(is_closure)?;
     cx.blocks()?;
     let func = cx.b.finish_verified().map_err(BuildError::Lir)?;
     Ok(Built {

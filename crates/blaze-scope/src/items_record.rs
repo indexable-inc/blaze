@@ -1767,6 +1767,11 @@ impl<'a> VerifiedItems<'a> {
     pub fn edition(&self) -> Edition {
         self.edition
     }
+
+    /// Number of file rows in this items record, read in O(1) without constructing `ItemsRecord`.
+    pub fn files(&self) -> usize {
+        self.counts.get(T_FILES).copied().unwrap_or(0)
+    }
 }
 
 /// One crate's items record, read in place (D114 rule 1, a record is its own index): a row, a

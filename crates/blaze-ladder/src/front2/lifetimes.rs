@@ -78,7 +78,7 @@ use blaze_typeck as tc;
 use blaze_typeck::{ItemKey, Name, PNode, PTy, PTys};
 
 use super::head_record::HeadAt;
-use super::heads::{Store, lower};
+use super::heads::{Store, with_lowered};
 use super::keys::{Keys, checker_of};
 use super::locals::Locals;
 use super::source::NamesSource;
@@ -455,8 +455,8 @@ impl<'c, 'n, S: NamesSource<'n>> Reader<'c, 'n, S> {
             return Ok(n);
         }
         let (text, _) = item_text(self.names, self.locals, lib)?;
-        let low = lower(self.names, lib, text).map_err(|_| LifeRefusal::Text)?;
-        let n = declared_lifetimes(&low.view())?;
+        let n = with_lowered(self.names, lib, text, |v| declared_lifetimes(v))
+            .map_err(|_| LifeRefusal::Text)??;
         self.counts.insert(lib, n);
         Ok(n)
     }

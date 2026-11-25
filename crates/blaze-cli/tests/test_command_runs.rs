@@ -136,7 +136,6 @@ fn run_cmd(dir: &Path, home: &Path, subcommand: &str, args: &[&str]) -> Said {
         .env("PWD", dir)
         .env("HOME", home)
         .env("CARGO_HOME", home.join(".cargo"))
-        .env("BLAZE_NO_DAEMON", "1")
         .stdin(Stdio::null())
         .stdout(std::fs::File::create(&stdout).expect("capture blaze's standard output"))
         .stderr(std::fs::File::create(&stderr).expect("capture blaze's standard error"))

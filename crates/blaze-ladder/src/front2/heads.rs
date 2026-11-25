@@ -153,14 +153,14 @@ pub struct TraitHead {
     pub all_self_defaults: bool,
     /// The marks on the principal trait of a trait object's inherent impl.
     pub marks: CoherenceMarks,
-    pub defaults: Vec<Option<PTy>, Global>,
-    pub assoc: Vec<Name, Global>,
-    pub fns: Vec<(Name, ItemKey), Global>,
+    pub defaults: blaze_own::Vec<Option<PTy>, Alloc<'static>>,
+    pub assoc: blaze_own::Vec<Name, Alloc<'static>>,
+    pub fns: blaze_own::Vec<(Name, ItemKey), Alloc<'static>>,
     /// The checker's flags read from the header: `auto` (which is coinductive too), `unsafe`.
     pub flags: tc::TraitFlags,
     /// Its members' dyn-compatibility facts, handed to the checker as `TraitDef.members`
     /// (the checker decides: `blaze_typeck::dyn_compat`).
-    pub members: Vec<tc::dyn_compat::MemberFacts, Global>,
+    pub members: blaze_own::Vec<tc::dyn_compat::MemberFacts, Alloc<'static>>,
 }
 
 /// Whether every parameter after a trait's implicit `Self` defaults to `Self`.
@@ -841,8 +841,8 @@ pub struct AdtRow {
     pub lifetimes: u32,
     /// One region row per field in variant order, shared with the borrow checker.
     pub field_regions: super::borrows::AdtFieldRegions,
-    pub variants: Vec<tc::Variant, Global>,
-    pub fields: Vec<tc::Field, Global>,
+    pub variants: blaze_own::Vec<tc::Variant, Alloc<'static>>,
+    pub fields: blaze_own::Vec<tc::Field, Alloc<'static>>,
     /// Its `#[repr(..)]`: what layout reads.
     pub repr: blaze_build::layout::ReprAttrs,
     /// Its `#[rustc_layout_scalar_valid_range_start(s)]` and `..._end(e)`, as written (each
@@ -852,7 +852,7 @@ pub struct AdtRow {
     pub valid: blaze_build::layout::ValidRange,
     /// An enum's discriminant by variant, explicit or implicit, in its discriminant type
     /// ([`discr_ty`]); empty for a struct or union. Layout's `discriminant` answers from it.
-    pub discrs: Vec<i128, Global>,
+    pub discrs: blaze_own::Vec<i128, Alloc<'static>>,
     /// Marked `#[blaze::args]` (rule 83, D126): an options struct, a call's named arguments and
     /// nothing else. The world answers it as [`tc::TypeAttrs::ARGS`] (world_items.rs `attrs`),
     /// which the body check's `args-inline` reads (blaze-typeck rules/args_inline.rs); the head
@@ -911,8 +911,8 @@ pub fn discr_ty(repr: blaze_build::layout::ReprAttrs) -> tc::DiscrRepr {
 /// a constant item; another expression is [`Why::ConstPath`] naming it); an implicit one is
 /// the previous variant's plus one (the first's is 0). Two variants with one value are the
 /// language's error (E0081), as is one past the type's range.
-fn discriminants<'n, S: NamesSource<'n>>(b: &Builder<'_, Maps, S>, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, repr: blaze_build::layout::ReprAttrs, written: &[(Option<lf::ConstIdx>, Range)]) -> Result<Vec<i128, Global>, Why> {
-    let mut out: Vec<i128, Global> = Vec::with_capacity_in(written.len(), Global);
+fn discriminants<'a, 'n, S: NamesSource<'n>>(b: &Builder<'_, Maps, S>, tys: &mut PortableTys<'a>, env: &Env<'_>, v: &View<'_>, repr: blaze_build::layout::ReprAttrs, written: &[(Option<lf::ConstIdx>, Range)]) -> Result<blaze_own::Vec<i128, Alloc<'a>>, Why> {
+    let mut out: blaze_own::Vec<i128, Alloc<'a>> = blaze_own::Vec::with_capacity_in(written.len(), tys.alloc());
     if written.is_empty() {
         return Ok(out);
     }
@@ -1168,7 +1168,7 @@ impl FnHead<'_> {
 pub struct CtorSig {
     pub adt: ItemKey,
     pub generics: u32,
-    pub inputs: Vec<PTy, Global>,
+    pub inputs: blaze_own::Vec<PTy, Alloc<'static>>,
     pub output: PTy,
 }
 
@@ -1295,28 +1295,28 @@ pub struct ImplHead {
     pub self_ty: PTy,
     pub trait_: Option<ItemKey>,
     pub trait_args: tc::ArgsAfterSelf,
-    pub assoc: Vec<(Name, PTy), Global>,
+    pub assoc: blaze_own::Vec<(Name, PTy), Alloc<'static>>,
     /// Its fns by name and key. No signature is made with the head: each is its own
     /// [`Want::MemberFn`], made when the fn is used (work at item grain).
-    pub fns: Vec<(Name, ItemKey), Global>,
+    pub fns: blaze_own::Vec<(Name, ItemKey), Alloc<'static>>,
     /// For each of `fns`, in its order: whether its first parameter is `self`, read from its
     /// text ([`member_fn::takes_self`]): what answering a name needs, without a signature.
-    pub fn_self: Vec<bool, Global>,
+    pub fn_self: blaze_own::Vec<bool, Alloc<'static>>,
     /// For each of `fns`, in its order: its visibility as written ([`MemberVis`], read from
     /// its text like `fn_self`): what method lookup asks before it takes an inherent fn
     /// (`World::member_visible`). A trait impl's members are `Public` (they are as visible as
     /// the trait, which lookup reaches only when it is in scope).
-    pub fn_vis: Vec<MemberVis, Global>,
+    pub fn_vis: blaze_own::Vec<MemberVis, Alloc<'static>>,
     /// An inherent impl's fns and constants that are unstable ([`Unstable`]: their own
     /// `#[unstable]`, or the impl's when they write no stability attribute), by name in
     /// member order; empty for a trait impl (lookup reaches a trait's member through the
     /// trait). What method and path lookup ask before taking an inherent candidate
     /// (`World::member_unstable`).
-    pub unstable: Vec<(Name, Unstable), Global>,
+    pub unstable: blaze_own::Vec<(Name, Unstable), Alloc<'static>>,
     /// Its associated constants (the Reference, "Associated constants"), each with a row in
     /// `Store::fns` as the checker reads one: no inputs, its type the output, and its body
     /// where its value is written (`has_body`: what the constant evaluator lowers).
-    pub consts: Vec<(Name, ItemKey), Global>,
+    pub consts: blaze_own::Vec<(Name, ItemKey), Alloc<'static>>,
     /// `impl !Trait for T` is negative (the Reference does not list negative impls: rustc's
     /// `negative_impls`, which core and alloc use); `#[rustc_reservation_impl]` reserves.
     pub polarity: tc::ImplPolarity,
@@ -2528,6 +2528,11 @@ pub struct Store<'n> {
     /// expansion reads. `None` (as [`Store::new`] makes it): every `env!`, include and proc
     /// macro in a body is refused by name. The command sets it once, before any body.
     pub sources: Option<&'n dyn super::body_host::BodySources>,
+    /// The command's prepared macro table, kept beside `sources` so lowering a defining body
+    /// (for an `impl Trait` auto-trait reveal or `_`-returning fn inference) still has prepared
+    /// macros even while `&mut Consts` is borrowed by an active constant evaluation (`const_at`,
+    /// `eval_len`, `eval_where_const`).
+    pub(crate) prepared: Option<&'n blaze_lower::scoped::Prepares<'n>>,
     /// Each body checked clean in this run: its read list's digest, by owner, filed where the
     /// check finished (front2 body_reads.rs); the list itself is dropped there.
     pub reads: super::body_reads::Digests,
@@ -2614,12 +2619,12 @@ pub enum NeedsMet {
 /// `Preds::predicates_implying`) and its associated types with their keys and defaults (in
 /// the store's table); made with its members ([`Want::Members`]).
 pub struct TraitExtra {
-    pub supertraits: Vec<PClause, Global>,
-    pub assoc: Vec<tc::AssocTyDef, Global>,
+    pub supertraits: blaze_own::Vec<PClause, Alloc<'static>>,
+    pub assoc: blaze_own::Vec<tc::AssocTyDef, Alloc<'static>>,
     /// Its associated constants, declared or defaulted (the Reference, "Associated
     /// Constants"), in the order written: each with a row in `Store::fns` as an impl's has
     /// ([`ImplHead::consts`]); the row's `has_body` says a default is written.
-    pub consts: Vec<(Name, ItemKey), Global>,
+    pub consts: blaze_own::Vec<(Name, ItemKey), Alloc<'static>>,
 }
 
 /// The step's result: done, the head it needs first, or the want it needs first (an impl's
@@ -2685,7 +2690,7 @@ fn bad(key: LibKey) -> impl Fn(Why) -> HeadError {
 /// (E0666); left as it is. A work list, no recursion.
 pub(super) fn anon_params(v: &View<'_>, base: u32, out: &mut blaze_own::Vec<(lf::TypeId, u32), Alloc<'static>>, alloc: Alloc<'static>) -> Result<(), Why> {
     let mut todo: blaze_own::Vec<lf::TypeId, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
-    let mut kids: Vec<lf::TypeId, Global> = Vec::new_in(Global);
+    let mut kids: blaze_own::Vec<lf::TypeId, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
     for &n in v.rows(v.list(head::PARAMS))?.iter().rev() {
         todo.extend(lf::Param::decode(n)?.ty);
     }
@@ -2705,7 +2710,7 @@ pub(super) fn anon_params(v: &View<'_>, base: u32, out: &mut blaze_own::Vec<(lf:
                 }
             }
         } else {
-            super::types::children(v, t, &mut kids)?;
+            super::types::children_into(v, t, &mut |id| kids.push(id))?;
         }
         todo.extend(kids.iter().rev().copied());
     }
@@ -2859,11 +2864,6 @@ pub(super) fn lower_alloc<'n, S: super::source::NamesSource<'n>>(names: S, key: 
     })
 }
 
-/// One item's signature, lowered from `text` under its crate's cfg.
-pub(super) fn lower<'n, S: super::source::NamesSource<'n>>(names: S, key: LibKey, text: &'n str) -> Result<Lowered<'static, 'n>, HeadError> {
-    lower_alloc(names, key, text, Alloc::global())
-}
-
 pub(super) fn lower_in<'a, 'n, S: super::source::NamesSource<'n>>(names: S, key: LibKey, text: &'n str, alloc: Alloc<'a>) -> Result<Lowered<'a, 'n>, HeadError> {
     lower_in_with_scratch(names, key, text, alloc, alloc)
 }
@@ -2994,7 +2994,8 @@ impl<'n> Store<'n> {
             anon_marks: HashMap::new_in(frame),
             lives: super::lifetimes::Lives::new_in(alloc),
             sources: None,
-            reads: super::body_reads::Digests::new(),
+            prepared: None,
+            reads: super::body_reads::Digests::new_in(alloc),
             closures: super::foreign_closures::ClosureRows::new_in(alloc),
             type_misses: Rows::new_in(alloc),
             cost: None,
@@ -3069,6 +3070,7 @@ impl<'n> Store<'n> {
             anon_marks,
             lives,
             sources,
+            prepared,
             reads,
             closures,
             type_misses,
@@ -3132,6 +3134,7 @@ impl<'n> Store<'n> {
         anon_marks.clear();
         lives.clear();
         *sources = None;
+        *prepared = None;
         reads.clear();
         closures.clear();
         type_misses.clear();
@@ -3196,7 +3199,7 @@ impl<'n> Store<'n> {
         let alloc = tys.alloc();
         let bool_ty = intern(tys, PNode::Bool)?;
         let args = params(tys, 0, total_generics, env.consts)?;
-        let conds = core::mem::take(&mut preds.conds);
+        let conds = core::mem::replace(&mut preds.conds, blaze_own::Vec::new_in(alloc));
         let mut made: blaze_own::Vec<(ItemKey, &'n str), Alloc<'static>> = blaze_own::Vec::with_capacity_in(conds.len(), alloc);
         for (k, &cond) in conds.iter().enumerate() {
             let at = v.const_range(cond)?;
@@ -4379,7 +4382,7 @@ impl<'n> Store<'n> {
         if !preds.conds.is_empty() {
             return Err(Why::Unsupported("`where const` in a trait alias", whole));
         }
-        let mut traits = Vec::new_in(Global);
+        let mut traits = blaze_own::Vec::new_in(alloc);
         for c in preds.clauses.iter() {
             let PClause::Trait { trait_, args } = *c else { continue };
             let first = self.tys.view().list(args).map_err(|_| Why::Unsupported("a clause list outside the store's table", whole))?.first().copied();
@@ -4559,16 +4562,16 @@ impl<'n> Store<'n> {
         // The trait's bounds are lowered after its head (they may name the trait): a default
         // written with `T::X` is refused as not yet readable, never as not found.
         let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::Trait(key), self_assoc: &[], anon: &[], consts: &cs, body: None };
-        let mut defaults = Vec::new_in(Global);
+        let mut defaults = blaze_own::Vec::new_in(alloc);
         own_defaults(&b, &mut self.tys, &env, v, 1, &mut defaults)?;
         let ck = checker_of(key);
-        let mut assoc = Vec::new_in(Global);
+        let mut assoc = blaze_own::Vec::new_in(alloc);
         let mut assoc_own: blaze_own::Vec<(Name, u32), Alloc<'static>> = blaze_own::Vec::new_in(alloc);
         let mut assoc_lives: blaze_own::Vec<(Name, u32), Alloc<'static>> = blaze_own::Vec::new_in(alloc);
         let mut assoc_where: blaze_own::Vec<(Name, super::gat::AssocWhere), Alloc<'static>> = blaze_own::Vec::new_in(alloc);
-        let mut fns = Vec::new_in(Global);
+        let mut fns = blaze_own::Vec::new_in(alloc);
         let ms = members(names, key, alloc).map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))?;
-        let mut members = Vec::new_in(Global);
+        let mut members = blaze_own::Vec::new_in(alloc);
         for m in &ms {
             with_lowered(names, key, m.text, |mv| -> Result<(), Why> {
                 if mv.cfg_out() {
@@ -4854,7 +4857,7 @@ impl<'n> Store<'n> {
         let mut preds = Preds::new_in(scope.clone_in(alloc));
         // What elaborating `T: Trait` adds: its implied clauses (`Preds::predicates_implying`:
         // the header's bounds with their associated item constraints, `where Self: ..`).
-        let mut supertraits = Vec::new_in(Global);
+        let mut supertraits = blaze_own::Vec::new_in(alloc);
         b.predicates_implying(&mut self.tys, &env, v, 1, Some(me), self.sized, &mut preds, &mut |c| supertraits.push(c))?;
         // Before the members' signatures: `Self::Output` in `Fn::call` is a supertrait's. The
         // supertraits proper: the implied trait clauses on `Self` (an associated type's bound,
@@ -4944,8 +4947,8 @@ impl<'n> Store<'n> {
         let super_projs = extract_super_projs(self.tys.view(), &supertraits, self.maps.alloc);
         self.maps.supers.insert(key, supers);
         self.maps.super_projs.insert(key, super_projs);
-        let mut assoc = Vec::new_in(Global);
-        let mut consts: Vec<(Name, ItemKey), Global> = Vec::new_in(Global);
+        let mut assoc = blaze_own::Vec::new_in(alloc);
+        let mut consts: blaze_own::Vec<(Name, ItemKey), Alloc<'static>> = blaze_own::Vec::new_in(alloc);
         // Each associated type's own const parameters (own position, type): filed after the
         // loop into `Maps::assoc_consts`.
         let mut assoc_consts: blaze_own::Vec<(Name, blaze_own::Vec<(u32, PTy), Alloc<'static>>), Alloc<'static>> = blaze_own::Vec::new_in(alloc);
@@ -5177,8 +5180,8 @@ impl<'n> Store<'n> {
             let vk = keys.member(ck, MemberKind::Ctor, "").map_err(|c| Why::Program(format!("{c}").into_boxed_str(), Range::new(0, 0)))?;
             shapes.push((vk, Name::of(name), ctor, v.list(head::FIELDS)));
         }
-        let mut variants = Vec::new_in(Global);
-        let mut fields = Vec::new_in(Global);
+        let mut variants = blaze_own::Vec::new_in(alloc);
+        let mut fields = blaze_own::Vec::new_in(alloc);
         // Each field's default (RFC 3681), one per field, and the text of each written one:
         // filed as an anonymous constant's head below, once the ADT's clauses are made.
         let mut defaults: blaze_own::Vec<Option<ItemKey>, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
@@ -5216,7 +5219,7 @@ impl<'n> Store<'n> {
             }
             variants.push(tc::Variant { key: vk, name, ctor, fields: List { start, len: fields.len() as u32 - start } });
             if ctor == tc::CtorKind::Tuple {
-                let mut inputs = Vec::with_capacity_in(fields.len() - start as usize, Global);
+                let mut inputs = blaze_own::Vec::with_capacity_in(fields.len() - start as usize, alloc);
                 inputs.extend(fields[start as usize..].iter().map(|f| f.ty));
                 self.ctors.insert(vk, CtorSig { adt: ck, generics, inputs, output: self_ty });
             }
@@ -5479,7 +5482,7 @@ impl<'n> Store<'n> {
         let ck = checker_of(key);
         self.provisional_impls.remove(&ck);
         let alloc = self.tys.alloc();
-        let mut ps = Vec::new_in(Global);
+        let mut ps = blaze_own::Vec::new_in(alloc);
         let mut cs = blaze_own::Vec::new_in(alloc);
         let marks = self.marks(names, key, v.item())?;
         let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
@@ -5574,19 +5577,19 @@ impl<'n> Store<'n> {
         };
         let given = SelfGiven { self_: self_given, impl_trait: impl_trait.as_deref(), param_bounds: &[] };
         let ms = members(names, key, alloc).map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))?;
-        let mut assoc = Vec::new_in(Global);
-        let mut fns = Vec::new_in(Global);
+        let mut assoc = blaze_own::Vec::new_in(alloc);
+        let mut fns = blaze_own::Vec::new_in(alloc);
         // Each fn's `self` from its text ([`member_fn::takes_self`]): its signature is its own
         // want ([`Want::MemberFn`]), made when it is used, never with this head (brief 14: a
         // signature naming `Self::BYTES` of a sibling impl made every lookup of a name in the
         // type need that constant).
-        let mut fn_self = Vec::new_in(Global);
+        let mut fn_self = blaze_own::Vec::new_in(alloc);
         // Each fn's visibility from its text too ([`MemberVis`]): a trait impl's members
         // write none and are the trait's (`Public` here).
-        let mut fn_vis = Vec::new_in(Global);
+        let mut fn_vis = blaze_own::Vec::new_in(alloc);
         // An inherent impl's unstable members ([`Unstable`]), under the impl's own stability.
         let impl_marked = if trait_.is_none() { Marked::of(v)? } else { Marked::Unmarked };
-        let mut unstable = Vec::new_in(Global);
+        let mut unstable = blaze_own::Vec::new_in(alloc);
         let mut const_texts = blaze_own::Vec::new_in(alloc);
         // Each `type X = U;` value's column (D148, `HeadRegions::impl_assoc`), or why not: filed
         // with the impl's regions below, a refusal refusing them.
@@ -5678,7 +5681,7 @@ impl<'n> Store<'n> {
         let mut preds = Preds::new_in(scope.clone_in(alloc));
         b.predicates(&mut self.tys, &env, v, 0, None, self.sized, &mut preds)?;
         Self::file_where_consts(&mut self.tys, &self.locals, &self.fns, &self.preds, ck, key, module, v, &env, &bounds, generics, keys, &mut preds)?;
-        let mut consts = Vec::with_capacity_in(const_texts.len(), Global);
+        let mut consts = blaze_own::Vec::with_capacity_in(const_texts.len(), alloc);
         let mut life_names = Vec::new_in(alloc);
         lifetime_names(v, &mut life_names)?;
         if let Some((waiting_const, need_const)) = first_assoc_const {
@@ -5783,9 +5786,9 @@ impl<'n> Store<'n> {
             consts.push((name, mk));
         }
         // The frame its fns' signatures are made in, each by its own want (`Store::member_fn`).
-        let mut frame_bounds = Vec::with_capacity_in(bounds.len(), Global);
+        let mut frame_bounds = blaze_own::Vec::with_capacity_in(bounds.len(), alloc);
         frame_bounds.extend_from_slice(&bounds);
-        let mut frame_consts = Vec::with_capacity_in(cs.len(), *frame_bounds.allocator());
+        let mut frame_consts = blaze_own::Vec::with_capacity_in(cs.len(), alloc);
         frame_consts.extend_from_slice(&cs);
         let self_ = env.self_;
         let is_const = v.head.get(head::FLAGS).is_some_and(|&f| f & sig::CONST != 0);
@@ -6178,7 +6181,7 @@ impl<'n> Store<'n> {
         // preorder; one with no macro is read in place. An `async fn`'s written return type is
         // walked the same way (`-> eyre::Result<impl Provider<N>>`: opaque 1, after the future's 0).
         let written_ret = v.head_opt(head::TY).map(lf::TypeId);
-        let mut rets = Vec::new_in(Global);
+        let mut rets: Vec<lf::TypeId, Alloc<'static>> = Vec::new_in(alloc);
         let has_macro = match written_ret {
             Some(t) => super::types::return_impls(v, t, &mut rets)?,
             None => false,
@@ -6189,7 +6192,9 @@ impl<'n> Store<'n> {
                 let r = v.site(v.type_range(t)?)?;
                 let ret_text = v.text_at(v.type_range(t)?)?;
                 let x = super::type_expand::expand_type_text(names, outer.module, ret_text, marks, r, alloc)?;
-                x.impls(ret_text, r, &mut rets)?;
+                let mut macro_rets = Vec::new_in(Global);
+                x.impls(ret_text, r, &mut macro_rets)?;
+                rets.extend_from_slice(&macro_rets);
                 Some(x)
             }
             _ => None,

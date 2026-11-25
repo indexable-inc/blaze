@@ -43,8 +43,8 @@ pub enum Sizing {
 /// evaluate. `sources[i]` is what `clauses[i]` was written as (one each, kept in step by
 /// [`Preds::push`] and [`Preds::remove_clause`]); `scope` names the item's lifetimes.
 pub struct Preds {
-    pub clauses: Vec<PClause, Global>,
-    pub conds: Vec<lf::ConstIdx, Global>,
+    pub clauses: OwnVec<PClause, Mem>,
+    pub conds: OwnVec<lf::ConstIdx, Mem>,
     pub sources: OwnVec<Src, Mem>,
     pub scope: Scope,
     /// Why the sources could not all be read as written (a bound's arguments the regions'
@@ -65,7 +65,7 @@ impl Preds {
     /// [`Scope::item`]).
     pub fn new_in(scope: Scope) -> Preds {
         let alloc = scope.alloc();
-        Preds { clauses: Vec::new_in(Global), conds: Vec::new_in(Global), sources: OwnVec::new_in(alloc), scope, regions_gap: None, trait_misses: None }
+        Preds { clauses: OwnVec::new_in(alloc), conds: OwnVec::new_in(alloc), sources: OwnVec::new_in(alloc), scope, regions_gap: None, trait_misses: None }
     }
 
     /// A fn head's: a bound whose trait names nothing is kept in [`Preds::trait_misses`] and
@@ -82,7 +82,7 @@ impl Preds {
 
     /// The clauses of a filed head (head_record.rs): their region columns were filed beside
     /// them, so each one's source is [`Src::Derived`] and its scope names nothing.
-    pub fn decoded(clauses: Vec<PClause, Global>, conds: Vec<lf::ConstIdx, Global>, alloc: Mem) -> Preds {
+    pub fn decoded(clauses: OwnVec<PClause, Mem>, conds: OwnVec<lf::ConstIdx, Mem>, alloc: Mem) -> Preds {
         let mut sources = OwnVec::with_capacity_in(clauses.len(), alloc);
         for _ in 0..clauses.len() {
             sources.push(Src::Derived);
@@ -114,7 +114,7 @@ impl Preds {
     /// [`On::Nested::of`]) down by one. A link to the removed clause itself cannot be: only an
     /// implied sizedness clause ([`Src::Derived`]) is removed, and no clause links to one.
     pub fn remove_clause(&mut self, at: usize) {
-        self.clauses.remove(at);
+        self.clauses.remove_shift(at);
         self.sources.remove_shift(at);
         let at = u32::try_from(at).unwrap_or(u32::MAX);
         let down = |of: &mut u32| {
@@ -224,7 +224,7 @@ pub(super) fn segment_args<'t>(tys: &mut PortableTys<'t>, v: &View<'_>, seg: &lf
         return Err(Why::Unsupported("return type notation (`Tr(..)`)", r));
     }
     if seg.parenthesized {
-        let mut inputs = Vec::new_in(Global);
+        let mut inputs = OwnVec::new_in(tys.alloc());
         for &n in v.rows(seg.args)? {
             match lf::GenericArg::decode(n)? {
                 lf::GenericArg::Type(t) => inputs.push(make(tys, t)?),
@@ -458,22 +458,22 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
     /// Whether `s` states its type's sizedness, so that no implied `Sized` is added: `?Sized`,
     /// `Sized` itself, or a supertrait of `Sized` (`MetaSized`, `PointeeSized`: RFC 3729, the
     /// sized hierarchy; the pinned core's `impl<T: PointeeSized> Clone for &T`).
-    fn states_size(&self, s: Sizing, sized: Option<LibKey>) -> Result<bool, Why> {
+    fn states_size(&self, s: Sizing, sized: Option<LibKey>, alloc: Mem) -> Result<bool, Why> {
         match s {
             Sizing::Relaxed => Ok(true),
             Sizing::NoTrait => Ok(false),
             Sizing::Trait(k) if Some(k) == sized => Ok(true),
-            Sizing::Trait(k) => self.sized_super(k, sized),
+            Sizing::Trait(k) => self.sized_super(k, sized, alloc),
         }
     }
 
     /// `key` is a supertrait of the `sized` lang trait, through its supertraits (by the heads'
     /// `trait_supers`, a work list). Asked only for a parameter's bounds, never while a trait's
     /// own supertraits are made, so lowering `Sized`'s head never waits on itself.
-    fn sized_super(&self, key: LibKey, sized: Option<LibKey>) -> Result<bool, Why> {
+    fn sized_super(&self, key: LibKey, sized: Option<LibKey>, alloc: Mem) -> Result<bool, Why> {
         const MOST: usize = 16;
         let Some(s) = sized else { return Ok(false) };
-        let mut todo = Vec::new_in(Global);
+        let mut todo = OwnVec::new_in(alloc);
         todo.push(s);
         for _ in 0..MOST {
             let Some(t) = todo.pop() else { return Ok(false) };
@@ -619,7 +619,7 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
                 if given.len() + 1 != head.generics as usize {
                     return Err(Why::Program(format!("a trait alias written with {} type arguments; it takes {}", given.len(), head.generics - 1).into_boxed_str(), pr));
                 }
-                let mut args = Vec::with_capacity_in(given.len() + 1, Global);
+                let mut args = OwnVec::with_capacity_in(given.len() + 1, tys.alloc());
                 args.push(me);
                 args.extend_from_slice(&given);
                 for &(trait_, l) in &head.traits {
@@ -649,7 +649,7 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
             for &b in v.rows(bounds)? {
                 let s = self.bound(tys, env, v, lf::Bound::decode(b)?, (me, On::Made, Binders::NONE), sized, out)?;
                 relaxed |= s == Sizing::Relaxed;
-                stated |= s != Sizing::Relaxed && self.states_size(s, sized)?;
+                stated |= s != Sizing::Relaxed && self.states_size(s, sized, out.alloc())?;
             }
             if let Some(s) = self.implied_size(stated, relaxed, sized)? {
                 let args = intern_list(tys, &[me])?;
@@ -680,7 +680,7 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
         for &b in v.rows(v.list(head::BOUNDS))? {
             let s = self.bound(tys, env, v, lf::Bound::decode(b)?, (me, On::Made, Binders::NONE), sized, out)?;
             relaxed |= s == Sizing::Relaxed;
-            stated |= s != Sizing::Relaxed && self.states_size(s, sized)?;
+            stated |= s != Sizing::Relaxed && self.states_size(s, sized, out.alloc())?;
         }
         if let Some(s) = self.implied_size(stated, relaxed, sized)? {
             let args = intern_list(tys, &[me])?;
@@ -792,8 +792,8 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
         // place) does not take the clause away: it relaxes it to `MetaSized`
         // ([`Self::implied_size`]; `relax`, applied at the end); a written sizedness trait
         // (`Sized`, `MetaSized`, `PointeeSized`) takes it away (`dropped`).
-        let mut own: Vec<(PTy, Option<usize>), Global> = Vec::new_in(Global);
-        let mut relax: Vec<usize, Global> = Vec::new_in(Global);
+        let mut own: OwnVec<(PTy, Option<usize>), Mem> = OwnVec::new_in(out.alloc());
+        let mut relax: OwnVec<usize, Mem> = OwnVec::new_in(out.alloc());
         let mut i = base;
         for &n in v.rows(v.list(head::GENERICS))? {
             // A const parameter takes an index too (`heads::param_names`) and is never `Sized`.
@@ -812,7 +812,7 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
                 for &b in v.rows(bounds)? {
                     let s = self.bound(tys, env, v, lf::Bound::decode(b)?, (me, On::Made, Binders::NONE), sized, out)?;
                     relaxed |= s == Sizing::Relaxed;
-                    stated |= s != Sizing::Relaxed && self.states_size(s, sized)?;
+                    stated |= s != Sizing::Relaxed && self.states_size(s, sized, out.alloc())?;
                 }
                 let mut at = None;
                 if let (false, Some(s)) = (stated, sized) {
@@ -847,7 +847,7 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
                 }
             }
         }
-        let mut dropped = Vec::new_in(Global);
+        let mut dropped = OwnVec::new_in(out.alloc());
         for &n in v.rows(v.list(head::WHERE))? {
             match lf::WherePred::decode(n)? {
                 lf::WherePred::Const { cond } => out.conds.push(cond),
@@ -870,7 +870,7 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
                             // `where T: ?Sized` on the item's own parameter relaxes its default
                             // to `MetaSized`; a sizedness trait there takes it away.
                             Some((_, Some(at))) if s == Sizing::Relaxed => relax.push(at),
-                            Some((_, Some(at))) if self.states_size(s, sized)? => dropped.push(at),
+                            Some((_, Some(at))) if self.states_size(s, sized, out.alloc())? => dropped.push(at),
                             Some(_) => {}
                             // `?Sized` on what has no implied bound here (an outer item's
                             // parameter, a type that is no parameter) is the language's error.

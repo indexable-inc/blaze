@@ -228,7 +228,9 @@ impl<'n> ProjectWorld<'n> {
         let mut store = Store::new(front.index.lang("sized"), frame, alloc);
         store.pointers = super::receiver::Pointers::find(&front.index, front.resolver);
         let bump = frame.alloc(blaze_own::Erased::new(frame)).bump();
-        Ok(ProjectWorld { front, store, buckets: None, consts: Consts::default(), prepared: Prepares::new_in(bump), alloc, by_chain: None })
+        let prepared = Prepares::new_in(bump);
+        store.prepared = Some(prepared);
+        Ok(ProjectWorld { front, store, buckets: None, consts: Consts::default(), prepared, alloc, by_chain: None })
     }
 }
 
@@ -242,7 +244,9 @@ impl<'n> ProjectWorld<'n, &'n source::Records<'n>> {
         let mut store = Store::new(front.index.lang("sized"), frame, alloc);
         store.pointers = super::receiver::Pointers::find(&front.index, front.resolver);
         let bump = frame.alloc(blaze_own::Erased::new(frame)).bump();
-        Ok(ProjectWorld { front, store, buckets: None, consts: Consts::default(), prepared: Prepares::new_in(bump), alloc, by_chain: None })
+        let prepared = Prepares::new_in(bump);
+        store.prepared = Some(prepared);
+        Ok(ProjectWorld { front, store, buckets: None, consts: Consts::default(), prepared, alloc, by_chain: None })
     }
 }
 
@@ -287,6 +291,7 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
                 Prepares::new_in(bump)
             }
         };
+        store.prepared = Some(prepared);
         ProjectWorld { front, store, buckets: None, consts: Consts::default(), prepared, alloc, by_chain: None }
     }
 

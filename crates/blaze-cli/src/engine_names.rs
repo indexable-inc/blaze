@@ -1265,6 +1265,10 @@ pub(crate) struct NamesQueue<'j, 'a> {
     uncommitted_snap: Option<(u32, crate::store::SharedSnapshot)>,
     uncommitted_mapped: Vec<Option<(Input, UncommittedMapped<'j>)>, &'j Frame>,
     width: usize,
+    /// Admission-time cap used during `Pipeline::admit` (before `scripts.dispatch()` runs in
+    /// `Pipeline::collect`) so newly queued scripts are never starved of initial pool slots; once
+    /// `scripts.dispatch()` runs, `NamesQueue::dispatch()` uses the full `width`.
+    admit_width: usize,
     order: BTreeMap<(bool, u16, Name), EngineTask, &'j Frame>,
     waiting: VecDeque<WaitingName<'j, 'a>, &'j Frame>,
     running: BTreeMap<Name, RunningName<'j, 'a>, &'j Frame>,
@@ -1281,7 +1285,7 @@ impl<'j, 'a: 'j> NamesQueue<'j, 'a> {
         let bump = frame.alloc(blaze_own::Erased::new(frame)).bump();
         Self { frame, bump, local, slots, columns: None, walk: ProducerWalk::new(frame), mapped: Vec::new_in(frame),
             uncommitted_snap: None, uncommitted_mapped: Vec::new_in(frame),
-            width: 1, order: BTreeMap::new_in(frame), waiting: VecDeque::new_in(frame), running: BTreeMap::new_in(frame), answered: BTreeMap::new_in(frame),
+            width: 1, admit_width: 1, order: BTreeMap::new_in(frame), waiting: VecDeque::new_in(frame), running: BTreeMap::new_in(frame), answered: BTreeMap::new_in(frame),
             scratch: BTreeMap::new_in(frame), ended: Vec::new_in(frame), edges: Vec::new_in(frame) }
     }
 
@@ -1327,12 +1331,16 @@ impl<'j, 'a: 'j> NamesQueue<'j, 'a> {
         self.next_virtual().map(|(tick, _)| tick)
     }
 
-    pub(crate) fn dispatch(&mut self) {
-        while self.running.len() < self.width && self.slots.free() && let Some(waiting) = self.waiting.pop_front() {
+    fn dispatch_up_to(&mut self, limit: usize) {
+        while self.running.len() < limit && self.slots.free() && let Some(waiting) = self.waiting.pop_front() {
             self.slots.take();
             let name = waiting.task.planned.name;
             self.running.insert(name, waiting.start(self.frame));
         }
+    }
+
+    pub(crate) fn dispatch(&mut self) {
+        self.dispatch_up_to(self.width);
     }
 
     /// Return a worker slot without publishing. Either stage can take the slot when
@@ -1370,15 +1378,20 @@ impl<'j, 'a: 'j> NamesQueue<'j, 'a> {
         let width = handles.workers.get().min(scope.workers());
         #[cfg(test)]
         let width = if crate::engine_scripts::runner_clock().is_some() { handles.workers.get() } else { width };
+        let workers = core::num::NonZeroU32::new(width).unwrap_or(core::num::NonZeroU32::MIN);
+        self.width = usize::try_from(workers.get()).unwrap_or(1);
+        // Reserve slots for runnable scripts only during `submit` (before `scripts.dispatch()`
+        // runs in `Pipeline::collect`). In `collect`, `scripts.dispatch()` always runs first and
+        // takes every slot runnable scripts can actually use, after which `NamesQueue::dispatch()`
+        // fills every remaining free pool slot up to the full `width` (no static 25% worker cap).
         let reserve = if runnable_scripts > 0 {
-            let cap = width.div_ceil(4);
+            let cap = width.div_ceil(2);
             let want = u32::try_from(runnable_scripts).unwrap_or(u32::MAX);
-            cap.min(want)
+            cap.min(want).min(width.saturating_sub(1))
         } else {
             0
         };
-        let workers = core::num::NonZeroU32::new(width.saturating_sub(reserve)).unwrap_or(core::num::NonZeroU32::MIN);
-        self.width = workers.get() as usize;
+        self.admit_width = usize::try_from(width.saturating_sub(reserve).max(1)).unwrap_or(1);
         workers
     }
 
@@ -1631,7 +1644,7 @@ impl<'j, 'a: 'j> NamesQueue<'j, 'a> {
         self.order.insert((!feeds_names, task.planned.phase.wave, name), task);
         self.waiting.push_back(WaitingName { task, scope, job, script, blocked: gate.err(), root: handles.root, clock: &handles.env.clock,
             board: handles.board, outlined: handles.outlined, alloc, waiter, submitted: crate::engine_times::ns(handles.env.clock.now().since_start()) });
-        self.dispatch();
+        self.dispatch_up_to(self.admit_width);
         Ok(())
     }
 

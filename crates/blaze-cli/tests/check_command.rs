@@ -481,7 +481,7 @@ fn check_detects_unused_dependency_with_zero_false_positives_and_fixes_it() {
     let ws = base.join("ws");
     build_udeps_workspace(&ws, true);
 
-    let check = blaze_env(&ws, &home, &["check"], &[("BLAZE_NO_DAEMON", "1")], "check");
+    let check = blaze_env(&ws, &home, &["check"], &[], "check");
     assert!(
         check.out.contains("warning[unused-dependency]") && check.out.contains("app/Cargo.toml:") && check.out.contains("`ghost`"),
         "expected unused-dependency warning for `ghost` at app/Cargo.toml:\n{}",
@@ -495,7 +495,7 @@ fn check_detects_unused_dependency_with_zero_false_positives_and_fixes_it() {
         );
     }
 
-    let fixed = blaze_env(&ws, &home, &["check", "--fix", "all"], &[("BLAZE_NO_DAEMON", "1")], "fix");
+    let fixed = blaze_env(&ws, &home, &["check", "--fix", "all"], &[], "fix");
     assert!(
         !fixed.out.contains("unused-dependency"),
         "after `--fix all`, no unused-dependency warning should remain:\n{}",
@@ -516,7 +516,7 @@ fn blaze_ci_passes_on_clean_fails_on_errors_and_unused_deps_and_emits_github_and
     // 1. Clean workspace -> exit 0, btab todo with `status: passed` and `todo: []`.
     let clean_ws = base.join("clean");
     build_udeps_workspace(&clean_ws, false);
-    let clean = blaze_env(&clean_ws, &home, &["ci", "--no-test"], &[("BLAZE_NO_DAEMON", "1")], "ci_clean");
+    let clean = blaze_env(&clean_ws, &home, &["ci", "--no-test"], &[], "ci_clean");
     assert_eq!(clean.status, Some(0), "clean ci should exit 0:\n{}", clean.all());
     assert!(clean.out.contains("blaze ci: PASSED"), "expected PASSED verdict:\n{}", clean.all());
     let todo_btab = read_text(&clean_ws.join(".blaze/ci/todo.btab"));
@@ -531,7 +531,7 @@ fn blaze_ci_passes_on_clean_fails_on_errors_and_unused_deps_and_emits_github_and
     // 2. Unused dependency -> exit 1, btab + JSON todo with suggestion, `--fix` repairs and passes.
     let udep_ws = base.join("udep");
     build_udeps_workspace(&udep_ws, true);
-    let udep = blaze_env(&udep_ws, &home, &["ci", "--no-test"], &[("BLAZE_NO_DAEMON", "1")], "ci_udep");
+    let udep = blaze_env(&udep_ws, &home, &["ci", "--no-test"], &[], "ci_udep");
     assert_eq!(udep.status, Some(1), "ci with unused dep must fail (exit 1):\n{}", udep.all());
     assert!(udep.out.contains("blaze ci: FAILED") && udep.out.contains("1 unused dep(s)"), "expected FAILED naming unused dep:\n{}", udep.all());
     let udep_btab = read_text(&udep_ws.join(".blaze/ci/todo.btab"));
@@ -554,7 +554,7 @@ fn blaze_ci_passes_on_clean_fails_on_errors_and_unused_deps_and_emits_github_and
         Some(1)
     );
 
-    let udep_json_run = blaze_env(&udep_ws, &home, &["ci", "--no-test", "--todo-format=json"], &[("BLAZE_NO_DAEMON", "1")], "ci_udep_json");
+    let udep_json_run = blaze_env(&udep_ws, &home, &["ci", "--no-test", "--todo-format=json"], &[], "ci_udep_json");
     assert_eq!(udep_json_run.status, Some(1), "ci json run fails:\n{}", udep_json_run.all());
     let udep_json = read_text(&udep_ws.join(".blaze/ci/todo.json"));
     assert!(
@@ -565,7 +565,7 @@ fn blaze_ci_passes_on_clean_fails_on_errors_and_unused_deps_and_emits_github_and
         "unexpected udep todo.json:\n{udep_json}"
     );
 
-    let udep_fixed = blaze_env(&udep_ws, &home, &["ci", "--no-test", "--fix"], &[("BLAZE_NO_DAEMON", "1")], "ci_udep_fix");
+    let udep_fixed = blaze_env(&udep_ws, &home, &["ci", "--no-test", "--fix"], &[], "ci_udep_fix");
     assert_eq!(udep_fixed.status, Some(0), "ci --fix should fix unused dep and pass:\n{}", udep_fixed.all());
     assert!(udep_fixed.out.contains("blaze ci: PASSED"), "expected PASSED after --fix:\n{}", udep_fixed.all());
 
@@ -582,7 +582,7 @@ fn blaze_ci_passes_on_clean_fails_on_errors_and_unused_deps_and_emits_github_and
         &gh_ws,
         &home,
         &["ci", "--no-test"],
-        &[("BLAZE_NO_DAEMON", "1"), ("GITHUB_ACTIONS", "true"), ("GITHUB_STEP_SUMMARY", &summary_str)],
+        &[("GITHUB_ACTIONS", "true"), ("GITHUB_STEP_SUMMARY", &summary_str)],
         "ci_gh",
     );
     assert_eq!(gh.status, Some(1), "github ci with type error + unused dep must fail:\n{}", gh.all());
@@ -628,7 +628,7 @@ fn blaze_ci_passes_on_clean_fails_on_errors_and_unused_deps_and_emits_github_and
         let test_ws = base.join("with_test");
         write(&test_ws.join("Cargo.toml"), "[package]\nname = \"clean_test\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
         write(&test_ws.join("src/lib.rs"), "pub fn add(a: u32, b: u32) -> u32 { a + b }\n#[test]\nfn adds() { assert_eq!(add(2, 3), 5); }\n");
-        let ran = blaze_env(&test_ws, &home, &["ci"], &[("BLAZE_NO_DAEMON", "1")], "ci_with_test");
+        let ran = blaze_env(&test_ws, &home, &["ci"], &[], "ci_with_test");
         assert_eq!(ran.status, Some(0), "full blaze ci with passing test must exit 0:\n{}", ran.all());
         assert!(
             ran.out.contains("blaze ci: PASSED") && ran.out.contains("1 test(s) passed"),

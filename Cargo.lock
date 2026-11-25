@@ -1288,6 +1288,10 @@ version = "0.0.0"
 dependencies = [
  "blaze-ask",
  "blaze-body",
+ "blaze-body-build",
+ "blaze-body-drops",
+ "blaze-body-eval",
+ "blaze-body-flow",
  "blaze-body-lower",
  "blaze-build",
  "blaze-build-script",

@@ -563,12 +563,12 @@ fn self_of<H: Heads + ?Sized>(heads: &H, found: Target, segs: usize) -> Option<Q
 /// names library does not resolve to a trait and a ground type, heads with no evaluator
 /// behind them): the text is then evaluated as written, and refused by its own name.
 /// `resolve` reads a path in the head's module, in the type namespace.
-pub fn substitute<'h, H: Heads + ?Sized>(
+pub fn substitute<'a, 'h, H: Heads + ?Sized>(
     heads: &'h H,
     resolve: &dyn Fn(bool, &[&str]) -> Result<Target, ResolveError>,
     text: &str,
-    alloc: Alloc<'static>,
-) -> Result<Option<String<Alloc<'static>>>, Stop<'h>> {
+    alloc: Alloc<'a>,
+) -> Result<Option<String<Alloc<'a>>>, Stop<'h>> {
     let mut out = String::new_in(alloc);
     let mut copied = 0usize;
     let mut first_need: Option<LibKey> = None;
@@ -599,7 +599,10 @@ pub fn substitute<'h, H: Heads + ?Sized>(
         if let Some(why) = heads.anon_failed(need) {
             return Err(Stop::Failed { start: leaf.start, end: leaf.end, why });
         }
-        let ask = QAsk { need, trait_: tr.key, self_, name: String::from_str_in(leaf.name, alloc) };
+        let Some(ask_alloc) = heads.mark_alloc() else {
+            return Ok(None);
+        };
+        let ask = QAsk { need, trait_: tr.key, self_, name: String::from_str_in(leaf.name, ask_alloc) };
         if !heads.ask_qpath(ask) {
             return Ok(None);
         }

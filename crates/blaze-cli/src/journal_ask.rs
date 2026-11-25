@@ -237,7 +237,7 @@ impl core::fmt::Display for SocketFits {
 }
 
 /// Allocation-free checkout key computation matching [`checkout_key`], shared by the pre-runtime
-/// daemon client (`daemon_client.rs`), resident daemon (`daemon_server.rs`), and `clean.rs`.
+/// `clean.rs`.
 pub(crate) fn checkout_key_of(root: &str) -> CheckoutKey {
     let mut hasher = blaze_blake3::Hasher::new();
     hasher.update(CHECKOUT_DOMAIN.as_bytes());

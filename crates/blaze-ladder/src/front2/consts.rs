@@ -726,8 +726,21 @@ impl<'n, S: NamesSource<'n>> ConstWorld for ConstsWorld<'_, 'n, S> {
     /// makes before it evaluates the need again, or refuses by name. `None` with nothing noted:
     /// the library declares no such lang trait, and the evaluator refuses the coercion by name.
     fn fn_trait_method(&self, which: blaze_build::FnTrait) -> blaze_consteval::FnTraitMethod {
-        use blaze_consteval::FnTraitMethod::{Absent, Found, Pending};
         let (lang, name) = super::langs::fn_trait_method(which);
+        self.lang_trait_method(lang, name)
+    }
+
+    fn deref_method(&self, mutbl: tc::Mutbl) -> blaze_consteval::FnTraitMethod {
+        match mutbl {
+            tc::Mutbl::Not => self.lang_trait_method(tc::LangItem::Deref, "deref"),
+            tc::Mutbl::Mut => self.lang_trait_method(tc::LangItem::DerefMut, "deref_mut"),
+        }
+    }
+}
+
+impl<'n, S: NamesSource<'n>> ConstsWorld<'_, 'n, S> {
+    fn lang_trait_method(&self, lang: tc::LangItem, name: &str) -> blaze_consteval::FnTraitMethod {
+        use blaze_consteval::FnTraitMethod::{Absent, Found, Pending};
         let Some(lib) = super::langs::lang_name(lang).and_then(|n| self.index.lang(n)) else { return Absent };
         let trait_ = super::keys::checker_of(lib);
         if let Some(method) = self.keys.filed_member(trait_, super::keys::MemberKind::Fn, name) {
@@ -1295,10 +1308,39 @@ impl<'n> Consts<'n> {
             let lits = LitTable::of(&view, &lowered.typeck, item)?;
             (checked, lits)
         };
+        let strip_expr_adjusts = |checked: &mut Checked<'static>, expr: tc::ExprId| {
+            let adj_e = checked.adjusts.column::<0>();
+            let start = adj_e.partition_point(|e| e.0 < expr.0);
+            let end = adj_e.partition_point(|e| e.0 <= expr.0);
+            if start == end {
+                return;
+            }
+            let mut stripped = blaze_own::Soa::new_in(r.store.tys.alloc());
+            for (i, ((&e, &k), &t)) in checked
+                .adjusts
+                .column::<0>()
+                .iter()
+                .zip(checked.adjusts.column::<1>().iter())
+                .zip(checked.adjusts.column::<2>().iter())
+                .enumerate()
+            {
+                if i < start || i >= end {
+                    stripped.push((e, k, t));
+                }
+            }
+            checked.adjusts = stripped;
+        };
         let root = match root {
             None => None,
             Some(BodyRoot::Block(block)) => match lowered.typeck.exprs.get(block.0 as usize) {
-                Some(tc::Expr::ConstBlock { .. }) => Some(block),
+                Some(tc::Expr::ConstBlock { .. }) => {
+                    // Adjustments on `block` itself belong to the enclosing expression (e.g.
+                    // `bytes!("...").to_vec()` puts `Bytes::deref` + autoref on the `const { .. }`
+                    // receiver); the const block's own record is its unadjusted value, and the
+                    // builder applies `block`'s adjustments after loading it (blaze-build walk.rs).
+                    strip_expr_adjusts(&mut checked, block);
+                    Some(block)
+                }
                 _ => return Err(ConstFail::NotConstBlock { owner: item, block }),
             },
             // The operand is evaluated; the builder borrows its row. Only a borrow THIS check
@@ -1326,20 +1368,7 @@ impl<'n> Consts<'n> {
                         {
                             return Err(ConstFail::NotPromoted { owner: item, borrow });
                         }
-                        let mut stripped = blaze_own::Soa::new_in(r.store.tys.alloc());
-                        for (i, ((&e, &k), &t)) in checked
-                            .adjusts
-                            .column::<0>()
-                            .iter()
-                            .zip(checked.adjusts.column::<1>().iter())
-                            .zip(checked.adjusts.column::<2>().iter())
-                            .enumerate()
-                        {
-                            if i < start || i >= end {
-                                stripped.push((e, k, t));
-                            }
-                        }
-                        checked.adjusts = stripped;
+                        strip_expr_adjusts(&mut checked, borrow);
                         Some(borrow)
                     }
                     None => return Err(ConstFail::NotPromoted { owner: item, borrow }),

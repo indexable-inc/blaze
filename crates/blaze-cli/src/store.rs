@@ -918,20 +918,8 @@ pub fn after_answer_printed(cx: &Cx, lent: CommandLent, home: &Home, stats: bool
         drop(lent);
         (after, commit_ns, spawn_bg)
     } else {
-        // Only lower to the after-answer utility class when running inline cleanup/seal slices
-        // (`slices > 0`). When `slices == 0`, the foreground CLI is waiting to exit after one
-        // commit flip and must not be throttled onto slow E-cores or behind background GC.
-        #[cfg(target_os = "macos")]
-        let _held = if slices > 0 {
-            match plain_place::AFTER_ANSWER_QOS {
-                plain_place::AfterAnswerQos::Scoped => Some(
-                    blaze_core::threads::qos::Lowered::at_most(blaze_core::threads::qos::AFTER_ANSWER).map_err(PlaceError::Qos)?,
-                ),
-                plain_place::AfterAnswerQos::AsCalled => None,
-            }
-        } else {
-            None
-        };
+        // `plain_place::after_answer` keeps `lent.commit()` at caller QoS (P-cores) and scopes
+        // QoS lowering strictly to inline maintenance (`fold_slice`, `clean_on`, `seal`).
         let after = plain_place::after_answer(cx, &lent, slices)?;
         let commit_ns = ns(clock).saturating_sub(answered);
         let manifest_changed = after.segments_written > 0 || after.sealed || after.compaction_slices > 0;
@@ -944,6 +932,13 @@ pub fn after_answer_printed(cx: &Cx, lent: CommandLent, home: &Home, stats: bool
         let _ = home.bg_gc.spawn(&cx, home.dir(), err);
     } else if !bg_detached {
         let cx = cx.span("store after answer: sweep of other forms' stores (a listing of the store root)");
+        #[cfg(target_os = "macos")]
+        let _sweep_qos = match plain_place::AFTER_ANSWER_QOS {
+            plain_place::AfterAnswerQos::Scoped => {
+                Some(blaze_core::threads::qos::Lowered::at_most(blaze_core::threads::qos::AFTER_ANSWER).map_err(PlaceError::Qos)?)
+            }
+            plain_place::AfterAnswerQos::AsCalled => None,
+        };
         crate::clean::sweep_other_forms(&cx, &home.dir, clock.wall().as_ns(), err, crate::clean::SweepPlant::None)?;
     }
     if stats {
@@ -962,64 +957,6 @@ pub fn after_answer_printed(cx: &Cx, lent: CommandLent, home: &Home, stats: bool
         err.line(cx, format_args!("{}", after.cleanup))?;
     }
     Ok(after.cleanup)
-}
-
-/// Commits this request's puts and roots for the resident daemon WITHOUT dropping `lent` or
-/// spawning background GC yet (the daemon sends `ServerFrame::Done` to the client first, then
-/// calls [`post_done_for_daemon`] to reclaim arenas and spawn background GC).
-pub(crate) fn after_answer_for_daemon(
-    cx: &Cx,
-    lent: &CommandLent,
-    home: &Home,
-) -> Result<(roots::CleanupLine, bool), CliError> {
-    // Queue lease release so the idle daemon holds zero leases on disk (never blocking `blaze gc`).
-    lent.release_lease();
-    let needs_hk = lent.needs_housekeeping(lent.wall_ns());
-    let bg_detached = home.bg_gc.is_detached();
-    let slices = if needs_hk && !bg_detached { AFTER_ANSWER_SLICES } else { 0 };
-    let has_work = slices > 0 || lent.needs_commit();
-    if !has_work {
-        let named = lent.named();
-        let before = lent.put_tally();
-        let cleanup = roots::CleanupLine {
-            roots: named.roots,
-            keys: named.keys,
-            indexed: named.indexed,
-            swept_bytes: 0,
-            slices: 0,
-            carried: lent.carried(),
-            leases: u32::try_from(lent.leases_len()).unwrap_or(u32::MAX),
-            put: roots::PutLine { before_answer: before, after_answer: blaze_cas::plain::PutTally::default() },
-        };
-        return Ok((cleanup, bg_detached && needs_hk));
-    }
-    let after = plain_place::after_answer(cx, lent, slices)?;
-    let manifest_changed = after.segments_written > 0 || after.sealed || after.compaction_slices > 0;
-    let spawn_bg = bg_detached && (needs_hk || (manifest_changed && lent.needs_housekeeping(lent.wall_ns())));
-    Ok((after.cleanup, spawn_bg))
-}
-
-/// Runs post-`Done` store maintenance inside the resident daemon after the client has already
-/// received `ServerFrame::Done`: reclaims per-request arena chunks while keeping mapped segments
-/// warm, and spawns detached background GC if queued.
-pub(crate) fn post_done_for_daemon(
-    cx: &Cx,
-    lent: &mut CommandLent,
-    home: &Home,
-    spawn_bg: bool,
-    err: &Out,
-) {
-    let _ = lent.reclaim_between_requests();
-    // Return idle worker frame shelves, pooled large spans, and warm chunk caches to the OS
-    // (`MADV_FREE_REUSABLE` on macOS, `MADV_DONTNEED` on Linux) after the client has been answered.
-    blaze_mem::frame::ask_spare_trim();
-    let _ = blaze_mem::frame::trim_spare(0);
-    let _ = blaze_mem::frame::trim_span_pool();
-    let _ = blaze_mem::chunks::trim();
-    if spawn_bg {
-        let cx = cx.span("daemon post-done: spawn detached background gc");
-        let _ = home.bg_gc.spawn(&cx, home.dir(), err);
-    }
 }
 
 /// A planted bug of the nonce's test (`store/nonce_tests.rs`).
@@ -1187,6 +1124,20 @@ impl<'m, D: Driver, S: Sharing> CommandStore<'m, '_, D, S> {
         Ok(self.place.renew(name, blaze_cas::plain::ROOT_LIFE_NS)?)
     }
 
+    /// Puts a record that is always `LOCAL` (answer pages, producer header shards, printed lines,
+    /// sealed pointers, bases), skipping [`Sharing::all_names_public`] drive-record parsing.
+    pub fn put_local(&mut self, _cx: &Cx, key: Key, bytes: &[u8]) -> Result<(), CliError> {
+        match self.place.put(key, false, bytes) {
+            Ok(()) => Ok(()),
+            Err(PlaceError::Lent(lent @ blaze_cas::plain::LentError::TwoValues { .. })) => {
+                let held = self.place.get(key)?;
+                let clash = Clash::of(held.map(|held| held.bytes), bytes);
+                Err(CliError::Store(StoreFailure::TwoValues { key, lent, clash }))
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Whether `name` is a toolchain crate's record ([`Store::toolchain_crates`]): a
     /// `CrateScope`, `ImplBucket`, or closed `Signature` name of one of its subjects.
     pub fn is_toolchain(&self, name: Name) -> bool {
@@ -1280,7 +1231,7 @@ impl<'m, D: Driver, S: Sharing> Store<'m> for CommandStore<'m, '_, D, S> {
     }
 
     fn put_parts(&mut self, _cx: &Cx, key: Key, parts: &[&[u8]]) -> Result<(), CliError> {
-        let public = self.sharing.all_names_public(parts);
+        let public = self.place.is_public_writer() && self.sharing.all_names_public(parts);
         match self.place.put_parts(key, public, parts) {
             Ok(()) => Ok(()),
             Err(PlaceError::Lent(lent @ blaze_cas::plain::LentError::TwoValues { .. })) => {
@@ -1298,7 +1249,7 @@ impl<'m, D: Driver, S: Sharing> Store<'m> for CommandStore<'m, '_, D, S> {
     }
 
     fn put_record(&mut self, _cx: &Cx, key: Key, tag: blaze_keyed::kind::Tag, owner: &[&[u8]], bytes: &[u8]) -> Result<blaze_keyed::store::Put, CliError> {
-        let public = self.sharing.all_names_public(owner);
+        let public = self.place.is_public_writer() && self.sharing.all_names_public(owner);
         match self.place.put_record(key, public, tag, bytes) {
             Ok(put) => Ok(put),
             Err(PlaceError::Lent(lent @ blaze_cas::plain::LentError::TwoValues { .. })) => {

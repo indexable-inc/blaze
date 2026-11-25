@@ -2124,7 +2124,7 @@ pub struct Plain<A: Allocator + Clone> {
     segments_here: u64,
     /// The indexes this process made, with how many keys each holds: what an indexed root
     /// that names one counts ([`Plain::named`]).
-    indexes_made: Vec<(Key, u64), A>,
+    indexes_made: Map<[u8; 32], u64, BuildKeyHasher, A>,
     /// The roots this process set and the keys they name ([`Plain::named`]).
     named: Named,
     /// What this process's commits did on the disk side of the put path ([`Plain::put_path`]).
@@ -2517,7 +2517,7 @@ impl<A: Allocator + Clone> Plain<A> {
             carried: 0,
             written_here: 0,
             segments_here: 0,
-            indexes_made: Vec::new_in(a()),
+            indexes_made: Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: a(), capacity: None }),
             named: Named::default(),
             put_path: PutPath::default(),
             alloc,
@@ -3207,7 +3207,7 @@ impl<A: Allocator + Clone> Plain<A> {
             return Err(PutError::Mismatch(two_values(&key, Holder::Committed, entry.tag, kept, tag, value)));
         }
         let held = &mut self.held[at];
-        held.batch.put(key, tag, value)?;
+        held.batch.put_crc(key, tag, value, crc)?;
         held.at.insert(key, held.batch.entries.len() - 1);
         Ok(Put::Written)
     }
@@ -3254,8 +3254,8 @@ impl<A: Allocator + Clone> Plain<A> {
         let key = Key(ContentId::of(INDEX_DOMAIN, &bytes));
         let index = ReservedTag::Index.tag();
         self.put(key, Namespace::LOCAL, index, &bytes).map_err(|it| it.into_store(index))?;
-        if !self.indexes_made.iter().any(|(it, _)| *it == key) {
-            self.indexes_made.push((key, count));
+        if let HashEntry::Vacant(vacant) = self.indexes_made.entry(key.0.0) {
+            vacant.insert(count);
         }
         Ok(key)
     }
@@ -3274,8 +3274,8 @@ impl<A: Allocator + Clone> Plain<A> {
         let key = beside_key(owner);
         let index = ReservedTag::Index.tag();
         self.put(key, Namespace::LOCAL, index, &bytes).map_err(|it| it.into_store(index))?;
-        if !self.indexes_made.iter().any(|(it, _)| *it == key) {
-            self.indexes_made.push((key, count));
+        if let HashEntry::Vacant(vacant) = self.indexes_made.entry(key.0.0) {
+            vacant.insert(count);
         }
         Ok(key)
     }
@@ -3295,8 +3295,8 @@ impl<A: Allocator + Clone> Plain<A> {
         let key = self.set_root(name, &bytes, life_ns, ReservedTag::IndexedRoot.tag(), INDEXED_ROOT_DOMAIN)?;
         self.named.roots += 1;
         for index in bytes.chunks_exact(32) {
-            let index = Key(ContentId(index.try_into().expect("32 bytes")));
-            let held = self.indexes_made.iter().find(|(it, _)| *it == index).map_or(1, |(_, n)| *n);
+            let Ok(raw) = <[u8; 32]>::try_from(index) else { continue };
+            let held = self.indexes_made.get(&raw).copied().unwrap_or(1);
             self.named.keys += held;
             self.named.indexed += held;
         }
@@ -3676,7 +3676,15 @@ impl<A: Allocator + Clone> Plain<A> {
         let entry_u64 = u64::try_from(ENTRY).unwrap_or(48);
         let footer_u64 = u64::try_from(FOOTER).unwrap_or(48);
         for &namespace in self.cfg.writes.iter() {
-            let mut all: blaze_own::Vec<(Entry, RecordFrom), &A> = blaze_own::Vec::new_in(&self.alloc);
+            let est: usize = self
+                .sealed
+                .iter()
+                .filter(|h| h.batch.namespace == namespace)
+                .map(|h| h.batch.entries.len())
+                .sum::<usize>()
+                .saturating_add(batches.iter().filter(|b| b.namespace == namespace).map(|b| b.entries.len()).sum())
+                .saturating_add(records.iter().filter(|r| r.namespace == namespace).count());
+            let mut all: blaze_own::Vec<(Entry, RecordFrom), &A> = blaze_own::Vec::with_capacity_in(est, &self.alloc);
             for (s_idx, held) in self.sealed.iter().enumerate() {
                 if held.batch.namespace != namespace {
                     continue;
@@ -3880,7 +3888,13 @@ impl<A: Allocator + Clone> Plain<A> {
             // Every record of the namespace, the store's own batch's, each worker's and each
             // lent one's (where it lies: no copy before this layout's one): in the store's
             // allocator, freed when the commit's layout is made.
-            let mut all: Vec<(Entry, &[u8]), &A> = Vec::new_in(&self.alloc);
+            let est: usize = own
+                .into_iter()
+                .chain(batches.iter().copied().filter(|it| it.namespace == namespace))
+                .map(|b| b.entries.len())
+                .sum::<usize>()
+                .saturating_add(records.iter().filter(|it| it.namespace == namespace).count());
+            let mut all: Vec<(Entry, &[u8]), &A> = Vec::with_capacity_in(est, &self.alloc);
             for batch in own.into_iter().chain(batches.iter().copied().filter(|it| it.namespace == namespace)) {
                 all.extend(batch.entries.iter().map(|it| (*it, batch.payload(it))));
             }
@@ -5273,6 +5287,40 @@ impl<A: Allocator + Clone> Plain<A> {
             }
         }
         if sets.is_empty() {
+            return Ok((out, new_blooms));
+        }
+        // Cold store fast path: with zero committed segments, no record can be reused from a
+        // prior segment (`out` is empty). Still validate `RootGone` / `IndexGone` / `NotAnIndex`
+        // and build per-root reach Bloom filters for large indexed roots in a single pass.
+        if self.maps.is_empty() {
+            let follow_indexes = self.plant() != Plant::IndexNotFollowed;
+            for root in &sets {
+                let Some(got) = self.get_in(&[Namespace::LOCAL], root) else {
+                    return Err(StoreError::RootGone { generation: self.manifest.generation, key: root.0 });
+                };
+                if reach_of(got.tag) == TagReach::Indexes && follow_indexes {
+                    if got.bytes.len() >= Self::ROOT_BLOOM_MIN_INDEXES * 32 {
+                        let bloom_id = root_bloom_digest(&root.0);
+                        if !self.bloom.has_digest(&bloom_id)
+                            && !self.pending_bloom.iter().any(|(d, _)| *d == bloom_id)
+                            && !new_blooms.iter().any(|(d, _)| *d == bloom_id)
+                        {
+                            new_blooms.push(self.build_root_bloom(&root.0, got.bytes)?);
+                        }
+                    } else {
+                        for index_chunk in got.bytes.chunks_exact(32) {
+                            let Ok(bytes) = <[u8; 32]>::try_from(index_chunk) else { continue };
+                            let index = ContentId(bytes);
+                            let Some(held) = self.get_in(&[Namespace::LOCAL], &Key(index)) else {
+                                return Err(StoreError::IndexGone { generation: self.manifest.generation, root: root.0, index });
+                            };
+                            if reach_of(held.tag) != TagReach::IndexKeys {
+                                return Err(StoreError::NotAnIndex { root: root.0, key: index, tag: held.tag });
+                            }
+                        }
+                    }
+                }
+            }
             return Ok((out, new_blooms));
         }
         edited_names.sort_unstable();
@@ -7542,9 +7590,20 @@ fn laid_of<A: Allocator + Clone>(mut out: Batch, alloc: A) -> Result<Laid<A>, St
 /// `keys` sorted and each once, as the 32-byte array a root's or an index's record holds: in
 /// `alloc`, scratch of the one put that copies it into its batch.
 fn sorted_keys<A: Allocator>(keys: &[Key], alloc: A) -> Vec<u8, A> {
-    let mut bytes = Vec::with_capacity_in(keys.len() * 32, alloc);
+    let mut bytes = Vec::with_capacity_in(keys.len().saturating_mul(32), alloc);
+    let mut strictly_sorted = true;
+    let mut prev: Option<&[u8; 32]> = None;
     for key in keys {
+        if let Some(last) = prev
+            && *last >= key.0.0
+        {
+            strictly_sorted = false;
+        }
+        prev = Some(&key.0.0);
         bytes.extend_from_slice(&key.0.0);
+    }
+    if strictly_sorted {
+        return bytes;
     }
     let (chunks, _) = bytes.as_chunks_mut::<32>();
     chunks.sort_unstable();

@@ -27,4 +27,4 @@ pub mod facts;
 mod tests;
 
 pub use elaborate::{ElabError, Plant, elaborate, elaborate_planted};
-pub use facts::{DropFacts, DropState, Field, NeedsDrop, Part, PartState};
+pub use facts::{DropFacts, DropState, Field, NeedsDrop, Part, PartState, VariantDrop};

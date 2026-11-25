@@ -100,7 +100,10 @@ impl<A: Allocator + Clone> Layout for Layouts<A> {
         let id = self.of(ty, cx).map_err(|e| stop(&e))?;
         let row = match self.get(id).variants {
             blaze_build::layout::Variants::Multiple { .. } => self.variant(id, variant).ok_or(NO_ROW)?,
-            blaze_build::layout::Variants::Single { .. } => id,
+            blaze_build::layout::Variants::Single { index } if index == variant => id,
+            // An absent enum variant (blaze-build layout.rs `enum_`): uninhabited and every
+            // field is a 1-ZST (size 0, align 1), so every valid field sits at offset 0.
+            blaze_build::layout::Variants::Single { .. } => return Ok(0),
         };
         Ok(Layouts::field_offset(self, row, field).ok_or(NO_ROW)?)
     }

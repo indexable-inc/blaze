@@ -296,7 +296,7 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
     /// The frame (the module doc): every local's ground type, layout and hold; the signature;
     /// the entry block, which takes the parameters and jumps to the body's first block; and
     /// the LIR block of every body block.
-    pub(crate) fn frame(&mut self) -> Result<(), BuildError> {
+    pub(crate) fn frame_inner(&mut self, is_closure: bool) -> Result<(), BuildError> {
         let taken = self.address_taken()?;
         let locals = self.v.locals() as usize;
         let mut args: Vec<Option<Local>, A> = Vec::new_in(self.alloc);
@@ -358,20 +358,25 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
             rust_call_spread = Some((last, fields_plan));
         }
         // `#[track_caller]`: a tracked fn takes one hidden last parameter (`&'static Location`).
-        let own_args = self.subst.ground.intern_list(self.subst.args).map_err(|_| self.malformed("the ground table is full"))?;
-        let own_inst = Instance { item: self.item, args: own_args };
-        let own_tracked = match self.adts.track_caller(own_inst, self.subst.ground) {
-            Some(true) => {
-                passes.push(Pass::Scalar { ty: Ty::PTR, ext: Ext::None, agg: false });
-                true
-            }
-            Some(false) => {
-                self.track = Track::No;
-                false
-            }
-            None => {
-                self.track = Track::Unsaid;
-                false
+        let own_tracked = if is_closure {
+            self.track = Track::No;
+            false
+        } else {
+            let own_args = self.subst.ground.intern_list(self.subst.args).map_err(|_| self.malformed("the ground table is full"))?;
+            let own_inst = Instance { item: self.item, args: own_args };
+            match self.adts.track_caller(own_inst, self.subst.ground) {
+                Some(true) => {
+                    passes.push(Pass::Scalar { ty: Ty::PTR, ext: Ext::None, agg: false });
+                    true
+                }
+                Some(false) => {
+                    self.track = Track::No;
+                    false
+                }
+                None => {
+                    self.track = Track::Unsaid;
+                    false
+                }
             }
         };
         let (params, rets) = abi::sig_of_in(&passes, self.ret, self.alloc);

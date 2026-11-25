@@ -652,7 +652,7 @@ fn run<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, stack: &mut Vec<ItemK
 /// `owner`'s body lowered and checked (a clean check files itself: body_reads.rs), or its
 /// refusal as printed (`Ok(Err)`, read by the work list with `wanted`).
 fn check_defining<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, opaque: ItemKey, owner: ItemKey) -> Result<Result<(), Box<str>>, HiddenFail> {
-    let Some(prepared) = r.consts.as_ref().map(|c| c.1) else {
+    let Some(prepared) = r.prepared() else {
         return Err(HiddenFail::NoPrepares { opaque, owner, shown: shown(r, owner) });
     };
     // A head or a constant the lowering needs is made and the body lowered again (front2
@@ -822,6 +822,11 @@ mod tests {
     use crate::front2::stalled_goals::Stalls;
     use crate::refusal::SourceFile;
 
+    fn fixture_toolchain() -> Toolchain {
+        let home = std::env::var("HOME").expect("HOME");
+        Toolchain::open(&mut DirShelf::new(format!("{home}/.blaze/v2/toolchain"))).expect("fixture toolchain")
+    }
+
     /// A defining body checked FOR a caller's auto trait takes the command's own check
     /// (`check_defining`, `Stalls::Decide`). Reduced from tempo zones/rpc ws.rs
     /// `handle_ws_session` (run c0545wave91: 2 of the 9 interior-gap lines): an async fn whose
@@ -958,8 +963,7 @@ fn boxed() -> Box<dyn std::future::Future<Output = ()> + Send> { Box::new(bytes_
 fn main() {}
 "#;
         let alloc = blaze_own::testing::heap().alloc();
-        let home = std::env::var("HOME").expect("HOME");
-        let tc = Toolchain::open(&mut DirShelf::new(format!("{home}/.blaze/v2/toolchain"))).expect("fixture toolchain");
+        let tc = fixture_toolchain();
         let files = [("/witness/src/main.rs".to_owned(), SOURCE.to_owned())];
         let user = UserCrate {
             name: "witness", dir: "/witness/", root: "/witness/src/main.rs", files: &files,
@@ -1063,5 +1067,83 @@ fn main() {}
         let [d] = control.diagnostics.as_slice() else { panic!("one error for the Rc across the await: {control:?}") };
         assert_eq!(d.code, "E0277", "{control:?}");
         assert!(d.text.contains("Send") && d.start < d.end, "{control:?}");
+    }
+
+    /// `define_for_reveal` succeeds even while `r.consts` is `None` (as during `const_at`,
+    /// where `&mut Consts` is borrowed by the active constant evaluation, e.g. `Box<T>::new`
+    /// reading `SizedTypeProperties::LAYOUT` for a type mentioning an `async fn`'s `impl Future`)
+    /// because `Store::prepared` stays available; when both are `None`, it still returns
+    /// `HiddenFail::NoPrepares`.
+    #[test]
+    fn define_for_reveal_uses_store_prepared_when_consts_is_borrowed() {
+        use crate::front2::check::{BuildOrder, Records};
+
+        const SOURCE: &str = r#"
+async fn make_val() -> u8 { 7 }
+fn caller() { let _ = make_val(); }
+fn main() {}
+"#;
+        let alloc = blaze_own::testing::heap().alloc();
+        let tc = fixture_toolchain();
+        let files = [("/prepared_const_at/src/main.rs".into(), SOURCE.into())];
+        let user = UserCrate {
+            name: "prepared_const_at", dir: "/prepared_const_at/", root: "/prepared_const_at/src/main.rs", files: &files,
+            edition: edition::PackageEdition::of_manifest("2024").expect("Rust 2024"), panic: blaze_build::Panic::Unwind,
+        };
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("fixture frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let inputs = Inputs::new(&user, &tc).expect("fixture crate");
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, erased.bump()).expect("fixture names");
+        let sources = [SourceFile { path: "src/main.rs", text: SOURCE }];
+        let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("fixture world");
+        let make_val_lib = world
+            .bodies(alloc)
+            .into_iter()
+            .find_map(|(body, _)| match body {
+                BodyRef::Free(k) if names.item_text(k)?.name == Some("make_val") => Some(k),
+                _ => None,
+            })
+            .expect("make_val body");
+        let want = super::super::heads::Want::Fn(make_val_lib);
+        world.store.ensure(world.front.names, &mut world.front.keys, want).expect("make_val head");
+        let opaque = world
+            .store
+            .opaques
+            .keys()
+            .copied()
+            .next()
+            .expect("make_val async opaque");
+        let mut buckets = None;
+        // Control: with both `consts: None` and `store.prepared: None`, returns `NoPrepares`.
+        let saved_prepared = world.store.prepared.take();
+        {
+            let mut r = Records {
+                names: world.front.names,
+                keys: &mut world.front.keys,
+                index: &world.front.index,
+                store: &mut world.store,
+                buckets: &mut buckets,
+                order: BuildOrder::AsAsked,
+                consts: None,
+            };
+            let err = super::define_for_reveal(&mut r, opaque).expect_err("without prepared macros, must fail");
+            assert!(matches!(err, super::HiddenFail::NoPrepares { .. }), "expected NoPrepares, got {err:?}");
+        }
+        // With `store.prepared: Some(...)` restored and `consts: None` (simulating `const_at`),
+        // `define_for_reveal` lowers and files `make_val`'s hidden type cleanly.
+        world.store.prepared = saved_prepared;
+        {
+            let mut r = Records {
+                names: world.front.names,
+                keys: &mut world.front.keys,
+                index: &world.front.index,
+                store: &mut world.store,
+                buckets: &mut buckets,
+                order: BuildOrder::AsAsked,
+                consts: None,
+            };
+            super::define_for_reveal(&mut r, opaque).expect("define_for_reveal must succeed with store.prepared");
+        }
     }
 }

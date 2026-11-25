@@ -53,22 +53,10 @@ pub(crate) fn run(
     err: &Out,
     phases: &mut Phases,
     heap: &'static blaze_own::Heap,
-    spawn_daemon: bool,
 ) -> Result<Status, CliError> {
     let flags = crate::flags(args)?;
     refuse_not_taken(&flags)?;
-    let status = crate::engine_check::run(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap)?;
-    if spawn_daemon && !cx.is_simulated() && !flags.dir.is_some_and(crate::single_file::is_script_arg) {
-        let frame = cx.frame();
-        if let Ok(checkout) = crate::checkout::checkout(flags.dir, frame)
-            && let Ok(located) = crate::run_package::locate(cx, fs, &checkout, frame)
-            && let Ok(served) = crate::engine_script_reads::Served::at_edge(false, located.at, frame)
-            && let Some(root_abs) = served.root_text()
-        {
-            crate::daemon_client::spawn_detached_daemon(cx, host, env, root_abs, frame);
-        }
-    }
-    Ok(status)
+    crate::engine_check::run(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap)
 }
 
 /// The first flag given that the engine's check does not take, refused by name (rule 3: never

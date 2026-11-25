@@ -125,7 +125,7 @@ pub struct BodyCall<'s> {
 /// marked word's start in the body's text, ascending, and its [`crate::mark_site::TextMark`]
 /// bytes, one [`blaze_expand::origin_column::MARK`] row per start) that fall in the input, and
 /// where the input starts, so a mark is asked by its byte offset in the input's text.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InputMarks<'s> {
     at: u32,
     starts: &'s [u32],
@@ -227,14 +227,22 @@ pub struct LocalMacro<'s> {
     pub form: LocalForm<'s>,
 }
 
-/// The text of a macro a body defines, by its kind.
+/// The body of a macro a body defines, by its kind and where its tokens live.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LocalForm<'s> {
-    /// `macro_rules! m { rules }`: the rules, inside the delimiters.
-    Rules(&'s str),
-    /// `macro m(params) { body }` or `macro m { arms }`: the trees after the name, their
-    /// delimiters kept (blaze-lower by_name.rs `macro2_of` splits them).
-    Macro2(&'s str),
+    /// `macro_rules! m { rules }` in the item's own text: the rules, inside the delimiters,
+    /// with any item-level marks on their words.
+    Rules { text: &'s str, marks: InputMarks<'s> },
+    /// `macro_rules! m { rules }` in an earlier body expansion: tokens `start..end`
+    /// (delimiters included) in that expansion's stream, keeping every token's hygiene context.
+    RulesExpanded { expansion: u32, start: u32, end: u32 },
+    /// `macro m(params) { body }` or `macro m { arms }` in the item's own text: the trees after
+    /// the name, their delimiters kept (blaze-lower by_name.rs `macro2_of_stream` splits them),
+    /// with any item-level marks on their words.
+    Macro2 { text: &'s str, marks: InputMarks<'s> },
+    /// `macro m(params) { body }` or `macro m { arms }` in an earlier body expansion: tokens
+    /// `start..end` (the trees after the name, delimiters kept) in that expansion's stream.
+    Macro2Expanded { expansion: u32, start: u32, end: u32 },
 }
 
 /// What a body macro call expanded to, as the expander writes it: the expansion's words

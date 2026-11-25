@@ -745,6 +745,15 @@ impl<P: FrontEnd> ConstWorld for FrontConsts<'_, P> {
         let (lang, name) = crate::front2::langs::fn_trait_method(which);
         self.program.lang_trait_fn(lang, name).map_or(Absent, Found)
     }
+
+    fn deref_method(&self, mutbl: Mutbl) -> blaze_consteval::FnTraitMethod {
+        use blaze_consteval::FnTraitMethod::{Absent, Found};
+        let (lang, name) = match mutbl {
+            Mutbl::Not => (LangItem::Deref, "deref"),
+            Mutbl::Mut => (LangItem::DerefMut, "deref_mut"),
+        };
+        self.program.lang_trait_fn(lang, name).map_or(Absent, Found)
+    }
 }
 
 /// Every `const` item's value, evaluated once each with what it reads settled first, as the
