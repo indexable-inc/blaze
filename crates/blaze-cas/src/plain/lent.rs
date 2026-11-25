@@ -1190,6 +1190,11 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
         store.root_through_owned(name, indexes, life_ns, &|key| puts.get(&key.0.0).is_some()).map_err(stopped("setting an indexed root"))
     }
 
+    /// Provides optional probe-order hints to `Plain::reused` (`Plain::hint_replaced_indexes`).
+    pub fn hint_replaced_indexes(&self, indexes: &[Key]) {
+        self.inner.borrow_mut().store.hint_replaced_indexes(indexes);
+    }
+
     /// An index of `keys` filed beside the record `owner` (`Plain::index_beside`).
     pub fn index_beside(&self, owner: Key, keys: &[Key]) -> Result<Key, LentError> {
         self.inner.borrow_mut().store.index_beside(owner, keys).map_err(stopped("putting an index beside a record"))

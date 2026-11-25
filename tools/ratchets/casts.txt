@@ -78,7 +78,7 @@ blaze-ladder	1215
 blaze-launch	174
 blaze-launch-rt	455
 blaze-launcher	6
-blaze-lint	187
+blaze-lint	185
 blaze-lint-defs	21
 blaze-lir	1376
 blaze-lower	303

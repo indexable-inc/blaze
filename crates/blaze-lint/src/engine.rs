@@ -59,6 +59,16 @@ pub(crate) enum K {
     Other,
 }
 
+/// Bitmask of trigger tokens observed during `Pass::lex_run`, allowing optional post-passes
+/// (`sequences`, `io_ref_pass`, `unused_import_pass`, `unused_mut_pass`, `heap_leak_pass`,
+/// `parallel_vecs_pass`) to skip completely in O(1) when no trigger token exists in the unit.
+const SAW_IO: u8 = 1 << 0;
+const SAW_USE: u8 = 1 << 1;
+const SAW_MUT: u8 = 1 << 2;
+const SAW_LEAK: u8 = 1 << 3;
+const SAW_VEC: u8 = 1 << 4;
+const SAW_SEQ: u8 = 1 << 5;
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Tok {
     pub(crate) start: u32,
@@ -66,7 +76,7 @@ pub(crate) struct Tok {
     pub(crate) k: K,
     /// An identifier's number in the rules' word table (`sequences::WORDS`), found once while
     /// lexing; `NO_WORD` for every other token and for a word no rule reads.
-    word: u8,
+    pub(crate) word: u8,
 }
 
 /// A `{` open, and what opened it.
@@ -317,25 +327,26 @@ pub(crate) fn run_with<'a>(
         defining: false,
         last_fn: None,
         cost: Cost::NONE,
+        saw: 0,
     };
     pass.lex(unit.holes)?;
     pass.walk();
-    if SEQUENCE_RULES.iter().any(|rule| rules.runs(*rule)) {
+    if (pass.saw & SAW_SEQ) != 0 && SEQUENCE_RULES.iter().any(|rule| rules.runs(*rule)) {
         pass.sequences();
     }
-    if rules.runs(Rule::IoRef) {
+    if (pass.saw & SAW_IO) != 0 && rules.runs(Rule::IoRef) {
         pass.io_ref_pass();
     }
-    if rules.runs(Rule::UnusedImport) {
+    if (pass.saw & SAW_USE) != 0 && rules.runs(Rule::UnusedImport) {
         pass.unused_import_pass(false);
     }
-    if rules.runs(Rule::UnusedMut) {
+    if (pass.saw & SAW_MUT) != 0 && rules.runs(Rule::UnusedMut) {
         pass.unused_mut_pass();
     }
-    if rules.runs(Rule::HeapLeak) {
+    if (pass.saw & SAW_LEAK) != 0 && rules.runs(Rule::HeapLeak) {
         pass.heap_leak_pass();
     }
-    if rules.runs(Rule::ParallelVecs) {
+    if (pass.saw & SAW_VEC) != 0 && rules.runs(Rule::ParallelVecs) {
         pass.parallel_vecs_pass();
     }
     let test_at_end = pass.test_at(unit.text.len().saturating_sub(1) as u32);
@@ -380,9 +391,12 @@ pub(crate) fn run_file_imports<'a>(
         defining: false,
         last_fn: None,
         cost: Cost::NONE,
+        saw: 0,
     };
     pass.lex(&[])?;
-    pass.unused_import_pass(true);
+    if (pass.saw & SAW_USE) != 0 {
+        pass.unused_import_pass(true);
+    }
     let from = count(out.list.len())?;
     pass.emit(out)?;
     let to = count(out.list.len())?;
@@ -425,6 +439,7 @@ pub(crate) struct Pass<'u, 's, 'a> {
     last_fn: Option<usize>,
     /// The sites each rule tried ([`Cost`]): one count at each dispatch into a rule.
     pub(crate) cost: Cost,
+    saw: u8,
 }
 
 impl<'u, 's, 'a> Pass<'u, 's, 'a> {
@@ -515,11 +530,19 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
             // The one probe per identifier: its number in the rules' word table, or none.
             let word = match k {
                 K::Ident => {
-                    let len = (end - start) as usize;
-                    if len >= MIN_WORD_LEN && len <= MAX_WORD_LEN {
-                        let first = self.bytes[start as usize].wrapping_sub(b'A');
+                    let s = &self.bytes[start as usize..end as usize];
+                    let len = s.len();
+                    match len {
+                        2 if s == b"Io" => self.saw |= SAW_IO,
+                        4 if s == b"leak" => self.saw |= SAW_LEAK,
+                        4 if s == b"AVec" => self.saw |= SAW_VEC,
+                        6 if s == b"StdVec" => self.saw |= SAW_VEC,
+                        _ => {}
+                    }
+                    let w = if len >= MIN_WORD_LEN && len <= MAX_WORD_LEN {
+                        let first = s[0].wrapping_sub(b'A');
                         if first < 64 && (WORD_FIRST_BY_LEN[len] & (1u64 << first)) != 0 {
-                            match WORD.index(&self.bytes[start as usize..end as usize]) {
+                            match WORD.index(s) {
                                 Some(at) => at as u8,
                                 None => NO_WORD,
                             }
@@ -528,7 +551,24 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
                         }
                     } else {
                         NO_WORD
+                    };
+                    if w != NO_WORD {
+                        if w == W_USE {
+                            self.saw |= SAW_USE;
+                        } else if w == W_MUT {
+                            self.saw |= SAW_MUT;
+                        } else if w == W_VEC {
+                            self.saw |= SAW_VEC;
+                        }
+                        if TRIE.root(w) != DEAD {
+                            self.saw |= SAW_SEQ;
+                        }
                     }
+                    w
+                }
+                K::P(b'.') => {
+                    self.saw |= SAW_SEQ;
+                    NO_WORD
                 }
                 _ => NO_WORD,
             };
@@ -2751,9 +2791,9 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
                         }
                         continue;
                     }
-                    // Only `.` (for `.await`, `.to_string()`, `.recv()`, etc.) and `:`/`!`/`(`/`{`/`|`/`<`
-                    // can ever map to non-OTHER punctuation; skip everything else in 1 branch.
-                    K::P(b'.' | b':' | b'!' | b'(' | b')' | b'{' | b'|' | b'<') => {}
+                    // Compile-time checked in `sequences.rs`: only `.` can start a punctuation
+                    // sequence; every other punctuation token skips immediately when no match is live.
+                    K::P(b'.') => {}
                     _ => {
                         i += 1;
                         continue;

@@ -47,7 +47,7 @@ use blaze_keyed::{
     store::{ALIGN, ENTRY, FOOTER, HEADER, Holder, Put, RowRefused, SEGMENT_MOST, SegmentId, StoreError, StoreFile, TwoValues},
 };
 
-use super::bloom::{BLOOM_ALLOC, BloomBuilder, BloomIndex, BloomMapped, BloomRef};
+use super::bloom::{BLOOM_ALLOC, BloomBuilder, BloomIndex, BloomMapped, BloomRef, ROOT_BITS_PER_KEY, root_bloom_digest};
 use super::format::{
     self, Entry, FORMAT, HEAD_LEN, HeadRead, Lease, LostKind, LostMark, Manifest, NEVER, OFFSET_MOST, Retired,
     Root, SLOT_AT, Segment, Slot, aligned, record_crc,
@@ -1968,8 +1968,13 @@ pub struct Plain<A: Allocator + Clone> {
     bloom: BloomIndex,
     bloom_loading: bool,
     open_parked: Option<OpenParked>,
-    /// Framed Bloom records built for segments written by this process, awaiting flip.
+    /// Framed Bloom records built for segments and large indexed roots written by this process,
+    /// awaiting flip.
     pending_bloom: blaze_own::Vec<(ContentId, blaze_own::Vec<u8, Kept>), Kept>,
+    /// Optional probe-order hints for [`Plain::reused`]: old index keys replaced by this commit's
+    /// root edits. Verified against live unexpired roots before probing, so hints can only speed
+    /// up `reused` and never affect soundness.
+    replaced_index_hints: blaze_own::Vec<Key, A>,
     /// Most recently hit segment row index in `manifest.segments` (for zero-mmap locality).
     pub(super) last_hit: Option<usize>,
     /// Optional creation-generation locality hint for the current `Plain::find` call.
@@ -2428,6 +2433,7 @@ impl<A: Allocator + Clone> Plain<A> {
             bloom_loading: false,
             open_parked: None,
             pending_bloom: blaze_own::Vec::new_in(BLOOM_ALLOC),
+            replaced_index_hints: blaze_own::Vec::new_in(a()),
             last_hit: None,
             hint_gen: None,
             boot: Boot(cfg.boot),
@@ -2865,7 +2871,7 @@ impl<A: Allocator + Clone> Plain<A> {
             && m.segments
                 .iter()
                 .any(|seg| seg.local && !self.bloom.has(seg) && !has_pending(&self.pending_bloom, &seg.digest) && self.by_id.contains_key(&seg.id));
-        let needs_compact = self.eager && self.bloom.needs_compact(&m.segments);
+        let needs_compact = self.eager && self.bloom.needs_compact(&m.segments, &m.roots);
         if needs_backfill || needs_compact {
             let mut bytes: blaze_own::Vec<u8, Kept> = blaze_own::Vec::new_in(BLOOM_ALLOC);
             let mut backfilled: blaze_own::Vec<(ContentId, blaze_own::Vec<u8, Kept>), Kept> = blaze_own::Vec::new_in(BLOOM_ALLOC);
@@ -2883,6 +2889,14 @@ impl<A: Allocator + Clone> Plain<A> {
                     backfilled.push((seg.digest, rec));
                 }
             }
+            for root in m.roots.iter() {
+                let want = root_bloom_digest(&root.key);
+                if let Some((_, rec)) = self.pending_bloom.iter().find(|(d, _)| *d == want) {
+                    bytes.extend_from_slice(rec);
+                } else if let Some(raw) = self.bloom.raw_record_digest(&want) {
+                    bytes.extend_from_slice(raw);
+                }
+            }
             for (digest, rec) in backfilled {
                 self.record_pending_bloom(digest, rec);
             }
@@ -2896,8 +2910,23 @@ impl<A: Allocator + Clone> Plain<A> {
             return None;
         }
         let mut bytes: blaze_own::Vec<u8, Kept> = blaze_own::Vec::new_in(BLOOM_ALLOC);
+        let live_roots: Option<Map<[u8; 32], (), BuildKeyHasher, Kept>> = if self.pending_bloom.len() > 4 && m.roots.len() > 8 {
+            let mut set = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: BLOOM_ALLOC, capacity: Some(m.roots.len()) });
+            for root in m.roots.iter() {
+                set.insert(root_bloom_digest(&root.key).0, ());
+            }
+            Some(set)
+        } else {
+            None
+        };
         for (digest, rec) in self.pending_bloom.iter() {
-            if m.segments.iter().any(|seg| seg.local && seg.digest == *digest) {
+            let live_seg = m.segments.iter().any(|seg| seg.local && seg.digest == *digest);
+            let live_root = !live_seg
+                && match &live_roots {
+                    Some(set) => set.contains_key(&digest.0),
+                    None => m.roots.iter().any(|root| root_bloom_digest(&root.key) == *digest),
+                };
+            if live_seg || live_root {
                 bytes.extend_from_slice(rec);
             }
         }
@@ -3237,6 +3266,14 @@ impl<A: Allocator + Clone> Plain<A> {
         self.roots_pending.push(RootEdit::Set { name: name.to_owned(), key, life_ns, renew_only });
     }
 
+    /// Provides optional probe-order hints to [`Plain::reused`]: old index keys superseded by
+    /// this commit's root edits (e.g., replaced base-shard page indexes when updating a delta
+    /// root). Each hint is verified against live unexpired roots before probing, so hints never
+    /// affect soundness.
+    pub fn hint_replaced_indexes(&mut self, indexes: &[Key]) {
+        self.replaced_index_hints.extend_from_slice(indexes);
+    }
+
     /// The root `name` set to the record `bytes` (sorted keys) under `tag`, its key derived
     /// under `domain`: the one body of [`Plain::root_for`] and [`Plain::root_through`].
     fn set_root(&mut self, name: &str, bytes: &[u8], life_ns: u64, tag: Tag, domain: &'static str) -> Result<Key, StoreError> {
@@ -3541,10 +3578,16 @@ impl<A: Allocator + Clone> Plain<A> {
         let mut roots = core::mem::replace(&mut self.roots_pending, empty_roots);
         // The segments of records this commit's roots name but did not write, dead in this
         // view: computed here, before the lock; the flip marks them touched.
-        self.touches = match self.cfg.liveness {
-            Liveness::Everything => self.alloc_vec(),
+        let new_root_blooms = match self.cfg.liveness {
+            Liveness::Everything => {
+                self.touches = self.alloc_vec();
+                blaze_own::Vec::new_in(BLOOM_ALLOC)
+            }
             Liveness::Reached => match self.reused(&roots, now_ns) {
-                Ok(it) => it,
+                Ok((touches, blooms)) => {
+                    self.touches = touches;
+                    blooms
+                }
                 Err(why) => {
                     self.roots_pending = roots;
                     self.sealed_back();
@@ -3552,6 +3595,10 @@ impl<A: Allocator + Clone> Plain<A> {
                 }
             },
         };
+        self.replaced_index_hints.clear();
+        for (digest, rec) in new_root_blooms {
+            self.record_pending_bloom(digest, rec);
+        }
         if self.cfg.liveness == Liveness::Reached && !nexts.is_empty() && !self.released {
             // Records no root names yet: this process's lease keeps them, and every segment
             // newer than the generation it opened on, until its answer roots them.
@@ -4820,19 +4867,117 @@ impl<A: Allocator + Clone> Plain<A> {
         Ok(())
     }
 
+    /// Minimum number of index records in a `TagReach::Indexes` root to persist a per-root reach
+    /// Bloom filter in the `bloom` sidecar.
+    const ROOT_BLOOM_MIN_INDEXES: usize = 16;
+
+    /// Binary search for 32-byte `target` inside a sorted 32-byte-chunk payload (`sorted_keys`).
+    #[inline]
+    fn sorted_chunks_contains(payload: &[u8], target: &[u8; 32]) -> bool {
+        let count = payload.len() / 32;
+        let mut lo = 0usize;
+        let mut hi = count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let at = mid * 32;
+            let Some(chunk) = payload.get(at..at + 32) else { return false };
+            match chunk.cmp(&target[..]) {
+                core::cmp::Ordering::Less => lo = mid + 1,
+                core::cmp::Ordering::Greater => hi = mid,
+                core::cmp::Ordering::Equal => return true,
+            }
+        }
+        false
+    }
+
+    /// Returns true when `target` is listed in at least one unexpired `TagReach::Indexes` root in
+    /// `roots`, using per-root Bloom filters when present and binary searching sorted root
+    /// payloads otherwise (zero 65k hash-map build on small delta commits).
+    fn index_in_live_roots(&self, target: &[u8; 32], roots: &[usize], trust_corrupt: bool) -> Result<bool, StoreError> {
+        if self.plant() == Plant::IndexNotFollowed {
+            return Ok(false);
+        }
+        for &i in roots {
+            let Some(root) = self.manifest.roots.get(i) else { continue };
+            let bloom_id = root_bloom_digest(&root.key);
+            if self.bloom.may_contain_any_digest(&bloom_id, core::iter::once(target), trust_corrupt) == Some(false) {
+                continue;
+            }
+            let Some((at, entry)) = self.find_in(&[Namespace::LOCAL], &Key(root.key)) else {
+                return Err(StoreError::RootGone { generation: self.manifest.generation, key: root.key });
+            };
+            if reach_of(entry.tag) != TagReach::Indexes {
+                continue;
+            }
+            let Some(map) = self.maps.get(at) else { continue };
+            if Self::sorted_chunks_contains(map.payload(&entry), target) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Builds a per-root reach Bloom filter for a `TagReach::Indexes` root covering `root_key`,
+    /// every index key it lists, and every leaf key inside each index.
+    fn build_root_bloom(&self, root_key: &ContentId, payload: &[u8]) -> Result<(ContentId, blaze_own::Vec<u8, Kept>), StoreError> {
+        let index_count = payload.len() / 32;
+        let mut index_payloads: blaze_own::Vec<([u8; 32], &[u8]), &A> = blaze_own::Vec::with_capacity_in(index_count, &self.alloc);
+        let mut total_keys: u64 = 1u64.saturating_add(u64::try_from(index_count).unwrap_or(u64::MAX));
+        for chunk in payload.chunks_exact(32) {
+            let Ok(raw) = <[u8; 32]>::try_from(chunk) else { continue };
+            let index = ContentId(raw);
+            let Some(got) = self.get_in(&[Namespace::LOCAL], &Key(index)) else {
+                return Err(StoreError::IndexGone { generation: self.manifest.generation, root: *root_key, index });
+            };
+            if reach_of(got.tag) != TagReach::IndexKeys {
+                return Err(StoreError::NotAnIndex { root: *root_key, key: index, tag: got.tag });
+            }
+            total_keys = total_keys.saturating_add(u64::try_from(got.bytes.len() / 32).unwrap_or(u64::MAX));
+            index_payloads.push((raw, got.bytes));
+        }
+        let bloom_id = root_bloom_digest(root_key);
+        let mut builder = BloomBuilder::with_bits_per_key(u32::try_from(total_keys).unwrap_or(u32::MAX), ROOT_BITS_PER_KEY);
+        builder.insert(&root_key.0);
+        for (idx_raw, idx_bytes) in index_payloads {
+            builder.insert(&idx_raw);
+            for key_chunk in idx_bytes.chunks_exact(32) {
+                if let Ok(key_raw) = <[u8; 32]>::try_from(key_chunk) {
+                    builder.insert(&key_raw);
+                }
+            }
+        }
+        Ok((bloom_id, builder.finish(&bloom_id)))
+    }
+
     /// Semi-join probe of one unexpired root at manifest index `idx`, removing every key it
     /// reaches from `pending` and returning early as soon as `pending` empties. When
     /// `prioritize_diff` is true, index records absent from `sets_indexes` (the replaced page
-    /// indexes of the root being updated) are scanned before unchanged indexes.
+    /// indexes of the root being updated) are scanned before unchanged indexes. When
+    /// `filter_by_bloom` is true, large `TagReach::Indexes` roots whose verified per-root Bloom
+    /// filter proves none of `pending` is present are skipped in O(|pending|); roots lacking a
+    /// filter have one built lazily and returned in `new_blooms`.
+    #[expect(clippy::too_many_arguments, reason = "internal semi-join probe with bloom acceleration")]
     fn probe_live_root(
         &self,
         idx: usize,
         prioritize_diff: bool,
+        filter_by_bloom: bool,
         sets_indexes: &Map<[u8; 32], (), BuildKeyHasher, &A>,
         visited_indexes: &mut Map<[u8; 32], (), BuildKeyHasher, &A>,
         pending: &mut Map<[u8; 32], u64, BuildKeyHasher, &A>,
+        new_blooms: &mut blaze_own::Vec<(ContentId, blaze_own::Vec<u8, Kept>), Kept>,
     ) -> Result<(), StoreError> {
         let Some(root) = self.manifest.roots.get(idx) else { return Ok(()) };
+        let trust_corrupt = self.plant() == Plant::TrustsCorruptBloom;
+        let bloom_id = root_bloom_digest(&root.key);
+        let mut need_root_bloom = false;
+        if filter_by_bloom && self.plant() != Plant::IndexNotFollowed {
+            match self.bloom.may_contain_any_digest(&bloom_id, pending.keys(), trust_corrupt) {
+                Some(false) => return Ok(()),
+                Some(true) => {}
+                None => need_root_bloom = true,
+            }
+        }
         let Some((at, entry)) = self.find_in(&[Namespace::LOCAL], &Key(root.key)) else {
             return Err(StoreError::RootGone { generation: self.manifest.generation, key: root.key });
         };
@@ -4843,7 +4988,52 @@ impl<A: Allocator + Clone> Plain<A> {
             let Ok(raw) = <[u8; 32]>::try_from(chunk) else { continue };
             pending.remove(&raw);
         }
-        if pending.is_empty() || reach_of(entry.tag) != TagReach::Indexes || self.plant() == Plant::IndexNotFollowed {
+        if reach_of(entry.tag) != TagReach::Indexes || self.plant() == Plant::IndexNotFollowed {
+            return Ok(());
+        }
+        // Lazily build and persist the per-root reach Bloom filter on the first scan of a large
+        // indexed root so every subsequent commit skips it in O(1) when disjoint from `pending`.
+        if need_root_bloom
+            && payload.len() >= Self::ROOT_BLOOM_MIN_INDEXES * 32
+            && !new_blooms.iter().any(|(d, _)| *d == bloom_id)
+        {
+            let index_count = payload.len() / 32;
+            let mut index_payloads: blaze_own::Vec<([u8; 32], &[u8]), &A> = blaze_own::Vec::with_capacity_in(index_count, &self.alloc);
+            let mut total_keys: u64 = 1u64.saturating_add(u64::try_from(index_count).unwrap_or(u64::MAX));
+            for chunk in payload.chunks_exact(32) {
+                let Ok(raw) = <[u8; 32]>::try_from(chunk) else { continue };
+                let index = ContentId(raw);
+                let Some((idx_at, idx_entry)) = self.find_in(&[Namespace::LOCAL], &Key(index)) else {
+                    return Err(StoreError::IndexGone { generation: self.manifest.generation, root: root.key, index });
+                };
+                if reach_of(idx_entry.tag) != TagReach::IndexKeys {
+                    return Err(StoreError::NotAnIndex { root: root.key, key: index, tag: idx_entry.tag });
+                }
+                let Some(idx_map) = self.maps.get(idx_at) else { continue };
+                let idx_bytes = idx_map.payload(&idx_entry);
+                total_keys = total_keys.saturating_add(u64::try_from(idx_bytes.len() / 32).unwrap_or(u64::MAX));
+                index_payloads.push((raw, idx_bytes));
+                if visited_indexes.insert(raw, ()).is_none() && !pending.is_empty() {
+                    for key_chunk in idx_bytes.chunks_exact(32) {
+                        let Ok(key_raw) = <[u8; 32]>::try_from(key_chunk) else { continue };
+                        pending.remove(&key_raw);
+                    }
+                }
+            }
+            let mut builder = BloomBuilder::with_bits_per_key(u32::try_from(total_keys).unwrap_or(u32::MAX), ROOT_BITS_PER_KEY);
+            builder.insert(&root.key.0);
+            for (idx_raw, idx_bytes) in index_payloads {
+                builder.insert(&idx_raw);
+                for key_chunk in idx_bytes.chunks_exact(32) {
+                    if let Ok(key_raw) = <[u8; 32]>::try_from(key_chunk) {
+                        builder.insert(&key_raw);
+                    }
+                }
+            }
+            new_blooms.push((bloom_id, builder.finish(&bloom_id)));
+            return Ok(());
+        }
+        if pending.is_empty() {
             return Ok(());
         }
         let mut probe_index = |raw: [u8; 32]| -> Result<bool, StoreError> {
@@ -4956,8 +5146,9 @@ impl<A: Allocator + Clone> Plain<A> {
     /// too) that this view holds and no unexpired root of this view reaches: a slice planned
     /// from a view like this one may have judged it dead, so the flip marks the segment
     /// touched ([`Segment::touched`]) and a slice that replaces it aborts. Sorted, each once.
-    fn reused(&self, edits: &[RootEdit], now_ns: u64) -> Result<Vec<(u64, ContentId), A>, StoreError> {
-        let mut out = Vec::new_in(self.alloc.clone());
+    fn reused(&self, edits: &[RootEdit], now_ns: u64) -> Result<(Vec<(u64, ContentId), A>, blaze_own::Vec<(ContentId, blaze_own::Vec<u8, Kept>), Kept>), StoreError> {
+        let mut out = self.alloc_vec();
+        let mut new_blooms: blaze_own::Vec<(ContentId, blaze_own::Vec<u8, Kept>), Kept> = blaze_own::Vec::new_in(BLOOM_ALLOC);
         let mut sets: blaze_own::Vec<Key, &A> = blaze_own::Vec::new_in(&self.alloc);
         let mut edited_names: blaze_own::Vec<&str, &A> = blaze_own::Vec::new_in(&self.alloc);
         for edit in edits {
@@ -4967,7 +5158,7 @@ impl<A: Allocator + Clone> Plain<A> {
             }
         }
         if sets.is_empty() {
-            return Ok(out);
+            return Ok((out, new_blooms));
         }
         edited_names.sort_unstable();
         edited_names.dedup();
@@ -4997,6 +5188,8 @@ impl<A: Allocator + Clone> Plain<A> {
         let mut prior_followed_loaded = false;
         let mut other_followed_loaded = false;
         let follow_indexes = self.plant() != Plant::IndexNotFollowed;
+        let trust_corrupt = self.plant() == Plant::TrustsCorruptBloom;
+        let mut set_index_checks = 0usize;
 
         for root in &sets {
             if let Some((at, _)) = self.find_in(&[Namespace::LOCAL], root)
@@ -5008,6 +5201,18 @@ impl<A: Allocator + Clone> Plain<A> {
                 return Err(StoreError::RootGone { generation: self.manifest.generation, key: root.0 });
             };
             if reach_of(got.tag) == TagReach::Indexes && follow_indexes {
+                // Pre-populate per-root reach Bloom filters for newly written large indexed roots
+                // (e.g., 512-page base reach shards) so subsequent incremental edits skip them in
+                // O(1) without ever scanning their 512 page indexes.
+                if got.bytes.len() >= Self::ROOT_BLOOM_MIN_INDEXES * 32 {
+                    let bloom_id = root_bloom_digest(&root.0);
+                    if !self.bloom.has_digest(&bloom_id)
+                        && !self.pending_bloom.iter().any(|(d, _)| *d == bloom_id)
+                        && !new_blooms.iter().any(|(d, _)| *d == bloom_id)
+                    {
+                        new_blooms.push(self.build_root_bloom(&root.0, got.bytes)?);
+                    }
+                }
                 if !prior_followed_loaded {
                     self.collect_followed_indexes(&prior_roots, &mut followed)?;
                     prior_followed_loaded = true;
@@ -5022,9 +5227,20 @@ impl<A: Allocator + Clone> Plain<A> {
                         continue;
                     }
                     if let Some((at, _)) = self.find_in(&[Namespace::LOCAL], &Key(ContentId(bytes))) {
+                        set_index_checks += 1;
                         if !other_followed_loaded {
-                            self.collect_followed_indexes(&other_roots, &mut followed)?;
-                            other_followed_loaded = true;
+                            if set_index_checks <= 32 {
+                                // Small delta edit: avoid building a 65k-entry hash map by
+                                // querying `other_roots` via per-root Bloom + binary search.
+                                if self.index_in_live_roots(&bytes, &other_roots, trust_corrupt)? {
+                                    followed.insert(bytes, ());
+                                    pending.remove(&bytes);
+                                    continue;
+                                }
+                            } else {
+                                self.collect_followed_indexes(&other_roots, &mut followed)?;
+                                other_followed_loaded = true;
+                            }
                         }
                         if followed.contains_key(&bytes) {
                             pending.remove(&bytes);
@@ -5065,19 +5281,86 @@ impl<A: Allocator + Clone> Plain<A> {
             }
         }
         if pending.is_empty() {
-            return Ok(out);
+            return Ok((out, new_blooms));
         }
         let mut visited_indexes: Map<[u8; 32], (), BuildKeyHasher, &A> = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: &self.alloc, capacity: None });
         for &idx in &prior_roots {
-            self.probe_live_root(idx, true, &sets_indexes, &mut visited_indexes, &mut pending)?;
+            self.probe_live_root(idx, true, false, &sets_indexes, &mut visited_indexes, &mut pending, &mut new_blooms)?;
             if pending.is_empty() {
-                return Ok(out);
+                return Ok((out, new_blooms));
             }
         }
+        // Probe caller-hinted replaced indexes FIRST (e.g., the 8-12 old base-shard page indexes
+        // superseded by a reach delta update), strictly after verifying each hint is genuinely
+        // listed in an unexpired live root so bad hints can never affect soundness.
+        if follow_indexes && !self.replaced_index_hints.is_empty() {
+            for hint in &self.replaced_index_hints {
+                let raw = hint.0.0;
+                if visited_indexes.contains_key(&raw) {
+                    continue;
+                }
+                let live = followed.contains_key(&raw)
+                    || self.index_in_live_roots(&raw, &prior_roots, trust_corrupt)?
+                    || self.index_in_live_roots(&raw, &other_roots, trust_corrupt)?;
+                if !live {
+                    continue;
+                }
+                visited_indexes.insert(raw, ());
+                pending.remove(&raw);
+                if let Some((idx_at, idx_entry)) = self.find_in(&[Namespace::LOCAL], hint)
+                    && reach_of(idx_entry.tag) == TagReach::IndexKeys
+                    && let Some(idx_map) = self.maps.get(idx_at)
+                {
+                    for key_chunk in idx_map.payload(&idx_entry).chunks_exact(32) {
+                        let Ok(key_raw) = <[u8; 32]>::try_from(key_chunk) else { continue };
+                        pending.remove(&key_raw);
+                    }
+                }
+                if pending.is_empty() {
+                    return Ok((out, new_blooms));
+                }
+            }
+        }
+        // Probe `other_roots`: check roots with a verified Bloom match (or non-indexed roots)
+        // first, skipping bloom-disjoint shards in O(1); then lazily scan & bloom-index any
+        // remaining unbloomed large shards.
+        let mut unbloomed: blaze_own::Vec<usize, &A> = blaze_own::Vec::new_in(&self.alloc);
         for &idx in &other_roots {
-            self.probe_live_root(idx, false, &sets_indexes, &mut visited_indexes, &mut pending)?;
+            let Some(root) = self.manifest.roots.get(idx) else { continue };
+            let bloom_id = root_bloom_digest(&root.key);
+            match self.bloom.may_contain_any_digest(&bloom_id, pending.keys(), trust_corrupt) {
+                Some(false) => continue,
+                Some(true) => {
+                    self.probe_live_root(idx, false, false, &sets_indexes, &mut visited_indexes, &mut pending, &mut new_blooms)?;
+                    if pending.is_empty() {
+                        return Ok((out, new_blooms));
+                    }
+                }
+                None => unbloomed.push(idx),
+            }
+        }
+        // Probe small / non-indexed unbloomed roots (e.g. `.answer` roots) before large unbloomed
+        // indexed shards so cross-worktree commits find shared answer records without scanning
+        // unbloomed 512-page shards first.
+        let mut large_unbloomed: blaze_own::Vec<usize, &A> = blaze_own::Vec::new_in(&self.alloc);
+        for &idx in &unbloomed {
+            let Some(root) = self.manifest.roots.get(idx) else { continue };
+            let is_large_indexed = self
+                .find_in(&[Namespace::LOCAL], &Key(root.key))
+                .is_some_and(|(_, entry)| reach_of(entry.tag) == TagReach::Indexes && usize::try_from(entry.len).unwrap_or(0) >= Self::ROOT_BLOOM_MIN_INDEXES * 32);
+            if is_large_indexed {
+                large_unbloomed.push(idx);
+            } else {
+                self.probe_live_root(idx, false, false, &sets_indexes, &mut visited_indexes, &mut pending, &mut new_blooms)?;
+                if pending.is_empty() {
+                    return Ok((out, new_blooms));
+                }
+            }
+        }
+        for &idx in &large_unbloomed {
+            self.probe_live_root(idx, false, true, &sets_indexes, &mut visited_indexes, &mut pending, &mut new_blooms)?;
             if pending.is_empty() {
-                return Ok(out);
+                return Ok((out, new_blooms));
             }
         }
         out.reserve(pending.len());
@@ -5086,7 +5369,7 @@ impl<A: Allocator + Clone> Plain<A> {
         }
         out.sort_unstable();
         out.dedup();
-        Ok(out)
+        Ok((out, new_blooms))
     }
 
     fn live_of(&self, seg: &Segment, owner: &Map<[u8; 32], u32, BuildKeyHasher, Kept>, kept_count: u32) -> (u64, u64) {
@@ -5933,12 +6216,27 @@ impl<A: Allocator + Clone> Plain<A> {
             self.invalidate_reach();
         }
         let pending_bloom = core::mem::replace(&mut self.pending_bloom, blaze_own::Vec::new_in(BLOOM_ALLOC));
+        let live_roots: Option<Map<[u8; 32], (), BuildKeyHasher, Kept>> = if pending_bloom.len() > 4 && self.manifest.roots.len() > 8 {
+            let mut set = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: BLOOM_ALLOC, capacity: Some(self.manifest.roots.len()) });
+            for root in self.manifest.roots.iter() {
+                set.insert(root_bloom_digest(&root.key).0, ());
+            }
+            Some(set)
+        } else {
+            None
+        };
         for (digest, rec) in pending_bloom {
-            if self.manifest.segments.iter().any(|seg| seg.local && seg.digest == digest) {
+            let live_seg = self.manifest.segments.iter().any(|seg| seg.local && seg.digest == digest);
+            let live_root = !live_seg
+                && match &live_roots {
+                    Some(set) => set.contains_key(&digest.0),
+                    None => self.manifest.roots.iter().any(|root| root_bloom_digest(&root.key) == digest),
+                };
+            if live_seg || live_root {
                 self.bloom.insert_owned(rec);
             }
         }
-        self.bloom.prune(&self.manifest.segments);
+        self.bloom.prune(&self.manifest.segments, &self.manifest.roots);
         if let Some((replaced, len)) = flip.bloom_written {
             self.bloom.note_written(replaced, len);
         }
@@ -7036,7 +7334,7 @@ impl<A: Allocator + Clone> Plain<A> {
                 self.invalidate_reach();
                 self.opened_ns = now_ns;
                 self.opened_generation = self.manifest.generation;
-                self.bloom.index_manifest(&self.manifest.segments);
+                self.bloom.index_manifest(&self.manifest.segments, &self.manifest.roots);
                 // Rows retired as lost and not yet reported to a caller who got the report
                 // (whoever wrote them: this open's process before a crash, or another): this
                 // open reports them, and clears them only after its own report is handed.

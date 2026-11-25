@@ -682,6 +682,238 @@ fn unit_at(items: &[blaze_surface::Item], chain_of: &dyn Fn(usize) -> u64, file:
     entries.chain((place == 0).then_some(0)).find(|&at| unit_name_of(file, at.checked_sub(1).map(chain_of)) == name)
 }
 
+/// Why [`lint_units_sparse`] could not finish linting a file's asked units.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SparseLintError {
+    Unplanned,
+    Unscoped,
+    Unlinted,
+    Ungathered,
+    Unpooled,
+}
+
+impl SparseLintError {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            SparseLintError::Unplanned => UNPLANNED,
+            SparseLintError::Unscoped => UNSCOPED,
+            SparseLintError::Unlinted => UNLINTED,
+            SparseLintError::Ungathered => UNGATHERED,
+            SparseLintError::Unpooled => UNPOOLED,
+        }
+    }
+}
+
+impl core::fmt::Display for SparseLintError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Findings, messages, and serialized fixes for a single non-clean lint unit.
+pub(crate) struct SparseFound<A: core::alloc::Allocator> {
+    pub(crate) findings: Vec<(u16, u32, u32, usize, usize), A>,
+    pub(crate) words: Vec<u8, A>,
+    pub(crate) fixes: Vec<u8, A>,
+}
+
+/// Sparse result of linting one asked unit (used by `engine_lints.rs`): carries the unit's index,
+/// name, token/rule cost, and (ONLY when non-empty) its findings, message bytes, and serialized
+/// fixes. Clean units perform zero output heap allocations and zero wasted per-unit hashing.
+pub(crate) struct SparseUnit<A: core::alloc::Allocator> {
+    pub(crate) unit: usize,
+    pub(crate) name: Name,
+    pub(crate) tokens: u32,
+    pub(crate) cost: blaze_lint::Cost,
+    pub(crate) found: Option<SparseFound<A>>,
+}
+
+/// Sparse twin of [`lint_units_in`] for `engine_lints.rs`: runs the exact same scope walk,
+/// batching (`S`), and `LintCounts` accounting, but skips per-unit `Record` allocation
+/// and `UNIT_OUT_DOMAIN` hashing for clean units and moves findings/words/fixes directly into
+/// `did` with zero intermediate copies.
+#[expect(clippy::too_many_arguments, reason = "one file's facts, each named; matches lint_units_in")]
+pub(crate) fn lint_units_sparse<S: Split, A: core::alloc::Allocator + Copy + Send + Sync>(
+    cx: &bstd::cx::Cx,
+    items: &[blaze_surface::Item],
+    chain_of: &dyn Fn(usize) -> u64,
+    text: &str,
+    path: &str,
+    file: ContentId,
+    asked: &[AskedUnit],
+    rules: &RuleSet,
+    marks: RootMarks,
+    alloc: Alloc<'_>,
+    out_alloc: A,
+    counts: &mut LintCounts,
+    did: &mut AVec<'_, Result<SparseUnit<A>, Why>>,
+) -> Result<(), SparseLintError> {
+    let marked = marks.rules(*rules);
+    let rules = &marked;
+    let units = Units::plan(items, text.len(), alloc).map_err(|_| SparseLintError::Unplanned)?;
+    let count = units.list.len();
+    let mut jobs: AVec<'_, (usize, usize)> = AVec::with_capacity_in(asked.len(), alloc);
+    for (task, (name, place)) in asked.iter().enumerate() {
+        if let Some(unit) = unit_at(items, chain_of, file, *name, *place) {
+            jobs.push((unit, task));
+        }
+    }
+    jobs.sort_unstable();
+    let mut scopes: AVec<'_, Option<Scope>> = AVec::with_capacity_in(count, alloc);
+    scopes.resize(count, None);
+    if let Some(root_scope) = scopes.first_mut() {
+        *root_scope = Some(file_scope_in(marks, path, text));
+    }
+    if reads_own_heads(marks, path) {
+        counts.heads_read += 1;
+    }
+    let mut walked: AVec<'_, bool> = AVec::with_capacity_in(count, alloc);
+    walked.resize(count, false);
+    let none = RuleSet::only(&[]);
+    let mut findings = Findings::new_in(alloc);
+    let mut stack: AVec<'_, usize> = AVec::new_in(alloc);
+    let mut scratch = blaze_lint::Scratch::new_in(alloc);
+    for &(unit, _) in jobs.iter() {
+        stack.clear();
+        let mut up = Units::parent_of(items, unit);
+        while let Some(parent) = up {
+            if walked.get(parent).copied().unwrap_or(false) {
+                break;
+            }
+            stack.push(parent);
+            up = Units::parent_of(items, parent);
+        }
+        while let Some(parent) = stack.pop() {
+            let scope = scopes.get(parent).copied().flatten().ok_or(SparseLintError::Unscoped)?;
+            let own = units.own(parent, text, alloc).map_err(|_| SparseLintError::Unlinted)?;
+            findings.clear();
+            let linted = blaze_lint::lint_own_with(&none, &own, scope, geometry(&units, parent), None, &mut scratch, &mut findings).map_err(|_| SparseLintError::Unlinted)?;
+            for (child, given) in units.children_of(parent).iter().zip(linted.children.iter()) {
+                if let Ok(idx) = usize::try_from(*child)
+                    && let Some(slot) = scopes.get_mut(idx)
+                {
+                    *slot = Some(*given);
+                }
+            }
+            if let Some(slot) = walked.get_mut(parent) {
+                *slot = true;
+            }
+            counts.units_walked += 1;
+            counts.bytes_lexed += u64::try_from(own.text.len()).unwrap_or(u64::MAX);
+        }
+    }
+    let variants = match rules.runs(Rule::VariantCount) {
+        true => {
+            counts.variants_gathered += 1;
+            Some(Variants::gather(text, alloc).map_err(|_| SparseLintError::Ungathered)?)
+        }
+        false => None,
+    };
+    let mut lone: AVec<'_, (usize, Lone)> = AVec::with_capacity_in(jobs.len(), alloc);
+    for &(unit, task) in jobs.iter() {
+        let name = asked.get(task).ok_or(SparseLintError::Unplanned)?.0;
+        let plan = *units.list.get(unit).ok_or(SparseLintError::Unplanned)?;
+        let scope = scopes.get(unit).copied().flatten().ok_or(SparseLintError::Unscoped)?;
+        lone.push((unit, Lone { name, plan, scope }));
+    }
+    let shared = Shared { text, holes: &units.holes, rules, variants: variants.as_ref().map(Variants::view) };
+    let mut made: AVec<'_, SparseUnit<A>> = AVec::with_capacity_in(lone.len(), alloc);
+    match S::BATCH {
+        Some(batch) if lone.len() > batch => {
+            let scope = cx.scope();
+            let mut running = Vec::with_capacity_in(lone.len().div_ceil(batch), out_alloc);
+            for chunk in lone.chunks(batch) {
+                running.push(scope.may_overlap("lint units, a batch of a file's", BATCH_FRAME, move |cx: &bstd::cx::Cx| {
+                    let erased = blaze_own::Erased::new(cx.frame());
+                    Ok::<_, core::convert::Infallible>(lint_batch_sparse(shared, chunk, erased.handle(), out_alloc))
+                }));
+            }
+            counts.batches += u64::try_from(running.len()).unwrap_or(u64::MAX);
+            let mut ran = Vec::with_capacity_in(running.len(), out_alloc);
+            for handle in running.into_iter() {
+                ran.push(handle.join(cx).ok());
+            }
+            scope.join(cx).map_err(|_| SparseLintError::Unpooled)?;
+            for one in ran.into_iter() {
+                let (units_out, bytes) = one.ok_or(SparseLintError::Unpooled)??;
+                made.extend(units_out);
+                counts.bytes_lexed += bytes;
+            }
+        }
+        _ => {
+            let (units_out, bytes) = lint_batch_sparse(shared, &lone, alloc, out_alloc)?;
+            made.extend(units_out);
+            counts.bytes_lexed += bytes;
+        }
+    }
+    counts.units_linted += u64::try_from(made.len()).unwrap_or(u64::MAX);
+    let mut answers: AVec<'_, Option<SparseUnit<A>>> = AVec::with_capacity_in(asked.len(), alloc);
+    answers.resize_with(asked.len(), || None);
+    for (&(_, task), unit) in jobs.iter().zip(made) {
+        if let Some(slot) = answers.get_mut(task) {
+            *slot = Some(unit);
+        }
+    }
+    for answer in answers.iter_mut() {
+        did.push(answer.take().ok_or(Why::Refused { what: "a `Lint` part whose file holds no unit of its name at its place", rule: "blaze-cli lints.rs, lint_units_sparse" }));
+    }
+    Ok(())
+}
+
+fn lint_batch_sparse<A: core::alloc::Allocator + Copy>(
+    shared: Shared<'_>,
+    lone: &[(usize, Lone)],
+    alloc: Alloc<'_>,
+    out_alloc: A,
+) -> Result<(Vec<SparseUnit<A>, A>, u64), SparseLintError> {
+    let mut out = Vec::with_capacity_in(lone.len(), out_alloc);
+    let mut bytes = 0u64;
+    let mut findings = Findings::new_in(alloc);
+    let mut scratch = blaze_lint::Scratch::new_in(alloc);
+    let mut msg = blaze_own::String::new_in(alloc);
+    let mut fix_tmp = AVec::new_in(alloc);
+    for &(unit, one) in lone {
+        let holes = blaze_lint::holes_in(one.plan, shared.holes);
+        let own = blaze_lint::own_text(one.plan, holes, shared.text, alloc).map_err(|_| SparseLintError::Unlinted)?;
+        findings.clear();
+        let at = Geometry { base: one.plan.base, len: one.plan.end - one.plan.base, holes };
+        let mut linted = blaze_lint::lint_own_with(shared.rules, &own, one.scope, at, shared.variants, &mut scratch, &mut findings).map_err(|_| SparseLintError::Unlinted)?;
+        if shared.rules.runs(Rule::UnusedImport) && holes.is_empty() && own.text.contains("use") {
+            blaze_lint::unused_imports_for_range(shared.text, one.scope, one.plan.base, one.plan.end, alloc, &mut findings, &mut linted).map_err(|_| SparseLintError::Unlinted)?;
+        }
+        bytes += u64::try_from(own.text.len()).unwrap_or(u64::MAX);
+        let run = linted.findings;
+        let from = usize::try_from(run.from).map_err(|_| SparseLintError::Unlinted)?;
+        let to = usize::try_from(run.to).map_err(|_| SparseLintError::Unlinted)?;
+        let list = findings.list.get(from..to).ok_or(SparseLintError::Unlinted)?;
+        if list.is_empty() {
+            out.push(SparseUnit { unit, name: one.name, tokens: linted.tokens, cost: linted.cost, found: None });
+            continue;
+        }
+        let mut unit_findings = Vec::with_capacity_in(list.len(), out_alloc);
+        let mut words = Vec::new_in(out_alloc);
+        for finding in list {
+            msg.clear();
+            blaze_lint::show_message(shared.rules, own.text.as_str(), &findings, finding, &mut msg);
+            let first = words.len();
+            words.extend_from_slice(msg.as_bytes());
+            unit_findings.push((LINT_BASE + finding.rule().id(), finding.range.start, finding.range.end, first, words.len()));
+        }
+        fix_tmp.clear();
+        payload(&findings, list, &mut fix_tmp);
+        let mut fixes = Vec::with_capacity_in(fix_tmp.len(), out_alloc);
+        fixes.extend_from_slice(&fix_tmp);
+        out.push(SparseUnit {
+            unit,
+            name: one.name,
+            tokens: linted.tokens,
+            cost: linted.cost,
+            found: Some(SparseFound { findings: unit_findings, words, fixes }),
+        });
+    }
+    Ok((out, bytes))
+}
+
 /// The units `lone` linted by `shared.rules` in `alloc`: each one's record, in order, and the
 /// own bytes lexed. A function of its inputs alone, so a batch on a worker answers what the
 /// file's own task would ([`Split`]).
@@ -825,8 +1057,8 @@ pub(crate) fn fix_at<'f>(
 /// range one of the unit's OWN text (a reader places it as [`own_to_item`] does). What `--fix`
 /// is to read back to apply a fix (blaze-lint `apply`; nothing reads it yet); the drive's
 /// findings hold only the words.
-fn payload(findings: &Findings<'_>, list: &[blaze_lint::Finding], out: &mut Vec<u8, Global>) {
-    let word = |out: &mut Vec<u8, Global>, value: u32| out.extend_from_slice(&value.to_le_bytes());
+fn payload<A: core::alloc::Allocator>(findings: &Findings<'_>, list: &[blaze_lint::Finding], out: &mut Vec<u8, A>) {
+    let word = |out: &mut Vec<u8, A>, value: u32| out.extend_from_slice(&value.to_le_bytes());
     word(out, list.len() as u32);
     for finding in list {
         out.extend_from_slice(&(finding.template as u16).to_le_bytes());

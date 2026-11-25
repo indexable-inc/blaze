@@ -528,7 +528,7 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
         // Bounded: `i` increases by at least 1 each iteration.
         while i < len {
             let Some(tok) = self.toks.get(i).copied() else { break };
-            if is_ident(self.text, tok, "use") {
+            if tok.word == crate::sequences::W_USE {
                 in_use = true;
                 i += 1;
                 continue;
@@ -649,7 +649,7 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
                     }
                 }
             }
-            if !is_ident(self.text, u_tok, "use") {
+            if u_tok.word != crate::sequences::W_USE {
                 i += 1;
                 continue;
             }
@@ -991,11 +991,11 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
             }
 
             // Case 1: `let mut <ident> [: Ty] = <expr>;` inside a block.
-            if brace_depth > 0 && is_ident(self.text, tok, "let") {
+            if brace_depth > 0 && tok.word == crate::sequences::W_LET {
                 if let (Some(mut_tok), Some(var_tok), Some(after_var)) =
                     (self.toks.get(i + 1).copied(), self.toks.get(i + 2).copied(), self.toks.get(i + 3).copied())
                 {
-                    if is_ident(self.text, mut_tok, "mut")
+                    if mut_tok.word == crate::sequences::W_MUT
                         && var_tok.k == K::Ident
                         && (is_punct(after_var, b'=') || is_punct(after_var, b':'))
                     {
@@ -1056,7 +1056,7 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
             }
 
             // Case 2: `fn name(... mut param: Ty ...) { ... }` (functions with bodies).
-            if is_ident(self.text, tok, "fn") && !has_leading_attr(self.text, self.toks, i, &["allow", "expect"]) {
+            if tok.word == crate::sequences::W_FN && !has_leading_attr(self.text, self.toks, i, &["allow", "expect"]) {
                 // Find the parameter list `(...)` and the body `{...}` (skipping `fn` signatures ending in `;`).
                 let mut p = i + 1;
                 // Skip fn name and optional generic `<...>`.
@@ -1093,7 +1093,7 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
                         let mut at_param_start = true;
                         while q < rparen {
                             let Some(tk) = self.toks.get(q).copied() else { break };
-                            if pd == 0 && bd == 0 && ad == 0 && at_param_start && is_ident(self.text, tk, "mut") {
+                            if pd == 0 && bd == 0 && ad == 0 && at_param_start && tk.word == crate::sequences::W_MUT {
                                 if let (Some(var_tok), Some(colon)) =
                                     (self.toks.get(q + 1).copied(), self.toks.get(q + 2).copied())
                                 {

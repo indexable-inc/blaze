@@ -4524,3 +4524,75 @@ fn reused_semi_join_tracks_dead_resurrection_without_touching_live_roots() {
     let dead_touched = store.core().segment_touched(dead_seg_id).expect("dead seg after");
     assert_eq!(dead_touched, res.generation, "resurrected dead key must mark its segment touched");
 }
+
+#[test]
+fn root_reach_bloom_and_replaced_index_hints_preserve_exact_touches_across_reopen() {
+    let root = test_root();
+    let mut c = cfg(1, 1, false, &root);
+    c.liveness = super::core::Liveness::Reached;
+    let sim = Sim::new(88, Faults::default());
+    let mut store = Driven::with(sim, Path::new("/sim"), c, &root).expect("open store");
+    store.disable_auto_merge();
+
+    // 1. Commit a dead record in its own segment, plus a dead index naming it (not rooted).
+    let dead_k = key(95_001);
+    store.put(dead_k, Namespace::LOCAL, TAG, b"dead-record-bloom").expect("put dead");
+    let bogus_dead_idx = store.index(&[dead_k]).expect("dead index");
+    let dead_commit = store.commit_with(&[]).expect("commit dead");
+    let dead_seg_id = dead_commit.segments[0];
+
+    // 2. Commit a large indexed shard (>= 16 indexes so a persistent root reach bloom is built)
+    //    plus a second large shard holding unrelated keys.
+    let mut shard0 = [key(0); 20];
+    let mut shard1 = [key(0); 20];
+    let mut kept_k = key(0);
+    for i in 0..20usize {
+        let i32_v = u32::try_from(i).unwrap();
+        let k0 = key(10_000 + i32_v * 2);
+        let k1 = key(10_000 + i32_v * 2 + 1);
+        store.put(k0, Namespace::LOCAL, TAG, &i32_v.to_le_bytes()).expect("put s0a");
+        store.put(k1, Namespace::LOCAL, TAG, &(i32_v + 100).to_le_bytes()).expect("put s0b");
+        if i == 11 {
+            kept_k = k0;
+        }
+        shard0[i] = store.index(&[k0, k1]).expect("s0 idx");
+
+        let u0 = key(20_000 + i32_v * 2);
+        let u1 = key(20_000 + i32_v * 2 + 1);
+        store.put(u0, Namespace::LOCAL, TAG, &(i32_v + 200).to_le_bytes()).expect("put s1a");
+        store.put(u1, Namespace::LOCAL, TAG, &(i32_v + 300).to_le_bytes()).expect("put s1b");
+        shard1[i] = store.index(&[u0, u1]).expect("s1 idx");
+    }
+    store.root_through("ws.reach.00", &shard0, super::core::ROOT_LIFE_NS).expect("root s0");
+    store.root_through("ws.reach.01", &shard1, super::core::ROOT_LIFE_NS).expect("root s1");
+    store.root_through("ws.reach.delta", &[], super::core::ROOT_LIFE_NS).expect("root delta");
+    let base_commit = store.commit_with(&[]).expect("commit shards");
+    let live_seg_id = base_commit.segments[0];
+
+    // 3. Reopen the store from disk so root blooms are loaded from the `bloom` sidecar.
+    let sim = store.into_driver();
+    let mut c2 = cfg(2, 1, false, &root);
+    c2.liveness = super::core::Liveness::Reached;
+    let mut store = Driven::with(sim, Path::new("/sim"), c2, &root).expect("reopen store");
+    store.disable_auto_merge();
+
+    // 4. Incremental delta edit reusing `kept_k` from `shard0[11]`, passing `shard0[11]` as a
+    //    replaced-index hint: zero segments should be marked touched.
+    let fresh_k = key(30_001);
+    store.put(fresh_k, Namespace::LOCAL, TAG, b"fresh-val").expect("put fresh");
+    let delta_idx = store.index(&[kept_k, fresh_k]).expect("delta idx");
+    store.hint_replaced_indexes(&[shard0[11]]);
+    store.root_through("ws.reach.delta", &[delta_idx], super::core::ROOT_LIFE_NS).expect("delta");
+    let inc = store.commit_with(&[]).expect("commit delta");
+    assert_ne!(store.core().segment_touched(live_seg_id).expect("live seg"), inc.generation, "already-live key must not touch its segment");
+    assert_ne!(store.core().segment_touched(dead_seg_id).expect("dead seg"), inc.generation, "unreferenced dead segment must not be touched");
+
+    // 5. Soundness control: resurrect `dead_k` while passing an UNROOTED `bogus_dead_idx` as a
+    //    hint — `reused` must verify hints against live unexpired roots, ignore `bogus_dead_idx`,
+    //    and STILL mark `dead_seg_id` touched.
+    let res_idx = store.index(&[dead_k, fresh_k]).expect("resurrect idx");
+    store.hint_replaced_indexes(&[bogus_dead_idx]);
+    store.root_through("ws.reach.delta", &[res_idx], super::core::ROOT_LIFE_NS).expect("delta res");
+    let res = store.commit_with(&[]).expect("commit resurrection");
+    assert_eq!(store.core().segment_touched(dead_seg_id).expect("dead seg"), res.generation, "bogus unrooted hint must never suppress touching a dead segment");
+}

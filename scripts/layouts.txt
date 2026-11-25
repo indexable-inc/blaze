@@ -55,7 +55,7 @@ crates/blaze-cli/src/engine_listing_record.rs	JOIN_MAGIC	none
 crates/blaze-cli/src/engine_listing_record.rs	PART_MAGIC	none
 crates/blaze-cli/src/engine_listing_record.rs	VERSION	none
 crates/blaze-cli/src/engine_member_rows.rs	MAGIC	none
-crates/blaze-cli/src/engine_member_rows.rs	VERSION	none
+crates/blaze-cli/src/engine_member_rows.rs	VERSION	test previous_version_2_is_refused
 crates/blaze-cli/src/engine_members_record.rs	MAGIC	none
 crates/blaze-cli/src/engine_scope_reads.rs	GRAINS_MAGIC	none
 crates/blaze-cli/src/engine_script_reads.rs	COVERAGE_MAGIC	none

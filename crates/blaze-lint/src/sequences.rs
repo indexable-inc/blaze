@@ -509,3 +509,15 @@ const N_NODES: usize = nodes_for(&PATTERNS);
 
 /// The one trie of every sequence, built as the crate compiles.
 pub(crate) static TRIE: Trie<N_NODES, SYMS, N_SEQS> = Trie::build(&PATTERNS);
+
+/// Compile-time proof that `Pass::sequences` and `Pass::lex_run` only need to treat `K::Ident`
+/// words and `K::P(b'.')` as sequence starters when no match is live.
+const _: () = {
+    let mut i = 0;
+    while i < SEQS.len() {
+        if let E::P(sym) = SEQS[i].elems[0] {
+            assert!(sym == DOT, "only DOT punctuation may start a sequence pattern");
+        }
+        i += 1;
+    }
+};

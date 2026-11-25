@@ -151,9 +151,9 @@ pub(crate) fn units_of(parts: &[Part], whole: Name) -> std::vec::Vec<UnitPart, G
 pub(crate) struct Found {
     pub(crate) name: Name,
     pub(crate) chain: Option<u64>,
-    pub(crate) findings: std::vec::Vec<(u16, u32, u32, usize, usize), Global>,
-    pub(crate) words: std::vec::Vec<u8, Global>,
-    pub(crate) fixes: std::vec::Vec<u8, Global>,
+    pub(crate) findings: blaze_own::Vec<(u16, u32, u32, usize, usize), Global>,
+    pub(crate) words: blaze_own::Vec<u8, Global>,
+    pub(crate) fixes: blaze_own::Vec<u8, Global>,
 }
 
 /// A file's last lint record, read back ([`Prior::of`]): what it was made under, every unit's
@@ -229,7 +229,7 @@ impl Prior {
                 _ => return Err(UNREAD),
             };
             let findings = at.u32()? as usize;
-            let mut one = Found { name, chain, findings: std::vec::Vec::with_capacity_in(findings.min(at.bytes.len() / 14), Global), words: std::vec::Vec::new_in(Global), fixes: std::vec::Vec::new_in(Global) };
+            let mut one = Found { name, chain, findings: blaze_own::Vec::with_capacity_in(findings.min(at.bytes.len() / 14), Global), words: blaze_own::Vec::new_in(Global), fixes: blaze_own::Vec::new_in(Global) };
             for _ in 0..findings {
                 let rule = u16::from_le_bytes(at.take(2)?.try_into().map_err(|_| UNREAD)?);
                 let (start, end) = (at.u32()?, at.u32()?);
@@ -787,7 +787,7 @@ pub(crate) fn lint_text(
     let chain_of = |at: usize| work::stored_item_chain(view, blaze_surface::ItemIndex(at as u32));
     // 1. Each unit kept by its key, or asked.
     let mut found: std::vec::Vec<Found, Global> = std::vec::Vec::new_in(Global);
-    let mut asked: std::vec::Vec<AskedUnit, Global> = std::vec::Vec::new_in(Global);
+    let mut asked: blaze_own::AVec<'_, AskedUnit> = blaze_own::AVec::new_in(alloc);
     for unit in units.iter() {
         match prior.and_then(|prior| prior.kept(under, unit.name, unit.key)) {
             Some(Some(kept)) => found.push(kept.clone()),
@@ -799,28 +799,28 @@ pub(crate) fn lint_text(
     // `outline_file`): the file stands as its own crate root, as there.
     let subject = crate::signature::file_subject(path);
     let marks = crate::lints::marks_of(text, text);
-    let mut did: blaze_own::Vec<Result<(usize, Record<Global>), Why>, Global> = blaze_own::Vec::with_capacity_in(asked.len(), Global);
-    crate::lints::lint_units_in::<crate::lints::Splitting>(cx, &entries, &chain_of, text, path, subject, &asked, rules, marks, alloc, counts, &mut did).map_err(refused)?;
+    let mut did: blaze_own::AVec<'_, Result<crate::lints::SparseUnit<Global>, Why>> = blaze_own::AVec::with_capacity_in(asked.len(), alloc);
+    crate::lints::lint_units_sparse::<crate::lints::Splitting, _>(cx, &entries, &chain_of, text, path, subject, &asked, rules, marks, alloc, Global, counts, &mut did)
+        .map_err(|err| refused(err.as_str()))?;
     // 3. Each linted unit's findings, its item named for the profile and the tests.
     let mut relinted = std::vec::Vec::with_capacity_in(did.len(), Global);
     let mut cost = (0u64, Cost::NONE);
     for one in did {
-        let (unit, record) = one?;
-        let entry = unit.checked_sub(1).and_then(|at| entries.get(at).map(|item| (at, item)));
+        let sparse = one?;
+        let entry = sparse.unit.checked_sub(1).and_then(|at| entries.get(at).map(|item| (at, item)));
         relinted.push(entry.map(|(_, item)| blaze_own::String::from_str_in(crate::item_name::shown_name(item, text), Global)));
-        let payload = record.payload_bytes().map_err(|_| refused("a lint unit's record holds no payload"))?;
-        let (tokens, sites) = crate::lints::cost_of(payload).ok_or(refused("a lint unit's record holds no cost"))?;
-        cost.0 += u64::from(tokens);
-        cost.1.add_all(&sites);
-        if record.findings.is_empty() {
+        cost.0 += u64::from(sparse.tokens);
+        cost.1.add_all(&sparse.cost);
+        let Some(unit_found) = sparse.found else {
             continue;
-        }
-        let fixes = crate::lints::fixes_of(payload).ok_or(refused("a lint unit's record holds no findings' fixes"))?;
-        let mut one = Found { name: record.name, chain: entry.map(|(at, _)| chain_of(at)), findings: std::vec::Vec::with_capacity_in(record.findings.len(), Global), words: std::vec::Vec::new_in(Global), fixes: std::vec::Vec::new_in(Global) };
-        one.findings.extend(record.findings.iter().copied());
-        one.words.extend(record.messages.iter().copied());
-        one.fixes.extend_from_slice(fixes);
-        found.push(one);
+        };
+        found.push(Found {
+            name: sparse.name,
+            chain: entry.map(|(at, _)| chain_of(at)),
+            findings: unit_found.findings,
+            words: unit_found.words,
+            fixes: unit_found.fixes,
+        });
     }
     // 4. The file's record, its found units in name order (kept or linted, the same bytes).
     found.sort_unstable_by_key(|one| one.name);
