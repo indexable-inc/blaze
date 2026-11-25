@@ -54,6 +54,12 @@ pub const INTRINSIC: &str = "rustc_intrinsic";
 /// `cfg_attr(target_feature = ..)` also contains the word; the head's lowered qualifiers decide.
 pub const TARGET_FEATURE: &str = "target_feature";
 
+/// The attribute that marks a fn deprecated-safe (`#[rustc_deprecated_safe_2024]`):
+/// `unsafe` from edition 2024, safe before it (library/std/src/env.rs `set_var`/`remove_var`;
+/// the `deprecated_safe_2024` lint, allow before 2024). blaze-typeck's rules/unsafety.rs files
+/// no E0133 for a call from an older-edition body.
+pub const DEPRECATED_SAFE_2024: &str = "rustc_deprecated_safe_2024";
+
 /// The attribute that marks a compile-time-only fn (`core::mem::type_info`, `TypeId::info`,
 /// `blaze_std::own::raw`): callable only during constant evaluation, so consteval treats it
 /// as a `const fn` (`FnQualifiers::CONST`).

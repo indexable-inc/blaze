@@ -51,7 +51,7 @@ use crate::machine::Machine;
 use crate::rules::args_inline::TypedFinding;
 use crate::rules::target_feature::Gate;
 use crate::ty::{Ty, TyView, TypeCtx};
-use crate::world::{AdtKind, Def, World};
+use crate::world::{AdtKind, Def, TypeAttrs, World};
 
 /// What the unsafety pass could not decide in a body: no error and no pass, filed as "not
 /// checked" by the command that prints the body's verdict (rule 3: never quietly a pass).
@@ -282,11 +282,18 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             return Ok(());
         }
         let Some(sig) = self.reads.fn_sig(k)? else { return Ok(()) };
+        let attrs = self.reads.attrs(k)?;
         if sig.header.safety == Safety::Unsafe {
-            self.refuse(ctx, At::Expr(e), UnsafeOp::Call(Some(k)));
+            // A fn marked `#[rustc_deprecated_safe_2024]` (std's `env::set_var`/`remove_var`)
+            // is `unsafe`, but a call of it from a body whose edition is older than 2024 is
+            // allowed: the `deprecated_safe_2024` lint is allow there, so no E0133 is filed
+            // (rustc's `deprecated_safe`; library/std/src/env.rs).
+            let allowed_by_edition = attrs.0 & TypeAttrs::DEPRECATED_SAFE_2024 != 0 && self.body.edition < Edition::E2024;
+            if !allowed_by_edition {
+                self.refuse(ctx, At::Expr(e), UnsafeOp::Call(Some(k)));
+            }
             return Ok(());
         }
-        let attrs = self.reads.attrs(k)?;
         match self.feature_gate(attrs, sig.header.safety)? {
             Gate::Open => {}
             Gate::Unsafe => self.refuse(ctx, At::Expr(e), UnsafeOp::TargetFeatureCall(k)),

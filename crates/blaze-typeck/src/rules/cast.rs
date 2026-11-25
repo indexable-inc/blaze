@@ -59,7 +59,14 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
             let to = self.lower_body_ty(ty, At::Expr(e))?;
             f.t = to;
             self.resume(f, 1)?;
-            self.push_expr(operand, Expectation::Castable(to), Then::Nothing)?;
+            // A cast to a trait object coerces a concrete source: the target is no
+            // expectation for the operand (rustc checks a cast's operand with
+            // `check_expr_without_expectation`). Propagating `dyn Trait` into the
+            // operand's `if`/`match` arms fails each arm against `dyn Trait` where
+            // rustc unifies the arms and coerces the whole (`params![if c { 1 } else { 0 }]`).
+            // For a concrete target the hint stays: `&0 as &u8` infers `0: u8`.
+            let expectation = if self.dyn_cast_target(to) { Expectation::None } else { Expectation::Castable(to) };
+            self.push_expr(operand, expectation, Then::Nothing)?;
             return Ok(Flow::Wait);
         }
         let from = self.ret;
@@ -68,6 +75,16 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
             self.casts.push(CastCheck { expr: e, operand, from, to });
         }
         Ok(Flow::Done(to))
+    }
+
+    /// Whether `to` (a cast's target) is a trait object or a reference to one: the only
+    /// cast targets for which the operand takes no expectation (see [`Self::expr_cast`]).
+    fn dyn_cast_target(&mut self, to: Ty) -> bool {
+        match self.view(to) {
+            TyView::Dynamic(_) => true,
+            TyView::Ref(_, inner) => matches!(self.view(inner), TyView::Dynamic(_)),
+            _ => false,
+        }
     }
 
     fn cast_kind(&mut self, t: Ty) -> Result<Kind, Stop> {
