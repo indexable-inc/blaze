@@ -3234,7 +3234,7 @@ fn layout_reverse_search_overlay(
     let preview_h = m.ch + 14.0;
     let list_h = visible as f32 * row_h + 8.0;
     let modal_h = (header_h + list_h + input_h + preview_h).min(vh - TOP_BAR_H - 28.0);
-    let modal_w = (vw - 48.0).clamp(480.0, 900.0);
+    let modal_w = (vw - 48.0).clamp(240.0, 900.0).min((vw - 24.0).max(200.0));
     let x0 = ((vw - modal_w) * 0.5).max(12.0);
     let x1 = x0 + modal_w;
     let y0 = (TOP_BAR_H + ((vh - TOP_BAR_H - modal_h) * 0.42)).max(TOP_BAR_H + 12.0);

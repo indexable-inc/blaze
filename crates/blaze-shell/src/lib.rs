@@ -962,4 +962,89 @@ mod tests {
         assert!(!vis.is_empty());
         assert!(!text.is_empty());
     }
+
+    #[test]
+    fn narrow_viewport_layouts_never_panic() {
+        let alloc = Alloc::global();
+        let dir = make_temp_dir("narrow-vp");
+        fs::write(
+            dir.join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let state = EngineState::new(dir.to_str().unwrap(), &[("HOME", "/tmp")], alloc);
+        let store = BlockStore::new(state.fork());
+        let prompt = PromptInfo::from_cwd(dir.to_str().unwrap(), "/tmp", 0, 0);
+        let editor = Editor::new();
+
+        let mut yazi = crate::yazi::YaziState::open(&dir);
+        let hub = crate::agent_hub::AgentHub {
+            local_host: "hydra".to_owned(),
+            agents: vec![crate::agent_hub::AgentRecord {
+                id: "local-1".to_owned(),
+                host: "hydra".to_owned(),
+                is_remote: false,
+                name: "claude #1".to_owned(),
+                prompt_summary: "test".to_owned(),
+                cwd: "/tmp".to_owned(),
+                pid: Some(1),
+                status: crate::agent_hub::AgentStatus::Running,
+                pty_session_idx: None,
+                preview_lines: vec!["ok".to_owned()],
+            }],
+            selected: 0,
+            composing_new: false,
+            new_prompt: String::new(),
+        };
+
+        for &vw in &[260.0f32, 320.0, 400.0, 514.0, 620.0, 1140.0] {
+            for &vh in &[200.0f32, 400.0, 820.0] {
+                let sy = crate::yazi::layout_yazi_view(
+                    &mut yazi,
+                    &store,
+                    &prompt,
+                    vw,
+                    vh,
+                    CellMetrics::default(),
+                    100,
+                    true,
+                );
+                assert!(!sy.rects.is_empty());
+
+                let sh = crate::agent_hub::layout_agent_hub(
+                    &hub,
+                    &store,
+                    &prompt,
+                    vw,
+                    vh,
+                    CellMetrics::default(),
+                    100,
+                    true,
+                );
+                assert!(!sh.rects.is_empty());
+
+                let sb = build_scene(&LayoutInput {
+                    store: &store,
+                    editor: &editor,
+                    prompt: &prompt,
+                    viewport_w: vw,
+                    viewport_h: vh,
+                    metrics: CellMetrics::default(),
+                    scroll_y: 0.0,
+                    cursor_visible: true,
+                    now_ns: 1_732_500_000_000_000_000,
+                    zoom_pct: 100,
+                    inline_titlebar: true,
+                    drag: None,
+                    cursor_trail: None,
+                    text_selection: None,
+                    active_popover: None,
+                    mouse_pos: None,
+                    output_nav: None,
+                });
+                assert!(!sb.rects.is_empty());
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

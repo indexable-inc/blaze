@@ -665,35 +665,41 @@ pub fn layout_yazi_view(
         scene.text(fx0 + 7.0, hty, flbl, theme::INK_1, false, false, 0);
     }
 
-    // 2. Three Miller columns: Parent (16%) | Current (30%) | Rich Preview (54%).
+    // 2. Responsive Miller columns: Parent (16%, hidden below 620px) | Current (30%) | Rich Preview (54%).
     let col1_x0 = 0.0;
-    let col1_x1 = (vw * 0.16).clamp(120.0, 210.0);
+    let col1_x1 = if vw < 620.0 { 0.0 } else { (vw * 0.16).clamp(110.0, 210.0) };
     let col2_x0 = col1_x1;
-    let col2_x1 = (col2_x0 + vw * 0.30).clamp(col2_x0 + 190.0, vw - 280.0);
+    let col2_max = (vw - 180.0).max(col2_x0 + 120.0).min(vw);
+    let col2_min = (col2_x0 + 150.0).min(col2_max);
+    let col2_x1 = (col2_x0 + vw * 0.30).clamp(col2_min, col2_max);
     let col3_x0 = col2_x1;
     let col3_x1 = vw;
 
-    scene.line(col1_x1, body_top, col1_x1, body_bot, 1.0, theme::LINE_FAINT, 0);
+    if col1_x1 > 0.0 {
+        scene.line(col1_x1, body_top, col1_x1, body_bot, 1.0, theme::LINE_FAINT, 0);
+    }
     scene.line(col2_x1, body_top, col2_x1, body_bot, 1.0, theme::LINE_FAINT, 0);
 
     let row_h = m.ch + 6.0;
     let max_vis_rows = ((body_h - 12.0) / row_h).floor().max(1.0) as usize;
     let icon_s = 13.0;
 
-    // Column 1: Parent directory (muted context).
-    let clip1 = scene.push_clip(col1_x0, body_top, col1_x1 - 1.0, body_bot, 0.0);
-    let p_start = yazi.parent_selected.saturating_sub(max_vis_rows / 2);
-    for (slot, entry) in yazi.parent_entries.iter().enumerate().skip(p_start).take(max_vis_rows) {
-        let ry = body_top + 6.0 + slot.saturating_sub(p_start) as f32 * row_h;
-        let is_cur = slot == yazi.parent_selected;
-        if is_cur {
-            scene.round_rect(col1_x0 + 6.0, ry, col1_x1 - 6.0, ry + row_h, 4.0, theme::BG_CHIP, 0.0, [0.0; 4], clip1);
+    // Column 1: Parent directory (muted context; hidden when narrow so file list + preview stay legible).
+    if col1_x1 > 0.0 {
+        let clip1 = scene.push_clip(col1_x0, body_top, col1_x1 - 1.0, body_bot, 0.0);
+        let p_start = yazi.parent_selected.saturating_sub(max_vis_rows / 2);
+        for (slot, entry) in yazi.parent_entries.iter().enumerate().skip(p_start).take(max_vis_rows) {
+            let ry = body_top + 6.0 + slot.saturating_sub(p_start) as f32 * row_h;
+            let is_cur = slot == yazi.parent_selected;
+            if is_cur {
+                scene.round_rect(col1_x0 + 6.0, ry, col1_x1 - 6.0, ry + row_h, 4.0, theme::BG_CHIP, 0.0, [0.0; 4], clip1);
+            }
+            let ty = ry + (row_h - m.ch) * 0.5;
+            scene.svg_icon_alpha(col1_x0 + 12.0, ty + (m.ch - icon_s) * 0.5, icon_s, entry.icon, 0.65, clip1);
+            let max_c = ((col1_x1 - col1_x0 - 38.0) / m.cw).floor().max(6.0) as usize;
+            let col = if is_cur { theme::INK_2 } else { theme::INK_4 };
+            scene.text(col1_x0 + 30.0, ty, truncate_chars(&entry.name, max_c), col, false, false, clip1);
         }
-        let ty = ry + (row_h - m.ch) * 0.5;
-        scene.svg_icon_alpha(col1_x0 + 12.0, ty + (m.ch - icon_s) * 0.5, icon_s, entry.icon, 0.65, clip1);
-        let max_c = ((col1_x1 - col1_x0 - 38.0) / m.cw).floor().max(6.0) as usize;
-        let col = if is_cur { theme::INK_2 } else { theme::INK_4 };
-        scene.text(col1_x0 + 30.0, ty, truncate_chars(&entry.name, max_c), col, false, false, clip1);
     }
 
     // Column 2: Active directory with crisp monochrome selection rail + sizes.

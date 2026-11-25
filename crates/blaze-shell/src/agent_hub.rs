@@ -303,7 +303,9 @@ pub fn layout_agent_hub(
     scene.text(32.0, hty, hdr_lbl, theme::INK_1, true, false, 0);
 
     // 2. Two-pane split: Left fleet list (38%) | Right live preview & prompt composer (62%).
-    let split_x = (vw * 0.38).clamp(240.0, 420.0);
+    let split_max = (vw - 180.0).max(160.0).min(420.0);
+    let split_min = 160.0f32.min(split_max);
+    let split_x = (vw * 0.38).clamp(split_min, split_max);
     scene.line(split_x, body_top, split_x, body_bot, 1.0, theme::LINE_FAINT, 0);
 
     let left_clip = scene.push_clip(0.0, body_top, split_x - 1.0, body_bot, 0.0);
