@@ -49,8 +49,8 @@ pub struct Look {
 }
 
 impl Look {
-    /// The look a stamp says: also how [`Facts`] reads its rows.
-    fn of(stamp: &Stamped) -> Look {
+    /// The look a stamp says: also how [`Facts`] and [`super::Entries`] read their rows.
+    pub(super) fn of(stamp: &Stamped) -> Look {
         Look {
             kind: EntryKind::of(stamp),
             len: stamp.size,
@@ -100,6 +100,16 @@ impl Looks {
     /// The look of the `i`th path given.
     pub fn get(&self, i: usize) -> Option<Look> {
         self.stamps.get(i).map(Look::of)
+    }
+
+    /// Raw Unix mode bits of the `i`th path given (`0` when out of bounds or gone).
+    pub fn mode(&self, i: usize) -> u32 {
+        self.stamps.get(i).map_or(0, |s| s.mode)
+    }
+
+    /// Whether the `i`th path has an execute permission bit set.
+    pub fn executable(&self, i: usize) -> bool {
+        self.stamps.get(i).is_some_and(Stamped::executable)
     }
 
     pub fn iter(&self) -> impl ExactSizeIterator<Item = Look> + '_ {
@@ -277,6 +287,16 @@ impl Facts<'_> {
     /// The look of the `i`th path asked.
     pub fn get(&self, i: usize) -> Option<Look> {
         self.stamps.get(i).map(Look::of)
+    }
+
+    /// Raw Unix mode bits of the `i`th path asked (`0` when out of bounds or gone).
+    pub fn mode(&self, i: usize) -> u32 {
+        self.stamps.get(i).map_or(0, |s| s.mode)
+    }
+
+    /// Whether the `i`th path asked has an execute permission bit set.
+    pub fn executable(&self, i: usize) -> bool {
+        self.stamps.get(i).is_some_and(Stamped::executable)
     }
 
     pub fn iter(&self) -> impl ExactSizeIterator<Item = Look> + '_ {

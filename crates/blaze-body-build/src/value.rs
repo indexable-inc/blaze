@@ -1285,7 +1285,7 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
 
     /// The target instance for a fn-item reification: `ReifyShim` when `instance` is
     /// `#[track_caller]`, else `instance` itself.
-    fn reify_target(&mut self, instance: Instance) -> Result<Instance, BuildError> {
+    pub(crate) fn reify_target(&mut self, instance: Instance) -> Result<Instance, BuildError> {
         if self.adts.track_caller(instance, self.subst.ground) == Some(true) {
             return reify_shim_instance(instance, self.subst.ground).map_err(|e| self.facts(e));
         }
