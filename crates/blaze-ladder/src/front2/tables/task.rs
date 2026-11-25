@@ -895,14 +895,36 @@ pub fn compare_repeats<'n, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &Body
     })
 }
 
+/// Borrows a body task's resettable scratch allocator (`work: Alloc<'w>`) as `Alloc<'static>`
+/// for a [`ProjectWorld`] created inside [`record_body_as`] and dropped before it returns.
+///
+/// # Safety
+///
+/// Every value allocated through the returned handle (the `ProjectWorld`, its `Store`,
+/// `Buckets`, `InferCtx`, `Checked`, and any temporary scratch passed to `HeadSeed::seed`)
+/// MUST be dropped before `'w` ends (before [`record_body_as`] returns or finishes unwinding),
+/// and no copy of the handle or allocation backed by it may escape into [`BodyReads`],
+/// [`TaskError`], `frame`, `tables`, or any shared state.
+#[inline]
+unsafe fn body_world_alloc<'w>(work: Alloc<'w>) -> Alloc<'static> {
+    // SAFETY: `Alloc<'w>` and `Alloc<'static>` are instantiations of the same struct differing
+    // only in a phantom lifetime marker, so their layouts are identical; the caller enforces
+    // that every allocation made through the returned handle is dropped before `'w` ends.
+    unsafe { core::mem::transmute::<Alloc<'w>, Alloc<'static>>(work) }
+}
+
 /// The body's world over `view`: its lang index, its `Front2` and the world itself, made in
 /// THIS frame and boxed in `alloc`. A debug build gives each local and temporary of a
 /// function its own slot for the whole call, and [`record_body_as`]'s frame stays on the
 /// stack under the whole type and borrow check (blaze-int notes t29 overflow-bt4.txt: 156,400
 /// bytes, the deepest of front2's): made there, the index, `Front2` and the world's value
 /// would ride under it; made here, only the box's pointer does.
+///
+/// `world_alloc` is the body's resettable `work` scratch frame (`body_world_alloc`), so the
+/// store's tables, type interner, impl buckets, and checker arenas all live in `work` and are
+/// reclaimed in O(1) when the caller resets its scratch after this body finishes.
 #[inline(never)]
-fn body_world<'v, 'n, 'w>(view: Tables<'v, 'n>, sink: &dyn ReadSink, name: Name, frame: &BodyFrame<'n>, asks: super::super::asks::AsksMet, alloc: Alloc<'w>) -> Result<blaze_own::Box<ProjectWorld<'n, Tables<'v, 'n>>, Alloc<'w>>, TaskError> {
+fn body_world<'v, 'n, 'w>(view: Tables<'v, 'n>, sink: &dyn ReadSink, name: Name, frame: &BodyFrame<'n>, asks: super::super::asks::AsksMet, alloc: Alloc<'w>, world_alloc: Alloc<'static>) -> Result<blaze_own::Box<ProjectWorld<'n, Tables<'v, 'n>>, Alloc<'w>>, TaskError> {
     let (index, pointers) = match frame.front {
         Some(sf) => {
             for &read in sf.reads.iter() {
@@ -921,7 +943,7 @@ fn body_world<'v, 'n, 'w>(view: Tables<'v, 'n>, sink: &dyn ReadSink, name: Name,
         }
     };
     let front = Front2 { names: view, resolver: crate::resolve::Paths { names: view }, texts: Texts::empty(), keys: Keys::new(), index, frame: frame.frame };
-    let mut world = blaze_own::Box::new_in(ProjectWorld::over_with_pointers(front, frame.prepared, pointers, frame.alloc), alloc);
+    let mut world = blaze_own::Box::new_in(ProjectWorld::over_with_pointers(front, frame.prepared, pointers, world_alloc), alloc);
     world.record_const_texts();
     world.set_cost(frame.cost);
     world.set_needs(frame.needs);
@@ -955,22 +977,28 @@ fn record_body_as<'n, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame
         BodyRef::Member { container, .. } => container,
         BodyRef::Free(key) => key,
     };
+    // SAFETY: `world` is owned locally in this function (moved into `collect_body_reads` and
+    // dropped there, or dropped on early return / unwind) strictly before `record_body_as`
+    // returns while `work: Alloc<'w>` is live. `const_texts` is copied into `frame.alloc`
+    // before `world` drops, and no `world_alloc`-backed handle escapes in `BodyReads` or
+    // `TaskError`.
+    let world_alloc = unsafe { body_world_alloc(alloc) };
     // In its own frame and behind a box: this frame rides under the whole check (the guard:
     // tests/front2_alias_opaques.rs `a_seeded_body_checks_on_a_small_stack`).
-    let mut world = body_world(view, &observed, name, frame, asks, alloc)?;
+    let mut world = body_world(view, &observed, name, frame, asks, alloc, world_alloc)?;
     drop(setup);
     let root = Listed { body, at: None, entry: None };
     let mut goal_hits = AVec::new_in(alloc);
     let mut seed_error = None;
     let check = |w: &mut ProjectWorld<'n, Tables<'_, 'n>>, b| {
         recorder.checking(Some("the body's type and borrow check"));
-        let pair = w.check_borrows(b, frame.alloc);
+        let pair = w.check_borrows(b, alloc);
         if let Some(error) = w.take_seed_error() {
             seed_error.get_or_insert_with(|| {
                 if let SeedError::Freeze(error @ FreezeError::Record { .. }) = error {
                     if let FreezeError::Record { error: super::super::head_record::HeadRecordError::MissingOpaqueRow { key, origin }, .. } = &error {
                         let ask = CellAsk::during_seed(&pair.0, *key);
-                        let shown = FactDefinition::of(view.records(), *key, Some((origin.owner, origin.index)), frame.alloc);
+                        let shown = FactDefinition::of(view.records(), *key, Some((origin.owner, origin.index)), alloc);
                         return TaskError::Cell { key: *key, ask, holder: origin.owner, shown, error };
                     }
                     return TaskError::Seed { body: name, error: SeedError::Freeze(error) };
@@ -1069,7 +1097,7 @@ fn collect_body_reads<'v, 'n, 'w>(
     observed: &'v ObservedReads<'_, 'w, '_, 'n, '_>,
     view: Tables<'v, 'n>,
     mut world: blaze_own::Box<ProjectWorld<'n, Tables<'v, 'n>>, Alloc<'w>>,
-    reached: AVec<'w, Reached<(BodyVerdict<'static>, BorrowVerdict)>>,
+    mut reached: AVec<'w, Reached<'n, (BodyVerdict<'w>, BorrowVerdict<'w>)>>,
     report: ReadReport<'_, 'w>,
 ) -> Result<CollectedBody<'w>, TaskError> {
     let recorder = observed.recorder;
@@ -1109,7 +1137,7 @@ fn collect_body_reads<'v, 'n, 'w>(
             // of a provided trait fn's `impl Trait` is that fn's (front2 rpitit.rs `filed_as`).
             let asked = blaze_typeck::ItemKey(row.fact.key);
             let owner = world.store.opaques.get(&super::super::rpitit::filed_as(&world.store, asked)).copied();
-            if let Some(read) = fact_read(view.records(), &world.front.keys, row.fact.kind, row.fact.key, owner, frame.alloc)? {
+            if let Some(read) = fact_read(view.records(), &world.front.keys, row.fact.kind, row.fact.key, owner, alloc)? {
                 observed.read(read);
             }
         }
@@ -1127,7 +1155,7 @@ fn collect_body_reads<'v, 'n, 'w>(
     // missing default body), so it is read whether or not the checker asked for it.
     recorder.checking(Some("the body's own head fact"));
     let own = super::super::keys::checker_of(own);
-    if let Some(read) = fact_read(view.records(), &world.front.keys, FactKind::Head, own.0, None, frame.alloc)? {
+    if let Some(read) = fact_read(view.records(), &world.front.keys, FactKind::Head, own.0, None, alloc)? {
         observed.read(read);
     }
     // THE CONTROL'S INSTRUMENT: the cell of each head the body's own store holds, beside the
@@ -1139,13 +1167,19 @@ fn collect_body_reads<'v, 'n, 'w>(
     }
     let mut held: AVec<'w, (TableRead, u128)> = AVec::with_capacity_in(held_keys.len(), alloc);
     for &k in held_keys.iter() {
-        if let Some(read) = fact_read(view.records(), &world.front.keys, FactKind::Head, k, None, frame.alloc)? {
+        if let Some(read) = fact_read(view.records(), &world.front.keys, FactKind::Head, k, None, alloc)? {
             held.push((read, k));
         }
     }
     held.sort_unstable();
     recorder.checking(Some("the body's constant definition reads"));
-    let const_texts = world.take_const_texts().map_err(TaskError::Full)?;
+    let world_const_texts = world.take_const_texts().map_err(TaskError::Full)?;
+    let mut const_texts = AVec::new_in(frame.alloc);
+    if !world_const_texts.is_empty() {
+        const_texts.reserve(world_const_texts.len());
+        const_texts.extend_from_slice(&world_const_texts);
+    }
+    drop(world_const_texts);
     let asked = *world.store.asked.borrow();
     drop(world);
     let _ = view;
@@ -1161,25 +1195,20 @@ fn collect_body_reads<'v, 'n, 'w>(
         + said.iter().map(|s| byte_size(s.words.capacity(), 1) + s.within.as_ref().map_or(0, |w| byte_size(w.capacity(), 1)) + if let SaidWhat::NotChecked { cause } = &s.what { byte_size(cause.capacity(), 1) } else { 0 }).sum::<u64>();
     drop(held_keys);
     drop(reading);
-    // The root's checked record (D163 R1), copied into `work` beside the rest of the answer, of
-    // every root whose TYPES are clean ([`keeps_typed`]); a clean check the record refused
-    // fails the task by name (rule 3).
-    let root_reached = reached.iter().find(|one| one.within.is_none());
+    // The root's checked record (D163 R1), already allocated in `work` beside the rest of the
+    // answer, of every root whose TYPES are clean ([`keeps_typed`]); a clean check the record
+    // refused fails the task by name (rule 3).
+    let root_reached = reached.iter_mut().find(|one| one.within.is_none());
     let clean = root_reached.filter(|one| keeps_typed(&one.got.0));
-    let typed = match clean.and_then(|one| one.got.0.typed.as_ref()) {
-        Some(Ok(record)) => {
-            let mut kept = AVec::with_capacity_in(record.len(), alloc);
-            kept.extend_from_slice(record);
-            Some(kept)
-        }
+    let (typed, typed_stalled) = match clean.and_then(|one| one.got.0.typed.take()) {
+        Some(Ok(record)) => (Some(record), false),
         // Its stalled goals were not all proved on their exact interiors (front2 stalled_goals.rs;
         // proved ones keep the record, borrows.rs `check_borrows_in`, F18): a `TypedGap` for
         // the run, counted (`typed_stalled`), never a failed task (D163).
-        Some(Err(blaze_typeck::checked_record::CheckedRecordError::NotClean { what: "stalled", .. })) => None,
-        Some(Err(why)) => return Err(TaskError::Typed { body: name, why: *why }),
-        None => None,
+        Some(Err(blaze_typeck::checked_record::CheckedRecordError::NotClean { what: "stalled", .. })) => (None, true),
+        Some(Err(why)) => return Err(TaskError::Typed { body: name, why }),
+        None => (None, false),
     };
-    let typed_stalled = matches!(clean.and_then(|one| one.got.0.typed.as_ref()), Some(Err(blaze_typeck::checked_record::CheckedRecordError::NotClean { what: "stalled", .. })));
     // `findings` summed over the root and its local fns (u32, saturating), as the row's.
     Ok(CollectedBody { digest, failed, findings, bytes, const_texts, locals, typed, typed_stalled, held, said, asked, verdict_capacity, held_bytes, said_bytes })
 }

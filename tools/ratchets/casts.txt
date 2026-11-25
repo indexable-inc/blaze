@@ -34,7 +34,7 @@ blaze-cast	40
 blaze-cc	17
 blaze-cert	14
 blaze-check	108
-blaze-cli	664
+blaze-cli	663
 blaze-code	139
 blaze-columns	2
 blaze-comptime-sys	150
@@ -48,7 +48,7 @@ blaze-deflate	152
 blaze-drive	64
 blaze-ed25519	5
 blaze-emit	551
-blaze-engine	119
+blaze-engine	117
 blaze-expand	284
 blaze-export	411
 blaze-facts	12

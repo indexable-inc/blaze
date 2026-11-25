@@ -72,14 +72,15 @@ pub(super) struct TraitReads {
 
 /// What [`Buckets::admit_asked`] keeps: which buckets are filed, and what each question read.
 pub(super) struct Indexed {
+    alloc: blaze_own::Alloc<'static>,
     /// Each (crate, bucket) filed, with its digest.
-    filed: HashMap<(usize, BucketKey), u64, Global>,
+    filed: HashMap<(usize, BucketKey), u64, blaze_own::Alloc<'static>>,
     /// Each crate whose unfiled list is filed, with the list's digest.
-    pub(super) unfiled: HashMap<usize, u64, Global>,
+    pub(super) unfiled: HashMap<usize, u64, blaze_own::Alloc<'static>>,
     /// The incoherent fact's digest, once `BucketIndex::crate_state` holds it.
     pub(super) incoherent: Option<u64>,
-    pub(super) trait_reads: HashMap<(ItemKey, Shape), TraitReads, Global>,
-    pub(super) inherent_reads: HashMap<Shape, Vec<BucketRead, Global>, Global>,
+    pub(super) trait_reads: HashMap<(ItemKey, Shape), TraitReads, blaze_own::Alloc<'static>>,
+    pub(super) inherent_reads: HashMap<Shape, Vec<BucketRead, Global>, blaze_own::Alloc<'static>>,
     /// How many impls were filed from a bucket: no impl row decoded, no text opened.
     pub(super) from_index: u32,
     /// How many (crate, bucket) were looked up in a crate's record ([`Buckets::bucket_lookups`]).
@@ -91,13 +92,14 @@ pub(super) struct Indexed {
 }
 
 impl Indexed {
-    pub(super) fn new() -> Indexed {
+    pub(super) fn new(alloc: blaze_own::Alloc<'static>) -> Indexed {
         Indexed {
-            filed: HashMap::new_in(Global),
-            unfiled: HashMap::new_in(Global),
+            alloc,
+            filed: HashMap::new_in(alloc),
+            unfiled: HashMap::new_in(alloc),
             incoherent: None,
-            trait_reads: HashMap::new_in(Global),
-            inherent_reads: HashMap::new_in(Global),
+            trait_reads: HashMap::new_in(alloc),
+            inherent_reads: HashMap::new_in(alloc),
             from_index: 0,
             lookups: 0,
             asks: 0,
@@ -130,8 +132,8 @@ fn first16(id: ContentId) -> u128 {
 /// fn item, a fn pointer, an opaque type, a closure, a trait object, a pattern type: an impl
 /// on one is unfiled or under "any"). Refused: a nominal type whose library key the key map
 /// and the records do not give.
-fn heads_of<'n, S: NamesSource<'n>>(names: S, keys: &Keys, shape: Shape) -> Result<Vec<(Head, Shape), Global>, ImplQuestionError> {
-    let mut out = Vec::new_in(Global);
+fn heads_of<'n, S: NamesSource<'n>>(names: S, keys: &Keys, shape: Shape, alloc: blaze_own::Alloc<'static>) -> Result<blaze_own::Vec<(Head, Shape), blaze_own::Alloc<'static>>, ImplQuestionError> {
+    let mut out = blaze_own::Vec::new_in(alloc);
     match shape {
         Shape::Bool | Shape::Char | Shape::Str | Shape::Int(_) | Shape::Uint(_) | Shape::Float(_) | Shape::AnyInt | Shape::AnyFloat => {
             for (name, _) in PRIMS.iter() {
@@ -202,14 +204,15 @@ impl BucketIndex {
         // The buckets asked of each crate, how an impl found in each is filed, and whether the
         // bucket is the "any" head's (where a self path the writer read to no constructor is:
         // `PathSelf`).
-        let mut wanted: Vec<(BucketKey, Under, bool), Global> = Vec::new_in(Global);
+        let alloc = self.indexed.alloc;
+        let mut wanted: blaze_own::Vec<(BucketKey, Under, bool), blaze_own::Alloc<'static>> = blaze_own::Vec::new_in(alloc);
         // The asked trait's crate (`PathSelf::Trait`).
         let mut trait_krate = None;
         let (trait_, shape) = match ask {
             Ask::Trait(t, shape) => (Some(t), shape),
             Ask::Inherent(shape) => (None, shape),
         };
-        let heads = heads_of(names, keys, shape)?;
+        let heads = heads_of(names, keys, shape, alloc)?;
         // A builtin the checker has no shape for is filed with no constructor (`file_row`).
         let shapeless = blaze_scope::BUILTIN_TYPES.iter().filter(|name| prim_shape(name).is_none()).filter_map(|name| blaze_scope::builtin_type(name)).map(|def| (Head::Named(def.key), None));
         let all_heads = heads.iter().map(|(head, of)| (*head, Some(*of))).chain(core::iter::once((Head::Any, None))).chain(shapeless);
@@ -240,7 +243,7 @@ impl BucketIndex {
             let unfiled = match self.indexed.unfiled.get(&krate).copied() {
                 Some(digest) => digest,
                 None => {
-                    let mut rows: Vec<(ImplRow<'n>, NotFiled), Global> = Vec::new_in(Global);
+                    let mut rows: blaze_own::Vec<(ImplRow<'n>, NotFiled), blaze_own::Alloc<'static>> = blaze_own::Vec::new_in(alloc);
                     // No record, or one that did not read: the source filed why.
                     let Some(digest) = names.unfiled(krate, &mut |row, why| rows.push((row, why))) else { continue };
                     filed += rows.len();
@@ -254,7 +257,7 @@ impl BucketIndex {
                 let digest = match self.indexed.filed.get(&(krate, *key)).copied() {
                     Some(digest) => digest,
                     None => {
-                        let mut got: Vec<BucketImpl, Global> = Vec::new_in(Global);
+                        let mut got: blaze_own::Vec<BucketImpl, blaze_own::Alloc<'static>> = blaze_own::Vec::new_in(alloc);
                         self.indexed.lookups += 1;
                         let Some(digest) = names.bucket(krate, key, &mut |it| got.push(it)) else { continue };
                         for it in got.iter() {
@@ -304,7 +307,7 @@ impl BucketIndex {
     /// [`Buckets::admit`] files a crate's rows: by the row (`file_row`: the reader's names
     /// resolve what the writer's did not), else by the header's text.
     fn file_unfiled<'n, S: NamesSource<'n>>(&mut self, names: S, krate: usize, rows: &[(ImplRow<'n>, NotFiled)]) {
-        let mut plain: Vec<ImplRow<'n>, Global> = Vec::with_capacity_in(rows.len(), Global);
+        let mut plain: blaze_own::Vec<ImplRow<'n>, blaze_own::Alloc<'static>> = blaze_own::Vec::with_capacity_in(rows.len(), self.indexed.alloc);
         for (row, why) in rows.iter() {
             self.indexed.not_filed[*why as usize] += 1;
             plain.push(*row);

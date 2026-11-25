@@ -648,14 +648,18 @@ fn write_at<'a>(bufs: &mut [PageBuf<'a>], bits: u8, name: Name, section: usize, 
 /// (for example, a cold workspace starting from a tiny `tool-base` with `bits = 0..2`). Writes
 /// directly into `1 << new_bits` [`PageBuf`]s via sorted 2-way merges without allocating
 /// per-entry intermediate `SVec`s. Returns `Ok(None)` if exact merged sizing still fits `last.bits`.
-fn try_repage<'a, 'g>(
+fn try_repage<'a, 'g, F>(
     kept: &Kept<'_>,
     last: &Root<'_>,
     source: &dyn StoredPages,
     work: &Work<'_>,
     get_record: &mut impl FnMut(Key) -> Got<'g>,
+    run_pages: &mut Option<F>,
     alloc: SharedAlloc<'a>,
-) -> Result<Option<Encoded<'a>>, PagesError> {
+) -> Result<Option<Encoded<'a>>, PagesError>
+where
+    F: FnOnce(&[PageJob<'_, '_>]) -> SVec<'a, PageBuilt<'a>>,
+{
     let mut old_pages: SVec<'a, &VerifiedPage<'_>> = SVec::with_capacity_in(usize::try_from(last.live_pages).unwrap_or(0), alloc);
     if !last.is_radix() {
         for (idx, &last_key) in last.pages.iter().enumerate() {
@@ -1088,25 +1092,29 @@ fn try_repage<'a, 'g>(
 
     root.bits = new_bits;
     root.bytes = 0;
-    let mut flat_pages = SVec::with_capacity_in(count, alloc);
-    let mut puts = SVec::new_in(alloc);
-    let mut records = SVec::new_in(alloc);
-    let mut live_pages = 0u32;
+    let mut jobs: SVec<'_, PageJob<'_, '_>> = SVec::with_capacity_in(count, alloc);
     for (index, buf) in bufs.iter().enumerate() {
         let idx_u32 = u32::try_from(index).unwrap_or(u32::MAX);
-        match buf.finish(new_bits, idx_u32, alloc) {
-            Some(bytes) => {
-                let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-                root.bytes = root.bytes.checked_add(len).ok_or(PagesError::Total { page: idx_u32, field: "page byte count" })?;
-                live_pages = live_pages.saturating_add(1);
-                let key = content_key(&bytes);
-                flat_pages.push(key);
-                let rec_bytes = buf.parts.get(RECORDS).map_or(&[][..], |part| part.as_slice());
-                let page_records = view::page_records(rec_bytes, alloc);
-                puts.push((key, bytes));
-                records.push((key, page_records));
+        jobs.push(PageJob { index: idx_u32, bits: new_bits, kind: PageJobKind::Repage { buf } });
+    }
+    let built = match run_pages.take() {
+        Some(run) => run(&jobs),
+        None => SVec::new_in(alloc),
+    };
+    let mut flat_pages = SVec::with_capacity_in(count, alloc);
+    flat_pages.resize(count, Key::default());
+    let mut puts = SVec::with_capacity_in(built.len(), alloc);
+    let mut records = SVec::with_capacity_in(built.len(), alloc);
+    let mut live_pages = 0u32;
+    for one in built {
+        if one.changed {
+            root.bytes = root.bytes.checked_add(one.new_len).ok_or(PagesError::Total { page: one.index, field: "page byte count" })?;
+            live_pages = live_pages.saturating_add(1);
+            if let Some(slot) = flat_pages.get_mut(usize::try_from(one.index).unwrap_or(usize::MAX)) {
+                *slot = one.key;
             }
-            None => flat_pages.push(Key::default()),
+            puts.push((one.key, one.bytes));
+            records.push((one.key, one.records));
         }
     }
     root.live_pages = live_pages;
@@ -1226,14 +1234,23 @@ fn merge_page<'a>(base: Option<&VerifiedPage<'_>>, change: &ChangedPage<'_>, bit
     (page, records)
 }
 
-/// One changed page ready to be merged and content-hashed independently of every other page
-/// ([`encode_changes_with`]).
+enum PageJobKind<'b, 'c> {
+    Merge {
+        base: Option<&'b VerifiedPage<'b>>,
+        change: &'c ChangedPage<'c>,
+        last_key: Key,
+    },
+    Repage {
+        buf: &'c PageBuf<'c>,
+    },
+}
+
+/// One changed or re-paged page ready to be encoded and content-hashed independently of every
+/// other page ([`encode_changes_radix`]).
 pub struct PageJob<'b, 'c> {
     index: u32,
-    base: Option<&'b VerifiedPage<'b>>,
-    change: &'c ChangedPage<'c>,
     bits: u8,
-    last_key: Key,
+    kind: PageJobKind<'b, 'c>,
 }
 
 /// The merged and hashed result of one [`PageJob`].
@@ -1248,19 +1265,41 @@ pub struct PageBuilt<'a> {
 }
 
 impl PageJob<'_, '_> {
-    /// Merge this page's base with its delta and compute its content key.
+    /// Merge or finalize this page and compute its content key.
     pub fn run<'a>(&self, alloc: SharedAlloc<'a>) -> PageBuilt<'a> {
-        let base_len = self.base.map_or(0, |p| u64::try_from(p.len()).unwrap_or(u64::MAX));
-        let (bytes, records) = merge_page(self.base, self.change, self.bits, self.index, alloc);
-        let new_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-        let key = if bytes.is_empty() { Key::default() } else { content_key(&bytes) };
-        let changed = key != Key::default() && key != self.last_key;
-        let (bytes, records) = if changed {
-            (bytes, records)
-        } else {
-            (SVec::new_in(alloc), SVec::new_in(alloc))
-        };
-        PageBuilt { index: self.index, base_len, new_len, key, bytes, records, changed }
+        match self.kind {
+            PageJobKind::Merge { base, change, last_key } => {
+                let base_len = base.map_or(0, |p| u64::try_from(p.len()).unwrap_or(u64::MAX));
+                let (bytes, records) = merge_page(base, change, self.bits, self.index, alloc);
+                let new_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                let key = if bytes.is_empty() { Key::default() } else { content_key(&bytes) };
+                let changed = key != Key::default() && key != last_key;
+                let (bytes, records) = if changed {
+                    (bytes, records)
+                } else {
+                    (SVec::new_in(alloc), SVec::new_in(alloc))
+                };
+                PageBuilt { index: self.index, base_len, new_len, key, bytes, records, changed }
+            }
+            PageJobKind::Repage { buf } => match buf.finish(self.bits, self.index, alloc) {
+                Some(bytes) => {
+                    let new_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                    let key = content_key(&bytes);
+                    let rec_bytes = buf.parts.get(RECORDS).map_or(&[][..], |part| part.as_slice());
+                    let records = view::page_records(rec_bytes, alloc);
+                    PageBuilt { index: self.index, base_len: 0, new_len, key, bytes, records, changed: true }
+                }
+                None => PageBuilt {
+                    index: self.index,
+                    base_len: 0,
+                    new_len: 0,
+                    key: Key::default(),
+                    bytes: SVec::new_in(alloc),
+                    records: SVec::new_in(alloc),
+                    changed: false,
+                },
+            },
+        }
     }
 }
 
@@ -1430,11 +1469,12 @@ where
     let answer = &kept.answer;
     let source = answer.stored().ok_or(PagesError::Base { serial: answer.serial })?;
     let work = answer.work().ok_or(PagesError::Base { serial: answer.serial })?;
+    let mut run_pages = Some(run_pages);
     let added = estimate_added_bytes(kept, work);
     let page_budget = blaze_drive::answers::PAGE_BYTES << last.bits.min(blaze_drive::answers::MOST_BITS);
     if added > page_budget / 2
         && blaze_drive::answers::bits_for(last.bytes.saturating_add(added)) > last.bits
-        && let Some(encoded) = try_repage(kept, last, source, work, &mut get_record, alloc)?
+        && let Some(encoded) = try_repage(kept, last, source, work, &mut get_record, &mut run_pages, alloc)?
     {
         return Ok(encoded);
     }
@@ -1542,9 +1582,12 @@ where
             let base = source.page_for(change.witness, Ask::Witness)?;
             let last_key = last.pages.get(usize::try_from(index).unwrap_or(usize::MAX)).copied().unwrap_or_default();
             if base.is_none() && last_key != Key::default() { return Err(PagesError::Missing { page: index, key: last_key }); }
-            jobs.push(PageJob { index, base, change, bits: last.bits, last_key });
+            jobs.push(PageJob { index, bits: last.bits, kind: PageJobKind::Merge { base, change, last_key } });
         }
-        let built = run_pages(&jobs);
+        let built = match run_pages.take() {
+            Some(run) => run(&jobs),
+            None => SVec::new_in(alloc),
+        };
         let mut puts = SVec::with_capacity_in(built.len() + 1, alloc);
         let mut records = SVec::with_capacity_in(built.len(), alloc);
         let mut page_deltas = SVec::with_capacity_in(built.len(), alloc);
@@ -1597,9 +1640,12 @@ where
             let (shard_idx, slot_idx) = Root::shard_of(usize::try_from(index).unwrap_or(usize::MAX));
             let last_key = touched_shards.get(&shard_idx).and_then(|s| s.keys.get(slot_idx)).copied().unwrap_or_default();
             if base.is_none() && last_key != Key::default() { return Err(PagesError::Missing { page: index, key: last_key }); }
-            jobs.push(PageJob { index, base, change, bits: last.bits, last_key });
+            jobs.push(PageJob { index, bits: last.bits, kind: PageJobKind::Merge { base, change, last_key } });
         }
-        let built = run_pages(&jobs);
+        let built = match run_pages.take() {
+            Some(run) => run(&jobs),
+            None => SVec::new_in(alloc),
+        };
         let mut puts = SVec::with_capacity_in(built.len() + touched_shards.len() + 4, alloc);
         let mut records = SVec::with_capacity_in(built.len(), alloc);
         let mut page_deltas = SVec::with_capacity_in(built.len(), alloc);

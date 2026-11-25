@@ -4601,6 +4601,17 @@ fn build_heads_overlay(
     Ok(overlay)
 }
 
+/// Shares `NamesWorld`'s already-populated command-scoped [`crate::body_types::SyncLazyTrees`]
+/// into `rq.bodies.kept` when `Names` built it lazily, so `Names`, `Heads`, and `Bodies` share
+/// ONE pack and checkout file cache instead of decompressing `core`/`alloc`/`std` packs again.
+fn share_names_trees(rq: &mut Drive<'_, '_, '_, '_, '_>) {
+    let Some(graph) = rq.graph else { return };
+    let Some(stage) = rq.names.as_ref() else { return };
+    let Some(names) = stage.names.as_ref() else { return };
+    let Some(packs) = names.made().and_then(crate::names::NamesWorld::lazy_trees) else { return };
+    rq.bodies.kept.share_lazy_trees(graph.out, packs, names.list(), rq.heap);
+}
+
 /// A Bodies phase: the crates' tables and frozen heads made ready, then the bodies checked;
 /// its run facts, in the phase's arena.
 #[inline(never)]
@@ -4619,6 +4630,7 @@ fn bodies_phase<'r, 'm, 'p>(
 ) -> Result<crate::engine_bodies::MadeFacts<'p>, CliError> {
     #[cfg(test)]
     stack_probe::at("bodies_phase");
+    share_names_trees(rq);
     let (cx, frame, alloc, heap, tools, planned) = (rq.cx, rq.frame, rq.alloc, rq.heap, rq.tools, rq.planned);
     let body_tool = tools.of(Name { kind: blaze_drive::Kind::BodyCheck, subject: blaze_ids::ContentId([0; 32]) });
     let handles = crate::engine_bodies::Handles { root: rq.root, env: rq.env, graph: rq.graph, names: rq.names.as_ref().map(crate::engine_names::NamesInputs::ran), outlined: rq.outlined, workers: rq.workers, clock: rq.phases.clock(), board: rq.board, tool: body_tool, scoped: rq.scoped };
@@ -5528,6 +5540,7 @@ fn ready_drive<'d, 'f, 'r, 's, 'w, 'm>(
     // request's error below.
     let names_missing: std::sync::OnceLock<Name> = std::sync::OnceLock::new();
     let names_stood = crate::engine_names::Stood { pages: stored, missing: &names_missing };
+    share_names_trees(rq);
     let names_inputs = rq.names.as_ref().map(|stage| crate::engine_names::NamesInputs::stood(stage, names_stood));
     let body_tool = tools.of(Name { kind: Kind::BodyCheck, subject: blaze_ids::ContentId([0; 32]) });
     let handles = crate::engine_bodies::Handles { root: rq.root, env, graph: rq.graph, names: names_inputs, outlined: rq.outlined, workers: rq.workers, clock: rq.phases.clock(), board: rq.board, tool: body_tool, scoped: rq.scoped };
@@ -5763,6 +5776,7 @@ fn heads_phase<'r, 'm, 'p, 'l>(
 ) -> Result<(), CliError> {
     #[cfg(test)]
     stack_probe::at("heads_phase");
+    share_names_trees(rq);
     let (cx, frame, alloc, heap, tools) = (rq.cx, rq.frame, rq.alloc, rq.heap, rq.tools);
     let body_tool = tools.of(Name { kind: blaze_drive::Kind::BodyCheck, subject: blaze_ids::ContentId([0; 32]) });
     let handles = crate::engine_bodies::Handles { root: rq.root, env: rq.env, graph: rq.graph, names: rq.names.as_ref().map(crate::engine_names::NamesInputs::ran), outlined: rq.outlined, workers: rq.workers, clock: rq.phases.clock(), board: rq.board, tool: body_tool, scoped: rq.scoped };

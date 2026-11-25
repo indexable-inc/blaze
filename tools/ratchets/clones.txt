@@ -14,7 +14,7 @@ blaze-build-script	22
 blaze-c	2
 blaze-cas	86
 blaze-check	7
-blaze-cli	73
+blaze-cli	69
 blaze-columns	29
 blaze-cond	3
 blaze-consteval	47

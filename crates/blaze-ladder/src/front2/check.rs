@@ -307,7 +307,7 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
     // maker `make_once` calls too (`Buckets::for_source`); over a lowering store the first impl
     // fill makes it, as before.
     if r.store.seeds.is_some() && r.buckets.is_none() {
-        *r.buckets = Some(Buckets::for_source(r.names, r.index));
+        *r.buckets = Some(Buckets::for_source_in(r.names, r.index, alloc));
     }
     // The body's gate (front2 asks.rs `Gate`): round 0's syntactic prefetch, before the walk.
     r.store.gate.borrow_mut().start(alloc);
@@ -423,9 +423,8 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
                 }
                 // The shared goals the finished round took (blaze-solve share.rs `GoalHit`): the
                 // one read each, which the body's result names (tables/task.rs).
-                let mut hits = Vec::with_capacity_in(cx.goal_hits().len(), Global);
-                hits.extend_from_slice(cx.goal_hits());
-                r.store.goal_hits = hits;
+                r.store.goal_hits.clear();
+                r.store.goal_hits.extend_from_slice(cx.goal_hits());
                 return Ok(done);
             }
             Outcome::Done(done) => {
@@ -2299,7 +2298,8 @@ fn make_once<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,fill: Fill) -> R
         Fill::Store(want) => r.store.ensure(r.names, r.keys, want).map_err(MakeFail::Head),
         Fill::Impls(trait_, shape, seen) => {
             let (names, index, order) = (r.names, r.index, r.order);
-            let b = &*r.buckets.get_or_insert_with(|| Buckets::for_source(names, index));
+            let alloc = r.store.tys.alloc();
+            let b = &*r.buckets.get_or_insert_with(|| Buckets::for_source_in(names, index, alloc));
             let mut heads = Lowering { names, keys: &mut *r.keys, store: &mut *r.store };
             match trait_question(names, &mut heads, b, trait_, shape, seen, order)? {
                 Made::Made => Ok(()),
@@ -2308,7 +2308,8 @@ fn make_once<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,fill: Fill) -> R
         }
         Fill::Inherent(shape, name) => {
             let (names, index, order) = (r.names, r.index, r.order);
-            let b = &*r.buckets.get_or_insert_with(|| Buckets::for_source(names, index));
+            let alloc = r.store.tys.alloc();
+            let b = &*r.buckets.get_or_insert_with(|| Buckets::for_source_in(names, index, alloc));
             let mut heads = Lowering { names, keys: &mut *r.keys, store: &mut *r.store };
             match inherent_question(names, &mut heads, b, shape, name, order)? {
                 Made::Made => Ok(()),
