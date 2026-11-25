@@ -1,11 +1,14 @@
 //! APC: kitty graphics and the glyph protocol (vt-inventory.md section 9; ghostty's
 //! `src/terminal/kitty/graphics_*.zig`, `apc.zig`, `apc/glyph/*`).
 
+pub mod apc;
 pub mod command;
 pub mod exec;
+pub mod glyph;
 pub mod image;
 mod num;
 pub mod storage;
+pub mod unicode;
 
 /// A reply's bytes, built in place: the longest kitty or glyph reply fits.
 #[derive(Clone, Copy, PartialEq, Eq)]
