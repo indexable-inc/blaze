@@ -681,3 +681,101 @@ fn builtin_assert_with_message_files_its_expansion_block_modules() {
     // `without_msg`'s `assert!(x > K)` writes none.
     assert_eq!(expansion_blocks, 2, "expected 2 expansion block modules for `assert!` with message");
 }
+
+/// Out-of-line `#[path = "..."] mod` and nested inline `mod` inside function blocks of a
+/// non-`mod.rs` file (`getrandom 0.4`'s `src/backends/linux_android_with_fallback.rs` writes
+/// `#[path = "../utils/lazy_ptr.rs"] mod lazy;` inside `pub fn fill_inner`), plus a macro-written
+/// `#[path = "sub"] mod inline_m` and a block inside an `include!`d file.
+///
+/// Decoys are planted at the buggy paths (`src/backends/linux_android/__blaze_block_0/...`,
+/// `src/backends/linux_android/utils/...`, `src/backends/linux_android/inline_m/...`,
+/// `src/backends/linux_android/sub/...`, `src/backends/helper.rs`) so only the exact `rustc`
+/// resolution rules bind the expected items with zero `FileNotFound` notes.
+const BLOCK_PATH_LIB: &str = "#![no_core]
+#[rustc_builtin_macro]
+macro_rules! include { () => {} }
+pub mod backends {
+    pub mod linux_android;
+}
+";
+
+const BLOCK_PATH_LINUX: &str = "
+pub trait Marker {}
+
+pub fn fill_inner() {
+    #[path = \"../utils/lazy_ptr.rs\"]
+    mod lazy;
+    impl Marker for lazy::LazyPtr {}
+    {
+        #[path = \"../utils/lazy_ptr.rs\"]
+        mod lazy2;
+        impl Marker for lazy2::LazyPtr {}
+    }
+    mod inline_m {
+        #[path = \"a.rs\"]
+        pub mod a;
+    }
+    impl Marker for inline_m::a::InlineTarget {}
+}
+
+macro_rules! make_inline_path {
+    () => {
+        #[path = \"sub\"]
+        pub mod sub_m {
+            #[path = \"b.rs\"]
+            pub mod b;
+        }
+    };
+}
+make_inline_path!();
+pub use sub_m::b::SubTarget;
+
+include!(\"../inc/inc.rs\");
+";
+
+static BLOCK_PATH_TEXTS: Texts = Texts(&[&[
+    ("/user/src/lib.rs", BLOCK_PATH_LIB),
+    ("/user/src/backends/linux_android.rs", BLOCK_PATH_LINUX),
+    // Real targets per rustc:
+    ("/user/src/utils/lazy_ptr.rs", "pub struct LazyPtr;\n"),
+    ("/user/src/backends/inline_m/a.rs", "pub struct InlineTarget;\n"),
+    ("/user/src/backends/sub/b.rs", "pub struct SubTarget;\n"),
+    ("/user/src/inc/inc.rs", "pub fn from_inc() {\n    #[path = \"helper.rs\"]\n    mod h;\n    impl Marker for h::IncTarget {}\n}\n"),
+    ("/user/src/inc/helper.rs", "pub struct IncTarget;\n"),
+    // Decoys at the wrong paths (old buggy dir joining):
+    ("/user/src/backends/linux_android/utils/lazy_ptr.rs", "pub struct WrongLazy;\n"),
+    ("/user/src/backends/linux_android/__blaze_block_0/utils/lazy_ptr.rs", "pub struct WrongBlockLazy;\n"),
+    ("/user/src/backends/linux_android/inline_m/a.rs", "pub struct WrongInline;\n"),
+    ("/user/src/backends/linux_android/sub/b.rs", "pub struct WrongSub;\n"),
+    ("/user/src/backends/helper.rs", "pub struct WrongInc;\n"),
+]]);
+
+#[test]
+fn block_and_macro_path_mods_resolve_against_path_dir() {
+    let mut user = input("user", "/user/src/lib.rs", &[]);
+    user.shown_from = "/user/";
+    let names = resolve_crates(&[user], Sysroot::default(), &BLOCK_PATH_TEXTS, &Serial, super::SyncFrame::leaked())
+        .unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let notes = std::format!("{:?}", names.notes(0));
+    assert!(!notes.contains("FileNotFound"), "all block/macro #[path] mods must be found: {notes}");
+
+    let lazy_imp = impl_ending(&names, 0, "Markerforlazy::LazyPtr");
+    assert_eq!(named_in(&names, lazy_imp, &["lazy", "LazyPtr"]), 0);
+
+    let lazy2_imp = impl_ending(&names, 0, "Markerforlazy2::LazyPtr");
+    assert_eq!(named_in(&names, lazy2_imp, &["lazy2", "LazyPtr"]), 0);
+
+    let inline_imp = impl_ending(&names, 0, "Markerforinline_m::a::InlineTarget");
+    assert_eq!(named_in(&names, inline_imp, &["inline_m", "a", "InlineTarget"]), 0);
+
+    let inc_imp = impl_ending(&names, 0, "Markerforh::IncTarget");
+    assert_eq!(named_in(&names, inc_imp, &["h", "IncTarget"]), 0);
+
+    let sub_ok = names.item_at(
+        names.root(0),
+        Namespace::Types,
+        Written { kind: PathKind::Plain, segments: &["backends", "linux_android", "SubTarget"] },
+        Alloc::global(),
+    );
+    assert!(sub_ok.is_ok(), "macro-written #[path = \"sub\"] inline mod should resolve SubTarget: {sub_ok:?}");
+}

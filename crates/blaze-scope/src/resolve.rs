@@ -4191,15 +4191,26 @@ fn expand_call<'a, S: SourceTexts<'a>>(
     // outlined and lowered).
     let mods = core::mem::replace(&mut out.mods_made, AVec::new_in(home));
     let mut bodies = core::mem::replace(&mut out.bodies, AVec::new_in(home));
-    if !mods.is_empty() {
-        part(ExpandPart::Modules, mac.name, mods.len());
-        // An `include!`'s file is the current file of what it writes ([`crate::included`]): a
-        // `mod x;` in it is found from the INCLUDED file's folder, not the calling module's.
-        let included_dir: Option<&'a str> = included.map(|path| {
+    // An `include!`'s file is the current file of what it writes ([`crate::included`]): a
+    // `mod x;` at its top or inside a body at its top is found from the INCLUDED file's folder,
+    // not the calling module's. Bodies lowered inside modules that `make_modules` creates below
+    // already inherit that folder from their own made module's `dir`/`path_dir`.
+    let included_dir: Option<&'a str> = if !mods.is_empty() || !bodies.is_empty() {
+        included.map(|path| {
             let mut dir = AString::from_str_in(path, alloc);
             pop_dir(&mut dir);
             keep(&dir, home_bump)
-        });
+        })
+    } else {
+        None
+    };
+    if included_dir.is_some() {
+        for body in bodies.iter_mut() {
+            body.included_dir = included_dir;
+        }
+    }
+    if !mods.is_empty() {
+        part(ExpandPart::Modules, mac.name, mods.len());
         let place = Made {
             text,
             outline: &made.outline,
@@ -4462,7 +4473,7 @@ fn make_blocks<'a, S: SourceTexts<'a>>(
         };
         let mut out = lower_in(LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false, harness: false, order: base.sources.attr_order() }, fragment, scratch, bump);
         let mods = core::mem::replace(&mut out.mods_made, AVec::new_in(scratch));
-        let place = Made { text, outline: &made.outline, at: Where::Expansion(body.loc), place: At::Expansion(call), dir: None, written: body.written, marks, tokens: frag_tokens };
+        let place = Made { text, outline: &made.outline, at: Where::Expansion(body.loc), place: At::Expansion(call), dir: body.included_dir, written: body.written, marks, tokens: frag_tokens };
         {
             let mut places = held(run.block_places.lock(), "block places");
             for m in mods.iter() {
@@ -4807,7 +4818,20 @@ fn make_modules<'c, 'a, S: SourceTexts<'a>>(
             _ => (dir.as_str(), path_dir.as_str()),
         };
         let (fragment_of, item, mdir, mpdir): (Made<'c, 'a>, Option<ItemIndex>, &'a str, &'a str) = if m.inline {
-            let d = keep(&joined(dir, &[m.path_attr.unwrap_or(m.name)], scratch), bump);
+            // A block's synthetic module (`__blaze_block_*`) is an anonymous scope, never a folder
+            // segment: rustc (`DirectoryOwnership::UnownedViaBlock`) resolves both `#[path]` and
+            // nested inline modules inside a block against the enclosing module's `path_dir`.
+            // For a real inline module, `#[path]` resolves against `path_dir` and a bare `mod m`
+            // against `dir`, matching `walk` (`task/lower.rs`).
+            let d = if crate::blocks::is_block_module(m.name) {
+                keep(path_dir, bump)
+            } else {
+                let d = match m.path_attr {
+                    Some(p) => joined(path_dir, &[p], scratch),
+                    None => joined(dir, &[m.name], scratch),
+                };
+                keep(&d, bump)
+            };
             (made, Some(m.item), d, d)
         } else {
             let sub = keep(&joined(dir, &[m.name], scratch), bump);

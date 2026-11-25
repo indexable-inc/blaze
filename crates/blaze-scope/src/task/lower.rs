@@ -1991,6 +1991,10 @@ pub struct BodySrc<'t> {
     pub loc: Loc,
     /// The file its text is written in ([`CallSrc::written`]): what its block modules' calls read from.
     pub written: &'t str,
+    /// The folder of the file an `include!` read this body from (`None` for a body written in a
+    /// module's own file or inside a module made from an included file): where a `#[path]` or
+    /// inline `mod` inside the body's blocks resolves from, matching `Made::dir`.
+    pub included_dir: Option<&'t str>,
     /// How many expansions (and bodies) deep its text is.
     pub depth: u16,
     /// Where it is written: the fragment (its owner's key: the module's own text, or a call's
@@ -2043,6 +2047,7 @@ impl<'t> BodySrc<'t> {
             text,
             loc,
             written,
+            included_dir: None,
             depth,
             place,
             marks,
