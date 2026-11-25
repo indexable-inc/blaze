@@ -1879,6 +1879,197 @@ fn a_panicking_make_fails_alone_and_the_next_one_makes() {
     std::println!("code worker: a panicked make failed alone");
 }
 
+/// Bounded worker `Frame` reclamation: across many suites exceeding a tight `Frame` reserve,
+/// `drive_with_frame` reclaims the frame on soft budget / LRU eviction / `forget` without ever
+/// exhausting the reserve; retries a warm-frame OOM panic once on a freshly reset empty frame;
+/// isolates a deterministic cold-frame panic without infinite retry; and isolates a panic inside
+/// `KeptMakers::shown` (rule 20: never crashes the worker task).
+#[test]
+fn worker_frame_reclaims_across_many_suites_and_recovers_from_oom_and_shown_panics() {
+    use crate::test_drive::{KeptMakers, MakerFactory, Makers, MakersPlant, drive_with_frame, make_one_or_retry};
+    use crate::test_loop::SuiteId;
+
+    struct DummyMaker(blaze_ladder::run::special::MakerKind);
+    impl crate::test_drive::MadeFor for DummyMaker {
+        fn made_for(&self) -> blaze_ladder::run::special::MakerKind {
+            self.0
+        }
+        fn set_direct_entry(&mut self, _: Option<ItemKey>, _: blaze_ladder::run::special::MakerStart) -> bool {
+            true
+        }
+    }
+
+    struct BoundedSuiteMakers<'f> {
+        frame: &'f bstd::mem::Frame,
+        makers: Makers<DummyMaker>,
+        reset_needed: bool,
+        reset_at: usize,
+        evict_reset_at: usize,
+        alloc_bytes: &'f dyn Fn(u32) -> usize,
+        panic_suite: Option<u32>,
+        panic_shown_suite: Option<u32>,
+        rebuilds: &'f Cell<usize>,
+    }
+
+    impl KeptMakers for BoundedSuiteMakers<'_> {
+        fn make(&mut self, job: &crate::test_drive::Job<'static>, entry: &mut AVec<'_, u8>) -> Result<(), crate::test_drive::Unmade> {
+            let suite = job.suite.0;
+            if self.panic_suite == Some(suite) {
+                panic!("deterministic cold-frame panic on suite {suite}");
+            }
+            if self.panic_shown_suite == Some(suite) {
+                let tabled = job.order.tabled;
+                return Err(blaze_ladder::body_ids::WalkError::Make {
+                    tabled,
+                    why: blaze_ladder::run::RunError::OneBody { key: tabled, why: "refusal triggering shown panic" },
+                });
+            }
+            let bytes = (self.alloc_bytes)(suite);
+            let _ = self.makers.of(job, || Ok(DummyMaker(blaze_ladder::run::special::MakerKind::of(job.entry, job.start))))?;
+            // Allocate into the worker's bounded frame just as `names_in` + `Front2` do.
+            let slice = self.frame.alloc_uninit_slice::<u8>(bytes);
+            assert_eq!(slice.len(), bytes);
+            entry.extend_from_slice(&suite.to_le_bytes());
+            Ok(())
+        }
+
+        fn forget(&mut self, suite: SuiteId) {
+            self.makers.forget(suite);
+            self.reset_needed = true;
+        }
+
+        fn shown(&mut self, job: &crate::test_drive::Job<'static>, _refusal: &mut CodeRefusal) {
+            if self.panic_shown_suite == Some(job.suite.0) {
+                panic!("simulated Unserved OOM panic inside shown()");
+            }
+        }
+
+        fn needs_reset(&self) -> bool {
+            let used = self.frame.used();
+            self.reset_needed || used >= self.reset_at || (self.makers.evicted() && used >= self.evict_reset_at)
+        }
+
+        fn is_warm(&self) -> bool {
+            self.frame.used() > 0
+        }
+    }
+
+    struct Factory<'a> {
+        alloc_bytes: &'a dyn Fn(u32) -> usize,
+        reset_at: usize,
+        evict_reset_at: usize,
+        panic_suite: Option<u32>,
+        panic_shown_suite: Option<u32>,
+        rebuilds: &'a Cell<usize>,
+        heap: &'static blaze_own::Heap,
+    }
+
+    impl<'a> MakerFactory for Factory<'a> {
+        type Makers<'f> = BoundedSuiteMakers<'f>
+        where
+            Self: 'f;
+
+        fn build<'f>(&'f self, frame: &'f bstd::mem::Frame) -> BoundedSuiteMakers<'f> {
+            self.rebuilds.set(self.rebuilds.get() + 1);
+            BoundedSuiteMakers {
+                frame,
+                makers: Makers::new(self.heap.alloc(), MakersPlant::None),
+                reset_needed: false,
+                reset_at: self.reset_at,
+                evict_reset_at: self.evict_reset_at,
+                alloc_bytes: self.alloc_bytes,
+                panic_suite: self.panic_suite,
+                panic_shown_suite: self.panic_shown_suite,
+                rebuilds: self.rebuilds,
+            }
+        }
+    }
+
+    let heap = blaze_own::testing::heap();
+
+    // 1. 20 suites * 256 KiB = 5 MiB total through a 2 MiB bounded Frame: reclaims cleanly without OOM.
+    let mut frame = bstd::mem::Frame::with_reserve(2 << 20, bstd::mem::Tag::Other).expect("2 MiB bounded frame");
+    let rebuilds = Cell::new(0usize);
+    let alloc_256k = |_suite: u32| 256 << 10;
+    let factory = Factory {
+        alloc_bytes: &alloc_256k,
+        reset_at: 1 << 20,
+        evict_reset_at: 512 << 10,
+        panic_suite: None,
+        panic_shown_suite: None,
+        rebuilds: &rebuilds,
+        heap,
+    };
+    let mut suite_iter = (0u32..20).map(|s| {
+        let mut job = toy_job(MAIN, MAIN);
+        job.suite = SuiteId(s);
+        job
+    });
+    let mut results = std::vec::Vec::new();
+    drive_with_frame(
+        &mut frame,
+        0,
+        &factory,
+        || Ok(suite_iter.next()),
+        |res| {
+            results.push(res);
+            Ok(())
+        },
+        |job, makers, scratch, allow_retry| make_one_or_retry(makers, job, scratch, heap.shared(), allow_retry),
+        heap,
+    )
+    .expect("20 suites through 2 MiB bounded frame must succeed without OOM");
+    assert_eq!(results.len(), 20);
+    assert!(results.iter().all(|r| r.is_ok()), "every suite must succeed after frame reclamation");
+    assert!(rebuilds.get() >= 4, "frame must have reset multiple times across 5 MiB of allocations (rebuilds={})", rebuilds.get());
+
+    // 2. Warm-frame OOM recovery + cold-frame deterministic panic + shown() panic isolation.
+    let mut frame2 = bstd::mem::Frame::with_reserve(2 << 20, bstd::mem::Tag::Other).expect("2 MiB bounded frame");
+    let rebuilds2 = Cell::new(0usize);
+    // Suite 0 takes 1 MiB (warms frame below 1.8 MiB soft cap); suite 1 takes 1.4 MiB (exceeds
+    // remaining 1 MiB -> panics on warm frame -> resets -> retries once on empty 2 MiB frame -> succeeds!);
+    // suite 2 panics deterministically even on a fresh frame -> fails alone as PANICKED;
+    // suite 3 returns Err and panics inside shown() -> isolated refusal, triggers reset;
+    // suite 4 succeeds cleanly afterward.
+    let alloc_mixed = |suite: u32| if suite == 1 { 1400 << 10 } else { 1024 << 10 };
+    let factory2 = Factory {
+        alloc_bytes: &alloc_mixed,
+        reset_at: 1800 << 10,
+        evict_reset_at: 1800 << 10,
+        panic_suite: Some(2),
+        panic_shown_suite: Some(3),
+        rebuilds: &rebuilds2,
+        heap,
+    };
+    let mut mixed_iter = (0u32..5).map(|s| {
+        let mut job = toy_job(MAIN, MAIN);
+        job.suite = SuiteId(s);
+        job
+    });
+    let mut mixed_results = std::vec::Vec::new();
+    drive_with_frame(
+        &mut frame2,
+        0,
+        &factory2,
+        || Ok(mixed_iter.next()),
+        |res| {
+            mixed_results.push(res);
+            Ok(())
+        },
+        |job, makers, scratch, allow_retry| make_one_or_retry(makers, job, scratch, heap.shared(), allow_retry),
+        heap,
+    )
+    .expect("worker loop must survive warm-frame OOM, cold panic, and shown() panic");
+    assert_eq!(mixed_results.len(), 5);
+    assert!(mixed_results[0].is_ok(), "suite 0 warms frame");
+    assert!(mixed_results[1].is_ok(), "suite 1 recovers from warm-frame OOM via single retry on fresh frame");
+    let err2 = mixed_results[2].as_ref().expect_err("suite 2 deterministic panic fails alone");
+    assert!(err2.walk.as_str().contains("panicked on its code worker"), "suite 2 refusal names panic: {err2}");
+    let err3 = mixed_results[3].as_ref().expect_err("suite 3 refusal survives shown() panic");
+    assert!(err3.walk.as_str().contains("refusal triggering shown panic"), "suite 3 preserves refusal: {err3}");
+    assert!(mixed_results[4].is_ok(), "suite 4 succeeds on clean frame after shown() panic reset");
+}
+
 #[test]
 fn publish_precomputed_emits_bytes_declare_data_publish_and_answers_later_needs_without_resolving() {
     let frame = bstd::mem::Frame::with_reserve(1 << 18, bstd::mem::Tag::Other).expect("frame");

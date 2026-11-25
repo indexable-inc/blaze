@@ -770,13 +770,13 @@ impl<'n> SharedTrees<'n> {
         SharedTrees { packs, fs, dirs, seen }
     }
 
-    pub(crate) fn tree(&self, cx: &Cx, scratch: &Frame, k: usize) -> Option<PackView<'static>> {
-        match self.packs.open_tree_with(cx, self.fs, Some(self.dirs), scratch, k) {
-            Some((view, newly_opened)) => {
+    fn open_cached(&self, cx: &Cx, scratch: &Frame, k: usize) -> Option<&'static CachedPack> {
+        match self.packs.open_cached(cx, self.fs, Some(self.dirs), scratch, k) {
+            Some((pack, newly_opened)) => {
                 if newly_opened {
                     self.seen.opened.set(self.seen.opened.get() + 1);
                 }
-                Some(view)
+                Some(pack)
             }
             None => {
                 if let Some(why) = self.packs.refused()
@@ -787,6 +787,24 @@ impl<'n> SharedTrees<'n> {
                 None
             }
         }
+    }
+
+    pub(crate) fn tree(&self, cx: &Cx, scratch: &Frame, k: usize) -> Option<PackView<'static>> {
+        self.open_cached(cx, scratch, k).map(|pack| pack.view)
+    }
+
+    /// Reads file `path` of immutable pack `k` as UTF-8 text from the command-wide cache
+    /// (zero bytes allocated in `scratch`, zero repeat Zstd decode across workers/suites).
+    pub(crate) fn read_str(&self, cx: &Cx, scratch: &Frame, k: usize, path: &str) -> Option<&'static str> {
+        let pack = self.open_cached(cx, scratch, k)?;
+        pack.get_or_load(cx, path, self.packs.heap.shared())?.as_str()
+    }
+
+    /// Reads file `path` of immutable pack `k` as raw bytes from the command-wide cache
+    /// (zero bytes allocated in `scratch`, zero repeat Zstd decode across workers/suites).
+    pub(crate) fn read_slice(&self, cx: &Cx, scratch: &Frame, k: usize, path: &str) -> Option<&'static [u8]> {
+        let pack = self.open_cached(cx, scratch, k)?;
+        pack.get_or_load(cx, path, self.packs.heap.shared())?.as_bytes()
     }
 
     pub(crate) fn refused(&self) -> Option<&'static str> {
