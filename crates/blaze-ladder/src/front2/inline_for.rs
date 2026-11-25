@@ -657,7 +657,7 @@ fn extract_enum_variants<'n, 'a, S: NamesSource<'n>>(
     let Some(it) = r.names.text_of(lib) else {
         return Err(EnumRenderError::NoSourceText);
     };
-    let Ok(low) = super::heads::lower(r.names, lib, it.text) else {
+    let Ok(low) = super::heads::lower_alloc(r.names, lib, it.text, r.store.tys.alloc()) else {
         return Err(EnumRenderError::HeadLowerFailed);
     };
     let head_view = low.view();
@@ -765,7 +765,7 @@ fn spell_enum_prefix<'n, 'a, S: NamesSource<'n>>(
                 return Some(EnumPrefix::Anchored(s));
             }
             if let Some((lib, text)) = orig_lib_text
-                && let Ok(low) = super::heads::lower(r.names, lib, text)
+                && let Ok(low) = super::heads::lower_alloc(r.names, lib, text, r.store.tys.alloc())
             {
                 let head_view = low.view();
                 if let Ok(spell) = Spelling::of(&head_view)
@@ -947,7 +947,7 @@ fn extract_fields<'n, 'a, S: NamesSource<'n>>(
                     let Some(it) = r.names.text_of(lib) else {
                         return IterKind::NotIterable("named struct has no source text");
                     };
-                    let Ok(low) = super::heads::lower(r.names, lib, it.text) else {
+                    let Ok(low) = super::heads::lower_alloc(r.names, lib, it.text, r.store.tys.alloc()) else {
                         return IterKind::NotIterable("named struct head did not lower");
                     };
                     let head_view = low.view();

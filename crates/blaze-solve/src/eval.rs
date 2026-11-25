@@ -1526,13 +1526,30 @@ impl<'a, E: Emit> Solver<'a, E> {
             }
             rs.clear();
             let mut const_holds = false;
+            let mut local_read = false;
             for &id in self.inputs.reads_of(&n.entry) {
                 let read = self.reads.read(id);
-                const_holds |= matches!(read.question, Question::ConstHolds(..));
+                match read.question {
+                    Question::ConstHolds(..) => const_holds = true,
+                    // An opaque's hidden type (and its digest when read inside its defining body)
+                    // and any closure/coroutine impl bucket depend on the asking body's scope:
+                    // never put into the shared table, lest another body replay reads that sort
+                    // before the scope mismatch (rules 21, 25).
+                    Question::Opaque(_)
+                    | Question::OpaqueHidden(_)
+                    | Question::Impls(_, crate::term::Shape::Closure(_) | crate::term::Shape::Coroutine(_)) => {
+                        local_read = true;
+                    }
+                    _ => {}
+                }
                 rs.push(read);
             }
             if const_holds {
                 self.count_refused(Refuse::ConstHolds);
+                continue;
+            }
+            if local_read {
+                self.count_refused(Refuse::Local);
                 continue;
             }
             rs.sort_unstable();

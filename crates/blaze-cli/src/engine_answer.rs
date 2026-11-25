@@ -1751,7 +1751,7 @@ fn save<'m, D: Driver, S: Sharing>(
         ..Saved::default()
     };
     for (at, (key, bytes)) in encoded.puts.iter().enumerate() {
-        store.put(cx, *key, bytes)?;
+        store.put_local(cx, *key, bytes)?;
         saved.puts += 1;
         if at < task_puts {
             let len = bytes.len() as u64;
@@ -1782,7 +1782,7 @@ fn save<'m, D: Driver, S: Sharing>(
     }
     saved.new_headers = writes.len() as u32;
     for (key, bytes) in &writes {
-        store.put(cx, *key, bytes)?;
+        store.put_local(cx, *key, bytes)?;
         saved.puts += 1;
     }
     drop(writes);
@@ -1790,7 +1790,7 @@ fn save<'m, D: Driver, S: Sharing>(
     // Empty bytes signal that `ViewSlot::render` already proved `lines.0` is held in the store
     // and skipped re-encoding it; `direct` below still pins `lines.0` under `{name}.answer`.
     if !lines.1.is_empty() {
-        store.put(cx, lines.0, lines.1)?;
+        store.put_local(cx, lines.0, lines.1)?;
         saved.puts += 1;
     }
     let leaves = Leaves::bytes_in(rows, frame)?;
@@ -1822,7 +1822,7 @@ fn save<'m, D: Driver, S: Sharing>(
     journal.encode(&mut pointer);
     let sealed = seal::seal(&pointer, &leaves, frame)?;
     let key = Key(ContentId::of(POINTER_DOMAIN, &sealed));
-    store.put(cx, key, &sealed)?;
+    store.put_local(cx, key, &sealed)?;
     saved.puts += 1;
     saved.pointer_key = key;
     saved.lines_key = lines.0;
@@ -1830,11 +1830,17 @@ fn save<'m, D: Driver, S: Sharing>(
     // A page and the payloads of *every* row on it share one immutable reach index.
     // StoreSink also includes each names payload's expansion index and its children.
     // The store follows exactly one index level from an indexed root.
-    use crate::engine_answer_rows::{AnswerSink as _, StoreSink};
+    use crate::engine_answer_rows::StoreSink;
     let mut sink = StoreSink { cx, store, lent, toolchain };
     let mut records = blaze_own::Vec::new_in(alloc);
     let mut scopes = blaze_own::Vec::new_in(alloc);
     let mut toolchain_records = blaze_own::Vec::new_in(alloc);
+    let mut cas_buf: blaze_own::Vec<blaze_cas::Key, SharedAlloc<'_>> = blaze_own::Vec::new_in(alloc);
+    let mut indexed_beside: BesideCache<'_> = blaze_hash::Map::new(blaze_hash::MapOpts {
+        hasher: blaze_hash::BuildKeyHasher::default(),
+        alloc,
+        capacity: Some(task_puts),
+    });
     for (page, rows) in encoded.page_records() {
         records.clear();
         scopes.clear();
@@ -1848,7 +1854,8 @@ fn save<'m, D: Driver, S: Sharing>(
                 toolchain_records.push(record);
             }
         }
-        sink.index_rows(page, &records, &scopes, alloc.into()).map_err(reach_error)?;
+        let beside = sink.index_rows_into(page, &records, &scopes, &mut cas_buf).map_err(reach_error)?;
+        indexed_beside.insert(page.0.0, beside);
         saved.puts += 1;
     }
     let reach_name = bstd::mem::format_in!(frame, "{name}.{REACH_ROOT}");
@@ -1858,7 +1865,7 @@ fn save<'m, D: Driver, S: Sharing>(
             (Some(base), Some(key)) if !base.root.is_radix() => Some((&base.root.pages[..], key)),
             _ => None,
         };
-        let (indexes, rekeyed) = page_indexes(lent, (reach_name.as_str(), answer_name.as_str()), last_pages, &encoded.pages, rekey, alloc)?;
+        let (indexes, rekeyed) = page_indexes(lent, (reach_name.as_str(), answer_name.as_str()), last_pages, &encoded.pages, rekey, Some(&indexed_beside), alloc)?;
         let count = u32::try_from(indexes.len()).unwrap_or(u32::MAX);
         lent.root_through(reach_name.as_str(), &indexes, blaze_cas::plain::ROOT_LIFE_NS).map_err(crate::store::PlaceError::from)?;
         // Retire any stale sharded reach roots left over if this answer previously exceeded the
@@ -1879,6 +1886,7 @@ fn save<'m, D: Driver, S: Sharing>(
             answer_name.as_str(),
             ReachSource::Radix { last: last_info, encoded: &encoded },
             rekey,
+            Some(&indexed_beside),
             alloc,
             frame,
         )?
@@ -1951,7 +1959,7 @@ fn keep_base<'m, D: Driver, S: Sharing>(cx: &Cx, store: &mut CommandStore<'m, '_
     let bases = with_base(&bases, now, frame);
     let bytes = encode_bases(&bases, frame);
     let record = Key(ContentId::of(BASES_DOMAIN, &bytes));
-    store.put(cx, record, &bytes)?;
+    store.put_local(cx, record, &bytes)?;
     store.pin(BASES_ROOT, &[record])?;
     let mut pointers = blaze_own::Vec::with_capacity_in(bases.len(), frame);
     pointers.extend(bases.iter().map(|it| it.pointer));
@@ -2293,7 +2301,7 @@ fn keep_toolchain_base<'m, D: Driver, S: Sharing>(
         return Err(error);
     }
     for (key, bytes) in encoded.puts.iter() {
-        store.put(cx, *key, bytes)?;
+        store.put_local(cx, *key, bytes)?;
     }
     let mut tc_hdr_err: Option<CliError> = None;
     let (headers, writes) = Headers::after_with(None, &tc_kept, Writer::Phases, tc_kept.answer.serial, HeadersPlant::None, |_| Ok(None), alloc, |jobs| {
@@ -2309,10 +2317,10 @@ fn keep_toolchain_base<'m, D: Driver, S: Sharing>(
         return Err(error);
     }
     for (key, bytes) in &writes {
-        store.put(cx, *key, bytes)?;
+        store.put_local(cx, *key, bytes)?;
     }
     let (empty_lines_key, empty_lines_bytes) = crate::engine_lines::Lines::new_in(alloc).record();
-    store.put(cx, empty_lines_key, &empty_lines_bytes)?;
+    store.put_local(cx, empty_lines_key, &empty_lines_bytes)?;
     let empty_rows = Rows::new_in(frame);
     let leaves = Leaves::bytes_in(&empty_rows, frame)?;
     let mut pointer: blaze_own::Vec<u8, &Frame> = blaze_own::Vec::with_capacity_in(POINTER_BYTES, frame);
@@ -2343,11 +2351,17 @@ fn keep_toolchain_base<'m, D: Driver, S: Sharing>(
     crate::journal_sweep::Stored::encode_units(core::iter::empty(), None, &mut pointer);
     let sealed = seal::seal(&pointer, &leaves, frame)?;
     let ptr_key = Key(ContentId::of(POINTER_DOMAIN, &sealed));
-    store.put(cx, ptr_key, &sealed)?;
-    use crate::engine_answer_rows::{AnswerSink as _, StoreSink};
+    store.put_local(cx, ptr_key, &sealed)?;
+    use crate::engine_answer_rows::StoreSink;
     let mut sink = StoreSink { cx, store, lent, toolchain };
     let mut records = blaze_own::Vec::new_in(alloc);
     let mut scopes = blaze_own::Vec::new_in(alloc);
+    let mut cas_buf: blaze_own::Vec<blaze_cas::Key, SharedAlloc<'_>> = blaze_own::Vec::new_in(alloc);
+    let mut indexed_beside: BesideCache<'_> = blaze_hash::Map::new(blaze_hash::MapOpts {
+        hasher: blaze_hash::BuildKeyHasher::default(),
+        alloc,
+        capacity: Some(usize::try_from(encoded.task_puts).unwrap_or(0)),
+    });
     for (page, page_rows) in encoded.page_records() {
         records.clear();
         scopes.clear();
@@ -2358,18 +2372,25 @@ fn keep_toolchain_base<'m, D: Driver, S: Sharing>(
                 scopes.push((name, record));
             }
         }
-        sink.index_rows(page, &records, &scopes, alloc.into()).map_err(reach_error)?;
+        let beside = sink.index_rows_into(page, &records, &scopes, &mut cas_buf).map_err(reach_error)?;
+        indexed_beside.insert(page.0.0, beside);
     }
+    let index_of = |p: Key| {
+        indexed_beside
+            .get(&p.0.0)
+            .copied()
+            .unwrap_or_else(|| blaze_cas::plain::beside_key(blaze_cas::Key(p.0)))
+    };
     let mut page_idx = blaze_own::Vec::new_in(alloc);
     if !encoded.is_radix() {
-        page_idx.extend(encoded.pages.iter().filter(|p| **p != Key::default()).map(|p| blaze_cas::plain::beside_key(blaze_cas::Key(p.0))));
+        page_idx.extend(encoded.pages.iter().filter(|p| **p != Key::default()).map(|p| index_of(*p)));
     } else {
         for (shard_idx, &shard_key) in encoded.page_shards.iter().enumerate() {
             if shard_key == Key::default() {
                 continue;
             }
             let shard = decode_lent_radix_shard(lent, shard_key, shard_idx, encoded.bits, alloc)?;
-            page_idx.extend(shard.keys.iter().filter(|p| **p != Key::default()).map(|p| blaze_cas::plain::beside_key(blaze_cas::Key(p.0))));
+            page_idx.extend(shard.keys.iter().filter(|p| **p != Key::default()).map(|p| index_of(*p)));
         }
     }
     page_idx.sort_unstable();
@@ -2406,7 +2427,12 @@ fn cas_key_at(bytes: &[u8], at: usize) -> blaze_cas::Key {
     blaze_cas::Key(ContentId(bytes[at * 32..at * 32 + 32].try_into().expect("a whole key")))
 }
 
-/// Decodes one radix leaf shard already stored (in arena or committed segment) in `lent`.
+/// Cache of newly indexed pages' `beside_key` digests so reach-root construction avoids
+/// recomputing BLAKE3 over pages just indexed in the same `save()` call.
+type BesideCache<'a> = blaze_hash::Map<[u8; 32], blaze_cas::Key, blaze_hash::BuildKeyHasher, SharedAlloc<'a>>;
+
+/// Decodes one radix leaf shard already stored (in arena or committed segment) in `lent` without
+/// lending its bytes (never pins an uncommitted shared arena) or re-hashing store-proved bytes.
 fn decode_lent_radix_shard<'a, D: Driver>(
     lent: &blaze_cas::plain::Lent<D, crate::store::StoreAlloc>,
     shard_key: Key,
@@ -2414,13 +2440,12 @@ fn decode_lent_radix_shard<'a, D: Driver>(
     bits: u8,
     alloc: SharedAlloc<'a>,
 ) -> Result<pages::RadixShard<'a>, CliError> {
-    let held = lent
-        .get(&blaze_cas::Key(shard_key.0))
-        .map_err(crate::store::PlaceError::from)?
-        .ok_or_else(|| page_error(PagesError::Missing { page: pages::ROOT_PAGE, key: shard_key }))?;
     let shard_u32 = u32::try_from(shard_idx).unwrap_or(u32::MAX);
-    let sealed = Sealed::hashed(shard_key, held.bytes).map_err(|torn| page_error(torn.at(pages::ROOT_PAGE)))?;
-    pages::decode_radix_shard(sealed, shard_u32, bits, alloc).map_err(page_error)
+    crate::store::plain_place::lent_with_checked(lent, shard_key, |bytes, proof| {
+        pages::decode_radix_shard(Sealed::by_store(shard_key, bytes, proof), shard_u32, bits, alloc)
+    })?
+    .ok_or_else(|| page_error(PagesError::Missing { page: pages::ROOT_PAGE, key: shard_key }))?
+    .map_err(page_error)
 }
 
 #[cfg(test)]
@@ -2529,9 +2554,14 @@ fn merge_carried_indexes<'h>(
     old: &[Key],
     now: &[Key],
     last_root: Key,
+    known_beside: Option<&BesideCache<'_>>,
     alloc: SharedAlloc<'h>,
 ) -> Result<(blaze_own::Vec<blaze_cas::Key, SharedAlloc<'h>>, u32), CliError> {
-    let index_of = |page: Key| blaze_cas::plain::beside_key(blaze_cas::Key(page.0));
+    let index_of = |page: Key| {
+        known_beside
+            .and_then(|map| map.get(&page.0.0).copied())
+            .unwrap_or_else(|| blaze_cas::plain::beside_key(blaze_cas::Key(page.0)))
+    };
     let mut out: blaze_own::Vec<blaze_cas::Key, SharedAlloc<'h>> = blaze_own::Vec::new_in(alloc);
     let mut into: blaze_own::Vec<blaze_cas::Key, SharedAlloc<'h>> = blaze_own::Vec::new_in(alloc);
     let mut pages = 0u32;
@@ -2581,9 +2611,14 @@ fn page_indexes<'h, D: Driver>(
     last: Option<(&[Key], Key)>,
     now: &[Key],
     rekey: Rekey,
+    known_beside: Option<&BesideCache<'_>>,
     alloc: SharedAlloc<'h>,
 ) -> Result<(blaze_own::Vec<blaze_cas::Key, SharedAlloc<'h>>, Rekeyed), CliError> {
-    let index_of = |page: Key| blaze_cas::plain::beside_key(blaze_cas::Key(page.0));
+    let index_of = |page: Key| {
+        known_beside
+            .and_then(|map| map.get(&page.0.0).copied())
+            .unwrap_or_else(|| blaze_cas::plain::beside_key(blaze_cas::Key(page.0)))
+    };
     let whole = |why: WhyWhole| {
         let mut indexes = blaze_own::Vec::new_in(alloc);
         indexes.extend(now.iter().filter(|page| **page != Key::default()).map(|page| index_of(*page)));
@@ -2596,7 +2631,7 @@ fn page_indexes<'h, D: Driver>(
         Err(why) => return whole(why),
     };
     let Some(carried) = held_root_bytes(lent, names.0)? else { return whole(WhyWhole::NoRoot) };
-    let (indexes, pages) = merge_carried_indexes(carried, old, now, last_root, alloc)?;
+    let (indexes, pages) = merge_carried_indexes(carried, old, now, last_root, known_beside, alloc)?;
     Ok((indexes, Rekeyed { pages, whole: None }))
 }
 
@@ -2668,10 +2703,15 @@ fn publish_reach_shards_from<D: Driver>(
     answer_name: &str,
     source: ReachSource<'_>,
     rekey: Rekey,
+    known_beside: Option<&BesideCache<'_>>,
     alloc: SharedAlloc<'_>,
     frame: &Frame,
 ) -> Result<(u32, Rekeyed), CliError> {
-    let index_of = |page: Key| blaze_cas::plain::beside_key(blaze_cas::Key(page.0));
+    let index_of = |page: Key| {
+        known_beside
+            .and_then(|map| map.get(&page.0.0).copied())
+            .unwrap_or_else(|| blaze_cas::plain::beside_key(blaze_cas::Key(page.0)))
+    };
     let (last_info, now_len, total_live) = match source {
         #[cfg(test)]
         ReachSource::Flat { last, now } => (
@@ -2859,7 +2899,7 @@ fn publish_reach_shards<D: Driver>(
     alloc: SharedAlloc<'_>,
     frame: &Frame,
 ) -> Result<(u32, Rekeyed), CliError> {
-    publish_reach_shards_from(lent, name, answer_name, ReachSource::Flat { last, now }, rekey, alloc, frame)
+    publish_reach_shards_from(lent, name, answer_name, ReachSource::Flat { last, now }, rekey, None, alloc, frame)
 }
 
 /// Appends any live sharded reach root names (`{name}.reach.00`..`{name}.reach.7f` and
@@ -3209,7 +3249,7 @@ mod reach_shard_tests {
         let (live1, rekey1) = publish_reach_shards_from(
             &lent, "big", "big.answer",
             ReachSource::Radix { last: None, encoded: &enc_v1 },
-            Rekey::Changed, alloc, frame,
+            Rekey::Changed, None, alloc, frame,
         ).expect("publish cold radix reach shards");
         assert_eq!(live1, enc_v1.live_pages);
         assert_eq!(rekey1.whole, Some(WhyWhole::NoLast));
@@ -3311,7 +3351,7 @@ mod reach_shard_tests {
         let (live2, rekey2) = publish_reach_shards_from(
             &lent, "big", "big.answer",
             ReachSource::Radix { last: Some((dir_v1.page_count(), enc_v1.root)), encoded: &enc_v2 },
-            Rekey::Changed, alloc, frame,
+            Rekey::Changed, None, alloc, frame,
         ).expect("publish incremental radix reach shards");
         let probes_delta = lent.put_tally().disk.root_probes - probes_before;
         assert_eq!(live2, enc_v2.live_pages);

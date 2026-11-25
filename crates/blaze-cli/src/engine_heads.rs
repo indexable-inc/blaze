@@ -428,18 +428,23 @@ fn scope_crates_labels<'n>(crates: crate::run_names::ScopeCrates<'_, 'n>, frame:
     }
 }
 
-/// Sorted index of `outlined` by physical checkout path for O(log N) lookup by path.
-fn outlined_by_path<'o>(outlined: &'o [Outlined<'_>], g: Alloc<'static>) -> Vec<(&'o [u8], usize), Alloc<'static>> {
-    let mut index: Vec<(&'o [u8], usize), Alloc<'static>> = Vec::with_capacity_in(outlined.len(), g);
-    index.extend(outlined.iter().enumerate().map(|(at, one)| (one.path.as_slice(), at)));
-    index.sort_unstable_by_key(|(path, at)| (*path, *at));
+/// Hash index of `outlined` by physical checkout path for O(1) lookup by path.
+fn outlined_by_path<'o>(outlined: &'o [Outlined<'_>], g: Alloc<'static>) -> blaze_hash::Map<&'o [u8], usize, blaze_hash::FixedState, Alloc<'static>> {
+    let mut index: blaze_hash::Map<&'o [u8], usize, blaze_hash::FixedState, Alloc<'static>> =
+        blaze_hash::Map::new(blaze_hash::MapOpts { hasher: blaze_hash::FixedState, alloc: g, capacity: Some(outlined.len()) });
+    for (at, one) in outlined.iter().enumerate() {
+        index.entry(one.path.as_slice()).or_insert(at);
+    }
     index
 }
 
 /// First outline in `outlined` whose path equals `path`, via [`outlined_by_path`].
-fn find_outlined<'o, 'a>(outlined: &'o [Outlined<'a>], by_path: &[(&[u8], usize)], path: &[u8]) -> Option<&'o Outlined<'a>> {
-    let at = by_path.partition_point(|(p, _)| *p < path);
-    by_path.get(at).filter(|(p, _)| *p == path).and_then(|(_, idx)| outlined.get(*idx))
+fn find_outlined<'o, 'a, 'p>(
+    outlined: &'o [Outlined<'a>],
+    by_path: &blaze_hash::Map<&'p [u8], usize, blaze_hash::FixedState, Alloc<'static>>,
+    path: &'p [u8],
+) -> Option<&'o Outlined<'a>> {
+    by_path.get(&path).and_then(|&idx| outlined.get(idx))
 }
 
 /// The cells a refusal over crate `at`'s check scope is a function of (plan row A8): the
@@ -665,7 +670,10 @@ impl HeadsStage {
                 }
             }
         }
-        let closed_worked = self.run_items(&cx, store, read, handles, kept, &items, view, buffer, times, alloc, at_phase, frame, snapshot, &snapshot_owner, &mut scope_cache, &closed_jobs, at_cells, lazy_snap.as_ref(), heads_lazy, once)?;
+        let mut by_path: Option<blaze_hash::Map<&[u8], usize, blaze_hash::FixedState, Alloc<'static>>> = None;
+        let mut phase_subjects: SVec<'p, Subject> = SVec::new_in(at_phase);
+        let mut loaded_prefixes: Vec<[u8; 8], Alloc<'static>> = Vec::new_in(g);
+        let closed_worked = self.run_items(&cx, store, read, handles, kept, &items, view, buffer, times, alloc, at_phase, frame, snapshot, &snapshot_owner, &mut scope_cache, &closed_jobs, at_cells, lazy_snap.as_ref(), heads_lazy, once, &mut by_path, &mut phase_subjects, &mut loaded_prefixes)?;
         if tasks.is_empty() {
             return Ok(());
         }
@@ -768,12 +776,14 @@ impl HeadsStage {
             }
         }
         // Source text belongs to its outline under either names-read strategy; only member crates
-        // appearing in the active jobs' scopes can ever be queried by `Owners::place`.
-        let subjects = match !jobs.is_empty() {
-            true => member_subjects(cache, read, &cx, store, names, &list, handles.outlined, &jobs, heap),
-            false => SVec::new_in(heap.shared()),
+        // appearing in the active jobs' scopes can ever be queried by `Owners::place`. Reuse any
+        // member subjects and path index already built in `run_items` for this phase.
+        let subjects: &Subjects = if !jobs.is_empty() {
+            member_subjects(cache, read, &cx, store, names, &list, handles.outlined, &jobs, &mut by_path, &mut phase_subjects, &mut loaded_prefixes, heap);
+            &phase_subjects[..]
+        } else {
+            &[]
         };
-        let subjects = &subjects[..];
         let lazy = heads_lazy.get_or_insert_with(|| crate::front_load::ScopeRecords::new(lazy_snap.as_ref(), CrateGraph::len(&list), heap));
         let lazy_before = lazy.counts();
         let scope_records = HeadsScopeRecords::new(cache, lazy, CrateGraph::len(&list), heap);
@@ -985,10 +995,9 @@ const IMPL_SLOW_WEIGHT: usize = 8;
 const IMPL_SLOW_CHUNK: usize = 8;
 const IMPL_FAST_CHUNK: usize = 32;
 
-/// Predicted impl-row cost for LPT dispatch of `ImplBucket` jobs (O(1) header read).
+/// Predicted impl-row cost for LPT dispatch of `ImplBucket` jobs (O(1) verified header read).
 fn impl_job_weight(job: &Job<'_>, g: Alloc<'static>) -> usize {
-    ItemsRecord::open(job.own_crate.records.items, g)
-        .map_or(job.own_crate.records.items.len(), |record| record.impls())
+    ItemsRecord::from_verified(job.own_crate.records.items_proof, g).impls()
 }
 
 /// Whether an impl row is likely to take the slow `from_text` header-lowering path.
@@ -1569,15 +1578,27 @@ impl HeadJobs {
 /// (its records reopened, its tables and lang index, its recorders) is small beside its tasks.
 const JOBS_A_WORKER: usize = 4;
 
-/// Oversized single-file split threshold: a file with at least this many head tasks AND more than
-/// twice the per-job target splits into balanced chunks of at least [`LARGE_FILE_CHUNK`] tasks so
-/// single mega-files scale across up to 128 cores instead of serializing on one core.
+/// Oversized single-file split thresholds:
+/// - `LARGE_FILE_MIN_TASKS` / `LARGE_FILE_CHUNK`: unweighted counts for [`file_splits`].
+/// - `LARGE_FILE_MIN_WEIGHT` / `LARGE_FILE_CHUNK_WEIGHT`: work-weighted thresholds for
+///   [`weighted_file_splits`] (where each task weighs `1 + heads + calls`). A plain function
+///   weighs `2`, so `96` keeps small/medium whole files intact while splitting mega-files and
+///   derive-heavy/impl-heavy files across 18 and 128 cores.
 const LARGE_FILE_MIN_TASKS: usize = 64;
 const LARGE_FILE_CHUNK: usize = 32;
+const LARGE_FILE_MIN_WEIGHT: usize = 96;
+const LARGE_FILE_CHUNK_WEIGHT: usize = 48;
 
 /// The requested number of jobs. A crate gets its share of `workers * JOBS_A_WORKER`
 /// proportionally to its share of the phase's tasks. [`file_splits`] chooses the actual cuts.
 pub(crate) fn split_count(split: HeadSplit, tasks: usize, total: usize, workers: usize) -> usize {
+    split_count_weighted(split, tasks, tasks, total, workers)
+}
+
+/// Work-weighted version of [`split_count`]: under [`HeadSplit::Rule`], allocates a crate's
+/// share of `workers * JOBS_A_WORKER` proportionally to `crate_weight / total_weight`, clamped
+/// to `1..=tasks`.
+fn split_count_weighted(split: HeadSplit, tasks: usize, crate_weight: usize, total_weight: usize, workers: usize) -> usize {
     if tasks == 0 {
         return 0;
     }
@@ -1585,12 +1606,15 @@ pub(crate) fn split_count(split: HeadSplit, tasks: usize, total: usize, workers:
         HeadSplit::Jobs(n) => usize::try_from(n.get()).unwrap_or(usize::MAX).min(tasks),
         #[cfg(test)]
         HeadSplit::Even(n) => usize::try_from(n.get()).unwrap_or(usize::MAX).min(tasks),
-        HeadSplit::Rule => workers.saturating_mul(JOBS_A_WORKER).saturating_mul(tasks).div_ceil(total.max(tasks)).clamp(1, tasks),
+        HeadSplit::Rule => {
+            let denom = total_weight.max(crate_weight).max(1);
+            workers.saturating_mul(JOBS_A_WORKER).saturating_mul(crate_weight).div_ceil(denom).clamp(1, tasks)
+        }
     }
 }
 
 /// Greedily take the longest prefix of whole files within `limit`. A file larger than
-/// `target` stands alone unless it exceeds [`LARGE_FILE_MIN_TASKS`] and `2 * target` (with
+/// `target` stands alone unless it reaches [`LARGE_FILE_MIN_TASKS`] and exceeds `target` (with
 /// `split_large` enabled), in which case it is cut into balanced chunks of `target.max(LARGE_FILE_CHUNK)`.
 fn greedy_file_splits(files: &[usize], target: usize, limit: usize, split_large: bool) -> impl Iterator<Item = core::ops::Range<usize>> + '_ {
     let mut files = files.iter().copied().peekable();
@@ -1605,7 +1629,7 @@ fn greedy_file_splits(files: &[usize], target: usize, limit: usize, split_large:
         let start = end;
         let first = files.next()?;
         end += first;
-        if split_large && first >= LARGE_FILE_MIN_TASKS && first > target.saturating_mul(2) {
+        if split_large && first >= LARGE_FILE_MIN_TASKS && first > target {
             let chunk = target.max(LARGE_FILE_CHUNK);
             let pieces = first.div_ceil(chunk);
             let balanced = first.div_ceil(pieces);
@@ -1623,7 +1647,7 @@ fn greedy_file_splits(files: &[usize], target: usize, limit: usize, split_large:
 }
 
 /// Fill toward the target, `ceil(tasks / requested)`, in sorted file order. Whole files stay whole
-/// unless a single oversized file exceeds [`LARGE_FILE_MIN_TASKS`] and `2 * target` with
+/// unless a single oversized file reaches [`LARGE_FILE_MIN_TASKS`] and exceeds `target` with
 /// `requested > 1`, unlocking 128-core parallelism on mega-files.
 pub(crate) fn file_splits(files: &[usize], tasks: usize, requested: usize) -> impl Iterator<Item = core::ops::Range<usize>> + '_ {
     let target = tasks.div_ceil(requested.max(1));
@@ -1632,6 +1656,100 @@ pub(crate) fn file_splits(files: &[usize], tasks: usize, requested: usize) -> im
     let mut limit = target;
     if files.len() > requested && runs(limit).count() > requested {
         let mut upper = target.saturating_add(files.iter().copied().max().unwrap_or(0)).min(tasks);
+        let budget = requested.max(runs(upper).count());
+        while limit < upper {
+            let mid = limit + (upper - limit) / 2;
+            if runs(mid).count() <= budget {
+                upper = mid;
+            } else {
+                limit = mid + 1;
+            }
+        }
+    }
+    runs(limit)
+}
+
+/// Greedily groups whole files by work weight within `limit`. A single oversized file whose weight
+/// reaches [`LARGE_FILE_MIN_WEIGHT`] and exceeds `target` (with `split_large` enabled and more than
+/// one task) splits along per-task weight boundaries targeting `target.max(LARGE_FILE_CHUNK_WEIGHT)`
+/// so mega-files and derive/impl-heavy files fan out across cores without straggler tails.
+fn greedy_weighted_splits<'a>(
+    files: &'a [(usize, usize)],
+    task_weights: &'a [usize],
+    target: usize,
+    limit: usize,
+    split_large: bool,
+) -> impl Iterator<Item = (core::ops::Range<usize>, usize)> + 'a {
+    let mut files = files.iter().copied().peekable();
+    let mut end = 0usize;
+    let mut pending: Option<(usize, usize, usize)> = None;
+    core::iter::from_fn(move || {
+        if let Some((cur, file_end, budget)) = pending {
+            let mut next_end = cur.saturating_add(1).min(file_end);
+            let mut weight = task_weights.get(cur).copied().unwrap_or(1);
+            while next_end < file_end {
+                let next_w = task_weights.get(next_end).copied().unwrap_or(1);
+                if weight.saturating_add(next_w) <= budget {
+                    weight = weight.saturating_add(next_w);
+                    next_end = next_end.saturating_add(1);
+                } else {
+                    break;
+                }
+            }
+            pending = (next_end < file_end).then_some((next_end, file_end, budget));
+            return Some((cur..next_end, weight));
+        }
+        let start = end;
+        let (first_len, first_weight) = files.next()?;
+        end = end.saturating_add(first_len);
+        if split_large && first_len > 1 && first_weight >= LARGE_FILE_MIN_WEIGHT && first_weight > target {
+            let chunk = target.max(LARGE_FILE_CHUNK_WEIGHT);
+            let pieces = first_weight.div_ceil(chunk).min(first_len).max(1);
+            let budget = first_weight.div_ceil(pieces);
+            let mut first_end = start.saturating_add(1).min(end);
+            let mut weight = task_weights.get(start).copied().unwrap_or(1);
+            while first_end < end {
+                let next_w = task_weights.get(first_end).copied().unwrap_or(1);
+                if weight.saturating_add(next_w) <= budget {
+                    weight = weight.saturating_add(next_w);
+                    first_end = first_end.saturating_add(1);
+                } else {
+                    break;
+                }
+            }
+            pending = (first_end < end).then_some((first_end, end, budget));
+            return Some((start..first_end, weight));
+        }
+        let mut total_weight = first_weight;
+        if first_weight <= target {
+            while let Some(&(next_len, next_weight)) = files.peek() {
+                if next_weight <= target && total_weight.saturating_add(next_weight) <= limit {
+                    files.next();
+                    end = end.saturating_add(next_len);
+                    total_weight = total_weight.saturating_add(next_weight);
+                } else {
+                    break;
+                }
+            }
+        }
+        Some((start..end, total_weight))
+    })
+}
+
+/// Fill toward the weight target `ceil(total_weight / requested)` in sorted file order.
+fn weighted_file_splits<'a>(
+    files: &'a [(usize, usize)],
+    task_weights: &'a [usize],
+    total_weight: usize,
+    requested: usize,
+) -> impl Iterator<Item = (core::ops::Range<usize>, usize)> + 'a {
+    let target = total_weight.div_ceil(requested.max(1));
+    let split_large = requested > 1;
+    let runs = |limit| greedy_weighted_splits(files, task_weights, target, limit, split_large);
+    let mut limit = target;
+    if files.len() > requested && runs(limit).count() > requested {
+        let max_file_weight = files.iter().map(|&(_, weight)| weight).max().unwrap_or(0);
+        let mut upper = target.saturating_add(max_file_weight).min(total_weight);
         let budget = requested.max(runs(upper).count());
         while limit < upper {
             let mid = limit + (upper - limit) / 2;
@@ -2900,17 +3018,20 @@ pub(crate) fn names_read(view: View<'_, '_>, id: CellId) -> CellId {
 /// there). A member whose records do not open lists no file: its heads are then placed as a
 /// dependency's (its record whole), never missed.
 #[expect(clippy::too_many_arguments, reason = "phase-level member subjects lookup over active jobs")]
-fn member_subjects<'r>(
+fn member_subjects<'r, 'p, 'h>(
     cache: &mut HeadsScopeCache<'r>,
     read: &mut EngineRecords<'r>,
     cx: &Cx,
     store: &mut dyn crate::store::Store<'r>,
     names: crate::engine_names::NamesInputs<'_, '_>,
     list: &blaze_world::crate_list::CrateList<'static>,
-    outlined: &[Outlined<'_>],
+    outlined: &'h [Outlined<'_>],
     jobs: &[Job<'r>],
+    by_path_slot: &mut Option<blaze_hash::Map<&'h [u8], usize, blaze_hash::FixedState, Alloc<'static>>>,
+    subjects: &mut SVec<'p, Subject>,
+    loaded_prefixes: &mut Vec<[u8; 8], Alloc<'static>>,
     heap: &'static blaze_own::Heap,
-) -> SVec<'static, Subject> {
+) {
     let g = heap.alloc();
     let mut members: Vec<usize, Alloc<'static>> = Vec::new_in(g);
     for job in jobs.iter() {
@@ -2925,29 +3046,36 @@ fn member_subjects<'r>(
     }
     members.sort_unstable();
     members.dedup();
-    let mut subjects = SVec::new_in(heap.shared());
+    members.retain(|&member| loaded_prefixes.binary_search(&list.key(member).prefix()).is_err());
     if members.is_empty() {
-        return subjects;
+        return;
     }
-    let by_path = outlined_by_path(outlined, g);
+    let by_path = &*by_path_slot.get_or_insert_with(|| outlined_by_path(outlined, g));
+    let mut added = false;
     for member in members.iter().copied() {
         // A member whose own records cannot be read lists no file here (its heads placed as a
         // dependency's, coarser, never missed); its typed cause is printed by the refusal of
         // that member's own head tasks and bodies.
         let Ok((_, own_records)) = cache.records_of(read, cx, store, names, list, member, g) else { continue };
-        let Ok(items) = ItemsRecord::open(own_records.items, g) else { continue };
+        let items = ItemsRecord::from_verified(own_records.items_proof, g);
         let prefix = list.key(member).prefix();
+        loaded_prefixes.push(prefix);
         for file in 0..u32::try_from(items.files()).unwrap_or(u32::MAX) {
             let Ok(Some(row)) = items.file_surface(file) else { continue };
             let Some(path) = row.path.in_package(list.shown_from(member), g) else { continue };
             let Some(path) = path.strip_prefix("/0/") else { continue };
-            if let Some(one) = find_outlined(outlined, &by_path, path.as_bytes()) {
+            if let Some(one) = find_outlined(outlined, by_path, path.as_bytes()) {
                 subjects.push(Subject::new(prefix, file, one));
+                added = true;
             }
         }
     }
-    subjects.sort_unstable();
-    subjects
+    loaded_prefixes.sort_unstable();
+    loaded_prefixes.dedup();
+    if added {
+        subjects.sort_unstable();
+        subjects.dedup();
+    }
 }
 
 /// One member crate's head tasks, made over its check scope's records (its own opened; every
@@ -3164,12 +3292,12 @@ impl HeadsStage {
     /// `buffer`. Overlaps any closed-dep `ImplBucket` jobs (`closed_jobs`) onto the same worker
     /// scope so closed-dep impl tables execute concurrently with `HeadsSetup` and `HeadsSplit`.
     #[expect(clippy::too_many_arguments, reason = "a phase's edge: each argument one handle of it")]
-    fn run_items<'a, 'p, 'r, 'l>(
+    fn run_items<'a, 'p, 'r, 'l, 'h>(
         &mut self,
         cx: &Cx,
         store: &mut dyn crate::store::Store<'r>,
         read: &mut EngineRecords<'r>,
-        handles: &Handles<'_, '_, '_, '_>,
+        handles: &Handles<'h, '_, '_, '_>,
         kept: &mut Kept,
         tasks: &[Task],
         view: View<'_, 'a>,
@@ -3186,6 +3314,9 @@ impl HeadsStage {
         lazy_snap: &'l crate::store::StoreSnapshot,
         heads_lazy: &mut Option<crate::front_load::ScopeRecords<'l>>,
         once: &crate::engine_heads_once::HeadsOnce,
+        by_path_slot: &mut Option<blaze_hash::Map<&'h [u8], usize, blaze_hash::FixedState, Alloc<'static>>>,
+        subjects: &mut SVec<'p, Subject>,
+        loaded_subjects: &mut Vec<[u8; 8], Alloc<'static>>,
     ) -> Result<Vec<ClosedWorked, Alloc<'static>>, CliError> {
         let heap = handles.env.heap;
         let g = heap.alloc();
@@ -3244,10 +3375,8 @@ impl HeadsStage {
         task_files.extend(tasks.iter().map(|task| task.planned.file));
         task_files.sort_unstable();
         task_files.dedup();
-        let by_path = outlined_by_path(handles.outlined, g);
-        let mut subjects = SVec::new_in(at_phase);
+        let by_path = &*by_path_slot.get_or_insert_with(|| outlined_by_path(handles.outlined, g));
         let mut jobs: std::vec::Vec<ItemJob<'r>, Global> = std::vec::Vec::new_in(Global);
-        let mut loaded_subjects: Vec<[u8; 8], Alloc<'static>> = Vec::new_in(g);
         let mut unvisited_members: Vec<usize, Alloc<'static>> = Vec::new_in(g);
         // Built lazily only if a task's file is in no member crate's items record, avoiding
         // probing `view.cell` for every standing member crate on normal incremental edits.
@@ -3261,6 +3390,8 @@ impl HeadsStage {
         let mut unread_count = 0u32;
         // Deduplicated cfg-blind module tree walks by crate root (lib + test share one root).
         let mut reached_roots: Vec<(Name, Vec<Name, Alloc<'static>>, bool), Alloc<'static>> = Vec::new_in(g);
+        let mut reached_root_index: blaze_hash::Map<Name, usize, blaze_hash::FixedState, Alloc<'static>> =
+            blaze_hash::Map::new(blaze_hash::MapOpts { hasher: blaze_hash::FixedState, alloc: g, capacity: None });
         // Each reaching member unit's cfg-blind walk index (only units whose walk reaches at least
         // one task file can ever match `task.planned.file`).
         let mut walks: Vec<(Name, [u8; 8], usize), Alloc<'static>> = Vec::new_in(g);
@@ -3270,7 +3401,7 @@ impl HeadsStage {
                 let Ok(Some(row)) = items.file_surface(file) else { continue };
                 let Some(path) = row.path.in_package(list.shown_from(member), g) else { continue };
                 let Some(path) = path.strip_prefix("/0/") else { continue };
-                if let Some(one) = find_outlined(handles.outlined, &by_path, path.as_bytes()) {
+                if let Some(one) = find_outlined(handles.outlined, by_path, path.as_bytes()) {
                     if task_files.binary_search(&one.name).is_ok() {
                         matched_task_file = true;
                     }
@@ -3294,13 +3425,21 @@ impl HeadsStage {
             let root_name = Name::file(root.strip_prefix("/0/").unwrap_or(root).as_bytes());
             let scope_name = blaze_drive::key::crate_scope_name(&list.key(member));
             let prefix = list.key(member).prefix();
-            let (reach_idx, reaches_any) = match reached_roots.iter().enumerate().find(|(_, (r, _, _))| *r == root_name) {
-                Some((idx, &(_, _, reaches_any))) => (idx, reaches_any),
+            let (reach_idx, reaches_any) = match reached_root_index.get(&root_name).copied() {
+                Some(idx) => {
+                    let reaches_any = reached_roots.get(idx).is_some_and(|(_, _, any)| *any);
+                    (idx, reaches_any)
+                }
                 None => {
                     let reach = crate::engine_body_plan::reached(handles.outlined, root_name, g).map_err(EngineCheckError::Unoutlined)?;
-                    let reaches_any = task_files.iter().any(|file| reach.binary_search(file).is_ok());
+                    let reaches_any = if task_files.len() <= reach.len() {
+                        task_files.iter().any(|file| reach.binary_search(file).is_ok())
+                    } else {
+                        reach.iter().any(|file| task_files.binary_search(file).is_ok())
+                    };
                     let idx = reached_roots.len();
                     reached_roots.push((root_name, reach, reaches_any));
+                    reached_root_index.insert(root_name, idx);
                     (idx, reaches_any)
                 }
             };
@@ -3320,13 +3459,8 @@ impl HeadsStage {
             };
             let cells = scope_cells(graph.name, &list, member, Some(&scope), shared);
             let cut_words = scope.cut_cause(&list).map(|cause| crate::engine_head_notes::leak(g, format_args!("its crate's {cause}")));
-            let Ok(items) = ItemsRecord::open(scope.own.records.items, g) else {
-                every_member_read = false;
-                unread_count = unread_count.saturating_add(1);
-                unread.get_or_insert_with(|| crate::engine_head_notes::leak(g, format_args!("the items record of crate `{}` does not open (blaze-scope items_record.rs `ItemsRecord::open`)", CrateGraph::name(&list, member))));
-                continue;
-            };
-            let _ = push_member_subjects(&mut subjects, member, prefix, &items);
+            let items = ItemsRecord::from_verified(scope.own.records.items_proof, g);
+            let _ = push_member_subjects(subjects, member, prefix, &items);
             loaded_subjects.push(prefix);
             jobs.push(make_job(prefix, scope, whole, cut_words, cells));
         }
@@ -3350,18 +3484,13 @@ impl HeadsStage {
                         continue;
                     }
                 };
-                let Ok(items) = ItemsRecord::open(own_records.items, g) else {
-                    every_member_read = false;
-                    unread_count = unread_count.saturating_add(1);
-                    unread.get_or_insert_with(|| crate::engine_head_notes::leak(g, format_args!("the items record of crate `{}` does not open (blaze-scope items_record.rs `ItemsRecord::open`)", CrateGraph::name(&list, member))));
-                    continue;
-                };
+                let items = ItemsRecord::from_verified(own_records.items_proof, g);
                 let mut holds_task_file = false;
                 for file in 0..u32::try_from(items.files()).unwrap_or(u32::MAX) {
                     let Ok(Some(row)) = items.file_surface(file) else { continue };
                     let Some(path) = row.path.in_package(list.shown_from(member), g) else { continue };
                     let Some(path) = path.strip_prefix("/0/") else { continue };
-                    if find_outlined(handles.outlined, &by_path, path.as_bytes()).is_some_and(|one| task_files.binary_search(&one.name).is_ok()) {
+                    if find_outlined(handles.outlined, by_path, path.as_bytes()).is_some_and(|one| task_files.binary_search(&one.name).is_ok()) {
                         holds_task_file = true;
                         break;
                     }
@@ -3380,13 +3509,39 @@ impl HeadsStage {
                 };
                 let cells = scope_cells(graph.name, &list, member, Some(&scope), shared);
                 let cut_words = scope.cut_cause(&list).map(|cause| crate::engine_head_notes::leak(g, format_args!("its crate's {cause}")));
-                let _ = push_member_subjects(&mut subjects, member, prefix, &items);
+                let _ = push_member_subjects(subjects, member, prefix, &items);
                 loaded_subjects.push(prefix);
                 jobs.push(make_job(prefix, scope, whole, cut_words, cells));
             }
         }
         subjects.sort_unstable();
+        subjects.dedup();
         jobs.sort_unstable_by_key(|job| job.prefix);
+        // Invert cfg-blind module walks per task file so each task checks only units whose walk
+        // actually reaches its file (O(1) lookup) instead of scanning all workspace units per task.
+        let mut reaching_by_file: blaze_hash::Map<Name, Vec<(Name, [u8; 8]), Alloc<'static>>, blaze_hash::FixedState, Alloc<'static>> =
+            blaze_hash::Map::new(blaze_hash::MapOpts { hasher: blaze_hash::FixedState, alloc: g, capacity: Some(task_files.len()) });
+        for &(unit, prefix, reach_idx) in walks.iter() {
+            let Some((_, reach, _)) = reached_roots.get(reach_idx) else { continue };
+            if task_files.len() <= reach.len() {
+                for &file in task_files.iter() {
+                    if reach.binary_search(&file).is_ok() {
+                        reaching_by_file.entry(file).or_insert_with(|| Vec::new_in(g)).push((unit, prefix));
+                    }
+                }
+            } else {
+                let mut prev: Option<Name> = None;
+                for &file in reach.iter() {
+                    if prev == Some(file) {
+                        continue;
+                    }
+                    prev = Some(file);
+                    if task_files.binary_search(&file).is_ok() {
+                        reaching_by_file.entry(file).or_insert_with(|| Vec::new_in(g)).push((unit, prefix));
+                    }
+                }
+            }
+        }
         // Each task to EVERY member unit (by prefix) whose files hold its file (lane RU1,
         // `head_cell`): each freezes the task's heads under its own records, one cell a unit.
         let mut by_file: std::vec::Vec<(Name, [u8; 8]), Global> = std::vec::Vec::with_capacity_in(subjects.len(), Global);
@@ -3481,9 +3636,11 @@ impl HeadsStage {
                     // not-held cells, so one that comes to hold the file moves the row.
                     let held = &by_file[at..];
                     let held = &held[..held.partition_point(|(file, _)| *file == task.planned.file)];
-                    for &(unit, prefix, reach_idx) in walks.iter() {
-                        if reached_roots.get(reach_idx).is_some_and(|(_, reach, _)| reach.binary_search(&task.planned.file).is_ok()) && !held.iter().any(|(_, one)| *one == prefix) {
-                            made.reads.push(crate::engine_body_plan::file_not_held_cell(view, unit, prefix));
+                    if let Some(units) = reaching_by_file.get(&task.planned.file) {
+                        for &(unit, prefix) in units.iter() {
+                            if !held.iter().any(|(_, one)| *one == prefix) {
+                                made.reads.push(crate::engine_body_plan::file_not_held_cell(view, unit, prefix));
+                            }
                         }
                     }
                     accs.push((*task, made));
@@ -3498,9 +3655,9 @@ impl HeadsStage {
         jobs.retain(|job| !job.tasks.is_empty());
         // Populate `subjects` for any member dependency crate appearing inside active jobs' scopes
         // so `Owners::place` and `crate_setup` identify every in-scope member crate accurately.
+        loaded_subjects.sort_unstable();
+        loaded_subjects.dedup();
         if !jobs.is_empty() {
-            loaded_subjects.sort_unstable();
-            loaded_subjects.dedup();
             let mut dep_members: Vec<usize, Alloc<'static>> = Vec::new_in(g);
             for job in jobs.iter() {
                 for one in job.rest.iter() {
@@ -3514,11 +3671,15 @@ impl HeadsStage {
             if !dep_members.is_empty() {
                 for member in dep_members.iter().copied() {
                     let Ok((_, own_records)) = cache.records_of(read, cx, store, names, &list, member, g) else { continue };
-                    let Ok(items) = ItemsRecord::open(own_records.items, g) else { continue };
+                    let items = ItemsRecord::from_verified(own_records.items_proof, g);
                     let prefix = list.key(member).prefix();
-                    let _ = push_member_subjects(&mut subjects, member, prefix, &items);
+                    let _ = push_member_subjects(subjects, member, prefix, &items);
+                    loaded_subjects.push(prefix);
                 }
+                loaded_subjects.sort_unstable();
+                loaded_subjects.dedup();
                 subjects.sort_unstable();
+                subjects.dedup();
             }
         }
         let lazy = heads_lazy.get_or_insert_with(|| crate::front_load::ScopeRecords::new(lazy_snap, CrateGraph::len(&list), heap));
@@ -3560,17 +3721,27 @@ impl HeadsStage {
             let max_workers = handles.workers;
             let scope = cx.scope();
             scope.narrow_workers(handles.workers, Class::Foreground);
-            // Spawn `crate_setup` first so `HeadsSplit` is never queued behind small dep
-            // `ImplBucket` tasks, then immediately spawn `closed_jobs` in LPT (largest-first)
+            // Spawn `crate_setup` largest-first (LPT) so `HeadsSplit` is never queued behind small
+            // crates or small dep `ImplBucket` tasks, then immediately spawn `closed_jobs` in LPT
             // order so heavy dep crates (`core`, `std`, `regex-automata`, ...) overlap with
             // `HeadsSetup` and `HeadsSplit` from t=0 without sitting at the tail.
+            let mut setup_dispatch: Vec<usize, Alloc<'static>> = Vec::with_capacity_in(jobs.len(), g);
+            setup_dispatch.extend(0..jobs.len());
+            setup_dispatch.sort_unstable_by_key(|&at| {
+                let tasks_len = jobs.get(at).map_or(0, |job| job.tasks.len());
+                (core::cmp::Reverse(tasks_len), at)
+            });
             let mut running = Vec::with_capacity_in(jobs.len(), g);
-            for job in jobs.iter() {
-                running.push(scope.may_overlap("engine heads: a crate's setup", HEADS_FRAME, move |cx: &Cx| {
-                    let began = clock.now();
-                    let made = work::unwinding(|| crate_setup(cx, root, fs, outlined, packs, corrected, procs, job, scope_records, subjects, view, heap, listings, snapshot));
-                    Ok::<_, Infallible>((made, clock.now().since(began).map_or(0, crate::engine_times::ns), crate::engine_times::ns(began.since_start())))
-                }));
+            for at in setup_dispatch.into_iter() {
+                let Some(job) = jobs.get(at) else { continue };
+                running.push((
+                    at,
+                    scope.may_overlap("engine heads: a crate's setup", HEADS_FRAME, move |cx: &Cx| {
+                        let began = clock.now();
+                        let made = work::unwinding(|| crate_setup(cx, root, fs, outlined, packs, corrected, procs, job, scope_records, subjects, view, heap, listings, snapshot));
+                        Ok::<_, Infallible>((made, clock.now().since(began).map_or(0, crate::engine_times::ns), crate::engine_times::ns(began.since_start())))
+                    }),
+                ));
             }
             let mut closed_dispatch: Vec<usize, Alloc<'static>> = Vec::with_capacity_in(closed_jobs.len(), g);
             closed_dispatch.extend(0..closed_jobs.len());
@@ -3594,96 +3765,137 @@ impl HeadsStage {
                     }),
                 ));
             }
+            let mut setups_paired: Vec<(usize, (Setup, u64)), Alloc<'static>> = Vec::with_capacity_in(jobs.len(), g);
             let mut stopped = None;
-            for handle in running.into_iter() {
+            for (at, handle) in running.into_iter() {
                 match handle.join(cx) {
                     Ok((made, ns, start)) => {
                         times.job(crate::engine_times::Step::HeadsSetup, start, start.saturating_add(ns));
-                        setups.push((made, ns));
+                        setups_paired.push((at, (made, ns)));
                     }
                     Err(error) => {
                         stopped.get_or_insert(error);
                     }
                 }
             }
-            // Each crate whose setup was made, cut into split jobs, in job order and task order.
-            total = jobs.iter().zip(setups.iter()).filter(|(_, (setup, _))| matches!(setup, Ok(Ok(_)))).map(|(job, _)| job.tasks.len()).sum();
-            let mut file_sizes = Vec::new_in(g);
-            for (at, (job, (setup, _))) in jobs.iter().zip(setups.iter()).enumerate() {
-                if !matches!(setup, Ok(Ok(_))) {
-                    continue;
-                }
-                let len = job.tasks.len();
-                let n = split_count(head_jobs.split, len, total, workers);
-                let before = splits.len();
-                let mut last_crossed = None;
-                let mut append = |range: core::ops::Range<usize>| {
-                    let file = job.tasks[range.start].planned.file;
-                    if range.start > 0 && job.tasks[range.start - 1].planned.file == file && last_crossed != Some(file) {
-                        split_files += 1;
-                        last_crossed = Some(file);
-                    }
-                    splits.push(SplitAt {
-                        job: u32::try_from(at).unwrap_or(u32::MAX),
-                        from: u32::try_from(range.start).unwrap_or(u32::MAX),
-                        to: u32::try_from(range.end).unwrap_or(u32::MAX),
-                    });
-                };
-                match head_jobs.split {
-                    #[cfg(test)]
-                    HeadSplit::Even(_) => {
-                        for cut in 0..n {
-                            append(cut * len / n..(cut + 1) * len / n);
+            // Rule 25: restore exact original `jobs` order for `setups`.
+            setups_paired.sort_unstable_by_key(|(at, _)| *at);
+            setups.extend(setups_paired.into_iter().map(|(_, one)| one));
+            if stopped.is_none() {
+                // Weight each Signature task by `1 + heads + calls` (from `setup.listing`) so
+                // traits/impls with many methods and derive-heavy structs get proportional splits
+                // and LPT priority rather than weighing the same as a `type` alias.
+                let mut job_weights: Vec<Vec<usize, Alloc<'static>>, Alloc<'static>> = Vec::with_capacity_in(jobs.len(), g);
+                let mut total_weight = 0usize;
+                for (job, (setup, _)) in jobs.iter().zip(setups.iter()) {
+                    let mut weights = Vec::new_in(g);
+                    if let Ok(Ok(setup)) = setup {
+                        total = total.saturating_add(job.tasks.len());
+                        weights.reserve(job.tasks.len());
+                        for task in job.tasks.iter() {
+                            let name = task.planned.name;
+                            let w = 1usize
+                                .saturating_add(setup.listing.of_entry(name).len())
+                                .saturating_add(setup.listing.calls_of(name).len());
+                            weights.push(w);
+                            total_weight = total_weight.saturating_add(w);
                         }
                     }
-                    HeadSplit::Rule | HeadSplit::Jobs(_) if n == 1 => append(0..len),
-                    HeadSplit::Rule | HeadSplit::Jobs(_) => {
-                        file_sizes.clear();
-                        file_sizes.extend(job.tasks.chunk_by(|a, b| a.planned.file == b.planned.file).map(|file| file.len()));
-                        file_splits(&file_sizes, len, n).for_each(append);
-                    }
+                    job_weights.push(weights);
                 }
-                most_splits = most_splits.max(splits.len() - before);
-            }
-            // Dispatch splits largest-first (LPT) so mega-crates/mega-files start immediately
-            // rather than creating a late straggler tail; `in_split_order` restores deterministic
-            // split order using each split's original `at` index.
-            let mut dispatch: Vec<usize, Alloc<'static>> = Vec::with_capacity_in(splits.len(), g);
-            dispatch.extend(0..splits.len());
-            dispatch.sort_unstable_by(|&a, &b| {
-                let len_a = splits.get(a).map_or(0, |s| s.to.saturating_sub(s.from));
-                let len_b = splits.get(b).map_or(0, |s| s.to.saturating_sub(s.from));
-                len_b.cmp(&len_a).then_with(|| a.cmp(&b))
-            });
-            // Each split's result as it was joined, then in split order ([`in_split_order`]).
-            arrived.reserve(splits.len());
-            let mut running_splits = Vec::with_capacity_in(splits.len(), g);
-            let setups_ref = &setups[..];
-            for at in dispatch.into_iter() {
-                let Some(split) = splits.get(at) else { continue };
-                let Some(job) = jobs.get(split.job as usize) else { continue };
-                // Only a crate whose setup was made has splits (above).
-                let Some(Ok(Ok(setup))) = setups_ref.get(split.job as usize).map(|(s, _)| s) else { continue };
-                let Some(tasks) = job.tasks.get(split.from as usize..split.to as usize) else { continue };
-                let at = u32::try_from(at).unwrap_or(u32::MAX);
-                running_splits.push((
-                    at,
-                    scope.may_overlap("engine heads", HEADS_FRAME, move |cx: &Cx| {
-                        let began = clock.now();
-                        let on_board = OnBoard { board, clock, shows };
-                        let made = work::unwinding(|| heads_of(cx, root, fs, outlined, packs, corrected, procs, &list, job, scope_records, setup, tasks, subjects, view, expansion_reads, heap, once, listings, head_jobs.listings, on_board, snapshot));
-                        Ok::<_, Infallible>((made, clock.now().since(began).map_or(0, crate::engine_times::ns), crate::engine_times::ns(began.since_start())))
-                    }),
-                ));
-            }
-            for (at, handle) in running_splits.into_iter() {
-                match handle.join(cx) {
-                    Ok((made, ns, start)) => {
-                        times.job(crate::engine_times::Step::HeadsSplit, start, start.saturating_add(ns));
-                        arrived.push((at, (made, ns)));
+                let mut file_weights: Vec<(usize, usize), Alloc<'static>> = Vec::new_in(g);
+                for (at, ((job, (setup, _)), weights)) in jobs.iter().zip(setups.iter()).zip(job_weights.iter()).enumerate() {
+                    if !matches!(setup, Ok(Ok(_))) {
+                        continue;
                     }
-                    Err(error) => {
-                        stopped.get_or_insert(error);
+                    let len = job.tasks.len();
+                    let crate_weight: usize = weights.iter().copied().sum();
+                    let n = split_count_weighted(head_jobs.split, len, crate_weight, total_weight, workers);
+                    let before = splits.len();
+                    let mut last_crossed = None;
+                    let mut append = |range: core::ops::Range<usize>, weight: usize| {
+                        let file = job.tasks[range.start].planned.file;
+                        if range.start > 0 && job.tasks[range.start - 1].planned.file == file && last_crossed != Some(file) {
+                            split_files += 1;
+                            last_crossed = Some(file);
+                        }
+                        splits.push(SplitAt {
+                            job: u32::try_from(at).unwrap_or(u32::MAX),
+                            from: u32::try_from(range.start).unwrap_or(u32::MAX),
+                            to: u32::try_from(range.end).unwrap_or(u32::MAX),
+                            weight: u64::try_from(weight).unwrap_or(u64::MAX),
+                        });
+                    };
+                    match head_jobs.split {
+                        #[cfg(test)]
+                        HeadSplit::Even(_) => {
+                            for cut in 0..n {
+                                let range = cut * len / n..(cut + 1) * len / n;
+                                let w: usize = weights.get(range.clone()).map_or(0, |s| s.iter().copied().sum());
+                                append(range, w);
+                            }
+                        }
+                        HeadSplit::Rule | HeadSplit::Jobs(_) if n == 1 => append(0..len, crate_weight),
+                        HeadSplit::Rule | HeadSplit::Jobs(_) => {
+                            file_weights.clear();
+                            let mut offset = 0usize;
+                            for file in job.tasks.chunk_by(|a, b| a.planned.file == b.planned.file) {
+                                let file_len = file.len();
+                                let file_weight: usize = weights.get(offset..offset + file_len).map_or(file_len, |s| s.iter().copied().sum());
+                                file_weights.push((file_len, file_weight));
+                                offset += file_len;
+                            }
+                            for (range, weight) in weighted_file_splits(&file_weights, weights, crate_weight, n) {
+                                append(range, weight);
+                            }
+                        }
+                    }
+                    most_splits = most_splits.max(splits.len() - before);
+                }
+                // Dispatch splits heaviest-first (LPT by work weight) so mega-crates/mega-files
+                // and derive/impl-heavy splits start immediately rather than creating a late
+                // straggler tail; `in_split_order` restores deterministic split order using each
+                // split's original `at` index.
+                let mut dispatch: Vec<usize, Alloc<'static>> = Vec::with_capacity_in(splits.len(), g);
+                dispatch.extend(0..splits.len());
+                dispatch.sort_unstable_by(|&a, &b| {
+                    let w_a = splits.get(a).map_or(0, |s| s.weight);
+                    let w_b = splits.get(b).map_or(0, |s| s.weight);
+                    w_b.cmp(&w_a).then_with(|| a.cmp(&b))
+                });
+                // Each split's result as it was joined, then in split order ([`in_split_order`]).
+                arrived.reserve(splits.len());
+                let mut running_splits = Vec::with_capacity_in(splits.len(), g);
+                let setups_ref = &setups[..];
+                for at in dispatch.into_iter() {
+                    let Some(split) = splits.get(at) else { continue };
+                    let Ok(job_idx) = usize::try_from(split.job) else { continue };
+                    let Ok(from_idx) = usize::try_from(split.from) else { continue };
+                    let Ok(to_idx) = usize::try_from(split.to) else { continue };
+                    let Some(job) = jobs.get(job_idx) else { continue };
+                    // Only a crate whose setup was made has splits (above).
+                    let Some(Ok(Ok(setup))) = setups_ref.get(job_idx).map(|(s, _)| s) else { continue };
+                    let Some(tasks) = job.tasks.get(from_idx..to_idx) else { continue };
+                    let at = u32::try_from(at).unwrap_or(u32::MAX);
+                    running_splits.push((
+                        at,
+                        scope.may_overlap("engine heads", HEADS_FRAME, move |cx: &Cx| {
+                            let began = clock.now();
+                            let on_board = OnBoard { board, clock, shows };
+                            let made = work::unwinding(|| heads_of(cx, root, fs, outlined, packs, corrected, procs, &list, job, scope_records, setup, tasks, subjects, view, expansion_reads, heap, once, listings, head_jobs.listings, on_board, snapshot));
+                            Ok::<_, Infallible>((made, clock.now().since(began).map_or(0, crate::engine_times::ns), crate::engine_times::ns(began.since_start())))
+                        }),
+                    ));
+                }
+                for (at, handle) in running_splits.into_iter() {
+                    match handle.join(cx) {
+                        Ok((made, ns, start)) => {
+                            times.job(crate::engine_times::Step::HeadsSplit, start, start.saturating_add(ns));
+                            arrived.push((at, (made, ns)));
+                        }
+                        Err(error) => {
+                            stopped.get_or_insert(error);
+                        }
                     }
                 }
             }
@@ -3942,13 +4154,14 @@ fn board_label(entry_name: Option<&str>, name: Name) -> crate::engine_status::La
     }
 }
 
-/// One split job's place in its crate's (file, name) order. Both ends are file boundaries
-/// under the production rule.
+/// One split job's place in its crate's (file, name) order and its estimated work weight
+/// (`sum(1 + heads + calls)`) for LPT dispatch.
 #[derive(Clone, Copy, Debug)]
 struct SplitAt {
     job: u32,
     from: u32,
     to: u32,
+    weight: u64,
 }
 
 /// What a crate's split jobs share, made once a crate a phase by [`crate_setup`], each list
@@ -4211,8 +4424,9 @@ fn heads_of(
     let both = blaze_ladder::front2::tables::owned_reads::BothOwners { names: &freeze_names, evals: &eval_names };
     let shared = base.reading_into(&freeze_names);
     let bump = frame.alloc(blaze_own::Erased::new(frame)).bump();
+    let fa = bump.alloc();
     let mut once_consts = crate::engine_heads_once::OnceConsts::new(base.reading_into(&eval_names), &index, bump, once, job.prefix).with_sources(body_sources);
-    let mut source = SeededHeads::new(SeededHeadsOpts { names: shared, sized, pointers, frame, scratch: g, alloc: g, consts: Some(&mut once_consts as &mut dyn ConstValues<'_>), known: Some(once), owners: Some(&both) });
+    let mut source = SeededHeads::new(SeededHeadsOpts { names: shared, sized, pointers, frame, scratch: g, alloc: fa, consts: Some(&mut once_consts as &mut dyn ConstValues<'_>), known: Some(once), owners: Some(&both) });
     let mut crate_scopes: blaze_own::Vec<crate::engine_heads_once::ScopeCrate, Alloc<'static>> =
         blaze_own::Vec::with_capacity_in(NamesSource::crate_count(records), g);
     for ci in 0..NamesSource::crate_count(records) {

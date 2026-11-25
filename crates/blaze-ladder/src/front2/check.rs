@@ -314,7 +314,7 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
     // How this body's world meets a hole (world_items.rs `BodyWorld::stops_at_holes`): the
     // same test, read once; the store's seeds and asks do not change during a check.
     let stops_at_holes = r.store.stops_at_holes();
-    let mut holes = RoundHoles::new();
+    let mut holes = RoundHoles::new_in(alloc);
     let mut stalled_rounds = 0u32;
     let mut rounds_run = 0u32;
     let mut patched: Option<super::body_const_gaps::PatchedConsts> = None;
@@ -641,14 +641,14 @@ fn collect_done_diags<'n, S: NamesSource<'n>>(
 /// that does not make what is asked). Questions are `Copy` and `Ord`: no text is made per round.
 struct RoundHoles {
     /// `(holes, new)` of each round, in order.
-    per_round: Vec<(u32, u32), Global>,
+    per_round: blaze_own::Vec<(u32, u32), blaze_own::Alloc<'static>>,
     /// Each distinct hole and the first round it was met in, sorted by the question.
-    seen: Vec<(Question, u32), Global>,
+    seen: blaze_own::Vec<(Question, u32), blaze_own::Alloc<'static>>,
 }
 
 impl RoundHoles {
-    fn new() -> RoundHoles {
-        RoundHoles { per_round: Vec::new_in(Global), seen: Vec::new_in(Global) }
+    fn new_in(alloc: blaze_own::Alloc<'static>) -> RoundHoles {
+        RoundHoles { per_round: blaze_own::Vec::new_in(alloc), seen: blaze_own::Vec::new_in(alloc) }
     }
 
     fn round(&mut self, round: u32, missing: &[Question]) -> u32 {
@@ -1667,7 +1667,7 @@ fn trait_words<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, tys: tc::PTys<'_>
     // (`{Rhs}`) its own, by the index the trait's header gives it (heads.rs `param_names`).
     let shown: Vec<String, Global> = tys.list(args).map(|l| l.iter().map(|&t| ty_shown(r, tys, t)).collect()).unwrap_or_default();
     let mut params: Vec<(Name, u32), Global> = Vec::new_in(Global);
-    let params_read = super::heads::lower(r.names, lib, text.text)
+    let params_read = super::heads::lower_alloc(r.names, lib, text.text, r.store.tys.alloc())
         .map_err(|e| format!("{e:?}"))
         .and_then(|low| super::heads::param_names(&low.view(), 1, &mut params, super::heads::Consts::Keep).map_err(|e| format!("{e:?}")));
     let unread = |why: &dyn core::fmt::Display| Some(format!("the trait `{this}`'s `#[diagnostic::on_unimplemented]` does not read ({why})"));
@@ -1777,7 +1777,8 @@ pub fn callee_target<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,scope: &
     // `Vec<T>`) is selected where the instance is made, as on a bare parameter: an impl picked
     // here would be picked at types that are not the instance's. The impls of the self type's
     // shape are walked by reach.rs `Instances`.
-    if holds_param(ground.view(), args).map_err(|error| CheckFail::Check { owner, error })? {
+    let alloc = r.store.tys.alloc();
+    if holds_param(ground.view(), args, alloc).map_err(|error| CheckFail::Check { owner, error })? {
         return Ok(Target::AtInstance(item));
     }
     // A self type whose `Clone` (and `Copy`) the LANGUAGE may give (below): the build asks
@@ -1802,7 +1803,6 @@ pub fn callee_target<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,scope: &
         false => None,
         true => copy_trait(r, owner)?,
     };
-    let alloc = r.store.tys.alloc();
     // For a refusal past the last round ([`rounds_fail`]).
     let (mut made, mut hole) = (0u64, None);
     for _ in 0..MOST_ROUNDS {
@@ -1818,8 +1818,9 @@ pub fn callee_target<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,scope: &
         if let Err(tc::ResolveError::NoImpl { trait_, .. }) = out
             && builtin
         {
-            let mut asked: Vec<tc::PTy, Global> = Vec::new_in(Global);
-            asked.extend_from_slice(ground.view().list(args).map_err(|error| CheckFail::Check { owner, error })?);
+            let args_slice = ground.view().list(args).map_err(|error| CheckFail::Check { owner, error })?;
+            let mut asked: blaze_own::Vec<tc::PTy, blaze_own::Alloc<'static>> = blaze_own::Vec::with_capacity_in(args_slice.len(), alloc);
+            asked.extend_from_slice(args_slice);
             let given = tc::holds(&world, trait_, &asked, ground, alloc).and_then(|given| match (given, copy) {
                 (true, Some(copy)) => tc::holds(&world, copy, &asked[..1], ground, alloc).map(|_| true),
                 (given, _) => Ok(given),
@@ -1947,11 +1948,12 @@ pub fn reach_capture_copy<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, sc
     let shown = |e| CheckFail::Check { owner, error: e };
     let Some(&me) = c.types.view().list(args).map_err(shown)?.first() else { return Ok(()) };
     let tc::PNode::Closure { owner: of, ordinal, .. } = c.types.view().node(me).map_err(shown)? else { return Ok(()) };
-    if of != owner || holds_param(c.types.view(), args).map_err(shown)? {
+    let alloc = r.store.tys.alloc();
+    if of != owner || holds_param(c.types.view(), args, alloc).map_err(shown)? {
         return Ok(());
     }
     let Some(&e) = c.closures.column::<0>().get(ordinal as usize) else { return Ok(()) };
-    let mut held: Vec<tc::PTy, Global> = Vec::new_in(Global);
+    let mut held: blaze_own::Vec<tc::PTy, blaze_own::Alloc<'static>> = blaze_own::Vec::new_in(alloc);
     for (p, by) in blaze_build::layout::captures(c, e) {
         if matches!(by, tc::CaptureKind::ByValue)
             && let Some(&t) = c.local_ty.get(p.ix())
@@ -1963,7 +1965,6 @@ pub fn reach_capture_copy<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, sc
         return Ok(());
     }
     let Some(copy) = copy_trait(r, owner)? else { return Ok(()) };
-    let alloc = r.store.tys.alloc();
     for &t in held.iter() {
         let mut done = false;
         // For a refusal past the last round ([`rounds_fail`]).
@@ -2003,8 +2004,8 @@ pub fn reach_capture_copy<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, sc
 
 /// Whether any type of `args` holds a type or const parameter (or a projection or opaque type,
 /// which name one in a generic body), by a work list.
-fn holds_param(v: tc::PTys<'_>, args: tc::List) -> Result<bool, tc::CheckError> {
-    let mut work: Vec<tc::PTy, Global> = Vec::new_in(Global);
+fn holds_param(v: tc::PTys<'_>, args: tc::List, alloc: blaze_own::Alloc<'static>) -> Result<bool, tc::CheckError> {
+    let mut work: blaze_own::Vec<tc::PTy, blaze_own::Alloc<'static>> = blaze_own::Vec::new_in(alloc);
     work.extend_from_slice(v.list(args)?);
     while let Some(t) = work.pop() {
         let lists = match v.node(t)? {
@@ -2212,8 +2213,9 @@ fn eval_len_inner<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, c: LibKey)
     // whose header writes `W<{ size_of::<u8>() }>` stays a refused candidate, a named gap of
     // the questions it could answer, as before there was an evaluator behind the heads.
     let anonymous = |k: LibKey| super::anon::need_key(checker_of(k)) == k;
-    let mut more: Vec<(LibKey, u128), Global> = Vec::new_in(Global);
-    let mut failed: Vec<(LibKey, Box<str, Global>), Global> = Vec::new_in(Global);
+    let eval_alloc = r.store.tys.alloc();
+    let mut more: blaze_own::Vec<(LibKey, u128), blaze_own::Alloc<'static>> = blaze_own::Vec::new_in(eval_alloc);
+    let mut failed: blaze_own::Vec<(LibKey, Box<str>), blaze_own::Alloc<'static>> = blaze_own::Vec::new_in(eval_alloc);
     for &o in asked.iter() {
         if o == c || r.store.maps.const_bits.contains_key(&o) || r.store.maps.anon_failed.contains_key(&o) {
             continue;
@@ -2274,7 +2276,7 @@ pub(super) fn make_all<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,fills:
 /// Makes the answer to `ImplsOf(trait_, shape)` from the one impl index (the same buckets the
 /// checker's questions fill) and returns the impls it holds; `None` when a candidate's header
 /// refused: the question then stays a gap, so the back half's asking it refuses by name.
-pub fn answer_impls<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,trait_: ItemKey, shape: tc::Shape) -> Option<Vec<ItemKey, Global>> {
+pub fn answer_impls<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,trait_: ItemKey, shape: tc::Shape) -> Option<blaze_own::Vec<ItemKey, blaze_own::Alloc<'static>>> {
     // Selection reads the trait's head too (`TraitDef`): made with its answer.
     if !r.store.trait_defs.contains_key(&trait_) {
         let want = super::fill::want_of_key(r.names, r.keys, trait_).ok()?;
@@ -2288,8 +2290,9 @@ pub fn answer_impls<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,trait_: I
     if b.trait_gap(trait_, shape).is_some() {
         return None;
     }
-    let mut out = Vec::new_in(Global);
-    out.extend_from_slice(b.impls_of(trait_, shape)?);
+    let slice = b.impls_of(trait_, shape)?;
+    let mut out = blaze_own::Vec::with_capacity_in(slice.len(), r.store.tys.alloc());
+    out.extend_from_slice(slice);
     Some(out)
 }
 
@@ -2413,7 +2416,7 @@ fn resolve_inferred_outputs<'n, S: NamesSource<'n>>(
                 return Err(InferredErr::Gap(Gap::InferredOutputFailed { item: cur, why: "inline for expansion failed" }));
             }
             let view = lowered.lowered.view();
-            let spell = match Spelling::of(&view) {
+            let spell = match Spelling::of_in(&view, alloc) {
                 Ok(s) => s,
                 Err(_) => {
                     return Err(InferredErr::Gap(Gap::InferredOutputFailed { item: cur, why: "body names could not be spelled" }));
@@ -2681,7 +2684,8 @@ mod round_cap_tests {
 
     #[test]
     fn round_holes_distinguishes_progress_from_stalled_loops() {
-        let mut progressing = RoundHoles::new();
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut progressing = RoundHoles::new_in(alloc);
         let mut stalled_rounds = 0u32;
         for r in 0..500u32 {
             let new = progressing.round(r, &[Question::FnSig(ItemKey(u128::from(r) + 1))]);
@@ -2691,7 +2695,7 @@ mod round_cap_tests {
         assert_eq!(stalled_rounds, 0);
         assert!(500 > MOST_ROUNDS && 500 < MOST_PROGRESS_ROUNDS);
 
-        let mut stuck = RoundHoles::new();
+        let mut stuck = RoundHoles::new_in(alloc);
         let mut stuck_rounds = 0u32;
         let mut stopped_at = None;
         for r in 0..MOST_PROGRESS_ROUNDS {

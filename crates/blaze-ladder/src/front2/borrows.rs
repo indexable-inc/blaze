@@ -2533,7 +2533,7 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
         // blaze-flow-lower one_call.rs `clause_of`), whether or not such a node was interned
         // yet. The census (wave-1119): 54,907 `Count` refusals named an alias's lifetimes "not
         // filed". The count itself is the one read below (rule 21).
-        for n in c.types.view().nodes().chain(r.store.tys.view().nodes()) {
+        for n in c.types.view().nodes() {
             match n {
                 tc::PNode::ExTrait(t, _) => g.trait_counts.push((t.0, None)),
                 tc::PNode::Alias { trait_, name, .. } | tc::PNode::ExProj { trait_, name, .. } => {
@@ -2543,16 +2543,212 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                 _ => {}
             }
         }
-        for &k in items.iter() {
-            let Some(p) = r.store.preds.get(&tc::ItemKey(k)) else { continue };
-            for cl in p.clauses.iter() {
-                match *cl {
-                    tc::PClause::Trait { trait_, .. } | tc::PClause::ForFields { trait_, .. } => g.trait_counts.push((trait_.0, None)),
-                    tc::PClause::Projection { trait_, name, .. } => {
-                        g.alias_counts.push((trait_.0, name, None));
-                        g.trait_counts.push((trait_.0, None));
+        // Walk only the `PTy`s in `r.store.tys` reachable from this body's gathered heads
+        // (`items`, `owner`'s container impl, `selected`, `opaques`, `traits`, `assoc_items`,
+        // and `roots` ADTs), never scanning unrelated heads in `r.store.tys`.
+        {
+            struct TyWalk<'a, 't> {
+                stys: tc::PTys<'t>,
+                seen: blaze_hash::Map<u32, (), blaze_hash::FixedState, Alloc<'a>>,
+                st: AVec<'a, tc::PTy>,
+            }
+            impl<'a> TyWalk<'a, '_> {
+                fn walk_ty(&mut self, root: tc::PTy, trait_counts: &mut AVec<'a, (u128, Option<u32>)>, alias_counts: &mut AVec<'a, (u128, tc::Name, Option<u32>)>) {
+                    if self.seen.insert(root.0, ()).is_some() {
+                        return;
                     }
-                    tc::PClause::Const { .. } | tc::PClause::TypeOutlives { .. } | tc::PClause::RegionOutlives { .. } => {}
+                    self.st.push(root);
+                    while let Some(t) = self.st.pop() {
+                        let Ok(node) = self.stys.node(t) else { continue };
+                        match node {
+                            tc::PNode::ExTrait(tr, _) => trait_counts.push((tr.0, None)),
+                            tc::PNode::Alias { trait_, name, .. } | tc::PNode::ExProj { trait_, name, .. } => {
+                                alias_counts.push((trait_.0, name, None));
+                                trait_counts.push((trait_.0, None));
+                            }
+                            _ => {}
+                        }
+                        if let Ok((list, last)) = super::adt_variance::children(self.stys, t, node) {
+                            for &ch in list {
+                                if self.seen.insert(ch.0, ()).is_none() {
+                                    self.st.push(ch);
+                                }
+                            }
+                            if let Some(ch) = last
+                                && self.seen.insert(ch.0, ()).is_none()
+                            {
+                                self.st.push(ch);
+                            }
+                        }
+                    }
+                }
+                fn walk_list(&mut self, list: tc::List, trait_counts: &mut AVec<'a, (u128, Option<u32>)>, alias_counts: &mut AVec<'a, (u128, tc::Name, Option<u32>)>) {
+                    if let Ok(items) = self.stys.list(list) {
+                        for &t in items {
+                            self.walk_ty(t, trait_counts, alias_counts);
+                        }
+                    }
+                }
+                fn walk_clause(&mut self, cl: &tc::PClause, trait_counts: &mut AVec<'a, (u128, Option<u32>)>, alias_counts: &mut AVec<'a, (u128, tc::Name, Option<u32>)>) {
+                    match *cl {
+                        tc::PClause::Trait { trait_, args } => {
+                            trait_counts.push((trait_.0, None));
+                            self.walk_list(args, trait_counts, alias_counts);
+                        }
+                        tc::PClause::ForFields { container, trait_, args } => {
+                            trait_counts.push((trait_.0, None));
+                            self.walk_ty(container, trait_counts, alias_counts);
+                            self.walk_list(args, trait_counts, alias_counts);
+                        }
+                        tc::PClause::Projection { trait_, args, name, term } => {
+                            alias_counts.push((trait_.0, name, None));
+                            trait_counts.push((trait_.0, None));
+                            self.walk_list(args, trait_counts, alias_counts);
+                            self.walk_ty(term, trait_counts, alias_counts);
+                        }
+                        tc::PClause::Const { args, .. } => self.walk_list(args, trait_counts, alias_counts),
+                        tc::PClause::TypeOutlives { ty, .. } => self.walk_ty(ty, trait_counts, alias_counts),
+                        tc::PClause::RegionOutlives { .. } => {}
+                    }
+                }
+            }
+            let mut walker = TyWalk {
+                stys: r.store.tys.view(),
+                seen: blaze_hash::Map::new(blaze_hash::MapOpts { hasher: blaze_hash::FixedState, alloc, capacity: None }),
+                st: AVec::new_in(alloc),
+            };
+            for &k in items.iter() {
+                let ik = tc::ItemKey(k);
+                if let Ok(sig) = regions.sig(ik) {
+                    walker.walk_ty(sig.col.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                }
+                if let Ok(cls) = regions.clauses(ik) {
+                    for cv in cls {
+                        walker.walk_ty(cv.col.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+                if let Some(f) = r.store.fns.get(&ik) {
+                    for &t in f.inputs.iter() {
+                        walker.walk_ty(t, &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                    walker.walk_ty(r.store.fn_output(ik).unwrap_or(f.output), &mut g.trait_counts, &mut g.alias_counts);
+                }
+                if let Some(p) = r.store.preds.get(&ik) {
+                    for cl in p.clauses.iter() {
+                        walker.walk_clause(cl, &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+            }
+            if let Some(Origin::Member { container, .. }) = r.keys.origin(owner) {
+                let ik = *container;
+                if let Ok((self_col, trait_col)) = regions.impl_header(ik) {
+                    walker.walk_ty(self_col.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                    if let Some(tc_col) = trait_col {
+                        walker.walk_ty(tc_col.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+                if let Ok(cls) = regions.clauses(ik) {
+                    for cv in cls {
+                        walker.walk_ty(cv.col.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+                if let Some(ih) = r.store.impls.get(&ik) {
+                    walker.walk_ty(ih.self_ty, &mut g.trait_counts, &mut g.alias_counts);
+                    walker.walk_list(ih.trait_args.list(), &mut g.trait_counts, &mut g.alias_counts);
+                }
+                if let Some(p) = r.store.preds.get(&ik) {
+                    for cl in p.clauses.iter() {
+                        walker.walk_clause(cl, &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+            }
+            let mut last_imp = None;
+            for &(k, name) in selected.iter() {
+                let ik = tc::ItemKey(k);
+                if let Some(n) = name
+                    && let Ok(v) = regions.impl_assoc(ik, n)
+                {
+                    walker.walk_ty(v.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                }
+                if last_imp == Some(k) {
+                    continue;
+                }
+                last_imp = Some(k);
+                if let Ok((self_col, trait_col)) = regions.impl_header(ik) {
+                    walker.walk_ty(self_col.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                    if let Some(tc_col) = trait_col {
+                        walker.walk_ty(tc_col.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+                if let Some(ih) = r.store.impls.get(&ik) {
+                    walker.walk_ty(ih.self_ty, &mut g.trait_counts, &mut g.alias_counts);
+                    walker.walk_list(ih.trait_args.list(), &mut g.trait_counts, &mut g.alias_counts);
+                    for &(an, v) in ih.assoc.iter() {
+                        walker.walk_ty(v, &mut g.trait_counts, &mut g.alias_counts);
+                        if let Ok(rv) = regions.impl_assoc(ik, an) {
+                            walker.walk_ty(rv.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                        }
+                    }
+                }
+                if let Ok(cls) = regions.clauses(ik) {
+                    for cv in cls {
+                        walker.walk_ty(cv.col.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+                if let Some(p) = r.store.preds.get(&ik) {
+                    for cl in p.clauses.iter() {
+                        walker.walk_clause(cl, &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+            }
+            for &k in opaques.iter() {
+                let ik = tc::ItemKey(k);
+                if let Ok(cls) = regions.clauses(ik) {
+                    for cv in cls {
+                        walker.walk_ty(cv.col.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+                if let Some(p) = r.store.preds.get(&ik) {
+                    for cl in p.clauses.iter() {
+                        walker.walk_clause(cl, &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+            }
+            for &k in traits.iter() {
+                let ik = tc::ItemKey(k);
+                if let Ok(cls) = regions.clauses(ik) {
+                    for cv in cls {
+                        walker.walk_ty(cv.col.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+                if let Some(def) = r.store.trait_defs.get(&ik) {
+                    for cl in def.supertraits.iter() {
+                        walker.walk_clause(cl, &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+                if let Some(p) = r.store.preds.get(&ik) {
+                    for cl in p.clauses.iter() {
+                        walker.walk_clause(cl, &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+            }
+            for &(_, _, a_item) in g.assoc_items.iter() {
+                if let Ok(cls) = regions.clauses(a_item) {
+                    for cv in cls {
+                        walker.walk_ty(cv.col.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+                if let Some(p) = r.store.preds.get(&a_item) {
+                    for cl in p.clauses.iter() {
+                        walker.walk_clause(cl, &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+            }
+            for &k in roots.iter() {
+                if let Some(row) = r.store.adts.get(&tc::ItemKey(k)) {
+                    for f in row.fields.iter() {
+                        walker.walk_ty(f.ty, &mut g.trait_counts, &mut g.alias_counts);
+                    }
                 }
             }
         }

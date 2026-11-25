@@ -447,11 +447,72 @@ pub(crate) struct Sealed {
     pub len: u64,
 }
 
+/// Batches small slices into 8 KiB (`8 * CHUNK_LEN`) aligned flushes so `blaze_blake3::Hasher`
+/// runs its 8-lane SIMD wide-tree compressor instead of scalar single-chunk updates, while
+/// passing already-large slices through directly without copying. Bit-for-bit identical to
+/// calling `blaze_ids::Hasher::update` on each slice directly (Rule 25).
+struct BufferedHasher {
+    hasher: blaze_ids::Hasher,
+    buf: [u8; 8192],
+    fill: usize,
+}
+
+impl BufferedHasher {
+    fn new(domain: &'static str) -> BufferedHasher {
+        BufferedHasher { hasher: blaze_ids::Hasher::new(domain), buf: [0u8; 8192], fill: 0 }
+    }
+
+    #[inline]
+    fn update(&mut self, mut bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        if self.fill > 0 {
+            let space = self.buf.len().saturating_sub(self.fill);
+            if bytes.len() < space {
+                if let Some(dst) = self.buf.get_mut(self.fill..self.fill + bytes.len()) {
+                    dst.copy_from_slice(bytes);
+                }
+                self.fill += bytes.len();
+                return;
+            }
+            if let (Some(dst), Some(src)) = (self.buf.get_mut(self.fill..), bytes.get(..space)) {
+                dst.copy_from_slice(src);
+            }
+            self.hasher.update(&self.buf);
+            self.fill = 0;
+            bytes = bytes.get(space..).unwrap_or(&[]);
+        }
+        let bulk = bytes.len() & !8191usize;
+        if bulk > 0
+            && let Some(head) = bytes.get(..bulk)
+        {
+            self.hasher.update(head);
+            bytes = bytes.get(bulk..).unwrap_or(&[]);
+        }
+        if !bytes.is_empty() {
+            if let Some(dst) = self.buf.get_mut(..bytes.len()) {
+                dst.copy_from_slice(bytes);
+            }
+            self.fill = bytes.len();
+        }
+    }
+
+    fn finish(mut self) -> ContentId {
+        if self.fill > 0
+            && let Some(tail) = self.buf.get(..self.fill)
+        {
+            self.hasher.update(tail);
+        }
+        self.hasher.finish()
+    }
+}
+
 pub(crate) fn seal_parts<'p>(namespace: Namespace, run: &[u8], index_at: u64, payloads: impl IntoIterator<Item = &'p [u8]>) -> Sealed {
     let count = (run.len() / ENTRY) as u32;
     let header = header(namespace, run, index_at);
     let foot = footer_head(count, index_at);
-    let mut hasher = blaze_ids::Hasher::new(SEGMENT_DIGEST);
+    let mut hasher = BufferedHasher::new(SEGMENT_DIGEST);
     hasher.update(&header);
     let mut at = HEADER as u64;
     for bytes in payloads {
@@ -484,13 +545,15 @@ pub(crate) fn seal_entries<'p>(
     let highest = entries.last().map_or(ContentId([0; 32]), |it| it.key);
     let header = header_of(namespace, count, lowest, highest, index_at);
     let foot = footer_head(count, index_at);
-    let mut hasher = blaze_ids::Hasher::new(SEGMENT_DIGEST);
+    let mut hasher = BufferedHasher::new(SEGMENT_DIGEST);
     hasher.update(&header);
     let mut at = u64::try_from(HEADER).unwrap_or(0);
     for (bytes, pad_len) in payloads {
         hasher.update(bytes);
         let pad = usize::from(pad_len);
-        if let Some(z) = ZEROS.get(..pad) {
+        if pad > 0
+            && let Some(z) = ZEROS.get(..pad)
+        {
             hasher.update(z);
         }
         at = at.saturating_add(u64::try_from(bytes.len()).unwrap_or(0)).saturating_add(u64::from(pad_len));

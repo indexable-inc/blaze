@@ -7,11 +7,10 @@
 //! checker identity comes from its container, kind and name ([`Keys::member`]).
 //! Its source identity is its member-row key ([`Keys::source_member`]).
 
-use std::alloc::Global;
-
 use blaze_hash::HashMap;
 use blaze_id::ItemKey as LibKey;
 use blaze_ids::ContentId;
+use blaze_own::Alloc;
 use blaze_typeck::ItemKey;
 
 /// What a member of a trait or impl is: what its key is made from beside its name. Ordered (in
@@ -42,7 +41,7 @@ pub enum Origin {
     /// An item the library keys (a module-level item, a variant, a macro-made item).
     Item(LibKey),
     /// A member of the trait or impl `container`.
-    Member { container: ItemKey, kind: MemberKind, name: Box<str, Global> },
+    Member { container: ItemKey, kind: MemberKind, name: Box<str> },
 }
 
 /// Two origins under one checker key.
@@ -63,11 +62,11 @@ impl core::fmt::Display for KeyClash {
 pub struct Keys {
     /// Filed through `&self` ([`super::rows::Rows`]): a head imported during a body's check
     /// files its keys while the check holds the map.
-    origins: super::rows::Rows<ItemKey, (Origin, Option<ItemKey>)>,
+    origins: super::rows::Rows<ItemKey, (Origin, Option<ItemKey>), Alloc<'static>>,
     /// The kind of each item declared in a body ([`Keys::local`]): the names library keys no
     /// such item and holds no outline entry for it, so what it is is told here, beside its
     /// origin, and never guessed from a missing entry.
-    locals: HashMap<ItemKey, super::locals::LocalKind, Global>,
+    locals: HashMap<ItemKey, super::locals::LocalKind, Alloc<'static>>,
 }
 
 /// The checker key of a library key: its first 16 bytes.
@@ -80,7 +79,12 @@ pub fn checker_of(key: LibKey) -> ItemKey {
 
 impl Keys {
     pub fn new() -> Keys {
-        Keys { origins: super::rows::Rows::new_in(Global), locals: HashMap::new_in(Global) }
+        Keys::new_in(Alloc::global())
+    }
+
+    /// Creates a key map whose backing tables live in `alloc` (e.g. a body's resettable scratch).
+    pub fn new_in(alloc: Alloc<'static>) -> Keys {
+        Keys { origins: super::rows::Rows::new_in(alloc), locals: HashMap::new_in(alloc) }
     }
 
     /// Resets all filed keys to empty while retaining bounded backing allocations for reuse.

@@ -1181,7 +1181,7 @@ impl<'a, S: Scope, L: LastAnswer, R: ReaderIndex<'a>> Engine<'a, S, L, R> {
             ready: false,
         };
         for (file, plan) in edit.files.iter() {
-            let old = engine.view.take_file(*file)?;
+            let old = engine.view.take_file_members(*file)?;
             let mut names: SVec<'a,Name> = Vec::with_capacity_in(plan.len(), alloc);
             for planned in plan.iter() {
                 names.push(planned.name);
@@ -1190,16 +1190,17 @@ impl<'a, S: Scope, L: LastAnswer, R: ReaderIndex<'a>> Engine<'a, S, L, R> {
                 *count = count.saturating_add(1);
             }
             names.sort_unstable();
-            for name in old.iter() {
+            for name in old.names.iter() {
                 if names.binary_search(name).is_err() {
                     engine.view.unowe(*name);
                     engine.report.retired += u32::from(engine.view.row(*name)?.is_some());
                     engine.remove_row(*name, None)?;
                 }
             }
+            let standing = old.standing.as_deref();
             for planned in plan.iter() {
                 let key = tools.key(planned.name, &planned.source);
-                if !engine.view.member_stands(*file, planned.name, key)? {
+                if !engine.view.member_stands_with(*file, standing, planned.name, key)? {
                     engine.candidate(*planned, None)?;
                 }
             }
@@ -1761,8 +1762,8 @@ impl<'a, S: Scope, L: LastAnswer, R: ReaderIndex<'a>> Engine<'a, S, L, R> {
         if let Some(pair) = names.windows(2).find(|pair| pair[0] == pair[1]) {
             return Err(EngineError::TwoValues { name: pair[0] });
         }
-        let old = self.view.take_file(by)?;
-        for name in old.iter() {
+        let old = self.view.take_file_members(by)?;
+        for name in old.names.iter() {
             if names.binary_search(name).is_ok() {
                 continue;
             }
@@ -1775,11 +1776,12 @@ impl<'a, S: Scope, L: LastAnswer, R: ReaderIndex<'a>> Engine<'a, S, L, R> {
             self.report.retired += u32::from(self.view.row(*name)?.is_some());
             self.remove_row(*name, Some(after))?;
         }
+        let standing = old.standing.as_deref();
         for one in planned.iter() {
             self.planned.insert(one.name, *one);
             self.report.grown += 1;
             let key = self.tools.key(one.name, &one.source);
-            if !self.view.member_stands(by, one.name, key)? {
+            if !self.view.member_stands_with(by, standing, one.name, key)? {
                 self.candidate(*one, None)?;
             }
         }
@@ -1840,8 +1842,8 @@ impl<'a, S: Scope, L: LastAnswer, R: ReaderIndex<'a>> Engine<'a, S, L, R> {
         }
         // As a changed file's plan at the request's start (`with_index_in`): what the last answer
         // planned of the file and this plan does not is retired.
-        let old = self.view.take_file(file)?;
-        for name in old.iter() {
+        let old = self.view.take_file_members(file)?;
+        for name in old.names.iter() {
             if names.binary_search(name).is_ok() {
                 continue;
             }
@@ -1854,15 +1856,16 @@ impl<'a, S: Scope, L: LastAnswer, R: ReaderIndex<'a>> Engine<'a, S, L, R> {
             self.planned.insert(one.name, *one);
             // Planned again (no outline): only a task the earlier plan did not hold is new to
             // the edit's counts.
-            if outline.is_some() || old.binary_search(&one.name).is_err() {
+            if outline.is_some() || old.names.binary_search(&one.name).is_err() {
                 let count = self.edit_counts.entry(one.phase).or_insert(0);
                 *count = count.saturating_add(1);
             }
         }
+        let standing = old.standing.as_deref();
         // The outline, filed as its phase's merge files a planned result: a planned row (not
         // inline), its cells moved once it is in, each reader that did not see them a candidate.
         if let Some(outline) = outline
-            && !self.view.member_stands(file, file, key)?
+            && !self.view.member_stands_with(file, standing, file, key)?
         {
             let cause = match self.view.row(file)? {
                 Some(_) => Cause::KeyMoved,
@@ -1883,7 +1886,7 @@ impl<'a, S: Scope, L: LastAnswer, R: ReaderIndex<'a>> Engine<'a, S, L, R> {
                 continue;
             }
             let key = self.tools.key(one.name, &one.source);
-            if !self.view.member_stands(file, one.name, key)? {
+            if !self.view.member_stands_with(file, standing, one.name, key)? {
                 self.candidate(*one, None)?;
             }
         }
@@ -2433,12 +2436,24 @@ impl<'a, S: Scope, L: LastAnswer, R: ReaderIndex<'a>> Engine<'a, S, L, R> {
         let mut changes: SVec<'a,(CellId, Option<ContentId>)> = Vec::new_in(alloc);
         let empty: &[(Cell, CellDigest)] = &[];
         let before = old.as_ref().map_or(empty, |old| old.defines.as_slice());
+        let old_from_last = old.as_ref().is_some_and(|old| old.from_last);
+        let absent_digest = CellDigest::of(&ABSENT);
         let (mut i, mut j) = (0, 0);
         while i < before.len() || j < done.defines.len() {
             match (before.get(i), done.defines.get(j)) {
                 (Some(b), Some(n)) if b.0 == n.0 => {
-                    if b.1 != CellDigest::of(&n.1) || !self.view.has_cell(&CellId { of: name, cell: n.0 }) {
-                        changes.push((CellId { of: name, cell: n.0 }, Some(n.1)));
+                    let id = CellId { of: name, cell: n.0 };
+                    // When `old` came from `self.last` with a non-ABSENT digest, every cell in
+                    // `old.defines` is already in `self.last`'s cell table unless tombstoned in
+                    // `self.work.cells` during this request; skip the `Ask::Cell` page lookup.
+                    let changed = b.1 != CellDigest::of(&n.1)
+                        || if old_from_last && b.1 != absent_digest {
+                            self.view.cell_tombstoned(&id)
+                        } else {
+                            !self.view.has_cell(&id)
+                        };
+                    if changed {
+                        changes.push((id, Some(n.1)));
                     }
                     i += 1;
                     j += 1;

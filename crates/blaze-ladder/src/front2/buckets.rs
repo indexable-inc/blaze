@@ -33,7 +33,7 @@ use blaze_scope::resolve::Names;
 use blaze_surface::ImplFlags;
 use blaze_typeck::{AssocItem, AssocKind, ItemKey, Mutbl, Name, PNode, PTy, PTys, Shape};
 
-use super::heads::{CoherenceMarks, HeadError, Store, Want, lower};
+use super::heads::{CoherenceMarks, HeadError, Store, Want, with_lowered};
 use super::tables::view::BodyHeadFacts;
 use super::index::Index;
 use super::keys::{Keys, checker_of};
@@ -421,12 +421,14 @@ fn alias_shape_cached<'n, S: NamesSource<'n>>(names: S, alias: LibKey, cache: &m
 fn alias_step<'n, S: NamesSource<'n>>(names: S, alias: LibKey) -> Option<Written> {
     let text = names.signature_text_of(alias)?.text;
     let module = names.home_of(alias)?;
-    let low = lower(names, alias, text).ok()?;
-    let v = low.view();
-    let mut params = Vec::new_in(Global);
-    super::heads::param_names(&v, 0, &mut params, super::heads::Consts::Skip).ok()?;
-    let t = v.head_opt(head::TY)?;
-    shape_step(names, module, &params, &v, lf::TypeId(t))
+    with_lowered(names, alias, text, |v| {
+        let mut params = Vec::new_in(Global);
+        super::heads::param_names(v, 0, &mut params, super::heads::Consts::Skip).ok()?;
+        let t = v.head_opt(head::TY)?;
+        shape_step(names, module, &params, v, lf::TypeId(t))
+    })
+    .ok()
+    .flatten()
 }
 
 /// What one written type is: a constructor, a path to a type alias to read next, or a builtin
@@ -478,42 +480,45 @@ fn shape_step<'n, S: NamesSource<'n>>(names: S, module: LibKey, params: &[(Name,
 /// was read to no constructor ([`PathSelf`]; `None` for any other impl).
 fn file<'n, S: NamesSource<'n>>(names: S, key: LibKey, module: LibKey) -> (Filed, Option<PathSelf>) {
     let Some(it) = names.signature_text_of(key) else { return (Filed::Unread(Unread::NoText, None), None) };
-    let Ok(low) = lower(names, key, it.text) else { return (Filed::Unread(Unread::Unlowered, None), None) };
-    let v = low.view();
-    let mut params = Vec::new_in(Global);
-    if super::heads::param_names(&v, 0, &mut params, super::heads::Consts::Skip).is_err() {
-        return (Filed::Unread(Unread::Generics, None), None);
-    }
-    let self_ty = lf::TypeId(v.head[head::SELF_TY]);
-    let Ok(self_shape) = written_shape(names, module, &params, &v, self_ty) else { return (Filed::NoCheckerType, None) };
-    let path_self = self_shape.is_none() && is_named_path(&params, &v, self_ty);
-    let Some(t) = v.head_opt(head::TRAIT) else { return (Filed::Inherent(self_shape), path_self.then_some(PathSelf::Inherent)) };
-    let Ok(lf::TypeRef::Path(p)) = v.ty(lf::TypeId(t)) else { return (Filed::Unread(Unread::TraitNotAPath, self_shape), None) };
-    let Ok((abs, texts, _, at)) = path_texts(&v, p) else { return (Filed::Unread(Unread::PathUnread, self_shape), None) };
-    let path: Box<str> = format!("{}{}", if abs { "::" } else { "" }, texts.join("::")).into_boxed_str();
-    // Its trait written with no type or const argument ([`Homes::bare`]).
-    let bare = written_args(&v, p).is_ok_and(|n| n == 0);
-    // The trait path is read where its first token's mark says (front2 item_site.rs,
-    // token-mark-F1), as the impl's head reads it (heads.rs `impl_`): a macro's
-    // `$crate::Tr` (written `crate::Tr` in the expansion, with the macro crate's mark) and a
-    // def-site `Tr` of a `macro` name the macro's trait, not a path of the impl's module. Read
-    // at the module, such an impl was filed unread: a candidate of EVERY trait question at its
-    // shape, so each question made its whole head, associated types' values included
-    // (primefield's `type ByteSize = U<{ <$name as ..>::PARAMS.modulus()..div_ceil(8) }>`),
-    // and a constant's own evaluation that asked any trait of the type met that head needing
-    // the constant itself (`ConstFail::Nested`, tempo census r20: 1,402 fns of p256).
-    let marks = match super::item_site::item_marks(names, key, it.text) {
-        Ok(m) => m,
-        Err(lost) => return (Filed::Unread(Unread::Site { path, why: format!("{lost}").into_boxed_str() }, self_shape), None),
-    };
-    match super::item_site::resolve_written(&crate::resolve::Paths { names }, marks, module, &v, p, abs, &texts, Ns::Type, at) {
-        Ok(f) if f.kind == Kind::Trait && f.consumed as usize == texts.len() && v.head[head::FLAGS] & sig::NEGATIVE != 0 => (Filed::Negative(checker_of(f.key), self_shape), None),
-        Ok(f) if f.kind == Kind::Trait && f.consumed as usize == texts.len() => {
-            (Filed::Trait(checker_of(f.key), self_shape, bare), path_self.then(|| PathSelf::Trait { of: names.crate_of(f.key), bare }))
+    match with_lowered(names, key, it.text, |v| {
+        let mut params = Vec::new_in(Global);
+        if super::heads::param_names(v, 0, &mut params, super::heads::Consts::Skip).is_err() {
+            return (Filed::Unread(Unread::Generics, None), None);
         }
-        Ok(f) => (Filed::Unread(Unread::NotATrait { path, kind: f.kind, consumed: f.consumed, written: texts.len() as u32 }, self_shape), None),
-        Err(super::types::Why::Resolve(why, _)) => (Filed::Unread(Unread::Resolve { path, why }, self_shape), None),
-        Err(other) => (Filed::Unread(Unread::Site { path, why: format!("{other:?}").into_boxed_str() }, self_shape), None),
+        let self_ty = lf::TypeId(v.head[head::SELF_TY]);
+        let Ok(self_shape) = written_shape(names, module, &params, v, self_ty) else { return (Filed::NoCheckerType, None) };
+        let path_self = self_shape.is_none() && is_named_path(&params, v, self_ty);
+        let Some(t) = v.head_opt(head::TRAIT) else { return (Filed::Inherent(self_shape), path_self.then_some(PathSelf::Inherent)) };
+        let Ok(lf::TypeRef::Path(p)) = v.ty(lf::TypeId(t)) else { return (Filed::Unread(Unread::TraitNotAPath, self_shape), None) };
+        let Ok((abs, texts, _, at)) = path_texts(v, p) else { return (Filed::Unread(Unread::PathUnread, self_shape), None) };
+        let path: Box<str> = format!("{}{}", if abs { "::" } else { "" }, texts.join("::")).into_boxed_str();
+        // Its trait written with no type or const argument ([`Homes::bare`]).
+        let bare = written_args(v, p).is_ok_and(|n| n == 0);
+        // The trait path is read where its first token's mark says (front2 item_site.rs,
+        // token-mark-F1), as the impl's head reads it (heads.rs `impl_`): a macro's
+        // `$crate::Tr` (written `crate::Tr` in the expansion, with the macro crate's mark) and a
+        // def-site `Tr` of a `macro` name the macro's trait, not a path of the impl's module. Read
+        // at the module, such an impl was filed unread: a candidate of EVERY trait question at its
+        // shape, so each question made its whole head, associated types' values included
+        // (primefield's `type ByteSize = U<{ <$name as ..>::PARAMS.modulus()..div_ceil(8) }>`),
+        // and a constant's own evaluation that asked any trait of the type met that head needing
+        // the constant itself (`ConstFail::Nested`, tempo census r20: 1,402 fns of p256).
+        let marks = match super::item_site::item_marks(names, key, it.text) {
+            Ok(m) => m,
+            Err(lost) => return (Filed::Unread(Unread::Site { path, why: format!("{lost}").into_boxed_str() }, self_shape), None),
+        };
+        match super::item_site::resolve_written(&crate::resolve::Paths { names }, marks, module, v, p, abs, &texts, Ns::Type, at) {
+            Ok(f) if f.kind == Kind::Trait && f.consumed as usize == texts.len() && v.head[head::FLAGS] & sig::NEGATIVE != 0 => (Filed::Negative(checker_of(f.key), self_shape), None),
+            Ok(f) if f.kind == Kind::Trait && f.consumed as usize == texts.len() => {
+                (Filed::Trait(checker_of(f.key), self_shape, bare), path_self.then(|| PathSelf::Trait { of: names.crate_of(f.key), bare }))
+            }
+            Ok(f) => (Filed::Unread(Unread::NotATrait { path, kind: f.kind, consumed: f.consumed, written: texts.len() as u32 }, self_shape), None),
+            Err(super::types::Why::Resolve(why, _)) => (Filed::Unread(Unread::Resolve { path, why }, self_shape), None),
+            Err(other) => (Filed::Unread(Unread::Site { path, why: format!("{other:?}").into_boxed_str() }, self_shape), None),
+        }
+    }) {
+        Ok(got) => got,
+        Err(_) => (Filed::Unread(Unread::Unlowered, None), None),
     }
 }
 

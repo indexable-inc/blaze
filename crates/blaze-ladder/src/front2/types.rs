@@ -146,11 +146,11 @@ fn program(message: std::string::String, r: Range) -> Why {
 /// arguments before it put in (the Reference, "Generic parameters": `Vec<u8>` is
 /// `Vec<u8, Global>`; "Type aliases": a type alias's parameters are generic parameters too).
 /// The one home of default filling for a type path.
-pub(super) fn with_defaults(tys: &mut PortableTys<'_>, kids: &[PTy], g: u32, defaults: &[Option<PTy>], shown: &str, r: Range) -> Result<Vec<PTy, Global>, Why> {
+pub(super) fn with_defaults<'a>(tys: &mut PortableTys<'a>, kids: &[PTy], g: u32, defaults: &[Option<PTy>], shown: &str, r: Range) -> Result<blaze_own::Vec<PTy, Alloc<'a>>, Why> {
     if kids.len() > g as usize {
         return Err(program(format!("`{shown}` is written with {} type arguments; it takes {g}", kids.len()), r));
     }
-    let mut args = Vec::with_capacity_in(g as usize, Global);
+    let mut args = blaze_own::Vec::with_capacity_in(g as usize, tys.alloc());
     args.extend_from_slice(kids);
     for i in kids.len()..g as usize {
         let Some(d) = defaults.get(i).copied().flatten() else {
@@ -440,10 +440,10 @@ pub struct TraitAliasHead {
     pub generics: u32,
     /// Its bounds on `Self` and its where clauses, as clauses (trait clauses and the
     /// projections of `Name = T`); no implied `Sized` on its own parameters.
-    pub clauses: Vec<PClause, Global>,
+    pub clauses: blaze_own::Vec<PClause, Alloc<'static>>,
     /// Its trait clauses on `Self` by library key (what `T::X` is looked up through, as a
     /// [`ParamBound`]), with their arguments over the same parameters.
-    pub traits: Vec<(LibKey, List), Global>,
+    pub traits: blaze_own::Vec<(LibKey, List), Alloc<'static>>,
 }
 
 /// The refusal of a `Self` written where the [`Env`] has no `Self` ([`SelfTy::None`]): one
@@ -918,7 +918,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             Some(rest) => (true, rest),
             None => (false, text),
         };
-        let mut segs: Vec<&str, Global> = Vec::new_in(Global);
+        let mut segs: SmallPath<&str, 8> = SmallPath::new("");
         let mut plain = true;
         for s in rest.split("::") {
             let s = s.trim();
@@ -937,7 +937,9 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         // place: a checked body's constant path holds no `Self` to select an impl by. A leaf
         // refused there refuses this head, naming the leaf and the reason.
         let resolve_ty = |abs: bool, segs: &[&str]| self.resolver.path(env.module, abs, segs, Ns::Type);
-        let with_values = match super::const_qpath::substitute(self.heads, &resolve_ty, text, blaze_own::Alloc::global()) {
+        blaze_mem::frame::task(blaze_mem::Tag::Parse, |frame| {
+        let scratch = blaze_own::Erased::new(frame);
+        let with_values = match super::const_qpath::substitute(self.heads, &resolve_ty, text, scratch.handle()) {
             Ok(done) => done,
             Err(super::const_qpath::Stop::Need(need)) => return Err(Why::NeedConst(need, r)),
             Err(super::const_qpath::Stop::Failed { start, end, why }) => {
@@ -999,6 +1001,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         }
         let need = ask.need;
         if self.heads.ask_anon(ask) { Err(Why::NeedConst(need, r)) } else { Err(other()) }
+        })
     }
 
     /// A constant written as a generic argument, an array length or a const parameter's
@@ -1535,7 +1538,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                     return Err(program(format!("`...` on a fn pointer type of the \"{}\" ABI: that calling convention has no variadics (E0045)", abi.name()), r));
                 }
                 let safety = if unsafety { tc::Safety::Unsafe } else { tc::Safety::Safe };
-                let mut l = Vec::with_capacity_in(kids.len() + 1, Global);
+                let mut l = blaze_own::Vec::with_capacity_in(kids.len() + 1, tys.alloc());
                 l.extend_from_slice(kids);
                 if ret.is_none() {
                     let unit = intern_list(tys, &[])?;
@@ -1698,7 +1701,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 if self.heads.trait_supers(tr).is_none() && !self.heads.trait_has_assoc(tr, name).ok_or(Why::Need(tr))? {
                     return self.written_self_assoc(tys, env, v, name, kids, r, shown);
                 }
-                let mut args = Vec::with_capacity_in(g as usize, Global);
+                let mut args = blaze_own::Vec::with_capacity_in(g as usize, tys.alloc());
                 for i in 0..g {
                     args.push(intern(tys, PNode::Param(i))?);
                 }
@@ -1785,7 +1788,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
     /// is `TryInto<T>`'s). Two distinct traits declaring it are ambiguous (rustc's E0221).
     #[expect(clippy::too_many_arguments, reason = "the trait, the associated item's own arguments, and the path's site")]
     fn trait_self_assoc(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, tr: LibKey, args: List, name: Name, own: &[PTy], r: Range, shown: &str) -> Result<PTy, Why> {
-        let mut found: Vec<(LibKey, List), Global> = Vec::new_in(Global);
+        let mut found: blaze_own::Vec<(LibKey, List), Alloc<'_>> = blaze_own::Vec::new_in(tys.alloc());
         if let Some(owner) = self.assoc_owner(tys, tr, args, name, r, shown)? {
             found.push(owner);
         }
@@ -1821,7 +1824,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             Bounds::Building(b) => (b, false),
             Bounds::Done(b) => (b, true),
         };
-        let mut found: Vec<(LibKey, List), Global> = Vec::new_in(Global);
+        let mut found: blaze_own::Vec<(LibKey, List), Alloc<'_>> = blaze_own::Vec::new_in(tys.alloc());
         for b in bounds.iter().filter(|b| b.param == param) {
             if let Some(owner) = self.assoc_owner(tys, b.trait_, b.args, name, r, shown)? {
                 if !found.contains(&owner) {
@@ -1849,10 +1852,11 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
     /// arguments substituted; `None` when none does, an error when two do.
     pub(super) fn assoc_owner(&self, tys: &mut PortableTys<'_>, tr: LibKey, args: List, name: Name, r: Range, shown: &str) -> Result<Option<(LibKey, List)>, Why> {
         const MOST_SUPERS: usize = 256;
-        let mut todo = Vec::new_in(Global);
+        let alloc = tys.alloc();
+        let mut todo = blaze_own::Vec::new_in(alloc);
         todo.push((tr, args));
         let mut found: Option<(LibKey, List)> = None;
-        let mut seen = Vec::new_in(Global);
+        let mut seen = blaze_own::Vec::new_in(alloc);
         for _ in 0..MOST_SUPERS {
             let Some((t, a)) = todo.pop() else { break };
             if seen.contains(&(t, a)) {
@@ -1867,13 +1871,13 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 continue;
             }
             let given = tys.view().list(a).map_err(|_| program(format!("a list outside the table"), r))?;
-            let mut given_v = Vec::with_capacity_in(given.len(), Global);
+            let mut given_v = blaze_own::Vec::with_capacity_in(given.len(), alloc);
             given_v.extend_from_slice(given);
             for &(st, sargs) in self.heads.trait_supers(t).ok_or(Why::Need(t))? {
                 let written = tys.view().list(sargs).map_err(|_| program(format!("a list outside the table"), r))?;
-                let mut written_v = Vec::with_capacity_in(written.len(), Global);
+                let mut written_v = blaze_own::Vec::with_capacity_in(written.len(), alloc);
                 written_v.extend_from_slice(written);
-                let mut out = Vec::with_capacity_in(written_v.len(), Global);
+                let mut out = blaze_own::Vec::with_capacity_in(written_v.len(), alloc);
                 for &w in &written_v {
                     out.push(subst(tys, w, &given_v)?);
                 }
@@ -1977,17 +1981,17 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
     /// The trait alias `alias` as a bound on `self_ty` with the written arguments `given`: its
     /// clauses with `Self` and its parameters substituted (the unstable book, `trait_alias`:
     /// a bound naming it "is equivalent to" its right-hand side), into `out`.
-    pub(super) fn alias_clauses(&self, tys: &mut PortableTys<'_>, alias: LibKey, r: Range, self_ty: PTy, given: &[PTy], out: &mut Vec<PClause, Global>) -> Result<(), Why> {
+    pub(super) fn alias_clauses<O: Extend<PClause>>(&self, tys: &mut PortableTys<'_>, alias: LibKey, r: Range, self_ty: PTy, given: &[PTy], out: &mut O) -> Result<(), Why> {
         let head = self.heads.trait_alias(alias).ok_or(Why::Need(alias))?;
         let want = head.generics as usize - 1;
         if given.len() != want {
             return Err(program(format!("a trait alias written with {} type arguments; it takes {want}", given.len()), r));
         }
-        let mut args = Vec::with_capacity_in(want + 1, Global);
+        let mut args = blaze_own::Vec::with_capacity_in(want + 1, tys.alloc());
         args.push(self_ty);
         args.extend_from_slice(given);
         for &c in &head.clauses {
-            out.push(subst_clause(tys, c, &args)?);
+            out.extend(core::iter::once(subst_clause(tys, c, &args)?));
         }
         Ok(())
     }
@@ -2000,7 +2004,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         if given.len() > want {
             return Err(program(format!("a trait written with {} type arguments; it takes {want}", given.len()), r));
         }
-        let mut args = Vec::with_capacity_in(want + 1, Global);
+        let mut args = blaze_own::Vec::with_capacity_in(want + 1, tys.alloc());
         args.push(self_ty);
         args.extend_from_slice(given);
         for i in given.len()..want {
@@ -2092,8 +2096,11 @@ pub enum Bounded {
 /// The clause `c` with each `Param(i)` replaced by `args[i]` ([`subst`] over its parts).
 pub fn subst_clause(tys: &mut PortableTys<'_>, c: PClause, args: &[PTy]) -> Result<PClause, Why> {
     let list = |tys: &mut PortableTys<'_>, l: List| -> Result<List, Why> {
-        let old = tys.view().list(l).map_err(|_| program(format!("a clause refers past the type table"), Range::new(0, 0)))?.to_vec_in(Global);
-        let mut new = Vec::with_capacity_in(old.len(), Global);
+        let alloc = tys.alloc();
+        let old_slice = tys.view().list(l).map_err(|_| program(format!("a clause refers past the type table"), Range::new(0, 0)))?;
+        let mut old = blaze_own::Vec::with_capacity_in(old_slice.len(), alloc);
+        old.extend_from_slice(old_slice);
+        let mut new = blaze_own::Vec::with_capacity_in(old.len(), alloc);
         for t in old {
             new.push(subst(tys, t, args)?);
         }
@@ -2235,7 +2242,7 @@ fn body_const_len<H: Heads + ?Sized>(heads: &H, env: &Env<'_>, v: &View<'_>, t: 
 }
 
 /// The types `t` is made of, in order; `None` past the table.
-pub fn children_of(t: blaze_typeck::PTys<'_>, ty: PTy, out: &mut Vec<PTy, Global>) -> Option<()> {
+pub fn children_of(t: blaze_typeck::PTys<'_>, ty: PTy, out: &mut impl Extend<PTy>) -> Option<()> {
     t.children_of(*t.get(ty)?, out).ok()
 }
 
@@ -2309,7 +2316,7 @@ pub(super) fn children(v: &View<'_>, t: lf::TypeId, out: &mut Vec<lf::TypeId, Gl
     children_into(v, t, &mut |id| out.push(id))
 }
 
-fn children_into(v: &View<'_>, t: lf::TypeId, out: &mut impl FnMut(lf::TypeId)) -> Result<(), Why> {
+pub(super) fn children_into(v: &View<'_>, t: lf::TypeId, out: &mut impl FnMut(lf::TypeId)) -> Result<(), Why> {
     let r = place(v, v.type_range(t))?;
     match v.ty(t)? {
         lf::TypeRef::Ref { inner, .. } | lf::TypeRef::Ptr { inner, .. } | lf::TypeRef::Slice(inner) => out(inner),
