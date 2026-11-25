@@ -121,6 +121,14 @@ pub enum UnpackError {
     Alloc(AllocFailure),
 }
 
+fn is_pack_alloc(why: &PackWhy) -> bool {
+    match why {
+        PackWhy::Alloc(_) => true,
+        PackWhy::Inflate(e) => matches!(e.why, blaze_deflate::Why::Alloc(_)),
+        _ => false,
+    }
+}
+
 impl UnpackError {
     /// Whether this refusal was caused by heap allocation exhaustion rather than malformed or
     /// missing archive/repository data.
@@ -128,11 +136,20 @@ impl UnpackError {
         match self {
             UnpackError::Alloc(_)
             | UnpackError::Pack(PackRefused::Alloc(_))
-            | UnpackError::GitAnswer(PktWhy::Alloc(_))
-            | UnpackError::GitStore(StoreWhy::Entry(PackWhy::Alloc(_))) => true,
-            UnpackError::GitPack(e) => matches!(e.why, PackWhy::Alloc(_)),
+            | UnpackError::GitAnswer(PktWhy::Alloc(_)) => true,
+            UnpackError::Gzip(e) => matches!(e.why, blaze_deflate::Why::Alloc(_)),
+            UnpackError::Tar(e) => matches!(e.why, blaze_tar::Why::Alloc(_)),
+            UnpackError::GitPack(e) => is_pack_alloc(&e.why),
+            UnpackError::GitStore(StoreWhy::Entry(why)) => is_pack_alloc(why),
+            UnpackError::GitStore(StoreWhy::Loose(e)) => matches!(e.why, blaze_deflate::Why::Alloc(_)),
             UnpackError::GitTree(e) => matches!(e.why, TreeWhy::Alloc(_)),
-            _ => false,
+            UnpackError::AfterGzip { .. }
+            | UnpackError::Outside { .. }
+            | UnpackError::HardLink { .. }
+            | UnpackError::Pack(_)
+            | UnpackError::GitAnswer(_)
+            | UnpackError::GitStore(_)
+            | UnpackError::NoCommit => false,
         }
     }
 }
