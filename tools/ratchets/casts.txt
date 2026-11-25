@@ -18,7 +18,7 @@ blaze-body-build	19
 blaze-body-drops	14
 blaze-body-flow	24
 blaze-body-lower	22
-blaze-borrow	21
+blaze-borrow	20
 blaze-bstd-convert	9
 blaze-build	736
 blaze-build-script	109
@@ -55,7 +55,7 @@ blaze-facts	12
 blaze-fetch	185
 blaze-file-items	94
 blaze-flow	135
-blaze-flow-lower	421
+blaze-flow-lower	346
 blaze-fmt	62
 blaze-format	44
 blaze-format-core	95
