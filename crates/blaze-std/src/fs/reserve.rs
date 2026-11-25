@@ -78,6 +78,7 @@ fn submit_and_settle(io: &Io, cx: &Cx, key: &FileName, effect: Effect) -> Result
             let err = FsError::new(FsOp::Publish, key, FsKind::Stopped(stopped));
             let until = Deadline::after(io.now(), TEARDOWN_WAIT);
             return match io.settle(tag, until, "bstd::fs::Dir::reserve settle") {
+                Ok(done @ Done::Renamed) => Ok(done),
                 Ok(_done) => Err(SubmitStop::Settled(err)),
                 Err(_) => Err(SubmitStop::Unsettled(err)),
             };
@@ -150,6 +151,8 @@ impl Dir<ReadWrite> {
         write: impl FnOnce(&mut [u8]) -> Result<u64, E>,
     ) -> Result<Result<(), E>, FsError> {
         let key = self.beneath(path);
+        cx.stopped_by(self.io.now())
+            .map_err(|s| FsError::new(FsOp::Publish, &key, FsKind::Stopped(s)))?;
         if let Some(quota) = self.quota.as_deref()
             && let Err(over) = quota.take(room)
         {

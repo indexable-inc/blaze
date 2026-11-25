@@ -674,9 +674,13 @@ fn load_git_folder_odb(
                 let scratch = Frame::with_reserve(reserve, bstd::mem::Tag::Other)
                     .map_err(|_| CliError::Text { what: "the frame a cargo git pack .idx is read in could not be reserved" })?;
                 let mut raw = Bytes::new_in(&scratch, "a cargo git pack .idx, confined read");
-                if git.read_all_confined(cx, &idx_path, &mut raw).is_err() {
-                    failed = true;
-                    break;
+                match git.read_all_confined(cx, &idx_path, &mut raw) {
+                    Ok(_) => {}
+                    Err(error) if error.stopped().is_some() => return Err(CliError::Fs(error)),
+                    Err(_) => {
+                        failed = true;
+                        break;
+                    }
                 }
                 let actual_len = u64::try_from(raw.len()).unwrap_or(u64::MAX);
                 let actual_total = folder_idx_bytes.saturating_add(actual_len);
@@ -936,6 +940,10 @@ impl local::GitObjectSource<Alloc<'static>> for CargoGitSource<'_> {
                 Ok(true)
             }
             Err(error) if error.kind == FsKind::NotFound => Ok(false),
+            Err(error) if matches!(error.stopped(), Some(bstd::Stopped::OutOfMemory { .. })) => {
+                self.alloc_failed = Some("a cargo git loose object exceeded its read frame");
+                Err(local::GitStoreWhy::LooseHeader)
+            }
             Err(_) => {
                 self.io_failed = true;
                 Err(local::GitStoreWhy::LooseHeader)
@@ -972,6 +980,10 @@ impl local::GitObjectSource<Alloc<'static>> for CargoGitSource<'_> {
                     return Err(local::GitStoreWhy::IdxShort);
                 }
                 Ok(true)
+            }
+            Err(error) if error.stopped().is_some() => {
+                self.alloc_failed = Some("a cargo git pack range read stopped");
+                Err(local::GitStoreWhy::IdxShort)
             }
             _ => {
                 self.io_failed = true;
