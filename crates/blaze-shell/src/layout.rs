@@ -4311,6 +4311,61 @@ fn layout_active_popover(
 
     scene.popover_rect = Some(HitRect::new(x0, y0, x1, y1));
 
+    // Active-anchor highlight indicator on whichever item/button/segment spawned this overlay,
+    // plus a crisp 2px left selection rail & hairline bridge for side file/folder previews.
+    let ax0 = pop.anchor.x0 - 2.0;
+    let ay0 = pop.anchor.y0 - 1.0;
+    let ax1 = pop.anchor.x1 + 2.0;
+    let ay1 = pop.anchor.y1 + 1.0;
+    if ax1 > ax0 && ay1 > ay0 {
+        scene.overlay_round_rect(
+            ax0,
+            ay0,
+            ax1,
+            ay1,
+            5.0,
+            theme::rgba(0xff, 0xff, 0xff, 0.08),
+            1.0,
+            theme::rgba(0xff, 0xff, 0xff, 0.24),
+            0,
+        );
+        if is_side_preview {
+            scene.overlay_round_rect(
+                ax0,
+                ay0 + 3.0,
+                ax0 + 2.0,
+                ay1 - 3.0,
+                1.0,
+                theme::INK_1,
+                0.0,
+                [0.0; 4],
+                0,
+            );
+            let mid_y = ((ay0 + ay1) * 0.5).clamp(y0 + 10.0, (y1 - 10.0).max(y0 + 10.0));
+            if x0 >= ax1 + 2.0 {
+                scene.overlay_line(
+                    ax1 + 1.0,
+                    mid_y,
+                    x0 - 1.0,
+                    mid_y,
+                    1.0,
+                    theme::rgba(0xff, 0xff, 0xff, 0.20),
+                    0,
+                );
+            } else if x1 + 2.0 <= ax0 {
+                scene.overlay_line(
+                    x1 + 1.0,
+                    mid_y,
+                    ax0 - 1.0,
+                    mid_y,
+                    1.0,
+                    theme::rgba(0xff, 0xff, 0xff, 0.20),
+                    0,
+                );
+            }
+        }
+    }
+
     // Soft shadow + dark glass body + 1px hairline border.
     scene.overlay_round_rect(
         x0 - 2.0,
