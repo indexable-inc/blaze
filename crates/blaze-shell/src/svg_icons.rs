@@ -72,17 +72,31 @@ const BLAZE_LOCK_SVG: &str = r##"<svg width="16" height="16" viewBox="0 0 16 16"
 <rect x="9.1" y="10.4" width="5.2" height="4.2" rx="0.9" fill="#232529" stroke="#CED0D6" stroke-width="1.15"/>
 </svg>"##;
 
-/// Modern Retina MacBook Pro vector icon (brushed aluminum lid & deck, Retina blue-glass display,
-/// signature camera notch & thumb indent — Apple emoji polish rendered natively in Metal).
+/// Open-perspective Apple MacBook Pro vector icon: glossy jet-black display with diagonal
+/// reflection, brushed-silver trapezoidal aluminum deck, black chiclet keyboard, & trackpad.
 const MACBOOK_PRO_SVG: &str = r##"<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-<rect x="2.1" y="2.2" width="11.8" height="8.5" rx="1.25" fill="#1C2026" stroke="#9EA7B3" stroke-width="0.95"/>
-<rect x="3.0" y="3.1" width="10.0" height="6.6" rx="0.5" fill="#234873"/>
-<path d="M3.0 7.7L7.6 3.1H10.5L3.0 9.7Z" fill="#3D78BF"/>
-<path d="M9.6 9.7L13.0 6.3V9.7H9.6Z" fill="#1B395C"/>
-<rect x="7.0" y="3.0" width="2.0" height="0.85" rx="0.3" fill="#15171B"/>
-<path d="M0.8 11.1H15.2V12.05C15.2 12.65 14.55 13.1 13.75 13.1H2.25C1.45 13.1 0.8 12.65 0.8 12.05V11.1Z" fill="#C7CDD6"/>
-<rect x="6.4" y="11.1" width="3.2" height="0.72" rx="0.35" fill="#7C8490"/>
-<line x1="1.8" y1="12.8" x2="14.2" y2="12.8" stroke="#858E9A" stroke-width="0.55"/>
+<path d="M2.25 1.75C2.2 1.3 2.55 0.95 3.0 0.95H13.0C13.45 0.95 13.8 1.3 13.75 1.75L13.2 8.2H2.8L2.25 1.75Z" fill="#090A0C" stroke="#A2A7B0" stroke-width="0.72"/>
+<path d="M8.9 1.3H13.15L12.78 7.85H11.45L8.9 1.3Z" fill="#3A3D43"/>
+<rect x="2.8" y="8.0" width="10.4" height="0.55" fill="#4C5058"/>
+<path d="M2.7 8.45H13.3L14.9 14.15C15.0 14.55 14.7 14.95 14.25 14.95H1.75C1.3 14.95 1.0 14.55 1.1 14.15L2.7 8.45Z" fill="#C9CCD1"/>
+<path d="M1.2 14.35H14.8L14.6 14.88C14.5 14.95 14.38 14.98 14.25 14.98H1.75C1.62 14.98 1.5 14.95 1.4 14.88L1.2 14.35Z" fill="#989DA6"/>
+<rect x="6.5" y="14.38" width="3.0" height="0.55" rx="0.25" fill="#6D727A"/>
+<rect x="3.2" y="9.0" width="1.25" height="0.65" rx="0.18" fill="#1F2125"/>
+<rect x="4.75" y="9.0" width="1.25" height="0.65" rx="0.18" fill="#1F2125"/>
+<rect x="6.3" y="9.0" width="1.25" height="0.65" rx="0.18" fill="#1F2125"/>
+<rect x="7.85" y="9.0" width="1.25" height="0.65" rx="0.18" fill="#1F2125"/>
+<rect x="9.4" y="9.0" width="1.25" height="0.65" rx="0.18" fill="#1F2125"/>
+<rect x="10.95" y="9.0" width="1.85" height="0.65" rx="0.18" fill="#1F2125"/>
+<rect x="2.9" y="10.0" width="1.55" height="0.68" rx="0.18" fill="#1F2125"/>
+<rect x="4.75" y="10.0" width="1.3" height="0.68" rx="0.18" fill="#1F2125"/>
+<rect x="6.35" y="10.0" width="1.3" height="0.68" rx="0.18" fill="#1F2125"/>
+<rect x="7.95" y="10.0" width="1.3" height="0.68" rx="0.18" fill="#1F2125"/>
+<rect x="9.55" y="10.0" width="1.3" height="0.68" rx="0.18" fill="#1F2125"/>
+<rect x="11.15" y="10.0" width="1.95" height="0.68" rx="0.18" fill="#1F2125"/>
+<rect x="2.6" y="11.02" width="1.9" height="0.72" rx="0.18" fill="#1F2125"/>
+<rect x="4.85" y="11.02" width="6.3" height="0.72" rx="0.18" fill="#1F2125"/>
+<rect x="11.5" y="11.02" width="1.9" height="0.72" rx="0.18" fill="#1F2125"/>
+<path d="M5.65 12.18H10.35L10.75 14.08H5.25L5.65 12.18Z" fill="#9DA1A8"/>
 </svg>"##;
 
 /// Modern dark-slate remote server rack vector icon with crisp luminous status LEDs.
