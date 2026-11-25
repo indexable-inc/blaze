@@ -14,19 +14,11 @@ pub(crate) struct Entry {
 }
 
 const fn e(code: u32, final_byte: u8) -> Option<Entry> {
-    Some(Entry {
-        code,
-        final_byte,
-        modifier: false,
-    })
+    Some(Entry { code, final_byte, modifier: false })
 }
 
 const fn modifier(code: u32) -> Option<Entry> {
-    Some(Entry {
-        code,
-        final_byte: b'u',
-        modifier: true,
-    })
+    Some(Entry { code, final_byte: b'u', modifier: true })
 }
 
 /// The table entry for `key`, if it has one (ghostty `kitty.zig:39`).

@@ -2,8 +2,13 @@
 //! only.
 
 use super::focus::{self, FocusEvent, FocusOpts};
-use super::key::{self, Action, EncodeOpts, Key, KeyEvent, KittyFlags, Mods, OptionAsAlt, Platform};
-use super::mouse::{self, Cell, MouseAction, MouseButton, MouseEvent, MouseEvents, MouseFormat, MouseOpts, Padding, Pixels, Size, SurfacePos};
+use super::key::{
+    self, Action, EncodeOpts, Key, KeyEvent, KittyFlags, Mods, OptionAsAlt, Platform,
+};
+use super::mouse::{
+    self, Cell, MouseAction, MouseButton, MouseEvent, MouseEvents, MouseFormat, MouseOpts, Padding,
+    Pixels, Size, SurfacePos,
+};
 use super::paste::{self, PasteOpts};
 use std::vec::Vec;
 
@@ -14,27 +19,15 @@ fn opts() -> EncodeOpts {
 }
 
 fn kitty(flags: KittyFlags) -> EncodeOpts {
-    EncodeOpts {
-        kitty_flags: flags,
-        ..opts()
-    }
+    EncodeOpts { kitty_flags: flags, ..opts() }
 }
 
 fn k(key: Key, mods: Mods) -> KeyEvent<'static> {
-    KeyEvent {
-        key,
-        mods,
-        ..KeyEvent::default()
-    }
+    KeyEvent { key, mods, ..KeyEvent::default() }
 }
 
 fn text(key: Key, mods: Mods, utf8: &'static str) -> KeyEvent<'static> {
-    KeyEvent {
-        key,
-        mods,
-        utf8: utf8.as_bytes(),
-        ..KeyEvent::default()
-    }
+    KeyEvent { key, mods, utf8: utf8.as_bytes(), ..KeyEvent::default() }
 }
 
 fn enc(e: &KeyEvent<'_>, o: &EncodeOpts) -> Vec<u8> {
@@ -84,7 +77,15 @@ fn inv10_legacy_modifier_param() {
 // "Modifier values": kitty 1 + bits (shift 1, alt 2, ctrl 4, super 8, caps 64, num 128).
 #[test]
 fn inv10_kitty_modifier_bits() {
-    for (m, p) in [(S, 2), (A, 3), (C, 5), (U, 9), (Mods::CAPS_LOCK, 65), (Mods::NUM_LOCK, 129), (S | A | C | U | Mods::CAPS_LOCK | Mods::NUM_LOCK, 208)] {
+    for (m, p) in [
+        (S, 2),
+        (A, 3),
+        (C, 5),
+        (U, 9),
+        (Mods::CAPS_LOCK, 65),
+        (Mods::NUM_LOCK, 129),
+        (S | A | C | U | Mods::CAPS_LOCK | Mods::NUM_LOCK, 208),
+    ] {
         is(k(Key::F13, m), kitty(KittyFlags::DISAMBIGUATE), &std::format!("\x1b[57376;{p}u"));
     }
 }
@@ -92,11 +93,10 @@ fn inv10_kitty_modifier_bits() {
 // "Legacy keys": Up / Down / Right / Left, CSI A–D, `CSI 1;m X`, DECCKM SS3 A–D.
 #[test]
 fn inv10_legacy_arrows() {
-    let app = EncodeOpts {
-        cursor_key_application: true,
-        ..opts()
-    };
-    for (key, f) in [(Key::ArrowUp, 'A'), (Key::ArrowDown, 'B'), (Key::ArrowRight, 'C'), (Key::ArrowLeft, 'D')] {
+    let app = EncodeOpts { cursor_key_application: true, ..opts() };
+    for (key, f) in
+        [(Key::ArrowUp, 'A'), (Key::ArrowDown, 'B'), (Key::ArrowRight, 'C'), (Key::ArrowLeft, 'D')]
+    {
         is(k(key, Mods::NONE), opts(), &std::format!("\x1b[{f}"));
         is(k(key, Mods::NONE), app, &std::format!("\x1bO{f}"));
         is(k(key, S), opts(), &std::format!("\x1b[1;2{f}"));
@@ -107,10 +107,7 @@ fn inv10_legacy_arrows() {
 // "Legacy keys": Home / End, CSI H / CSI F, `CSI 1;m H/F`, DECCKM SS3 H/F.
 #[test]
 fn inv10_legacy_home_end() {
-    let app = EncodeOpts {
-        cursor_key_application: true,
-        ..opts()
-    };
+    let app = EncodeOpts { cursor_key_application: true, ..opts() };
     for (key, f) in [(Key::Home, 'H'), (Key::End, 'F')] {
         is(k(key, Mods::NONE), opts(), &std::format!("\x1b[{f}"));
         is(k(key, Mods::NONE), app, &std::format!("\x1bO{f}"));
@@ -159,14 +156,8 @@ fn inv10_legacy_f5_f12_and_no_f13() {
 // with ?66 set and ?1035 off.
 #[test]
 fn inv10_legacy_keypad() {
-    let kpam = EncodeOpts {
-        keypad_key_application: true,
-        ..opts()
-    };
-    let numlock = EncodeOpts {
-        ignore_keypad_with_numlock: true,
-        ..kpam
-    };
+    let kpam = EncodeOpts { keypad_key_application: true, ..opts() };
+    let numlock = EncodeOpts { ignore_keypad_with_numlock: true, ..kpam };
     let keys = [
         (Key::Numpad0, "0", 'p'),
         (Key::Numpad5, "5", 'u'),
@@ -192,10 +183,7 @@ fn inv10_legacy_keypad() {
 // Begin is `CSI E` / `SS3 E`.
 #[test]
 fn inv10_legacy_keypad_navigation() {
-    let app = EncodeOpts {
-        cursor_key_application: true,
-        ..opts()
-    };
+    let app = EncodeOpts { cursor_key_application: true, ..opts() };
     for (kp, main) in [
         (Key::NumpadUp, Key::ArrowUp),
         (Key::NumpadDown, Key::ArrowDown),
@@ -222,14 +210,8 @@ fn inv10_legacy_keypad_navigation() {
 // modifyOtherKeys 2 `CSI 27;m;127~`.
 #[test]
 fn inv10_legacy_backspace() {
-    let bkm = EncodeOpts {
-        backarrow_key_mode: true,
-        ..opts()
-    };
-    let mok2 = EncodeOpts {
-        modify_other_keys_state_2: true,
-        ..opts()
-    };
+    let bkm = EncodeOpts { backarrow_key_mode: true, ..opts() };
+    let mok2 = EncodeOpts { modify_other_keys_state_2: true, ..opts() };
     is(k(Key::Backspace, Mods::NONE), opts(), "\x7f");
     is(k(Key::Backspace, Mods::NONE), bkm, "\x08");
     is(k(Key::Backspace, C), opts(), "\x08");
@@ -296,11 +278,7 @@ fn inv10_ctrl_char_c0_table() {
     }
     for c in b'a'..=b'z' {
         let t = [c];
-        let e = KeyEvent {
-            mods: C,
-            utf8: &t,
-            ..KeyEvent::default()
-        };
+        let e = KeyEvent { mods: C, utf8: &t, ..KeyEvent::default() };
         let want = match c {
             b'i' | b'm' => std::format!("\x1b[{c};5u").into_bytes(),
             _ => std::vec![c - b'a' + 1],
@@ -324,10 +302,7 @@ fn inv10_ctrl_alt_esc_prefix() {
 fn inv10_ctrl_other_char_csi_u() {
     is(text(Key::Quote, C, "'"), opts(), "\x1b[39;5u");
     is(text(Key::Unidentified, C, "é"), opts(), "\x1b[233;5u");
-    let shifted = KeyEvent {
-        unshifted_codepoint: Some('a'),
-        ..text(Key::KeyA, C | S, "A")
-    };
+    let shifted = KeyEvent { unshifted_codepoint: Some('a'), ..text(Key::KeyA, C | S, "A") };
     is(shifted, opts(), "\x1b[97;6u");
 }
 
@@ -335,17 +310,11 @@ fn inv10_ctrl_other_char_csi_u() {
 #[test]
 fn inv10_alt_char() {
     let e = text(Key::KeyX, A, "x");
-    let prefix = EncodeOpts {
-        alt_esc_prefix: true,
-        ..opts()
-    };
+    let prefix = EncodeOpts { alt_esc_prefix: true, ..opts() };
     // Without 1036: the text.
     is(e, opts(), "x");
     assert_eq!(enc(&e, &prefix), b"\x1bx");
-    let mac = EncodeOpts {
-        platform: Platform::MacOs,
-        ..prefix
-    };
+    let mac = EncodeOpts { platform: Platform::MacOs, ..prefix };
     assert_eq!(enc(&e, &mac), b"x");
     for (setting, side, want) in [
         (OptionAsAlt::True, Mods::NONE, "\x1bx"),
@@ -354,10 +323,7 @@ fn inv10_alt_char() {
         (OptionAsAlt::Right, Mods::ALT_RIGHT_SIDE, "\x1bx"),
         (OptionAsAlt::Right, Mods::NONE, "x"),
     ] {
-        let o = EncodeOpts {
-            macos_option_as_alt: setting,
-            ..mac
-        };
+        let o = EncodeOpts { macos_option_as_alt: setting, ..mac };
         let e = KeyEvent { mods: A | side, ..e };
         assert_eq!(enc(&e, &o), want.as_bytes(), "{setting:?} {side:?}");
     }
@@ -397,10 +363,7 @@ fn inv10_macos_cmd_key_sends_nothing() {
 fn inv10_ime_composing() {
     let committed = text(Key::Unidentified, Mods::NONE, "日本");
     is(committed, opts(), "日本");
-    let composing = KeyEvent {
-        composing: true,
-        ..committed
-    };
+    let composing = KeyEvent { composing: true, ..committed };
     is(composing, opts(), "");
     is(composing, kitty(KittyFlags::DISAMBIGUATE), "");
 }
@@ -457,10 +420,7 @@ fn inv10_kitty_no_report_all() {
     is(k(Key::Backspace, Mods::NONE), o, "\x7f");
     is(text(Key::KeyQ, Mods::NONE, "q"), o, "q");
     // Shift consumed by the layout is not a modifier for this.
-    let shifted = KeyEvent {
-        consumed_mods: S,
-        ..text(Key::KeyQ, S, "Q")
-    };
+    let shifted = KeyEvent { consumed_mods: S, ..text(Key::KeyQ, S, "Q") };
     is(shifted, o, "Q");
 }
 
@@ -470,25 +430,15 @@ fn inv10_kitty_no_report_all() {
 #[test]
 fn inv10_kitty_report_events() {
     let o = kitty(KittyFlags::DISAMBIGUATE | KittyFlags::REPORT_EVENTS);
-    let a = |action| KeyEvent {
-        action,
-        unshifted_codepoint: Some('a'),
-        ..k(Key::KeyA, C)
-    };
+    let a = |action| KeyEvent { action, unshifted_codepoint: Some('a'), ..k(Key::KeyA, C) };
     is(a(Action::Press), o, "\x1b[97;5u");
     is(a(Action::Repeat), o, "\x1b[97;5:2u");
     is(a(Action::Release), o, "\x1b[97;5:3u");
-    let unmodified = KeyEvent {
-        action: Action::Repeat,
-        ..k(Key::F13, Mods::NONE)
-    };
+    let unmodified = KeyEvent { action: Action::Repeat, ..k(Key::F13, Mods::NONE) };
     is(unmodified, o, "\x1b[57376;1:2u");
     is(k(Key::F13, Mods::NONE), o, "\x1b[57376u");
     is(k(Key::ArrowUp, Mods::NONE), o, "\x1b[1;1:1A");
-    let up_release = KeyEvent {
-        action: Action::Release,
-        ..k(Key::ArrowUp, S)
-    };
+    let up_release = KeyEvent { action: Action::Release, ..k(Key::ArrowUp, S) };
     is(up_release, o, "\x1b[1;2:3A");
     // Without flag 2, releases send nothing.
     is(a(Action::Release), kitty(KittyFlags::DISAMBIGUATE), "");
@@ -499,16 +449,10 @@ fn inv10_kitty_report_events() {
 fn inv10_kitty_events_without_report_all() {
     let o = kitty(KittyFlags::DISAMBIGUATE | KittyFlags::REPORT_EVENTS);
     for key in [Key::Enter, Key::Tab, Key::Backspace] {
-        let rel = KeyEvent {
-            action: Action::Release,
-            ..k(key, C)
-        };
+        let rel = KeyEvent { action: Action::Release, ..k(key, C) };
         is(rel, o, "");
     }
-    let rel = KeyEvent {
-        action: Action::Release,
-        ..k(Key::Escape, Mods::NONE)
-    };
+    let rel = KeyEvent { action: Action::Release, ..k(Key::Escape, Mods::NONE) };
     is(rel, o, "\x1b[27;1:3u");
 }
 
@@ -516,10 +460,7 @@ fn inv10_kitty_events_without_report_all() {
 #[test]
 fn inv10_kitty_report_alternates() {
     let o = kitty(KittyFlags::DISAMBIGUATE | KittyFlags::REPORT_ALTERNATES);
-    let e = KeyEvent {
-        unshifted_codepoint: Some('2'),
-        ..text(Key::Digit2, S | C, "@")
-    };
+    let e = KeyEvent { unshifted_codepoint: Some('2'), ..text(Key::Digit2, S | C, "@") };
     is(e, o, "\x1b[50:64;6u");
     // Control codes (Escape 27 here) get none.
     is(text(Key::Escape, S, "\x1b"), o, "\x1b[27;2u");
@@ -529,10 +470,7 @@ fn inv10_kitty_report_alternates() {
 #[test]
 fn inv10_kitty_report_all() {
     let o = kitty(KittyFlags::DISAMBIGUATE | KittyFlags::REPORT_ALL);
-    let a = KeyEvent {
-        unshifted_codepoint: Some('a'),
-        ..text(Key::KeyA, Mods::NONE, "a")
-    };
+    let a = KeyEvent { unshifted_codepoint: Some('a'), ..text(Key::KeyA, Mods::NONE, "a") };
     is(a, o, "\x1b[97u");
     is(k(Key::Enter, Mods::NONE), o, "\x1b[13u");
     is(k(Key::Tab, Mods::NONE), o, "\x1b[9u");
@@ -543,11 +481,9 @@ fn inv10_kitty_report_all() {
 // "Kitty, flag 16": associated text, not with ctrl/super/alt (but macOS option), not on release.
 #[test]
 fn inv10_kitty_report_associated() {
-    let o = kitty(KittyFlags::DISAMBIGUATE | KittyFlags::REPORT_ALL | KittyFlags::REPORT_ASSOCIATED);
-    let e = |mods, t| KeyEvent {
-        unshifted_codepoint: Some('a'),
-        ..text(Key::KeyA, mods, t)
-    };
+    let o =
+        kitty(KittyFlags::DISAMBIGUATE | KittyFlags::REPORT_ALL | KittyFlags::REPORT_ASSOCIATED);
+    let e = |mods, t| KeyEvent { unshifted_codepoint: Some('a'), ..text(Key::KeyA, mods, t) };
     is(e(Mods::NONE, "a"), o, "\x1b[97;;97u");
     is(e(S, "A"), o, "\x1b[97;2;65u");
     is(e(C, "a"), o, "\x1b[97;5u");
@@ -555,58 +491,33 @@ fn inv10_kitty_report_associated() {
     // Alt prevents text on Linux; on macOS only when option is alt.
     let alt = e(A, "å");
     assert_eq!(enc(&alt, &o), b"\x1b[97;3u");
-    let mac = EncodeOpts {
-        platform: Platform::MacOs,
-        ..o
-    };
+    let mac = EncodeOpts { platform: Platform::MacOs, ..o };
     assert_eq!(enc(&alt, &mac), b"\x1b[97;3;229u");
-    let mac_alt = EncodeOpts {
-        macos_option_as_alt: OptionAsAlt::True,
-        ..mac
-    };
+    let mac_alt = EncodeOpts { macos_option_as_alt: OptionAsAlt::True, ..mac };
     assert_eq!(enc(&alt, &mac_alt), b"\x1b[97;3u");
     // Not on release.
-    let rel = KeyEvent {
-        action: Action::Release,
-        ..e(Mods::NONE, "a")
-    };
+    let rel = KeyEvent { action: Action::Release, ..e(Mods::NONE, "a") };
     let ev = kitty(KittyFlags::ALL);
     is(rel, ev, "\x1b[97;1:3u");
     // Several code points.
-    let multi = KeyEvent {
-        unshifted_codepoint: Some('a'),
-        ..text(Key::KeyA, Mods::NONE, "ab")
-    };
+    let multi = KeyEvent { unshifted_codepoint: Some('a'), ..text(Key::KeyA, Mods::NONE, "ab") };
     is(multi, o, "\x1b[97;;97:98u");
 }
 
 fn msize() -> Size {
     Size {
-        screen: Pixels {
-            width: 1000,
-            height: 1000,
-        },
+        screen: Pixels { width: 1000, height: 1000 },
         cell: Pixels { width: 1, height: 1 },
         padding: Padding::default(),
     }
 }
 
 fn mo(event: MouseEvents, format: MouseFormat) -> MouseOpts {
-    MouseOpts {
-        event,
-        format,
-        size: msize(),
-        any_button_pressed: true,
-    }
+    MouseOpts { event, format, size: msize(), any_button_pressed: true }
 }
 
 fn me(button: Option<MouseButton>, action: MouseAction, mods: Mods, x: f32, y: f32) -> MouseEvent {
-    MouseEvent {
-        action,
-        button,
-        mods,
-        pos: SurfacePos { x, y },
-    }
+    MouseEvent { action, button, mods, pos: SurfacePos { x, y } }
 }
 
 fn menc(e: &MouseEvent, o: &MouseOpts) -> Vec<u8> {
@@ -621,7 +532,10 @@ const L: Option<MouseButton> = Some(MouseButton::Left);
 fn inv10_mouse_x10_format() {
     let o = mo(MouseEvents::Normal, MouseFormat::X10);
     assert_eq!(menc(&me(L, MouseAction::Press, Mods::NONE, 9.0, 4.0), &o), b"\x1b[M\x20\x2a\x25");
-    assert_eq!(menc(&me(L, MouseAction::Press, Mods::NONE, 222.0, 222.0), &o), b"\x1b[M\x20\xff\xff");
+    assert_eq!(
+        menc(&me(L, MouseAction::Press, Mods::NONE, 222.0, 222.0), &o),
+        b"\x1b[M\x20\xff\xff"
+    );
     assert_eq!(menc(&me(L, MouseAction::Press, Mods::NONE, 0.0, 223.0), &o), b"");
 }
 
@@ -631,7 +545,10 @@ fn inv10_mouse_utf8() {
     let o = mo(MouseEvents::Normal, MouseFormat::Utf8);
     assert_eq!(menc(&me(L, MouseAction::Press, Mods::NONE, 9.0, 4.0), &o), b"\x1b[M\x20\x2a\x25");
     // 167 + 33 = U+00C8, two bytes; 0 + 33 = `!`.
-    assert_eq!(menc(&me(L, MouseAction::Press, Mods::NONE, 167.0, 0.0), &o), b"\x1b[M\x20\xc3\x88!");
+    assert_eq!(
+        menc(&me(L, MouseAction::Press, Mods::NONE, 167.0, 0.0), &o),
+        b"\x1b[M\x20\xc3\x88!"
+    );
 }
 
 // "Mouse SGR (1006)": `CSI < b;x;y M` / `m` on release.
@@ -640,32 +557,39 @@ fn inv10_mouse_sgr() {
     let o = mo(MouseEvents::Normal, MouseFormat::Sgr);
     assert_eq!(menc(&me(L, MouseAction::Press, Mods::NONE, 9.0, 4.0), &o), b"\x1b[<0;10;5M");
     assert_eq!(menc(&me(L, MouseAction::Release, Mods::NONE, 9.0, 4.0), &o), b"\x1b[<0;10;5m");
-    assert_eq!(menc(&me(L, MouseAction::Press, Mods::NONE, 999.0, 999.0), &o), b"\x1b[<0;1000;1000M");
+    assert_eq!(
+        menc(&me(L, MouseAction::Press, Mods::NONE, 999.0, 999.0), &o),
+        b"\x1b[<0;1000;1000M"
+    );
 }
 
 // "Mouse urxvt (1015)": `CSI 32+b;x;y M`.
 #[test]
 fn inv10_mouse_urxvt() {
     let o = mo(MouseEvents::Normal, MouseFormat::Urxvt);
-    assert_eq!(menc(&me(Some(MouseButton::Middle), MouseAction::Press, Mods::NONE, 9.0, 4.0), &o), b"\x1b[33;10;5M");
-    assert_eq!(menc(&me(Some(MouseButton::Middle), MouseAction::Release, Mods::NONE, 9.0, 4.0), &o), b"\x1b[35;10;5M");
+    assert_eq!(
+        menc(&me(Some(MouseButton::Middle), MouseAction::Press, Mods::NONE, 9.0, 4.0), &o),
+        b"\x1b[33;10;5M"
+    );
+    assert_eq!(
+        menc(&me(Some(MouseButton::Middle), MouseAction::Release, Mods::NONE, 9.0, 4.0), &o),
+        b"\x1b[35;10;5M"
+    );
 }
 
 // "Mouse SGR-pixels (1016)": SGR with pixel coordinates, rounded, may be negative or outside.
 #[test]
 fn inv10_mouse_sgr_pixels() {
     let mut o = mo(MouseEvents::Any, MouseFormat::SgrPixels);
-    o.size.padding = Padding {
-        top: 10,
-        bottom: 0,
-        right: 0,
-        left: 10,
-    };
+    o.size.padding = Padding { top: 10, bottom: 0, right: 0, left: 10 };
     assert_eq!(menc(&me(L, MouseAction::Press, Mods::NONE, 15.6, 12.4), &o), b"\x1b[<0;6;2M");
     // Above-left of the grid: negative.
     assert_eq!(menc(&me(L, MouseAction::Press, Mods::NONE, 2.0, 3.0), &o), b"\x1b[<0;-8;-7M");
     // Outside the surface while dragging.
-    assert_eq!(menc(&me(L, MouseAction::Motion, Mods::NONE, 1500.0, -20.0), &o), b"\x1b[<32;1490;-30M");
+    assert_eq!(
+        menc(&me(L, MouseAction::Motion, Mods::NONE, 1500.0, -20.0), &o),
+        b"\x1b[<32;1490;-30M"
+    );
 }
 
 // "Mouse button codes": L 0, M 1, R 2, wheel 4–7 → 64–67, 8/9 → 128/129; shift +4, alt +8,
@@ -685,18 +609,33 @@ fn inv10_mouse_button_codes() {
         (MouseButton::Eight, 128),
         (MouseButton::Nine, 129),
     ] {
-        assert_eq!(menc(&me(Some(b), MouseAction::Press, Mods::NONE, 0.0, 0.0), &o), std::format!("\x1b[<{code};1;1M").as_bytes());
+        assert_eq!(
+            menc(&me(Some(b), MouseAction::Press, Mods::NONE, 0.0, 0.0), &o),
+            std::format!("\x1b[<{code};1;1M").as_bytes()
+        );
     }
     for (m, add) in [(S, 4), (A, 8), (C, 16), (S | A | C, 28)] {
-        assert_eq!(menc(&me(L, MouseAction::Press, m, 0.0, 0.0), &o), std::format!("\x1b[<{add};1;1M").as_bytes());
+        assert_eq!(
+            menc(&me(L, MouseAction::Press, m, 0.0, 0.0), &o),
+            std::format!("\x1b[<{add};1;1M").as_bytes()
+        );
     }
     assert_eq!(menc(&me(L, MouseAction::Motion, S, 0.0, 0.0), &o), b"\x1b[<36;1;1M");
     assert_eq!(menc(&me(None, MouseAction::Motion, Mods::NONE, 0.0, 0.0), &o), b"\x1b[<35;1;1M");
     let legacy = mo(MouseEvents::Any, MouseFormat::X10);
-    assert_eq!(menc(&me(Some(MouseButton::Right), MouseAction::Release, Mods::NONE, 0.0, 0.0), &legacy), b"\x1b[M\x23!!");
+    assert_eq!(
+        menc(&me(Some(MouseButton::Right), MouseAction::Release, Mods::NONE, 0.0, 0.0), &legacy),
+        b"\x1b[M\x23!!"
+    );
     let x10 = mo(MouseEvents::X10, MouseFormat::Sgr);
-    assert_eq!(menc(&me(Some(MouseButton::Right), MouseAction::Press, C | S, 0.0, 0.0), &x10), b"\x1b[<2;1;1M");
-    assert_eq!(menc(&me(Some(MouseButton::Four), MouseAction::Press, Mods::NONE, 0.0, 0.0), &x10), b"");
+    assert_eq!(
+        menc(&me(Some(MouseButton::Right), MouseAction::Press, C | S, 0.0, 0.0), &x10),
+        b"\x1b[<2;1;1M"
+    );
+    assert_eq!(
+        menc(&me(Some(MouseButton::Four), MouseAction::Press, Mods::NONE, 0.0, 0.0), &x10),
+        b""
+    );
 }
 
 // "Mouse event modes": 1000 no motion, 1002 motion with a button held, 1003 all; motion only on
@@ -717,7 +656,9 @@ fn inv10_mouse_event_modes() {
     let mut last: Option<Cell> = None;
     let mut buf = [0u8; mouse::MAX_LEN];
     let step = |x: f32, last: &mut Option<Cell>, buf: &mut [u8; mouse::MAX_LEN], o: &MouseOpts| {
-        mouse::encode(&me(L, MouseAction::Motion, Mods::NONE, x, 3.0), o, Some(last), buf).unwrap().to_vec()
+        mouse::encode(&me(L, MouseAction::Motion, Mods::NONE, x, 3.0), o, Some(last), buf)
+            .unwrap()
+            .to_vec()
     };
     assert_eq!(step(3.2, &mut last, &mut buf, &o), b"\x1b[<32;4;4M");
     assert_eq!(step(3.7, &mut last, &mut buf, &o), b"");
@@ -727,7 +668,10 @@ fn inv10_mouse_event_modes() {
 
     // Outside the viewport.
     let mut out = mo(MouseEvents::Normal, MouseFormat::Sgr);
-    assert_eq!(menc(&me(L, MouseAction::Release, Mods::NONE, -5.0, 2000.0), &out), b"\x1b[<0;1;1000m");
+    assert_eq!(
+        menc(&me(L, MouseAction::Release, Mods::NONE, -5.0, 2000.0), &out),
+        b"\x1b[<0;1;1000m"
+    );
     assert_eq!(menc(&me(L, MouseAction::Press, Mods::NONE, -5.0, 2.0), &out), b"");
     out.event = MouseEvents::Button;
     assert_eq!(menc(&me(L, MouseAction::Motion, Mods::NONE, -5.0, 2.0), &out), b"\x1b[<32;1;3M");

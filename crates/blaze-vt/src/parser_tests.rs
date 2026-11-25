@@ -120,7 +120,10 @@ fn csi_sgr_colon_sets_the_separator_bit() {
 #[test]
 fn csi_sgr_underline_color_with_many_colons() {
     // Parser.zig:633 "csi: SGR with many blank and colon"
-    assert_eq!(run(b"\x1b[58:2::240:143:104m"), vec![csi(b"", &[58, 2, 0, 240, 143, 104], 0b11111, b'm')]);
+    assert_eq!(
+        run(b"\x1b[58:2::240:143:104m"),
+        vec![csi(b"", &[58, 2, 0, 240, 143, 104], 0b11111, b'm')]
+    );
 }
 
 #[test]
@@ -210,13 +213,19 @@ fn csi_executes_c0_inside() {
 fn osc_title_ended_by_bel_and_by_st() {
     // Parser.zig:844 "osc: change window title", :867 "(end in esc)"
     assert_eq!(run(b"\x1b]2;abc\x07"), vec![Ev::Osc(b"2;abc".to_vec(), Terminator::Bel)]);
-    assert_eq!(run(b"\x1b]2;abc\x1b\\"), vec![Ev::Osc(b"2;abc".to_vec(), Terminator::St), Ev::Esc(vec![], b'\\')]);
+    assert_eq!(
+        run(b"\x1b]2;abc\x1b\\"),
+        vec![Ev::Osc(b"2;abc".to_vec(), Terminator::St), Ev::Esc(vec![], b'\\')]
+    );
 }
 
 #[test]
 fn osc_ended_by_can_still_dispatches() {
     // vt-inventory.md §1: leaving osc_string dispatches on any exit.
-    assert_eq!(run(b"\x1b]0;t\x18A"), vec![Ev::Osc(b"0;t".to_vec(), Terminator::St), Ev::Exec(0x18), Ev::Print('A')]);
+    assert_eq!(
+        run(b"\x1b]0;t\x18A"),
+        vec![Ev::Osc(b"0;t".to_vec(), Terminator::St), Ev::Exec(0x18), Ev::Print('A')]
+    );
 }
 
 #[test]
@@ -260,13 +269,19 @@ fn dcs_too_many_params_is_never_hooked() {
 #[test]
 fn apc_bulk_payload_keeps_c0_and_ends_at_st() {
     // stream.zig:3868 "apc bulk slice", :3900 "keeps C0 bytes as data"
-    assert_eq!(run(b"\x1b_Gab\x01c\x1b\\"), vec![Ev::Apc(b"Gab\x01c".to_vec()), Ev::Esc(vec![], b'\\')]);
+    assert_eq!(
+        run(b"\x1b_Gab\x01c\x1b\\"),
+        vec![Ev::Apc(b"Gab\x01c".to_vec()), Ev::Esc(vec![], b'\\')]
+    );
 }
 
 #[test]
 fn apc_aborted_by_can() {
     // stream.zig:3909 "apc aborted by CAN"
-    assert_eq!(run(b"\x1b_Gab\x18Z"), vec![Ev::Apc(b"Gab".to_vec()), Ev::Exec(0x18), Ev::Print('Z')]);
+    assert_eq!(
+        run(b"\x1b_Gab\x18Z"),
+        vec![Ev::Apc(b"Gab".to_vec()), Ev::Exec(0x18), Ev::Print('Z')]
+    );
 }
 
 #[test]
@@ -278,15 +293,18 @@ fn sos_and_pm_are_apc() {
 #[test]
 fn ground_c0_up_to_0x0f_executes_and_the_rest_print() {
     // Terminal.zig:12561: 0x10–0x1F (but ESC) and DEL are printed in ground.
-    assert_eq!(run(b"\x07\x0f\x10\x18\x1a\x1f\x7f"), vec![
-        Ev::Exec(0x07),
-        Ev::Exec(0x0f),
-        Ev::Print('\u{10}'),
-        Ev::Print('\u{18}'),
-        Ev::Print('\u{1a}'),
-        Ev::Print('\u{1f}'),
-        Ev::Print('\u{7f}'),
-    ]);
+    assert_eq!(
+        run(b"\x07\x0f\x10\x18\x1a\x1f\x7f"),
+        vec![
+            Ev::Exec(0x07),
+            Ev::Exec(0x0f),
+            Ev::Print('\u{10}'),
+            Ev::Print('\u{18}'),
+            Ev::Print('\u{1a}'),
+            Ev::Print('\u{1f}'),
+            Ev::Print('\u{7f}'),
+        ]
+    );
 }
 
 #[test]
@@ -314,15 +332,20 @@ fn utf8_invalid_bytes_and_cut_sequences() {
     assert_eq!(run(&[0xFF]), vec![Ev::Print('\u{FFFD}')]);
     assert_eq!(run(&[0xE0, 0xA0, 0x80]), vec![Ev::Print('\u{800}')]);
     // UTF8Decoder.zig:141: a cut sequence is one U+FFFD and the breaking byte is read again.
-    assert_eq!(run(&[0xF0, 0x9F, 0x98, 0x84, 0xF0, 0x9F, 0x41]), vec![
-        Ev::Print('\u{1F604}'),
-        Ev::Print('\u{FFFD}'),
-        Ev::Print('A'),
-    ]);
+    assert_eq!(
+        run(&[0xF0, 0x9F, 0x98, 0x84, 0xF0, 0x9F, 0x41]),
+        vec![Ev::Print('\u{1F604}'), Ev::Print('\u{FFFD}'), Ev::Print('A'),]
+    );
     // ESC cuts a sequence and still starts one.
-    assert_eq!(run(&[0xE2, 0x82, 0x1B, b'[', b'H']), vec![Ev::Print('\u{FFFD}'), csi(b"", &[], 0, b'H')]);
+    assert_eq!(
+        run(&[0xE2, 0x82, 0x1B, b'[', b'H']),
+        vec![Ev::Print('\u{FFFD}'), csi(b"", &[], 0, b'H')]
+    );
     // Surrogates and overlongs are refused.
-    assert_eq!(run(&[0xED, 0xA0, 0x80]), vec![Ev::Print('\u{FFFD}'), Ev::Print('\u{FFFD}'), Ev::Print('\u{FFFD}')]);
+    assert_eq!(
+        run(&[0xED, 0xA0, 0x80]),
+        vec![Ev::Print('\u{FFFD}'), Ev::Print('\u{FFFD}'), Ev::Print('\u{FFFD}')]
+    );
     assert_eq!(run(&[0xC0, 0xAF]), vec![Ev::Print('\u{FFFD}'), Ev::Print('\u{FFFD}')]);
 }
 
@@ -346,9 +369,9 @@ fn at_rest_only_in_ground_between_code_points() {
 
 /// Bytes the property draws from: every byte class the table distinguishes.
 const ALPHABET: &[u8] = &[
-    0x00, 0x07, 0x08, 0x0A, 0x0D, 0x10, 0x18, 0x1A, 0x1B, 0x1F, b' ', b'!', b'"', b'$', b'+', b'0', b'5', b'9',
-    b':', b';', b'<', b'?', b'@', b'A', b'H', b'P', b'X', b'[', b'\\', b']', b'^', b'_', b'm', b'q', b'~', 0x7F,
-    0x84, 0x90, 0x98, 0x9B, 0x9C, 0x9D, 0xA0, 0xC3, 0xE2, 0xF0, 0xFF,
+    0x00, 0x07, 0x08, 0x0A, 0x0D, 0x10, 0x18, 0x1A, 0x1B, 0x1F, b' ', b'!', b'"', b'$', b'+', b'0',
+    b'5', b'9', b':', b';', b'<', b'?', b'@', b'A', b'H', b'P', b'X', b'[', b'\\', b']', b'^',
+    b'_', b'm', b'q', b'~', 0x7F, 0x84, 0x90, 0x98, 0x9B, 0x9C, 0x9D, 0xA0, 0xC3, 0xE2, 0xF0, 0xFF,
 ];
 
 #[test]

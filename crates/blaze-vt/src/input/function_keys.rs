@@ -104,56 +104,38 @@ const fn any(sequence: &'static [u8]) -> Entry {
 
 /// Exactly `mods`.
 const fn exact(mods: Mods, sequence: &'static [u8]) -> Entry {
-    Entry {
-        mods: ModsMatch::Exact(mods),
-        sequence,
-        ..BASE
-    }
+    Entry { mods: ModsMatch::Exact(mods), sequence, ..BASE }
 }
 
 /// Exactly `mods`, when modifyOtherKeys is not 2.
 const fn set(mods: Mods, sequence: &'static [u8]) -> Entry {
-    Entry {
-        modify_other_keys: ModifyKeys::Set,
-        ..exact(mods, sequence)
-    }
+    Entry { modify_other_keys: ModifyKeys::Set, ..exact(mods, sequence) }
 }
 
 /// Exactly `mods`, under modifyOtherKeys 2.
 const fn set_other(mods: Mods, sequence: &'static [u8]) -> Entry {
-    Entry {
-        modify_other_keys: ModifyKeys::SetOther,
-        ..exact(mods, sequence)
-    }
+    Entry { modify_other_keys: ModifyKeys::SetOther, ..exact(mods, sequence) }
 }
 
 /// ghostty `pcStyle(fmt)`: the fifteen modifier entries.
 const fn pc(fmt: &'static [u8]) -> Entry {
-    Entry {
-        mods: ModsMatch::EachModifier,
-        sequence: fmt,
-        ..BASE
-    }
+    Entry { mods: ModsMatch::EachModifier, sequence: fmt, ..BASE }
 }
 
 /// ghostty `cursorKey(normal, application)`.
 const fn cursor(normal: &'static [u8], application: &'static [u8]) -> [Entry; 2] {
     [
-        Entry {
-            cursor: CursorMode::Normal,
-            sequence: normal,
-            ..BASE
-        },
-        Entry {
-            cursor: CursorMode::Application,
-            sequence: application,
-            ..BASE
-        },
+        Entry { cursor: CursorMode::Normal, sequence: normal, ..BASE },
+        Entry { cursor: CursorMode::Application, sequence: application, ..BASE },
     ]
 }
 
 /// ghostty `pcStyle(fmt) ++ cursorKey(normal, application)`.
-const fn cursor_key(fmt: &'static [u8], normal: &'static [u8], application: &'static [u8]) -> [Entry; 3] {
+const fn cursor_key(
+    fmt: &'static [u8],
+    normal: &'static [u8],
+    application: &'static [u8],
+) -> [Entry; 3] {
     let [n, a] = cursor(normal, application);
     [pc(fmt), n, a]
 }
@@ -162,16 +144,8 @@ const fn cursor_key(fmt: &'static [u8], normal: &'static [u8], application: &'st
 /// then `SS3 m x` with modifiers.
 const fn kp(plain: &'static [u8], modified: &'static [u8]) -> [Entry; 2] {
     [
-        Entry {
-            mods: ModsMatch::None,
-            keypad: KeypadMode::Application,
-            sequence: plain,
-            ..BASE
-        },
-        Entry {
-            keypad: KeypadMode::Application,
-            ..pc(modified)
-        },
+        Entry { mods: ModsMatch::None, keypad: KeypadMode::Application, sequence: plain, ..BASE },
+        Entry { keypad: KeypadMode::Application, ..pc(modified) },
     ]
 }
 
@@ -252,14 +226,8 @@ const BACKSPACE: [Entry; 29] = [
     set_other(m!(U C S), b"\x1b[27;14;127~"),
     set_other(m!(A U C), b"\x1b[27;15;127~"),
     set_other(m!(A U C S), b"\x1b[27;16;127~"),
-    Entry {
-        decbkm: Some(b"\x7f"),
-        ..exact(C, b"\x08")
-    },
-    Entry {
-        decbkm: Some(b"\x08"),
-        ..any(b"\x7f")
-    },
+    Entry { decbkm: Some(b"\x7f"), ..exact(C, b"\x08") },
+    Entry { decbkm: Some(b"\x08"), ..any(b"\x7f") },
 ];
 
 const TAB: [Entry; 18] = [

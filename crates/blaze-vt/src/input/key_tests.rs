@@ -21,10 +21,7 @@ fn opts() -> EncodeOpts {
 }
 
 fn kitty_opts(flags: KittyFlags) -> EncodeOpts {
-    EncodeOpts {
-        kitty_flags: flags,
-        ..opts()
-    }
+    EncodeOpts { kitty_flags: flags, ..opts() }
 }
 
 fn enc(event: &KeyEvent<'_>, opts: &EncodeOpts) -> Vec<u8> {
@@ -96,15 +93,7 @@ fn csi_u_mods_modifier_sequence_values() {
 // ghostty key_encode.zig:951 "modifier sequence values" (KittyMods)
 #[test]
 fn kitty_mods_modifier_sequence_values() {
-    let m = |shift, alt, ctrl| {
-        KittyMods {
-            shift,
-            alt,
-            ctrl,
-            ..KittyMods::default()
-        }
-        .seq_int()
-    };
+    let m = |shift, alt, ctrl| KittyMods { shift, alt, ctrl, ..KittyMods::default() }.seq_int();
     assert_eq!(m(false, false, false), 1);
     assert_eq!(m(true, false, false), 2);
     assert_eq!(m(false, true, false), 3);
@@ -120,45 +109,22 @@ fn kitty_mods_modifier_sequence_values() {
 fn kitty_sequence_backspace() {
     assert_eq!(run(seq(127, b'u')), b"\x1B[127u");
     assert_eq!(
-        run(KittySequence {
-            event: KittyEvent::Release,
-            ..seq(127, b'u')
-        }),
+        run(KittySequence { event: KittyEvent::Release, ..seq(127, b'u') }),
         b"\x1B[127;1:3u"
     );
-    assert_eq!(
-        run(KittySequence {
-            mods: KSHIFT,
-            ..seq(127, b'u')
-        }),
-        b"\x1B[127;2u"
-    );
+    assert_eq!(run(KittySequence { mods: KSHIFT, ..seq(127, b'u') }), b"\x1B[127;2u");
 }
 
 // ghostty key_encode.zig:1125 "KittySequence: text"
 #[test]
 fn kitty_sequence_text() {
+    assert_eq!(run(KittySequence { text: b"A", ..seq(127, b'u') }), b"\x1B[127;;65u");
     assert_eq!(
-        run(KittySequence {
-            text: b"A",
-            ..seq(127, b'u')
-        }),
-        b"\x1B[127;;65u"
-    );
-    assert_eq!(
-        run(KittySequence {
-            event: KittyEvent::Release,
-            text: b"A",
-            ..seq(127, b'u')
-        }),
+        run(KittySequence { event: KittyEvent::Release, text: b"A", ..seq(127, b'u') }),
         b"\x1B[127;1:3;65u"
     );
     assert_eq!(
-        run(KittySequence {
-            mods: KSHIFT,
-            text: b"A",
-            ..seq(127, b'u')
-        }),
+        run(KittySequence { mods: KSHIFT, text: b"A", ..seq(127, b'u') }),
         b"\x1B[127;2;65u"
     );
 }
@@ -166,20 +132,8 @@ fn kitty_sequence_text() {
 // ghostty key_encode.zig:1167 "KittySequence: text with control characters"
 #[test]
 fn kitty_sequence_text_with_control_characters() {
-    assert_eq!(
-        run(KittySequence {
-            text: b"\n",
-            ..seq(127, b'u')
-        }),
-        b"\x1b[127u"
-    );
-    assert_eq!(
-        run(KittySequence {
-            text: b"A\n",
-            ..seq(127, b'u')
-        }),
-        b"\x1b[127;;65u"
-    );
+    assert_eq!(run(KittySequence { text: b"\n", ..seq(127, b'u') }), b"\x1b[127u");
+    assert_eq!(run(KittySequence { text: b"A\n", ..seq(127, b'u') }), b"\x1b[127;;65u");
 }
 
 // ghostty key_encode.zig:1195 "KittySequence: special no mods"
@@ -191,24 +145,14 @@ fn kitty_sequence_special_no_mods() {
 // ghostty key_encode.zig:1203 "KittySequence: special mods only"
 #[test]
 fn kitty_sequence_special_mods_only() {
-    assert_eq!(
-        run(KittySequence {
-            mods: KSHIFT,
-            ..seq(1, b'A')
-        }),
-        b"\x1B[1;2A"
-    );
+    assert_eq!(run(KittySequence { mods: KSHIFT, ..seq(1, b'A') }), b"\x1B[1;2A");
 }
 
 // ghostty key_encode.zig:1211 "KittySequence: special mods and event"
 #[test]
 fn kitty_sequence_special_mods_and_event() {
     assert_eq!(
-        run(KittySequence {
-            event: KittyEvent::Release,
-            mods: KSHIFT,
-            ..seq(1, b'A')
-        }),
+        run(KittySequence { event: KittyEvent::Release, mods: KSHIFT, ..seq(1, b'A') }),
         b"\x1B[1;2:3A"
     );
 }
@@ -216,23 +160,14 @@ fn kitty_sequence_special_mods_and_event() {
 // ghostty key_encode.zig:1224 "kitty: plain text"
 #[test]
 fn kitty_plain_text() {
-    let e = KeyEvent {
-        key: Key::KeyA,
-        utf8: b"abcd",
-        ..ev()
-    };
+    let e = KeyEvent { key: Key::KeyA, utf8: b"abcd", ..ev() };
     both(e, kitty_opts(D), b"abcd");
 }
 
 // ghostty key_encode.zig:1237 "kitty: repeat with just disambiguate"
 #[test]
 fn kitty_repeat_with_just_disambiguate() {
-    let e = KeyEvent {
-        key: Key::KeyA,
-        action: Action::Repeat,
-        utf8: b"a",
-        ..ev()
-    };
+    let e = KeyEvent { key: Key::KeyA, action: Action::Repeat, utf8: b"a", ..ev() };
     both(e, kitty_opts(D), b"a");
 }
 
@@ -240,29 +175,11 @@ fn kitty_repeat_with_just_disambiguate() {
 #[test]
 fn kitty_enter_backspace_tab() {
     let k = |key| KeyEvent { key, ..ev() };
-    let rel = |key| KeyEvent {
-        key,
-        action: Action::Release,
-        ..ev()
-    };
+    let rel = |key| KeyEvent { key, action: Action::Release, ..ev() };
     both(k(Key::Enter), kitty_opts(D), b"\r");
     // DECBKM reset, then set: kitty does not support DECBKM, so no change.
-    both(
-        k(Key::Backspace),
-        EncodeOpts {
-            backarrow_key_mode: false,
-            ..kitty_opts(D)
-        },
-        b"\x7f",
-    );
-    both(
-        k(Key::Backspace),
-        EncodeOpts {
-            backarrow_key_mode: true,
-            ..kitty_opts(D)
-        },
-        b"\x7f",
-    );
+    both(k(Key::Backspace), EncodeOpts { backarrow_key_mode: false, ..kitty_opts(D) }, b"\x7f");
+    both(k(Key::Backspace), EncodeOpts { backarrow_key_mode: true, ..kitty_opts(D) }, b"\x7f");
     both(k(Key::Tab), kitty_opts(D), b"\t");
     // No release events without "report all".
     both(rel(Key::Enter), kitty_opts(D | EV), b"");
@@ -277,33 +194,21 @@ fn kitty_enter_backspace_tab() {
 // ghostty key_encode.zig:1345 "kitty: shift+backspace emits CSI u"
 #[test]
 fn kitty_shift_backspace_emits_csi_u() {
-    let e = KeyEvent {
-        key: Key::Backspace,
-        mods: Mods::SHIFT,
-        ..ev()
-    };
+    let e = KeyEvent { key: Key::Backspace, mods: Mods::SHIFT, ..ev() };
     both(e, kitty_opts(D), b"\x1b[127;2u");
 }
 
 // ghostty key_encode.zig:1360 "kitty: shift+enter emits CSI u"
 #[test]
 fn kitty_shift_enter_emits_csi_u() {
-    let e = KeyEvent {
-        key: Key::Enter,
-        mods: Mods::SHIFT,
-        ..ev()
-    };
+    let e = KeyEvent { key: Key::Enter, mods: Mods::SHIFT, ..ev() };
     both(e, kitty_opts(D), b"\x1b[13;2u");
 }
 
 // ghostty key_encode.zig:1373 "kitty: shift+tab emits CSI u"
 #[test]
 fn kitty_shift_tab_emits_csi_u() {
-    let e = KeyEvent {
-        key: Key::Tab,
-        mods: Mods::SHIFT,
-        ..ev()
-    };
+    let e = KeyEvent { key: Key::Tab, mods: Mods::SHIFT, ..ev() };
     both(e, kitty_opts(D), b"\x1b[9;2u");
 }
 
@@ -317,69 +222,42 @@ fn kitty_enter_with_all_flags() {
 // ghostty key_encode.zig:1402 "kitty: ctrl with all flags"
 #[test]
 fn kitty_ctrl_with_all_flags() {
-    let e = KeyEvent {
-        key: Key::ControlLeft,
-        mods: Mods::CTRL,
-        ..ev()
-    };
+    let e = KeyEvent { key: Key::ControlLeft, mods: Mods::CTRL, ..ev() };
     both(e, kitty_opts(KittyFlags::ALL), b"\x1b[57442;5u");
 }
 
 // ghostty key_encode.zig:1418 "kitty: ctrl release with ctrl mod set"
 #[test]
 fn kitty_ctrl_release_with_ctrl_mod_set() {
-    let e = KeyEvent {
-        action: Action::Release,
-        key: Key::ControlLeft,
-        mods: Mods::CTRL,
-        ..ev()
-    };
+    let e = KeyEvent { action: Action::Release, key: Key::ControlLeft, mods: Mods::CTRL, ..ev() };
     both(e, kitty_opts(KittyFlags::ALL), b"\x1b[57442;5:3u");
 }
 
 // ghostty key_encode.zig:1439 "kitty: delete"
 #[test]
 fn kitty_delete() {
-    let e = KeyEvent {
-        key: Key::Delete,
-        utf8: b"\x7F",
-        ..ev()
-    };
+    let e = KeyEvent { key: Key::Delete, utf8: b"\x7F", ..ev() };
     both(e, kitty_opts(D), b"\x1b[3~");
 }
 
 // ghostty key_encode.zig:1450 "kitty: composing with no modifier"
 #[test]
 fn kitty_composing_with_no_modifier() {
-    let e = KeyEvent {
-        key: Key::KeyA,
-        mods: Mods::SHIFT,
-        composing: true,
-        ..ev()
-    };
+    let e = KeyEvent { key: Key::KeyA, mods: Mods::SHIFT, composing: true, ..ev() };
     both(e, kitty_opts(D), b"");
 }
 
 // ghostty key_encode.zig:1463 "kitty: composing with modifier"
 #[test]
 fn kitty_composing_with_modifier() {
-    let e = KeyEvent {
-        key: Key::ShiftLeft,
-        mods: Mods::SHIFT,
-        composing: true,
-        ..ev()
-    };
+    let e = KeyEvent { key: Key::ShiftLeft, mods: Mods::SHIFT, composing: true, ..ev() };
     both(e, kitty_opts(D | ALL), b"\x1b[57441;2u");
 }
 
 // ghostty key_encode.zig:1476 "kitty: composed text with report all"
 #[test]
 fn kitty_composed_text_with_report_all() {
-    let e = KeyEvent {
-        key: Key::Unidentified,
-        utf8: "û".as_bytes(),
-        ..ev()
-    };
+    let e = KeyEvent { key: Key::Unidentified, utf8: "û".as_bytes(), ..ev() };
     both(e, kitty_opts(KittyFlags::ALL), "û".as_bytes());
 }
 
@@ -491,42 +369,28 @@ fn kitty_report_alternates_with_hu_layout_release() {
 // ghostty key_encode.zig:1651 "kitty: up arrow with utf8" (macOS sends text for arrows)
 #[test]
 fn kitty_up_arrow_with_utf8() {
-    let e = KeyEvent {
-        key: Key::ArrowUp,
-        utf8: &[30],
-        ..ev()
-    };
+    let e = KeyEvent { key: Key::ArrowUp, utf8: &[30], ..ev() };
     both(e, kitty_opts(D), b"\x1b[A");
 }
 
 // ghostty key_encode.zig:1664 "kitty: shift+tab"
 #[test]
 fn kitty_shift_tab() {
-    let e = KeyEvent {
-        key: Key::Tab,
-        mods: Mods::SHIFT,
-        ..ev()
-    };
+    let e = KeyEvent { key: Key::Tab, mods: Mods::SHIFT, ..ev() };
     both(e, kitty_opts(D | ALT), b"\x1b[9;2u");
 }
 
 // ghostty key_encode.zig:1677 "kitty: left shift"
 #[test]
 fn kitty_left_shift() {
-    let e = KeyEvent {
-        key: Key::ShiftLeft,
-        ..ev()
-    };
+    let e = KeyEvent { key: Key::ShiftLeft, ..ev() };
     both(e, kitty_opts(D | ALT), b"");
 }
 
 // ghostty key_encode.zig:1690 "kitty: left shift with report all"
 #[test]
 fn kitty_left_shift_with_report_all() {
-    let e = KeyEvent {
-        key: Key::ShiftLeft,
-        ..ev()
-    };
+    let e = KeyEvent { key: Key::ShiftLeft, ..ev() };
     both(e, kitty_opts(D | ALL), b"\x1b[57441u");
 }
 
@@ -540,20 +404,16 @@ fn kitty_report_associated_with_alt_text_on_macos_with_option() {
         unshifted_codepoint: Some('w'),
         ..ev()
     };
-    let o = EncodeOpts {
-        macos_option_as_alt: OptionAsAlt::False,
-        ..kitty_opts(D | ALL | ALT | ASSOC)
-    };
+    let o =
+        EncodeOpts { macos_option_as_alt: OptionAsAlt::False, ..kitty_opts(D | ALL | ALT | ASSOC) };
     mac(e, o, b"\x1b[119;3;8721u");
 }
 
 // ghostty key_encode.zig:1725 "kitty: report associated with alt text on macOS with alt"
 #[test]
 fn kitty_report_associated_with_alt_text_on_macos_with_alt() {
-    let o = EncodeOpts {
-        macos_option_as_alt: OptionAsAlt::True,
-        ..kitty_opts(D | ALL | ALT | ASSOC)
-    };
+    let o =
+        EncodeOpts { macos_option_as_alt: OptionAsAlt::True, ..kitty_opts(D | ALL | ALT | ASSOC) };
     let e = KeyEvent {
         key: Key::KeyW,
         mods: Mods::ALT,
@@ -610,72 +470,43 @@ fn kitty_report_associated_on_release() {
 // ghostty key_encode.zig:1831 "kitty: alternates omit control characters"
 #[test]
 fn kitty_alternates_omit_control_characters() {
-    let e = KeyEvent {
-        key: Key::Delete,
-        utf8: &[0x7F],
-        ..ev()
-    };
+    let e = KeyEvent { key: Key::Delete, utf8: &[0x7F], ..ev() };
     both(e, kitty_opts(D | ALT | ALL), b"\x1b[3~");
 }
 
 // ghostty key_encode.zig:1848 "kitty: enter with utf8 (dead key state)"
 #[test]
 fn kitty_enter_with_utf8_dead_key_state() {
-    let e = KeyEvent {
-        key: Key::Enter,
-        utf8: b"A",
-        unshifted_codepoint: Some('\r'),
-        ..ev()
-    };
+    let e = KeyEvent { key: Key::Enter, utf8: b"A", unshifted_codepoint: Some('\r'), ..ev() };
     both(e, kitty_opts(D | ALT | ALL), b"A");
 }
 
 // ghostty key_encode.zig:1865 "kitty: keypad number"
 #[test]
 fn kitty_keypad_number() {
-    let e = KeyEvent {
-        key: Key::Numpad1,
-        utf8: b"1",
-        ..ev()
-    };
+    let e = KeyEvent { key: Key::Numpad1, utf8: b"1", ..ev() };
     both(e, kitty_opts(KittyFlags::ALL), b"\x1b[57400;;49u");
 }
 
 // ghostty key_encode.zig:1885 "kitty: backspace with utf8 (dead key state)"
 #[test]
 fn kitty_backspace_with_utf8_dead_key_state() {
-    let e = KeyEvent {
-        key: Key::Backspace,
-        utf8: b"A",
-        unshifted_codepoint: Some('\r'),
-        ..ev()
-    };
+    let e = KeyEvent { key: Key::Backspace, utf8: b"A", unshifted_codepoint: Some('\r'), ..ev() };
     both(e, kitty_opts(KittyFlags::ALL), b"");
 }
 
 // ghostty key_encode.zig:1904 "legacy: backspace with utf8 (dead key state)"
 #[test]
 fn legacy_backspace_with_utf8_dead_key_state() {
-    let e = KeyEvent {
-        key: Key::Backspace,
-        utf8: b"A",
-        unshifted_codepoint: Some('\r'),
-        ..ev()
-    };
+    let e = KeyEvent { key: Key::Backspace, utf8: b"A", unshifted_codepoint: Some('\r'), ..ev() };
     both(e, opts(), b"");
 }
 
 // ghostty key_encode.zig:1915 "kitty: backspace (DECBKM reset) (report_all: true)"
 #[test]
 fn kitty_backspace_decbkm_reset_report_all() {
-    let e = KeyEvent {
-        key: Key::Backspace,
-        ..ev()
-    };
-    let o = EncodeOpts {
-        backarrow_key_mode: false,
-        ..kitty_opts(KittyFlags::ALL)
-    };
+    let e = KeyEvent { key: Key::Backspace, ..ev() };
+    let o = EncodeOpts { backarrow_key_mode: false, ..kitty_opts(KittyFlags::ALL) };
     both(e, o, b"\x1b[127u");
 }
 
@@ -683,96 +514,52 @@ fn kitty_backspace_decbkm_reset_report_all() {
 #[test]
 fn kitty_backspace_decbkm_set_report_all() {
     // Kitty does not support DECBKM, so there is no difference.
-    let e = KeyEvent {
-        key: Key::Backspace,
-        ..ev()
-    };
-    let o = EncodeOpts {
-        backarrow_key_mode: true,
-        ..kitty_opts(KittyFlags::ALL)
-    };
+    let e = KeyEvent { key: Key::Backspace, ..ev() };
+    let o = EncodeOpts { backarrow_key_mode: true, ..kitty_opts(KittyFlags::ALL) };
     both(e, o, b"\x1b[127u");
 }
 
 // ghostty key_encode.zig:1952 "legacy: enter with utf8 (dead key state)"
 #[test]
 fn legacy_enter_with_utf8_dead_key_state() {
-    let e = KeyEvent {
-        key: Key::Enter,
-        utf8: b"A",
-        unshifted_codepoint: Some('\r'),
-        ..ev()
-    };
+    let e = KeyEvent { key: Key::Enter, utf8: b"A", unshifted_codepoint: Some('\r'), ..ev() };
     both(e, opts(), b"A");
 }
 
 // ghostty key_encode.zig:1963 "legacy: esc with utf8 (dead key state)"
 #[test]
 fn legacy_esc_with_utf8_dead_key_state() {
-    let e = KeyEvent {
-        key: Key::Escape,
-        utf8: b"A",
-        unshifted_codepoint: Some('\r'),
-        ..ev()
-    };
+    let e = KeyEvent { key: Key::Escape, utf8: b"A", unshifted_codepoint: Some('\r'), ..ev() };
     both(e, opts(), b"A");
 }
 
 // ghostty key_encode.zig:1974 "legacy: ctrl+shift+minus (underscore on US)"
 #[test]
 fn legacy_ctrl_shift_minus_underscore_on_us() {
-    let e = KeyEvent {
-        key: Key::Minus,
-        mods: Mods::CTRL | Mods::SHIFT,
-        utf8: b"_",
-        ..ev()
-    };
+    let e = KeyEvent { key: Key::Minus, mods: Mods::CTRL | Mods::SHIFT, utf8: b"_", ..ev() };
     both(e, opts(), b"\x1F");
 }
 
 // ghostty key_encode.zig:1985 "legacy: ctrl+alt+c"
 #[test]
 fn legacy_ctrl_alt_c() {
-    let e = KeyEvent {
-        key: Key::KeyC,
-        mods: Mods::CTRL | Mods::ALT,
-        utf8: b"c",
-        ..ev()
-    };
+    let e = KeyEvent { key: Key::KeyC, mods: Mods::CTRL | Mods::ALT, utf8: b"c", ..ev() };
     both(e, opts(), b"\x1b\x03");
 }
 
 // ghostty key_encode.zig:1996 "legacy: alt+c"
 #[test]
 fn legacy_alt_c() {
-    let e = KeyEvent {
-        key: Key::KeyC,
-        utf8: b"c",
-        mods: Mods::ALT,
-        ..ev()
-    };
-    let o = EncodeOpts {
-        alt_esc_prefix: true,
-        macos_option_as_alt: OptionAsAlt::True,
-        ..opts()
-    };
+    let e = KeyEvent { key: Key::KeyC, utf8: b"c", mods: Mods::ALT, ..ev() };
+    let o = EncodeOpts { alt_esc_prefix: true, macos_option_as_alt: OptionAsAlt::True, ..opts() };
     both(e, o, b"\x1Bc");
 }
 
 // ghostty key_encode.zig:2010 "legacy: alt+e only unshifted"
 #[test]
 fn legacy_alt_e_only_unshifted() {
-    let e = KeyEvent {
-        key: Key::KeyE,
-        unshifted_codepoint: Some('e'),
-        mods: Mods::ALT,
-        ..ev()
-    };
-    let o = EncodeOpts {
-        alt_esc_prefix: true,
-        macos_option_as_alt: OptionAsAlt::True,
-        ..opts()
-    };
+    let e = KeyEvent { key: Key::KeyE, unshifted_codepoint: Some('e'), mods: Mods::ALT, ..ev() };
+    let o = EncodeOpts { alt_esc_prefix: true, macos_option_as_alt: OptionAsAlt::True, ..opts() };
     both(e, o, b"\x1Be");
 }
 
@@ -786,11 +573,7 @@ fn legacy_alt_x_macos() {
         mods: Mods::ALT,
         ..ev()
     };
-    let o = EncodeOpts {
-        alt_esc_prefix: true,
-        macos_option_as_alt: OptionAsAlt::True,
-        ..opts()
-    };
+    let o = EncodeOpts { alt_esc_prefix: true, macos_option_as_alt: OptionAsAlt::True, ..opts() };
     mac(e, o, b"\x1Bc");
 }
 
@@ -804,130 +587,79 @@ fn legacy_shift_alt_period_macos() {
         mods: Mods::ALT | Mods::SHIFT,
         ..ev()
     };
-    let o = EncodeOpts {
-        alt_esc_prefix: true,
-        macos_option_as_alt: OptionAsAlt::True,
-        ..opts()
-    };
+    let o = EncodeOpts { alt_esc_prefix: true, macos_option_as_alt: OptionAsAlt::True, ..opts() };
     mac(e, o, b"\x1B>");
 }
 
 // ghostty key_encode.zig:2058 "legacy: alt+ф"
 #[test]
 fn legacy_alt_ef() {
-    let e = KeyEvent {
-        key: Key::KeyF,
-        utf8: "ф".as_bytes(),
-        mods: Mods::ALT,
-        ..ev()
-    };
-    let o = EncodeOpts {
-        alt_esc_prefix: true,
-        ..opts()
-    };
+    let e = KeyEvent { key: Key::KeyF, utf8: "ф".as_bytes(), mods: Mods::ALT, ..ev() };
+    let o = EncodeOpts { alt_esc_prefix: true, ..opts() };
     both(e, o, "ф".as_bytes());
 }
 
 // ghostty key_encode.zig:2071 "legacy: ctrl+c"
 #[test]
 fn legacy_ctrl_c() {
-    let e = KeyEvent {
-        key: Key::KeyC,
-        mods: Mods::CTRL,
-        utf8: b"c",
-        ..ev()
-    };
+    let e = KeyEvent { key: Key::KeyC, mods: Mods::CTRL, utf8: b"c", ..ev() };
     both(e, opts(), b"\x03");
 }
 
 // ghostty key_encode.zig:2082 "legacy: ctrl+space"
 #[test]
 fn legacy_ctrl_space() {
-    let e = KeyEvent {
-        key: Key::Space,
-        mods: Mods::CTRL,
-        utf8: b" ",
-        ..ev()
-    };
+    let e = KeyEvent { key: Key::Space, mods: Mods::CTRL, utf8: b" ", ..ev() };
     both(e, opts(), b"\x00");
 }
 
 // ghostty key_encode.zig:2093 "legacy: ctrl+shift+backspace"
 #[test]
 fn legacy_ctrl_shift_backspace() {
-    let e = KeyEvent {
-        key: Key::Backspace,
-        mods: Mods::CTRL | Mods::SHIFT,
-        ..ev()
-    };
+    let e = KeyEvent { key: Key::Backspace, mods: Mods::CTRL | Mods::SHIFT, ..ev() };
     both(e, opts(), b"\x08");
 }
 
 fn decbkm(on: bool) -> EncodeOpts {
-    EncodeOpts {
-        backarrow_key_mode: on,
-        ..opts()
-    }
+    EncodeOpts { backarrow_key_mode: on, ..opts() }
 }
 
 // ghostty key_encode.zig:2103 "legacy: backspace (DECBKM reset)"
 #[test]
 fn legacy_backspace_decbkm_reset() {
-    let e = KeyEvent {
-        key: Key::Backspace,
-        ..ev()
-    };
+    let e = KeyEvent { key: Key::Backspace, ..ev() };
     both(e, decbkm(false), b"\x7f");
 }
 
 // ghostty key_encode.zig:2113 "legacy: backspace (DECBKM reset, with ctrl)"
 #[test]
 fn legacy_backspace_decbkm_reset_with_ctrl() {
-    let e = KeyEvent {
-        key: Key::Backspace,
-        mods: Mods::CTRL,
-        ..ev()
-    };
+    let e = KeyEvent { key: Key::Backspace, mods: Mods::CTRL, ..ev() };
     both(e, decbkm(false), b"\x08");
 }
 
 // ghostty key_encode.zig:2125 "legacy: backspace (DECBKM set)"
 #[test]
 fn legacy_backspace_decbkm_set() {
-    let e = KeyEvent {
-        key: Key::Backspace,
-        ..ev()
-    };
+    let e = KeyEvent { key: Key::Backspace, ..ev() };
     both(e, decbkm(true), b"\x08");
 }
 
 // ghostty key_encode.zig:2135 "legacy: backspace (DECBKM set, with ctrl)"
 #[test]
 fn legacy_backspace_decbkm_set_with_ctrl() {
-    let e = KeyEvent {
-        key: Key::Backspace,
-        mods: Mods::CTRL,
-        ..ev()
-    };
+    let e = KeyEvent { key: Key::Backspace, mods: Mods::CTRL, ..ev() };
     both(e, decbkm(true), b"\x7f");
 }
 
 fn mok2() -> EncodeOpts {
-    EncodeOpts {
-        modify_other_keys_state_2: true,
-        ..opts()
-    }
+    EncodeOpts { modify_other_keys_state_2: true, ..opts() }
 }
 
 // ghostty key_encode.zig:2147 "legacy: ctrl+shift+char with modify other state 2"
 #[test]
 fn legacy_ctrl_shift_char_with_modify_other_state_2() {
-    let e = KeyEvent {
-        key: Key::KeyH,
-        mods: Mods::CTRL | Mods::SHIFT,
-        utf8: b"H",
-        ..ev()
-    };
+    let e = KeyEvent { key: Key::KeyH, mods: Mods::CTRL | Mods::SHIFT, utf8: b"H", ..ev() };
     both(e, mok2(), b"\x1b[27;6;72~");
 }
 
@@ -947,16 +679,8 @@ fn legacy_ctrl_shift_char_with_modify_other_state_2_and_consumed_mods() {
 // ghostty key_encode.zig:2174 "legacy: alt+digit with modify other state 2"
 #[test]
 fn legacy_alt_digit_with_modify_other_state_2() {
-    let e = KeyEvent {
-        key: Key::Digit8,
-        mods: Mods::ALT,
-        utf8: b"8",
-        ..ev()
-    };
-    let o = EncodeOpts {
-        macos_option_as_alt: OptionAsAlt::True,
-        ..mok2()
-    };
+    let e = KeyEvent { key: Key::Digit8, mods: Mods::ALT, utf8: b"8", ..ev() };
+    let o = EncodeOpts { macos_option_as_alt: OptionAsAlt::True, ..mok2() };
     both(e, o, b"\x1b[27;3;56~");
 }
 
@@ -971,22 +695,14 @@ fn legacy_alt_digit_with_modify_other_state_2_and_macos_option_as_alt_false() {
         utf8: b"[",
         ..ev()
     };
-    let o = EncodeOpts {
-        macos_option_as_alt: OptionAsAlt::False,
-        ..mok2()
-    };
+    let o = EncodeOpts { macos_option_as_alt: OptionAsAlt::False, ..mok2() };
     mac(e, o, b"[");
 }
 
 // ghostty key_encode.zig:2205 "legacy: fixterm awkward letters"
 #[test]
 fn legacy_fixterm_awkward_letters() {
-    let c = |key, utf8: &'static [u8]| KeyEvent {
-        key,
-        mods: Mods::CTRL,
-        utf8,
-        ..ev()
-    };
+    let c = |key, utf8: &'static [u8]| KeyEvent { key, mods: Mods::CTRL, utf8, ..ev() };
     both(c(Key::KeyI, b"i"), opts(), b"\x1b[105;5u");
     both(c(Key::KeyM, b"m"), opts(), b"\x1b[109;5u");
     both(c(Key::BracketLeft, b"["), opts(), b"\x1b[91;5u");
@@ -1017,32 +733,19 @@ fn legacy_ctrl_shift_letter_ascii() {
 // ghostty key_encode.zig:2262 "legacy: shift+function key should use all mods"
 #[test]
 fn legacy_shift_function_key_should_use_all_mods() {
-    let e = KeyEvent {
-        key: Key::ArrowUp,
-        mods: Mods::SHIFT,
-        consumed_mods: Mods::SHIFT,
-        ..ev()
-    };
+    let e = KeyEvent { key: Key::ArrowUp, mods: Mods::SHIFT, consumed_mods: Mods::SHIFT, ..ev() };
     both(e, opts(), b"\x1b[1;2A");
 }
 
 // ghostty key_encode.zig:2273 "legacy: keypad enter"
 #[test]
 fn legacy_keypad_enter() {
-    let e = KeyEvent {
-        key: Key::NumpadEnter,
-        ..ev()
-    };
+    let e = KeyEvent { key: Key::NumpadEnter, ..ev() };
     both(e, opts(), b"\r");
 }
 
 fn kp1(mods: Mods) -> KeyEvent<'static> {
-    KeyEvent {
-        key: Key::Numpad1,
-        mods,
-        utf8: b"1",
-        ..ev()
-    }
+    KeyEvent { key: Key::Numpad1, mods, utf8: b"1", ..ev() }
 }
 
 // ghostty key_encode.zig:2284 "legacy: keypad 1"
@@ -1054,42 +757,28 @@ fn legacy_keypad_1() {
 // ghostty key_encode.zig:2296 "legacy: keypad 1 with application keypad"
 #[test]
 fn legacy_keypad_1_with_application_keypad() {
-    let o = EncodeOpts {
-        keypad_key_application: true,
-        ..opts()
-    };
+    let o = EncodeOpts { keypad_key_application: true, ..opts() };
     both(kp1(Mods::NONE), o, b"\x1bOq");
 }
 
 // ghostty key_encode.zig:2310 "legacy: keypad 1 with application keypad and numlock"
 #[test]
 fn legacy_keypad_1_with_application_keypad_and_numlock() {
-    let o = EncodeOpts {
-        keypad_key_application: true,
-        ..opts()
-    };
+    let o = EncodeOpts { keypad_key_application: true, ..opts() };
     both(kp1(Mods::NUM_LOCK), o, b"\x1bOq");
 }
 
 // ghostty key_encode.zig:2324 "legacy: keypad 1 with application keypad and numlock ignore"
 #[test]
 fn legacy_keypad_1_with_application_keypad_and_numlock_ignore() {
-    let o = EncodeOpts {
-        keypad_key_application: true,
-        ignore_keypad_with_numlock: true,
-        ..opts()
-    };
+    let o = EncodeOpts { keypad_key_application: true, ignore_keypad_with_numlock: true, ..opts() };
     both(kp1(Mods::NONE), o, b"1");
 }
 
 // ghostty key_encode.zig:2339 "legacy: f1"
 #[test]
 fn legacy_f1() {
-    let c = |key| KeyEvent {
-        key,
-        mods: Mods::CTRL,
-        ..ev()
-    };
+    let c = |key| KeyEvent { key, mods: Mods::CTRL, ..ev() };
     both(c(Key::F1), opts(), b"\x1b[1;5P");
     both(c(Key::F2), opts(), b"\x1b[1;5Q");
     both(c(Key::F3), opts(), b"\x1b[13;5~");
@@ -1100,22 +789,14 @@ fn legacy_f1() {
 // ghostty key_encode.zig:2398 "legacy: left_shift+tab"
 #[test]
 fn legacy_left_shift_tab() {
-    let e = KeyEvent {
-        key: Key::Tab,
-        mods: Mods::SHIFT,
-        ..ev()
-    };
+    let e = KeyEvent { key: Key::Tab, mods: Mods::SHIFT, ..ev() };
     both(e, opts(), b"\x1b[Z");
 }
 
 // ghostty key_encode.zig:2411 "legacy: right_shift+tab"
 #[test]
 fn legacy_right_shift_tab() {
-    let e = KeyEvent {
-        key: Key::Tab,
-        mods: Mods::SHIFT | Mods::SHIFT_RIGHT_SIDE,
-        ..ev()
-    };
+    let e = KeyEvent { key: Key::Tab, mods: Mods::SHIFT | Mods::SHIFT_RIGHT_SIDE, ..ev() };
     both(e, opts(), b"\x1b[Z");
 }
 
@@ -1135,12 +816,7 @@ fn legacy_hu_layout_ctrl_o_double_acute_sends_proper_codepoint() {
 // ghostty key_encode.zig:2437 "legacy: super-only on macOS with text"
 #[test]
 fn legacy_super_only_on_macos_with_text() {
-    let e = KeyEvent {
-        key: Key::KeyB,
-        utf8: b"b",
-        mods: Mods::SUPER,
-        ..ev()
-    };
+    let e = KeyEvent { key: Key::KeyB, utf8: b"b", mods: Mods::SUPER, ..ev() };
     mac(e, opts(), b"");
     // Elsewhere super+b types "b" (GNOME Console).
     assert_eq!(on(Platform::Other, &e, &opts()), b"b");
@@ -1149,36 +825,23 @@ fn legacy_super_only_on_macos_with_text() {
 // ghostty key_encode.zig:2450 "legacy: super and other mods on macOS with text"
 #[test]
 fn legacy_super_and_other_mods_on_macos_with_text() {
-    let e = KeyEvent {
-        key: Key::KeyB,
-        utf8: b"B",
-        mods: Mods::SUPER | Mods::SHIFT,
-        ..ev()
-    };
+    let e = KeyEvent { key: Key::KeyB, utf8: b"B", mods: Mods::SUPER | Mods::SHIFT, ..ev() };
     mac(e, opts(), b"");
 }
 
 // ghostty key_encode.zig:2463 "legacy: backspace with DEL utf8 (DECBKM reset)"
 #[test]
 fn legacy_backspace_with_del_utf8_decbkm_reset() {
-    let e = KeyEvent {
-        key: Key::Backspace,
-        utf8: &[0x7F],
-        unshifted_codepoint: Some('\x08'),
-        ..ev()
-    };
+    let e =
+        KeyEvent { key: Key::Backspace, utf8: &[0x7F], unshifted_codepoint: Some('\x08'), ..ev() };
     both(e, decbkm(false), b"\x7F");
 }
 
 // ghostty key_encode.zig:2474 "legacy: backspace with DEL utf8 (DECBKM set)"
 #[test]
 fn legacy_backspace_with_del_utf8_decbkm_set() {
-    let e = KeyEvent {
-        key: Key::Backspace,
-        utf8: &[0x7F],
-        unshifted_codepoint: Some('\x08'),
-        ..ev()
-    };
+    let e =
+        KeyEvent { key: Key::Backspace, utf8: &[0x7F], unshifted_codepoint: Some('\x08'), ..ev() };
     both(e, decbkm(true), b"\x08");
 }
 
@@ -1191,7 +854,10 @@ fn ctrlseq_normal_ctrl_c() {
 // ghostty key_encode.zig:2490 "ctrlseq: normal ctrl c, right control"
 #[test]
 fn ctrlseq_normal_ctrl_c_right_control() {
-    assert_eq!(ctrl_seq(Key::Unidentified, b"c", Some('c'), Mods::CTRL | Mods::CTRL_RIGHT_SIDE), Some(0x03));
+    assert_eq!(
+        ctrl_seq(Key::Unidentified, b"c", Some('c'), Mods::CTRL | Mods::CTRL_RIGHT_SIDE),
+        Some(0x03)
+    );
 }
 
 // ghostty key_encode.zig:2495 "ctrlseq: alt should be allowed"
@@ -1215,7 +881,10 @@ fn ctrlseq_shifted_non_character() {
 // ghostty key_encode.zig:2509 "ctrlseq: caps ascii letter"
 #[test]
 fn ctrlseq_caps_ascii_letter() {
-    assert_eq!(ctrl_seq(Key::Unidentified, b"C", Some('c'), Mods::CTRL | Mods::CAPS_LOCK), Some(0x03));
+    assert_eq!(
+        ctrl_seq(Key::Unidentified, b"C", Some('c'), Mods::CTRL | Mods::CAPS_LOCK),
+        Some(0x03)
+    );
 }
 
 // ghostty key_encode.zig:2514 "ctrlseq: shift does not generate ctrl seq"
@@ -1234,19 +903,28 @@ fn ctrlseq_russian_ctrl_c() {
 // ghostty key_encode.zig:2524 "ctrlseq: russian shifted ctrl c"
 #[test]
 fn ctrlseq_russian_shifted_ctrl_c() {
-    assert_eq!(ctrl_seq(Key::KeyC, "с".as_bytes(), Some('\u{441}'), Mods::CTRL | Mods::SHIFT), None);
+    assert_eq!(
+        ctrl_seq(Key::KeyC, "с".as_bytes(), Some('\u{441}'), Mods::CTRL | Mods::SHIFT),
+        None
+    );
 }
 
 // ghostty key_encode.zig:2529 "ctrlseq: russian alt ctrl c"
 #[test]
 fn ctrlseq_russian_alt_ctrl_c() {
-    assert_eq!(ctrl_seq(Key::KeyC, "с".as_bytes(), Some('\u{441}'), Mods::CTRL | Mods::ALT), Some(0x03));
+    assert_eq!(
+        ctrl_seq(Key::KeyC, "с".as_bytes(), Some('\u{441}'), Mods::CTRL | Mods::ALT),
+        Some(0x03)
+    );
 }
 
 // ghostty key_encode.zig:2534 "ctrlseq: right ctrl c"
 #[test]
 fn ctrlseq_right_ctrl_c() {
-    assert_eq!(ctrl_seq(Key::KeyC, "с".as_bytes(), Some('c'), Mods::CTRL | Mods::CTRL_RIGHT_SIDE), Some(0x03));
+    assert_eq!(
+        ctrl_seq(Key::KeyC, "с".as_bytes(), Some('c'), Mods::CTRL | Mods::CTRL_RIGHT_SIDE),
+        Some(0x03)
+    );
 }
 
 // ghostty function_keys.zig:298 "keys": every sequence fits termio's small write (38 bytes).
@@ -1320,10 +998,7 @@ fn pc_style_runs_expand_like_ghostty() {
             let want = fmt.replace("{}", &std::format!("{}", i + 2));
             for cursor_app in [false, true] {
                 let e = KeyEvent { key, mods: m, ..ev() };
-                let o = EncodeOpts {
-                    cursor_key_application: cursor_app,
-                    ..opts()
-                };
+                let o = EncodeOpts { cursor_key_application: cursor_app, ..opts() };
                 assert_eq!(on(Platform::Other, &e, &o), want.as_bytes(), "{key:?} {m:?}");
             }
         }
@@ -1333,10 +1008,7 @@ fn pc_style_runs_expand_like_ghostty() {
 #[test]
 fn cursor_and_keypad_modes() {
     let k = |key| KeyEvent { key, ..ev() };
-    let app = EncodeOpts {
-        cursor_key_application: true,
-        ..opts()
-    };
+    let app = EncodeOpts { cursor_key_application: true, ..opts() };
     for (key, normal, application) in [
         (Key::ArrowUp, "\x1b[A", "\x1bOA"),
         (Key::NumpadDown, "\x1b[B", "\x1bOB"),
@@ -1348,25 +1020,10 @@ fn cursor_and_keypad_modes() {
         both(k(key), app, application.as_bytes());
     }
     // Keypad application mode, modified: `SS3 m x`.
-    let kpam = EncodeOpts {
-        keypad_key_application: true,
-        ..opts()
-    };
-    let e = KeyEvent {
-        key: Key::NumpadAdd,
-        mods: Mods::CTRL,
-        utf8: b"+",
-        ..ev()
-    };
+    let kpam = EncodeOpts { keypad_key_application: true, ..opts() };
+    let e = KeyEvent { key: Key::NumpadAdd, mods: Mods::CTRL, utf8: b"+", ..ev() };
     both(e, kpam, b"\x1bO5k");
-    both(
-        KeyEvent {
-            key: Key::NumpadEnter,
-            ..ev()
-        },
-        kpam,
-        b"\x1bOM",
-    );
+    both(KeyEvent { key: Key::NumpadEnter, ..ev() }, kpam, b"\x1bOM");
 }
 
 /// No event, under any options, outgrows [`max_len`].
@@ -1396,7 +1053,8 @@ fn every_encoding_fits_max_len() {
         Key::Unidentified,
         Key::MediaPlayPause,
     ];
-    const ALT_OPTS: [OptionAsAlt; 4] = [OptionAsAlt::False, OptionAsAlt::True, OptionAsAlt::Left, OptionAsAlt::Right];
+    const ALT_OPTS: [OptionAsAlt; 4] =
+        [OptionAsAlt::False, OptionAsAlt::True, OptionAsAlt::Left, OptionAsAlt::Right];
     const ACTIONS: [Action; 3] = [Action::Press, Action::Release, Action::Repeat];
     const CHARS: &[char] = &['a', 'A', '\u{10FFFF}', 'ч', '\x7F', '\x1B', ' ', '\u{337}', '\r'];
     blaze_sim::check(blaze_sim::Config::cases(4000), |tape| {
@@ -1436,11 +1094,7 @@ fn every_encoding_fits_max_len() {
 /// A buffer one byte short fails whole, never with a truncated sequence.
 #[test]
 fn a_short_buffer_is_refused() {
-    let e = KeyEvent {
-        key: Key::ArrowUp,
-        mods: Mods::CTRL,
-        ..ev()
-    };
+    let e = KeyEvent { key: Key::ArrowUp, mods: Mods::CTRL, ..ev() };
     let mut buf = [0u8; 5];
     assert_eq!(encode(&e, &opts(), &mut buf), Err(BufferFull { capacity: 5 }));
     let mut buf = [0u8; 6];

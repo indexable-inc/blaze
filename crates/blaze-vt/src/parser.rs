@@ -250,7 +250,9 @@ impl Parser {
 
     fn exit(&mut self, b: u8, sink: &mut impl Sink) {
         match self.state {
-            State::OscString => sink.osc_end(if b == 0x07 { Terminator::Bel } else { Terminator::St }),
+            State::OscString => {
+                sink.osc_end(if b == 0x07 { Terminator::Bel } else { Terminator::St })
+            }
             State::DcsPassthrough => {
                 if self.dcs_hooked {
                     self.dcs_hooked = false;
@@ -430,7 +432,9 @@ fn own(state: State, b: u8) -> Option<(State, Act)> {
             0x50 => (S::DcsEntry, Act::None),
             0x5B => (S::CsiEntry, Act::None),
             0x5D => (S::OscString, Act::None),
-            0x30..=0x4F | 0x51..=0x57 | 0x59 | 0x5A | 0x5C | 0x60..=0x7E => (S::Ground, Act::EscDispatch),
+            0x30..=0x4F | 0x51..=0x57 | 0x59 | 0x5A | 0x5C | 0x60..=0x7E => {
+                (S::Ground, Act::EscDispatch)
+            }
             _ => return None,
         },
         S::EscapeIntermediate => match b {

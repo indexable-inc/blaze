@@ -83,11 +83,7 @@ pub fn encode(data: &mut [u8], opts: PasteOpts) -> Pasted<'_> {
         }
     }
     let (prefix, suffix) = frame(opts.bracketed);
-    Pasted {
-        prefix,
-        data,
-        suffix,
-    }
+    Pasted { prefix, data, suffix }
 }
 
 /// Encodes borrowed `data` when it needs no editing (ghostty's `[]const u8` form).
@@ -96,11 +92,7 @@ pub fn encode_borrowed(data: &[u8], opts: PasteOpts) -> Result<Pasted<'_>, Mutab
         return Err(MutableRequired);
     }
     let (prefix, suffix) = frame(opts.bracketed);
-    Ok(Pasted {
-        prefix,
-        data,
-        suffix,
-    })
+    Ok(Pasted { prefix, data, suffix })
 }
 
 /// Whether `data` looks safe to paste without asking: no `\n` (it can run a command) and no
@@ -174,7 +166,10 @@ mod tests {
     fn encode_strip_unsafe_bytes_mutable_bracketed() {
         let mut data = b"hel\x1blo\x00world".to_vec();
         let r = encode(&mut data, BRACKETED);
-        assert_eq!((r.prefix, r.data, r.suffix), (&b"\x1b[200~"[..], &b"hel lo world"[..], &b"\x1b[201~"[..]));
+        assert_eq!(
+            (r.prefix, r.data, r.suffix),
+            (&b"\x1b[200~"[..], &b"hel lo world"[..], &b"\x1b[201~"[..])
+        );
     }
 
     // ghostty paste.zig:212 "encode strip unsafe bytes mutable unbracketed"
@@ -226,9 +221,7 @@ mod tests {
     fn borrowed_agrees_with_in_place() {
         blaze_sim::check(blaze_sim::Config::cases(1000), |tape| {
             let data: Vec<u8> = tape.vec(0..=24, "data", |t| t.int_in(0..=0x7Fu8, "b"));
-            let opts = PasteOpts {
-                bracketed: tape.coin("bracketed"),
-            };
+            let opts = PasteOpts { bracketed: tape.coin("bracketed") };
             let mut copy = data.clone();
             let in_place = encode(&mut copy, opts);
             match encode_borrowed(&data, opts) {

@@ -124,8 +124,14 @@ impl Size {
     /// The surface less padding (ghostty `subPadding`, saturating).
     fn terminal(self) -> Pixels {
         Pixels {
-            width: self.screen.width.saturating_sub(self.padding.left.saturating_add(self.padding.right)),
-            height: self.screen.height.saturating_sub(self.padding.top.saturating_add(self.padding.bottom)),
+            width: self
+                .screen
+                .width
+                .saturating_sub(self.padding.left.saturating_add(self.padding.right)),
+            height: self
+                .screen
+                .height
+                .saturating_sub(self.padding.top.saturating_add(self.padding.bottom)),
         }
     }
 
@@ -134,10 +140,7 @@ impl Size {
         let t = self.terminal();
         let cols = (t.width as f32 / self.cell.width as f32) as u16;
         let rows = (t.height as f32 / self.cell.height as f32) as u16;
-        Cell {
-            x: cols.max(1),
-            y: rows.max(1),
-        }
+        Cell { x: cols.max(1), y: rows.max(1) }
     }
 }
 
@@ -178,7 +181,12 @@ pub fn encode<'o>(
     Ok(w.finish())
 }
 
-fn write(w: &mut Out<'_>, event: &MouseEvent, opts: &MouseOpts, last_cell: Option<&mut Option<Cell>>) -> Result<(), BufferFull> {
+fn write(
+    w: &mut Out<'_>,
+    event: &MouseEvent,
+    opts: &MouseOpts,
+    last_cell: Option<&mut Option<Cell>>,
+) -> Result<(), BufferFull> {
     if !should_report(event, opts) {
         return Ok(());
     }
@@ -196,7 +204,10 @@ fn write(w: &mut Out<'_>, event: &MouseEvent, opts: &MouseOpts, last_cell: Optio
 
     // Motion only when the cell changed, unless the format reports pixels.
     if let Some(last) = last_cell {
-        if event.action == MouseAction::Motion && opts.format != MouseFormat::SgrPixels && *last == Some(cell) {
+        if event.action == MouseAction::Motion
+            && opts.format != MouseFormat::SgrPixels
+            && *last == Some(cell)
+        {
             return Ok(());
         }
         *last = Some(cell);
@@ -264,7 +275,10 @@ fn should_report(event: &MouseEvent, opts: &MouseOpts) -> bool {
         MouseEvents::None => false,
         MouseEvents::X10 => {
             event.action == MouseAction::Press
-                && matches!(event.button, Some(MouseButton::Left | MouseButton::Middle | MouseButton::Right))
+                && matches!(
+                    event.button,
+                    Some(MouseButton::Left | MouseButton::Middle | MouseButton::Right)
+                )
         }
         MouseEvents::Normal => event.action != MouseAction::Motion,
         MouseEvents::Button => event.button.is_some(),
@@ -279,7 +293,12 @@ fn button_code(event: &MouseEvent, opts: &MouseOpts) -> Option<u8> {
         // Motion with no button.
         None => 3,
         // Legacy formats cannot say which button was released.
-        Some(_) if event.action == MouseAction::Release && !matches!(opts.format, MouseFormat::Sgr | MouseFormat::SgrPixels) => 3,
+        Some(_)
+            if event.action == MouseAction::Release
+                && !matches!(opts.format, MouseFormat::Sgr | MouseFormat::SgrPixels) =>
+        {
+            3
+        }
         Some(b) => match b {
             MouseButton::Left => 0,
             MouseButton::Middle => 1,
@@ -325,10 +344,7 @@ fn pos_to_cell(pos: SurfacePos, size: Size) -> Cell {
     let grid = size.grid();
     let col = (term_x.max(0.0) / f64::from(size.cell.width)) as u16;
     let row = (term_y.max(0.0) / f64::from(size.cell.height)) as u16;
-    Cell {
-        x: col.min(grid.x - 1),
-        y: row.min(grid.y - 1),
-    }
+    Cell { x: col.min(grid.x - 1), y: row.min(grid.y - 1) }
 }
 
 /// Terminal-space pixels, rounded half away from zero, not clamped (ghostty
@@ -362,31 +378,18 @@ mod tests {
 
     fn test_size() -> Size {
         Size {
-            screen: Pixels {
-                width: 1_000,
-                height: 1_000,
-            },
+            screen: Pixels { width: 1_000, height: 1_000 },
             cell: Pixels { width: 1, height: 1 },
             padding: Padding::default(),
         }
     }
 
     fn opts(event: MouseEvents, format: MouseFormat) -> MouseOpts {
-        MouseOpts {
-            event,
-            format,
-            size: test_size(),
-            any_button_pressed: false,
-        }
+        MouseOpts { event, format, size: test_size(), any_button_pressed: false }
     }
 
     fn ev(button: Option<MouseButton>, action: MouseAction, x: f32, y: f32) -> MouseEvent {
-        MouseEvent {
-            action,
-            button,
-            mods: Mods::NONE,
-            pos: SurfacePos { x, y },
-        }
+        MouseEvent { action, button, mods: Mods::NONE, pos: SurfacePos { x, y } }
     }
 
     fn enc(event: &MouseEvent, opts: &MouseOpts, last: &mut Option<Cell>) -> Vec<u8> {
@@ -394,14 +397,18 @@ mod tests {
         encode(event, opts, Some(last), &mut buf).unwrap().to_vec()
     }
 
-    const ACTIONS: [MouseAction; 3] = [MouseAction::Press, MouseAction::Release, MouseAction::Motion];
+    const ACTIONS: [MouseAction; 3] =
+        [MouseAction::Press, MouseAction::Release, MouseAction::Motion];
     const LEFT: Option<MouseButton> = Some(MouseButton::Left);
 
     // ghostty mouse_encode.zig:292 "shouldReport: none mode never reports"
     #[test]
     fn should_report_none_mode_never_reports() {
         for a in ACTIONS {
-            assert!(!should_report(&ev(LEFT, a, 0.0, 0.0), &opts(MouseEvents::None, MouseFormat::X10)));
+            assert!(!should_report(
+                &ev(LEFT, a, 0.0, 0.0),
+                &opts(MouseEvents::None, MouseFormat::X10)
+            ));
         }
     }
 
@@ -453,28 +460,52 @@ mod tests {
         let mut e = ev(LEFT, MouseAction::Press, 0.0, 0.0);
         e.mods = Mods::SHIFT | Mods::ALT | Mods::CTRL;
         let mut last = None;
-        assert_eq!(enc(&e, &opts(MouseEvents::X10, MouseFormat::X10), &mut last), [0x1B, b'[', b'M', 32, 33, 33]);
+        assert_eq!(
+            enc(&e, &opts(MouseEvents::X10, MouseFormat::X10), &mut last),
+            [0x1B, b'[', b'M', 32, 33, 33]
+        );
     }
 
     // ghostty mouse_encode.zig:416 "x10 ignores release"
     #[test]
     fn x10_ignores_release() {
         let mut last = None;
-        assert!(enc(&ev(LEFT, MouseAction::Release, 0.0, 0.0), &opts(MouseEvents::X10, MouseFormat::X10), &mut last).is_empty());
+        assert!(
+            enc(
+                &ev(LEFT, MouseAction::Release, 0.0, 0.0),
+                &opts(MouseEvents::X10, MouseFormat::X10),
+                &mut last
+            )
+            .is_empty()
+        );
     }
 
     // ghostty mouse_encode.zig:433 "normal ignores motion"
     #[test]
     fn normal_ignores_motion() {
         let mut last = None;
-        assert!(enc(&ev(LEFT, MouseAction::Motion, 0.0, 0.0), &opts(MouseEvents::Normal, MouseFormat::Sgr), &mut last).is_empty());
+        assert!(
+            enc(
+                &ev(LEFT, MouseAction::Motion, 0.0, 0.0),
+                &opts(MouseEvents::Normal, MouseFormat::Sgr),
+                &mut last
+            )
+            .is_empty()
+        );
     }
 
     // ghostty mouse_encode.zig:450 "button mode requires button"
     #[test]
     fn button_mode_requires_button() {
         let mut last = None;
-        assert!(enc(&ev(None, MouseAction::Motion, 0.0, 0.0), &opts(MouseEvents::Button, MouseFormat::Sgr), &mut last).is_empty());
+        assert!(
+            enc(
+                &ev(None, MouseAction::Motion, 0.0, 0.0),
+                &opts(MouseEvents::Button, MouseFormat::Sgr),
+                &mut last
+            )
+            .is_empty()
+        );
     }
 
     // ghostty mouse_encode.zig:467 "sgr release keeps button identity"
@@ -499,16 +530,24 @@ mod tests {
         let mut last = None;
         let mut e = ev(LEFT, MouseAction::Press, 2.0, 3.0);
         e.mods = Mods::SHIFT | Mods::ALT | Mods::CTRL;
-        assert_eq!(enc(&e, &opts(MouseEvents::Any, MouseFormat::Urxvt), &mut last), b"\x1B[60;3;4M");
+        assert_eq!(
+            enc(&e, &opts(MouseEvents::Any, MouseFormat::Urxvt), &mut last),
+            b"\x1B[60;3;4M"
+        );
     }
 
     // ghostty mouse_encode.zig:522 "utf8 encodes large coordinates"
     #[test]
     fn utf8_encodes_large_coordinates() {
         let mut last = None;
-        let out = enc(&ev(LEFT, MouseAction::Press, 300.0, 400.0), &opts(MouseEvents::Any, MouseFormat::Utf8), &mut last);
+        let out = enc(
+            &ev(LEFT, MouseAction::Press, 300.0, 400.0),
+            &opts(MouseEvents::Any, MouseFormat::Utf8),
+            &mut last,
+        );
         assert_eq!(out[..4], [0x1B, b'[', b'M', 32]);
-        let cps: Vec<u32> = core::str::from_utf8(&out[4..]).unwrap().chars().map(u32::from).collect();
+        let cps: Vec<u32> =
+            core::str::from_utf8(&out[4..]).unwrap().chars().map(u32::from).collect();
         assert_eq!(cps, [333, 433]);
     }
 
@@ -516,15 +555,31 @@ mod tests {
     #[test]
     fn x10_coordinate_limit() {
         let mut last = None;
-        assert!(enc(&ev(LEFT, MouseAction::Press, 223.0, 0.0), &opts(MouseEvents::X10, MouseFormat::X10), &mut last).is_empty());
+        assert!(
+            enc(
+                &ev(LEFT, MouseAction::Press, 223.0, 0.0),
+                &opts(MouseEvents::X10, MouseFormat::X10),
+                &mut last
+            )
+            .is_empty()
+        );
     }
 
     // ghostty mouse_encode.zig:565 "sgr wheel button mappings"
     #[test]
     fn sgr_wheel_button_mappings() {
-        for (b, code) in [(MouseButton::Four, 64), (MouseButton::Five, 65), (MouseButton::Six, 66), (MouseButton::Seven, 67)] {
+        for (b, code) in [
+            (MouseButton::Four, 64),
+            (MouseButton::Five, 65),
+            (MouseButton::Six, 66),
+            (MouseButton::Seven, 67),
+        ] {
             let mut last = None;
-            let out = enc(&ev(Some(b), MouseAction::Press, 0.0, 0.0), &opts(MouseEvents::Any, MouseFormat::Sgr), &mut last);
+            let out = enc(
+                &ev(Some(b), MouseAction::Press, 0.0, 0.0),
+                &opts(MouseEvents::Any, MouseFormat::Sgr),
+                &mut last,
+            );
             assert_eq!(out, std::format!("\x1B[<{code};1;1M").as_bytes());
         }
     }
@@ -534,7 +589,10 @@ mod tests {
     fn urxvt_release_uses_legacy_button_3_encoding() {
         let mut last = None;
         let e = ev(Some(MouseButton::Right), MouseAction::Release, 2.0, 3.0);
-        assert_eq!(enc(&e, &opts(MouseEvents::Any, MouseFormat::Urxvt), &mut last), b"\x1B[35;3;4M");
+        assert_eq!(
+            enc(&e, &opts(MouseEvents::Any, MouseFormat::Urxvt), &mut last),
+            b"\x1B[35;3;4M"
+        );
     }
 
     // ghostty mouse_encode.zig:615 "unsupported button is ignored"
@@ -550,7 +608,10 @@ mod tests {
     fn sgr_pixels_uses_terminal_space_cursor_coordinates() {
         let mut last = None;
         let e = ev(LEFT, MouseAction::Press, 10.0, 20.0);
-        assert_eq!(enc(&e, &opts(MouseEvents::Any, MouseFormat::SgrPixels), &mut last), b"\x1B[<0;10;20M");
+        assert_eq!(
+            enc(&e, &opts(MouseEvents::Any, MouseFormat::SgrPixels), &mut last),
+            b"\x1B[<0;10;20M"
+        );
     }
 
     // ghostty mouse_encode.zig:651 "sgr pixels release keeps button identity"
@@ -558,7 +619,10 @@ mod tests {
     fn sgr_pixels_release_keeps_button_identity() {
         let mut last = None;
         let e = ev(Some(MouseButton::Right), MouseAction::Release, 10.0, 20.0);
-        assert_eq!(enc(&e, &opts(MouseEvents::Any, MouseFormat::SgrPixels), &mut last), b"\x1B[<2;10;20m");
+        assert_eq!(
+            enc(&e, &opts(MouseEvents::Any, MouseFormat::SgrPixels), &mut last),
+            b"\x1B[<2;10;20m"
+        );
     }
 
     // ghostty mouse_encode.zig:669 "position exactly at viewport boundary is encoded in final cell"
@@ -588,7 +652,10 @@ mod tests {
         let mut last = None;
         let mut o = opts(MouseEvents::Any, MouseFormat::Sgr);
         o.any_button_pressed = true;
-        assert_eq!(enc(&ev(LEFT, MouseAction::Motion, -1.0, -1.0), &o, &mut last), b"\x1B[<32;1;1M");
+        assert_eq!(
+            enc(&ev(LEFT, MouseAction::Motion, -1.0, -1.0), &o, &mut last),
+            b"\x1B[<32;1;1M"
+        );
     }
 
     // ghostty mouse_encode.zig:731 "motion is deduped by last cell except sgr pixels"
@@ -609,12 +676,7 @@ mod tests {
         o.size = Size {
             screen: Pixels { width: 110, height: 110 },
             cell: Pixels { width: 10, height: 10 },
-            padding: Padding {
-                top: 5,
-                bottom: 5,
-                right: 5,
-                left: 5,
-            },
+            padding: Padding { top: 5, bottom: 5, right: 5, left: 5 },
         };
         let mut last = None;
         // (24, 4) is terminal (19, -1): cell (1, 0), the negative row clamped.
@@ -625,7 +687,10 @@ mod tests {
         assert_eq!(enc(&ev(LEFT, MouseAction::Press, 5.5, 4.5), &o, &mut last), b"\x1B[<0;1;-1M");
         // Past the grid: the last cell.
         o.format = MouseFormat::Sgr;
-        assert_eq!(enc(&ev(LEFT, MouseAction::Press, 109.0, 109.0), &o, &mut last), b"\x1B[<0;10;10M");
+        assert_eq!(
+            enc(&ev(LEFT, MouseAction::Press, 109.0, 109.0), &o, &mut last),
+            b"\x1B[<0;10;10M"
+        );
     }
 
     #[test]
@@ -641,12 +706,28 @@ mod tests {
     #[test]
     fn every_report_fits_max_len() {
         blaze_sim::check(blaze_sim::Config::cases(2000), |tape| {
-            const BUTTONS: [Option<MouseButton>; 6] =
-                [None, LEFT, Some(MouseButton::Right), Some(MouseButton::Four), Some(MouseButton::Nine), Some(MouseButton::Eleven)];
-            const EVENTS: [MouseEvents; 5] =
-                [MouseEvents::None, MouseEvents::X10, MouseEvents::Normal, MouseEvents::Button, MouseEvents::Any];
-            const FORMATS: [MouseFormat; 5] =
-                [MouseFormat::X10, MouseFormat::Utf8, MouseFormat::Sgr, MouseFormat::Urxvt, MouseFormat::SgrPixels];
+            const BUTTONS: [Option<MouseButton>; 6] = [
+                None,
+                LEFT,
+                Some(MouseButton::Right),
+                Some(MouseButton::Four),
+                Some(MouseButton::Nine),
+                Some(MouseButton::Eleven),
+            ];
+            const EVENTS: [MouseEvents; 5] = [
+                MouseEvents::None,
+                MouseEvents::X10,
+                MouseEvents::Normal,
+                MouseEvents::Button,
+                MouseEvents::Any,
+            ];
+            const FORMATS: [MouseFormat; 5] = [
+                MouseFormat::X10,
+                MouseFormat::Utf8,
+                MouseFormat::Sgr,
+                MouseFormat::Urxvt,
+                MouseFormat::SgrPixels,
+            ];
             let coord = |t: &blaze_sim::Tape, l| match t.below(3, l) {
                 0 => f32::MAX,
                 1 => -f32::MAX,
@@ -656,10 +737,7 @@ mod tests {
                 action: *tape.pick(&ACTIONS, "action").unwrap_or(&MouseAction::Press),
                 button: *tape.pick(&BUTTONS, "button").unwrap_or(&None),
                 mods: Mods::from_bits(tape.int_in(0..=0x3FFu16, "mods")),
-                pos: SurfacePos {
-                    x: coord(tape, "x"),
-                    y: coord(tape, "y"),
-                },
+                pos: SurfacePos { x: coord(tape, "x"), y: coord(tape, "y") },
             };
             let o = MouseOpts {
                 event: *tape.pick(&EVENTS, "event").unwrap_or(&MouseEvents::Any),

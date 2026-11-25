@@ -47,9 +47,7 @@ impl<'o> Out<'o> {
     }
 
     fn full(&self) -> BufferFull {
-        BufferFull {
-            capacity: self.buf.len(),
-        }
+        BufferFull { capacity: self.buf.len() }
     }
 
     pub(crate) fn byte(&mut self, b: u8) -> Result<(), BufferFull> {

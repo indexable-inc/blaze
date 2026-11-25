@@ -406,11 +406,7 @@ impl Mods {
 
     /// The side alt is held on.
     pub const fn alt_side(self) -> Side {
-        if self.contains(Mods::ALT_RIGHT_SIDE) {
-            Side::Right
-        } else {
-            Side::Left
-        }
+        if self.contains(Mods::ALT_RIGHT_SIDE) { Side::Right } else { Side::Left }
     }
 
     /// The legacy modifier parameter, `1 + (shift | alt << 1 | ctrl << 2 | super << 3)`, for a
@@ -421,7 +417,10 @@ impl Mods {
         if b.is_empty() {
             return None;
         }
-        let bits = (b.shift() as u8) | (b.alt() as u8) << 1 | (b.ctrl() as u8) << 2 | (b.super_key() as u8) << 3;
+        let bits = (b.shift() as u8)
+            | (b.alt() as u8) << 1
+            | (b.ctrl() as u8) << 2
+            | (b.super_key() as u8) << 3;
         Some(bits + 1)
     }
 }
@@ -473,11 +472,7 @@ impl KeyEvent<'_> {
     /// The modifiers that count for bindings: all of them, less the consumed ones when there is
     /// text (ghostty `key.zig:52`).
     pub const fn effective_mods(&self) -> Mods {
-        if self.utf8.is_empty() {
-            self.mods
-        } else {
-            self.mods.without(self.consumed_mods)
-        }
+        if self.utf8.is_empty() { self.mods } else { self.mods.without(self.consumed_mods) }
     }
 }
 
@@ -599,7 +594,11 @@ const MAX_FIXED_LEN: usize = 2 + 7 + 8 + 8 + 4 + 2 + 2 + 1;
 
 /// Encodes `event` into `out` and returns the bytes written, which may be none (a release in
 /// legacy mode, a dead key, a lone modifier).
-pub fn encode<'o>(event: &KeyEvent<'_>, opts: &EncodeOpts, out: &'o mut [u8]) -> Result<&'o [u8], BufferFull> {
+pub fn encode<'o>(
+    event: &KeyEvent<'_>,
+    opts: &EncodeOpts,
+    out: &'o mut [u8],
+) -> Result<&'o [u8], BufferFull> {
     let mut w = Out::new(out);
     if opts.kitty_flags.is_empty() {
         legacy(&mut w, event, opts)?;
@@ -622,7 +621,9 @@ fn kitty(w: &mut Out<'_>, event: &KeyEvent<'_>, opts: &EncodeOpts) -> Result<(),
             return Ok(());
         }
         // Enter, backspace and tab report releases only with "report all".
-        if !flags.contains(KittyFlags::REPORT_ALL) && matches!(event.key, Key::Enter | Key::Backspace | Key::Tab) {
+        if !flags.contains(KittyFlags::REPORT_ALL)
+            && matches!(event.key, Key::Enter | Key::Backspace | Key::Tab)
+        {
             return Ok(());
         }
     }
@@ -650,7 +651,10 @@ fn kitty(w: &mut Out<'_>, event: &KeyEvent<'_>, opts: &EncodeOpts) -> Result<(),
 
         // IME confirmation still sends an enter key: enter (or backspace) with text that is not
         // a single control byte is that text (backspace: nothing).
-        if !event.utf8.is_empty() && matches!(event.key, Key::Enter | Key::Backspace) && !is_control_utf8(event.utf8) {
+        if !event.utf8.is_empty()
+            && matches!(event.key, Key::Enter | Key::Backspace)
+            && !is_control_utf8(event.utf8)
+        {
             if event.key == Key::Backspace {
                 return Ok(());
             }
@@ -670,7 +674,8 @@ fn kitty(w: &mut Out<'_>, event: &KeyEvent<'_>, opts: &EncodeOpts) -> Result<(),
             }
 
             // Unmodified printable text goes as text (not releases: those are encoded).
-            if !event.utf8.is_empty() && binding_mods.is_empty() && event.action != Action::Release {
+            if !event.utf8.is_empty() && binding_mods.is_empty() && event.action != Action::Release
+            {
                 // Invalid UTF-8 is encoded as if the key had no text.
                 if let Ok(text) = core::str::from_utf8(event.utf8)
                     && !text.chars().any(|c| is_control(u32::from(c)))
@@ -825,8 +830,9 @@ fn legacy(w: &mut Out<'_>, event: &KeyEvent<'_>, opts: &EncodeOpts) -> Result<()
                 }
             }
             // xterm's `ModifyOtherKeys`: control input, any non-shift modifier, or shift+space.
-            let should_modify =
-                (0x40..=0x7F).contains(&cp) || !mods.without(Mods::SHIFT).is_empty() || cp == u32::from(' ');
+            let should_modify = (0x40..=0x7F).contains(&cp)
+                || !mods.without(Mods::SHIFT).is_empty()
+                || cp == u32::from(' ');
             if should_modify && let Some(param) = mods.legacy_param() {
                 w.bytes(b"\x1B[27;")?;
                 w.dec(u32::from(param))?;
@@ -878,7 +884,12 @@ fn legacy(w: &mut Out<'_>, event: &KeyEvent<'_>, opts: &EncodeOpts) -> Result<()
 
 /// The byte alt prefixes with ESC, if alt is pressed, 1036 is set and (on macOS) option is
 /// alt on that side. ghostty `key_encode.zig:551`.
-fn legacy_alt_prefix(event: &KeyEvent<'_>, binding_mods: Mods, mods: Mods, opts: &EncodeOpts) -> Option<u8> {
+fn legacy_alt_prefix(
+    event: &KeyEvent<'_>,
+    binding_mods: Mods,
+    mods: Mods,
+    opts: &EncodeOpts,
+) -> Option<u8> {
     if !binding_mods.alt() || !opts.alt_esc_prefix {
         return None;
     }
@@ -899,7 +910,11 @@ fn legacy_alt_prefix(event: &KeyEvent<'_>, binding_mods: Mods, mods: Mods, opts:
 
 /// The legacy table sequence for `key` under these modes, if any. ghostty
 /// `key_encode.zig:604`.
-fn pc_style_function_key(key: Key, mods: Mods, opts: &EncodeOpts) -> Option<function_keys::Sequence> {
+fn pc_style_function_key(
+    key: Key,
+    mods: Mods,
+    opts: &EncodeOpts,
+) -> Option<function_keys::Sequence> {
     // Sides and locks do not matter here.
     let mods = mods.binding();
     // Mode 1035 forces the numeric keypad; otherwise 66 decides.
@@ -946,7 +961,12 @@ fn pc_style_function_key(key: Key, mods: Mods, opts: &EncodeOpts) -> Option<func
 
 /// The C0 byte ctrl+key sends, if it sends one: Kitty's table, with fixterms' `i`, `m` and `[`
 /// left to `CSI u`. ghostty `key_encode.zig:684`.
-fn ctrl_seq(logical_key: Key, utf8: &[u8], unshifted_codepoint: Option<char>, mods: Mods) -> Option<u8> {
+fn ctrl_seq(
+    logical_key: Key,
+    utf8: &[u8],
+    unshifted_codepoint: Option<char>,
+    mods: Mods,
+) -> Option<u8> {
     if !mods.ctrl() {
         return None;
     }
@@ -1054,11 +1074,7 @@ struct CsiUMods {
 
 impl CsiUMods {
     const fn from_input(mods: Mods) -> CsiUMods {
-        CsiUMods {
-            shift: mods.shift(),
-            alt: mods.alt(),
-            ctrl: mods.ctrl(),
-        }
+        CsiUMods { shift: mods.shift(), alt: mods.alt(), ctrl: mods.ctrl() }
     }
 
     /// The bitmask plus one, as sent.
