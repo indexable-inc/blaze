@@ -339,6 +339,7 @@ blaze-lower = { path = "crates/blaze-lower" }
 blaze-manifest = { path = "crates/blaze-manifest" }
 blaze-math = { path = "crates/blaze-math" }
 blaze-native = { path = "crates/blaze-native" }
+blaze-pbr = { path = "crates/blaze-pbr" }
 blaze-pins = { path = "crates/blaze-pins" }
 blaze-new = { path = "crates/blaze-new" }
 blaze-producers = { path = "crates/blaze-producers" }

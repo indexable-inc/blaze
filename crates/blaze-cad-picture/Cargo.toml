@@ -27,6 +27,8 @@ blaze-math.workspace = true
 blaze-units.workspace = true
 # `Vec`, `Alloc`, `AllocFailure`, the plant seam.
 blaze-own.workspace = true
+# Standalone deterministic GGX + HDRI IBL + CC0 PBR + VNDF + À-Trous denoiser + bloom library.
+blaze-pbr.workspace = true
 
 [dev-dependencies]
 # Property tests and typed planted-bug controls (D165).

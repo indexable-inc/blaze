@@ -2435,3 +2435,172 @@ fn multi_material_shell_roles_survive_simplification_and_cache_opt() {
     assert_eq!(stencil.min_feature, Some(Length::mm(2.0)));
     assert_eq!(stencil.max_error, Some(Length::mm(0.5)));
 }
+
+#[test]
+fn uv_box_metric_and_tangents_orthonormal_with_planted_controls() {
+    use blaze_cad_field::{BoxOpts, CompileOpts, Graph, GraphOpts, compile};
+    use blaze_units::Length;
+
+    let mut g = Graph::new(GraphOpts { alloc: heap(), .. });
+    let s = g
+        .cuboid(BoxOpts { size: [Length::mm(400.0), Length::mm(200.0), Length::mm(100.0)], round: Length::mm(10.0), .. })
+        .unwrap();
+    let tape = compile(&g, s.id(), CompileOpts { alloc: heap(), .. }).unwrap();
+    let grid = auto_grid(&tape.aabb(), Length::mm(3.0), None);
+    let meshed = mesh(
+        &tape,
+        MeshOpts { tolerance: Length::mm(3.0), piece: grid.piece, feature: grid.feature, alloc: heap(), scratch: heap(), .. },
+    )
+    .unwrap();
+
+    let uvd = project_uvs(
+        &meshed.mesh.view(),
+        ProjectUvOpts {
+            mode: UvMode::BoxMetric { tile_size: Length::m(0.5), grain: UvGrainAxis::Longest },
+            alloc: heap(),
+            scratch: heap(),
+        },
+    )
+    .expect("project_uvs BoxMetric");
+    assert!(uvd.view().uvs().is_some(), "UV column must be populated");
+    assert!(
+        uvd.view().vertex_count() > meshed.mesh.view().vertex_count(),
+        "6-face box projection must split vertices along chart seams"
+    );
+
+    // Planted control: SkipSeamSplit must NOT increase vertex count across seams.
+    let uvd_planted = project_uvs_planted(
+        &meshed.mesh.view(),
+        ProjectUvOpts {
+            mode: UvMode::BoxMetric { tile_size: Length::m(0.5), grain: UvGrainAxis::Longest },
+            alloc: heap(),
+            scratch: heap(),
+        },
+        UvProjectPlant::SkipSeamSplit,
+    )
+    .expect("planted uv");
+    assert!(uvd_planted.view().vertex_count() <= meshed.mesh.view().vertex_count());
+
+    // Tangents must be unit length, orthogonal to normals, with handedness ±1.
+    let tanned = attach_tangents(&uvd.view(), TangentOpts { alloc: heap(), scratch: heap() }).expect("attach_tangents");
+    let v = tanned.view();
+    let tangents = v.tangents().expect("tangents present");
+    let normals = v.normals();
+    for (t, n) in tangents.iter().zip(normals.iter()) {
+        let len = crate::geom::sqrt(f64::from(t[0]).powi(2) + f64::from(t[1]).powi(2) + f64::from(t[2]).powi(2));
+        assert!((len - 1.0).abs() < 1e-4, "tangent must be unit length, got {len}");
+        let ndott =
+            (f64::from(t[0]) * f64::from(n[0]) + f64::from(t[1]) * f64::from(n[1]) + f64::from(t[2]) * f64::from(n[2])).abs();
+        assert!(ndott < 1e-3, "tangent must be orthogonal to normal, |n·t| = {ndott}");
+        assert!(t[3] == 1.0 || t[3] == -1.0, "handedness must be ±1, got {}", t[3]);
+    }
+
+    // Planted control: FlipHandedness flips sign of w on vertices with non-degenerate UVs.
+    let tanned_flipped =
+        attach_tangents_planted(&uvd.view(), TangentOpts { alloc: heap(), scratch: heap() }, UvProjectPlant::FlipHandedness)
+            .expect("flipped tangents");
+    let mut flipped_count = 0usize;
+    for (a, b) in tangents.iter().zip(tanned_flipped.view().tangents().unwrap().iter()) {
+        if (a[3] + b[3]).abs() < 1e-6 {
+            flipped_count += 1;
+        }
+    }
+    assert!(flipped_count > tangents.len() / 2, "FlipHandedness must flip handedness");
+}
+
+#[test]
+fn bake_sdf_surface_and_normal_map_distinguish_curvature_ao_and_bevels() {
+    use blaze_cad_field::{BoxOpts, CompileOpts, Graph, GraphOpts, Placement, compile};
+    use blaze_units::Length;
+
+    // L-shaped bracket: has both an outer convex corner and an inner 90° concave crevice!
+    let mut g = Graph::new(GraphOpts { alloc: heap(), .. });
+    let leg_a = g
+        .cuboid(BoxOpts { size: [Length::mm(200.0), Length::mm(60.0), Length::mm(60.0)], round: Length::mm(6.0), .. })
+        .unwrap();
+    let leg_b = g
+        .cuboid(BoxOpts { size: [Length::mm(60.0), Length::mm(200.0), Length::mm(60.0)], round: Length::mm(6.0), .. })
+        .unwrap();
+    let leg_b = g.place(leg_b, Placement::shift(Length::mm(-70.0), Length::mm(70.0), Length::ZERO)).unwrap();
+    let bracket = g.union(leg_a, leg_b).unwrap();
+    let tape = compile(&g, bracket.id(), CompileOpts { alloc: heap(), .. }).unwrap();
+
+    let grid = auto_grid(&tape.aabb(), Length::mm(3.0), None);
+    let meshed = mesh(
+        &tape,
+        MeshOpts { tolerance: Length::mm(3.0), piece: grid.piece, feature: grid.feature, alloc: heap(), scratch: heap(), .. },
+    )
+    .unwrap();
+
+    let baked = bake_sdf_surface(
+        &meshed.mesh.view(),
+        &tape,
+        BakeSurfaceOpts {
+            ao_radius: Length::mm(60.0),
+            curvature_radius: Length::mm(6.0),
+            cavity_radius: Length::mm(10.0),
+            alloc: heap(),
+            scratch: heap(),
+            ..
+        },
+    )
+    .expect("bake_sdf_surface");
+    let cols = baked.view().colours().expect("baked COLOR_0 present");
+    let min_ao = cols.iter().map(|c| c[0]).min().unwrap();
+    let max_ao = cols.iter().map(|c| c[0]).max().unwrap();
+    let min_curv = cols.iter().map(|c| c[1]).min().unwrap();
+    let max_curv = cols.iter().map(|c| c[1]).max().unwrap();
+    assert!(
+        max_ao > min_ao + 30,
+        "L-bracket must show clear AO contrast between inner corner and outer faces: min={min_ao} max={max_ao}"
+    );
+    assert!(
+        min_curv < 110 && max_curv > 145,
+        "L-bracket must distinguish concave crevice (<110) and convex edges (>145): min={min_curv} max={max_curv}"
+    );
+
+    // Planted controls: FlatAo destroys contrast.
+    let flat_ao = bake_sdf_surface_planted(
+        &meshed.mesh.view(),
+        &tape,
+        BakeSurfaceOpts {
+            ao_radius: Length::mm(60.0),
+            curvature_radius: Length::mm(6.0),
+            cavity_radius: Length::mm(10.0),
+            alloc: heap(),
+            scratch: heap(),
+            ..
+        },
+        BakePlant::FlatAo,
+    )
+    .unwrap();
+    assert!(flat_ao.view().colours().unwrap().iter().all(|c| c[0] == 255));
+
+    // Non-overlapping BoxAtlas UVs + tangents -> analytic tangent-space normal map!
+    let atlas = project_uvs(
+        &baked.view(),
+        ProjectUvOpts { mode: UvMode::BoxAtlas { resolution: 64, gutter_px: 4 }, alloc: heap(), scratch: heap() },
+    )
+    .expect("BoxAtlas");
+    let atlas_tan = attach_tangents(&atlas.view(), TangentOpts { alloc: heap(), scratch: heap() }).expect("atlas tangents");
+    let nmap = bake_sdf_normal_map(
+        &atlas_tan.view(),
+        &tape,
+        BakeNormalOpts { width: 64, height: 64, max_snap: Length::mm(8.0), gutter_px: 4, alloc: heap(), scratch: heap(), .. },
+    )
+    .expect("bake_sdf_normal_map");
+    assert!(nmap.covered_texels > 200, "atlas normal map must cover UV islands: {}", nmap.covered_texels);
+    let non_flat = nmap.pixels.chunks_exact(4).filter(|p| p[0] != 128 || p[1] != 128 || p[2] != 255).count();
+    assert!(non_flat > 20, "normal map must capture non-flat SDF bevel/surface detail, got {non_flat}");
+
+    // Planted control: FlatNormalMap produces zero non-flat texels.
+    let nmap_flat = crate::bake::bake_sdf_normal_map_planted(
+        &atlas_tan.view(),
+        &tape,
+        BakeNormalOpts { width: 64, height: 64, max_snap: Length::mm(8.0), gutter_px: 4, alloc: heap(), scratch: heap(), .. },
+        BakePlant::FlatNormalMap,
+    )
+    .unwrap();
+    let non_flat_p = nmap_flat.pixels.chunks_exact(4).filter(|p| p[0] != 128 || p[1] != 128 || p[2] != 255).count();
+    assert_eq!(non_flat_p, 0);
+}

@@ -1297,6 +1297,7 @@ fn effective_shading(shading: &Shading, strip_lights: &[Option<StripLight>; 4]) 
             }
             Shading::Studio(studio)
         }
+        Shading::Pbr(pbr) => Shading::Pbr(pbr),
     }
 }
 

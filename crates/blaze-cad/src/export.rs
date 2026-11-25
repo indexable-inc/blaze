@@ -43,6 +43,7 @@ pub const STEEL: Material<'static> = Material {
     emissive_strength: None,
     clearcoat: None,
     double_sided: false,
+    ..
 };
 
 /// [`STEEL`] alone.
@@ -437,10 +438,11 @@ pub fn export_glb<'a, P: Planted<CadPlant>>(
             mass,
             joint: None,
             collider,
+            ..
         };
         nodes.try_push(node).map_err(|_| ModelError::Alloc { what: "the export's nodes" })?;
     }
-    let scene = blaze_cad_out::Scene { parts: &nodes, materials: o.materials };
+    let scene = blaze_cad_out::Scene { parts: &nodes, materials: o.materials, .. };
     let glb = glb(&scene, GlbOpts { encoding: o.encoding, up: o.up, limits: o.limits, alloc: o.alloc, scratch: s }).map_err(ModelError::Glb)?;
     Ok(Exported { glb, counts })
 }

@@ -493,6 +493,7 @@ dependencies = [
  "blaze-deflate",
  "blaze-math",
  "blaze-own",
+ "blaze-pbr",
  "blaze-sim",
  "blaze-text",
  "blaze-units",
@@ -567,6 +568,7 @@ dependencies = [
  "blaze-deflate",
  "blaze-math",
  "blaze-own",
+ "blaze-pbr",
  "blaze-sim",
  "blaze-units",
 ]
@@ -1629,6 +1631,14 @@ dependencies = [
  "blaze-kit",
  "blaze-own",
  "zstd",
+]
+
+[[package]]
+name = "blaze-pbr"
+version = "0.0.0"
+dependencies = [
+ "blaze-math",
+ "blaze-own",
 ]
 
 [[package]]

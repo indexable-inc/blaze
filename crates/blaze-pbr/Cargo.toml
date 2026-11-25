@@ -1,0 +1,24 @@
+[package]
+name = "blaze-pbr"
+description = "Reusable no_std sans-IO PBR library: Cook-Torrance GGX microfacet BRDF (anisotropy, clearcoat, sheen, transmission, multi-scattering), AgX/ACES filmic tone mapping, procedural HDRI IBL environments, bilinear/hex-tile/triplanar CC0 texture sampling, SDF-mask smart-material wear/grime/dust layering, and deterministic procedural CC0 PBR pack synthesis"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-math.workspace = true
+blaze-own.workspace = true
+
+[dev-dependencies]
+blaze-own = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true
