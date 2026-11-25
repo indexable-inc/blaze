@@ -1,0 +1,431 @@
+//! GPU-independent visual scene primitives, hit-test regions, and structured value
+//! formatting helpers consumed by `layout.rs` and rasterized by Metal (`render.rs`).
+
+use blaze_sh::Value;
+use blaze_ui::shaders::{ClipRectGpu, RectInst, prim_kind};
+
+use crate::blocks::{BlockId, BranchId};
+use crate::theme;
+
+/// Logical CSS-pixel dimensions of one monospace cell.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CellMetrics {
+    pub cw: f32,
+    pub ch: f32,
+}
+
+impl Default for CellMetrics {
+    fn default() -> Self {
+        Self { cw: 8.0, ch: 18.0 }
+    }
+}
+
+/// A styled text span positioned in logical pixels to be turned into [`blaze_ui::shaders::GlyphInst`]s.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextRun {
+    pub x: f32,
+    pub y: f32,
+    pub text: String,
+    pub color: [f32; 4],
+    pub bold: bool,
+    pub italic: bool,
+    pub clip_id: u32,
+}
+
+/// Axis-aligned clickable hit box in logical pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HitRect {
+    pub x0: f32,
+    pub y0: f32,
+    pub x1: f32,
+    pub y1: f32,
+}
+
+impl HitRect {
+    #[inline]
+    pub const fn new(x0: f32, y0: f32, x1: f32, y1: f32) -> Self {
+        Self { x0, y0, x1, y1 }
+    }
+
+    #[inline]
+    pub fn contains(&self, x: f32, y: f32) -> bool {
+        x >= self.x0 && x <= self.x1 && y >= self.y0 && y <= self.y1
+    }
+}
+
+/// Semantic UI action triggered by clicking a [`HitRegion`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HitAction {
+    SwitchBranch(BranchId),
+    ForkActiveBranch,
+    ForkBlock(BlockId),
+    ToggleFold(BlockId),
+    ToggleExpandCell { block: BlockId, row: usize, col: usize },
+    SelectCompletion(usize),
+}
+
+/// Clickable UI target recorded during layout.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HitRegion {
+    pub rect: HitRect,
+    pub action: HitAction,
+}
+
+/// Complete layered frame output emitted by [`crate::layout::build_scene`].
+#[derive(Clone, Debug)]
+pub struct Scene {
+    /// Background cards, headers, pills, alternating table rows, and borders.
+    pub rects: Vec<RectInst>,
+    /// Primary text runs rasterized over `rects`.
+    pub text_runs: Vec<TextRun>,
+    /// Foreground overlays (underlines, error carets, beam cursor, hairlines) drawn over text.
+    pub over_rects: Vec<RectInst>,
+    /// Floating popup backgrounds (completion dropdown, Ctrl+R bar) drawn above all content.
+    pub overlay_rects: Vec<RectInst>,
+    /// Floating popup text runs drawn above `overlay_rects`.
+    pub overlay_text: Vec<TextRun>,
+    /// Fragment-shader rounded-rect clip table (slot 0 is always the unbounded full viewport).
+    pub clips: Vec<ClipRectGpu>,
+    /// Clickable regions in paint order (`hit_test` walks in reverse so top-most wins).
+    pub hit_regions: Vec<HitRegion>,
+    /// Total height of the scrollable block column in logical pixels.
+    pub total_content_height: f32,
+    /// Height of the visible scroll viewport between top bar and input bar.
+    pub scroll_viewport_height: f32,
+    /// Y coordinate where the docked bottom input bar starts.
+    pub input_top_y: f32,
+    /// Window clear color RGB.
+    pub clear_color: [f32; 3],
+}
+
+impl Scene {
+    pub fn new() -> Self {
+        let infinite_clip = ClipRectGpu {
+            rect: [-1.0e6, -1.0e6, 1.0e6, 1.0e6],
+            params: [0.0; 4],
+        };
+        Self {
+            rects: Vec::new(),
+            text_runs: Vec::new(),
+            over_rects: Vec::new(),
+            overlay_rects: Vec::new(),
+            overlay_text: Vec::new(),
+            clips: vec![infinite_clip],
+            hit_regions: Vec::new(),
+            total_content_height: 0.0,
+            scroll_viewport_height: 0.0,
+            input_top_y: 0.0,
+            clear_color: theme::BG_CANVAS_RGB,
+        }
+    }
+
+    /// Push a rounded-rect clip region and return its GPU table index (`clip_id`).
+    pub fn push_clip(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, radius: f32) -> u32 {
+        let id = self.clips.len() as u32;
+        self.clips.push(ClipRectGpu {
+            rect: [x0, y0, x1, y1],
+            params: [radius, 0.0, 0.0, 0.0],
+        });
+        id
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn round_rect(
+        &mut self,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        radius: f32,
+        fill: [f32; 4],
+        border_w: f32,
+        border_color: [f32; 4],
+        clip_id: u32,
+    ) {
+        self.rects.push(RectInst {
+            rect: [x0, y0, x1, y1],
+            color: fill,
+            border_color,
+            params: [radius, border_w, 0.0, prim_kind::ROUND_RECT],
+            clip_info: [clip_id, 0, 0, 0],
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn overlay_round_rect(
+        &mut self,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        radius: f32,
+        fill: [f32; 4],
+        border_w: f32,
+        border_color: [f32; 4],
+        clip_id: u32,
+    ) {
+        self.overlay_rects.push(RectInst {
+            rect: [x0, y0, x1, y1],
+            color: fill,
+            border_color,
+            params: [radius, border_w, 0.0, prim_kind::ROUND_RECT],
+            clip_info: [clip_id, 0, 0, 0],
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn shadow(
+        &mut self,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        radius: f32,
+        blur: f32,
+        color: [f32; 4],
+        clip_id: u32,
+    ) {
+        self.rects.push(RectInst {
+            rect: [x0, y0, x1, y1],
+            color,
+            border_color: [0.0; 4],
+            params: [radius, 0.0, blur, prim_kind::SHADOW],
+            clip_info: [clip_id, 0, 0, 0],
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn overlay_shadow(
+        &mut self,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        radius: f32,
+        blur: f32,
+        color: [f32; 4],
+        clip_id: u32,
+    ) {
+        self.overlay_rects.push(RectInst {
+            rect: [x0, y0, x1, y1],
+            color,
+            border_color: [0.0; 4],
+            params: [radius, 0.0, blur, prim_kind::SHADOW],
+            clip_info: [clip_id, 0, 0, 0],
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn over_round_rect(
+        &mut self,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        radius: f32,
+        fill: [f32; 4],
+        clip_id: u32,
+    ) {
+        self.over_rects.push(RectInst {
+            rect: [x0, y0, x1, y1],
+            color: fill,
+            border_color: [0.0; 4],
+            params: [radius, 0.0, 0.0, prim_kind::ROUND_RECT],
+            clip_info: [clip_id, 0, 0, 0],
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn line(
+        &mut self,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        thickness: f32,
+        color: [f32; 4],
+        clip_id: u32,
+    ) {
+        self.over_rects.push(RectInst {
+            rect: [x0, y0, x1, y1],
+            color,
+            border_color: [0.0; 4],
+            params: [thickness, 0.0, 0.0, prim_kind::LINE],
+            clip_info: [clip_id, 0, 0, 0],
+        });
+    }
+
+    pub fn circle(
+        &mut self,
+        cx: f32,
+        cy: f32,
+        radius: f32,
+        fill: [f32; 4],
+        clip_id: u32,
+    ) {
+        self.rects.push(RectInst {
+            rect: [cx - radius, cy - radius, cx + radius, cy + radius],
+            color: fill,
+            border_color: [0.0; 4],
+            params: [radius, 0.0, 0.0, prim_kind::CIRCLE],
+            clip_info: [clip_id, 0, 0, 0],
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn text(
+        &mut self,
+        x: f32,
+        y: f32,
+        text: impl Into<String>,
+        color: [f32; 4],
+        bold: bool,
+        italic: bool,
+        clip_id: u32,
+    ) {
+        let s = text.into();
+        if !s.is_empty() {
+            self.text_runs.push(TextRun { x, y, text: s, color, bold, italic, clip_id });
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn overlay_text_run(
+        &mut self,
+        x: f32,
+        y: f32,
+        text: impl Into<String>,
+        color: [f32; 4],
+        bold: bool,
+        italic: bool,
+        clip_id: u32,
+    ) {
+        let s = text.into();
+        if !s.is_empty() {
+            self.overlay_text.push(TextRun { x, y, text: s, color, bold, italic, clip_id });
+        }
+    }
+
+    pub fn push_hit(&mut self, rect: HitRect, action: HitAction) {
+        self.hit_regions.push(HitRegion { rect, action });
+    }
+
+    /// Record a hit target clipped against `self.clips[clip_id]` so scrolled-off buttons
+    /// behind the top bar or docked input card can never intercept mouse clicks.
+    pub fn push_hit_clipped(&mut self, rect: HitRect, clip_id: u32, action: HitAction) {
+        let Some(clip) = self.clips.get(clip_id as usize) else {
+            self.hit_regions.push(HitRegion { rect, action });
+            return;
+        };
+        let x0 = rect.x0.max(clip.rect[0]);
+        let y0 = rect.y0.max(clip.rect[1]);
+        let x1 = rect.x1.min(clip.rect[2]);
+        let y1 = rect.y1.min(clip.rect[3]);
+        if x1 > x0 && y1 > y0 {
+            self.hit_regions.push(HitRegion {
+                rect: HitRect::new(x0, y0, x1, y1),
+                action,
+            });
+        }
+    }
+
+    /// Hit-test a logical point `(x, y)` against recorded regions (top-most wins).
+    pub fn hit_test(&self, x: f32, y: f32) -> Option<HitAction> {
+        for region in self.hit_regions.iter().rev() {
+            if region.rect.contains(x, y) {
+                return Some(region.action);
+            }
+        }
+        None
+    }
+}
+
+impl Default for Scene {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Compact cell representation of a `Value` for table cells and badges.
+pub fn format_value_cell(val: &Value<'_>) -> String {
+    match val {
+        Value::List(l) => format!("[list {}]", l.len()),
+        Value::Record(r) => format!("{{record {}}}", r.len()),
+        Value::Table(t) => format!("[table {}x{}]", t.nrows(), t.ncols()),
+        Value::Nothing => "—".to_owned(),
+        _ => {
+            let mut out = String::new();
+            let _ = val.format_cell(&mut out);
+            out
+        }
+    }
+}
+
+/// True when clicking a table cell containing `val` should expand/collapse an inline drawer.
+pub fn is_expandable_cell(val: &Value<'_>) -> bool {
+    matches!(val, Value::List(_) | Value::Record(_) | Value::Table(_))
+}
+
+/// Format elapsed milliseconds concisely (`<1ms`, `4ms`, `1.2s`).
+pub fn format_duration_ms(ms: u64) -> String {
+    if ms == 0 {
+        "<1ms".to_owned()
+    } else if ms < 1_000 {
+        format!("{ms}ms")
+    } else if ms < 60_000 {
+        let secs = ms / 1_000;
+        let tenths = (ms % 1_000) / 100;
+        format!("{secs}.{tenths}s")
+    } else {
+        let mins = ms / 60_000;
+        let secs = (ms % 60_000) / 1_000;
+        format!("{mins}m {secs}s")
+    }
+}
+
+/// Truncate `s` to at most `max_chars` Unicode scalar values, appending `…` if truncated.
+pub fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let count = s.chars().count();
+    if count <= max_chars {
+        return s.to_owned();
+    }
+    if max_chars == 1 {
+        return "…".to_owned();
+    }
+    let mut out: String = s.chars().take(max_chars - 1).collect();
+    out.push('…');
+    out
+}
+
+/// Wrap `s` into visual lines of at most `max_cols` characters each (preserving explicit `\n`).
+pub fn wrap_lines(s: &str, max_cols: usize) -> Vec<String> {
+    let cap = max_cols.max(8);
+    let mut out = Vec::new();
+    for raw_line in s.split('\n') {
+        let cleaned = raw_line.trim_end_matches('\r');
+        if cleaned.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let mut cur = String::new();
+        let mut cur_len = 0usize;
+        for ch in cleaned.chars() {
+            if cur_len >= cap {
+                out.push(core::mem::take(&mut cur));
+                cur_len = 0;
+            }
+            cur.push(ch);
+            cur_len += 1;
+        }
+        if !cur.is_empty() {
+            out.push(cur);
+        }
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}

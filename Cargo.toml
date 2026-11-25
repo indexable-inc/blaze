@@ -21,6 +21,9 @@ exclude = [
     # build steps on macOS. Its own workspace with its own lock; nothing depends on it and
     # nothing selects it.
     "crates/blaze-hvbox",
+    # Native macOS shell app (docs/v2/plan/design/sh.md): AppKit/Metal/CoreText through objc2;
+    # its own workspace with its own lock while blaze-sh and blaze-vt stay workspace members.
+    "crates/blaze-shell",
     "demo",
     "harness",
     # The standard library's own workspace (docs/toolchain.md).
@@ -523,6 +526,7 @@ blaze-site-wasm = { path = "crates/blaze-site-wasm" } # Zero-import no_std wasm3
 blaze-tab = { path = "crates/blaze-tab" } # Blaze's LLM-first tabular data format inspired by NUON (sparse schemas, lossless Value).
 blaze-toml = { path = "crates/blaze-toml" }
 blaze-vt = { path = "crates/blaze-vt" } # bstd::vt: a sans-IO terminal emulator core with ghostty's coverage (docs/v2/plan/design/vt.md).
+blaze-sh = { path = "crates/blaze-sh" } # bstd::sh: a sans-IO nushell-like structured shell core with O(1) CoW forkable state (docs/v2/plan/design/sh.md).
 blaze-ui = { path = "crates/blaze-ui" } # Pure no_std, zero-unsafe, sans-IO relational ECS UI library + Rust->WGSL/MSL WebGPU renderer.
 blaze-ui-wasm = { path = "crates/blaze-ui-wasm" } # Zero-import no_std wasm32 C-ABI cdylib over blaze-ui + generated WebGPU shaders.
 blaze-v2-proof = { path = "crates/blaze-v2-proof" }

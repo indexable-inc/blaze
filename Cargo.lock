@@ -1978,6 +1978,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-sh"
+version = "0.0.0"
+dependencies = [
+ "blaze-data",
+ "blaze-glob",
+ "blaze-json",
+ "blaze-own",
+ "blaze-sim",
+ "blaze-toml",
+]
+
+[[package]]
 name = "blaze-sha256"
 version = "0.0.0"
 dependencies = [
