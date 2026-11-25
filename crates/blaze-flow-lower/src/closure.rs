@@ -1039,6 +1039,36 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                         stack.push((child, blaze_typeck::ClosureParamRegion::push_step(p, to_u32(ci))));
                     }
                 }
+                PNode::Dynamic(_) => {
+                    // Slot 0 is the object lifetime (`+ 'o`); slots 1.. are existential
+                    // predicate slots bound by `dyn`'s own inner `for<..>` binder (e.g.
+                    // `|tx: &dyn Fn(&Fixture) -> AASigned|`), so under an explicit annotation
+                    // they receive `InnerBound` (existential in the closure body) rather than
+                    // `Late(None)` (rigid universal).
+                    let total = self.npos(t, e)?;
+                    if total > 0 {
+                        push_written(p, 0, owner, out);
+                        for slot_idx in 1..total {
+                            if inferred_unannotated {
+                                out.push(SigSlot::Owner(*owner));
+                                *owner += 1;
+                            } else {
+                                out.push(SigSlot::InnerBound(u32::MAX - 1, slot_idx));
+                            }
+                        }
+                    }
+                }
+                PNode::FnPtr(..) => {
+                    let total = self.npos(t, e)?;
+                    for slot_idx in 0..total {
+                        if inferred_unannotated {
+                            out.push(SigSlot::Owner(*owner));
+                            *owner += 1;
+                        } else {
+                            out.push(SigSlot::InnerBound(u32::MAX - 2, slot_idx));
+                        }
+                    }
+                }
                 _ => {
                     push_default(self.npos(t, e)?, owner, out);
                 }

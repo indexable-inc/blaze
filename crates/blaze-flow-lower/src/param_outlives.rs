@@ -34,7 +34,7 @@
 use blaze_flow::Origin;
 use blaze_own::Vec;
 use blaze_typeck::regions::Region;
-use blaze_typeck::{ExprId, List, PNode, PTy};
+use blaze_typeck::{ExprId, PNode, PTy};
 use core::alloc::Allocator;
 
 use crate::{CallBounds, Facts, Form, Lower, MOST_POSITIONS, OutlivesType, Plant, Refusal, TyD};
@@ -222,34 +222,5 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         }
         self.param_origs.push(ParamOrigin { origin: o, param: u, certain });
         o
-    }
-
-    /// Whether the call of a callee with declared `bounds`, instantiated with `g`, owes a
-    /// type-outlives bound over an argument that holds none of the call's origin positions
-    /// but does hold a type parameter of the body or a type the lowering does not place: the
-    /// first such callee parameter. Such a call is taken by `call_by_generic_signature` (which
-    /// relates or refuses it), never by `call_by_signature` (which reads no bounds).
-    pub(crate) fn owes_type_outlives(&self, bounds: CallBounds<'_>, g: List, e: ExprId) -> Result<Option<u32>, Refusal> {
-        let args: &'c [PTy] = self.list(g, e)?;
-        // A bound on the output is independent of the future's own captures. It must
-        // reach the generic signature even for an entirely capture-free block.
-        for &(subject, _) in bounds.outlives {
-            if !matches!(subject, OutlivesType::Param(_)) {
-                return Ok(Some(subject.param()));
-            }
-        }
-        let mut params: Vec<u32, A> = Vec::new_in(self.alloc);
-        for (i, &t) in args.iter().enumerate() {
-            let i = i as u32;
-            let bound = i < bounds.unread_below || bounds.outlives.iter().any(|&(s, _)| s == OutlivesType::Param(i));
-            if !bound {
-                continue;
-            }
-            params.clear();
-            if self.npos(t, e)? != 0 || self.unplaced(t, e, &mut params)? || !params.is_empty() {
-                return Ok(Some(i));
-            }
-        }
-        Ok(None)
     }
 }
