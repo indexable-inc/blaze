@@ -111,6 +111,8 @@ pub enum Request<'a> {
 pub struct DirEntry<'a> {
     pub name: AString<'a>,
     pub kind: FileKind,
+    /// Optional rich file/directory classification from `blaze-sniff` (e.g. `"Git worktree"`, `"Rust crate"`).
+    pub analysis: Option<AString<'a>>,
     pub size: Bytes,
     pub modified: DateTime,
     pub readonly: bool,

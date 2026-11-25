@@ -153,7 +153,7 @@ pub fn get_svg(name: &str) -> Option<&'static SvgArt> {
 /// Map a file or folder name + optional `ls` type (`"dir"`, `"file"`, `"symlink"`) to its
 /// canonical macOS folder or IntelliJ New UI dark SVG icon name.
 pub fn icon_name_for_file(path: &str, kind: Option<&str>) -> &'static str {
-    let is_dir = matches!(kind, Some("dir")) || path.ends_with('/');
+    let is_dir = kind.is_some_and(blaze_sniff::is_dir_label) || path.ends_with('/');
     let base_raw = path.trim_end_matches('/').rsplit('/').next().unwrap_or(path);
     if is_dir {
         return match base_raw {
@@ -164,6 +164,7 @@ pub fn icon_name_for_file(path: &str, kind: Option<&str>) -> &'static str {
     }
     let base = base_raw.to_ascii_lowercase();
     match base.as_str() {
+        ".git" => return "gitignore",
         "cargo.toml" => return "cargo_toml",
         "cargo.lock" => return "cargo_lock",
         "blaze.lock" => return "blaze_lock",

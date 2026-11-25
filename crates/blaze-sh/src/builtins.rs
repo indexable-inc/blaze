@@ -1670,10 +1670,15 @@ fn builtin_ls<'a>(
     for &idx in order.iter() {
         let e = &entries[idx];
         eval.charge(1, span)?;
+        let type_str = e
+            .analysis
+            .as_ref()
+            .map(|a| a.as_str())
+            .unwrap_or(e.kind.as_str());
         if long {
             let row = [
                 Value::string(e.name.as_str(), alloc),
-                Value::string(e.kind.as_str(), alloc),
+                Value::string(type_str, alloc),
                 Value::Size(e.size),
                 Value::Date(e.modified),
                 Value::Bool(e.readonly),
@@ -1682,7 +1687,7 @@ fn builtin_ls<'a>(
         } else {
             let row = [
                 Value::string(e.name.as_str(), alloc),
-                Value::string(e.kind.as_str(), alloc),
+                Value::string(type_str, alloc),
                 Value::Size(e.size),
                 Value::Date(e.modified),
             ];

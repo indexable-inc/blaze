@@ -194,7 +194,8 @@ const DEFAULT_ABBREVIATIONS: &[(&str, &str)] = &[
     ("lso", "ls | sort-by modified"),
     ("lt", "ls | sort-by modified -r"),
     ("p", "pwd"),
-    ("c", "clear"),
+    ("c", "cd"),
+    ("cl", "clear"),
     ("o", "open"),
     ("op", "open"),
     // Structured pipeline shorthand (Nushell-style)

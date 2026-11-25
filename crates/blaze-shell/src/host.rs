@@ -348,6 +348,34 @@ fn system_time_to_datetime(t: SystemTime, offset_secs: i32) -> DateTime {
     DateTime { utc_ns: ns, offset_secs }
 }
 
+fn sniff_entry_label(entry_path: &Path, name: &str, kind: FileKind) -> String {
+    let res = match kind {
+        FileKind::Dir => {
+            let markers = blaze_sniff::DirMarkers {
+                has_cargo_toml: entry_path.join("Cargo.toml").exists(),
+                has_package_json: entry_path.join("package.json").exists(),
+                has_pyproject: entry_path.join("pyproject.toml").exists(),
+                has_go_mod: entry_path.join("go.mod").exists(),
+                has_flake_nix: entry_path.join("flake.nix").exists(),
+                has_git: entry_path.join(".git").exists(),
+            };
+            blaze_sniff::sniff_dir(name, markers)
+        }
+        FileKind::Symlink => blaze_sniff::sniff_symlink(),
+        FileKind::File => {
+            let mut head = [0u8; blaze_sniff::SNIFF_HEAD_BYTES];
+            let n = fs::File::open(entry_path)
+                .and_then(|mut f| f.read(&mut head))
+                .unwrap_or(0);
+            blaze_sniff::sniff_file(name, &head[..n])
+        }
+        FileKind::Other => blaze_sniff::sniff_file(name, &[]),
+    };
+    let mut s = String::new();
+    let _ = res.format_label(&mut s);
+    s
+}
+
 fn read_dir_entries(
     path: &Path,
     show_hidden: bool,
@@ -355,34 +383,37 @@ fn read_dir_entries(
 ) -> Result<AVec<'static, DirEntry<'static>>, String> {
     let rd = fs::read_dir(path).map_err(|e| format!("ls `{}`: {e}", path.display()))?;
     let tz = local_tz_offset_secs();
-    let mut rows: Vec<(String, FileKind, Bytes, DateTime, bool)> = Vec::new();
+    let mut rows: Vec<(String, FileKind, String, Bytes, DateTime, bool)> = Vec::new();
     for item in rd {
         let Ok(ent) = item else { continue };
         let name = ent.file_name().to_string_lossy().into_owned();
         if !show_hidden && name.starts_with('.') {
             continue;
         }
-        let meta = match fs::symlink_metadata(ent.path()) {
+        let ent_path = ent.path();
+        let meta = match fs::symlink_metadata(&ent_path) {
             Ok(m) => m,
             Err(_) => continue,
         };
         let kind = file_kind_from_meta(&meta);
+        let analysis = sniff_entry_label(&ent_path, &name, kind);
         let size = Bytes(meta.len().min(i64::MAX as u64) as i64);
         let modified = meta
             .modified()
             .map(|t| system_time_to_datetime(t, tz))
             .unwrap_or_default();
         let readonly = meta.permissions().readonly();
-        rows.push((name, kind, size, modified, readonly));
+        rows.push((name, kind, analysis, size, modified, readonly));
     }
     // Deterministic ordering by name (rule 25).
     rows.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut out = AVec::with_capacity_in(rows.len(), alloc);
-    for (name, kind, size, modified, readonly) in rows {
+    for (name, kind, analysis, size, modified, readonly) in rows {
         out.push(DirEntry {
             name: AString::from_str_in(&name, alloc),
             kind,
+            analysis: Some(AString::from_str_in(&analysis, alloc)),
             size,
             modified,
             readonly,
@@ -398,9 +429,12 @@ fn stat_entry(path: &Path, alloc: Alloc<'static>) -> Result<DirEntry<'static>, S
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string_lossy().into_owned());
     let tz = local_tz_offset_secs();
+    let kind = file_kind_from_meta(&meta);
+    let analysis = sniff_entry_label(path, &name, kind);
     Ok(DirEntry {
         name: AString::from_str_in(&name, alloc),
-        kind: file_kind_from_meta(&meta),
+        kind,
+        analysis: Some(AString::from_str_in(&analysis, alloc)),
         size: Bytes(meta.len().min(i64::MAX as u64) as i64),
         modified: meta
             .modified()

@@ -21,6 +21,8 @@ path = "src/main.rs"
 [dependencies]
 blaze-own = { path = "../blaze-own", features = ["std"] }
 blaze-git = { path = "../blaze-git" }
+blaze-preview = { path = "../blaze-preview" }
+blaze-sniff = { path = "../blaze-sniff" }
 blaze-ssh = { path = "../blaze-ssh" }
 blaze-vim = { path = "../blaze-vim" }
 blaze-vt = { path = "../blaze-vt" }

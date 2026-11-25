@@ -1,0 +1,22 @@
+[package]
+name = "blaze-preview"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-own = { path = "../blaze-own" }
+blaze-data = { path = "../blaze-data" }
+blaze-json = { path = "../blaze-json" }
+blaze-toml = { path = "../blaze-toml" }
+blaze-sniff = { path = "../blaze-sniff" }
+
+[dev-dependencies]
+blaze-own = { path = "../blaze-own", features = ["testing"] }
+blaze-sim = { path = "../blaze-sim" }
+
+[lints]
+workspace = true

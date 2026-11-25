@@ -1,10 +1,21 @@
-//! Native Yazi-class 3-column GPU file manager (`y` / `y <dir>`):
-//! Miller columns (parent | current | live preview) rendered directly in Metal with macOS blue
-//! folders, IntelliJ New UI dark SVG icons, instant text/dir previews, and Vim navigation
-//! (`j`/`k`/`h`/`l`/`gg`/`G`/`/` filter/`Enter`/`Space` insert/`q`/`Esc`).
+//! Native Yazi-class 3-column GPU file manager (`y` / `y <dir>`) powered by our sans-IO
+//! `blaze-sniff` + `blaze-preview` crates:
+//! - Miller columns (parent | current | rich structured preview) in Metal
+//! - Tabular previews for `uv.lock`, `Cargo.lock`, `blaze.lock`, CSV, JSON arrays
+//! - Structured key/value + deps tables for `Cargo.toml`, `package.json`, `flake.lock`, TOML
+//! - Rendered Markdown (`README.md`, `AGENTS.md`, `*.md`) with headings, bullets, inline code
+//!   pills, blockquotes, and syntax-highlighted code fences
+//! - Syntax-highlighted source code for Rust, TS/JS, Python, Go, Nix, Shell, SQL, etc.
+//! - Vim navigation (`j`/`k`/`h`/`l`/`gg`/`G`/`/` filter/`Enter`/`Space` insert/`q`/`Esc`).
 
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use blaze_own::Alloc;
+use blaze_preview::{
+    CodeLine, MdBlock, MdStyle, PreviewBody, PreviewDoc, PreviewKv, PreviewLimits, PreviewTable,
+    TokenKind, build_preview,
+};
 
 use crate::blocks::BlockStore;
 use crate::layout::{TOP_BAR_H, layout_top_bar};
@@ -13,15 +24,14 @@ use crate::svg_icons::icon_name_for_file;
 use crate::theme;
 use crate::view::{CellMetrics, Scene, truncate_chars};
 
+const MAX_PREVIEW_BYTES: usize = 32 * 1024;
+const MAX_DIR_ENTRIES: usize = 512;
+
 fn format_size_bytes(bytes: i64) -> String {
     let mut s = String::new();
     let _ = blaze_sh::Value::Size(blaze_sh::Bytes(bytes)).format_cell(&mut s);
     s
 }
-
-const MAX_PREVIEW_BYTES: usize = 8192;
-const MAX_PREVIEW_LINES: usize = 64;
-const MAX_DIR_ENTRIES: usize = 512;
 
 /// One entry inside a Miller column.
 #[derive(Clone, Debug)]
@@ -33,19 +43,12 @@ pub struct YaziEntry {
     pub icon: &'static str,
 }
 
-/// Preview content for the currently highlighted entry in the right pane.
+/// Rich preview content for the currently highlighted entry in the right pane.
 #[derive(Clone, Debug)]
 pub enum YaziPreview {
     Empty,
     Directory(Vec<YaziEntry>),
-    Text {
-        meta: String,
-        lines: Vec<String>,
-        truncated: bool,
-    },
-    Binary {
-        meta: String,
-    },
+    Rich(PreviewDoc<'static>),
     Error(String),
 }
 
@@ -53,11 +56,8 @@ pub enum YaziPreview {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum YaziAction {
     Continue,
-    /// Exit `y` and `cd` into the directory the user navigated to.
     ExitAndCd(PathBuf),
-    /// Exit `y` without changing directory.
     ExitCancel,
-    /// Exit `y` and insert the selected path into the shell prompt.
     InsertPath(String),
 }
 
@@ -96,7 +96,6 @@ impl YaziState {
         st
     }
 
-    /// Return filtered indices into `self.entries`.
     pub fn visible_indices(&self) -> Vec<usize> {
         if self.filter.is_empty() {
             return (0..self.entries.len()).collect();
@@ -147,10 +146,9 @@ impl YaziState {
             self.preview = YaziPreview::Directory(sub);
             return;
         }
-        self.preview = load_file_preview_body(&entry.path, entry.size);
+        self.preview = load_rich_preview(&entry.path, &entry.name, entry.size);
     }
 
-    /// Handle one keyboard input in `y`.
     pub fn handle_key(&mut self, key: &str, ch: Option<char>) -> YaziAction {
         if self.filtering {
             match key {
@@ -303,12 +301,25 @@ impl YaziState {
     }
 }
 
-/// Read a bounded, clean file preview for both `y` and `ls` hover popovers!
+fn load_rich_preview(path: &Path, name: &str, size: u64) -> YaziPreview {
+    use std::io::Read as _;
+    let Ok(mut f) = fs::File::open(path) else {
+        return YaziPreview::Error("permission denied".to_owned());
+    };
+    let mut buf = vec![0u8; (size as usize).min(MAX_PREVIEW_BYTES)];
+    let n = f.read(&mut buf).unwrap_or(0);
+    buf.truncate(n);
+    let doc = build_preview(name, &buf, size, PreviewLimits::SHIPPED, Alloc::global());
+    YaziPreview::Rich(doc)
+}
+
+/// Read a bounded, clean file preview for `ls` hover popovers (powered by `blaze-sniff` + `blaze-preview`).
 pub fn load_file_preview_lines(path: &Path, max_lines: usize) -> (String, Vec<String>, bool) {
     let meta = match fs::metadata(path) {
         Ok(m) => m,
         Err(e) => return ("unreadable".to_owned(), vec![format!("{e}")], false),
     };
+    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
     if meta.is_dir() {
         let entries = read_dir_entries(path, false);
         let total = entries.len();
@@ -321,50 +332,74 @@ pub fn load_file_preview_lines(path: &Path, max_lines: usize) -> (String, Vec<St
         return (meta_str, lines, total > max_lines);
     }
     let size = meta.len();
-    match load_file_preview_body(path, size) {
-        YaziPreview::Text { meta, mut lines, mut truncated } => {
-            if lines.len() > max_lines {
-                lines.truncate(max_lines);
-                truncated = true;
+    match load_rich_preview(path, name, size) {
+        YaziPreview::Rich(doc) => {
+            let mut kind_lbl = String::new();
+            let _ = doc.sniff.format_label(&mut kind_lbl);
+            let meta_str = format!("{kind_lbl} · {}", format_size_bytes(size as i64));
+            match doc.body {
+                PreviewBody::Table(t) => {
+                    let mut lines = Vec::new();
+                    let hdr = t.headers.iter().map(|h| h.as_str()).collect::<Vec<_>>().join("   ");
+                    lines.push(hdr);
+                    for row in t.rows.iter().take(max_lines.saturating_sub(1)) {
+                        let line = row.iter().map(|c| c.as_str()).collect::<Vec<_>>().join("   ");
+                        lines.push(line);
+                    }
+                    (meta_str, lines, t.total_rows > max_lines)
+                }
+                PreviewBody::KeyValues(kv) => {
+                    let mut lines = Vec::new();
+                    for (k, v) in kv.pairs.iter().take(max_lines) {
+                        lines.push(format!("{:<14} {}", k.as_str(), v.as_str()));
+                    }
+                    if let Some(t) = kv.table {
+                        for row in t.rows.iter().take(max_lines.saturating_sub(lines.len())) {
+                            lines.push(row.iter().map(|c| c.as_str()).collect::<Vec<_>>().join("  "));
+                        }
+                    }
+                    (meta_str, lines, false)
+                }
+                PreviewBody::Markdown { blocks, truncated } => {
+                    let mut lines = Vec::new();
+                    for b in blocks.iter().take(max_lines) {
+                        let s = match b {
+                            MdBlock::Heading { spans, .. }
+                            | MdBlock::Paragraph { spans }
+                            | MdBlock::Quote { spans } => {
+                                spans.iter().map(|sp| sp.text.as_str()).collect::<String>()
+                            }
+                            MdBlock::Bullet { marker, spans, .. } => {
+                                let body: String = spans.iter().map(|sp| sp.text.as_str()).collect();
+                                format!("{} {body}", marker.as_str())
+                            }
+                            MdBlock::CodeFence { lang, .. } => format!("[code: {}]", lang.as_str()),
+                            MdBlock::Rule => "────────".to_owned(),
+                            MdBlock::Blank => String::new(),
+                        };
+                        lines.push(s);
+                    }
+                    (meta_str, lines, truncated)
+                }
+                PreviewBody::Code { lines: cl, truncated, .. } => {
+                    let out: Vec<String> = cl
+                        .iter()
+                        .take(max_lines)
+                        .map(|l| l.spans.iter().map(|s| s.text.as_str()).collect())
+                        .collect();
+                    (meta_str, out, truncated || cl.len() > max_lines)
+                }
+                PreviewBody::Summary { pairs } => {
+                    let out: Vec<String> = pairs
+                        .iter()
+                        .map(|(k, v)| format!("{:<12} {}", k.as_str(), v.as_str()))
+                        .collect();
+                    (meta_str, out, false)
+                }
             }
-            (meta, lines, truncated)
         }
-        YaziPreview::Binary { meta } => (meta, vec!["<binary file>".to_owned()], false),
         YaziPreview::Error(e) => ("error".to_owned(), vec![e], false),
-        _ => (format_size_bytes(size as i64), vec!["(empty file)".to_owned()], false),
-    }
-}
-
-fn load_file_preview_body(path: &Path, size: u64) -> YaziPreview {
-    use std::io::Read as _;
-    let Ok(mut f) = fs::File::open(path) else {
-        return YaziPreview::Error("permission denied".to_owned());
-    };
-    let mut buf = vec![0u8; (size as usize).min(MAX_PREVIEW_BYTES)];
-    let n = f.read(&mut buf).unwrap_or(0);
-    buf.truncate(n);
-    if buf.iter().take(512).any(|&b| b == 0) {
-        return YaziPreview::Binary {
-            meta: format!("binary · {}", format_size_bytes(size as i64)),
-        };
-    }
-    let text = String::from_utf8_lossy(&buf);
-    let mut lines = Vec::new();
-    let mut truncated = (size as usize) > MAX_PREVIEW_BYTES;
-    for line in text.lines() {
-        if lines.len() >= MAX_PREVIEW_LINES {
-            truncated = true;
-            break;
-        }
-        lines.push(line.replace('\t', "    "));
-    }
-    if lines.is_empty() {
-        lines.push("(empty file)".to_owned());
-    }
-    YaziPreview::Text {
-        meta: format_size_bytes(size as i64),
-        lines,
-        truncated,
+        _ => (format_size_bytes(size as i64), vec!["(empty)".to_owned()], false),
     }
 }
 
@@ -396,8 +431,22 @@ fn read_dir_entries(dir: &Path, show_hidden: bool) -> Vec<YaziEntry> {
     out
 }
 
-/// Lay out the native 3-column Miller file browser (`y`) directly in Metal, keeping the
-/// unified top tab bar visible and clickable at the top of the window.
+fn token_color(kind: TokenKind) -> ([f32; 4], bool, bool) {
+    match kind {
+        TokenKind::Plain => (theme::INK_2, false, false),
+        TokenKind::Keyword => (theme::INK_1, true, false),
+        TokenKind::Type => (theme::rgb(0x9a, 0xc2, 0xe8), false, false),
+        TokenKind::String => (theme::rgb(0x7c, 0xc9, 0x8b), false, false),
+        TokenKind::Number => (theme::rgb(0xd8, 0xc9, 0x9b), false, false),
+        TokenKind::Comment => (theme::INK_4, false, true),
+        TokenKind::Attr => (theme::rgb(0xb4, 0xa2, 0xd8), false, false),
+        TokenKind::Key => (theme::INK_1, false, false),
+        TokenKind::Punct => (theme::INK_3, false, false),
+    }
+}
+
+/// Lay out the native 3-column Miller file browser (`y`) directly in Metal, rendering
+/// `blaze-preview`'s structured tables, rendered Markdown, and syntax-highlighted code!
 #[allow(clippy::too_many_arguments)]
 pub fn layout_yazi_view(
     yazi: &mut YaziState,
@@ -425,7 +474,7 @@ pub fn layout_yazi_view(
     let hty = TOP_BAR_H + (header_h - m.ch) * 0.5;
     scene.svg_icon(14.0, hty + (m.ch - 13.0) * 0.5, 13.0, "folder_macos", 0);
     let cwd_str = yazi.cwd.to_string_lossy();
-    let max_path_c = ((vw - 260.0) / m.cw).floor().max(16.0) as usize;
+    let max_path_c = ((vw - 280.0) / m.cw).floor().max(16.0) as usize;
     scene.text(34.0, hty, truncate_chars(&cwd_str, max_path_c), theme::INK_1, true, false, 0);
 
     if yazi.filtering || !yazi.filter.is_empty() {
@@ -436,11 +485,11 @@ pub fn layout_yazi_view(
         scene.text(fx0 + 7.0, hty, flbl, theme::INK_1, false, false, 0);
     }
 
-    // 2. Three Miller columns: Parent (18%) | Current (34%) | Live Preview (48%).
+    // 2. Three Miller columns: Parent (16%) | Current (30%) | Rich Preview (54%).
     let col1_x0 = 0.0;
-    let col1_x1 = (vw * 0.18).clamp(130.0, 240.0);
+    let col1_x1 = (vw * 0.16).clamp(120.0, 210.0);
     let col2_x0 = col1_x1;
-    let col2_x1 = (col2_x0 + vw * 0.34).clamp(col2_x0 + 200.0, vw - 220.0);
+    let col2_x1 = (col2_x0 + vw * 0.30).clamp(col2_x0 + 190.0, vw - 280.0);
     let col3_x0 = col2_x1;
     let col3_x1 = vw;
 
@@ -486,36 +535,12 @@ pub fn layout_yazi_view(
             let ry = body_top + 6.0 + (slot - yazi.scroll) as f32 * row_h;
             let is_sel = slot == yazi.selected;
             if is_sel {
-                scene.round_rect(
-                    col2_x0 + 6.0,
-                    ry,
-                    col2_x1 - 6.0,
-                    ry + row_h,
-                    5.0,
-                    theme::rgb(0x1e, 0x1e, 0x22),
-                    0.0,
-                    [0.0; 4],
-                    clip2,
-                );
-                scene.round_rect(
-                    col2_x0 + 6.0,
-                    ry + 4.0,
-                    col2_x0 + 8.0,
-                    ry + row_h - 4.0,
-                    1.0,
-                    theme::INK_1,
-                    0.0,
-                    [0.0; 4],
-                    clip2,
-                );
+                scene.round_rect(col2_x0 + 6.0, ry, col2_x1 - 6.0, ry + row_h, 5.0, theme::rgb(0x1e, 0x1e, 0x22), 0.0, [0.0; 4], clip2);
+                scene.round_rect(col2_x0 + 6.0, ry + 4.0, col2_x0 + 8.0, ry + row_h - 4.0, 1.0, theme::INK_1, 0.0, [0.0; 4], clip2);
             }
             let ty = ry + (row_h - m.ch) * 0.5;
             scene.svg_icon(col2_x0 + 14.0, ty + (m.ch - icon_s) * 0.5, icon_s, entry.icon, clip2);
-            let sz_lbl = if entry.is_dir {
-                String::new()
-            } else {
-                format_size_bytes(entry.size as i64)
-            };
+            let sz_lbl = if entry.is_dir { String::new() } else { format_size_bytes(entry.size as i64) };
             let sz_w = if sz_lbl.is_empty() { 0.0 } else { sz_lbl.len() as f32 * m.cw + 10.0 };
             if !sz_lbl.is_empty() {
                 scene.text(col2_x1 - 12.0 - sz_lbl.len() as f32 * m.cw, ty, &sz_lbl, theme::INK_4, false, false, clip2);
@@ -527,17 +552,17 @@ pub fn layout_yazi_view(
         }
     }
 
-    // Column 3: Live content / directory preview pane.
+    // Column 3: Rich `blaze-preview` pane (Tables | KeyValues | Rendered Markdown | Highlighted Code | Summary).
     let clip3 = scene.push_clip(col3_x0 + 1.0, body_top, col3_x1, body_bot, 0.0);
-    let px = col3_x0 + 16.0;
-    let pw = (col3_x1 - px - 14.0).max(80.0);
+    let px = col3_x0 + 18.0;
+    let pw = (col3_x1 - px - 16.0).max(100.0);
     match &yazi.preview {
         YaziPreview::Empty => {
-            scene.text(px, body_top + 12.0, "no selection", theme::INK_4, false, true, clip3);
+            scene.text(px, body_top + 14.0, "no selection", theme::INK_4, false, true, clip3);
         }
         YaziPreview::Directory(items) => {
             if items.is_empty() {
-                scene.text(px, body_top + 12.0, "empty directory", theme::INK_4, false, true, clip3);
+                scene.text(px, body_top + 14.0, "empty directory", theme::INK_4, false, true, clip3);
             } else {
                 for (i, sub) in items.iter().take(max_vis_rows).enumerate() {
                     let ry = body_top + 6.0 + i as f32 * row_h;
@@ -549,52 +574,352 @@ pub fn layout_yazi_view(
                 }
             }
         }
-        YaziPreview::Text { lines, truncated, .. } => {
-            let line_step = m.ch + 2.0;
-            let gutter_w = 4.0 * m.cw;
-            let max_c = ((pw - gutter_w) / m.cw).floor().max(12.0) as usize;
-            let max_lines = ((body_h - 16.0) / line_step).floor().max(1.0) as usize;
-            for (i, line) in lines.iter().take(max_lines).enumerate() {
-                let ly = body_top + 8.0 + i as f32 * line_step;
-                scene.text(px, ly, format!("{:>3}", i + 1), theme::INK_4, false, false, clip3);
-                let col = if line.trim_start().starts_with("//") || line.trim_start().starts_with('#') {
-                    theme::INK_3
-                } else {
-                    theme::INK_2
-                };
-                scene.text(px + gutter_w, ly, truncate_chars(line, max_c), col, false, false, clip3);
-            }
-            if *truncated && lines.len() < max_lines {
-                let ly = body_top + 8.0 + lines.len() as f32 * line_step;
-                scene.text(px + gutter_w, ly, "… truncated", theme::INK_4, false, true, clip3);
-            }
-        }
-        YaziPreview::Binary { meta } => {
-            scene.text(px, body_top + 14.0, meta, theme::INK_3, false, false, clip3);
-            scene.text(px, body_top + 14.0 + m.ch + 6.0, "binary preview skipped", theme::INK_4, false, true, clip3);
+        YaziPreview::Rich(doc) => {
+            render_rich_preview(&mut scene, doc, px, body_top + 10.0, pw, body_bot - 8.0, m, clip3);
         }
         YaziPreview::Error(err) => {
             scene.text(px, body_top + 14.0, err, theme::DANGER, false, false, clip3);
         }
     }
 
-    // 3. Minimal status footer bar.
+    // 3. Minimal status footer bar with `blaze-sniff` type tag!
     scene.round_rect(0.0, body_bot, vw, vh, 0.0, theme::BG_SURFACE, 0.0, [0.0; 4], 0);
     scene.line(0.0, body_bot, vw, body_bot, 1.0, theme::LINE, 0);
     let fty = body_bot + (footer_h - m.ch) * 0.5;
+    let kind_badge = match &yazi.preview {
+        YaziPreview::Rich(doc) => {
+            let mut s = String::new();
+            let _ = doc.sniff.format_label(&mut s);
+            format!(" · {s}")
+        }
+        YaziPreview::Directory(items) => format!(" · {} items", items.len()),
+        _ => String::new(),
+    };
     let pos_lbl = if vis.is_empty() {
-        "y · 0/0".to_owned()
+        format!("y · 0/0{kind_badge}")
     } else {
-        format!("y · {}/{}", yazi.selected + 1, vis.len())
+        format!("y · {}/{}{kind_badge}", yazi.selected + 1, vis.len())
     };
     scene.text(14.0, fty, pos_lbl, theme::INK_2, true, false, 0);
     let hint = "hjkl move  ·  / filter  ·  . hidden  ·  space insert  ·  q cd & exit";
     let hw = hint.chars().count() as f32 * m.cw;
-    if vw - 14.0 - hw > 140.0 {
+    if vw - 14.0 - hw > 220.0 {
         scene.text(vw - 14.0 - hw, fty, hint, theme::INK_4, false, false, 0);
     }
 
-    // 4. Unified top tab bar always visible!
     layout_top_bar(&mut scene, store, prompt, vw, m, zoom_pct, inline_titlebar);
     scene
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_rich_preview(
+    scene: &mut Scene,
+    doc: &PreviewDoc<'_>,
+    x0: f32,
+    y0: f32,
+    w: f32,
+    max_y: f32,
+    m: CellMetrics,
+    clip: u32,
+) {
+    match &doc.body {
+        PreviewBody::Table(tbl) => {
+            render_preview_table(scene, tbl, x0, y0, w, max_y, m, clip);
+        }
+        PreviewBody::KeyValues(kv) => {
+            render_preview_kv(scene, kv, x0, y0, w, max_y, m, clip);
+        }
+        PreviewBody::Markdown { blocks, truncated } => {
+            render_preview_markdown(scene, blocks.as_slice(), *truncated, x0, y0, w, max_y, m, clip);
+        }
+        PreviewBody::Code { lang, lines, truncated } => {
+            // Subtle language badge at top-right of code preview.
+            let mut y = y0;
+            scene.text(x0, y, *lang, theme::INK_3, true, false, clip);
+            let sz = format_size_bytes(doc.file_size as i64);
+            scene.text(x0 + w - sz.len() as f32 * m.cw, y, sz, theme::INK_4, false, false, clip);
+            y += m.ch + 6.0;
+            scene.line(x0, y, x0 + w, y, 1.0, theme::LINE_FAINT, clip);
+            y += 8.0;
+            render_code_lines(scene, lines.as_slice(), x0, y, w, max_y, m, clip, true);
+            if *truncated && y + (lines.len() as f32) * (m.ch + 2.0) < max_y {
+                scene.text(x0 + 4.0 * m.cw, max_y - m.ch, "… truncated", theme::INK_4, false, true, clip);
+            }
+        }
+        PreviewBody::Summary { pairs } => {
+            let mut y = y0;
+            let mut lbl = String::new();
+            let _ = doc.sniff.format_label(&mut lbl);
+            scene.text(x0, y, &lbl, theme::INK_1, true, false, clip);
+            y += m.ch + 8.0;
+            scene.line(x0, y, x0 + w, y, 1.0, theme::LINE_FAINT, clip);
+            y += 10.0;
+            for (k, v) in pairs.iter() {
+                if y + m.ch > max_y {
+                    break;
+                }
+                scene.text(x0, y, k.as_str(), theme::INK_4, false, false, clip);
+                scene.text(x0 + 14.0 * m.cw, y, v.as_str(), theme::INK_1, false, false, clip);
+                y += m.ch + 6.0;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_preview_table(
+    scene: &mut Scene,
+    tbl: &PreviewTable<'_>,
+    x0: f32,
+    mut y: f32,
+    w: f32,
+    max_y: f32,
+    m: CellMetrics,
+    clip: u32,
+) -> f32 {
+    scene.text(x0, y, tbl.title.as_str(), theme::INK_1, true, false, clip);
+    let sub_w = tbl.subtitle.chars().count() as f32 * m.cw;
+    scene.text(x0 + w - sub_w, y, tbl.subtitle.as_str(), theme::INK_4, false, false, clip);
+    y += m.ch + 6.0;
+    scene.line(x0, y, x0 + w, y, 1.0, theme::LINE_FAINT, clip);
+    y += 7.0;
+
+    let ncols = tbl.headers.len().max(1);
+    let col_gap = 14.0;
+    let mut widths = vec![0usize; ncols];
+    for (c, h) in tbl.headers.iter().enumerate() {
+        widths[c] = h.chars().count().max(4);
+    }
+    for row in tbl.rows.iter() {
+        for (c, cell) in row.iter().enumerate().take(ncols) {
+            widths[c] = widths[c].max(cell.chars().count().min(32));
+        }
+    }
+    let total_px: f32 = widths.iter().map(|&n| n as f32 * m.cw + col_gap).sum();
+    let scale = if total_px > w && total_px > 0.0 { w / total_px } else { 1.0 };
+    let col_px: Vec<f32> = widths.iter().map(|&n| (n as f32 * m.cw + col_gap) * scale).collect();
+
+    // Header row
+    let mut cx = x0;
+    for (c, h) in tbl.headers.iter().enumerate() {
+        let max_c = ((col_px[c] - 6.0) / m.cw).floor().max(3.0) as usize;
+        scene.text(cx, y, truncate_chars(h.as_str(), max_c), theme::INK_3, false, false, clip);
+        cx += col_px[c];
+    }
+    y += m.ch + 5.0;
+    scene.line(x0, y, x0 + w, y, 1.0, theme::LINE, clip);
+    y += 5.0;
+
+    let row_h = m.ch + 5.0;
+    for row in tbl.rows.iter() {
+        if y + row_h > max_y {
+            break;
+        }
+        let mut rx = x0;
+        for (c, cell) in row.iter().enumerate().take(ncols) {
+            let max_c = ((col_px[c] - 6.0) / m.cw).floor().max(3.0) as usize;
+            let col = if c == 0 { theme::INK_1 } else if c == 1 { theme::rgb(0x7c, 0xc9, 0x8b) } else { theme::INK_3 };
+            scene.text(rx, y + 1.0, truncate_chars(cell.as_str(), max_c), col, false, false, clip);
+            rx += col_px[c];
+        }
+        y += row_h;
+    }
+    if tbl.total_rows > tbl.rows.len() && y + m.ch <= max_y {
+        let more = format!("… +{} more", tbl.total_rows - tbl.rows.len());
+        scene.text(x0, y + 2.0, more, theme::INK_4, false, true, clip);
+        y += m.ch + 4.0;
+    }
+    y
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_preview_kv(
+    scene: &mut Scene,
+    kv: &PreviewKv<'_>,
+    x0: f32,
+    mut y: f32,
+    w: f32,
+    max_y: f32,
+    m: CellMetrics,
+    clip: u32,
+) {
+    scene.text(x0, y, kv.title.as_str(), theme::INK_1, true, false, clip);
+    let sub_w = kv.subtitle.chars().count() as f32 * m.cw;
+    scene.text(x0 + w - sub_w, y, kv.subtitle.as_str(), theme::INK_4, false, false, clip);
+    y += m.ch + 6.0;
+    scene.line(x0, y, x0 + w, y, 1.0, theme::LINE_FAINT, clip);
+    y += 8.0;
+
+    let key_w = (kv.pairs.iter().map(|(k, _)| k.chars().count()).max().unwrap_or(8).clamp(8, 20) as f32 + 3.0) * m.cw;
+    let val_max_c = ((w - key_w) / m.cw).floor().max(10.0) as usize;
+    for (k, v) in kv.pairs.iter() {
+        if y + m.ch > max_y {
+            return;
+        }
+        scene.text(x0, y, k.as_str(), theme::INK_3, false, false, clip);
+        scene.text(x0 + key_w, y, truncate_chars(v.as_str(), val_max_c), theme::INK_1, false, false, clip);
+        y += m.ch + 4.0;
+    }
+    if let Some(tbl) = &kv.table
+        && y + m.ch * 3.0 < max_y
+    {
+        y += 10.0;
+        render_preview_table(scene, tbl, x0, y, w, max_y, m, clip);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_preview_markdown(
+    scene: &mut Scene,
+    blocks: &[MdBlock<'_>],
+    truncated: bool,
+    x0: f32,
+    mut y: f32,
+    w: f32,
+    max_y: f32,
+    m: CellMetrics,
+    clip: u32,
+) {
+    let max_cols = (w / m.cw).floor().max(16.0) as usize;
+    for blk in blocks {
+        if y + m.ch > max_y {
+            break;
+        }
+        match blk {
+            MdBlock::Blank => {
+                y += m.ch * 0.55;
+            }
+            MdBlock::Rule => {
+                let ry = y + m.ch * 0.4;
+                scene.line(x0, ry, x0 + w, ry, 1.0, theme::LINE, clip);
+                y += m.ch * 0.9;
+            }
+            MdBlock::Heading { level, spans } => {
+                if y > 60.0 {
+                    y += 4.0;
+                }
+                let col = if *level <= 2 { [1.0, 1.0, 1.0, 1.0] } else { theme::INK_1 };
+                render_md_spans(scene, spans.as_slice(), x0, y, max_cols, col, true, m, clip);
+                y += m.ch + 4.0;
+                if *level <= 2 {
+                    scene.line(x0, y - 1.0, x0 + w, y - 1.0, 1.0, theme::LINE_FAINT, clip);
+                    y += 4.0;
+                }
+            }
+            MdBlock::Paragraph { spans } => {
+                render_md_spans(scene, spans.as_slice(), x0, y, max_cols, theme::INK_2, false, m, clip);
+                y += m.ch + 4.0;
+            }
+            MdBlock::Bullet { indent, marker, spans } => {
+                let ix = x0 + (*indent as f32) * 2.0 * m.cw;
+                scene.text(ix, y, marker.as_str(), theme::INK_3, true, false, clip);
+                let bx = ix + (marker.chars().count() as f32 + 1.0) * m.cw;
+                let avail = max_cols.saturating_sub((*indent as usize) * 2 + marker.chars().count() + 1);
+                render_md_spans(scene, spans.as_slice(), bx, y, avail.max(8), theme::INK_2, false, m, clip);
+                y += m.ch + 4.0;
+            }
+            MdBlock::Quote { spans } => {
+                scene.over_round_rect(x0, y + 1.0, x0 + 2.0, y + m.ch - 1.0, 1.0, theme::LINE_STRONG, clip);
+                render_md_spans(scene, spans.as_slice(), x0 + 12.0, y, max_cols.saturating_sub(2), theme::INK_3, false, m, clip);
+                y += m.ch + 4.0;
+            }
+            MdBlock::CodeFence { lang, lines } => {
+                let box_h = (lines.len().max(1) as f32 * (m.ch + 2.0) + 12.0).min((max_y - y).max(20.0));
+                scene.round_rect(x0, y, x0 + w, y + box_h, 6.0, theme::rgb(0x15, 0x15, 0x18), 1.0, theme::LINE_FAINT, clip);
+                if !lang.is_empty() {
+                    let lw = lang.chars().count() as f32 * m.cw;
+                    scene.text(x0 + w - 10.0 - lw, y + 5.0, lang.as_str(), theme::INK_4, false, false, clip);
+                }
+                render_code_lines(scene, lines.as_slice(), x0 + 10.0, y + 6.0, w - 20.0, y + box_h - 4.0, m, clip, false);
+                y += box_h + 6.0;
+            }
+        }
+    }
+    if truncated && y + m.ch <= max_y {
+        scene.text(x0, y + 2.0, "… more content", theme::INK_4, false, true, clip);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_md_spans(
+    scene: &mut Scene,
+    spans: &[blaze_preview::MdSpan<'_>],
+    x0: f32,
+    y: f32,
+    max_cols: usize,
+    base_col: [f32; 4],
+    force_bold: bool,
+    m: CellMetrics,
+    clip: u32,
+) {
+    let mut cx = x0;
+    let mut rem = max_cols;
+    for sp in spans {
+        if rem == 0 {
+            break;
+        }
+        let txt = truncate_chars(sp.text.as_str(), rem);
+        let len = txt.chars().count();
+        let sw = len as f32 * m.cw;
+        match sp.style {
+            MdStyle::Plain => {
+                scene.text(cx, y, &txt, base_col, force_bold, false, clip);
+            }
+            MdStyle::Bold => {
+                scene.text(cx, y, &txt, theme::INK_1, true, false, clip);
+            }
+            MdStyle::Italic => {
+                scene.text(cx, y, &txt, theme::INK_2, force_bold, true, clip);
+            }
+            MdStyle::Code => {
+                scene.round_rect(cx - 2.0, y, cx + sw + 2.0, y + m.ch, 3.5, theme::rgb(0x1f, 0x1f, 0x24), 0.0, [0.0; 4], clip);
+                scene.text(cx, y, &txt, theme::rgb(0x7c, 0xc9, 0x8b), false, false, clip);
+            }
+            MdStyle::Link => {
+                scene.text(cx, y, &txt, theme::rgb(0x9a, 0xc2, 0xe8), force_bold, false, clip);
+            }
+        }
+        cx += sw;
+        rem = rem.saturating_sub(len);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_code_lines(
+    scene: &mut Scene,
+    lines: &[CodeLine<'_>],
+    x0: f32,
+    mut y: f32,
+    w: f32,
+    max_y: f32,
+    m: CellMetrics,
+    clip: u32,
+    show_gutter: bool,
+) {
+    let line_step = m.ch + 2.0;
+    let gutter_w = if show_gutter { 4.2 * m.cw } else { 0.0 };
+    let max_cols = ((w - gutter_w) / m.cw).floor().max(8.0) as usize;
+    for line in lines {
+        if y + m.ch > max_y {
+            break;
+        }
+        if show_gutter {
+            scene.text(x0, y, format!("{:>3}", line.line_no), theme::INK_4, false, false, clip);
+        }
+        let mut cx = x0 + gutter_w;
+        let mut rem = max_cols;
+        for sp in line.spans.iter() {
+            if rem == 0 {
+                break;
+            }
+            let clean = sp.text.as_str().replace('\t', "    ");
+            let txt = truncate_chars(&clean, rem);
+            let len = txt.chars().count();
+            let (col, bold, italic) = token_color(sp.kind);
+            scene.text(cx, y, &txt, col, bold, italic, clip);
+            cx += len as f32 * m.cw;
+            rem = rem.saturating_sub(len);
+        }
+        y += line_step;
+    }
 }

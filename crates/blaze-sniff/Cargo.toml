@@ -1,0 +1,15 @@
+[package]
+name = "blaze-sniff"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+doctest = false
+
+[dev-dependencies]
+blaze-own = { path = "../blaze-own", features = ["testing"] }
+blaze-sim = { path = "../blaze-sim" }
+
+[lints]
+workspace = true

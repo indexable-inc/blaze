@@ -121,6 +121,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-preview"
+version = "0.0.0"
+dependencies = [
+ "blaze-data",
+ "blaze-json",
+ "blaze-own",
+ "blaze-sniff",
+ "blaze-toml",
+]
+
+[[package]]
 name = "blaze-reclaim"
 version = "0.0.0"
 dependencies = [
@@ -150,7 +161,9 @@ dependencies = [
  "blaze-git",
  "blaze-json",
  "blaze-own",
+ "blaze-preview",
  "blaze-sh",
+ "blaze-sniff",
  "blaze-ssh",
  "blaze-ui",
  "blaze-vim",
@@ -164,6 +177,10 @@ dependencies = [
  "objc2-metal",
  "objc2-quartz-core",
 ]
+
+[[package]]
+name = "blaze-sniff"
+version = "0.0.0"
 
 [[package]]
 name = "blaze-ssh"

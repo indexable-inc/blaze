@@ -1130,7 +1130,7 @@ fn layout_file_grid(
             .and_then(Value::as_str)
             .unwrap_or("");
         let kind = type_col.and_then(|ti| table.cell(r, ti)).and_then(Value::as_str);
-        let is_dir = matches!(kind, Some("dir")) || raw.ends_with('/');
+        let is_dir = kind.is_some_and(blaze_sniff::is_dir_label) || raw.ends_with('/');
         let label = if is_dir && !raw.ends_with('/') {
             format!("{raw}/")
         } else {
@@ -1333,29 +1333,45 @@ fn layout_table(
         col_displays.push(disp);
 
         let hdr = table.columns.get(c).map(|s| s.as_ref()).unwrap_or("");
-        let mut max_c = (hdr.chars().count() + 2).max(3);
+        let is_icon_only_bool = hdr == "readonly"
+            || (disp == ColDisplay::Status
+                && (0..sample_rows)
+                    .filter_map(|r| table.cell(r, c))
+                    .all(|v| matches!(v, Value::Bool(_) | Value::Nothing)));
+        let mut max_c = if is_icon_only_bool {
+            2
+        } else {
+            (hdr.chars().count() + 2).max(3)
+        };
         let mut numeric_votes = 0usize;
         let mut non_empty = 0usize;
         let mut max_num = 0.0f64;
 
         for r in 0..sample_rows {
             if let Some(cell) = table.cell(r, c) {
-                let mut txt = format_value_cell_at(cell, Some(now_ns));
-                if disp == ColDisplay::FileEntry
-                    && type_col_idx.and_then(|ti| table.cell(r, ti)).and_then(Value::as_str) == Some("dir")
-                    && !txt.ends_with('/')
-                {
-                    txt.push('/');
+                let row_is_dir = type_col_idx
+                    .and_then(|ti| table.cell(r, ti))
+                    .and_then(Value::as_str)
+                    .is_some_and(blaze_sniff::is_dir_label);
+                if !is_icon_only_bool {
+                    let mut txt = format_value_cell_at(cell, Some(now_ns));
+                    if disp == ColDisplay::FileEntry && row_is_dir && !txt.ends_with('/') {
+                        txt.push('/');
+                    }
+                    max_c = max_c.max(txt.chars().count());
                 }
-                max_c = max_c.max(txt.chars().count());
                 if !matches!(cell, Value::Nothing) {
                     non_empty += 1;
                     if theme::is_right_aligned(cell) {
                         numeric_votes += 1;
                     }
                     match cell {
-                        Value::Size(Bytes(b)) => max_num = max_num.max((*b).max(0) as f64),
-                        Value::Float(f) if disp == ColDisplay::Percent => max_num = max_num.max(f.max(0.0)),
+                        Value::Size(Bytes(b)) if !row_is_dir => {
+                            max_num = max_num.max((*b).max(0) as f64)
+                        }
+                        Value::Float(f) if disp == ColDisplay::Percent => {
+                            max_num = max_num.max(f.max(0.0))
+                        }
                         _ => {}
                     }
                 }
@@ -1364,13 +1380,17 @@ fn layout_table(
         col_chars.push(max_c.min(40));
         col_right_align.push(
             matches!(disp, ColDisplay::FileSize | ColDisplay::Percent | ColDisplay::HumanTime)
-                || (non_empty > 0 && numeric_votes * 2 >= non_empty),
+                || (!is_icon_only_bool && non_empty > 0 && numeric_votes * 2 >= non_empty),
         );
-        let extra = match disp {
-            ColDisplay::FileEntry | ColDisplay::Crate | ColDisplay::Process => icon_pad + 10.0,
-            ColDisplay::Status => 14.0,
-            ColDisplay::FileSize | ColDisplay::Percent if max_num > 0.0 => SIZE_BAR_W + 10.0,
-            _ => 0.0,
+        let extra = if is_icon_only_bool {
+            10.0
+        } else {
+            match disp {
+                ColDisplay::FileEntry | ColDisplay::Crate | ColDisplay::Process => icon_pad + 10.0,
+                ColDisplay::Status => 14.0,
+                ColDisplay::FileSize | ColDisplay::Percent if max_num > 0.0 => SIZE_BAR_W + 10.0,
+                _ => 0.0,
+            }
         };
         col_extra_px.push(extra);
         col_max_num.push(max_num);
@@ -1383,7 +1403,7 @@ fn layout_table(
     if total_w > avail_w && total_w > 0.0 {
         let scale = avail_w / total_w;
         for w in &mut col_widths {
-            *w = (*w * scale).max(52.0);
+            *w = (*w * scale).max(40.0);
         }
     }
     let table_w = (idx_w + col_widths.iter().sum::<f32>() - col_gap * 0.4).min(width - scrollbar_reserve);
@@ -1408,16 +1428,24 @@ fn layout_table(
             Some(false) => " ↑",
             None => "",
         };
-        let max_ch = (content_w / m.cw).floor().max(2.0) as usize;
-        let hdr_base = truncate_chars(col_raw, max_ch.saturating_sub(suffix.chars().count()).max(1));
-        let hdr = format!("{hdr_base}{suffix}");
-        let tx = if col_right_align[c] {
-            cx + content_w - hdr.chars().count() as f32 * m.cw
-        } else {
-            cx
-        };
         let hdr_col = if active_sort.is_some() { theme::INK_1 } else { theme::INK_3 };
-        scene.text(tx, y0, hdr, hdr_col, active_sort.is_some(), false, clip_id);
+        if col_raw == "readonly" {
+            let ls = 11.0;
+            draw_icon(scene, Icon::Lock, cx + 2.0, y0 + (m.ch - ls) * 0.5, ls, hdr_col, clip_id);
+            if !suffix.is_empty() {
+                scene.text(cx + ls + 4.0, y0, suffix.trim(), hdr_col, true, false, clip_id);
+            }
+        } else {
+            let max_ch = (content_w / m.cw).floor().max(2.0) as usize;
+            let hdr_base = truncate_chars(col_raw, max_ch.saturating_sub(suffix.chars().count()).max(1));
+            let hdr = format!("{hdr_base}{suffix}");
+            let tx = if col_right_align[c] {
+                cx + content_w - hdr.chars().count() as f32 * m.cw
+            } else {
+                cx
+            };
+            scene.text(tx, y0, hdr, hdr_col, active_sort.is_some(), false, clip_id);
+        }
         if depth == 0 {
             let hdr_hit = HitRect::new(cx - 4.0, y0 - 2.0, cx + content_w + 4.0, y0 + m.ch + 4.0);
             scene.push_hit_clipped(
@@ -1508,7 +1536,8 @@ fn layout_table(
                             ColDisplay::FileEntry => {
                                 let raw_name = format_value_cell_at(cell, Some(now_ns));
                                 let icon_name = icon_name_for_file(&raw_name, row_file_kind);
-                                let is_dir = matches!(row_file_kind, Some("dir")) || raw_name.ends_with('/');
+                                let is_dir = row_file_kind.is_some_and(blaze_sniff::is_dir_label)
+                                    || raw_name.ends_with('/');
                                 let display_name = if is_dir && !raw_name.ends_with('/') {
                                     format!("{raw_name}/")
                                 } else {
@@ -1574,46 +1603,81 @@ fn layout_table(
                                 scene.text(rx + icon_pad, ty, txt, theme::INK_1, false, false, clip_id);
                             }
                             ColDisplay::Status => {
-                                let raw = format_value_cell_at(cell, Some(now_ns));
-                                let is_ok = matches!(cell, Value::Bool(true))
-                                    || raw.eq_ignore_ascii_case("running")
-                                    || raw.eq_ignore_ascii_case("ok")
-                                    || raw == "R"
-                                    || raw == "S";
-                                let dot_y = ty + m.ch * 0.5;
-                                if is_ok {
-                                    scene.over_circle(rx + 4.0, dot_y, 3.0, theme::OK, clip_id);
+                                let col_name = table.columns.get(c).map(|s| s.as_ref()).unwrap_or("");
+                                if let Value::Bool(flag) = cell {
+                                    // Crisp icon-only boolean rendering (zero `○ false` / `● true` noise!).
+                                    if col_name == "readonly" {
+                                        if *flag {
+                                            let ls = 11.5;
+                                            draw_icon(scene, Icon::Lock, rx + 2.0, ty + (m.ch - ls) * 0.5, ls, theme::INK_2, clip_id);
+                                            scene.push_hover_clipped(
+                                                HitRect::new(rx, cur_y, rx + 18.0, cur_y + row_h),
+                                                clip_id,
+                                                HoverKind::Tooltip {
+                                                    title: "read-only".to_owned(),
+                                                    subtitle: None,
+                                                },
+                                            );
+                                        } else {
+                                            scene.text(rx + 4.0, ty, "·", theme::rgba(0x57, 0x57, 0x5a, 0.45), false, false, clip_id);
+                                        }
+                                    } else if *flag {
+                                        scene.over_circle(rx + 6.0, ty + m.ch * 0.5, 3.0, theme::OK, clip_id);
+                                    } else {
+                                        scene.text(rx + 4.0, ty, "·", theme::rgba(0x57, 0x57, 0x5a, 0.45), false, false, clip_id);
+                                    }
                                 } else {
-                                    scene.over_ring(rx + 4.0, dot_y, 3.2, 1.1, theme::INK_4, clip_id);
+                                    let raw = format_value_cell_at(cell, Some(now_ns));
+                                    let is_ok = raw.eq_ignore_ascii_case("running")
+                                        || raw.eq_ignore_ascii_case("ok")
+                                        || raw.eq_ignore_ascii_case("staged")
+                                        || raw.eq_ignore_ascii_case("current")
+                                        || raw == "R"
+                                        || raw == "S";
+                                    let dot_y = ty + m.ch * 0.5;
+                                    if is_ok {
+                                        scene.over_circle(rx + 4.0, dot_y, 3.0, theme::OK, clip_id);
+                                    } else if raw.eq_ignore_ascii_case("conflict") || raw.eq_ignore_ascii_case("deleted") {
+                                        scene.over_circle(rx + 4.0, dot_y, 3.0, theme::DANGER, clip_id);
+                                    } else {
+                                        scene.over_ring(rx + 4.0, dot_y, 3.0, 1.1, theme::INK_3, clip_id);
+                                    }
+                                    let max_ch = ((content_w - 14.0) / m.cw).floor().max(2.0) as usize;
+                                    let txt = truncate_chars(&raw, max_ch);
+                                    let col = if is_ok { theme::INK_2 } else { theme::INK_3 };
+                                    scene.text(rx + 13.0, ty, txt, col, false, false, clip_id);
                                 }
-                                let max_ch = ((content_w - 14.0) / m.cw).floor().max(2.0) as usize;
-                                let txt = truncate_chars(&raw, max_ch);
-                                let col = if is_ok { theme::INK_2 } else { theme::INK_3 };
-                                scene.text(rx + 13.0, ty, txt, col, false, false, clip_id);
                             }
                             ColDisplay::FileSize => {
-                                let raw = format_value_cell_at(cell, Some(now_ns));
+                                let row_is_dir = row_file_kind.is_some_and(blaze_sniff::is_dir_label);
                                 let bar_on = col_max_num[c] > 0.0;
                                 let text_area_w = if bar_on {
                                     (content_w - SIZE_BAR_W - 10.0).max(m.cw * 3.0)
                                 } else {
                                     content_w
                                 };
-                                let max_ch = (text_area_w / m.cw).floor().max(2.0) as usize;
-                                let txt = truncate_chars(&raw, max_ch);
-                                let tx = rx + text_area_w - txt.chars().count() as f32 * m.cw;
-                                scene.text(tx, ty, txt, theme::INK_2, false, false, clip_id);
+                                if row_is_dir {
+                                    // Folders don't have meaningful byte sizes or bars (quiet `—`).
+                                    let tx = rx + text_area_w - m.cw;
+                                    scene.text(tx, ty, "—", theme::INK_4, false, false, clip_id);
+                                } else {
+                                    let raw = format_value_cell_at(cell, Some(now_ns));
+                                    let max_ch = (text_area_w / m.cw).floor().max(2.0) as usize;
+                                    let txt = truncate_chars(&raw, max_ch);
+                                    let tx = rx + text_area_w - txt.chars().count() as f32 * m.cw;
+                                    scene.text(tx, ty, txt, theme::INK_2, false, false, clip_id);
 
-                                if bar_on && let Value::Size(Bytes(b)) = cell {
-                                    let frac = ((*b).max(0) as f64 / col_max_num[c]).clamp(0.0, 1.0) as f32;
-                                    let bx0 = rx + text_area_w + 10.0;
-                                    let by0 = ty + m.ch * 0.5 - 2.0;
-                                    let by1 = by0 + 4.0;
-                                    scene.round_rect(bx0, by0, bx0 + SIZE_BAR_W, by1, 2.0, theme::BG_TRACK, 0.0, [0.0; 4], clip_id);
-                                    if frac > 0.01 {
-                                        let fill_w = (SIZE_BAR_W * frac).max(3.0);
-                                        let fill_col = if frac >= 0.99 { theme::INK_2 } else { theme::INK_4 };
-                                        scene.round_rect(bx0, by0, bx0 + fill_w, by1, 2.0, fill_col, 0.0, [0.0; 4], clip_id);
+                                    if bar_on && let Value::Size(Bytes(b)) = cell {
+                                        let frac = ((*b).max(0) as f64 / col_max_num[c]).clamp(0.0, 1.0) as f32;
+                                        if frac >= 0.015 {
+                                            let bx0 = rx + text_area_w + 10.0;
+                                            let by0 = ty + m.ch * 0.5 - 2.0;
+                                            let by1 = by0 + 4.0;
+                                            scene.round_rect(bx0, by0, bx0 + SIZE_BAR_W, by1, 2.0, theme::BG_TRACK, 0.0, [0.0; 4], clip_id);
+                                            let fill_w = (SIZE_BAR_W * frac).max(3.0);
+                                            let fill_col = if frac >= 0.99 { theme::INK_2 } else { theme::INK_4 };
+                                            scene.round_rect(bx0, by0, bx0 + fill_w, by1, 2.0, fill_col, 0.0, [0.0; 4], clip_id);
+                                        }
                                     }
                                 }
                             }

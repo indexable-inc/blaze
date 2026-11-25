@@ -83,6 +83,7 @@ impl FakeHost {
                         out.push(DirEntry {
                             name: AString::from_str_in(name, a),
                             kind: *kind,
+                            analysis: None,
                             size: Bytes(*size),
                             modified: self.now,
                             readonly: false,
@@ -99,6 +100,7 @@ impl FakeHost {
                     Answer::Stat(DirEntry {
                         name: AString::from_str_in(p, a),
                         kind: FileKind::File,
+                        analysis: None,
                         size: Bytes(bytes.len() as i64),
                         modified: self.now,
                         readonly: false,
@@ -107,6 +109,7 @@ impl FakeHost {
                     Answer::Stat(DirEntry {
                         name: AString::from_str_in(p, a),
                         kind: FileKind::Dir,
+                        analysis: None,
                         size: Bytes(0),
                         modified: self.now,
                         readonly: false,
