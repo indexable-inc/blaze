@@ -2397,6 +2397,7 @@ version = "0.0.0"
 dependencies = [
  "blaze-own",
  "blaze-sim",
+ "blaze-unicode",
 ]
 
 [[package]]

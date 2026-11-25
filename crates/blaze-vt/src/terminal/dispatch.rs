@@ -1,0 +1,656 @@
+//! The parser's events to the terminal's operations (stream.zig `execute` 1057, `csiDispatch`
+//! 1089, `escDispatch` 2423; stream_terminal.zig for what each does and replies).
+
+use blaze_own::planted::Planted;
+
+use super::ops::{EraseDisplay, EraseLine};
+use super::{DcsHead, Effect, Mode, StatusDisplay, Terminal};
+use crate::parser::{Csi, Dcs, Esc, Sink, Terminator};
+use crate::plant::VtPlant;
+use crate::screen::{Charset, CursorShape, KittySet, ProtectedMode, Slot};
+use crate::style::{Color, Style};
+
+/// "def1": no parameter is 1, one is itself, more is invalid (stream.zig).
+fn def1(csi: &Csi<'_>) -> Option<usize> {
+    match csi.params {
+        [] => Some(1),
+        [p] => Some(usize::from(*p)),
+        _ => None,
+    }
+}
+
+impl<P: Planted<VtPlant>> Sink for Terminal<'_, P> {
+    fn print(&mut self, c: char) {
+        Terminal::print(self, u32::from(c));
+    }
+
+    fn execute(&mut self, c0: u8) {
+        match c0 {
+            0x00..=0x02 => {}
+            0x05 => {
+                let e = self.opts.enquiry;
+                if !e.is_empty() && e.len() < 256 {
+                    self.reply_bytes(&[e]);
+                }
+            }
+            0x07 => self.effect(Effect::Bell),
+            0x08 => self.cursor_left(1),
+            0x09 => self.tabs(1, false),
+            0x0A..=0x0C => self.linefeed(),
+            0x0D => self.carriage_return(),
+            0x0E => self.invoke_charset(false, Slot::G1, false),
+            0x0F => self.invoke_charset(false, Slot::G0, false),
+            _ => self.unsupported(),
+        }
+    }
+
+    fn esc(&mut self, esc: &Esc<'_>) {
+        let none = esc.intermediates.is_empty();
+        match esc.final_byte {
+            b'B' | b'A' | b'0' => {
+                let set = match esc.final_byte {
+                    b'B' => Charset::Ascii,
+                    b'A' => Charset::British,
+                    _ => Charset::DecSpecial,
+                };
+                let slot = match esc.intermediates {
+                    [b'('] => Slot::G0,
+                    [b')'] => Slot::G1,
+                    [b'*'] => Slot::G2,
+                    [b'+'] => Slot::G3,
+                    _ => return self.unsupported(),
+                };
+                self.scr().charset.sets[slot as usize] = set;
+            }
+            b'7' if none => self.save_cursor(),
+            b'8' if none => self.restore_cursor(),
+            b'8' if esc.intermediates == b"#" => self.decaln(),
+            b'D' if none => self.index(),
+            b'E' if none => {
+                self.index();
+                self.carriage_return();
+            }
+            b'H' if none => self.tab_set(),
+            b'M' if none => self.reverse_index(),
+            b'N' if none => self.invoke_charset(false, Slot::G2, true),
+            b'O' if none => self.invoke_charset(false, Slot::G3, true),
+            b'V' if none => self.set_protected_mode(ProtectedMode::Iso),
+            b'W' if none => self.set_protected_mode(ProtectedMode::Off),
+            b'Z' if none => self.device_attributes(0),
+            b'c' if none => self.full_reset(),
+            b'n' if none => self.invoke_charset(false, Slot::G2, false),
+            b'o' if none => self.invoke_charset(false, Slot::G3, false),
+            b'~' if none => self.invoke_charset(true, Slot::G1, false),
+            b'}' if none => self.invoke_charset(true, Slot::G2, false),
+            b'|' if none => self.invoke_charset(true, Slot::G3, false),
+            b'=' if none => self.set_mode(Mode::KeypadKeys, true),
+            b'>' if none => self.set_mode(Mode::KeypadKeys, false),
+            b'\\' => {}
+            _ => self.unsupported(),
+        }
+    }
+
+    fn csi(&mut self, csi: &Csi<'_>) {
+        self.csi_dispatch(csi);
+    }
+
+    fn osc_start(&mut self) {
+        self.osc.start();
+    }
+
+    fn osc_put(&mut self, b: u8) {
+        self.osc.put(&[b]);
+    }
+
+    fn osc_end(&mut self, end: Terminator) {
+        if self.osc.overflow {
+            self.stats.strings_truncated += 1;
+            return;
+        }
+        let buf = core::mem::replace(&mut self.osc.bytes, blaze_own::Vec::new_in(self.alloc));
+        self.osc(&buf, end);
+        self.osc.bytes = buf;
+        self.osc.bytes.clear();
+    }
+
+    fn dcs_hook(&mut self, dcs: &Dcs<'_>) {
+        let mut head = DcsHead {
+            intermediates: [0; crate::parser::MAX_INTERMEDIATES],
+            n_intermediates: dcs.intermediates.len() as u8,
+            params: [0; crate::parser::MAX_PARAMS],
+            n_params: dcs.params.len() as u8,
+            final_byte: dcs.final_byte,
+        };
+        head.intermediates[..dcs.intermediates.len()].copy_from_slice(dcs.intermediates);
+        head.params[..dcs.params.len()].copy_from_slice(dcs.params);
+        self.dcs_head = Some(head);
+        self.dcs.start();
+    }
+
+    fn dcs_put(&mut self, b: u8) {
+        self.dcs.put(&[b]);
+    }
+
+    fn dcs_unhook(&mut self) {
+        let Some(head) = self.dcs_head.take() else { return };
+        if self.dcs.overflow {
+            self.stats.strings_truncated += 1;
+            return;
+        }
+        let buf = core::mem::replace(&mut self.dcs.bytes, blaze_own::Vec::new_in(self.alloc));
+        self.dcs(&head, &buf);
+        self.dcs.bytes = buf;
+        self.dcs.bytes.clear();
+    }
+
+    fn apc_start(&mut self) {
+        self.apc.start();
+    }
+
+    fn apc_put(&mut self, bytes: &[u8]) {
+        self.apc.put(bytes);
+    }
+
+    fn apc_end(&mut self) {
+        if self.apc.overflow {
+            self.stats.strings_truncated += 1;
+            return;
+        }
+        let buf = core::mem::replace(&mut self.apc.bytes, blaze_own::Vec::new_in(self.alloc));
+        self.apc(&buf);
+        self.apc.bytes = buf;
+        self.apc.bytes.clear();
+    }
+}
+
+impl<P: Planted<VtPlant>> Terminal<'_, P> {
+    // sgr lane replaces
+    /// SGR, the attributes this lane needs to test with: 0, 1, 7, 22, 27, 30–37, 39, 40–47,
+    /// 49. The SGR lane's parser takes its place.
+    fn sgr(&mut self, csi: &Csi<'_>) {
+        let mut st = self.scr().cursor.style;
+        let params: &[u16] = if csi.params.is_empty() { &[0] } else { csi.params };
+        for &p in params {
+            match p {
+                0 => st = Style::default(),
+                1 => st.flags.bold = true,
+                7 => st.flags.inverse = true,
+                22 => {
+                    st.flags.bold = false;
+                    st.flags.faint = false;
+                }
+                27 => st.flags.inverse = false,
+                30..=37 => st.fg = Color::Palette((p - 30) as u8),
+                39 => st.fg = Color::None,
+                40..=47 => st.bg = Color::Palette((p - 40) as u8),
+                49 => st.bg = Color::None,
+                _ => self.stats.unsupported += 1,
+            }
+        }
+        self.scr().set_cursor_style(st);
+    }
+
+    // osc lane replaces
+    /// An OSC's bytes. Records nothing yet: the OSC lane's parser takes its place.
+    fn osc(&mut self, _data: &[u8], _end: Terminator) {}
+
+    // dcs lane replaces
+    /// A DCS's hook and bytes. Records nothing yet: the DCS lane takes its place.
+    fn dcs(&mut self, _head: &DcsHead, _data: &[u8]) {}
+
+    // apc lane replaces
+    /// An APC's bytes. Records nothing yet: the kitty graphics lane takes its place.
+    fn apc(&mut self, _data: &[u8]) {}
+
+    /// DA1 (0), DA2 (1), DA3 (2).
+    fn device_attributes(&mut self, which: u8) {
+        let d = self.opts.device;
+        match which {
+            0 => {
+                let mut buf = [0u8; 128];
+                let mut w = Fixed { buf: &mut buf, n: 0 };
+                let _ = core::fmt::Write::write_str(&mut w, "\x1b[?");
+                for (i, v) in d.primary.iter().enumerate() {
+                    let sep = if i > 0 { ";" } else { "" };
+                    let _ = core::fmt::write(&mut w, format_args!("{sep}{v}"));
+                }
+                let _ = core::fmt::Write::write_str(&mut w, "c");
+                let n = w.n;
+                self.reply_bytes(&[&buf[..n]]);
+            }
+            1 => {
+                let [a, b, c] = d.secondary;
+                self.reply(format_args!("\x1b[>{a};{b};{c}c"));
+            }
+            _ => {
+                if let Some(id) = d.tertiary {
+                    self.reply_bytes(&[b"\x1bP!|", id, b"\x1b\\"]);
+                }
+            }
+        }
+    }
+
+    fn csi_dispatch(&mut self, csi: &Csi<'_>) {
+        let none = csi.intermediates.is_empty();
+        let inter = csi.intermediates;
+        let params = csi.params;
+        match csi.final_byte {
+            b'A' | b'k' if none => match def1(csi) {
+                Some(n) => self.cursor_up(n),
+                None => self.unsupported(),
+            },
+            b'B' if none => match def1(csi) {
+                Some(n) => self.cursor_down(n),
+                None => self.unsupported(),
+            },
+            b'C' if none => match def1(csi) {
+                Some(n) => self.cursor_right(n),
+                None => self.unsupported(),
+            },
+            b'D' | b'j' if none => match def1(csi) {
+                Some(n) => self.cursor_left(n),
+                None => self.unsupported(),
+            },
+            b'E' if none => match def1(csi) {
+                Some(n) => {
+                    self.cursor_down(n);
+                    self.carriage_return();
+                }
+                None => self.unsupported(),
+            },
+            b'F' if none => match def1(csi) {
+                Some(n) => {
+                    self.cursor_up(n);
+                    self.carriage_return();
+                }
+                None => self.unsupported(),
+            },
+            b'G' | b'`' if none => match def1(csi) {
+                Some(n) => {
+                    let (row, _) = self.cursor_pos_relative();
+                    self.set_cursor_pos(row, n);
+                }
+                None => self.unsupported(),
+            },
+            b'H' | b'f' if none => match params {
+                [] => self.set_cursor_pos(1, 1),
+                [r] => self.set_cursor_pos(usize::from(*r), 1),
+                [r, c] => self.set_cursor_pos(usize::from(*r), usize::from(*c)),
+                _ => self.unsupported(),
+            },
+            b'I' if none => match def1(csi) {
+                Some(n) => self.tabs(n, false),
+                None => self.unsupported(),
+            },
+            b'J' => {
+                let protected = match inter {
+                    [] => false,
+                    [b'?'] => true,
+                    _ => return self.unsupported(),
+                };
+                let mode = match params {
+                    [] | [0] => EraseDisplay::Below,
+                    [1] => EraseDisplay::Above,
+                    [2] => EraseDisplay::Complete,
+                    [3] => EraseDisplay::Scrollback,
+                    [22] => EraseDisplay::ScrollComplete,
+                    _ => return self.unsupported(),
+                };
+                self.erase_display(mode, protected);
+            }
+            b'K' => {
+                let protected = match inter {
+                    [] => false,
+                    [b'?'] => true,
+                    _ => return self.unsupported(),
+                };
+                let mode = match params {
+                    [] | [0] => EraseLine::Right,
+                    [1] => EraseLine::Left,
+                    [2] => EraseLine::Complete,
+                    _ => return self.unsupported(),
+                };
+                self.erase_line(mode, protected);
+            }
+            b'L' if none => match def1(csi) {
+                Some(n) => self.insert_lines(n),
+                None => self.unsupported(),
+            },
+            b'M' if none => match def1(csi) {
+                Some(n) => self.delete_lines(n),
+                None => self.unsupported(),
+            },
+            b'P' if none => match def1(csi) {
+                Some(n) => self.delete_chars(n),
+                None => self.unsupported(),
+            },
+            b'S' if none => match def1(csi) {
+                Some(n) => self.scroll_up(n),
+                None => self.unsupported(),
+            },
+            b'T' if none => match def1(csi) {
+                Some(n) => self.scroll_down(n),
+                None => self.unsupported(),
+            },
+            b'W' => match (inter, params) {
+                ([], [] | [0]) => self.tab_set(),
+                ([], [2]) => self.tab_clear_current(),
+                ([], [5]) => self.tab_clear_all(),
+                ([b'?'], [5]) => self.tab_reset(),
+                _ => self.unsupported(),
+            },
+            b'X' if none => match def1(csi) {
+                Some(n) => self.erase_chars(n),
+                None => self.unsupported(),
+            },
+            b'Z' if none => match def1(csi) {
+                Some(n) => self.tabs(n, true),
+                None => self.unsupported(),
+            },
+            b'a' if none => match def1(csi) {
+                Some(n) => {
+                    let (row, col) = self.cursor_pos_relative();
+                    self.set_cursor_pos(row, col.saturating_add(n));
+                }
+                None => self.unsupported(),
+            },
+            b'b' if none => match def1(csi) {
+                Some(n) => self.print_repeat(n),
+                None => self.unsupported(),
+            },
+            b'c' => match inter {
+                [] => self.device_attributes(0),
+                [b'>'] => self.device_attributes(1),
+                [b'='] => self.device_attributes(2),
+                _ => self.unsupported(),
+            },
+            b'd' if none => match def1(csi) {
+                Some(n) => {
+                    let (_, col) = self.cursor_pos_relative();
+                    self.set_cursor_pos(n, col);
+                }
+                None => self.unsupported(),
+            },
+            b'e' if none => match def1(csi) {
+                Some(n) => {
+                    let (row, col) = self.cursor_pos_relative();
+                    self.set_cursor_pos(row.saturating_add(n), col);
+                }
+                None => self.unsupported(),
+            },
+            b'g' if none => match params {
+                [0] => self.tab_clear_current(),
+                [3] => self.tab_clear_all(),
+                _ => self.unsupported(),
+            },
+            b'h' | b'l' => {
+                let on = csi.final_byte == b'h';
+                let ansi = match inter {
+                    [] => true,
+                    [b'?'] => false,
+                    _ => return self.unsupported(),
+                };
+                for &p in params {
+                    match Mode::from_int(p, ansi) {
+                        Some(m) => self.set_mode(m, on),
+                        None => self.unsupported(),
+                    }
+                }
+            }
+            b'm' => match inter {
+                [] => self.sgr(csi),
+                [b'>'] => self.xtmodkeys(params),
+                _ => self.unsupported(),
+            },
+            b'n' => self.device_status(inter, params),
+            b'p' => match (inter, params) {
+                ([b'?', b'$'], [n]) => self.request_mode(*n),
+                _ => self.unsupported(),
+            },
+            b'q' => match inter {
+                [b' '] => self.decscusr(params),
+                [b'"'] => match params {
+                    [] | [0] | [2] => self.set_protected_mode(ProtectedMode::Off),
+                    [1] => self.set_protected_mode(ProtectedMode::Dec),
+                    _ => self.unsupported(),
+                },
+                [b'>'] => {
+                    let v = self.opts.xtversion;
+                    let v: &[u8] = if v.is_empty() { b"libghostty" } else { v };
+                    if v.len() <= 256 {
+                        self.reply_bytes(&[b"\x1bP>|", v, b"\x1b\\"]);
+                    }
+                }
+                _ => self.unsupported(),
+            },
+            b'r' => match (inter, params) {
+                ([], []) => self.set_top_bottom_margin(0, 0),
+                ([], [t]) => self.set_top_bottom_margin(usize::from(*t), 0),
+                ([], [t, b]) => self.set_top_bottom_margin(usize::from(*t), usize::from(*b)),
+                ([b'?'], _) => {
+                    for &p in params {
+                        match Mode::from_int(p, false) {
+                            Some(m) => {
+                                let v = self.modes.restore(m);
+                                self.set_mode(m, v);
+                            }
+                            None => self.unsupported(),
+                        }
+                    }
+                }
+                _ => self.unsupported(),
+            },
+            b's' => match (inter, params) {
+                ([], []) => {
+                    if self.modes.get(Mode::EnableLeftRightMargin) {
+                        self.set_left_right_margin(0, 0);
+                    } else {
+                        self.save_cursor();
+                    }
+                }
+                ([], [l]) => self.set_left_right_margin(usize::from(*l), 0),
+                ([], [l, r]) => self.set_left_right_margin(usize::from(*l), usize::from(*r)),
+                ([b'?'], _) => {
+                    for &p in params {
+                        match Mode::from_int(p, false) {
+                            Some(m) => self.modes.save(m),
+                            None => self.unsupported(),
+                        }
+                    }
+                }
+                ([b'>'], [] | [0]) => self.flags.mouse_shift_capture = Some(false),
+                ([b'>'], [1]) => self.flags.mouse_shift_capture = Some(true),
+                _ => self.unsupported(),
+            },
+            b't' if none => self.xtwinops(params),
+            b'u' => match inter {
+                [] => self.restore_cursor(),
+                [b'?'] => {
+                    let f = self.scr().kitty.current();
+                    self.reply(format_args!("\x1b[?{f}u"));
+                }
+                [b'>'] => match params {
+                    [f] if *f > 31 => self.unsupported(),
+                    [f] => self.scr().kitty.push(*f as u8),
+                    _ => self.scr().kitty.push(0),
+                },
+                [b'<'] => {
+                    let n = if let [n] = params { usize::from(*n) } else { 1 };
+                    self.scr().kitty.pop(n);
+                }
+                [b'='] => {
+                    let flags = params.first().copied().unwrap_or(0);
+                    if flags > 31 {
+                        return self.unsupported();
+                    }
+                    let how = match params.get(1).copied().unwrap_or(1) {
+                        1 => KittySet::Set,
+                        2 => KittySet::Or,
+                        3 => KittySet::Not,
+                        _ => return self.unsupported(),
+                    };
+                    self.scr().kitty.set(how, flags as u8);
+                }
+                _ => self.unsupported(),
+            },
+            b'@' if none => match params {
+                [] => self.insert_blanks(1),
+                [p] => self.insert_blanks(usize::from(*p).max(1)),
+                _ => self.unsupported(),
+            },
+            b'}' => match (inter, params) {
+                ([b'$'], [0]) => self.status_display = StatusDisplay::Main,
+                ([b'$'], [1]) => self.status_display = StatusDisplay::StatusLine,
+                _ => self.unsupported(),
+            },
+            _ => self.unsupported(),
+        }
+    }
+
+    /// XTMODKEYS `CSI > Pp ; Pv m` (S:1738): only `4;2` turns modifyOtherKeys 2 on.
+    fn xtmodkeys(&mut self, params: &[u16]) {
+        if params.len() > 2 {
+            return self.unsupported();
+        }
+        let numeric = match params {
+            [] => false,
+            [p, rest @ ..] => match p {
+                0..=2 => false,
+                4 => rest == [2],
+                _ => return self.unsupported(),
+            },
+        };
+        self.flags.modify_other_keys_2 = numeric;
+    }
+
+    /// DSR (S:1804).
+    fn device_status(&mut self, inter: &[u8], params: &[u16]) {
+        match inter {
+            [] | [b'?', ..] => {
+                let question = match inter {
+                    [] => false,
+                    [b'?'] => true,
+                    _ => return self.unsupported(),
+                };
+                match (params, question) {
+                    ([5], false) => self.reply_bytes(&[b"\x1b[0n"]),
+                    ([6], false) => {
+                        let (row, col) = self.cursor_pos_relative();
+                        self.reply(format_args!("\x1b[{row};{col}R"));
+                    }
+                    ([996], true) => self.report_color_scheme(),
+                    _ => self.unsupported(),
+                }
+            }
+            [b'>'] => self.flags.modify_other_keys_2 = false,
+            _ => self.unsupported(),
+        }
+    }
+
+    /// DECRQM `CSI ? n $ p`: `CSI ? n ; 1|2|0 $ y` (modes.zig `getReport`).
+    fn request_mode(&mut self, n: u16) {
+        let v = match Mode::from_int(n, false) {
+            Some(m) => {
+                if self.modes.get(m) {
+                    1
+                } else {
+                    2
+                }
+            }
+            None => 0,
+        };
+        self.reply(format_args!("\x1b[?{n};{v}$y"));
+    }
+
+    /// DECSCUSR (S:1903; stream_terminal.zig `cursor_style`).
+    fn decscusr(&mut self, params: &[u16]) {
+        let (shape, blink) = match params {
+            [] | [0] => (CursorShape::Block, false),
+            [1] => (CursorShape::Block, true),
+            [2] => (CursorShape::Block, false),
+            [3] => (CursorShape::Underline, true),
+            [4] => (CursorShape::Underline, false),
+            [5] => (CursorShape::Bar, true),
+            [6] => (CursorShape::Bar, false),
+            _ => return self.unsupported(),
+        };
+        self.modes.set(Mode::CursorBlinking, blink);
+        self.scr().cursor.shape = shape;
+    }
+
+    /// XTWINOPS: the reports 14, 16, 18, 21 and the title stack 22/23 (S:2070).
+    fn xtwinops(&mut self, params: &[u16]) {
+        match params {
+            [14] => {
+                if let Some(px) = self.opts.cell_px {
+                    let h = self.rows as u64 * u64::from(px.height);
+                    let w = self.cols as u64 * u64::from(px.width);
+                    self.reply(format_args!("\x1b[4;{h};{w}t"));
+                }
+            }
+            [16] => {
+                if let Some(px) = self.opts.cell_px {
+                    let (h, w) = (px.height, px.width);
+                    self.reply(format_args!("\x1b[6;{h};{w}t"));
+                }
+            }
+            [18] => {
+                let (r, c) = (self.rows, self.cols);
+                self.reply(format_args!("\x1b[8;{r};{c}t"));
+            }
+            [21] => {
+                let title = core::mem::replace(&mut self.title, blaze_own::Vec::new_in(self.alloc));
+                self.reply_bytes(&[b"\x1b]l", &title, b"\x1b\\"]);
+                self.title = title;
+            }
+            [22, 0 | 2] | [22, 0 | 2, _] => self.title_push(),
+            [23, 0 | 2] | [23, 0 | 2, _] => self.title_pop(),
+            _ => self.unsupported(),
+        }
+    }
+
+    /// CSI 22 t: the title onto the stack, the oldest dropped past the cap.
+    fn title_push(&mut self) {
+        if self.opts.caps.title_stack == 0 {
+            self.stats.titles_evicted += 1;
+            return;
+        }
+        if self.title_stack.len() >= self.opts.caps.title_stack {
+            self.title_stack.remove_shift(0);
+            self.stats.titles_evicted += 1;
+        }
+        let mut t = blaze_own::Vec::new_in(self.alloc);
+        if t.try_reserve(self.title.len()).is_err() || self.title_stack.try_reserve(1).is_err() {
+            self.stats.titles_evicted += 1;
+            return;
+        }
+        t.extend_from_slice(&self.title);
+        self.title_stack.push(t);
+    }
+
+    /// CSI 23 t: the title from the stack, if any.
+    fn title_pop(&mut self) {
+        if let Some(t) = self.title_stack.pop() {
+            self.title = t;
+            self.effect(Effect::TitleChanged);
+        }
+    }
+}
+
+/// A fixed buffer to format into.
+struct Fixed<'b> {
+    buf: &'b mut [u8],
+    n: usize,
+}
+
+impl core::fmt::Write for Fixed<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let end = self.n + s.len();
+        if end > self.buf.len() {
+            return Err(core::fmt::Error);
+        }
+        self.buf[self.n..end].copy_from_slice(s.as_bytes());
+        self.n = end;
+        Ok(())
+    }
+}

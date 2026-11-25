@@ -16,6 +16,8 @@ doctest = false
 [dependencies]
 # Vec, Box, String with the allocator named (rule 11).
 blaze-own.workspace = true
+# Display width and grapheme clusters of what is printed.
+blaze-unicode.workspace = true
 
 [dev-dependencies]
 # Property tests against the reference model, and planted-bug controls.
