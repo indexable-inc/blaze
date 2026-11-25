@@ -69,7 +69,7 @@ mod macos_app {
     use objc2::rc::autoreleasepool;
     use objc2::{MainThreadMarker, MainThreadOnly};
     use objc2_app_kit::{
-        NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSEventMask,
+        NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSCursor, NSEventMask,
         NSEventModifierFlags, NSEventType, NSPasteboard, NSPasteboardTypeString, NSWindow,
         NSWindowStyleMask, NSWindowTitleVisibility,
     };
@@ -135,6 +135,61 @@ mod macos_app {
         active: bool,
         over_composer: bool,
         payload: DragPayload,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum CursorKind {
+        Arrow,
+        Pointer,
+        IBeam,
+        OpenHand,
+        ClosedHand,
+    }
+
+    fn apply_cursor(cur: &mut CursorKind, next: CursorKind) {
+        if *cur == next {
+            return;
+        }
+        *cur = next;
+        let cursor = match next {
+            CursorKind::Arrow => NSCursor::arrowCursor(),
+            CursorKind::Pointer => NSCursor::pointingHandCursor(),
+            CursorKind::IBeam => NSCursor::IBeamCursor(),
+            CursorKind::OpenHand => NSCursor::openHandCursor(),
+            CursorKind::ClosedHand => NSCursor::closedHandCursor(),
+        };
+        cursor.set();
+    }
+
+    fn cursor_for_point(
+        scene: &Scene,
+        alt_screen: bool,
+        dragging: bool,
+        selecting_composer: bool,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+    ) -> CursorKind {
+        if x < 0.0 || y < 0.0 || x > w || y > h {
+            return CursorKind::Arrow;
+        }
+        if dragging {
+            return CursorKind::ClosedHand;
+        }
+        if alt_screen || selecting_composer {
+            return CursorKind::IBeam;
+        }
+        if scene.hit_test(x, y).is_some() {
+            return CursorKind::Pointer;
+        }
+        if scene.composer_rect.contains(x, y) {
+            return CursorKind::IBeam;
+        }
+        if scene.drag_source_at(x, y).is_some() {
+            return CursorKind::OpenHand;
+        }
+        CursorKind::Arrow
     }
 
     struct ActivePty {
@@ -481,6 +536,7 @@ mod macos_app {
         window.setTitleVisibility(NSWindowTitleVisibility::Hidden);
         window.setTitlebarAppearsTransparent(true);
         window.setMovableByWindowBackground(false);
+        window.setAcceptsMouseMovedEvents(true);
         let bg_color = objc2_app_kit::NSColor::colorWithSRGBRed_green_blue_alpha(
             0x10 as f64 / 255.0,
             0x10 as f64 / 255.0,
@@ -614,6 +670,8 @@ mod macos_app {
         let mut selecting_composer = false;
         let mut popup_engaged = false;
         let mut zoom_changed = false;
+        let mut cur_cursor = CursorKind::Arrow;
+        let mut last_mouse: Option<(f32, f32)> = None;
 
         loop {
             let mut quit = false;
@@ -1141,10 +1199,34 @@ mod macos_app {
                                 }
                             }
                         }
+                        NSEventType::MouseMoved if window.isKeyWindow() => {
+                            let pt = ev.locationInWindow();
+                            let x = pt.x as f32;
+                            let y = (size.height - pt.y) as f32;
+                            last_mouse = Some((x, y));
+                            let in_traffic_lights = y >= 0.0 && y < TOP_BAR_H && x >= 0.0 && x < 76.0;
+                            let in_window = x >= 0.0 && y >= 0.0 && x <= size.width as f32 && y <= size.height as f32;
+                            if in_window && !in_traffic_lights {
+                                let next = cursor_for_point(
+                                    &shell.last_scene,
+                                    shell.store.is_alternate_screen(),
+                                    pending_drag.as_ref().is_some_and(|d| d.active),
+                                    selecting_composer,
+                                    x,
+                                    y,
+                                    size.width as f32,
+                                    size.height as f32,
+                                );
+                                apply_cursor(&mut cur_cursor, next);
+                                continue;
+                            }
+                            apply_cursor(&mut cur_cursor, CursorKind::Arrow);
+                        }
                         NSEventType::LeftMouseDragged if window.isKeyWindow() => {
                             let pt = ev.locationInWindow();
                             let x = pt.x as f32;
                             let y = (size.height - pt.y) as f32;
+                            last_mouse = Some((x, y));
                             if let Some(d) = &mut pending_drag {
                                 d.x = x;
                                 d.y = y;
@@ -1153,6 +1235,7 @@ mod macos_app {
                                 }
                                 if d.active {
                                     d.over_composer = shell.last_scene.composer_rect.contains(x, y);
+                                    apply_cursor(&mut cur_cursor, CursorKind::ClosedHand);
                                     dirty = true;
                                 }
                                 continue;
@@ -1164,15 +1247,17 @@ mod macos_app {
                                 let line = ((y - oy).max(0.0) / line_step).floor() as usize;
                                 let col = (((x - ox).max(0.0) + m.cw * 0.45) / m.cw).floor() as usize;
                                 shell.editor.set_cursor_at_line_col(line, col, true);
+                                apply_cursor(&mut cur_cursor, CursorKind::IBeam);
                                 dirty = true;
                                 continue;
                             }
                         }
                         NSEventType::LeftMouseUp => {
+                            let pt = ev.locationInWindow();
+                            let x = pt.x as f32;
+                            let y = (size.height - pt.y) as f32;
+                            last_mouse = Some((x, y));
                             if let Some(d) = pending_drag.take() {
-                                let pt = ev.locationInWindow();
-                                let x = pt.x as f32;
-                                let y = (size.height - pt.y) as f32;
                                 if d.active && shell.last_scene.composer_rect.contains(x, y) {
                                     shell.editor.insert_dropped_token(&d.payload.insert_text);
                                     popup_engaged = false;
@@ -1180,11 +1265,33 @@ mod macos_app {
                                     blink_on = true;
                                     last_blink = Instant::now();
                                 }
+                                let next = cursor_for_point(
+                                    &shell.last_scene,
+                                    shell.store.is_alternate_screen(),
+                                    false,
+                                    false,
+                                    x,
+                                    y,
+                                    size.width as f32,
+                                    size.height as f32,
+                                );
+                                apply_cursor(&mut cur_cursor, next);
                                 dirty = true;
                                 continue;
                             }
                             if selecting_composer {
                                 selecting_composer = false;
+                                let next = cursor_for_point(
+                                    &shell.last_scene,
+                                    shell.store.is_alternate_screen(),
+                                    false,
+                                    false,
+                                    x,
+                                    y,
+                                    size.width as f32,
+                                    size.height as f32,
+                                );
+                                apply_cursor(&mut cur_cursor, next);
                                 continue;
                             }
                         }
@@ -1418,6 +1525,21 @@ mod macos_app {
                 scene.overlay_icons.clear();
                 scene.overlay_text.clear();
                 shell.last_scene = scene;
+                if let Some((mx, my)) = last_mouse
+                    && window.isKeyWindow()
+                {
+                    let next = cursor_for_point(
+                        &shell.last_scene,
+                        shell.store.is_alternate_screen(),
+                        pending_drag.as_ref().is_some_and(|d| d.active),
+                        selecting_composer,
+                        mx,
+                        my,
+                        size.width as f32,
+                        size.height as f32,
+                    );
+                    apply_cursor(&mut cur_cursor, next);
+                }
                 dirty = false;
             }
         }
