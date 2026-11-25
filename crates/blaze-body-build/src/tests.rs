@@ -1115,3 +1115,254 @@ bb1:
         b2.refs
     );
 }
+
+#[test]
+fn synthetic_drop_glue_and_shims_build_and_verify() {
+    use blaze_typeck::{Adt, AdtKind, CtorKind, Field, FnPtrHeader, FnSig, List, Name, Variant};
+    use crate::{build_closure_shim, build_ctor_fn, build_drop_glue, build_fn_shim, build_reify_shim, build_vtable_shim};
+
+    fn mk_sig<'w>(types: blaze_typeck::PTys<'w>, inputs: &'w [PTy], output: PTy) -> FnSig<'w> {
+        FnSig {
+            parent_count: 0,
+            own_count: 0,
+            declared_count: 0,
+            self_param: false,
+            header: FnPtrHeader::RUST,
+            c_variadic: false,
+            legacy_const_generics: &[],
+            inputs,
+            output,
+            types,
+        }
+    }
+
+    const DROP_IN_PLACE: ItemKey = ItemKey(0x7001);
+    const DROP_IMPL_FN: ItemKey = ItemKey(0x7002);
+    const PANIC_CANT_UNWIND: ItemKey = ItemKey(0x7003);
+    const FN_CALL: ItemKey = ItemKey(0x7004);
+    const FN_MUT_CALL: ItemKey = ItemKey(0x7005);
+    const FN_ONCE_CALL: ItemKey = ItemKey(0x7006);
+    const ADT_DROP: ItemKey = ItemKey(0x7010);
+    const ADT_WRAP: ItemKey = ItemKey(0x7011);
+    const ADT_ENUM: ItemKey = ItemKey(0x7012);
+    const ADT_PAIR: ItemKey = ItemKey(0x7013);
+    const CLOSURE_OWNER: ItemKey = ItemKey(0x7020);
+    const TARGET_FN: ItemKey = ItemKey(0x7021);
+    const TRACKED_FN: ItemKey = ItemKey(0x7022);
+    const LOC_ADT: ItemKey = ItemKey(0x7023);
+    const VTABLE_METHOD: ItemKey = ItemKey(0x7024);
+
+    struct ShimWorld {
+        adt_tys: PortableTys<'static>,
+        drop_fields: [Field; 1],
+        drop_variants: [Variant; 1],
+        wrap_fields: [Field; 2],
+        wrap_variants: [Variant; 1],
+        enum_fields: [Field; 1],
+        enum_variants: [Variant; 2],
+        pair_fields: [Field; 2],
+        pair_variants: [Variant; 1],
+        loc_fields: [Field; 3],
+        loc_variants: [Variant; 1],
+        closure_sig: PTy,
+        closure_env: PTy,
+        panic: Panic,
+    }
+
+    impl LayoutFacts for ShimWorld {
+        fn adt(&self, key: ItemKey) -> Option<Adt<'_>> {
+            let types = self.adt_tys.view();
+            match key {
+                ADT_DROP => Some(Adt { kind: AdtKind::Struct, generics: 0, variants: &self.drop_variants, fields: &self.drop_fields, types }),
+                ADT_WRAP => Some(Adt { kind: AdtKind::Struct, generics: 0, variants: &self.wrap_variants, fields: &self.wrap_fields, types }),
+                ADT_ENUM => Some(Adt { kind: AdtKind::Enum, generics: 0, variants: &self.enum_variants, fields: &self.enum_fields, types }),
+                ADT_PAIR => Some(Adt { kind: AdtKind::Struct, generics: 0, variants: &self.pair_variants, fields: &self.pair_fields, types }),
+                LOC_ADT => Some(Adt { kind: AdtKind::Struct, generics: 0, variants: &self.loc_variants, fields: &self.loc_fields, types }),
+                _ => None,
+            }
+        }
+        fn repr(&self, _: ItemKey) -> Result<ReprAttrs, Missing> { Ok(ReprAttrs::RUST) }
+        fn discriminant(&self, _: ItemKey, _: u32) -> Result<Option<i128>, Missing> { Ok(None) }
+        fn valid_range(&self, _: ItemKey) -> Result<ValidRange, Missing> { Ok(ValidRange::default()) }
+        fn closure(&self, owner: ItemKey, ordinal: u32) -> Option<blaze_build::layout::ClosureFacts<'_>> {
+            (owner == CLOSURE_OWNER && ordinal == 0).then(|| blaze_build::layout::ClosureFacts {
+                types: self.adt_tys.view(),
+                sig: self.closure_sig,
+                env: self.closure_env,
+                kind: blaze_build::FnTrait::Fn,
+            })
+        }
+    }
+
+    impl Adts for ShimWorld {
+        fn adt(&self, key: ItemKey) -> Option<Adt<'_>> { LayoutFacts::adt(self, key) }
+        fn facts(&self) -> &dyn LayoutFacts { self }
+        fn overflow_checks(&self) -> blaze_build::OverflowChecks { blaze_build::OverflowChecks::Off }
+        fn ub_checks(&self) -> blaze_build::UbChecks { blaze_build::UbChecks::Off }
+        fn panic(&self) -> Panic { self.panic }
+        fn abi(&self, _: ItemKey) -> Option<Abi> { Some(Abi::Rust) }
+        fn lang_fn(&self, name: &str) -> Option<ItemKey> {
+            match name {
+                "drop_in_place" => Some(DROP_IN_PLACE),
+                "panic_cannot_unwind" => Some(PANIC_CANT_UNWIND),
+                _ => None,
+            }
+        }
+        fn fn_trait_method(&self, which: blaze_build::FnTrait) -> Option<ItemKey> {
+            Some(match which {
+                blaze_build::FnTrait::Fn => FN_CALL,
+                blaze_build::FnTrait::FnMut => FN_MUT_CALL,
+                blaze_build::FnTrait::FnOnce => FN_ONCE_CALL,
+            })
+        }
+        fn drop_impl(&self, ty: PTy, ground: &mut PortableTys<'_>) -> Result<Option<ItemKey>, blaze_build::BuildError> {
+            Ok(match ground.view().node(ty) {
+                Ok(PNode::Adt(ADT_DROP, _)) => Some(DROP_IMPL_FN),
+                _ => None,
+            })
+        }
+        fn location_adt(&self) -> Option<ItemKey> { Some(LOC_ADT) }
+        fn track_caller(&self, inst: blaze_build::Instance, _: &mut PortableTys<'_>) -> Option<bool> {
+            Some(inst.item == TRACKED_FN)
+        }
+        fn def_site(&self, item: ItemKey) -> Result<blaze_build::CallerSite<'_>, blaze_build::SiteGap> {
+            Ok(blaze_build::CallerSite { file: "shims.rs", item, offset: 7 })
+        }
+    }
+
+    let mut at = PortableTys::new_in(heap());
+    let u32_t = at.intern(PNode::Uint(blaze_typeck::UintTy::U32)).unwrap();
+    let i64_t = at.intern(PNode::Int(IntTy::I64)).unwrap();
+    let str_t = at.intern(PNode::Str).unwrap();
+    let ref_str = at.intern(PNode::Ref(Mutbl::Not, str_t)).unwrap();
+    let empty = at.intern_list(&[]).unwrap();
+    let drop_adt_t = at.intern(PNode::Adt(ADT_DROP, empty)).unwrap();
+    let csig_list = at.intern_list(&[i64_t, i64_t]).unwrap();
+    let closure_sig = at.intern(PNode::FnPtr(csig_list, FnPtrHeader::RUST)).unwrap();
+    let cenv_list = at.intern_list(&[drop_adt_t]).unwrap();
+    let closure_env = at.intern(PNode::Tuple(cenv_list)).unwrap();
+
+    let w_unwind = ShimWorld {
+        adt_tys: at,
+        drop_fields: [Field { name: Name::of("x"), ty: u32_t }],
+        drop_variants: [Variant { key: ADT_DROP, name: Name::of("Droppable"), fields: List { start: 0, len: 1 }, ctor: CtorKind::Braces }],
+        wrap_fields: [Field { name: Name::of("a"), ty: drop_adt_t }, Field { name: Name::of("b"), ty: drop_adt_t }],
+        wrap_variants: [Variant { key: ADT_WRAP, name: Name::of("Wrap"), fields: List { start: 0, len: 2 }, ctor: CtorKind::Braces }],
+        enum_fields: [Field { name: Name::of("0"), ty: drop_adt_t }],
+        enum_variants: [
+            Variant { key: ItemKey(0x7090), name: Name::of("Empty"), fields: List { start: 0, len: 0 }, ctor: CtorKind::Unit },
+            Variant { key: ItemKey(0x7091), name: Name::of("Full"), fields: List { start: 0, len: 1 }, ctor: CtorKind::Tuple },
+        ],
+        pair_fields: [Field { name: Name::of("0"), ty: u32_t }, Field { name: Name::of("1"), ty: i64_t }],
+        pair_variants: [Variant { key: ADT_PAIR, name: Name::of("Pair"), fields: List { start: 0, len: 2 }, ctor: CtorKind::Tuple }],
+        loc_fields: [
+            Field { name: Name::of("file"), ty: ref_str },
+            Field { name: Name::of("line"), ty: u32_t },
+            Field { name: Name::of("col"), ty: u32_t },
+        ],
+        loc_variants: [Variant { key: LOC_ADT, name: Name::of("Location"), fields: List { start: 0, len: 3 }, ctor: CtorKind::Braces }],
+        closure_sig,
+        closure_env,
+        panic: Panic::Unwind,
+    };
+
+    // 1. `build_drop_glue`: struct with two droppable fields (unwind ladder), enum, slice, and plain ZST/Copy.
+    {
+        let mut g = PortableTys::new_in(heap());
+        let g_empty = g.intern_list(&[]).unwrap();
+        let g_drop = g.intern(PNode::Adt(ADT_DROP, g_empty)).unwrap();
+        let g_wrap = g.intern(PNode::Adt(ADT_WRAP, g_empty)).unwrap();
+        let g_enum = g.intern(PNode::Adt(ADT_ENUM, g_empty)).unwrap();
+        let g_slice = g.intern(PNode::Slice(g_drop)).unwrap();
+        let g_u32 = g.intern(PNode::Uint(blaze_typeck::UintTy::U32)).unwrap();
+
+        let b_plain = build_drop_glue(&mut Subst { args: &[g_u32], ground: &mut g, scratch: heap() }, &w_unwind, heap()).unwrap();
+        assert!(b_plain.refs.is_empty(), "plain u32 drop glue should emit no calls");
+
+        let b_drop = build_drop_glue(&mut Subst { args: &[g_drop], ground: &mut g, scratch: heap() }, &w_unwind, heap()).unwrap();
+        assert!(b_drop.refs.iter().any(|r| r.item == DROP_IMPL_FN), "ADT_DROP glue must call Drop::drop");
+
+        let b_wrap = build_drop_glue(&mut Subst { args: &[g_wrap], ground: &mut g, scratch: heap() }, &w_unwind, heap()).unwrap();
+        let lir_wrap = printed(&b_wrap);
+        assert!(lir_wrap.contains("invoke"), "unwinding struct drop glue must build unwind ladder:\n{lir_wrap}");
+        assert!(lir_wrap.contains("resume"), "unwinding struct drop glue must resume:\n{lir_wrap}");
+
+        let b_enum = build_drop_glue(&mut Subst { args: &[g_enum], ground: &mut g, scratch: heap() }, &w_unwind, heap()).unwrap();
+        let lir_enum = printed(&b_enum);
+        assert!(lir_enum.contains("switch"), "enum drop glue must switch on discriminant:\n{lir_enum}");
+
+        let b_slice = build_drop_glue(&mut Subst { args: &[g_slice], ground: &mut g, scratch: heap() }, &w_unwind, heap()).unwrap();
+        let lir_slice = printed(&b_slice);
+        assert!(lir_slice.contains("invoke"), "slice drop glue must invoke element drop_in_place:\n{lir_slice}");
+    }
+
+    // 2. `build_closure_shim`: `Fn` closure called via `FnMut` and `FnOnce` (with env drop).
+    {
+        let mut g = PortableTys::new_in(heap());
+        let g_empty = g.intern_list(&[]).unwrap();
+        let clo = g.intern(PNode::Closure { owner: CLOSURE_OWNER, ordinal: 0, args: g_empty }).unwrap();
+        let b_mut = build_closure_shim(clo, blaze_build::FnTrait::FnMut, &mut Subst { args: &[], ground: &mut g, scratch: heap() }, &w_unwind, heap()).unwrap();
+        assert!(b_mut.refs.iter().any(|r| r.item == FN_CALL), "FnMut shim must forward to Fn::call");
+        let b_once = build_closure_shim(clo, blaze_build::FnTrait::FnOnce, &mut Subst { args: &[], ground: &mut g, scratch: heap() }, &w_unwind, heap()).unwrap();
+        assert!(b_once.refs.iter().any(|r| r.item == FN_CALL), "FnOnce shim must forward to Fn::call");
+        assert!(b_once.refs.iter().any(|r| r.item == DROP_IN_PLACE), "FnOnce shim must drop droppable closure env");
+    }
+
+    // 3. `build_fn_shim`: fn item + fn pointer shims.
+    {
+        let mut g = PortableTys::new_in(heap());
+        let g_i64 = g.intern(PNode::Int(IntTy::I64)).unwrap();
+        let g_empty = g.intern_list(&[]).unwrap();
+        let g_tup_l = g.intern_list(&[g_i64]).unwrap();
+        let g_tup = g.intern(PNode::Tuple(g_tup_l)).unwrap();
+        let g_fndef = g.intern(PNode::FnDef(TARGET_FN, g_empty)).unwrap();
+        let g_fpl = g.intern_list(&[g_i64, g_i64]).unwrap();
+        let g_fnptr = g.intern(PNode::FnPtr(g_fpl, FnPtrHeader::RUST)).unwrap();
+
+        let mut st = PortableTys::new_in(heap());
+        let s_i64 = st.intern(PNode::Int(IntTy::I64)).unwrap();
+        let ins = [s_i64];
+        let sig = mk_sig(st.view(), &ins, s_i64);
+
+        let b_item = build_fn_shim(g_fndef, g_tup, blaze_build::FnTrait::FnOnce, Some(&sig), &mut Subst { args: &[], ground: &mut g, scratch: heap() }, &w_unwind, heap()).unwrap();
+        assert!(b_item.refs.iter().any(|r| r.item == TARGET_FN), "FnDef shim must call target fn");
+
+        let b_ptr = build_fn_shim(g_fnptr, g_tup, blaze_build::FnTrait::Fn, None, &mut Subst { args: &[], ground: &mut g, scratch: heap() }, &w_unwind, heap()).unwrap();
+        let lir_ptr = printed(&b_ptr);
+        assert!(lir_ptr.contains("call_indirect"), "FnPtr shim must emit call_indirect:\n{lir_ptr}");
+    }
+
+    // 4. `build_ctor_fn`: tuple struct `Pair(u32, i64)` builds and runs cleanly!
+    {
+        let mut g = PortableTys::new_in(heap());
+        let mut st = PortableTys::new_in(heap());
+        let s_u32 = st.intern(PNode::Uint(blaze_typeck::UintTy::U32)).unwrap();
+        let s_i64 = st.intern(PNode::Int(IntTy::I64)).unwrap();
+        let s_empty = st.intern_list(&[]).unwrap();
+        let s_pair = st.intern(PNode::Adt(ADT_PAIR, s_empty)).unwrap();
+        let ins = [s_u32, s_i64];
+        let sig = mk_sig(st.view(), &ins, s_pair);
+        let b_ctor = build_ctor_fn(ADT_PAIR, 0, &sig, &mut Subst { args: &[], ground: &mut g, scratch: heap() }, &w_unwind, heap()).unwrap();
+        let lir_ctor = printed(&b_ctor);
+        assert!(lir_ctor.contains("store"), "ctor fn must store fields:\n{lir_ctor}");
+    }
+
+    // 5. `build_reify_shim` and `build_vtable_shim`.
+    {
+        let mut g = PortableTys::new_in(heap());
+        let mut st = PortableTys::new_in(heap());
+        let s_i64 = st.intern(PNode::Int(IntTy::I64)).unwrap();
+        let ins = [s_i64];
+        let sig = mk_sig(st.view(), &ins, s_i64);
+        let b_reify = build_reify_shim(TRACKED_FN, &sig, &mut Subst { args: &[], ground: &mut g, scratch: heap() }, &w_unwind, heap()).unwrap();
+        let lir_reify = printed(&b_reify);
+        assert!(lir_reify.contains("data_addr"), "reify shim must materialize Location row:\n{lir_reify}");
+        assert!(b_reify.refs.iter().any(|r| r.item == TRACKED_FN));
+
+        let v_inst = blaze_build::Instance { item: VTABLE_METHOD, args: List::EMPTY };
+        let b_vt = build_vtable_shim(v_inst, Some(&sig), &mut Subst { args: &[], ground: &mut g, scratch: heap() }, &w_unwind, heap()).unwrap();
+        let lir_vt = printed(&b_vt);
+        assert!(lir_vt.contains("load"), "vtable shim must load Self from data_ptr:\n{lir_vt}");
+        assert!(b_vt.refs.iter().any(|r| r.item == VTABLE_METHOD));
+    }
+}

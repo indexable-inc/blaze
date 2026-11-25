@@ -58,8 +58,12 @@ fn print(b: &Body<Global>) -> String {
     out
 }
 
+fn test_alloc() -> impl core::alloc::Allocator + Copy {
+    Global
+}
+
 fn try_run<F: DropFacts>(text: &str, facts: &F, plant: Plant) -> Result<Body<Global>, crate::ElabError> {
-    let a = Global;
+    let a = Default::default();
     let input = blaze_body::parse(text, a).unwrap_or_else(|e| panic!("{e:?} in:\n{text}"));
     let v = verify(&input).unwrap_or_else(|e| panic!("the input is refused: {e:?}:\n{text}"));
     elaborate_planted(v, facts, a, plant)
@@ -592,4 +596,50 @@ bb1:
     assert!(printed.contains("_1#1.0:t2"), "expected variant 1 field 0 drop:\n{printed}");
     assert!(printed.contains("_1#1.1:t2"), "expected variant 1 field 1 drop:\n{printed}");
     assert!(printed.contains("cleanup:"), "expected unwind cleanup ladder:\n{printed}");
+}
+
+#[test]
+fn out_of_block_order_loans_replay_without_id_mismatch() {
+    use blaze_body::body::{ExprId, Mutbl};
+    use blaze_body::{BlockKind, BodyBuilder, BorrowKind, LocalDecl, Role, Span};
+
+    let a = test_alloc();
+    let mut b = BodyBuilder::new_in(a);
+    let _r0 = b.new_local(LocalDecl { ty: PTy(0), kind: LocalKind::Return, mutbl: Mutbl::Mut });
+    let x = b.new_local(LocalDecl { ty: PTy(1), kind: LocalKind::Temp(ExprId(0), Role::Value), mutbl: Mutbl::Not });
+    let r1 = b.new_local(LocalDecl { ty: PTy(2), kind: LocalKind::Temp(ExprId(1), Role::Borrow), mutbl: Mutbl::Not });
+    let r2 = b.new_local(LocalDecl { ty: PTy(2), kind: LocalKind::Temp(ExprId(2), Role::Borrow), mutbl: Mutbl::Not });
+    let xp = b.local_place(x);
+    let r1p = b.local_place(r1);
+    let r2p = b.local_place(r2);
+    let o0 = b.origin(false);
+    let o1 = b.origin(false);
+
+    let bb0 = b.new_block(BlockKind::Normal);
+    let bb1 = b.new_block(BlockKind::Normal);
+    let bb2 = b.new_block(BlockKind::Normal);
+
+    // Fill bb0, then bb2 (emitting L0), then bb1 (emitting L1): loan IDs follow statement order,
+    // not block index order.
+    b.start(bb0);
+    b.terminate(StmtKind::Goto(bb2), Span::default());
+
+    b.start(bb2);
+    let _l0 = b.borrow(r1p, BorrowKind::Shared, xp, o0, Span::default());
+    b.terminate(StmtKind::Goto(bb1), Span::default());
+
+    b.start(bb1);
+    let _l1 = b.borrow(r2p, BorrowKind::Shared, xp, o1, Span::default());
+    b.terminate(StmtKind::Return, Span::default());
+
+    let body = b.finish().expect("build body");
+    let v = verify(&body).expect("verify input");
+    struct NoDrops;
+    impl DropFacts for NoDrops {
+        fn at(&self, _: Stmt) -> DropState<'_> { DropState::Uninit }
+        fn needs_drop(&self, _: PTy) -> NeedsDrop { NeedsDrop::No }
+        fn bool_ty(&self) -> PTy { PTy(1) }
+    }
+    let out = crate::elaborate(v, &NoDrops, a).expect("elaborate out-of-order loans");
+    verify(&out).expect("elaborated body verifies");
 }
