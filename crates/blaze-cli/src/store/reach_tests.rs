@@ -362,3 +362,45 @@ fn a_program_root_planted_off_makes_the_code_again() {
     assert!(problems.iter().any(|it| it.contains("after the sweep made")), "the oracle did not catch the missing root: {problems:?}");
     std::println!("reach control: no program root: the live checkout's run made {}", last.made);
 }
+
+/// Incremental builds that put zero new toolchain code renew `tool.<id>` via the O(1)
+/// `renew_root` fast path (no new segment bytes written, zero root/index reads) while still
+/// keeping every toolchain record reachable across a sweep past `ROOT_LIFE_NS`.
+#[test]
+fn keep_toolchain_with_empty_puts_renews_in_o1_and_keeps_std_alive() {
+    let keep = Keep { program: true, toolchain: true };
+    let sim = Sim::new(53, Faults::default());
+    // Cold run creates std's 8 records and writes `tool.<id>`.
+    let (mut sim, _first, std_first) = run_with(sim, 1, Checkout { which: 1, program: A }, keep, STD);
+    assert_eq!(std_first, 8);
+    let disk_before = disk(&mut sim);
+
+    // Advance 2 days (past TOUCH_NS so renewal actually touches the root) and call
+    // `keep_toolchain` with empty `made` and `beside` (exact incremental edit case).
+    sim.advance(2 * DAY);
+    {
+        let lent = process(sim, 2);
+        let kept = keep_toolchain(&lent, blaze_toolchain::PINNED, &[], &[]).expect("O(1) renew");
+        assert!(kept.is_some(), "existing tool root renewed cleanly");
+        after_answer(&test_cx(), &lent, 0).expect("commit renewal");
+        sim = back(lent);
+    }
+    assert_eq!(disk(&mut sim), disk_before, "O(1) toolchain renewal must write 0 new segment bytes");
+
+    // Advance past the program root's life (still inside renewed toolchain root's life) and sweep.
+    sim.advance(Duration::from_nanos(ROOT_LIFE_NS) + MINUTE);
+    let mut n = 3u64;
+    for _ in 0..4 {
+        sim = idle(sim, n);
+        n += 1;
+        sim.advance(Duration::from_secs(1));
+    }
+    sim.advance(Duration::from_nanos(LEASE_NS.max(GRACE_NS)) + MINUTE);
+    for _ in 0..4 {
+        sim = idle(sim, n);
+        n += 1;
+        sim.advance(Duration::from_secs(1));
+    }
+    let (_sim, _fresh, std_made) = run_with(sim, n, Checkout { which: 3, program: 48..56 }, keep, STD);
+    assert_eq!(std_made, 0, "renewed toolchain root must keep all 8 std records alive");
+}

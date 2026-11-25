@@ -31,7 +31,7 @@ use blaze_mem::Frame;
 
 use super::{
     core::{
-        DEFAULT_MAX_STORE_BYTES, GRACE_NS, Liveness, Plain, PlainConfig, Plant, ROOT_LIFE_NS, TAGS, WATERMARK_HIGH_PCT, WATERMARK_LOW_PCT, watermark_bytes,
+        DEFAULT_MAX_STORE_BYTES, GRACE_NS, LEASE_NS, Liveness, Plain, PlainConfig, Plant, ROOT_LIFE_NS, TAGS, WATERMARK_HIGH_PCT, WATERMARK_LOW_PCT, watermark_bytes,
     },
     settings::Settings,
     test_root,
@@ -956,4 +956,122 @@ fn multi_slice_compact_foreground_reclaims_many_segments_and_roots_soundly() {
         }
     }
     assert!(checked >= 10, "expected >= 10 live records verified across surviving roots, got {checked}");
+}
+
+/// Over-budget GC must prioritize 100%-dead segments first (0 bytes written, zero write
+/// amplification) instead of copying a partially-dead segment that appears earlier in the scan.
+/// Control (`Plant::SweepCappedByPayload`) uses the legacy first-fit scan and copies the
+/// partially-dead segment first (`bytes_out > 0`).
+#[test]
+fn over_budget_gc_prioritizes_all_dead_segments_with_zero_write_amp() {
+    let run_one_slice = |plant: Plant| -> super::Sliced {
+        let root = test_root();
+        let mut sim = Sim::new(808, Faults::default());
+        const CAP: u64 = 12 << 10;
+
+        // Seg 0: 90% live (key 1 rooted, 4000 B) + 10% dead (key 2 unrooted, 400 B).
+        {
+            let mut s = open_whole(&mut sim, 1, 1, CAP, false, Plant::None, &root);
+            s.put(key(1), Namespace::LOCAL, TAG, &value(1, 4000, &root)).expect("put live");
+            s.put(key(2), Namespace::LOCAL, TAG, &value(2, 400, &root)).expect("put small dead");
+            s.root_for("keep.live", &[key(1)], ROOT_LIFE_NS).expect("root");
+            s.release_lease();
+            commit_ok(&mut sim, &mut s);
+        }
+        // Seg 1: 100% live (key 3 rooted, 4000 B).
+        sim.advance(MINUTE);
+        {
+            let mut s = open_whole(&mut sim, 2, 1, CAP, false, Plant::None, &root);
+            s.put(key(3), Namespace::LOCAL, TAG, &value(3, 4000, &root)).expect("put live 2");
+            s.root_for("keep.live2", &[key(3)], ROOT_LIFE_NS).expect("root 2");
+            s.release_lease();
+            commit_ok(&mut sim, &mut s);
+        }
+        // Seg 2: 100% dead (key 4 unrooted, 6000 B) -> total > 12 KiB CAP!
+        sim.advance(MINUTE);
+        {
+            let mut s = open_whole(&mut sim, 3, 1, CAP, false, Plant::None, &root);
+            s.put(key(4), Namespace::LOCAL, TAG, &value(4, 6000, &root)).expect("put all dead");
+            s.release_lease();
+            commit_ok(&mut sim, &mut s);
+        }
+
+        // Advance past lease expiry so all 3 segments are sweepable (generation % 3 == 0 starts at Seg 0).
+        sim.advance(Duration::from_nanos(LEASE_NS) + MINUTE);
+        let mut gc = open_whole(&mut sim, 4, 1, CAP, false, plant, &root);
+        let mut effects = core::default::Default::default();
+        assert!(gc.compact(&mut effects), "compact must start");
+        settle!(&mut sim, &mut gc, &mut effects);
+        gc.take_sliced().expect("slice must complete")
+    };
+
+    let fixed = run_one_slice(Plant::None);
+    assert_eq!(fixed.bytes_out, 0, "over-budget GC must pick 100%-dead segment first with 0 write amp: {fixed:?}");
+    assert!(fixed.bytes_in >= 6000, "must drop the 6000-byte 100%-dead segment: {fixed:?}");
+
+    // Planted bug control (rule 43): legacy first-fit scan hits Seg 0 first and copies 4000 B of live data.
+    let control = run_one_slice(Plant::SweepCappedByPayload);
+    assert!(control.bytes_out >= 4000, "control must copy partially-dead Seg 0 first: {control:?}");
+}
+
+/// Retired files past `GRACE_NS` must be unlinked in a fast metadata-only slice BEFORE copying
+/// sparse segments, so a concurrent foreground commit cannot keep retired files pinned on disk.
+/// Control (`Plant::MixRetiredWithCopy`) bundles retired unlinks with segment copying so the first
+/// slice writes copied bytes instead of unlinking retired files cleanly first.
+#[test]
+fn retired_files_unlink_first_before_copy_and_plant_is_caught() {
+    let run_case = |plant: Plant| -> (super::Sliced, u32) {
+        let root = test_root();
+        let mut sim = Sim::new(909, Faults::default());
+        const CAP: u64 = 12 << 10;
+
+        // Seed 2 segments: Seg 0 (partially dead: 3000 B live + 3500 B dead), Seg 1 (100% dead: 6000 B).
+        {
+            let mut s = open_whole(&mut sim, 1, 1, CAP, false, Plant::None, &root);
+            s.put(key(10), Namespace::LOCAL, TAG, &value(10, 3000, &root)).expect("put live");
+            s.put(key(11), Namespace::LOCAL, TAG, &value(11, 3500, &root)).expect("put dead");
+            s.root_for("r.live", &[key(10)], ROOT_LIFE_NS).expect("root");
+            s.release_lease();
+            commit_ok(&mut sim, &mut s);
+        }
+        sim.advance(MINUTE);
+        {
+            let mut s = open_whole(&mut sim, 2, 1, CAP, false, Plant::None, &root);
+            s.put(key(12), Namespace::LOCAL, TAG, &value(12, 6000, &root)).expect("put all dead");
+            s.release_lease();
+            commit_ok(&mut sim, &mut s);
+        }
+
+        // First slice retires Seg 1 (leaving Seg 0 still sparse and Seg 1 in manifest.retired).
+        sim.advance(Duration::from_nanos(LEASE_NS) + MINUTE);
+        {
+            let mut gc1 = open_whole(&mut sim, 3, 1, CAP, false, Plant::None, &root);
+            let mut effects = core::default::Default::default();
+            assert!(gc1.compact(&mut effects));
+            settle!(&mut sim, &mut gc1, &mut effects);
+            let s1 = gc1.take_sliced().expect("first slice drops all-dead seg");
+            assert_eq!(s1.bytes_out, 0);
+        }
+
+        // Advance past GRACE_NS: now Seg 1 is ready to unlink AND Seg 0 is sparse (needs copy).
+        sim.advance(Duration::from_nanos(GRACE_NS) + MINUTE);
+        let mut gc2 = open_whole(&mut sim, 4, 1, CAP, false, plant, &root);
+        let before_plan = gc2.plan_gc(sim.wall_ns()).expect("plan before");
+        assert!(before_plan.retired_ready >= 1, "retired segment must be ready to unlink");
+        let mut effects = core::default::Default::default();
+        assert!(gc2.compact(&mut effects));
+        settle!(&mut sim, &mut gc2, &mut effects);
+        let s2 = gc2.take_sliced().expect("second slice completes");
+        let after_plan = gc2.plan_gc(sim.wall_ns()).expect("plan after");
+        (s2, after_plan.retired_ready)
+    };
+
+    let (fixed, remaining) = run_case(Plant::None);
+    assert_eq!(fixed.bytes_out, 0, "first slice with retired files ready must be metadata-only (0 bytes copied): {fixed:?}");
+    assert!(fixed.removed >= 1, "metadata-only slice must unlink retired files immediately: {fixed:?}");
+    assert_eq!(remaining, 0, "zero retired files left ready after metadata-only slice");
+
+    // Planted bug control (rule 43): mixing retired unlink with segment copy copies >= 3000 B in the same slice.
+    let (control, _) = run_case(Plant::MixRetiredWithCopy);
+    assert!(control.bytes_out >= 3000, "control must mix retired unlink with copying Seg 0's live bytes: {control:?}");
 }

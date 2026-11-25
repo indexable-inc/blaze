@@ -375,16 +375,18 @@ impl BloomRef {
                 let Some(slot_state) = usize::try_from(*state_idx).ok().and_then(|i| shared.states.get(i)) else {
                     return true;
                 };
-                let state = slot_state.load(Ordering::Acquire);
-                if state == STATE_CORRUPT {
-                    return true;
-                }
-                if state == STATE_UNVERIFIED && !*trust_corrupt {
-                    if record_crc_valid(record, *crc) {
-                        slot_state.store(STATE_VALID, Ordering::Release);
-                    } else {
-                        slot_state.store(STATE_CORRUPT, Ordering::Release);
+                let state = slot_state.load(Ordering::Relaxed);
+                if state != STATE_VALID {
+                    if state == STATE_CORRUPT {
                         return true;
+                    }
+                    if !*trust_corrupt {
+                        if record_crc_valid(record, *crc) {
+                            slot_state.store(STATE_VALID, Ordering::Relaxed);
+                        } else {
+                            slot_state.store(STATE_CORRUPT, Ordering::Relaxed);
+                            return true;
+                        }
                     }
                 }
                 let Some(body) = record.get(RECORD_HEADER..) else {
@@ -519,7 +521,7 @@ impl BloomIndex {
     /// Prunes entries whose segment or root is no longer present in `segments`/`roots`, preventing
     /// long-lived processes from retaining owned Bloom buffers for retired entries.
     pub(crate) fn prune(&mut self, segments: &[Segment], roots: &[Root]) {
-        let mut root_digests: Option<Map<u64, ContentId, BuildKeyHasher, Kept>> = if !roots.is_empty() {
+        let root_digests: Option<Map<u64, ContentId, BuildKeyHasher, Kept>> = if !roots.is_empty() {
             let mut m = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: BLOOM_ALLOC, capacity: Some(roots.len()) });
             for root in roots {
                 let d = root_bloom_digest(&root.key);
@@ -576,16 +578,18 @@ impl BloomIndex {
                 let Some(record) = map.bytes().get(*offset..end) else {
                     return true;
                 };
-                let state = slot_state.load(Ordering::Acquire);
-                if state == STATE_CORRUPT {
-                    return true;
-                }
-                if state == STATE_UNVERIFIED && !trust_corrupt {
-                    if record_crc_valid(record, *crc) {
-                        slot_state.store(STATE_VALID, Ordering::Release);
-                    } else {
-                        slot_state.store(STATE_CORRUPT, Ordering::Release);
+                let state = slot_state.load(Ordering::Relaxed);
+                if state != STATE_VALID {
+                    if state == STATE_CORRUPT {
                         return true;
+                    }
+                    if !trust_corrupt {
+                        if record_crc_valid(record, *crc) {
+                            slot_state.store(STATE_VALID, Ordering::Relaxed);
+                        } else {
+                            slot_state.store(STATE_CORRUPT, Ordering::Relaxed);
+                            return true;
+                        }
                     }
                 }
                 let Some(body) = record.get(RECORD_HEADER..) else {
@@ -616,7 +620,7 @@ impl BloomIndex {
                     return None;
                 }
                 let slot_state = self.states.as_ref().and_then(|s| usize::try_from(*state_idx).ok().and_then(|i| s.get(i)))?;
-                if !trust_corrupt && slot_state.load(Ordering::Acquire) == STATE_CORRUPT {
+                if !trust_corrupt && slot_state.load(Ordering::Relaxed) == STATE_CORRUPT {
                     return None;
                 }
                 Some(BloomRef::Mapped { offset: *offset, blocks: *blocks, crc: *crc, state_idx: *state_idx, trust_corrupt })
@@ -651,16 +655,18 @@ impl BloomIndex {
                 let body_len = usize::try_from(*blocks).ok()?.checked_mul(BLOCK_BYTES)?;
                 let end = offset.checked_add(RECORD_HEADER)?.checked_add(body_len)?;
                 let record = map.bytes().get(*offset..end)?;
-                let state = slot_state.load(Ordering::Acquire);
-                if state == STATE_CORRUPT {
-                    return None;
-                }
-                if state == STATE_UNVERIFIED && !trust_corrupt {
-                    if record_crc_valid(record, *crc) {
-                        slot_state.store(STATE_VALID, Ordering::Release);
-                    } else {
-                        slot_state.store(STATE_CORRUPT, Ordering::Release);
+                let state = slot_state.load(Ordering::Relaxed);
+                if state != STATE_VALID {
+                    if state == STATE_CORRUPT {
                         return None;
+                    }
+                    if !trust_corrupt {
+                        if record_crc_valid(record, *crc) {
+                            slot_state.store(STATE_VALID, Ordering::Relaxed);
+                        } else {
+                            slot_state.store(STATE_CORRUPT, Ordering::Relaxed);
+                            return None;
+                        }
                     }
                 }
                 (record.get(RECORD_HEADER..)?, *blocks)
@@ -690,15 +696,15 @@ impl BloomIndex {
                 let body_len = usize::try_from(*blocks).ok()?.checked_mul(BLOCK_BYTES)?;
                 let end = offset.checked_add(RECORD_HEADER)?.checked_add(body_len)?;
                 let record = map.bytes().get(*offset..end)?;
-                let state = slot_state.load(Ordering::Acquire);
-                if state == STATE_CORRUPT {
-                    return None;
-                }
-                if state == STATE_UNVERIFIED {
+                let state = slot_state.load(Ordering::Relaxed);
+                if state != STATE_VALID {
+                    if state == STATE_CORRUPT {
+                        return None;
+                    }
                     if record_crc_valid(record, *crc) {
-                        slot_state.store(STATE_VALID, Ordering::Release);
+                        slot_state.store(STATE_VALID, Ordering::Relaxed);
                     } else {
-                        slot_state.store(STATE_CORRUPT, Ordering::Release);
+                        slot_state.store(STATE_CORRUPT, Ordering::Relaxed);
                         return None;
                     }
                 }
@@ -736,15 +742,26 @@ impl BloomIndex {
                         .states
                         .as_ref()
                         .and_then(|s| usize::try_from(*state_idx).ok().and_then(|i| s.get(i)))
-                        .is_some_and(|st| st.load(Ordering::Acquire) != STATE_CORRUPT)
+                        .is_some_and(|st| st.load(Ordering::Relaxed) != STATE_CORRUPT)
             }
             BloomSlot::Owned { digest, .. } => digest == want,
         }
     }
 
-    /// Whether the on-disk `bloom` file has accumulated enough dead bytes from retired segments
-    /// and roots (more than 2x live + 64 KiB) to warrant rewriting compactly.
-    pub(crate) fn needs_compact(&self, segments: &[Segment], roots: &[Root]) -> bool {
+    /// Pre-verifies mapped Bloom records for all live local `segments` and `roots` outside the
+    /// exclusive flip lock so compact sidecar rewrites inside `Plain::build` do zero CRC-32C work.
+    pub(crate) fn verify_live(&self, segments: &[Segment], roots: &[Root]) {
+        for seg in segments.iter().filter(|it| it.local) {
+            let _ = self.raw_record(seg);
+        }
+        for root in roots {
+            let want = root_bloom_digest(&root.key);
+            let _ = self.raw_record_digest(&want);
+        }
+    }
+
+    /// Total live byte size of Bloom records for `segments` and `roots` currently indexed.
+    fn live_bytes(&self, segments: &[Segment], roots: &[Root]) -> u64 {
         let mut live = 0u64;
         for seg in segments.iter().filter(|it| it.local) {
             if let Some(slot) = self.entries.get(&seg.id) {
@@ -767,7 +784,21 @@ impl BloomIndex {
                 live = live.saturating_add(RECORD_HEADER_U64.saturating_add(u64::from(blocks).saturating_mul(BLOCK_BYTES_U64)));
             }
         }
+        live
+    }
+
+    /// Whether the on-disk `bloom` file has accumulated enough dead bytes from retired segments
+    /// and roots (more than 2x live + 64 KiB) to warrant rewriting compactly during GC/compaction.
+    pub(crate) fn needs_compact(&self, segments: &[Segment], roots: &[Root]) -> bool {
+        let live = self.live_bytes(segments, roots);
         self.mapped_bytes > live.saturating_mul(2).saturating_add(64 << 10)
+    }
+
+    /// Higher threshold for foreground commits (4x live + 1 MiB) so normal foreground commits
+    /// perform tiny O(1) appends and leave routine `bloom` sidecar compaction to background GC.
+    pub(crate) fn needs_urgent_compact(&self, segments: &[Segment], roots: &[Root]) -> bool {
+        let live = self.live_bytes(segments, roots);
+        self.mapped_bytes > live.saturating_mul(4).saturating_add(1 << 20)
     }
 }
 
