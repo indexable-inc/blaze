@@ -2,17 +2,28 @@
 //! small io_uring of its own (`IORING_SETUP_SINGLE_ISSUER | DEFER_TASKRUN`, no kernel thread)
 //! on which each blocking wait is one request, a futex wait (`IORING_OP_FUTEX_WAIT`, 6.7), a
 //! child's exit (`IORING_OP_WAITID`, 6.7), a poll of one descriptor (`IORING_OP_POLL_ADD`) or
-//! a sleep (`IORING_OP_TIMEOUT` to an absolute time). Each request's deadline is in the ring's
-//! registered wait region (`IORING_REGISTER_MEM_REGION`, 6.13): the region holds the absolute
-//! `CLOCK_MONOTONIC` time and the signal mask, `io_uring_enter` is told only its offset
-//! (`IORING_ENTER_EXT_ARG_REG | ABS_TIMER`), and a retry after an interruption rewrites only
-//! the region's time, recomputed from the wait's clock by [`super::until`]. A request whose
+//! a sleep (`IORING_OP_TIMEOUT` to an absolute time). Each waiting enter's argument — the
+//! deadline and the waiting signal mask — is the ring's registered wait region's where the
+//! kernel takes one (7.3), told to `io_uring_enter` by its offset
+//! (`IORING_ENTER_EXT_ARG_REG | ABS_TIMER`), and a `io_uring_getevents_arg`'s by pointer where
+//! it does not (`IORING_ENTER_EXT_ARG`, 5.11); a retry after an interruption waits for only
+//! what is left, recomputed from the wait's clock by [`super::until`]. A request whose
 //! deadline passed is cancelled and its end taken before the wait returns, so the kernel
 //! never writes memory the wait no longer holds.
 //!
-//! Linux 7.3 is blaze's floor (docs/v2/plan/design/deadline-waits.md step 5): its fix of
-//! io_uring futex in-flight accounting is what lets an idle pool's threads park here. Nothing
-//! is probed: a kernel without one of these fails the wait with an error naming it.
+//! The form is the kernel's answer when the ring is made ([`wait_arg_of`]): the registered
+//! wait region (`IORING_REGISTER_MEM_REGION` with `MEM_REGION_REG_WAIT_ARG`, 7.3) where it
+//! takes one, the inline argument (`ENTER_EXT_ARG`, 5.11) where it does not (`EINVAL`,
+//! `ENOSYS`); a register refused any other way (a filter's `EPERM`) fails the ring, naming
+//! the step. The inline enter's time is the length left of the deadline, recomputed by
+//! [`super::until`] before each entry (no `ABS_TIMER` before 6.12).
+//!
+//! Linux 6.7 is the ring's floor (ops 50 to 52 came then); the setup flags (6.1) and both
+//! wait-argument forms are older. The pool's park is private (`FUTEX2_PRIVATE`) only, which
+//! is what lets an idle pool's threads park here: before the two 2026-07-30 commits (merged
+//! for 7.3, Cc: stable) a wake is also counted as a request in flight — a speed note, not a
+//! fact (docs/v2/plan/design/deadline-waits.md step 5). Nothing else is probed: a kernel
+//! without one of these fails the wait with an error naming it.
 //!
 //! The sandbox launcher stays off this ring: its seccomp filter refuses io_uring to what it
 //! launches, and it waits between its fork and its exec, where nothing may be made. What it
@@ -209,8 +220,11 @@ struct WaitRing {
     cq_mask: u32,
     cqes: *const Cqe,
     tail: u32,
-    /// The region's wait argument, which every waiting enter names.
+    /// The region's wait argument, which every waiting enter names in the region's form.
     wait: *mut RegWait,
+    /// How a waiting enter's argument reaches the kernel, [`wait_arg_of`]'s answer at the
+    /// ring's making.
+    arg: WaitArg,
     /// What a `waitid` writes of its child, and a sleep's absolute time: the kernel's until
     /// the request ends.
     info: Box<siginfo_t>,
@@ -239,6 +253,39 @@ fn register(fd: RawFd, opcode: c_uint, arg: *const c_void, n: c_uint) -> i64 {
     unsafe { libc::syscall(linux::nr::IO_URING_REGISTER as core::ffi::c_long, fd, opcode, arg, n) }
 }
 
+/// How a waiting enter's argument reaches the kernel, chosen once by its answer to
+/// registering the wait region ([`wait_arg_of`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WaitArg {
+    /// In the ring's registered wait region (`MEM_REGION_REG_WAIT_ARG`, 7.3): the enter names
+    /// the region's offset (`ENTER_EXT_ARG_REG`) and an absolute time (`ENTER_ABS_TIMER`).
+    Region,
+    /// By pointer, a `io_uring_getevents_arg` (`ENTER_EXT_ARG`, 5.11): the enter's time is
+    /// the length left of the deadline, recomputed by [`until`] before each entry (no
+    /// `ABS_TIMER` before 6.12).
+    Inline,
+}
+
+/// The wait argument's form by the kernel's answer to registering the wait region: the
+/// region where it took one; inline where the region is unknown to it (`EINVAL`: an opcode or
+/// a flag it does not have, `ENOSYS`: no such opcode); any other refusal (a filter's `EPERM`)
+/// the ring's, named.
+fn wait_arg_of(registered: i64, errno: i32) -> Result<WaitArg, i32> {
+    if registered >= 0 {
+        return Ok(WaitArg::Region);
+    }
+    match errno {
+        libc::EINVAL | libc::ENOSYS => Ok(WaitArg::Inline),
+        refused => Err(refused),
+    }
+}
+
+/// The inline form's wait argument: what is left of the deadline, a length the kernel counts
+/// from the enter ([`until`] recomputes it after an interruption), under [`WAITING_MASK`].
+fn inline_wait(left: Option<Duration>) -> linux::EnterWait {
+    linux::EnterWait { left: left.map(Timespec::from_duration), mask: Some(linux::SigSet(WAITING_MASK)) }
+}
+
 impl WaitRing {
     fn new() -> io::Result<WaitRing> {
         let refused = |step: &str, error: io::Error| {
@@ -246,7 +293,7 @@ impl WaitRing {
                 error.kind(),
                 // alloc: the error of a setup that failed.
                 format!(
-                    "a thread's wait ring: {step}: {error} (blaze needs Linux 7.3 or later, and this is Linux {})",
+                    "a thread's wait ring: {step}: {error} (blaze's wait ring needs Linux 6.7 or later, and this is Linux {})",
                     crate::cgroup::kernel()
                 ),
             )
@@ -308,9 +355,11 @@ impl WaitRing {
             flags: MEM_REGION_REG_WAIT_ARG,
             resv: [0; 2],
         };
-        if register(fd.fd().raw(), REGISTER_MEM_REGION, ptr::from_ref(&reg).cast(), 1) < 0 {
-            return Err(refused("registering its wait region", io::Error::last_os_error()));
-        }
+        let registered = register(fd.fd().raw(), REGISTER_MEM_REGION, ptr::from_ref(&reg).cast(), 1);
+        let arg = match wait_arg_of(registered, if registered < 0 { errno() } else { 0 }) {
+            Ok(arg) => arg,
+            Err(code) => return Err(refused("registering its wait region", io::Error::from_raw_os_error(code))),
+        };
         // Enabled by the thread that waits on it, its one issuer.
         if register(fd.fd().raw(), REGISTER_ENABLE_RINGS, ptr::null(), 0) < 0 {
             return Err(refused("enabling it", io::Error::last_os_error()));
@@ -331,6 +380,7 @@ impl WaitRing {
             cqes: rings.at(cq.cqes as usize),
             tail: 0,
             wait,
+            arg,
             info: Box::new(siginfo_t::ZERO), // alloc: once per thread's ring.
             sleep: Box::new(Timespec::ZERO), // alloc: once per thread's ring.
             lost: false,
@@ -357,35 +407,38 @@ impl WaitRing {
     }
 
     /// One `io_uring_enter`: submits what was pushed and, with `wait`, waits for a completion
-    /// for up to `left` (no limit for `None`), the absolute time written to the region.
+    /// for up to `left` (no limit for `None`), the wait's argument in the ring's form
+    /// ([`WaitArg`]).
     fn enter(&mut self, wait: bool, left: Option<Duration>) -> io::Result<Once<()>> {
         // SAFETY: the kernel's counter, as in `push`.
         let head = unsafe { (*self.sq_head).load(Ordering::Acquire) };
         let submit = self.tail.wrapping_sub(head);
-        let (min, mut flags, arg, size): (u32, u32, *const c_void, usize) = match wait {
-            true => (
-                1,
-                ENTER_GETEVENTS | ENTER_EXT_ARG | ENTER_EXT_ARG_REG,
-                ptr::null(),
-                size_of::<RegWait>(),
-            ),
-            false => (0, 0, ptr::null(), 0),
-        };
-        if wait {
-            let (ts, ts_flags) = match left {
-                Some(left) => (Timespec::from_duration(monotonic()?.saturating_add(left)), REG_WAIT_TS),
-                None => (Timespec::ZERO, 0),
-            };
-            if ts_flags != 0 {
-                flags |= ENTER_ABS_TIMER;
-            }
-            // SAFETY: the region's wait argument; the kernel reads it only inside an enter,
-            // and this thread is its only writer.
-            unsafe {
-                (&raw mut (*self.wait).ts).write(ts);
-                (&raw mut (*self.wait).flags).write(ts_flags);
+        match (wait, self.arg) {
+            (false, _) => self.enter_raw(submit, 0, 0, ptr::null(), 0),
+            (true, WaitArg::Inline) => self.enter_inline(submit, left),
+            (true, WaitArg::Region) => {
+                let mut flags = ENTER_GETEVENTS | ENTER_EXT_ARG | ENTER_EXT_ARG_REG;
+                let (ts, ts_flags) = match left {
+                    Some(left) => (Timespec::from_duration(monotonic()?.saturating_add(left)), REG_WAIT_TS),
+                    None => (Timespec::ZERO, 0),
+                };
+                if ts_flags != 0 {
+                    flags |= ENTER_ABS_TIMER;
+                }
+                // SAFETY: the region's wait argument; the kernel reads it only inside an
+                // enter, and this thread is its only writer.
+                unsafe {
+                    (&raw mut (*self.wait).ts).write(ts);
+                    (&raw mut (*self.wait).flags).write(ts_flags);
+                }
+                self.enter_raw(submit, 1, flags, ptr::null(), size_of::<RegWait>())
             }
         }
+    }
+
+    /// One `io_uring_enter` with the argument raw: `arg`/`size` as the form's flag says (an
+    /// offset into the registered region for `EXT_ARG_REG`, else null).
+    fn enter_raw(&mut self, submit: u32, min: u32, flags: u32, arg: *const c_void, size: usize) -> io::Result<Once<()>> {
         // SAFETY: the ring's descriptor; with `EXT_ARG_REG` the argument is an offset into
         // the registered region (0, its one wait argument), not a pointer.
         let entered = unsafe {
@@ -407,6 +460,23 @@ impl WaitRing {
             code if code == i32::from(linux::ETIME.raw()) => Ok(Once::TimedOut),
             code if code == i32::from(Errno::Busy.raw()) || code == i32::from(Errno::Again.raw()) => Ok(Once::Ready(())),
             error => Err(io::Error::from_raw_os_error(error)),
+        }
+    }
+
+    /// One waiting `io_uring_enter` of the inline form: the argument, [`inline_wait`]'s, by
+    /// pointer (`ENTER_EXT_ARG`, 5.11), its time the length left of the deadline.
+    fn enter_inline(&mut self, submit: u32, left: Option<Duration>) -> io::Result<Once<()>> {
+        let wait = inline_wait(left);
+        // SAFETY: every request pushed names memory that lives until its completion is taken
+        // (the ring's contract, as in `enter_raw`); the argument and what it names live for
+        // the call, which the kernel outlives copying them.
+        let entered = unsafe { linux::io_uring_enter(self.fd.fd(), submit, 1, linux::EnterFlags::GET_EVENTS, Some(&wait)) };
+        match entered {
+            Ok(_) => Ok(Once::Ready(())),
+            Err(Errno::Intr) => Ok(Once::Interrupted),
+            Err(error) if error == linux::ETIME => Ok(Once::TimedOut),
+            Err(Errno::Busy | Errno::Again) => Ok(Once::Ready(())),
+            Err(error) => Err(io::Error::from_raw_os_error(i32::from(error.raw()))),
         }
     }
 
@@ -758,4 +828,86 @@ pub(crate) fn sleep_until(
     clock: &impl Clock,
 ) -> Result<(), WaitError> {
     with_ring(what, |ring| ring.sleep_until(what, deadline, clock))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::atomic::AtomicU32;
+    use std::sync::Arc;
+
+    /// The wait argument's form follows the kernel's answer to registering the wait region:
+    /// the region where it took one, inline where the region is unknown to it (`EINVAL`, an
+    /// opcode or flag it does not have; `ENOSYS`, no such opcode), and any other refusal (a
+    /// filter's `EPERM`) the ring's, named — never a silent downgrade of a refused register.
+    #[test]
+    fn the_wait_arguments_form_follows_the_kernels_answer() {
+        assert_eq!(wait_arg_of(0, 0), Ok(WaitArg::Region));
+        assert_eq!(wait_arg_of(1, libc::EINTR), Ok(WaitArg::Region));
+        assert_eq!(wait_arg_of(-1, libc::EINVAL), Ok(WaitArg::Inline));
+        assert_eq!(wait_arg_of(-1, libc::ENOSYS), Ok(WaitArg::Inline));
+        assert_eq!(wait_arg_of(-1, libc::EPERM), Err(libc::EPERM));
+        assert_eq!(wait_arg_of(-1, libc::EACCES), Err(libc::EACCES));
+        assert_eq!(wait_arg_of(-1, libc::EBADF), Err(libc::EBADF));
+    }
+
+    /// The inline form's argument names what is left of the deadline — a length the kernel
+    /// counts from the enter, not an absolute time (`ABS_TIMER` is 6.12) — under the waiting
+    /// mask, with or without a deadline.
+    #[test]
+    fn the_inline_wait_names_what_is_left_under_the_waiting_mask() {
+        let left = Duration::from_millis(40);
+        let wait = inline_wait(Some(left));
+        assert_eq!(wait.left, Some(Timespec::from_duration(left)));
+        assert_eq!(wait.mask, Some(linux::SigSet(WAITING_MASK)));
+        let endless = inline_wait(None);
+        assert_eq!(endless.left, None);
+        assert_eq!(endless.mask, Some(linux::SigSet(WAITING_MASK)));
+    }
+
+    /// A sleep on this thread's ring ends at its deadline, on the wait-argument form this
+    /// kernel took (the region on 7.3, inline before it).
+    #[test]
+    fn a_ring_sleep_ends_at_its_deadline() {
+        let clock = Monotonic::new();
+        let began = clock.now();
+        sleep_until("a test's sleep", Deadline::after(began, Duration::from_millis(30)), &clock)
+            .expect("the ring sleeps");
+        let slept = clock.now().saturating_sub(began);
+        assert!(slept >= Duration::from_millis(30), "slept {slept:?}");
+        assert!(slept < Duration::from_secs(5), "slept {slept:?}");
+    }
+
+    /// A futex wait through the ring ends at its deadline where nothing wakes it, and a wake
+    /// ends it first where one comes — through the waker's own ring where it has one.
+    #[test]
+    fn a_ring_futex_wait_ends_at_its_deadline_and_at_a_wake() {
+        let clock = Monotonic::new();
+        let word = AtomicU32::new(0);
+        let began = clock.now();
+        let waited = Futexes
+            .wait("a test's park", &word, 0, Some(Deadline::after(began, Duration::from_millis(30))), &clock)
+            .expect("the ring waits");
+        assert_eq!(waited, Waited::Deadline);
+
+        let word = Arc::new(AtomicU32::new(0));
+        let waker = {
+            let word = Arc::clone(&word);
+            std::thread::spawn(move || {
+                // The waker's own ring, so its wake is the ring's `FUTEX_WAKE` where it has one.
+                let clock = Monotonic::new();
+                let _ = sleep_until("the waker's sleep", Deadline::after(clock.now(), Duration::from_millis(1)), &clock);
+                std::thread::sleep(Duration::from_millis(20));
+                word.store(1, Ordering::Release);
+                Futexes.wake(&word);
+            })
+        };
+        let began = clock.now();
+        let waited = Futexes
+            .wait("a test's park", &word, 0, Some(Deadline::after(began, Duration::from_secs(5))), &clock)
+            .expect("the ring waits");
+        assert_eq!(waited, Waited::Ready(()));
+        assert!(clock.now().saturating_sub(began) < Duration::from_secs(5));
+        waker.join().expect("the waker");
+    }
 }
