@@ -80,11 +80,11 @@ mod macos_app {
     use blaze_vt::input::key::{Key, OptionAsAlt, Platform};
     use blaze_vt::terminal::{Effect, Opts as VtOpts, Terminal};
     use objc2::rc::autoreleasepool;
-    use objc2::{MainThreadMarker, MainThreadOnly};
+    use objc2::{MainThreadMarker, MainThreadOnly, sel};
     use objc2_app_kit::{
         NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSCursor, NSEventMask,
-        NSEventModifierFlags, NSEventType, NSPasteboard, NSPasteboardTypeString, NSWindow,
-        NSWindowStyleMask, NSWindowTitleVisibility,
+        NSEventModifierFlags, NSEventType, NSMenu, NSMenuItem, NSPasteboard,
+        NSPasteboardTypeString, NSWindow, NSWindowStyleMask, NSWindowTitleVisibility,
     };
     use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSPoint, NSRect, NSSize, NSString};
     use objc2_metal::MTLCreateSystemDefaultDevice;
@@ -1761,6 +1761,96 @@ mod macos_app {
         }
     }
 
+    /// Install standard macOS Application and Window menus so system shortcuts
+    /// (`Cmd+H` Hide, `Cmd+Opt+H` Hide Others, `Cmd+M` Minimize, `Cmd+Q` Quit,
+    /// `Cmd+`` ` window cycling) behave like a first-class native macOS app.
+    fn install_macos_menu(app: &NSApplication, mtm: MainThreadMarker) {
+        let menubar = NSMenu::new(mtm);
+
+        // 1. Application menu ("blaze-shell").
+        let app_menu_item = NSMenuItem::new(mtm);
+        let app_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("blaze-shell"));
+        // SAFETY: standard AppKit responder selectors (`hide:`, `hideOtherApplications:`,
+        // `unhideAllApplications:`, `terminate:`) are valid Objective-C selectors on NSApplication.
+        unsafe {
+            let hide_item = NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str("Hide blaze-shell"),
+                Some(sel!(hide:)),
+                &NSString::from_str("h"),
+            );
+            app_menu.addItem(&hide_item);
+
+            let hide_others = NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str("Hide Others"),
+                Some(sel!(hideOtherApplications:)),
+                &NSString::from_str("h"),
+            );
+            hide_others.setKeyEquivalentModifierMask(
+                NSEventModifierFlags::Command | NSEventModifierFlags::Option,
+            );
+            app_menu.addItem(&hide_others);
+
+            let show_all = NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str("Show All"),
+                Some(sel!(unhideAllApplications:)),
+                &NSString::from_str(""),
+            );
+            app_menu.addItem(&show_all);
+
+            app_menu.addItem(&NSMenuItem::separatorItem(mtm));
+
+            let quit_item = NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str("Quit blaze-shell"),
+                Some(sel!(terminate:)),
+                &NSString::from_str("q"),
+            );
+            app_menu.addItem(&quit_item);
+        }
+        app_menu_item.setSubmenu(Some(&app_menu));
+        menubar.addItem(&app_menu_item);
+
+        // 2. Window menu ("Window").
+        let win_menu_item = NSMenuItem::new(mtm);
+        let win_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("Window"));
+        // SAFETY: standard AppKit NSWindow/NSApplication selectors.
+        unsafe {
+            let min_item = NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str("Minimize"),
+                Some(sel!(performMiniaturize:)),
+                &NSString::from_str("m"),
+            );
+            win_menu.addItem(&min_item);
+
+            let zoom_item = NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str("Zoom"),
+                Some(sel!(performZoom:)),
+                &NSString::from_str(""),
+            );
+            win_menu.addItem(&zoom_item);
+
+            win_menu.addItem(&NSMenuItem::separatorItem(mtm));
+
+            let front_item = NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str("Bring All to Front"),
+                Some(sel!(arrangeInFront:)),
+                &NSString::from_str(""),
+            );
+            win_menu.addItem(&front_item);
+        }
+        win_menu_item.setSubmenu(Some(&win_menu));
+        menubar.addItem(&win_menu_item);
+
+        app.setMainMenu(Some(&menubar));
+        app.setWindowsMenu(Some(&win_menu));
+    }
+
     pub fn run() {
         let cli = parse_cli();
 
@@ -1779,6 +1869,9 @@ mod macos_app {
         } else {
             NSApplicationActivationPolicy::Regular
         });
+        if cli.screenshot.is_none() {
+            install_macos_menu(&app, mtm);
+        }
         app.finishLaunching();
 
         let init_w = 1140.0;
@@ -1974,6 +2067,7 @@ mod macos_app {
         let mut zoom_changed = false;
         let mut cur_cursor = CursorKind::Arrow;
         let mut last_mouse: Option<(f32, f32)> = None;
+        let mut was_hidden = false;
 
         loop {
             let mut quit = false;
@@ -1999,6 +2093,27 @@ mod macos_app {
                                 .map(|s| s.to_string())
                                 .unwrap_or_default();
                             let lower = chars.to_ascii_lowercase();
+
+                            // Native macOS application & window shortcuts ALWAYS win (never swallowed
+                            // by the composer, Command Palette, Yazi, or active PTY).
+                            if flags.contains(NSEventModifierFlags::Command) {
+                                if !ctrl && !alt && !shift && (key == Key::KeyH || lower == "h") {
+                                    app.hide(None);
+                                    continue;
+                                }
+                                if !ctrl && !alt && !shift && (key == Key::KeyM || lower == "m") {
+                                    window.miniaturize(None);
+                                    continue;
+                                }
+                                if ctrl && !alt && !shift && (key == Key::KeyF || lower == "f") {
+                                    window.toggleFullScreen(None);
+                                    continue;
+                                }
+                                if !ctrl && !alt && !shift && (key == Key::KeyQ || lower == "q") {
+                                    quit = true;
+                                    continue;
+                                }
+                            }
 
                             // 0. `Cmd+Shift+P`: toggle Command Palette, and route keys into it when open.
                             if flags.contains(NSEventModifierFlags::Command) && shift && !ctrl && !alt && key == Key::KeyP {
@@ -2405,7 +2520,14 @@ mod macos_app {
                                         }
                                         continue;
                                     }
-                                    _ => {}
+                                    _ => {
+                                        // Forward unhandled `Cmd+*` shortcuts (e.g. `Cmd+\``,
+                                        // `Cmd+Ctrl+Space`, menu/window manager keys) to AppKit
+                                        // instead of swallowing them or leaking stray characters
+                                        // into the composer, Yazi, or PTY.
+                                        app.sendEvent(&ev);
+                                        continue;
+                                    }
                                 }
                             }
 
@@ -3880,13 +4002,23 @@ mod macos_app {
                 app.updateWindows();
             });
 
-            if quit || !window.isVisible() {
+            // Distinguish user-closed window from `Cmd+H` (app hidden) or `Cmd+M` (minimized to Dock)
+            // so hiding/minimizing keeps the shell alive and repaints cleanly on unhide.
+            let is_hidden_or_min = app.isHidden() || window.isMiniaturized();
+            let closed_by_user = !window.isVisible() && !is_hidden_or_min;
+            if quit || closed_by_user {
                 for pane in panes.values_mut() {
                     if let Some(ap) = pane.active_pty.take() {
                         ap.pty.hangup();
                     }
                 }
                 break;
+            }
+            if is_hidden_or_min {
+                was_hidden = true;
+            } else if was_hidden {
+                was_hidden = false;
+                dirty = true;
             }
 
             // Poll ALL panes in the window so unfocused tiled panes stream git/jobs/PTYs live at 60fps!
@@ -4043,7 +4175,7 @@ mod macos_app {
                 }
             }
 
-            if dirty {
+            if dirty && !is_hidden_or_min {
                 let metrics = fonts.cell_metrics(scale);
                 // Steady non-blinking cursor (matches Ghostty `cursor-style-blink = false`).
                 let cursor_vis = window.isKeyWindow();
