@@ -36,7 +36,11 @@ pub mod terminal;
 mod utf8;
 
 #[cfg(test)]
+mod inventory_tests;
+#[cfg(test)]
 mod parser_tests;
+#[cfg(test)]
+mod screen_tests;
 #[cfg(test)]
 mod terminal_tests;
 #[cfg(test)]

@@ -657,6 +657,20 @@ pub struct Resize {
     pub prompt_redraw: PromptRedraw,
 }
 
+/// What [`Screen::set_semantic_content`] sets (ghostty's `cursorSetSemanticContent` union).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SemanticSet {
+    Output,
+    /// `clear_eol`: the next linefeed puts the cursor back to output (OSC 133 B's default).
+    Input {
+        clear_eol: bool,
+    },
+    /// A prompt; `continuation` marks the row a continuation of the prompt above.
+    Prompt {
+        continuation: bool,
+    },
+}
+
 /// OSC 133's `redraw` option (ghostty's `osc.semantic_prompt.Redraw`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum PromptRedraw {
@@ -1277,6 +1291,23 @@ impl<'a, P: Planted<VtPlant>> Screen<'a, P> {
     pub fn end_hyperlink(&mut self) {
         self.links.release(self.cursor.hyperlink);
         self.cursor.hyperlink = 0;
+    }
+
+    /// What the cursor writes from now on, and the cursor row's prompt mark (OSC 133; ghostty's
+    /// `cursorSetSemanticContent`, Screen.zig:2593).
+    pub fn set_semantic_content(&mut self, to: SemanticSet) {
+        let (content, clear_eol) = match to {
+            SemanticSet::Output => (SemanticContent::Output, false),
+            SemanticSet::Input { clear_eol } => (SemanticContent::Input, clear_eol),
+            SemanticSet::Prompt { continuation } => {
+                let r = self.cursor_r();
+                self.pages.row_mut(r).prompt =
+                    if continuation { RowPrompt::Continuation } else { RowPrompt::Prompt };
+                (SemanticContent::Prompt, false)
+            }
+        };
+        self.cursor.semantic = content;
+        self.cursor.semantic_clear_eol = clear_eol;
     }
 
     // ---- resize ----------------------------------------------------------------------------
