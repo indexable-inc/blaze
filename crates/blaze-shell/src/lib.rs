@@ -128,6 +128,8 @@ mod tests {
             zoom_pct: 100,
             inline_titlebar: true,
             drag: None,
+            cursor_trail: None,
+            text_selection: None,
         });
 
         // Fold toggle hit region must be present, and every block must have a ForkBlock hit target.
@@ -179,6 +181,8 @@ mod tests {
             zoom_pct: 100,
             inline_titlebar: true,
             drag: None,
+            cursor_trail: None,
+            text_selection: None,
         });
         assert!(
             scene_unfolded.total_content_height > h_folded,
@@ -201,6 +205,8 @@ mod tests {
             zoom_pct: 100,
             inline_titlebar: true,
             drag: None,
+            cursor_trail: None,
+            text_selection: None,
         });
         assert!(scene_expanded.total_content_height > h_before_expand);
         assert!(scene_expanded.text_runs.iter().any(|t| t.text == "meta"));
@@ -389,8 +395,11 @@ mod tests {
             assert!(!art.layers.is_empty(), "no vector layers parsed for `{name}`");
         }
         assert_eq!(icon_name_for_file("crates", Some("dir")), "folder_macos");
+        assert_eq!(icon_name_for_file("target", Some("dir")), "folder_target");
         assert_eq!(icon_name_for_file(".github", Some("dir")), "folderGithub_dark");
-        assert_eq!(icon_name_for_file("Cargo.toml", Some("file")), "toml_dark");
+        assert_eq!(icon_name_for_file("Cargo.toml", Some("file")), "cargo_toml");
+        assert_eq!(icon_name_for_file("Cargo.lock", Some("file")), "cargo_lock");
+        assert_eq!(icon_name_for_file("blaze.lock", Some("file")), "blaze_lock");
         assert_eq!(icon_name_for_file("main.rs", Some("file")), "rust_dark");
         assert_eq!(icon_name_for_file(".gitignore", Some("file")), "gitignore");
 
@@ -448,6 +457,8 @@ mod tests {
             zoom_pct: 100,
             inline_titlebar: true,
             drag: None,
+            cursor_trail: None,
+            text_selection: None,
         });
         assert!(
             grid_scene
@@ -468,7 +479,7 @@ mod tests {
             grid_scene
                 .drag_sources
                 .iter()
-                .any(|d| d.payload.insert_text == "Cargo.lock" && d.payload.icon == Some("lockFile_dark")),
+                .any(|d| d.payload.insert_text == "Cargo.lock" && d.payload.icon == Some("cargo_lock")),
             "expected Cargo.lock to be draggable from ls grid"
         );
         assert!(
@@ -491,6 +502,8 @@ mod tests {
             zoom_pct: 100,
             inline_titlebar: true,
             drag: None,
+            cursor_trail: None,
+            text_selection: None,
         });
         assert!(table_scene.total_content_height > grid_scene.total_content_height);
         assert!(
@@ -572,6 +585,161 @@ mod tests {
                 .iter()
                 .any(|c| c.label == "modified" && c.kind == CompletionKind::Column),
             "expected column-aware completion for `ls | sort-by `"
+        );
+    }
+
+    #[test]
+    fn vim_modal_editing_auto_pairs_tab_out_and_atuin_history() {
+        use blaze_vim::{KeyCode as VK, KeyEvent as VE, Mode as VM};
+        use crate::editor::{HistoryEntry, HistoryScope};
+
+        let mut ed = Editor::new();
+
+        // 1. IntelliJ auto-pairing: `{` -> `{|}`, typing inside, `Tab` jumps out!
+        ed.insert_typed("rust ");
+        ed.insert_typed("{");
+        assert_eq!(ed.text, "rust {}");
+        assert_eq!(ed.cursor, 6);
+        ed.insert_typed("(");
+        assert_eq!(ed.text, "rust {()}");
+        assert_eq!(ed.cursor, 7);
+        ed.insert_typed("42");
+        assert_eq!(ed.text, "rust {(42)}");
+        assert!(ed.tab_out());
+        assert_eq!(ed.cursor, 10);
+        assert!(ed.tab_out());
+        assert_eq!(ed.cursor, 11);
+
+        // Overtype closing bracket + empty-pair backspace.
+        ed.clear_line();
+        ed.insert_typed("[");
+        assert_eq!(ed.text, "[]");
+        ed.backspace();
+        assert_eq!(ed.text, "");
+        ed.insert_typed("(");
+        ed.insert_typed(")");
+        assert_eq!(ed.text, "()");
+        assert_eq!(ed.cursor, 2);
+
+        // Selection wrapping.
+        ed.set_text("foo".to_owned());
+        ed.select_all();
+        ed.insert_typed("{");
+        assert_eq!(ed.text, "{foo}");
+
+        // 2. Embedded `blaze-vim` modal editing with shell `i|` pipeline text object + undo.
+        ed.set_text("ls | take 5 | sort-by size".to_owned());
+        ed.cursor = 7; // inside `take 5`
+        ed.feed_vim_key(VE::key(VK::Escape));
+        assert_eq!(ed.vim_mode(), VM::Normal);
+        ed.feed_vim_key(VE::char('c'));
+        ed.feed_vim_key(VE::char('i'));
+        ed.feed_vim_key(VE::char('|'));
+        assert_eq!(ed.vim_mode(), VM::Insert);
+        for ch in "head".chars() {
+            let mut b = [0u8; 4];
+            ed.insert_typed(ch.encode_utf8(&mut b));
+        }
+        assert_eq!(ed.text, "ls | head | sort-by size");
+        assert!(ed.undo());
+        assert_eq!(ed.text, "ls | take 5 | sort-by size");
+
+        // 3. Atuin-class Ctrl+R history palette: fuzzy search + scope cycling.
+        ed.record_history_entry(HistoryEntry {
+            command: "blaze test -p blaze-vim".to_owned(),
+            cwd: "/Volumes/Projects/blaze".to_owned(),
+            git_branch: Some("main".to_owned()),
+            duration_ms: 420,
+            exit_code: 0,
+            timestamp_ns: 1_732_500_000_000_000_000,
+            in_session: true,
+        });
+        ed.record_history_entry(HistoryEntry {
+            command: "git status".to_owned(),
+            cwd: "/tmp/other".to_owned(),
+            git_branch: Some("dev".to_owned()),
+            duration_ms: 12,
+            exit_code: 0,
+            timestamp_ns: 1_732_500_010_000_000_000,
+            in_session: false,
+        });
+        ed.start_reverse_search_in("/Volumes/Projects/blaze");
+        assert_eq!(ed.reverse_search.as_ref().unwrap().scope, HistoryScope::Global);
+        ed.reverse_search_push('b');
+        ed.reverse_search_push('v');
+        ed.reverse_search_push('i');
+        ed.reverse_search_push('m');
+        assert_eq!(
+            ed.reverse_search.as_ref().and_then(|r| r.matched_text.as_deref()),
+            Some("blaze test -p blaze-vim")
+        );
+        ed.reverse_search_cycle_scope();
+        assert_eq!(ed.reverse_search.as_ref().unwrap().scope, HistoryScope::Directory);
+        ed.reverse_search_cycle_scope();
+        assert_eq!(ed.reverse_search.as_ref().unwrap().scope, HistoryScope::Session);
+    }
+
+    #[test]
+    fn path_value_renders_folder_chip_and_text_selection_extracts_lines() {
+        use blaze_sh::PathKind;
+        use crate::view::{TextSelection, compute_text_selection};
+
+        let alloc = Alloc::global();
+        let state = EngineState::new("/Volumes/Projects/blaze", &[], alloc);
+        let mut store = BlockStore::new(state.fork());
+        let prompt = PromptInfo::from_cwd("/Volumes/Projects/blaze", "/Users/dev", 0, 1);
+
+        let pval = Value::path("/Volumes/Projects/blaze", PathKind::Dir, alloc);
+        store.record_block(
+            "pwd".to_owned(),
+            prompt.clone(),
+            state.fork(),
+            state.fork(),
+            1,
+            1,
+            0,
+            BlockBody::Value(pval),
+        );
+
+        let editor = Editor::new();
+        let m = CellMetrics::default();
+        let scene = build_scene(&LayoutInput {
+            store: &store,
+            editor: &editor,
+            prompt: &prompt,
+            viewport_w: 960.0,
+            viewport_h: 640.0,
+            metrics: m,
+            scroll_y: 0.0,
+            cursor_visible: true,
+            now_ns: 1_732_500_000_000_000_000,
+            zoom_pct: 100,
+            inline_titlebar: true,
+            drag: None,
+            cursor_trail: None,
+            text_selection: None,
+        });
+
+        assert!(
+            scene.icon_quads.iter().any(|q| q.name == "folder_macos"),
+            "pwd Value::Path should render macOS folder SVG icon"
+        );
+        assert!(
+            scene.drag_sources.iter().any(|d| d.payload.insert_text == "/Volumes/Projects/blaze"),
+            "pwd Value::Path should be draggable into the prompt"
+        );
+
+        // Universal drag selection across rendered scene text runs extracts the path text.
+        let (rects, extracted) = compute_text_selection(
+            &scene.text_runs,
+            m,
+            TextSelection { anchor: [0.0, 40.0], head: [900.0, 220.0] },
+            34.0,
+        );
+        assert!(!rects.is_empty(), "expected highlight rects for drag selection");
+        assert!(
+            extracted.contains("/Volumes/Projects/blaze"),
+            "expected extracted text to include path, got: {extracted:?}"
         );
     }
 }

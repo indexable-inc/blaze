@@ -436,6 +436,23 @@ impl StatusCounts {
     }
 }
 
+/// Category of a changed file reported in [`PromptStatus::changed_samples`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ChangeKind {
+    Modified,
+    Untracked,
+    Deleted,
+    Staged,
+    Conflicted,
+}
+
+/// One bounded sample of an uncommitted file in the working tree or index.
+#[derive(PartialEq, Eq, Debug)]
+pub struct ChangedSample<'a> {
+    pub path: AString<'a>,
+    pub kind: ChangeKind,
+}
+
 /// Complete Starship-class summary of a Git repository snapshot.
 #[derive(PartialEq, Eq, Debug)]
 pub struct PromptStatus<'a> {
@@ -446,6 +463,8 @@ pub struct PromptStatus<'a> {
     pub counts: StatusCounts,
     pub worktree: WorktreeKind,
     pub truncated: Truncated,
+    /// Up to 24 representative uncommitted file paths (modified, untracked, deleted, conflicted).
+    pub changed_samples: blaze_own::AVec<'a, ChangedSample<'a>>,
 }
 
 /// A typed refusal naming the git file, byte offset (when applicable), and rule violated.

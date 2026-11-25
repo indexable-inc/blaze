@@ -43,6 +43,10 @@ pub enum BlockBody {
         stdout: String,
         value: Value<'static>,
     },
+    /// A command running asynchronously while the prompt is already live on the next line.
+    Running {
+        label: String,
+    },
 }
 
 /// One submitted command and its structured output card.

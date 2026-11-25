@@ -75,6 +75,8 @@ pub enum HitAction {
     ToggleTableView(BlockId),
     ToggleExpandCell { block: BlockId, row: usize, col: usize },
     SelectCompletion(usize),
+    SelectHistory(usize),
+    CycleHistoryScope,
     ResetZoom,
 }
 
@@ -109,6 +111,197 @@ pub struct ActiveDrag {
     pub payload: DragPayload,
 }
 
+/// Active Ghostty-style cursor sweep trail (`DURATION = 0.2s`, `TRAIL_LENGTH = 0.5`, `EaseOutCubic`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CursorTrail {
+    pub prev_rect: [f32; 4],
+    pub progress: f32,
+}
+
+/// Active mouse drag-selection across rendered output/terminal text.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextSelection {
+    pub anchor: [f32; 2],
+    pub head: [f32; 2],
+}
+
+/// Compute highlight rectangles and extracted plain text for `sel` over `runs` (all in logical
+/// screen coordinates). Runs above `min_y` (such as the top titlebar) are ignored.
+pub fn compute_text_selection(
+    runs: &[TextRun],
+    m: CellMetrics,
+    sel: TextSelection,
+    min_y: f32,
+) -> (Vec<[f32; 4]>, String) {
+    if m.cw <= 0.0 || m.ch <= 0.0 {
+        return (Vec::new(), String::new());
+    }
+    let mut eligible: Vec<&TextRun> = runs
+        .iter()
+        .filter(|r| !r.text.is_empty() && r.y + m.ch > min_y)
+        .collect();
+    if eligible.is_empty() {
+        return (Vec::new(), String::new());
+    }
+    eligible.sort_by(|a, b| {
+        a.y.partial_cmp(&b.y)
+            .unwrap_or(core::cmp::Ordering::Equal)
+            .then_with(|| a.x.partial_cmp(&b.x).unwrap_or(core::cmp::Ordering::Equal))
+    });
+
+    // Group runs into visual lines by vertical proximity.
+    let mut lines: Vec<(f32, Vec<&TextRun>)> = Vec::new();
+    for run in eligible {
+        if let Some((ly, row)) = lines.last_mut()
+            && (run.y - *ly).abs() <= m.ch * 0.45
+        {
+            row.push(run);
+        } else {
+            lines.push((run.y, vec![run]));
+        }
+    }
+    for (_, row) in &mut lines {
+        row.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(core::cmp::Ordering::Equal));
+    }
+
+    // Normalize anchor/head into top-to-bottom, left-to-right order.
+    let same_row = (sel.anchor[1] - sel.head[1]).abs() <= m.ch * 0.55;
+    let (start, end) = if same_row {
+        if sel.anchor[0] <= sel.head[0] {
+            (sel.anchor, sel.head)
+        } else {
+            (sel.head, sel.anchor)
+        }
+    } else if sel.anchor[1] < sel.head[1] {
+        (sel.anchor, sel.head)
+    } else {
+        (sel.head, sel.anchor)
+    };
+
+    // Find visual line indices intersecting [start_y, end_y].
+    let line_for_y = |py: f32| -> Option<usize> {
+        lines.iter().position(|(ly, _)| py >= *ly - 2.0 && py <= *ly + m.ch + 2.0)
+    };
+    let first_line = line_for_y(start[1])
+        .or_else(|| lines.iter().position(|(ly, _)| *ly + m.ch >= start[1]));
+    let last_line = line_for_y(end[1])
+        .or_else(|| lines.iter().rposition(|(ly, _)| *ly <= end[1]));
+    let (Some(l0), Some(l1)) = (first_line, last_line) else {
+        return (Vec::new(), String::new());
+    };
+    if l0 > l1 {
+        return (Vec::new(), String::new());
+    }
+
+    let mut rects = Vec::new();
+    let mut out_lines: Vec<String> = Vec::new();
+
+    for (li, (ly, row)) in lines.iter().enumerate().take(l1 + 1).skip(l0) {
+        let row_x0 = if li == l0 { start[0] } else { f32::NEG_INFINITY };
+        let row_x1 = if li == l1 { end[0] } else { f32::INFINITY };
+
+        let mut line_txt = String::new();
+        let mut prev_end_x: Option<f32> = None;
+        let mut rect_x0: Option<f32> = None;
+        let mut rect_x1: f32 = 0.0;
+
+        for run in row {
+            let nchars = run.text.chars().count();
+            let run_x0 = run.x;
+            let run_x1 = run.x + nchars as f32 * m.cw;
+            if run_x1 <= row_x0 || run_x0 >= row_x1 {
+                continue;
+            }
+            let c0 = if row_x0 <= run_x0 {
+                0
+            } else {
+                (((row_x0 - run_x0) / m.cw).floor().max(0.0) as usize).min(nchars)
+            };
+            let c1 = if row_x1 >= run_x1 {
+                nchars
+            } else {
+                (((row_x1 - run_x0) / m.cw).ceil().max(0.0) as usize).min(nchars)
+            };
+            if c0 >= c1 {
+                continue;
+            }
+            let sx0 = run_x0 + c0 as f32 * m.cw;
+            let sx1 = run_x0 + c1 as f32 * m.cw;
+            if let Some(pe) = prev_end_x
+                && sx0 - pe >= m.cw * 0.65
+            {
+                line_txt.push(' ');
+            }
+            for ch in run.text.chars().skip(c0).take(c1 - c0) {
+                line_txt.push(ch);
+            }
+            prev_end_x = Some(sx1);
+            rect_x0 = Some(rect_x0.map_or(sx0, |a| a.min(sx0)));
+            rect_x1 = rect_x1.max(sx1);
+        }
+
+        if let Some(rx0) = rect_x0
+            && rect_x1 > rx0
+        {
+            rects.push([rx0, *ly, rect_x1, *ly + m.ch]);
+            out_lines.push(line_txt);
+        }
+    }
+
+    (rects, out_lines.join("\n"))
+}
+
+/// Build a [`TextSelection`] covering the word or full visual line at `(x, y)` (for double/triple click).
+pub fn select_at_point(
+    runs: &[TextRun],
+    m: CellMetrics,
+    x: f32,
+    y: f32,
+    whole_line: bool,
+    min_y: f32,
+) -> Option<TextSelection> {
+    if m.cw <= 0.0 || m.ch <= 0.0 || y < min_y {
+        return None;
+    }
+    let mut row: Vec<&TextRun> = runs
+        .iter()
+        .filter(|r| !r.text.is_empty() && y >= r.y - 2.0 && y <= r.y + m.ch + 2.0)
+        .collect();
+    if row.is_empty() {
+        return None;
+    }
+    row.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(core::cmp::Ordering::Equal));
+    let ly = row[0].y + m.ch * 0.5;
+    if whole_line {
+        let min_x = row.first()?.x;
+        let last = row.last()?;
+        let max_x = last.x + last.text.chars().count() as f32 * m.cw;
+        return Some(TextSelection { anchor: [min_x, ly], head: [max_x, ly] });
+    }
+    for run in row {
+        let chars: Vec<char> = run.text.chars().collect();
+        let run_x1 = run.x + chars.len() as f32 * m.cw;
+        if x >= run.x - m.cw * 0.25 && x <= run_x1 + m.cw * 0.25 && !chars.is_empty() {
+            let idx = (((x - run.x) / m.cw).floor().max(0.0) as usize).min(chars.len() - 1);
+            let is_word = |c: char| !c.is_whitespace() && !matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'' | ',' | ';');
+            let want_word = is_word(chars[idx]);
+            let mut s = idx;
+            while s > 0 && is_word(chars[s - 1]) == want_word {
+                s -= 1;
+            }
+            let mut e = idx + 1;
+            while e < chars.len() && is_word(chars[e]) == want_word {
+                e += 1;
+            }
+            return Some(TextSelection {
+                anchor: [run.x + s as f32 * m.cw, ly],
+                head: [run.x + e as f32 * m.cw, ly],
+            });
+        }
+    }
+    None
+}
+
 /// Complete layered frame output emitted by [`crate::layout::build_scene`].
 #[derive(Clone, Debug)]
 pub struct Scene {
@@ -136,6 +329,8 @@ pub struct Scene {
     pub composer_rect: HitRect,
     /// Logical origin `[x, y]` of character `(0, 0)` inside the composer input hotbar.
     pub composer_text_origin: [f32; 2],
+    /// Logical rect `[x0, y0, x1, y1]` of the live cursor in this frame (feeds Ghostty sweep trail).
+    pub cursor_rect: Option<[f32; 4]>,
     /// Total height of the scrollable block column in logical pixels.
     pub total_content_height: f32,
     /// Height of the visible scroll viewport between top bar and input bar.
@@ -165,6 +360,7 @@ impl Scene {
             drag_sources: Vec::new(),
             composer_rect: HitRect::new(0.0, 0.0, 0.0, 0.0),
             composer_text_origin: [0.0, 0.0],
+            cursor_rect: None,
             total_content_height: 0.0,
             scroll_viewport_height: 0.0,
             input_top_y: 0.0,

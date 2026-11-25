@@ -45,6 +45,6 @@ pub use protocol::{
 pub use span::{LineCol, Span, line_col};
 pub use state::{DefData, EngineState, RustCell, VarSlot};
 pub use value::{
-    Bytes, ClosureData, ColDisplay, DateTime, Nanos, PathMember, RangeVal, Record, Table, Value,
-    format_relative_time,
+    Bytes, ClosureData, ColDisplay, DateTime, Nanos, PathKind, PathMember, RangeVal, Record, Table,
+    Value, format_relative_time,
 };

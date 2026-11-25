@@ -130,6 +130,7 @@ pub fn value_color(val: &Value<'_>) -> [f32; 4] {
         Value::Bool(false) => INK_3,
         Value::Int(_) | Value::Float(_) => INK_1,
         Value::String(_) => INK_1,
+        Value::Path { .. } => PROMPT_DIR,
         Value::Size(_) => INK_2,
         Value::Duration(_) => INK_2,
         Value::Date(_) => INK_3,

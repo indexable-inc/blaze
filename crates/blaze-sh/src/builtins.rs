@@ -1354,7 +1354,7 @@ impl<'a> EvalArgs<'a> {
 
 fn value_as_word<'a>(v: &Value<'a>, alloc: Alloc<'a>) -> Option<AString<'a>> {
     match v {
-        Value::String(s) => Some(AString::from_str_in(s.as_ref(), alloc)),
+        Value::String(s) | Value::Path { path: s, .. } => Some(AString::from_str_in(s.as_ref(), alloc)),
         Value::CellPath(path) => {
             let mut out = AString::new_in(alloc);
             for (i, m) in path.iter().enumerate() {
@@ -1501,7 +1501,7 @@ pub(crate) fn dispatch_builtin<'a>(
         // FS & OS
         "ls" => builtin_ls(eval, args, span)?,
         "cd" => builtin_cd(eval, args, span)?,
-        "pwd" => Value::String(eval.state().cwd.share()),
+        "pwd" => Value::Path { path: eval.state().cwd.share(), kind: crate::value::PathKind::Dir },
         "open" => builtin_open(eval, args, span)?,
         "save" => builtin_save(eval, args, input, span)?,
         "cp" => builtin_cp(eval, args, span)?,

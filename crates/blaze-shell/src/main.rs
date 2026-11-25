@@ -17,7 +17,10 @@ fn headless_repl() {
     use std::io::{self, BufRead, Write};
 
     use blaze_own::Alloc;
-    use blaze_sh::{EngineState, Value};
+    use blaze_sh::{
+        Bytes, ColDisplay, DateTime, EngineState, ErrorKind, Nanos, PathKind, Record, ShellError,
+        Span, Table, Value,
+    };
     use blaze_shell::host::run_command_line;
 
     let alloc = Alloc::global();
@@ -59,11 +62,19 @@ fn headless_repl() {
 #[cfg(target_os = "macos")]
 mod macos_app {
     use std::path::PathBuf;
+    use std::sync::mpsc;
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     use blaze_own::Alloc;
-    use blaze_sh::{EngineState, Value};
+    use blaze_sh::{
+        Bytes, ColDisplay, DateTime, EngineState, ErrorKind, Nanos, PathKind, Record, ShellError,
+        Span, Table, Value,
+    };
     use blaze_ui::shaders::ViewportUniform;
+    use blaze_vim::{
+        KeyCode as VimKeyCode, KeyEvent as VimKeyEvent, Mode as VimMode, Mods as VimMods,
+        Outcome as VimOutcome,
+    };
     use blaze_vt::input::key::{Key, OptionAsAlt, Platform};
     use blaze_vt::terminal::{Effect, Opts as VtOpts, Terminal};
     use objc2::rc::autoreleasepool;
@@ -78,9 +89,9 @@ mod macos_app {
     use objc2_quartz_core::CAMetalLayer;
 
     use blaze_shell::blocks::{BlockBody, BlockId, BlockStore};
-    use blaze_shell::editor::Editor;
+    use blaze_shell::editor::{Editor, HistoryEntry};
     use blaze_shell::font::Fonts;
-    use blaze_shell::host::{InteractiveSpawn, run_command_line};
+    use blaze_shell::host::{InteractiveSpawn, RustCellMeta, run_command_line};
     use blaze_shell::keys;
     use blaze_shell::layout::{LayoutInput, TOP_BAR_H, build_scene, layout_fullscreen_terminal};
     use blaze_shell::prompt::{GitStatusWorker, PromptInfo};
@@ -88,16 +99,21 @@ mod macos_app {
     use blaze_shell::render::{FrameDraw, PIXEL_FORMAT, Renderer};
     use blaze_shell::rust_cell;
     use blaze_shell::svg_icons::IconAtlas;
-    use blaze_shell::view::{ActiveDrag, DragPayload, HitAction, Scene};
+    use blaze_shell::view::{
+        ActiveDrag, CursorTrail, DragPayload, HitAction, Scene, TextSelection,
+        compute_text_selection, select_at_point,
+    };
 
     const FONT_POINTS: f64 = 13.0;
     const MIN_FONT_POINTS: f64 = 8.5;
     const MAX_FONT_POINTS: f64 = 28.0;
     const ZOOM_STEP_POINTS: f64 = 1.5;
+    const CURSOR_TRAIL_SECS: f32 = 0.20;
 
     struct CliOpts {
         demo: bool,
         demo_popup: bool,
+        demo_history: bool,
         scroll_bottom: bool,
         screenshot: Option<PathBuf>,
     }
@@ -105,6 +121,7 @@ mod macos_app {
     fn parse_cli() -> CliOpts {
         let mut demo = false;
         let mut demo_popup = false;
+        let mut demo_history = false;
         let mut scroll_bottom = false;
         let mut screenshot = None;
         let mut args = std::env::args().skip(1);
@@ -115,6 +132,10 @@ mod macos_app {
                     demo = true;
                     demo_popup = true;
                 }
+                "--demo-history" => {
+                    demo = true;
+                    demo_history = true;
+                }
                 "--scroll-bottom" => scroll_bottom = true,
                 "--screenshot" => {
                     if let Some(p) = args.next() {
@@ -124,7 +145,7 @@ mod macos_app {
                 _ => {}
             }
         }
-        CliOpts { demo, demo_popup, scroll_bottom, screenshot }
+        CliOpts { demo, demo_popup, demo_history, scroll_bottom, screenshot }
     }
 
     struct PendingDrag {
@@ -165,7 +186,7 @@ mod macos_app {
         scene: &Scene,
         alt_screen: bool,
         dragging: bool,
-        selecting_composer: bool,
+        selecting_text: bool,
         x: f32,
         y: f32,
         w: f32,
@@ -177,7 +198,7 @@ mod macos_app {
         if dragging {
             return CursorKind::ClosedHand;
         }
-        if alt_screen || selecting_composer {
+        if alt_screen || selecting_text {
             return CursorKind::IBeam;
         }
         if scene.hit_test(x, y).is_some() {
@@ -189,6 +210,17 @@ mod macos_app {
         if scene.drag_source_at(x, y).is_some() {
             return CursorKind::OpenHand;
         }
+        if y >= TOP_BAR_H
+            && scene.text_runs.iter().any(|r| {
+                !r.text.is_empty()
+                    && y >= r.y - 1.0
+                    && y <= r.y + 18.0
+                    && x >= r.x
+                    && x <= r.x + r.text.chars().count() as f32 * 9.0
+            })
+        {
+            return CursorKind::IBeam;
+        }
         CursorKind::Arrow
     }
 
@@ -196,6 +228,236 @@ mod macos_app {
         block_id: BlockId,
         pty: Pty,
         started: Instant,
+    }
+
+    /// Lossless `Send` mirror of `blaze_sh::Value` so background command threads can return
+    /// typed tables, records, paths, sizes, dates, and spanned errors to the UI thread safely.
+    enum SendValue {
+        Nothing,
+        Bool(bool),
+        Int(i64),
+        Float(f64),
+        Size(Bytes),
+        Duration(Nanos),
+        Date(DateTime),
+        Range(blaze_sh::RangeVal),
+        String(String),
+        Path(String, PathKind),
+        Binary(Vec<u8>),
+        List(Vec<SendValue>),
+        Record(Vec<(String, SendValue)>),
+        Table {
+            columns: Vec<String>,
+            displays: Vec<ColDisplay>,
+            default_grid: bool,
+            rows: Vec<Vec<SendValue>>,
+        },
+        Error {
+            kind: ErrorKind,
+            span: Span,
+            message: String,
+            help: Option<String>,
+        },
+    }
+
+    impl SendValue {
+        fn from_value(v: &Value<'_>) -> Self {
+            match v {
+                Value::Nothing => Self::Nothing,
+                Value::Bool(b) => Self::Bool(*b),
+                Value::Int(n) => Self::Int(*n),
+                Value::Float(f) => Self::Float(*f),
+                Value::Size(b) => Self::Size(*b),
+                Value::Duration(d) => Self::Duration(*d),
+                Value::Date(dt) => Self::Date(*dt),
+                Value::String(s) => Self::String(s.as_ref().to_owned()),
+                Value::Path { path, kind } => Self::Path(path.as_ref().to_owned(), *kind),
+                Value::Binary(b) => Self::Binary(b.as_ref().to_vec()),
+                Value::List(xs) => Self::List(xs.iter().map(Self::from_value).collect()),
+                Value::Record(rec) => Self::Record(
+                    rec.iter()
+                        .map(|(k, val)| (k.to_owned(), Self::from_value(val)))
+                        .collect(),
+                ),
+                Value::Table(t) => {
+                    let columns = t.columns.iter().map(|c| c.as_ref().to_owned()).collect();
+                    let displays = t.col_display.iter().copied().collect();
+                    let mut rows = Vec::with_capacity(t.nrows());
+                    for r in 0..t.nrows() {
+                        let mut row = Vec::with_capacity(t.ncols());
+                        for c in 0..t.ncols() {
+                            row.push(
+                                t.cell(r, c)
+                                    .map(Self::from_value)
+                                    .unwrap_or(Self::Nothing),
+                            );
+                        }
+                        rows.push(row);
+                    }
+                    Self::Table { columns, displays, default_grid: t.default_grid, rows }
+                }
+                Value::Error(e) => Self::Error {
+                    kind: e.kind,
+                    span: e.span,
+                    message: e.message.as_str().to_owned(),
+                    help: e.help.as_ref().map(|h| h.as_str().to_owned()),
+                },
+                Value::Range(r) => Self::Range(*r),
+                Value::Closure(_) | Value::CellPath(_) => {
+                    let mut s = String::new();
+                    let _ = v.format_cell(&mut s);
+                    Self::String(s)
+                }
+            }
+        }
+
+        fn into_value(self, alloc: Alloc<'static>) -> Value<'static> {
+            match self {
+                Self::Nothing => Value::Nothing,
+                Self::Bool(b) => Value::Bool(b),
+                Self::Int(n) => Value::Int(n),
+                Self::Float(f) => Value::Float(f),
+                Self::Size(b) => Value::Size(b),
+                Self::Duration(d) => Value::Duration(d),
+                Self::Date(dt) => Value::Date(dt),
+                Self::Range(r) => Value::Range(r),
+                Self::String(s) => Value::string(&s, alloc),
+                Self::Path(p, kind) => Value::path(&p, kind, alloc),
+                Self::Binary(b) => Value::binary(&b, alloc),
+                Self::List(xs) => {
+                    let mut out = blaze_sh::PVec::new(alloc);
+                    for x in xs {
+                        out.push(x.into_value(alloc));
+                    }
+                    Value::List(out)
+                }
+                Self::Record(entries) => {
+                    let mut rec = Record::new(alloc);
+                    for (k, v) in entries {
+                        rec.insert_str(&k, v.into_value(alloc));
+                    }
+                    Value::Record(rec)
+                }
+                Self::Table { columns, displays, default_grid, rows } => {
+                    let col_refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+                    let mut t = Table::from_col_names(&col_refs, alloc);
+                    t.default_grid = default_grid;
+                    for (col, disp) in columns.iter().zip(displays.into_iter()) {
+                        t.set_col_display(col, disp);
+                    }
+                    for row in rows {
+                        let vals: Vec<Value<'static>> =
+                            row.into_iter().map(|v| v.into_value(alloc)).collect();
+                        t.push_row_values(&vals);
+                    }
+                    Value::Table(t)
+                }
+                Self::Error { kind, span, message, help } => {
+                    let mut err = ShellError::new(kind, span, &message, alloc);
+                    if let Some(h) = help {
+                        err = err.with_help(&h, alloc);
+                    }
+                    Value::Error(blaze_own::Rc::new_in(err, alloc))
+                }
+            }
+        }
+    }
+
+    struct AsyncJobDone {
+        block_id: BlockId,
+        source: String,
+        cwd: String,
+        branch: Option<String>,
+        duration_ms: u64,
+        exit_code: i32,
+        streamed_lines: Vec<String>,
+        rust_meta: Option<RustCellMeta>,
+        interactive_spawn: Option<InteractiveSpawn>,
+        value: SendValue,
+        new_rust_cell: Option<String>,
+    }
+
+    /// True for commands that may take noticeable time (`rust { ... }`, `:rs`, external binaries
+    /// like `blaze`, `cargo`, `git`, `sleep`, etc.) so they run asynchronously while the next
+    /// prompt line appears immediately!
+    fn should_run_async(trimmed: &str) -> bool {
+        if trimmed.starts_with("rust") || trimmed.starts_with(":rs") {
+            return true;
+        }
+        let first = trimmed
+            .split(['|', ';', '\n'])
+            .next()
+            .unwrap_or("")
+            .split_whitespace()
+            .next()
+            .unwrap_or("");
+        if first.is_empty()
+            || first.starts_with('^')
+            || first.starts_with("./")
+            || first.starts_with('/')
+        {
+            return true;
+        }
+        // Fast state-mutating or instant in-process builtins stay synchronous (<1ms) so
+        // `cd`, `let`, `def`, `alias`, `ls`, `pwd`, `sys`, `$_` pipelines update immediately.
+        let instant_or_stateful = matches!(
+            first,
+            "let" | "mut" | "def" | "alias" | "cd" | "pwd" | "ls" | "sys" | "env" | "echo"
+                | "print" | "clear" | "help" | "fork" | "open" | "which" | "if" | "for"
+                | "while" | "match" | "try" | "ps"
+        ) || first.starts_with('$')
+            || first.starts_with('[')
+            || first.starts_with('{')
+            || first.starts_with('(')
+            || first.starts_with('"')
+            || first.starts_with('\'')
+            || first.chars().next().is_some_and(|c| c.is_ascii_digit());
+        !instant_or_stateful && !blaze_sh::is_builtin(first)
+    }
+
+    fn copy_to_pasteboard(text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let pb = NSPasteboard::generalPasteboard();
+        // SAFETY: valid static AppKit pasteboard type.
+        let t = unsafe { NSPasteboardTypeString };
+        pb.clearContents();
+        pb.setString_forType(&NSString::from_str(text), t);
+    }
+
+    fn to_vim_key(key: Key, text: &str, ctrl: bool, alt: bool, shift: bool) -> Option<VimKeyEvent> {
+        let mods = VimMods { ctrl, alt, shift };
+        let code = match key {
+            Key::Escape => VimKeyCode::Escape,
+            Key::Enter | Key::NumpadEnter => VimKeyCode::Enter,
+            Key::Backspace => VimKeyCode::Backspace,
+            Key::Delete => VimKeyCode::Delete,
+            Key::ArrowLeft => VimKeyCode::Left,
+            Key::ArrowRight => VimKeyCode::Right,
+            Key::ArrowUp => VimKeyCode::Up,
+            Key::ArrowDown => VimKeyCode::Down,
+            Key::Home => VimKeyCode::Home,
+            Key::End => VimKeyCode::End,
+            Key::Tab => VimKeyCode::Tab,
+            _ => {
+                if ctrl {
+                    let ch = match key {
+                        Key::KeyR => 'r',
+                        Key::BracketLeft => '[',
+                        _ => return None,
+                    };
+                    VimKeyCode::Char(ch)
+                } else {
+                    let ch = text.chars().next()?;
+                    if ch.is_control() {
+                        return None;
+                    }
+                    VimKeyCode::Char(ch)
+                }
+            }
+        };
+        Some(VimKeyEvent { code, mods })
     }
 
     struct ShellApp {
@@ -208,6 +470,10 @@ mod macos_app {
         auto_scroll_bottom: bool,
         active_pty: Option<ActivePty>,
         last_scene: Scene,
+        job_tx: mpsc::Sender<AsyncJobDone>,
+        job_rx: mpsc::Receiver<AsyncJobDone>,
+        running_jobs: usize,
+        output_seq: u64,
     }
 
     impl ShellApp {
@@ -228,6 +494,8 @@ mod macos_app {
             git_worker.request(&cwd);
             let mut editor = Editor::new();
             editor.load_user_abbreviations(&home);
+            editor.load_persistent_history(&home);
+            let (job_tx, job_rx) = mpsc::channel();
 
             Self {
                 store: BlockStore::new(state),
@@ -239,7 +507,24 @@ mod macos_app {
                 auto_scroll_bottom: false,
                 active_pty: None,
                 last_scene: Scene::new(),
+                job_tx,
+                job_rx,
+                running_jobs: 0,
+                output_seq: 0,
             }
+        }
+
+        /// Bind `$_`, `$last`, and `$_<seq>` in `state` so any subsequent command can pipe or
+        /// inspect previous outputs with zero copying (O(1) CoW persistent values!).
+        fn bind_output_refs(&mut self, state: &mut EngineState<'static>, val: &Value<'static>) {
+            if matches!(val, Value::Nothing | Value::Error(_)) {
+                return;
+            }
+            self.output_seq += 1;
+            state.set_var("_", val.clone(), false);
+            state.set_var("last", val.clone(), false);
+            let numbered = format!("_{}", self.output_seq);
+            state.set_var(&numbered, val.clone(), false);
         }
 
         fn refresh_prompt(&mut self, last_exit: i32, last_duration_ms: u64) {
@@ -273,7 +558,14 @@ mod macos_app {
             self.editor.refresh_assist(&st, &cols, open_popup);
         }
 
-        fn submit_command(&mut self, src: &str, term_cols: u16, term_rows: u16, cell_px: (u32, u32)) {
+        fn submit_command(
+            &mut self,
+            src: &str,
+            term_cols: u16,
+            term_rows: u16,
+            cell_px: (u32, u32),
+            allow_async: bool,
+        ) {
             let trimmed = src.trim();
             if trimmed.is_empty() {
                 return;
@@ -287,8 +579,85 @@ mod macos_app {
             let state_before = self.store.active_state().fork();
             let prompt_snap = self.prompt.clone();
             let started_ms = now_ms();
-            let t0 = Instant::now();
 
+            // Non-blocking background execution for `rust { ... }` cells and external commands:
+            // immediately record a live `Running` block and return control to the next prompt line!
+            if allow_async && should_run_async(trimmed) {
+                let label = if trimmed.starts_with("rust") || trimmed.starts_with(":rs") {
+                    "blaze run…".to_owned()
+                } else {
+                    "running…".to_owned()
+                };
+                let block_id = self.store.record_block(
+                    trimmed.to_owned(),
+                    prompt_snap.clone(),
+                    state_before.fork(),
+                    state_before.fork(),
+                    started_ms,
+                    0,
+                    0,
+                    BlockBody::Running { label },
+                );
+                self.running_jobs += 1;
+                self.auto_scroll_bottom = true;
+
+                let tx = self.job_tx.clone();
+                let src_owned = trimmed.to_owned();
+                let cwd = prompt_snap.cwd.clone();
+                let branch = prompt_snap.git_branch.clone();
+                // Snapshot lightweight cwd/env/vars/rust_cells to run on worker thread.
+                let env_owned: Vec<(String, String)> = {
+                    let mut out = Vec::new();
+                    state_before.env.for_each(&mut |k, v| {
+                        out.push((k.as_ref().to_owned(), v.as_ref().to_owned()));
+                    });
+                    out
+                };
+                let prior_rust_cells: Vec<String> = state_before
+                    .rust_cells
+                    .iter()
+                    .map(|c| c.code.as_ref().to_owned())
+                    .collect();
+                let _ = std::thread::Builder::new()
+                    .name("blaze-shell-job".to_owned())
+                    .spawn(move || {
+                        let t0 = Instant::now();
+                        let alloc = Alloc::global();
+                        let env_refs: Vec<(&str, &str)> = env_owned
+                            .iter()
+                            .map(|(k, v)| (k.as_str(), v.as_str()))
+                            .collect();
+                        let mut st = EngineState::new(&cwd, &env_refs, alloc);
+                        for cell_src in prior_rust_cells {
+                            st.push_rust_cell(&cell_src);
+                        }
+                        let prior_count = st.rust_cells.len();
+                        let res = run_command_line(&src_owned, st, true);
+                        let duration_ms = t0.elapsed().as_millis() as u64;
+                        let new_rust_cell = if res.outcome.state.rust_cells.len() > prior_count {
+                            res.outcome.state.rust_cells.last().map(|c| c.code.as_ref().to_owned())
+                        } else {
+                            None
+                        };
+                        let value = SendValue::from_value(&res.outcome.value);
+                        let _ = tx.send(AsyncJobDone {
+                            block_id,
+                            source: src_owned,
+                            cwd,
+                            branch,
+                            duration_ms,
+                            exit_code: res.outcome.exit_code,
+                            streamed_lines: res.streamed_lines,
+                            rust_meta: res.rust_meta,
+                            interactive_spawn: res.interactive_spawn,
+                            value,
+                            new_rust_cell,
+                        });
+                    });
+                return;
+            }
+
+            let t0 = Instant::now();
             let res = run_command_line(trimmed, state_before.fork(), true);
             let duration_ms = t0.elapsed().as_millis() as u64;
 
@@ -308,33 +677,13 @@ mod macos_app {
             }
 
             let exit_code = res.outcome.exit_code;
-            let state_after = res.outcome.state;
-            let body = if let Some(meta) = res.rust_meta {
-                if let Value::Error(e) = &res.outcome.value {
-                    BlockBody::Error { err: (**e).clone() }
-                } else {
-                    BlockBody::RustCell {
-                        code: meta.code,
-                        compile_ms: meta.compile_ms,
-                        run_ms: meta.run_ms,
-                        stdout: meta.stdout,
-                        value: res.outcome.value,
-                    }
-                }
-            } else if let Value::Error(e) = &res.outcome.value {
-                BlockBody::Error { err: (**e).clone() }
-            } else if !res.streamed_lines.is_empty() {
-                BlockBody::StreamAndValue {
-                    lines: res.streamed_lines,
-                    value: res.outcome.value,
-                }
-            } else {
-                BlockBody::Value(res.outcome.value)
-            };
+            let mut state_after = res.outcome.state;
+            self.bind_output_refs(&mut state_after, &res.outcome.value);
+            let body = body_from_result(res.rust_meta, res.streamed_lines, res.outcome.value);
 
             let block_id = self.store.record_block(
                 trimmed.to_owned(),
-                prompt_snap,
+                prompt_snap.clone(),
                 state_before,
                 state_after.fork(),
                 started_ms,
@@ -343,12 +692,80 @@ mod macos_app {
                 body,
             );
             self.store.set_active_state(state_after);
+            self.editor.record_history_entry(HistoryEntry {
+                command: trimmed.to_owned(),
+                cwd: prompt_snap.cwd,
+                git_branch: prompt_snap.git_branch,
+                duration_ms,
+                exit_code,
+                timestamp_ns: now_ns(),
+                in_session: true,
+            });
 
             if let Some(label) = res.forked_label {
                 let _ = self.store.fork_from_block(block_id, Some(&label));
             }
             self.refresh_prompt(exit_code, duration_ms);
             self.auto_scroll_bottom = true;
+        }
+
+        fn poll_async_jobs(&mut self, cols: u16, rows: u16, cell_px: (u32, u32)) -> bool {
+            let mut updated = false;
+            while let Ok(done) = self.job_rx.try_recv() {
+                self.running_jobs = self.running_jobs.saturating_sub(1);
+                updated = true;
+
+                if let Some(spawn) = done.interactive_spawn {
+                    // Full-screen / interactive PTY command: upgrade to a live PTY!
+                    let state_before = self
+                        .store
+                        .block(done.block_id)
+                        .map(|b| b.state_before.fork())
+                        .unwrap_or_else(|| self.store.active_state().fork());
+                    let prompt_snap = self.prompt.clone();
+                    self.spawn_pty_block(
+                        done.source,
+                        prompt_snap,
+                        state_before.fork(),
+                        state_before,
+                        now_ms(),
+                        spawn,
+                        cols,
+                        rows,
+                        cell_px,
+                    );
+                    continue;
+                }
+
+                let alloc = Alloc::global();
+                let exit_code = done.exit_code;
+                let val = done.value.into_value(alloc);
+                let val_for_ref = val.clone();
+                let body = body_from_result(done.rust_meta, done.streamed_lines, val);
+                let mut active = self.store.active_state().fork();
+                self.bind_output_refs(&mut active, &val_for_ref);
+                if let Some(cell_code) = done.new_rust_cell {
+                    active.push_rust_cell(&cell_code);
+                }
+                self.store.set_active_state(active.fork());
+                if let Some(blk) = self.store.block_mut(done.block_id) {
+                    blk.duration_ms = done.duration_ms;
+                    blk.exit_code = exit_code;
+                    blk.state_after = active;
+                    blk.body = body;
+                }
+                self.editor.record_history_entry(HistoryEntry {
+                    command: done.source,
+                    cwd: done.cwd,
+                    git_branch: done.branch,
+                    duration_ms: done.duration_ms,
+                    exit_code,
+                    timestamp_ns: now_ns(),
+                    in_session: true,
+                });
+                self.refresh_prompt(exit_code, done.duration_ms);
+            }
+            updated
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -431,40 +848,65 @@ mod macos_app {
             cell_px: (u32, u32),
             scroll_bottom: bool,
             show_popup: bool,
+            show_history: bool,
         ) {
             // Compute real live `blaze-git` Starship status synchronously before demo commands.
             self.prompt.refresh_git_sync();
 
-            self.submit_command("ls", cols, rows, cell_px);
-            self.submit_command("ls crates/blaze-sh/src | sort-by size -r | take 5", cols, rows, cell_px);
-            self.submit_command("sys", cols, rows, cell_px);
+            self.submit_command("pwd", cols, rows, cell_px, false);
+            self.submit_command("ls", cols, rows, cell_px, false);
+            self.submit_command("$_ | sort-by size -r | take 4", cols, rows, cell_px, false);
+            self.submit_command("sys", cols, rows, cell_px, false);
 
             // Demonstrate O(1) CoW session fork in the top branch bar.
             let _ = self.store.fork_active_branch(Some("experiment"));
-            self.submit_command(
-                "[[crate lines status]; [blaze-sh 1840 true] [blaze-vt 3120 true] [blaze-shell 2290 true]] | sort-by lines -r",
-                cols,
-                rows,
-                cell_px,
-            );
             if rust_cell::find_blaze_binary(None).is_some() {
-                self.submit_command("rust { (1..=10).sum::<i64>() }", cols, rows, cell_px);
+                self.submit_command("rust { (1..=10).sum::<i64>() }", cols, rows, cell_px, false);
             }
-            self.submit_command("ls | get nonexistent_col", cols, rows, cell_px);
+            self.submit_command("ls | get nonexistent_col", cols, rows, cell_px, false);
             self.prompt.refresh_git_sync();
 
-            // Seed command history so Fish-style ghost autosuggestion works right away.
-            self.editor.push_history("ls crates/blaze-sh/src | sort-by size -r | take 5".to_owned());
-            self.editor.push_history("open Cargo.toml | get package".to_owned());
-            if show_popup {
+            if show_history {
+                let cwd = self.prompt.cwd.clone();
+                self.editor.start_reverse_search_in(&cwd);
+                for ch in "ls".chars() {
+                    self.editor.reverse_search_push(ch);
+                }
+            } else if show_popup {
                 self.editor.set_text_initial("open Ca".to_owned());
                 self.refresh_editor_assist(true);
             } else {
-                self.editor.set_text_initial("ls crates/blaze-sh".to_owned());
+                self.editor.set_text_initial("$_ | where size".to_owned());
                 self.refresh_editor_assist(false);
             }
             self.auto_scroll_bottom = scroll_bottom;
             self.scroll_y = 0.0;
+        }
+    }
+
+    fn body_from_result(
+        rust_meta: Option<RustCellMeta>,
+        streamed_lines: Vec<String>,
+        value: Value<'static>,
+    ) -> BlockBody {
+        if let Some(meta) = rust_meta {
+            if let Value::Error(e) = &value {
+                BlockBody::Error { err: (**e).clone() }
+            } else {
+                BlockBody::RustCell {
+                    code: meta.code,
+                    compile_ms: meta.compile_ms,
+                    run_ms: meta.run_ms,
+                    stdout: meta.stdout,
+                    value,
+                }
+            }
+        } else if let Value::Error(e) = &value {
+            BlockBody::Error { err: (**e).clone() }
+        } else if !streamed_lines.is_empty() {
+            BlockBody::StreamAndValue { lines: streamed_lines, value }
+        } else {
+            BlockBody::Value(value)
         }
     }
 
@@ -484,7 +926,9 @@ mod macos_app {
 
     fn grid_for(size: NSSize, fonts: &Fonts, scale: f64) -> (u16, u16) {
         let m = fonts.metrics;
-        let w = ((size.width - 36.0) * scale / m.cell_w as f64)
+        // Account for `OUTER_PAD_X * 2 + terminal inner pad * 2` so inline PTY lines wrap
+        // cleanly inside the block border without clipping on the right edge.
+        let w = ((size.width - 56.0) * scale / m.cell_w as f64)
             .floor()
             .max(20.0);
         let h = ((size.height - 140.0) * scale / m.cell_h as f64)
@@ -585,6 +1029,7 @@ mod macos_app {
                 cell_px,
                 cli.scroll_bottom,
                 cli.demo_popup,
+                cli.demo_history,
             );
         }
 
@@ -606,6 +1051,8 @@ mod macos_app {
                 zoom_pct,
                 inline_titlebar: true,
                 drag: None,
+                cursor_trail: None,
+                text_selection: None,
             });
             let max_s = (scene.total_content_height - scene.scroll_viewport_height).max(0.0);
             if shell.auto_scroll_bottom && max_s > 0.0 {
@@ -623,6 +1070,8 @@ mod macos_app {
                     zoom_pct,
                     inline_titlebar: true,
                     drag: None,
+                    cursor_trail: None,
+                    text_selection: None,
                 });
             }
             let glyphs = fonts.rasterize_runs(&scene.text_runs, scale);
@@ -664,10 +1113,14 @@ mod macos_app {
         let mut pty_buf = vec![0u8; 1 << 16];
         let mut keybuf = [0u8; 128];
         let mut dirty = true;
-        let mut blink_on = true;
-        let mut last_blink = Instant::now();
+        let mut last_cursor_rect: Option<[f32; 4]> = None;
+        let mut trail_prev: Option<[f32; 4]> = None;
+        let mut trail_start: Option<Instant> = None;
+        let mut last_running_tick = Instant::now();
         let mut pending_drag: Option<PendingDrag> = None;
         let mut selecting_composer = false;
+        let mut selecting_output = false;
+        let mut output_selection: Option<TextSelection> = None;
         let mut popup_engaged = false;
         let mut zoom_changed = false;
         let mut cur_cursor = CursorKind::Arrow;
@@ -741,7 +1194,7 @@ mod macos_app {
                                         Key::Backspace => {
                                             shell.editor.kill_to_line_start();
                                             popup_engaged = false;
-                                            shell.refresh_editor_assist(true);
+                                            shell.refresh_editor_assist(false);
                                             dirty = true;
                                             continue;
                                         }
@@ -757,6 +1210,7 @@ mod macos_app {
                                     "k" if shell.active_pty.is_none() => {
                                         shell.store.clear_active_branch();
                                         shell.scroll_y = 0.0;
+                                        output_selection = None;
                                         dirty = true;
                                         continue;
                                     }
@@ -778,35 +1232,45 @@ mod macos_app {
                                         continue;
                                     }
                                     "a" if shell.active_pty.is_none() => {
+                                        output_selection = None;
                                         shell.editor.select_all();
                                         dirty = true;
                                         continue;
                                     }
                                     "x" if shell.active_pty.is_none() => {
                                         if let Some(cut) = shell.editor.cut_selection() {
-                                            let pb = NSPasteboard::generalPasteboard();
-                                            // SAFETY: valid static AppKit pasteboard type.
-                                            let t = unsafe { NSPasteboardTypeString };
-                                            pb.clearContents();
-                                            pb.setString_forType(&NSString::from_str(&cut), t);
+                                            copy_to_pasteboard(&cut);
                                             popup_engaged = false;
                                             shell.refresh_editor_assist(false);
                                             dirty = true;
                                         }
                                         continue;
                                     }
-                                    "c" if shell.active_pty.is_none() => {
-                                        let copy_text = shell
-                                            .editor
-                                            .selected_text()
-                                            .map(str::to_owned)
-                                            .unwrap_or_else(|| shell.editor.text.clone());
-                                        if !copy_text.is_empty() {
-                                            let pb = NSPasteboard::generalPasteboard();
-                                            // SAFETY: valid static AppKit pasteboard type.
-                                            let t = unsafe { NSPasteboardTypeString };
-                                            pb.clearContents();
-                                            pb.setString_forType(&NSString::from_str(&copy_text), t);
+                                    "c" => {
+                                        // Copy selected output/scrollback text first, else composer selection, else full line!
+                                        if let Some(doc_sel) = output_selection {
+                                            let screen_sel = TextSelection {
+                                                anchor: [doc_sel.anchor[0], doc_sel.anchor[1] - shell.scroll_y],
+                                                head: [doc_sel.head[0], doc_sel.head[1] - shell.scroll_y],
+                                            };
+                                            let (_, selected) = compute_text_selection(
+                                                &shell.last_scene.text_runs,
+                                                fonts.cell_metrics(scale),
+                                                screen_sel,
+                                                TOP_BAR_H,
+                                            );
+                                            if !selected.is_empty() {
+                                                copy_to_pasteboard(&selected);
+                                                continue;
+                                            }
+                                        }
+                                        if shell.active_pty.is_none() {
+                                            let copy_text = shell
+                                                .editor
+                                                .selected_text()
+                                                .map(str::to_owned)
+                                                .unwrap_or_else(|| shell.editor.text.clone());
+                                            copy_to_pasteboard(&copy_text);
                                         }
                                         continue;
                                     }
@@ -858,45 +1322,162 @@ mod macos_app {
                                         ap.pty.write_all(bytes);
                                     }
                                 }
-                                blink_on = true;
-                                last_blink = Instant::now();
                                 dirty = true;
                                 continue;
                             }
 
                             // Interactive shell editor key handling.
+                            output_selection = None;
                             let text = keys::text_of(&ev);
 
                             if shell.editor.reverse_search.is_some() {
+                                // Atuin-class `Ctrl+R` fuzzy history palette.
                                 if ctrl && key == Key::KeyR {
-                                    shell.editor.reverse_search_next();
+                                    shell.editor.reverse_search_cycle_scope();
                                 } else if key == Key::Escape || (ctrl && key == Key::KeyC) {
                                     shell.editor.cancel_reverse_search();
-                                } else if key == Key::Enter || key == Key::NumpadEnter {
+                                } else if key == Key::ArrowUp || (ctrl && key == Key::KeyP) {
+                                    shell.editor.reverse_search_up();
+                                } else if key == Key::ArrowDown || (ctrl && key == Key::KeyN) {
+                                    shell.editor.reverse_search_down();
+                                } else if key == Key::Tab || key == Key::ArrowRight {
                                     shell.editor.accept_reverse_search();
+                                    popup_engaged = false;
+                                    shell.refresh_editor_assist(false);
+                                } else if key == Key::Enter || key == Key::NumpadEnter {
+                                    if shell.editor.accept_reverse_search() {
+                                        let cmd = shell.editor.take_submitted();
+                                        popup_engaged = false;
+                                        let (cols, rows) = grid_for(size, &fonts, scale);
+                                        let cpx = (
+                                            fonts.metrics.cell_w as u32,
+                                            fonts.metrics.cell_h as u32,
+                                        );
+                                        shell.submit_command(&cmd, cols, rows, cpx, true);
+                                    }
+                                } else if alt
+                                    && matches!(
+                                        key,
+                                        Key::Digit1
+                                            | Key::Digit2
+                                            | Key::Digit3
+                                            | Key::Digit4
+                                            | Key::Digit5
+                                            | Key::Digit6
+                                            | Key::Digit7
+                                            | Key::Digit8
+                                            | Key::Digit9
+                                    )
+                                {
+                                    let offset = match key {
+                                        Key::Digit1 => 1,
+                                        Key::Digit2 => 2,
+                                        Key::Digit3 => 3,
+                                        Key::Digit4 => 4,
+                                        Key::Digit5 => 5,
+                                        Key::Digit6 => 6,
+                                        Key::Digit7 => 7,
+                                        Key::Digit8 => 8,
+                                        Key::Digit9 => 9,
+                                        _ => 0,
+                                    };
+                                    let target = shell
+                                        .editor
+                                        .reverse_search
+                                        .as_ref()
+                                        .map(|rs| rs.selected + offset);
+                                    if let Some(idx) = target
+                                        && let Some(cmd) = shell.editor.take_reverse_search_index(idx)
+                                    {
+                                        shell.editor.set_text(cmd);
+                                        shell.editor.enter_vim_insert();
+                                        popup_engaged = false;
+                                        shell.refresh_editor_assist(false);
+                                    }
                                 } else if key == Key::Backspace {
                                     shell.editor.reverse_search_backspace();
-                                } else if !ctrl && !text.is_empty() {
+                                } else if !ctrl && !alt && !text.is_empty() {
                                     for ch in text.chars() {
-                                        shell.editor.reverse_search_push(ch);
+                                        if !ch.is_control() {
+                                            shell.editor.reverse_search_push(ch);
+                                        }
+                                    }
+                                }
+                            } else if shell.editor.vim_mode() != VimMode::Insert {
+                                // `blaze-vim` sans-IO Normal / Visual / VisualLine modal editing
+                                // (with shell-aware `i|`/`a|`, `i/`/`a/`, `i,`/`a,` text objects).
+                                if ctrl && key == Key::KeyP {
+                                    shell.editor.move_up();
+                                } else if ctrl && key == Key::KeyN {
+                                    shell.editor.move_down();
+                                } else if ctrl && key == Key::KeyC {
+                                    if shell.editor.vim_mode() == VimMode::Normal {
+                                        shell.editor.clear_line();
+                                        shell.editor.enter_vim_insert();
+                                    } else {
+                                        shell.editor.feed_vim_key(VimKeyEvent::key(VimKeyCode::Escape));
+                                    }
+                                } else if let Some(vev) = to_vim_key(key, &text, ctrl, alt, shift) {
+                                    match shell.editor.feed_vim_key(vev) {
+                                        VimOutcome::NormalEnter => {
+                                            shell.editor.try_expand_abbreviation();
+                                            let cmd = shell.editor.take_submitted();
+                                            popup_engaged = false;
+                                            let (cols, rows) = grid_for(size, &fonts, scale);
+                                            let cpx = (
+                                                fonts.metrics.cell_w as u32,
+                                                fonts.metrics.cell_h as u32,
+                                            );
+                                            shell.submit_command(&cmd, cols, rows, cpx, true);
+                                        }
+                                        VimOutcome::Handled { mutated, yanked } => {
+                                            if yanked {
+                                                copy_to_pasteboard(shell.editor.vim_register_text());
+                                            }
+                                            if mutated {
+                                                shell.auto_scroll_bottom = true;
+                                            }
+                                        }
+                                        VimOutcome::PassThrough => {}
                                     }
                                 }
                             } else if ctrl {
                                 match key {
-                                    Key::KeyR => shell.editor.start_reverse_search(),
+                                    Key::KeyR => {
+                                        let cwd = shell.prompt.cwd.clone();
+                                        shell.editor.start_reverse_search_in(&cwd);
+                                    }
                                     Key::Space => {
                                         let st = shell.store.active_state().fork();
                                         let cols = shell.recent_table_columns();
                                         shell.editor.trigger_completion_with_cols(&st, &cols);
                                         popup_engaged = !shell.editor.completions.is_empty();
                                     }
-                                    Key::KeyP if !shell.editor.completions.is_empty() => {
+                                    Key::KeyP => {
+                                        if !shell.editor.completions.is_empty() {
+                                            popup_engaged = true;
+                                        }
                                         shell.editor.move_up();
-                                        popup_engaged = true;
+                                        if shell.editor.completions.is_empty() {
+                                            shell.refresh_editor_assist(false);
+                                        }
                                     }
-                                    Key::KeyN if !shell.editor.completions.is_empty() => {
+                                    Key::KeyN => {
+                                        if !shell.editor.completions.is_empty() {
+                                            popup_engaged = true;
+                                        }
                                         shell.editor.move_down();
-                                        popup_engaged = true;
+                                        if shell.editor.completions.is_empty() {
+                                            shell.refresh_editor_assist(false);
+                                        }
+                                    }
+                                    Key::BracketLeft => {
+                                        if !shell.editor.completions.is_empty() {
+                                            shell.editor.dismiss_completions();
+                                            popup_engaged = false;
+                                        } else {
+                                            shell.editor.feed_vim_key(VimKeyEvent::key(VimKeyCode::Escape));
+                                        }
                                     }
                                     Key::KeyC => {
                                         shell.editor.dismiss_completions();
@@ -915,7 +1496,7 @@ mod macos_app {
                                     Key::KeyW => {
                                         shell.editor.kill_word_back();
                                         popup_engaged = false;
-                                        shell.refresh_editor_assist(true);
+                                        shell.refresh_editor_assist(false);
                                     }
                                     Key::KeyA => {
                                         shell.editor.move_home(shift);
@@ -933,7 +1514,7 @@ mod macos_app {
                                         if popup_engaged && !shell.editor.completions.is_empty() {
                                             shell.editor.apply_selected_completion();
                                             popup_engaged = false;
-                                            shell.refresh_editor_assist(true);
+                                            shell.refresh_editor_assist(false);
                                         } else if shift || shell.editor.is_incomplete() {
                                             shell.editor.insert_char('\n');
                                             popup_engaged = false;
@@ -947,14 +1528,18 @@ mod macos_app {
                                                 fonts.metrics.cell_w as u32,
                                                 fonts.metrics.cell_h as u32,
                                             );
-                                            shell.submit_command(&cmd, cols, rows, cpx);
+                                            shell.submit_command(&cmd, cols, rows, cpx, true);
                                         }
                                     }
                                     Key::Tab => {
                                         if !shell.editor.completions.is_empty() && !popup_engaged {
                                             shell.editor.apply_selected_completion();
                                             popup_engaged = false;
-                                            shell.refresh_editor_assist(true);
+                                            shell.refresh_editor_assist(false);
+                                        } else if shell.editor.completions.is_empty()
+                                            && shell.editor.tab_out()
+                                        {
+                                            shell.refresh_editor_assist(false);
                                         } else {
                                             let st = shell.store.active_state().fork();
                                             let cols = shell.recent_table_columns();
@@ -963,8 +1548,12 @@ mod macos_app {
                                         }
                                     }
                                     Key::Escape => {
-                                        shell.editor.dismiss_completions();
-                                        popup_engaged = false;
+                                        if !shell.editor.completions.is_empty() {
+                                            shell.editor.dismiss_completions();
+                                            popup_engaged = false;
+                                        } else {
+                                            shell.editor.feed_vim_key(VimKeyEvent::key(VimKeyCode::Escape));
+                                        }
                                     }
                                     Key::Backspace => {
                                         if alt {
@@ -973,7 +1562,7 @@ mod macos_app {
                                             shell.editor.backspace();
                                         }
                                         popup_engaged = false;
-                                        shell.refresh_editor_assist(true);
+                                        shell.refresh_editor_assist(false);
                                     }
                                     Key::Delete => {
                                         if alt {
@@ -1051,16 +1640,15 @@ mod macos_app {
                                                 // Fish/Nushell inline abbreviation expansion on Space!
                                                 shell.editor.try_expand_abbreviation();
                                             }
-                                            shell.editor.insert_str(&text);
+                                            shell.editor.insert_typed(&text);
                                             popup_engaged = false;
                                             shell.auto_scroll_bottom = true;
-                                            shell.refresh_editor_assist(true);
+                                            // Keep Fish ghost autosuggestions live, never auto-pop noisy menu!
+                                            shell.refresh_editor_assist(false);
                                         }
                                     }
                                 }
                             }
-                            blink_on = true;
-                            last_blink = Instant::now();
                             dirty = true;
                             continue;
                         }
@@ -1103,6 +1691,7 @@ mod macos_app {
                                 let x = pt.x as f32;
                                 let y = (size.height - pt.y) as f32;
                                 if let Some(action) = shell.last_scene.hit_test(x, y) {
+                                    output_selection = None;
                                     match action {
                                         HitAction::SwitchBranch(bid) => {
                                             if shell.store.switch_branch(bid) {
@@ -1142,7 +1731,22 @@ mod macos_app {
                                         HitAction::SelectCompletion(idx) => {
                                             shell.editor.apply_completion(idx);
                                             popup_engaged = false;
-                                            shell.refresh_editor_assist(true);
+                                            shell.refresh_editor_assist(false);
+                                            dirty = true;
+                                        }
+                                        HitAction::SelectHistory(idx) => {
+                                            if let Some(cmd) =
+                                                shell.editor.take_reverse_search_index(idx)
+                                            {
+                                                shell.editor.set_text(cmd);
+                                                shell.editor.enter_vim_insert();
+                                                popup_engaged = false;
+                                                shell.refresh_editor_assist(false);
+                                                dirty = true;
+                                            }
+                                        }
+                                        HitAction::CycleHistoryScope => {
+                                            shell.editor.reverse_search_cycle_scope();
                                             dirty = true;
                                         }
                                         HitAction::ResetZoom => {
@@ -1154,8 +1758,10 @@ mod macos_app {
                                     continue;
                                 }
 
-                                // Click inside the recessed composer hotbar: position cursor / word-select / drag-select.
+                                // Click inside the inline composer: enter Insert mode and position/select cursor.
                                 if shell.last_scene.composer_rect.contains(x, y) {
+                                    output_selection = None;
+                                    shell.editor.enter_vim_insert();
                                     let m = fonts.cell_metrics(scale);
                                     let [ox, oy] = shell.last_scene.composer_text_origin;
                                     let line_step = (m.ch + 2.0).max(1.0);
@@ -1173,8 +1779,6 @@ mod macos_app {
                                     }
                                     shell.editor.dismiss_completions();
                                     popup_engaged = false;
-                                    blink_on = true;
-                                    last_blink = Instant::now();
                                     dirty = true;
                                     continue;
                                 }
@@ -1198,6 +1802,39 @@ mod macos_app {
                                     window.performWindowDragWithEvent(&ev);
                                     continue;
                                 }
+
+                                // Drag-select (or double/triple click) any rendered block/terminal output text!
+                                if y >= TOP_BAR_H {
+                                    shell.editor.selection_anchor = None;
+                                    let m = fonts.cell_metrics(scale);
+                                    let clicks = ev.clickCount();
+                                    if clicks >= 2 {
+                                        if let Some(sel) = select_at_point(
+                                            &shell.last_scene.text_runs,
+                                            m,
+                                            x,
+                                            y,
+                                            clicks >= 3,
+                                            TOP_BAR_H,
+                                        ) {
+                                            output_selection = Some(TextSelection {
+                                                anchor: [sel.anchor[0], sel.anchor[1] + shell.scroll_y],
+                                                head: [sel.head[0], sel.head[1] + shell.scroll_y],
+                                            });
+                                        } else {
+                                            output_selection = None;
+                                        }
+                                        selecting_output = false;
+                                    } else {
+                                        output_selection = Some(TextSelection {
+                                            anchor: [x, y + shell.scroll_y],
+                                            head: [x, y + shell.scroll_y],
+                                        });
+                                        selecting_output = true;
+                                    }
+                                    dirty = true;
+                                    continue;
+                                }
                             }
                         }
                         NSEventType::MouseMoved if window.isKeyWindow() => {
@@ -1212,7 +1849,7 @@ mod macos_app {
                                     &shell.last_scene,
                                     shell.store.is_alternate_screen(),
                                     pending_drag.as_ref().is_some_and(|d| d.active),
-                                    selecting_composer,
+                                    selecting_composer || selecting_output,
                                     x,
                                     y,
                                     size.width as f32,
@@ -1246,10 +1883,18 @@ mod macos_app {
                             if selecting_composer {
                                 let m = fonts.cell_metrics(scale);
                                 let [ox, oy] = shell.last_scene.composer_text_origin;
-                                let line_step = (m.ch + 4.0).max(1.0);
+                                let line_step = (m.ch + 2.0).max(1.0);
                                 let line = ((y - oy).max(0.0) / line_step).floor() as usize;
                                 let col = (((x - ox).max(0.0) + m.cw * 0.45) / m.cw).floor() as usize;
                                 shell.editor.set_cursor_at_line_col(line, col, true);
+                                apply_cursor(&mut cur_cursor, CursorKind::IBeam);
+                                dirty = true;
+                                continue;
+                            }
+                            if selecting_output {
+                                if let Some(sel) = &mut output_selection {
+                                    sel.head = [x, y + shell.scroll_y];
+                                }
                                 apply_cursor(&mut cur_cursor, CursorKind::IBeam);
                                 dirty = true;
                                 continue;
@@ -1265,12 +1910,11 @@ mod macos_app {
                                 let dropped_in_prompt = cr.contains(x, y)
                                     || (y >= cr.y0 && y <= size.height as f32 && x >= cr.x0 && x <= cr.x1);
                                 if d.active && dropped_in_prompt {
+                                    shell.editor.enter_vim_insert();
                                     shell.editor.insert_dropped_token(&d.payload.insert_text);
                                     popup_engaged = false;
                                     shell.auto_scroll_bottom = true;
                                     shell.refresh_editor_assist(false);
-                                    blink_on = true;
-                                    last_blink = Instant::now();
                                 }
                                 let next = cursor_for_point(
                                     &shell.last_scene,
@@ -1288,6 +1932,27 @@ mod macos_app {
                             }
                             if selecting_composer {
                                 selecting_composer = false;
+                                let next = cursor_for_point(
+                                    &shell.last_scene,
+                                    shell.store.is_alternate_screen(),
+                                    false,
+                                    false,
+                                    x,
+                                    y,
+                                    size.width as f32,
+                                    size.height as f32,
+                                );
+                                apply_cursor(&mut cur_cursor, next);
+                                continue;
+                            }
+                            if selecting_output {
+                                selecting_output = false;
+                                if let Some(sel) = output_selection
+                                    && (sel.head[0] - sel.anchor[0]).hypot(sel.head[1] - sel.anchor[1]) < 3.0
+                                {
+                                    output_selection = None;
+                                    dirty = true;
+                                }
                                 let next = cursor_for_point(
                                     &shell.last_scene,
                                     shell.store.is_alternate_screen(),
@@ -1327,6 +1992,19 @@ mod macos_app {
                 } else {
                     shell.prompt.git_status = None;
                 }
+                dirty = true;
+            }
+
+            // Poll non-blocking background command jobs (`rust { ... }`, external commands).
+            {
+                let (cols, rows) = grid_for(size, &fonts, scale);
+                let cpx = (fonts.metrics.cell_w as u32, fonts.metrics.cell_h as u32);
+                if shell.poll_async_jobs(cols, rows, cpx) {
+                    dirty = true;
+                }
+            }
+            if shell.running_jobs > 0 && last_running_tick.elapsed().as_millis() >= 80 {
+                last_running_tick = Instant::now();
                 dirty = true;
             }
 
@@ -1417,15 +2095,24 @@ mod macos_app {
                 dirty = true;
             }
 
-            if last_blink.elapsed().as_millis() > 550 {
-                blink_on = !blink_on;
-                last_blink = Instant::now();
-                dirty = true;
+            // Ghostty-style eased cursor sweep trail (`DURATION = 0.20s`, `EaseOutCubic`).
+            let mut active_trail: Option<CursorTrail> = None;
+            if let (Some(prev), Some(t0)) = (trail_prev, trail_start) {
+                let p = t0.elapsed().as_secs_f32() / CURSOR_TRAIL_SECS;
+                if p < 1.0 {
+                    active_trail = Some(CursorTrail { prev_rect: prev, progress: p });
+                    dirty = true;
+                } else {
+                    trail_start = None;
+                    trail_prev = None;
+                    dirty = true;
+                }
             }
 
             if dirty {
                 let metrics = fonts.cell_metrics(scale);
-                let cursor_vis = blink_on && window.isKeyWindow();
+                // Steady non-blinking cursor (matches Ghostty `cursor-style-blink = false`).
+                let cursor_vis = window.isKeyWindow();
                 let zoom_pct = ((font_points / FONT_POINTS) * 100.0).round() as u16;
                 let active_drag = pending_drag.as_ref().and_then(|d| {
                     if d.active {
@@ -1453,6 +2140,12 @@ mod macos_app {
                     )
                 } else {
                     let frame_now = now_ns();
+                    let screen_sel = |sy: f32| {
+                        output_selection.map(|s| TextSelection {
+                            anchor: [s.anchor[0], s.anchor[1] - sy],
+                            head: [s.head[0], s.head[1] - sy],
+                        })
+                    };
                     let first = build_scene(&LayoutInput {
                         store: &shell.store,
                         editor: &shell.editor,
@@ -1466,6 +2159,8 @@ mod macos_app {
                         zoom_pct,
                         inline_titlebar: true,
                         drag: active_drag.as_ref(),
+                        cursor_trail: active_trail,
+                        text_selection: screen_sel(shell.scroll_y),
                     });
                     let max_s = (first.total_content_height - first.scroll_viewport_height).max(0.0);
                     let target_scroll = if shell.auto_scroll_bottom {
@@ -1489,11 +2184,24 @@ mod macos_app {
                             zoom_pct,
                             inline_titlebar: true,
                             drag: active_drag.as_ref(),
+                            cursor_trail: active_trail,
+                            text_selection: screen_sel(shell.scroll_y),
                         })
                     } else {
                         first
                     }
                 };
+
+                // Detect significant cursor jump to trigger Ghostty eased sweep trail!
+                if let (Some(prev), Some(curr)) = (last_cursor_rect, scene.cursor_rect) {
+                    let dx = (curr[0] + curr[2] * 0.5) - (prev[0] + prev[2] * 0.5);
+                    let dy = (curr[1] + curr[3] * 0.5) - (prev[1] + prev[3] * 0.5);
+                    if dx.hypot(dy) > 10.0 {
+                        trail_prev = Some(prev);
+                        trail_start = Some(Instant::now());
+                    }
+                }
+                last_cursor_rect = scene.cursor_rect;
 
                 let glyphs = fonts.rasterize_runs(&scene.text_runs, scale);
                 let overlay_glyphs = fonts.rasterize_runs(&scene.overlay_text, scale);
@@ -1523,9 +2231,9 @@ mod macos_app {
                     overlay_glyphs: &overlay_glyphs,
                 };
                 renderer.draw(&layer, &frame);
-                // Keep hit regions, drag sources & composer geometry in `last_scene` for instant mouse handling.
+                // Keep `text_runs`, hit regions, drag sources & composer geometry in `last_scene`
+                // for instant mouse hover, output text selection, and `Cmd+C` extraction!
                 scene.rects.clear();
-                scene.text_runs.clear();
                 scene.icon_quads.clear();
                 scene.over_rects.clear();
                 scene.overlay_rects.clear();
@@ -1539,7 +2247,7 @@ mod macos_app {
                         &shell.last_scene,
                         shell.store.is_alternate_screen(),
                         pending_drag.as_ref().is_some_and(|d| d.active),
-                        selecting_composer,
+                        selecting_composer || selecting_output,
                         mx,
                         my,
                         size.width as f32,
@@ -1547,7 +2255,7 @@ mod macos_app {
                     );
                     apply_cursor(&mut cur_cursor, next);
                 }
-                dirty = false;
+                dirty = trail_start.is_some();
             }
         }
     }

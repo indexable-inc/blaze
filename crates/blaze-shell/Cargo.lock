@@ -152,6 +152,7 @@ dependencies = [
  "blaze-own",
  "blaze-sh",
  "blaze-ui",
+ "blaze-vim",
  "blaze-vt",
  "objc2",
  "objc2-app-kit",
@@ -214,6 +215,13 @@ dependencies = [
 [[package]]
 name = "blaze-unicode"
 version = "0.0.0"
+
+[[package]]
+name = "blaze-vim"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
+]
 
 [[package]]
 name = "blaze-vt"

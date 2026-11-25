@@ -13,8 +13,27 @@ use blaze_own::Alloc;
 use blaze_sh::builtins::{BUILTIN_SPECS, find_spec};
 use blaze_sh::lex::{HighlightSpan, highlight, is_incomplete};
 use blaze_sh::{Bytes, EngineState};
+use blaze_vim::{
+    CursorShape, KeyEvent as VimKeyEvent, Mode as VimMode, Outcome as VimOutcome, ShellObjects,
+    TextBuffer, VimMachine, VimOpts,
+};
 
 use crate::svg_icons::icon_name_for_file;
+
+struct StdStringBuf<'a>(&'a mut String);
+
+impl TextBuffer for StdStringBuf<'_> {
+    #[inline]
+    fn text(&self) -> &str {
+        self.0.as_str()
+    }
+
+    fn replace_range(&mut self, start: usize, end: usize, insert: &str) {
+        let s = clamp_char_boundary(self.0, start);
+        let e = clamp_char_boundary(self.0, end).max(s);
+        self.0.replace_range(s..e, insert);
+    }
+}
 
 const MAX_UNDO_DEPTH: usize = 256;
 const MAX_PATH_BINS: usize = 4096;
@@ -50,19 +69,63 @@ pub struct CompletionItem {
     pub match_indices: Vec<usize>,
 }
 
-/// Incremental `Ctrl+R` reverse history search state.
+/// Scope filter for the Atuin-class `Ctrl+R` command history palette.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HistoryScope {
+    #[default]
+    Global,
+    Directory,
+    Session,
+}
+
+impl HistoryScope {
+    pub const fn label(self) -> &'static str {
+        match self {
+            HistoryScope::Global => "GLOBAL",
+            HistoryScope::Directory => "DIR",
+            HistoryScope::Session => "SESSION",
+        }
+    }
+
+    pub const fn next(self) -> Self {
+        match self {
+            HistoryScope::Global => HistoryScope::Directory,
+            HistoryScope::Directory => HistoryScope::Session,
+            HistoryScope::Session => HistoryScope::Global,
+        }
+    }
+}
+
+/// Rich structured command history entry (persisted to JSONL across restarts).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryEntry {
+    pub command: String,
+    pub cwd: String,
+    pub git_branch: Option<String>,
+    pub duration_ms: u64,
+    pub exit_code: i32,
+    pub timestamp_ns: i64,
+    pub in_session: bool,
+}
+
+/// One scored fuzzy match inside the `Ctrl+R` Atuin-class history palette.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryMatch {
+    pub entry: HistoryEntry,
+    pub match_indices: Vec<usize>,
+}
+
+/// Atuin-class `Ctrl+R` interactive command history palette state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReverseSearch {
     pub query: String,
-    pub match_index: Option<usize>,
+    pub scope: HistoryScope,
+    pub cwd: String,
+    pub results: Vec<HistoryMatch>,
+    pub selected: usize,
+    pub total_entries: usize,
+    /// Convenience mirror of `results.get(selected).map(|m| m.entry.command.clone())`.
     pub matched_text: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct UndoSnap {
-    text: String,
-    cursor: usize,
-    anchor: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -73,16 +136,18 @@ enum EditOp {
     DeleteBack,
 }
 
-/// Multi-line interactive input editor for `blaze-shell`.
-#[derive(Clone, Debug, Default)]
+/// Multi-line interactive input editor for `blaze-shell`, powered by `blaze-vim`.
 pub struct Editor {
     pub text: String,
     /// Byte offset in `text`, always kept on a valid UTF-8 character boundary.
     pub cursor: usize,
-    /// Optional selection anchor byte offset (also a valid UTF-8 boundary).
+    /// Optional mouse/Shift selection anchor byte offset (also a valid UTF-8 boundary).
     pub selection_anchor: Option<usize>,
-    /// Submitted command history (oldest first).
+    /// Submitted command history strings (oldest first, used for Up/Down + Fish ghost).
     pub history: Vec<String>,
+    /// Rich structured command history entries (oldest first, persisted across sessions).
+    pub history_entries: Vec<HistoryEntry>,
+    history_file: Option<PathBuf>,
     history_pos: Option<usize>,
     history_draft: String,
     /// Active `Ctrl+R` reverse search overlay, if open.
@@ -93,14 +158,20 @@ pub struct Editor {
     completion_replace_start: usize,
     /// Fish/Nushell-style dimmed inline ghost suffix shown directly after the cursor.
     pub ghost: Option<String>,
-    /// Bounded undo/redo stacks (`Cmd+Z` / `Cmd+Shift+Z`).
-    undo_stack: Vec<UndoSnap>,
-    redo_stack: Vec<UndoSnap>,
+    /// Sans-IO Vim modal editing engine (`Normal`/`Insert`/`Visual`/`VisualLine`, undo/redo,
+    /// registers, `.` repeat, and pluggable `ShellObjects` including `i|`/`i/`/`i,`).
+    vim: VimMachine<'static>,
     last_edit_op: EditOp,
     /// Lazily cached external executable names from `$PATH`.
     path_bins: Option<Vec<String>>,
     /// Command-position abbreviations expanded inline on Space / Enter (like Fish / Nushell).
     pub abbreviations: BTreeMap<String, String>,
+}
+
+impl Default for Editor {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Built-in Fish/Nushell-style command-position abbreviations (`l` -> `ls`, `sb` -> `sort-by`, etc.).
@@ -192,9 +263,83 @@ const COLUMN_COMMANDS: &[&str] = &[
 
 impl Editor {
     pub fn new() -> Self {
-        let mut ed = Self::default();
+        let mut ed = Self {
+            text: String::new(),
+            cursor: 0,
+            selection_anchor: None,
+            history: Vec::new(),
+            history_entries: Vec::new(),
+            history_file: None,
+            history_pos: None,
+            history_draft: String::new(),
+            reverse_search: None,
+            completions: Vec::new(),
+            completion_selected: 0,
+            completion_replace_start: 0,
+            ghost: None,
+            vim: VimMachine::new(
+                VimOpts {
+                    initial_mode: VimMode::Insert,
+                    max_undo: MAX_UNDO_DEPTH,
+                    max_count: 10_000,
+                },
+                Alloc::global(),
+            ),
+            last_edit_op: EditOp::Other,
+            path_bins: None,
+            abbreviations: BTreeMap::new(),
+        };
         ed.load_default_abbreviations();
         ed
+    }
+
+    #[inline]
+    pub fn vim_mode(&self) -> VimMode {
+        self.vim.mode()
+    }
+
+    #[inline]
+    pub fn vim_cursor_shape(&self) -> CursorShape {
+        self.vim.cursor_shape()
+    }
+
+    pub fn vim_pending(&self) -> String {
+        let mut s = String::new();
+        let _ = self.vim.format_pending(&mut s);
+        s
+    }
+
+    pub fn vim_register_text(&self) -> &str {
+        self.vim.register().text.as_str()
+    }
+
+    pub fn enter_vim_insert(&mut self) {
+        self.vim.set_mode(&self.text, VimMode::Insert);
+        self.vim.set_cursor(&self.text, self.cursor);
+    }
+
+    /// Feed a normalized keystroke into `blaze-vim` with `ShellObjects` (`i|`/`i/`/`i,` + standard Vim).
+    pub fn feed_vim_key(&mut self, ev: VimKeyEvent) -> VimOutcome {
+        self.clamp_cursor();
+        let prev_mode = self.vim.mode();
+        self.vim.set_cursor(&self.text, self.cursor);
+        let outcome = self.vim.feed(ev, &mut StdStringBuf(&mut self.text), &ShellObjects);
+        self.cursor = clamp_char_boundary(&self.text, self.vim.cursor());
+        if !matches!(self.vim.mode(), VimMode::Insert) {
+            self.selection_anchor = None;
+            self.ghost = None;
+            self.dismiss_completions();
+        }
+        // Coalesce subsequent typing into a single atomic undo step after Vim change (`c`/`s`/`C`/`S`).
+        self.last_edit_op = if prev_mode != VimMode::Insert
+            && self.vim.mode() == VimMode::Insert
+            && matches!(outcome, VimOutcome::Handled { mutated: true, .. })
+        {
+            EditOp::InsertWord
+        } else {
+            EditOp::Other
+        };
+        outcome
     }
 
     /// Populate built-in abbreviations.
@@ -272,75 +417,50 @@ impl Editor {
     }
 
     fn push_undo(&mut self, op: EditOp) {
-        let coalesce = op != EditOp::Other && op == self.last_edit_op && !self.undo_stack.is_empty();
+        let coalesce = op != EditOp::Other && op == self.last_edit_op;
         if !coalesce {
-            let snap = UndoSnap {
-                text: self.text.clone(),
-                cursor: self.cursor,
-                anchor: self.selection_anchor,
-            };
-            if self.undo_stack.last() != Some(&snap) {
-                if self.undo_stack.len() >= MAX_UNDO_DEPTH {
-                    self.undo_stack.remove(0);
-                }
-                self.undo_stack.push(snap);
-            }
+            self.vim.set_cursor(&self.text, self.cursor);
+            self.vim.checkpoint_undo(&self.text);
         }
-        self.redo_stack.clear();
         self.last_edit_op = op;
     }
 
-    /// `Cmd+Z`: restore previous editor state.
+    /// `Cmd+Z` / Vim `u`: restore previous editor state from the unified `blaze-vim` undo stack.
     pub fn undo(&mut self) -> bool {
-        let Some(prev) = self.undo_stack.pop() else {
-            return false;
-        };
-        let cur = UndoSnap {
-            text: core::mem::take(&mut self.text),
-            cursor: self.cursor,
-            anchor: self.selection_anchor,
-        };
-        if self.redo_stack.len() >= MAX_UNDO_DEPTH {
-            self.redo_stack.remove(0);
+        self.vim.set_cursor(&self.text, self.cursor);
+        let ok = self.vim.undo(&mut StdStringBuf(&mut self.text));
+        if ok {
+            self.cursor = clamp_char_boundary(&self.text, self.vim.cursor());
+            self.selection_anchor = None;
+            self.last_edit_op = EditOp::Other;
+            self.history_pos = None;
+            self.dismiss_completions();
+            self.ghost = None;
         }
-        self.redo_stack.push(cur);
-        self.text = prev.text;
-        self.cursor = prev.cursor;
-        self.selection_anchor = prev.anchor;
-        self.clamp_cursor();
-        self.last_edit_op = EditOp::Other;
-        self.history_pos = None;
-        self.dismiss_completions();
-        self.ghost = None;
-        true
+        ok
     }
 
-    /// `Cmd+Shift+Z`: reapply an undone edit.
+    /// `Cmd+Shift+Z` / Vim `Ctrl+R`: reapply an undone edit.
     pub fn redo(&mut self) -> bool {
-        let Some(next) = self.redo_stack.pop() else {
-            return false;
-        };
-        let cur = UndoSnap {
-            text: core::mem::take(&mut self.text),
-            cursor: self.cursor,
-            anchor: self.selection_anchor,
-        };
-        if self.undo_stack.len() >= MAX_UNDO_DEPTH {
-            self.undo_stack.remove(0);
+        self.vim.set_cursor(&self.text, self.cursor);
+        let ok = self.vim.redo(&mut StdStringBuf(&mut self.text));
+        if ok {
+            self.cursor = clamp_char_boundary(&self.text, self.vim.cursor());
+            self.selection_anchor = None;
+            self.last_edit_op = EditOp::Other;
+            self.history_pos = None;
+            self.dismiss_completions();
+            self.ghost = None;
         }
-        self.undo_stack.push(cur);
-        self.text = next.text;
-        self.cursor = next.cursor;
-        self.selection_anchor = next.anchor;
-        self.clamp_cursor();
-        self.last_edit_op = EditOp::Other;
-        self.history_pos = None;
-        self.dismiss_completions();
-        self.ghost = None;
-        true
+        ok
     }
 
     pub fn selection_range(&self) -> Option<(usize, usize)> {
+        if let Some(vis) = self.vim.visual_selection(&self.text) {
+            if !vis.is_empty() {
+                return Some((vis.start, vis.end));
+            }
+        }
         let a = self.selection_anchor?;
         if a == self.cursor {
             return None;
@@ -414,8 +534,8 @@ impl Editor {
         self.cursor = text.len();
         self.text = text;
         self.selection_anchor = None;
-        self.undo_stack.clear();
-        self.redo_stack.clear();
+        self.vim.reset_for_new_buffer();
+        self.vim.set_cursor(&self.text, self.cursor);
         self.last_edit_op = EditOp::Other;
         self.dismiss_completions();
     }
@@ -441,6 +561,102 @@ impl Editor {
         let mut buf = [0u8; 4];
         let s = ch.encode_utf8(&mut buf);
         self.insert_str(s);
+    }
+
+    /// Interactive keyboard typing with IntelliJ-style auto-pairing (`{}`, `()`, `[]`, `""`, `''`),
+    /// selection wrapping (`{selected}`), and closing-delimiter overtype.
+    pub fn insert_typed(&mut self, s: &str) {
+        let mut chars = s.chars();
+        let Some(ch) = chars.next() else { return };
+        if chars.next().is_some() {
+            self.insert_str(s);
+            return;
+        }
+
+        let pair_close = |open: char| -> Option<char> {
+            match open {
+                '{' => Some('}'),
+                '(' => Some(')'),
+                '[' => Some(']'),
+                '"' => Some('"'),
+                '\'' => Some('\''),
+                _ => None,
+            }
+        };
+
+        // 1. Wrap active selection when typing an opening bracket or quote.
+        if let Some((a, b)) = self.selection_range()
+            && let Some(close) = pair_close(ch)
+        {
+            self.push_undo(EditOp::Other);
+            let mut open_buf = [0u8; 4];
+            let mut close_buf = [0u8; 4];
+            let os = ch.encode_utf8(&mut open_buf);
+            let cs = close.encode_utf8(&mut close_buf);
+            self.text.insert_str(b, cs);
+            self.text.insert_str(a, os);
+            self.selection_anchor = Some(a + os.len());
+            self.cursor = b + os.len();
+            self.history_pos = None;
+            self.dismiss_completions();
+            return;
+        }
+
+        self.clamp_cursor();
+        let next_ch = self.text[self.cursor..].chars().next();
+        let prev_ch = self.text[..self.cursor].chars().next_back();
+
+        // 2. Overtype closing delimiter if cursor is already right before it.
+        if matches!(ch, '}' | ')' | ']' | '"' | '\'') && next_ch == Some(ch) {
+            self.cursor += ch.len_utf8();
+            self.selection_anchor = None;
+            self.dismiss_completions();
+            return;
+        }
+
+        // 3. Auto-pair opening brackets and balanced quotes when followed by boundary/delimiter.
+        if let Some(close) = pair_close(ch) {
+            let next_ok = next_ch.is_none_or(|c| {
+                c.is_whitespace() || matches!(c, ')' | ']' | '}' | ',' | ';' | '|' | ':')
+            });
+            let is_quote = ch == '"' || ch == '\'';
+            let prev_ok = !is_quote
+                || prev_ch.is_none_or(|c| {
+                    c.is_whitespace() || matches!(c, '(' | '[' | '{' | '=' | ',' | ':' | '|')
+                });
+            let quote_balanced = !is_quote || self.text.chars().filter(|&c| c == ch).count() % 2 == 0;
+            if next_ok && prev_ok && quote_balanced {
+                self.push_undo(EditOp::Other);
+                let mut pair = String::with_capacity(2);
+                pair.push(ch);
+                pair.push(close);
+                self.text.insert_str(self.cursor, &pair);
+                self.cursor += ch.len_utf8();
+                self.selection_anchor = None;
+                self.history_pos = None;
+                self.dismiss_completions();
+                return;
+            }
+        }
+
+        self.insert_str(s);
+    }
+
+    /// IntelliJ-style Tab-out: when cursor sits right before a closing delimiter (`}`, `)`, `]`,
+    /// `"`, `'`), jump cursor out past it and return `true`.
+    pub fn tab_out(&mut self) -> bool {
+        if self.selection_range().is_some() {
+            return false;
+        }
+        self.clamp_cursor();
+        if let Some(ch) = self.text[self.cursor..].chars().next()
+            && matches!(ch, '}' | ')' | ']' | '"' | '\'')
+        {
+            self.cursor += ch.len_utf8();
+            self.last_edit_op = EditOp::Other;
+            return true;
+        }
+        false
     }
 
     /// Insert a drag-and-dropped file/folder/value token with automatic shell quoting and spacing.
@@ -489,7 +705,21 @@ impl Editor {
         }
         self.push_undo(EditOp::DeleteBack);
         let prev = prev_char_boundary(&self.text, self.cursor);
-        self.text.drain(prev..self.cursor);
+        let prev_ch = self.text[prev..self.cursor].chars().next();
+        let next_ch = self.text[self.cursor..].chars().next();
+        let delete_end = if matches!(
+            (prev_ch, next_ch),
+            (Some('{'), Some('}'))
+                | (Some('('), Some(')'))
+                | (Some('['), Some(']'))
+                | (Some('"'), Some('"'))
+                | (Some('\''), Some('\''))
+        ) {
+            next_char_boundary(&self.text, self.cursor)
+        } else {
+            self.cursor
+        };
+        self.text.drain(prev..delete_end);
         self.cursor = prev;
         self.history_pos = None;
         self.dismiss_completions();
@@ -812,6 +1042,69 @@ impl Editor {
         if self.history.last().map(|s| s.as_str()) != Some(trimmed) {
             self.history.push(trimmed.to_owned());
         }
+        // Keep `history_entries` synced for unit tests / quick callers that don't pass rich metadata.
+        if self
+            .history_entries
+            .last()
+            .map(|e| e.command.as_str())
+            != Some(trimmed)
+        {
+            self.history_entries.push(HistoryEntry {
+                command: trimmed.to_owned(),
+                cwd: String::new(),
+                git_branch: None,
+                duration_ms: 0,
+                exit_code: 0,
+                timestamp_ns: 0,
+                in_session: true,
+            });
+        }
+    }
+
+    /// Record a rich command execution in history and append to persistent JSONL store.
+    pub fn record_history_entry(&mut self, entry: HistoryEntry) {
+        let trimmed = entry.command.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if self.history.last().map(|s| s.as_str()) != Some(trimmed) {
+            self.history.push(trimmed.to_owned());
+        }
+        // Replace placeholder entry pushed by `take_submitted` if it matches.
+        if let Some(last) = self.history_entries.last_mut()
+            && last.command == trimmed
+            && last.timestamp_ns == 0
+        {
+            *last = entry.clone();
+        } else {
+            self.history_entries.push(entry.clone());
+        }
+        const MAX_HISTORY_ENTRIES: usize = 10_000;
+        if self.history_entries.len() > MAX_HISTORY_ENTRIES {
+            let drop_n = self.history_entries.len() - MAX_HISTORY_ENTRIES;
+            self.history_entries.drain(0..drop_n);
+        }
+        if let Some(path) = &self.history_file {
+            append_history_jsonl(path, &entry);
+        }
+    }
+
+    /// Load persistent command history from `<home>/.local/share/blaze-shell/history.jsonl`.
+    pub fn load_persistent_history(&mut self, home: &str) {
+        let dir = PathBuf::from(home).join(".local/share/blaze-shell");
+        let path = dir.join("history.jsonl");
+        let _ = fs::create_dir_all(&dir);
+        if let Ok(raw) = fs::read_to_string(&path) {
+            for line in raw.lines().rev().take(4000).collect::<Vec<_>>().into_iter().rev() {
+                if let Some(entry) = parse_history_jsonl_line(line) {
+                    if self.history.last().map(|s| s.as_str()) != Some(entry.command.as_str()) {
+                        self.history.push(entry.command.clone());
+                    }
+                    self.history_entries.push(entry);
+                }
+            }
+        }
+        self.history_file = Some(path);
     }
 
     pub fn history_prev(&mut self) {
@@ -860,8 +1153,7 @@ impl Editor {
         self.history_pos = None;
         self.history_draft.clear();
         self.reverse_search = None;
-        self.undo_stack.clear();
-        self.redo_stack.clear();
+        self.vim.reset_for_new_buffer();
         self.last_edit_op = EditOp::Other;
         self.dismiss_completions();
         self.ghost = None;
@@ -929,45 +1221,87 @@ impl Editor {
     }
 
     // -------------------------------------------------------------------------
-    // Ctrl+R incremental reverse history search
+    // Ctrl+R Atuin-class fuzzy command history palette
     // -------------------------------------------------------------------------
 
     pub fn start_reverse_search(&mut self) {
-        if self.reverse_search.is_some() {
-            self.reverse_search_next();
+        self.start_reverse_search_in("");
+    }
+
+    pub fn start_reverse_search_in(&mut self, cwd: &str) {
+        if let Some(rs) = &mut self.reverse_search {
+            // Pressing Ctrl+R while already open cycles scope: GLOBAL -> DIR -> SESSION (Atuin style!).
+            rs.scope = rs.scope.next();
+            rs.selected = 0;
+            update_reverse_search(rs, &self.history_entries);
             return;
         }
         self.dismiss_completions();
         let mut rs = ReverseSearch {
             query: String::new(),
-            match_index: None,
+            scope: HistoryScope::Global,
+            cwd: cwd.to_owned(),
+            results: Vec::new(),
+            selected: 0,
+            total_entries: self.history_entries.len(),
             matched_text: None,
         };
-        update_reverse_search(&mut rs, &self.history, self.history.len());
+        update_reverse_search(&mut rs, &self.history_entries);
         self.reverse_search = Some(rs);
+    }
+
+    pub fn reverse_search_cycle_scope(&mut self) {
+        if let Some(rs) = &mut self.reverse_search {
+            rs.scope = rs.scope.next();
+            rs.selected = 0;
+            update_reverse_search(rs, &self.history_entries);
+        }
     }
 
     pub fn reverse_search_push(&mut self, ch: char) {
         if let Some(rs) = &mut self.reverse_search {
             rs.query.push(ch);
-            update_reverse_search(rs, &self.history, self.history.len());
+            rs.selected = 0;
+            update_reverse_search(rs, &self.history_entries);
         }
     }
 
     pub fn reverse_search_backspace(&mut self) {
         if let Some(rs) = &mut self.reverse_search {
             rs.query.pop();
-            update_reverse_search(rs, &self.history, self.history.len());
+            rs.selected = 0;
+            update_reverse_search(rs, &self.history_entries);
+        }
+    }
+
+    pub fn reverse_search_up(&mut self) {
+        if let Some(rs) = &mut self.reverse_search
+            && !rs.results.is_empty()
+        {
+            if rs.selected + 1 < rs.results.len() {
+                rs.selected += 1;
+            } else {
+                rs.selected = 0;
+            }
+            rs.matched_text = rs.results.get(rs.selected).map(|m| m.entry.command.clone());
+        }
+    }
+
+    pub fn reverse_search_down(&mut self) {
+        if let Some(rs) = &mut self.reverse_search
+            && !rs.results.is_empty()
+        {
+            if rs.selected == 0 {
+                rs.selected = rs.results.len() - 1;
+            } else {
+                rs.selected -= 1;
+            }
+            rs.matched_text = rs.results.get(rs.selected).map(|m| m.entry.command.clone());
         }
     }
 
     pub fn reverse_search_next(&mut self) {
-        if let Some(rs) = &mut self.reverse_search {
-            let start = rs.match_index.unwrap_or(self.history.len());
-            if start > 0 {
-                update_reverse_search(rs, &self.history, start);
-            }
-        }
+        self.reverse_search_up();
     }
 
     pub fn accept_reverse_search(&mut self) -> bool {
@@ -976,10 +1310,17 @@ impl Editor {
         };
         if let Some(matched) = rs.matched_text {
             self.set_text(matched);
+            self.enter_vim_insert();
             true
         } else {
             false
         }
+    }
+
+    /// Accept row `idx` of the history palette into the prompt for editing (or return it to run).
+    pub fn take_reverse_search_index(&mut self, idx: usize) -> Option<String> {
+        let rs = self.reverse_search.take()?;
+        rs.results.get(idx).map(|m| m.entry.command.clone())
     }
 
     pub fn cancel_reverse_search(&mut self) {
@@ -1598,17 +1939,131 @@ fn infer_pipeline_columns(before_cursor: &str, recent_cols: &[String]) -> Vec<(S
         .collect()
 }
 
-fn update_reverse_search(rs: &mut ReverseSearch, history: &[String], before_idx: usize) {
-    let end = before_idx.min(history.len());
-    for i in (0..end).rev() {
-        if history[i].contains(&rs.query) {
-            rs.match_index = Some(i);
-            rs.matched_text = Some(history[i].clone());
-            return;
+fn update_reverse_search(rs: &mut ReverseSearch, entries: &[HistoryEntry]) {
+    rs.total_entries = entries.len();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut scored: Vec<(i32, usize, HistoryMatch)> = Vec::new();
+
+    // Walk newest-first so recency wins ties and deduplication keeps the latest run.
+    for (rev_rank, entry) in entries.iter().rev().enumerate() {
+        match rs.scope {
+            HistoryScope::Global => {}
+            HistoryScope::Directory => {
+                if !rs.cwd.is_empty() && entry.cwd != rs.cwd {
+                    continue;
+                }
+            }
+            HistoryScope::Session => {
+                if !entry.in_session {
+                    continue;
+                }
+            }
+        }
+        if !seen.insert(entry.command.clone()) {
+            continue;
+        }
+        let Some((mut score, idxs)) = fuzzy_match_score(&entry.command, &rs.query) else {
+            continue;
+        };
+        // Boost same-directory commands in Global search and successful runs.
+        if !rs.cwd.is_empty() && entry.cwd == rs.cwd {
+            score += 25;
+        }
+        if entry.exit_code == 0 {
+            score += 6;
+        }
+        // Mild recency preference so recent commands float near the bottom/top cleanly.
+        let recency_bonus = 40i32.saturating_sub((rev_rank / 4) as i32).max(0);
+        scored.push((
+            score + recency_bonus,
+            rev_rank,
+            HistoryMatch { entry: entry.clone(), match_indices: idxs },
+        ));
+    }
+
+    // When query is empty, preserve pure reverse-chronological order; otherwise rank by score then recency.
+    if !rs.query.is_empty() {
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    }
+    scored.truncate(60);
+
+    rs.results = scored.into_iter().map(|(_, _, m)| m).collect();
+    if rs.selected >= rs.results.len() {
+        rs.selected = 0;
+    }
+    rs.matched_text = rs.results.get(rs.selected).map(|m| m.entry.command.clone());
+}
+
+fn append_history_jsonl(path: &Path, e: &HistoryEntry) {
+    use std::io::Write as _;
+    let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+    let esc = |s: &str| {
+        let mut out = String::with_capacity(s.len());
+        for ch in s.chars() {
+            match ch {
+                '\\' => out.push_str("\\\\"),
+                '"' => out.push_str("\\\""),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c => out.push(c),
+            }
+        }
+        out
+    };
+    let branch_json = match &e.git_branch {
+        Some(b) => format!("\"{}\"", esc(b)),
+        None => "null".to_owned(),
+    };
+    let _ = writeln!(
+        f,
+        "{{\"cmd\":\"{}\",\"cwd\":\"{}\",\"branch\":{},\"dur\":{},\"exit\":{},\"ts\":{}}}",
+        esc(&e.command),
+        esc(&e.cwd),
+        branch_json,
+        e.duration_ms,
+        e.exit_code,
+        e.timestamp_ns,
+    );
+}
+
+fn parse_history_jsonl_line(line: &str) -> Option<HistoryEntry> {
+    let alloc = Alloc::global();
+    let val = blaze_json::read_in(line.as_bytes(), blaze_json::Limits::SHIPPED, alloc).ok()?;
+    let blaze_data::Value::Map(ref map) = val else {
+        return None;
+    };
+    let mut cmd = String::new();
+    let mut cwd = String::new();
+    let mut git_branch = None;
+    let mut duration_ms = 0u64;
+    let mut exit_code = 0i32;
+    let mut timestamp_ns = 0i64;
+    for (k, v) in map.iter() {
+        match (k, v) {
+            ("cmd", blaze_data::Value::Text(s)) => cmd = s.as_str().to_owned(),
+            ("cwd", blaze_data::Value::Text(s)) => cwd = s.as_str().to_owned(),
+            ("branch", blaze_data::Value::Text(s)) => git_branch = Some(s.as_str().to_owned()),
+            ("dur", blaze_data::Value::Int(n)) => duration_ms = n.as_i64().unwrap_or(0).max(0) as u64,
+            ("exit", blaze_data::Value::Int(n)) => exit_code = n.as_i64().unwrap_or(0) as i32,
+            ("ts", blaze_data::Value::Int(n)) => timestamp_ns = n.as_i64().unwrap_or(0),
+            _ => {}
         }
     }
-    rs.match_index = None;
-    rs.matched_text = None;
+    if cmd.is_empty() {
+        return None;
+    }
+    Some(HistoryEntry {
+        command: cmd,
+        cwd,
+        git_branch,
+        duration_ms,
+        exit_code,
+        timestamp_ns,
+        in_session: false,
+    })
 }
 
 fn active_stage_command(before_cursor: &str) -> Option<&str> {

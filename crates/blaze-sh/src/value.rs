@@ -452,6 +452,16 @@ pub struct ClosureData<'a> {
 }
 
 /// A first-class structured value flowing through `blaze-sh` pipelines.
+/// Filesystem entry classification carried by a first-class [`Value::Path`].
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum PathKind {
+    #[default]
+    Unknown,
+    Dir,
+    File,
+    Symlink,
+}
+
 #[derive(Clone, Debug)]
 pub enum Value<'a> {
     Nothing,
@@ -459,6 +469,7 @@ pub enum Value<'a> {
     Int(i64),
     Float(f64),
     String(ARc<'a, str>),
+    Path { path: ARc<'a, str>, kind: PathKind },
     Size(Bytes),
     Duration(Nanos),
     Date(DateTime),
@@ -479,6 +490,10 @@ impl<'a> Value<'a> {
         Value::String(Rc::from_str_in(s, alloc))
     }
 
+    pub fn path(s: &str, kind: PathKind, alloc: Alloc<'a>) -> Value<'a> {
+        Value::Path { path: Rc::from_str_in(s, alloc), kind }
+    }
+
     pub fn binary(b: &[u8], alloc: Alloc<'a>) -> Value<'a> {
         Value::Binary(Rc::from_slice_in(b, alloc))
     }
@@ -494,6 +509,7 @@ impl<'a> Value<'a> {
             Value::Int(_) => "int",
             Value::Float(_) => "float",
             Value::String(_) => "string",
+            Value::Path { .. } => "path",
             Value::Size(_) => "size",
             Value::Duration(_) => "duration",
             Value::Date(_) => "date",
@@ -515,6 +531,7 @@ impl<'a> Value<'a> {
             Value::Int(n) => *n != 0,
             Value::Float(f) => *f != 0.0 && !f.is_nan(),
             Value::String(s) => !s.is_empty(),
+            Value::Path { path, .. } => !path.is_empty(),
             Value::Size(Bytes(n)) => *n != 0,
             Value::Duration(Nanos(n)) => *n != 0,
             Value::List(v) => !v.is_empty(),
@@ -528,6 +545,7 @@ impl<'a> Value<'a> {
     pub fn as_str(&self) -> Option<&str> {
         match self {
             Value::String(s) => Some(s.as_ref()),
+            Value::Path { path, .. } => Some(path.as_ref()),
             _ => None,
         }
     }
@@ -646,6 +664,9 @@ impl<'a> Value<'a> {
             (Value::Int(a), Value::Float(b)) => (*a as f64).partial_cmp(b),
             (Value::Float(a), Value::Int(b)) => a.partial_cmp(&(*b as f64)),
             (Value::String(a), Value::String(b)) => Some(a.as_ref().cmp(b.as_ref())),
+            (Value::Path { path: a, .. }, Value::Path { path: b, .. }) => Some(a.as_ref().cmp(b.as_ref())),
+            (Value::Path { path: a, .. }, Value::String(b)) => Some(a.as_ref().cmp(b.as_ref())),
+            (Value::String(a), Value::Path { path: b, .. }) => Some(a.as_ref().cmp(b.as_ref())),
             (Value::Size(a), Value::Size(b)) => Some(a.cmp(b)),
             (Value::Duration(a), Value::Duration(b)) => Some(a.cmp(b)),
             (Value::Date(a), Value::Date(b)) => Some(a.cmp(b)),
@@ -662,6 +683,7 @@ impl<'a> Value<'a> {
             Value::Int(n) => write!(out, "{n}"),
             Value::Float(f) => write!(out, "{f}"),
             Value::String(s) => out.write_str(s.as_ref()),
+            Value::Path { path, .. } => out.write_str(path.as_ref()),
             Value::Size(b) => format_size(*b, out),
             Value::Duration(d) => format_duration(*d, out),
             Value::Date(dt) => format_date(*dt, out),
@@ -719,6 +741,7 @@ impl<'a> Value<'a> {
             Value::Int(n) => blaze_data::Value::Int(blaze_data::Int::from_i64(*n)),
             Value::Float(f) => blaze_data::Value::Float(*f),
             Value::String(s) => blaze_data::Value::Text(AString::from_str_in(s.as_ref(), alloc)),
+            Value::Path { path, .. } => blaze_data::Value::Text(AString::from_str_in(path.as_ref(), alloc)),
             Value::Size(Bytes(n)) => blaze_data::Value::Int(blaze_data::Int::from_i64(*n)),
             Value::Duration(Nanos(n)) => blaze_data::Value::Int(blaze_data::Int::from_i64(*n)),
             Value::Date(dt) => {
@@ -829,6 +852,9 @@ impl PartialEq for Value<'_> {
             (Value::Int(a), Value::Float(b)) => (*a as f64) == *b,
             (Value::Float(a), Value::Int(b)) => *a == (*b as f64),
             (Value::String(a), Value::String(b)) => a.as_ref() == b.as_ref(),
+            (Value::Path { path: a, .. }, Value::Path { path: b, .. }) => a.as_ref() == b.as_ref(),
+            (Value::Path { path: a, .. }, Value::String(b)) => a.as_ref() == b.as_ref(),
+            (Value::String(a), Value::Path { path: b, .. }) => a.as_ref() == b.as_ref(),
             (Value::Size(a), Value::Size(b)) => a == b,
             (Value::Duration(a), Value::Duration(b)) => a == b,
             (Value::Date(a), Value::Date(b)) => a == b,

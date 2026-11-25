@@ -38,11 +38,50 @@ const MACOS_FOLDER_SVG: &str = r##"<svg width="16" height="16" viewBox="0 0 16 1
 <line x1="2.4" y1="5.1" x2="13.6" y2="5.1" stroke="#8ECEFF" stroke-width="0.6"/>
 </svg>"##;
 
+/// Warm amber excluded build-directory folder (`target/`, `.blaze/`, `node_modules/`), matching RustRover.
+const EXCLUDED_FOLDER_SVG: &str = r##"<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+<path d="M1.2 3.2C1.2 2.48 1.78 1.9 2.5 1.9H6.0C6.42 1.9 6.81 2.1 7.06 2.44L7.85 3.45H13.5C14.22 3.45 14.8 4.03 14.8 4.75V12.4C14.8 13.12 14.22 13.7 13.5 13.7H2.5C1.78 13.7 1.2 13.12 1.2 12.4V3.2Z" fill="#B57234"/>
+<rect x="1.2" y="4.8" width="13.6" height="8.9" rx="1.45" fill="#D49253"/>
+<line x1="2.4" y1="5.1" x2="13.6" y2="5.1" stroke="#E8B27A" stroke-width="0.6"/>
+</svg>"##;
+
+/// RustRover / IntelliJ New UI `Cargo.toml` icon: 3 Cargo orange crate boxes + circular TOML badge.
+const CARGO_TOML_SVG: &str = r##"<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+<rect x="1.6" y="1.6" width="5.0" height="5.0" rx="0.9" fill="#3B2719" stroke="#D98245" stroke-width="1.25"/>
+<rect x="8.6" y="1.6" width="5.0" height="5.0" rx="0.9" fill="#3B2719" stroke="#D98245" stroke-width="1.25"/>
+<rect x="1.6" y="8.6" width="5.0" height="5.0" rx="0.9" fill="#3B2719" stroke="#D98245" stroke-width="1.25"/>
+<circle cx="11.7" cy="11.7" r="3.1" fill="#232529" stroke="#CED0D6" stroke-width="1.15"/>
+<path d="M10.1 10.6H13.3M11.7 10.6V13.4" stroke="#CED0D6" stroke-width="1.1" stroke-linecap="round"/>
+</svg>"##;
+
+/// RustRover / IntelliJ New UI `Cargo.lock` icon: 3 Cargo orange crate boxes + silver padlock badge.
+const CARGO_LOCK_SVG: &str = r##"<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+<rect x="1.6" y="1.6" width="5.0" height="5.0" rx="0.9" fill="#3B2719" stroke="#D98245" stroke-width="1.25"/>
+<rect x="8.6" y="1.6" width="5.0" height="5.0" rx="0.9" fill="#3B2719" stroke="#D98245" stroke-width="1.25"/>
+<rect x="1.6" y="8.6" width="5.0" height="5.0" rx="0.9" fill="#3B2719" stroke="#D98245" stroke-width="1.25"/>
+<path d="M10.2 10.4V9.3C10.2 8.45 10.85 7.8 11.7 7.8C12.55 7.8 13.2 8.45 13.2 9.3V10.4" stroke="#CED0D6" stroke-width="1.15" stroke-linecap="round"/>
+<rect x="9.1" y="10.4" width="5.2" height="4.2" rx="0.9" fill="#232529" stroke="#CED0D6" stroke-width="1.15"/>
+</svg>"##;
+
+/// Blaze `blaze.lock` icon: 3 blaze-ember crate boxes (`#E0461A`) + silver padlock badge.
+const BLAZE_LOCK_SVG: &str = r##"<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+<rect x="1.6" y="1.6" width="5.0" height="5.0" rx="0.9" fill="#3D1C14" stroke="#E85A30" stroke-width="1.25"/>
+<rect x="8.6" y="1.6" width="5.0" height="5.0" rx="0.9" fill="#3D1C14" stroke="#E85A30" stroke-width="1.25"/>
+<rect x="1.6" y="8.6" width="5.0" height="5.0" rx="0.9" fill="#3D1C14" stroke="#E85A30" stroke-width="1.25"/>
+<path d="M10.2 10.4V9.3C10.2 8.45 10.85 7.8 11.7 7.8C12.55 7.8 13.2 8.45 13.2 9.3V10.4" stroke="#CED0D6" stroke-width="1.15" stroke-linecap="round"/>
+<rect x="9.1" y="10.4" width="5.2" height="4.2" rx="0.9" fill="#232529" stroke="#CED0D6" stroke-width="1.15"/>
+</svg>"##;
+
 macro_rules! intellij_dark {
     ($($name:literal),* $(,)?) => {
         &[
-            // Two-tone macOS blue folder (matching `ix.dev/blaze`'s `target/`).
+            // Two-tone macOS blue folder & RustRover excluded amber folder.
             ("folder_macos", MACOS_FOLDER_SVG),
+            ("folder_target", EXCLUDED_FOLDER_SVG),
+            // RustRover / IntelliJ New UI Cargo & Blaze manifest/lock icons.
+            ("cargo_toml", CARGO_TOML_SVG),
+            ("cargo_lock", CARGO_LOCK_SVG),
+            ("blaze_lock", BLAZE_LOCK_SVG),
             // Open-source IntelliJ New UI dark file icons (Apache-2.0, see harness-native-render/icons/files/NOTICE).
             ("gitignore", include_str!("../../harness/harness-native-render/icons/files/gitignore.svg")),
             $(($name, include_str!(concat!("../../harness/harness-native-render/icons/files/", $name, ".svg")))),*
@@ -119,14 +158,17 @@ pub fn icon_name_for_file(path: &str, kind: Option<&str>) -> &'static str {
     if is_dir {
         return match base_raw {
             ".github" => "folderGithub_dark",
+            "target" | ".blaze" | "node_modules" | "dist" | "build" => "folder_target",
             _ => "folder_macos",
         };
     }
     let base = base_raw.to_ascii_lowercase();
     match base.as_str() {
+        "cargo.toml" => return "cargo_toml",
+        "cargo.lock" => return "cargo_lock",
+        "blaze.lock" => return "blaze_lock",
         "flake.nix" | "default.nix" | "shell.nix" => return "nix_dark",
-        "cargo.lock"
-        | "flake.lock"
+        "flake.lock"
         | "package-lock.json"
         | "yarn.lock"
         | "bun.lock"

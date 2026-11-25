@@ -23,6 +23,9 @@ pub enum Icon {
     Terminal,
     Error,
     Blaze,
+    Grid,
+    Table,
+    Search,
 }
 
 /// Infer the best semantic icon and restrained `ix.dev/blaze` accent color for a filesystem entry.
@@ -329,6 +332,43 @@ pub fn draw_icon(
         Icon::Blaze => {
             // Minimal blaze ember mark.
             scene.over_circle(cx, cy, s * 0.28, color, clip_id);
+        }
+        Icon::Grid => {
+            // Crisp 2×2 rounded squares icon (switch to compact grid view).
+            let g = s * 0.14;
+            let b = s * 0.34;
+            let r = s * 0.08;
+            let x1 = x + s * 0.10;
+            let x2 = x1 + b + g;
+            let y1 = y + s * 0.10;
+            let y2 = y1 + b + g;
+            for (rx, ry) in [(x1, y1), (x2, y1), (x1, y2), (x2, y2)] {
+                scene.round_rect(rx, ry, rx + b, ry + b, r, [0.0; 4], t, color, clip_id);
+            }
+        }
+        Icon::Table => {
+            // Crisp minimal table frame + header rule + vertical divider (switch to table view).
+            scene.round_rect(
+                x + s * 0.10,
+                y + s * 0.14,
+                x + s * 0.90,
+                y + s * 0.86,
+                s * 0.12,
+                [0.0; 4],
+                t,
+                color,
+                clip_id,
+            );
+            scene.line(x + s * 0.12, y + s * 0.38, x + s * 0.88, y + s * 0.38, t, color, clip_id);
+            scene.line(x + s * 0.44, y + s * 0.38, x + s * 0.44, y + s * 0.84, t, color, clip_id);
+        }
+        Icon::Search => {
+            // Crisp magnifying glass for Atuin-style history search palette.
+            let r = s * 0.29;
+            let mx = x + s * 0.43;
+            let my = y + s * 0.43;
+            scene.over_ring(mx, my, r, t, color, clip_id);
+            scene.line(mx + r * 0.72, my + r * 0.72, x + s * 0.88, y + s * 0.88, t * 1.15, color, clip_id);
         }
     }
 }

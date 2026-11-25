@@ -53,6 +53,8 @@ pub struct GitStatusSummary {
     pub state_label: Option<String>,
     /// Exact Starship status bracket (e.g. `"[?]"`, `"[!2+1?]"`, `"[⇡1]"`, or `""` when clean).
     pub status_badge: String,
+    /// Distinct IntelliJ SVG icon names for uncommitted files (`(icon_name, count)`), ordered by frequency.
+    pub changed_icons: Vec<(&'static str, u32)>,
     pub dirty: bool,
     pub conflicted: u32,
     pub staged: u32,
@@ -77,6 +79,8 @@ pub struct PromptInfo {
     pub git_status: Option<GitStatusSummary>,
     /// True when a `Cargo.toml` lives in cwd or repo root.
     pub in_rust_project: bool,
+    /// Detected project toolchain/ecosystem IntelliJ SVG icons (e.g. `rust_dark`, `nix_dark`, `typeScript_dark`).
+    pub project_icons: Vec<&'static str>,
     pub last_exit: i32,
     pub last_duration_ms: u64,
 }
@@ -87,8 +91,32 @@ impl PromptInfo {
         let head = read_git_head(cwd);
         let cwd_display = abbreviate_home(cwd, home);
         let dir_short = short_dir_display(cwd, home, head.as_ref().map(|h| h.work_tree.as_path()));
-        let in_rust_project = Path::new(cwd).join("Cargo.toml").exists()
-            || head.as_ref().is_some_and(|h| h.work_tree.join("Cargo.toml").exists());
+        let root = head.as_ref().map(|h| h.work_tree.as_path());
+        let has_marker = |name: &str| {
+            Path::new(cwd).join(name).exists() || root.is_some_and(|r| r.join(name).exists())
+        };
+        let in_rust_project = has_marker("Cargo.toml");
+        let mut project_icons = Vec::new();
+        if in_rust_project {
+            project_icons.push("rust_dark");
+        }
+        if has_marker("tsconfig.json") {
+            project_icons.push("typeScript_dark");
+        } else if has_marker("package.json") {
+            project_icons.push("javaScript_dark");
+        }
+        if has_marker("pyproject.toml") || has_marker("requirements.txt") {
+            project_icons.push("python_dark");
+        }
+        if has_marker("go.mod") {
+            project_icons.push("go_dark");
+        }
+        if has_marker("flake.nix") {
+            project_icons.push("nix_dark");
+        }
+        if has_marker("Dockerfile") {
+            project_icons.push("docker_dark");
+        }
         let (git_branch, git_detached) = match head {
             Some(h) => (Some(h.label), h.detached),
             None => (None, false),
@@ -101,6 +129,7 @@ impl PromptInfo {
             git_detached,
             git_status: None,
             in_rust_project,
+            project_icons,
             last_exit,
             last_duration_ms,
         }
@@ -303,6 +332,20 @@ pub fn query_blaze_git_status(cwd: &str) -> Option<GitStatusSummary> {
                     .map(|idx| full_fmt[idx + 1..].to_owned())
                     .unwrap_or_default();
 
+                // Collect distinct IntelliJ SVG icons for uncommitted files, ranked by count.
+                let mut changed_icons: Vec<(&'static str, u32)> = Vec::new();
+                for sample in status.changed_samples.iter() {
+                    let p = sample.path.as_str();
+                    let leaf = p.rsplit('/').next().unwrap_or(p);
+                    let icon = crate::svg_icons::icon_name_for_file(leaf, Some("file"));
+                    if let Some(slot) = changed_icons.iter_mut().find(|(n, _)| *n == icon) {
+                        slot.1 += 1;
+                    } else {
+                        changed_icons.push((icon, 1));
+                    }
+                }
+                changed_icons.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+
                 let dirty = c.conflicted > 0
                     || staged > 0
                     || c.modified > 0
@@ -316,6 +359,7 @@ pub fn query_blaze_git_status(cwd: &str) -> Option<GitStatusSummary> {
                     tag,
                     state_label,
                     status_badge,
+                    changed_icons,
                     dirty,
                     conflicted: c.conflicted,
                     staged,

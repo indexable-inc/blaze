@@ -6,7 +6,11 @@
 
 use blaze_own::Alloc;
 use blaze_sh::lex::{HighlightSpan, highlight};
-use blaze_sh::{Bytes, ColDisplay, Record, ShellError, Table, Value, line_col};
+use blaze_sh::{
+    Bytes, ColDisplay, DateTime, PathKind, Record, ShellError, Table, Value, format_relative_time,
+    line_col,
+};
+use blaze_vim::{CursorShape, Mode as VimMode};
 use blaze_vt::color::Colors;
 use blaze_vt::page::Wide;
 use blaze_vt::style::{Color as VtColor, Rgb as VtRgb, Underline as VtUnderline};
@@ -19,8 +23,9 @@ use crate::prompt::PromptInfo;
 use crate::svg_icons::icon_name_for_file;
 use crate::theme;
 use crate::view::{
-    ActiveDrag, CellMetrics, DragPayload, HitAction, HitRect, Scene, format_duration_ms,
-    format_value_cell_at, is_expandable_cell, truncate_chars, wrap_lines,
+    ActiveDrag, CellMetrics, CursorTrail, DragPayload, HitAction, HitRect, Scene, TextSelection,
+    compute_text_selection, format_duration_ms, format_value_cell_at, is_expandable_cell,
+    truncate_chars, wrap_lines,
 };
 
 pub const TOP_BAR_H: f32 = 34.0;
@@ -49,6 +54,10 @@ pub struct LayoutInput<'a> {
     pub inline_titlebar: bool,
     /// In-flight drag-and-drop payload and pointer position, if any.
     pub drag: Option<&'a ActiveDrag>,
+    /// Active Ghostty-style eased cursor sweep trail (`EaseOutCubic`, `0.2s`), if animating.
+    pub cursor_trail: Option<CursorTrail>,
+    /// Active mouse drag-selection over rendered output/terminal text (screen coordinates).
+    pub text_selection: Option<TextSelection>,
 }
 
 /// Lay out the full `ix.dev/blaze` + Starship inline-stream shell interface.
@@ -118,12 +127,21 @@ pub fn build_scene(input: &LayoutInput<'_>) -> Scene {
         feed_clip,
         input.cursor_visible,
         input.drag,
+        input.cursor_trail,
     );
     let prompt_y1 = prompt_y0 + prompt_h;
     content_y += prompt_h + 14.0;
     scene.total_content_height = content_y;
 
-    // 4. Unified inline macOS titlebar (branch tabs, cwd/git pill, zoom, fork button).
+    // 3b. Translucent selection highlight over any drag-selected scrollback/output text.
+    if let Some(sel) = input.text_selection {
+        let (sel_rects, _) = compute_text_selection(&scene.text_runs, m, sel, feed_top);
+        for [rx0, ry0, rx1, ry1] in sel_rects {
+            scene.over_round_rect(rx0, ry0, rx1, ry1, 2.0, [0.24, 0.50, 0.90, 0.34], feed_clip);
+        }
+    }
+
+    // 4. Unified inline macOS titlebar (branch tabs, cwd/git pill, zoom, icon fork button).
     layout_top_bar(
         &mut scene,
         input.store,
@@ -134,9 +152,9 @@ pub fn build_scene(input: &LayoutInput<'_>) -> Scene {
         input.inline_titlebar,
     );
 
-    // 5. Floating overlays anchored directly below (or flipped above) the live inline prompt.
+    // 5. Floating overlays: Atuin-class Ctrl+R history palette, Tab completion popup, drag chip.
     if let Some(rs) = &input.editor.reverse_search {
-        layout_reverse_search_overlay(&mut scene, rs, col_x0, prompt_y0, prompt_y1, vh, col_x1, m);
+        layout_reverse_search_overlay(&mut scene, rs, vw, vh, m, input.now_ns);
     } else if !input.editor.completions.is_empty() {
         layout_completion_popup(&mut scene, input.editor, col_x0, prompt_y0, prompt_y1, vh, col_x1, m);
     }
@@ -164,16 +182,14 @@ fn layout_top_bar(
     let icon_y = (TOP_BAR_H - icon_s) * 0.5;
     let mut x = if inline_titlebar { TRAFFIC_LIGHTS_PAD } else { OUTER_PAD_X };
 
-    // Right-aligned inline controls inside the titlebar: `fork`, optional zoom badge, cwd/git chip.
-    let mut rx = vw - 16.0;
-    let fork_label = "fork";
-    let fork_w = icon_s + 6.0 + fork_label.len() as f32 * m.cw + 16.0;
+    // Right-aligned inline controls inside the titlebar: icon-only fork button, zoom badge, cwd/git.
+    let mut rx = vw - 14.0;
+    let btn_y0 = 6.0;
+    let btn_y1 = TOP_BAR_H - 6.0;
+    let fork_w = 26.0;
     let fork_x0 = (rx - fork_w).max(x + 20.0);
-    let btn_y0 = 7.0;
-    let btn_y1 = TOP_BAR_H - 7.0;
     scene.round_rect(fork_x0, btn_y0, rx, btn_y1, 6.0, theme::BG_CHIP, 1.0, theme::LINE, 0);
-    draw_icon(scene, Icon::Branch, fork_x0 + 8.0, icon_y, icon_s, theme::INK_3, 0);
-    scene.text(fork_x0 + 8.0 + icon_s + 5.0, mid_y, fork_label, theme::INK_2, false, false, 0);
+    draw_icon(scene, Icon::Branch, fork_x0 + (fork_w - icon_s) * 0.5, icon_y, icon_s, theme::INK_2, 0);
     scene.push_hit(HitRect::new(fork_x0, btn_y0, rx, btn_y1), HitAction::ForkActiveBranch);
     rx = fork_x0 - 10.0;
 
@@ -190,20 +206,35 @@ fn layout_top_bar(
         }
     }
 
-    // Inline repo/directory + branch status badge tucked cleanly on the right of the titlebar.
+    // Inline repo/directory + branch + uncommitted file icons tucked cleanly on the right of the titlebar.
     let dir_txt = truncate_chars(&prompt.dir_short, 24);
     let branch_part = prompt.git_branch.as_deref().unwrap_or("");
-    let badge_part = prompt
+    let top_icons: &[(&'static str, u32)] = prompt
         .git_status
         .as_ref()
-        .map(|s| s.status_badge.as_str())
-        .unwrap_or("");
+        .map(|s| s.changed_icons.as_slice())
+        .unwrap_or(&[]);
+    let top_dirty_total: u32 = prompt
+        .git_status
+        .as_ref()
+        .map(|s| s.conflicted + s.staged + s.modified + s.deleted + s.untracked)
+        .unwrap_or(0);
     let dir_icon_s = 13.0;
+    let mini_icon_s = 11.5;
+    let shown_top_icons = top_icons.len().min(3);
+    let dirty_count_str = if top_dirty_total > 0 {
+        format!("{top_dirty_total}")
+    } else {
+        String::new()
+    };
     let mut info_w = dir_icon_s + 6.0 + dir_txt.chars().count() as f32 * m.cw;
     if !branch_part.is_empty() {
         info_w += 14.0 + icon_s + 5.0 + branch_part.chars().count() as f32 * m.cw;
-        if !badge_part.is_empty() {
-            info_w += 6.0 + badge_part.chars().count() as f32 * m.cw;
+        if shown_top_icons > 0 {
+            info_w += 8.0 + shown_top_icons as f32 * (mini_icon_s + 2.5);
+            if !dirty_count_str.is_empty() {
+                info_w += 2.0 + dirty_count_str.len() as f32 * m.cw;
+            }
         }
     }
     let info_x0 = rx - info_w - 8.0;
@@ -219,9 +250,16 @@ fn layout_top_bar(
             ix += icon_s + 5.0;
             scene.text(ix, mid_y, branch_part, theme::PROMPT_BRANCH, false, false, 0);
             ix += branch_part.chars().count() as f32 * m.cw;
-            if !badge_part.is_empty() {
-                ix += 6.0;
-                scene.text(ix, mid_y, badge_part, theme::PROMPT_STATUS, false, false, 0);
+            if shown_top_icons > 0 {
+                ix += 8.0;
+                let miy = (TOP_BAR_H - mini_icon_s) * 0.5;
+                for &(ic, _) in top_icons.iter().take(shown_top_icons) {
+                    scene.svg_icon(ix, miy, mini_icon_s, ic, 0);
+                    ix += mini_icon_s + 2.5;
+                }
+                if !dirty_count_str.is_empty() {
+                    scene.text(ix + 2.0, mid_y, &dirty_count_str, theme::PROMPT_STATUS, false, false, 0);
+                }
             }
         }
         info_x0 - 18.0
@@ -258,7 +296,8 @@ fn layout_top_bar(
     }
 }
 
-/// Draw a Starship-style context line (`folder  dir on  branch [?] ✦`) using `blaze-git` status.
+/// Draw an upgraded Starship context line (`folder dir on  branch [🦀 🇹 6] · 🦀`) powered by
+/// `blaze-git` + custom IntelliJ SVG icons for uncommitted file types & detected project toolchains.
 #[allow(clippy::too_many_arguments)]
 fn layout_starship_line(
     scene: &mut Scene,
@@ -275,7 +314,7 @@ fn layout_starship_line(
     scene.svg_icon(cx, iy, icon_s, "folder_macos", clip_id);
     cx += icon_s + 6.0;
 
-    let max_dir = ((max_w * 0.45) / m.cw).floor().max(12.0) as usize;
+    let max_dir = ((max_w * 0.42) / m.cw).floor().max(12.0) as usize;
     let dir_lbl = truncate_chars(
         if prompt.dir_short.is_empty() { &prompt.cwd_display } else { &prompt.dir_short },
         max_dir,
@@ -304,7 +343,71 @@ fn layout_starship_line(
                 scene.text(cx, y, &s_txt, theme::FIRE, true, false, clip_id);
                 cx += s_txt.chars().count() as f32 * m.cw;
             }
-            if !st.status_badge.is_empty() {
+
+            let total_dirty = st.conflicted + st.staged + st.modified + st.deleted + st.untracked;
+            if !st.changed_icons.is_empty() {
+                // Visual file-type pill showing custom IntelliJ SVG icons of uncommitted files!
+                let shown_icons = st.changed_icons.len().min(4);
+                let count_txt = if total_dirty > 1 {
+                    format!("{total_dirty}")
+                } else {
+                    String::new()
+                };
+                let f_icon = 12.5;
+                let pill_pad_x = 6.0;
+                let icons_w = shown_icons as f32 * (f_icon + 3.0) - 3.0;
+                let count_w = if count_txt.is_empty() {
+                    0.0
+                } else {
+                    5.0 + count_txt.len() as f32 * m.cw
+                };
+                let pill_w = pill_pad_x * 2.0 + icons_w + count_w;
+                cx += 7.0;
+                let px0 = cx;
+                let py0 = y - 1.0;
+                let py1 = y + m.ch + 1.0;
+                let bd_col = if st.conflicted > 0 {
+                    theme::DANGER
+                } else if st.staged > 0 && st.modified == 0 && st.untracked == 0 {
+                    theme::OK
+                } else {
+                    theme::LINE_STRONG
+                };
+                scene.round_rect(px0, py0, px0 + pill_w, py1, 5.0, theme::BG_CHIP, 1.0, bd_col, clip_id);
+                let mut ix = px0 + pill_pad_x;
+                let f_iy = y + (m.ch - f_icon) * 0.5;
+                for &(icon_name, _) in st.changed_icons.iter().take(shown_icons) {
+                    scene.svg_icon(ix, f_iy, f_icon, icon_name, clip_id);
+                    ix += f_icon + 3.0;
+                }
+                if !count_txt.is_empty() {
+                    let count_col = if st.conflicted > 0 {
+                        theme::DANGER
+                    } else if st.modified > 0 || st.deleted > 0 {
+                        theme::FIRE
+                    } else {
+                        theme::PROMPT_STATUS
+                    };
+                    scene.text(ix + 2.0, y, &count_txt, count_col, true, false, clip_id);
+                }
+                cx = px0 + pill_w;
+
+                // Compact ahead / behind / stash indicators alongside the file-icon pill.
+                let mut extras = String::new();
+                if st.ahead > 0 {
+                    extras.push_str(&format!(" ⇡{}", st.ahead));
+                }
+                if st.behind > 0 {
+                    extras.push_str(&format!(" ⇣{}", st.behind));
+                }
+                if st.stashed > 0 {
+                    extras.push_str(&format!(" ≡{}", st.stashed));
+                }
+                if !extras.is_empty() {
+                    scene.text(cx, y, &extras, theme::INK_3, false, false, clip_id);
+                    cx += extras.chars().count() as f32 * m.cw;
+                }
+            } else if !st.status_badge.is_empty() {
                 cx += 0.8 * m.cw;
                 scene.text(cx, y, &st.status_badge, theme::PROMPT_STATUS, true, false, clip_id);
                 cx += st.status_badge.chars().count() as f32 * m.cw;
@@ -312,9 +415,25 @@ fn layout_starship_line(
         }
     }
 
-    if prompt.in_rust_project || prompt.git_branch.is_some() {
+    // Project toolchain SVG icons (`rust_dark`, `typeScript_dark`, `nix_dark`, ...) or subtle `✦`.
+    if !prompt.project_icons.is_empty() {
+        cx += 8.0;
+        let p_s = 13.0;
+        let p_iy = y + (m.ch - p_s) * 0.5;
+        for &icon_name in prompt.project_icons.iter().take(3) {
+            scene.svg_icon(cx, p_iy, p_s, icon_name, clip_id);
+            cx += p_s + 4.0;
+        }
+    } else if prompt.git_branch.is_some() {
         cx += 0.9 * m.cw;
         scene.text(cx, y, "✦", theme::PROMPT_SPARK, false, false, clip_id);
+        cx += m.cw;
+    }
+
+    // Starship-style elapsed duration badge when the previous command took >= 1s.
+    if prompt.last_duration_ms >= 1000 {
+        let took = format!(" took {}", format_duration_ms(prompt.last_duration_ms));
+        scene.text(cx, y, &took, theme::FIRE, false, false, clip_id);
     }
 }
 
@@ -339,51 +458,54 @@ fn layout_block(
         cur_y += m.ch + 2.0;
     }
 
-    // Right-aligned quiet inline metadata on the command row: exit, duration, optional grid/table toggle, `fork`.
+    // Right-aligned quiet icon buttons on the command row: fork icon, optional grid/table icon, duration, exit.
     let mut rx = x1;
-    let fork_lbl = "fork";
-    let fork_w = fork_lbl.len() as f32 * m.cw;
-    let fx0 = rx - fork_w;
-    scene.text(fx0, cur_y, fork_lbl, theme::INK_4, false, false, clip_id);
+    let act_s = 12.0;
+    let act_iy = cur_y + (m.ch - act_s) * 0.5;
+    let fx0 = rx - act_s;
+    draw_icon(scene, Icon::Branch, fx0, act_iy, act_s, theme::INK_4, clip_id);
     scene.push_hit_clipped(
         HitRect::new(fx0 - 4.0, cur_y - 2.0, rx + 4.0, cur_y + m.ch + 2.0),
         clip_id,
         HitAction::ForkBlock(block.id),
     );
-    rx = fx0 - 14.0;
+    rx = fx0 - 12.0;
 
-    // Quiet `table` / `grid` toggle on file-entry tables (e.g. `ls`, `ls -l`, `ls | sort-by ...`).
+    // Quiet icon-only table/grid view toggle on file-entry tables (`ls`, `ls -l`, `ls | sort-by ...`).
     if let BlockBody::Value(Value::Table(t)) = &block.body
         && is_file_table(t)
     {
         let in_grid = block.is_grid_view(t.default_grid);
-        let mode_lbl = if in_grid { "table" } else { "grid" };
-        let mw = mode_lbl.len() as f32 * m.cw;
-        let mx0 = rx - mw;
-        scene.text(mx0, cur_y, mode_lbl, theme::INK_4, false, false, clip_id);
+        let toggle_icon = if in_grid { Icon::Table } else { Icon::Grid };
+        let mx0 = rx - act_s;
+        draw_icon(scene, toggle_icon, mx0, act_iy, act_s, theme::INK_4, clip_id);
         scene.push_hit_clipped(
             HitRect::new(mx0 - 4.0, cur_y - 2.0, rx + 4.0, cur_y + m.ch + 2.0),
             clip_id,
             HitAction::ToggleTableView(block.id),
         );
-        rx = mx0 - 14.0;
+        rx = mx0 - 12.0;
     }
 
-    let dur_lbl = format_duration_ms(block.duration_ms);
-    let dur_w = dur_lbl.len() as f32 * m.cw;
-    scene.text(rx - dur_w, cur_y, dur_lbl, theme::INK_4, false, false, clip_id);
-    rx -= dur_w + 12.0;
-
-    if matches!(&block.body, BlockBody::Terminal { running: true, .. }) {
-        let lbl = "running";
+    if matches!(&block.body, BlockBody::Running { .. } | BlockBody::Terminal { running: true, .. }) {
+        let elapsed_ms = (now_ns.max(0) as u64 / 1_000_000).saturating_sub(block.started_ms);
+        let lbl = format_duration_ms(elapsed_ms);
         let w = lbl.len() as f32 * m.cw;
         scene.text(rx - w, cur_y, lbl, theme::FIRE, false, false, clip_id);
-        rx -= w + 12.0;
-    } else if block.exit_code != 0 {
-        let lbl = format!("exit {}", block.exit_code);
-        let w = lbl.len() as f32 * m.cw;
-        scene.text(rx - w, cur_y, lbl, theme::DANGER, false, false, clip_id);
-        rx -= w + 12.0;
+        scene.over_circle(rx - w - 9.0, cur_y + m.ch * 0.5, 3.0, theme::FIRE, clip_id);
+        rx -= w + 20.0;
+    } else {
+        let dur_lbl = format_duration_ms(block.duration_ms);
+        let dur_w = dur_lbl.len() as f32 * m.cw;
+        scene.text(rx - dur_w, cur_y, dur_lbl, theme::INK_4, false, false, clip_id);
+        rx -= dur_w + 12.0;
+
+        if block.exit_code != 0 {
+            let lbl = format!("exit {}", block.exit_code);
+            let w = lbl.len() as f32 * m.cw;
+            scene.text(rx - w, cur_y, lbl, theme::DANGER, false, false, clip_id);
+            rx -= w + 12.0;
+        }
     }
 
     // Command row: Starship `❯` prompt + syntax-highlighted command source.
@@ -467,6 +589,12 @@ fn layout_block(
                     m,
                     clip_id,
                 )
+            }
+            BlockBody::Running { label } => {
+                scene.over_circle(x0 + 5.0, cur_y + m.ch * 0.5, 3.0, theme::FIRE, clip_id);
+                let txt = if label.is_empty() { "running…" } else { label.as_str() };
+                scene.text(x0 + 15.0, cur_y, txt, theme::INK_3, false, false, clip_id);
+                m.ch + 2.0
             }
         };
         cur_y += body_h;
@@ -1341,6 +1469,81 @@ fn layout_scalar(
     clip_id: u32,
     now_ns: i64,
 ) -> f32 {
+    // Rich typed `Value::Path` (returned by `pwd`, etc.): macOS folder / IntelliJ file icon,
+    // dimmed parent path + bright leaf segment, subtle `path` pill, and draggable into the prompt!
+    if let Value::Path { path, kind } = val {
+        let raw = path.as_ref();
+        let kind_hint = match kind {
+            PathKind::Dir => Some("dir"),
+            PathKind::File => Some("file"),
+            PathKind::Symlink => Some("symlink"),
+            PathKind::Unknown => None,
+        };
+        let icon_name = if *kind == PathKind::Dir {
+            "folder_macos"
+        } else {
+            icon_name_for_file(raw, kind_hint)
+        };
+        let icon_s = 14.0;
+        let icon_pad = icon_s + 6.0;
+        let type_lbl = "path";
+        let pill_w = type_lbl.len() as f32 * m.cw + 14.0;
+        let bx0 = x0 + width - pill_w;
+        scene.round_rect(
+            bx0,
+            y0 - 1.0,
+            x0 + width,
+            y0 + m.ch + 1.0,
+            (m.ch + 2.0) * 0.5,
+            [0.0; 4],
+            1.0,
+            theme::LINE,
+            clip_id,
+        );
+        scene.text(bx0 + 7.0, y0, type_lbl, theme::INK_3, false, false, clip_id);
+
+        let avail_w = (bx0 - 14.0 - x0 - icon_pad).max(m.cw * 8.0);
+        let max_ch = (avail_w / m.cw).floor().max(8.0) as usize;
+        let shown = truncate_chars(raw, max_ch);
+        let chip_w = (icon_pad + shown.chars().count() as f32 * m.cw + 12.0).min(bx0 - 10.0 - x0);
+        scene.round_rect(
+            x0 - 4.0,
+            y0 - 2.0,
+            x0 - 4.0 + chip_w,
+            y0 + m.ch + 2.0,
+            5.0,
+            theme::BG_CHIP,
+            0.0,
+            [0.0; 4],
+            clip_id,
+        );
+        scene.svg_icon(x0 + 2.0, y0 + (m.ch - icon_s) * 0.5, icon_s, icon_name, clip_id);
+        let tx = x0 + 2.0 + icon_pad;
+        if let Some(slash) = shown.rfind('/')
+            && slash + 1 < shown.len()
+        {
+            let parent = &shown[..=slash];
+            let leaf = &shown[slash + 1..];
+            scene.text(tx, y0, parent, theme::INK_3, false, false, clip_id);
+            let px = tx + parent.chars().count() as f32 * m.cw;
+            let leaf_col = if *kind == PathKind::Dir { theme::PROMPT_DIR } else { theme::INK_1 };
+            scene.text(px, y0, leaf, leaf_col, true, false, clip_id);
+        } else {
+            let leaf_col = if *kind == PathKind::Dir { theme::PROMPT_DIR } else { theme::INK_1 };
+            scene.text(tx, y0, &shown, leaf_col, true, false, clip_id);
+        }
+        scene.push_drag_source_clipped(
+            HitRect::new(x0 - 4.0, y0 - 2.0, x0 - 4.0 + chip_w, y0 + m.ch + 2.0),
+            clip_id,
+            DragPayload {
+                label: shown,
+                insert_text: raw.to_owned(),
+                icon: Some(icon_name),
+            },
+        );
+        return m.ch + 4.0;
+    }
+
     let type_lbl = val.type_name();
     let type_w = type_lbl.len() as f32 * m.cw;
     let text_w = (width - type_w - 20.0).max(80.0);
@@ -1678,13 +1881,36 @@ fn layout_inline_prompt(
     clip_id: u32,
     cursor_visible: bool,
     drag: Option<&ActiveDrag>,
+    cursor_trail: Option<CursorTrail>,
 ) -> f32 {
     let trimmed = editor.text.trim_start();
     let is_rust_mode = trimmed.starts_with("rust") || trimmed.starts_with(":rs");
     let drop_hover = drag.is_some_and(|d| d.over_composer);
+    let vim_mode = editor.vim_mode();
+    let vim_pending = editor.vim_pending();
 
     // Line 1: Starship context header (`folder dir on  branch [$3] ✦`) + quiet right metadata.
     layout_starship_line(scene, prompt, x0, y0, (x1 - x0) * 0.72, m, clip_id);
+
+    let mut rx = x1;
+    // Sleek Vim mode indicator when in Normal / Visual / VisualLine (plus pending keys like `ci`, `2d`).
+    if vim_mode != VimMode::Insert || !vim_pending.is_empty() {
+        let mode_lbl = if vim_pending.is_empty() {
+            vim_mode.short_label().to_owned()
+        } else {
+            format!("{} {vim_pending}", vim_mode.short_label())
+        };
+        let mw = mode_lbl.chars().count() as f32 * m.cw + 12.0;
+        let mx0 = rx - mw;
+        let (pill_bg, pill_fg) = match vim_mode {
+            VimMode::Normal => (theme::BG_CHIP, theme::INK_2),
+            VimMode::Visual | VimMode::VisualLine => (theme::rgba(0x6e, 0xd8, 0xce, 0.16), theme::PROMPT_DIR),
+            VimMode::Insert => (theme::FIRE_FAINT, theme::FIRE),
+        };
+        scene.round_rect(mx0, y0 - 1.0, rx, y0 + m.ch + 1.0, 4.0, pill_bg, 1.0, theme::LINE, clip_id);
+        scene.text(mx0 + 6.0, y0, mode_lbl, pill_fg, true, false, clip_id);
+        rx = mx0 - 10.0;
+    }
 
     let right_txt = if drop_hover {
         format!("drop `{}` to insert", drag.unwrap().payload.label)
@@ -1706,7 +1932,7 @@ fn layout_inline_prompt(
             theme::INK_4
         };
         let rw = right_txt.chars().count() as f32 * m.cw;
-        scene.text(x1 - rw, y0, right_txt, right_col, false, false, clip_id);
+        scene.text(rx - rw, y0, right_txt, right_col, false, false, clip_id);
     }
 
     // Line 2+: `❯` prompt + editable syntax-highlighted text + Fish ghost text directly inline.
@@ -1735,6 +1961,10 @@ fn layout_inline_prompt(
 
     let prompt_col = if is_rust_mode {
         theme::FIRE
+    } else if vim_mode == VimMode::Normal {
+        theme::PROMPT_BRANCH
+    } else if matches!(vim_mode, VimMode::Visual | VimMode::VisualLine) {
+        theme::PROMPT_DIR
     } else if prompt.last_exit != 0 {
         theme::DANGER
     } else {
@@ -1776,7 +2006,8 @@ fn layout_inline_prompt(
         let h = layout_highlighted_source(scene, &editor.text, &spans, text_x, input_y, x1, m, clip_id);
 
         // Fish/Nushell inline ghost autosuggestion directly after the cursor on single-line input.
-        if let Some(ghost) = &editor.ghost
+        if vim_mode == VimMode::Insert
+            && let Some(ghost) = &editor.ghost
             && !editor.text.contains('\n')
             && editor.cursor == editor.text.len()
         {
@@ -1790,15 +2021,184 @@ fn layout_inline_prompt(
         h
     };
 
+    // Vim cursor shape (Block / Beam / Underline) + Ghostty-style EaseOutCubic sweep trail!
+    let (cline, ccol) = editor.cursor_line_col();
+    let cur_x = text_x + ccol as f32 * m.cw;
+    let cur_y = input_y + cline as f32 * line_step;
+    let shape = editor.vim_cursor_shape();
+    let cur_rect = match shape {
+        CursorShape::Beam => [cur_x, cur_y + 1.0, cur_x + 2.0, cur_y + m.ch - 1.0],
+        CursorShape::Block => [cur_x, cur_y, cur_x + m.cw, cur_y + m.ch],
+        CursorShape::Underline => [cur_x, cur_y + m.ch - 2.5, cur_x + m.cw, cur_y + m.ch],
+    };
+    scene.cursor_rect = Some(cur_rect);
+
     if cursor_visible {
-        let (cline, ccol) = editor.cursor_line_col();
-        let cur_x = text_x + ccol as f32 * m.cw;
-        let cur_y = input_y + cline as f32 * line_step;
-        let cur_col = if is_rust_mode || drop_hover { theme::FIRE } else { theme::INK_1 };
-        scene.over_round_rect(cur_x, cur_y + 1.0, cur_x + 1.8, cur_y + m.ch - 1.0, 0.9, cur_col, clip_id);
+        let cur_col = if is_rust_mode || drop_hover {
+            theme::FIRE
+        } else if shape == CursorShape::Underline {
+            theme::FIRE
+        } else if matches!(vim_mode, VimMode::Visual | VimMode::VisualLine) {
+            theme::PROMPT_DIR
+        } else {
+            theme::INK_1
+        };
+
+        // Ghostty `crt.glsl` eased sweep trail (`DURATION = 0.2s`, `TRAIL_LENGTH = 0.5`, `EaseOutCubic`).
+        if let Some(trail) = cursor_trail
+            && trail.progress < 1.0
+        {
+            layout_ghostty_cursor_trail(scene, trail.prev_rect, cur_rect, trail.progress, cur_col, clip_id);
+        }
+
+        match shape {
+            CursorShape::Beam => {
+                scene.over_round_rect(
+                    cur_rect[0],
+                    cur_rect[1],
+                    cur_rect[2],
+                    cur_rect[3],
+                    1.0,
+                    cur_col,
+                    clip_id,
+                );
+            }
+            CursorShape::Underline => {
+                scene.over_round_rect(
+                    cur_rect[0],
+                    cur_rect[1],
+                    cur_rect[2],
+                    cur_rect[3],
+                    1.0,
+                    cur_col,
+                    clip_id,
+                );
+            }
+            CursorShape::Block => {
+                // Solid Vim block behind text + re-render character under block in inverted dark ink.
+                scene.round_rect(
+                    cur_rect[0],
+                    cur_rect[1],
+                    cur_rect[2],
+                    cur_rect[3],
+                    1.5,
+                    cur_col,
+                    0.0,
+                    [0.0; 4],
+                    clip_id,
+                );
+                if let Some(ch) = editor.text.get(editor.cursor..).and_then(|s| s.chars().next())
+                    && ch != '\n'
+                {
+                    let mut tmp = [0u8; 4];
+                    let s = ch.encode_utf8(&mut tmp);
+                    scene.text(cur_x, cur_y, s, theme::BG_CANVAS, true, false, clip_id);
+                }
+            }
+        }
     }
 
     (input_y + rendered_h.max(text_h) - y0) + 2.0
+}
+
+/// Ghostty `crt.glsl`-faithful EaseOutCubic cursor sweep trail (`TRAIL_LENGTH = 0.5`, `BLUR = 2.0`).
+fn layout_ghostty_cursor_trail(
+    scene: &mut Scene,
+    prev: [f32; 4],
+    cur: [f32; 4],
+    progress: f32,
+    color: [f32; 4],
+    clip_id: u32,
+) {
+    const TRAIL_LENGTH: f32 = 0.5;
+    let p = progress.clamp(0.0, 1.0);
+    // EaseOutCubic: 1 - (1 - p)^3
+    let shrink = 1.0 - (1.0 - p).powi(3);
+
+    let prev_c = [(prev[0] + prev[2]) * 0.5, (prev[1] + prev[3]) * 0.5];
+    let cur_c = [(cur[0] + cur[2]) * 0.5, (cur[1] + cur[3]) * 0.5];
+    let cur_w = (cur[2] - cur[0]).max(2.0);
+    let cur_h = (cur[3] - cur[1]).max(2.0);
+
+    let dx = cur_c[0] - prev_c[0];
+    let dy = cur_c[1] - prev_c[1];
+    let dist = dx.hypot(dy);
+    // Skip tiny 1-char typing jitters; fire cleanly on Vim motions / jumps / completions.
+    if dist <= cur_h * 0.85 {
+        return;
+    }
+
+    let mix = |a: f32, b: f32, t: f32| a + (b - a) * t;
+    let alpha = (1.0 - shrink) * 0.52;
+    if alpha <= 0.01 {
+        return;
+    }
+
+    let is_straight = dx.abs() < 1.0 || dy.abs() < 1.0;
+    if is_straight {
+        // Exact `crt.glsl` straight-move shrunk bounding-rect sweep + 2px soft glow.
+        let min_cx = prev_c[0].min(cur_c[0]);
+        let max_cx = prev_c[0].max(cur_c[0]);
+        let min_cy = prev_c[1].min(cur_c[1]);
+        let max_cy = prev_c[1].max(cur_c[1]);
+
+        let full_w = (max_cx - min_cx) + cur_w;
+        let full_h = (max_cy - min_cy) + cur_h;
+        let full_cx = (min_cx + max_cx) * 0.5;
+        let full_cy = (min_cy + max_cy) * 0.5;
+
+        let start_w = mix(cur_w, full_w, TRAIL_LENGTH);
+        let start_h = mix(cur_h, full_h, TRAIL_LENGTH);
+        let start_cx = mix(cur_c[0], full_cx, TRAIL_LENGTH);
+        let start_cy = mix(cur_c[1], full_cy, TRAIL_LENGTH);
+
+        let anim_w = mix(start_w, cur_w, shrink);
+        let anim_h = mix(start_h, cur_h, shrink);
+        let anim_cx = mix(start_cx, cur_c[0], shrink);
+        let anim_cy = mix(start_cy, cur_c[1], shrink);
+
+        let rx0 = anim_cx - anim_w * 0.5;
+        let ry0 = anim_cy - anim_h * 0.5;
+        let rx1 = anim_cx + anim_w * 0.5;
+        let ry1 = anim_cy + anim_h * 0.5;
+        let glow_col = [color[0], color[1], color[2], alpha * 0.65];
+        scene.shadow(rx0, ry0, rx1, ry1, 1.5, 2.5, glow_col, clip_id);
+        scene.round_rect(
+            rx0,
+            ry0,
+            rx1,
+            ry1,
+            1.5,
+            [color[0], color[1], color[2], alpha],
+            0.0,
+            [0.0; 4],
+            clip_id,
+        );
+    } else {
+        // Smooth diagonal sweep tail (e.g. `gg`/`G`/multi-line jumps).
+        let tail_start_x = mix(cur_c[0], prev_c[0], TRAIL_LENGTH);
+        let tail_start_y = mix(cur_c[1], prev_c[1], TRAIL_LENGTH);
+        let tail_x = mix(tail_start_x, cur_c[0], shrink);
+        let tail_y = mix(tail_start_y, cur_c[1], shrink);
+        const STEPS: usize = 6;
+        for i in 1..=STEPS {
+            let frac = i as f32 / STEPS as f32;
+            let cx = mix(tail_x, cur_c[0], frac);
+            let cy = mix(tail_y, cur_c[1], frac);
+            let step_a = alpha * (0.25 + 0.75 * frac) * 0.65;
+            scene.round_rect(
+                cx - cur_w * 0.5,
+                cy - cur_h * 0.5,
+                cx + cur_w * 0.5,
+                cy + cur_h * 0.5,
+                1.5,
+                [color[0], color[1], color[2], step_a],
+                0.0,
+                [0.0; 4],
+                clip_id,
+            );
+        }
+    }
 }
 
 /// IntelliJ-style live autocomplete popup anchored directly below the inline prompt
@@ -2022,48 +2422,267 @@ fn layout_drag_overlay(scene: &mut Scene, drag: &ActiveDrag, m: CellMetrics) {
     scene.overlay_text_run(cx, y0 + (pill_h - m.ch) * 0.5, label, theme::INK_1, false, false, 0);
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Native Atuin-class `Ctrl+R` command history palette: scored fuzzy search, color-coded
+/// exit/duration column, relative timestamps, directory tags, clickable scope pill (`GLOBAL` /
+/// `DIR` / `SESSION`), fuzzy match highlights, and live command preview.
 fn layout_reverse_search_overlay(
     scene: &mut Scene,
     rs: &crate::editor::ReverseSearch,
-    x0: f32,
-    prompt_y0: f32,
-    prompt_y1: f32,
+    vw: f32,
     vh: f32,
-    x1: f32,
     m: CellMetrics,
+    now_ns: i64,
 ) {
-    let h = 36.0;
-    let below_y0 = prompt_y1 + 6.0;
-    let py0 = if below_y0 + h <= vh - 12.0 {
-        below_y0.max(TOP_BAR_H + 8.0)
+    let max_rows = 12usize;
+    let total_matches = rs.results.len();
+    let visible = total_matches.min(max_rows).max(1);
+    let win_start = if rs.selected >= max_rows {
+        rs.selected + 1 - max_rows
     } else {
-        (prompt_y0 - 8.0 - h).max(TOP_BAR_H + 8.0)
+        0
     };
-    let py1 = py0 + h;
-    scene.overlay_shadow(x0, py0 + 4.0, x1, py1 + 4.0, 8.0, 14.0, theme::SHADOW_SOFT, 0);
-    scene.overlay_round_rect(
-        x0,
-        py0,
-        x1,
-        py1,
-        8.0,
-        theme::BG_POPUP,
-        1.0,
-        theme::LINE_STRONG,
-        0,
-    );
-    let ty = py0 + (h - m.ch) * 0.5;
-    let prefix = format!("history  {}  │  ", rs.query);
-    scene.overlay_text_run(x0 + 14.0, ty, &prefix, theme::INK_3, false, false, 0);
-    let mx = x0 + 14.0 + prefix.chars().count() as f32 * m.cw;
-    let max_m = ((x1 - 14.0 - mx) / m.cw).floor().max(8.0) as usize;
-    match &rs.matched_text {
-        Some(matched) => {
-            scene.overlay_text_run(mx, ty, truncate_chars(matched, max_m), theme::INK_1, false, false, 0);
+
+    let pad_x = 14.0;
+    let header_h = m.ch + 16.0;
+    let row_h = m.ch + 7.0;
+    let input_h = m.ch + 16.0;
+    let preview_h = m.ch + 14.0;
+    let list_h = visible as f32 * row_h + 8.0;
+    let modal_h = (header_h + list_h + input_h + preview_h).min(vh - TOP_BAR_H - 28.0);
+    let modal_w = (vw - 48.0).clamp(440.0, 860.0);
+    let x0 = ((vw - modal_w) * 0.5).max(12.0);
+    let x1 = x0 + modal_w;
+    let y0 = (TOP_BAR_H + ((vh - TOP_BAR_H - modal_h) * 0.42)).max(TOP_BAR_H + 12.0);
+    let y1 = y0 + modal_h;
+
+    // Subtle full-window backdrop dim + elevated crisp modal card.
+    scene.overlay_round_rect(0.0, TOP_BAR_H, vw, vh, 0.0, theme::rgba(0x00, 0x00, 0x00, 0.36), 0.0, [0.0; 4], 0);
+    scene.overlay_shadow(x0, y0 + 6.0, x1, y1 + 6.0, 10.0, 24.0, theme::SHADOW_SOFT, 0);
+    scene.overlay_round_rect(x0, y0, x1, y1, 10.0, theme::BG_POPUP, 1.0, theme::LINE_STRONG, 0);
+
+    // 1. Header bar: title, match count, quiet shortcuts.
+    let h_ty = y0 + (header_h - m.ch) * 0.5;
+    scene.overlay_text_run(x0 + pad_x, h_ty, "history", theme::INK_1, true, false, 0);
+    let count_lbl = format!("  {total_matches} / {}", rs.total_entries);
+    scene.overlay_text_run(x0 + pad_x + 7.0 * m.cw, h_ty, &count_lbl, theme::INK_4, false, false, 0);
+    let hints = "esc exit  ·  tab edit  ·  enter run  ·  ctrl+r scope";
+    let hints_w = hints.chars().count() as f32 * m.cw;
+    if x1 - pad_x - hints_w > x0 + pad_x + 20.0 * m.cw {
+        scene.overlay_text_run(x1 - pad_x - hints_w, h_ty, hints, theme::INK_4, false, false, 0);
+    }
+    scene.overlay_line(x0 + 1.0, y0 + header_h, x1 - 1.0, y0 + header_h, 1.0, theme::LINE, 0);
+
+    // 2. Results list (Atuin bottom-up: best/newest match sits directly above the search input!).
+    let list_top = y0 + header_h + 4.0;
+    let list_bottom = y1 - input_h - preview_h - 4.0;
+    if rs.results.is_empty() {
+        let mid_y = (list_top + list_bottom - m.ch) * 0.5;
+        scene.overlay_text_run(x0 + pad_x, mid_y, "no matching commands", theme::INK_4, false, true, 0);
+    } else {
+        let dur_col_w = 7.5 * m.cw;
+        let ago_col_w = 10.0 * m.cw;
+        let idx_col_w = 2.4 * m.cw;
+        let dir_col_w = if rs.scope == crate::editor::HistoryScope::Global && modal_w > 640.0 {
+            16.0 * m.cw
+        } else {
+            0.0
+        };
+
+        let show_count = total_matches.saturating_sub(win_start).min(max_rows);
+        for slot in 0..show_count {
+            // Render index `win_start + slot` from bottom upward (`slot == 0` is bottom-most!).
+            let idx = win_start + slot;
+            let row_from_top = show_count - 1 - slot;
+            let ry = list_top + row_from_top as f32 * row_h;
+            if ry + row_h > list_bottom + 2.0 {
+                continue;
+            }
+            let item = &rs.results[idx];
+            let is_sel = idx == rs.selected;
+            let ty = ry + (row_h - m.ch) * 0.5;
+
+            if is_sel {
+                scene.overlay_round_rect(
+                    x0 + 6.0,
+                    ry,
+                    x1 - 6.0,
+                    ry + row_h,
+                    5.0,
+                    theme::BG_SELECTED,
+                    0.0,
+                    [0.0; 4],
+                    0,
+                );
+                scene.overlay_round_rect(
+                    x0 + 6.0,
+                    ry + 4.0,
+                    x0 + 8.0,
+                    ry + row_h - 4.0,
+                    1.0,
+                    theme::FIRE,
+                    0.0,
+                    [0.0; 4],
+                    0,
+                );
+            }
+
+            let mut cx = x0 + pad_x;
+            // Selection caret or compact relative shortcut number (`1..9` above selected).
+            let idx_lbl = if is_sel {
+                "❯".to_owned()
+            } else if idx > rs.selected && idx - rs.selected <= 9 {
+                format!("{}", idx - rs.selected)
+            } else {
+                String::new()
+            };
+            if !idx_lbl.is_empty() {
+                let col = if is_sel { theme::FIRE } else { theme::INK_4 };
+                scene.overlay_text_run(cx, ty, idx_lbl, col, is_sel, false, 0);
+            }
+            cx += idx_col_w;
+
+            // Color-coded duration (`OK` green when exit == 0, `DANGER` rose when exit != 0).
+            let dur_lbl = format_duration_ms(item.entry.duration_ms);
+            let dur_col = if item.entry.exit_code == 0 {
+                theme::OK
+            } else {
+                theme::DANGER
+            };
+            let dur_x = cx + (dur_col_w - dur_lbl.len() as f32 * m.cw - m.cw).max(0.0);
+            scene.overlay_text_run(dur_x, ty, dur_lbl, dur_col, false, false, 0);
+            cx += dur_col_w;
+
+            // Relative timestamp (`5m ago`, `2h ago`, `26d ago`).
+            let ago_lbl = if item.entry.timestamp_ns > 0 {
+                let mut s = String::new();
+                let _ = format_relative_time(
+                    DateTime { utc_ns: item.entry.timestamp_ns, offset_secs: 0 },
+                    now_ns,
+                    &mut s,
+                );
+                s
+            } else {
+                "session".to_owned()
+            };
+            let ago_x = cx + (ago_col_w - ago_lbl.len() as f32 * m.cw - 1.2 * m.cw).max(0.0);
+            scene.overlay_text_run(ago_x, ty, ago_lbl, theme::PROMPT_SPARK, false, false, 0);
+            cx += ago_col_w;
+
+            // Command text with fuzzy matched-character highlighting!
+            let cmd_right = x1 - pad_x - dir_col_w;
+            let max_cmd_ch = ((cmd_right - cx) / m.cw).floor().max(10.0) as usize;
+            let cmd_one_line = item.entry.command.replace('\n', " ↵ ");
+            let shown_cmd = truncate_chars(&cmd_one_line, max_cmd_ch);
+            let base_col = if is_sel { theme::INK_1 } else { theme::INK_2 };
+
+            if item.match_indices.is_empty() {
+                scene.overlay_text_run(cx, ty, &shown_cmd, base_col, is_sel, false, 0);
+            } else {
+                let mut run = String::new();
+                let mut run_start = 0usize;
+                let mut run_m = false;
+                for (ci, ch) in shown_cmd.chars().enumerate() {
+                    let matched = item.match_indices.contains(&ci);
+                    if !run.is_empty() && matched != run_m {
+                        let col = if run_m { theme::MATCH_HIGHLIGHT } else { base_col };
+                        scene.overlay_text_run(
+                            cx + run_start as f32 * m.cw,
+                            ty,
+                            core::mem::take(&mut run),
+                            col,
+                            run_m || is_sel,
+                            false,
+                            0,
+                        );
+                        run_start = ci;
+                        run_m = matched;
+                    } else if run.is_empty() {
+                        run_start = ci;
+                        run_m = matched;
+                    }
+                    run.push(ch);
+                }
+                if !run.is_empty() {
+                    let col = if run_m { theme::MATCH_HIGHLIGHT } else { base_col };
+                    scene.overlay_text_run(
+                        cx + run_start as f32 * m.cw,
+                        ty,
+                        run,
+                        col,
+                        run_m || is_sel,
+                        false,
+                        0,
+                    );
+                }
+            }
+
+            // Optional right-aligned leaf dir badge in GLOBAL mode.
+            if dir_col_w > 0.0 && !item.entry.cwd.is_empty() {
+                let leaf = item.entry.cwd.rsplit('/').next().unwrap_or(&item.entry.cwd);
+                let leaf_txt = truncate_chars(leaf, 14);
+                let lw = leaf_txt.chars().count() as f32 * m.cw;
+                scene.overlay_text_run(x1 - pad_x - lw, ty, leaf_txt, theme::INK_4, false, false, 0);
+            }
+
+            scene.push_hit(
+                HitRect::new(x0 + 6.0, ry, x1 - 6.0, ry + row_h),
+                HitAction::SelectHistory(idx),
+            );
         }
-        None => {
-            scene.overlay_text_run(mx, ty, "no match", theme::INK_4, false, true, 0);
+    }
+
+    // 3. Search input bar with clickable `[ GLOBAL | DIR | SESSION ]` scope pill.
+    let in_y0 = y1 - input_h - preview_h;
+    scene.overlay_line(x0 + 1.0, in_y0, x1 - 1.0, in_y0, 1.0, theme::LINE, 0);
+    let in_ty = in_y0 + (input_h - m.ch) * 0.5;
+    let scope_lbl = rs.scope.label();
+    let scope_w = scope_lbl.len() as f32 * m.cw + 16.0;
+    let sb_x0 = x0 + pad_x;
+    let sb_y0 = in_y0 + 5.0;
+    let sb_y1 = in_y0 + input_h - 5.0;
+    scene.overlay_round_rect(sb_x0, sb_y0, sb_x0 + scope_w, sb_y1, 5.0, theme::BG_CHIP, 1.0, theme::LINE_STRONG, 0);
+    scene.overlay_text_run(sb_x0 + 8.0, in_ty, scope_lbl, theme::PROMPT_DIR, true, false, 0);
+    scene.push_hit(HitRect::new(sb_x0, sb_y0, sb_x0 + scope_w, sb_y1), HitAction::CycleHistoryScope);
+
+    let qx = sb_x0 + scope_w + 12.0;
+    scene.overlay_text_run(qx, in_ty, "❯", theme::FIRE, true, false, 0);
+    let q_txt_x = qx + 1.8 * m.cw;
+    if rs.query.is_empty() {
+        scene.overlay_text_run(q_txt_x, in_ty, "fuzzy search command history…", theme::INK_4, false, false, 0);
+    } else {
+        scene.overlay_text_run(q_txt_x, in_ty, &rs.query, theme::INK_1, false, false, 0);
+    }
+    let cur_x = q_txt_x + rs.query.chars().count() as f32 * m.cw;
+    scene.overlay_round_rect(cur_x, in_ty + 1.0, cur_x + 1.8, in_ty + m.ch - 1.0, 0.9, theme::FIRE, 0.0, [0.0; 4], 0);
+
+    // 4. Bottom full-command preview & metadata strip.
+    let pv_y0 = y1 - preview_h;
+    scene.overlay_line(x0 + 1.0, pv_y0, x1 - 1.0, pv_y0, 1.0, theme::LINE_FAINT, 0);
+    let pv_ty = pv_y0 + (preview_h - m.ch) * 0.5;
+    if let Some(sel) = rs.results.get(rs.selected) {
+        let mut meta = String::new();
+        if !sel.entry.cwd.is_empty() {
+            meta.push_str(&sel.entry.cwd);
         }
+        if let Some(br) = &sel.entry.git_branch {
+            if !meta.is_empty() {
+                meta.push_str("  ");
+            }
+            meta.push_str(br);
+        }
+        if sel.entry.exit_code != 0 {
+            if !meta.is_empty() {
+                meta.push_str("  ");
+            }
+            meta.push_str(&format!("exit {}", sel.entry.exit_code));
+        }
+        let meta_w = (meta.chars().count().min(36) as f32) * m.cw;
+        let meta_shown = truncate_chars(&meta, 36);
+        if !meta_shown.is_empty() {
+            scene.overlay_text_run(x1 - pad_x - meta_w, pv_ty, meta_shown, theme::INK_4, false, false, 0);
+        }
+        let max_pv = ((x1 - pad_x * 2.0 - meta_w - 14.0) / m.cw).floor().max(12.0) as usize;
+        let pv_cmd = truncate_chars(&sel.entry.command.replace('\n', " ↵ "), max_pv);
+        scene.overlay_text_run(x0 + pad_x, pv_ty, pv_cmd, theme::INK_3, false, false, 0);
     }
 }
