@@ -613,23 +613,21 @@ fn control_a_runner_that_acts_on_the_exit_first_loses_a_result() {
     control(SimConfig::cases(4_000), RunPlant::None, RunPlant::ExitBeforeDrain, "lost a result the zygote sent before it died", request);
 }
 
-/// No zygote is started on a host with no test sandbox; each test prints its `NOT RUN` line with
-/// the reason, and the command fails. With the host check removed from `Runner::begin_suite`,
-/// the simulated zygote starts and the first assertion fails.
+/// A test sandbox exists on Linux too (blaze-cli test_sandbox.rs: a Landlock ruleset, seccomp
+/// filter and rlimits the child enters before its execve), so `Runner::begin_suite` starts
+/// the zygote there: the host check's refusal is reachable only on a host that has none.
 #[test]
-fn on_linux_every_run_is_refused_for_want_of_a_sandbox() {
+fn on_linux_runs_start_behind_the_sandbox() {
     let tape = Tape::new(&[], blaze_sim::Tail::Calm, 1_000);
     let g = Alloc::global();
     let mut scripts: AVec<'static, Script> = Vec::new_in(g);
     scripts.resize(3, Script::Pass);
     let mut runner = Runner::new(SimZygote::new(&tape, scripts, None), &config(2).plan, Host::Linux, g);
     let driven = drive(&mut runner, 2, 3).expect("the request ends");
-    assert_eq!(runner.zygotes().starts, 0, "no zygote starts without a sandbox");
+    assert_eq!(runner.zygotes().starts, 1, "one zygote starts behind the Linux sandbox");
     assert!(driven.stopped.is_none(), "{:?}", driven.stopped);
-    for row in 0..3 {
-        assert!(driven.text.contains(&format!("NOT RUN m::t{row}: cannot be run yet: no test sandbox is built for Linux yet")), "{}", driven.text);
-    }
-    assert!(driven.status.is_some_and(|status| status.not_run == 3 && !status.passed()), "{:?}", driven.status.map(|status| status.not_run));
+    assert!(!driven.text.contains("NOT RUN"), "{}", driven.text);
+    assert!(driven.status.is_some_and(|status| status.passed() && status.not_run == 0), "{:?}", driven.status);
 }
 
 /// This build's zygote source: every test keeps today's line, and nothing is asked of a zygote.

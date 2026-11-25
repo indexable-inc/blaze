@@ -95,6 +95,7 @@ pub(crate) mod suite_cache;
 /// The system's launcher of `sandbox_init` (blaze-proc-macro native_sandbox.rs uses the same):
 /// it applies the profile, then executes the launcher in its place, so the launcher's process is
 /// the test's and its end is the test's end.
+#[cfg(target_os = "macos")]
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 /// How often a running test's pipes are emptied while its channel is quiet: a writer blocks on
 /// a full pipe (64 KiB) for at most this long.
@@ -245,7 +246,10 @@ impl fmt::Display for OneError {
             ),
             OneError::LauncherNotLooked { launcher, why } => write!(f, "whether the launcher is at `{launcher}` could not be looked at: {why}"),
             OneError::Profile { why } => write!(f, "a test's sandbox profile: {why}"),
+            #[cfg(target_os = "macos")]
             OneError::Start(error) => write!(f, "a test's launcher did not start under {SANDBOX_EXEC}: {error}"),
+            #[cfg(target_os = "linux")]
+            OneError::Start(error) => write!(f, "a test's launcher did not start confined: {error}"),
             OneError::Pipe(error) => write!(f, "a test's output: {error}"),
             OneError::MissingPipe { stream } => write!(f, "the test launcher was started with piped {stream} but supplied no read end"),
             OneError::Capture(error) => write!(f, "the test's stderr capture: {error}"),
@@ -2656,6 +2660,7 @@ pub(crate) struct Launched<'c, 'h, 'a> {
 /// The test profile with the one grant a native image needs: `dlopen` maps `<store>/<64 hex>`
 /// executable, which `(deny default)` refuses (blaze-launch-rt native_lib.rs, step 2). That one
 /// file, by its literal path, nothing else: it is the parent's own record, named by its key.
+#[cfg(any(target_os = "macos", test))]
 fn with_native<'a>(mut profile: AString<'a>, store: &str, native: Option<crate::engine_native::NativeSend<'_>>) -> Result<AString<'a>, OneError> {
     let Some(send) = native else { return Ok(profile) };
     if store.contains(['"', '\\', '\n']) || !send.hex.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -2886,14 +2891,34 @@ impl<'c> Launched<'c, '_, '_> {
             let value = lazy_native.as_ref().map_or(send.hex, |s| s.as_str());
             vars.push(("BLAZE_LAUNCH_NATIVE", value));
         }
-        // 4. Seatbelt profile + spawn.
-        let profile = seatbelt_profile(temp.as_str(), self.store, self.native, frame, alloc)?;
-        let mut args = Vec::with_capacity_in(self.args.len() + 3, frame);
-        args.extend_from_slice(&["-p", profile.as_str(), self.launcher]);
-        args.extend_from_slice(self.args);
-        let spec = RunSpec { program: SANDBOX_EXEC, arg0: None, args: args.as_slice(), env: vars.as_slice(), dir: self.place.dir, streams: Streams::PIPED, own_group: true, parent_death: ParentDeath::STRONGEST };
-        signals.begin(Doing::Starting);
-        let Started { child: mut run, pipes: given } = self.spawner.start_served(cx, &spec).map_err(OneError::Start)?;
+        // 4. The sandbox + spawn: a seatbelt profile under `sandbox-exec` (macOS), or the
+        // Landlock ruleset, seccomp filter and rlimits the child enters before its execve
+        // (Linux, test_sandbox.rs). `prepared` lives until the start returns, by which time
+        // the child has exec'd (CLONE_VFORK) and holds its own domain.
+        #[cfg(target_os = "macos")]
+        let started = {
+            let profile = seatbelt_profile(temp.as_str(), self.store, self.native, frame, alloc)?;
+            let mut args = Vec::with_capacity_in(self.args.len() + 3, frame);
+            args.extend_from_slice(&["-p", profile.as_str(), self.launcher]);
+            args.extend_from_slice(self.args);
+            let spec = RunSpec { program: SANDBOX_EXEC, arg0: None, args: args.as_slice(), env: vars.as_slice(), dir: self.place.dir, streams: Streams::PIPED, own_group: true, parent_death: ParentDeath::STRONGEST };
+            signals.begin(Doing::Starting);
+            self.spawner.start_served(cx, &spec).map_err(OneError::Start)?
+        };
+        #[cfg(target_os = "linux")]
+        let started = {
+            let prepared = crate::test_sandbox::prepare(
+                temp.as_str(),
+                self.store,
+                self.launcher,
+                self.native.as_ref().map(|send| send.hex),
+                Duration::from_nanos(budget.0),
+            )?;
+            let spec = RunSpec { program: self.launcher, arg0: None, args: self.args, env: vars.as_slice(), dir: self.place.dir, streams: Streams::PIPED, own_group: true, parent_death: ParentDeath::STRONGEST };
+            signals.begin(Doing::Starting);
+            self.spawner.start_served_confined(cx, &spec, &prepared.confine()).map_err(OneError::Start)?
+        };
+        let Started { child: mut run, pipes: given } = started;
         let started_at = run.now();
         signals.started.set(true);
         signals.progress.set(true);
@@ -3466,6 +3491,7 @@ impl<'c> Launched<'c, '_, '_> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn seatbelt_profile<'a>(
     temp: &str,
     store: &str,

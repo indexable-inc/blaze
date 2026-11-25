@@ -98,11 +98,13 @@ impl Host {
     /// The host this blaze was built for.
     pub(crate) const THIS: Host = if cfg!(target_os = "linux") { Host::Linux } else { Host::Macos };
 
-    /// A test sandbox exists here (macOS `sandbox_init`; Linux's is not built: test.md piece 9).
+    /// A test sandbox exists here (macOS `sandbox_init`; Linux: the Landlock ruleset, seccomp
+    /// filter and rlimits of blaze-cli test_sandbox.rs, entered by the child before its
+    /// execve: test.md piece 9).
     pub(crate) const fn has_sandbox(self) -> bool {
         match self {
             Host::Macos => true,
-            Host::Linux => false,
+            Host::Linux => true,
         }
     }
 }

@@ -102,6 +102,8 @@ mod test_args;
 mod test_cache;
 mod test_drive;
 mod test_loop;
+#[cfg(target_os = "linux")]
+mod test_sandbox;
 mod test_run;
 mod toolchain;
 mod units;

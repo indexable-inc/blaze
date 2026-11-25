@@ -306,6 +306,26 @@ impl Spawner {
         Ok(Started { child: Served { run, channel: parent }, pipes })
     }
 
+    /// `spec` started served, its channel as [`CHILD_FD`], and confined as
+    /// [`Spawner::start_confined`] (Linux): the test runner's start (blaze-cli
+    /// test_drive.rs `Launched`), the one caller. The confinement is made from the test
+    /// sandbox's plan (blaze-cli test_sandbox.rs), never by hand here.
+    #[cfg(target_os = "linux")]
+    pub fn start_served_confined(
+        &self,
+        cx: &Cx,
+        spec: &RunSpec<'_>,
+        confine: &blaze_core::linked::run::ChildConfine<'_>,
+    ) -> Result<Started<Served>, RunError> {
+        let refuse = |fault| RunError { step: RunStep::Start, proc: None, fault };
+        let (parent, child_end) = channel::pair().map_err(|error| refuse(RunFault::Channel(error)))?;
+        let given = [(child_end.fd(), CHILD_FD)];
+        let Started { child: run, pipes } = self.start_with(cx, spec, &given, Some(confine))?;
+        // As in `start_served`: the child holds the only copy of its end from here.
+        drop(child_end);
+        Ok(Started { child: Served { run, channel: parent }, pipes })
+    }
+
     fn start_with(
         &self,
         cx: &Cx,

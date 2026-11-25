@@ -16,7 +16,7 @@ jobs:
       - name: build Blaze and toolchain cutter
         run: |
           cargo build --release --locked -p scripts --bin toolchain_cut
-          cargo build --release --locked -p blaze-cli --bin blaze
+          cargo build --release --locked -p blaze-cli --bin blaze -p blaze-launcher --bin blaze-launcher
       - name: cut toolchain and create fixture
         run: |
           cargo fetch --locked --quiet

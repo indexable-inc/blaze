@@ -359,11 +359,29 @@ fn passes() {
 
 #[test]
 #[cfg(target_os = "linux")]
-fn no_sandbox_runs_nothing() {
+fn linux_tests_run_confined_where_code_is_served() {
     let said = blaze_test("test_command_runs_linux", PASS);
-    let line = "NOT RUN passes: cannot be run yet: no test sandbox is built for Linux yet, and blaze runs no test unsandboxed (rule 9; test.md, piece 9)";
-    assert!(said.stdout.lines().any(|l| l == line), "{}", evidence(line, &said));
-    assert_ne!(said.code, Some(0), "a suite that ran nothing is not a pass\n{}", said.stdout);
+    assert!(
+        !said.stdout.contains("no test sandbox is built for Linux"),
+        "the test sandbox exists on Linux (test_sandbox.rs)\n{}",
+        evidence("no sandbox refusal", &said)
+    );
+    #[cfg(target_arch = "aarch64")]
+    {
+        assert_eq!(said.code, Some(0), "the suite passes confined\n{}", evidence("pass", &said));
+        assert!(said.stdout.contains(PASS_SUMMARY), "{}", evidence(PASS_SUMMARY, &said));
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        // The x86-64 backend emits no code records (run.md piece 6, D124): the suite is
+        // refused by the code layer, never by the sandbox.
+        assert_ne!(said.code, Some(0), "no code records, no pass\n{}", said.stdout);
+        assert!(
+            said.stderr.contains("code records are AArch64 and this machine is not"),
+            "{}",
+            evidence("the code layer's refusal", &said)
+        );
+    }
 }
 
 // Deliberately put beta first in the manifest. The command orders results by owner and path.
