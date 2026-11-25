@@ -50,10 +50,14 @@ pub const NATIVE_RUN_DEADLINE: Duration = Duration::from_secs(30 * 60);
 pub struct OwnedNativeSetting<'a> {
     /// The resolved shelf, named by the pin's SHA-256.
     pub shelf: AString<'a>,
-    /// The resolved SDK folder.
+    /// The resolved C library root: the macOS SDK folder, or the pinned glibc sysroot folder
+    /// named by its pin's SHA-256.
     pub sdk: AString<'a>,
-    /// The SDK's `Version` (in every native run's key, as `macos-sdk <version>`).
+    /// The SDK's `Version` (macOS), or the sysroot pin's SHA-256 hex (Linux).
     pub sdk_version: AString<'a>,
+    /// The sysroot's line in every native run's key: `macos-sdk <version>+<build>` (Apple) or
+    /// `pinned-sysroot <sha256 hex>` (a pinned glibc sysroot, D69).
+    pub sysroot_key: AString<'a>,
     /// The resolved work folder, made if absent.
     pub work: AString<'a>,
     pub deadline: Duration,
@@ -63,7 +67,15 @@ impl OwnedNativeSetting<'_> {
     /// The setting `script_unit::Setting::native` takes, with the command's jobserver `jobs`
     /// (`crate::jobserver::Jobserver::new`, its fifo under `work`).
     pub fn setting<'s>(&'s self, jobs: &'s crate::jobserver::Jobserver) -> NativeSetting<'s> {
-        NativeSetting { shelf: self.shelf.as_str(), sdk: self.sdk.as_str(), work: self.work.as_str(), deadline: self.deadline, jobs, shim: None }
+        NativeSetting {
+            shelf: self.shelf.as_str(),
+            sdk: self.sdk.as_str(),
+            sysroot_key: self.sysroot_key.as_str(),
+            work: self.work.as_str(),
+            deadline: self.deadline,
+            jobs,
+            shim: None,
+        }
     }
 }
 
@@ -135,8 +147,12 @@ impl<'a> NativeRun<'a> {
 pub enum NativeSettingError<'a> {
     /// The pin table has no toolchain or no macOS SDK sysroot for the host.
     Pin(PinError<'a>),
-    /// The host's sysroot is a pinned one (Linux's form): not built yet, refused by name.
-    PinnedSysroot { host: &'a str },
+    /// The host's sysroot is pinned (Linux's form) but its folder is not on the shelf at
+    /// `<home>/.blaze/v2/toolchain/sysroot/<sha256 hex>`.
+    NoSysrootFolder { path: AString<'a>, error: io::Error },
+    /// The sysroot folder resolves to a folder not named by the pin's SHA-256 (its name is in
+    /// the run key, like the shelf's).
+    SysrootNotPin { path: AString<'a>, real: AString<'a> },
     /// The pinned toolchain is not unpacked on the shelf.
     NoShelf { path: AString<'a>, error: io::Error },
     /// The shelf resolves to a folder not named by the pin's SHA-256 (its name is the key's
@@ -159,10 +175,16 @@ impl core::fmt::Display for NativeSettingError<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             NativeSettingError::Pin(error) => write!(f, "{error}: no native setting, so the tool-spawning build scripts cannot run (D112)"),
-            NativeSettingError::PinnedSysroot { host } => write!(
+            NativeSettingError::NoSysrootFolder { path, error } => write!(
                 f,
-                "{}: {host}'s sysroot is a pinned archive, which native scripts do not take yet (only `macos-sdk` is built, D112)",
-                CLANG_PATH
+                "{}: {error}: the pinned glibc sysroot the native build scripts compile against (D69) is not unpacked there; unpack its pinned blob beside the clang shelf",
+                path.as_str()
+            ),
+            NativeSettingError::SysrootNotPin { path, real } => write!(
+                f,
+                "{}: resolves to {}, whose name is not the sysroot pin's SHA-256 (the folder's name is the sysroot's digest in the run key, D69)",
+                path.as_str(),
+                real.as_str()
             ),
             NativeSettingError::NoShelf { path, error } => write!(
                 f,
@@ -222,6 +244,21 @@ fn resolved<'a>(
     Ok(String::from_str_in(real, alloc))
 }
 
+/// Where `host`'s pinned glibc sysroot is unpacked under `home`
+/// (`<home>/.blaze/v2/toolchain/sysroot/<sha256 hex>`, the hex being the host's `sysroots` row
+/// of [`CLANG_JSON`]). The folder itself is validated by [`native_setting`] (its name must be
+/// the pin's hex); this only computes the spelling. A host with no pinned sysroot row (Apple's
+/// `macos-sdk`, or `null`) is a typed error.
+pub fn pinned_sysroot_folder<'a>(home: &str, host: &'a str, alloc: Alloc<'a>) -> Result<std::string::String, NativeSettingError<'a>> {
+    match toolchain::sysroot(CLANG_JSON, host).map_err(NativeSettingError::Pin)? {
+        Sysroot::Pinned { sha256 } => {
+            let want = hex(&sha256, alloc);
+            Ok(std::format!("{home}/.blaze/v2/toolchain/sysroot/{}", want.as_str()))
+        }
+        Sysroot::MacosSdk => Err(NativeSettingError::Pin(PinError::NoSysroot { target: host })),
+    }
+}
+
 /// The command's native setting for scripts run on `host`: the shelf of the host's clang pin
 /// under `home`, the SDK folder `sdk`, the work folder of `command` under `home` (made if
 /// absent), and [`NATIVE_RUN_DEADLINE`]. Called once per command at its edge (rule 75); a
@@ -251,10 +288,7 @@ pub fn native_setting<'a>(
     alloc: Alloc<'a>,
 ) -> Result<OwnedNativeSetting<'a>, NativeSettingError<'a>> {
     let pin = toolchain::clang_pin(CLANG_JSON, host).map_err(NativeSettingError::Pin)?;
-    match toolchain::sysroot(CLANG_JSON, host).map_err(NativeSettingError::Pin)? {
-        Sysroot::MacosSdk => {}
-        Sysroot::Pinned { .. } => return Err(NativeSettingError::PinnedSysroot { host }),
-    }
+    let sysroot = toolchain::sysroot(CLANG_JSON, host).map_err(NativeSettingError::Pin)?;
 
     let digest = hex(&pin.sha256, alloc);
     let named = String::from_str_in(shelf, alloc);
@@ -265,19 +299,47 @@ pub fn native_setting<'a>(
     // nm-row: every member the native runs start or load is on the shelf (a link must lead to
     // a file); a shelf unpacked before a member was added is refused naming it.
     let member_there = |member: &str| fs::metadata(text(&[shelf.as_str(), "/", member], alloc).as_str()).is_ok();
-    if let Some(member) = toolchain::shelf_missing(member_there) {
+    if let Some(member) = toolchain::shelf_missing(host, member_there) {
         return Err(NativeSettingError::ShelfIncomplete { shelf, member });
     }
 
-    let sdk = resolved(&String::from_str_in(sdk, alloc), |path, error| NativeSettingError::NoSdk { path, error }, alloc)?;
-    let settings_path = text(&[sdk.as_str(), "/SDKSettings.json"], alloc);
-    let settings = fs::read_to_string(settings_path.as_str()).map_err(|error| NativeSettingError::NoSdk { path: settings_path.clone(), error })?;
-    let version = sdk_version(&settings).ok_or(NativeSettingError::SdkVersion { path: settings_path })?;
-    let sdk_version = String::from_str_in(version, alloc);
+    let named_sdk = String::from_str_in(sdk, alloc);
+    let (sdk, sdk_version, sysroot_key) = match sysroot {
+        Sysroot::MacosSdk => {
+            let sdk = resolved(&named_sdk, |path, error| NativeSettingError::NoSdk { path, error }, alloc)?;
+            let settings_path = text(&[sdk.as_str(), "/SDKSettings.json"], alloc);
+            let settings = fs::read_to_string(settings_path.as_str()).map_err(|error| NativeSettingError::NoSdk { path: settings_path.clone(), error })?;
+            let version = sdk_version(&settings).ok_or(NativeSettingError::SdkVersion { path: settings_path })?;
+            // The key's sysroot line, as native_unit held it: `macos-sdk <version>+<build>`.
+            let built_path = text(&[sdk.as_str(), "/", blaze_apple_sdk::SYSTEM_VERSION], alloc);
+            let built = fs::read_to_string(built_path.as_str()).map_err(|error| NativeSettingError::NoSdk { path: built_path.clone(), error })?;
+            let (_, id) = blaze_apple_sdk::identity_of(&settings, &built)
+                .map_err(|_why| NativeSettingError::SdkVersion { path: text(&[sdk.as_str(), "/", blaze_apple_sdk::SETTINGS], alloc) })?;
+            let key = blaze_own::format_in!(alloc, "macos-sdk {id}");
+            (sdk, String::from_str_in(version, alloc), key)
+        }
+        Sysroot::Pinned { sha256 } => {
+            let want = hex(&sha256, alloc);
+            let sdk = resolved(&named_sdk, |path, error| NativeSettingError::NoSysrootFolder { path, error }, alloc)?;
+            if sdk.as_str().rsplit('/').next() != Some(want.as_str()) {
+                return Err(NativeSettingError::SysrootNotPin { path: named_sdk, real: sdk });
+            }
+            // The loader and the C headers the compiles read must be under it, by the blob's
+            // own layout; a folder missing them is not the sysroot the pin names.
+            for member in ["lib64/ld-linux-x86-64.so.2", "usr/include/stdio.h"] {
+                let path = text(&[sdk.as_str(), "/", member], alloc);
+                if fs::metadata(path.as_str()).is_err() {
+                    return Err(NativeSettingError::NoSysrootFolder { path, error: io::Error::new(io::ErrorKind::NotFound, "not the pinned sysroot's layout") });
+                }
+            }
+            let key = text(&["pinned-sysroot ", want.as_str()], alloc);
+            (sdk, want, key)
+        }
+    };
 
     let work = String::from_str_in(work, alloc);
     fs::create_dir_all(work.as_str()).map_err(|error| NativeSettingError::Work { path: work.clone(), error })?;
     let work = resolved(&work, |path, error| NativeSettingError::Work { path, error }, alloc)?;
 
-    Ok(OwnedNativeSetting { shelf, sdk, sdk_version, work, deadline: NATIVE_RUN_DEADLINE })
+    Ok(OwnedNativeSetting { shelf, sdk, sdk_version, sysroot_key, work, deadline: NATIVE_RUN_DEADLINE })
 }

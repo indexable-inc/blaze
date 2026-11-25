@@ -107,6 +107,7 @@ fn run_once(name: &str, workers: Option<u32>) -> (std::string::String, Option<(s
     // The keyed environment holds no job count: a key made of it is one for every count.
     assert_eq!(env.get("NUM_JOBS"), None);
     let c = CInputs {
+        target: "aarch64-apple-darwin",
         shelf: Shelf { dir: &shelf, clang_major: "23" },
         sysroot: &sdk,
         out_dir: &out,
@@ -267,6 +268,7 @@ fn cert_scenario<'a>(
     vars.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
     let env = Env { vars };
     let c = CInputs {
+        target: "aarch64-apple-darwin",
         shelf: Shelf { dir: shelf, clang_major: "23" },
         sysroot: sdk,
         out_dir: out_dir.as_str(),

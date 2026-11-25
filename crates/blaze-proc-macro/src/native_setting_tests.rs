@@ -60,8 +60,14 @@ fn fake_home(name: &str, shelf: bool) -> (std::string::String, std::string::Stri
         }
     }
     let sdk = home.join("MacOSX.sdk");
-    std::fs::create_dir_all(&sdk).expect("the SDK folder");
+    std::fs::create_dir_all(sdk.join("System/Library/CoreServices")).expect("the SDK folder");
     std::fs::write(sdk.join("SDKSettings.json"), r#"{"CanonicalName":"macosx15.2","Version":"15.2"}"#).expect("SDKSettings.json");
+    // The build the run key's `macos-sdk <version>+<build>` line names (native_setting.rs).
+    std::fs::write(
+        sdk.join("System/Library/CoreServices/SystemVersion.plist"),
+        "<?xml version=\"1.0\"?><plist><dict><key>ProductBuildVersion</key><string>24B2082</string></dict></plist>",
+    )
+    .expect("SystemVersion.plist");
     (home.to_str().expect("a UTF-8 temp folder").to_owned(), sdk.to_str().expect("a UTF-8 temp folder").to_owned())
 }
 

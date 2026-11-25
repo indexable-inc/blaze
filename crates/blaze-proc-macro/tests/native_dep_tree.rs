@@ -144,6 +144,7 @@ fn run_once(name: &str, resolved: bool) -> Result<std::vec::Vec<(std::string::St
     vars.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
     let env = Env { vars };
     let c = CInputs {
+        target: "aarch64-apple-darwin",
         shelf: Shelf { dir: &shelf, clang_major: "23" },
         sysroot: &sdk,
         out_dir: &out,

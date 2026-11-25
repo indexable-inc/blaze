@@ -110,8 +110,11 @@ pub struct NativeSetting<'s> {
     /// The unpacked pin, `<home>/.blaze/v2/toolchain/clang/<sha256 hex>`: its name is the
     /// compiler's digest in the key.
     pub shelf: &'s str,
-    /// The macOS SDK folder, resolved once by the command.
+    /// The macOS SDK folder, or the pinned glibc sysroot folder, resolved once by the command.
     pub sdk: &'s str,
+    /// The sysroot's line in the run key (`macos-sdk <version>+<build>`, or
+    /// `pinned-sysroot <sha256 hex>`), computed once at the command's edge.
+    pub sysroot_key: &'s str,
     /// A folder of the command's own where packages held in records are written out and each
     /// run's `OUT_DIR` is made (`pkg/<key>`, `out/<key>`).
     pub work: &'s str,
@@ -432,20 +435,12 @@ pub fn native_outputs<'a>(
         tool_keys.push(HostToolKey::of(tool, name.as_str(), digest));
     }
 
-    // The key: the compiler by its shelf digest, the SDK by its version (D69), the tools.
-    match toolchain::sysroot(CLANG_JSON, setting.host) {
-        Ok(Sysroot::MacosSdk) => {}
-        Ok(Sysroot::Pinned { .. }) => return Err(pin(format!("{}: {}'s pinned sysroot is not fetched yet (D69)", CLANG_PATH, setting.host))),
-        Err(error) => return Err(pin(error.to_string())),
-    }
-    let text = |file: &str| -> Result<String, NativeUnitError> {
-        String::from_utf8(read_file(native.sdk, file)?).map_err(|_| NativeUnitError::Read { path: format!("{}/{file}", native.sdk), why: "it is not UTF-8".to_owned() })
-    };
-    let (settings, built) = (text(blaze_apple_sdk::SETTINGS)?, text(blaze_apple_sdk::SYSTEM_VERSION)?);
-    let (_, id) = blaze_apple_sdk::identity_of(&settings, &built).map_err(|why| NativeUnitError::Read { path: native.sdk.to_owned(), why: format!("{why}, which a native script's key holds (D69)") })?;
-    let sysroot_key = format!("macos-sdk {id}");
+    // The key: the compiler by its shelf digest, the sysroot by the line the edge computed
+    // (`macos-sdk <version>+<build>`, or `pinned-sysroot <sha256 hex>` for a pinned glibc
+    // sysroot, D69), the tools.
+    let sysroot_key = native.sysroot_key;
     let compiler = hex32(native.shelf.rsplit('/').next().unwrap_or("")).ok_or_else(|| NativeUnitError::Shelf { shelf: native.shelf.to_owned() })?;
-    let parts = NativeKeyParts { compiler, target: setting.host, sysroot: &sysroot_key, host_tools: &tool_keys };
+    let parts = NativeKeyParts { compiler, target: setting.host, sysroot: sysroot_key, host_tools: &tool_keys };
     let inputs = KeyInputs {
         module: module_digest,
         env: &env,
@@ -496,7 +491,7 @@ pub fn native_outputs<'a>(
     let out_dir = fresh_folder(native.work, out_rel.as_str(), &[], &pkg(), alloc)?;
     work_guard.push_dir(out_rel);
     let clang_major = toolchain::clang_major(CLANG_JSON).map_err(|e| pin(e.to_string()))?;
-    let c = CInputs { shelf: Shelf { dir: native.shelf, clang_major }, sysroot: native.sdk, out_dir: &out_dir, package: &package_dir, seen: root.seen(), macos_min: MACOS_MIN };
+    let c = CInputs { shelf: Shelf { dir: native.shelf, clang_major }, target: setting.host, sysroot: native.sdk, out_dir: &out_dir, package: &package_dir, seen: root.seen(), macos_min: MACOS_MIN };
     // N7: the fact shim the command placed in its work folder, and this run's facts folder.
     // A native run's probes are answered from the pins through the fact shim; the questions
     // asked become reads in the wasm path's fact form (native_facts::reads).
