@@ -1257,4 +1257,47 @@ mod tests {
                 .any(|h| h.action == HitAction::SplitPane(SplitAxis::Vertical))
         );
     }
+
+    #[test]
+    fn dual_font_icons_middle_truncation_and_scrollable_popups() {
+        // 1. Modern MacBook Pro & server rack SVGs parse cleanly.
+        assert!(crate::svg_icons::get_svg("macbook_pro").is_some());
+        assert!(crate::svg_icons::get_svg("server_rack").is_some());
+
+        // 2. Middle truncation preserves trailing filename for long nested paths.
+        let mid = crate::view::truncate_middle("crates/blaze-shell/src/layout.rs", 20);
+        assert!(mid.ends_with("layout.rs"), "expected filename preserved, got {mid}");
+        assert!(mid.contains('…'), "expected ellipsis in {mid}");
+
+        // 3. Scrollable Tab completions + Ctrl+R history + Cmd+Shift+P Command Palette.
+        let mut ed = Editor::new();
+        for i in 0..20 {
+            ed.completions.push(crate::editor::CompletionItem {
+                label: format!("item_{i:02}"),
+                insert: format!("item_{i:02}"),
+                detail: "file".to_owned(),
+                doc: format!("doc {i}"),
+                kind: crate::editor::CompletionKind::File,
+                icon: None,
+                match_indices: Vec::new(),
+            });
+        }
+        assert_eq!(ed.completion_scroll, 0);
+        assert!(ed.completion_scroll_by(4));
+        assert_eq!(ed.completion_scroll, 4);
+        assert!(ed.completion_scroll_by(-2));
+        assert_eq!(ed.completion_scroll, 2);
+
+        let mut pal = crate::editor::CommandPalette::open();
+        assert!(pal.matches.len() > crate::editor::PALETTE_VISIBLE_ROWS);
+        assert!(pal.scroll_by(3));
+        assert_eq!(pal.scroll, 3);
+        pal.push_char('s');
+        pal.push_char('p');
+        pal.push_char('l');
+        assert!(!pal.matches.is_empty());
+        let mut sc = crate::view::Scene::new();
+        crate::layout::layout_command_palette(&mut sc, &pal, 1140.0, 820.0, CellMetrics::default());
+        assert!(sc.hit_regions.iter().any(|h| matches!(h.action, HitAction::SelectPalette(_))));
+    }
 }

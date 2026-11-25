@@ -94,7 +94,7 @@ mod macos_app {
         AgentHub, AgentHubAction, AgentRecord, AgentStatus, layout_agent_hub_pane,
     };
     use blaze_shell::blocks::{BlockBody, BlockId, BlockStore};
-    use blaze_shell::editor::{Editor, HistoryEntry};
+    use blaze_shell::editor::{CommandPalette, Editor, HistoryEntry, PaletteAction};
     use blaze_shell::font::Fonts;
     use blaze_shell::host::{
         InteractiveSpawn, RustCellMeta, run_command_line, run_command_line_with_pid,
@@ -102,14 +102,15 @@ mod macos_app {
     use blaze_shell::keys;
     use blaze_shell::layout::{
         LayoutInput, PANE_HEADER_H, TILE_GAP, TOP_BAR_H, TabBarItem, build_pane_scene,
-        draw_split_dividers, draw_tiled_pane_chrome, layout_fullscreen_terminal_pane,
-        layout_window_top_bar,
+        draw_split_dividers, draw_tiled_pane_chrome, layout_command_palette,
+        layout_fullscreen_terminal_pane, layout_window_top_bar,
     };
     use blaze_shell::prompt::{GitStatusWorker, PromptInfo, try_native_git_command};
     use blaze_shell::pty::{Pty, Read as PtyRead};
     use blaze_shell::render::{FrameDraw, PIXEL_FORMAT, Renderer};
     use blaze_shell::rust_cell;
     use blaze_shell::svg_icons::IconAtlas;
+    use blaze_shell::theme;
     use blaze_shell::tiling::{
         CloseOutcome, FocusDir, PaneId, SplitAxis, SplitHandle, TileLayout, TileManager,
     };
@@ -1426,6 +1427,7 @@ mod macos_app {
         mouse_pos: Option<[f32; 2]>,
         output_nav: Option<OutputNav>,
         dragging_split: Option<SplitHandle>,
+        command_palette: Option<&CommandPalette>,
     ) -> (Scene, TileLayout) {
         let work_area = HitRect::new(0.0, TOP_BAR_H, vw, vh.max(TOP_BAR_H + 60.0));
         let tile_layout = wm.layout(work_area, TILE_GAP);
@@ -1585,6 +1587,19 @@ mod macos_app {
             pane.last_scene.scroll_viewport_height = sub.scroll_viewport_height;
 
             master.composite_pane(sub, content_rect, TOP_BAR_H, pl.focused, vw, vh);
+
+            // Subtle Ghostty-style dim veil on unfocused tiled panes so focus is unmistakable.
+            if show_pane_hdr && !pl.focused {
+                master.over_round_rect(
+                    pl.rect.x0,
+                    pl.rect.y0,
+                    pl.rect.x1,
+                    pl.rect.y1,
+                    0.0,
+                    theme::rgba(0x08, 0x08, 0x0a, 0.22),
+                    0,
+                );
+            }
         }
 
         // 2. Crisp hairline split dividers between tiled panes.
@@ -1630,7 +1645,122 @@ mod macos_app {
             );
         }
 
+        // 4. Optional `Cmd+Shift+P` Command Palette rendered above everything.
+        if let Some(pal) = command_palette {
+            layout_command_palette(&mut master, pal, vw, vh, metrics);
+        }
+
         (master, tile_layout)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_palette_action(
+        action: PaletteAction,
+        wm: &mut TileManager,
+        panes: &mut std::collections::HashMap<PaneId, ShellApp>,
+        font_points: &mut f64,
+        zoom_changed: &mut bool,
+        pty_sizes_dirty: &mut bool,
+        quit: &mut bool,
+    ) {
+        let cwd = panes
+            .get(&wm.focused_pane())
+            .map(|p| p.cwd().to_owned())
+            .unwrap_or_else(|| "/".to_owned());
+        match action {
+            PaletteAction::NewTab => {
+                let (_, new_pid) = wm.new_tab();
+                panes.insert(new_pid, ShellApp::new_in(Some(&cwd)));
+                *pty_sizes_dirty = true;
+            }
+            PaletteAction::NewWindow => spawn_new_window(&cwd),
+            PaletteAction::SplitVertical => {
+                let new_pid = wm.split_focused(SplitAxis::Vertical);
+                panes.insert(new_pid, ShellApp::new_in(Some(&cwd)));
+                *pty_sizes_dirty = true;
+            }
+            PaletteAction::SplitHorizontal => {
+                let new_pid = wm.split_focused(SplitAxis::Horizontal);
+                panes.insert(new_pid, ShellApp::new_in(Some(&cwd)));
+                *pty_sizes_dirty = true;
+            }
+            PaletteAction::ToggleZoom => {
+                if wm.toggle_zoom() {
+                    *pty_sizes_dirty = true;
+                }
+            }
+            PaletteAction::EqualizeSplits => {
+                wm.equalize_splits();
+                *pty_sizes_dirty = true;
+            }
+            PaletteAction::ClosePane => match wm.close_focused() {
+                CloseOutcome::PaneClosed { closed, .. } => {
+                    if let Some(mut p) = panes.remove(&closed)
+                        && let Some(ap) = p.active_pty.take()
+                    {
+                        ap.pty.hangup();
+                    }
+                    *pty_sizes_dirty = true;
+                }
+                CloseOutcome::TabClosed { closed_panes, .. } => {
+                    for pid in closed_panes {
+                        if let Some(mut p) = panes.remove(&pid)
+                            && let Some(ap) = p.active_pty.take()
+                        {
+                            ap.pty.hangup();
+                        }
+                    }
+                    *pty_sizes_dirty = true;
+                }
+                CloseOutcome::LastPaneInLastTab => *quit = true,
+            },
+            PaletteAction::ForkBranch => {
+                if let Some(p) = panes.get_mut(&wm.focused_pane()) {
+                    let _ = p.store.fork_active_branch(None);
+                    p.refresh_prompt(p.prompt.last_exit, p.prompt.last_duration_ms);
+                }
+            }
+            PaletteAction::OpenYazi => {
+                if let Some(p) = panes.get_mut(&wm.focused_pane()) {
+                    let dir = std::path::PathBuf::from(p.cwd());
+                    p.yazi = Some(YaziState::open(&dir));
+                    p.agent_hub = None;
+                }
+            }
+            PaletteAction::OpenAgentHub => {
+                if let Some(p) = panes.get_mut(&wm.focused_pane()) {
+                    let host = p.editor.local_host.clone();
+                    let home = p.home.clone();
+                    let c = p.cwd().to_owned();
+                    p.agent_hub = Some(AgentHub::open(&host, &home, &c, &p.managed_agents));
+                    p.yazi = None;
+                }
+            }
+            PaletteAction::OpenHistory => {
+                if let Some(p) = panes.get_mut(&wm.focused_pane()) {
+                    let c = p.cwd().to_owned();
+                    p.editor.start_reverse_search_in(&c);
+                }
+            }
+            PaletteAction::ClearScreen => {
+                if let Some(p) = panes.get_mut(&wm.focused_pane()) {
+                    p.store.clear_active_branch();
+                    p.scroll_y = 0.0;
+                }
+            }
+            PaletteAction::ZoomIn => {
+                *font_points = (*font_points + ZOOM_STEP_POINTS).min(MAX_FONT_POINTS);
+                *zoom_changed = true;
+            }
+            PaletteAction::ZoomOut => {
+                *font_points = (*font_points - ZOOM_STEP_POINTS).max(MIN_FONT_POINTS);
+                *zoom_changed = true;
+            }
+            PaletteAction::ResetZoom => {
+                *font_points = FONT_POINTS;
+                *zoom_changed = true;
+            }
+        }
     }
 
     pub fn run() {
@@ -1786,6 +1916,7 @@ mod macos_app {
                 None,
                 None,
                 None,
+                None,
             );
             let glyphs = fonts.rasterize_runs(&scene.text_runs, scale);
             let overlay_glyphs = fonts.rasterize_runs(&scene.overlay_text, scale);
@@ -1830,6 +1961,7 @@ mod macos_app {
         let mut composite_scene = Scene::new();
         let mut tile_layout = TileLayout::default();
         let mut dragging_split: Option<SplitHandle> = None;
+        let mut command_palette: Option<CommandPalette> = None;
         let mut last_cursor_rect: Option<[f32; 4]> = None;
         let mut trail_prev: Option<[f32; 4]> = None;
         let mut trail_start: Option<Instant> = None;
@@ -1869,6 +2001,53 @@ mod macos_app {
                                 .map(|s| s.to_string())
                                 .unwrap_or_default();
                             let lower = chars.to_ascii_lowercase();
+
+                            // 0. `Cmd+Shift+P`: toggle Command Palette, and route keys into it when open.
+                            if flags.contains(NSEventModifierFlags::Command) && shift && !ctrl && !alt && key == Key::KeyP {
+                                command_palette = if command_palette.is_some() {
+                                    None
+                                } else {
+                                    active_popover = None;
+                                    Some(CommandPalette::open())
+                                };
+                                dirty = true;
+                                continue;
+                            }
+                            if let Some(pal) = &mut command_palette {
+                                if key == Key::Escape {
+                                    command_palette = None;
+                                } else if matches!(key, Key::Enter | Key::NumpadEnter) {
+                                    if let Some(act) = pal.selected_action() {
+                                        command_palette = None;
+                                        run_palette_action(
+                                            act,
+                                            &mut wm,
+                                            &mut panes,
+                                            &mut font_points,
+                                            &mut zoom_changed,
+                                            &mut pty_sizes_dirty,
+                                            &mut quit,
+                                        );
+                                    } else {
+                                        command_palette = None;
+                                    }
+                                } else if key == Key::ArrowUp || (ctrl && key == Key::KeyP) {
+                                    pal.move_up();
+                                } else if key == Key::ArrowDown || (ctrl && key == Key::KeyN) {
+                                    pal.move_down();
+                                } else if key == Key::Backspace {
+                                    pal.backspace();
+                                } else if !flags.contains(NSEventModifierFlags::Command) && !ctrl && !alt {
+                                    let text = keys::text_of(&ev);
+                                    for ch in text.chars() {
+                                        if !ch.is_control() {
+                                            pal.push_char(ch);
+                                        }
+                                    }
+                                }
+                                dirty = true;
+                                continue;
+                            }
 
                             // Global tiling & workspace shortcuts (`Cmd+N`, `Cmd+T`, `Cmd+1..9`, `Cmd+D`,
                             // `Cmd+Shift+D`, `Cmd+W`, `Cmd+Opt+Arrow/HJKL`, `Cmd+[/]`, `Cmd+Shift+[/]`,
@@ -2846,7 +3025,40 @@ mod macos_app {
                             let pt = ev.locationInWindow();
                             let mx = pt.x as f32;
                             let my = (size.height - pt.y) as f32;
-                            // Scroll whichever tiled pane the pointer is currently hovering over!
+                            let dy = ev.scrollingDeltaY();
+                            let step_px = if ev.hasPreciseScrollingDeltas() {
+                                dy as f32
+                            } else {
+                                dy as f32 * 24.0
+                            };
+                            let rows_delta = (-step_px / 18.0).round() as isize;
+
+                            // 1. Scroll active Command Palette (`Cmd+Shift+P`).
+                            if let Some(pal) = &mut command_palette {
+                                if pal.scroll_by(rows_delta) {
+                                    dirty = true;
+                                }
+                                continue;
+                            }
+                            // 2. Scroll open `Ctrl+R` History Palette or Tab Autocomplete popup!
+                            if let Some(focused) = panes.get_mut(&wm.focused_pane()) {
+                                if focused.editor.reverse_search.is_some() {
+                                    // Bottom-up list: scrolling up (dy > 0) reveals older entries (+scroll).
+                                    let hist_delta = (step_px / 18.0).round() as isize;
+                                    if focused.editor.reverse_search_scroll_by(hist_delta) {
+                                        dirty = true;
+                                    }
+                                    continue;
+                                }
+                                if !focused.editor.completions.is_empty() {
+                                    if focused.editor.completion_scroll_by(rows_delta) {
+                                        dirty = true;
+                                    }
+                                    continue;
+                                }
+                            }
+
+                            // 3. Scroll whichever tiled pane the pointer is currently hovering over!
                             let hovered_pl = tile_layout
                                 .panes
                                 .iter()
@@ -2859,14 +3071,7 @@ mod macos_app {
                             let Some(shell) = panes.get_mut(&scroll_pid) else {
                                 continue;
                             };
-                            let dy = ev.scrollingDeltaY();
                             if let Some(yazi) = &mut shell.yazi {
-                                let step_px = if ev.hasPreciseScrollingDeltas() {
-                                    dy as f32
-                                } else {
-                                    dy as f32 * 24.0
-                                };
-                                let rows_delta = (-step_px / 18.0).round() as isize;
                                 if yazi.scroll_at(mx - pane_x0, rows_delta) {
                                     dirty = true;
                                 }
@@ -2934,6 +3139,28 @@ mod macos_app {
                             let pt = ev.locationInWindow();
                             let x = pt.x as f32;
                             let y = (size.height - pt.y) as f32;
+                            // 0. If the Command Palette is open, handle row clicks or backdrop dismiss!
+                            if let Some(pal) = &command_palette {
+                                if let Some(HitAction::SelectPalette(idx)) = composite_scene.hit_test(x, y)
+                                    && let Some(act) = pal.action_at(idx)
+                                {
+                                    command_palette = None;
+                                    run_palette_action(
+                                        act,
+                                        &mut wm,
+                                        &mut panes,
+                                        &mut font_points,
+                                        &mut zoom_changed,
+                                        &mut pty_sizes_dirty,
+                                        &mut quit,
+                                    );
+                                    dirty = true;
+                                    continue;
+                                }
+                                command_palette = None;
+                                dirty = true;
+                                continue;
+                            }
                             // Let macOS AppKit handle native window edge/corner resize drags directly!
                             if !on_resize_edge(x, y, size.width as f32, size.height as f32) {
                                 // 1. Grabbing a tiled split divider starts live drag resize!
@@ -3259,7 +3486,8 @@ mod macos_app {
                                         | HitAction::NewWindow
                                         | HitAction::FocusPane(_)
                                         | HitAction::ClosePane(_)
-                                        | HitAction::ToggleZoomPane(_) => {}
+                                        | HitAction::ToggleZoomPane(_)
+                                        | HitAction::SelectPalette(_) => {}
                                     }
                                     continue;
                                 }
@@ -3821,6 +4049,7 @@ mod macos_app {
                     mouse_pt,
                     output_nav,
                     dragging_split,
+                    command_palette.as_ref(),
                 );
                 tile_layout = next_tl;
 

@@ -8,7 +8,21 @@ use crate::blocks::{BlockId, BranchId};
 use crate::theme;
 use crate::tiling::{PaneId, SplitAxis, TabId};
 
-/// Logical CSS-pixel dimensions of one monospace cell.
+/// Typography face & scale role: dual-font SF Pro (UI chrome & prose) + SF Mono (code & tabular data).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum TextFace {
+    /// Primary monospace (`13pt` SF Mono / Berkeley Mono / JetBrains Mono): commands, code, paths, PTY, tabular numbers.
+    #[default]
+    Mono,
+    /// Proportional UI sans (`12.2pt` Apple SF Pro): tabs, pane headers, prose, directory names, command palette.
+    Ui,
+    /// Compact proportional UI sans (`11pt` Apple SF Pro): table column headers, `blaze-sniff` tags, metadata, hints.
+    UiSmall,
+    /// Scaled proportional heading (`15.5pt` Apple SF Pro Semibold): rendered Markdown headings.
+    Heading,
+}
+
+/// Logical CSS-pixel dimensions of one monospace cell, with calibrated proportional measurement helpers.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CellMetrics {
     pub cw: f32,
@@ -21,6 +35,46 @@ impl Default for CellMetrics {
     }
 }
 
+impl CellMetrics {
+    /// Deterministic logical width of `text` in `face` (exact `len * cw` for `Mono`,
+    /// calibrated proportional glyph advance estimator for Apple SF Pro sans faces).
+    pub fn measure(&self, text: &str, face: TextFace) -> f32 {
+        if face == TextFace::Mono {
+            return text.chars().count() as f32 * self.cw;
+        }
+        let scale = match face {
+            TextFace::Mono => 1.0,
+            TextFace::Ui => 0.84,
+            TextFace::UiSmall => 0.77,
+            TextFace::Heading => 1.06,
+        };
+        let mut units = 0.0f32;
+        for ch in text.chars() {
+            units += match ch {
+                ' ' => 0.42,
+                'i' | 'l' | 'I' | '!' | '|' | '.' | ',' | ':' | ';' | '\'' | '`' => 0.42,
+                'f' | 'j' | 'r' | 't' | '(' | ')' | '[' | ']' | '/' | '\\' | '-' | '·' => 0.56,
+                'm' | 'w' | 'M' | 'W' | '…' | '—' => 1.24,
+                c if c.is_ascii_uppercase() => 1.04,
+                c if !c.is_ascii() => 1.15,
+                _ => 0.88,
+            };
+        }
+        units * self.cw * scale
+    }
+
+    /// Logical line height for `face`.
+    #[inline]
+    pub fn line_h(&self, face: TextFace) -> f32 {
+        match face {
+            TextFace::Mono => self.ch,
+            TextFace::Ui => self.ch * 0.96,
+            TextFace::UiSmall => self.ch * 0.88,
+            TextFace::Heading => self.ch * 1.22,
+        }
+    }
+}
+
 /// A styled text span positioned in logical pixels to be turned into [`blaze_ui::shaders::GlyphInst`]s.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextRun {
@@ -30,6 +84,7 @@ pub struct TextRun {
     pub color: [f32; 4],
     pub bold: bool,
     pub italic: bool,
+    pub face: TextFace,
     pub clip_id: u32,
 }
 
@@ -78,6 +133,7 @@ pub enum HitAction {
     ToggleExpandCell { block: BlockId, row: usize, col: usize },
     SelectCompletion(usize),
     SelectHistory(usize),
+    SelectPalette(usize),
     CycleHistoryScope,
     ResetZoom,
     /// Interactive prompt-capsule popover actions.
@@ -858,9 +914,64 @@ impl Scene {
         italic: bool,
         clip_id: u32,
     ) {
+        self.text_with_face(x, y, text, color, bold, italic, TextFace::Mono, clip_id);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn ui_text(
+        &mut self,
+        x: f32,
+        y: f32,
+        text: impl Into<String>,
+        color: [f32; 4],
+        bold: bool,
+        italic: bool,
+        clip_id: u32,
+    ) {
+        self.text_with_face(x, y, text, color, bold, italic, TextFace::Ui, clip_id);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn ui_small(
+        &mut self,
+        x: f32,
+        y: f32,
+        text: impl Into<String>,
+        color: [f32; 4],
+        bold: bool,
+        italic: bool,
+        clip_id: u32,
+    ) {
+        self.text_with_face(x, y, text, color, bold, italic, TextFace::UiSmall, clip_id);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn heading_text(
+        &mut self,
+        x: f32,
+        y: f32,
+        text: impl Into<String>,
+        color: [f32; 4],
+        clip_id: u32,
+    ) {
+        self.text_with_face(x, y, text, color, true, false, TextFace::Heading, clip_id);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn text_with_face(
+        &mut self,
+        x: f32,
+        y: f32,
+        text: impl Into<String>,
+        color: [f32; 4],
+        bold: bool,
+        italic: bool,
+        face: TextFace,
+        clip_id: u32,
+    ) {
         let s = text.into();
         if !s.is_empty() {
-            self.text_runs.push(TextRun { x, y, text: s, color, bold, italic, clip_id });
+            self.text_runs.push(TextRun { x, y, text: s, color, bold, italic, face, clip_id });
         }
     }
 
@@ -875,9 +986,52 @@ impl Scene {
         italic: bool,
         clip_id: u32,
     ) {
+        self.overlay_text_with_face(x, y, text, color, bold, italic, TextFace::Mono, clip_id);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn overlay_ui_text(
+        &mut self,
+        x: f32,
+        y: f32,
+        text: impl Into<String>,
+        color: [f32; 4],
+        bold: bool,
+        italic: bool,
+        clip_id: u32,
+    ) {
+        self.overlay_text_with_face(x, y, text, color, bold, italic, TextFace::Ui, clip_id);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn overlay_ui_small(
+        &mut self,
+        x: f32,
+        y: f32,
+        text: impl Into<String>,
+        color: [f32; 4],
+        bold: bool,
+        italic: bool,
+        clip_id: u32,
+    ) {
+        self.overlay_text_with_face(x, y, text, color, bold, italic, TextFace::UiSmall, clip_id);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn overlay_text_with_face(
+        &mut self,
+        x: f32,
+        y: f32,
+        text: impl Into<String>,
+        color: [f32; 4],
+        bold: bool,
+        italic: bool,
+        face: TextFace,
+        clip_id: u32,
+    ) {
         let s = text.into();
         if !s.is_empty() {
-            self.overlay_text.push(TextRun { x, y, text: s, color, bold, italic, clip_id });
+            self.overlay_text.push(TextRun { x, y, text: s, color, bold, italic, face, clip_id });
         }
     }
 
@@ -1214,6 +1368,32 @@ pub fn format_duration_ms(ms: u64) -> String {
         let secs = (ms % 60_000) / 1_000;
         format!("{mins}m {secs}s")
     }
+}
+
+/// Middle-truncate `s` (e.g. long paths `crates/blaze-shell/src/layout.rs` -> `crates/…/layout.rs`)
+/// so the filename at the end stays readable inside narrow tiled panes!
+pub fn truncate_middle(s: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max_chars {
+        return s.to_owned();
+    }
+    if max_chars <= 3 {
+        return truncate_chars(s, max_chars);
+    }
+    let keep_tail = ((max_chars - 1) * 2 / 3).max(4).min(max_chars - 2);
+    let keep_head = max_chars - 1 - keep_tail;
+    let mut out = String::with_capacity(s.len());
+    for &c in &chars[..keep_head] {
+        out.push(c);
+    }
+    out.push('…');
+    for &c in &chars[chars.len() - keep_tail..] {
+        out.push(c);
+    }
+    out
 }
 
 /// Truncate `s` to at most `max_chars` Unicode scalar values, appending `…` if truncated.

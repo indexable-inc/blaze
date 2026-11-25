@@ -72,12 +72,38 @@ const BLAZE_LOCK_SVG: &str = r##"<svg width="16" height="16" viewBox="0 0 16 16"
 <rect x="9.1" y="10.4" width="5.2" height="4.2" rx="0.9" fill="#232529" stroke="#CED0D6" stroke-width="1.15"/>
 </svg>"##;
 
+/// Modern Retina MacBook Pro vector icon (brushed aluminum lid & deck, Retina blue-glass display,
+/// signature camera notch & thumb indent — Apple emoji polish rendered natively in Metal).
+const MACBOOK_PRO_SVG: &str = r##"<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+<rect x="2.1" y="2.2" width="11.8" height="8.5" rx="1.25" fill="#1C2026" stroke="#9EA7B3" stroke-width="0.95"/>
+<rect x="3.0" y="3.1" width="10.0" height="6.6" rx="0.5" fill="#234873"/>
+<path d="M3.0 7.7L7.6 3.1H10.5L3.0 9.7Z" fill="#3D78BF"/>
+<path d="M9.6 9.7L13.0 6.3V9.7H9.6Z" fill="#1B395C"/>
+<rect x="7.0" y="3.0" width="2.0" height="0.85" rx="0.3" fill="#15171B"/>
+<path d="M0.8 11.1H15.2V12.05C15.2 12.65 14.55 13.1 13.75 13.1H2.25C1.45 13.1 0.8 12.65 0.8 12.05V11.1Z" fill="#C7CDD6"/>
+<rect x="6.4" y="11.1" width="3.2" height="0.72" rx="0.35" fill="#7C8490"/>
+<line x1="1.8" y1="12.8" x2="14.2" y2="12.8" stroke="#858E9A" stroke-width="0.55"/>
+</svg>"##;
+
+/// Modern dark-slate remote server rack vector icon with crisp luminous status LEDs.
+const SERVER_RACK_SVG: &str = r##"<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+<rect x="1.8" y="2.2" width="12.4" height="5.0" rx="1.1" fill="#22252B" stroke="#8A92A0" stroke-width="0.9"/>
+<rect x="1.8" y="8.8" width="12.4" height="5.0" rx="1.1" fill="#22252B" stroke="#8A92A0" stroke-width="0.9"/>
+<circle cx="4.2" cy="4.7" r="1.05" fill="#52C482"/>
+<circle cx="4.2" cy="11.3" r="1.05" fill="#5CA4E8"/>
+<line x1="7.2" y1="4.7" x2="12.0" y2="4.7" stroke="#6E7684" stroke-width="1.0" stroke-linecap="round"/>
+<line x1="7.2" y1="11.3" x2="12.0" y2="11.3" stroke="#6E7684" stroke-width="1.0" stroke-linecap="round"/>
+</svg>"##;
+
 macro_rules! intellij_dark {
     ($($name:literal),* $(,)?) => {
         &[
             // Two-tone macOS blue folder & RustRover excluded amber folder.
             ("folder_macos", MACOS_FOLDER_SVG),
             ("folder_target", EXCLUDED_FOLDER_SVG),
+            // Modern MacBook Pro & remote server icons for prompt host segment & Agent Hub.
+            ("macbook_pro", MACBOOK_PRO_SVG),
+            ("server_rack", SERVER_RACK_SVG),
             // RustRover / IntelliJ New UI Cargo & Blaze manifest/lock icons.
             ("cargo_toml", CARGO_TOML_SVG),
             ("cargo_lock", CARGO_LOCK_SVG),

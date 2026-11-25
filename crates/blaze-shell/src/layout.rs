@@ -17,7 +17,10 @@ use blaze_vt::style::{Color as VtColor, Rgb as VtRgb, Underline as VtUnderline};
 use blaze_vt::terminal::{Mode as VtMode, Terminal};
 
 use crate::blocks::{Block, BlockBody, BlockStore, TABLE_FOLD_ROWS};
-use crate::editor::{CompletionKind, Editor};
+use crate::editor::{
+    COMPLETION_VISIBLE_ROWS, CommandPalette, CompletionKind, Editor, HISTORY_VISIBLE_ROWS,
+    PALETTE_VISIBLE_ROWS,
+};
 use crate::icons::{Icon, draw_icon, icon_for_record_key};
 use crate::prompt::PromptInfo;
 use crate::svg_icons::icon_name_for_file;
@@ -25,9 +28,9 @@ use crate::theme;
 use crate::tiling::{PaneId, SplitAxis, SplitHandle, SplitId, TabId};
 use crate::view::{
     ActiveDrag, ActivePopover, CellMetrics, CursorTrail, DragPayload, HitAction, HitRect,
-    HoverKind, OutputNav, OutputVisualMode, Scene, TextSelection, compute_text_selection,
+    HoverKind, OutputNav, OutputVisualMode, Scene, TextFace, TextSelection, compute_text_selection,
     extract_visual_lines, format_duration_ms, format_value_cell_at, is_expandable_cell,
-    output_nav_geometry, truncate_chars, wrap_lines,
+    output_nav_geometry, truncate_chars, truncate_middle, wrap_lines,
 };
 
 pub const TOP_BAR_H: f32 = 34.0;
@@ -37,7 +40,6 @@ const TRAFFIC_LIGHTS_PAD: f32 = 80.0;
 const OUTER_PAD_X: f32 = 16.0;
 const BLOCK_PAD_Y: f32 = 6.0;
 const TABLE_ROW_PAD_Y: f32 = 2.5;
-const MAX_POPUP_ROWS: usize = 8;
 const SIZE_BAR_W: f32 = 42.0;
 
 /// All inputs required to lay out one frame of `blaze-shell` (deterministic: `now_ns` injected).
@@ -101,18 +103,26 @@ fn build_scene_inner(input: &LayoutInput<'_>, draw_top_bar: bool) -> Scene {
     let blocks = input.store.active_blocks();
 
     let mut content_y = 8.0f32;
+    let mut prev_cwd: Option<&str> = None;
+    let mut prev_branch: Option<Option<&str>> = None;
     for (idx, blk) in blocks.iter().enumerate() {
         if idx > 0 {
             let sep_y = feed_top + content_y - input.scroll_y;
             scene.line(col_x0, sep_y, col_x1, sep_y, 1.0, theme::LINE_FAINT, feed_clip);
             content_y += BLOCK_PAD_Y;
         }
-        // Always keep the context capsule on every command block (never vanishes after running).
+        // Delta prompt capsules: show full context capsule on block 0 or whenever cwd/git branch
+        // changed; consecutive commands in the same context stay calm & scannable!
+        let cur_cwd = blk.prompt_snapshot.cwd.as_str();
+        let cur_branch = blk.prompt_snapshot.git_branch.as_deref();
+        let show_capsule = prev_cwd != Some(cur_cwd) || prev_branch != Some(cur_branch);
+        prev_cwd = Some(cur_cwd);
+        prev_branch = Some(cur_branch);
         let draw_y = feed_top + content_y - input.scroll_y;
         let h = layout_block(
             &mut scene,
             blk,
-            true,
+            show_capsule,
             col_x0,
             draw_y,
             col_x1,
@@ -535,73 +545,17 @@ pub fn layout_window_top_bar(
         }
     }
 
-    // Inline repo/directory + branch + uncommitted file icons tucked cleanly on the right.
-    let dir_txt = truncate_chars(&prompt.dir_short, 20);
-    let branch_part = prompt.git_branch.as_deref().unwrap_or("");
-    let top_icons: &[(&'static str, u32)] = prompt
-        .git_status
-        .as_ref()
-        .map(|s| s.changed_icons.as_slice())
-        .unwrap_or(&[]);
-    let top_dirty_total: u32 = prompt
-        .git_status
-        .as_ref()
-        .map(|s| s.conflicted + s.staged + s.modified + s.deleted + s.untracked)
-        .unwrap_or(0);
-    let dir_icon_s = 13.0;
-    let mini_icon_s = 11.5;
-    let shown_top_icons = top_icons.len().min(3);
-    let dirty_count_str = if top_dirty_total > 0 {
-        format!("{top_dirty_total}")
-    } else {
-        String::new()
-    };
-    let mut info_w = dir_icon_s + 6.0 + dir_txt.chars().count() as f32 * m.cw;
-    if !branch_part.is_empty() {
-        info_w += 12.0 + icon_s + 5.0 + branch_part.chars().count() as f32 * m.cw;
-        if shown_top_icons > 0 {
-            info_w += 8.0 + shown_top_icons as f32 * (mini_icon_s + 2.5);
-            if !dirty_count_str.is_empty() {
-                info_w += 2.0 + dirty_count_str.len() as f32 * m.cw;
-            }
-        }
-    }
-    let info_x0 = rx - info_w - 6.0;
-    let tabs_limit = if info_x0 > x + 220.0 {
-        let mut ix = info_x0;
-        scene.svg_icon(ix, (TOP_BAR_H - dir_icon_s) * 0.5, dir_icon_s, "folder_macos", 0);
-        ix += dir_icon_s + 6.0;
-        scene.text(ix, mid_y, &dir_txt, theme::INK_2, false, false, 0);
-        ix += dir_txt.chars().count() as f32 * m.cw;
-        if !branch_part.is_empty() {
-            ix += 12.0;
-            draw_icon(scene, Icon::Branch, ix, icon_y, icon_s, theme::INK_3, 0);
-            ix += icon_s + 5.0;
-            scene.text(ix, mid_y, branch_part, theme::INK_2, false, false, 0);
-            ix += branch_part.chars().count() as f32 * m.cw;
-            if shown_top_icons > 0 {
-                ix += 8.0;
-                let miy = (TOP_BAR_H - mini_icon_s) * 0.5;
-                for &(ic, _) in top_icons.iter().take(shown_top_icons) {
-                    scene.svg_icon(ix, miy, mini_icon_s, ic, 0);
-                    ix += mini_icon_s + 2.5;
-                }
-                if !dirty_count_str.is_empty() {
-                    scene.text(ix + 2.0, mid_y, &dirty_count_str, theme::INK_3, false, false, 0);
-                }
-            }
-        }
-        info_x0 - 16.0
-    } else {
-        rx - 10.0
-    };
+    // De-duplicated window-level top bar: keep cwd/git strictly in the focused pane header &
+    // prompt capsule so workspace tabs enjoy clean, generous SF Pro typography!
+    let tabs_limit = rx - 10.0;
+    let _ = prompt;
 
     // Left: Workspace tabs (`1..N` via Cmd+1..9) + `+` button (`Cmd+T`) + CoW branch pills if >1 branch.
     let plus_w = 24.0;
     let tabs_end = (tabs_limit - plus_w - 6.0).max(x);
     for tab in tabs {
         let slot_str = format!("{} ", tab.slot);
-        let title_str = truncate_chars(tab.title, 18);
+        let title_str = truncate_chars(tab.title, 22);
         let badge_str = if tab.zoomed && tab.pane_count > 1 {
             format!(" · Z{}", tab.pane_count)
         } else if tab.pane_count > 1 {
@@ -611,10 +565,14 @@ pub fn layout_window_top_bar(
         } else {
             String::new()
         };
-        let pad_x = 8.0;
-        let slot_w = slot_str.chars().count() as f32 * m.cw;
-        let title_w = title_str.chars().count() as f32 * m.cw;
-        let badge_w = badge_str.chars().count() as f32 * m.cw;
+        let pad_x = 9.0;
+        let slot_w = m.measure(&slot_str, TextFace::UiSmall) + 2.0;
+        let title_w = m.measure(&title_str, TextFace::Ui) + 2.0;
+        let badge_w = if badge_str.is_empty() {
+            0.0
+        } else {
+            m.measure(&badge_str, TextFace::UiSmall) + 2.0
+        };
         let tab_w = pad_x * 2.0 + slot_w + title_w + badge_w;
         if x + tab_w > tabs_end {
             break;
@@ -648,12 +606,12 @@ pub fn layout_window_top_bar(
         let slot_col = if tab.active { theme::INK_3 } else { theme::INK_4 };
         let title_col = if tab.active { theme::INK_1 } else { theme::INK_3 };
         let badge_col = if tab.active { theme::INK_3 } else { theme::INK_4 };
-        scene.text(tx, mid_y, &slot_str, slot_col, false, false, 0);
+        scene.ui_small(tx, mid_y, &slot_str, slot_col, false, false, 0);
         tx += slot_w;
-        scene.text(tx, mid_y, &title_str, title_col, tab.active, false, 0);
+        scene.ui_text(tx, mid_y, &title_str, title_col, tab.active, false, 0);
         tx += title_w;
         if !badge_str.is_empty() {
-            scene.text(tx, mid_y, &badge_str, badge_col, false, false, 0);
+            scene.ui_small(tx, mid_y, &badge_str, badge_col, false, false, 0);
         }
         let rect = HitRect::new(x, btn_y0, x + tab_w, btn_y1);
         scene.push_hit(rect, HitAction::SwitchTab(tab.id));
@@ -689,13 +647,13 @@ pub fn layout_window_top_bar(
         x += plus_w + 8.0;
     }
 
-    // If the focused pane has >1 CoW session branch (`Cmd+B`), show compact branch switcher pills too.
+    // If the focused pane has >1 CoW session branch (`Cmd+B`), show compact SF Pro branch switcher pills too.
     if store.branches().len() > 1 {
         let active_bid = store.active_branch_id();
         for branch in store.branches() {
             let is_active = branch.id == active_bid;
             let name = branch.name.as_str();
-            let bw = 14.0 + icon_s + 4.0 + name.chars().count() as f32 * m.cw;
+            let bw = 16.0 + icon_s + 4.0 + m.measure(name, TextFace::UiSmall);
             if x + bw > tabs_limit {
                 break;
             }
@@ -703,7 +661,7 @@ pub fn layout_window_top_bar(
                 scene.round_rect(x, btn_y0, x + bw, btn_y1, 5.5, theme::BG_CHIP, 1.0, theme::LINE_STRONG, 0);
             }
             draw_icon(scene, Icon::Branch, x + 6.0, icon_y, icon_s, if is_active { theme::INK_2 } else { theme::INK_4 }, 0);
-            scene.text(
+            scene.ui_small(
                 x + 6.0 + icon_s + 4.0,
                 mid_y,
                 name,
@@ -816,8 +774,9 @@ pub fn draw_tiled_pane_chrome(
         label.push_str(tag);
         label.push(']');
     }
-    let max_c = ((rx - lx) / m.cw).floor().max(6.0) as usize;
-    scene.text(
+    let avg_cw = m.measure("n", TextFace::UiSmall).max(4.5);
+    let max_c = ((rx - lx) / avg_cw).floor().max(6.0) as usize;
+    scene.ui_small(
         lx,
         mid_y,
         truncate_chars(&label, max_c),
@@ -903,23 +862,30 @@ fn layout_starship_line(
         scene.line(x, y + 4.0, x, y + cap_h - 4.0, 1.0, sep_col, clip_id);
     };
 
-    // Segment 0: Machine/Server badge (Laptop icon for local Mac, Server rack icon for remote host).
+    // Segment 0: Modern Retina MacBook Pro / Server Rack icon + hostname (`SF Pro` UI label).
     if !prompt.host.is_empty() {
         let seg0_x0 = cx - 4.0;
-        let host_s = 11.5;
-        let host_icon = if prompt.is_remote { Icon::Server } else { Icon::Laptop };
+        let host_s = 13.5;
+        let host_svg = if prompt.is_remote { "server_rack" } else { "macbook_pro" };
         let host_col = if prompt.is_remote {
             theme::INK_1
         } else if is_live {
-            theme::INK_3
+            theme::INK_2
         } else {
             theme::INK_4
         };
-        draw_icon(scene, host_icon, cx, ty + (m.ch - host_s) * 0.5, host_s, host_col, clip_id);
+        scene.svg_icon_alpha(
+            cx,
+            ty + (m.ch - host_s) * 0.5,
+            host_s,
+            host_svg,
+            if is_live { 1.0 } else { 0.72 },
+            clip_id,
+        );
         cx += host_s + 5.0;
         let host_lbl = truncate_chars(&prompt.host, 16);
-        scene.text(cx, ty, &host_lbl, host_col, prompt.is_remote, false, clip_id);
-        cx += host_lbl.chars().count() as f32 * m.cw;
+        scene.ui_small(cx, ty, &host_lbl, host_col, prompt.is_remote, false, clip_id);
+        cx += m.measure(&host_lbl, TextFace::UiSmall);
         scene.push_hover_clipped(
             HitRect::new(seg0_x0, y, cx + 4.0, y + cap_h),
             clip_id,
@@ -1916,14 +1882,66 @@ fn layout_table(
         col_max_num.push(max_num);
     }
 
+    // Priority-based responsive column widths: preserve exact intrinsic widths for short fixed
+    // columns (`status`, `size`, `modified`, `readonly`) and flex/middle-truncate path columns!
     let mut col_widths: Vec<f32> = (0..ncols)
         .map(|c| col_chars[c] as f32 * m.cw + col_extra_px[c] + col_gap)
         .collect();
     let total_w: f32 = col_widths.iter().sum();
     if total_w > avail_w && total_w > 0.0 {
-        let scale = avail_w / total_w;
-        for w in &mut col_widths {
-            *w = (*w * scale).max(40.0);
+        let is_flex: Vec<bool> = (0..ncols)
+            .map(|c| {
+                let col_name = table.columns.get(c).map(|s| s.as_ref()).unwrap_or("");
+                col_name != "readonly"
+                    && !matches!(
+                        col_displays[c],
+                        ColDisplay::FileSize
+                            | ColDisplay::HumanTime
+                            | ColDisplay::Percent
+                            | ColDisplay::Status
+                    )
+            })
+            .collect();
+        let fixed_sum: f32 = (0..ncols)
+            .filter(|&c| !is_flex[c])
+            .map(|c| col_widths[c])
+            .sum();
+        let flex_sum: f32 = total_w - fixed_sum;
+        let flex_budget = avail_w - fixed_sum;
+        if flex_sum > 0.0 && flex_budget >= 110.0 {
+            let fscale = flex_budget / flex_sum;
+            for c in 0..ncols {
+                if is_flex[c] {
+                    col_widths[c] = (col_widths[c] * fscale).max(96.0);
+                }
+            }
+        } else {
+            // Very narrow pane: compact status column to single-letter badge first before shrinking sizes/times!
+            for c in 0..ncols {
+                if col_displays[c] == ColDisplay::Status
+                    && table.columns.get(c).map(|s| s.as_ref()) != Some("readonly")
+                {
+                    col_widths[c] = (m.cw * 3.2 + col_gap).min(col_widths[c]);
+                }
+            }
+            let new_total: f32 = col_widths.iter().sum();
+            if new_total > avail_w && new_total > 0.0 {
+                let fsum2: f32 = (0..ncols).filter(|&c| is_flex[c]).map(|c| col_widths[c]).sum();
+                let fix2 = new_total - fsum2;
+                if fsum2 > 0.0 && avail_w - fix2 >= 90.0 {
+                    let fs = (avail_w - fix2) / fsum2;
+                    for c in 0..ncols {
+                        if is_flex[c] {
+                            col_widths[c] = (col_widths[c] * fs).max(86.0);
+                        }
+                    }
+                } else {
+                    let scale = avail_w / new_total;
+                    for w in &mut col_widths {
+                        *w = (*w * scale).max(38.0);
+                    }
+                }
+            }
         }
     }
     let table_w = (idx_w + col_widths.iter().sum::<f32>() - col_gap * 0.4).min(width - scrollbar_reserve);
@@ -1931,8 +1949,8 @@ fn layout_table(
 
     let row_h = m.ch + TABLE_ROW_PAD_Y * 2.0;
 
-    // Clickable sortable column headers + crisp hairline underneath.
-    scene.text(x0, y0, "#", theme::INK_4, false, false, clip_id);
+    // Clickable sortable column headers in crisp Apple SF Pro (`UiSmall`) + hairline underneath.
+    scene.ui_small(x0, y0, "#", theme::INK_4, false, false, clip_id);
     let mut cx = x0 + idx_w;
     for c in 0..ncols {
         let cw = col_widths[c];
@@ -1953,18 +1971,20 @@ fn layout_table(
             let ls = 11.0;
             draw_icon(scene, Icon::Lock, cx + 2.0, y0 + (m.ch - ls) * 0.5, ls, hdr_col, clip_id);
             if !suffix.is_empty() {
-                scene.text(cx + ls + 4.0, y0, suffix.trim(), hdr_col, true, false, clip_id);
+                scene.ui_small(cx + ls + 4.0, y0, suffix.trim(), hdr_col, true, false, clip_id);
             }
         } else {
-            let max_ch = (content_w / m.cw).floor().max(2.0) as usize;
+            let avg_cw = m.measure("n", TextFace::UiSmall).max(4.5);
+            let max_ch = (content_w / avg_cw).floor().max(2.0) as usize;
             let hdr_base = truncate_chars(col_raw, max_ch.saturating_sub(suffix.chars().count()).max(1));
             let hdr = format!("{hdr_base}{suffix}");
+            let hdr_w = m.measure(&hdr, TextFace::UiSmall);
             let tx = if col_right_align[c] {
-                cx + content_w - hdr.chars().count() as f32 * m.cw
+                cx + content_w - hdr_w
             } else {
                 cx
             };
-            scene.text(tx, y0, hdr, hdr_col, active_sort.is_some(), false, clip_id);
+            scene.ui_small(tx, y0, hdr, hdr_col, active_sort.is_some(), false, clip_id);
         }
         if depth <= 1 {
             let hdr_hit = HitRect::new(cx - 4.0, y0 - 2.0, cx + content_w + 4.0, y0 + m.ch + 4.0);
@@ -2063,8 +2083,13 @@ fn layout_table(
                                 } else {
                                     raw_name.clone()
                                 };
-                                let max_ch = ((content_w - icon_pad - 8.0) / m.cw).floor().max(3.0) as usize;
-                                let txt = truncate_chars(&display_name, max_ch);
+                                let max_ch = ((content_w - icon_pad - 8.0) / m.cw).floor().max(4.0) as usize;
+                                // Middle-truncate nested paths (`crates/…/layout.rs`) so filenames stay visible!
+                                let txt = if display_name.contains('/') {
+                                    truncate_middle(&display_name, max_ch)
+                                } else {
+                                    truncate_chars(&display_name, max_ch)
+                                };
                                 let chip_w = (icon_pad + txt.chars().count() as f32 * m.cw + 10.0)
                                     .min(content_w + 2.0);
                                 let bx0 = rx - 5.0;
@@ -2151,21 +2176,59 @@ fn layout_table(
                                     let is_ok = raw.eq_ignore_ascii_case("running")
                                         || raw.eq_ignore_ascii_case("ok")
                                         || raw.eq_ignore_ascii_case("staged")
+                                        || raw.eq_ignore_ascii_case("added")
                                         || raw.eq_ignore_ascii_case("current")
                                         || raw == "R"
                                         || raw == "S";
-                                    let dot_y = ty + m.ch * 0.5;
-                                    if is_ok {
-                                        scene.over_circle(rx + 4.0, dot_y, 3.0, theme::OK, clip_id);
-                                    } else if raw.eq_ignore_ascii_case("conflict") || raw.eq_ignore_ascii_case("deleted") {
-                                        scene.over_circle(rx + 4.0, dot_y, 3.0, theme::DANGER, clip_id);
+                                    let is_danger = raw.eq_ignore_ascii_case("conflict")
+                                        || raw.eq_ignore_ascii_case("deleted");
+                                    let compact_w = content_w < 7.5 * m.cw;
+                                    if compact_w {
+                                        // Crisp compact single-letter status badge when narrow (`M`, `A`, `D`, `?`, `R`).
+                                        let badge = match raw.to_ascii_lowercase().as_str() {
+                                            "modified" => "M",
+                                            "untracked" => "?",
+                                            "staged" | "added" => "A",
+                                            "deleted" => "D",
+                                            "renamed" => "R",
+                                            "conflict" => "!",
+                                            _ => raw.get(..1).unwrap_or("·"),
+                                        };
+                                        let col = if is_ok {
+                                            theme::OK
+                                        } else if is_danger {
+                                            theme::DANGER
+                                        } else if badge == "M" {
+                                            theme::rgb(0xde, 0xc7, 0x92)
+                                        } else {
+                                            theme::INK_3
+                                        };
+                                        scene.round_rect(
+                                            rx,
+                                            cur_y + 3.0,
+                                            rx + 18.0,
+                                            cur_y + row_h - 3.0,
+                                            4.0,
+                                            theme::BG_CHIP,
+                                            1.0,
+                                            theme::LINE_FAINT,
+                                            clip_id,
+                                        );
+                                        scene.text(rx + 5.0, ty, badge, col, true, false, clip_id);
                                     } else {
-                                        scene.over_ring(rx + 4.0, dot_y, 3.0, 1.1, theme::INK_3, clip_id);
+                                        let dot_y = ty + m.ch * 0.5;
+                                        if is_ok {
+                                            scene.over_circle(rx + 4.0, dot_y, 3.0, theme::OK, clip_id);
+                                        } else if is_danger {
+                                            scene.over_circle(rx + 4.0, dot_y, 3.0, theme::DANGER, clip_id);
+                                        } else {
+                                            scene.over_ring(rx + 4.0, dot_y, 3.0, 1.1, theme::INK_3, clip_id);
+                                        }
+                                        let max_ch = ((content_w - 14.0) / m.cw).floor().max(2.0) as usize;
+                                        let txt = truncate_chars(&raw, max_ch);
+                                        let col = if is_ok { theme::INK_2 } else { theme::INK_3 };
+                                        scene.ui_small(rx + 13.0, ty, txt, col, false, false, clip_id);
                                     }
-                                    let max_ch = ((content_w - 14.0) / m.cw).floor().max(2.0) as usize;
-                                    let txt = truncate_chars(&raw, max_ch);
-                                    let col = if is_ok { theme::INK_2 } else { theme::INK_3 };
-                                    scene.text(rx + 13.0, ty, txt, col, false, false, clip_id);
                                 }
                             }
                             ColDisplay::FileSize => {
@@ -3522,12 +3585,11 @@ fn layout_completion_popup(
     if total == 0 {
         return;
     }
-    let show = total.min(MAX_POPUP_ROWS);
-    let win_start = if editor.completion_selected >= show {
-        editor.completion_selected + 1 - show
-    } else {
-        0
-    };
+    let show = total.min(COMPLETION_VISIBLE_ROWS);
+    let max_scroll = total.saturating_sub(show);
+    let win_start = editor.completion_scroll.min(max_scroll);
+    let has_sb = total > show;
+    let sb_pad = if has_sb { 10.0 } else { 0.0 };
     let row_h = m.ch + 8.0;
     let doc_h = m.ch + 12.0;
     let popup_h = show as f32 * row_h + doc_h + 10.0;
@@ -3562,7 +3624,8 @@ fn layout_completion_popup(
     );
 
     let icon_s = 14.0;
-    let mut ry = py0 + 5.0;
+    let list_y0 = py0 + 5.0;
+    let mut ry = list_y0;
     for offset in 0..show {
         let idx = win_start + offset;
         let item = &editor.completions[idx];
@@ -3571,7 +3634,7 @@ fn layout_completion_popup(
             scene.overlay_round_rect(
                 px0 + 5.0,
                 ry,
-                px1 - 5.0,
+                px1 - 5.0 - sb_pad,
                 ry + row_h,
                 5.0,
                 theme::BG_SELECTED,
@@ -3617,11 +3680,11 @@ fn layout_completion_popup(
             scene.overlay_text_run(gx, ty, glyph, fg_col, true, false, 0);
         }
 
-        // Right-aligned type / file-size detail.
-        let detail_txt = truncate_chars(&item.detail, 18);
-        let detail_w = detail_txt.chars().count() as f32 * m.cw;
-        let detail_x = px1 - 14.0 - detail_w;
-        scene.overlay_text_run(
+        // Right-aligned type / file-size detail in crisp SF Pro (`UiSmall`).
+        let detail_txt = truncate_chars(&item.detail, 20);
+        let detail_w = m.measure(&detail_txt, TextFace::UiSmall);
+        let detail_x = px1 - 12.0 - sb_pad - detail_w;
+        scene.overlay_ui_small(
             detail_x,
             ty,
             &detail_txt,
@@ -3679,25 +3742,59 @@ fn layout_completion_popup(
         }
 
         scene.push_hit(
-            HitRect::new(px0 + 5.0, ry, px1 - 5.0, ry + row_h),
+            HitRect::new(px0 + 5.0, ry, px1 - 5.0 - sb_pad, ry + row_h),
             HitAction::SelectCompletion(idx),
         );
         ry += row_h;
     }
 
-    // Bottom IntelliJ Quick-Doc strip for the currently selected item.
+    // Crisp vertical scrollbar thumb when completions exceed visible window.
+    if has_sb {
+        draw_overlay_scrollbar(scene, px1 - 8.0, list_y0 + 2.0, ry - 2.0, win_start, max_scroll, show, total);
+    }
+
+    // Bottom Quick-Doc strip in SF Pro + scroll count indicator.
     let div_y = py1 - doc_h;
     scene.overlay_line(px0 + 1.0, div_y, px1 - 1.0, div_y, 1.0, theme::LINE, 0);
     let doc_ty = div_y + (doc_h - m.ch) * 0.5;
-    let hint = "↑↓  tab  esc";
-    let hint_w = hint.chars().count() as f32 * m.cw;
-    scene.overlay_text_run(px1 - 12.0 - hint_w, doc_ty, hint, theme::INK_4, false, false, 0);
+    let hint = if has_sb {
+        format!("{}/{}  ·  ↑↓ scroll  tab", editor.completion_selected + 1, total)
+    } else {
+        "↑↓  tab  esc".to_owned()
+    };
+    let hint_w = m.measure(&hint, TextFace::UiSmall);
+    scene.overlay_ui_small(px1 - 12.0 - hint_w, doc_ty, &hint, theme::INK_4, false, false, 0);
 
     if let Some(sel) = editor.completions.get(editor.completion_selected) {
-        let max_doc = ((px1 - 24.0 - hint_w - (px0 + 13.0)) / m.cw).floor().max(8.0) as usize;
+        let avg_cw = m.measure("n", TextFace::UiSmall).max(4.5);
+        let max_doc = ((px1 - 24.0 - hint_w - (px0 + 13.0)) / avg_cw).floor().max(8.0) as usize;
         let doc_txt = truncate_chars(&sel.doc, max_doc);
-        scene.overlay_text_run(px0 + 13.0, doc_ty, doc_txt, theme::INK_3, false, false, 0);
+        scene.overlay_ui_small(px0 + 13.0, doc_ty, doc_txt, theme::INK_3, false, false, 0);
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_overlay_scrollbar(
+    scene: &mut Scene,
+    x: f32,
+    y0: f32,
+    y1: f32,
+    scroll: usize,
+    max_scroll: usize,
+    visible: usize,
+    total: usize,
+) {
+    let track_h = (y1 - y0).max(16.0);
+    let frac = (visible as f32 / total.max(1) as f32).clamp(0.12, 1.0);
+    let thumb_h = (track_h * frac).max(18.0).min(track_h);
+    let ratio = if max_scroll == 0 {
+        0.0
+    } else {
+        scroll as f32 / max_scroll as f32
+    };
+    let ty0 = y0 + ratio * (track_h - thumb_h);
+    scene.overlay_round_rect(x, y0, x + 3.5, y1, 1.75, theme::rgba(0x28, 0x28, 0x2d, 0.45), 0.0, [0.0; 4], 0);
+    scene.overlay_round_rect(x, ty0, x + 3.5, ty0 + thumb_h, 1.75, theme::rgba(0x88, 0x88, 0x92, 0.72), 0.0, [0.0; 4], 0);
 }
 
 /// Floating pill rendered under the cursor while dragging a file/folder/crate into the hotbar.
@@ -3738,14 +3835,11 @@ fn layout_reverse_search_overlay(
     m: CellMetrics,
     now_ns: i64,
 ) {
-    let max_rows = 12usize;
+    let max_rows = HISTORY_VISIBLE_ROWS;
     let total_matches = rs.results.len();
     let visible = total_matches.min(max_rows).max(1);
-    let win_start = if rs.selected >= max_rows {
-        rs.selected + 1 - max_rows
-    } else {
-        0
-    };
+    let max_scroll = total_matches.saturating_sub(max_rows);
+    let win_start = rs.scroll.min(max_scroll);
 
     let pad_x = 14.0;
     let header_h = m.ch + 16.0;
@@ -3765,21 +3859,27 @@ fn layout_reverse_search_overlay(
     scene.overlay_shadow(x0, y0 + 6.0, x1, y1 + 6.0, 10.0, 24.0, theme::SHADOW_SOFT, 0);
     scene.overlay_round_rect(x0, y0, x1, y1, 10.0, theme::rgb(0x14, 0x14, 0x17), 1.0, theme::rgb(0x2a, 0x2a, 0x2f), 0);
 
-    // 1. Header bar: title, match count, quiet shortcuts.
+    // 1. Header bar: SF Pro title, match count, quiet shortcuts.
     let h_ty = y0 + (header_h - m.ch) * 0.5;
-    scene.overlay_text_run(x0 + pad_x, h_ty, "history", theme::INK_1, true, false, 0);
+    scene.overlay_ui_text(x0 + pad_x, h_ty, "History", theme::INK_1, true, false, 0);
     let count_lbl = format!("  {total_matches} / {}", rs.total_entries);
-    scene.overlay_text_run(x0 + pad_x + 7.0 * m.cw, h_ty, &count_lbl, theme::INK_4, false, false, 0);
-    let hints = "esc exit  ·  tab edit  ·  enter run  ·  ctrl+r scope";
-    let hints_w = hints.chars().count() as f32 * m.cw;
-    if x1 - pad_x - hints_w > x0 + pad_x + 20.0 * m.cw {
-        scene.overlay_text_run(x1 - pad_x - hints_w, h_ty, hints, theme::INK_4, false, false, 0);
+    let title_w = m.measure("History", TextFace::Ui) + 4.0;
+    scene.overlay_ui_small(x0 + pad_x + title_w, h_ty, &count_lbl, theme::INK_4, false, false, 0);
+    let hints = "esc exit  ·  tab edit  ·  enter run  ·  ctrl+r scope  ·  scroll";
+    let hints_w = m.measure(hints, TextFace::UiSmall);
+    if x1 - pad_x - hints_w > x0 + pad_x + title_w + 90.0 {
+        scene.overlay_ui_small(x1 - pad_x - hints_w, h_ty, hints, theme::INK_4, false, false, 0);
     }
     scene.overlay_line(x0 + 1.0, y0 + header_h, x1 - 1.0, y0 + header_h, 1.0, theme::LINE, 0);
 
     // 2. Results list (bottom-up: best/newest match sits directly above the search input!).
     let list_top = y0 + header_h + 4.0;
     let list_bottom = y1 - input_h - preview_h - 4.0;
+    if total_matches > max_rows {
+        // Bottom-up scroll: `win_start = 0` sits at the bottom, larger `win_start` moves thumb upward.
+        let thumb_pos = max_scroll.saturating_sub(win_start);
+        draw_overlay_scrollbar(scene, x1 - 7.5, list_top + 2.0, list_bottom - 2.0, thumb_pos, max_scroll, max_rows, total_matches);
+    }
     if rs.results.is_empty() {
         let mid_y = (list_top + list_bottom - m.ch) * 0.5;
         scene.overlay_text_run(x0 + pad_x, mid_y, "no matching commands", theme::INK_4, false, true, 0);
@@ -4462,7 +4562,7 @@ fn layout_active_popover(
                 ry += line_h;
             }
             if *truncated {
-                scene.overlay_text_run(x0 + pad_x + gutter_w, ry + 1.0, "… more lines", theme::INK_4, false, true, 0);
+                scene.overlay_ui_small(x0 + pad_x + gutter_w, ry + 1.0, "… more lines", theme::INK_4, false, true, 0);
             }
         }
         HoverKind::DirPreview { name, icon, meta, entries, total_items, hidden_count, .. } => {
@@ -4472,18 +4572,19 @@ fn layout_active_popover(
                 scene.overlay_svg_icon(hx, hy + (m.ch - icon_s) * 0.5, icon_s, ic, 0);
                 hx += icon_s + 7.0;
             }
-            let mw = meta.chars().count() as f32 * m.cw;
-            let max_name = ((x1 - pad_x - mw - 12.0 - hx) / m.cw).floor().max(8.0) as usize;
-            scene.overlay_text_run(hx, hy, truncate_chars(name, max_name), theme::INK_1, true, false, 0);
+            let mw = m.measure(meta, TextFace::UiSmall);
+            let avg_ui = m.measure("n", TextFace::Ui).max(4.5);
+            let max_name = ((x1 - pad_x - mw - 12.0 - hx) / avg_ui).floor().max(8.0) as usize;
+            scene.overlay_ui_text(hx, hy, truncate_chars(name, max_name), theme::INK_1, true, false, 0);
             if !meta.is_empty() {
-                scene.overlay_text_run(x1 - pad_x - mw, hy, meta, theme::INK_4, false, false, 0);
+                scene.overlay_ui_small(x1 - pad_x - mw, hy, meta, theme::INK_4, false, false, 0);
             }
             scene.overlay_line(x0 + 1.0, y0 + hdr_h, x1 - 1.0, y0 + hdr_h, 1.0, theme::LINE_FAINT, 0);
 
             let dir_row_h = m.ch + 5.0;
             let mut ry = y0 + hdr_h + 6.0;
             if entries.is_empty() {
-                scene.overlay_text_run(
+                scene.overlay_ui_small(
                     x0 + pad_x,
                     ry + (dir_row_h - m.ch) * 0.5,
                     "empty directory",
@@ -4497,8 +4598,8 @@ fn layout_active_popover(
                 let inner_w = pop_w - pad_x * 2.0;
                 let has_size = entries.iter().take(16).any(|e| !e.size_label.is_empty());
                 let size_w = if has_size { 9.0 * m.cw } else { 0.0 };
-                let show_kind = inner_w >= 280.0 && entries.iter().take(16).any(|e| !e.kind_label.is_empty());
-                let kind_w = if show_kind { 13.0 * m.cw } else { 0.0 };
+                let show_kind = inner_w >= 270.0 && entries.iter().take(16).any(|e| !e.kind_label.is_empty());
+                let kind_w = if show_kind { 11.5 * m.cw } else { 0.0 };
                 let name_x = x0 + pad_x + icon_s + 8.0;
                 let name_max_c = ((x1 - pad_x - size_w - kind_w - 8.0 - name_x) / m.cw)
                     .floor()
@@ -4524,10 +4625,10 @@ fn layout_active_popover(
                     scene.overlay_text_run(name_x, ty, truncate_chars(&lbl, name_max_c), col, false, false, 0);
                     if show_kind && !ent.kind_label.is_empty() {
                         let kx = x1 - pad_x - size_w - kind_w;
-                        scene.overlay_text_run(
+                        scene.overlay_ui_small(
                             kx,
                             ty,
-                            truncate_chars(ent.kind_label, 12),
+                            truncate_chars(ent.kind_label, 14),
                             theme::INK_4,
                             false,
                             false,
@@ -4557,10 +4658,147 @@ fn layout_active_popover(
                     (0, h_n) => format!("{h_n} hidden"),
                     (m_n, h_n) => format!("… {m_n} more · {h_n} hidden"),
                 };
-                scene.overlay_text_run(x0 + pad_x + icon_s + 8.0, ry + 2.0, foot, theme::INK_4, false, true, 0);
+                scene.overlay_ui_small(x0 + pad_x + icon_s + 8.0, ry + 2.0, foot, theme::INK_4, false, true, 0);
             }
         }
     }
+}
+
+/// Monochrome dark-glass `Cmd+Shift+P` Command Palette rendered in Apple SF Pro with
+/// right-aligned monospace shortcut keycaps, fuzzy matching, & trackpad scrolling.
+pub fn layout_command_palette(
+    scene: &mut Scene,
+    palette: &CommandPalette,
+    vw: f32,
+    vh: f32,
+    m: CellMetrics,
+) {
+    let total = palette.matches.len();
+    let show = total.min(PALETTE_VISIBLE_ROWS).max(1);
+    let max_scroll = total.saturating_sub(PALETTE_VISIBLE_ROWS);
+    let win_start = palette.scroll.min(max_scroll);
+    let has_sb = total > PALETTE_VISIBLE_ROWS;
+    let sb_pad = if has_sb { 10.0 } else { 0.0 };
+
+    let pad_x = 14.0;
+    let input_h = m.ch + 20.0;
+    let row_h = m.ch + 10.0;
+    let footer_h = m.ch + 12.0;
+    let list_h = show as f32 * row_h + 8.0;
+    let modal_w = (vw - 48.0).clamp(320.0, 580.0).min((vw - 24.0).max(240.0));
+    let modal_h = (input_h + list_h + footer_h).min(vh - TOP_BAR_H - 28.0);
+    let x0 = ((vw - modal_w) * 0.5).max(12.0);
+    let x1 = x0 + modal_w;
+    let y0 = (TOP_BAR_H + ((vh - TOP_BAR_H - modal_h) * 0.24)).max(TOP_BAR_H + 14.0);
+    let y1 = y0 + modal_h;
+
+    scene.overlay_round_rect(0.0, TOP_BAR_H, vw, vh, 0.0, theme::rgba(0x00, 0x00, 0x00, 0.42), 0.0, [0.0; 4], 0);
+    scene.overlay_shadow(x0, y0 + 6.0, x1, y1 + 6.0, 10.0, 26.0, theme::SHADOW_SOFT, 0);
+    scene.overlay_round_rect(x0, y0, x1, y1, 10.0, theme::rgb(0x14, 0x14, 0x17), 1.0, theme::rgb(0x2d, 0x2d, 0x33), 0);
+
+    // 1. Search input bar (`>` + SF Pro query or placeholder).
+    let in_ty = y0 + (input_h - m.ch) * 0.5;
+    scene.overlay_text_run(x0 + pad_x, in_ty, "›", theme::INK_2, true, false, 0);
+    let qx = x0 + pad_x + 16.0;
+    if palette.query.is_empty() {
+        scene.overlay_ui_text(qx, in_ty, "Type a command…", theme::INK_4, false, false, 0);
+    } else {
+        scene.overlay_ui_text(qx, in_ty, &palette.query, theme::INK_1, false, false, 0);
+    }
+    let count_s = format!("{total}");
+    let cw = m.measure(&count_s, TextFace::UiSmall);
+    scene.overlay_ui_small(x1 - pad_x - cw, in_ty, &count_s, theme::INK_4, false, false, 0);
+    scene.overlay_line(x0 + 1.0, y0 + input_h, x1 - 1.0, y0 + input_h, 1.0, theme::LINE, 0);
+
+    // 2. Scrollable command list.
+    let list_y0 = y0 + input_h + 4.0;
+    let mut ry = list_y0;
+    if palette.matches.is_empty() {
+        scene.overlay_ui_small(x0 + pad_x, ry + 6.0, "No matching commands", theme::INK_4, false, true, 0);
+    } else {
+        for offset in 0..show {
+            let idx = win_start + offset;
+            let (cmd, _) = &palette.matches[idx];
+            let is_sel = idx == palette.selected;
+            let ty = ry + (row_h - m.ch) * 0.5;
+
+            if is_sel {
+                scene.overlay_round_rect(
+                    x0 + 6.0,
+                    ry,
+                    x1 - 6.0 - sb_pad,
+                    ry + row_h,
+                    6.0,
+                    theme::rgb(0x21, 0x21, 0x26),
+                    0.0,
+                    [0.0; 4],
+                    0,
+                );
+                scene.overlay_round_rect(
+                    x0 + 6.0,
+                    ry + 5.0,
+                    x0 + 8.0,
+                    ry + row_h - 5.0,
+                    1.0,
+                    theme::INK_1,
+                    0.0,
+                    [0.0; 4],
+                    0,
+                );
+            }
+
+            // Right-aligned monospace shortcut keycap pill (`⌘D`, `⌘⇧↵`, `⌘T`).
+            let sc_w = cmd.shortcut.chars().count() as f32 * m.cw + 12.0;
+            let sc_x1 = x1 - pad_x - sb_pad;
+            let sc_x0 = sc_x1 - sc_w;
+            scene.overlay_round_rect(
+                sc_x0,
+                ry + 4.0,
+                sc_x1,
+                ry + row_h - 4.0,
+                4.5,
+                theme::rgb(0x1b, 0x1b, 0x1f),
+                1.0,
+                theme::LINE,
+                0,
+            );
+            scene.overlay_text_run(sc_x0 + 6.0, ty, cmd.shortcut, theme::INK_2, false, false, 0);
+
+            // Category prefix + SF Pro command title.
+            let cat_w = m.measure(cmd.category, TextFace::UiSmall) + 12.0;
+            scene.overlay_ui_small(x0 + pad_x + 4.0, ty, cmd.category, theme::INK_4, false, false, 0);
+            let title_x = x0 + pad_x + 4.0 + cat_w.max(66.0);
+            let avg_ui = m.measure("n", TextFace::Ui).max(4.5);
+            let max_c = ((sc_x0 - 10.0 - title_x) / avg_ui).floor().max(8.0) as usize;
+            scene.overlay_ui_text(
+                title_x,
+                ty,
+                truncate_chars(cmd.title, max_c),
+                if is_sel { theme::INK_1 } else { theme::INK_2 },
+                is_sel,
+                false,
+                0,
+            );
+
+            scene.push_hit(
+                HitRect::new(x0 + 6.0, ry, x1 - 6.0 - sb_pad, ry + row_h),
+                HitAction::SelectPalette(idx),
+            );
+            ry += row_h;
+        }
+        if has_sb {
+            draw_overlay_scrollbar(scene, x1 - 8.0, list_y0 + 2.0, ry - 2.0, win_start, max_scroll, PALETTE_VISIBLE_ROWS, total);
+        }
+    }
+
+    // 3. Footer bar.
+    let fy0 = y1 - footer_h;
+    scene.overlay_line(x0 + 1.0, fy0, x1 - 1.0, fy0, 1.0, theme::LINE_FAINT, 0);
+    let fty = fy0 + (footer_h - m.ch) * 0.5;
+    scene.overlay_ui_small(x0 + pad_x, fty, "Command Palette", theme::INK_3, false, false, 0);
+    let fh = "↑↓ navigate  ·  scroll  ·  enter run  ·  esc close";
+    let fhw = m.measure(fh, TextFace::UiSmall);
+    scene.overlay_ui_small(x1 - pad_x - fhw, fty, fh, theme::INK_4, false, false, 0);
 }
 
 fn parent_breadcrumbs(cwd: &str) -> Vec<(String, String)> {

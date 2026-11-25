@@ -128,9 +128,162 @@ pub struct ReverseSearch {
     pub cwd: String,
     pub results: Vec<HistoryMatch>,
     pub selected: usize,
+    pub scroll: usize,
     pub total_entries: usize,
     /// Convenience mirror of `results.get(selected).map(|m| m.entry.command.clone())`.
     pub matched_text: Option<String>,
+}
+
+/// Semantic action executed from the `Cmd+Shift+P` Command Palette.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaletteAction {
+    NewTab,
+    NewWindow,
+    SplitVertical,
+    SplitHorizontal,
+    ToggleZoom,
+    EqualizeSplits,
+    ClosePane,
+    ForkBranch,
+    OpenYazi,
+    OpenAgentHub,
+    OpenHistory,
+    ClearScreen,
+    ZoomIn,
+    ZoomOut,
+    ResetZoom,
+}
+
+/// One row inside the searchable `Cmd+Shift+P` Command Palette.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PaletteCommand {
+    pub title: &'static str,
+    pub category: &'static str,
+    pub shortcut: &'static str,
+    pub action: PaletteAction,
+}
+
+/// Stateful monochrome glass Command Palette (`Cmd+Shift+P`) with fuzzy search & smooth scrolling.
+#[derive(Clone, Debug)]
+pub struct CommandPalette {
+    pub query: String,
+    pub matches: Vec<(PaletteCommand, Vec<usize>)>,
+    pub selected: usize,
+    pub scroll: usize,
+}
+
+const PALETTE_CATALOG: &[PaletteCommand] = &[
+    PaletteCommand { title: "Split Pane Vertically (Right)", category: "Tiling", shortcut: "⌘D", action: PaletteAction::SplitVertical },
+    PaletteCommand { title: "Split Pane Horizontally (Down)", category: "Tiling", shortcut: "⌘⇧D", action: PaletteAction::SplitHorizontal },
+    PaletteCommand { title: "Toggle Zoom Focused Pane", category: "Tiling", shortcut: "⌘⇧↵", action: PaletteAction::ToggleZoom },
+    PaletteCommand { title: "Equalize Split Ratios", category: "Tiling", shortcut: "⌘⌃=", action: PaletteAction::EqualizeSplits },
+    PaletteCommand { title: "Close Focused Pane / Tab", category: "Tiling", shortcut: "⌘W", action: PaletteAction::ClosePane },
+    PaletteCommand { title: "New Workspace Tab", category: "Workspace", shortcut: "⌘T", action: PaletteAction::NewTab },
+    PaletteCommand { title: "New Window (Inherit Directory)", category: "Window", shortcut: "⌘N", action: PaletteAction::NewWindow },
+    PaletteCommand { title: "Fork Session Branch (O(1) CoW)", category: "Session", shortcut: "⌘B", action: PaletteAction::ForkBranch },
+    PaletteCommand { title: "Open File Browser (y)", category: "Tools", shortcut: "y", action: PaletteAction::OpenYazi },
+    PaletteCommand { title: "Open Agent Fleet Hub", category: "Tools", shortcut: "agent", action: PaletteAction::OpenAgentHub },
+    PaletteCommand { title: "Search Command History", category: "History", shortcut: "⌃R", action: PaletteAction::OpenHistory },
+    PaletteCommand { title: "Clear Screen", category: "View", shortcut: "⌘K", action: PaletteAction::ClearScreen },
+    PaletteCommand { title: "Zoom Font In", category: "View", shortcut: "⌘=", action: PaletteAction::ZoomIn },
+    PaletteCommand { title: "Zoom Font Out", category: "View", shortcut: "⌘-", action: PaletteAction::ZoomOut },
+    PaletteCommand { title: "Reset Font Zoom (100%)", category: "View", shortcut: "⌘0", action: PaletteAction::ResetZoom },
+];
+
+pub const PALETTE_VISIBLE_ROWS: usize = 10;
+pub const COMPLETION_VISIBLE_ROWS: usize = 9;
+pub const HISTORY_VISIBLE_ROWS: usize = 12;
+
+impl CommandPalette {
+    pub fn open() -> Self {
+        let mut p = Self {
+            query: String::new(),
+            matches: Vec::new(),
+            selected: 0,
+            scroll: 0,
+        };
+        p.refresh();
+        p
+    }
+
+    pub fn push_char(&mut self, ch: char) {
+        self.query.push(ch);
+        self.selected = 0;
+        self.scroll = 0;
+        self.refresh();
+    }
+
+    pub fn backspace(&mut self) {
+        self.query.pop();
+        self.selected = 0;
+        self.scroll = 0;
+        self.refresh();
+    }
+
+    pub fn move_up(&mut self) {
+        if self.matches.is_empty() {
+            return;
+        }
+        if self.selected == 0 {
+            self.selected = self.matches.len() - 1;
+        } else {
+            self.selected -= 1;
+        }
+        self.keep_selected_visible();
+    }
+
+    pub fn move_down(&mut self) {
+        if self.matches.is_empty() {
+            return;
+        }
+        self.selected = (self.selected + 1) % self.matches.len();
+        self.keep_selected_visible();
+    }
+
+    pub fn scroll_by(&mut self, delta_rows: isize) -> bool {
+        let max_s = self.matches.len().saturating_sub(PALETTE_VISIBLE_ROWS);
+        let next = if delta_rows > 0 {
+            self.scroll.saturating_add(delta_rows as usize).min(max_s)
+        } else {
+            self.scroll.saturating_sub(delta_rows.unsigned_abs())
+        };
+        let changed = next != self.scroll;
+        self.scroll = next;
+        changed
+    }
+
+    pub fn selected_action(&self) -> Option<PaletteAction> {
+        self.matches.get(self.selected).map(|(c, _)| c.action)
+    }
+
+    pub fn action_at(&self, idx: usize) -> Option<PaletteAction> {
+        self.matches.get(idx).map(|(c, _)| c.action)
+    }
+
+    fn keep_selected_visible(&mut self) {
+        if self.selected < self.scroll {
+            self.scroll = self.selected;
+        } else if self.selected >= self.scroll + PALETTE_VISIBLE_ROWS {
+            self.scroll = self.selected + 1 - PALETTE_VISIBLE_ROWS;
+        }
+    }
+
+    fn refresh(&mut self) {
+        let mut scored: Vec<(i32, PaletteCommand, Vec<usize>)> = Vec::new();
+        for cmd in PALETTE_CATALOG {
+            if let Some((sc, idxs)) = fuzzy_match_score(cmd.title, &self.query) {
+                scored.push((sc + 20, cmd.clone(), idxs));
+            } else if let Some((sc, _)) = fuzzy_match_score(cmd.category, &self.query) {
+                scored.push((sc, cmd.clone(), Vec::new()));
+            }
+        }
+        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        self.matches = scored.into_iter().map(|(_, c, i)| (c, i)).collect();
+        if self.selected >= self.matches.len() {
+            self.selected = 0;
+        }
+        self.scroll = self.scroll.min(self.matches.len().saturating_sub(PALETTE_VISIBLE_ROWS));
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -160,6 +313,7 @@ pub struct Editor {
     /// Active IntelliJ-style completion popup candidates.
     pub completions: Vec<CompletionItem>,
     pub completion_selected: usize,
+    pub completion_scroll: usize,
     completion_replace_start: usize,
     /// Fish/Nushell-style dimmed inline ghost suffix shown directly after the cursor.
     pub ghost: Option<String>,
@@ -287,6 +441,7 @@ impl Editor {
             reverse_search: None,
             completions: Vec::new(),
             completion_selected: 0,
+            completion_scroll: 0,
             completion_replace_start: 0,
             ghost: None,
             vim: VimMachine::new(
@@ -914,6 +1069,7 @@ impl Editor {
             } else {
                 self.completion_selected -= 1;
             }
+            self.sync_completion_scroll();
             return;
         }
         self.clamp_cursor();
@@ -936,6 +1092,7 @@ impl Editor {
         self.last_edit_op = EditOp::Other;
         if !self.completions.is_empty() {
             self.completion_selected = (self.completion_selected + 1) % self.completions.len();
+            self.sync_completion_scroll();
             return;
         }
         self.clamp_cursor();
@@ -1277,6 +1434,7 @@ impl Editor {
             cwd: cwd.to_owned(),
             results: Vec::new(),
             selected: 0,
+            scroll: 0,
             total_entries: self.history_entries.len(),
             matched_text: None,
         };
@@ -1288,6 +1446,7 @@ impl Editor {
         if let Some(rs) = &mut self.reverse_search {
             rs.scope = rs.scope.next();
             rs.selected = 0;
+            rs.scroll = 0;
             update_reverse_search(rs, &self.history_entries);
         }
     }
@@ -1296,6 +1455,7 @@ impl Editor {
         if let Some(rs) = &mut self.reverse_search {
             rs.query.push(ch);
             rs.selected = 0;
+            rs.scroll = 0;
             update_reverse_search(rs, &self.history_entries);
         }
     }
@@ -1304,6 +1464,7 @@ impl Editor {
         if let Some(rs) = &mut self.reverse_search {
             rs.query.pop();
             rs.selected = 0;
+            rs.scroll = 0;
             update_reverse_search(rs, &self.history_entries);
         }
     }
@@ -1316,6 +1477,11 @@ impl Editor {
                 rs.selected += 1;
             } else {
                 rs.selected = 0;
+            }
+            if rs.selected < rs.scroll {
+                rs.scroll = rs.selected;
+            } else if rs.selected >= rs.scroll + HISTORY_VISIBLE_ROWS {
+                rs.scroll = rs.selected + 1 - HISTORY_VISIBLE_ROWS;
             }
             rs.matched_text = rs.results.get(rs.selected).map(|m| m.entry.command.clone());
         }
@@ -1330,8 +1496,29 @@ impl Editor {
             } else {
                 rs.selected -= 1;
             }
+            if rs.selected < rs.scroll {
+                rs.scroll = rs.selected;
+            } else if rs.selected >= rs.scroll + HISTORY_VISIBLE_ROWS {
+                rs.scroll = rs.selected + 1 - HISTORY_VISIBLE_ROWS;
+            }
             rs.matched_text = rs.results.get(rs.selected).map(|m| m.entry.command.clone());
         }
+    }
+
+    /// Scroll the `Ctrl+R` history list directly via trackpad/mouse wheel (`delta_rows > 0` scrolls older).
+    pub fn reverse_search_scroll_by(&mut self, delta_rows: isize) -> bool {
+        let Some(rs) = &mut self.reverse_search else {
+            return false;
+        };
+        let max_s = rs.results.len().saturating_sub(HISTORY_VISIBLE_ROWS);
+        let next = if delta_rows > 0 {
+            rs.scroll.saturating_add(delta_rows as usize).min(max_s)
+        } else {
+            rs.scroll.saturating_sub(delta_rows.unsigned_abs())
+        };
+        let changed = next != rs.scroll;
+        rs.scroll = next;
+        changed
     }
 
     pub fn reverse_search_next(&mut self) {
@@ -1368,6 +1555,31 @@ impl Editor {
     pub fn dismiss_completions(&mut self) {
         self.completions.clear();
         self.completion_selected = 0;
+        self.completion_scroll = 0;
+    }
+
+    fn sync_completion_scroll(&mut self) {
+        if self.completion_selected < self.completion_scroll {
+            self.completion_scroll = self.completion_selected;
+        } else if self.completion_selected >= self.completion_scroll + COMPLETION_VISIBLE_ROWS {
+            self.completion_scroll = self.completion_selected + 1 - COMPLETION_VISIBLE_ROWS;
+        }
+    }
+
+    /// Scroll the open autocomplete popup directly via trackpad/mouse wheel!
+    pub fn completion_scroll_by(&mut self, delta_rows: isize) -> bool {
+        if self.completions.is_empty() {
+            return false;
+        }
+        let max_s = self.completions.len().saturating_sub(COMPLETION_VISIBLE_ROWS);
+        let next = if delta_rows > 0 {
+            self.completion_scroll.saturating_add(delta_rows as usize).min(max_s)
+        } else {
+            self.completion_scroll.saturating_sub(delta_rows.unsigned_abs())
+        };
+        let changed = next != self.completion_scroll;
+        self.completion_scroll = next;
+        changed
     }
 
     fn ensure_path_bins(&mut self) {
@@ -1488,6 +1700,7 @@ impl Editor {
             self.completion_replace_start = token_start;
             self.completions = items;
             self.completion_selected = 0;
+            self.completion_scroll = 0;
         }
     }
 
@@ -1507,6 +1720,7 @@ impl Editor {
                 self.apply_selected_completion();
             } else {
                 self.completion_selected = (self.completion_selected + 1) % self.completions.len();
+                self.sync_completion_scroll();
             }
             return;
         }
@@ -1522,6 +1736,7 @@ impl Editor {
         self.completion_replace_start = token_start;
         self.completions = items;
         self.completion_selected = 0;
+        self.completion_scroll = 0;
 
         if self.completions.len() == 1 {
             self.apply_selected_completion();
@@ -1973,7 +2188,7 @@ impl Editor {
         for (_, item) in scored {
             if seen_labels.insert(item.label.clone()) {
                 items.push(item);
-                if items.len() >= 36 {
+                if items.len() >= 64 {
                     break;
                 }
             }

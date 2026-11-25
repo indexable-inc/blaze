@@ -351,9 +351,8 @@ fn layout_agent_hub_inner(
         }
         let ty1 = ry + 5.0;
         let ty2 = ty1 + m.ch + 2.0;
-        let icon = if ag.is_remote { Icon::Server } else { Icon::Laptop };
-        let icon_col = if is_sel { theme::INK_1 } else { theme::INK_3 };
-        draw_icon(&mut scene, icon, 18.0, ty1 + (m.ch - 11.5) * 0.5, 11.5, icon_col, left_clip);
+        let svg = if ag.is_remote { "server_rack" } else { "macbook_pro" };
+        scene.svg_icon_alpha(17.0, ty1 + (m.ch - 13.5) * 0.5, 13.5, svg, if is_sel { 1.0 } else { 0.72 }, left_clip);
 
         // Status indicator dot.
         let dot_col = match ag.status {

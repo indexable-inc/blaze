@@ -23,7 +23,8 @@ use crate::prompt::PromptInfo;
 use crate::svg_icons::icon_name_for_file;
 use crate::theme;
 use crate::view::{
-    CellMetrics, DirPreviewEntry, HoverKind, PreviewLine, PreviewSpan, Scene, truncate_chars,
+    CellMetrics, DirPreviewEntry, HoverKind, PreviewLine, PreviewSpan, Scene, TextFace,
+    truncate_chars,
 };
 
 const MAX_PREVIEW_BYTES: usize = 256 * 1024;
@@ -891,7 +892,7 @@ fn layout_yazi_inner(
         }
         YaziPreview::Directory { meta, items } => {
             let hdr_h = m.ch + 10.0;
-            scene.text(px, body_top + 8.0, meta.as_str(), theme::INK_4, false, false, clip3);
+            scene.ui_small(px, body_top + 8.0, meta.as_str(), theme::INK_4, false, false, clip3);
             scene.line(px, body_top + hdr_h + 2.0, col3_x1 - 14.0, body_top + hdr_h + 2.0, 1.0, theme::LINE_FAINT, clip3);
             let list_top = body_top + hdr_h + 6.0;
             let dir_vis_rows = ((body_bot - list_top - 6.0) / row_h).floor().max(1.0) as usize;
@@ -900,11 +901,11 @@ fn layout_yazi_inner(
             let sc = yazi.preview_scroll.min(max_s);
             yazi.preview_scroll = sc;
             if items.is_empty() {
-                scene.text(px, list_top + 8.0, "empty directory", theme::INK_4, false, true, clip3);
+                scene.ui_small(px, list_top + 8.0, "empty directory", theme::INK_4, false, true, clip3);
             } else {
                 let sz_col_w = 9.0 * m.cw;
                 let show_kind = pw >= 290.0;
-                let kind_col_w = if show_kind { 14.0 * m.cw } else { 0.0 };
+                let kind_col_w = if show_kind { 13.0 * m.cw } else { 0.0 };
                 for (i, sub) in items.iter().skip(sc).take(dir_vis_rows).enumerate() {
                     let ry = list_top + i as f32 * row_h;
                     let ty = ry + (row_h - m.ch) * 0.5;
@@ -924,7 +925,7 @@ fn layout_yazi_inner(
                     scene.text(px + 20.0, ty, truncate_chars(&lbl, max_c), name_col, false, false, clip3);
                     if show_kind && !kind_lbl.is_empty() {
                         let kx = col3_x1 - 18.0 - sz_col_w - kind_col_w;
-                        scene.text(kx, ty, truncate_chars(kind_lbl, 13), theme::INK_4, false, false, clip3);
+                        scene.ui_small(kx, ty, truncate_chars(kind_lbl, 14), theme::INK_4, false, false, clip3);
                     }
                     if !sub.is_dir {
                         let sz = format_size_bytes(sub.size as i64);
@@ -978,11 +979,11 @@ fn layout_yazi_inner(
     } else {
         format!("y · {}/{}{kind_badge}", yazi.selected + 1, vis.len())
     };
-    scene.text(14.0, fty, pos_lbl, theme::INK_2, true, false, 0);
+    scene.ui_small(14.0, fty, pos_lbl, theme::INK_2, true, false, 0);
     let hint = "hjkl move  ·  J/K scroll  ·  / filter  ·  . hidden  ·  space insert  ·  q exit";
-    let hw = hint.chars().count() as f32 * m.cw;
+    let hw = m.measure(hint, TextFace::UiSmall);
     if vw - 14.0 - hw > 220.0 {
-        scene.text(vw - 14.0 - hw, fty, hint, theme::INK_4, false, false, 0);
+        scene.ui_small(vw - 14.0 - hw, fty, hint, theme::INK_4, false, false, 0);
     }
 
     if draw_top_bar {
@@ -1241,7 +1242,6 @@ fn render_preview_markdown(
     m: CellMetrics,
     clip: u32,
 ) -> f32 {
-    let max_cols = (w / m.cw).floor().max(16.0) as usize;
     for blk in blocks {
         if y + m.ch > max_y {
             break;
@@ -1257,39 +1257,40 @@ fn render_preview_markdown(
             }
             MdBlock::Heading { level, spans } => {
                 if y > 60.0 {
-                    y += 4.0;
+                    y += 5.0;
                 }
                 let col = if *level <= 2 { [1.0, 1.0, 1.0, 1.0] } else { theme::INK_1 };
-                render_md_spans(scene, spans.as_slice(), x0, y, max_cols, col, true, m, clip);
-                y += m.ch + 4.0;
+                let face = if *level <= 2 { TextFace::Heading } else { TextFace::Ui };
+                render_md_spans(scene, spans.as_slice(), x0, y, w, col, true, face, m, clip);
+                y += m.line_h(face) + 4.0;
                 if *level <= 2 {
                     scene.line(x0, y - 1.0, x0 + w, y - 1.0, 1.0, theme::LINE_FAINT, clip);
-                    y += 4.0;
+                    y += 5.0;
                 }
             }
             MdBlock::Paragraph { spans } => {
-                render_md_spans(scene, spans.as_slice(), x0, y, max_cols, theme::INK_2, false, m, clip);
+                render_md_spans(scene, spans.as_slice(), x0, y, w, theme::INK_2, false, TextFace::Ui, m, clip);
                 y += m.ch + 4.0;
             }
             MdBlock::Bullet { indent, marker, spans } => {
-                let ix = x0 + (*indent as f32) * 2.0 * m.cw;
-                scene.text(ix, y, marker.as_str(), theme::INK_3, true, false, clip);
-                let bx = ix + (marker.chars().count() as f32 + 1.0) * m.cw;
-                let avail = max_cols.saturating_sub((*indent as usize) * 2 + marker.chars().count() + 1);
-                render_md_spans(scene, spans.as_slice(), bx, y, avail.max(8), theme::INK_2, false, m, clip);
+                let ix = x0 + (*indent as f32) * 14.0;
+                scene.ui_text(ix, y, marker.as_str(), theme::INK_3, true, false, clip);
+                let bx = ix + m.measure(marker.as_str(), TextFace::Ui) + 7.0;
+                let avail_w = (x0 + w - bx).max(60.0);
+                render_md_spans(scene, spans.as_slice(), bx, y, avail_w, theme::INK_2, false, TextFace::Ui, m, clip);
                 y += m.ch + 4.0;
             }
             MdBlock::Quote { spans } => {
                 scene.over_round_rect(x0, y + 1.0, x0 + 2.0, y + m.ch - 1.0, 1.0, theme::LINE_STRONG, clip);
-                render_md_spans(scene, spans.as_slice(), x0 + 12.0, y, max_cols.saturating_sub(2), theme::INK_3, false, m, clip);
+                render_md_spans(scene, spans.as_slice(), x0 + 12.0, y, (w - 14.0).max(60.0), theme::INK_3, false, TextFace::Ui, m, clip);
                 y += m.ch + 4.0;
             }
             MdBlock::CodeFence { lang, lines } => {
                 let box_h = (lines.len().max(1) as f32 * (m.ch + 2.0) + 12.0).min((max_y - y).max(20.0));
                 scene.round_rect(x0, y, x0 + w, y + box_h, 6.0, theme::rgb(0x15, 0x15, 0x18), 1.0, theme::LINE_FAINT, clip);
                 if !lang.is_empty() {
-                    let lw = lang.chars().count() as f32 * m.cw;
-                    scene.text(x0 + w - 10.0 - lw, y + 5.0, lang.as_str(), theme::INK_4, false, false, clip);
+                    let lw = m.measure(lang.as_str(), TextFace::UiSmall);
+                    scene.ui_small(x0 + w - 10.0 - lw, y + 5.0, lang.as_str(), theme::INK_4, false, false, clip);
                 }
                 render_code_lines(scene, lines.as_slice(), x0 + 10.0, y + 6.0, w - 20.0, y + box_h - 4.0, m, clip, false);
                 y += box_h + 6.0;
@@ -1297,7 +1298,7 @@ fn render_preview_markdown(
         }
     }
     if truncated && y + m.ch <= max_y {
-        scene.text(x0, y + 2.0, "… more content", theme::INK_4, false, true, clip);
+        scene.ui_small(x0, y + 2.0, "… more content", theme::INK_4, false, true, clip);
         y += m.ch + 4.0;
     }
     y
@@ -1309,41 +1310,45 @@ fn render_md_spans(
     spans: &[blaze_preview::MdSpan<'_>],
     x0: f32,
     y: f32,
-    max_cols: usize,
+    max_w: f32,
     base_col: [f32; 4],
     force_bold: bool,
+    prose_face: TextFace,
     m: CellMetrics,
     clip: u32,
 ) {
     let mut cx = x0;
-    let mut rem = max_cols;
+    let x_end = x0 + max_w;
     for sp in spans {
-        if rem == 0 {
+        let rem_w = x_end - cx;
+        if rem_w < m.cw * 2.0 {
             break;
         }
-        let txt = truncate_chars(sp.text.as_str(), rem);
-        let len = txt.chars().count();
-        let sw = len as f32 * m.cw;
+        let face = if matches!(sp.style, MdStyle::Code) { TextFace::Mono } else { prose_face };
+        let avg_cw = m.measure("n", face).max(4.0);
+        let max_c = (rem_w / avg_cw).floor().max(2.0) as usize;
+        let txt = truncate_chars(sp.text.as_str(), max_c);
+        let sw = m.measure(&txt, face);
         match sp.style {
             MdStyle::Plain => {
-                scene.text(cx, y, &txt, base_col, force_bold, false, clip);
+                scene.text_with_face(cx, y, &txt, base_col, force_bold, false, face, clip);
             }
             MdStyle::Bold => {
-                scene.text(cx, y, &txt, theme::INK_1, true, false, clip);
+                scene.text_with_face(cx, y, &txt, theme::INK_1, true, false, face, clip);
             }
             MdStyle::Italic => {
-                scene.text(cx, y, &txt, theme::INK_2, force_bold, true, clip);
+                scene.text_with_face(cx, y, &txt, theme::INK_2, force_bold, true, face, clip);
             }
             MdStyle::Code => {
-                scene.round_rect(cx - 2.0, y, cx + sw + 2.0, y + m.ch, 3.5, theme::rgb(0x1f, 0x1f, 0x24), 0.0, [0.0; 4], clip);
+                scene.round_rect(cx - 2.5, y, cx + sw + 2.5, y + m.ch, 3.5, theme::rgb(0x1f, 0x1f, 0x24), 0.0, [0.0; 4], clip);
                 scene.text(cx, y, &txt, theme::rgb(0x7c, 0xc9, 0x8b), false, false, clip);
+                cx += 3.0;
             }
             MdStyle::Link => {
-                scene.text(cx, y, &txt, theme::rgb(0x9a, 0xc2, 0xe8), force_bold, false, clip);
+                scene.text_with_face(cx, y, &txt, theme::rgb(0x9a, 0xc2, 0xe8), force_bold, false, face, clip);
             }
         }
         cx += sw;
-        rem = rem.saturating_sub(len);
     }
 }
 
