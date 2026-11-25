@@ -1,0 +1,70 @@
+name: aarch64 Blaze test smoke
+on:
+  push:
+    branches: [agent/blaze-aarch64-smoke]
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-22.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - name: pinned Rust
+        run: |
+          rustup toolchain install "$(cat pins/toolchain)" --profile minimal --no-self-update
+          rustup default "$(cat pins/toolchain)"
+      - name: build Blaze and toolchain cutter
+        run: |
+          cargo build --release --locked -p scripts --bin toolchain_cut
+          cargo build --release --locked -p blaze-cli --bin blaze
+      - name: cut toolchain and create fixture
+        run: |
+          cargo fetch --locked --quiet
+          reg="$(ls -d "$HOME"/.cargo/registry/cache/index.crates.io-* | head -n 1)"
+          mkdir -p .home/.blaze/v2
+          target/release/toolchain_cut "{\"tree\": \".\", \"targets\": [\"aarch64-apple-darwin\", \"aarch64-unknown-linux-gnu\", \"x86_64-unknown-linux-gnu\"], \"registry\": \"$reg\", \"shelf\": \"$GITHUB_WORKSPACE/.home/.blaze/v2/toolchain\", \"write_pin\": false, \"check\": false, \"macro_side\": true}"
+          python3 - <<'PY'
+          from pathlib import Path
+          root = Path("fixture")
+          (root / "src").mkdir(parents=True)
+          (root / "Cargo.toml").write_text('[package]\nname="aarch64_fixture"\nversion="0.1.0"\nedition="2021"\n')
+          f = [f'pub fn f{i}(x: i32) -> i32 {{ x * {i+1} + {i} }}' for i in range(1, 21)]
+          t = [f'    #[test]\n    fn f{i}_works() {{ assert_eq!(super::f{i}(2), 2 * {i+1} + {i}); }}' for i in range(1, 21)]
+          (root / "src/lib.rs").write_text("\n\n".join(f) + '\n\n#[cfg(test)]\nmod tests {\n' + "\n\n".join(t) + '\n}\n')
+          PY
+      - name: cargo baseline and Blaze cold/warm/selected tests
+        env:
+          HOME: ${{ github.workspace }}/.home
+          BLAZE: ${{ github.workspace }}/target/release/blaze
+        run: |
+          set -euo pipefail
+          uname -m | tee arch.txt
+          test "$(uname -m)" = aarch64
+          cd fixture
+          cargo test --offline | tee ../cargo-test.txt
+          "$BLAZE" check . --view json --each | tee ../blaze-check.json
+          "$BLAZE" test . | tee ../blaze-test-cold.txt
+          "$BLAZE" test . | tee ../blaze-test-warm.txt
+          grep -q '20 cached' ../blaze-test-warm.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("src/lib.rs")
+          s = p.read_text().replace("x * 2 + 1", "x * 3 + 1", 1)
+          s = s.replace("2 * 2 + 1", "2 * 3 + 1", 1)
+          p.write_text(s)
+          PY
+          "$BLAZE" test . | tee ../blaze-test-selected.txt
+          grep -q '19 cached' ../blaze-test-selected.txt
+          printf '\n// Name-free edit.\n' >> src/lib.rs
+          "$BLAZE" test . | tee ../blaze-test-comment.txt
+          grep -q '20 cached' ../blaze-test-comment.txt
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: aarch64-blaze-smoke
+          path: |
+            arch.txt
+            cargo-test.txt
+            blaze-check.json
+            blaze-test-*.txt
+          if-no-files-found: warn
