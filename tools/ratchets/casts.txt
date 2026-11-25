@@ -39,7 +39,7 @@ blaze-code	139
 blaze-columns	2
 blaze-comptime-sys	150
 blaze-cond	13
-blaze-consteval	357
+blaze-consteval	356
 blaze-core	754
 blaze-cunit	62
 blaze-data	1
