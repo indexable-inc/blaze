@@ -28,10 +28,10 @@ use core::alloc::Allocator;
 use blaze_typeck::{PNode, PTys};
 
 use crate::body::{
-    BadRow, Block, BlockKind, BlockRow, Body, BodyRef, BorrowKind, Callee, CalleeId, Const, ConstDecl,
-    ConstKind, Edge, List, Local, LocalDecl, LocalKind, Loan, LoanRow, Mutbl, NONE, Operand, Ops,
-    Origin, PTy, Place, PlaceRow, Proj, Span, Stmt, StmtKind, StmtRow, Subset, Table, TyError,
-    TyListRef, Unwind, Value,
+    AsmArch, AsmOpKind, AsmOpRow, AsmPiece, AsmRegKind, AsmRow, BadRow, Block, BlockKind, BlockRow,
+    Body, BodyRef, BorrowKind, Callee, CalleeId, Const, ConstDecl, ConstKind, Edge, List, Local,
+    LocalDecl, LocalKind, Loan, LoanRow, Mutbl, NONE, Operand, Ops, Origin, PTy, Place, PlaceRow,
+    Proj, Span, Stmt, StmtKind, StmtRow, Subset, Table, TyError, TyListRef, Unwind, Value,
 };
 use crate::code::ty_children;
 
@@ -293,6 +293,47 @@ impl<'b> Verified<'b> {
         self.body.ty_list(record, l)
     }
 
+    /// How many inline assembly blocks.
+    pub fn asms(&self) -> u32 {
+        self.body.asms()
+    }
+
+    /// Descriptor of inline assembly block `i`.
+    pub fn asm(&self, i: u32) -> AsmRow {
+        self.body.asm(i).unwrap_or(AsmRow {
+            pieces: Ops::default(),
+            ops: Ops::default(),
+            clobbers_start: 0,
+            clobbers_len: 0,
+            options: 0,
+            arch: AsmArch::Aarch64,
+        })
+    }
+
+    /// Template piece `i`.
+    pub fn asm_piece(&self, i: u32) -> AsmPiece {
+        self.body.asm_piece(i).unwrap_or(AsmPiece::Line)
+    }
+
+    /// Operand descriptor `i`.
+    pub fn asm_op(&self, i: u32) -> AsmOpRow {
+        self.body.asm_op(i).unwrap_or(AsmOpRow {
+            kind: AsmOpKind::In,
+            reg_kind: AsmRegKind::None,
+            reg_start: 0,
+            reg_len: 0,
+            in_op: None,
+            out_place: None,
+            label: None,
+            discard_out: false,
+        })
+    }
+
+    /// UTF-8 slice for an `asm!` text/register/clobber field.
+    pub fn asm_str(&self, start: u32, len: u32) -> &'b str {
+        self.body.asm_str(start, len).unwrap_or("")
+    }
+
     /// Calls `f` on each block edge out of terminator `kind`, with how it is taken.
     pub fn for_each_edge(&self, kind: &StmtKind, f: impl FnMut(Block, Edge)) {
         let _ = self.body.for_each_edge(kind, f);
@@ -528,14 +569,31 @@ pub fn check_refs(body: &BodyRef<'_>, at: Stmt, kind: &StmtKind) -> Result<(), V
             r.block(resume)?;
             r.block(cancel)
         }
-        StmtKind::InlineAsm { operands, target, unwind, .. } => {
+        StmtKind::InlineAsm { asm, operands, target, unwind } => {
             r.ops(operands)?;
+            if body.asms() > 0 {
+                r.within(Table::Asms, asm, body.asms())?;
+                if let Ok(row) = body.asm(asm) {
+                    let n_ops = operands.len();
+                    for i in row.ops.start..row.ops.end {
+                        if let Ok(op) = body.asm_op(i)
+                            && let Some(idx) = op.in_op
+                        {
+                            r.within(Table::Operands, idx, n_ops)?;
+                        }
+                    }
+                }
+            }
             if let Some(t) = target {
                 r.block(t)?;
             }
             r.unwind(unwind)
         }
-        StmtKind::Return | StmtKind::Unreachable | StmtKind::Resume | StmtKind::Terminate => Ok(()),
+        StmtKind::TailCall { callee, args } => {
+            r.within(Table::Callees, callee.0, body.callees())?;
+            r.ops(args)
+        }
+        StmtKind::Return | StmtKind::Cancelled | StmtKind::Unreachable | StmtKind::Resume | StmtKind::Terminate => Ok(()),
     }
 }
 
@@ -620,6 +678,29 @@ fn tables(b: &BodyRef<'_>) -> Result<(), VerifyError> {
         let r = Refs { b, site: at(Table::Known, len(i)) };
         r.origin(from)?;
         r.origin(into)?;
+    }
+    for i in 0..b.asms() {
+        let row = b.asm(i)?;
+        let r = Refs { b, site: at(Table::Asms, i) };
+        r.range(Table::AsmPieces, row.pieces, b.asm_pieces.len())?;
+        r.range(Table::AsmOps, row.ops, b.asm_ops.len())?;
+        b.asm_str(row.clobbers_start, row.clobbers_len)?;
+        for pi in row.pieces.start..row.pieces.end {
+            if let AsmPiece::Text { start, len } = b.asm_piece(pi)? {
+                b.asm_str(start, len)?;
+            }
+        }
+        for oi in row.ops.start..row.ops.end {
+            let op = b.asm_op(oi)?;
+            b.asm_str(op.reg_start, op.reg_len)?;
+            let or = Refs { b, site: at(Table::AsmOps, oi) };
+            if let Some(p) = op.out_place {
+                or.place(p)?;
+            }
+            if let Some(lbl) = op.label {
+                or.block(lbl)?;
+            }
+        }
     }
     overlay(b)
 }

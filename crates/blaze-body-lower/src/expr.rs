@@ -21,13 +21,16 @@
 use core::alloc::Allocator;
 
 use blaze_body::{
-    AggregateKind, AssertKind, BinOp as BBin, BlockKind, BorrowKind, Callee, CastKind, ConstDecl, ConstKind, Local,
-    LocalDecl, LocalKind, Operand, Place, Proj, Role, Span, StmtKind, UnOp as BUn, Unwind, Value,
+    AggregateKind, AsmArch as BodyAsmArch, AsmOpInput, AsmOpKind, AsmPieceInput, AsmRegKind,
+    AssertKind, BinOp as BBin, Block, BlockKind, BorrowKind, Callee, CastKind, ConstDecl,
+    ConstKind, Local, LocalDecl, LocalKind, Operand, Place, Proj, Role, Span, StmtKind,
+    UnOp as BUn, Unwind, Value,
 };
 use blaze_own::Vec;
 use blaze_typeck::{
-    AdjustKind, Arm, BinOp, Def, Expr, ExprId, FieldInit, FieldPat, IntTy, ItemKey, Lit, List, Mutbl, PNode, PTy, PatId,
-    Stmt, StmtId, UintTy, UnOp,
+    AdjustKind, Arm, AsmArch as TcAsmArch, AsmKind as TcAsmKind, AsmPiece as TcAsmPiece,
+    AsmReg as TcAsmReg, BinOp, Def, Expr, ExprId, FieldInit, FieldPat, IntTy, ItemKey, List, Lit,
+    Mutbl, PNode, PTy, PatId, Stmt, StmtId, UintTy, UnOp,
 };
 
 use crate::scope::Pending;
@@ -112,7 +115,8 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
 
     /// A new temporary of `ty` made for `e`, its storage begun and scheduled for drop.
     pub(crate) fn temp_local(&mut self, e: ExprId, ty: PTy, role: Role) -> Result<(Local, Place), LowerError> {
-        let local = self.b.new_local(LocalDecl { ty, kind: LocalKind::Temp(e, role), mutbl: Mutbl::Mut });
+        let cty = self.canonical_ty(ty, At::Expr(e))?;
+        let local = self.b.new_local(LocalDecl { ty: cty, kind: LocalKind::Temp(e, role), mutbl: Mutbl::Mut });
         let place = self.b.local_place(local);
         let drops = self.needs_drop(ty, At::Expr(e))?;
         let span = self.span(e);
@@ -127,7 +131,8 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
     /// A temporary read at once by the row after it (a condition, a length, a checked pair, a
     /// discriminant): no storage rows, not scheduled; its type never needs drop.
     pub(crate) fn scratch(&mut self, e: ExprId, ty: PTy) -> Place {
-        let local = self.b.new_local(LocalDecl { ty, kind: LocalKind::Temp(e, Role::Value), mutbl: Mutbl::Mut });
+        let cty = self.canonical_ty(ty, At::Expr(e)).unwrap_or(ty);
+        let local = self.b.new_local(LocalDecl { ty: cty, kind: LocalKind::Temp(e, Role::Value), mutbl: Mutbl::Mut });
         self.b.local_place(local)
     }
 
@@ -800,6 +805,9 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
                 let args = self.ck.const_args_of(e).unwrap_or(EMPTY);
                 Ok(Some(Operand::Const(self.b.new_const(ConstDecl { kind: ConstKind::Item { key, args }, ty }))))
             }
+            Some(Def::TyParam(idx)) => {
+                Ok(Some(Operand::Const(self.b.new_const(ConstDecl { kind: ConstKind::Param(idx), ty }))))
+            }
             Some(Def::Static(..)) | Some(Def::Ctor { .. }) | Some(Def::Fn(_)) => Ok(None),
             _ => match self.callee_of(e) {
                 Some((key, args)) => {
@@ -836,7 +844,7 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
             Expr::Break { value, target } => self.break_(e, value, target),
             Expr::Continue { target } => self.continue_(e, target),
             Expr::Return { value } => self.return_(e, value),
-            Expr::Become { value } => self.return_(e, Some(value)),
+            Expr::Become { value } => self.become_(e, value),
             Expr::Let { .. } => self.refuse(Construct::LetChain, e),
             Expr::Call { callee, args } => self.call_into(dest, e, callee, args),
             Expr::MethodCall { receiver, args, .. } => self.method_into(dest, e, receiver, args),
@@ -866,10 +874,12 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
             Expr::Record { fields, base } => self.record_into(dest, e, fields, base),
             Expr::Closure { .. } => self.closure_into(dest, e),
             Expr::FormatArgs { .. } => self.refuse(Construct::FormatArgs, e),
-            Expr::Await(_) => self.refuse(Construct::Await, e),
-            Expr::AsyncBlock { .. } => self.refuse(Construct::AsyncBlock, e),
+            Expr::Await(operand) => self.await_into(dest, e, operand),
+            Expr::AsyncBlock { .. } => self.coroutine_into(dest, e),
             Expr::OffsetOf { .. } => self.refuse(Construct::OffsetOf, e),
-            Expr::Asm { .. } => self.refuse(Construct::InlineAsm, e),
+            Expr::Asm { arch, pieces, operands, options, clobber_abis } => {
+                self.asm_into(dest, e, arch, pieces, operands, options, clobber_abis)
+            }
             Expr::Underscore => self.refuse(Construct::Underscore, e),
             _ => self.refuse(Construct::Malformed, e),
         }
@@ -878,7 +888,8 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
     // Calls.
 
     /// The callee of a fn item: a trait's method is resolved per instance.
-    fn item_callee(&self, key: ItemKey, args: List, e: ExprId) -> Result<Callee, LowerError> {
+    pub(crate) fn item_callee(&mut self, key: ItemKey, args: List, e: ExprId) -> Result<Callee, LowerError> {
+        let args = self.canonical_list(args, At::Expr(e))?;
         match self.facts.trait_item(key) {
             Some(true) => Ok(Callee::Method { key, args }),
             Some(false) => Ok(Callee::FnItem { key, args }),
@@ -1718,6 +1729,326 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
         }
         let operands = self.b.operands(&ops);
         self.b.assign(dest, Value::Aggregate { kind: AggregateKind::Tuple, ty, operands }, span);
+        Ok(())
+    }
+
+    /// Evaluates expression `x` into a fresh temporary local (scheduled above `arg_mark`) and
+    /// returns an operand reading or moving it, so dropping earlier locals cannot invalidate it.
+    fn materialize_tail_operand(&mut self, x: ExprId) -> Result<Operand, LowerError> {
+        let ty = self.adjusted_ty(x)?;
+        let tmp = self.temp(x, ty, Role::Value)?;
+        self.lower_into(tmp, x)?;
+        Ok(if self.is_copy(ty, At::Expr(x))? { Operand::Copy(tmp) } else { Operand::Move(tmp) })
+    }
+
+    /// `become value` (RFC 3407 explicit tail call): for direct fn, concrete method, and
+    /// non-`"rust-call"` fn-pointer calls with no return adjustments, materializes callee/args
+    /// into fresh temps, drops all local scopes `0..arg_mark`, and terminates with
+    /// `StmtKind::TailCall`; otherwise falls back cleanly to `self.return_(e, Some(value))`.
+    fn become_(&mut self, e: ExprId, value: ExprId) -> Result<(), LowerError> {
+        let mut call_e = value;
+        for _ in 0..16 {
+            if let Expr::Paren(inner) = self.expr(call_e)? {
+                call_e = inner;
+            } else {
+                break;
+            }
+        }
+        let (vs, ve) = self.adjust_rows(value);
+        let (cs, ce) = self.adjust_rows(call_e);
+        if vs != ve || cs != ce {
+            return self.return_(e, Some(value));
+        }
+        let span = self.span(e);
+        match self.expr(call_e)? {
+            Expr::Call { callee, args } => {
+                if matches!(self.expr_def(callee), Some(Def::Ctor { .. })) {
+                    return self.return_(e, Some(value));
+                }
+                let ids = self.exprs_in(args, call_e)?;
+                let cty = self.adjusted_ty(callee)?;
+                let act = self.activate.len();
+                match self.node(cty, At::Expr(callee))? {
+                    PNode::FnDef(k, l) => {
+                        let arg_mark = self.sched.len();
+                        if !matches!(self.expr(callee)?, Expr::Path(_)) {
+                            let _ = self.operand(callee)?;
+                        }
+                        let c = self.item_callee(k, l, call_e)?;
+                        let mut ops: Vec<Operand, A> = Vec::with_capacity_in(ids.len(), self.alloc);
+                        for &a in ids {
+                            ops.push(self.materialize_tail_operand(a)?);
+                        }
+                        self.finish_tail_call(c, &ops, arg_mark, act, span)
+                    }
+                    PNode::FnPtr(_, header) if header.abi != blaze_typeck::Abi::RustCall => {
+                        let arg_mark = self.sched.len();
+                        let callee_op = self.materialize_tail_operand(callee)?;
+                        let mut ops: Vec<Operand, A> = Vec::with_capacity_in(ids.len(), self.alloc);
+                        for &a in ids {
+                            ops.push(self.materialize_tail_operand(a)?);
+                        }
+                        self.finish_tail_call(Callee::Value(callee_op), &ops, arg_mark, act, span)
+                    }
+                    _ => self.return_(e, Some(value)),
+                }
+            }
+            Expr::MethodCall { receiver, args, .. } => {
+                let Some((k, l)) = self.callee_of(call_e) else {
+                    return self.return_(e, Some(value));
+                };
+                let c = self.item_callee(k, l, call_e)?;
+                let act = self.activate.len();
+                let ids = self.exprs_in(args, call_e)?;
+                let arg_mark = self.sched.len();
+                let mut ops: Vec<Operand, A> = Vec::with_capacity_in(ids.len() + 1, self.alloc);
+                ops.push(self.materialize_tail_operand(receiver)?);
+                for &a in ids {
+                    ops.push(self.materialize_tail_operand(a)?);
+                }
+                self.finish_tail_call(c, &ops, arg_mark, act, span)
+            }
+            _ => self.return_(e, Some(value)),
+        }
+    }
+
+    fn finish_tail_call(
+        &mut self,
+        c: Callee,
+        ops: &[Operand],
+        arg_mark: usize,
+        act: usize,
+        span: Span,
+    ) -> Result<(), LowerError> {
+        let mut i = act;
+        while let Some(&loan) = self.activate.get(i) {
+            self.b.push(StmtKind::Activate(loan), span);
+            i += 1;
+        }
+        self.activate.truncate(act);
+        self.emit_exit_below(arg_mark, span)?;
+        let callee = self.b.callee(c);
+        let args = self.b.operands(ops);
+        self.b.terminate(StmtKind::TailCall { callee, args }, span);
+        self.dead_block();
+        Ok(())
+    }
+
+    /// Lowers `Expr::Asm` into `StmtKind::InlineAsm` with its self-contained `AsmRow` metadata
+    /// table entry in `blaze-body`.
+    fn asm_into(
+        &mut self,
+        dest: Place,
+        e: ExprId,
+        arch: TcAsmArch,
+        pieces: List,
+        operands: List,
+        options: u16,
+        clobber_abis: List,
+    ) -> Result<(), LowerError> {
+        const ASM_NORETURN: u16 = 1 << 4;
+        let span = self.span(e);
+        let body = self.body;
+        let Some(ops) = body.asm_operands.get(operands.range()) else {
+            return self.refuse(Construct::Malformed, e);
+        };
+        let Some(tpl) = body.asm_pieces.get(pieces.range()) else {
+            return self.refuse(Construct::Malformed, e);
+        };
+        let Some(abis) = body.asm_clobbers.get(clobber_abis.range()) else {
+            return self.refuse(Construct::Malformed, e);
+        };
+        let make_malformed = || LowerError { construct: Construct::Malformed, at: At::Expr(e), range: crate::range_of(body, e) };
+        let asm_str = |first: u32, len: u32| -> Result<&'v str, LowerError> {
+            let s = usize::try_from(first).map_err(|_| make_malformed())?;
+            let l = usize::try_from(len).map_err(|_| make_malformed())?;
+            let end = s.checked_add(l).ok_or_else(make_malformed)?;
+            body.asm_text.get(s..end).ok_or_else(make_malformed)
+        };
+
+        let mut in_ops: Vec<Operand, A> = Vec::new_in(self.alloc);
+        let mut asm_ops: Vec<AsmOpInput<'v>, A> = Vec::with_capacity_in(ops.len(), self.alloc);
+        let mut labels: Vec<(Block, ExprId), A> = Vec::new_in(self.alloc);
+        for op in ops {
+            let (reg_kind, reg) = match op.reg {
+                Some(TcAsmReg::Class { first, len }) => (AsmRegKind::Class, asm_str(first, len)?),
+                Some(TcAsmReg::Explicit { first, len }) => (AsmRegKind::Explicit, asm_str(first, len)?),
+                None => (AsmRegKind::None, ""),
+            };
+            let desc = match op.kind {
+                TcAsmKind::In => {
+                    let idx = u32::try_from(in_ops.len()).map_err(|_| make_malformed())?;
+                    let v = self.operand(op.expr)?;
+                    in_ops.push(v);
+                    AsmOpInput {
+                        kind: AsmOpKind::In,
+                        reg_kind,
+                        reg,
+                        in_op: Some(idx),
+                        out_place: None,
+                        label: None,
+                        discard_out: false,
+                    }
+                }
+                TcAsmKind::Out | TcAsmKind::LateOut => {
+                    let kind = if op.kind == TcAsmKind::Out { AsmOpKind::Out } else { AsmOpKind::LateOut };
+                    if matches!(self.expr(op.expr)?, Expr::Underscore) {
+                        AsmOpInput { kind, reg_kind, reg, in_op: None, out_place: None, label: None, discard_out: true }
+                    } else {
+                        let p = self.place(op.expr)?;
+                        AsmOpInput { kind, reg_kind, reg, in_op: None, out_place: Some(p), label: None, discard_out: false }
+                    }
+                }
+                TcAsmKind::InOut | TcAsmKind::InLateOut => {
+                    let kind = if op.kind == TcAsmKind::InOut { AsmOpKind::InOut } else { AsmOpKind::InLateOut };
+                    match op.out_expr {
+                        None => {
+                            let p = self.place(op.expr)?;
+                            AsmOpInput { kind, reg_kind, reg, in_op: None, out_place: Some(p), label: None, discard_out: false }
+                        }
+                        Some(out) => {
+                            let idx = u32::try_from(in_ops.len()).map_err(|_| make_malformed())?;
+                            let v = self.operand(op.expr)?;
+                            in_ops.push(v);
+                            if matches!(self.expr(out)?, Expr::Underscore) {
+                                AsmOpInput { kind, reg_kind, reg, in_op: Some(idx), out_place: None, label: None, discard_out: true }
+                            } else {
+                                let p = self.place(out)?;
+                                AsmOpInput { kind, reg_kind, reg, in_op: Some(idx), out_place: Some(p), label: None, discard_out: false }
+                            }
+                        }
+                    }
+                }
+                TcAsmKind::Sym => {
+                    let idx = u32::try_from(in_ops.len()).map_err(|_| make_malformed())?;
+                    let sym_ty = self.expr_ty(op.expr)?;
+                    let c = if let PNode::FnDef(key, args) = self.node(sym_ty, At::Expr(op.expr))? {
+                        self.b.new_const(ConstDecl { kind: ConstKind::FnItem { key, args }, ty: sym_ty })
+                    } else if let Some(Def::Static(item, _)) = self.expr_def(op.expr) {
+                        self.b.new_const(ConstDecl { kind: ConstKind::StaticAddr(item), ty: sym_ty })
+                    } else {
+                        return self.refuse(Construct::Malformed, op.expr);
+                    };
+                    in_ops.push(Operand::Const(c));
+                    AsmOpInput {
+                        kind: AsmOpKind::Sym,
+                        reg_kind: AsmRegKind::None,
+                        reg: "",
+                        in_op: Some(idx),
+                        out_place: None,
+                        label: None,
+                        discard_out: false,
+                    }
+                }
+                TcAsmKind::Const => {
+                    let idx = u32::try_from(in_ops.len()).map_err(|_| make_malformed())?;
+                    let mut x = op.expr;
+                    for _ in 0..16 {
+                        if let Expr::Paren(inner) = self.expr(x)? {
+                            x = inner;
+                        } else {
+                            break;
+                        }
+                    }
+                    let c_op = if let Some(c) = self.const_operand(x)? {
+                        c
+                    } else if let Expr::Unary { op: UnOp::Neg, operand } = self.expr(x)?
+                        && let Expr::Lit(Lit::Int(_)) = self.expr(operand)?
+                    {
+                        let ty = self.expr_ty(x)?;
+                        let raw = match self.body.call_arg_ints.iter().find(|(id, _)| *id == operand) {
+                            Some(&(_, v)) => v,
+                            None => match self.facts.int_lit(operand) {
+                                Some(v) => v,
+                                None => return self.refuse(Construct::NoLiteralValue, operand),
+                            },
+                        };
+                        self.scalar(raw.wrapping_neg(), ty)
+                    } else {
+                        return self.refuse(Construct::InlineAsm, x);
+                    };
+                    in_ops.push(c_op);
+                    AsmOpInput {
+                        kind: AsmOpKind::Const,
+                        reg_kind: AsmRegKind::None,
+                        reg: "",
+                        in_op: Some(idx),
+                        out_place: None,
+                        label: None,
+                        discard_out: false,
+                    }
+                }
+                TcAsmKind::Label => {
+                    let lbl = self.b.new_block(BlockKind::Normal);
+                    labels.push((lbl, op.expr));
+                    AsmOpInput {
+                        kind: AsmOpKind::Label,
+                        reg_kind: AsmRegKind::None,
+                        reg: "",
+                        in_op: None,
+                        out_place: None,
+                        label: Some(lbl),
+                        discard_out: false,
+                    }
+                }
+            };
+            asm_ops.push(desc);
+        }
+
+        let mut pieces_in: Vec<AsmPieceInput<'v>, A> = Vec::with_capacity_in(tpl.len(), self.alloc);
+        for piece in tpl {
+            pieces_in.push(match *piece {
+                TcAsmPiece::Text { first, len } => AsmPieceInput::Text(asm_str(first, len)?),
+                TcAsmPiece::Line => AsmPieceInput::Line,
+                TcAsmPiece::Operand { index, modifier } => AsmPieceInput::Operand { index, modifier },
+            });
+        }
+        let mut clobbers_buf: Vec<u8, A> = Vec::new_in(self.alloc);
+        for (i, &(first, len)) in abis.iter().enumerate() {
+            if i > 0 {
+                clobbers_buf.push(b',');
+            }
+            clobbers_buf.extend_from_slice(asm_str(first, len)?.as_bytes());
+        }
+        let clobbers_str = core::str::from_utf8(&clobbers_buf).map_err(|_| make_malformed())?;
+        let body_arch = match arch {
+            TcAsmArch::Aarch64 => BodyAsmArch::Aarch64,
+            TcAsmArch::X86_64 => BodyAsmArch::X86_64,
+        };
+        let asm_id = self.b.new_asm(body_arch, options, clobbers_str, &pieces_in, &asm_ops);
+        let ops_range = self.b.operands(&in_ops);
+        let noreturn = (options & ASM_NORETURN) != 0;
+
+        if labels.is_empty() {
+            if noreturn {
+                self.b.terminate(StmtKind::InlineAsm { asm: asm_id, operands: ops_range, target: None, unwind: Unwind::Continue }, span);
+                self.dead_block();
+                return Ok(());
+            }
+            let next = self.b.new_block(BlockKind::Normal);
+            self.b.terminate(StmtKind::InlineAsm { asm: asm_id, operands: ops_range, target: Some(next), unwind: Unwind::Continue }, span);
+            self.b.start(next);
+            let ty = self.expr_ty(e)?;
+            return self.unit(dest, ty, At::Expr(e), span);
+        }
+
+        let join = self.b.new_block(BlockKind::Normal);
+        let target = if noreturn { None } else { Some(join) };
+        self.b.terminate(StmtKind::InlineAsm { asm: asm_id, operands: ops_range, target, unwind: Unwind::Continue }, span);
+        for &(lbl, lbl_expr) in labels.iter() {
+            self.b.start(lbl);
+            let _ = self.open();
+            let lty = self.expr_ty(lbl_expr)?;
+            let tmp = self.temp(lbl_expr, lty, Role::Value)?;
+            self.lower_into(tmp, lbl_expr)?;
+            self.close(span)?;
+            self.goto(join, span);
+        }
+        self.b.start(join);
+        let ty = self.expr_ty(e)?;
+        if !matches!(self.node(ty, At::Expr(e))?, PNode::Never) {
+            self.unit(dest, ty, At::Expr(e), span)?;
+        }
         Ok(())
     }
 }

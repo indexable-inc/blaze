@@ -234,6 +234,9 @@ pub mod host;
 // pays for at start"): a program that turns none on links none of their dependencies.
 #[cfg(feature = "image")]
 pub mod image;
+/// Fast Starship-class Git prompt and status driven over `bstd::fs` (sans-IO core in `blaze-git`).
+#[cfg(feature = "git")]
+pub mod git;
 /// The simulated host behind the capabilities blaze-core has no effect for, and how a call
 /// on one fails.
 pub mod hosted;

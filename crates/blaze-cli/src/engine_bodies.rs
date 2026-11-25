@@ -59,7 +59,7 @@ use blaze_ladder::front2::heads::Want;
 use blaze_ladder::front2::tables::head::{CellFailure, ConstValues, FreezeError, NotTheirs, SeededHeads, SeededHeadsOpts, cell_id as head_cell_id};
 use blaze_ladder::front2::tables::recorder::{PlacedCell, Recorder, RecorderOpts, TableRead};
 use blaze_ladder::front2::tables::seeds::{HeadSeed, RequestSeedOpts, SeedError};
-use blaze_ladder::front2::tables::task::{BodyFrame, ReadIds, ReadKeyer, Said as Line, SaidWhat, TaskError, WorkBytes, check_body_item};
+use blaze_ladder::front2::tables::task::{BodyFrame, ReadIds, ReadKeyer, Said as Line, SaidWhat, StretchStore, StretchStoreOpts, TaskError, WorkBytes, check_body_item};
 use blaze_ladder::front2::tables::view::{Tables, TablesOpts};
 use blaze_own::{SharedAlloc, Vec};
 use blaze_scope::crate_env::EnvLent;
@@ -286,7 +286,7 @@ use crate::engine_member_rows::MOST_UNCOVERED_NAMED;
 
 /// The lines block of the note of bodies a macro wrote that no entry covers: no task's (its
 /// domain is no task name's), stable across requests.
-const UNCOVERED_NOTE: &[u8] = b"{bodies a macro wrote that no entry covers}";
+pub(crate) const UNCOVERED_NOTE: &[u8] = b"{bodies a macro wrote that no entry covers}";
 
 /// The label of the root's `fn main` that D104's launcher replaced (body_types/covered.rs
 /// `Root::label`): its findings are at the entry's start, said so (`WRITTEN_UNPLACED`).
@@ -343,16 +343,16 @@ pub(crate) fn plan_views<'h, P: ViewPlan>(outlined: &[Outlined<'_>], skipped: &[
                     Some(cfg) => crate::engine_body_plan::source_with_cfg(source, cfg),
                     None => source,
                 };
-                // A body two units or more hold: its units are in each row's key (rule 21).
-                let source = match views.len() {
-                    0 | 1 => source,
-                    _ => crate::engine_body_plan::source_at_views(source, &views),
-                };
+                // Each row's key covers ONLY its own unit's view (rule 21: distinguishes two units
+                // taking the base slot under different scopes) without folding sibling units, so
+                // narrowing from whole-workspace to scoped checks preserves every standing unit's
+                // body key; standing findings refresh their `VIEW` header from today's reach.
                 if !reached {
                     planned.push(Planned { name: part.name, phase: Phase::new(Stage::Bodies, 0), source, file: one.name });
                 }
-                for at in 0..views.len() {
-                    planned.push(Planned { name: at_view(part.name, P::view_of(&views, at)), phase: Phase::new(Stage::Bodies, 0), source, file: one.name });
+                for (at, &view) in views.iter().enumerate() {
+                    let row_source = crate::engine_body_plan::source_at_views(source, &[view]);
+                    planned.push(Planned { name: at_view(part.name, P::view_of(&views, at)), phase: Phase::new(Stage::Bodies, 0), source: row_source, file: one.name });
                 }
             }
         }
@@ -705,13 +705,22 @@ const BODY_SCRATCH: usize = 1 << 30;
 /// bodies without pinning 576 MiB across 18 workers.
 const SCRATCH_KEEP: usize = 8 << 20;
 
+/// Virtual address-space reservation for a stretch's reusable heads store (`StretchStore`).
+/// Reserved once per stretch and committed only as frozen heads are imported; rolled over past
+/// [`HEADS_STRETCH_CAP`] and trimmed back to [`HEADS_STRETCH_KEEP`].
+const HEADS_STRETCH_FRAME: usize = 512 << 20;
+const HEADS_STRETCH_CAP: usize = 64 << 20;
+const HEADS_STRETCH_KEEP: usize = 8 << 20;
+
 /// What the runs' frames held committed (rule 16): the scratch's most at a body's end, the
-/// stretch frame's most at a stretch's end, and how many times a scratch was trimmed back to
-/// [`SCRATCH_KEEP`]. The floor a worker: one body's scratch and one stretch's records, together.
+/// stretch frame's most at a stretch's end, the stretch heads frame's most, and how many times a
+/// scratch was trimmed back to [`SCRATCH_KEEP`]. The floor a worker: one body's scratch and one
+/// stretch's records, together.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct FramesHeld {
     scratch_committed_most: u64,
     stretch_committed_most: u64,
+    heads_committed_most: u64,
     scratch_trims: u64,
 }
 
@@ -719,6 +728,7 @@ impl FramesHeld {
     fn fold(&mut self, other: FramesHeld) {
         self.scratch_committed_most = self.scratch_committed_most.max(other.scratch_committed_most);
         self.stretch_committed_most = self.stretch_committed_most.max(other.stretch_committed_most);
+        self.heads_committed_most = self.heads_committed_most.max(other.heads_committed_most);
         self.scratch_trims = self.scratch_trims.saturating_add(other.scratch_trims);
     }
 }
@@ -1603,7 +1613,7 @@ struct Group<'f, 'r> {
     /// Scheduled body items in this member group for this phase: groups with fewer than 2 bodies
     /// leave `goals` uninitialized so 1-body incremental edits pay zero table overhead.
     bodies: u32,
-    /// Group-scoped shared trait goal table allocated lazily in `shared.heap.shared()` when
+    /// Group-scoped shared trait goals table allocated lazily in `shared.heap.shared()` when
     /// `bodies >= 2` and dropped when `Bodies` ends (rule 70): never shared across member groups.
     goals: bstd::sync::Once<blaze_ladder::front2::tables::goals::GoalTable<SharedAlloc<'static>>>,
 }
@@ -4157,31 +4167,25 @@ impl<'f> BodiesStage<'f> {
                 let dispatch_slice = dispatch.as_slice();
                 let cursor_ref = &cursor;
                 let clock = prepared.clock;
-                if worker_count == 1 {
-                    if let Some(worker_out) = worker_outs.first_mut() {
-                        run_worker_stealing(&cx, &shared, runs_slice, dispatch_slice, cursor_ref, clock, worker_out, alloc, at_phase);
+                let scope = cx.scope();
+                scope.narrow_workers(handles.workers, Class::Foreground);
+                let mut running = Vec::with_capacity_in(worker_count, heap.alloc());
+                for worker_out in worker_outs.iter_mut() {
+                    let shared = &shared;
+                    running.push(scope.may_overlap("engine bodies worker", BODIES_FRAME, move |cx: &Cx| {
+                        run_worker_stealing(cx, shared, runs_slice, dispatch_slice, cursor_ref, clock, worker_out, alloc, at_phase);
+                        Ok::<(), Infallible>(())
+                    }));
+                }
+                let mut failed = None;
+                for handle in running.into_iter() {
+                    if let Err(error) = handle.join(&cx) {
+                        failed.get_or_insert(error);
                     }
-                } else {
-                    let scope = cx.scope();
-                    scope.narrow_workers(handles.workers, Class::Foreground);
-                    let mut running = Vec::with_capacity_in(worker_count, heap.alloc());
-                    for worker_out in worker_outs.iter_mut() {
-                        let shared = &shared;
-                        running.push(scope.may_overlap("engine bodies worker", BODIES_FRAME, move |cx: &Cx| {
-                            run_worker_stealing(cx, shared, runs_slice, dispatch_slice, cursor_ref, clock, worker_out, alloc, at_phase);
-                            Ok::<(), Infallible>(())
-                        }));
-                    }
-                    let mut failed = None;
-                    for handle in running.into_iter() {
-                        if let Err(error) = handle.join(&cx) {
-                            failed.get_or_insert(error);
-                        }
-                    }
-                    scope.join(&cx).map_err(CliError::Pool)?;
-                    if let Some(error) = failed {
-                        return Err(CliError::Pool(error));
-                    }
+                }
+                scope.join(&cx).map_err(CliError::Pool)?;
+                if let Some(error) = failed {
+                    return Err(CliError::Pool(error));
                 }
             }
             // Stopped while the phase ran: account for any unpulled items in the queue and return
@@ -5543,6 +5547,63 @@ impl<'f> BodiesStage<'f> {
         Ok(())
     }
 
+    /// Computes today's `VIEW` header for a standing `BodyCheck` row with findings so a standing
+    /// finding carried from a whole-workspace answer into a scoped check (or across a target
+    /// addition/removal) never keeps a stale `VIEW` unit list.
+    ///
+    /// Returns `Ok(None)` when `file` is not in `outlined` (e.g. an unread outline on the `Ready`
+    /// path, where no unit was added or removed so the stored `VIEW` header is already exact) or
+    /// when `self.reach` is absent; returns `Ok(Some(None))` when today's reach has `< 2` holders
+    /// (strip any stale `VIEW`); returns `Ok(Some(Some((base, at, units))))` when `>= 2` holders.
+    #[expect(clippy::type_complexity, reason = "optional refresh result for standing body VIEW header")]
+    pub(crate) fn standing_view<'s, 'r>(
+        &'s self,
+        name: Name,
+        outlined: &[Outlined<'_>],
+        file: Name,
+        frame: &'r Frame,
+    ) -> Result<Option<Option<(Name, u32, Vec<crate::engine_lines::ViewUnit<'s>, &'r Frame>)>>, EngineCheckError> {
+        let Some(reach) = self.reach.as_ref() else { return Ok(None) };
+        if reach.ranks(file).len() < 2 {
+            return Ok(Some(None));
+        }
+        let Ok(file_at) = outlined.binary_search_by(|one| one.name.cmp(&file)) else {
+            return Ok(None);
+        };
+        let Some(one) = outlined.get(file_at) else {
+            return Ok(None);
+        };
+        let Ok(record) = &one.made else {
+            return Ok(Some(None));
+        };
+        let erased = blaze_own::Erased::new(frame);
+        let cuts = crate::engine_plan_cfg::file_cuts(one, erased.handle());
+        let mut views: Vec<ViewKey, &'r Frame> = Vec::new_in(frame);
+        let mut ranks: Vec<u32, &'r Frame> = Vec::new_in(frame);
+        for part in record.parts.iter().filter(|part| matches!((part.name.kind, part.locate), (Kind::BodyCheck, Locate::Source(_)))) {
+            let cut = crate::engine_plan_cfg::part_cut(cuts.as_ref(), part);
+            ranks.clear();
+            ranks.extend(reach.body_ranks(file, cut));
+            reach.views_into(file, cut, &mut views);
+            for (i, _rank) in ranks.iter().enumerate() {
+                if at_view(part.name, Production::view_of(&views, i)) == name {
+                    if ranks.len() < 2 {
+                        return Ok(Some(None));
+                    }
+                    let mut units: Vec<crate::engine_lines::ViewUnit<'s>, &'r Frame> = Vec::with_capacity_in(ranks.len(), frame);
+                    for &r in ranks.iter() {
+                        units.push(reach.label(r).ok_or(EngineCheckError::Unplaced {
+                            body: name,
+                            what: "a unit that holds a row of the body has no label in the plan's reach (engine_body_plan.rs `Reach::label`)",
+                        })?);
+                    }
+                    return Ok(Some(Some((part.name, u32::try_from(i).unwrap_or(u32::MAX), units))));
+                }
+            }
+        }
+        Ok(Some(None))
+    }
+
     /// Body `name`'s item as written, when it ran.
     pub(crate) fn label(&self, name: Name) -> Option<&'f str> {
         self.ran.binary_search_by_key(&name, |one| one.name).ok().map(|at| self.ran[at].label).filter(|label| !label.is_empty())
@@ -5782,12 +5843,13 @@ impl<'f> BodiesStage<'f> {
         let frames = self.frames;
         let _ = writeln!(
             into,
-            "bodies: frames committed: a run's scratch at most {} bytes (floor {} used, {:.2}x; kept {SCRATCH_KEEP} between bodies, trimmed {} times); a stretch's frame at most {} bytes at its end (given back with it)",
+            "bodies: frames committed: a run's scratch at most {} bytes (floor {} used, {:.2}x; kept {SCRATCH_KEEP} between bodies, trimmed {} times); a stretch's frame at most {} bytes at its end (given back with it); a stretch's heads frame at most {} bytes",
             frames.scratch_committed_most,
             self.scratch_most,
             frames.scratch_committed_most as f64 / self.scratch_most.max(1) as f64,
             frames.scratch_trims,
-            frames.stretch_committed_most
+            frames.stretch_committed_most,
+            frames.heads_committed_most
         );
         // What the plan left to no unit (engine_body_plan.rs): entries, and files, counted; and
         // the rows entered by view (D191): a row is called checked only when its own check ran
@@ -6989,19 +7051,18 @@ fn run_stretch_with<'d, 'a, 'b, 'f, R: ?Sized + CellDigests>(
     // `ProjectWorld::over_prepared` allocates 0 bytes in `frame` per body and macros are prepared
     // once per stretch rather than leaked per body.
     let prepared: &blaze_scope::prepares::Prepares<'_> = blaze_scope::prepares::Prepares::new_in(fb);
-    // Per-group shared trait goal table (rule 70: dropped when `Bodies` ends; never shared across
-    // member groups; skipped when this group has < 2 scheduled bodies so 1-body edits pay 0).
+    // Per-group shared trait goals table (rule 70: dropped when `Bodies` ends; never shared
+    // across member groups; uses `ReplayMode::SameScope` so verified reads memoize per body;
+    // skipped when this group has < 2 scheduled bodies so 1-body edits pay 0).
     let goals_ref: Option<&dyn blaze_ladder::front2::tables::goals::GoalShare> = if group.bodies >= 2 {
         match group.goals.get_or_make(cx, |_| {
-            Ok::<_, core::convert::Infallible>(blaze_ladder::front2::tables::goals::GoalTable::new_in(
-                blaze_ladder::front2::tables::goals::GoalTableOpts {
-                    share: blaze_ladder::front2::tables::goals::ShareOpts::default(),
-                    most: blaze_ladder::front2::tables::goals::MOST_GOALS,
-                },
-                shared.heap.shared(),
-            ))
+            let opts = blaze_ladder::front2::tables::goals::GoalTableOpts {
+                share: blaze_ladder::front2::tables::goals::share_opts_same_scope(),
+                most: blaze_ladder::front2::tables::goals::MOST_GOALS,
+            };
+            Ok::<_, core::convert::Infallible>(blaze_ladder::front2::tables::goals::GoalTable::new_in(opts, shared.heap.shared()))
         }) {
-            Ok(table) => Some(table),
+            Ok(table) => Some(table as &dyn blaze_ladder::front2::tables::goals::GoalShare),
             Err(_) => None,
         }
     } else {
@@ -7021,6 +7082,26 @@ fn run_stretch_with<'d, 'a, 'b, 'f, R: ?Sized + CellDigests>(
         lang_ns: ns_between(set_heads, set_lang),
         owners_ns: ns_between(set_lang, set_done),
     });
+    let mut stretch_store = if body_frame.heads.is_some() {
+        match StretchStore::new(StretchStoreOpts {
+            reserve: HEADS_STRETCH_FRAME,
+            cap: HEADS_STRETCH_CAP,
+            keep: HEADS_STRETCH_KEEP,
+            alloc: g,
+        }) {
+            Ok(store) => Some(store),
+            Err(_) => {
+                return driver.refuse_current::<R>(
+                    "the heads frame of its run's stretch could not be reserved (engine_bodies.rs `HEADS_STRETCH_FRAME`)",
+                    scope,
+                    clock,
+                    alloc,
+                );
+            }
+        }
+    } else {
+        None
+    };
     let mut taken = 0usize;
     while let Some((one, out, ran, run_out)) = driver.next_body(taken, frame.used(), shared, clock, alloc, at_phase) {
         taken += 1;
@@ -7076,13 +7157,17 @@ fn run_stretch_with<'d, 'a, 'b, 'f, R: ?Sized + CellDigests>(
         let left_at = opened.sources.0.left.borrow().len();
         // A refused large allocation need not increase the peak, and an ordinary panic can
         // happen arbitrarily close to the limit. Read the typed refusal at its source.
-        let frame_limit = |what: &'static str| {
+        let frame_limit = |what: &'static str, heads: Option<&StretchStore<'_>>| {
             let scratch_full = sc.take_exhaustion();
+            let heads_full = heads.and_then(StretchStore::take_exhaustion);
             // A shared stretch has space left by its preceding bodies. No source cell
             // certifies that capacity. Only the body's private reservation starts empty.
             match frame.take_exhaustion() {
                 Some(used) => Some((used, frame.reserved(), what, Stands::OwedNextRequest)),
-                None => scratch_full.map(|used| (used, sc.reserved(), what, Stands::ByReads)),
+                None => match heads_full {
+                    Some((used, reserved)) => Some((used, reserved, what, Stands::OwedNextRequest)),
+                    None => scratch_full.map(|used| (used, sc.reserved(), what, Stands::ByReads)),
+                },
             }
         };
         let gather = || {
@@ -7136,7 +7221,7 @@ fn run_stretch_with<'d, 'a, 'b, 'f, R: ?Sized + CellDigests>(
                         ids: core::cell::RefCell::new(&mut ids),
                     };
                     let active = recording.as_mut().expect("the entry owns its recorder");
-                    let mut check = || check_body_item(tables, &asked, &body_frame, w, active, Some(&keyer), &mut encoding);
+                    let mut check = || check_body_item(tables, &asked, &body_frame, w, active, Some(&keyer), &mut encoding, stretch_store.as_mut());
                     #[cfg(test)]
                     let checked = if shared.plants.check_only_guard {
                         match work::unwinding(check) {
@@ -7332,7 +7417,7 @@ fn run_stretch_with<'d, 'a, 'b, 'f, R: ?Sized + CellDigests>(
                         if let Some(what) = recording.as_ref().and_then(Recorder::allocating) {
                             mem.allocating = what;
                         }
-                        if let Some(limit) = frame_limit(mem.allocating) {
+                        if let Some(limit) = frame_limit(mem.allocating, stretch_store.as_ref()) {
                             // A fallible write can return TaskError instead of unwinding.
                             return Err(limit);
                         }
@@ -7658,12 +7743,12 @@ fn run_stretch_with<'d, 'a, 'b, 'f, R: ?Sized + CellDigests>(
         body_tally.reads.covered = mem.asks.covered;
         body_tally.reads.by_kind = mem.asks.by_kind;
         let outcome = match outcome {
-            Ok(Ok(body)) => match frame_limit(mem.allocating) {
+            Ok(Ok(body)) => match frame_limit(mem.allocating, stretch_store.as_ref()) {
                 None => Ok(body),
                 limit => Err(limit),
             },
             Ok(Err(limit)) => Err(Some(limit)),
-            Err(work::Panicked) => Err(frame_limit(mem.allocating)),
+            Err(work::Panicked) => Err(frame_limit(mem.allocating, stretch_store.as_ref())),
         };
         let stopped = outcome.is_err();
         let result = match outcome {
@@ -7750,6 +7835,9 @@ fn run_stretch_with<'d, 'a, 'b, 'f, R: ?Sized + CellDigests>(
         mem.scratch = mem.scratch.max(sc.used() as u64);
         mem.count_done(&result.done);
         run_out.scratch_most = run_out.scratch_most.max(mem.scratch);
+        if let Some(ss) = stretch_store.as_ref() {
+            run_out.frames.heads_committed_most = run_out.frames.heads_committed_most.max(u64::try_from(ss.committed()).unwrap_or(u64::MAX));
+        }
         let ns = clock.now().since(began).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
         let bytes = frame.used().saturating_sub(at_start) as u64;
         ran.push(Ran { name, label: one.label, ns, bytes, chain: one.place.chain, note: None, found: FindingRange::default(), file: one.file, stretch });

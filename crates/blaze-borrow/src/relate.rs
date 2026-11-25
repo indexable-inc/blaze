@@ -850,10 +850,43 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                                 continue;
                             }
                             (self.bound, self.bound_len, self.hr, self.hr_len, self.binder_v) = saved;
+                        } else if bv == BinderCtx::Clause {
+                            // Inside `BinderCtx::Clause`, `a` comes from a caller's already-assumed
+                            // clause (or its supertrait elaboration), whose impl well-formedness is
+                            // guaranteed by the caller's environment. If its impl was not recorded
+                            // at this call site and `b` is completely region- and param-free (`inert`),
+                            // equating `a` with `b` cannot constrain any region.
+                            let saved = (self.bound, self.bound_len, self.hr, self.hr_len, self.binder_v);
+                            match self.normalize(a, na, d) {
+                                Ok(a_norm) => {
+                                    enter = Some((a_norm, b, v, bv, d + 1));
+                                    continue;
+                                }
+                                Err(Refused::Unselected { .. }) => {
+                                    (self.bound, self.bound_len, self.hr, self.hr_len, self.binder_v) = saved;
+                                    let mut bb = MOST_WALK_STEPS;
+                                    if self.inert(b, 0, &mut bb)? {
+                                        continue;
+                                    }
+                                    return self.normalize(a, na, d).map(|_| ());
+                                }
+                                Err(err) => return Err(err),
+                            }
                         } else {
-                            let a = self.normalize(a, na, d)?;
-                            enter = Some((a, b, v, bv, d + 1));
-                            continue;
+                            let saved = (self.bound, self.bound_len, self.hr, self.hr_len, self.binder_v);
+                            match self.normalize(a, na, d) {
+                                Ok(a_norm) => {
+                                    enter = Some((a_norm, b, v, bv, d + 1));
+                                    continue;
+                                }
+                                Err(Refused::Unselected { why: NotSelected::GenericSelf(crate::inst::SelfHead::Other), .. })
+                                    if self.ground_where_gat_bridge(a, b, trait_, v)? =>
+                                {
+                                    (self.bound, self.bound_len, self.hr, self.hr_len, self.binder_v) = saved;
+                                    continue;
+                                }
+                                Err(err) => return Err(err),
+                            }
                         }
                     }
                     if let PNode::Alias { trait_, name, .. } = nb {
@@ -1052,6 +1085,80 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         Ok(Side { ty: value.ty, slots: Slots::Sig { col: value.col, env } })
     }
 
+    /// When a ground projection `<K as Tr>::Assoc<'g>` (`K` and all trait args completely
+    /// region- and param-free) fails selection with `GenericSelf(Other)` strictly because the
+    /// caller has a lifetime-free ground `where K: Tr` clause (e.g. `evm2_macros::instruction`
+    /// emitting `where TempoEvmTypes: EvmTypesHost`), `blaze-typeck` already normalized `<K as
+    /// Tr>::Assoc<'g>` to `b` via the unique impl. If `a` has at most one GAT lifetime and `b`
+    /// has a matching single slot (or is inert), relate them directly.
+    fn ground_where_gat_bridge(&mut self, a: Side<'c>, b: Side<'c>, trait_: ItemKey, v: Variance) -> Result<bool, Refused> {
+        let Ok(a_total) = self.fits(a) else { return Ok(false) };
+        let Ok(a_own) = self.own(a) else { return Ok(false) };
+        if a_own.get() > 1 || a_total != a_own {
+            return Ok(false);
+        }
+        let Ok(akids) = self.kids_of(a) else { return Ok(false) };
+        let Some((_, mut arest)) = a.slots.split(a_own) else { return Ok(false) };
+        for k in 0..akids.len() {
+            let Ok((kid, r)) = self.kid(a, &akids, arest, k) else { return Ok(false) };
+            arest = r;
+            let mut budget = MOST_WALK_STEPS;
+            if !self.inert(kid, 0, &mut budget)? {
+                return Ok(false);
+            }
+        }
+        // Confirm the caller actually has a matching lifetime-free ground `where K: Tr` clause.
+        let owner: &'c dyn Owner = self.owner;
+        let clauses = owner.clauses();
+        if clauses.is_empty() {
+            return Ok(false);
+        }
+        let Some(oenv) = self.envs.owner_env() else { return Ok(false) };
+        let mut has_ground_clause = false;
+        for cv in clauses {
+            let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: oenv } };
+            let Ok(PNode::ExTrait(ct, _)) = self.node(c) else { continue };
+            if ct != trait_ || self.fits(c).is_err() {
+                continue;
+            }
+            let Ok(c_own) = self.own(c) else { continue };
+            let Ok(ckids) = self.kids_of(c) else { continue };
+            if c_own != SlotCount::ZERO || ckids.len() != akids.len() {
+                continue;
+            }
+            let mut all_same = true;
+            for k in 0..akids.len() {
+                let (Some(ca), Some(aa)) = (self.erased_kid(c, k), self.erased_kid(a, k)) else {
+                    all_same = false;
+                    break;
+                };
+                if !self.erased_sides(ca, aa) {
+                    all_same = false;
+                    break;
+                }
+            }
+            if all_same {
+                has_ground_clause = true;
+                break;
+            }
+        }
+        if !has_ground_clause {
+            return Ok(false);
+        }
+        let Ok(b_total) = self.fits(b) else { return Ok(false) };
+        if b_total == SlotCount::ZERO {
+            let mut budget = MOST_WALK_STEPS;
+            return self.inert(b, 0, &mut budget);
+        }
+        if a_own.get() == 1 && b_total.get() == 1 {
+            let ra = self.slot(a, 0)?;
+            let rb = self.slot(b, 0)?;
+            self.pair(a.ty, ra, rb, v, Self::env_of(a), Self::env_of(b))?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     /// Normalize a trait fn's RPITIT opaque (`Opaque(op_key, ..)`, RFC 3425) at a concrete call
     /// site to either its provided default `Twin` or the selected impl fn's return subtree.
     fn normalize_rpitit(&mut self, s: Side<'c>, op_key: ItemKey, other: PNode, depth: u32) -> Result<RpititStep<'c>, Refused> {
@@ -1244,100 +1351,163 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
     }
 
     /// Whether `cur` (an unselected alias) is already assumed to outlive some region `rhs_reg`
-    /// in the caller — either from an explicit `where <Alias>: 'rhs` clause (`owner.clauses()`)
-    /// or from an RFC 1214 implied bound (`&'rhs <Alias>` in `owner.sig()`) — that can prove
-    /// `cur: region`. When satisfied, emits `rhs_reg: region` and returns `Ok(true)`.
+    /// — from the associated type's own item bounds (`type Error: 'static`), the trait's clauses,
+    /// an explicit caller `where <Alias>: 'rhs` clause (`owner.clauses()`), or an RFC 1214 implied
+    /// bound (`&'rhs <Alias>` in `owner.sig()`) — that can prove `cur: region`. When satisfied,
+    /// emits `rhs_reg: region` and returns `Ok(true)`.
     fn alias_assumed_outlives(&mut self, cur: Side<'c>, region: Reg) -> Result<bool, Refused> {
-        let owner: &'c dyn Owner = self.owner;
-        let clauses = owner.clauses();
-        let sig = owner.sig();
-        if clauses.is_empty() && sig.is_none() {
-            return Ok(false);
-        }
-        let Some(oenv) = self.envs.owner_env() else { return Ok(false) };
         let mut unique_rhs: Option<Option<Reg>> = None;
         let record_rhs = |unique: &mut Option<Option<Reg>>, r: Reg| match *unique {
             None => *unique = Some(Some(r)),
             Some(Some(prev)) if prev == r => {}
             _ => *unique = Some(None),
         };
-        for cv in clauses {
-            let Some(rhs) = cv.outlives else { continue };
-            if cv.binders != 0 {
-                continue;
-            }
-            let rhs_reg = if rhs == Region::Static { Reg::Static } else { Reg::Owner(rhs) };
-            let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: oenv } };
-            if !self.alias_side_eq(c, cur) {
-                continue;
-            }
-            if rhs_reg == Reg::Static || rhs_reg == region {
-                self.outlives(cur.ty, rhs_reg, region)?;
-                return Ok(true);
-            }
-            record_rhs(&mut unique_rhs, rhs_reg);
-        }
-        if let Some(sig) = sig {
-            // Walk the caller's signature (`FnPtr([inputs.., output])`) to collect RFC 1214
-            // implied bounds `&'rhs T` -> `T: 'rhs` where `T` contains an unselected alias.
-            let mut stack: [Option<(Side<'c>, Option<Reg>)>; 64] = [None; 64];
-            let mut sp = 1usize;
-            if let Some(slot) = stack.get_mut(0) {
-                *slot = Some((Side { ty: sig.ty, slots: Slots::Sig { col: sig.col, env: oenv } }, None));
-            }
-            let mut steps = 0u32;
-            while let Some(top_idx) = sp.checked_sub(1) {
-                sp = top_idx;
-                steps += 1;
-                if steps > 256 {
-                    break;
+        // 1. Associated type item bounds (`type Error: Error + Send + Sync + 'static`) and the
+        //    trait's own clauses (`selected.assoc_clauses` / `selected.trait_clauses`).
+        if let Ok(PNode::Alias { trait_: at, name, .. }) = self.node(cur)
+            && self.fits(cur).is_ok()
+        {
+            let selected: &'c dyn Selected = self.selected;
+            let s_own = self.own(cur)?;
+            let skids = self.kids_of(cur)?;
+            for source in [selected.assoc_clauses(at, name), selected.trait_clauses(at)] {
+                let Some((at_lts, views)) = source else { continue };
+                if views.is_empty() || !views.iter().any(|cv| cv.outlives.is_some() && cv.binders == 0) {
+                    continue;
                 }
-                let Some((s, under)) = stack.get(top_idx).copied().flatten() else { continue };
-                let Ok(n) = self.node(s) else { continue };
-                if matches!(n, PNode::Alias { .. }) {
-                    if let Some(rhs_reg) = under
-                        && self.alias_side_eq(s, cur)
-                    {
-                        if rhs_reg == Reg::Static || rhs_reg == region {
-                            self.outlives(cur.ty, rhs_reg, region)?;
-                            return Ok(true);
+                let lts = at_lts.max(s_own.get());
+                let Some(aenv) = self.envs.impl_env(lts, skids.len()) else { continue };
+                let mut bound_ok = true;
+                for k in 0..at_lts.min(s_own.get()) {
+                    match self.slot(cur, k)? {
+                        RegAt::Known(r) if self.envs.bind_reg(aenv, k, r).is_ok() => {}
+                        _ => {
+                            bound_ok = false;
+                            break;
                         }
-                        record_rhs(&mut unique_rhs, rhs_reg);
                     }
+                }
+                if !bound_ok {
                     continue;
                 }
-                let descend = matches!(
-                    n,
-                    PNode::FnPtr(..)
-                        | PNode::Ref(..)
-                        | PNode::Ptr(..)
-                        | PNode::Slice(_)
-                        | PNode::Array(..)
-                        | PNode::Pat(..)
-                        | PNode::Tuple(_)
-                        | PNode::Record(..)
-                        | PNode::Union(_)
-                        | PNode::Adt(..)
-                );
-                if !descend || self.fits(s).is_err() {
+                for k in at_lts.min(s_own.get())..lts {
+                    let o = self.out.fresh(Kind::Existential);
+                    let _ = self.envs.bind_reg(aenv, k, Reg::Origin(o));
+                }
+                let Some((_, mut srest)) = cur.slots.split(s_own) else { continue };
+                for k in 0..skids.len() {
+                    let Ok((c, r)) = self.kid(cur, &skids, srest, k) else {
+                        bound_ok = false;
+                        break;
+                    };
+                    srest = r;
+                    let _ = self.envs.bind_type(aenv, k, c);
+                }
+                if !bound_ok {
                     continue;
                 }
-                let next_under = if matches!(n, PNode::Ref(..)) {
-                    match self.slot(s, 0) {
-                        Ok(RegAt::Known(r @ (Reg::Static | Reg::Owner(_)))) => Some(r),
-                        _ => None,
+                for cv in views {
+                    let Some(rhs) = cv.outlives else { continue };
+                    if cv.binders != 0 {
+                        continue;
                     }
-                } else {
-                    under
-                };
-                let (Ok(own), Ok(kids)) = (self.own(s), self.kids_of(s)) else { continue };
-                let Some((_, mut rest)) = s.slots.split(own) else { continue };
-                for k in 0..kids.len() {
-                    let Ok((child, rem)) = self.kid(s, &kids, rest, k) else { break };
-                    rest = rem;
-                    if let Some(slot) = stack.get_mut(sp) {
-                        *slot = Some((child, next_under));
-                        sp += 1;
+                    let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: aenv } };
+                    if !self.alias_side_eq(c, cur) {
+                        continue;
+                    }
+                    let Ok(RegAt::Known(rhs_reg)) = self.envs.reg(aenv, rhs) else { continue };
+                    if rhs_reg == Reg::Static || rhs_reg == region {
+                        self.outlives(cur.ty, rhs_reg, region)?;
+                        return Ok(true);
+                    }
+                    record_rhs(&mut unique_rhs, rhs_reg);
+                }
+            }
+        }
+        let owner: &'c dyn Owner = self.owner;
+        let clauses = owner.clauses();
+        let sig = owner.sig();
+        if !clauses.is_empty() || sig.is_some() {
+            if let Some(oenv) = self.envs.owner_env() {
+                for cv in clauses {
+                    let Some(rhs) = cv.outlives else { continue };
+                    if cv.binders != 0 {
+                        continue;
+                    }
+                    let rhs_reg = if rhs == Region::Static { Reg::Static } else { Reg::Owner(rhs) };
+                    let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: oenv } };
+                    if !self.alias_side_eq(c, cur) {
+                        continue;
+                    }
+                    if rhs_reg == Reg::Static || rhs_reg == region {
+                        self.outlives(cur.ty, rhs_reg, region)?;
+                        return Ok(true);
+                    }
+                    record_rhs(&mut unique_rhs, rhs_reg);
+                }
+                if let Some(sig) = sig {
+                    // Walk the caller's signature (`FnPtr([inputs.., output])`) to collect RFC 1214
+                    // implied bounds `&'rhs T` -> `T: 'rhs` where `T` contains an unselected alias.
+                    let mut stack: [Option<(Side<'c>, Option<Reg>)>; 64] = [None; 64];
+                    let mut sp = 1usize;
+                    if let Some(slot) = stack.get_mut(0) {
+                        *slot = Some((Side { ty: sig.ty, slots: Slots::Sig { col: sig.col, env: oenv } }, None));
+                    }
+                    let mut steps = 0u32;
+                    while let Some(top_idx) = sp.checked_sub(1) {
+                        sp = top_idx;
+                        steps += 1;
+                        if steps > 256 {
+                            break;
+                        }
+                        let Some((s, under)) = stack.get(top_idx).copied().flatten() else { continue };
+                        let Ok(n) = self.node(s) else { continue };
+                        if matches!(n, PNode::Alias { .. }) {
+                            if let Some(rhs_reg) = under
+                                && self.alias_side_eq(s, cur)
+                            {
+                                if rhs_reg == Reg::Static || rhs_reg == region {
+                                    self.outlives(cur.ty, rhs_reg, region)?;
+                                    return Ok(true);
+                                }
+                                record_rhs(&mut unique_rhs, rhs_reg);
+                            }
+                            continue;
+                        }
+                        let descend = matches!(
+                            n,
+                            PNode::FnPtr(..)
+                                | PNode::Ref(..)
+                                | PNode::Ptr(..)
+                                | PNode::Slice(_)
+                                | PNode::Array(..)
+                                | PNode::Pat(..)
+                                | PNode::Tuple(_)
+                                | PNode::Record(..)
+                                | PNode::Union(_)
+                                | PNode::Adt(..)
+                        );
+                        if !descend || self.fits(s).is_err() {
+                            continue;
+                        }
+                        let next_under = if matches!(n, PNode::Ref(..)) {
+                            match self.slot(s, 0) {
+                                Ok(RegAt::Known(r @ (Reg::Static | Reg::Owner(_)))) => Some(r),
+                                _ => None,
+                            }
+                        } else {
+                            under
+                        };
+                        let (Ok(own), Ok(kids)) = (self.own(s), self.kids_of(s)) else { continue };
+                        let Some((_, mut rest)) = s.slots.split(own) else { continue };
+                        for k in 0..kids.len() {
+                            let Ok((child, rem)) = self.kid(s, &kids, rest, k) else { break };
+                            rest = rem;
+                            if let Some(slot) = stack.get_mut(sp) {
+                                *slot = Some((child, next_under));
+                                sp += 1;
+                            }
+                        }
                     }
                 }
             }
@@ -1674,7 +1844,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             }
             let side = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env } };
             if matches!(self.node(side)?, PNode::ExProj { .. }) {
-                self.proj_of(side)?;
+                self.proj_of(side, cv.binders)?;
             }
         }
         for &(long, short) in w.params {
@@ -1712,7 +1882,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             }
             let side = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env } };
             if matches!(self.node(side)?, PNode::ExTrait(..)) {
-                self.tie_of(side)?;
+                self.tie_of(side, cv.binders)?;
             }
         }
         Ok(())
@@ -1815,7 +1985,67 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
     /// clause's (laid apart, tied by [`Walk::tie_of`]). Any other projection clause has no rule
     /// here yet: refused by name ([`NotSelected::WhereProjection`]), never skipped
     /// (`I: Iterator<Item = T>` with `I = Iter<'x, u8>` makes `T`'s region `'x`).
-    fn proj_of(&mut self, proj: Side<'c>) -> Result<(), Refused> {
+    /// Whether `s` (`ExTrait` or `ExProj`) has a subject that peels references down to a
+    /// `PNode::Dynamic` trait object (`&dyn for<'a> Fn(..)`, `dyn for<'a> Tr<'a>`).
+    fn is_dyn_subject(&self, s: Side<'c>) -> bool {
+        let Ok(own) = self.own(s) else { return false };
+        let Ok(kids) = self.kids_of(s) else { return false };
+        if kids.len() == 0 {
+            return false;
+        }
+        let Some((_, rest)) = s.slots.split(own) else { return false };
+        let Ok((mut cur, _)) = self.kid(s, &kids, rest, 0) else { return false };
+        for _ in 0..8 {
+            let Ok(Resolved::Side(res)) = self.resolve(cur) else { return false };
+            cur = res;
+            match self.node(cur) {
+                Ok(PNode::Dynamic(_)) => return true,
+                Ok(PNode::Ref(..)) => {
+                    let Ok(co) = self.own(cur) else { return false };
+                    let Ok(ck) = self.kids_of(cur) else { return false };
+                    let Some((_, cr)) = cur.slots.split(co) else { return false };
+                    let Ok((inner, _)) = self.kid(cur, &ck, cr, 0) else { return false };
+                    cur = inner;
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// Skolemizes a clause's own `for<..>` binder (`binder: 0`, `0..binders`) to universal
+    /// placeholder origins so higher-ranked trait and projection goals (e.g.
+    /// `for<'a> <Self::SolType as SolType>::Token<'a>: TokenSeq<'a>`) normalize and tie through
+    /// impls and where-clauses soundly without leaving raw `Reg::Bound { binder: 0, .. }`
+    /// outside a binder context. When the subject is a `dyn` object (`&dyn Fn(..)`), reuses
+    /// canonical `dyn_placeholder(var)` ordinals so passing the same `&dyn` to multiple calls
+    /// does not create conflicting placeholders across calls.
+    fn skolemize_side(&mut self, s: Side<'c>, binders: u32) -> Result<Side<'c>, Refused> {
+        if binders == 0 {
+            return Ok(s);
+        }
+        let Slots::Sig { col, env } = s.slots else {
+            return Ok(s);
+        };
+        if !col.iter().any(|r| matches!(r, Region::Late { binder: 0, .. })) {
+            return Ok(s);
+        }
+        let use_dyn_ph = self.is_dyn_subject(s);
+        let mut ord = 0u32;
+        let out = &mut *self.out;
+        let new_env = self
+            .envs
+            .skolemize_clause(env, binders, || {
+                let o = if use_dyn_ph { out.dyn_placeholder(ord) } else { out.fresh(Kind::Placeholder) };
+                ord += 1;
+                o
+            })
+            .ok_or(self.malformed(s.ty, Bad::StepBound))?;
+        Ok(Side { ty: s.ty, slots: Slots::Sig { col, env: new_env } })
+    }
+
+    fn proj_of(&mut self, proj: Side<'c>, binders: u32) -> Result<(), Refused> {
+        let proj = self.skolemize_side(proj, binders)?;
         let PNode::ExProj { trait_, name, .. } = self.node(proj)? else { return Err(self.malformed(proj.ty, Bad::NotOfKind)) };
         self.fits(proj)?;
         let own = self.own(proj)?;
@@ -1950,7 +2180,8 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
 
     /// `T: Trait<A..>` laid subject-first (`ExTrait(Trait, [T, A..])`, a clause column's form):
     /// as [`Walk::tie`], with the subject read off the node.
-    fn tie_of(&mut self, trait_ref: Side<'c>) -> Result<(), Refused> {
+    fn tie_of(&mut self, trait_ref: Side<'c>, binders: u32) -> Result<(), Refused> {
+        let trait_ref = self.skolemize_side(trait_ref, binders)?;
         let PNode::ExTrait(trait_, _) = self.node(trait_ref)? else { return Err(self.malformed(trait_ref.ty, Bad::NotOfKind)) };
         let mut budget = MOST_WALK_STEPS;
         if self.inert(trait_ref, 0, &mut budget)? {
@@ -2426,6 +2657,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             }
             let next_depth = cur_depth + 1;
             if next_depth < 12 {
+                let (sub_chain, sub_clen) = self.alias_self_chain(subject);
                 let start = sp;
                 for cv in views {
                     let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: tenv } };
@@ -2436,7 +2668,9 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                         && ckids.len() > 0
                         && let Some((_, crest)) = c.slots.split(c_own)
                         && let Ok((c_self, _)) = self.kid(c, &ckids, crest, 0)
-                        && (self.erased_sides(c_self, subject) || self.erased_sides(c_self, cur_self))
+                        && (self.erased_sides(c_self, subject)
+                            || self.erased_sides(c_self, cur_self)
+                            || sub_chain.iter().take(sub_clen).flatten().any(|&a| self.erased_sides(c_self, a)))
                         && let Some(slot) = stack.get_mut(sp)
                     {
                         *slot = Some((ct, c_self, c, true, next_depth));
@@ -2502,6 +2736,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             }
             let next_depth = cur_depth + 1;
             if next_depth < 12 {
+                let (sub_chain, sub_clen) = self.alias_self_chain(subject);
                 let start = sp;
                 for cv in views {
                     let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: tenv } };
@@ -2512,7 +2747,9 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                         && ckids.len() > 0
                         && let Some((_, crest)) = c.slots.split(c_own)
                         && let Ok((c_self, _)) = self.kid(c, &ckids, crest, 0)
-                        && (self.erased_sides(c_self, subject) || self.erased_sides(c_self, cur_self))
+                        && (self.erased_sides(c_self, subject)
+                            || self.erased_sides(c_self, cur_self)
+                            || sub_chain.iter().take(sub_clen).flatten().any(|&a| self.erased_sides(c_self, a)))
                         && let Some(slot) = stack.get_mut(sp)
                     {
                         *slot = Some((ct, c_self, c, true, next_depth));
@@ -2553,7 +2790,8 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         (out, len)
     }
 
-    /// Bind an opaque type's defining-item env from a clause whose child 0 is `Opaque(op_key, ..)`.
+    /// Bind an opaque type's defining-item env from a clause whose child 0 is `Opaque(op_key, ..)`
+    /// or a projection `Alias` whose self-chain reaches `Opaque(op_key, ..)`.
     fn opaque_clause_side(&mut self, cv: &blaze_typeck::region_facts::ClauseView<'c>, op_lts: u32, subject: Side<'c>, op_key: ItemKey) -> Result<Option<Side<'c>>, Refused> {
         let sub_kids = self.kids_of(subject)?;
         let Some(oenv) = self.envs.impl_env(op_lts, sub_kids.len()) else { return Ok(None) };
@@ -2568,11 +2806,17 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         }
         let Some((_, crest)) = c.slots.split(c_own) else { return Ok(None) };
         let (c0, _) = self.kid(c, &ckids, crest, 0)?;
-        if !matches!(self.node(c0)?, PNode::Opaque(k, _) if k == op_key) {
-            return Ok(None);
-        }
-        // Walking `c0` against `subject` binds every captured lifetime and type param of `oenv`.
-        if self.walk(c0, subject, Variance::In, 1).is_err() {
+        let op_in_clause = if matches!(self.node(c0)?, PNode::Opaque(k, _) if k == op_key) {
+            c0
+        } else {
+            let (chain, clen) = self.alias_self_chain(c0);
+            let Some(found) = chain.iter().take(clen).flatten().copied().find(|&a| matches!(self.node(a), Ok(PNode::Opaque(k, _)) if k == op_key)) else {
+                return Ok(None);
+            };
+            found
+        };
+        // Walking `op_in_clause` against `subject` binds every captured lifetime and type param of `oenv`.
+        if self.walk(op_in_clause, subject, Variance::In, 1).is_err() {
             return Ok(None);
         }
         for i in 0..op_lts {
@@ -2582,6 +2826,96 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             }
         }
         Ok(Some(c))
+    }
+
+    /// Try to prove `subject: trait_ref` from the opaque clauses of `op_key` (bound against
+    /// `op_side`, which is either `subject` itself or an `Opaque` ancestor in `alias_self_chain`).
+    fn try_prove_from_opaque_clauses(
+        &mut self,
+        op_key: ItemKey,
+        op_side: Side<'c>,
+        subject: Side<'c>,
+        trait_ref: Side<'c>,
+        has_subject: bool,
+        trait_: ItemKey,
+    ) -> Result<bool, Refused> {
+        let selected: &'c dyn Selected = self.selected;
+        let Some((op_lts, views)) = selected.opaque_clauses(op_key) else {
+            return Ok(false);
+        };
+        for allow_alias in [false, true] {
+            for cv in views {
+                if let Ok(PNode::ExTrait(ct, _)) = self.sig_types.node(cv.col.ty())
+                    && ct == trait_
+                    && let Some(c) = self.opaque_clause_side(cv, op_lts, op_side, op_key)?
+                    && self.match_trait_clause(c, subject, trait_ref, has_subject, allow_alias)?
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        let mut visited = [(ItemKey(0), false); 64];
+        let mut vlen = 0usize;
+        for cv in views {
+            if let Ok(PNode::ExTrait(ct, _)) = self.sig_types.node(cv.col.ty())
+                && let Some(c) = self.opaque_clause_side(cv, op_lts, op_side, op_key)?
+                && let Ok(c_own) = self.own(c)
+                && let Ok(ckids) = self.kids_of(c)
+                && ckids.len() > 0
+                && let Some((_, crest)) = c.slots.split(c_own)
+                && let Ok((c_self, _)) = self.kid(c, &ckids, crest, 0)
+                && self.elaborate_for_trait(ct, c_self, c, true, trait_, subject, trait_ref, has_subject, 0, &mut visited, &mut vlen)?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Try to normalize `want` from the opaque clauses of `op_key` (bound against `op_side`).
+    #[allow(clippy::too_many_arguments)]
+    fn try_normalize_from_opaque_clauses(
+        &mut self,
+        op_key: ItemKey,
+        op_side: Side<'c>,
+        want: Side<'c>,
+        want_arg_count: u32,
+        subject: Side<'c>,
+        trait_: ItemKey,
+        name: blaze_typeck::Name,
+    ) -> Result<Option<Side<'c>>, Refused> {
+        let selected: &'c dyn Selected = self.selected;
+        let Some((op_lts, views)) = selected.opaque_clauses(op_key) else {
+            return Ok(None);
+        };
+        for allow_alias in [false, true] {
+            for cv in views {
+                if let Ok(PNode::ExProj { trait_: ct, name: cn, .. }) = self.sig_types.node(cv.col.ty())
+                    && ct == trait_
+                    && cn == name
+                    && let Some(c) = self.opaque_clause_side(cv, op_lts, op_side, op_key)?
+                    && let Some(term) = self.match_proj_clause(c, want, want_arg_count, trait_, name, allow_alias)?
+                {
+                    return Ok(Some(term));
+                }
+            }
+        }
+        let mut visited = [(ItemKey(0), false); 64];
+        let mut vlen = 0usize;
+        for cv in views {
+            if let Ok(PNode::ExTrait(ct, _)) = self.sig_types.node(cv.col.ty())
+                && let Some(c) = self.opaque_clause_side(cv, op_lts, op_side, op_key)?
+                && let Ok(c_own) = self.own(c)
+                && let Ok(ckids) = self.kids_of(c)
+                && ckids.len() > 0
+                && let Some((_, crest)) = c.slots.split(c_own)
+                && let Ok((c_self, _)) = self.kid(c, &ckids, crest, 0)
+                && let Some(term) = self.elaborate_for_proj(ct, c_self, c, true, want, want_arg_count, subject, trait_, name, 0, &mut visited, &mut vlen)?
+            {
+                return Ok(Some(term));
+            }
+        }
+        Ok(None)
     }
 
     /// Try to prove `subject: trait_ref` from non-impl sources: builtin `Fn*`, caller bounds
@@ -2716,29 +3050,8 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 }
             }
             PNode::Opaque(op_key, _) => {
-                let selected: &'c dyn Selected = self.selected;
-                if let Some((op_lts, views)) = selected.opaque_clauses(op_key) {
-                    for allow_alias in [false, true] {
-                        for cv in views {
-                            if let Ok(PNode::ExTrait(ct, _)) = self.sig_types.node(cv.col.ty())
-                                && ct == trait_
-                                && let Some(c) = self.opaque_clause_side(cv, op_lts, subject, op_key)?
-                                && self.match_trait_clause(c, subject, trait_ref, has_subject, allow_alias)?
-                            {
-                                return Ok(true);
-                            }
-                        }
-                    }
-                    let mut visited = [(ItemKey(0), false); 64];
-                    let mut vlen = 0usize;
-                    for cv in views {
-                        if let Ok(PNode::ExTrait(ct, _)) = self.sig_types.node(cv.col.ty())
-                            && let Some(c) = self.opaque_clause_side(cv, op_lts, subject, op_key)?
-                            && self.elaborate_for_trait(ct, subject, c, true, trait_, subject, trait_ref, has_subject, 0, &mut visited, &mut vlen)?
-                        {
-                            return Ok(true);
-                        }
-                    }
+                if self.try_prove_from_opaque_clauses(op_key, subject, subject, trait_ref, has_subject, trait_)? {
+                    return Ok(true);
                 }
             }
             PNode::Alias { trait_: at, name, .. } => {
@@ -2750,6 +3063,16 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                         && !views.is_empty()
                         && self.fits(subject).is_ok()
                         && self.try_prove_from_alias_clauses(at_lts, views, subject, trait_ref, has_subject, trait_)?
+                    {
+                        return Ok(true);
+                    }
+                }
+                // Also elaborate bounds of any ancestor `Opaque` in `subject`'s self-chain
+                // (e.g. `<impl ExecutableTxIterator<Evm> as ExecutableTxTuple>::Tx: ExecutableTxFor<Evm>`).
+                let (chain, clen) = self.alias_self_chain(subject);
+                for anc in chain.iter().take(clen).flatten().copied() {
+                    if let Ok(PNode::Opaque(op_key, _)) = self.node(anc)
+                        && self.try_prove_from_opaque_clauses(op_key, anc, subject, trait_ref, has_subject, trait_)?
                     {
                         return Ok(true);
                     }
@@ -3005,30 +3328,8 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 }
             }
             PNode::Opaque(op_key, _) => {
-                let selected: &'c dyn Selected = self.selected;
-                if let Some((op_lts, views)) = selected.opaque_clauses(op_key) {
-                    for allow_alias in [false, true] {
-                        for cv in views {
-                            if let Ok(PNode::ExProj { trait_: ct, name: cn, .. }) = self.sig_types.node(cv.col.ty())
-                                && ct == trait_
-                                && cn == name
-                                && let Some(c) = self.opaque_clause_side(cv, op_lts, subject, op_key)?
-                                && let Some(term) = self.match_proj_clause(c, want, want_arg_count, trait_, name, allow_alias)?
-                            {
-                                return Ok(Some(term));
-                            }
-                        }
-                    }
-                    let mut visited = [(ItemKey(0), false); 64];
-                    let mut vlen = 0usize;
-                    for cv in views {
-                        if let Ok(PNode::ExTrait(ct, _)) = self.sig_types.node(cv.col.ty())
-                            && let Some(c) = self.opaque_clause_side(cv, op_lts, subject, op_key)?
-                            && let Some(term) = self.elaborate_for_proj(ct, subject, c, true, want, want_arg_count, subject, trait_, name, 0, &mut visited, &mut vlen)?
-                        {
-                            return Ok(Some(term));
-                        }
-                    }
+                if let Some(term) = self.try_normalize_from_opaque_clauses(op_key, subject, want, want_arg_count, subject, trait_, name)? {
+                    return Ok(Some(term));
                 }
             }
             PNode::Alias { trait_: at, name: an, .. } => {
@@ -3095,6 +3396,14 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                                 return Ok(Some(term));
                             }
                         }
+                    }
+                }
+                let (chain, clen) = self.alias_self_chain(subject);
+                for anc in chain.iter().take(clen).flatten().copied() {
+                    if let Ok(PNode::Opaque(op_key, _)) = self.node(anc)
+                        && let Some(term) = self.try_normalize_from_opaque_clauses(op_key, anc, want, want_arg_count, subject, trait_, name)?
+                    {
+                        return Ok(Some(term));
                     }
                 }
             }
@@ -3212,8 +3521,8 @@ pub fn clauses<'c, 'k: 'c, A: Allocator + Copy>(cx: &mut Cx<'k, '_>, inst: &mut 
             Clause::Outlives { long, short, at } => w.outlives(at, long, short)?,
             Clause::TypeOutlives { subject, region } => w.components(subject, region, 0)?,
             Clause::Trait { subject, trait_ref } => w.tie(subject, trait_ref)?,
-            Clause::TraitOf { trait_ref } => w.tie_of(trait_ref)?,
-            Clause::ProjOf { proj } => w.proj_of(proj)?,
+            Clause::TraitOf { trait_ref, binders } => w.tie_of(trait_ref, binders)?,
+            Clause::ProjOf { proj, binders } => w.proj_of(proj, binders)?,
         }
     }
     Ok(())

@@ -493,6 +493,7 @@ dependencies = [
  "blaze-deflate",
  "blaze-math",
  "blaze-own",
+ "blaze-pbr",
  "blaze-sim",
  "blaze-text",
  "blaze-units",
@@ -567,6 +568,7 @@ dependencies = [
  "blaze-deflate",
  "blaze-math",
  "blaze-own",
+ "blaze-pbr",
  "blaze-sim",
  "blaze-units",
 ]
@@ -1071,6 +1073,17 @@ version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
  "blaze-ids",
+]
+
+[[package]]
+name = "blaze-git"
+version = "0.0.0"
+dependencies = [
+ "blaze-git-fetch",
+ "blaze-hash",
+ "blaze-memchr",
+ "blaze-own",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -1621,6 +1634,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-pbr"
+version = "0.0.0"
+dependencies = [
+ "blaze-math",
+ "blaze-own",
+]
+
+[[package]]
 name = "blaze-pg"
 version = "0.0.0"
 dependencies = [
@@ -2140,6 +2161,7 @@ dependencies = [
  "blaze-ecs",
  "blaze-ed25519",
  "blaze-format",
+ "blaze-git",
  "blaze-glob",
  "blaze-h1",
  "blaze-h2",

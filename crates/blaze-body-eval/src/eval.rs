@@ -69,6 +69,7 @@ pub fn eval_body<'w, 'a, W: BodyWorld, L: Layout>(
         live_bits: Vec::new_in(alloc),
         inst_tys: Vec::new_in(alloc),
         cached_tys: Vec::new_in(alloc),
+        min_align: Vec::new_in(alloc),
         limits,
         steps: 0,
         alloc,
@@ -428,6 +429,9 @@ pub(crate) struct Machine<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> {
     /// Cached per-instance grounded local types: `(body_id, args, start, len)` indexing `cached_tys`.
     inst_tys: Vec<(BodyId, List, u32, u32), Alloc<'a>>,
     cached_tys: Vec<PTy, Alloc<'a>>,
+    /// Inherited minimum log2 alignments for allocations written whole from a higher-aligned
+    /// base place (e.g. promoted `&ALIGNED_BYTES.bytes` inheriting the base struct's alignment).
+    min_align: Vec<(AllocId, u8), Alloc<'a>>,
     pub(crate) limits: Limits,
     pub(crate) steps: u64,
     pub(crate) alloc: Alloc<'a>,
@@ -511,10 +515,49 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
         Ok(self.mem.write(p, size, v)?)
     }
 
+    /// Effective log2 alignment of `id`: its own allocation alignment, or a higher alignment
+    /// inherited from a base-struct field copy (e.g. promoted `&ALIGNED_BYTES.bytes`).
+    pub(crate) fn effective_align_log2(&self, id: AllocId) -> R<'a, u8> {
+        let base = self.mem.get(id)?.align_log2;
+        let extra = self.min_align.iter().find(|&&(a, _)| a == id).map_or(0, |&(_, al)| al);
+        Ok(base.max(extra))
+    }
+
+    /// Guaranteed log2 byte alignment of `ptr` within its allocation: the allocation's effective
+    /// alignment when `ptr.offset == 0`, otherwise capped by the lowest set bit of `ptr.offset`.
+    pub(crate) fn place_align_log2(&self, ptr: Pointer) -> R<'a, u8> {
+        let src = self.effective_align_log2(ptr.alloc)?;
+        Ok(if ptr.offset == 0 {
+            src
+        } else {
+            src.min(u8::try_from(ptr.offset.trailing_zeros()).unwrap_or(u8::MAX))
+        })
+    }
+
+    /// Preserves `src`'s base-place alignment on `dst` when a whole allocation is overwritten
+    /// at offset 0.
+    fn inherit_align(&mut self, src: Pointer, dst: Pointer, size: u64) -> R<'a, ()> {
+        if dst.offset != 0 || size != self.alloc_len(dst.alloc)? {
+            return Ok(());
+        }
+        let align = self.place_align_log2(src)?;
+        let base = self.mem.get(dst.alloc)?.align_log2;
+        if align <= base {
+            return Ok(());
+        }
+        if let Some((_, cur)) = self.min_align.iter_mut().find(|(a, _)| *a == dst.alloc) {
+            *cur = (*cur).max(align);
+        } else {
+            self.min_align.push((dst.alloc, align));
+        }
+        Ok(())
+    }
+
     pub(crate) fn mem_copy(&mut self, src: Pointer, dst: Pointer, size: u64) -> R<'a, ()> {
         self.ensure_loaded(src.alloc)?;
         self.ensure_loaded(dst.alloc)?;
-        Ok(self.mem.copy(src, dst, size)?)
+        self.mem.copy(src, dst, size)?;
+        self.inherit_align(src, dst, size)
     }
 
     pub(crate) fn mem_deinit(&mut self, p: Pointer, size: u64) -> R<'a, ()> {
@@ -580,11 +623,14 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
                 self.jump(target)?;
             }
             StmtKind::Return => return self.ret(),
+            StmtKind::TailCall { callee, args } => return self.tail_call(callee, args),
             // Undefined behaviour reached (the Reference, "Behavior considered undefined").
             StmtKind::Unreachable => return Err(Refusal::Unreachable.into()),
             StmtKind::Resume => return Err(malformed("`resume` reached: the evaluator follows no unwind edge").into()),
             StmtKind::Terminate => return Err(Stop::Fault(Fault::Abort)),
-            StmtKind::Suspend { .. } => return Err(unsupported("a suspension (a coroutine's) in a constant").into()),
+            StmtKind::Suspend { .. } | StmtKind::Cancelled => {
+                return Err(unsupported("a suspension (a coroutine's) in a constant").into());
+            }
             StmtKind::InlineAsm { .. } => return Err(unsupported("inline assembly in a constant").into()),
         }
         Ok(None)
@@ -848,6 +894,70 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
         }
     }
 
+    fn tail_call(&mut self, callee: CalleeId, args: Ops) -> R<'a, Option<DataRecord<Alloc<'a>>>> {
+        let body = self.top()?.body;
+        let ret = self.top()?.ret;
+        let (key, gargs) = match body.callee(callee) {
+            Callee::FnItem { key, args } | Callee::Method { key, args } | Callee::Intrinsic { key, args } => {
+                (key, self.ground_list(args)?)
+            }
+            Callee::Value(op) => self.callee_of_value(op)?,
+        };
+        let (item, iargs) = self.resolve(key, gargs)?;
+        match self.world.fn_kind(item) {
+            FnKind::Const => {
+                let f = self.frame(item, iargs, ret)?;
+                let mut k = 1usize;
+                for op in body.ops(args) {
+                    let Some(id) = f.locals.get(k).copied().flatten() else {
+                        for lid in f.locals.iter().flatten() {
+                            self.mem.kill(*lid);
+                        }
+                        return Err(malformed("a tail call with more arguments than its callee takes").into());
+                    };
+                    if let Err(e) = self.operand_into(op, Pointer { alloc: id, offset: 0 }) {
+                        for lid in f.locals.iter().flatten() {
+                            self.mem.kill(*lid);
+                        }
+                        return Err(e);
+                    }
+                    k += 1;
+                }
+                if k != usize::try_from(f.body.args()).unwrap_or(0) + 1 {
+                    for lid in f.locals.iter().flatten() {
+                        self.mem.kill(*lid);
+                    }
+                    return Err(malformed("a tail call with fewer arguments than its callee takes").into());
+                }
+                if let Some(old) = self.frames.pop() {
+                    for lid in old.locals.iter().flatten() {
+                        self.mem.kill(*lid);
+                    }
+                }
+                self.frames.push(f);
+                Ok(None)
+            }
+            FnKind::NotConst => Err(Refusal::NotConstFn { item }.into()),
+            FnKind::UnknownIntrinsic => Err(Refusal::UnknownIntrinsic { item }.into()),
+            FnKind::Missing(fact) => Err(Refusal::FnFact { item, fact }.into()),
+            FnKind::Ctor { variant, .. } => {
+                let d = self.place(body.local_place(Local(0)))?;
+                self.fields(d.ptr, d.ty, variant, body.ops(args))?;
+                self.set_tag(d.ptr, d.ty, variant)?;
+                self.ret()
+            }
+            FnKind::Panic => Err(Refusal::Panic { parts: Vec::new_in(self.alloc) }.into()),
+            FnKind::Intrinsic(Intrinsic::ConstEvalSelect) => {
+                Err(unsupported("`become const_eval_select` in a constant").into())
+            }
+            FnKind::Intrinsic(i) => {
+                let d = self.place(body.local_place(Local(0)))?;
+                self.intrinsic(i, iargs, args, Some(d))?;
+                self.ret()
+            }
+        }
+    }
+
     fn call_const_eval_select(&mut self, args: Ops, d: Option<Pl>, target: Option<Block>) -> R<'a, ()> {
         let body = self.top()?.body;
         let mut ops = body.ops(args);
@@ -942,7 +1052,7 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
     /// Freezes a sub-body's `_0` allocation into an immutable `Origin::Data` allocation, zeroing
     /// unwritten padding and verifying that no pointer dangles into a dead local of `f`.
     fn freeze_sub_result(&mut self, r0: AllocId) -> R<'a, AllocId> {
-        let align = self.mem.get(r0)?.align_log2;
+        let align = self.effective_align_log2(r0)?;
         let mut bytes: Vec<u8, Alloc<'a>> = Vec::new_in(self.alloc);
         bytes.extend_from_slice(self.mem.bytes(r0)?);
         self.mem.zero_unwritten(r0, &mut bytes);
@@ -1543,6 +1653,9 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
                 let s = self.read(o)?;
                 let size = self.size(o.ty)?;
                 self.mem_write(dst, size, s)?;
+                if let Src::At(src) = o.src {
+                    self.inherit_align(src, dst, size)?;
+                }
                 return Ok(());
             }
             let size = self.size(o.ty)?;
@@ -2263,7 +2376,7 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
         let mut k = 0;
         while let Some(&id) = order.get(k) {
             k += 1;
-            let align = self.mem.get(id)?.align_log2;
+            let align = self.effective_align_log2(id)?;
             let mut bytes: alloc::vec::Vec<u8, Alloc<'a>> = alloc::vec::Vec::new_in(self.alloc);
             bytes.extend_from_slice(self.mem.bytes(id)?);
             self.mem.zero_unwritten(id, &mut bytes);

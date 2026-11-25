@@ -115,6 +115,10 @@ impl Table {
         Table { entries: Vec::new_in(alloc), refusals: None }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty() && self.refusals.as_ref().is_none_or(|v| v.is_empty())
+    }
+
     pub fn clear(&mut self) {
         let Table { entries, refusals } = self;
         entries.clear();
@@ -541,7 +545,7 @@ fn file<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, need: LibKey, out: R
         Ok(None) => State::NotLeaf,
         Err(e) => {
             // Kept typed, in the allocator of the store's type table (the store's own).
-            let alloc = r.store.tys.alloc();
+            let alloc = r.store.work_alloc();
             let mut t = r.store.maps.inherents.borrow_mut();
             t.refusals.get_or_insert_with(|| Vec::new_in(alloc)).push((need, e));
             State::Refused

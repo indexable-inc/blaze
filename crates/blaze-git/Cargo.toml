@@ -1,0 +1,27 @@
+[package]
+name = "blaze-git"
+description = "Sans-IO, hardware-floor git prompt and status engine for Starship-class tools: zero-copy .git/index (v2-v4 + recursive TREE cache-tree), binary commit-graph (CGPH) ahead/behind, refs/packed-refs/config/stash/repo-state, .gitignore stack, batched single-pass directory walk, and Starship prompt formatting; no_std, allocator-explicit, zero external dependencies"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-git-fetch.workspace = true
+blaze-hash.workspace = true
+blaze-memchr.workspace = true
+blaze-own.workspace = true
+
+[dev-dependencies]
+blaze-own = { workspace = true, features = ["testing"] }
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

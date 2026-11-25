@@ -1682,9 +1682,22 @@ impl<'a> ImplsCols<'a> {
     }
 }
 
-/// An items record whose header, column tables, and strings section have been verified ONCE
-/// (rule 74: verify once). Constructing [`ItemsRecord`] from a [`VerifiedItems`] proof is O(1)
-/// and performs zero re-validation or UTF-8 scanning across stretches and jobs.
+/// How an items record's strings section is verified (rule 74).
+///
+/// - [`StringsMode::Verified`]: the entire strings section passed `core::str::from_utf8` once at
+///   [`VerifiedItems::check`]; individual reads only check range bounds and UTF-8 char boundaries.
+/// - [`StringsMode::Lazy`]: [`VerifiedItems::check_header`] checked all section bounds in O(1)
+///   without touching the strings pages; each accessed slice is validated via `core::str::from_utf8`
+///   at [`ItemsRecord::str_at`]. Zero unverified bytes are ever returned as `&str`.
+#[derive(Clone, Copy, Debug)]
+enum StringsMode<'a> {
+    Verified(&'a str),
+    Lazy(&'a [u8]),
+}
+
+/// An items record whose header and column tables (and optionally its full strings section) have
+/// been verified ONCE (rule 74: verify once). Constructing [`ItemsRecord`] from a [`VerifiedItems`]
+/// proof is O(1) and performs zero re-validation across stretches and jobs.
 #[derive(Clone, Copy, Debug)]
 pub struct VerifiedItems<'a> {
     bytes: &'a [u8],
@@ -1698,27 +1711,38 @@ pub struct VerifiedItems<'a> {
     impl_cols: ImplsCols<'a>,
     buckets: buckets::BucketsCols<'a>,
     variants: variants::VariantsCols<'a>,
-    strings: &'a str,
+    strings: StringsMode<'a>,
 }
 
 impl<'a> VerifiedItems<'a> {
-    /// Checks the header, every column table, edition/std bytes, and UTF-8 of the strings section
-    /// once, returning a `Copy` proof reusable across jobs and stretches.
+    /// Checks the header, every column table, edition/std bytes, and UTF-8 of the entire strings
+    /// section once, returning a `Copy` proof reusable across jobs and stretches.
     pub fn check(bytes: &'a [u8]) -> Result<VerifiedItems<'a>, ItemsRecordError> {
-        if bytes.as_ptr() as usize % ALIGN != 0 {
+        Self::check_inner(bytes, true)
+    }
+
+    /// Checks the header, alignment, every column table header, section bounds, and edition/std
+    /// bytes in O(1), deferring UTF-8 validation of individual accessed strings to
+    /// [`ItemsRecord::str_at`]. Zero unverified bytes are ever returned as `&str`.
+    pub fn check_header(bytes: &'a [u8]) -> Result<VerifiedItems<'a>, ItemsRecordError> {
+        Self::check_inner(bytes, false)
+    }
+
+    fn check_inner(bytes: &'a [u8], eager_utf8: bool) -> Result<VerifiedItems<'a>, ItemsRecordError> {
+        if !bytes.as_ptr().addr().is_multiple_of(ALIGN) {
             return Err(ItemsRecordError::Unaligned);
         }
-        if bytes.len() < HEADER || bytes[..4] != MAGIC || le32(bytes, 4) != VERSION {
+        if bytes.len() < HEADER || bytes.get(..4) != Some(MAGIC.as_slice()) || le32(bytes, 4) != VERSION {
             return Err(ItemsRecordError::NotThisRecord);
         }
-        let f = |i: usize| le32(bytes, 8 + 4 * i) as usize;
+        let f = |i: usize| usize::try_from(le32(bytes, 8 + 4 * i)).unwrap_or(usize::MAX);
         let mut counts = [0usize; TABLES];
         let mut offsets = [0usize; TABLES + 1];
-        for i in 0..TABLES {
-            counts[i] = f(F_COUNTS + i);
+        for (i, slot) in counts.iter_mut().enumerate() {
+            *slot = f(F_COUNTS + i);
         }
-        for i in 0..=TABLES {
-            offsets[i] = f(F_OFFSETS + i);
+        for (i, slot) in offsets.iter_mut().enumerate() {
+            *slot = f(F_OFFSETS + i);
         }
         let strings_len = f(F_STRINGS_LEN);
         let within = |what: &'static str, at: usize, len: Option<usize>| match len.and_then(|len| at.checked_add(len)) {
@@ -1735,15 +1759,28 @@ impl<'a> VerifiedItems<'a> {
         let impl_cols = ImplsCols::open(bytes, offsets[T_IMPLS], counts[T_IMPLS])?;
         let buckets = buckets::BucketsCols::open(bytes, f(buckets::F_BUCKETS_AT), f(buckets::F_BUCKETS_COUNT))?;
         let variants = variants::VariantsCols::open(bytes, f(variants::F_VARIANTS_AT), f(variants::F_VARIANTS_COUNT))?;
-        within("strings", offsets[TABLES], Some(strings_len))?;
-        // The one UTF-8 check of the record's strings (rule 74): every string a row names is a
-        // slice of this section, which the writer made of `&str`s alone ([`Strings::put`]), so
-        // a bad byte anywhere in it is refused here, at check, whichever row's string it is in.
-        let strings = core::str::from_utf8(&bytes[offsets[TABLES]..offsets[TABLES] + strings_len])
-            .map_err(|e| ItemsRecordError::Utf8 { what: "the record's strings", at: e.valid_up_to() })?;
+        let strings_at = offsets[TABLES];
+        within("strings", strings_at, Some(strings_len))?;
+        let raw_strings = strings_at
+            .checked_add(strings_len)
+            .and_then(|end| bytes.get(strings_at..end))
+            .ok_or(ItemsRecordError::Short { what: "strings", at: strings_at })?;
+        let strings = if eager_utf8 {
+            // The one UTF-8 check of the record's strings (rule 74): every string a row names is a
+            // slice of this section, which the writer made of `&str`s alone ([`Strings::put`]), so
+            // a bad byte anywhere in it is refused here, at check, whichever row's string it is in.
+            StringsMode::Verified(
+                core::str::from_utf8(raw_strings)
+                    .map_err(|e| ItemsRecordError::Utf8 { what: "the record's strings", at: e.valid_up_to() })?,
+            )
+        } else {
+            StringsMode::Lazy(raw_strings)
+        };
+        let edition_byte = bytes.get(8 + 4 * F_EDITION).copied().unwrap_or(u8::MAX);
         let edition = Edition::from_byte(u8::try_from(f(F_EDITION)).unwrap_or(u8::MAX))
-            .ok_or(ItemsRecordError::Byte { what: "an edition", byte: bytes[8 + 4 * F_EDITION] })?;
-        std_of(le32(bytes, 8 + 4 * F_STD)).ok_or(ItemsRecordError::Byte { what: "the crate's std", byte: bytes[8 + 4 * F_STD] })?;
+            .ok_or(ItemsRecordError::Byte { what: "an edition", byte: edition_byte })?;
+        let std_byte = bytes.get(8 + 4 * F_STD).copied().unwrap_or(u8::MAX);
+        std_of(le32(bytes, 8 + 4 * F_STD)).ok_or(ItemsRecordError::Byte { what: "the crate's std", byte: std_byte })?;
         Ok(VerifiedItems {
             bytes,
             key: CrateItemKey(id_at(bytes, KEYS_AT)),
@@ -1790,10 +1827,9 @@ pub struct ItemsRecord<'a> {
     impl_cols: ImplsCols<'a>,
     buckets: buckets::BucketsCols<'a>,
     variants: variants::VariantsCols<'a>,
-    /// The strings section, checked UTF-8 ONCE by [`VerifiedItems::check`] (the proof every row's
-    /// string is read under: a row's string is a slice of it, so a read checks only that the
-    /// slice lies inside it and on character boundaries, never the bytes again).
-    strings: &'a str,
+    /// The strings section: either checked UTF-8 whole by [`VerifiedItems::check`] or validated
+    /// per accessed slice in [`ItemsRecord::str_at`] when opened via [`VerifiedItems::check_header`].
+    strings: StringsMode<'a>,
     atoms: OnceCell<AVec<'a, (&'a str, Option<&'a str>)>>,
     /// Each text asked, by where it is, as its one check saw it: empty, and unallocated, until
     /// the first text is asked.
@@ -1905,15 +1941,23 @@ impl<'a> ItemsRecord<'a> {
     }
 
     fn str_at(&self, what: &'static str, at: u32, len: u32) -> Result<&'a str, ItemsRecordError> {
-        let (at, len) = (at as usize, len as usize);
-        let Some(end) = at.checked_add(len).filter(|end| *end <= self.strings.len()) else {
-            return Err(ItemsRecordError::Short { what, at });
-        };
-        // No UTF-8 check here: `open` checked the whole section ([`ItemsRecord::strings`]). A
-        // range that cuts a character (a writer's bug: the writer stores whole strings) is
-        // refused by name, as a bad byte was.
-        let strings: &'a str = self.strings;
-        strings.get(at..end).ok_or(ItemsRecordError::Utf8 { what, at })
+        let (at, len) = (usize::try_from(at).unwrap_or(usize::MAX), usize::try_from(len).unwrap_or(usize::MAX));
+        match self.strings {
+            StringsMode::Verified(strings) => {
+                let Some(end) = at.checked_add(len).filter(|end| *end <= strings.len()) else {
+                    return Err(ItemsRecordError::Short { what, at });
+                };
+                // No UTF-8 check here: `check` checked the whole section. A range that cuts a
+                // character (a writer's bug: the writer stores whole strings) is refused by name.
+                strings.get(at..end).ok_or(ItemsRecordError::Utf8 { what, at })
+            }
+            StringsMode::Lazy(bytes) => {
+                let Some(slice) = at.checked_add(len).and_then(|end| bytes.get(at..end)) else {
+                    return Err(ItemsRecordError::Short { what, at });
+                };
+                core::str::from_utf8(slice).map_err(|e| ItemsRecordError::Utf8 { what, at: at.saturating_add(e.valid_up_to()) })
+            }
+        }
     }
 
     /// Row `i` of table `t`: its offset in the bytes. `i` is below the table's count.

@@ -643,3 +643,57 @@ fn out_of_block_order_loans_replay_without_id_mismatch() {
     let out = crate::elaborate(v, &NoDrops, a).expect("elaborate out-of-order loans");
     verify(&out).expect("elaborated body verifies");
 }
+
+/// A non-`Copy` local conditionally moved before `StmtKind::Suspend` gets one drop flag checked on
+/// BOTH the `cancel` path (ending in `StmtKind::Cancelled`) and the `resume` path (ending in
+/// `StmtKind::Return`), with zero double-drops and zero leaked drops.
+#[test]
+fn coroutine_suspend_elaborates_cancel_and_resume_drop_flags() {
+    let text = "\
+local _0: t0 return mut
+local _1: t1 arg 0
+local _2: t2 binding pat0 mut
+local _3: t2 temp e0 value
+const c0 = scalar 0x0: t0
+const c1 = scalar 0x1: t2
+bb0:
+  live _2
+  _2 = const c1
+  switch copy _1 [0 -> bb2] else bb1
+bb1:
+  _3 = move _2
+  goto bb2
+bb2:
+  suspend resume bb3 cancel bb4
+bb3:
+  drop _2 then bb5 unwind continue
+bb5:
+  dead _2
+  _0 = const c0
+  return
+bb4:
+  drop _2 then bb6 unwind continue
+bb6:
+  dead _2
+  cancelled
+";
+    struct MaybeOnDrops;
+    impl DropFacts for MaybeOnDrops {
+        fn at(&self, _: Stmt) -> DropState<'_> {
+            DropState::Maybe
+        }
+        fn needs_drop(&self, ty: PTy) -> NeedsDrop {
+            if ty == PTy(2) { NeedsDrop::Yes } else { NeedsDrop::No }
+        }
+        fn bool_ty(&self) -> PTy {
+            PTy(1)
+        }
+    }
+    let out = try_run(text, &MaybeOnDrops, Plant::None).expect("elaborates coroutine drops");
+    verify(&out).expect("elaborated coroutine body verifies");
+    let printed = print(&out);
+    assert!(printed.contains("suspend resume"), "suspend preserved:\n{printed}");
+    assert!(printed.contains("cancelled"), "cancelled preserved:\n{printed}");
+    assert!(printed.contains("flag _2"), "drop flag created for _2:\n{printed}");
+    assert_eq!(first_bad_drop(&out), None, "zero double-drops or leaked drops on both resume and cancel:\n{printed}");
+}

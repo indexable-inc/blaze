@@ -317,7 +317,7 @@ impl Maps {
             const_proofs: None,
             anon_asked: core::cell::RefCell::new(blaze_own::Vec::new_in(alloc)),
             anon_failed: HashMap::new_in(alloc),
-            qpaths: Default::default(),
+            qpaths: core::cell::RefCell::new(super::const_qpath::Table::new_in(alloc)),
             inherents: core::cell::RefCell::new(super::const_inherent::Table::new_in(alloc)),
             const_params: Rows::new_in(alloc),
             fieldless_enums: Rows::new_in(alloc),
@@ -394,6 +394,44 @@ impl Maps {
         assoc_lifetimes.clear();
         opaque_lifetimes.clear();
         record_field_names.clear();
+    }
+
+    /// Rebinds every per-body scratch map/vec on [`Maps`] to `work` before checking a body over a
+    /// stretch-reused [`Store`], leaving persistent head tables in `self.alloc`.
+    fn begin_body_reuse(&mut self, work: Alloc<'static>) {
+        self.const_lens = HashMap::new_in(work);
+        self.const_bits = HashMap::new_in(work);
+        self.const_text_reads = None;
+        self.const_proofs = None;
+        *self.anon_asked.get_mut() = blaze_own::Vec::new_in(work);
+        self.anon_failed = HashMap::new_in(work);
+        *self.qpaths.get_mut() = super::const_qpath::Table::new_in(work);
+        *self.inherents.get_mut() = super::const_inherent::Table::new_in(work);
+        self.written_depth.set(0);
+        self.evaluating.set(0);
+    }
+
+    /// Checks whether any per-body constant/anonymous state tainted the stretch store, then swaps
+    /// every per-body field back to a zero-capacity shell in `heads_alloc` so zero bytes of the
+    /// stretch heads frame are spent on per-body fields and no pointer into `work` survives reset.
+    fn end_body_reuse(&mut self, heads_alloc: Alloc<'static>) -> bool {
+        let tainted = !self.anon_asked.get_mut().is_empty()
+            || !self.const_bits.is_empty()
+            || !self.const_lens.is_empty()
+            || !self.anon_failed.is_empty()
+            || !self.qpaths.get_mut().is_empty()
+            || !self.inherents.get_mut().is_empty();
+        self.const_lens = HashMap::new_in(heads_alloc);
+        self.const_bits = HashMap::new_in(heads_alloc);
+        self.const_text_reads = None;
+        self.const_proofs = None;
+        *self.anon_asked.get_mut() = blaze_own::Vec::new_in(heads_alloc);
+        self.anon_failed = HashMap::new_in(heads_alloc);
+        *self.qpaths.get_mut() = super::const_qpath::Table::new_in(heads_alloc);
+        *self.inherents.get_mut() = super::const_inherent::Table::new_in(heads_alloc);
+        self.written_depth.set(0);
+        self.evaluating.set(0);
+        tainted
     }
 }
 
@@ -2096,7 +2134,9 @@ struct FnSig<'s> {
     container: Option<&'s ContainerRegions>,
     /// How many fragments on the sink are inputs (the one after them is the return type's).
     inputs_laid: usize,
-    /// Input 0 is `&self`, `&mut self` or `self: &Self` (elision's receiver rule).
+    /// Input 0 is a `self` receiver whose wrapper chain around `Self` contains exactly one
+    /// reference (`&self`, `&mut self`, `self: &Self`, `self: &Arc<Self>`, `self: Pin<&mut Self>`,
+    /// ...: elision's receiver rule).
     receiver: bool,
     /// A fn (a constant's or static's type elides to `'static`).
     item_fn: bool,
@@ -2166,6 +2206,47 @@ impl FnSig<'_> {
             Used::None | Used::Many => Err(RegionRefusal::not_laid(NotLaidWhy::OpaqueElided, self.whole)),
         }
     }
+}
+
+/// Whether a `self` parameter's type `ty` wraps `self_ty` in a pointer/reference chain containing
+/// **exactly one** `&` / `&mut` (and only zero-lifetime wrapper ADTs like `Box`, `Rc`, `Arc`,
+/// `Pin` before that reference), so rustc's receiver lifetime elision rule applies (the Reference,
+/// "Lifetime elision in functions"; RFC 2394): `&self`, `&mut self`, `self: &Self`,
+/// `self: &Arc<Self>`, `self: Pin<&mut Self>`, `self: Box<&Self>`, `self: Pin<&Arc<Self>>`,
+/// `self: &Arc<S<'a>>`, etc.
+///
+/// Rejects zero references (`self`, `self: Box<Self>`, `self: Arc<S<'a>>`,
+/// `impl Tr for &T { fn f(self, ...) }`) and two or more references (`self: &'a &'b Self`,
+/// `self: &mut Pin<&mut Self>`). Because every wrapper ADT peeled before the reference has 0
+/// lifetime parameters, slot 0 of input 0's region fragment is guaranteed to be that single
+/// reference's lifetime.
+fn receiver_has_single_ref(tys: tc::PTys<'_>, mut ty: PTy, self_ty: PTy, arity: &dyn tc::regions::Arity) -> bool {
+    const MAX_DEPTH: usize = 16;
+    let mut refs = 0u32;
+    for _ in 0..MAX_DEPTH {
+        if ty == self_ty {
+            return refs == 1;
+        }
+        match tys.node(ty) {
+            Ok(PNode::Ref(_, inner)) => {
+                refs += 1;
+                if refs > 1 {
+                    return false;
+                }
+                ty = inner;
+            }
+            Ok(PNode::Adt(adt, args)) => {
+                if refs == 0 && !matches!(arity.adt_lifetimes(adt), tc::regions::Count::Known(0)) {
+                    return false;
+                }
+                let Ok(list) = tys.list(args) else { return false };
+                let Some(&first) = list.first() else { return false };
+                ty = first;
+            }
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// E0106, the one place it is the PROGRAM's error (a hard [`Why::Program`], the head refused):
@@ -2406,6 +2487,10 @@ pub struct PendingConstHolds {
 
 pub struct Store<'n> {
     pub tys: PortableTys<'static>,
+    /// Per-body scratch allocator (`BODY_SCRATCH` during stretch reuse; equal to `tys.alloc()`
+    /// otherwise). Persistent head rows always allocate in `tys.alloc()`; per-body temporary
+    /// worklists, lowerings, and checker arenas allocate in `work_alloc()`.
+    work: Alloc<'static>,
     pub maps: Maps,
     /// Evaluated `where const { COND }` condition answers, keyed by `(cond_item, ground_args_digest)`.
     pub where_const_answers: Rows<(ItemKey, u64), tc::ConstHolds>,
@@ -2577,6 +2662,9 @@ pub struct Store<'n> {
     /// True during the pre-unroll `inline for` probe check (allows downstream diagnostics that
     /// depend on the unexpanded loop body and skips filing `inferred_outputs`).
     pub(crate) inline_for_probe: bool,
+    /// True if `inline_for` unrolling or specialization ran during the current body check
+    /// (taints a stretch-reused store so synthetic heads never leak across bodies).
+    pub(crate) inline_for_ran: bool,
     /// How a trait's members' needs are met: the seam the cost test proves equal.
     pub needs: NeedsMet,
     /// A body task's frozen heads (front2 tables/seeds.rs): with one, every head
@@ -2942,7 +3030,36 @@ fn members<'n, S: super::source::NamesSource<'n>>(names: S, key: LibKey, alloc: 
     Ok(out)
 }
 
+/// Counts of persistent head tables captured at the start of a body check over a stretch-reused
+/// [`Store`], used by [`Store::end_body_reuse`] to detect whether any body-local lowering added
+/// rows outside the surgically cleaned fn/static/pred tables.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ReuseSnapshot {
+    opaques: usize,
+    adts: usize,
+    impls: usize,
+    trait_defs: usize,
+    aliases: usize,
+    trait_aliases: usize,
+}
+
+/// Whether a stretch-reused [`Store`] remains clean after checking a body or must be dropped and
+/// its heads frame reset before the next body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReuseStatus {
+    Clean,
+    Tainted,
+}
+
 impl<'n> Store<'n> {
+    /// Per-body scratch allocator (`BODY_SCRATCH` during stretch reuse; equal to `tys.alloc()`
+    /// for standalone stores). Use for temporary worklists, lowerings, and checker arenas; keep
+    /// persistent head-table rows on `self.tys.alloc()`.
+    #[inline]
+    pub fn work_alloc(&self) -> Alloc<'static> {
+        self.work
+    }
+
     /// An empty store; `sized` is the program's `#[lang = "sized"]` trait (none in a
     /// `no_core` rung that declares none).
     /// `frame` is the command's ([`super::Front2::frame`]), where bodies' local items are kept.
@@ -2955,6 +3072,7 @@ impl<'n> Store<'n> {
                 // `new_stable` refuses only columns that already hold rows; these are new.
                 Err(error) => panic!("the heads store's type table over fresh columns was refused: {error:?}"),
             },
+            work: alloc,
             maps: Maps::new_in(alloc),
             where_const_answers: Rows::new_in(alloc),
             where_const_pending: core::cell::RefCell::new(blaze_own::Vec::new_in(alloc)),
@@ -3009,6 +3127,7 @@ impl<'n> Store<'n> {
             inferred_output_wanted: None,
             inferred_output_cycle: None,
             inline_for_probe: false,
+            inline_for_ran: false,
             seeds: None,
             seed_error: None,
             // `First` until `All` is proven on clap-root: under `All`, clap's `Cmd` was refused
@@ -3029,8 +3148,10 @@ impl<'n> Store<'n> {
     /// backing allocations (the `Box<Store>`, `PortableTys` columns/index, `Rows` first segments
     /// and index maps) so repeated per-cell freezes avoid re-allocating them.
     pub fn reset(&mut self, sized: Option<LibKey>, pointers: super::receiver::Pointers) {
+        let heads_alloc = self.tys.alloc();
         let Store {
             tys,
+            work,
             maps,
             where_const_answers,
             where_const_pending,
@@ -3085,6 +3206,7 @@ impl<'n> Store<'n> {
             inferred_output_wanted,
             inferred_output_cycle,
             inline_for_probe,
+            inline_for_ran,
             needs,
             seeds,
             seed_error,
@@ -3094,6 +3216,7 @@ impl<'n> Store<'n> {
             asked,
             gate,
         } = self;
+        *work = heads_alloc;
         tys.clear();
         maps.clear();
         where_const_answers.clear();
@@ -3149,6 +3272,7 @@ impl<'n> Store<'n> {
         *inferred_output_wanted = None;
         *inferred_output_cycle = None;
         *inline_for_probe = false;
+        *inline_for_ran = false;
         *needs = NeedsMet::First;
         *seeds = None;
         *seed_error = None;
@@ -3157,6 +3281,132 @@ impl<'n> Store<'n> {
         *asks = super::asks::Asks::Again;
         *asked.get_mut() = blaze_ask::Counts::default();
         *gate.get_mut() = super::asks::Gate::Off;
+    }
+
+    /// Rebinds every per-body field on [`Store`], [`Maps`], and [`Keys`] to `work` (the body's
+    /// resettable scratch frame) before checking a body over a stretch-reused store, leaving
+    /// persistent head tables in `self.tys.alloc()`.
+    pub(super) fn begin_body_reuse(&mut self, work: Alloc<'static>, keys: &mut Keys) -> ReuseSnapshot {
+        let snapshot = ReuseSnapshot {
+            opaques: self.opaques.len(),
+            adts: self.adts.len(),
+            impls: self.impls.len(),
+            trait_defs: self.trait_defs.len(),
+            aliases: self.maps.aliases.len(),
+            trait_aliases: self.maps.trait_aliases.len(),
+        };
+        self.work = work;
+        self.maps.begin_body_reuse(work);
+        keys.begin_body_reuse(work);
+        self.where_const_answers = Rows::new_in(work);
+        *self.where_const_pending.get_mut() = blaze_own::Vec::new_in(work);
+        self.auto_copy_pub = Rows::new_in(work);
+        self.provisional_impls = Rows::new_in(work);
+        *self.provisional_used.get_mut() = blaze_own::Vec::new_in(work);
+        *self.active_consts.get_mut() = blaze_own::Vec::new_in(work);
+        self.from_trait.set(None);
+        self.alloc_shims.set([None; 6]);
+        self.const_waits = Rows::new_in(work);
+        self.hidden = super::opaque_auto::HiddenTable::new_in(work);
+        self.locals.clear();
+        self.anon_marks.clear();
+        self.reads = super::body_reads::Digests::new_in(work);
+        self.closures = super::foreign_closures::ClosureRows::new_in(work);
+        self.cost = None;
+        self.goals = None;
+        self.goal_hits = blaze_own::Vec::new_in(work);
+        self.trace = None;
+        self.traced = None;
+        self.more_needs = blaze_own::Vec::new_in(work);
+        self.inferred_outputs = HashMap::new_in(work);
+        self.inferring_output_stack = blaze_own::Vec::new_in(work);
+        self.inferred_output_wanted = None;
+        self.inferred_output_cycle = None;
+        self.inline_for_probe = false;
+        self.inline_for_ran = false;
+        self.sources = None;
+        self.seeds = None;
+        self.seed_error = None;
+        self.lowered = 0;
+        self.imported.set(0);
+        self.asks = super::asks::Asks::Again;
+        *self.asked.get_mut() = blaze_ask::Counts::default();
+        *self.gate.get_mut() = super::asks::Gate::Off;
+        snapshot
+    }
+
+    /// Inspects hard-taint conditions, surgically removes body-local keys filed during the body
+    /// check, and swaps every per-body field back to a zero-capacity shell in `self.tys.alloc()`
+    /// so zero bytes of `HEADS_STRETCH_FRAME` are spent on per-body fields and zero pointers into
+    /// `work` survive `scratch.reset()`.
+    pub(super) fn end_body_reuse(&mut self, snapshot: ReuseSnapshot, keys: &mut Keys) -> ReuseStatus {
+        let heads_alloc = self.tys.alloc();
+        let lowered_non_fn = self.lowered > 0
+            && (self.seeds.is_none()
+                || self.opaques.len() != snapshot.opaques
+                || self.adts.len() != snapshot.adts
+                || self.impls.len() != snapshot.impls
+                || self.trait_defs.len() != snapshot.trait_defs
+                || self.maps.aliases.len() != snapshot.aliases
+                || self.maps.trait_aliases.len() != snapshot.trait_aliases);
+        let maps_tainted = self.maps.end_body_reuse(heads_alloc);
+        let tainted = maps_tainted
+            || self.seed_error.is_some()
+            || !self.anon_marks.is_empty()
+            || !self.where_const_answers.is_empty()
+            || !self.where_const_pending.get_mut().is_empty()
+            || !self.provisional_impls.is_empty()
+            || !self.const_waits.is_empty()
+            || self.inline_for_ran
+            || lowered_non_fn;
+        for ck in keys.local_keys() {
+            self.fns.remove(&ck);
+            self.fn_gaps.remove(&ck);
+            self.statics.remove(&ck);
+            self.preds.remove(&ck);
+            self.type_misses.remove(&ck);
+            self.region_gaps.remove(&ck);
+            if let Some(super::keys::Origin::Item(lib)) = keys.origin(ck) {
+                self.maps.const_params.remove(lib);
+            }
+        }
+        keys.end_body_reuse(heads_alloc);
+        self.where_const_answers = Rows::new_in(heads_alloc);
+        *self.where_const_pending.get_mut() = blaze_own::Vec::new_in(heads_alloc);
+        self.auto_copy_pub = Rows::new_in(heads_alloc);
+        self.provisional_impls = Rows::new_in(heads_alloc);
+        *self.provisional_used.get_mut() = blaze_own::Vec::new_in(heads_alloc);
+        *self.active_consts.get_mut() = blaze_own::Vec::new_in(heads_alloc);
+        self.from_trait.set(None);
+        self.alloc_shims.set([None; 6]);
+        self.const_waits = Rows::new_in(heads_alloc);
+        self.hidden = super::opaque_auto::HiddenTable::new_in(heads_alloc);
+        self.locals.clear();
+        self.anon_marks.clear();
+        self.reads = super::body_reads::Digests::new_in(heads_alloc);
+        self.closures = super::foreign_closures::ClosureRows::new_in(heads_alloc);
+        self.cost = None;
+        self.goals = None;
+        self.goal_hits = blaze_own::Vec::new_in(heads_alloc);
+        self.trace = None;
+        self.traced = None;
+        self.more_needs = blaze_own::Vec::new_in(heads_alloc);
+        self.inferred_outputs = HashMap::new_in(heads_alloc);
+        self.inferring_output_stack = blaze_own::Vec::new_in(heads_alloc);
+        self.inferred_output_wanted = None;
+        self.inferred_output_cycle = None;
+        self.inline_for_probe = false;
+        self.inline_for_ran = false;
+        self.sources = None;
+        self.seeds = None;
+        self.seed_error = None;
+        self.lowered = 0;
+        self.imported.set(0);
+        self.asks = super::asks::Asks::Again;
+        *self.asked.get_mut() = blaze_ask::Counts::default();
+        *self.gate.get_mut() = super::asks::Gate::Off;
+        self.work = heads_alloc;
+        if tainted { ReuseStatus::Tainted } else { ReuseStatus::Clean }
     }
 
     /// The frame impl `ck`'s member fns are made in, kept when its head was made (head
@@ -3422,7 +3672,7 @@ impl<'n> Store<'n> {
                     return false;
                 }
                 let Some(text) = names.signature_text_of(lib) else { return false };
-                let Ok(low) = lower_alloc(names, lib, text.text, self.tys.alloc()) else { return false };
+                let Ok(low) = lower_alloc(names, lib, text.text, self.work_alloc()) else { return false };
                 let view = low.view();
                 is_auto_copy_pub_view(names, lib, lib, tc::AdtKind::Struct, &view).is_ok_and(|x| x)
             });
@@ -3465,14 +3715,14 @@ impl<'n> Store<'n> {
         if self.inferred_outputs.contains_key(&key) {
             return false;
         }
-        self.fns.get(&key).is_some_and(|f| has_infer_hole(self.tys.view(), f.output, self.tys.alloc()))
+        self.fns.get(&key).is_some_and(|f| has_infer_hole(self.tys.view(), f.output, self.work_alloc()))
     }
 
     /// Copies a checked body's finalized return type `root` from `from` into `self.tys` and
     /// records it under `owner` in `self.inferred_outputs`. Returns `None` if `root` cannot be
     /// copied cleanly (unresolved hole/error type or full table).
     pub(crate) fn file_inferred_output(&mut self, owner: ItemKey, from: tc::PTys<'_>, root: PTy) -> Option<PTy> {
-        let alloc = self.tys.alloc();
+        let alloc = self.work_alloc();
         let n = from.len();
         let mut seen: blaze_own::Vec<bool, Alloc<'static>> = blaze_own::Vec::with_capacity_in(n, alloc);
         seen.resize(n, false);
@@ -3631,7 +3881,7 @@ impl<'n> Store<'n> {
         };
         // Seeded: the asked want first (`ensure_seeded` seeds only what a step needs), then
         // every need its steps meet. Its record files it whole; the steps below find it made.
-        let scratch = self.tys.alloc();
+        let scratch = self.work_alloc();
         let mut failed = None;
         let made = {
             let mut seed = |store: &mut Store<'n>, keys: &mut Keys, need: Want| {
@@ -3663,7 +3913,7 @@ impl<'n> Store<'n> {
         noted: &mut dyn FnMut(Want),
         seed: &mut dyn FnMut(&mut Store<'n>, &mut Keys, Want) -> Result<Seeded, SeedFailed>,
     ) -> Result<(), HeadError> {
-        let mut stack: blaze_own::Vec<HeadFrame<'n>, Alloc<'static>> = blaze_own::Vec::new_in(self.tys.alloc());
+        let mut stack: blaze_own::Vec<HeadFrame<'n>, Alloc<'static>> = blaze_own::Vec::new_in(self.work_alloc());
         stack.push(HeadFrame::new(want));
         self.ensure_seeded_in(names, keys, &mut stack, noted, seed)
     }
@@ -3692,7 +3942,8 @@ impl<'n> Store<'n> {
                 (top, self.step(names, keys, top, frame.supers_only, &mut frame.lowered)?)
             };
             super::tables::cost::Cost::step_end(self.cost, stepped, matches!(step, Step::Need(_)));
-            let more = core::mem::replace(&mut self.more_needs, blaze_own::Vec::new_in(self.tys.alloc()));
+            let work = self.work_alloc();
+            let more = core::mem::replace(&mut self.more_needs, blaze_own::Vec::new_in(work));
             let (need, need_supers) = match step {
                 Step::Done => {
                     just_made = stack.pop().map(|f| (f.want, f.supers_only));
@@ -3760,7 +4011,7 @@ impl<'n> Store<'n> {
                 (detail, it.text, it.module)
             }
         };
-        let low = lower_alloc(names, key, text, self.tys.alloc())?;
+        let low = lower_alloc(names, key, text, self.work_alloc())?;
         Ok(lowered.insert(FrameLowering { detail, text, module, low }))
     }
 
@@ -4612,7 +4863,7 @@ impl<'n> Store<'n> {
                     ItemDetail::Const { .. } => DynMember::Const,
                     d => return Err(Why::Unsupported(crate::front::detail_name(d), whole)),
                 };
-                let shape = super::dyn_ty::member(&b.resolver, module, self.sized, &self.pointers, kind, mv)?;
+                let shape = super::dyn_ty::member(&b.resolver, module, self.sized, &self.pointers, b.marks, self.work_alloc(), kind, mv)?;
                 members.push(tc::dyn_compat::MemberFacts { name: Name::of(m.name), shape });
                 Ok(())
             })
@@ -5443,7 +5694,7 @@ impl<'n> Store<'n> {
         if self.provisional_impls.is_empty() {
             return false;
         }
-        let mut drop_keys: blaze_own::Vec<ItemKey, Alloc<'static>> = blaze_own::Vec::new_in(self.tys.alloc());
+        let mut drop_keys: blaze_own::Vec<ItemKey, Alloc<'static>> = blaze_own::Vec::new_in(self.work_alloc());
         for (&ck, p) in self.provisional_impls.iter() {
             if p.waiting_const == need {
                 drop_keys.push(ck);
@@ -5461,7 +5712,7 @@ impl<'n> Store<'n> {
         if self.provisional_impls.is_empty() {
             return false;
         }
-        let mut drop_keys: blaze_own::Vec<ItemKey, Alloc<'static>> = blaze_own::Vec::new_in(self.tys.alloc());
+        let mut drop_keys: blaze_own::Vec<ItemKey, Alloc<'static>> = blaze_own::Vec::new_in(self.work_alloc());
         for (&ck, _) in self.provisional_impls.iter() {
             drop_keys.push(ck);
         }
@@ -5852,7 +6103,7 @@ impl<'n> Store<'n> {
     /// is that constant's own gap (`fn_gaps`), by why, never its impl's; one that waits on
     /// another leaf being evaluated waits on that one.
     pub(super) fn remake_waiting<S: NamesSource<'n>>(&mut self, names: S, need: LibKey) {
-        let mut due: blaze_own::Vec<(ItemKey, ConstWait), Alloc<'static>> = blaze_own::Vec::new_in(self.tys.alloc());
+        let mut due: blaze_own::Vec<(ItemKey, ConstWait), Alloc<'static>> = blaze_own::Vec::new_in(self.work_alloc());
         due.extend(self.const_waits.iter().filter(|(_, w)| w.need == need).map(|(k, w)| (*k, *w)));
         for (mk, w) in due {
             self.const_waits.remove(&mk);
@@ -6352,7 +6603,11 @@ impl<'n> Store<'n> {
         // How the signature elides (D148): numbered by `numbering`, the output rule over the
         // inputs' fragments. `fn_regions` below lays the signature by it, and a return opaque's
         // bounds take `'_` by it ([`FnSig::opaque_elided`]).
-        let receiver = self_param && matches!((inputs.first().map(|&t| self.tys.view().node(t)), self_ty), (Some(Ok(PNode::Ref(_, p))), Some(s)) if p == s);
+        let receiver = self_param
+            && matches!(
+                (inputs.first().copied(), self_ty),
+                (Some(t), Some(s)) if receiver_has_single_ref(self.tys.view(), t, s, &HeadsArity { heads: b.heads, opaques: &[], names: b.resolver.names })
+            );
         let sig = FnSig { numbering, own: &own_names, elided: &elided_ids, container: container_regions, inputs_laid, receiver, item_fn: matches!(detail, ItemDetail::Fn { .. }), is_async, whole };
         // A return opaque's scope: the fn's names, and `'_` (`-> impl Trait + '_`,
         // `-> impl Iterator<Item = &u8>`) by the output rule, or why it gives none (soft).
@@ -6879,6 +7134,52 @@ pub fn p(q: fn(&u8) -> &u8) {}
         assert!(refused.contains("E0106"), "ORACLE: `h`'s refusal names E0106: {refused}");
         let (sig, _) = sig_of("pub fn h(x: &u8) -> &u8 { x }\n", free("h")).unwrap_or_else(|e| panic!("CONTROL: one input refused: {e}"));
         assert_eq!(sig, [Region::Param(0), Region::Param(0)], "CONTROL: one input's lifetime is the output's");
+    }
+
+    /// Smart-pointer reference receivers (`self: &Arc<Self>`, `self: Pin<&mut Self>` — as in
+    /// `commonware-runtime`'s `Opens::open(self: &Arc<Self>, partition: &str, name: &[u8]) ->
+    /// Opened<'_>`) elide output lifetimes to that single receiver reference's lifetime (RFC 2394).
+    /// Controls: two references on the receiver spine (`self: &&Self`) or zero references
+    /// (`self: Box<Self>`) with multiple ref inputs MUST still report E0106.
+    #[test]
+    fn a_smart_pointer_ref_receiver_elides_output_to_self() {
+        const SRC: &str = "\
+pub struct Wrap<T>(T);
+pub struct Guard<'a>(&'a u8);
+pub struct Opens;
+impl Opens {
+    pub fn open_ref_wrap(self: &Wrap<Self>, a: &u8, b: &u8) -> Guard<'_> { loop {} }
+    pub fn open_wrap_ref(self: Wrap<&mut Self>, a: &u8, b: &u8) -> Guard<'_> { loop {} }
+    pub fn bad_double_ref(self: &&Self, a: &u8) -> Guard<'_> { loop {} }
+    pub fn bad_no_ref(self: Wrap<Self>, a: &u8, b: &u8) -> Guard<'_> { loop {} }
+}
+";
+        let method = |name: &'static str| {
+            move |names: crate::front2::tables::head_tests::Src| {
+                let mut found = None;
+                for w in cells(names).iter() {
+                    if let Want::MemberFn(lib, k) = *w
+                        && k == member_key_of(checker_of(lib), MemberKind::Fn, name)
+                    {
+                        found = Some((*w, k));
+                    }
+                }
+                found.unwrap_or_else(|| panic!("`Opens::{name}`'s cell"))
+            }
+        };
+        let (sig_rw, late_rw) = sig_of(SRC, method("open_ref_wrap")).unwrap_or_else(|e| panic!("`open_ref_wrap` refused: {e}"));
+        assert_eq!(sig_rw, [Region::Param(0), Region::Param(1), Region::Param(2), Region::Param(0)], "ORACLE: `&Wrap<Self>` elides output to receiver ref");
+        assert_eq!(late_rw, [true, true, true], "`open_ref_wrap` late-bound elided inputs");
+
+        let (sig_wr, late_wr) = sig_of(SRC, method("open_wrap_ref")).unwrap_or_else(|e| panic!("`open_wrap_ref` refused: {e}"));
+        assert_eq!(sig_wr, [Region::Param(0), Region::Param(1), Region::Param(2), Region::Param(0)], "ORACLE: `Wrap<&mut Self>` elides output to receiver ref");
+        assert_eq!(late_wr, [true, true, true], "`open_wrap_ref` late-bound elided inputs");
+
+        let err_double = sig_of(SRC, method("bad_double_ref")).expect_err("CONTROL: `&&Self` with extra ref input must be E0106");
+        assert!(err_double.contains("E0106"), "CONTROL: `&&Self` refusal names E0106: {err_double}");
+
+        let err_none = sig_of(SRC, method("bad_no_ref")).expect_err("CONTROL: `Wrap<Self>` with two ref inputs must be E0106");
+        assert!(err_none.contains("E0106"), "CONTROL: `Wrap<Self>` refusal names E0106: {err_none}");
     }
 
     /// A fn pointer argument `fn(&u8) -> &u8` binds its own lifetime: both slots are

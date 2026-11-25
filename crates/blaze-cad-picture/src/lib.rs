@@ -60,10 +60,12 @@ mod shade;
 #[cfg(test)]
 mod tests;
 
+pub use blaze_pbr::{Cc0PackView, DenoiseOpts, EnvironmentPreset, GBufferPixel, SmartMaterial, SurfaceMasks, TextureView, ToneMap};
 pub use compare::{PANEL_BORDER_PX, PictureDiff, compose_grid, compose_side_by_side, diff_pictures};
 pub use mesh::{
-    HighlightStyle, MaterialMaps, MeshHighlight, MeshNormalSource, MeshPictureOpts, MeshPicturePlant, MeshScenePart, TextureMap,
-    Wireframe, render_mesh, render_mesh_scene, render_mesh_scene_planted,
+    HighlightStyle, MaterialLook, MaterialMaps, MeshHighlight, MeshNormalSource, MeshPictureOpts, MeshPicturePlant,
+    MeshScenePart, PbrRenderParams, PreparedMeshScene, PreparedMeshSceneRef, TextureMap, Wireframe, finish_pbr_frame,
+    render_mesh, render_mesh_scene, render_mesh_scene_planted,
 };
 
 use blaze_cad_field::{Lanes, Points, Scratch, Tape, eval_box, eval_grad, eval_point, eval_points, simplify};
@@ -275,6 +277,111 @@ impl Default for ZebraOpts {
     }
 }
 
+/// Settings for [`Shading::Pbr`]: physical Cook-Torrance GGX + HDRI IBL + Heitz VNDF rough
+/// reflections + 1-bounce BVH hemisphere GI + emissive NEE + thin-lens DoF + À-Trous denoising +
+/// dual-radius HDR bloom + AgX/ACES tone mapping.
+#[blaze::args]
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct PbrOpts {
+    pub environment: EnvironmentPreset = EnvironmentPreset::StudioSoftbox,
+    pub tonemap: ToneMap = ToneMap::AgXPunchy,
+    pub exposure: f64 = 1.0,
+    pub direct_intensity: f64 = 1.0,
+    pub ibl_intensity: f64 = 1.0,
+    pub ao_strength: f64 = 0.72,
+    pub ao_steps: u8 = 8,
+    pub shadow_samples: u8 = 6,
+    pub reflection_bounces: u8 = 1,
+    pub instance_wear: f64 = 1.0,
+    pub ground_plane: bool = true,
+    pub ground_colour: [f64; 3] = [0.24, 0.25, 0.27],
+    pub env_background: bool = true,
+    pub bloom_threshold: f64 = 1.20,
+    pub bloom_strength: f64 = 0.20,
+    pub vignette: f64 = 0.10,
+    pub denoise: bool = true,
+    pub aperture_radius_mm: f64 = 0.0,
+    pub focus_distance_m: f64 = 0.0,
+    pub atmosphere_haze: f64 = 0.0,
+}
+
+impl PbrOpts {
+    pub const STUDIO: PbrOpts = PbrOpts {
+        environment: EnvironmentPreset::StudioSoftbox,
+        tonemap: ToneMap::AgXPunchy,
+        exposure: 1.0,
+        ibl_intensity: 1.0,
+        direct_intensity: 1.0,
+        ao_steps: 8,
+        ao_strength: 0.72,
+        shadow_samples: 6,
+        reflection_bounces: 1,
+        instance_wear: 1.0,
+        env_background: true,
+        ground_plane: true,
+        ground_colour: [0.24, 0.25, 0.27],
+        bloom_threshold: 1.20,
+        bloom_strength: 0.20,
+        vignette: 0.10,
+        denoise: true,
+        aperture_radius_mm: 0.0,
+        focus_distance_m: 0.0,
+        atmosphere_haze: 0.0,
+    };
+
+    pub const GOLDEN_HOUR: PbrOpts = PbrOpts {
+        environment: EnvironmentPreset::GoldenHour,
+        tonemap: ToneMap::AgXPunchy,
+        exposure: 0.94,
+        ibl_intensity: 1.0,
+        direct_intensity: 1.0,
+        ao_steps: 8,
+        ao_strength: 0.75,
+        shadow_samples: 6,
+        reflection_bounces: 1,
+        instance_wear: 1.0,
+        env_background: true,
+        ground_plane: true,
+        ground_colour: [0.15, 0.14, 0.11],
+        bloom_threshold: 1.12,
+        bloom_strength: 0.24,
+        vignette: 0.12,
+        denoise: true,
+        aperture_radius_mm: 0.0,
+        focus_distance_m: 0.0,
+        atmosphere_haze: 0.006,
+    };
+
+    pub const HANGAR: PbrOpts = PbrOpts {
+        environment: EnvironmentPreset::HangarBay,
+        tonemap: ToneMap::AgXPunchy,
+        exposure: 1.08,
+        ibl_intensity: 1.0,
+        direct_intensity: 1.0,
+        ao_steps: 8,
+        ao_strength: 0.78,
+        shadow_samples: 6,
+        reflection_bounces: 1,
+        instance_wear: 1.0,
+        env_background: true,
+        ground_plane: true,
+        ground_colour: [0.09, 0.10, 0.12],
+        bloom_threshold: 1.08,
+        bloom_strength: 0.28,
+        vignette: 0.15,
+        denoise: true,
+        aperture_radius_mm: 0.0,
+        focus_distance_m: 0.0,
+        atmosphere_haze: 0.0,
+    };
+}
+
+impl Default for PbrOpts {
+    fn default() -> PbrOpts {
+        PbrOpts::STUDIO
+    }
+}
+
 /// How lit surfaces are shaded when [`RenderMode::Shaded`] is selected.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Shading {
@@ -283,6 +390,9 @@ pub enum Shading {
     /// Three-point CAD studio lighting with Blinn-Phong specular, hemisphere fill, Fresnel rim,
     /// SDF ambient occlusion, soft SDF shadows, and optional movable strip lights.
     Studio(StudioOpts),
+    /// Photoreal Cook-Torrance GGX + HDRI IBL + VNDF rough reflections + 1-bounce GI + NEE +
+    /// thin-lens DoF + À-Trous denoising + dual-radius HDR bloom + AgX/ACES tone mapping.
+    Pbr(PbrOpts),
 }
 
 /// What each hit pixel visualizes.

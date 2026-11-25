@@ -1005,22 +1005,6 @@ pub enum AwaitUnrelated {
     GenericUnaligned(Misfit),
 }
 
-impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c, F, A, R> {
-    /// Which row a call of `item`, whose head writes lifetimes, lacked to be related by its
-    /// signature (its [`Facts::sig`] read): the first of [`Facts::shape`],
-    /// [`Facts::call_bounds`] that is `None`, else [`CallLacks::Unaligned`] with why the last
-    /// instantiation tried at this call did not line up (`misfit`, reset at each try).
-    fn call_lacks(&self, item: ItemKey) -> CallLacks {
-        if self.facts.shape(item).is_none() {
-            CallLacks::Shape
-        } else if self.facts.call_bounds(item).is_none() {
-            CallLacks::Bounds
-        } else {
-            CallLacks::Unaligned(self.misfit)
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Refusal {
     pub form: Form,
@@ -1361,6 +1345,8 @@ enum Task {
     FieldDefaults(ExprId),
     IndexDone(ExprId, bool),
     FmtDone(ExprId, u32),
+    /// An `asm!` expression whose runtime operands have been evaluated onto `vals`.
+    AsmDone(ExprId, List, u16),
     LetInit(StmtId),
     /// An `.await`, its operand's value on the stack (coroutine.rs `await_done`).
     AwaitDone(ExprId),
@@ -1999,9 +1985,6 @@ struct Lower<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule = one_
     /// Per local: what it stands for (identity.rs): the one table of identities, emitted in
     /// `LoweredAsync::identity`.
     identity: Vec<Identity, A>,
-    /// Why the last `call_by_generic_signature` related nothing (generic_call.rs `Misfit`):
-    /// what a `CallWritesLifetimes { lacks: Unaligned(..) }` refusal says.
-    misfit: Misfit,
     /// Per `.await` being lowered, innermost last: `(operand, await)`, so the call that is the
     /// operand knows it is awaited (await_call.rs `awaited_shadow`).
     awaiting: Vec<(ExprId, ExprId), A>,
@@ -2117,7 +2100,6 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             field_places: Vec::new_in(alloc),
             points: Vec::new_in(alloc),
             identity: Vec::new_in(alloc),
-            misfit: Misfit::NotTried,
             awaiting: Vec::new_in(alloc),
             awaited: Vec::new_in(alloc),
             coarse: core::cell::Cell::new(None),
@@ -4006,16 +3988,6 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         }
     }
 
-    /// [`Self::sig_declared`] with the destination's child (`k == sig.inputs()`) the call's
-    /// `value` ([`CallValue`]): an awaited `async fn`'s written return type, laid over its own
-    /// column's type (the head records' table, as the signature's).
-    fn value_declared(&self, sig: SigLife<'_>, value: CallValue<'_>, k: u32, e: ExprId) -> Result<PTy, Refusal> {
-        match value {
-            CallValue::Awaited { ty, .. } if k == sig.inputs() => Ok(ty),
-            _ => self.sig_declared(sig, k, e),
-        }
-    }
-
     /// A declared type of a head record's column, read in the columns' table
     /// ([`Facts::region_tys`]; the checked record's when the facts give none). Never a type of
     /// the body's: its `PTy`s number another table.
@@ -4655,61 +4627,12 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
 
     /// Relates a call's operands and destination through the callee's lifetime part, at the
     /// call statement just added: each operand's positions flow into the regions of its
-    /// parameter, the output's regions into the destination's positions (the first position of
-    /// a reference one way, every other both ways, as [`Self::relate`] does); the declared
-    /// bounds and the bounds implied by the parameter and output types hold among the regions.
-    /// `false`, relating nothing, when the positions do not line up one for one or a region is
-    /// hidden: the caller takes its older, coarser path.
-    /// `tie`: the callee and its type arguments, whose trait lifetimes are tied to the caller's
-    /// regions (trait_ties.rs); `None` for a value callee.
-    fn call_by_signature(&mut self, life: SigLife<'_>, tie: Option<(ItemKey, List)>, vs: &[Val], dest: Place, dest_ty: TyD, e: ExprId) -> Result<bool, Refusal> {
-        self.call_by_signature_to(life, CallValue::Returned, tie, vs, dest, dest_ty, e)
-    }
-
-    /// [`Self::call_by_signature`] with the destination holding the call's `value`
-    /// ([`CallValue`]): the call's own output, or what an `.await` of an `async fn`'s call
-    /// yields (await_call.rs `relate_awaited`), the written return type's column taking the
-    /// output's place.
-    #[expect(clippy::too_many_arguments, reason = "call_by_signature's inputs and the value")]
-    fn call_by_signature_to<'s>(&mut self, life: SigLife<'s>, value: CallValue<'s>, tie: Option<(ItemKey, List)>, vs: &[Val], dest: Place, dest_ty: TyD, e: ExprId) -> Result<bool, Refusal> {
-        // The column's positions, laid as the flow lays the call's: each input's then the
-        // output's, one region per position (`regions`), input `i`'s ending at `ends[i]`. A
-        // child the flow does not lay as the column does (`lay_positions`: an opaque type or a
-        // projection, two subtrees it does not descend into) is related per call or refused by
-        // the caller, never here by a guess.
-        if !life.well_formed() || life.inputs() as usize != vs.len() {
-            return Ok(false);
-        }
-        let mut regions: Vec<Region, A> = Vec::new_in(self.alloc);
-        let mut ends: Vec<u32, A> = Vec::new_in(self.alloc);
-        let mut laid: Vec<Option<Region>, A> = Vec::new_in(self.alloc);
-        for k in 0..=life.inputs() {
-            let slots = if k < life.inputs() { life.input(k) } else { life.value(value) };
-            let Some(slots) = slots else { return Ok(false) };
-            let declared = self.value_declared(life, value, k, e)?;
-            if !self.lay_positions(declared, slots, &mut laid, e)? {
-                return Ok(false);
-            }
-            for &r in laid.iter() {
-                let Some(r) = r else { return Ok(false) };
-                regions.push(r);
-            }
-            if k < life.inputs() {
-                ends.push(regions.len() as u32);
-            }
-        }
-        let tie = tie.map(|(item, g)| (item, g, life));
-        self.call_laid(Laid { regions: &regions, ends: &ends, bounds: life.bounds() }, tie, &[], vs, dest, dest_ty, e)
-    }
-
     /// Relates a call through a signature already laid as the flow's positions ([`Laid`]),
     /// with some of the callee's regions already the caller's origins (`seed`): a call through
-    /// a fn-pointer parameter, whose free regions are that parameter's own positions
+    /// a fn-pointer or callable value, whose free regions are that value's own positions
     /// (`call_through_value`); every other `Param` and each `Late` is one fresh origin a call
-    /// ([`Lower::instance`]), `'static` the body's. `tie`: the callee, its type arguments and
-    /// its signature, for its trait lifetimes (trait_ties.rs).
-    #[expect(clippy::too_many_arguments, reason = "call_by_signature's inputs and the seed")]
-    fn call_laid(&mut self, laid: Laid<'_>, tie: Option<(ItemKey, List, SigLife<'_>)>, seed: &[(Region, Origin)], vs: &[Val], dest: Place, dest_ty: TyD, e: ExprId) -> Result<bool, Refusal> {
+    /// ([`Lower::instance`]), `'static` the body's.
+    fn call_laid(&mut self, laid: Laid<'_>, seed: &[(Region, Origin)], vs: &[Val], dest: Place, dest_ty: TyD, e: ExprId) -> Result<bool, Refusal> {
         let Laid { regions, ends, bounds } = laid;
         if ends.len() != vs.len() {
             return Ok(false);
@@ -4742,14 +4665,6 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         let out_at = lo;
         let mut inst: Vec<(Region, Origin), A> = Vec::new_in(self.alloc);
         inst.extend_from_slice(seed);
-        if let Some((item, g, life)) = tie {
-            let args: &'c [PTy] = self.list(g, e)?;
-            let mut impl_ties = trait_ties::ImplTies::new_in(self.alloc);
-            self.tie_bounds(item, life, args, &mut inst, &mut impl_ties, e)?;
-            // No type argument here holds a position (the caller's condition for this path),
-            // so an impl's answer names none: a row that does is malformed.
-            self.tie_impl_relations(&impl_ties, &mut inst, |_, _, _| None, e)?;
-        }
         let mut ranges: Vec<(u32, u32), A> = Vec::new_in(self.alloc);
         let mut vars: Vec<Variance, A> = Vec::new_in(self.alloc);
         lo = 0;
@@ -4819,26 +4734,6 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         for &(a, b) in bounds {
             let (oa, ob) = (self.instance(&mut inst, a), self.instance(&mut inst, b));
             self.b.subset(oa, ob);
-        }
-        Ok(true)
-    }
-
-    /// Whether every child of `life`'s column is laid by the flow as the column lays it with
-    /// no opaque or projection position ([`Lower::lay_positions`] all `Some`): a head that is
-    /// not holds a hidden position, related per call (hidden_call.rs) or refused, never by its
-    /// column read as positions.
-    fn sig_laid(&self, life: SigLife<'_>, e: ExprId) -> Result<bool, Refusal> {
-        if !life.well_formed() {
-            return Ok(false);
-        }
-        let mut laid: Vec<Option<Region>, A> = Vec::new_in(self.alloc);
-        for k in 0..=life.inputs() {
-            let slots = if k < life.inputs() { life.input(k) } else { life.output() };
-            let Some(slots) = slots else { return Ok(false) };
-            let declared = self.sig_declared(life, k, e)?;
-            if !self.lay_positions(declared, slots, &mut laid, e)? || laid.iter().any(Option::is_none) {
-                return Ok(false);
-            }
         }
         Ok(true)
     }
@@ -5170,6 +5065,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             Task::CtorDone(e, n) => self.aggregate(e, n, Agg::Ctor),
             Task::AggDone(e, n) => self.aggregate(e, n, Agg::Other),
             Task::FmtDone(e, n) => self.aggregate(e, n, Agg::Fmt),
+            Task::AsmDone(e, operands, options) => self.asm_done(e, operands, options),
             Task::OpDone(e) => self.aggregate(e, 1, Agg::Other),
             Task::BinDone(e, op) => self.bin_done(e, op),
             Task::AssignDone(e) => {
@@ -5826,7 +5722,35 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 self.tasks.push(Task::Eval(op, false));
             }
             Expr::Underscore => return self.refuse(Form::Malformed, e),
-            Expr::Asm { .. } => return self.refuse(Form::InlineAsm, e),
+            Expr::Asm { operands, options, .. } => {
+                let Some(ops) = body.asm_operands.get(operands.range()) else {
+                    return self.refuse(Form::Malformed, e);
+                };
+                if ops.iter().any(|o| o.kind == blaze_typeck::AsmKind::Label) {
+                    return self.refuse(Form::InlineAsm, e);
+                }
+                self.tasks.push(Task::AsmDone(e, operands, options));
+                for o in ops.iter().rev() {
+                    match (o.kind, o.out_expr) {
+                        (blaze_typeck::AsmKind::In, _) => self.tasks.push(Task::Eval(o.expr, false)),
+                        (blaze_typeck::AsmKind::Out | blaze_typeck::AsmKind::LateOut, _) => {
+                            if !matches!(self.expr(o.expr)?, Expr::Underscore) {
+                                self.tasks.push(Task::Eval(o.expr, true));
+                            }
+                        }
+                        (blaze_typeck::AsmKind::InOut | blaze_typeck::AsmKind::InLateOut, Some(out)) => {
+                            if !matches!(self.expr(out)?, Expr::Underscore) {
+                                self.tasks.push(Task::Eval(out, true));
+                            }
+                            self.tasks.push(Task::Eval(o.expr, false));
+                        }
+                        (blaze_typeck::AsmKind::InOut | blaze_typeck::AsmKind::InLateOut, None) => {
+                            self.tasks.push(Task::Eval(o.expr, true));
+                        }
+                        (blaze_typeck::AsmKind::Sym | blaze_typeck::AsmKind::Const | blaze_typeck::AsmKind::Label, _) => {}
+                    }
+                }
+            }
             Expr::FormatArgs { args, .. } => {
                 let es = match body.expr_lists.get(args.range()) {
                     Some(a) => a,
@@ -6188,33 +6112,56 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
     /// standing for them, every position equal).
     fn unsize_to_object(&mut self, src: Place, from: TyD, dst: Place, to: TyD, e: ExprId) -> Result<UnsizeDone, Refusal> {
         let (s, d) = (self.info(src), self.info(dst));
-        if !s.exact || !d.exact || s.len == 0 || d.len < 2 {
+        if !s.exact || !d.exact {
             return Ok(UnsizeDone::Fallback);
         }
-        if !(from.wrap.is_some() || matches!(self.node(from.ty, e)?, PNode::Ref(..))) {
+        let facts: &'b F = self.facts;
+        // Peel either `&T -> &dyn ...` (`ref_skip = 1`) or `Box<T> -> Box<dyn ...>` (`ref_skip = 0`,
+        // with zero lifetimes on `Box` and zero slots on its allocator parameter).
+        let (ref_skip, from_inner, obj) = if from.wrap.is_some() || matches!(self.node(from.ty, e)?, PNode::Ref(..)) {
+            if s.len == 0 || d.len < 2 {
+                return Ok(UnsizeDone::Fallback);
+            }
+            let obj = match to.wrap {
+                Some(_) => to.ty,
+                None => match self.node(to.ty, e)? {
+                    PNode::Ref(_, i) => i,
+                    _ => return Ok(UnsizeDone::Fallback),
+                },
+            };
+            let from_inner = match from.wrap {
+                Some(_) => from.ty,
+                None => match self.node(from.ty, e)? {
+                    PNode::Ref(_, i) => i,
+                    _ => return Ok(UnsizeDone::Fallback),
+                },
+            };
+            (1u32, from_inner, obj)
+        } else if to.wrap.is_none()
+            && let (PNode::Adt(fk, fl), PNode::Adt(tk, tl)) = (self.node(from.ty, e)?, self.node(to.ty, e)?)
+            && fk == tk
+            && facts.adt(fk).is_some_and(|a| a.is_box && a.lifetimes == 0)
+        {
+            if d.len < 1 {
+                return Ok(UnsizeDone::Fallback);
+            }
+            let (flist, tlist) = (self.list(fl, e)?, self.list(tl, e)?);
+            let (Some(&fi), Some(&ti)) = (flist.first(), tlist.first()) else {
+                return Ok(UnsizeDone::Fallback);
+            };
+            if flist.len() != tlist.len() || flist[1..].iter().any(|&a| self.npos(a, e).unwrap_or(1) != 0) {
+                return Ok(UnsizeDone::Fallback);
+            }
+            (0u32, fi, ti)
+        } else {
             return Ok(UnsizeDone::Fallback);
-        }
-        let obj = match to.wrap {
-            Some(_) => to.ty,
-            None => match self.node(to.ty, e)? {
-                PNode::Ref(_, i) => i,
-                _ => return Ok(UnsizeDone::Fallback),
-            },
         };
         let PNode::Dynamic(preds) = self.node(obj, e)? else {
             return Ok(UnsizeDone::Fallback);
         };
-        let facts: &'b F = self.facts;
-        let from_inner = match from.wrap {
-            Some(_) => from.ty,
-            None => match self.node(from.ty, e)? {
-                PNode::Ref(_, i) => i,
-                _ => return Ok(UnsizeDone::Fallback),
-            },
-        };
         // Exact closure-to-`dyn Fn*(Args) -> Ret + 'q` unsizing (both HRTB and non-HRTB):
-        // `'r_src: 'r_dst`, every capture slot outlives `'q` (one-way), and every `dyn`
-        // `Fn*` / `FnOnce::Output` predicate slot equates with the closure's corresponding
+        // `'r_src: 'r_dst` (when `&`/`&mut`), every capture slot outlives `'q` (one-way), and every
+        // `dyn` `Fn*` / `FnOnce::Output` predicate slot equates with the closure's corresponding
         // signature slot (`SigSlot::Owner` / `SigSlot::Static`).
         if let PNode::Closure { owner, ordinal, .. } = self.node(from_inner, e)?
             && owner == self.body.owner
@@ -6223,12 +6170,12 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             let mut sig_slots: Vec<closure::SigSlot, A> = Vec::new_in(self.alloc);
             if self.sig_slots(ordinal as usize, ce, &mut sig_slots).is_ok() {
                 let nsig = self.owner_sig_count(ordinal as usize, e)?;
-                if s.len >= 1 + nsig {
-                    let ncap = s.len - 1 - nsig;
+                if s.len >= ref_skip + nsig {
+                    let ncap = s.len - ref_skip - nsig;
                     let out_name = Name::of("Output");
                     // `(dyn_off, sig_base, count)` pairs to equate after validating every predicate.
                     let mut ties: Vec<(u32, usize, u32), A> = Vec::new_in(self.alloc);
-                    let mut dyn_at = 2u32;
+                    let mut dyn_at = ref_skip + 1;
                     let mut ok = true;
                     for &p in self.list(preds, e)? {
                         let pn = self.npos(p, e)?;
@@ -6265,10 +6212,13 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                         dyn_at += pn;
                     }
                     if ok && dyn_at == d.len {
-                        let (d0, q) = (self.origs[d.start as usize], self.origs[(d.start + 1) as usize]);
-                        self.b.subset(self.origs[s.start as usize], d0);
+                        if ref_skip == 1 {
+                            let d0 = self.origs[d.start as usize];
+                            self.b.subset(self.origs[s.start as usize], d0);
+                        }
+                        let q = self.origs[(d.start + ref_skip) as usize];
                         for j in 0..ncap {
-                            self.b.subset(self.origs[(s.start + 1 + j) as usize], q);
+                            self.b.subset(self.origs[(s.start + ref_skip + j) as usize], q);
                         }
                         let nsig_usize = usize::try_from(nsig).unwrap_or(0);
                         let mut tied: Vec<bool, A> = Vec::with_capacity_in(nsig_usize, self.alloc);
@@ -6278,7 +6228,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                                 let d_orig = self.origs[(d.start + dyn_off + i) as usize];
                                 match sig_slots[sig_base + i as usize] {
                                     closure::SigSlot::Owner(k) if k < nsig => {
-                                        let c_orig = self.origs[(s.start + 1 + ncap + k) as usize];
+                                        let c_orig = self.origs[(s.start + ref_skip + ncap + k) as usize];
                                         self.b.subset(c_orig, d_orig);
                                         self.b.subset(d_orig, c_orig);
                                         if let Some(slot) = usize::try_from(k).ok().and_then(|ki| tied.get_mut(ki)) {
@@ -6300,7 +6250,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 }
             }
         }
-        if d.len != 2 {
+        if d.len != ref_skip + 1 {
             return Ok(UnsizeDone::Fallback);
         }
         let mut held: Vec<u32, A> = Vec::new_in(self.alloc);
@@ -6323,9 +6273,12 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 }
             }
         }
-        let (d0, q) = (self.origs[d.start as usize], self.origs[(d.start + 1) as usize]);
-        self.b.subset(self.origs[s.start as usize], d0);
-        for j in s.start + 1..s.start + s.len {
+        if ref_skip == 1 {
+            let d0 = self.origs[d.start as usize];
+            self.b.subset(self.origs[s.start as usize], d0);
+        }
+        let q = self.origs[(d.start + ref_skip) as usize];
+        for j in s.start + ref_skip..s.start + s.len {
             self.b.subset(self.origs[j as usize], q);
         }
         Ok(UnsizeDone::Handled)
@@ -6960,6 +6913,98 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             }
         }
         self.refuse(Form::Bound, e)
+    }
+
+    /// Lowers an `asm!` expression after its runtime operands have been evaluated onto `vals`:
+    /// reads/moves input operands into a temporary (checking borrow conflicts and moves), writes
+    /// output places (dropping if needed and checking mutable access), and diverges on `noreturn`.
+    fn asm_done(&mut self, e: ExprId, operands: List, options: u16) -> Result<(), Refusal> {
+        let Some(ops) = self.body.asm_operands.get(operands.range()) else {
+            return self.refuse(Form::Malformed, e);
+        };
+        let mut count = 0usize;
+        for o in ops.iter() {
+            match (o.kind, o.out_expr) {
+                (blaze_typeck::AsmKind::In, _) => count += 1,
+                (blaze_typeck::AsmKind::Out | blaze_typeck::AsmKind::LateOut, _) => {
+                    if !matches!(self.expr(o.expr)?, Expr::Underscore) {
+                        count += 1;
+                    }
+                }
+                (blaze_typeck::AsmKind::InOut | blaze_typeck::AsmKind::InLateOut, Some(out)) => {
+                    count += 1;
+                    if !matches!(self.expr(out)?, Expr::Underscore) {
+                        count += 1;
+                    }
+                }
+                (blaze_typeck::AsmKind::InOut | blaze_typeck::AsmKind::InLateOut, None) => count += 1,
+                (blaze_typeck::AsmKind::Sym | blaze_typeck::AsmKind::Const | blaze_typeck::AsmKind::Label, _) => {}
+            }
+        }
+        let at = match self.vals.len().checked_sub(count) {
+            Some(a) => a,
+            None => return self.refuse(Form::Malformed, e),
+        };
+        let mut vs: Vec<Val, A> = Vec::new_in(self.alloc);
+        vs.extend_from_slice(&self.vals[at..]);
+        self.vals.truncate(at);
+        let mut idx = 0usize;
+        let span = self.span(e);
+        let mut in_ops: Vec<Operand, A> = Vec::new_in(self.alloc);
+        for o in ops.iter() {
+            match (o.kind, o.out_expr) {
+                (blaze_typeck::AsmKind::In, _) => {
+                    let Some(&v) = vs.get(idx) else { return self.refuse(Form::Malformed, e) };
+                    idx += 1;
+                    in_ops.push(self.operand(v, o.expr)?);
+                }
+                (blaze_typeck::AsmKind::Out | blaze_typeck::AsmKind::LateOut, _) => {
+                    if !matches!(self.expr(o.expr)?, Expr::Underscore) {
+                        let Some(&v) = vs.get(idx) else { return self.refuse(Form::Malformed, e) };
+                        idx += 1;
+                        let p = self.as_place(v, o.expr)?;
+                        if self.needs_drop(v.ty, o.expr)? {
+                            self.b.stmt(StmtKind::Drop(p), span);
+                        }
+                        self.b.assign(p, Operand::Const, span);
+                    }
+                }
+                (blaze_typeck::AsmKind::InOut | blaze_typeck::AsmKind::InLateOut, Some(out)) => {
+                    let Some(&vin) = vs.get(idx) else { return self.refuse(Form::Malformed, e) };
+                    idx += 1;
+                    in_ops.push(self.operand(vin, o.expr)?);
+                    if !matches!(self.expr(out)?, Expr::Underscore) {
+                        let Some(&vout) = vs.get(idx) else { return self.refuse(Form::Malformed, e) };
+                        idx += 1;
+                        let p = self.as_place(vout, out)?;
+                        if self.needs_drop(vout.ty, out)? {
+                            self.b.stmt(StmtKind::Drop(p), span);
+                        }
+                        self.b.assign(p, Operand::Const, span);
+                    }
+                }
+                (blaze_typeck::AsmKind::InOut | blaze_typeck::AsmKind::InLateOut, None) => {
+                    let Some(&v) = vs.get(idx) else { return self.refuse(Form::Malformed, e) };
+                    idx += 1;
+                    let p = self.as_place(v, o.expr)?;
+                    let op = self.operand(v, o.expr)?;
+                    self.b.assign(p, op, span);
+                }
+                (blaze_typeck::AsmKind::Sym | blaze_typeck::AsmKind::Const | blaze_typeck::AsmKind::Label, _) => {}
+            }
+        }
+        let ty = TyD::of(self.expr_ty(e)?);
+        if !in_ops.is_empty() {
+            let t = self.temp(ty, e)?;
+            let tp = self.place_of(t);
+            self.b.aggregate(tp, &in_ops, span);
+        }
+        if options & blaze_typeck::ASM_NORETURN != 0 {
+            self.b.stmt(StmtKind::Unreachable, span);
+            self.fresh();
+        }
+        self.vals.push(Val { at: At::Const, ty });
+        Ok(())
     }
 
     /// An aggregate (a constructor, tuple, array, struct, cast, unary op or `format_args!`): its
@@ -7617,7 +7662,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 return self.refuse(Form::CalleeValueUnknown, e);
             }
             let laid = Laid { regions: &regions, ends: &ends, bounds: &[] };
-            if !self.call_laid(laid, None, &[], args, dest, dest_ty, e)? {
+            if !self.call_laid(laid, &[], args, dest, dest_ty, e)? {
                 return self.refuse(Form::CalleeValueUnknown, e);
             }
             self.stats.calls_by_signature += 1;
@@ -7676,7 +7721,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             }
         }
         let laid = Laid { regions: &regions, ends: &ends, bounds: &[] };
-        if !self.call_laid(laid, None, &seed, args, dest, dest_ty, e)? {
+        if !self.call_laid(laid, &seed, args, dest, dest_ty, e)? {
             return self.refuse(Form::CalleeValueUnknown, e);
         }
         self.stats.calls_by_signature += 1;
@@ -7899,7 +7944,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             }
         }
         let laid = Laid { regions: &regions, ends: &ends, bounds: &[] };
-        self.call_laid(laid, None, &seed, args, dest, dest_ty, e)
+        self.call_laid(laid, &seed, args, dest, dest_ty, e)
     }
 
     /// Resolves a callable expression `c` whose declared region column lives in a static/const,
@@ -7907,7 +7952,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
     /// `dyn Fn*` (`(self.0)(parent)`), or a local initialized from a call returning a callable
     /// (`let prev = take_hook(); prev(info)`), and relates the call through its declared column.
     fn call_through_source_callable(&mut self, mut c: ExprId, callee_val: Val, args: &[Val], dest: Place, dest_ty: TyD, e: ExprId) -> Result<bool, Refusal> {
-        if dest_ty.wrap.is_some() || args.iter().any(|v| v.ty.wrap.is_some()) || callee_val.ty.wrap.is_some() {
+        if dest_ty.wrap.is_some() || args.iter().any(|v| v.ty.wrap.is_some()) {
             return Ok(false);
         }
         let mut peel_index = false;
@@ -7926,7 +7971,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             At::Place(p) => Some(self.info(p)),
             At::Const => None,
         };
-        let resolved: Option<(PTy, &'b [Region], bool)> = match self.expr(c)? {
+        let mut traced_container = false;
+        let mut resolved: Option<(PTy, &'b [Region], bool)> = match self.expr(c)? {
             Expr::Path(_) => match self.expr_def(c) {
                 Some(Def::Static(item, _) | Def::Const(item)) => {
                     if let Ok(sig) = facts.sig(item)
@@ -7981,34 +8027,49 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             }
             _ => None,
         };
+        if resolved.is_none()
+            && let Some(r) = self.trace_container_callable_root(c, e)?
+        {
+            resolved = Some(r);
+            traced_container = true;
+        }
         let Some((mut declared, mut slots, owner_numbered)) = resolved else {
             return Ok(false);
         };
         let arity = crate::one_call::FactsArity { facts };
         let heads = blaze_borrow::Columns::new(facts.region_tys().unwrap_or(self.tys), &arity, &arity);
-        for _ in 0..16 {
-            match self.head_node(declared, e)? {
-                PNode::Ref(_, inner) => {
-                    let Some(rest) = slots.get(1..) else { break };
-                    declared = inner;
-                    slots = rest;
-                }
-                PNode::Slice(inner) | PNode::Array(inner, _) if peel_index => {
-                    declared = inner;
-                }
-                PNode::Adt(k, l) if facts.adt(k).is_some_and(|a| a.lifetimes == 0) => {
-                    let list = self.head_list(l, e)?;
-                    let Some(&inner) = list.first() else { break };
-                    if list.len() > 2 {
-                        break;
+        if !traced_container {
+            for _ in 0..16 {
+                match self.head_node(declared, e)? {
+                    PNode::Ref(_, inner) => {
+                        let Some(rest) = slots.get(1..) else { break };
+                        declared = inner;
+                        slots = rest;
                     }
-                    let Ok(ic) = blaze_borrow::RegionTypes::count(&heads, inner) else { break };
-                    let Some(inner_slots) = slots.get(..ic.len()) else { break };
-                    declared = inner;
-                    slots = inner_slots;
+                    PNode::Slice(inner) | PNode::Array(inner, _) if peel_index => {
+                        declared = inner;
+                    }
+                    PNode::Adt(k, l) if facts.adt(k).is_some_and(|a| a.lifetimes == 0) => {
+                        let list = self.head_list(l, e)?;
+                        let Some(&inner) = list.first() else { break };
+                        if list.len() > 2 {
+                            break;
+                        }
+                        let Ok(ic) = blaze_borrow::RegionTypes::count(&heads, inner) else { break };
+                        let Some(inner_slots) = slots.get(..ic.len()) else { break };
+                        declared = inner;
+                        slots = inner_slots;
+                    }
+                    _ => break,
                 }
-                _ => break,
             }
+        }
+        if !matches!(self.head_node(declared, e)?, PNode::Dynamic(_) | PNode::FnPtr(..))
+            && let Some(want_dyn) = self.peel_body_dyn(callee_val.ty.ty, e)?
+            && let Some((found_ty, found_slots)) = self.find_unique_dyn_in_head(declared, slots, &heads, want_dyn, e)?
+        {
+            declared = found_ty;
+            slots = found_slots;
         }
         match self.head_node(declared, e)? {
             PNode::Dynamic(list) => {
@@ -8018,6 +8079,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 self.call_through_dyn_fn(list, slots, args, dest, dest_ty, e)
             }
             PNode::FnPtr(fn_list, _) => {
+                if callee_val.ty.wrap.is_some() {
+                    return Ok(false);
+                }
                 let fn_kids = self.head_list(fn_list, e)?;
                 if fn_kids.len() != args.len() + 1 {
                     return Ok(false);
@@ -8065,10 +8129,217 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                     }
                 }
                 let laid = Laid { regions: slots, ends: &ends, bounds: &[] };
-                self.call_laid(laid, None, &seed, args, dest, dest_ty, e)
+                self.call_laid(laid, &seed, args, dest, dest_ty, e)
             }
             _ => Ok(false),
         }
+    }
+
+    /// Traces a callable expression `c` (including a closure parameter in `map`/`and_then`, e.g.
+    /// `ERROR_REGISTRY.get(&selector).and_then(|decoder| decoder(data))`, or a local extracted
+    /// from a container via method calls/indexing) back to a root static/const, field, owner
+    /// parameter, or call whose declared head type+column can supply the `dyn Fn*` regions.
+    fn trace_container_callable_root(&self, start: ExprId, e: ExprId) -> Result<Option<(PTy, &'b [Region], bool)>, Refusal> {
+        let facts: &'b F = self.facts;
+        let mut cur = start;
+        for _ in 0..16 {
+            match self.expr(cur)? {
+                Expr::Paren(i) | Expr::Unary { op: UnOp::Deref, operand: i } | Expr::Ref { operand: i, .. } => cur = i,
+                Expr::MethodCall { receiver, .. } => cur = receiver,
+                Expr::Index { base, .. } => cur = base,
+                Expr::Path(_) => match self.expr_def(cur) {
+                    Some(Def::Static(item, _) | Def::Const(item)) => {
+                        if let Ok(sig) = facts.sig(item)
+                            && let Some(out_slots) = sig.output()
+                            && let Ok(out_ty) = self.sig_declared(sig, sig.inputs(), e)
+                        {
+                            return Ok(Some((out_ty, out_slots, false)));
+                        }
+                        return Ok(None);
+                    }
+                    _ => return Ok(None),
+                },
+                Expr::Field { base, .. } | Expr::TupleField { base, .. } => {
+                    let field_idx = match self.expr(cur)? {
+                        Expr::Field { .. } => self.field_of(cur),
+                        Expr::TupleField { index, .. } => Some(index),
+                        _ => None,
+                    };
+                    if let Some(fi) = field_idx
+                        && let Some(adt) = self.peel_field_adt(base, e)?
+                        && let Ok(col) = facts.regions().field(adt, 0, fi)
+                    {
+                        return Ok(Some((col.ty(), col.as_slice(), false)));
+                    }
+                    cur = base;
+                }
+                Expr::Local(p) => {
+                    if let Some(&(_, adt, variant, field)) = self.local_field_source.iter().find(|&&(pat, ..)| pat == p)
+                        && let Ok(col) = facts.regions().field(adt, variant, field)
+                    {
+                        return Ok(Some((col.ty(), col.as_slice(), false)));
+                    }
+                    if let Some(param) = self.body.params.iter().position(|x| *x == p)
+                        && let Ok(param32) = u32::try_from(param)
+                        && let Ok(own_sig) = facts.sig(self.body.owner)
+                        && let Some(in_slots) = own_sig.input(param32)
+                        && let Ok(in_ty) = self.sig_declared(own_sig, param32, e)
+                    {
+                        return Ok(Some((in_ty, in_slots, true)));
+                    }
+                    // Local initialized by a `let p = expr;` statement in the body.
+                    let mut init_expr: Option<ExprId> = None;
+                    for stmt in self.body.stmts.iter() {
+                        if let blaze_typeck::Stmt::Let { pat, init: Some(i), .. } = *stmt
+                            && pat == p
+                        {
+                            if init_expr.is_some() {
+                                return Ok(None);
+                            }
+                            init_expr = Some(i);
+                        }
+                    }
+                    if let Some(i) = init_expr {
+                        cur = i;
+                        continue;
+                    }
+                    // Parameter of a closure passed to a method call (e.g. `opt.and_then(|d| d(x))`).
+                    if self.in_nested
+                        && let Some(next) = self.closure_param_call_receiver(p)
+                    {
+                        cur = next;
+                        continue;
+                    }
+                    return Ok(None);
+                }
+                _ => return Ok(None),
+            }
+        }
+        Ok(None)
+    }
+
+    /// If `p` is a parameter of a closure expression `ce` passed as an argument to a method call
+    /// `recv.method(..., ce, ...)`, returns `Some(recv)`.
+    fn closure_param_call_receiver(&self, p: PatId) -> Option<ExprId> {
+        let mut closure_expr: Option<ExprId> = None;
+        for (i, expr) in self.body.exprs.iter().enumerate() {
+            let Expr::Closure { params, .. } = *expr else { continue };
+            let Some(plist) = self.body.pat_lists.get(params.range()) else { continue };
+            if plist.contains(&p) {
+                let Ok(idx) = u32::try_from(i) else { return None };
+                closure_expr = Some(ExprId(idx));
+                break;
+            }
+        }
+        let ce = closure_expr?;
+        for expr in self.body.exprs.iter() {
+            if let Expr::MethodCall { receiver, args, .. } = *expr
+                && let Some(alist) = self.body.expr_lists.get(args.range())
+                && alist.contains(&ce)
+            {
+                return Some(receiver);
+            }
+        }
+        None
+    }
+
+    /// Peels `&`/`&mut`/`Box` off a body-table type `t` to find an underlying `PNode::Dynamic`.
+    fn peel_body_dyn(&self, mut t: PTy, e: ExprId) -> Result<Option<PTy>, Refusal> {
+        let facts: &'b F = self.facts;
+        for _ in 0..16 {
+            match self.node(t, e)? {
+                PNode::Ref(_, inner) => t = inner,
+                PNode::Adt(k, l) if facts.adt(k).is_some_and(|a| a.is_box) => {
+                    let Some(&inner) = self.list(l, e)?.first() else { return Ok(None) };
+                    t = inner;
+                }
+                PNode::Dynamic(_) => return Ok(Some(t)),
+                _ => return Ok(None),
+            }
+        }
+        Ok(None)
+    }
+
+    /// Searches a head-table container type `(root, slots)` for `PNode::Dynamic` subtrees whose
+    /// erased predicates match `want_dyn` (in `self.tys`). Returns `Some((ty, sub_slots))` only
+    /// when every matching subtree agrees on the exact region slice (never guesses across two
+    /// distinct `dyn Fn*` signatures in one container).
+    fn find_unique_dyn_in_head(
+        &self,
+        root: PTy,
+        slots: &'b [Region],
+        heads: &blaze_borrow::Columns<'_>,
+        want_dyn: PTy,
+        e: ExprId,
+    ) -> Result<Option<(PTy, &'b [Region])>, Refusal> {
+        let want_slots = self.npos(want_dyn, e)?;
+        let PNode::Dynamic(want_preds) = self.node(want_dyn, e)? else { return Ok(None) };
+        let want_list = self.list(want_preds, e)?;
+        let mut stack: Vec<(PTy, &'b [Region]), A> = Vec::new_in(self.alloc);
+        stack.push((root, slots));
+        let mut found: Option<(PTy, &'b [Region])> = None;
+        let mut steps = 0u32;
+        while let Some((cur, cur_slots)) = stack.pop() {
+            steps += 1;
+            if steps > MOST_POSITIONS {
+                return Ok(None);
+            }
+            if let Ok(PNode::Dynamic(h_preds)) = self.head_node(cur, e)
+                && usize::try_from(want_slots).ok() == Some(cur_slots.len())
+                && self.dyn_preds_match(h_preds, want_list, e)?
+            {
+                match found {
+                    None => found = Some((cur, cur_slots)),
+                    Some((_, prev_slots)) if prev_slots == cur_slots => {}
+                    Some(_) => return Ok(None),
+                }
+                continue;
+            }
+            // Do not descend into fn pointers (e.g. `LazyLock<T, fn() -> T>`'s initializer `F`
+            // carries a binder-shifted duplicate of `T`'s `dyn Fn*` that is never the extracted value).
+            if matches!(self.head_node(cur, e), Ok(PNode::FnPtr(..))) {
+                continue;
+            }
+            let Ok(own) = blaze_borrow::RegionTypes::own(heads, cur) else { continue };
+            let Ok(kids) = blaze_borrow::RegionTypes::kids(heads, cur) else { continue };
+            let Some((_, mut rest)) = cur_slots.split_at_checked(own.len()) else { continue };
+            for k in 0..kids.len() {
+                let Some(kid) = kids.get(k) else { break };
+                let Ok(kc) = blaze_borrow::RegionTypes::count(heads, kid) else { break };
+                let Some((kslots, next_rest)) = rest.split_at_checked(kc.len()) else { break };
+                rest = next_rest;
+                stack.push((kid, kslots));
+            }
+        }
+        Ok(found)
+    }
+
+    /// Whether a head-table `Dynamic` predicate list `h_preds` has the same trait/projection/auto
+    /// items (ignoring regions) as a body-table `Dynamic` predicate list `want_list`.
+    fn dyn_preds_match(&self, h_preds: List, want_list: &[PTy], e: ExprId) -> Result<bool, Refusal> {
+        let h_list = self.head_list(h_preds, e)?;
+        if h_list.len() != want_list.len() {
+            return Ok(false);
+        }
+        for (&hp, &wp) in h_list.iter().zip(want_list.iter()) {
+            match (self.head_node(hp, e)?, self.node(wp, e)?) {
+                (PNode::ExAuto(ha), PNode::ExAuto(wa)) if ha == wa => {}
+                (PNode::ExTrait(ht, ha), PNode::ExTrait(wt, wa)) if ht == wt => {
+                    if self.head_list(ha, e)?.len() != self.list(wa, e)?.len() {
+                        return Ok(false);
+                    }
+                }
+                (PNode::ExProj { trait_: ht, name: hn, args: ha, .. }, PNode::ExProj { trait_: wt, name: wn, args: wa, .. })
+                    if ht == wt && hn == wn =>
+                {
+                    if self.head_list(ha, e)?.len() != self.list(wa, e)?.len() {
+                        return Ok(false);
+                    }
+                }
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
     }
 
     /// Peels `&`/`&mut`/`Box` off a field expression's base to find its `PNode::Adt` key.
@@ -8311,7 +8582,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                         }
                         if seed_ok {
                             let laid = Laid { regions: slots, ends: &ends, bounds: &[] };
-                            if self.call_laid(laid, None, &seed, args, dest, dest_ty, e)? {
+                            if self.call_laid(laid, &seed, args, dest, dest_ty, e)? {
                                 return Ok(true);
                             }
                         }
@@ -8361,7 +8632,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             return Ok(false);
         }
         let laid = Laid { regions: &regions, ends: &ends, bounds: &[] };
-        self.call_laid(laid, None, &seed, args, dest, dest_ty, e)
+        self.call_laid(laid, &seed, args, dest, dest_ty, e)
     }
 
     fn break_done(&mut self, e: ExprId, has: bool) -> Result<(), Refusal> {
@@ -8896,7 +9167,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 Some(&t) => t,
                 None => return self.refuse_pat(Form::Malformed, sp),
             };
-            let ft = if peels { self.peeled_field_ty(ty, adt, variant, fi, sp, own)? } else { TyD::of(own) };
+            let ft = if peels { self.peeled_field_ty(ty, adt, variant, fi, sp, own, mode)? } else { TyD::of(own) };
             let q = self.project(base, ty, Proj::Field(fi), ft, f.drop_impl, root)?;
             stack.push(BindItem::Pat(sp, q, ft, mode));
         }
@@ -8918,7 +9189,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
     /// there (`mut x` before edition 2024) moves out of the deref: E0507 (blaze-flow
     /// `MoveOut::Deref`). Checked, not assumed: the peels must land on `own`, else the
     /// binding modes the check took are not the ones rebuilt here (`Form::BindingMode`).
-    fn peeled_field_ty(&self, ty: TyD, adt: ItemKey, variant: u32, fi: u32, sp: PatId, own: PTy) -> Result<TyD, Refusal> {
+    fn peeled_field_ty(&self, ty: TyD, adt: ItemKey, variant: u32, fi: u32, sp: PatId, own: PTy, mode: u8) -> Result<TyD, Refusal> {
         let root = self.body.root;
         let args: &'c [PTy] = match (ty.wrap, self.node(ty.ty, root)?) {
             (None, PNode::Adt(k, l)) if k == adt => self.list(l, root)?,
@@ -8935,6 +9206,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             Some(FieldLead::Plain) => TyD::of(own),
             Some(FieldLead::Unread) | None => match self.facts.field_param(adt, variant, fi) {
                 Some(p) => TyD::of(arg(p)?),
+                None if mode == 0 && self.pat_proves_no_peel(sp)? => TyD::of(own),
                 None => return self.refuse_pat(Form::PeelUnderAdtField, sp),
             },
         };
@@ -8950,6 +9222,42 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             return self.refuse_pat(Form::BindingMode, sp);
         }
         Ok(field)
+    }
+
+    /// When entering a peeling subpattern `sp` in `Move` mode (`mode == 0`), any direct immutable
+    /// by-value binding `x` (`by_ref.is_none() && !mutable`) whose checked binding type
+    /// (`local_ty[x]`) equals its pattern type (`pat_ty[x]`) proves `sp` peeled zero references:
+    /// peeling `&` or `&mut` under match ergonomics changes the default binding mode to `ref` or
+    /// `ref mut`, making `local_ty[x] == &pat_ty[x] != pat_ty[x]`.
+    fn pat_proves_no_peel(&self, sp: PatId) -> Result<bool, Refusal> {
+        let Some(&pat) = self.body.pats.get(sp.ix()) else {
+            return self.refuse_pat(Form::Malformed, sp);
+        };
+        let check_bind = |p: PatId| -> bool {
+            let Some(Pat::Bind { ann, .. }) = self.body.pats.get(p.ix()) else { return false };
+            ann.by_ref.is_none()
+                && !ann.mutable
+                && self.ck.pat_ty.get(p.ix()).is_some()
+                && self.ck.local_ty.get(p.ix()) == self.ck.pat_ty.get(p.ix())
+        };
+        match pat {
+            Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
+                for f in self.body.field_pats.get(fields.range()).unwrap_or(&[]) {
+                    if check_bind(f.pat) {
+                        return Ok(true);
+                    }
+                }
+            }
+            Pat::Tuple { elems, .. } | Pat::TupleStruct { elems, .. } | Pat::Slice { elems, .. } => {
+                for &ep in self.body.pat_lists.get(elems.range()).unwrap_or(&[]) {
+                    if check_bind(ep) {
+                        return Ok(true);
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(false)
     }
 
     fn stmt(&mut self, s: StmtId) -> Result<(), Refusal> {

@@ -16,11 +16,16 @@ use blaze_cad_out::{Material, Transform};
 use blaze_math::{Aabb3, Vec3};
 use blaze_own::planted::{NoPlant, Planted, Plants};
 use blaze_own::{Alloc, AllocFailure, Vec};
-
-use crate::shade::{
-    RGSS_2X2, ShadeContext, eval_strip_lights, linear_to_srgb, quantize, resolve_samples, shade_zebra, srgb_to_linear,
+use blaze_pbr::{
+    Cc0PackView, DenoiseOpts, EnvironmentPreset, GBufferPixel, PostProcessOpts, SmartMaterial, SurfaceMasks, SurfacePbr,
+    TextureView, apply_smart_material, apply_tonemap, decode_tangent_normal, denoise_atrous, dominant_light, eval_direct_brdf,
+    eval_ibl_with_irradiance, fbm3, fresnel_schlick_roughness, hash2, perturb_normal, post_process_hdr, rnm_blend,
+    sample_bilinear, sample_environment, sample_ggx_vndf, sample_hex_tile, sample_triplanar,
+    srgb_to_linear as pbr_srgb_to_linear,
 };
-use crate::{Camera, LEAST_STEP, Picture, PictureError, PictureOpts, PictureStats, RenderMode, Shading, StudioOpts, View, slab};
+
+use crate::shade::{RGSS_2X2, ShadeContext, eval_strip_lights, linear_to_srgb, quantize, resolve_samples, shade_zebra, srgb_to_linear};
+use crate::{Camera, LEAST_STEP, PbrOpts, Picture, PictureError, PictureOpts, PictureStats, RenderMode, Shading, StudioOpts, View, slab};
 
 /// Maximum triangles stored in a single BVH leaf.
 const LEAF_TRIS: usize = 4;
@@ -208,18 +213,13 @@ impl TextureMap<'_> {
 /// in [`MeshPictureOpts::material_maps`].
 #[derive(Clone, Copy, Debug)]
 pub struct MaterialMaps<'a> {
-    /// Base-colour / albedo RGBA8 map (sRGB-encoded RGB, multiplied with `Material::base_colour`).
     pub base_colour: Option<TextureMap<'a>>,
-    /// glTF-convention metallic-roughness RGBA8 map (G = roughness factor, B = metallic factor).
     pub metallic_roughness: Option<TextureMap<'a>>,
-    /// Tangent-space normal map RGBA8 texture (RGB unpacked from `[0, 1]` to `[-1, 1]`).
     pub normal: Option<TextureMap<'a>>,
-    /// Tangent-space XY perturbation scale (typically `1.0`).
     pub normal_scale: f64,
 }
 
 impl MaterialMaps<'_> {
-    /// Empty material map set with no textures bound.
     pub const NONE: MaterialMaps<'static> = MaterialMaps {
         base_colour: None,
         metallic_roughness: None,
@@ -232,6 +232,18 @@ impl Default for MaterialMaps<'_> {
     fn default() -> MaterialMaps<'static> {
         MaterialMaps::NONE
     }
+}
+
+/// Optional CC0 PBR texture pack + smart-material wear profile attached to a `MaterialRole`
+/// index during [`Shading::Pbr`] mesh rendering.
+#[derive(Clone, Copy, Debug)]
+pub struct MaterialLook<'m> {
+    pub textures: Cc0PackView<'m>,
+    pub smart: SmartMaterial,
+}
+
+impl MaterialLook<'static> {
+    pub const NONE: MaterialLook<'static> = MaterialLook { textures: Cc0PackView::NONE, smart: SmartMaterial::NONE };
 }
 
 /// Options for [`render_mesh`] and [`render_mesh_scene`].
@@ -249,7 +261,7 @@ pub struct MeshPictureOpts<'a, 's, 'h> {
     pub fallback_colour: [u8; 3] = [168, 178, 192],
     /// Lighting model in [`RenderMode::Shaded`].
     pub shading: Shading = Shading::Studio(StudioOpts::DEFAULT),
-    /// Visualization mode (`Shaded`, `Normals`, `Depth`, `Matcap`, `Zebra`).
+    /// Visualization mode (`Shaded`, `Normals`, `Depth`, `Matcap`).
     pub mode: RenderMode = RenderMode::Shaded,
     /// Whether to shade with exported interpolated normals or flat geometric normals.
     pub normal_source: MeshNormalSource = MeshNormalSource::Shading,
@@ -260,6 +272,12 @@ pub struct MeshPictureOpts<'a, 's, 'h> {
     pub highlights: &'h [MeshHighlight] = &[],
     /// Optional baked PBR texture & tangent-space normal maps indexed in parallel with `materials`.
     pub material_maps: &'h [MaterialMaps<'h>] = &[],
+    /// Optional per-`MaterialRole` CC0 texture packs and smart-material wear/grime profiles
+    /// (indexed by `MaterialRole.0`, used by [`Shading::Pbr`]).
+    pub material_looks: &'h [MaterialLook<'h>] = &[],
+    /// Optional per-part baked tangent-space detail normal maps (indexed by part index, blended
+    /// over CC0 micro-normals via RNM in [`Shading::Pbr`]).
+    pub part_normal_maps: &'h [Option<TextureView<'h>>] = &[],
     /// Deterministic supersampling per axis: `1` or `2` (2×2 RGSS).
     pub supersample: u8 = 1,
 }
@@ -286,6 +304,309 @@ pub fn render_mesh_scene<'a>(
     render_mesh_scene_planted(parts, materials, view, o, NoPlant)
 }
 
+/// Immutable, `Copy + Send + Sync` read-only PBR rendering parameters for parallel tile rendering
+/// with [`PreparedMeshSceneRef::render_pbr_rows`]. Holds no allocators so it can be shared
+/// across worker threads with `#![forbid(unsafe_code)]`.
+#[derive(Clone, Copy)]
+pub struct PbrRenderParams<'m> {
+    pub background: [u8; 4] = [245, 246, 248, 255],
+    pub fallback_colour: [u8; 3] = [180, 185, 192],
+    pub normal_source: MeshNormalSource = MeshNormalSource::Shading,
+    pub supersample: u8 = 2,
+    pub material_looks: &'m [MaterialLook<'m>] = &[],
+    pub part_normal_maps: &'m [Option<TextureView<'m>>] = &[],
+}
+
+impl<'m> PbrRenderParams<'m> {
+    /// Extract the read-only, thread-safe PBR parameters from a [`MeshPictureOpts`].
+    #[must_use]
+    pub const fn from_mesh_opts(o: &MeshPictureOpts<'_, '_, 'm>) -> PbrRenderParams<'m> {
+        PbrRenderParams {
+            background: o.background,
+            fallback_colour: o.fallback_colour,
+            normal_source: o.normal_source,
+            supersample: o.supersample,
+            material_looks: o.material_looks,
+            part_normal_maps: o.part_normal_maps,
+        }
+    }
+}
+
+/// Prebuilt immutable BVH + emissive light scene for multi-view or multi-threaded tile rendering.
+///
+/// Built once via [`PreparedMeshScene::new`], then borrowed as a `Copy + Send + Sync`
+/// [`PreparedMeshSceneRef`] via [`PreparedMeshScene::as_ref`] so any host scheduler or thread
+/// pool can render horizontal bands in parallel with zero BVH rebuilds and zero `unsafe` code,
+/// while keeping `blaze-cad-picture` 100% `#![no_std]` sans-IO.
+pub struct PreparedMeshScene<'s> {
+    bvh: MeshBvh<'s>,
+}
+
+/// Read-only, `Copy + Send + Sync` view of a [`PreparedMeshScene`] for parallel band rendering.
+#[derive(Clone, Copy)]
+pub struct PreparedMeshSceneRef<'a> {
+    bvh: MeshBvhRef<'a>,
+}
+
+impl<'s> PreparedMeshScene<'s> {
+    /// Build the SAH BVH and clustered emissive NEE light table once for `parts`.
+    pub fn new(
+        parts: &[MeshScenePart<'_>],
+        materials: &[Material<'_>],
+        fallback_colour: [u8; 3],
+        scratch: Alloc<'s>,
+    ) -> Result<PreparedMeshScene<'s>, PictureError> {
+        let bvh = build_bvh(parts, materials, fallback_colour, scratch, NoPlant)?;
+        Ok(PreparedMeshScene { bvh })
+    }
+
+    /// Borrow a `Copy + Send + Sync` view of the built BVH for multi-threaded band rendering.
+    #[must_use]
+    pub fn as_ref(&self) -> PreparedMeshSceneRef<'_> {
+        PreparedMeshSceneRef { bvh: self.bvh.as_ref() }
+    }
+
+    /// Render rows `[y_start, y_end)` of a full linear HDR + G-buffer PBR frame (`Shading::Pbr`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_pbr_rows(
+        &self,
+        view: View,
+        o: &MeshPictureOpts<'_, '_, '_>,
+        pbr: &PbrOpts,
+        y_start: u32,
+        y_end: u32,
+        out_hdr: &mut [[f64; 3]],
+        out_gbuf: &mut [GBufferPixel],
+        out_depth: &mut [f64],
+    ) -> Result<PictureStats, PictureError> {
+        let params = PbrRenderParams::from_mesh_opts(o);
+        self.as_ref().render_pbr_rows(view, &params, pbr, y_start, y_end, out_hdr, out_gbuf, out_depth)
+    }
+}
+
+impl PreparedMeshSceneRef<'_> {
+    /// Render rows `[y_start, y_end)` of a full linear HDR + G-buffer PBR frame (`Shading::Pbr`),
+    /// writing `(y_end - y_start) * view.width` entries into `out_hdr`, `out_gbuf`, and `out_depth`.
+    ///
+    /// Supports `supersample` `1..=4` (1, 4, 9, or 16 SPP), physical thin-lens Depth of Field
+    /// (`pbr.aperture_radius_mm`), VNDF rough GGX reflections, 1-bounce BVH GI, and emissive NEE.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_pbr_rows(
+        self,
+        view: View,
+        params: &PbrRenderParams<'_>,
+        pbr: &PbrOpts,
+        y_start: u32,
+        y_end: u32,
+        out_hdr: &mut [[f64; 3]],
+        out_gbuf: &mut [GBufferPixel],
+        out_depth: &mut [f64],
+    ) -> Result<PictureStats, PictureError> {
+        if !(1..=4).contains(&params.supersample) {
+            return Err(PictureError::BadSupersample { supersample: params.supersample });
+        }
+        let cam = Camera::new(&view)?;
+        let y0 = y_start.min(view.height);
+        let y1 = y_end.min(view.height).max(y0);
+        let expected = ((y1 - y0) as usize) * (view.width as usize);
+        if out_hdr.len() < expected || out_gbuf.len() < expected || out_depth.len() < expected {
+            return Err(PictureError::TooManyPixels { pixels: expected as u64, most: out_hdr.len() as u64 });
+        }
+
+        let ctx = ShadeContext::from_colors(&cam, self.bvh.scene_bounds, params.fallback_colour, params.background, true);
+        let use_shading_normals = matches!(params.normal_source, MeshNormalSource::Shading);
+        let mut stats = PictureStats::default();
+
+        let spp_side = usize::from(params.supersample);
+        let spp = spp_side * spp_side;
+        let inv_spp = 1.0 / (spp as f64);
+
+        // Thin-lens Depth of Field parameters (metres).
+        let lens_r = (pbr.aperture_radius_mm * 0.001).max(0.0);
+        let eye_v = Vec3::new(view.eye[0].as_m(), view.eye[1].as_m(), view.eye[2].as_m());
+        let tgt_v = Vec3::new(view.target[0].as_m(), view.target[1].as_m(), view.target[2].as_m());
+        let focus_dist = if pbr.focus_distance_m > 1e-3 {
+            pbr.focus_distance_m
+        } else {
+            (tgt_v - eye_v).length().max(0.05)
+        };
+        let dof_active = lens_r > 1e-6 && spp > 1 && matches!(view.projection, crate::Projection::Perspective { .. });
+
+        let mut out_idx = 0usize;
+        for y in y0..y1 {
+            for x in 0..view.width {
+                let mut sum = [0.0f64; 3];
+                let mut g_alb = [0.0f64; 3];
+                let mut g_nrm = [0.0f64; 3];
+                let mut g_pres = 0.0f64;
+                let mut hit_g_count = 0usize;
+                let mut best_t = f64::INFINITY;
+                let mut depth_sum = 0.0f64;
+
+                let pix_hash = hash2(x as i64, y as i64, 0x3f2d);
+                let pix_hash2 = hash2(x as i64, y as i64, 0x91a7);
+
+                for si in 0..spp {
+                    let seed = (y.wrapping_mul(1973) ^ x.wrapping_mul(9277) ^ ((si as u32).wrapping_mul(26699))) as i64;
+                    let (ox, oy) = if spp == 1 {
+                        (0.5, 0.5)
+                    } else if spp == 4 {
+                        RGSS_2X2[si]
+                    } else {
+                        // Stratified jittered grid for 3×3 (9 SPP) or 4×4 (16 SPP).
+                        let gx = (si % spp_side) as f64;
+                        let gy = (si / spp_side) as f64;
+                        let jx = (pix_hash + (si as f64) * 0.7548776662).fract();
+                        let jy = (pix_hash2 + (si as f64) * 0.5698402909).fract();
+                        ((gx + 0.15 + 0.70 * jx) / (spp_side as f64), (gy + 0.15 + 0.70 * jy) / (spp_side as f64))
+                    };
+
+                    let (mut origin, mut dir) = cam.ray_at(f64::from(x) + ox, f64::from(y) + oy);
+                    if dof_active {
+                        // Stratified concentric disk thin-lens bokeh sampling.
+                        let u1 = ((si as f64 + 0.5) / (spp as f64) + pix_hash * 0.25).fract();
+                        let u2 = (pix_hash2 + (si as f64) * 0.6180339887).fract();
+                        let r_d = blaze_math::sqrt(u1.clamp(0.0, 1.0)) * lens_r;
+                        let ang_d = u2 * core::f64::consts::TAU;
+                        let offset = cam.right * (r_d * blaze_math::cos(ang_d)) + cam.up * (r_d * blaze_math::sin(ang_d));
+                        let denom = dir.dot(cam.forward).max(1e-4);
+                        let p_focus = origin + dir * (focus_dist / denom);
+                        origin = origin + offset;
+                        dir = (p_focus - origin).normalized().unwrap_or(dir);
+                    }
+
+                    stats.rays += 1;
+                    if let Some(hit) = self.bvh.trace(origin, dir, f64::INFINITY, &mut stats) {
+                        stats.hits += 1;
+                        best_t = best_t.min(hit.t);
+                        let tri = &self.bvh.tris[hit.tri_idx as usize];
+                        let p = origin + dir * hit.t;
+                        let w = (1.0 - hit.u - hit.v).max(0.0);
+                        let mut n = if use_shading_normals {
+                            (tri.n0 * w + tri.n1 * hit.u + tri.n2 * hit.v).normalized().unwrap_or(tri.ng)
+                        } else {
+                            tri.ng
+                        };
+                        if n.dot(dir) > 0.0 {
+                            n = n * -1.0;
+                        }
+                        let ng_face = if tri.ng.dot(dir) > 0.0 { tri.ng * -1.0 } else { tri.ng };
+                        let (mut col, gp) = shade_mesh_pbr_hdr_gbuf(
+                            self.bvh,
+                            &ctx,
+                            params,
+                            pbr,
+                            p,
+                            dir,
+                            n,
+                            ng_face,
+                            tri,
+                            w,
+                            hit.u,
+                            hit.v,
+                            pbr.reflection_bounces,
+                            seed,
+                            &mut stats,
+                        );
+                        // Optional outdoor aerial perspective atmospheric haze.
+                        if pbr.atmosphere_haze > 1e-6 && hit.t > 2.0 {
+                            let haze = 1.0 - blaze_math::exp(-(hit.t - 2.0) * pbr.atmosphere_haze);
+                            let hdir = Vec3::new(dir.x, dir.y, 0.025).normalized().unwrap_or(dir);
+                            let hcol = sample_environment(pbr.environment, hdir, Vec3::new(0.0, 0.0, 1.0));
+                            for c in 0..3 {
+                                col[c] = col[c] * (1.0 - haze) + hcol[c] * haze;
+                            }
+                        }
+                        sum[0] += col[0];
+                        sum[1] += col[1];
+                        sum[2] += col[2];
+                        g_alb[0] += f64::from(gp.albedo[0]);
+                        g_alb[1] += f64::from(gp.albedo[1]);
+                        g_alb[2] += f64::from(gp.albedo[2]);
+                        g_nrm[0] += f64::from(gp.normal[0]);
+                        g_nrm[1] += f64::from(gp.normal[1]);
+                        g_nrm[2] += f64::from(gp.normal[2]);
+                        g_pres += f64::from(gp.preserve);
+                        depth_sum += hit.t;
+                        hit_g_count += 1;
+                    } else {
+                        let (bg, miss_t, gp) = shade_pbr_miss_hdr(self.bvh, &ctx, params, pbr, origin, dir, seed, &mut stats);
+                        best_t = best_t.min(miss_t);
+                        sum[0] += bg[0];
+                        sum[1] += bg[1];
+                        sum[2] += bg[2];
+                        if miss_t.is_finite() {
+                            g_alb[0] += f64::from(gp.albedo[0]);
+                            g_alb[1] += f64::from(gp.albedo[1]);
+                            g_alb[2] += f64::from(gp.albedo[2]);
+                            g_nrm[0] += f64::from(gp.normal[0]);
+                            g_nrm[1] += f64::from(gp.normal[1]);
+                            g_nrm[2] += f64::from(gp.normal[2]);
+                            g_pres += f64::from(gp.preserve);
+                            depth_sum += miss_t;
+                            hit_g_count += 1;
+                        }
+                    }
+                }
+
+                out_hdr[out_idx] = [sum[0] * inv_spp, sum[1] * inv_spp, sum[2] * inv_spp];
+                out_depth[out_idx] = best_t;
+                out_gbuf[out_idx] = if hit_g_count > 0 {
+                    let inv_g = 1.0 / (hit_g_count as f64);
+                    let nv = Vec3::new(g_nrm[0], g_nrm[1], g_nrm[2]).normalized().unwrap_or(Vec3::new(0.0, 0.0, 1.0));
+                    GBufferPixel {
+                        albedo: [(g_alb[0] * inv_g) as f32, (g_alb[1] * inv_g) as f32, (g_alb[2] * inv_g) as f32],
+                        normal: [nv.x as f32, nv.y as f32, nv.z as f32],
+                        depth: depth_sum * inv_g,
+                        preserve: (g_pres * inv_g) as f32,
+                    }
+                } else {
+                    GBufferPixel::SKY
+                };
+                out_idx += 1;
+            }
+        }
+
+        Ok(stats)
+    }
+}
+
+/// Finish a full linear HDR + G-buffer PBR frame (produced by one or more parallel calls to
+/// [`PreparedMeshScene::render_pbr_rows`]): runs edge-preserving À-Trous denoising (when
+/// `pbr.denoise` is true), dual-radius HDR optical bloom, subtle vignette, and AgX/ACES tone
+/// mapping.
+#[allow(clippy::too_many_arguments)]
+pub fn finish_pbr_frame<'a>(
+    hdr: &mut [[f64; 3]],
+    gbuf: &[GBufferPixel],
+    depth: Vec<f64, Alloc<'a>>,
+    width: u32,
+    height: u32,
+    pbr: &PbrOpts,
+    stats: PictureStats,
+    alloc: Alloc<'a>,
+    scratch: Alloc<'_>,
+) -> Result<Picture<'a>, PictureError> {
+    if pbr.denoise {
+        denoise_atrous(hdr, gbuf, width, height, DenoiseOpts::DEFAULT, scratch)?;
+    }
+    let pixels = post_process_hdr(
+        hdr,
+        width,
+        height,
+        PostProcessOpts {
+            tonemap: pbr.tonemap,
+            exposure: pbr.exposure,
+            bloom_threshold: pbr.bloom_threshold,
+            bloom_strength: pbr.bloom_strength,
+            vignette: pbr.vignette,
+        },
+        alloc,
+        scratch,
+    )?;
+    Ok(Picture { width, height, pixels, depth, stats })
+}
+
 /// [`render_mesh_scene`] with a planted bug, for the test controls.
 pub fn render_mesh_scene_planted<'a>(
     parts: &[MeshScenePart<'_>],
@@ -294,7 +615,15 @@ pub fn render_mesh_scene_planted<'a>(
     o: MeshPictureOpts<'a, '_, '_>,
     plant: impl Planted<MeshPicturePlant>,
 ) -> Result<Picture<'a>, PictureError> {
-    if o.supersample != 1 && o.supersample != 2 {
+    let is_pbr_fast = matches!((o.mode, o.shading, o.wireframe), (RenderMode::Shaded, Shading::Pbr(_), Wireframe::Off))
+        && (plant.has(MeshPicturePlant::IgnoreHighlights) || o.highlights.is_empty())
+        && !plant.has(MeshPicturePlant::FlatOnly);
+
+    if is_pbr_fast {
+        if !(1..=4).contains(&o.supersample) {
+            return Err(PictureError::BadSupersample { supersample: o.supersample });
+        }
+    } else if o.supersample != 1 && o.supersample != 2 {
         return Err(PictureError::BadSupersample { supersample: o.supersample });
     }
     let cam = Camera::new(&view)?;
@@ -305,6 +634,22 @@ pub fn render_mesh_scene_planted<'a>(
     let n_usize = usize::try_from(n_pixels).map_err(|_| PictureError::TooManyPixels { pixels: n_pixels, most: o.most_pixels })?;
 
     let bvh = build_bvh(parts, materials, o.fallback_colour, o.scratch, plant)?;
+
+    // Dedicated full-HDR PBR path: routes through `PreparedMeshScene::render_pbr_rows` +
+    // `finish_pbr_frame` (G-buffer À-Trous denoising + dual-radius HDR bloom + AgX/ACES)!
+    if is_pbr_fast && let Shading::Pbr(pbr) = o.shading {
+        let scene = PreparedMeshScene { bvh };
+        let mut hdr_buf: Vec<[f64; 3], Alloc<'_>> = Vec::try_with_capacity_in(n_usize, o.scratch)?;
+        let mut gbuf: Vec<GBufferPixel, Alloc<'_>> = Vec::try_with_capacity_in(n_usize, o.scratch)?;
+        let mut depth: Vec<f64, Alloc<'a>> = Vec::try_with_capacity_in(n_usize, o.alloc)?;
+        for _ in 0..n_usize {
+            push(&mut hdr_buf, [0.0; 3])?;
+            push(&mut gbuf, GBufferPixel::SKY)?;
+            push(&mut depth, f64::INFINITY)?;
+        }
+        let stats = scene.render_pbr_rows(view, &o, &pbr, 0, view.height, &mut hdr_buf, &mut gbuf, &mut depth)?;
+        return finish_pbr_frame(&mut hdr_buf, &gbuf, depth, view.width, view.height, &pbr, stats, o.alloc, o.scratch);
+    }
 
     let mut pixels: Vec<u8, Alloc<'a>> = Vec::try_with_capacity_in(n_usize * 4, o.alloc)?;
     let mut depth: Vec<f64, Alloc<'a>> = Vec::try_with_capacity_in(n_usize, o.alloc)?;
@@ -350,6 +695,15 @@ pub fn render_mesh_scene_planted<'a>(
                     let rgba = resolve_samples(sample, 1.0, ctx.linear_blend);
                     pixels.try_extend_from_slice(&rgba)?;
                     push(&mut depth, hit.t)?;
+                } else if let (RenderMode::Shaded, Shading::Pbr(pbr)) = (o.mode, o.shading)
+                    && (pbr.ground_plane || pbr.env_background)
+                {
+                    let seed = (y.wrapping_mul(1973) ^ x.wrapping_mul(9277)) as i64;
+                    let params = PbrRenderParams::from_mesh_opts(&o);
+                    let (sample, miss_t) = shade_pbr_miss(bvh.as_ref(), &ctx, &params, &pbr, origin, dir, seed, &mut stats);
+                    let rgba = resolve_samples(sample, 1.0, ctx.linear_blend);
+                    pixels.try_extend_from_slice(&rgba)?;
+                    push(&mut depth, miss_t)?;
                 } else {
                     pixels.try_extend_from_slice(&o.background)?;
                     push(&mut depth, f64::INFINITY)?;
@@ -358,7 +712,7 @@ pub fn render_mesh_scene_planted<'a>(
                 let mut sum = [0.0f64; 4];
                 let mut best_t = f64::INFINITY;
                 let mut any_hit = false;
-                for &(ox, oy) in &RGSS_2X2 {
+                for (si, &(ox, oy)) in RGSS_2X2.iter().enumerate() {
                     let (sx, sy) = (f64::from(x) + ox, f64::from(y) + oy);
                     let (origin, dir) = cam.ray_at(sx, sy);
                     stats.rays += 1;
@@ -384,6 +738,15 @@ pub fn render_mesh_scene_planted<'a>(
                         for c in 0..4 {
                             sum[c] += s[c];
                         }
+                    } else if let (RenderMode::Shaded, Shading::Pbr(pbr)) = (o.mode, o.shading)
+                        && (pbr.ground_plane || pbr.env_background)
+                    {
+                        let seed = (y.wrapping_mul(1973) ^ x.wrapping_mul(9277) ^ ((si as u32).wrapping_mul(26699))) as i64;
+                        let params = PbrRenderParams::from_mesh_opts(&o);
+                        let (bg, _) = shade_pbr_miss(bvh.as_ref(), &ctx, &params, &pbr, origin, dir, seed, &mut stats);
+                        for c in 0..4 {
+                            sum[c] += bg[c];
+                        }
                     } else {
                         let bg = ctx.miss_sample();
                         for c in 0..4 {
@@ -391,7 +754,8 @@ pub fn render_mesh_scene_planted<'a>(
                         }
                     }
                 }
-                let rgba = if any_hit { resolve_samples(sum, 0.25, ctx.linear_blend) } else { o.background };
+                let pbr_miss_active = matches!((o.mode, o.shading), (RenderMode::Shaded, Shading::Pbr(p)) if p.ground_plane || p.env_background);
+                let rgba = if any_hit || pbr_miss_active { resolve_samples(sum, 0.25, ctx.linear_blend) } else { o.background };
                 pixels.try_extend_from_slice(&rgba)?;
                 push(&mut depth, best_t)?;
             }
@@ -566,11 +930,13 @@ struct WorldTri {
     n1: Vec3,
     n2: Vec3,
     ng: Vec3,
-    /// Optional per-vertex UV coordinates `(u, v)` copied from the exported mesh's `uvs` column.
-    uvs: Option<[[f64; 2]; 3]>,
-    /// Optional world-space unit vertex tangents `[tx, ty, tz, handedness]` transformed by the
-    /// part's linear matrix and orthonormalized against the vertex normals.
-    tangents: Option<[[f64; 4]; 3]>,
+    uv: [[f32; 2]; 3],
+    tan: [Vec3; 3],
+    tan_w: f64,
+    col: [[f64; 4]; 3],
+    has_uv: bool,
+    has_tan: bool,
+    has_col: bool,
     /// `2 * area / edge_len` for each of the 3 opposite edges (used for exact screen-space
     /// pixel distance to the nearest triangle edge in wireframe mode).
     alt_scale: [f64; 3],
@@ -581,9 +947,16 @@ struct WorldTri {
     metallic: f64,
     roughness: f64,
     emissive: [f64; 3],
-    role: u32,
-    has_tint_override: bool,
+    clearcoat: f64,
+    clearcoat_roughness: f64,
+    anisotropy: f64,
+    sheen_colour: [f64; 3],
+    sheen_roughness: f64,
+    transmission: f64,
+    ior: f64,
+    role_idx: u32,
     part_idx: u32,
+    has_tint_override: bool,
     bounds: Aabb3,
     centroid: Vec3,
 }
@@ -597,11 +970,48 @@ struct BvhNode {
     count: u32,
 }
 
+/// Compact area-light proxy extracted deterministically from emissive mesh clusters for
+/// noise-free Next-Event Estimation (NEE) direct lighting.
+#[derive(Clone, Copy)]
+struct EmissiveLight {
+    pos: Vec3,
+    /// Total radiant flux (`emissive * area`, scaled for inverse-square PBR evaluation).
+    power: [f64; 3],
+    /// Approximate bounding radius of the emissive cluster (prevents inverse-square singularity
+    /// and skips self-shadowing against the emitter's own surface).
+    radius: f64,
+}
+
 struct MeshBvh<'s> {
     nodes: Vec<BvhNode, Alloc<'s>>,
     tris: Vec<WorldTri, Alloc<'s>>,
     inv_xforms: Vec<Affine3, Alloc<'s>>,
     scene_bounds: Aabb3,
+    emissive_lights: [EmissiveLight; 12],
+    emissive_count: usize,
+}
+
+/// Borrowed, `Copy + Send + Sync` read-only view of [`MeshBvh`].
+#[derive(Clone, Copy)]
+struct MeshBvhRef<'a> {
+    nodes: &'a [BvhNode],
+    tris: &'a [WorldTri],
+    scene_bounds: Aabb3,
+    emissive_lights: [EmissiveLight; 12],
+    emissive_count: usize,
+}
+
+impl MeshBvh<'_> {
+    #[inline]
+    fn as_ref(&self) -> MeshBvhRef<'_> {
+        MeshBvhRef {
+            nodes: &self.nodes,
+            tris: &self.tris,
+            scene_bounds: self.scene_bounds,
+            emissive_lights: self.emissive_lights,
+            emissive_count: self.emissive_count,
+        }
+    }
 }
 
 struct MeshHit {
@@ -654,11 +1064,11 @@ fn build_bvh<'s>(
         let view = &part.mesh;
         let pos = view.positions();
         let nrms = view.normals();
-        let uvs_col = view.uvs();
-        let tans_col = view.tangents();
+        let uvs_opt = view.uvs();
+        let tans_opt = view.tangents();
+        let cols_opt = view.colours();
         let roles = view.roles();
         let has_nrms = nrms.len() == pos.len();
-        let has_tint_override = part.tint_override.is_some();
 
         for (ti, tri) in view.triangles().iter().enumerate() {
             let (i0, i1, i2) = if mirrored {
@@ -688,39 +1098,52 @@ fn build_bvh<'s>(
                 (ng, ng, ng)
             };
 
-            let uvs = uvs_col.map(|col| {
-                [
-                    [f64::from(col[i0][0]), f64::from(col[i0][1])],
-                    [f64::from(col[i1][0]), f64::from(col[i1][1])],
-                    [f64::from(col[i2][0]), f64::from(col[i2][1])],
-                ]
-            });
-
-            let tangents = tans_col.map(|col| {
-                let xf_tan = |raw: [f32; 4], nv: Vec3| -> [f64; 4] {
-                    let tw = mul_mat3(&xf.m, [raw[0], raw[1], raw[2]]);
-                    let t_ortho = (tw - nv * tw.dot(nv)).normalized().unwrap_or_else(|| {
-                        let helper = if nv.z.abs() < 0.9 { Vec3::new(0.0, 0.0, 1.0) } else { Vec3::new(1.0, 0.0, 0.0) };
-                        helper.cross(nv).normalized().unwrap_or(Vec3::new(1.0, 0.0, 0.0))
-                    });
-                    let w_raw = if raw[3] < 0.0 { -1.0 } else { 1.0 };
-                    let w_sign = if mirrored { -w_raw } else { w_raw };
-                    [t_ortho.x, t_ortho.y, t_ortho.z, w_sign]
-                };
-                [xf_tan(col[i0], n0), xf_tan(col[i1], n1), xf_tan(col[i2], n2)]
-            });
+            let (uv, has_uv) = match uvs_opt {
+                Some(u) => ([u[i0], u[i1], u[i2]], true),
+                None => ([[0.0; 2]; 3], false),
+            };
+            let (tan, tan_w, has_tan) = match tans_opt {
+                Some(ts) => {
+                    let t0 = mul_mat3(&xf.m, [ts[i0][0], ts[i0][1], ts[i0][2]]).normalized().unwrap_or(Vec3::new(1.0, 0.0, 0.0));
+                    let t1 = mul_mat3(&xf.m, [ts[i1][0], ts[i1][1], ts[i1][2]]).normalized().unwrap_or(t0);
+                    let t2 = mul_mat3(&xf.m, [ts[i2][0], ts[i2][1], ts[i2][2]]).normalized().unwrap_or(t0);
+                    let w = if (ts[i0][3] < 0.0) ^ mirrored { -1.0 } else { 1.0 };
+                    ([t0, t1, t2], w, true)
+                }
+                None => ([Vec3::new(1.0, 0.0, 0.0); 3], 1.0, false),
+            };
+            let (col, has_col) = match cols_opt {
+                Some(cs) => {
+                    let dec = |c: [u8; 4]| [f64::from(c[0]) / 255.0, f64::from(c[1]) / 255.0, f64::from(c[2]) / 255.0, f64::from(c[3]) / 255.0];
+                    ([dec(cs[i0]), dec(cs[i1]), dec(cs[i2])], true)
+                }
+                None => ([[1.0, 0.5, 1.0, 0.5]; 3], false),
+            };
 
             let len_bc = (c - b).length().max(LEAST_STEP);
             let len_ca = e2.length().max(LEAST_STEP);
             let len_ab = e1.length().max(LEAST_STEP);
             let alt_scale = [twice_area / len_bc, twice_area / len_ca, twice_area / len_ab];
 
-            let role = roles.get(ti).map_or(0u32, |r| r.0);
-            let (albedo_linear, albedo_srgb, metallic, roughness, emissive) = if let Some(rgb) = part.tint_override {
+            let role_idx = roles.get(ti).map(|r| r.0).unwrap_or(0);
+            let (
+                albedo_linear,
+                albedo_srgb,
+                metallic,
+                roughness,
+                emissive,
+                clearcoat,
+                clearcoat_roughness,
+                anisotropy,
+                sheen_colour,
+                sheen_roughness,
+                transmission,
+                ior,
+            ) = if let Some(rgb) = part.tint_override {
                 let srgb = [f64::from(rgb[0]) / 255.0, f64::from(rgb[1]) / 255.0, f64::from(rgb[2]) / 255.0];
                 let lin = [srgb_to_linear(rgb[0]), srgb_to_linear(rgb[1]), srgb_to_linear(rgb[2])];
-                (lin, srgb, 0.15, 0.55, [0.0; 3])
-            } else if let Some(mat) = roles.get(ti).and_then(|r| materials.get(r.0 as usize)) {
+                (lin, srgb, 0.15, 0.55, [0.0; 3], 0.0, 0.1, 0.0, [0.0; 3], 0.5, 0.0, 1.5)
+            } else if let Some(mat) = materials.get(role_idx as usize) {
                 let lin = [
                     mat.base_colour[0].clamp(0.0, 1.0),
                     mat.base_colour[1].clamp(0.0, 1.0),
@@ -729,9 +1152,13 @@ fn build_bvh<'s>(
                 let srgb = [linear_to_srgb(lin[0]), linear_to_srgb(lin[1]), linear_to_srgb(lin[2])];
                 let em_scale = mat.emissive_strength.unwrap_or(1.0).max(0.0);
                 let em = [mat.emissive[0] * em_scale, mat.emissive[1] * em_scale, mat.emissive[2] * em_scale];
-                (lin, srgb, mat.metallic.clamp(0.0, 1.0), mat.roughness.clamp(0.04, 1.0), em)
+                let (cc, cc_r) = mat.clearcoat.map(|c| (c.factor.clamp(0.0, 1.0), c.roughness.clamp(0.04, 1.0))).unwrap_or((0.0, 0.1));
+                let aniso = mat.anisotropy.map(|a| a.strength.clamp(-0.95, 0.95)).unwrap_or(0.0);
+                let (sc, sr) = mat.sheen.map(|s| (s.colour, s.roughness.clamp(0.04, 1.0))).unwrap_or(([0.0; 3], 0.5));
+                let (tr, ior) = mat.transmission.map(|t| (t.factor.clamp(0.0, 1.0), t.ior.max(1.0))).unwrap_or((0.0, 1.5));
+                (lin, srgb, mat.metallic.clamp(0.0, 1.0), mat.roughness.clamp(0.04, 1.0), em, cc, cc_r, aniso, sc, sr, tr, ior)
             } else {
-                (fb_linear, fb_srgb, 0.2, 0.5, [0.0; 3])
+                (fb_linear, fb_srgb, 0.2, 0.5, [0.0; 3], 0.0, 0.1, 0.0, [0.0; 3], 0.5, 0.0, 1.5)
             };
 
             let lo = a.min(b).min(c);
@@ -745,17 +1172,29 @@ fn build_bvh<'s>(
                 n1,
                 n2,
                 ng,
-                uvs,
-                tangents,
+                uv,
+                tan,
+                tan_w,
+                col,
+                has_uv,
+                has_tan,
+                has_col,
                 alt_scale,
                 albedo_linear,
                 albedo_srgb,
                 metallic,
                 roughness,
                 emissive,
-                role,
-                has_tint_override,
+                clearcoat,
+                clearcoat_roughness,
+                anisotropy,
+                sheen_colour,
+                sheen_roughness,
+                transmission,
+                ior,
+                role_idx,
                 part_idx: part_idx as u32,
+                has_tint_override: part.tint_override.is_some(),
                 bounds: Aabb3::new(lo, hi),
                 centroid,
             })?;
@@ -763,7 +1202,15 @@ fn build_bvh<'s>(
     }
 
     if tris.is_empty() {
-        return Ok(MeshBvh { nodes: Vec::new_in(scratch), tris, inv_xforms, scene_bounds: Aabb3::EMPTY });
+        let zero_light = EmissiveLight { pos: Vec3::ZERO, power: [0.0; 3], radius: 0.05 };
+        return Ok(MeshBvh {
+            nodes: Vec::new_in(scratch),
+            tris,
+            inv_xforms,
+            scene_bounds: Aabb3::EMPTY,
+            emissive_lights: [zero_light; 12],
+            emissive_count: 0,
+        });
     }
 
     let mut nodes: Vec<BvhNode, Alloc<'s>> = Vec::try_with_capacity_in(tris.len().saturating_mul(2), scratch)?;
@@ -863,7 +1310,75 @@ fn build_bvh<'s>(
         push(&mut work, (left_idx, start, mid))?;
     }
 
-    Ok(MeshBvh { nodes, tris, inv_xforms, scene_bounds: root_bounds })
+    // Deterministically cluster emissive triangles into up to 12 local area lights for noise-free NEE.
+    let mut clusters_pos = [Vec3::ZERO; 12];
+    let mut clusters_pow = [[0.0f64; 3]; 12];
+    let mut clusters_area = [0.0f64; 12];
+    let mut clusters_bounds = [Aabb3::EMPTY; 12];
+    let mut cluster_n = 0usize;
+    let merge_dist = (root_bounds.hi - root_bounds.lo).length() * 0.08;
+    let merge_r2 = (merge_dist.clamp(0.18, 0.55)).powi(2);
+
+    for t in tris.iter() {
+        let emax = t.emissive[0].max(t.emissive[1]).max(t.emissive[2]);
+        if emax <= 0.25 {
+            continue;
+        }
+        let area = 0.5 * t.e1.cross(t.e2).length();
+        if area <= 1e-9 {
+            continue;
+        }
+        // Find nearest existing cluster within merge radius.
+        let mut target = None;
+        let mut best_d2 = merge_r2;
+        for ci in 0..cluster_n {
+            let cur_c = clusters_pos[ci] * (1.0 / clusters_area[ci].max(1e-9));
+            let d = t.centroid - cur_c;
+            let d2 = d.dot(d);
+            if d2 < best_d2 {
+                best_d2 = d2;
+                target = Some(ci);
+            }
+        }
+        let ci = if let Some(idx) = target {
+            idx
+        } else if cluster_n < 12 {
+            let idx = cluster_n;
+            cluster_n += 1;
+            idx
+        } else {
+            // Merge into nearest cluster when >12 clusters exist.
+            let mut nearest = 0usize;
+            let mut nd2 = f64::INFINITY;
+            for ci in 0..12 {
+                let cur_c = clusters_pos[ci] * (1.0 / clusters_area[ci].max(1e-9));
+                let d = t.centroid - cur_c;
+                let d2 = d.dot(d);
+                if d2 < nd2 {
+                    nd2 = d2;
+                    nearest = ci;
+                }
+            }
+            nearest
+        };
+        clusters_pos[ci] = clusters_pos[ci] + t.centroid * area;
+        clusters_area[ci] += area;
+        clusters_bounds[ci] = union_aabb(&clusters_bounds[ci], &t.bounds);
+        for c in 0..3 {
+            clusters_pow[ci][c] += t.emissive[c] * area;
+        }
+    }
+
+    let zero_light = EmissiveLight { pos: Vec3::ZERO, power: [0.0; 3], radius: 0.05 };
+    let mut emissive_lights = [zero_light; 12];
+    for ci in 0..cluster_n {
+        let inv_a = 1.0 / clusters_area[ci].max(1e-9);
+        let pos = clusters_pos[ci] * inv_a;
+        let rad = ((clusters_bounds[ci].hi - clusters_bounds[ci].lo).length() * 0.5).max(0.06);
+        emissive_lights[ci] = EmissiveLight { pos, power: clusters_pow[ci], radius: rad };
+    }
+
+    Ok(MeshBvh { nodes, tris, inv_xforms, scene_bounds: root_bounds, emissive_lights, emissive_count: cluster_n })
 }
 
 #[inline]
@@ -905,7 +1420,19 @@ fn range_bounds(tris: &[WorldTri]) -> Aabb3 {
 }
 
 impl MeshBvh<'_> {
-    fn trace(&self, origin: Vec3, dir: Vec3, mut best_t: f64, stats: &mut PictureStats) -> Option<MeshHit> {
+    #[inline]
+    fn trace(&self, origin: Vec3, dir: Vec3, best_t: f64, stats: &mut PictureStats) -> Option<MeshHit> {
+        self.as_ref().trace(origin, dir, best_t, stats)
+    }
+
+    #[inline]
+    fn occluded(&self, origin: Vec3, dir: Vec3, max_t: f64, stats: &mut PictureStats) -> bool {
+        self.as_ref().occluded(origin, dir, max_t, stats)
+    }
+}
+
+impl MeshBvhRef<'_> {
+    fn trace(self, origin: Vec3, dir: Vec3, mut best_t: f64, stats: &mut PictureStats) -> Option<MeshHit> {
         if self.nodes.is_empty() {
             return None;
         }
@@ -972,7 +1499,17 @@ impl MeshBvh<'_> {
         best
     }
 
-    fn occluded(&self, origin: Vec3, dir: Vec3, max_t: f64, stats: &mut PictureStats) -> bool {
+    fn occluded(self, origin: Vec3, dir: Vec3, max_t: f64, stats: &mut PictureStats) -> bool {
+        self.occluded_ex(origin, dir, max_t, false, stats)
+    }
+
+    /// Shadow-ray occlusion test that lets clear refractive glass (`transmission > 0.35`) transmit
+    /// direct sunlight and local emissive light into interiors, cockpits, and optical barrels.
+    fn occluded_opaque(self, origin: Vec3, dir: Vec3, max_t: f64, stats: &mut PictureStats) -> bool {
+        self.occluded_ex(origin, dir, max_t, true, stats)
+    }
+
+    fn occluded_ex(self, origin: Vec3, dir: Vec3, max_t: f64, skip_glass: bool, stats: &mut PictureStats) -> bool {
         if self.nodes.is_empty() {
             return false;
         }
@@ -992,8 +1529,12 @@ impl MeshBvh<'_> {
                 let start = node.first as usize;
                 let end = start + node.count as usize;
                 for idx in start..end {
+                    let tri = &self.tris[idx];
+                    if skip_glass && tri.transmission > 0.35 {
+                        continue;
+                    }
                     stats.points += 1;
-                    if intersect_tri(origin, dir, &self.tris[idx], max_t).is_some() {
+                    if intersect_tri(origin, dir, tri, max_t).is_some() {
                         return true;
                     }
                 }
@@ -1088,7 +1629,6 @@ fn mesh_ao(
     (1.0 - strength) + strength * open
 }
 
-/// Effective per-hit PBR material parameters after optional baked texture sampling.
 #[derive(Clone, Copy)]
 struct SampledSurface {
     albedo_linear: [f64; 3],
@@ -1133,13 +1673,11 @@ fn shade_mesh_hit(
         metallic: tri.metallic,
         roughness: tri.roughness,
     };
-
-    if let Some(uvs) = tri.uvs
-        && let Some(maps) = material_maps.get(tri.role as usize)
+    if tri.has_uv
+        && let Some(maps) = material_maps.get(tri.role_idx as usize)
     {
-        let uv_u = uvs[0][0] * w + uvs[1][0] * hit.u + uvs[2][0] * hit.v;
-        let uv_v = uvs[0][1] * w + uvs[1][1] * hit.u + uvs[2][1] * hit.v;
-
+        let uv_u = f64::from(tri.uv[0][0]) * w + f64::from(tri.uv[1][0]) * hit.u + f64::from(tri.uv[2][0]) * hit.v;
+        let uv_v = f64::from(tri.uv[0][1]) * w + f64::from(tri.uv[1][1]) * hit.u + f64::from(tri.uv[2][1]) * hit.v;
         if !tri.has_tint_override
             && let Some(tex) = maps.base_colour
         {
@@ -1150,23 +1688,17 @@ fn shade_mesh_hit(
                 surface.albedo_srgb[c] = (surface.albedo_srgb[c] * s_raw[c]).clamp(0.0, 1.0);
             }
         }
-
         if let Some(tex) = maps.metallic_roughness {
             let mr = tex.sample_bilinear(uv_u, uv_v);
             surface.roughness = (surface.roughness * mr[1]).clamp(0.04, 1.0);
             surface.metallic = (surface.metallic * mr[2]).clamp(0.0, 1.0);
         }
-
         if let Some(tex) = maps.normal
-            && let Some(tans) = tri.tangents
+            && tri.has_tan
         {
-            let tx = tans[0][0] * w + tans[1][0] * hit.u + tans[2][0] * hit.v;
-            let ty = tans[0][1] * w + tans[1][1] * hit.u + tans[2][1] * hit.v;
-            let tz = tans[0][2] * w + tans[1][2] * hit.u + tans[2][2] * hit.v;
-            let tw = if tans[0][3] * w + tans[1][3] * hit.u + tans[2][3] * hit.v < 0.0 { -1.0 } else { 1.0 };
-            let t_raw = Vec3::new(tx, ty, tz);
+            let t_raw = tri.tan[0] * w + tri.tan[1] * hit.u + tri.tan[2] * hit.v;
             if let Some(t_dir) = (t_raw - n * t_raw.dot(n)).normalized() {
-                let b_dir = n.cross(t_dir) * tw;
+                let b_dir = n.cross(t_dir) * tri.tan_w;
                 let nm = tex.sample_bilinear(uv_u, uv_v);
                 let scale = if maps.normal_scale.is_finite() { maps.normal_scale } else { 1.0 };
                 let nx = (nm[0] * 2.0 - 1.0) * scale;
@@ -1230,6 +1762,29 @@ fn shade_mesh_hit(
                     ]
                 }
                 Shading::Studio(studio) => shade_mesh_studio(bvh, cam, ctx, &studio, p, dir, n, ng_face, tri, &surface, stats),
+                Shading::Pbr(pbr) => {
+                    let seed = ((sy as i64).wrapping_mul(1973) ^ (sx as i64).wrapping_mul(9277)) as i64;
+                    let params = PbrRenderParams::from_mesh_opts(o);
+                    let hdr = shade_mesh_pbr_hdr(
+                        bvh.as_ref(),
+                        ctx,
+                        &params,
+                        &pbr,
+                        p,
+                        dir,
+                        n,
+                        ng_face,
+                        tri,
+                        w,
+                        hit.u,
+                        hit.v,
+                        pbr.reflection_bounces,
+                        seed,
+                        stats,
+                    );
+                    let mapped = apply_tonemap(hdr, pbr.exposure, pbr.tonemap);
+                    [mapped[0], mapped[1], mapped[2], 1.0]
+                }
             },
         },
     };
@@ -1381,8 +1936,6 @@ fn shade_mesh_studio(
         0.0
     };
     let rim_tint = [0.95, 0.98, 1.04];
-
-    // Optional movable studio strip lights (exact no-op when all slots are `None`).
     let strip_contrib = eval_strip_lights(cam, &studio.strip_lights, n, v, surface.roughness, ao);
 
     let mut out = [0.0f64; 4];
@@ -1399,4 +1952,839 @@ fn shade_mesh_studio(
     out[3] = 1.0;
     let _ = quantize;
     out
+}
+
+// ---- Photoreal PBR (GGX + HDRI IBL + CC0 Textures + SDF Smart Materials + Bounces) -------
+
+/// Deterministic Vogel-disk 8-point offsets for soft area shadows (zero RNG, zero banding).
+const VOGEL_DISK_8: [[f64; 2]; 8] = [
+    [0.25000000, 0.00000000],
+    [-0.31932325, 0.29245940],
+    [0.04885020, -0.55671855],
+    [0.44949576, 0.48477474],
+    [-0.72858899, -0.07291663],
+    [0.54166402, -0.60619752],
+    [-0.00797848, 0.87584050],
+    [-0.64096839, -0.71315826],
+];
+
+/// Evaluate deterministic soft area shadow visibility in `[0, 1]` toward `light_dir`,
+/// rotated per sample via a deterministic pixel seed so supersampled penumbras have zero banding.
+#[allow(clippy::too_many_arguments)]
+fn mesh_soft_shadow(
+    bvh: MeshBvhRef<'_>,
+    p: Vec3,
+    ng: Vec3,
+    light_dir: Vec3,
+    angular_radius: f64,
+    bias: f64,
+    max_t: f64,
+    samples: u8,
+    seed: i64,
+    stats: &mut PictureStats,
+) -> f64 {
+    if samples == 0 {
+        return 1.0;
+    }
+    let origin = p + ng * bias;
+    if samples == 1 || angular_radius <= 1e-5 {
+        return if bvh.occluded_opaque(origin, light_dir, max_t, stats) { 0.0 } else { 1.0 };
+    }
+    let helper = if light_dir.z.abs() < 0.9 { Vec3::new(0.0, 0.0, 1.0) } else { Vec3::new(1.0, 0.0, 0.0) };
+    let u = helper.cross(light_dir).normalized().unwrap_or(Vec3::new(1.0, 0.0, 0.0));
+    let v = light_dir.cross(u);
+    let ang = hash2(seed, 17, 0x51a3) * core::f64::consts::TAU;
+    let ca = blaze_math::cos(ang);
+    let sa = blaze_math::sin(ang);
+    let n = usize::from(samples).min(VOGEL_DISK_8.len());
+    let mut lit = 0usize;
+    for d in &VOGEL_DISK_8[..n] {
+        let rx = (d[0] * ca - d[1] * sa) * angular_radius;
+        let ry = (d[0] * sa + d[1] * ca) * angular_radius;
+        let dir = (light_dir + u * rx + v * ry).normalized().unwrap_or(light_dir);
+        if !bvh.occluded_opaque(origin, dir, max_t, stats) {
+            lit += 1;
+        }
+    }
+    (lit as f64) / (n as f64)
+}
+
+/// Deterministic 1-bounce BVH hemisphere global illumination + directional sky visibility +
+/// indirect emissive lighting (using Cranley-Patterson rotated cosine-weighted hemisphere rays).
+///
+/// Returns `(diffuse_irradiance, sky_visibility)`:
+/// - Open rays sample the true directional HDRI sky (`sample_environment`).
+/// - Occluded rays bounce hit-surface emissive light (e.g. warm hearth windows & cyan ion
+///   thrusters lighting nearby wood/stone/nozzles!) plus 1-bounce sunlit diffuse color bleeding.
+#[allow(clippy::too_many_arguments)]
+fn eval_bvh_gi(
+    bvh: MeshBvhRef<'_>,
+    pbr: &PbrOpts,
+    p: Vec3,
+    n: Vec3,
+    ng: Vec3,
+    bias: f64,
+    max_t: f64,
+    n_rays: u8,
+    seed: i64,
+    world_up: Vec3,
+    dom: blaze_pbr::DominantLight,
+    stats: &mut PictureStats,
+) -> ([f64; 3], f64) {
+    let count = usize::from(n_rays).min(12);
+    if count == 0 {
+        return ([0.0; 3], 1.0);
+    }
+    let helper = if n.z.abs() < 0.9 { Vec3::new(0.0, 0.0, 1.0) } else { Vec3::new(1.0, 0.0, 0.0) };
+    let t_ax = helper.cross(n).normalized().unwrap_or(Vec3::new(1.0, 0.0, 0.0));
+    let b_ax = n.cross(t_ax);
+
+    let rot = hash2(seed, 31, 0x9e37) * core::f64::consts::TAU;
+    let r_jitter = hash2(seed, 53, 0x7f4a);
+    let golden = 2.399963229728653; // pi * (3 - sqrt(5))
+    let origin = p + ng * bias;
+    let ao_reach = max_t * 0.28;
+
+    let mut irr = [0.0f64; 3];
+    let mut vis_sum = 0.0f64;
+    let mut weight_sum = 0.0f64;
+
+    for i in 0..count {
+        // Stratified cosine-weighted hemisphere sample via Malley's disk projection.
+        let r2 = ((i as f64) + 0.15 + 0.70 * ((r_jitter + (i as f64) * 0.6180339887).fract())) / (count as f64);
+        let r = blaze_math::sqrt(r2.clamp(0.002, 0.985));
+        let phi = rot + (i as f64) * golden;
+        let lx = r * blaze_math::cos(phi);
+        let ly = r * blaze_math::sin(phi);
+        let lz = blaze_math::sqrt((1.0 - r * r).max(0.001));
+        let wi = (t_ax * lx + b_ax * ly + n * lz).normalized().unwrap_or(n);
+        if wi.dot(ng) <= 0.015 {
+            continue;
+        }
+        weight_sum += 1.0;
+        stats.rays += 1;
+        if let Some(hit) = bvh.trace(origin, wi, max_t, stats) {
+            let tri = &bvh.tris[hit.tri_idx as usize];
+            if tri.transmission > 0.35 {
+                // Clear glass transmits soft sky irradiance into interiors and cockpits!
+                let sky = sample_environment(pbr.environment, wi, world_up);
+                let tr = (tri.transmission * 0.85).clamp(0.0, 0.9);
+                for c in 0..3 {
+                    irr[c] += sky[c] * tr;
+                }
+                vis_sum += tr;
+                continue;
+            }
+            let mut hn = tri.ng;
+            if hn.dot(wi) > 0.0 {
+                hn = hn * -1.0;
+            }
+            // Fast 1-bounce diffuse color bleeding from hit triangle (emissive lights are handled
+            // noise-free via deterministic Next-Event Estimation `eval_emissive_nee`!).
+            let ndotl = hn.dot(dom.direction).max(0.0);
+            let sky_fill = 0.22 + 0.28 * (0.5 + 0.5 * hn.dot(world_up));
+            let bounce_scale = (1.0 - tri.metallic * 0.7) * 0.85;
+            for c in 0..3 {
+                let direct_b = dom.colour[c] * pbr.direct_intensity * ndotl * 0.24;
+                let amb_b = 0.35 * sky_fill * pbr.ibl_intensity;
+                let bounced = (tri.albedo_linear[c] * bounce_scale * (direct_b + amb_b)).min(3.0);
+                irr[c] += bounced;
+            }
+            // Distance-weighted sky visibility for smooth contact AO under eaves & crevices.
+            let dist_open = smoothstep_f64(0.0, ao_reach, hit.t) * 0.35;
+            vis_sum += dist_open;
+        } else {
+            let sky = sample_environment(pbr.environment, wi, world_up);
+            for c in 0..3 {
+                irr[c] += sky[c];
+            }
+            vis_sum += 1.0;
+        }
+    }
+
+    if weight_sum <= 0.0 {
+        return ([0.0; 3], 1.0);
+    }
+    let inv = 1.0 / weight_sum;
+    let raw_vis = (vis_sum * inv).clamp(0.0, 1.0);
+    let ao_vis = (1.0 - pbr.ao_strength) + pbr.ao_strength * raw_vis;
+    ([irr[0] * inv, irr[1] * inv, irr[2] * inv], ao_vis)
+}
+
+/// Noise-free Next-Event Estimation (NEE) from clustered emissive meshes (e.g. warm brass porch
+/// lantern lighting cedar walls & oak doors, or cyan ion thrusters illuminating thruster nozzles
+/// and glossy hangar decks).
+#[allow(clippy::too_many_arguments)]
+fn eval_emissive_nee(
+    bvh: MeshBvhRef<'_>,
+    surf: &SurfacePbr,
+    p: Vec3,
+    n: Vec3,
+    ng: Vec3,
+    t_vec: Vec3,
+    b_vec: Vec3,
+    view_v: Vec3,
+    bias: f64,
+    stats: &mut PictureStats,
+) -> [f64; 3] {
+    let mut out = [0.0f64; 3];
+    if bvh.emissive_count == 0 {
+        return out;
+    }
+    let origin = p + ng * bias;
+    for light in &bvh.emissive_lights[..bvh.emissive_count] {
+        let to_l = light.pos - p;
+        let d2 = to_l.dot(to_l);
+        let d = blaze_math::sqrt(d2);
+        if d <= light.radius * 0.65 {
+            continue;
+        }
+        let l_dir = to_l * (1.0 / d);
+        if n.dot(l_dir) <= 1e-4 || ng.dot(l_dir) <= 0.0 {
+            continue;
+        }
+        let atten = 1.0 / (4.0 * core::f64::consts::PI * (d2 + light.radius * light.radius * 0.65));
+        let max_rad = (light.power[0].max(light.power[1]).max(light.power[2])) * atten;
+        if max_rad < 4e-3 {
+            continue;
+        }
+        let max_t = (d - light.radius * 0.92 - bias).max(bias);
+        if max_t > bias && bvh.occluded_opaque(origin, l_dir, max_t, stats) {
+            continue;
+        }
+        let brdf = eval_direct_brdf(surf, n, t_vec, b_vec, view_v, l_dir);
+        // Scale radiant flux slightly so real-world-sized bulbs/thrusters cast natural visible pools.
+        let gain = 3.2 * atten;
+        out[0] += brdf[0] * light.power[0] * gain;
+        out[1] += brdf[1] * light.power[1] * gain;
+        out[2] += brdf[2] * light.power[2] * gain;
+    }
+    out
+}
+
+/// Shade a primary miss ray in linear HDR: environment-matched PBR ground (alpine stone/meadow
+/// terrain, glossy paneled hangar floor with real aircraft reflections, or photographic studio
+/// sweep) fading smoothly into the procedural HDRI environment & atmospheric horizon.
+#[allow(clippy::too_many_arguments)]
+fn shade_pbr_miss_hdr(
+    bvh: MeshBvhRef<'_>,
+    ctx: &ShadeContext,
+    o: &PbrRenderParams<'_>,
+    pbr: &PbrOpts,
+    origin: Vec3,
+    dir: Vec3,
+    seed: i64,
+    stats: &mut PictureStats,
+) -> ([f64; 3], f64, GBufferPixel) {
+    let world_up = Vec3::new(0.0, 0.0, 1.0);
+    let env_hdr = if pbr.env_background {
+        sample_environment(pbr.environment, dir, world_up)
+    } else {
+        [ctx.bg_linear[0], ctx.bg_linear[1], ctx.bg_linear[2]]
+    };
+
+    if pbr.ground_plane && !bvh.scene_bounds.is_empty() && dir.z < -1e-6 {
+        let z_floor = bvh.scene_bounds.lo.z - (ctx.scene_diag * 1e-4).max(1e-5);
+        let t = (z_floor - origin.z) / dir.z;
+        if t > LEAST_STEP {
+            let p = origin + dir * t;
+            let cx = 0.5 * (bvh.scene_bounds.lo.x + bvh.scene_bounds.hi.x);
+            let cy = 0.5 * (bvh.scene_bounds.lo.y + bvh.scene_bounds.hi.y);
+            let dx = p.x - cx;
+            let dy = p.y - cy;
+            let dist = blaze_math::sqrt(dx * dx + dy * dy);
+            let max_r = ctx.scene_diag * 14.0;
+            // Smooth horizon atmosphere target (slightly above z=0 so floor dissolves seamlessly into sky haze, zero dark band!).
+            let horizon_dir = Vec3::new(dir.x, dir.y, 0.018).normalized().unwrap_or(dir);
+            let horizon_hdr = if pbr.env_background {
+                sample_environment(pbr.environment, horizon_dir, world_up)
+            } else {
+                [ctx.bg_linear[0], ctx.bg_linear[1], ctx.bg_linear[2]]
+            };
+            if dist < max_r {
+                let fade = 1.0 - smoothstep_f64(max_r * 0.16, max_r, dist);
+                let mut n = world_up;
+                let t_ax = Vec3::new(1.0, 0.0, 0.0);
+                let b_ax = Vec3::new(0.0, 1.0, 0.0);
+                let v = dir * -1.0;
+                let bias = (ctx.scene_diag * 2e-4).max(1e-4);
+                let dom = dominant_light(pbr.environment, world_up);
+
+                // Procedural environment-matched PBR ground material!
+                let (ground_albedo, ground_rough, ground_reflect) = match pbr.environment {
+                    EnvironmentPreset::GoldenHour | EnvironmentPreset::OvercastSky => {
+                        // Photographic alpine mountain clearing: mossy dark forest loam, dry pine
+                        // needles, weathered meadow grass tufts, and crushed slate drainage gravel.
+                        let macro_n = fbm3(Vec3::new(p.x * 0.14, p.y * 0.14, 0.4), 4);
+                        let mid_n = fbm3(Vec3::new(p.x * 0.72 + 2.3, p.y * 0.72 - 1.7, 1.2), 4);
+                        let fine_n = fbm3(Vec3::new(p.x * 4.8, p.y * 4.8, 2.7), 3);
+                        let pebbles = fbm3(Vec3::new(p.x * 16.0, p.y * 16.0, 4.1), 2);
+                        let apron = 1.0 - smoothstep_f64(ctx.scene_diag * 0.30, ctx.scene_diag * 0.62, dist);
+                        let meadow_col = [
+                            0.048 + 0.045 * macro_n + 0.028 * mid_n + 0.014 * fine_n,
+                            0.072 + 0.056 * macro_n + 0.025 * fine_n,
+                            0.028 + 0.018 * macro_n,
+                        ];
+                        let loam_col = [
+                            0.082 + 0.042 * mid_n + 0.025 * fine_n,
+                            0.058 + 0.032 * mid_n + 0.018 * fine_n,
+                            0.036 + 0.018 * mid_n,
+                        ];
+                        let gravel_col = [
+                            0.115 + 0.055 * pebbles + 0.032 * fine_n,
+                            0.110 + 0.050 * pebbles + 0.030 * fine_n,
+                            0.102 + 0.045 * pebbles + 0.025 * fine_n,
+                        ];
+                        let w_loam = smoothstep_f64(0.36, 0.72, mid_n * 0.7 + macro_n * 0.3);
+                        let forest_col = [
+                            meadow_col[0] + (loam_col[0] - meadow_col[0]) * w_loam,
+                            meadow_col[1] + (loam_col[1] - meadow_col[1]) * w_loam,
+                            meadow_col[2] + (loam_col[2] - meadow_col[2]) * w_loam,
+                        ];
+                        let w_g = (apron * (0.50 + 0.50 * mid_n)).clamp(0.0, 1.0);
+                        let col = [
+                            forest_col[0] + (gravel_col[0] - forest_col[0]) * w_g,
+                            forest_col[1] + (gravel_col[1] - forest_col[1]) * w_g,
+                            forest_col[2] + (gravel_col[2] - forest_col[2]) * w_g,
+                        ];
+                        // Crisp multi-scale raking micro-bump so low golden-hour sun catches soil & gravel!
+                        let gx = (fbm3(Vec3::new((p.x + 0.045) * 3.6, p.y * 3.6, 0.9), 3)
+                            - fbm3(Vec3::new((p.x - 0.045) * 3.6, p.y * 3.6, 0.9), 3))
+                            + 0.45 * (fbm3(Vec3::new((p.x + 0.015) * 14.0, p.y * 14.0, 2.2), 2)
+                                - fbm3(Vec3::new((p.x - 0.015) * 14.0, p.y * 14.0, 2.2), 2));
+                        let gy = (fbm3(Vec3::new(p.x * 3.6, (p.y + 0.045) * 3.6, 0.9), 3)
+                            - fbm3(Vec3::new(p.x * 3.6, (p.y - 0.045) * 3.6, 0.9), 3))
+                            + 0.45 * (fbm3(Vec3::new(p.x * 14.0, (p.y + 0.015) * 14.0, 2.2), 2)
+                                - fbm3(Vec3::new(p.x * 14.0, (p.y - 0.015) * 14.0, 2.2), 2));
+                        n = Vec3::new(-gx * 0.48, -gy * 0.48, 1.0).normalized().unwrap_or(world_up);
+                        let rough = (0.88 - 0.16 * w_g + 0.08 * fine_n).clamp(0.62, 0.97);
+                        (col, rough, 0.0)
+                    }
+                    EnvironmentPreset::HangarBay => {
+                        // Polished dark concrete/epoxy aerospace hangar deck with crisp 2.0m expansion joints!
+                        let tile = 1.8;
+                        let fx = (p.x / tile).rem_euclid(1.0);
+                        let fy = (p.y / tile).rem_euclid(1.0);
+                        let seam = ((fx.min(1.0 - fx) / 0.012).min(fy.min(1.0 - fy) / 0.012)).clamp(0.0, 1.0);
+                        let wear = fbm3(Vec3::new(p.x * 0.65, p.y * 0.65, 0.3), 4);
+                        let micro = fbm3(Vec3::new(p.x * 3.8, p.y * 3.8, 1.7), 2);
+                        let base_v = (0.72 + 0.38 * wear) * (0.45 + 0.55 * seam);
+                        let col = [
+                            pbr.ground_colour[0] * base_v,
+                            pbr.ground_colour[1] * base_v * 1.02,
+                            pbr.ground_colour[2] * base_v * 1.06,
+                        ];
+                        let rough = (0.24 + 0.20 * (1.0 - wear) + 0.06 * micro + 0.35 * (1.0 - seam)).clamp(0.16, 0.85);
+                        (col, rough, 0.42 * seam)
+                    }
+                    EnvironmentPreset::StudioSoftbox => {
+                        // Sleek satin commercial studio sweep floor with subtle contact-hardening reflection.
+                        let subtle = 0.95 + 0.08 * fbm3(Vec3::new(p.x * 0.6, p.y * 0.6, 0.2), 2);
+                        let col = [
+                            pbr.ground_colour[0] * subtle,
+                            pbr.ground_colour[1] * subtle,
+                            pbr.ground_colour[2] * subtle,
+                        ];
+                        (col, 0.24, 0.34)
+                    }
+                };
+
+                let (gi_irr, sky_vis) = eval_bvh_gi(
+                    bvh,
+                    pbr,
+                    p,
+                    n,
+                    world_up,
+                    bias,
+                    ctx.scene_diag * 2.2,
+                    pbr.ao_steps.min(8),
+                    seed,
+                    world_up,
+                    dom,
+                    stats,
+                );
+                let shadow = mesh_soft_shadow(
+                    bvh,
+                    p,
+                    world_up,
+                    dom.direction,
+                    dom.angular_radius,
+                    bias,
+                    ctx.scene_diag * 3.5,
+                    pbr.shadow_samples,
+                    seed,
+                    stats,
+                );
+                let ground_surf = SurfacePbr {
+                    base_colour: ground_albedo,
+                    metallic: 0.0,
+                    roughness: ground_rough,
+                    ao: sky_vis,
+                    ..SurfacePbr::DEFAULT
+                };
+                let direct = eval_direct_brdf(&ground_surf, n, t_ax, b_ax, v, dom.direction);
+                let mut ibl = eval_ibl_with_irradiance(
+                    pbr.environment,
+                    &ground_surf,
+                    n,
+                    t_ax,
+                    b_ax,
+                    v,
+                    world_up,
+                    pbr.ibl_intensity,
+                    if pbr.ao_steps > 0 { Some(gi_irr) } else { None },
+                );
+
+                // VNDF rough GGX glossy floor reflection on Hangar/Studio floors: sharp at contact,
+                // naturally softening with distance just like real concrete and studio floors!
+                if ground_reflect > 0.05 && pbr.reflection_bounces > 0 {
+                    let ndotv = n.dot(v).clamp(1e-4, 1.0);
+                    let u1 = hash2(seed, 71, 0x4b1d);
+                    let u2 = hash2(seed, 89, 0x8c3a);
+                    let r_dir = sample_ggx_vndf(v, n, t_ax, b_ax, (ground_rough * 0.62).clamp(0.04, 0.45), 0.0, u1, u2);
+                    if r_dir.z > 0.01 {
+                        stats.rays += 1;
+                        if let Some(rhit) = bvh.trace(p + world_up * bias, r_dir, ctx.scene_diag * 3.0, stats) {
+                            let rtri = &bvh.tris[rhit.tri_idx as usize];
+                            let rp = p + world_up * bias + r_dir * rhit.t;
+                            let rw = (1.0 - rhit.u - rhit.v).max(0.0);
+                            let mut rn = (rtri.n0 * rw + rtri.n1 * rhit.u + rtri.n2 * rhit.v).normalized().unwrap_or(rtri.ng);
+                            if rn.dot(r_dir) > 0.0 {
+                                rn = rn * -1.0;
+                            }
+                            let rng = if rtri.ng.dot(r_dir) > 0.0 { rtri.ng * -1.0 } else { rtri.ng };
+                            let rcol = shade_mesh_pbr_hdr(
+                                bvh,
+                                ctx,
+                                o,
+                                pbr,
+                                rp,
+                                r_dir,
+                                rn,
+                                rng,
+                                rtri,
+                                rw,
+                                rhit.u,
+                                rhit.v,
+                                0,
+                                seed ^ 0x2a7,
+                                stats,
+                            );
+                            let fres = fresnel_schlick_roughness(ndotv, [0.05; 3], ground_rough)[0];
+                            let dist_fade = (1.0 - smoothstep_f64(0.0, ctx.scene_diag * 1.4, rhit.t)).max(0.15);
+                            let rw_blend = (ground_reflect * (0.35 + 1.8 * fres) * dist_fade).clamp(0.0, 0.65);
+                            for c in 0..3 {
+                                ibl[c] = ibl[c] * (1.0 - rw_blend * 0.5) + rcol[c] * rw_blend;
+                            }
+                        }
+                    }
+                }
+
+                let nee = eval_emissive_nee(bvh, &ground_surf, p, n, world_up, t_ax, b_ax, v, bias, stats);
+                let floor_hdr = [
+                    direct[0] * dom.colour[0] * pbr.direct_intensity * shadow + ibl[0] + nee[0],
+                    direct[1] * dom.colour[1] * pbr.direct_intensity * shadow + ibl[1] + nee[1],
+                    direct[2] * dom.colour[2] * pbr.direct_intensity * shadow + ibl[2] + nee[2],
+                ];
+                let blended = [
+                    horizon_hdr[0] + (floor_hdr[0] - horizon_hdr[0]) * fade,
+                    horizon_hdr[1] + (floor_hdr[1] - horizon_hdr[1]) * fade,
+                    horizon_hdr[2] + (floor_hdr[2] - horizon_hdr[2]) * fade,
+                ];
+                let gp = GBufferPixel {
+                    albedo: [ground_albedo[0] as f32, ground_albedo[1] as f32, ground_albedo[2] as f32],
+                    normal: [n.x as f32, n.y as f32, n.z as f32],
+                    depth: t,
+                    preserve: if fade < 0.25 { 0.85 } else { 0.0 },
+                };
+                return (blended, t, gp);
+            }
+            return (horizon_hdr, f64::INFINITY, GBufferPixel::SKY);
+        }
+    }
+
+    (env_hdr, f64::INFINITY, GBufferPixel::SKY)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn shade_pbr_miss(
+    bvh: MeshBvhRef<'_>,
+    ctx: &ShadeContext,
+    o: &PbrRenderParams<'_>,
+    pbr: &PbrOpts,
+    origin: Vec3,
+    dir: Vec3,
+    seed: i64,
+    stats: &mut PictureStats,
+) -> ([f64; 4], f64) {
+    let (hdr, t, _) = shade_pbr_miss_hdr(bvh, ctx, o, pbr, origin, dir, seed, stats);
+    if pbr.env_background || t.is_finite() {
+        let mapped = apply_tonemap(hdr, pbr.exposure, pbr.tonemap);
+        ([mapped[0], mapped[1], mapped[2], 1.0], t)
+    } else {
+        (ctx.bg_linear, f64::INFINITY)
+    }
+}
+
+/// Evaluate linear HDR radiance at a mesh hit using `blaze-pbr`.
+#[allow(clippy::too_many_arguments)]
+fn shade_mesh_pbr_hdr(
+    bvh: MeshBvhRef<'_>,
+    ctx: &ShadeContext,
+    o: &PbrRenderParams<'_>,
+    pbr: &PbrOpts,
+    p: Vec3,
+    dir: Vec3,
+    n_base: Vec3,
+    ng: Vec3,
+    tri: &WorldTri,
+    w: f64,
+    u: f64,
+    v_bary: f64,
+    bounces_left: u8,
+    seed: i64,
+    stats: &mut PictureStats,
+) -> [f64; 3] {
+    shade_mesh_pbr_hdr_gbuf(bvh, ctx, o, pbr, p, dir, n_base, ng, tri, w, u, v_bary, bounces_left, seed, stats).0
+}
+
+/// Evaluate linear HDR radiance + G-buffer pixel guidance (`albedo`, `normal`, `preserve`) at a
+/// mesh hit using `blaze-pbr` (Cook-Torrance GGX + VNDF rough reflections + 1-bounce BVH GI +
+/// emissive NEE + CC0 textures + SDF smart-material wear/grime + closed-solid glass pass-through).
+#[allow(clippy::too_many_arguments)]
+fn shade_mesh_pbr_hdr_gbuf(
+    bvh: MeshBvhRef<'_>,
+    ctx: &ShadeContext,
+    o: &PbrRenderParams<'_>,
+    pbr: &PbrOpts,
+    p: Vec3,
+    dir: Vec3,
+    n_base: Vec3,
+    ng: Vec3,
+    tri: &WorldTri,
+    w: f64,
+    u: f64,
+    v_bary: f64,
+    bounces_left: u8,
+    seed: i64,
+    stats: &mut PictureStats,
+) -> ([f64; 3], GBufferPixel) {
+    let world_up = Vec3::new(0.0, 0.0, 1.0);
+    let view_v = dir * -1.0;
+
+    // Build orthonormal tangent frame `(t_vec, b_vec, n_base)`.
+    let (t_vec, b_vec) = if tri.has_tan {
+        let t_interp = tri.tan[0] * w + tri.tan[1] * u + tri.tan[2] * v_bary;
+        let t_orth = (t_interp - n_base * n_base.dot(t_interp)).normalized().unwrap_or_else(|| {
+            let helper = if n_base.z.abs() < 0.9 { Vec3::new(0.0, 0.0, 1.0) } else { Vec3::new(1.0, 0.0, 0.0) };
+            helper.cross(n_base).normalized().unwrap_or(Vec3::new(1.0, 0.0, 0.0))
+        });
+        (t_orth, n_base.cross(t_orth) * tri.tan_w)
+    } else {
+        let helper = if n_base.z.abs() < 0.9 { Vec3::new(0.0, 0.0, 1.0) } else { Vec3::new(1.0, 0.0, 0.0) };
+        let t_orth = helper.cross(n_base).normalized().unwrap_or(Vec3::new(1.0, 0.0, 0.0));
+        (t_orth, n_base.cross(t_orth))
+    };
+
+    // Start from the material's scalar PBR factors.
+    let mut surf = SurfacePbr {
+        base_colour: tri.albedo_linear,
+        metallic: tri.metallic,
+        roughness: tri.roughness,
+        ao: 1.0,
+        emissive: tri.emissive,
+        clearcoat: tri.clearcoat,
+        clearcoat_roughness: tri.clearcoat_roughness,
+        anisotropy: tri.anisotropy,
+        sheen_colour: tri.sheen_colour,
+        sheen_roughness: tri.sheen_roughness,
+        transmission: tri.transmission,
+        ior: tri.ior,
+    };
+
+    let mut n = n_base;
+    let uv = [
+        f64::from(tri.uv[0][0]) * w + f64::from(tri.uv[1][0]) * u + f64::from(tri.uv[2][0]) * v_bary,
+        f64::from(tri.uv[0][1]) * w + f64::from(tri.uv[1][1]) * u + f64::from(tri.uv[2][1]) * v_bary,
+    ];
+
+    // 1. Sample optional CC0 PBR texture pack + optional per-part baked SDF detail normal map.
+    let mut combined_tn: Option<[f64; 3]> = None;
+    if let Some(Some(part_nmap)) = o.part_normal_maps.get(tri.part_idx as usize)
+        && tri.has_uv
+    {
+        let s = sample_bilinear(part_nmap, uv);
+        combined_tn = Some(decode_tangent_normal(s, 1.0));
+    }
+
+    if let Some(look) = o.material_looks.get(tri.role_idx as usize) {
+        let pack = &look.textures;
+        let scaled_uv = [uv[0] * pack.uv_scale[0], uv[1] * pack.uv_scale[1]];
+        let sample_map = |tex: &TextureView<'_>| -> [f64; 4] {
+            if tri.has_uv {
+                if pack.hex_tile { sample_hex_tile(tex, scaled_uv, 0.45) } else { sample_bilinear(tex, scaled_uv) }
+            } else {
+                sample_triplanar(tex, p, n_base, 1.0 / pack.uv_scale[0].max(1e-3), pack.hex_tile)
+            }
+        };
+        if let Some(albedo_tex) = &pack.albedo {
+            let s = sample_map(albedo_tex);
+            // glTF 2.0: linear baseColorFactor * sRGB-decoded baseColorTexture.
+            surf.base_colour = [
+                pbr_srgb_to_linear(s[0]) * tri.albedo_linear[0],
+                pbr_srgb_to_linear(s[1]) * tri.albedo_linear[1],
+                pbr_srgb_to_linear(s[2]) * tri.albedo_linear[2],
+            ];
+        }
+        if let Some(orm_tex) = &pack.orm {
+            let s = sample_map(orm_tex);
+            surf.ao *= s[0].clamp(0.0, 1.0);
+            surf.roughness = (s[1] * tri.roughness).clamp(0.04, 1.0);
+            surf.metallic = (s[2] * tri.metallic).clamp(0.0, 1.0);
+        }
+        if let Some(norm_tex) = &pack.normal {
+            let s = sample_map(norm_tex);
+            let detail_tn = decode_tangent_normal(s, pack.normal_scale);
+            combined_tn = Some(match combined_tn {
+                Some(base_tn) => rnm_blend(base_tn, detail_tn),
+                None => detail_tn,
+            });
+        }
+        if let Some(tn) = combined_tn {
+            n = perturb_normal(n_base, t_vec, b_vec, tn);
+            // Keep perturbed normal in the front-facing hemisphere so grazing pixels never black out.
+            if n.dot(view_v) < 0.02 {
+                n = (n + view_v * (0.04 - n.dot(view_v))).normalized().unwrap_or(n_base);
+            }
+        }
+
+        // 2. Apply SDF-mask smart-material layering (edge wear, crevice grime, upward dust, macro breakup).
+        let masks = if tri.has_col {
+            let c0 = tri.col[0];
+            let c1 = tri.col[1];
+            let c2 = tri.col[2];
+            SurfaceMasks {
+                ao: c0[0] * w + c1[0] * u + c2[0] * v_bary,
+                curvature: c0[1] * w + c1[1] * u + c2[1] * v_bary,
+                cavity: c0[2] * w + c1[2] * u + c2[2] * v_bary,
+                height: c0[3] * w + c1[3] * u + c2[3] * v_bary,
+            }
+        } else {
+            SurfaceMasks::NEUTRAL
+        };
+        surf = apply_smart_material(surf, masks, p, n, world_up, &look.smart, pbr.instance_wear);
+    } else if let Some(tn) = combined_tn {
+        n = perturb_normal(n_base, t_vec, b_vec, tn);
+    } else if tri.has_col {
+        // Even without an explicit SmartMaterial, honor baked SDF AO in `COLOR_0.r`.
+        let baked_ao = tri.col[0][0] * w + tri.col[1][0] * u + tri.col[2][0] * v_bary;
+        surf.ao *= baked_ao.clamp(0.0, 1.0);
+    }
+
+    // 3. Direct dominant light + 1-bounce BVH hemisphere GI (directional sky visibility,
+    //    color bleeding, and indirect emissive light!) combined with baked SDF & texture AO.
+    let bias = (ctx.scene_diag * 2e-4).max(LEAST_STEP * 100.0);
+    let dom = dominant_light(pbr.environment, world_up);
+    let micro_ao = surf.ao.clamp(0.0, 1.0);
+    let gi_steps = if bounces_left == pbr.reflection_bounces {
+        pbr.ao_steps
+    } else if bounces_left + 1 == pbr.reflection_bounces {
+        // Enclosed interiors & optical barrels seen through glass still need true occlusion/GI
+        // so interior rooms stay warmly enclosed instead of leaking unoccluded outdoor sky!
+        pbr.ao_steps.min(3)
+    } else {
+        0
+    };
+    let gi_override = if gi_steps > 0 {
+        let (gi_irr, rt_ao) = eval_bvh_gi(
+            bvh,
+            pbr,
+            p,
+            n,
+            ng,
+            bias,
+            ctx.scene_diag * 2.2,
+            gi_steps,
+            seed,
+            world_up,
+            dom,
+            stats,
+        );
+        surf.ao = (micro_ao * rt_ao).clamp(0.0, 1.0);
+        Some([gi_irr[0] * micro_ao, gi_irr[1] * micro_ao, gi_irr[2] * micro_ao])
+    } else {
+        None
+    };
+
+    // 4. Direct dominant light with Cranley-Patterson rotated Vogel-disk soft area shadows.
+    let shadow = if n.dot(dom.direction) > 0.0 {
+        let s_samples = if bounces_left == pbr.reflection_bounces { pbr.shadow_samples } else { pbr.shadow_samples.min(1) };
+        mesh_soft_shadow(bvh, p, ng, dom.direction, dom.angular_radius, bias, ctx.scene_diag * 2.5, s_samples, seed, stats)
+    } else {
+        0.0
+    };
+    let direct = eval_direct_brdf(&surf, n, t_vec, b_vec, view_v, dom.direction);
+
+    // 5. Environment IBL (1-bounce GI diffuse + prefiltered GGX specular + clearcoat + sheen).
+    let mut ibl = eval_ibl_with_irradiance(
+        pbr.environment,
+        &surf,
+        n,
+        t_vec,
+        b_vec,
+        view_v,
+        world_up,
+        pbr.ibl_intensity,
+        gi_override,
+    );
+
+    // 6. Real BVH secondary ray bounces for glossy/metallic reflections & refractive glass canopies!
+    if bounces_left > 0 {
+        let ndotv = n.dot(view_v).clamp(1e-4, 1.0);
+        let f = fresnel_schlick_roughness(ndotv, surf.f0(), surf.roughness);
+
+        // Glossy / metallic / clearcoat VNDF GGX rough reflection bounce (contact hardening!).
+        let spec_strength = (1.0 - surf.roughness).max(surf.clearcoat * (1.0 - surf.clearcoat_roughness));
+        if spec_strength > 0.30 {
+            let eff_r = if surf.clearcoat > 0.35 && surf.clearcoat_roughness < surf.roughness {
+                surf.clearcoat_roughness
+            } else {
+                surf.roughness
+            };
+            let u1 = hash2(seed, 101, 0x6c4e);
+            let u2 = hash2(seed, 137, 0x3b91);
+            let r_dir = if eff_r < 0.06 {
+                (n * (2.0 * ndotv) - view_v).normalized().unwrap_or(n)
+            } else {
+                sample_ggx_vndf(view_v, n, t_vec, b_vec, eff_r * 0.72, surf.anisotropy, u1, u2)
+            };
+            if r_dir.dot(ng) > 0.02 {
+                stats.rays += 1;
+                if let Some(rhit) = bvh.trace(p + ng * bias, r_dir, ctx.scene_diag * 3.0, stats) {
+                    let rtri = &bvh.tris[rhit.tri_idx as usize];
+                    let rp = p + ng * bias + r_dir * rhit.t;
+                    let rw = (1.0 - rhit.u - rhit.v).max(0.0);
+                    let mut rn = (rtri.n0 * rw + rtri.n1 * rhit.u + rtri.n2 * rhit.v).normalized().unwrap_or(rtri.ng);
+                    if rn.dot(r_dir) > 0.0 {
+                        rn = rn * -1.0;
+                    }
+                    let rng = if rtri.ng.dot(r_dir) > 0.0 { rtri.ng * -1.0 } else { rtri.ng };
+                    let bounce_col = shade_mesh_pbr_hdr(
+                        bvh,
+                        ctx,
+                        o,
+                        pbr,
+                        rp,
+                        r_dir,
+                        rn,
+                        rng,
+                        rtri,
+                        rw,
+                        rhit.u,
+                        rhit.v,
+                        bounces_left - 1,
+                        seed ^ 0x5c3,
+                        stats,
+                    );
+                    let blend = ((spec_strength - 0.32) / 0.68).clamp(0.0, 0.85);
+                    for c in 0..3 {
+                        ibl[c] = ibl[c] * (1.0 - blend * f[c]) + bounce_col[c] * blend * f[c];
+                    }
+                }
+            }
+        }
+
+        // Physical dielectric transmission bounce (sees interior cockpit / cabin rooms through
+        // closed-solid CAD glass slabs by stepping cleanly past the glass exit face!).
+        if surf.transmission > 0.05 {
+            let eta = 1.0 / surf.ior.max(1.0);
+            let k = (1.0 - eta * eta * (1.0 - ndotv * ndotv)).max(0.0);
+            let refract_dir = ((view_v * -eta) + n * (eta * ndotv - blaze_math::sqrt(k))).normalized().unwrap_or(dir);
+            let mut t_origin = p - ng * (bias * 2.0);
+            let mut ray_dir = refract_dir;
+            let mut behind_opt: Option<[f64; 3]> = None;
+            // Allow stepping across up to 2 transmissive glass boundaries (entry -> exit face of solid pane!)
+            for _step in 0..3 {
+                stats.rays += 1;
+                if let Some(thit) = bvh.trace(t_origin, ray_dir, ctx.scene_diag * 3.0, stats) {
+                    let ttri = &bvh.tris[thit.tri_idx as usize];
+                    let tp = t_origin + ray_dir * thit.t;
+                    if ttri.transmission > 0.05 && ttri.part_idx == tri.part_idx {
+                        // Exiting the back face of the same solid CAD glass pane: continue straight into the interior!
+                        t_origin = tp + ray_dir * (bias * 3.0);
+                        ray_dir = dir;
+                        continue;
+                    }
+                    let tw = (1.0 - thit.u - thit.v).max(0.0);
+                    let mut tn = (ttri.n0 * tw + ttri.n1 * thit.u + ttri.n2 * thit.v).normalized().unwrap_or(ttri.ng);
+                    if tn.dot(ray_dir) > 0.0 {
+                        tn = tn * -1.0;
+                    }
+                    let tng = if ttri.ng.dot(ray_dir) > 0.0 { ttri.ng * -1.0 } else { ttri.ng };
+                    behind_opt = Some(shade_mesh_pbr_hdr(
+                        bvh,
+                        ctx,
+                        o,
+                        pbr,
+                        tp,
+                        ray_dir,
+                        tn,
+                        tng,
+                        ttri,
+                        tw,
+                        thit.u,
+                        thit.v,
+                        bounces_left - 1,
+                        seed ^ 0x9b1,
+                        stats,
+                    ));
+                    break;
+                } else {
+                    break;
+                }
+            }
+            if let Some(behind) = behind_opt {
+                let tr = surf.transmission.clamp(0.0, 1.0);
+                for c in 0..3 {
+                    let wt = (1.0 - f[c]) * tr;
+                    ibl[c] = ibl[c] * (1.0 - wt * 0.90) + behind[c] * surf.base_colour[c] * wt;
+                }
+            }
+        }
+    }
+
+    // 7. Noise-free Next-Event Estimation from local emissive meshes (porch lanterns, interior
+    //    Edison lamps visible through glass windows, cockpit HUDs, and cyan ion cores).
+    let nee = if bounces_left + 1 >= pbr.reflection_bounces {
+        eval_emissive_nee(bvh, &surf, p, n, ng, t_vec, b_vec, view_v, bias, stats)
+    } else {
+        [0.0; 3]
+    };
+
+    let hdr = [
+        (direct[0] * dom.colour[0] * pbr.direct_intensity * shadow + ibl[0] + nee[0] + surf.emissive[0]).max(0.0),
+        (direct[1] * dom.colour[1] * pbr.direct_intensity * shadow + ibl[1] + nee[1] + surf.emissive[1]).max(0.0),
+        (direct[2] * dom.colour[2] * pbr.direct_intensity * shadow + ibl[2] + nee[2] + surf.emissive[2]).max(0.0),
+    ];
+    let emax = surf.emissive[0].max(surf.emissive[1]).max(surf.emissive[2]);
+    let preserve = if emax > 0.4 || surf.transmission > 0.25 {
+        0.95
+    } else if surf.roughness < 0.14 && (surf.metallic > 0.6 || surf.clearcoat > 0.7) {
+        0.65
+    } else {
+        0.0
+    };
+    let gp = GBufferPixel {
+        albedo: [surf.base_colour[0] as f32, surf.base_colour[1] as f32, surf.base_colour[2] as f32],
+        normal: [n.x as f32, n.y as f32, n.z as f32],
+        depth: 0.0, // filled with primary hit.t by caller
+        preserve,
+    };
+    (hdr, gp)
+}
+
+#[inline]
+fn smoothstep_f64(edge0: f64, edge1: f64, x: f64) -> f64 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }

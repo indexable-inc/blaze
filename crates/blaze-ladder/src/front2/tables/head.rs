@@ -1039,7 +1039,7 @@ pub fn file_frozen<'n, N: NamesSource<'n>>(names: N, cell: Want, frozen: FrozenH
     // Where the store's type table stands before the import: the nodes past it are this
     // record's ([`file_named_items`]).
     let tys_before = store.tys.view().len_now();
-    let heads = match crate::front2::project::head_digest::import_with_opaque_origins_boxed(names, keys, store, &frozen, &mut text_of, scratch, scratch) {
+    let heads = match crate::front2::project::head_digest::import_with_opaque_origins_boxed(names, keys, store, &frozen, &mut text_of, store.tys.alloc(), scratch) {
         Ok(heads) => heads,
         // A record of another form (an old home): its regions read as `RecordForm` while the
         // error goes up, reported, and the cell is made again from text. Never migrated.
@@ -1080,7 +1080,7 @@ pub fn file_frozen_cached<'n, N: NamesSource<'n>>(
             &frozen,
             &mut text_of,
             &mut verify,
-            scratch,
+            store.tys.alloc(),
             scratch,
         ) {
             Ok(heads) => heads,
@@ -1110,7 +1110,7 @@ fn file_frozen_finish<'n, N: NamesSource<'n>>(
     tys_before: usize,
 ) -> Result<(), FreezeError> {
     file_keys(cell, members, &heads, keys)?;
-    file_named_items(names, cell, store, keys, tys_before)?;
+    file_named_items(names, cell, store, keys, &heads, tys_before)?;
     // Each head's recorded regions (form 11) against its record: laid exactly when the record
     // holds the section, and none only for a kind that holds none.
     for ((at, head), e) in heads.iter().zip(frozen.heads()) {
@@ -1266,20 +1266,101 @@ pub(crate) fn member_definition<'n, N: NamesSource<'n>>(names: N, keys: &Keys, i
 /// `Keys::library_in` of each such item through its own recorded view (buckets.rs
 /// `coherence_wants` and `inherent_crates`, `facts.library`): 41 reads more than the lowering
 /// store on a 40-link method chain (front2 tables/enter_once_tests.rs, 2026-11-21).
-fn file_named_items<'n, N: NamesSource<'n>>(names: N, cell: Want, store: &Store<'n>, keys: &Keys, from: usize) -> Result<(), FreezeError> {
-    let view = store.tys.view();
-    for node in view.nodes().skip(from) {
-        let k = match *node {
-            blaze_typeck::PNode::Adt(k, _) | blaze_typeck::PNode::FnDef(k, _) => k,
-            _ => continue,
-        };
+fn file_named_items<'n, N: NamesSource<'n>>(
+    names: N,
+    cell: Want,
+    store: &Store<'n>,
+    keys: &Keys,
+    heads: &[(HeadAt, blaze_own::Box<Head<'_>, Alloc<'static>>)],
+    from: usize,
+) -> Result<(), FreezeError> {
+    let clash = |error| FreezeError::Head { want: cell, error: HeadError::Key(error) };
+    let file_key = |k: ItemKey| -> Result<(), FreezeError> {
         if keys.origin(k).is_some() {
-            continue;
+            return Ok(());
         }
         // A key no item row begins with (a body-local item, a member) stays unfiled: its
         // origin is the body's, filed where it is lowered.
-        let Some(lib) = names.key_beginning(k.0.to_be_bytes()) else { continue };
-        keys.item(lib).map_err(|error| FreezeError::Head { want: cell, error: HeadError::Key(error) })?;
+        let Some(lib) = names.key_beginning(k.0.to_be_bytes()) else { return Ok(()) };
+        keys.item(lib).map_err(clash)?;
+        Ok(())
+    };
+    let file_clauses = |clauses: &[blaze_typeck::PClause]| -> Result<(), FreezeError> {
+        for c in clauses {
+            match *c {
+                blaze_typeck::PClause::Trait { trait_, .. }
+                | blaze_typeck::PClause::Projection { trait_, .. }
+                | blaze_typeck::PClause::ForFields { trait_, .. } => file_key(trait_)?,
+                blaze_typeck::PClause::Const { .. }
+                | blaze_typeck::PClause::TypeOutlives { .. }
+                | blaze_typeck::PClause::RegionOutlives { .. } => {}
+            }
+        }
+        Ok(())
+    };
+    let view = store.tys.view();
+    for node in view.nodes().skip(from) {
+        let k = match *node {
+            blaze_typeck::PNode::Adt(k, _)
+            | blaze_typeck::PNode::FnDef(k, _)
+            | blaze_typeck::PNode::Foreign(k)
+            | blaze_typeck::PNode::ExTrait(k, _)
+            | blaze_typeck::PNode::ExAuto(k)
+            | blaze_typeck::PNode::Alias { trait_: k, .. }
+            | blaze_typeck::PNode::ExProj { trait_: k, .. } => k,
+            _ => continue,
+        };
+        file_key(k)?;
+    }
+    for (_, head) in heads.iter() {
+        match &**head {
+            Head::Impl { head, preds, .. } => {
+                if let Some(t) = head.trait_ {
+                    file_key(t)?;
+                }
+                if let Some(p) = preds {
+                    file_clauses(&p.clauses)?;
+                }
+            }
+            Head::Trait { extra, supers, preds, assoc_side, .. } => {
+                for &(lib, _) in supers.iter() {
+                    keys.item(lib).map_err(clash)?;
+                }
+                if let Some(x) = extra {
+                    file_clauses(&x.supertraits)?;
+                }
+                if let Some(p) = preds {
+                    file_clauses(&p.clauses)?;
+                }
+                for side in assoc_side.iter() {
+                    if let Some(b) = &side.bounds {
+                        file_clauses(&b.clauses)?;
+                    }
+                }
+            }
+            Head::Adt { row, preds, .. } => {
+                if row.kind == blaze_typeck::AdtKind::Enum {
+                    for v in row.variants.iter() {
+                        file_key(v.key)?;
+                    }
+                }
+                if let Some(p) = preds {
+                    file_clauses(&p.clauses)?;
+                }
+            }
+            Head::Fn { preds, .. } | Head::Opaque { preds, .. } => {
+                if let Some(p) = preds {
+                    file_clauses(&p.clauses)?;
+                }
+            }
+            Head::TraitAlias { head, .. } => {
+                for &(lib, _) in head.traits.iter() {
+                    keys.item(lib).map_err(clash)?;
+                }
+                file_clauses(&head.clauses)?;
+            }
+            Head::Ctor { .. } | Head::Alias { .. } | Head::AliasRefused { .. } | Head::FnRefused { .. } => {}
+        }
     }
     Ok(())
 }

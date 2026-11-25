@@ -248,7 +248,7 @@ impl<'n, S: NamesSource<'n>> blaze_lower::ValueNames for ModuleValues<'n, '_, S>
         }
         let (names, krate, item, owner, text) = (self.names, self.krate, self.item, self.owner, self.text);
         let planted = self.store.locals.planted();
-        let alloc = self.store.tys.alloc();
+        let alloc = self.store.work_alloc();
         let kept = &self.store.locals;
         let keys: &Keys = &*self.keys;
         let blocks = self.blocks.get_or_insert_with(|| super::glob_uses::PatternBlocks::of(names, kept, keys, krate, item, owner, text, alloc));
@@ -785,7 +785,7 @@ impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
                     *dst = (inner, next);
                     sp += 1;
                 }
-                blaze_typeck::PNode::Tuple(l) => {
+                blaze_typeck::PNode::Tuple(l) | blaze_typeck::PNode::FnPtr(l, _) => {
                     let Ok(elems) = tys.list(l) else { return false };
                     for (ci, &child) in elems.iter().enumerate().rev() {
                         let Ok(ci_u32) = u32::try_from(ci) else { return false };
@@ -1289,7 +1289,7 @@ pub(crate) fn lower_body_with_text<'n, S: NamesSource<'n>>(
     let head_key = param_subst.map_or(owner, |(orig, _)| orig);
     let head = store.fns.get(&head_key).ok_or(BodyError::NoHead(head_key))?;
     let krate = names.crate_of(head.lib).ok_or(BodyError::NoText(head.lib))?;
-    let alloc = store.tys.alloc();
+    let alloc = store.work_alloc();
     let container = head.container;
     let site = Site {
         item,
@@ -1308,7 +1308,7 @@ pub(crate) fn lower_body_with_text<'n, S: NamesSource<'n>>(
     let mut body = lower_at(names, prepared, keys, store, site, into, subst_slice, parser::Extensions::RECORDS)?;
     body.expanded_text = Some(text);
     if let Some((orig, args)) = param_subst {
-        let store_alloc = store.tys.alloc();
+        let store_alloc = store.work_alloc();
         let mut kept_args = blaze_own::Vec::with_capacity_in(args.len(), store_alloc);
         kept_args.extend_from_slice(args);
         body.param_subst = Some((orig, kept_args));
@@ -1320,7 +1320,7 @@ pub(crate) fn lower_body_with_text<'n, S: NamesSource<'n>>(
     if let Some(own) = super::own_trait::of_member(store, container).map_err(|e| BodyError::NoHead(e.0))? {
         if let Err(at) = body.traits.binary_search(&own) {
             body.traits.insert(at, own);
-            body.blocks.add(own, store.tys.alloc());
+            body.blocks.add(own, store.work_alloc());
         }
     }
     Ok(body)
@@ -1343,7 +1343,7 @@ fn lower_fn_into<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys
         store.ensure(names, keys, Want::Fn(item)).map_err(|error| BodyError::Head { item, error })?;
     }
     let head = store.fns.get(&owner).ok_or(BodyError::NoHead(owner))?;
-    let alloc = store.tys.alloc();
+    let alloc = store.work_alloc();
     let site = Site {
         item, owner, krate, module, text, marks,
         params: copy_slice(&head.params, alloc),
@@ -1408,7 +1408,7 @@ fn lower_member_into<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, 
             return Err(BodyError::Record { item: head.lib, owner: key, why });
         }
     };
-    let alloc = store.tys.alloc();
+    let alloc = store.work_alloc();
     let site = Site {
         item: head.lib,
         owner: key,
@@ -1429,7 +1429,7 @@ fn lower_member_into<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, 
     if let Some(own) = super::own_trait::of_member(store, container).map_err(|e| BodyError::NoHead(e.0))? {
         if let Err(at) = body.traits.binary_search(&own) {
             body.traits.insert(at, own);
-            body.blocks.add(own, store.tys.alloc());
+            body.blocks.add(own, store.work_alloc());
         }
     }
     Ok(body)
@@ -1561,8 +1561,8 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
         Some(m) => Some(blaze_lower::mark_site::ItemMarks::of(text, m).map_err(|miss| BodyError::Record { item, owner, why: Why::Program(format!("{miss}").into_boxed_str(), Range::new(0, 0)) })?),
         None => None,
     };
-    // The store's allocator: the body, its types and its block traits are kept for the check.
-    let alloc = store.tys.alloc();
+    // The store's per-body work allocator: the body, its types and its block traits are kept for the check.
+    let alloc = store.work_alloc();
     let edition = names.edition_of(krate).ok_or(BodyError::NoText(item))?;
     let atoms = names.cfg_atoms(krate).ok_or(BodyError::NoText(item))?;
 
@@ -1811,7 +1811,10 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
 
     let in_scope = names.traits_in_scope(module, alloc).map_err(|error| BodyError::Traits { item, error })?;
     let mut traits = blaze_own::Vec::with_capacity_in(in_scope.len(), alloc);
-    traits.extend(in_scope.iter().map(|&k| checker_of(k)));
+    for &k in in_scope.iter() {
+        let _ = keys.item(k);
+        traits.push(checker_of(k));
+    }
     traits.sort_unstable();
     traits.dedup();
     // The traits a block's `use` brings into scope there (tracing's `use
@@ -1855,5 +1858,119 @@ fn note_body_record_field_names(view: &View<'_>, maps: &super::heads::Maps) {
                 maps.note_record_field_name(Name(hash), text);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod closure_param_regions_tests {
+    use blaze_id::{ContentId, CrateItemKey};
+    use blaze_lower::scoped::Prepares;
+    use blaze_mem::Frame;
+    use blaze_scope::graph::Sysroot;
+    use blaze_scope::resolve::{CrateInput, SourceTexts, resolve_crates};
+    use blaze_scope::task::Serial;
+    use blaze_surface::Edition;
+    use blaze_typeck::{ClosureParamRegion, WrittenRegion};
+    use blaze_unit_graph::{Implicit, Prelude, StdIs};
+
+    use super::{Store, lower_fn};
+    use crate::front2::Front2;
+    use crate::refusal::SourceFile;
+
+    struct OneFile<'a>(&'a str);
+    impl<'a> SourceTexts<'a> for OneFile<'a> {
+        fn read(&self, krate: usize, path: &str) -> Option<&'a str> {
+            (krate == 0 && path == "/fnptr/src/lib.rs").then_some(self.0)
+        }
+    }
+
+    fn lower_regions<'a>(source: &str, fn_name: &str, alloc: blaze_own::Alloc<'a>) -> blaze_own::Vec<(u32, u64, u32, WrittenRegion), blaze_own::Alloc<'a>> {
+        let frame = Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let bump = erased.bump();
+        let heap = blaze_own::testing::heap();
+        let store_alloc = heap.alloc();
+        let input = CrateInput {
+            name: "fnptr_test",
+            key: CrateItemKey(ContentId::of("closure_param_regions_fnptr_test", b"fnptr_test")),
+            root: "/fnptr/src/lib.rs",
+            shown_from: "/fnptr/",
+            edition: Edition::E2024,
+            implicit: Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2024), proc_macro: false, entry: false },
+            features: &[],
+            deps: &[],
+            cfg: &[],
+            script: None,
+        };
+        let names = resolve_crates(&[input], Sysroot::default(), &OneFile(source), &Serial, bump).expect("resolve");
+        let front_frame = Frame::new(blaze_mem::tag::Tag::Infer).expect("front frame");
+        let files = [SourceFile { path: "src/lib.rs", text: source }];
+        let mut front = Front2::new(&names, &front_frame, &files, store_alloc).expect("front2");
+        let prepared = Prepares::new_in(bump);
+        let mut store = Store::new(front.index.lang("sized"), front.frame, store_alloc);
+        let (item, _, _) = names
+            .items(0)
+            .find(|(k, _, _)| names.item_text(*k).and_then(|t| t.name) == Some(fn_name))
+            .expect("target fn");
+        let body = lower_fn(&names, &prepared, &mut front.keys, &mut store, item).expect("lower_fn");
+        let mut out = blaze_own::Vec::new_in(alloc);
+        for r in body.typeck.closure_param_regions.iter() {
+            out.push((r.param, r.path, r.own, r.kind));
+        }
+        out
+    }
+
+    #[test]
+    fn front2_closure_param_regions_descend_into_fn_ptr_for_and_aliases() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let src = r#"#![no_core]
+pub struct Tx;
+pub type Edit<'x> = for<'b> fn(&'b mut Tx, &'x u8) -> &'static u8;
+
+pub fn elided_fn_ptr() {
+    let _ = |edit: fn(&mut Tx)| { let _ = edit; };
+}
+
+pub fn elided_ret_from_static_and_named<'a>() {
+    let _ = |f: fn(&'static u8) -> &u8, g: fn(&'a u8) -> &u8| { let _ = (f, g); };
+}
+
+pub fn hrtb_alias_and_tuple<'a>() {
+    let _ = |f: for<'b> fn(&'b u8, &'a u8) -> &'b u8, e: Edit<'a>, pair: (for<'b> fn(&'b u8), &'a u8)| {
+        let _ = (f, e, pair);
+    };
+}
+"#;
+        let step = |p: u64, c: u32| ClosureParamRegion::push_step(p, c).expect("step");
+        let root = ClosureParamRegion::ROOT;
+
+        // Elided `fn(&mut Tx)` (Tempo `retired_root_error_order_and_access_gas` shape):
+        // its parameter lifetime is late-bound by the fn pointer, so 0 free entries.
+        assert_eq!(&lower_regions(src, "elided_fn_ptr", alloc)[..], &[]);
+
+        // Return-type lifetime elision on bare fn pointers inherits the single input lifetime
+        // (`'static` or outer named `'a`) via `RegionSink::fn_ptr`.
+        assert_eq!(
+            &lower_regions(src, "elided_ret_from_static_and_named", alloc)[..],
+            &[
+                (0, step(root, 0), 0, WrittenRegion::Static),
+                (0, step(root, 1), 0, WrittenRegion::Static),
+                (1, step(root, 0), 0, WrittenRegion::Named),
+                (1, step(root, 1), 0, WrittenRegion::Named),
+            ]
+        );
+
+        // Higher-ranked `for<'b> fn(...)`, type alias expanding to `for<'b> fn(...)`, and tuple
+        // containing a `for<'b> fn(...)` followed by an outer `&'a u8`.
+        assert_eq!(
+            &lower_regions(src, "hrtb_alias_and_tuple", alloc)[..],
+            &[
+                (0, step(root, 1), 0, WrittenRegion::Named),
+                (1, step(root, 1), 0, WrittenRegion::Named),
+                (1, step(root, 2), 0, WrittenRegion::Static),
+                (2, step(root, 1), 0, WrittenRegion::Named),
+            ]
+        );
     }
 }

@@ -1302,7 +1302,7 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>>(
 }
 
 /// What an `asks_again` / `object_missing` retry round stopped on, for [`AskProgress`].
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum AskKey {
     Question(blaze_typeck::Question),
     Adt(ItemKey),
@@ -1313,7 +1313,7 @@ enum AskKey {
 fn build_error_ask_key(error: &BuildError) -> Option<AskKey> {
     match error {
         BuildError::Select(blaze_typeck::ResolveError::Missing(q)) => Some(AskKey::Question(*q)),
-        BuildError::NoAdt { adt } => Some(AskKey::Adt(*adt)),
+        BuildError::NoAdt { adt } | BuildError::MissingRecord { item: adt } => Some(AskKey::Adt(*adt)),
         _ => None,
     }
 }
@@ -1330,6 +1330,7 @@ fn layout_refusal_ask_key(why: &blaze_build::layout::Refusal) -> Option<AskKey> 
 fn ask_key(e: &RunError) -> Option<AskKey> {
     match e {
         RunError::Build { error, .. } => build_error_ask_key(error).or_else(|| object_missing(e).map(AskKey::Object)),
+        RunError::ItemRefused { error, .. } => build_error_ask_key(error),
         RunError::Resolve { error: blaze_typeck::ResolveError::Missing(q), .. } => Some(AskKey::Question(*q)),
         RunError::NoAdt { adt, .. } => Some(AskKey::Adt(*adt)),
         RunError::Vtable { why: VtableFail::Layout(error), .. } => layout_refusal_ask_key(&error.why),
@@ -2636,6 +2637,7 @@ fn build_refusal<P: FrontEnd>(program: &P, function: Named, body: Option<&blaze_
         | BuildError::NoStatic { item: adt, .. }
         | BuildError::NoConstValue { item: adt, .. }
         | BuildError::NoPatConstValue { item: adt, .. }
+        | BuildError::MissingRecord { item: adt }
             if let Some(why) = program.left_out(adt) =>
         {
             return RunError::LeftOut { function, item: adt, path: program.item_named(adt), why: Box::from(why) };
@@ -3709,9 +3711,11 @@ pub fn walk_records<M: Make<Error = RunError, Grant = Fixture>>(
 
 #[cfg(test)]
 mod ask_progress_tests {
-    use super::{AskKey, AskProgress};
+    use super::{AskKey, AskProgress, ask_key, build_error_ask_key};
     use crate::front2::check::{MOST_PROGRESS_ROUNDS, MOST_ROUNDS};
-    use blaze_typeck::{ItemKey, Question, Shape};
+    use crate::run::{Named, RunError, asks_again, build_error_asks_again};
+    use blaze_build::BuildError;
+    use blaze_typeck::{ExprId, ItemKey, Question, Shape};
 
     #[test]
     fn ask_progress_allows_forward_progress_and_caps_stuck_loops() {
@@ -3737,5 +3741,31 @@ mod ask_progress_tests {
             total += 1;
         }
         assert_eq!(total, MOST_PROGRESS_ROUNDS, "even distinct keys stop at MOST_PROGRESS_ROUNDS");
+    }
+
+    #[test]
+    fn missing_record_asks_again_and_tracks_adt_ask_key() {
+        let item = ItemKey(0xDEAD_BEEF);
+        let named = || Named { path: "test::f".into(), at: crate::front::At { file: 0, place: 0 } };
+        let missing = BuildError::MissingRecord { item };
+        assert!(build_error_asks_again(&missing));
+        assert_eq!(build_error_ask_key(&missing), Some(AskKey::Adt(item)));
+
+        let as_build = RunError::Build { function: named(), error: BuildError::MissingRecord { item }, range: None };
+        assert!(asks_again(&as_build));
+        assert_eq!(ask_key(&as_build), Some(AskKey::Adt(item)));
+
+        let as_refused = RunError::ItemRefused { function: named(), error: BuildError::MissingRecord { item }, item, path: None };
+        assert!(asks_again(&as_refused));
+        assert_eq!(ask_key(&as_refused), Some(AskKey::Adt(item)));
+
+        let non_retryable = RunError::ItemRefused {
+            function: named(),
+            error: BuildError::NoStatic { expr: ExprId(0), item },
+            item,
+            path: None,
+        };
+        assert!(!asks_again(&non_retryable));
+        assert_eq!(ask_key(&non_retryable), None);
     }
 }

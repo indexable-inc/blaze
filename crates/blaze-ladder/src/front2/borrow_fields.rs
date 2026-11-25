@@ -98,7 +98,7 @@ pub(crate) fn freeze_field_regions<'n, 'a, S: NamesSource<'n>>(
     // The one region counter's facts: each declared count the names' (D155), what the column
     // was laid by in every store.
     let arity = HeadsArity { heads: &store.maps, opaques: &[], names };
-    let reader = store.regions.reader(store.tys.alloc());
+    let reader = store.regions.reader(store.work_alloc());
     let mut at = AVec::with_capacity_in(fields.len(), alloc);
     let mut list = AVec::new_in(alloc);
     for (field, &(variant, index, written_ty)) in fields.iter().zip(written.iter()) {
@@ -350,7 +350,7 @@ fn read_copy_impl<'a>(store: &Store<'_>, langs: super::BorrowLangs, adt: tc::Ite
             let map = match &mut lt_map {
                 Some(m) => m,
                 slot @ None => {
-                    let reader = store.regions.reader(store.tys.alloc());
+                    let reader = store.regions.reader(store.work_alloc());
                     let adt_lts = usize::try_from(store.adts.get(&adt)?.lifetimes).ok()?;
                     let (self_col, _) = reader.impl_header(imp).ok()?;
                     let self_slice = self_col.as_slice();
@@ -911,7 +911,7 @@ pub(super) fn drop_facts_of<'n, 'a, S: NamesSource<'n>>(
         fhash.u32(lifetimes);
         if let Some(row) = BodyHeadFacts::new(&*r.store, r.names).adt(key) {
             let tys = r.store.tys.view();
-            let reader = r.store.regions.reader(r.store.tys.alloc());
+            let reader = r.store.regions.reader(r.store.work_alloc());
             fhash.u32(u32::try_from(row.fields.len()).unwrap_or(u32::MAX));
             for (vi, v) in row.variants.iter().enumerate() {
                 for (fi, f) in row.fields.get(v.fields.range()).unwrap_or(&[]).iter().enumerate() {
@@ -1040,7 +1040,7 @@ pub(super) fn drop_facts_of<'n, 'a, S: NamesSource<'n>>(
     // `params` / `strict_params` / `drop_lts`.
     let tys = r.store.tys.view();
     let arity = HeadsArity { heads: &r.store.maps, opaques: &[], names: r.names };
-    let reader = r.store.regions.reader(r.store.tys.alloc());
+    let reader = r.store.regions.reader(r.store.work_alloc());
     let max_iters = nodes.len().saturating_add(2);
     for _ in 0..max_iters {
         let mut changed = false;

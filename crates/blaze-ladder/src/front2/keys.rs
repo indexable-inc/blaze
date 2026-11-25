@@ -96,6 +96,27 @@ impl Keys {
         }
     }
 
+    /// Rebinds the per-body `locals` map to `work` (the body's resettable scratch frame) before
+    /// checking a body over a stretch-reused [`Keys`].
+    pub(super) fn begin_body_reuse(&mut self, work: Alloc<'static>) {
+        self.locals = HashMap::new_in(work);
+    }
+
+    /// Removes every body-local key filed during the body check from `origins` and swaps `locals`
+    /// back to a zero-capacity shell in `heads_alloc` so no pointer into `work` survives
+    /// `scratch.reset()` and zero bytes of the stretch heads frame are spent on `locals`.
+    pub(super) fn end_body_reuse(&mut self, heads_alloc: Alloc<'static>) {
+        for &ck in self.locals.keys() {
+            self.origins.remove(&ck);
+        }
+        self.locals = HashMap::new_in(heads_alloc);
+    }
+
+    /// Every body-local checker key filed by [`Keys::local`] during the current body check.
+    pub(super) fn local_keys(&self) -> impl Iterator<Item = ItemKey> + '_ {
+        self.locals.keys().copied()
+    }
+
     /// Files `key` and returns its checker key; a different library key already filed under
     /// that checker key is a [`KeyClash`].
     pub fn item(&self, key: LibKey) -> Result<ItemKey, KeyClash> {

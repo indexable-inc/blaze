@@ -1193,3 +1193,418 @@ fn wave2_let_chain_binding_or_value_pat_super_let_deref_index_fn_trait_lower_and
     assert!(tc.contains("method k301"), "OverloadedDeref in closure must emit method call k301:\n{tc}");
     let _ = Arm { pat: PatId(0), guard: None, body: ExprId(0) };
 }
+
+#[test]
+fn become_and_inline_asm_lower_and_verify() {
+    use blaze_typeck::{
+        AsmArch, AsmKind, AsmOperand, AsmPiece, AsmReg, BindAnn, BodyPath, IntTy, List, Lit, PNode,
+        Pat, PatId, PathIdx, PortableTys, Range, ScopeId, Segment, Stmt, StmtId,
+    };
+
+    // 1. `fn f(x: i32) -> i32 { become g(x) }` lowers to `StmtKind::TailCall` and verifies!
+    let mut fx = Fx::new();
+    let i32_t = fx.ty(PNode::Int(IntTy::I32));
+    let f_key = fx.func("f", 0, &[i32_t], i32_t, Default::default());
+    let _g_key = fx.func("g", 0, &[i32_t], i32_t, Default::default());
+    fx.finish();
+    let bt1 = PortableTys::new_in(heap());
+    let pats1 = [Pat::Bind {
+        name: Name::of("x"),
+        ann: BindAnn { by_ref: None, mutable: false },
+        sub: None,
+        ty: None,
+    }];
+    let pat_ranges1 = [Range { start: 0, end: 1 }];
+    let segments1 = [Segment { name: Name::of("g"), generic_args: List::EMPTY, has_args: false }];
+    let paths1 = [BodyPath {
+        scope: ScopeId(0),
+        segments: List { start: 0, len: 1 },
+        lang: None,
+        anchor: None,
+    }];
+    let exprs1 = [
+        Expr::Path(PathIdx(0)),                                            // 0: g
+        Expr::Local(PatId(0)),                                             // 1: x
+        Expr::Call { callee: ExprId(0), args: List { start: 0, len: 1 } }, // 2: g(x)
+        Expr::Become { value: ExprId(2) },                                 // 3: become g(x)
+    ];
+    let expr_lists1 = [ExprId(1)];
+    let expr_ranges1 = [
+        Range { start: 0, end: 1 },
+        Range { start: 1, end: 2 },
+        Range { start: 2, end: 3 },
+        Range { start: 3, end: 4 },
+    ];
+    let params1 = [PatId(0)];
+    let mut bv1 = empty_body_view(f_key, bt1.view(), ExprId(3));
+    bv1.params = &params1;
+    bv1.pats = &pats1;
+    bv1.pat_ranges = &pat_ranges1;
+    bv1.segments = &segments1;
+    bv1.paths = &paths1;
+    bv1.exprs = &exprs1;
+    bv1.expr_lists = &expr_lists1;
+    bv1.expr_ranges = &expr_ranges1;
+    let mut cx1 = InferCtx::new_in(heap());
+    let ck1 = match blaze_typeck::check(&bv1, &fx, &mut cx1, &Needs::new_in(heap()), heap()) {
+        Ok(Outcome::Done(c)) => {
+            assert!(c.diags.is_empty(), "become fixture type-checks clean: {:?}", c.diags);
+            c
+        }
+        Ok(Outcome::Need(n)) => panic!("become world missed {:?}", n.questions),
+        Err(e) => panic!("{e:?}"),
+    };
+    let body1 = lower(&bv1, &ck1, &Plain, heap()).expect("become lowers cleanly");
+    blaze_body::verify(&body1).expect("become body verifies");
+    let mut text1 = blaze_own::String::new_in(heap());
+    blaze_body::print(&body1.view(), &mut text1).expect("prints");
+    assert!(text1.contains("tail_call fn"), "become g(x) must lower to tail_call:\n{text1}");
+
+    // 2. `Expr::Asm` with `in(reg)` + `out(reg)` + `const` lowers, encodes via kept record,
+    //    reopens, and verifies with full `AsmRow` metadata!
+    let mut fx2 = Fx::new();
+    let i64_t = fx2.ty(PNode::Int(IntTy::I64));
+    let owner = fx2.func("asm_fn", 0, &[i64_t], i64_t, Default::default());
+    fx2.finish();
+    let mut bt = PortableTys::new_in(heap());
+    let bt_i64 = bt.intern(PNode::Int(IntTy::I64)).unwrap();
+    let pats = [
+        Pat::Bind {
+            name: Name::of("x"),
+            ann: BindAnn { by_ref: None, mutable: false },
+            sub: None,
+            ty: None,
+        },
+        Pat::Bind {
+            name: Name::of("out"),
+            ann: BindAnn { by_ref: None, mutable: true },
+            sub: None,
+            ty: None,
+        },
+    ];
+    let pat_ranges = [Range { start: 0, end: 1 }, Range { start: 1, end: 2 }];
+    let exprs = [
+        Expr::Lit(Lit::Int(None)), // 0: 0i64 (init out)
+        Expr::Local(PatId(0)),     // 1: x (in)
+        Expr::Local(PatId(1)),     // 2: out (out)
+        Expr::Lit(Lit::Int(None)), // 3: 7i64 (const)
+        Expr::Asm {
+            arch: AsmArch::Aarch64,
+            pieces: List { start: 0, len: 6 },
+            operands: List { start: 0, len: 3 },
+            options: 0,
+            clobber_abis: List::EMPTY,
+        }, // 4: asm!
+        Expr::Local(PatId(1)),     // 5: out (tail)
+        Expr::Block {
+            stmts: List { start: 0, len: 2 },
+            tail: Some(ExprId(5)),
+            scope: ScopeId(0),
+        }, // 6
+    ];
+    let expr_ranges = [
+        Range { start: 0, end: 1 },
+        Range { start: 1, end: 2 },
+        Range { start: 2, end: 3 },
+        Range { start: 3, end: 4 },
+        Range { start: 4, end: 5 },
+        Range { start: 5, end: 6 },
+        Range { start: 6, end: 7 },
+    ];
+    let stmts = [
+        Stmt::Let { pat: PatId(1), ty: Some(bt_i64), init: Some(ExprId(0)), else_: None },
+        Stmt::Expr { expr: ExprId(4), semi: true },
+    ];
+    let stmt_lists = [StmtId(0), StmtId(1)];
+    let params = [PatId(0)];
+    let asm_text = "add , , #reg";
+    let asm_pieces = [
+        AsmPiece::Text { first: 0, len: 4 }, // "add "
+        AsmPiece::Operand { index: 1, modifier: None },
+        AsmPiece::Text { first: 4, len: 2 }, // ", "
+        AsmPiece::Operand { index: 0, modifier: None },
+        AsmPiece::Text { first: 6, len: 3 }, // ", #"
+        AsmPiece::Operand { index: 2, modifier: None },
+    ];
+    let asm_operands = [
+        AsmOperand {
+            kind: AsmKind::In,
+            reg: Some(AsmReg::Class { first: 9, len: 3 }),
+            expr: ExprId(1),
+            out_expr: None,
+        },
+        AsmOperand {
+            kind: AsmKind::Out,
+            reg: Some(AsmReg::Class { first: 9, len: 3 }),
+            expr: ExprId(2),
+            out_expr: None,
+        },
+        AsmOperand { kind: AsmKind::Const, reg: None, expr: ExprId(3), out_expr: None },
+    ];
+    let call_arg_ints = [(ExprId(0), 0u128), (ExprId(3), 7u128)];
+    let mut bv = empty_body_view(owner, bt.view(), ExprId(6));
+    bv.params = &params;
+    bv.pats = &pats;
+    bv.pat_ranges = &pat_ranges;
+    bv.exprs = &exprs;
+    bv.expr_ranges = &expr_ranges;
+    bv.stmts = &stmts;
+    bv.stmt_lists = &stmt_lists;
+    bv.asm_text = asm_text;
+    bv.asm_pieces = &asm_pieces;
+    bv.asm_operands = &asm_operands;
+    bv.call_arg_ints = &call_arg_ints;
+    let unsafe_blocks = [ExprId(6)];
+    bv.unsafe_blocks = &unsafe_blocks;
+
+    let mut cx = InferCtx::new_in(heap());
+    let ck = match blaze_typeck::check(&bv, &fx2, &mut cx, &Needs::new_in(heap()), heap()) {
+        Ok(Outcome::Done(c)) => {
+            assert!(c.diags.is_empty(), "asm fixture type-checks clean: {:?}", c.diags);
+            c
+        }
+        Ok(Outcome::Need(n)) => panic!("asm world missed {:?}", n.questions),
+        Err(e) => panic!("{e:?}"),
+    };
+    let kept_bytes = crate::keep(&bv, &ck, &Plain, heap()).expect("asm body keeps cleanly");
+    let kept = blaze_body::kept::open(&kept_bytes, heap()).expect("kept asm record reopens cleanly");
+    assert_eq!(kept.verified().asms(), 1, "kept body must preserve its AsmRow");
+    assert_eq!(kept.verified().asm(0).ops.len(), 3, "AsmRow must preserve all 3 operands");
+}
+
+/// Coroutines: `async fn` outer body (`AggregateKind::Coroutine` with canonical `PNode::Coroutine`),
+/// `lower_coroutine` with multiple `.await` points + droppable local live across `.await`
+/// (dropped on both normal exit and `cancel` -> `cancelled`), and `Poll<!>` diverging `.await`.
+#[test]
+fn async_fn_async_block_and_await_lower_and_verify() {
+    use blaze_typeck::{
+        BindAnn, Capture, CaptureKind, Checked, CoroutineKind, Expr, ExprId, ItemKey, List, PNode,
+        PTy, Pat, PatId, PortableTys, Range, ScopeId, Stmt, StmtId, UintTy,
+    };
+    use crate::{AsyncBodyItems, Discr, DiscrInt, lower_coroutine};
+
+    const OWNER: ItemKey = ItemKey(0xa001);
+    const INTO_FUTURE_FN: ItemKey = ItemKey(0xa010);
+    const FUTURE_POLL_FN: ItemKey = ItemKey(0xa011);
+    const POLL_ADT: ItemKey = ItemKey(0xa012);
+    const PIN_ADT: ItemKey = ItemKey(0xa013);
+    const GUARD_ADT: ItemKey = ItemKey(0xa014);
+    const SUB_FUT_ADT: ItemKey = ItemKey(0xa015);
+    const NEVER_FUT_ADT: ItemKey = ItemKey(0xa016);
+
+    struct AsyncFacts;
+    impl blaze_flow_lower::Facts for AsyncFacts {
+        fn regions(&self) -> &dyn blaze_flow_lower::RegionFacts { &blaze_flow_lower::NoRegions }
+        fn region_tys(&self) -> Option<blaze_typeck::PTys<'_>> { None }
+        fn adt_variances(&self, _: ItemKey) -> Option<&[blaze_flow_lower::Variance]> { None }
+        fn implied_bounds(&self) -> Option<(&[(u32, blaze_flow_lower::Region)], &[(blaze_flow_lower::Region, blaze_flow_lower::Region)])> { None }
+        fn constant_initializer(&self) -> bool { false }
+        fn fn_binders(&self) -> bool { true }
+        fn closure_bodies_checked(&self) -> bool { false }
+        fn closure_requirements(&self, _: ExprId) -> &[blaze_flow_lower::Requirement] { &[] }
+        fn async_bodies_checked(&self) -> bool { false }
+        fn is_future(&self, _: PTy) -> Option<bool> { None }
+        fn shape(&self, _: ItemKey) -> Option<blaze_flow_lower::Shape<'_>> { None }
+        fn object_trait_lifetimes(&self, _: ItemKey) -> Option<bool> { None }
+        fn call_bounds(&self, _: ItemKey) -> Option<blaze_flow_lower::CallBounds<'_>> { None }
+        fn trait_lifetimes(&self, _: ItemKey) -> Option<u32> { None }
+        fn ties(&self, _: ItemKey) -> Option<blaze_flow_lower::Ties<'_>> { None }
+        fn field_param(&self, _: ItemKey, _: u32, _: u32) -> Option<u32> { None }
+        fn field_lead(&self, _: ItemKey, _: u32, _: u32) -> Option<blaze_flow_lower::FieldLead> { None }
+        fn field_regions(&self, _: ItemKey, _: u32, _: u32) -> Option<&[blaze_flow_lower::FieldRegion]> { None }
+        fn copy_args(&self, _: ItemKey) -> Option<&[bool]> { None }
+        fn adt(&self, k: ItemKey) -> Option<blaze_flow_lower::AdtFacts> {
+            match k {
+                GUARD_ADT => Some(blaze_flow_lower::AdtFacts { copy: false, drop_impl: true, needs_drop: true, lifetimes: 0, union: false, is_enum: false, is_box: false }),
+                POLL_ADT => Some(blaze_flow_lower::AdtFacts { copy: false, drop_impl: false, needs_drop: false, lifetimes: 0, union: false, is_enum: true, is_box: false }),
+                PIN_ADT => Some(blaze_flow_lower::AdtFacts { copy: false, drop_impl: false, needs_drop: false, lifetimes: 0, union: false, is_enum: false, is_box: false }),
+                SUB_FUT_ADT | NEVER_FUT_ADT => Some(blaze_flow_lower::AdtFacts { copy: false, drop_impl: true, needs_drop: true, lifetimes: 0, union: false, is_enum: false, is_box: false }),
+                _ => None,
+            }
+        }
+        fn callee(&self, _: ItemKey) -> Option<CalleeFacts> {
+            Some(CalleeFacts { writes_lifetimes: false, self_ref: false, c_variadic: false })
+        }
+        fn field(&self, _: ItemKey, _: u32, _: Name) -> Option<u32> { None }
+        fn field_count(&self, _: ItemKey, _: u32) -> Option<u32> { Some(1) }
+        fn param_copy(&self, _: u32) -> bool { false }
+        fn alias_lifetimes(&self, _: ItemKey, _: Name) -> Option<u32> { None }
+    }
+    impl crate::BodyFacts for AsyncFacts {
+        fn trait_item(&self, k: ItemKey) -> Option<bool> {
+            Some(matches!(k, INTO_FUTURE_FN | FUTURE_POLL_FN))
+        }
+        fn async_items(&self) -> Option<AsyncBodyItems> {
+            Some(AsyncBodyItems {
+                future_poll: FUTURE_POLL_FN,
+                poll: POLL_ADT,
+                ready: 0,
+                pending: 1,
+                pin: PIN_ADT,
+                ready_discr: Discr { int: DiscrInt::Uint(UintTy::U8), bits: 0 },
+            })
+        }
+    }
+
+    let empty_checked = || -> Checked<'static> {
+        let mut fx0 = Fx::new();
+        let u_t = fx0.tuple(&[]);
+        let f0 = fx0.func("empty", 0, &[], u_t, Default::default());
+        fx0.finish();
+        let bt0 = PortableTys::new_in(heap());
+        let e0 = [Expr::Tuple { elems: List::EMPTY }];
+        let r0 = [Range { start: 0, end: 1 }];
+        let mut bv0 = empty_body_view(f0, bt0.view(), ExprId(0));
+        bv0.exprs = &e0;
+        bv0.expr_ranges = &r0;
+        let mut cx0 = InferCtx::new_in(heap());
+        let mut c = match blaze_typeck::check(&bv0, &fx0, &mut cx0, &Needs::new_in(heap()), heap()) {
+            Ok(Outcome::Done(c)) => c,
+            Ok(Outcome::Need(n)) => panic!("empty checked needed {:?}", n.questions),
+            Err(e) => panic!("empty checked failed: {e:?}"),
+        };
+        c.expr_ty.clear();
+        c.pat_ty.clear();
+        c.local_ty.clear();
+        c
+    };
+
+    // Build a synthetic checked `async fn f(up: u32, g: Guard, f1: SubFut, f2: SubFut) -> u32`:
+    //   async move {
+    //     let a = f1.await;
+    //     let b = f2.await;
+    //     b
+    //   }
+    let mut tys = PortableTys::new_in(heap());
+    let u32_t = tys.intern(PNode::Uint(UintTy::U32)).unwrap();
+    let unit_l = tys.intern_list(&[]).unwrap();
+    let unit_t = tys.intern(PNode::Tuple(unit_l)).unwrap();
+    let guard_t = tys.intern(PNode::Adt(GUARD_ADT, unit_l)).unwrap();
+    let sub_fut_t = tys.intern(PNode::Adt(SUB_FUT_ADT, unit_l)).unwrap();
+    let sub_fut_l = tys.intern_list(&[sub_fut_t]).unwrap();
+    let future_t = tys.intern(PNode::Future(ExprId(7), u32_t, unit_t)).unwrap();
+
+    let pats = [
+        Pat::Bind { name: Name::of("up"), ann: BindAnn { by_ref: None, mutable: false }, sub: None, ty: None },
+        Pat::Bind { name: Name::of("g"), ann: BindAnn { by_ref: None, mutable: false }, sub: None, ty: None },
+        Pat::Bind { name: Name::of("f1"), ann: BindAnn { by_ref: None, mutable: false }, sub: None, ty: None },
+        Pat::Bind { name: Name::of("f2"), ann: BindAnn { by_ref: None, mutable: false }, sub: None, ty: None },
+        Pat::Bind { name: Name::of("a"), ann: BindAnn { by_ref: None, mutable: false }, sub: None, ty: None },
+        Pat::Bind { name: Name::of("b"), ann: BindAnn { by_ref: None, mutable: false }, sub: None, ty: None },
+    ];
+    let pat_ranges = [Range { start: 0, end: 1 }; 6];
+    let exprs = [
+        Expr::Local(PatId(2)),                                                // 0: f1
+        Expr::Await(ExprId(0)),                                               // 1: f1.await
+        Expr::Local(PatId(3)),                                                // 2: f2
+        Expr::Await(ExprId(2)),                                               // 3: f2.await
+        Expr::Local(PatId(4)),                                                // 4: a
+        Expr::Local(PatId(5)),                                                // 5: b
+        Expr::Block { stmts: List { start: 0, len: 2 }, tail: Some(ExprId(5)), scope: ScopeId(0) }, // 6: inner block
+        Expr::AsyncBlock { body: ExprId(6), capture: Capture::Move },         // 7: async move { .. }
+    ];
+    let expr_ranges = [Range { start: 0, end: 1 }; 8];
+    let stmts = [
+        Stmt::Let { pat: PatId(4), ty: None, init: Some(ExprId(1)), else_: None },
+        Stmt::Let { pat: PatId(5), ty: None, init: Some(ExprId(3)), else_: None },
+    ];
+    let stmt_lists = [StmtId(0), StmtId(1)];
+    let params = [PatId(0), PatId(1), PatId(2), PatId(3)];
+
+    let bt_empty = PortableTys::new_in(heap());
+    let mut bv = empty_body_view(OWNER, bt_empty.view(), ExprId(7));
+    bv.coroutine = Some(CoroutineKind::Async { output: u32_t });
+    bv.params = &params;
+    bv.pats = &pats;
+    bv.pat_ranges = &pat_ranges;
+    bv.exprs = &exprs;
+    bv.expr_ranges = &expr_ranges;
+    bv.stmts = &stmts;
+    bv.stmt_lists = &stmt_lists;
+
+    let mut ck = empty_checked();
+    ck.types = tys;
+    for &t in &[sub_fut_t, u32_t, sub_fut_t, u32_t, u32_t, u32_t, u32_t, future_t] {
+        ck.expr_ty.push(t);
+    }
+    for &t in &[u32_t, guard_t, sub_fut_t, sub_fut_t, u32_t, u32_t] {
+        ck.pat_ty.push(t);
+        ck.local_ty.push(t);
+    }
+    for pid in [PatId(0), PatId(1), PatId(2), PatId(3)] {
+        ck.captures.push((ExprId(7), pid, CaptureKind::ByValue));
+    }
+    for await_e in [ExprId(1), ExprId(3)] {
+        ck.callees.push((await_e, INTO_FUTURE_FN, sub_fut_l));
+        ck.awaited.push((await_e, sub_fut_t));
+    }
+
+    // 1. Outer `async fn` lowers to `AggregateKind::Coroutine` with canonical `PNode::Coroutine`!
+    let outer = lower(&bv, &ck, &AsyncFacts, heap()).expect("outer async fn lowers cleanly");
+    blaze_body::verify(&outer).expect("outer async fn verifies");
+    let mut outer_txt = blaze_own::String::new_in(heap());
+    blaze_body::print(&outer.view(), &mut outer_txt).expect("prints");
+    assert!(outer_txt.contains("coroutine "), "outer async fn must construct coroutine aggregate:\n{outer_txt}");
+    assert!(!outer_txt.contains("future e"), "canonicalization must replace PNode::Future with PNode::Coroutine:\n{outer_txt}");
+
+    // 2. Inner coroutine body lowers with 2 `suspend`s, 2 `cancelled` paths, and `drop` on `g`!
+    let inner = lower_coroutine(&bv, &ck, &AsyncFacts, ExprId(7), heap()).expect("inner coroutine lowers cleanly");
+    let inner_v = blaze_body::verify(&inner).expect("inner coroutine verifies");
+    let mut inner_txt = blaze_own::String::new_in(heap());
+    blaze_body::print(&inner.view(), &mut inner_txt).expect("prints");
+    assert_eq!(inner_txt.matches("suspend resume").count(), 2, "must emit 2 suspend terminators:\n{inner_txt}");
+    assert_eq!(inner_txt.matches("cancelled").count(), 2, "must emit 2 cancel exit terminators:\n{inner_txt}");
+    assert!(inner_txt.contains("drop _2"), "droppable capture `g` (_2) must be dropped on normal & cancel paths:\n{inner_txt}");
+    // Verify binary round-trip with VERSION=5 preserves `Suspend` and `Cancelled`!
+    let enc = blaze_body::try_encode(&inner.view(), heap()).expect("encode");
+    let opened = blaze_body::open(&enc).expect("open");
+    blaze_body::verify_ref(opened).expect("reopened verifies");
+    assert_eq!(inner_v.args(), 4);
+
+    // 3. `Poll<!>` diverging `.await` lowers unconditionally to `Suspend` -> `Cancelled`!
+    let mut tys2 = PortableTys::new_in(heap());
+    let never_t = tys2.intern(PNode::Never).unwrap();
+    let unit_l2 = tys2.intern_list(&[]).unwrap();
+    let unit_t2 = tys2.intern(PNode::Tuple(unit_l2)).unwrap();
+    let nfut_t = tys2.intern(PNode::Adt(NEVER_FUT_ADT, unit_l2)).unwrap();
+    let nfut_l = tys2.intern_list(&[nfut_t]).unwrap();
+    let future_never_t = tys2.intern(PNode::Future(ExprId(2), never_t, unit_t2)).unwrap();
+
+    let pats2 = [Pat::Bind { name: Name::of("nf"), ann: BindAnn { by_ref: None, mutable: false }, sub: None, ty: None }];
+    let pat_ranges2 = [Range { start: 0, end: 1 }];
+    let exprs2 = [
+        Expr::Local(PatId(0)),                                  // 0: nf
+        Expr::Await(ExprId(0)),                                 // 1: nf.await (type `!`)
+        Expr::AsyncBlock { body: ExprId(1), capture: Capture::Move }, // 2: async move { nf.await }
+    ];
+    let expr_ranges2 = [Range { start: 0, end: 1 }; 3];
+    let params2 = [PatId(0)];
+    let bt_empty2 = PortableTys::new_in(heap());
+    let mut bv2 = empty_body_view(OWNER, bt_empty2.view(), ExprId(2));
+    bv2.coroutine = Some(CoroutineKind::Async { output: never_t });
+    bv2.params = &params2;
+    bv2.pats = &pats2;
+    bv2.pat_ranges = &pat_ranges2;
+    bv2.exprs = &exprs2;
+    bv2.expr_ranges = &expr_ranges2;
+
+    let mut ck2 = empty_checked();
+    ck2.types = tys2;
+    for &t in &[nfut_t, never_t, future_never_t] {
+        ck2.expr_ty.push(t);
+    }
+    ck2.pat_ty.push(nfut_t);
+    ck2.local_ty.push(nfut_t);
+    ck2.captures.push((ExprId(2), PatId(0), CaptureKind::ByValue));
+    ck2.callees.push((ExprId(1), INTO_FUTURE_FN, nfut_l));
+    ck2.awaited.push((ExprId(1), nfut_t));
+
+    let never_body = lower_coroutine(&bv2, &ck2, &AsyncFacts, ExprId(2), heap()).expect("Poll<!> coroutine lowers");
+    blaze_body::verify(&never_body).expect("Poll<!> coroutine verifies");
+    let mut never_txt = blaze_own::String::new_in(heap());
+    blaze_body::print(&never_body.view(), &mut never_txt).expect("prints");
+    assert!(never_txt.contains("suspend resume"), "Poll<!> must suspend:\n{never_txt}");
+    assert!(never_txt.contains("cancelled"), "Poll<!> must have cancel exit:\n{never_txt}");
+    assert!(!never_txt.contains("discr "), "Poll<!> must not read discriminant of uninhabited Poll<!>:\n{never_txt}");
+    let _ = PTy(0);
+}

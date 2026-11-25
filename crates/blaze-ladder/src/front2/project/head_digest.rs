@@ -336,7 +336,7 @@ pub fn import_with_opaque_origins_boxed_verified<'n, 'a, N: NamesSource<'n>>(
 ) -> Result<AVec<'a, (HeadAt, blaze_own::Box<Head<'n>, Alloc<'static>>)>, FreezeError> {
     let want = frozen.want();
     let mut heads = AVec::new_in(out);
-    let mut origins = AVec::new_in(alloc);
+    let mut origins = AVec::new_in(out);
     for entry in frozen.heads() {
         let rec = |error| FreezeError::Record { want, at: entry.at, error };
         let text = match entry.at { HeadAt::Fn(_) => text_of(entry.at), _ => None };

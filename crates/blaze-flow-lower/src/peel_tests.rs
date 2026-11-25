@@ -412,3 +412,26 @@ fn a_peeled_binding_keeps_its_loan_live() {
     let planted = lowered(&w, &b, w.wrap, root, &w.facts, Plant::NoRelate, "loan through the peel, planted NoRelate");
     assert!(!planted.iter().any(|l| l.starts_with("borrow")), "the control hides it: {planted:?}");
 }
+
+/// Owned destructuring under an ADT field whose `field_lead` is unknown (`None`, as for a field
+/// typed as an associated type projection like `BlockAssemblerInput::transactions`): a direct
+/// immutable `ByValue` binding `y` with `local_ty == pat_ty` under `mode == Move` proves 0
+/// references were peeled (`pat_proves_no_peel`), instead of refusing `PeelUnderAdtField`.
+#[test]
+fn owned_by_value_binding_proves_zero_peel_when_field_lead_unknown() {
+    let mut w = world();
+    w.facts.leads = false;
+    let mut b = Bb::new();
+    let wp = b.param("w");
+    let y = b.bind("y");
+    let inner = ev(&mut b, y);
+    let pat = b.variant_pat(&["Wrapper", "W"], &[inner]);
+    let s = b.local(wp);
+    let body = call1(&mut b, "h", y);
+    let wild = b.wild();
+    let none = b.block(&[], None);
+    let m = b.match_(s, &[(pat, body), (wild, none)]);
+    let root = b.block(&[], Some(m));
+    let got = lowered(&w, &b, w.wrap, root, &w.facts, Plant::None, "zero-peel proof");
+    assert!(got.is_empty(), "owned `Wrapper::W(E::V(y))` with unknown field_lead must lower cleanly: {got:?}");
+}

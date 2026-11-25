@@ -26,7 +26,7 @@
 //! (`scratch`) and returns a typed error naming a refusal; nothing allocates through `Global`.
 
 #![no_std]
-#![feature(allocator_api, register_tool, custom_inner_attributes)]
+#![feature(allocator_api, register_tool, custom_inner_attributes, default_field_values)]
 #![register_tool(blaze)]
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
@@ -38,6 +38,7 @@
 #[cfg(test)]
 extern crate std;
 
+pub mod flecs;
 pub mod glb;
 pub mod glb_read;
 mod json;
@@ -52,17 +53,19 @@ pub mod svg;
 #[cfg(test)]
 mod tests;
 
+pub use flecs::{FlecsError, FlecsOpts, flecs_prefab, flecs_prefab_planted};
 pub use glb::{
     Encoding, Field, GlbError, GlbOpts, MaterialField, MeshSlot, NormalBits, glb, glb_planted, glb_textured,
     glb_textured_planted,
 };
 pub use glb_read::{GlbReadError, GlbReadOpts, LoadedGlb, LoadedImage, LoadedLod, LoadedMaterial, LoadedPart, read_glb};
 pub use json::JsonFault;
-pub use plant::{GlbPlant, PngPlant, StlPlant, SummaryPlant, SvgPlant};
+pub use plant::{FlecsPlant, GlbPlant, PngPlant, StlPlant, SummaryPlant, SvgPlant};
 pub use png::{DecodedPng, Image, PngError, PngKind, PngOpts, decode_png, png, png_planted};
 pub use scene::{
-    Clearcoat, Collider, Joint, JointKind, Lod, MassFacts, Material, MaterialTextures, Matrix, Part, Scene, TexturePack,
-    Transform, Trs, Up,
+    Anisotropy, Clearcoat, Collider, ImageData, ImageId, Joint, JointKind, Lod, MassFacts, Material, MaterialTextures,
+    Matrix, NormalTexture, OcclusionTexture, Part, PbrTextures, Scene, Sheen, Socket, TextureImage, TexturePack,
+    TextureRef, Transform, Transmission, Trs, Up,
 };
 pub use stl::{FACET_BYTES, HEADER_BYTES, StlError, StlOpts, StlUnit, stl, stl_planted};
 pub use summary::{SummaryError, SummaryOpts, summary, summary_planted};

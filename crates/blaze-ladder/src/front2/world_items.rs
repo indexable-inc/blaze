@@ -325,7 +325,7 @@ pub(super) fn ctor_world<'n, S: NamesSource<'n>, T>(
     };
     let Some(module) = keys.library_in(names, at) else { return Err(refused) };
     let spell = Spelling::fixed();
-    let blocks = super::block_traits::BlockTraits::module(store.tys.alloc());
+    let blocks = super::block_traits::BlockTraits::module(store.work_alloc());
     let self_ = SelfTy::None;
     let world = BodyWorld {
         names,
@@ -408,7 +408,7 @@ impl<'w, 'n, S: NamesSource<'n>> BodyWorld<'w, 'n, S> {
         }
         if let Some(seeds) = self.store.seeds {
             let _cost = super::tables::cost::Cost::enter_want(self.store.cost, w);
-            let filed = seeds.seed(self.store, self.keys, w, self.store.tys.alloc());
+            let filed = seeds.seed(self.store, self.keys, w, self.store.work_alloc());
             if matches!(filed, Ok(Seeded::Filed)) && self.store.made(w) {
                 self.store.imported.set(self.store.imported.get() + 1);
                 return Err(Missing);
@@ -1025,7 +1025,12 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
 
     fn lang_item_once(&self, item: LangItem) -> Fetch<Option<ItemKey>> {
         match super::langs::find(self.index, self.resolver(), item) {
-            Ok(found) => Ok(found.map(checker_of)),
+            Ok(found) => {
+                if let Some(lib) = found {
+                    let _ = self.keys.item(lib);
+                }
+                Ok(found.map(checker_of))
+            }
             Err(why) => self.gap(Gap::Lang(item, why)),
         }
     }
@@ -1033,6 +1038,7 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
     fn lang_path_once(&self, item: LangItem) -> Fetch<Option<Def>> {
         let Some(name) = lang_name(item) else { return self.gap(Gap::Lang(item, "no `#[lang]` name is known for it")) };
         let Some(lib) = self.index.lang(name) else { return self.gap(Gap::Lang(item, "no item of the program's crates is `#[lang]` under its name")) };
+        let _ = self.keys.item(lib);
         match self.resolver().detail(lib) {
             Some(ItemDetail::Fn { .. }) => Ok(Some(Def::Fn(checker_of(lib)))),
             Some(ItemDetail::Struct) => Ok(Some(Def::Adt(checker_of(lib)))),
@@ -1269,7 +1275,7 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
         if self.store.maps.evaluating.get() > 0 {
             return self.gap(Gap::BodyRecord(tc::Question::ConstHolds(cond, digest)));
         }
-        let alloc = self.store.tys.alloc();
+        let alloc = self.store.work_alloc();
         let mut req_tys = blaze_typeck::PortableTys::new_in(alloc);
         let Ok(list) = super::const_at::copy_ground(types, args, &mut req_tys, alloc) else {
             return self.gap(Gap::BodyRecord(tc::Question::ConstHolds(cond, digest)));

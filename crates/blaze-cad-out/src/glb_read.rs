@@ -104,6 +104,7 @@ impl LoadedMaterial<'_> {
             emissive_strength: self.emissive_strength,
             clearcoat: self.clearcoat,
             double_sided: self.double_sided,
+            ..
         }
     }
 }

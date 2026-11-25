@@ -411,6 +411,17 @@ pub trait NamesSource<'n>: Copy {
     /// (front2 tables/recorder.rs `ReadSink::asking`); one that does not has nothing to tell.
     fn asking(self, _ask: Option<blaze_typeck::Asking>) {}
 
+    /// Starts capturing raw [`TableRead`]s emitted through this source for `SharedFacts` replay.
+    fn begin_read_tap(self) -> Option<usize> {
+        None
+    }
+
+    /// Ends a capture started at `mark` and hands the captured slice to `f`.
+    fn end_read_tap(self, _mark: usize, _f: &mut dyn FnMut(&[super::tables::recorder::TableRead])) {}
+
+    /// Replays previously captured [`TableRead`]s through this source's recorder.
+    fn replay_table_reads(self, _reads: &[super::tables::recorder::TableRead]) {}
+
     /// The impl `key` of crate `krate`, written in `module`, with its header's text: for the
     /// one impl a row does not file ([`NamesSource::each_impl_row`]'s reader). `None`: the
     /// text did not read (filed in the log).

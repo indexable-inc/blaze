@@ -34,6 +34,7 @@ struct CustomAdt {
     kind: AdtKind,
     variants: StdVec<Variant>,
     fields: StdVec<Field>,
+    repr: ReprAttrs,
 }
 
 /// The fixture world, plus bodies in the text form by item.
@@ -200,7 +201,7 @@ impl Tw {
             ctor: CtorKind::Braces,
             fields: List { start: 0, len: fs.len() as u32 },
         }]);
-        self.custom_adts.push(CustomAdt { key, kind: AdtKind::Union, variants: vs, fields: fs });
+        self.custom_adts.push(CustomAdt { key, kind: AdtKind::Union, variants: vs, fields: fs, repr: ReprAttrs::RUST });
         self
     }
 
@@ -210,7 +211,26 @@ impl Tw {
             kind: AdtKind::Enum,
             variants: StdVec::new(),
             fields: StdVec::new(),
+            repr: ReprAttrs::RUST,
         });
+        self
+    }
+
+    fn with_aligned_struct(mut self, key: ItemKey, align_log2: u8, fields: &[(&str, PTy)]) -> Tw {
+        let mut fs = StdVec::new();
+        for &(name, ty) in fields {
+            fs.push(Field { name: Name::of(name), ty });
+        }
+        let vs = StdVec::from([Variant {
+            key,
+            name: Name::of("Aligned"),
+            ctor: CtorKind::Braces,
+            fields: List { start: 0, len: fs.len() as u32 },
+        }]);
+        let mut repr = ReprAttrs::RUST;
+        repr.c = true;
+        repr.align = Some(align_log2);
+        self.custom_adts.push(CustomAdt { key, kind: AdtKind::Struct, variants: vs, fields: fs, repr });
         self
     }
 }
@@ -260,8 +280,8 @@ impl LayoutFacts for Tw {
         self.w.adt(key)
     }
     fn repr(&self, key: ItemKey) -> Result<ReprAttrs, Missing> {
-        if self.custom_adts.iter().any(|c| c.key == key) {
-            return Ok(ReprAttrs::RUST);
+        if let Some(c) = self.custom_adts.iter().find(|c| c.key == key) {
+            return Ok(c.repr);
         }
         self.w.repr(key)
     }
@@ -2209,4 +2229,110 @@ bb0:
     };
     check_case(true);
     check_case(false);
+}
+
+/// Mirror of `#2466`: promoted field borrows (`&ALIGNED_BYTES.bytes` at offset 0 and an offset-8
+/// field inside an align(16) struct) preserve the base struct's alignment (`align == 4` at offset
+/// 0, `align == 3` at offset 8) in the interned `DataAlloc`, matching `hashbrown::Group::static_empty()`.
+#[test]
+fn promoted_field_borrow_preserves_base_struct_alignment() {
+    let (mut tw, t) = world();
+    let arr16 = tw.w.ty("[u8; 16]");
+    let arr8 = tw.w.ty("[u8; 8]");
+    let ref_arr16 = tw.w.ty("&[u8; 16]");
+    let ref_arr8 = tw.w.ty("&[u8; 8]");
+    let u64_t = PTy(t.u64);
+    let u8_t = PTy(t.u8);
+
+    // `#[repr(C, align(16))] struct AlignedBytes { bytes: [u8; 16] }` (offset 0 -> align_log2 = 4)
+    let k_aligned = ItemKey(0xaa01);
+    let aligned_ty = tw.w.fx.t.intern(PNode::Adt(k_aligned, List::EMPTY)).unwrap();
+    // `#[repr(C, align(16))] struct AlignedSplit { head: u64, tail: [u8; 8] }` (tail at offset 8 -> align_log2 = 3)
+    let k_split = ItemKey(0xaa02);
+    let _split_ty = tw.w.fx.t.intern(PNode::Adt(k_split, List::EMPTY)).unwrap();
+
+    tw = tw
+        .with_aligned_struct(k_aligned, 4, &[("bytes", arr16)])
+        .with_aligned_struct(k_split, 4, &[("head", u64_t), ("tail", arr8)]);
+
+    // Promoted borrow e10: returns `ALIGNED_BYTES.bytes` (`[u8; 16]`, natural align 0 -> must inherit 4).
+    let promo_zero = format!(
+        "\
+local _0: t{a16} return mut
+local _1: t{s} temp e0 value
+local _2: t{a16} temp e1 value
+const c0 = scalar 0x80: t{u8}
+const c1 = scalar 0x10: t{us}
+bb0:
+  _2 = repeat(const c0, c1)
+  _1 = adt t{s}#0(move _2)
+  _0 = copy _1.0:t{a16}
+  return
+",
+        a16 = arr16.0,
+        s = aligned_ty.0,
+        u8 = u8_t.0,
+        us = t.usize,
+    );
+    // Root returns `&ALIGNED_BYTES.bytes` via `ConstKind::Promoted(10)`.
+    let root_zero = format!(
+        "\
+local _0: t{r} return mut
+const c0 = promoted 10: t{r}
+bb0:
+  _0 = const c0
+  return
+",
+        r = ref_arr16.0,
+    );
+    let tw_zero = tw.with(ROOT, &root_zero).with_promoted_body(ROOT, ExprId(10), &promo_zero);
+    let rec_zero = run(&tw_zero, Limits::DEFAULT).expect("promoted &ALIGNED_BYTES.bytes evaluates");
+    assert_eq!(rec_zero.allocs.len(), 2, "expected pointer root + promoted pointee allocation");
+    assert_eq!(rec_zero.allocs[1].bytes.as_slice(), &[0x80u8; 16]);
+    assert_eq!(rec_zero.allocs[1].align, 4, "offset-0 field borrow must preserve align(16) (log2 == 4)");
+
+    // Promoted borrow e11: returns `ALIGNED_SPLIT.tail` at offset 8 (`[u8; 8]` -> must inherit min(4, 3) == 3).
+    let (mut tw2, t2) = world();
+    let arr8_2 = tw2.w.ty("[u8; 8]");
+    let ref_arr8_2 = tw2.w.ty("&[u8; 8]");
+    let u64_2 = PTy(t2.u64);
+    let u8_2 = PTy(t2.u8);
+    let split_ty_2 = tw2.w.fx.t.intern(PNode::Adt(k_split, List::EMPTY)).unwrap();
+    tw2 = tw2.with_aligned_struct(k_split, 4, &[("head", u64_2), ("tail", arr8_2)]);
+    let promo_off8 = format!(
+        "\
+local _0: t{a8} return mut
+local _1: t{s} temp e0 value
+local _2: t{a8} temp e1 value
+const c0 = scalar 0x55: t{u8}
+const c1 = scalar 0x8: t{us}
+const c2 = scalar 0x11223344: t{u64}
+bb0:
+  _2 = repeat(const c0, c1)
+  _1 = adt t{s}#0(const c2, move _2)
+  _0 = copy _1.1:t{a8}
+  return
+",
+        a8 = arr8_2.0,
+        s = split_ty_2.0,
+        u8 = u8_2.0,
+        us = t2.usize,
+        u64 = t2.u64,
+    );
+    let root_off8 = format!(
+        "\
+local _0: t{r} return mut
+const c0 = promoted 11: t{r}
+bb0:
+  _0 = const c0
+  return
+",
+        r = ref_arr8_2.0,
+    );
+    let tw_off8 = tw2.with(ROOT, &root_off8).with_promoted_body(ROOT, ExprId(11), &promo_off8);
+    let rec_off8 = run(&tw_off8, Limits::DEFAULT).expect("promoted &ALIGNED_SPLIT.tail evaluates");
+    assert_eq!(rec_off8.allocs.len(), 2);
+    assert_eq!(rec_off8.allocs[1].bytes.as_slice(), &[0x55u8; 8]);
+    assert_eq!(rec_off8.allocs[1].align, 3, "offset-8 field borrow must preserve align(8) (log2 == 3)");
+    let _ = ref_arr8;
 }

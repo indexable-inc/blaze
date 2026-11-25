@@ -298,3 +298,128 @@ fn a_bound_keeps_the_traits_callee() {
     assert_eq!(callee_at(&c, ExprId(1)), Some((it.trait_fn, 1)), "the trait's into_future at [T]");
     std::println!("T.await: calls the trait's into_future<T>");
 }
+
+/// `.await` on an `IntoFuture` impl with where-clauses records the selected `IntoFuture` impl
+/// and its where-clause obligations in `Checked::selected`, matching regular calls:
+/// - concrete `impl<T: Marker> IntoFuture for Req<T>` at `Req<&u8>` with `impl Marker for &'static u8`
+///   records both `Req<&u8>: IntoFuture` and `&u8: Marker` as `Selected::Impl`;
+/// - alloy's `fn into_future(self) -> Self::IntoFuture` shape records
+///   `<SelfRet<&u8> as IntoFuture>::IntoFuture` in `selected_at(e)` as well as `&u8: Marker`
+///   in `call_selections(e)`;
+/// - generic `async fn go<U: Send>(x: Req<U>) -> U { x.await }` records `Req<U>: IntoFuture`
+///   (`Selected::Impl`) and `U: Send` (`Selected::ParamEnv`);
+/// - control `async fn wait(x: B) -> u32 { x.await }` (no regions, no params, no `Self::IntoFuture`
+///   signature alias) records no unnecessary selection rows.
+#[test]
+fn into_future_impl_where_clauses_are_recorded_in_selected() {
+    use crate::ids::Mutbl;
+    use crate::selected::Selected;
+
+    let mut world_fx = Fx::new();
+    let fx = &mut world_fx;
+    let sized = fx.tr("Sized", 1, [].into(), &[]);
+    fx.lang(LangItem::Sized, sized);
+    let u8_ = fx.u8();
+    let ref_u8 = fx.r(Mutbl::Not, u8_);
+    let p0 = fx.param(0);
+
+    let marker = fx.tr("Marker", 1, [].into(), &[]);
+    let marker_ref = fx.imp("impl Marker for &u8", 0, ref_u8, Some((marker, &[])), &[], [].into());
+
+    let into_future = fx.tr("IntoFuture", 1, [].into(), &["Output", "IntoFuture"]);
+    fx.lang(LangItem::IntoFuture, into_future);
+    let held_p0 = fx.alias(into_future, "IntoFuture", &[p0]);
+    let trait_fn = fx.trait_fn(into_future, "into_future", true, &[p0], held_p0);
+    fx.lang_def(LangItem::IntoFutureIntoFuture, Def::Fn(trait_fn));
+
+    let ready = fx.tuple_strukt("Ready", 1, &[p0]);
+    let ready_p0 = fx.adt(ready, &[p0]);
+
+    // 1. Concrete return `fn into_future(self) -> Ready<T>` with `T: Marker`.
+    let req = fx.tuple_strukt("Req", 1, &[p0]);
+    let req_p0 = fx.adt(req, &[p0]);
+    let marker_p0 = fx.bound(marker, &[p0]);
+    let req_imp = fx.imp(
+        "impl<T: Marker> IntoFuture for Req<T>",
+        1,
+        req_p0,
+        Some((into_future, &[])),
+        &[("Output", p0), ("IntoFuture", ready_p0)],
+        [marker_p0].into(),
+    );
+    let req_fn = fx.impl_fn(req_imp, "into_future", true, &[req_p0], ready_p0);
+
+    // 2. Alloy shape: `fn into_future(self) -> Self::IntoFuture` with `T: Marker`.
+    let self_ret = fx.tuple_strukt("SelfRet", 1, &[p0]);
+    let self_ret_p0 = fx.adt(self_ret, &[p0]);
+    let self_ret_held = fx.alias(into_future, "IntoFuture", &[self_ret_p0]);
+    let self_ret_imp = fx.imp(
+        "impl<T: Marker> IntoFuture for SelfRet<T>",
+        1,
+        self_ret_p0,
+        Some((into_future, &[])),
+        &[("Output", p0), ("IntoFuture", ready_p0)],
+        [marker_p0].into(),
+    );
+    let self_ret_fn = fx.impl_fn(self_ret_imp, "into_future", true, &[self_ret_p0], self_ret_held);
+
+    let req_ref = fx.adt(req, &[ref_u8]);
+    let self_ret_ref = fx.adt(self_ret, &[ref_u8]);
+    let f_req = fx.func("f_req", 0, &[req_ref], ref_u8, [].into());
+    let f_self_ret = fx.func("f_self_ret", 0, &[self_ret_ref], ref_u8, [].into());
+    fx.finish();
+
+    // Case 1: concrete `into_future` return -> `call_selections(await)` has both `IntoFuture` and `Marker`.
+    let mut b = Bb::new();
+    let x = b.param("x");
+    let u8_ty = b.ty(PNode::Uint(UintTy::U8));
+    let out = b.ty(PNode::Ref(Mutbl::Not, u8_ty));
+    b.async_fn(out);
+    let e0 = b.local(x);
+    let e1 = b.await_(e0);
+    let root = b.block(&[], Some(e1));
+    let c = check_body(&world_fx, &b, f_req, root, Plant::None, InferPlant::None);
+    assert!(c.diags.is_empty(), "f_req clean: {:?}", c.diags);
+    assert_eq!(callee_at(&c, e1), Some((req_fn, 1)));
+    assert!(c.selected_at(e1).is_empty(), "no Self::IntoFuture signature alias -> selected_at empty");
+    let rows = c.call_selections(e1);
+    assert!(
+        rows.iter().any(|r| r.trait_ == into_future && r.name.is_none() && matches!(r.selected, Selected::Impl { imp, .. } if imp == req_imp)),
+        "expected IntoFuture impl row at .await: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.trait_ == marker && r.name.is_none() && matches!(r.selected, Selected::Impl { imp, .. } if imp == marker_ref)),
+        "expected Marker where-clause impl row at .await: {rows:?}"
+    );
+
+    // Case 2: `fn into_future(self) -> Self::IntoFuture` -> `selected_at(await)` has `<SelfRet<&u8> as IntoFuture>::IntoFuture`
+    // and `call_selections(await)` has `&u8: Marker`.
+    let c = check_body(&world_fx, &b, f_self_ret, root, Plant::None, InferPlant::None);
+    assert!(c.diags.is_empty(), "f_self_ret clean: {:?}", c.diags);
+    assert_eq!(callee_at(&c, e1), Some((self_ret_fn, 1)));
+    let proj_rows = c.selected_at(e1);
+    assert_eq!(proj_rows.len(), 1, "expected one Self::IntoFuture projection row: {proj_rows:?}");
+    assert_eq!(proj_rows[0].trait_, into_future);
+    assert_eq!(proj_rows[0].name, Some(Name::of("IntoFuture")));
+    assert!(matches!(proj_rows[0].selected, Selected::Impl { imp, .. } if imp == self_ret_imp), "{:?}", proj_rows[0]);
+    let all_rows = c.call_selections(e1);
+    assert!(
+        all_rows.iter().any(|r| r.trait_ == marker && r.name.is_none() && matches!(r.selected, Selected::Impl { imp, .. } if imp == marker_ref)),
+        "expected Marker where-clause impl row alongside Self::IntoFuture: {all_rows:?}"
+    );
+
+    // Case 3: generic caller `go<U: Send>(x: Req<U>) -> U { x.await }` + control `wait(x: B) -> u32 { x.await }`.
+    let (fx, it) = world(false);
+    let c = await_param(&fx, it.go, PNode::Param(0));
+    assert!(c.diags.is_empty());
+    let go_rows = c.call_selections(ExprId(1));
+    assert_eq!(go_rows.len(), 2, "expected IntoFuture impl + U: Send bound row: {go_rows:?}");
+    assert!(go_rows.iter().any(|r| matches!(r.selected, Selected::Impl { .. })), "{go_rows:?}");
+    assert!(go_rows.iter().any(|r| matches!(r.selected, Selected::ParamEnv { .. })), "{go_rows:?}");
+
+    let c = await_param(&fx, it.wait, PNode::Uint(UintTy::U32));
+    assert!(c.diags.is_empty());
+    let wait_rows = c.call_selections(ExprId(1));
+    assert_eq!(wait_rows.len(), 1, "CONTROL: B.await (ADT with no impl where-clauses) records only its IntoFuture impl row: {wait_rows:?}");
+    assert!(wait_rows[0].name.is_none() && matches!(wait_rows[0].selected, Selected::Impl { .. }), "{wait_rows:?}");
+}

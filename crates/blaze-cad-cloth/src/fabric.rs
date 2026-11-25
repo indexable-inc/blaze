@@ -60,6 +60,7 @@ impl Fabric {
             emissive_strength: None,
             clearcoat: None,
             double_sided: true,
+            ..
         }
     }
 

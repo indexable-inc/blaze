@@ -44,7 +44,8 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
             Pat::Bind { ann, .. } if ann.mutable => Mutbl::Mut,
             _ => Mutbl::Not,
         };
-        let local = self.b.new_local(LocalDecl { ty, kind: LocalKind::Binding(p), mutbl });
+        let cty = self.canonical_ty(ty, At::Pat(p))?;
+        let local = self.b.new_local(LocalDecl { ty: cty, kind: LocalKind::Binding(p), mutbl });
         let place = self.b.local_place(local);
         let span = self.pat_span(p);
         self.b.push(StmtKind::StorageLive(local), span);

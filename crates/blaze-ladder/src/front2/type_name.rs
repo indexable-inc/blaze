@@ -82,7 +82,7 @@ pub(crate) fn item_path<'a, 'n: 'a, S: NamesSource<'n>>(
     item: ItemKey,
     out: &mut dyn FnMut(&str),
 ) -> bool {
-    let alloc = store.tys.alloc();
+    let alloc = store.work_alloc();
     let tys = store.tys.view();
     let mut buf = OwnString::new_in(alloc);
     let mut stack: AVec<'_, Piece<'a>> = AVec::new_in(alloc);
