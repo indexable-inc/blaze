@@ -14,9 +14,13 @@
 //! | [`screen`] | a screen: interned styles, out-of-line graphemes and links, cursor, reflowing resize | built |
 //! | [`terminal`] | C0/C1, ESC, CSI and modes on two screens; replies as bytes, effects as data | built |
 //! | [`plant`] | the planted bugs the simulation tests must catch | built |
-//!
-//! The screen, terminal, SGR, OSC, DCS, kitty and input modules are written in lanes against
-//! these interfaces (vt.md, "Modules").
+//! | [`sgr`] | SGR parameters to attributes (colon groups on 4, 38, 48, 58), applied to a [`style::Style`] | built |
+//! | [`color`] | colour specs (`rgb:`, `rgbi:`, `#…`, X11 names), the default and dynamic palettes, `rgb:` reply forms | built |
+//! | [`osc`] | an OSC payload to a command (every OSC ghostty parses), and the bytes a colour query replies | built |
+//! | [`dcs`] | the DCS handler: DECRQSS, XTGETTCAP, tmux control mode ([`dcs::tmux`]), capped buffer | built |
+//! | [`terminfo`] | the terminfo entry XTGETTCAP answers from (ghostty's 268 capabilities, `TN`, `Co`, `RGB`) | built |
+//! | [`reply`] | every reply's exact bytes and terminator, as encoders over plain state | built |
+//! | [`input`] | key (legacy, modifyOtherKeys 2, kitty flags 1–16), mouse (9/1000/1002/1003; X10, 1005, 1006, 1015, 1016), paste (2004, unsafe bytes) and focus (1004) encoding into the caller's buffer | built |
 
 #![no_std]
 #![feature(register_tool, custom_inner_attributes)]
@@ -27,12 +31,19 @@
 #[cfg(test)]
 extern crate std;
 
+pub mod color;
+pub mod dcs;
+pub mod input;
+pub mod osc;
 pub mod page;
 pub mod parser;
 pub mod plant;
+pub mod reply;
 pub mod screen;
+pub mod sgr;
 pub mod style;
 pub mod terminal;
+pub mod terminfo;
 mod utf8;
 
 #[cfg(test)]
