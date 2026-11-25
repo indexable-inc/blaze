@@ -2396,6 +2396,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-vt"
+version = "0.0.0"
+dependencies = [
+ "blaze-base64",
+ "blaze-deflate",
+ "blaze-own",
+ "blaze-sim",
+ "blaze-unicode",
+]
+
+[[package]]
 name = "blaze-wasi"
 version = "0.0.0"
 dependencies = [

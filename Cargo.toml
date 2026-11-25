@@ -522,6 +522,7 @@ blaze-site = { path = "crates/blaze-site" } # Pure no_std, zero-unsafe, sans-IO 
 blaze-site-wasm = { path = "crates/blaze-site-wasm" } # Zero-import no_std wasm32 C-ABI cdylib over blaze-site + generated WebGPU Slug/SDF shaders.
 blaze-tab = { path = "crates/blaze-tab" } # Blaze's LLM-first tabular data format inspired by NUON (sparse schemas, lossless Value).
 blaze-toml = { path = "crates/blaze-toml" }
+blaze-vt = { path = "crates/blaze-vt" } # bstd::vt: a sans-IO terminal emulator core with ghostty's coverage (docs/v2/plan/design/vt.md).
 blaze-ui = { path = "crates/blaze-ui" } # Pure no_std, zero-unsafe, sans-IO relational ECS UI library + Rust->WGSL/MSL WebGPU renderer.
 blaze-ui-wasm = { path = "crates/blaze-ui-wasm" } # Zero-import no_std wasm32 C-ABI cdylib over blaze-ui + generated WebGPU shaders.
 blaze-v2-proof = { path = "crates/blaze-v2-proof" }
