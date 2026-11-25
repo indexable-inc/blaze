@@ -843,7 +843,7 @@ fn sandbox(profile: &str, temp: &[u8], alloc: Alloc<'_>) -> Option<i32> {
         let Ok(temp_c) = core::ffi::CStr::from_bytes_with_nul(temp) else {
             return Some(libc::EINVAL);
         };
-        let prepared = match blaze_sys::linux::confine::TestConfine::prepare(temp_c, None) {
+        let prepared = match blaze_sys::linux::confine::TestConfine::prepare(temp_c) {
             Ok(p) => p,
             Err(blaze_sys::linux::confine::TestConfineError::AbiProbe(e))
             | Err(blaze_sys::linux::confine::TestConfineError::CreateRuleset(e))

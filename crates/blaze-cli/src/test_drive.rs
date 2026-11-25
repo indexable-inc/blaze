@@ -2987,9 +2987,15 @@ impl<'c> Launched<'c, '_, '_> {
             let value = lazy_native.as_ref().map_or(send.hex, |s| s.as_str());
             vars.push(("BLAZE_LAUNCH_NATIVE", value));
         }
+        #[cfg(target_os = "macos")]
         let unwound_full = self.tests.harnessed().then(|| bstd::mem::format_in!(frame, "{}/unwound-{row}", self.temp));
+        #[cfg(target_os = "macos")]
         if let Some(unwound) = unwound_full.as_ref() {
             vars.push(("BLAZE_LAUNCH_UNWOUND_FILE", unwound.as_str()));
+        }
+        #[cfg(target_os = "linux")]
+        if self.tests.harnessed() {
+            vars.push(("BLAZE_LAUNCH_UNWOUND_FILE", "fd:4"));
         }
         // 4. Sandbox + spawn.
         #[cfg(target_os = "macos")]
@@ -3003,25 +3009,18 @@ impl<'c> Launched<'c, '_, '_> {
             self.spawner.start_served(cx, &spec).map_err(OneError::Start)?
         };
         #[cfg(target_os = "linux")]
-        let Started { child: mut run, pipes: given } = {
-            if unwound_full.is_some() {
-                // Pre-create the empty marker so Landlock can grant file-only WRITE_FILE|TRUNCATE
-                // on this single inode without opening `suite_dir` (and sibling `stderr-<row>`)
-                // for writes.
-                let marker = suite_dir.create(cx, unwound_path).map_err(OneError::Capture)?;
-                marker.close(cx, Durable::No).map_err(OneError::Capture)?;
-            }
+        let (Started { child: mut run, pipes: given }, mut unwound_channel) = {
             let spec = RunSpec { program: self.launcher, arg0: None, args: self.args, env: vars.as_slice(), dir: self.place.dir, streams: Streams::PIPED, own_group: true, parent_death: ParentDeath::STRONGEST };
             let sandbox = bstd::procs::TestSandbox {
                 temp: temp.as_str(),
-                unwound: unwound_full.as_ref().map(|s| s.as_str()),
+                unwound_channel: self.tests.harnessed(),
             };
             signals.begin(Doing::Starting);
             self.spawner.start_served_test(cx, &spec, &sandbox).map_err(OneError::Start)?
         };
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         let Started { child: mut run, pipes: given } = {
-            let _ = (vars, unwound_full, signals);
+            let _ = (vars, signals);
             return Err(OneError::Profile { why: Box::from("no test sandbox is built for this host") });
         };
         let started_at = run.now();
@@ -3404,27 +3403,34 @@ impl<'c> Launched<'c, '_, '_> {
         }
         let mut panic_text = String::new_in(self.tables);
         if self.tests.harnessed() && matches!(ended, How::NoReport { code: 101, torn: 0 }) {
-            match suite_dir.open_read(cx, unwound_path) {
+            #[cfg(target_os = "linux")]
+            let unwound = {
+                let _ = unwound_path;
+                unwound_channel.as_mut().is_some_and(|ch| ch.did_unwind(frame))
+            };
+            #[cfg(not(target_os = "linux"))]
+            let unwound = match suite_dir.open_read(cx, unwound_path) {
                 Ok(marker) => {
                     let mut byte = [0u8; 1];
                     let n = marker.read_into(&mut byte, 0).wait(cx).map_err(OneError::Capture)?;
                     drop(marker);
                     let _ = suite_dir.remove(cx, unwound_path, Durable::No);
-                    if n > 0 && byte[0] == b'1' {
-                        ended = How::Reported(Said::Panicked { at: None });
-                        let tail = stderr.tail_bytes(cx, frame)?;
-                        let mut lossy = String::new_in(alloc);
-                        for chunk in tail.utf8_chunks() {
-                            lossy.push_str(chunk.valid());
-                            if !chunk.invalid().is_empty() {
-                                lossy.push('\u{FFFD}');
-                            }
-                        }
-                        panic_text.push_str(extract_panic_message(lossy.as_str()));
+                    n > 0 && byte[0] == b'1'
+                }
+                Err(error) if error.kind == FsKind::NotFound => false,
+                Err(error) => return Err(OneError::Capture(error)),
+            };
+            if unwound {
+                ended = How::Reported(Said::Panicked { at: None });
+                let tail = stderr.tail_bytes(cx, frame)?;
+                let mut lossy = String::new_in(alloc);
+                for chunk in tail.utf8_chunks() {
+                    lossy.push_str(chunk.valid());
+                    if !chunk.invalid().is_empty() {
+                        lossy.push('\u{FFFD}');
                     }
                 }
-                Err(error) if error.kind == FsKind::NotFound => {}
-                Err(error) => return Err(OneError::Capture(error)),
+                panic_text.push_str(extract_panic_message(lossy.as_str()));
             }
         }
         if let How::Signal { number } = ended {

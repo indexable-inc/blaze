@@ -68,13 +68,38 @@ pub struct RunSpec<'a> {
     pub parent_death: ParentDeath,
 }
 
-/// The Linux test sandbox's writable paths ([`Spawner::start_served_test`]; test.md, piece 9):
-/// the test's own `$TMPDIR` (full writable subtree) and, when harnessed, the pre-created unwind
-/// marker file (file-only write + truncate, leaving sibling files in its directory read-only).
+/// Descriptor inherited by `blaze-launcher` on Linux for the launcher-owned unwind channel
+/// (never exposed as a filesystem path; set `FD_CLOEXEC` by the launcher before guest code runs).
+#[cfg(target_os = "linux")]
+pub const UNWOUND_FD: u32 = 4;
+
+/// The Linux test sandbox configuration ([`Spawner::start_served_test`]; test.md, piece 9):
+/// the test's own `$TMPDIR` (the sole writable subtree beside `/dev/null`) and whether to attach
+/// a launcher-owned unwind channel on [`UNWOUND_FD`] (for harnessed tests).
 #[cfg(target_os = "linux")]
 pub struct TestSandbox<'a> {
     pub temp: &'a str,
-    pub unwound: Option<&'a str>,
+    pub unwound_channel: bool,
+}
+
+/// Parent end of the launcher-owned unwind channel (`UNWOUND_FD`), checked after a harnessed
+/// test exits with status 101 to distinguish an uncaught Rust panic unwind from `exit(101)`.
+#[cfg(target_os = "linux")]
+pub struct UnwoundChannel {
+    channel: Channel,
+    io: Io,
+}
+
+#[cfg(target_os = "linux")]
+impl UnwoundChannel {
+    /// Returns `true` iff the launcher wrote the unwind sentinel (`b"1"`) before exiting.
+    pub fn did_unwind<A: Allocator>(&mut self, alloc: A) -> bool {
+        let mut buf: Vec<u8, A> = Vec::new_in(alloc);
+        matches!(
+            self.channel.recv_message(&mut buf, 16, Deadline::PASSED, &DriverClock(&self.io)),
+            Ok(Message::Whole { .. }) if buf.get(PREFIX..) == Some(b"1")
+        )
+    }
 }
 
 /// What to start detached in a new session ([`Spawner::start_detached`]): the program, its
@@ -316,11 +341,17 @@ impl Spawner {
     }
 
     /// `spec` started with its channel as [`CHILD_FD`] inside the Linux test sandbox
-    /// (`blaze_sys::linux::confine::TestConfine`: Landlock + seccomp + `PR_SET_NO_NEW_PRIVS`,
-    /// entered in the child before `execve`). Refused steps are [`RunFault::Host`]; the program
-    /// never runs unsandboxed (rule 9).
+    /// (`blaze_sys::linux::confine::TestConfine`: Landlock ABI >= 6 + seccomp +
+    /// `PR_SET_NO_NEW_PRIVS`, entered in the child before `execve`). When `sandbox.unwound_channel`
+    /// is true, also inherits a launcher-owned unwind channel on [`UNWOUND_FD`] and returns its
+    /// parent end. Refused steps are [`RunFault::Host`]; the program never runs unsandboxed (rule 9).
     #[cfg(target_os = "linux")]
-    pub fn start_served_test(&self, cx: &Cx, spec: &RunSpec<'_>, sandbox: &TestSandbox<'_>) -> Result<Started<Served>, RunError> {
+    pub fn start_served_test(
+        &self,
+        cx: &Cx,
+        spec: &RunSpec<'_>,
+        sandbox: &TestSandbox<'_>,
+    ) -> Result<(Started<Served>, Option<UnwoundChannel>), RunError> {
         fn c_path<'a>(path: &str, buf: &'a mut [u8; 4096], what: &'static str) -> Result<&'a core::ffi::CStr, RunError> {
             let bytes = path.as_bytes();
             if bytes.len() + 1 > buf.len() || bytes.contains(&0) {
@@ -334,15 +365,10 @@ impl Spawner {
         let refuse = |fault| RunError { step: RunStep::Start, proc: None, fault };
         let mut temp_buf = [0u8; 4096];
         let temp_c = c_path(sandbox.temp, &mut temp_buf, "test sandbox temp path")?;
-        let mut unwound_buf = [0u8; 4096];
-        let unwound_c = match sandbox.unwound {
-            Some(path) => Some(c_path(path, &mut unwound_buf, "test sandbox unwound path")?),
-            None => None,
-        };
-        let prepared = blaze_sys::linux::confine::TestConfine::prepare(temp_c, unwound_c).map_err(|err| {
+        let prepared = blaze_sys::linux::confine::TestConfine::prepare(temp_c).map_err(|err| {
             let (what, os) = match err {
                 blaze_sys::linux::confine::TestConfineError::AbiProbe(errno) => ("landlock ABI probe", i32::from(errno.raw())),
-                blaze_sys::linux::confine::TestConfineError::AbiTooOld { .. } => ("landlock ABI is older than 3", 0),
+                blaze_sys::linux::confine::TestConfineError::AbiTooOld { .. } => ("landlock ABI is older than 6 (signal scoping required)", 0),
                 blaze_sys::linux::confine::TestConfineError::CreateRuleset(errno) => ("landlock_create_ruleset", i32::from(errno.raw())),
                 blaze_sys::linux::confine::TestConfineError::OpenPath { which, errno } => (which, i32::from(errno.raw())),
                 blaze_sys::linux::confine::TestConfineError::AddRule { which, errno } => (which, i32::from(errno.raw())),
@@ -350,10 +376,27 @@ impl Spawner {
             refuse(RunFault::Host { what, os })
         })?;
         let (parent, child_end) = channel::pair().map_err(|error| refuse(RunFault::Channel(error)))?;
-        let given = [(child_end.fd(), CHILD_FD)];
-        let Started { child: run, pipes } = self.start_with(cx, spec, &given, Some(&prepared.confine()))?;
+        let unwound_pair = if sandbox.unwound_channel {
+            Some(channel::pair().map_err(|error| refuse(RunFault::Channel(error)))?)
+        } else {
+            None
+        };
+        let Started { child: run, pipes } = match &unwound_pair {
+            Some((_, unwound_child)) => {
+                let given = [(child_end.fd(), CHILD_FD), (unwound_child.fd(), UNWOUND_FD)];
+                self.start_with(cx, spec, &given, Some(&prepared.confine()))?
+            }
+            None => {
+                let given = [(child_end.fd(), CHILD_FD)];
+                self.start_with(cx, spec, &given, Some(&prepared.confine()))?
+            }
+        };
         drop(child_end);
-        Ok(Started { child: Served { run, channel: parent }, pipes })
+        let unwound = unwound_pair.map(|(u_parent, u_child)| {
+            drop(u_child);
+            UnwoundChannel { channel: u_parent, io: self.io.clone() }
+        });
+        Ok((Started { child: Served { run, channel: parent }, pipes }, unwound))
     }
 
     fn start_with(

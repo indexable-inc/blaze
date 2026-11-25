@@ -23,7 +23,7 @@
 use core::ffi::CStr;
 
 use super::{
-    AccessFs, CWD, OpenFlags, OwnedFd, PathBeneath, RulesetAttr, SockFilter,
+    AccessFs, AccessNet, CWD, OpenFlags, OwnedFd, PathBeneath, RulesetAttr, SockFilter,
     landlock_abi, landlock_add_rule_path, landlock_create_ruleset, nr::PRLIMIT64, openat, raw,
 };
 use crate::{Errno, Fd, Path};
@@ -171,6 +171,16 @@ pub mod deny {
     pub const EPERM: [u32; 19] = [41, 101, 310, 311, 165, 166, 155, 272, 308, 428, 429, 430, 432, 321, 298, 425, 250, 248, 249];
     #[cfg(target_arch = "aarch64")]
     pub const EPERM: [u32; 19] = [198, 117, 270, 271, 40, 39, 41, 97, 268, 428, 429, 430, 432, 280, 241, 425, 219, 217, 218];
+    /// `setpgid` and `setsid`: denied in the test sandbox after setup so spawned helpers cannot
+    /// leave the test's process group (its kill domain).
+    #[cfg(target_arch = "x86_64")]
+    pub const SETPGID: u32 = 109;
+    #[cfg(target_arch = "aarch64")]
+    pub const SETPGID: u32 = 154;
+    #[cfg(target_arch = "x86_64")]
+    pub const SETSID: u32 = 112;
+    #[cfg(target_arch = "aarch64")]
+    pub const SETSID: u32 = 157;
     /// `clone`.
     #[cfg(target_arch = "x86_64")]
     pub const CLONE: u32 = 56;
@@ -238,13 +248,19 @@ pub fn build(filter: Filter, out: &mut [SockFilter; MOST_FILTER]) -> &[SockFilte
 }
 
 const AF_UNIX: u32 = 1;
-const AF_INET: u32 = 2;
-const AF_INET6: u32 = 10;
+/// All Linux `CLONE_NEW*` namespace bits (`NEWNS | NEWCGROUP | NEWUTS | NEWIPC | NEWUSER | NEWPID | NEWNET | NEWTIME`).
+const CLONE_NEW_MASK: u32 = 0x7E02_0080;
 
-/// Seccomp filter for a sandboxed test child (`docs/v2/plan/design/test.md`, piece 9): denies all
-/// non-socket dangerous syscalls (`ptrace`, mounts, namespaces, `bpf`, `perf_event_open`,
-/// `io_uring_setup`, keyrings) and restricts `socket(domain, ..)` to `AF_UNIX`, `AF_INET`, and
-/// `AF_INET6`. Processes (`fork`/`clone`/`exec`) remain allowed so tests can spawn helpers.
+/// Seccomp filter for a sandboxed test child (`docs/v2/plan/design/test.md`, piece 9):
+/// - Denies all non-socket dangerous syscalls (`ptrace`, mounts, namespaces, `bpf`,
+///   `perf_event_open`, `io_uring_setup`, keyrings) plus `setpgid` and `setsid` (so helpers
+///   cannot leave the test's kill process group) with `EPERM`.
+/// - Denies `clone3` with `ENOSYS` (glibc/musl fall back to `clone`) and rejects any `clone`
+///   call carrying a `CLONE_NEW*` namespace flag with `EPERM`, while permitting ordinary threads
+///   and helper subprocesses.
+/// - Restricts `socket(domain, ..)` to `AF_UNIX` (path-based sockets confined by Landlock to
+///   `$TMPDIR`, abstract sockets scoped by Landlock ABI 6), blocking all off-machine network
+///   families (`AF_INET`, `AF_INET6`, etc.) with `EPERM`.
 #[blaze::noalloc]
 #[blaze::nopanic]
 pub fn build_test(out: &mut [SockFilter; MOST_FILTER]) -> &[SockFilter] {
@@ -265,19 +281,31 @@ pub fn build_test(out: &mut [SockFilter; MOST_FILTER]) -> &[SockFilter] {
         put(jump(JEQ_K, nr, 0, 1));
         put(stmt(RET_K, RET_ERRNO | EPERM));
     }
-    // `socket(domain, ..)`: allow only AF_UNIX, AF_INET, AF_INET6; deny other families with EPERM.
-    put(jump(JEQ_K, deny::SOCKET, 0, 5));
+    for nr in [deny::SETPGID, deny::SETSID] {
+        put(jump(JEQ_K, nr, 0, 1));
+        put(stmt(RET_K, RET_ERRNO | EPERM));
+    }
+    put(jump(JEQ_K, deny::CLONE3, 0, 1));
+    put(stmt(RET_K, RET_ERRNO | ENOSYS));
+    // `socket(domain, ..)`: allow only AF_UNIX; deny all other socket families with EPERM.
+    put(jump(JEQ_K, deny::SOCKET, 0, 4));
     put(stmt(LD_W_ABS, DATA_ARG0));
-    put(jump(JEQ_K, AF_UNIX, 3, 0));
-    put(jump(JEQ_K, AF_INET, 2, 0));
-    put(jump(JEQ_K, AF_INET6, 1, 0));
+    put(jump(JEQ_K, AF_UNIX, 0, 1));
+    put(stmt(RET_K, RET_ALLOW));
+    put(stmt(RET_K, RET_ERRNO | EPERM));
+    // `clone(flags, ..)`: allow ordinary threads and helpers; deny any CLONE_NEW* flag with EPERM.
+    put(jump(JEQ_K, deny::CLONE, 0, 3));
+    put(stmt(LD_W_ABS, DATA_ARG0));
+    put(jump(JSET_K, CLONE_NEW_MASK, 0, 1));
     put(stmt(RET_K, RET_ERRNO | EPERM));
     put(stmt(RET_K, RET_ALLOW));
     &out[..at]
 }
 
-/// Minimum Landlock ABI required to confine a Linux test process (ABI 3 adds `TRUNCATE`).
-pub const LEAST_TEST_ABI: u32 = 3;
+/// Minimum Landlock ABI required to confine a Linux test process: ABI 6 adds signal and abstract
+/// Unix socket scoping (`LANDLOCK_SCOPE_SIGNAL | LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET`), ensuring
+/// a test cannot signal the blaze runner or other same-UID processes outside its sandbox (rule 9).
+pub const LEAST_TEST_ABI: u32 = 6;
 
 /// `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET | LANDLOCK_SCOPE_SIGNAL` (ABI 6).
 const TEST_SCOPES: u64 = 0b11;
@@ -291,7 +319,7 @@ pub enum TestConfineError {
     AbiTooOld { abi: u32, least: u32 },
     /// Creating the Landlock ruleset failed.
     CreateRuleset(Errno),
-    /// Opening one of the fixed paths (`/`, `temp`, `/dev/null`, or `unwound`) failed.
+    /// Opening one of the fixed paths (`/`, `temp`, or `/dev/null`) failed.
     OpenPath { which: &'static str, errno: Errno },
     /// Adding a Landlock rule for `which` failed.
     AddRule { which: &'static str, errno: Errno },
@@ -306,28 +334,31 @@ pub struct TestConfine {
 }
 
 impl TestConfine {
-    /// Builds the Linux test sandbox matching macOS Seatbelt's test policy (`blaze-run child.rs`):
+    /// Builds the Linux test sandbox (`docs/v2/plan/design/test.md`, piece 9):
+    /// - Requires Landlock ABI >= 6 (`TRUNCATE`, `BIND_TCP|CONNECT_TCP`, `IOCTL_DEV`, and
+    ///   `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET | LANDLOCK_SCOPE_SIGNAL`).
     /// - Read + execute anywhere under `/` (so checkout fixtures, system libraries, and the code
-    ///   store are readable, and child binaries can exec).
-    /// - Write + create + remove + rename + socket + exec beneath `temp` (`$TMPDIR`).
-    /// - Write + truncate (+ ioctl on ABI >= 5) on `/dev/null`.
-    /// - Write + truncate on the pre-created `unwound` marker file when harnessed (no directory
-    ///   write permission on its parent, so sibling `stderr-<row>` cannot be tampered with).
-    /// - Signals and abstract Unix sockets scoped to the sandbox on ABI >= 6.
-    /// - Seccomp filter from [`build_test`].
+    ///   store are readable, and helper binaries can exec).
+    /// - Write + create + remove + rename + socket + exec beneath `temp` (`$TMPDIR`), with no
+    ///   char/block device creation and no writable paths anywhere outside `temp` and `/dev/null`.
+    /// - File-only read + write + truncate + ioctl on `/dev/null`.
+    /// - All TCP bind/connect denied by Landlock (zero net rules); seccomp further restricts
+    ///   `socket()` to `AF_UNIX` only, blocks `setpgid`/`setsid`, rejects `clone3` (`ENOSYS`),
+    ///   and rejects any `CLONE_NEW*` flag on `clone`.
     #[blaze::noalloc]
     #[blaze::nopanic]
-    pub fn prepare(temp: &CStr, unwound: Option<&CStr>) -> Result<TestConfine, TestConfineError> {
+    pub fn prepare(temp: &CStr) -> Result<TestConfine, TestConfineError> {
         let abi = landlock_abi().map_err(TestConfineError::AbiProbe)?;
         if abi < LEAST_TEST_ABI {
             return Err(TestConfineError::AbiTooOld { abi, least: LEAST_TEST_ABI });
         }
         let base_fs = AccessFs::ALL_ABI1.with(AccessFs::REFER).with(AccessFs::TRUNCATE);
-        let handled_fs = if abi >= 5 { base_fs.with(AccessFs::IOCTL_DEV) } else { base_fs };
+        let handled_fs = base_fs.with(AccessFs::IOCTL_DEV);
+        let handled_net = AccessNet::BIND_TCP.with(AccessNet::CONNECT_TCP);
         let attr = RulesetAttr {
             handled_access_fs: handled_fs.bits(),
-            handled_access_net: 0,
-            scoped: if abi >= 6 { TEST_SCOPES } else { 0 },
+            handled_access_net: handled_net.bits(),
+            scoped: TEST_SCOPES,
         };
         let ruleset = landlock_create_ruleset(&attr).map_err(TestConfineError::CreateRuleset)?;
 
@@ -350,16 +381,12 @@ impl TestConfine {
         );
         add_path("temp", temp, dir_flags, temp_access)?;
 
-        // 3. `/dev/null`: file-only write + read + truncate (+ ioctl on ABI >= 5).
-        let null_base = AccessFs::READ_FILE.with(AccessFs::WRITE_FILE).with(AccessFs::TRUNCATE);
-        let null_access = if abi >= 5 { null_base.with(AccessFs::IOCTL_DEV) } else { null_base };
+        // 3. `/dev/null`: file-only read + write + truncate + ioctl.
+        let null_access = AccessFs::READ_FILE
+            .with(AccessFs::WRITE_FILE)
+            .with(AccessFs::TRUNCATE)
+            .with(AccessFs::IOCTL_DEV);
         add_path("/dev/null", c"/dev/null", path_flags, null_access)?;
-
-        // 4. Optional pre-created unwind marker file: file-only write + truncate.
-        if let Some(marker) = unwound {
-            let marker_access = AccessFs::READ_FILE.with(AccessFs::WRITE_FILE).with(AccessFs::TRUNCATE);
-            add_path("unwound", marker, path_flags, marker_access)?;
-        }
 
         let mut filter = [SockFilter { code: 0, jt: 0, jf: 0, k: 0 }; MOST_FILTER];
         let filter_len = build_test(&mut filter).len();

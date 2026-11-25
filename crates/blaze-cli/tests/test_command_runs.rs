@@ -343,25 +343,30 @@ fn passes() {
     }
 }
 
-/// Linux test sandbox (Landlock + seccomp, `test.md` piece 9):
-/// - writes inside `$TMPDIR` succeed;
-/// - writes outside `$TMPDIR` (e.g. the package manifest) are refused with `PermissionDenied`;
-/// - `#[should_panic(expected = ...)]` succeeds via the pre-created `unwound-<row>` marker;
-/// - `std::process::exit(101)` without unwinding is NOT misclassified as a panic (control against
-///   treating the pre-created 0-byte marker file as an unwind).
+/// Linux test sandbox (Landlock ABI >= 6 + seccomp, `test.md` piece 9):
+/// - writes and `AF_UNIX` sockets inside `$TMPDIR` succeed;
+/// - writes outside `$TMPDIR` (creating or opening `Cargo.toml`) are refused with `PermissionDenied`;
+/// - `AF_INET` / `AF_INET6` sockets are refused with `PermissionDenied` (no off-machine network);
+/// - spawning a normal helper subprocess succeeds (`clone3 -> ENOSYS` fallback + non-namespace `clone`);
+/// - `#[should_panic(expected = ...)]` succeeds via the launcher-owned `fd:4` channel (no guest-
+///   writable unwind file in `$TMPDIR/..`), while `std::process::exit(101)` is NOT classified as a panic.
 #[test]
 #[cfg(target_os = "linux")]
 fn linux_sandbox_confines_writes_and_distinguishes_exit_101() {
     let source = r#"
 #[test]
-fn can_write_inside_tmpdir() {
+fn can_write_and_unix_socket_inside_tmpdir() {
     let p = std::env::temp_dir().join("ok.txt");
     std::fs::write(&p, b"hello").expect("write inside TMPDIR");
     assert_eq!(std::fs::read(&p).expect("read back"), b"hello");
+    let sock = std::env::temp_dir().join("ok.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&sock).expect("AF_UNIX bind inside TMPDIR");
+    let status = std::process::Command::new("/bin/true").status().expect("spawn helper");
+    assert!(status.success());
 }
 
 #[test]
-fn cannot_write_outside_tmpdir() {
+fn cannot_write_outside_tmpdir_or_open_inet_socket() {
     let cwd = std::env::current_dir().expect("current dir");
     let escaped = cwd.join("escaped.txt");
     let err = std::fs::write(&escaped, b"nope").expect_err("creating file outside TMPDIR must be denied by Landlock");
@@ -371,11 +376,20 @@ fn cannot_write_outside_tmpdir() {
         .open(cwd.join("Cargo.toml"))
         .expect_err("opening existing file for write outside TMPDIR must be denied by Landlock");
     assert_eq!(err2.kind(), std::io::ErrorKind::PermissionDenied, "expected EACCES/PermissionDenied writing Cargo.toml, got {err2:?}");
+    let err3 = std::net::TcpListener::bind("127.0.0.1:0").expect_err("AF_INET socket must be denied");
+    assert_eq!(err3.kind(), std::io::ErrorKind::PermissionDenied, "expected EPERM on AF_INET socket, got {err3:?}");
+    // No guest-writable unwind marker exists beside TMPDIR.
+    let parent_entries: Vec<_> = std::fs::read_dir(std::env::temp_dir().parent().unwrap())
+        .expect("read parent")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("unwound-"))
+        .collect();
+    assert!(parent_entries.is_empty(), "expected no filesystem unwind marker beside TMPDIR, found {parent_entries:?}");
 }
 
 #[test]
 #[should_panic(expected = "expected boom")]
-fn should_panic_works_with_precreated_marker() {
+fn should_panic_works_with_unwound_channel() {
     panic!("expected boom");
 }
 

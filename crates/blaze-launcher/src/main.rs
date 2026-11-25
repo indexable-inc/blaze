@@ -226,13 +226,35 @@ fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::Shared
     // harnessed tests): runs the entry with `End::Return` so an uncaught Rust panic unwinding
     // out of the test entry writes the marker and exits 101 instead of aborting with SIGABRT,
     // keeping genuine SIGABRTs (C `abort()`, double-panic, allocator abort) distinct.
-    let unwound_file = match (std::env::var_os("BLAZE_LAUNCH_UNWOUND_FILE"), start.form) {
+    enum UnwoundSink {
+        File(PathBuf),
+        Fd(OwnedFd),
+    }
+    let unwound_sink = match (std::env::var_os("BLAZE_LAUNCH_UNWOUND_FILE"), start.form) {
         (None, _) => None,
         (Some(_), EntryForm::Comptime | EntryForm::Hosted) => stop(
             CANNOT_RUN,
             "BLAZE_LAUNCH_UNWOUND_FILE is set for a non-test entry",
         ),
-        (Some(path), EntryForm::Unit | EntryForm::CMain) => Some(PathBuf::from(path)),
+        (Some(raw), EntryForm::Unit | EntryForm::CMain) => {
+            if let Some(fd_str) = raw.to_str().and_then(|s| s.strip_prefix("fd:")) {
+                let fd: i32 = match fd_str.parse() {
+                    Ok(n) if n > 3 => n,
+                    _ => stop(CANNOT_RUN, "BLAZE_LAUNCH_UNWOUND_FILE fd target is invalid"),
+                };
+                // SAFETY: validates `fd` is open and immediately marks it close-on-exec so no
+                // subprocess spawned by the test inherits the launcher-owned unwind channel.
+                if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1
+                    || unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1
+                {
+                    stop(CANNOT_RUN, "BLAZE_LAUNCH_UNWOUND_FILE fd is not open");
+                }
+                // SAFETY: `fd` was inherited from `blaze test` exclusively for this launcher.
+                Some(UnwoundSink::Fd(unsafe { OwnedFd::from_raw_fd(fd) }))
+            } else {
+                Some(UnwoundSink::File(PathBuf::from(raw)))
+            }
+        }
     };
     let open_explore = std::env::var_os("BLAZE_LAUNCH_EXPLORE").is_some_and(|v| v == "1");
     if let Some(raw_stride) = std::env::var_os("BLAZE_ALLOC_SAMPLE_BYTES") {
@@ -310,7 +332,7 @@ fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::Shared
     // span_exit frames). When `BLAZE_LAUNCH_TELEMETRY` is set, `ObservedBind` layers zero-touch
     // alloc/IO/mutex telemetry on top; otherwise plain `LauncherOwn<Dlsym>` pays zero overhead.
     let ordinary = |socket, handed| {
-        let end = if unwound_file.is_some() { End::Return } else { End::Exit };
+        let end = if unwound_sink.is_some() { End::Return } else { End::Exit };
         let ran = if telemetry_on {
             run_mode::run(
                 socket,
@@ -335,14 +357,25 @@ fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::Shared
             )
         };
         match ran {
-            Ok(status) if unwound_file.is_some() => {
+            Ok(status) if unwound_sink.is_some() => {
                 // SAFETY: ends the process as a return from the entry does, flushing stdio streams.
                 unsafe { libc::exit(status) }
             }
             Ok(status) => stop(STOPPED, &format!("the run returned status {status} where it ends the process (End::Exit)")),
             Err(run_mode::RunModeError::Unwound) => {
-                if let Some(path) = unwound_file.as_ref() {
-                    let _ = std::fs::write(path, b"1");
+                if let Some(sink) = unwound_sink.as_ref() {
+                    match sink {
+                        UnwoundSink::File(path) => {
+                            let _ = std::fs::write(path, b"1");
+                        }
+                        UnwoundSink::Fd(fd) => {
+                            use std::os::fd::AsRawFd;
+                            let frame: [u8; 5] = [0, 0, 0, 1, b'1'];
+                            // SAFETY: `fd` is the open launcher-owned unwind socket; writes a
+                            // single 5-byte length-prefixed sentinel frame before exiting 101.
+                            let _ = unsafe { libc::write(fd.as_raw_fd(), frame.as_ptr().cast(), frame.len()) };
+                        }
+                    }
                     // SAFETY: ends the process with Rust's standard panic exit code (101) after
                     // recording the unwind marker for `blaze test`.
                     unsafe { libc::exit(101) }
