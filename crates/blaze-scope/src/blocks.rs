@@ -110,8 +110,22 @@ pub fn block_modules<'a>(krate: CrateItemKey, body: ItemKey, nested: &Nested<'_>
 /// text copies (offsets in `text`): a body a macro wrote moves its marks' column with them
 /// (crate_roots `remapped`); a file's body passes `&mut |_| {}`.
 pub fn module_text<'a>(text: &str, nested: &Nested<'_>, copied: &mut dyn FnMut(crate::crate_roots::Copied), alloc: Alloc<'a>) -> AString<'a> {
+    let mut synthetic_blocks = AVec::new_in(alloc);
+    module_text_with_blocks(text, nested, copied, &mut synthetic_blocks, alloc)
+}
+
+/// As [`module_text`], also recording the sorted byte offsets of every synthetic block module
+/// name written into the returned text so `resolve::make_modules` can distinguish synthetic blocks
+/// from user-written modules whose names happen to start with [`BLOCK_MODULE`].
+pub(crate) fn module_text_with_blocks<'a>(
+    text: &str,
+    nested: &Nested<'_>,
+    copied: &mut dyn FnMut(crate::crate_roots::Copied),
+    synthetic_blocks: &mut AVec<'_, u32>,
+    alloc: Alloc<'a>,
+) -> AString<'a> {
     let written = written_blocks(nested, alloc);
-    crate::expanded_blocks::render(text, nested, &written, crate::expanded_blocks::Outer::Module, copied, alloc)
+    crate::expanded_blocks::render(text, nested, &written, crate::expanded_blocks::Outer::Module, copied, synthetic_blocks, alloc)
 }
 
 #[cfg(test)]

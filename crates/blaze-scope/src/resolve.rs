@@ -4048,7 +4048,7 @@ fn expand_call<'a, S: SourceTexts<'a>>(
     // resettable `call_scratch`: if outlining fails and `statements_as_items` yields no items (or
     // refuses), return without ever building `origin_column` or copying `rendered`/`Outline` into
     // `home_bump` (saves ~15% of all expansion renders & outlines on `core`).
-    let mut pre_block_items: Option<(AString<'_>, AVec<'_, crate::crate_roots::Copied>)> = None;
+    let mut pre_block_items: Option<(AString<'_>, AVec<'_, crate::crate_roots::Copied>, AVec<'_, u32>)> = None;
     if in_block {
         part(ExpandPart::Outline, mac.name, rendered.len());
         let probe = outline(rendered.as_str(), edition, alloc);
@@ -4056,8 +4056,8 @@ fn expand_call<'a, S: SourceTexts<'a>>(
             part(ExpandPart::Lower, mac.name, rendered.len());
             match crate::expanded_blocks::statements_as_items(rendered.as_str(), call, alloc) {
                 Ok(None) => return Some((DeclsBuilder::new_in(home), None)),
-                Ok(Some((items, copies))) => {
-                    pre_block_items = Some((items, copies));
+                Ok(Some((items, copies, synthetic_blocks))) => {
+                    pre_block_items = Some((items, copies, synthetic_blocks));
                 }
                 Err(refused) => {
                     note(ExpandNote::NotItems { macro_name: mac.name, message: refused.message() });
@@ -4076,8 +4076,15 @@ fn expand_call<'a, S: SourceTexts<'a>>(
     };
     let mark_of = |at: usize| expansion.hygiene(at).mark.map(blaze_expand::origin_column::TextMark::of);
     let origin_column = crate::expansion_origins::column_of(call, &placed, &roots, &expansion.origins, input_index, &mark_of, alloc);
-    let (rendered_text, text, made, column, moved_copies): (&'a str, &'a str, &'a ExpansionText<'a>, Option<blaze_expand::origin_column::OriginsRef<'a>>, Option<AVec<'_, crate::crate_roots::Copied>>) =
-        if let Some((items_str, copies)) = pre_block_items {
+    let (rendered_text, text, made, column, moved_copies, synthetic_blocks): (
+        &'a str,
+        &'a str,
+        &'a ExpansionText<'a>,
+        Option<blaze_expand::origin_column::OriginsRef<'a>>,
+        Option<AVec<'_, crate::crate_roots::Copied>>,
+        AVec<'_, u32>,
+    ) =
+        if let Some((items_str, copies, synthetic_blocks)) = pre_block_items {
             let rendered_text: &'a str = keep(rendered.as_str(), home_bump);
             let items: &'a str = keep(items_str.as_str(), home_bump);
             let raw_origins = origin_column
@@ -4116,7 +4123,7 @@ fn expand_call<'a, S: SourceTexts<'a>>(
                 note(ExpandNote::NotItems { macro_name: mac.name, message: again.outline.message(error) });
                 return Some((DeclsBuilder::new_in(home), None));
             }
-            (rendered_text, items, again, column, Some(copies))
+            (rendered_text, items, again, column, Some(copies), synthetic_blocks)
         } else {
             // Rendered in the call's work (the text grows as it is written), kept at its exact size.
             let rendered_text: &'a str = keep(rendered.as_str(), home_bump);
@@ -4139,7 +4146,7 @@ fn expand_call<'a, S: SourceTexts<'a>>(
             if let Some(error) = made.outline.errors().first() {
                 note(ExpandNote::NotItems { macro_name: mac.name, message: made.outline.message(error) });
             }
-            (rendered_text, rendered_text, made, column, None)
+            (rendered_text, rendered_text, made, column, None, AVec::new_in(alloc))
         };
     // An `include!`'s file is the current file of what it writes ([`crate::included`]): the
     // calls in it read from it, and a `mod x;` at its top is found from its folder. A file
@@ -4191,15 +4198,26 @@ fn expand_call<'a, S: SourceTexts<'a>>(
     // outlined and lowered).
     let mods = core::mem::replace(&mut out.mods_made, AVec::new_in(home));
     let mut bodies = core::mem::replace(&mut out.bodies, AVec::new_in(home));
-    if !mods.is_empty() {
-        part(ExpandPart::Modules, mac.name, mods.len());
-        // An `include!`'s file is the current file of what it writes ([`crate::included`]): a
-        // `mod x;` in it is found from the INCLUDED file's folder, not the calling module's.
-        let included_dir: Option<&'a str> = included.map(|path| {
+    // An `include!`'s file is the current file of what it writes ([`crate::included`]): a
+    // `mod x;` at its top or inside a body at its top is found from the INCLUDED file's folder,
+    // not the calling module's. Bodies lowered inside modules that `make_modules` creates below
+    // already inherit that folder from their own made module's `dir`/`path_dir`.
+    let included_dir: Option<&'a str> = if !mods.is_empty() || !bodies.is_empty() {
+        included.map(|path| {
             let mut dir = AString::from_str_in(path, alloc);
             pop_dir(&mut dir);
             keep(&dir, home_bump)
-        });
+        })
+    } else {
+        None
+    };
+    if included_dir.is_some() {
+        for body in bodies.iter_mut() {
+            body.included_dir = included_dir;
+        }
+    }
+    if !mods.is_empty() {
+        part(ExpandPart::Modules, mac.name, mods.len());
         let place = Made {
             text,
             outline: &made.outline,
@@ -4209,6 +4227,7 @@ fn expand_call<'a, S: SourceTexts<'a>>(
             written,
             marks: column.map(|column| crate::crate_roots::TextMarks { text, column }),
             tokens: FragmentTokens::LazyDeferBody(&get_tokens),
+            synthetic_blocks: &synthetic_blocks,
         };
         make_modules(base, run, src.module, &mods, place, src.depth + 1, &mut bodies, alloc);
     }
@@ -4324,7 +4343,7 @@ fn keep_item<'a, S: SourceTexts<'a>>(
     // A struct, an enum or a union makes no module; moved as `expand_decls` moves them so a
     // change there stays one shape.
     let mods = core::mem::replace(&mut out.mods_made, AVec::new_in(alloc));
-    let place = Made { text, outline: &made.outline, at: Where::Expansion(src.loc), place: At::Expansion(call), dir: None, written: src.written, marks: None, tokens: FragmentTokens::from_option(kept_tokens) };
+    let place = Made { text, outline: &made.outline, at: Where::Expansion(src.loc), place: At::Expansion(call), dir: None, written: src.written, marks: None, tokens: FragmentTokens::from_option(kept_tokens), synthetic_blocks: &[] };
     let mut bodies = core::mem::replace(&mut out.bodies, AVec::new_in(alloc));
     make_modules(base, run, src.module, &mods, place, src.depth + 1, &mut bodies, alloc);
     let decls = core::mem::replace(&mut out.decls, DeclsBuilder::new_in(alloc));
@@ -4394,7 +4413,8 @@ fn make_blocks<'a, S: SourceTexts<'a>>(
             continue;
         }
         let mut copies: AVec<'_, crate::crate_roots::Copied> = AVec::new_in(scratch);
-        let rendered = crate::blocks::module_text(body.text, &nested, &mut |c| copies.push(c), scratch);
+        let mut synthetic_blocks: AVec<'_, u32> = AVec::new_in(scratch);
+        let rendered = crate::blocks::module_text_with_blocks(body.text, &nested, &mut |c| copies.push(c), &mut synthetic_blocks, scratch);
         let text: &'a str = bump.alloc_str(&rendered);
         let call = crate::task::key_of(base.key, body.key, "blocks", "", 0);
         // Copied tokens keep their indexes in the writing call's input, even when this
@@ -4462,7 +4482,7 @@ fn make_blocks<'a, S: SourceTexts<'a>>(
         };
         let mut out = lower_in(LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false, harness: false, order: base.sources.attr_order() }, fragment, scratch, bump);
         let mods = core::mem::replace(&mut out.mods_made, AVec::new_in(scratch));
-        let place = Made { text, outline: &made.outline, at: Where::Expansion(body.loc), place: At::Expansion(call), dir: None, written: body.written, marks, tokens: frag_tokens };
+        let place = Made { text, outline: &made.outline, at: Where::Expansion(body.loc), place: At::Expansion(call), dir: body.included_dir, written: body.written, marks, tokens: frag_tokens, synthetic_blocks: &synthetic_blocks };
         {
             let mut places = held(run.block_places.lock(), "block places");
             for m in mods.iter() {
@@ -4731,6 +4751,11 @@ struct Made<'c, 'a> {
     marks: Option<crate::crate_roots::TextMarks<'a>>,
     /// [`Fragment::tokens`] of this text (kept lazy until an inline module lowers a nested call).
     tokens: FragmentTokens<'c, 'a>,
+    /// Sorted byte offsets in `text` of synthetic block module names written by
+    /// `expanded_blocks::render` (`make_blocks` / `statements_as_items`). Empty for all real
+    /// source files and ordinary macro expansions, so a user or macro module legitimately named
+    /// `__blaze_block_*` is never mistaken for a synthetic block.
+    synthetic_blocks: &'c [u32],
 }
 
 /// Where a module of this crate is: its children's directory, what their `#[path]` is relative
@@ -4807,7 +4832,27 @@ fn make_modules<'c, 'a, S: SourceTexts<'a>>(
             _ => (dir.as_str(), path_dir.as_str()),
         };
         let (fragment_of, item, mdir, mpdir): (Made<'c, 'a>, Option<ItemIndex>, &'a str, &'a str) = if m.inline {
-            let d = keep(&joined(dir, &[m.path_attr.unwrap_or(m.name)], scratch), bump);
+            // A synthetic block module emitted by `expanded_blocks::render` is an anonymous scope,
+            // never a folder segment: rustc (`DirectoryOwnership::UnownedViaBlock`) resolves both
+            // `#[path]` and nested inline modules inside a block against the enclosing module's
+            // `path_dir`. Identified structurally by its rendered name offset rather than by name
+            // prefix so a genuine user/macro `mod __blaze_block_*` keeps its own folder segment.
+            // For any real inline module, `#[path]` resolves against `path_dir` and a bare `mod m`
+            // against `dir`, matching `walk` (`task/lower.rs`).
+            let outline_item = made.outline.item(m.item);
+            let is_synthetic_block = outline_item
+                .name
+                .and_then(|name| outline_item.range.start.checked_add(name.start))
+                .is_some_and(|at| made.synthetic_blocks.binary_search(&at).is_ok());
+            let d = if is_synthetic_block {
+                keep(path_dir, bump)
+            } else {
+                let d = match m.path_attr {
+                    Some(p) => joined(path_dir, &[p], scratch),
+                    None => joined(dir, &[m.name], scratch),
+                };
+                keep(&d, bump)
+            };
             (made, Some(m.item), d, d)
         } else {
             let sub = keep(&joined(dir, &[m.name], scratch), bump);
@@ -4843,7 +4888,7 @@ fn make_modules<'c, 'a, S: SourceTexts<'a>>(
                 note(MadeNote::CfgOff);
                 continue;
             }
-            (Made { text: file.text, outline: &file.outline, at: Where::File(at), place: At::File(at), dir: None, written: file.path, marks: None, tokens: FragmentTokens::None }, None, mdir, mpdir)
+            (Made { text: file.text, outline: &file.outline, at: Where::File(at), place: At::File(at), dir: None, written: file.path, marks: None, tokens: FragmentTokens::None, synthetic_blocks: &[] }, None, mdir, mpdir)
         };
         let fragment = Fragment {
             module: m.key,
