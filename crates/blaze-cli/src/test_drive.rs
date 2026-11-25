@@ -228,6 +228,8 @@ pub(crate) enum OneError {
     CodeHandOff { chan: &'static str, worker: usize, why: &'static str },
     /// Preparing `CARGO_BIN_EXE_*` launcher stubs or their Unix code-server socket failed.
     Bins(crate::test_bins::BinStubError),
+    /// Host-side code serving for a spawned `CARGO_BIN_EXE_*` workspace binary failed.
+    BinServe(crate::test_bins::BinServeError),
 }
 
 impl fmt::Display for OneError {
@@ -271,6 +273,7 @@ impl fmt::Display for OneError {
                 waited % 1_000_000_000 / 100_000_000,
             ),
             OneError::Bins(error) => write!(f, "{error}"),
+            OneError::BinServe(error) => write!(f, "{error}"),
         }
     }
 }
@@ -813,10 +816,11 @@ pub(crate) trait RunOne {
     /// its purity verdict, its entered functions, and its output into `output`.
     async fn run(&self, row: u32, budget: Nanos, output: &mut Output<'_>, signals: &Signals) -> Result<RunOutcome, OneError>;
 
-    /// Non-blocking pump for workspace binary launcher stubs (`CARGO_BIN_EXE_*`). Returns `true`
-    /// when any binary connection was accepted or made progress.
-    fn pump_bins(&self) -> bool {
-        false
+    /// Non-blocking pump for workspace binary launcher stubs (`CARGO_BIN_EXE_*`). Returns `Ok(true)`
+    /// when any binary connection was accepted or made progress, or `Err(OneError)` on host-side
+    /// binary serving failure.
+    fn pump_bins(&self) -> Result<bool, OneError> {
+        Ok(false)
     }
 }
 
@@ -1151,7 +1155,18 @@ impl<R: RunOne, C: Fn() -> Nanos> Zygotes for OneEach<'_, R, C> {
             self.signals.wait.set(interval.min(left));
             self.signals.progress.set(false);
             let bin_before = (self.now)();
-            let bin_progress = self.runs.pump_bins();
+            let bin_progress = match self.runs.pump_bins() {
+                Ok(prog) => prog,
+                Err(error) => {
+                    let row = self.running.first().map_or(0, |r| r.row);
+                    self.failed = Some((row, error));
+                    return Err(RunError::Seam {
+                        call: "serving workspace binary stub",
+                        errno: 0,
+                        suite: Some(self.suite),
+                    });
+                }
+            };
             let bin_nanos = (self.now)().0.saturating_sub(bin_before.0);
             if bin_progress {
                 self.signals.progress.set(true);
@@ -2713,6 +2728,8 @@ pub(crate) struct Launched<'c, 'h, 'a> {
     /// Command-wide binary launcher stub server (`CARGO_BIN_EXE_*`, `test.md` piece 17), borrowed
     /// strictly within synchronous calls (never across `.await`, rule 27).
     pub bins: Option<&'c RefCell<crate::test_bins::BinServer<'a, 'h>>>,
+    /// Whether this suite exposes `CARGO_BIN_EXE_*` (integration tests and benchmarks only).
+    pub expose_bins: bool,
 }
 
 /// The test profile with the one grant a native image needs: `dlopen` maps `<store>/<64 hex>`
@@ -3011,23 +3028,35 @@ impl<'c> Launched<'c, '_, '_> {
         vars.extend_from_slice(self.place.vars);
         let package = self.place.vars;
         // Borrow `self.bins` strictly synchronously here to snapshot bin-exe env vars and remap
-        // table into `frame` (never across `.await`, rule 27).
+        // table into `frame` (never across `.await`, rule 27). Only integration-test and benchmark
+        // suites receive `CARGO_BIN_EXE_*` (`blaze_scope::crate_env::env_of`).
         let mut bin_env_pairs: Vec<(&str, &str), &Frame> = Vec::new_in(frame);
         let mut bin_map_text: Option<String<&Frame>> = None;
         let mut bin_dir_text: Option<String<&Frame>> = None;
+        #[cfg(target_os = "linux")]
+        let mut bin_sock_dir_text: Option<String<&Frame>> = None;
+        let mut bin_owner_text: Option<String<&Frame>> = None;
         #[cfg(target_os = "macos")]
         let mut bin_socket_text: Option<String<&Frame>> = None;
         #[cfg(target_os = "macos")]
         let mut bin_natives: Vec<crate::engine_native::NativeSend<'_>, &Frame> = Vec::new_in(frame);
-        if let Some(bins_cell) = self.bins {
+        if self.expose_bins
+            && let Some(bins_cell) = self.bins
+        {
             let bins_ref = bins_cell.borrow();
             let mut raw_pairs: Vec<(&str, &str), &Frame> = Vec::new_in(frame);
-            if let Some(map) = bins_ref.fill_suite_env(self.package, &mut raw_pairs, frame) {
+            let (any, map) = bins_ref.fill_suite_env(self.package, &mut raw_pairs, frame);
+            if any {
                 for &(k, v) in raw_pairs.iter() {
                     bin_env_pairs.push((crate::work::held_str(k, frame), crate::work::held_str(v, frame)));
                 }
-                bin_map_text = Some(map);
+                bin_map_text = map;
                 bin_dir_text = Some(String::from_str_in(bins_ref.bins_dir(), frame));
+                #[cfg(target_os = "linux")]
+                {
+                    bin_sock_dir_text = Some(String::from_str_in(bins_ref.sock_dir(), frame));
+                }
+                bin_owner_text = Some(bstd::mem::format_in!(frame, "{}:{row}", self.suite.0));
                 #[cfg(target_os = "macos")]
                 {
                     bin_socket_text = Some(String::from_str_in(bins_ref.socket_path(), frame));
@@ -3038,6 +3067,7 @@ impl<'c> Launched<'c, '_, '_> {
         vars.extend_from_slice(bin_env_pairs.as_slice());
         let command = self.env.iter().copied().filter(|(name, _)| {
             *name != "TMPDIR"
+                && *name != "BLAZE_LAUNCH_BIN_OWNER"
                 && package.binary_search_by(|(set, _)| set.cmp(name)).is_err()
                 && !bin_env_pairs.iter().any(|(set, _)| set == name)
         });
@@ -3050,6 +3080,9 @@ impl<'c> Launched<'c, '_, '_> {
         if let Some(map) = bin_map_text.as_ref() {
             vars.push(("BLAZE_LAUNCH_BIN_MAP", map.as_str()));
         }
+        if let Some(owner) = bin_owner_text.as_ref() {
+            vars.push(("BLAZE_LAUNCH_BIN_OWNER", owner.as_str()));
+        }
         #[cfg(target_os = "macos")]
         let unwound_full = self.tests.harnessed().then(|| bstd::mem::format_in!(frame, "{}/unwound-{row}", self.temp));
         #[cfg(target_os = "macos")]
@@ -3061,6 +3094,9 @@ impl<'c> Launched<'c, '_, '_> {
             vars.push(("BLAZE_LAUNCH_SANDBOX_TEMP", temp.as_str()));
             if let Some(dir) = bin_dir_text.as_ref() {
                 vars.push(("BLAZE_LAUNCH_BINS_DIR", dir.as_str()));
+            }
+            if let Some(sock_dir) = bin_sock_dir_text.as_ref() {
+                vars.push(("BLAZE_LAUNCH_BINS_SOCK_DIR", sock_dir.as_str()));
             }
             if self.tests.harnessed() {
                 vars.push(("BLAZE_LAUNCH_UNWOUND_FILE", "fd:4"));
@@ -3534,6 +3570,11 @@ impl<'c> Launched<'c, '_, '_> {
             )?;
         } else if let Some(error) = torn {
             return Err(child_error(error));
+        }
+        if self.expose_bins
+            && let Some(bins_cell) = self.bins
+        {
+            bins_cell.borrow_mut().drain_owner_evidence(self.suite.0, row, &mut entered_fns, &mut keep);
         }
         if entered_fns.is_empty() && keep.is_ok() {
             keep = Err(NotKept::Untraced);
@@ -4122,10 +4163,12 @@ impl RunOne for Selected<'_, Launched<'_, '_, '_>> {
         self.suites[loc.suite.0 as usize].run(loc.row, budget, output, signals).await
     }
 
-    fn pump_bins(&self) -> bool {
-        let Some(first) = self.suites.first() else { return false };
-        let Some(bins) = first.bins else { return false };
-        bins.borrow_mut().pump(first.cx, first.ids, first.lent, first.watch, first.err)
+    fn pump_bins(&self) -> Result<bool, OneError> {
+        let Some(first) = self.suites.first() else { return Ok(false) };
+        let Some(bins) = first.bins else { return Ok(false) };
+        bins.borrow_mut()
+            .pump(first.cx, first.ids, first.lent, first.watch)
+            .map_err(OneError::BinServe)
     }
 }
 
@@ -4413,6 +4456,19 @@ fn run_dirty<'a, 'r, 'm, 'h, D: blaze_core::Driver>(
     let command = bstd::mem::format_in!(frame, "{}-{}", host.pid(), clock.now().since_start().as_nanos());
     let command_path = Path::new(command.as_str()).map_err(|why| one(OneError::Path(why)))?;
     let mine = temps.make_dir(cx, &command_path, Durable::No).map_err(|why| one(OneError::Temp(why)))?;
+    // RAII guard ensures `<mine>` (`v2/test/tmp/<pid>-<ns>`) is removed even if any setup step
+    // below (launcher check, `BinServer::start`, etc.) returns an error before tests run.
+    struct MineCleanup<'c, 't> {
+        cx: &'c Cx,
+        temps: &'t Dir<ReadWrite>,
+        path: &'t Path,
+    }
+    impl Drop for MineCleanup<'_, '_> {
+        fn drop(&mut self) {
+            let _ = crate::gc::remove_tree_best_effort(self.cx, self.temps, self.path);
+        }
+    }
+    let _mine_cleanup = MineCleanup { cx, temps: &temps, path: &command_path };
     let store = bstd::mem::format_in!(frame, "{home}/{RECORDS}");
     // 2. The launcher beside this binary, the spawner, the command's environment.
     let exe = host.exe().map_err(DriveError::Missing)?;
@@ -4424,12 +4480,15 @@ fn run_dirty<'a, 'r, 'm, 'h, D: blaze_core::Driver>(
     let mut vars: Vec<(&str, &str), &Frame> = Vec::new_in(frame);
     vars.extend(env.each());
     let mine_abs = bstd::mem::format_in!(frame, "{home}/{TEMPS}/{}", command.as_str());
+    let sock_nonce = u64::try_from(clock.now().since_start().as_nanos()).unwrap_or(0)
+        ^ (u64::from(host.pid()).rotate_left(32));
     let bin_server = if !bins.is_empty() && TestHost::THIS.has_sandbox() {
         Some(RefCell::new(
             crate::test_bins::BinServer::start(
                 cx,
                 &mine,
                 mine_abs.as_str(),
+                sock_nonce,
                 launcher.as_str(),
                 store.as_str(),
                 bins,
@@ -4483,6 +4542,7 @@ fn run_dirty<'a, 'r, 'm, 'h, D: blaze_core::Driver>(
             cache_alloc: alloc,
             suite_cache,
             bins: bin_server.as_ref(),
+            expose_bins: unit.expose_bins,
         });
         child_base += tests.len();
         checks.push(EntryCheck { tests, names: suite.names, builder: suite.builder, tables, image: suite.native.map(|native| native.map_or(&[][..], |send| send.items)), said: String::new_in(alloc) });
@@ -4551,14 +4611,13 @@ fn run_dirty<'a, 'r, 'm, 'h, D: blaze_core::Driver>(
     // Persist verified binary stub pairs (`BZTV`) before dropping `bin_server` so even a failed
     // first run warms subsequent spawns of the same workspace binary under today's certificate.
     let bin_saved = bin_server.as_ref().map(|server| server.borrow().save_verified(lent, &certificate));
-    // Close the binary stub listener and drop any remaining connections before cleaning up `<mine>`.
+    // Close the binary stub listener and drop any remaining connections before `_mine_cleanup`
+    // removes `<mine>` (`v2/test/tmp/<pid>-<ns>`).
     drop(runner);
     drop(launched);
     drop(launches);
     drop(bin_server);
-    // Clean up this command's per-run `$TMPDIR` tree (`v2/test/tmp/<pid>-<ns>`) on both Ok and Err
-    // paths now that all child test processes have exited.
-    let _ = crate::gc::remove_tree_best_effort(cx, &temps, &command_path);
+    drop(_mine_cleanup);
     if let Some(Err(err)) = bin_saved {
         return Err(err);
     }

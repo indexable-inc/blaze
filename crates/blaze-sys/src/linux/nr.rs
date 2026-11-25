@@ -300,6 +300,7 @@ numbers! {
     OPEN_TREE           = 428,    428;
     MOVE_MOUNT          = 429,    429;
     MOUNT_SETATTR       = 442,    442;
+    PIVOT_ROOT          = 155,    41;
 }
 
 /// The x86-64 calls on a path from the current directory, which aarch64 never had (it has

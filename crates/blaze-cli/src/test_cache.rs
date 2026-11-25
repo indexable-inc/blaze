@@ -82,11 +82,12 @@ pub(crate) fn tools_digest(tools: &[blaze_drive::Tool; blaze_drive::key::KINDS])
     h.finish().0
 }
 
-/// Typed store error from persisting incremental test cache records (rule 19).
+/// Typed store error from persisting or reading incremental test cache records (rule 19).
 #[derive(Debug)]
 pub(crate) enum CacheError {
     Store(LentError),
     Root(RootError),
+    Corrupt(&'static str),
 }
 
 impl core::fmt::Display for CacheError {
@@ -94,6 +95,7 @@ impl core::fmt::Display for CacheError {
         match self {
             CacheError::Store(e) => core::fmt::Display::fmt(e, f),
             CacheError::Root(e) => core::fmt::Display::fmt(e, f),
+            CacheError::Corrupt(what) => f.write_str(what),
         }
     }
 }
@@ -132,19 +134,27 @@ pub(crate) fn bin_cache_id(package: &str, bin_name: &str, key: blaze_id::CrateIt
 
 /// Loads previously verified `(instance_key, content_key)` pairs for an arbitrary suite/binary
 /// identity `id` if and only if they were recorded under today's exact `certificate`.
+/// Returns `Ok(0)` only on a genuine cold miss (no pointer or certificate mismatch); store I/O
+/// errors, dangling pointers, wrong tags, and corrupt `BZTV` payloads are returned as typed errors.
 pub(crate) fn load_verified_by_id<D: Driver>(
     lent: &Lent<D, StoreAlloc>,
     id: ContentId,
     certificate: &crate::start_list::Certificate,
     into: &mut Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
-) -> usize {
+) -> Result<usize, DriveError> {
+    let store_err = |e: LentError| DriveError::CacheStore { what: "reading binary stub verified cache", why: CacheError::Store(e) };
+    let corrupt = |what: &'static str| DriveError::CacheStore { what: "reading binary stub verified cache", why: CacheError::Corrupt(what) };
     let ptr_key = verified_ptr_key(id);
-    let Ok(Some(state_key)) = lent.pointed(TestIndex::TAG, &ptr_key) else { return 0 };
-    let Ok(Some(lend)) = lent.get(&state_key) else { return 0 };
+    let Some(state_key) = lent.pointed(TestIndex::TAG, &ptr_key).map_err(store_err)? else {
+        return Ok(0);
+    };
+    let Some(lend) = lent.get(&state_key).map_err(store_err)? else {
+        return Err(corrupt("verified cache pointer names a missing record"));
+    };
     if lend.tag != TestIndex::TAG {
-        return 0;
+        return Err(corrupt("verified cache record has unexpected store tag"));
     }
-    decode_verified(lend.bytes, certificate, into).unwrap_or(0)
+    decode_verified(lend.bytes, certificate, into).ok_or_else(|| corrupt("malformed BZTV verified cache payload"))
 }
 
 /// Persists and pins verified `(instance_key, content_key)` pairs for a workspace binary identity

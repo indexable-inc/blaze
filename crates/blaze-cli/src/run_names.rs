@@ -603,6 +603,9 @@ pub(crate) struct TestUnit<'m> {
     /// Its edition, as its items record says (front_load.rs `CrateRecords::edition`): what its
     /// code is built for (run_parent.rs `builder_for`).
     pub(crate) edition: blaze_surface::Edition,
+    /// Whether Cargo/Blaze exposes `CARGO_BIN_EXE_<name>` to this unit (integration tests and
+    /// benchmarks only; `blaze_scope::crate_env::env_of`).
+    pub(crate) expose_bins: bool,
 }
 
 /// A harness supplies one row per marked function. A custom harness supplies its own main
@@ -897,31 +900,8 @@ fn tests_of<'s, 'f: 's, 'm: 's>(
     let snapshot = run_snapshot(store)?;
     let mut suites = AVec::new_in(heap.alloc());
     let mut bins = AVec::new_in(heap.alloc());
+    let mut bin_packages: AVec<'_, &str> = AVec::new_in(heap.alloc());
     for (index, unit) in units.iter().enumerate() {
-        if !unit.for_host
-            && let blaze_unit_graph::UnitKind::Bin(bin_name) = &unit.kind
-            && selected.binary_search(&unit.name.as_str()).is_ok()
-        {
-            let at = usize::try_from(u32_at(mapping, index * 4)).unwrap_or(usize::MAX);
-            if at < CrateGraph::len(&list) && list.member(at) {
-                let name = CrateGraph::name(&list, at);
-                let key = list.key(at);
-                if let Some((package, version)) = list.env_facts(at).package
-                    && package == unit.name.as_str()
-                    && version == unit.version.as_str()
-                    && name == unit.crate_name.as_str()
-                    && let Some(input) = answer.crate_input(at, blaze_drive::key::crate_scope_name(&key))
-                    && let Ok(records) = read.records(cx, store, &input, key, heap.alloc())
-                {
-                    let bin_name = crate::work::held_str(bin_name.as_str(), frame);
-                    bins.push((
-                        Found::Stood(answer, blaze_own::Share::share(&snapshot)),
-                        BinUnit { at, key, package, bin_name, edition: records.edition },
-                    ));
-                }
-            }
-            continue;
-        }
         let Some((kind, target_name, harness)) = test_target(unit) else { continue };
         if let Some(bin) = bin && (kind != "bin" || target_name != bin) {
             continue;
@@ -962,7 +942,49 @@ fn tests_of<'s, 'f: 's, 'm: 's>(
         } else {
             crate::work::held_str(bstd::mem::format_in!(frame, "{kind}:{target_name}").as_str(), frame)
         };
-        suites.push((Found::Stood(answer, snapshot.clone()), TestUnit { at, key, package, target, tests, edition: records.edition }));
+        let expose_bins = matches!(
+            unit.kind,
+            blaze_unit_graph::UnitKind::IntegrationTest(_) | blaze_unit_graph::UnitKind::Bench(_)
+        );
+        if expose_bins && !bin_packages.iter().any(|&p| p == package) {
+            bin_packages.push(package);
+        }
+        suites.push((
+            Found::Stood(answer, snapshot.clone()),
+            TestUnit { at, key, package, target, tests, edition: records.edition, expose_bins },
+        ));
+    }
+    // Collect advertised workspace `[[bin]]` targets for packages with selected integration/bench
+    // suites, propagating missing or unreadable engine records rather than silently omitting them.
+    if !bin_packages.is_empty() {
+        for (index, unit) in units.iter().enumerate() {
+            if unit.for_host {
+                continue;
+            }
+            let blaze_unit_graph::UnitKind::Bin(bin_name) = &unit.kind else { continue };
+            if !bin_packages.iter().any(|&p| p == unit.name.as_str()) {
+                continue;
+            }
+            let at = usize::try_from(u32_at(mapping, index * 4)).unwrap_or(usize::MAX);
+            if at >= CrateGraph::len(&list) || !list.member(at) {
+                return Err(RunNamesError::TestMap { unit: index, why: "the advertised binary target has no member crate at its mapped index" });
+            }
+            let name = CrateGraph::name(&list, at);
+            let key = list.key(at);
+            let input = answer.crate_input(at, blaze_drive::key::crate_scope_name(&key)).ok_or(RunNamesError::NotAnswered { crate_name: name })?;
+            let records = read.records(cx, store, &input, key, heap.alloc()).map_err(|why| unread(name, why))?;
+            let Some((package, version)) = list.env_facts(at).package else {
+                return Err(RunNamesError::TestMap { unit: index, why: "the advertised binary target's crate has no package" });
+            };
+            if package != unit.name.as_str() || version != unit.version.as_str() || name != unit.crate_name.as_str() {
+                return Err(RunNamesError::TestMap { unit: index, why: "the mapped binary crate does not belong to this unit" });
+            }
+            let bin_name = crate::work::held_str(bin_name.as_str(), frame);
+            bins.push((
+                Found::Stood(answer, blaze_own::Share::share(&snapshot)),
+                BinUnit { at, key, package, bin_name, edition: records.edition },
+            ));
+        }
     }
     suites.sort_unstable_by(|(_, a), (_, b)| (a.package, a.target, a.key).cmp(&(b.package, b.target, b.key)));
     bins.sort_unstable_by(|(_, a), (_, b)| (a.package, a.bin_name, a.key).cmp(&(b.package, b.bin_name, b.key)));

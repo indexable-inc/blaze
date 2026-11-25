@@ -1099,10 +1099,11 @@ fn impure_clock() {
     });
 }
 
-/// `CARGO_BIN_EXE_<name>` launcher stubs (`test.md` piece 17): integration tests can inspect and
-/// spawn workspace `[[bin]]` targets through BOTH compile-time `env!("CARGO_BIN_EXE_helper")`
-/// (deterministic guest path `/target/debug/bin/<pkg>/<bin>` remapped by `LauncherOwn`) AND
-/// runtime `std::env::var("CARGO_BIN_EXE_helper")`, including concurrent multi-child spawns.
+/// `CARGO_BIN_EXE_<name>` launcher stubs (`test.md` piece 17): integration tests can read, inspect,
+/// shell-exec, and spawn workspace `[[bin]]` targets through BOTH compile-time
+/// `env!("CARGO_BIN_EXE_helper")` (`/target/debug/bin/<pkg>/<bin>`) AND runtime
+/// `std::env::var("CARGO_BIN_EXE_helper")`, including concurrent multi-child spawns, while unit
+/// tests do NOT receive `CARGO_BIN_EXE_*`.
 #[test]
 fn integration_test_spawns_cargo_bin_exe_stub() {
     let manifest = "\
@@ -1114,6 +1115,15 @@ edition = \"2024\"
 [[bin]]
 name = \"helper\"
 path = \"src/main.rs\"
+";
+    let lib_rs = "\
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn unit_test_does_not_receive_cargo_bin_exe() {
+        assert!(std::env::var_os(\"CARGO_BIN_EXE_helper\").is_none());
+    }
+}
 ";
     let main_rs = "\
 fn main() {
@@ -1129,7 +1139,11 @@ use std::process::Command;
 fn spawns_via_compile_time_and_runtime_env() {
     let compile_path = env!(\"CARGO_BIN_EXE_helper\");
     assert_eq!(compile_path, \"/target/debug/bin/binapp/helper\");
-    assert!(Path::new(compile_path).exists(), \"remapped guest stub path must exist\");
+    assert!(Path::new(compile_path).exists(), \"advertised stub path must exist\");
+
+    // Verify a real file is readable at the advertised compile-time path (not only exec/stat).
+    let bytes = std::fs::read(compile_path).expect(\"std::fs::read on advertised CARGO_BIN_EXE path\");
+    assert!(!bytes.is_empty(), \"stub executable file must be non-empty\");
 
     let runtime_path = std::env::var(\"CARGO_BIN_EXE_helper\").expect(\"runtime CARGO_BIN_EXE_helper\");
     assert!(Path::new(&runtime_path).exists(), \"runtime stub path must exist\");
@@ -1155,18 +1169,35 @@ fn spawns_via_compile_time_and_runtime_env() {
     assert!(out_b.status.success(), \"child_b failed: status={:?} stderr={}\", out_b.status, String::from_utf8_lossy(&out_b.stderr));
     assert_eq!(String::from_utf8_lossy(&out_a.stdout).trim(), \"helper-ok:alpha,one\");
     assert_eq!(String::from_utf8_lossy(&out_b.stdout).trim(), \"helper-ok:beta,two\");
+
+    // On Linux, `/target/debug/bin` is bind-mounted in the kernel namespace so even an external
+    // `/bin/sh` child sees and executes the exact compile-time path.
+    #[cfg(target_os = \"linux\")]
+    {
+        let sh_out = Command::new(\"/bin/sh\")
+            .args([\"-c\", \"\\\"$1\\\" via shell\", \"sh\", compile_path])
+            .output()
+            .expect(\"spawn /bin/sh with compile-time CARGO_BIN_EXE_helper\");
+        assert!(sh_out.status.success(), \"sh failed: status={:?} stderr={}\", sh_out.status, String::from_utf8_lossy(&sh_out.stderr));
+        assert_eq!(String::from_utf8_lossy(&sh_out.stdout).trim(), \"helper-ok:via,shell\");
+    }
 }
 ";
     fixture(
         "bin_exe",
-        &[("Cargo.toml", manifest), ("src/main.rs", main_rs), ("tests/spawns_bin.rs", integ_rs)],
+        &[
+            ("Cargo.toml", manifest),
+            ("src/lib.rs", lib_rs),
+            ("src/main.rs", main_rs),
+            ("tests/spawns_bin.rs", integ_rs),
+        ],
         |dir, home| {
             let said = run(dir, home, &["--", "--deadline", "60s"]);
             assert_eq!(said.code, Some(0), "{}", evidence("CARGO_BIN_EXE stub test passes", &said));
             assert!(
-                said.stdout.contains("1 passed, 0 failed"),
+                said.stdout.contains("2 passed, 0 failed"),
                 "{}",
-                evidence("1 passed, 0 failed", &said)
+                evidence("2 passed, 0 failed", &said)
             );
         },
     );

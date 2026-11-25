@@ -1630,6 +1630,18 @@ pub fn peer_ids(socket: Fd) -> Result<(super::types::uid_t, super::types::gid_t)
     Ok((uid, gid))
 }
 
+/// Returns `Ok(true)` if the connected Unix domain socket's peer has the same effective UID as
+/// this process (`SO_PEERCRED` on Linux, `getpeereid` on macOS).
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn peer_is_self_uid(socket: Fd) -> Result<bool, Errno> {
+    let me = super::thread::geteuid();
+    #[cfg(target_os = "linux")]
+    return peer_cred(socket).map(|cred| cred.uid == me);
+    #[cfg(target_os = "macos")]
+    return peer_ids(socket).map(|(uid, _)| uid == me);
+}
+
 /// `getsockopt(SOL_LOCAL, LOCAL_PEERTOKEN)` (macOS): a connected Unix socket's peer's audit
 /// token (`audit_token_t`, eight `u32`s), as it was when it connected.
 /// replaces libc::getsockopt (LOCAL_PEERTOKEN)

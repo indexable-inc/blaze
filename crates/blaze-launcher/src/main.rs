@@ -299,6 +299,15 @@ fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::Shared
         ),
         (Some(raw), EntryForm::Unit | EntryForm::CMain) => Some(raw),
     };
+    #[cfg(target_os = "linux")]
+    let bins_sock_dir = match (env::var_os("BLAZE_LAUNCH_BINS_SOCK_DIR"), start.form) {
+        (None, _) => None,
+        (Some(_), EntryForm::Comptime | EntryForm::Hosted) => stop(
+            CANNOT_RUN,
+            "BLAZE_LAUNCH_BINS_SOCK_DIR is set for a non-test entry",
+        ),
+        (Some(raw), EntryForm::Unit | EntryForm::CMain) => Some(raw),
+    };
     let bin_map = match (env::var_os("BLAZE_LAUNCH_BIN_MAP"), start.form) {
         (None, _) => None,
         (Some(_), EntryForm::Comptime | EntryForm::Hosted) => stop(
@@ -323,6 +332,7 @@ fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::Shared
         "BLAZE_LAUNCH_UNWOUND_FILE",
         "BLAZE_LAUNCH_SANDBOX_TEMP",
         "BLAZE_LAUNCH_BINS_DIR",
+        "BLAZE_LAUNCH_BINS_SOCK_DIR",
         "BLAZE_LAUNCH_BIN_MAP",
         grants::VAR,
         telemetry::VAR,
@@ -357,30 +367,49 @@ fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::Shared
                 Err(_) => stop(CANNOT_RUN, "BLAZE_LAUNCH_BINS_DIR holds a NUL byte"),
             },
         };
-        let keep_one = [store_c.as_c_str()];
-        let keep_two_cwd = cwd_c.as_ref().map(|cwd| [store_c.as_c_str(), cwd.as_c_str()]);
-        let keep_two_bins = bins_c.as_ref().map(|bins| [store_c.as_c_str(), bins.as_c_str()]);
-        let keep_three = match (cwd_c.as_ref(), bins_c.as_ref()) {
-            (Some(cwd), Some(bins)) => Some([store_c.as_c_str(), cwd.as_c_str(), bins.as_c_str()]),
-            _ => None,
+        let sock_c = match bins_sock_dir {
+            None => None,
+            Some(raw) => match CString::new(raw.into_vec()) {
+                Ok(c) => Some(c),
+                Err(_) => stop(CANNOT_RUN, "BLAZE_LAUNCH_BINS_SOCK_DIR holds a NUL byte"),
+            },
         };
-        let keep_ro: &[&core::ffi::CStr] = match (keep_three.as_ref(), keep_two_cwd.as_ref(), keep_two_bins.as_ref()) {
-            (Some(triple), _, _) => triple,
-            (None, Some(pair), _) => pair,
-            (None, None, Some(pair)) => pair,
-            (None, None, None) => &keep_one,
-        };
-        if let Err(why) = blaze_sys::linux::confine::enter_test_sandbox(
+        let mut keep_ro_buf: [&core::ffi::CStr; 4] = [store_c.as_c_str(); 4];
+        let mut keep_ro_len = 1usize;
+        if let Some(cwd) = cwd_c.as_ref()
+            && let Some(slot) = keep_ro_buf.get_mut(keep_ro_len)
+        {
+            *slot = cwd.as_c_str();
+            keep_ro_len += 1;
+        }
+        if let Some(bins) = bins_c.as_ref()
+            && let Some(slot) = keep_ro_buf.get_mut(keep_ro_len)
+        {
+            *slot = bins.as_c_str();
+            keep_ro_len += 1;
+        }
+        if let Some(sock) = sock_c.as_ref()
+            && let Some(slot) = keep_ro_buf.get_mut(keep_ro_len)
+        {
+            *slot = sock.as_c_str();
+            keep_ro_len += 1;
+        }
+        let keep_ro = keep_ro_buf.get(..keep_ro_len).unwrap_or(&[]);
+        let temp_mount = match blaze_sys::linux::confine::enter_test_sandbox(
             temp_c.as_c_str(),
             keep_ro,
             cwd_c.as_deref(),
+            bins_c.as_deref(),
         ) {
-            stop(CANNOT_RUN, &format!("Linux test sandbox refused: {why:?}"));
-        }
-        // SAFETY: still single-threaded before any launcher/guest thread starts; point `$TMPDIR`
-        // at the short `/tmp/t` mount of this test's isolated temp folder.
-        unsafe {
-            env::set_var("TMPDIR", "/tmp/t");
+            Ok(mount) => mount,
+            Err(why) => stop(CANNOT_RUN, &format!("Linux test sandbox refused: {why:?}")),
+        };
+        if let Ok(mount_str) = temp_mount.to_str() {
+            // SAFETY: still single-threaded before any launcher/guest thread starts; point
+            // `$TMPDIR` at the exact non-colliding short mount chosen for this test's temp folder.
+            unsafe {
+                env::set_var("TMPDIR", mount_str);
+            }
         }
     }
     let telemetry_on = match telemetry_path {
@@ -728,7 +757,18 @@ fn main() {
                     ),
                 ),
             };
-            if let Err(why) = stream.write_all(&bin.to_le_bytes()) {
+            let (owner_suite, owner_row) = env::var_os("BLAZE_LAUNCH_BIN_OWNER")
+                .and_then(|v| v.into_string().ok())
+                .and_then(|s| {
+                    let (a, b) = s.split_once(':')?;
+                    Some((a.parse::<u32>().ok()?, b.parse::<u32>().ok()?))
+                })
+                .unwrap_or((u32::MAX, u32::MAX));
+            let [b0, b1, b2, b3] = bin.to_le_bytes();
+            let [s0, s1, s2, s3] = owner_suite.to_le_bytes();
+            let [r0, r1, r2, r3] = owner_row.to_le_bytes();
+            let hello = [b0, b1, b2, b3, s0, s1, s2, s3, r0, r1, r2, r3];
+            if let Err(why) = stream.write_all(&hello) {
                 stop(
                     CANNOT_RUN,
                     &format!("{} could not identify bin {bin} to {}: {why}", exe.display(), socket.display()),

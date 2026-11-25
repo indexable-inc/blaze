@@ -23,12 +23,13 @@
 use core::ffi::CStr;
 
 use super::{
-    AccessFs, CWD, Family, OpenFlags, OwnedFd, PathBeneath, RulesetAttr, SockFilter, SockFlags,
-    SockKind, landlock_abi, landlock_add_rule_path, landlock_create_ruleset, mkdirat,
+    AccessFs, CWD, EntryKind, Family, OpenFlags, OwnedFd, PathBeneath, RulesetAttr, SockFilter,
+    SockFlags, SockKind, Unlink, getdents64, landlock_abi, landlock_add_rule_path,
+    landlock_create_ruleset, mkdirat,
     nr::{CAPSET, IOCTL, MOUNT_SETATTR, MOVE_MOUNT, OPEN_TREE, PRLIMIT64},
-    openat, raw, socket,
-    task::{MountFlags, Namespaces, chdir, mount, unshare},
-    write,
+    openat, raw, readlinkat, socket, symlinkat,
+    task::{MountFlags, Namespaces, UnmountFlags, chdir, mount, pivot_root, umount2, unshare},
+    unlinkat, write,
 };
 use crate::{Errno, Fd, Path};
 
@@ -658,6 +659,150 @@ fn drop_all_capabilities() -> Result<(), TestConfineError> {
     Ok(())
 }
 
+/// Candidate short mountpoints inside the fresh `/tmp` tmpfs for the test's isolated RW `$TMPDIR`
+/// (6 bytes each, leaving ample headroom for pathname `AF_UNIX` sockets under Linux's 108-byte
+/// `sun_path` limit). Chosen to avoid colliding with any `keep_ro` path under `/tmp`.
+const TEMP_MOUNTS: [&CStr; 7] = [c"/tmp/t", c"/tmp/u", c"/tmp/v", c"/tmp/w", c"/tmp/x", c"/tmp/y", c"/tmp/z"];
+
+#[blaze::noalloc]
+#[blaze::nopanic]
+fn paths_overlap(a: &[u8], b: &[u8]) -> bool {
+    if a == b {
+        return true;
+    }
+    if a.len() > b.len() && a.starts_with(b) && a.get(b.len()).copied() == Some(b'/') {
+        return true;
+    }
+    b.len() > a.len() && b.starts_with(a) && b.get(a.len()).copied() == Some(b'/')
+}
+
+#[blaze::noalloc]
+#[blaze::nopanic]
+fn pick_temp_mount(keep_ro: &[&CStr]) -> Result<&'static CStr, TestConfineError> {
+    for &candidate in &TEMP_MOUNTS {
+        let cand = candidate.to_bytes();
+        let mut collides = false;
+        for &path in keep_ro {
+            if paths_overlap(path.to_bytes(), cand) {
+                collides = true;
+                break;
+            }
+        }
+        if !collides {
+            return Ok(candidate);
+        }
+    }
+    Err(TestConfineError::Mount { which: "pick temp mount", errno: Errno::Exist })
+}
+
+#[blaze::noalloc]
+#[blaze::nopanic]
+fn make_prefixed_cstr<'a>(buf: &'a mut [u8; 512], prefix: &[u8], name: &[u8]) -> Option<&'a CStr> {
+    let total = prefix.len().checked_add(name.len())?;
+    if total + 1 > buf.len() {
+        return None;
+    }
+    buf.get_mut(..prefix.len())?.copy_from_slice(prefix);
+    buf.get_mut(prefix.len()..total)?.copy_from_slice(name);
+    *buf.get_mut(total)? = 0;
+    CStr::from_bytes_with_nul(buf.get(..=total)?).ok()
+}
+
+/// Switches the sandbox's root mount to a minimal private `tmpfs` mirroring the host's top-level
+/// root entries while bind-mounting `bins_tree` read-only at `/target/debug/bin` so compile-time
+/// `env!("CARGO_BIN_EXE_<name>")` paths exist as real, kernel-visible executable files.
+#[blaze::noalloc]
+#[blaze::nopanic]
+fn pivot_root_with_bins(bins_tree: LocalFd) -> Result<(), TestConfineError> {
+    let tmpfs_flags = MountFlags::NO_SUID.with(MountFlags::NO_DEV);
+    mount(Some(Path::new(c"tmpfs")), Path::new(c"/tmp"), Some(Path::new(c"tmpfs")), tmpfs_flags, Some(c"size=4m,mode=0755"))
+        .map_err(|errno| TestConfineError::Mount { which: "mount staging /tmp", errno })?;
+    mkdirat(CWD, Path::new(c"/tmp/nr"), 0o755)
+        .map_err(|errno| TestConfineError::Mount { which: "mkdir /tmp/nr", errno })?;
+    mount(Some(Path::new(c"tmpfs")), Path::new(c"/tmp/nr"), Some(Path::new(c"tmpfs")), tmpfs_flags, Some(c"size=4m,mode=0755"))
+        .map_err(|errno| TestConfineError::Mount { which: "mount newroot", errno })?;
+    mkdirat(CWD, Path::new(c"/tmp/nr/.old"), 0o755)
+        .map_err(|errno| TestConfineError::Mount { which: "mkdir /tmp/nr/.old", errno })?;
+
+    let dir_flags = OpenFlags::READ.with(OpenFlags::DIRECTORY).with(OpenFlags::CLOSE_ON_EXEC);
+    let root_fd = openat(CWD, Path::new(c"/"), dir_flags, 0)
+        .map_err(|errno| TestConfineError::OpenPath { which: "open /", errno })?;
+    let nr_fd = openat(CWD, Path::new(c"/tmp/nr"), dir_flags, 0)
+        .map_err(|errno| TestConfineError::OpenPath { which: "open /tmp/nr", errno })?;
+
+    let mut dents = [0u8; 4096];
+    let mut name_buf = [0u8; 512];
+    let mut src_buf = [0u8; 512];
+    let mut dst_buf = [0u8; 512];
+    let mut link_buf = [0u8; 512];
+    let mut link_c_buf = [0u8; 512];
+    loop {
+        let entries = getdents64(root_fd.fd(), &mut dents)
+            .map_err(|errno| TestConfineError::Mount { which: "getdents64 /", errno })?;
+        let mut any = false;
+        for entry in entries {
+            any = true;
+            let name = entry.name;
+            if name == b"." || name == b".." || name == b"target" || name == b".old" {
+                continue;
+            }
+            let Some(name_c) = make_prefixed_cstr(&mut name_buf, b"", name) else { continue };
+            let Some(src_c) = make_prefixed_cstr(&mut src_buf, b"/", name) else { continue };
+            let Some(dst_c) = make_prefixed_cstr(&mut dst_buf, b"/tmp/nr/", name) else { continue };
+            match entry.kind {
+                EntryKind::Link => {
+                    if let Ok(target) = readlinkat(root_fd.fd(), Path::new(name_c), &mut link_buf)
+                        && let Some(target_c) = make_prefixed_cstr(&mut link_c_buf, b"", target)
+                    {
+                        let _ = symlinkat(Path::new(target_c), nr_fd.fd(), Path::new(name_c));
+                    }
+                }
+                EntryKind::Dir => {
+                    if mkdirat(nr_fd.fd(), Path::new(name_c), 0o755).is_ok() && name != b"tmp" {
+                        let _ = mount(
+                            Some(Path::new(src_c)),
+                            Path::new(dst_c),
+                            None,
+                            MountFlags::BIND.with(MountFlags::RECURSIVE),
+                            None,
+                        );
+                    }
+                }
+                EntryKind::Regular => {
+                    let create_flags = OpenFlags::CREATE.with(OpenFlags::WRITE).with(OpenFlags::CLOSE_ON_EXEC);
+                    if openat(nr_fd.fd(), Path::new(name_c), create_flags, 0o600).is_ok() {
+                        let _ = mount(Some(Path::new(src_c)), Path::new(dst_c), None, MountFlags::BIND, None);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !any {
+            break;
+        }
+    }
+
+    mkdirat(nr_fd.fd(), Path::new(c"target"), 0o755)
+        .map_err(|errno| TestConfineError::Mount { which: "mkdir /target", errno })?;
+    mkdirat(CWD, Path::new(c"/tmp/nr/target/debug"), 0o755)
+        .map_err(|errno| TestConfineError::Mount { which: "mkdir /target/debug", errno })?;
+    mkdirat(CWD, Path::new(c"/tmp/nr/target/debug/bin"), 0o755)
+        .map_err(|errno| TestConfineError::Mount { which: "mkdir /target/debug/bin", errno })?;
+    move_mount_empty("move_mount /target/debug/bin", &bins_tree, c"/tmp/nr/target/debug/bin")?;
+    drop(bins_tree);
+    mount_setattr_ro("mount_setattr /target/debug/bin ro", c"/tmp/nr/target/debug/bin", true)?;
+
+    drop(root_fd);
+    drop(nr_fd);
+    pivot_root(Path::new(c"/tmp/nr"), Path::new(c"/tmp/nr/.old"))
+        .map_err(|errno| TestConfineError::Mount { which: "pivot_root", errno })?;
+    chdir(Path::new(c"/")).map_err(|errno| TestConfineError::Mount { which: "chdir /", errno })?;
+    umount2(Path::new(c"/.old"), UnmountFlags::DETACH)
+        .map_err(|errno| TestConfineError::Mount { which: "umount2 /.old", errno })?;
+    let _ = unlinkat(CWD, Path::new(c"/.old"), Unlink::Dir);
+    Ok(())
+}
+
 /// Enters the full Linux test sandbox in the current (single-threaded) process (`test.md`, piece 9):
 /// 1. Unshares private user, network, IPC, and mount namespaces (`CLONE_NEWUSER | CLONE_NEWNET |
 ///    CLONE_NEWIPC | CLONE_NEWNS`) and maps the caller's effective UID/GID 1:1.
@@ -668,9 +813,10 @@ fn drop_all_capabilities() -> Result<(), TestConfineError> {
 ///    (refusing writes AND metadata mutations like `chmod`/`chown`/`utime*`/`*xattr` everywhere
 ///    outside `$TMPDIR` with `EROFS`), masks `/run`, `/var/tmp`, `/dev/shm`, and `/tmp` with empty
 ///    read-only `tmpfs` (hiding host daemon pathname UNIX sockets), preserves any `keep_ro`
-///    directories (e.g. code store or workspace checkout when located under `/tmp`) as read-only
-///    mounts, and bind-mounts `temp` (`$TMPDIR`) read-write so file writes, `chmod`, `utime`, and
-///    sandbox-local pathname `AF_UNIX` sockets all work inside `$TMPDIR`.
+///    directories (e.g. code store, workspace checkout, or private socket dir when located under
+///    `/tmp`) as read-only mounts, bind-mounts `bins_dir` (when provided) read-only at
+///    `/target/debug/bin` via a private `pivot_root`, and bind-mounts `temp` (`$TMPDIR`) read-write
+///    at a short non-colliding mountpoint under `/tmp` (returned to the caller).
 /// 4. Drops all capabilities via `capset(0)`, sets `RLIMIT_CORE = 0`, sets `PR_SET_NO_NEW_PRIVS`,
 ///    enforces Landlock ABI >= 6 (`LANDLOCK_SCOPE_SIGNAL | LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET`
 ///    plus filesystem read/exec on `/`, writable `temp`, and `/dev/null`), and installs the
@@ -680,9 +826,15 @@ fn drop_all_capabilities() -> Result<(), TestConfineError> {
 /// running guest code). Fails closed on every step (rule 9).
 #[blaze::noalloc]
 #[blaze::nopanic]
-pub fn enter_test_sandbox(temp: &CStr, keep_ro: &[&CStr], cwd: Option<&CStr>) -> Result<(), TestConfineError> {
+pub fn enter_test_sandbox(
+    temp: &CStr,
+    keep_ro: &[&CStr],
+    cwd: Option<&CStr>,
+    bins_dir: Option<&CStr>,
+) -> Result<&'static CStr, TestConfineError> {
     let uid = super::host::geteuid();
     let gid = super::host::getegid();
+    let temp_mount = pick_temp_mount(keep_ro)?;
 
     // 1. Enter private user, net, IPC, and mount namespaces.
     unshare(Namespaces::USER.with(Namespaces::NET).with(Namespaces::IPC).with(Namespaces::NS))
@@ -695,13 +847,18 @@ pub fn enter_test_sandbox(temp: &CStr, keep_ro: &[&CStr], cwd: Option<&CStr>) ->
     bring_up_loopback()?;
 
     // 3. Isolate mount namespace: `/` recursively read-only, host `/run` & temp dirs masked with
-    //    empty read-only tmpfs, `keep_ro` preserved read-only, `temp` (`$TMPDIR`) mounted RW.
+    //    empty read-only tmpfs, `keep_ro` preserved read-only, optional `bins_dir` mounted RO at
+    //    `/target/debug/bin`, and `temp` (`$TMPDIR`) mounted RW at `temp_mount`.
     mount(None, Path::new(c"/"), None, MountFlags::RECURSIVE.with(MountFlags::PRIVATE), None)
         .map_err(|errno| TestConfineError::Mount { which: "MS_PRIVATE /", errno })?;
     let temp_tree = open_tree_clone("open_tree temp", temp)?;
+    let bins_tree = match bins_dir {
+        Some(path) => Some(open_tree_clone("open_tree bins_dir", path)?),
+        None => None,
+    };
 
-    // Snapshot any `keep_ro` paths (at most 4) that live under a masked directory before overmounting.
-    let mut saved_ro: [Option<(LocalFd, usize)>; 4] = [None, None, None, None];
+    // Snapshot any `keep_ro` paths (at most 6) that live under a masked directory before overmounting.
+    let mut saved_ro: [Option<(LocalFd, usize)>; 6] = [None, None, None, None, None, None];
     for (&path, slot) in keep_ro.iter().zip(saved_ro.iter_mut()) {
         if let Some(prefix_len) = masked_prefix_len(path) {
             let tree = open_tree_clone("open_tree keep_ro", path)?;
@@ -709,7 +866,13 @@ pub fn enter_test_sandbox(temp: &CStr, keep_ro: &[&CStr], cwd: Option<&CStr>) ->
         }
     }
 
-    // Lock all original mounts recursively read-only BEFORE overmounting masked dirs so any hidden
+    // When `CARGO_BIN_EXE_*` stubs are exposed, pivot to a private root tmpfs so
+    // `/target/debug/bin/<package>/<name>` is a real, kernel-visible read-only file.
+    if let Some(bins_tree) = bins_tree {
+        pivot_root_with_bins(bins_tree)?;
+    }
+
+    // Lock all mounts recursively read-only BEFORE overmounting masked dirs so any hidden
     // mounts underneath them are read-only too.
     mount_setattr_ro("mount_setattr / ro", c"/", true)?;
 
@@ -734,10 +897,8 @@ pub fn enter_test_sandbox(temp: &CStr, keep_ro: &[&CStr], cwd: Option<&CStr>) ->
         }
     }
 
-    // Create `/tmp/t` inside the fresh empty `/tmp` tmpfs as the short, uniform sandbox `$TMPDIR`
-    // (6 bytes, matching `cargo test`'s `/tmp` headroom so tests binding pathname `AF_UNIX` sockets
-    // beneath `$TMPDIR` never hit Linux's 108-byte `sun_path` limit).
-    mkdir_under_masked("mkdir /tmp/t", c"/tmp/t", b"/tmp/".len())?;
+    // Create the short, non-colliding `$TMPDIR` mountpoint inside the fresh empty `/tmp` tmpfs.
+    mkdir_under_masked("mkdir temp_mount", temp_mount, b"/tmp/".len())?;
 
     // Lock the fresh empty tmpfs masks themselves read-only (non-recursive so `keep_ro` stays).
     for (&(dir, _), &mounted) in MASKED_DIRS.iter().zip(masked_mounted.iter()) {
@@ -746,8 +907,8 @@ pub fn enter_test_sandbox(temp: &CStr, keep_ro: &[&CStr], cwd: Option<&CStr>) ->
         }
     }
 
-    // Mount the cloned read-write `$TMPDIR` at `/tmp/t`.
-    move_mount_empty("move_mount temp rw", &temp_tree, c"/tmp/t")?;
+    // Mount the cloned read-write `$TMPDIR` at `temp_mount`.
+    move_mount_empty("move_mount temp rw", &temp_tree, temp_mount)?;
     drop(temp_tree);
 
     // Re-anchor cwd onto the visible read-only mount if requested.
@@ -786,7 +947,7 @@ pub fn enter_test_sandbox(temp: &CStr, keep_ro: &[&CStr], cwd: Option<&CStr>) ->
     let temp_access = AccessFs::from_bits(
         base_fs.bits() & !(AccessFs::MAKE_CHAR.with(AccessFs::MAKE_BLOCK).bits()),
     );
-    add_path("temp", c"/tmp/t", dir_flags, temp_access)?;
+    add_path("temp", temp_mount, dir_flags, temp_access)?;
     let null_access = AccessFs::READ_FILE
         .with(AccessFs::WRITE_FILE)
         .with(AccessFs::TRUNCATE)
@@ -801,7 +962,8 @@ pub fn enter_test_sandbox(temp: &CStr, keep_ro: &[&CStr], cwd: Option<&CStr>) ->
     let filter_slice = build_test(&mut filter);
     let limits = [(Resource::Core, Rlimit { soft: 0, hard: 0 })];
     let confine = ChildConfine { ruleset: ruleset.fd(), filter: filter_slice, limits: &limits };
-    enter(&confine).map_err(|(step, errno)| TestConfineError::Enter { step, errno })
+    enter(&confine).map_err(|(step, errno)| TestConfineError::Enter { step, errno })?;
+    Ok(temp_mount)
 }
 
 #[cfg(test)]

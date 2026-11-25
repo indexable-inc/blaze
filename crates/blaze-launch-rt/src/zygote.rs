@@ -843,8 +843,8 @@ fn sandbox(profile: &str, temp: &[u8], alloc: Alloc<'_>) -> Option<i32> {
         let Ok(temp_c) = core::ffi::CStr::from_bytes_with_nul(temp) else {
             return Some(libc::EINVAL);
         };
-        match blaze_sys::linux::confine::enter_test_sandbox(temp_c, &[], None) {
-            Ok(()) => None,
+        match blaze_sys::linux::confine::enter_test_sandbox(temp_c, &[], None, None) {
+            Ok(_) => None,
             Err(blaze_sys::linux::confine::TestConfineError::AbiTooOld { .. }) => Some(libc::ENOSYS),
             Err(err) => Some(i32::from(err.raw_errno())),
         }

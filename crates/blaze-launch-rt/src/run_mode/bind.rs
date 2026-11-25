@@ -171,6 +171,15 @@ impl<B: Bind> Bind for LauncherOwn<B> {
                 "access" => Some(addr(bin_remap::remap_access as *const ())),
                 "faccessat" => Some(addr(bin_remap::remap_faccessat as *const ())),
                 "realpath" => Some(addr(bin_remap::remap_realpath as *const ())),
+                "readlink" => Some(addr(bin_remap::remap_readlink as *const ())),
+                "readlinkat" => Some(addr(bin_remap::remap_readlinkat as *const ())),
+                "fopen" => Some(addr(bin_remap::remap_fopen as *const ())),
+                "open" => Some(addr(bin_remap::remap_open as *const ())),
+                "openat" => Some(addr(bin_remap::remap_openat as *const ())),
+                #[cfg(target_os = "linux")]
+                "open64" => Some(addr(bin_remap::remap_open as *const ())),
+                #[cfg(target_os = "linux")]
+                "openat64" => Some(addr(bin_remap::remap_openat as *const ())),
                 _ => None,
             } {
                 return Some(target);

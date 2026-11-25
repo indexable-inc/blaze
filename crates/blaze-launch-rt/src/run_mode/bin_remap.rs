@@ -263,6 +263,62 @@ pub(crate) extern "C" fn remap_realpath(
     unsafe { libc::realpath(remap_cstr(path), resolved) }
 }
 
+pub(crate) extern "C" fn remap_readlink(
+    path: *const c_char,
+    buf: *mut c_char,
+    bufsiz: libc::size_t,
+) -> libc::ssize_t {
+    // SAFETY: `remap_cstr` returns either `path` or a `'static` NUL-terminated C string.
+    unsafe { libc::readlink(remap_cstr(path), buf, bufsiz) }
+}
+
+pub(crate) extern "C" fn remap_readlinkat(
+    dirfd: c_int,
+    path: *const c_char,
+    buf: *mut c_char,
+    bufsiz: libc::size_t,
+) -> libc::ssize_t {
+    // SAFETY: `remap_cstr` returns either `path` or a `'static` NUL-terminated C string.
+    unsafe { libc::readlinkat(dirfd, remap_cstr(path), buf, bufsiz) }
+}
+
+pub(crate) extern "C" fn remap_fopen(
+    path: *const c_char,
+    mode: *const c_char,
+) -> *mut libc::FILE {
+    // SAFETY: `remap_cstr` returns either `path` or a `'static` NUL-terminated C string.
+    unsafe { libc::fopen(remap_cstr(path), mode) }
+}
+
+pub(crate) unsafe extern "C" fn remap_open(
+    path: *const c_char,
+    oflag: c_int,
+    mut args: ...
+) -> c_int {
+    let remapped = unsafe { remap_cstr(path) };
+    if (oflag & libc::O_CREAT) != 0 {
+        let mode: libc::c_uint = unsafe { args.next_arg() };
+        unsafe { libc::open(remapped, oflag, mode) }
+    } else {
+        unsafe { libc::open(remapped, oflag) }
+    }
+}
+
+pub(crate) unsafe extern "C" fn remap_openat(
+    dirfd: c_int,
+    path: *const c_char,
+    oflag: c_int,
+    mut args: ...
+) -> c_int {
+    let remapped = unsafe { remap_cstr(path) };
+    if (oflag & libc::O_CREAT) != 0 {
+        let mode: libc::c_uint = unsafe { args.next_arg() };
+        unsafe { libc::openat(dirfd, remapped, oflag, mode) }
+    } else {
+        unsafe { libc::openat(dirfd, remapped, oflag) }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{BinRemapError, parse_entries};
