@@ -73,7 +73,7 @@ pub fn exact_interiors<'n, 'a, S: NamesSource<'n>>(
     alloc: Alloc<'a>,
 ) -> Result<Option<Exacts<'a>>, tc::CheckError> {
     let exprs = &body.typeck.exprs;
-    if !exprs.iter().any(|e| matches!(e, tc::Expr::AsyncBlock { .. })) {
+    if !exprs.iter().any(|e| matches!(e, tc::Expr::AsyncBlock { .. } | tc::Expr::Closure { is_async: true, .. })) {
         return Ok(None);
     }
     let langs = BorrowLangs::of(r.index);
@@ -85,7 +85,7 @@ pub fn exact_interiors<'n, 'a, S: NamesSource<'n>>(
     let view = body.typeck.view(tys);
     let mut blocks = AVec::new_in(alloc);
     for (i, e) in exprs.iter().enumerate() {
-        if !matches!(e, tc::Expr::AsyncBlock { .. }) {
+        if !matches!(e, tc::Expr::AsyncBlock { .. } | tc::Expr::Closure { is_async: true, .. }) {
             continue;
         }
         let block = tc::ExprId(i as u32);
