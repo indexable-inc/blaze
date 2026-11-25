@@ -733,20 +733,55 @@ pub enum GapWhy<'h> {
 }
 
 impl GapWhy<'_> {
-    /// Its text, written into `out` (a `Why` by its `Debug`, a record's as held).
+    /// Its text, written directly into `out` with zero `Global` allocation (a `Why` by its
+    /// `Debug`, a record's as held).
     fn write_into(self, out: &mut RecordBytes<'_>) {
+        struct BytesWrite<'a, 'b>(&'a mut RecordBytes<'b>);
+        impl core::fmt::Write for BytesWrite<'_, '_> {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                self.0.extend_from_slice(s.as_bytes());
+                Ok(())
+            }
+        }
         match self {
             GapWhy::Text(text) => out.extend_from_slice(text),
-            GapWhy::Made(why) => out.extend_from_slice(std::format!("{why:?}").as_bytes()),
+            GapWhy::Made(why) => {
+                let _ = core::fmt::Write::write_fmt(&mut BytesWrite(out), format_args!("{why:?}"));
+            }
         }
     }
 
-    /// Whether two say the same text.
+    /// Whether two say the same text, without allocating on `Global`.
     fn same(self, other: GapWhy<'_>) -> bool {
+        struct TextMatch<'a> {
+            rest: &'a [u8],
+            matched: bool,
+        }
+        impl core::fmt::Write for TextMatch<'_> {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                if !self.matched {
+                    return Ok(());
+                }
+                match self.rest.strip_prefix(s.as_bytes()) {
+                    Some(tail) => self.rest = tail,
+                    None => self.matched = false,
+                }
+                Ok(())
+            }
+        }
+        let matches_text = |why: &super::types::Why, text: &[u8]| -> bool {
+            let mut m = TextMatch { rest: text, matched: true };
+            let _ = core::fmt::Write::write_fmt(&mut m, format_args!("{why:?}"));
+            m.matched && m.rest.is_empty()
+        };
         match (self, other) {
             (GapWhy::Text(a), GapWhy::Text(b)) => a == b,
-            (GapWhy::Made(a), GapWhy::Made(b)) => std::format!("{a:?}") == std::format!("{b:?}"),
-            (GapWhy::Made(why), GapWhy::Text(text)) | (GapWhy::Text(text), GapWhy::Made(why)) => std::format!("{why:?}").as_bytes() == text,
+            (GapWhy::Made(a), GapWhy::Made(b)) => blaze_mem::frame::task(blaze_mem::Tag::Parse, |frame| {
+                let mut buf = blaze_own::String::new_in(frame);
+                let _ = core::fmt::Write::write_fmt(&mut buf, format_args!("{a:?}"));
+                matches_text(b, buf.as_bytes())
+            }),
+            (GapWhy::Made(why), GapWhy::Text(text)) | (GapWhy::Text(text), GapWhy::Made(why)) => matches_text(why, text),
         }
     }
 }
@@ -2516,31 +2551,45 @@ fn decode_retaining_with<'n>(
     keep_text: Option<&mut dyn FnMut(&str) -> &'n str>,
     verify_text: Option<&mut dyn FnMut(ItemKey, u32, Option<u32>, [u8; 32], &'n str) -> bool>,
 ) -> Result<DecodedHead<'n>, HeadRecordError> {
-    let mut r = In { bytes, at: 0, tys, locals: Vec::new_in(alloc), scratch: Vec::new_in(alloc), origins: Vec::new_in(alloc), alloc };
-    if r.take(4, "the magic")? != &MAGIC[..] {
-        return Err(E::NotThisRecord);
-    }
-    let found = r.u32("the version")?;
-    if found != VERSION {
-        return Err(E::Version { found });
-    }
-    let kind = r.u8("the head's kind")?;
-    let terms = r.count("the term table")?;
-    for _ in 0..terms {
-        r.node()?;
-    }
-    let head = r.decode_head_kind(kind, text, keep_text, verify_text)?;
-    let mut head = head;
-    // Form 22: the regions section, every column laid again over its type here, once.
-    if let Some(filed) = r.opt("a head's regions section", |r| r.regions_section())? {
-        regions_fit_head((*head).as_ref(), filed.regions(), tys.view())?;
-        head.set_regions(filed)?;
-    }
-    if r.at != bytes.len() {
-        return Err(E::Trailing { at: r.at });
-    }
-    r.dedup_origins()?;
-    Ok(DecodedHead { head, origins: r.origins })
+    blaze_mem::frame::task(blaze_mem::Tag::Parse, |decode_frame| {
+        let erased = blaze_own::Erased::new(decode_frame);
+        let scratch_alloc = erased.handle();
+        let mut r = In {
+            bytes,
+            at: 0,
+            tys,
+            locals: Vec::new_in(scratch_alloc),
+            scratch: Vec::new_in(scratch_alloc),
+            origins: Vec::new_in(alloc),
+            alloc,
+            scratch_alloc,
+        };
+        if r.take(4, "the magic")? != &MAGIC[..] {
+            return Err(E::NotThisRecord);
+        }
+        let found = r.u32("the version")?;
+        if found != VERSION {
+            return Err(E::Version { found });
+        }
+        let kind = r.u8("the head's kind")?;
+        let terms = r.count("the term table")?;
+        // Each term starts with at least a 1-byte tag, so `bytes.len()` safely bounds capacity.
+        r.locals.reserve(terms.min(bytes.len()));
+        for _ in 0..terms {
+            r.node()?;
+        }
+        let mut head = r.decode_head_kind(kind, text, keep_text, verify_text)?;
+        // Form 22: the regions section, every column laid again over its type here, once.
+        if let Some(filed) = r.opt("a head's regions section", |r| r.regions_section())? {
+            regions_fit_head((*head).as_ref(), filed.regions(), tys.view())?;
+            head.set_regions(filed)?;
+        }
+        if r.at != bytes.len() {
+            return Err(E::Trailing { at: r.at });
+        }
+        r.dedup_origins()?;
+        Ok(DecodedHead { head, origins: r.origins })
+    })
 }
 
 /// A decoded list that pre-sizes to the exact wire count before pushing elements.
@@ -2561,18 +2610,19 @@ impl<T> SizedList<T> for std::vec::Vec<T> {
 }
 
 /// The reader: the bytes, where it is, and the record's terms as interned so far.
-struct In<'r, 't, 'a> {
+struct In<'r, 't, 'a, 's> {
     bytes: &'r [u8],
     at: usize,
     tys: &'t PortableTys<'a>,
-    /// The record's term `i` is `locals[i]` in `tys`.
-    locals: Vec<PTy, Mem>,
-    scratch: Vec<PTy, Mem>,
+    /// The record's term `i` is `locals[i]` in `tys` (short-lived decode scratch frame).
+    locals: Vec<PTy, Alloc<'s>>,
+    scratch: Vec<PTy, Alloc<'s>>,
     origins: Vec<(ItemKey, OpaqueOrigin), Mem>,
     alloc: Mem,
+    scratch_alloc: Alloc<'s>,
 }
 
-impl<'r> In<'r, '_, '_> {
+impl<'r> In<'r, '_, '_, '_> {
     fn box_head<'n>(&self, head: Head<'n>) -> blaze_own::Box<Head<'n>, Mem> {
         blaze_own::Box::new_in(head, self.alloc)
     }
@@ -2963,7 +3013,7 @@ impl<'r> In<'r, '_, '_> {
             T_RECORD => {
                 let s = blaze_typeck::RecordSchema(self.u64("a record's schema")?);
                 let n = self.u32("a record's field name count")?;
-                let mut names = Vec::with_capacity_in(usize::try_from(n).unwrap_or(0), self.tys.alloc());
+                let mut names = Vec::with_capacity_in(usize::try_from(n).unwrap_or(0).min(self.bytes.len()), self.scratch_alloc);
                 for _ in 0..n {
                     names.push(self.name("a record's field name")?);
                 }

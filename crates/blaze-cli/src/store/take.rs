@@ -41,9 +41,12 @@
 //! `--origin` nothing here runs and nothing is read.
 
 use core::fmt;
+use core::num::NonZeroUsize;
 
 use blaze_cas::Key as CasKey;
-use blaze_cas::plain::{ENTRY, Entry, HEADER, Lent, check_segment};
+#[cfg(test)]
+use blaze_cas::plain::{ENTRY, Entry, HEADER};
+use blaze_cas::plain::Lent;
 use blaze_core::Driver;
 use blaze_drive::Key;
 use blaze_ids::ContentId;
@@ -51,12 +54,16 @@ use blaze_keyed::store::{Put, StoreError};
 use blaze_remote::PublicKey;
 use blaze_remote::published::set::{SetCheck, SetName, SetNameError};
 use blaze_remote::read::form::{HEAD_DOMAIN, HEAD_LEN, HEAD_SIGNED, PREFIX_MOST, decode_prefix};
-use blaze_remote::read::{Head, HeadCheck, Namespace, Object, Origin, Refused, SignatureWhy, Unfetched};
-use blaze_remote::wire_segment::{WireSegmentError, decode_wire_segment};
+use blaze_remote::read::{BatchOutcome, BatchRead, Head, HeadCheck, Namespace, Object, Origin, OriginError, Refused, SignatureWhy, Unfetched};
+#[cfg(test)]
+use blaze_remote::wire_segment::decode_wire_segment;
+use blaze_remote::wire_segment::{VerifiedWireSegment, WireSegmentError, decode_wire_segment_verified};
 use blaze_toolchain::ToolchainId;
 use bstd::clock::Clock;
 use bstd::cx::Cx;
+use bstd::mem::TASK_FRAME;
 use bstd::out::Out;
+use bstd::par::{self, Grain};
 
 use super::plain_place::{PlaceError, PlainPlace, StoreAlloc};
 use super::published::{self, PublishedError};
@@ -69,6 +76,8 @@ use crate::CliError;
 pub(crate) const FRESH_NS: u64 = 10 * 60 * 1_000_000_000;
 /// The most bytes one read asks: under the HTTP origin's body bound (store.rs `ORIGIN_WIRE`).
 pub(crate) const READ_CHUNK: usize = 8 << 20;
+/// Bounded concurrent `BZS1` segment downloads & parallel decodes per wave (rule 18).
+pub(crate) const SEGMENT_IN_FLIGHT: usize = 8;
 /// Each read's deadline, from its start.
 const READ_WAIT_NS: u64 = 30 * 1_000_000_000;
 /// A segment taken whole is at most this: a published set cuts its segments at 32 MiB of
@@ -270,18 +279,32 @@ pub(crate) fn before_first_phase(
     Ok(())
 }
 
-/// [`take_from`] over the origin `named` reaches: its folder, or its `http://` base.
+/// [`take_from`] over the origin `named` reaches: its folder, or its `http://` / `https://` base.
 pub(crate) fn take<D: Driver>(cx: &Cx, named: &NamedOrigin, set: ContentId, lent: &Lent<D, StoreAlloc>, toolchain: ToolchainId, clock: &Clock, plant: TakePlant) -> Result<Taken, TakeError> {
     let keys = named.check.named_keys();
     match &named.at {
-        OriginAt::Folder(folder) => take_from(&mut FolderOrigin { cx, folder }, keys, set, lent, toolchain, clock, plant),
-        OriginAt::Http(at) => take_from(&mut HttpOrigin::new(cx, at, clock), keys, set, lent, toolchain, clock, plant),
+        OriginAt::Folder(folder) => take_from_inner(Some(cx), &mut FolderOrigin { cx, folder }, keys, set, lent, toolchain, clock, plant),
+        OriginAt::Http(at) => take_from_inner(Some(cx), &mut HttpOrigin::new(cx, at, clock), keys, set, lent, toolchain, clock, plant),
     }
 }
 
 /// The set `set`, read from `origin` and believed from a key trusted for it (`keys`: those the
 /// command named), taken into `lent` as the module says.
 pub(crate) fn take_from<D: Driver, O: Origin + ?Sized>(origin: &mut O, keys: &[PublicKey], set: ContentId, lent: &Lent<D, StoreAlloc>, toolchain: ToolchainId, clock: &Clock, plant: TakePlant) -> Result<Taken, TakeError> {
+    take_from_inner(None, origin, keys, set, lent, toolchain, clock, plant)
+}
+
+#[expect(clippy::too_many_arguments, reason = "the take's internal entry with optional parallel decode context")]
+fn take_from_inner<D: Driver, O: Origin + ?Sized>(
+    cx: Option<&Cx>,
+    origin: &mut O,
+    keys: &[PublicKey],
+    set: ContentId,
+    lent: &Lent<D, StoreAlloc>,
+    toolchain: ToolchainId,
+    clock: &Clock,
+    plant: TakePlant,
+) -> Result<Taken, TakeError> {
     let began = now_ns(clock);
     let wall = clock.wall().as_ns();
     let seen = published::seen(lent, &set).map_err(TakeError::Published)?;
@@ -293,7 +316,7 @@ pub(crate) fn take_from<D: Driver, O: Origin + ?Sized>(origin: &mut O, keys: &[P
         return Ok(taken);
     }
     let mut origin = Counted { origin, heads: 0, reads: 0 };
-    let result = take_counted(&mut origin, keys, set, lent, toolchain, clock, plant, (seen.generation, wall, rooted), &mut taken);
+    let result = take_counted(cx, &mut origin, keys, set, lent, toolchain, clock, plant, (seen.generation, wall, rooted), &mut taken);
     taken.head_reads = origin.heads;
     taken.reads = origin.reads;
     taken.take_ns = now_ns(clock).saturating_sub(began);
@@ -302,6 +325,7 @@ pub(crate) fn take_from<D: Driver, O: Origin + ?Sized>(origin: &mut O, keys: &[P
 
 #[expect(clippy::too_many_arguments, reason = "the take's edge, its counted origin and its tally")]
 fn take_counted<D: Driver, O: Origin + ?Sized>(
+    cx: Option<&Cx>,
     origin: &mut Counted<'_, O>,
     keys: &[PublicKey],
     set: ContentId,
@@ -346,73 +370,211 @@ fn take_counted<D: Driver, O: Origin + ?Sized>(
         return Err(TakeError::TooLarge { what: "the set's segments' bytes", len: bytes_named, most: BYTES_TAKEN_MOST });
     }
     drop(bytes);
-    // 3. Each segment whole in one GET (`segz-<digest>`, BZS1 wire encoding), decoded back to
-    //    BLPS, checked ONCE against the row's digest, its records put; committed segment by segment.
-    let mut kept: std::vec::Vec<CasKey, StoreAlloc> = std::vec::Vec::with_capacity_in(records_named as usize, alloc);
-    let mut wire: blaze_own::Vec<u8, StoreAlloc> = blaze_own::Vec::new_in(alloc);
-    let mut segment: blaze_own::Vec<u8, StoreAlloc> = blaze_own::Vec::new_in(alloc);
-    for row in prefixed.rows.iter() {
-        let object = Object::SegmentWire(row.segment);
-        if row.len > SEGMENT_TAKEN_MOST {
-            return Err(TakeError::TooLarge { what: "a segment's length", len: row.len, most: SEGMENT_TAKEN_MOST });
-        }
-        if row.wire_len > SEGMENT_TAKEN_MOST {
-            return Err(TakeError::TooLarge { what: "a wire segment's length", len: row.wire_len, most: SEGMENT_TAKEN_MOST });
-        }
-        let wire_len = usize::try_from(row.wire_len).map_err(|_| TakeError::TooLarge { what: "a wire segment's length", len: row.wire_len, most: SEGMENT_TAKEN_MOST })?;
-        read_exact(origin, object, wire_len, &mut wire, clock)?;
-        decode_wire_segment(wire.as_slice(), row.len, &mut segment, alloc).map_err(|why| TakeError::Segment { object, why: SegmentWhy::Wire(why) })?;
-        let len = segment.len();
-        let verifying = now_ns(clock);
-        #[cfg(test)]
-        let unverified = plant.unverified;
-        #[cfg(not(test))]
-        let unverified = false;
-        let described = if unverified {
-            (len >= HEADER + blaze_cas::plain::FOOTER)
-                .then(|| blaze_cas::plain::describe(&segment[..HEADER], &segment[len - blaze_cas::plain::FOOTER..], len as u64))
-                .flatten()
-                .ok_or(TakeError::Segment { object, why: SegmentWhy::NotItsRow })?
-        } else {
-            check_segment(segment.as_slice()).map_err(|why| TakeError::Segment { object, why: SegmentWhy::Check(why) })?
-        };
-        taken.verify_ns += now_ns(clock).saturating_sub(verifying);
-        if described.digest != row.segment || described.count != row.count || described.index_at != row.index_at || described.namespace != Namespace::PUBLIC {
-            return Err(TakeError::Segment { object, why: SegmentWhy::NotItsRow });
-        }
-        let index_at = described.index_at as usize;
-        for i in 0..described.count as usize {
-            let at = index_at + i * ENTRY;
-            let entry_at = at as u64;
-            let bad = |what| TakeError::Segment { object, why: SegmentWhy::Entry { what, at: entry_at } };
-            let entry = segment.get(at..at + ENTRY).ok_or(bad("past the segment's end")).and_then(|bytes| Entry::decode(bytes).map_err(bad))?;
-            let end = entry.at.checked_add(u64::from(entry.len)).filter(|end| entry.at >= HEADER as u64 && *end <= described.index_at).ok_or(bad("its record is outside the payloads"))?;
-            let payload = &segment[entry.at as usize..end as usize];
-            #[cfg(test)]
-            if plant.stop_after == Some(taken.records + taken.already) {
-                return Err(TakeError::Stopped);
+    // 3. Segments fetched in bounded parallel waves (`SEGMENT_IN_FLIGHT`), decoded and verified
+    //    ONCE via streaming BLAKE3 (`decode_wire_segment_verified`, no second BLPS RAM copy) in
+    //    parallel across workers when available, then put and committed in deterministic row order.
+    let records_cap = usize::try_from(records_named).unwrap_or(0);
+    let mut kept: blaze_own::Vec<CasKey, StoreAlloc> = blaze_own::Vec::with_capacity_in(records_cap, alloc);
+    let kept_alloc = blaze_mem::Kept(blaze_mem::Tag::Store);
+    let mut wire_bufs: blaze_own::Vec<blaze_own::Vec<u8, blaze_mem::Kept>, StoreAlloc> = blaze_own::Vec::with_capacity_in(SEGMENT_IN_FLIGHT, alloc);
+    for _ in 0..SEGMENT_IN_FLIGHT {
+        wire_bufs.push(blaze_own::Vec::new_in(kept_alloc));
+    }
+
+    let rows = prefixed.rows.as_slice();
+    let mut wave_start = 0usize;
+    while wave_start < rows.len() {
+        let wave_end = (wave_start + SEGMENT_IN_FLIGHT).min(rows.len());
+        let Some(wave_rows) = rows.get(wave_start..wave_end) else { break };
+        let wave_len = wave_rows.len();
+
+        // Validate every row's declared lengths BEFORE allocating or fetching any bytes.
+        let mut wire_lens: blaze_own::Vec<usize, StoreAlloc> = blaze_own::Vec::with_capacity_in(wave_len, alloc);
+        for row in wave_rows {
+            if row.len > SEGMENT_TAKEN_MOST {
+                return Err(TakeError::TooLarge { what: "a segment's length", len: row.len, most: SEGMENT_TAKEN_MOST });
             }
-            match place.put_record(Key(entry.key), false, entry.tag, payload).map_err(TakeError::Place)? {
-                Put::Same => taken.already += 1,
-                Put::Written => {
-                    taken.records += 1;
-                    taken.bytes += u64::from(entry.len);
+            if row.wire_len > SEGMENT_TAKEN_MOST {
+                return Err(TakeError::TooLarge { what: "a wire segment's length", len: row.wire_len, most: SEGMENT_TAKEN_MOST });
+            }
+            let wire_len = usize::try_from(row.wire_len).map_err(|_| TakeError::TooLarge { what: "a wire segment's length", len: row.wire_len, most: SEGMENT_TAKEN_MOST })?;
+            wire_lens.push(wire_len);
+        }
+
+        // Parallel wave download of `segz-<digest>` wire segments via `Origin::read_batch`.
+        for (i, &wire_len) in wire_lens.as_slice().iter().enumerate() {
+            if let Some(buf) = wire_bufs.as_mut_slice().get_mut(i) {
+                buf.clear();
+                buf.resize(wire_len, 0);
+            }
+        }
+        if let Some(active_bufs) = wire_bufs.as_mut_slice().get_mut(..wave_len) {
+            let deadline = now_ns(clock).saturating_add(READ_WAIT_NS);
+            let mut reads: blaze_own::Vec<BatchRead<'_>, StoreAlloc> = blaze_own::Vec::with_capacity_in(wave_len, alloc);
+            for (i, (row, buf)) in wave_rows.iter().zip(active_bufs.iter_mut()).enumerate() {
+                reads.push(BatchRead {
+                    id: u32::try_from(i).unwrap_or(0),
+                    object: Object::SegmentWire(row.segment),
+                    at: 0,
+                    into: buf.as_mut_slice(),
+                    deadline_ns: deadline,
+                });
+            }
+            let mut outcomes: blaze_own::Vec<BatchOutcome, StoreAlloc> = blaze_own::Vec::with_capacity_in(wave_len, alloc);
+            outcomes.resize(wave_len, BatchOutcome { result: Err(OriginError::Unreadable), at_ns: 0 });
+            let mut now_fn = || now_ns(clock);
+            origin.read_batch(reads.as_mut_slice(), &mut now_fn, outcomes.as_mut_slice());
+            drop(reads);
+
+            // Check outcomes in row order; finish any partial read cleanly or fail by name.
+            for (i, row) in wave_rows.iter().enumerate() {
+                let object = Object::SegmentWire(row.segment);
+                let wire_len = wire_lens.as_slice().get(i).copied().unwrap_or(0);
+                let outcome = outcomes.as_slice().get(i).copied().unwrap_or(BatchOutcome { result: Err(OriginError::Unreadable), at_ns: 0 });
+                let mut got = outcome.result.map_err(|error| TakeError::Read(Unfetched::Origin { object, error }))?.min(wire_len);
+                if got == 0 && wire_len > 0 {
+                    return Err(TakeError::Read(Unfetched::Short { object, got: 0, wanted: row.wire_len }));
                 }
-                Put::Other => return Err(TakeError::TwoValues { key: entry.key }),
+                while got < wire_len {
+                    let Some(buf) = active_bufs.get_mut(i) else { break };
+                    let Some(tail) = buf.as_mut_slice().get_mut(got..wire_len) else { break };
+                    let at_u64 = u64::try_from(got).unwrap_or(u64::MAX);
+                    let n = read_at(origin, object, at_u64, tail, clock)?;
+                    if n == 0 {
+                        return Err(TakeError::Read(Unfetched::Short { object, got: at_u64, wanted: row.wire_len }));
+                    }
+                    got += n;
+                }
             }
-            kept.push(CasKey(entry.key));
         }
-        // Durable before the next segment is read; no root names them yet.
-        place.commit().map_err(TakeError::Place)?;
+
+        // Planted-bug test path: unverified decode without BLAKE3 digest verification.
         #[cfg(test)]
-        if plant.root_each_segment {
-            let mut so_far: std::vec::Vec<CasKey, StoreAlloc> = std::vec::Vec::with_capacity_in(kept.len(), alloc);
-            so_far.extend_from_slice(&kept);
-            so_far.sort_unstable();
-            so_far.dedup();
-            roots::keep_toolchain(lent, toolchain, &so_far, &[]).map_err(TakeError::Root)?;
-            place.commit().map_err(TakeError::Place)?;
+        if plant.unverified {
+            let mut segment: blaze_own::Vec<u8, StoreAlloc> = blaze_own::Vec::new_in(alloc);
+            for (i, row) in wave_rows.iter().enumerate() {
+                let object = Object::SegmentWire(row.segment);
+                let wire = wire_bufs.as_slice().get(i).map_or(&[][..], |b| b.as_slice());
+                decode_wire_segment(wire, row.len, &mut segment, alloc).map_err(|why| TakeError::Segment { object, why: SegmentWhy::Wire(why) })?;
+                let len = segment.len();
+                let verifying = now_ns(clock);
+                let described = (len >= HEADER + blaze_cas::plain::FOOTER)
+                    .then(|| blaze_cas::plain::describe(&segment[..HEADER], &segment[len - blaze_cas::plain::FOOTER..], u64::try_from(len).unwrap_or(u64::MAX)))
+                    .flatten()
+                    .ok_or(TakeError::Segment { object, why: SegmentWhy::NotItsRow })?;
+                taken.verify_ns += now_ns(clock).saturating_sub(verifying);
+                if described.digest != row.segment || described.count != row.count || described.index_at != row.index_at || described.namespace != Namespace::PUBLIC {
+                    return Err(TakeError::Segment { object, why: SegmentWhy::NotItsRow });
+                }
+                let index_at = usize::try_from(described.index_at).map_err(|_| TakeError::Segment { object, why: SegmentWhy::NotItsRow })?;
+                for idx in 0..usize::try_from(described.count).unwrap_or(0) {
+                    let at = index_at + idx * ENTRY;
+                    let entry_at = u64::try_from(at).unwrap_or(u64::MAX);
+                    let bad = |what| TakeError::Segment { object, why: SegmentWhy::Entry { what, at: entry_at } };
+                    let entry = segment.get(at..at + ENTRY).ok_or(bad("past the segment's end")).and_then(|b| Entry::decode(b).map_err(bad))?;
+                    let end = entry.at.checked_add(u64::from(entry.len)).filter(|end| entry.at >= u64::try_from(HEADER).unwrap_or(128) && *end <= described.index_at).ok_or(bad("its record is outside the payloads"))?;
+                    let start_u = usize::try_from(entry.at).map_err(|_| bad("offset overflow"))?;
+                    let end_u = usize::try_from(end).map_err(|_| bad("end overflow"))?;
+                    let payload = segment.get(start_u..end_u).ok_or(bad("payload slice"))?;
+                    if plant.stop_after == Some(taken.records + taken.already) {
+                        return Err(TakeError::Stopped);
+                    }
+                    match place.put_record(Key(entry.key), false, entry.tag, payload).map_err(TakeError::Place)? {
+                        Put::Same => taken.already += 1,
+                        Put::Written => {
+                            taken.records += 1;
+                            taken.bytes += u64::from(entry.len);
+                        }
+                        Put::Other => return Err(TakeError::TwoValues { key: entry.key }),
+                    }
+                    kept.push(CasKey(entry.key));
+                }
+                place.commit().map_err(TakeError::Place)?;
+                if plant.root_each_segment {
+                    let mut so_far: blaze_own::Vec<CasKey, StoreAlloc> = blaze_own::Vec::with_capacity_in(kept.len(), alloc);
+                    so_far.extend_from_slice(&kept);
+                    so_far.sort_unstable();
+                    so_far.dedup();
+                    roots::keep_toolchain(lent, toolchain, &so_far, &[]).map_err(TakeError::Root)?;
+                    place.commit().map_err(TakeError::Place)?;
+                }
+            }
+            wave_start = wave_end;
+            continue;
         }
+
+        // Verified zero-BLPS-copy decode + streaming BLAKE3 verification, in parallel across the
+        // wave's segments when `cx` provides worker threads (and inline otherwise).
+        let mut inputs: blaze_own::Vec<(&blaze_remote::read::form::Row, &[u8]), StoreAlloc> = blaze_own::Vec::with_capacity_in(wave_len, alloc);
+        for (i, row) in wave_rows.iter().enumerate() {
+            let wire = wire_bufs.as_slice().get(i).map_or(&[][..], |b| b.as_slice());
+            inputs.push((row, wire));
+        }
+        let mut decoded_wave: blaze_own::Vec<Option<Result<VerifiedWireSegment<'_, blaze_mem::Kept>, SegmentWhy>>, StoreAlloc> =
+            blaze_own::Vec::with_capacity_in(wave_len, alloc);
+        for _ in 0..wave_len {
+            decoded_wave.push(None);
+        }
+
+        let verifying = now_ns(clock);
+        if let Some(cx) = cx
+            && wave_len > 1
+        {
+            let scope = cx.scope();
+            let grain = Grain::new(NonZeroUsize::MIN, TASK_FRAME);
+            let mapped = par::map_into(cx, &scope, inputs.as_slice(), decoded_wave.as_mut_slice(), grain, |&(row, wire)| {
+                Some(verify_wave_segment(row, wire, kept_alloc))
+            });
+            let joined = scope.join(cx);
+            if mapped.is_err() || joined.is_err() {
+                // Any worker panic/cancellation stops cleanly with a typed segment check failure.
+                let object = wave_rows.first().map_or(Object::Prefix, |r| Object::SegmentWire(r.segment));
+                return Err(TakeError::Segment { object, why: SegmentWhy::NotItsRow });
+            }
+        } else {
+            for (&(row, wire), slot) in inputs.as_slice().iter().zip(decoded_wave.as_mut_slice().iter_mut()) {
+                *slot = Some(verify_wave_segment(row, wire, kept_alloc));
+            }
+        }
+        taken.verify_ns += now_ns(clock).saturating_sub(verifying);
+
+        // Put verified records in deterministic manifest row order and commit segment by segment.
+        for (row, slot) in wave_rows.iter().zip(decoded_wave.as_mut_slice().iter_mut()) {
+            let object = Object::SegmentWire(row.segment);
+            let verified = match slot.take() {
+                Some(Ok(v)) => v,
+                Some(Err(why)) => return Err(TakeError::Segment { object, why }),
+                None => return Err(TakeError::Segment { object, why: SegmentWhy::NotItsRow }),
+            };
+            for (key, tag, payload) in verified.iter() {
+                #[cfg(test)]
+                if plant.stop_after == Some(taken.records + taken.already) {
+                    return Err(TakeError::Stopped);
+                }
+                match place.put_record(Key(key), false, tag, payload).map_err(TakeError::Place)? {
+                    Put::Same => taken.already += 1,
+                    Put::Written => {
+                        taken.records += 1;
+                        taken.bytes += u64::try_from(payload.len()).unwrap_or(u64::MAX);
+                    }
+                    Put::Other => return Err(TakeError::TwoValues { key }),
+                }
+                kept.push(CasKey(key));
+            }
+            // Durable before the next segment is committed; no root names them yet.
+            place.commit().map_err(TakeError::Place)?;
+            #[cfg(test)]
+            if plant.root_each_segment {
+                let mut so_far: blaze_own::Vec<CasKey, StoreAlloc> = blaze_own::Vec::with_capacity_in(kept.len(), alloc);
+                so_far.extend_from_slice(&kept);
+                so_far.sort_unstable();
+                so_far.dedup();
+                roots::keep_toolchain(lent, toolchain, &so_far, &[]).map_err(TakeError::Root)?;
+                place.commit().map_err(TakeError::Place)?;
+            }
+        }
+
+        wave_start = wave_end;
     }
     // 4. The root last, then the floor, then the commit that makes both durable.
     kept.sort_unstable();
@@ -423,6 +585,25 @@ fn take_counted<D: Driver, O: Origin + ?Sized>(
     taken.generation = head.generation;
     taken.how = How::Took;
     Ok(())
+}
+
+/// Decodes and streaming-verifies one `BZS1` wire segment against its manifest row's exact
+/// BLAKE3 digest, record count, index offset, and `PUBLIC` namespace (zero redundant BLPS copy).
+fn verify_wave_segment<'w>(
+    row: &blaze_remote::read::form::Row,
+    wire: &'w [u8],
+    kept_alloc: blaze_mem::Kept,
+) -> Result<VerifiedWireSegment<'w, blaze_mem::Kept>, SegmentWhy> {
+    let verified = decode_wire_segment_verified(wire, row.len, kept_alloc).map_err(SegmentWhy::Wire)?;
+    let described = verified.described();
+    if described.digest != row.segment
+        || described.count != row.count
+        || described.index_at != row.index_at
+        || described.namespace != Namespace::PUBLIC
+    {
+        return Err(SegmentWhy::NotItsRow);
+    }
+    Ok(verified)
 }
 
 /// The check of the prefix's head: equal, byte for byte, to the head checked by [`SetCheck`]
@@ -446,12 +627,27 @@ struct Counted<'o, O: Origin + ?Sized> {
 }
 
 impl<O: Origin + ?Sized> Origin for Counted<'_, O> {
-    fn read(&mut self, object: &Object, at: u64, into: &mut [u8], deadline_ns: u64) -> Result<usize, blaze_remote::read::OriginError> {
+    fn read(&mut self, object: &Object, at: u64, into: &mut [u8], deadline_ns: u64) -> Result<usize, OriginError> {
         self.reads += 1;
         if *object == Object::Head {
             self.heads += 1;
         }
         self.origin.read(object, at, into, deadline_ns)
+    }
+
+    fn read_batch(
+        &mut self,
+        reads: &mut [BatchRead<'_>],
+        clock: &mut dyn FnMut() -> u64,
+        outcomes: &mut [BatchOutcome],
+    ) {
+        for req in reads.iter() {
+            self.reads += 1;
+            if req.object == Object::Head {
+                self.heads += 1;
+            }
+        }
+        self.origin.read_batch(reads, clock, outcomes);
     }
 }
 
@@ -485,23 +681,6 @@ fn read_to_end<O: Origin + ?Sized>(origin: &mut O, object: Object, most: u64, in
             return Ok(());
         }
     }
-}
-
-/// `len` bytes of `object` from its start into `into`, asking the whole remaining range in one
-/// read (bounded by [`SEGMENT_TAKEN_MOST`], which matches `ORIGIN_WIRE.body_most`); loops only
-/// if the origin returns a short read, and refuses EOF before `len`.
-fn read_exact<O: Origin + ?Sized>(origin: &mut O, object: Object, len: usize, into: &mut blaze_own::Vec<u8, StoreAlloc>, clock: &Clock) -> Result<(), TakeError> {
-    into.clear();
-    into.resize(len, 0);
-    let mut at = 0;
-    while at < len {
-        let n = read_at(origin, object, at as u64, &mut into[at..len], clock)?;
-        if n == 0 {
-            return Err(TakeError::Read(Unfetched::Short { object, got: at as u64, wanted: len as u64 }));
-        }
-        at += n;
-    }
-    Ok(())
 }
 
 /// A fresh home takes the set whole once; its second command takes nothing; a flipped byte is

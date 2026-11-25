@@ -422,34 +422,57 @@ impl core::fmt::Display for Unwritten {
 /// `waits`: what in the crate waits on a failed dependency (names/scope.rs `resolve_metered`,
 /// blaze-scope waits_on.rs); such a path is counted, not found (plan row A8).
 fn scope_record<'a>(cx: &Cx, workers: core::num::NonZeroU32, done: &blaze_scope::crate_scope::CrateScope<'a>, crate_name: &str, member: bool, has_surface: bool, waits: &blaze_scope::waits_on::WaitsOn<'_, 'a>, metered: &metered::Metered<'_>, kept: blaze_own::SharedAlloc<'static>) -> Result<ScopeRecord, Unwritten> {
+    const ALIGN: usize = 16;
+    const PLACES: usize = 16;
     let unwritten = |section: &'static str, why: std::string::String| Unwritten { crate_name: crate_name.into(), section, why };
-    let copy_global = |bytes: &[u8]| {
-        let mut out = blaze_own::Vec::with_capacity_in(bytes.len(), Global);
-        out.extend_from_slice(bytes);
-        out
-    };
     let mut findings = PathFindings::new_in(kept);
     let unresolved = done.names.notes.len() as u32 + unresolved(done.names, member, waits, &mut findings);
-    // Each section's encoder runs in its own rolled-back scratch scope (metered.with_scratch)
-    // and copies ONLY its final encoded bytes out into exact-sized Global buffers, so ~400 MB of
-    // intermediate encoding scratch (on `core`) never stacks onto the crate's solve frame (rule 11).
-    let names_record = metered.with_scratch(|scratch| {
+    // Stream each section directly into the single `Global` payload buffer from its rolled-back
+    // scratch scope (metered.with_scratch), eliminating 6 intermediate Global copies + the final
+    // `sections::write` double-copy (rule 11) while writing the exact `sections::write` layout.
+    let initial_cap = sections::HEAD.saturating_add(done.record.len().saturating_mul(4));
+    let mut payload = blaze_own::Vec::with_capacity_in(initial_cap, Global);
+    payload.resize(sections::HEAD, 0);
+    let mut places = [(0usize, 0usize); sections::SECTIONS];
+    fn append_section<A: core::alloc::Allocator>(payload: &mut blaze_own::Vec<u8, A>, places: &mut [(usize, usize); sections::SECTIONS], idx: usize, bytes: &[u8]) {
+        const ALIGN: usize = 16;
+        let at = payload.len().next_multiple_of(ALIGN);
+        payload.resize(at, 0);
+        payload.extend_from_slice(bytes);
+        if let Some(slot) = places.get_mut(idx) {
+            *slot = (at, bytes.len());
+        }
+    }
+    fn section_slice<'p>(payload: &'p [u8], places: &[(usize, usize); sections::SECTIONS], idx: usize) -> &'p [u8] {
+        places
+            .get(idx)
+            .and_then(|&(at, len)| at.checked_add(len).and_then(|end| payload.get(at..end)))
+            .unwrap_or(&[])
+    }
+    // Section 0: Exports. Section 1: Inner (omitted on disk: no reader consumes it; only
+    // `names/scope.rs` hashes `done.inner` in memory into the task's `out` digest).
+    append_section(&mut payload, &mut places, 0, &done.record);
+    append_section(&mut payload, &mut places, 1, &[]);
+    // Section 2: Names.
+    metered.with_scratch(|scratch| {
         let bytes = blaze_scope::names_record::encode(done.names, scratch.alloc())
             .map_err(|error| unwritten("names", std::format!("{error:?}")))?;
-        Ok(copy_global(&bytes))
+        append_section(&mut payload, &mut places, 2, &bytes);
+        Ok(())
     })?;
-    let items_record = metered.with_scratch(|scratch| {
+    // Section 3: Items.
+    metered.with_scratch(|scratch| {
         let bytes = blaze_scope::items_record::encode_for(done.names, has_surface, scratch.alloc())
             .map_err(|error| unwritten("items", std::format!("{error:?}")))?;
-        Ok(copy_global(&bytes))
+        append_section(&mut payload, &mut places, 3, &bytes);
+        Ok(())
     })?;
-    // A test unit's tests, from attributes alone (test.md, "The tests record", piece 6): the
-    // fifth section. A unit without `test` in its cfg has none, and its section is empty.
-    // A refused tests record is the crate's finding, not its failure: the section stays
-    // empty and the rest of the record is kept, standing until a file it read moves. What it
-    // says of one function (refused, or marked twice) is that function's finding: the other
-    // tests keep their rows.
-    let (tests, tests_refused, test_marks) = metered.with_scratch(|scratch| {
+    // Section 4: Tests. A test unit's tests, from attributes alone (test.md, "The tests record",
+    // piece 6). A unit without `test` in its cfg has none, and its section is empty. A refused
+    // tests record is the crate's finding, not its failure: the section stays empty and the rest
+    // of the record is kept, standing until a file it read moves. What it says of one function
+    // (refused, or marked twice) is that function's finding: the other tests keep their rows.
+    let (tests_refused, test_marks) = metered.with_scratch(|scratch| {
         let mut tests_refused = None;
         let tests_record = match blaze_scope::tests_record::encode(done.names, scratch.alloc()) {
             Ok(section) => Some(section),
@@ -463,17 +486,15 @@ fn scope_record<'a>(cx: &Cx, workers: core::num::NonZeroU32, done: &blaze_scope:
             (true, Some(section)) => test_marks::findings(done.names, section),
             _ => blaze_own::Vec::new_in(Global),
         };
-        let tests = match &tests_record {
-            Some(section) => copy_global(&section.bytes[..]),
-            None => copy_global(&[]),
-        };
-        (tests, tests_refused, test_marks)
+        let bytes = tests_record.as_ref().map_or(&[][..], |section| &section.bytes[..]);
+        append_section(&mut payload, &mut places, 4, bytes);
+        (tests_refused, test_marks)
     });
-    // The crate's expansions (runtime.md plan row B3): deduplicated on canonical uncompressed
-    // content first, then compressed (5-stream delta+varint + zstd) in parallel across worker
-    // cores directly into exact-sized Global buffers so `core`'s ~14k unique expansions fan out
-    // across idle cores with zero scratch-to-Global double copy.
-    let (expansions, extras, expansions_out) = metered.with_scratch(|scratch| {
+    // Section 5: Expansions (runtime.md plan row B3): deduplicated on canonical uncompressed
+    // content first, then compressed (5-stream delta+varint + zstd) in parallel across all
+    // available worker cores directly into exact-sized Global buffers so `core`'s ~14k unique
+    // expansions fan out linearly across up to 128+ cores with zero scratch-to-Global double copy.
+    let (extras, expansions_out) = metered.with_scratch(|scratch| {
         let alloc = scratch.alloc();
         let g = Global;
         let prepared = blaze_scope::expansion_records::prepare(done.names, alloc)
@@ -489,7 +510,7 @@ fn scope_record<'a>(cx: &Cx, workers: core::num::NonZeroU32, done: &blaze_scope:
                 .map_err(|error| unwritten("expansions", blaze_own::format_in!(local_alloc, "{error}").as_str().into()))
         };
         let mut flat = blaze_own::Vec::with_capacity_in(n_rec, g);
-        let par_workers = usize::try_from(workers.get().min(cx.workers())).unwrap_or(6).min(6);
+        let par_workers = usize::try_from(workers.get().min(cx.workers())).unwrap_or(1);
         if par_workers > 1 && n_rec >= 128 {
             let chunk_size = n_rec.div_ceil(par_workers).max(32);
             let scope = cx.scope();
@@ -523,7 +544,6 @@ fn scope_record<'a>(cx: &Cx, workers: core::num::NonZeroU32, done: &blaze_scope:
         }
         let (dir_bytes, order) = prepared.finish_directory(&stored_keys, alloc)
             .map_err(|error| unwritten("expansions", blaze_own::format_in!(alloc, "{error}").as_str().into()))?;
-        let expansions = copy_global(&dir_bytes[..]);
         let mut records = blaze_own::Vec::with_capacity_in(n_rec, g);
         for &u in order.iter() {
             if let Some(slot) = flat.get_mut(u) {
@@ -531,7 +551,7 @@ fn scope_record<'a>(cx: &Cx, workers: core::num::NonZeroU32, done: &blaze_scope:
                 records.push((key, bytes));
             }
         }
-        let dir = blaze_scope::expansion_records::Directory::open(&expansions)
+        let dir = blaze_scope::expansion_records::Directory::open(&dir_bytes[..])
             .map_err(|error| unwritten("expansions", blaze_own::format_in!(alloc, "{error}").as_str().into()))?;
         let calls = u32::try_from(dir.len())
             .map_err(|_| unwritten("expansions", "more than a u32 of macro calls".into()))?;
@@ -544,44 +564,76 @@ fn scope_record<'a>(cx: &Cx, workers: core::num::NonZeroU32, done: &blaze_scope:
             expansions_hash.id(&entry.call.0).id(&entry.record);
         }
         let expansions_out = expansions_hash.finish();
+        append_section(&mut payload, &mut places, 5, &dir_bytes[..]);
         let extras = crate::work::Extras { records, calls, released: None };
-        Ok((expansions, extras, expansions_out))
+        Ok((extras, expansions_out))
     })?;
-    // The crate's link table, from the names resolved here (run.md, "the native image as a
+    // Section 6: Link table, from the names resolved here (run.md, "the native image as a
     // task"): a refused table is written as its refusal (state 1), so only a program that links
     // the crate fails; an error here is a table that could not be written at all.
-    let links = metered.with_scratch(|scratch| {
+    metered.with_scratch(|scratch| {
         let mut links = blaze_own::AVec::new_in(scratch.alloc());
         blaze_ladder::native_links::scope_table(done.names, &mut links, scratch)
             .map_err(|error| unwritten("link table", std::format!("{error:?}")))?;
-        Ok(copy_global(&links))
+        append_section(&mut payload, &mut places, 6, &links);
+        Ok(())
     })?;
-    // The cell table (drive.md, "Names at module grain" point 3): what a reader by cell is
+    // Section 7: Cell table (drive.md, "Names at module grain" point 3): what a reader by cell is
     // checked against, over the two records above and, whole, the names, the items and the
     // expansions. Each section a reader can read whole (`NameCell::Whole`) is a row: a body's
     // read of a cell the table does not hold is read ABSENT (engine_bodies.rs `widen`), so a
     // whole section missing here would be a read no edit moves (rule 21).
-    let wholes = [
-        (blaze_scope::names_cells::Section::Names, &names_record[..]),
-        (blaze_scope::names_cells::Section::Items, &items_record[..]),
-        (blaze_scope::names_cells::Section::Expansions, &expansions[..]),
-    ];
-    let cells = if has_surface {
+    if has_surface {
         metered.with_scratch(|scratch| {
-            let bytes = blaze_scope::names_cells::crate_table(done.names, &names_record, &items_record, &wholes, scratch)
-                .map_err(|error| unwritten("cell table", blaze_own::format_in!(scratch.alloc(), "{error:?}").as_str().into()))?;
-            Ok(copy_global(&bytes))
-        })?
+            let bytes = {
+                let names_bytes = section_slice(&payload, &places, 2);
+                let items_bytes = section_slice(&payload, &places, 3);
+                let expansions_bytes = section_slice(&payload, &places, 5);
+                let wholes = [
+                    (blaze_scope::names_cells::Section::Names, names_bytes),
+                    (blaze_scope::names_cells::Section::Items, items_bytes),
+                    (blaze_scope::names_cells::Section::Expansions, expansions_bytes),
+                ];
+                blaze_scope::names_cells::crate_table(done.names, names_bytes, items_bytes, &wholes, scratch)
+                    .map_err(|error| unwritten("cell table", blaze_own::format_in!(scratch.alloc(), "{error:?}").as_str().into()))?
+            };
+            let at = payload.len().next_multiple_of(ALIGN);
+            let final_len = at.saturating_add(bytes.len());
+            if final_len > payload.capacity() {
+                payload.reserve_exact(final_len - payload.len());
+            }
+            append_section(&mut payload, &mut places, 7, &bytes);
+            Ok(())
+        })?;
     } else {
-        copy_global(&[])
-    };
+        append_section(&mut payload, &mut places, 7, &[]);
+    }
     metered.trim_scratch();
-    // Section::Inner is omitted (&[]) on disk: no reader consumes it (only `names/scope.rs`
-    // hashes `done.inner` in memory into the task's `out` digest). Keeping the 8-section wire
-    // header avoids bumping the format while cutting 14-18% off every stored CrateScope record.
-    let payload = sections::write(unresolved, [&done.record[..], &[], &names_record[..], &items_record[..], &tests[..], &expansions[..], &links[..], &cells[..]]);
+    if let Some(head) = payload.get_mut(..sections::HEAD) {
+        if let Some(dst) = head.get_mut(0..4) {
+            dst.copy_from_slice(&sections::MAGIC);
+        }
+        if let Some(dst) = head.get_mut(4..8) {
+            dst.copy_from_slice(&sections::FORM.to_le_bytes());
+        }
+        if let Some(dst) = head.get_mut(8..12) {
+            dst.copy_from_slice(&unresolved.to_le_bytes());
+        }
+        if let Some(dst) = head.get_mut(12..PLACES) {
+            dst.fill(0);
+        }
+        for (i, &(at, len)) in places.iter().enumerate() {
+            let off = PLACES + i * 16;
+            if let Some(dst) = head.get_mut(off..off + 8) {
+                dst.copy_from_slice(&u64::try_from(at).unwrap_or(u64::MAX).to_le_bytes());
+            }
+            if let Some(dst) = head.get_mut(off + 8..off + 16) {
+                dst.copy_from_slice(&u64::try_from(len).unwrap_or(u64::MAX).to_le_bytes());
+            }
+        }
+    }
     #[cfg(test)]
-    sections::watch_tests(crate_name, &payload, &tests[..]);
+    sections::watch_tests(crate_name, &payload, section_slice(&payload, &places, 4));
     Ok(ScopeRecord { payload, findings, unresolved, tests_refused, test_marks, expansions: extras, expansions_out })
 }
 

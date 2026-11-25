@@ -514,3 +514,66 @@ fn scale_twenty_thousand_tasks_of_five_hundred_reads() {
     // (the merged runs hold one entry an edge; the tail keeps a phase's capacity).
     assert!(columns.bytes_per_edge() * 4 <= FLOOR_BYTES_PER_EDGE as u64 * 5 + 4 * 32, "{} bytes an edge against a floor of {FLOOR_BYTES_PER_EDGE}", columns.bytes_per_edge());
 }
+
+/// Round-trip equivalence, tail release after big seals, and compact interned memory density
+/// (well below the 82-byte un-interned `(CellId, Name)` floor).
+#[test]
+fn interned_soa_reader_index_round_trip_and_memory_density() {
+    let mut paired = Paired::new_in(alloc(), Plant::None);
+    let mut mapped = Mapped::new_in(alloc(), Plant::None);
+    let mut out_p: SVec<'static, (Name, bool)> = blaze_own::Vec::new_in(alloc());
+    let mut out_m: SVec<'static, (Name, bool)> = blaze_own::Vec::new_in(alloc());
+
+    // 4 phases of 500 tasks x 100 reads = 200,000 writes over 4,000 unique cells, plus overwrites
+    // and deletions in later phases so sealing, merging, and tail shrinking are all exercised.
+    let cells = 4_000u32;
+    for phase in 0..4u32 {
+        paired.reserve(50_000);
+        for t in phase * 500..(phase + 1) * 500 {
+            let reader = scale_name(t);
+            for r in 0..100u32 {
+                let j = (t.wrapping_mul(7_919).wrapping_add(r.wrapping_mul(104_729))) % cells;
+                let cell = scale_cell(j);
+                let reads = (phase + r) % 7 != 0;
+                paired.write(cell, reader, reads);
+                mapped.write(cell, reader, reads);
+            }
+        }
+        // Flip a few edges from phase 0 in later phases to exercise newest-wins across runs.
+        if phase > 0 {
+            for t in 0..25u32 {
+                let reader = scale_name(t);
+                let cell = scale_cell(t * 17 % cells);
+                let reads = phase % 2 == 0;
+                paired.write(cell, reader, reads);
+                mapped.write(cell, reader, reads);
+            }
+        }
+        // Trigger seal via a guaranteed-written cell plus 20 spread cells and verify identical answers.
+        paired.edits_of(scale_cell(0), &mut out_p);
+        mapped.edits_of(scale_cell(0), &mut out_m);
+        assert_eq!(out_p.as_slice(), out_m.as_slice(), "edits_of(cell 0) must match Mapped at phase {phase}");
+        for q in 0..20u32 {
+            let cell = scale_cell((phase * 97 + q * 31) % cells);
+            paired.edits_of(cell, &mut out_p);
+            mapped.edits_of(cell, &mut out_m);
+            assert_eq!(out_p.as_slice(), out_m.as_slice(), "edits_of must match Mapped exactly at phase {phase} query {q}");
+        }
+    }
+
+    let cost = paired.cost();
+    assert!(cost.exact);
+    assert!(cost.seals >= 4, "expected at least 4 seals, got {}", cost.seals);
+    assert!(
+        cost.bytes_per_edge() <= 16,
+        "interned SoA Paired must stay <= 16 B/edge (got {} B/edge, {} bytes for {} edges; un-interned floor is {FLOOR_BYTES_PER_EDGE} B/edge)",
+        cost.bytes_per_edge(),
+        cost.bytes,
+        cost.edges,
+    );
+
+    // Exact finish round-trip equivalence (strictly ascending by `(CellId, Name)`).
+    let finished_p = paired.finish(alloc());
+    let finished_m = mapped.finish(alloc());
+    assert_eq!(finished_p.edits.as_slice(), finished_m.edits.as_slice(), "Paired::finish must match Mapped::finish byte-for-byte");
+}

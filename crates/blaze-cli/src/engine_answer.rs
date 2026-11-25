@@ -1567,6 +1567,13 @@ pub(crate) fn save_changes<'m, D: Driver, S: Sharing>(
 }
 
 const SAVE_TASK_FRAME: usize = 64 << 10;
+/// Reusable per-worker bump frame reserved for `BEP6` page dictionary & merge scratch.
+/// Virtual reservation only; pages are committed lazily and trimmed back to [`PAGE_SCRATCH_KEEP`].
+const PAGE_SCRATCH_FRAME: usize = 1 << 30;
+/// Retained warm capacity for per-worker page encoding scratch frames after trimming.
+const PAGE_SCRATCH_KEEP: usize = 256 << 10;
+/// High-water trim threshold for per-worker page encoding scratch frames.
+const PAGE_SCRATCH_TRIM: usize = 2 << 20;
 /// Minimum changed/non-empty answer pages to fan out across workers (0..=3 run inline with zero
 /// thread-spawn overhead on 1-line incremental edits).
 const PAGE_PAR_MIN: usize = 4;
@@ -1611,9 +1618,10 @@ where
     let scope = cx.scope();
     scope.narrow_workers(workers, bstd::task::Class::Foreground);
     let mut handles = blaze_own::Vec::with_capacity_in(worker_count, alloc);
+    let est_per_worker = (n / worker_count).saturating_add(batch);
     for _ in 0..worker_count {
         handles.push(scope.may_overlap(span, SAVE_TASK_FRAME, move |_cx: &Cx| -> Result<_, core::convert::Infallible> {
-            let mut local = blaze_own::Vec::new_in(alloc);
+            let mut local = blaze_own::Vec::with_capacity_in(est_per_worker, alloc);
             loop {
                 let start = next_ref.fetch_add(batch, core::sync::atomic::Ordering::Relaxed);
                 if start >= n {
@@ -1642,6 +1650,109 @@ where
                         *slot = Some(item);
                     }
                 }
+            }
+            Err(error) => {
+                pool_err.get_or_insert(CliError::Pool(error));
+            }
+        }
+    }
+    if let Err(error) = scope.join(cx) {
+        pool_err.get_or_insert(CliError::Pool(error));
+    }
+    if let Some(error) = pool_err {
+        return Err(error);
+    }
+    for slot in slots {
+        if let Some(item) = slot {
+            out.push(item);
+        }
+    }
+    Ok(out)
+}
+
+/// [`run_jobs_par`] giving each worker its own reusable bump [`Frame`] (reset between jobs and
+/// trimmed above [`PAGE_SCRATCH_TRIM`]) so `BEP6` page dictionary & merge scratch never contends
+/// on `save_mem` or allocates on `Global`.
+fn run_jobs_par_framed<'a, J, R, F>(
+    cx: &Cx,
+    workers: core::num::NonZeroU32,
+    min_par: usize,
+    span: &'static str,
+    jobs: &[J],
+    alloc: SharedAlloc<'a>,
+    run: F,
+) -> Result<blaze_own::Vec<R, SharedAlloc<'a>>, CliError>
+where
+    J: Sync,
+    R: Send,
+    F: Fn(&J, &Frame) -> R + Sync,
+{
+    let mut out = blaze_own::Vec::with_capacity_in(jobs.len(), alloc);
+    let active_workers = workers.get().min(cx.workers());
+    if jobs.len() < min_par || active_workers <= 1 {
+        let mut scratch = Frame::with_reserve(PAGE_SCRATCH_FRAME, blaze_mem::Tag::Query)
+            .map_err(|error| crate::engine_phase_mem::PhaseMemError::Request { error })?;
+        for job in jobs {
+            scratch.reset();
+            if scratch.committed() > PAGE_SCRATCH_TRIM {
+                scratch.trim(PAGE_SCRATCH_KEEP);
+            }
+            out.push(run(job, &scratch));
+        }
+        return Ok(out);
+    }
+    let n = jobs.len();
+    let worker_count = usize::try_from(active_workers).unwrap_or(1).min(n);
+    let batch = if n >= worker_count.saturating_mul(16) { 8 } else { 1 };
+    let next = core::sync::atomic::AtomicUsize::new(0);
+    let next_ref = &next;
+    let run_ref = &run;
+    let scope = cx.scope();
+    scope.narrow_workers(workers, bstd::task::Class::Foreground);
+    let mut handles = blaze_own::Vec::with_capacity_in(worker_count, alloc);
+    let est_per_worker = (n / worker_count).saturating_add(batch);
+    for _ in 0..worker_count {
+        handles.push(scope.may_overlap(span, SAVE_TASK_FRAME, move |_cx: &Cx| -> Result<_, core::convert::Infallible> {
+            let mut scratch = match Frame::with_reserve(PAGE_SCRATCH_FRAME, blaze_mem::Tag::Query) {
+                Ok(frame) => frame,
+                Err(error) => return Ok(Err(error)),
+            };
+            let mut local = blaze_own::Vec::with_capacity_in(est_per_worker, alloc);
+            loop {
+                let start = next_ref.fetch_add(batch, core::sync::atomic::Ordering::Relaxed);
+                if start >= n {
+                    break;
+                }
+                let end = start.saturating_add(batch).min(n);
+                if let Some(slice) = jobs.get(start..end) {
+                    for (offset, job) in slice.iter().enumerate() {
+                        scratch.reset();
+                        if scratch.committed() > PAGE_SCRATCH_TRIM {
+                            scratch.trim(PAGE_SCRATCH_KEEP);
+                        }
+                        local.push((start + offset, run_ref(job, &scratch)));
+                    }
+                }
+            }
+            Ok(Ok(local))
+        }));
+    }
+    let mut pool_err: Option<CliError> = None;
+    let mut slots: blaze_own::Vec<Option<R>, SharedAlloc<'a>> = blaze_own::Vec::with_capacity_in(n, alloc);
+    for _ in 0..n {
+        slots.push(None);
+    }
+    for handle in handles {
+        match handle.join(cx) {
+            Ok(Ok(part)) => {
+                for (idx, item) in part {
+                    if let Some(slot) = slots.get_mut(idx) {
+                        *slot = Some(item);
+                    }
+                }
+            }
+            Ok(Err(error)) => {
+                pool_err.get_or_insert_with(|| CliError::from(crate::engine_phase_mem::PhaseMemError::Request { error }));
             }
             Err(error) => {
                 pool_err.get_or_insert(CliError::Pool(error));
@@ -1711,7 +1822,7 @@ fn save<'m, D: Driver, S: Sharing>(
                         None
                     }
                 },
-                |jobs| match run_jobs_par(cx, workers, PAGE_PAR_MIN, "answer pages", jobs, alloc, |job| job.run(alloc)) {
+                |jobs| match run_jobs_par_framed(cx, workers, PAGE_PAR_MIN, "answer pages", jobs, alloc, |job, scratch| job.run_in(alloc, scratch)) {
                     Ok(built) => built,
                     Err(error) => {
                         pool_err = Some(error);
@@ -1730,7 +1841,7 @@ fn save<'m, D: Driver, S: Sharing>(
         None => {
             let mut pool_err: Option<CliError> = None;
             let encoded = pages::encode_par(kept, None, alloc, |jobs| {
-                match run_jobs_par(cx, workers, PAGE_PAR_MIN, "answer pages", jobs, alloc, |job| job.run(alloc)) {
+                match run_jobs_par_framed(cx, workers, PAGE_PAR_MIN, "answer pages", jobs, alloc, |job, scratch| job.run_in(alloc, scratch)) {
                     Ok(built) => built,
                     Err(error) => {
                         pool_err = Some(error);
@@ -1755,11 +1866,14 @@ fn save<'m, D: Driver, S: Sharing>(
         changed: (encoded.changed_entries, encoded.changed_pages),
         ..Saved::default()
     };
-    for (at, (key, bytes)) in encoded.puts.iter().enumerate() {
-        store.put_local(cx, *key, bytes)?;
+    // Drain `encoded.puts` as each record is written into `store` so encoded page buffers return
+    // to `save_mem` immediately rather than remaining live until after the whole loop.
+    let puts = core::mem::replace(&mut encoded.puts, blaze_own::Vec::new_in(alloc));
+    for (at, (key, bytes)) in puts.into_iter().enumerate() {
+        store.put_local(cx, key, &bytes)?;
         saved.puts += 1;
         if at < task_puts {
-            let len = bytes.len() as u64;
+            let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
             saved.new_page_bytes += len;
             saved.largest_new_page = saved.largest_new_page.max(len);
         }
@@ -1768,9 +1882,6 @@ fn save<'m, D: Driver, S: Sharing>(
     {
         saved.pages_digest = Some(test_pages_digest(lent, &encoded, alloc, frame)?);
     }
-    // Every encoded page and radix sub-record is now in `store`; release their buffers back to
-    // `save_mem`'s free lists before allocating producer header shards or reach indexes.
-    encoded.puts = blaze_own::Vec::new_in(alloc);
     let mut header_pool_err: Option<CliError> = None;
     let (headers, writes) = Headers::after_with(last.map(|base| base.headers), kept, writer, kept.answer.serial, HeadersPlant::None, |index| match last {
         Some(base) => base.headers_at(index),
@@ -1835,10 +1946,36 @@ fn save<'m, D: Driver, S: Sharing>(
     // A page and the payloads of *every* row on it share one immutable reach index.
     // StoreSink also includes each names payload's expansion index and its children.
     // The store follows exactly one index level from an indexed root.
-    use crate::engine_answer_rows::StoreSink;
+    // Prepare, sort, and deduplicate per-page CAS key lists in parallel across workers; on the
+    // main thread, publish non-scope pages directly into `lent.index_beside` with zero re-copy or
+    // serial re-sort, and delegate the few `CrateScope` pages to `StoreSink::index_rows_into`.
+    use crate::engine_answer_rows::{PublishError, StoreSink};
+    struct PreparedReach<'a> {
+        page: Key,
+        keys: blaze_own::Vec<blaze_cas::Key, SharedAlloc<'a>>,
+        scopes: blaze_own::Vec<(Name, Key), SharedAlloc<'a>>,
+    }
+    let page_recs: blaze_own::Vec<(Key, &[(Name, Key)]), SharedAlloc<'_>> =
+        blaze_own::Vec::from_iter_in(encoded.page_records(), alloc);
+    let prepared = run_jobs_par(cx, workers, PAGE_PAR_MIN, "answer reach", &page_recs, alloc, |&(page, rows)| {
+        let mut keys: blaze_own::Vec<blaze_cas::Key, SharedAlloc<'_>> =
+            blaze_own::Vec::with_capacity_in(rows.len().saturating_add(1), alloc);
+        let mut scopes: blaze_own::Vec<(Name, Key), SharedAlloc<'_>> = blaze_own::Vec::new_in(alloc);
+        keys.push(blaze_cas::Key(page.0));
+        for &(name, record) in rows {
+            keys.push(blaze_cas::Key(record.0));
+            if name.kind == blaze_drive::Kind::CrateScope {
+                scopes.push((name, record));
+            }
+        }
+        if scopes.is_empty() {
+            keys.sort_unstable();
+            keys.dedup();
+        }
+        PreparedReach { page, keys, scopes }
+    })?;
     let mut sink = StoreSink { cx, store, lent, toolchain };
     let mut records = blaze_own::Vec::new_in(alloc);
-    let mut scopes = blaze_own::Vec::new_in(alloc);
     let mut toolchain_records = blaze_own::Vec::new_in(alloc);
     let mut cas_buf: blaze_own::Vec<blaze_cas::Key, SharedAlloc<'_>> = blaze_own::Vec::new_in(alloc);
     let mut indexed_beside: BesideCache<'_> = blaze_hash::Map::new(blaze_hash::MapOpts {
@@ -1846,21 +1983,32 @@ fn save<'m, D: Driver, S: Sharing>(
         alloc,
         capacity: Some(task_puts),
     });
-    for (page, rows) in encoded.page_records() {
-        records.clear();
-        scopes.clear();
-        records.push(page);
+    for (item, &(_, rows)) in prepared.into_iter().zip(page_recs.iter()) {
         for &(name, record) in rows {
-            records.push(record);
-            if name.kind == blaze_drive::Kind::CrateScope {
-                scopes.push((name, record));
-            }
             if sink.store.is_toolchain(name) {
                 toolchain_records.push(record);
             }
         }
-        let beside = sink.index_rows_into(page, &records, &scopes, &mut cas_buf).map_err(reach_error)?;
-        indexed_beside.insert(page.0.0, beside);
+        let beside = if item.scopes.is_empty() {
+            if item.keys.len() > blaze_cas::plain::INDEX_KEYS_MOST {
+                return Err(reach_error(PublishError::RowsReach {
+                    segment: item.page,
+                    cap: blaze_cas::plain::INDEX_KEYS_MOST,
+                }));
+            }
+            sink.lent
+                .index_beside(blaze_cas::Key(item.page.0), &item.keys)
+                .map_err(|error| reach_error(PublishError::Cas(error)))?
+        } else {
+            records.clear();
+            records.reserve(rows.len().saturating_add(1));
+            records.push(item.page);
+            for &(_, record) in rows {
+                records.push(record);
+            }
+            sink.index_rows_into(item.page, &records, &item.scopes, &mut cas_buf).map_err(reach_error)?
+        };
+        indexed_beside.insert(item.page.0.0, beside);
         saved.puts += 1;
     }
     let reach_name = bstd::mem::format_in!(frame, "{name}.{REACH_ROOT}");
@@ -2599,7 +2747,7 @@ fn keep_toolchain_base<'m, D: Driver, S: Sharing>(
     }
     let mut tc_page_err: Option<CliError> = None;
     let encoded = pages::encode_par(&tc_kept, None, alloc, |jobs| {
-        match run_jobs_par(cx, workers, PAGE_PAR_MIN, "toolchain base pages", jobs, alloc, |job| job.run(alloc)) {
+        match run_jobs_par_framed(cx, workers, PAGE_PAR_MIN, "toolchain base pages", jobs, alloc, |job, scratch| job.run_in(alloc, scratch)) {
             Ok(built) => built,
             Err(error) => {
                 tc_page_err = Some(error);

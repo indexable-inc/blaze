@@ -630,10 +630,12 @@ fn ns_between(from: bstd::clock::Instant, to: bstd::clock::Instant) -> u64 {
     to.since(from).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
 }
 
-/// One clean body's typed record in the phase's arena, put by [`BodiesStage::run_phase`] under
-/// `engine_body_record::typed_key(bytes)`, its key named by `check`'s run facts.
+/// One clean body's typed record in the phase's arena, hashed on its Bodies worker
+/// (`engine_body_record::typed_key(bytes)`) and put by [`BodiesStage::run_phase`], its key named
+/// by `check`'s run facts.
 struct TypedPut<'a> {
     check: Name,
+    key: Key,
     bytes: SVec<'a, u8>,
 }
 
@@ -674,11 +676,36 @@ pub(crate) struct RunOut<'a> {
     /// `DataCell::Followed`), its path and the answer the body saw: the leaf rows the request
     /// saves so the sweep follows them ([`BodiesStage::data_files`]).
     data_files: SVec<'a, (blaze_own::String<SharedAlloc<'a>>, ContentId)>,
+    /// Pre-encoded run-facts payloads (`engine_body_facts::write`) built on Bodies workers for
+    /// whole (unsliced) entries so coordinator merge skips per-body cover sorting and encoding.
+    facts_bytes: SVec<'a, u8>,
+    /// `(row_index, from, to)` slices in `facts_bytes`, in ascending `row_index` order.
+    facts_index: SVec<'a, (usize, u32, u32)>,
+    /// First `engine_body_facts::write` error observed on a worker, surfaced at merge.
+    facts_error: Option<(Name, crate::engine_body_facts::BodyFactsError)>,
 }
 
 impl<'a> RunOut<'a> {
     fn new(alloc: SharedAlloc<'a>) -> RunOut<'a> {
-        RunOut { found: SVec::new_in(alloc), messages: SVec::new_in(alloc), notes: SVec::new_in(alloc), locals: SVec::new_in(alloc), clean: 0, items: 0, item_tasks: 0, outs: SVec::new_in(alloc), scratch_most: 0, frames: FramesHeld::default(), typed: SVec::new_in(alloc), untyped_clean: 0, setup: StretchSetup::default(), data_files: SVec::new_in(alloc) }
+        RunOut {
+            found: SVec::new_in(alloc),
+            messages: SVec::new_in(alloc),
+            notes: SVec::new_in(alloc),
+            locals: SVec::new_in(alloc),
+            clean: 0,
+            items: 0,
+            item_tasks: 0,
+            outs: SVec::new_in(alloc),
+            scratch_most: 0,
+            frames: FramesHeld::default(),
+            typed: SVec::new_in(alloc),
+            untyped_clean: 0,
+            setup: StretchSetup::default(),
+            data_files: SVec::new_in(alloc),
+            facts_bytes: SVec::new_in(alloc),
+            facts_index: SVec::new_in(alloc),
+            facts_error: None,
+        }
     }
 }
 
@@ -710,6 +737,13 @@ const SCRATCH_KEEP: usize = 8 << 20;
 const HEADS_STRETCH_FRAME: usize = 512 << 20;
 const HEADS_STRETCH_CAP: usize = 64 << 20;
 const HEADS_STRETCH_KEEP: usize = 8 << 20;
+
+/// Virtual address-space reservation for a Bodies worker's reusable dependency-head freeze
+/// scratch frame ([`LazyBodySeed`]'s `SeededHeads`), reset and trimmed back to
+/// [`FREEZE_SCRATCH_KEEP`] after every freeze call so cold dependency head freezes never churn
+/// the `Global` heap.
+const FREEZE_SCRATCH: usize = 256 << 20;
+const FREEZE_SCRATCH_KEEP: usize = 4 << 20;
 
 /// What the runs' frames held committed (rule 16): the scratch's most at a body's end, the
 /// stretch frame's most at a stretch's end, the stretch heads frame's most, and how many times a
@@ -2072,7 +2106,7 @@ fn body_subject<'p>(one: &Ran<'_>, name: Name, base: Name, outlined: &[Outlined<
 /// `Unchecked` note is `TYPES_NOT_CHECKED`, a `BorrowsUnchecked` one `BORROWS_NOT_CHECKED`, and
 /// every refusal, panic, frame refusal and task fault `work::NOT_RUN` (those notes carry no rule
 /// number of their own). A body with no note that did not run is `NOT_RUN` too.
-fn note_rule(said: Option<&Said<&str>>, checked: bool) -> Option<u16> {
+fn note_rule<E>(said: Option<&Said<E>>, checked: bool) -> Option<u16> {
     match said {
         Some(Said::Unchecked { .. }) => Some(crate::body_types::TYPES_NOT_CHECKED),
         Some(Said::BorrowsUnchecked(_)) => Some(crate::body_types::BORROWS_NOT_CHECKED),
@@ -4346,15 +4380,23 @@ impl<'f> BodiesStage<'f> {
             // `blaze run` builds from it.
             self.untyped_clean = self.untyped_clean.saturating_add(run_out.untyped_clean);
             self.setup.add(run_out.setup);
+            if let Some((body, why)) = run_out.facts_error {
+                return Err(EngineCheckError::BodyFacts { body, why: crate::engine_body_facts::MakeError::Bytes(why) }.into());
+            }
+            let preencoded = run_out.facts_index.len() == ran.len();
             typed_keys.clear();
             for one in run_out.typed.iter() {
-                let key = crate::engine_body_record::typed_key(&one.bytes);
+                let key = one.key;
                 store.put(cx, key, &one.bytes)?;
                 self.typed_bytes = self.typed_bytes.saturating_add(one.bytes.len() as u64);
                 self.typed.get_or_insert_with(|| Vec::new_in(heap.alloc())).push(key);
-                typed_keys.push((one.check, key));
+                if !preencoded {
+                    typed_keys.push((one.check, key));
+                }
             }
-            typed_keys.sort_unstable_by_key(|one| one.0);
+            if !preencoded {
+                typed_keys.sort_unstable_by_key(|one| one.0);
+            }
             self.items += run_out.items;
             self.item_tasks += run_out.item_tasks;
             // One copy of the run's messages. Each row addresses its contiguous findings in
@@ -4372,42 +4414,65 @@ impl<'f> BodiesStage<'f> {
                 findings.push(BodyFinding { rule, at, message: &messages[from..end] });
                 from = end;
             }
-            // Each body of the run: its class from its note and its findings' rules, its covered
-            // keys from the run's `One` of that name (a body in a run ran unless it has a note),
-            // and each fn declared in a body its check reached (`RunOut::locals`, in run order).
-            for (at, one) in ran.iter().enumerate() {
-                // Its bodies as a program calls them ([`asked_keys`]: a method by its member
-                // key), not each library key's first 16 bytes. Each run appends `Ran` rows in
-                // exact `runs[run_at]` index order (0..len), so `runs[run_at][at]` is O(1).
-                let run_tasks = runs.get(run_at).copied().unwrap_or(&[]);
-                let matched = run_tasks.get(at).filter(|task| task.task.planned.name == one.name);
-                debug_assert!(
-                    matched.is_some() || run_tasks.iter().all(|task| task.task.planned.name != one.name),
-                    "join_runs expected ran[{at}] ({:?}) to match runs[{run_at}][{at}]",
-                    one.name,
-                );
-                let asked: &[blaze_typeck::ItemKey] = matched.map_or(&[], |task| task.asked);
-                let found_from = run_out.found.partition_point(|found| found.0 < at);
-                let found_to = run_out.found.partition_point(|found| found.0 <= at);
-                let rules = run_out.found.get(found_from..found_to).unwrap_or(&[]).iter().map(|found| found.1);
-                let rule = note_rule(one.said(), true);
-                let class = crate::engine_body_facts::class_of(rule.into_iter().chain(rules));
-                let from = run_out.locals.partition_point(|local| local.0 < at);
-                let to = run_out.locals.partition_point(|local| local.0 <= at);
-                covers.clear();
-                covers.extend(asked.iter().map(|key| key.0.to_be_bytes()));
-                // A fn declared in a body is always `Free` (front2 tables/task.rs `locals`): its
-                // checker key is its library key's first 16 bytes (keys.rs `Keys::local`).
-                for item in run_out.locals[from..to].iter().map(|local| &local.1) {
-                    covers.push(blaze_ladder::front2::keys::checker_of(*item).0.to_be_bytes());
+            if preencoded {
+                let base = made.bytes.len();
+                made.bytes.extend_from_slice(&run_out.facts_bytes);
+                made.index.reserve(run_out.facts_index.len());
+                for &(at, from, to) in run_out.facts_index.iter() {
+                    if let Some(one) = ran.get(at) {
+                        let start = base.saturating_add(usize::try_from(from).unwrap_or(0));
+                        let end = base.saturating_add(usize::try_from(to).unwrap_or(0));
+                        made.index.push((one.name, u32::try_from(start).unwrap_or(u32::MAX), u32::try_from(end).unwrap_or(u32::MAX)));
+                    }
                 }
-                covers.sort_unstable();
-                covers.dedup();
-                let typed = typed_keys.binary_search_by_key(&one.name, |typed| typed.0).ok().map(|at| typed_keys[at].1);
-                let from = made.bytes.len();
-                crate::engine_body_facts::write(class, &covers, typed, &mut made.bytes)
-                    .map_err(|why| EngineCheckError::BodyFacts { body: one.name, why: crate::engine_body_facts::MakeError::Bytes(why) })?;
-                made.index.push((one.name, from as u32, made.bytes.len() as u32));
+            } else {
+                // Fallback path for sliced entries (`join_slices`) and runs with refused rows:
+                // reuse any pre-encoded row verbatim, and encode any remaining row here.
+                for (at, one) in ran.iter().enumerate() {
+                    if let Ok(idx) = run_out.facts_index.binary_search_by_key(&at, |entry| entry.0)
+                        && let Some(&(_, f, t)) = run_out.facts_index.get(idx)
+                        && let (Ok(fs), Ok(ts)) = (usize::try_from(f), usize::try_from(t))
+                        && let Some(slice) = run_out.facts_bytes.get(fs..ts)
+                    {
+                        let from = made.bytes.len();
+                        made.bytes.extend_from_slice(slice);
+                        let end = made.bytes.len();
+                        made.index.push((one.name, u32::try_from(from).unwrap_or(u32::MAX), u32::try_from(end).unwrap_or(u32::MAX)));
+                        continue;
+                    }
+                    // Its bodies as a program calls them ([`asked_keys`]: a method by its member
+                    // key), not each library key's first 16 bytes. Each run appends `Ran` rows in
+                    // exact `runs[run_at]` index order (0..len), so `runs[run_at][at]` is O(1).
+                    let run_tasks = runs.get(run_at).copied().unwrap_or(&[]);
+                    let matched = run_tasks.get(at).filter(|task| task.task.planned.name == one.name);
+                    debug_assert!(
+                        matched.is_some() || run_tasks.iter().all(|task| task.task.planned.name != one.name),
+                        "join_runs expected ran[{at}] ({:?}) to match runs[{run_at}][{at}]",
+                        one.name,
+                    );
+                    let asked: &[blaze_typeck::ItemKey] = matched.map_or(&[], |task| task.asked);
+                    let found_from = run_out.found.partition_point(|found| found.0 < at);
+                    let found_to = run_out.found.partition_point(|found| found.0 <= at);
+                    let rules = run_out.found.get(found_from..found_to).unwrap_or(&[]).iter().map(|found| found.1);
+                    let rule = note_rule(one.said(), true);
+                    let class = crate::engine_body_facts::class_of(rule.into_iter().chain(rules));
+                    let from = run_out.locals.partition_point(|local| local.0 < at);
+                    let to = run_out.locals.partition_point(|local| local.0 <= at);
+                    covers.clear();
+                    covers.extend(asked.iter().map(|key| key.0.to_be_bytes()));
+                    // A fn declared in a body is always `Free` (front2 tables/task.rs `locals`): its
+                    // checker key is its library key's first 16 bytes (keys.rs `Keys::local`).
+                    for item in run_out.locals[from..to].iter().map(|local| &local.1) {
+                        covers.push(blaze_ladder::front2::keys::checker_of(*item).0.to_be_bytes());
+                    }
+                    covers.sort_unstable();
+                    covers.dedup();
+                    let typed = typed_keys.binary_search_by_key(&one.name, |typed| typed.0).ok().map(|at| typed_keys[at].1);
+                    let from = made.bytes.len();
+                    crate::engine_body_facts::write(class, &covers, typed, &mut made.bytes)
+                        .map_err(|why| EngineCheckError::BodyFacts { body: one.name, why: crate::engine_body_facts::MakeError::Bytes(why) })?;
+                    made.index.push((one.name, u32::try_from(from).unwrap_or(u32::MAX), u32::try_from(made.bytes.len()).unwrap_or(u32::MAX)));
+                }
             }
             self.ran.extend(ran.drain(..));
         }
@@ -6646,6 +6711,20 @@ fn run_worker_stealing<'a, 'b, 'f, R: ?Sized + CellDigests>(
             worker.items.push(item);
         }
     };
+    let Ok(mut freeze_scratch) = blaze_ladder::front2::tables::head::FreezeScratch::new(FREEZE_SCRATCH, FREEZE_SCRATCH_KEEP, bstd::mem::Tag::Infer) else {
+        loop {
+            if shared.board.stopping().is_some() {
+                return;
+            }
+            let slot = cursor.fetch_add(1, Ordering::Relaxed);
+            let Some(&at) = dispatch.get(slot) else { return };
+            let Some(run) = runs.get(at).copied() else { continue };
+            let mut item = ItemDone::new(at, run.len(), clock, alloc, at_phase);
+            let _ = refuse::<R>(run, "the dependency-head freeze scratch frame could not be reserved (engine_bodies.rs `FREEZE_SCRATCH`)", None, &mut item.out, &mut item.ran, &mut item.run_out, alloc);
+            item.span.1 = crate::engine_times::ns(clock.now().since_start());
+            worker.items.push(item);
+        }
+    };
     let mut pending: Option<Pending<'a, 'b, 'f>> = None;
     loop {
         let next = match pending.take() {
@@ -6696,7 +6775,10 @@ fn run_worker_stealing<'a, 'b, 'f, R: ?Sized + CellDigests>(
                     worker_setup: &mut worker.setup,
                     pending: None,
                 };
-                let _ = run_stretch_with(cx, shared, &mut driver, &stretch, &mut scratch, clock, &mut worker.tally, alloc, at_phase);
+                let _ = freeze_scratch.with_resettable_alloc(|freeze_alloc, freeze_reset| {
+                    let stretch = &stretch;
+                    run_stretch_with(cx, shared, &mut driver, stretch, &mut scratch, freeze_alloc, freeze_reset, clock, &mut worker.tally, alloc, at_phase)
+                });
                 worker.frames.stretch_committed_most = worker.frames.stretch_committed_most.max(u64::try_from(stretch.committed()).unwrap_or(u64::MAX));
                 if let StretchDriver::Stealing { pending: carry, .. } = driver {
                     pending = carry;
@@ -6732,6 +6814,10 @@ fn run_bodies<'a, 'b, 'f, R: ?Sized + CellDigests>(cx: &Cx, shared: &Shared<'_, 
         refuse::<R>(run, "the scratch frame of its run's bodies could not be reserved (engine_bodies.rs `BODY_SCRATCH`)", None, out, ran, run_out, alloc);
         return;
     };
+    let Ok(mut freeze_scratch) = blaze_ladder::front2::tables::head::FreezeScratch::new(FREEZE_SCRATCH, FREEZE_SCRATCH_KEEP, bstd::mem::Tag::Infer) else {
+        refuse::<R>(run, "the dependency-head freeze scratch frame could not be reserved (engine_bodies.rs `FREEZE_SCRATCH`)", None, out, ran, run_out, alloc);
+        return;
+    };
     let mut at = 0;
     while at < run.len() {
         let rest = &run[at..];
@@ -6745,7 +6831,10 @@ fn run_bodies<'a, 'b, 'f, R: ?Sized + CellDigests>(cx: &Cx, shared: &Shared<'_, 
         let took = match Frame::with_reserve(BODIES_FRAME, bstd::mem::Tag::Infer) {
             Ok(stretch) => {
                 let mut driver = StretchDriver::Fixed { run: rest, at: 0, out, ran, run_out };
-                let took = run_stretch_with(cx, shared, &mut driver, &stretch, &mut scratch, clock, tally, alloc, at_phase);
+                let took = freeze_scratch.with_resettable_alloc(|freeze_alloc, freeze_reset| {
+                    let stretch = &stretch;
+                    run_stretch_with(cx, shared, &mut driver, stretch, &mut scratch, freeze_alloc, freeze_reset, clock, tally, alloc, at_phase)
+                });
                 // Its records' pages go as the stretch ends, not the run (the frame's drop: what
                 // its thread's shelf has no room for goes back, blaze-mem frame.rs `give_span`).
                 run_out.frames.stretch_committed_most = run_out.frames.stretch_committed_most.max(stretch.committed() as u64);
@@ -6942,7 +7031,7 @@ impl core::fmt::Display for LangIndexRefused {
 /// (`Known::Bytes`) and member refusals (`Known::Refused`) directly in O(1) without constructing
 /// `lang_index`, `Pointers`, `HeadConsts`, or `SeededHeads`. Only on a cold dependency head miss
 /// (`Known::Freeze`) does it lazily build the freezer once per stretch into `frame`.
-struct LazyBodySeed<'k, 'n, 't> {
+struct LazyBodySeed<'k, 'r, 'm, 'n, 't> {
     names: &'n blaze_ladder::front2::source::Records<'n>,
     heads: &'k crate::engine_seeds::StretchHeads<'k, 'k, 'n>,
     tables: Tables<'t, 'n>,
@@ -6952,6 +7041,10 @@ struct LazyBodySeed<'k, 'n, 't> {
     fb: blaze_own::Bump<'n>,
     fa: blaze_own::Alloc<'n>,
     g: blaze_own::Alloc<'static>,
+    freeze_alloc: blaze_own::Alloc<'static>,
+    freeze_reset: &'r blaze_ladder::front2::tables::head::FreezeReset<'r, 'm>,
+    freeze_exhausted: &'k core::cell::Cell<Option<(usize, usize)>>,
+    freeze_depth: core::cell::Cell<u32>,
     body_locals: blaze_ladder::front2::tables::seeds::BodyLocals,
     import_cache: &'k blaze_ladder::front2::tables::head::FrozenImportCache<'n>,
     front: Option<&'n blaze_ladder::front2::tables::task::StretchFront>,
@@ -6960,7 +7053,7 @@ struct LazyBodySeed<'k, 'n, 't> {
     inner: core::cell::OnceCell<Result<&'n crate::engine_seeds::BodySeed<'k, 'n, 'n, &'n blaze_ladder::front2::source::Records<'n>, crate::engine_seeds::StretchHeads<'k, 'k, 'n>>, LangIndexRefused>>,
 }
 
-impl<'k, 'n, 't> LazyBodySeed<'k, 'n, 't> {
+impl<'k, 'r, 'm, 'n, 't> LazyBodySeed<'k, 'r, 'm, 'n, 't> {
     fn index_reads(&self) -> u64 {
         self.index_reads.get()
     }
@@ -7002,7 +7095,7 @@ impl<'k, 'n, 't> LazyBodySeed<'k, 'n, 't> {
         // (engine_heads.rs `heads_of`): without them this freezer would write other bytes
         // under a dependency head's key (rule 21; lane H9).
         let pointers = pointers.unwrap_or_else(|| blaze_ladder::front2::receiver::Pointers::find(index, blaze_ladder::resolve::Paths { names: self.tables }));
-        let freezer = SeededHeads::new(SeededHeadsOpts { names: self.names, sized, pointers, frame: self.frame, scratch: self.g, alloc: self.fa, consts, known: Some(self.heads), owners: None });
+        let freezer = SeededHeads::new(SeededHeadsOpts { names: self.names, sized, pointers, frame: self.frame, scratch: self.freeze_alloc, alloc: self.fa, consts, known: Some(self.heads), owners: None });
         self.frame.alloc(crate::engine_seeds::BodySeed::new(RequestSeedOpts { names: self.names, heads: self.heads, freezer, body_locals: self.body_locals }))
     }
 
@@ -7024,7 +7117,7 @@ impl<'k, 'n, 't> LazyBodySeed<'k, 'n, 't> {
     }
 }
 
-impl<'n> HeadSeed<'n> for LazyBodySeed<'_, 'n, '_> {
+impl<'n> HeadSeed<'n> for LazyBodySeed<'_, '_, '_, 'n, '_> {
     fn seed(&self, store: &blaze_ladder::front2::heads::Store<'n>, keys: &blaze_ladder::front2::keys::Keys, need: Want, scratch: blaze_own::Alloc<'static>) -> Result<blaze_ladder::front2::heads::Seeded, SeedError> {
         if self.body_locals == blaze_ladder::front2::tables::seeds::BodyLocals::Lowered
             && blaze_ladder::front2::tables::seeds::of_the_body(store, need)
@@ -7045,7 +7138,27 @@ impl<'n> HeadSeed<'n> for LazyBodySeed<'_, 'n, '_> {
         }
         let inner = self.inner.get_or_init(|| self.build_freezer());
         match inner {
-            Ok(body_seed) => body_seed.seed(store, keys, need, scratch),
+            Ok(body_seed) => {
+                struct FreezeResetGuard<'a, 'k, 'm> {
+                    depth: &'a core::cell::Cell<u32>,
+                    reset: &'k blaze_ladder::front2::tables::head::FreezeReset<'k, 'm>,
+                    exhausted: &'k core::cell::Cell<Option<(usize, usize)>>,
+                }
+                impl Drop for FreezeResetGuard<'_, '_, '_> {
+                    fn drop(&mut self) {
+                        let next = self.depth.get().saturating_sub(1);
+                        self.depth.set(next);
+                        if next == 0
+                            && let Some(ex) = self.reset.reset_and_trim()
+                        {
+                            self.exhausted.set(Some(ex));
+                        }
+                    }
+                }
+                self.freeze_depth.set(self.freeze_depth.get().saturating_add(1));
+                let _reset = FreezeResetGuard { depth: &self.freeze_depth, reset: self.freeze_reset, exhausted: self.freeze_exhausted };
+                body_seed.seed(store, keys, need, scratch)
+            }
             Err(refused) => Err(SeedError::of_freeze(FreezeError::NotTheirs {
                 want: cell,
                 why: NotTheirs::Failed { said: refused.0 },
@@ -7058,12 +7171,14 @@ impl<'n> HeadSeed<'n> for LazyBodySeed<'_, 'n, '_> {
 /// `driver` checked over one view until `driver` stops (group change, [`STRETCH_FULL`], stop
 /// signal, or unwind). Returns how many bodies it checked (or refused for a fixed slice).
 #[expect(clippy::too_many_arguments, reason = "a stretch's edge: each argument one handle of it")]
-fn run_stretch_with<'d, 'a, 'b, 'f, R: ?Sized + CellDigests>(
+fn run_stretch_with<'d, 'a, 'b, 'f, 'r, 'm, R: ?Sized + CellDigests>(
     cx: &Cx,
     shared: &Shared<'_, 'a, '_, '_, R>,
     driver: &mut StretchDriver<'d, 'a, 'b, 'f>,
     frame: &Frame,
     scratch: &mut Frame,
+    freeze_alloc: blaze_own::Alloc<'static>,
+    freeze_reset: &'r blaze_ladder::front2::tables::head::FreezeReset<'r, 'm>,
     clock: &Clock,
     tally: &mut crate::engine_seeds::SeedTally,
     alloc: SharedAlloc<'a>,
@@ -7150,7 +7265,9 @@ fn run_stretch_with<'d, 'a, 'b, 'f, R: ?Sized + CellDigests>(
     let mut eval = EvalReads { placed: 0, ids: Vec::new_in(fa) };
     // Held on the stretch's stack in `g` so it leaves 0 bytes in `frame` and drops cleanly with the stretch.
     let import_cache = blaze_ladder::front2::tables::head::FrozenImportCache::new(g);
-    let seed: Option<&LazyBodySeed<'_, '_, '_>> = stretch_heads.as_ref().map(|table| {
+    let binding_keys = blaze_ladder::front2::tables::recorder::SharedBindingKeys::new(g);
+    let freeze_exhausted: core::cell::Cell<Option<(usize, usize)>> = core::cell::Cell::new(None);
+    let seed: Option<&LazyBodySeed<'_, '_, '_, '_, '_>> = stretch_heads.as_ref().map(|table| {
         &*frame.alloc(LazyBodySeed {
             names: opened.records,
             heads: table,
@@ -7161,6 +7278,10 @@ fn run_stretch_with<'d, 'a, 'b, 'f, R: ?Sized + CellDigests>(
             fb,
             fa,
             g,
+            freeze_alloc,
+            freeze_reset,
+            freeze_exhausted: &freeze_exhausted,
+            freeze_depth: core::cell::Cell::new(0),
             body_locals: table.body_locals(),
             import_cache: &import_cache,
             front: front_ref,
@@ -7273,7 +7394,7 @@ fn run_stretch_with<'d, 'a, 'b, 'f, R: ?Sized + CellDigests>(
         let name = one.task.planned.name;
         let (made_before, hits_before) = ids.counts();
         let mut body_tally = crate::engine_seeds::SeedTally::default();
-        let mut recording = Some(Recorder::new(RecorderOpts { alloc: w }));
+        let mut recording = Some(Recorder::with_shared_bindings(RecorderOpts { alloc: w }, &binding_keys));
         // Keep the include log until publication: a frame can fill after the last include
         // and before the row's reads have been copied out.
         let data_at = opened.sources.0.data.borrow().len();
@@ -7285,13 +7406,17 @@ fn run_stretch_with<'d, 'a, 'b, 'f, R: ?Sized + CellDigests>(
         let frame_limit = |what: &'static str, heads: Option<&StretchStore<'_>>| {
             let scratch_full = sc.take_exhaustion();
             let heads_full = heads.and_then(StretchStore::take_exhaustion);
+            let freeze_full = freeze_exhausted.take();
             // A shared stretch has space left by its preceding bodies. No source cell
             // certifies that capacity. Only the body's private reservation starts empty.
             match frame.take_exhaustion() {
                 Some(used) => Some((used, frame.reserved(), what, Stands::OwedNextRequest)),
                 None => match heads_full {
                     Some((used, reserved)) => Some((used, reserved, what, Stands::OwedNextRequest)),
-                    None => scratch_full.map(|used| (used, sc.reserved(), what, Stands::ByReads)),
+                    None => match freeze_full {
+                        Some((used, reserved)) => Some((used, reserved, what, Stands::OwedNextRequest)),
+                        None => scratch_full.map(|used| (used, sc.reserved(), what, Stands::ByReads)),
+                    },
                 },
             }
         };
@@ -7376,7 +7501,7 @@ fn run_stretch_with<'d, 'a, 'b, 'f, R: ?Sized + CellDigests>(
                     let keys = blaze_ladder::front2::keys::Keys::new();
                     let error = blaze_ladder::front2::tables::head::fact_cell(opened.records, &keys, key).expect_err("no head for the data digest");
                     let shown = blaze_ladder::front2::item_shown::FactDefinition::of(opened.records, key, None, w);
-                    let active = recording.insert(Recorder::new(RecorderOpts { alloc: w }));
+                    let active = recording.insert(Recorder::with_shared_bindings(RecorderOpts { alloc: w }, &binding_keys));
                     for &key in &body.reads {
                         active.read(key);
                     }
@@ -7930,6 +8055,7 @@ fn run_stretch_with<'d, 'a, 'b, 'f, R: ?Sized + CellDigests>(
         opened.sources.0.data.borrow_mut().truncate(data_at);
         opened.sources.0.left.borrow_mut().truncate(left_at);
         let index = ran.len();
+        let entry_rule = note_rule(result.note.as_ref().map(|(said, _)| said), true);
         if let Some((said, head_failed)) = result.note {
             run_out.notes.push((index, said, head_failed));
         } else if result.checked && result.done.findings == 0 {
@@ -7944,15 +8070,46 @@ fn run_stretch_with<'d, 'a, 'b, 'f, R: ?Sized + CellDigests>(
             run_out.messages.extend_from_slice(finding.message);
             run_out.found.push((index, finding.rule, finding.at, run_out.messages.len()));
         }
-        run_out.locals.extend(result.locals.iter().map(|key| (index, *key)));
+        let mut entry_typed: Option<Key> = None;
         if result.checked {
             run_out.untyped_clean = run_out.untyped_clean.saturating_add(result.untyped_clean);
             run_out.typed.reserve(result.typed.len());
             for &(check, bytes) in result.typed.iter() {
+                let key = crate::engine_body_record::typed_key(bytes);
+                if check == name {
+                    entry_typed = Some(key);
+                }
                 let mut kept = SVec::with_capacity_in(bytes.len(), at_phase);
                 kept.extend_from_slice(bytes);
-                run_out.typed.push(TypedPut { check, bytes: kept });
+                run_out.typed.push(TypedPut { check, key, bytes: kept });
             }
+        }
+        let mut encoded_facts = false;
+        if one.part.is_none() && run_out.facts_error.is_none() {
+            let class = crate::engine_body_facts::class_of(entry_rule.into_iter().chain(result.found.iter().map(|finding| finding.rule)));
+            let mut covers: SVec<'_, [u8; 16]> = SVec::with_capacity_in(one.asked.len().saturating_add(result.locals.len()), at_phase);
+            covers.extend(one.asked.iter().map(|key| key.0.to_be_bytes()));
+            for item in result.locals.iter() {
+                covers.push(blaze_ladder::front2::keys::checker_of(*item).0.to_be_bytes());
+            }
+            covers.sort_unstable();
+            covers.dedup();
+            let from = run_out.facts_bytes.len();
+            match crate::engine_body_facts::write(class, &covers, entry_typed, &mut run_out.facts_bytes) {
+                Ok(()) => {
+                    let end = run_out.facts_bytes.len();
+                    if let (Ok(from), Ok(end)) = (u32::try_from(from), u32::try_from(end)) {
+                        run_out.facts_index.push((index, from, end));
+                        encoded_facts = true;
+                    }
+                }
+                Err(why) => {
+                    run_out.facts_error = Some((name, why));
+                }
+            }
+        }
+        if !encoded_facts {
+            run_out.locals.extend(result.locals.iter().map(|key| (index, *key)));
         }
         let (made_now, hits_now) = ids.counts();
         mem.ids_made = made_now - made_before;

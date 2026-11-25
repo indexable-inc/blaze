@@ -36,6 +36,10 @@ use crate::engine::SVec;
 /// The most writes a tail holds before it is sealed on its own (rule 18): a place is a `u32`.
 pub const TAIL_CAP: usize = u32::MAX as usize;
 
+/// Tail buffer capacity retained after a seal (bytes): larger tails are released back to the
+/// allocator so a single heavy phase does not pin megabytes of idle scratch for the whole request.
+const TAIL_RETAIN_BYTES: usize = 64 * 1024;
+
 /// What a table holds and has cost: the profile's counters.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct RunsCost {
@@ -114,6 +118,9 @@ impl<'a, K: Ord + Copy, V: Copy> Runs<'a, K, V> {
             run.push((newest.0, newest.2));
         }
         self.tail.clear();
+        if self.tail.capacity().saturating_mul(size_of::<(K, u32, V)>()) > TAIL_RETAIN_BYTES {
+            self.tail = Vec::new_in(self.alloc);
+        }
         self.push_run(run);
     }
 
