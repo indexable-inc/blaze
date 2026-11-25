@@ -20,7 +20,7 @@ blaze-body-flow	24
 blaze-body-lower	22
 blaze-borrow	21
 blaze-bstd-convert	9
-blaze-build	738
+blaze-build	736
 blaze-build-script	109
 blaze-c	4
 blaze-cad	101
