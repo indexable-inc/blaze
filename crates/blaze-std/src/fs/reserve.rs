@@ -49,7 +49,12 @@ impl Dir<ReadWrite> {
             return Err(FsError::new(FsOp::Publish, &key, FsKind::OverQuota(over)));
         }
         let fresh = self.io.fresh();
-        let (mut reserve, first) = Reserve::new(key.share(), room, Tag(fresh));
+        let unique = if self.io.is_sim() {
+            fresh
+        } else {
+            (u64::from(crate::rt::process_id()) << 32) | (fresh & 0xffff_ffff)
+        };
+        let (mut reserve, first) = Reserve::new(key.share(), room, Tag(unique));
         let submit = |effect: Effect| -> Result<Done, FsError> {
             call(&self.io, cx, FsOp::Publish, &key, |tag| retag(effect, tag))
         };

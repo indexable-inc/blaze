@@ -20,7 +20,8 @@
 
 use blaze_deflate::{GzipDecoder, Limits as Inflate};
 use blaze_git_fetch::{
-    CacheStats, Found, Index, Kind as GitKind, Mode as GitMode, Oid, PackError, PackLimits, PktWhy, TreeError, TreeLimits,
+    CacheStats, Found, Index, Kind as GitKind, Mode as GitMode, Oid, PackError, PackLimits, PackWhy, PktWhy, TreeError,
+    TreeLimits, TreeWhy,
     store::{ObjectDb, ObjectSource, StoreWhy},
 };
 use blaze_own::{Alloc, AllocFailure, Vec};
@@ -118,6 +119,22 @@ pub enum UnpackError {
     /// The pack holds no commit of the pinned id.
     NoCommit,
     Alloc(AllocFailure),
+}
+
+impl UnpackError {
+    /// Whether this refusal was caused by heap allocation exhaustion rather than malformed or
+    /// missing archive/repository data.
+    pub fn is_alloc(&self) -> bool {
+        match self {
+            UnpackError::Alloc(_)
+            | UnpackError::Pack(PackRefused::Alloc(_))
+            | UnpackError::GitAnswer(PktWhy::Alloc(_))
+            | UnpackError::GitStore(StoreWhy::Entry(PackWhy::Alloc(_))) => true,
+            UnpackError::GitPack(e) => matches!(e.why, PackWhy::Alloc(_)),
+            UnpackError::GitTree(e) => matches!(e.why, TreeWhy::Alloc(_)),
+            _ => false,
+        }
+    }
 }
 
 impl Show for UnpackError {

@@ -149,6 +149,14 @@ pub enum AdoptRefused {
     Unpack(UnpackError),
 }
 
+impl AdoptRefused {
+    /// Whether adoption failed because of heap allocation exhaustion rather than missing or
+    /// malformed local cache data.
+    pub fn is_alloc(&self) -> bool {
+        matches!(self, AdoptRefused::Unpack(why) if why.is_alloc())
+    }
+}
+
 impl Show for AdoptRefused {
     fn show<P: Put + ?Sized>(&self, out: &mut P) {
         match self {
