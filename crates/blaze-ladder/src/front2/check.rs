@@ -171,6 +171,15 @@ pub struct Records<'r, 'n, S = &'n Names<'n>> {
     pub consts: Option<(&'r mut Consts<'n>, &'r Prepares<'n>)>,
 }
 
+impl<'r, 'n, S> Records<'r, 'n, S> {
+    /// Prepared macros available for lowering a defining body (e.g. an `impl Trait` auto-trait
+    /// reveal or `_`-returning fn inference), even while `&mut Consts` is borrowed by an active
+    /// constant evaluation.
+    pub(super) fn prepared(&self) -> Option<&'r Prepares<'n>> {
+        self.consts.as_ref().map(|c| c.1).or(self.store.prepared)
+    }
+}
+
 /// The order the loop makes what a round noted: as asked, or reversed (a test's second run).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BuildOrder {
@@ -2397,7 +2406,7 @@ fn resolve_inferred_outputs<'n, S: NamesSource<'n>>(
             r.store.inferring_output_stack.extend_from_slice(&stack);
             r.store.inferred_output_wanted = None;
             r.store.inferred_output_cycle = None;
-            let Some(prepared) = r.consts.as_ref().map(|c| c.1) else {
+            let Some(prepared) = r.prepared() else {
                 return Err(InferredErr::Gap(Gap::BodyRecord(tc::Question::FnSig(cur))));
             };
             let target = match r.keys.library_in(r.names, cur) {

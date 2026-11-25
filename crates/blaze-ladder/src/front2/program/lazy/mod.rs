@@ -525,6 +525,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         store.pointers = pointers;
         let bump = front.frame.alloc(blaze_own::Erased::new(front.frame)).bump();
         let prepared = Prepares::new_in(bump);
+        store.prepared = Some(prepared);
         let (seed, buckets) = if seeded_heads {
             let consts_index = crate::front2::index::Index::from_source(front.names, front.index.scope())
                 .map_err(|e| Front2Refusal::Front(crate::front2::FrontError::Lang(e)))?;

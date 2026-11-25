@@ -493,6 +493,29 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
         }
     }
 
+    /// Copies tokens `start..end` (stripping outer delimiters when `strip_delims` is true)
+    /// from an earlier body expansion and seals them with that expansion's key.
+    fn expanded_slice(&self, expansion: u32, start: u32, end: u32, strip_delims: bool) -> Result<TokenStream<'a>, Refused<'a>> {
+        let (key, tokens) =
+            self.expansions.get(expansion as usize).ok_or(Refused::Failed(Failure::NoExpansion { expansion }))?;
+        let (s, e) = (
+            usize::try_from(start).map_err(|_| Refused::Failed(Failure::NoDelimiters))?,
+            usize::try_from(end).map_err(|_| Refused::Failed(Failure::NoDelimiters))?,
+        );
+        let range = match strip_delims {
+            true => {
+                if e < s.saturating_add(2) {
+                    return Err(Refused::Failed(Failure::NoDelimiters));
+                }
+                s + 1..e - 1
+            }
+            false => s..e,
+        };
+        let mut copy = tokens.copy_in(range, self.alloc).map_err(|e| Refused::Failed(Failure::Stream(e)))?;
+        copy.seal(*key);
+        Ok(copy)
+    }
+
     /// The `macro_rules!` or `macro` of the body a single-name `path` names (the last written
     /// of the name in scope), as a definition in the body's crate at `edition`.
     fn local(&self, path: &str, locals: &[LocalMacro<'_>], edition: Edition) -> Option<Result<MacroDefinition<'a>, Refused<'a>>> {
@@ -504,11 +527,23 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
         };
         let Some(site) = site else { return Some(Err(Refused::Unknown(NoMacro::LocalWithoutCrate))) };
         let at = DefAt { site, edition, export: Export::Local, local_inner: LocalInner::No, transparency: None };
+        let lex_text = |text: &str, marks: InputMarks<'_>| match marks.is_empty() {
+            true => lex(text, edition, self.alloc),
+            false => blaze_expand::lex_marked(text, edition, &|at| marks.mark_at(at), self.alloc),
+        };
         Some(match written.form {
-            LocalForm::Rules(rules) => {
-                lex(rules, edition, self.alloc).map(|body| MacroDefinition::rules(body, at)).map_err(|e| Refused::Failed(Failure::Lex(e)))
+            LocalForm::Rules { text, marks } => {
+                lex_text(text, marks).map(|body| MacroDefinition::rules(body, at)).map_err(|e| Refused::Failed(Failure::Lex(e)))
             }
-            LocalForm::Macro2(trees) => macro2_of(trees, at, self.alloc).map_err(Refused::Failed),
+            LocalForm::RulesExpanded { expansion, start, end } => {
+                self.expanded_slice(expansion, start, end, true).map(|body| MacroDefinition::rules(body, at))
+            }
+            LocalForm::Macro2 { text, marks } => lex_text(text, marks)
+                .map_err(|e| Refused::Failed(Failure::Lex(e)))
+                .and_then(|stream| macro2_of_stream(&stream, at, self.alloc).map_err(Refused::Failed)),
+            LocalForm::Macro2Expanded { expansion, start, end } => self
+                .expanded_slice(expansion, start, end, false)
+                .and_then(|stream| macro2_of_stream(&stream, at, self.alloc).map_err(Refused::Failed)),
         })
     }
 
@@ -545,18 +580,7 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
                 }
                 lexed.copy_in(1..len - 1, self.alloc).map_err(|e| Refused::Failed(Failure::Stream(e)))
             }
-            CallInput::Expanded { expansion, start, end } => {
-                let (key, tokens) =
-                    self.expansions.get(expansion as usize).ok_or(Refused::Failed(Failure::NoExpansion { expansion }))?;
-                if end < start + 2 {
-                    return Err(Refused::Failed(Failure::NoDelimiters));
-                }
-                let mut copy = tokens
-                    .copy_in(start as usize + 1..end as usize - 1, self.alloc)
-                    .map_err(|e| Refused::Failed(Failure::Stream(e)))?;
-                copy.seal(*key);
-                Ok(copy)
-            }
+            CallInput::Expanded { expansion, start, end } => self.expanded_slice(expansion, start, end, true),
         }
     }
 
@@ -782,19 +806,18 @@ struct CallFrame<'d, 'a> {
     pending: AVec<'a, NestedCall>,
 }
 
-/// The body's `macro` whose trees after its name are `trees`, defined `at`: `(params) { body }`
+/// The body's `macro` whose trees after its name are `stream`, defined `at`: `(params) { body }`
 /// one function-like rule, `{ arms }` arms as a `macro_rules!` has; the params and the body
 /// are the tokens inside their delimiters, as blaze-scope makes a module's `macro`
 /// (task/lower.rs, `ItemDetail::MacroDef`).
-fn macro2_of<'a>(trees: &str, at: DefAt, alloc: Alloc<'a>) -> Result<MacroDefinition<'a>, Failure<'a>> {
+fn macro2_of_stream<'a>(stream: &TokenStream<'_>, at: DefAt, alloc: Alloc<'a>) -> Result<MacroDefinition<'a>, Failure<'a>> {
     use blaze_expand::Delim;
-    let lexed = lex(trees, at.edition, alloc).map_err(Failure::Lex)?;
-    let tokens = lexed.tokens();
+    let tokens = stream.tokens();
     let group = |open: usize, delim: Delim| match tokens.get(open).map(|t| t.kind) {
-        Some(TokenKind::Open(d)) if d == delim => lexed.close_of(open),
+        Some(TokenKind::Open(d)) if d == delim => stream.close_of(open),
         _ => None,
     };
-    let inside = |open: usize, close: usize| lexed.copy_in(open + 1..close, alloc).map_err(Failure::Stream);
+    let inside = |open: usize, close: usize| stream.copy_in(open + 1..close, alloc).map_err(Failure::Stream);
     let (params, body_open) = match group(0, Delim::Paren) {
         Some(close) => (Some(inside(0, close)?), close + 1),
         None => (None, 0),

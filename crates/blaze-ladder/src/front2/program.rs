@@ -898,6 +898,7 @@ impl<'n> Front2Program<'n> {
         let mut buckets = None;
         let bump = frame.alloc(blaze_own::Erased::new(frame)).bump();
         let prepared = Prepares::new_in(bump);
+        store.prepared = Some(prepared);
         let mut mains: Vec<Body<'n>, Global> = Vec::with_capacity_in(roots.len(), Global);
         let mut kept: Vec<LibKey, Global> = Vec::with_capacity_in(roots.len(), Global);
         // The records, with the program's one constant evaluator, are made BEFORE the roots

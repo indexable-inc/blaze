@@ -1253,6 +1253,41 @@ fn nested_borrow_async_block_reloads_by_ref_and_by_mut_ref_across_await() {
     assert_eq!(cancelled, Ran { value: u64::MAX, polls: 1, drops: 1, made: 1 });
 }
 
+/// A coroutine whose output is uninhabited (`!`, so `Poll<!>` is zero-sized / `Repr::None`)
+/// and an `.await` on that `Poll<!>` future both build and execute cleanly: each poll returns
+/// `Poll::Pending` without writing a tag, and cancelling while suspended drops live locals once.
+#[test]
+fn poll_of_never_coroutine_and_await_suspend_and_cancel_cleanly() {
+    let mut w = open_world();
+    let owner = async_fn(&mut w, "never_owner", "never_owner_future");
+    w.fx.finish();
+    let mut b = async_body();
+    let lits = StdVec::new();
+    // Inner `async move { let d = mk_d(); loop { let _ = twice().await; } }` -> Output = `!` (`Poll<!>`).
+    let d = b.bind("d");
+    let mk = b.path(&["mk_d"]);
+    let d_val = b.call(mk, &[]);
+    let s_d = b.let_(d, None, d_val);
+    let awaited = call_await(&mut b, "twice");
+    let s_await = b.semi(awaited);
+    let loop_body = b.block(&[s_await], None);
+    let loop_e = b.int(None);
+    b.exprs[loop_e.ix()] = Expr::Loop { body: loop_body };
+    let inner_body = b.block(&[s_d], Some(loop_e));
+    let blk_e = b.async_block(inner_body, Capture::Move);
+    let blk = b.bind("blk");
+    let s_blk = b.let_(blk, None, blk_e);
+    let blk_ref = b.local(blk);
+    let waited = b.await_(blk_ref);
+    let body = b.block(&[s_blk], Some(waited));
+    let root = b.async_block(body, Capture::Move);
+    let progs = [Prog { item: owner, b: &b, root, lits: &lits }];
+    // Two polls suspend through both the `Poll<!>` inner coroutine and the outer `.await` of it;
+    // cancelling after 2 polls drops `d` once (and `twice()` was constructed once).
+    let cancelled = run(&w, &progs, Script::CancelAfter(2));
+    assert_eq!(cancelled, Ran { value: u64::MAX, polls: 2, drops: 1, made: 1 });
+}
+
 mod async_unwind;
 
 /// Every slot kept across a suspension names a flow local (walk/state_names.rs; ASYNC.md P8).
