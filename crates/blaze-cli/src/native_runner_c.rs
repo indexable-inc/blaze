@@ -137,6 +137,42 @@ impl fmt::Display for Said<'_> {
     }
 }
 
+/// The C library root the deferred C tasks compile against: the macOS SDK, or the pinned
+/// glibc sysroot (D69: its folder is named by the pin's SHA-256, which is its key).
+#[derive(Clone, Copy)]
+pub(crate) enum CSysroot<'e> {
+    Macos(blaze_apple_sdk::Sdk<'e>),
+    /// The resolved sysroot folder and its pin's SHA-256.
+    Pinned { folder: &'e str, digest: [u8; 32] },
+}
+
+impl<'e> CSysroot<'e> {
+    fn folder(&self) -> &'e str {
+        match self {
+            CSysroot::Macos(sdk) => sdk.folder(),
+            CSysroot::Pinned { folder, .. } => folder,
+        }
+    }
+
+    /// The sysroot's identity bytes in the tasks' keys: the SDK's version+build key, or the
+    /// pin's SHA-256.
+    fn key(&self, alloc: Alloc<'static>) -> AVec<'static, u8> {
+        let mut out: AVec<'static, u8> = Vec::new_in(alloc);
+        match self {
+            CSysroot::Macos(sdk) => out.extend_from_slice(&sdk.identity().key()),
+            CSysroot::Pinned { digest, .. } => out.extend_from_slice(digest),
+        }
+        out
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            CSysroot::Macos(_) => "the macOS SDK",
+            CSysroot::Pinned { .. } => "the pinned glibc sysroot",
+        }
+    }
+}
+
 /// The C toolchain of one command's image, set up at the first crate that has requests.
 struct Setup {
     setting: OwnedNativeSetting<'static>,
@@ -146,8 +182,9 @@ struct Setup {
     area: AString<'static>,
     /// The shelf's digest: its folder's name.
     compiler: [u8; 32],
-    sdk_key: [u8; blaze_apple_sdk::SdkId::KEY_LEN],
+    sdk_key: AVec<'static, u8>,
     sdk_digest: [u8; 32],
+    sdk_name: &'static str,
 }
 
 /// What [`built_for`] reads beyond one crate: handed by engine_native.rs `image_for`, for the
@@ -155,7 +192,7 @@ struct Setup {
 /// compile results cross worker threads there, native_c_tasks.rs `CTasksSetting::heap`).
 pub(crate) struct CTasks<'e> {
     home: Option<&'e str>,
-    sdk: blaze_apple_sdk::Sdk<'e>,
+    sdk: CSysroot<'e>,
     fs: &'e bstd::fs::Fs,
     workers: u32,
     heap: &'static blaze_own::Heap,
@@ -164,7 +201,7 @@ pub(crate) struct CTasks<'e> {
 }
 
 impl<'e> CTasks<'e> {
-    pub(crate) fn new(home: Option<&'e str>, sdk: blaze_apple_sdk::Sdk<'e>, fs: &'e bstd::fs::Fs, workers: u32, heap: &'static blaze_own::Heap) -> CTasks<'e> {
+    pub(crate) fn new(home: Option<&'e str>, sdk: CSysroot<'e>, fs: &'e bstd::fs::Fs, workers: u32, heap: &'static blaze_own::Heap) -> CTasks<'e> {
         CTasks { home, sdk, fs, workers, heap, setup: None, dirs: PackDirs::default() }
     }
 
@@ -181,7 +218,7 @@ fn kept<'s>(scratch: &'s Frame, words: fmt::Arguments<'_>) -> &'s str {
     crate::work::held_str(bstd::mem::format_in!(scratch, "{words}").as_str(), scratch)
 }
 
-fn set_up<'w>(home: Option<&str>, sdk: blaze_apple_sdk::Sdk<'_>, alloc: Alloc<'static>, scratch: &'w Frame) -> Result<Setup, CTaskWhy<'w>> {
+fn set_up<'w>(home: Option<&str>, sdk: CSysroot<'_>, alloc: Alloc<'static>, scratch: &'w Frame) -> Result<Setup, CTaskWhy<'w>> {
     let words = |what: fmt::Arguments<'_>| CTaskWhy::Setup { words: kept(scratch, what) };
     let Some(home) = home else { return Err(words(format_args!("HOME is not set, and the shelf and the work folder are beneath it"))) };
     let setting = command_native_setting(home, sdk.folder(), WORK, crate::graph::TRIPLE, alloc).map_err(|e| words(format_args!("{e}")))?;
@@ -200,10 +237,10 @@ fn set_up<'w>(home: Option<&str>, sdk: blaze_apple_sdk::Sdk<'_>, alloc: Alloc<'s
     let real = std::fs::canonicalize(area.as_str()).map_err(|e| words(format_args!("{}: {e}", area.as_str())))?;
     let real = real.to_str().ok_or_else(|| words(format_args!("{}: its real path is not UTF-8", area.as_str())))?;
     let area = String::from_str_in(real, alloc);
-    let sdk_key = sdk.identity().key();
+    let sdk_key = sdk.key(alloc);
     let mut digest = Hasher::new("blaze-cli c tasks sdk root 1");
     digest.update(&sdk_key);
-    Ok(Setup { setting, clang, area, compiler, sdk_key, sdk_digest: digest.finish().0 })
+    Ok(Setup { setting, clang, area, compiler, sdk_key, sdk_digest: digest.finish().0, sdk_name: sdk.name() })
 }
 
 /// 64 hex digits as 32 bytes.
@@ -294,9 +331,9 @@ pub(crate) fn built_for<'s, 'm: 's>(
     demand_text.extend(demand.iter().map(|d| d.as_str()));
     let (compiler, sdk_key) = {
         let setup = c.setup(scratch)?;
-        (setup.compiler, setup.sdk_key)
+        (setup.compiler, setup.sdk_key.clone())
     };
-    let toolchain = Toolchain { kind: CompilerKind::ShelfClang, compiler, sdk: &sdk_key, target: crate::graph::TRIPLE };
+    let toolchain = Toolchain { kind: CompilerKind::ShelfClang, compiler, sdk: sdk_key.as_slice(), target: crate::graph::TRIPLE };
     // A crate with process-tree requests (`sh configure`, `make`): the host tools the table
     // grants it and the OS build, read and keyed once (native_c_tasks.rs `tree_tools`); their
     // digest is in the built key, so a changed tool is another built record (rule 21).
@@ -362,7 +399,7 @@ pub(crate) fn built_for<'s, 'm: 's>(
     let setting = CTasksSetting {
         clang: setup.clang.as_str(),
         shelf: Laid { guest: GUEST_SHELF, host: setup_shelf, digest: setup.compiler, name: "the pinned clang's shelf" },
-        sdk: Laid { guest: GUEST_SDK, host: setup.setting.sdk.as_str(), digest: setup.sdk_digest, name: "the macOS SDK" },
+        sdk: Laid { guest: GUEST_SDK, host: setup.setting.sdk.as_str(), digest: setup.sdk_digest, name: setup.sdk_name },
         work: setup.setting.work.as_str(),
         area: setup.area.as_str(),
         workers: c.workers,

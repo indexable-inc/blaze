@@ -574,9 +574,25 @@ impl<'f> Scripts<'f> {
         // the jobserver made) is opened by the one setup both this command and the census's
         // exporter call (blaze-world `script_setting::ScriptSetup`, rule 30).
         let shim = env.exe_dir.map(|dir| std::format!("{dir}/{}", blaze_build_script::fact_shim::SHIM_NAME));
-        let native_opts = match env.sdk {
-            Err(refused) => Err(said(frame, format_args!("{refused}"))),
-            Ok(sdk) => match blaze_proc_macro::native_setting::command_native_setting(home, sdk.folder(), NATIVE_WORK, host, alloc.clone()) {
+        // A host whose pin row names a pinned glibc sysroot (Linux, D69) has no Apple SDK: the
+        // sysroot folder the pin names under the home stands in for it (the setting checks its
+        // name against the pin).
+        let sdk_folder: Result<std::string::String, &'f str> = match env.sdk {
+            Ok(sdk) => Ok(sdk.folder().to_owned()),
+            Err(refused) => {
+                if host.ends_with("-linux-gnu") {
+                    match blaze_proc_macro::native_setting::pinned_sysroot_folder(home, host, alloc.clone()) {
+                        Ok(folder) => Ok(folder),
+                        Err(why) => Err(said(frame, format_args!("{refused}; and no pinned sysroot either: {why}"))),
+                    }
+                } else {
+                    Err(said(frame, format_args!("{refused}")))
+                }
+            }
+        };
+        let native_opts = match sdk_folder {
+            Err(words) => Err(words),
+            Ok(sdk_folder) => match blaze_proc_macro::native_setting::command_native_setting(home, sdk_folder.as_str(), NATIVE_WORK, host, alloc.clone()) {
                 Err(error) => Err(said(frame, format_args!("the native runner's setting (D112): {error}"))),
                 Ok(owned) => match (&shim, core::num::NonZeroU32::new(workers)) {
                     (Err(why), _) => Err(said(frame, format_args!("the native runner's fact shim (D112, N7): {why}"))),
