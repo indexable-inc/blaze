@@ -448,11 +448,11 @@ pub(crate) fn warm_toolchain(
     };
     let located = crate::run_package::Located { root: ws_dir, at: work::held_str(abs_at.as_str(), &request), member: "" };
     edge_at(cx, fs, env, net, host, out, err, phases, heap, &flags, None, Some(located), &request, |edge, phases| {
-        let Edge { root, opts, mut shown, err, frame, .. } = edge;
+        let Edge { root, opts, mut shown, err, frame, lazy_sdk, .. } = edge;
         shown.quiet = true;
         let mut check_opts = opts();
         check_opts.fresh = fresh;
-        let checked = check(cx, fs, host, rng, Some(args), net, root, check_opts, &mut shown, phases, out, err)?;
+        let checked = check_live(cx, fs, host, rng, Some(args), net, root, check_opts, &mut shown, phases, out, err, None, Some(&lazy_sdk))?;
         let tc_hex = blaze_toolchain::PINNED.hex();
         out.line(
             cx,
@@ -493,7 +493,7 @@ fn serve(
     let flags = crate::flags(args)?;
     let request = request_frame()?;
     edge(cx, fs, env, net, host, out, err, phases, heap, &flags, why, &request, |edge, phases| {
-        let Edge { root, opts, mut shown, err, caps, view, shown_root, frame, .. } = edge;
+        let Edge { root, opts, mut shown, err, caps, view, shown_root, frame, lazy_sdk, .. } = edge;
         let Some(target) = why else {
             let checked = match flags.fix {
                 None => {
@@ -508,7 +508,7 @@ fn serve(
                     let ran = crate::run_line::watched(cx, err, clock, line, |watch, bg| {
                         watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Checking));
                         let live = line.live.then_some(bg);
-                        let res = check_live(cx, fs, host, rng, Some(args), net, root, opts(), &mut shown, phases, out, err, live);
+                        let res = check_live(cx, fs, host, rng, Some(args), net, root, opts(), &mut shown, phases, out, err, live, Some(&lazy_sdk));
                         watch.see(blaze_screen::Step::Says);
                         res
                     }).map_err(CliError::RunLine)??;
@@ -524,7 +524,7 @@ fn serve(
                     if selectors.is_empty() {
                         selectors.push("all");
                     }
-                    let mut ask = |mut shown| check(cx, fs, host, rng, Some(args), net, root, opts(), &mut shown, phases, out, err).map(|checked| (checked, shown));
+                    let mut ask = |mut shown| check_live(cx, fs, host, rng, Some(args), net, root, opts(), &mut shown, phases, out, err, None, Some(&lazy_sdk)).map(|checked| (checked, shown));
                     match crate::fix_then_check::<crate::fix::Atomic, Checked>(cx, root, &selectors, (caps, view, shown_root), frame, out, &mut ask)? {
                         crate::Fixed::Refused => None,
                         crate::Fixed::Checked(checked, _) => Some(checked),
@@ -547,6 +547,42 @@ fn request_frame() -> Result<Frame, CliError> {
     Frame::with_reserve(REQUEST_FRAME, bstd::mem::Tag::Plane).map_err(|_| CliError::Text { what: "the request's frame could not be reserved (engine_check.rs `REQUEST_FRAME`)" })
 }
 
+/// Deferred macOS SDK resolution: skips `SDKSettings.json` / `SystemVersion.plist` / `sdk-answers`
+/// I/O during `open_checkout` so certificate hits, `Driver::Ready` body edits, and `blaze why` pay
+/// 0 ms for SDK probing; resolves at most once via `OnceCell` on demand when `Driver::Phases` plans
+/// build scripts or when `check_and_open` constructs `Standing` for `run`/`test`/`export`.
+pub(crate) struct LazySdk<'f> {
+    fs: &'f bstd::fs::Fs,
+    sdkroot: Option<&'f str>,
+    xcrun_env: crate::sdk::XcrunEnv<'f>,
+    frame: &'f Frame,
+    resolved: core::cell::OnceCell<Result<blaze_apple_sdk::Sdk<'f>, blaze_apple_sdk::SdkRefused<'f>>>,
+}
+
+impl<'f> LazySdk<'f> {
+    fn resolve(&self, cx: &Cx, phases: &mut Phases) -> Result<blaze_apple_sdk::Sdk<'f>, blaze_apple_sdk::SdkRefused<'f>> {
+        let mut phase_label: Option<&'static str> = None;
+        let clock = phases.clock();
+        let &sdk = self.resolved.get_or_init(|| {
+            let (sdk, how) = crate::sdk::resolve_how(
+                cx,
+                self.fs,
+                self.sdkroot,
+                &self.xcrun_env,
+                crate::sdk::SHIPPED,
+                clock,
+                self.frame,
+            );
+            phase_label = Some(how.phase());
+            sdk
+        });
+        if let Some(label) = phase_label {
+            phases.mark_cx(cx, label, self.frame);
+        }
+        sdk
+    }
+}
+
 /// The command's edge, read once (rule 75): what `check`, `why`, `run` and `test` each take of
 /// it. Handed to a continuation, since the options borrow the edge's own values (the signals
 /// guard, the origin, the printer's root).
@@ -561,6 +597,7 @@ pub(crate) struct Edge<'f> {
     pub(crate) shown_root: &'f str,
     pub(crate) frame: &'f Frame,
     pub(crate) place: Place<'f>,
+    pub(crate) lazy_sdk: LazySdk<'f>,
     pub(crate) tools: blaze_engine::Tools,
     pub(crate) workers: NonZeroU32,
     pub(crate) producers: &'f blaze_ids::producer::Producers,
@@ -659,16 +696,21 @@ fn edge_at<'l, R>(
             None => Err(crate::fetch::ExeDirWhy::NotUtf8),
         },
     };
-    let (sdk, sdk_how) = crate::sdk::resolve_how(
-        cx,
-        &fs,
-        var("SDKROOT"),
-        &crate::sdk::XcrunEnv { path: var("PATH"), developer_dir: var("DEVELOPER_DIR"), home: var("HOME"), toolchains: var("TOOLCHAINS") },
-        crate::sdk::SHIPPED,
-        phases.clock(),
+    // Defer macOS SDK probing (`SDKSettings.json` / `SystemVersion.plist` / `sdk-answers`) until a
+    // `Driver::Phases` script plan or a native `run`/`test`/`export` actually needs the SDK.
+    let lazy_sdk = LazySdk {
+        fs,
+        sdkroot: var("SDKROOT"),
+        xcrun_env: crate::sdk::XcrunEnv {
+            path: var("PATH"),
+            developer_dir: var("DEVELOPER_DIR"),
+            home: var("HOME"),
+            toolchains: var("TOOLCHAINS"),
+        },
         frame,
-    );
-    phases.mark_cx(cx, sdk_how.phase(), frame);
+        resolved: core::cell::OnceCell::new(),
+    };
+    let sdk = Err(blaze_apple_sdk::SdkRefused::Neither { xcrun: blaze_apple_sdk::XcrunFailed::NotMacos });
     // The checkout's absolute root: the one resolution of the start folder a command makes
     // (one realpath), never `PWD` (rule 75: `env -i` leaves it unset, a shell can leave it
     // stale). Every served read takes it from `place`.
@@ -754,7 +796,7 @@ fn edge_at<'l, R>(
     };
     // `requests` is `&'static` (the handlers' one board), so the guard moves into the edge.
     let edge = Edge {
-        root: &root, opts: &opts, shown, err, caps, view, shown_root: shown_root.as_str(), frame, place, tools, workers, producers: &producers, member,
+        root: &root, opts: &opts, shown, err, caps, view, shown_root: shown_root.as_str(), frame, place, lazy_sdk, tools, workers, producers: &producers, member,
         #[cfg(unix)]
         signals: asked,
     };
@@ -1048,9 +1090,9 @@ fn check_and_open<R>(
     let request = request_frame()?;
     edge(cx, fs, env, net, host, out, err, phases, heap, flags, None, &request, |edge, phases| {
         #[cfg(unix)]
-        let Edge { root, opts, mut shown, err, caps, shown_root, frame, place, workers, producers, member, signals, .. } = edge;
+        let Edge { root, opts, mut shown, err, caps, shown_root, frame, mut place, lazy_sdk, workers, producers, member, signals, .. } = edge;
         #[cfg(not(unix))]
-        let Edge { root, opts, mut shown, err, caps, shown_root, frame, place, workers, producers, member, .. } = edge;
+        let Edge { root, opts, mut shown, err, caps, shown_root, frame, mut place, lazy_sdk, workers, producers, member, .. } = edge;
         let mut fixes_applied: u32 = 0;
         let mut files_fixed: u32 = 0;
         let (require_graph, check_scope, picked, selected_packages) = match mode {
@@ -1078,7 +1120,7 @@ fn check_and_open<R>(
                     let mut first = print::Shown::new(caps, blaze_report::frame::plain::View::Agent, shown_root, frame);
                     first.quiet = true;
                     first.output_only = false;
-                    let _ = check_live(cx, fs, host, rng, args, net, root, opts(), &mut first, phases, out, err, None)?;
+                    let _ = check_live(cx, fs, host, rng, args, net, root, opts(), &mut first, phases, out, err, None, Some(&lazy_sdk))?;
                     if first.listed.iter().any(|l| l.fix.is_some())
                         && let Ok(applied) = crate::fix::apply(cx, root, &crate::fix::Atomic, &first.listed, &["all"], frame)?
                     {
@@ -1095,7 +1137,7 @@ fn check_and_open<R>(
         let mut opts = opts();
         opts.scope = check_scope;
         let toolchain = opts.toolchain;
-        let checked = check_live(cx, fs, host, rng, args, net, root, opts, &mut shown, phases, out, err, live)?;
+        let checked = check_live(cx, fs, host, rng, args, net, root, opts, &mut shown, phases, out, err, live, Some(&lazy_sdk))?;
         // The check has answered: its signals go back before the start, which takes the
         // parent's own (D103: run_loop.rs `Held::hold`; a suite's pool, test_drive.rs
         // `Signals`, once for the suite). Held into the start, the first run is refused.
@@ -1162,6 +1204,7 @@ fn check_and_open<R>(
         }
         let standing = match (pointer.as_ref(), rows.as_ref(), stored.as_ref(), graph) {
             (Some(pointer), Some(rows_ref), Some(stored_ref), Some(graph)) if refused.get().is_none() => {
+                place.sdk = lazy_sdk.resolve(cx, phases);
                 let records: &dyn crate::engine_run_answer::Records = stored_ref;
                 Some(Standing {
                     root: pointer.root.0,
@@ -1456,7 +1499,7 @@ pub(crate) fn check<'f>(
     out: &Out,
     err: &Out,
 ) -> Result<Checked, CliError> {
-    check_live(cx, fs, host, rng, args, net, root, opts, shown, phases, out, err, None)
+    check_live(cx, fs, host, rng, args, net, root, opts, shown, phases, out, err, None, None)
 }
 
 /// Extracts an [`crate::engine_answer::Unreadable`] reason when reading a lazy page or standing
@@ -1492,7 +1535,7 @@ enum StoredRecovery {
 }
 
 #[expect(clippy::too_many_arguments, reason = "the command's edge: each argument one handle of it")]
-fn check_live<'f>(
+fn check_live<'f, 's: 'f>(
     cx: &'f Cx,
     fs: &bstd::fs::Fs,
     host: &bstd::host::Host,
@@ -1506,6 +1549,7 @@ fn check_live<'f>(
     out: &Out,
     err: &Out,
     live: Option<&(dyn blaze_screen::Watch + Sync)>,
+    lazy_sdk: Option<&LazySdk<'s>>,
 ) -> Result<Checked, CliError> {
     #[cfg(test)]
     stack_probe::at("check");
@@ -1552,6 +1596,7 @@ fn check_live<'f>(
                         board_ref,
                         &mut active,
                         live,
+                        lazy_sdk,
                     )
                 }).map_err(EngineCheckError::Watcher)?
             })
@@ -1639,7 +1684,7 @@ fn made_boxed<T>(heap: &'static blaze_own::Heap, make: impl FnOnce() -> T) -> bl
 
 /// [`check`] under its board.
 #[expect(clippy::too_many_arguments, reason = "the command's edge: each argument one handle of it")]
-fn checking<'f>(
+fn checking<'f, 's: 'f>(
     cx: &'f Cx,
     fs: &bstd::fs::Fs,
     host: &bstd::host::Host,
@@ -1659,6 +1704,7 @@ fn checking<'f>(
     board: &crate::engine_status::Board<'_>,
     active: &mut Option<Phase>,
     live: Option<&(dyn blaze_screen::Watch + Sync)>,
+    lazy_sdk: Option<&LazySdk<'s>>,
 ) -> Result<BoxedChecked, CliError> {
     #[cfg(test)]
     stack_probe::at("checking");
@@ -1884,7 +1930,6 @@ fn checking<'f>(
     // The scripts' status answers start from what the last command kept, at the journal's place.
     if let Some(sweep) = script_sweep.as_mut() { sweep.prepare(cx, &mut store, answer_root.as_str(), &journal, frame)?; }
     let mut followed_kept = None;
-    let mut today_slots: std::vec::Vec<(&str, sweep::Probed), &Frame> = std::vec::Vec::new_in(frame);
     if let (Some(pointer), Some(lines)) = (&pointer, &last_lines) {
         // Only the rows the journal's changes reach are looked at; all where it says nothing.
         // Another checkout's leaves: every row looked at (its journal is not this checkout's).
@@ -1964,10 +2009,6 @@ fn checking<'f>(
     } else {
         None
     };
-    if let Some(followed) = followed_kept.as_ref() {
-        today_slots.extend(followed.now.rows.iter().filter(|leaf| leaf.kind == sweep::LeafKind::Slot).map(|leaf| (followed.now.path(leaf), (leaf.flags, leaf.stamp, leaf.id))));
-        today_slots.sort_unstable_by(|a, b| a.0.cmp(b.0));
-    }
     let last = match (last_dir, &pointer) {
         (Some(root_dir), Some(ptr)) => Some((root_dir, &ptr.headers)),
         _ => None,
@@ -1977,6 +2018,7 @@ fn checking<'f>(
     // cannot serve stops here, naming why (rule 3: the phases never run in its place). Under
     // `--driver=auto` (the default) an ineligible edit routes cleanly to the phase path.
     let changed = followed_kept.as_ref().map(|followed| crate::engine_ready_edit::changed_leaves(followed, request));
+    let has_script_leaf = changed.as_deref().is_some_and(|rows| rows.iter().any(|one| one.kind.by_script()));
     let mut chosen = crate::engine_ready_edit::choose(driver, last.as_ref().map(|(root, _)| root), base, changed.as_deref().unwrap_or(&[])).map_err(EngineCheckError::ReadyRefused)?;
     drop(changed);
     // The ready path reads no header shard (D187): the index it reads is the one its commit
@@ -2006,13 +2048,31 @@ fn checking<'f>(
         }
         _ => None,
     };
+    // When the sweep saw a moved `by_script()` leaf (e.g. a clean-to-dirty git transition),
+    // check in O(moved Given tasks) whether any `Kind::Script` reader actually wakes BEFORE
+    // running `ready_preflight`, avoiding throwing away `ready_setup` + `plan_reach` + outlining.
+    if matches!(chosen, crate::engine_ready_edit::Chosen::Wake { .. })
+        && has_script_leaf
+        && let (Some(last_stored), Some(followed)) = (stored.as_ref(), followed_kept.as_ref())
+        && crate::engine_ready_edit::wakes_script(last_stored, followed, &tools, request)?
+    {
+        let why = crate::engine_ready_edit::PhasesWhy::ScriptRead;
+        if driver == crate::engine_ready_edit::Driver::Auto {
+            chosen = crate::engine_ready_edit::Chosen::Phases(why);
+            if let (Some((root, headers)), Some(snapshot)) = (&last, &snapshot) {
+                stored = Some(open_stored(root, snapshot, headers, request));
+            }
+        } else {
+            return Err(EngineCheckError::ReadyRefused(crate::engine_ready_edit::ReadyRefused::Root(why)).into());
+        }
+    }
     let last_root = stored.as_ref().map(|source| source.root);
     let last_serial = last_root.map_or(0, |root| root.serial.0);
     if pointer.is_some() {
         phases.mark_cx(cx, "stored answer read", frame);
     }
     let read_from_last = last_root.is_some();
-    let env = place.fetch_env(phases.clock().clone(), toolchain, fs.clone(), heap);
+    let mut env = place.fetch_env(phases.clock().clone(), toolchain, fs.clone(), heap);
 
     // 1. Plan: the units stage, then the files, then the crates; on the ready path
     // ([`ready_setup`]) none of them: the graph's row and list, the outlines read back by their
@@ -2175,6 +2235,11 @@ fn checking<'f>(
         }
     }
 
+    if ready_preflight.is_none()
+        && let Some(lazy) = lazy_sdk
+    {
+        env.sdk = lazy.resolve(cx, phases);
+    }
     let start = stored.as_ref().map_or_else(|| Answer::new_in(request), |source| source.answer());
     let mut records = RecordKeys { base: stored.as_ref().map(|one| one as &dyn StoredPages), changes: SMap::new_in(request) };
     let mut setup = match ready_preflight {
@@ -2183,6 +2248,11 @@ fn checking<'f>(
             // The phase path's setup (or a ready request under a test's `ready_lays_out` plant).
             #[cfg(test)]
             stack_probe::at("checking: the setup");
+            let mut today_slots: Vec<(&str, sweep::Probed), &Frame> = Vec::new_in(frame);
+            if let Some(followed) = followed_kept.as_ref() {
+                today_slots.extend(followed.now.rows.iter().filter(|leaf| leaf.kind == sweep::LeafKind::Slot).map(|leaf| (followed.now.path(leaf), (leaf.flags, leaf.stamp, leaf.id))));
+                today_slots.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            }
             let mut planned: SVec<'_, Planned> = SVec::new_in(alloc);
             let mut rows = Rows::new_in(frame);
             // PHASE-MEM-DEBT(Units): the layout's manifests on the process heap (units.rs `lay`, `heap:
@@ -4799,46 +4869,61 @@ fn ready_setup<'f, 'h, 'a>(
         path.extend_from_slice(&sweep::real_path(slot, probed.0, cx.frame()));
         outlined.push(Outlined { name: file, path, source, outline_source, edition: want.edition, made: Ok(record) });
     }
-    // Each file whose row does not stand (an edited file) outlined on the workers, in its task's
-    // frame, as [`plan`] outlines one.
-    let scope = cx.scope();
-    scope.narrow_workers(workers, Class::Foreground);
-    let mut handles = Vec::with_capacity_in(wanted.len(), alloc);
-    for (want, known) in wanted.iter() {
-        let known = *known;
-        files.outlined += 1;
-        files.probed += u32::from(known.is_none());
-        handles.push(scope.may_overlap("outline", TASK_FRAME, move |cx: &Cx| Ok::<_, Infallible>(outline_one(cx, root, stamps, want, known, lints, alloc))));
-    }
-    let mut stopped = None;
-    for (handle, (want, known)) in handles.into_iter().zip(wanted.iter()) {
-        match handle.join(&cx).map(|one| one.map_err(|why| why.of(want))) {
-            Ok(Ok((one, probed))) => {
-                // A slot probed again (read as another kind of slot): its row is today's probe,
-                // as [`plan`] pushes it (the newest row of a path is the one kept).
-                if known.is_none() {
-                    match core::str::from_utf8(&want.slot) {
-                        Ok(slot) => {
-                            sweep::opened(slot, probed, &mut rows);
-                        }
-                        Err(_) => {
-                            stopped.get_or_insert(CliError::Text { what: "a path is not UTF-8" });
+    // Each file whose row does not stand (an edited file) outlined: inline on `cx` when there is
+    // at most one file (or one worker) to avoid spawning a pool worker and mmap/munmap'ing a
+    // 64 MiB `TASK_FRAME`, else in parallel on the workers as [`plan`] outlines them.
+    if wanted.len() <= 1 || workers.get() <= 1 {
+        for (want, known) in wanted.iter() {
+            let known = *known;
+            files.outlined += 1;
+            files.probed += u32::from(known.is_none());
+            let (one, probed) = outline_one(&cx, root, stamps, want, known, lints, alloc).map_err(|why| why.of(want))?;
+            if known.is_none() {
+                let slot = core::str::from_utf8(&want.slot).map_err(|_| CliError::Text { what: "a path is not UTF-8" })?;
+                sweep::opened(slot, probed, &mut rows);
+            }
+            outlined.push(one);
+        }
+    } else {
+        let scope = cx.scope();
+        scope.narrow_workers(workers, Class::Foreground);
+        let mut handles = Vec::with_capacity_in(wanted.len(), alloc);
+        for (want, known) in wanted.iter() {
+            let known = *known;
+            files.outlined += 1;
+            files.probed += u32::from(known.is_none());
+            handles.push(scope.may_overlap("outline", TASK_FRAME, move |cx: &Cx| Ok::<_, Infallible>(outline_one(cx, root, stamps, want, known, lints, alloc))));
+        }
+        let mut stopped = None;
+        for (handle, (want, known)) in handles.into_iter().zip(wanted.iter()) {
+            match handle.join(&cx).map(|one| one.map_err(|why| why.of(want))) {
+                Ok(Ok((one, probed))) => {
+                    // A slot probed again (read as another kind of slot): its row is today's probe,
+                    // as [`plan`] pushes it (the newest row of a path is the one kept).
+                    if known.is_none() {
+                        match core::str::from_utf8(&want.slot) {
+                            Ok(slot) => {
+                                sweep::opened(slot, probed, &mut rows);
+                            }
+                            Err(_) => {
+                                stopped.get_or_insert(CliError::Text { what: "a path is not UTF-8" });
+                            }
                         }
                     }
+                    outlined.push(one);
                 }
-                outlined.push(one);
-            }
-            Ok(Err(error)) => {
-                stopped.get_or_insert(error);
-            }
-            Err(error) => {
-                stopped.get_or_insert(CliError::Pool(error));
+                Ok(Err(error)) => {
+                    stopped.get_or_insert(error);
+                }
+                Err(error) => {
+                    stopped.get_or_insert(CliError::Pool(error));
+                }
             }
         }
-    }
-    scope.join(&cx).map_err(CliError::Pool)?;
-    if let Some(error) = stopped {
-        return Err(error);
+        scope.join(&cx).map_err(CliError::Pool)?;
+        if let Some(error) = stopped {
+            return Err(error);
+        }
     }
     outlined.sort_unstable_by(|a, b| a.name.cmp(&b.name));
     deferred.sort_unstable_by(|a, b| a.0.name.cmp(&b.0.name));
@@ -5332,9 +5417,7 @@ fn ready_drive<'d, 'f, 'r, 's, 'w, 'm>(
     // `Prepared::scope_records`): a body's scope crate past its member opened at its first
     // question, once for every run; its counts read after the join.
     let by_need = prepared.scope_records();
-    let parked = prepared.pre_open_lang_with(cx, &by_need, rq.workers, |cx| {
-        crate::engine_ready_check::walk_lints(cx, &*rq.lints, rq.root, rq.outlined, &lint_tasks, alloc)
-    })??;
+    let parked = crate::engine_ready_check::walk_lints(cx, &*rq.lints, rq.root, rq.outlined, &lint_tasks, alloc)?;
     let stages = crate::engine_ready_check::Stages { parked, runner: prepared.runner(rq.bodies.reads_paged(&stored_shelf), &by_need), decided };
     let driven = crate::engine_ready_check::drive_edit(engine, given_answers, &given_entering, rq.outlined, stages, &mut pool, alloc, heap.shared())?;
     let crate::engine_ready_check::Driven { finished, mut sunk, panicked } = driven;
@@ -6454,7 +6537,17 @@ fn plan<'h, 'm>(
                     None => {
                         files.outlined += 1;
                         files.probed += u32::from(known.is_none());
-                        handles.push(Ok(scope.may_overlap("outline", TASK_FRAME, move |cx: &Cx| Ok::<_, Infallible>(outline_one(cx, root, stamps, want, known, lints, alloc)))));
+                        if wave.len() <= 1 || workers.get() <= 1 {
+                            match outline_one(cx, root, stamps, want, known, lints, alloc).map_err(|stopped| stopped.of(want)) {
+                                Ok(pair) => handles.push(Err(Ok(pair))),
+                                Err(error) => {
+                                    stopped.get_or_insert(error);
+                                    handles.push(Err(Err(())));
+                                }
+                            }
+                        } else {
+                            handles.push(Ok(scope.may_overlap("outline", TASK_FRAME, move |cx: &Cx| Ok::<_, Infallible>(outline_one(cx, root, stamps, want, known, lints, alloc)))));
+                        }
                     }
                 }
             }

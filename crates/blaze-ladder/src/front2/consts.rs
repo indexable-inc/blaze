@@ -820,7 +820,7 @@ impl<'n> Consts<'n> {
     /// `args` is laid out from its owner's facts there.
     #[allow(clippy::too_many_arguments)]
     pub fn value_with_args<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, item: ItemKey, from: tc::PTys<'_>, args: &[tc::PTy], build: Option<super::const_at::BuildFacts<'_>>, scratch: Alloc<'_>) -> Result<&ConstRecord<Alloc<'static>>, ConstFail> {
-        let list = self.args_in_unit(item, from, args, r.store.tys.alloc(), scratch)?;
+        let list = self.args_in_unit(item, from, args, r.store.work_alloc(), scratch)?;
         let build = build.map(|b| EvalBuild { closures: b.closures, coroutines: b.coroutines.map(|coroutines| BuildCoroutines { coroutines, ground: from }) });
         self.value_at(r, prepared, item, Root::Args(list), build)
     }
@@ -840,7 +840,7 @@ impl<'n> Consts<'n> {
         // the head's anonymous constant as "no constant evaluator" in `anon_failed` for good,
         // and every later check of a body using that head refused (tempo t2115d: RawVec's
         // `new_in`, a head's `1 << 0`).
-        let list = self.args_in_unit(key, from, args, r.store.tys.alloc(), scratch)?;
+        let list = self.args_in_unit(key, from, args, r.store.work_alloc(), scratch)?;
         let build = build.map(|b| EvalBuild { closures: b.closures, coroutines: b.coroutines.map(|coroutines| BuildCoroutines { coroutines, ground: from }) });
         self.value_at(r, prepared, key, Root::Body { owner, at: root, args: list }, build)
     }
@@ -1064,7 +1064,7 @@ impl<'n> Consts<'n> {
     /// One evaluation of [`Consts::value_at`]'s root: the key of its record (kept in
     /// `self.records`), or the refusal.
     fn value_key<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, item: ItemKey, root: Root, build: Option<EvalBuild<'_>>) -> Result<RecordKey, ConstFail> {
-        let alloc = r.store.tys.alloc();
+        let alloc = r.store.work_alloc();
         // A body's constant: its owner's body checked for this evaluator once, under the
         // constant's key, before the evaluator's table is taken (a failure that names a
         // constant to evaluate first goes to `value_listed`'s work list).
@@ -1276,7 +1276,7 @@ impl<'n> Consts<'n> {
     /// `block_key` / `promoted_key`). A `root` that is not a const block, or not a borrow the
     /// check here lists as promoted, of the body as lowered here is refused by name.
     fn check_as<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, item: ItemKey, key: ItemKey, root: Option<BodyRoot>) -> Result<(), ConstFail> {
-        let capture = r.store.maps.capture_const(r.store.tys.alloc());
+        let capture = r.store.maps.capture_const(r.store.work_alloc());
         let result = self.checked_body(r, prepared, item, key, root);
         let inputs = r.store.maps.finish_capture(capture);
         let mut body = result?;
@@ -1315,7 +1315,7 @@ impl<'n> Consts<'n> {
             if start == end {
                 return;
             }
-            let mut stripped = blaze_own::Soa::new_in(r.store.tys.alloc());
+            let mut stripped = blaze_own::Soa::new_in(r.store.work_alloc());
             for (i, ((&e, &k), &t)) in checked
                 .adjusts
                 .column::<0>()
@@ -1387,7 +1387,7 @@ impl<'n> Consts<'n> {
         // written in a constant's body is laid out from the body that holds it, as a fn's is.
         // Its owner's parameters: the head's (a free constant has none and no row).
         if !checked.closures.is_empty() {
-            let alloc = r.store.tys.alloc();
+            let alloc = r.store.work_alloc();
             let generics = r.store.fns.get(&item).map_or(0, |h| h.parent + h.own);
             let tys = lowered.tys.view(&r.store.tys).expect("a body's types over the records' table it was lowered over");
             let view = lowered.typeck.view(tys);

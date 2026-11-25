@@ -248,7 +248,7 @@ impl<'n, S: NamesSource<'n>> blaze_lower::ValueNames for ModuleValues<'n, '_, S>
         }
         let (names, krate, item, owner, text) = (self.names, self.krate, self.item, self.owner, self.text);
         let planted = self.store.locals.planted();
-        let alloc = self.store.tys.alloc();
+        let alloc = self.store.work_alloc();
         let kept = &self.store.locals;
         let keys: &Keys = &*self.keys;
         let blocks = self.blocks.get_or_insert_with(|| super::glob_uses::PatternBlocks::of(names, kept, keys, krate, item, owner, text, alloc));
@@ -1289,7 +1289,7 @@ pub(crate) fn lower_body_with_text<'n, S: NamesSource<'n>>(
     let head_key = param_subst.map_or(owner, |(orig, _)| orig);
     let head = store.fns.get(&head_key).ok_or(BodyError::NoHead(head_key))?;
     let krate = names.crate_of(head.lib).ok_or(BodyError::NoText(head.lib))?;
-    let alloc = store.tys.alloc();
+    let alloc = store.work_alloc();
     let container = head.container;
     let site = Site {
         item,
@@ -1308,7 +1308,7 @@ pub(crate) fn lower_body_with_text<'n, S: NamesSource<'n>>(
     let mut body = lower_at(names, prepared, keys, store, site, into, subst_slice, parser::Extensions::RECORDS)?;
     body.expanded_text = Some(text);
     if let Some((orig, args)) = param_subst {
-        let store_alloc = store.tys.alloc();
+        let store_alloc = store.work_alloc();
         let mut kept_args = blaze_own::Vec::with_capacity_in(args.len(), store_alloc);
         kept_args.extend_from_slice(args);
         body.param_subst = Some((orig, kept_args));
@@ -1320,7 +1320,7 @@ pub(crate) fn lower_body_with_text<'n, S: NamesSource<'n>>(
     if let Some(own) = super::own_trait::of_member(store, container).map_err(|e| BodyError::NoHead(e.0))? {
         if let Err(at) = body.traits.binary_search(&own) {
             body.traits.insert(at, own);
-            body.blocks.add(own, store.tys.alloc());
+            body.blocks.add(own, store.work_alloc());
         }
     }
     Ok(body)
@@ -1343,7 +1343,7 @@ fn lower_fn_into<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys
         store.ensure(names, keys, Want::Fn(item)).map_err(|error| BodyError::Head { item, error })?;
     }
     let head = store.fns.get(&owner).ok_or(BodyError::NoHead(owner))?;
-    let alloc = store.tys.alloc();
+    let alloc = store.work_alloc();
     let site = Site {
         item, owner, krate, module, text, marks,
         params: copy_slice(&head.params, alloc),
@@ -1408,7 +1408,7 @@ fn lower_member_into<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, 
             return Err(BodyError::Record { item: head.lib, owner: key, why });
         }
     };
-    let alloc = store.tys.alloc();
+    let alloc = store.work_alloc();
     let site = Site {
         item: head.lib,
         owner: key,
@@ -1429,7 +1429,7 @@ fn lower_member_into<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, 
     if let Some(own) = super::own_trait::of_member(store, container).map_err(|e| BodyError::NoHead(e.0))? {
         if let Err(at) = body.traits.binary_search(&own) {
             body.traits.insert(at, own);
-            body.blocks.add(own, store.tys.alloc());
+            body.blocks.add(own, store.work_alloc());
         }
     }
     Ok(body)
@@ -1561,8 +1561,8 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
         Some(m) => Some(blaze_lower::mark_site::ItemMarks::of(text, m).map_err(|miss| BodyError::Record { item, owner, why: Why::Program(format!("{miss}").into_boxed_str(), Range::new(0, 0)) })?),
         None => None,
     };
-    // The store's allocator: the body, its types and its block traits are kept for the check.
-    let alloc = store.tys.alloc();
+    // The store's per-body work allocator: the body, its types and its block traits are kept for the check.
+    let alloc = store.work_alloc();
     let edition = names.edition_of(krate).ok_or(BodyError::NoText(item))?;
     let atoms = names.cfg_atoms(krate).ok_or(BodyError::NoText(item))?;
 
@@ -1811,7 +1811,10 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
 
     let in_scope = names.traits_in_scope(module, alloc).map_err(|error| BodyError::Traits { item, error })?;
     let mut traits = blaze_own::Vec::with_capacity_in(in_scope.len(), alloc);
-    traits.extend(in_scope.iter().map(|&k| checker_of(k)));
+    for &k in in_scope.iter() {
+        let _ = keys.item(k);
+        traits.push(checker_of(k));
+    }
     traits.sort_unstable();
     traits.dedup();
     // The traits a block's `use` brings into scope there (tracing's `use

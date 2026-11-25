@@ -139,7 +139,7 @@ pub(super) fn select_once<'n, S: NamesSource<'n>>(
     let spell = Spelling::fixed();
     // An empty block list (no block's `use` is in a trait's own scope); `BlockTraits::module`
     // takes an `Alloc<'static>`, which the caller's `alloc` is not: the store's is.
-    let blocks = BlockTraits::module(store.tys.alloc());
+    let blocks = BlockTraits::module(store.work_alloc());
     let self_ = SelfTy::None;
     let world = BodyWorld {
         names,

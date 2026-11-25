@@ -232,7 +232,7 @@ impl Maker for SeedMaker<'_, '_> {
 
     fn step(&mut self, _: Need, _: &mut (), _: Option<Given>) -> Step {
         let _cost = super::tables::cost::Cost::enter_want(self.store.cost, self.want);
-        let filed = self.seeds.seed(self.store, self.keys, self.want, self.store.tys.alloc());
+        let filed = self.seeds.seed(self.store, self.keys, self.want, self.store.work_alloc());
         if matches!(filed, Ok(Seeded::Filed)) && self.store.made(self.want) { Step::Made(0) } else { Step::Failed(0) }
     }
 }
@@ -245,7 +245,7 @@ pub fn ask_seed<'n>(store: &Store<'n>, keys: &Keys, seeds: &dyn HeadSeed<'n>, wa
         return Err(AskRefused { need, why: "the store meets its heads again (`AsksMet::Again`); the one ask is the `Once` path" });
     };
     let mut maker = SeedMaker { store, keys, seeds, want };
-    let mut asker: Asker<'_, Alloc<'static>, ()> = Asker::new(AskerOpts { board, me: ONE_TASK, alloc: store.tys.alloc(), most: blaze_ask::ask::MOST_DEPTH, plant: Plant::Clean });
+    let mut asker: Asker<'_, Alloc<'static>, ()> = Asker::new(AskerOpts { board, me: ONE_TASK, alloc: store.work_alloc(), most: blaze_ask::ask::MOST_DEPTH, plant: Plant::Clean });
     // One task: a publish of this store's asks wakes nobody.
     let got = asker.ask(&mut maker, need, FUEL, &mut |_| {});
     let counts: Counts = *asker.counts();

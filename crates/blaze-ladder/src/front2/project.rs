@@ -295,6 +295,32 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
         ProjectWorld { front, store, buckets: None, consts: Consts::default(), prepared, alloc, by_chain: None }
     }
 
+    /// As [`ProjectWorld::over_with_pointers`], reusing an already-populated stretch [`Store`]
+    /// (whose persistent head tables live in `HEADS_STRETCH_FRAME` and whose per-body scratch
+    /// fields have been rebound to `work` via `Store::begin_body_reuse`).
+    pub(super) fn over_with_store(
+        front: Front2<'n, S>,
+        mut store: Store<'n>,
+        prepared: Option<&'n Prepares<'n>>,
+        alloc: Alloc<'static>,
+    ) -> ProjectWorld<'n, S> {
+        let prepared = match prepared {
+            Some(prepared) => prepared,
+            None => {
+                let bump = front.frame.alloc(blaze_own::Erased::new(front.frame)).bump();
+                Prepares::new_in(bump)
+            }
+        };
+        store.prepared = Some(prepared);
+        ProjectWorld { front, store, buckets: None, consts: Consts::default(), prepared, alloc, by_chain: None }
+    }
+
+    /// Consumes this per-body world, dropping its per-body `Buckets` and `Consts` and returning
+    /// its reusable [`Store`] and [`super::keys::Keys`].
+    pub(super) fn into_store_and_keys(self) -> (Store<'n>, super::keys::Keys) {
+        (self.store, self.front.keys)
+    }
+
     /// The meter the checks file their parts in (front2 tables/cost.rs): a measurement only.
     pub fn set_cost(&mut self, cost: Option<&'n super::tables::cost::Cost<'n>>) {
         self.store.cost = cost;
@@ -317,9 +343,9 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
     }
 
     /// How the store's world meets a head it lacks (front2 asks.rs, D161 step 3's seam): under
-    /// `Once` the store's board is made now, from the store's own allocator.
+    /// `Once` the store's board is made now, from the store's per-body work allocator.
     pub fn set_asks(&mut self, met: super::asks::AsksMet) -> Result<(), blaze_core::claim_table::ClaimError> {
-        self.store.asks = super::asks::Asks::of(met, self.store.tys.alloc())?;
+        self.store.asks = super::asks::Asks::of(met, self.store.work_alloc())?;
         Ok(())
     }
 
@@ -331,13 +357,13 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
     /// Capture the definitions the task evaluates, including its local bodies and callees.
     pub fn record_const_texts(&mut self) {
         use super::tables::recorder::{Recorder, RecorderOpts};
-        self.store.maps.const_text_reads = Some(Recorder::new(RecorderOpts { alloc: self.store.tys.alloc() }));
+        self.store.maps.const_text_reads = Some(Recorder::new(RecorderOpts { alloc: self.store.work_alloc() }));
     }
 
     /// A pooled file job shares this world. Each subsequent body must receive
     /// the defining-text reads even for values the job has already computed.
     pub fn record_shared_const_texts(&mut self) {
-        let alloc = self.store.tys.alloc();
+        let alloc = self.store.work_alloc();
         self.store.maps.const_proofs.get_or_insert_with(|| super::heads::ConstProofs::new(alloc));
         self.record_const_texts();
     }
@@ -576,15 +602,15 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
                 Some(b) => Some((b, seen?)),
                 None => None,
             };
-            let rows = facts_with_buckets(list.questions(), Some(list.rows.column::<1>()), module, written.paths, written.segments, buckets, alloc)?;
+            let rows = super::reads::facts_with_buckets(list.questions(), Some(list.rows.column::<1>()), module, written.paths, written.segments, buckets, alloc)?;
             Ok(BodyReads { rows, reach: Reach::Whole })
         };
         verdict.facts = match (&checked, &asked.finished) {
             (Ok((_, filed)), _) => whole(&filed.reads),
             (Err(_), Some(list)) => whole(list),
             (Err(_), None) => match buckets {
-                Some(b) => seen.and_then(|seen| facts_with_buckets(&asked.questions, None, module, written.paths, written.segments, Some((b, seen)), alloc)),
-                None => facts_with_buckets(&asked.questions, None, module, written.paths, written.segments, None, alloc),
+                Some(b) => seen.and_then(|seen| super::reads::facts_with_buckets(&asked.questions, None, module, written.paths, written.segments, Some((b, seen)), alloc)),
+                None => super::reads::facts_with_buckets(&asked.questions, None, module, written.paths, written.segments, None, alloc),
             }
             .map(|rows| BodyReads { rows, reach: Reach::Asked }),
         };

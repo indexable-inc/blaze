@@ -79,7 +79,7 @@ pub fn exact_interiors<'n, 'a, S: NamesSource<'n>>(
     let langs = BorrowLangs::of(r.index);
     let facts = gather_facts(r, body.typeck.owner, done, langs, alloc);
     // Every fn's signature regions are its head record's, read in place (D148).
-    let reader = r.store.regions.reader(r.store.tys.alloc());
+    let reader = r.store.regions.reader(r.store.work_alloc());
     let nested = NestedFacts::new(facts.read_by(&reader, r.store.tys.view()));
     let tys = body.tys.view(&r.store.tys)?;
     let view = body.typeck.view(tys);

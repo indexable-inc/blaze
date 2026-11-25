@@ -508,7 +508,7 @@ pub(crate) fn file<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, body: &Bo
     if !r.store.hidden.wants(owner, &body.typeck.exprs, done) {
         return Ok(());
     }
-    let alloc = r.store.tys.alloc();
+    let alloc = r.store.work_alloc();
     // Only suspension liveness can refine NeedsSavedLocals. Complete witnesses
     // (including a direct await) already carry both the captures and pending
     // future. Flow uses the same binding rows and cannot refine unknown places.
@@ -695,7 +695,7 @@ fn check_defining<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, opaque: It
     // files nothing to compare.
     let checked = super::body_reads::check_body_filed_as(r, &lowered, &scope, None, None, super::stalled_goals::Stalls::Decide)
         .and_then(|(_, filed)| {
-            let scratch = r.store.tys.alloc();
+            let scratch = r.store.work_alloc();
             r.store.reads.file(lowered.typeck.owner, &filed.reads, scratch)
         });
     Ok(match checked {

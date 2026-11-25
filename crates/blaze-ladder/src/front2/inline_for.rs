@@ -657,7 +657,7 @@ fn extract_enum_variants<'n, 'a, S: NamesSource<'n>>(
     let Some(it) = r.names.text_of(lib) else {
         return Err(EnumRenderError::NoSourceText);
     };
-    let Ok(low) = super::heads::lower_alloc(r.names, lib, it.text, r.store.tys.alloc()) else {
+    let Ok(low) = super::heads::lower_alloc(r.names, lib, it.text, r.store.work_alloc()) else {
         return Err(EnumRenderError::HeadLowerFailed);
     };
     let head_view = low.view();
@@ -765,7 +765,7 @@ fn spell_enum_prefix<'n, 'a, S: NamesSource<'n>>(
                 return Some(EnumPrefix::Anchored(s));
             }
             if let Some((lib, text)) = orig_lib_text
-                && let Ok(low) = super::heads::lower_alloc(r.names, lib, text, r.store.tys.alloc())
+                && let Ok(low) = super::heads::lower_alloc(r.names, lib, text, r.store.work_alloc())
             {
                 let head_view = low.view();
                 if let Ok(spell) = Spelling::of(&head_view)
@@ -947,7 +947,7 @@ fn extract_fields<'n, 'a, S: NamesSource<'n>>(
                     let Some(it) = r.names.text_of(lib) else {
                         return IterKind::NotIterable("named struct has no source text");
                     };
-                    let Ok(low) = super::heads::lower_alloc(r.names, lib, it.text, r.store.tys.alloc()) else {
+                    let Ok(low) = super::heads::lower_alloc(r.names, lib, it.text, r.store.work_alloc()) else {
                         return IterKind::NotIterable("named struct head did not lower");
                     };
                     let head_view = low.view();
@@ -1703,11 +1703,12 @@ pub fn expand_concrete_body<'n, S: NamesSource<'n>>(
     prepared: &Prepares<'n>,
     body: &mut Body<'n>,
 ) -> Result<(), CheckFail> {
-    let alloc = r.store.tys.alloc();
+    let alloc = r.store.work_alloc();
     for round in 0..MAX_UNROLL_ROUNDS {
         if body.typeck.inline_fors.is_empty() {
             break;
         }
+        r.store.inline_for_ran = true;
         let probe = {
             let view = body.lowered.view();
             let spell = Spelling::of(&view).map_err(|_| CheckFail::InlineFor {
@@ -2146,7 +2147,7 @@ fn check_for_fields_generic_bodies<'n, S: NamesSource<'n>>(
     probe: &Checked<'static>,
     top_sites: &[(InlineForSite, usize, usize)],
 ) -> Result<(), CheckFail> {
-    let alloc = r.store.tys.alloc();
+    let alloc = r.store.work_alloc();
     let owner = body.owner;
     let mut ff_clauses: AVec<'_, (PTy, ItemKey, List)> = OwnVec::new_in(alloc);
     let mut sized_for_container: AVec<'_, (PTy, ItemKey)> = OwnVec::new_in(alloc);
@@ -2483,7 +2484,7 @@ fn check_enum_generic_bodies<'n, S: NamesSource<'n>>(
     probe: &Checked<'static>,
     top_sites: &[(InlineForSite, usize, usize)],
 ) -> Result<(), CheckFail> {
-    let alloc = r.store.tys.alloc();
+    let alloc = r.store.work_alloc();
     let owner = body.owner;
     let enum_trait = super::langs::find(r.index, crate::resolve::Paths { names: r.names }, tc::LangItem::Enum)
         .ok()
@@ -2821,6 +2822,7 @@ fn install_spec_head<'n, S: NamesSource<'n>>(
     concrete_args: &[PTy],
     override_text: Option<&'n str>,
 ) -> Result<blaze_id::ItemKey, CheckFail> {
+    r.store.inline_for_ran = true;
     let alloc = r.store.tys.alloc();
     if override_text.is_none() && r.store.fns.contains_key(&spec_key) {
         let lib = r
@@ -2950,7 +2952,7 @@ fn specialize_one_imported<'n, S: NamesSource<'n>>(
     orig_key: ItemKey,
     args_copy: OwnVec<PTy, Alloc<'static>>,
 ) -> Result<SpecializedBody<'n>, CheckFail> {
-    let alloc = r.store.tys.alloc();
+    let alloc = r.store.work_alloc();
     let spec_key = synth_spec_key(orig_key, &args_copy, r.store.tys.view(), alloc);
     let lib = install_spec_head(r, orig_key, spec_key, &args_copy, None)?;
     let orig_text = r
@@ -3007,7 +3009,8 @@ pub fn specialize_one_generic_inline_for<'n, S: NamesSource<'n>>(
     if ground_args.is_empty() {
         return Ok(None);
     }
-    let alloc = r.store.tys.alloc();
+    r.store.inline_for_ran = true;
+    let alloc = r.store.work_alloc();
     let mut args_copy: OwnVec<PTy, Alloc<'static>> = OwnVec::with_capacity_in(ground_args.len(), alloc);
     for &raw in ground_args {
         let Some(copied) = copy_ty_into(ground_tys, raw, &mut r.store.tys, None, alloc) else {
@@ -3031,7 +3034,7 @@ pub fn specialize_generic_inline_fors<'n>(
     main_checked: &[Option<Checked<'static>>],
     census: &mut Census<'n>,
 ) -> Result<OwnVec<SpecializedBody<'n>, Alloc<'static>>, CheckFail> {
-    let alloc = r.store.tys.alloc();
+    let alloc = r.store.work_alloc();
     let mut generic_inline: HashMap<ItemKey, (), Alloc<'static>> = HashMap::new_in(alloc);
     for m in mains.iter() {
         if !m.typeck.inline_fors.is_empty() {
