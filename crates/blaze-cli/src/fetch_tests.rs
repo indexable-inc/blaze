@@ -922,4 +922,17 @@ fn dir_reserve_crash_faults_and_interleaving_dst() {
         dir.read_all(&after_cx, &target, &mut read).expect("durable record survives crash");
         assert_eq!(read.as_slice(), p.as_slice());
     }
+
+    // Delayed-completion stop check: when `poll_fuel == 0` prevents an in-flight `MapWrite` from
+    // settling under latency, `Dir::reserve` returns `FsKind::Stopped` without issuing a racing
+    // `Effect::Remove`.
+    {
+        let mut world = SimWorld::new(99, Limits { poll_fuel: 0, ..Limits::USUAL });
+        world.faults = Faults { max_latency: core::time::Duration::from_millis(10), ..Faults::default() };
+        let io = Io::simulated(world);
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("root cx");
+        let dir = io.need_fs().expect("fs").root().subdir(&Path::new("sources").expect("dir"));
+        let res: Result<Result<(), &str>, _> = dir.reserve(&cx, &Path::new("stalled").expect("key"), 4096, |_| Ok(0));
+        assert!(matches!(res, Err(err) if err.stopped().is_some()), "unsettled stop returns Stopped");
+    }
 }

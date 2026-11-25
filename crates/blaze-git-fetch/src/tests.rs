@@ -1130,6 +1130,78 @@ fn v1_pack_index_parses_searches_and_reads_objects() {
         }
     }
 
+    // Delta base and intermediates charged during delta resolution are recorded in `charged_oids`
+    // so subsequently reading the base directly does not double-charge it.
+    {
+        let base_bytes = b"0123456789abcdef0123456789abcdef";
+        let derived_bytes = b"0123456789abcdef0123456789abcdef_ext";
+        let base_oid = Oid::of(Kind::Blob, base_bytes);
+        let derived_oid = Oid::of(Kind::Blob, derived_bytes);
+        // Delta stream: base len (32), result len (36), copy 32 bytes from offset 0, insert "_ext".
+        let delta_stream = [32u8, 36u8, 0x80 | 0x10, 32u8, 4u8, b'_', b'e', b'x', b't'];
+        let mut dpack = StdVec::new();
+        dpack.extend_from_slice(b"PACK");
+        dpack.extend_from_slice(&2u32.to_be_bytes());
+        dpack.extend_from_slice(&2u32.to_be_bytes());
+        let base_off = dpack.len() as u32;
+        {
+            let mut size = base_bytes.len() as u64;
+            let mut b = (3u8 << 4) | (size & 0x0f) as u8;
+            size >>= 4;
+            while size > 0 {
+                dpack.push(b | 0x80);
+                b = (size & 0x7f) as u8;
+                size >>= 7;
+            }
+            dpack.push(b);
+            let mut zb = Vec::new_in(heap());
+            blaze_deflate::zlib(base_bytes, blaze_deflate::Level::Fast, heap(), &mut zb).expect("zlib");
+            dpack.extend_from_slice(zb.as_slice());
+        }
+        let delta_off = dpack.len() as u32;
+        // Type 6 = OFS_DELTA, inflated size = delta_stream.len() (9).
+        dpack.push((6u8 << 4) | (delta_stream.len() as u8));
+        // Encoded positive offset back = delta_off - base_off (< 128 -> single byte).
+        let back = delta_off - base_off;
+        assert!(back < 128);
+        dpack.push(back as u8);
+        let mut zdelta = Vec::new_in(heap());
+        blaze_deflate::zlib(delta_stream.as_slice(), blaze_deflate::Level::Fast, heap(), &mut zdelta).expect("zlib");
+        dpack.extend_from_slice(zdelta.as_slice());
+        let dpack_sha = crate::sha1::sha1(&dpack);
+        dpack.extend_from_slice(&dpack_sha);
+
+        let mut ditems = vec![(base_oid, base_off), (derived_oid, delta_off)];
+        ditems.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+        let mut didx = StdVec::new();
+        for first in 0..=255u8 {
+            let c = ditems.iter().filter(|(o, _)| o.0[0] <= first).count() as u32;
+            didx.extend_from_slice(&c.to_be_bytes());
+        }
+        for (o, off) in &ditems {
+            didx.extend_from_slice(&off.to_be_bytes());
+            didx.extend_from_slice(&o.0);
+        }
+        didx.extend_from_slice(&dpack_sha);
+        let didx_sha = crate::sha1::sha1(&didx);
+        didx.extend_from_slice(&didx_sha);
+
+        let tight = crate::PackLimits {
+            most_objects: 2,
+            most_object: 1024,
+            most_total: (base_bytes.len() + derived_bytes.len()) as u64,
+            most_depth: 8,
+            most_cache: 0,
+        };
+        let mut ddb = ObjectDb::new(&[(&didx, dpack.len() as u64)], tight, heap()).expect("delta odb");
+        let mut dsrc = MemPack(&dpack);
+        // Read delta FIRST (charges base + derived), then base directly (must NOT double-charge base).
+        assert_eq!(ddb.read_object(&derived_oid, &mut dsrc, &mut out), Ok(Some(Kind::Blob)));
+        assert_eq!(out.as_slice(), derived_bytes);
+        assert_eq!(ddb.read_object(&base_oid, &mut dsrc, &mut out), Ok(Some(Kind::Blob)));
+        assert_eq!(out.as_slice(), base_bytes);
+    }
+
     // Flipping a bit in a v1 .idx OID table is caught by ObjectDb::new via trailer SHA-1 verification.
     let mut flipped_v1 = idx.clone();
     flipped_v1[1024 + 4] ^= 0x01;

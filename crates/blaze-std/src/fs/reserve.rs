@@ -36,15 +36,28 @@ fn reserve_error(key: &FileName, err: ReserveError) -> FsError {
     }
 }
 
+#[derive(Debug)]
+enum SubmitStop {
+    /// `cx` stopped before submitting, or the in-flight effect settled conclusively before
+    /// returning, so it is safe to run cleanup (`Effect::Remove`).
+    Settled(FsError),
+    /// The in-flight effect did not settle within [`TEARDOWN_WAIT`] / `poll_fuel` and was
+    /// forgotten; it may still complete in the driver, so callers MUST NOT race it with
+    /// `Effect::Remove`.
+    Unsettled(FsError),
+}
+
 /// Submits one reservation effect and waits under `cx`; if `cx` stops (cancel, deadline, stall)
-/// while the effect is in flight, settles that effect on `io` before returning so no `MapWrite`,
-/// `Truncate`, `Sync`, or `Rename` lands concurrently with teardown cleanup.
-fn submit_and_settle(io: &Io, cx: &Cx, key: &FileName, effect: Effect) -> Result<Done, FsError> {
+/// while the effect is in flight, settles that effect on `io` before returning. Distinguishes a
+/// settled stop (safe to remove the scratch file) from an unsettled stop (must not race cleanup
+/// against an in-flight effect).
+fn submit_and_settle(io: &Io, cx: &Cx, key: &FileName, effect: Effect) -> Result<Done, SubmitStop> {
     if matches!(effect, Effect::Sync { .. }) && io.plant() == super::Plant::SyncSkipped {
         return Ok(Done::Synced);
     }
     let began = io.now();
-    cx.stopped_by(began).map_err(|s| FsError::new(FsOp::Publish, key, FsKind::Stopped(s)))?;
+    cx.stopped_by(began)
+        .map_err(|s| SubmitStop::Settled(FsError::new(FsOp::Publish, key, FsKind::Stopped(s))))?;
     let tag = io.submit(|tag| retag(effect, tag));
     let deadline = cx.deadline();
     let mut idle = 0;
@@ -62,10 +75,12 @@ fn submit_and_settle(io: &Io, cx: &Cx, key: &FileName, effect: Effect) -> Result
             None
         };
         if let Some(stopped) = stopped {
+            let err = FsError::new(FsOp::Publish, key, FsKind::Stopped(stopped));
             let until = Deadline::after(io.now(), TEARDOWN_WAIT);
-            // Settle the in-flight effect (dropping any `MappingWrite` it produces) before cleanup.
-            let _ = io.settle(tag, until, "bstd::fs::Dir::reserve settle");
-            return Err(FsError::new(FsOp::Publish, key, FsKind::Stopped(stopped)));
+            return match io.settle(tag, until, "bstd::fs::Dir::reserve settle") {
+                Ok(_done) => Err(SubmitStop::Settled(err)),
+                Err(_) => Err(SubmitStop::Unsettled(err)),
+            };
         }
         match io.take_or_poll(tag, deadline) {
             Ok(done) => return Ok(done),
@@ -157,8 +172,12 @@ impl Dir<ReadWrite> {
         let mut write_fn = Some(write);
         let mut done = match submit_and_settle(&self.io, cx, &key, first) {
             Ok(done) => done,
-            Err(error) => {
+            Err(SubmitStop::Settled(error)) => {
                 let _ = guard.abandon_now();
+                return Err(error);
+            }
+            Err(SubmitStop::Unsettled(error)) => {
+                guard.active = false;
                 return Err(error);
             }
         };
@@ -194,8 +213,12 @@ impl Dir<ReadWrite> {
                             };
                             done = match submit_and_settle(&self.io, cx, &key, effect) {
                                 Ok(done) => done,
-                                Err(error) => {
+                                Err(SubmitStop::Settled(error)) => {
                                     let _ = guard.abandon_now();
+                                    return Err(error);
+                                }
+                                Err(SubmitStop::Unsettled(error)) => {
+                                    guard.active = false;
                                     return Err(error);
                                 }
                             };
@@ -209,8 +232,12 @@ impl Dir<ReadWrite> {
                 Ok(Next::Ask(effect)) => {
                     done = match submit_and_settle(&self.io, cx, &key, effect) {
                         Ok(done) => done,
-                        Err(error) => {
+                        Err(SubmitStop::Settled(error)) => {
                             let _ = guard.abandon_now();
+                            return Err(error);
+                        }
+                        Err(SubmitStop::Unsettled(error)) => {
+                            guard.active = false;
                             return Err(error);
                         }
                     };
@@ -646,7 +673,7 @@ mod tests {
         let inflight_target = Path::new("inflight").map_err(|e| format!("{e}"))?;
         let inflight_key = dir.beneath(&inflight_target);
         let (mut inflight, first) = Reserve::new(inflight_key.share(), 4096, Tag(777));
-        let done = submit_and_settle(&io, &cx, &inflight_key, first).map_err(|e| format!("inflight map: {e}"))?;
+        let done = submit_and_settle(&io, &cx, &inflight_key, first).map_err(|e| format!("inflight map: {e:?}"))?;
         let mapping = match inflight.answer(done) {
             Ok(Next::Write(mut m)) => {
                 m.bytes_mut()[..12].copy_from_slice(b"half-written");
@@ -655,12 +682,12 @@ mod tests {
             other => return Err(format!("expected Next::Write, got {other:?}")),
         };
         let trunc = inflight.finish(mapping, 12).map_err(|e| format!("inflight finish: {e}"))?;
-        let done = submit_and_settle(&io, &cx, &inflight_key, trunc).map_err(|e| format!("inflight trunc: {e}"))?;
+        let done = submit_and_settle(&io, &cx, &inflight_key, trunc).map_err(|e| format!("inflight trunc: {e:?}"))?;
         let sync_eff = match inflight.answer(done) {
             Ok(Next::Ask(eff)) => eff,
             other => return Err(format!("expected Sync ask, got {other:?}")),
         };
-        let done = submit_and_settle(&io, &cx, &inflight_key, sync_eff).map_err(|e| format!("inflight sync: {e}"))?;
+        let done = submit_and_settle(&io, &cx, &inflight_key, sync_eff).map_err(|e| format!("inflight sync: {e:?}"))?;
         match inflight.answer(done) {
             Ok(Next::Ask(Effect::Rename { .. })) => {} // Drop before submitting Rename: simulate SIGKILL!
             other => return Err(format!("expected Rename ask, got {other:?}")),

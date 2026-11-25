@@ -70,9 +70,14 @@ pub(crate) fn sources_dir(cx: &Cx, env: &FetchEnv<'_>) -> Result<Dir<ReadWrite>,
         bstd::fs::HomeWhy::Fs(error) => CliError::Fs(error),
         _ => CliError::Text { what: "HOME could not be opened for the sources store (fetch.rs `SOURCES`): not absolute, with `.` or `..`, or no second tree" },
     })?;
+    let simulated = cx.is_simulated();
     dir.sweep_parts(cx, |_name, tag| {
         let pid = u32::try_from(tag >> 32).unwrap_or(0);
-        pid == 0 || crate::gc::PidProbe::probe(&crate::gc::OsPidProbe, pid) == crate::gc::PidState::Dead
+        if simulated {
+            pid == 0
+        } else {
+            pid > 0 && crate::gc::PidProbe::probe(&crate::gc::OsPidProbe, pid) == crate::gc::PidState::Dead
+        }
     })?;
     Ok(dir)
 }
@@ -673,12 +678,18 @@ fn load_git_folder_odb(
                     failed = true;
                     break;
                 }
+                let actual_len = u64::try_from(raw.len()).unwrap_or(u64::MAX);
+                let actual_total = folder_idx_bytes.saturating_add(actual_len);
+                if actual_len > MOST_GIT_IDX_BYTES || actual_total > MOST_GIT_IDX_TOTAL_BYTES {
+                    failed = true;
+                    break;
+                }
                 let mut idx_bytes = blaze_own::Vec::new_in(global);
                 idx_bytes
                     .try_extend_from_slice(raw.as_slice())
                     .map_err(|_| CliError::Text { what: "a cargo git pack .idx could not be allocated" })?;
                 folder_packs = folder_packs.saturating_add(1);
-                folder_idx_bytes = next_idx_bytes;
+                folder_idx_bytes = actual_total;
                 packs
                     .try_push(GitPackEntry { pack_path, idx_bytes, pack_len })
                     .map_err(|_| CliError::Text { what: "a cargo git pack entry could not be allocated" })?;
@@ -691,6 +702,7 @@ fn load_git_folder_odb(
         }
         // No `objects/pack` directory yet: loose objects under `objects/` may still hold the commit.
         Ok(None) => Ok(GitDbOdb::Ready { packs: blaze_own::Vec::new_in(global) }),
+        Err(error) if error.stopped().is_some() => Err(CliError::Fs(error)),
         Err(_) => Ok(GitDbOdb::Unreadable),
     }
 }
@@ -717,6 +729,7 @@ impl LookedGit {
         let entries = match git.entries_confined(cx, &Path::new(CARGO_DB_IN_GIT)?) {
             Ok(Some(entries)) => entries,
             Ok(None) => return Ok(LookedGit::Closed { shown, miss: ClosedMiss::Absent }),
+            Err(error) if error.stopped().is_some() => return Err(CliError::Fs(error)),
             Err(error) => {
                 said(&mut shown, &error)?;
                 return Ok(LookedGit::Closed { shown, miss: ClosedMiss::Unreadable });
@@ -1095,7 +1108,7 @@ mod net {
 
     use core::net::{Ipv4Addr, SocketAddr};
     use std::collections::HashMap;
-    use std::time::Duration;
+    use std::{process, time::Duration};
 
     use blaze_core::reserve::{Next, Reserve, Step as Reserving};
     use blaze_core::{Done, FileName, Tag};
@@ -1482,7 +1495,8 @@ mod net {
                 _ = write(&body, Err(StoreFailure::Io));
                 return Reserved::Abandoned;
             };
-            let (mut reserve, first) = Reserve::new(name, room, Tag(u64::from(unit)));
+            let tag = Tag((u64::from(process::id()) << 32) | u64::from(unit));
+            let (mut reserve, first) = Reserve::new(name, room, tag);
             let mut done = ask_disk(disk, first);
             loop {
                 let Some(answer) = done else {
