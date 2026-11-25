@@ -615,6 +615,9 @@ fn lay_package<'s>(cx: &Cx, c: &mut CTasks<'_>, list: &CrateList<'_>, r: usize, 
     let prefix = if dir.is_empty() { None } else { Some(dir) };
     let mut laid = 0u32;
     for entry in view.entries() {
+        if entry.mode == blaze_fetch::Mode::Submodule {
+            continue;
+        }
         let rest = match prefix {
             None => entry.path,
             Some(dir) => match entry.path.strip_prefix(dir).and_then(|rest| rest.strip_prefix('/')) {

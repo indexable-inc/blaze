@@ -5,23 +5,24 @@
 //! is text, and lists each file by its BLAKE3 instead of inlining it, so each file is an object
 //! of its own in the store and two trees share the files they share.
 //!
-//! The encoding, `blaze tree 2`:
+//! The encoding, `blaze tree 3`:
 //!
 //! ```text
-//! blaze tree 2\n
+//! blaze tree 3\n
 //! <kind> <blake3 hex of the bytes> <length> <path>\n   one line a file, sorted by the path's bytes
 //! ```
 //!
 //! `length` is the file's length in decimal, with no leading zero: with it a lookup knows
 //! how large each file is without reading any file.
 //!
-//! `kind` is `file`, `exec` (a file with any executable bit) or `link` (a symlink, its bytes
-//! where it points). A path is `/`-separated UTF-8 with no empty, `.`, `..` or `.git` part and
+//! `kind` is `file`, `exec` (a file with any executable bit), `link` (a symlink, its bytes
+//! where it points) or `submodule` (a gitlink `0o160000`, its bytes its 20-byte pinned commit
+//! SHA-1). A path is `/`-separated UTF-8 with no empty, `.`, `..` or `.git` part and
 //! no newline; directories are not listed (an empty one is not in the tree), and no path is
 //! twice or both a file and a directory, compared without regard to ASCII case, so that no
 //! listing written out on a case-insensitive file system (APFS, NTFS) puts a file under
 //! another file or a symlink. [`parse`] refuses all of it as [`listing`] does. A change to any
-//! of this is `blaze tree 3`.
+//! of this is `blaze tree 4`.
 
 use alloc::{borrow::ToOwned, string::String, vec::Vec};
 use core::{fmt, fmt::Write as _};
@@ -31,7 +32,7 @@ use crate::digest::Blake3;
 /// The listing format's name and version, its first line. Every index record's key covers it
 /// (a pin names the format it was made in): a step's output under a new format is a new record, never a
 /// second value under the old one's key.
-pub(crate) const HEADER: &str = "blaze tree 2\n";
+pub(crate) const HEADER: &str = "blaze tree 3\n";
 
 /// What a listed path is.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]

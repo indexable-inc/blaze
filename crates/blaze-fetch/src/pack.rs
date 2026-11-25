@@ -2,14 +2,14 @@
 //! place ([`PackView`]). Little-endian:
 //!
 //! ```text
-//! 0..8     b"BLZFPK04"
+//! 0..8     b"BLZFPK05"
 //! 8        kind: 1 a registry crate, 2 a git commit, 3 a tree of blaze's toolchain
 //! 9..12    zero
 //! 12..16   files n
 //! 16..24   bytes of paths
 //! 24..32   bytes of stored data
 //! 32..64   the source's digest: the `.crate`'s SHA-256, or the commit id and 12 zeros
-//! 64..96   the BLAKE3 of the files' `blaze tree 2` listing (crate::tree): the tree's pin
+//! 64..96   the BLAKE3 of the files' `blaze tree 3` listing (crate::tree): the tree's pin
 //! 96..     the stored data, each file's bytes (raw or RFC 8878 Zstandard) in archive order
 //! then     the paths (uncompressed UTF-8)
 //! then     n rows of 64: path offset u32, path length u16, kind u8, codec u8,
@@ -46,7 +46,7 @@ use crate::digest::Blake3;
 pub use crate::tree::Kind as Mode;
 use crate::tree::{self, TreeRefused};
 
-pub const MAGIC: &[u8; 8] = b"BLZFPK04";
+pub const MAGIC: &[u8; 8] = b"BLZFPK05";
 pub const HEADER: usize = 96;
 pub const ROW: usize = 64;
 pub const FOOTER: usize = 32;

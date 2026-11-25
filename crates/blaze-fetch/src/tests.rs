@@ -81,14 +81,19 @@ fn a_listing_is_sorted_and_refuses_escapes() {
     // A listing no `listing` writes is refused on read, the same rules over it.
     let hex = Blake3::of(b"x").hex();
     for bad in [
-        format!("blaze tree 2\nlink {hex} 1 A\nfile {hex} 1 a/b\n"),
-        format!("blaze tree 2\nfile {hex} 1 README\nfile {hex} 1 Readme\n"),
-        format!("blaze tree 2\nfile {hex} 01 a\n"),
-        format!("blaze tree 2\nfile {hex} a\n"),
+        format!("blaze tree 2\nfile {hex} 1 a\n"),
+        format!("blaze tree 3\nlink {hex} 1 A\nfile {hex} 1 a/b\n"),
+        format!("blaze tree 3\nfile {hex} 1 README\nfile {hex} 1 Readme\n"),
+        format!("blaze tree 3\nfile {hex} 01 a\n"),
+        format!("blaze tree 3\nfile {hex} a\n"),
     ] {
         assert!(tree::parse(bad.as_bytes()).is_err(), "{bad:?}");
     }
-    assert_eq!(tree::parse(format!("blaze tree 2\nfile {hex} 1 a b\n").as_bytes()).unwrap()[0].path, "a b");
+    assert_eq!(tree::parse(format!("blaze tree 3\nfile {hex} 1 a b\n").as_bytes()).unwrap()[0].path, "a b");
+    let sub_parsed = tree::parse(format!("blaze tree 3\nsubmodule {hex} 20 third_party/v8\n").as_bytes()).unwrap();
+    assert_eq!(sub_parsed.len(), 1);
+    assert_eq!(sub_parsed[0].kind, Kind::Submodule);
+    assert_eq!(sub_parsed[0].path, "third_party/v8");
 }
 
 #[test]
@@ -105,8 +110,8 @@ fn previous_magic_is_refused() {
     b.file("src/lib.rs", crate::Mode::File, b"pub fn hi() {}\n").expect("add file");
     let mut record = b.finish().expect("finish");
     assert_eq!(&record.as_slice()[..8], crate::pack::MAGIC);
-    // Rewriting header magic to previous BLZFPK03 (with valid BLAKE3 footer) must be refused.
-    record.as_mut_slice()[..8].copy_from_slice(b"BLZFPK03");
+    // Rewriting header magic to previous BLZFPK04 (with valid BLAKE3 footer) must be refused.
+    record.as_mut_slice()[..8].copy_from_slice(b"BLZFPK04");
     let body_len = record.len() - crate::pack::FOOTER;
     let new_digest = Blake3::of(&record.as_slice()[..body_len]).0;
     record.as_mut_slice()[body_len..].copy_from_slice(&new_digest);

@@ -768,6 +768,9 @@ fn tree_of(files: &Files<'_>, checkout: crate::engine_script_reads::Served<'_>, 
             let mut decoded: blaze_own::Vec<(&str, blaze_fetch::FileBytes<'_, &bstd::mem::Frame>), &bstd::mem::Frame> =
                 blaze_own::Vec::with_capacity_in(view.len(), &frame);
             for entry in view.entries() {
+                if entry.mode == blaze_fetch::Mode::Submodule {
+                    continue;
+                }
                 let bytes = entry.read_in(&frame).map_err(|why| {
                     failed("a build script's pack entry failed to decode", format_args!("the build script of {package}: {}: {}", entry.path, blaze_text::Shown(&why)), false)
                 })?;
