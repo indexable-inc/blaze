@@ -2248,8 +2248,10 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
     // ---- The value ----
 
     /// The root's `_0` and every allocation it reaches, as a data record: allocation 0 is the
-    /// value. A pointer into a local's storage (other than the value's own) dangles once the
-    /// constant is evaluated, and is refused.
+    /// value. A pointer into a dead allocation (such as a scoped local whose storage ended or a
+    /// callee's frame) dangles once the constant is evaluated, and is refused; a live unscoped
+    /// local of the root constant body (such as a promoted borrow inside a constant initializer)
+    /// is interned alongside the root value.
     fn intern(&mut self, root: AllocId) -> R<'a, DataRecord<Alloc<'a>>> {
         let mut order: Vec<AllocId, Alloc<'a>> = Vec::new_in(self.alloc);
         order.push(root);
@@ -2265,12 +2267,13 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
             self.mem.zero_unwritten(id, &mut bytes);
             let mut relocs: alloc::vec::Vec<DataReloc, Alloc<'a>> = alloc::vec::Vec::new_in(self.alloc);
             for &(offset, to) in self.mem.relocs(id)? {
-                let target = match self.mem.get(to)?.origin {
+                let target_alloc = self.mem.get(to)?;
+                let target = match target_alloc.origin {
                     Origin::Static(s) => DataTarget::Static(s),
                     Origin::Fn(i) => DataTarget::Fn(i),
                     Origin::Vtable(v) => DataTarget::Vtable(v),
-                    Origin::Local if to != root => return Err(Refusal::Dangling.into()),
-                    _ => {
+                    Origin::Data | Origin::Local => {
+                        let _ = self.mem.bytes(to)?;
                         let n = match order.iter().position(|&x| x == to) {
                             Some(n) => n,
                             None => {

@@ -550,3 +550,46 @@ bb4:
     assert!(!printed.contains("drop _3[_4]"), "u32 Index drop must be removed:\n{printed}");
     assert!(printed.contains("drop _5[0 of 2]"), "droppable ConstIndex drop must stay:\n{printed}");
 }
+
+#[test]
+fn enum_partial_drop_switches_on_discriminant() {
+    use crate::VariantDrop;
+    let v0_fields = [Part { path: &[Field { index: 0, ty: PTy(2) }], state: PartState::Init }];
+    let v1_fields = [
+        Part { path: &[Field { index: 0, ty: PTy(2) }], state: PartState::Maybe },
+        Part { path: &[Field { index: 1, ty: PTy(2) }], state: PartState::Init },
+    ];
+    let variants = [
+        VariantDrop { discr: 0, variant: 0, parts: &v0_fields },
+        VariantDrop { discr: 1, variant: 1, parts: &v1_fields },
+    ];
+    struct EnumFacts<'a>(&'a [VariantDrop<'a>]);
+    impl<'a> DropFacts for EnumFacts<'a> {
+        fn at(&self, _: Stmt) -> DropState<'_> {
+            DropState::Enum { discr_ty: PTy(4), variants: self.0 }
+        }
+        fn needs_drop(&self, ty: PTy) -> NeedsDrop {
+            if ty == PTy(4) || ty == PTy(0) || ty == PTy(1) { NeedsDrop::No } else { NeedsDrop::Yes }
+        }
+        fn bool_ty(&self) -> PTy {
+            PTy(1)
+        }
+    }
+    let text = "\
+local _0: t0 return
+local _1: t3 arg 0
+bb0:
+  drop _1 then bb1 unwind continue
+bb1:
+  return
+";
+    let out = try_run(text, &EnumFacts(&variants), Plant::None).unwrap();
+    verify(&out).expect("enum partial drop body verifies");
+    let printed = print(&out);
+    assert!(printed.contains("discr _1"), "expected discriminant read:\n{printed}");
+    assert!(printed.contains("switch"), "expected discriminant switch:\n{printed}");
+    assert!(printed.contains("_1#0.0:t2"), "expected variant 0 field 0 drop:\n{printed}");
+    assert!(printed.contains("_1#1.0:t2"), "expected variant 1 field 0 drop:\n{printed}");
+    assert!(printed.contains("_1#1.1:t2"), "expected variant 1 field 1 drop:\n{printed}");
+    assert!(printed.contains("cleanup:"), "expected unwind cleanup ladder:\n{printed}");
+}

@@ -375,6 +375,15 @@ impl<A: Allocator + Copy> BodyBuilder<A> {
         &self.body
     }
 
+    /// Copies the overlay type columns (`ty_base`, `list_base`, `tys`, `ty_lists`) from `from`
+    /// so a body-to-body pass (such as drop elaboration) preserves every overlay type handle.
+    pub fn copy_overlay(&mut self, from: &crate::body::BodyRef<'_>) {
+        self.body.ty_base = from.ty_base;
+        self.body.list_base = from.list_base;
+        self.body.tys.extend_from_slice(from.tys);
+        self.body.ty_lists.extend_from_slice(from.ty_lists);
+    }
+
     /// A new local; its own place is made with it. Locals come in order: the return place,
     /// then the arguments (`Arg(0)`, `Arg(1)`, ..), then bindings, temporaries and flags.
     pub fn new_local(&mut self, decl: LocalDecl) -> Local {

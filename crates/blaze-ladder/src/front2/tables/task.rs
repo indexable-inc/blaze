@@ -1609,11 +1609,21 @@ pub struct KeepValues<'v> {
     pub chars: &'v [(blaze_typeck::ExprId, u32)],
     pub strs: &'v [(blaze_typeck::ExprId, &'v [u8])],
     pub int_pats: &'v [(blaze_typeck::PatId, u128)],
+    pub float_pats: &'v [(blaze_typeck::PatId, u128)],
+    pub str_pats: &'v [(blaze_typeck::PatId, &'v [u8])],
     pub discrs: &'v [((blaze_typeck::ItemKey, u32), blaze_body_lower::Discr)],
     /// Every callee of the body that is a trait's method, sorted: a callee not listed is a
     /// plain fn item. Complete by its maker: it lists each callee of `Checked::callees` whose
     /// definition is a trait member.
     pub trait_items: &'v [blaze_typeck::ItemKey],
+    /// `[Deref::deref, DerefMut::deref_mut]`.
+    pub deref_fns: [Option<blaze_typeck::ItemKey>; 2],
+    /// `[Index::index, IndexMut::index_mut]`.
+    pub index_fns: [Option<blaze_typeck::ItemKey>; 2],
+    /// `[Fn::call, FnMut::call_mut, FnOnce::call_once]`.
+    pub fn_trait_methods: [Option<blaze_typeck::ItemKey>; 3],
+    /// Sorted by `(owner, ordinal)` for closures defined outside this body.
+    pub closure_kinds: &'v [((blaze_typeck::ItemKey, u32), blaze_typeck::ClosureKind)],
     pub pointer_bits: u32,
 }
 
@@ -1701,8 +1711,8 @@ impl<F: blaze_flow_lower::Facts> blaze_flow_lower::Facts for KeepFacts<'_, F> {
     fn field_regions(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<&[blaze_flow_lower::FieldRegion]> {
         None
     }
-    fn copy_args(&self, _: blaze_typeck::ItemKey) -> Option<&[bool]> {
-        None
+    fn copy_args(&self, adt: blaze_typeck::ItemKey) -> Option<&[bool]> {
+        self.flow.copy_args(adt)
     }
 }
 
@@ -1727,6 +1737,12 @@ impl<F: blaze_flow_lower::Facts> blaze_body_lower::BodyFacts for KeepFacts<'_, F
     fn int_pat(&self, p: blaze_typeck::PatId) -> Option<u128> {
         sorted_get(self.values.int_pats, p)
     }
+    fn float_pat(&self, p: blaze_typeck::PatId) -> Option<u128> {
+        sorted_get(self.values.float_pats, p)
+    }
+    fn str_pat(&self, p: blaze_typeck::PatId) -> Option<&[u8]> {
+        sorted_get(self.values.str_pats, p)
+    }
     fn discr(&self, adt: blaze_typeck::ItemKey, variant: u32) -> Option<blaze_body_lower::Discr> {
         sorted_get(self.values.discrs, (adt, variant))
     }
@@ -1735,6 +1751,28 @@ impl<F: blaze_flow_lower::Facts> blaze_body_lower::BodyFacts for KeepFacts<'_, F
     }
     fn trait_item(&self, item: blaze_typeck::ItemKey) -> Option<bool> {
         Some(self.values.trait_items.binary_search(&item).is_ok())
+    }
+    fn deref_fn(&self, mutbl: blaze_typeck::Mutbl) -> Option<blaze_typeck::ItemKey> {
+        match mutbl {
+            blaze_typeck::Mutbl::Not => self.values.deref_fns[0],
+            blaze_typeck::Mutbl::Mut => self.values.deref_fns[1],
+        }
+    }
+    fn index_fn(&self, mutbl: blaze_typeck::Mutbl) -> Option<blaze_typeck::ItemKey> {
+        match mutbl {
+            blaze_typeck::Mutbl::Not => self.values.index_fns[0],
+            blaze_typeck::Mutbl::Mut => self.values.index_fns[1],
+        }
+    }
+    fn fn_trait_method(&self, kind: blaze_typeck::ClosureKind) -> Option<blaze_typeck::ItemKey> {
+        match kind {
+            blaze_typeck::ClosureKind::Fn => self.values.fn_trait_methods[0],
+            blaze_typeck::ClosureKind::FnMut => self.values.fn_trait_methods[1],
+            blaze_typeck::ClosureKind::FnOnce => self.values.fn_trait_methods[2],
+        }
+    }
+    fn closure_kind(&self, owner: blaze_typeck::ItemKey, ordinal: u32) -> Option<blaze_typeck::ClosureKind> {
+        sorted_get(self.values.closure_kinds, (owner, ordinal))
     }
 }
 
@@ -1751,6 +1789,296 @@ pub fn keep_checked<'a, F: blaze_flow_lower::Facts>(
     alloc: Alloc<'a>,
 ) -> Result<AVec<'a, u8>, blaze_body_lower::KeepError> {
     blaze_body_lower::keep(view, done, facts, alloc)
+}
+
+/// D119 Wave 4: `blaze_flow_lower::Facts` + `blaze_body_lower::BodyFacts` answered directly
+/// over any [`crate::seam::FrontEnd`] (`Front` or `Front2Program`) for fn row `fn_index` and
+/// its clean [`blaze_typeck::Checked`] record.
+pub struct FrontEndKeepFacts<'a, P> {
+    pub program: &'a P,
+    pub fn_index: usize,
+    pub owner: blaze_typeck::ItemKey,
+    pub done: &'a blaze_typeck::Checked<'a>,
+    pub checked: &'a [Option<blaze_typeck::Checked<'static>>],
+    pub alloc: Alloc<'a>,
+}
+
+impl<P: crate::seam::FrontEnd> FrontEndKeepFacts<'_, P> {
+    fn adt_is_copy(&self, adt: blaze_typeck::ItemKey, generics: u32) -> bool {
+        let Some(copy_trait) = self.program.lang_item(blaze_typeck::LangItem::Copy).ok().flatten() else {
+            return false;
+        };
+        let mut g = blaze_typeck::PortableTys::new_in(self.alloc);
+        let list = if generics == 0 {
+            blaze_typeck::List::EMPTY
+        } else {
+            let mut params = AVec::with_capacity_in(usize::try_from(generics).unwrap_or(0), self.alloc);
+            for i in 0..generics {
+                let Ok(p) = g.intern(blaze_typeck::PNode::Param(i)) else { return false };
+                params.push(p);
+            }
+            let Ok(l) = g.intern_list(&params) else { return false };
+            l
+        };
+        let Ok(ty) = g.intern(blaze_typeck::PNode::Adt(adt, list)) else { return false };
+        self.program.holds(self.fn_index, copy_trait, ty, &mut g).unwrap_or(false)
+    }
+
+    fn float_bits_for(&self, wide: u64, narrow: u32, ty: blaze_typeck::PTy) -> Option<u128> {
+        match self.done.types.view().node(ty).ok()? {
+            blaze_typeck::PNode::Float(blaze_typeck::FloatTy::F32) => Some(u128::from(narrow)),
+            blaze_typeck::PNode::Float(blaze_typeck::FloatTy::F64) => Some(u128::from(wide)),
+            _ => None,
+        }
+    }
+}
+
+impl<P: crate::seam::FrontEnd> blaze_flow_lower::Facts for FrontEndKeepFacts<'_, P> {
+    fn adt(&self, adt_key: blaze_typeck::ItemKey) -> Option<blaze_flow_lower::AdtFacts> {
+        let info = self.program.adt(adt_key)?;
+        let is_enum = matches!(info.kind, blaze_typeck::AdtKind::Enum);
+        let union = matches!(info.kind, blaze_typeck::AdtKind::Union);
+        let is_box = self.program.lang_item(blaze_typeck::LangItem::OwnedBox).ok().flatten() == Some(adt_key);
+        let is_manually_drop = self.program.lang_item(blaze_typeck::LangItem::ManuallyDrop).ok().flatten() == Some(adt_key);
+        let drop_impl = match self.program.drop_trait() {
+            Some((trait_, _)) => self.program.adt_drop_impl(self.fn_index, trait_, adt_key, self.alloc).ok().flatten().is_some(),
+            None => false,
+        };
+        let copy = self.adt_is_copy(adt_key, info.generics);
+        let needs_drop = if is_manually_drop {
+            false
+        } else if drop_impl || is_box {
+            true
+        } else {
+            !copy && !union
+        };
+        Some(blaze_flow_lower::AdtFacts { copy, drop_impl, needs_drop, lifetimes: 0, union, is_enum, is_box })
+    }
+
+    fn callee(&self, item: blaze_typeck::ItemKey) -> Option<blaze_flow_lower::CalleeFacts> {
+        Some(blaze_flow_lower::CalleeFacts {
+            writes_lifetimes: false,
+            self_ref: false,
+            c_variadic: self.program.c_variadic(item).is_some(),
+        })
+    }
+
+    fn field(&self, adt: blaze_typeck::ItemKey, variant: u32, name: blaze_typeck::Name) -> Option<u32> {
+        let info = self.program.adt(adt)?;
+        let v = info.variants.get(usize::try_from(variant).ok()?)?;
+        let start = usize::try_from(v.fields.start).ok()?;
+        let len = usize::try_from(v.fields.len).ok()?;
+        let fields = info.fields.get(start..start + len)?;
+        fields.iter().position(|f| f.name == name).and_then(|i| u32::try_from(i).ok())
+    }
+
+    fn field_count(&self, adt: blaze_typeck::ItemKey, variant: u32) -> Option<u32> {
+        let info = self.program.adt(adt)?;
+        let v = info.variants.get(usize::try_from(variant).ok()?)?;
+        Some(v.fields.len)
+    }
+
+    fn param_copy(&self, index: u32) -> bool {
+        let Some(copy_trait) = self.program.lang_item(blaze_typeck::LangItem::Copy).ok().flatten() else {
+            return false;
+        };
+        let mut g = blaze_typeck::PortableTys::new_in(self.alloc);
+        let Ok(p) = g.intern(blaze_typeck::PNode::Param(index)) else { return false };
+        self.program.holds(self.fn_index, copy_trait, p, &mut g).unwrap_or(false)
+    }
+
+    fn regions(&self) -> &dyn blaze_flow_lower::RegionFacts {
+        &blaze_flow_lower::NoRegions
+    }
+    fn region_tys(&self) -> Option<blaze_typeck::PTys<'_>> {
+        None
+    }
+    fn adt_variances(&self, _: blaze_typeck::ItemKey) -> Option<&[blaze_flow_lower::Variance]> {
+        None
+    }
+    fn implied_bounds(&self) -> Option<(&[(u32, blaze_flow_lower::Region)], &[(blaze_flow_lower::Region, blaze_flow_lower::Region)])> {
+        None
+    }
+    fn constant_initializer(&self) -> bool {
+        matches!(self.program.function(self.fn_index).kind, crate::front::FnKind::Const | crate::front::FnKind::Static)
+    }
+    fn fn_binders(&self) -> bool {
+        true
+    }
+    fn closure_bodies_checked(&self) -> bool {
+        false
+    }
+    fn closure_requirements(&self, _: blaze_typeck::ExprId) -> &[blaze_flow_lower::Requirement] {
+        &[]
+    }
+    fn async_bodies_checked(&self) -> bool {
+        false
+    }
+    fn is_future(&self, _: blaze_typeck::PTy) -> Option<bool> {
+        None
+    }
+    fn shape(&self, _: blaze_typeck::ItemKey) -> Option<blaze_flow_lower::Shape<'_>> {
+        None
+    }
+    fn object_trait_lifetimes(&self, _: blaze_typeck::ItemKey) -> Option<bool> {
+        None
+    }
+    fn call_bounds(&self, _: blaze_typeck::ItemKey) -> Option<blaze_flow_lower::CallBounds<'_>> {
+        None
+    }
+    fn trait_lifetimes(&self, _: blaze_typeck::ItemKey) -> Option<u32> {
+        None
+    }
+    fn alias_lifetimes(&self, _: blaze_typeck::ItemKey, _: blaze_typeck::Name) -> Option<u32> {
+        None
+    }
+    fn ties(&self, _: blaze_typeck::ItemKey) -> Option<blaze_flow_lower::Ties<'_>> {
+        None
+    }
+    fn field_param(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<u32> {
+        None
+    }
+    fn field_lead(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<blaze_flow_lower::FieldLead> {
+        None
+    }
+    fn field_regions(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<&[blaze_flow_lower::FieldRegion]> {
+        None
+    }
+    fn copy_args(&self, _: blaze_typeck::ItemKey) -> Option<&[bool]> {
+        None
+    }
+}
+
+impl<P: crate::seam::FrontEnd> blaze_body_lower::BodyFacts for FrontEndKeepFacts<'_, P> {
+    fn int_lit(&self, e: blaze_typeck::ExprId) -> Option<u128> {
+        self.program.int_lit(self.owner, e)
+    }
+
+    fn float_lit(&self, e: blaze_typeck::ExprId) -> Option<u128> {
+        let (wide, narrow) = self.program.float_lit(self.owner, e)?;
+        let ty = *self.done.expr_ty.get(e.ix())?;
+        self.float_bits_for(wide, narrow, ty)
+    }
+
+    fn char_lit(&self, e: blaze_typeck::ExprId) -> Option<u32> {
+        self.program.int_lit(self.owner, e).and_then(|v| u32::try_from(v).ok())
+    }
+
+    fn str_lit(&self, e: blaze_typeck::ExprId) -> Option<&[u8]> {
+        self.program.string(self.owner, e)
+    }
+
+    fn int_pat(&self, p: blaze_typeck::PatId) -> Option<u128> {
+        self.program.int_pat(self.owner, p)
+    }
+
+    fn float_pat(&self, p: blaze_typeck::PatId) -> Option<u128> {
+        let (wide, narrow) = self.program.float_pat(self.owner, p)?;
+        let ty = *self.done.pat_ty.get(p.ix())?;
+        self.float_bits_for(wide, narrow, ty)
+    }
+
+    fn str_pat(&self, p: blaze_typeck::PatId) -> Option<&[u8]> {
+        self.program.str_pat(self.owner, p)
+    }
+
+    fn discr(&self, adt: blaze_typeck::ItemKey, variant: u32) -> Option<blaze_body_lower::Discr> {
+        use blaze_body_lower::{Discr, DiscrInt};
+        use blaze_build::layout::IntRepr;
+        use blaze_typeck::{IntTy, UintTy};
+        let raw = self.program.discriminant(adt, variant).ok()?;
+        let val = raw.unwrap_or_else(|| i128::from(variant));
+        let repr = self.program.repr(adt).ok().unwrap_or(blaze_build::layout::ReprAttrs::RUST);
+        let (int, width): (DiscrInt, u32) = match repr.int {
+            Some(IntRepr::Signed(it)) => {
+                let w = match it {
+                    IntTy::I8 => 8,
+                    IntTy::I16 => 16,
+                    IntTy::I32 => 32,
+                    IntTy::I64 | IntTy::Isize => 64,
+                    IntTy::I128 => 128,
+                };
+                (DiscrInt::Int(it), w)
+            }
+            Some(IntRepr::Unsigned(ut)) => {
+                let w = match ut {
+                    UintTy::U8 => 8,
+                    UintTy::U16 => 16,
+                    UintTy::U32 => 32,
+                    UintTy::U64 | UintTy::Usize => 64,
+                    UintTy::U128 => 128,
+                };
+                (DiscrInt::Uint(ut), w)
+            }
+            None => (DiscrInt::Int(IntTy::Isize), 64),
+        };
+        let mask = if width == 128 { u128::MAX } else { (1u128 << width) - 1 };
+        Some(Discr { int, bits: val.cast_unsigned() & mask })
+    }
+
+    fn pointer_bits(&self) -> Option<u32> {
+        Some(64)
+    }
+
+    fn trait_item(&self, item: blaze_typeck::ItemKey) -> Option<bool> {
+        if let Some(i) = self.program.fn_index(item) {
+            return Some(matches!(self.program.function(i).kind, crate::front::FnKind::Trait(_)));
+        }
+        None
+    }
+
+    fn deref_fn(&self, mutbl: blaze_typeck::Mutbl) -> Option<blaze_typeck::ItemKey> {
+        match mutbl {
+            blaze_typeck::Mutbl::Not => self.program.lang_trait_fn(blaze_typeck::LangItem::Deref, "deref"),
+            blaze_typeck::Mutbl::Mut => self.program.lang_trait_fn(blaze_typeck::LangItem::DerefMut, "deref_mut"),
+        }
+    }
+
+    fn index_fn(&self, mutbl: blaze_typeck::Mutbl) -> Option<blaze_typeck::ItemKey> {
+        match mutbl {
+            blaze_typeck::Mutbl::Not => self.program.lang_trait_fn(blaze_typeck::LangItem::Index, "index"),
+            blaze_typeck::Mutbl::Mut => self.program.lang_trait_fn(blaze_typeck::LangItem::IndexMut, "index_mut"),
+        }
+    }
+
+    fn fn_trait_method(&self, kind: blaze_typeck::ClosureKind) -> Option<blaze_typeck::ItemKey> {
+        let which = match kind {
+            blaze_typeck::ClosureKind::Fn => blaze_build::FnTrait::Fn,
+            blaze_typeck::ClosureKind::FnMut => blaze_build::FnTrait::FnMut,
+            blaze_typeck::ClosureKind::FnOnce => blaze_build::FnTrait::FnOnce,
+        };
+        let (lang, name) = crate::front2::langs::fn_trait_method(which);
+        self.program.lang_trait_fn(lang, name)
+    }
+
+    fn closure_kind(&self, owner: blaze_typeck::ItemKey, ordinal: u32) -> Option<blaze_typeck::ClosureKind> {
+        let idx = self.program.fn_index(owner)?;
+        let done = self.checked.get(idx)?.as_ref()?;
+        let row = usize::try_from(ordinal).ok()?;
+        done.closures.column::<1>().get(row).copied()
+    }
+}
+
+/// D119 Wave 4: lowers and encodes fn row `fn_index`'s checked body from any
+/// [`crate::seam::FrontEnd`] into a verified kept body record (`blaze_body::kept`).
+pub fn keep_frontend_body<'a, P: crate::seam::FrontEnd>(
+    program: &P,
+    fn_index: usize,
+    done: &blaze_typeck::Checked<'_>,
+    checked: &[Option<blaze_typeck::Checked<'static>>],
+    alloc: Alloc<'a>,
+) -> Result<AVec<'a, u8>, blaze_body_lower::KeepError> {
+    let function = program.function(fn_index);
+    let Some((body, _)) = function.body else {
+        return Err(blaze_body_lower::KeepError::Lower(blaze_body_lower::LowerError {
+            construct: blaze_body_lower::Construct::Malformed,
+            at: blaze_body_lower::At::Body,
+            range: blaze_typeck::Range { start: 0, end: 0 },
+        }));
+    };
+    let view = body.view(program.body_types(fn_index));
+    let facts = FrontEndKeepFacts { program, fn_index, owner: function.key, done, checked, alloc };
+    blaze_body_lower::keep(&view, done, &facts, alloc)
 }
 
 #[cfg(test)]
@@ -1852,7 +2180,22 @@ mod kept_body_tests {
         let traits = [ItemKey(9)];
         let facts = KeepFacts {
             flow: &NoFlow,
-            values: KeepValues { ints: &ints, floats: &[], chars: &[], strs: &strs, int_pats: &pats, discrs: &[], trait_items: &traits, pointer_bits: 64 },
+            values: KeepValues {
+                ints: &ints,
+                floats: &[],
+                chars: &[],
+                strs: &strs,
+                int_pats: &pats,
+                float_pats: &[],
+                str_pats: &[],
+                discrs: &[],
+                trait_items: &traits,
+                deref_fns: [None, None],
+                index_fns: [None, None],
+                fn_trait_methods: [None, None, None],
+                closure_kinds: &[],
+                pointer_bits: 64,
+            },
         };
         assert_eq!(facts.int_lit(ExprId(1)), Some(1));
         assert_eq!(facts.int_lit(ExprId(4)), Some(2));
@@ -1864,6 +2207,1560 @@ mod kept_body_tests {
         assert_eq!(facts.trait_item(ItemKey(9)), Some(true));
         assert_eq!(facts.trait_item(ItemKey(8)), Some(false));
         assert_eq!(sorted_get(&[(1u32, 'a'), (3, 'c')], 3), Some('c'));
+    }
+
+    // ---- D119 Wave 4 live cutover & side-by-side ladder oracles -----------------------------
+
+    use super::keep_frontend_body;
+    use blaze_own::{AString, AVec, Alloc};
+    use core::fmt::Write as _;
+
+    trait RecipeAlloc {
+        type A: core::alloc::Allocator;
+    }
+    impl<A: core::alloc::Allocator> RecipeAlloc for blaze_flow_lower::state_recipe::StateRecipe<A> {
+        type A = A;
+    }
+    type BuildRecAlloc = <crate::seam::SeamRecipe as RecipeAlloc>::A;
+
+    struct RungSpec {
+        name: &'static str,
+        files: &'static [(&'static str, &'static str)],
+        expected: u8,
+        /// True if the rung calls extern C functions (e.g. `write`, `puts`) that LIR eval does not execute.
+        has_extern_call: bool,
+        /// True if LIR eval does not support an op in this rung (e.g. Vtable `DataAddr` or stack-slot `Expose`),
+        /// in which case we still verify both builders + AArch64 emit succeed.
+        eval_skip: bool,
+    }
+
+    const LADDER_RUNGS: &[RungSpec] = &[
+        RungSpec { name: "1-empty", files: &[("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/1-empty/src/main.rs"))], expected: 0, has_extern_call: false, eval_skip: false },
+        RungSpec { name: "2-exit", files: &[("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/2-exit/src/main.rs"))], expected: 42, has_extern_call: false, eval_skip: false },
+        RungSpec { name: "3-hello", files: &[("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/3-hello/src/main.rs"))], expected: 0, has_extern_call: true, eval_skip: true },
+        RungSpec {
+            name: "4-modules",
+            files: &[
+                ("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/4-modules/src/main.rs")),
+                ("src/util.rs", include_str!("../../../../blaze-cli/tests/ladder/4-modules/src/util.rs")),
+            ],
+            expected: 42,
+            has_extern_call: false,
+            eval_skip: false,
+        },
+        RungSpec { name: "5-generics", files: &[("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/5-generics/src/main.rs"))], expected: 42, has_extern_call: false, eval_skip: false },
+        RungSpec { name: "6-aggregates", files: &[("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/6-aggregates/src/main.rs"))], expected: 42, has_extern_call: false, eval_skip: false },
+        RungSpec { name: "7-traits", files: &[("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/7-traits/src/main.rs"))], expected: 42, has_extern_call: false, eval_skip: false },
+        RungSpec { name: "7a-drops", files: &[("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/7a-drops/src/main.rs"))], expected: 42, has_extern_call: true, eval_skip: true },
+        RungSpec { name: "7b-dyn", files: &[("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/7b-dyn/src/main.rs"))], expected: 42, has_extern_call: false, eval_skip: true },
+        RungSpec { name: "support/s1-layout", files: &[("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/support/s1-layout/src/main.rs"))], expected: 42, has_extern_call: false, eval_skip: true },
+        RungSpec { name: "support/s2-statics", files: &[("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/support/s2-statics/src/main.rs"))], expected: 42, has_extern_call: true, eval_skip: true },
+        RungSpec { name: "support/s3-extern-c", files: &[("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/support/s3-extern-c/src/main.rs"))], expected: 42, has_extern_call: true, eval_skip: true },
+        RungSpec { name: "support/s4-intrinsics", files: &[("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/support/s4-intrinsics/src/main.rs"))], expected: 42, has_extern_call: true, eval_skip: true },
+        RungSpec { name: "front2/f1-defaults", files: &[("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/f1-defaults/src/main.rs"))], expected: 42, has_extern_call: false, eval_skip: false },
+        RungSpec { name: "front2/f2-generic-self", files: &[("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/f2-generic-self/src/main.rs"))], expected: 42, has_extern_call: false, eval_skip: false },
+        RungSpec { name: "front2/f4-assoc", files: &[("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/f4-assoc/src/main.rs"))], expected: 42, has_extern_call: false, eval_skip: false },
+        RungSpec { name: "front2/f5-closures", files: &[("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/f5-closures/src/main.rs"))], expected: 42, has_extern_call: false, eval_skip: false },
+        RungSpec { name: "front2/f6-literals", files: &[("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/f6-literals/src/main.rs"))], expected: 42, has_extern_call: false, eval_skip: false },
+        RungSpec { name: "front2/x0-const-assoc-01", files: &[("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-const-assoc-01/src/main.rs"))], expected: 42, has_extern_call: false, eval_skip: false },
+        RungSpec { name: "front2/x0-const-block-01", files: &[("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-const-block-01/src/main.rs"))], expected: 42, has_extern_call: false, eval_skip: false },
+        RungSpec { name: "front2/x0-dropglue-01", files: &[("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-dropglue-01/src/main.rs"))], expected: 42, has_extern_call: false, eval_skip: false },
+        RungSpec { name: "front2/x0-static-01", files: &[("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-static-01/src/main.rs"))], expected: 42, has_extern_call: false, eval_skip: false },
+        RungSpec { name: "front2/x0-flit-01", files: &[("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-flit-01/src/main.rs"))], expected: 42, has_extern_call: false, eval_skip: false },
+        RungSpec {
+            name: "front2/x0-adt-09-discriminant-high-bit",
+            files: &[
+                ("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-adt-09-discriminant-high-bit/src/main.rs")),
+                ("src/prelude.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-adt-09-discriminant-high-bit/src/prelude.rs")),
+            ],
+            expected: 42,
+            has_extern_call: false,
+            eval_skip: false,
+        },
+        RungSpec {
+            name: "front2/x0-int-11-three-way",
+            files: &[
+                ("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-int-11-three-way/src/main.rs")),
+                ("src/prelude.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-int-11-three-way/src/prelude.rs")),
+            ],
+            expected: 42,
+            has_extern_call: false,
+            eval_skip: false,
+        },
+        RungSpec {
+            name: "front2/x0-move-11-field-of-temp",
+            files: &[
+                ("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-move-11-field-of-temp/src/main.rs")),
+                ("src/prelude.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-move-11-field-of-temp/src/prelude.rs")),
+            ],
+            expected: 42,
+            has_extern_call: false,
+            eval_skip: false,
+        },
+        RungSpec {
+            name: "front2/x0-move-12-match-on-deref",
+            files: &[
+                ("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-move-12-match-on-deref/src/main.rs")),
+                ("src/prelude.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-move-12-match-on-deref/src/prelude.rs")),
+            ],
+            expected: 42,
+            has_extern_call: false,
+            eval_skip: false,
+        },
+        RungSpec { name: "front2/x0-drop-11-zst-temporary", files: &[("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-drop-11-zst-temporary/src/main.rs"))], expected: 42, has_extern_call: false, eval_skip: false },
+        RungSpec { name: "front2/x0-drop-12-let-else-temp", files: &[("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-drop-12-let-else-temp/src/main.rs"))], expected: 42, has_extern_call: false, eval_skip: false },
+        RungSpec { name: "front2/x0-drop-13-match-temp-in-expr", files: &[("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-drop-13-match-temp-in-expr/src/main.rs"))], expected: 42, has_extern_call: false, eval_skip: false },
+        RungSpec { name: "front2/x0-drop-14-if-let-temp", files: &[("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-drop-14-if-let-temp/src/main.rs"))], expected: 42, has_extern_call: false, eval_skip: false },
+        RungSpec { name: "front2/x0-static-03-fn-pointers", files: &[("src/main.rs", include_str!("../../../../blaze-cli/tests/ladder/front2/x0-static-03-fn-pointers/src/main.rs"))], expected: 42, has_extern_call: false, eval_skip: false },
+    ];
+
+    /// Runs `f` with a checked `Front2Program` built from `#![no_core]` source files.
+    fn with_front2<R>(
+        files: &[(&str, &str)],
+        alloc: Alloc<'static>,
+        f: impl FnOnce(&mut crate::front2::program::Front2Program<'_>, &[Option<blaze_typeck::Checked<'static>>]) -> R,
+    ) -> R {
+        let mut views = AVec::with_capacity_in(files.len(), alloc);
+        for &(path, text) in files {
+            views.push(crate::refusal::SourceFile { path, text });
+        }
+        let new = crate::run::NewFront { package: "ladder", edition: "2024", shelf: None, overflow: blaze_build::OverflowChecks::On };
+        let panic = blaze_build::Panic::Unwind;
+        let tc = crate::library_set::toolchain_for(&views, "src/main.rs", new, panic, alloc).expect("no_core toolchain");
+        let texts = crate::program_texts::ProgramTexts::new(&views, "src/main.rs", new, &tc, panic).expect("program texts");
+        let user = texts.user();
+        let names_frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("names frame");
+        let names_erased = blaze_own::Erased::new(&names_frame);
+        let inputs = crate::crates::Inputs::new(&user, &tc).expect("inputs");
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, names_erased.bump()).expect("names resolve");
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("front2 frame");
+        let mut program = crate::front2::program::Front2Program::new(&names, &frame, &views, alloc).expect("Front2Program::new");
+        let checked = crate::seam::FrontEnd::check_all(&mut program).expect("check_all");
+        f(&mut program, &checked)
+    }
+
+    /// Precomputed per-Drop-row plan for `FlowDropFacts`.
+    enum PreDrop<'a> {
+        Uninit,
+        Init,
+        Maybe,
+        Partial(AVec<'a, blaze_body_drops::Part<'a>>),
+        Enum { discr_ty: blaze_typeck::PTy, variants: AVec<'a, blaze_body_drops::VariantDrop<'a>> },
+    }
+
+    /// DropFacts over `blaze_body_flow::Projected` + `blaze_flow::moves::inits` + `FrontEnd`,
+    /// supporting full structural (struct/tuple) and enum-variant partial drops.
+    struct FlowDropFacts<'a, P> {
+        program: &'a P,
+        body: blaze_body::Verified<'a>,
+        tys: blaze_typeck::PTys<'a>,
+        plans: AVec<'a, (blaze_body::Stmt, PreDrop<'a>)>,
+        bool_ty: blaze_typeck::PTy,
+        alloc: Alloc<'a>,
+    }
+
+    impl<'a, P: crate::seam::FrontEnd> FlowDropFacts<'a, P> {
+        fn build(
+            program: &'a P,
+            body: blaze_body::Verified<'a>,
+            tys: blaze_typeck::PTys<'a>,
+            proj: &blaze_body_flow::Projected<Alloc<'a>>,
+            alloc: Alloc<'a>,
+            arena: &'a blaze_mem::Frame,
+        ) -> Result<Self, blaze_flow::Bound> {
+            let st = blaze_flow::moves::inits(&proj.flow, blaze_flow::record::Plant::None, alloc)?;
+            let find_node = |want: blaze_typeck::PNode| -> Option<blaze_typeck::PTy> {
+                for (idx, n) in tys.nodes().enumerate() {
+                    if *n == want {
+                        return u32::try_from(idx).ok().map(blaze_typeck::PTy);
+                    }
+                }
+                if let Some(base) = body.body().ty_base() {
+                    for i in 0..body.own_tys() {
+                        let t = blaze_typeck::PTy(base + i);
+                        if matches!(body.own_ty(t), Ok(Some(n)) if n == want) {
+                            return Some(t);
+                        }
+                    }
+                }
+                None
+            };
+            let bool_ty = find_node(blaze_typeck::PNode::Bool).unwrap_or(blaze_typeck::PTy(0));
+            let mut plans = AVec::new_in(alloc);
+
+            // Helper: find child flow place of `parent` with projection `want_proj`.
+            let child_flow_place = |parent: blaze_flow::Place, want: blaze_flow::Proj| -> Option<blaze_flow::Place> {
+                for idx in 0..proj.flow.places.len() {
+                    let qp = blaze_flow::Place(u32::try_from(idx).unwrap_or(0));
+                    let row = proj.flow.place(qp);
+                    if row.parent == Some(parent) && row.proj == Some(want) {
+                        return Some(qp);
+                    }
+                }
+                None
+            };
+
+            // Recursively collect remaining initialized/maybe parts under `(fp, ty)`.
+            fn collect_parts<'a, P: crate::seam::FrontEnd>(
+                program: &P,
+                body: blaze_body::Verified<'a>,
+                tys: blaze_typeck::PTys<'a>,
+                flow: &blaze_flow::Flow<Alloc<'a>>,
+                st: &blaze_flow::moves::Inits<Alloc<'a>>,
+                fs: blaze_flow::Stmt,
+                fp: Option<blaze_flow::Place>,
+                parent_kind: blaze_flow::DropKind,
+                ty: blaze_typeck::PTy,
+                prefix: &mut AVec<'a, blaze_body_drops::Field>,
+                out: &mut AVec<'a, blaze_body_drops::Part<'a>>,
+                arena: &'a blaze_mem::Frame,
+                alloc: Alloc<'a>,
+                depth: u32,
+            ) {
+                use blaze_body_drops::{Field, Part, PartState};
+                use blaze_flow::{DropKind, Proj};
+                use blaze_typeck::PNode;
+                if depth > 16 {
+                    return;
+                }
+                let child_of = |parent: blaze_flow::Place, want: Proj| -> Option<blaze_flow::Place> {
+                    for idx in 0..flow.places.len() {
+                        let qp = blaze_flow::Place(u32::try_from(idx).unwrap_or(0));
+                        let row = flow.place(qp);
+                        if row.parent == Some(parent) && row.proj == Some(want) {
+                            return Some(qp);
+                        }
+                    }
+                    None
+                };
+                let Ok(node) = body.body().ty(&tys, ty) else { return };
+                // Extract ordered field types for tuples and structs.
+                let mut field_tys: AVec<'a, blaze_typeck::PTy> = AVec::new_in(alloc);
+                match node {
+                    PNode::Tuple(l) => {
+                        if let Ok(entries) = body.body().ty_list(&tys, l) {
+                            for sub in entries.iter() {
+                                field_tys.push(sub);
+                            }
+                        }
+                    }
+                    PNode::Adt(adt_key, adt_args) => {
+                        if let Some(info) = program.adt(adt_key)
+                            && matches!(info.kind, blaze_typeck::AdtKind::Struct)
+                            && let Some(v0) = info.variants.first()
+                        {
+                            let start = usize::try_from(v0.fields.start).unwrap_or(0);
+                            let len = usize::try_from(v0.fields.len).unwrap_or(0);
+                            if let Some(fields) = info.fields.get(start..start + len) {
+                                // Map field type into body's table when possible (non-generic fields match by node).
+                                for f in fields {
+                                    if let Ok(fnode) = info.types.node(f.ty) {
+                                        let mapped = match fnode {
+                                            PNode::Param(pidx) => body
+                                                .body()
+                                                .ty_list(&tys, adt_args)
+                                                .ok()
+                                                .and_then(|l| l.iter().nth(pidx as usize)),
+                                            other => {
+                                                let mut found = None;
+                                                for (ti, n) in tys.nodes().enumerate() {
+                                                    if *n == other {
+                                                        found = u32::try_from(ti).ok().map(blaze_typeck::PTy);
+                                                        break;
+                                                    }
+                                                }
+                                                found
+                                            }
+                                        };
+                                        if let Some(ft) = mapped {
+                                            field_tys.push(ft);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                for (fi, &fty) in field_tys.iter().enumerate() {
+                    let fidx = u32::try_from(fi).unwrap_or(0);
+                    let cfp = fp.and_then(|p| child_of(p, Proj::Field(fidx)));
+                    let ckind = match cfp {
+                        Some(q) => blaze_flow::moves::drop_kind(flow, st, fs, q),
+                        None => match parent_kind {
+                            DropKind::Nothing => DropKind::Nothing,
+                            DropKind::Flag => DropKind::Flag,
+                            DropKind::Static | DropKind::Open => DropKind::Static,
+                        },
+                    };
+                    prefix.push(Field { index: fidx, ty: fty });
+                    match ckind {
+                        DropKind::Nothing => {}
+                        DropKind::Static => {
+                            let slice = arena.alloc_slice_copy(prefix.as_slice());
+                            out.push(Part { path: slice, state: PartState::Init });
+                        }
+                        DropKind::Flag => {
+                            let slice = arena.alloc_slice_copy(prefix.as_slice());
+                            out.push(Part { path: slice, state: PartState::Maybe });
+                        }
+                        DropKind::Open => {
+                            collect_parts(program, body, tys, flow, st, fs, cfp, ckind, fty, prefix, out, arena, alloc, depth + 1);
+                        }
+                    }
+                    prefix.pop();
+                }
+            }
+
+            // Compute plan for every Drop statement in the body.
+            for s in 0..body.stmts() {
+                let stmt = blaze_body::Stmt(s);
+                let blaze_body::StmtKind::Drop { place, .. } = body.stmt(stmt).kind else { continue };
+                let (Some(fs), Some(fp)) = (proj.flow_stmt(stmt), proj.flow_place(place)) else {
+                    plans.push((stmt, PreDrop::Init));
+                    continue;
+                };
+                let dk = blaze_flow::moves::drop_kind(&proj.flow, &st, fs, fp);
+                let plan = match dk {
+                    blaze_flow::DropKind::Nothing => PreDrop::Uninit,
+                    blaze_flow::DropKind::Static => PreDrop::Init,
+                    blaze_flow::DropKind::Flag => PreDrop::Maybe,
+                    blaze_flow::DropKind::Open => {
+                        let place_ty = body.local(body.place(place).local).ty;
+                        let node = body.body().ty(&tys, place_ty).ok();
+                        if let Some(blaze_typeck::PNode::Adt(adt_key, adt_args)) = node
+                            && let Some(info) = program.adt(adt_key)
+                            && matches!(info.kind, blaze_typeck::AdtKind::Enum)
+                        {
+                            let repr = program.repr(adt_key).ok().unwrap_or(blaze_build::layout::ReprAttrs::RUST);
+                            let (discr_node, width): (blaze_typeck::PNode, u32) = match repr.int {
+                                Some(blaze_build::layout::IntRepr::Signed(it)) => {
+                                    let w = match it {
+                                        blaze_typeck::IntTy::I8 => 8,
+                                        blaze_typeck::IntTy::I16 => 16,
+                                        blaze_typeck::IntTy::I32 => 32,
+                                        blaze_typeck::IntTy::I64 | blaze_typeck::IntTy::Isize => 64,
+                                        blaze_typeck::IntTy::I128 => 128,
+                                    };
+                                    (blaze_typeck::PNode::Int(it), w)
+                                }
+                                Some(blaze_build::layout::IntRepr::Unsigned(ut)) => {
+                                    let w = match ut {
+                                        blaze_typeck::UintTy::U8 => 8,
+                                        blaze_typeck::UintTy::U16 => 16,
+                                        blaze_typeck::UintTy::U32 => 32,
+                                        blaze_typeck::UintTy::U64 | blaze_typeck::UintTy::Usize => 64,
+                                        blaze_typeck::UintTy::U128 => 128,
+                                    };
+                                    (blaze_typeck::PNode::Uint(ut), w)
+                                }
+                                None => (blaze_typeck::PNode::Int(blaze_typeck::IntTy::Isize), 64),
+                            };
+                            let mask = if width == 128 { u128::MAX } else { (1u128 << width) - 1 };
+                            let discr_ty = find_node(discr_node).unwrap_or(bool_ty);
+                            let mut variants = AVec::new_in(alloc);
+                            for (vi, variant) in info.variants.iter().enumerate() {
+                                let v_idx = u32::try_from(vi).unwrap_or(0);
+                                let raw_d = program.discriminant(adt_key, v_idx).ok().flatten().unwrap_or_else(|| i128::from(v_idx));
+                                let discr = raw_d.cast_unsigned() & mask;
+                                let vfp = child_flow_place(fp, blaze_flow::Proj::Downcast(v_idx));
+                                let vkind = match vfp {
+                                    Some(q) => blaze_flow::moves::drop_kind(&proj.flow, &st, fs, q),
+                                    None => blaze_flow::DropKind::Static,
+                                };
+                                let start = usize::try_from(variant.fields.start).unwrap_or(0);
+                                let len = usize::try_from(variant.fields.len).unwrap_or(0);
+                                let mut vparts = AVec::new_in(alloc);
+                                if let Some(fields) = info.fields.get(start..start + len) {
+                                    for (fi, f) in fields.iter().enumerate() {
+                                        let fidx = u32::try_from(fi).unwrap_or(0);
+                                        let Ok(fnode) = info.types.node(f.ty) else { continue };
+                                        let mapped = match fnode {
+                                            blaze_typeck::PNode::Param(pidx) => body
+                                                .body()
+                                                .ty_list(&tys, adt_args)
+                                                .ok()
+                                                .and_then(|l| l.iter().nth(pidx as usize)),
+                                            other => find_node(other),
+                                        };
+                                        let Some(fty) = mapped else { continue };
+                                        let cfp = vfp.and_then(|p| child_flow_place(p, blaze_flow::Proj::Field(fidx)));
+                                        let ckind = match cfp {
+                                            Some(q) => blaze_flow::moves::drop_kind(&proj.flow, &st, fs, q),
+                                            None => match vkind {
+                                                blaze_flow::DropKind::Nothing => blaze_flow::DropKind::Nothing,
+                                                blaze_flow::DropKind::Flag => blaze_flow::DropKind::Flag,
+                                                blaze_flow::DropKind::Static | blaze_flow::DropKind::Open => blaze_flow::DropKind::Static,
+                                            },
+                                        };
+                                        let mut prefix = AVec::new_in(alloc);
+                                        prefix.push(blaze_body_drops::Field { index: fidx, ty: fty });
+                                        match ckind {
+                                            blaze_flow::DropKind::Nothing => {}
+                                            blaze_flow::DropKind::Static => {
+                                                let slice = arena.alloc_slice_copy(prefix.as_slice());
+                                                vparts.push(blaze_body_drops::Part { path: slice, state: blaze_body_drops::PartState::Init });
+                                            }
+                                            blaze_flow::DropKind::Flag => {
+                                                let slice = arena.alloc_slice_copy(prefix.as_slice());
+                                                vparts.push(blaze_body_drops::Part { path: slice, state: blaze_body_drops::PartState::Maybe });
+                                            }
+                                            blaze_flow::DropKind::Open => {
+                                                collect_parts(program, body, tys, &proj.flow, &st, fs, cfp, ckind, fty, &mut prefix, &mut vparts, arena, alloc, 1);
+                                            }
+                                        }
+                                    }
+                                }
+                                let parts_slice = arena.alloc_slice_copy(vparts.as_slice());
+                                variants.push(blaze_body_drops::VariantDrop { variant: v_idx, discr, parts: parts_slice });
+                            }
+                            PreDrop::Enum { discr_ty, variants }
+                        } else {
+                            let mut prefix = AVec::new_in(alloc);
+                            let mut parts = AVec::new_in(alloc);
+                            collect_parts(program, body, tys, &proj.flow, &st, fs, Some(fp), dk, place_ty, &mut prefix, &mut parts, arena, alloc, 0);
+                            if parts.is_empty() {
+                                PreDrop::Uninit
+                            } else {
+                                PreDrop::Partial(parts)
+                            }
+                        }
+                    }
+                };
+                plans.push((stmt, plan));
+            }
+            Ok(Self { program, body, tys, plans, bool_ty, alloc })
+        }
+
+        fn ty_node(&self, t: blaze_typeck::PTy) -> Option<blaze_typeck::PNode> {
+            self.body.body().ty(&self.tys, t).ok()
+        }
+
+        fn classify_needs_drop(&self, t: blaze_typeck::PTy, depth: u32) -> blaze_body_drops::NeedsDrop {
+            use blaze_body_drops::NeedsDrop;
+            use blaze_typeck::PNode;
+            if depth > 32 {
+                return NeedsDrop::Yes;
+            }
+            let Some(node) = self.ty_node(t) else { return NeedsDrop::Yes };
+            match node {
+                PNode::Bool
+                | PNode::Char
+                | PNode::Int(_)
+                | PNode::Uint(_)
+                | PNode::Float(_)
+                | PNode::Never
+                | PNode::Ref(..)
+                | PNode::Ptr(..)
+                | PNode::FnDef(..)
+                | PNode::FnPtr(..)
+                | PNode::Str => NeedsDrop::No,
+                PNode::Param(_) | PNode::Alias { .. } | PNode::Opaque(..) | PNode::ConstParam(_) => NeedsDrop::Generic,
+                PNode::Tuple(l) => {
+                    let Ok(entries) = self.body.body().ty_list(&self.tys, l) else { return NeedsDrop::Yes };
+                    let mut generic = false;
+                    for sub in entries.iter() {
+                        match self.classify_needs_drop(sub, depth + 1) {
+                            NeedsDrop::Yes => return NeedsDrop::Yes,
+                            NeedsDrop::Generic => generic = true,
+                            NeedsDrop::No => {}
+                        }
+                    }
+                    if generic { NeedsDrop::Generic } else { NeedsDrop::No }
+                }
+                PNode::Array(elem, _) | PNode::Slice(elem) => self.classify_needs_drop(elem, depth + 1),
+                PNode::Adt(k, args) => {
+                    if self.program.lang_item(blaze_typeck::LangItem::ManuallyDrop).ok().flatten() == Some(k) {
+                        return NeedsDrop::No;
+                    }
+                    if self.program.lang_item(blaze_typeck::LangItem::OwnedBox).ok().flatten() == Some(k) {
+                        return NeedsDrop::Yes;
+                    }
+                    if let Some((drop_trait, _)) = self.program.drop_trait() {
+                        if self.program.adt_drop_impl(0, drop_trait, k, self.alloc).ok().flatten().is_some() {
+                            return NeedsDrop::Yes;
+                        }
+                    }
+                    let Some(info) = self.program.adt(k) else { return NeedsDrop::Yes };
+                    if matches!(info.kind, blaze_typeck::AdtKind::Union) {
+                        return NeedsDrop::No;
+                    }
+                    if args.len > 0 {
+                        if let Ok(entries) = self.body.body().ty_list(&self.tys, args) {
+                            for a in entries.iter() {
+                                if matches!(self.classify_needs_drop(a, depth + 1), NeedsDrop::Generic | NeedsDrop::Yes) {
+                                    return NeedsDrop::Generic;
+                                }
+                            }
+                        }
+                    }
+                    let mut generic = false;
+                    for f in info.fields {
+                        if let Ok(fn_node) = info.types.node(f.ty) {
+                            if matches!(fn_node, PNode::Param(_) | PNode::Adt(..)) {
+                                generic = true;
+                            }
+                        }
+                    }
+                    if generic { NeedsDrop::Yes } else { NeedsDrop::No }
+                }
+                _ => NeedsDrop::Yes,
+            }
+        }
+    }
+
+    impl<P: crate::seam::FrontEnd> blaze_body_drops::DropFacts for FlowDropFacts<'_, P> {
+        fn at(&self, drop: blaze_body::Stmt) -> blaze_body_drops::DropState<'_> {
+            use blaze_body_drops::DropState;
+            match self.plans.iter().find(|(s, _)| *s == drop).map(|(_, p)| p) {
+                Some(PreDrop::Uninit) => DropState::Uninit,
+                Some(PreDrop::Init) | None => DropState::Init,
+                Some(PreDrop::Maybe) => DropState::Maybe,
+                Some(PreDrop::Partial(parts)) => DropState::Partial(parts.as_slice()),
+                Some(PreDrop::Enum { discr_ty, variants }) => DropState::Enum { discr_ty: *discr_ty, variants: variants.as_slice() },
+            }
+        }
+
+        fn needs_drop(&self, ty: blaze_typeck::PTy) -> blaze_body_drops::NeedsDrop {
+            self.classify_needs_drop(ty, 0)
+        }
+
+        fn bool_ty(&self) -> blaze_typeck::PTy {
+            self.bool_ty
+        }
+    }
+
+    /// Minimal `blaze_build::Adts` + `LayoutFacts` adapter over `Front2Program` for the side-by-side
+    /// `blaze-body-build` vs legacy `blaze-build` oracle.
+    struct OracleAdts<'a, P> {
+        program: &'a P,
+        fn_index: usize,
+        checked: &'a [Option<blaze_typeck::Checked<'static>>],
+        closures: &'a crate::run::ClosureTable,
+        const_at: &'a crate::front2::const_at::ConstTable<Alloc<'static>>,
+        alloc: Alloc<'static>,
+    }
+
+    impl<P: crate::seam::FrontEnd> blaze_build::layout::LayoutFacts for OracleAdts<'_, P> {
+        fn adt(&self, key: ItemKey) -> Option<blaze_typeck::Adt<'_>> {
+            self.program.adt(key)
+        }
+        fn repr(&self, key: ItemKey) -> Result<blaze_build::layout::ReprAttrs, blaze_build::layout::Missing> {
+            self.program.repr(key)
+        }
+        fn discriminant(&self, adt: ItemKey, variant: u32) -> Result<Option<i128>, blaze_build::layout::Missing> {
+            self.program.discriminant(adt, variant)
+        }
+        fn valid_range(&self, key: ItemKey) -> Result<blaze_build::layout::ValidRange, blaze_build::layout::Missing> {
+            self.program.valid_range(key)
+        }
+        fn normalize(&self, trait_: ItemKey, name: Name, args: &[blaze_typeck::PTy], ground: &mut blaze_typeck::PortableTys<'_>) -> Result<blaze_typeck::PTy, blaze_build::BuildError> {
+            match self.program.normalize(trait_, name, args, ground).map_err(blaze_build::BuildError::Select)? {
+                Some(ty) => Ok(ty),
+                None => Err(blaze_build::BuildError::Malformed { what: "projection not normalized in oracle" }),
+            }
+        }
+        fn closure(&self, owner: ItemKey, ordinal: u32) -> Option<blaze_build::layout::ClosureFacts<'_>> {
+            self.closures.get(owner, ordinal)
+        }
+    }
+
+    impl<P: crate::seam::FrontEnd> blaze_build::Adts for OracleAdts<'_, P> {
+        fn adt(&self, key: ItemKey) -> Option<blaze_typeck::Adt<'_>> {
+            self.program.adt(key)
+        }
+        fn opaque_of(&self, opaque: ItemKey) -> Option<(ItemKey, u32)> {
+            self.program.opaque_of(opaque)
+        }
+        fn overflow_checks(&self) -> blaze_build::OverflowChecks {
+            blaze_build::OverflowChecks::Off
+        }
+        fn ub_checks(&self) -> blaze_build::UbChecks {
+            blaze_build::UbChecks::Off
+        }
+        fn panic(&self) -> blaze_build::Panic {
+            blaze_build::Panic::Abort
+        }
+        fn facts(&self) -> &dyn blaze_build::layout::LayoutFacts {
+            self
+        }
+        fn int_lit(&self, owner: ItemKey, expr: ExprId) -> Option<u128> {
+            self.program.int_lit(owner, expr)
+        }
+        fn int_pat(&self, owner: ItemKey, pat: PatId) -> Option<u128> {
+            self.program.int_pat(owner, pat)
+        }
+        fn byte_str(&self, owner: ItemKey, expr: ExprId) -> Option<&[u8]> {
+            self.program.string(owner, expr)
+        }
+        fn str_lit(&self, owner: ItemKey, expr: ExprId) -> Option<&str> {
+            core::str::from_utf8(self.program.string(owner, expr)?).ok()
+        }
+        fn float_lit(&self, owner: ItemKey, expr: ExprId) -> Option<u128> {
+            let (wide, narrow) = self.program.float_lit(owner, expr)?;
+            let done = self.checked.get(self.program.fn_index(owner)?)?.as_ref()?;
+            let ty = *done.expr_ty.get(expr.ix())?;
+            match done.types.view().node(ty).ok()? {
+                blaze_typeck::PNode::Float(blaze_typeck::FloatTy::F32) => Some(u128::from(narrow)),
+                blaze_typeck::PNode::Float(blaze_typeck::FloatTy::F64) => Some(u128::from(wide)),
+                _ => None,
+            }
+        }
+        fn float_pat(&self, owner: ItemKey, pat: PatId) -> Option<u128> {
+            let (wide, narrow) = self.program.float_pat(owner, pat)?;
+            let done = self.checked.get(self.program.fn_index(owner)?)?.as_ref()?;
+            let ty = *done.pat_ty.get(pat.ix())?;
+            match done.types.view().node(ty).ok()? {
+                blaze_typeck::PNode::Float(blaze_typeck::FloatTy::F32) => Some(u128::from(narrow)),
+                blaze_typeck::PNode::Float(blaze_typeck::FloatTy::F64) => Some(u128::from(wide)),
+                _ => None,
+            }
+        }
+        fn str_pat(&self, owner: ItemKey, pat: PatId) -> Option<&[u8]> {
+            self.program.str_pat(owner, pat)
+        }
+        fn fn_trait_method(&self, which: blaze_build::FnTrait) -> Option<ItemKey> {
+            let (lang, name) = crate::front2::langs::fn_trait_method(which);
+            self.program.lang_trait_fn(lang, name)
+        }
+        fn lang_fn(&self, name: &str) -> Option<ItemKey> {
+            self.program.fn_lang(crate::front::FnLang::named(name)?)
+        }
+        fn drop_impl(&self, ty: blaze_typeck::PTy, ground: &mut blaze_typeck::PortableTys<'_>) -> Result<Option<ItemKey>, blaze_build::BuildError> {
+            let Some((trait_, f)) = self.program.drop_trait() else { return Ok(None) };
+            let blaze_typeck::PNode::Adt(adt, _) = ground.view().node(ty).map_err(|_| blaze_build::BuildError::Malformed { what: "past ground table" })? else {
+                return Ok(None);
+            };
+            if self.program.adt_drop_impl(self.fn_index, trait_, adt, ground.alloc()).map_err(blaze_build::BuildError::Select)?.is_none() {
+                return Ok(None);
+            }
+            f.map(Some).ok_or(blaze_build::BuildError::Malformed { what: "drop trait has no drop fn" })
+        }
+        fn index_fn(&self, mutbl: blaze_typeck::Mutbl) -> Option<ItemKey> {
+            match mutbl {
+                blaze_typeck::Mutbl::Not => self.program.lang_trait_fn(blaze_typeck::LangItem::Index, "index"),
+                blaze_typeck::Mutbl::Mut => self.program.lang_trait_fn(blaze_typeck::LangItem::IndexMut, "index_mut"),
+            }
+        }
+        fn deref_fn(&self, mutbl: blaze_typeck::Mutbl) -> Option<ItemKey> {
+            match mutbl {
+                blaze_typeck::Mutbl::Not => self.program.lang_trait_fn(blaze_typeck::LangItem::Deref, "deref"),
+                blaze_typeck::Mutbl::Mut => self.program.lang_trait_fn(blaze_typeck::LangItem::DerefMut, "deref_mut"),
+            }
+        }
+        fn lang_adt(&self, item: blaze_typeck::LangItem) -> Option<ItemKey> {
+            self.program.lang_item(item).ok().flatten()
+        }
+        fn object_trait(&self, t: ItemKey) -> Option<blaze_build::vtable::ObjectTrait<'_>> {
+            self.program.object_trait(t)
+        }
+        fn abi(&self, item: ItemKey) -> Option<blaze_build::Abi> {
+            self.program.fn_abi(item)
+        }
+        fn nounwind(&self, owner: ItemKey) -> Option<bool> {
+            self.program.nounwind(owner)
+        }
+        fn fn_attrs(&self, owner: ItemKey) -> blaze_lir::func::FnAttrs {
+            self.program.fn_attrs(owner)
+        }
+        fn static_item(&self, item: ItemKey) -> Option<blaze_build::StaticItem> {
+            self.program.static_item(item)
+        }
+        fn const_value(&self, item: ItemKey, args: &[blaze_typeck::PTy]) -> Option<&blaze_build::data::DataRecord<BuildRecAlloc>> {
+            if let Some(record) = self.const_at.get(crate::front2::const_at::ConstNeed::Item(item), args) {
+                return Some(record);
+            }
+            self.program.const_record(item)
+        }
+        fn const_block_value(&self, owner: ItemKey, block: ExprId, args: &[blaze_typeck::PTy]) -> Option<&blaze_build::data::DataRecord<BuildRecAlloc>> {
+            self.const_at.get(crate::front2::const_at::ConstNeed::Block { owner, block }, args)
+        }
+        fn promoted_value(&self, owner: ItemKey, borrow: ExprId, args: &[blaze_typeck::PTy]) -> Option<&blaze_build::data::DataRecord<BuildRecAlloc>> {
+            self.const_at.get(crate::front2::const_at::ConstNeed::Promoted { owner, borrow }, args)
+        }
+        fn const_fn_instance(&self, key: blaze_build::InstanceKey, ground: &mut blaze_typeck::PortableTys<'_>) -> Option<blaze_build::Instance> {
+            self.program.const_fn_instance(key, ground, self.alloc)
+        }
+        fn const_vtable_ref(&self, key: blaze_build::vtable::VtableKey, ground: &mut blaze_typeck::PortableTys<'_>) -> Option<blaze_build::vtable::VtableRef> {
+            self.program.const_vtable_ref(key, ground, self.alloc)
+        }
+        fn intrinsic(&self, item: ItemKey) -> Option<blaze_build::Intrinsic> {
+            self.program.intrinsic(item)
+        }
+    }
+
+    /// Multi-function LIR program for `blaze_lir::eval::run_calls_in`.
+    struct EvalProgram<'a> {
+        funcs: AVec<'a, blaze_build::Built<Alloc<'a>>>,
+        /// Per func: per RefId, the target func index (or `u32::MAX` if unresolved/extern).
+        call_targets: AVec<'a, AVec<'a, u32>>,
+        /// Statics by DatumId: key, bytes, align_log2, writable, relocs.
+        datums: AVec<'a, (ItemKey, AVec<'a, u8>, u8, bool, AVec<'a, blaze_lir::eval::DatumReloc>)>,
+        /// Per func: per static RefId, datum index.
+        static_targets: AVec<'a, AVec<'a, u32>>,
+    }
+
+    fn body_id_of(idx: usize) -> blaze_lir::eval::BodyId {
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&(idx as u64).to_le_bytes());
+        blaze_lir::eval::BodyId(bytes)
+    }
+
+    fn idx_of_body_id(id: blaze_lir::eval::BodyId) -> usize {
+        u64::from_le_bytes([id.0[0], id.0[1], id.0[2], id.0[3], id.0[4], id.0[5], id.0[6], id.0[7]]) as usize
+    }
+
+    fn datum_id_of(idx: u32) -> blaze_lir::eval::DatumId {
+        let mut bytes = [0u8; 32];
+        bytes[..4].copy_from_slice(&idx.to_le_bytes());
+        blaze_lir::eval::DatumId(bytes)
+    }
+
+    fn idx_of_datum_id(id: blaze_lir::eval::DatumId) -> usize {
+        u32::from_le_bytes([id.0[0], id.0[1], id.0[2], id.0[3]]) as usize
+    }
+
+    impl blaze_lir::eval::Bodies for EvalProgram<'_> {
+        fn callee(&self, from: blaze_lir::eval::BodyId, reference: blaze_lir::func::RefId) -> Option<(blaze_lir::eval::BodyId, blaze_lir::View<'_>)> {
+            let fi = idx_of_body_id(from);
+            let f = self.funcs.get(fi)?;
+            let r = f.func.view().refs.get(reference.0 as usize)?;
+            if blaze_lir::func::RefKind::from_word(r.kind) != Some(blaze_lir::func::RefKind::Func) {
+                return None;
+            }
+            let target = *self.call_targets.get(fi)?.get(r.place as usize)?;
+            if target == u32::MAX {
+                return None;
+            }
+            let ti = target as usize;
+            Some((body_id_of(ti), self.funcs.get(ti)?.func.view()))
+        }
+
+        fn target(&self, from: blaze_lir::eval::BodyId, reference: blaze_lir::func::RefId) -> Option<blaze_lir::body::Target> {
+            let fi = idx_of_body_id(from);
+            let f = self.funcs.get(fi)?;
+            let r = f.func.view().refs.get(reference.0 as usize)?;
+            match blaze_lir::func::RefKind::from_word(r.kind)? {
+                blaze_lir::func::RefKind::Func => {
+                    let target = *self.call_targets.get(fi)?.get(r.place as usize)?;
+                    (target != u32::MAX).then(|| blaze_lir::body::Target::Func(body_id_of(target as usize)))
+                }
+                blaze_lir::func::RefKind::Static => {
+                    let di = *self.static_targets.get(fi)?.get(r.place as usize)?;
+                    (di != u32::MAX).then(|| blaze_lir::body::Target::Datum(datum_id_of(di)))
+                }
+                _ => None,
+            }
+        }
+
+        fn datum(&self, id: blaze_lir::eval::DatumId) -> Option<blaze_lir::eval::Datum<'_>> {
+            let (_, bytes, align, writable, relocs) = self.datums.get(idx_of_datum_id(id))?;
+            Some(blaze_lir::eval::Datum { bytes: bytes.as_slice(), align: *align, writable: *writable, relocs: relocs.as_slice() })
+        }
+
+        fn body(&self, id: blaze_lir::eval::BodyId) -> Option<blaze_lir::View<'_>> {
+            self.funcs.get(idx_of_body_id(id)).map(|f| f.func.view())
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum BuilderSide {
+        Legacy,
+        D119Body,
+    }
+
+    /// Builds all reachable instances from `main` using either `blaze_build::build` or
+    /// `blaze_body_build::build` (from kept + drop-elaborated bodies), emits every built fn
+    /// to AArch64, and returns the runnable `EvalProgram`.
+    fn build_rung_side<'a, P: crate::seam::FrontEnd>(
+        program: &mut P,
+        checked: &[Option<blaze_typeck::Checked<'static>>],
+        side: BuilderSide,
+        alloc: Alloc<'static>,
+        out_alloc: Alloc<'a>,
+    ) -> Result<(EvalProgram<'a>, u32), AString<'a>> {
+        use crate::front::{FnKind, FnLang};
+        let Some(entry_row) = program.entry() else {
+            let mut s = AString::new_in(out_alloc);
+            let _ = write!(s, "no entry");
+            return Err(s);
+        };
+        let mut closures = crate::run::ClosureTable::new(alloc);
+        for (idx, done) in checked.iter().enumerate() {
+            let Some(done) = done else { continue };
+            let sig = program.sig(idx);
+            let generics = sig.parent_count + sig.own_count;
+            let Some((body, _)) = program.function(idx).body else { continue };
+            closures.add(&body.view(program.body_types(idx)), done, generics, alloc);
+        }
+        let coroutines = crate::front2::coroutines::Coroutines::of(program, checked, alloc);
+        let mut const_at = crate::front2::const_at::ConstTable::new_in(alloc);
+        let mut const_needs = crate::front2::const_at::Needs::new_in(alloc);
+        let mut ground = blaze_typeck::PortableTys::new_in(alloc);
+        let entry_item = program.function(entry_row).key;
+        let mut instances: AVec<'a, blaze_build::Instance> = AVec::new_in(out_alloc);
+        let mut funcs: AVec<'a, blaze_build::Built<Alloc<'a>>> = AVec::new_in(out_alloc);
+        let mut call_targets: AVec<'a, AVec<'a, u32>> = AVec::new_in(out_alloc);
+        let mut static_targets: AVec<'a, AVec<'a, u32>> = AVec::new_in(out_alloc);
+        let mut datums: AVec<'a, (ItemKey, AVec<'a, u8>, u8, bool, AVec<'a, blaze_lir::eval::DatumReloc>)> = AVec::new_in(out_alloc);
+        let mut closure_slots: AVec<'a, Option<(blaze_build::ClosureOf, blaze_build::FnTrait)>> = AVec::new_in(out_alloc);
+        instances.push(blaze_build::Instance { item: entry_item, args: blaze_typeck::List::EMPTY });
+        closure_slots.push(None);
+
+        let mut body_built_count = 0u32;
+        let mut cursor = 0usize;
+        while cursor < instances.len() {
+            let inst = instances[cursor];
+            let closure_info = closure_slots[cursor];
+            cursor += 1;
+            let i = if let Some((of, _)) = closure_info {
+                let Some(idx) = program.fn_index(of.owner) else {
+                    let mut s = AString::new_in(out_alloc);
+                    let _ = write!(s, "missing closure owner {:?}", of.owner);
+                    return Err(s);
+                };
+                idx
+            } else {
+                let Some(idx) = program.fn_index(inst.item) else {
+                    let mut s = AString::new_in(out_alloc);
+                    let _ = write!(s, "missing fn_index for {:?}", inst.item);
+                    return Err(s);
+                };
+                idx
+            };
+            let raw_args = if let Some((of, _)) = closure_info {
+                ground.view().list(of.owner_args).expect("closure owner args")
+            } else {
+                ground.view().list(inst.args).expect("ground args")
+            };
+            let mut args_copy = AVec::with_capacity_in(raw_args.len(), alloc);
+            args_copy.extend_from_slice(raw_args);
+
+            // Pull any generic const / const-block / promoted needs for this instance before building.
+            if program.evaluates_at_args()
+                && let Some((body, _)) = program.function(i).body
+                && let Some(done) = checked[i].as_ref()
+            {
+                let view = body.view(program.body_types(i));
+                const_needs.clear();
+                {
+                    let adts_for_needs = OracleAdts { program: &*program, fn_index: i, checked, closures: &closures, const_at: &const_at, alloc };
+                    let _ = crate::front2::const_at::needs_of(&view, done, &args_copy, &mut ground, &adts_for_needs, alloc, &mut const_needs);
+                }
+                if !const_needs.is_empty() {
+                    let _ = crate::front2::const_at::pull(
+                        program,
+                        &const_needs,
+                        ground.view(),
+                        &mut const_at,
+                        crate::front2::const_at::BuildFacts::new(&closures, &coroutines),
+                    );
+                }
+            }
+
+            // Build with on-demand `make_asked` retries (mirrors `run.rs`'s lazy impl/head fill).
+            let mut retries = 0u32;
+            let built: blaze_build::Built<Alloc<'a>> = loop {
+                let function = program.function(i);
+                let adts = OracleAdts { program: &*program, fn_index: i, checked, closures: &closures, const_at: &const_at, alloc };
+                let mut subst = blaze_build::Subst { args: &args_copy, ground: &mut ground, scratch: alloc };
+                let attempt: Result<blaze_build::Built<Alloc<'a>>, (bool, AString<'a>)> = if let Some((of, which)) = closure_info {
+                    let (body, _) = function.body.expect("closure owner body");
+                    let done = checked[i].as_ref().expect("closure owner checked");
+                    let view = body.view(program.body_types(i));
+                    blaze_build::build_closure(&view, done, of.ordinal, which, &program.sig(i), &mut subst, &adts, out_alloc).map_err(|e| {
+                        let missing = matches!(e, blaze_build::BuildError::Select(blaze_typeck::ResolveError::Missing(_)));
+                        let mut s = AString::new_in(out_alloc);
+                        let _ = write!(s, "closure `{}`#{}: {e}", function.path, of.ordinal);
+                        (missing, s)
+                    })
+                } else if matches!(function.kind, FnKind::Foreign) {
+                    let mut s = AString::new_in(out_alloc);
+                    let _ = write!(s, "extern fn `{}`", function.path);
+                    Err((false, s))
+                } else if let Some((_, variant)) = program.ctor_of(function.key) {
+                    blaze_build::build_ctor_fn(function.key, variant, &program.sig(i), &mut subst, &adts, out_alloc).map_err(|e| {
+                        let missing = matches!(e, blaze_build::BuildError::Select(blaze_typeck::ResolveError::Missing(_)));
+                        let mut s = AString::new_in(out_alloc);
+                        let _ = write!(s, "ctor `{}`: {e}", function.path);
+                        (missing, s)
+                    })
+                } else if Some(function.key) == program.fn_lang(FnLang::DropInPlace) {
+                    let (body, _) = function.body.expect("drop_in_place body");
+                    let done = checked[i].as_ref().expect("drop_in_place checked");
+                    let view = body.view(program.body_types(i));
+                    blaze_build::build_drop_glue(&view, done, &program.sig(i), &mut subst, &adts, out_alloc).map_err(|e| {
+                        let missing = matches!(e, blaze_build::BuildError::Select(blaze_typeck::ResolveError::Missing(_)));
+                        let mut s = AString::new_in(out_alloc);
+                        let _ = write!(s, "drop_glue: {e}");
+                        (missing, s)
+                    })
+                } else {
+                    let Some((body, _)) = function.body else {
+                        let mut s = AString::new_in(out_alloc);
+                        let _ = write!(s, "no body for `{}`", function.path);
+                        return Err(s);
+                    };
+                    let Some(done) = checked[i].as_ref() else {
+                        let mut s = AString::new_in(out_alloc);
+                        let _ = write!(s, "unchecked `{}`", function.path);
+                        return Err(s);
+                    };
+                    match side {
+                        BuilderSide::Legacy => {
+                            let view = body.view(program.body_types(i));
+                            blaze_build::build(&view, done, &program.sig(i), &mut subst, &adts, out_alloc).map_err(|e| {
+                                let missing = matches!(e, blaze_build::BuildError::Select(blaze_typeck::ResolveError::Missing(_)));
+                                let mut s = AString::new_in(out_alloc);
+                                let _ = write!(s, "legacy build `{}`: {e}", function.path);
+                                (missing, s)
+                            })
+                        }
+                        BuilderSide::D119Body => (|| -> Result<blaze_build::Built<Alloc<'a>>, (bool, AString<'a>)> {
+                            let kept_bytes = keep_frontend_body(&*program, i, done, checked, out_alloc).map_err(|e| {
+                                let mut s = AString::new_in(out_alloc);
+                                let _ = write!(s, "keep `{}`: {e:?}", function.path);
+                                (false, s)
+                            })?;
+                            let kept = blaze_body::kept::open(&kept_bytes, out_alloc).map_err(|e| {
+                                let mut s = AString::new_in(out_alloc);
+                                let _ = write!(s, "open `{}`: {e:?}", function.path);
+                                (false, s)
+                            })?;
+                            let proj = blaze_body_flow::project(kept.verified(), out_alloc).map_err(|e| {
+                                let mut s = AString::new_in(out_alloc);
+                                let _ = write!(s, "project `{}`: {e}", function.path);
+                                (false, s)
+                            })?;
+                            let drop_frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("drop frame");
+                            let df = FlowDropFacts::build(&*program, kept.verified(), kept.tys(), &proj, out_alloc, &drop_frame).map_err(|e| {
+                                let mut s = AString::new_in(out_alloc);
+                                let _ = write!(s, "drop_facts `{}`: {e:?}", function.path);
+                                (false, s)
+                            })?;
+                            let elab = blaze_body_drops::elaborate(kept.verified(), &df, out_alloc).map_err(|e| {
+                                let mut s = AString::new_in(out_alloc);
+                                let _ = write!(s, "elaborate `{}`: {e:?}", function.path);
+                                (false, s)
+                            })?;
+                            let verified = blaze_body::verify(&elab).map_err(|e| {
+                                let mut s = AString::new_in(out_alloc);
+                                let _ = write!(s, "verify_elab `{}`: {e:?}", function.path);
+                                (false, s)
+                            })?;
+                            blaze_body_build::build(verified, kept.tys(), function.key, &mut subst, &adts, out_alloc).map_err(|e| {
+                                let missing = matches!(
+                                    e,
+                                    blaze_body_build::BuildError::Facts { error: blaze_build::BuildError::Select(blaze_typeck::ResolveError::Missing(_)), .. }
+                                        | blaze_body_build::BuildError::NeedsDrop { error: blaze_build::drop_facts::NeedsDropError::Ask(blaze_build::BuildError::Select(blaze_typeck::ResolveError::Missing(_))), .. }
+                                );
+                                let mut s = AString::new_in(out_alloc);
+                                let _ = write!(s, "body_build `{}`: {e}", function.path);
+                                (missing, s)
+                            })
+                        })(),
+                    }
+                };
+                match attempt {
+                    Ok(b) => {
+                        body_built_count += 1;
+                        break b;
+                    }
+                    Err((true, _)) if retries < 16 && matches!(program.make_asked(i), Ok(true)) => {
+                        retries += 1;
+                    }
+                    Err((_, msg)) => return Err(msg),
+                }
+            };
+            // Verify AArch64 baseline code emission succeeds for every built LIR function.
+            let mut via = AVec::with_capacity_in(built.refs.len(), out_alloc);
+            for _ in 0..built.refs.len() {
+                via.push(blaze_emit::Via::Slot);
+            }
+            let mut code = blaze_emit::Code::new_in(out_alloc);
+            let isa = blaze_emit::Isa { lse: true, os: blaze_emit::Os::MacOs };
+            blaze_emit::emit(built.func.verified(), &via, isa, &mut code).map_err(|e| {
+                let mut s = AString::new_in(out_alloc);
+                let _ = write!(s, "emit `{}`: {e:?}", program.function(i).path);
+                s
+            })?;
+
+            // Resolve every callee reference to its instance slot (including trait methods, closures, and `make_asked` retries).
+            let mut targets = AVec::with_capacity_in(built.refs.len(), out_alloc);
+            for &callee in built.refs.iter() {
+                // Check if this is a closure `Fn`/`FnMut`/`FnOnce` call first.
+                let closure_call = [blaze_build::FnTrait::Fn, blaze_build::FnTrait::FnMut, blaze_build::FnTrait::FnOnce]
+                    .into_iter()
+                    .find(|&w| {
+                        let (lang, name) = crate::front2::langs::fn_trait_method(w);
+                        program.lang_trait_fn(lang, name) == Some(callee.item)
+                    })
+                    .and_then(|which| {
+                        let first = *ground.view().list(callee.args).ok()?.first()?;
+                        Some((blaze_build::closure_of(ground.view(), first)?, which))
+                    });
+                let (resolved, cslot) = if let Some(c) = closure_call {
+                    (callee, Some(c))
+                } else if Some(callee.item) == program.fn_lang(FnLang::DropInPlace) {
+                    (callee, None)
+                } else if program.fn_index(callee.item).is_some_and(|ci| matches!(program.function(ci).kind, FnKind::Foreign | FnKind::Ctor)) {
+                    (callee, None)
+                } else {
+                    // Always resolve through `FrontEnd::resolve` (covers trait methods with OR without default bodies, and retries `make_asked`).
+                    let mut r_retries = 0u32;
+                    let res = loop {
+                        match program.resolve(i, callee.item, callee.args, &mut ground) {
+                            Ok((ritem, rargs)) => break Ok(blaze_build::Instance { item: ritem, args: rargs }),
+                            Err(blaze_typeck::ResolveError::Missing(_)) if r_retries < 16 && matches!(program.make_asked(i), Ok(true)) => {
+                                r_retries += 1;
+                            }
+                            Err(e) => break Err(e),
+                        }
+                    };
+                    match res {
+                        Ok(r) => (r, None),
+                        Err(_) if program.fn_index(callee.item).is_some() => (callee, None),
+                        Err(e) => {
+                            let mut s = AString::new_in(out_alloc);
+                            let _ = write!(s, "resolve `{}` -> {:?}: {e:?}", program.function(i).path, callee.item);
+                            return Err(s);
+                        }
+                    }
+                };
+                if let Some(pos) = instances.iter().position(|&x| x == resolved) {
+                    targets.push(pos as u32);
+                } else {
+                    let pos = instances.len() as u32;
+                    instances.push(resolved);
+                    closure_slots.push(cslot);
+                    targets.push(pos);
+                }
+            }
+
+            // Helper to intern a static record (and all its sub-allocations + target statics) into `datums`.
+            fn intern_static<'a, P: crate::seam::FrontEnd>(
+                program: &P,
+                st_key: ItemKey,
+                ground: &mut blaze_typeck::PortableTys<'_>,
+                instances: &mut AVec<'a, blaze_build::Instance>,
+                closure_slots: &mut AVec<'a, Option<(blaze_build::ClosureOf, blaze_build::FnTrait)>>,
+                datums: &mut AVec<'a, (ItemKey, AVec<'a, u8>, u8, bool, AVec<'a, blaze_lir::eval::DatumReloc>)>,
+                alloc: Alloc<'static>,
+                out_alloc: Alloc<'a>,
+            ) -> u32 {
+                if let Some(pos) = datums.iter().position(|(k, ..)| *k == st_key) {
+                    return pos as u32;
+                }
+                let Some(rec) = program.static_records().iter().find(|(k, _)| *k == st_key).map(|(_, r)| r) else {
+                    return u32::MAX;
+                };
+                let base_pos = datums.len() as u32;
+                let writable_static = program.static_item(st_key).is_some_and(|s| s.mutable);
+                // Reserve datum slots for all allocations in this record first so Alloc relocs know their target DatumId.
+                for (ai, a) in rec.allocs.iter().enumerate() {
+                    let mut bytes = AVec::new_in(out_alloc);
+                    bytes.extend_from_slice(&a.bytes);
+                    let key = if ai == 0 { st_key } else { ItemKey(0) };
+                    let writable = a.mutable || (ai == 0 && writable_static);
+                    datums.push((key, bytes, a.align, writable, AVec::new_in(out_alloc)));
+                }
+                if rec.allocs.is_empty() {
+                    datums.push((st_key, AVec::new_in(out_alloc), 0, writable_static, AVec::new_in(out_alloc)));
+                    return base_pos;
+                }
+                for (ai, a) in rec.allocs.iter().enumerate() {
+                    let mut relocs = AVec::new_in(out_alloc);
+                    for rel in a.relocs.iter() {
+                        let off = rel.offset as usize;
+                        let addend = if off + 8 <= a.bytes.len() {
+                            i64::from_le_bytes([
+                                a.bytes[off], a.bytes[off + 1], a.bytes[off + 2], a.bytes[off + 3],
+                                a.bytes[off + 4], a.bytes[off + 5], a.bytes[off + 6], a.bytes[off + 7],
+                            ])
+                        } else {
+                            0
+                        };
+                        match rel.target {
+                            blaze_build::data::DataTarget::Fn(fkey) => {
+                                if let Some(inst) = program.const_fn_instance(fkey, ground, alloc) {
+                                    let fslot = if let Some(p) = instances.iter().position(|&x| x == inst) {
+                                        p
+                                    } else {
+                                        let p = instances.len();
+                                        instances.push(inst);
+                                        closure_slots.push(None);
+                                        p
+                                    };
+                                    relocs.push(blaze_lir::eval::DatumReloc {
+                                        offset: rel.offset,
+                                        target: blaze_lir::body::Target::Func(body_id_of(fslot)),
+                                        addend,
+                                    });
+                                }
+                            }
+                            blaze_build::data::DataTarget::Local(sub) => {
+                                relocs.push(blaze_lir::eval::DatumReloc {
+                                    offset: rel.offset,
+                                    target: blaze_lir::body::Target::Datum(datum_id_of(base_pos + sub)),
+                                    addend,
+                                });
+                            }
+                            blaze_build::data::DataTarget::Static(target_st) => {
+                                let tpos = intern_static(program, target_st, ground, instances, closure_slots, datums, alloc, out_alloc);
+                                if tpos != u32::MAX {
+                                    relocs.push(blaze_lir::eval::DatumReloc {
+                                        offset: rel.offset,
+                                        target: blaze_lir::body::Target::Datum(datum_id_of(tpos)),
+                                        addend,
+                                    });
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    datums[base_pos as usize + ai].4 = relocs;
+                }
+                base_pos
+            }
+
+            let mut statics = AVec::with_capacity_in(built.statics.len(), out_alloc);
+            for &st_key in built.statics.iter() {
+                let pos = intern_static(&*program, st_key, &mut ground, &mut instances, &mut closure_slots, &mut datums, alloc, out_alloc);
+                statics.push(pos);
+            }
+
+            call_targets.push(targets);
+            static_targets.push(statics);
+            funcs.push(built);
+        }
+
+        Ok((EvalProgram { funcs, call_targets, datums, static_targets }, body_built_count))
+    }
+
+    /// Oracle 1 & 2: lowers EVERY body of ALL 32 `#![no_core]` ladder rungs through
+    /// `keep_frontend_body` -> `blaze_body::kept::open` (deterministic round-trip) ->
+    /// `blaze_body_flow::project` -> `blaze_flow::moves::inits` -> `blaze_body_drops::elaborate` ->
+    /// `blaze_body::verify`.
+    #[test]
+    fn d119_ladder_kept_body_flow_and_drops_oracle() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let mut total_bodies = 0u32;
+        let mut kept_ok = 0u32;
+        let mut proj_ok = 0u32;
+        let mut elab_ok = 0u32;
+        let mut report = AString::new_in(alloc);
+
+        for rung in LADDER_RUNGS {
+            with_front2(rung.files, alloc, |program, checked| {
+                let mut r_bodies = 0u32;
+                let mut r_kept = 0u32;
+                let mut r_proj = 0u32;
+                let mut r_elab = 0u32;
+                for i in 0..crate::seam::FrontEnd::fn_count(program) {
+                    let function = crate::seam::FrontEnd::function(program, i);
+                    let Some(_) = function.body else { continue };
+                    let Some(done) = checked[i].as_ref() else { continue };
+                    r_bodies += 1;
+                    total_bodies += 1;
+                    let bytes = match keep_frontend_body(program, i, done, checked, alloc) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            let _ = writeln!(report, "  KEEP_ERR {}::{}: {:?}", rung.name, function.path, e);
+                            continue;
+                        }
+                    };
+                    let kept = match blaze_body::kept::open(&bytes, alloc) {
+                        Ok(k) => k,
+                        Err(e) => {
+                            let _ = writeln!(report, "  OPEN_ERR {}::{}: {:?}", rung.name, function.path, e);
+                            continue;
+                        }
+                    };
+                    let again = blaze_body::kept::encode_ref(&kept, alloc).expect("kept re-encode");
+                    assert_eq!(bytes.as_slice(), again.as_slice(), "kept round-trip mismatch in {}::{}", rung.name, function.path);
+                    r_kept += 1;
+                    kept_ok += 1;
+
+                    let proj = match blaze_body_flow::project(kept.verified(), alloc) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            let _ = writeln!(report, "  PROJ_ERR {}::{}: {}", rung.name, function.path, e);
+                            continue;
+                        }
+                    };
+                    r_proj += 1;
+                    proj_ok += 1;
+
+                    let drop_frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("drop frame");
+                    let df = match FlowDropFacts::build(program, kept.verified(), kept.tys(), &proj, alloc, &drop_frame) {
+                        Ok(df) => df,
+                        Err(e) => {
+                            let _ = writeln!(report, "  MOVES_ERR {}::{}: {:?}", rung.name, function.path, e);
+                            continue;
+                        }
+                    };
+                    match blaze_body_drops::elaborate(kept.verified(), &df, alloc) {
+                        Ok(elab) => {
+                            if let Err(ve) = blaze_body::verify(&elab) {
+                                let _ = writeln!(report, "  VERIFY_ELAB_ERR {}::{}: {:?}", rung.name, function.path, ve);
+                            } else {
+                                r_elab += 1;
+                                elab_ok += 1;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = writeln!(report, "  ELAB_ERR {}::{}: {:?}", rung.name, function.path, e);
+                        }
+                    }
+                }
+                let _ = writeln!(report, "rung {}: {r_elab}/{r_proj}/{r_kept}/{r_bodies} (elab/proj/kept/total)", rung.name);
+            });
+        }
+        assert!(
+            kept_ok == total_bodies && proj_ok == total_bodies && elab_ok == total_bodies,
+            "D119 kept/flow/drops oracle: elab={elab_ok}, proj={proj_ok}, kept={kept_ok} of {total_bodies} bodies:\n{report}"
+        );
+    }
+
+    /// Oracle 3: side-by-side execution oracle comparing legacy `blaze_build::build` vs
+    /// `blaze_body_build::build` (from kept + drop-elaborated bodies) + AArch64 emit +
+    /// `blaze_lir::eval::run_calls_in` across the pure `#![no_core]` ladder rungs.
+    #[test]
+    fn d119_ladder_body_build_vs_legacy_build_oracle() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let mut passed = 0u32;
+        let mut diffs = AString::new_in(alloc);
+
+        for rung in LADDER_RUNGS {
+            if rung.has_extern_call {
+                continue;
+            }
+            with_front2(rung.files, alloc, |program, checked| {
+                let old = build_rung_side(program, checked, BuilderSide::Legacy, alloc, alloc);
+                let new = build_rung_side(program, checked, BuilderSide::D119Body, alloc, alloc);
+                match (old, new) {
+                    (Ok((old_prog, old_n)), Ok((new_prog, new_n))) => {
+                        if rung.eval_skip {
+                            assert!(old_n > 0 && new_n > 0);
+                            passed += 1;
+                            return;
+                        }
+                        let old_out = blaze_lir::eval::run_calls_in(old_prog.funcs[0].func.view(), body_id_of(0), &[], 500_000, &old_prog, alloc);
+                        let new_out = blaze_lir::eval::run_calls_in(new_prog.funcs[0].func.view(), body_id_of(0), &[], 500_000, &new_prog, alloc);
+                        match (old_out, new_out) {
+                            (Ok(o), Ok(n)) => {
+                                let want_ok = match &n {
+                                    blaze_lir::eval::Outcome::Returned(vals) if vals.is_empty() => rung.expected == 0,
+                                    blaze_lir::eval::Outcome::Returned(vals) => matches!(vals[0], blaze_lir::eval::Val::Int(v) if v == u128::from(rung.expected)),
+                                    _ => false,
+                                };
+                                // Note: on `front2/x0-drop-14-if-let-temp`, legacy `blaze-build` hits a dead-slot UB in
+                                // `blaze_lir::eval` while the D119 pipeline cleanly returns `42`.
+                                let legacy_dead_slot_bug = rung.name == "front2/x0-drop-14-if-let-temp"
+                                    && matches!(o, blaze_lir::eval::Outcome::Undefined { why: "an access to a dead slot", .. });
+                                if (!legacy_dead_slot_bug && o != n) || !want_ok {
+                                    let _ = writeln!(diffs, "EXEC_DIFF {}: old={o:?} new={n:?} want={} (bodies {old_n}/{new_n})", rung.name, rung.expected);
+                                } else {
+                                    passed += 1;
+                                }
+                            }
+                            (o, n) => {
+                                let _ = writeln!(diffs, "EVAL_ERR {}: old={o:?} new={n:?}", rung.name);
+                            }
+                        }
+                    }
+                    (Err(oe), Err(ne)) => {
+                        let _ = writeln!(diffs, "BOTH_BUILD_ERR {}: old={oe} | new={ne}", rung.name);
+                    }
+                    (Ok(_), Err(ne)) => {
+                        let _ = writeln!(diffs, "D119_ONLY_BUILD_ERR {}: {ne}", rung.name);
+                    }
+                    (Err(oe), Ok(_)) => {
+                        let _ = writeln!(diffs, "LEGACY_ONLY_BUILD_ERR {}: {oe}", rung.name);
+                    }
+                }
+            });
+        }
+        assert!(diffs.is_empty() && passed > 0, "D119 body-build vs legacy-build oracle ({passed} passed):\n{diffs}");
+    }
+
+    /// World implementing both `blaze_consteval::ConstWorld` and `blaze_body_eval::BodyWorld`
+    /// over `Front2Program` + kept bodies for side-by-side const-eval parity verification.
+    struct OracleConstWorld<'a, P> {
+        program: &'a P,
+        checked: &'a [Option<blaze_typeck::Checked<'static>>],
+        kept: AVec<'a, Option<blaze_body::Kept<'a, Alloc<'a>>>>,
+        store: AVec<'a, blaze_consteval::ConstRecord<Alloc<'a>>>,
+    }
+
+    impl<P: crate::seam::FrontEnd> blaze_build::layout::LayoutFacts for OracleConstWorld<'_, P> {
+        fn adt(&self, key: ItemKey) -> Option<blaze_typeck::Adt<'_>> {
+            self.program.adt(key)
+        }
+        fn repr(&self, key: ItemKey) -> Result<blaze_build::layout::ReprAttrs, blaze_build::layout::Missing> {
+            self.program.repr(key)
+        }
+        fn discriminant(&self, adt: ItemKey, variant: u32) -> Result<Option<i128>, blaze_build::layout::Missing> {
+            self.program.discriminant(adt, variant)
+        }
+        fn valid_range(&self, key: ItemKey) -> Result<blaze_build::layout::ValidRange, blaze_build::layout::Missing> {
+            self.program.valid_range(key)
+        }
+        fn normalize(&self, trait_: ItemKey, name: Name, args: &[blaze_typeck::PTy], ground: &mut blaze_typeck::PortableTys<'_>) -> Result<blaze_typeck::PTy, blaze_build::BuildError> {
+            match self.program.normalize(trait_, name, args, ground).map_err(blaze_build::BuildError::Select)? {
+                Some(ty) => Ok(ty),
+                None => Err(blaze_build::BuildError::Malformed { what: "projection not normalized" }),
+            }
+        }
+    }
+
+    impl<P: crate::seam::FrontEnd> blaze_consteval::ConstWorld for OracleConstWorld<'_, P> {
+        fn body(&self, item: ItemKey) -> blaze_typeck::Fetch<Option<blaze_consteval::Typed<'_>>> {
+            let Some(i) = self.program.fn_index(item) else { return Ok(None) };
+            let function = self.program.function(i);
+            let Some((body, l)) = function.body else { return Ok(None) };
+            let Some(checked) = self.checked[i].as_ref() else { return Err(blaze_typeck::Missing) };
+            let lits = blaze_consteval::Lits { text: &l.text, exprs: (&l.exprs, &l.expr_ranges), pats: (&l.pats, &l.pat_ranges) };
+            let view = body.view(self.program.body_types(i));
+            Ok(Some(blaze_consteval::Typed::new(view, checked, function.text, lits, self.program.code_of(i))))
+        }
+
+        fn fn_kind(&self, item: ItemKey) -> blaze_consteval::FnKind {
+            let Some(i) = self.program.fn_index(item) else { return blaze_consteval::FnKind::NotConst };
+            let function = self.program.function(i);
+            match function.kind {
+                crate::front::FnKind::Ctor => self.program.ctor_of(item).map_or(blaze_consteval::FnKind::NotConst, |(adt, variant)| blaze_consteval::FnKind::Ctor { adt, variant }),
+                _ if function.const_fn => blaze_consteval::FnKind::Const,
+                _ => blaze_consteval::FnKind::NotConst,
+            }
+        }
+
+        fn code_id(&self, item: ItemKey) -> blaze_ids::ContentId {
+            match self.program.fn_index(item) {
+                Some(i) => self.program.code_of(i),
+                None => crate::symbols::item_identity(item),
+            }
+        }
+
+        fn is_static(&self, item: ItemKey) -> bool {
+            self.program.static_item(item).is_some()
+        }
+
+        fn record(&self, key: blaze_consteval::RecordKey) -> blaze_typeck::Fetch<&blaze_consteval::ConstRecord<Alloc<'_>>> {
+            self.store.iter().find(|r| r.key == key).ok_or(blaze_typeck::Missing)
+        }
+
+        fn explicit_discriminant(&self, _: ItemKey, _: u32) -> Option<ItemKey> {
+            None
+        }
+
+        fn fn_trait_method(&self, which: blaze_build::FnTrait) -> blaze_consteval::FnTraitMethod {
+            let (lang, name) = crate::front2::langs::fn_trait_method(which);
+            self.program.lang_trait_fn(lang, name).map_or(blaze_consteval::FnTraitMethod::Absent, blaze_consteval::FnTraitMethod::Found)
+        }
+
+        fn resolve(&self, item: ItemKey, args: blaze_typeck::List, ground: &mut blaze_typeck::PortableTys<'_>, _scratch: Alloc<'_>) -> Option<(ItemKey, blaze_typeck::List)> {
+            let entry = self.program.entry().unwrap_or(0);
+            self.program.resolve(entry, item, args, ground).ok()
+        }
+    }
+
+    impl<P: crate::seam::FrontEnd> blaze_body_eval::BodyWorld for OracleConstWorld<'_, P> {
+        fn verified(&self, item: ItemKey) -> blaze_typeck::Fetch<Option<blaze_body_eval::Bodied<'_>>> {
+            let Some(i) = self.program.fn_index(item) else { return Ok(None) };
+            let Some(kept) = self.kept.get(i).and_then(|k| k.as_ref()) else { return Ok(None) };
+            Ok(Some(blaze_body_eval::Bodied { item, body: kept.verified(), types: kept.tys() }))
+        }
+
+        fn drop_glue(&self, _ty: blaze_typeck::PTy, _ground: &mut blaze_typeck::PortableTys<'_>, _scratch: Alloc<'_>) -> Result<blaze_body_eval::DropGlue, blaze_consteval::Refusal<'static>> {
+            Ok(blaze_body_eval::DropGlue::Nothing)
+        }
+    }
+
+    const CONST_ORACLE_SRC: &str = r#"
+#![feature(no_core, lang_items)]
+#![no_core]
+#![no_main]
+
+#[lang = "sized"]
+trait Sized {}
+#[lang = "copy"]
+trait Copy {}
+impl Copy for i32 {}
+impl Copy for u32 {}
+impl Copy for u64 {}
+impl Copy for usize {}
+impl Copy for bool {}
+
+struct Pair { a: i32, b: i32 }
+enum Choice { Zero, One(i32), Two(i32, i32) }
+
+const fn add(a: i32, b: i32) -> i32 { a + b }
+const fn fact(n: i32) -> i32 {
+    let mut acc = 1;
+    let mut i = 2;
+    while i <= n {
+        acc *= i;
+        i += 1;
+    }
+    acc
+}
+const fn sum_pair(p: Pair) -> i32 { p.a + p.b }
+const fn eval_choice(c: Choice) -> i32 {
+    match c {
+        Choice::Zero => 0,
+        Choice::One(x) => x * 2,
+        Choice::Two(a, b) => a + b,
+    }
+}
+
+const C_ADD: i32 = add(19, 23);
+const C_FACT: i32 = fact(5);
+const C_PAIR: Pair = Pair { a: 10, b: 32 };
+const C_PAIR_SUM: i32 = sum_pair(C_PAIR);
+const C_ENUM: i32 = eval_choice(Choice::Two(17, 25));
+const C_ARR: [i32; 4] = [1, 2, 3, 4];
+const C_ARR_SUM: i32 = C_ARR[0] + C_ARR[1] + C_ARR[2] + C_ARR[3];
+const C_REF: &[i32; 4] = &C_ARR;
+static S_VAL: i32 = C_ADD + C_ENUM;
+
+#[unsafe(no_mangle)]
+pub extern "C" fn main() -> i32 {
+    C_ADD + C_FACT + C_PAIR_SUM + C_ENUM + C_ARR_SUM + C_REF[2] + S_VAL
+}
+"#;
+
+    /// Oracle 4: side-by-side const evaluation (`blaze_body_eval::eval_body` vs legacy
+    /// `blaze_consteval::value_of`) across all `const` and `static` items in ladder rungs
+    /// plus a dedicated `const fn` / struct / enum / array / static suite.
+    #[test]
+    fn d119_ladder_body_eval_vs_consteval_oracle() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let mut compared = 0u32;
+        let mut diffs = AString::new_in(alloc);
+
+        let check_files = |label: &str, files: &[(&str, &str)], compared: &mut u32, diffs: &mut AString<'_>| {
+            let mut views = AVec::with_capacity_in(files.len(), alloc);
+            for &(path, text) in files {
+                views.push(crate::refusal::SourceFile { path, text });
+            }
+            let mut attrs = crate::front::BlazeAttrs::default();
+            let Ok(mut program) = crate::front::Front::new(&views, "src/main.rs", &mut attrs, alloc) else {
+                return;
+            };
+            let Ok(checked) = crate::seam::FrontEnd::check_all(&mut program) else {
+                return;
+            };
+            let program = &program;
+            let checked = &checked;
+            let n = crate::seam::FrontEnd::fn_count(program);
+            let mut raw_kept: AVec<'_, Option<AVec<'_, u8>>> = AVec::with_capacity_in(n, alloc);
+            for i in 0..n {
+                let function = crate::seam::FrontEnd::function(program, i);
+                if function.body.is_some()
+                    && let Some(done) = checked[i].as_ref()
+                {
+                    raw_kept.push(keep_frontend_body(program, i, done, checked, alloc).ok());
+                } else {
+                    raw_kept.push(None);
+                }
+            }
+            let mut kept: AVec<'_, Option<blaze_body::Kept<'_, Alloc<'_>>>> = AVec::with_capacity_in(n, alloc);
+            for slot in raw_kept.iter() {
+                kept.push(slot.as_ref().and_then(|bytes| blaze_body::kept::open(bytes, alloc).ok()));
+            }
+
+            let mut world = OracleConstWorld { program, checked, kept, store: AVec::new_in(alloc) };
+            let mut ground = blaze_typeck::PortableTys::new_in(alloc);
+            let mut layout = blaze_build::layout::Layouts::new_in(alloc);
+            let mut codes = blaze_consteval::Codes::new_in(alloc);
+
+            for i in 0..n {
+                let function = crate::seam::FrontEnd::function(program, i);
+                if !matches!(function.kind, crate::front::FnKind::Const | crate::front::FnKind::Static)
+                    || function.body.is_none()
+                    || function.condition
+                {
+                    continue;
+                }
+                // Settle dependencies in legacy evaluator first so `world.store` holds prerequisites.
+                let mut settle = blaze_consteval::Settle::new(
+                    blaze_consteval::Need { kind: blaze_consteval::NeedKind::Value, item: function.key, args: blaze_typeck::List::EMPTY },
+                    64,
+                    alloc,
+                );
+                let mut old_key = None;
+                let mut old_err = None;
+                while let Some(need) = settle.next() {
+                    match blaze_consteval::value_of(&world, &mut layout, &mut codes, need.item, need.args, &mut ground, blaze_consteval::Limits::DEFAULT, alloc) {
+                        Ok(blaze_consteval::Answer::Done(record)) => {
+                            old_key = Some(record.key);
+                            if !world.store.iter().any(|r| r.key == record.key) {
+                                world.store.push(record);
+                            }
+                            settle.done();
+                        }
+                        Ok(blaze_consteval::Answer::Need(dep)) => {
+                            if let Err(e) = settle.need(dep) {
+                                old_err = Some(e);
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            old_err = Some(e);
+                            break;
+                        }
+                    }
+                }
+                if let Some(e) = old_err {
+                    let _ = writeln!(diffs, "LEGACY_EVAL_ERR {label}::{}: {e:?}", function.path);
+                    continue;
+                }
+                let Some(old_rec) = old_key.and_then(|k| world.store.iter().find(|r| r.key == k)) else {
+                    continue;
+                };
+
+                // Now evaluate the EXACT same item via `blaze_body_eval::eval_body`!
+                match blaze_body_eval::eval_body(&world, &mut layout, &mut ground, function.key, blaze_typeck::List::EMPTY, blaze_consteval::Limits::DEFAULT, alloc) {
+                    Ok(blaze_consteval::Answer::Done(new_data)) => {
+                        let same_len = old_rec.data.allocs.len() == new_data.allocs.len();
+                        let same_allocs = same_len
+                            && old_rec.data.allocs.iter().zip(new_data.allocs.iter()).all(|(a, b)| {
+                                a.bytes == b.bytes && a.align == b.align && a.mutable == b.mutable && a.relocs == b.relocs
+                            });
+                        if !same_allocs {
+                            let _ = writeln!(
+                                diffs,
+                                "EVAL_MISMATCH {label}::{}: old_allocs={} new_allocs={} old0={:?} new0={:?}",
+                                function.path,
+                                old_rec.data.allocs.len(),
+                                new_data.allocs.len(),
+                                old_rec.data.allocs.first().map(|a| &a.bytes),
+                                new_data.allocs.first().map(|a| &a.bytes),
+                            );
+                        } else {
+                            *compared += 1;
+                        }
+                    }
+                    Ok(blaze_consteval::Answer::Need(need)) => {
+                        let _ = writeln!(diffs, "BODY_EVAL_NEED {label}::{}: {need:?}", function.path);
+                    }
+                    Err(e) => {
+                        let _ = writeln!(diffs, "BODY_EVAL_ERR {label}::{}: {e:?}", function.path);
+                    }
+                }
+            }
+        };
+
+        check_files("const_oracle_src", &[("src/main.rs", CONST_ORACLE_SRC)], &mut compared, &mut diffs);
+        for rung in LADDER_RUNGS {
+            check_files(rung.name, rung.files, &mut compared, &mut diffs);
+        }
+        assert!(diffs.is_empty() && compared >= 8, "D119 body-eval vs consteval oracle ({compared} matched):\n{diffs}");
     }
 }
 

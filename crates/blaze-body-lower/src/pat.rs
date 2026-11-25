@@ -1228,7 +1228,9 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
     /// refused) and the scrutinee shallowly borrowed, so the guard cannot change what matched.
     pub(crate) fn match_into(&mut self, dest: Place, e: ExprId, scrutinee: ExprId, arms: List) -> Result<(), LowerError> {
         let span = self.span(e);
-        let tm = self.open();
+        // The Reference, [destructors.scope.temporary]: the scrutinee of a `match` expression is
+        // NOT a temporary scope, so temporaries in the scrutinee stay alive until the enclosing
+        // statement's temporary scope ends.
         let sty = self.adjusted_ty(scrutinee)?;
         let sp = self.place(scrutinee)?;
         self.b.push(StmtKind::FakeRead(sp), span);
@@ -1376,12 +1378,10 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
                 self.close(span)?;
             }
             self.close(span)?;
-            self.emit_exit(tm, span)?;
             self.goto(join, span);
             self.b.start(fail);
         }
         self.b.terminate(StmtKind::Unreachable, span);
-        self.pop_scope();
         self.b.start(join);
         Ok(())
     }
