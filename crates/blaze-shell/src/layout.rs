@@ -23,11 +23,11 @@ use crate::view::{
     format_value_cell_at, is_expandable_cell, truncate_chars, wrap_lines,
 };
 
-pub const TOP_BAR_H: f32 = 38.0;
-const TRAFFIC_LIGHTS_PAD: f32 = 82.0;
-const OUTER_PAD_X: f32 = 28.0;
-const BLOCK_PAD_Y: f32 = 16.0;
-const TABLE_ROW_PAD_Y: f32 = 4.5;
+pub const TOP_BAR_H: f32 = 34.0;
+const TRAFFIC_LIGHTS_PAD: f32 = 80.0;
+const OUTER_PAD_X: f32 = 16.0;
+const BLOCK_PAD_Y: f32 = 6.0;
+const TABLE_ROW_PAD_Y: f32 = 2.5;
 const MAX_POPUP_ROWS: usize = 8;
 const SIZE_BAR_W: f32 = 42.0;
 
@@ -72,7 +72,7 @@ pub fn build_scene(input: &LayoutInput<'_>) -> Scene {
     let col_x1 = (vw - OUTER_PAD_X).max(col_x0 + 200.0);
     let blocks = input.store.active_blocks();
 
-    let mut content_y = 14.0f32;
+    let mut content_y = 8.0f32;
     let mut prev_cwd: Option<&str> = None;
     for (idx, blk) in blocks.iter().enumerate() {
         if idx > 0 {
@@ -120,7 +120,7 @@ pub fn build_scene(input: &LayoutInput<'_>) -> Scene {
         input.drag,
     );
     let prompt_y1 = prompt_y0 + prompt_h;
-    content_y += prompt_h + 24.0;
+    content_y += prompt_h + 14.0;
     scene.total_content_height = content_y;
 
     // 4. Unified inline macOS titlebar (branch tabs, cwd/git pill, zoom, fork button).
@@ -336,7 +336,7 @@ fn layout_block(
     // Starship context line (`folder dir on  branch [?] ✦`) powered by `blaze-git`.
     if show_context {
         layout_starship_line(scene, &block.prompt_snapshot, x0, cur_y, x1 - x0, m, clip_id);
-        cur_y += m.ch + 8.0;
+        cur_y += m.ch + 2.0;
     }
 
     // Right-aligned quiet inline metadata on the command row: exit, duration, optional grid/table toggle, `fork`.
@@ -395,7 +395,7 @@ fn layout_block(
     };
     scene.text(x0, cur_y, "❯", prompt_col, true, false, clip_id);
 
-    let cmd_x = x0 + 2.2 * m.cw;
+    let cmd_x = x0 + 1.8 * m.cw;
     let cmd_max_x = (rx - 8.0).max(cmd_x + 100.0);
     let spans: Vec<HighlightSpan> = highlight(&block.source, Alloc::global())
         .iter()
@@ -413,32 +413,32 @@ fn layout_block(
     );
     cur_y += cmd_h;
 
-    // Body aligned cleanly under `cmd_x`.
+    // Body flows flush left at `x0` (just like a native terminal — zero extra left indent!).
     let has_body = !matches!(&block.body, BlockBody::Value(Value::Nothing));
     if has_body {
-        cur_y += 11.0;
-        let body_w = (x1 - cmd_x).max(120.0);
+        cur_y += 3.0;
+        let body_w = (x1 - x0).max(120.0);
         let body_h = match &block.body {
             BlockBody::Value(val) => {
-                layout_value(scene, block, val, cmd_x, cur_y, body_w, m, clip_id, 0, now_ns)
+                layout_value(scene, block, val, x0, cur_y, body_w, m, clip_id, 0, now_ns)
             }
             BlockBody::StreamAndValue { lines, value } => {
                 let mut sy = cur_y;
                 let max_cols = (body_w / m.cw).floor().max(20.0) as usize;
                 for line in lines {
                     for wrapped in wrap_lines(line, max_cols) {
-                        scene.text(cmd_x, sy, wrapped, theme::INK_2, false, false, clip_id);
-                        sy += m.ch + 2.0;
+                        scene.text(x0, sy, wrapped, theme::INK_2, false, false, clip_id);
+                        sy += m.ch + 1.0;
                     }
                 }
                 if !matches!(value, Value::Nothing) {
-                    sy += 6.0;
-                    sy += layout_value(scene, block, value, cmd_x, sy, body_w, m, clip_id, 0, now_ns);
+                    sy += 3.0;
+                    sy += layout_value(scene, block, value, x0, sy, body_w, m, clip_id, 0, now_ns);
                 }
                 sy - cur_y
             }
             BlockBody::Error { err } => {
-                layout_error_panel(scene, &block.source, err, cmd_x, cur_y, body_w, m, clip_id)
+                layout_error_panel(scene, &block.source, err, x0, cur_y, body_w, m, clip_id)
             }
             BlockBody::RustCell { compile_ms, run_ms, stdout, value, .. } => {
                 layout_rust_cell_body(
@@ -448,7 +448,7 @@ fn layout_block(
                     *run_ms,
                     stdout,
                     value,
-                    cmd_x,
+                    x0,
                     cur_y,
                     body_w,
                     m,
@@ -461,7 +461,7 @@ fn layout_block(
                     scene,
                     term,
                     *running && cursor_visible,
-                    cmd_x,
+                    x0,
                     cur_y,
                     body_w,
                     m,
@@ -669,9 +669,9 @@ fn layout_file_grid(
         total
     };
 
-    let icon_s = 14.5;
-    let icon_gap = 7.0;
-    let col_gap = 22.0;
+    let icon_s = 13.5;
+    let icon_gap = 5.0;
+    let col_gap = 14.0;
 
     // Pre-collect display labels + SVG icon names.
     struct GridItem {
@@ -723,11 +723,11 @@ fn layout_file_grid(
     }
 
     let nrows = visible.div_ceil(best_cols);
-    let row_h = m.ch + 7.0;
+    let row_h = m.ch + 2.0;
     let mut cur_y = y0;
 
     for r in 0..nrows {
-        let ty = cur_y + 3.0;
+        let ty = cur_y + 1.0;
         let iy = ty + (m.ch - icon_s) * 0.5;
         let mut cx = x0;
         for c in 0..best_cols {
@@ -1710,10 +1710,10 @@ fn layout_inline_prompt(
     }
 
     // Line 2+: `❯` prompt + editable syntax-highlighted text + Fish ghost text directly inline.
-    let input_y = y0 + m.ch + 7.0;
-    let line_step = m.ch + 4.0;
+    let input_y = y0 + m.ch + 2.0;
+    let line_step = m.ch + 2.0;
     let num_lines = editor.text.split('\n').count().max(1);
-    let text_h = (num_lines as f32 * line_step - 4.0).max(m.ch);
+    let text_h = (num_lines as f32 * line_step - 2.0).max(m.ch);
 
     // Subtle inline drop halo ONLY when dragging an item (`Cargo.lock`, etc.) into the prompt.
     if drag.is_some() {
@@ -1721,11 +1721,11 @@ fn layout_inline_prompt(
         let halo_fill = if drop_hover { theme::BG_SURFACE } else { [0.0; 4] };
         let bw = if drop_hover { 1.4 } else { 1.0 };
         scene.round_rect(
-            x0 - 10.0,
-            input_y - 6.0,
-            x1 + 10.0,
-            input_y + text_h + 6.0,
-            8.0,
+            x0 - 8.0,
+            input_y - 4.0,
+            x1 + 8.0,
+            input_y + text_h + 4.0,
+            6.0,
             halo_fill,
             bw,
             halo_border,
@@ -1742,12 +1742,12 @@ fn layout_inline_prompt(
     };
     scene.text(x0, input_y, "❯", prompt_col, true, false, clip_id);
 
-    let text_x = x0 + 2.2 * m.cw;
+    let text_x = x0 + 1.8 * m.cw;
     scene.composer_rect = HitRect::new(
-        (x0 - 10.0).max(0.0),
-        input_y - 6.0,
-        x1 + 10.0,
-        input_y + text_h + 8.0,
+        (x0 - 8.0).max(0.0),
+        input_y - 4.0,
+        x1 + 8.0,
+        input_y + text_h + 6.0,
     );
     scene.composer_text_origin = [text_x, input_y];
 
@@ -1770,15 +1770,6 @@ fn layout_inline_prompt(
     }
 
     let rendered_h = if editor.text.is_empty() {
-        scene.text(
-            text_x,
-            input_y,
-            "command, pipeline, or rust { ... }",
-            theme::GHOST_INK,
-            false,
-            false,
-            clip_id,
-        );
         m.ch
     } else {
         let spans = editor.highlight_spans();
@@ -1807,7 +1798,7 @@ fn layout_inline_prompt(
         scene.over_round_rect(cur_x, cur_y + 1.0, cur_x + 1.8, cur_y + m.ch - 1.0, 0.9, cur_col, clip_id);
     }
 
-    (input_y + rendered_h.max(text_h) - y0) + 4.0
+    (input_y + rendered_h.max(text_h) - y0) + 2.0
 }
 
 /// IntelliJ-style live autocomplete popup anchored directly below the inline prompt

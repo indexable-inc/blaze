@@ -1158,7 +1158,7 @@ mod macos_app {
                                 if shell.last_scene.composer_rect.contains(x, y) {
                                     let m = fonts.cell_metrics(scale);
                                     let [ox, oy] = shell.last_scene.composer_text_origin;
-                                    let line_step = (m.ch + 4.0).max(1.0);
+                                    let line_step = (m.ch + 2.0).max(1.0);
                                     let line = ((y - oy).max(0.0) / line_step).floor() as usize;
                                     let col = (((x - ox).max(0.0) + m.cw * 0.45) / m.cw).floor() as usize;
                                     let clicks = ev.clickCount();
