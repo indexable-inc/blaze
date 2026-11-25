@@ -7515,6 +7515,12 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         if self.call_through_fndef_local(c, args, dest, dest_ty, e)? {
             return Ok(());
         }
+        // A fn-pointer parameter of a closure (e.g. `|label: &str, edit: fn(&mut Tx)| { edit(&mut tx); }`)
+        // whose output carries no lifetime slots and whose inputs are higher-ranked (`for<..>`).
+        if self.call_through_closure_fn_ptr_param(c, args, dest, dest_ty, e)? {
+            self.stats.calls_by_signature += 1;
+            return Ok(());
+        }
         let param = match self.expr(c)? {
             Expr::Local(p) => self.body.params.iter().position(|x| *x == p),
             _ => None,
@@ -8427,6 +8433,53 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             self.call_by_rule(&crate::one_call::CallSite { e, vs: args, ins: &[], tp: dest, ty: dest_ty, out, callee: Some((item, ty_args)) })?;
         }
         Ok(true)
+    }
+
+    /// Calls a fn-pointer parameter of an enclosing closure (e.g. `|edit: fn(&mut Tx)| edit(&mut tx)`)
+    /// when its return type carries zero lifetime slots and its written parameter type carries no
+    /// explicit `'static`/named lifetime annotations (so every input lifetime is higher-ranked).
+    fn call_through_closure_fn_ptr_param(&mut self, c: ExprId, args: &[Val], dest: Place, dest_ty: TyD, e: ExprId) -> Result<bool, Refusal> {
+        let Expr::Local(p) = self.expr(c)? else { return Ok(false) };
+        if dest_ty.wrap.is_some() || args.iter().any(|v| v.ty.wrap.is_some()) || self.npos_d(dest_ty, e)? != 0 {
+            return Ok(false);
+        }
+        let Ok(c_ty) = self.expr_ty(c) else { return Ok(false) };
+        let Ok(PNode::FnPtr(fn_list, _)) = self.node(c_ty, c) else { return Ok(false) };
+        if self.list(fn_list, e)?.len() != args.len() + 1 {
+            return Ok(false);
+        }
+        let mut found: Option<(ExprId, u32)> = None;
+        for (ix, expr) in self.body.exprs.iter().enumerate() {
+            let Expr::Closure { params, param_tys, .. } = *expr else { continue };
+            let Some(ps) = self.body.pat_lists.get(params.range()) else { continue };
+            let Some(pi) = ps.iter().position(|&q| q == p) else { continue };
+            let Some(ce_u32) = u32::try_from(ix).ok() else { return Ok(false) };
+            let Some(pi_u32) = u32::try_from(pi).ok() else { return Ok(false) };
+            let written = self.body.opt_types.get(param_tys.range()).and_then(|l| l.get(pi)).is_some_and(Option::is_some);
+            if !written {
+                return Ok(false);
+            }
+            found = Some((ExprId(ce_u32), pi_u32));
+            break;
+        }
+        let Some((ce, pi)) = found else { return Ok(false) };
+        // If any explicit `'static` or named lifetime was written inside this fn-pointer param,
+        // do not assume all input lifetimes are independent higher-ranked binders.
+        if self.body.closure_param_regions.iter().any(|r| r.closure == ce && r.param == pi) {
+            return Ok(false);
+        }
+        let mut ends: Vec<u32, A> = Vec::new_in(self.alloc);
+        let mut at = 0u32;
+        for v in args.iter() {
+            at += self.npos_d(v.ty, e)?;
+            ends.push(at);
+        }
+        let mut regions: Vec<Region, A> = Vec::new_in(self.alloc);
+        for k in 0..at {
+            regions.push(Region::Late { binder: 0, var: k });
+        }
+        let laid = Laid { regions: &regions, ends: &ends, bounds: &[] };
+        self.call_laid(laid, &[], args, dest, dest_ty, e)
     }
 
     fn local_call_init(&self, p: PatId) -> Option<ItemKey> {

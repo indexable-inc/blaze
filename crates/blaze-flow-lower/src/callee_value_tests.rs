@@ -21,12 +21,13 @@ pub(crate) struct Lane {
     /// The closure expression `reqs` are for.
     pub(crate) closure: Option<ExprId>,
     pub(crate) reqs: &'static [Requirement],
+    pub(crate) fn_traits: [Option<ItemKey>; 3],
 }
 
 impl Lane {
     /// No head declared.
     pub(crate) fn new() -> Lane {
-        Lane { wide: Wide { sigs: Sigs::new(), life: None }, closure: None, reqs: &[] }
+        Lane { wide: Wide { sigs: Sigs::new(), life: None }, closure: None, reqs: &[], fn_traits: [None; 3] }
     }
 
     /// The heads of `w`'s `g`, `m` and `h` declared ([`World`]).
@@ -87,6 +88,9 @@ impl Facts for Lane {
     }
     fn alias_lifetimes(&self, _: blaze_typeck::ItemKey, _: blaze_typeck::Name) -> Option<u32> {
         None
+    }
+    fn is_fn_trait(&self, k: ItemKey) -> bool {
+        self.fn_traits.contains(&Some(k))
     }
     fn ties(&self, _: blaze_typeck::ItemKey) -> Option<crate::Ties<'_>> {
         None
@@ -368,6 +372,151 @@ fn a_closure_result_holds_its_capture() {
             assert!(planted.as_ref().is_ok_and(|p| p.is_empty()), "{planted:?}");
         } else {
             assert_eq!(got, Ok(std::vec::Vec::new()), "{got:?}");
+        }
+    }
+}
+
+/// Target 2 (`precompiles/src/error.rs::add_errors_to_registry` shape): a closure coerced to a
+/// higher-ranked trait object `dyn for<'a> Fn(&'a S) -> &'a S` (`SigFrom::Object`) reads the
+/// expecting object's `Fn*` predicates and ties its input and output `Late` regions so returning
+/// `data` does NOT trigger E0521 (`UnprovenOutlives`).
+#[test]
+fn object_coerced_hrtb_closure_ties_input_and_output_late_region() {
+    use blaze_typeck::regions::Region;
+
+    let mut items = None;
+    let mut fn_trait = None;
+    let mut fn_once_trait = None;
+    let w = world_with(|fx, _st, rs, unit| {
+        let sized = fx.tr("Sized", 1, no_clauses(), &[]);
+        let unsize = fx.tr("Unsize", 2, no_clauses(), &[]);
+        let coerce = fx.tr("CoerceUnsized", 2, no_clauses(), &[]);
+        let f_tr = fx.tr("Fn", 2, no_clauses(), &[]);
+        let fm_tr = fx.tr("FnMut", 2, no_clauses(), &[]);
+        let fo_tr = fx.tr("FnOnce", 2, no_clauses(), &["Output"]);
+        fx.lang(LangItem::Sized, sized);
+        fx.lang(LangItem::Unsize, unsize);
+        fx.lang(LangItem::CoerceUnsized, coerce);
+        fx.lang(LangItem::Fn, f_tr);
+        fx.lang(LangItem::FnMut, fm_tr);
+        fx.lang(LangItem::FnOnce, fo_tr);
+        let rs_list = fx.list(&[rs]);
+        let tup = fx.ty(PNode::Tuple(rs_list));
+        let tup_list = fx.list(&[tup]);
+        let ex_fn = fx.ty(PNode::ExTrait(f_tr, tup_list));
+        let ex_out = fx.ty(PNode::ExProj { trait_: fo_tr, name: Name::of("Output"), args: tup_list, term: rs });
+        let preds = fx.list(&[ex_fn, ex_out]);
+        let dyn_fn = fx.ty(PNode::Dynamic(preds));
+        let r_dyn = fx.ty(PNode::Ref(Mutbl::Not, dyn_fn));
+        let take = fx.func("take", 0, &[r_dyn], unit, no_clauses());
+        let f = fx.func("f", 0, &[rs], unit, no_clauses());
+        fn_trait = Some(f_tr);
+        fn_once_trait = Some(fo_tr);
+        items = Some((take, f, r_dyn));
+    });
+    let (take, f, r_dyn) = items.expect("declared");
+    let f_tr = fn_trait.expect("Fn");
+    let fo_tr = fn_once_trait.expect("FnOnce");
+
+    // Build `fn f(keep: &S) { take(&|data| data); }`.
+    let mut b = Bb::new();
+    let _keep = b.param("keep");
+    let p_data = b.bind("data");
+    let l_data = b.local(p_data);
+    let cl = b.closure(&[p_data], l_data);
+    let r_cl = b.borrow(Mutbl::Not, cl);
+    let callee = b.path(&["take"]);
+    let call = b.call(callee, &[r_cl]);
+    let st_call = b.semi(call);
+    let root = b.block(&[st_call], None);
+
+    let body = b.view(f, root);
+    let mut ck = crate::region_fixture::checked(&w.fx, &body);
+
+    // `take`'s declared signature: `fn take(_: &'0 (dyn for<'a> Fn(&'a S) -> &'a S + 'static))`.
+    // In `take`'s sig, root `FnPtr` is binder 0, so the `Dynamic` node is binder 1.
+    let late1 = Region::Late { binder: 1, var: 0 };
+    let mut lane = Lane::of(&w);
+    lane.fn_traits = [Some(f_tr), Some(fo_tr), None];
+    lane.wide.sigs.decls.trait_(f_tr, 0);
+    lane.wide.sigs.decls.trait_(fo_tr, 0);
+    lane.wide.sigs.decls.alias(fo_tr, "Output", 0);
+    lane.wide.add(
+        take,
+        FnHead { lifetimes: 1, late: &[0], outlives: &[], inputs: &[r_dyn], output: w.unit, slots: &[P0, Region::Static, late1, late1, late1] },
+    );
+    lane.wide.add(f, FnHead { lifetimes: 1, late: &[0], outlives: &[], inputs: &[w.rs], output: w.unit, slots: &[P0] });
+    let regions = lane.decls().lay(w.fx.t.view(), &mut ck.types);
+    let with = crate::region_fixture::WithRegions { base: &lane, regions: &regions };
+    let cf = crate::lower_closure_external(&body, &ck, cl, &with, crate::region_fixture::alloc()).expect("lower closure");
+    let report = blaze_flow::check(&cf.lowered.flow, crate::region_fixture::alloc()).expect("flow check");
+    assert!(report.moves.is_empty() && report.borrows.is_empty(), "HRTB dyn Fn closure returning `data` must have zero borrow errors: moves={} borrows={}", report.moves.len(), report.borrows.len());
+    assert_eq!(
+        cf.externals.iter().filter(|(_, ext)| *ext == crate::External::Late).count(),
+        2,
+        "both input and output positions must be tied as External::Late: {:?}",
+        cf.externals
+    );
+}
+
+/// Bonus (`retired_root_error_order_and_access_gas` shape): calling a fn-pointer parameter of a
+/// closure (`|edit: fn(&mut S)| { edit(&mut s); }`) lowers cleanly instead of refusing with
+/// `CalleeValueUnknown`, and still catches an active shared borrow across `edit(&mut s)`.
+#[test]
+fn closure_fn_ptr_param_call_lowers_cleanly() {
+    let mut owner = None;
+    let mut fn_ptr_ty = None;
+    let w = world_with(|fx, st, _rs, unit| {
+        let rms = fx.ty(PNode::Ref(Mutbl::Mut, st));
+        let fp_list = fx.list(&[rms, unit]);
+        let fp = fx.ty(PNode::FnPtr(fp_list, FnPtrHeader::RUST));
+        fn_ptr_ty = Some(fp);
+        owner = Some(fx.func("f", 0, &[st], unit, no_clauses()));
+    });
+    let f = owner.expect("declared");
+    let fp = fn_ptr_ty.expect("fn ptr");
+
+    for conflict in [false, true] {
+        let mut b = Bb::new();
+        let s = b.param("s");
+        let p_edit = b.bind("edit");
+        let l_edit = b.local(p_edit);
+        let l_s = b.local(s);
+        let m_s = b.borrow(Mutbl::Mut, l_s);
+        let call_edit = b.call(l_edit, &[m_s]);
+        let st_call = b.semi(call_edit);
+        let inner = if conflict {
+            let l_s2 = b.local(s);
+            let r_s = b.borrow(Mutbl::Not, l_s2);
+            let pr = b.bind("r");
+            let st_r = b.let_(pr, None, r_s);
+            let use_r = call1(&mut b, "g", pr);
+            let st_use = b.semi(use_r);
+            b.block(&[st_r, st_call, st_use], None)
+        } else {
+            b.block(&[st_call], None)
+        };
+        let cl = b.closure(&[p_edit], inner);
+        let pc = b.bind("c");
+        let st_let = b.let_(pc, None, cl);
+        let root = b.block(&[st_let], None);
+
+        let mut body = b.view(f, root);
+        let written = [Some(fp)];
+        body.types = w.fx.t.view();
+        body.opt_types = &written;
+        let mut ck = crate::region_fixture::checked(&w.fx, &body);
+
+        let mut lane = Lane::of(&w);
+        lane.wide.add(f, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[w.st], output: w.unit, slots: &[] });
+        let regions = lane.decls().lay(w.fx.t.view(), &mut ck.types);
+        let with = crate::region_fixture::WithRegions { base: &lane, regions: &regions };
+        let cf = crate::lower_closure_external(&body, &ck, cl, &with, crate::region_fixture::alloc()).expect("lower closure");
+        let report = blaze_flow::check(&cf.lowered.flow, crate::region_fixture::alloc()).expect("flow check");
+        if conflict {
+            assert!(!report.borrows.is_empty(), "NEGATIVE CONTROL: shared borrow across `edit(&mut s)` must error");
+        } else {
+            assert!(report.moves.is_empty() && report.borrows.is_empty(), "clean `edit(&mut s)` must have zero errors: moves={} borrows={}", report.moves.len(), report.borrows.len());
         }
     }
 }
