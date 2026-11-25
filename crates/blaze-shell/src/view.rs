@@ -6,6 +6,7 @@ use blaze_ui::shaders::{ClipRectGpu, RectInst, prim_kind};
 
 use crate::blocks::{BlockId, BranchId};
 use crate::theme;
+use crate::tiling::{PaneId, SplitAxis, TabId};
 
 /// Logical CSS-pixel dimensions of one monospace cell.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -84,6 +85,15 @@ pub enum HitAction {
     SwitchGitBranch(String),
     ChangeDir(String),
     InsertToken(String),
+    /// In-app tiling window manager & workspace tab actions.
+    SwitchTab(TabId),
+    NewTab,
+    CloseTab(TabId),
+    SplitPane(SplitAxis),
+    NewWindow,
+    FocusPane(PaneId),
+    ClosePane(PaneId),
+    ToggleZoomPane(PaneId),
 }
 
 /// Clickable UI target recorded during layout.
@@ -109,6 +119,17 @@ pub struct PreviewLine {
     pub spans: Vec<PreviewSpan>,
 }
 
+/// One entry inside a rich directory hover preview popover.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DirPreviewEntry {
+    pub name: String,
+    pub icon: &'static str,
+    pub is_dir: bool,
+    pub size_label: String,
+    pub kind_label: &'static str,
+    pub muted: bool,
+}
+
 /// Rich interactive hover popover kind attached to prompt capsule segments, icon buttons, & files.
 #[derive(Clone, Debug, PartialEq)]
 pub enum HoverKind {
@@ -118,7 +139,7 @@ pub enum HoverKind {
     GitChanges { files: Vec<(String, &'static str, &'static str)>, total: u32 },
     GitStashes { stashes: Vec<String>, total: u32 },
     Toolchains { items: Vec<(&'static str, &'static str, &'static str)> },
-    /// Hovering a file entry in `ls` grid or table; lazily hydrated into `FilePreview` by the app loop.
+    /// Hovering a file entry in `ls` grid or table; lazily hydrated into `FilePreview` / `DirPreview`.
     FileEntry { full_path: String, name: String, icon: Option<&'static str>, is_dir: bool },
     /// Hydrated rich syntax-highlighted / tabular / markdown preview popover rendered in dark glass.
     FilePreview {
@@ -128,6 +149,16 @@ pub enum HoverKind {
         meta: String,
         lines: Vec<PreviewLine>,
         truncated: bool,
+    },
+    /// Rich directory hover preview with SVG icons, `blaze-sniff` analysis, and right-aligned sizes.
+    DirPreview {
+        full_path: String,
+        name: String,
+        icon: Option<&'static str>,
+        meta: String,
+        entries: Vec<DirPreviewEntry>,
+        total_items: usize,
+        hidden_count: usize,
     },
 }
 
@@ -974,6 +1005,156 @@ impl Scene {
             }
         }
         None
+    }
+
+    /// Composite a full pane sub-scene (rendered for `[0..pane_w, top_offset..top_offset+pane_h]`)
+    /// cleanly into `pane_rect` inside the window's master [`Scene`].
+    ///
+    /// Base layers are tightly clipped to `pane_rect` (zero bleed between tiled panes); floating
+    /// overlays from the focused pane (`Ctrl+R`, hover previews, completions) float freely above
+    /// pane borders inside the full window viewport.
+    pub fn composite_pane(
+        &mut self,
+        sub: Scene,
+        pane_rect: HitRect,
+        top_offset: f32,
+        is_focused: bool,
+        win_w: f32,
+        win_h: f32,
+    ) {
+        let dx = pane_rect.x0;
+        let dy = pane_rect.y0 - top_offset;
+        let pane_clip = self.push_clip(pane_rect.x0, pane_rect.y0, pane_rect.x1, pane_rect.y1, 0.0);
+
+        let mut clip_map: Vec<u32> = Vec::with_capacity(sub.clips.len());
+        let mut overlay_clip_map: Vec<u32> = Vec::with_capacity(sub.clips.len());
+        for (i, c) in sub.clips.iter().enumerate() {
+            if i == 0 {
+                clip_map.push(pane_clip);
+                overlay_clip_map.push(0);
+            } else {
+                let cx0 = (c.rect[0] + dx).max(pane_rect.x0);
+                let cy0 = (c.rect[1] + dy).max(pane_rect.y0);
+                let cx1 = (c.rect[2] + dx).min(pane_rect.x1).max(cx0);
+                let cy1 = (c.rect[3] + dy).min(pane_rect.y1).max(cy0);
+                let id = self.push_clip(cx0, cy0, cx1, cy1, c.params[0]);
+                clip_map.push(id);
+
+                if is_focused {
+                    let ox0 = (c.rect[0] + dx).max(0.0);
+                    let oy0 = (c.rect[1] + dy).max(0.0);
+                    let ox1 = (c.rect[2] + dx).min(win_w).max(ox0);
+                    let oy1 = (c.rect[3] + dy).min(win_h).max(oy0);
+                    overlay_clip_map.push(self.push_clip(ox0, oy0, ox1, oy1, c.params[0]));
+                } else {
+                    overlay_clip_map.push(0);
+                }
+            }
+        }
+        let map_clip = |cid: u32| -> u32 {
+            clip_map.get(cid as usize).copied().unwrap_or(pane_clip)
+        };
+        let map_ov_clip = |cid: u32| -> u32 {
+            overlay_clip_map.get(cid as usize).copied().unwrap_or(0)
+        };
+        let xlat_rect = |mut r: RectInst, cid: u32| -> RectInst {
+            r.rect[0] += dx;
+            r.rect[1] += dy;
+            r.rect[2] += dx;
+            r.rect[3] += dy;
+            r.clip_info[0] = cid;
+            r
+        };
+        let xlat_hit = |r: HitRect| -> Option<HitRect> {
+            let x0 = (r.x0 + dx).max(pane_rect.x0);
+            let y0 = (r.y0 + dy).max(pane_rect.y0);
+            let x1 = (r.x1 + dx).min(pane_rect.x1);
+            let y1 = (r.y1 + dy).min(pane_rect.y1);
+            (x1 > x0 && y1 > y0).then_some(HitRect::new(x0, y0, x1, y1))
+        };
+
+        for r in sub.rects {
+            let cid = map_clip(r.clip_info[0]);
+            self.rects.push(xlat_rect(r, cid));
+        }
+        for mut t in sub.text_runs {
+            t.x += dx;
+            t.y += dy;
+            t.clip_id = map_clip(t.clip_id);
+            self.text_runs.push(t);
+        }
+        for mut ic in sub.icon_quads {
+            ic.x += dx;
+            ic.y += dy;
+            ic.clip_id = map_clip(ic.clip_id);
+            self.icon_quads.push(ic);
+        }
+        for r in sub.over_rects {
+            let cid = map_clip(r.clip_info[0]);
+            self.over_rects.push(xlat_rect(r, cid));
+        }
+
+        for h in sub.hit_regions {
+            if let Some(rect) = xlat_hit(h.rect) {
+                self.hit_regions.push(HitRegion { rect, action: h.action });
+            }
+        }
+        for hv in sub.hover_regions {
+            if let Some(rect) = xlat_hit(hv.rect) {
+                self.hover_regions.push(HoverRegion { rect, kind: hv.kind });
+            }
+        }
+        for sc in sub.scroll_regions {
+            if let Some(rect) = xlat_hit(sc.rect) {
+                self.scroll_regions.push(ScrollRegion {
+                    rect,
+                    block: sc.block,
+                    max_scroll_y: sc.max_scroll_y,
+                    max_scroll_x: sc.max_scroll_x,
+                });
+            }
+        }
+        for ds in sub.drag_sources {
+            if let Some(rect) = xlat_hit(ds.rect) {
+                self.drag_sources.push(DragSource { rect, payload: ds.payload });
+            }
+        }
+
+        if is_focused {
+            for r in sub.overlay_rects {
+                let cid = map_ov_clip(r.clip_info[0]);
+                self.overlay_rects.push(xlat_rect(r, cid));
+            }
+            for mut ic in sub.overlay_icons {
+                ic.x += dx;
+                ic.y += dy;
+                ic.clip_id = map_ov_clip(ic.clip_id);
+                self.overlay_icons.push(ic);
+            }
+            for mut t in sub.overlay_text {
+                t.x += dx;
+                t.y += dy;
+                t.clip_id = map_ov_clip(t.clip_id);
+                self.overlay_text.push(t);
+            }
+            self.composer_rect = HitRect::new(
+                sub.composer_rect.x0 + dx,
+                sub.composer_rect.y0 + dy,
+                sub.composer_rect.x1 + dx,
+                sub.composer_rect.y1 + dy,
+            );
+            self.composer_text_origin = [
+                sub.composer_text_origin[0] + dx,
+                sub.composer_text_origin[1] + dy,
+            ];
+            self.cursor_rect = sub.cursor_rect.map(|c| [c[0] + dx, c[1] + dy, c[2] + dx, c[3] + dy]);
+            self.popover_rect = sub
+                .popover_rect
+                .map(|r| HitRect::new(r.x0 + dx, r.y0 + dy, r.x1 + dx, r.y1 + dy));
+            self.total_content_height = sub.total_content_height;
+            self.scroll_viewport_height = sub.scroll_viewport_height;
+            self.input_top_y = sub.input_top_y + dy;
+        }
     }
 }
 

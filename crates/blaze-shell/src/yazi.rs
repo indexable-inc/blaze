@@ -22,7 +22,9 @@ use crate::layout::{TOP_BAR_H, layout_top_bar};
 use crate::prompt::PromptInfo;
 use crate::svg_icons::icon_name_for_file;
 use crate::theme;
-use crate::view::{CellMetrics, PreviewLine, PreviewSpan, Scene, truncate_chars};
+use crate::view::{
+    CellMetrics, DirPreviewEntry, HoverKind, PreviewLine, PreviewSpan, Scene, truncate_chars,
+};
 
 const MAX_PREVIEW_BYTES: usize = 256 * 1024;
 const MAX_DIR_ENTRIES: usize = 512;
@@ -54,7 +56,7 @@ pub struct YaziEntry {
 #[derive(Clone, Debug)]
 pub enum YaziPreview {
     Empty,
-    Directory(Vec<YaziEntry>),
+    Directory { meta: String, items: Vec<YaziEntry> },
     Rich(PreviewDoc<'static>),
     Error(String),
 }
@@ -157,8 +159,9 @@ impl YaziState {
             return;
         };
         if entry.is_dir {
-            let sub = read_dir_entries(&entry.path, self.show_hidden);
-            self.preview = YaziPreview::Directory(sub);
+            let (sub, _, markers) = read_dir_entries_detailed(&entry.path, self.show_hidden);
+            let meta = format_dir_summary(&entry.name, &sub, markers);
+            self.preview = YaziPreview::Directory { meta, items: sub };
             return;
         }
         self.preview = load_rich_preview(&entry.path, &entry.name, entry.size);
@@ -369,6 +372,62 @@ fn load_rich_preview(path: &Path, name: &str, size: u64) -> YaziPreview {
     buf.truncate(n);
     let doc = build_preview(name, &buf, size, YAZI_PREVIEW_LIMITS, Alloc::global());
     YaziPreview::Rich(doc)
+}
+
+/// Hydrate a hovered `ls` / `git status` file or folder entry into a rich `HoverKind::DirPreview`
+/// (with SVG icons, `blaze-sniff` folder analysis, semantic tags, and right-aligned sizes) or
+/// `HoverKind::FilePreview` (syntax highlighting, rendered Markdown, tabular lockfiles).
+pub fn load_hover_preview(
+    path: &Path,
+    name: &str,
+    icon: Option<&'static str>,
+    max_lines: usize,
+) -> HoverKind {
+    if let Ok(meta) = fs::metadata(path)
+        && meta.is_dir()
+    {
+        let (all_entries, hidden_count, markers) = read_dir_entries_detailed(path, false);
+        let total_items = all_entries.len();
+        let summary = format_dir_summary(name, &all_entries, markers);
+        let entries: Vec<DirPreviewEntry> = all_entries
+            .into_iter()
+            .take(max_lines)
+            .map(|e| {
+                let (kind_label, muted) = entry_kind_label(&e);
+                let size_label = if e.is_dir {
+                    String::new()
+                } else {
+                    format_size_bytes(e.size as i64)
+                };
+                DirPreviewEntry {
+                    name: e.name,
+                    icon: e.icon,
+                    is_dir: e.is_dir,
+                    size_label,
+                    kind_label,
+                    muted,
+                }
+            })
+            .collect();
+        return HoverKind::DirPreview {
+            full_path: path.to_string_lossy().into_owned(),
+            name: name.to_owned(),
+            icon: icon.or_else(|| Some(icon_name_for_file(name, Some("dir")))),
+            meta: summary,
+            entries,
+            total_items,
+            hidden_count,
+        };
+    }
+    let (meta, lines, truncated) = load_file_preview_lines(path, max_lines);
+    HoverKind::FilePreview {
+        full_path: path.to_string_lossy().into_owned(),
+        name: name.to_owned(),
+        icon,
+        meta,
+        lines,
+        truncated,
+    }
 }
 
 /// Read a bounded, rich styled file preview for `ls`/`git status` hover popovers (powered by
@@ -583,16 +642,35 @@ pub fn load_file_preview_lines(path: &Path, max_lines: usize) -> (String, Vec<Pr
 }
 
 fn read_dir_entries(dir: &Path, show_hidden: bool) -> Vec<YaziEntry> {
+    read_dir_entries_detailed(dir, show_hidden).0
+}
+
+fn read_dir_entries_detailed(
+    dir: &Path,
+    show_hidden: bool,
+) -> (Vec<YaziEntry>, usize, blaze_sniff::DirMarkers) {
     let Ok(rd) = fs::read_dir(dir) else {
-        return Vec::new();
+        return (Vec::new(), 0, blaze_sniff::DirMarkers::default());
     };
     let mut out = Vec::new();
+    let mut hidden_count = 0usize;
+    let mut markers = blaze_sniff::DirMarkers::default();
     for entry in rd.flatten() {
-        if out.len() >= MAX_DIR_ENTRIES {
-            break;
-        }
         let name = entry.file_name().to_string_lossy().into_owned();
+        match name.as_str() {
+            "Cargo.toml" => markers.has_cargo_toml = true,
+            "package.json" => markers.has_package_json = true,
+            "pyproject.toml" => markers.has_pyproject = true,
+            "go.mod" => markers.has_go_mod = true,
+            "flake.nix" => markers.has_flake_nix = true,
+            ".git" => markers.has_git = true,
+            _ => {}
+        }
         if !show_hidden && name.starts_with('.') {
+            hidden_count += 1;
+            continue;
+        }
+        if out.len() >= MAX_DIR_ENTRIES {
             continue;
         }
         let meta = entry.metadata().ok();
@@ -607,7 +685,41 @@ fn read_dir_entries(dir: &Path, show_hidden: bool) -> Vec<YaziEntry> {
             .cmp(&a.is_dir)
             .then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()))
     });
-    out
+    (out, hidden_count, markers)
+}
+
+fn format_dir_summary(
+    dir_name: &str,
+    entries: &[YaziEntry],
+    markers: blaze_sniff::DirMarkers,
+) -> String {
+    let sniff = blaze_sniff::sniff_dir(dir_name, markers);
+    let dirs = entries.iter().filter(|e| e.is_dir).count();
+    let files = entries.len().saturating_sub(dirs);
+    let d_word = if dirs == 1 { "dir" } else { "dirs" };
+    let f_word = if files == 1 { "file" } else { "files" };
+    match (dirs, files) {
+        (0, 0) => format!("{} · empty", sniff.label),
+        (d, 0) => format!("{} · {d} {d_word}", sniff.label),
+        (0, f) => format!("{} · {f} {f_word}", sniff.label),
+        (d, f) => format!("{} · {d} {d_word} · {f} {f_word}", sniff.label),
+    }
+}
+
+fn entry_kind_label(entry: &YaziEntry) -> (&'static str, bool) {
+    if entry.is_dir {
+        let sniff = blaze_sniff::sniff_dir(&entry.name, blaze_sniff::DirMarkers::default());
+        let muted = sniff.label == "Build output";
+        let lbl = if sniff.label == "Folder" { "" } else { sniff.label };
+        (lbl, muted)
+    } else {
+        let sniff = blaze_sniff::sniff_file(&entry.name, &[]);
+        let lbl = match sniff.label {
+            "Text" | "Empty" => "",
+            other => other,
+        };
+        (lbl, false)
+    }
 }
 
 pub(crate) fn token_color(kind: TokenKind) -> ([f32; 4], bool, bool) {
@@ -638,9 +750,38 @@ pub fn layout_yazi_view(
     zoom_pct: u16,
     inline_titlebar: bool,
 ) -> Scene {
+    layout_yazi_inner(yazi, store, prompt, viewport_w, viewport_h, m, zoom_pct, inline_titlebar, true)
+}
+
+/// Lay out `y` as a tiled pane (omits global window titlebar).
+#[allow(clippy::too_many_arguments)]
+pub fn layout_yazi_pane(
+    yazi: &mut YaziState,
+    store: &BlockStore,
+    prompt: &PromptInfo,
+    viewport_w: f32,
+    viewport_h: f32,
+    m: CellMetrics,
+    zoom_pct: u16,
+) -> Scene {
+    layout_yazi_inner(yazi, store, prompt, viewport_w, viewport_h, m, zoom_pct, false, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn layout_yazi_inner(
+    yazi: &mut YaziState,
+    store: &BlockStore,
+    prompt: &PromptInfo,
+    viewport_w: f32,
+    viewport_h: f32,
+    m: CellMetrics,
+    zoom_pct: u16,
+    inline_titlebar: bool,
+    draw_top_bar: bool,
+) -> Scene {
     let mut scene = Scene::new();
-    let vw = viewport_w.max(400.0);
-    let vh = viewport_h.max(260.0);
+    let vw = viewport_w.max(240.0);
+    let vh = viewport_h.max(200.0);
 
     let header_h = m.ch + 14.0;
     let footer_h = m.ch + 12.0;
@@ -748,24 +889,51 @@ pub fn layout_yazi_view(
             yazi.preview_max_scroll = 0;
             scene.text(px, body_top + 14.0, "no selection", theme::INK_4, false, true, clip3);
         }
-        YaziPreview::Directory(items) => {
-            let max_s = items.len().saturating_sub(max_vis_rows);
+        YaziPreview::Directory { meta, items } => {
+            let hdr_h = m.ch + 10.0;
+            scene.text(px, body_top + 8.0, meta.as_str(), theme::INK_4, false, false, clip3);
+            scene.line(px, body_top + hdr_h + 2.0, col3_x1 - 14.0, body_top + hdr_h + 2.0, 1.0, theme::LINE_FAINT, clip3);
+            let list_top = body_top + hdr_h + 6.0;
+            let dir_vis_rows = ((body_bot - list_top - 6.0) / row_h).floor().max(1.0) as usize;
+            let max_s = items.len().saturating_sub(dir_vis_rows);
             yazi.preview_max_scroll = max_s;
             let sc = yazi.preview_scroll.min(max_s);
             yazi.preview_scroll = sc;
             if items.is_empty() {
-                scene.text(px, body_top + 14.0, "empty directory", theme::INK_4, false, true, clip3);
+                scene.text(px, list_top + 8.0, "empty directory", theme::INK_4, false, true, clip3);
             } else {
-                for (i, sub) in items.iter().skip(sc).take(max_vis_rows).enumerate() {
-                    let ry = body_top + 6.0 + i as f32 * row_h;
+                let sz_col_w = 9.0 * m.cw;
+                let show_kind = pw >= 290.0;
+                let kind_col_w = if show_kind { 14.0 * m.cw } else { 0.0 };
+                for (i, sub) in items.iter().skip(sc).take(dir_vis_rows).enumerate() {
+                    let ry = list_top + i as f32 * row_h;
                     let ty = ry + (row_h - m.ch) * 0.5;
-                    scene.svg_icon(px, ty + (m.ch - icon_s) * 0.5, icon_s, sub.icon, clip3);
-                    let max_c = ((pw - 24.0) / m.cw).floor().max(8.0) as usize;
+                    let (kind_lbl, muted) = entry_kind_label(sub);
+                    let alpha = if muted { 0.72 } else { 1.0 };
+                    scene.svg_icon_alpha(px, ty + (m.ch - icon_s) * 0.5, icon_s, sub.icon, alpha, clip3);
                     let lbl = if sub.is_dir { format!("{}/", sub.name) } else { sub.name.clone() };
-                    scene.text(px + 20.0, ty, truncate_chars(&lbl, max_c), theme::INK_2, false, false, clip3);
+                    let name_w = (pw - 24.0 - sz_col_w - kind_col_w - 8.0).max(8.0 * m.cw);
+                    let max_c = (name_w / m.cw).floor().max(8.0) as usize;
+                    let name_col = if muted {
+                        theme::INK_4
+                    } else if sub.is_dir {
+                        theme::INK_1
+                    } else {
+                        theme::INK_2
+                    };
+                    scene.text(px + 20.0, ty, truncate_chars(&lbl, max_c), name_col, false, false, clip3);
+                    if show_kind && !kind_lbl.is_empty() {
+                        let kx = col3_x1 - 18.0 - sz_col_w - kind_col_w;
+                        scene.text(kx, ty, truncate_chars(kind_lbl, 13), theme::INK_4, false, false, clip3);
+                    }
+                    if !sub.is_dir {
+                        let sz = format_size_bytes(sub.size as i64);
+                        let sw = sz.chars().count() as f32 * m.cw;
+                        scene.text(col3_x1 - 18.0 - sw, ty, sz, theme::INK_3, false, false, clip3);
+                    }
                 }
                 if max_s > 0 {
-                    draw_mini_scrollbar(&mut scene, col3_x1 - 9.0, body_top + 8.0, body_bot - 8.0, sc, max_s, max_vis_rows, items.len(), clip3);
+                    draw_mini_scrollbar(&mut scene, col3_x1 - 9.0, list_top, body_bot - 8.0, sc, max_s, dir_vis_rows, items.len(), clip3);
                 }
             }
         }
@@ -802,7 +970,7 @@ pub fn layout_yazi_view(
             let _ = doc.sniff.format_label(&mut s);
             format!(" · {s}")
         }
-        YaziPreview::Directory(items) => format!(" · {} items", items.len()),
+        YaziPreview::Directory { meta, .. } => format!(" · {meta}"),
         _ => String::new(),
     };
     let pos_lbl = if vis.is_empty() {
@@ -817,7 +985,9 @@ pub fn layout_yazi_view(
         scene.text(vw - 14.0 - hw, fty, hint, theme::INK_4, false, false, 0);
     }
 
-    layout_top_bar(&mut scene, store, prompt, vw, m, zoom_pct, inline_titlebar);
+    if draw_top_bar {
+        layout_top_bar(&mut scene, store, prompt, vw, m, zoom_pct, inline_titlebar);
+    }
     scene
 }
 

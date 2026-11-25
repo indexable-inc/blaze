@@ -284,9 +284,38 @@ pub fn layout_agent_hub(
     zoom_pct: u16,
     inline_titlebar: bool,
 ) -> Scene {
+    layout_agent_hub_inner(hub, store, prompt, viewport_w, viewport_h, m, zoom_pct, inline_titlebar, true)
+}
+
+/// Lay out the unified multi-server `agent` fleet overview inside a tiled pane.
+#[allow(clippy::too_many_arguments)]
+pub fn layout_agent_hub_pane(
+    hub: &AgentHub,
+    store: &BlockStore,
+    prompt: &PromptInfo,
+    viewport_w: f32,
+    viewport_h: f32,
+    m: CellMetrics,
+    zoom_pct: u16,
+) -> Scene {
+    layout_agent_hub_inner(hub, store, prompt, viewport_w, viewport_h, m, zoom_pct, false, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn layout_agent_hub_inner(
+    hub: &AgentHub,
+    store: &BlockStore,
+    prompt: &PromptInfo,
+    viewport_w: f32,
+    viewport_h: f32,
+    m: CellMetrics,
+    zoom_pct: u16,
+    inline_titlebar: bool,
+    draw_top_bar: bool,
+) -> Scene {
     let mut scene = Scene::new();
-    let vw = viewport_w.max(440.0);
-    let vh = viewport_h.max(280.0);
+    let vw = viewport_w.max(240.0);
+    let vh = viewport_h.max(200.0);
 
     let header_h = m.ch + 16.0;
     let footer_h = m.ch + 14.0;
@@ -398,6 +427,8 @@ pub fn layout_agent_hub(
         scene.text(vw - 14.0 - hw, fty, hints, theme::INK_4, false, false, 0);
     }
 
-    layout_top_bar(&mut scene, store, prompt, vw, m, zoom_pct, inline_titlebar);
+    if draw_top_bar {
+        layout_top_bar(&mut scene, store, prompt, vw, m, zoom_pct, inline_titlebar);
+    }
     scene
 }

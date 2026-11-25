@@ -158,7 +158,9 @@ pub fn icon_name_for_file(path: &str, kind: Option<&str>) -> &'static str {
     if is_dir {
         return match base_raw {
             ".github" => "folderGithub_dark",
-            "target" | ".blaze" | "node_modules" | "dist" | "build" => "folder_target",
+            "target" | ".blaze" | "node_modules" | "dist" | "build" | "out" | "__pycache__" => {
+                "folder_target"
+            }
             _ => "folder_macos",
         };
     }

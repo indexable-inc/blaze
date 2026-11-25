@@ -13,6 +13,7 @@ pub mod prompt;
 pub mod rust_cell;
 pub mod svg_icons;
 pub mod theme;
+pub mod tiling;
 pub mod view;
 pub mod yazi;
 pub mod zoxide;
@@ -1046,5 +1047,214 @@ mod tests {
             }
         }
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dir_hover_preview_has_rich_svg_icons_and_sniff_metadata() {
+        let dir = make_temp_dir("dir-hover");
+        fs::create_dir_all(dir.join("node_modules")).unwrap();
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("package.json"), r#"{"name":"site"}"#).unwrap();
+        fs::write(dir.join("bun.lock"), "{}").unwrap();
+        fs::write(dir.join("README.md"), "# Site\n").unwrap();
+        fs::write(dir.join(".env"), "KEY=1\n").unwrap();
+
+        let kind = crate::yazi::load_hover_preview(&dir, "site/", None, 16);
+        match kind {
+            crate::view::HoverKind::DirPreview { meta, entries, total_items, hidden_count, .. } => {
+                assert!(meta.contains("Web"), "expected Web sniff label, got {meta}");
+                assert!(meta.contains("2 dirs") && meta.contains("3 files"), "got {meta}");
+                assert_eq!(total_items, 5);
+                assert_eq!(hidden_count, 1);
+                let nm = entries.iter().find(|e| e.name == "node_modules").unwrap();
+                assert_eq!(nm.icon, "folder_target");
+                assert!(nm.muted);
+                assert_eq!(nm.kind_label, "Build output");
+                let pkg = entries.iter().find(|e| e.name == "package.json").unwrap();
+                assert_eq!(pkg.icon, "json_dark");
+                assert!(!pkg.size_label.is_empty());
+                let md = entries.iter().find(|e| e.name == "README.md").unwrap();
+                assert_eq!(md.icon, "markdown_dark");
+            }
+            other => panic!("expected HoverKind::DirPreview, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tiling_wm_invariants_and_scene_compositing() {
+        use crate::layout::{
+            TOP_BAR_H, TabBarItem, build_pane_scene, draw_split_dividers, draw_tiled_pane_chrome,
+            layout_window_top_bar,
+        };
+        use crate::tiling::{CloseOutcome, FocusDir, SplitAxis, TileManager};
+        use crate::view::{HitRect, Scene};
+
+        let (mut wm, t1, p1) = TileManager::new();
+        assert_eq!(wm.focused_pane(), p1);
+        assert_eq!(wm.tabs()[0].id, t1);
+
+        // Split vertically -> horizontally -> check directional navigation & zoom.
+        let p2 = wm.split_focused(SplitAxis::Vertical);
+        let _p3 = wm.split_focused(SplitAxis::Horizontal);
+        let area = HitRect::new(0.0, TOP_BAR_H, 1200.0, 800.0);
+        let tl = wm.layout(area, 2.0);
+        assert_eq!(tl.panes.len(), 3);
+        assert_eq!(tl.handles.len(), 2);
+
+        // Spatial navigation: from p3 (bottom-right) -> Up -> p2 (top-right) -> Left -> p1 (left).
+        assert_eq!(wm.focus_direction(FocusDir::Up, area, 2.0), Some(p2));
+        assert_eq!(wm.focus_direction(FocusDir::Left, area, 2.0), Some(p1));
+        assert_eq!(wm.focus_direction(FocusDir::Right, area, 2.0), Some(p2));
+
+        // Zoom collapses layout to 1 full-area pane, then unzoom restores all 3.
+        assert!(wm.toggle_zoom());
+        let zoomed = wm.layout(area, 2.0);
+        assert_eq!(zoomed.panes.len(), 1);
+        assert!(zoomed.is_zoomed);
+        assert!(wm.toggle_zoom());
+        assert_eq!(wm.layout(area, 2.0).panes.len(), 3);
+
+        // Workspace tabs: Cmd+T, Cmd+1..9, Cmd+W.
+        let (t2, p4) = wm.new_tab();
+        assert_eq!(wm.active_tab().id, t2);
+        assert_eq!(wm.focused_pane(), p4);
+        assert_eq!(wm.select_tab_slot(1), Some(p2));
+        assert_eq!(wm.select_tab_slot(9), Some(p4));
+        assert!(matches!(wm.close_focused(), CloseOutcome::TabClosed { .. }));
+        assert_eq!(wm.tabs().len(), 1);
+
+        // Deterministic 120-step fuzz verifying zero overlap & focused-pane invariant at narrow & wide sizes.
+        let mut rng: u64 = 0x5EED_CAFE_1234_5678;
+        let mut next_u32 = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (rng >> 32) as u32
+        };
+        for _ in 0..120 {
+            let op = next_u32() % 10;
+            match op {
+                0 if wm.active_tab().root.leaf_count() < 6 => {
+                    let _ = wm.split_focused(SplitAxis::Vertical);
+                }
+                1 if wm.active_tab().root.leaf_count() < 6 => {
+                    let _ = wm.split_focused(SplitAxis::Horizontal);
+                }
+                2 if wm.tabs().len() < 5 => {
+                    let _ = wm.new_tab();
+                }
+                3 => {
+                    let slot = (next_u32() as usize % 9) + 1;
+                    let _ = wm.select_tab_slot(slot);
+                }
+                4 => {
+                    let dir = [FocusDir::Left, FocusDir::Right, FocusDir::Up, FocusDir::Down]
+                        [(next_u32() % 4) as usize];
+                    let _ = wm.focus_direction(dir, area, 2.0);
+                }
+                5 => {
+                    let _ = wm.toggle_zoom();
+                }
+                6 => {
+                    let dir = [FocusDir::Left, FocusDir::Right, FocusDir::Up, FocusDir::Down]
+                        [(next_u32() % 4) as usize];
+                    let _ = wm.nudge_focused_split(dir, 0.08);
+                }
+                7 => wm.equalize_splits(),
+                8 => {
+                    let _ = wm.cycle_pane(1);
+                }
+                _ => {
+                    if wm.tabs().len() > 1 || wm.active_tab().root.leaf_count() > 1 {
+                        let _ = wm.close_focused();
+                    }
+                }
+            }
+            let focused = wm.focused_pane();
+            assert!(wm.active_tab().root.contains(focused), "focused pane must exist in tree");
+            for &(w, h) in &[(320.0f32, 240.0f32), (1200.0, 800.0)] {
+                let a = HitRect::new(0.0, TOP_BAR_H, w, h);
+                let l = wm.layout(a, 2.0);
+                for (i, pa) in l.panes.iter().enumerate() {
+                    assert!(pa.rect.x1 > pa.rect.x0 && pa.rect.y1 > pa.rect.y0);
+                    for pb in &l.panes[i + 1..] {
+                        let ox = pa.rect.x1.min(pb.rect.x1) - pa.rect.x0.max(pb.rect.x0);
+                        let oy = pa.rect.y1.min(pb.rect.y1) - pa.rect.y0.max(pb.rect.y0);
+                        assert!(ox <= 0.0 || oy <= 0.0, "panes must never overlap: {pa:?} vs {pb:?}");
+                    }
+                }
+            }
+        }
+
+        // Verify Scene::composite_pane + layout_window_top_bar end-to-end.
+        let alloc = Alloc::global();
+        let state = EngineState::new("/tmp", &[("HOME", "/tmp")], alloc);
+        let store = BlockStore::new(state.fork());
+        let prompt = PromptInfo::from_cwd("/tmp", "/tmp", 0, 0);
+        let editor = Editor::new();
+        let l = wm.layout(area, 2.0);
+        let mut master = Scene::new();
+        for pl in &l.panes {
+            let content = draw_tiled_pane_chrome(
+                &mut master,
+                pl.pane,
+                pl.rect,
+                pl.focused,
+                "tmp",
+                Some("main"),
+                None,
+                CellMetrics::default(),
+            );
+            let sub = build_pane_scene(&LayoutInput {
+                store: &store,
+                editor: &editor,
+                prompt: &prompt,
+                viewport_w: content.x1 - content.x0,
+                viewport_h: (content.y1 - content.y0) + TOP_BAR_H,
+                metrics: CellMetrics::default(),
+                scroll_y: 0.0,
+                cursor_visible: pl.focused,
+                now_ns: 1_732_500_000_000_000_000,
+                zoom_pct: 100,
+                inline_titlebar: false,
+                drag: None,
+                cursor_trail: None,
+                text_selection: None,
+                active_popover: None,
+                mouse_pos: None,
+                output_nav: None,
+            });
+            master.composite_pane(sub, content, TOP_BAR_H, pl.focused, 1200.0, 800.0);
+        }
+        draw_split_dividers(&mut master, &l.handles, None);
+        let tabs = [TabBarItem {
+            id: wm.active_tab().id,
+            slot: 1,
+            title: "tmp",
+            active: true,
+            pane_count: l.pane_count_in_tab,
+            zoomed: l.is_zoomed,
+            process_tag: None,
+        }];
+        layout_window_top_bar(
+            &mut master,
+            &tabs,
+            wm.focused_pane(),
+            l.is_zoomed,
+            l.pane_count_in_tab,
+            &store,
+            &prompt,
+            1200.0,
+            CellMetrics::default(),
+            100,
+            true,
+        );
+        assert!(master.hit_regions.iter().any(|h| h.action == HitAction::NewTab));
+        assert!(master.hit_regions.iter().any(|h| h.action == HitAction::NewWindow));
+        assert!(
+            master
+                .hit_regions
+                .iter()
+                .any(|h| h.action == HitAction::SplitPane(SplitAxis::Vertical))
+        );
     }
 }

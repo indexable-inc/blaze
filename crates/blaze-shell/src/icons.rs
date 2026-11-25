@@ -29,6 +29,12 @@ pub enum Icon {
     Stash,
     Laptop,
     Server,
+    SplitV,
+    SplitH,
+    Plus,
+    Close,
+    Maximize,
+    NewWindow,
 }
 
 /// Infer the best semantic icon and restrained `ix.dev/blaze` accent color for a filesystem entry.
@@ -422,6 +428,73 @@ pub fn draw_icon(
             );
             scene.over_circle(x + s * 0.28, y + s * 0.30, s * 0.065, color, clip_id);
             scene.over_circle(x + s * 0.28, y + s * 0.70, s * 0.065, color, clip_id);
+        }
+        Icon::SplitV => {
+            // Side-by-side vertical split icon (two columns inside a rounded frame).
+            scene.round_rect(
+                x + s * 0.10,
+                y + s * 0.14,
+                x + s * 0.90,
+                y + s * 0.86,
+                s * 0.14,
+                [0.0; 4],
+                t,
+                color,
+                clip_id,
+            );
+            scene.line(cx, y + s * 0.16, cx, y + s * 0.84, t, color, clip_id);
+        }
+        Icon::SplitH => {
+            // Stacked horizontal split icon (two rows inside a rounded frame).
+            scene.round_rect(
+                x + s * 0.10,
+                y + s * 0.14,
+                x + s * 0.90,
+                y + s * 0.86,
+                s * 0.14,
+                [0.0; 4],
+                t,
+                color,
+                clip_id,
+            );
+            scene.line(x + s * 0.12, cy, x + s * 0.88, cy, t, color, clip_id);
+        }
+        Icon::Plus => {
+            scene.line(cx, y + s * 0.20, cx, y + s * 0.80, t * 1.05, color, clip_id);
+            scene.line(x + s * 0.20, cy, x + s * 0.80, cy, t * 1.05, color, clip_id);
+        }
+        Icon::Close => {
+            let p0 = s * 0.24;
+            let p1 = s * 0.76;
+            scene.line(x + p0, y + p0, x + p1, y + p1, t * 1.05, color, clip_id);
+            scene.line(x + p1, y + p0, x + p0, y + p1, t * 1.05, color, clip_id);
+        }
+        Icon::Maximize => {
+            // Crisp diagonal expand corners for pane zoom (`Cmd+Shift+Enter`).
+            let p0 = s * 0.18;
+            let p1 = s * 0.82;
+            let arm = s * 0.24;
+            scene.line(x + p0, y + p0, x + p0 + arm, y + p0, t, color, clip_id);
+            scene.line(x + p0, y + p0, x + p0, y + p0 + arm, t, color, clip_id);
+            scene.line(x + p1, y + p1, x + p1 - arm, y + p1, t, color, clip_id);
+            scene.line(x + p1, y + p1, x + p1, y + p1 - arm, t, color, clip_id);
+        }
+        Icon::NewWindow => {
+            // Crisp macOS window frame with subtle top bar + plus sign (`Cmd+N`).
+            scene.round_rect(
+                x + s * 0.10,
+                y + s * 0.14,
+                x + s * 0.90,
+                y + s * 0.86,
+                s * 0.14,
+                [0.0; 4],
+                t,
+                color,
+                clip_id,
+            );
+            scene.line(x + s * 0.12, y + s * 0.36, x + s * 0.88, y + s * 0.36, t * 0.9, color, clip_id);
+            scene.line(cx, y + s * 0.48, cx, y + s * 0.74, t * 0.95, color, clip_id);
+            scene.line(cx - s * 0.13, y + s * 0.61, cx + s * 0.13, y + s * 0.61, t * 0.95, color, clip_id);
         }
     }
 }

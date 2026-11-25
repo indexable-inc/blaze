@@ -22,6 +22,7 @@ use crate::icons::{Icon, draw_icon, icon_for_record_key};
 use crate::prompt::PromptInfo;
 use crate::svg_icons::icon_name_for_file;
 use crate::theme;
+use crate::tiling::{PaneId, SplitAxis, SplitHandle, SplitId, TabId};
 use crate::view::{
     ActiveDrag, ActivePopover, CellMetrics, CursorTrail, DragPayload, HitAction, HitRect,
     HoverKind, OutputNav, OutputVisualMode, Scene, TextSelection, compute_text_selection,
@@ -30,6 +31,8 @@ use crate::view::{
 };
 
 pub const TOP_BAR_H: f32 = 34.0;
+pub const PANE_HEADER_H: f32 = 24.0;
+pub const TILE_GAP: f32 = 2.0;
 const TRAFFIC_LIGHTS_PAD: f32 = 80.0;
 const OUTER_PAD_X: f32 = 16.0;
 const BLOCK_PAD_Y: f32 = 6.0;
@@ -72,9 +75,18 @@ pub struct LayoutInput<'a> {
 /// The live prompt flows directly underneath the last command output (like a native
 /// terminal / TUI), with zero separate docked bottom pane.
 pub fn build_scene(input: &LayoutInput<'_>) -> Scene {
+    build_scene_inner(input, true)
+}
+
+/// Lay out the shell stream inside a tiled pane (omits the global window titlebar).
+pub fn build_pane_scene(input: &LayoutInput<'_>) -> Scene {
+    build_scene_inner(input, false)
+}
+
+fn build_scene_inner(input: &LayoutInput<'_>, draw_top_bar: bool) -> Scene {
     let mut scene = Scene::new();
-    let vw = input.viewport_w.max(320.0);
-    let vh = input.viewport_h.max(240.0);
+    let vw = input.viewport_w.max(220.0);
+    let vh = input.viewport_h.max(160.0);
     let m = input.metrics;
 
     // 1. Full-height scrollable stream below the unified inline titlebar (`clip_id = 1`).
@@ -198,15 +210,17 @@ pub fn build_scene(input: &LayoutInput<'_>) -> Scene {
     }
 
     // 4. Unified inline macOS titlebar (branch tabs, cwd/git pill, zoom, icon fork button).
-    layout_top_bar(
-        &mut scene,
-        input.store,
-        input.prompt,
-        vw,
-        m,
-        input.zoom_pct,
-        input.inline_titlebar,
-    );
+    if draw_top_bar {
+        layout_top_bar(
+            &mut scene,
+            input.store,
+            input.prompt,
+            vw,
+            m,
+            input.zoom_pct,
+            input.inline_titlebar,
+        );
+    }
 
     // 5. Floating overlays: Atuin-class Ctrl+R history palette, Tab completion popup, hover popover, drag chip.
     if let Some(rs) = &input.editor.reverse_search {
@@ -371,6 +385,467 @@ pub(crate) fn layout_top_bar(
             HitAction::SwitchBranch(branch.id),
         );
         x += tab_w + 8.0;
+    }
+}
+
+/// Summary descriptor for one workspace tab pill in the unified window titlebar.
+pub struct TabBarItem<'a> {
+    pub id: TabId,
+    /// 1-based workspace number (`Cmd+1..9`).
+    pub slot: usize,
+    pub title: &'a str,
+    pub active: bool,
+    pub pane_count: usize,
+    pub zoomed: bool,
+    pub process_tag: Option<&'a str>,
+}
+
+/// Render the SOTA window-level tiling titlebar: workspace tabs (`Cmd+1..9`), `+` (`Cmd+T`),
+/// zoomed badge (`Cmd+Shift+↵`), focused pane cwd/git status, and split/window controls
+/// (`Cmd+D`, `Cmd+Shift+D`, `Cmd+N`, `Cmd+B`).
+#[allow(clippy::too_many_arguments)]
+pub fn layout_window_top_bar(
+    scene: &mut Scene,
+    tabs: &[TabBarItem<'_>],
+    focused_pane: PaneId,
+    is_zoomed: bool,
+    pane_count_in_tab: usize,
+    store: &BlockStore,
+    prompt: &PromptInfo,
+    vw: f32,
+    m: CellMetrics,
+    zoom_pct: u16,
+    inline_titlebar: bool,
+) {
+    scene.round_rect(0.0, 0.0, vw, TOP_BAR_H, 0.0, theme::BG_TOPBAR, 0.0, [0.0; 4], 0);
+    scene.line(0.0, TOP_BAR_H - 0.5, vw, TOP_BAR_H - 0.5, 1.0, theme::LINE, 0);
+
+    let mid_y = (TOP_BAR_H - m.ch) * 0.5;
+    let icon_s = 11.5;
+    let icon_y = (TOP_BAR_H - icon_s) * 0.5;
+    let btn_y0 = 6.0;
+    let btn_y1 = TOP_BAR_H - 6.0;
+    let mut x = if inline_titlebar { TRAFFIC_LIGHTS_PAD } else { OUTER_PAD_X };
+
+    // Right-aligned tiling & window controls: Fork (Cmd+B), New Window (Cmd+N), Split H, Split V.
+    let mut rx = vw - 12.0;
+    let btn_w = 24.0;
+    let btn_gap = 5.0;
+    let push_icon_btn = |scene: &mut Scene,
+                             rx: &mut f32,
+                             icon: Icon,
+                             action: HitAction,
+                             title: &str,
+                             subtitle: &str| {
+        let bx0 = (*rx - btn_w).max(x + 20.0);
+        if bx0 <= x + 40.0 {
+            return;
+        }
+        let rect = HitRect::new(bx0, btn_y0, *rx, btn_y1);
+        scene.round_rect(bx0, btn_y0, *rx, btn_y1, 5.5, theme::BG_CHIP, 1.0, theme::LINE, 0);
+        draw_icon(scene, icon, bx0 + (btn_w - icon_s) * 0.5, icon_y, icon_s, theme::INK_2, 0);
+        scene.push_hit(rect, action);
+        scene.push_hover_clipped(
+            rect,
+            0,
+            HoverKind::Tooltip {
+                title: title.to_owned(),
+                subtitle: Some(subtitle.to_owned()),
+            },
+        );
+        *rx = bx0 - btn_gap;
+    };
+
+    push_icon_btn(
+        scene,
+        &mut rx,
+        Icon::Branch,
+        HitAction::ForkActiveBranch,
+        "Fork session branch",
+        "Cmd+B · O(1) CoW snapshot",
+    );
+    push_icon_btn(
+        scene,
+        &mut rx,
+        Icon::NewWindow,
+        HitAction::NewWindow,
+        "New window",
+        "Cmd+N · inherit cwd",
+    );
+    push_icon_btn(
+        scene,
+        &mut rx,
+        Icon::SplitH,
+        HitAction::SplitPane(SplitAxis::Horizontal),
+        "Split horizontally",
+        "Cmd+Shift+D · top / bottom",
+    );
+    push_icon_btn(
+        scene,
+        &mut rx,
+        Icon::SplitV,
+        HitAction::SplitPane(SplitAxis::Vertical),
+        "Split vertically",
+        "Cmd+D · left | right",
+    );
+    rx -= 5.0;
+
+    // Zoomed-pane badge (`Cmd+Shift+Enter` to unzoom back to full tiled layout).
+    if is_zoomed && pane_count_in_tab > 1 {
+        let z_lbl = format!("zoom 1/{pane_count_in_tab}");
+        let z_w = z_lbl.chars().count() as f32 * m.cw + 14.0;
+        let zx0 = (rx - z_w).max(x + 20.0);
+        if zx0 > x + 60.0 {
+            let rect = HitRect::new(zx0, btn_y0, rx, btn_y1);
+            scene.round_rect(
+                zx0,
+                btn_y0,
+                rx,
+                btn_y1,
+                5.5,
+                theme::rgb(0x23, 0x23, 0x28),
+                1.0,
+                theme::LINE_STRONG,
+                0,
+            );
+            scene.text(zx0 + 7.0, mid_y, z_lbl, theme::INK_1, true, false, 0);
+            scene.push_hit(rect, HitAction::ToggleZoomPane(focused_pane));
+            scene.push_hover_clipped(
+                rect,
+                0,
+                HoverKind::Tooltip {
+                    title: "Unzoom pane".to_owned(),
+                    subtitle: Some("Cmd+Shift+Enter".to_owned()),
+                },
+            );
+            rx = zx0 - 8.0;
+        }
+    }
+
+    // Quiet clickable UI zoom % pill when zoomed in/out (`Cmd+`/`Cmd-`).
+    if zoom_pct != 100 {
+        let z_lbl = format!("{zoom_pct}%");
+        let z_w = z_lbl.len() as f32 * m.cw + 14.0;
+        let zx0 = (rx - z_w).max(x + 20.0);
+        if zx0 > x + 60.0 {
+            scene.round_rect(zx0, btn_y0, rx, btn_y1, 5.5, theme::BG_CHIP, 1.0, theme::LINE, 0);
+            scene.text(zx0 + 7.0, mid_y, z_lbl, theme::INK_3, false, false, 0);
+            scene.push_hit(HitRect::new(zx0, btn_y0, rx, btn_y1), HitAction::ResetZoom);
+            rx = zx0 - 8.0;
+        }
+    }
+
+    // Inline repo/directory + branch + uncommitted file icons tucked cleanly on the right.
+    let dir_txt = truncate_chars(&prompt.dir_short, 20);
+    let branch_part = prompt.git_branch.as_deref().unwrap_or("");
+    let top_icons: &[(&'static str, u32)] = prompt
+        .git_status
+        .as_ref()
+        .map(|s| s.changed_icons.as_slice())
+        .unwrap_or(&[]);
+    let top_dirty_total: u32 = prompt
+        .git_status
+        .as_ref()
+        .map(|s| s.conflicted + s.staged + s.modified + s.deleted + s.untracked)
+        .unwrap_or(0);
+    let dir_icon_s = 13.0;
+    let mini_icon_s = 11.5;
+    let shown_top_icons = top_icons.len().min(3);
+    let dirty_count_str = if top_dirty_total > 0 {
+        format!("{top_dirty_total}")
+    } else {
+        String::new()
+    };
+    let mut info_w = dir_icon_s + 6.0 + dir_txt.chars().count() as f32 * m.cw;
+    if !branch_part.is_empty() {
+        info_w += 12.0 + icon_s + 5.0 + branch_part.chars().count() as f32 * m.cw;
+        if shown_top_icons > 0 {
+            info_w += 8.0 + shown_top_icons as f32 * (mini_icon_s + 2.5);
+            if !dirty_count_str.is_empty() {
+                info_w += 2.0 + dirty_count_str.len() as f32 * m.cw;
+            }
+        }
+    }
+    let info_x0 = rx - info_w - 6.0;
+    let tabs_limit = if info_x0 > x + 220.0 {
+        let mut ix = info_x0;
+        scene.svg_icon(ix, (TOP_BAR_H - dir_icon_s) * 0.5, dir_icon_s, "folder_macos", 0);
+        ix += dir_icon_s + 6.0;
+        scene.text(ix, mid_y, &dir_txt, theme::INK_2, false, false, 0);
+        ix += dir_txt.chars().count() as f32 * m.cw;
+        if !branch_part.is_empty() {
+            ix += 12.0;
+            draw_icon(scene, Icon::Branch, ix, icon_y, icon_s, theme::INK_3, 0);
+            ix += icon_s + 5.0;
+            scene.text(ix, mid_y, branch_part, theme::INK_2, false, false, 0);
+            ix += branch_part.chars().count() as f32 * m.cw;
+            if shown_top_icons > 0 {
+                ix += 8.0;
+                let miy = (TOP_BAR_H - mini_icon_s) * 0.5;
+                for &(ic, _) in top_icons.iter().take(shown_top_icons) {
+                    scene.svg_icon(ix, miy, mini_icon_s, ic, 0);
+                    ix += mini_icon_s + 2.5;
+                }
+                if !dirty_count_str.is_empty() {
+                    scene.text(ix + 2.0, mid_y, &dirty_count_str, theme::INK_3, false, false, 0);
+                }
+            }
+        }
+        info_x0 - 16.0
+    } else {
+        rx - 10.0
+    };
+
+    // Left: Workspace tabs (`1..N` via Cmd+1..9) + `+` button (`Cmd+T`) + CoW branch pills if >1 branch.
+    let plus_w = 24.0;
+    let tabs_end = (tabs_limit - plus_w - 6.0).max(x);
+    for tab in tabs {
+        let slot_str = format!("{} ", tab.slot);
+        let title_str = truncate_chars(tab.title, 18);
+        let badge_str = if tab.zoomed && tab.pane_count > 1 {
+            format!(" · Z{}", tab.pane_count)
+        } else if tab.pane_count > 1 {
+            format!(" · {}", tab.pane_count)
+        } else if let Some(proc_tag) = tab.process_tag {
+            format!(" · {proc_tag}")
+        } else {
+            String::new()
+        };
+        let pad_x = 8.0;
+        let slot_w = slot_str.chars().count() as f32 * m.cw;
+        let title_w = title_str.chars().count() as f32 * m.cw;
+        let badge_w = badge_str.chars().count() as f32 * m.cw;
+        let tab_w = pad_x * 2.0 + slot_w + title_w + badge_w;
+        if x + tab_w > tabs_end {
+            break;
+        }
+        if tab.active {
+            scene.round_rect(
+                x,
+                btn_y0,
+                x + tab_w,
+                btn_y1,
+                6.0,
+                theme::rgb(0x1b, 0x1b, 0x1f),
+                1.0,
+                theme::rgb(0x2d, 0x2d, 0x33),
+                0,
+            );
+        } else {
+            scene.round_rect(
+                x,
+                btn_y0,
+                x + tab_w,
+                btn_y1,
+                6.0,
+                theme::rgba(0x16, 0x16, 0x19, 0.55),
+                1.0,
+                theme::rgba(0x24, 0x24, 0x28, 0.6),
+                0,
+            );
+        }
+        let mut tx = x + pad_x;
+        let slot_col = if tab.active { theme::INK_3 } else { theme::INK_4 };
+        let title_col = if tab.active { theme::INK_1 } else { theme::INK_3 };
+        let badge_col = if tab.active { theme::INK_3 } else { theme::INK_4 };
+        scene.text(tx, mid_y, &slot_str, slot_col, false, false, 0);
+        tx += slot_w;
+        scene.text(tx, mid_y, &title_str, title_col, tab.active, false, 0);
+        tx += title_w;
+        if !badge_str.is_empty() {
+            scene.text(tx, mid_y, &badge_str, badge_col, false, false, 0);
+        }
+        let rect = HitRect::new(x, btn_y0, x + tab_w, btn_y1);
+        scene.push_hit(rect, HitAction::SwitchTab(tab.id));
+        scene.push_hover_clipped(
+            rect,
+            0,
+            HoverKind::Tooltip {
+                title: format!("Workspace {}", tab.slot),
+                subtitle: Some(if tab.slot <= 9 {
+                    format!("Cmd+{} · {} pane(s)", tab.slot, tab.pane_count)
+                } else {
+                    format!("{} pane(s)", tab.pane_count)
+                }),
+            },
+        );
+        x += tab_w + 6.0;
+    }
+
+    // Crisp `+` new workspace tab button (`Cmd+T`).
+    if x + plus_w <= tabs_limit {
+        let rect = HitRect::new(x, btn_y0, x + plus_w, btn_y1);
+        scene.round_rect(x, btn_y0, x + plus_w, btn_y1, 5.5, theme::BG_CHIP, 1.0, theme::LINE, 0);
+        draw_icon(scene, Icon::Plus, x + (plus_w - 10.5) * 0.5, (TOP_BAR_H - 10.5) * 0.5, 10.5, theme::INK_3, 0);
+        scene.push_hit(rect, HitAction::NewTab);
+        scene.push_hover_clipped(
+            rect,
+            0,
+            HoverKind::Tooltip {
+                title: "New workspace tab".to_owned(),
+                subtitle: Some("Cmd+T".to_owned()),
+            },
+        );
+        x += plus_w + 8.0;
+    }
+
+    // If the focused pane has >1 CoW session branch (`Cmd+B`), show compact branch switcher pills too.
+    if store.branches().len() > 1 {
+        let active_bid = store.active_branch_id();
+        for branch in store.branches() {
+            let is_active = branch.id == active_bid;
+            let name = branch.name.as_str();
+            let bw = 14.0 + icon_s + 4.0 + name.chars().count() as f32 * m.cw;
+            if x + bw > tabs_limit {
+                break;
+            }
+            if is_active {
+                scene.round_rect(x, btn_y0, x + bw, btn_y1, 5.5, theme::BG_CHIP, 1.0, theme::LINE_STRONG, 0);
+            }
+            draw_icon(scene, Icon::Branch, x + 6.0, icon_y, icon_s, if is_active { theme::INK_2 } else { theme::INK_4 }, 0);
+            scene.text(
+                x + 6.0 + icon_s + 4.0,
+                mid_y,
+                name,
+                if is_active { theme::INK_2 } else { theme::INK_4 },
+                is_active,
+                false,
+                0,
+            );
+            scene.push_hit(HitRect::new(x, btn_y0, x + bw, btn_y1), HitAction::SwitchBranch(branch.id));
+            x += bw + 5.0;
+        }
+    }
+}
+
+/// Draw crisp monochrome tiling pane header + subtle active/inactive border when `pane_count > 1`.
+/// Returns the inner content `HitRect` below the 24px pane header.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_tiled_pane_chrome(
+    scene: &mut Scene,
+    pane_id: PaneId,
+    outer: HitRect,
+    focused: bool,
+    title: &str,
+    branch: Option<&str>,
+    process_tag: Option<&str>,
+    m: CellMetrics,
+) -> HitRect {
+    let hdr_y1 = (outer.y0 + PANE_HEADER_H).min(outer.y1);
+    let hdr_bg = if focused {
+        theme::rgb(0x16, 0x16, 0x19)
+    } else {
+        theme::rgb(0x12, 0x12, 0x14)
+    };
+    let border_col = if focused {
+        theme::rgb(0x3a, 0x3a, 0x42)
+    } else {
+        theme::LINE_FAINT
+    };
+
+    // Header bar background + hairline bottom divider + active accent rail on top edge.
+    scene.round_rect(outer.x0, outer.y0, outer.x1, hdr_y1, 0.0, hdr_bg, 0.0, [0.0; 4], 0);
+    if focused {
+        scene.line(outer.x0, outer.y0 + 1.0, outer.x1, outer.y0 + 1.0, 2.0, theme::rgb(0x6e, 0x6e, 0x78), 0);
+    }
+    scene.line(outer.x0, hdr_y1 - 0.5, outer.x1, hdr_y1 - 0.5, 1.0, border_col, 0);
+
+    // Clicking anywhere on the header focuses the pane.
+    scene.push_hit(HitRect::new(outer.x0, outer.y0, outer.x1, hdr_y1), HitAction::FocusPane(pane_id));
+
+    let mid_y = outer.y0 + (PANE_HEADER_H - m.ch) * 0.5;
+    let mut lx = outer.x0 + 10.0;
+    let dot_col = if focused { theme::INK_1 } else { theme::INK_4 };
+    scene.over_circle(lx + 2.5, outer.y0 + PANE_HEADER_H * 0.5, 2.5, dot_col, 0);
+    lx += 11.0;
+
+    // Right-aligned Zoom + Close icon buttons on the pane header.
+    let btn_s = 10.0;
+    let btn_w = 20.0;
+    let mut rx = outer.x1 - 4.0;
+    if rx - btn_w > lx + 40.0 {
+        let close_r = HitRect::new(rx - btn_w, outer.y0 + 2.0, rx, hdr_y1 - 2.0);
+        draw_icon(
+            scene,
+            Icon::Close,
+            close_r.x0 + (btn_w - btn_s) * 0.5,
+            outer.y0 + (PANE_HEADER_H - btn_s) * 0.5,
+            btn_s,
+            theme::INK_4,
+            0,
+        );
+        scene.push_hit(close_r, HitAction::ClosePane(pane_id));
+        rx -= btn_w + 2.0;
+    }
+    if rx - btn_w > lx + 40.0 {
+        let zoom_r = HitRect::new(rx - btn_w, outer.y0 + 2.0, rx, hdr_y1 - 2.0);
+        draw_icon(
+            scene,
+            Icon::Maximize,
+            zoom_r.x0 + (btn_w - btn_s) * 0.5,
+            outer.y0 + (PANE_HEADER_H - btn_s) * 0.5,
+            btn_s,
+            theme::INK_4,
+            0,
+        );
+        scene.push_hit(zoom_r, HitAction::ToggleZoomPane(pane_id));
+        rx -= btn_w + 6.0;
+    }
+
+    // Folder icon + title + optional git branch / active process badge.
+    let icon_s = 11.5;
+    scene.svg_icon_alpha(
+        lx,
+        outer.y0 + (PANE_HEADER_H - icon_s) * 0.5,
+        icon_s,
+        "folder_macos",
+        if focused { 1.0 } else { 0.65 },
+        0,
+    );
+    lx += icon_s + 6.0;
+
+    let mut label = title.to_owned();
+    if let Some(br) = branch
+        && !br.is_empty()
+    {
+        label.push_str("  ·  ");
+        label.push_str(br);
+    }
+    if let Some(tag) = process_tag {
+        label.push_str("  [");
+        label.push_str(tag);
+        label.push(']');
+    }
+    let max_c = ((rx - lx) / m.cw).floor().max(6.0) as usize;
+    scene.text(
+        lx,
+        mid_y,
+        truncate_chars(&label, max_c),
+        if focused { theme::INK_1 } else { theme::INK_4 },
+        focused,
+        false,
+        0,
+    );
+
+    HitRect::new(outer.x0, hdr_y1, outer.x1, outer.y1.max(hdr_y1 + 20.0))
+}
+
+/// Draw crisp 1px hairline split dividers between tiled panes (highlighted while actively dragged).
+pub fn draw_split_dividers(scene: &mut Scene, handles: &[SplitHandle], dragging: Option<SplitId>) {
+    for h in handles {
+        let is_drag = dragging == Some(h.split);
+        let col = if is_drag { theme::INK_2 } else { theme::LINE };
+        let thick = if is_drag { 2.0 } else { 1.0 };
+        match h.axis {
+            SplitAxis::Vertical => {
+                let mx = (h.rect.x0 + h.rect.x1) * 0.5;
+                scene.over_round_rect(mx - thick * 0.5, h.rect.y0, mx + thick * 0.5, h.rect.y1, 0.0, col, 0);
+            }
+            SplitAxis::Horizontal => {
+                let my = (h.rect.y0 + h.rect.y1) * 0.5;
+                scene.over_round_rect(h.rect.x0, my - thick * 0.5, h.rect.x1, my + thick * 0.5, 0.0, col, 0);
+            }
+        }
     }
 }
 
@@ -2304,9 +2779,52 @@ pub fn layout_fullscreen_terminal(
     zoom_pct: u16,
     inline_titlebar: bool,
 ) -> Scene {
+    layout_fullscreen_terminal_inner(
+        term,
+        store,
+        prompt,
+        viewport_w,
+        viewport_h,
+        m,
+        cursor_on,
+        zoom_pct,
+        inline_titlebar,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn layout_fullscreen_terminal_pane(
+    term: &Terminal<'_>,
+    store: &BlockStore,
+    prompt: &PromptInfo,
+    viewport_w: f32,
+    viewport_h: f32,
+    m: CellMetrics,
+    cursor_on: bool,
+    zoom_pct: u16,
+) -> Scene {
+    layout_fullscreen_terminal_inner(
+        term, store, prompt, viewport_w, viewport_h, m, cursor_on, zoom_pct, false, false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn layout_fullscreen_terminal_inner(
+    term: &Terminal<'_>,
+    store: &BlockStore,
+    prompt: &PromptInfo,
+    viewport_w: f32,
+    viewport_h: f32,
+    m: CellMetrics,
+    cursor_on: bool,
+    zoom_pct: u16,
+    inline_titlebar: bool,
+    draw_top_bar: bool,
+) -> Scene {
     let mut scene = Scene::new();
-    let vw = viewport_w.max(320.0);
-    let vh = viewport_h.max(240.0);
+    let vw = viewport_w.max(220.0);
+    let vh = viewport_h.max(160.0);
     let colors = term.colors();
     let bg0 = colors
         .background
@@ -2328,7 +2846,9 @@ pub fn layout_fullscreen_terminal(
     draw_terminal_rows(&mut scene, term, pad_x, pad_y, rows, m, cursor_on, term_clip);
 
     // Keep session tabs, traffic-light clearance, cwd/branch, and fork button live in fullscreen!
-    layout_top_bar(&mut scene, store, prompt, vw, m, zoom_pct, inline_titlebar);
+    if draw_top_bar {
+        layout_top_bar(&mut scene, store, prompt, vw, m, zoom_pct, inline_titlebar);
+    }
     scene
 }
 
@@ -3623,17 +4143,48 @@ fn layout_active_popover(
                 .unwrap_or(28)
                 .max(name.chars().count() + meta.chars().count() + 6)
                 .min(72);
-            let w = (max_line_c as f32 * m.cw + pad_x * 2.0 + 16.0).clamp(300.0, 580.0);
+            let w = (max_line_c as f32 * m.cw + pad_x * 2.0 + 16.0)
+                .clamp(300.0, 580.0)
+                .min((vw - 24.0).max(240.0));
             let line_h = m.ch + 2.0;
             let extra = if *truncated { m.ch + 4.0 } else { 0.0 };
             let h = hdr_h + 6.0 + shown as f32 * line_h + extra + pad_y;
             (w, h)
         }
+        HoverKind::DirPreview { name, meta, entries, total_items, hidden_count, .. } => {
+            let shown = entries.len().clamp(1, 16);
+            let max_name_c = entries
+                .iter()
+                .take(shown)
+                .map(|e| e.name.chars().count() + usize::from(e.is_dir))
+                .max()
+                .unwrap_or(14)
+                .clamp(14, 28);
+            let has_kind = entries.iter().take(shown).any(|e| !e.kind_label.is_empty());
+            let has_size = entries.iter().take(shown).any(|e| !e.size_label.is_empty());
+            let row_chars = max_name_c
+                + 4
+                + if has_kind { 14 } else { 0 }
+                + if has_size { 10 } else { 0 };
+            let hdr_chars = name.chars().count() + meta.chars().count() + 7;
+            let total_c = row_chars.max(hdr_chars).min(64);
+            let w = (total_c as f32 * m.cw + pad_x * 2.0 + icon_s + 14.0)
+                .clamp(340.0, 540.0)
+                .min((vw - 24.0).max(240.0));
+            let dir_row_h = m.ch + 5.0;
+            let has_footer = *total_items > shown || *hidden_count > 0;
+            let extra = if has_footer { m.ch + 10.0 } else { 0.0 };
+            let h = hdr_h + 6.0 + shown as f32 * dir_row_h + extra + pad_y;
+            (w, h)
+        }
     };
 
-    // Place file previews on the RIGHT-HAND SIDE (never above/below, so hovering up/down a file list
-    // glides smoothly row-by-row!); place prompt-capsule dropdown menus cleanly below their anchor.
-    let is_side_preview = matches!(pop.kind, HoverKind::FilePreview { .. } | HoverKind::FileEntry { .. });
+    // Place file & directory previews on the RIGHT-HAND SIDE (never above/below, so hovering up/down
+    // a file list glides smoothly row-by-row!); place prompt-capsule dropdown menus below their anchor.
+    let is_side_preview = matches!(
+        pop.kind,
+        HoverKind::FilePreview { .. } | HoverKind::DirPreview { .. } | HoverKind::FileEntry { .. }
+    );
     let (x0, y0) = if is_side_preview {
         let right_x0 = pop.anchor.x1 + 14.0;
         let sx0 = if right_x0 + pop_w <= vw - 12.0 {
@@ -3912,6 +4463,101 @@ fn layout_active_popover(
             }
             if *truncated {
                 scene.overlay_text_run(x0 + pad_x + gutter_w, ry + 1.0, "… more lines", theme::INK_4, false, true, 0);
+            }
+        }
+        HoverKind::DirPreview { name, icon, meta, entries, total_items, hidden_count, .. } => {
+            let hy = y0 + (hdr_h - m.ch) * 0.5;
+            let mut hx = x0 + pad_x;
+            if let Some(ic) = icon {
+                scene.overlay_svg_icon(hx, hy + (m.ch - icon_s) * 0.5, icon_s, ic, 0);
+                hx += icon_s + 7.0;
+            }
+            let mw = meta.chars().count() as f32 * m.cw;
+            let max_name = ((x1 - pad_x - mw - 12.0 - hx) / m.cw).floor().max(8.0) as usize;
+            scene.overlay_text_run(hx, hy, truncate_chars(name, max_name), theme::INK_1, true, false, 0);
+            if !meta.is_empty() {
+                scene.overlay_text_run(x1 - pad_x - mw, hy, meta, theme::INK_4, false, false, 0);
+            }
+            scene.overlay_line(x0 + 1.0, y0 + hdr_h, x1 - 1.0, y0 + hdr_h, 1.0, theme::LINE_FAINT, 0);
+
+            let dir_row_h = m.ch + 5.0;
+            let mut ry = y0 + hdr_h + 6.0;
+            if entries.is_empty() {
+                scene.overlay_text_run(
+                    x0 + pad_x,
+                    ry + (dir_row_h - m.ch) * 0.5,
+                    "empty directory",
+                    theme::INK_4,
+                    false,
+                    true,
+                    0,
+                );
+                ry += dir_row_h;
+            } else {
+                let inner_w = pop_w - pad_x * 2.0;
+                let has_size = entries.iter().take(16).any(|e| !e.size_label.is_empty());
+                let size_w = if has_size { 9.0 * m.cw } else { 0.0 };
+                let show_kind = inner_w >= 280.0 && entries.iter().take(16).any(|e| !e.kind_label.is_empty());
+                let kind_w = if show_kind { 13.0 * m.cw } else { 0.0 };
+                let name_x = x0 + pad_x + icon_s + 8.0;
+                let name_max_c = ((x1 - pad_x - size_w - kind_w - 8.0 - name_x) / m.cw)
+                    .floor()
+                    .max(10.0) as usize;
+
+                for ent in entries.iter().take(16) {
+                    let ty = ry + (dir_row_h - m.ch) * 0.5;
+                    scene.overlay_svg_icon(
+                        x0 + pad_x,
+                        ty + (m.ch - icon_s) * 0.5,
+                        icon_s,
+                        ent.icon,
+                        0,
+                    );
+                    let lbl = if ent.is_dir { format!("{}/", ent.name) } else { ent.name.clone() };
+                    let col = if ent.muted {
+                        theme::INK_4
+                    } else if ent.is_dir {
+                        theme::INK_1
+                    } else {
+                        theme::INK_2
+                    };
+                    scene.overlay_text_run(name_x, ty, truncate_chars(&lbl, name_max_c), col, false, false, 0);
+                    if show_kind && !ent.kind_label.is_empty() {
+                        let kx = x1 - pad_x - size_w - kind_w;
+                        scene.overlay_text_run(
+                            kx,
+                            ty,
+                            truncate_chars(ent.kind_label, 12),
+                            theme::INK_4,
+                            false,
+                            false,
+                            0,
+                        );
+                    }
+                    if !ent.size_label.is_empty() {
+                        let sw = ent.size_label.chars().count() as f32 * m.cw;
+                        scene.overlay_text_run(
+                            x1 - pad_x - sw,
+                            ty,
+                            &ent.size_label,
+                            theme::INK_3,
+                            false,
+                            false,
+                            0,
+                        );
+                    }
+                    ry += dir_row_h;
+                }
+            }
+            let shown = entries.len().min(16);
+            let more = total_items.saturating_sub(shown);
+            if more > 0 || *hidden_count > 0 {
+                let foot = match (more, *hidden_count) {
+                    (m_n, 0) => format!("… {m_n} more"),
+                    (0, h_n) => format!("{h_n} hidden"),
+                    (m_n, h_n) => format!("… {m_n} more · {h_n} hidden"),
+                };
+                scene.overlay_text_run(x0 + pad_x + icon_s + 8.0, ry + 2.0, foot, theme::INK_4, false, true, 0);
             }
         }
     }

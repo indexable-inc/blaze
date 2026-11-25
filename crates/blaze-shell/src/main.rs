@@ -90,7 +90,9 @@ mod macos_app {
     use objc2_metal::MTLCreateSystemDefaultDevice;
     use objc2_quartz_core::CAMetalLayer;
 
-    use blaze_shell::agent_hub::{AgentHub, AgentHubAction, AgentRecord, AgentStatus, layout_agent_hub};
+    use blaze_shell::agent_hub::{
+        AgentHub, AgentHubAction, AgentRecord, AgentStatus, layout_agent_hub_pane,
+    };
     use blaze_shell::blocks::{BlockBody, BlockId, BlockStore};
     use blaze_shell::editor::{Editor, HistoryEntry};
     use blaze_shell::font::Fonts;
@@ -98,18 +100,25 @@ mod macos_app {
         InteractiveSpawn, RustCellMeta, run_command_line, run_command_line_with_pid,
     };
     use blaze_shell::keys;
-    use blaze_shell::layout::{LayoutInput, TOP_BAR_H, build_scene, layout_fullscreen_terminal};
+    use blaze_shell::layout::{
+        LayoutInput, PANE_HEADER_H, TILE_GAP, TOP_BAR_H, TabBarItem, build_pane_scene,
+        draw_split_dividers, draw_tiled_pane_chrome, layout_fullscreen_terminal_pane,
+        layout_window_top_bar,
+    };
     use blaze_shell::prompt::{GitStatusWorker, PromptInfo, try_native_git_command};
     use blaze_shell::pty::{Pty, Read as PtyRead};
     use blaze_shell::render::{FrameDraw, PIXEL_FORMAT, Renderer};
     use blaze_shell::rust_cell;
     use blaze_shell::svg_icons::IconAtlas;
+    use blaze_shell::tiling::{
+        CloseOutcome, FocusDir, PaneId, SplitAxis, SplitHandle, TileLayout, TileManager,
+    };
     use blaze_shell::view::{
         ActiveDrag, ActivePopover, CursorTrail, DragPayload, HitAction, HitRect, HoverKind,
         OutputNav, OutputVisualMode, Scene, TextSelection, compute_text_selection,
         extract_visual_lines, output_nav_geometry, select_at_point,
     };
-    use blaze_shell::yazi::{YaziAction, YaziState, layout_yazi_view, load_file_preview_lines};
+    use blaze_shell::yazi::{YaziAction, YaziState, layout_yazi_pane, load_hover_preview};
 
     const FONT_POINTS: f64 = 13.0;
     const MIN_FONT_POINTS: f64 = 8.5;
@@ -128,7 +137,9 @@ mod macos_app {
         demo: bool,
         demo_popup: bool,
         demo_history: bool,
+        demo_tiled: bool,
         scroll_bottom: bool,
+        cwd: Option<String>,
         screenshot: Option<PathBuf>,
     }
 
@@ -136,7 +147,9 @@ mod macos_app {
         let mut demo = false;
         let mut demo_popup = false;
         let mut demo_history = false;
+        let mut demo_tiled = false;
         let mut scroll_bottom = false;
+        let mut cwd = None;
         let mut screenshot = None;
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -150,7 +163,16 @@ mod macos_app {
                     demo = true;
                     demo_history = true;
                 }
+                "--demo-tiled" => {
+                    demo = true;
+                    demo_tiled = true;
+                }
                 "--scroll-bottom" => scroll_bottom = true,
+                "--cwd" => {
+                    if let Some(d) = args.next() {
+                        cwd = Some(d);
+                    }
+                }
                 "--screenshot" => {
                     if let Some(p) = args.next() {
                         screenshot = Some(PathBuf::from(p));
@@ -159,7 +181,20 @@ mod macos_app {
                 _ => {}
             }
         }
-        CliOpts { demo, demo_popup, demo_history, scroll_bottom, screenshot }
+        CliOpts { demo, demo_popup, demo_history, demo_tiled, scroll_bottom, cwd, screenshot }
+    }
+
+    /// Spawn a fresh native macOS `blaze-shell` window inheriting `cwd` (`Cmd+N`).
+    fn spawn_new_window(cwd: &str) {
+        if let Ok(exe) = std::env::current_exe() {
+            let _ = std::process::Command::new(exe)
+                .arg("--cwd")
+                .arg(cwd)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+        }
     }
 
     struct PendingDrag {
@@ -179,6 +214,8 @@ mod macos_app {
         IBeam,
         OpenHand,
         ClosedHand,
+        ResizeEW,
+        ResizeNS,
     }
 
     fn apply_cursor(cur: &mut CursorKind, next: CursorKind) {
@@ -186,18 +223,24 @@ mod macos_app {
             return;
         }
         *cur = next;
+        #[allow(deprecated)]
         let cursor = match next {
             CursorKind::Arrow => NSCursor::arrowCursor(),
             CursorKind::Pointer => NSCursor::pointingHandCursor(),
             CursorKind::IBeam => NSCursor::IBeamCursor(),
             CursorKind::OpenHand => NSCursor::openHandCursor(),
             CursorKind::ClosedHand => NSCursor::closedHandCursor(),
+            CursorKind::ResizeEW => NSCursor::resizeLeftRightCursor(),
+            CursorKind::ResizeNS => NSCursor::resizeUpDownCursor(),
         };
         cursor.set();
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn cursor_for_point(
         scene: &Scene,
+        handles: &[SplitHandle],
+        dragging_split: Option<SplitHandle>,
         alt_screen: bool,
         dragging: bool,
         selecting_text: bool,
@@ -206,11 +249,23 @@ mod macos_app {
         w: f32,
         h: f32,
     ) -> CursorKind {
+        if let Some(sh) = dragging_split {
+            return match sh.axis {
+                SplitAxis::Vertical => CursorKind::ResizeEW,
+                SplitAxis::Horizontal => CursorKind::ResizeNS,
+            };
+        }
         if x < 0.0 || y < 0.0 || x > w || y > h {
             return CursorKind::Arrow;
         }
         if dragging {
             return CursorKind::ClosedHand;
+        }
+        if let Some(sh) = handles.iter().find(|sh| sh.hit_rect.contains(x, y)) {
+            return match sh.axis {
+                SplitAxis::Vertical => CursorKind::ResizeEW,
+                SplitAxis::Horizontal => CursorKind::ResizeNS,
+            };
         }
         if alt_screen || selecting_text {
             return CursorKind::IBeam;
@@ -522,11 +577,16 @@ mod macos_app {
     }
 
     impl ShellApp {
-        fn new() -> Self {
+        fn new_in(initial_cwd: Option<&str>) -> Self {
             let alloc = Alloc::global();
-            let cwd = std::env::current_dir()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| "/".to_owned());
+            let cwd = initial_cwd
+                .filter(|p| std::path::Path::new(p).is_dir())
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    std::env::current_dir()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_else(|_| "/".to_owned())
+                });
             let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_owned());
             let env_owned: Vec<(String, String)> = std::env::vars().collect();
             let env_refs: Vec<(&str, &str)> = env_owned
@@ -561,6 +621,22 @@ mod macos_app {
                 job_rx,
                 running_jobs: 0,
                 output_seq: 0,
+            }
+        }
+
+        fn cwd(&self) -> &str {
+            self.store.active_state().cwd.as_ref()
+        }
+
+        fn process_tag(&self) -> Option<&'static str> {
+            if self.yazi.is_some() {
+                Some("y")
+            } else if self.agent_hub.is_some() {
+                Some("agent")
+            } else if self.active_pty.is_some() {
+                Some("tty")
+            } else {
+                None
             }
         }
 
@@ -1292,6 +1368,271 @@ mod macos_app {
         (w as u16, h as u16)
     }
 
+    fn grid_for_rect(rect: HitRect, fonts: &Fonts, scale: f64) -> (u16, u16) {
+        let m = fonts.metrics;
+        let rw = f64::from((rect.x1 - rect.x0).max(100.0));
+        let rh = f64::from((rect.y1 - rect.y0).max(80.0));
+        let w = ((rw - 24.0) * scale / m.cell_w as f64).floor().max(20.0);
+        let h = ((rh - 16.0) * scale / m.cell_h as f64).floor().max(6.0);
+        (w as u16, h as u16)
+    }
+
+    fn sync_pty_sizes(
+        panes: &mut std::collections::HashMap<PaneId, ShellApp>,
+        tile_layout: &TileLayout,
+        fonts: &Fonts,
+        scale: f64,
+    ) {
+        let show_hdr = tile_layout.pane_count_in_tab > 1 && !tile_layout.is_zoomed;
+        for pl in &tile_layout.panes {
+            let content_rect = if show_hdr {
+                HitRect::new(pl.rect.x0, (pl.rect.y0 + PANE_HEADER_H).min(pl.rect.y1), pl.rect.x1, pl.rect.y1)
+            } else {
+                pl.rect
+            };
+            if let Some(pane) = panes.get_mut(&pl.pane)
+                && let Some(ap) = &pane.active_pty
+            {
+                let (cols, rows) = grid_for_rect(content_rect, fonts, scale);
+                let px = (
+                    cols.saturating_mul(fonts.metrics.cell_w as u16),
+                    rows.saturating_mul(fonts.metrics.cell_h as u16),
+                );
+                ap.pty.resize(cols, rows, px);
+                if let Some(blk) = pane.store.block_mut(ap.block_id)
+                    && let BlockBody::Terminal { term, .. } = &mut blk.body
+                {
+                    term.resize(cols, rows);
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_window_scene(
+        wm: &TileManager,
+        panes: &mut std::collections::HashMap<PaneId, ShellApp>,
+        vw: f32,
+        vh: f32,
+        metrics: blaze_shell::view::CellMetrics,
+        cursor_vis: bool,
+        frame_now: i64,
+        zoom_pct: u16,
+        inline_titlebar: bool,
+        active_drag: Option<&ActiveDrag>,
+        active_trail: Option<CursorTrail>,
+        output_selection: Option<TextSelection>,
+        active_popover: Option<&ActivePopover>,
+        mouse_pos: Option<[f32; 2]>,
+        output_nav: Option<OutputNav>,
+        dragging_split: Option<SplitHandle>,
+    ) -> (Scene, TileLayout) {
+        let work_area = HitRect::new(0.0, TOP_BAR_H, vw, vh.max(TOP_BAR_H + 60.0));
+        let tile_layout = wm.layout(work_area, TILE_GAP);
+        let mut master = Scene::new();
+        let show_pane_hdr = tile_layout.pane_count_in_tab > 1 && !tile_layout.is_zoomed;
+
+        // 1. Lay out and composite every visible pane in the active workspace tab!
+        for pl in &tile_layout.panes {
+            let Some(pane) = panes.get_mut(&pl.pane) else {
+                continue;
+            };
+            let content_rect = if show_pane_hdr {
+                let proc_tag = pane.process_tag();
+                draw_tiled_pane_chrome(
+                    &mut master,
+                    pl.pane,
+                    pl.rect,
+                    pl.focused,
+                    &pane.prompt.dir_short,
+                    pane.prompt.git_branch.as_deref(),
+                    proc_tag,
+                    metrics,
+                )
+            } else {
+                pl.rect
+            };
+            let pw = (content_rect.x1 - content_rect.x0).max(120.0);
+            let ph = (content_rect.y1 - content_rect.y0).max(80.0);
+            let sub_vh = ph + TOP_BAR_H;
+            let pane_cursor_vis = cursor_vis && pl.focused;
+
+            // Translate active window-space popover & mouse pos into pane-local space for the focused pane.
+            let local_dx = content_rect.x0;
+            let local_dy = content_rect.y0 - TOP_BAR_H;
+            let local_popover = if pl.focused {
+                active_popover.map(|p| ActivePopover {
+                    anchor: HitRect::new(
+                        p.anchor.x0 - local_dx,
+                        p.anchor.y0 - local_dy,
+                        p.anchor.x1 - local_dx,
+                        p.anchor.y1 - local_dy,
+                    ),
+                    kind: p.kind.clone(),
+                    pinned: p.pinned,
+                })
+            } else {
+                None
+            };
+            let local_mouse = mouse_pos.map(|[mx, my]| [mx - local_dx, my - local_dy]);
+            let local_drag = if pl.focused {
+                active_drag.map(|d| ActiveDrag {
+                    x: d.x - local_dx,
+                    y: d.y - local_dy,
+                    over_composer: d.over_composer,
+                    payload: d.payload.clone(),
+                })
+            } else {
+                None
+            };
+            let local_trail = if pl.focused {
+                active_trail.map(|t| CursorTrail {
+                    prev_rect: [
+                        t.prev_rect[0] - local_dx,
+                        t.prev_rect[1] - local_dy,
+                        t.prev_rect[2] - local_dx,
+                        t.prev_rect[3] - local_dy,
+                    ],
+                    progress: t.progress,
+                })
+            } else {
+                None
+            };
+
+            let sub = if let Some(yazi) = &mut pane.yazi {
+                layout_yazi_pane(yazi, &pane.store, &pane.prompt, pw, sub_vh, metrics, zoom_pct)
+            } else if let Some(hub) = &pane.agent_hub {
+                layout_agent_hub_pane(hub, &pane.store, &pane.prompt, pw, sub_vh, metrics, zoom_pct)
+            } else if pane.store.is_alternate_screen()
+                && let Some(tid) = pane.store.active_running_terminal()
+                && let Some(blk) = pane.store.block(tid)
+                && let BlockBody::Terminal { term, .. } = &blk.body
+            {
+                layout_fullscreen_terminal_pane(
+                    term,
+                    &pane.store,
+                    &pane.prompt,
+                    pw,
+                    sub_vh,
+                    metrics,
+                    pane_cursor_vis,
+                    zoom_pct,
+                )
+            } else {
+                let screen_sel = |sy: f32| {
+                    if !pl.focused {
+                        return None;
+                    }
+                    output_selection.map(|s| TextSelection {
+                        anchor: [s.anchor[0] - local_dx, s.anchor[1] - sy - local_dy],
+                        head: [s.head[0] - local_dx, s.head[1] - sy - local_dy],
+                    })
+                };
+                let first = build_pane_scene(&LayoutInput {
+                    store: &pane.store,
+                    editor: &pane.editor,
+                    prompt: &pane.prompt,
+                    viewport_w: pw,
+                    viewport_h: sub_vh,
+                    metrics,
+                    scroll_y: pane.scroll_y,
+                    cursor_visible: pane_cursor_vis,
+                    now_ns: frame_now,
+                    zoom_pct,
+                    inline_titlebar: false,
+                    drag: local_drag.as_ref(),
+                    cursor_trail: local_trail,
+                    text_selection: screen_sel(pane.scroll_y),
+                    active_popover: local_popover.as_ref(),
+                    mouse_pos: local_mouse,
+                    output_nav: if pl.focused { output_nav } else { None },
+                });
+                let max_s = (first.total_content_height - first.scroll_viewport_height).max(0.0);
+                let target_scroll = if pane.auto_scroll_bottom {
+                    pane.auto_scroll_bottom = false;
+                    max_s
+                } else {
+                    pane.scroll_y.clamp(0.0, max_s)
+                };
+                if (target_scroll - pane.scroll_y).abs() > 0.5 {
+                    pane.scroll_y = target_scroll;
+                    build_pane_scene(&LayoutInput {
+                        store: &pane.store,
+                        editor: &pane.editor,
+                        prompt: &pane.prompt,
+                        viewport_w: pw,
+                        viewport_h: sub_vh,
+                        metrics,
+                        scroll_y: pane.scroll_y,
+                        cursor_visible: pane_cursor_vis,
+                        now_ns: frame_now,
+                        zoom_pct,
+                        inline_titlebar: false,
+                        drag: local_drag.as_ref(),
+                        cursor_trail: local_trail,
+                        text_selection: screen_sel(pane.scroll_y),
+                        active_popover: local_popover.as_ref(),
+                        mouse_pos: local_mouse,
+                        output_nav: if pl.focused { output_nav } else { None },
+                    })
+                } else {
+                    first
+                }
+            };
+
+            // Remember each pane's own content height / viewport height for hover-scrolling!
+            pane.last_scene.total_content_height = sub.total_content_height;
+            pane.last_scene.scroll_viewport_height = sub.scroll_viewport_height;
+
+            master.composite_pane(sub, content_rect, TOP_BAR_H, pl.focused, vw, vh);
+        }
+
+        // 2. Crisp hairline split dividers between tiled panes.
+        if !tile_layout.handles.is_empty() {
+            draw_split_dividers(&mut master, &tile_layout.handles, dragging_split.map(|h| h.split));
+        }
+
+        // 3. Unified window-level titlebar with workspace tabs (`Cmd+1..9`), `+` (`Cmd+T`),
+        //    zoomed badge, split buttons (`Cmd+D` / `Cmd+Shift+D`), and new window (`Cmd+N`).
+        let focused_id = wm.focused_pane();
+        let tab_items: Vec<TabBarItem<'_>> = wm
+            .tabs()
+            .iter()
+            .enumerate()
+            .map(|(i, tab)| {
+                let p = panes.get(&tab.focused);
+                let title = p.map_or("shell", |s| s.prompt.dir_short.as_str());
+                let process_tag = p.and_then(|s| s.process_tag());
+                TabBarItem {
+                    id: tab.id,
+                    slot: i + 1,
+                    title,
+                    active: i == wm.active_tab_index(),
+                    pane_count: tab.root.leaf_count(),
+                    zoomed: tab.zoomed,
+                    process_tag,
+                }
+            })
+            .collect();
+        if let Some(focused) = panes.get(&focused_id) {
+            layout_window_top_bar(
+                &mut master,
+                &tab_items,
+                focused_id,
+                tile_layout.is_zoomed,
+                tile_layout.pane_count_in_tab,
+                &focused.store,
+                &focused.prompt,
+                vw,
+                metrics,
+                zoom_pct,
+                inline_titlebar,
+            );
+        }
+
+        (master, tile_layout)
+    }
+
     pub fn run() {
         let cli = parse_cli();
 
@@ -1375,11 +1716,14 @@ mod macos_app {
         layer.setContentsScale(scale);
         layer.setDrawableSize(NSSize::new(size.width * scale, size.height * scale));
 
-        let mut shell = ShellApp::new();
+        let (mut wm, _, first_pane_id) = TileManager::new();
+        let mut panes: std::collections::HashMap<PaneId, ShellApp> = std::collections::HashMap::new();
+        let mut first_pane = ShellApp::new_in(cli.cwd.as_deref());
         let (init_cols, init_rows) = grid_for(size, &fonts, scale);
         let cell_px = (fonts.metrics.cell_w as u32, fonts.metrics.cell_h as u32);
+        let mut demo_popover: Option<ActivePopover> = None;
         if cli.demo {
-            shell.populate_demo(
+            first_pane.populate_demo(
                 init_cols,
                 init_rows,
                 cell_px,
@@ -1388,54 +1732,61 @@ mod macos_app {
                 cli.demo_history,
             );
         }
+        let demo_cwd = first_pane.cwd().to_owned();
+        panes.insert(first_pane_id, first_pane);
+
+        if cli.demo_tiled {
+            // Create a 3-pane SOTA BSP layout (left: shell + ls -l, top-right: yazi, bottom-right: git status)
+            // plus a 2nd workspace tab so screenshots verify both tiling chrome and workspace tabs!
+            let right_top_id = wm.split_focused(SplitAxis::Vertical);
+            let mut right_top = ShellApp::new_in(Some(&demo_cwd));
+            right_top.yazi = Some(YaziState::open(std::path::Path::new(&demo_cwd)));
+            panes.insert(right_top_id, right_top);
+
+            let right_bot_id = wm.split_focused(SplitAxis::Horizontal);
+            let mut right_bot = ShellApp::new_in(Some(&demo_cwd));
+            right_bot.submit_command("git status", init_cols / 2, init_rows / 2, cell_px, false);
+            panes.insert(right_bot_id, right_bot);
+
+            let (_, tab2_pane_id) = wm.new_tab();
+            panes.insert(tab2_pane_id, ShellApp::new_in(Some(&demo_cwd)));
+            let _ = wm.select_tab_slot(1);
+            wm.focus_pane(first_pane_id);
+
+            // Also preview the rich `site/` folder hover popover if present!
+            let site_dir = std::path::Path::new(&demo_cwd).join("site");
+            if site_dir.is_dir() {
+                demo_popover = Some(ActivePopover {
+                    anchor: HitRect::new(24.0, 210.0, 140.0, 232.0),
+                    kind: load_hover_preview(&site_dir, "site/", Some("folder_macos"), 14),
+                    pinned: true,
+                });
+            }
+        }
 
         // Offscreen deterministic screenshot mode: render 1 frame (warming atlases) and exit.
         if let Some(shot_path) = cli.screenshot {
             let metrics = fonts.cell_metrics(scale);
             let frame_now = now_ns();
             let zoom_pct = ((font_points / FONT_POINTS) * 100.0).round() as u16;
-            let mut scene = build_scene(&LayoutInput {
-                store: &shell.store,
-                editor: &shell.editor,
-                prompt: &shell.prompt,
-                viewport_w: size.width as f32,
-                viewport_h: size.height as f32,
+            let (scene, _) = build_window_scene(
+                &wm,
+                &mut panes,
+                size.width as f32,
+                size.height as f32,
                 metrics,
-                scroll_y: shell.scroll_y,
-                cursor_visible: true,
-                now_ns: frame_now,
+                true,
+                frame_now,
                 zoom_pct,
-                inline_titlebar: true,
-                drag: None,
-                cursor_trail: None,
-                text_selection: None,
-                active_popover: None,
-                mouse_pos: None,
-                output_nav: None,
-            });
-            let max_s = (scene.total_content_height - scene.scroll_viewport_height).max(0.0);
-            if shell.auto_scroll_bottom && max_s > 0.0 {
-                shell.scroll_y = max_s;
-                scene = build_scene(&LayoutInput {
-                    store: &shell.store,
-                    editor: &shell.editor,
-                    prompt: &shell.prompt,
-                    viewport_w: size.width as f32,
-                    viewport_h: size.height as f32,
-                    metrics,
-                    scroll_y: shell.scroll_y,
-                    cursor_visible: true,
-                    now_ns: frame_now,
-                    zoom_pct,
-                    inline_titlebar: true,
-                    drag: None,
-                    cursor_trail: None,
-                    text_selection: None,
-                    active_popover: None,
-                    mouse_pos: None,
-                    output_nav: None,
-                });
-            }
+                true,
+                None,
+                None,
+                None,
+                demo_popover.as_ref(),
+                None,
+                None,
+                None,
+            );
             let glyphs = fonts.rasterize_runs(&scene.text_runs, scale);
             let overlay_glyphs = fonts.rasterize_runs(&scene.overlay_text, scale);
             for (slot, bytes) in fonts.pending.drain(..) {
@@ -1475,6 +1826,10 @@ mod macos_app {
         let mut pty_buf = vec![0u8; 1 << 16];
         let mut keybuf = [0u8; 128];
         let mut dirty = true;
+        let mut pty_sizes_dirty = false;
+        let mut composite_scene = Scene::new();
+        let mut tile_layout = TileLayout::default();
+        let mut dragging_split: Option<SplitHandle> = None;
         let mut last_cursor_rect: Option<[f32; 4]> = None;
         let mut trail_prev: Option<[f32; 4]> = None;
         let mut trail_start: Option<Instant> = None;
@@ -1515,9 +1870,207 @@ mod macos_app {
                                 .unwrap_or_default();
                             let lower = chars.to_ascii_lowercase();
 
-                            // Global macOS Command shortcuts (`Cmd+Q/W/K/B/A/C/X/V/Z`, zoom `Cmd+`/`Cmd-`/`Cmd+0`,
-                            // and natural line navigation `Cmd+Left/Right/Backspace`).
+                            // Global tiling & workspace shortcuts (`Cmd+N`, `Cmd+T`, `Cmd+1..9`, `Cmd+D`,
+                            // `Cmd+Shift+D`, `Cmd+W`, `Cmd+Opt+Arrow/HJKL`, `Cmd+[/]`, `Cmd+Shift+[/]`,
+                            // `Cmd+Shift+Enter` zoom, `Cmd+Ctrl+Arrow` resize, `Ctrl+Tab` cycle tab).
+                            if ctrl && !flags.contains(NSEventModifierFlags::Command) && key == Key::Tab {
+                                let delta = if shift { -1 } else { 1 };
+                                if wm.cycle_tab(delta).is_some() {
+                                    active_popover = None;
+                                    output_selection = None;
+                                    output_nav = None;
+                                    pty_sizes_dirty = true;
+                                    dirty = true;
+                                }
+                                continue;
+                            }
+
                             if flags.contains(NSEventModifierFlags::Command) {
+                                // 1. `Cmd+N`: new native macOS window inheriting focused pane's cwd.
+                                if key == Key::KeyN && !ctrl && !alt {
+                                    let cwd = panes
+                                        .get(&wm.focused_pane())
+                                        .map(|p| p.cwd().to_owned())
+                                        .unwrap_or_else(|| "/".to_owned());
+                                    spawn_new_window(&cwd);
+                                    continue;
+                                }
+                                // 2. `Cmd+T`: new workspace tab inheriting focused pane's cwd.
+                                if key == Key::KeyT && !ctrl && !alt {
+                                    let cwd = panes
+                                        .get(&wm.focused_pane())
+                                        .map(|p| p.cwd().to_owned())
+                                        .unwrap_or_else(|| "/".to_owned());
+                                    let (_, new_pid) = wm.new_tab();
+                                    panes.insert(new_pid, ShellApp::new_in(Some(&cwd)));
+                                    active_popover = None;
+                                    output_selection = None;
+                                    output_nav = None;
+                                    pty_sizes_dirty = true;
+                                    dirty = true;
+                                    continue;
+                                }
+                                // 3. `Cmd+1..9`: switch directly to workspace tab # (9 = last tab).
+                                let tab_slot = match key {
+                                    Key::Digit1 => Some(1),
+                                    Key::Digit2 => Some(2),
+                                    Key::Digit3 => Some(3),
+                                    Key::Digit4 => Some(4),
+                                    Key::Digit5 => Some(5),
+                                    Key::Digit6 => Some(6),
+                                    Key::Digit7 => Some(7),
+                                    Key::Digit8 => Some(8),
+                                    Key::Digit9 => Some(9),
+                                    _ => None,
+                                };
+                                if let Some(slot) = tab_slot && !ctrl && !alt && !shift {
+                                    if wm.select_tab_slot(slot).is_some() {
+                                        active_popover = None;
+                                        output_selection = None;
+                                        output_nav = None;
+                                        pty_sizes_dirty = true;
+                                        dirty = true;
+                                    }
+                                    continue;
+                                }
+                                // 4. `Cmd+D` (vertical side-by-side) / `Cmd+Shift+D` (horizontal top/bottom).
+                                if key == Key::KeyD && !ctrl && !alt {
+                                    let axis = if shift {
+                                        SplitAxis::Horizontal
+                                    } else {
+                                        SplitAxis::Vertical
+                                    };
+                                    let cwd = panes
+                                        .get(&wm.focused_pane())
+                                        .map(|p| p.cwd().to_owned())
+                                        .unwrap_or_else(|| "/".to_owned());
+                                    let new_pid = wm.split_focused(axis);
+                                    panes.insert(new_pid, ShellApp::new_in(Some(&cwd)));
+                                    active_popover = None;
+                                    output_selection = None;
+                                    output_nav = None;
+                                    pty_sizes_dirty = true;
+                                    dirty = true;
+                                    continue;
+                                }
+                                // 5. `Cmd+W`: close focused pane -> collapse split -> close tab -> quit if last.
+                                if key == Key::KeyW && !ctrl && !alt {
+                                    match wm.close_focused() {
+                                        CloseOutcome::PaneClosed { closed, .. } => {
+                                            if let Some(mut p) = panes.remove(&closed)
+                                                && let Some(ap) = p.active_pty.take()
+                                            {
+                                                ap.pty.hangup();
+                                            }
+                                            active_popover = None;
+                                            output_selection = None;
+                                            output_nav = None;
+                                            pty_sizes_dirty = true;
+                                            dirty = true;
+                                        }
+                                        CloseOutcome::TabClosed { closed_panes, .. } => {
+                                            for pid in closed_panes {
+                                                if let Some(mut p) = panes.remove(&pid)
+                                                    && let Some(ap) = p.active_pty.take()
+                                                {
+                                                    ap.pty.hangup();
+                                                }
+                                            }
+                                            active_popover = None;
+                                            output_selection = None;
+                                            output_nav = None;
+                                            pty_sizes_dirty = true;
+                                            dirty = true;
+                                        }
+                                        CloseOutcome::LastPaneInLastTab => {
+                                            quit = true;
+                                        }
+                                    }
+                                    continue;
+                                }
+                                // 6. `Cmd+Shift+Enter`: zoom / unzoom focused pane.
+                                if shift && !ctrl && !alt && matches!(key, Key::Enter | Key::NumpadEnter) {
+                                    if wm.toggle_zoom() {
+                                        active_popover = None;
+                                        output_selection = None;
+                                        pty_sizes_dirty = true;
+                                        dirty = true;
+                                    }
+                                    continue;
+                                }
+                                // 7. `Cmd+Opt+Arrow` or `Cmd+Opt+H/J/K/L`: spatial directional pane focus.
+                                if alt && !ctrl {
+                                    let dir = match key {
+                                        Key::ArrowLeft | Key::KeyH => Some(FocusDir::Left),
+                                        Key::ArrowRight | Key::KeyL => Some(FocusDir::Right),
+                                        Key::ArrowUp | Key::KeyK => Some(FocusDir::Up),
+                                        Key::ArrowDown | Key::KeyJ => Some(FocusDir::Down),
+                                        _ => None,
+                                    };
+                                    if let Some(d) = dir {
+                                        let area = HitRect::new(
+                                            0.0,
+                                            TOP_BAR_H,
+                                            size.width as f32,
+                                            size.height as f32,
+                                        );
+                                        if wm.focus_direction(d, area, TILE_GAP).is_some() {
+                                            active_popover = None;
+                                            output_selection = None;
+                                            output_nav = None;
+                                            dirty = true;
+                                        }
+                                        continue;
+                                    }
+                                }
+                                // 8. `Cmd+Ctrl+Arrow` (resize split) & `Cmd+Ctrl+=` (equalize splits).
+                                if ctrl && !alt {
+                                    let dir = match key {
+                                        Key::ArrowLeft | Key::KeyH => Some(FocusDir::Left),
+                                        Key::ArrowRight | Key::KeyL => Some(FocusDir::Right),
+                                        Key::ArrowUp | Key::KeyK => Some(FocusDir::Up),
+                                        Key::ArrowDown | Key::KeyJ => Some(FocusDir::Down),
+                                        _ => None,
+                                    };
+                                    if let Some(d) = dir {
+                                        if wm.nudge_focused_split(d, 0.05) {
+                                            pty_sizes_dirty = true;
+                                            dirty = true;
+                                        }
+                                        continue;
+                                    }
+                                    if key == Key::Equal {
+                                        wm.equalize_splits();
+                                        pty_sizes_dirty = true;
+                                        dirty = true;
+                                        continue;
+                                    }
+                                }
+                                // 9. `Cmd+Shift+[` / `Cmd+Shift+]` (cycle tabs) & `Cmd+[` / `Cmd+]` (cycle panes).
+                                if !ctrl && !alt && matches!(key, Key::BracketLeft | Key::BracketRight) {
+                                    let delta = if key == Key::BracketLeft { -1 } else { 1 };
+                                    let changed = if shift {
+                                        wm.cycle_tab(delta).is_some()
+                                    } else {
+                                        wm.cycle_pane(delta).is_some()
+                                    };
+                                    if changed {
+                                        active_popover = None;
+                                        output_selection = None;
+                                        output_nav = None;
+                                        pty_sizes_dirty = true;
+                                        dirty = true;
+                                    }
+                                    continue;
+                                }
+                                // 10. `Cmd+Shift+E`: equalize splits cleanly.
+                                if shift && !ctrl && !alt && key == Key::KeyE {
+                                    wm.equalize_splits();
+                                    pty_sizes_dirty = true;
+                                    dirty = true;
+                                    continue;
+                                }
+
                                 // Zoom (`Cmd+=`/`Cmd++`, `Cmd+-`, `Cmd+0`).
                                 if matches!(lower.as_str(), "=" | "+")
                                     || matches!(key, Key::Equal | Key::NumpadAdd)
@@ -1539,7 +2092,18 @@ mod macos_app {
                                     dirty = true;
                                     continue;
                                 }
+                                if lower == "q" {
+                                    quit = true;
+                                    continue;
+                                }
+                            }
 
+                            let shell = panes
+                                .get_mut(&wm.focused_pane())
+                                .expect("focused pane must exist");
+
+                            // Per-pane macOS Command shortcuts (`Cmd+K/B/A/C/X/V/Z` & line navigation).
+                            if flags.contains(NSEventModifierFlags::Command) {
                                 // Navigation & editing inside the composer when no PTY is running.
                                 if shell.active_pty.is_none() {
                                     match key {
@@ -1567,10 +2131,6 @@ mod macos_app {
                                 }
 
                                 match lower.as_str() {
-                                    "q" | "w" => {
-                                        quit = true;
-                                        continue;
-                                    }
                                     "k" if shell.active_pty.is_none() => {
                                         shell.store.clear_active_branch();
                                         shell.scroll_y = 0.0;
@@ -1618,7 +2178,7 @@ mod macos_app {
                                                 head: [doc_sel.head[0], doc_sel.head[1] - shell.scroll_y],
                                             };
                                             let (_, selected) = compute_text_selection(
-                                                &shell.last_scene.text_runs,
+                                                &composite_scene.text_runs,
                                                 fonts.cell_metrics(scale),
                                                 screen_sel,
                                                 TOP_BAR_H,
@@ -1764,7 +2324,7 @@ mod macos_app {
                                 let text = keys::text_of(&ev);
                                 let m = fonts.cell_metrics(scale);
                                 let vlines = extract_visual_lines(
-                                    &shell.last_scene.text_runs,
+                                    &composite_scene.text_runs,
                                     m,
                                     TOP_BAR_H,
                                     size.height as f32,
@@ -2002,9 +2562,9 @@ mod macos_app {
                                         || (ctrl && key == Key::KeyG))
                                 {
                                     let m = fonts.cell_metrics(scale);
-                                    let max_y = (shell.last_scene.input_top_y - 2.0).max(TOP_BAR_H);
+                                    let max_y = (composite_scene.input_top_y - 2.0).max(TOP_BAR_H);
                                     let vlines = extract_visual_lines(
-                                        &shell.last_scene.text_runs,
+                                        &composite_scene.text_runs,
                                         m,
                                         TOP_BAR_H,
                                         max_y,
@@ -2283,6 +2843,22 @@ mod macos_app {
                             continue;
                         }
                         NSEventType::ScrollWheel => {
+                            let pt = ev.locationInWindow();
+                            let mx = pt.x as f32;
+                            let my = (size.height - pt.y) as f32;
+                            // Scroll whichever tiled pane the pointer is currently hovering over!
+                            let hovered_pl = tile_layout
+                                .panes
+                                .iter()
+                                .find(|p| p.rect.contains(mx, my))
+                                .copied();
+                            let scroll_pid = hovered_pl
+                                .map(|p| p.pane)
+                                .unwrap_or_else(|| wm.focused_pane());
+                            let pane_x0 = hovered_pl.map_or(0.0, |p| p.rect.x0);
+                            let Some(shell) = panes.get_mut(&scroll_pid) else {
+                                continue;
+                            };
                             let dy = ev.scrollingDeltaY();
                             if let Some(yazi) = &mut shell.yazi {
                                 let step_px = if ev.hasPreciseScrollingDeltas() {
@@ -2291,9 +2867,7 @@ mod macos_app {
                                     dy as f32 * 24.0
                                 };
                                 let rows_delta = (-step_px / 18.0).round() as isize;
-                                let pt = ev.locationInWindow();
-                                let mx = pt.x as f32;
-                                if yazi.scroll_at(mx, rows_delta) {
+                                if yazi.scroll_at(mx - pane_x0, rows_delta) {
                                     dirty = true;
                                 }
                             } else if let Some(hub) = &mut shell.agent_hub {
@@ -2334,10 +2908,7 @@ mod macos_app {
                                 } else {
                                     ev.scrollingDeltaX() as f32 * 24.0
                                 };
-                                let pt = ev.locationInWindow();
-                                let mx = pt.x as f32;
-                                let my = (size.height - pt.y) as f32;
-                                if let Some(reg) = shell.last_scene.scroll_region_at(mx, my)
+                                if let Some(reg) = composite_scene.scroll_region_at(mx, my)
                                     && shell.store.scroll_table(
                                         reg.block,
                                         step_y,
@@ -2365,15 +2936,91 @@ mod macos_app {
                             let y = (size.height - pt.y) as f32;
                             // Let macOS AppKit handle native window edge/corner resize drags directly!
                             if !on_resize_edge(x, y, size.width as f32, size.height as f32) {
-                                // Unified titlebar clicks (branch tabs, fork, zoom) & window drag work
-                                // EVERYWHERE — including inside full-screen PTY (`claude`), `y`, and `agent`!
+                                // 1. Grabbing a tiled split divider starts live drag resize!
+                                if y >= TOP_BAR_H
+                                    && let Some(&sh) = tile_layout
+                                        .handles
+                                        .iter()
+                                        .find(|h| h.hit_rect.contains(x, y))
+                                {
+                                    dragging_split = Some(sh);
+                                    active_popover = None;
+                                    apply_cursor(
+                                        &mut cur_cursor,
+                                        match sh.axis {
+                                            SplitAxis::Vertical => CursorKind::ResizeEW,
+                                            SplitAxis::Horizontal => CursorKind::ResizeNS,
+                                        },
+                                    );
+                                    continue;
+                                }
+
+                                // 2. Unified titlebar clicks (workspace tabs, +, split V/H, new window,
+                                //    zoom, branch tabs, fork) & window drag work EVERYWHERE!
                                 if y < TOP_BAR_H {
-                                    if let Some(action) = shell.last_scene.hit_test(x, y) {
+                                    if let Some(action) = composite_scene.hit_test(x, y) {
                                         output_selection = None;
                                         output_nav = None;
+                                        active_popover = None;
                                         match action {
+                                            HitAction::SwitchTab(tid) => {
+                                                if wm.select_tab_by_id(tid).is_some() {
+                                                    pty_sizes_dirty = true;
+                                                    dirty = true;
+                                                }
+                                            }
+                                            HitAction::NewTab => {
+                                                let cwd = panes
+                                                    .get(&wm.focused_pane())
+                                                    .map(|p| p.cwd().to_owned())
+                                                    .unwrap_or_else(|| "/".to_owned());
+                                                let (_, new_pid) = wm.new_tab();
+                                                panes.insert(new_pid, ShellApp::new_in(Some(&cwd)));
+                                                pty_sizes_dirty = true;
+                                                dirty = true;
+                                            }
+                                            HitAction::CloseTab(tid) => {
+                                                if let CloseOutcome::TabClosed { closed_panes, .. } =
+                                                    wm.close_tab(tid)
+                                                {
+                                                    for pid in closed_panes {
+                                                        if let Some(mut p) = panes.remove(&pid)
+                                                            && let Some(ap) = p.active_pty.take()
+                                                        {
+                                                            ap.pty.hangup();
+                                                        }
+                                                    }
+                                                    pty_sizes_dirty = true;
+                                                    dirty = true;
+                                                }
+                                            }
+                                            HitAction::SplitPane(axis) => {
+                                                let cwd = panes
+                                                    .get(&wm.focused_pane())
+                                                    .map(|p| p.cwd().to_owned())
+                                                    .unwrap_or_else(|| "/".to_owned());
+                                                let new_pid = wm.split_focused(axis);
+                                                panes.insert(new_pid, ShellApp::new_in(Some(&cwd)));
+                                                pty_sizes_dirty = true;
+                                                dirty = true;
+                                            }
+                                            HitAction::NewWindow => {
+                                                let cwd = panes
+                                                    .get(&wm.focused_pane())
+                                                    .map(|p| p.cwd().to_owned())
+                                                    .unwrap_or_else(|| "/".to_owned());
+                                                spawn_new_window(&cwd);
+                                            }
+                                            HitAction::ToggleZoomPane(_) => {
+                                                if wm.toggle_zoom() {
+                                                    pty_sizes_dirty = true;
+                                                    dirty = true;
+                                                }
+                                            }
                                             HitAction::SwitchBranch(bid) => {
-                                                if shell.store.switch_branch(bid) {
+                                                if let Some(shell) = panes.get_mut(&wm.focused_pane())
+                                                    && shell.store.switch_branch(bid)
+                                                {
                                                     shell.yazi = None;
                                                     shell.agent_hub = None;
                                                     shell.scroll_y = 0.0;
@@ -2383,12 +3030,14 @@ mod macos_app {
                                                 }
                                             }
                                             HitAction::ForkActiveBranch => {
-                                                let _ = shell.store.fork_active_branch(None);
-                                                shell.refresh_prompt(
-                                                    shell.prompt.last_exit,
-                                                    shell.prompt.last_duration_ms,
-                                                );
-                                                dirty = true;
+                                                if let Some(shell) = panes.get_mut(&wm.focused_pane()) {
+                                                    let _ = shell.store.fork_active_branch(None);
+                                                    shell.refresh_prompt(
+                                                        shell.prompt.last_exit,
+                                                        shell.prompt.last_duration_ms,
+                                                    );
+                                                    dirty = true;
+                                                }
                                             }
                                             HitAction::ResetZoom => {
                                                 font_points = FONT_POINTS;
@@ -2404,14 +3053,84 @@ mod macos_app {
                                         continue;
                                     }
                                 }
+
+                                // 3. Clicking inside any tiled pane focuses it immediately & checks
+                                //    pane header chrome buttons (Close `×`, Zoom, Focus).
+                                if y >= TOP_BAR_H {
+                                    if let Some(action) = composite_scene.hit_test(x, y) {
+                                        match action {
+                                            HitAction::ClosePane(pid) => {
+                                                match wm.close_pane(pid) {
+                                                    CloseOutcome::PaneClosed { closed, .. } => {
+                                                        if let Some(mut p) = panes.remove(&closed)
+                                                            && let Some(ap) = p.active_pty.take()
+                                                        {
+                                                            ap.pty.hangup();
+                                                        }
+                                                        active_popover = None;
+                                                        output_selection = None;
+                                                        pty_sizes_dirty = true;
+                                                        dirty = true;
+                                                    }
+                                                    CloseOutcome::TabClosed { closed_panes, .. } => {
+                                                        for cid in closed_panes {
+                                                            if let Some(mut p) = panes.remove(&cid)
+                                                                && let Some(ap) = p.active_pty.take()
+                                                            {
+                                                                ap.pty.hangup();
+                                                            }
+                                                        }
+                                                        active_popover = None;
+                                                        output_selection = None;
+                                                        pty_sizes_dirty = true;
+                                                        dirty = true;
+                                                    }
+                                                    CloseOutcome::LastPaneInLastTab => {}
+                                                }
+                                                continue;
+                                            }
+                                            HitAction::ToggleZoomPane(pid) => {
+                                                wm.focus_pane(pid);
+                                                if wm.toggle_zoom() {
+                                                    active_popover = None;
+                                                    pty_sizes_dirty = true;
+                                                    dirty = true;
+                                                }
+                                                continue;
+                                            }
+                                            HitAction::FocusPane(pid) => {
+                                                if wm.focus_pane(pid) {
+                                                    active_popover = None;
+                                                    output_selection = None;
+                                                    output_nav = None;
+                                                    dirty = true;
+                                                }
+                                                continue;
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    if let Some(pl) =
+                                        tile_layout.panes.iter().find(|p| p.rect.contains(x, y))
+                                        && wm.focus_pane(pl.pane)
+                                    {
+                                        active_popover = None;
+                                        output_selection = None;
+                                        output_nav = None;
+                                        dirty = true;
+                                    }
+                                }
                             }
+                            let shell = panes
+                                .get_mut(&wm.focused_pane())
+                                .expect("focused pane must exist");
                             if !on_resize_edge(x, y, size.width as f32, size.height as f32)
                                 && !shell.store.is_alternate_screen()
                                 && shell.yazi.is_none()
                                 && shell.agent_hub.is_none()
                             {
                                 output_nav = None;
-                                if let Some(action) = shell.last_scene.hit_test(x, y) {
+                                if let Some(action) = composite_scene.hit_test(x, y) {
                                     output_selection = None;
                                     match action {
                                         HitAction::SwitchBranch(bid) => {
@@ -2482,7 +3201,7 @@ mod macos_app {
                                             dirty = true;
                                         }
                                         HitAction::OpenBranchPicker => {
-                                            if let Some(reg) = shell.last_scene.hover_at(x, y) {
+                                            if let Some(reg) = composite_scene.hover_at(x, y) {
                                                 let already_pinned = active_popover
                                                     .as_ref()
                                                     .is_some_and(|p| p.pinned && p.anchor == reg.rect);
@@ -2533,6 +3252,14 @@ mod macos_app {
                                             shell.refresh_editor_assist(false);
                                             dirty = true;
                                         }
+                                        HitAction::SwitchTab(_)
+                                        | HitAction::NewTab
+                                        | HitAction::CloseTab(_)
+                                        | HitAction::SplitPane(_)
+                                        | HitAction::NewWindow
+                                        | HitAction::FocusPane(_)
+                                        | HitAction::ClosePane(_)
+                                        | HitAction::ToggleZoomPane(_) => {}
                                     }
                                     continue;
                                 }
@@ -2542,11 +3269,11 @@ mod macos_app {
                                 }
 
                                 // Click inside the inline composer: enter Insert mode and position/select cursor.
-                                if shell.last_scene.composer_rect.contains(x, y) {
+                                if composite_scene.composer_rect.contains(x, y) {
                                     output_selection = None;
                                     shell.editor.enter_vim_insert();
                                     let m = fonts.cell_metrics(scale);
-                                    let [ox, oy] = shell.last_scene.composer_text_origin;
+                                    let [ox, oy] = composite_scene.composer_text_origin;
                                     let line_step = (m.ch + 2.0).max(1.0);
                                     let line = ((y - oy).max(0.0) / line_step).floor() as usize;
                                     let col = (((x - ox).max(0.0) + m.cw * 0.45) / m.cw).floor() as usize;
@@ -2567,7 +3294,7 @@ mod macos_app {
                                 }
 
                                 // Press on any draggable file/folder/crate cell (e.g. `Cargo.lock`): arm drag-to-hotbar.
-                                if let Some(payload) = shell.last_scene.drag_source_at(x, y).cloned() {
+                                if let Some(payload) = composite_scene.drag_source_at(x, y).cloned() {
                                     pending_drag = Some(PendingDrag {
                                         start_x: x,
                                         start_y: y,
@@ -2593,7 +3320,7 @@ mod macos_app {
                                     let clicks = ev.clickCount();
                                     if clicks >= 2 {
                                         if let Some(sel) = select_at_point(
-                                            &shell.last_scene.text_runs,
+                                            &composite_scene.text_runs,
                                             m,
                                             x,
                                             y,
@@ -2628,20 +3355,28 @@ mod macos_app {
                             let in_traffic_lights = y >= 0.0 && y < TOP_BAR_H && x >= 0.0 && x < 76.0;
                             let near_resize_edge = on_resize_edge(x, y, size.width as f32, size.height as f32);
                             let in_window = x >= 0.0 && y >= 0.0 && x <= size.width as f32 && y <= size.height as f32;
+                            let shell = panes
+                                .get(&wm.focused_pane())
+                                .expect("focused pane must exist");
                             if in_window && !in_traffic_lights && !near_resize_edge {
                                 // Smooth native hover popover tracking:
                                 // - For interactive prompt menus (branches/dir/changes), keep alive while
                                 //   pointer travels from anchor into the menu.
-                                // - For read-only RHS file previews, ONLY keep alive while still over the
-                                //   hovered file row so gliding up & down switches previews instantaneously!
+                                // - For read-only RHS file/folder previews, ONLY keep alive while still over
+                                //   the hovered row so gliding up & down switches previews instantaneously!
                                 let in_open_popover = active_popover.as_ref().is_some_and(|p| {
                                     if p.anchor.contains(x, y) {
                                         return true;
                                     }
-                                    if matches!(p.kind, HoverKind::FilePreview { .. } | HoverKind::FileEntry { .. }) {
+                                    if matches!(
+                                        p.kind,
+                                        HoverKind::FilePreview { .. }
+                                            | HoverKind::DirPreview { .. }
+                                            | HoverKind::FileEntry { .. }
+                                    ) {
                                         return false;
                                     }
-                                    if let Some(pr) = shell.last_scene.popover_rect {
+                                    if let Some(pr) = composite_scene.popover_rect {
                                         if pr.contains(x, y) {
                                             return true;
                                         }
@@ -2665,23 +3400,18 @@ mod macos_app {
                                     && !selecting_composer
                                     && !selecting_output
                                     && pending_drag.is_none()
-                                    && let Some(reg) = shell.last_scene.hover_at(x, y)
+                                    && dragging_split.is_none()
+                                    && let Some(reg) = composite_scene.hover_at(x, y)
                                 {
                                     if active_popover.as_ref().is_none_or(|cur| !cur.pinned && cur.anchor != reg.rect) {
                                         let hydrated_kind = match &reg.kind {
                                             HoverKind::FileEntry { full_path, name, icon, .. } => {
-                                                let (meta, lines, truncated) = load_file_preview_lines(
+                                                load_hover_preview(
                                                     std::path::Path::new(full_path),
+                                                    name,
+                                                    *icon,
                                                     16,
-                                                );
-                                                HoverKind::FilePreview {
-                                                    full_path: full_path.clone(),
-                                                    name: name.clone(),
-                                                    icon: *icon,
-                                                    meta,
-                                                    lines,
-                                                    truncated,
-                                                }
+                                                )
                                             }
                                             other => other.clone(),
                                         };
@@ -2698,7 +3428,9 @@ mod macos_app {
                                 }
 
                                 let next = cursor_for_point(
-                                    &shell.last_scene,
+                                    &composite_scene,
+                                    &tile_layout.handles,
+                                    dragging_split,
                                     shell.store.is_alternate_screen(),
                                     pending_drag.as_ref().is_some_and(|d| d.active),
                                     selecting_composer || selecting_output,
@@ -2724,6 +3456,33 @@ mod macos_app {
                             let x = pt.x as f32;
                             let y = (size.height - pt.y) as f32;
                             last_mouse = Some((x, y));
+                            if let Some(sh) = dragging_split {
+                                let ratio = match sh.axis {
+                                    SplitAxis::Vertical => {
+                                        let w = (sh.parent_rect.x1 - sh.parent_rect.x0).max(1.0);
+                                        (x - sh.parent_rect.x0) / w
+                                    }
+                                    SplitAxis::Horizontal => {
+                                        let h = (sh.parent_rect.y1 - sh.parent_rect.y0).max(1.0);
+                                        (y - sh.parent_rect.y0) / h
+                                    }
+                                };
+                                if wm.set_split_ratio(sh.split, ratio) {
+                                    pty_sizes_dirty = true;
+                                    dirty = true;
+                                }
+                                apply_cursor(
+                                    &mut cur_cursor,
+                                    match sh.axis {
+                                        SplitAxis::Vertical => CursorKind::ResizeEW,
+                                        SplitAxis::Horizontal => CursorKind::ResizeNS,
+                                    },
+                                );
+                                continue;
+                            }
+                            let shell = panes
+                                .get_mut(&wm.focused_pane())
+                                .expect("focused pane must exist");
                             if let Some(d) = &mut pending_drag {
                                 d.x = x;
                                 d.y = y;
@@ -2731,7 +3490,7 @@ mod macos_app {
                                     d.active = true;
                                 }
                                 if d.active {
-                                    let cr = shell.last_scene.composer_rect;
+                                    let cr = composite_scene.composer_rect;
                                     d.over_composer = cr.contains(x, y)
                                         || (y >= cr.y0 && y <= size.height as f32 && x >= cr.x0 && x <= cr.x1);
                                     apply_cursor(&mut cur_cursor, CursorKind::ClosedHand);
@@ -2741,7 +3500,7 @@ mod macos_app {
                             }
                             if selecting_composer {
                                 let m = fonts.cell_metrics(scale);
-                                let [ox, oy] = shell.last_scene.composer_text_origin;
+                                let [ox, oy] = composite_scene.composer_text_origin;
                                 let line_step = (m.ch + 2.0).max(1.0);
                                 let line = ((y - oy).max(0.0) / line_step).floor() as usize;
                                 let col = (((x - ox).max(0.0) + m.cw * 0.45) / m.cw).floor() as usize;
@@ -2764,8 +3523,32 @@ mod macos_app {
                             let x = pt.x as f32;
                             let y = (size.height - pt.y) as f32;
                             last_mouse = Some((x, y));
+                            if dragging_split.take().is_some() {
+                                pty_sizes_dirty = true;
+                                dirty = true;
+                                let alt_scr = panes
+                                    .get(&wm.focused_pane())
+                                    .is_some_and(|p| p.store.is_alternate_screen());
+                                let next = cursor_for_point(
+                                    &composite_scene,
+                                    &tile_layout.handles,
+                                    None,
+                                    alt_scr,
+                                    false,
+                                    false,
+                                    x,
+                                    y,
+                                    size.width as f32,
+                                    size.height as f32,
+                                );
+                                apply_cursor(&mut cur_cursor, next);
+                                continue;
+                            }
+                            let shell = panes
+                                .get_mut(&wm.focused_pane())
+                                .expect("focused pane must exist");
                             if let Some(d) = pending_drag.take() {
-                                let cr = shell.last_scene.composer_rect;
+                                let cr = composite_scene.composer_rect;
                                 let dropped_in_prompt = cr.contains(x, y)
                                     || (y >= cr.y0 && y <= size.height as f32 && x >= cr.x0 && x <= cr.x1);
                                 if d.active && dropped_in_prompt {
@@ -2776,7 +3559,9 @@ mod macos_app {
                                     shell.refresh_editor_assist(false);
                                 }
                                 let next = cursor_for_point(
-                                    &shell.last_scene,
+                                    &composite_scene,
+                                    &tile_layout.handles,
+                                    None,
                                     shell.store.is_alternate_screen(),
                                     false,
                                     false,
@@ -2792,7 +3577,9 @@ mod macos_app {
                             if selecting_composer {
                                 selecting_composer = false;
                                 let next = cursor_for_point(
-                                    &shell.last_scene,
+                                    &composite_scene,
+                                    &tile_layout.handles,
+                                    None,
                                     shell.store.is_alternate_screen(),
                                     false,
                                     false,
@@ -2813,7 +3600,9 @@ mod macos_app {
                                     dirty = true;
                                 }
                                 let next = cursor_for_point(
-                                    &shell.last_scene,
+                                    &composite_scene,
+                                    &tile_layout.handles,
+                                    None,
                                     shell.store.is_alternate_screen(),
                                     false,
                                     false,
@@ -2834,116 +3623,128 @@ mod macos_app {
             });
 
             if quit || !window.isVisible() {
-                if let Some(ap) = shell.active_pty.take() {
-                    ap.pty.hangup();
+                for pane in panes.values_mut() {
+                    if let Some(ap) = pane.active_pty.take() {
+                        ap.pty.hangup();
+                    }
                 }
                 break;
             }
 
-            // Poll asynchronous `blaze-git` Starship status worker (single atomic check when idle).
-            if let Some((cwd, summary)) = shell.git_worker.poll()
-                && cwd == shell.prompt.cwd
-            {
-                if let Some(st) = summary {
-                    shell.prompt.git_branch = Some(st.branch.clone());
-                    shell.prompt.git_detached = st.detached;
-                    shell.prompt.git_status = Some(st);
-                } else {
-                    shell.prompt.git_status = None;
-                }
-                dirty = true;
-            }
-
-            // Poll non-blocking background command jobs (`rust { ... }`, external commands).
-            {
-                let (cols, rows) = grid_for(size, &fonts, scale);
-                let cpx = (fonts.metrics.cell_w as u32, fonts.metrics.cell_h as u32);
-                if shell.poll_async_jobs(cols, rows, cpx) {
+            // Poll ALL panes in the window so unfocused tiled panes stream git/jobs/PTYs live at 60fps!
+            let focused_pid = wm.focused_pane();
+            let cpx = (fonts.metrics.cell_w as u32, fonts.metrics.cell_h as u32);
+            let mut any_running_jobs = false;
+            for (&pid, pane) in panes.iter_mut() {
+                if let Some((cwd, summary)) = pane.git_worker.poll()
+                    && cwd == pane.prompt.cwd
+                {
+                    if let Some(st) = summary {
+                        pane.prompt.git_branch = Some(st.branch.clone());
+                        pane.prompt.git_detached = st.detached;
+                        pane.prompt.git_status = Some(st);
+                    } else {
+                        pane.prompt.git_status = None;
+                    }
                     dirty = true;
                 }
-            }
-            if shell.running_jobs > 0 && last_running_tick.elapsed().as_millis() >= 80 {
-                last_running_tick = Instant::now();
-                dirty = true;
-            }
 
-            // Pump live PTY output into its `blaze-vt` terminal block.
-            let mut pty_finished: Option<(BlockId, i32, u64)> = None;
-            if let Some(ap) = &shell.active_pty {
-                let mut closed = false;
-                loop {
-                    match ap.pty.read(&mut pty_buf) {
-                        PtyRead::Bytes(n) => {
-                            if let Some(blk) = shell.store.block_mut(ap.block_id)
-                                && let BlockBody::Terminal { term, .. } = &mut blk.body
-                            {
-                                term.feed(&pty_buf[..n]);
-                                let replies = term.take_replies();
-                                if !replies.is_empty() {
-                                    ap.pty.write_all(&replies);
-                                }
-                                let effects = term.take_effects();
-                                for eff in effects.iter() {
-                                    if let Effect::TitleChanged = eff {
-                                        let t = String::from_utf8_lossy(term.title()).into_owned();
-                                        window.setTitle(&NSString::from_str(if t.is_empty() {
-                                            "blaze-shell"
-                                        } else {
-                                            &t
-                                        }));
-                                    }
-                                }
-                            }
-                            dirty = true;
-                        }
-                        PtyRead::Nothing => break,
-                        PtyRead::Closed => {
-                            closed = true;
-                            break;
-                        }
-                    }
+                let (cols, rows) = tile_layout
+                    .panes
+                    .iter()
+                    .find(|pl| pl.pane == pid)
+                    .map(|pl| grid_for_rect(pl.rect, &fonts, scale))
+                    .unwrap_or_else(|| grid_for(size, &fonts, scale));
+                if pane.poll_async_jobs(cols, rows, cpx) {
+                    dirty = true;
                 }
-                if let Some(code) = ap.pty.try_wait() {
-                    pty_finished = Some((ap.block_id, code, ap.started.elapsed().as_millis() as u64));
-                } else if closed {
-                    pty_finished = Some((ap.block_id, 0, ap.started.elapsed().as_millis() as u64));
+                if pane.running_jobs > 0 {
+                    any_running_jobs = true;
                 }
-            }
-            if let Some((block_id, code, dur_ms)) = pty_finished {
-                // Drain any remaining unread bytes from the PTY master before closing/dropping it
-                // so fast commands never lose their final output!
-                if let Some(ap) = shell.active_pty.take() {
-                    let drain_deadline = Instant::now() + std::time::Duration::from_millis(15);
+
+                let mut pty_finished: Option<(BlockId, i32, u64)> = None;
+                if let Some(ap) = &pane.active_pty {
+                    let mut closed = false;
                     loop {
                         match ap.pty.read(&mut pty_buf) {
                             PtyRead::Bytes(n) => {
-                                if let Some(blk) = shell.store.block_mut(ap.block_id)
+                                if let Some(blk) = pane.store.block_mut(ap.block_id)
                                     && let BlockBody::Terminal { term, .. } = &mut blk.body
                                 {
                                     term.feed(&pty_buf[..n]);
+                                    let replies = term.take_replies();
+                                    if !replies.is_empty() {
+                                        ap.pty.write_all(&replies);
+                                    }
+                                    let effects = term.take_effects();
+                                    for eff in effects.iter() {
+                                        if let Effect::TitleChanged = eff
+                                            && pid == focused_pid
+                                        {
+                                            let t = String::from_utf8_lossy(term.title()).into_owned();
+                                            window.setTitle(&NSString::from_str(if t.is_empty() {
+                                                "blaze-shell"
+                                            } else {
+                                                &t
+                                            }));
+                                        }
+                                    }
                                 }
+                                dirty = true;
                             }
-                            PtyRead::Closed => break,
-                            PtyRead::Nothing => {
-                                if Instant::now() >= drain_deadline {
-                                    break;
-                                }
-                                std::thread::sleep(std::time::Duration::from_millis(1));
+                            PtyRead::Nothing => break,
+                            PtyRead::Closed => {
+                                closed = true;
+                                break;
                             }
                         }
                     }
-                }
-                if let Some(blk) = shell.store.block_mut(block_id) {
-                    blk.exit_code = code;
-                    blk.duration_ms = dur_ms;
-                    if let BlockBody::Terminal { running, exit_code, .. } = &mut blk.body {
-                        *running = false;
-                        *exit_code = Some(code);
+                    if let Some(code) = ap.pty.try_wait() {
+                        pty_finished = Some((ap.block_id, code, ap.started.elapsed().as_millis() as u64));
+                    } else if closed {
+                        pty_finished = Some((ap.block_id, 0, ap.started.elapsed().as_millis() as u64));
                     }
                 }
-                window.setTitle(&NSString::from_str("blaze-shell"));
-                shell.refresh_prompt(code, dur_ms);
-                shell.auto_scroll_bottom = true;
+                if let Some((block_id, code, dur_ms)) = pty_finished {
+                    if let Some(ap) = pane.active_pty.take() {
+                        let drain_deadline = Instant::now() + std::time::Duration::from_millis(15);
+                        loop {
+                            match ap.pty.read(&mut pty_buf) {
+                                PtyRead::Bytes(n) => {
+                                    if let Some(blk) = pane.store.block_mut(ap.block_id)
+                                        && let BlockBody::Terminal { term, .. } = &mut blk.body
+                                    {
+                                        term.feed(&pty_buf[..n]);
+                                    }
+                                }
+                                PtyRead::Closed => break,
+                                PtyRead::Nothing => {
+                                    if Instant::now() >= drain_deadline {
+                                        break;
+                                    }
+                                    std::thread::sleep(std::time::Duration::from_millis(1));
+                                }
+                            }
+                        }
+                    }
+                    if let Some(blk) = pane.store.block_mut(block_id) {
+                        blk.exit_code = code;
+                        blk.duration_ms = dur_ms;
+                        if let BlockBody::Terminal { running, exit_code, .. } = &mut blk.body {
+                            *running = false;
+                            *exit_code = Some(code);
+                        }
+                    }
+                    if pid == focused_pid {
+                        window.setTitle(&NSString::from_str("blaze-shell"));
+                    }
+                    pane.refresh_prompt(code, dur_ms);
+                    pane.auto_scroll_bottom = true;
+                    dirty = true;
+                }
+            }
+            if any_running_jobs && last_running_tick.elapsed().as_millis() >= 80 {
+                last_running_tick = Instant::now();
                 dirty = true;
             }
 
@@ -2960,20 +3761,14 @@ mod macos_app {
                 }
                 size = new_size;
                 layer.setDrawableSize(NSSize::new(size.width * scale, size.height * scale));
-                if let Some(ap) = &shell.active_pty {
-                    let (cols, rows) = grid_for(size, &fonts, scale);
-                    let px = (
-                        cols.saturating_mul(fonts.metrics.cell_w as u16),
-                        rows.saturating_mul(fonts.metrics.cell_h as u16),
-                    );
-                    ap.pty.resize(cols, rows, px);
-                    if let Some(blk) = shell.store.block_mut(ap.block_id)
-                        && let BlockBody::Terminal { term, .. } = &mut blk.body
-                    {
-                        term.resize(cols, rows);
-                    }
-                }
+                pty_sizes_dirty = true;
                 dirty = true;
+            }
+            if pty_sizes_dirty {
+                let area = HitRect::new(0.0, TOP_BAR_H, size.width as f32, size.height as f32);
+                let next_tl = wm.layout(area, TILE_GAP);
+                sync_pty_sizes(&mut panes, &next_tl, &fonts, scale);
+                pty_sizes_dirty = false;
             }
 
             // Ghostty-style eased cursor sweep trail (`DURATION = 0.20s`, `EaseOutCubic`).
@@ -3007,104 +3802,27 @@ mod macos_app {
                         None
                     }
                 });
-                let mut scene = if let Some(yazi) = &mut shell.yazi {
-                    layout_yazi_view(
-                        yazi,
-                        &shell.store,
-                        &shell.prompt,
-                        size.width as f32,
-                        size.height as f32,
-                        metrics,
-                        zoom_pct,
-                        true,
-                    )
-                } else if let Some(hub) = &shell.agent_hub {
-                    layout_agent_hub(
-                        hub,
-                        &shell.store,
-                        &shell.prompt,
-                        size.width as f32,
-                        size.height as f32,
-                        metrics,
-                        zoom_pct,
-                        true,
-                    )
-                } else if shell.store.is_alternate_screen()
-                    && let Some(tid) = shell.store.active_running_terminal()
-                    && let Some(blk) = shell.store.block(tid)
-                    && let BlockBody::Terminal { term, .. } = &blk.body
-                {
-                    layout_fullscreen_terminal(
-                        term,
-                        &shell.store,
-                        &shell.prompt,
-                        size.width as f32,
-                        size.height as f32,
-                        metrics,
-                        cursor_vis,
-                        zoom_pct,
-                        true,
-                    )
-                } else {
-                    let frame_now = now_ns();
-                    let screen_sel = |sy: f32| {
-                        output_selection.map(|s| TextSelection {
-                            anchor: [s.anchor[0], s.anchor[1] - sy],
-                            head: [s.head[0], s.head[1] - sy],
-                        })
-                    };
-                    let mouse_pt = last_mouse.map(|(mx, my)| [mx, my]);
-                    let first = build_scene(&LayoutInput {
-                        store: &shell.store,
-                        editor: &shell.editor,
-                        prompt: &shell.prompt,
-                        viewport_w: size.width as f32,
-                        viewport_h: size.height as f32,
-                        metrics,
-                        scroll_y: shell.scroll_y,
-                        cursor_visible: cursor_vis,
-                        now_ns: frame_now,
-                        zoom_pct,
-                        inline_titlebar: true,
-                        drag: active_drag.as_ref(),
-                        cursor_trail: active_trail,
-                        text_selection: screen_sel(shell.scroll_y),
-                        active_popover: active_popover.as_ref(),
-                        mouse_pos: mouse_pt,
-                        output_nav,
-                    });
-                    let max_s = (first.total_content_height - first.scroll_viewport_height).max(0.0);
-                    let target_scroll = if shell.auto_scroll_bottom {
-                        shell.auto_scroll_bottom = false;
-                        max_s
-                    } else {
-                        shell.scroll_y.clamp(0.0, max_s)
-                    };
-                    if (target_scroll - shell.scroll_y).abs() > 0.5 {
-                        shell.scroll_y = target_scroll;
-                        build_scene(&LayoutInput {
-                            store: &shell.store,
-                            editor: &shell.editor,
-                            prompt: &shell.prompt,
-                            viewport_w: size.width as f32,
-                            viewport_h: size.height as f32,
-                            metrics,
-                            scroll_y: shell.scroll_y,
-                            cursor_visible: cursor_vis,
-                            now_ns: frame_now,
-                            zoom_pct,
-                            inline_titlebar: true,
-                            drag: active_drag.as_ref(),
-                            cursor_trail: active_trail,
-                            text_selection: screen_sel(shell.scroll_y),
-                            active_popover: active_popover.as_ref(),
-                            mouse_pos: mouse_pt,
-                            output_nav,
-                        })
-                    } else {
-                        first
-                    }
-                };
+                let frame_now = now_ns();
+                let mouse_pt = last_mouse.map(|(mx, my)| [mx, my]);
+                let (mut scene, next_tl) = build_window_scene(
+                    &wm,
+                    &mut panes,
+                    size.width as f32,
+                    size.height as f32,
+                    metrics,
+                    cursor_vis,
+                    frame_now,
+                    zoom_pct,
+                    true,
+                    active_drag.as_ref(),
+                    active_trail,
+                    output_selection,
+                    active_popover.as_ref(),
+                    mouse_pt,
+                    output_nav,
+                    dragging_split,
+                );
+                tile_layout = next_tl;
 
                 // Detect significant cursor jump to trigger Ghostty eased sweep trail!
                 if let (Some(prev), Some(curr)) = (last_cursor_rect, scene.cursor_rect) {
@@ -3145,7 +3863,7 @@ mod macos_app {
                     overlay_glyphs: &overlay_glyphs,
                 };
                 renderer.draw(&layer, &frame);
-                // Keep `text_runs`, hit regions, drag sources & composer geometry in `last_scene`
+                // Keep `text_runs`, hit regions, drag sources & composer geometry in `composite_scene`
                 // for instant mouse hover, output text selection, and `Cmd+C` extraction!
                 scene.rects.clear();
                 scene.icon_quads.clear();
@@ -3153,14 +3871,19 @@ mod macos_app {
                 scene.overlay_rects.clear();
                 scene.overlay_icons.clear();
                 scene.overlay_text.clear();
-                shell.last_scene = scene;
+                composite_scene = scene;
                 if let Some((mx, my)) = last_mouse
                     && window.isKeyWindow()
                     && !on_resize_edge(mx, my, size.width as f32, size.height as f32)
                 {
+                    let alt_scr = panes
+                        .get(&wm.focused_pane())
+                        .is_some_and(|p| p.store.is_alternate_screen());
                     let next = cursor_for_point(
-                        &shell.last_scene,
-                        shell.store.is_alternate_screen(),
+                        &composite_scene,
+                        &tile_layout.handles,
+                        dragging_split,
+                        alt_scr,
                         pending_drag.as_ref().is_some_and(|d| d.active),
                         selecting_composer || selecting_output,
                         mx,
