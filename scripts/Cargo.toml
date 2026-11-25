@@ -39,6 +39,10 @@ blaze-pins.workspace = true
 # Seatbelt profile renderer (`blaze-roots::seatbelt`, zero extra third-party deps).
 blaze-build-script.workspace = true
 blaze-roots.workspace = true
+# confined_exec: the one hermetic run (bstd::procs::hermetic: Landlock + seccomp on Linux,
+# Seatbelt on macOS) and its task context, for the native build's sandbox (D69).
+blaze-std.workspace = true
+blaze-core.workspace = true
 blaze-manifest = { workspace = true, default-features = false }
 edition.workspace = true
 

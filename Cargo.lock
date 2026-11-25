@@ -4236,6 +4236,7 @@ name = "scripts"
 version = "0.0.0"
 dependencies = [
  "blaze-build-script",
+ "blaze-core",
  "blaze-data",
  "blaze-fetch",
  "blaze-git-fetch",
@@ -4247,6 +4248,7 @@ dependencies = [
  "blaze-roots",
  "blaze-script",
  "blaze-sha256",
+ "blaze-std",
  "blaze-text",
  "blaze-toml",
  "blaze-toolchain",

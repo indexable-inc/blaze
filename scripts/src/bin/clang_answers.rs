@@ -43,6 +43,9 @@ struct Given {
     table: String,
     work: String,
     deadline: Duration,
+    /// The host the shelf's clang builds for; its sysroot flag shape follows it
+    /// (`-isysroot` on Apple hosts, `--sysroot=` on Linux ones).
+    target: String,
 }
 
 fn typed(text: &str) -> Given {
@@ -59,7 +62,7 @@ fn typed(text: &str) -> Given {
     };
     let value: Value = serde_json::from_str(&text).unwrap_or_else(|e| fail(SCRIPT, &format!("the input is not JSON: {e}")));
     let Value::Object(value) = value else { fail(SCRIPT, "the input is a JSON object") };
-    let known = ["deadline_secs", "sdk", "shelf", "table", "work"];
+    let known = ["deadline_secs", "sdk", "shelf", "table", "target", "work"];
     let mut unknown: Vec<&str> = value.keys().map(String::as_str).filter(|it| !known.contains(it)).collect();
     unknown.sort_unstable();
     if !unknown.is_empty() {
@@ -78,12 +81,23 @@ fn typed(text: &str) -> Given {
         None => fail(SCRIPT, "field deadline_secs is missing"),
     };
     let (shelf, sdk) = (text_of("shelf"), text_of("sdk"));
+    let target = match value.get("target") {
+        None => {
+            if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+                "x86_64-unknown-linux-gnu".to_owned()
+            } else {
+                "aarch64-apple-darwin".to_owned()
+            }
+        }
+        Some(Value::String(it)) if !it.is_empty() => it.clone(),
+        Some(_) => fail(SCRIPT, "field target is a non-empty string"),
+    };
     for (name, path) in [("shelf", &shelf), ("sdk", &sdk)] {
         if !Path::new(path).is_absolute() {
             fail(SCRIPT, &format!("field {name} is an absolute path, not {path}"));
         }
     }
-    Given { shelf, sdk, table: text_of("table"), work: text_of("work"), deadline }
+    Given { shelf, sdk, table: text_of("table"), work: text_of("work"), deadline, target }
 }
 
 /// `hex` of `bytes`, lowercase.
@@ -209,8 +223,12 @@ fn answer(given: &Given, sources: &Map<String, Value>, row: &Map<String, Value>,
     argv.push("--no-default-config".to_owned());
     argv.extend(args.iter().map(|arg| to_host(arg, &paths, &out_dir, &given.sdk)));
     if !args.iter().any(|arg| arg.starts_with("-isysroot") || arg.starts_with("--sysroot")) {
-        argv.push("-isysroot".to_owned());
-        argv.push(given.sdk.clone());
+        if given.target.ends_with("-apple-darwin") {
+            argv.push("-isysroot".to_owned());
+            argv.push(given.sdk.clone());
+        } else {
+            argv.push(format!("--sysroot={}", given.sdk));
+        }
     }
     let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
     let ran = match run_within(&argv, Path::new(&out_dir), given.deadline) {

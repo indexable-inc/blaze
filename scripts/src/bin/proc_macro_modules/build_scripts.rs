@@ -77,18 +77,26 @@ impl Input for Wrapped {
     }
 }
 
-/// The host the native mode builds for; the only one with a pinned clang and a sysroot today
-/// (pins/clang.json: Linux's sysroot is not pinned).
+/// The host the native mode builds for: the pinned clang and sysroot of this machine's own
+/// target (pins/clang.json has `aarch64-apple-darwin` and `x86_64-unknown-linux-gnu` rows).
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 const HOST: &str = "aarch64-apple-darwin";
+/// The host the native mode builds for (see above).
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+const HOST: &str = "x86_64-unknown-linux-gnu";
+/// The host the native mode builds for (see above): no pinned toolchain for any other host.
+#[cfg(not(any(all(target_arch = "aarch64", target_os = "macos"), all(target_arch = "x86_64", target_os = "linux"))))]
+const HOST: &str = "unsupported-host";
 
 /// `native`: the scripts are built as host binaries (no process shim: they really start the
-/// pinned clang), linked by the shelf's clang (`bin/clang`, whose `bin/clang.cfg` says
-/// `-fuse-ld=lld`: the release's `ld64.lld`) against the SDK; the machine's `cc` and `ld` are
-/// never asked.
+/// pinned clang), linked by the shelf's clang (`bin/clang`; `-fuse-ld=lld` from its
+/// `bin/clang.cfg` or the build's link args) against the C library root: the macOS SDK, or the
+/// pinned glibc sysroot on Linux; the machine's `cc` and `ld` are never asked.
 struct Native {
     /// `<home>/.blaze/v2/toolchain/clang/<sha256>`: the unpacked pin.
     clang: PathBuf,
-    /// The macOS SDK folder, resolved once by the caller (`xcrun --show-sdk-path`).
+    /// The macOS SDK folder (resolved once by the caller, `xcrun --show-sdk-path`), or the
+    /// pinned glibc sysroot folder `<home>/.blaze/v2/toolchain/sysroot/<sha256>` on Linux.
     sdk: PathBuf,
 }
 
@@ -102,12 +110,20 @@ impl Input for Native {
 
 impl Native {
     /// The identity's lines: the target, the compiler by its shelf digest (the folder's name),
-    /// the SDK by its settings file's digest; no machine path.
+    /// the C library root by its own key (the SDK settings file's digest on macOS, the sysroot
+    /// pin's hex folder name on Linux); no machine path.
     fn identity(&self) -> Result<String, Failure> {
         let digest = self.clang.file_name().map(|it| it.to_string_lossy().into_owned()).unwrap_or_default();
-        let settings = self.sdk.join("SDKSettings.json");
-        let settings = std::fs::read(&settings).map_err(io(&settings))?;
-        Ok(format!("target {HOST}\nlinker clang {digest}\nsdk settings {}\n", sha256(&settings)))
+        if HOST.ends_with("-apple-darwin") {
+            let settings = self.sdk.join("SDKSettings.json");
+            let settings = std::fs::read(&settings).map_err(io(&settings))?;
+            return Ok(format!("target {HOST}\nlinker clang {digest}\nsdk settings {}\n", sha256(&settings)));
+        }
+        let sysroot = self.sdk.file_name().map(|it| it.to_string_lossy().into_owned()).unwrap_or_default();
+        if sysroot.len() != 64 || !sysroot.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(Failure::NoSandbox { why: format!("{}: the pinned sysroot's folder is not named by its pin's SHA-256 (D69)", self.sdk.display()) });
+        }
+        Ok(format!("target {HOST}\nlinker clang {digest}\nsysroot {sysroot}\n"))
     }
 }
 
@@ -483,7 +499,18 @@ impl Plan<'_> {
         if !script.exists() {
             return Err(no_module(format!("it has no build script at {}", script.display())));
         }
-        let ws = self.work.join("bs-ws").join(format!("{}-{}", wanted.name, wanted.version));
+        // A native Linux build's workspace lives under a fixed /tmp root, not under the work
+        // folder: cargo reads `.cargo/config.toml` in every ancestor of its cwd, and a $HOME
+        // with one (rustup's) would be an ambient read the Landlock grant must refuse — which
+        // cargo treats as fatal. `/tmp/blaze-pmm-ws` is the same spelling on every machine, and
+        // the remap below keeps it out of the bytes.
+        let ws = if native.is_some() && HOST.ends_with("-linux-gnu") {
+            let ws = PathBuf::from(format!("/tmp/blaze-pmm-ws/{}-{}", wanted.name, wanted.version));
+            let _ = std::fs::remove_dir_all(&ws);
+            ws
+        } else {
+            self.work.join("bs-ws").join(format!("{}-{}", wanted.name, wanted.version))
+        };
         write(&ws.join("Cargo.toml"), "[workspace]\nmembers = [\"script\"]\nresolver = \"2\"\n\n[profile.release]\ndebug = false\nincremental = false\npanic = \"abort\"\ncodegen-units = 16\n")?;
         let path = source.join("Cargo.toml");
         let manifest = super::member_dependencies::filtered_manifest(&script_only(&original), &path, &features, alloc)?;
@@ -502,20 +529,26 @@ impl Plan<'_> {
             "--workspace".into(),
             "--message-format=json".into(),
         ];
-        let triple = match native {
-            None => {
-                argv.push("-Zbuild-std=std,panic_abort".into());
-                "wasm32-wasip1"
-            }
-            Some(_) => HOST,
-        };
-        argv.extend::<[OsString; 3]>([
-            "--target".into(),
-            triple.into(),
+        // A native Linux build is for this host itself: no `--target`, so cargo applies
+        // `CARGO_ENCODED_RUSTFLAGS` (the sysroot and `-fuse-ld=lld` link args) to the host
+        // artifacts too — with `--target` they reach only the target crate and every
+        // dependency's build script would link with the machine's `ld` (D69).
+        let self_target = native.is_some() && HOST.ends_with("-linux-gnu");
+        if !self_target {
+            let triple = match native {
+                None => {
+                    argv.push("-Zbuild-std=std,panic_abort".into());
+                    "wasm32-wasip1"
+                }
+                Some(_) => HOST,
+            };
+            argv.extend::<[OsString; 2]>(["--target".into(), triple.into()]);
+        }
+        argv.push(
             // Exactly the unit's set: the member declares each as empty, `default` among them
             // when the unit has it, so nothing else is turned on.
             "--no-default-features".into(),
-        ]);
+        );
         if !features.is_empty() {
             argv.push("--features".into());
             argv.push(features.join(",").into());
@@ -524,18 +557,30 @@ impl Plan<'_> {
         // sources, its dependencies' (vendored), the pinned Rust toolchain, the shelf's clang
         // and the SDK; writes only of its own folders. The wasm build keeps the builder's
         // write-only confinement (its std copy and shim are read from the whole work folder).
+        // Linux: the same grant, enforced by Landlock + seccomp through `confined_exec`
+        // (bstd::procs::hermetic, D177); the build's writable folders live under the script's
+        // workspace, the one output root of its hermetic spec.
+        let (target, cargo_home, tmp) = match native {
+            Some(_) if HOST.ends_with("-linux-gnu") => (ws.join(".target"), ws.join(".cargo-home"), ws.join(".tmp")),
+            _ => (self.work.join("bs-target"), self.work.join("cargo-home"), self.work.join("tmp")),
+        };
+        for dir in [&target, &cargo_home, &tmp] {
+            std::fs::create_dir_all(dir).map_err(io(dir))?;
+        }
+        let own_source = match origin {
+            Origin::Path { dir, .. } | Origin::Git { dir, .. } => Some(dir.as_path()),
+            Origin::Registry { .. } => None,
+        };
+        let mut linux_confined = false;
         let sandbox = match native {
             None => sandboxed(argv.clone(), &self.work),
+            // Linux: the confinement is written after the environment is complete (it is part
+            // of the hermetic spec); the argv stays bare until then.
+            Some(_) if HOST.ends_with("-linux-gnu") => {
+                linux_confined = true;
+                Ok(argv.clone())
+            }
             Some(native) => {
-                let target = self.work.join("bs-target");
-                let (cargo_home, tmp) = (self.work.join("cargo-home"), self.work.join("tmp"));
-                for dir in [&target, &cargo_home, &tmp] {
-                    std::fs::create_dir_all(dir).map_err(io(dir))?;
-                }
-                let own_source = match origin {
-                    Origin::Path { dir, .. } | Origin::Git { dir, .. } => Some(dir.as_path()),
-                    Origin::Registry { .. } => None,
-                };
                 let vendor = self.work.join("vendor");
                 let mut reads: Vec<&Path> = vec![vendor.as_path(), self.tool.sysroot.as_path(), native.clang.as_path(), native.sdk.as_path()];
                 reads.extend(own_source);
@@ -556,7 +601,7 @@ impl Plan<'_> {
                 builder.profile().and_then(|profile| native_sandboxed(argv.clone(), profile))
             }
         };
-        let argv = match sandbox {
+        let mut argv = match sandbox {
             Ok(argv) => argv,
             Err(why) if self.args.unsandboxed_build_scripts => {
                 println!("{SCRIPT}: UNSANDBOXED: the build of {} {}'s script runs with no sandbox ({why}), as the input asked", wanted.name, wanted.version);
@@ -564,25 +609,64 @@ impl Plan<'_> {
             }
             Err(why) => return Err(Failure::NoSandbox { why }),
         };
-        let mut env = self.env(&self.work.join("cargo-home"));
+        let mut env = self.env(&cargo_home);
+        if linux_confined {
+            // The build's temp folder is under its one writable root, not the shared one.
+            for (key, value) in env.iter_mut() {
+                if key == "TMPDIR" {
+                    *value = tmp.clone().into_os_string();
+                }
+            }
+        }
         env.push(("SOURCE_DATE_EPOCH".to_owned(), "0".into()));
         let mut flags = vec![format!("--remap-path-prefix={}=/build", self.work.display()), "-Cdebuginfo=0".to_owned()];
+        if linux_confined {
+            flags.push(format!("--remap-path-prefix={}=/build/ws", ws.display()));
+        }
         if let Origin::Path { dir, .. } = origin {
             flags.push(format!("--remap-path-prefix={}=/build/path/{}-{}", dir.display(), wanted.name, wanted.version));
         }
         env.push(("CARGO_ENCODED_RUSTFLAGS".to_owned(), flags.join("\u{1f}").into()));
-        let target = self.work.join("bs-target");
         env.push(("CARGO_TARGET_DIR".to_owned(), target.clone().into_os_string()));
         match native {
             None => env.push(("__CARGO_TESTS_ONLY_SRC_ROOT".to_owned(), library.as_os_str().to_owned())),
             Some(native) => {
                 // Every host artifact (the script, its build-dependencies' scripts and proc
-                // macros) links with the shelf's clang, which links with `ld64.lld`, against
-                // the SDK: the machine's `cc` and `ld` are never asked.
-                env.push(("CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER".to_owned(), native.clang.join("bin/clang").into_os_string()));
-                env.push(("SDKROOT".to_owned(), native.sdk.clone().into_os_string()));
-                env.push(("MACOSX_DEPLOYMENT_TARGET".to_owned(), "11.0".into()));
+                // macros) links with the shelf's clang, against the C library root; the
+                // machine's `cc` and `ld` are never asked.
+                let linker_var = format!("CARGO_TARGET_{}_LINKER", HOST.to_uppercase().replace('-', "_"));
+                env.push((linker_var, native.clang.join("bin/clang").into_os_string()));
+                if HOST.ends_with("-apple-darwin") {
+                    env.push(("SDKROOT".to_owned(), native.sdk.clone().into_os_string()));
+                    env.push(("MACOSX_DEPLOYMENT_TARGET".to_owned(), "11.0".into()));
+                } else {
+                    // Linux: clang finds the sysroot's headers, crt and libs only through
+                    // `--sysroot`, and `ld.lld` only through `-fuse-ld=lld` (the shelf holds no
+                    // `clang.cfg`); both ride the encoded rustflags beside the path remaps.
+                    let extra = format!("-Clink-arg=--sysroot={}\u{1f}-Clink-arg=-fuse-ld=lld", native.sdk.display());
+                    match env.iter_mut().find(|(k, _)| k == "CARGO_ENCODED_RUSTFLAGS") {
+                        Some((_, value)) => {
+                            let mut flags = value.to_string_lossy().into_owned();
+                            if !flags.is_empty() {
+                                flags.push('\u{1f}');
+                            }
+                            flags.push_str(&extra);
+                            *value = flags.into();
+                        }
+                        None => env.push(("CARGO_ENCODED_RUSTFLAGS".to_owned(), extra.into())),
+                    }
+                }
                 env.push(("ZERO_AR_DATE".to_owned(), "1".into()));
+            }
+        }
+        if linux_confined {
+            let native = native.expect("linux_confined is set only in the native arm");
+            match linux_confined_argv(&argv, native, self, &ws, own_source, &target, &env, wanted) {
+                Ok(wrapped) => argv = wrapped,
+                Err(why) if self.args.unsandboxed_build_scripts => {
+                    println!("{SCRIPT}: UNSANDBOXED: the build of {} {}'s script runs with no sandbox ({why}), as the input asked", wanted.name, wanted.version);
+                }
+                Err(why) => return Err(Failure::NoSandbox { why }),
             }
         }
         let what = format!("the build of {} {}'s script", wanted.name, wanted.version);
@@ -598,10 +682,11 @@ impl Plan<'_> {
         check_compiled(&compiled, &closure, &std_lock, library, &wanted.name, &wanted.version)?;
 
         let (artifact, module_file, digest_file) = match native {
-            None => ("wasm32-wasip1/release/build-script-build.wasm", "module.wasm", "wasm-sha256"),
-            Some(_) => ("aarch64-apple-darwin/release/build-script-build", "script.bin", "bin-sha256"),
+            None => ("wasm32-wasip1/release/build-script-build.wasm".to_owned(), "module.wasm", "wasm-sha256"),
+            Some(_) if self_target => ("release/build-script-build".to_owned(), "script.bin", "bin-sha256"),
+            Some(_) => (format!("{HOST}/release/build-script-build"), "script.bin", "bin-sha256"),
         };
-        let wasm_path = target.join(artifact);
+        let wasm_path = target.join(&artifact);
         let wasm = std::fs::read(&wasm_path).map_err(io(&wasm_path))?;
         let wasm_sha256 = sha256(&wasm);
         let record = self.args.store.join("build-script/modules").join(&key);
@@ -759,11 +844,80 @@ impl NativeBuilder<'_> {
     }
 }
 
-/// The command that runs `argv` under `profile`. macOS only: Linux has no pinned sysroot, so no
-/// native script is built there yet (D69).
+/// The Linux confinement of a native script's build (D69): the same grant the macOS Seatbelt
+/// profile states, enforced by Landlock + seccomp through `confined_exec` (bstd's hermetic run,
+/// D177). The build's writable folders (`ws`, `.target`, `.cargo-home`, `.tmp`) are the spec's
+/// one output root; reads are the vendored sources, the pinned Rust toolchain, the shelf's
+/// clang and the pinned sysroot (and a path package's own sources). The spec is written under
+/// the work folder and the returned argv runs `confined_exec <spec>`: a missing helper or a
+/// refused spec is an error, never a silent unsandboxed build.
+fn linux_confined_argv(
+    argv: &[OsString],
+    native: &Native,
+    plan: &Plan<'_>,
+    ws: &Path,
+    own_source: Option<&Path>,
+    target: &Path,
+    env: &[(String, OsString)],
+    wanted: &Wanted,
+) -> Result<Vec<OsString>, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let helper = exe.parent().map(|dir| dir.join("confined_exec")).ok_or_else(|| "current_exe has no folder".to_owned())?;
+    if !helper.is_file() {
+        return Err(format!("{}: the Landlock helper is not built beside proc_macro_modules (cargo build -p scripts --bin confined_exec)", helper.display()));
+    }
+    let text = |path: &Path| path.to_string_lossy().into_owned();
+    let toolchain_bin = plan.tool.sysroot.join("bin");
+    let rustlib_bin = plan.tool.sysroot.join("lib").join("rustlib").join(HOST).join("bin");
+    let shelf_bin = native.clang.join("bin");
+    let helpers: Vec<String> = [
+        toolchain_bin.join("rustc"),
+        rustlib_bin.join("rust-objcopy"),
+        rustlib_bin.join("rust-lld"),
+        shelf_bin.join("clang"),
+        shelf_bin.join("clang++"),
+        shelf_bin.join("ld.lld"),
+        shelf_bin.join("lld"),
+        shelf_bin.join("llvm-ar"),
+        shelf_bin.join("llvm-nm"),
+    ]
+    .iter()
+    .map(|p| text(p))
+    .collect();
+    let mut reads: Vec<String> = vec![
+        text(&plan.work.join("vendor")),
+        text(&plan.tool.sysroot),
+        text(&native.clang),
+        text(&native.sdk),
+    ];
+    reads.extend(own_source.map(|dir| text(dir)));
+    let env_pairs: Vec<String> = env.iter().map(|(k, v)| format!("{k}\u{1f}{}", v.to_string_lossy())).collect();
+    let args: Vec<String> = argv.iter().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
+    let spec = serde_json::json!({
+        "program": text(Path::new(&plan.tool.cargo())),
+        "args": args,
+        "cwd": text(ws),
+        "env": env_pairs,
+        "reads": reads,
+        "write": text(ws),
+        "helpers": helpers,
+        "helper_folders": [text(target)],
+        "cpu_secs": plan.args.build_seconds,
+        "memory_bytes": 16u64 << 30,
+        "deadline_secs": plan.args.build_seconds,
+    });
+    let folder = plan.work.join("confine");
+    std::fs::create_dir_all(&folder).map_err(|e| format!("{}: {e}", folder.display()))?;
+    let path = folder.join(format!("{}-{}.json", wanted.name, wanted.version));
+    std::fs::write(&path, format!("{spec}\n")).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(vec![helper.into_os_string(), path.into_os_string()])
+}
+
+/// The command that runs `argv` under `profile`. macOS only; Linux's confinement is
+/// [`linux_confined_argv`] (D69).
 fn native_sandboxed(argv: Vec<OsString>, profile: String) -> Result<Vec<OsString>, String> {
     if !cfg!(target_os = "macos") {
-        return Err("a native build script is built only on macOS for now (D69: no Linux sysroot is pinned)".to_owned());
+        return Err("sandbox-exec is a macOS tool; this host's native builds are confined by linux_confined_argv (D69)".to_owned());
     }
     let exec = Path::new("/usr/bin/sandbox-exec");
     if !exec.exists() {
