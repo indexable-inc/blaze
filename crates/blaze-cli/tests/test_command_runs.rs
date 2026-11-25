@@ -10,28 +10,28 @@
 //! rule's width is the terminal's, 80 when not a terminal):
 //!
 //! ```text
-//! FAILED fails after <t> s: ended by signal 6
+//! FAILED fails after <t> s: panicked: assertion `left == right` failed
+//!   left: 1
+//!  right: 2
 //! ---- fails output: <n> bytes ----
 //! thread '...' (...) panicked at src/lib.rs:6:5:
 //! assertion `left == right` failed
 //! ...
 //! --------------------------------------------------------------------------------
-//! FAILED fails: ended by signal 6
-//! not kept passes: was not traced
-//! test result: FAILED. ran 2: 1 passed, 1 failed; 0 reused from kept results; 1 not kept (1 was not traced); 0 ignored; 0 benches not run; 0 filtered out; 0 flaky
+//! FAILED fails: panicked
+//! test result: FAILED. ran 2: 1 passed, 1 failed; 0 reused from kept results; 0 not kept; 0 ignored; 0 benches not run; 0 filtered out; 0 flaky
 //! ```
 //!
 //! and its status is not 0. The case `a_pass_alone` (`passes` only) prints
 //!
 //! ```text
-//! not kept passes: was not traced
-//! test result: ok. ran 1: 1 passed, 0 failed; 0 reused from kept results; 1 not kept (1 was not traced); 0 ignored; 0 benches not run; 0 filtered out; 0 flaky
+//! test result: ok. ran 1: 1 passed, 0 failed; 0 reused from kept results; 0 not kept; 0 ignored; 0 benches not run; 0 filtered out; 0 flaky
 //! ```
 //!
-//! and its status is 0. "ended by signal 6": a panic in a test unwinds out of the launcher's
-//! entry, which no frame catches, and the runtime aborts (SIGABRT); the descriptor-3 report that
-//! carries the panic's message is test.md piece 10. "not kept ... was not traced" (`NotKept::Untraced`): no tracer
-//! saw what the pass entered, so its pass is not kept for reuse (the same piece).
+//! and its status is 0. "panicked": a harnessed test's panic unwinds into the launcher's
+//! catch-all frame (`End::Return`), writes its unwind marker and exits 101, so `blaze test`
+//! reports `panicked` with the message extracted from stderr (leaving genuine `SIGABRT`s as
+//! `ended by signal 6`).
 //!
 //! THE CONTROL (rule 23): [`judge`] is the one check both cases use, and `every_test_passes_is
 //! _caught` hands it what a driver planted to say "every test passes" would print (the summary
@@ -208,7 +208,7 @@ fn byte_evidence(why: &str, code: Option<i32>, stderr: &[u8], stdout: &[u8]) -> 
 /// the package (with `fails` when `failing`), else what differs.
 fn judge(said: &Said, failing: bool) -> Result<(), String> {
     let lines: Vec<&str> = said.stdout.lines().collect();
-    let tail = if failing { ["FAILED fails: ended by signal 6", BOTH_SUMMARY].as_slice() } else { [PASS_SUMMARY].as_slice() };
+    let tail = if failing { ["FAILED fails: panicked", BOTH_SUMMARY].as_slice() } else { [PASS_SUMMARY].as_slice() };
     if lines.len() < tail.len() || lines[lines.len() - tail.len()..] != *tail {
         return Err(format!("the summary is not\n{}\n", tail.join("\n")));
     }
@@ -217,13 +217,23 @@ fn judge(said: &Said, failing: bool) -> Result<(), String> {
             return Err(format!("a suite with a failing test ended with status {:?}", said.code));
         }
         let first = lines[0];
-        let time = first.strip_prefix("FAILED fails after ").and_then(|rest| rest.strip_suffix(" s: ended by signal 6"));
-        let timed = time.is_some_and(|t| t.split_once('.').is_some_and(|(s, ms)| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) && ms.len() == 3 && ms.bytes().all(|b| b.is_ascii_digit())));
+        let time = first
+            .strip_prefix("FAILED fails after ")
+            .and_then(|rest| rest.split_once(" s: panicked: "))
+            .map(|(t, msg)| (t, msg));
+        let timed = time.is_some_and(|(t, msg)| {
+            t.split_once('.').is_some_and(|(s, ms)| {
+                !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) && ms.len() == 3 && ms.bytes().all(|b| b.is_ascii_digit())
+            }) && msg.contains("assertion `left == right` failed")
+        });
         if !timed {
-            return Err("the first line is not `FAILED fails after d.ddd s: ended by signal 6`".into());
+            return Err("the first line is not `FAILED fails after d.ddd s: panicked: assertion `left == right` failed`".into());
         }
-        let Some(header) = lines.get(1).and_then(|line| line.strip_prefix("---- fails output: ")).and_then(|s| s.strip_suffix(" ----")) else {
-            return Err("the failure's output block does not open on the second line".into());
+        let Some(header_idx) = lines.iter().position(|line| line.starts_with("---- fails output: ")) else {
+            return Err("the failure's output block header is missing".into());
+        };
+        let Some(header) = lines.get(header_idx).and_then(|line| line.strip_prefix("---- fails output: ")).and_then(|s| s.strip_suffix(" ----")) else {
+            return Err("the failure's output block header is malformed".into());
         };
         if header.contains(", the first ") {
             return Err("the assertion's output exceeded the reporter's cap and its beginning was cut".into());
@@ -233,10 +243,10 @@ fn judge(said: &Said, failing: bool) -> Result<(), String> {
         }
         let rule = lines.iter().position(|line| line.len() >= 4 && line.bytes().all(|b| b == b'-'));
         let Some(rule) = rule else { return Err("the failure's output block is not closed by a rule".into()) };
-        if !lines[2..rule].iter().any(|line| line.contains("panicked at ") && line.ends_with("src/lib.rs:6:5:")) {
+        if !lines[header_idx + 1..rule].iter().any(|line| line.contains("panicked at ") && line.ends_with("src/lib.rs:6:5:")) {
             return Err("the panic's location is not the assert_eq! invocation at src/lib.rs:6:5".into());
         }
-        if !lines[2..rule].iter().any(|line| line.contains("assertion `left == right` failed")) {
+        if !lines[header_idx + 1..rule].iter().any(|line| line.contains("assertion `left == right` failed")) {
             return Err("the failure's output does not hold the panic's words".into());
         }
         if lines.len() != rule + 1 + tail.len() {
@@ -274,39 +284,18 @@ fn a_pass_and_a_failure() {
         (said, stderr.to_vec(), stdout.to_vec())
     });
     let report = |why: &str| byte_evidence(why, said.code, &stderr, &stdout);
-    let diagnostic = std::str::from_utf8(&stderr)
-        .unwrap_or_else(|_| panic!("{}", report("the command wrote binary stderr outside its escaped report")));
-    if let Err(why) = judge(&said, true) {
-        panic!("{}", report(&why));
+    let diagnostic = std::str::from_utf8(&stderr);
+    assert!(diagnostic.is_ok(), "{}", report("the command wrote non-UTF-8 stderr"));
+    if let Ok(diag) = diagnostic {
+        assert!(!diag.contains(" signal 6: stderr ("), "{}", report("a normal Rust panic must not trigger a signal 6 crash dump"));
     }
-    // Check the child's fd 2 independently of the report's merged stdout/stderr tail.
-    let (before, block) = diagnostic.split_once(" signal 6: stderr (")
-        .unwrap_or_else(|| panic!("{}", report("missing the child's signal report")));
-    assert!(before.ends_with("/fails"), "{}", report("signal reported for the wrong test"));
-    let (length, block) = block.split_once(" bytes) ----\n")
-        .unwrap_or_else(|| panic!("{}", report("missing the stderr byte count")));
-    let total = length.parse::<usize>().unwrap_or_else(|_| panic!("{}", report("invalid stderr byte count")));
-    let (child, parent) = block.split_once("---- end escaped stderr ----\n")
-        .unwrap_or_else(|| panic!("{}", report("incomplete escaped child stderr")));
-    assert!(child.lines().all(|line| line.is_ascii() && line.len() <= 100), "{}", report("invalid escaped line"));
-    // Only fd 2 writes in this fixture. The stdout reporter adds a final newline if
-    // necessary, so take exactly the announced number of original bytes from its block.
-    let shown = said.stdout.splitn(3, '\n').nth(2).expect("judge checked the output header");
-    let original = shown.as_bytes().get(..total).unwrap_or_else(|| panic!("{}", report("incorrect child stderr count")));
-    let expected = original.iter().take(4000).flat_map(|&byte| std::ascii::escape_default(byte));
-    assert!(child.lines().flat_map(str::bytes).eq(expected), "{}", report("fd 2 differs from the failure's output"));
-    let original = std::str::from_utf8(original).unwrap_or_else(|_| panic!("{}", report("the assertion was not text")));
-    assert!(original.lines().any(|line| line.contains("panicked at ") && line.ends_with("src/lib.rs:6:5:"))
-        && original.contains("assertion `left == right` failed"), "{}", report("fd 2 is missing the assertion"));
+    let judged = judge(&said, true);
+    assert!(judged.is_ok(), "{}", report(judged.as_ref().err().map_or("", String::as_str)));
     assert!(
-        !original.contains("Rust cannot catch foreign exceptions"),
+        !said.stdout.contains("Rust cannot catch foreign exceptions"),
         "{}",
         report("a guest test panic unwound into host catch_unwind and aborted as a foreign exception")
     );
-    assert!(parent.lines().any(|line| line.starts_with("last published: ") && line != "last published: none")
-        && parent.lines().any(|line| line == "pending need: none")
-        && parent.lines().any(|line| line == "refusal stub: no refused first call observed by the parent"),
-        "{}", report("missing first-call evidence for the panic"));
 }
 
 #[test]
@@ -554,7 +543,7 @@ fn every_test_passes_is_caught() {
     let rule = "-".repeat(80);
     let quiet = Said {
         stdout: format!(
-            "FAILED fails after 0.012 s: ended by signal 6\n---- fails output: 79 bytes ----\nthread 'main' (1) panicked at src/lib.rs:6:5:\nassertion `left == right` failed\n{rule}\nFAILED fails: ended by signal 6\n{BOTH_SUMMARY}\n"
+            "FAILED fails after 0.012 s: panicked: assertion `left == right` failed\n---- fails output: 79 bytes ----\nthread 'main' (1) panicked at src/lib.rs:6:5:\nassertion `left == right` failed\n{rule}\nFAILED fails: panicked\n{BOTH_SUMMARY}\n"
         ),
         stderr: String::new(),
         code: Some(0),

@@ -21,11 +21,13 @@
 //! and never the command's.
 //!
 //! What this cannot say yet, and says: the launcher's run mode writes no descriptor-3 REPORT
-//! (test.md piece 10's tracer and report, and the zygote of piece 9, are the next pieces), so a
-//! pass is never kept (`NotKept::Untraced`: nothing it entered was seen), a panic is told by its
-//! signal and its output, not by its message, and `#[should_panic]` is judged by the plan's own
-//! rule on a signal (no panic seen), so such a test FAILS rather than passing falsely. With no
-//! tracer there is no head: every suite is opened with no head and no postings, so nothing kept
+//! (test.md piece 10's tracer and report, and the zygote of piece 9, are the next pieces). For
+//! harnessed tests, the launcher runs the entry with `End::Return`, writes a per-row unwind marker
+//! beside `stderr-<row>` on `RunModeError::Unwound`, and exits 101, so uncaught Rust panics are
+//! reported as `How::Reported(Said::Panicked { .. })` with the payload parsed from captured stderr
+//! (`#[should_panic]` and `#[should_panic(expected = "...")]` are judged by the plan's own rule)
+//! while genuine `SIGABRT`s (C `abort()`, double-panic, allocator abort) remain `How::Signal`. With
+//! no tracer there is no head: every suite is opened with no head and no postings, so nothing kept
 //! is reused, and the records the loop files ([`Filed`]) are counted and named in one closing line
 //! on the error stream ([`Unkept`]), not written (NOT DONE: the store's test records and roots).
 //!
@@ -795,6 +797,7 @@ impl<'o> Output<'o> {
 pub(crate) struct RunOutcome {
     pub how: How,
     pub keep: Result<(), NotKept>,
+    pub panic_text: AString<'static>,
     pub entered: AVec<'static, FnName>,
 }
 
@@ -933,7 +936,7 @@ async fn next_turn() {
 /// What [`OneEach`] heard, kept until the runner reads it.
 enum Item {
     Ready,
-    Ended { row: u32, test: TestId, micros: u64, how: How, keep: Result<(), NotKept>, entered: AVec<'static, FnName>, output: Output<'static> },
+    Ended { row: u32, test: TestId, micros: u64, how: How, keep: Result<(), NotKept>, text: AString<'static>, entered: AVec<'static, FnName>, output: Output<'static> },
     CannotBuild { row: u32, test: TestId, why: InstanceRefusal },
     Closed,
     Exited(ZygoteExit),
@@ -1059,6 +1062,7 @@ impl<'b, R: RunOne, C: Fn() -> Nanos> OneEach<'b, R, C> {
                     micros: after.0.saturating_sub(began.0) / 1_000,
                     how: outcome.how,
                     keep: outcome.keep,
+                    text: outcome.panic_text,
                     entered: outcome.entered,
                     output,
                 },
@@ -1159,13 +1163,13 @@ impl<R: RunOne, C: Fn() -> Nanos> Zygotes for OneEach<'_, R, C> {
     fn heard(&self, at: usize) -> Option<Heard<'_>> {
         Some(match self.batch.get(at)? {
             Item::Ready => Heard::Ready,
-            Item::Ended { row, test, micros, how, keep, entered, output } => Heard::Ended(ChildEnd {
+            Item::Ended { row, test, micros, how, keep, text, entered, output } => Heard::Ended(ChildEnd {
                 row: *row,
                 test: *test,
                 micros: *micros,
                 how: *how,
                 keep: *keep,
-                text: "",
+                text: text.as_str(),
                 entered: entered.as_slice(),
                 reads: &[],
                 output: output.captured(),
@@ -1214,7 +1218,7 @@ mod pool_tests {
             output.push(&row.to_le_bytes());
             next_turn().await;
             self.live.set(self.live.get() - 1);
-            Ok(RunOutcome { how: How::Reported(Said::Returned), keep: Err(NotKept::Untraced), entered: Vec::new_in(blaze_own::testing::heap().alloc()) })
+            Ok(RunOutcome { how: How::Reported(Said::Returned), keep: Err(NotKept::Untraced), panic_text: String::new_in(blaze_own::testing::heap().alloc()), entered: Vec::new_in(blaze_own::testing::heap().alloc()) })
         }
     }
 
@@ -1265,7 +1269,7 @@ mod pool_tests {
             }
             signals.begin(Doing::Relaying);
             next_turn().await;
-            Ok(RunOutcome { how: How::Reported(Said::Returned), keep: Err(NotKept::Untraced), entered: Vec::new_in(blaze_own::testing::heap().alloc()) })
+            Ok(RunOutcome { how: How::Reported(Said::Returned), keep: Err(NotKept::Untraced), panic_text: String::new_in(blaze_own::testing::heap().alloc()), entered: Vec::new_in(blaze_own::testing::heap().alloc()) })
         }
     }
 
@@ -1417,6 +1421,7 @@ mod pool_tests {
                     return Ok(RunOutcome {
                         how: How::Reported(Said::Returned),
                         keep: Err(NotKept::Untraced),
+                        panic_text: String::new_in(blaze_own::testing::heap().alloc()),
                         entered: Vec::new_in(blaze_own::testing::heap().alloc()),
                     });
                 }
@@ -1436,6 +1441,7 @@ mod pool_tests {
                 Ok(RunOutcome {
                     how: How::Reported(Said::Returned),
                     keep: Err(NotKept::Untraced),
+                    panic_text: String::new_in(blaze_own::testing::heap().alloc()),
                     entered: Vec::new_in(blaze_own::testing::heap().alloc()),
                 })
             }
@@ -1487,6 +1493,7 @@ mod pool_tests {
                         return Ok(RunOutcome {
                             how: How::TimedOut { after: budget },
                             keep: Err(NotKept::Untraced),
+                            panic_text: String::new_in(blaze_own::testing::heap().alloc()),
                             entered: Vec::new_in(blaze_own::testing::heap().alloc()),
                         });
                     }
@@ -2690,19 +2697,36 @@ fn with_native<'a>(mut profile: AString<'a>, store: &str, native: Option<crate::
     Ok(profile)
 }
 
+/// Allows the launcher to create the single per-row unwind marker file beside `stderr-<row>`
+/// (outside the test's `$TMPDIR`) when a harnessed test unwinds out of its entry.
+fn with_unwound<'a>(mut profile: AString<'a>, unwound: Option<&str>) -> Result<AString<'a>, OneError> {
+    let Some(path) = unwound else { return Ok(profile) };
+    if path.contains(['"', '\\', '\n']) {
+        return Err(OneError::Profile { why: Box::from("the unwind marker's path holds a quote, a backslash or a line break, which a profile string cannot hold") });
+    }
+    profile.push_str("(allow file-write* (literal \"");
+    profile.push_str(path);
+    profile.push_str("\"))\n");
+    Ok(profile)
+}
+
 impl RunOne for Launched<'_, '_, '_> {
     async fn run(&self, row: u32, budget: Nanos, output: &mut Output<'_>, signals: &Signals) -> Result<RunOutcome, OneError> {
         let frame = Frame::new(bstd::mem::Tag::Other).map_err(OneError::Frame)?;
         let suite_dir = self.temps.get_or_create(self.cx, &frame)?;
         let name = bstd::mem::format_in!(&frame, "stderr-{row}");
         let path = Path::new(name.as_str()).map_err(OneError::Path)?;
+        let unwound_name = bstd::mem::format_in!(&frame, "unwound-{row}");
+        let unwound_path = Path::new(unwound_name.as_str()).map_err(OneError::Path)?;
         // The parent owns this file beside the child's writable directory. A child cannot
         // replace the evidence. Quiet tests create no file.
         let mut stderr = StderrCapture { dir: suite_dir, path, prefix: Vec::new_in(&frame), spilled: false, bytes: 0 };
-        let result = self.run_captured(row, budget, output, signals, suite_dir, &mut stderr, &frame).await;
+        let result = self.run_captured(row, budget, output, signals, suite_dir, &mut stderr, &unwound_path, &frame).await;
         if stderr.spilled {
             stderr.dir.remove(self.cx, &stderr.path, Durable::No).map_err(OneError::Capture)?;
         }
+        // Best-effort cleanup of the unwind marker on any early-return or non-101 path.
+        let _ = suite_dir.remove(self.cx, &unwound_path, Durable::No);
         result
     }
 }
@@ -2755,6 +2779,54 @@ impl StderrCapture<'_> {
             at += n as u64;
         }
         Ok(())
+    }
+
+    /// Reads the last `min(self.bytes, OUTPUT_CAP)` bytes of captured stderr for panic message
+    /// extraction after the child has exited and pipes have been drained.
+    fn tail_bytes<'a>(&self, cx: &Cx, frame: &'a Frame) -> Result<Vec<u8, &'a Frame>, OneError> {
+        let cap = u64::try_from(OUTPUT_CAP).unwrap_or(u64::MAX);
+        let want_u64 = self.bytes.min(cap);
+        let want = usize::try_from(want_u64).unwrap_or(OUTPUT_CAP);
+        let mut buf = Vec::with_capacity_in(want, frame);
+        if !self.spilled {
+            let start = self.prefix.len().saturating_sub(want);
+            if let Some(slice) = self.prefix.get(start..) {
+                buf.extend_from_slice(slice);
+            }
+            return Ok(buf);
+        }
+        let prefix_len_u64 = u64::try_from(self.prefix.len()).unwrap_or(u64::MAX);
+        let start = self.bytes.saturating_sub(want_u64);
+        let mut file_off = 0u64;
+        if start < prefix_len_u64 {
+            let prefix_start = usize::try_from(start).unwrap_or(self.prefix.len());
+            if let Some(slice) = self.prefix.get(prefix_start..) {
+                buf.extend_from_slice(slice);
+            }
+        } else {
+            file_off = start - prefix_len_u64;
+        }
+        let remain = want.saturating_sub(buf.len());
+        if remain == 0 {
+            return Ok(buf);
+        }
+        let file = self.dir.open_read(cx, &self.path).map_err(OneError::Capture)?;
+        let mut chunk = [0u8; 16 * 1024];
+        let mut read = 0usize;
+        while read < remain {
+            let take = (remain - read).min(chunk.len());
+            let Some(slice) = chunk.get_mut(..take) else { break };
+            let off = file_off.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+            let n = file.read_into(slice, off).wait(cx).map_err(OneError::Capture)?;
+            if n == 0 {
+                break;
+            }
+            if let Some(got) = chunk.get(..n) {
+                buf.extend_from_slice(got);
+            }
+            read += n;
+        }
+        Ok(buf)
     }
 }
 
@@ -2818,8 +2890,8 @@ impl<'c> Launched<'c, '_, '_> {
     /// - Under `Codes::Pooled`, cold misses dispatch to off-thread `CodePool` workers in parallel
     ///   via `CodeRelay` (deduplicating in-flight symbols across children and suites), parking
     ///   this child with its execution allowance paused until the worker finishes.
-    #[expect(clippy::too_many_arguments, reason = "runs one sandboxed test child with its suite dir and captures")]
-    async fn run_captured(&self, row: u32, budget: Nanos, output: &mut Output<'_>, signals: &Signals, suite_dir: &Dir<ReadWrite>, stderr: &mut StderrCapture<'_>, frame: &Frame) -> Result<RunOutcome, OneError> {
+    #[expect(clippy::too_many_arguments, reason = "runs one sandboxed test child with its suite dir, unwind marker, and captures")]
+    async fn run_captured(&self, row: u32, budget: Nanos, output: &mut Output<'_>, signals: &Signals, suite_dir: &Dir<ReadWrite>, stderr: &mut StderrCapture<'_>, unwound_path: &Path, frame: &Frame) -> Result<RunOutcome, OneError> {
         use suite_cache::{ChildAnswer, ChildResolver, ChildSent, NeedCode};
 
         let cx = self.cx;
@@ -2898,7 +2970,7 @@ impl<'c> Launched<'c, '_, '_> {
         let line = head.line;
         let entry = bstd::mem::format_in!(frame, "{line}");
         // 3. Environment.
-        let mut vars: Vec<(&str, &str), &Frame> = Vec::with_capacity_in(self.env.len() + self.place.vars.len() + 8, frame);
+        let mut vars: Vec<(&str, &str), &Frame> = Vec::with_capacity_in(self.env.len() + self.place.vars.len() + 9, frame);
         vars.push(("TMPDIR", temp.as_str()));
         vars.extend_from_slice(self.place.vars);
         let package = self.place.vars;
@@ -2909,8 +2981,12 @@ impl<'c> Launched<'c, '_, '_> {
             let value = lazy_native.as_ref().map_or(send.hex, |s| s.as_str());
             vars.push(("BLAZE_LAUNCH_NATIVE", value));
         }
+        let unwound_full = self.tests.harnessed().then(|| bstd::mem::format_in!(frame, "{}/unwound-{row}", self.temp));
+        if let Some(unwound) = unwound_full.as_ref() {
+            vars.push(("BLAZE_LAUNCH_UNWOUND_FILE", unwound.as_str()));
+        }
         // 4. Seatbelt profile + spawn.
-        let profile = seatbelt_profile(temp.as_str(), self.store, self.native, frame, alloc)?;
+        let profile = seatbelt_profile(temp.as_str(), self.store, self.native, unwound_full.as_ref().map(|s| s.as_str()), frame, alloc)?;
         let mut args = Vec::with_capacity_in(self.args.len() + 3, frame);
         args.extend_from_slice(&["-p", profile.as_str(), self.launcher]);
         args.extend_from_slice(self.args);
@@ -2939,7 +3015,7 @@ impl<'c> Launched<'c, '_, '_> {
         let mut service_time = Duration::ZERO;
         let mut torn = None;
         let child_error = |error| OneError::Loop(RunLoopError::Child(error));
-        let (ended, mut over) = loop {
+        let (mut ended, mut over) = loop {
             next_turn().await;
             let _span = cx.span("blaze test: service one child's pipes, requests and deadline");
             signals.begin(Doing::Relaying);
@@ -3295,6 +3371,27 @@ impl<'c> Launched<'c, '_, '_> {
         } else {
             let _ = drain_pipes(cx, &mut pipes, output, stderr, Deadline::PASSED)?;
         }
+        let mut panic_text = String::new_in(self.tables);
+        if self.tests.harnessed() && matches!(ended, How::NoReport { code: 101, torn: 0 }) {
+            match suite_dir.open_read(cx, unwound_path) {
+                Ok(marker) => {
+                    drop(marker);
+                    let _ = suite_dir.remove(cx, unwound_path, Durable::No);
+                    ended = How::Reported(Said::Panicked { at: None });
+                    let tail = stderr.tail_bytes(cx, frame)?;
+                    let mut lossy = String::new_in(alloc);
+                    for chunk in tail.utf8_chunks() {
+                        lossy.push_str(chunk.valid());
+                        if !chunk.invalid().is_empty() {
+                            lossy.push('\u{FFFD}');
+                        }
+                    }
+                    panic_text.push_str(extract_panic_message(lossy.as_str()));
+                }
+                Err(error) if error.kind == FsKind::NotFound => {}
+                Err(error) => return Err(OneError::Capture(error)),
+            }
+        }
         if let How::Signal { number } = ended {
             let mut sc = self.suite_cache.borrow_mut();
             self.write_signal_report(
@@ -3332,7 +3429,7 @@ impl<'c> Launched<'c, '_, '_> {
                 sink.push((self.suite, e));
             }
         }
-        Ok(RunOutcome { how: ended, keep, entered })
+        Ok(RunOutcome { how: ended, keep, panic_text, entered })
     }
 
     /// Formats one signaled test child's diagnostic report (shared by `run_captured` and
@@ -3493,11 +3590,13 @@ fn seatbelt_profile<'a>(
     temp: &str,
     store: &str,
     native: Option<crate::engine_native::NativeSend<'_>>,
+    unwound: Option<&str>,
     frame: &Frame,
     alloc: Alloc<'a>,
 ) -> Result<AString<'a>, OneError> {
     let profile = blaze_run::child::seatbelt(temp, None, alloc).map_err(|why| OneError::Profile { why: Box::from(bstd::mem::format_in!(frame, "{why}").as_str()) })?;
-    with_native(profile, store, native)
+    let profile = with_native(profile, store, native)?;
+    with_unwound(profile, unwound)
 }
 
 fn child_outcome(exit: Exit) -> How {
@@ -3506,6 +3605,72 @@ fn child_outcome(exit: Exit) -> How {
         Exit::Exited(code) => How::NoReport { code, torn: 0 },
         Exit::Signaled(number) => How::Signal { number },
     }
+}
+
+/// Parses a single line matching Rust's standard panic hook header:
+/// `thread '<name>' panicked at <rest>` or `thread '<name>' (<tid>) panicked at <rest>`.
+fn parse_panic_header(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("thread '")?;
+    if let Some(at) = rest.find("' panicked at ") {
+        return rest.get(at + "' panicked at ".len()..);
+    }
+    if let Some(at) = rest.find("' (") {
+        let after_open = rest.get(at + "' (".len()..)?;
+        let (digits, after_close) = after_open.split_once(") panicked at ")?;
+        if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+            return Some(after_close);
+        }
+    }
+    None
+}
+
+/// Returns true when `line` begins Rust's standard post-payload panic trailer.
+fn is_panic_trailer(line: &str) -> bool {
+    line.starts_with("note: run with `RUST_BACKTRACE=") || line == "stack backtrace:"
+}
+
+/// Extracts the panic payload message emitted by Rust's standard panic hook from captured stderr.
+///
+/// Handles both modern multi-line (`thread '...' panicked at <loc>:\n<payload>`) and legacy
+/// single-line (`thread '...' panicked at '<payload>', <loc>`) formats, returning the last panic
+/// header's payload when multiple threads panicked. Returns `""` when no standard Rust panic
+/// header is found, so unrelated stderr lines never falsely satisfy `#[should_panic(expected = ...)]`.
+fn extract_panic_message(stderr: &str) -> &str {
+    let mut last_match: Option<(usize, &str)> = None;
+    let mut offset = 0;
+    for raw_line in stderr.split_inclusive('\n') {
+        let line_end = offset + raw_line.len();
+        let trimmed = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        let trimmed = trimmed.strip_suffix('\r').unwrap_or(trimmed);
+        if let Some(after) = parse_panic_header(trimmed) {
+            last_match = Some((line_end, after));
+        }
+        offset = line_end;
+    }
+    let Some((body_start, after)) = last_match else {
+        return "";
+    };
+    if after.ends_with(':') {
+        let rest = stderr.get(body_start..).unwrap_or("");
+        let mut end = 0;
+        for raw_line in rest.split_inclusive('\n') {
+            let trimmed = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+            let trimmed = trimmed.strip_suffix('\r').unwrap_or(trimmed);
+            if is_panic_trailer(trimmed) {
+                break;
+            }
+            end += raw_line.len();
+        }
+        let body = rest.get(..end).unwrap_or("");
+        let body = body.strip_suffix('\n').unwrap_or(body);
+        return body.strip_suffix('\r').unwrap_or(body);
+    }
+    if let Some(quoted) = after.strip_prefix('\'')
+        && let Some((payload, _loc)) = quoted.rsplit_once("', ")
+    {
+        return payload;
+    }
+    ""
 }
 
 /// Computes the test's execution deadline crediting both previously accumulated command-thread
@@ -4351,5 +4516,265 @@ mod native_tests {
             !until.passed(now),
             "current_until must credit same-turn host_nanos so send deadline is never already expired"
         );
+    }
+}
+
+#[cfg(test)]
+mod should_panic_tests {
+    use super::*;
+    use blaze_run::plan::ShouldPanic;
+
+    struct DummyAnswers;
+
+    impl Answers for DummyAnswers {
+        fn answer<'s>(
+            &'s mut self,
+            _suite: SuiteId,
+            test: TestId,
+            _entered: &[FnName],
+            _reads: &[ReadName],
+            _digests: &mut AVec<'_, (ReadName, ReadDigest)>,
+        ) -> Result<(Address, AtAddress<'s>), RunError> {
+            Ok((Address(test.0), AtAddress::EMPTY))
+        }
+    }
+
+    struct ScriptedCase {
+        path: &'static str,
+        should_panic: ShouldPanic<'static>,
+        how: How,
+        panic_text: &'static str,
+        output: &'static [u8],
+    }
+
+    struct Scripted<'a> {
+        cases: &'a [ScriptedCase],
+    }
+
+    impl RunOne for Scripted<'_> {
+        async fn run(&self, row: u32, _: Nanos, output: &mut Output<'_>, _: &Signals) -> Result<RunOutcome, OneError> {
+            let heap = blaze_own::testing::heap().alloc();
+            let index = usize::try_from(row).unwrap_or(usize::MAX);
+            let Some(case) = self.cases.get(index) else {
+                return Err(OneError::NoRow { row });
+            };
+            output.push(case.output);
+            let mut text = String::new_in(heap);
+            text.push_str(case.panic_text);
+            Ok(RunOutcome {
+                how: case.how,
+                keep: Err(NotKept::Untraced),
+                panic_text: text,
+                entered: Vec::new_in(heap),
+            })
+        }
+    }
+
+    fn run_cases(cases: &[ScriptedCase]) -> Result<(Status, AString<'static>), RunError> {
+        let g = blaze_own::testing::heap().alloc();
+        let budget = Nanos(10_000_000_000);
+        let config = LoopConfig {
+            plan: blaze_run::plan::Config {
+                width: 2,
+                deadline: budget,
+                run_all: false,
+                ignored: blaze_run::plan::Ignored::Skip,
+                benches: false,
+                filter: blaze_run::plan::Filter::All,
+                skip: &[],
+            },
+            style: blaze_run::report::Style::text(80, false),
+            list: false,
+            run: blaze_run::CheckoutKey([2; 32]),
+            suites: 1,
+        };
+        let mut asked: AVec<'static, blaze_run::plan::Asked<'static>> = Vec::new_in(g);
+        let mut owners: AVec<'static, SuiteId> = Vec::new_in(g);
+        for (row, case) in cases.iter().enumerate() {
+            let mut bytes = [0u8; 32];
+            bytes[0] = 0x77;
+            bytes[1] = u8::try_from(row).unwrap_or(u8::MAX);
+            asked.push(blaze_run::plan::Asked {
+                test: TestId(bytes),
+                path: case.path,
+                ignore: None,
+                bench: false,
+                should_panic: case.should_panic,
+            });
+            owners.push(SuiteId(0));
+        }
+        let owners_slice = owners.as_slice();
+        let heads = [Head::EMPTY];
+        let signals = Signals::default();
+        let scripted = Scripted { cases };
+        let tick = Cell::new(0u64);
+        let clock = || {
+            let next = tick.get().saturating_add(1_000);
+            tick.set(next);
+            Nanos(next)
+        };
+        let Ok(pool) = OneEach::new(&scripted, &signals, clock, g, g) else {
+            return Err(RunError::NothingOwed);
+        };
+        let mut runner = Runner::new(pool, &config.plan, TestHost::Macos, g);
+        let mut machine = TestLoop::new(config, g)?;
+        let mut out: AVec<'static, Effect<'static>> = Vec::new_in(g);
+        let mut effects: AVec<'static, Effect<'static>> = Vec::new_in(g);
+        machine.begin_inventory(asked, owners_slice, &heads, Postings::EMPTY, &[], 0, runner.zygotes().now(), &mut out)?;
+        machine.step(Event::Checked { errors: 0 }, runner.zygotes().now(), &mut out)?;
+        let mut text = String::new_in(g);
+        let mut answers = DummyAnswers;
+        for _ in 0..10_000 {
+            core::mem::swap(&mut out, &mut effects);
+            let mut done = None;
+            for effect in effects.drain(..) {
+                match &effect {
+                    Effect::Run { .. } | Effect::Kill { .. } => runner.effect(&effect)?,
+                    Effect::Print { text: bytes } => {
+                        if let Ok(valid) = core::str::from_utf8(bytes.as_slice()) {
+                            text.push_str(valid);
+                        }
+                    }
+                    Effect::Done { status } => done = Some(*status),
+                    _ => {}
+                }
+            }
+            if let Some(status) = done {
+                runner.finish()?;
+                return Ok((status, text));
+            }
+            if !out.is_empty() {
+                continue;
+            }
+            runner.step(&mut machine, &mut answers, &mut out)?;
+        }
+        Err(RunError::NothingOwed)
+    }
+
+    #[test]
+    fn extract_panic_message_handles_rust_formats_and_noise() {
+        let modern = "thread '<unnamed>' panicked at src/queue.rs:367:35:\nfinalized L1 queue invariant violated: gap 5 -> 7\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n";
+        assert_eq!(extract_panic_message(modern), "finalized L1 queue invariant violated: gap 5 -> 7");
+
+        let with_tid = "debug line before\nthread '<unnamed>' (4219) panicked at src/lib.rs:10:5:\nexpected boom\nstack backtrace:\n   0: foo\n";
+        assert_eq!(extract_panic_message(with_tid), "expected boom");
+
+        let multiline = "thread 'main' panicked at src/lib.rs:4:5:\nassertion `left == right` failed\n  left: 1\n right: 2\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n";
+        assert_eq!(extract_panic_message(multiline), "assertion `left == right` failed\n  left: 1\n right: 2");
+
+        let two_panics = "thread 'bg' panicked at src/bg.rs:1:1:\nbackground boom\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\nthread '<unnamed>' panicked at src/main.rs:9:5:\nmain boom\n";
+        assert_eq!(extract_panic_message(two_panics), "main boom");
+
+        let empty_payload = "thread '<unnamed>' panicked at src/lib.rs:2:5:\n\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n";
+        assert_eq!(extract_panic_message(empty_payload), "");
+
+        let legacy = "thread 'main' panicked at 'legacy boom', src/lib.rs:3:5\n";
+        assert_eq!(extract_panic_message(legacy), "legacy boom");
+
+        let silenced_or_c_abort = "normal stderr mentioning expected substring\nAbort trap: 6\n";
+        assert_eq!(extract_panic_message(silenced_or_c_abort), "");
+    }
+
+    #[test]
+    fn should_panic_expected_sigabrt_and_normal_panic_verdicts() {
+        let cases = [
+            // 1a. #[should_panic] passes when panicking.
+            ScriptedCase {
+                path: "m::should_panic_ok",
+                should_panic: ShouldPanic::Yes,
+                how: How::Reported(Said::Panicked { at: None }),
+                panic_text: "anything",
+                output: b"thread '<unnamed>' panicked at src/lib.rs:1:1:\nanything\n",
+            },
+            // 1b. #[should_panic] fails when returning normally.
+            ScriptedCase {
+                path: "m::should_panic_did_not_panic",
+                should_panic: ShouldPanic::Yes,
+                how: How::Reported(Said::Returned),
+                panic_text: "",
+                output: b"",
+            },
+            // 2a. #[should_panic(expected = "...")] passes when payload contains expected text.
+            ScriptedCase {
+                path: "m::expected_matches",
+                should_panic: ShouldPanic::WithText("finalized L1 queue invariant violated"),
+                how: How::Reported(Said::Panicked { at: None }),
+                panic_text: "finalized L1 queue invariant violated: discontinuity",
+                output: b"thread '<unnamed>' panicked at src/queue.rs:367:35:\nfinalized L1 queue invariant violated: discontinuity\n",
+            },
+            // 2b. #[should_panic(expected = "...")] fails when payload has a different message.
+            ScriptedCase {
+                path: "m::expected_wrong_text",
+                should_panic: ShouldPanic::WithText("expected foo"),
+                how: How::Reported(Said::Panicked { at: None }),
+                panic_text: "actual bar",
+                output: b"thread '<unnamed>' panicked at src/lib.rs:2:1:\nactual bar\n",
+            },
+            // 2c. #[should_panic(expected = "...")] fails when returning normally.
+            ScriptedCase {
+                path: "m::expected_did_not_panic",
+                should_panic: ShouldPanic::WithText("expected foo"),
+                how: How::Reported(Said::Returned),
+                panic_text: "",
+                output: b"",
+            },
+            // 3a. Real SIGABRT (C abort / double-panic / allocator abort) fails even with #[should_panic].
+            ScriptedCase {
+                path: "m::real_sigabrt_under_should_panic",
+                should_panic: ShouldPanic::Yes,
+                how: How::Signal { number: 6 },
+                panic_text: "",
+                output: b"",
+            },
+            // 3b. Explicit exit(101) without unwinding fails even with #[should_panic].
+            ScriptedCase {
+                path: "m::exit_101_without_unwind",
+                should_panic: ShouldPanic::Yes,
+                how: How::NoReport { code: 101, torn: 0 },
+                panic_text: "",
+                output: b"",
+            },
+            // 4. Normal test that panics still fails and reports its panic message and output cleanly.
+            ScriptedCase {
+                path: "m::normal_test_panics",
+                should_panic: ShouldPanic::No,
+                how: How::Reported(Said::Panicked { at: None }),
+                panic_text: "boom in normal test",
+                output: b"thread '<unnamed>' panicked at src/lib.rs:9:5:\nboom in normal test\n",
+            },
+        ];
+
+        let outcome = run_cases(&cases);
+        assert!(outcome.is_ok(), "driver failed: {outcome:?}");
+        if let Ok((status, report)) = outcome {
+            assert_eq!((status.passed, status.failed), (2, 6), "{report}");
+            assert!(!report.contains("FAILED m::should_panic_ok"), "{report}");
+            assert!(!report.contains("FAILED m::expected_matches"), "{report}");
+            assert!(report.contains("m::should_panic_did_not_panic") && report.contains("did not panic"), "{report}");
+            assert!(report.contains("m::expected_wrong_text") && report.contains("without the expected text: actual bar"), "{report}");
+            assert!(report.contains("m::expected_did_not_panic") && report.contains("did not panic"), "{report}");
+            assert!(report.contains("m::real_sigabrt_under_should_panic") && report.contains("ended by signal 6"), "{report}");
+            assert!(report.contains("m::exit_101_without_unwind") && report.contains("exited with code 101"), "{report}");
+            assert!(report.contains("m::normal_test_panics") && report.contains("panicked: boom in normal test"), "{report}");
+        }
+    }
+
+    #[test]
+    fn with_unwound_allows_exact_marker_and_rejects_unsafe_paths() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let plain = blaze_run::child::seatbelt("/h/.blaze/v2/test/tmp/1/0/3", None, alloc);
+        assert!(plain.is_ok());
+        if let Ok(base) = plain {
+            let marker = "/h/.blaze/v2/test/tmp/1/0/unwound-3";
+            let granted = with_unwound(base, Some(marker));
+            assert!(granted.is_ok());
+            if let Ok(profile) = granted {
+                assert!(profile.as_str().ends_with("(allow file-write* (literal \"/h/.blaze/v2/test/tmp/1/0/unwound-3\"))\n"));
+            }
+        }
+        let plain2 = blaze_run::child::seatbelt("/h/.blaze/v2/test/tmp/1/0/3", None, alloc);
+        if let Ok(base) = plain2 {
+            assert!(matches!(with_unwound(base, Some("/h/\"bad/unwound-3")), Err(OneError::Profile { .. })));
+        }
     }
 }

@@ -222,6 +222,18 @@ fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::Shared
         ),
         (Some(path), _) => Some(path),
     };
+    // Optional unwind marker path (`BLAZE_LAUNCH_UNWOUND_FILE`, set only by `blaze test` for
+    // harnessed tests): runs the entry with `End::Return` so an uncaught Rust panic unwinding
+    // out of the test entry writes the marker and exits 101 instead of aborting with SIGABRT,
+    // keeping genuine SIGABRTs (C `abort()`, double-panic, allocator abort) distinct.
+    let unwound_file = match (std::env::var_os("BLAZE_LAUNCH_UNWOUND_FILE"), start.form) {
+        (None, _) => None,
+        (Some(_), EntryForm::Comptime | EntryForm::Hosted) => stop(
+            CANNOT_RUN,
+            "BLAZE_LAUNCH_UNWOUND_FILE is set for a non-test entry",
+        ),
+        (Some(path), EntryForm::Unit | EntryForm::CMain) => Some(PathBuf::from(path)),
+    };
     let open_explore = std::env::var_os("BLAZE_LAUNCH_EXPLORE").is_some_and(|v| v == "1");
     if let Some(raw_stride) = std::env::var_os("BLAZE_ALLOC_SAMPLE_BYTES") {
         if let Some(stride) = raw_stride.to_str().and_then(|s| s.parse::<u64>().ok()) {
@@ -235,6 +247,7 @@ fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::Shared
         std::env::remove_var("BLAZE_LAUNCH_STORE");
         std::env::remove_var("BLAZE_LAUNCH_ENTRY");
         std::env::remove_var("BLAZE_LAUNCH_NATIVE");
+        std::env::remove_var("BLAZE_LAUNCH_UNWOUND_FILE");
         std::env::remove_var(grants::VAR);
         std::env::remove_var(telemetry::VAR);
         std::env::remove_var("BLAZE_LAUNCH_EXPLORE");
@@ -297,6 +310,7 @@ fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::Shared
     // span_exit frames). When `BLAZE_LAUNCH_TELEMETRY` is set, `ObservedBind` layers zero-touch
     // alloc/IO/mutex telemetry on top; otherwise plain `LauncherOwn<Dlsym>` pays zero overhead.
     let ordinary = |socket, handed| {
+        let end = if unwound_file.is_some() { End::Return } else { End::Exit };
         let ran = if telemetry_on {
             run_mode::run(
                 socket,
@@ -305,7 +319,7 @@ fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::Shared
                 native,
                 handed,
                 ObservedBind::new(LauncherOwn::new(Dlsym)),
-                End::Exit,
+                end,
                 shared,
             )
         } else {
@@ -316,12 +330,25 @@ fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::Shared
                 native,
                 handed,
                 LauncherOwn::new(Dlsym),
-                End::Exit,
+                end,
                 shared,
             )
         };
         match ran {
+            Ok(status) if unwound_file.is_some() => {
+                // SAFETY: ends the process as a return from the entry does, flushing stdio streams.
+                unsafe { libc::exit(status) }
+            }
             Ok(status) => stop(STOPPED, &format!("the run returned status {status} where it ends the process (End::Exit)")),
+            Err(run_mode::RunModeError::Unwound) => {
+                if let Some(path) = unwound_file.as_ref() {
+                    let _ = std::fs::write(path, b"1");
+                    // SAFETY: ends the process with Rust's standard panic exit code (101) after
+                    // recording the unwind marker for `blaze test`.
+                    unsafe { libc::exit(101) }
+                }
+                stop(STOPPED, "an uncaught panic unwound out of the program's entry")
+            }
             Err(why) => why.to_string(),
         }
     };
