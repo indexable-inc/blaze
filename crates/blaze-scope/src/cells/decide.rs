@@ -645,6 +645,7 @@ fn freeze<N: crate::Name>(core: &mut Cells<'_, N>) {
     core.cell_queue.clear();
     core.item_queue.clear();
     core.extra.clear();
+    core.scratch.quiet.reset_cursors();
     core.taken.clear();
     core.weak_error = None;
 }

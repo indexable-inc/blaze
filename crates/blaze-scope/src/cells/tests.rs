@@ -1860,3 +1860,68 @@ fn a_blocks_call_reads_its_modules_named_import_before_the_prelude() {
     let twin = with_dep(&w, root, dep, CellPlant::None);
     assert_eq!(called(&twin, call), Some(format), "the twin: the prelude's `format`: {:?}", twin.call_outcome(call));
 }
+
+/// Regression test for large mutually glob-reexported module graphs with many unresolved macro
+/// calls (e.g. `lsp-types` / `codex-protocol` style `pub use submod::*;` + repeated `#[serde]`):
+/// on-demand Tarjan + incremental Phase-A closure + transient `Guess::epoch` textual skipping +
+/// per-stall `weak_view` memoization must converge in bounded quiet points with identical forward
+/// and backward schedules.
+#[test]
+fn many_mutually_globbed_modules_with_unresolved_calls_converge_quickly() {
+    const MODS: [&str; 32] = [
+        "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7", "m8", "m9", "m10", "m11", "m12", "m13", "m14", "m15", "m16",
+        "m17", "m18", "m19", "m20", "m21", "m22", "m23", "m24", "m25", "m26", "m27", "m28", "m29", "m30", "m31",
+    ];
+    const CRATE_MODS: [&str; 32] = [
+        "crate::m0", "crate::m1", "crate::m2", "crate::m3", "crate::m4", "crate::m5", "crate::m6", "crate::m7",
+        "crate::m8", "crate::m9", "crate::m10", "crate::m11", "crate::m12", "crate::m13", "crate::m14", "crate::m15",
+        "crate::m16", "crate::m17", "crate::m18", "crate::m19", "crate::m20", "crate::m21", "crate::m22", "crate::m23",
+        "crate::m24", "crate::m25", "crate::m26", "crate::m27", "crate::m28", "crate::m29", "crate::m30", "crate::m31",
+    ];
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let mut mods = Vec::with_capacity(MODS.len());
+    for &name in &MODS {
+        let m = w.module(root, name, V::Pub);
+        mods.push(m);
+        w.glob(root, CRATE_MODS[mods.len() - 1], V::Pub);
+    }
+    let ok_fn = w.fun(mods[0], "ok_fn", V::Pub);
+    let mut calls = Vec::new();
+    for (idx, &m) in mods.iter().enumerate() {
+        // Mutual glob cycle across all 32 submodules + root re-exports.
+        w.glob(m, CRATE_MODS[(idx + 1) % MODS.len()], V::Pub);
+        w.glob(m, "crate", V::Priv);
+        for _ in 0..16 {
+            calls.push(w.call(m, "serde", crate::CallShape::Attr));
+        }
+    }
+    w.use_(root, "crate::m31::ok_fn", V::Priv);
+
+    let run = |backward: bool| {
+        w.expanded.borrow_mut().clear();
+        let mut c = Cells::load(&w, root, Alloc::global()).expect("load");
+        c.backward = backward;
+        let expand = |call: ItemKey, _: crate::Def| {
+            w.expanded.borrow_mut().insert(call);
+        };
+        c.run(&w, &expand, &[]).expect("run");
+        c
+    };
+    let fwd = run(false);
+    let bwd = run(true);
+    let root_use_idx = MODS.len() as u32;
+    assert_eq!(named_def(outcome(&fwd, root, root_use_idx), Namespace::Values), Some(ok_fn));
+    assert_eq!(named_def(outcome(&bwd, root, root_use_idx), Namespace::Values), Some(ok_fn));
+    for &call in &calls {
+        assert_eq!(fwd.call_outcome(call), Some(Outcome::Failed(Unresolved::NotFound)));
+        assert_eq!(bwd.call_outcome(call), Some(Outcome::Failed(Unresolved::NotFound)));
+    }
+    assert!(
+        fwd.stats.quiet_points <= 64,
+        "expected bounded quiet points, got {} (quiet_nodes={}, stalls={})",
+        fwd.stats.quiet_points,
+        fwd.stats.quiet_nodes,
+        fwd.stats.stalls
+    );
+}
