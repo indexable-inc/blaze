@@ -79,6 +79,7 @@ blaze-h1	0	0	1
 blaze-h2	0	0	1
 blaze-hash	0	1	1
 blaze-hashcons	0	0	8
+blaze-html	0	0	1
 blaze-http	3	1	62
 blaze-id	0	0	8
 blaze-ids	1	3	8

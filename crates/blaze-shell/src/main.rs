@@ -99,6 +99,7 @@ mod macos_app {
     use blaze_shell::host::{
         InteractiveSpawn, RustCellMeta, run_command_line, run_command_line_with_pid,
     };
+    use blaze_shell::image_atlas::ImageAtlas;
     use blaze_shell::keys;
     use blaze_shell::layout::{
         LayoutInput, PANE_HEADER_H, TILE_GAP, TOP_BAR_H, TabBarItem, build_pane_scene,
@@ -141,6 +142,7 @@ mod macos_app {
         demo_tiled: bool,
         scroll_bottom: bool,
         cwd: Option<String>,
+        cmd: Option<String>,
         screenshot: Option<PathBuf>,
     }
 
@@ -151,6 +153,7 @@ mod macos_app {
         let mut demo_tiled = false;
         let mut scroll_bottom = false;
         let mut cwd = None;
+        let mut cmd = None;
         let mut screenshot = None;
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -174,6 +177,11 @@ mod macos_app {
                         cwd = Some(d);
                     }
                 }
+                "--cmd" => {
+                    if let Some(c) = args.next() {
+                        cmd = Some(c);
+                    }
+                }
                 "--screenshot" => {
                     if let Some(p) = args.next() {
                         screenshot = Some(PathBuf::from(p));
@@ -182,7 +190,7 @@ mod macos_app {
                 _ => {}
             }
         }
-        CliOpts { demo, demo_popup, demo_history, demo_tiled, scroll_bottom, cwd, screenshot }
+        CliOpts { demo, demo_popup, demo_history, demo_tiled, scroll_bottom, cwd, cmd, screenshot }
     }
 
     /// Spawn a fresh native macOS `blaze-shell` window inheriting `cwd` (`Cmd+N`).
@@ -1933,6 +1941,7 @@ mod macos_app {
         let mut font_points: f64 = FONT_POINTS;
         let mut fonts = Fonts::new(font_points, scale);
         let mut icon_atlas = IconAtlas::new(scale);
+        let mut image_atlas = ImageAtlas::new(scale);
         let mut size = view.bounds().size;
         layer.setContentsScale(scale);
         layer.setDrawableSize(NSSize::new(size.width * scale, size.height * scale));
@@ -1952,6 +1961,13 @@ mod macos_app {
                 cli.demo_popup,
                 cli.demo_history,
             );
+        }
+        if let Some(ref startup_cmd) = cli.cmd {
+            first_pane.submit_command(startup_cmd, init_cols, init_rows, cell_px, false);
+            if !cli.scroll_bottom {
+                first_pane.scroll_y = 0.0;
+                first_pane.auto_scroll_bottom = false;
+            }
         }
         let demo_cwd = first_pane.cwd().to_owned();
         panes.insert(first_pane_id, first_pane);
@@ -2019,6 +2035,10 @@ mod macos_app {
             for (slot, rgba) in icon_atlas.pending.drain(..) {
                 renderer.upload_icon(slot, &rgba);
             }
+            let images = image_atlas.rasterize_quads(&scene.image_quads);
+            for (slot, rgba) in image_atlas.pending.drain(..) {
+                renderer.upload_image(slot, &rgba);
+            }
             let vp = ViewportUniform {
                 size: [size.width as f32, size.height as f32],
                 dpr: scale as f32,
@@ -2031,6 +2051,7 @@ mod macos_app {
                 rects: &scene.rects,
                 glyphs: &glyphs,
                 icons: &icons,
+                images: &images,
                 over_rects: &scene.over_rects,
                 overlay_rects: &scene.overlay_rects,
                 overlay_icons: &overlay_icons,
@@ -4146,6 +4167,7 @@ mod macos_app {
                     scale = new_scale;
                     fonts = Fonts::new(font_points, scale);
                     icon_atlas = IconAtlas::new(scale * (font_points / FONT_POINTS));
+                    image_atlas.set_scale(scale);
                     layer.setContentsScale(scale);
                     zoom_changed = false;
                 }
@@ -4236,6 +4258,10 @@ mod macos_app {
                 for (slot, rgba) in icon_atlas.pending.drain(..) {
                     renderer.upload_icon(slot, &rgba);
                 }
+                let images = image_atlas.rasterize_quads(&scene.image_quads);
+                for (slot, rgba) in image_atlas.pending.drain(..) {
+                    renderer.upload_image(slot, &rgba);
+                }
                 let vp = ViewportUniform {
                     size: [size.width as f32, size.height as f32],
                     dpr: scale as f32,
@@ -4248,6 +4274,7 @@ mod macos_app {
                     rects: &scene.rects,
                     glyphs: &glyphs,
                     icons: &icons,
+                    images: &images,
                     over_rects: &scene.over_rects,
                     overlay_rects: &scene.overlay_rects,
                     overlay_icons: &overlay_icons,
@@ -4258,6 +4285,7 @@ mod macos_app {
                 // for instant mouse hover, output text selection, and `Cmd+C` extraction!
                 scene.rects.clear();
                 scene.icon_quads.clear();
+                scene.image_quads.clear();
                 scene.over_rects.clear();
                 scene.overlay_rects.clear();
                 scene.overlay_icons.clear();

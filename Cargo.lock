@@ -1177,6 +1177,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-html"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
+ "blaze-sim",
+]
+
+[[package]]
 name = "blaze-http"
 version = "0.0.0"
 dependencies = [
@@ -1670,6 +1678,7 @@ name = "blaze-preview"
 version = "0.0.0"
 dependencies = [
  "blaze-data",
+ "blaze-html",
  "blaze-json",
  "blaze-own",
  "blaze-sim",

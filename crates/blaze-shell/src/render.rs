@@ -22,6 +22,7 @@ use objc2_metal::{
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 
 use crate::font::{ATLAS, Slot};
+use crate::image_atlas::{IMAGE_ATLAS_SIZE, ImageSlot};
 use crate::svg_icons::{ICON_ATLAS_SIZE, IconSlot};
 
 type Dev = Retained<ProtocolObject<dyn MTLDevice>>;
@@ -35,6 +36,7 @@ pub struct FrameDraw<'a> {
     pub clips: &'a [ClipRectGpu],
     pub rects: &'a [RectInst],
     pub icons: &'a [GlyphInst],
+    pub images: &'a [GlyphInst],
     pub glyphs: &'a [GlyphInst],
     pub over_rects: &'a [RectInst],
     pub overlay_rects: &'a [RectInst],
@@ -50,6 +52,7 @@ pub struct Renderer {
     sprite: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     atlas: Retained<ProtocolObject<dyn MTLTexture>>,
     icon_atlas: Retained<ProtocolObject<dyn MTLTexture>>,
+    image_atlas: Retained<ProtocolObject<dyn MTLTexture>>,
     sampler: Retained<ProtocolObject<dyn MTLSamplerState>>,
     linear_sampler: Retained<ProtocolObject<dyn MTLSamplerState>>,
 }
@@ -115,6 +118,16 @@ impl Renderer {
             )
         };
         let icon_atlas = dev.newTextureWithDescriptor(&itd).expect("Metal icon atlas texture");
+        // SAFETY: valid 2D RGBA8Unorm descriptor of size IMAGE_ATLAS_SIZE x IMAGE_ATLAS_SIZE.
+        let imtd = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                MTLPixelFormat::RGBA8Unorm,
+                IMAGE_ATLAS_SIZE,
+                IMAGE_ATLAS_SIZE,
+                false,
+            )
+        };
+        let image_atlas = dev.newTextureWithDescriptor(&imtd).expect("Metal image atlas texture");
         let sd = MTLSamplerDescriptor::new();
         sd.setMinFilter(MTLSamplerMinMagFilter::Nearest);
         sd.setMagFilter(MTLSamplerMinMagFilter::Nearest);
@@ -123,7 +136,18 @@ impl Renderer {
         lsd.setMinFilter(MTLSamplerMinMagFilter::Linear);
         lsd.setMagFilter(MTLSamplerMinMagFilter::Linear);
         let linear_sampler = dev.newSamplerStateWithDescriptor(&lsd).expect("Metal linear sampler");
-        Renderer { dev, queue, sdf, glyph, sprite, atlas, icon_atlas, sampler, linear_sampler }
+        Renderer {
+            dev,
+            queue,
+            sdf,
+            glyph,
+            sprite,
+            atlas,
+            icon_atlas,
+            image_atlas,
+            sampler,
+            linear_sampler,
+        }
     }
 
     pub fn device(&self) -> &Dev {
@@ -155,6 +179,22 @@ impl Renderer {
         // SAFETY: `rgba_bytes` holds `slot.w * slot.h * 4` RGBA8 bytes inside `ICON_ATLAS_SIZE`.
         unsafe {
             self.icon_atlas.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+                region,
+                0,
+                NonNull::new(rgba_bytes.as_ptr().cast_mut().cast::<c_void>()).expect("non-null"),
+                slot.w * 4,
+            );
+        }
+    }
+
+    pub fn upload_image(&self, slot: ImageSlot, rgba_bytes: &[u8]) {
+        let region = MTLRegion {
+            origin: MTLOrigin { x: slot.x, y: slot.y, z: 0 },
+            size: MTLSize { width: slot.w, height: slot.h, depth: 1 },
+        };
+        // SAFETY: `rgba_bytes` holds `slot.w * slot.h * 4` RGBA8 bytes inside `IMAGE_ATLAS_SIZE`.
+        unsafe {
+            self.image_atlas.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
                 region,
                 0,
                 NonNull::new(rgba_bytes.as_ptr().cast_mut().cast::<c_void>()).expect("non-null"),
@@ -234,6 +274,12 @@ impl Renderer {
             self.buffer(frame.icons),
             frame.icons.len(),
             Some((&*self.icon_atlas, &*self.linear_sampler)),
+        );
+        draw_layer(
+            &self.sprite,
+            self.buffer(frame.images),
+            frame.images.len(),
+            Some((&*self.image_atlas, &*self.linear_sampler)),
         );
         draw_layer(
             &self.glyph,

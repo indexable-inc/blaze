@@ -24,8 +24,12 @@ use blaze_data::Value as DataValue;
 use blaze_own::{AString, AVec, Alloc};
 use blaze_sniff::{FileCategory, SniffResult, sniff_file};
 
+pub use blaze_html::{ColorScheme, TextAlign};
 pub use crate::highlight::{CodeLine, CodeSpan, TokenKind, highlight_code};
-pub use crate::markdown::{MdBlock, MdSpan, MdStyle, parse_markdown};
+pub use crate::markdown::{
+    MdBlock, MdSpan, MdStyle, MdTable, parse_html_document, parse_markdown,
+    parse_markdown_with_scheme,
+};
 
 /// Limits guarding preview parsing & rendering against huge files (rule 18: bounded progress).
 #[derive(Clone, Copy, Debug)]
@@ -138,9 +142,17 @@ pub fn build_preview<'a>(
 
     let truncated = (bytes.len() as u64) < total_file_size;
 
-    // 2. Rendered Markdown (`README.md`, `AGENTS.md`, `*.md`).
+    // 2. Rendered Markdown (`README.md`, `AGENTS.md`, `*.md`) & standalone HTML (`*.html`, `*.htm`).
     if sniff.label == "Markdown" {
         let blocks = parse_markdown(text, limits.max_lines, alloc);
+        return PreviewDoc {
+            sniff,
+            file_size: total_file_size,
+            body: PreviewBody::Markdown { blocks, truncated },
+        };
+    }
+    if sniff.label == "HTML" {
+        let blocks = parse_html_document(text, ColorScheme::Dark, limits.max_lines, alloc);
         return PreviewDoc {
             sniff,
             file_size: total_file_size,
