@@ -1194,7 +1194,19 @@ pub fn lex_marked<'a>(
             }
             None => {
                 out.push_whole(token.kind, lexed.whole_at(i), ctx)?;
-                i += 1;
+                // A lifetime `'name` is one parser word whose mark is stored at the `'`, while
+                // `body_words` reads the lifetime's hygiene and mark from its name token.
+                if mark.is_some()
+                    && matches!(token.kind, TokenKind::Punct { char: '\'', spacing: Spacing::Joint })
+                    && let Some(next) = tokens.get(i + 1)
+                    && matches!(next.kind, TokenKind::Ident { .. })
+                    && places.get(i + 1).is_some_and(|&(next_start, _)| next_start == end && mark_at(next_start).is_none())
+                {
+                    out.push_whole(next.kind, lexed.whole_at(i + 1), ctx)?;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
             }
         }
     }

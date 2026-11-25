@@ -2528,6 +2528,11 @@ pub struct Store<'n> {
     /// expansion reads. `None` (as [`Store::new`] makes it): every `env!`, include and proc
     /// macro in a body is refused by name. The command sets it once, before any body.
     pub sources: Option<&'n dyn super::body_host::BodySources>,
+    /// The command's prepared macro table, kept beside `sources` so lowering a defining body
+    /// (for an `impl Trait` auto-trait reveal or `_`-returning fn inference) still has prepared
+    /// macros even while `&mut Consts` is borrowed by an active constant evaluation (`const_at`,
+    /// `eval_len`, `eval_where_const`).
+    pub(crate) prepared: Option<&'n blaze_lower::scoped::Prepares<'n>>,
     /// Each body checked clean in this run: its read list's digest, by owner, filed where the
     /// check finished (front2 body_reads.rs); the list itself is dropped there.
     pub reads: super::body_reads::Digests,
@@ -2989,6 +2994,7 @@ impl<'n> Store<'n> {
             anon_marks: HashMap::new_in(frame),
             lives: super::lifetimes::Lives::new_in(alloc),
             sources: None,
+            prepared: None,
             reads: super::body_reads::Digests::new_in(alloc),
             closures: super::foreign_closures::ClosureRows::new_in(alloc),
             type_misses: Rows::new_in(alloc),
@@ -3064,6 +3070,7 @@ impl<'n> Store<'n> {
             anon_marks,
             lives,
             sources,
+            prepared,
             reads,
             closures,
             type_misses,
@@ -3127,6 +3134,7 @@ impl<'n> Store<'n> {
         anon_marks.clear();
         lives.clear();
         *sources = None;
+        *prepared = None;
         reads.clear();
         closures.clear();
         type_misses.clear();
