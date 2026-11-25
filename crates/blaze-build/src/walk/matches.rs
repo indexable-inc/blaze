@@ -63,7 +63,7 @@ pub(super) struct At {
     /// Its ground type.
     g: PTy,
     /// The default binding mode is `ref`: a reference was followed by a non-reference pattern.
-    by_ref: bool,
+    pub(super) by_ref: bool,
     /// The scrutinee's value copied into the match's own slot: a `ref mut` would write a copy.
     copy: bool,
 }

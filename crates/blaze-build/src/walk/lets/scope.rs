@@ -116,7 +116,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     pub(in crate::walk) fn link_fail(&mut self, fail: Block) -> Result<(Block, bool), BuildError> {
         let depth = self.scope_marks.len();
         let mark = *self.scope_marks.last().ok_or(malformed("an `if let` link outside its region"))? as usize;
-        let has_slots = self.co.is_some() && self.scope_slots.iter().any(|&(d, _)| d >= depth);
+        let has_slots = self.co.is_some() && self.scope_slots.iter().any(|&(d, _, _)| d >= depth);
         if !self.pending_from(mark) && !has_slots {
             return Ok((fail, false));
         }

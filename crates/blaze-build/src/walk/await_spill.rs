@@ -28,14 +28,22 @@ use super::val_stack::Owns;
 use super::{PTR_BITS, Repr, V, Walk, malformed};
 use crate::BuildError;
 
-/// One waiting value preserved across a suspend: either a runtime value spilled into the flow's
-/// saved slot, or a pure compile-time constant aggregate (`At::Const` in `blaze-flow-lower`, so
-/// it has no flow local) whose temporary slot is ended before the suspend and re-materialized on
-/// the Ready edge.
+/// One waiting value preserved across a suspend: a runtime value spilled into the flow's saved
+/// slot, a pure compile-time constant aggregate (`At::Const` in `blaze-flow-lower`, so it has no
+/// flow local) re-materialized on the Ready edge, or a scalar loaded directly from a saved state
+/// slot or upvar (`blaze-flow-lower` `settle_operand` skips creating a separate temporary for
+/// reference-bearing places, keeping the value in its binding or upvar) reloaded on the Ready edge.
 #[derive(Clone, Copy)]
 pub(super) enum Spilled {
     Slot { at: usize, slot: SlotId, ty: Ty, form: Form },
     Remat { at: usize, kind: RematConst },
+    Reload { at: usize, base: ReloadBase, off: i32, ty: Ty, align: u8, form: Form },
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum ReloadBase {
+    Slot(SlotId),
+    State(Value),
 }
 
 #[derive(Clone, Copy)]
@@ -209,6 +217,50 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         Ok(kind)
     }
 
+    /// If `x` is an `Op::Load` directly from a named state slot or the coroutine's `state` upvar
+    /// pointer (with optional constant `Op::PtrAdd` offsets), returns the base, total byte offset,
+    /// and access alignment so the value can be reloaded on the Ready edge without a second state
+    /// slot (matching `blaze-flow-lower`'s `settle_operand`, which keeps reference-bearing place
+    /// operands in their binding or upvar).
+    fn reload_from_state(&self, x: Value) -> Option<(ReloadBase, i32, u8)> {
+        let view = self.b.func().view();
+        let ix = x.index();
+        if ix >= view.len() || view.op(ix) != Op::Load {
+            return None;
+        }
+        let align = view.mem_attrs(ix).map_or(0, |m| m.align);
+        let mut o = view.operands(ix);
+        let mut ptr = o.value();
+        let mut off = o.word().cast_signed();
+        for _ in 0..8 {
+            let pix = ptr.index();
+            if pix >= view.len() || view.op(pix) != Op::PtrAdd {
+                break;
+            }
+            let mut po = view.operands(pix);
+            let base = po.value();
+            let delta_v = po.value();
+            let dix = delta_v.index();
+            if dix >= view.len() || view.op(dix) != Op::Iconst {
+                return None;
+            }
+            let delta = view.data.get(dix).copied()?.cast_signed();
+            off = off.checked_add(delta)?;
+            ptr = base;
+        }
+        let pix = ptr.index();
+        if pix == 1 && pix < view.len() && view.op(pix) == Op::Param {
+            return Some((ReloadBase::State(ptr), off, align));
+        }
+        if pix < view.len() && view.op(pix) == Op::SlotAddr {
+            let slot = SlotId(*view.data.get(pix)?);
+            if self.slot_is_named(slot) {
+                return Some((ReloadBase::Slot(slot), off, align));
+            }
+        }
+        None
+    }
+
     /// Before `.await` `e`'s loop: each value waiting on the stack that is not made again after
     /// a resume, written to the slot of the flow local that holds it. Without a laid state (this
     /// crate's unit tests) nothing is written: the split keeps the values itself, as before.
@@ -248,7 +300,17 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 return Err(malformed("a value waiting across an `.await` of no byte width (await_spill.rs)"));
             }
             let bytes = bits / 8;
-            let (id, row) = self.waiting_local(e, self.val_expr(at), bytes)?;
+            let (id, row) = match self.waiting_local(e, self.val_expr(at), bytes) {
+                Ok(found) => found,
+                Err(BuildError::Unsupported { what, .. })
+                    if what == crate::coroutine_state::UNNAMED_ACROSS
+                        && let Some((base, off, align)) = self.reload_from_state(x) =>
+                {
+                    out.push(Spilled::Reload { at, base, off, ty, align, form });
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
             let align = u8::try_from(bytes.next_power_of_two().trailing_zeros()).unwrap_or(4).min(4);
             let slot = match self.spill_slot(e, id)? {
                 Some(slot) => slot,
@@ -280,6 +342,20 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                             Form::Scalar => V::Scalar(x),
                             Form::Place(off) => V::Place(x, off),
                             Form::Unsized(off) => V::Unsized(x, off),
+                        };
+                    }
+                }
+                Spilled::Reload { at, base, off, ty, align, form } => {
+                    let p = match base {
+                        ReloadBase::Slot(slot) => self.b.slot_addr(slot),
+                        ReloadBase::State(state) => state,
+                    };
+                    let x = self.b.load(ty, Flags::NONE, p, off, MemAttrs::aligned(align));
+                    if let Some(dst) = self.vals.get_mut(at) {
+                        *dst = match form {
+                            Form::Scalar => V::Scalar(x),
+                            Form::Place(poff) => V::Place(x, poff),
+                            Form::Unsized(poff) => V::Unsized(x, poff),
                         };
                     }
                 }
