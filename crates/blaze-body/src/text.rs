@@ -590,6 +590,7 @@ fn stmt<W: Write>(b: &BodyRef<'_>, kind: StmtKind, w: &mut W) -> Result<(), Prin
             unwind(u, w)?;
         }
         StmtKind::Suspend { resume, cancel } => write!(w, "suspend resume {resume} cancel {cancel}")?,
+        StmtKind::Cancelled => w.write_str("cancelled")?,
         StmtKind::Return => w.write_str("return")?,
         StmtKind::Unreachable => w.write_str("unreachable")?,
         StmtKind::Resume => w.write_str("resume")?,
@@ -1371,6 +1372,7 @@ impl<A: Allocator + Copy> Parser<A> {
                 }
                 StmtKind::Suspend { resume, cancel: Self::block(c)? }
             }
+            "cancelled" => StmtKind::Cancelled,
             "return" => StmtKind::Return,
             "unreachable" => StmtKind::Unreachable,
             "resume" => StmtKind::Resume,

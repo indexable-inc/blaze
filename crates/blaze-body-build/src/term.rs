@@ -71,7 +71,13 @@ impl<'a, A: Allocator + Copy> Cx<'a, '_, '_, A> {
         match kind {
             StmtKind::Goto(to) => self.goto(to),
             StmtKind::Switch { on, cases, otherwise } => self.switch(on, cases, otherwise),
-            StmtKind::Return => self.ret(),
+            StmtKind::Return => {
+                if self.co.is_some() {
+                    self.coroutine_return()
+                } else {
+                    self.ret()
+                }
+            }
             StmtKind::Call { callee, args, dest, target, unwind } => self.call(callee, args, dest, target, unwind),
             StmtKind::Drop { place, target, unwind } => self.drop_place(place, target, unwind),
             StmtKind::Assert { cond, expected, kind, msg, target, unwind } => self.assert(cond, expected, kind, msg, target, unwind),
@@ -85,7 +91,8 @@ impl<'a, A: Allocator + Copy> Cx<'a, '_, '_, A> {
                 Ok(())
             }
             StmtKind::Terminate => self.cannot_unwind(),
-            StmtKind::Suspend { .. } => Err(self.unsupported("a suspension (a coroutine's body is split first)")),
+            StmtKind::Suspend { resume, cancel } => self.coroutine_suspend(resume, cancel),
+            StmtKind::Cancelled => self.coroutine_cancelled(),
             StmtKind::InlineAsm { asm, operands, target, .. } => self.inline_asm(asm, operands, target),
             StmtKind::TailCall { callee, args } => self.tail_call(callee, args),
             StmtKind::Assign { .. }
@@ -231,7 +238,7 @@ impl<'a, A: Allocator + Copy> Cx<'a, '_, '_, A> {
     /// The hidden last `Location` argument for a call to `callee`, when `callee` is
     /// `#[track_caller]`: forwards this fn's own hidden parameter if tracked, or materializes a
     /// `Location` data row at the current row's site if untracked.
-    fn caller_arg(&mut self, callee: Instance, name: &'static str) -> Result<Option<Value>, BuildError> {
+    pub(crate) fn caller_arg(&mut self, callee: Instance, name: &'static str) -> Result<Option<Value>, BuildError> {
         if self.adts.track_caller(callee, self.subst.ground) != Some(true) {
             return Ok(None);
         }
@@ -589,6 +596,7 @@ impl<'a, A: Allocator + Copy> Cx<'a, '_, '_, A> {
         let mut variadic = Variadic::No;
         let mut declared: Option<usize> = None;
         let mut tracked_loc: Option<Value> = None;
+        let mut append_cx: Option<Value> = None;
         let (to, call_abi, may_unwind) = match self.v.callee(callee) {
             Callee::FnItem { key, args: fn_args } => {
                 match self.adts.intrinsic(key) {
@@ -617,6 +625,12 @@ impl<'a, A: Allocator + Copy> Cx<'a, '_, '_, A> {
                 (Target::Direct(self.func_ref(instance)), abi, self.adts.nounwind(key) != Some(true))
             }
             Callee::Method { key, args: fn_args } => {
+                if let Some(co) = self.co
+                    && self.adts.future_poll() == Some(key)
+                    && ops.len() == 1
+                {
+                    append_cx = Some(co.cx);
+                }
                 let abi = self.adts.abi(key).ok_or(BuildError::NoAbi { item: key })?;
                 let instance = self.instance(key, fn_args)?;
                 let may_unwind = self.adts.nounwind(key) != Some(true);
@@ -738,6 +752,10 @@ impl<'a, A: Allocator + Copy> Cx<'a, '_, '_, A> {
                     passes.push(fpass);
                 }
             }
+        }
+        if let Some(cx) = append_cx {
+            values.push(cx);
+            passes.push(Pass::Scalar { ty: Ty::PTR, ext: Ext::None, agg: false });
         }
         if let Some(loc) = tracked_loc {
             values.push(loc);
@@ -1134,7 +1152,7 @@ impl<'a, A: Allocator + Copy> Cx<'a, '_, '_, A> {
         if row.depth == 0 {
             let i = self.ix(row.local)?;
             return match *self.held.get(i).ok_or(self.malformed("a local past the frame"))? {
-                crate::Held::Slot(_) | crate::Held::At(_) => Ok(Some(self.base(row.local)?)),
+                crate::Held::Slot(_) | crate::Held::At(_) | crate::Held::AtOff(..) => Ok(Some(self.base(row.local)?)),
                 _ => Ok(None),
             };
         }
@@ -1279,27 +1297,26 @@ impl<'a, A: Allocator + Copy> Cx<'a, '_, '_, A> {
         let cold = self.b.create_block(BlockKind::Cold);
         self.b.br(Flags::NONE, holds, (to, &args), (cold, &[]));
         self.b.begin(cold);
-        let panic = match kind {
+        let lang_name: &'static str = match kind {
             AssertKind::Overflow(op) => match op {
-                BinOp::Add => PanicConst::AddOverflow,
-                BinOp::Sub => PanicConst::SubOverflow,
-                BinOp::Mul => PanicConst::MulOverflow,
-                BinOp::Div => PanicConst::DivOverflow,
-                BinOp::Rem => PanicConst::RemOverflow,
-                BinOp::Shl => PanicConst::ShlOverflow,
-                BinOp::Shr => PanicConst::ShrOverflow,
+                BinOp::Add => PanicConst::AddOverflow.lang(),
+                BinOp::Sub => PanicConst::SubOverflow.lang(),
+                BinOp::Mul => PanicConst::MulOverflow.lang(),
+                BinOp::Div => PanicConst::DivOverflow.lang(),
+                BinOp::Rem => PanicConst::RemOverflow.lang(),
+                BinOp::Shl => PanicConst::ShlOverflow.lang(),
+                BinOp::Shr => PanicConst::ShrOverflow.lang(),
                 _ => return Err(self.malformed("an overflow assert of an operator that cannot overflow")),
             },
-            AssertKind::OverflowNeg => PanicConst::NegOverflow,
-            AssertKind::DivisionByZero => PanicConst::DivByZero,
-            AssertKind::RemainderByZero => PanicConst::RemByZero,
+            AssertKind::OverflowNeg => PanicConst::NegOverflow.lang(),
+            AssertKind::DivisionByZero => PanicConst::DivByZero.lang(),
+            AssertKind::RemainderByZero => PanicConst::RemByZero.lang(),
             AssertKind::Bounds => return self.bounds_panic(msg, unwind),
-            AssertKind::ResumedAfterReturn | AssertKind::ResumedAfterPanic => {
-                return Err(self.unsupported("a coroutine's resumed-after assert"));
-            }
+            AssertKind::ResumedAfterReturn => "panic_const_async_fn_resumed",
+            AssertKind::ResumedAfterPanic => "panic_const_async_fn_resumed_panic",
         };
-        let (instance, may_unwind) = self.lang_instance(panic.lang(), &[])?;
-        let loc = self.caller_arg(instance, panic.lang())?;
+        let (instance, may_unwind) = self.lang_instance(lang_name, &[])?;
+        let loc = self.caller_arg(instance, lang_name)?;
         let r = self.func_ref(instance);
         let mut ps: Vec<Param, A> = Vec::with_capacity_in(1, self.alloc);
         let mut vs: Vec<Value, A> = Vec::with_capacity_in(1, self.alloc);

@@ -291,6 +291,7 @@ pub mod tag {
     pub const TERMINATE: u16 = 49;
     pub const INLINE_ASM: u16 = 50;
     pub const TAIL_CALL: u16 = 51;
+    pub const CANCELLED: u16 = 52;
 }
 
 /// For each fieldless enum: its number and its text name, one table each.
@@ -594,6 +595,7 @@ pub fn encode_stmt(k: StmtKind) -> StmtWords {
             w.flags = kc | (ku << 4) | (u16::from(expected) << 6);
         }
         StmtKind::Suspend { resume, cancel } => (w.tag, w.a, w.b) = (tag::SUSPEND, resume.0, cancel.0),
+        StmtKind::Cancelled => w.tag = tag::CANCELLED,
         StmtKind::Return => w.tag = tag::RETURN,
         StmtKind::Unreachable => w.tag = tag::UNREACHABLE,
         StmtKind::Resume => w.tag = tag::RESUME,
@@ -670,6 +672,7 @@ pub fn decode_stmt(w: StmtWords) -> Option<StmtKind> {
             unwind: unwind?,
         },
         tag::SUSPEND => StmtKind::Suspend { resume: Block(w.a), cancel: Block(w.b) },
+        tag::CANCELLED => StmtKind::Cancelled,
         tag::RETURN => StmtKind::Return,
         tag::UNREACHABLE => StmtKind::Unreachable,
         tag::RESUME => StmtKind::Resume,

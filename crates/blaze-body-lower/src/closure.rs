@@ -42,7 +42,7 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
     /// env_fields.rs, the active strategy): each captured binding and how. A field holding a
     /// place below its binding is refused by name (`Construct::CapturedPlace`): its field is the
     /// place's value, which this lowering does not build yet.
-    fn captures_of(&self, c: ExprId) -> Result<Vec<(PatId, CaptureKind), A>, LowerError> {
+    pub(crate) fn captures_of(&self, c: ExprId) -> Result<Vec<(PatId, CaptureKind), A>, LowerError> {
         let mut out = Vec::new_in(self.alloc);
         for f in self.ck.env_fields(c) {
             if !f.is_whole() {
@@ -54,7 +54,7 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
     }
 
     /// The type of capture of `x` (its variable's type `t`) as a field of the closure.
-    fn capture_ty(&mut self, kind: CaptureKind, t: PTy, at: At) -> Result<PTy, LowerError> {
+    pub(crate) fn capture_ty(&mut self, kind: CaptureKind, t: PTy, at: At) -> Result<PTy, LowerError> {
         match kind {
             CaptureKind::ByValue => Ok(t),
             CaptureKind::ByRef => self.find_ty(PNode::Ref(Mutbl::Not, t), at),
