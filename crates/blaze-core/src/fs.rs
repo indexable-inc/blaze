@@ -1605,7 +1605,7 @@ fn open_dir(root: &Path) -> io::Result<std::os::fd::OwnedFd> {
 
 /// One name's stamp, relative to the directory `dir`.
 #[cfg(unix)]
-fn stamp_at(dir: std::os::fd::BorrowedFd<'_>, name: &std::ffi::CStr) -> Stamp {
+pub(crate) fn stamp_at(dir: std::os::fd::BorrowedFd<'_>, name: &core::ffi::CStr) -> Stamp {
     match crate::raw::stat_at(dir, name) {
         Ok(stat) => stamp_of(&stat),
         Err(error) => match error.raw_os_error() {
