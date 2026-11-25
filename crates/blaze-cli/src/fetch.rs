@@ -589,12 +589,14 @@ impl CargoCache {
             let objects = Path::new(CARGO_GIT_OBJECTS)?;
             let pack = Path::new(CARGO_GIT_PACK)?;
             let global = env.heap.alloc();
-            // Aggregate `.idx` budget across all folders matching `repo` (without leaking one
-            // repository's index usage into another repository in the same command).
+            // Release previously cached indexes for unrelated repositories so command-wide retained
+            // `.idx` memory stays bounded to one repository's cap (`MOST_GIT_PACKS` /
+            // `MOST_GIT_IDX_TOTAL_BYTES`), independent of how many Git dependencies the lock holds.
             let mut repo_packs: usize = 0;
             let mut repo_idx_bytes: u64 = 0;
-            for folder in folders.iter() {
+            for folder in folders.iter_mut() {
                 if !local::git_db_folder(repo, folder.name()) {
+                    folder.odb = None;
                     continue;
                 }
                 if let Some(GitDbOdb::Ready { packs }) = &folder.odb {
@@ -621,6 +623,19 @@ impl CargoCache {
                         let mut failed = false;
                         for i in 0..entries.len() {
                             let name = entries.name(i);
+                            if local::git_pack_file(name) {
+                                if entries.kind(i) != bstd::fs::EntryKind::File {
+                                    failed = true;
+                                    break;
+                                }
+                                let Some(stem) = name.strip_suffix(".pack") else { continue };
+                                let idx_name_str = bstd::mem::format_in!(cx.frame(), "{stem}.idx");
+                                if entries.find(idx_name_str.as_str()).is_none() {
+                                    failed = true;
+                                    break;
+                                }
+                                continue;
+                            }
                             if !local::git_idx_file(name) {
                                 continue;
                             }
@@ -664,23 +679,22 @@ impl CargoCache {
                                 break;
                             };
                             let reserve = idx_usize.saturating_mul(2).max(1 << 16).saturating_add(1 << 16);
-                            let Ok(scratch) = Frame::with_reserve(reserve, bstd::mem::Tag::Other) else {
-                                failed = true;
-                                break;
-                            };
+                            let scratch = Frame::with_reserve(reserve, bstd::mem::Tag::Other)
+                                .map_err(|_| CliError::Text { what: "the frame a cargo git pack .idx is read in could not be reserved" })?;
                             let mut raw = Bytes::new_in(&scratch, "a cargo git pack .idx, confined read");
                             if git.read_all_confined(cx, &idx_path, &mut raw).is_err() {
                                 failed = true;
                                 break;
                             }
                             let mut idx_bytes = blaze_own::Vec::new_in(global);
-                            if idx_bytes.try_extend_from_slice(raw.as_slice()).is_err() {
-                                failed = true;
-                                break;
-                            }
+                            idx_bytes
+                                .try_extend_from_slice(raw.as_slice())
+                                .map_err(|_| CliError::Text { what: "a cargo git pack .idx could not be allocated" })?;
                             folder_packs = folder_packs.saturating_add(1);
                             folder_idx_bytes = next_idx_bytes;
-                            packs.push(GitPackEntry { pack_path, idx_bytes, pack_len });
+                            packs
+                                .try_push(GitPackEntry { pack_path, idx_bytes, pack_len })
+                                .map_err(|_| CliError::Text { what: "a cargo git pack entry could not be allocated" })?;
                         }
                         if failed {
                             GitDbOdb::Unreadable

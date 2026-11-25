@@ -97,6 +97,15 @@ pub fn git_idx_file(name: &str) -> bool {
     is_lower_hex(hex, 40)
 }
 
+/// Whether `name`, a file listed in `<cargo home>/git/db/<folder>/objects/pack`, is a git
+/// pack data file (`pack-<40 lowercase hex digits>.pack`). Ensures a single safe path component.
+pub fn git_pack_file(name: &str) -> bool {
+    let Some(hex) = name.strip_prefix("pack-").and_then(|rest| rest.strip_suffix(".pack")) else {
+        return false;
+    };
+    is_lower_hex(hex, 40)
+}
+
 /// The longest crate name and version the plan lets through (plan.rs: `{1,64}` each).
 const PART_MOST: usize = 64;
 const SUFFIX: &str = ".crate";

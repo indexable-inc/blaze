@@ -528,9 +528,6 @@ impl<'i, A: Allocator + Copy> ObjectDb<'i, A> {
         let max_window = self.limits.most_object.saturating_mul(2).saturating_add(64);
 
         let kind = loop {
-            if chain.len() > usize::from(self.limits.most_depth) {
-                return Err((cur_at, StoreWhy::Entry(PackWhy::DepthOver { most: self.limits.most_depth })));
-            }
             let head = self.read_entry_window(cur_pack, cur_at, max_window, source, &mut window)?;
             match head.base {
                 Base::Whole(kind) => {
@@ -539,6 +536,12 @@ impl<'i, A: Allocator + Copy> ObjectDb<'i, A> {
                     break kind;
                 }
                 Base::Ofs { back } => {
+                    if back == 0 {
+                        return Err((cur_at, StoreWhy::Entry(PackWhy::BaseOffset { back })));
+                    }
+                    if chain.len() >= usize::from(self.limits.most_depth) {
+                        return Err((cur_at, StoreWhy::Entry(PackWhy::DepthOver { most: self.limits.most_depth })));
+                    }
                     chain.try_push((cur_pack, cur_at)).map_err(|r| (cur_at, StoreWhy::Entry(PackWhy::Alloc(r.why))))?;
                     cur_at = match cur_at.checked_sub(back) {
                         Some(base) if base >= 12 => base,
@@ -546,6 +549,9 @@ impl<'i, A: Allocator + Copy> ObjectDb<'i, A> {
                     };
                 }
                 Base::Ref { base } => {
+                    if chain.len() >= usize::from(self.limits.most_depth) {
+                        return Err((cur_at, StoreWhy::Entry(PackWhy::DepthOver { most: self.limits.most_depth })));
+                    }
                     chain.try_push((cur_pack, cur_at)).map_err(|r| (cur_at, StoreWhy::Entry(PackWhy::Alloc(r.why))))?;
                     // Cross-pack or loose base lookup across the entire object DB.
                     let mut loose_raw = Vec::new_in(self.alloc);

@@ -43,6 +43,11 @@ impl Dir<ReadWrite> {
         write: impl FnOnce(&mut [u8]) -> Result<u64, E>,
     ) -> Result<Result<(), E>, FsError> {
         let key = self.beneath(path);
+        if let Some(quota) = self.quota.as_deref()
+            && let Err(over) = quota.take(room)
+        {
+            return Err(FsError::new(FsOp::Publish, &key, FsKind::OverQuota(over)));
+        }
         let fresh = self.io.fresh();
         let (mut reserve, first) = Reserve::new(key.share(), room, Tag(fresh));
         let submit = |effect: Effect| -> Result<Done, FsError> {
@@ -72,14 +77,6 @@ impl Dir<ReadWrite> {
                     };
                     match outcome {
                         Ok(len) => {
-                            if let Some(quota) = self.quota.as_deref()
-                                && let Err(over) = quota.take(len)
-                            {
-                                if let Some(cleanup) = reserve.abandon(Some(mapping)) {
-                                    let _ = submit(cleanup);
-                                }
-                                return Err(FsError::new(FsOp::Publish, &key, FsKind::OverQuota(over)));
-                            }
                             let effect = match reserve.finish(mapping, len) {
                                 Ok(effect) => effect,
                                 Err(err) => {
