@@ -1682,15 +1682,15 @@ impl<'a> ImplsCols<'a> {
     }
 }
 
-/// One crate's items record, read in place (D114 rule 1, a record is its own index): a row, a
-/// file's rows, an owner's members ([`Members`]) and an expansion are each found by binary search
-/// and read from the bytes each time asked. Opening allocates nothing. The cfg atoms are made
-/// the first time asked, and each text is checked against its digest the first time asked; both
-/// are kept for the rest of the command.
-pub struct ItemsRecord<'a> {
+/// An items record whose header, column tables, and strings section have been verified ONCE
+/// (rule 74: verify once). Constructing [`ItemsRecord`] from a [`VerifiedItems`] proof is O(1)
+/// and performs zero re-validation or UTF-8 scanning across stretches and jobs.
+#[derive(Clone, Copy, Debug)]
+pub struct VerifiedItems<'a> {
     bytes: &'a [u8],
     key: CrateItemKey,
     root_module: ItemKey,
+    edition: Edition,
     counts: [usize; TABLES],
     offsets: [usize; TABLES + 1],
     item_cols: ItemsCols<'a>,
@@ -1698,30 +1698,13 @@ pub struct ItemsRecord<'a> {
     impl_cols: ImplsCols<'a>,
     buckets: buckets::BucketsCols<'a>,
     variants: variants::VariantsCols<'a>,
-    /// The strings section, checked UTF-8 ONCE by [`ItemsRecord::open`] (the proof every row's
-    /// string is read under: a row's string is a slice of it, so a read checks only that the
-    /// slice lies inside it and on character boundaries, never the bytes again).
     strings: &'a str,
-    atoms: OnceCell<AVec<'a, (&'a str, Option<&'a str>)>>,
-    /// Each text asked, by where it is, as its one check saw it: empty, and unallocated, until
-    /// the first text is asked.
-    seen: RefCell<HashMap<At, Seen<'a>, Alloc<'a>>>,
-    source: Option<ABox<'a, FileSource<'a>>>,
-    current: RefCell<HashMap<u32, Result<CurrentFile<'a>, ItemsRecordError>, Alloc<'a>>>,
-    decoded: Cell<ItemsDecoded>,
-    alloc: Alloc<'a>,
 }
 
-impl<'a> ItemsRecord<'a> {
-    /// Open a reader that can answer file positions and text from the caller's snapshot.
-    pub fn open_with_files(bytes: &'a [u8], alloc: Alloc<'a>, source: impl Fn(u32, PackagePath<'a>, ContentId, Edition) -> Result<Option<CurrentFile<'a>>, ItemsRecordError> + 'a) -> Result<Self, ItemsRecordError> {
-        let mut record = Self::open(bytes, alloc)?;
-        record.source = Some(Box::new_in(source, alloc));
-        Ok(record)
-    }
-
-    /// Checks the header and that every section lies inside `bytes`; parses nothing else.
-    pub fn open(bytes: &'a [u8], alloc: Alloc<'a>) -> Result<ItemsRecord<'a>, ItemsRecordError> {
+impl<'a> VerifiedItems<'a> {
+    /// Checks the header, every column table, edition/std bytes, and UTF-8 of the strings section
+    /// once, returning a `Copy` proof reusable across jobs and stretches.
+    pub fn check(bytes: &'a [u8]) -> Result<VerifiedItems<'a>, ItemsRecordError> {
         if bytes.as_ptr() as usize % ALIGN != 0 {
             return Err(ItemsRecordError::Unaligned);
         }
@@ -1755,15 +1738,17 @@ impl<'a> ItemsRecord<'a> {
         within("strings", offsets[TABLES], Some(strings_len))?;
         // The one UTF-8 check of the record's strings (rule 74): every string a row names is a
         // slice of this section, which the writer made of `&str`s alone ([`Strings::put`]), so
-        // a bad byte anywhere in it is refused here, at open, whichever row's string it is in.
+        // a bad byte anywhere in it is refused here, at check, whichever row's string it is in.
         let strings = core::str::from_utf8(&bytes[offsets[TABLES]..offsets[TABLES] + strings_len])
             .map_err(|e| ItemsRecordError::Utf8 { what: "the record's strings", at: e.valid_up_to() })?;
-        Edition::from_byte(u8::try_from(f(F_EDITION)).unwrap_or(u8::MAX)).ok_or(ItemsRecordError::Byte { what: "an edition", byte: bytes[8 + 4 * F_EDITION] })?;
+        let edition = Edition::from_byte(u8::try_from(f(F_EDITION)).unwrap_or(u8::MAX))
+            .ok_or(ItemsRecordError::Byte { what: "an edition", byte: bytes[8 + 4 * F_EDITION] })?;
         std_of(le32(bytes, 8 + 4 * F_STD)).ok_or(ItemsRecordError::Byte { what: "the crate's std", byte: bytes[8 + 4 * F_STD] })?;
-        Ok(ItemsRecord {
+        Ok(VerifiedItems {
             bytes,
             key: CrateItemKey(id_at(bytes, KEYS_AT)),
             root_module: key_at(bytes, KEYS_AT + 32),
+            edition,
             counts,
             offsets,
             item_cols,
@@ -1772,13 +1757,98 @@ impl<'a> ItemsRecord<'a> {
             buckets,
             variants,
             strings,
+        })
+    }
+
+    pub fn key(&self) -> CrateItemKey {
+        self.key
+    }
+
+    pub fn edition(&self) -> Edition {
+        self.edition
+    }
+}
+
+/// One crate's items record, read in place (D114 rule 1, a record is its own index): a row, a
+/// file's rows, an owner's members ([`Members`]) and an expansion are each found by binary search
+/// and read from the bytes each time asked. Opening allocates nothing. The cfg atoms are made
+/// the first time asked, and each text is checked against its digest the first time asked; both
+/// are kept for the rest of the command.
+pub struct ItemsRecord<'a> {
+    bytes: &'a [u8],
+    key: CrateItemKey,
+    root_module: ItemKey,
+    counts: [usize; TABLES],
+    offsets: [usize; TABLES + 1],
+    item_cols: ItemsCols<'a>,
+    member_cols: MembersCols<'a>,
+    impl_cols: ImplsCols<'a>,
+    buckets: buckets::BucketsCols<'a>,
+    variants: variants::VariantsCols<'a>,
+    /// The strings section, checked UTF-8 ONCE by [`VerifiedItems::check`] (the proof every row's
+    /// string is read under: a row's string is a slice of it, so a read checks only that the
+    /// slice lies inside it and on character boundaries, never the bytes again).
+    strings: &'a str,
+    atoms: OnceCell<AVec<'a, (&'a str, Option<&'a str>)>>,
+    /// Each text asked, by where it is, as its one check saw it: empty, and unallocated, until
+    /// the first text is asked.
+    seen: RefCell<HashMap<At, Seen<'a>, Alloc<'a>>>,
+    source: Option<ABox<'a, FileSource<'a>>>,
+    current: RefCell<HashMap<u32, Result<CurrentFile<'a>, ItemsRecordError>, Alloc<'a>>>,
+    decoded: Cell<ItemsDecoded>,
+    alloc: Alloc<'a>,
+}
+
+impl<'a> ItemsRecord<'a> {
+    /// Open a reader over an already-verified proof in O(1) without re-checking columns or UTF-8.
+    pub fn from_verified(proof: VerifiedItems<'a>, alloc: Alloc<'a>) -> ItemsRecord<'a> {
+        Self::from_parts(proof, 0, alloc)
+    }
+
+    /// Open a reader with a file snapshot callback over an already-verified proof in O(1).
+    pub fn from_verified_with_files(
+        proof: VerifiedItems<'a>,
+        alloc: Alloc<'a>,
+        source: impl Fn(u32, PackagePath<'a>, ContentId, Edition) -> Result<Option<CurrentFile<'a>>, ItemsRecordError> + 'a,
+    ) -> ItemsRecord<'a> {
+        let mut record = Self::from_parts(proof, 0, alloc);
+        record.source = Some(Box::new_in(source, alloc));
+        record
+    }
+
+    fn from_parts(proof: VerifiedItems<'a>, string_checks: usize, alloc: Alloc<'a>) -> ItemsRecord<'a> {
+        ItemsRecord {
+            bytes: proof.bytes,
+            key: proof.key,
+            root_module: proof.root_module,
+            counts: proof.counts,
+            offsets: proof.offsets,
+            item_cols: proof.item_cols,
+            member_cols: proof.member_cols,
+            impl_cols: proof.impl_cols,
+            buckets: proof.buckets,
+            variants: proof.variants,
+            strings: proof.strings,
             atoms: OnceCell::new(),
             seen: RefCell::new(HashMap::new_in(alloc)),
             source: None,
             current: RefCell::new(HashMap::new_in(alloc)),
-            decoded: Cell::new(ItemsDecoded { crates: 1, bytes: bytes.len(), string_checks: 1, ..ItemsDecoded::default() }),
+            decoded: Cell::new(ItemsDecoded { crates: 1, bytes: proof.bytes.len(), string_checks, ..ItemsDecoded::default() }),
             alloc,
-        })
+        }
+    }
+
+    /// Open a reader that can answer file positions and text from the caller's snapshot.
+    pub fn open_with_files(bytes: &'a [u8], alloc: Alloc<'a>, source: impl Fn(u32, PackagePath<'a>, ContentId, Edition) -> Result<Option<CurrentFile<'a>>, ItemsRecordError> + 'a) -> Result<Self, ItemsRecordError> {
+        let mut record = Self::open(bytes, alloc)?;
+        record.source = Some(Box::new_in(source, alloc));
+        Ok(record)
+    }
+
+    /// Checks the header and that every section lies inside `bytes`; parses nothing else.
+    pub fn open(bytes: &'a [u8], alloc: Alloc<'a>) -> Result<ItemsRecord<'a>, ItemsRecordError> {
+        let proof = VerifiedItems::check(bytes)?;
+        Ok(Self::from_parts(proof, 1, alloc))
     }
 
     pub fn key(&self) -> CrateItemKey {
@@ -2421,6 +2491,12 @@ pub trait LoadItems<'a>: 'a {
     /// 16-aligned, or `None` when none is kept.
     fn load(&self, krate: usize) -> Option<&'a [u8]>;
 
+    /// An already-verified [`VerifiedItems`] proof for `krate` (rule 74), avoiding redundant
+    /// column validation and UTF-8 checks on every job and stretch.
+    fn load_verified(&self, _krate: usize) -> Option<VerifiedItems<'a>> {
+        None
+    }
+
     /// The text of the crate's file at `path` in its package, as it is now: the loader joins
     /// `path` onto the directory its world placed the crate's package at
     /// ([`PackagePath::in_package`]). The record checks the text against the digest it holds,
@@ -2478,12 +2554,18 @@ impl<'a, L: LoadItems<'a>> RecordItems<'a, L> {
         self.open
             .get(krate)?
             .get_or_init(|| {
-                let bytes = self.load.load(krate)?;
+                let verified = self.load.load_verified(krate);
+                let bytes = if verified.is_some() { None } else { Some(self.load.load(krate)?) };
                 let load = self.load.clone();
                 let alloc = self.alloc;
                 let bump = self.bump;
                 let source = move |index, path, surface, edition| load.file_items(krate, index, path, surface, edition, bump);
-                Some(ItemsRecord::open_with_files(bytes, alloc, source).unwrap_or_else(|e| panic!("the items record of crate {:?} did not open: {e:?}", self.keys[krate])))
+                if let Some(proof) = verified {
+                    Some(ItemsRecord::from_verified_with_files(proof, alloc, source))
+                } else {
+                    let bytes = bytes?;
+                    Some(ItemsRecord::open_with_files(bytes, alloc, source).unwrap_or_else(|e| panic!("the items record of crate {:?} did not open: {e:?}", self.keys[krate])))
+                }
             })
             .as_ref()
     }

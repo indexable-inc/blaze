@@ -618,7 +618,7 @@ fn cost_of_one_body() {
     let mut all_reads: HashMap<ItemKey, Vec<String>> = HashMap::new();
     let start = Instant::now();
     for (key, _) in bodies.iter() {
-        let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: Some(cost), needs: NeedsMet::All, heads: None, sources: None, goals: None, prepared: None };
+        let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: Some(cost), needs: NeedsMet::All, heads: None, sources: None, goals: None, prepared: None, front: None };
         let (before, b0, t0) = (cost.spent(), BYTES.load(Ordering::Relaxed), Instant::now());
         let out = check_body(view, &task_of(*key), &body_frame, &NameMake, shared).unwrap_or_else(|e| panic!("the body task of {key:x}: {e}"));
         let us = t0.elapsed().as_micros() as u64;
@@ -682,7 +682,7 @@ fn cost_of_one_body() {
     let mut differ: Vec<String> = Vec::new();
     let mut reads_differ: Vec<String> = Vec::new();
     for (key, bytes, reads) in kept_outs.iter() {
-        let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: None, needs: NeedsMet::First, heads: None, sources: None, goals: None, prepared: None };
+        let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: None, needs: NeedsMet::First, heads: None, sources: None, goals: None, prepared: None, front: None };
         let out = check_body(view, &task_of(*key), &body_frame, &NameMake, shared).unwrap_or_else(|e| panic!("the body task of {key:x}: {e}"));
         let label = NamesSource::name_of(task_records, *key).unwrap_or("?");
         if out.bytes.as_slice() != bytes.as_slice() {
@@ -717,7 +717,7 @@ fn cost_of_one_body() {
         let mut differ: Vec<String> = Vec::new();
         let mut per_body: Vec<(String, usize)> = Vec::new();
         for (key, bytes, _) in order {
-            let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: None, needs: NeedsMet::All, heads: None, sources: None, goals: Some(table), prepared: None };
+            let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: None, needs: NeedsMet::All, heads: None, sources: None, goals: Some(table), prepared: None, front: None };
             let out = check_body(view, &task_of(*key), &body_frame, &NameMake, shared).unwrap_or_else(|e| panic!("the body task of {key:x}: {e}"));
             let label = NamesSource::name_of(task_records, *key).unwrap_or("?").to_string();
             if out.bytes.as_slice() != bytes.as_slice() {
@@ -767,7 +767,7 @@ fn cost_of_one_body() {
     // type: counted with its reason, and left out of the seeded run.
     let mut refused: HashMap<ItemKey, String> = HashMap::new();
     for (key, _, _) in kept_outs.iter() {
-        let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: None, needs: NeedsMet::All, heads: Some(freezing), sources: None, goals: None, prepared: None };
+        let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: None, needs: NeedsMet::All, heads: Some(freezing), sources: None, goals: None, prepared: None, front: None };
         if let Err(e) = check_body(view, &task_of(*key), &body_frame, &NameMake, shared) {
             let label = NamesSource::name_of(task_records, *key).unwrap_or("?");
             note!("SEED REFUSED `{label}`: {e}");
@@ -798,7 +798,7 @@ fn cost_of_one_body() {
     // `Part::Heads` entries) and its impl questions filed (`Part::Impls` entries), its name.
     let mut per_body: Vec<(u64, u64, u64, String)> = Vec::new();
     for (key, bytes, _) in kept_outs.iter().filter(|(k, _, _)| !refused.contains_key(k)) {
-        let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: Some(cost), needs: NeedsMet::All, heads: Some(table), sources: None, goals: None, prepared: None };
+        let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: Some(cost), needs: NeedsMet::All, heads: Some(table), sources: None, goals: None, prepared: None, front: None };
         let (before, t0) = (cost.spent(), Instant::now());
         let out = check_body(view, &task_of(*key), &body_frame, &NameMake, shared).unwrap_or_else(|e| panic!("seeded, the body task of {key:x}: {e}"));
         let spent = cost.spent().since(&before);

@@ -432,10 +432,8 @@ fn compare_binding(provider: &'static str, plant: bool) {
             name: Name::new(Kind::BodyCheck, main.0), phase: Phase::new(Stage::Bodies, 0),
             source: ABSENT, file: Name::new(Kind::FileItems, ABSENT),
         };
-        let body = BodyFrame {
-            frame, alloc: a, plant_drop: None, cost: None, needs: blaze_ladder::front2::heads::NeedsMet::All,
-            heads: None, sources: None, goals: None, prepared: None,
-        };
+        let body = BodyFrame { frame, alloc: a, plant_drop: None, cost: None, needs: blaze_ladder::front2::heads::NeedsMet::All,
+        heads: None, sources: None, goals: None, prepared: None, front: None };
         let filed = check_body(view, &Task { planned, key: Key(ABSENT) }, &body, kept, blaze_own::testing::heap().shared())
             .expect("the caller's BodyCheck read list");
         let reads = recorder.finish().expect("binding reads");

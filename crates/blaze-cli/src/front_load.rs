@@ -30,7 +30,7 @@ use blaze_core::SharedSet;
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
 use blaze_ladder::front2::source::{Load, LoadedExpansion};
 use blaze_own::{AVec, Alloc, Bump, SharedAlloc, Vec};
-use blaze_scope::items_record::{CurrentFile, ItemsRecord, ItemsRecordError};
+use blaze_scope::items_record::{CurrentFile, ItemsRecordError, VerifiedItems};
 use blaze_scope::names_record::{NamesRecordError, Verified};
 use blaze_scope::package_path::PackagePath;
 use blaze_scope::resolve::SourceTexts;
@@ -56,7 +56,10 @@ pub(crate) struct CrateRecords<'n> {
     /// opens it from here, in O(1), with no check again.
     pub names_proof: Verified<'n>,
     pub items: &'n [u8],
-    /// The items section's edition, read by its one open at the load ([`checked_records`]):
+    /// The items section's one form and UTF-8 check this process (rule 74): every later job or
+    /// stretch opens `ItemsRecord` from here in O(1), with no re-check of columns or strings.
+    pub items_proof: VerifiedItems<'n>,
+    /// The items section's edition, read by its one check at the load ([`checked_records`]):
     /// what a reader that needs only the edition takes, never opening the section again (a
     /// proc-macro caller's edition, run_names.rs; before 2026-11-18 every names-records build
     /// opened every crate's items section for it, re-checking its strings).
@@ -128,15 +131,15 @@ pub(crate) fn checked_records<'n>(
     if found != key {
         return Err(LoadError::OtherCrate { name, asked: key, found, which: "names" });
     }
-    // The section's one open this command: its key checked, its edition kept beside it. Every
-    // later reader of its rows opens it once per job, in the job's names records
-    // (front2 source.rs `Records::items_record`).
-    let opened = ItemsRecord::open(items, alloc).map_err(|error| LoadError::Items { name, error })?;
-    let (found, edition) = (opened.key(), opened.edition());
+    // The section's one form + UTF-8 check this command (rule 74): its key checked, its proof
+    // and edition kept beside it so every job and stretch opens `ItemsRecord` in O(1).
+    let _ = alloc;
+    let items_proof = VerifiedItems::check(items).map_err(|error| LoadError::Items { name, error })?;
+    let (found, edition) = (items_proof.key(), items_proof.edition());
     if found != key {
         return Err(LoadError::OtherCrate { name, asked: key, found, which: "items" });
     }
-    Ok(CrateRecords { key, file_slots: &[], names, names_proof, items, edition, expansions })
+    Ok(CrateRecords { key, file_slots: &[], names, names_proof, items, items_proof, edition, expansions })
 }
 
 /// The crate `key`'s sections from the record `input` names, read from `store` by its key
@@ -321,7 +324,7 @@ impl<'r> ScopeRecords<'r> {
             self.opened.fetch_add(counts.records, Relaxed);
             self.bytes.fetch_add(counts.bytes, Relaxed);
             read.map(|records| {
-                let nfiles = ItemsRecord::open(records.items, self.heap.alloc()).map_or(0, |r| r.files());
+                let nfiles = blaze_scope::items_record::ItemsRecord::from_verified(records.items_proof, self.heap.alloc()).files();
                 let pack_files = blaze_own::Vec::from_iter_in((0..nfiles).map(|_| OnceLock::new()), self.heap.shared());
                 OpenedCrate { records, pack_files }
             })
@@ -610,6 +613,10 @@ impl<'n> Load<'n> for StoreLoad<'n> {
 
     fn items(&self, krate: usize) -> Option<&'n [u8]> {
         self.records_of(krate).map(|c| c.items)
+    }
+
+    fn items_verified(&self, krate: usize) -> Option<VerifiedItems<'n>> {
+        self.records_of(krate).map(|c| c.items_proof)
     }
 
     fn file(&self, krate: usize, path: PackagePath<'_>) -> Option<&'n str> {

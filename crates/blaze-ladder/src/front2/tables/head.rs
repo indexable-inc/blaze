@@ -972,6 +972,62 @@ pub fn seed<'n, N: NamesSource<'n>, H: HeadSource>(names: N, own: Option<Want>, 
     Ok(Seeded::Filed)
 }
 
+fn want_cache_key(cell: Want) -> (u8, LibKey, ItemKey) {
+    match cell {
+        Want::Head(k) => (0, k, ItemKey(0)),
+        Want::Adt(k) => (1, k, ItemKey(0)),
+        Want::Members(k) => (2, k, ItemKey(0)),
+        Want::Impl(k) => (3, k, ItemKey(0)),
+        Want::Fn(k) => (4, k, ItemKey(0)),
+        Want::MemberFn(k, f) => (5, k, f),
+    }
+}
+
+/// Stretch-scoped cache for [`file_frozen_cached`]: remembers each container's sorted member
+/// texts and each verified immutable `(fn_key, text_prefix, want_digest, text_ptr, text_len)`
+/// so later bodies in the same stretch skip repeated `each_member_matching` scans and BLAKE3
+/// fn-text re-hashing (rule 74: verify once). Held on the stretch's stack in `alloc` so it
+/// leaves zero bytes in the stretch's bump frame and drops cleanly when the stretch ends.
+pub struct FrozenImportCache<'n> {
+    members: core::cell::RefCell<blaze_hash::HashMap<(u8, LibKey, ItemKey), AVec<'static, MemberText<'n>>, Alloc<'static>>>,
+    verified: core::cell::RefCell<blaze_hash::HashSet<(ItemKey, Option<u32>, [u8; 32], usize, usize), Alloc<'static>>>,
+    alloc: Alloc<'static>,
+}
+
+impl<'n> FrozenImportCache<'n> {
+    pub fn new(alloc: Alloc<'static>) -> Self {
+        Self {
+            members: core::cell::RefCell::new(blaze_hash::HashMap::new_in(alloc)),
+            verified: core::cell::RefCell::new(blaze_hash::HashSet::new_in(alloc)),
+            alloc,
+        }
+    }
+
+    fn with_members<N: NamesSource<'n>, R>(&self, names: N, cell: Want, f: impl FnOnce(&[MemberText<'n>]) -> R) -> R {
+        let key = want_cache_key(cell);
+        if !self.members.borrow().contains_key(&key) {
+            let mut list = members_of(names, cell, self.alloc);
+            list.sort_unstable_by_key(|m| (m.key, m.kind != MemberKind::Type));
+            self.members.borrow_mut().insert(key, list);
+        }
+        let map = self.members.borrow();
+        let slice = map.get(&key).map_or(&[][..], |v| v.as_slice());
+        f(slice)
+    }
+
+    fn verify_text(&self, key: ItemKey, want_len: u32, text_prefix: Option<u32>, want: [u8; 32], text: &'n str) -> bool {
+        let entry = (key, text_prefix, want, text.as_ptr().addr(), text.len());
+        if self.verified.borrow().contains(&entry) {
+            return true;
+        }
+        let ok = head_record::verify_fn_text(text, want_len, text_prefix, want);
+        if ok {
+            self.verified.borrow_mut().insert(entry);
+        }
+        ok
+    }
+}
+
 /// Import an already-frozen cell. A Bodies task has the record its Heads task published and
 /// can only file it or report a typed error. The expected cell is checked before filing keys.
 pub fn file_frozen<'n, N: NamesSource<'n>>(names: N, cell: Want, frozen: FrozenHead<'_>, store: &Store<'n>, keys: &Keys, scratch: Alloc<'static>) -> Result<(), FreezeError> {
@@ -997,6 +1053,48 @@ pub fn file_frozen<'n, N: NamesSource<'n>>(names: N, cell: Want, frozen: FrozenH
         }
     };
     file_frozen_finish(names, cell, store, keys, &frozen, &members, heads, tys_before)
+}
+
+/// As [`file_frozen`], reusing `cache`'s stretch-scoped sorted container members and verified
+/// fn-text proofs across bodies checked against the same immutable `names` records.
+pub fn file_frozen_cached<'n, N: NamesSource<'n>>(
+    names: N,
+    cell: Want,
+    frozen: FrozenHead<'_>,
+    store: &Store<'n>,
+    keys: &Keys,
+    cache: &FrozenImportCache<'n>,
+    scratch: Alloc<'static>,
+) -> Result<(), FreezeError> {
+    if frozen.want() != cell {
+        return Err(FreezeError::Read { want: cell, error: FrozenError::WrongCell { found: frozen.want() } });
+    }
+    cache.with_members(names, cell, |members| {
+        let mut text_of = |at: HeadAt| fn_text_sorted(names, cell, members, at);
+        let mut verify = |key, want_len, text_prefix, want, text| cache.verify_text(key, want_len, text_prefix, want, text);
+        let tys_before = store.tys.view().len_now();
+        let heads = match crate::front2::project::head_digest::import_with_opaque_origins_boxed_verified(
+            names,
+            keys,
+            store,
+            &frozen,
+            &mut text_of,
+            &mut verify,
+            scratch,
+            scratch,
+        ) {
+            Ok(heads) => heads,
+            Err(e) => {
+                if let FreezeError::Record { at, error, .. } = &e {
+                    if let Some(found) = head_record::form_of(error) {
+                        store.regions.file_form(head_record::regions_key(*at), found);
+                    }
+                }
+                return Err(e);
+            }
+        };
+        file_frozen_finish(names, cell, store, keys, &frozen, members, heads, tys_before)
+    })
 }
 
 #[inline(never)]
@@ -1039,6 +1137,7 @@ fn file_frozen_finish<'n, N: NamesSource<'n>>(
 
 /// One member of a cell's container as the names library lists it (a macro call left out):
 /// its key by the kind its head files it as, its kind, name and text.
+#[derive(Clone, Copy)]
 struct MemberText<'n> {
     key: ItemKey,
     kind: MemberKind,
@@ -1127,6 +1226,16 @@ fn fn_text<'n, N: NamesSource<'n>>(names: N, cell: Want, members: &[MemberText<'
         }
     }
     members.iter().find(|m| m.key == k && m.kind != MemberKind::Type).map(|m| m.text)
+}
+
+fn fn_text_sorted<'n, N: NamesSource<'n>>(names: N, cell: Want, members: &[MemberText<'n>], at: HeadAt) -> Option<&'n str> {
+    let HeadAt::Fn(k) = at else { return None };
+    if let Want::Fn(lib) = cell {
+        if checker_of(lib) == k {
+            return names.seeded_text_of(lib).map(|t| t.text);
+        }
+    }
+    members.binary_search_by_key(&(k, true), |m| (m.key, m.kind != MemberKind::Type)).ok().and_then(|i| members.get(i)).map(|m| m.text)
 }
 
 /// A function pointer's code identity consumes the target's definition even when

@@ -979,8 +979,8 @@ impl<'b> PackView<'b> {
         (0..self.n).map(|at| self.entry(at))
     }
 
-    /// Zero-copy metadata lookup of `path`, by binary search (never decompresses payload).
-    pub fn find_entry(&self, path: &str) -> Option<FileEntry<'b>> {
+    /// Zero-copy index lookup of `path` by binary search (never decompresses payload).
+    pub fn find_index(&self, path: &str) -> Option<usize> {
         let (mut low, mut high) = (0, self.n);
         while low < high {
             let mid = low + (high - low) / 2;
@@ -988,10 +988,15 @@ impl<'b> PackView<'b> {
             match entry.path.as_bytes().cmp(path.as_bytes()) {
                 core::cmp::Ordering::Less => low = mid + 1,
                 core::cmp::Ordering::Greater => high = mid,
-                core::cmp::Ordering::Equal => return Some(entry),
+                core::cmp::Ordering::Equal => return Some(mid),
             }
         }
         None
+    }
+
+    /// Zero-copy metadata lookup of `path`, by binary search (never decompresses payload).
+    pub fn find_entry(&self, path: &str) -> Option<FileEntry<'b>> {
+        self.find_index(path).map(|at| self.entry(at))
     }
 
     /// Reads file `at`, decompressing into `alloc` if compressed (zero-copy if stored raw).

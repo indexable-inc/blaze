@@ -361,8 +361,10 @@ impl<'a> ReadGrains<'a> {
     }
 
     pub(crate) fn place(&self, id: CellId, fine_buckets: bool) -> CellId {
-        if fine_buckets && id.of.kind == blaze_drive::Kind::ImplBucket {
-            return id;
+        match id.of.kind {
+            blaze_drive::Kind::CrateScope => {}
+            blaze_drive::Kind::ImplBucket if !fine_buckets => {}
+            _ => return id,
         }
         self.by_name.get(&id.of).copied().unwrap_or(ReadGrain::Cell).place(id, self.graph)
     }

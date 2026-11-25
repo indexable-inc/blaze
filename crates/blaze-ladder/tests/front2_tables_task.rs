@@ -313,7 +313,7 @@ fn run(records: &'static Records<'static>, impls: Option<&'static TableSet<'stat
 
 fn body_frame(plant: Option<NameCell>) -> BodyFrame<'static> {
     let frame: &'static blaze_mem::Frame = Box::leak(Box::new(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the body's frame")));
-    BodyFrame { frame, alloc: a(), plant_drop: plant, cost: None, needs: blaze_ladder::front2::heads::NeedsMet::All, heads: None, sources: None, goals: None, prepared: None }
+    BodyFrame { frame, alloc: a(), plant_drop: plant, cost: None, needs: blaze_ladder::front2::heads::NeedsMet::All, heads: None, sources: None, goals: None, prepared: None, front: None }
 }
 
 /// What two runs are compared by: each body's whole result, by key.

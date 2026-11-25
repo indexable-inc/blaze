@@ -3806,7 +3806,6 @@ struct SplitAt {
 /// the records themselves (a reader is one thread's, front2 source.rs `Records`), so a split
 /// opens them again over the same bytes and builds its own tables and lang index from them (the
 /// index holds only the lang rows; what building it reads is `lang_reads`, read here once).
-#[derive(Clone, Copy)]
 struct CrateSetup {
     /// The crates whose lang rows name the lang items.
     lang: &'static [usize],
@@ -3821,6 +3820,9 @@ struct CrateSetup {
     members: &'static [Name],
     /// The crate's listing, from the request's table.
     listing: &'static Listing,
+    /// Owned lang-item index built once per crate setup and borrowed by every split job in
+    /// `heads_of` with zero `Global` allocation and zero repeated `ItemsRecord` scans.
+    index: blaze_ladder::front2::index::IndexIn,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3900,7 +3902,9 @@ fn crate_setup(
     // The constant evaluator's lang index; what it read is read by every head that evaluates
     // (engine_head_consts.rs).
     let lang_recorder = Recorder::new(RecorderOpts { alloc: g });
-    let index = crate::engine_head_consts::lang_index(base, &lang_recorder, lang).map_err(|_| "two crates of its scope declare one lang item, so its constants have no index (front2 index.rs `LangTwice`)")?;
+    let index_in = blaze_ladder::front2::index::IndexIn::from_source_in(base.reading_into(&lang_recorder), lang, heap.shared())
+        .map_err(|_| "two crates of its scope declare one lang item, so its constants have no index (front2 index.rs `LangTwice`)")?;
+    let index = index_in.borrow();
     // The scope names of the job's crates that are members, sorted: every other crate's names
     // reads are kept at its record's `WHOLE` (engine_heads_once.rs `coarse`).
     let mut members: Vec<Name, Alloc<'static>> = Vec::new_in(g);
@@ -3960,7 +3964,7 @@ fn crate_setup(
     if let Some(why) = packs.refused() {
         return Err(why);
     }
-    Ok(CrateSetup { lang, sized, pointers, lang_reads: lang_reads.leak_static(), pointer_reads: pointer_reads.leak_static(), members, listing })
+    Ok(CrateSetup { lang, sized, pointers, lang_reads: lang_reads.leak_static(), pointer_reads: pointer_reads.leak_static(), members, listing, index: index_in })
 }
 
 /// One run of a member crate's head tasks (`tasks`, a split of `job`'s: [`split_count`]) on a
@@ -3998,13 +4002,11 @@ fn heads_of(
     let scope_crates = job.scope_crates(scope_records);
     let opened = open_scope_by_need(cx, root, fs, outlined, scope_crates, packs, corrected, procs, frame, g, snapshot).map_err(OpenScopeRefused::message)?;
     let records = opened.records;
-    let CrateSetup { lang, sized, pointers, lang_reads, pointer_reads, members, listing } = *setup;
+    let CrateSetup { lang, sized, pointers, lang_reads, pointer_reads, members, listing, ref index } = *setup;
     let unused = Recorder::new(RecorderOpts { alloc: g });
     let base = Tables::new(TablesOpts { records, impls: None, lang_crates: lang, reads: &unused });
-    // The split's own lang index over its own records (the index borrows them); what building
-    // it reads is the setup's `lang_reads`, so this recorder's are dropped.
-    let index_recorder = Recorder::new(RecorderOpts { alloc: g });
-    let index = crate::engine_head_consts::lang_index(base, &index_recorder, lang).map_err(|_| "two crates of its scope declare one lang item, so its constants have no index (front2 index.rs `LangTwice`)")?;
+    // Borrow the crate setup's owned lang index with zero Global allocation and zero re-scan.
+    let index = index.borrow();
     let crate_key = NamesSource::crate_key(records, 0).ok_or("its crate has no key in its own records (front2 source.rs `crate_key`)")?;
     let over = (job.own.records.key == crate_key).then_some(&job.own.records).ok_or("its crate is not the first of the crates its records were opened over (run_names.rs `names_records`)")?;
     let scope_name = blaze_drive::key::crate_scope_name(&crate_key);

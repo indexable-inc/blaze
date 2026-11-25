@@ -197,7 +197,7 @@ impl Fixture {
         let table = self.frame.alloc(self.table());
         let seed = self.frame.alloc(table.view(self.records));
         let tables = Tables::new(TablesOpts { records: self.records, impls: None, lang_crates: LANG, reads: &recorder });
-        let frame = BodyFrame { frame: self.frame, alloc: alloc(), needs: NeedsMet::All, heads: Some(seed), cost: None, plant_drop: None, sources: None, goals: None, prepared: None };
+        let frame = BodyFrame { frame: self.frame, alloc: alloc(), needs: NeedsMet::All, heads: Some(seed), cost: None, plant_drop: None, sources: None, goals: None, prepared: None, front: None };
         let task = Task { planned: Planned { name: Name::new(Kind::BodyCheck, self.key(0, name).0), phase: Phase::new(Stage::Bodies, 0), source: ABSENT, file: Name::new(Kind::FileItems, ABSENT) }, key: Key(ABSENT) };
         check_body_reads(tables, &task, &frame, alloc())
     }
@@ -422,7 +422,7 @@ fn the_one_ask_answers_seeded_bodies_as_the_restart_path_and_its_plant_is_seen()
     let table = fixture.frame.alloc(fixture.table());
     let seed = fixture.frame.alloc(table.view(fixture.records));
     let tables = Tables::new(TablesOpts { records: fixture.records, impls: None, lang_crates: LANG, reads: &recorder });
-    let frame = BodyFrame { frame: fixture.frame, alloc: alloc(), needs: NeedsMet::All, heads: Some(seed), cost: None, plant_drop: None, sources: None, goals: None, prepared: None };
+    let frame = BodyFrame { frame: fixture.frame, alloc: alloc(), needs: NeedsMet::All, heads: Some(seed), cost: None, plant_drop: None, sources: None, goals: None, prepared: None, front: None };
     let mut seen = 0;
     for name in ["direct", "nested", "scalar"] {
         let task = Task { planned: Planned { name: Name::new(Kind::BodyCheck, fixture.key(0, name).0), phase: Phase::new(Stage::Bodies, 0), source: ABSENT, file: Name::new(Kind::FileItems, ABSENT) }, key: Key(ABSENT) };
@@ -457,7 +457,7 @@ fn a_repeated_question_offers_nothing_and_leaves_each_read_list_equal_and_its_pl
     let table = fixture.frame.alloc(fixture.table());
     let seed = fixture.frame.alloc(table.view(fixture.records));
     let tables = Tables::new(TablesOpts { records: fixture.records, impls: None, lang_crates: LANG, reads: &recorder });
-    let frame = BodyFrame { frame: fixture.frame, alloc: alloc(), needs: NeedsMet::All, heads: Some(seed), cost: None, plant_drop: None, sources: None, goals: None, prepared: None };
+    let frame = BodyFrame { frame: fixture.frame, alloc: alloc(), needs: NeedsMet::All, heads: Some(seed), cost: None, plant_drop: None, sources: None, goals: None, prepared: None, front: None };
     let (mut memo, mut seen) = (0u64, 0u32);
     for name in ["direct", "nested", "scalar"] {
         let task = Task { planned: Planned { name: Name::new(Kind::BodyCheck, fixture.key(0, name).0), phase: Phase::new(Stage::Bodies, 0), source: ABSENT, file: Name::new(Kind::FileItems, ABSENT) }, key: Key(ABSENT) };
