@@ -577,8 +577,8 @@ pub fn run_inits_with(loaded: Loaded, argc: core::ffi::c_int, argv: *const *cons
         unsafe extern "C" {
             static environ: *const *const c_char;
         }
-        let empty: *const c_char = core::ptr::null();
-        let (argc, argv) = if argv.is_null() { (0, &raw const empty) } else { (argc, argv) };
+        const EMPTY_ARGV: [*const c_char; 1] = [core::ptr::null()];
+        let (argc, argv) = if argv.is_null() { (0, EMPTY_ARGV.as_ptr()) } else { (argc, argv) };
         // SAFETY: `run_inits_with` is called only on the process's initial thread before guest
         // execution begins (images with C initializers load eagerly), so `environ` is immutable
         // process startup state live for the process's life.

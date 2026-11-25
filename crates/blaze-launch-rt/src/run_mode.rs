@@ -2776,7 +2776,9 @@ fn control<S: RecordSource + RecordFiles, B: Bind>(
                         let opened = match open_gate.open(record) {
                             Some(Ok(natives)) => load_library_opened(&mut mode, natives, &mut memory),
                             Some(Err(why)) => Err(why),
-                            None => load_library(&mut mode, source, &mut memory),
+                            None => Err(RunModeError::NotBuilt {
+                                what: "eager native library open bridge missing (cannot open on control thread)",
+                            }),
                         };
                         match opened {
                             Ok(loaded) => {
@@ -3041,5 +3043,191 @@ mod position_tests {
         assert!(acts.is_empty(), "a bound slot needs no second placement");
         assert!(mode.position_inputs.is_empty(), "the repeated answer leaves no input");
         println!("run_mode: slots received lines 13 and 29 once; PositionOrder caught the one-off pairing");
+    }
+}
+
+/// Deterministic simulation proof of the two-`Handoff` eager-open protocol (`EagerOpenGate` +
+/// `ready` + `NullInit` control stop) between the initial thread and the control thread.
+#[cfg(test)]
+mod eager_open_dst {
+    use blaze_sim::{Broke, Config, Tape, check, control};
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Plant {
+        None,
+        /// Planted bug: omit `EagerOpenGate::drop`'s `open_ask.put(None)` on early control return.
+        SkipDropWake,
+        /// Planted bug: omit `shared.stop()` when `run_inits_with` returns `NullInit`.
+        SkipInitErrStop,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum InitStep {
+        WaitOpenAsk,
+        DoOpen,
+        WaitReady,
+        RunInits,
+        JoinControl,
+        Done,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum CtrlStep {
+        Setup,
+        WaitOpenAns,
+        LoadNative,
+        EventLoop,
+        Done,
+    }
+
+    fn run_case(tape: &Tape, plant: Plant) -> Result<(), Broke> {
+        let early_fail = tape.below(3, "early_fail") == 0;
+        let open_fails = tape.below(3, "open_fails") == 0;
+        let load_fails = tape.below(3, "load_fails") == 0;
+        let init_fails = tape.below(3, "init_fails") == 0;
+
+        let mut open_ask: Option<Option<u32>> = None;
+        let mut open_ans: Option<bool> = None;
+        let mut ready: Option<bool> = None;
+        let mut stop_sent = false;
+        let mut gate_armed = true;
+
+        let mut init_step = InitStep::WaitOpenAsk;
+        let mut ctrl_step = CtrlStep::Setup;
+
+        let mut opened_on_init = 0u32;
+        let mut loaded_after_open = false;
+        let mut inits_after_load = false;
+
+        for _ in 0..64 {
+            if init_step == InitStep::Done && ctrl_step == CtrlStep::Done {
+                if !early_fail && opened_on_init != 1 {
+                    return Err(Broke::Oracle("dlopen must run once on initial thread when control reaches Act::Native".into()));
+                }
+                if !early_fail && !open_fails && !loaded_after_open {
+                    return Err(Broke::Oracle("load_native must follow initial-thread dlopen".into()));
+                }
+                if !early_fail && !open_fails && !load_fails && !inits_after_load {
+                    return Err(Broke::Oracle("run_inits must follow load_native".into()));
+                }
+                return Ok(());
+            }
+
+            let init_ready = match init_step {
+                InitStep::WaitOpenAsk => open_ask.is_some(),
+                InitStep::DoOpen | InitStep::RunInits => true,
+                InitStep::WaitReady => ready.is_some(),
+                InitStep::JoinControl => ctrl_step == CtrlStep::Done,
+                InitStep::Done => false,
+            };
+            let ctrl_ready = match ctrl_step {
+                CtrlStep::Setup | CtrlStep::LoadNative => true,
+                CtrlStep::WaitOpenAns => open_ans.is_some(),
+                CtrlStep::EventLoop => stop_sent,
+                CtrlStep::Done => false,
+            };
+
+            if !init_ready && !ctrl_ready {
+                return Err(Broke::Oracle("deadlock between initial thread and control thread".into()));
+            }
+
+            let pick_init = match (init_ready, ctrl_ready) {
+                (true, false) => true,
+                (false, true) => false,
+                (true, true) => tape.below(2, "turn") == 0,
+                (false, false) => unreachable!(),
+            };
+
+            if pick_init {
+                match init_step {
+                    InitStep::WaitOpenAsk => {
+                        let asked = open_ask.take();
+                        init_step = match asked {
+                            Some(Some(_)) => InitStep::DoOpen,
+                            Some(None) => InitStep::WaitReady,
+                            None => return Err(Broke::Oracle("missing open_ask".into())),
+                        };
+                    }
+                    InitStep::DoOpen => {
+                        opened_on_init += 1;
+                        open_ans = Some(!open_fails);
+                        init_step = InitStep::WaitReady;
+                    }
+                    InitStep::WaitReady => match ready.take() {
+                        Some(true) => init_step = InitStep::RunInits,
+                        Some(false) => init_step = InitStep::JoinControl,
+                        None => return Err(Broke::Oracle("missing ready".into())),
+                    },
+                    InitStep::RunInits => {
+                        inits_after_load = loaded_after_open;
+                        if init_fails {
+                            if plant != Plant::SkipInitErrStop {
+                                stop_sent = true;
+                            }
+                            init_step = InitStep::JoinControl;
+                        } else {
+                            stop_sent = true;
+                            init_step = InitStep::JoinControl;
+                        }
+                    }
+                    InitStep::JoinControl => {
+                        init_step = InitStep::Done;
+                    }
+                    InitStep::Done => {}
+                }
+            } else {
+                match ctrl_step {
+                    CtrlStep::Setup => {
+                        if early_fail {
+                            // Control exits early before Act::Native: EagerOpenGate::drop wakes initial thread.
+                            if gate_armed && plant != Plant::SkipDropWake {
+                                gate_armed = false;
+                                open_ask = Some(None);
+                            }
+                            ready = Some(false);
+                            ctrl_step = CtrlStep::Done;
+                        } else {
+                            gate_armed = false;
+                            open_ask = Some(Some(1));
+                            ctrl_step = CtrlStep::WaitOpenAns;
+                        }
+                    }
+                    CtrlStep::WaitOpenAns => match open_ans.take() {
+                        Some(true) => ctrl_step = CtrlStep::LoadNative,
+                        Some(false) => {
+                            ready = Some(false);
+                            ctrl_step = CtrlStep::Done;
+                        }
+                        None => return Err(Broke::Oracle("missing open_ans".into())),
+                    },
+                    CtrlStep::LoadNative => {
+                        loaded_after_open = opened_on_init == 1;
+                        if load_fails {
+                            ready = Some(false);
+                            ctrl_step = CtrlStep::Done;
+                        } else {
+                            ready = Some(true);
+                            ctrl_step = CtrlStep::EventLoop;
+                        }
+                    }
+                    CtrlStep::EventLoop => {
+                        ctrl_step = CtrlStep::Done;
+                    }
+                    CtrlStep::Done => {}
+                }
+            }
+        }
+        Err(Broke::Oracle("protocol did not finish within step bound".into()))
+    }
+
+    #[test]
+    fn eager_open_handoff_is_deadlock_free_and_ordered() {
+        check(Config::cases(4_000), |tape| run_case(tape, Plant::None));
+    }
+
+    #[test]
+    fn control_missing_drop_wake_and_missing_init_err_stop_are_caught() {
+        control(Config::cases(1_000), Plant::None, Plant::SkipDropWake, "deadlock between initial thread and control thread", run_case);
+        control(Config::cases(1_000), Plant::None, Plant::SkipInitErrStop, "deadlock between initial thread and control thread", run_case);
     }
 }
