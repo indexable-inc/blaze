@@ -78,6 +78,12 @@ pub(crate) enum StartError {
     AbortTests { test: std::boxed::Box<str>, dependency: std::boxed::Box<str> },
 }
 
+impl StartError {
+    fn test_place(shown: &str) -> Self {
+        Self::TestPlace { shown: shown.into() }
+    }
+}
+
 impl fmt::Display for StartError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -321,35 +327,397 @@ fn body_ids_cert(root: ContentId, scope: crate::engine_check::CheckScope<'_>) ->
     }
 }
 
+/// Tag bytes under [`SCOPED_IDS_CERT_DOMAIN`] for the last-`RunIds` delta anchor and pointer
+/// (disjoint from `body_ids_cert`, which hashes 32-byte `root` followed by tag `1` or `2`).
+const DELTA_ANCHOR_TAG: u8 = 3;
+const DELTA_PTR_TAG: u8 = 4;
+const DELTA_ANCHOR_BYTES: usize = 64;
+
+fn hash_scope(h: &mut blaze_ids::Hasher, scope: crate::engine_check::CheckScope<'_>) {
+    let put_len = |h: &mut blaze_ids::Hasher, n: usize| {
+        h.update(&u64::try_from(n).unwrap_or(u64::MAX).to_le_bytes());
+    };
+    match scope {
+        crate::engine_check::CheckScope::Whole => {
+            h.update(&[0]);
+        }
+        crate::engine_check::CheckScope::Bin { package, root: bin_root } => {
+            h.update(&[1]);
+            put_len(h, package.len());
+            h.update(package.as_bytes());
+            put_len(h, bin_root.len());
+            h.update(bin_root.as_bytes());
+        }
+        crate::engine_check::CheckScope::Test { packages, bin, bin_roots } => {
+            h.update(&[2]);
+            put_len(h, packages.len());
+            for package in packages {
+                put_len(h, package.len());
+                h.update(package.as_bytes());
+            }
+            match bin {
+                Some(name) => {
+                    h.update(&[1]);
+                    put_len(h, name.len());
+                    h.update(name.as_bytes());
+                }
+                None => {
+                    h.update(&[0]);
+                }
+            }
+            put_len(h, bin_roots.len());
+            for bin_root in bin_roots {
+                put_len(h, bin_root.len());
+                h.update(bin_root.as_bytes());
+            }
+        }
+    }
+}
+
+/// CAS pointer name for the checkout+scope's most recent `RunIds` delta anchor, keyed by
+/// `(checkout, scope, toolchain, tools)` under [`SCOPED_IDS_CERT_DOMAIN`].
+fn body_ids_last_ptr(
+    checkout: &str,
+    scope: crate::engine_check::CheckScope<'_>,
+    toolchain: blaze_toolchain::ToolchainId,
+    tools: &[Tool; KINDS],
+) -> blaze_cas::Key {
+    let mut h = blaze_ids::Hasher::new(SCOPED_IDS_CERT_DOMAIN);
+    h.update(&[DELTA_PTR_TAG]);
+    h.update(&u64::try_from(checkout.len()).unwrap_or(u64::MAX).to_le_bytes());
+    h.update(checkout.as_bytes());
+    hash_scope(&mut h, scope);
+    h.update(&toolchain.0);
+    for tool in tools {
+        h.id(&tool.0);
+    }
+    blaze_cas::Key(h.finish())
+}
+
+fn body_ids_anchor_bytes(root: ContentId, table: Key) -> [u8; DELTA_ANCHOR_BYTES] {
+    let mut bytes = [0u8; DELTA_ANCHOR_BYTES];
+    if let Some(head) = bytes.get_mut(..32) {
+        head.copy_from_slice(&root.0);
+    }
+    if let Some(tail) = bytes.get_mut(32..64) {
+        tail.copy_from_slice(&table.0.0);
+    }
+    bytes
+}
+
+fn body_ids_anchor_key(anchor: &[u8; DELTA_ANCHOR_BYTES]) -> blaze_cas::Key {
+    let mut h = blaze_ids::Hasher::new(SCOPED_IDS_CERT_DOMAIN);
+    h.update(&[DELTA_ANCHOR_TAG]);
+    h.update(anchor);
+    blaze_cas::Key(h.finish())
+}
+
+fn save_last_body_ids_if_moved<D: blaze_core::Driver>(
+    lent: &blaze_cas::plain::Lent<D, crate::store::plain_place::StoreAlloc>,
+    ptr: &blaze_cas::Key,
+    root: ContentId,
+    table: Key,
+) {
+    let tag = blaze_keyed::kind::ReservedTag::Drive.tag();
+    let anchor = body_ids_anchor_bytes(root, table);
+    let anchor_key = body_ids_anchor_key(&anchor);
+    if matches!(lent.pointed(tag, ptr), Ok(Some(current)) if current == anchor_key) {
+        return;
+    }
+    if lent.put(&anchor_key, blaze_cas::plain::Namespace::LOCAL, tag, &anchor).is_ok() {
+        let _ = lent.point(tag, ptr, &anchor_key);
+    }
+}
+
+fn load_last_body_ids<'m, D: blaze_core::Driver>(
+    lent: &'m blaze_cas::plain::Lent<D, crate::store::plain_place::StoreAlloc>,
+    ptr: &blaze_cas::Key,
+) -> Option<(ContentId, &'m [u8])> {
+    let tag = blaze_keyed::kind::ReservedTag::Drive.tag();
+    let anchor_key = match lent.pointed(tag, ptr) {
+        Ok(Some(key)) => key,
+        Ok(None) | Err(blaze_cas::plain::LentError::TargetGone { .. }) => return None,
+        Err(_) => return None,
+    };
+    let anchor = lent.get(&anchor_key).ok()??;
+    if anchor.bytes.len() != DELTA_ANCHOR_BYTES {
+        return None;
+    }
+    let mut prev_root = [0u8; 32];
+    let mut prev_table = [0u8; 32];
+    prev_root.copy_from_slice(anchor.bytes.get(..32)?);
+    prev_table.copy_from_slice(anchor.bytes.get(32..64)?);
+    let prev_record = lent.get(&blaze_cas::Key(ContentId(prev_table))).ok()??;
+    Some((ContentId(prev_root), prev_record.bytes))
+}
+
+/// Page-level reuse oracle comparing two engine answer [`blaze_engine::pages::Root`] directories.
+/// Any `Name` whose page key is identical in `prev_root` and `curr_root` (and whose `PLACE_SKIPPED`
+/// flag in `Root::places` did not flip) has mathematically identical `RowFacts`, record key, and
+/// immutable CAS record bytes (rules 21, 25, 26).
+struct PageReuseOracle<'a> {
+    bits: u8,
+    changed_pages: blaze_own::AVec<'a, u64>,
+    skipped_changed: blaze_own::AVec<'a, blaze_drive::Name>,
+}
+
+impl PageReuseOracle<'_> {
+    fn mark_changed(bits: &mut [u64], page: usize) {
+        if let Some(word) = bits.get_mut(page / 64) {
+            *word |= 1u64 << (page % 64);
+        }
+    }
+
+    fn is_page_changed(bits: &[u64], page: usize) -> bool {
+        bits.get(page / 64).is_none_or(|word| (*word & (1u64 << (page % 64))) != 0)
+    }
+
+    fn collect_skipped_diff<'a>(
+        prev: &blaze_engine::pages::Root<'_>,
+        curr: &blaze_engine::pages::Root<'_>,
+        alloc: Alloc<'a>,
+    ) -> blaze_own::AVec<'a, blaze_drive::Name> {
+        let skipped = |place: Option<&blaze_engine::pages::FilePlace>| {
+            place.is_some_and(|p| (p.flags & crate::engine_check::PLACE_SKIPPED) != 0)
+        };
+        let mut diff = blaze_own::Vec::new_in(alloc);
+        for (&file, place) in curr.places.iter() {
+            if skipped(Some(place)) != skipped(prev.places.get(&file)) {
+                diff.push(file);
+            }
+        }
+        for (&file, place) in prev.places.iter() {
+            if skipped(Some(place)) && !curr.places.contains_key(&file) {
+                diff.push(file);
+            }
+        }
+        diff.sort_unstable();
+        diff.dedup();
+        diff
+    }
+
+    /// Sans-IO builder over flat page key slices (`!is_radix`), directly testable without a store.
+    fn from_flat_pages<'a>(
+        bits: u8,
+        prev_pages: &[Key],
+        curr_pages: &[Key],
+        skipped_changed: blaze_own::AVec<'a, blaze_drive::Name>,
+        alloc: Alloc<'a>,
+    ) -> Option<PageReuseOracle<'a>> {
+        if prev_pages.len() != curr_pages.len() {
+            return None;
+        }
+        let page_count = 1usize.checked_shl(u32::from(bits))?;
+        if prev_pages.len() != page_count {
+            return None;
+        }
+        let words = page_count.div_ceil(64).max(1);
+        let mut changed_pages = blaze_own::Vec::with_capacity_in(words, alloc);
+        changed_pages.resize(words, 0u64);
+        for (idx, (pk, ck)) in prev_pages.iter().zip(curr_pages.iter()).enumerate() {
+            if pk != ck {
+                Self::mark_changed(changed_pages.as_mut_slice(), idx);
+            }
+        }
+        let ug_page = usize::try_from(blaze_drive::answers::page_of(blaze_drive::Name::unit_graph(), bits)).unwrap_or(usize::MAX);
+        if Self::is_page_changed(changed_pages.as_slice(), ug_page) {
+            return None;
+        }
+        Some(PageReuseOracle { bits, changed_pages, skipped_changed })
+    }
+
+    /// Sans-IO builder for flat roots (`!curr.is_radix()`).
+    fn from_flat_roots<'a>(
+        prev: &blaze_engine::pages::Root<'_>,
+        curr: &blaze_engine::pages::Root<'_>,
+        alloc: Alloc<'a>,
+    ) -> Option<PageReuseOracle<'a>> {
+        if prev.bits != curr.bits || prev.is_radix() || curr.is_radix() {
+            return None;
+        }
+        let skipped_changed = Self::collect_skipped_diff(prev, curr, alloc);
+        Self::from_flat_pages(curr.bits, prev.pages.as_slice(), curr.pages.as_slice(), skipped_changed, alloc)
+    }
+}
+
+impl crate::run_ids::ReuseOracle for PageReuseOracle<'_> {
+    fn unchanged(&self, name: blaze_drive::Name) -> bool {
+        let page = usize::try_from(blaze_drive::answers::page_of(name, self.bits)).unwrap_or(usize::MAX);
+        if Self::is_page_changed(self.changed_pages.as_slice(), page) {
+            return false;
+        }
+        if name.kind == Kind::FileItems && self.skipped_changed.binary_search(&name).is_ok() {
+            return false;
+        }
+        true
+    }
+}
+
+fn decode_root_from_store<'a, 'm>(
+    cx: &Cx,
+    store: &mut dyn crate::store::Store<'m>,
+    key: Key,
+    alloc: blaze_own::SharedAlloc<'a>,
+) -> Result<Option<blaze_engine::pages::Root<'a>>, CliError> {
+    let Some(held) = store.get(cx, key)? else { return Ok(None) };
+    let mut store_err: Option<CliError> = None;
+    let decoded = blaze_engine::pages::decode_root_with(
+        blaze_engine::pages::Sealed::by_store(key, held.bytes, held.proof),
+        |sub_key| match store.get(cx, sub_key) {
+            Ok(found) => found.map(|h| Ok(blaze_engine::pages::Sealed::by_store(sub_key, h.bytes, h.proof))),
+            Err(err) => {
+                store_err.get_or_insert(err);
+                None
+            }
+        },
+        alloc,
+    );
+    if let Some(err) = store_err {
+        return Err(err);
+    }
+    Ok(decoded.ok())
+}
+
+fn decode_shard_from_store<'a, 'm>(
+    cx: &Cx,
+    store: &mut dyn crate::store::Store<'m>,
+    key: Key,
+    shard: u32,
+    bits: u8,
+    alloc: blaze_own::SharedAlloc<'a>,
+) -> Result<Option<blaze_engine::pages::RadixShard<'a>>, CliError> {
+    let Some(held) = store.get(cx, key)? else { return Ok(None) };
+    Ok(blaze_engine::pages::decode_radix_shard(
+        blaze_engine::pages::Sealed::by_store(key, held.bytes, held.proof),
+        shard,
+        bits,
+        alloc,
+    )
+    .ok())
+}
+
+fn build_page_reuse_oracle<'a, 'm>(
+    cx: &Cx,
+    store: &mut dyn crate::store::Store<'m>,
+    prev_root_id: ContentId,
+    curr_root_id: ContentId,
+    scratch: blaze_own::SharedAlloc<'_>,
+    alloc: Alloc<'a>,
+) -> Result<Option<PageReuseOracle<'a>>, CliError> {
+    if prev_root_id == curr_root_id {
+        return Ok(None);
+    }
+    let Some(prev) = decode_root_from_store(cx, store, Key(prev_root_id), scratch)? else { return Ok(None) };
+    let Some(curr) = decode_root_from_store(cx, store, Key(curr_root_id), scratch)? else { return Ok(None) };
+    if prev.bits != curr.bits {
+        return Ok(None);
+    }
+    if !curr.is_radix() {
+        return Ok(PageReuseOracle::from_flat_roots(&prev, &curr, alloc));
+    }
+    if prev.page_shards.len() != curr.page_shards.len() {
+        return Ok(None);
+    }
+    let words = curr.page_count().div_ceil(64).max(1);
+    let mut changed_pages = blaze_own::Vec::with_capacity_in(words, alloc);
+    changed_pages.resize(words, 0u64);
+    for (shard_idx, (&prev_sk, &curr_sk)) in prev.page_shards.iter().zip(curr.page_shards.iter()).enumerate() {
+        if prev_sk == curr_sk {
+            continue;
+        }
+        let Ok(shard_u32) = u32::try_from(shard_idx) else { return Ok(None) };
+        let prev_shard = if prev_sk == Key::default() {
+            None
+        } else {
+            let Some(decoded) = decode_shard_from_store(cx, store, prev_sk, shard_u32, curr.bits, scratch)? else {
+                return Ok(None);
+            };
+            Some(decoded)
+        };
+        let curr_shard = if curr_sk == Key::default() {
+            None
+        } else {
+            let Some(decoded) = decode_shard_from_store(cx, store, curr_sk, shard_u32, curr.bits, scratch)? else {
+                return Ok(None);
+            };
+            Some(decoded)
+        };
+        let base = shard_idx * blaze_engine::pages::RADIX_LEAF_PAGES;
+        for slot in 0..blaze_engine::pages::RADIX_LEAF_PAGES {
+            let pk = prev_shard.as_ref().and_then(|s| s.keys.get(slot).copied()).unwrap_or_default();
+            let ck = curr_shard.as_ref().and_then(|s| s.keys.get(slot).copied()).unwrap_or_default();
+            if pk != ck {
+                PageReuseOracle::mark_changed(changed_pages.as_mut_slice(), base + slot);
+            }
+        }
+    }
+    let ug_page = usize::try_from(blaze_drive::answers::page_of(blaze_drive::Name::unit_graph(), curr.bits)).unwrap_or(usize::MAX);
+    if PageReuseOracle::is_page_changed(changed_pages.as_slice(), ug_page) {
+        return Ok(None);
+    }
+    let skipped_changed = PageReuseOracle::collect_skipped_diff(&prev, &curr, alloc);
+    Ok(Some(PageReuseOracle { bits: curr.bits, changed_pages, skipped_changed }))
+}
+
 /// The body ids of the answer at its root (run_ids.rs): one get when a start under this root
-/// wrote them, else walked over E2's answer from the workspace's bodies and written at the root.
+/// wrote them, else incrementally updated from the prior `RunIds` record via page diff when
+/// unchanged crates/files/checks stand (producing 100% byte-identical bytes), or walked fresh
+/// over E2's answer and written at the root.
 /// Either way they read each workspace body's reads BY NEED from the stored rows in place
 /// (`Standing::rows`, run_ids.rs `BodyReads`), counted in `asked` for the profile's line.
-/// COST: a hit, one get; a miss, O(workspace bodies) row reads and one put; no read list.
+/// COST: a hit, one get; an incremental miss, O(changed pages + changed checks) store reads and
+/// one put; a cold miss, one store read per body (zero duplicate reads) and one put.
 pub(crate) fn body_ids<'a, 'r: 'a, 'm: 'a>(
     cx: &Cx, standing: &mut Standing<'r, 'm>, list: &blaze_world::crate_list::CrateList<'_>, asked: &'a crate::run_ids::Asked, bump: blaze_own::Bump<'a>,
 ) -> Result<RunIds<'a>, CliError> {
     let alloc = bump.alloc();
     let frame = standing.frame;
-    let refused = |error: RunIdsError<'_>| CliError::Start(StartError::BodyIds { shown: std::boxed::Box::from(bstd::mem::format_in!(frame, "{error}").as_str()) });
+    let refused = |error: RunIdsError<'_>| CliError::Start(StartError::BodyIds { shown: bstd::mem::format_in!(frame, "{error}").as_str().into() });
     let cert = body_ids_cert(standing.root, standing.scope);
     let (toolchain, tools): (_, [Tool; KINDS]) = (standing.toolchain, standing.tools);
+    let table_cas_key = crate::run_ids::table_key(cert, toolchain, &tools);
+    let lent = standing.lent;
+    let checkout_id = standing.place.served.root_text().unwrap_or(standing.place.checkout);
+    let last_ptr = body_ids_last_ptr(checkout_id, standing.scope, toolchain, &tools);
     let most = crate::run_ids::Most::USUAL;
     let from = crate::run_ids::ReadsFrom::new(standing.rows(), asked, most);
     let reading = |ids: RunIds<'a>| ids.reading::<crate::run_ids::Production>(from).map_err(|why| refused(RunIdsError::Unread(why)));
     if let Some(ids) = RunIds::from_record(cx, &mut *standing.store, cert, toolchain, &tools, bump).map_err(refused)? {
+        save_last_body_ids_if_moved(lent, &last_ptr, standing.root, table_cas_key);
         return reading(ids);
     }
     // Each active member unit's root and view: the walk asks each unit's row of a body at its view (D191).
     let scoped = crate::engine_check::ScopedUnits::of(standing.scope, list, standing.heap.alloc());
     let units = crate::run_ids::unit_roots_scoped(list, scoped.as_ref(), alloc).map_err(refused)?;
     let walk_from = if scoped.is_some() { crate::run_ids::WalkFrom::UnitRoots } else { crate::run_ids::WalkFrom::Workspace };
-    let mut answer = standing.answer();
     let body_tool = blaze_engine::Tools(tools).of(blaze_drive::Name { kind: Kind::BodyCheck, subject: blaze_ids::ContentId([0; 32]) });
+    // Incremental delta fast path: when a prior `RunIds` record exists for this `(checkout, scope,
+    // toolchain, tools)` and `UnitGraph` did not move, diff `prev_root` vs `curr_root` pages and
+    // copy all standing crates/files/checks directly from `prev_ids` without opening their records.
+    if let Some((prev_root_id, prev_bytes)) = load_last_body_ids(lent, &last_ptr) {
+        let prev_erased = blaze_own::Erased::new(frame);
+        let prev_bump = prev_erased.bump();
+        if let Ok(prev_ids) = RunIds::read(prev_bytes, prev_bump)
+            && prev_ids.matches_build(toolchain, &tools)
+        {
+            let oracle = build_page_reuse_oracle(cx, &mut *standing.store, prev_root_id, standing.root, standing.heap.shared(), alloc)?;
+            if let Some(oracle) = oracle {
+                let mut answer = standing.answer();
+                let walk = crate::run_ids::workspace_of_delta(cx, &mut answer, body_tool, &units, walk_from, &prev_ids, &oracle, alloc).map_err(refused)?;
+                let ids = RunIds::from_walked(cx, toolchain, list, scoped.as_ref(), &tools, &walk, &mut answer, Some((&prev_ids, &oracle)), most, bump).map_err(refused)?;
+                drop(answer);
+                ids.put(cx, &mut *standing.store, cert, &tools, alloc).map_err(refused)?;
+                save_last_body_ids_if_moved(lent, &last_ptr, standing.root, table_cas_key);
+                return reading(ids);
+            }
+        }
+    }
+    let mut answer = standing.answer();
     let walk = crate::run_ids::workspace_of_scoped(cx, &mut answer, body_tool, &units, walk_from, None, alloc).map_err(refused)?;
-    let ids = RunIds::new_scoped(cx, toolchain, list, scoped.as_ref(), &tools, &walk.bodies, &walk.edges, &mut answer, None, most, bump).map_err(refused)?;
+    let ids = RunIds::from_walked(cx, toolchain, list, scoped.as_ref(), &tools, &walk, &mut answer, None, most, bump).map_err(refused)?;
     drop(answer);
     ids.put(cx, &mut *standing.store, cert, &tools, alloc).map_err(refused)?;
+    save_last_body_ids_if_moved(lent, &last_ptr, standing.root, table_cas_key);
     reading(ids)
 }
 
@@ -407,7 +775,7 @@ pub(crate) fn run_program(
     // unit graph is not read again here (engine_native.rs reads it once more inside).
     let closure = program_found.closure_in(alloc);
     let native = crate::engine_native::image_for(cx, &mut standing, &closure, watch)
-        .map_err(|error| CliError::Start(StartError::Native { shown: std::boxed::Box::from(bstd::mem::format_in!(frame, "{error}").as_str()) }))?;
+        .map_err(|error| CliError::Start(StartError::Native { shown: bstd::mem::format_in!(frame, "{error}").as_str().into() }))?;
     watch.see(blaze_screen::Step::Began(blaze_screen::Stage::BodyIds));
     let list = found.list().ok_or(CliError::Start(StartError::NoProgram))?;
     let asked = crate::run_ids::Asked::default();
@@ -573,68 +941,88 @@ pub(crate) fn run_tests_status(
         let began = phases.now();
         let ids = body_ids(cx, &mut standing, list, &asked, bump)?;
         let ids_ns = phases.since(began);
-        // Each suite's native image, as `run` has its program's (engine_native.rs `image_for`):
-        // the C of every crate its test program links (a build script's deferred C built by
-        // native_runner_c.rs), made once and found by its key after, told to every test's start
-        // before any of its code (test_drive.rs `Launched`). One that cannot be had leaves that
-        // suite's tests NOT RUN naming why (test_drive.rs `EntryCheck`), the others run. A crate
-        // whose C is refused does not stop the image: its archives are left out, said by name,
-        // and only a test whose code calls one of its C names stops (engine_native.rs `image_for`).
-        // NOT DONE: a proc-macro crate's tests (the macro side, native_image.rs `linked`) get no
-        // image, as `image_for` links target-side crates only; a C name one calls stays its
-        // test's `dlsym` failure, named by the launcher.
-        let mut images = blaze_own::Vec::with_capacity_in(inventory.suites.len(), frame);
-        for (_, unit) in &inventory.suites {
-            if !crate::native_image::linked(list, unit.at) {
-                images.push(Ok(None));
-                continue;
-            }
-            let closure = suite_closure(list, unit.at, alloc);
-            let image = crate::engine_native::image_for(cx, &mut standing, &closure, watch)
-                .map(|image| image.send)
-                .map_err(|error| crate::work::held_str(bstd::mem::format_in!(frame, "{error}").as_str(), frame));
-            images.push(image);
-        }
         let overflow = program::dev_overflow(cx, root, frame)?;
         let panic = blaze_ladder::panic_strategy::of_profile(blaze_world::panic::TEST_PROFILE);
         // Boxed in the process heap: the error outlives this frame to `main`'s print.
         let parent = move |why| CliError::OwnProcess(blaze_own::Box::new_in(crate::own_process::OwnError::Parent(why), heap.alloc()));
         let isa = crate::run_parent::isa().map_err(parent)?;
         let producer = standing.producers.get::<blaze_ids::producer::CodeBuilder>();
-        // One runner for every suite, made at the first proc-macro call any suite's body meets
-        // ([`RunProcs`]; C9). Every suite's names records read one committed snapshot. Before
-        // `runnable`, whose names records borrow it, so it outlives them.
-        let inputs = inventory.suites.first().map(|(found, _)| RunProcs { cx, root, snapshot: found.snapshot(), graph: standing.graph, env: &facts.fetch_env, frame });
-        let maker = crate::job_texts::MadeOnce::new(|| match &inputs {
-            Some(inputs) => inputs.make(),
-            // No suite: no names records, so nothing asks.
-            None => Err("no proc-macro runner: this command has no test suite (engine_start.rs `run_tests`)"),
-        });
-        let procs = crate::job_texts::Procs::ByNeed(&maker);
-        let mut runnable = blaze_own::Vec::with_capacity_in(inventory.suites.len(), frame);
-        // Each test unit runs in its package's root, told its package's variables (test_drive.rs
-        // `PackageRun`): the checkout's absolute root as the edge resolved it.
-        let checkout = standing.place.served.root_text();
-        for (at, (found, unit)) in inventory.suites.iter().enumerate() {
-            let place = crate::test_drive::package_run(checkout, list.env_facts(unit.at), bump)
-                .map_err(|why| CliError::Start(StartError::TestPlace { shown: std::boxed::Box::from(bstd::mem::format_in!(frame, "{why}").as_str()) }))?;
-            // What the suite's names records are made of, kept for the command's code workers
-            // (test_drive.rs `pooled`, D194), then the command thread's own names records of it.
-            let named = cx.span("run names: open the names records");
-            let crates = run_names::crates_of(&named, found, run_names::Owner::At(unit.at), &mut *standing.store, &mut facts.bodies, &mut read, &facts.fetch_env, &pack_dirs, frame, heap)
-                .map_err(CliError::RunNames)?;
-            drop(named);
-            let names = run_names::names_in(cx, root, crates, procs, &seen, frame).map_err(CliError::RunNames)?;
+        let mut specs = blaze_own::Vec::with_capacity_in(inventory.suites.len(), frame);
+        for (_, unit) in &inventory.suites {
             let builder = crate::run_parent::builder_for(unit.edition.name(), overflow, panic, producer, isa).map_err(parent)?;
-            runnable.push(crate::test_drive::Suite { names, crates, builder, unit: *unit, place, native: images[at] });
+            specs.push(crate::test_drive::SuiteSpec { unit: *unit, builder });
         }
         let certificate = crate::start_list::Certificate::of_answer(&standing);
         let tools_digest = crate::test_cache::tools_digest(&standing.tools);
-        let typed = crate::engine_body_record::TypedFrom { cx, lent: standing.lent, records: standing.records(), alloc: heap.alloc() };
-        let ran = crate::test_drive::run_suites(cx, launch.fs, launch.env, launch.host, clock, rng, launch.out, launch.err, &runnable, &ids, typed, certificate, tools_digest, config, launch.args, standing.lent, root, procs, heap, watch, frame);
-        end_procs(cx, &maker, err, "test")?;
-        ids_line = Some(ids.line(&asked, ids_ns));
-        ran.map_err(|error| CliError::Test(blaze_own::Box::new_in(error, heap.alloc())))?
+        let lent = standing.lent;
+        let prep_erased = blaze_own::Erased::new(frame);
+        let prep_bump = prep_erased.bump();
+        let prepared = crate::test_drive::prepare_suites(
+            cx, clock, launch.out, specs.as_slice(), &ids, &certificate, tools_digest, config, launch.args, lent, watch, prep_bump,
+        )
+        .map_err(|error| CliError::Test(blaze_own::Box::new_in(error, heap.alloc())))?;
+        match prepared {
+            // Zero-spawn fast path: every targeted test hit `TestCache` (or was filtered/ignored);
+            // skip native-image linking, crate names opening, `$TMPDIR`, code workers, and launcher spawns.
+            crate::test_drive::PreparedSuites::Done(status) => {
+                ids_line = Some(ids.line(&asked, ids_ns));
+                status
+            }
+            crate::test_drive::PreparedSuites::Dirty(dirty) => {
+                // Each dirty suite's native image, as `run` has its program's (engine_native.rs `image_for`):
+                // clean cached suites skip native image linking completely.
+                let mut images = blaze_own::Vec::with_capacity_in(inventory.suites.len(), frame);
+                for (at, (_, unit)) in inventory.suites.iter().enumerate() {
+                    if !dirty.is_suite_dirty(at) || !crate::native_image::linked(list, unit.at) {
+                        images.push(Ok(None));
+                        continue;
+                    }
+                    let closure = suite_closure(list, unit.at, alloc);
+                    let image = crate::engine_native::image_for(cx, &mut standing, &closure, watch)
+                        .map(|image| image.send)
+                        .map_err(|error| crate::work::held_str(bstd::mem::format_in!(frame, "{error}").as_str(), frame));
+                    images.push(image);
+                }
+                // One runner for every dirty suite, made at the first proc-macro call any body meets
+                // ([`RunProcs`]; C9). Before `runnable`, whose names records borrow it, so it outlives them.
+                let inputs = inventory.suites.first().map(|(found, _)| RunProcs { cx, root, snapshot: found.snapshot(), graph: standing.graph, env: &facts.fetch_env, frame });
+                let maker = crate::job_texts::MadeOnce::new(|| match &inputs {
+                    Some(inputs) => inputs.make(),
+                    None => Err("no proc-macro runner: this command has no test suite (engine_start.rs `run_tests`)"),
+                });
+                let procs = crate::job_texts::Procs::ByNeed(&maker);
+                let mut runnable = blaze_own::Vec::with_capacity_in(inventory.suites.len(), frame);
+                // Each dirty test unit runs in its package's root, told its package's variables
+                // (test_drive.rs `PackageRun`); clean cached suites skip crates/names loading.
+                let checkout = standing.place.served.root_text();
+                for (at, (found, unit)) in inventory.suites.iter().enumerate() {
+                    if !dirty.is_suite_dirty(at) {
+                        runnable.push(None);
+                        continue;
+                    }
+                    let place = crate::test_drive::package_run(checkout, list.env_facts(unit.at), bump)
+                        .map_err(|why| CliError::Start(StartError::test_place(bstd::mem::format_in!(frame, "{why}").as_str())))?;
+                    let named = cx.span("run names: open the names records");
+                    let crates = run_names::crates_of(&named, found, run_names::Owner::At(unit.at), &mut *standing.store, &mut facts.bodies, &mut read, &facts.fetch_env, &pack_dirs, frame, heap)
+                        .map_err(CliError::RunNames)?;
+                    drop(named);
+                    let names = run_names::names_in(cx, root, crates, procs, &seen, frame).map_err(CliError::RunNames)?;
+                    let Some(spec) = specs.get(at) else {
+                        return Err(CliError::Start(StartError::NoProgram));
+                    };
+                    let native = images.get(at).copied().unwrap_or(Ok(None));
+                    runnable.push(Some(crate::test_drive::Suite { names, crates, builder: spec.builder, unit: *unit, place, native }));
+                }
+                let typed = crate::engine_body_record::TypedFrom { cx, lent, records: standing.records(), alloc: heap.alloc() };
+                let ran = dirty.run(
+                    cx, launch.fs, launch.env, launch.host, clock, rng, launch.out, launch.err,
+                    runnable.as_slice(), &ids, typed, certificate, config, launch.args, lent, root, procs, heap, watch, frame,
+                );
+                end_procs(cx, &maker, err, "test")?;
+                ids_line = Some(ids.line(&asked, ids_ns));
+                ran.map_err(|error| CliError::Test(blaze_own::Box::new_in(error, heap.alloc())))?
+            }
+        }
     };
     let names_read = run_names::NamesRead::of(read.counts(), &seen);
     phases.run_names = Some(match ids_line {
@@ -686,5 +1074,98 @@ mod tests {
         assert_ne!(a, b);
         assert_ne!(bin, whole);
         assert_ne!(bin, a);
+    }
+
+    #[test]
+    fn page_reuse_oracle_tracks_changed_pages_skipped_toggles_and_unit_graph() {
+        use crate::run_ids::ReuseOracle as _;
+
+        let alloc = blaze_own::testing::heap().alloc();
+        let bits = 4u8; // 16 pages
+        let prev = [blaze_drive::Key(blaze_ids::ContentId([0x10; 32])); 16];
+        let mut curr = prev;
+        let edited_file = blaze_drive::Name::file(b"crates/a/src/lib.rs");
+        let skipped_file = blaze_drive::Name::file(b"crates/b/src/bin/extra.rs");
+        let untouched_file = blaze_drive::Name::file(b"crates/c/src/lib.rs");
+        let edited_page = usize::try_from(blaze_drive::answers::page_of(edited_file, bits)).unwrap_or(0);
+        let ug_page = usize::try_from(blaze_drive::answers::page_of(blaze_drive::Name::unit_graph(), bits)).unwrap_or(0);
+        let target_page = if edited_page == ug_page { (edited_page + 1) % 16 } else { edited_page };
+        if let Some(slot) = curr.get_mut(target_page) {
+            *slot = blaze_drive::Key(blaze_ids::ContentId([0x20; 32]));
+        }
+
+        let mut skipped = blaze_own::Vec::new_in(alloc);
+        skipped.push(skipped_file);
+        let oracle = super::PageReuseOracle::from_flat_pages(bits, &prev, &curr, skipped, alloc);
+        assert!(oracle.is_some(), "oracle must construct when UnitGraph page is unchanged");
+        if let Some(oracle) = oracle {
+            if edited_page == target_page {
+                assert!(!oracle.unchanged(edited_file), "changed page must report unchanged=false");
+            }
+            assert!(!oracle.unchanged(skipped_file), "PLACE_SKIPPED toggle must report unchanged=false");
+            let untouched_page = usize::try_from(blaze_drive::answers::page_of(untouched_file, bits)).unwrap_or(0);
+            if untouched_page != target_page {
+                assert!(oracle.unchanged(untouched_file), "untouched page must report unchanged=true");
+            }
+        }
+
+        // Control: when UnitGraph's page changed, oracle returns None so full walk runs.
+        if let Some(slot) = curr.get_mut(ug_page) {
+            *slot = blaze_drive::Key(blaze_ids::ContentId([0x30; 32]));
+        }
+        assert!(
+            super::PageReuseOracle::from_flat_pages(bits, &prev, &curr, blaze_own::Vec::new_in(alloc), alloc).is_none(),
+            "changed UnitGraph page must disable delta reuse"
+        );
+        // Control: mismatched slice length returns None.
+        assert!(super::PageReuseOracle::from_flat_pages(bits, &prev[..8], &curr, blaze_own::Vec::new_in(alloc), alloc).is_none());
+    }
+
+    #[test]
+    fn last_body_ids_anchor_round_trips_and_skips_redundant_writes() {
+        use blaze_cas::plain::{Namespace, Settings as StoreSettings};
+        use blaze_core::FileName;
+        use blaze_core::sim::{Faults, Sim};
+        use crate::store::plain_place::{Facts, after_answer, config, open, test_cx};
+
+        let alloc = blaze_own::testing::heap().alloc();
+        let cx = test_cx();
+        let open_lent = |sim: Sim, nonce: u64| {
+            let Some(store_name) = FileName::new("store") else { panic!("store name") };
+            let cfg = config(store_name, &StoreSettings::default(), Facts { boot: Some(1), nonce }, alloc);
+            let Ok(lent) = open(sim, cfg, alloc) else { panic!("open sim lent {nonce}") };
+            lent
+        };
+        let lent1 = open_lent(Sim::new(71, Faults::default()), 101);
+
+        let tools: [blaze_drive::Tool; blaze_drive::key::KINDS] =
+            core::array::from_fn(|at| blaze_drive::Tool(blaze_ids::ContentId([u8::try_from(at).unwrap_or(u8::MAX); 32])));
+        let tc = blaze_toolchain::ToolchainId([0x55; 32]);
+        let ptr_whole = super::body_ids_last_ptr("/ws/a", crate::engine_check::CheckScope::Whole, tc, &tools);
+        let ptr_other = super::body_ids_last_ptr("/ws/b", crate::engine_check::CheckScope::Whole, tc, &tools);
+        let ptr_scoped = super::body_ids_last_ptr("/ws/a", crate::engine_check::CheckScope::Test { packages: &["p"], bin: None, bin_roots: &[] }, tc, &tools);
+        assert_ne!(ptr_whole, ptr_other);
+        assert_ne!(ptr_whole, ptr_scoped);
+
+        assert!(super::load_last_body_ids(&lent1, &ptr_whole).is_none(), "empty store has no prior anchor");
+
+        let root1 = blaze_ids::ContentId([0xaa; 32]);
+        let table_key1 = blaze_drive::Key(blaze_ids::ContentId([0xbb; 32]));
+        let fake_bzri = b"BZRI-payload-bytes";
+        assert!(lent1.put(&blaze_cas::Key(table_key1.0), Namespace::LOCAL, blaze_keyed::kind::ReservedTag::Drive.tag(), fake_bzri).is_ok());
+        super::save_last_body_ids_if_moved(&lent1, &ptr_whole, root1, table_key1);
+        let puts_after_first = lent1.counts().puts;
+        // Repeat save with identical (root1, table_key1) must write nothing.
+        super::save_last_body_ids_if_moved(&lent1, &ptr_whole, root1, table_key1);
+        assert_eq!(lent1.counts().puts, puts_after_first, "unchanged anchor must not perform redundant puts");
+        assert!(after_answer(&cx, &lent1, 0).is_ok());
+
+        // Reload after restart: anchor must recover (root1, fake_bzri).
+        let lent2 = open_lent(lent1.into_store().into_driver(), 102);
+        let loaded = super::load_last_body_ids(&lent2, &ptr_whole);
+        assert_eq!(loaded, Some((root1, &fake_bzri[..])));
+        let puts_before_hit = lent2.counts().puts;
+        super::save_last_body_ids_if_moved(&lent2, &ptr_whole, root1, table_key1);
+        assert_eq!(lent2.counts().puts, puts_before_hit, "cache hit after restart must perform zero writes");
     }
 }

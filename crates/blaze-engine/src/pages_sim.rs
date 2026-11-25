@@ -590,15 +590,15 @@ fn a_flipped_or_cut_page_is_refused_by_name() {
     }
 }
 
-/// Previous persisted root layout (`BER3`) is rejected cleanly by magic (rule 26 / `layouts.txt`).
+/// Previous persisted root layout (`BER4`) is rejected cleanly by magic (rule 26 / `layouts.txt`).
 #[test]
-fn previous_root_magic_ber3_is_rejected() {
-    let mut ber3 = StdVec::from(&b"BER3"[..]);
-    ber3.extend_from_slice(&[0u8; 64]);
-    let key = content_key(&ber3);
-    let err = crate::pages::decode_root_hashed(key, &ber3, alloc())
+fn previous_root_magic_ber4_is_rejected() {
+    let mut ber4 = StdVec::from(&b"BER4"[..]);
+    ber4.extend_from_slice(&[0u8; 64]);
+    let key = content_key(&ber4);
+    let err = crate::pages::decode_root_hashed(key, &ber4, alloc())
         .err()
-        .expect("previous BER3 root magic must be rejected");
+        .expect("previous BER4 root magic must be rejected");
     assert_eq!(err, PagesError::Magic { page: crate::pages::ROOT_PAGE });
 }
 

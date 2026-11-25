@@ -1180,6 +1180,7 @@ impl<'a, S: Scope, L: LastAnswer, R: ReaderIndex<'a>> Engine<'a, S, L, R> {
             orphans: BTreeSet::new_in(alloc),
             ready: false,
         };
+        let owed_before: SVec<'a, Planned> = engine.view.owed_tasks();
         for (file, plan) in edit.files.iter() {
             let old = engine.view.take_file_members(*file)?;
             let mut names: SVec<'a,Name> = Vec::with_capacity_in(plan.len(), alloc);
@@ -1195,6 +1196,13 @@ impl<'a, S: Scope, L: LastAnswer, R: ReaderIndex<'a>> Engine<'a, S, L, R> {
                     engine.view.unowe(*name);
                     engine.report.retired += u32::from(engine.view.row(*name)?.is_some());
                     engine.remove_row(*name, None)?;
+                }
+            }
+            for planned in owed_before.iter() {
+                if planned.file == *file && names.binary_search(&planned.name).is_err() {
+                    engine.view.unowe(planned.name);
+                    engine.report.retired += u32::from(engine.view.row(planned.name)?.is_some());
+                    engine.remove_row(planned.name, None)?;
                 }
             }
             let standing = old.standing.as_deref();

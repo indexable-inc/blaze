@@ -491,3 +491,160 @@ fn auto_tier_merge_during_commit_is_lossless_for_unleased_records() {
         assert_eq!(p2.got(got).bytes, value(n).as_slice());
     }
 }
+
+/// Foreground `commit_records` MUST NOT stall on synchronous `fold_tiered_slice` while open
+/// segment count is below the emergency ceiling (`Plain::AUTO_TIER_MERGE_FG` = 128), even past
+/// the soft background housekeeping threshold (`Plain::AUTO_TIER_MERGE_BG` = 24); post-answer
+/// housekeeping (`compact_foreground`) must then fold the tiers cleanly with exact byte-for-byte
+/// round-trip preservation.
+///
+/// Control (`Plant::ForegroundFoldsAtBgThreshold`): folding synchronously at 24 segments is caught
+/// by the oracle (rules 43, 53).
+#[test]
+fn foreground_commits_defer_tiered_fold_below_ceiling_and_housekeeping_folds_cleanly() {
+    use super::core::{Plain, ROOT_LIFE_NS};
+
+    const COMMITS: u32 = 40;
+    assert!(usize::try_from(COMMITS).unwrap_or(0) > Plain::<&Frame>::AUTO_TIER_MERGE_BG);
+    assert!(usize::try_from(COMMITS).unwrap_or(0) < Plain::<&Frame>::AUTO_TIER_MERGE_FG);
+
+    let run = |plant: Plant| {
+        let root = test_root();
+        let mut store = Driven::planted(Sim::new(119, Faults::default()), Path::new("/sim"), reached_cfg(1, &root), &root, plant).expect("open");
+        let mut keys = blaze_own::Vec::new_in(&root);
+        let mut sync_folded = false;
+        for i in 0..COMMITS {
+            let n = 110_000 + i;
+            let k = record(n);
+            store.put(k, Namespace::LOCAL, TAG, &value(n)).expect("put");
+            store.commit_with(&[]).expect("foreground commit");
+            keys.push((n, k));
+            let expected = usize::try_from(i + 1).unwrap_or(0);
+            if store.core().segments().len() < expected {
+                sync_folded = true;
+            }
+        }
+        let segs_before_hk = store.core().segments().len();
+        let needs_fg = store.core().needs_auto_tier_merge();
+        let needs_bg = store.core().needs_auto_tier_merge_bg();
+        let now = store.driver().wall_ns();
+        let needs_hk = store.needs_housekeeping(now);
+
+        let mut key_list = blaze_own::Vec::with_capacity_in(keys.len(), &root);
+        key_list.extend(keys.iter().map(|&(_, k)| k));
+        store.root_for("fg.answer", &key_list, ROOT_LIFE_NS).expect("root");
+        store.release_lease();
+        store.commit_with(&[]).expect("final commit");
+
+        let _ = store.compact_foreground(8).expect("post-answer housekeeping compact");
+        let _ = store.seal_foreground().expect("post-answer housekeeping seal");
+        let segs_after_hk = store.core().segments().len();
+        let sim = store.into_driver();
+
+        let mut reopen = Driven::with(sim, Path::new("/sim"), reached_cfg(2, &root), &root).expect("reopen");
+        for &(n, k) in &keys {
+            let got = reopen.get(&k).expect("reopen get").expect("record must survive deferred housekeeping fold");
+            assert_eq!(reopen.got(got).bytes, value(n).as_slice(), "byte mismatch for record {n}");
+        }
+        (segs_before_hk, sync_folded, needs_fg, needs_bg, needs_hk, segs_after_hk)
+    };
+
+    let (segs_before_hk, sync_folded, needs_fg, needs_bg, needs_hk, segs_after_hk) = run(Plant::None);
+    assert!(!sync_folded, "foreground commits below AUTO_TIER_MERGE_FG must not synchronously fold");
+    assert_eq!(segs_before_hk, usize::try_from(COMMITS).unwrap_or(0), "all 40 foreground commits must publish without synchronous merging");
+    assert!(!needs_fg, "40 segments must remain below emergency foreground ceiling");
+    assert!(needs_bg && needs_hk, "40 segments must flag background housekeeping");
+    assert!(segs_after_hk <= 4, "post-answer housekeeping must fold 40 tier-0 segments down (got {segs_after_hk})");
+
+    // Planted-bug control: reproducing the old 24-segment foreground stall is caught by the oracle.
+    let (planted_segs, planted_folded, _, _, _, _) = run(Plant::ForegroundFoldsAtBgThreshold);
+    assert!(planted_folded && planted_segs < usize::try_from(COMMITS).unwrap_or(0), "oracle must catch premature synchronous folding at AUTO_TIER_MERGE_BG");
+}
+
+/// Crashing (both process death and durable power cut) at every completion step while an emergency
+/// foreground `fold_tiered_slice` + `commit_records` runs at `Plain::AUTO_TIER_MERGE_FG` (128)
+/// must never lose any prior committed record or fail with `TooManySegments`, and a subsequent
+/// commit + housekeeping pass must converge to byte-identical state (rules 26, 43).
+#[test]
+fn emergency_foreground_fold_survives_crashes_at_every_cut() {
+    use super::core::{Plain, ROOT_LIFE_NS};
+
+    let root = test_root();
+    let ceiling = u32::try_from(Plain::<&Frame>::AUTO_TIER_MERGE_FG).unwrap_or(128);
+    fn durable_reached<'a>(n: u64, r: &'a Frame) -> PlainConfig<&'a Frame> {
+        let mut c = reached_cfg(n, r);
+        c.durable = true;
+        c
+    }
+
+    // Build a durable store right at the emergency foreground ceiling (128 segments, 0 sync folds).
+    let mut base_keys = blaze_own::Vec::new_in(&root);
+    for i in 0..ceiling {
+        let n = 120_000 + i;
+        base_keys.push((n, record(n)));
+    }
+    let seed_sim = |r: &Frame| -> Sim {
+        let mut w = Driven::with(Sim::new(121, Faults::default()), Path::new("/sim"), durable_reached(1, r), r).expect("seed open");
+        for &(n, k) in &base_keys {
+            w.put(k, Namespace::LOCAL, TAG, &value(n)).expect("seed put");
+            if n + 1 == 120_000 + ceiling {
+                let mut key_list = blaze_own::Vec::with_capacity_in(base_keys.len(), r);
+                key_list.extend(base_keys.iter().map(|&(_, key)| key));
+                w.root_for("seed.answer", &key_list, ROOT_LIFE_NS).expect("seed root");
+                w.release_lease();
+            }
+            w.commit_with(&[]).expect("seed commit");
+        }
+        assert_eq!(w.core().segments().len(), usize::try_from(ceiling).unwrap_or(128), "seed must reach ceiling without early sync fold");
+        assert!(w.core().needs_auto_tier_merge(), "store at ceiling must arm emergency foreground fold");
+        w.into_driver()
+    };
+
+    let trigger_n = 120_000 + ceiling;
+    let trigger_k = record(trigger_n);
+    let mut cuts = 0u32;
+    let mut reached_once = false;
+    for cut_at in 0..256u32 {
+        for power in [false, true] {
+            let cut_root = test_root();
+            let mut p2 = Driven::with(seed_sim(&cut_root), Path::new("/sim"), durable_reached(2, &cut_root), &cut_root).expect("p2 open");
+            p2.map_all().expect("map_all");
+            p2.put(trigger_k, Namespace::LOCAL, TAG, &value(trigger_n)).expect("trigger put");
+            p2.cut(Some(Cut::After(cut_at)));
+            let reached = p2.commit_with(&[]).is_ok();
+            let mut sim = p2.into_driver();
+            if power {
+                sim.crash();
+            } else {
+                sim.processes_died();
+            }
+            let mut after = Driven::with(sim, Path::new("/sim"), durable_reached(3, &cut_root), &cut_root).expect("reopen after crash");
+            for &(n, k) in &base_keys {
+                let got = after.get(&k).expect("get base").expect("base record must survive emergency fold crash");
+                assert_eq!(after.got(got).bytes, value(n).as_slice(), "corrupt base record {n} at cut {cut_at} (power={power})");
+            }
+            if reached {
+                let got = after.get(&trigger_k).expect("get trigger").expect("committed trigger record must be readable");
+                assert_eq!(after.got(got).bytes, value(trigger_n).as_slice());
+                assert!(after.core().segments().len() < usize::try_from(ceiling).unwrap_or(128), "emergency fold must have reduced segment count");
+            } else {
+                // Next request completes cleanly and converges to exact full state.
+                after.put(trigger_k, Namespace::LOCAL, TAG, &value(trigger_n)).expect("retry put");
+                after.commit_with(&[]).expect("retry commit");
+                let _ = after.compact_foreground(8).expect("post-crash housekeeping");
+                let got = after.get(&trigger_k).expect("get after retry").expect("retry record must be readable");
+                assert_eq!(after.got(got).bytes, value(trigger_n).as_slice());
+                assert!(after.core().segments().len() <= 8, "housekeeping must fold store cleanly after crash recovery");
+            }
+            cuts += 1;
+            if reached && power {
+                reached_once = true;
+                break;
+            }
+        }
+        if reached_once {
+            break;
+        }
+    }
+    assert!(reached_once && cuts > 8, "expected crash cuts across emergency fold + commit (cuts={cuts}, reached={reached_once})");
+}
