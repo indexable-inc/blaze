@@ -785,7 +785,7 @@ impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
                     *dst = (inner, next);
                     sp += 1;
                 }
-                blaze_typeck::PNode::Tuple(l) => {
+                blaze_typeck::PNode::Tuple(l) | blaze_typeck::PNode::FnPtr(l, _) => {
                     let Ok(elems) = tys.list(l) else { return false };
                     for (ci, &child) in elems.iter().enumerate().rev() {
                         let Ok(ci_u32) = u32::try_from(ci) else { return false };
@@ -1855,5 +1855,119 @@ fn note_body_record_field_names(view: &View<'_>, maps: &super::heads::Maps) {
                 maps.note_record_field_name(Name(hash), text);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod closure_param_regions_tests {
+    use blaze_id::{ContentId, CrateItemKey};
+    use blaze_lower::scoped::Prepares;
+    use blaze_mem::Frame;
+    use blaze_scope::graph::Sysroot;
+    use blaze_scope::resolve::{CrateInput, SourceTexts, resolve_crates};
+    use blaze_scope::task::Serial;
+    use blaze_surface::Edition;
+    use blaze_typeck::{ClosureParamRegion, WrittenRegion};
+    use blaze_unit_graph::{Implicit, Prelude, StdIs};
+
+    use super::{Store, lower_fn};
+    use crate::front2::Front2;
+    use crate::refusal::SourceFile;
+
+    struct OneFile<'a>(&'a str);
+    impl<'a> SourceTexts<'a> for OneFile<'a> {
+        fn read(&self, krate: usize, path: &str) -> Option<&'a str> {
+            (krate == 0 && path == "/fnptr/src/lib.rs").then_some(self.0)
+        }
+    }
+
+    fn lower_regions<'a>(source: &str, fn_name: &str, alloc: blaze_own::Alloc<'a>) -> blaze_own::Vec<(u32, u64, u32, WrittenRegion), blaze_own::Alloc<'a>> {
+        let frame = Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let bump = erased.bump();
+        let heap = blaze_own::testing::heap();
+        let store_alloc = heap.alloc();
+        let input = CrateInput {
+            name: "fnptr_test",
+            key: CrateItemKey(ContentId::of("closure_param_regions_fnptr_test", b"fnptr_test")),
+            root: "/fnptr/src/lib.rs",
+            shown_from: "/fnptr/",
+            edition: Edition::E2024,
+            implicit: Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2024), proc_macro: false, entry: false },
+            features: &[],
+            deps: &[],
+            cfg: &[],
+            script: None,
+        };
+        let names = resolve_crates(&[input], Sysroot::default(), &OneFile(source), &Serial, bump).expect("resolve");
+        let front_frame = Frame::new(blaze_mem::tag::Tag::Infer).expect("front frame");
+        let files = [SourceFile { path: "src/lib.rs", text: source }];
+        let mut front = Front2::new(&names, &front_frame, &files, store_alloc).expect("front2");
+        let prepared = Prepares::new_in(bump);
+        let mut store = Store::new(front.index.lang("sized"), front.frame, store_alloc);
+        let (item, _, _) = names
+            .items(0)
+            .find(|(k, _, _)| names.item_text(*k).and_then(|t| t.name) == Some(fn_name))
+            .expect("target fn");
+        let body = lower_fn(&names, &prepared, &mut front.keys, &mut store, item).expect("lower_fn");
+        let mut out = blaze_own::Vec::new_in(alloc);
+        for r in body.typeck.closure_param_regions.iter() {
+            out.push((r.param, r.path, r.own, r.kind));
+        }
+        out
+    }
+
+    #[test]
+    fn front2_closure_param_regions_descend_into_fn_ptr_for_and_aliases() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let src = r#"#![no_core]
+pub struct Tx;
+pub type Edit<'x> = for<'b> fn(&'b mut Tx, &'x u8) -> &'static u8;
+
+pub fn elided_fn_ptr() {
+    let _ = |edit: fn(&mut Tx)| { let _ = edit; };
+}
+
+pub fn elided_ret_from_static_and_named<'a>() {
+    let _ = |f: fn(&'static u8) -> &u8, g: fn(&'a u8) -> &u8| { let _ = (f, g); };
+}
+
+pub fn hrtb_alias_and_tuple<'a>() {
+    let _ = |f: for<'b> fn(&'b u8, &'a u8) -> &'b u8, e: Edit<'a>, pair: (for<'b> fn(&'b u8), &'a u8)| {
+        let _ = (f, e, pair);
+    };
+}
+"#;
+        let step = |p: u64, c: u32| ClosureParamRegion::push_step(p, c).expect("step");
+        let root = ClosureParamRegion::ROOT;
+
+        // Elided `fn(&mut Tx)` (Tempo `retired_root_error_order_and_access_gas` shape):
+        // its parameter lifetime is late-bound by the fn pointer, so 0 free entries.
+        assert_eq!(&lower_regions(src, "elided_fn_ptr", alloc)[..], &[]);
+
+        // Return-type lifetime elision on bare fn pointers inherits the single input lifetime
+        // (`'static` or outer named `'a`) via `RegionSink::fn_ptr`.
+        assert_eq!(
+            &lower_regions(src, "elided_ret_from_static_and_named", alloc)[..],
+            &[
+                (0, step(root, 0), 0, WrittenRegion::Static),
+                (0, step(root, 1), 0, WrittenRegion::Static),
+                (1, step(root, 0), 0, WrittenRegion::Named),
+                (1, step(root, 1), 0, WrittenRegion::Named),
+            ]
+        );
+
+        // Higher-ranked `for<'b> fn(...)`, type alias expanding to `for<'b> fn(...)`, and tuple
+        // containing a `for<'b> fn(...)` followed by an outer `&'a u8`.
+        assert_eq!(
+            &lower_regions(src, "hrtb_alias_and_tuple", alloc)[..],
+            &[
+                (0, step(root, 1), 0, WrittenRegion::Named),
+                (1, step(root, 1), 0, WrittenRegion::Named),
+                (1, step(root, 2), 0, WrittenRegion::Static),
+                (2, step(root, 1), 0, WrittenRegion::Named),
+            ]
+        );
     }
 }
