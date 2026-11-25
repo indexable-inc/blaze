@@ -2354,14 +2354,39 @@ pub fn run<S: RecordSource + RecordFiles + Sync, B: Bind + Send>(
         return Err(RunModeError::NotBuilt { what: "run mode on x86-64: code records are AArch64 (blaze-code a64)" });
     }
     let raw = fd.as_raw_fd();
+    // Capture process `argc`/`argv` once before guest execution starts so eager initializers,
+    // lazy initializers (allocation-free in `table::resolve`), and `Handed::CMain` all share the
+    // exact same argument array.
+    let (argc, argv) = match handed {
+        Handed::Comptime(args) => (args.argc, args.argv),
+        Handed::CMain => process_args(),
+        Handed::Unit | Handed::Hosted(_) => {
+            if cfg!(target_os = "linux") {
+                process_args()
+            } else {
+                (0, core::ptr::null())
+            }
+        }
+    };
+    let eager_native = matches!(native, Some(NativeStart::Eager(_)));
+    let open_ask: crate::sys::Handoff<Option<RecordId>> = crate::sys::Handoff::new();
+    let open_ans: crate::sys::Handoff<Result<crate::native_lib::DlNatives, RunModeError>> = crate::sys::Handoff::new();
     let ready: crate::sys::Handoff<Ready> = crate::sys::Handoff::new();
+    let open_bridge = eager_native.then_some((&open_ask, &open_ans));
     std::thread::scope(|scope| {
         let control = std::thread::Builder::new()
             .name("blaze-run-control".to_owned())
-            .spawn_scoped(scope, || control(raw, source, entry, native, bind, alloc, &ready));
+            .spawn_scoped(scope, || control(raw, source, entry, native, bind, alloc, open_bridge, &ready));
         let Ok(control) = control else {
             return Err(RunModeError::Thread { what: "control" });
         };
+        if eager_native {
+            if let Some(record) = open_ask.take() {
+                // Run `dlopen` on the initial thread so any `DT_NEEDED` dependency constructors
+                // execute on the initial thread before `main`.
+                open_ans.put(crate::native_lib::DlNatives::open_record(source.folder(), record));
+            }
+        }
         // The wait "run mode: the entry's stub written": the control thread answers at once,
         // with the thunk or with why it has none (and then returns, so the scope's join ends).
         let (thunk, shared, loaded) = ready.take()?;
@@ -2373,9 +2398,14 @@ pub fn run<S: RecordSource + RecordFiles + Sync, B: Bind + Send>(
         // and before it is called (native_lib.rs step 5): an executable's order. They may call
         // Rust words: each is a slot's thunk, served by the control thread, already in its loop.
         if let Some(loaded) = loaded {
-            crate::native_lib::run_inits(loaded)?;
+            if let Err(why) = crate::native_lib::run_inits_with(loaded, argc, argv) {
+                drop(me);
+                shared.stop();
+                let _ = control.join();
+                return Err(why);
+            }
         }
-        let exit = call_entry(thunk, handed);
+        let exit = call_entry_with(thunk, handed, argc, argv);
         match (exit, end) {
             (EntryExit::Returned(status), End::Exit) => {
                 // The main thread stays a mutator to the end: `exit` runs the program's
@@ -2420,6 +2450,26 @@ pub fn run<S: RecordSource + RecordFiles + Sync, B: Bind + Send>(
     })
 }
 
+/// The process's own `argc` and `argv`, built in `blaze_launch::KEPT` for the process's life
+/// and shared by `Handed::CMain` and Linux native-library initializers (`native_lib::run_inits`).
+pub(crate) fn process_args() -> (core::ffi::c_int, *const *const core::ffi::c_char) {
+    use core::ffi::{c_char, c_int};
+    use std::os::unix::ffi::OsStringExt;
+
+    // The program's `argv`, leaked for its life (it is the process's).
+    let mut args: std::vec::Vec<*const c_char, _> = std::vec::Vec::new_in(blaze_launch::KEPT);
+    for arg in std::env::args_os() {
+        match std::ffi::CString::new(arg.into_vec()) {
+            Ok(it) => args.push(it.into_raw().cast_const()),
+            Err(_) => stop_with(format_args!("blaze: an argument of this process has a NUL in it")),
+        }
+    }
+    args.push(core::ptr::null());
+    let argc = c_int::try_from(args.len() - 1).unwrap_or(c_int::MAX);
+    let argv = args.leak().as_ptr();
+    (argc, argv)
+}
+
 /// How the program's entry ended when called from the launcher's run thread.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum EntryExit {
@@ -2444,9 +2494,17 @@ enum EntryExit {
 /// without invoking host `panic_unwind::__rust_panic_cleanup` (which would reject the guest's
 /// `CANARY` with `"fatal runtime error: Rust cannot catch foreign exceptions, aborting"`) or
 /// `_Unwind_DeleteException` (which would invoke guest `__rust_drop_panic`).
+#[cfg(test)]
 fn call_entry(thunk: u64, handed: Handed) -> EntryExit {
+    let (argc, argv) = match handed {
+        Handed::CMain => process_args(),
+        _ => (0, core::ptr::null()),
+    };
+    call_entry_with(thunk, handed, argc, argv)
+}
+
+fn call_entry_with(thunk: u64, handed: Handed, argc: core::ffi::c_int, argv: *const *const core::ffi::c_char) -> EntryExit {
     use core::ffi::{c_char, c_int, c_void};
-    use std::os::unix::ffi::OsStringExt;
 
     enum Call {
         Hosted { entry: extern "C-unwind" fn(*const c_void) -> c_int, table: *const c_void },
@@ -2496,17 +2554,6 @@ fn call_entry(thunk: u64, handed: Handed) -> EntryExit {
             Call::Unit { entry }
         }
         Handed::CMain => {
-            // The program's `argv`, leaked for its life (it is the process's).
-            let mut args: std::vec::Vec<*const c_char> = std::vec::Vec::new_in(blaze_launch::KEPT);
-            for arg in std::env::args_os() {
-                match std::ffi::CString::new(arg.into_vec()) {
-                    Ok(it) => args.push(it.into_raw().cast_const()),
-                    Err(_) => stop_with(format_args!("blaze: an argument of this process has a NUL in it")),
-                }
-            }
-            args.push(core::ptr::null());
-            let argc = (args.len() - 1) as c_int;
-            let argv = args.leak().as_ptr();
             // SAFETY: as above, for `extern "C-unwind" fn(c_int, *const *const c_char) -> c_int`.
             let entry: extern "C-unwind" fn(c_int, *const *const c_char) -> c_int =
                 unsafe { core::mem::transmute(entry_addr) };
@@ -2565,9 +2612,32 @@ enum NativeExpect {
     Lazy { record: RecordId },
 }
 
+/// Ensures the initial thread waiting on `open_ask` for an eager native library is always woken
+/// with `None` if `control` returns early before reaching `Act::Native`.
+struct EagerOpenGate<'a> {
+    bridge: Option<(&'a crate::sys::Handoff<Option<RecordId>>, &'a crate::sys::Handoff<Result<crate::native_lib::DlNatives, RunModeError>>)>,
+}
+
+impl<'a> EagerOpenGate<'a> {
+    fn open(&mut self, record: RecordId) -> Option<Result<crate::native_lib::DlNatives, RunModeError>> {
+        let (ask, ans) = self.bridge.take()?;
+        ask.put(Some(record));
+        Some(ans.take())
+    }
+}
+
+impl Drop for EagerOpenGate<'_> {
+    fn drop(&mut self) {
+        if let Some((ask, _)) = self.bridge.take() {
+            ask.put(None);
+        }
+    }
+}
+
 /// The control thread: maps the run's memory (its tables are in the run's allocator, which
 /// stays on this thread), starts the socket's reader, writes the entry's stub, then is the one
 /// writer of code and words for the life of the process.
+#[expect(clippy::too_many_arguments, reason = "receives the run's handoffs and eager native open bridge")]
 fn control<S: RecordSource + RecordFiles, B: Bind>(
     fd: i32,
     source: &S,
@@ -2575,10 +2645,13 @@ fn control<S: RecordSource + RecordFiles, B: Bind>(
     native: Option<NativeStart>,
     bind: B,
     alloc: blaze_own::SharedAlloc<'static>,
+    open_bridge: Option<(&crate::sys::Handoff<Option<RecordId>>, &crate::sys::Handoff<Result<crate::native_lib::DlNatives, RunModeError>>)>,
     ready: &crate::sys::Handoff<Ready>,
 ) {
     use crate::stub_wait::Answer;
     use crate::table::Event as Queued;
+
+    let mut open_gate = EagerOpenGate { bridge: open_bridge };
 
     // The one unwind registry, before any record is placed: the finder installed (macOS) and
     // its writer kept by this thread, the one writer of code and words.
@@ -2617,10 +2690,8 @@ fn control<S: RecordSource + RecordFiles, B: Bind>(
     // under `NativeStart::Eager`, once that library is loaded (`Act::Native` below; bounded by
     // `NATIVE_WAIT_MS`, rule 18).
     let mut expect = match native {
-        // Linux: the load is not built (NATIVE.md W5: the ELF image's initializers and its
-        // loader's checks); refused by name, never skipped.
-        Some(NativeStart::Eager(_)) if cfg!(not(target_os = "macos")) => {
-            return ready.put(Err(RunModeError::NotBuilt { what: "a program's native library on Linux (NATIVE.md W5)" }));
+        Some(NativeStart::Eager(_)) if cfg!(not(any(target_os = "macos", target_os = "linux"))) => {
+            return ready.put(Err(RunModeError::NotBuilt { what: "a program's native library on this platform (NATIVE.md W5)" }));
         }
         Some(NativeStart::Eager(record)) => NativeExpect::Eager { record, since: now() },
         None => NativeExpect::None,
@@ -2702,7 +2773,14 @@ fn control<S: RecordSource + RecordFiles, B: Bind>(
                 // stopped by name.
                 Act::Native { record } => match core::mem::replace(&mut expect, NativeExpect::None) {
                     NativeExpect::Eager { record: named, .. } if named == record => {
-                        match load_library(&mut mode, source, &mut memory) {
+                        let opened = match open_gate.open(record) {
+                            Some(Ok(natives)) => load_library_opened(&mut mode, natives, &mut memory),
+                            Some(Err(why)) => Err(why),
+                            None => Err(RunModeError::NotBuilt {
+                                what: "eager native library open bridge missing (cannot open on control thread)",
+                            }),
+                        };
+                        match opened {
                             Ok(loaded) => {
                                 ready.put(Ok((memory.thunk(entry), std::sync::Arc::clone(&shared), Some(loaded))));
                                 Ok(())
@@ -2711,10 +2789,13 @@ fn control<S: RecordSource + RecordFiles, B: Bind>(
                         }
                     }
                     NativeExpect::Lazy { record: named } if named == record => {
-                        if cfg!(not(target_os = "macos")) {
-                            Err(RunModeError::NotBuilt { what: "a program's native library on Linux (NATIVE.md W5)" })
+                        if cfg!(not(any(target_os = "macos", target_os = "linux"))) {
+                            Err(RunModeError::NotBuilt { what: "a program's native library on this platform (NATIVE.md W5)" })
                         } else {
                             match load_library(&mut mode, source, &mut memory) {
+                                Ok(loaded) if cfg!(target_os = "linux") && loaded.inits > 0 => Err(RunModeError::NotBuilt {
+                                    what: "lazy native library initializers on Linux (images with C initializers must load eagerly)",
+                                }),
                                 Ok(loaded) => {
                                     shared.publish_lazy_inits(loaded);
                                     Ok(())
@@ -2796,7 +2877,15 @@ mod thread_locals;
 ///   code record carries a type, so a mismatch is the program's own undefined behaviour, as
 ///   it is under a native link.
 fn load_library<S: RecordFiles, B: Bind>(mode: &mut RunMode<'_>, source: &S, memory: &mut NativeMemory<'_, B>) -> Result<crate::native_lib::Loaded, RunModeError> {
-    let mut natives = crate::native_lib::DlNatives::new(source.folder())?;
+    let natives = crate::native_lib::DlNatives::new(source.folder())?;
+    load_library_opened(mode, natives, memory)
+}
+
+fn load_library_opened<B: Bind>(
+    mode: &mut RunMode<'_>,
+    mut natives: crate::native_lib::DlNatives,
+    memory: &mut NativeMemory<'_, B>,
+) -> Result<crate::native_lib::Loaded, RunModeError> {
     let loaded = match mode.load_native(&mut natives, memory) {
         Ok(loaded) => loaded,
         Err(RunModeError::Native(NativeError::Open { record })) => return Err(RunModeError::Native(crate::native_lib::open_refused(record, natives.said()))),
@@ -2954,5 +3043,191 @@ mod position_tests {
         assert!(acts.is_empty(), "a bound slot needs no second placement");
         assert!(mode.position_inputs.is_empty(), "the repeated answer leaves no input");
         println!("run_mode: slots received lines 13 and 29 once; PositionOrder caught the one-off pairing");
+    }
+}
+
+/// Deterministic simulation proof of the two-`Handoff` eager-open protocol (`EagerOpenGate` +
+/// `ready` + `NullInit` control stop) between the initial thread and the control thread.
+#[cfg(test)]
+mod eager_open_dst {
+    use blaze_sim::{Broke, Config, Tape, check, control};
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Plant {
+        None,
+        /// Planted bug: omit `EagerOpenGate::drop`'s `open_ask.put(None)` on early control return.
+        SkipDropWake,
+        /// Planted bug: omit `shared.stop()` when `run_inits_with` returns `NullInit`.
+        SkipInitErrStop,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum InitStep {
+        WaitOpenAsk,
+        DoOpen,
+        WaitReady,
+        RunInits,
+        JoinControl,
+        Done,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum CtrlStep {
+        Setup,
+        WaitOpenAns,
+        LoadNative,
+        EventLoop,
+        Done,
+    }
+
+    fn run_case(tape: &Tape, plant: Plant) -> Result<(), Broke> {
+        let early_fail = tape.below(3, "early_fail") == 0;
+        let open_fails = tape.below(3, "open_fails") == 0;
+        let load_fails = tape.below(3, "load_fails") == 0;
+        let init_fails = tape.below(3, "init_fails") == 0;
+
+        let mut open_ask: Option<Option<u32>> = None;
+        let mut open_ans: Option<bool> = None;
+        let mut ready: Option<bool> = None;
+        let mut stop_sent = false;
+        let mut gate_armed = true;
+
+        let mut init_step = InitStep::WaitOpenAsk;
+        let mut ctrl_step = CtrlStep::Setup;
+
+        let mut opened_on_init = 0u32;
+        let mut loaded_after_open = false;
+        let mut inits_after_load = false;
+
+        for _ in 0..64 {
+            if init_step == InitStep::Done && ctrl_step == CtrlStep::Done {
+                if !early_fail && opened_on_init != 1 {
+                    return Err(Broke::Oracle("dlopen must run once on initial thread when control reaches Act::Native".into()));
+                }
+                if !early_fail && !open_fails && !loaded_after_open {
+                    return Err(Broke::Oracle("load_native must follow initial-thread dlopen".into()));
+                }
+                if !early_fail && !open_fails && !load_fails && !inits_after_load {
+                    return Err(Broke::Oracle("run_inits must follow load_native".into()));
+                }
+                return Ok(());
+            }
+
+            let init_ready = match init_step {
+                InitStep::WaitOpenAsk => open_ask.is_some(),
+                InitStep::DoOpen | InitStep::RunInits => true,
+                InitStep::WaitReady => ready.is_some(),
+                InitStep::JoinControl => ctrl_step == CtrlStep::Done,
+                InitStep::Done => false,
+            };
+            let ctrl_ready = match ctrl_step {
+                CtrlStep::Setup | CtrlStep::LoadNative => true,
+                CtrlStep::WaitOpenAns => open_ans.is_some(),
+                CtrlStep::EventLoop => stop_sent,
+                CtrlStep::Done => false,
+            };
+
+            if !init_ready && !ctrl_ready {
+                return Err(Broke::Oracle("deadlock between initial thread and control thread".into()));
+            }
+
+            let pick_init = match (init_ready, ctrl_ready) {
+                (true, false) => true,
+                (false, true) => false,
+                (true, true) => tape.below(2, "turn") == 0,
+                (false, false) => unreachable!(),
+            };
+
+            if pick_init {
+                match init_step {
+                    InitStep::WaitOpenAsk => {
+                        let asked = open_ask.take();
+                        init_step = match asked {
+                            Some(Some(_)) => InitStep::DoOpen,
+                            Some(None) => InitStep::WaitReady,
+                            None => return Err(Broke::Oracle("missing open_ask".into())),
+                        };
+                    }
+                    InitStep::DoOpen => {
+                        opened_on_init += 1;
+                        open_ans = Some(!open_fails);
+                        init_step = InitStep::WaitReady;
+                    }
+                    InitStep::WaitReady => match ready.take() {
+                        Some(true) => init_step = InitStep::RunInits,
+                        Some(false) => init_step = InitStep::JoinControl,
+                        None => return Err(Broke::Oracle("missing ready".into())),
+                    },
+                    InitStep::RunInits => {
+                        inits_after_load = loaded_after_open;
+                        if init_fails {
+                            if plant != Plant::SkipInitErrStop {
+                                stop_sent = true;
+                            }
+                            init_step = InitStep::JoinControl;
+                        } else {
+                            stop_sent = true;
+                            init_step = InitStep::JoinControl;
+                        }
+                    }
+                    InitStep::JoinControl => {
+                        init_step = InitStep::Done;
+                    }
+                    InitStep::Done => {}
+                }
+            } else {
+                match ctrl_step {
+                    CtrlStep::Setup => {
+                        if early_fail {
+                            // Control exits early before Act::Native: EagerOpenGate::drop wakes initial thread.
+                            if gate_armed && plant != Plant::SkipDropWake {
+                                gate_armed = false;
+                                open_ask = Some(None);
+                            }
+                            ready = Some(false);
+                            ctrl_step = CtrlStep::Done;
+                        } else {
+                            gate_armed = false;
+                            open_ask = Some(Some(1));
+                            ctrl_step = CtrlStep::WaitOpenAns;
+                        }
+                    }
+                    CtrlStep::WaitOpenAns => match open_ans.take() {
+                        Some(true) => ctrl_step = CtrlStep::LoadNative,
+                        Some(false) => {
+                            ready = Some(false);
+                            ctrl_step = CtrlStep::Done;
+                        }
+                        None => return Err(Broke::Oracle("missing open_ans".into())),
+                    },
+                    CtrlStep::LoadNative => {
+                        loaded_after_open = opened_on_init == 1;
+                        if load_fails {
+                            ready = Some(false);
+                            ctrl_step = CtrlStep::Done;
+                        } else {
+                            ready = Some(true);
+                            ctrl_step = CtrlStep::EventLoop;
+                        }
+                    }
+                    CtrlStep::EventLoop => {
+                        ctrl_step = CtrlStep::Done;
+                    }
+                    CtrlStep::Done => {}
+                }
+            }
+        }
+        Err(Broke::Oracle("protocol did not finish within step bound".into()))
+    }
+
+    #[test]
+    fn eager_open_handoff_is_deadlock_free_and_ordered() {
+        check(Config::cases(4_000), |tape| run_case(tape, Plant::None));
+    }
+
+    #[test]
+    fn control_missing_drop_wake_and_missing_init_err_stop_are_caught() {
+        control(Config::cases(1_000), Plant::None, Plant::SkipDropWake, "deadlock between initial thread and control thread", run_case);
+        control(Config::cases(1_000), Plant::None, Plant::SkipInitErrStop, "deadlock between initial thread and control thread", run_case);
     }
 }
