@@ -154,7 +154,11 @@ pub(crate) fn load_verified_by_id<D: Driver>(
     if lend.tag != TestIndex::TAG {
         return Err(corrupt("verified cache record has unexpected store tag"));
     }
-    decode_verified(lend.bytes, certificate, into).ok_or_else(|| corrupt("malformed BZTV verified cache payload"))
+    match decode_verified_status(lend.bytes, certificate, into) {
+        VerifiedDecode::Loaded(n) => Ok(n),
+        VerifiedDecode::StaleCertificate => Ok(0),
+        VerifiedDecode::Corrupt => Err(corrupt("malformed BZTV verified cache payload")),
+    }
 }
 
 /// Persists and pins verified `(instance_key, content_key)` pairs for a workspace binary identity
@@ -1456,38 +1460,68 @@ fn encode_verified(
     }
 }
 
-fn decode_verified(
+enum VerifiedDecode {
+    Loaded(usize),
+    StaleCertificate,
+    Corrupt,
+}
+
+fn decode_verified_status(
     bytes: &[u8],
     certificate: &crate::start_list::Certificate,
     into: &mut Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
-) -> Option<usize> {
+) -> VerifiedDecode {
     let header_len = 4 + 4 + 32 + 4;
     if bytes.len() < header_len || bytes.get(0..4) != Some(&VERIFIED_MAGIC) {
-        return None;
+        return VerifiedDecode::Corrupt;
     }
-    let version = u32::from_le_bytes(bytes.get(4..8)?.try_into().ok()?);
-    if version != VERIFIED_VERSION {
-        return None;
+    let Some(version_bytes) = bytes.get(4..8).and_then(|s| <[u8; 4]>::try_from(s).ok()) else {
+        return VerifiedDecode::Corrupt;
+    };
+    if u32::from_le_bytes(version_bytes) != VERIFIED_VERSION {
+        return VerifiedDecode::Corrupt;
+    }
+    let Some(count_bytes) = bytes.get(40..44).and_then(|s| <[u8; 4]>::try_from(s).ok()) else {
+        return VerifiedDecode::Corrupt;
+    };
+    let Ok(count) = usize::try_from(u32::from_le_bytes(count_bytes)) else {
+        return VerifiedDecode::Corrupt;
+    };
+    let Some(payload) = count.checked_mul(64) else {
+        return VerifiedDecode::Corrupt;
+    };
+    if bytes.len().checked_sub(header_len) != Some(payload) {
+        return VerifiedDecode::Corrupt;
     }
     if bytes.get(8..40) != Some(certificate.bytes().as_slice()) {
-        return None;
-    }
-    let count = usize::try_from(u32::from_le_bytes(bytes.get(40..44)?.try_into().ok()?)).ok()?;
-    let payload = count.checked_mul(64)?;
-    if bytes.len().checked_sub(header_len)? != payload {
-        return None;
+        return VerifiedDecode::StaleCertificate;
     }
     let mut at = header_len;
     let mut loaded = 0usize;
     for _ in 0..count {
-        let key: [u8; 32] = bytes.get(at..at + 32)?.try_into().ok()?;
-        let under: [u8; 32] = bytes.get(at + 32..at + 64)?.try_into().ok()?;
+        let Some(key) = bytes.get(at..at + 32).and_then(|s| <[u8; 32]>::try_from(s).ok()) else {
+            return VerifiedDecode::Corrupt;
+        };
+        let Some(under) = bytes.get(at + 32..at + 64).and_then(|s| <[u8; 32]>::try_from(s).ok()) else {
+            return VerifiedDecode::Corrupt;
+        };
         at += 64;
         if into.insert((key, under)) {
             loaded += 1;
         }
     }
-    Some(loaded)
+    VerifiedDecode::Loaded(loaded)
+}
+
+fn decode_verified(
+    bytes: &[u8],
+    certificate: &crate::start_list::Certificate,
+    into: &mut Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
+) -> Option<usize> {
+    match decode_verified_status(bytes, certificate, into) {
+        VerifiedDecode::Loaded(n) => Some(n),
+        VerifiedDecode::StaleCertificate | VerifiedDecode::Corrupt => None,
+    }
 }
 
 fn load_suite_state<'a, 'm, D: Driver>(lent: &'m Lent<D, StoreAlloc>, suite: ContentId, alloc: Alloc<'a>) -> Option<LoadedState<'a, 'm>> {

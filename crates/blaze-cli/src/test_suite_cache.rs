@@ -1089,6 +1089,24 @@ impl<'h> SuiteCache<'h> {
         tally: &mut Tally,
         scratch_alloc: Alloc<'_>,
     ) -> Result<usize, ParentError> {
+        self.prepublish_warm_bounded(test_entry, head, child, needs, out, tally, usize::MAX, scratch_alloc)
+    }
+
+    /// Bounded variant of [`Self::prepublish_warm`] that stops before `out.len()` exceeds
+    /// `max_out_len`, advancing `child.warm_cursor` only through entries actually processed so any
+    /// remaining warm functions are published in later turns or served on demand (rule 18).
+    #[expect(clippy::too_many_arguments, reason = "pre-publishes cached suite entries into one impure child's wire buffer under a byte cap")]
+    pub(crate) fn prepublish_warm_bounded<A: Allocator>(
+        &self,
+        test_entry: [u8; 32],
+        head: StartHead,
+        child: &mut ChildSent<'_>,
+        needs: &mut Needs<'_>,
+        out: &mut crate::run_parent::WireOut<A>,
+        tally: &mut Tally,
+        max_out_len: usize,
+        scratch_alloc: Alloc<'_>,
+    ) -> Result<usize, ParentError> {
         let start = child.warm_cursor;
         let total = self.warm_order.len();
         if start >= total {
@@ -1100,7 +1118,12 @@ impl<'h> SuiteCache<'h> {
         let mut inline = Vec::new_in(scratch_alloc);
         let mut entered = Vec::new_in(scratch_alloc);
         let mut published = 0usize;
+        let mut next_cursor = start;
         for &sym in self.warm_order.iter().skip(start) {
+            if out.len() >= max_out_len {
+                break;
+            }
+            next_cursor += 1;
             if sym.0 == test_entry || needs.is_settled(&sym) {
                 continue;
             }
@@ -1124,6 +1147,12 @@ impl<'h> SuiteCache<'h> {
             )? else {
                 continue;
             };
+            // Check estimated additional bytes before writing so one large entry cannot breach the cap.
+            let inline_bytes: usize = inline.iter().map(|(_, b)| b.len()).sum();
+            if published > 0 && out.len().saturating_add(inline_bytes) >= max_out_len {
+                next_cursor -= 1;
+                break;
+            }
             if needs.publish_precomputed(
                 sym,
                 entry.record,
@@ -1140,7 +1169,7 @@ impl<'h> SuiteCache<'h> {
                 tally.found += rows;
             }
         }
-        child.warm_cursor = total;
+        child.warm_cursor = next_cursor;
         Ok(published)
     }
 

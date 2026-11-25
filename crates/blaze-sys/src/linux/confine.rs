@@ -708,8 +708,103 @@ fn make_prefixed_cstr<'a>(buf: &'a mut [u8; 512], prefix: &[u8], name: &[u8]) ->
     CStr::from_bytes_with_nul(buf.get(..=total)?).ok()
 }
 
+/// Mirrors every child entry of `src_dir` into `dst_dir` (which must be an existing directory on
+/// the new tmpfs root), skipping `skip_a` and `skip_b` (and `.` / `..`). Fails closed on mount
+/// errors so resource limits cannot silently leave empty placeholders in the pivoted root.
+#[blaze::noalloc]
+#[blaze::nopanic]
+fn mirror_dir_into(
+    src_path: &CStr,
+    src_prefix: &[u8],
+    dst_path: &CStr,
+    dst_prefix: &[u8],
+    skip_a: &[u8],
+    skip_b: &[u8],
+    skip_mount_dir: &[u8],
+) -> Result<bool, TestConfineError> {
+    let dir_flags = OpenFlags::READ.with(OpenFlags::DIRECTORY).with(OpenFlags::CLOSE_ON_EXEC);
+    let src_fd = match openat(CWD, Path::new(src_path), dir_flags, 0) {
+        Ok(fd) => fd,
+        Err(Errno::NoEnt | Errno::NotDir) => return Ok(false),
+        Err(errno) => return Err(TestConfineError::OpenPath { which: "open mirror src", errno }),
+    };
+    let dst_fd = openat(CWD, Path::new(dst_path), dir_flags, 0)
+        .map_err(|errno| TestConfineError::OpenPath { which: "open mirror dst", errno })?;
+
+    let mut dents = [0u8; 4096];
+    let mut name_buf = [0u8; 512];
+    let mut src_buf = [0u8; 512];
+    let mut dst_buf = [0u8; 512];
+    let mut link_buf = [0u8; 512];
+    let mut link_c_buf = [0u8; 512];
+    let mut saw_skip_a = false;
+    loop {
+        let entries = getdents64(src_fd.fd(), &mut dents)
+            .map_err(|errno| TestConfineError::Mount { which: "getdents64 mirror", errno })?;
+        let mut any = false;
+        for entry in entries {
+            any = true;
+            let name = entry.name;
+            if name == b"." || name == b".." || name == skip_b {
+                continue;
+            }
+            if name == skip_a {
+                saw_skip_a = true;
+                continue;
+            }
+            let Some(name_c) = make_prefixed_cstr(&mut name_buf, b"", name) else {
+                return Err(TestConfineError::Mount { which: "mirror name too long", errno: Errno::NameTooLong });
+            };
+            let Some(src_c) = make_prefixed_cstr(&mut src_buf, src_prefix, name) else {
+                return Err(TestConfineError::Mount { which: "mirror src too long", errno: Errno::NameTooLong });
+            };
+            let Some(dst_c) = make_prefixed_cstr(&mut dst_buf, dst_prefix, name) else {
+                return Err(TestConfineError::Mount { which: "mirror dst too long", errno: Errno::NameTooLong });
+            };
+            match entry.kind {
+                EntryKind::Link => {
+                    let target = readlinkat(src_fd.fd(), Path::new(name_c), &mut link_buf)
+                        .map_err(|errno| TestConfineError::Mount { which: "readlink mirror", errno })?;
+                    let Some(target_c) = make_prefixed_cstr(&mut link_c_buf, b"", target) else {
+                        return Err(TestConfineError::Mount { which: "mirror symlink too long", errno: Errno::NameTooLong });
+                    };
+                    symlinkat(Path::new(target_c), dst_fd.fd(), Path::new(name_c))
+                        .map_err(|errno| TestConfineError::Mount { which: "symlink mirror", errno })?;
+                }
+                EntryKind::Dir => {
+                    mkdirat(dst_fd.fd(), Path::new(name_c), 0o755)
+                        .map_err(|errno| TestConfineError::Mount { which: "mkdir mirror", errno })?;
+                    if name != skip_mount_dir {
+                        mount(
+                            Some(Path::new(src_c)),
+                            Path::new(dst_c),
+                            None,
+                            MountFlags::BIND.with(MountFlags::RECURSIVE),
+                            None,
+                        )
+                        .map_err(|errno| TestConfineError::Mount { which: "bind mirror dir", errno })?;
+                    }
+                }
+                EntryKind::Regular => {
+                    let create_flags = OpenFlags::CREATE.with(OpenFlags::WRITE).with(OpenFlags::CLOSE_ON_EXEC);
+                    openat(dst_fd.fd(), Path::new(name_c), create_flags, 0o600)
+                        .map_err(|errno| TestConfineError::Mount { which: "create mirror file", errno })?;
+                    mount(Some(Path::new(src_c)), Path::new(dst_c), None, MountFlags::BIND, None)
+                        .map_err(|errno| TestConfineError::Mount { which: "bind mirror file", errno })?;
+                }
+                _ => {}
+            }
+        }
+        if !any {
+            break;
+        }
+    }
+    Ok(saw_skip_a)
+}
+
 /// Switches the sandbox's root mount to a minimal private `tmpfs` mirroring the host's top-level
-/// root entries while bind-mounting `bins_tree` read-only at `/target/debug/bin` so compile-time
+/// root entries while overlaying ONLY `/target/debug/bin` with read-only `bins_tree` (preserving
+/// any existing host `/target` and `/target/debug` entries) so compile-time
 /// `env!("CARGO_BIN_EXE_<name>")` paths exist as real, kernel-visible executable files.
 #[blaze::noalloc]
 #[blaze::nopanic]
@@ -724,76 +819,33 @@ fn pivot_root_with_bins(bins_tree: LocalFd) -> Result<(), TestConfineError> {
     mkdirat(CWD, Path::new(c"/tmp/nr/.old"), 0o755)
         .map_err(|errno| TestConfineError::Mount { which: "mkdir /tmp/nr/.old", errno })?;
 
-    let dir_flags = OpenFlags::READ.with(OpenFlags::DIRECTORY).with(OpenFlags::CLOSE_ON_EXEC);
-    let root_fd = openat(CWD, Path::new(c"/"), dir_flags, 0)
-        .map_err(|errno| TestConfineError::OpenPath { which: "open /", errno })?;
-    let nr_fd = openat(CWD, Path::new(c"/tmp/nr"), dir_flags, 0)
-        .map_err(|errno| TestConfineError::OpenPath { which: "open /tmp/nr", errno })?;
-
-    let mut dents = [0u8; 4096];
-    let mut name_buf = [0u8; 512];
-    let mut src_buf = [0u8; 512];
-    let mut dst_buf = [0u8; 512];
-    let mut link_buf = [0u8; 512];
-    let mut link_c_buf = [0u8; 512];
-    loop {
-        let entries = getdents64(root_fd.fd(), &mut dents)
-            .map_err(|errno| TestConfineError::Mount { which: "getdents64 /", errno })?;
-        let mut any = false;
-        for entry in entries {
-            any = true;
-            let name = entry.name;
-            if name == b"." || name == b".." || name == b"target" || name == b".old" {
-                continue;
-            }
-            let Some(name_c) = make_prefixed_cstr(&mut name_buf, b"", name) else { continue };
-            let Some(src_c) = make_prefixed_cstr(&mut src_buf, b"/", name) else { continue };
-            let Some(dst_c) = make_prefixed_cstr(&mut dst_buf, b"/tmp/nr/", name) else { continue };
-            match entry.kind {
-                EntryKind::Link => {
-                    if let Ok(target) = readlinkat(root_fd.fd(), Path::new(name_c), &mut link_buf)
-                        && let Some(target_c) = make_prefixed_cstr(&mut link_c_buf, b"", target)
-                    {
-                        let _ = symlinkat(Path::new(target_c), nr_fd.fd(), Path::new(name_c));
-                    }
-                }
-                EntryKind::Dir => {
-                    if mkdirat(nr_fd.fd(), Path::new(name_c), 0o755).is_ok() && name != b"tmp" {
-                        let _ = mount(
-                            Some(Path::new(src_c)),
-                            Path::new(dst_c),
-                            None,
-                            MountFlags::BIND.with(MountFlags::RECURSIVE),
-                            None,
-                        );
-                    }
-                }
-                EntryKind::Regular => {
-                    let create_flags = OpenFlags::CREATE.with(OpenFlags::WRITE).with(OpenFlags::CLOSE_ON_EXEC);
-                    if openat(nr_fd.fd(), Path::new(name_c), create_flags, 0o600).is_ok() {
-                        let _ = mount(Some(Path::new(src_c)), Path::new(dst_c), None, MountFlags::BIND, None);
-                    }
-                }
-                _ => {}
-            }
-        }
-        if !any {
-            break;
-        }
-    }
-
-    mkdirat(nr_fd.fd(), Path::new(c"target"), 0o755)
+    let had_target = mirror_dir_into(c"/", b"/", c"/tmp/nr", b"/tmp/nr/", b"target", b".old", b"tmp")?;
+    mkdirat(CWD, Path::new(c"/tmp/nr/target"), 0o755)
         .map_err(|errno| TestConfineError::Mount { which: "mkdir /target", errno })?;
+    let had_debug = if had_target {
+        mirror_dir_into(c"/target", b"/target/", c"/tmp/nr/target", b"/tmp/nr/target/", b"debug", b"", b"")?
+    } else {
+        false
+    };
     mkdirat(CWD, Path::new(c"/tmp/nr/target/debug"), 0o755)
         .map_err(|errno| TestConfineError::Mount { which: "mkdir /target/debug", errno })?;
+    if had_debug {
+        let _ = mirror_dir_into(
+            c"/target/debug",
+            b"/target/debug/",
+            c"/tmp/nr/target/debug",
+            b"/tmp/nr/target/debug/",
+            b"bin",
+            b"",
+            b"",
+        )?;
+    }
     mkdirat(CWD, Path::new(c"/tmp/nr/target/debug/bin"), 0o755)
         .map_err(|errno| TestConfineError::Mount { which: "mkdir /target/debug/bin", errno })?;
     move_mount_empty("move_mount /target/debug/bin", &bins_tree, c"/tmp/nr/target/debug/bin")?;
     drop(bins_tree);
     mount_setattr_ro("mount_setattr /target/debug/bin ro", c"/tmp/nr/target/debug/bin", true)?;
 
-    drop(root_fd);
-    drop(nr_fd);
     pivot_root(Path::new(c"/tmp/nr"), Path::new(c"/tmp/nr/.old"))
         .map_err(|errno| TestConfineError::Mount { which: "pivot_root", errno })?;
     chdir(Path::new(c"/")).map_err(|errno| TestConfineError::Mount { which: "chdir /", errno })?;

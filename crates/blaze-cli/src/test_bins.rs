@@ -696,17 +696,19 @@ fn service_conn_read<'a, 'h>(
         }
         conn.needs.name_personality(head.personality, &mut conn.outbox).map_err(make_err)?;
         // Pre-publish warm functions already compiled by earlier spawns ONLY when this binary is
-        // already impure (native image linked); pure binaries record exact entered functions.
+        // already impure (native image linked); bounded strictly by `MAX_OUTBOX` (rule 18).
         if conn.keep.is_err() {
+            let cap = conn.out_at.saturating_add(MAX_OUTBOX);
             bin.suite_cache
                 .borrow()
-                .prepublish_warm(
+                .prepublish_warm_bounded(
                     bin.entry_sym,
                     head,
                     &mut conn.child_sent,
                     &mut conn.needs,
                     &mut conn.outbox,
                     &mut conn.tally,
+                    cap,
                     alloc,
                 )
                 .map_err(make_err)?;
@@ -800,15 +802,17 @@ fn service_conn_read<'a, 'h>(
                         && conn.child_sent.warm_cursor < warm_len
                         && (was_keep_ok || warm_len.saturating_sub(conn.child_sent.warm_cursor) >= 256)
                     {
+                        let cap = conn.out_at.saturating_add(MAX_OUTBOX);
                         bin.suite_cache
                             .borrow()
-                            .prepublish_warm(
+                            .prepublish_warm_bounded(
                                 bin.entry_sym,
                                 bin.roots.head(),
                                 &mut conn.child_sent,
                                 &mut conn.needs,
                                 &mut conn.outbox,
                                 &mut conn.tally,
+                                cap,
                                 alloc,
                             )
                             .map_err(make_err)?;
