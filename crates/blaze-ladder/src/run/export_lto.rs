@@ -1,11 +1,13 @@
 //! Whole-program demand-driven cross-function LIR inlining and LTO for `blaze export`.
 //!
 //! 1. Starts from workspace seed instances already reached by `Walk` and performs a bounded BFS
-//!    (depth <= 12, up to 1536 bodies) following normal-block non-cold `Op::Call` edges first
-//!    (and `Op::Invoke` edges only with remaining budget) into inlineable callees (`core`/`std`/
-//!    dependency helpers with `<= 384` raw LIR instructions, or `#[inline]` / `#[inline(always)]`
-//!    up to `640` raw instructions; `#[cold]`, `-> !` noreturn, and `#[inline(never)]` callees
-//!    are skipped).
+//!    (default `depth <= 16`, up to `4096` bodies) following normal-block non-cold `Op::Call` edges
+//!    first (and `Op::Invoke` edges only with remaining budget) into reachable non-cold,
+//!    non-noreturn callees and library callers (up to `max_caller_insts`, default `2048` raw LIR
+//!    instructions, including `#[inline(never)]` hot algorithms whose own small callees inline into
+//!    them while `lto_optimize_module` continues respecting `Inline::Never` and
+//!    `policy.max_callee_insts` when deciding what to inline into callers). Cold (unless
+//!    `#[inline(always)]`) and `-> !` noreturn bodies stay excluded.
 //! 2. Runs deterministic bottom-up Tarjan SCC ThinLTO (`blaze_lir::lto::lto_optimize_module`) over
 //!    the gathered module so iterator loops (`Range::into_iter`/`next`, `slice::Iter::next`),
 //!    slice indexing (`Index::index`), wrapping/checked arithmetic, and workspace helpers inline
@@ -58,14 +60,19 @@ pub struct ExportLtoOpts {
     pub max_callee_insts: usize,
     /// Maximum LIR instruction count for keeping a `#[inline(always)]` non-workspace callee.
     pub max_always_inline_insts: usize,
+    /// Maximum LIR instruction count for keeping a reachable non-cold library caller (e.g.
+    /// `core::slice::sort::drift::sort`, `hashbrown::RawTable::find`) in the LTO module so its
+    /// own small callees inline bottom-up into it and it emits with host-ISA SOTA codegen.
+    pub max_caller_insts: usize,
     /// Cross-function inlining policy handed to `blaze_lir::lto::lto_optimize_module`.
     pub policy: InlinePolicy,
 }
 
 impl ExportLtoOpts {
     /// Release export defaults: bounded demand-driven BFS (`depth <= 16`, `<= 4096` bodies,
-    /// raw non-workspace callees `<= 384` LIR insts / `#[inline]` & `#[inline(always)]` `<= 640`)
-    /// and aggressive cross-function inlining.
+    /// non-cold library callers `<= 2048` LIR insts) and aggressive cross-function inlining
+    /// (`lto_optimize_module` enforces `Inline::Never` and `policy.max_callee_insts` when
+    /// deciding whether a body may be inlined into its own callers).
     pub fn for_export(isa: Isa) -> Self {
         Self {
             machine: export_machine(isa),
@@ -73,6 +80,7 @@ impl ExportLtoOpts {
             max_bodies: 4096,
             max_callee_insts: 384,
             max_always_inline_insts: 640,
+            max_caller_insts: 2048,
             policy: InlinePolicy {
                 cost_threshold: 120,
                 max_callee_insts: 256,
@@ -812,6 +820,40 @@ fn lower_ieee_libm_calls<'a>(built: &mut BuiltLir<'a>, machine: Machine, alloc: 
 }
 
 /// Runs demand-driven whole-program cross-function LIR inlining and host-ISA SOTA emission over
+/// Decides whether a non-workspace callee reached during demand-driven export LTO BFS enters
+/// the LTO module. Non-cold, non-noreturn library callers up to `opts.max_caller_insts` (including
+/// `#[inline(never)]` hot algorithms such as `core::slice::sort::drift::sort`) are kept so their
+/// own small callees inline bottom-up into them and they emit with host-ISA SOTA codegen, while
+/// `lto_optimize_module` continues enforcing `Inline::Never` and `opts.policy.max_callee_insts`
+/// when deciding whether to inline them into their own callers. Cold and noreturn bodies stay out
+/// of the module unless explicitly marked `#[inline(always)]`.
+fn should_keep_non_seed(
+    attrs: u32,
+    insts: usize,
+    in_tiny_reserve: bool,
+    tiny_leaf_insts: usize,
+    opts: &ExportLtoOpts,
+) -> bool {
+    let is_cold = (attrs & FnAttrs::COLD) != 0;
+    let is_noreturn = (attrs & FnAttrs::NORETURN) != 0;
+    let inline_attr = FnAttrs(attrs).inline();
+    if is_noreturn || (is_cold && inline_attr != Inline::Always) {
+        return false;
+    }
+    if in_tiny_reserve {
+        return matches!(inline_attr, Inline::Always | Inline::Hint) && insts <= tiny_leaf_insts;
+    }
+    let keep_limit = opts
+        .max_caller_insts
+        .max(if inline_attr == Inline::Always || inline_attr == Inline::Hint {
+            opts.max_always_inline_insts
+        } else {
+            opts.max_callee_insts
+        });
+    insts <= keep_limit
+}
+
+/// Whole-program demand-driven cross-function LIR inlining and host-ISA SOTA emission over
 /// workspace seed rows and their small inlineable callees.
 #[expect(clippy::too_many_arguments, reason = "whole-program export LTO over walk, seeds, gate, maker, options, output allocator, and scratch allocator")]
 pub fn optimize_export_workspace<'a, 's, 'n, G, T>(
@@ -913,26 +955,8 @@ where
         }
 
         let view = built.func.view();
-        if !is_seed {
-            let is_cold = (view.head.attrs & FnAttrs::COLD) != 0;
-            let is_noreturn = (view.head.attrs & FnAttrs::NORETURN) != 0;
-            let inline_attr = FnAttrs(view.head.attrs).inline();
-            let insts = view.len();
-            let keep = if is_noreturn
-                || inline_attr == Inline::Never
-                || (is_cold && inline_attr != Inline::Always)
-            {
-                false
-            } else if in_tiny_reserve {
-                matches!(inline_attr, Inline::Always | Inline::Hint) && insts <= TINY_INLINE_LEAF_INSTS
-            } else if inline_attr == Inline::Always || inline_attr == Inline::Hint {
-                insts <= opts.max_always_inline_insts
-            } else {
-                insts <= opts.max_callee_insts
-            };
-            if !keep {
-                continue;
-            }
+        if !is_seed && !should_keep_non_seed(view.head.attrs, view.len(), in_tiny_reserve, TINY_INLINE_LEAF_INSTS, &opts) {
+            continue;
         }
 
         if depth < opts.max_depth {
@@ -1446,5 +1470,32 @@ mod tests {
 
         let mut sqrt_x64 = build_c_call_fn("sqrtf", &[Ty::F32], Ty::F32, Variadic::No, alloc);
         assert!(!lower_ieee_libm_calls(&mut sqrt_x64, x64_machine(Machine::FMA | Machine::AVX2), alloc));
+    }
+
+    #[test]
+    fn non_seed_filter_keeps_non_cold_library_callers_and_excludes_cold_and_noreturn() {
+        let opts = ExportLtoOpts::for_export(Isa { lse: true, os: blaze_emit::Os::Linux });
+        let no_inline = FnAttrs(0).with_inline(Inline::Never).0;
+        let always_inline = FnAttrs(0).with_inline(Inline::Always).0;
+        let hint_inline = FnAttrs(0).with_inline(Inline::Hint).0;
+
+        // Non-cold library callers (even `#[inline(never)]` sorting/hashing kernels) up to
+        // `max_caller_insts` enter the module so their own small callees inline into them.
+        assert!(should_keep_non_seed(0, 900, false, 24, &opts));
+        assert!(should_keep_non_seed(no_inline, 1500, false, 24, &opts));
+        assert!(!should_keep_non_seed(0, opts.max_caller_insts + 1, false, 24, &opts));
+
+        // Cold and noreturn bodies stay excluded (except explicitly `#[inline(always)]` cold).
+        assert!(!should_keep_non_seed(FnAttrs::COLD, 16, false, 24, &opts));
+        assert!(!should_keep_non_seed(FnAttrs::COLD | no_inline, 16, false, 24, &opts));
+        assert!(!should_keep_non_seed(FnAttrs::NORETURN, 16, false, 24, &opts));
+        assert!(!should_keep_non_seed(FnAttrs::NORETURN | always_inline, 16, false, 24, &opts));
+        assert!(should_keep_non_seed(FnAttrs::COLD | always_inline, 16, false, 24, &opts));
+
+        // Tiny-reserve tail admits only `<= 24`-inst `#[inline]` / `#[inline(always)]` leaves.
+        assert!(should_keep_non_seed(hint_inline, 24, true, 24, &opts));
+        assert!(should_keep_non_seed(always_inline, 12, true, 24, &opts));
+        assert!(!should_keep_non_seed(0, 12, true, 24, &opts));
+        assert!(!should_keep_non_seed(hint_inline, 25, true, 24, &opts));
     }
 }

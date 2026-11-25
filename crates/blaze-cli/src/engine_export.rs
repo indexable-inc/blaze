@@ -579,6 +579,9 @@ fn export_program<'f>(
     let bump = erased.bump();
 
     watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Crates));
+    // Ensure the store is mapped before reading records: on a warm certificate hit, `engine_check`
+    // skipped pool tasks and never triggered `Store::map_all`.
+    standing.store.map_all(cx)?;
     let mut read = EngineRecords::new(heap.alloc());
     let seen = TreesSeen::default();
     let pack_dirs = SyncPackDirs::default();
@@ -677,50 +680,53 @@ fn export_program<'f>(
     let root_count = roots.len();
 
     let mut next_row = 0usize;
-    while next_row < walk.len() {
-        let row = next_row;
-        next_row += 1;
-        let tabled = walk.tabled(row);
-        let symbol = walk.symbol(row);
-        let kind = walk.kind(row);
-        let proof = ids.runnable(tabled).map_err(|why| {
-            let krate = crate_of_item(list, tabled, heap.alloc());
-            box_err(ExportCliError::NotChecked { krate, function: tabled, symbol: symbol.0, row, reached: walk.len(), compiled, cached, why }, heap)
-        })?;
-        match walk.one(row, &ids, &mut codes, &builder, &builder.producer, &mut maker, &proof, &body_ids::EntryForm, MOST_WALKED, &mut scratch) {
-            Ok(one) => match one.stepped {
-                Stepped::Found(key) => {
-                    cached += 1;
-                    outcomes.push(RowOutcome::Keyed(key));
+    {
+        let _walk_span = cx.span("export: walk reachable functions");
+        while next_row < walk.len() {
+            let row = next_row;
+            next_row += 1;
+            let tabled = walk.tabled(row);
+            let symbol = walk.symbol(row);
+            let kind = walk.kind(row);
+            let proof = ids.runnable(tabled).map_err(|why| {
+                let krate = crate_of_item(list, tabled, heap.alloc());
+                box_err(ExportCliError::NotChecked { krate, function: tabled, symbol: symbol.0, row, reached: walk.len(), compiled, cached, why }, heap)
+            })?;
+            match walk.one(row, &ids, &mut codes, &builder, &builder.producer, &mut maker, &proof, &body_ids::EntryForm, MOST_WALKED, &mut scratch) {
+                Ok(one) => match one.stepped {
+                    Stepped::Found(key) => {
+                        cached += 1;
+                        outcomes.push(RowOutcome::Keyed(key));
+                    }
+                    Stepped::Made(key) => {
+                        compiled += 1;
+                        outcomes.push(RowOutcome::Keyed(key));
+                    }
+                    Stepped::Unkeyed(_) => {
+                        unkeyed += 1;
+                        let mut copied: AVec<'_, u8> = Vec::with_capacity_in(scratch.made().len(), alloc);
+                        copied.extend_from_slice(scratch.made());
+                        outcomes.push(RowOutcome::Unkeyed(copied));
+                    }
+                },
+                Err(why) if row >= root_count && kind == RowKind::Instance && why.scope() == blaze_ladder::scope::Scope::One => {
+                    let msg = bstd::mem::format_in!(frame, "blaze export: called unbuilt function: {why}");
+                    let stub_bytes = make_unbuilt_stub_record(symbol, msg.as_str(), frame, alloc, heap).map_err(|e| box_err(e, heap))?;
+                    stubs += 1;
+                    outcomes.push(RowOutcome::UnbuiltStub(stub_bytes));
                 }
-                Stepped::Made(key) => {
-                    compiled += 1;
-                    outcomes.push(RowOutcome::Keyed(key));
+                Err(why) => {
+                    return Err(box_err(
+                        ExportCliError::Walk { symbol: symbol.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+                        heap,
+                    ));
                 }
-                Stepped::Unkeyed(_) => {
-                    unkeyed += 1;
-                    let mut copied: AVec<'_, u8> = Vec::with_capacity_in(scratch.made().len(), alloc);
-                    copied.extend_from_slice(scratch.made());
-                    outcomes.push(RowOutcome::Unkeyed(copied));
-                }
-            },
-            Err(why) if row >= root_count && kind == RowKind::Instance && why.scope() == blaze_ladder::scope::Scope::One => {
-                let msg = bstd::mem::format_in!(frame, "blaze export: called unbuilt function: {why}");
-                let stub_bytes = make_unbuilt_stub_record(symbol, msg.as_str(), frame, alloc, heap).map_err(|e| box_err(e, heap))?;
-                stubs += 1;
-                outcomes.push(RowOutcome::UnbuiltStub(stub_bytes));
-            }
-            Err(why) => {
-                return Err(box_err(
-                    ExportCliError::Walk { symbol: symbol.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
-                    heap,
-                ));
             }
         }
     }
 
     // Whole-program demand-driven cross-function LIR inlining + host-ISA SOTA emission over
-    // workspace functions and their small inlineable callees (kept ephemeral in `export_bump`,
+    // workspace functions and their non-cold reachable callees (kept ephemeral in `export_bump`,
     // never written into portable `HomeCodeStore`).
     let mut lto_seeds: AVec<'_, usize> = Vec::new_in(alloc);
     for (row, outcome) in outcomes.iter().enumerate() {
@@ -732,22 +738,25 @@ fn export_program<'f>(
         }
     }
     let lto_opts = blaze_ladder::run::make_one::export_lto::ExportLtoOpts::for_export(isa);
-    let lto_out = blaze_ladder::run::make_one::export_lto::optimize_export_workspace(
-        &walk,
-        lto_seeds.as_slice(),
-        |row| walk.kind(row) == RowKind::Instance && !matches!(outcomes.get(row), Some(RowOutcome::UnbuiltStub(_))),
-        |tabled| ids.runnable(tabled).ok(),
-        &mut maker,
-        lto_opts,
-        alloc,
-        heap.alloc(),
-    )
-    .map_err(|why| {
-        box_err(
-            ExportCliError::Lto { shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
-            heap,
+    let lto_out = {
+        let _lto_span = cx.span("export: workspace LTO");
+        blaze_ladder::run::make_one::export_lto::optimize_export_workspace(
+            &walk,
+            lto_seeds.as_slice(),
+            |row| walk.kind(row) == RowKind::Instance && !matches!(outcomes.get(row), Some(RowOutcome::UnbuiltStub(_))),
+            |tabled| ids.runnable(tabled).ok(),
+            &mut maker,
+            lto_opts,
+            alloc,
+            heap.alloc(),
         )
-    })?;
+        .map_err(|why| {
+            box_err(
+                ExportCliError::Lto { shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+                heap,
+            )
+        })?
+    };
     let lto_bodies = lto_out.bodies.len();
     let lto_inlined = lto_out.total_inlined;
     let mut extra_roots: AVec<'_, (ItemKey, AVec<'_, u8>)> = Vec::new_in(alloc);
@@ -810,36 +819,6 @@ fn export_program<'f>(
     phases.run_names = Some(run_names::NamesRead::of(read.counts(), &seen).with_ids(ids_line));
     if let Some(why) = seen.refused() {
         return Err(CliError::RunNames(run_names::RunNamesError::Trees { why }));
-    }
-
-    // Multi-pass bottom-up whole-program LTO inlining:
-    // - Passes 0..2 (`populate_only = true`): collect all small closed 0-call LIR leaves (including
-    //   shared `core` helpers discovered early in BFS like `ptr::add` / `read_unaligned`) and
-    //   fold them into mid-level helpers (`hash7_tagged`, `lookup_x2`, etc.) without emitting code.
-    // - Pass 2 (`populate_only = false`): splice all banked helpers into callers and re-emit SOTA
-    //   AArch64 code records for every caller that spliced >= 1 callee.
-    {
-        let mut lto_buf: AVec<'_, u8> = Vec::new_in(alloc);
-        for pass in 0u8..3 {
-            let populate_only = pass < 2;
-            for row in (0..outcomes.len()).rev() {
-                if walk.kind(row) != RowKind::Instance {
-                    continue;
-                }
-                if matches!(outcomes.get(row), Some(RowOutcome::UnbuiltStub(_) | RowOutcome::Lto { .. })) {
-                    continue;
-                }
-                lto_buf.clear();
-                let sym = walk.symbol(row);
-                let tabled = walk.tabled(row);
-                let name = walk.name(row);
-                if let Ok(true) = maker.make_export_lto(sym, tabled, name, populate_only, &mut lto_buf) {
-                    let mut copied: AVec<'_, u8> = Vec::with_capacity_in(lto_buf.len(), alloc);
-                    copied.extend_from_slice(lto_buf.as_slice());
-                    outcomes[row] = RowOutcome::Unkeyed(copied);
-                }
-            }
-        }
     }
 
     // Detect whether any walked row or code record touches Rust thread-locals.
