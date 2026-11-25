@@ -768,7 +768,18 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                     (None, None)
                 }
             }
-            SigFrom::Written | SigFrom::Inferred | SigFrom::Object => (None, None),
+            SigFrom::Object => {
+                if let Some((in_s, decl_tup, out_part, binder)) =
+                    ck.closures.column::<0>().get(row).copied().and_then(|ce| self.object_expectation(ce, inputs.len(), &heads, e))
+                {
+                    outer_binder = binder;
+                    static_as_static = true;
+                    (Some((in_s, Some(decl_tup), None)), out_part)
+                } else {
+                    (None, None)
+                }
+            }
+            SigFrom::Written | SigFrom::Inferred => (None, None),
         };
         let mut owner = 0u32;
         let mut pairs: Vec<(PTy, PTy), A> = Vec::new_in(self.alloc);
@@ -929,6 +940,276 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         }
         let (in_slots, out_slots) = fn_slots.split_at_checked(in_len)?;
         Some((in_slots, in_kids, out_slots, out_kid, outer_binder))
+    }
+
+    /// Resolves the expecting `dyn Fn*(Args) -> Output` trait object type and its region column
+    /// for a closure coerced to a trait object (`SigFrom::Object`, e.g. `Box::new(move |data: &[u8]| ...)`
+    /// coerced to `Box<dyn for<'a> Fn(&'a [u8]) -> Option<Decoded<'a>>>`).
+    ///
+    /// Returns `(input_slots, declared_args_tuple, output_part, dyn_binder)` in the heads' table
+    /// when a unique matching `PNode::Dynamic` with `Fn*` predicates is found in the expecting
+    /// site or enclosing owner's signature.
+    #[allow(clippy::type_complexity)]
+    fn object_expectation<'h>(
+        &self,
+        ce: ExprId,
+        n_inputs: usize,
+        heads: &'h blaze_borrow::Columns<'h>,
+        e: ExprId,
+    ) -> Option<(&'b [Region], PTy, Option<(&'b [Region], Option<PTy>)>, u32)> {
+        use blaze_borrow::RegionTypes;
+        use blaze_typeck::Def;
+
+        let facts: &'b F = self.facts;
+        // Walk up from `ce` through transparent wrappers (`Paren`, `&`, `Box::new`, `Cast`)
+        // to find the coerced erased `PNode::Dynamic` target type.
+        let mut cur = ce;
+        let mut want_dyn: Option<PTy> = None;
+        for _ in 0..8 {
+            if let Ok(adj) = self.adjusted_ty(cur)
+                && let Ok(Some(d)) = self.peel_body_dyn(adj, e)
+            {
+                want_dyn = Some(d);
+                break;
+            }
+            // Find the parent expression that wraps `cur`.
+            let mut next = None;
+            for (ix, expr) in self.body.exprs.iter().enumerate() {
+                let pe = ExprId(to_u32(ix));
+                match *expr {
+                    Expr::Paren(inner) | Expr::Ref { operand: inner, .. } | Expr::Cast { operand: inner, .. } if inner == cur => {
+                        next = Some(pe);
+                        break;
+                    }
+                    Expr::Call { args, .. } => {
+                        if let Some(es) = self.body.expr_lists.get(args.range())
+                            && es.len() == 1
+                            && es[0] == cur
+                            && let Ok(pty) = self.expr_ty(pe)
+                            && let Ok(PNode::Adt(k, _)) = self.node(pty, e)
+                            && facts.adt(k).is_some_and(|a| a.is_box)
+                        {
+                            next = Some(pe);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let Some(parent) = next else { break };
+            cur = parent;
+        }
+        let want_dyn = want_dyn?;
+        let target_expr = cur;
+
+        let mut found: Option<(PTy, &'b [Region], u32)> = None;
+
+        // 1. Direct expecting site (struct field, tuple ctor, direct fn or method call arg).
+        for (ix, expr) in self.body.exprs.iter().enumerate() {
+            let pe = ExprId(to_u32(ix));
+            match *expr {
+                Expr::Struct { fields, .. } => {
+                    let Some(fs) = self.body.field_inits.get(fields.range()) else { continue };
+                    let Some(f) = fs.iter().find(|f| f.expr == target_expr) else { continue };
+                    let (adt, variant) = match self.expr_def(pe) {
+                        Some(Def::Ctor { adt, variant, .. }) => (adt, variant),
+                        Some(Def::Adt(adt)) if facts.adt(adt).is_some_and(|a| !a.is_enum) => (adt, 0),
+                        _ => continue,
+                    };
+                    let Some(fi) = facts.field(adt, variant, f.name) else { continue };
+                    if let Ok(col) = facts.regions().field(adt, variant, fi)
+                        && let Ok(Some(m)) = self.find_unique_dyn_with_binder(col.ty(), col.as_slice(), 0, heads, want_dyn, e)
+                    {
+                        found = Some(m);
+                        break;
+                    }
+                }
+                Expr::Call { callee, args } => {
+                    let Some(es) = self.body.expr_lists.get(args.range()) else { continue };
+                    let Some(arg_i) = es.iter().position(|&a| a == target_expr) else { continue };
+                    match self.expr_def(callee) {
+                        Some(Def::Ctor { adt, variant, .. }) => {
+                            if let Ok(col) = facts.regions().field(adt, variant, to_u32(arg_i))
+                                && let Ok(Some(m)) = self.find_unique_dyn_with_binder(col.ty(), col.as_slice(), 0, heads, want_dyn, e)
+                            {
+                                found = Some(m);
+                                break;
+                            }
+                        }
+                        Some(Def::Fn(item)) => {
+                            if let Ok(sig) = facts.sig(item)
+                                && let Some(in_slots) = sig.input(to_u32(arg_i))
+                                && let Ok(in_ty) = self.sig_declared(sig, to_u32(arg_i), e)
+                            {
+                                let base = self.fn_sig_param_binder(sig, to_u32(arg_i), heads);
+                                if let Ok(Some(m)) = self.find_unique_dyn_with_binder(in_ty, in_slots, base, heads, want_dyn, e) {
+                                    found = Some(m);
+                                    break;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Expr::MethodCall { args, .. } => {
+                    let Some(es) = self.body.expr_lists.get(args.range()) else { continue };
+                    let Some(arg_i) = es.iter().position(|&a| a == target_expr) else { continue };
+                    let param_i = to_u32(arg_i + 1);
+                    if let Some(pos) = self.ck.callees.column::<0>().iter().position(|&x| x == pe)
+                        && let Some(&item) = self.ck.callees.column::<1>().get(pos)
+                        && let Ok(sig) = facts.sig(item)
+                        && let Some(in_slots) = sig.input(param_i)
+                        && let Ok(in_ty) = self.sig_declared(sig, param_i, e)
+                    {
+                        let base = self.fn_sig_param_binder(sig, param_i, heads);
+                        if let Ok(Some(m)) = self.find_unique_dyn_with_binder(in_ty, in_slots, base, heads, want_dyn, e) {
+                            found = Some(m);
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // 2. When the immediate call is generic (e.g. `HashMap::insert(k, Box::new(closure))` into
+        //    a parameter `registry: &mut HashMap<K, Box<dyn for<'a> Fn(&'a [u8]) -> ...>>`),
+        //    search the enclosing fn's own declared signature for a unique matching `PNode::Dynamic`.
+        if found.is_none()
+            && let Ok(own_sig) = facts.sig(self.body.owner)
+            && let Ok(blaze_borrow::Kids::List(sig_kids)) = heads.kids(own_sig.regions().col.ty())
+        {
+            let mut ambiguous = false;
+            for (ki, &kty) in sig_kids.iter().enumerate() {
+                let Some(kslots) = own_sig.regions().col.child(to_u32(ki)) else { continue };
+                let base = self.fn_sig_param_binder(own_sig, to_u32(ki), heads);
+                let Ok(cand) = self.find_unique_dyn_with_binder(kty, kslots, base, heads, want_dyn, e) else {
+                    ambiguous = true;
+                    break;
+                };
+                if let Some((dt, ds, db)) = cand {
+                    match found {
+                        None => found = Some((dt, ds, db)),
+                        Some((_, prev_s, prev_b)) if prev_b == db && prev_s == ds => {}
+                        Some(_) => {
+                            ambiguous = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if ambiguous {
+                found = None;
+            }
+        }
+
+        let (dyn_ty, dyn_slots, dyn_binder) = found?;
+        let Ok(PNode::Dynamic(preds)) = heads.node(dyn_ty) else { return None };
+        let Some(mut rest) = dyn_slots.get(1..) else { return None };
+        let out_name = blaze_typeck::Name::of("Output");
+        let mut args_match: Option<(PTy, &'b [Region])> = None;
+        let mut out_match: Option<(&'b [Region], Option<PTy>)> = None;
+        for &bound in self.head_list(preds, e).ok()? {
+            let Ok(bc) = heads.count(bound) else { return None };
+            let Some((bslots, after)) = rest.split_at_checked(bc.len()) else { return None };
+            rest = after;
+            match heads.node(bound) {
+                Ok(PNode::ExTrait(tr, _)) if facts.is_fn_trait(tr) => {
+                    let Ok(kids) = heads.kids(bound) else { continue };
+                    let Some(tup) = kids.get(0) else { continue };
+                    let Ok(PNode::Tuple(_)) = heads.node(tup) else { continue };
+                    let Ok(tkids) = heads.kids(tup) else { continue };
+                    if to_usize(tkids.len()) != n_inputs {
+                        continue;
+                    }
+                    let Ok(tc) = heads.count(tup) else { return None };
+                    if tc.len() != bslots.len() {
+                        return None;
+                    }
+                    args_match = Some((tup, bslots));
+                }
+                Ok(PNode::ExProj { trait_: tr, name, term, .. }) if facts.is_fn_trait(tr) && name == out_name => {
+                    let Ok(tc) = heads.count(term) else { return None };
+                    let tn = tc.len();
+                    let Some(oslots) = bslots.get(bslots.len().saturating_sub(tn)..) else { return None };
+                    if oslots.len() != tn {
+                        return None;
+                    }
+                    out_match = Some((oslots, Some(term)));
+                }
+                _ => {}
+            }
+        }
+        if !rest.is_empty() {
+            return None;
+        }
+        let (args_tup, args_slots) = args_match?;
+        Some((args_slots, args_tup, out_match, dyn_binder))
+    }
+
+    /// Searches a head-table type `(root, slots)` in exact pre-order (tracking binder indices
+    /// from `base_binder`) for a unique `PNode::Dynamic` matching `want_dyn`.
+    #[allow(clippy::type_complexity)]
+    fn find_unique_dyn_with_binder(
+        &self,
+        root: PTy,
+        slots: &'b [Region],
+        base_binder: u32,
+        heads: &blaze_borrow::Columns<'_>,
+        want_dyn: PTy,
+        e: ExprId,
+    ) -> Result<Option<(PTy, &'b [Region], u32)>, Refusal> {
+        use blaze_borrow::RegionTypes;
+
+        let want_slots = self.npos(want_dyn, e)?;
+        let PNode::Dynamic(want_preds) = self.node(want_dyn, e)? else { return Ok(None) };
+        let want_list = self.list(want_preds, e)?;
+        let mut stack: Vec<(PTy, &'b [Region], bool), A> = Vec::new_in(self.alloc);
+        stack.push((root, slots, false));
+        let mut found: Option<(PTy, &'b [Region], u32)> = None;
+        let mut next_binder = base_binder;
+        let mut steps = 0u32;
+        while let Some((cur, cur_slots, under_fn_ptr)) = stack.pop() {
+            steps += 1;
+            if steps > MOST_POSITIONS {
+                return Ok(None);
+            }
+            let cur_node = self.head_node(cur, e).ok();
+            let mut child_under_fn_ptr = under_fn_ptr;
+            if let Some(PNode::Dynamic(h_preds)) = cur_node {
+                let my_binder = next_binder;
+                next_binder += 1;
+                if !under_fn_ptr
+                    && usize::try_from(want_slots).ok() == Some(cur_slots.len())
+                    && self.dyn_preds_match(h_preds, want_list, e)?
+                {
+                    match found {
+                        None => found = Some((cur, cur_slots, my_binder)),
+                        Some((_, prev_slots, prev_b)) if prev_b == my_binder && prev_slots == cur_slots => {}
+                        Some(_) => return Ok(None),
+                    }
+                }
+            } else if matches!(cur_node, Some(PNode::FnPtr(..))) {
+                next_binder += 1;
+                child_under_fn_ptr = true;
+            }
+            let Ok(own) = heads.own(cur) else { continue };
+            let Ok(kids) = heads.kids(cur) else { continue };
+            let Some((_, mut rest)) = cur_slots.split_at_checked(own.len()) else { continue };
+            // Collect children first, then push in reverse so stack pop visits in exact pre-order.
+            let mut kslices: Vec<(PTy, &'b [Region]), A> = Vec::new_in(self.alloc);
+            for k in 0..kids.len() {
+                let Some(kid) = kids.get(k) else { break };
+                let Ok(kc) = heads.count(kid) else { break };
+                let Some((kslots, next_rest)) = rest.split_at_checked(kc.len()) else { break };
+                rest = next_rest;
+                kslices.push((kid, kslots));
+            }
+            for &(kid, kslots) in kslices.iter().rev() {
+                stack.push((kid, kslots, child_under_fn_ptr));
+            }
+        }
+        Ok(found)
     }
 
     /// Pre-order binder index of parameter `param_i`'s root node in `sig` (`sig`'s own root
