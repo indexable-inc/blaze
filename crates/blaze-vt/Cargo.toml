@@ -16,6 +16,10 @@ doctest = false
 [dependencies]
 # Vec, Box, String with the allocator named (rule 11).
 blaze-own.workspace = true
+# Kitty graphics `o=z` payloads (zlib).
+blaze-deflate.workspace = true
+# The glyph protocol's strict base64 payload; kitty test payloads.
+blaze-base64.workspace = true
 
 [dev-dependencies]
 # Property tests against the reference model, and planted-bug controls.

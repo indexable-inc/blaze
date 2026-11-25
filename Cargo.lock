@@ -2395,6 +2395,8 @@ dependencies = [
 name = "blaze-vt"
 version = "0.0.0"
 dependencies = [
+ "blaze-base64",
+ "blaze-deflate",
  "blaze-own",
  "blaze-sim",
 ]
