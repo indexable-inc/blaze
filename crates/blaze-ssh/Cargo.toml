@@ -1,0 +1,15 @@
+[package]
+name = "blaze-ssh"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+blaze-own.workspace = true
+
+[dev-dependencies]
+blaze-own = { workspace = true, features = ["testing"] }
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

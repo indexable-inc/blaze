@@ -255,6 +255,7 @@ crates/blaze-scope/src/tree_record.rs	MAGIC	none
 crates/blaze-scope/src/tree_record.rs	VERSION	test previous_version_3_is_rejected
 crates/blaze-script/src/engine.rs	STATUS_FORMAT	not persisted: a status line's form
 crates/blaze-script/src/finding.rs	SCHEMA	none
+crates/blaze-shell/src/render.rs	PIXEL_FORMAT	not persisted: Metal BGRA8Unorm swapchain pixel format constant
 crates/blaze-sim/src/board.rs	MAGIC	none
 crates/blaze-sim/src/board.rs	VERSION	none
 crates/blaze-spawn/src/answer.rs	LAYOUT	none
@@ -263,6 +264,8 @@ crates/blaze-sqlite/src/lib.rs	LIST_SCHEMA	none
 crates/blaze-sqlite/src/lib.rs	MAIN_SCHEMA	none
 crates/blaze-sqlite/src/lib.rs	XINFO_SCHEMA	none
 crates/blaze-squeeze/src/lib.rs	MAGIC	none
+crates/blaze-ssh/src/proto.rs	MAGIC	not persisted: SSH session framing wire magic
+crates/blaze-ssh/src/proto.rs	PROTOCOL_VERSION	not persisted: SSH session framing wire protocol version
 crates/blaze-std/src/comptime.rs	BLAZE_COMPTIME_MIN_VERSION	none
 crates/blaze-std/src/hosting.rs	MAGIC	none
 crates/blaze-std/src/hosting.rs	VERSION	none
