@@ -108,14 +108,18 @@ pub fn impl_header<'t, 'a>(
         let mut walk = Params::new();
         for i in at + 1..close {
             let tok = toks[i];
-            if walk.next(tok.kind, step(&toks, i)) == ParamTok::Start {
-                let name = match tok.kind {
-                    LIFETIME_IDENT => None,
-                    CONST_KW => toks.get(i + 1).filter(|it| it.kind == IDENT).map(word),
-                    IDENT => Some(word(&tok)),
-                    _ => None,
-                };
-                params.extend(name);
+            match walk.next(tok.kind, tok_delim(&toks, i)) {
+                ParamTok::Start => {
+                    let name = match tok.kind {
+                        LIFETIME_IDENT => None,
+                        CONST_KW => toks.get(i + 1).filter(|it| it.kind == IDENT).map(word),
+                        IDENT => Some(word(&tok)),
+                        _ => None,
+                    };
+                    params.extend(name);
+                }
+                ParamTok::Unclosed => return Err(HeaderError::Unclosed),
+                ParamTok::Inside | ParamTok::End => {}
             }
         }
         at = close + 1;
@@ -130,12 +134,12 @@ pub fn impl_header<'t, 'a>(
         at += 1;
     }
     // The trait ends at the first `for` at depth 0; the self type at `where`, `{` or `;`.
-    let mut depth = 0usize;
+    let mut depth = Brackets::default();
     let mut split = None;
     let mut end = toks.len();
     for i in at..toks.len() {
         let kind = toks[i].kind;
-        if depth == 0 {
+        if depth.is_top() {
             if kind == FOR_KW && split.is_none() && i > at {
                 split = Some(i);
             } else if matches!(kind, WHERE_KW | L_CURLY | SEMICOLON) {
@@ -143,11 +147,12 @@ pub fn impl_header<'t, 'a>(
                 break;
             }
         }
-        match step(&toks, i) {
-            Step::Open => depth += 1,
-            Step::Close => depth = depth.checked_sub(1).ok_or(HeaderError::Unclosed)?,
-            Step::Other | Step::Arrow => {}
+        if depth.step(tok_delim(&toks, i)).is_err() {
+            return Err(HeaderError::Unclosed);
         }
+    }
+    if !depth.is_top() {
+        return Err(HeaderError::Unclosed);
     }
     let span = |from: usize, to: usize| -> Option<&'t str> {
         (from < to).then(|| text.get(toks[from].start..toks[to - 1].end).map(str::trim)).flatten()
@@ -205,8 +210,9 @@ pub fn declared_lifetimes(text: &str, edition: Edition) -> Result<u16, GenericsE
     /// Where the walk is.
     #[derive(Clone, Copy)]
     enum At {
-        /// Before the item keyword, `depth` brackets in (an attribute's, a visibility's).
-        Seek { depth: usize },
+        /// Before the item keyword, `group` token-tree brackets in (an attribute's, a visibility's).
+        /// Angle brackets `<` / `>` never count while seeking the item keyword.
+        Seek { group: usize },
         /// After the keyword: its name next. `union`: the keyword was the contextual
         /// `union`, which an identifier after it confirms (else it was a name, and the walk
         /// goes on seeking).
@@ -220,10 +226,10 @@ pub fn declared_lifetimes(text: &str, edition: Edition) -> Result<u16, GenericsE
     if lexed.errors().next().is_some() {
         return Err(GenericsError::Lex);
     }
-    let mut state = At::Seek { depth: 0 };
+    let mut state = At::Seek { group: 0 };
     let mut params = Params::new();
     let mut count = 0u16;
-    // The token before, for a `->`'s `>` (no bracket: [`step`]'s rule).
+    // The token before, for a `->`'s `>` (no bracket: [`delim`]'s rule).
     let mut prev: Option<(SyntaxKind, usize)> = None;
     let mut offset = 0;
     for i in 0..lexed.len() {
@@ -232,47 +238,37 @@ pub fn declared_lifetimes(text: &str, edition: Edition) -> Result<u16, GenericsE
         if kind.is_trivia() {
             continue;
         }
-        let arrow = kind == R_ANGLE && prev == Some((MINUS, start));
+        let d = delim(kind, prev == Some((MINUS, start)));
         prev = Some((kind, offset));
-        let opens = matches!(kind, L_ANGLE | L_PAREN | L_BRACK | L_CURLY);
-        let closes = !arrow && matches!(kind, R_ANGLE | R_PAREN | R_BRACK | R_CURLY);
         let word = text.get(start..offset).unwrap_or("");
         state = match state {
             At::Name { .. } if kind == IDENT => At::Open,
             At::Name { union: false } => return Err(GenericsError::NoKeyword),
             // `union` was a name: this token is seeked over like any other.
             At::Name { union: true } | At::Seek { .. } => {
-                let depth = match state {
-                    At::Seek { depth } => depth,
-                    _ => 0,
+                let mut brackets = Brackets {
+                    group: match state {
+                        At::Seek { group } => group,
+                        _ => 0,
+                    },
+                    angle: 0,
                 };
-                if depth == 0 && matches!(kind, STRUCT_KW | ENUM_KW | TRAIT_KW | TYPE_KW | UNION_KW) {
+                if brackets.group == 0 && matches!(kind, STRUCT_KW | ENUM_KW | TRAIT_KW | TYPE_KW | UNION_KW) {
                     At::Name { union: false }
-                } else if depth == 0 && kind == IDENT && word == "union" {
+                } else if brackets.group == 0 && kind == IDENT && word == "union" {
                     At::Name { union: true }
-                } else if opens {
-                    At::Seek { depth: depth + 1 }
-                } else if closes {
-                    At::Seek { depth: depth.checked_sub(1).ok_or(GenericsError::Unclosed)? }
                 } else {
-                    At::Seek { depth }
+                    brackets.step_group(d).map_err(|()| GenericsError::Unclosed)?;
+                    At::Seek { group: brackets.group }
                 }
             }
             At::Open if kind == L_ANGLE => At::In,
             At::Open => return Ok(0),
             At::In => {
-                let step = if opens {
-                    Step::Open
-                } else if closes {
-                    Step::Close
-                } else if arrow {
-                    Step::Arrow
-                } else {
-                    Step::Other
-                };
-                match params.next(kind, step) {
+                match params.next(kind, d) {
                     ParamTok::Start if kind == LIFETIME_IDENT => count = count.checked_add(1).ok_or(GenericsError::TooMany)?,
                     ParamTok::End => return Ok(count),
+                    ParamTok::Unclosed => return Err(GenericsError::Unclosed),
                     ParamTok::Start | ParamTok::Inside => {}
                 }
                 At::In
@@ -282,6 +278,7 @@ pub fn declared_lifetimes(text: &str, edition: Edition) -> Result<u16, GenericsE
     match state {
         At::Open => Ok(0),
         At::In => Err(GenericsError::Unclosed),
+        At::Seek { group } if group > 0 => Err(GenericsError::Unclosed),
         At::Seek { .. } | At::Name { .. } => Err(GenericsError::NoKeyword),
     }
 }
@@ -293,7 +290,7 @@ pub fn declared_lifetimes(text: &str, edition: Edition) -> Result<u16, GenericsE
 pub fn impl_may_dangle_params(text: &str, edition: Edition) -> Result<u64, GenericsError> {
     #[derive(Clone, Copy)]
     enum At {
-        Seek { depth: usize },
+        Seek { group: usize },
         Open,
         In,
     }
@@ -301,7 +298,7 @@ pub fn impl_may_dangle_params(text: &str, edition: Edition) -> Result<u64, Gener
     if lexed.errors().next().is_some() {
         return Err(GenericsError::Lex);
     }
-    let mut state = At::Seek { depth: 0 };
+    let mut state = At::Seek { group: 0 };
     let mut params = Params::new();
     let mut mask = 0u64;
     let mut param_idx = 0u32;
@@ -314,21 +311,17 @@ pub fn impl_may_dangle_params(text: &str, edition: Edition) -> Result<u64, Gener
         if kind.is_trivia() {
             continue;
         }
-        let arrow = kind == R_ANGLE && prev == Some((MINUS, start));
+        let d = delim(kind, prev == Some((MINUS, start)));
         prev = Some((kind, offset));
-        let opens = matches!(kind, L_ANGLE | L_PAREN | L_BRACK | L_CURLY);
-        let closes = !arrow && matches!(kind, R_ANGLE | R_PAREN | R_BRACK | R_CURLY);
         let word = text.get(start..offset).unwrap_or("");
         state = match state {
-            At::Seek { depth } => {
-                if depth == 0 && kind == IMPL_KW {
+            At::Seek { group } => {
+                if group == 0 && kind == IMPL_KW {
                     At::Open
-                } else if opens {
-                    At::Seek { depth: depth + 1 }
-                } else if closes {
-                    At::Seek { depth: depth.checked_sub(1).ok_or(GenericsError::Unclosed)? }
                 } else {
-                    At::Seek { depth }
+                    let mut brackets = Brackets { group, angle: 0 };
+                    brackets.step_group(d).map_err(|()| GenericsError::Unclosed)?;
+                    At::Seek { group: brackets.group }
                 }
             }
             At::Open => {
@@ -339,20 +332,12 @@ pub fn impl_may_dangle_params(text: &str, edition: Edition) -> Result<u64, Gener
                 }
             }
             At::In => {
-                if params.attr && params.depth == 1 && kind == IDENT && word == "may_dangle" {
+                if params.attr && params.depth.group == 1 && kind == IDENT && word == "may_dangle" {
                     has_may_dangle = true;
                 }
-                let s = if arrow {
-                    Step::Arrow
-                } else if opens {
-                    Step::Open
-                } else if closes {
-                    Step::Close
-                } else {
-                    Step::Other
-                };
-                match params.next(kind, s) {
+                match params.next(kind, d) {
                     ParamTok::End => return Ok(mask),
+                    ParamTok::Unclosed => return Err(GenericsError::Unclosed),
                     ParamTok::Start => {
                         match kind {
                             IDENT => {
@@ -375,31 +360,81 @@ pub fn impl_may_dangle_params(text: &str, edition: Edition) -> Result<u64, Gener
         };
     }
     match state {
+        At::Seek { group } if group > 0 => Err(GenericsError::Unclosed),
         At::Seek { .. } => Err(GenericsError::NoKeyword),
         At::Open => Ok(0),
         At::In => Err(GenericsError::Unclosed),
     }
 }
 
-enum Step {
-    Open,
-    Close,
+/// Balanced delimiter depth (rule 30: the one counter every reader in this file shares).
+///
+/// `group` counts Rust token-tree delimiters `( ) [ ] { }`, which are always balanced — inside
+/// outer attributes (`#[debug("..", match x { A => 1 })]`), visibilities (`pub(...)`), const
+/// generic expressions (`{ if a > b { 1 } else { 0 } }`), and parenthesized types alike.
+/// `angle` counts `< >` strictly at `group == 0`: comparisons, shifts, fat arrows (`=>`), and
+/// nested generics inside any `( ) [ ] { }` group never open or close an outer angle bracket.
+#[derive(Clone, Copy, Default)]
+struct Brackets {
+    group: usize,
+    angle: usize,
+}
+
+impl Brackets {
+    fn is_top(&self) -> bool {
+        self.group == 0 && self.angle == 0
+    }
+
+    /// Updates only token-tree group depth (`( ) [ ] { }`), ignoring `<`, `>`, and `->`.
+    fn step_group(&mut self, d: Delim) -> Result<(), ()> {
+        match d {
+            Delim::OpenGroup => self.group += 1,
+            Delim::CloseGroup => self.group = self.group.checked_sub(1).ok_or(())?,
+            Delim::OpenAngle | Delim::CloseAngle | Delim::Arrow | Delim::Other => {}
+        }
+        Ok(())
+    }
+
+    /// Updates group depth everywhere and angle depth strictly when `group == 0`.
+    fn step(&mut self, d: Delim) -> Result<(), ()> {
+        match d {
+            Delim::OpenGroup => self.group += 1,
+            Delim::CloseGroup => self.group = self.group.checked_sub(1).ok_or(())?,
+            Delim::OpenAngle if self.group == 0 => self.angle += 1,
+            Delim::CloseAngle if self.group == 0 => self.angle = self.angle.checked_sub(1).ok_or(())?,
+            Delim::OpenAngle | Delim::CloseAngle | Delim::Arrow | Delim::Other => {}
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Delim {
+    OpenGroup,
+    CloseGroup,
+    OpenAngle,
+    CloseAngle,
     /// The `>` of a `->`: no bracket.
     Arrow,
     Other,
 }
 
-/// What token `i` does to the bracket depth: `<` `(` `[` `{` open, their pairs close, and a
-/// `>` right after a `-` is an arrow.
-fn step(toks: &[Tok], i: usize) -> Step {
-    match toks[i].kind {
-        L_ANGLE | L_PAREN | L_BRACK | L_CURLY => Step::Open,
-        R_ANGLE if i > 0 && toks[i - 1].kind == MINUS && toks[i - 1].end == toks[i].start => {
-            Step::Arrow
-        }
-        R_ANGLE | R_PAREN | R_BRACK | R_CURLY => Step::Close,
-        _ => Step::Other,
+fn delim(kind: SyntaxKind, prev_minus_adjacent: bool) -> Delim {
+    match kind {
+        L_PAREN | L_BRACK | L_CURLY => Delim::OpenGroup,
+        R_PAREN | R_BRACK | R_CURLY => Delim::CloseGroup,
+        L_ANGLE => Delim::OpenAngle,
+        R_ANGLE if prev_minus_adjacent => Delim::Arrow,
+        R_ANGLE => Delim::CloseAngle,
+        _ => Delim::Other,
     }
+}
+
+/// What token `i` does to the delimiter depth: `(` `[` `{` open groups, `<` opens an angle at
+/// `group == 0`, their pairs close, and a `>` right after a `-` is an arrow.
+fn tok_delim(toks: &[Tok], i: usize) -> Delim {
+    let prev_minus_adjacent = i > 0 && toks[i - 1].kind == MINUS && toks[i - 1].end == toks[i].start;
+    delim(toks[i].kind, prev_minus_adjacent)
 }
 
 /// What one token of a generics list is to its parameters ([`Params::next`]).
@@ -413,82 +448,80 @@ enum ParamTok {
     Inside,
     /// The list's closing `>`.
     End,
+    /// A closing group delimiter with no matching opener inside the list.
+    Unclosed,
 }
 
 /// THE ONE WALK of a generics list's parameters (rule 30), used by every reader of one in this
-/// file ([`impl_header`]'s names, [`declared_lifetimes`]'s count): which token starts a
-/// parameter. A parameter starts after the list's `<` or a comma at the list's own depth, and
-/// its own outer attributes are before its start, stepped over (std's
+/// file ([`impl_header`]'s names, [`declared_lifetimes`]'s count, [`impl_may_dangle_params`]):
+/// which token starts a parameter. A parameter starts after the list's `<` or a comma at the
+/// list's own depth, and its own outer attributes are before its start, stepped over (std's
 /// `unsafe impl<#[may_dangle] T, A: Allocator> Drop for Vec<T, A>`, `MutexGuard<
-/// #[rustc_assert_variance(covariant)] 'a, ..>`; several, and brackets inside one, alike).
-/// Fed every non-trivia token after the `<`, with its [`Step`]; nothing kept but the depths.
+/// #[rustc_assert_variance(covariant)] 'a, ..>`; several, and brackets or `=>` inside one,
+/// alike). Fed every non-trivia token after the `<`, with its [`Delim`]; nothing kept but the
+/// depths.
 struct Params {
-    /// Brackets open inside the list.
-    depth: usize,
+    /// Delimiters open inside the list (`group` for `() [] {}`, `angle` for `< >` at `group == 0`).
+    depth: Brackets,
     /// The next token starts a parameter (or its attributes).
     first: bool,
-    /// Inside a parameter's own attribute: its `[..]` is open (`depth` counts its brackets).
+    /// Saw `#` at a parameter's start; an immediate `[` enters an outer attribute.
+    pound: bool,
+    /// Inside a parameter's own attribute: its `[..]` is open (`depth.group` counts its brackets).
     attr: bool,
 }
 
 impl Params {
     /// The walk right after the list's `<`.
     fn new() -> Params {
-        Params { depth: 0, first: true, attr: false }
+        Params { depth: Brackets::default(), first: true, pound: false, attr: false }
     }
 
-    /// What the token of `kind`, doing `step` to the bracket depth, is to the parameters.
-    fn next(&mut self, kind: SyntaxKind, step: Step) -> ParamTok {
+    /// What the token of `kind`, doing `d` to the delimiter depth, is to the parameters.
+    fn next(&mut self, kind: SyntaxKind, d: Delim) -> ParamTok {
         if self.attr {
-            match step {
-                Step::Open => self.depth += 1,
-                Step::Close => {
-                    self.depth = self.depth.saturating_sub(1);
-                    if self.depth == 0 {
-                        // The attribute's `]`: the parameter still starts next.
-                        self.attr = false;
-                    }
-                }
-                Step::Arrow | Step::Other => {}
+            if self.depth.step_group(d).is_err() {
+                return ParamTok::Unclosed;
+            }
+            if self.depth.group == 0 {
+                // The attribute's `]`: the parameter still starts next.
+                self.attr = false;
             }
             return ParamTok::Inside;
         }
-        if self.depth == 0 && matches!(step, Step::Close) {
+        if self.depth.is_top() && d == Delim::CloseAngle {
             return ParamTok::End;
         }
-        if self.first && self.depth == 0 && kind == POUND {
+        if self.first && self.depth.is_top() && kind == POUND {
+            self.pound = true;
             return ParamTok::Inside;
         }
-        if self.first && self.depth == 0 && kind == L_BRACK {
-            self.depth = 1;
+        if self.first && self.pound && self.depth.is_top() && kind == L_BRACK {
+            self.pound = false;
+            self.depth.group = 1;
             self.attr = true;
             return ParamTok::Inside;
         }
+        self.pound = false;
         let start = self.first && kind != COMMA;
         self.first = false;
-        match step {
-            Step::Open => self.depth += 1,
-            Step::Close => self.depth -= 1,
-            Step::Other if kind == COMMA && self.depth == 0 => self.first = true,
-            Step::Other | Step::Arrow => {}
+        if self.depth.step(d).is_err() {
+            return ParamTok::Unclosed;
+        }
+        if kind == COMMA && self.depth.is_top() {
+            self.first = true;
         }
         if start { ParamTok::Start } else { ParamTok::Inside }
     }
 }
 
-/// The token closing the bracket opened at `open`.
+/// The token closing the `<` opened at `open`.
 fn closing(toks: &[Tok], open: usize) -> Result<usize, HeaderError> {
-    let mut depth = 0usize;
+    let mut depth = Brackets::default();
     for i in open..toks.len() {
-        match step(toks, i) {
-            Step::Open => depth += 1,
-            Step::Close => {
-                depth = depth.checked_sub(1).ok_or(HeaderError::Unclosed)?;
-                if depth == 0 {
-                    return Ok(i);
-                }
-            }
-            Step::Arrow | Step::Other => {}
+        depth.step(tok_delim(toks, i)).map_err(|()| HeaderError::Unclosed)?;
+        if depth.is_top() {
+            return Ok(i);
         }
     }
     Err(HeaderError::Unclosed)
