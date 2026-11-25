@@ -1156,10 +1156,14 @@ pub(crate) fn crate_cells<'a>(payload: &[u8], out: ContentId, into: &mut blaze_e
     for at in 0..CrateGraph::len(&list) {
         let key = list.key(at);
         let mut h = blaze_ids::Hasher::new("blaze unit graph crate cell digest 1");
-        h.part(&key.0.0).part(list.root(at).as_bytes());
-        let tree = list.root(at).strip_prefix('/').and_then(|s| s.split_once('/')).and_then(|(tree, _)| tree.parse::<usize>().ok());
-        match tree.and_then(|k| list.tree(k)) {
-            Some(row) => {
+        let root = list.root(at);
+        let parsed = root.strip_prefix('/').and_then(|s| s.split_once('/')).and_then(|(tree, rel)| Some((tree.parse::<usize>().ok()?, rel)));
+        match parsed.and_then(|(k, rel)| list.tree(k).map(|row| (row, rel))) {
+            Some((row, rel)) => {
+                // Hash the crate key, tree-relative root path, pack origin, and pack file tree,
+                // never the unstable dense tree-table slot `/<k>/` which shifts whenever an
+                // unrelated dependency's key moves and reorders `list.trees` (rule 21, rule 77).
+                h.part(&key.0.0).part(rel.as_bytes());
                 match row.origin {
                     blaze_world::PackOrigin::Shelf { digest } => h.part(b"shelf").part(&digest),
                     blaze_world::PackOrigin::Source { key } => h.part(b"source").part(&key.0),
@@ -1167,7 +1171,7 @@ pub(crate) fn crate_cells<'a>(payload: &[u8], out: ContentId, into: &mut blaze_e
                 h.part(&row.files);
             }
             None => {
-                h.part(b"checkout");
+                h.part(&key.0.0).part(root.as_bytes()).part(b"checkout");
             }
         }
         into.push((crate_cell(&key), h.finish()));

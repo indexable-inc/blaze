@@ -1073,6 +1073,10 @@ pub(crate) enum Plant {
     /// unlinking them in a zero-conflict slice first (so a concurrent foreground conflict aborts
     /// unlinking ready retired files).
     MixRetiredWithCopy,
+    /// Planted bug: triggers synchronous foreground `fold_tiered_slice` at the soft background
+    /// housekeeping threshold ([`Plain::AUTO_TIER_MERGE_BG`] = 24) instead of deferring until
+    /// the emergency safety ceiling ([`Plain::AUTO_TIER_MERGE_FG`] = 128).
+    ForegroundFoldsAtBgThreshold,
 }
 
 /// What one slice of the background pass did ([`Plain::scrub_next`]).
@@ -3600,6 +3604,9 @@ impl<A: Allocator + Clone> Plain<A> {
     /// hundreds of consecutive multi-phase commits without background GC stay well below
     /// [`Plain::named_most`].
     pub(crate) fn auto_merge_open_threshold(&self) -> usize {
+        if self.plant() == Plant::ForegroundFoldsAtBgThreshold {
+            return self.auto_merge_bg_threshold().max(Self::AUTO_TIER_MERGE_BG);
+        }
         self.auto_merge_bg_threshold().max(Self::AUTO_TIER_MERGE_FG)
     }
 

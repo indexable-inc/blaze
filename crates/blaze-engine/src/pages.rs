@@ -125,11 +125,11 @@ pub fn readers_slot(id: &CellId) -> Name {
     Name::new(id.of.kind, ContentId(subject))
 }
 /// The root's form. `BER3` stored a flat array of up to 65,536 page keys (2 MiB) plus all
-/// directory sections inline; `BER4` keeps small answers (`bits <= RADIX_FLAT_MAX_BITS`) inline
-/// and stores large answers (`bits > RADIX_FLAT_MAX_BITS`) as a 2-level 256-way radix tree with
-/// sharded file directory and immutable `places`/`summary` sub-records. A `BER3` root is a
-/// [`PagesError::Magic`], reported, and the answer made again (D160), never read as this one.
-pub const ROOT_MAGIC: &[u8; 4] = b"BER4";
+/// directory sections inline; `BER4` kept small answers inline and stored large answers as a
+/// 2-level 256-way radix tree over `BEP5` pages; `BER5` stores the same directory over `BEP6`
+/// dictionary-encoded pages. A `BER4` root is a [`PagesError::Magic`], reported at `open_root`
+/// and rebuilt cleanly (D160), never failing mid-engine on a `BEP5` page.
+pub const ROOT_MAGIC: &[u8; 4] = b"BER5";
 /// Leaf-shard form of a 2-level radix answer root: 256 page keys (8,192 bytes + 9-byte header).
 pub const RADIX_SHARD_MAGIC: &[u8; 4] = b"BEX1";
 /// File-directory shard form of a radix answer root (16 shards by subject's leading nibble).
