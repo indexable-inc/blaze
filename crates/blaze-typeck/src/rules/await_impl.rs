@@ -35,7 +35,8 @@ use crate::diag::{About, At, DiagCode};
 use crate::error::Stop;
 use crate::ids::{ItemKey, LangItem, Name};
 use crate::machine::{Lower, Machine};
-use crate::ty::{Cause, Obligation, TyList, TypeCtx};
+use crate::portable::PNode;
+use crate::ty::{Cause, Goal, Obligation, TyList, TypeCtx};
 use crate::world::{ImplPolarity, Shape, World};
 
 /// The impls of `IntoFuture` that hold at one `.await`'s operand: the first, and how many.
@@ -79,6 +80,26 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
                         // It matched in the probe: the same unification cannot fail outside it.
                         return Err(crate::error::CheckError::Malformed(crate::error::Malformed::Expr(e)).into());
                     };
+                    let first_row = self.projected.len();
+                    // An impl that does not define `into_future` runs the trait's provided one
+                    // (`resolve_instance`'s rule): the trait's callee stays.
+                    let assoc = self.reads.assoc_item(imp, Name::of("into_future"))?;
+                    // Record `<T as IntoFuture>::IntoFuture` when `into_future`'s own signature
+                    // returns `Self::IntoFuture` (matching `Mark::Proj` order in `selected_at(e)`
+                    // and letting writeback select nested aliases inside `type IntoFuture = ..`),
+                    // otherwise record `T: IntoFuture` as a bound row so `call_selections(e)`
+                    // still carries the selected impl.
+                    let sig_returns_into_future = match assoc {
+                        Some(a) => self.reads.fn_sig(a.item)?.is_some_and(|sig| {
+                            matches!(
+                                sig.types.node(sig.output),
+                                Ok(PNode::Alias { trait_, name, .. }) if trait_ == tr && name == Name::of("IntoFuture")
+                            )
+                        }),
+                        None => false,
+                    };
+                    let into_future_name = sig_returns_into_future.then_some(Name::of("IntoFuture"));
+                    self.projected.push((e, tr, into_future_name, args));
                     // The selected impl's where-clauses are owed here, as selection's nested
                     // goals are (the probe only asked them, then rolled back). A parameter
                     // neither the self type nor the trait names is decided by one of them
@@ -86,18 +107,30 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
                     // DebugNodeLauncherFuture<L, Target, N, B> where L: LaunchNode<Target,
                     // Node = NodeHandle<N, AddOns>>` binds `AddOns` only by that projection.
                     // Unregistered, the callee row kept `?AddOns` and writeback refused it
-                    // (E0282, tempo crates/zones/node/tests/it/utils.rs:2658). Filed at the
-                    // `.await` (`Cause::Expr`, not `Cause::Clause`: the row's item is
-                    // `into_future`, not the impl whose clause it is).
+                    // (E0282, tempo crates/zones/node/tests/it/utils.rs:2658). Also record each
+                    // trait/projection clause in `self.projected` (matching `record_lifetime_impls`
+                    // on regular calls) so writeback exports the selected impls into
+                    // `Checked::selected` for downstream borrow lowering (`relate_into_future`).
                     let wc = self.reads.predicates(imp)?;
                     for c in wc.clauses {
-                        if let Some(goal) = self.clause_goal(wc.types, *c, iargs, Cause::Body)? {
+                        if let Some(goal) = self.clause_goal(wc.types, *c, iargs, Cause::Expr(e))? {
+                            match goal {
+                                Goal::Trait { trait_, args: actual } => {
+                                    if !self.projected.iter().skip(first_row).any(|&(pe, ptr, _, a)| pe == e && ptr == trait_ && a == actual) {
+                                        self.projected.push((e, trait_, None, actual));
+                                    }
+                                }
+                                Goal::Projection { trait_, args: actual, name, .. } => {
+                                    if !self.projected.iter().skip(first_row).any(|&(pe, ptr, m, a)| pe == e && ptr == trait_ && m == Some(name) && a == actual) {
+                                        self.projected.push((e, trait_, Some(name), actual));
+                                    }
+                                }
+                                _ => {}
+                            }
                             self.ty.register(Obligation { goal, cause: Cause::Expr(e) })?;
                         }
                     }
-                    // An impl that does not define `into_future` runs the trait's provided one
-                    // (`resolve_instance`'s rule): the trait's callee stays.
-                    if let Some(a) = self.reads.assoc_item(imp, Name::of("into_future"))? {
+                    if let Some(a) = assoc {
                         self.callees[j] = (e, a.item, iargs);
                     }
                 }
