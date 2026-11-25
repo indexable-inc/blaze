@@ -513,21 +513,16 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 Some(t) => match self.view(t) {
                     TyView::Ref(_, inner) | TyView::Ptr(_, inner) => {
                         let inner = self.ty.shallow_resolve(inner);
-                        match self.view(inner) {
-                            // A trait-object pointee is no expectation for the operand, as for a
-                            // cast's (rules/cast.rs `dyn_cast_target`): `&if c { 1 } else { 0 }`
-                            // unifies the arms to `i32` and `&i32` unsizes to `&dyn Tr`. The
-                            // `rvalue_hint` soft expectation would keep an integer-literal arm
-                            // from defaulting to `i32` (borrow_if in tests/front2_cast_dyn.rs).
-                            TyView::Dynamic(_) => Expectation::None,
-                            // `rvalue_hint` (rules/mod.rs): an unsized expected pointee is only a
-                            // hint, so `&if c { p } else { cwd.join(p) }` with expected `&Path`
-                            // unifies the arms to `PathBuf` and coerces the whole `&PathBuf` to
-                            // `&Path`, instead of failing each arm against `Path` (E0308). Its
-                            // `struct_tail` also catches an unsized-tail ADT like `Path`, which
-                            // the inline `Str | Slice` match missed.
-                            _ => self.rvalue_hint(inner)?,
-                        }
+                        // `rvalue_hint` (rules/mod.rs): an unsized expected pointee is only a
+                        // hint, never a hard type for the operand. So `&if c { p } else {
+                        // cwd.join(p) }` with expected `&Path` unifies the arms to `PathBuf` and
+                        // coerces the whole `&PathBuf` to `&Path`, instead of failing each arm
+                        // against `Path` (E0308); its `struct_tail` also catches an unsized-tail
+                        // ADT like `Path`, which the inline `Str | Slice` match missed. And a
+                        // closure borrowed as `&dyn Fn(..)` still reads its signature from the
+                        // hint (closure.rs `deduce_closure_signature`), which a flat `None`
+                        // would starve (omp-stats session.rs, pa-agent agent.rs).
+                        self.rvalue_hint(inner)?
                     }
                     _ => Expectation::None,
                 },
