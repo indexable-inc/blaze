@@ -685,6 +685,10 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
             let allow_auto = self.auto_merge;
             #[cfg(not(test))]
             let allow_auto = true;
+            // Routine tiered merging (`Plain::AUTO_TIER_MERGE_BG` = 24) runs asynchronously in
+            // detached `blaze gc --background`. Foreground commits only fold a synchronous slice
+            // at the emergency safety ceiling (`Plain::AUTO_TIER_MERGE_FG` = 128) so interactive
+            // `blaze check`/`test` commits never stall on multi-hundred-MB tier merges.
             if allow_auto && !self.core.slice_parked() && self.core.needs_auto_tier_merge() {
                 let now = self.driver.wall_ns();
                 if self.core.fold_tiered_slice(now, &mut self.effects)? {
@@ -725,7 +729,7 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
             self.run("compacting")?;
             let sliced = self.core.take_sliced().ok_or(StoreError::Unfinished { what: "a compaction slice" })?;
             out.push(sliced);
-            if !sliced.more || sliced.aborted || (sliced.segments == 0 && sliced.evicted_roots == 0 && sliced.removed == 0) {
+            if !sliced.more || sliced.aborted || (sliced.segments == 0 && sliced.evicted_roots == 0 && sliced.removed == 0 && sliced.orphans == 0) {
                 break;
             }
         }

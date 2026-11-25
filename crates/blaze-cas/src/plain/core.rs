@@ -605,6 +605,7 @@ pub struct LockWaited {
 /// What a root's record key is derived under.
 const ROOT_DOMAIN: &str = "blaze plain store root 1";
 const LOG_DOMAIN: &str = "blaze plain store log 1";
+const BLOOM_DOMAIN: &str = "blaze plain store bloom tmp 1";
 /// What an index's record key is derived under ([`Plain::index`]).
 const INDEX_DOMAIN: &str = "blaze plain store index 1";
 /// What an indexed root's record key is derived under: never a plain root's key for the same
@@ -1211,8 +1212,12 @@ const SEG_RENAME: u8 = 22;
 const SEG_UNWRITE: u8 = 23;
 /// Optional map of the `bloom` sidecar file at open.
 const BLOOM_MAP: u8 = 24;
-/// Optional append or compact rewrite of the `bloom` sidecar under the flip lock.
+/// Optional append or atomic rename of the `bloom` sidecar under the flip lock.
 const BLOOM_WRITE: u8 = 25;
+/// Compact `bloom` sidecar staged to a unique temp file OUTSIDE the exclusive flip lock.
+const BLOOM_STAGE: u8 = 26;
+/// Best-effort removal of an unconsumed staged `bloom` temp file after unlock or failure.
+const BLOOM_CLEANUP: u8 = 27;
 /// A streamed copy's writes, by their [`SEG_PIECE`] index: 0 its header, then a payload chunk
 /// each from 1, an index chunk each from this, and its footer at [`FOOTER_PIECE`].
 const INDEX_PIECE: u32 = 1 << 30;
@@ -1857,6 +1862,15 @@ struct Base {
     manifest: Manifest,
 }
 
+/// Compact `bloom` sidecar written to a unique temp file OUTSIDE the exclusive `flip` lock
+/// (`Phase::StagingBloom`), ready for an O(1) atomic `Effect::RenameUnsynced` inside the lock
+/// when `base.manifest.generation` still equals `base_gen`.
+struct StagedBloom {
+    file: FileName,
+    base_gen: u64,
+    len: u64,
+}
+
 struct Flip<A: Allocator + Clone> {
     change: Change<A>,
     waits: u32,
@@ -1880,7 +1894,12 @@ struct Flip<A: Allocator + Clone> {
     /// [`Plant::UnlinkEarly`]: unlinks in flight before the log's write, which waits here.
     early: u32,
     deferred: Option<Effect>,
-    /// Optional sidecar Bloom append or compact rewrite performed under the flip lock before
+    /// Staged compact `bloom` temp file written OUTSIDE the exclusive `flip` lock. Consumed by
+    /// `Effect::RenameUnsynced` under the lock when `base.manifest.generation == base_gen`, or
+    /// unlinked via `BLOOM_CLEANUP` after unlock on conflict, abort, refusal, carry, or error.
+    bloom_staged: Option<StagedBloom>,
+    bloom_staging: bool,
+    /// Optional sidecar Bloom append or O(1) atomic rename performed under the flip lock before
     /// `SLOT_WRITE`. Its failure never aborts the flip.
     bloom_effect: Option<Effect>,
     /// `(replaced, written_bytes)` for `bloom_effect`, cleared if `BLOOM_WRITE` fails and applied
@@ -2578,6 +2597,12 @@ impl<A: Allocator + Clone> Plain<A> {
         self.prefixed_hex_file(b"/manifests-", id)
     }
 
+    fn bloom_temp_file(&mut self) -> FileName {
+        self.seq += 1;
+        let id = format::id_of(BLOOM_DOMAIN, &[&self.cfg.nonce.to_le_bytes(), &self.seq.to_le_bytes(), &self.now_ns.to_le_bytes()]);
+        self.prefixed_hex_file(b"/bloom-tmp-", id)
+    }
+
     /// Formats `seg-<id>` once into a [`FileName`], caches a shared handle in
     /// `self.pending_map_files[row]` so [`Plain::on_map`] avoids re-allocating it, and appends
     /// the [`Effect::Map`].
@@ -2867,15 +2892,83 @@ impl<A: Allocator + Clone> Plain<A> {
         }
     }
 
-    /// Pre-builds any missing backfill segment Bloom filters and pre-verifies live mapped Bloom
-    /// records OUTSIDE the exclusive flip lock so `Plain::build` holds `self.flip` for minimal
-    /// time (zero `BloomBuilder::from_run` hashing and zero CRC-32C verification under the lock).
-    fn prepare_bloom_for_flip(&mut self, compact_bloom: bool) {
+    /// Projects the post-flip local segments and live root keys for `change` (against
+    /// `self.manifest` and any parked `self.folding`), backfills any missing mapped local segment
+    /// Bloom filters into `self.pending_bloom`, and — when compaction or backfill warrants a full
+    /// `bloom` rewrite — builds the complete compact `bloom` bytes OUTSIDE the exclusive `flip`
+    /// lock. Returns `Some((temp_file, bytes))` when a staged write should run in
+    /// `Phase::StagingBloom` before acquiring `self.flip`.
+    fn prepare_staged_bloom(&mut self, change: &Change<A>) -> Option<(StagedBloom, Effect)> {
         if !self.eager {
-            return;
+            return None;
         }
+        let compact_bloom = matches!(change, Change::Compact { .. });
+        let mut proj_segs: blaze_own::Vec<Segment, Kept> =
+            blaze_own::Vec::with_capacity_in(self.manifest.segments.len().saturating_add(4), BLOOM_ALLOC);
+        let mut proj_roots: blaze_own::Vec<ContentId, Kept> =
+            blaze_own::Vec::with_capacity_in(self.manifest.roots.len().saturating_add(4), BLOOM_ALLOC);
+
+        let folded = if matches!(change, Change::Commit { .. }) { self.folding.as_ref() } else { None };
+        let (drop_candidates, add_slice_seg, evict_plan): (&[u64], Option<Segment>, Option<&EvictPlan<A>>) = match change {
+            Change::Compact { seg, candidates, evict, .. } => (candidates.as_slice(), seg.as_ref().map(|(s, _)| *s), evict.as_ref()),
+            Change::Commit { .. } => match folded {
+                Some(slice) => (slice.candidates.as_slice(), slice.seg.as_ref().map(|(s, _)| *s), slice.evict.as_ref()),
+                None => (&[], None, None),
+            },
+            _ => (&[], None, None),
+        };
+
+        for seg in self.manifest.segments.iter() {
+            if !seg.local || self.dropped.contains(&seg.id) || drop_candidates.contains(&seg.id) {
+                continue;
+            }
+            proj_segs.push(*seg);
+        }
+        if let Some(seg) = add_slice_seg
+            && seg.local
+            && !proj_segs.iter().any(|it| it.id == seg.id)
+        {
+            proj_segs.push(seg);
+        }
+        if let Change::Commit { segs, .. } = change {
+            for (seg, _) in segs.iter() {
+                if seg.local && !proj_segs.iter().any(|it| it.id == seg.id) {
+                    proj_segs.push(*seg);
+                }
+            }
+        }
+
+        let root_removed = |name: &str| -> bool {
+            if evict_plan.is_some_and(|plan| plan.contains(name)) {
+                return true;
+            }
+            if let Change::Commit { roots, .. } = change {
+                return roots.iter().any(|edit| match edit {
+                    RootEdit::Set { name: n, renew_only: false, .. } | RootEdit::Unset(n) => n == name,
+                    _ => false,
+                });
+            }
+            false
+        };
+        for root in self.manifest.roots.iter() {
+            if root.expires_ns <= self.now_ns || root_removed(&root.name) {
+                continue;
+            }
+            proj_roots.push(root.key);
+        }
+        if let Change::Commit { roots, .. } = change {
+            for edit in roots.iter() {
+                if let RootEdit::Set { key, renew_only: false, .. } = edit {
+                    proj_roots.push(key.0);
+                }
+            }
+        }
+        proj_roots.sort_unstable();
+        proj_roots.dedup();
+
+        let mut backfilled_any = false;
         let mut backfilled: blaze_own::Vec<(ContentId, blaze_own::Vec<u8, Kept>), Kept> = blaze_own::Vec::new_in(BLOOM_ALLOC);
-        for seg in self.manifest.segments.iter().filter(|it| it.local) {
+        for seg in proj_segs.iter() {
             if !self.bloom.has(seg)
                 && !self.pending_bloom.iter().any(|(d, _)| *d == seg.digest)
                 && let Some(&at) = self.by_id.get(&seg.id)
@@ -2884,74 +2977,99 @@ impl<A: Allocator + Clone> Plain<A> {
             {
                 let rec = BloomBuilder::from_run(mapped.run(), &seg.digest);
                 backfilled.push((seg.digest, rec));
+                backfilled_any = true;
             }
         }
         for (digest, rec) in backfilled {
             self.record_pending_bloom(digest, rec);
         }
-        let will_rewrite = (compact_bloom && self.bloom.needs_compact(&self.manifest.segments, &self.manifest.roots))
-            || self.bloom.needs_urgent_compact(&self.manifest.segments, &self.manifest.roots);
-        if will_rewrite {
-            self.bloom.verify_live(&self.manifest.segments, &self.manifest.roots);
+
+        let mut pending_bytes = 0u64;
+        for (digest, rec) in self.pending_bloom.iter() {
+            let live_seg = proj_segs.iter().any(|seg| seg.digest == *digest);
+            let live_root = !live_seg && proj_roots.iter().any(|rk| root_bloom_digest(rk) == *digest);
+            if live_seg || live_root {
+                pending_bytes = pending_bytes.saturating_add(u64::try_from(rec.len()).unwrap_or(u64::MAX));
+            }
         }
+
+        let needs_compact = if compact_bloom {
+            self.bloom.needs_compact_for(&proj_segs, &proj_roots, pending_bytes)
+        } else {
+            self.bloom.needs_urgent_compact_for(&proj_segs, &proj_roots, pending_bytes)
+        };
+        if !backfilled_any && !needs_compact {
+            return None;
+        }
+
+        // Build the complete compact `bloom` bytes OUTSIDE the exclusive flip lock (lazy CRC-32C
+        // verification of existing mapped records happens here so lock hold time is O(1)).
+        let estimated = usize::try_from(
+            self.bloom.live_bytes_for_keys(&proj_segs, &proj_roots).saturating_add(pending_bytes),
+        )
+        .unwrap_or(0);
+        let mut bytes = effect_bytes!(estimated);
+        for seg in proj_segs.iter() {
+            if let Some((_, rec)) = self.pending_bloom.iter().find(|(d, _)| *d == seg.digest) {
+                bytes.extend_from_slice(rec);
+            } else if let Some(raw) = self.bloom.raw_record(seg) {
+                bytes.extend_from_slice(raw);
+            }
+        }
+        for rk in proj_roots.iter() {
+            let want = root_bloom_digest(rk);
+            if let Some((_, rec)) = self.pending_bloom.iter().find(|(d, _)| *d == want) {
+                bytes.extend_from_slice(rec);
+            } else if let Some(raw) = self.bloom.raw_record_digest(&want) {
+                bytes.extend_from_slice(raw);
+            }
+        }
+        if bytes.is_empty() {
+            return None;
+        }
+        let temp = self.bloom_temp_file();
+        let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        let info = StagedBloom { file: temp.share(), base_gen: self.manifest.generation, len };
+        let effect = Effect::WriteUnsynced { file: temp, bytes, tag: self.tag(BLOOM_STAGE, 0) };
+        Some((info, effect))
     }
 
-    /// Plans the optional `bloom` sidecar write for a flip whose resulting manifest is `m`.
-    /// When the store is whole (`self.eager`) and any live local segment lacks a filter (e.g.
-    /// upgrading an existing store) or dead bytes exceed the compaction threshold (`2x live + 64 KiB`
-    /// during compaction/GC, or `4x live + 1 MiB` urgent cap on foreground commits), writes a
-    /// compact replacement via atomic `WriteUnsynced`; otherwise appends only newly built records.
+    /// Plans the optional `bloom` sidecar write for a flip whose resulting manifest is `m`,
+    /// running strictly under the exclusive `flip` lock.
+    ///
+    /// Heavy multi-MB compaction/backfill bytes are NEVER built or written under the lock: they
+    /// were already staged to a temporary file in `Phase::StagingBloom` before acquiring `flip`.
+    /// Under the lock we ONLY perform either:
+    /// - an O(1) atomic `Effect::RenameUnsynced` of the staged temp file over `bloom` when
+    ///   `staged_ok && base_gen == staged.base_gen` (no concurrent commit or folded-slice abort
+    ///   invalidated the staged snapshot); or
+    /// - a tiny O(new records) `Effect::Append` of `self.pending_bloom` (leaving any stale staged
+    ///   temp file to be unlinked via `BLOOM_CLEANUP` after unlock).
     /// Returns `(effect, replaced, written_bytes)`.
-    fn plan_bloom_effect(&mut self, m: &Manifest, compact_bloom: bool) -> Option<(Effect, bool, u64)> {
-        let has_pending = |pending: &[(ContentId, blaze_own::Vec<u8, Kept>)], digest: &ContentId| pending.iter().any(|(d, _)| d == digest);
-        let needs_backfill = self.eager
-            && m.segments
-                .iter()
-                .any(|seg| seg.local && !self.bloom.has(seg) && !has_pending(&self.pending_bloom, &seg.digest) && self.by_id.contains_key(&seg.id));
-        let needs_compact = self.eager
-            && if compact_bloom {
-                self.bloom.needs_compact(&m.segments, &m.roots)
-            } else {
-                self.bloom.needs_urgent_compact(&m.segments, &m.roots)
-            };
-        if needs_backfill || needs_compact {
-            let mut bytes: blaze_own::Vec<u8, Kept> = blaze_own::Vec::new_in(BLOOM_ALLOC);
-            let mut backfilled: blaze_own::Vec<(ContentId, blaze_own::Vec<u8, Kept>), Kept> = blaze_own::Vec::new_in(BLOOM_ALLOC);
-            for seg in m.segments.iter().filter(|it| it.local) {
-                if let Some((_, rec)) = self.pending_bloom.iter().find(|(d, _)| *d == seg.digest) {
-                    bytes.extend_from_slice(rec);
-                } else if let Some(raw) = self.bloom.raw_record(seg) {
-                    bytes.extend_from_slice(raw);
-                } else if let Some(&at) = self.by_id.get(&seg.id)
-                    && let Some(mapped) = self.maps.get(at)
-                    && mapped.seg().digest == seg.digest
-                {
-                    let rec = BloomBuilder::from_run(mapped.run(), &seg.digest);
-                    bytes.extend_from_slice(&rec);
-                    backfilled.push((seg.digest, rec));
-                }
-            }
-            for root in m.roots.iter() {
-                let want = root_bloom_digest(&root.key);
-                if let Some((_, rec)) = self.pending_bloom.iter().find(|(d, _)| *d == want) {
-                    bytes.extend_from_slice(rec);
-                } else if let Some(raw) = self.bloom.raw_record_digest(&want) {
-                    bytes.extend_from_slice(raw);
-                }
-            }
-            for (digest, rec) in backfilled {
-                self.record_pending_bloom(digest, rec);
-            }
-            if bytes.is_empty() {
-                return None;
-            }
-            let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-            return Some((Effect::WriteUnsynced { file: self.bloom_file.share(), bytes: bytes.into_iter().collect(), tag: self.tag(BLOOM_WRITE, 0) }, true, len));
+    fn plan_bloom_effect(
+        &self,
+        m: &Manifest,
+        base_gen: u64,
+        staged_ok: bool,
+        staged: &Option<StagedBloom>,
+    ) -> Option<(Effect, bool, u64)> {
+        if staged_ok
+            && let Some(info) = staged.as_ref()
+            && info.base_gen == base_gen
+        {
+            return Some((
+                Effect::RenameUnsynced {
+                    from: info.file.share(),
+                    to: self.bloom_file.share(),
+                    tag: self.tag(BLOOM_WRITE, 0),
+                },
+                true,
+                info.len,
+            ));
         }
         if self.pending_bloom.is_empty() {
             return None;
         }
-        let mut bytes: blaze_own::Vec<u8, Kept> = blaze_own::Vec::new_in(BLOOM_ALLOC);
         let live_roots: Option<Map<[u8; 32], (), BuildKeyHasher, Kept>> = if self.pending_bloom.len() > 4 && m.roots.len() > 8 {
             let mut set = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: BLOOM_ALLOC, capacity: Some(m.roots.len()) });
             for root in m.roots.iter() {
@@ -2961,6 +3079,22 @@ impl<A: Allocator + Clone> Plain<A> {
         } else {
             None
         };
+        let mut total_len = 0usize;
+        for (digest, rec) in self.pending_bloom.iter() {
+            let live_seg = m.segments.iter().any(|seg| seg.local && seg.digest == *digest);
+            let live_root = !live_seg
+                && match &live_roots {
+                    Some(set) => set.contains_key(&digest.0),
+                    None => m.roots.iter().any(|root| root_bloom_digest(&root.key) == *digest),
+                };
+            if live_seg || live_root {
+                total_len = total_len.saturating_add(rec.len());
+            }
+        }
+        if total_len == 0 {
+            return None;
+        }
+        let mut bytes = effect_bytes!(total_len);
         for (digest, rec) in self.pending_bloom.iter() {
             let live_seg = m.segments.iter().any(|seg| seg.local && seg.digest == *digest);
             let live_root = !live_seg
@@ -2972,11 +3106,14 @@ impl<A: Allocator + Clone> Plain<A> {
                 bytes.extend_from_slice(rec);
             }
         }
-        if bytes.is_empty() {
-            return None;
-        }
         let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-        Some((Effect::Append { file: self.bloom_file.share(), bytes: bytes.into_iter().collect(), tag: self.tag(BLOOM_WRITE, 0) }, false, len))
+        Some((Effect::Append { file: self.bloom_file.share(), bytes, tag: self.tag(BLOOM_WRITE, 0) }, false, len))
+    }
+
+    /// Whether this process currently holds the exclusive `flip` lock (for DST lock-hold checks).
+    #[cfg(test)]
+    pub(crate) fn holds_flip_lock(&self) -> bool {
+        self.holds_lock
     }
 
     /// The leases this generation names: `(holder's nonce, expires ns)`.
@@ -3389,15 +3526,28 @@ impl<A: Allocator + Clone> Plain<A> {
         })
     }
 
+    /// Whether any local segment in the manifest is not yet barrier-sealed (`!seg.sealed`).
+    /// Unsealed segments require full-segment BLAKE3 re-verification after a reboot, so
+    /// `needs_housekeeping` reports them for detached `blaze gc --background` to barrier-seal off
+    /// the foreground critical path.
+    pub(crate) fn has_unsealed_segments(&self) -> bool {
+        self.manifest.segments.iter().any(|it| it.local && !it.sealed)
+    }
+
     /// O(segments + roots + retired) check of whether real compaction or GC housekeeping is due
     /// at `now_ns`, using only the in-memory manifest (no `map_all`, no index probes):
     /// - total committed bytes exceed the budget high watermark;
+    /// - any local segment is unsealed (`!seg.sealed`), so detached GC barrier-seals it for O(1)
+    ///   post-reboot verification;
     /// - any tier of any namespace exceeds `K` open mergeable segments (including leased open
     ///   segments, which tiered merges compact losslessly);
     /// - any root has expired (`expires_ns <= now_ns`);
     /// - any retired file is past `GRACE_NS`, not held by a live lease, and ready to unlink.
     pub fn needs_housekeeping(&self, now_ns: u64) -> bool {
         if self.over_budget() {
+            return true;
+        }
+        if self.has_unsealed_segments() {
             return true;
         }
         if self.manifest.roots.iter().any(|it| it.expires_ns != NEVER && it.expires_ns <= now_ns) {
@@ -3428,24 +3578,34 @@ impl<A: Allocator + Clone> Plain<A> {
         false
     }
 
-    /// Open mergeable segment threshold in one namespace past which a commit automatically folds
-    /// one lossless tiered-merge slice into its own flip (`Driven::commit_records`):
-    /// `K * open_tiers + K` (24 for [`Tiers::STORE`]), guaranteeing by pigeonhole that at least
-    /// one open tier exceeds `K` while leaving normal interactive runs (<= 20 open segments) with
-    /// zero foreground compaction overhead.
-    pub(crate) fn auto_merge_open_threshold(&self) -> usize {
+    /// Background housekeeping threshold (`K * open_tiers + K` = 24 for [`Tiers::STORE`]):
+    /// handled asynchronously by detached `blaze gc --background` via [`Plain::needs_housekeeping`].
+    pub const AUTO_TIER_MERGE_BG: usize = 24;
+
+    /// Emergency foreground safety ceiling for `Driven::commit_records`: normal foreground
+    /// commits never stall on multi-hundred-MB synchronous tier merges while detached GC keeps
+    /// segment count low; only if a namespace accumulates `>= 128` open mergeable segments (still
+    /// well below [`SEGMENTS_MOST`] = 276) does a foreground commit fold one lossless merge slice.
+    pub const AUTO_TIER_MERGE_FG: usize = 128;
+
+    /// Background open-segment merge threshold (`K * open_tiers + K`, 24 for [`Tiers::STORE`]).
+    pub(crate) fn auto_merge_bg_threshold(&self) -> usize {
         let tiers = self.tiers();
         let open_tiers = tiers.tier(tiers.segment_most()).saturating_sub(1);
         tiers.most().saturating_mul(open_tiers).saturating_add(tiers.most())
     }
 
-    /// Whether any namespace has accumulated at least [`Plain::auto_merge_open_threshold`] open
-    /// mergeable segments and should automatically fold one tiered-merge slice into the next
-    /// commit flip so consecutive multi-phase commits stay well below [`Plain::named_most`].
-    pub fn needs_auto_tier_merge(&self) -> bool {
+    /// Emergency foreground open-segment merge ceiling (`>= AUTO_TIER_MERGE_FG` = 128) past which
+    /// `Driven::commit_records` synchronously folds one lossless tiered-merge slice so even
+    /// hundreds of consecutive multi-phase commits without background GC stay well below
+    /// [`Plain::named_most`].
+    pub(crate) fn auto_merge_open_threshold(&self) -> usize {
+        self.auto_merge_bg_threshold().max(Self::AUTO_TIER_MERGE_FG)
+    }
+
+    fn has_open_mergeable_at_least(&self, threshold: usize) -> bool {
         let tiers = self.tiers();
         let blind = tiers.plant == TierPlant::PastCap;
-        let threshold = self.auto_merge_open_threshold();
         let segs = &self.manifest.segments;
         for (idx, first) in segs.iter().enumerate() {
             if segs.iter().take(idx).any(|prev| prev.namespace == first.namespace) {
@@ -3461,6 +3621,19 @@ impl<A: Allocator + Clone> Plain<A> {
             }
         }
         false
+    }
+
+    /// Whether any namespace has reached the emergency foreground auto-merge safety ceiling
+    /// ([`Plain::AUTO_TIER_MERGE_FG`] = 128) and must fold one lossless tiered-merge slice on
+    /// commit to stay well below [`Plain::named_most`].
+    pub fn needs_auto_tier_merge(&self) -> bool {
+        self.has_open_mergeable_at_least(self.auto_merge_open_threshold())
+    }
+
+    /// Whether any namespace has reached the background tier-merge threshold
+    /// ([`Plain::AUTO_TIER_MERGE_BG`] = 24), handled asynchronously by detached GC.
+    pub fn needs_auto_tier_merge_bg(&self) -> bool {
+        self.has_open_mergeable_at_least(self.auto_merge_bg_threshold().max(Self::AUTO_TIER_MERGE_BG))
     }
 
     /// Lets go of the root `name` at the next commit.
@@ -4022,6 +4195,7 @@ impl<A: Allocator + Clone> Plain<A> {
             Phase::Ready => "ready",
             Phase::Listing => "compacting",
             Phase::Writing(..) | Phase::Renaming(..) | Phase::Unwriting { .. } | Phase::SyncingSegment(..) => "writing a segment",
+            Phase::Flipping(ref flip) if flip.bloom_staging => "staging bloom sidecar",
             Phase::Flipping(_) => "flipping its head",
             Phase::Sealing { .. } => "sealing the exit tail",
             Phase::Broken => "broken",
@@ -5799,8 +5973,11 @@ impl<A: Allocator + Clone> Plain<A> {
     // ---- the flip: the one lock, held for it alone ----
 
     fn start_flip(&mut self, change: Change<A>, effects: &mut Vec<Effect>) {
-        let compact_bloom = matches!(change, Change::Compact { .. });
-        self.prepare_bloom_for_flip(compact_bloom);
+        let (bloom_staged, stage_effect) = match self.prepare_staged_bloom(&change) {
+            Some((info, effect)) => (Some(info), Some(effect)),
+            None => (None, None),
+        };
+        let bloom_staging = stage_effect.is_some();
         self.phase = Phase::Flipping(Box::new(Flip {
             change,
             waits: 0,
@@ -5816,10 +5993,16 @@ impl<A: Allocator + Clone> Plain<A> {
             carry: false,
             early: 0,
             deferred: None,
+            bloom_staged,
+            bloom_staging,
             bloom_effect: None,
             bloom_written: None,
         }));
-        effects.push(Effect::Lock { file: self.flip.share(), mode: LockMode::Exclusive, tag: self.tag(LOCK, 0) });
+        if let Some(effect) = stage_effect {
+            effects.push(effect);
+        } else {
+            effects.push(Effect::Lock { file: self.flip.share(), mode: LockMode::Exclusive, tag: self.tag(LOCK, 0) });
+        }
     }
 
     /// A built generation whose manifest would not encode (`why`: a row `format::Row::new`
@@ -5836,6 +6019,7 @@ impl<A: Allocator + Clone> Plain<A> {
     /// found, and what is retired past its grace.
     fn build(&mut self, base: Base, fresh: bool, now_ns: u64, effects: &mut Vec<Effect>) {
         let Phase::Flipping(mut flip) = std::mem::replace(&mut self.phase, Phase::Broken) else { unreachable!("a build is a flip's") };
+        let base_gen = base.manifest.generation;
         let generation = base.slot.map_or(1, |it| it.generation + 1);
         let mut m = base.manifest;
         m.generation = generation;
@@ -6249,8 +6433,8 @@ impl<A: Allocator + Clone> Plain<A> {
         flip.log = self.log_file(log);
         flip.fresh = fresh;
         flip.removals = removals;
-        let compact_bloom = matches!(flip.change, Change::Compact { .. });
-        if let Some((effect, replaced, len)) = self.plan_bloom_effect(&m, compact_bloom) {
+        let staged_ok = !folded.as_ref().is_some_and(|s| s.stats.aborted);
+        if let Some((effect, replaced, len)) = self.plan_bloom_effect(&m, base_gen, staged_ok, &flip.bloom_staged) {
             flip.bloom_effect = Some(effect);
             flip.bloom_written = Some((replaced, len));
         } else {
@@ -6334,6 +6518,9 @@ impl<A: Allocator + Clone> Plain<A> {
     fn flipped(&mut self, effects: &mut Vec<Effect>) {
         let Phase::Flipping(flip) = std::mem::replace(&mut self.phase, Phase::Broken) else { unreachable!("an unlock is a flip's") };
         let flip = *flip;
+        if let Some(staged) = flip.bloom_staged {
+            effects.push(Effect::Remove { file: staged.file, tag: self.tag(BLOOM_CLEANUP, 0) });
+        }
         if let Some(why) = flip.refused {
             self.pending_bloom.clear();
             let roots = match flip.change {
@@ -6915,7 +7102,7 @@ impl<A: Allocator + Clone> Plain<A> {
         let op = ((completion.tag.0 - self.cfg.tags) >> 32) as u8;
         let index = completion.tag.0 as u32;
         self.now_ns = now_ns;
-        if op == LATE_SYNC {
+        if op == LATE_SYNC || op == BLOOM_CLEANUP {
             return;
         }
         if matches!(self.phase, Phase::Broken) {
@@ -7323,6 +7510,16 @@ impl<A: Allocator + Clone> Plain<A> {
                 self.segment_written(Synced::by_sync(*writing), *why, effects);
                 Ok(())
             }
+            (BLOOM_STAGE, Phase::Flipping(flip)) if flip.bloom_staging => {
+                // `bloom` is a rebuildable acceleration sidecar: staging failure outside the lock
+                // never aborts the flip; fall through to acquiring `flip` with `bloom_staged = None`.
+                flip.bloom_staging = false;
+                if matches!(done, Done::Failed(_) | Done::Broken { .. }) {
+                    flip.bloom_staged = None;
+                }
+                effects.push(Effect::Lock { file: self.flip.share(), mode: LockMode::Exclusive, tag: self.tag(LOCK, 0) });
+                Ok(())
+            }
             (LOCK, Phase::Flipping(flip)) => match done {
                 Done::Locked => {
                     self.holds_lock = true;
@@ -7393,10 +7590,15 @@ impl<A: Allocator + Clone> Plain<A> {
                 Ok(())
             }
             (BLOOM_WRITE, Phase::Flipping(flip)) => {
-                // `bloom` is a rebuildable acceleration sidecar: an I/O error writing or
+                // `bloom` is a rebuildable acceleration sidecar: an I/O error renaming or
                 // appending to it never aborts the generation flip, but we clear `bloom_written`
                 // so `BloomIndex::mapped_bytes` is only updated when the write actually succeeded.
-                if matches!(done, Done::Failed(_) | Done::Broken { .. }) {
+                // When `RenameUnsynced` succeeded (`Done::Renamed`), the temp file was atomically
+                // consumed so clear `bloom_staged`; otherwise leave `bloom_staged` so `flipped()`
+                // removes the unused temp file after unlock.
+                if matches!(done, Done::Renamed) {
+                    flip.bloom_staged = None;
+                } else if matches!(done, Done::Failed(_) | Done::Broken { .. }) {
                     flip.bloom_written = None;
                 }
                 self.write_slot(effects);
@@ -7451,6 +7653,16 @@ impl<A: Allocator + Clone> Plain<A> {
         }
         })();
         if let Err(why) = outcome {
+            if let Phase::Flipping(flip) = &mut self.phase
+                && let Some(staged) = flip.bloom_staged.take()
+            {
+                effects.push(Effect::Remove { file: staged.file, tag: self.tag(BLOOM_CLEANUP, 0) });
+            }
+            if let Some(flip) = self.flip_parked.as_mut()
+                && let Some(staged) = flip.bloom_staged.take()
+            {
+                effects.push(Effect::Remove { file: staged.file, tag: self.tag(BLOOM_CLEANUP, 0) });
+            }
             if self.holds_lock {
                 // A failure under the flip lock lets the lock go as the store stops, with
                 // nothing this process wrote under it still in flight (a flip writes under it

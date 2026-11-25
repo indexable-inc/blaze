@@ -405,8 +405,9 @@ fn reused_dedups_shared_indexes_across_many_roots() {
     assert_eq!(store.got(found).bytes, &value(10_000)[..]);
 }
 
-/// `needs_housekeeping` is `false` on a clean bounded store and `true` in each trigger condition:
-/// total bytes over cap, expired root, tier count exceeding `K`, and expired retired file.
+/// `needs_housekeeping` is `false` on a clean sealed bounded store and `true` in each trigger
+/// condition: unsealed local segment, total bytes over cap, expired root, tier count exceeding
+/// `K`, and expired retired file.
 #[test]
 fn needs_housekeeping_clean_and_each_trigger_condition() {
     use super::super::core::{GRACE_NS, ROOT_LIFE_NS, TIER_SEGMENTS_MOST};
@@ -422,8 +423,14 @@ fn needs_housekeeping_clean_and_each_trigger_condition() {
     store.commit_with(&[]).expect("commit 1");
     let now = store.driver().wall_ns();
 
-    // Clean bounded store -> false.
-    assert!(!store.needs_housekeeping(now), "clean store with 1 segment needs no housekeeping");
+    // Trigger 0: newly committed unsealed local segment triggers housekeeping so detached GC
+    // barrier-seals it for O(1) post-reboot verification.
+    assert!(store.needs_housekeeping(now), "unsealed local segment triggers housekeeping");
+    store.seal().expect("seal 1");
+    let now = store.driver().wall_ns();
+
+    // Clean sealed bounded store -> false.
+    assert!(!store.needs_housekeeping(now), "clean sealed store with 1 segment needs no housekeeping");
 
     // Trigger 1: total bytes over cap -> true; back under cap -> false.
     store.core_mut().set_cap(1);
@@ -445,19 +452,21 @@ fn needs_housekeeping_clean_and_each_trigger_condition() {
         store.root_for("keep", &keys[..=i], ROOT_LIFE_NS).expect("root");
         store.release_lease();
         store.commit_with(&[]).expect("commit");
+        store.seal().expect("seal");
         let t = store.driver().wall_ns();
         let segs = store.core().segments().len();
         if segs <= TIER_SEGMENTS_MOST {
-            assert!(!store.needs_housekeeping(t), "{segs} segments in tier 0 (<= K) needs no housekeeping");
+            assert!(!store.needs_housekeeping(t), "{segs} sealed segments in tier 0 (<= K) needs no housekeeping");
         } else {
             assert!(store.needs_housekeeping(t), "{segs} segments in tier 0 (> K) triggers housekeeping");
         }
     }
 
-    // Compact merges tier 0 back to 1 segment and retires the old ones.
+    // Compact merges tier 0 back to 1 segment and retires the old ones; seal seals the merged segment.
     store.compact(1).expect("compact");
+    store.seal().expect("seal after compact");
     let after_compact = store.driver().wall_ns();
-    assert!(!store.needs_housekeeping(after_compact), "freshly compacted store (retired within grace) needs no housekeeping");
+    assert!(!store.needs_housekeeping(after_compact), "freshly compacted sealed store (retired within grace) needs no housekeeping");
 
     // Trigger 4: expired retired file past GRACE_NS -> true.
     assert!(store.needs_housekeeping(after_compact + GRACE_NS), "retired file past grace triggers housekeeping");

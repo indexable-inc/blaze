@@ -19,7 +19,7 @@ use blaze_core::{
 use blaze_ids::ContentId;
 use blaze_keyed::kind::{Namespace, Tag};
 use blaze_mem::{Frame, Kept};
-use blaze_own::Vec as OwnedVec;
+use blaze_own::{Share, Vec as OwnedVec};
 use blaze_sim::{Config, Tape};
 
 use super::{
@@ -358,4 +358,267 @@ fn bloom_dst_zero_false_negatives_across_cuts_faults_and_compactions() {
             sim = lent.into_store().into_driver();
         }
     });
+}
+
+/// Verifies:
+/// 1. `needs_housekeeping` flags unsealed local segments so detached GC barrier-seals them,
+///    clears once sealed, and post-reboot open proves sealed segments in O(1) (`checks().full == 0`).
+/// 2. Out-of-lock `bloom` compaction stages `bloom-tmp-*` via `Effect::WriteUnsynced` strictly
+///    OUTSIDE the exclusive `flip` lock (`!holds_flip_lock()`), NEVER writes `bloom` via
+///    `WriteUnsynced` under the lock, and ONLY performs an O(1) `Effect::RenameUnsynced` under
+///    `flip`.
+/// 3. Crashing (`sim.crash()`) at every completion step of out-of-lock bloom compaction leaves
+///    a valid store with zero false negatives in both `Driven::get` and `Snapshot::get`.
+/// 4. A concurrent writer committing while a compactor stages `bloom-tmp-*` succeeds with zero
+///    lock contention, and the compactor cleanly unlinks its stale temp file without clobbering
+///    the concurrent writer's appended bloom record.
+#[test]
+fn out_of_lock_bloom_compaction_crash_safety_and_unsealed_housekeeping() {
+    use core::time::Duration;
+    use blaze_core::{Driver, Effect, wait::Deadline};
+    use super::{bloom::BloomBuilder, core::Plain};
+
+    let root = test_root();
+    let bloom_file = FileName::new("plain/bloom").unwrap();
+
+    // Part 1: Unsealed segment triggers `needs_housekeeping`; sealing clears it and gives O(1)
+    // post-reboot verification with 0 full BLAKE3 segment checks.
+    {
+        let mut w = Driven::with(Sim::new(501, Faults::default()), "/sim".as_ref(), cfg(1, 1, &root), &root).expect("open");
+        w.put(key(1), Namespace::LOCAL, TAG, &value(1)).expect("put");
+        w.commit_with(&[]).expect("commit");
+        let now = w.driver().wall_ns();
+        assert!(w.needs_housekeeping(now), "unsealed local segment must trigger housekeeping");
+        assert!(w.seal().expect("seal"), "seal must seal the newly committed segment");
+        let after_seal = w.driver().wall_ns();
+        assert!(!w.needs_housekeeping(after_seal), "sealed clean store must not need housekeeping");
+        let sim = w.into_driver();
+
+        // Reboot (boot = 2): sealed segment is proved by seal with 0 full checks!
+        let mut r = Driven::with(sim, "/sim".as_ref(), cfg(2, 2, &root), &root).expect("reboot open");
+        assert_eq!(read_bytes(&mut r, &key(1)), Some(value(1)));
+        assert_eq!(r.core().proved_by_seal().len(), 1, "boot 2 must prove sealed segment without re-hashing");
+        assert_eq!(r.core().checks().full, 0, "sealed segment must incur 0 full BLAKE3 checks after reboot");
+    }
+
+    // Helper: creates a durable 6-segment store whose `plain/bloom` is bloated (> 2x live + 64 KiB)
+    // with dead/retired bloom records so the next `compact` triggers full bloom compaction.
+    let make_bloated = |seed: u64| -> (Sim, usize) {
+        let mut c = cfg(1, 1, &root);
+        c.durable = true;
+        let mut w = Driven::with(Sim::new(seed, Faults::default()), "/sim".as_ref(), c, &root).expect("open");
+        w.disable_auto_merge();
+        for seg in 0..6u32 {
+            for j in 0..8u32 {
+                let id = seg * 10 + j + 1;
+                w.put(key(id), Namespace::LOCAL, TAG, &value(id)).expect("put");
+            }
+            w.commit_with(&[]).expect("commit");
+        }
+        w.seal().expect("seal");
+        let mut sim = w.into_driver();
+        // Append > 128 KiB of valid framed dead-segment bloom records so `needs_compact` triggers.
+        let mut bloated = OwnedVec::new_in(BLOOM_ALLOC);
+        bloated.extend_from_slice(&sim.contents(&bloom_file));
+        for dead in 0..16u32 {
+            let dead_digest = ContentId::of("dead retired bloom seg", &dead.to_le_bytes());
+            let rec = BloomBuilder::new(8_000).finish(&dead_digest);
+            bloated.extend_from_slice(&rec);
+        }
+        let bloated_len = bloated.len();
+        sim.change(&bloom_file, &bloated);
+        (sim, bloated_len)
+    };
+
+    // Part 2: Step `Plain::compact` effect-by-effect and assert bloom staging runs OUTSIDE `flip`
+    // lock while ONLY O(1) `RenameUnsynced` runs under the lock.
+    {
+        let (mut sim, bloated_len) = make_bloated(502);
+        let mut c = cfg(2, 1, &root);
+        c.durable = true;
+        let mut store = Plain::new(c, &root);
+        let mut effects = core::default::Default::default();
+        let mut done = core::default::Default::default();
+        store.open_whole(&mut effects);
+        for _ in 0..20_000u32 {
+            sim.submit(&mut effects);
+            if store.ready() && sim.in_flight() == 0 {
+                break;
+            }
+            let now = sim.now();
+            sim.poll(&mut done, Deadline::after(now, Duration::from_secs(1)));
+            let wall = sim.wall_ns();
+            for comp in done.drain(..) {
+                if store.owns(comp.tag) {
+                    store.complete(comp, wall, &mut effects);
+                }
+            }
+        }
+        assert!(store.ready(), "compactor opened");
+
+        assert!(store.compact(&mut effects), "compact starts");
+        let mut staged_file: Option<FileName> = None;
+        let mut bloom_renames = 0u32;
+        for _ in 0..20_000u32 {
+            for eff in effects.iter() {
+                match eff {
+                    Effect::WriteUnsynced { file, .. } if file.as_str().contains("bloom") => {
+                        assert!(!store.holds_flip_lock(), "bloom WriteUnsynced must NEVER run while holding exclusive flip lock: {}", file.as_str());
+                        assert!(file.as_str().contains("bloom-tmp-"), "staged bloom must use temp file: {}", file.as_str());
+                        staged_file = Some(file.share());
+                    }
+                    Effect::RenameUnsynced { from, to, .. } if to.as_str().ends_with("/bloom") => {
+                        assert!(store.holds_flip_lock(), "atomic bloom rename must run under flip lock");
+                        assert!(from.as_str().contains("bloom-tmp-"), "rename source must be staged temp file: {}", from.as_str());
+                        bloom_renames += 1;
+                    }
+                    _ => {}
+                }
+            }
+            sim.submit(&mut effects);
+            if store.ready() && sim.in_flight() == 0 {
+                break;
+            }
+            let now = sim.now();
+            sim.poll(&mut done, Deadline::after(now, Duration::from_secs(1)));
+            let wall = sim.wall_ns();
+            for comp in done.drain(..) {
+                if store.owns(comp.tag) {
+                    store.complete(comp, wall, &mut effects);
+                }
+            }
+        }
+        assert!(store.broken().is_none(), "compactor broke: {:?}", store.broken());
+        let staged = staged_file.expect("out-of-lock bloom staging must have executed");
+        assert_eq!(bloom_renames, 1, "expected exactly 1 atomic rename under flip lock");
+        assert!(!sim.exists(&staged), "staged bloom temp file must be consumed by rename");
+        let after_len = sim.contents(&bloom_file).len();
+        assert!(after_len > 0 && after_len < bloated_len, "compacted bloom ({after_len}) must be non-empty and smaller than bloated ({bloated_len})");
+
+        let lent = Lent::new(Driven::with(sim, "/sim".as_ref(), cfg(3, 1, &root), &root).expect("reopen"), &root);
+        let snap = lent.snapshot_in(&root).expect("snapshot");
+        for seg in 0..6u32 {
+            for j in 0..8u32 {
+                let id = seg * 10 + j + 1;
+                let want = value(id);
+                assert_eq!(lent.get(&key(id)).expect("lent").expect("hit").bytes, want.as_slice());
+                assert_eq!(snap.get(&key(id)).expect("snap").expect("hit"), want.as_slice());
+            }
+        }
+    }
+
+    // Part 3: Crash at every completion step `0..48` during out-of-lock bloom compaction -> 0
+    // false negatives on reopen, and a subsequent clean compaction produces a compact bloom file.
+    for cut_at in 0..48u32 {
+        let (sim, bloated_len) = make_bloated(600 + u64::from(cut_at));
+        let mut c = cfg(2, 1, &root);
+        c.durable = true;
+        let mut comp = Driven::with(sim, "/sim".as_ref(), c, &root).expect("comp open");
+        comp.cut(Some(Cut::After(cut_at)));
+        let finished = comp.compact(1).is_ok();
+        let mut sim = comp.into_driver();
+        if !finished {
+            sim.crash();
+        }
+
+        let mut verify_cfg = cfg(3, 2, &root);
+        verify_cfg.durable = true;
+        let lent = Lent::new(Driven::with(sim, "/sim".as_ref(), verify_cfg, &root).expect("reopen after crash"), &root);
+        let snap = lent.snapshot_in(&root).expect("snap after crash");
+        for seg in 0..6u32 {
+            for j in 0..8u32 {
+                let id = seg * 10 + j + 1;
+                let want = value(id);
+                assert_eq!(lent.get(&key(id)).expect("lent").expect("hit").bytes, want.as_slice(), "cut {cut_at} key {id}");
+                assert_eq!(snap.get(&key(id)).expect("snap").expect("hit"), want.as_slice(), "cut {cut_at} snap key {id}");
+            }
+        }
+        drop(snap);
+        if finished {
+            let sim_after = lent.into_store().into_driver();
+            let len_after = sim_after.contents(&bloom_file).len();
+            assert!(len_after > 0 && len_after < bloated_len, "completed bloom compaction must shrink bloom");
+            break;
+        }
+    }
+
+    // Part 4: Concurrent writer commits while compactor is in `Phase::StagingBloom` (outside the
+    // flip lock) -> writer acquires `flip` immediately with zero contention, compactor detects
+    // `base_gen != staged.base_gen`, cleans up its stale temp file after unlock, and preserves
+    // both writers' keys.
+    {
+        let (mut sim, _) = make_bloated(700);
+        let mut c1 = cfg(2, 1, &root);
+        c1.durable = true;
+        let mut comp = Plain::new(c1, &root);
+        let mut ceffects = core::default::Default::default();
+        let mut done = core::default::Default::default();
+        comp.open_whole(&mut ceffects);
+        for _ in 0..20_000u32 {
+            sim.submit(&mut ceffects);
+            if comp.ready() && sim.in_flight() == 0 {
+                break;
+            }
+            let now = sim.now();
+            sim.poll(&mut done, Deadline::after(now, Duration::from_secs(1)));
+            let wall = sim.wall_ns();
+            for comp_done in done.drain(..) {
+                if comp.owns(comp_done.tag) {
+                    comp.complete(comp_done, wall, &mut ceffects);
+                }
+            }
+        }
+        assert!(comp.compact(&mut ceffects));
+        let mut staged_file: Option<FileName> = None;
+        let mut paused_for_writer = false;
+        let concurrent_key = key(777_001);
+        for _ in 0..20_000u32 {
+            if !paused_for_writer {
+                for eff in ceffects.iter() {
+                    if let Effect::WriteUnsynced { file, .. } = eff
+                        && file.as_str().contains("bloom-tmp-")
+                    {
+                        assert!(!comp.holds_flip_lock());
+                        staged_file = Some(file.share());
+                    }
+                }
+            }
+            sim.submit(&mut ceffects);
+            if comp.ready() && sim.in_flight() == 0 {
+                break;
+            }
+            let now = sim.now();
+            sim.poll(&mut done, Deadline::after(now, Duration::from_secs(1)));
+            let wall = sim.wall_ns();
+            for comp_done in done.drain(..) {
+                if comp.owns(comp_done.tag) {
+                    comp.complete(comp_done, wall, &mut ceffects);
+                }
+            }
+            // Right after `BLOOM_STAGE` finishes, `ceffects` holds `Effect::Lock` (not yet submitted).
+            // Run a concurrent writer to completion on the exact same `sim` before submitting `comp`'s lock!
+            if !paused_for_writer && staged_file.is_some() && !ceffects.is_empty() && ceffects.iter().any(|e| matches!(e, Effect::Lock { .. })) {
+                paused_for_writer = true;
+                let mut w_cfg = cfg(3, 1, &root);
+                w_cfg.durable = true;
+                let mut w = Driven::with(sim, "/sim".as_ref(), w_cfg, &root).expect("concurrent writer open");
+                w.put(concurrent_key, Namespace::LOCAL, TAG, &value(777_001)).expect("writer put");
+                w.commit_with(&[]).expect("concurrent writer commits without lock contention");
+                sim = w.into_driver();
+            }
+        }
+        assert!(paused_for_writer, "must have interleaved concurrent writer right after bloom staging");
+        assert!(comp.broken().is_none(), "compactor broke: {:?}", comp.broken());
+        let staged = staged_file.expect("staged temp file");
+        assert!(!sim.exists(&staged), "stale staged bloom temp file must be cleaned up after unlock");
+
+        let mut check = Driven::with(sim, "/sim".as_ref(), cfg(4, 1, &root), &root).expect("final open");
+        assert_eq!(read_bytes(&mut check, &concurrent_key), Some(value(777_001)));
+        for seg in 0..6u32 {
+            for j in 0..8u32 {
+                let id = seg * 10 + j + 1;
+                assert_eq!(read_bytes(&mut check, &key(id)), Some(value(id)));
+            }
+        }
+    }
 }

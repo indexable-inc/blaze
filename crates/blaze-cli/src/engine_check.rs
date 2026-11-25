@@ -2964,8 +2964,15 @@ fn checking<'f, 's: 'f>(
         let me = crate::journal_ask::Me::of(&host.build_id()?, place.served.root_text(), place.home, frame);
         let exe = (!cfg!(test) && !cx.is_simulated()).then(|| host.exe().ok()).flatten();
         let start = crate::journal_ask::HelperStart::detached(host, exe.as_deref(), place.served.root_text(), place.home);
-        let strategy = crate::journal_ask::Shipped { me, start };
-        strategy.changed_since(cx, root, opened.home.dir(), phases.clock(), chosen.places(), frame)?
+        let replay = if cx.is_simulated() {
+            crate::journal_ask::ReplayPolicy::Always
+        } else {
+            crate::journal_ask::ReplayPolicy::Auto {
+                stored_leaves: pointer.as_ref().map(|p| p.leaves.len()),
+            }
+        };
+        let strategy = crate::journal_ask::Shipped { me, start, replay };
+        strategy.changed_since(cx, fs, root, opened.home.dir(), phases.clock(), chosen.places(), frame)?
     };
     let now_places = crate::journal_checkpoint::Places::of_taken(&journal, frame);
     // The lint step and rules the root manifest names, as `check` reads them (lints.rs
@@ -3009,7 +3016,11 @@ fn checking<'f, 's: 'f>(
         let facts = pointer.facts;
         // The certificate reads no row, so it alone needs the tools (engine_answer.rs "THE
         // TOOLS"), and it renews this checkout's own roots: it stands on this checkout's answer
-        // under today's tools alone (`StoredBase::Own`). For a scoped check reusing this
+        // under today's tools (`StoredBase::Own`), AND on a whole-workspace
+        // `StoredBase::OtherCheckout` base whose every leaf digest matched this checkout
+        // (`!moved`), whose tools match (`certifies_under(&tools)`), and that has 0 owed tasks:
+        // adopting it writes this checkout's own pointer, fresh leaf stamps, journal cursor, and
+        // GC reach roots without falling through to `Phases`. For a scoped check reusing this
         // checkout's own whole-workspace answer (`own_whole`), the whole answer is a strict
         // superset and certifies directly when completely clean (0 findings, 0 lines blocks,
         // names checked, bodies checked whole); if it holds any finding/note (possibly in an
@@ -3020,8 +3031,31 @@ fn checking<'f, 's: 'f>(
                 && facts.printed.names
                 && facts.printed.bodies_whole
                 && lines.blocks().next().is_none());
-        if !moved && facts.printed.replayable && facts.owed == 0 && base == crate::engine_ready_edit::StoredBase::Own {
-            let scoped_filtered = if whole_clean_cert {
+        let own_certifies = base == crate::engine_ready_edit::StoredBase::Own;
+        let other_certifies = base == crate::engine_ready_edit::StoredBase::OtherCheckout
+            && check_scope.is_whole()
+            && !own_whole
+            && unreadable.is_none()
+            && pointer.leaves.len() > 0
+            && pointer.certifies_under(&tools)
+            && preopened_root.is_some();
+        if !moved && facts.printed.replayable && facts.owed == 0 && (own_certifies || other_certifies) {
+            let adopted = match preopened_root.as_ref() {
+                Some(root_dir) if other_certifies => crate::engine_answer::adopt_certified(
+                    cx,
+                    &mut store,
+                    &opened.lent,
+                    answer_root.as_str(),
+                    pointer,
+                    root_dir,
+                    &followed.now,
+                    &journal,
+                    request,
+                    frame,
+                )?,
+                _ => None,
+            };
+            let scoped_filtered = if whole_clean_cert || !own_certifies {
                 None
             } else {
                 match filter_whole_lines_for_scope(cx, &mut store, pointer, &followed.now, lines, check_scope, request, heap.alloc())? {
@@ -3032,7 +3066,7 @@ fn checking<'f, 's: 'f>(
                     }
                 }
             };
-            if whole_clean_cert || scoped_filtered.is_some() {
+            if (own_certifies && (whole_clean_cert || scoped_filtered.is_some())) || adopted.is_some() {
                 // The certificate's print and commit, then its profile, each in a call of its own
                 // (rule 54: no stage's temporaries in this frame).
                 let cert_root = if own_whole { whole_root.as_str() } else { answer_root.as_str() };
@@ -3055,7 +3089,7 @@ fn checking<'f, 's: 'f>(
                     live.see(blaze_screen::Step::Says);
                 }
                 *printed_out = true;
-                let stood = certified(cx, root, active_view_slot, pointer, lines, filtered_arg, cert_root, journal, &mut store, (&tools, toolchain), shown, phases, began, request, frame, out)?;
+                let stood = certified(cx, root, active_view_slot, pointer, lines, filtered_arg, cert_root, adopted.is_some(), journal, &mut store, (&tools, toolchain), shown, phases, began, request, frame, out)?;
                 drop(scoped_filtered);
                 drop(cert_view_slot);
                 drop(view_slot);
@@ -3086,8 +3120,13 @@ fn checking<'f, 's: 'f>(
             let me = crate::journal_ask::Me::of(&host.build_id()?, place.served.root_text(), place.home, frame);
             let exe = (!cfg!(test) && !cx.is_simulated()).then(|| host.exe().ok()).flatten();
             let start = crate::journal_ask::HelperStart::detached(host, exe.as_deref(), place.served.root_text(), place.home);
-            let strategy = crate::journal_ask::Shipped { me, start };
-            strategy.changed_since(cx, root, opened.home.dir(), phases.clock(), whole_chosen.places(), frame)?
+            let replay = if cx.is_simulated() {
+                crate::journal_ask::ReplayPolicy::Always
+            } else {
+                crate::journal_ask::ReplayPolicy::Auto { stored_leaves: Some(whole_ptr.leaves.len()) }
+            };
+            let strategy = crate::journal_ask::Shipped { me, start, replay };
+            strategy.changed_since(cx, fs, root, opened.home.dir(), phases.clock(), whole_chosen.places(), frame)?
         };
         let whole_marked = whole_journal.marked(&whole_ptr.leaves, frame);
         let follow = sweep::Follow { stamps: FromMeta::now(phases.clock()), plant: sweep::Plant::None };
@@ -3131,7 +3170,7 @@ fn checking<'f, 's: 'f>(
                     live.see(blaze_screen::Step::Says);
                 }
                 *printed_out = true;
-                let stood = certified(cx, root, whole_view_slot.as_ref(), &whole_ptr, &whole_lines, filtered_arg, whole_root.as_str(), journal_arg, &mut store, (&tools, toolchain), shown, phases, began, request, frame, out)?;
+                let stood = certified(cx, root, whole_view_slot.as_ref(), &whole_ptr, &whole_lines, filtered_arg, whole_root.as_str(), false, journal_arg, &mut store, (&tools, toolchain), shown, phases, began, request, frame, out)?;
                 drop(scoped_filtered);
                 drop(whole_view_slot);
                 drop(view_slot);
@@ -3998,7 +4037,7 @@ fn checking<'f, 's: 'f>(
             }
         }
         // 3. Print: the whole answer's lines, in a call of their own ([`lines_of`]).
-        let made = lines_of(cx, root, laid_now, &finished, last_lines.as_ref(), (names.as_ref(), &*scripts, &mut *bodies, &*heads, &*lints), (outlined, unread_notes.as_slice()), discovered, rows, skipped, heap, alloc, frame)?;
+        let made = lines_of(cx, root, &mut store, laid_now, &finished, last_lines.as_ref(), (names.as_ref(), &*scripts, &mut *bodies, &*heads, &*lints), (outlined, unread_notes.as_slice()), discovered, rows, skipped, heap, alloc, frame)?;
         phases.mark_cx(cx, "lines made", frame);
         let heap_lines_made = crate::engine_phase_mem::heap_now();
         // The closing line's count: every file the request has an outline of (on the ready setup,
@@ -4010,8 +4049,7 @@ fn checking<'f, 's: 'f>(
         *printed_out = true;
         let printed = print_answer(cx, root, &view_slot, &mut store, &made, rows, (names.as_ref(), &*bodies), &finished, (outlined, files_checked), unreadable.as_ref(), names_oracle, (&*phases, began), shown, frame, out)?;
         let AnswerPrinted { tally, lines_key, lines_bytes, status, oracle, bodies_whole } = printed;
-        let unprinted = made.unprinted;
-        drop(made);
+        let Made { unprinted, unused_dep_keys, .. } = made;
         phases.mark_cx(cx, "answer printed", frame);
         let heap_printed = crate::engine_phase_mem::heap_now();
         // The answer stored, its pointer written last, all in the store's one commit after it.
@@ -4080,6 +4118,8 @@ fn checking<'f, 's: 'f>(
         let mut kept_beside = heads.listing_keys(heap.alloc());
         kept_beside.extend(bodies.member_row_keys().iter().copied());
         kept_beside.extend(bodies.typed_record_keys().iter().copied());
+        kept_beside.extend(unused_dep_keys.iter().copied());
+        drop(unused_dep_keys);
         kept_beside.sort_unstable();
         kept_beside.dedup();
         // One commit call for both drivers, so what follows it (the scripts' status keep) follows
@@ -4297,6 +4337,9 @@ struct Made<'a> {
     first_unprinted: Option<Name>,
     /// Whether every standing body row's kept block says its body was checked whole.
     standing_bodies_whole: bool,
+    /// Per-file `unused_deps` cache record keys read or written this command, pinned under
+    /// `{name}.answer` so GC keeps them alive while this answer stands.
+    unused_dep_keys: SVec<'a, blaze_drive::Key>,
 }
 
 /// The stages [`lines_of`] reads the entered tasks' lines from: Names (when it ran), Scripts,
@@ -4318,6 +4361,7 @@ type LineStages<'x, 'f, 'b> = (
 fn lines_of<'a, 'f>(
     cx: &Cx,
     root: &Dir<ReadWrite>,
+    store: &mut dyn crate::store::Store<'_>,
     laid: Option<&crate::units::Laid<'_>>,
     finished: &blaze_engine::Finished<'_>,
     last_lines: Option<&crate::engine_lines::Last<'a, '_>>,
@@ -4498,8 +4542,10 @@ fn lines_of<'a, 'f>(
         }
     }
     // Unused-dependency warnings (unused_deps.rs): computed fresh on the Phases path where `laid`
-    // holds every member's manifest metadata, and carried forward from the last lines record on
-    // the Ready path (zero extra manifest I/O on body-only edits).
+    // holds every member's manifest metadata (hitting the per-file `BUD1` CAS cache for unchanged
+    // files), and carried forward from the last lines record on the Ready path (zero extra
+    // manifest I/O on body-only edits).
+    let mut unused_dep_keys: SVec<'a, blaze_drive::Key> = SVec::new_in(alloc);
     match laid {
         Some(laid) => {
             let mut skipped_roots: Vec<&str, &Frame> = Vec::with_capacity_in(skipped.targets.len(), frame);
@@ -4511,7 +4557,7 @@ fn lines_of<'a, 'f>(
                     skipped_roots.push(path);
                 }
             }
-            crate::unused_deps::collect(cx, root, laid, names, finished, outlined, &skipped_roots, &mut lines, frame)?;
+            crate::unused_deps::collect(cx, root, store, laid, names, finished, outlined, rows, &skipped_roots, &mut lines, &mut unused_dep_keys, frame)?;
         }
         None => {
             if let Some(last) = last_lines {
@@ -4527,7 +4573,7 @@ fn lines_of<'a, 'f>(
     for (name, why) in scripts.unkept() {
         lines.note(name, crate::engine_lines::Class::Told, bstd::mem::format_in!(frame, "{}", crate::engine_scripts::UnkeptWords(name, why)).as_bytes());
     }
-    Ok(Made { lines, unprinted, first_unprinted, standing_bodies_whole })
+    Ok(Made { lines, unprinted, first_unprinted, standing_bodies_whole, unused_dep_keys })
 }
 
 /// What [`print_answer`] printed and decided.
@@ -4566,7 +4612,7 @@ fn print_answer<'m, 'f, 'a>(
 ) -> Result<AnswerPrinted<'a>, CliError> {
     #[cfg(test)]
     stack_probe::at("print_answer");
-    let Made { lines, unprinted, first_unprinted, standing_bodies_whole } = made;
+    let Made { lines, unprinted, first_unprinted, standing_bodies_whole, unused_dep_keys: _ } = made;
     let (unprinted, first_unprinted) = (*unprinted, *first_unprinted);
     // Render and publish the immutable view alongside the semantic lines record.  On the next
     // unchanged request `ViewSlot::certified` can transfer these bytes without decoding or
@@ -4670,6 +4716,7 @@ fn print_answer<'m, 'f, 'a>(
 /// so its temporaries (the coverage, the tally, the formatted names) are never in
 /// [`checking`]'s frame (rule 54, bt4 2026-11-20). The store is committed by the caller after.
 #[inline(never)]
+#[expect(clippy::too_many_arguments, reason = "the certificate edge: each argument one handle of it")]
 fn certified<'m, 'f, D: blaze_core::Driver, S: crate::store::Sharing>(
     cx: &Cx,
     root: &Dir<ReadWrite>,
@@ -4678,6 +4725,7 @@ fn certified<'m, 'f, D: blaze_core::Driver, S: crate::store::Sharing>(
     lines: &crate::engine_lines::Last<'_, '_>,
     scoped_filtered: Option<(&crate::engine_lines::Lines<'_>, bool)>,
     answer_root: &str,
+    adopted: bool,
     journal: (&crate::journal_checkpoint::Chosen<'_>, &crate::journal_checkpoint::Places<'_>, &mut crate::journal_checkpoint::Counts),
     store: &mut crate::store::CommandStore<'m, '_, D, S>,
     (tools, toolchain): (&blaze_engine::Tools, blaze_toolchain::ToolchainId),
@@ -4732,30 +4780,43 @@ fn certified<'m, 'f, D: blaze_core::Driver, S: crate::store::Sharing>(
     phases.mark_cx(cx, "answer printed (the certificate)", frame);
     let status = status_of(&tally, 0, shown, coverage.is_some());
     // Read through, so renewed (store/roots.rs, the census).
-    let reach = bstd::mem::format_in!(frame, "{}.{}", answer_root, crate::engine_answer::REACH_ROOT);
-    let answer_index = bstd::mem::format_in!(frame, "{}.{}", answer_root, crate::engine_answer::ANSWER_ROOT);
-    // The certificate stood on this pointer at this replay's places: when due, they are kept as
-    // its journal checkpoint, riding the commit after (journal_checkpoint.rs).
-    journal_counts.written = crate::journal_checkpoint::after_certificate(cx, store, answer_root, pointer.key, chosen, now_places.stored(), crate::journal_checkpoint::DUE_EVENTS, frame)?;
-    let journal_root = crate::journal_checkpoint::name(answer_root, frame);
     let seeds_root = crate::engine_seeds::root_name(tools, frame);
-    let mut reach_shards = blaze_own::Vec::new_in(frame);
-    crate::engine_answer::push_reach_shards(store, answer_root, frame, &mut reach_shards)?;
-    let mut to_renew: blaze_own::Vec<&str, &Frame> = blaze_own::Vec::with_capacity_in(6 + reach_shards.len(), frame);
-    to_renew.push(answer_root);
-    to_renew.push(reach.as_str());
-    to_renew.push(answer_index.as_str());
-    to_renew.push(journal_root.as_str());
-    if view_hit
-        && let Some(slot) = view_slot
-    {
-        to_renew.push(slot.name.as_str());
+    if adopted {
+        // `adopt_certified` already pinned `answer_root`, its reach/answer roots, and its journal
+        // root with this checkout's fresh cursor; only renew shared seeds/toolchain (and view).
+        let mut to_renew: blaze_own::Vec<&str, &Frame> = blaze_own::Vec::with_capacity_in(2, frame);
+        if view_hit
+            && let Some(slot) = view_slot
+        {
+            to_renew.push(slot.name.as_str());
+        }
+        to_renew.push(seeds_root.as_str());
+        store.renew(&to_renew, toolchain)?;
+    } else {
+        let reach = bstd::mem::format_in!(frame, "{}.{}", answer_root, crate::engine_answer::REACH_ROOT);
+        let answer_index = bstd::mem::format_in!(frame, "{}.{}", answer_root, crate::engine_answer::ANSWER_ROOT);
+        // The certificate stood on this pointer at this replay's places: when due, they are kept as
+        // its journal checkpoint, riding the commit after (journal_checkpoint.rs).
+        journal_counts.written = crate::journal_checkpoint::after_certificate(cx, store, answer_root, pointer.key, chosen, now_places.stored(), crate::journal_checkpoint::DUE_EVENTS, frame)?;
+        let journal_root = crate::journal_checkpoint::name(answer_root, frame);
+        let mut reach_shards = blaze_own::Vec::new_in(frame);
+        crate::engine_answer::push_reach_shards(store, answer_root, frame, &mut reach_shards)?;
+        let mut to_renew: blaze_own::Vec<&str, &Frame> = blaze_own::Vec::with_capacity_in(6 + reach_shards.len(), frame);
+        to_renew.push(answer_root);
+        to_renew.push(reach.as_str());
+        to_renew.push(answer_index.as_str());
+        to_renew.push(journal_root.as_str());
+        if view_hit
+            && let Some(slot) = view_slot
+        {
+            to_renew.push(slot.name.as_str());
+        }
+        to_renew.push(seeds_root.as_str());
+        for shard in &reach_shards {
+            to_renew.push(shard.as_str());
+        }
+        store.renew(&to_renew, toolchain)?;
     }
-    to_renew.push(seeds_root.as_str());
-    for shard in &reach_shards {
-        to_renew.push(shard.as_str());
-    }
-    store.renew(&to_renew, toolchain)?;
     crate::store::Store::after_answer(store, cx, &mut blaze_drive::profile::Profile::default())?;
     Ok((status, tally))
 }
