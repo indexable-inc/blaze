@@ -2752,7 +2752,7 @@ fn build_from<P: FrontEnd>(
             let mut laid_for_const: blaze_own::AVec<'static, blaze_build::CoroutineOf> = blaze_own::AVec::new_in(alloc);
             if !need_tys.is_empty() {
                 let facts = FrontAdts(&*program_mut, i, &consts, &langs, &checked_bodies);
-                let coro_roots = match crate::front2::coroutine_needs::held_coroutines(&mut ground, &need_tys, &facts, alloc) {
+                let coro_roots = match crate::front2::coroutine_needs::referenced_coroutines(&mut ground, &need_tys, &facts, alloc) {
                     Ok(roots) => roots,
                     Err(error) => {
                         filed(&mut survey, RunError::Build { function: named, error, range: None })?;
@@ -2959,7 +2959,7 @@ fn build_from<P: FrontEnd>(
                 let mut laid_for_const: blaze_own::AVec<'static, blaze_build::CoroutineOf> = blaze_own::AVec::new_in(alloc);
                 if !need_tys.is_empty() {
                     let ofacts = FrontAdts(&*program_mut, ci, &consts, &langs, checked_bodies);
-                    let coro_roots = crate::front2::coroutine_needs::held_coroutines(ground, &need_tys, &ofacts, alloc)
+                    let coro_roots = crate::front2::coroutine_needs::referenced_coroutines(ground, &need_tys, &ofacts, alloc)
                         .map_err(|error| RunError::Build { function: program_mut.function(ci).named(), error, range: None })?;
                     if !coro_roots.is_empty() {
                         match lay_states::lay_only(&*program_mut, &consts, &langs, checked_bodies, ground, layouts, ci, &coro_roots, alloc)? {
@@ -3037,10 +3037,12 @@ fn build_from<P: FrontEnd>(
         // built into its state BEFORE this build (run/lay_states.rs): the build never meets a
         // state not laid. A coroutine's own function was built with its coroutine; a shim has
         // no body of its own.
-        if from_coroutine.is_none() && shim.is_none() && vtable_shim.is_none() && test_report.is_none() && clone_row.is_none() && from_row.is_none() {
+        if from_coroutine.is_none() {
+            let include_body = shim.is_none() && vtable_shim.is_none() && test_report.is_none() && clone_row.is_none() && from_row.is_none();
+            let extra_args = (instance.args != owner_args).then_some(instance.args);
             let roots = {
                 let adts = FrontAdts(&*program_mut, i, &consts, &langs, &checked_bodies);
-                match lay_states::roots_of_instance(&*program_mut, &checked_bodies, &adts, i, &args, &mut ground, alloc) {
+                match lay_states::roots_of_instance(&*program_mut, &checked_bodies, &adts, i, &args, extra_args, include_body, &mut ground, alloc) {
                     Ok(roots) => roots,
                     Err(e) => step_refused!(e),
                 }

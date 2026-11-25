@@ -43,23 +43,78 @@ pub(crate) fn held_coroutines<'a>(
     facts: &dyn LayoutFacts,
     alloc: Alloc<'a>,
 ) -> Result<Vec<CoroutineOf, Alloc<'a>>, BuildError> {
+    collect_coroutines(ground, roots, facts, false, alloc)
+}
+
+/// Each coroutine type `roots` hold by value OR reference through pointers, references, slices,
+/// fn items/pointers, trait objects, or generic type arguments, deduplicated, in first-met order.
+///
+/// Used when collecting an instance's root coroutines before building (`roots_of_instance`) and
+/// before constant evaluation (`const_at::pull`), where functions like `size_of_val_raw::<C>`,
+/// `Pin<&mut Timeout<C>>::project`, `MaybeDone::<C>::output_mut`, or `drop_in_place::<Wrapper<C>>`
+/// query `C`'s layout even though `C` is behind a pointer/reference or only in type arguments.
+/// [`held_coroutines`] remains strictly by-value for [`layout_order`]'s E0733 cycle check.
+pub(crate) fn referenced_coroutines<'a>(
+    ground: &mut PortableTys<'_>,
+    roots: &[PTy],
+    facts: &dyn LayoutFacts,
+    alloc: Alloc<'a>,
+) -> Result<Vec<CoroutineOf, Alloc<'a>>, BuildError> {
+    collect_coroutines(ground, roots, facts, true, alloc)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Walk {
+    /// Syntactic-only scan of type constructors and generic arguments (never calls `facts.adt`
+    /// or `facts.closure`, guaranteeing termination on recursive pointer ADTs and avoiding huge
+    /// transitive `Arc<...>` graph walks).
+    Syntactic = 0,
+    /// Reached across one `Ref`/`Ptr`/`Slice` hop: expands by-value fields of the pointee ADT
+    /// (so `&mut Holder` finds a non-generic TAIT coroutine field), while any further pointer hop
+    /// degrades to `Syntactic`.
+    Pointee = 1,
+    /// By-value traversal from the root types.
+    Inline = 2,
+}
+
+fn is_lazy_need(err: &BuildError) -> bool {
+    matches!(
+        err,
+        BuildError::NoAdt { .. }
+            | BuildError::MissingRecord { .. }
+            | BuildError::OpaqueOwnerUnchecked { .. }
+            | BuildError::Select(_)
+    )
+}
+
+fn collect_coroutines<'a>(
+    ground: &mut PortableTys<'_>,
+    roots: &[PTy],
+    facts: &dyn LayoutFacts,
+    through_ptrs: bool,
+    alloc: Alloc<'a>,
+) -> Result<Vec<CoroutineOf, Alloc<'a>>, BuildError> {
     let past = |_| BuildError::Malformed { what: "a type past the ground table (held_coroutines)" };
     let mut out: Vec<CoroutineOf, Alloc<'a>> = Vec::new_in(alloc);
-    let mut todo: Vec<PTy, Alloc<'a>> = Vec::with_capacity_in(roots.len(), alloc);
-    todo.extend_from_slice(roots);
-    // Every ground type entered, sorted: each is entered once.
-    let mut seen: Vec<PTy, Alloc<'a>> = Vec::new_in(alloc);
+    let mut todo: Vec<(PTy, Walk), Alloc<'a>> = Vec::with_capacity_in(roots.len(), alloc);
+    for &r in roots {
+        todo.push((r, Walk::Inline));
+    }
+    // Every ground type entered, sorted by `PTy`, storing the strongest `Walk` mode already run.
+    let mut seen: Vec<(PTy, Walk), Alloc<'a>> = Vec::new_in(alloc);
     let mut args: Vec<PTy, Alloc<'a>> = Vec::new_in(alloc);
-    while let Some(t) = todo.pop() {
-        match seen.binary_search(&t) {
-            Ok(_) => continue,
-            Err(at) => seen.insert_shift(at, t),
+    while let Some((t, mode)) = todo.pop() {
+        match seen.binary_search_by_key(&t, |&(ty, _)| ty) {
+            Ok(at) => {
+                if seen[at].1 >= mode {
+                    continue;
+                }
+                seen[at].1 = mode;
+            }
+            Err(at) => seen.insert_shift(at, (t, mode)),
         }
         let node = ground.view().node(t).map_err(past)?;
         match node {
-            // Nothing held inline past the value's own bytes: scalars, `str` and slices
-            // (unsized), pointers and references (the pointee is elsewhere), fn items (no
-            // bytes), fn pointers, trait objects and their parts, a constant's value.
             PNode::Bool
             | PNode::Char
             | PNode::Int(_)
@@ -67,46 +122,90 @@ pub(crate) fn held_coroutines<'a>(
             | PNode::Float(_)
             | PNode::Str
             | PNode::Never
-            | PNode::Ref(..)
-            | PNode::Ptr(..)
-            | PNode::Slice(_)
-            | PNode::FnDef(..)
-            | PNode::FnPtr(..)
-            | PNode::Dynamic(_)
-            | PNode::ExTrait(..)
-            | PNode::ExProj { .. }
             | PNode::ExAuto(_)
             // An extern type: no fields, and never held by value (it has no size).
             | PNode::Foreign(_)
             | PNode::ConstValue { .. } => {}
-            PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) => todo.extend_from_slice(ground.view().list(l).map_err(past)?),
+            PNode::Ref(_, inner) | PNode::Ptr(_, inner) | PNode::Slice(inner) => {
+                if through_ptrs {
+                    let next = if mode == Walk::Inline { Walk::Pointee } else { Walk::Syntactic };
+                    todo.push((inner, next));
+                }
+            }
+            PNode::FnDef(_, l) | PNode::FnPtr(l, _) | PNode::Dynamic(l) | PNode::ExTrait(_, l) => {
+                if through_ptrs {
+                    for &elem in ground.view().list(l).map_err(past)? {
+                        todo.push((elem, Walk::Syntactic));
+                    }
+                }
+            }
+            PNode::ExProj { args: l, term, .. } => {
+                if through_ptrs {
+                    todo.push((term, Walk::Syntactic));
+                    for &elem in ground.view().list(l).map_err(past)? {
+                        todo.push((elem, Walk::Syntactic));
+                    }
+                }
+            }
+            PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) => {
+                for &elem in ground.view().list(l).map_err(past)? {
+                    todo.push((elem, mode));
+                }
+            }
             // The element; the length is a constant.
-            PNode::Array(element, _) => todo.push(element),
+            PNode::Array(element, _) => todo.push((element, mode)),
             // A pattern type is held as its base.
-            PNode::Pat(base, _) => todo.push(base),
+            PNode::Pat(base, _) => todo.push((base, mode)),
             PNode::Adt(key, l) => {
+                args.clear();
+                args.extend_from_slice(ground.view().list(l).map_err(past)?);
+                if through_ptrs {
+                    for &arg in args.iter() {
+                        todo.push((arg, Walk::Syntactic));
+                    }
+                }
+                if mode == Walk::Syntactic {
+                    continue;
+                }
                 // An ADT whose row is not made is the build's `NoAdt`, the one form of that
                 // need: a lazy program makes the row and the instance is built again.
                 let adt = facts.adt(key).ok_or(BuildError::NoAdt { adt: key })?;
-                args.clear();
-                args.extend_from_slice(ground.view().list(l).map_err(past)?);
                 // `Adt::fields` holds every variant's fields: an enum holds each by value in
                 // its variant, a union each in its one place.
                 for field in adt.fields {
-                    let g = blaze_build::ground(adt.types, field.ty, &args, ground, alloc, facts)?;
-                    todo.push(g);
+                    match blaze_build::ground(adt.types, field.ty, &args, ground, alloc, facts) {
+                        Ok(g) => todo.push((g, mode)),
+                        Err(e) if mode == Walk::Pointee && !is_lazy_need(&e) => {}
+                        Err(e) => return Err(e),
+                    }
                 }
             }
             PNode::Closure { owner, ordinal, args: l } => {
-                let closure = facts.closure(owner, ordinal).ok_or(BuildError::UnsupportedSig {
-                    what: "a closure whose facts the world did not answer (`LayoutFacts::closure`), met while listing the coroutines a value holds",
-                })?;
                 args.clear();
                 args.extend_from_slice(ground.view().list(l).map_err(past)?);
-                let env = blaze_build::ground(closure.types, closure.env, &args, ground, alloc, facts)?;
-                todo.push(env);
+                if through_ptrs {
+                    for &arg in args.iter() {
+                        todo.push((arg, Walk::Syntactic));
+                    }
+                }
+                if mode == Walk::Syntactic {
+                    continue;
+                }
+                let Some(closure) = facts.closure(owner, ordinal) else {
+                    if mode == Walk::Pointee {
+                        continue;
+                    }
+                    return Err(BuildError::UnsupportedSig {
+                        what: "a closure whose facts the world did not answer (`LayoutFacts::closure`), met while listing the coroutines a value holds",
+                    });
+                };
+                match blaze_build::ground(closure.types, closure.env, &args, ground, alloc, facts) {
+                    Ok(env) => todo.push((env, mode)),
+                    Err(e) if mode == Walk::Pointee && !is_lazy_need(&e) => {}
+                    Err(e) => return Err(e),
+                }
             }
-            PNode::Coroutine { .. } => {
+            PNode::Coroutine { args: l, .. } => {
                 let of = coroutine_of(ground.view(), t).ok_or(BuildError::Malformed {
                     what: "a coroutine node `coroutine_of` does not read (held_coroutines)",
                 })?;
@@ -116,6 +215,11 @@ pub(crate) fn held_coroutines<'a>(
                     }
                     out.push(of);
                 }
+                if through_ptrs {
+                    for &arg in ground.view().list(l).map_err(past)? {
+                        todo.push((arg, Walk::Syntactic));
+                    }
+                }
             }
             PNode::Param(_)
             | PNode::ConstParam(_)
@@ -124,6 +228,9 @@ pub(crate) fn held_coroutines<'a>(
             | PNode::Future(..)
             | PNode::Infer
             | PNode::Error => {
+                if mode != Walk::Inline {
+                    continue;
+                }
                 return Err(BuildError::Malformed {
                     what: "a parameter, alias, opaque type, hole or future named by its expression in a ground type (held_coroutines)",
                 });
@@ -202,4 +309,58 @@ pub(crate) enum OrderError<'a> {
     HoldsItself(Vec<CoroutineOf, Alloc<'a>>),
     /// A refusal of `held_by`, or a bound past [`MOST_HELD`].
     Build(BuildError),
+}
+
+#[cfg(test)]
+mod tests {
+    use blaze_build::layout::{ClosureFacts, LayoutFacts, Missing, ReprAttrs, ValidRange};
+    use blaze_build::{CoroutineFacts, StateShape};
+    use blaze_mem::Frame as MemFrame;
+    use blaze_typeck::{Adt, ItemKey, Mutbl, Name, PNode, PTy, PTys, PortableTys};
+
+    use super::*;
+
+    struct EmptyFacts;
+
+    impl LayoutFacts for EmptyFacts {
+        fn adt(&self, _key: ItemKey) -> Option<Adt<'_>> { None }
+        fn repr(&self, key: ItemKey) -> Result<ReprAttrs, Missing> { Err(Missing { item: key }) }
+        fn discriminant(&self, adt: ItemKey, _variant: u32) -> Result<Option<i128>, Missing> { Err(Missing { item: adt }) }
+        fn valid_range(&self, key: ItemKey) -> Result<ValidRange, Missing> { Err(Missing { item: key }) }
+        fn normalize(&self, _trait_: ItemKey, _name: Name, _args: &[PTy], _ground: &mut PortableTys<'_>) -> Result<PTy, BuildError> {
+            Err(BuildError::Malformed { what: "unused" })
+        }
+        fn closure(&self, _owner: ItemKey, _ordinal: u32) -> Option<ClosureFacts<'_>> { None }
+        fn coroutine(&self, _owner: ItemKey, _ordinal: u32) -> Option<CoroutineFacts<'_>> { None }
+        fn coroutine_state(&self, owner: ItemKey, _ordinal: u32, _args: &[PTy], _ground: PTys<'_>) -> Result<Option<StateShape>, Missing> {
+            Err(Missing { item: owner })
+        }
+        fn opaque_hidden(&self, _opaque: ItemKey, _args: &[PTy], _ground: &mut PortableTys<'_>) -> Result<PTy, BuildError> {
+            Err(BuildError::Malformed { what: "unused" })
+        }
+    }
+
+    #[test]
+    fn referenced_finds_coroutines_behind_ptrs_refs_and_fndefs_while_held_skips_them() {
+        let Ok(frame) = MemFrame::new(blaze_mem::tag::Tag::Infer) else { unreachable!() };
+        let erased = blaze_own::Erased::new(&frame);
+        let alloc = erased.handle();
+        let mut ground = PortableTys::new_in(alloc);
+        let owner = ItemKey(42);
+        let empty = ground.intern_list(&[]).ok().unwrap_or_else(|| unreachable!());
+        let coro = ground.intern(PNode::Coroutine { owner, ordinal: 0, args: empty }).ok().unwrap_or_else(|| unreachable!());
+        let raw_ptr = ground.intern(PNode::Ptr(Mutbl::Not, coro)).ok().unwrap_or_else(|| unreachable!());
+        let mut_ref = ground.intern(PNode::Ref(Mutbl::Mut, coro)).ok().unwrap_or_else(|| unreachable!());
+        let fn_args = ground.intern_list(&[coro]).ok().unwrap_or_else(|| unreachable!());
+        let fn_def = ground.intern(PNode::FnDef(ItemKey(7), fn_args)).ok().unwrap_or_else(|| unreachable!());
+
+        let expected = CoroutineOf { owner, ordinal: 0, owner_args: empty };
+        let held = held_coroutines(&mut ground, &[raw_ptr, mut_ref, fn_def], &EmptyFacts, alloc).ok();
+        assert_eq!(held.as_deref(), Some(&[][..]));
+
+        for root in [raw_ptr, mut_ref, fn_def] {
+            let found = referenced_coroutines(&mut ground, &[root], &EmptyFacts, alloc).ok();
+            assert_eq!(found.as_deref(), Some(&[expected][..]));
+        }
+    }
 }

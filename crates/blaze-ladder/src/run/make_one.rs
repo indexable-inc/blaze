@@ -1533,7 +1533,7 @@ fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize
         if need_tys.is_empty() {
             Ok(())
         } else {
-            match crate::front2::coroutine_needs::held_coroutines(&mut work.ground, &need_tys, &facts, work.alloc) {
+            match crate::front2::coroutine_needs::referenced_coroutines(&mut work.ground, &need_tys, &facts, work.alloc) {
                 Ok(coro_roots) if coro_roots.is_empty() => Ok(()),
                 Ok(coro_roots) => match lay_only(&*program, &[], &work.langs, &bodies, &mut work.ground, &mut work.layouts, i, &coro_roots, work.alloc) {
                     Ok(LaidOnly::Done(recorded)) => {
@@ -1970,7 +1970,7 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
                 let t = tables.take().ok_or_else(|| tables_gone(tabled))?;
                 let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow, ub: work.ub, panic: work.panic, alloc: work.alloc };
                 let facts = FrontAdts(&*program, i, &[], &work.langs, &bodies);
-                let found = crate::front2::coroutine_needs::held_coroutines(&mut work.ground, &need_tys, &facts, work.alloc);
+                let found = crate::front2::coroutine_needs::referenced_coroutines(&mut work.ground, &need_tys, &facts, work.alloc);
                 *tables = Some(Tables { closures: bodies.closures, coroutines: bodies.coroutines, const_at: bodies.const_at });
                 found
             };
@@ -2244,8 +2244,10 @@ fn build_lir_phase<P: FrontEnd>(
             Some((at, part.index()))
         }
     };
-    if from_coroutine.is_none() && shim.is_none() && vtable_shim.is_none() && test_report.is_none() {
-        let roots = roots_of_instance(program, bodies, &adts, i, &args, &mut work.ground, work.alloc)?;
+    if from_coroutine.is_none() {
+        let include_body = shim.is_none() && vtable_shim.is_none() && test_report.is_none() && builtin_clone.is_none() && builtin_from.is_none();
+        let extra_args = (instance.args != owner_args).then_some(instance.args);
+        let roots = roots_of_instance(program, bodies, &adts, i, &args, extra_args, include_body, &mut work.ground, work.alloc)?;
         if !roots.is_empty() {
             match lay_and_build(program, &[], &work.langs, bodies, &mut work.ground, &mut work.layouts, &mut work.stash, i, &roots, true, work.alloc)? {
                 Lay::Done => {}
