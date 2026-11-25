@@ -24,8 +24,15 @@ use crate::svg_icons::icon_name_for_file;
 use crate::theme;
 use crate::view::{CellMetrics, PreviewLine, PreviewSpan, Scene, truncate_chars};
 
-const MAX_PREVIEW_BYTES: usize = 32 * 1024;
+const MAX_PREVIEW_BYTES: usize = 256 * 1024;
 const MAX_DIR_ENTRIES: usize = 512;
+
+const YAZI_PREVIEW_LIMITS: PreviewLimits = PreviewLimits {
+    max_rows: 512,
+    max_cols: 6,
+    max_lines: 400,
+    max_cell_chars: 64,
+};
 
 fn format_size_bytes(bytes: i64) -> String {
     let mut s = String::new();
@@ -69,6 +76,9 @@ pub struct YaziState {
     pub entries: Vec<YaziEntry>,
     pub selected: usize,
     pub scroll: usize,
+    pub preview_scroll: usize,
+    pub preview_max_scroll: usize,
+    pub preview_split_x: f32,
     pub filter: String,
     pub filtering: bool,
     pub show_hidden: bool,
@@ -86,6 +96,9 @@ impl YaziState {
             entries: Vec::new(),
             selected: 0,
             scroll: 0,
+            preview_scroll: 0,
+            preview_max_scroll: 0,
+            preview_split_x: 420.0,
             filter: String::new(),
             filtering: false,
             show_hidden: false,
@@ -137,6 +150,8 @@ impl YaziState {
     }
 
     pub fn refresh_preview(&mut self) {
+        self.preview_scroll = 0;
+        self.preview_max_scroll = 0;
         let Some(entry) = self.current_entry().cloned() else {
             self.preview = YaziPreview::Empty;
             return;
@@ -147,6 +162,41 @@ impl YaziState {
             return;
         }
         self.preview = load_rich_preview(&entry.path, &entry.name, entry.size);
+    }
+
+    /// Handle macOS trackpad / mouse-wheel scrolling in either the file column or the RHS preview pane!
+    pub fn scroll_at(&mut self, x: f32, delta_rows: isize) -> bool {
+        if delta_rows == 0 {
+            return false;
+        }
+        if x >= self.preview_split_x {
+            let next = if delta_rows > 0 {
+                self.preview_scroll.saturating_add(delta_rows as usize)
+            } else {
+                self.preview_scroll.saturating_sub(delta_rows.unsigned_abs())
+            }
+            .min(self.preview_max_scroll);
+            let changed = next != self.preview_scroll;
+            self.preview_scroll = next;
+            changed
+        } else {
+            let vis_len = self.visible_indices().len();
+            if vis_len == 0 {
+                return false;
+            }
+            let next = if delta_rows > 0 {
+                self.selected.saturating_add(delta_rows as usize).min(vis_len - 1)
+            } else {
+                self.selected.saturating_sub(delta_rows.unsigned_abs())
+            };
+            if next != self.selected {
+                self.selected = next;
+                self.refresh_preview();
+                true
+            } else {
+                false
+            }
+        }
     }
 
     pub fn handle_key(&mut self, key: &str, ch: Option<char>) -> YaziAction {
@@ -242,6 +292,14 @@ impl YaziState {
                 }
                 YaziAction::Continue
             }
+            Some('J') => {
+                self.preview_scroll = (self.preview_scroll + 4).min(self.preview_max_scroll);
+                YaziAction::Continue
+            }
+            Some('K') => {
+                self.preview_scroll = self.preview_scroll.saturating_sub(4);
+                YaziAction::Continue
+            }
             Some('h') => {
                 self.go_parent();
                 YaziAction::Continue
@@ -309,7 +367,7 @@ fn load_rich_preview(path: &Path, name: &str, size: u64) -> YaziPreview {
     let mut buf = vec![0u8; (size as usize).min(MAX_PREVIEW_BYTES)];
     let n = f.read(&mut buf).unwrap_or(0);
     buf.truncate(n);
-    let doc = build_preview(name, &buf, size, PreviewLimits::SHIPPED, Alloc::global());
+    let doc = build_preview(name, &buf, size, YAZI_PREVIEW_LIMITS, Alloc::global());
     YaziPreview::Rich(doc)
 }
 
@@ -675,18 +733,24 @@ pub fn layout_yazi_view(
     }
 
     // Column 3: Rich `blaze-preview` pane (Tables | KeyValues | Rendered Markdown | Highlighted Code | Summary).
+    yazi.preview_split_x = col3_x0;
     let clip3 = scene.push_clip(col3_x0 + 1.0, body_top, col3_x1, body_bot, 0.0);
     let px = col3_x0 + 18.0;
-    let pw = (col3_x1 - px - 16.0).max(100.0);
+    let pw = (col3_x1 - px - 18.0).max(100.0);
     match &yazi.preview {
         YaziPreview::Empty => {
+            yazi.preview_max_scroll = 0;
             scene.text(px, body_top + 14.0, "no selection", theme::INK_4, false, true, clip3);
         }
         YaziPreview::Directory(items) => {
+            let max_s = items.len().saturating_sub(max_vis_rows);
+            yazi.preview_max_scroll = max_s;
+            let sc = yazi.preview_scroll.min(max_s);
+            yazi.preview_scroll = sc;
             if items.is_empty() {
                 scene.text(px, body_top + 14.0, "empty directory", theme::INK_4, false, true, clip3);
             } else {
-                for (i, sub) in items.iter().take(max_vis_rows).enumerate() {
+                for (i, sub) in items.iter().skip(sc).take(max_vis_rows).enumerate() {
                     let ry = body_top + 6.0 + i as f32 * row_h;
                     let ty = ry + (row_h - m.ch) * 0.5;
                     scene.svg_icon(px, ty + (m.ch - icon_s) * 0.5, icon_s, sub.icon, clip3);
@@ -694,12 +758,30 @@ pub fn layout_yazi_view(
                     let lbl = if sub.is_dir { format!("{}/", sub.name) } else { sub.name.clone() };
                     scene.text(px + 20.0, ty, truncate_chars(&lbl, max_c), theme::INK_2, false, false, clip3);
                 }
+                if max_s > 0 {
+                    draw_mini_scrollbar(&mut scene, col3_x1 - 9.0, body_top + 8.0, body_bot - 8.0, sc, max_s, max_vis_rows, items.len(), clip3);
+                }
             }
         }
         YaziPreview::Rich(doc) => {
-            render_rich_preview(&mut scene, doc, px, body_top + 10.0, pw, body_bot - 8.0, m, clip3);
+            let (_, max_s) = render_rich_preview_scrolled(
+                &mut scene,
+                doc,
+                px,
+                body_top + 10.0,
+                pw,
+                body_bot - 8.0,
+                m,
+                clip3,
+                yazi.preview_scroll,
+            );
+            yazi.preview_max_scroll = max_s;
+            if yazi.preview_scroll > max_s {
+                yazi.preview_scroll = max_s;
+            }
         }
         YaziPreview::Error(err) => {
+            yazi.preview_max_scroll = 0;
             scene.text(px, body_top + 14.0, err, theme::DANGER, false, false, clip3);
         }
     }
@@ -723,7 +805,7 @@ pub fn layout_yazi_view(
         format!("y · {}/{}{kind_badge}", yazi.selected + 1, vis.len())
     };
     scene.text(14.0, fty, pos_lbl, theme::INK_2, true, false, 0);
-    let hint = "hjkl move  ·  / filter  ·  . hidden  ·  space insert  ·  q cd & exit";
+    let hint = "hjkl move  ·  J/K scroll  ·  / filter  ·  . hidden  ·  space insert  ·  q exit";
     let hw = hint.chars().count() as f32 * m.cw;
     if vw - 14.0 - hw > 220.0 {
         scene.text(vw - 14.0 - hw, fty, hint, theme::INK_4, false, false, 0);
@@ -731,6 +813,31 @@ pub fn layout_yazi_view(
 
     layout_top_bar(&mut scene, store, prompt, vw, m, zoom_pct, inline_titlebar);
     scene
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_mini_scrollbar(
+    scene: &mut Scene,
+    x0: f32,
+    y0: f32,
+    y1: f32,
+    scroll: usize,
+    max_scroll: usize,
+    visible: usize,
+    total: usize,
+    clip: u32,
+) {
+    if max_scroll == 0 || y1 <= y0 + 20.0 {
+        return;
+    }
+    let track_h = y1 - y0;
+    let w = 3.5;
+    scene.round_rect(x0, y0, x0 + w, y1, 1.75, theme::BG_TRACK, 0.0, [0.0; 4], clip);
+    let frac = (visible as f32 / total.max(1) as f32).clamp(0.10, 1.0);
+    let thumb_h = (track_h * frac).max(18.0);
+    let pos_frac = (scroll.min(max_scroll) as f32) / (max_scroll as f32);
+    let ty0 = y0 + (track_h - thumb_h) * pos_frac;
+    scene.over_round_rect(x0, ty0, x0 + w, ty0 + thumb_h, 1.75, theme::INK_4, clip);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -744,15 +851,40 @@ pub(crate) fn render_rich_preview(
     m: CellMetrics,
     clip: u32,
 ) -> f32 {
+    render_rich_preview_scrolled(scene, doc, x0, y0, w, max_y, m, clip, 0).0
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_rich_preview_scrolled(
+    scene: &mut Scene,
+    doc: &PreviewDoc<'_>,
+    x0: f32,
+    y0: f32,
+    w: f32,
+    max_y: f32,
+    m: CellMetrics,
+    clip: u32,
+    scroll: usize,
+) -> (f32, usize) {
     match &doc.body {
         PreviewBody::Table(tbl) => {
-            render_preview_table(scene, tbl, x0, y0, w, max_y, m, clip) - y0
+            let (end_y, max_s) = render_preview_table(scene, tbl, x0, y0, w, max_y, m, clip, scroll);
+            (end_y - y0, max_s)
         }
         PreviewBody::KeyValues(kv) => {
-            render_preview_kv(scene, kv, x0, y0, w, max_y, m, clip) - y0
+            let (end_y, max_s) = render_preview_kv(scene, kv, x0, y0, w, max_y, m, clip, scroll);
+            (end_y - y0, max_s)
         }
         PreviewBody::Markdown { blocks, truncated } => {
-            render_preview_markdown(scene, blocks.as_slice(), *truncated, x0, y0, w, max_y, m, clip) - y0
+            let slice = blocks.as_slice();
+            let est_vis = (((max_y - y0) / (m.ch + 5.0)).floor().max(1.0) as usize).min(slice.len());
+            let max_s = slice.len().saturating_sub(est_vis);
+            let sc = scroll.min(max_s);
+            let end_y = render_preview_markdown(scene, &slice[sc..], *truncated, x0, y0, w - 8.0, max_y, m, clip);
+            if max_s > 0 {
+                draw_mini_scrollbar(scene, x0 + w + 4.0, y0, max_y, sc, max_s, est_vis, slice.len(), clip);
+            }
+            (end_y - y0, max_s)
         }
         PreviewBody::Code { lang, lines, truncated } => {
             let mut y = y0;
@@ -762,12 +894,19 @@ pub(crate) fn render_rich_preview(
             y += m.ch + 6.0;
             scene.line(x0, y, x0 + w, y, 1.0, theme::LINE_FAINT, clip);
             y += 8.0;
-            let end_y = render_code_lines(scene, lines.as_slice(), x0, y, w, max_y, m, clip, true);
-            if *truncated && end_y + m.ch <= max_y {
+            let slice = lines.as_slice();
+            let vis = (((max_y - y) / (m.ch + 2.0)).floor().max(1.0) as usize).min(slice.len());
+            let max_s = slice.len().saturating_sub(vis);
+            let sc = scroll.min(max_s);
+            let end_y = render_code_lines(scene, &slice[sc..], x0, y, w - 8.0, max_y, m, clip, true);
+            if max_s > 0 {
+                draw_mini_scrollbar(scene, x0 + w + 4.0, y, max_y, sc, max_s, vis, slice.len(), clip);
+            }
+            if *truncated && sc == max_s && end_y + m.ch <= max_y {
                 scene.text(x0 + 4.0 * m.cw, end_y + 2.0, "… truncated", theme::INK_4, false, true, clip);
-                (end_y + m.ch + 4.0) - y0
+                ((end_y + m.ch + 4.0) - y0, max_s)
             } else {
-                end_y - y0
+                (end_y - y0, max_s)
             }
         }
         PreviewBody::Summary { pairs } => {
@@ -786,7 +925,7 @@ pub(crate) fn render_rich_preview(
                 scene.text(x0 + 14.0 * m.cw, y, v.as_str(), theme::INK_1, false, false, clip);
                 y += m.ch + 6.0;
             }
-            y - y0
+            (y - y0, 0)
         }
     }
 }
@@ -801,7 +940,8 @@ fn render_preview_table(
     max_y: f32,
     m: CellMetrics,
     clip: u32,
-) -> f32 {
+    scroll: usize,
+) -> (f32, usize) {
     scene.text(x0, y, tbl.title.as_str(), theme::INK_1, true, false, clip);
     let sub_w = tbl.subtitle.chars().count() as f32 * m.cw;
     scene.text(x0 + w - sub_w, y, tbl.subtitle.as_str(), theme::INK_4, false, false, clip);
@@ -810,22 +950,25 @@ fn render_preview_table(
     y += 7.0;
 
     let ncols = tbl.headers.len().max(1);
+    let idx_w = 3.5 * m.cw;
+    let inner_w = (w - idx_w - 8.0).max(80.0);
     let col_gap = 14.0;
     let mut widths = vec![0usize; ncols];
     for (c, h) in tbl.headers.iter().enumerate() {
         widths[c] = h.chars().count().max(4);
     }
-    for row in tbl.rows.iter() {
+    for row in tbl.rows.iter().take(128) {
         for (c, cell) in row.iter().enumerate().take(ncols) {
             widths[c] = widths[c].max(cell.chars().count().min(32));
         }
     }
     let total_px: f32 = widths.iter().map(|&n| n as f32 * m.cw + col_gap).sum();
-    let scale = if total_px > w && total_px > 0.0 { w / total_px } else { 1.0 };
+    let scale = if total_px > inner_w && total_px > 0.0 { inner_w / total_px } else { 1.0 };
     let col_px: Vec<f32> = widths.iter().map(|&n| (n as f32 * m.cw + col_gap) * scale).collect();
 
-    // Header row
-    let mut cx = x0;
+    // Sticky header row
+    scene.text(x0, y, "#", theme::INK_4, false, false, clip);
+    let mut cx = x0 + idx_w;
     for (c, h) in tbl.headers.iter().enumerate() {
         let max_c = ((col_px[c] - 6.0) / m.cw).floor().max(3.0) as usize;
         scene.text(cx, y, truncate_chars(h.as_str(), max_c), theme::INK_3, false, false, clip);
@@ -835,26 +978,38 @@ fn render_preview_table(
     scene.line(x0, y, x0 + w, y, 1.0, theme::LINE, clip);
     y += 5.0;
 
+    let rows_top = y;
     let row_h = m.ch + 5.0;
-    for row in tbl.rows.iter() {
-        if y + row_h > max_y {
-            break;
-        }
-        let mut rx = x0;
+    let vis_rows = (((max_y - rows_top) / row_h).floor().max(1.0) as usize).min(tbl.rows.len());
+    let max_s = tbl.rows.len().saturating_sub(vis_rows);
+    let sc = scroll.min(max_s);
+
+    for (i, row) in tbl.rows.iter().enumerate().skip(sc).take(vis_rows) {
+        scene.text(x0, y + 1.0, format!("{i}"), theme::INK_4, false, false, clip);
+        let mut rx = x0 + idx_w;
         for (c, cell) in row.iter().enumerate().take(ncols) {
             let max_c = ((col_px[c] - 6.0) / m.cw).floor().max(3.0) as usize;
-            let col = if c == 0 { theme::INK_1 } else if c == 1 { theme::rgb(0x7c, 0xc9, 0x8b) } else { theme::INK_3 };
+            let col = if c == 0 {
+                theme::INK_1
+            } else if c == 1 {
+                theme::rgb(0x7c, 0xc9, 0x8b)
+            } else {
+                theme::INK_3
+            };
             scene.text(rx, y + 1.0, truncate_chars(cell.as_str(), max_c), col, false, false, clip);
             rx += col_px[c];
         }
         y += row_h;
     }
-    if tbl.total_rows > tbl.rows.len() && y + m.ch <= max_y {
+    if max_s > 0 {
+        draw_mini_scrollbar(scene, x0 + w + 4.0, rows_top, y, sc, max_s, vis_rows, tbl.rows.len(), clip);
+    }
+    if tbl.total_rows > tbl.rows.len() && sc == max_s && y + m.ch <= max_y {
         let more = format!("… +{} more", tbl.total_rows - tbl.rows.len());
-        scene.text(x0, y + 2.0, more, theme::INK_4, false, true, clip);
+        scene.text(x0 + idx_w, y + 2.0, more, theme::INK_4, false, true, clip);
         y += m.ch + 4.0;
     }
-    y
+    (y, max_s)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -867,7 +1022,8 @@ fn render_preview_kv(
     max_y: f32,
     m: CellMetrics,
     clip: u32,
-) -> f32 {
+    scroll: usize,
+) -> (f32, usize) {
     scene.text(x0, y, kv.title.as_str(), theme::INK_1, true, false, clip);
     let sub_w = kv.subtitle.chars().count() as f32 * m.cw;
     scene.text(x0 + w - sub_w, y, kv.subtitle.as_str(), theme::INK_4, false, false, clip);
@@ -879,19 +1035,22 @@ fn render_preview_kv(
     let val_max_c = ((w - key_w) / m.cw).floor().max(10.0) as usize;
     for (k, v) in kv.pairs.iter() {
         if y + m.ch > max_y {
-            return y;
+            return (y, 0);
         }
         scene.text(x0, y, k.as_str(), theme::INK_3, false, false, clip);
         scene.text(x0 + key_w, y, truncate_chars(v.as_str(), val_max_c), theme::INK_1, false, false, clip);
         y += m.ch + 4.0;
     }
+    let mut max_s = 0usize;
     if let Some(tbl) = &kv.table
         && y + m.ch * 3.0 < max_y
     {
         y += 10.0;
-        y = render_preview_table(scene, tbl, x0, y, w, max_y, m, clip);
+        let (end_y, ms) = render_preview_table(scene, tbl, x0, y, w, max_y, m, clip, scroll);
+        y = end_y;
+        max_s = ms;
     }
-    y
+    (y, max_s)
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -1463,7 +1463,7 @@ fn layout_table(
         let cw = col_widths[c];
         let content_w = (cw - col_gap).max(m.cw * 2.0);
         let col_raw = table.columns.get(c).map(|s| s.as_ref()).unwrap_or("");
-        let active_sort = if depth == 0 {
+        let active_sort = if depth <= 1 {
             block.table_sort.and_then(|(sc, desc)| if sc == c { Some(desc) } else { None })
         } else {
             None
@@ -1491,7 +1491,7 @@ fn layout_table(
             };
             scene.text(tx, y0, hdr, hdr_col, active_sort.is_some(), false, clip_id);
         }
-        if depth == 0 {
+        if depth <= 1 {
             let hdr_hit = HitRect::new(cx - 4.0, y0 - 2.0, cx + content_w + 4.0, y0 + m.ch + 4.0);
             scene.push_hit_clipped(
                 hdr_hit,
@@ -1829,7 +1829,7 @@ fn layout_table(
         );
     }
 
-    if depth == 0 && total_rows > TABLE_FOLD_ROWS {
+    if depth <= 1 && total_rows > TABLE_FOLD_ROWS {
         cur_y += 4.0;
         let lbl = if block.folded {
             format!(

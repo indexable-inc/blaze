@@ -2284,7 +2284,29 @@ mod macos_app {
                         }
                         NSEventType::ScrollWheel => {
                             let dy = ev.scrollingDeltaY();
-                            if shell.store.is_alternate_screen() {
+                            if let Some(yazi) = &mut shell.yazi {
+                                let step_px = if ev.hasPreciseScrollingDeltas() {
+                                    dy as f32
+                                } else {
+                                    dy as f32 * 24.0
+                                };
+                                let rows_delta = (-step_px / 18.0).round() as isize;
+                                let pt = ev.locationInWindow();
+                                let mx = pt.x as f32;
+                                if yazi.scroll_at(mx, rows_delta) {
+                                    dirty = true;
+                                }
+                            } else if let Some(hub) = &mut shell.agent_hub {
+                                if dy.abs() > 0.5 && !hub.agents.is_empty() {
+                                    if dy < 0.0 && hub.selected + 1 < hub.agents.len() {
+                                        hub.selected += 1;
+                                        dirty = true;
+                                    } else if dy > 0.0 && hub.selected > 0 {
+                                        hub.selected -= 1;
+                                        dirty = true;
+                                    }
+                                }
+                            } else if shell.store.is_alternate_screen() {
                                 if let Some(ap) = &shell.active_pty
                                     && dy.abs() > 0.5
                                     && let Some(blk) = shell.store.block(ap.block_id)
