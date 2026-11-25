@@ -97,19 +97,19 @@ pub const PROMPT_OK: [f32; 4] = rgb(0x7a, 0xd8, 0x96);
 /// Starship sparkle / indicator accent (soft sky-periwinkle).
 pub const PROMPT_SPARK: [f32; 4] = rgb(0x74, 0xb0, 0xf7);
 /// Fish-style inline ghost autosuggestion text.
-pub const GHOST_INK: [f32; 4] = rgb(0x4f, 0x4f, 0x54);
-/// IntelliJ completion matched-character highlight.
-pub const MATCH_HIGHLIGHT: [f32; 4] = rgb(0xf0, 0x8a, 0x4b);
+pub const GHOST_INK: [f32; 4] = rgb(0x56, 0x56, 0x5c);
+/// Completion & history matched-character highlight (crisp pure white, monochrome-first).
+pub const MATCH_HIGHLIGHT: [f32; 4] = rgb(0xff, 0xff, 0xff);
 
 /// Monochrome-first syntax highlighting matching `ix.dev/blaze`'s `$ curl -fsSL ... | sh`:
-/// commands and args in warm paper-white (`INK_1`), flags/pipes/operators in quiet stone,
-/// colour reserved for errors and Rust cells.
+/// commands in warm paper-white (`INK_1`), quoted strings in crisp editorial green, flags/pipes
+/// in quiet stone, and colour reserved for errors and semantic signals.
 pub fn highlight_color(kind: HighlightKind) -> [f32; 4] {
     match kind {
         HighlightKind::Command => INK_1,
         HighlightKind::Keyword => INK_2,
         HighlightKind::Flag => INK_3,
-        HighlightKind::String => rgb(0xd4, 0xd3, 0xcf),
+        HighlightKind::String => rgb(0x7c, 0xc9, 0x8b),
         HighlightKind::Number => INK_1,
         HighlightKind::Unit => INK_3,
         HighlightKind::Var => INK_2,

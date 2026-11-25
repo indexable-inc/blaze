@@ -93,7 +93,7 @@ pub struct HitRegion {
     pub action: HitAction,
 }
 
-/// Rich interactive hover popover kind attached to prompt capsule segments & icon buttons.
+/// Rich interactive hover popover kind attached to prompt capsule segments, icon buttons, & files.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HoverKind {
     Tooltip { title: String, subtitle: Option<String> },
@@ -102,6 +102,17 @@ pub enum HoverKind {
     GitChanges { files: Vec<(String, &'static str, &'static str)>, total: u32 },
     GitStashes { stashes: Vec<String>, total: u32 },
     Toolchains { items: Vec<(&'static str, &'static str, &'static str)> },
+    /// Hovering a file entry in `ls` grid or table; lazily hydrated into `FilePreview` by the app loop.
+    FileEntry { full_path: String, name: String, icon: Option<&'static str>, is_dir: bool },
+    /// Hydrated file preview popover rendered cleanly in dark glass without IO inside `layout.rs`.
+    FilePreview {
+        full_path: String,
+        name: String,
+        icon: Option<&'static str>,
+        meta: String,
+        lines: Vec<String>,
+        truncated: bool,
+    },
 }
 
 /// Hoverable region recorded during layout.
@@ -164,6 +175,132 @@ pub struct CursorTrail {
 pub struct TextSelection {
     pub anchor: [f32; 2],
     pub head: [f32; 2],
+}
+
+/// Visual selection granularity during Vim scrollback/output browsing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputVisualMode {
+    Char,
+    Line,
+}
+
+/// Vim Normal/Visual cursor browsing previous command outputs (`h`/`j`/`k`/`l`, `v`/`V`, `y`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutputNav {
+    /// Index into extracted visible visual lines (`0` = topmost visible line below titlebar).
+    pub line: usize,
+    /// Character column within `line`.
+    pub col: usize,
+    /// Optional visual anchor `(line, col)` and mode when `v` or `V` is active.
+    pub visual: Option<(usize, usize, OutputVisualMode)>,
+    /// True after pressing `g` once (for `gg` jump to top).
+    pub pending_g: bool,
+}
+
+/// One visual row of rendered text extracted from [`Scene::text_runs`] for Vim output navigation.
+#[derive(Clone, Debug)]
+pub struct VisualLine {
+    pub y: f32,
+    pub chars: Vec<(f32, char)>,
+}
+
+/// Extract ordered visual rows from `runs` (ignoring titlebar runs above `min_y`).
+pub fn extract_visual_lines(runs: &[TextRun], m: CellMetrics, min_y: f32, max_y: f32) -> Vec<VisualLine> {
+    if m.cw <= 0.0 || m.ch <= 0.0 {
+        return Vec::new();
+    }
+    let mut eligible: Vec<&TextRun> = runs
+        .iter()
+        .filter(|r| !r.text.is_empty() && r.y >= min_y && r.y + m.ch <= max_y)
+        .collect();
+    if eligible.is_empty() {
+        return Vec::new();
+    }
+    eligible.sort_by(|a, b| {
+        a.y.partial_cmp(&b.y)
+            .unwrap_or(core::cmp::Ordering::Equal)
+            .then_with(|| a.x.partial_cmp(&b.x).unwrap_or(core::cmp::Ordering::Equal))
+    });
+    let mut grouped: Vec<(f32, Vec<&TextRun>)> = Vec::new();
+    for run in eligible {
+        if let Some((ly, row)) = grouped.last_mut()
+            && (run.y - *ly).abs() <= m.ch * 0.45
+        {
+            row.push(run);
+        } else {
+            grouped.push((run.y, vec![run]));
+        }
+    }
+    let mut out = Vec::with_capacity(grouped.len());
+    for (ly, mut row) in grouped {
+        row.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(core::cmp::Ordering::Equal));
+        let mut chars: Vec<(f32, char)> = Vec::new();
+        let mut prev_end_x: Option<f32> = None;
+        for run in row {
+            if let Some(pe) = prev_end_x
+                && run.x - pe >= m.cw * 0.65
+            {
+                chars.push((pe, ' '));
+            }
+            for (ci, ch) in run.text.chars().enumerate() {
+                chars.push((run.x + ci as f32 * m.cw, ch));
+            }
+            prev_end_x = Some(run.x + run.text.chars().count() as f32 * m.cw);
+        }
+        if !chars.is_empty() {
+            out.push(VisualLine { y: ly, chars });
+        }
+    }
+    out
+}
+
+/// Compute cursor rect, visual selection highlight rects, and yanked text for [`OutputNav`].
+pub fn output_nav_geometry(
+    lines: &[VisualLine],
+    m: CellMetrics,
+    nav: OutputNav,
+) -> (Option<[f32; 4]>, Vec<[f32; 4]>, String) {
+    if lines.is_empty() {
+        return (None, Vec::new(), String::new());
+    }
+    let li = nav.line.min(lines.len() - 1);
+    let row = &lines[li];
+    let ci = nav.col.min(row.chars.len().saturating_sub(1));
+    let cx = row.chars.get(ci).map(|(x, _)| *x).unwrap_or(0.0);
+    let cursor_rect = Some([cx, row.y, cx + m.cw, row.y + m.ch]);
+
+    let Some((al, ac, mode)) = nav.visual else {
+        let ch_str = row.chars.get(ci).map(|(_, c)| c.to_string()).unwrap_or_default();
+        return (cursor_rect, Vec::new(), ch_str);
+    };
+    let al = al.min(lines.len() - 1);
+    let ((l0, c0), (l1, c1)) = if (al, ac) <= (li, ci) {
+        ((al, ac), (li, ci))
+    } else {
+        ((li, ci), (al, ac))
+    };
+
+    let mut rects = Vec::new();
+    let mut text_lines = Vec::new();
+    for (idx, line) in lines.iter().enumerate().take(l1 + 1).skip(l0) {
+        if line.chars.is_empty() {
+            continue;
+        }
+        let (sc, ec) = match mode {
+            OutputVisualMode::Line => (0, line.chars.len() - 1),
+            OutputVisualMode::Char => {
+                let s = if idx == l0 { c0.min(line.chars.len() - 1) } else { 0 };
+                let e = if idx == l1 { c1.min(line.chars.len() - 1) } else { line.chars.len() - 1 };
+                (s.min(e), e.max(s))
+            }
+        };
+        let x0 = line.chars[sc].0;
+        let x1 = line.chars[ec].0 + m.cw;
+        rects.push([x0, line.y, x1, line.y + m.ch]);
+        let s: String = line.chars[sc..=ec].iter().map(|(_, c)| *c).collect();
+        text_lines.push(s);
+    }
+    (cursor_rect, rects, text_lines.join("\n"))
 }
 
 /// Compute highlight rectangles and extracted plain text for `sel` over `runs` (all in logical

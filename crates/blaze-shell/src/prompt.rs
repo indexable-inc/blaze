@@ -75,6 +75,10 @@ pub struct GitStatusSummary {
 /// Snapshot of prompt metadata captured at block submission and displayed live in the composer.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PromptInfo {
+    /// Machine hostname (local laptop or remote server over SSH/BSH1).
+    pub host: String,
+    /// True when this session is connected to a remote server rather than the local Mac.
+    pub is_remote: bool,
     pub cwd: String,
     /// Full `~`-abbreviated path (used in tooltips / titlebar).
     pub cwd_display: String,
@@ -141,6 +145,8 @@ impl PromptInfo {
             None => (None, false),
         };
         Self {
+            host: crate::zoxide::detect_local_hostname(),
+            is_remote: false,
             cwd: cwd.to_owned(),
             cwd_display,
             dir_short,
@@ -761,5 +767,114 @@ impl Drop for GitStatusWorker {
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
+    }
+}
+
+/// Native `blaze-git` rich command overrides for `git status` / `git st`, `git branch`, and
+/// `git stash list` (bypassed automatically if raw-text flags like `--porcelain` or `^git`
+/// are passed). Returns structured typed `blaze_sh::Value` tables with IntelliJ SVG file icons,
+/// proportional byte size bars, hover file previews, and clickable header sorting!
+pub fn try_native_git_command(src: &str, cwd: &str) -> Option<blaze_sh::Value<'static>> {
+    let trimmed = src.trim();
+    // Respect `^git ...` explicit external escape hatch and pipelines/redirections handled by blaze-sh.
+    if trimmed.starts_with('^') || trimmed.contains('|') || trimmed.contains(';') || trimmed.contains('>') {
+        return None;
+    }
+    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+    if parts.first().copied() != Some("git") {
+        return None;
+    }
+    let sub = parts.get(1).copied()?;
+    let rest = &parts[2..];
+    let alloc = Alloc::global();
+
+    match sub {
+        "status" | "st" => {
+            // Only intercept plain `git status` / `git st` (let `--porcelain`, `-s`, `-u`, etc. hit git).
+            if !rest.is_empty() {
+                return None;
+            }
+            let head = read_git_head(cwd)?;
+            let summary = query_blaze_git_status(cwd)?;
+            if summary.changed_files.is_empty() && !summary.dirty {
+                let mut rec = blaze_sh::Record::new(alloc);
+                rec.insert_str("branch", blaze_sh::Value::string(&summary.branch, alloc));
+                rec.insert_str("state", blaze_sh::Value::string("clean", alloc));
+                rec.insert_str("ahead", blaze_sh::Value::Int(i64::from(summary.ahead)));
+                rec.insert_str("behind", blaze_sh::Value::Int(i64::from(summary.behind)));
+                rec.insert_str("stashes", blaze_sh::Value::Int(i64::from(summary.stashed)));
+                return Some(blaze_sh::Value::Record(rec));
+            }
+            let mut tbl = blaze_sh::Table::from_col_names(&["status", "name", "size", "modified"], alloc);
+            tbl.set_col_display("status", blaze_sh::ColDisplay::Status);
+            tbl.set_col_display("name", blaze_sh::ColDisplay::FileEntry);
+            tbl.set_col_display("size", blaze_sh::ColDisplay::FileSize);
+            tbl.set_col_display("modified", blaze_sh::ColDisplay::HumanTime);
+            tbl.default_grid = false;
+
+            for (rel_path, _icon, tag) in &summary.changed_files {
+                let status_label = match *tag {
+                    "+" => "staged",
+                    "M" => "modified",
+                    "D" => "deleted",
+                    "?" => "untracked",
+                    "!" => "conflict",
+                    other => other,
+                };
+                let abs = head.work_tree.join(rel_path);
+                let (size_val, mod_val) = match fs::metadata(&abs) {
+                    Ok(meta) => {
+                        let sz = blaze_sh::Value::Size(blaze_sh::Bytes(meta.len() as i64));
+                        let dt = meta
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| {
+                                blaze_sh::Value::Date(blaze_sh::DateTime {
+                                    utc_ns: d.as_nanos() as i64,
+                                    offset_secs: 0,
+                                })
+                            })
+                            .unwrap_or(blaze_sh::Value::Nothing);
+                        (sz, dt)
+                    }
+                    Err(_) => (blaze_sh::Value::Nothing, blaze_sh::Value::Nothing),
+                };
+                tbl.push_row_values(&[
+                    blaze_sh::Value::string(status_label, alloc),
+                    blaze_sh::Value::string(rel_path, alloc),
+                    size_val,
+                    mod_val,
+                ]);
+            }
+            Some(blaze_sh::Value::Table(tbl))
+        }
+        "branch" if rest.is_empty() => {
+            let head = read_git_head(cwd)?;
+            let branches = read_local_branches(&head.common_dir, &head.label, 64);
+            let mut tbl = blaze_sh::Table::from_col_names(&["branch", "status"], alloc);
+            tbl.set_col_display("status", blaze_sh::ColDisplay::Status);
+            for br in branches {
+                let is_cur = br == head.label;
+                tbl.push_row_values(&[
+                    blaze_sh::Value::string(&br, alloc),
+                    blaze_sh::Value::string(if is_cur { "current" } else { "local" }, alloc),
+                ]);
+            }
+            Some(blaze_sh::Value::Table(tbl))
+        }
+        "stash" if rest == ["list"] => {
+            let head = read_git_head(cwd)?;
+            let stashes = read_git_stashes(&head.common_dir, 32);
+            let mut tbl = blaze_sh::Table::from_col_names(&["stash", "message"], alloc);
+            for (i, msg) in stashes.iter().enumerate() {
+                tbl.push_row_values(&[
+                    blaze_sh::Value::string(&format!("stash@{{{i}}}"), alloc),
+                    blaze_sh::Value::string(msg, alloc),
+                ]);
+            }
+            Some(blaze_sh::Value::Table(tbl))
+        }
+        _ => None,
     }
 }

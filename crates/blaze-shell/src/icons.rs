@@ -27,6 +27,8 @@ pub enum Icon {
     Table,
     Search,
     Stash,
+    Laptop,
+    Server,
 }
 
 /// Infer the best semantic icon and restrained `ix.dev/blaze` accent color for a filesystem entry.
@@ -378,6 +380,48 @@ pub fn draw_icon(
             scene.line(lx0, y + s * 0.28, lx1, y + s * 0.28, t * 1.05, color, clip_id);
             scene.line(lx0 + s * 0.06, y + s * 0.52, lx1 - s * 0.06, y + s * 0.52, t * 1.05, color, clip_id);
             scene.line(lx0 + s * 0.12, y + s * 0.76, lx1 - s * 0.12, y + s * 0.76, t * 1.05, color, clip_id);
+        }
+        Icon::Laptop => {
+            // Crisp minimal MacBook silhouette: rounded screen frame + wider base ledge.
+            scene.round_rect(
+                x + s * 0.16,
+                y + s * 0.18,
+                x + s * 0.84,
+                y + s * 0.70,
+                s * 0.10,
+                [0.0; 4],
+                t,
+                color,
+                clip_id,
+            );
+            scene.line(x + s * 0.06, y + s * 0.80, x + s * 0.94, y + s * 0.80, t * 1.2, color, clip_id);
+        }
+        Icon::Server => {
+            // Crisp stacked rack-server blades with status dots.
+            scene.round_rect(
+                x + s * 0.12,
+                y + s * 0.14,
+                x + s * 0.88,
+                y + s * 0.46,
+                s * 0.09,
+                [0.0; 4],
+                t,
+                color,
+                clip_id,
+            );
+            scene.round_rect(
+                x + s * 0.12,
+                y + s * 0.54,
+                x + s * 0.88,
+                y + s * 0.86,
+                s * 0.09,
+                [0.0; 4],
+                t,
+                color,
+                clip_id,
+            );
+            scene.over_circle(x + s * 0.28, y + s * 0.30, s * 0.065, color, clip_id);
+            scene.over_circle(x + s * 0.28, y + s * 0.70, s * 0.065, color, clip_id);
         }
     }
 }

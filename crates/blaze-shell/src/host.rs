@@ -856,9 +856,31 @@ fn run_external_captured(
     cmd.current_dir(cwd);
     if !env.is_empty() {
         cmd.env_clear();
+        let mut has_term = false;
+        let mut has_colorterm = false;
+        let mut has_clicolor = false;
         for (k, v) in env.iter() {
+            match k.as_ref() {
+                "TERM" => has_term = true,
+                "COLORTERM" => has_colorterm = true,
+                "CLICOLOR" => has_clicolor = true,
+                _ => {}
+            }
             cmd.env(k.as_ref(), v.as_ref());
         }
+        if !has_term {
+            cmd.env("TERM", "xterm-256color");
+        }
+        if !has_colorterm {
+            cmd.env("COLORTERM", "truecolor");
+        }
+        if !has_clicolor {
+            cmd.env("CLICOLOR", "1");
+        }
+    } else {
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
+        cmd.env("CLICOLOR", "1");
     }
     cmd.stdin(if stdin_bytes.is_some() { Stdio::piped() } else { Stdio::null() });
     cmd.stdout(Stdio::piped());

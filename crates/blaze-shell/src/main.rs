@@ -90,6 +90,7 @@ mod macos_app {
     use objc2_metal::MTLCreateSystemDefaultDevice;
     use objc2_quartz_core::CAMetalLayer;
 
+    use blaze_shell::agent_hub::{AgentHub, AgentHubAction, AgentRecord, AgentStatus, layout_agent_hub};
     use blaze_shell::blocks::{BlockBody, BlockId, BlockStore};
     use blaze_shell::editor::{Editor, HistoryEntry};
     use blaze_shell::font::Fonts;
@@ -98,21 +99,30 @@ mod macos_app {
     };
     use blaze_shell::keys;
     use blaze_shell::layout::{LayoutInput, TOP_BAR_H, build_scene, layout_fullscreen_terminal};
-    use blaze_shell::prompt::{GitStatusWorker, PromptInfo};
+    use blaze_shell::prompt::{GitStatusWorker, PromptInfo, try_native_git_command};
     use blaze_shell::pty::{Pty, Read as PtyRead};
     use blaze_shell::render::{FrameDraw, PIXEL_FORMAT, Renderer};
     use blaze_shell::rust_cell;
     use blaze_shell::svg_icons::IconAtlas;
     use blaze_shell::view::{
-        ActiveDrag, ActivePopover, CursorTrail, DragPayload, HitAction, HitRect, Scene,
-        TextSelection, compute_text_selection, select_at_point,
+        ActiveDrag, ActivePopover, CursorTrail, DragPayload, HitAction, HitRect, HoverKind,
+        OutputNav, OutputVisualMode, Scene, TextSelection, compute_text_selection,
+        extract_visual_lines, output_nav_geometry, select_at_point,
     };
+    use blaze_shell::yazi::{YaziAction, YaziState, layout_yazi_view, load_file_preview_lines};
 
     const FONT_POINTS: f64 = 13.0;
     const MIN_FONT_POINTS: f64 = 8.5;
     const MAX_FONT_POINTS: f64 = 28.0;
     const ZOOM_STEP_POINTS: f64 = 1.5;
     const CURSOR_TRAIL_SECS: f32 = 0.20;
+    /// macOS `FullSizeContentView` native window resize border zone (px).
+    const RESIZE_EDGE: f32 = 8.0;
+
+    #[inline]
+    fn on_resize_edge(x: f32, y: f32, w: f32, h: f32) -> bool {
+        x <= RESIZE_EDGE || x >= w - RESIZE_EDGE || y >= h - RESIZE_EDGE || y <= 4.0
+    }
 
     struct CliOpts {
         demo: bool,
@@ -370,6 +380,7 @@ mod macos_app {
     struct AsyncJobDone {
         block_id: BlockId,
         source: String,
+        host: String,
         cwd: String,
         branch: Option<String>,
         duration_ms: u64,
@@ -500,6 +511,9 @@ mod macos_app {
         scroll_y: f32,
         auto_scroll_bottom: bool,
         active_pty: Option<ActivePty>,
+        yazi: Option<YaziState>,
+        agent_hub: Option<AgentHub>,
+        managed_agents: Vec<AgentRecord>,
         last_scene: Scene,
         job_tx: mpsc::Sender<AsyncJobDone>,
         job_rx: mpsc::Receiver<AsyncJobDone>,
@@ -526,6 +540,8 @@ mod macos_app {
             let mut editor = Editor::new();
             editor.load_user_abbreviations(&home);
             editor.load_persistent_history(&home);
+            let local_host = editor.local_host.clone();
+            editor.zoxide.record_visit(&local_host, &cwd, now_ns());
             let (job_tx, job_rx) = mpsc::channel();
 
             Self {
@@ -537,6 +553,9 @@ mod macos_app {
                 scroll_y: 0.0,
                 auto_scroll_bottom: false,
                 active_pty: None,
+                yazi: None,
+                agent_hub: None,
+                managed_agents: Vec::new(),
                 last_scene: Scene::new(),
                 job_tx,
                 job_rx,
@@ -607,9 +626,181 @@ mod macos_app {
                 return;
             }
 
+            // 1. Native `y` / `y <dir>`: built-in Yazi-class 3-column GPU file manager with previews!
+            if trimmed == "y" || trimmed.starts_with("y ") {
+                let arg = trimmed.strip_prefix("y").unwrap_or("").trim();
+                let target_dir = if arg.is_empty() {
+                    PathBuf::from(&self.prompt.cwd)
+                } else {
+                    let clean = arg.trim_matches(|c| c == '"' || c == '\'');
+                    let p = if let Some(rest) = clean.strip_prefix("~/") {
+                        PathBuf::from(&self.home).join(rest)
+                    } else if clean.starts_with('/') {
+                        PathBuf::from(clean)
+                    } else {
+                        PathBuf::from(&self.prompt.cwd).join(clean)
+                    };
+                    if p.is_dir() { p } else { PathBuf::from(&self.prompt.cwd) }
+                };
+                self.yazi = Some(YaziState::open(&target_dir));
+                return;
+            }
+
+            // 2. Native `agent`: unified multi-server interactive Agent Hub / prompt launcher!
+            if trimmed == "agent" || trimmed.starts_with("agent ") {
+                let arg = trimmed.strip_prefix("agent").unwrap_or("").trim();
+                if arg.is_empty() {
+                    let local_host = self.editor.local_host.clone();
+                    let home = self.home.clone();
+                    let cwd = self.prompt.cwd.clone();
+                    self.agent_hub = Some(AgentHub::open(&local_host, &home, &cwd, &self.managed_agents));
+                    return;
+                }
+                // `agent "<prompt>"` or `agent --host <srv> "<prompt>"`: launch an interactive agent session!
+                let (target_host, is_remote, prompt_text) = if let Some(rest) = arg.strip_prefix("--host ") {
+                    let mut parts = rest.trim().splitn(2, char::is_whitespace);
+                    let h = parts.next().unwrap_or("").to_owned();
+                    let p = parts.next().unwrap_or("").trim().trim_matches(|c| c == '"' || c == '\'').to_owned();
+                    (h, true, p)
+                } else {
+                    (
+                        self.editor.local_host.clone(),
+                        false,
+                        arg.trim_matches(|c| c == '"' || c == '\'').to_owned(),
+                    )
+                };
+                self.launch_agent_session(
+                    &target_host,
+                    is_remote,
+                    &self.prompt.cwd.clone(),
+                    if prompt_text.is_empty() { None } else { Some(prompt_text) },
+                    term_cols,
+                    term_rows,
+                    cell_px,
+                );
+                return;
+            }
+
+            // 3. Cross-host Zoxide CRDT `cd` / `z`: fuzzy directory jump + remote `host:path` SSH!
+            let mut effective_cmd = trimmed.to_owned();
+            if let Some(raw_arg) = trimmed.strip_prefix("cd ").or_else(|| trimmed.strip_prefix("z ")) {
+                let arg = raw_arg.trim().trim_matches(|c| c == '"' || c == '\'');
+                if !arg.is_empty() && arg != "-" && arg != "~" && !arg.starts_with("~/") {
+                    // Explicit cross-host jump `host:/path` -> open interactive SSH right into that dir!
+                    if let Some((host, rpath)) = arg.split_once(':')
+                        && !host.is_empty()
+                        && !host.contains('/')
+                        && !rpath.is_empty()
+                    {
+                        let state_before = self.store.active_state().fork();
+                        let prompt_snap = self.prompt.clone();
+                        let remote_cmd = format!("cd {} && exec ${{SHELL:-/bin/sh}} -l", rpath);
+                        let spawn = InteractiveSpawn {
+                            program: "ssh".to_owned(),
+                            args: vec!["-t".to_owned(), host.to_owned(), remote_cmd],
+                            cwd: self.prompt.cwd.clone(),
+                            env: Vec::new(),
+                        };
+                        self.spawn_pty_block(
+                            None,
+                            trimmed.to_owned(),
+                            prompt_snap,
+                            state_before.fork(),
+                            state_before,
+                            now_ms(),
+                            spawn,
+                            term_cols,
+                            term_rows,
+                            cell_px,
+                        );
+                        return;
+                    }
+                    let local_candidate = if arg.starts_with('/') {
+                        PathBuf::from(arg)
+                    } else {
+                        PathBuf::from(&self.prompt.cwd).join(arg)
+                    };
+                    if !local_candidate.is_dir() {
+                        let local_host = self.editor.local_host.clone();
+                        if let Some(best) = self
+                            .editor
+                            .zoxide
+                            .query(arg, &local_host, now_ns(), 1)
+                            .into_iter()
+                            .next()
+                        {
+                            if best.is_local {
+                                effective_cmd = if best.path.contains(' ') {
+                                    format!("cd \"{}\"", best.path)
+                                } else {
+                                    format!("cd {}", best.path)
+                                };
+                            } else {
+                                let state_before = self.store.active_state().fork();
+                                let prompt_snap = self.prompt.clone();
+                                let remote_cmd = format!("cd {} && exec ${{SHELL:-/bin/sh}} -l", best.path);
+                                let spawn = InteractiveSpawn {
+                                    program: "ssh".to_owned(),
+                                    args: vec!["-t".to_owned(), best.host.clone(), remote_cmd],
+                                    cwd: self.prompt.cwd.clone(),
+                                    env: Vec::new(),
+                                };
+                                self.spawn_pty_block(
+                                    None,
+                                    format!("cd {}:{}", best.host, best.path),
+                                    prompt_snap,
+                                    state_before.fork(),
+                                    state_before,
+                                    now_ms(),
+                                    spawn,
+                                    term_cols,
+                                    term_rows,
+                                    cell_px,
+                                );
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+            let trimmed = effective_cmd.as_str();
+
             let state_before = self.store.active_state().fork();
             let prompt_snap = self.prompt.clone();
             let started_ms = now_ms();
+
+            // 4. Native `blaze-git` rich structured overrides (`git status`, `git branch`, `git stash list`)!
+            let t_git = Instant::now();
+            if let Some(git_val) = try_native_git_command(trimmed, &prompt_snap.cwd) {
+                let duration_ms = t_git.elapsed().as_millis() as u64;
+                let mut state_after = state_before.fork();
+                self.bind_output_refs(&mut state_after, &git_val);
+                let body = BlockBody::Value(git_val);
+                self.store.record_block(
+                    trimmed.to_owned(),
+                    prompt_snap.clone(),
+                    state_before,
+                    state_after.fork(),
+                    started_ms,
+                    duration_ms,
+                    0,
+                    body,
+                );
+                self.store.set_active_state(state_after);
+                self.editor.record_history_entry(HistoryEntry {
+                    command: trimmed.to_owned(),
+                    host: prompt_snap.host,
+                    cwd: prompt_snap.cwd,
+                    git_branch: prompt_snap.git_branch,
+                    duration_ms,
+                    exit_code: 0,
+                    timestamp_ns: now_ns(),
+                    in_session: true,
+                });
+                self.refresh_prompt(0, duration_ms);
+                self.auto_scroll_bottom = true;
+                return;
+            }
 
             // Non-blocking background execution for `rust { ... }` cells and external commands:
             // immediately record a live `Running` block and return control to the next prompt line!
@@ -635,6 +826,7 @@ mod macos_app {
 
                 let tx = self.job_tx.clone();
                 let src_owned = trimmed.to_owned();
+                let host = prompt_snap.host.clone();
                 let cwd = prompt_snap.cwd.clone();
                 let branch = prompt_snap.git_branch.clone();
                 // Snapshot lightweight cwd/env/vars/rust_cells to run on worker thread.
@@ -678,6 +870,7 @@ mod macos_app {
                         let _ = tx.send(AsyncJobDone {
                             block_id,
                             source: src_owned,
+                            host,
                             cwd,
                             branch,
                             duration_ms,
@@ -728,8 +921,14 @@ mod macos_app {
                 body,
             );
             self.store.set_active_state(state_after);
+            let new_cwd = self.store.active_state().cwd.as_ref().to_owned();
+            if new_cwd != prompt_snap.cwd {
+                let lh = self.editor.local_host.clone();
+                self.editor.zoxide.record_visit(&lh, &new_cwd, now_ns());
+            }
             self.editor.record_history_entry(HistoryEntry {
                 command: trimmed.to_owned(),
+                host: prompt_snap.host,
                 cwd: prompt_snap.cwd,
                 git_branch: prompt_snap.git_branch,
                 duration_ms,
@@ -793,6 +992,7 @@ mod macos_app {
                 }
                 self.editor.record_history_entry(HistoryEntry {
                     command: done.source,
+                    host: done.host,
                     cwd: done.cwd,
                     git_branch: done.branch,
                     duration_ms: done.duration_ms,
@@ -942,6 +1142,91 @@ mod macos_app {
             self.auto_scroll_bottom = scroll_bottom;
             self.scroll_y = 0.0;
         }
+
+        #[allow(clippy::too_many_arguments)]
+        fn launch_agent_session(
+            &mut self,
+            host: &str,
+            is_remote: bool,
+            cwd: &str,
+            prompt_text: Option<String>,
+            cols: u16,
+            rows: u16,
+            cell_px: (u32, u32),
+        ) {
+            let state_before = self.store.active_state().fork();
+            let prompt_snap = self.prompt.clone();
+            let (program, args, display_cmd) = if is_remote {
+                let remote_cmd = match &prompt_text {
+                    Some(p) => {
+                        let esc = p.replace('\'', "'\\''");
+                        format!("claude '{esc}' || exec ${{SHELL:-/bin/sh}} -l")
+                    }
+                    None => "claude || exec ${SHELL:-/bin/sh} -l".to_owned(),
+                };
+                (
+                    "ssh".to_owned(),
+                    vec!["-t".to_owned(), host.to_owned(), remote_cmd],
+                    match &prompt_text {
+                        Some(p) => format!("agent --host {host} \"{p}\""),
+                        None => format!("agent --host {host}"),
+                    },
+                )
+            } else {
+                let mut a = Vec::new();
+                if let Some(p) = &prompt_text {
+                    a.push(p.clone());
+                }
+                (
+                    "claude".to_owned(),
+                    a,
+                    match &prompt_text {
+                        Some(p) => format!("agent \"{p}\""),
+                        None => "agent".to_owned(),
+                    },
+                )
+            };
+            let id_num = self.managed_agents.len() + 1;
+            self.managed_agents.push(AgentRecord {
+                id: format!("agent-{id_num}"),
+                host: host.to_owned(),
+                is_remote,
+                name: format!("agent #{id_num} ({host})"),
+                prompt_summary: prompt_text
+                    .clone()
+                    .unwrap_or_else(|| "interactive session".to_owned()),
+                cwd: cwd.to_owned(),
+                pid: None,
+                status: AgentStatus::Running,
+                pty_session_idx: Some(id_num - 1),
+                preview_lines: vec![
+                    format!("host:   {host}"),
+                    format!("cwd:    {cwd}"),
+                    format!("cmd:    {display_cmd}"),
+                ],
+            });
+            let spawn = InteractiveSpawn {
+                program,
+                args,
+                cwd: self.prompt.cwd.clone(),
+                env: Vec::new(),
+            };
+            self.spawn_pty_block(
+                None,
+                display_cmd,
+                prompt_snap,
+                state_before.fork(),
+                state_before,
+                now_ms(),
+                spawn,
+                cols,
+                rows,
+                cell_px,
+            );
+            if let (Some(ap), Some(rec)) = (&self.active_pty, self.managed_agents.last_mut()) {
+                rec.pid = Some(ap.pty.pid());
+            }
+        }
     }
 
     fn body_from_result(
@@ -986,12 +1271,12 @@ mod macos_app {
 
     fn grid_for(size: NSSize, fonts: &Fonts, scale: f64) -> (u16, u16) {
         let m = fonts.metrics;
-        // Account for `OUTER_PAD_X * 2 + terminal inner pad * 2` so inline PTY lines wrap
-        // cleanly inside the block border without clipping on the right edge.
-        let w = ((size.width - 56.0) * scale / m.cell_w as f64)
+        // Account for horizontal padding + unified `TOP_BAR_H` so full-screen TUIs (`claude`, `vim`)
+        // never clip below the bottom edge or collide with session tabs!
+        let w = ((size.width - 28.0) * scale / m.cell_w as f64)
             .floor()
             .max(20.0);
-        let h = ((size.height - 140.0) * scale / m.cell_h as f64)
+        let h = ((size.height - f64::from(TOP_BAR_H) - 20.0) * scale / m.cell_h as f64)
             .floor()
             .max(8.0);
         (w as u16, h as u16)
@@ -1004,6 +1289,7 @@ mod macos_app {
         unsafe {
             std::env::set_var("TERM", "xterm-256color");
             std::env::set_var("COLORTERM", "truecolor");
+            std::env::set_var("CLICOLOR", "1");
             std::env::set_var("TERM_PROGRAM", "blaze-shell");
         }
 
@@ -1115,6 +1401,7 @@ mod macos_app {
                 text_selection: None,
                 active_popover: None,
                 mouse_pos: None,
+                output_nav: None,
             });
             let max_s = (scene.total_content_height - scene.scroll_viewport_height).max(0.0);
             if shell.auto_scroll_bottom && max_s > 0.0 {
@@ -1136,6 +1423,7 @@ mod macos_app {
                     text_selection: None,
                     active_popover: None,
                     mouse_pos: None,
+                    output_nav: None,
                 });
             }
             let glyphs = fonts.rasterize_runs(&scene.text_runs, scale);
@@ -1185,6 +1473,7 @@ mod macos_app {
         let mut selecting_composer = false;
         let mut selecting_output = false;
         let mut output_selection: Option<TextSelection> = None;
+        let mut output_nav: Option<OutputNav> = None;
         let mut active_popover: Option<ActivePopover> = None;
         let mut popup_engaged = false;
         let mut zoom_changed = false;
@@ -1373,6 +1662,214 @@ mod macos_app {
                                 }
                             }
 
+                            // 0a. Native `y` (Yazi 3-column file manager) keyboard handling.
+                            if let Some(yazi) = &mut shell.yazi {
+                                let text = keys::text_of(&ev);
+                                let kname = match key {
+                                    Key::Escape => "Escape",
+                                    Key::Enter | Key::NumpadEnter => "Enter",
+                                    Key::Backspace => "Backspace",
+                                    Key::ArrowUp => "Up",
+                                    Key::ArrowDown => "Down",
+                                    Key::ArrowLeft => "Left",
+                                    Key::ArrowRight => "Right",
+                                    _ => "",
+                                };
+                                let ch = if !ctrl && !alt { text.chars().next() } else { None };
+                                let act = yazi.handle_key(kname, ch);
+                                match act {
+                                    YaziAction::Continue => {}
+                                    YaziAction::ExitCancel => {
+                                        shell.yazi = None;
+                                    }
+                                    YaziAction::ExitAndCd(dir) => {
+                                        shell.yazi = None;
+                                        let dir_s = dir.to_string_lossy().into_owned();
+                                        if dir_s != shell.prompt.cwd {
+                                            let cmd = if dir_s.contains(' ') {
+                                                format!("cd \"{dir_s}\"")
+                                            } else {
+                                                format!("cd {dir_s}")
+                                            };
+                                            let (cols, rows) = grid_for(size, &fonts, scale);
+                                            let cpx = (
+                                                fonts.metrics.cell_w as u32,
+                                                fonts.metrics.cell_h as u32,
+                                            );
+                                            shell.submit_command(&cmd, cols, rows, cpx, false);
+                                        }
+                                    }
+                                    YaziAction::InsertPath(p) => {
+                                        shell.yazi = None;
+                                        shell.editor.enter_vim_insert();
+                                        shell.editor.insert_dropped_token(&p);
+                                        shell.refresh_editor_assist(false);
+                                    }
+                                }
+                                dirty = true;
+                                continue;
+                            }
+
+                            // 0b. Native `agent` multi-server interactive fleet hub keyboard handling.
+                            if let Some(hub) = &mut shell.agent_hub {
+                                let text = keys::text_of(&ev);
+                                let kname = match key {
+                                    Key::Escape => "Escape",
+                                    Key::Enter | Key::NumpadEnter => "Enter",
+                                    Key::Backspace => "Backspace",
+                                    Key::ArrowUp => "Up",
+                                    Key::ArrowDown => "Down",
+                                    _ => "",
+                                };
+                                let ch = if !ctrl && !alt { text.chars().next() } else { None };
+                                match hub.handle_key(kname, ch) {
+                                    AgentHubAction::Continue => {}
+                                    AgentHubAction::Exit => {
+                                        shell.agent_hub = None;
+                                    }
+                                    AgentHubAction::EnterAgent {
+                                        host,
+                                        is_remote,
+                                        cwd,
+                                        prompt,
+                                        ..
+                                    } => {
+                                        shell.agent_hub = None;
+                                        let (cols, rows) = grid_for(size, &fonts, scale);
+                                        let cpx = (
+                                            fonts.metrics.cell_w as u32,
+                                            fonts.metrics.cell_h as u32,
+                                        );
+                                        shell.launch_agent_session(
+                                            &host, is_remote, &cwd, prompt, cols, rows, cpx,
+                                        );
+                                    }
+                                }
+                                dirty = true;
+                                continue;
+                            }
+
+                            // 0c. Vim Scrollback / Output Navigation Mode (`h`/`j`/`k`/`l`, `v`/`V`, `y` over outputs!).
+                            if let Some(mut nav) = output_nav {
+                                let text = keys::text_of(&ev);
+                                let m = fonts.cell_metrics(scale);
+                                let vlines = extract_visual_lines(
+                                    &shell.last_scene.text_runs,
+                                    m,
+                                    TOP_BAR_H,
+                                    size.height as f32,
+                                );
+                                if vlines.is_empty() {
+                                    output_nav = None;
+                                    dirty = true;
+                                    continue;
+                                }
+                                nav.line = nav.line.min(vlines.len() - 1);
+                                let max_col = vlines[nav.line].chars.len().saturating_sub(1);
+                                nav.col = nav.col.min(max_col);
+                                let ch = if !ctrl && !alt { text.chars().next() } else { None };
+
+                                if nav.pending_g {
+                                    nav.pending_g = false;
+                                    if ch == Some('g') {
+                                        nav.line = 0;
+                                        nav.col = 0;
+                                        output_nav = Some(nav);
+                                        dirty = true;
+                                        continue;
+                                    }
+                                }
+
+                                let mut keep = true;
+                                match (key, ch) {
+                                    (Key::Escape, _) => {
+                                        if nav.visual.is_some() {
+                                            nav.visual = None;
+                                        } else {
+                                            keep = false;
+                                        }
+                                    }
+                                    (_, Some('i' | 'a' | 'q')) => {
+                                        keep = false;
+                                        if ch != Some('q') {
+                                            shell.editor.enter_vim_insert();
+                                        }
+                                    }
+                                    (Key::ArrowLeft, _) | (_, Some('h')) => {
+                                        nav.col = nav.col.saturating_sub(1);
+                                    }
+                                    (Key::ArrowRight, _) | (_, Some('l')) => {
+                                        nav.col = (nav.col + 1).min(max_col);
+                                    }
+                                    (Key::ArrowUp, _) | (_, Some('k')) => {
+                                        if nav.line > 0 {
+                                            nav.line -= 1;
+                                        } else if shell.scroll_y > 0.0 {
+                                            shell.scroll_y = (shell.scroll_y - m.ch * 3.0).max(0.0);
+                                            shell.auto_scroll_bottom = false;
+                                        }
+                                    }
+                                    (Key::ArrowDown, _) | (_, Some('j')) => {
+                                        if nav.line + 1 < vlines.len() {
+                                            nav.line += 1;
+                                        } else if nav.visual.is_none() {
+                                            // Pressing `j` past the bottom line returns smoothly to the prompt!
+                                            keep = false;
+                                        }
+                                    }
+                                    (_, Some('0')) => nav.col = 0,
+                                    (_, Some('$')) => nav.col = max_col,
+                                    (_, Some('g')) => nav.pending_g = true,
+                                    (_, Some('G')) => nav.line = vlines.len() - 1,
+                                    (_, Some('w')) => {
+                                        let row = &vlines[nav.line].chars;
+                                        let mut c = nav.col;
+                                        while c < row.len() && !row[c].1.is_whitespace() {
+                                            c += 1;
+                                        }
+                                        while c < row.len() && row[c].1.is_whitespace() {
+                                            c += 1;
+                                        }
+                                        nav.col = c.min(max_col);
+                                    }
+                                    (_, Some('b')) => {
+                                        let row = &vlines[nav.line].chars;
+                                        let mut c = nav.col.saturating_sub(1);
+                                        while c > 0 && row[c].1.is_whitespace() {
+                                            c -= 1;
+                                        }
+                                        while c > 0 && !row[c - 1].1.is_whitespace() {
+                                            c -= 1;
+                                        }
+                                        nav.col = c;
+                                    }
+                                    (_, Some('v')) => {
+                                        nav.visual = match nav.visual {
+                                            Some((_, _, OutputVisualMode::Char)) => None,
+                                            _ => Some((nav.line, nav.col, OutputVisualMode::Char)),
+                                        };
+                                    }
+                                    (_, Some('V')) => {
+                                        nav.visual = match nav.visual {
+                                            Some((_, _, OutputVisualMode::Line)) => None,
+                                            _ => Some((nav.line, nav.col, OutputVisualMode::Line)),
+                                        };
+                                    }
+                                    (_, Some('y')) | (Key::Enter, _) => {
+                                        let (_, _, yanked) = output_nav_geometry(&vlines, m, nav);
+                                        if !yanked.is_empty() {
+                                            copy_to_pasteboard(&yanked);
+                                        }
+                                        nav.visual = None;
+                                        keep = false;
+                                    }
+                                    _ => {}
+                                }
+                                output_nav = if keep { Some(nav) } else { None };
+                                dirty = true;
+                                continue;
+                            }
+
                             // Forward directly to live PTY when an interactive external command is running.
                             if let Some(ap) = &shell.active_pty {
                                 if let Some(blk) = shell.store.block(ap.block_id)
@@ -1481,7 +1978,36 @@ mod macos_app {
                             } else if shell.editor.vim_mode() != VimMode::Insert {
                                 // `blaze-vim` sans-IO Normal / Visual / VisualLine modal editing
                                 // (with shell-aware `i|`/`a|`, `i/`/`a/`, `i,`/`a,` text objects).
-                                if ctrl && key == Key::KeyP {
+                                // Pressing `k` / `Up` on line 0 of the prompt (or `Ctrl+G`) smoothly
+                                // enters Scrollback Output Navigation (`h`/`j`/`k`/`l`, `v`/`V`, `y`)!
+                                let (cline, _) = shell.editor.cursor_line_col();
+                                if ctrl && key == Key::KeyL {
+                                    shell.store.clear_active_branch();
+                                    shell.scroll_y = 0.0;
+                                    output_selection = None;
+                                } else if shell.editor.vim_mode() == VimMode::Normal
+                                    && cline == 0
+                                    && ((key == Key::ArrowUp && !ctrl && !alt)
+                                        || (!ctrl && !alt && text == "k")
+                                        || (ctrl && key == Key::KeyG))
+                                {
+                                    let m = fonts.cell_metrics(scale);
+                                    let max_y = (shell.last_scene.input_top_y - 2.0).max(TOP_BAR_H);
+                                    let vlines = extract_visual_lines(
+                                        &shell.last_scene.text_runs,
+                                        m,
+                                        TOP_BAR_H,
+                                        max_y,
+                                    );
+                                    if !vlines.is_empty() {
+                                        output_nav = Some(OutputNav {
+                                            line: vlines.len() - 1,
+                                            col: 0,
+                                            visual: None,
+                                            pending_g: false,
+                                        });
+                                    }
+                                } else if ctrl && key == Key::KeyP {
                                     shell.editor.move_up();
                                 } else if ctrl && key == Key::KeyN {
                                     shell.editor.move_down();
@@ -1520,7 +2046,14 @@ mod macos_app {
                                 match key {
                                     Key::KeyR => {
                                         let cwd = shell.prompt.cwd.clone();
-                                        shell.editor.start_reverse_search_in(&cwd);
+                                        let host = shell.prompt.host.clone();
+                                        shell.editor.start_reverse_search_for(&host, &cwd);
+                                    }
+                                    Key::KeyL => {
+                                        shell.store.clear_active_branch();
+                                        shell.scroll_y = 0.0;
+                                        output_selection = None;
+                                        output_nav = None;
                                     }
                                     Key::Space => {
                                         let st = shell.store.active_state().fork();
@@ -1795,10 +2328,57 @@ mod macos_app {
                             }
                         }
                         NSEventType::LeftMouseDown if window.isKeyWindow() => {
-                            if !shell.store.is_alternate_screen() {
-                                let pt = ev.locationInWindow();
-                                let x = pt.x as f32;
-                                let y = (size.height - pt.y) as f32;
+                            let pt = ev.locationInWindow();
+                            let x = pt.x as f32;
+                            let y = (size.height - pt.y) as f32;
+                            // Let macOS AppKit handle native window edge/corner resize drags directly!
+                            if !on_resize_edge(x, y, size.width as f32, size.height as f32) {
+                                // Unified titlebar clicks (branch tabs, fork, zoom) & window drag work
+                                // EVERYWHERE — including inside full-screen PTY (`claude`), `y`, and `agent`!
+                                if y < TOP_BAR_H {
+                                    if let Some(action) = shell.last_scene.hit_test(x, y) {
+                                        output_selection = None;
+                                        output_nav = None;
+                                        match action {
+                                            HitAction::SwitchBranch(bid) => {
+                                                if shell.store.switch_branch(bid) {
+                                                    shell.yazi = None;
+                                                    shell.agent_hub = None;
+                                                    shell.scroll_y = 0.0;
+                                                    shell.auto_scroll_bottom = true;
+                                                    shell.refresh_prompt(0, 0);
+                                                    dirty = true;
+                                                }
+                                            }
+                                            HitAction::ForkActiveBranch => {
+                                                let _ = shell.store.fork_active_branch(None);
+                                                shell.refresh_prompt(
+                                                    shell.prompt.last_exit,
+                                                    shell.prompt.last_duration_ms,
+                                                );
+                                                dirty = true;
+                                            }
+                                            HitAction::ResetZoom => {
+                                                font_points = FONT_POINTS;
+                                                zoom_changed = true;
+                                                dirty = true;
+                                            }
+                                            _ => {}
+                                        }
+                                        continue;
+                                    }
+                                    if x > 74.0 {
+                                        window.performWindowDragWithEvent(&ev);
+                                        continue;
+                                    }
+                                }
+                            }
+                            if !on_resize_edge(x, y, size.width as f32, size.height as f32)
+                                && !shell.store.is_alternate_screen()
+                                && shell.yazi.is_none()
+                                && shell.agent_hub.is_none()
+                            {
+                                output_nav = None;
                                 if let Some(action) = shell.last_scene.hit_test(x, y) {
                                     output_selection = None;
                                     match action {
@@ -2014,8 +2594,9 @@ mod macos_app {
                             let y = (size.height - pt.y) as f32;
                             last_mouse = Some((x, y));
                             let in_traffic_lights = y >= 0.0 && y < TOP_BAR_H && x >= 0.0 && x < 76.0;
+                            let near_resize_edge = on_resize_edge(x, y, size.width as f32, size.height as f32);
                             let in_window = x >= 0.0 && y >= 0.0 && x <= size.width as f32 && y <= size.height as f32;
-                            if in_window && !in_traffic_lights {
+                            if in_window && !in_traffic_lights && !near_resize_edge {
                                 // Smooth native hover popover tracking (keeps popover alive while
                                 // pointer travels from anchor down into the interactive menu!).
                                 let in_open_popover = active_popover.as_ref().is_some_and(|p| {
@@ -2039,6 +2620,8 @@ mod macos_app {
                                 if in_open_popover {
                                     dirty = true;
                                 } else if !shell.store.is_alternate_screen()
+                                    && shell.yazi.is_none()
+                                    && shell.agent_hub.is_none()
                                     && shell.editor.reverse_search.is_none()
                                     && shell.editor.completions.is_empty()
                                     && !selecting_composer
@@ -2046,13 +2629,29 @@ mod macos_app {
                                     && pending_drag.is_none()
                                     && let Some(reg) = shell.last_scene.hover_at(x, y)
                                 {
-                                    let next_pop = ActivePopover {
-                                        anchor: reg.rect,
-                                        kind: reg.kind.clone(),
-                                        pinned: false,
-                                    };
-                                    if active_popover.as_ref().is_none_or(|cur| !cur.pinned && cur.anchor != next_pop.anchor) {
-                                        active_popover = Some(next_pop);
+                                    if active_popover.as_ref().is_none_or(|cur| !cur.pinned && cur.anchor != reg.rect) {
+                                        let hydrated_kind = match &reg.kind {
+                                            HoverKind::FileEntry { full_path, name, icon, .. } => {
+                                                let (meta, lines, truncated) = load_file_preview_lines(
+                                                    std::path::Path::new(full_path),
+                                                    16,
+                                                );
+                                                HoverKind::FilePreview {
+                                                    full_path: full_path.clone(),
+                                                    name: name.clone(),
+                                                    icon: *icon,
+                                                    meta,
+                                                    lines,
+                                                    truncated,
+                                                }
+                                            }
+                                            other => other.clone(),
+                                        };
+                                        active_popover = Some(ActivePopover {
+                                            anchor: reg.rect,
+                                            kind: hydrated_kind,
+                                            pinned: false,
+                                        });
                                         dirty = true;
                                     }
                                 } else if active_popover.as_ref().is_some_and(|p| !p.pinned) {
@@ -2077,7 +2676,10 @@ mod macos_app {
                                 active_popover = None;
                                 dirty = true;
                             }
-                            apply_cursor(&mut cur_cursor, CursorKind::Arrow);
+                            // Only reset to Arrow when strictly outside resize edges (otherwise let AppKit show resize arrows!).
+                            if !near_resize_edge {
+                                apply_cursor(&mut cur_cursor, CursorKind::Arrow);
+                            }
                         }
                         NSEventType::LeftMouseDragged if window.isKeyWindow() => {
                             let pt = ev.locationInWindow();
@@ -2367,17 +2969,43 @@ mod macos_app {
                         None
                     }
                 });
-                let mut scene = if shell.store.is_alternate_screen()
+                let mut scene = if let Some(yazi) = &mut shell.yazi {
+                    layout_yazi_view(
+                        yazi,
+                        &shell.store,
+                        &shell.prompt,
+                        size.width as f32,
+                        size.height as f32,
+                        metrics,
+                        zoom_pct,
+                        true,
+                    )
+                } else if let Some(hub) = &shell.agent_hub {
+                    layout_agent_hub(
+                        hub,
+                        &shell.store,
+                        &shell.prompt,
+                        size.width as f32,
+                        size.height as f32,
+                        metrics,
+                        zoom_pct,
+                        true,
+                    )
+                } else if shell.store.is_alternate_screen()
                     && let Some(tid) = shell.store.active_running_terminal()
                     && let Some(blk) = shell.store.block(tid)
                     && let BlockBody::Terminal { term, .. } = &blk.body
                 {
                     layout_fullscreen_terminal(
                         term,
+                        &shell.store,
+                        &shell.prompt,
                         size.width as f32,
                         size.height as f32,
                         metrics,
                         cursor_vis,
+                        zoom_pct,
+                        true,
                     )
                 } else {
                     let frame_now = now_ns();
@@ -2405,6 +3033,7 @@ mod macos_app {
                         text_selection: screen_sel(shell.scroll_y),
                         active_popover: active_popover.as_ref(),
                         mouse_pos: mouse_pt,
+                        output_nav,
                     });
                     let max_s = (first.total_content_height - first.scroll_viewport_height).max(0.0);
                     let target_scroll = if shell.auto_scroll_bottom {
@@ -2432,6 +3061,7 @@ mod macos_app {
                             text_selection: screen_sel(shell.scroll_y),
                             active_popover: active_popover.as_ref(),
                             mouse_pos: mouse_pt,
+                            output_nav,
                         })
                     } else {
                         first
@@ -2488,6 +3118,7 @@ mod macos_app {
                 shell.last_scene = scene;
                 if let Some((mx, my)) = last_mouse
                     && window.isKeyWindow()
+                    && !on_resize_edge(mx, my, size.width as f32, size.height as f32)
                 {
                     let next = cursor_for_point(
                         &shell.last_scene,

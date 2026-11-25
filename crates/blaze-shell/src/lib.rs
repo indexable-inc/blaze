@@ -3,6 +3,7 @@
 //! All GPU-independent modules (`theme`, `blocks`, `prompt`, `editor`, `view`, `layout`,
 //! `rust_cell`, `host`) compile and are unit-tested on every platform without requiring Metal.
 
+pub mod agent_hub;
 pub mod blocks;
 pub mod editor;
 pub mod host;
@@ -13,6 +14,8 @@ pub mod rust_cell;
 pub mod svg_icons;
 pub mod theme;
 pub mod view;
+pub mod yazi;
+pub mod zoxide;
 
 #[cfg(target_os = "macos")]
 pub mod font;
@@ -132,6 +135,7 @@ mod tests {
             text_selection: None,
             active_popover: None,
             mouse_pos: None,
+            output_nav: None,
         });
 
         // Fold toggle hit region must be present, and every block must have a ForkBlock hit target.
@@ -187,6 +191,7 @@ mod tests {
             text_selection: None,
             active_popover: None,
             mouse_pos: None,
+            output_nav: None,
         });
         assert!(
             scene_unfolded.total_content_height > h_folded,
@@ -213,6 +218,7 @@ mod tests {
             text_selection: None,
             active_popover: None,
             mouse_pos: None,
+            output_nav: None,
         });
         assert!(scene_expanded.total_content_height > h_before_expand);
         assert!(scene_expanded.text_runs.iter().any(|t| t.text == "meta"));
@@ -467,6 +473,7 @@ mod tests {
             text_selection: None,
             active_popover: None,
             mouse_pos: None,
+            output_nav: None,
         });
         assert!(
             grid_scene
@@ -514,6 +521,7 @@ mod tests {
             text_selection: None,
             active_popover: None,
             mouse_pos: None,
+            output_nav: None,
         });
         assert!(table_scene.total_content_height > grid_scene.total_content_height);
         assert!(
@@ -654,9 +662,10 @@ mod tests {
         assert!(ed.undo());
         assert_eq!(ed.text, "ls | take 5 | sort-by size");
 
-        // 3. Atuin-class Ctrl+R history palette: fuzzy search + scope cycling.
+        // 3. Atuin-class Ctrl+R history palette: fuzzy search + host/dir/session scope cycling.
         ed.record_history_entry(HistoryEntry {
             command: "blaze test -p blaze-vim".to_owned(),
+            host: "hydra".to_owned(),
             cwd: "/Volumes/Projects/blaze".to_owned(),
             git_branch: Some("main".to_owned()),
             duration_ms: 420,
@@ -666,6 +675,7 @@ mod tests {
         });
         ed.record_history_entry(HistoryEntry {
             command: "git status".to_owned(),
+            host: "blaze-vm".to_owned(),
             cwd: "/tmp/other".to_owned(),
             git_branch: Some("dev".to_owned()),
             duration_ms: 12,
@@ -673,7 +683,7 @@ mod tests {
             timestamp_ns: 1_732_500_010_000_000_000,
             in_session: false,
         });
-        ed.start_reverse_search_in("/Volumes/Projects/blaze");
+        ed.start_reverse_search_for("hydra", "/Volumes/Projects/blaze");
         assert_eq!(ed.reverse_search.as_ref().unwrap().scope, HistoryScope::Global);
         ed.reverse_search_push('b');
         ed.reverse_search_push('v');
@@ -683,6 +693,8 @@ mod tests {
             ed.reverse_search.as_ref().and_then(|r| r.matched_text.as_deref()),
             Some("blaze test -p blaze-vim")
         );
+        ed.reverse_search_cycle_scope();
+        assert_eq!(ed.reverse_search.as_ref().unwrap().scope, HistoryScope::Host);
         ed.reverse_search_cycle_scope();
         assert_eq!(ed.reverse_search.as_ref().unwrap().scope, HistoryScope::Directory);
         ed.reverse_search_cycle_scope();
@@ -730,6 +742,7 @@ mod tests {
             text_selection: None,
             active_popover: None,
             mouse_pos: None,
+            output_nav: None,
         });
 
         assert!(
@@ -822,6 +835,7 @@ mod tests {
             text_selection: None,
             active_popover: None,
             mouse_pos: None,
+            output_nav: None,
         });
         assert!(!s1.scroll_regions.is_empty(), "expected scrollable table region");
         assert!(
@@ -834,5 +848,104 @@ mod tests {
         assert_eq!(store.block(bid).unwrap().table_sort, Some((1, true)));
         assert!(store.toggle_table_sort(bid, 1));
         assert_eq!(store.block(bid).unwrap().table_sort, Some((1, false)));
+    }
+
+    #[test]
+    fn zoxide_crdt_semilattice_and_fullscreen_block_sdf_and_ghost_predictor() {
+        use blaze_vt::terminal::{Opts as VtOpts, Terminal};
+        use crate::layout::layout_fullscreen_terminal;
+        use crate::view::{OutputNav, OutputVisualMode, extract_visual_lines, output_nav_geometry};
+        use crate::zoxide::{FrecencyEntry, FrecencyStore};
+
+        // 1. Cross-host Zoxide CRDT semilattice merge laws (commutative & idempotent).
+        let mut a = FrecencyStore::new();
+        let mut b = FrecencyStore::new();
+        a.join_entry(FrecencyEntry {
+            host: "hydra".to_owned(),
+            path: "/Volumes/Projects/blaze".to_owned(),
+            visits: 10,
+            last_ns: 1_000,
+        });
+        b.join_entry(FrecencyEntry {
+            host: "hydra".to_owned(),
+            path: "/Volumes/Projects/blaze".to_owned(),
+            visits: 14,
+            last_ns: 900,
+        });
+        b.join_entry(FrecencyEntry {
+            host: "blaze-vm".to_owned(),
+            path: "/srv/blaze".to_owned(),
+            visits: 7,
+            last_ns: 2_000,
+        });
+        let mut ab = a.clone();
+        ab.merge(&b);
+        let mut ba = b.clone();
+        ba.merge(&a);
+        let ab_v: Vec<_> = ab.entries().cloned().collect();
+        let ba_v: Vec<_> = ba.entries().cloned().collect();
+        assert_eq!(ab_v, ba_v, "CRDT join must be commutative");
+        ab.merge(&b);
+        let ab2_v: Vec<_> = ab.entries().cloned().collect();
+        assert_eq!(ab2_v, ab_v, "CRDT join must be idempotent");
+        let top = ab.query("blaze", "hydra", 2_500, 4);
+        assert_eq!(top.len(), 2);
+        assert_eq!(top[0].host, "hydra", "local host should rank ahead of remote");
+        assert_eq!(top[1].host, "blaze-vm", "cross-server entry must appear");
+
+        // 2. Full-screen PTY keeps top tab bar AND renders Unicode block/box elements via SDF (zero font seams!).
+        let alloc = Alloc::global();
+        let state = EngineState::new("/tmp", &[], alloc);
+        let store = BlockStore::new(state.fork());
+        let prompt = PromptInfo::from_cwd("/tmp", "/tmp", 0, 0);
+        let mut term = Terminal::new_in(VtOpts::new(40, 12, 1 << 16), alloc).unwrap();
+        term.feed("█▛▜▙▟─│┌┐└┘".as_bytes());
+        let scene = layout_fullscreen_terminal(
+            &term,
+            &store,
+            &prompt,
+            960.0,
+            640.0,
+            CellMetrics::default(),
+            true,
+            100,
+            true,
+        );
+        assert!(
+            scene.hit_regions.iter().any(|h| matches!(h.action, HitAction::SwitchBranch(_))),
+            "fullscreen terminal must keep clickable session tabs in top bar"
+        );
+        assert!(
+            !scene.over_rects.is_empty(),
+            "block elements & box drawing must render via custom GPU SDF quads"
+        );
+        assert!(
+            !scene.text_runs.iter().any(|t| t.text.contains('█') || t.text.contains('▛')),
+            "block elements must NOT fall back to CoreText font glyphs"
+        );
+
+        // 3. Zero-history instant ghost predictor + Vim OutputNav visual line yank.
+        let mut ed = Editor::new();
+        ed.set_text("git s".to_owned());
+        ed.refresh_assist(&state, &[], false);
+        assert_eq!(ed.ghost.as_deref(), Some("tatus"));
+        ed.set_text("agent ".to_owned());
+        ed.refresh_assist(&state, &[], false);
+        assert_eq!(ed.ghost.as_deref(), Some("\"\""));
+
+        let vlines = extract_visual_lines(&scene.text_runs, CellMetrics::default(), 0.0, 640.0);
+        let (cur, vis, text) = output_nav_geometry(
+            &vlines,
+            CellMetrics::default(),
+            OutputNav {
+                line: 0,
+                col: 0,
+                visual: Some((0, 0, OutputVisualMode::Line)),
+                pending_g: false,
+            },
+        );
+        assert!(cur.is_some());
+        assert!(!vis.is_empty());
+        assert!(!text.is_empty());
     }
 }
