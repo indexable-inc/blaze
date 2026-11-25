@@ -135,6 +135,12 @@ impl Pty {
         Ok(Pty { fd, pid })
     }
 
+    /// OS process ID of the spawned child process.
+    #[inline]
+    pub fn pid(&self) -> u32 {
+        self.pid.max(0) as u32
+    }
+
     pub fn read(&self, buf: &mut [u8]) -> Read {
         // SAFETY: `buf` is writable for `buf.len()` bytes and `self.fd` is an open PTY fd.
         let n = unsafe { read(self.fd, buf.as_mut_ptr().cast(), buf.len()) };

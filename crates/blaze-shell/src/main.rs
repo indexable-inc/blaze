@@ -62,6 +62,8 @@ fn headless_repl() {
 #[cfg(target_os = "macos")]
 mod macos_app {
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU32;
     use std::sync::mpsc;
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -91,7 +93,9 @@ mod macos_app {
     use blaze_shell::blocks::{BlockBody, BlockId, BlockStore};
     use blaze_shell::editor::{Editor, HistoryEntry};
     use blaze_shell::font::Fonts;
-    use blaze_shell::host::{InteractiveSpawn, RustCellMeta, run_command_line};
+    use blaze_shell::host::{
+        InteractiveSpawn, RustCellMeta, run_command_line, run_command_line_with_pid,
+    };
     use blaze_shell::keys;
     use blaze_shell::layout::{LayoutInput, TOP_BAR_H, build_scene, layout_fullscreen_terminal};
     use blaze_shell::prompt::{GitStatusWorker, PromptInfo};
@@ -377,10 +381,37 @@ mod macos_app {
         new_rust_cell: Option<String>,
     }
 
-    /// True for commands that may take noticeable time (`rust { ... }`, `:rs`, external binaries
-    /// like `blaze`, `cargo`, `git`, `sleep`, etc.) so they run asynchronously while the next
-    /// prompt line appears immediately!
+    /// True for full-screen TUI or interactive REPL programs that genuinely need a foreground
+    /// keyboard-attached PTY rather than non-blocking background execution.
+    fn is_interactive_tty_cmd(trimmed: &str) -> bool {
+        if trimmed.contains('|') {
+            return false;
+        }
+        let mut parts = trimmed.split_whitespace();
+        let Some(raw_cmd) = parts.next() else {
+            return false;
+        };
+        let cmd = raw_cmd.trim_start_matches('^').rsplit('/').next().unwrap_or(raw_cmd);
+        let has_args = parts.next().is_some();
+        match cmd {
+            "vim" | "nvim" | "vi" | "hx" | "nano" | "emacs" | "less" | "more" | "man" | "top"
+            | "htop" | "btop" | "ssh" | "tmux" | "screen" | "fzf" | "lazygit" | "gitui"
+            | "tig" | "claude" | "codex" | "bash" | "zsh" | "fish" | "sh" | "sudo" | "watch"
+            | "yazi" | "ranger" | "k9s" => true,
+            "python" | "python3" | "node" | "bun" | "irb" | "sqlite3" | "psql" | "redis-cli" => {
+                !has_args
+            }
+            _ => false,
+        }
+    }
+
+    /// True for commands that may take noticeable time (`rust { ... }`, `:rs`, external CLI
+    /// binaries like `git`, `blaze`, `cargo`, `sleep`, etc.) so they run asynchronously while
+    /// the next prompt line appears immediately!
     fn should_run_async(trimmed: &str) -> bool {
+        if is_interactive_tty_cmd(trimmed) {
+            return false;
+        }
         if trimmed.starts_with("rust") || trimmed.starts_with(":rs") {
             return true;
         }
@@ -588,6 +619,7 @@ mod macos_app {
                 } else {
                     "running…".to_owned()
                 };
+                let pid_slot = Arc::new(AtomicU32::new(0));
                 let block_id = self.store.record_block(
                     trimmed.to_owned(),
                     prompt_snap.clone(),
@@ -596,7 +628,7 @@ mod macos_app {
                     started_ms,
                     0,
                     0,
-                    BlockBody::Running { label },
+                    BlockBody::Running { label, pid: Arc::clone(&pid_slot) },
                 );
                 self.running_jobs += 1;
                 self.auto_scroll_bottom = true;
@@ -632,7 +664,10 @@ mod macos_app {
                             st.push_rust_cell(&cell_src);
                         }
                         let prior_count = st.rust_cells.len();
-                        let res = run_command_line(&src_owned, st, true);
+                        // Non-interactive background CLI commands run captured (`allow_interactive_pty = false`)
+                        // so they publish their OS PID immediately, never hijack the prompt, and update their
+                        // single block in-place when complete!
+                        let res = run_command_line_with_pid(&src_owned, st, false, Some(&pid_slot));
                         let duration_ms = t0.elapsed().as_millis() as u64;
                         let new_rust_cell = if res.outcome.state.rust_cells.len() > prior_count {
                             res.outcome.state.rust_cells.last().map(|c| c.code.as_ref().to_owned())
@@ -663,6 +698,7 @@ mod macos_app {
 
             if let Some(spawn) = res.interactive_spawn {
                 self.spawn_pty_block(
+                    None,
                     trimmed.to_owned(),
                     prompt_snap,
                     state_before,
@@ -716,7 +752,7 @@ mod macos_app {
                 updated = true;
 
                 if let Some(spawn) = done.interactive_spawn {
-                    // Full-screen / interactive PTY command: upgrade to a live PTY!
+                    // Upgrade the existing `Running` block in-place to a live PTY (never duplicate!).
                     let state_before = self
                         .store
                         .block(done.block_id)
@@ -724,6 +760,7 @@ mod macos_app {
                         .unwrap_or_else(|| self.store.active_state().fork());
                     let prompt_snap = self.prompt.clone();
                     self.spawn_pty_block(
+                        Some(done.block_id),
                         done.source,
                         prompt_snap,
                         state_before.fork(),
@@ -771,6 +808,7 @@ mod macos_app {
         #[allow(clippy::too_many_arguments)]
         fn spawn_pty_block(
             &mut self,
+            existing_block: Option<BlockId>,
             source: String,
             prompt_snap: PromptInfo,
             state_before: EngineState<'static>,
@@ -793,22 +831,37 @@ mod macos_app {
             let alloc = Alloc::global();
             match Pty::spawn(&argv_refs, &spawn.cwd, cols, rows, px) {
                 Ok(pty) => {
+                    let child_pid = Some(pty.pid());
                     let mut opts = VtOpts::new(cols, rows, 4 << 20);
                     opts.cell_px = Some(blaze_vt::input::mouse::Pixels {
                         width: cell_px.0,
                         height: cell_px.1,
                     });
                     if let Ok(term) = Terminal::new_in(opts, alloc) {
-                        let block_id = self.store.record_block(
-                            source,
-                            prompt_snap,
-                            state_before,
-                            state_after.fork(),
-                            started_ms,
-                            0,
-                            0,
-                            BlockBody::Terminal { term, running: true, exit_code: None },
-                        );
+                        let body = BlockBody::Terminal {
+                            term,
+                            pid: child_pid,
+                            running: true,
+                            exit_code: None,
+                        };
+                        let block_id = if let Some(id) = existing_block
+                            && let Some(blk) = self.store.block_mut(id)
+                        {
+                            blk.body = body;
+                            blk.state_after = state_after.fork();
+                            id
+                        } else {
+                            self.store.record_block(
+                                source,
+                                prompt_snap,
+                                state_before,
+                                state_after.fork(),
+                                started_ms,
+                                0,
+                                0,
+                                body,
+                            )
+                        };
                         self.store.set_active_state(state_after);
                         self.active_pty = Some(ActivePty {
                             block_id,
@@ -825,16 +878,23 @@ mod macos_app {
                         &format!("failed to spawn `{}` on PTY: {msg}", spawn.program),
                         alloc,
                     );
-                    self.store.record_block(
-                        source,
-                        prompt_snap,
-                        state_before,
-                        state_after,
-                        started_ms,
-                        0,
-                        1,
-                        BlockBody::Error { err },
-                    );
+                    if let Some(id) = existing_block
+                        && let Some(blk) = self.store.block_mut(id)
+                    {
+                        blk.exit_code = 1;
+                        blk.body = BlockBody::Error { err };
+                    } else {
+                        self.store.record_block(
+                            source,
+                            prompt_snap,
+                            state_before,
+                            state_after,
+                            started_ms,
+                            0,
+                            1,
+                            BlockBody::Error { err },
+                        );
+                    }
                     self.refresh_prompt(1, 0);
                     self.auto_scroll_bottom = true;
                 }
@@ -2051,7 +2111,29 @@ mod macos_app {
                 }
             }
             if let Some((block_id, code, dur_ms)) = pty_finished {
-                shell.active_pty = None;
+                // Drain any remaining unread bytes from the PTY master before closing/dropping it
+                // so fast commands never lose their final output!
+                if let Some(ap) = shell.active_pty.take() {
+                    let drain_deadline = Instant::now() + std::time::Duration::from_millis(15);
+                    loop {
+                        match ap.pty.read(&mut pty_buf) {
+                            PtyRead::Bytes(n) => {
+                                if let Some(blk) = shell.store.block_mut(ap.block_id)
+                                    && let BlockBody::Terminal { term, .. } = &mut blk.body
+                                {
+                                    term.feed(&pty_buf[..n]);
+                                }
+                            }
+                            PtyRead::Closed => break,
+                            PtyRead::Nothing => {
+                                if Instant::now() >= drain_deadline {
+                                    break;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                            }
+                        }
+                    }
+                }
                 if let Some(blk) = shell.store.block_mut(block_id) {
                     blk.exit_code = code;
                     blk.duration_ms = dur_ms;

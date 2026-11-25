@@ -557,10 +557,22 @@ fn layout_block(
         rx = mx0 - 12.0;
     }
 
+    let running_pid: Option<u32> = match &block.body {
+        BlockBody::Running { pid, .. } => {
+            let p = pid.load(std::sync::atomic::Ordering::Relaxed);
+            if p > 0 { Some(p) } else { None }
+        }
+        BlockBody::Terminal { pid, running: true, .. } => *pid,
+        _ => None,
+    };
     if matches!(&block.body, BlockBody::Running { .. } | BlockBody::Terminal { running: true, .. }) {
         let elapsed_ms = (now_ns.max(0) as u64 / 1_000_000).saturating_sub(block.started_ms);
-        let lbl = format_duration_ms(elapsed_ms);
-        let w = lbl.len() as f32 * m.cw;
+        let dur = format_duration_ms(elapsed_ms);
+        let lbl = match running_pid {
+            Some(p) => format!("pid {p} · {dur}"),
+            None => dur,
+        };
+        let w = lbl.chars().count() as f32 * m.cw;
         scene.text(rx - w, cur_y, lbl, theme::FIRE, false, false, clip_id);
         scene.over_circle(rx - w - 9.0, cur_y + m.ch * 0.5, 3.0, theme::FIRE, clip_id);
         rx -= w + 20.0;
@@ -569,6 +581,13 @@ fn layout_block(
         let dur_w = dur_lbl.len() as f32 * m.cw;
         scene.text(rx - dur_w, cur_y, dur_lbl, theme::INK_4, false, false, clip_id);
         rx -= dur_w + 12.0;
+
+        if let BlockBody::Terminal { pid: Some(p), .. } = &block.body {
+            let pid_lbl = format!("pid {p}");
+            let pw = pid_lbl.len() as f32 * m.cw;
+            scene.text(rx - pw, cur_y, pid_lbl, theme::INK_4, false, false, clip_id);
+            rx -= pw + 12.0;
+        }
 
         if block.exit_code != 0 {
             let lbl = format!("exit {}", block.exit_code);
@@ -660,9 +679,11 @@ fn layout_block(
                     clip_id,
                 )
             }
-            BlockBody::Running { label } => {
+            BlockBody::Running { label, pid } => {
                 scene.over_circle(x0 + 5.0, cur_y + m.ch * 0.5, 3.0, theme::FIRE, clip_id);
-                let txt = if label.is_empty() { "running…" } else { label.as_str() };
+                let p = pid.load(std::sync::atomic::Ordering::Relaxed);
+                let base = if label.is_empty() { "running…" } else { label.as_str() };
+                let txt = if p > 0 { format!("pid {p} · {base}") } else { base.to_owned() };
                 scene.text(x0 + 15.0, cur_y, txt, theme::INK_3, false, false, clip_id);
                 m.ch + 2.0
             }

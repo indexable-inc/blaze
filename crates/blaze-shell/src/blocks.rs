@@ -5,6 +5,9 @@
 //! Clicking **Fork** on any historical block creates a sibling [`Branch`] in O(1) time without
 //! copying tables, variables, or `def`s.
 
+use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
+
 use blaze_sh::{EngineState, ShellError, Value};
 use blaze_vt::terminal::{Terminal, Which};
 
@@ -32,6 +35,7 @@ pub enum BlockBody {
     /// An external program running on a PTY rendered through `blaze-vt`.
     Terminal {
         term: Terminal<'static>,
+        pid: Option<u32>,
         running: bool,
         exit_code: Option<i32>,
     },
@@ -46,6 +50,8 @@ pub enum BlockBody {
     /// A command running asynchronously while the prompt is already live on the next line.
     Running {
         label: String,
+        /// Live OS child PID (0 until child process spawns or for in-process tasks).
+        pid: Arc<AtomicU32>,
     },
 }
 

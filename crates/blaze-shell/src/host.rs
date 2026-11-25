@@ -7,6 +7,8 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -66,6 +68,17 @@ pub fn run_command_line(
     state: EngineState<'static>,
     allow_interactive_pty: bool,
 ) -> ExecResult {
+    run_command_line_with_pid(src, state, allow_interactive_pty, None)
+}
+
+/// Drive `blaze_sh::machine::Machine` to completion, optionally publishing the spawned OS child
+/// PID into `pid_out` as soon as an external process starts.
+pub fn run_command_line_with_pid(
+    src: &str,
+    state: EngineState<'static>,
+    allow_interactive_pty: bool,
+    pid_out: Option<&Arc<AtomicU32>>,
+) -> ExecResult {
     let alloc = Alloc::global();
     let initial_cwd = state.cwd.as_ref().to_owned();
     let home = state.get_env("HOME").unwrap_or("").to_owned();
@@ -115,6 +128,7 @@ pub fn run_command_line(
                     &oldpwd,
                     path_env.as_deref(),
                     allow_interactive_pty,
+                    pid_out,
                     &mut rust_meta,
                     &mut interactive_spawn,
                     &mut forked_label,
@@ -155,6 +169,7 @@ fn handle_request(
     oldpwd: &str,
     path_env: Option<&str>,
     allow_interactive_pty: bool,
+    pid_out: Option<&Arc<AtomicU32>>,
     rust_meta: &mut Option<RustCellMeta>,
     interactive_spawn: &mut Option<InteractiveSpawn>,
     forked_label: &mut Option<String>,
@@ -255,6 +270,7 @@ fn handle_request(
                     cwd.as_str(),
                     &env,
                     stdin.as_ref().map(|b| b.as_slice()),
+                    pid_out,
                     alloc,
                 ) {
                     Ok(res) => Answer::External(res),
@@ -830,6 +846,7 @@ fn run_external_captured(
     cwd: &str,
     env: &AVec<'_, (blaze_own::ARc<'_, str>, blaze_own::ARc<'_, str>)>,
     stdin_bytes: Option<&[u8]>,
+    pid_out: Option<&Arc<AtomicU32>>,
     alloc: Alloc<'static>,
 ) -> Result<ExternalResult<'static>, String> {
     let mut cmd = Command::new(program);
@@ -850,6 +867,9 @@ fn run_external_captured(
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to run `{program}`: {e}"))?;
+    if let Some(slot) = pid_out {
+        slot.store(child.id(), Ordering::Relaxed);
+    }
 
     if let Some(input) = stdin_bytes
         && let Some(mut pipe) = child.stdin.take()
