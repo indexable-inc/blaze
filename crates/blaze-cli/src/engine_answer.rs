@@ -455,6 +455,7 @@ pub(crate) fn root_of(rows: &Rows<'_>) -> ContentId {
 
 /// The base a checkout whose root manifest has the id `root` starts from when its lock names
 /// none (sans-IO): the newest entry of an equal root manifest; never a zero-root match.
+#[cfg_attr(not(test), allow(dead_code, reason = "tested sans-IO entry point beside candidate_bases"))]
 pub(crate) fn pick_by_root(bases: &[Base], root: ContentId) -> Option<Base> {
     bases.iter().find(|it| it.root == root && root != NO_ROOT).copied()
 }
@@ -516,9 +517,52 @@ pub(crate) fn with_base<'f>(bases: &[Base], now: Base, frame: &'f Frame) -> blaz
 
 /// The base a checkout of `workspace` with lock `lock` starts from (sans-IO): the newest of its
 /// workspace and lock digest, else the newest of its workspace, else none.
+#[cfg_attr(not(test), allow(dead_code, reason = "tested sans-IO entry point beside candidate_bases"))]
 pub(crate) fn pick_base(bases: &[Base], workspace: Workspace, lock: ContentId) -> Option<Base> {
     let mine = |it: &&Base| it.workspace == workspace.id;
     bases.iter().filter(mine).find(|it| it.lock == lock && lock != NO_LOCK).or_else(|| bases.iter().find(mine)).copied()
+}
+
+/// Every candidate base in `bases` matching `(workspace, lock)` or `root` in priority order
+/// (sans-IO, newest first within each tier, deduplicated by pointer):
+/// 1. Same `workspace` and equal non-zero `lock` digest;
+/// 2. Same `workspace` (other lock digest);
+/// 3. If neither workspace tier matched, equal non-zero `root` manifest digest.
+pub(crate) fn candidate_bases<'f>(
+    bases: &[Base],
+    workspace: Option<Workspace>,
+    lock: ContentId,
+    root: ContentId,
+    frame: &'f Frame,
+) -> blaze_own::Vec<Base, &'f Frame> {
+    fn push_unique<'f>(out: &mut blaze_own::Vec<Base, &'f Frame>, base: Base) {
+        if !out.iter().any(|existing: &Base| existing.pointer == base.pointer) {
+            out.push(base);
+        }
+    }
+    let mut out = blaze_own::Vec::new_in(frame);
+    if let Some(ws) = workspace {
+        if lock != NO_LOCK {
+            for &base in bases {
+                if base.workspace == ws.id && base.lock == lock {
+                    push_unique(&mut out, base);
+                }
+            }
+        }
+        for &base in bases {
+            if base.workspace == ws.id {
+                push_unique(&mut out, base);
+            }
+        }
+    }
+    if out.is_empty() && root != NO_ROOT {
+        for &base in bases {
+            if base.root == root {
+                push_unique(&mut out, base);
+            }
+        }
+    }
+    out
 }
 
 /// The workspace a save's rows are of, with no read (the module's "KNOWN WITH NO READ"): the
@@ -558,13 +602,18 @@ impl fmt::Display for BaseKept {
     }
 }
 
-/// The tests' control of the bases (rule 23): [`BasePlant::OnePointer`] keeps and reads the one
-/// [`LATEST_ROOT`] as before 2026-11-21, so a second repository's answer replaces the first's.
+/// The tests' control of the bases (rule 23):
+/// - [`BasePlant::OnePointer`] keeps and reads the one [`LATEST_ROOT`] as before 2026-11-21, so a
+///   second repository's answer replaces the first's.
+/// - [`BasePlant::NoStaleFallback`] skips cross-worktree base fallback when the checkout's own
+///   stored answer is unreadable or from older tools, proving the stale-answer fallback test
+///   catches the pre-fix regression.
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum BasePlant {
     None,
     OnePointer,
+    NoStaleFallback,
 }
 
 #[cfg(test)]
@@ -573,7 +622,7 @@ std::thread_local! {
 }
 
 #[cfg(test)]
-fn base_plant() -> BasePlant {
+pub(crate) fn base_plant() -> BasePlant {
     BASE_PLANT.get()
 }
 
@@ -1876,50 +1925,115 @@ fn read_bases<'m, 'f, D: Driver, S: Sharing>(cx: &Cx, store: &mut CommandStore<'
     Ok(Some(decode_bases(held.bytes, frame)))
 }
 
-/// The base a checkout with no answer of its own starts from (the module's bases), the bases
-/// record read first (no file is read when the home keeps none): its lock read from `root`
-/// once, its workspace's newest entry of an equal lock digest, else its workspace's newest;
-/// with no lock, a lock of no path package or no entry of its workspace, its root manifest
-/// read once and the newest entry of equal bytes ([`pick_by_root`]); else `None`. The control
-/// ([`BasePlant::OnePointer`]) reads the home's one [`LATEST_ROOT`].
-pub(crate) fn load_base<'m, D: Driver, S: Sharing>(
+/// A fully validated fallback base answer: its sealed pointer, printed lines record, and decoded
+/// root directory all opened cleanly against `store`.
+pub(crate) struct LoadedBase<'m, 'a> {
+    pub(crate) pointer: Pointer<'m>,
+    pub(crate) lines: crate::engine_lines::Last<'m, 'a>,
+    pub(crate) root: Root<'a>,
+}
+
+/// Opens a named root's pointer, lines record, and root directory, returning `Ok(None)` if the
+/// root is absent, unreadable, excluded, or (when `require_current_tools`) written under other
+/// tools.
+#[expect(clippy::too_many_arguments, reason = "base open helper: each argument one handle or constraint")]
+pub(crate) fn open_named_base<'m, 'a, D: Driver, S: Sharing>(
     cx: &Cx,
     store: &mut CommandStore<'m, '_, D, S>,
-    root: &bstd::fs::Dir<bstd::fs::ReadWrite>,
+    name: &str,
+    tools: &Tools,
+    exclude: Option<Key>,
+    require_current_tools: bool,
+    alloc: SharedAlloc<'a>,
+) -> Result<Option<LoadedBase<'m, 'a>>, CliError> {
+    let Some(Ok(pointer)) = load_pointer(cx, store, name)? else { return Ok(None) };
+    if exclude == Some(pointer.key) {
+        return Ok(None);
+    }
+    if require_current_tools && !pointer.certifies_under(tools) {
+        return Ok(None);
+    }
+    let Ok(lines) = load_lines(cx, store, pointer.lines, alloc)? else { return Ok(None) };
+    let Ok(root) = open_root(cx, store, pointer.root, alloc)? else { return Ok(None) };
+    Ok(Some(LoadedBase { pointer, lines, root }))
+}
+
+/// Opens the best readable workspace base from [`BASES_ROOT`] for the checkout at `dir_root`:
+/// iterates [`candidate_bases`] in priority order (same workspace + lock, then same workspace,
+/// else same root manifest; newest first), skipping `exclude` and any unreadable base, and
+/// preferring a base written under `tools` (`certifies_under(tools)`) before falling back to any
+/// readable base when `!require_current_tools`.
+#[expect(clippy::too_many_arguments, reason = "workspace base open helper: each argument one handle or constraint")]
+pub(crate) fn open_base_for_tools<'m, 'a, D: Driver, S: Sharing>(
+    cx: &Cx,
+    store: &mut CommandStore<'m, '_, D, S>,
+    dir_root: &bstd::fs::Dir<bstd::fs::ReadWrite>,
+    tools: &Tools,
+    exclude: Option<Key>,
+    require_current_tools: bool,
+    alloc: SharedAlloc<'a>,
     frame: &Frame,
-) -> Result<Option<Result<Pointer<'m>, Unreadable>>, CliError> {
+) -> Result<Option<LoadedBase<'m, 'a>>, CliError> {
     #[cfg(test)]
     if base_plant() == BasePlant::OnePointer {
-        return load_pointer(cx, store, LATEST_ROOT);
+        return open_named_base(cx, store, LATEST_ROOT, tools, exclude, require_current_tools, alloc);
     }
     let Some(Some(bases)) = read_bases(cx, store, frame)? else { return Ok(None) };
-    // One file of the checkout's root, whole: `false` when none is there.
     let read = |name: &str, text: &mut bstd::mem::Bytes<'_>| -> Result<bool, CliError> {
-        match root.read_all(cx, &bstd::path::Path::new(name)?, text) {
+        match dir_root.read_all(cx, &bstd::path::Path::new(name)?, text) {
             Ok(_) => Ok(true),
             Err(error) if matches!(error.kind, bstd::fs::FsKind::NotFound | bstd::fs::FsKind::IsADirectory) => Ok(false),
             Err(error) => Err(error.into()),
         }
     };
     let mut lock_text = bstd::mem::Bytes::new_in(frame, "the checkout's lock, for its workspace's base");
-    let by_lock = match read(LOCK_FILE, &mut lock_text)? {
-        true => Workspace::of_lock(lock_text.as_slice(), frame).and_then(|now| pick_base(&bases, now, ContentId::of(crate::sweep::FILE_DOMAIN, lock_text.as_slice()))),
-        false => None,
+    let (workspace, lock_id) = match read(LOCK_FILE, &mut lock_text)? {
+        true => (Workspace::of_lock(lock_text.as_slice(), frame), ContentId::of(crate::sweep::FILE_DOMAIN, lock_text.as_slice())),
+        false => (None, NO_LOCK),
     };
-    let picked = match by_lock {
-        Some(base) => Some(base),
-        None => {
-            let mut manifest = bstd::mem::Bytes::new_in(frame, "the checkout's root manifest, for its workspace's base");
-            match read(ROOT_MANIFEST, &mut manifest)? {
-                true => pick_by_root(&bases, ContentId::of(crate::sweep::FILE_DOMAIN, manifest.as_slice())),
-                false => None,
-            }
+    let mut candidates = candidate_bases(&bases, workspace, lock_id, NO_ROOT, frame);
+    if candidates.is_empty() {
+        let mut manifest = bstd::mem::Bytes::new_in(frame, "the checkout's root manifest, for its workspace's base");
+        if read(ROOT_MANIFEST, &mut manifest)? {
+            candidates = candidate_bases(&bases, None, NO_LOCK, ContentId::of(crate::sweep::FILE_DOMAIN, manifest.as_slice()), frame);
         }
-    };
-    match picked {
-        Some(base) => pointer_at(cx, store, base.pointer).map(Some),
-        None => Ok(None),
     }
+    let mut fallback: Option<LoadedBase<'m, 'a>> = None;
+    for base in candidates.iter() {
+        if exclude == Some(base.pointer) {
+            continue;
+        }
+        let Ok(pointer) = pointer_at(cx, store, base.pointer)? else { continue };
+        let current = pointer.certifies_under(tools);
+        if require_current_tools && !current {
+            continue;
+        }
+        if !current && fallback.is_some() {
+            continue;
+        }
+        let Ok(lines) = load_lines(cx, store, pointer.lines, alloc)? else { continue };
+        let Ok(root) = open_root(cx, store, pointer.root, alloc)? else { continue };
+        let loaded = LoadedBase { pointer, lines, root };
+        if current {
+            return Ok(Some(loaded));
+        }
+        fallback = Some(loaded);
+    }
+    Ok(fallback)
+}
+
+/// Opens the pre-warmed toolchain-only fallback base (`tool-base.<PINNED>.<TRIPLE>.<tools>`),
+/// verifying its pointer, lines, and root directory.
+pub(crate) fn open_toolchain_base<'m, 'a, D: Driver, S: Sharing>(
+    cx: &Cx,
+    store: &mut CommandStore<'m, '_, D, S>,
+    toolchain: blaze_toolchain::ToolchainId,
+    tools: &Tools,
+    alloc: SharedAlloc<'a>,
+    frame: &Frame,
+) -> Result<Option<LoadedBase<'m, 'a>>, CliError> {
+    let name = toolchain_base_root(toolchain, tools, frame);
+    open_named_base(cx, store, name.as_str(), tools, None, false, alloc)
 }
 
 /// The home-wide toolchain-only answer root: `tool-base.<PINNED>.<TRIPLE>.<tools>`.
@@ -1948,6 +2062,7 @@ pub(crate) fn toolchain_base_root<'f>(
 /// Fallback lookup for a fresh checkout that has neither its own answer nor a matching workspace
 /// base: loads the pre-warmed toolchain-only `Answer` pointer under
 /// `tool-base.<PINNED>.<TRIPLE>.<tools>`.
+#[cfg(test)]
 pub(crate) fn load_toolchain_base<'m, D: Driver, S: Sharing>(
     cx: &Cx,
     store: &mut CommandStore<'m, '_, D, S>,

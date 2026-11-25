@@ -45,6 +45,9 @@ const GC_LOCK_LEAF: &str = "gc.lock";
 
 /// Maximum compaction/sweep slices per `blaze gc` invocation (rule 18: bounded progress).
 const GC_SLICES_MOST: u32 = 1024;
+/// Maximum manifest-refresh retries when a compaction slice aborts due to a concurrent
+/// foreground commit touching a candidate segment or renewing a root (rule 18).
+const GC_CONFLICT_RETRIES_MOST: u32 = 3;
 
 /// Arguments passed to the detached background GC helper.
 #[cfg(unix)]
@@ -358,33 +361,50 @@ pub(crate) fn run_with(
     let mut summary = GcSummary { cap_bytes, ..GcSummary::default() };
 
     if store_exists {
-        let lent = home.open_store_with_liveness(&settings, facts, Liveness::Reached, heap.alloc())?;
-        summary.bytes_before = lent.total_bytes();
-        let ran = if opts.background {
-            lent.compact(GC_SLICES_MOST)
-        } else {
-            lent.compact_foreground(GC_SLICES_MOST)
-        }
-        .map_err(|error| CliError::Store(StoreFailure::Place(PlaceError::Lent(error))))?;
+        let mut remaining_slices = GC_SLICES_MOST;
         let mut totals = Sliced::default();
-        for slice in &ran {
-            if !slice.aborted {
-                totals = totals.and(*slice);
-                if slice.segments > 0 || slice.evicted_roots > 0 || slice.removed > 0 {
-                    summary.slices += 1;
+        for attempt in 0..=GC_CONFLICT_RETRIES_MOST {
+            let attempt_facts = if attempt == 0 { facts } else { Facts { boot, nonce: nonce(rng) } };
+            let lent = home.open_store_with_liveness(&settings, attempt_facts, Liveness::Reached, heap.alloc())?;
+            if attempt == 0 {
+                summary.bytes_before = lent.total_bytes();
+            }
+            let ran = if opts.background {
+                lent.compact(remaining_slices)
+            } else {
+                lent.compact_foreground(remaining_slices)
+            }
+            .map_err(|error| CliError::Store(StoreFailure::Place(PlaceError::Lent(error))))?;
+            let mut aborted = false;
+            for slice in &ran {
+                if slice.aborted {
+                    aborted = true;
+                } else {
+                    totals = totals.and(*slice);
+                    if slice.segments > 0 || slice.evicted_roots > 0 || slice.removed > 0 {
+                        summary.slices += 1;
+                        remaining_slices = remaining_slices.saturating_sub(1);
+                    }
                 }
             }
+            if aborted && remaining_slices > 0 && attempt < GC_CONFLICT_RETRIES_MOST {
+                // Another foreground process committed concurrently; drop and reopen on the newest
+                // manifest rather than abandoning remaining reclamation work.
+                drop(lent);
+                continue;
+            }
+            let _ = if opts.background {
+                lent.seal()
+            } else {
+                lent.seal_foreground()
+            }
+            .map_err(|error| CliError::Store(StoreFailure::Place(PlaceError::Lent(error))))?;
+            summary.bytes_after = lent.total_bytes();
+            drop(lent);
+            break;
         }
         summary.evicted_roots = totals.evicted_roots;
         summary.files_unlinked = totals.removed;
-        let _ = if opts.background {
-            lent.seal()
-        } else {
-            lent.seal_foreground()
-        }
-        .map_err(|error| CliError::Store(StoreFailure::Place(PlaceError::Lent(error))))?;
-        summary.bytes_after = lent.total_bytes();
-        drop(lent);
     }
 
     // Clean stale old-format store directories (e.g. f5s2, legacy format <=4 files in v2/store/).

@@ -1621,6 +1621,20 @@ fn missing_stored_record(error: &CliError) -> Option<crate::engine_answer::Unrea
     }
 }
 
+/// How [`checking`] recovers when a prior stored answer's lazy page or standing outline is missing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StoredRecovery {
+    /// Normal check: load this checkout's own answer (falling back to a compatible base if absent,
+    /// unreadable, or from an older binary while a current-binary workspace base exists).
+    Normal,
+    /// Retry after a lazy missing record in this checkout's own answer: skip the checkout's own
+    /// root and `exclude` pointer, try another worktree's compatible workspace base, else rebuild
+    /// cleanly in full.
+    SkipOwn { exclude: blaze_drive::Key },
+    /// Rebuild cleanly from no stored answer.
+    Fresh,
+}
+
 #[expect(clippy::too_many_arguments, reason = "the command's edge: each argument one handle of it")]
 fn check_live_with_daemon<'f, 'd>(
     cx: &'f Cx,
@@ -1659,29 +1673,17 @@ fn check_live_with_daemon<'f, 'd>(
     let mut board = board_in(heap, &asking, phases.now().since_start());
     let mut active = None;
     let mut printed = false;
-    let first = {
-        let board_ref: &crate::engine_status::Board<'_> = &board;
-        work::unwinding(|| {
-            crate::engine_status::watched(cx, stop_host, root, err, &clock, board_ref, asking.every, live, || {
-                checking(cx, fs, host, rng, args, net, root, &opts, false, None, &mut printed, shown, phases, out, err, board_ref, &mut active, live, daemon.as_deref_mut())
-            }).map_err(EngineCheckError::Watcher)?
-        })
-    };
-    let result = match first {
-        Ok(Err(error))
-            if !printed
-                && !opts.fresh
-                && opts.driver != crate::engine_ready_edit::Driver::Ready
-                && let Some(unreadable) = missing_stored_record(&error) =>
-        {
-            if let Some(ctx) = daemon.as_deref_mut()
-                && let Some(crash_cursor) = daemon_crash_cursor
-            {
-                ctx.watch = Some(crate::daemon_watch::PollOutcome::FullRescan { crash_cursor, needs_refresh: true });
-            }
-            board = board_in(heap, &asking, phases.now().since_start());
-            active = None;
+    #[cfg(test)]
+    let allow_stale_fallback = crate::engine_answer::base_plant() != crate::engine_answer::BasePlant::NoStaleFallback;
+    #[cfg(not(test))]
+    let allow_stale_fallback = true;
+    let mut recovery = StoredRecovery::Normal;
+    let mut prior_unreadable: Option<crate::engine_answer::Unreadable> = None;
+    let result = loop {
+        let mut used_pointer: Option<(blaze_drive::Key, bool)> = None;
+        let attempt = {
             let board_ref: &crate::engine_status::Board<'_> = &board;
+            let prior = prior_unreadable.take();
             work::unwinding(|| {
                 crate::engine_status::watched(cx, stop_host, root, err, &clock, board_ref, asking.every, live, || {
                     checking(
@@ -1693,8 +1695,9 @@ fn check_live_with_daemon<'f, 'd>(
                         net,
                         root,
                         &opts,
-                        true,
-                        Some(unreadable),
+                        recovery,
+                        prior,
+                        &mut used_pointer,
                         &mut printed,
                         shown,
                         phases,
@@ -1703,12 +1706,40 @@ fn check_live_with_daemon<'f, 'd>(
                         board_ref,
                         &mut active,
                         live,
-                        daemon,
+                        daemon.as_deref_mut(),
                     )
                 }).map_err(EngineCheckError::Watcher)?
             })
+        };
+        let next_recovery = match &attempt {
+            Ok(Err(error))
+                if !printed
+                    && !opts.fresh
+                    && recovery != StoredRecovery::Fresh
+                    && opts.driver != crate::engine_ready_edit::Driver::Ready =>
+            {
+                missing_stored_record(error).map(|unreadable| {
+                    let next = match (recovery, used_pointer) {
+                        (StoredRecovery::Normal, Some((exclude, false))) if allow_stale_fallback => StoredRecovery::SkipOwn { exclude },
+                        _ => StoredRecovery::Fresh,
+                    };
+                    (next, unreadable)
+                })
+            }
+            _ => None,
+        };
+        let Some((next, unreadable)) = next_recovery else {
+            break attempt;
+        };
+        if let Some(ctx) = daemon.as_deref_mut()
+            && let Some(crash_cursor) = daemon_crash_cursor
+        {
+            ctx.watch = Some(crate::daemon_watch::PollOutcome::FullRescan { crash_cursor, needs_refresh: true });
         }
-        other => other,
+        board = board_in(heap, &asking, phases.now().since_start());
+        active = None;
+        recovery = next;
+        prior_unreadable = Some(unreadable);
     };
     let board: &crate::engine_status::Board<'_> = &board;
     let error = match result {
@@ -1777,8 +1808,9 @@ fn checking<'f, 'd>(
     net: Option<&bstd::net::Net>,
     root: &Dir<ReadWrite>,
     opts: &Opts<'f>,
-    fresh_override: bool,
+    recovery: StoredRecovery,
     prior_unreadable: Option<crate::engine_answer::Unreadable>,
+    used_pointer: &mut Option<(blaze_drive::Key, bool)>,
     printed_out: &mut bool,
     shown: &mut print::Shown<'f>,
     phases: &mut Phases,
@@ -1793,7 +1825,7 @@ fn checking<'f, 'd>(
     stack_probe::at("checking");
     let &Opts { tools, workers, toolchain, heap, place, fresh, heads_from, head_units, head_jobs, head_sources, frame, scope_reads, unreadable: planted_unreadable, body_locals, status: _, origin, names_oracle, driver, ready_plant, scope: check_scope } = opts;
     // The oracle compares every crate's names, so every crate is entered: no stored answer read.
-    let fresh = fresh || fresh_override || names_oracle.on();
+    let fresh = fresh || recovery == StoredRecovery::Fresh || names_oracle.on();
     let began = phases.now();
     let erased = blaze_own::Erased::new(frame);
     // The request's arena (engine_phase_mem.rs): what this call keeps to its end and no record
@@ -1827,82 +1859,168 @@ fn checking<'f, 'd>(
     let whole_root = crate::engine_answer::root_name(place.checkout, frame);
     let answer_root = crate::engine_answer::scoped_root_name(place.checkout, check_scope, frame);
     let view_slot = crate::engine_lines::ViewSlot::load(&opened.lent, answer_root.as_str(), fresh, shown, &tools, frame)?;
+    #[expect(clippy::too_many_arguments, reason = "fallback base lookup helper")]
+    fn open_fallback_base<'m, 'a, D: blaze_core::Driver, S: crate::store::Sharing>(
+        cx: &Cx,
+        store: &mut crate::store::CommandStore<'m, '_, D, S>,
+        root: &Dir<ReadWrite>,
+        check_scope: CheckScope<'_>,
+        whole_root: &str,
+        toolchain: blaze_toolchain::ToolchainId,
+        tools: &blaze_engine::Tools,
+        exclude: Option<blaze_drive::Key>,
+        require_current_tools: bool,
+        include_tool_base: bool,
+        alloc: blaze_own::SharedAlloc<'a>,
+        frame: &Frame,
+    ) -> Result<Option<(crate::engine_answer::LoadedBase<'m, 'a>, bool)>, CliError> {
+        if !check_scope.is_whole()
+            && let Some(loaded) = crate::engine_answer::open_named_base(cx, store, whole_root, tools, exclude, require_current_tools, alloc)?
+        {
+            return Ok(Some((loaded, true)));
+        }
+        if let Some(loaded) = crate::engine_answer::open_base_for_tools(cx, store, root, tools, exclude, require_current_tools, alloc, frame)? {
+            return Ok(Some((loaded, true)));
+        }
+        if include_tool_base
+            && let Some(loaded) = crate::engine_answer::open_toolchain_base(cx, store, toolchain, tools, alloc, frame)?
+        {
+            return Ok(Some((loaded, false)));
+        }
+        Ok(None)
+    }
+    #[cfg(test)]
+    let allow_stale_fallback = crate::engine_answer::base_plant() != crate::engine_answer::BasePlant::NoStaleFallback;
+    #[cfg(not(test))]
+    let allow_stale_fallback = true;
     // The pointer and the last request's lines, in a frame of their own ([`own_frame`]).
-    let (mut unreadable, pointer, last_lines, other_checkout) = own_frame(|| -> Result<_, CliError> {
+    let (mut unreadable, mut pointer, mut last_lines, mut preopened_root, other_checkout) = own_frame(|| -> Result<_, CliError> {
         let mut unreadable: Option<crate::engine_answer::Unreadable> = prior_unreadable;
-        let mut other_checkout = false;
-        let stored = match fresh {
-            true => None,
-            false => match crate::engine_answer::load_pointer(cx, &mut store, &answer_root)? {
-                // No answer of this scope's own: for a scoped check, first reuse this checkout's
-                // whole-workspace answer if present (never certified as own, so its standing rows
-                // warm the scoped closure without overwriting the whole-workspace root); else its
-                // workspace's base (`load_base`), else the pre-warmed toolchain-only base
-                // (`tool-base.<PINNED>.<TRIPLE>.<tools>`), all loaded via `StoredBase::OtherCheckout`.
-                None => {
-                    let from_whole = if !check_scope.is_whole() {
-                        crate::engine_answer::load_pointer(cx, &mut store, &whole_root)?
-                    } else {
-                        None
-                    };
-                    let latest = match from_whole {
-                        Some(found) => Some(found),
-                        None => match crate::engine_answer::load_base(cx, &mut store, root, frame)? {
-                            Some(found) => Some(found),
-                            None => crate::engine_answer::load_toolchain_base(cx, &mut store, toolchain, &tools, frame)?,
-                        },
-                    };
-                    other_checkout = latest.is_some();
-                    latest
-                }
-                own => own,
-            },
-        };
-        let pointer = match stored {
-            None => None,
-            // Held by value, never boxed: `Pointer<'m>` borrows the store's mapping (its leaves,
-            // its journal place), and a `blaze_own::Box` of it would (1) give it drop glue, so its
-            // drop at this function's end would use `'m` after the commit moves `opened.lent`,
-            // and (2) through `Box::deref` (a call, not a built-in deref) add `'m: 'x` to every
-            // read through it, putting the store's lifetime into `stored`, the start and the
-            // drive's results (the compile of 2026-11-21 06:35). Its 4 KiB stays in this frame.
-            Some(Ok(pointer)) => Some(pointer),
-            Some(Err(why)) => {
-                unreadable = Some(why);
-                None
-            }
-        };
-        phases.mark_cx(cx, "stored answer's pointer read", frame);
-        // The last request's printed lines (engine_lines.rs): what the certificate prints, and each
-        // standing row's block for a request that enters tasks. Unreadable: answered in full.
+        let mut pointer = None;
         let mut last_lines = None;
-        if let Some(pointer) = &pointer {
-            match crate::engine_answer::load_lines(cx, &mut store, pointer.lines, request)? {
-                Ok(lines) => last_lines = Some(lines),
-                Err(why) => unreadable = Some(why),
+        let mut preopened_root: Option<blaze_engine::pages::Root<'_>> = None;
+        let mut other_checkout = false;
+        if !fresh {
+            match recovery {
+                StoredRecovery::SkipOwn { exclude } => {
+                    if let Some((loaded, true)) = open_fallback_base(cx, &mut store, root, check_scope, &whole_root, toolchain, &tools, Some(exclude), false, false, request, frame)? {
+                        pointer = Some(loaded.pointer);
+                        last_lines = Some(loaded.lines);
+                        preopened_root = Some(loaded.root);
+                        other_checkout = true;
+                        unreadable = None;
+                    }
+                    phases.mark_cx(cx, "stored answer's pointer read", frame);
+                    phases.mark_cx(cx, "stored answer's lines read", frame);
+                }
+                StoredRecovery::Normal => {
+                    match crate::engine_answer::load_pointer(cx, &mut store, &answer_root)? {
+                        // No answer of this scope's own: reuse this checkout's whole-workspace
+                        // answer (for scoped checks), else its workspace's base, else `tool-base`.
+                        None => {
+                            if let Some((loaded, _)) = open_fallback_base(cx, &mut store, root, check_scope, &whole_root, toolchain, &tools, None, false, true, request, frame)? {
+                                pointer = Some(loaded.pointer);
+                                last_lines = Some(loaded.lines);
+                                preopened_root = Some(loaded.root);
+                                other_checkout = true;
+                            }
+                            phases.mark_cx(cx, "stored answer's pointer read", frame);
+                            phases.mark_cx(cx, "stored answer's lines read", frame);
+                        }
+                        // Unreadable own pointer (e.g. older binary format `BEL7`, torn, missing):
+                        // automatically fall back to another worktree's compatible workspace base
+                        // instead of rebuilding every task from `no answer`.
+                        Some(Err(why)) => {
+                            phases.mark_cx(cx, "stored answer's pointer read", frame);
+                            if allow_stale_fallback
+                                && let Some((loaded, is_workspace)) = open_fallback_base(cx, &mut store, root, check_scope, &whole_root, toolchain, &tools, None, false, true, request, frame)?
+                            {
+                                pointer = Some(loaded.pointer);
+                                last_lines = Some(loaded.lines);
+                                preopened_root = Some(loaded.root);
+                                other_checkout = true;
+                                if !is_workspace {
+                                    unreadable = Some(why);
+                                }
+                            } else {
+                                unreadable = Some(why);
+                            }
+                            phases.mark_cx(cx, "stored answer's lines read", frame);
+                        }
+                        // Readable own pointer:
+                        // - If written by current tools: keep zero-overhead certificate hot path
+                        //   (no `open_root`, no `BASES_ROOT` read unless lines fail).
+                        // - If written by older tools (`!certifies_under(&tools)`): prefer another
+                        //   worktree's current-binary workspace base when one exists; otherwise
+                        //   keep this checkout's own answer (`ToolsMoved`) so only moved kinds run.
+                        Some(Ok(own_ptr)) => {
+                            phases.mark_cx(cx, "stored answer's pointer read", frame);
+                            let mut used_fallback = false;
+                            if !own_ptr.certifies_under(&tools)
+                                && allow_stale_fallback
+                                && let Some((loaded, true)) = open_fallback_base(cx, &mut store, root, check_scope, &whole_root, toolchain, &tools, Some(own_ptr.key), true, false, request, frame)?
+                            {
+                                pointer = Some(loaded.pointer);
+                                last_lines = Some(loaded.lines);
+                                preopened_root = Some(loaded.root);
+                                other_checkout = true;
+                                used_fallback = true;
+                            }
+                            if !used_fallback {
+                                match crate::engine_answer::load_lines(cx, &mut store, own_ptr.lines, request)? {
+                                    Ok(lines) => {
+                                        pointer = Some(own_ptr);
+                                        last_lines = Some(lines);
+                                    }
+                                    Err(why) => {
+                                        if allow_stale_fallback
+                                            && let Some((loaded, is_workspace)) = open_fallback_base(cx, &mut store, root, check_scope, &whole_root, toolchain, &tools, Some(own_ptr.key), false, true, request, frame)?
+                                        {
+                                            pointer = Some(loaded.pointer);
+                                            last_lines = Some(loaded.lines);
+                                            preopened_root = Some(loaded.root);
+                                            other_checkout = true;
+                                            if !is_workspace {
+                                                unreadable = Some(why);
+                                            }
+                                        } else {
+                                            unreadable = Some(why);
+                                        }
+                                    }
+                                }
+                            }
+                            phases.mark_cx(cx, "stored answer's lines read", frame);
+                        }
+                    }
+                }
+                StoredRecovery::Fresh => {}
             }
         }
-        let pointer = pointer.filter(|_| last_lines.is_some());
-        phases.mark_cx(cx, "stored answer's lines read", frame);
-        let other_checkout = other_checkout && pointer.is_some();
-        Ok((unreadable, pointer, last_lines, other_checkout))
+        Ok((unreadable, pointer, last_lines, preopened_root, other_checkout))
     })?;
     // The planted control (engine_answer.rs `RootPlant::PerTools`): an answer under other tools
     // is not read, as when the root's name held the tools.
     #[cfg(test)]
-    let (pointer, last_lines) = match crate::engine_answer::ROOT_PLANT.with(core::cell::Cell::get) {
-        crate::engine_answer::RootPlant::PerTools if pointer.as_ref().is_some_and(|pointer| !pointer.certifies_under(&tools)) => (None, None),
-        crate::engine_answer::RootPlant::PerTools | crate::engine_answer::RootPlant::None => (pointer, last_lines),
+    let other_checkout = if crate::engine_answer::ROOT_PLANT.with(core::cell::Cell::get) == crate::engine_answer::RootPlant::PerTools
+        && pointer.as_ref().is_some_and(|pointer| !pointer.certifies_under(&tools))
+    {
+        pointer = None;
+        last_lines = None;
+        preopened_root = None;
+        false
+    } else {
+        other_checkout
     };
     // What the stored answer is to this request: the one decision of the certificate and the
     // wake (engine_ready_edit.rs `StoredBase`). Another checkout's answer, or one under other
     // tools, is read as a base whose every row stands or is entered by its own key and reads
     // (engine_answer.rs "THE TOOLS").
-    let base = match &pointer {
+    let mut base = match &pointer {
         Some(_) if other_checkout => crate::engine_ready_edit::StoredBase::OtherCheckout,
         Some(pointer) if !pointer.certifies_under(&tools) => crate::engine_ready_edit::StoredBase::ToolsMoved,
         _ => crate::engine_ready_edit::StoredBase::Own,
     };
+    *used_pointer = pointer.as_ref().map(|p| (p.key, other_checkout));
     // The places to replay from: the pointer's, each made later by the checkout's journal
     // checkpoint where one extends this very pointer (journal_checkpoint.rs). Another
     // checkout's places are its journal's, never this one's: none, so every leaf is looked at.
@@ -1985,8 +2103,6 @@ fn checking<'f, 'd>(
         // keeps paths out of it, which would hold that exclusive borrow past the later readers.
         followed_kept = Some(followed);
         let followed: &sweep::Followed<'_> = followed_kept.as_ref().expect("set on the line above");
-        today_slots.extend(followed.now.rows.iter().filter(|leaf| leaf.kind == sweep::LeafKind::Slot).map(|leaf| (followed.now.path(leaf), (leaf.flags, leaf.stamp, leaf.id))));
-        today_slots.sort_unstable_by(|a, b| a.0.cmp(b.0));
         let moved = followed.layout_moved || followed.now.rows.iter().zip(followed.was.iter()).any(|(now, was)| now.state() != *was);
         phases.mark_cx(cx, "sweep", frame);
         let facts = pointer.facts;
@@ -2025,15 +2141,53 @@ fn checking<'f, 'd>(
             return certificate_checked(cx, root, stood, sweep_counts, &journal_counts, &cleanup, phases, heap, frame);
         }
     }
-    let last = match &pointer {
-        Some(pointer) => match crate::engine_answer::open_root(cx, &mut store, pointer.root, request)? {
-            Ok(root) => Some((root, &pointer.headers)),
+    let last_dir = if let Some(root_dir) = preopened_root.take() {
+        Some(root_dir)
+    } else if let Some(ptr) = &pointer {
+        match crate::engine_answer::open_root(cx, &mut store, ptr.root, request)? {
+            Ok(root_dir) => Some(root_dir),
             Err(why) => {
-                unreadable = Some(why);
-                None
+                // Own answer's root directory is unreadable (e.g. bumped directory format or
+                // missing root record): fall back to another worktree's compatible base and
+                // re-sweep its leaves instead of rebuilding every task from `no answer`.
+                let fallback = if !other_checkout && allow_stale_fallback {
+                    open_fallback_base(cx, &mut store, root, check_scope, &whole_root, toolchain, &tools, Some(ptr.key), false, true, request, frame)?
+                } else {
+                    None
+                };
+                if let Some((loaded, is_workspace)) = fallback {
+                    pointer = Some(loaded.pointer);
+                    last_lines = Some(loaded.lines);
+                    base = crate::engine_ready_edit::StoredBase::OtherCheckout;
+                    *used_pointer = pointer.as_ref().map(|p| (p.key, true));
+                    if !is_workspace {
+                        unreadable = Some(why);
+                    }
+                    if let Some(new_ptr) = &pointer {
+                        let follow = sweep::Follow { stamps: FromMeta::now(phases.clock()), plant: sweep::Plant::None };
+                        let follow_began = phases.clock().now();
+                        let (followed, statted) = follow.follow_served_with_facts(cx, root, Some(opened.home.dir()), &new_ptr.leaves, None, script_sweep.as_mut(), false, frame)?;
+                        let follow_ns = phases.clock().now().since(follow_began).map_or(0, |it| u64::try_from(it.as_nanos()).unwrap_or(u64::MAX));
+                        sweep_counts = journal.counts(statted, u32::try_from(new_ptr.leaves.len()).unwrap_or(u32::MAX)).with_parts(journal.parts(&new_ptr.leaves, frame)).with_looks(followed.looks, follow_ns);
+                        followed_kept = Some(followed);
+                    }
+                    Some(loaded.root)
+                } else {
+                    unreadable = Some(why);
+                    None
+                }
             }
-        },
-        None => None,
+        }
+    } else {
+        None
+    };
+    if let Some(followed) = followed_kept.as_ref() {
+        today_slots.extend(followed.now.rows.iter().filter(|leaf| leaf.kind == sweep::LeafKind::Slot).map(|leaf| (followed.now.path(leaf), (leaf.flags, leaf.stamp, leaf.id))));
+        today_slots.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    }
+    let last = match (last_dir, &pointer) {
+        (Some(root_dir), Some(ptr)) => Some((root_dir, &ptr.headers)),
+        _ => None,
     };
     // The driver, decided before any row is read (engine_ready_edit.rs `choose`): from the
     // stored root and the sweep's changed leaves. Under `--driver=ready` an edit the ready path

@@ -215,3 +215,107 @@ fn incremental_edit_and_second_cold_repo_do_not_rewrite_toolchain_base() {
     assert_eq!(b.errors, 0, "B cold check clean:\n{}", b.profile);
     assert_eq!(read_tc_ptr(), key_after_cold, "second cold repo on same toolchain did not rewrite tool-base");
 }
+
+#[test]
+fn stale_older_format_answer_in_worktree_falls_back_to_current_base_and_control_is_caught() {
+    use blaze_cas::Key as CasKey;
+    use blaze_keyed::kind::{Namespace, Tag};
+
+    let run_case = |plant: BasePlant| -> Checked {
+        BASE_PLANT.set(plant);
+        let io = Io::simulated(SimWorld::new(31, Limits::USUAL));
+        repository_a(&io, A1);
+        repository_a(&io, A2);
+        let a1 = at(&io, A1);
+        assert!(a1.entered(blaze_engine::Stage::Bodies) > 0, "A1 cold check enters bodies");
+        let a2_cold = at(&io, A2);
+        assert_eq!(a2_cold.errors, 0);
+
+        // Overwrite A2's own answer pointer root (`engine.<hex>`) with a sealed older-format
+        // (`BEL7`) pointer record, simulating an existing 2nd worktree whose last check ran on an
+        // older binary format.
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("root cx");
+        let frame = Frame::with_reserve(16 << 20, bstd::mem::Tag::Other).expect("frame");
+        let opts = engine_check_tests::opts(&io, 1, false);
+        let fs = io.need_fs().expect("files");
+        let root_dir = fs.open_dir(&cx, &Path::new(A2.dir).expect("a2 path")).expect("open");
+        let err = io.need_err().expect("err");
+        let clock = io.need_clock().expect("clock");
+        let host = io.need_host().expect("host");
+        let mut rng = io.need_rng().expect("rng");
+        let opened = crate::store::open_for_command(&cx, &fs, &host, &mut rng, opts.place.home, None, &root_dir, A2.dir, &clock, &err, opts.heap).expect("open store");
+        let answer_root_name = crate::engine_answer::root_name(A2.dir, &frame);
+        assert!(opened.lent.has_root(answer_root_name.as_str()), "A2 must have its own pointer root");
+        let mut stale_ptr = [0u8; 40];
+        stale_ptr[..4].copy_from_slice(b"BEL7");
+        let sealed = crate::seal::seal(&stale_ptr, &[], &frame).expect("seal stale ptr");
+        let stale_key = CasKey(blaze_ids::ContentId::of("blaze-cli engine-check pointer", &sealed));
+        opened.lent.put(&stale_key, Namespace::LOCAL, Tag(1), &sealed).expect("put stale ptr");
+        opened.lent.root_for(answer_root_name.as_str(), &[stale_key], blaze_cas::plain::ROOT_LIFE_NS).expect("root stale ptr");
+        opened.lent.release_lease();
+        opened.lent.commit().expect("commit stale ptr");
+        drop(opened);
+        drop(sealed);
+        drop(answer_root_name);
+        drop(frame);
+
+        let a2_after = at(&io, A2);
+        BASE_PLANT.set(BasePlant::None);
+        a2_after
+    };
+
+    let fixed = run_case(BasePlant::None);
+    assert!(fixed.engine().from_last, "stale BEL7 own answer must fall back to A1's current base:\n{}", fixed.profile);
+    assert_eq!(fixed.entered(blaze_engine::Stage::Bodies), 0, "stale BEL7 fallback enters 0 bodies:\n{}", fixed.profile);
+    assert_eq!(fixed.entered(blaze_engine::Stage::Names), 0, "stale BEL7 fallback enters 0 names:\n{}", fixed.profile);
+    assert_eq!(fixed.errors, 0);
+
+    // Planted bug control (rule 43): disabling stale fallback rebuilds A2 from `no answer`.
+    let control = run_case(BasePlant::NoStaleFallback);
+    assert!(!control.engine().from_last, "control must start from no answer:\n{}", control.profile);
+    assert!(control.entered(blaze_engine::Stage::Bodies) > 0, "control must rebuild bodies:\n{}", control.profile);
+}
+
+#[test]
+fn stale_older_tools_answer_in_worktree_falls_back_to_current_binary_base_and_control_is_caught() {
+    let check_with = |io: &Io, checkout: Checkout, older_tools: bool| {
+        let opts = || {
+            let mut opts = if older_tools {
+                planted(io, Some((blaze_ids::producer::Row::BodyChecker, "an older body checker")))
+            } else {
+                planted(io, None)
+            };
+            opts.place.checkout = checkout.dir;
+            opts
+        };
+        check_in::<fix::Atomic>(io, checkout, &opts, View::Person, None)
+    };
+
+    let run_case = |plant: BasePlant| -> Checked {
+        BASE_PLANT.set(plant);
+        let io = Io::simulated(SimWorld::new(37, Limits::USUAL));
+        repository_a(&io, A1);
+        repository_a(&io, A2);
+        // A2 checked earlier with an older binary (older BodyChecker producer hash).
+        let a2_old = check_with(&io, A2, true);
+        assert!(a2_old.entered(blaze_engine::Stage::Bodies) > 0);
+        // User upgrades binary and checks A1 first, publishing a current-binary workspace base.
+        let a1_new = check_with(&io, A1, false);
+        assert!(a1_new.entered(blaze_engine::Stage::Bodies) > 0);
+        // Now user checks A2 with the current binary: A2's own answer is older-tools,
+        // so it should automatically adopt A1's current-binary workspace base!
+        let a2_new = check_with(&io, A2, false);
+        BASE_PLANT.set(BasePlant::None);
+        a2_new
+    };
+
+    let fixed = run_case(BasePlant::None);
+    assert!(fixed.engine().from_last, "A2 must reuse A1's current-binary base:\n{}", fixed.profile);
+    assert_eq!(fixed.entered(blaze_engine::Stage::Bodies), 0, "A2 must enter 0 bodies by adopting A1's current-binary base:\n{}", fixed.profile);
+    assert_eq!(fixed.errors, 0);
+
+    // Planted bug control (rule 43): without stale-tools fallback, A2 keeps its older-tools own
+    // answer and re-enters every body task.
+    let control = run_case(BasePlant::NoStaleFallback);
+    assert!(control.entered(blaze_engine::Stage::Bodies) > 0, "control must re-enter bodies under older-tools own answer:\n{}", control.profile);
+}

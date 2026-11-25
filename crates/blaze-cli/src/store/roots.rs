@@ -256,6 +256,15 @@ pub(crate) const TOOLCHAIN_INDEXES_FOLD: usize = 64;
 /// root as they are, so reach keeps what they hold too (one level).
 pub(crate) fn keep_toolchain<D: Driver>(lent: &Lent<D, StoreAlloc>, toolchain: ToolchainId, made: &[CasKey], beside: &[CasKey]) -> Result<Option<Rooted<Toolchain>>, RootError> {
     let root = RootName::toolchain(toolchain);
+    // O(1) fast path on incremental edits where no new toolchain records were written: renew the
+    // existing `tool.<id>` root lease in the manifest without reading, copying, sorting, or
+    // re-probing every toolchain index record.
+    if made.is_empty() && beside.is_empty() {
+        return Ok(match lent.renew_root(root.as_str(), TOOLCHAIN_LIFE_NS) {
+            blaze_cas::plain::Renewed::Fresh(key) | blaze_cas::plain::Renewed::Extended(key) => Some(Rooted::new(key)),
+            blaze_cas::plain::Renewed::Missing => None,
+        });
+    }
     let store = |why| RootError::Store { class: Toolchain::WHAT, root, why };
     let not_indexed = |key| RootError::NotIndexed { class: Toolchain::WHAT, root, key };
     let mut indexes: std::vec::Vec<CasKey, StoreAlloc> = std::vec::Vec::new_in(*lent.alloc());

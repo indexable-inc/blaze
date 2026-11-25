@@ -1065,6 +1065,13 @@ pub(crate) enum Plant {
     /// Emits all commit payload chunks at once instead of respecting [`COMMIT_PIECES_IN_FLIGHT`]
     /// (tests, `the_commit_meter_catches_an_unbounded_window`).
     CommitWholeWindow,
+    /// Planted bug: caps `plan_reached` segment inspection by `SWEEP_BYTES` of payload bytes
+    /// (reproducing the wedge where one large live closed segment hides dead segments behind it).
+    SweepCappedByPayload,
+    /// Planted bug: mixes expired retired-file unlinks into segment-copy slices instead of
+    /// unlinking them in a zero-conflict slice first (so a concurrent foreground conflict aborts
+    /// unlinking ready retired files).
+    MixRetiredWithCopy,
 }
 
 /// What one slice of the background pass did ([`Plain::scrub_next`]).
@@ -2860,18 +2867,53 @@ impl<A: Allocator + Clone> Plain<A> {
         }
     }
 
+    /// Pre-builds any missing backfill segment Bloom filters and pre-verifies live mapped Bloom
+    /// records OUTSIDE the exclusive flip lock so `Plain::build` holds `self.flip` for minimal
+    /// time (zero `BloomBuilder::from_run` hashing and zero CRC-32C verification under the lock).
+    fn prepare_bloom_for_flip(&mut self, compact_bloom: bool) {
+        if !self.eager {
+            return;
+        }
+        let mut backfilled: blaze_own::Vec<(ContentId, blaze_own::Vec<u8, Kept>), Kept> = blaze_own::Vec::new_in(BLOOM_ALLOC);
+        for seg in self.manifest.segments.iter().filter(|it| it.local) {
+            if !self.bloom.has(seg)
+                && !self.pending_bloom.iter().any(|(d, _)| *d == seg.digest)
+                && let Some(&at) = self.by_id.get(&seg.id)
+                && let Some(mapped) = self.maps.get(at)
+                && mapped.seg().digest == seg.digest
+            {
+                let rec = BloomBuilder::from_run(mapped.run(), &seg.digest);
+                backfilled.push((seg.digest, rec));
+            }
+        }
+        for (digest, rec) in backfilled {
+            self.record_pending_bloom(digest, rec);
+        }
+        let will_rewrite = (compact_bloom && self.bloom.needs_compact(&self.manifest.segments, &self.manifest.roots))
+            || self.bloom.needs_urgent_compact(&self.manifest.segments, &self.manifest.roots);
+        if will_rewrite {
+            self.bloom.verify_live(&self.manifest.segments, &self.manifest.roots);
+        }
+    }
+
     /// Plans the optional `bloom` sidecar write for a flip whose resulting manifest is `m`.
     /// When the store is whole (`self.eager`) and any live local segment lacks a filter (e.g.
-    /// upgrading an existing store) or dead bytes exceed 2x live + 64 KiB, writes a compact
-    /// replacement via atomic `WriteUnsynced`; otherwise appends only newly built records.
+    /// upgrading an existing store) or dead bytes exceed the compaction threshold (`2x live + 64 KiB`
+    /// during compaction/GC, or `4x live + 1 MiB` urgent cap on foreground commits), writes a
+    /// compact replacement via atomic `WriteUnsynced`; otherwise appends only newly built records.
     /// Returns `(effect, replaced, written_bytes)`.
-    fn plan_bloom_effect(&mut self, m: &Manifest) -> Option<(Effect, bool, u64)> {
+    fn plan_bloom_effect(&mut self, m: &Manifest, compact_bloom: bool) -> Option<(Effect, bool, u64)> {
         let has_pending = |pending: &[(ContentId, blaze_own::Vec<u8, Kept>)], digest: &ContentId| pending.iter().any(|(d, _)| d == digest);
         let needs_backfill = self.eager
             && m.segments
                 .iter()
                 .any(|seg| seg.local && !self.bloom.has(seg) && !has_pending(&self.pending_bloom, &seg.digest) && self.by_id.contains_key(&seg.id));
-        let needs_compact = self.eager && self.bloom.needs_compact(&m.segments, &m.roots);
+        let needs_compact = self.eager
+            && if compact_bloom {
+                self.bloom.needs_compact(&m.segments, &m.roots)
+            } else {
+                self.bloom.needs_urgent_compact(&m.segments, &m.roots)
+            };
         if needs_backfill || needs_compact {
             let mut bytes: blaze_own::Vec<u8, Kept> = blaze_own::Vec::new_in(BLOOM_ALLOC);
             let mut backfilled: blaze_own::Vec<(ContentId, blaze_own::Vec<u8, Kept>), Kept> = blaze_own::Vec::new_in(BLOOM_ALLOC);
@@ -4768,12 +4810,18 @@ impl<A: Allocator + Clone> Plain<A> {
     /// the first namespace that breaks the invariant, FIRST, so the invariant holds after every
     /// cleanup in sweep mode too (a sparse row always present would else take every first
     /// slice, and only merges go on: [`Plain::cleanup_goes_on`]); else a contiguous run of one
-    /// namespace's rows, from the first found under half live (over the cap: holding any dead
-    /// record) among at most [`SWEEP_BYTES`] of rows looked at from a place that moves with the
-    /// generation, up to [`SLICE_BYTES`]. A row a live lease keeps, a published row and one
-    /// not here are never in a run (a run stops at one) nor in a merge. And whether it is the
-    /// tiered merge ([`Sliced::merged`]).
+    /// namespace's rows.
+    ///
+    /// When `over_or_evict` is true (over budget or evicting roots), scans ALL sweepable segments
+    /// (since [`Plain::live_of`] inspects only the 48-byte index entries, never payloads) and
+    /// prioritizes 100%-dead segments first (0 bytes written, instant reclaim) followed by the
+    /// highest dead ratio (tie-broken by most dead bytes). When under budget, bounds the scan by
+    /// index bytes (`SWEEP_INDEX_BYTES`) with a floor of `SWEEP_SEGMENTS_MIN` sweepable segments
+    /// so a single large live closed segment never blinds GC to sparse segments behind it.
     fn plan_reached(&mut self, now_ns: u64, over_or_evict: bool, kept_count: Option<u32>) -> Result<(Vec<Segment, A>, bool), StoreError> {
+        const SWEEP_SEGMENTS_MIN: usize = 16;
+        const SWEEP_INDEX_BYTES: u64 = 16 << 20;
+
         let merge = self.plan_tiered(|it| self.mergeable(it));
         if !merge.is_empty() && self.plant() != Plant::SweepBeforeMerge {
             return Ok((merge, true));
@@ -4784,39 +4832,106 @@ impl<A: Allocator + Clone> Plain<A> {
             None => return Ok((merge, true)),
         };
         let segs = &self.manifest.segments;
-        let mut sparse = None;
+        let mut sparse: Option<(usize, bool)> = None;
         if !segs.is_empty() {
             let start = usize::try_from(self.manifest.generation % u64::try_from(segs.len()).unwrap_or(1)).unwrap_or(0);
-            let mut looked = 0u64;
-            for k in 0..segs.len() {
-                let i = (start + k) % segs.len();
-                let Some(seg) = segs.get(i) else { continue };
-                if !self.sweepable(seg, now_ns) {
-                    continue;
+            if self.plant() == Plant::SweepCappedByPayload {
+                let mut looked = 0u64;
+                for k in 0..segs.len() {
+                    let i = (start + k) % segs.len();
+                    let Some(seg) = segs.get(i) else { continue };
+                    if !self.sweepable(seg, now_ns) {
+                        continue;
+                    }
+                    if looked >= SWEEP_BYTES {
+                        break;
+                    }
+                    looked = looked.saturating_add(seg.file_len());
+                    let (live, all) = self.live_of(seg, &owner, kept);
+                    if live.saturating_mul(2) < seg.file_len() || (over_or_evict && live < all) {
+                        sparse = Some((i, false));
+                        break;
+                    }
                 }
-                if looked >= SWEEP_BYTES {
-                    break;
+            } else if over_or_evict {
+                // Over budget: scan every sweepable segment and pick the highest-value reclaim
+                // candidate (100%-dead segments first for zero write amplification, else highest
+                // dead ratio, tie-breaking by most dead bytes).
+                let mut best: Option<(usize, bool, u64, u64)> = None;
+                for k in 0..segs.len() {
+                    let i = (start + k) % segs.len();
+                    let Some(seg) = segs.get(i) else { continue };
+                    if !self.sweepable(seg, now_ns) {
+                        continue;
+                    }
+                    let (live, all) = self.live_of(seg, &owner, kept);
+                    if live >= all {
+                        continue;
+                    }
+                    let dead = all.saturating_sub(live);
+                    let all_dead = live == 0;
+                    let better = match best {
+                        None => true,
+                        Some((_, best_all_dead, best_dead, best_all)) => match (all_dead, best_all_dead) {
+                            (true, false) => true,
+                            (false, true) => false,
+                            (true, true) => dead > best_dead,
+                            (false, false) => {
+                                let lhs = u128::from(dead).saturating_mul(u128::from(best_all));
+                                let rhs = u128::from(best_dead).saturating_mul(u128::from(all));
+                                lhs > rhs || (lhs == rhs && dead > best_dead)
+                            }
+                        },
+                    };
+                    if better {
+                        best = Some((i, all_dead, dead, all));
+                    }
                 }
-                looked = looked.saturating_add(seg.file_len());
-                let (live, all) = self.live_of(seg, &owner, kept);
-                if live.saturating_mul(2) < seg.file_len() || (over_or_evict && live < all) {
-                    sparse = Some(i);
-                    break;
+                if let Some((idx, all_dead, _, _)) = best {
+                    sparse = Some((idx, all_dead));
+                }
+            } else {
+                let entry_u64 = u64::try_from(ENTRY).unwrap_or(48);
+                let mut looked_index = 0u64;
+                let mut scanned = 0usize;
+                for k in 0..segs.len() {
+                    let i = (start + k) % segs.len();
+                    let Some(seg) = segs.get(i) else { continue };
+                    if !self.sweepable(seg, now_ns) {
+                        continue;
+                    }
+                    if scanned >= SWEEP_SEGMENTS_MIN && looked_index >= SWEEP_INDEX_BYTES {
+                        break;
+                    }
+                    scanned = scanned.saturating_add(1);
+                    looked_index = looked_index.saturating_add(u64::from(seg.count).saturating_mul(entry_u64));
+                    let (live, _) = self.live_of(seg, &owner, kept);
+                    if live.saturating_mul(2) < seg.file_len() {
+                        sparse = Some((i, live == 0));
+                        break;
+                    }
                 }
             }
         }
         // No sparse row: the tiered merge (empty here unless planted to sweep first).
-        let Some(from) = sparse else { return Ok((merge, true)) };
+        let Some((from, all_dead)) = sparse else { return Ok((merge, true)) };
         let Some(first) = segs.get(from) else { return Ok((merge, true)) };
         let namespace = first.namespace;
         let mut out = self.alloc_vec();
         let mut bytes = 0u64;
         // A contiguous run from the sparse row: its copy takes the newest one's place, past no
-        // row it skipped.
+        // row it skipped. When the picked segment is 100%-dead, bundle only adjacent 100%-dead
+        // segments so zero live bytes are rewritten.
         if let Some(tail) = segs.get(from..) {
             for seg in tail.iter().filter(|it| it.local && it.namespace == namespace) {
                 if !self.sweepable(seg, now_ns) || (!out.is_empty() && bytes.saturating_add(seg.file_len()) > SLICE_BYTES) {
                     break;
+                }
+                if all_dead && !out.is_empty() {
+                    let (live, _) = self.live_of(seg, &owner, kept);
+                    if live > 0 {
+                        break;
+                    }
                 }
                 bytes = bytes.saturating_add(seg.file_len());
                 out.push(*seg);
@@ -5464,6 +5579,16 @@ impl<A: Allocator + Clone> Plain<A> {
                 orphans.push((id, log));
             }
         }
+        let expired = self.has_unlinkable_retired(now_ns);
+        // On standalone compaction (`!self.fold_asked`), unlink expired retired files in a fast,
+        // zero-conflict metadata-only slice FIRST so disk space is reclaimed in <1 ms and never
+        // starved by a concurrent foreground commit conflicting with a segment copy slice.
+        if expired && !self.fold_asked && self.plant() != Plant::MixRetiredWithCopy {
+            let stats = Sliced { orphans: u32::try_from(orphans.len()).unwrap_or(u32::MAX), ..Sliced::default() };
+            let empty_ids = self.alloc_vec();
+            self.slice_ready(None, empty_ids, orphans, None, stats, effects);
+            return;
+        }
         let over = self.over_budget();
         let (evict, kept_count) = if over && !self.manifest.roots.is_empty() {
             if let Err(why) = self.ensure_reach(now_ns, true) {
@@ -5490,7 +5615,6 @@ impl<A: Allocator + Clone> Plain<A> {
             Err(why) => return self.stop(why),
         };
         let mut stats = Sliced { orphans: orphans.len() as u32, merged, ..Sliced::default() };
-        let expired = self.has_unlinkable_retired(now_ns);
         let expired_roots = self.manifest.roots.iter().any(|it| it.expires_ns != NEVER && it.expires_ns <= now_ns);
         if candidates.is_empty() {
             if orphans.is_empty() && !expired && !expired_roots && evict.is_none() {
@@ -5627,6 +5751,8 @@ impl<A: Allocator + Clone> Plain<A> {
     // ---- the flip: the one lock, held for it alone ----
 
     fn start_flip(&mut self, change: Change<A>, effects: &mut Vec<Effect>) {
+        let compact_bloom = matches!(change, Change::Compact { .. });
+        self.prepare_bloom_for_flip(compact_bloom);
         self.phase = Phase::Flipping(Box::new(Flip {
             change,
             waits: 0,
@@ -6040,12 +6166,14 @@ impl<A: Allocator + Clone> Plain<A> {
         // before the log or the slot is touched, and the store stops naming the segment
         // ([`Plain::flipped`]): the command that built it fails, not the next one.
         let most = self.tiers().segment_most();
-        let estimate = match m.encode(most) {
-            Ok(bytes) => bytes.len() as u64 + 24,
+        let initial_bytes = match m.encode(most) {
+            Ok(bytes) => bytes,
             Err(why) => return self.refuse_built(flip, folded, why, effects),
         };
+        let estimate = u64::try_from(initial_bytes.len()).unwrap_or(u64::MAX).saturating_add(24);
         // A log no generation's manifest was read from may be gone: never appended to.
         let appendable = !self.log_lost || self.plant() == Plant::AppendToLostLog;
+        let mut rotated_old_log = false;
         let (log, at) = match base.slot {
             Some(slot) if appendable && slot.log_end() + estimate <= LOG_MOST => (slot.log, slot.log_end()),
             _ => {
@@ -6053,20 +6181,28 @@ impl<A: Allocator + Clone> Plain<A> {
                 let id = format::id_of(LOG_DOMAIN, &[&self.cfg.nonce.to_le_bytes(), &self.seq.to_le_bytes(), &now_ns.to_le_bytes()]);
                 if let Some(old) = base.slot {
                     retire(&mut m, old.log, true);
+                    rotated_old_log = true;
                 }
                 flip.new_log = true;
                 (id, 0)
             }
         };
-        let bytes = match m.encode(most) {
-            Ok(bytes) => bytes,
-            Err(why) => return self.refuse_built(flip, folded, why, effects),
+        // Reuse the single encoded manifest buffer on the 99.9% non-rotating path; only re-encode
+        // when rotating an existing log added a retired log row to `m.retired`.
+        let bytes = if rotated_old_log {
+            match m.encode(most) {
+                Ok(bytes) => bytes,
+                Err(why) => return self.refuse_built(flip, folded, why, effects),
+            }
+        } else {
+            initial_bytes
         };
         let slot = Slot { generation, log, manifest_at: at, manifest_len: bytes.len() as u32, manifest_crc: crc32c::crc32c(&bytes) };
         flip.log = self.log_file(log);
         flip.fresh = fresh;
         flip.removals = removals;
-        if let Some((effect, replaced, len)) = self.plan_bloom_effect(&m) {
+        let compact_bloom = matches!(flip.change, Change::Compact { .. });
+        if let Some((effect, replaced, len)) = self.plan_bloom_effect(&m, compact_bloom) {
             flip.bloom_effect = Some(effect);
             flip.bloom_written = Some((replaced, len));
         } else {

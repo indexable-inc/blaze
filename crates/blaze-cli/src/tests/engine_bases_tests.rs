@@ -192,3 +192,36 @@ fn a_record_of_another_form_is_refused() {
     let swapped = [one[1], one[0]];
     assert!(decode_bases(&encode_bases(&swapped, &frame), &frame).is_none(), "entries out of order");
 }
+
+#[test]
+fn candidate_bases_orders_by_lock_then_workspace_then_root_without_duplicates() {
+    let frame = test_frame();
+    let entry = |ws: u8, lock: ContentId, layout: u8, root: u8, ptr: u8| Base {
+        workspace: id(ws),
+        lock,
+        layout: id(layout),
+        root: id(root),
+        pointer: Key(id(ptr)),
+        seq: 0,
+    };
+    let mut bases = blaze_own::Vec::new_in(&frame);
+    // Oldest -> newest: ws1/lockA (ptr 10), ws1/lockB (ptr 11), ws1/lockA newer layout (ptr 12), ws2/lockA (ptr 13).
+    for base in [
+        entry(1, id(0xA1), 1, 0x61, 10),
+        entry(1, id(0xB1), 2, 0x62, 11),
+        entry(1, id(0xA1), 3, 0x63, 12),
+        entry(2, id(0xA1), 4, 0x64, 13),
+    ] {
+        bases = with_base(&bases, base, &frame);
+    }
+    let got = candidate_bases(&bases, Some(Workspace { id: id(1) }), id(0xA1), id(0x64), &frame);
+    let ptrs: StdVec<Key> = got.iter().map(|it| it.pointer).collect();
+    // Same workspace + same lock newest-first (12, 10), then same workspace other lock (11); never ws2 (13).
+    assert_eq!(ptrs, std::vec![Key(id(12)), Key(id(10)), Key(id(11))]);
+
+    // When workspace has no match, falls back to matching root manifest id (never NO_ROOT).
+    let by_root = candidate_bases(&bases, Some(Workspace { id: id(9) }), id(0xA1), id(0x64), &frame);
+    let root_ptrs: StdVec<Key> = by_root.iter().map(|it| it.pointer).collect();
+    assert_eq!(root_ptrs, std::vec![Key(id(13))]);
+    assert!(candidate_bases(&bases, None, NO_LOCK, NO_ROOT, &frame).is_empty());
+}
