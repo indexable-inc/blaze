@@ -117,6 +117,69 @@ pub(crate) fn suite_id(unit: TestUnit<'_>, builder: &Builder) -> ContentId {
     h.finish()
 }
 
+/// Computes the stable suite identity for a workspace `[[bin]]` stub served via `CARGO_BIN_EXE_*`
+/// so its `SuiteCache::verified` (`BZTV`) set persists across runs under today's `Certificate`.
+pub(crate) fn bin_cache_id(package: &str, bin_name: &str, key: blaze_id::CrateItemKey, builder: &Builder) -> ContentId {
+    let mut h = Hasher::new(SUITE_ID_DOMAIN);
+    h.part(package.as_bytes())
+        .part(b"bin-exe:")
+        .part(bin_name.as_bytes())
+        .id(&key.0)
+        .part(&[2]);
+    hash_builder(&mut h, builder);
+    h.finish()
+}
+
+/// Loads previously verified `(instance_key, content_key)` pairs for an arbitrary suite/binary
+/// identity `id` if and only if they were recorded under today's exact `certificate`.
+pub(crate) fn load_verified_by_id<D: Driver>(
+    lent: &Lent<D, StoreAlloc>,
+    id: ContentId,
+    certificate: &crate::start_list::Certificate,
+    into: &mut Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
+) -> usize {
+    let ptr_key = verified_ptr_key(id);
+    let Ok(Some(state_key)) = lent.pointed(TestIndex::TAG, &ptr_key) else { return 0 };
+    let Ok(Some(lend)) = lent.get(&state_key) else { return 0 };
+    if lend.tag != TestIndex::TAG {
+        return 0;
+    }
+    decode_verified(lend.bytes, certificate, into).unwrap_or(0)
+}
+
+/// Persists and pins verified `(instance_key, content_key)` pairs for a workspace binary identity
+/// `id` under today's exact `certificate`.
+pub(crate) fn save_verified_by_id<D: Driver>(
+    lent: &Lent<D, StoreAlloc>,
+    id: ContentId,
+    certificate: &crate::start_list::Certificate,
+    pairs: impl Iterator<Item = ([u8; 32], [u8; 32])>,
+    alloc: Alloc<'_>,
+) -> Result<(), DriveError> {
+    let store_err = |e: LentError| DriveError::CacheStore { what: "writing binary stub verified cache", why: CacheError::Store(e) };
+    let root_err = |e: RootError| DriveError::CacheStore { what: "pinning binary stub verified cache", why: CacheError::Root(e) };
+    let mut list: AVec<'_, ([u8; 32], [u8; 32])> = Vec::new_in(alloc);
+    for pair in pairs {
+        if list.len() >= MOST_VERIFIED_PERSISTED {
+            break;
+        }
+        list.push(pair);
+    }
+    if list.is_empty() {
+        return Ok(());
+    }
+    list.sort_unstable();
+    list.dedup();
+    let mut vbytes: AVec<'_, u8> = Vec::new_in(alloc);
+    encode_verified(certificate, list.as_slice(), &mut vbytes);
+    let vstate_key = CasKey(ContentId::of(VERIFIED_STATE_DOMAIN, vbytes.as_slice()));
+    let vptr_key = verified_ptr_key(id);
+    lent.put(&vstate_key, Namespace::LOCAL, TestIndex::TAG, vbytes.as_slice()).map_err(store_err)?;
+    lent.point(TestIndex::TAG, &vptr_key, &vstate_key).map_err(store_err)?;
+    roots::keep_test_suite(lent, &id, &[vptr_key, vstate_key]).map_err(root_err)?;
+    Ok(())
+}
+
 /// Computes the stable base [`TestId`] for one test row, covering every input that affects its
 /// verdict independently of its code (rule 21).
 pub(crate) fn test_id(unit: TestUnit<'_>, row: TestRow<'_>, builder: &Builder, args: &[&str]) -> TestId {

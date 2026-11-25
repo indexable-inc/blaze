@@ -612,11 +612,20 @@ pub(crate) fn run_tests_status(
         });
         let procs = crate::job_texts::Procs::ByNeed(&maker);
         let mut runnable = blaze_own::Vec::with_capacity_in(inventory.suites.len(), frame);
+        let mut needed_bins: blaze_own::Vec<(&str, &str), _> = blaze_own::Vec::new_in(frame);
         // Each test unit runs in its package's root, told its package's variables (test_drive.rs
         // `PackageRun`): the checkout's absolute root as the edge resolved it.
         let checkout = standing.place.served.root_text();
         for (at, (found, unit)) in inventory.suites.iter().enumerate() {
-            let place = crate::test_drive::package_run(checkout, list.env_facts(unit.at), bump)
+            let env_facts = list.env_facts(unit.at);
+            if let Some((pkg, _)) = env_facts.package {
+                for bin_name in env_facts.bin_exes.names() {
+                    if !needed_bins.iter().any(|&(p, b)| p == pkg && b == bin_name) {
+                        needed_bins.push((pkg, bin_name));
+                    }
+                }
+            }
+            let place = crate::test_drive::package_run(checkout, env_facts, bump)
                 .map_err(|why| CliError::Start(StartError::TestPlace { shown: std::boxed::Box::from(bstd::mem::format_in!(frame, "{why}").as_str()) }))?;
             // What the suite's names records are made of, kept for the command's code workers
             // (test_drive.rs `pooled`, D194), then the command thread's own names records of it.
@@ -628,10 +637,43 @@ pub(crate) fn run_tests_status(
             let builder = crate::run_parent::builder_for(unit.edition.name(), overflow, panic, producer, isa).map_err(parent)?;
             runnable.push(crate::test_drive::Suite { names, crates, builder, unit: *unit, place, native: images[at] });
         }
+        // Build `BinSuite` entries only for workspace `[[bin]]` targets actually exposed via
+        // `CARGO_BIN_EXE_<name>` by at least one selected test suite (`test.md` piece 17).
+        let bin_panic = blaze_ladder::panic_strategy::of_profile(profile);
+        let mut bin_suites = blaze_own::Vec::new_in(frame);
+        for (found, bin_unit) in &inventory.bins {
+            if !needed_bins.iter().any(|&(p, b)| p == bin_unit.package && b == bin_unit.bin_name) {
+                continue;
+            }
+            let native = if crate::native_image::linked(list, bin_unit.at) {
+                let closure = suite_closure(list, bin_unit.at, alloc);
+                match crate::engine_native::image_for(cx, &mut standing, &closure, watch) {
+                    Ok(image) => image.send,
+                    Err(error) => {
+                        let shown = bstd::mem::format_in!(frame, "{error}");
+                        return Err(CliError::Start(StartError::Native { shown: shown.as_str().into() }));
+                    }
+                }
+            } else {
+                None
+            };
+            let crates = run_names::crates_of(cx, found, run_names::Owner::At(bin_unit.at), &mut *standing.store, &mut facts.bodies, &mut read, &facts.fetch_env, &pack_dirs, frame, heap)
+                .map_err(CliError::RunNames)?;
+            let names = run_names::names_in(cx, root, crates, procs, &seen, frame).map_err(CliError::RunNames)?;
+            let builder = crate::run_parent::builder_for(bin_unit.edition.name(), overflow, bin_panic, producer, isa).map_err(parent)?;
+            bin_suites.push(crate::test_bins::BinSuite {
+                package: bin_unit.package,
+                bin_name: bin_unit.bin_name,
+                key: bin_unit.key,
+                names,
+                builder,
+                native,
+            });
+        }
         let certificate = crate::start_list::Certificate::of_answer(&standing);
         let tools_digest = crate::test_cache::tools_digest(&standing.tools);
         let typed = crate::engine_body_record::TypedFrom { cx, lent: standing.lent, records: standing.records(), alloc: heap.alloc() };
-        let ran = crate::test_drive::run_suites(cx, launch.fs, launch.env, launch.host, clock, rng, launch.out, launch.err, &runnable, &ids, typed, certificate, tools_digest, config, launch.args, standing.lent, root, procs, heap, watch, frame);
+        let ran = crate::test_drive::run_suites(cx, launch.fs, launch.env, launch.host, clock, rng, launch.out, launch.err, &runnable, &bin_suites, &ids, typed, certificate, tools_digest, config, launch.args, standing.lent, root, procs, heap, watch, frame);
         end_procs(cx, &maker, err, "test")?;
         ids_line = Some(ids.line(&asked, ids_ns));
         ran.map_err(|error| CliError::Test(blaze_own::Box::new_in(error, heap.alloc())))?

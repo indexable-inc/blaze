@@ -734,10 +734,10 @@ pub fn enter_test_sandbox(temp: &CStr, keep_ro: &[&CStr], cwd: Option<&CStr>) ->
         }
     }
 
-    // Ensure `temp`'s mountpoint directory exists if `temp` lives under a masked dir.
-    if let Some(prefix_len) = masked_prefix_len(temp) {
-        mkdir_under_masked("mkdir temp", temp, prefix_len)?;
-    }
+    // Create `/tmp/t` inside the fresh empty `/tmp` tmpfs as the short, uniform sandbox `$TMPDIR`
+    // (6 bytes, matching `cargo test`'s `/tmp` headroom so tests binding pathname `AF_UNIX` sockets
+    // beneath `$TMPDIR` never hit Linux's 108-byte `sun_path` limit).
+    mkdir_under_masked("mkdir /tmp/t", c"/tmp/t", b"/tmp/".len())?;
 
     // Lock the fresh empty tmpfs masks themselves read-only (non-recursive so `keep_ro` stays).
     for (&(dir, _), &mounted) in MASKED_DIRS.iter().zip(masked_mounted.iter()) {
@@ -746,8 +746,8 @@ pub fn enter_test_sandbox(temp: &CStr, keep_ro: &[&CStr], cwd: Option<&CStr>) ->
         }
     }
 
-    // Mount the cloned read-write `$TMPDIR` into place.
-    move_mount_empty("move_mount temp rw", &temp_tree, temp)?;
+    // Mount the cloned read-write `$TMPDIR` at `/tmp/t`.
+    move_mount_empty("move_mount temp rw", &temp_tree, c"/tmp/t")?;
     drop(temp_tree);
 
     // Re-anchor cwd onto the visible read-only mount if requested.
@@ -786,7 +786,7 @@ pub fn enter_test_sandbox(temp: &CStr, keep_ro: &[&CStr], cwd: Option<&CStr>) ->
     let temp_access = AccessFs::from_bits(
         base_fs.bits() & !(AccessFs::MAKE_CHAR.with(AccessFs::MAKE_BLOCK).bits()),
     );
-    add_path("temp", temp, dir_flags, temp_access)?;
+    add_path("temp", c"/tmp/t", dir_flags, temp_access)?;
     let null_access = AccessFs::READ_FILE
         .with(AccessFs::WRITE_FILE)
         .with(AccessFs::TRUNCATE)

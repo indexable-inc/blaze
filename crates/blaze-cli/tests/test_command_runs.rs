@@ -1098,3 +1098,76 @@ fn impure_clock() {
         assert!(serial_on_pooled.stdout.ends_with(expect_warm), "{}", evidence(expect_warm, &serial_on_pooled));
     });
 }
+
+/// `CARGO_BIN_EXE_<name>` launcher stubs (`test.md` piece 17): integration tests can inspect and
+/// spawn workspace `[[bin]]` targets through BOTH compile-time `env!("CARGO_BIN_EXE_helper")`
+/// (deterministic guest path `/target/debug/bin/<pkg>/<bin>` remapped by `LauncherOwn`) AND
+/// runtime `std::env::var("CARGO_BIN_EXE_helper")`, including concurrent multi-child spawns.
+#[test]
+fn integration_test_spawns_cargo_bin_exe_stub() {
+    let manifest = "\
+[package]
+name = \"binapp\"
+version = \"0.1.0\"
+edition = \"2024\"
+
+[[bin]]
+name = \"helper\"
+path = \"src/main.rs\"
+";
+    let main_rs = "\
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    println!(\"helper-ok:{}\", args.join(\",\"));
+}
+";
+    let integ_rs = "\
+use std::path::Path;
+use std::process::Command;
+
+#[test]
+fn spawns_via_compile_time_and_runtime_env() {
+    let compile_path = env!(\"CARGO_BIN_EXE_helper\");
+    assert_eq!(compile_path, \"/target/debug/bin/binapp/helper\");
+    assert!(Path::new(compile_path).exists(), \"remapped guest stub path must exist\");
+
+    let runtime_path = std::env::var(\"CARGO_BIN_EXE_helper\").expect(\"runtime CARGO_BIN_EXE_helper\");
+    assert!(Path::new(&runtime_path).exists(), \"runtime stub path must exist\");
+
+    // Spawn two children concurrently (one via compile-time guest path, one via runtime stub path)
+    // to exercise concurrent multi-connection serving on the binary stub Unix listener.
+    let child_a = Command::new(compile_path)
+        .args([\"alpha\", \"one\"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect(\"spawn compile-time CARGO_BIN_EXE_helper\");
+    let child_b = Command::new(&runtime_path)
+        .args([\"beta\", \"two\"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect(\"spawn runtime CARGO_BIN_EXE_helper\");
+
+    let out_a = child_a.wait_with_output().expect(\"wait child_a\");
+    let out_b = child_b.wait_with_output().expect(\"wait child_b\");
+    assert!(out_a.status.success(), \"child_a failed: status={:?} stderr={}\", out_a.status, String::from_utf8_lossy(&out_a.stderr));
+    assert!(out_b.status.success(), \"child_b failed: status={:?} stderr={}\", out_b.status, String::from_utf8_lossy(&out_b.stderr));
+    assert_eq!(String::from_utf8_lossy(&out_a.stdout).trim(), \"helper-ok:alpha,one\");
+    assert_eq!(String::from_utf8_lossy(&out_b.stdout).trim(), \"helper-ok:beta,two\");
+}
+";
+    fixture(
+        "bin_exe",
+        &[("Cargo.toml", manifest), ("src/main.rs", main_rs), ("tests/spawns_bin.rs", integ_rs)],
+        |dir, home| {
+            let said = run(dir, home, &["--", "--deadline", "60s"]);
+            assert_eq!(said.code, Some(0), "{}", evidence("CARGO_BIN_EXE stub test passes", &said));
+            assert!(
+                said.stdout.contains("1 passed, 0 failed"),
+                "{}",
+                evidence("1 passed, 0 failed", &said)
+            );
+        },
+    );
+}

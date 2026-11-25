@@ -633,8 +633,20 @@ impl<'m> TestRows<'m> {
     }
 }
 
+/// A workspace binary target (`[[bin]]`) belonging to a selected package, served via a
+/// `CARGO_BIN_EXE_<bin_name>` launcher stub when any selected test suite exposes it (`test.md` piece 17).
+#[derive(Clone, Copy)]
+pub(crate) struct BinUnit<'m> {
+    pub(crate) at: usize,
+    pub(crate) key: blaze_id::CrateItemKey,
+    pub(crate) package: &'m str,
+    pub(crate) bin_name: &'m str,
+    pub(crate) edition: blaze_surface::Edition,
+}
+
 pub(crate) struct TestInventory<'m> {
     pub(crate) suites: AVec<'static, (Found<'m>, TestUnit<'m>)>,
+    pub(crate) bins: AVec<'static, (Found<'m>, BinUnit<'m>)>,
     walked: Option<CrateList<'static>>,
 }
 
@@ -884,7 +896,32 @@ fn tests_of<'s, 'f: 's, 'm: 's>(
     }
     let snapshot = run_snapshot(store)?;
     let mut suites = AVec::new_in(heap.alloc());
+    let mut bins = AVec::new_in(heap.alloc());
     for (index, unit) in units.iter().enumerate() {
+        if !unit.for_host
+            && let blaze_unit_graph::UnitKind::Bin(bin_name) = &unit.kind
+            && selected.binary_search(&unit.name.as_str()).is_ok()
+        {
+            let at = usize::try_from(u32_at(mapping, index * 4)).unwrap_or(usize::MAX);
+            if at < CrateGraph::len(&list) && list.member(at) {
+                let name = CrateGraph::name(&list, at);
+                let key = list.key(at);
+                if let Some((package, version)) = list.env_facts(at).package
+                    && package == unit.name.as_str()
+                    && version == unit.version.as_str()
+                    && name == unit.crate_name.as_str()
+                    && let Some(input) = answer.crate_input(at, blaze_drive::key::crate_scope_name(&key))
+                    && let Ok(records) = read.records(cx, store, &input, key, heap.alloc())
+                {
+                    let bin_name = crate::work::held_str(bin_name.as_str(), frame);
+                    bins.push((
+                        Found::Stood(answer, blaze_own::Share::share(&snapshot)),
+                        BinUnit { at, key, package, bin_name, edition: records.edition },
+                    ));
+                }
+            }
+            continue;
+        }
         let Some((kind, target_name, harness)) = test_target(unit) else { continue };
         if let Some(bin) = bin && (kind != "bin" || target_name != bin) {
             continue;
@@ -928,7 +965,9 @@ fn tests_of<'s, 'f: 's, 'm: 's>(
         suites.push((Found::Stood(answer, snapshot.clone()), TestUnit { at, key, package, target, tests, edition: records.edition }));
     }
     suites.sort_unstable_by(|(_, a), (_, b)| (a.package, a.target, a.key).cmp(&(b.package, b.target, b.key)));
-    Ok(TestInventory { suites, walked: Some(list) })
+    bins.sort_unstable_by(|(_, a), (_, b)| (a.package, a.bin_name, a.key).cmp(&(b.package, b.bin_name, b.key)));
+    bins.dedup_by(|(_, a), (_, b)| a.package == b.package && a.bin_name == b.bin_name);
+    Ok(TestInventory { suites, bins, walked: Some(list) })
 }
 
 /// The program's crates from `answered`: the crate list of its `UnitGraph` row (read once a

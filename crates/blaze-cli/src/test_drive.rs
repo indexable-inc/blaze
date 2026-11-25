@@ -226,6 +226,8 @@ pub(crate) enum OneError {
     /// A make, or a worker's ask for the proc-macro runner, could not be handed over the code
     /// workers' channel `chan` (D194): the worker `worker` is gone, or the hand-over stopped so.
     CodeHandOff { chan: &'static str, worker: usize, why: &'static str },
+    /// Preparing `CARGO_BIN_EXE_*` launcher stubs or their Unix code-server socket failed.
+    Bins(crate::test_bins::BinStubError),
 }
 
 impl fmt::Display for OneError {
@@ -268,6 +270,7 @@ impl fmt::Display for OneError {
                 waited / 1_000_000_000,
                 waited % 1_000_000_000 / 100_000_000,
             ),
+            OneError::Bins(error) => write!(f, "{error}"),
         }
     }
 }
@@ -809,6 +812,12 @@ pub(crate) trait RunOne {
     /// Runs row `row` in a process of its own, killed `budget` after its start: how it ended,
     /// its purity verdict, its entered functions, and its output into `output`.
     async fn run(&self, row: u32, budget: Nanos, output: &mut Output<'_>, signals: &Signals) -> Result<RunOutcome, OneError>;
+
+    /// Non-blocking pump for workspace binary launcher stubs (`CARGO_BIN_EXE_*`). Returns `true`
+    /// when any binary connection was accepted or made progress.
+    fn pump_bins(&self) -> bool {
+        false
+    }
 }
 
 /// Process-wide dispositions belong to the pool. A SIGTERM is observed by every child,
@@ -1141,6 +1150,24 @@ impl<R: RunOne, C: Fn() -> Nanos> Zygotes for OneEach<'_, R, C> {
             let left = Duration::from_nanos(until.0.saturating_sub(before_sweep.0));
             self.signals.wait.set(interval.min(left));
             self.signals.progress.set(false);
+            let bin_before = (self.now)();
+            let bin_progress = self.runs.pump_bins();
+            let bin_nanos = (self.now)().0.saturating_sub(bin_before.0);
+            if bin_progress {
+                self.signals.progress.set(true);
+                self.signals.wait.set(Duration::ZERO);
+            }
+            if bin_nanos > 0 {
+                for running in self.running.iter_mut() {
+                    if !running.started {
+                        running.pre_start = Nanos(running.pre_start.0.saturating_add(bin_nanos));
+                    } else if running.parked_now {
+                        running.parked = Nanos(running.parked.0.saturating_add(bin_nanos));
+                    } else {
+                        running.stalled = Nanos(running.stalled.0.saturating_add(bin_nanos));
+                    }
+                }
+            }
             self.sweep(&mut context)?;
             swept = true;
             crossed_until = before_sweep < until && (self.now)() >= until;
@@ -2683,6 +2710,9 @@ pub(crate) struct Launched<'c, 'h, 'a> {
     /// Suite-wide shared walk, maker, verified set, and publication cache (borrowed strictly
     /// within synchronous calls, never across `.await`, rule 27).
     pub suite_cache: &'c RefCell<suite_cache::SuiteCache<'h>>,
+    /// Command-wide binary launcher stub server (`CARGO_BIN_EXE_*`, `test.md` piece 17), borrowed
+    /// strictly within synchronous calls (never across `.await`, rule 27).
+    pub bins: Option<&'c RefCell<crate::test_bins::BinServer<'a, 'h>>>,
 }
 
 /// The test profile with the one grant a native image needs: `dlopen` maps `<store>/<64 hex>`
@@ -2976,16 +3006,49 @@ impl<'c> Launched<'c, '_, '_> {
         let line = head.line;
         let entry = bstd::mem::format_in!(frame, "{line}");
         // 3. Environment.
-        let mut vars: Vec<(&str, &str), &Frame> = Vec::with_capacity_in(self.env.len() + self.place.vars.len() + 9, frame);
+        let mut vars: Vec<(&str, &str), &Frame> = Vec::with_capacity_in(self.env.len() + self.place.vars.len() + 16, frame);
         vars.push(("TMPDIR", temp.as_str()));
         vars.extend_from_slice(self.place.vars);
         let package = self.place.vars;
-        let command = self.env.iter().copied().filter(|(name, _)| *name != "TMPDIR" && package.binary_search_by(|(set, _)| set.cmp(name)).is_err());
+        // Borrow `self.bins` strictly synchronously here to snapshot bin-exe env vars and remap
+        // table into `frame` (never across `.await`, rule 27).
+        let mut bin_env_pairs: Vec<(&str, &str), &Frame> = Vec::new_in(frame);
+        let mut bin_map_text: Option<String<&Frame>> = None;
+        let mut bin_dir_text: Option<String<&Frame>> = None;
+        #[cfg(target_os = "macos")]
+        let mut bin_socket_text: Option<String<&Frame>> = None;
+        #[cfg(target_os = "macos")]
+        let mut bin_natives: Vec<crate::engine_native::NativeSend<'_>, &Frame> = Vec::new_in(frame);
+        if let Some(bins_cell) = self.bins {
+            let bins_ref = bins_cell.borrow();
+            let mut raw_pairs: Vec<(&str, &str), &Frame> = Vec::new_in(frame);
+            if let Some(map) = bins_ref.fill_suite_env(self.package, &mut raw_pairs, frame) {
+                for &(k, v) in raw_pairs.iter() {
+                    bin_env_pairs.push((crate::work::held_str(k, frame), crate::work::held_str(v, frame)));
+                }
+                bin_map_text = Some(map);
+                bin_dir_text = Some(String::from_str_in(bins_ref.bins_dir(), frame));
+                #[cfg(target_os = "macos")]
+                {
+                    bin_socket_text = Some(String::from_str_in(bins_ref.socket_path(), frame));
+                    bin_natives.extend_from_slice(bins_ref.bin_natives());
+                }
+            }
+        }
+        vars.extend_from_slice(bin_env_pairs.as_slice());
+        let command = self.env.iter().copied().filter(|(name, _)| {
+            *name != "TMPDIR"
+                && package.binary_search_by(|(set, _)| set.cmp(name)).is_err()
+                && !bin_env_pairs.iter().any(|(set, _)| set == name)
+        });
         run_parent::launch_env(command, self.store, entry.as_str(), None, &mut vars);
         let lazy_native = self.native.filter(|_| !eager_native).map(|send| bstd::mem::format_in!(frame, "lazy:{}", send.hex));
         if let Some(send) = self.native {
             let value = lazy_native.as_ref().map_or(send.hex, |s| s.as_str());
             vars.push(("BLAZE_LAUNCH_NATIVE", value));
+        }
+        if let Some(map) = bin_map_text.as_ref() {
+            vars.push(("BLAZE_LAUNCH_BIN_MAP", map.as_str()));
         }
         #[cfg(target_os = "macos")]
         let unwound_full = self.tests.harnessed().then(|| bstd::mem::format_in!(frame, "{}/unwound-{row}", self.temp));
@@ -2996,14 +3059,28 @@ impl<'c> Launched<'c, '_, '_> {
         #[cfg(target_os = "linux")]
         {
             vars.push(("BLAZE_LAUNCH_SANDBOX_TEMP", temp.as_str()));
+            if let Some(dir) = bin_dir_text.as_ref() {
+                vars.push(("BLAZE_LAUNCH_BINS_DIR", dir.as_str()));
+            }
             if self.tests.harnessed() {
                 vars.push(("BLAZE_LAUNCH_UNWOUND_FILE", "fd:4"));
             }
         }
+        #[cfg(not(target_os = "linux"))]
+        let _ = &bin_dir_text;
         // 4. Sandbox + spawn.
         #[cfg(target_os = "macos")]
         let Started { child: mut run, pipes: given } = {
-            let profile = seatbelt_profile(temp.as_str(), self.store, self.native, unwound_full.as_ref().map(|s| s.as_str()), frame, alloc)?;
+            let profile = seatbelt_profile(
+                temp.as_str(),
+                self.store,
+                self.native,
+                unwound_full.as_ref().map(|s| s.as_str()),
+                bin_socket_text.as_ref().map(|s| s.as_str()),
+                bin_natives.as_slice(),
+                frame,
+                alloc,
+            )?;
             let mut args = Vec::with_capacity_in(self.args.len() + 3, frame);
             args.extend_from_slice(&["-p", profile.as_str(), self.launcher]);
             args.extend_from_slice(self.args);
@@ -3636,11 +3713,19 @@ fn seatbelt_profile<'a>(
     store: &str,
     native: Option<crate::engine_native::NativeSend<'_>>,
     unwound: Option<&str>,
+    control: Option<&str>,
+    bin_natives: &[crate::engine_native::NativeSend<'_>],
     frame: &Frame,
     alloc: Alloc<'a>,
 ) -> Result<AString<'a>, OneError> {
-    let profile = blaze_run::child::seatbelt(temp, None, alloc).map_err(|why| OneError::Profile { why: Box::from(bstd::mem::format_in!(frame, "{why}").as_str()) })?;
-    let profile = with_native(profile, store, native)?;
+    let profile = blaze_run::child::seatbelt(temp, control, alloc).map_err(|why| {
+        let text = bstd::mem::format_in!(frame, "{why}");
+        OneError::Profile { why: text.as_str().into() }
+    })?;
+    let mut profile = with_native(profile, store, native)?;
+    for &bin_native in bin_natives {
+        profile = with_native(profile, store, Some(bin_native))?;
+    }
     with_unwound(profile, unwound)
 }
 
@@ -4036,6 +4121,12 @@ impl RunOne for Selected<'_, Launched<'_, '_, '_>> {
         let loc = self.rows.get(flat as usize).ok_or(OneError::NoRow { row: flat })?;
         self.suites[loc.suite.0 as usize].run(loc.row, budget, output, signals).await
     }
+
+    fn pump_bins(&self) -> bool {
+        let Some(first) = self.suites.first() else { return false };
+        let Some(bins) = first.bins else { return false };
+        bins.borrow_mut().pump(first.cx, first.ids, first.lent, first.watch, first.err)
+    }
 }
 
 /// The selected suites run, their code made where [`CODES`] says (D194, THE seam): `Serial`, in
@@ -4058,7 +4149,7 @@ pub(crate) fn run_suites<'h>(
     rng: &mut bstd::rng::Rng,
     out: &bstd::out::Out,
     err: &bstd::out::Out,
-    suites: &[Suite<'_, 'h>], ids: &RunIds<'h>, typed: crate::engine_body_record::TypedFrom<'h>, certificate: crate::start_list::Certificate, tools_digest: [u8; 32], config: LoopConfig<'_>,
+    suites: &[Suite<'_, 'h>], bins: &[crate::test_bins::BinSuite<'_, 'h>], ids: &RunIds<'h>, typed: crate::engine_body_record::TypedFrom<'h>, certificate: crate::start_list::Certificate, tools_digest: [u8; 32], config: LoopConfig<'_>,
     args: &[&str], lent: &CommandLent, root: &Dir<ReadWrite>, procs: crate::job_texts::Procs<'_>, heap: &'static blaze_own::Heap, watch: &dyn Watch, frame: &Frame,
 ) -> Result<Status, DriveError> {
     let sel_cx = cx.span("blaze test: selected suites");
@@ -4197,7 +4288,7 @@ pub(crate) fn run_suites<'h>(
             let sync_typed = typed.sync_over(*ids);
             pooled(cx, clock, rng, suites, sync_typed, want_workers, root, procs, heap, make_watch, |relay| {
                 run_dirty(
-                    &sel_cx, fs, env, host, clock, err, suites, ids, typed, certificate, config, args, lent,
+                    &sel_cx, fs, env, host, clock, err, suites, bins, ids, typed, certificate, config, args, lent,
                     tables, watch, make_watch, frame, alloc, Some(relay), &mut machine, pending_runs,
                     steps_left, most, locations.as_slice(), &mut cache, &mut print,
                 )
@@ -4205,7 +4296,7 @@ pub(crate) fn run_suites<'h>(
         }
         Codes::Serial | Codes::Pooled => {
             run_dirty(
-                &sel_cx, fs, env, host, clock, err, suites, ids, typed, certificate, config, args, lent,
+                &sel_cx, fs, env, host, clock, err, suites, bins, ids, typed, certificate, config, args, lent,
                 tables, watch, make_watch, frame, alloc, None, &mut machine, pending_runs,
                 steps_left, most, locations.as_slice(), &mut cache, &mut print,
             )
@@ -4303,7 +4394,7 @@ fn run_dirty<'a, 'r, 'm, 'h, D: blaze_core::Driver>(
     host: &bstd::host::Host,
     clock: &bstd::clock::Clock,
     err: &bstd::out::Out,
-    suites: &[Suite<'_, 'h>], ids: &RunIds<'h>, typed: crate::engine_body_record::TypedFrom<'h>, certificate: crate::start_list::Certificate, config: LoopConfig<'r>,
+    suites: &[Suite<'_, 'h>], bins: &[crate::test_bins::BinSuite<'a, 'h>], ids: &RunIds<'h>, typed: crate::engine_body_record::TypedFrom<'h>, certificate: crate::start_list::Certificate, config: LoopConfig<'r>,
     args: &[&str], lent: &CommandLent, tables: Alloc<'static>, watch: &dyn Watch, make_watch: blaze_ladder::run::make_one::MakeWatch<'static>, frame: &Frame,
     alloc: Alloc<'a>, relay: Option<&CodeRelay<'_>>, machine: &mut TestLoop<'a, 'r>, pending_runs: AVec<'a, Effect<'a>>,
     steps_left: usize, most: usize, locations: &[Location], cache: &mut crate::test_cache::TestCache<'a, 'm, D>,
@@ -4332,6 +4423,29 @@ fn run_dirty<'a, 'r, 'm, 'h, D: blaze_core::Driver>(
     let spawner = host.spawner().map_err(DriveError::Missing)?;
     let mut vars: Vec<(&str, &str), &Frame> = Vec::new_in(frame);
     vars.extend(env.each());
+    let mine_abs = bstd::mem::format_in!(frame, "{home}/{TEMPS}/{}", command.as_str());
+    let bin_server = if !bins.is_empty() && TestHost::THIS.has_sandbox() {
+        Some(RefCell::new(
+            crate::test_bins::BinServer::start(
+                cx,
+                &mine,
+                mine_abs.as_str(),
+                launcher.as_str(),
+                store.as_str(),
+                bins,
+                lent,
+                &certificate,
+                typed,
+                tables,
+                make_watch,
+                frame,
+                alloc,
+            )
+            .map_err(|err| one(OneError::Bins(err)))?,
+        ))
+    } else {
+        None
+    };
     let mut dirs = Vec::with_capacity_in(suites.len(), frame);
     for index in 0..suites.len() {
         let dir = LazySuiteDir::new(&mine, index);
@@ -4368,6 +4482,7 @@ fn run_dirty<'a, 'r, 'm, 'h, D: blaze_core::Driver>(
             entered_sink: &entered_sink,
             cache_alloc: alloc,
             suite_cache,
+            bins: bin_server.as_ref(),
         });
         child_base += tests.len();
         checks.push(EntryCheck { tests, names: suite.names, builder: suite.builder, tables, image: suite.native.map(|native| native.map_or(&[][..], |send| send.items)), said: String::new_in(alloc) });
@@ -4410,9 +4525,7 @@ fn run_dirty<'a, 'r, 'm, 'h, D: blaze_core::Driver>(
         alloc,
     );
     watch.see(blaze_screen::Step::Says);
-    // Clean up this command's per-run `$TMPDIR` tree (`v2/test/tmp/<pid>-<ns>`) on both Ok and Err
-    // paths now that all child test processes have exited.
-    let _ = crate::gc::remove_tree_best_effort(cx, &temps, &command_path);
+    let mut one_stopped = false;
     if let (Err(DriveError::Run(_)), Some((row, failed))) = (&status, runner.zygotes().failed.as_ref()) {
         let row_idx = usize::try_from(*row).map_err(|_| one(OneError::NoRow { row: *row }))?;
         let location = locations.get(row_idx).ok_or(one(OneError::NoRow { row: *row }))?;
@@ -4422,9 +4535,8 @@ fn run_dirty<'a, 'r, 'm, 'h, D: blaze_core::Driver>(
         let loc_row = usize::try_from(location.row).map_err(|_| one(OneError::NoRow { row: location.row }))?;
         let path = record_row(tests, loc_row)?.path;
         err.line(cx, format_args!("blaze test: the test `{}/{}/{path}` could not be run: {failed}", unit.package, unit.target)).map_err(|_| DriveError::Print)?;
-        return Err(DriveError::OneStopped);
-    }
-    if let (Err(DriveError::Run(RunError::ZygoteSilent { .. })), Some(turn)) = (&status, runner.zygotes().longest) {
+        one_stopped = true;
+    } else if let (Err(DriveError::Run(RunError::ZygoteSilent { .. })), Some(turn)) = (&status, runner.zygotes().longest) {
         let row_idx = usize::try_from(turn.row).map_err(|_| one(OneError::NoRow { row: turn.row }))?;
         let location = locations.get(row_idx).ok_or(one(OneError::NoRow { row: turn.row }))?;
         let suite_idx = usize::try_from(location.suite.0).map_err(|_| DriveError::NoSuite { suite: location.suite })?;
@@ -4435,6 +4547,23 @@ fn run_dirty<'a, 'r, 'm, 'h, D: blaze_core::Driver>(
             "blaze test: the command thread, which serves every test's process, was held {}.{} s in one turn of `{}/{}/{path}` (row {}): {}; while a turn runs no test is answered (test_drive.rs `OneEach`)",
             turn.nanos / 1_000_000_000, turn.nanos % 1_000_000_000 / 100_000_000, unit.package, unit.target, turn.row, turn.doing,
         )).map_err(|_| DriveError::Print)?;
+    }
+    // Persist verified binary stub pairs (`BZTV`) before dropping `bin_server` so even a failed
+    // first run warms subsequent spawns of the same workspace binary under today's certificate.
+    let bin_saved = bin_server.as_ref().map(|server| server.borrow().save_verified(lent, &certificate));
+    // Close the binary stub listener and drop any remaining connections before cleaning up `<mine>`.
+    drop(runner);
+    drop(launched);
+    drop(launches);
+    drop(bin_server);
+    // Clean up this command's per-run `$TMPDIR` tree (`v2/test/tmp/<pid>-<ns>`) on both Ok and Err
+    // paths now that all child test processes have exited.
+    let _ = crate::gc::remove_tree_best_effort(cx, &temps, &command_path);
+    if let Some(Err(err)) = bin_saved {
+        return Err(err);
+    }
+    if one_stopped {
+        return Err(DriveError::OneStopped);
     }
     let status = status?;
     for (index, sc) in suite_caches.iter().enumerate() {

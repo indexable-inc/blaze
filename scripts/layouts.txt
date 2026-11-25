@@ -356,3 +356,4 @@ crates/syntax-tree/src/flat/image.rs	IMAGE_LAYOUT	none
 crates/syntax-tree/src/flat/image.rs	MAGIC	none
 crates/syntax/src/image.rs	MAGIC	none
 crates/syntax/src/image.rs	TREE_VERSION	none
+crates/blaze-sys/src/linux/confine.rs	LINUX_CAPABILITY_VERSION_3	not persisted: Linux capset ABI constant
