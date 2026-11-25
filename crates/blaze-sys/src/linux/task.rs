@@ -146,6 +146,10 @@ pub fn pause() -> Errno {
 flag_set! {
     /// The namespaces an [`unshare`] makes new (`CLONE_NEW*`, sched.h).
     Namespaces: u32 {
+        /// `CLONE_NEWNS`: a new mount namespace.
+        NS = 0x0002_0000;
+        /// `CLONE_NEWIPC`: a new System V IPC and POSIX message queue namespace.
+        IPC = 0x0800_0000;
         /// `CLONE_NEWUSER`: a new user namespace.
         USER = 0x1000_0000;
         /// `CLONE_NEWNET`: a new network namespace.

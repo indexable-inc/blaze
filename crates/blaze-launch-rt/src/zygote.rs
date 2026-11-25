@@ -312,9 +312,6 @@ pub fn run<'s, S: Suite>(
     alloc: Alloc<'_>,
     sink: &mut dyn FnMut(&Finished<'_>),
 ) -> Result<(), DriverError<'s>> {
-    if cfg!(target_os = "linux") {
-        return Err(DriverError::NoSandbox { platform: "linux" });
-    }
     no_frameworks()?;
     let mut pool = Pool::new(width, alloc).map_err(DriverError::Pool)?;
     for one in asked {
@@ -546,6 +543,7 @@ fn child_main<'a>(suite: &dyn Suite, row: u32, child: &mut Child<'_, 'a>, report
     // Kept on `child_main`'s stack until `_exit` so POSIX `environ` points at live memory
     // without leaking.
     let mut env_keep: Option<(AVec<'a, AVec<'a, u8>>, AVec<'a, *mut c_char>)> = None;
+    let mut temp_path: AVec<'a, u8> = Vec::new_in(alloc);
     loop {
         let Some(step) = child.next() else { break };
         let failed = match step {
@@ -555,9 +553,12 @@ fn child_main<'a>(suite: &dyn Suite, row: u32, child: &mut Child<'_, 'a>, report
             }
             Step::Signals => signals(),
             Step::Descriptors => descriptors(report, output, alloc),
-            Step::TempFolder { path } => folder(path, alloc),
+            Step::TempFolder { path } => {
+                temp_path = c_text(path, alloc);
+                folder(path, alloc)
+            }
             Step::Environment { vars, temp } => environment(vars, temp, alloc, &mut env_keep),
-            Step::Sandbox { profile } => sandbox(profile, alloc),
+            Step::Sandbox { profile } => sandbox(profile, temp_path.as_slice(), alloc),
             Step::Control { socket } => suite.control(socket).err(),
             // The spec's row, the one forked for.
             Step::Call { .. } => break,
@@ -816,9 +817,10 @@ unsafe extern "C" {
     fn sandbox_init(profile: *const c_char, flags: u64, errorbuf: *mut *mut c_char) -> c_int;
 }
 
-fn sandbox(profile: &str, alloc: Alloc<'_>) -> Option<i32> {
+fn sandbox(profile: &str, temp: &[u8], alloc: Alloc<'_>) -> Option<i32> {
     #[cfg(target_os = "macos")]
     {
+        let _ = temp;
         let text = c_text(profile, alloc);
         let mut error: *mut c_char = core::ptr::null_mut();
         // SAFETY: a NUL-terminated profile in a live buffer; the process is one thread.
@@ -838,7 +840,13 @@ fn sandbox(profile: &str, alloc: Alloc<'_>) -> Option<i32> {
     #[cfg(target_os = "linux")]
     {
         let _ = (profile, alloc);
-        // `run` stops before any fork on Linux; a child here has no sandbox to enter.
-        return Some(libc::ENOSYS);
+        let Ok(temp_c) = core::ffi::CStr::from_bytes_with_nul(temp) else {
+            return Some(libc::EINVAL);
+        };
+        match blaze_sys::linux::confine::enter_test_sandbox(temp_c, &[], None) {
+            Ok(()) => None,
+            Err(blaze_sys::linux::confine::TestConfineError::AbiTooOld { .. }) => Some(libc::ENOSYS),
+            Err(err) => Some(i32::from(err.raw_errno())),
+        }
     }
 }
