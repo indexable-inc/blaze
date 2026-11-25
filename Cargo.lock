@@ -1074,6 +1074,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-git"
+version = "0.0.0"
+dependencies = [
+ "blaze-git-fetch",
+ "blaze-hash",
+ "blaze-memchr",
+ "blaze-own",
+ "blaze-sim",
+]
+
+[[package]]
 name = "blaze-git-fetch"
 version = "0.0.0"
 dependencies = [
@@ -2128,6 +2139,7 @@ dependencies = [
  "blaze-ecs",
  "blaze-ed25519",
  "blaze-format",
+ "blaze-git",
  "blaze-glob",
  "blaze-h1",
  "blaze-h2",

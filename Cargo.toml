@@ -443,6 +443,8 @@ blaze-h2 = { path = "crates/blaze-h2" }
 blaze-url = { path = "crates/blaze-url" } # HostPort, Scheme, Origin, Url: checked addresses, the one home; bstd re-exports them.
 # A commit's files over git's smart HTTP protocol v2: pkt-lines, packs with deltas, SHA-1 object ids.
 blaze-git-fetch = { path = "crates/blaze-git-fetch" }
+# Sans-IO, hardware-floor Git prompt and status engine for Starship-class tools.
+blaze-git = { path = "crates/blaze-git" }
 # What a run may see and what it saw: roots, RelPath, the read list and its one check (no_std, sans-IO).
 blaze-roots = { path = "crates/blaze-roots" }
 blaze-rung-tiers = { path = "crates/blaze-rung-tiers" }
