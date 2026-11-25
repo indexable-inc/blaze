@@ -454,6 +454,36 @@ impl<'n> CratesFrom<'n> {
     }
 }
 
+/// Optional lookup of precomputed checkout file digests (`crate::sweep::FILE_DOMAIN`),
+/// implemented by [`crate::job_texts::JobTexts`] when backed by [`crate::body_types::SyncLazyTrees`].
+pub(crate) trait DigestLookup {
+    fn checkout_digest(&self, inner: &str) -> Option<ContentId>;
+}
+
+impl DigestLookup for crate::job_texts::JobTexts<'_> {
+    fn checkout_digest(&self, inner: &str) -> Option<ContentId> {
+        crate::job_texts::JobTexts::checkout_digest(self, inner)
+    }
+}
+
+/// Source texts accepted by [`StoreLoad::from_crates`]: either a plain `&dyn SourceTexts` or a
+/// [`crate::job_texts::JobTexts`] that also exposes cached `FILE_DOMAIN` checkout digests.
+pub(crate) trait StoreTexts<'n> {
+    fn split(self) -> (&'n dyn SourceTexts<'n>, Option<&'n dyn DigestLookup>);
+}
+
+impl<'a: 'n, 'n> StoreTexts<'n> for &'a (dyn SourceTexts<'n> + 'n) {
+    fn split(self) -> (&'n dyn SourceTexts<'n>, Option<&'n dyn DigestLookup>) {
+        (self, None)
+    }
+}
+
+impl<'a: 'n, 'n> StoreTexts<'n> for &'a crate::job_texts::JobTexts<'n> {
+    fn split(self) -> (&'n dyn SourceTexts<'n>, Option<&'n dyn DigestLookup>) {
+        (self, Some(self))
+    }
+}
+
 /// front2's [`Load`] over crates read from the store: `crates`' crate `i` is the reader's crate
 /// `i` (the program's own at 0, as `Records::new`'s keys), `texts` the world's trees.
 pub(crate) struct StoreLoad<'n> {
@@ -467,6 +497,7 @@ pub(crate) struct StoreLoad<'n> {
     /// `CrateInput::shown_from`): a record's package path is joined onto it to read (D96).
     packages: &'n [&'n str],
     texts: &'n dyn SourceTexts<'n>,
+    digests: Option<&'n dyn DigestLookup>,
     snapshot: Option<&'n StoreSnapshot>,
     expansion_keys: Option<&'n SharedSet<Key, blaze_own::SharedAlloc<'static>>>,
     outlines: Option<&'n [crate::engine_tasks::Outlined<'n>]>,
@@ -530,14 +561,15 @@ impl<'n> StoreLoad<'n> {
     pub(crate) fn from_crates(
         crates: CratesFrom<'n>,
         packages: &'n [&'n str],
-        texts: &'n dyn SourceTexts<'n>,
+        texts: impl StoreTexts<'n>,
         snapshot: Option<&'n StoreSnapshot>,
         expansion_keys: Option<&'n SharedSet<Key, blaze_own::SharedAlloc<'static>>>,
         outlines: Option<&'n [crate::engine_tasks::Outlined<'n>]>,
         bump: Bump<'n>,
         alloc: Alloc<'n>,
     ) -> Self {
-        StoreLoad { crates, refused: core::cell::Cell::new(None), packages, texts, snapshot, expansion_keys, outlines, unserved: RefCell::new(AVec::new_in(alloc)), alloc, bump }
+        let (texts, digests) = texts.split();
+        StoreLoad { crates, refused: core::cell::Cell::new(None), packages, texts, digests, snapshot, expansion_keys, outlines, unserved: RefCell::new(AVec::new_in(alloc)), alloc, bump }
     }
 
     /// The crates' keys in reader order: `Records::new`'s `keys`.
@@ -661,7 +693,7 @@ impl<'n> Load<'n> for StoreLoad<'n> {
         if found != expected { return Err(stale(expected, found)); }
         let payload = record.payload_bytes().map_err(|_| ItemsRecordError::FileItemsUnavailable { file: index, what: "the planned outline payload is unavailable" })?;
         let view = blaze_surface::FileItemsView::read(payload).map_err(|why| ItemsRecordError::FileItemsRead { file: index, why })?;
-        let digest = ContentId::of(crate::sweep::FILE_DOMAIN, text.as_bytes());
+        let digest = self.digests.and_then(|d| d.checkout_digest(real)).unwrap_or_else(|| ContentId::of(crate::sweep::FILE_DOMAIN, text.as_bytes()));
         if view.file() != digest { return Err(stale(view.file(), digest)); }
         Ok(Some(CurrentFile { text, surface, view }))
     }

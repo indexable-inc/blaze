@@ -601,10 +601,10 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
                     let at = u.at();
                     let text = match *u {
                         blaze_typeck::Undecided::TargetFeatureCall { callee, .. } => {
-                            format!("the call of `{}` is not checked for `unsafe`", super::check::item_shown(&r, callee))
+                            blaze_own::format_in!(alloc, "the call of `{}` is not checked for `unsafe`", super::check::item_shown(&r, callee))
                         }
                     };
-                    verdict.undecided.push(BodyUndecided { cause: u.says(), text: AString::from_str_in(&text, alloc), start: at.start, end: at.end });
+                    verdict.undecided.push(BodyUndecided { cause: u.says(), text, start: at.start, end: at.end });
                 }
                 then(&mut r, &*lowered, &done);
             }

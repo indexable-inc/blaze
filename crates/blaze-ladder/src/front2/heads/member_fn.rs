@@ -29,7 +29,7 @@ use super::super::source::NamesSource;
 use super::super::types::{Bounds, Env, ParamBound, SelfTy, Why};
 // The parent's own imports of the allocator, `Vec` and `format!` (no new line naming `std`:
 // tools/ratchets/std-alloc.txt).
-use super::{Global, Store, Vec, Want, format, lower, members};
+use super::{Alloc, Global, Store, Vec, Want, format, lower_alloc, members};
 
 /// What an impl's member fns are made in, kept when the impl's head is made (its module, its
 /// generic parameters, their bounds, its `Self`): a member fn's want reads it, never lowers
@@ -93,29 +93,30 @@ impl<'n> Store<'n> {
             Some(Origin::Member { container, kind: MemberKind::Fn, name }) if *container == ck => name.clone(),
             other => return Err(Why::Program(format!("member fn {fn_:?} is filed as {other:?}, not as a fn of impl {ck:?}").into_boxed_str(), whole)),
         };
-        let ms = members(names, impl_).map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))?;
+        let alloc = self.tys.alloc();
+        let ms = members(names, impl_, alloc).map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))?;
         for m in &ms {
             if !matches!(m.detail, ItemDetail::Fn { .. }) || m.name != &*name {
                 continue;
             }
-            let low = lower(names, impl_, m.text).map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))?;
+            let low = lower_alloc(names, impl_, m.text, alloc).map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))?;
             let v = low.view();
             if v.cfg_out() {
                 continue;
             }
             let frame = self.member_frames.get(&ck).ok_or_else(|| Why::Program(format!("impl {ck:?}: its head is made but its members' frame is not kept").into_boxed_str(), whole))?;
             let (module, generics, is_const, self_) = (frame.module, frame.generics, frame.is_const, frame.self_);
-            let mut params = Vec::with_capacity_in(frame.params.len(), Global);
+            let mut params = blaze_own::Vec::with_capacity_in(frame.params.len(), alloc);
             params.extend_from_slice(&frame.params);
-            let mut consts = Vec::with_capacity_in(frame.consts.len(), Global);
+            let mut consts = blaze_own::Vec::with_capacity_in(frame.consts.len(), alloc);
             consts.extend_from_slice(&frame.consts);
-            let mut bounds = Vec::with_capacity_in(frame.bounds.len(), Global);
+            let mut bounds = blaze_own::Vec::with_capacity_in(frame.bounds.len(), alloc);
             bounds.extend_from_slice(&frame.bounds);
             let head = self.impls.get(&ck).ok_or_else(|| Why::Program(format!("impl {ck:?}: a member fn asked before its head").into_boxed_str(), whole))?;
-            let mut self_assoc = Vec::with_capacity_in(head.assoc.len(), Global);
+            let mut self_assoc = blaze_own::Vec::with_capacity_in(head.assoc.len(), alloc);
             self_assoc.extend_from_slice(&head.assoc);
             let clauses = self.preds.get(&ck).ok_or_else(|| Why::Program(format!("impl {ck:?}: its head is made but its clauses are not filed").into_boxed_str(), whole))?;
-            let mut inherited: Vec<PClause, Global> = Vec::with_capacity_in(clauses.clauses.len(), Global);
+            let mut inherited: blaze_own::Vec<PClause, Alloc<'static>> = blaze_own::Vec::with_capacity_in(clauses.clauses.len(), alloc);
             inherited.extend_from_slice(&clauses.clauses);
             let env = Env { module, params: &params, bounds: Bounds::Done(&bounds), self_, self_assoc: &self_assoc, anon: &[], consts: &consts, body: None };
             let marks = super::super::item_site::member_marks(names, impl_, m.written_by, m.text).map_err(super::super::item_site::MarksLost::why)?;

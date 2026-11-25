@@ -18,11 +18,13 @@
 //! those no entry covers) is the member's listing row (engine_member_rows.rs), read by key; a
 //! member none of whose files is owed is not opened.
 //!
-//! THE RUNS: the bodies of one member cut into runs of at most [`RUN`], each run a task of one
-//! bstd scope; a run opens its own `Records` over the shared bytes (`Records` opens lazily
-//! through `RefCell`s: never shared between threads, view.rs), and every body of the run is
-//! checked over one `Tables` with its own recorder (task.rs). The stretch memoizes the IDs
-//! of distinct questions over those tables. A panic fails its body alone (rule 20).
+//! THE RUNS: entered bodies are scheduled as LPT (largest-first) work-stealing items across long-
+//! lived pool workers; each worker keeps its current member's stretch frame (`BODIES_FRAME`) and
+//! `Records` alive across consecutive stolen items of the same member group (`Records` opens lazily
+//! through `RefCell`s: never shared between threads, view.rs), resetting its per-body scratch frame
+//! (`BODY_SCRATCH`, trimmed to `SCRATCH_KEEP`) between bodies. The stretch memoizes the IDs of
+//! distinct questions over those tables. A panic fails its body alone (rule 20). Results are
+//! reassembled in exact original order before merging (rule 25).
 //!
 //! WHAT A BODY READS, as the engine keys its readers: the view records names, lang, head and
 //! impl-bucket cells. A crate's `ImplBucket` cell is read as read: the Heads stage defines it
@@ -39,6 +41,7 @@
 
 use core::convert::Infallible;
 use core::num::NonZeroU32;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use blaze_drive::cells::Cell;
 use blaze_drive::key::ABSENT;
@@ -66,6 +69,7 @@ use bstd::clock::Clock;
 use bstd::cx::Cx;
 use bstd::fs::{Dir, ReadWrite};
 use bstd::mem::Frame;
+use bstd::sync::CachePadded;
 use bstd::task::Class;
 use std::alloc::Global;
 
@@ -89,22 +93,29 @@ use crate::work;
 /// Where the rule that refuses a body on this path is.
 const RULE: &str = "engine_bodies.rs";
 
-/// The most bodies one run checks: a run opens its own records once, and its frame holds every
-/// body's lowering until the run ends (a body's frame is the records' lifetime in `check_body`,
-/// so it cannot be reset per body yet: see the report's brief), so runs are short.
-const RUN: usize = 16;
+/// Threshold in predicted bytes above which a body is always scheduled as its own single-body
+/// work item in the dynamic LPT work-stealing queue (so no two medium/heavy bodies can ever
+/// serialize on one core).
+const SINGLE_BODY_BYTES: u64 = 1024;
 
-/// The most predicted cost one run checks, in bytes of its bodies' text (D167 (a): work at item
-/// grain, a batch sized by predicted cost and capped, never grouped by origin). A run of short
-/// entries ends at [`RUN`] entries or at this; an entry whose bodies are predicted past it (one
-/// `storable_nested_arrays!()` call: 704 bodies) is cut into slices of at most this, each its own
-/// run on its own worker, joined into the entry's one result after the join ([`join_slices`]);
-/// a body predicted past it alone is a slice alone. The predictor is each body's text length,
-/// known at plan time from the items record's rows with no text read ([`text_bytes`]); a cap by
-/// body COUNT (64) left one slice of 64 bodies at 4,693 ms, 73 ms a body against a mean of 12
-/// (profile score-c1725wave42). Sized to 12 KiB from the measured fit (~19 ms/KiB on ripgrep:
-/// a 48 KiB cap produced a 2,585 ms straggler run vs 0.64 ms stretch setup).
-const SLICE_BYTES: u64 = 12 << 10;
+/// Maximum number of consecutive tiny bodies (`< SINGLE_BODY_BYTES`) of the same member group
+/// grouped into one tiny work-stealing batch, and the predicted byte cap on such a batch.
+const TINY_BATCH_MAX: usize = 4;
+const TINY_BATCH_BYTES: u64 = 1024;
+
+/// Bodies with predicted cost at or above this threshold are ordered by exact descending cost
+/// (strict LPT) in the work-stealing queue; smaller items are quantized into 512-byte tiers so
+/// same-group, same-file items stay contiguous for worker-local stretch and cache reuse.
+const LPT_EXACT_BYTES: u64 = 4 << 10;
+
+/// The most predicted cost one macro-expansion slice checks, in bytes of its bodies' text (D167
+/// (a): work at item grain, sized by predicted cost and capped, never grouped by origin). An entry
+/// of multiple macro-written bodies predicted past this (e.g. one `storable_nested_arrays!()`
+/// call: 704 bodies) is cut into slices of at most this, each its own work-stealing item joined
+/// back into the entry's one result after the phase ([`join_slices`]); a body predicted past it
+/// alone is a slice alone. Sized to 4 KiB so dense macro expansions scale across 18–128 cores
+/// without creating a tail straggler.
+const SLICE_BYTES: u64 = 4 << 10;
 
 /// A body's least predicted cost: what checking any body costs beside its text (its stretch's
 /// questions, its row), so a slice of many tiny bodies is still cut.
@@ -578,7 +589,7 @@ struct BodyResult<'a, 'b, 's> {
     stands: Stands,
 }
 
-/// What a stretch's setup took before its first body began ([`run_stretch`]'s opening), in
+/// What a stretch's setup took before its first body began ([`run_stretch_with`]'s opening), in
 /// wall ns, by part, summed over the stretches: the profile's `bodies: stretch setup` line.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 struct StretchSetup {
@@ -675,13 +686,15 @@ impl<'a> RunOut<'a> {
 // The stretch path's types, bounded where they are declared (rule 76).
 const _: () = assert!(core::mem::size_of::<RunOut<'static>>() <= 4 << 10);
 
-/// A body's scratch frame, reset when the body ends (rule 11): reserved once a run, nothing
+/// A body's scratch frame, reset when the body ends (rule 11): reserved once per worker, nothing
 /// committed until used. It holds every list of a body that is only a step toward its row
-/// (lane BD3): the recorder's list and `seen` set, the cells before and after widening, the
-/// verdict's words and bytes, its findings and their messages. A cap, not a size: the
-/// recorder's own cap (front2 tables/recorder.rs `MOST_READS`, 2^20 reads) fills about 150 MB of
-/// it with its cells, so 1 GiB leaves a body several times that; a body past it panics in its
-/// own job (rule 20: the alloc-error hook) and is said as such.
+/// (lane BD3): the per-body checker arenas (`Store`, `InferCtx`, `Solver`, `Buckets`), the
+/// recorder's list and `seen` set, the cells before and after widening, the verdict's words and
+/// bytes, its findings and their messages. A cap, not a size: the recorder's own cap (front2
+/// tables/recorder.rs `MOST_READS`, 2^20 reads) fills about 150 MB of it with its cells, so 1 GiB
+/// leaves a body several times that and fits per-body checker arenas comfortably; trimmed to
+/// [`SCRATCH_KEEP`] between bodies; a body past it panics in its own job (rule 20: the
+/// alloc-error hook) and is said as such.
 const BODY_SCRATCH: usize = 1 << 30;
 
 /// What a run's scratch keeps committed between two bodies: a reset keeps every block a body
@@ -2132,7 +2145,7 @@ pub(crate) struct Handles<'h, 'e, 'n, 'o> {
 type Stop<'f> = (&'static str, &'f [CellId]);
 
 /// The on-demand packs of the crate list's trees and its corrected files (body_types.rs `Kept::lazy_trees`).
-type Trees<'f> = (blaze_own::Box<crate::body_types::SyncLazyTrees<'f>, blaze_own::Alloc<'static>>, &'static [(u32, &'static str, &'static str)]);
+type Trees = crate::body_types::LazyTreesHeld;
 
 /// What [`BodiesStage::groups`] found: each member's group, each body's place, the files of
 /// member crates, and the members' names.
@@ -2155,7 +2168,7 @@ struct Found<'f, 'r> {
     /// Each member crate's outlined files by its key's prefix and its items record's file
     /// index, sorted: where a head read finds its head task (engine_heads.rs `Owners`, [`widen`]).
     heads: SVec<'f, crate::engine_heads::Subject>,
-    trees: Trees<'f>,
+    trees: Trees,
 }
 
 /// The stage: the crates' records read once a command, and every body's result.
@@ -2719,7 +2732,7 @@ impl<'n> blaze_ladder::front2::source::Load<'n> for BodiesLoad<'n> {
         // `DependencyFiles` only hashes `text` on first outline miss. Unread checkout files
         // (`/0/...`) still hash and check `unread_digests` against the request's initial sweep.
         let digest = if let Some(real) = full.strip_prefix("/0/") {
-            let digest = ContentId::of(crate::sweep::FILE_DOMAIN, text.as_bytes());
+            let digest = self.texts.checkout_digest(real).unwrap_or_else(|| ContentId::of(crate::sweep::FILE_DOMAIN, text.as_bytes()));
             if let Some(digests) = self.unread_digests {
                 let find = |path: &str| digests.binary_search_by(|(p, _)| p.as_str().cmp(path)).ok().and_then(|i| digests.get(i)).map(|row| row.1);
                 let expected = find(real).or_else(|| {
@@ -3092,7 +3105,7 @@ impl<'s, 'f, 'r> Prepared<'s, 'f, 'r> {
     /// This setup's runner over `found` (this setup's, `Prepared::found`) and the stage's view
     /// `stage` ([`BodiesStage::reads_view`]).
     fn runner_of<'v>(&'v self, found: &'v Found<'f, 'r>, stage: StageReads<'v>, by_need: &'v dyn crate::front_load::OpenByNeed) -> BodyRunner<'v, 'f, 'r> {
-        let (packs, corrected) = (&*found.trees.0, found.trees.1);
+        let (packs, corrected) = found.trees;
         BodyRunner {
             grains: &found.grains,
             outlined: self.outlined,
@@ -4023,42 +4036,41 @@ impl<'f> BodiesStage<'f> {
             wholes.push(*one);
             false
         });
-        // The slices first, each alone; then the rest, a run ending at `RUN` entries or at
-        // `SLICE_BYTES` predicted, whichever comes first. They are started the most predicted
-        // first (below), so the longest work is begun first.
-        let mut runs: Vec<&[One<'f>], Global> = Vec::new_in(Global);
+        // Build dynamic LPT work-stealing items: macro-expansion slices first (each alone for
+        // `join_slices`), then individual items for every body >= `SINGLE_BODY_BYTES`, and tiny
+        // same-group batches (<= `TINY_BATCH_MAX` bodies and <= `TINY_BATCH_BYTES`) for trivial
+        // getters (or 1-body items on small incremental edits so every dirty body fans out).
+        let mut runs: SVec<'p, &[One<'f>]> = SVec::new_in(at_phase);
         for part in parts.iter() {
             runs.push(core::slice::from_ref(part));
         }
-        // Adaptive run size: when only a small batch of bodies is dirty (e.g. an incremental edit),
-        // split finely across available workers so independent bodies run in parallel instead of
-        // bunching into 1-3 serial runs of up to `RUN` (32) entries.
         let workers = usize::try_from(handles.workers.get()).unwrap_or(1).max(1);
-        let target_runs = workers.saturating_mul(2);
-        let max_run = if ones.len() <= target_runs { 1 } else { ones.len().div_ceil(target_runs).min(RUN) };
-        let mut from = 0;
-        while from < ones.len() {
-            let group = ones[from].group;
-            let mut to = from;
-            let mut cost = 0u64;
-            while to < ones.len() && ones[to].group == group && to - from < max_run {
-                let next = predicted(ones[to].costs, 0, ones[to].items.len());
-                if to > from && cost + next > SLICE_BYTES {
-                    break;
+        let tiny_batch_max = if ones.len() <= workers.saturating_mul(4) { 1 } else { TINY_BATCH_MAX };
+        let mut from = 0usize;
+        while let Some(first) = ones.get(from) {
+            let group = first.group;
+            let first_cost = predicted(first.costs, 0, first.items.len());
+            let mut to = from + 1;
+            if first_cost < SINGLE_BODY_BYTES && tiny_batch_max > 1 {
+                let mut cost = first_cost;
+                while let Some(next_one) = ones.get(to) {
+                    if next_one.group != group || to - from >= tiny_batch_max {
+                        break;
+                    }
+                    let next = predicted(next_one.costs, 0, next_one.items.len());
+                    if next >= SINGLE_BODY_BYTES || cost.saturating_add(next) > TINY_BATCH_BYTES {
+                        break;
+                    }
+                    cost = cost.saturating_add(next);
+                    to += 1;
                 }
-                cost += next;
-                to += 1;
             }
-            runs.push(&ones[from..to]);
+            if let Some(slice) = ones.get(from..to) {
+                runs.push(slice);
+            }
             from = to;
         }
         self.runs = u32::try_from(runs.len()).unwrap_or(u32::MAX);
-        // Each run's results in the phase's arena: its `Done`s (in `alloc` for engine merge),
-        // its bodies' rows and their findings ([`RunOut`]) in `at_phase`, dropped with the phase.
-        let mut buffers: SVec<'p, (Buffer<'a>, SVec<'p, Ran<'f>>, RunOut<'p>)> = SVec::with_capacity_in(runs.len(), at_phase);
-        for _ in 0..runs.len() {
-            buffers.push((Buffer::new_in(alloc), SVec::new_in(at_phase), RunOut::new(at_phase)));
-        }
         let Some(found) = prepared.found.as_ref() else {
             // Nothing to run: every task's result is in `buffer` above.
             self.ran.sort_unstable_by_key(|one| one.name);
@@ -4066,73 +4078,133 @@ impl<'f> BodiesStage<'f> {
         };
         // The same each phase (found from the same records): kept, not summed.
         self.uncovered = found.uncovered;
-        // Each run's counts of its seeded bodies, summed after the join.
-        let mut tallies: Vec<crate::engine_seeds::SeedTally, Global> = Vec::new_in(Global);
-        tallies.resize(runs.len(), crate::engine_seeds::SeedTally::default());
-        // Each run's thread stretch (start, end), for the stage's floor (engine_times.rs
+        // Each item's results in the phase's arena: its `Done`s (in `alloc` for engine merge),
+        // its bodies' rows and their findings ([`RunOut`]) in `at_phase`, dropped with the phase.
+        let mut buffers: SVec<'p, (Buffer<'a>, SVec<'p, Ran<'f>>, RunOut<'p>)> = SVec::with_capacity_in(runs.len(), at_phase);
+        // Each item's thread span (start, end), for the stage's floor (engine_times.rs
         // `Times::job`): what bounds the stage is how many ran at once, measured, not the workers.
         let mut spans: SVec<'p, (u64, u64)> = SVec::with_capacity_in(runs.len(), at_phase);
-        spans.resize(runs.len(), (0, 0));
-        // The phase's scope records opened by need, one for all its runs (each crate opened
-        // once whichever run asks it first); its counts read after the runs end.
+        // The phase's scope records opened by need, one for all its workers (each crate opened
+        // once whichever worker asks it first); its counts read after the workers end.
         let by_need = prepared.scope_records();
         prepared.pre_open_lang(&cx, &by_need, handles.workers)?;
-        {
+        if let [single_run] = runs.as_slice() {
+            // Single-item fast path: zero worker-pool overhead for 1-body incremental edits.
             let stage_reads = match paged_shelf {
                 Some(source) => self.reads_paged(source),
                 None => self.reads_view(),
             };
             let shared = prepared.shared(found, stage_reads, &view, &by_need);
-            let scope = cx.scope();
-            scope.narrow_workers(handles.workers, Class::Foreground);
-            // Each run started the most predicted first (ties in plan order), so the longest work
-            // is begun first and the stage does not end on a long run started last.
-            let mut started = Vec::with_capacity_in(runs.len(), heap.alloc());
-            for (at, (((run, (out, ran, run_out)), tally), span)) in runs.iter().zip(buffers.iter_mut()).zip(tallies.iter_mut()).zip(spans.iter_mut()).enumerate() {
+            let mut out = Buffer::new_in(alloc);
+            let mut ran = SVec::new_in(at_phase);
+            let mut run_out = RunOut::new(at_phase);
+            let mut tally = crate::engine_seeds::SeedTally::default();
+            let span = if shared.board.stopping().is_some() {
+                shared.board.refused(Stage::Bodies, u64::try_from(single_run.len()).unwrap_or(u64::MAX));
+                (0, 0)
+            } else {
+                let start = crate::engine_times::ns(prepared.clock.now().since_start());
+                run_bodies(&cx, &shared, single_run, prepared.clock, &mut out, &mut ran, &mut run_out, &mut tally, alloc, at_phase);
+                (start, crate::engine_times::ns(prepared.clock.now().since_start()))
+            };
+            if handles.board.stopping().is_some() {
+                self.wall_ns = self.wall_ns.saturating_add(handles.clock.now().since(began).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)));
+                return Ok(MadeFacts { bytes: SVec::new_in(at_phase), index: SVec::new_in(at_phase) });
+            }
+            self.seeds.add(&tally);
+            buffers.push((out, ran, run_out));
+            spans.push(span);
+        } else if !runs.is_empty() {
+            // Dynamic LPT work stealing: sort heavy items strictly largest-first (and bucket
+            // medium/small items into 512B tiers grouped by member + original file/item order for
+            // worker-local stretch and cache reuse), then pull dynamically from one 128B-padded
+            // atomic cursor across `min(workers, runs.len())` long-lived workers.
+            let mut dispatch: SVec<'p, usize> = SVec::with_capacity_in(runs.len(), at_phase);
+            dispatch.extend(0..runs.len());
+            dispatch.sort_unstable_by_key(|&at| {
+                let run = runs.get(at).copied().unwrap_or(&[]);
                 let cost: u64 = run.iter().map(|one| predicted(one.costs, 0, one.items.len())).sum();
-                started.push((core::cmp::Reverse(cost), at, run, out, ran, run_out, tally, span));
+                let tier = if cost >= LPT_EXACT_BYTES { cost } else { cost & !511 };
+                let group = run.first().map_or(0, |one| one.group);
+                (core::cmp::Reverse(tier), group, at)
+            });
+            let worker_count = workers.min(runs.len());
+            let cursor = CachePadded::new(AtomicUsize::new(0));
+            let mut worker_outs: SVec<'p, CachePadded<WorkerOut<'a, 'p, 'f>>> = SVec::with_capacity_in(worker_count, at_phase);
+            for _ in 0..worker_count {
+                worker_outs.push(CachePadded::new(WorkerOut::new(at_phase)));
             }
-            started.sort_unstable_by_key(|one| (one.0, one.1));
-            // One handle a run: as many as the project's bodies over `RUN`, so in the heap.
-            let mut running = Vec::new_in(heap.alloc());
-            for (_, _, run, out, ran, run_out, tally, span) in started.into_iter() {
-                let shared = &shared;
-                let clock = prepared.clock.clone();
-                running.push(scope.may_overlap("engine bodies run", BODIES_FRAME, move |cx: &Cx| {
-                    if shared.board.stopping().is_some() {
-                        shared.board.refused(Stage::Bodies, u64::try_from(run.len()).unwrap_or(u64::MAX));
-                        return Ok::<(), Infallible>(());
+            {
+                let stage_reads = match paged_shelf {
+                    Some(source) => self.reads_paged(source),
+                    None => self.reads_view(),
+                };
+                let shared = prepared.shared(found, stage_reads, &view, &by_need);
+                let runs_slice = runs.as_slice();
+                let dispatch_slice = dispatch.as_slice();
+                let cursor_ref = &cursor;
+                let clock = prepared.clock;
+                if worker_count == 1 {
+                    if let Some(worker_out) = worker_outs.first_mut() {
+                        run_worker_stealing(&cx, &shared, runs_slice, dispatch_slice, cursor_ref, clock, worker_out, alloc, at_phase);
                     }
-                    let began = crate::engine_times::ns(clock.now().since_start());
-                    run_bodies(cx, shared, run, &clock, out, ran, run_out, tally, alloc, at_phase);
-                    *span = (began, crate::engine_times::ns(clock.now().since_start()));
-                    Ok::<(), Infallible>(())
-                }));
-            }
-            let mut failed = None;
-            for handle in running.into_iter() {
-                if let Err(error) = handle.join(&cx) {
-                    failed.get_or_insert(error);
+                } else {
+                    let scope = cx.scope();
+                    scope.narrow_workers(handles.workers, Class::Foreground);
+                    let mut running = Vec::with_capacity_in(worker_count, heap.alloc());
+                    for worker_out in worker_outs.iter_mut() {
+                        let shared = &shared;
+                        running.push(scope.may_overlap("engine bodies worker", BODIES_FRAME, move |cx: &Cx| {
+                            run_worker_stealing(cx, shared, runs_slice, dispatch_slice, cursor_ref, clock, worker_out, alloc, at_phase);
+                            Ok::<(), Infallible>(())
+                        }));
+                    }
+                    let mut failed = None;
+                    for handle in running.into_iter() {
+                        if let Err(error) = handle.join(&cx) {
+                            failed.get_or_insert(error);
+                        }
+                    }
+                    scope.join(&cx).map_err(CliError::Pool)?;
+                    if let Some(error) = failed {
+                        return Err(CliError::Pool(error));
+                    }
                 }
             }
-            scope.join(&cx).map_err(CliError::Pool)?;
-            if let Some(error) = failed {
-                return Err(CliError::Pool(error));
+            // Stopped while the phase ran: account for any unpulled items in the queue and return
+            // without merging to stay well within `STOP_BOUND` (rule 18).
+            if handles.board.stopping().is_some() {
+                let pulled = cursor.load(Ordering::Acquire).min(dispatch.len());
+                if let Some(rest) = dispatch.get(pulled..) {
+                    let unpulled: u64 = rest.iter().map(|&at| runs.get(at).map_or(0, |r| u64::try_from(r.len()).unwrap_or(u64::MAX))).sum();
+                    if unpulled > 0 {
+                        handles.board.refused(Stage::Bodies, unpulled);
+                    }
+                }
+                self.wall_ns = self.wall_ns.saturating_add(handles.clock.now().since(began).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)));
+                return Ok(MadeFacts { bytes: SVec::new_in(at_phase), index: SVec::new_in(at_phase) });
             }
-        }
-        // Stopped while the phase ran: `one_phase` calls `stop_point` right after `run_stage`
-        // and drops the phase arena without merging, so skip joining tens of thousands of
-        // unbegun bodies to stay well within `STOP_BOUND` (rule 18).
-        if handles.board.stopping().is_some() {
-            self.wall_ns = self.wall_ns.saturating_add(handles.clock.now().since(began).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)));
-            return Ok(MadeFacts { bytes: SVec::new_in(at_phase), index: SVec::new_in(at_phase) });
+            let mut all_items: SVec<'p, ItemDone<'a, 'p, 'f>> = SVec::with_capacity_in(runs.len(), at_phase);
+            for worker_out in worker_outs.into_iter() {
+                let worker = worker_out.into_inner();
+                self.seeds.add(&worker.tally);
+                self.setup.add(worker.setup);
+                self.frames.fold(worker.frames);
+                all_items.extend(worker.items.into_iter());
+            }
+            // Rule 25: reassemble work items in exact original `0..runs.len()` order before merging.
+            all_items.sort_unstable_by_key(|item| item.at);
+            if all_items.len() != runs.len() {
+                return Err(CliError::Text { what: "the Bodies stage's work-stealing workers did not return every scheduled item (engine_bodies.rs `run_phase`)" });
+            }
+            for item in all_items.into_iter() {
+                buffers.push((item.out, item.ran, item.run_out));
+                spans.push(item.span);
+            }
         }
         self.expansion_demands = prepared.snapshot.expansion_demands();
         self.expansion_keys = prepared.expansion_keys.len() as u64;
         self.add_by_need(by_need.counts());
-        for tally in tallies.iter() {
-            self.seeds.add(tally);
-        }
         for &(start, end) in spans.iter() {
             times.job(crate::engine_times::Step::BodiesRun, start, end);
         }
@@ -4362,12 +4434,12 @@ impl<'f> BodiesStage<'f> {
         let setup_records = LazyScopeRecords::new(snapshot, CrateGraph::len(&list), Some(names.keys()), heap);
         let planted_unreadable = self.unreadable;
         // The trees are packs mapped from the shelf and the sources store (body_types.rs
-        // `open_trees`): a refusal there is of the machine's files, not of a cell (a pack missing
-        // or not the one the list's world read), so it reads nothing and is owed, entered again
-        // each request (rule 3: no invented read to make it stand).
-        let packs = blaze_own::Box::new_in(crate::body_types::SyncLazyTrees::new(handles.env.home, handles.env.heap, list, frame), handles.env.heap.alloc());
-        let corrected = match crate::body_types::corrected_of(&list, handles.env.heap) {
-            Ok(corrected) => corrected,
+        // `Kept::lazy_trees`, shared across `Names`, `Heads`, and `Bodies`): a refusal there is
+        // of the machine's files, not of a cell (a pack missing or not the one the list's world
+        // read), so it reads nothing and is owed, entered again each request (rule 3: no invented
+        // read to make it stand).
+        let (packs, corrected) = match self.kept.lazy_trees(handles.env, graph.out, list) {
+            Ok(trees) => trees,
             Err(why) => return Ok(Err((why, &[]))),
         };
         // The setup's laps ([`SetupParts`]): from its start to here, the list and the trees.
@@ -4918,7 +4990,7 @@ impl<'f> BodiesStage<'f> {
             // is opened only if they ask it.
             let opened = match (open_records, group.as_ref()) {
                 (true, Some(group)) => {
-                    let record_files = ((&*packs, &handles.env.fs), Some(handles.outlined));
+                    let record_files = ((packs, &handles.env.fs), Some(handles.outlined));
                     Some(crate::run_names::names_records_over(cx, handles.root, group.crates.scope(&setup_records), record_files, corrected, procs, std::vec::Vec::new_in(Global), env_in(group.env, frame).ok().flatten(), Some(snapshot), Some(expansion_keys), frame, g))
                 }
                 _ => None,
@@ -6136,6 +6208,318 @@ fn seed_cause<'n>(
 /// other half (tempo, g124650: three 32-body runs used up the whole 1 GiB in one frame).
 const STRETCH_FULL: usize = BODIES_FRAME / 2;
 
+/// One completed work item from a work-stealing Bodies worker, tagged with its original index
+/// `at` in `0..runs.len()` so the coordinator reassembles results in deterministic order (rule 25).
+struct ItemDone<'a, 'b, 'f> {
+    at: usize,
+    out: Buffer<'a>,
+    ran: SVec<'b, Ran<'f>>,
+    run_out: RunOut<'b>,
+    span: (u64, u64),
+}
+
+impl<'a, 'b, 'f> ItemDone<'a, 'b, 'f> {
+    fn new(at: usize, len: usize, clock: &Clock, alloc: SharedAlloc<'a>, at_phase: SharedAlloc<'b>) -> Self {
+        // Filing a refusal must work even when the allocation for the successful row failed.
+        // Each body consumes at most one slot in each of these four lists.
+        let mut out = Buffer::new_in(alloc);
+        out.done.reserve_exact(len);
+        out.owed.reserve_exact(len);
+        let ran = SVec::with_capacity_in(len, at_phase);
+        let mut run_out = RunOut::new(at_phase);
+        run_out.notes.reserve_exact(len);
+        let began = crate::engine_times::ns(clock.now().since_start());
+        ItemDone { at, out, ran, run_out, span: (began, began) }
+    }
+}
+
+/// Work carried across a stretch boundary by a stealing worker when either a stolen item belongs
+/// to a different member group or a multi-body item was interrupted mid-batch by `STRETCH_FULL`
+/// or an unwind.
+enum Pending<'a, 'b, 'f> {
+    Whole(usize),
+    Partial { item: ItemDone<'a, 'b, 'f>, offset: usize },
+}
+
+/// Per-worker results accumulated without locks across a multi-item Bodies phase, wrapped in
+/// [`CachePadded`] at its owner to eliminate false sharing across cores (rule 86).
+struct WorkerOut<'a, 'b, 'f> {
+    items: SVec<'b, ItemDone<'a, 'b, 'f>>,
+    tally: crate::engine_seeds::SeedTally,
+    setup: StretchSetup,
+    frames: FramesHeld,
+}
+
+impl<'a, 'b, 'f> WorkerOut<'a, 'b, 'f> {
+    fn new(at_phase: SharedAlloc<'b>) -> Self {
+        WorkerOut {
+            items: SVec::new_in(at_phase),
+            tally: crate::engine_seeds::SeedTally::default(),
+            setup: StretchSetup::default(),
+            frames: FramesHeld::default(),
+        }
+    }
+}
+
+/// Feeds bodies into [`run_stretch_with`]: either a fixed slice ([`run_bodies`], used by the
+/// single-item fast path and the `Ready` driver) or a dynamic LPT work-stealing worker that keeps
+/// its stretch alive across consecutive stolen items of the same member group.
+enum StretchDriver<'d, 'a, 'b, 'f> {
+    Fixed {
+        run: &'d [One<'f>],
+        at: usize,
+        out: &'d mut Buffer<'a>,
+        ran: &'d mut SVec<'b, Ran<'f>>,
+        run_out: &'d mut RunOut<'b>,
+    },
+    Stealing {
+        group: u32,
+        runs: &'d [&'d [One<'f>]],
+        dispatch: &'d [usize],
+        cursor: &'d CachePadded<AtomicUsize>,
+        current: Option<(ItemDone<'a, 'b, 'f>, usize)>,
+        worker_items: &'d mut SVec<'b, ItemDone<'a, 'b, 'f>>,
+        worker_setup: &'d mut StretchSetup,
+        pending: Option<Pending<'a, 'b, 'f>>,
+    },
+}
+
+impl<'d, 'a, 'b, 'f> StretchDriver<'d, 'a, 'b, 'f> {
+    fn group_id(&self) -> Option<u32> {
+        match self {
+            StretchDriver::Fixed { run, .. } => run.first().map(|one| one.group),
+            StretchDriver::Stealing { group, .. } => Some(*group),
+        }
+    }
+
+    fn refuse_current<R: ?Sized + CellDigests>(
+        &mut self,
+        why: &'static str,
+        scope: Option<(&Shared<'_, 'a, '_, '_, R>, &Group<'_, '_>)>,
+        clock: &Clock,
+        alloc: SharedAlloc<'a>,
+    ) -> usize {
+        match self {
+            StretchDriver::Fixed { run, at, out, ran, run_out } => {
+                let took = refuse::<R>(run, why, scope, out, ran, run_out, alloc);
+                *at = took;
+                took
+            }
+            StretchDriver::Stealing { runs, current, worker_items, .. } => {
+                if let Some((mut item, offset)) = current.take() {
+                    if let Some(rest) = runs.get(item.at).and_then(|r| r.get(offset..)) {
+                        let _ = refuse::<R>(rest, why, scope, &mut item.out, &mut item.ran, &mut item.run_out, alloc);
+                    }
+                    item.span.1 = crate::engine_times::ns(clock.now().since_start());
+                    worker_items.push(item);
+                }
+                0
+            }
+        }
+    }
+
+    fn record_setup(&mut self, setup: StretchSetup) {
+        match self {
+            StretchDriver::Fixed { run_out, .. } => run_out.setup.add(setup),
+            StretchDriver::Stealing { worker_setup, .. } => worker_setup.add(setup),
+        }
+    }
+
+    fn next_body<R: ?Sized + CellDigests>(
+        &mut self,
+        taken: usize,
+        frame_used: usize,
+        shared: &Shared<'_, 'a, '_, '_, R>,
+        clock: &Clock,
+        alloc: SharedAlloc<'a>,
+        at_phase: SharedAlloc<'b>,
+    ) -> Option<(&'d One<'f>, &mut Buffer<'a>, &mut SVec<'b, Ran<'f>>, &mut RunOut<'b>)> {
+        match self {
+            StretchDriver::Fixed { run, at, out, ran, run_out } => {
+                if *at >= run.len() {
+                    return None;
+                }
+                if taken > 0 && frame_used > STRETCH_FULL {
+                    return None;
+                }
+                // The workers' scheduling point (engine_status.rs): stopped, the stretch ends, and
+                // `run_bodies` refuses the rest.
+                if taken > 0 && shared.board.stopping().is_some() {
+                    return None;
+                }
+                let one = run.get(*at)?;
+                *at += 1;
+                Some((one, out, ran, run_out))
+            }
+            StretchDriver::Stealing { group, runs, dispatch, cursor, current, worker_items, pending, .. } => {
+                loop {
+                    let needs_next = match current.as_ref() {
+                        None => true,
+                        Some((item, offset)) => *offset >= runs.get(item.at).map_or(0, |r| r.len()),
+                    };
+                    if needs_next {
+                        if let Some((mut item, _)) = current.take() {
+                            item.span.1 = crate::engine_times::ns(clock.now().since_start());
+                            worker_items.push(item);
+                        }
+                        if taken > 0 && frame_used > STRETCH_FULL {
+                            return None;
+                        }
+                        if shared.board.stopping().is_some() {
+                            return None;
+                        }
+                        let slot = cursor.fetch_add(1, Ordering::Relaxed);
+                        let &next_at = dispatch.get(slot)?;
+                        let next_run = *runs.get(next_at)?;
+                        if next_run.first().map(|o| o.group) != Some(*group) {
+                            *pending = Some(Pending::Whole(next_at));
+                            return None;
+                        }
+                        *current = Some((ItemDone::new(next_at, next_run.len(), clock, alloc, at_phase), 0));
+                        continue;
+                    }
+                    if taken > 0 && frame_used > STRETCH_FULL {
+                        if let Some((item, offset)) = current.take() {
+                            *pending = Some(if offset == 0 { Pending::Whole(item.at) } else { Pending::Partial { item, offset } });
+                        }
+                        return None;
+                    }
+                    if shared.board.stopping().is_some() {
+                        if let Some((item, offset)) = current.take() {
+                            let rem = runs.get(item.at).map_or(0, |r| r.len().saturating_sub(offset));
+                            shared.board.refused(Stage::Bodies, u64::try_from(rem).unwrap_or(u64::MAX));
+                        }
+                        return None;
+                    }
+                    break;
+                }
+                let (item, offset) = current.as_mut()?;
+                let one = runs.get(item.at).copied().and_then(|r| r.get(*offset))?;
+                *offset += 1;
+                Some((one, &mut item.out, &mut item.ran, &mut item.run_out))
+            }
+        }
+    }
+
+    fn after_body(&mut self, stopped: bool, clock: &Clock) -> bool {
+        if !stopped {
+            return false;
+        }
+        if let StretchDriver::Stealing { runs, current, worker_items, pending, .. } = self
+            && let Some((mut item, offset)) = current.take()
+        {
+            let len = runs.get(item.at).map_or(0, |r| r.len());
+            if offset < len {
+                *pending = Some(Pending::Partial { item, offset });
+            } else {
+                item.span.1 = crate::engine_times::ns(clock.now().since_start());
+                worker_items.push(item);
+            }
+        }
+        true
+    }
+}
+
+/// Long-lived Bodies worker: reserves one [`BODY_SCRATCH`] frame for the phase, steals LPT items
+/// dynamically from `cursor`, and keeps its current member's [`BODIES_FRAME`] stretch alive across
+/// consecutive stolen items of the same member group (opening a fresh stretch only when the group
+/// changes, `frame.used() > STRETCH_FULL`, or an unwind poisons the stretch).
+#[expect(clippy::too_many_arguments, reason = "a stealing worker's edge: each argument one handle of it")]
+fn run_worker_stealing<'a, 'b, 'f, R: ?Sized + CellDigests>(
+    cx: &Cx,
+    shared: &Shared<'_, 'a, '_, '_, R>,
+    runs: &[&[One<'f>]],
+    dispatch: &[usize],
+    cursor: &CachePadded<AtomicUsize>,
+    clock: &Clock,
+    worker: &mut WorkerOut<'a, 'b, 'f>,
+    alloc: SharedAlloc<'a>,
+    at_phase: SharedAlloc<'b>,
+) {
+    #[cfg(test)]
+    crate::engine_check::stack_probe::at("run_bodies");
+    let Ok(mut scratch) = Frame::with_reserve(BODY_SCRATCH, bstd::mem::Tag::Diagnostics) else {
+        loop {
+            if shared.board.stopping().is_some() {
+                return;
+            }
+            let slot = cursor.fetch_add(1, Ordering::Relaxed);
+            let Some(&at) = dispatch.get(slot) else { return };
+            let Some(run) = runs.get(at).copied() else { continue };
+            let mut item = ItemDone::new(at, run.len(), clock, alloc, at_phase);
+            let _ = refuse::<R>(run, "the scratch frame of its run's bodies could not be reserved (engine_bodies.rs `BODY_SCRATCH`)", None, &mut item.out, &mut item.ran, &mut item.run_out, alloc);
+            item.span.1 = crate::engine_times::ns(clock.now().since_start());
+            worker.items.push(item);
+        }
+    };
+    let mut pending: Option<Pending<'a, 'b, 'f>> = None;
+    loop {
+        let next = match pending.take() {
+            Some(item) => {
+                if shared.board.stopping().is_some() {
+                    let rem = match item {
+                        Pending::Whole(at) => runs.get(at).map_or(0, |r| r.len()),
+                        Pending::Partial { item, offset } => runs.get(item.at).map_or(0, |r| r.len().saturating_sub(offset)),
+                    };
+                    if rem > 0 {
+                        shared.board.refused(Stage::Bodies, u64::try_from(rem).unwrap_or(u64::MAX));
+                    }
+                    break;
+                }
+                item
+            }
+            None => {
+                if shared.board.stopping().is_some() {
+                    break;
+                }
+                let slot = cursor.fetch_add(1, Ordering::Relaxed);
+                let Some(&at) = dispatch.get(slot) else { break };
+                Pending::Whole(at)
+            }
+        };
+        let (mut item, offset) = match next {
+            Pending::Whole(at) => {
+                let Some(run) = runs.get(at).copied() else { continue };
+                (ItemDone::new(at, run.len(), clock, alloc, at_phase), 0)
+            }
+            Pending::Partial { item, offset } => (item, offset),
+        };
+        let Some(run) = runs.get(item.at).copied() else { continue };
+        let Some(first) = run.first() else {
+            item.span.1 = crate::engine_times::ns(clock.now().since_start());
+            worker.items.push(item);
+            continue;
+        };
+        match Frame::with_reserve(BODIES_FRAME, bstd::mem::Tag::Infer) {
+            Ok(stretch) => {
+                let mut driver = StretchDriver::Stealing {
+                    group: first.group,
+                    runs,
+                    dispatch,
+                    cursor,
+                    current: Some((item, offset)),
+                    worker_items: &mut worker.items,
+                    worker_setup: &mut worker.setup,
+                    pending: None,
+                };
+                let _ = run_stretch_with(cx, shared, &mut driver, &stretch, &mut scratch, clock, &mut worker.tally, alloc, at_phase);
+                worker.frames.stretch_committed_most = worker.frames.stretch_committed_most.max(u64::try_from(stretch.committed()).unwrap_or(u64::MAX));
+                if let StretchDriver::Stealing { pending: carry, .. } = driver {
+                    pending = carry;
+                }
+            }
+            Err(_) => {
+                if let Some(rest) = run.get(offset..) {
+                    let _ = refuse::<R>(rest, "the frame of its run's stretch could not be reserved (engine_bodies.rs `BODIES_FRAME`)", None, &mut item.out, &mut item.ran, &mut item.run_out, alloc);
+                }
+                item.span.1 = crate::engine_times::ns(clock.now().since_start());
+                worker.items.push(item);
+            }
+        }
+    }
+    worker.frames.scratch_committed_most = worker.frames.scratch_committed_most.max(u64::try_from(scratch.committed()).unwrap_or(u64::MAX));
+}
+
 /// One run: its bodies checked in stretches, each over a frame of its own that ends with it
 /// ([`STRETCH_FULL`]), so no run uses up a frame however many bodies it holds.
 #[expect(clippy::too_many_arguments, reason = "a run's edge: each argument one handle of it")]
@@ -6166,7 +6550,8 @@ fn run_bodies<'a, 'b, 'f, R: ?Sized + CellDigests>(cx: &Cx, shared: &Shared<'_, 
         }
         let took = match Frame::with_reserve(BODIES_FRAME, bstd::mem::Tag::Infer) {
             Ok(stretch) => {
-                let took = run_stretch(cx, shared, rest, &stretch, &mut scratch, clock, out, ran, run_out, tally, alloc, at_phase);
+                let mut driver = StretchDriver::Fixed { run: rest, at: 0, out, ran, run_out };
+                let took = run_stretch_with(cx, shared, &mut driver, &stretch, &mut scratch, clock, tally, alloc, at_phase);
                 // Its records' pages go as the stretch ends, not the run (the frame's drop: what
                 // its thread's shelf has no room for goes back, blaze-mem frame.rs `give_span`).
                 run_out.frames.stretch_committed_most = run_out.frames.stretch_committed_most.max(stretch.committed() as u64);
@@ -6176,6 +6561,7 @@ fn run_bodies<'a, 'b, 'f, R: ?Sized + CellDigests>(cx: &Cx, shared: &Shared<'_, 
         };
         at += took.max(1);
     }
+    run_out.frames.scratch_committed_most = run_out.frames.scratch_committed_most.max(u64::try_from(scratch.committed()).unwrap_or(u64::MAX));
 }
 
 /// Every body of `rest` refused for one reason, each named (rule 3): how many it took (all).
@@ -6476,28 +6862,26 @@ impl<'n> HeadSeed<'n> for LazyBodySeed<'_, 'n, '_> {
     }
 }
 
-/// One stretch of a run: its member's records opened once into `frame`, each body checked over
-/// one view until the frame is past [`STRETCH_FULL`]. How many bodies it took (at least one).
+/// One stretch of bodies: its member's records opened once into `frame`, each body supplied by
+/// `driver` checked over one view until `driver` stops (group change, [`STRETCH_FULL`], stop
+/// signal, or unwind). Returns how many bodies it checked (or refused for a fixed slice).
 #[expect(clippy::too_many_arguments, reason = "a stretch's edge: each argument one handle of it")]
-fn run_stretch<'a, 'b, 'f, R: ?Sized + CellDigests>(
+fn run_stretch_with<'d, 'a, 'b, 'f, R: ?Sized + CellDigests>(
     cx: &Cx,
     shared: &Shared<'_, 'a, '_, '_, R>,
-    run: &[One<'f>],
+    driver: &mut StretchDriver<'d, 'a, 'b, 'f>,
     frame: &Frame,
     scratch: &mut Frame,
     clock: &Clock,
-    out: &mut Buffer<'a>,
-    ran: &mut SVec<'b, Ran<'f>>,
-    run_out: &mut RunOut<'b>,
     tally: &mut crate::engine_seeds::SeedTally,
     alloc: SharedAlloc<'a>,
     at_phase: SharedAlloc<'b>,
 ) -> usize {
     #[cfg(test)]
     crate::engine_check::stack_probe::at("run_stretch");
-    let Some(first) = run.first() else { return 0 };
-    let Some(group) = shared.groups.get(first.group as usize) else {
-        return refuse::<R>(run, "a body's member group is gone", None, out, ran, run_out, alloc);
+    let Some(group_id) = driver.group_id() else { return 0 };
+    let Some(group) = usize::try_from(group_id).ok().and_then(|idx| shared.groups.get(idx)) else {
+        return driver.refuse_current::<R>("a body's member group is gone", None, clock, alloc);
     };
     // The setup's marks (D168 (2) (e)): what the stretch does before its first body begins.
     let set_began = clock.now();
@@ -6522,7 +6906,7 @@ fn run_stretch<'a, 'b, 'f, R: ?Sized + CellDigests>(
     let scope = Some((shared, group));
     let env = match env_in(group.env, frame) {
         Ok(env) => env,
-        Err(error) => return refuse(run, leak(g, format_args!("its member's environment did not copy into the run: {error:?} (blaze-scope crate_env.rs `EnvLent::copy_in`)")), scope, out, ran, run_out, alloc),
+        Err(error) => return driver.refuse_current(leak(g, format_args!("its member's environment did not copy into the run: {error:?} (blaze-scope crate_env.rs `EnvLent::copy_in`)")), scope, clock, alloc),
     };
     // Its scope crates past the member opened by need, at their first question, through the
     // request's memo (`shared.by_need`, piece C (a)); the oracle arm's all opened at the setup.
@@ -6606,7 +6990,7 @@ fn run_stretch<'a, 'b, 'f, R: ?Sized + CellDigests>(
     let set_lang = clock.now();
     let mut owners = crate::engine_heads::Owners::new(shared.heads, group.crates.scope(shared.by_need), shared.listings, g);
     let set_done = clock.now();
-    run_out.setup.add(StretchSetup {
+    driver.record_setup(StretchSetup {
         stretches: 1,
         ns: ns_between(set_began, set_done),
         records_ns: ns_between(set_began, set_records),
@@ -6615,15 +6999,7 @@ fn run_stretch<'a, 'b, 'f, R: ?Sized + CellDigests>(
         owners_ns: ns_between(set_lang, set_done),
     });
     let mut taken = 0usize;
-    for one in run {
-        if taken > 0 && frame.used() > STRETCH_FULL {
-            break;
-        }
-        // The workers' scheduling point (engine_status.rs): stopped, the stretch ends, and
-        // `run_bodies` refuses the rest.
-        if taken > 0 && shared.board.stopping().is_some() {
-            break;
-        }
+    while let Some((one, out, ran, run_out)) = driver.next_body(taken, frame.used(), shared, clock, alloc, at_phase) {
         taken += 1;
         // The body's scratch starts empty (rule 11): the last body's findings and words were
         // copied out as it ended. Kept only under the plant (the answers must not change).
@@ -7357,7 +7733,7 @@ fn run_stretch<'a, 'b, 'f, R: ?Sized + CellDigests>(
         out.push(result.done, result.stands);
         shared.record_memory(one, &mem);
         running.end(shared.board.now(clock));
-        if stopped {
+        if driver.after_body(stopped, clock) {
             break;
         }
     }

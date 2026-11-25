@@ -1562,6 +1562,100 @@ pub(crate) fn save_changes<'m, D: Driver, S: Sharing>(
 }
 
 const SAVE_TASK_FRAME: usize = 64 << 10;
+/// Minimum changed/non-empty answer pages to fan out across workers (0..=3 run inline with zero
+/// thread-spawn overhead on 1-line incremental edits).
+const PAGE_PAR_MIN: usize = 4;
+/// Minimum dirty producer header shards to fan out across workers (0..=1 run inline with zero
+/// thread-spawn overhead on 1-line incremental edits).
+const HEADER_PAR_MIN: usize = 2;
+
+/// Runs independent encoding jobs in parallel when `jobs.len() >= min_par` and more than one
+/// worker is active, returning results in exact `jobs` index order (Rule 25). Below `min_par` or
+/// on 1 worker, runs inline with zero thread-spawn or atomic overhead.
+fn run_jobs_par<'a, J, R, F>(
+    cx: &Cx,
+    workers: core::num::NonZeroU32,
+    min_par: usize,
+    span: &'static str,
+    jobs: &[J],
+    alloc: SharedAlloc<'a>,
+    run: F,
+) -> Result<blaze_own::Vec<R, SharedAlloc<'a>>, CliError>
+where
+    J: Sync,
+    R: Send,
+    F: Fn(&J) -> R + Sync,
+{
+    let mut out = blaze_own::Vec::with_capacity_in(jobs.len(), alloc);
+    let active_workers = workers.get().min(cx.workers());
+    if jobs.len() < min_par || active_workers <= 1 {
+        for job in jobs {
+            out.push(run(job));
+        }
+        return Ok(out);
+    }
+    let n = jobs.len();
+    let worker_count = usize::try_from(active_workers).unwrap_or(1).min(n);
+    // Dynamic work stealing balances skewed page sizes (e.g. hot `READERS` pages) and skewed
+    // header shards (64 heavy `Signature` shards vs tiny `Units`/`Fetch` shards) across 18/128
+    // cores. Batching 8 pages at a time when `n >= worker_count * 16` amortizes atomic fetch_add.
+    let batch = if n >= worker_count.saturating_mul(16) { 8 } else { 1 };
+    let next = core::sync::atomic::AtomicUsize::new(0);
+    let next_ref = &next;
+    let run_ref = &run;
+    let scope = cx.scope();
+    scope.narrow_workers(workers, bstd::task::Class::Foreground);
+    let mut handles = blaze_own::Vec::with_capacity_in(worker_count, alloc);
+    for _ in 0..worker_count {
+        handles.push(scope.may_overlap(span, SAVE_TASK_FRAME, move |_cx: &Cx| -> Result<_, core::convert::Infallible> {
+            let mut local = blaze_own::Vec::new_in(alloc);
+            loop {
+                let start = next_ref.fetch_add(batch, core::sync::atomic::Ordering::Relaxed);
+                if start >= n {
+                    break;
+                }
+                let end = start.saturating_add(batch).min(n);
+                if let Some(slice) = jobs.get(start..end) {
+                    for (offset, job) in slice.iter().enumerate() {
+                        local.push((start + offset, run_ref(job)));
+                    }
+                }
+            }
+            Ok(local)
+        }));
+    }
+    let mut pool_err: Option<CliError> = None;
+    let mut slots: blaze_own::Vec<Option<R>, SharedAlloc<'a>> = blaze_own::Vec::with_capacity_in(n, alloc);
+    for _ in 0..n {
+        slots.push(None);
+    }
+    for handle in handles {
+        match handle.join(cx) {
+            Ok(part) => {
+                for (idx, item) in part {
+                    if let Some(slot) = slots.get_mut(idx) {
+                        *slot = Some(item);
+                    }
+                }
+            }
+            Err(error) => {
+                pool_err.get_or_insert(CliError::Pool(error));
+            }
+        }
+    }
+    if let Err(error) = scope.join(cx) {
+        pool_err.get_or_insert(CliError::Pool(error));
+    }
+    if let Some(error) = pool_err {
+        return Err(error);
+    }
+    for slot in slots {
+        if let Some(item) = slot {
+            out.push(item);
+        }
+    }
+    Ok(out)
+}
 
 #[inline(never)]
 #[expect(clippy::too_many_arguments, reason = "the write's inputs, each one handle")]
@@ -1612,43 +1706,14 @@ fn save<'m, D: Driver, S: Sharing>(
                         None
                     }
                 },
-                |jobs| {
-                let mut out = blaze_own::Vec::with_capacity_in(jobs.len(), alloc);
-                if jobs.len() <= 4 || workers.get() <= 1 {
-                    for job in jobs {
-                        out.push(job.run(alloc));
+                |jobs| match run_jobs_par(cx, workers, PAGE_PAR_MIN, "answer pages", jobs, alloc, |job| job.run(alloc)) {
+                    Ok(built) => built,
+                    Err(error) => {
+                        pool_err = Some(error);
+                        blaze_own::Vec::new_in(alloc)
                     }
-                    return out;
-                }
-                let chunk = jobs.len().div_ceil(usize::try_from(workers.get()).unwrap_or(1)).max(1);
-                let scope = cx.scope();
-                scope.narrow_workers(workers, bstd::task::Class::Foreground);
-                let mut handles = blaze_own::Vec::with_capacity_in(jobs.len().div_ceil(chunk), alloc);
-                for slice in jobs.chunks(chunk) {
-                    handles.push(scope.may_overlap("answer pages", SAVE_TASK_FRAME, move |_cx: &Cx| -> Result<_, core::convert::Infallible> {
-                        let mut part = blaze_own::Vec::with_capacity_in(slice.len(), alloc);
-                        for job in slice {
-                            part.push(job.run(alloc));
-                        }
-                        Ok(part)
-                    }));
-                }
-                for handle in handles {
-                    match handle.join(cx) {
-                        Ok(part) => out.extend(part),
-                        Err(error) => {
-                            pool_err.get_or_insert(CliError::Pool(error));
-                        }
-                    }
-                }
-                if let Err(error) = scope.join(cx) {
-                    pool_err.get_or_insert(CliError::Pool(error));
-                }
-                if pool_err.is_some() {
-                    out.clear();
-                }
-                out
-            });
+                },
+            );
             if let Some(error) = snap_err {
                 return Err(error);
             }
@@ -1657,7 +1722,22 @@ fn save<'m, D: Driver, S: Sharing>(
             }
             encoded.map_err(page_error)?
         }
-        None => pages::encode(kept, None, alloc),
+        None => {
+            let mut pool_err: Option<CliError> = None;
+            let encoded = pages::encode_par(kept, None, alloc, |jobs| {
+                match run_jobs_par(cx, workers, PAGE_PAR_MIN, "answer pages", jobs, alloc, |job| job.run(alloc)) {
+                    Ok(built) => built,
+                    Err(error) => {
+                        pool_err = Some(error);
+                        blaze_own::Vec::new_in(alloc)
+                    }
+                }
+            });
+            if let Some(error) = pool_err {
+                return Err(error);
+            }
+            encoded
+        }
     };
     // The encoder's puts are task pages first (`..task_puts`), then radix/directory sub-records,
     // then the top root last (durable order: children before parent).
@@ -1690,42 +1770,12 @@ fn save<'m, D: Driver, S: Sharing>(
     let (headers, writes) = Headers::after_with(last.map(|base| base.headers), kept, writer, kept.answer.serial, HeadersPlant::None, |index| match last {
         Some(base) => base.headers_at(index),
         None => Ok(None),
-    }, alloc, |jobs| {
-        let mut out = blaze_own::Vec::with_capacity_in(jobs.len(), alloc);
-        if jobs.len() <= 4 || workers.get() <= 1 {
-            for job in jobs {
-                out.push(job.run(alloc));
-            }
-            return out;
+    }, alloc, |jobs| match run_jobs_par(cx, workers, HEADER_PAR_MIN, "answer headers", jobs, alloc, |job| job.run(alloc)) {
+        Ok(built) => built,
+        Err(error) => {
+            header_pool_err = Some(error);
+            blaze_own::Vec::new_in(alloc)
         }
-        let chunk = jobs.len().div_ceil(usize::try_from(workers.get()).unwrap_or(1)).max(1);
-        let scope = cx.scope();
-        scope.narrow_workers(workers, bstd::task::Class::Foreground);
-        let mut handles = blaze_own::Vec::with_capacity_in(jobs.len().div_ceil(chunk), alloc);
-        for slice in jobs.chunks(chunk) {
-            handles.push(scope.may_overlap("answer headers", SAVE_TASK_FRAME, move |_cx: &Cx| -> Result<_, core::convert::Infallible> {
-                let mut part = blaze_own::Vec::with_capacity_in(slice.len(), alloc);
-                for job in slice {
-                    part.push(job.run(alloc));
-                }
-                Ok(part)
-            }));
-        }
-        for handle in handles {
-            match handle.join(cx) {
-                Ok(part) => out.extend(part),
-                Err(error) => {
-                    header_pool_err.get_or_insert(CliError::Pool(error));
-                }
-            }
-        }
-        if let Err(error) = scope.join(cx) {
-            header_pool_err.get_or_insert(CliError::Pool(error));
-        }
-        if header_pool_err.is_some() {
-            out.clear();
-        }
-        out
     }).map_err(page_error)?;
     if let Some(error) = header_pool_err {
         return Err(error);
@@ -1860,7 +1910,7 @@ fn save<'m, D: Driver, S: Sharing>(
     // Refresh the toolchain-only fallback base (`tool-base.<PINNED>.<TRIPLE>.<tools>`) whenever
     // this build holds non-failed closed toolchain rows, so any fresh project or git worktree
     // automatically reuses pre-warmed `core`/`alloc`/`std`/`bstd`.
-    keep_toolchain_base(cx, store, lent, toolchain, tools, kept, alloc, frame)?;
+    keep_toolchain_base(cx, store, lent, toolchain, tools, kept, workers, alloc, frame)?;
     store.pin(name, &[key])?;
     // Reset `<name>.journal` to `[key]` (reusing the exact same 32-byte root record as `name`)
     // so subsequent runs do not probe older segments for a stale checkpoint of an earlier answer.
@@ -2103,6 +2153,7 @@ fn keep_toolchain_base<'m, D: Driver, S: Sharing>(
     toolchain: blaze_toolchain::ToolchainId,
     tools: &Tools,
     kept: &Kept<'_>,
+    workers: core::num::NonZeroU32,
     alloc: SharedAlloc<'_>,
     frame: &Frame,
 ) -> Result<(), CliError> {
@@ -2228,11 +2279,35 @@ fn keep_toolchain_base<'m, D: Driver, S: Sharing>(
             tc_kept.answer.readers.entry(id).or_insert_with(|| blaze_own::BTreeSet::new_in(alloc)).insert(name);
         }
     }
-    let encoded = pages::encode(&tc_kept, None, alloc);
+    let mut tc_page_err: Option<CliError> = None;
+    let encoded = pages::encode_par(&tc_kept, None, alloc, |jobs| {
+        match run_jobs_par(cx, workers, PAGE_PAR_MIN, "toolchain base pages", jobs, alloc, |job| job.run(alloc)) {
+            Ok(built) => built,
+            Err(error) => {
+                tc_page_err = Some(error);
+                blaze_own::Vec::new_in(alloc)
+            }
+        }
+    });
+    if let Some(error) = tc_page_err {
+        return Err(error);
+    }
     for (key, bytes) in encoded.puts.iter() {
         store.put(cx, *key, bytes)?;
     }
-    let (headers, writes) = Headers::after(None, &tc_kept, Writer::Phases, tc_kept.answer.serial, HeadersPlant::None, |_| Ok(None), alloc).map_err(page_error)?;
+    let mut tc_hdr_err: Option<CliError> = None;
+    let (headers, writes) = Headers::after_with(None, &tc_kept, Writer::Phases, tc_kept.answer.serial, HeadersPlant::None, |_| Ok(None), alloc, |jobs| {
+        match run_jobs_par(cx, workers, HEADER_PAR_MIN, "toolchain base headers", jobs, alloc, |job| job.run(alloc)) {
+            Ok(built) => built,
+            Err(error) => {
+                tc_hdr_err = Some(error);
+                blaze_own::Vec::new_in(alloc)
+            }
+        }
+    }).map_err(page_error)?;
+    if let Some(error) = tc_hdr_err {
+        return Err(error);
+    }
     for (key, bytes) in &writes {
         store.put(cx, *key, bytes)?;
     }

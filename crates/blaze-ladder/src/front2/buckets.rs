@@ -578,11 +578,15 @@ enum PathSelf {
 /// With it, whether the impl is a BLANKET trait impl: its self type as written is one name that
 /// is one of its own generic parameters (`impl<T> Tr<..> for T`), read from the same tokens
 /// ([`Homes::blanket`] says which questions such an impl can answer).
+fn default_alloc() -> blaze_own::Alloc<'static> {
+    blaze_own::Alloc::global()
+}
+
 fn written_trait<'n, S: NamesSource<'n>>(names: S, at: &super::index::ImplAt<'n>) -> (Option<&'n str>, bool) {
     // A crate with no edition (over records: no items record, filed by the source) reads as a
     // header that does not read.
     let Some(edition) = names.edition_of(at.krate) else { return (None, false) };
-    let Ok(h) = blaze_file_items::impl_header(at.header, edition, blaze_own::Alloc::global()) else { return (None, false) };
+    let Ok(h) = blaze_file_items::impl_header(at.header, edition, default_alloc()) else { return (None, false) };
     let blanket = h.trait_.is_some() && h.params.iter().any(|p| *p == h.self_ty);
     (h.trait_, blanket)
 }
@@ -1265,8 +1269,9 @@ fn negative_fits(filed: Option<Shape>, asked: Shape) -> bool {
     }
 }
 
-fn push<K: core::hash::Hash + Eq, V>(m: &mut HashMap<K, Vec<V, Global>, Global>, k: K, v: V) {
-    m.entry(k).or_insert_with(|| Vec::new_in(Global)).push(v);
+fn push<K: core::hash::Hash + Eq, V>(m: &mut HashMap<K, blaze_own::Vec<V, blaze_own::Alloc<'static>>, blaze_own::Alloc<'static>>, k: K, v: V) {
+    let alloc = *m.allocator();
+    m.entry(k).or_insert_with(|| blaze_own::Vec::new_in(alloc)).push(v);
 }
 
 /// The impls filed by their headers as written, and the answers made so far.
@@ -1295,13 +1300,14 @@ fn push<K: core::hash::Hash + Eq, V>(m: &mut HashMap<K, Vec<V, Global>, Global>,
 /// (between rounds, `&mut Buckets`) reaches the index through [`Buckets::index_get_mut`], which
 /// takes no runtime borrow. No `unsafe`.
 pub struct Buckets {
+    alloc: blaze_own::Alloc<'static>,
     /// Each trait question's answer, by the trait, the shape and whose impls it may hold
     /// ([`Seen`]).
-    answers: Rows<(ItemKey, Shape, Seen), Vec<ItemKey, Global>>,
+    answers: Rows<(ItemKey, Shape, Seen), blaze_own::Vec<ItemKey, blaze_own::Alloc<'static>>, blaze_own::Alloc<'static>>,
     /// Per answered trait question, the least-keyed candidate whose header failed: the
     /// question's gap. Only a question that HAS such a candidate is a gap of the body asking it,
     /// so a body's outcome never depends on which other bodies or rounds lowered what first.
-    answer_failed: Rows<(ItemKey, Shape, Seen), LibKey>,
+    answer_failed: Rows<(ItemKey, Shape, Seen), LibKey, blaze_own::Alloc<'static>>,
     /// Trait questions whose answer read a provisional impl header during constant evaluation
     /// (`Store::provisional_impls`): cleared once the waited-on constant finishes so the final
     /// `ImplHead` is lowered and cached.
@@ -1312,10 +1318,10 @@ pub struct Buckets {
     /// A test's removed cause ([`Buckets::plant_whole_program_sight`]): every question sees
     /// every crate's impls, as before answers were keyed by what they see.
     whole_program_sight: bool,
-    inherent: Rows<(Shape, Name), Vec<AssocItem, Global>>,
+    inherent: Rows<(Shape, Name), blaze_own::Vec<AssocItem, blaze_own::Alloc<'static>>, blaze_own::Alloc<'static>>,
     /// The answered inherent questions (a shape and a name), each with its least-keyed failed
     /// candidate, if any: only an impl that declares a member of the name is a candidate.
-    inherent_done: Rows<(Shape, Name), Option<LibKey>>,
+    inherent_done: Rows<(Shape, Name), Option<LibKey>, blaze_own::Alloc<'static>>,
     index: RefCell<BucketIndex>,
 }
 
@@ -1332,61 +1338,62 @@ pub(super) struct CrateState {
 /// What [`Buckets`] files impls in and counts: every field but the answers, mutated through
 /// one `RefCell` ([`Buckets`]'s docs).
 pub struct BucketIndex {
-    by_shape: HashMap<(ItemKey, Shape), Vec<LibKey, Global>, Global>,
-    any: HashMap<ItemKey, Vec<LibKey, Global>, Global>,
+    alloc: blaze_own::Alloc<'static>,
+    by_shape: HashMap<(ItemKey, Shape), blaze_own::Vec<LibKey, blaze_own::Alloc<'static>>, blaze_own::Alloc<'static>>,
+    any: HashMap<ItemKey, blaze_own::Vec<LibKey, blaze_own::Alloc<'static>>, blaze_own::Alloc<'static>>,
     /// Every unread impl ([`Buckets::is_unread`]).
-    unread: HashSet<LibKey, Global>,
+    unread: HashSet<LibKey, blaze_own::Alloc<'static>>,
     /// Trait impls whose trait path failed, by their self type's shape where it was read
     /// (then also under `AnyInt`/`AnyFloat`), else in `unread_any`: candidates of trait
     /// questions at that shape only, never of inherent ones.
-    unread_by_shape: HashMap<Shape, Vec<LibKey, Global>, Global>,
-    unread_any: Vec<LibKey, Global>,
+    unread_by_shape: HashMap<Shape, blaze_own::Vec<LibKey, blaze_own::Alloc<'static>>, blaze_own::Alloc<'static>>,
+    unread_any: blaze_own::Vec<LibKey, blaze_own::Alloc<'static>>,
     /// Impls not read far enough to tell trait from inherent (no text, not lowered, generics
     /// refused): candidates of every question.
-    unread_blind: Vec<LibKey, Global>,
-    inherent_by_shape: HashMap<Shape, Vec<LibKey, Global>, Global>,
+    unread_blind: blaze_own::Vec<LibKey, blaze_own::Alloc<'static>>,
+    inherent_by_shape: HashMap<Shape, blaze_own::Vec<LibKey, blaze_own::Alloc<'static>>, blaze_own::Alloc<'static>>,
     /// Inherent impls whose self type's shape was not read ([`Buckets::is_unsure`]).
-    inherent_any: HashSet<LibKey, Global>,
+    inherent_any: HashSet<LibKey, blaze_own::Alloc<'static>>,
     /// How many impl headers the questions made the store lower.
     pub lowered: u32,
     /// Impls on a self type the checker has no type for (blaze's `i80`), filed nowhere.
     pub no_checker_type: u32,
     /// The unread candidates whose header failed, with why (sorted by key): left out of the
     /// answers; a gap of each body that asks a question they are candidates of.
-    pub failed: Vec<(LibKey, Box<str>), Global>,
+    pub failed: blaze_own::Vec<(LibKey, Box<str>), blaze_own::Alloc<'static>>,
     /// Why each unread impl's trait path was not filed (in filing order).
-    pub unread_why: Vec<(LibKey, Unread), Global>,
+    pub unread_why: blaze_own::Vec<(LibKey, Unread), blaze_own::Alloc<'static>>,
     /// The negative impls, by trait ([`Filed::Negative`]), each with its self type's shape
     /// (`None`: any), in filing order: no trait question's candidates.
-    negative: HashMap<ItemKey, Vec<(LibKey, Option<Shape>), Global>, Global>,
+    negative: HashMap<ItemKey, blaze_own::Vec<(LibKey, Option<Shape>), blaze_own::Alloc<'static>>, blaze_own::Alloc<'static>>,
     /// Each impl's crate, by key: known without reading its header.
-    krates: HashMap<LibKey, usize, Global>,
+    krates: HashMap<LibKey, usize, blaze_own::Alloc<'static>>,
     /// The home each answered trait question was narrowed to ([`trait_home`]).
-    homes: HashMap<(ItemKey, Shape), Homes, Global>,
+    homes: HashMap<(ItemKey, Shape), Homes, blaze_own::Alloc<'static>>,
     /// The trait impls whose trait path is written with no generic arguments.
-    bare: HashSet<LibKey, Global>,
+    bare: HashSet<LibKey, blaze_own::Alloc<'static>>,
     /// Per crate: whether its root turns on `rustc_attrs` ([`Home::Incoherent`]) and whether
     /// it is a linked (non-proc-macro or root) unit.
-    crate_state: Vec<CrateState, Global>,
+    crate_state: blaze_own::Vec<CrateState, blaze_own::Alloc<'static>>,
     /// The trait impls filed by their header's text ([`file_by_text`]) because the lowered
     /// header did not name their trait: each is a defect of the lowering or of the block's
     /// module to remove at its home, counted here so it is seen. A set: [`Buckets::answer`]
     /// asks it of each candidate (it was a vector searched by halves that, over
     /// [`Buckets::lazy`], was never sorted across crates, so a search could miss a member).
-    pub by_text: HashSet<LibKey, Global>,
+    pub by_text: HashSet<LibKey, blaze_own::Alloc<'static>>,
     /// The blanket trait impls (`impl<T> Tr<..> for T`, by their header's tokens:
     /// [`written_trait`]), read or unread: each is judged by [`Homes::blanket`], so an
     /// unread one is a candidate only of questions about a trait of its own crate.
-    blanket: HashSet<LibKey, Global>,
+    blanket: HashSet<LibKey, blaze_own::Alloc<'static>>,
     /// The impls whose self path was read to no constructor that the coherence rules bound
     /// to their crate's local types ([`PathSelf`]), each with its crate: filed at every
     /// shape, but a candidate only of a question whose [`Homes::local`] may be that crate's,
     /// so a refused one is no gap of a question at a primitive, a parameter or a type of
     /// another crate.
-    bounded: HashMap<LibKey, usize, Global>,
+    bounded: HashMap<LibKey, usize, blaze_own::Alloc<'static>>,
     /// Over [`Buckets::lazy`]: per crate, whether its impls were filed ([`Buckets::admit`]).
     /// Empty over [`Buckets::new`], which files every crate's.
-    lazy_filed: Vec<bool, Global>,
+    lazy_filed: blaze_own::Vec<bool, blaze_own::Alloc<'static>>,
     /// Over [`Buckets::lazy`]: how many impls [`Buckets::admit`] filed from their rows of the
     /// items record, no text opened ([`file_row`]).
     pub filed_from_rows: u32,
@@ -1414,14 +1421,16 @@ pub struct BucketIndex {
 impl Buckets {
     /// No impl filed, no crate known, no question answered.
     fn of(index: BucketIndex) -> Buckets {
+        let alloc = index.alloc;
         Buckets {
-            answers: Rows::new_in(Global),
-            answer_failed: Rows::new_in(Global),
+            alloc,
+            answers: Rows::new_in(alloc),
+            answer_failed: Rows::new_in(alloc),
             provisional_answers: OnceCell::new(),
             sights: OnceCell::new(),
             whole_program_sight: false,
-            inherent: Rows::new_in(Global),
-            inherent_done: Rows::new_in(Global),
+            inherent: Rows::new_in(alloc),
+            inherent_done: Rows::new_in(alloc),
             index: RefCell::new(index),
         }
     }
@@ -1442,15 +1451,25 @@ impl Buckets {
     /// both paths call: check.rs `make_once` on the first impl fill, and `check_rounds_as`
     /// before round 0 of a seeded body.
     pub fn for_source<'n, S: NamesSource<'n>>(names: S, index: &Index<'_>) -> Buckets {
+        Self::for_source_in(names, index, default_alloc())
+    }
+
+    /// As [`Buckets::for_source`], backing the bucket tables and answers in `alloc`.
+    pub fn for_source_in<'n, S: NamesSource<'n>>(names: S, index: &Index<'_>, alloc: blaze_own::Alloc<'static>) -> Buckets {
         match names.solved() {
-            Some(solved) => Buckets::new(solved, index),
-            None => Buckets::lazy(names),
+            Some(solved) => Buckets::new_in(solved, index, alloc),
+            None => Buckets::lazy_in(names, alloc),
         }
     }
 
     /// Files every impl of `index` by its header as written.
     pub fn new(names: &Names<'_>, index: &Index<'_>) -> Buckets {
-        let mut b = BucketIndex::empty();
+        Self::new_in(names, index, default_alloc())
+    }
+
+    /// As [`Buckets::new`], backing the bucket tables and answers in `alloc`.
+    pub fn new_in(names: &Names<'_>, index: &Index<'_>, alloc: blaze_own::Alloc<'static>) -> Buckets {
+        let mut b = BucketIndex::empty_in(alloc);
         b.krates.extend(index.impls.iter().map(|at| (at.key, at.krate)));
         // `#![feature(rustc_attrs)]` is an inner attribute of the crate root, the first file
         // read; a mention anywhere in that text keeps the crate on the wide side.
@@ -1462,7 +1481,7 @@ impl Buckets {
         // Each refused derive's gap (D193 point 5), as the items record writes it: the solve's
         // values give the same rows (blaze-scope `each_refused_impl_row`, the one home).
         for (krate, c) in names.crates().iter().enumerate() {
-            let mut gaps: Vec<ImplRow<'_>, Global> = Vec::new_in(Global);
+            let mut gaps: blaze_own::Vec<ImplRow<'_>, blaze_own::Alloc<'static>> = blaze_own::Vec::new_in(alloc);
             blaze_scope::items_record::each_refused_impl_row(c, &mut |row| gaps.push(row));
             if gaps.is_empty() {
                 continue;
@@ -1479,7 +1498,12 @@ impl Buckets {
     /// [`Buckets::admit`] files the impls of the crates the question's home admits, from the
     /// source's impl rows ([`NamesSource::each_impl`]); a crate is filed once.
     pub fn lazy<'n, S: NamesSource<'n>>(names: S) -> Buckets {
-        let mut b = BucketIndex::empty();
+        Self::lazy_in(names, default_alloc())
+    }
+
+    /// As [`Buckets::lazy`], backing the bucket tables and answers in `alloc`.
+    pub fn lazy_in<'n, S: NamesSource<'n>>(names: S, alloc: blaze_own::Alloc<'static>) -> Buckets {
+        let mut b = BucketIndex::empty_in(alloc);
         let crates = names.crate_count();
         // Unknown until asked ([`Buckets::admit`]): the wide side, as `admits` reads a crate
         // with no row.
@@ -1555,15 +1579,15 @@ impl Buckets {
         self.index().is_lazy()
     }
 
-    pub fn trait_candidates(&self, trait_: ItemKey, shape: Shape, home: Homes) -> Vec<LibKey, Global> {
+    pub fn trait_candidates(&self, trait_: ItemKey, shape: Shape, home: Homes) -> blaze_own::Vec<LibKey, blaze_own::Alloc<'static>> {
         self.index().trait_candidates(trait_, shape, home)
     }
 
-    pub fn negative_of(&self, trait_: ItemKey, shape: Shape, home: Homes) -> Vec<LibKey, Global> {
+    pub fn negative_of(&self, trait_: ItemKey, shape: Shape, home: Homes) -> blaze_own::Vec<LibKey, blaze_own::Alloc<'static>> {
         self.index().negative_of(trait_, shape, home)
     }
 
-    pub fn inherent_candidates(&self, shape: Shape, home: Homes) -> Vec<LibKey, Global> {
+    pub fn inherent_candidates(&self, shape: Shape, home: Homes) -> blaze_own::Vec<LibKey, blaze_own::Alloc<'static>> {
         self.index().inherent_candidates(shape, home)
     }
 
@@ -1620,8 +1644,8 @@ impl Buckets {
     }
 
     /// The unread impls filed at no shape ([`BucketIndex::shapeless_unread`]), in filing order.
-    pub(crate) fn shapeless_unread(&self) -> Vec<LibKey, Global> {
-        let mut out = Vec::new_in(Global);
+    pub(crate) fn shapeless_unread(&self) -> blaze_own::Vec<LibKey, blaze_own::Alloc<'static>> {
+        let mut out = blaze_own::Vec::new_in(self.alloc);
         out.extend(self.index().shapeless_unread());
         out
     }
@@ -1668,37 +1692,38 @@ impl Buckets {
 }
 
 impl BucketIndex {
-    /// No impl filed, no crate known.
-    fn empty() -> BucketIndex {
+    /// No impl filed, no crate known, backed by `alloc`.
+    fn empty_in(alloc: blaze_own::Alloc<'static>) -> BucketIndex {
         BucketIndex {
-            by_shape: HashMap::new_in(Global),
-            any: HashMap::new_in(Global),
-            unread: HashSet::new_in(Global),
-            unread_by_shape: HashMap::new_in(Global),
-            unread_any: Vec::new_in(Global),
-            unread_blind: Vec::new_in(Global),
-            inherent_by_shape: HashMap::new_in(Global),
-            inherent_any: HashSet::new_in(Global),
+            alloc,
+            by_shape: HashMap::new_in(alloc),
+            any: HashMap::new_in(alloc),
+            unread: HashSet::new_in(alloc),
+            unread_by_shape: HashMap::new_in(alloc),
+            unread_any: blaze_own::Vec::new_in(alloc),
+            unread_blind: blaze_own::Vec::new_in(alloc),
+            inherent_by_shape: HashMap::new_in(alloc),
+            inherent_any: HashSet::new_in(alloc),
             lowered: 0,
             no_checker_type: 0,
-            failed: Vec::new_in(Global),
-            unread_why: Vec::new_in(Global),
-            negative: HashMap::new_in(Global),
-            krates: HashMap::new_in(Global),
-            homes: HashMap::new_in(Global),
-            bare: HashSet::new_in(Global),
-            crate_state: Vec::new_in(Global),
-            by_text: HashSet::new_in(Global),
-            blanket: HashSet::new_in(Global),
-            bounded: HashMap::new_in(Global),
-            lazy_filed: Vec::new_in(Global),
+            failed: blaze_own::Vec::new_in(alloc),
+            unread_why: blaze_own::Vec::new_in(alloc),
+            negative: HashMap::new_in(alloc),
+            krates: HashMap::new_in(alloc),
+            homes: HashMap::new_in(alloc),
+            bare: HashSet::new_in(alloc),
+            crate_state: blaze_own::Vec::new_in(alloc),
+            by_text: HashSet::new_in(alloc),
+            blanket: HashSet::new_in(alloc),
+            bounded: HashMap::new_in(alloc),
+            lazy_filed: blaze_own::Vec::new_in(alloc),
             filed_from_rows: 0,
             filed_from_text: 0,
             row_misses: [0; 6],
             no_rows: false,
             table_reads: None,
             tables_cache: None,
-            indexed: asked::Indexed::new(),
+            indexed: asked::Indexed::new(alloc),
             alias_shapes: None,
         }
     }
@@ -1773,7 +1798,7 @@ impl BucketIndex {
             if !self.crate_linked(names, krate) {
                 continue;
             }
-            let mut rows: Vec<ImplRow<'n>, Global> = Vec::new_in(Global);
+            let mut rows: blaze_own::Vec<ImplRow<'n>, blaze_own::Alloc<'static>> = blaze_own::Vec::new_in(self.alloc);
             if !self.no_rows && names.each_impl_row(krate, &mut |row| rows.push(row)) {
                 let mut aliases = self.alias_shapes.take();
                 let counts = file_rows_with_aliases(names, krate, &rows, aliases.as_mut(), &mut |f| self.take(names, krate, f));
@@ -1781,7 +1806,7 @@ impl BucketIndex {
                 self.count(counts);
             } else {
                 // Every impl of a source with no impl rows is read from its header's text.
-                let mut impls: Vec<super::index::ImplAt<'n>, Global> = Vec::new_in(Global);
+                let mut impls: blaze_own::Vec<super::index::ImplAt<'n>, blaze_own::Alloc<'static>> = blaze_own::Vec::new_in(self.alloc);
                 names.each_impl(krate, &mut |at| impls.push(at));
                 // By key: the order impls are filed in is a function of the records.
                 impls.sort_by_key(|at| at.key);
@@ -1901,8 +1926,8 @@ impl BucketIndex {
     }
 
     /// The candidates for `trait_` at `shape`, each once.
-    pub fn trait_candidates(&self, trait_: ItemKey, shape: Shape, home: Homes) -> Vec<LibKey, Global> {
-        let mut out = Vec::new_in(Global);
+    pub fn trait_candidates(&self, trait_: ItemKey, shape: Shape, home: Homes) -> blaze_own::Vec<LibKey, blaze_own::Alloc<'static>> {
+        let mut out = blaze_own::Vec::new_in(self.alloc);
         out.extend_from_slice(self.by_shape.get(&(trait_, shape)).map_or(&[], |v| v.as_slice()));
         out.extend_from_slice(self.any.get(&trait_).map_or(&[], |v| v.as_slice()));
         out.extend_from_slice(self.unread_by_shape.get(&shape).map_or(&[], |v| v.as_slice()));
@@ -1918,7 +1943,7 @@ impl BucketIndex {
     /// impl is judged by `home.bare`, any other by `home.all`). A blanket impl is judged by
     /// `home.blanket` first: its trait's crate alone, the narrowest of the three. A bounded
     /// impl ([`Buckets::bounded`]) is also judged by `home.local`.
-    fn keep_home(&self, out: &mut Vec<LibKey, Global>, home: Homes) {
+    fn keep_home(&self, out: &mut blaze_own::Vec<LibKey, blaze_own::Alloc<'static>>, home: Homes) {
         if home == Homes::ANY {
             return;
         }
@@ -1981,8 +2006,8 @@ impl BucketIndex {
     /// for `{integer}`). Over the impl tables a question reads only its shape's buckets, so
     /// the trait's other negatives are filed only by other questions; read whole, the answer
     /// depended on what was asked before (rule 21; tests/front2_buckets_order.rs found it).
-    pub fn negative_of(&self, trait_: ItemKey, shape: Shape, home: Homes) -> Vec<LibKey, Global> {
-        let mut out = Vec::new_in(Global);
+    pub fn negative_of(&self, trait_: ItemKey, shape: Shape, home: Homes) -> blaze_own::Vec<LibKey, blaze_own::Alloc<'static>> {
+        let mut out = blaze_own::Vec::new_in(self.alloc);
         let filed = self.negative.get(&trait_).map_or(&[][..], |v| v.as_slice());
         out.extend(filed.iter().filter(|(_, at)| negative_fits(*at, shape)).map(|(k, _)| *k));
         self.keep_home(&mut out, home);
@@ -1991,8 +2016,8 @@ impl BucketIndex {
     }
 
     /// The candidates for an inherent fn of `shape`, each once.
-    pub fn inherent_candidates(&self, shape: Shape, home: Homes) -> Vec<LibKey, Global> {
-        let mut out = Vec::new_in(Global);
+    pub fn inherent_candidates(&self, shape: Shape, home: Homes) -> blaze_own::Vec<LibKey, blaze_own::Alloc<'static>> {
+        let mut out = blaze_own::Vec::new_in(self.alloc);
         out.extend_from_slice(self.inherent_by_shape.get(&shape).map_or(&[], |v| v.as_slice()));
         out.extend(self.inherent_any.iter().copied());
         // A trait impl (its trait written in its header's text, though unread, refused or
@@ -2082,7 +2107,7 @@ impl Buckets {
             return Ok(());
         }
         let view = store.tys.view();
-        let mut got = Vec::new_in(Global);
+        let mut got = blaze_own::Vec::new_in(self.alloc);
         // Candidates come sorted, so the first failed one is the least key.
         let mut first_failed = None;
         let mut used_provisional = false;
@@ -2194,7 +2219,7 @@ impl Buckets {
         }
         let view = store.tys.view();
         let mut first_failed = None;
-        let mut got = Vec::new_in(Global);
+        let mut got = blaze_own::Vec::new_in(self.alloc);
         for &k in candidates {
             if self.has_failed(k) {
                 first_failed = first_failed.or(Some(k));

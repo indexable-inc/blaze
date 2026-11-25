@@ -79,7 +79,7 @@
 
 use core::convert::Infallible;
 use core::num::NonZeroU32;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use blaze_drive::cells::Cell;
 use blaze_drive::{Input, Key, Kind, Locate, Name};
@@ -95,12 +95,13 @@ use blaze_ladder::front2::tables::recorder::{Recorder, RecorderOpts};
 use blaze_ladder::front2::tables::task::cell_id;
 use blaze_ladder::front2::tables::view::{Tables, TablesOpts};
 use blaze_own::{Alloc, SharedAlloc, Vec};
-use blaze_scope::items_record::ItemsRecord;
+use blaze_scope::items_record::{ImplRow, ItemsRecord, SelfHead};
 use blaze_scope::resolve::At;
 use blaze_surface::ItemIndex;
 use blaze_world::crate_list::CrateGraph;
 use bstd::cx::Cx;
 use bstd::mem::Frame;
+use bstd::sync::CachePadded;
 use bstd::task::Class;
 use std::alloc::Global;
 
@@ -777,31 +778,42 @@ impl HeadsStage {
         let lazy_before = lazy.counts();
         let scope_records = HeadsScopeRecords::new(cache, lazy, CrateGraph::len(&list), heap);
         let scope_records = &scope_records;
-        // 2. The tables, at once, on the workers.
+        // 2. The tables, largest-first (LPT) on the workers; restored to task order below.
         let procs = names.stage().names.as_ref().and_then(|names| names.procs());
         let root = handles.root;
         let fs = &handles.env.fs;
         let outlined = handles.outlined;
         let clock = handles.clock;
+        let max_workers = handles.workers;
         let mut worked: std::vec::Vec<(Result<Result<Worked, &'static str>, work::Panicked>, u64), Global> = std::vec::Vec::with_capacity_in(jobs.len(), Global);
         if !jobs.is_empty() {
+            let mut job_dispatch: Vec<usize, Alloc<'static>> = Vec::with_capacity_in(jobs.len(), g);
+            job_dispatch.extend(0..jobs.len());
+            job_dispatch.sort_unstable_by_key(|&at| {
+                let weight = jobs.get(at).map_or(0, |job| impl_job_weight(job, g));
+                (core::cmp::Reverse(weight), at)
+            });
             let scope = cx.scope();
             scope.narrow_workers(handles.workers, Class::Foreground);
-            let mut running = std::vec::Vec::with_capacity_in(jobs.len(), Global);
-            for job in jobs.iter() {
-                let clock = clock.clone();
-                running.push(scope.may_overlap("engine impl tables", HEADS_FRAME, move |cx: &Cx| {
-                    let began = clock.now();
-                    let made = work::unwinding(|| tables_of(cx, root, fs, outlined, packs, corrected, procs, job, scope_records, subjects, at_cells, heap, listings, snapshot));
-                    Ok::<_, Infallible>((made, clock.now().since(began).map_or(0, crate::engine_times::ns), crate::engine_times::ns(began.since_start())))
-                }));
+            let mut running = Vec::with_capacity_in(jobs.len(), g);
+            for at in job_dispatch.into_iter() {
+                let Some(job) = jobs.get(at) else { continue };
+                running.push((
+                    at,
+                    scope.may_overlap("engine impl tables", HEADS_FRAME, move |cx: &Cx| {
+                        let began = clock.now();
+                        let made = work::unwinding(|| tables_of(cx, root, fs, outlined, packs, corrected, procs, job, scope_records, subjects, at_cells, heap, listings, snapshot, max_workers));
+                        Ok::<_, Infallible>((made, clock.now().since(began).map_or(0, crate::engine_times::ns), crate::engine_times::ns(began.since_start())))
+                    }),
+                ));
             }
+            let mut worked_paired: Vec<(usize, (Result<Result<Worked, &'static str>, work::Panicked>, u64)), Alloc<'static>> = Vec::with_capacity_in(jobs.len(), g);
             let mut stopped = None;
-            for handle in running.into_iter() {
+            for (at, handle) in running.into_iter() {
                 match handle.join(&cx) {
                     Ok((made, ns, start)) => {
                         times.job(crate::engine_times::Step::HeadsTables, start, start.saturating_add(ns));
-                        worked.push((made, ns));
+                        worked_paired.push((at, (made, ns)));
                     }
                     Err(error) => {
                         stopped.get_or_insert(error);
@@ -813,6 +825,9 @@ impl HeadsStage {
             if let Some(error) = stopped {
                 return Err(CliError::Pool(error));
             }
+            // Rule 25: restore exact original `jobs` order before merging rows and shelf tables.
+            worked_paired.sort_unstable_by_key(|(at, _)| *at);
+            worked.extend(worked_paired.into_iter().map(|(_, res)| res));
         }
         // 3. Each result as the engine's row, its tables on the shelf, in task order.
         // Build a lazy Name -> first Done index map so `one.heads` lookups are O(1) instead of
@@ -959,9 +974,74 @@ pub(crate) fn complete(cx: &Cx, store: &mut dyn crate::store::Store<'_>, names: 
     Ok(read_back)
 }
 
-/// Minimum number of impl rows in a single crate before [`tables_of`] splits filing across
-/// workers in parallel chunks (`file_impl_rows_chunk` + `finish_impl_tables`).
-const IMPL_TABLE_SPLIT_MIN: usize = 256;
+/// Minimum weighted impl rows and row count before [`tables_of`] splits filing across workers
+/// via dynamic work stealing (`file_impl_rows_chunk` + `finish_impl_tables`). Slow `from_text`
+/// candidates (`header_unread`, `trait_unread`, or `SelfHead::Other`) carry [`IMPL_SLOW_WEIGHT`]
+/// and are placed in tiny [`IMPL_SLOW_CHUNK`] chunks at the front of the queue so dense macro or
+/// unparsed headers fan out across all idle cores without creating a static straggler tail.
+const IMPL_TABLE_SPLIT_MIN_WEIGHT: usize = 64;
+const IMPL_TABLE_SPLIT_MIN_ROWS: usize = 16;
+const IMPL_SLOW_WEIGHT: usize = 8;
+const IMPL_SLOW_CHUNK: usize = 8;
+const IMPL_FAST_CHUNK: usize = 32;
+
+/// Predicted impl-row cost for LPT dispatch of `ImplBucket` jobs (O(1) header read).
+fn impl_job_weight(job: &Job<'_>, g: Alloc<'static>) -> usize {
+    ItemsRecord::open(job.own_crate.records.items, g)
+        .map_or(job.own_crate.records.items.len(), |record| record.impls())
+}
+
+/// Whether an impl row is likely to take the slow `from_text` header-lowering path.
+fn is_slow_impl_row(row: &ImplRow<'_>) -> bool {
+    row.header_unread || row.trait_unread || matches!(row.head, SelfHead::Other)
+}
+
+type StolenImplChunks = (
+    Vec<blaze_ladder::front2::buckets::ImplChunk<SharedAlloc<'static>>, SharedAlloc<'static>>,
+    Vec<CellId, SharedAlloc<'static>>,
+    Vec<CellId, SharedAlloc<'static>>,
+);
+
+/// Shared work-stealing loop executed by both the parent worker (reusing its already-opened
+/// scope) and each helper worker (opening its scope once, lazily after stealing a first chunk).
+#[expect(clippy::too_many_arguments, reason = "shared worker loop for parent and helper impl table chunks")]
+fn steal_impl_chunks<'n>(
+    first_slot: usize,
+    opened: &crate::run_names::Opened<'n>,
+    crates: crate::run_names::ScopeCrates<'n, 'n>,
+    ordered_rows: &[ImplRow<'n>],
+    chunk_ranges: &[(usize, usize)],
+    cursor: &CachePadded<AtomicUsize>,
+    subjects: &'n Subjects,
+    at_cells: bool,
+    listings: &'n Listings,
+    frame: &'n Frame,
+    g: Alloc<'static>,
+    shared: SharedAlloc<'static>,
+) -> Result<StolenImplChunks, TableReadRefused> {
+    let rec = opened.records;
+    let recorder = Recorder::new(RecorderOpts { alloc: g });
+    let view = Tables::new(TablesOpts { records: rec, impls: None, lang_crates: &[], reads: &recorder });
+    let mut local_chunks: Vec<blaze_ladder::front2::buckets::ImplChunk<SharedAlloc<'static>>, SharedAlloc<'static>> = Vec::new_in(shared);
+    let mut slot = first_slot;
+    while let Some(&(start, end)) = chunk_ranges.get(slot) {
+        if let Some(slice) = ordered_rows.get(start..end) {
+            let chunk = file_impl_rows_chunk(view, 0, slice, shared)
+                .map_err(|_| TableReadRefused("its impl tables were not written (front2 buckets/records.rs `file_impl_rows_chunk`: a row its writer refuses)"))?;
+            if let Some((_, why)) = opened.load.refused() {
+                return Err(TableReadRefused(why));
+            }
+            local_chunks.push(chunk);
+        }
+        slot = cursor.fetch_add(1, Ordering::Relaxed);
+    }
+    let recorded = recorder.finish().map_err(|_| TableReadRefused("its impl tables read more names cells than the recorder holds (front2 tables/recorder.rs)"))?;
+    let (local_reads, local_heads) = place_table_reads(rec, crates, subjects, at_cells, listings, &recorded, frame, g, shared)?;
+    if let Some((_, why)) = opened.load.refused() {
+        return Err(TableReadRefused(why));
+    }
+    Ok((local_chunks, local_reads, local_heads))
+}
 
 /// Typed refusal returned by [`place_table_reads`].
 struct TableReadRefused(&'static str);
@@ -1029,8 +1109,10 @@ where
 }
 
 /// One crate's tables on a worker: its scope's records opened in the task's frame, its rows filed.
-/// Large crates (`rows.len() >= IMPL_TABLE_SPLIT_MIN`) split filing across workers on `cx.scope()`.
-/// The member subjects place source reads. At cell grain, each header's head read is placed too.
+/// Large or header-heavy crates split filing across workers via dynamic LPT work stealing on
+/// `cx.scope()`, with the parent worker reusing its already-opened scope and each helper opening
+/// its scope at most once (lazily after stealing a chunk). The member subjects place source reads.
+/// At cell grain, each header's head read is placed too.
 #[expect(clippy::too_many_arguments, reason = "a worker's edge: each argument one handle of it")]
 fn tables_of(
     cx: &Cx,
@@ -1047,6 +1129,7 @@ fn tables_of(
     heap: &'static blaze_own::Heap,
     listings: &Listings,
     snapshot: &crate::store::StoreSnapshot,
+    max_workers: NonZeroU32,
 ) -> Result<Worked, &'static str> {
     let frame = cx.frame();
     let g = heap.alloc();
@@ -1063,50 +1146,100 @@ fn tables_of(
         }
         return Err("its crate's records hold no impl rows (front2 source.rs `each_impl_row`)");
     }
-    let workers = usize::try_from(cx.workers()).unwrap_or(1);
-    let (out, defines_v, reads_v, heads_v, tables) = if rows.len() >= IMPL_TABLE_SPLIT_MIN && workers > 1 {
+    let workers = usize::try_from(cx.workers().min(max_workers.get())).unwrap_or(1);
+    let total_weight: usize = rows.iter().map(|row| if is_slow_impl_row(row) { IMPL_SLOW_WEIGHT } else { 1 }).sum();
+    let (out, defines_v, reads_v, heads_v, tables) = if workers > 1 && rows.len() >= IMPL_TABLE_SPLIT_MIN_ROWS && total_weight >= IMPL_TABLE_SPLIT_MIN_WEIGHT {
         let crate_key = NamesSource::crate_key(records, 0).ok_or("its crate has no key in its own records (front2 source.rs `crate_key`)")?;
         if impl_tables_name(crate_key) != job.task.planned.name {
             return Err("its tables' crate key is not its task's (front2 buckets/records.rs `impl_tables_name`)");
         }
         let shared = heap.shared();
-        let parts = (rows.len() / IMPL_TABLE_SPLIT_MIN).clamp(2, workers);
-        let step = rows.len().div_ceil(parts);
-        let mut chunks: Vec<blaze_ladder::front2::buckets::ImplChunk<SharedAlloc<'static>>, Alloc<'static>> = Vec::with_capacity_in(parts, g);
+        // Partition slow `from_text` candidates into small chunks at the front of the queue (LPT),
+        // followed by fast rows in their original `(trait_path, module, key)` order so `RowNames`
+        // keeps resolving consecutive equal `(trait_path, module)` runs once per chunk.
+        let mut ordered_rows: Vec<ImplRow<'_>, Alloc<'static>> = Vec::with_capacity_in(rows.len(), g);
+        let mut chunk_ranges: Vec<(usize, usize), Alloc<'static>> = Vec::new_in(g);
+        for row in rows.iter() {
+            if is_slow_impl_row(row) {
+                ordered_rows.push(*row);
+            }
+        }
+        let slow_end = ordered_rows.len();
+        let mut at = 0usize;
+        while at < slow_end {
+            let end = at.saturating_add(IMPL_SLOW_CHUNK).min(slow_end);
+            chunk_ranges.push((at, end));
+            at = end;
+        }
+        for row in rows.iter() {
+            if !is_slow_impl_row(row) {
+                ordered_rows.push(*row);
+            }
+        }
+        let fast_end = ordered_rows.len();
+        at = slow_end;
+        while at < fast_end {
+            let end = at.saturating_add(IMPL_FAST_CHUNK).min(fast_end);
+            chunk_ranges.push((at, end));
+            at = end;
+        }
+        let ordered_slice = ordered_rows.as_slice();
+        let ranges_slice = chunk_ranges.as_slice();
+        let cursor = CachePadded::new(AtomicUsize::new(0));
+        let cursor_ref = &cursor;
+        let helper_count = workers.saturating_sub(1).min(ranges_slice.len().saturating_sub(1));
+        let mut chunks: Vec<blaze_ladder::front2::buckets::ImplChunk<SharedAlloc<'static>>, Alloc<'static>> = Vec::with_capacity_in(ranges_slice.len(), g);
         let mut reads_v: Vec<CellId, Alloc<'static>> = Vec::new_in(g);
         let mut heads_v: Vec<CellId, Alloc<'static>> = Vec::new_in(g);
         let mut chunk_err: Option<&'static str> = None;
         {
             let scope = cx.scope();
-            let mut running = Vec::with_capacity_in(parts, g);
-            for slice in rows.chunks(step) {
-                running.push(scope.may_overlap("engine impl tables chunk", HEADS_FRAME, move |cx: &Cx| {
+            scope.narrow_workers(max_workers, Class::Foreground);
+            let mut running = Vec::with_capacity_in(helper_count, g);
+            for _ in 0..helper_count {
+                running.push(scope.may_overlap("engine impl tables worker", HEADS_FRAME, move |cx: &Cx| {
+                    let first = cursor_ref.fetch_add(1, Ordering::Relaxed);
+                    if first >= ranges_slice.len() {
+                        return Ok::<Result<Option<StolenImplChunks>, &'static str>, Infallible>(Ok(None));
+                    }
                     let g = heap.alloc();
                     let chunk_frame = cx.frame();
                     let chunk_crates = job.scope_crates(scope_records);
-                    let opened_chunk = open_scope_by_need(cx, root, fs, outlined, chunk_crates, packs, corrected, procs, chunk_frame, g, snapshot).map_err(OpenScopeRefused::message)?;
-                    let rec = opened_chunk.records;
-                    let recorder = Recorder::new(RecorderOpts { alloc: g });
-                    let view = Tables::new(TablesOpts { records: rec, impls: None, lang_crates: &[], reads: &recorder });
-                    let chunk = file_impl_rows_chunk(view, 0, slice, shared)
-                        .map_err(|_| "its impl tables were not written (front2 buckets/records.rs `file_impl_rows_chunk`: a row its writer refuses)")?;
-                    if let Some((_, why)) = opened_chunk.load.refused() {
-                        return Err(why);
-                    }
-                    let recorded = recorder.finish().map_err(|_| "its impl tables read more names cells than the recorder holds (front2 tables/recorder.rs)")?;
-                    let (chunk_reads, chunk_heads) = place_table_reads(rec, chunk_crates, subjects, at_cells, listings, &recorded, chunk_frame, g, shared).map_err(|e| e.0)?;
-                    if let Some((_, why)) = opened_chunk.load.refused() {
-                        return Err(why);
-                    }
-                    Ok::<_, &'static str>((chunk, chunk_reads, chunk_heads))
+                    let opened_chunk = match open_scope_by_need(cx, root, fs, outlined, chunk_crates, packs, corrected, procs, chunk_frame, g, snapshot) {
+                        Ok(opened_chunk) => opened_chunk,
+                        Err(err) => return Ok(Err(err.message())),
+                    };
+                    let res = steal_impl_chunks(first, &opened_chunk, chunk_crates, ordered_slice, ranges_slice, cursor_ref, subjects, at_cells, listings, chunk_frame, g, shared)
+                        .map(Some)
+                        .map_err(|e| e.0);
+                    Ok(res)
                 }));
+            }
+            // Parent worker participates in the same stealing queue reusing its already-opened
+            // `opened` scope (zero redundant `open_scope_by_need`, zero idle parent core).
+            let parent_first = cursor_ref.fetch_add(1, Ordering::Relaxed);
+            if parent_first < ranges_slice.len() {
+                match steal_impl_chunks(parent_first, &opened, scope_crates, ordered_slice, ranges_slice, cursor_ref, subjects, at_cells, listings, frame, g, shared) {
+                    Ok((local_chunks, local_reads, local_heads)) => {
+                        chunks.extend(local_chunks.into_iter());
+                        reads_v.extend_from_slice(&local_reads);
+                        heads_v.extend_from_slice(&local_heads);
+                    }
+                    Err(why) => {
+                        chunk_err.get_or_insert(why.0);
+                    }
+                }
             }
             for handle in running.into_iter() {
                 match handle.join(cx) {
-                    Ok((chunk, chunk_reads, chunk_heads)) => {
-                        chunks.push(chunk);
-                        reads_v.extend_from_slice(&chunk_reads);
-                        heads_v.extend_from_slice(&chunk_heads);
+                    Ok(Ok(Some((local_chunks, local_reads, local_heads)))) => {
+                        chunks.extend(local_chunks.into_iter());
+                        reads_v.extend_from_slice(&local_reads);
+                        heads_v.extend_from_slice(&local_heads);
+                    }
+                    Ok(Ok(None)) => {}
+                    Ok(Err(why)) => {
+                        chunk_err.get_or_insert(why);
                     }
                     Err(error) => {
                         let _ = error;
@@ -3424,28 +3557,42 @@ impl HeadsStage {
         let mut most_splits = 0usize;
         let mut split_files = 0usize;
         {
+            let max_workers = handles.workers;
             let scope = cx.scope();
             scope.narrow_workers(handles.workers, Class::Foreground);
-            let mut running_closed = Vec::with_capacity_in(closed_jobs.len(), g);
-            for (_, job) in closed_jobs.iter() {
-                running_closed.push(scope.may_overlap("engine impl tables (closed dep)", HEADS_FRAME, move |cx: &Cx| {
-                    let began = clock.now();
-                    let made = if board.stopping().is_some() {
-                        Ok(Err(NOT_BEGUN))
-                    } else {
-                        work::unwinding(|| tables_of(cx, root, fs, outlined, packs, corrected, procs, job, scope_records, &[], at_cells, heap, listings, snapshot))
-                    };
-                    Ok::<_, Infallible>((made, clock.now().since(began).map_or(0, crate::engine_times::ns), crate::engine_times::ns(began.since_start())))
-                }));
-            }
+            // Spawn `crate_setup` first so `HeadsSplit` is never queued behind small dep
+            // `ImplBucket` tasks, then immediately spawn `closed_jobs` in LPT (largest-first)
+            // order so heavy dep crates (`core`, `std`, `regex-automata`, ...) overlap with
+            // `HeadsSetup` and `HeadsSplit` from t=0 without sitting at the tail.
             let mut running = Vec::with_capacity_in(jobs.len(), g);
             for job in jobs.iter() {
-                let clock = clock.clone();
                 running.push(scope.may_overlap("engine heads: a crate's setup", HEADS_FRAME, move |cx: &Cx| {
                     let began = clock.now();
                     let made = work::unwinding(|| crate_setup(cx, root, fs, outlined, packs, corrected, procs, job, scope_records, subjects, view, heap, listings, snapshot));
                     Ok::<_, Infallible>((made, clock.now().since(began).map_or(0, crate::engine_times::ns), crate::engine_times::ns(began.since_start())))
                 }));
+            }
+            let mut closed_dispatch: Vec<usize, Alloc<'static>> = Vec::with_capacity_in(closed_jobs.len(), g);
+            closed_dispatch.extend(0..closed_jobs.len());
+            closed_dispatch.sort_unstable_by_key(|&at| {
+                let weight = closed_jobs.get(at).map_or(0, |(_, job)| impl_job_weight(job, g));
+                (core::cmp::Reverse(weight), at)
+            });
+            let mut running_closed = Vec::with_capacity_in(closed_jobs.len(), g);
+            for at in closed_dispatch.into_iter() {
+                let Some((_, job)) = closed_jobs.get(at) else { continue };
+                running_closed.push((
+                    at,
+                    scope.may_overlap("engine impl tables (closed dep)", HEADS_FRAME, move |cx: &Cx| {
+                        let began = clock.now();
+                        let made = if board.stopping().is_some() {
+                            Ok(Err(NOT_BEGUN))
+                        } else {
+                            work::unwinding(|| tables_of(cx, root, fs, outlined, packs, corrected, procs, job, scope_records, &[], at_cells, heap, listings, snapshot, max_workers))
+                        };
+                        Ok::<_, Infallible>((made, clock.now().since(began).map_or(0, crate::engine_times::ns), crate::engine_times::ns(began.since_start())))
+                    }),
+                ));
             }
             let mut stopped = None;
             for handle in running.into_iter() {
@@ -3518,13 +3665,12 @@ impl HeadsStage {
                 // Only a crate whose setup was made has splits (above).
                 let Some(Ok(Ok(setup))) = setups_ref.get(split.job as usize).map(|(s, _)| s) else { continue };
                 let Some(tasks) = job.tasks.get(split.from as usize..split.to as usize) else { continue };
-                let clock = clock.clone();
                 let at = u32::try_from(at).unwrap_or(u32::MAX);
                 running_splits.push((
                     at,
                     scope.may_overlap("engine heads", HEADS_FRAME, move |cx: &Cx| {
                         let began = clock.now();
-                        let on_board = OnBoard { board, clock: &clock, shows };
+                        let on_board = OnBoard { board, clock, shows };
                         let made = work::unwinding(|| heads_of(cx, root, fs, outlined, packs, corrected, procs, job, scope_records, setup, tasks, subjects, view, expansion_reads, heap, once, listings, head_jobs.listings, on_board, snapshot));
                         Ok::<_, Infallible>((made, clock.now().since(began).map_or(0, crate::engine_times::ns), crate::engine_times::ns(began.since_start())))
                     }),
@@ -3541,11 +3687,12 @@ impl HeadsStage {
                     }
                 }
             }
-            for handle in running_closed.into_iter() {
+            let mut closed_paired: Vec<(usize, ClosedWorked), Alloc<'static>> = Vec::with_capacity_in(closed_jobs.len(), g);
+            for (at, handle) in running_closed.into_iter() {
                 match handle.join(cx) {
                     Ok((made, ns, start)) => {
                         times.job(crate::engine_times::Step::HeadsTables, start, start.saturating_add(ns));
-                        closed_worked.push(ClosedWorked { made, ns });
+                        closed_paired.push((at, ClosedWorked { made, ns }));
                     }
                     Err(error) => {
                         stopped.get_or_insert(error);
@@ -3557,6 +3704,9 @@ impl HeadsStage {
             if let Some(error) = stopped {
                 return Err(CliError::Pool(error));
             }
+            // Rule 25: restore exact original `closed_jobs` order before merging rows and shelf tables.
+            closed_paired.sort_unstable_by_key(|(at, _)| *at);
+            closed_worked.extend(closed_paired.into_iter().map(|(_, worked)| worked));
         }
         let worked = in_split_order(arrived, splits.len(), head_jobs.merge, heap.shared()).map_err(|error| CliError::Text { what: crate::engine_head_notes::leak(g, format_args!("{error}")) })?;
         // 3. Each unit's results gathered by task (units in prefix order, a unit's splits in task
