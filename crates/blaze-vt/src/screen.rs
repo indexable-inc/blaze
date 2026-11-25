@@ -984,7 +984,8 @@ impl<'a, P: Planted<VtPlant>> Screen<'a, P> {
         if old.style_id() != style {
             self.styles.release(old.style_id(), 1);
             self.styles.add(style, 1);
-        } else if self.plant.has(VtPlant::StyleFreedWhileNamed) {
+        } else if self.plant.has(VtPlant::StyleFreedWhileNamed) && self.styles.refs(style) > 1 {
+            // An undercount, never a free on its own: a later release frees it while named.
             self.styles.release(style, 1);
         }
         let mut new = Cell::new(c, style, wide);
