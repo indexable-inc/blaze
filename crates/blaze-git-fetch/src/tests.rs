@@ -1120,6 +1120,55 @@ fn v1_pack_index_parses_searches_and_reads_objects() {
         Err((_, StoreWhy::Id { .. }))
     ));
 
+    // Unsorted OID table with a recomputed valid SHA-1 trailer is rejected by verify_ordering.
+    {
+        let mut unsorted = idx.clone();
+        // Swap the two 24-byte v1 entries while keeping the fanout counts unchanged.
+        let mut e0 = [0u8; 24];
+        let mut e1 = [0u8; 24];
+        e0.copy_from_slice(&unsorted[1024..1048]);
+        e1.copy_from_slice(&unsorted[1048..1072]);
+        unsorted[1024..1048].copy_from_slice(&e1);
+        unsorted[1048..1072].copy_from_slice(&e0);
+        let body_len = unsorted.len() - 20;
+        let sha = crate::sha1::sha1(&unsorted[..body_len]);
+        unsorted[body_len..].copy_from_slice(&sha);
+        assert!(matches!(
+            ObjectDb::new(&[(&unsorted, pack.len() as u64)], PACK, heap()),
+            Err((_, StoreWhy::IdxFanout { .. }))
+        ));
+    }
+
+    // Valid v2 .idx with unsorted OIDs in the same bucket (and recomputed valid SHA-1 trailer)
+    // is rejected by verify_ordering.
+    {
+        let mut id_hi = [0x42u8; 20];
+        let mut id_lo = [0x42u8; 20];
+        id_hi[19] = 0x02;
+        id_lo[19] = 0x01;
+        let mut v2 = StdVec::new();
+        v2.extend_from_slice(&[0xff, b't', b'O', b'c']);
+        v2.extend_from_slice(&2u32.to_be_bytes());
+        for b in 0..=255u8 {
+            let c: u32 = if b < 0x42 { 0 } else { 2 };
+            v2.extend_from_slice(&c.to_be_bytes());
+        }
+        // Out of order inside bucket 0x42: id_hi before id_lo.
+        v2.extend_from_slice(&id_hi);
+        v2.extend_from_slice(&id_lo);
+        // 2 CRC32s + 2 offsets (12 and 24).
+        v2.extend_from_slice(&[0u8; 8]);
+        v2.extend_from_slice(&12u32.to_be_bytes());
+        v2.extend_from_slice(&24u32.to_be_bytes());
+        v2.extend_from_slice(&pack_sha);
+        let sha = crate::sha1::sha1(&v2);
+        v2.extend_from_slice(&sha);
+        assert!(matches!(
+            ObjectDb::new(&[(&v2, pack.len() as u64)], PACK, heap()),
+            Err((_, StoreWhy::IdxFanout { byte: 0x42 }))
+        ));
+    }
+
     // Non-v1 garbage of >= 1064 bytes with monotonic zeros (0 objects) + trailing extra bytes is rejected as IdxMagic.
     let mut bad = vec![0u8; 1065];
     bad[0] = 0;

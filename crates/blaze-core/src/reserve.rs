@@ -32,6 +32,13 @@ use crate::{Done, Effect, FileName, IoError, MappingWrite, Tag};
 /// What a reservation's scratch name adds to its key's: `<key>.part-<tag>`.
 pub const PART: &str = ".part-";
 
+/// Parses the tag from a reservation scratch name `<key>.part-<tag>`, returning `None` for any
+/// non-scratch name.
+pub fn part_tag(name: &str) -> Option<u64> {
+    let (_, suffix) = name.rsplit_once(PART)?;
+    suffix.parse::<u64>().ok()
+}
+
 /// One reservation's protocol. The caller submits each [`Effect`] it hands back and gives the
 /// completion to [`Reserve::answer`].
 #[derive(Debug)]

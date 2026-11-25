@@ -145,6 +145,34 @@ impl<'i> Idx<'i> {
         Ok(())
     }
 
+    /// Verifies that every OID lies in the fanout bucket matching its first byte and that the OID
+    /// table is strictly ascending (no unsorted or duplicate entries), guaranteeing binary search
+    /// in [`Idx::search`] is sound.
+    pub fn verify_ordering(&self) -> Result<(), (u64, StoreWhy)> {
+        let fanout = if self.version == 1 { 0 } else { FANOUT };
+        for byte in 0..256usize {
+            let low = if byte == 0 { 0 } else { be32(self.bytes, fanout + (byte - 1) * 4) };
+            let high = be32(self.bytes, fanout + byte * 4);
+            let expected = u8::try_from(byte).unwrap_or(u8::MAX);
+            let mut prev: Option<&[u8]> = None;
+            for at in low..high {
+                let id = self.id(at);
+                if id.first() != Some(&expected) {
+                    let off = u64::try_from(fanout + byte * 4).unwrap_or(u64::MAX);
+                    return Err((off, StoreWhy::IdxFanout { byte: expected }));
+                }
+                if let Some(last) = prev
+                    && id <= last
+                {
+                    let off = u64::try_from(fanout + byte * 4).unwrap_or(u64::MAX);
+                    return Err((off, StoreWhy::IdxFanout { byte: expected }));
+                }
+                prev = Some(id);
+            }
+        }
+        Ok(())
+    }
+
     /// The `at`-th id in sorted order.
     pub fn id(&self, at: u32) -> &'i [u8] {
         if self.version == 1 {
@@ -455,6 +483,7 @@ impl<'i, A: Allocator + Copy> ObjectDb<'i, A> {
             }
             let idx = Idx::parse(idx_bytes, limits.most_objects)?;
             idx.verify_checksum()?;
+            idx.verify_ordering()?;
             parsed.push(PackTable { idx, pack_end: pack_len - 20, sorted_offsets: None });
         }
         Ok(ObjectDb { packs: parsed, limits, resolved_objects: 0, resolved_bytes: 0, alloc })

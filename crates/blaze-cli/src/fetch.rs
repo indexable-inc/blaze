@@ -60,14 +60,21 @@ pub const SOURCES: &str = ".blaze/v2/sources";
 
 /// The sources store ([`SOURCES`] beneath the home main.rs read, rule 75), through the effect
 /// layer's second tree (`Fs::home`). No home is a typed stop, never a folder chosen instead.
+/// Sweeps any stale `.part-<tag>` reservation scratch files left behind by crashed processes
+/// (preserving scratch files whose encoded PID is still alive).
 pub(crate) fn sources_dir(cx: &Cx, env: &FetchEnv<'_>) -> Result<Dir<ReadWrite>, CliError> {
     let Some(home) = env.home else {
         return Err(CliError::Text { what: "HOME is not set: the sources store (fetch.rs `SOURCES`) is beneath it" });
     };
-    env.fs.home(cx, home, &Path::new(SOURCES)?).map_err(|error| match error.why {
+    let dir = env.fs.home(cx, home, &Path::new(SOURCES)?).map_err(|error| match error.why {
         bstd::fs::HomeWhy::Fs(error) => CliError::Fs(error),
         _ => CliError::Text { what: "HOME could not be opened for the sources store (fetch.rs `SOURCES`): not absolute, with `.` or `..`, or no second tree" },
-    })
+    })?;
+    dir.sweep_parts(cx, |_name, tag| {
+        let pid = u32::try_from(tag >> 32).unwrap_or(0);
+        pid == 0 || crate::gc::PidProbe::probe(&crate::gc::OsPidProbe, pid) == crate::gc::PidState::Dead
+    })?;
+    Ok(dir)
 }
 
 /// The sources store's folder as the machine names it, `<home>/.blaze/v2/sources`, in `frame`:

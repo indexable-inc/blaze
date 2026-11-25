@@ -3,11 +3,11 @@
 
 use blaze_core::{
     Done, Effect, FileName, Tag,
-    reserve::{Next, Reserve, ReserveError, Why},
+    reserve::{Next, Reserve, ReserveError, Why, part_tag},
 };
 use blaze_own::Share as _;
 
-use super::{Dir, FsError, FsKind, FsOp, ReadWrite, answered_error, call, driver_error};
+use super::{Dir, DirName, Durable, EntryKind, FsError, FsKind, FsOp, Meta, ReadWrite, answered_error, call, driver_error, stat};
 use crate::{cx::Cx, path::Path};
 
 fn retag(effect: Effect, tag: Tag) -> Effect {
@@ -106,7 +106,8 @@ impl Dir<ReadWrite> {
                         }
                         Err(user_err) => {
                             if let Some(cleanup) = reserve.abandon(Some(mapping)) {
-                                let _ = submit(cleanup);
+                                let done = submit(cleanup)?;
+                                reserve.answer(done).map_err(|err| reserve_error(&key, err))?;
                             }
                             return Ok(Err(user_err));
                         }
@@ -139,6 +140,51 @@ impl Dir<ReadWrite> {
                 }
             }
         }
+    }
+
+    /// Sweeps abandoned reservation scratch files (`<key>.part-<tag>`) directly inside this
+    /// directory whenever `should_remove(name, tag)` returns `true`. Ignores `NotFound` when the
+    /// directory does not exist yet or a scratch file disappears concurrently, and propagates all
+    /// other filesystem errors.
+    pub fn sweep_parts(
+        &self,
+        cx: &Cx,
+        mut should_remove: impl FnMut(&str, u64) -> bool,
+    ) -> Result<u32, FsError> {
+        if let DirName::Named(ref base) = self.base {
+            match stat(&self.io, cx, FsOp::Entries, base)? {
+                None => return Ok(0),
+                Some(Meta { dir: false, .. }) => return Err(FsError::new(FsOp::Entries, base, FsKind::NotADirectory)),
+                Some(_) => {}
+            }
+        }
+        let entries = match self.own_entries(cx) {
+            Ok(entries) => entries,
+            Err(err) if err.kind == FsKind::NotFound => return Ok(0),
+            Err(err) => return Err(err),
+        };
+        let mut removed = 0u32;
+        for i in 0..entries.len() {
+            if entries.kind(i) != EntryKind::File {
+                continue;
+            }
+            let name = entries.name(i);
+            let Some(tag) = part_tag(name) else {
+                continue;
+            };
+            if !should_remove(name, tag) {
+                continue;
+            }
+            let Ok(path) = entries.path(i) else {
+                continue;
+            };
+            match self.remove(cx, &path, Durable::No) {
+                Ok(()) => removed = removed.saturating_add(1),
+                Err(err) if err.kind == FsKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(removed)
     }
 }
 
@@ -259,6 +305,45 @@ mod tests {
         let mut got = None;
         let _ = blaze_core::run_until_idle(sim, &mut effects, |completion, _| got = Some(completion.done));
         got.expect("sim completes one effect")
+    }
+
+    fn list_sim_dir(sim: &mut blaze_core::sim::Sim, dir: &FileName) -> Vec<FileName> {
+        for _ in 0..64 {
+            let done = ask_sim(sim, Effect::List { dir: dir.share().into(), tag: Tag(0xffff_fffd) }, Plant::None);
+            match done {
+                Done::Listed(entries) => return entries.into_iter().map(|(n, _)| n).collect(),
+                Done::Failed(_) => continue,
+                _ => continue,
+            }
+        }
+        Vec::new()
+    }
+
+    fn sweep_sim_parts(sim: &mut blaze_core::sim::Sim, dir: &FileName) -> Result<(), String> {
+        for entry in list_sim_dir(sim, dir) {
+            if part_tag(entry.as_str()).is_some() {
+                let mut removed = false;
+                for _ in 0..64 {
+                    match ask_sim(sim, Effect::Remove { file: entry.share(), tag: Tag(0xffff_fffc) }, Plant::None) {
+                        Done::Removed => {
+                            removed = true;
+                            break;
+                        }
+                        Done::Failed(_) => continue,
+                        _ => continue,
+                    }
+                }
+                if !removed {
+                    return Err(format!("could not sweep orphan {}", entry.as_str()));
+                }
+            }
+        }
+        for entry in list_sim_dir(sim, dir) {
+            if part_tag(entry.as_str()).is_some() {
+                return Err(format!("orphan scratch file remained after sweep: {}", entry.as_str()));
+            }
+        }
+        Ok(())
     }
 
     fn read_sim_target(sim: &mut blaze_core::sim::Sim, key: &FileName) -> Option<Vec<u8>> {
@@ -402,6 +487,8 @@ mod tests {
                     if plan.fail_syncs {
                         sim.fail_syncs(dir_name.share());
                     }
+                    // Verify recovery sweep reclaims every orphan `.part-` file without touching `key`.
+                    sweep_sim_parts(&mut sim, &dir_name)?;
                     let got = read_sim_target(&mut sim, &key);
                     if !allowed.contains(&got) {
                         return Err(format!(
@@ -447,8 +534,26 @@ mod tests {
         if !matches!(res, Ok(Ok(()))) {
             return Err(format!("reserve failed: {res:?}"));
         }
+        // Plant a simulated crashed orphan `.part-` file beside `k` and verify `sweep_parts` reclaims
+        // it after crash without disturbing `k`.
+        let orphan = Path::new("k.part-999").map_err(|e| format!("{e}"))?;
+        let planted: Result<Result<(), &str>, _> = dir.reserve(&cx, &orphan, 64, |buf| {
+            buf[..8].copy_from_slice(b"leftover");
+            Ok(8)
+        });
+        if !matches!(planted, Ok(Ok(()))) {
+            return Err(format!("plant orphan: {planted:?}"));
+        }
         if !io.crash() {
             return Err("not simulated".into());
+        }
+        let sweep_cx = io.cx(BUDGET, TASK_FRAME).map_err(|e| format!("sweep cx: {e}"))?;
+        let swept = dir.sweep_parts(&sweep_cx, |_, _| true).map_err(|e| format!("sweep_parts: {e}"))?;
+        if swept == 0 {
+            return Err("sweep_parts did not remove crashed orphan .part- file".into());
+        }
+        if dir.stat(&sweep_cx, &orphan).map_err(|e| format!("stat orphan: {e}"))?.is_some() {
+            return Err("orphan .part- file survived sweep_parts".into());
         }
         let got = read_bstd_target(&io, &dir, &target)?;
         if got.as_ref() != Some(&payload) {

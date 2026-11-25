@@ -806,6 +806,27 @@ fn dir_reserve_crash_faults_and_interleaving_dst() {
                     if fail_syncs {
                         sim.fail_syncs(dir_name.share());
                     }
+                    // Sweep any orphan `.part-` scratch files left by the crash and verify none remain.
+                    let list_names = |sim: &mut Sim| -> std::vec::Vec<FileName> {
+                        for _ in 0..64 {
+                            if let Done::Listed(entries) = ask_sim(sim, Effect::List { dir: dir_name.share().into(), tag: Tag(0xffff_fffd) }, false) {
+                                return entries.into_iter().map(|(n, _)| n).collect();
+                            }
+                        }
+                        std::vec::Vec::new()
+                    };
+                    for entry in list_names(&mut sim) {
+                        if blaze_core::reserve::part_tag(entry.as_str()).is_some() {
+                            for _ in 0..64 {
+                                if matches!(ask_sim(&mut sim, Effect::Remove { file: entry.share(), tag: Tag(0xffff_fffc) }, false), Done::Removed) {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if list_names(&mut sim).iter().any(|e| blaze_core::reserve::part_tag(e.as_str()).is_some()) {
+                        return Err(std::format!("seed {seed} step {step}: orphan .part- remained after sweep"));
+                    }
                     let got = read_sim(&mut sim, &key);
                     if !allowed.contains(&got) {
                         return Err(std::format!("seed {seed} step {step}: torn/stale record ({:?})", got.as_ref().map(|v| v.len())));
@@ -839,9 +860,18 @@ fn dir_reserve_crash_faults_and_interleaving_dst() {
             })
             .expect("reserve ok");
         assert_eq!(committed, Ok(()));
+        let orphan = Path::new("record_key.part-42").expect("orphan");
+        let planted: Result<Result<(), &str>, _> = dir.reserve(&cx, &orphan, 64, |buf| {
+            buf[..8].copy_from_slice(b"leftover");
+            Ok(8)
+        });
+        assert_eq!(planted.expect("plant orphan"), Ok(()));
         assert!(io.crash(), "simulated world crashes");
-        let mut read = Bytes::new_in(cx.frame(), "read after crash");
-        dir.read_all(&cx, &target, &mut read).expect("durable record survives crash");
+        let after_cx = io.cx(BUDGET, TASK_FRAME).expect("after crash cx");
+        assert_eq!(dir.sweep_parts(&after_cx, |_, _| true).expect("sweep"), 1);
+        assert!(dir.stat(&after_cx, &orphan).expect("stat orphan").is_none());
+        let mut read = Bytes::new_in(after_cx.frame(), "read after crash");
+        dir.read_all(&after_cx, &target, &mut read).expect("durable record survives crash");
         assert_eq!(read.as_slice(), p.as_slice());
     }
 }
