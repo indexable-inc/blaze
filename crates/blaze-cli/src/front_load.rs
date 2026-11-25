@@ -324,7 +324,7 @@ impl<'r> ScopeRecords<'r> {
             self.opened.fetch_add(counts.records, Relaxed);
             self.bytes.fetch_add(counts.bytes, Relaxed);
             read.map(|records| {
-                let nfiles = blaze_scope::items_record::ItemsRecord::from_verified(records.items_proof, self.heap.alloc()).files();
+                let nfiles = records.items_proof.files();
                 let pack_files = blaze_own::Vec::from_iter_in((0..nfiles).map(|_| OnceLock::new()), self.heap.shared());
                 OpenedCrate { records, pack_files }
             })

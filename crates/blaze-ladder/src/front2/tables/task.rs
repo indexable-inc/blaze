@@ -942,7 +942,7 @@ fn body_world<'v, 'n, 'w>(view: Tables<'v, 'n>, sink: &dyn ReadSink, name: Name,
             (index, None)
         }
     };
-    let front = Front2 { names: view, resolver: crate::resolve::Paths { names: view }, texts: Texts::empty(), keys: Keys::new(), index, frame: frame.frame };
+    let front = Front2 { names: view, resolver: crate::resolve::Paths { names: view }, texts: Texts::empty(), keys: Keys::new_in(world_alloc), index, frame: frame.frame };
     let mut world = blaze_own::Box::new_in(ProjectWorld::over_with_pointers(front, frame.prepared, pointers, world_alloc), alloc);
     world.record_const_texts();
     world.set_cost(frame.cost);

@@ -315,16 +315,16 @@ pub struct Body<'n> {
     /// lowered: read with it, `tys.view(&store.tys)`. A record is answered from `Store::tys`
     /// alone, which never holds a body's type, whatever bodies were checked before.
     pub tys: OwnTys<'static>,
-    pub params: Vec<(Name, u32), Global>,
+    pub params: blaze_own::Vec<(Name, u32), Alloc<'static>>,
     pub self_: SelfTy,
     /// The traits in scope at `module`, checker keys, sorted.
-    pub traits: Vec<ItemKey, Global>,
+    pub traits: blaze_own::Vec<ItemKey, Alloc<'static>>,
     /// The traits in scope at each block whose list is not `traits`: the blocks' `use`s
     /// ([`super::block_traits`]).
     pub blocks: super::block_traits::BlockTraits,
     /// Each written type that names nothing (E0412, [`TypeMiss`]): converted as the error type,
     /// reported by the check beside its own findings (front2 check.rs `check_rounds_as`).
-    pub type_misses: Vec<TypeMiss, Global>,
+    pub type_misses: blaze_own::Vec<TypeMiss, Alloc<'static>>,
     /// Rewritten item text produced by comptime `inline for` unrolling (`None` for ordinary bodies).
     pub expanded_text: Option<&'n str>,
     /// Original generic owner and concrete ground arguments for a monomorphized `inline for`
@@ -395,7 +395,7 @@ struct BodyTypes<'b, S> {
     text: &'b str,
     /// Each written type that names nothing (E0412), converted as the error type so the rest of
     /// the body is checked.
-    misses: Vec<TypeMiss, Global>,
+    misses: blaze_own::Vec<TypeMiss, Alloc<'static>>,
     /// The items declared in bodies, and whose body this is: a path through a type alias is
     /// expanded only where no item of the body takes its first segment
     /// ([`super::world_paths::AliasPaths`]).
@@ -1266,6 +1266,12 @@ pub fn lower_again<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, ke
     }
 }
 
+fn copy_slice<T: Copy>(src: &[T], alloc: Alloc<'static>) -> blaze_own::Vec<T, Alloc<'static>> {
+    let mut out = blaze_own::Vec::with_capacity_in(src.len(), alloc);
+    out.extend_from_slice(src);
+    out
+}
+
 /// Lowers `owner`'s body from rewritten item text `text` (produced by `inline for` unrolling),
 /// optionally substituting generic parameter indices with concrete `subst` arguments from `orig`.
 #[allow(clippy::too_many_arguments)]
@@ -1283,7 +1289,7 @@ pub(crate) fn lower_body_with_text<'n, S: NamesSource<'n>>(
     let head_key = param_subst.map_or(owner, |(orig, _)| orig);
     let head = store.fns.get(&head_key).ok_or(BodyError::NoHead(head_key))?;
     let krate = names.crate_of(head.lib).ok_or(BodyError::NoText(head.lib))?;
-    let alloc = *head.params.allocator();
+    let alloc = store.tys.alloc();
     let container = head.container;
     let site = Site {
         item,
@@ -1292,11 +1298,11 @@ pub(crate) fn lower_body_with_text<'n, S: NamesSource<'n>>(
         module: head.module,
         text,
         marks: None,
-        params: head.params.to_vec_in(alloc),
-        consts: head.consts.to_vec_in(alloc),
-        bounds: head.bounds.to_vec_in(alloc),
+        params: copy_slice(&head.params, alloc),
+        consts: copy_slice(&head.consts, alloc),
+        bounds: copy_slice(&head.bounds, alloc),
         self_: head.self_,
-        self_assoc: head.self_assoc.to_vec_in(alloc),
+        self_assoc: copy_slice(&head.self_assoc, alloc),
     };
     let subst_slice = param_subst.map(|(_, args)| args);
     let mut body = lower_at(names, prepared, keys, store, site, into, subst_slice, parser::Extensions::RECORDS)?;
@@ -1337,14 +1343,14 @@ fn lower_fn_into<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys
         store.ensure(names, keys, Want::Fn(item)).map_err(|error| BodyError::Head { item, error })?;
     }
     let head = store.fns.get(&owner).ok_or(BodyError::NoHead(owner))?;
-    let alloc = *head.params.allocator();
+    let alloc = store.tys.alloc();
     let site = Site {
         item, owner, krate, module, text, marks,
-        params: head.params.to_vec_in(alloc),
-        consts: head.consts.to_vec_in(alloc),
-        bounds: head.bounds.to_vec_in(alloc),
+        params: copy_slice(&head.params, alloc),
+        consts: copy_slice(&head.consts, alloc),
+        bounds: copy_slice(&head.bounds, alloc),
         self_: head.self_,
-        self_assoc: head.self_assoc.to_vec_in(alloc),
+        self_assoc: copy_slice(&head.self_assoc, alloc),
     };
     lower_at(names, prepared, keys, store, site, into, None, parser::Extensions::NONE)
 }
@@ -1402,7 +1408,7 @@ fn lower_member_into<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, 
             return Err(BodyError::Record { item: head.lib, owner: key, why });
         }
     };
-    let alloc = *head.params.allocator();
+    let alloc = store.tys.alloc();
     let site = Site {
         item: head.lib,
         owner: key,
@@ -1410,11 +1416,11 @@ fn lower_member_into<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, 
         module: head.module,
         text: head.text,
         marks,
-        params: head.params.to_vec_in(alloc),
-        consts: head.consts.to_vec_in(alloc),
-        bounds: head.bounds.to_vec_in(alloc),
+        params: copy_slice(&head.params, alloc),
+        consts: copy_slice(&head.consts, alloc),
+        bounds: copy_slice(&head.bounds, alloc),
         self_: head.self_,
-        self_assoc: head.self_assoc.to_vec_in(alloc),
+        self_assoc: copy_slice(&head.self_assoc, alloc),
     };
     let container = head.container;
     let mut body = lower_at(names, prepared, keys, store, site, into, None, parser::Extensions::NONE)?;
@@ -1455,12 +1461,12 @@ struct Site<'n> {
     /// The marks of `text`'s words when a macro wrote it (front2 item_site.rs); `None` for a
     /// text of a file, or one that keeps no origin column (`item_site::marks_of`).
     marks: Option<blaze_scope::crate_roots::TextMarks<'n>>,
-    params: Vec<(Name, u32), Global>,
+    params: blaze_own::Vec<(Name, u32), Alloc<'static>>,
     /// The const generic parameters among `params` ([`Env::consts`]).
-    consts: Vec<(u32, PTy), Global>,
-    bounds: Vec<ParamBound, Global>,
+    consts: blaze_own::Vec<(u32, PTy), Alloc<'static>>,
+    bounds: blaze_own::Vec<ParamBound, Alloc<'static>>,
     self_: SelfTy,
-    self_assoc: Vec<(Name, PTy), Global>,
+    self_assoc: blaze_own::Vec<(Name, PTy), Alloc<'static>>,
 }
 
 /// The gate of a base-less struct expression `S { a: 1, .. }` (RFC 3681,
@@ -1705,7 +1711,7 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
             failed: None,
             expanded_type: None,
             text,
-            misses: Vec::new_in(Global),
+            misses: blaze_own::Vec::new_in(alloc),
             locals: &store.locals,
             owner,
             async_ret,
@@ -1769,7 +1775,7 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
                     Some(k) => k,
                     None => OwnTys::none(alloc),
                 };
-                typeck = Some((b, kept, core::mem::take(&mut types.misses)));
+                typeck = Some((b, kept, core::mem::replace(&mut types.misses, blaze_own::Vec::new_in(alloc))));
                 break;
             }
             // A fn whose text has no body (an intrinsic's or a foreign fn's declaration, met
@@ -1789,12 +1795,8 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
                     store.ensure(names, keys, need).map_err(|error| BodyError::Head { item, error })?;
                 }
                 why => {
-                    // The caller's site owns its parameters on the heap. Its allocator can
-                    // also own the spelling after the worker drops the lowering and store.
-                    let expanded_type = types.expanded_type.map(|at| view.text_at(at).map(|text| {
-                        let bytes = text.as_bytes().to_vec_in(*params.allocator());
-                        std::string::String::from_utf8(bytes).expect("copied from a str").into_boxed_str()
-                    }));
+                    // Own the spelling in `Box<str>` so it outlives the lowering and store.
+                    let expanded_type = types.expanded_type.map(|at| view.text_at(at).map(Box::<str>::from));
                     return Err(BodyError::Convert { item, refused, why, expanded_type });
                 }
             },
@@ -1808,7 +1810,7 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
     }
 
     let in_scope = names.traits_in_scope(module, alloc).map_err(|error| BodyError::Traits { item, error })?;
-    let mut traits = Vec::with_capacity_in(in_scope.len(), Global);
+    let mut traits = blaze_own::Vec::with_capacity_in(in_scope.len(), alloc);
     traits.extend(in_scope.iter().map(|&k| checker_of(k)));
     traits.sort_unstable();
     traits.dedup();

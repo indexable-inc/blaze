@@ -911,6 +911,12 @@ pub trait LoadNames<'a> {
     /// The names record of the crate at `krate` (an index of the keys the reader was given), or
     /// `None` when none is kept.
     fn load(&self, krate: usize) -> Option<&'a [u8]>;
+
+    /// An already-verified [`Verified`] proof for `krate` (rule 74), avoiding redundant
+    /// `Verified::check` scans when the caller verified the record once at load time.
+    fn load_verified(&self, _krate: usize) -> Option<Verified<'a>> {
+        None
+    }
 }
 
 /// What a reader opened so far: crates and their records' bytes. Nothing else is counted, as
@@ -960,6 +966,9 @@ impl<'a, L: LoadNames<'a>> RecordNames<'a, L> {
     /// crate.
     pub fn record(&self, krate: usize) -> Option<NamesRecord<'a>> {
         let proof = self.proofs.get(krate)?.get_or_init(|| {
+            if let Some(proof) = self.load.load_verified(krate) {
+                return Some(proof);
+            }
             let bytes = self.load.load(krate)?;
             Some(Verified::check(bytes).unwrap_or_else(|e| panic!("the names record of crate {:?} does not check: {e:?}", self.keys[krate])))
         });

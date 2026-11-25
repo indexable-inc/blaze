@@ -2543,6 +2543,23 @@ fn decode_retaining_with<'n>(
     Ok(DecodedHead { head, origins: r.origins })
 }
 
+/// A decoded list that pre-sizes to the exact wire count before pushing elements.
+trait SizedList<T>: Default {
+    fn reserve_for(&mut self, n: usize);
+    fn push_one(&mut self, value: T);
+}
+
+impl<T> SizedList<T> for std::vec::Vec<T> {
+    fn reserve_for(&mut self, n: usize) {
+        if n > 0 {
+            self.reserve_exact(n);
+        }
+    }
+    fn push_one(&mut self, value: T) {
+        self.push(value);
+    }
+}
+
 /// The reader: the bytes, where it is, and the record's terms as interned so far.
 struct In<'r, 't, 'a> {
     bytes: &'r [u8],
@@ -2602,7 +2619,7 @@ impl<'r> In<'r, '_, '_> {
         let key = self.key("a constructor's key")?;
         let adt = self.key("a constructor's ADT")?;
         let generics = self.u32("a constructor's generics")?;
-        let inputs = self.many("a constructor's inputs", |r| r.ty("a constructor's input"))?;
+        let inputs = self.own("a constructor's inputs", |r| r.ty("a constructor's input"))?;
         let output = self.ty("a constructor's output")?;
         Ok(self.box_head(Head::Ctor { key, sig: CtorSig { adt, generics, inputs, output }, regions: None }))
     }
@@ -2655,8 +2672,8 @@ impl<'r> In<'r, '_, '_> {
     fn trait_alias<'n>(&mut self) -> Result<blaze_own::Box<Head<'n>, Mem>, E> {
         let key = self.lib("a trait alias's key")?;
         let generics = self.u32("a trait alias's generics")?;
-        let clauses = self.many("a trait alias's clauses", |r| r.clause())?;
-        let traits = self.many("a trait alias's traits", |r| Ok((r.lib("a trait alias's trait")?, r.list("a trait alias's trait arguments")?)))?;
+        let clauses = self.own("a trait alias's clauses", |r| r.clause())?;
+        let traits = self.own("a trait alias's traits", |r| Ok((r.lib("a trait alias's trait")?, r.list("a trait alias's trait arguments")?)))?;
         Ok(self.box_head(Head::TraitAlias { key, head: TraitAliasHead { generics, clauses, traits } }))
     }
 
@@ -2759,13 +2776,13 @@ impl<'r> In<'r, '_, '_> {
     fn opt<T>(&mut self, what: &'static str, one: impl FnOnce(&mut Self) -> Result<T, E>) -> Result<Option<T>, E> {
         if self.flag(what)? { Ok(Some(one(self)?)) } else { Ok(None) }
     }
-    /// `n` entries into a list of the head types' own kind (their allocator is theirs).
-    fn many<T, C: Default + Extend<T>>(&mut self, what: &'static str, mut one: impl FnMut(&mut Self) -> Result<T, E>) -> Result<C, E> {
+    /// `n` entries into a pre-sized list of the head types' own kind (their allocator is theirs).
+    fn many<T, C: SizedList<T>>(&mut self, what: &'static str, mut one: impl FnMut(&mut Self) -> Result<T, E>) -> Result<C, E> {
         let n = self.count(what)?;
         let mut c = C::default();
+        c.reserve_for(n);
         for _ in 0..n {
-            let v = one(self)?;
-            c.extend(core::iter::once(v));
+            c.push_one(one(self)?);
         }
         Ok(c)
     }
@@ -2960,11 +2977,14 @@ impl<'r> In<'r, '_, '_> {
         })
     }
 
-    fn named_tys<C: Default + Extend<(Name, PTy)>>(&mut self, what: &'static str) -> Result<C, E> {
+    fn named_tys<C: SizedList<(Name, PTy)>>(&mut self, what: &'static str) -> Result<C, E> {
         self.many(what, |r| Ok((r.name(what)?, r.ty(what)?)))
     }
-    fn named_keys<C: Default + Extend<(Name, ItemKey)>>(&mut self, what: &'static str) -> Result<C, E> {
-        self.many(what, |r| Ok((r.name(what)?, r.key(what)?)))
+    fn named_tys_own(&mut self, what: &'static str) -> Result<Vec<(Name, PTy), Mem>, E> {
+        self.own(what, |r| Ok((r.name(what)?, r.ty(what)?)))
+    }
+    fn named_keys_own(&mut self, what: &'static str) -> Result<Vec<(Name, ItemKey), Mem>, E> {
+        self.own(what, |r| Ok((r.name(what)?, r.key(what)?)))
     }
     fn defaults(&mut self) -> Result<Vec<Option<PTy>, Mem>, E> {
         self.own("parameter defaults", |r| r.opt("a parameter default", |r| r.ty("a parameter default")))
@@ -2972,13 +2992,20 @@ impl<'r> In<'r, '_, '_> {
     fn const_params_own(&mut self) -> Result<Vec<(u32, PTy), Mem>, E> {
         self.own("const parameters", |r| Ok((r.u32("a const parameter")?, r.ty("a const parameter's type")?)))
     }
-    /// `Out::scope`'s fields, into the store's own lists.
-    fn scope<P, C, B>(&mut self) -> Result<(P, C, B, SelfTy), E>
-    where
-        P: Default + Extend<(Name, u32)>,
-        C: Default + Extend<(u32, PTy)>,
-        B: Default + Extend<ParamBound>,
-    {
+    fn self_ty(&mut self) -> Result<SelfTy, E> {
+        match self.u8("a fn's `Self`")? {
+            0 => Ok(SelfTy::None),
+            1 => Ok(SelfTy::Trait(self.lib("a fn's `Self` trait")?)),
+            2 => {
+                let t = self.ty("a fn's `Self` type")?;
+                let tr = self.opt("`Self`'s trait", |r| Ok((r.lib("`Self`'s trait")?, r.list("`Self`'s trait arguments")?)))?;
+                Ok(SelfTy::Ty(t, tr))
+            }
+            byte => Err(E::Byte { what: "a fn's `Self`", byte }),
+        }
+    }
+    /// `Out::scope`'s fields, into `FnHead`'s lists.
+    fn scope<P: SizedList<(Name, u32)>, C: SizedList<(u32, PTy)>, B: SizedList<ParamBound>>(&mut self) -> Result<(P, C, B, SelfTy), E> {
         let params = self.many("a fn's parameters in scope", |r| Ok((r.name("a parameter's name")?, r.u32("a parameter's index")?)))?;
         let consts = self.many("const parameters", |r| Ok((r.u32("a const parameter")?, r.ty("a const parameter's type")?)))?;
         let bounds = self.many("a fn's parameter bounds", |r| {
@@ -2986,16 +3013,19 @@ impl<'r> In<'r, '_, '_> {
             let trait_ = r.lib("a bound's trait")?;
             Ok(ParamBound { param, trait_, args: r.list("a parameter bound's arguments")? })
         })?;
-        let self_ = match self.u8("a fn's `Self`")? {
-            0 => SelfTy::None,
-            1 => SelfTy::Trait(self.lib("a fn's `Self` trait")?),
-            2 => {
-                let t = self.ty("a fn's `Self` type")?;
-                let tr = self.opt("`Self`'s trait", |r| Ok((r.lib("`Self`'s trait")?, r.list("`Self`'s trait arguments")?)))?;
-                SelfTy::Ty(t, tr)
-            }
-            byte => return Err(E::Byte { what: "a fn's `Self`", byte }),
-        };
+        let self_ = self.self_ty()?;
+        Ok((params, consts, bounds, self_))
+    }
+    /// `Out::scope`'s fields, into the reader's allocator (`MemberFrame`).
+    fn scope_own(&mut self) -> Result<(Vec<(Name, u32), Mem>, Vec<(u32, PTy), Mem>, Vec<ParamBound, Mem>, SelfTy), E> {
+        let params = self.own("a fn's parameters in scope", |r| Ok((r.name("a parameter's name")?, r.u32("a parameter's index")?)))?;
+        let consts = self.own("const parameters", |r| Ok((r.u32("a const parameter")?, r.ty("a const parameter's type")?)))?;
+        let bounds = self.own("a fn's parameter bounds", |r| {
+            let param = r.u32("a bound's parameter")?;
+            let trait_ = r.lib("a bound's trait")?;
+            Ok(ParamBound { param, trait_, args: r.list("a parameter bound's arguments")? })
+        })?;
+        let self_ = self.self_ty()?;
         Ok((params, consts, bounds, self_))
     }
     fn clause(&mut self) -> Result<PClause, E> {
@@ -3033,8 +3063,8 @@ impl<'r> In<'r, '_, '_> {
     /// A head's clauses, boxed where they are made ([`HeadPreds`]): what `opt` and the head's
     /// constructor move is the box.
     fn preds(&mut self) -> Result<HeadPreds, E> {
-        let clauses = self.many("where-clauses", |r| r.clause())?;
-        let conds = self.many("`where const` conditions", |r| Ok(lf::ConstIdx(r.u32("a `where const` condition")?)))?;
+        let clauses = self.own("where-clauses", |r| r.clause())?;
+        let conds = self.own("`where const` conditions", |r| Ok(lf::ConstIdx(r.u32("a `where const` condition")?)))?;
         Ok(blaze_own::Box::new_in(Preds::decoded(clauses, conds, self.alloc), self.alloc))
     }
     fn region(&mut self) -> Result<Region, E> {
@@ -3361,7 +3391,7 @@ impl<'r> In<'r, '_, '_> {
         };
         let generics = self.u32("an ADT's generics")?;
         // Both lists' types are the row's (inferred from it below), never named here.
-        let variants = self.many("an ADT's variants", |r| {
+        let variants = self.own("an ADT's variants", |r| {
             let key = r.key("a variant's key")?;
             let name = r.name("a variant's name")?;
             let ctor = match r.u8("a variant's constructor kind")? {
@@ -3374,7 +3404,7 @@ impl<'r> In<'r, '_, '_> {
             let len = r.u32("a variant's field count")?;
             Ok(tc::Variant { key, name, ctor, fields: List { start, len } })
         })?;
-        let fields: std::vec::Vec<tc::Field> = self.many("an ADT's fields", |r| Ok(tc::Field { name: r.name("a field's name")?, ty: r.ty("a field's type")? }))?;
+        let fields = self.own("an ADT's fields", |r| Ok(tc::Field { name: r.name("a field's name")?, ty: r.ty("a field's type")? }))?;
         let repr = self.repr()?;
         let valid = blaze_build::layout::ValidRange {
             start: self.opt("an ADT's valid range start", |r| r.u128("a valid range start"))?,
@@ -3398,7 +3428,7 @@ impl<'r> In<'r, '_, '_> {
                 field_region_at.push(super::borrows::NO_ROW);
             }
         }
-        let discrs = self.many("an enum's discriminants", |r| Ok(i128::from_le_bytes(r.array("a discriminant")?)))?;
+        let discrs = self.own("an enum's discriminants", |r| Ok(i128::from_le_bytes(r.array("a discriminant")?)))?;
         let defaults = self.defaults()?;
         let const_params = self.const_params_own()?;
         let field_defaults = self.own("an ADT's field defaults", |r| r.opt("a field default", |r| r.key("a field default's key")))?;
@@ -3503,26 +3533,26 @@ impl<'r> In<'r, '_, '_> {
     fn trait_<'n>(&mut self) -> Result<blaze_own::Box<Head<'n>, Mem>, E> {
         let key = self.lib("a trait's key")?;
         let generics = self.u32("a trait's generics")?;
-        let defaults = self.many("parameter defaults", |r| r.opt("a parameter default", |r| r.ty("a parameter default")))?;
-        let assoc = self.many("a trait's associated types", |r| r.name("an associated type's name"))?;
-        let fns = self.named_keys("a trait's fns")?;
+        let defaults = self.own("parameter defaults", |r| r.opt("a parameter default", |r| r.ty("a parameter default")))?;
+        let assoc = self.own("a trait's associated types", |r| r.name("an associated type's name"))?;
+        let fns = self.named_keys_own("a trait's fns")?;
         let flags = tc::TraitFlags(self.u32("a trait's flags")?);
         let marks = self.coherence_marks()?;
         let all_self_defaults = self.flag("a trait's parameters all default to Self")?;
-        let members = self.many("a trait's member facts", |r| r.member())?;
+        let members = self.own("a trait's member facts", |r| r.member())?;
         let head = TraitHead { generics, defaults, assoc, fns, flags, members, marks, all_self_defaults };
         if head.all_self_defaults != super::heads::all_self_defaults(&head.defaults, self.tys.view()) {
             return Err(E::Shape { what: "a trait's Self-default flag disagrees with its parameter defaults" });
         }
         let extra = self.opt("a trait's members part", |r| {
-            let supertraits = r.many("a trait's supertrait clauses", |r| r.clause())?;
-            let assoc = r.many("a trait's associated type rows", |r| {
+            let supertraits = r.own("a trait's supertrait clauses", |r| r.clause())?;
+            let assoc = r.own("a trait's associated type rows", |r| {
                 let name = r.name("an associated type's name")?;
                 let item = r.key("an associated type's key")?;
                 let default = r.opt("an associated type's default", |r| r.ty("an associated type's default"))?;
                 Ok(tc::AssocTyDef { name, item, default })
             })?;
-            let consts = r.named_keys("a trait's associated constants")?;
+            let consts = r.named_keys_own("a trait's associated constants")?;
             Ok(TraitExtra { supertraits, assoc, consts })
         })?;
         let supers = self.own("a trait's supertraits", |r| Ok((r.lib("a supertrait")?, r.list("a supertrait's arguments")?)))?;
@@ -3595,24 +3625,24 @@ impl<'r> In<'r, '_, '_> {
                     .map_err(|_| E::Shape { what: "an impl's trait arguments do not follow its self type" })?
             }
         };
-        let assoc = self.named_tys("an impl's associated types")?;
-        let fns = self.named_keys("an impl's fns")?;
-        let fn_self = self.many("an impl's fn `self` flags", |r| match r.u8("an impl's fn `self` flag")? {
+        let assoc = self.named_tys_own("an impl's associated types")?;
+        let fns = self.named_keys_own("an impl's fns")?;
+        let fn_self = self.own("an impl's fn `self` flags", |r| match r.u8("an impl's fn `self` flag")? {
             0 => Ok(false),
             1 => Ok(true),
             byte => Err(E::Byte { what: "an impl's fn `self` flag", byte }),
         })?;
-        let fn_vis = self.many("an impl's fn visibilities", |r| {
+        let fn_vis = self.own("an impl's fn visibilities", |r| {
             let byte = r.u8("an impl's fn visibility")?;
             MemberVis::of_byte(byte).ok_or(E::Byte { what: "an impl's fn visibility", byte })
         })?;
-        let unstable = self.many("an impl's unstable members", |r| {
+        let unstable = self.own("an impl's unstable members", |r| {
             let name = r.name("an unstable member's name")?;
             let feature = Box::<str>::from(r.text("an unstable member's feature")?);
             let implied_by = r.opt("an unstable member's `implied_by`", |r| Ok(Box::<str>::from(r.text("an unstable member's `implied_by`")?)))?;
             Ok((name, super::heads::Unstable { feature, implied_by }))
         })?;
-        let consts = self.named_keys("an impl's constants")?;
+        let consts = self.named_keys_own("an impl's constants")?;
         let polarity = match self.u8("an impl's polarity")? {
             0 => tc::ImplPolarity::Positive,
             1 => tc::ImplPolarity::Negative,
@@ -3624,7 +3654,7 @@ impl<'r> In<'r, '_, '_> {
             let module = r.lib("a frame's module")?;
             let generics = r.u32("a frame's generics")?;
             let is_const = r.flag("a frame's const")?;
-            let (params, consts, bounds, self_) = r.scope()?;
+            let (params, consts, bounds, self_) = r.scope_own()?;
             Ok(MemberFrame { module, generics, is_const, params, consts, bounds, self_ })
         })?;
         let head = ImplHead { generics, self_ty, trait_, trait_args, assoc, fns, fn_self, fn_vis, unstable, consts, polarity };
@@ -4626,7 +4656,9 @@ mod region_tests {
     }
 
     fn ctor(t: &Tys) -> CtorSig {
-        CtorSig { adt: S, generics: 0, inputs: std::vec![t.r], output: t.s }
+        let mut inputs = Vec::with_capacity_in(1, a());
+        inputs.push(t.r);
+        CtorSig { adt: S, generics: 0, inputs, output: t.s }
     }
 
     fn record(t: &Tys, sig: &CtorSig, regions: Option<&FiledRegions>) -> std::vec::Vec<u8> {
@@ -4776,7 +4808,9 @@ mod region_tests {
         // CONTROL: an erased edit, `fn(&u8) -> &u8` in place of `fn(&u8) -> S`, moves both.
         let io = t.tys.intern_list_shared(&[t.r, t.r]).unwrap();
         let f2 = t.tys.intern_shared(PNode::FnPtr(io, RUST)).unwrap();
-        let sig2 = CtorSig { adt: S, generics: 0, inputs: std::vec![t.r], output: t.r };
+        let mut sig2_inputs = Vec::with_capacity_in(1, a());
+        sig2_inputs.push(t.r);
+        let sig2 = CtorSig { adt: S, generics: 0, inputs: sig2_inputs, output: t.r };
         let mut r2 = HeadRegions::new_in(LifetimeParams::new_in(2, a()), a());
         r2.sig = Some(lay(&t, f2, &[RRegion::Param(0), RRegion::Param(0)]));
         let z = FiledRegions::new(r2, &Toy, t.tys.view(), a()).unwrap_or_else(|e| panic!("filed: {e}"));

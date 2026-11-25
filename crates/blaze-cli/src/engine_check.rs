@@ -2075,7 +2075,7 @@ fn checking<'f>(
             let Some(lines) = last_lines.as_ref() else { return Ok(Err(ReadyRefused::Root(PhasesWhy::NoAnswer))) };
             let pre_start = last_stored.answer();
             let pre_records = RecordKeys { base: Some(last_stored as &dyn StoredPages), changes: SMap::new_in(alloc) };
-            let setup = match ready_setup(cx, root, &stamps, stood, followed, last, lines, &pre_start, &pre_records, &tools, &mut store, &env, workers, Some(linting.rules), alloc, frame)? {
+            let setup = match ready_setup(cx, root, &stamps, stood, followed, last, lines, last_stored, &pre_start, &pre_records, &tools, &mut store, &env, workers, Some(linting.rules), alloc, frame)? {
                 Ok(setup) => setup,
                 Err(why) => return Ok(Err(why)),
             };
@@ -4653,6 +4653,7 @@ fn ready_setup<'f, 'h, 'a>(
     last: &blaze_engine::pages::Root<'_>,
     // The last request's lines: each skipped target's note is carried from it.
     last_lines: &crate::engine_lines::Last<'_, '_>,
+    stored: &crate::engine_answer::Stored<'_>,
     start: &Answer<'a>,
     records: &RecordKeys<'a>,
     tools: &blaze_engine::Tools,
@@ -4668,8 +4669,9 @@ fn ready_setup<'f, 'h, 'a>(
     let cx = cx.span(READY_SETUP_SPAN);
     // 1. The graph's row, its record and the crate list sealed in it.
     let name = Name::unit_graph();
-    let Some(row) = start.row_facts(name).map_err(EngineError::from)? else { return Ok(Err(ReadyRefused::NoRow { name })) };
-    let Some(key) = records.get(name)? else { return Ok(Err(ReadyRefused::Graph(crate::engine_units::BackRefused::NoKey))) };
+    let Some(header) = stored.header(name).map_err(crate::engine_answer::page_error)? else { return Ok(Err(ReadyRefused::NoRow { name })) };
+    let row = header.facts;
+    let Some(key) = header.record else { return Ok(Err(ReadyRefused::Graph(crate::engine_units::BackRefused::NoKey))) };
     let names = {
         let _cx = cx.span("names: the crate list read back");
         let (view, sections) = match crate::engine_units::stored_graph_at(&cx, store, key)? {
@@ -4740,7 +4742,7 @@ fn ready_setup<'f, 'h, 'a>(
     let mut deferred: SVec<'h, (Want<'h>, sweep::Probed)> = SVec::new_in(alloc);
     let mut slots = 0u32;
     let mut files = Files::default();
-    let kept = Kept { slots: &[], answer: start, records, stored: None, tools, read: core::sync::atomic::AtomicU32::new(0) };
+    let kept = Kept { slots: &[], answer: start, records, stored: Some(stored), tools, read: core::sync::atomic::AtomicU32::new(0) };
     for (at, leaf) in followed.now.rows.iter().enumerate() {
         let slot = followed.now.path(leaf);
         // Script/data read rows (`by_script`) are appended by `scripts.script_rows` in the tail
@@ -6735,7 +6737,16 @@ impl Kept<'_, '_, '_> {
             return Ok(None);
         }
         self.read.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        let Some(row) = self.answer.row_facts(want.name).map_err(EngineError::from)? else { return Ok(None) };
+        let (row, record) = match self.answer.stored() {
+            Some(base) if self.answer.work().is_none() && self.answer.rows.is_empty() && self.records.changes.is_empty() => {
+                let Some(header) = base.header(want.name).map_err(crate::engine_answer::page_error)? else { return Ok(None) };
+                (header.facts, Some(header.record))
+            }
+            _ => {
+                let Some(row) = self.answer.row_facts(want.name).map_err(EngineError::from)? else { return Ok(None) };
+                (row, None)
+            }
+        };
         if row.phase.stage != Stage::Outlines || row.failed {
             return Ok(None);
         }
@@ -6746,7 +6757,11 @@ impl Kept<'_, '_, '_> {
         if row.source != outline_source || row.key != self.tools.key(want.name, &outline_source) {
             return Ok(None);
         }
-        let key = self.records.get(want.name)?.ok_or(EngineCheckError::MissingRecord { name: want.name })?;
+        let key = match record {
+            Some(record) => record,
+            None => self.records.get(want.name)?,
+        }
+        .ok_or(EngineCheckError::MissingRecord { name: want.name })?;
         Ok(Some((key, source, outline_source)))
     }
 }

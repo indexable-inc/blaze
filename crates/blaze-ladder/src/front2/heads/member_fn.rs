@@ -27,9 +27,9 @@ use blaze_typeck::{ItemKey, Name, PClause, PTy};
 use super::super::keys::{Keys, MemberKind, Origin, checker_of};
 use super::super::source::NamesSource;
 use super::super::types::{Bounds, Env, ParamBound, SelfTy, Why};
-// The parent's own imports of the allocator, `Vec` and `format!` (no new line naming `std`:
+// The parent's own imports of the allocator and `format!` (no new line naming `std`:
 // tools/ratchets/std-alloc.txt).
-use super::{Alloc, Global, Store, Vec, Want, format, lower_alloc, members};
+use super::{Alloc, Store, Want, format, lower_alloc, members};
 
 /// What an impl's member fns are made in, kept when the impl's head is made (its module, its
 /// generic parameters, their bounds, its `Self`): a member fn's want reads it, never lowers
@@ -39,9 +39,9 @@ pub struct MemberFrame {
     pub module: LibKey,
     pub generics: u32,
     pub is_const: bool,
-    pub params: Vec<(Name, u32), Global>,
-    pub consts: Vec<(u32, PTy), Global>,
-    pub bounds: Vec<ParamBound, Global>,
+    pub params: blaze_own::Vec<(Name, u32), Alloc<'static>>,
+    pub consts: blaze_own::Vec<(u32, PTy), Alloc<'static>>,
+    pub bounds: blaze_own::Vec<ParamBound, Alloc<'static>>,
     pub self_: SelfTy,
 }
 
@@ -89,14 +89,14 @@ impl<'n> Store<'n> {
     pub(super) fn member_fn<S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, impl_: LibKey, fn_: ItemKey) -> Result<(), Why> {
         let whole = Range::new(0, 0);
         let ck = checker_of(impl_);
-        let name = match keys.origin(fn_) {
-            Some(Origin::Member { container, kind: MemberKind::Fn, name }) if *container == ck => name.clone(),
+        let name: &str = match keys.origin(fn_) {
+            Some(Origin::Member { container, kind: MemberKind::Fn, name }) if *container == ck => name,
             other => return Err(Why::Program(format!("member fn {fn_:?} is filed as {other:?}, not as a fn of impl {ck:?}").into_boxed_str(), whole)),
         };
         let alloc = self.tys.alloc();
         let ms = members(names, impl_, alloc).map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))?;
         for m in &ms {
-            if !matches!(m.detail, ItemDetail::Fn { .. }) || m.name != &*name {
+            if !matches!(m.detail, ItemDetail::Fn { .. }) || m.name != name {
                 continue;
             }
             let low = lower_alloc(names, impl_, m.text, alloc).map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))?;

@@ -1600,6 +1600,12 @@ struct Group<'f, 'r> {
     /// Group-scoped lang-item index and receiver pointers built at most once per member group
     /// across all stretches and workers (zero per-stretch rebuilds, zero stretch-frame growth).
     front: bstd::sync::Once<Option<blaze_ladder::front2::tables::task::StretchFront>>,
+    /// Scheduled body items in this member group for this phase: groups with fewer than 2 bodies
+    /// leave `goals` uninitialized so 1-body incremental edits pay zero table overhead.
+    bodies: u32,
+    /// Group-scoped shared trait goal table allocated lazily in `shared.heap.shared()` when
+    /// `bodies >= 2` and dropped when `Bodies` ends (rule 70): never shared across member groups.
+    goals: bstd::sync::Once<blaze_ladder::front2::tables::goals::GoalTable<SharedAlloc<'static>>>,
 }
 
 /// A group's scope crates in reader order, the member at 0: the two arms of piece C (a) (rule
@@ -3785,7 +3791,7 @@ impl<'f> BodiesStage<'f> {
             false => self.groups::<ByNeed, EveryMember>(&cx, store, read, handles, view, plants, frame, snapshot, &expansion_keys, &owed, entered)?,
             true => self.groups::<ByNeed, StandingMembers>(&cx, store, read, handles, view, plants, frame, snapshot, &expansion_keys, &owed, entered)?,
         };
-        let (found, stopped) = match found {
+        let (mut found, stopped) = match found {
             Ok(found) => (Some(found), None),
             Err(why) => (None, Some(why)),
         };
@@ -3945,6 +3951,13 @@ impl<'f> BodiesStage<'f> {
         // 3. Your code first is the next piece (engine.md 4); today: by member, file, name.
         ones.sort_unstable_by_key(|one| (one.group, one.file, one.task.planned.name));
         let ones: &'f [One<'f>] = ones.into_bump_slice();
+        if let Some(found) = found.as_mut() {
+            for one in ones {
+                if let Some(group) = usize::try_from(one.group).ok().and_then(|idx| found.groups.get_mut(idx)) {
+                    group.bodies = group.bodies.saturating_add(u32::try_from(one.items.len()).unwrap_or(u32::MAX));
+                }
+            }
+        }
         // The memory status's slots sized once for every body to check: a slice has its
         // entry's path and label, so the entries cover the slices `run_phase` cuts.
         handles.board.bodies_mem.prepare(ones, handles.outlined, heap.shared())?;
@@ -4779,15 +4792,9 @@ impl<'f> BodiesStage<'f> {
             // A scope refused at need takes back the member's head subjects (as the oracle arm
             // refuses before the first).
             let heads_at = heads.len();
-            // The member's files: its items record's file rows, matched to the planner's outlines.
-            let Ok(items) = ItemsRecord::open(own_records.items, g) else {
-                // The items record is the crate's names task's: a function of its cell.
-                refuse_all(&reach, "its crate's items record does not open (blaze-scope items_record.rs `ItemsRecord::open`)", own_cells);
-                if again.is_none() {
-                    members_out.member(&rec::Member { at: place, unit: unit_val, state: rec::MemberState::Refused(rec::RefusedWhy::Unstood), not_held: reach });
-                }
-                continue;
-            };
+            // The member's files: its items record's file rows, matched to the planner's outlines
+            // (already verified when `own_records` was loaded, rule 74).
+            let items = ItemsRecord::from_verified(own_records.items_proof, g);
             // Each member's text length of the impls and traits a macro wrote, made the first
             // time a body is asked that no item row holds ([`text_bytes`]).
             let mut member_lens: Option<Vec<(ItemKey, u32), blaze_own::Alloc<'static>>> = None;
@@ -4920,7 +4927,7 @@ impl<'f> BodiesStage<'f> {
                         (Some(rest), Some(own)) => Some(GroupCrates::ByNeed { own, rest }),
                         (Some(_), None) => None,
                     };
-                    (whole, cut_words, cut_missing, scope_cells, crates.map(|crates| Group { list, own: own.name, crates, env, script, lang: scope.lang, scope: scope.scope, front: bstd::sync::Once::new("bodies group front") }))
+                    (whole, cut_words, cut_missing, scope_cells, crates.map(|crates| Group { list, own: own.name, crates, env, script, lang: scope.lang, scope: scope.scope, front: bstd::sync::Once::new("bodies group front"), bodies: 0, goals: bstd::sync::Once::new("bodies group goals") }))
                 }
                 None => (true, None, None, own_cells, None),
             };
@@ -6838,18 +6845,16 @@ impl<'n> HeadSeed<'n> for LazyBodySeed<'_, 'n, '_> {
             return Ok(blaze_ladder::front2::heads::Seeded::Lower);
         }
         let cell = blaze_ladder::front2::tables::head::cell_of(self.names, need).map_err(SeedError::Freeze)?;
-        match blaze_ladder::front2::tables::head::KnownHeads::known(self.heads, cell) {
-            blaze_ladder::front2::tables::head::Known::Bytes(bytes) => {
-                let frozen = blaze_ladder::front2::tables::head::FrozenHead::read(bytes)
-                    .map_err(|error| SeedError::Freeze(FreezeError::Read { want: cell, error }))?;
+        match self.heads.known_frozen(cell).map_err(SeedError::Freeze)? {
+            crate::engine_seeds::KnownFrozen::Head(frozen) => {
                 blaze_ladder::front2::tables::head::file_frozen_cached(self.names, cell, frozen, store, keys, self.import_cache, scratch)
                     .map_err(SeedError::Freeze)?;
                 return Ok(blaze_ladder::front2::heads::Seeded::Filed);
             }
-            blaze_ladder::front2::tables::head::Known::Refused(why) => {
+            crate::engine_seeds::KnownFrozen::Refused(why) => {
                 return Err(SeedError::of_freeze(FreezeError::NotTheirs { want: cell, why }));
             }
-            blaze_ladder::front2::tables::head::Known::Freeze => {}
+            crate::engine_seeds::KnownFrozen::Freeze => {}
         }
         let inner = self.inner.get_or_init(|| self.build_freezer());
         match inner {
@@ -6984,7 +6989,25 @@ fn run_stretch_with<'d, 'a, 'b, 'f, R: ?Sized + CellDigests>(
     // `ProjectWorld::over_prepared` allocates 0 bytes in `frame` per body and macros are prepared
     // once per stretch rather than leaked per body.
     let prepared: &blaze_scope::prepares::Prepares<'_> = blaze_scope::prepares::Prepares::new_in(fb);
-    let body_frame = BodyFrame { frame, alloc: g, plant_drop: None, cost: Some(cost), needs: NeedsMet::First, heads: seed.map(|s| s as &dyn HeadSeed<'_>), sources: Some(opened.sources), goals: None, prepared: Some(prepared), front: front_ref };
+    // Per-group shared trait goal table (rule 70: dropped when `Bodies` ends; never shared across
+    // member groups; skipped when this group has < 2 scheduled bodies so 1-body edits pay 0).
+    let goals_ref: Option<&dyn blaze_ladder::front2::tables::goals::GoalShare> = if group.bodies >= 2 {
+        match group.goals.get_or_make(cx, |_| {
+            Ok::<_, core::convert::Infallible>(blaze_ladder::front2::tables::goals::GoalTable::new_in(
+                blaze_ladder::front2::tables::goals::GoalTableOpts {
+                    share: blaze_ladder::front2::tables::goals::ShareOpts::default(),
+                    most: blaze_ladder::front2::tables::goals::MOST_GOALS,
+                },
+                shared.heap.shared(),
+            ))
+        }) {
+            Ok(table) => Some(table),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    let body_frame = BodyFrame { frame, alloc: g, plant_drop: None, cost: Some(cost), needs: NeedsMet::First, heads: seed.map(|s| s as &dyn HeadSeed<'_>), sources: Some(opened.sources), goals: goals_ref, prepared: Some(prepared), front: front_ref };
     // Each crate's listing from the request's table (engine_heads.rs `Listings`): made once a
     // request, not once a stretch that places a read in it.
     let set_lang = clock.now();
