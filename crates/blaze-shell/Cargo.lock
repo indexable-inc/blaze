@@ -187,6 +187,7 @@ dependencies = [
 name = "blaze-shell"
 version = "0.0.0"
 dependencies = [
+ "blaze-base64",
  "blaze-cli-spec",
  "blaze-data",
  "blaze-dust",
@@ -202,6 +203,7 @@ dependencies = [
  "blaze-ssh",
  "blaze-sys",
  "blaze-sysmon",
+ "blaze-term-api",
  "blaze-ui",
  "blaze-vim",
  "blaze-vt",
@@ -260,6 +262,16 @@ name = "blaze-tab"
 version = "0.0.0"
 dependencies = [
  "blaze-data",
+ "blaze-own",
+]
+
+[[package]]
+name = "blaze-term-api"
+version = "0.0.0"
+dependencies = [
+ "blaze-base64",
+ "blaze-data",
+ "blaze-json",
  "blaze-own",
 ]
 

@@ -4,11 +4,19 @@
 
 #[cfg(target_os = "macos")]
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("api") {
+        std::process::exit(blaze_shell::term_server::run_cli_api(&args[2..]));
+    }
     macos_app::run();
 }
 
 #[cfg(not(target_os = "macos"))]
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("api") {
+        std::process::exit(blaze_shell::term_server::run_cli_api(&args[2..]));
+    }
     headless_repl();
 }
 
@@ -1024,6 +1032,56 @@ mod macos_app {
             // 2b. Native Metal Activity & GPU Monitor (`top` / `btop` / `htop` / `sysmon`).
             // Use `^top` to bypass and run external `/usr/bin/top` on a PTY if ever needed.
             let first_tok = trimmed.split_whitespace().next().unwrap_or("");
+            if first_tok == "term"
+                && !trimmed.contains('|')
+                && !trimmed.contains(';')
+                && !trimmed.contains("&&")
+            {
+                let t0 = Instant::now();
+                let state_before = self.store.active_state().fork();
+                let state_after = state_before.fork();
+                let prompt_snap = self.prompt.clone();
+                let tokens = blaze_shell::term_server::split_shell_tokens(trimmed);
+                let srv = blaze_shell::term_server::start_global(&self.home);
+                let res = blaze_shell::term_server::exec_term_command(
+                    &srv,
+                    &self.prompt.cwd,
+                    tokens.get(1..).unwrap_or(&[]),
+                );
+                let dur_ms = t0.elapsed().as_millis() as u64;
+                let dur_ns = t0.elapsed().as_nanos() as u64;
+                let (exit_code, body) = match res {
+                    Ok(val) => (0, BlockBody::Value(val)),
+                    Err(msg) => (
+                        1,
+                        BlockBody::Error {
+                            err: blaze_sh::ShellError::new(
+                                blaze_sh::ErrorKind::External,
+                                blaze_sh::Span { start: 0, end: trimmed.len() as u32 },
+                                &msg,
+                                Alloc::global(),
+                            ),
+                        },
+                    ),
+                };
+                let id = self.store.record_block(
+                    trimmed.to_owned(),
+                    prompt_snap,
+                    state_before,
+                    state_after,
+                    0,
+                    dur_ms,
+                    exit_code,
+                    body,
+                );
+                if let Some(blk) = self.store.block_mut(id) {
+                    blk.duration_ns = dur_ns;
+                }
+                self.refresh_prompt(exit_code, dur_ms);
+                self.auto_scroll_bottom = true;
+                self.scroll_to_block = None;
+                return;
+            }
             if matches!(first_tok, "top" | "btop" | "htop" | "sysmon")
                 && !trimmed.contains('|')
                 && !trimmed.contains(';')
@@ -2512,6 +2570,7 @@ mod macos_app {
                 }
                 let mut icons = icon_atlas.rasterize_quads(&scene.icon_quads);
                 icon_atlas.rasterize_emoji_quads_into(&scene.emoji_quads, &mut icons);
+                icon_atlas.rasterize_custom_symbol_quads_into(&scene.custom_symbols, &mut icons);
                 let overlay_icons = icon_atlas.rasterize_quads(&scene.overlay_icons);
                 for (slot, rgba) in icon_atlas.pending.drain(..) {
                     renderer.upload_icon(slot, &rgba);
@@ -2550,6 +2609,7 @@ mod macos_app {
                 scene.rects.clear();
                 scene.icon_quads.clear();
                 scene.emoji_quads.clear();
+                scene.custom_symbols.clear();
                 scene.image_quads.clear();
                 scene.over_rects.clear();
                 scene.overlay_rects.clear();
@@ -2664,6 +2724,10 @@ mod macos_app {
         layer.setContentsScale(scale);
         layer.setDrawableSize(NSSize::new(size.width * scale, size.height * scale));
 
+        let term_home = std::env::var("HOME").unwrap_or_else(|_| "/".to_owned());
+        let term_server = blaze_shell::term_server::start_global(&term_home);
+        let mut last_term_rev = term_server.revision();
+
         let (mut wm, _, first_pane_id) = TileManager::new();
         let mut panes: std::collections::HashMap<PaneId, ShellApp> = std::collections::HashMap::new();
         let mut first_pane = ShellApp::new_in(cli.cwd.as_deref());
@@ -2756,6 +2820,7 @@ mod macos_app {
             }
             let mut icons = icon_atlas.rasterize_quads(&scene.icon_quads);
             icon_atlas.rasterize_emoji_quads_into(&scene.emoji_quads, &mut icons);
+            icon_atlas.rasterize_custom_symbol_quads_into(&scene.custom_symbols, &mut icons);
             let overlay_icons = icon_atlas.rasterize_quads(&scene.overlay_icons);
             for (slot, rgba) in icon_atlas.pending.drain(..) {
                 renderer.upload_icon(slot, &rgba);
@@ -6042,6 +6107,14 @@ mod macos_app {
                     dirty = true;
                 }
             }
+            let cur_term_rev = term_server.revision();
+            if cur_term_rev != last_term_rev {
+                last_term_rev = cur_term_rev;
+                for pane in panes.values_mut() {
+                    pane.refresh_prompt(pane.prompt.last_exit, pane.prompt.last_duration_ms);
+                }
+                dirty = true;
+            }
             let cur_app_icon_rev = blaze_shell::sysmon_driver::app_icon_revision();
             if cur_app_icon_rev != last_app_icon_rev {
                 last_app_icon_rev = cur_app_icon_rev;
@@ -6159,15 +6232,23 @@ mod macos_app {
                                     }
                                     let effects = term.take_effects();
                                     for eff in effects.iter() {
-                                        if let Effect::TitleChanged = eff
-                                            && pid == focused_pid
-                                        {
-                                            let t = String::from_utf8_lossy(term.title()).into_owned();
-                                            window.setTitle(&NSString::from_str(if t.is_empty() {
-                                                "blaze-shell"
-                                            } else {
-                                                &t
-                                            }));
+                                        match *eff {
+                                            Effect::TitleChanged if pid == focused_pid => {
+                                                let t = String::from_utf8_lossy(term.title()).into_owned();
+                                                window.setTitle(&NSString::from_str(if t.is_empty() {
+                                                    "blaze-shell"
+                                                } else {
+                                                    &t
+                                                }));
+                                            }
+                                            Effect::BlazeTermApi(span) => {
+                                                let (_mutated, reply) =
+                                                    term_server.handle_osc_7770(effects.bytes(span));
+                                                if let Some(osc_reply) = reply {
+                                                    ap.pty.write_all(osc_reply.as_bytes());
+                                                }
+                                            }
+                                            _ => {}
                                         }
                                     }
                                 }
@@ -6410,6 +6491,7 @@ mod macos_app {
                 }
                 let mut icons = icon_atlas.rasterize_quads(&scene.icon_quads);
                 icon_atlas.rasterize_emoji_quads_into(&scene.emoji_quads, &mut icons);
+                icon_atlas.rasterize_custom_symbol_quads_into(&scene.custom_symbols, &mut icons);
                 let overlay_icons = icon_atlas.rasterize_quads(&scene.overlay_icons);
                 for (slot, rgba) in icon_atlas.pending.drain(..) {
                     renderer.upload_icon(slot, &rgba);
@@ -6445,6 +6527,7 @@ mod macos_app {
                 scene.rects.clear();
                 scene.icon_quads.clear();
                 scene.emoji_quads.clear();
+                scene.custom_symbols.clear();
                 scene.image_quads.clear();
                 scene.over_rects.clear();
                 scene.overlay_rects.clear();
@@ -6476,5 +6559,6 @@ mod macos_app {
                 dirty = trail_start.is_some();
             }
         }
+        term_server.shutdown();
     }
 }
