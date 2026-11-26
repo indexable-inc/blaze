@@ -924,6 +924,7 @@ fn run_dep_build_script(
         host: crate::graph::TRIPLE,
         table: Arc::new(table),
         probes: None,
+        c_probes: None,
         c_mode: CMode::Deferred,
         mode: Mode::Check,
         native: None,
