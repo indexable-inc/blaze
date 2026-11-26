@@ -26,7 +26,9 @@ hardware-floor execution on 128-core servers and Apple Silicon Macs via one code
   `.agents/skills/must_read_blaze/SKILL.md` (`must_read_blaze`) and log missing features or
   stricter-is-better catches in `agents/feature-requests.md`. Spawn tasks as subagents by default so
   the coordinator stays free for incoming tasks. Sandbox blocking shell/tools? Stop immediately, ask
-  the user for full permissions, and wait.
+  the user for full permissions, and wait. After finishing a change, immediately land/merge it (PR +
+  smoke) and fast-forward/update the base branch head you branched off of (never leave finished work
+  sitting unmerged on a stale branch).
 - **Docs & skills:** [docs/contributing.md](docs/contributing.md), [docs/README.md](docs/README.md),
   and `.agents/skills/` (load the relevant skill before domain work, including `authoring-prompts`
   before editing rules/skills/briefs).
@@ -97,7 +99,7 @@ hardware-floor execution on 128-core servers and Apple Silicon Macs via one code
 - **69. every-command-has-a-timeout**: Put a timeout on every command; verify on real projects first; a hang is a bug to report.
 
 ### Landing (skill `landing`)
-- **37. land-through-pr**: Land small and often through a pull request with `.github/scripts/land.py`; never push to main.
+- **37. land-through-pr**: Land finished work immediately via PR (`land.py` + smoke) & fast-forward base branch; never push.
 - **68. proof-before-merge**: The PR quotes a release blaze running, checking and testing hello-world on the exact tree.
 
 ### Docs and scripts (skill `docs-and-scripts`)

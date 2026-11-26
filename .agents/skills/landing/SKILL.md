@@ -9,8 +9,10 @@ description: "How a change gets to main: the hello-world smoke run on the Mac or
 
 ## land-through-pr (rule 37)
 
-Land small and often through a pull request: `python3 .github/scripts/land.py '{"what": "what the
-branch does", "smoke": "smoke.txt"}'` opens it with the smoke quote in its body (the block
+After finishing a change, immediately land/merge it through a pull request and fast-forward/update
+the base branch head you branched off of — never leave finished work sitting unmerged on a stale
+branch. Land small and often through a pull request: `python3 .github/scripts/land.py '{"what":
+"what the branch does", "smoke": "smoke.txt"}'` opens it with the smoke quote in its body (the block
 `scripts/src/bin/smoke.rs` prints, first line `blaze-smoke 2`, for a release blaze built from the
 branch's head, which contains origin/main), waits for the merge gate, and merges once the gate
 passes and the quote still holds for the head GitHub has (`'{"follow": true}'` resumes the waiting).
