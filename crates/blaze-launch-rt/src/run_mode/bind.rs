@@ -155,8 +155,13 @@ impl<B: Bind> Bind for LauncherOwn<B> {
                 "execvp" => Some(addr(bin_remap::remap_execvp as *const ())),
                 #[cfg(target_os = "linux")]
                 "execvpe" => Some(addr(bin_remap::remap_execvpe as *const ())),
+                "execl" => Some(addr(bin_remap::remap_execl as *const ())),
+                "execlp" => Some(addr(bin_remap::remap_execlp as *const ())),
+                "execle" => Some(addr(bin_remap::remap_execle as *const ())),
                 "posix_spawn" => Some(addr(bin_remap::remap_posix_spawn as *const ())),
                 "posix_spawnp" => Some(addr(bin_remap::remap_posix_spawnp as *const ())),
+                "system" => Some(addr(bin_remap::remap_system as *const ())),
+                "popen" => Some(addr(bin_remap::remap_popen as *const ())),
                 "stat" => Some(addr(bin_remap::remap_stat as *const ())),
                 "lstat" => Some(addr(bin_remap::remap_lstat as *const ())),
                 "fstatat" => Some(addr(bin_remap::remap_fstatat as *const ())),

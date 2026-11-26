@@ -9,17 +9,21 @@
 //! namespaces, so `/target` cannot be created by an unprivileged test runner. Instead, runtime
 //! `CARGO_BIN_EXE_<name>` carries the real host stub path and this table remaps compile-time
 //! `/target/debug/bin/<package>/<name>` literals across `open`/`openat`/`fopen`/`stat*`/`access*`/
-//! `realpath`/`readlink*` AND across `exec*`/`posix_spawn*` `path`, `argv` (both exact arguments
-//! and embedded shell command strings), and `envp` so child processes such as `/bin/sh` receive
-//! the real host stub path.
+//! `realpath`/`readlink*` AND across every process-launching entry point (`execv`/`execve`/
+//! `execvp`/`execvpe`/`execl`/`execlp`/`execle`/`posix_spawn`/`posix_spawnp`/`system`/`popen`)
+//! so child processes such as `/bin/sh` receive the real host stub path.
 //!
 //! Installed once on the launcher's main thread before any guest thread starts (from
 //! `BLAZE_LAUNCH_BIN_MAP`, which is removed from the process environment immediately after).
-//! Every wrapper is lock-free and allocation-free (stack-bounded, failing closed with `E2BIG` on
-//! overflow) so `execve`/`execv`/`execvp`/`execvpe` remain async-signal-safe after `fork()`.
+//! Every wrapper is lock-free and async-signal-safe after `fork()`: small calls use a stack
+//! fast-path with zero syscalls, and arbitrarily large `argv`/`envp` or command buffers fall back
+//! to a raw `mmap(MAP_PRIVATE | MAP_ANON)` region freed via `munmap` on drop (no malloc locks, no
+//! artificial 255-argument cap).
 
-use core::ffi::{CStr, c_char, c_int};
+use core::ffi::{CStr, c_char, c_int, c_void};
+use core::mem::{align_of, size_of};
 use core::ptr;
+use core::slice;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
 use blaze_own::{ABox, AVec, Alloc, Box, Vec};
@@ -27,11 +31,11 @@ use blaze_own::{ABox, AVec, Alloc, Box, Vec};
 /// Fixed compile-time guest prefix emitted by `blaze_scope::crate_env::bin_exe`.
 const GUEST_PREFIX: &[u8] = b"/target/debug/bin/";
 
-/// Stack-bounded pointer array capacity for rewritten `argv`/`envp` (rule 18, async-signal-safe).
-const MAX_REMAP_PTRS: usize = 256;
+/// Fast-path stack pointer count before falling back to async-signal-safe anonymous `mmap`.
+const STACK_PTRS: usize = 256;
 
-/// Stack-bounded byte scratch capacity for rewritten embedded arguments/env strings.
-const MAX_REMAP_SCRATCH: usize = 16 * 1024;
+/// Fast-path stack scratch bytes before falling back to async-signal-safe anonymous `mmap`.
+const STACK_SCRATCH: usize = 16 * 1024;
 
 struct Entry {
     guest: AVec<'static, u8>,
@@ -142,6 +146,69 @@ fn find_subslice(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     None
 }
 
+enum MeasureResult {
+    Unchanged,
+    Exact(*const c_char),
+    /// Exact number of bytes required including the trailing NUL byte.
+    NeedsBytes(usize),
+}
+
+/// Measures whether `input` requires rewriting and, if embedded rewriting is needed, returns the
+/// exact output byte count (including trailing NUL) without allocating.
+fn measure_rewrite(input: &[u8], entries: &[Entry]) -> Result<MeasureResult, ()> {
+    let Some(first_hit) = find_subslice(input, GUEST_PREFIX, 0) else {
+        return Ok(MeasureResult::Unchanged);
+    };
+    if first_hit == 0 {
+        for entry in entries.iter() {
+            if entry.guest.as_slice() == input {
+                return Ok(MeasureResult::Exact(entry.host.as_ptr().cast::<c_char>()));
+            }
+        }
+    }
+    let mut pos = 0usize;
+    let mut out_len = 0usize;
+    let mut changed = false;
+    while pos < input.len() {
+        let Some(hit) = find_subslice(input, GUEST_PREFIX, pos) else {
+            break;
+        };
+        let mut matched: Option<&Entry> = None;
+        for entry in entries.iter() {
+            let g = entry.guest.as_slice();
+            if input.get(hit..hit + g.len()) == Some(g) {
+                let next_ok = input.get(hit + g.len()).is_none_or(|&b| !is_path_cont(b));
+                if next_ok && matched.is_none_or(|m| g.len() > m.guest.len()) {
+                    matched = Some(entry);
+                }
+            }
+        }
+        let Some(entry) = matched else {
+            let copy_end = hit + GUEST_PREFIX.len();
+            if changed {
+                out_len = out_len.checked_add(copy_end - pos).ok_or(())?;
+            }
+            pos = copy_end;
+            continue;
+        };
+        if !changed {
+            changed = true;
+            out_len = hit;
+        } else {
+            out_len = out_len.checked_add(hit - pos).ok_or(())?;
+        }
+        let host_len = entry.host.len().saturating_sub(1);
+        out_len = out_len.checked_add(host_len).ok_or(())?;
+        pos = hit + entry.guest.len();
+    }
+    if !changed {
+        return Ok(MeasureResult::Unchanged);
+    }
+    out_len = out_len.checked_add(input.len() - pos).ok_or(())?;
+    out_len = out_len.checked_add(1).ok_or(())?;
+    Ok(MeasureResult::NeedsBytes(out_len))
+}
+
 enum RewriteResult {
     Unchanged,
     Exact(*const c_char),
@@ -184,23 +251,18 @@ fn rewrite_bytes(
             }
         }
         let Some(entry) = matched else {
-            // Advance past `GUEST_PREFIX` so we don't spin on an unmapped `/target/debug/bin/...`.
             let copy_end = hit + GUEST_PREFIX.len();
             if changed {
                 let seg = input.get(pos..copy_end).ok_or(())?;
                 let dst = scratch.get_mut(*cursor..cursor.checked_add(seg.len()).ok_or(())?).ok_or(())?;
                 dst.copy_from_slice(seg);
                 *cursor += seg.len();
-                pos = copy_end;
-            } else {
-                // Keep delaying copy until an actual replacement is found.
-                pos = copy_end;
             }
+            pos = copy_end;
             continue;
         };
         if !changed {
             changed = true;
-            // Copy everything from index 0 up to `hit` now that we know a replacement happens.
             let prefix = input.get(..hit).ok_or(())?;
             let dst = scratch.get_mut(*cursor..cursor.checked_add(prefix.len()).ok_or(())?).ok_or(())?;
             dst.copy_from_slice(prefix);
@@ -211,7 +273,6 @@ fn rewrite_bytes(
             dst.copy_from_slice(gap);
             *cursor += gap.len();
         }
-        // `entry.host` ends with a trailing NUL byte; copy its path bytes only.
         let host_bytes = entry.host.get(..entry.host.len().saturating_sub(1)).ok_or(())?;
         let dst = scratch.get_mut(*cursor..cursor.checked_add(host_bytes.len()).ok_or(())?).ok_or(())?;
         dst.copy_from_slice(host_bytes);
@@ -231,15 +292,131 @@ fn rewrite_bytes(
     Ok(RewriteResult::Rewritten { start, end: *cursor })
 }
 
-/// Rewrites a NUL-terminated `char* const*` list (`argv` or `envp`) into caller stack storage
-/// whenever any string matches or embeds an installed `/target/debug/bin/<package>/<name>` path.
-/// Returns `Ok(original_list)` untouched if no entry needed rewriting, `Ok(ptrs.as_ptr())` if
-/// rewritten, or `Err(())` (`E2BIG`) if the stack bounds would be exceeded.
+/// Async-signal-safe anonymous `mmap` allocation used ONLY when a rewritten `argv`/`envp` or
+/// command string exceeds the stack fast-path (`STACK_PTRS` / `STACK_SCRATCH`).
+/// Automatically unmapped on drop (or reclaimed by the kernel on successful `exec*`).
+struct MmapGuard {
+    ptr: *mut c_void,
+    len: usize,
+}
+
+impl MmapGuard {
+    const EMPTY: MmapGuard = MmapGuard { ptr: ptr::null_mut(), len: 0 };
+
+    fn alloc(len: usize) -> Result<MmapGuard, ()> {
+        if len == 0 {
+            return Ok(MmapGuard::EMPTY);
+        }
+        // SAFETY: anonymous private mapping touches no allocator locks and is async-signal-safe.
+        let ptr = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED || ptr.is_null() {
+            return Err(());
+        }
+        Ok(MmapGuard { ptr, len })
+    }
+}
+
+impl Drop for MmapGuard {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() && self.len > 0 {
+            // SAFETY: `self.ptr` and `self.len` came from `libc::mmap` in `MmapGuard::alloc`.
+            unsafe {
+                let _ = libc::munmap(self.ptr, self.len);
+            }
+        }
+    }
+}
+
+/// Rewrites a NUL-terminated `char* const*` list (`argv` or `envp`) whenever any entry matches or
+/// embeds an installed `/target/debug/bin/<package>/<name>` path.
+///
+/// Uses caller stack storage (`stack_ptrs` + `stack_scratch`) on the fast path, and falls back to
+/// an async-signal-safe anonymous `mmap` stored in `mmap_guard` for arbitrarily large vectors.
+unsafe fn remap_cstr_list_with(
+    list: *const *const c_char,
+    entries: &[Entry],
+    stack_ptrs: &mut [*const c_char; STACK_PTRS],
+    stack_scratch: &mut [u8; STACK_SCRATCH],
+    mmap_guard: &mut MmapGuard,
+) -> Result<*const *const c_char, ()> {
+    if list.is_null() {
+        return Ok(list);
+    }
+    // Pass 1: measure total pointer count and rewritten byte budget without allocating.
+    let mut count = 0usize;
+    let mut any_changed = false;
+    let mut need_bytes = 0usize;
+    loop {
+        // SAFETY: caller passes a valid NUL-terminated `argv`/`envp` pointer array.
+        let elem = unsafe { *list.add(count) };
+        if elem.is_null() {
+            break;
+        }
+        let bytes = unsafe { CStr::from_ptr(elem) }.to_bytes();
+        match measure_rewrite(bytes, entries)? {
+            MeasureResult::Unchanged => {}
+            MeasureResult::Exact(_) => any_changed = true,
+            MeasureResult::NeedsBytes(n) => {
+                any_changed = true;
+                need_bytes = need_bytes.checked_add(n).ok_or(())?;
+            }
+        }
+        count = count.checked_add(1).ok_or(())?;
+    }
+    if !any_changed {
+        return Ok(list);
+    }
+    let ptr_slots = count.checked_add(1).ok_or(())?;
+    let (ptrs_slice, scratch_slice): (&mut [*const c_char], &mut [u8]) =
+        if ptr_slots <= STACK_PTRS && need_bytes <= STACK_SCRATCH {
+            (stack_ptrs.as_mut_slice(), stack_scratch.as_mut_slice())
+        } else {
+            let ptr_bytes = ptr_slots.checked_mul(size_of::<*const c_char>()).ok_or(())?;
+            let total = ptr_bytes.checked_add(need_bytes).ok_or(())?;
+            *mmap_guard = MmapGuard::alloc(total)?;
+            // SAFETY: `mmap` returns page-aligned memory (>= `align_of::<*const c_char>()`),
+            // valid for `ptr_bytes + need_bytes` bytes, exclusively owned by `mmap_guard`.
+            let _ = align_of::<*const c_char>();
+            let p_slice = unsafe { slice::from_raw_parts_mut(mmap_guard.ptr.cast::<*const c_char>(), ptr_slots) };
+            let b_ptr = unsafe { mmap_guard.ptr.cast::<u8>().add(ptr_bytes) };
+            let b_slice = unsafe { slice::from_raw_parts_mut(b_ptr, need_bytes) };
+            (p_slice, b_slice)
+        };
+
+    // Pass 2: populate pointer table and rewritten strings.
+    let mut cursor = 0usize;
+    for i in 0..count {
+        // SAFETY: `i < count`, valid elements of `list`.
+        let elem = unsafe { *list.add(i) };
+        let bytes = unsafe { CStr::from_ptr(elem) }.to_bytes();
+        let out_ptr = match rewrite_bytes(bytes, entries, scratch_slice, &mut cursor)? {
+            RewriteResult::Unchanged => elem,
+            RewriteResult::Exact(host) => host,
+            RewriteResult::Rewritten { start, .. } => {
+                // SAFETY: `start < scratch_slice.len()` and string is NUL-terminated.
+                unsafe { scratch_slice.as_ptr().add(start).cast::<c_char>() }
+            }
+        };
+        *ptrs_slice.get_mut(i).ok_or(())? = out_ptr;
+    }
+    *ptrs_slice.get_mut(count).ok_or(())? = ptr::null();
+    Ok(ptrs_slice.as_ptr())
+}
+
 unsafe fn remap_cstr_list(
     list: *const *const c_char,
-    ptrs: &mut [*const c_char; MAX_REMAP_PTRS],
-    scratch: &mut [u8; MAX_REMAP_SCRATCH],
-    cursor: &mut usize,
+    stack_ptrs: &mut [*const c_char; STACK_PTRS],
+    stack_scratch: &mut [u8; STACK_SCRATCH],
+    mmap_guard: &mut MmapGuard,
 ) -> Result<*const *const c_char, ()> {
     if list.is_null() {
         return Ok(list);
@@ -250,63 +427,60 @@ unsafe fn remap_cstr_list(
     }
     // SAFETY: `map_ptr` was published once and never freed for the life of the process.
     let entries = unsafe { (*map_ptr).entries.as_slice() };
-    let mut any_changed = false;
-    let mut count = 0usize;
-    loop {
-        // SAFETY: caller passes a valid NUL-terminated `argv`/`envp` pointer array.
-        let elem = unsafe { *list.add(count) };
-        if elem.is_null() {
-            break;
-        }
-        let bytes = unsafe { CStr::from_ptr(elem) }.to_bytes();
-        let next_ptr = match rewrite_bytes(bytes, entries, scratch.as_mut_slice(), cursor)? {
-            RewriteResult::Unchanged => elem,
-            RewriteResult::Exact(host) => {
-                any_changed = true;
-                host
-            }
-            RewriteResult::Rewritten { start, .. } => {
-                any_changed = true;
-                // SAFETY: `start < MAX_REMAP_SCRATCH` and `scratch[start..end]` is NUL-terminated.
-                unsafe { scratch.as_ptr().add(start).cast::<c_char>() }
-            }
-        };
-        if any_changed {
-            // Backfill any earlier unchanged elements on first change.
-            if count >= MAX_REMAP_PTRS - 1 {
-                return Err(());
-            }
-            if ptrs.first().is_some_and(|p| p.is_null()) && count > 0 {
-                for i in 0..count {
-                    // SAFETY: `i < count`, valid elements of `list`.
-                    *ptrs.get_mut(i).ok_or(())? = unsafe { *list.add(i) };
+    unsafe { remap_cstr_list_with(list, entries, stack_ptrs, stack_scratch, mmap_guard) }
+}
+
+/// Rewrites a single shell command C string (for `system` / `popen`) into stack storage or
+/// `mmap_guard` when larger than `STACK_SCRATCH`.
+unsafe fn remap_cmd_cstr(
+    cmd: *const c_char,
+    stack_scratch: &mut [u8; STACK_SCRATCH],
+    mmap_guard: &mut MmapGuard,
+) -> Result<*const c_char, ()> {
+    if cmd.is_null() {
+        return Ok(cmd);
+    }
+    let map_ptr = MAP.load(Ordering::Acquire);
+    if map_ptr.is_null() {
+        return Ok(cmd);
+    }
+    // SAFETY: `map_ptr` was published once and never freed for the life of the process.
+    let entries = unsafe { (*map_ptr).entries.as_slice() };
+    let bytes = unsafe { CStr::from_ptr(cmd) }.to_bytes();
+    match measure_rewrite(bytes, entries)? {
+        MeasureResult::Unchanged => Ok(cmd),
+        MeasureResult::Exact(host) => Ok(host),
+        MeasureResult::NeedsBytes(need) => {
+            let buf: &mut [u8] = if need <= STACK_SCRATCH {
+                stack_scratch.as_mut_slice()
+            } else {
+                *mmap_guard = MmapGuard::alloc(need)?;
+                // SAFETY: `mmap_guard` owns `need` writable bytes.
+                unsafe { slice::from_raw_parts_mut(mmap_guard.ptr.cast::<u8>(), need) }
+            };
+            let mut cursor = 0usize;
+            match rewrite_bytes(bytes, entries, buf, &mut cursor)? {
+                RewriteResult::Unchanged => Ok(cmd),
+                RewriteResult::Exact(host) => Ok(host),
+                RewriteResult::Rewritten { start, .. } => {
+                    Ok(unsafe { buf.as_ptr().add(start).cast::<c_char>() })
                 }
             }
-            *ptrs.get_mut(count).ok_or(())? = next_ptr;
-        }
-        count += 1;
-        if any_changed && count >= MAX_REMAP_PTRS {
-            return Err(());
         }
     }
-    if !any_changed {
-        return Ok(list);
-    }
-    *ptrs.get_mut(count).ok_or(())? = ptr::null();
-    Ok(ptrs.as_ptr())
 }
 
 #[inline]
-fn set_errno_e2big() {
+fn set_errno(val: c_int) {
     #[cfg(target_os = "linux")]
     // SAFETY: `__errno_location()` returns the calling thread's valid `errno` pointer.
     unsafe {
-        *libc::__errno_location() = libc::E2BIG;
+        *libc::__errno_location() = val;
     }
     #[cfg(target_os = "macos")]
     // SAFETY: `__error()` returns the calling thread's valid `errno` pointer.
     unsafe {
-        *libc::__error() = libc::E2BIG;
+        *libc::__error() = val;
     }
 }
 
@@ -346,43 +520,45 @@ pub(crate) extern "C" fn remap_execve(
     argv: *const *const c_char,
     envp: *const *const c_char,
 ) -> c_int {
-    let mut argv_ptrs = [ptr::null(); MAX_REMAP_PTRS];
-    let mut envp_ptrs = [ptr::null(); MAX_REMAP_PTRS];
-    let mut scratch = [0u8; MAX_REMAP_SCRATCH];
-    let mut cursor = 0usize;
-    let Ok(new_argv) = (unsafe { remap_cstr_list(argv, &mut argv_ptrs, &mut scratch, &mut cursor) }) else {
-        set_errno_e2big();
+    let mut argv_ptrs = [ptr::null(); STACK_PTRS];
+    let mut envp_ptrs = [ptr::null(); STACK_PTRS];
+    let mut argv_scratch = [0u8; STACK_SCRATCH];
+    let mut envp_scratch = [0u8; STACK_SCRATCH];
+    let mut argv_mmap = MmapGuard::EMPTY;
+    let mut envp_mmap = MmapGuard::EMPTY;
+    let Ok(new_argv) = (unsafe { remap_cstr_list(argv, &mut argv_ptrs, &mut argv_scratch, &mut argv_mmap) }) else {
+        set_errno(libc::ENOMEM);
         return -1;
     };
-    let Ok(new_envp) = (unsafe { remap_cstr_list(envp, &mut envp_ptrs, &mut scratch, &mut cursor) }) else {
-        set_errno_e2big();
+    let Ok(new_envp) = (unsafe { remap_cstr_list(envp, &mut envp_ptrs, &mut envp_scratch, &mut envp_mmap) }) else {
+        set_errno(libc::ENOMEM);
         return -1;
     };
-    // SAFETY: `remap_cstr`, `new_argv`, and `new_envp` live on this stack frame across `execve`.
+    // SAFETY: `remap_cstr`, `new_argv`, and `new_envp` stay live across `execve`.
     unsafe { libc::execve(remap_cstr(path), new_argv, new_envp) }
 }
 
 pub(crate) extern "C" fn remap_execv(path: *const c_char, argv: *const *const c_char) -> c_int {
-    let mut argv_ptrs = [ptr::null(); MAX_REMAP_PTRS];
-    let mut scratch = [0u8; MAX_REMAP_SCRATCH];
-    let mut cursor = 0usize;
-    let Ok(new_argv) = (unsafe { remap_cstr_list(argv, &mut argv_ptrs, &mut scratch, &mut cursor) }) else {
-        set_errno_e2big();
+    let mut argv_ptrs = [ptr::null(); STACK_PTRS];
+    let mut argv_scratch = [0u8; STACK_SCRATCH];
+    let mut argv_mmap = MmapGuard::EMPTY;
+    let Ok(new_argv) = (unsafe { remap_cstr_list(argv, &mut argv_ptrs, &mut argv_scratch, &mut argv_mmap) }) else {
+        set_errno(libc::ENOMEM);
         return -1;
     };
-    // SAFETY: `remap_cstr` and `new_argv` live on this stack frame across `execv`.
+    // SAFETY: `remap_cstr` and `new_argv` stay live across `execv`.
     unsafe { libc::execv(remap_cstr(path), new_argv) }
 }
 
 pub(crate) extern "C" fn remap_execvp(file: *const c_char, argv: *const *const c_char) -> c_int {
-    let mut argv_ptrs = [ptr::null(); MAX_REMAP_PTRS];
-    let mut scratch = [0u8; MAX_REMAP_SCRATCH];
-    let mut cursor = 0usize;
-    let Ok(new_argv) = (unsafe { remap_cstr_list(argv, &mut argv_ptrs, &mut scratch, &mut cursor) }) else {
-        set_errno_e2big();
+    let mut argv_ptrs = [ptr::null(); STACK_PTRS];
+    let mut argv_scratch = [0u8; STACK_SCRATCH];
+    let mut argv_mmap = MmapGuard::EMPTY;
+    let Ok(new_argv) = (unsafe { remap_cstr_list(argv, &mut argv_ptrs, &mut argv_scratch, &mut argv_mmap) }) else {
+        set_errno(libc::ENOMEM);
         return -1;
     };
-    // SAFETY: `remap_cstr` and `new_argv` live on this stack frame across `execvp`.
+    // SAFETY: `remap_cstr` and `new_argv` stay live across `execvp`.
     unsafe { libc::execvp(remap_cstr(file), new_argv) }
 }
 
@@ -392,20 +568,133 @@ pub(crate) extern "C" fn remap_execvpe(
     argv: *const *const c_char,
     envp: *const *const c_char,
 ) -> c_int {
-    let mut argv_ptrs = [ptr::null(); MAX_REMAP_PTRS];
-    let mut envp_ptrs = [ptr::null(); MAX_REMAP_PTRS];
-    let mut scratch = [0u8; MAX_REMAP_SCRATCH];
-    let mut cursor = 0usize;
-    let Ok(new_argv) = (unsafe { remap_cstr_list(argv, &mut argv_ptrs, &mut scratch, &mut cursor) }) else {
-        set_errno_e2big();
+    let mut argv_ptrs = [ptr::null(); STACK_PTRS];
+    let mut envp_ptrs = [ptr::null(); STACK_PTRS];
+    let mut argv_scratch = [0u8; STACK_SCRATCH];
+    let mut envp_scratch = [0u8; STACK_SCRATCH];
+    let mut argv_mmap = MmapGuard::EMPTY;
+    let mut envp_mmap = MmapGuard::EMPTY;
+    let Ok(new_argv) = (unsafe { remap_cstr_list(argv, &mut argv_ptrs, &mut argv_scratch, &mut argv_mmap) }) else {
+        set_errno(libc::ENOMEM);
         return -1;
     };
-    let Ok(new_envp) = (unsafe { remap_cstr_list(envp, &mut envp_ptrs, &mut scratch, &mut cursor) }) else {
-        set_errno_e2big();
+    let Ok(new_envp) = (unsafe { remap_cstr_list(envp, &mut envp_ptrs, &mut envp_scratch, &mut envp_mmap) }) else {
+        set_errno(libc::ENOMEM);
         return -1;
     };
-    // SAFETY: `remap_cstr`, `new_argv`, and `new_envp` live on this stack frame across `execvpe`.
+    // SAFETY: `remap_cstr`, `new_argv`, and `new_envp` stay live across `execvpe`.
     unsafe { libc::execvpe(remap_cstr(file), new_argv, new_envp) }
+}
+
+/// Collects variadic `execl`/`execlp`/`execle` arguments into a stack buffer (falling back to
+/// async-signal-safe anonymous `mmap` when > `STACK_PTRS - 1` args), then calls `f(argv, envp)`.
+unsafe fn collect_execl_args<F>(
+    arg0: *const c_char,
+    mut args: core::ffi::VaList<'_>,
+    has_envp: bool,
+    f: F,
+) -> c_int
+where
+    F: FnOnce(*const *const c_char, *const *const c_char) -> c_int,
+{
+    let mut stack = [ptr::null::<c_char>(); STACK_PTRS];
+    let mut count = 0usize;
+    let mut mmap = MmapGuard::EMPTY;
+    let mut mmap_cap = 0usize;
+    let mut cur = arg0;
+    loop {
+        if mmap.ptr.is_null() {
+            if count < STACK_PTRS - 1 {
+                if let Some(slot) = stack.get_mut(count) {
+                    *slot = cur;
+                }
+            } else {
+                let new_cap = STACK_PTRS.saturating_mul(2);
+                let Some(bytes) = new_cap.checked_mul(size_of::<*const c_char>()) else {
+                    set_errno(libc::ENOMEM);
+                    return -1;
+                };
+                let Ok(buf) = MmapGuard::alloc(bytes) else {
+                    set_errno(libc::ENOMEM);
+                    return -1;
+                };
+                // SAFETY: `buf` is page-aligned and holds `new_cap` pointers.
+                unsafe {
+                    ptr::copy_nonoverlapping(stack.as_ptr(), buf.ptr.cast::<*const c_char>(), count);
+                    *buf.ptr.cast::<*const c_char>().add(count) = cur;
+                }
+                mmap = buf;
+                mmap_cap = new_cap;
+            }
+        } else {
+            if count >= mmap_cap - 1 {
+                let Some(new_cap) = mmap_cap.checked_mul(2) else {
+                    set_errno(libc::ENOMEM);
+                    return -1;
+                };
+                let Some(bytes) = new_cap.checked_mul(size_of::<*const c_char>()) else {
+                    set_errno(libc::ENOMEM);
+                    return -1;
+                };
+                let Ok(buf) = MmapGuard::alloc(bytes) else {
+                    set_errno(libc::ENOMEM);
+                    return -1;
+                };
+                // SAFETY: `buf` holds `new_cap` pointers; old `mmap` is unmapped on replacement.
+                unsafe {
+                    ptr::copy_nonoverlapping(mmap.ptr.cast::<*const c_char>(), buf.ptr.cast::<*const c_char>(), count);
+                }
+                mmap = buf;
+                mmap_cap = new_cap;
+            }
+            // SAFETY: `count < mmap_cap - 1`.
+            unsafe {
+                *mmap.ptr.cast::<*const c_char>().add(count) = cur;
+            }
+        }
+        if cur.is_null() {
+            break;
+        }
+        count += 1;
+        // SAFETY: POSIX `execl*` variadic arguments are `*const c_char` terminated by `NULL`.
+        cur = unsafe { args.next_arg::<*const c_char>() };
+    }
+    let envp = if has_envp {
+        // SAFETY: POSIX `execle` passes `envp: *const *const c_char` immediately after `NULL`.
+        unsafe { args.next_arg::<*const *const c_char>() }
+    } else {
+        ptr::null()
+    };
+    let argv = if mmap.ptr.is_null() {
+        stack.as_ptr()
+    } else {
+        mmap.ptr.cast::<*const c_char>()
+    };
+    f(argv, envp)
+}
+
+pub(crate) unsafe extern "C" fn remap_execl(
+    path: *const c_char,
+    arg0: *const c_char,
+    args: ...
+) -> c_int {
+    unsafe { collect_execl_args(arg0, args, false, |argv, _| remap_execv(path, argv)) }
+}
+
+pub(crate) unsafe extern "C" fn remap_execlp(
+    file: *const c_char,
+    arg0: *const c_char,
+    args: ...
+) -> c_int {
+    unsafe { collect_execl_args(arg0, args, false, |argv, _| remap_execvp(file, argv)) }
+}
+
+pub(crate) unsafe extern "C" fn remap_execle(
+    path: *const c_char,
+    arg0: *const c_char,
+    args: ...
+) -> c_int {
+    unsafe { collect_execl_args(arg0, args, true, |argv, envp| remap_execve(path, argv, envp)) }
 }
 
 pub(crate) extern "C" fn remap_posix_spawn(
@@ -416,17 +705,19 @@ pub(crate) extern "C" fn remap_posix_spawn(
     argv: *const *mut c_char,
     envp: *const *mut c_char,
 ) -> c_int {
-    let mut argv_ptrs = [ptr::null(); MAX_REMAP_PTRS];
-    let mut envp_ptrs = [ptr::null(); MAX_REMAP_PTRS];
-    let mut scratch = [0u8; MAX_REMAP_SCRATCH];
-    let mut cursor = 0usize;
-    let Ok(new_argv) = (unsafe { remap_cstr_list(argv.cast(), &mut argv_ptrs, &mut scratch, &mut cursor) }) else {
-        return libc::E2BIG;
+    let mut argv_ptrs = [ptr::null(); STACK_PTRS];
+    let mut envp_ptrs = [ptr::null(); STACK_PTRS];
+    let mut argv_scratch = [0u8; STACK_SCRATCH];
+    let mut envp_scratch = [0u8; STACK_SCRATCH];
+    let mut argv_mmap = MmapGuard::EMPTY;
+    let mut envp_mmap = MmapGuard::EMPTY;
+    let Ok(new_argv) = (unsafe { remap_cstr_list(argv.cast(), &mut argv_ptrs, &mut argv_scratch, &mut argv_mmap) }) else {
+        return libc::ENOMEM;
     };
-    let Ok(new_envp) = (unsafe { remap_cstr_list(envp.cast(), &mut envp_ptrs, &mut scratch, &mut cursor) }) else {
-        return libc::E2BIG;
+    let Ok(new_envp) = (unsafe { remap_cstr_list(envp.cast(), &mut envp_ptrs, &mut envp_scratch, &mut envp_mmap) }) else {
+        return libc::ENOMEM;
     };
-    // SAFETY: POSIX `posix_spawn` never mutates `argv`/`envp` strings; stack buffers outlive the call.
+    // SAFETY: POSIX `posix_spawn` never mutates `argv`/`envp` strings; buffers outlive the call.
     unsafe {
         libc::posix_spawn(
             pid,
@@ -447,17 +738,19 @@ pub(crate) extern "C" fn remap_posix_spawnp(
     argv: *const *mut c_char,
     envp: *const *mut c_char,
 ) -> c_int {
-    let mut argv_ptrs = [ptr::null(); MAX_REMAP_PTRS];
-    let mut envp_ptrs = [ptr::null(); MAX_REMAP_PTRS];
-    let mut scratch = [0u8; MAX_REMAP_SCRATCH];
-    let mut cursor = 0usize;
-    let Ok(new_argv) = (unsafe { remap_cstr_list(argv.cast(), &mut argv_ptrs, &mut scratch, &mut cursor) }) else {
-        return libc::E2BIG;
+    let mut argv_ptrs = [ptr::null(); STACK_PTRS];
+    let mut envp_ptrs = [ptr::null(); STACK_PTRS];
+    let mut argv_scratch = [0u8; STACK_SCRATCH];
+    let mut envp_scratch = [0u8; STACK_SCRATCH];
+    let mut argv_mmap = MmapGuard::EMPTY;
+    let mut envp_mmap = MmapGuard::EMPTY;
+    let Ok(new_argv) = (unsafe { remap_cstr_list(argv.cast(), &mut argv_ptrs, &mut argv_scratch, &mut argv_mmap) }) else {
+        return libc::ENOMEM;
     };
-    let Ok(new_envp) = (unsafe { remap_cstr_list(envp.cast(), &mut envp_ptrs, &mut scratch, &mut cursor) }) else {
-        return libc::E2BIG;
+    let Ok(new_envp) = (unsafe { remap_cstr_list(envp.cast(), &mut envp_ptrs, &mut envp_scratch, &mut envp_mmap) }) else {
+        return libc::ENOMEM;
     };
-    // SAFETY: POSIX `posix_spawnp` never mutates `argv`/`envp` strings; stack buffers outlive the call.
+    // SAFETY: POSIX `posix_spawnp` never mutates `argv`/`envp` strings; buffers outlive the call.
     unsafe {
         libc::posix_spawnp(
             pid,
@@ -468,6 +761,31 @@ pub(crate) extern "C" fn remap_posix_spawnp(
             new_envp.cast::<*mut c_char>(),
         )
     }
+}
+
+pub(crate) extern "C" fn remap_system(command: *const c_char) -> c_int {
+    let mut scratch = [0u8; STACK_SCRATCH];
+    let mut mmap = MmapGuard::EMPTY;
+    let Ok(cmd) = (unsafe { remap_cmd_cstr(command, &mut scratch, &mut mmap) }) else {
+        set_errno(libc::ENOMEM);
+        return -1;
+    };
+    // SAFETY: `cmd` is null or a valid NUL-terminated string live across `libc::system`.
+    unsafe { libc::system(cmd) }
+}
+
+pub(crate) extern "C" fn remap_popen(
+    command: *const c_char,
+    mode: *const c_char,
+) -> *mut libc::FILE {
+    let mut scratch = [0u8; STACK_SCRATCH];
+    let mut mmap = MmapGuard::EMPTY;
+    let Ok(cmd) = (unsafe { remap_cmd_cstr(command, &mut scratch, &mut mmap) }) else {
+        set_errno(libc::ENOMEM);
+        return ptr::null_mut();
+    };
+    // SAFETY: `cmd` and `mode` are valid NUL-terminated C strings live across `libc::popen`.
+    unsafe { libc::popen(cmd, mode) }
 }
 
 pub(crate) extern "C" fn remap_stat(path: *const c_char, buf: *mut libc::stat) -> c_int {
@@ -606,9 +924,15 @@ pub(crate) unsafe extern "C" fn remap_openat(
 
 #[cfg(test)]
 mod tests {
-    use core::ffi::CStr;
+    use core::ffi::{CStr, c_char};
+    use core::ptr;
 
-    use super::{BinRemapError, RewriteResult, parse_entries, rewrite_bytes};
+    use blaze_own::Vec;
+
+    use super::{
+        BinRemapError, MmapGuard, RewriteResult, STACK_PTRS, STACK_SCRATCH, parse_entries,
+        remap_cstr_list_with, rewrite_bytes,
+    };
 
     #[test]
     fn parse_valid_and_rejects_malformed() {
@@ -634,14 +958,12 @@ mod tests {
         let mut scratch = [0u8; 256];
         let mut cursor = 0usize;
 
-        // Unrelated argument stays untouched.
         assert!(matches!(
             rewrite_bytes(b"--flag=value", entries.as_slice(), &mut scratch, &mut cursor),
             Ok(RewriteResult::Unchanged)
         ));
         assert_eq!(cursor, 0);
 
-        // Exact argument returns direct `'static` host pointer without consuming scratch.
         let Ok(RewriteResult::Exact(ptr)) =
             rewrite_bytes(b"/target/debug/bin/app/cli", entries.as_slice(), &mut scratch, &mut cursor)
         else {
@@ -650,7 +972,6 @@ mod tests {
         assert_eq!(unsafe { CStr::from_ptr(ptr) }.to_bytes(), b"/host/b/app/cli");
         assert_eq!(cursor, 0);
 
-        // Embedded shell script rewrites both paths and respects path boundaries (`cli` vs `cli-v2`).
         let Ok(RewriteResult::Rewritten { start, end }) = rewrite_bytes(
             b"\"/target/debug/bin/app/cli\" && /target/debug/bin/app/cli-v2 --ok",
             entries.as_slice(),
@@ -662,13 +983,11 @@ mod tests {
         assert_eq!(&scratch[start..end - 1], b"\"/host/b/app/cli\" && /host/b/app/cli-v2 --ok");
         assert_eq!(scratch[end - 1], 0);
 
-        // Unmapped longer prefix `/target/debug/bin/app/cli2` is NOT corrupted by `cli`.
         assert!(matches!(
             rewrite_bytes(b"/target/debug/bin/app/cli2", entries.as_slice(), &mut scratch, &mut cursor),
             Ok(RewriteResult::Unchanged)
         ));
 
-        // Environment variable `MY_BIN=/target/debug/bin/app/cli` is rewritten cleanly.
         let Ok(RewriteResult::Rewritten { start, end }) = rewrite_bytes(
             b"MY_BIN=/target/debug/bin/app/cli",
             entries.as_slice(),
@@ -679,11 +998,53 @@ mod tests {
         };
         assert_eq!(&scratch[start..end - 1], b"MY_BIN=/host/b/app/cli");
 
-        // Overflow fails closed with `Err(())` (`E2BIG`).
         let mut tiny = [0u8; 8];
         let mut tiny_cur = 0usize;
         assert!(
             rewrite_bytes(b"X=/target/debug/bin/app/cli", entries.as_slice(), &mut tiny, &mut tiny_cur).is_err()
         );
+    }
+
+    #[test]
+    fn remap_cstr_list_handles_large_vectors_past_stack_threshold() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let entries = parse_entries(b"/target/debug/bin/app/cli\t/host/b/app/cli\n", alloc).expect("entries");
+        let plain = c"arg".as_ptr();
+        let exact = c"/target/debug/bin/app/cli".as_ptr();
+        let embedded = c"RUN=/target/debug/bin/app/cli --flag".as_ptr();
+        let mut raw: Vec<*const c_char, _> = Vec::with_capacity_in(402, alloc);
+        for i in 0..400usize {
+            if i == 300 {
+                raw.push(exact);
+            } else if i == 350 {
+                raw.push(embedded);
+            } else {
+                raw.push(plain);
+            }
+        }
+        raw.push(ptr::null());
+
+        let mut stack_ptrs = [ptr::null(); STACK_PTRS];
+        let mut stack_scratch = [0u8; STACK_SCRATCH];
+        let mut mmap_guard = MmapGuard::EMPTY;
+        let out = unsafe {
+            remap_cstr_list_with(
+                raw.as_ptr(),
+                entries.as_slice(),
+                &mut stack_ptrs,
+                &mut stack_scratch,
+                &mut mmap_guard,
+            )
+        }
+        .expect("400-element argv must succeed via anonymous mmap");
+        assert!(!mmap_guard.ptr.is_null(), "expected mmap fallback for > STACK_PTRS entries");
+        assert_eq!(unsafe { CStr::from_ptr(*out.add(0)) }.to_bytes(), b"arg");
+        assert_eq!(unsafe { CStr::from_ptr(*out.add(300)) }.to_bytes(), b"/host/b/app/cli");
+        assert_eq!(
+            unsafe { CStr::from_ptr(*out.add(350)) }.to_bytes(),
+            b"RUN=/host/b/app/cli --flag"
+        );
+        assert_eq!(unsafe { CStr::from_ptr(*out.add(399)) }.to_bytes(), b"arg");
+        assert!(unsafe { *out.add(400) }.is_null());
     }
 }

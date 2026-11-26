@@ -1099,25 +1099,49 @@ impl<'a, 'h> BinServer<'a, 'h> {
             }
             let ready = match poll(self.pollfds.as_mut_slice(), timeout) {
                 Ok(n) => n,
-                Err(_) => break,
+                Err(Errno::Intr) => continue,
+                Err(errno) => {
+                    return Err(BinServeError {
+                        owner: None,
+                        package: owned_text("<listener>", self.tables),
+                        bin: owned_text("<listener>", self.tables),
+                        why: BinServeWhy::ListenerPoll(errno),
+                    });
+                }
             };
             if ready == 0 {
                 break;
             }
             let mut burst_progress = false;
-            if let Some(listen_pfd) = self.pollfds.first()
-                && listen_pfd.found().contains(PollEvents::IN)
-            {
-                loop {
-                    match blaze_sys::posix::net::accept_unix(self.listener.fd()) {
-                        Ok(fd) => {
-                            let same_uid = blaze_sys::posix::net::peer_is_self_uid(fd.fd()).unwrap_or(false);
-                            if self.proto.accept(same_uid, fd).is_some() {
-                                burst_progress = true;
+            if let Some(listen_pfd) = self.pollfds.first() {
+                let found = listen_pfd.found();
+                if found.contains(PollEvents::ERR) || found.contains(PollEvents::NVAL) {
+                    return Err(BinServeError {
+                        owner: None,
+                        package: owned_text("<listener>", self.tables),
+                        bin: owned_text("<listener>", self.tables),
+                        why: BinServeWhy::ListenerPoll(Errno::BadF),
+                    });
+                }
+                if found.contains(PollEvents::IN) {
+                    loop {
+                        match blaze_sys::posix::net::accept_unix(self.listener.fd()) {
+                            Ok(fd) => {
+                                let same_uid = blaze_sys::posix::net::peer_is_self_uid(fd.fd()).unwrap_or(false);
+                                if self.proto.accept(same_uid, fd).is_some() {
+                                    burst_progress = true;
+                                }
+                            }
+                            Err(Errno::Again | Errno::Intr) => break,
+                            Err(errno) => {
+                                return Err(BinServeError {
+                                    owner: None,
+                                    package: owned_text("<listener>", self.tables),
+                                    bin: owned_text("<listener>", self.tables),
+                                    why: BinServeWhy::ListenerPoll(errno),
+                                });
                             }
                         }
-                        Err(Errno::Again) => break,
-                        Err(_) => break,
                     }
                 }
             }
