@@ -222,12 +222,107 @@ impl<'a> DustMachine<'a> {
     }
 }
 
-/// Compute a smooth visual `dust` bar fraction (`0.0..=1.0`) for `bytes` against `max_bytes`.
+/// Binary IEC magnitude tier for subtle visual color-coding of `dust` size bars.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SizeTier {
+    /// `< 1 KiB`
+    Bytes,
+    /// `1 KiB .. 1 MiB`
+    KiB,
+    /// `1 MiB .. 1 GiB`
+    MiB,
+    /// `>= 1 GiB`
+    GiB,
+}
+
+/// Classify `bytes` into its IEC binary order of magnitude (`2^10`, `2^20`, `2^30`).
+pub const fn size_tier(bytes: u64) -> SizeTier {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * 1024 * 1024;
+    if bytes < KIB {
+        SizeTier::Bytes
+    } else if bytes < MIB {
+        SizeTier::KiB
+    } else if bytes < GIB {
+        SizeTier::MiB
+    } else {
+        SizeTier::GiB
+    }
+}
+
+/// Pure `#![no_std]` IEEE-754 base-2 logarithm for positive finite `x >= 1.0`.
+///
+/// Exact on powers of two and accurate to `< 1e-4` across `[1, 2^64]`, matching IEC binary
+/// orders of magnitude (`+10` = `1 KiB`, `+20` = `1 MiB`, `+30` = `1 GiB`).
+fn log2_pos(x: f64) -> f64 {
+    if x <= 1.0 {
+        return 0.0;
+    }
+    let bits = x.to_bits();
+    let exp = ((bits >> 52) & 0x7ff) as i32 - 1023;
+    // Normalized mantissa `m` in `[1.0, 2.0)`.
+    let m = f64::from_bits((bits & 0x000f_ffff_ffff_ffff) | 0x3ff0_0000_0000_0000);
+    // Minimax / Padé approximation of `log2(m)` on `[1, 2)` via `t = (m - 1) / (m + 1)`.
+    let t = (m - 1.0) / (m + 1.0);
+    let t2 = t * t;
+    // `ln(m) = 2 * t * (1 + t^2/3 + t^4/5 + t^6/7)`, scaled by `1 / ln(2)`.
+    let ln_m = 2.0 * t * (1.0 + t2 * (1.0 / 3.0 + t2 * (1.0 / 5.0 + t2 * (1.0 / 7.0))));
+    exp as f64 + ln_m * core::f64::consts::LOG2_E
+}
+
+/// Compute a mathematically sound $\log_2$-scale `dust` bar fraction (`0.0..=1.0`):
+///
+/// $$\text{frac}(b, m) = \frac{\log_2(b + 1)}{\log_2(m + 1)}$$
+///
+/// Every logarithm base yields the identical ratio ($\log_b x / \log_b m$), and $\log_2$ aligns
+/// naturally with IEC binary byte tiers (`KiB = 2^10`, `MiB = 2^20`, `GiB = 2^30`) so a `92 KiB`
+/// `.git/` folder remains clearly visible beside a `44 MiB` `target/` directory instead of collapsing
+/// to zero pixels.
 pub fn bar_fraction(bytes: u64, max_bytes: u64) -> f32 {
     if bytes == 0 || max_bytes == 0 {
         return 0.0;
     }
-    ((bytes as f64) / (max_bytes as f64)).clamp(0.0, 1.0) as f32
+    if bytes >= max_bytes {
+        return 1.0;
+    }
+    let num = log2_pos(bytes.saturating_add(1) as f64);
+    let den = log2_pos(max_bytes.saturating_add(1) as f64);
+    if den <= 0.0 {
+        return 0.0;
+    }
+    (num / den).clamp(0.0, 1.0) as f32
+}
+
+/// Format `bytes` in IEC binary units (`8 B`, `44.9 KiB`, `43.9 MiB`, `2.1 GiB`, `1.4 TiB`) into `alloc`.
+pub fn format_iec_bytes_in<'a>(bytes: u64, alloc: Alloc<'a>) -> AString<'a> {
+    use core::fmt::Write as _;
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const TIB: u64 = 1024 * 1024 * 1024 * 1024;
+    let mut out = String::new_in(alloc);
+    let (unit, suffix) = if bytes < KIB {
+        let _ = write!(out, "{bytes} B");
+        return out;
+    } else if bytes < MIB {
+        (KIB, "KiB")
+    } else if bytes < GIB {
+        (MIB, "MiB")
+    } else if bytes < TIB {
+        (GIB, "GiB")
+    } else {
+        (TIB, "TiB")
+    };
+    let tenths = ((bytes as u128 * 10 + (unit as u128 / 2)) / unit as u128) as u64;
+    let whole = tenths / 10;
+    let frac = tenths % 10;
+    if frac == 0 && whole >= 100 {
+        let _ = write!(out, "{whole} {suffix}");
+    } else {
+        let _ = write!(out, "{whole}.{frac} {suffix}");
+    }
+    out
 }
 
 #[cfg(test)]
@@ -328,5 +423,25 @@ mod tests {
         assert!(m.progress().capped);
         assert!(m.progress().done);
         assert_eq!(m.progress().bytes, 1024);
+    }
+
+    #[test]
+    fn log2_bar_fraction_and_iec_formatting() {
+        let alloc = Alloc::global();
+        let max_b = 44 * 1024 * 1024; // 44 MiB
+        let f_8b = bar_fraction(8, max_b);
+        let f_92k = bar_fraction(92 * 1024, max_b);
+        let f_max = bar_fraction(max_b, max_b);
+        assert!(f_8b > 0.08 && f_8b < 0.20, "8 B should be a visible stub: {f_8b}");
+        assert!(f_92k > 0.55 && f_92k < 0.72, "92 KiB beside 44 MiB should be ~65%: {f_92k}");
+        assert_eq!(f_max, 1.0);
+
+        assert_eq!(format_iec_bytes_in(8, alloc).as_str(), "8 B");
+        assert_eq!(format_iec_bytes_in(1024, alloc).as_str(), "1.0 KiB");
+        assert_eq!(format_iec_bytes_in(44 * 1024 * 1024, alloc).as_str(), "44.0 MiB");
+        assert_eq!(size_tier(512), SizeTier::Bytes);
+        assert_eq!(size_tier(92 * 1024), SizeTier::KiB);
+        assert_eq!(size_tier(44 * 1024 * 1024), SizeTier::MiB);
+        assert_eq!(size_tier(2 * 1024 * 1024 * 1024), SizeTier::GiB);
     }
 }

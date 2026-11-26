@@ -870,27 +870,27 @@ impl PartialEq for Value<'_> {
     }
 }
 
-/// Human-friendly byte size formatting (`512 B`, `14.2 KB`, `3.1 MB`, `1.4 GB`).
+/// Human-friendly IEC binary byte-size formatting (`512 B`, `14.2 KiB`, `3.1 MiB`, `1.4 GiB`).
 pub fn format_size(Bytes(b): Bytes, out: &mut impl fmt::Write) -> fmt::Result {
     let neg = b < 0;
     let abs = b.unsigned_abs();
     if neg {
         out.write_char('-')?;
     }
-    const KB: u64 = 1_000;
-    const MB: u64 = 1_000_000;
-    const GB: u64 = 1_000_000_000;
-    const TB: u64 = 1_000_000_000_000;
-    if abs < KB {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const TIB: u64 = 1024 * 1024 * 1024 * 1024;
+    if abs < KIB {
         write!(out, "{abs} B")
-    } else if abs < MB {
-        write_scaled(abs, KB, "KB", out)
-    } else if abs < GB {
-        write_scaled(abs, MB, "MB", out)
-    } else if abs < TB {
-        write_scaled(abs, GB, "GB", out)
+    } else if abs < MIB {
+        write_scaled(abs, KIB, "KiB", out)
+    } else if abs < GIB {
+        write_scaled(abs, MIB, "MiB", out)
+    } else if abs < TIB {
+        write_scaled(abs, GIB, "GiB", out)
     } else {
-        write_scaled(abs, TB, "TB", out)
+        write_scaled(abs, TIB, "TiB", out)
     }
 }
 
