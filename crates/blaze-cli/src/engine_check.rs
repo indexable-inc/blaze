@@ -3272,6 +3272,7 @@ fn checking<'f, 's: 'f>(
     fn open_fallback_base<'m, 'f: 'm, 'a, D: blaze_core::Driver, S: crate::store::Sharing>(
         cx: &Cx,
         store: &mut crate::store::CommandStore<'m, '_, D, S>,
+        lent: &blaze_cas::plain::Lent<D, crate::store::StoreAlloc>,
         root: &Dir<ReadWrite>,
         check_scope: CheckScope<'_>,
         whole_root: &str,
@@ -3284,15 +3285,26 @@ fn checking<'f, 's: 'f>(
         frame: &'f Frame,
     ) -> Result<Option<(crate::engine_answer::LoadedBase<'m, 'a>, FallbackFrom)>, CliError> {
         if !check_scope.is_whole()
-            && let Some(loaded) = crate::engine_answer::open_named_base(cx, store, whole_root, tools, exclude, require_current_tools, alloc, frame)?
+            && let Some(loaded) = crate::engine_answer::open_named_base(
+                cx,
+                store,
+                lent,
+                whole_root,
+                crate::engine_answer::ReachCheck::Sharded(whole_root),
+                tools,
+                exclude,
+                require_current_tools,
+                alloc,
+                frame,
+            )?
         {
             return Ok(Some((loaded, FallbackFrom::OwnWhole)));
         }
-        if let Some(loaded) = crate::engine_answer::open_base_for_tools(cx, store, root, tools, exclude, require_current_tools, alloc, frame)? {
+        if let Some(loaded) = crate::engine_answer::open_base_for_tools(cx, store, lent, root, tools, exclude, require_current_tools, alloc, frame)? {
             return Ok(Some((loaded, FallbackFrom::OtherWorkspace)));
         }
         if include_tool_base
-            && let Some(loaded) = crate::engine_answer::open_toolchain_base(cx, store, toolchain, tools, alloc, frame)?
+            && let Some(loaded) = crate::engine_answer::open_toolchain_base(cx, store, lent, toolchain, tools, alloc, frame)?
         {
             return Ok(Some((loaded, FallbackFrom::Toolchain)));
         }
@@ -3314,7 +3326,7 @@ fn checking<'f, 's: 'f>(
         if !fresh {
             match recovery {
                 StoredRecovery::SkipOwn { exclude } => {
-                    if let Some((loaded, from)) = open_fallback_base(cx, &mut store, root, check_scope, &whole_root, toolchain, &tools, Some(exclude), false, false, request_mem_of(request_mem_slot)?.shared(), frame)?
+                    if let Some((loaded, from)) = open_fallback_base(cx, &mut store, &opened.lent, root, check_scope, &whole_root, toolchain, &tools, Some(exclude), false, false, request_mem_of(request_mem_slot)?.shared(), frame)?
                         && from != FallbackFrom::Toolchain
                     {
                         pointer = Some(loaded.pointer);
@@ -3346,7 +3358,7 @@ fn checking<'f, 's: 'f>(
                                 loaded_own_whole = true;
                             }
                             if !loaded_own_whole
-                                && let Some((loaded, from)) = open_fallback_base(cx, &mut store, root, check_scope, &whole_root, toolchain, &tools, None, false, true, request_mem_of(request_mem_slot)?.shared(), frame)?
+                                && let Some((loaded, from)) = open_fallback_base(cx, &mut store, &opened.lent, root, check_scope, &whole_root, toolchain, &tools, None, false, true, request_mem_of(request_mem_slot)?.shared(), frame)?
                             {
                                 pointer = Some(loaded.pointer);
                                 last_lines = Some(loaded.lines);
@@ -3364,7 +3376,7 @@ fn checking<'f, 's: 'f>(
                         Some(Err(why)) => {
                             phases.mark_cx(cx, "stored answer's pointer read", frame);
                             if allow_stale_fallback
-                                && let Some((loaded, from)) = open_fallback_base(cx, &mut store, root, check_scope, &whole_root, toolchain, &tools, None, false, true, request_mem_of(request_mem_slot)?.shared(), frame)?
+                                && let Some((loaded, from)) = open_fallback_base(cx, &mut store, &opened.lent, root, check_scope, &whole_root, toolchain, &tools, None, false, true, request_mem_of(request_mem_slot)?.shared(), frame)?
                             {
                                 pointer = Some(loaded.pointer);
                                 last_lines = Some(loaded.lines);
@@ -3392,7 +3404,7 @@ fn checking<'f, 's: 'f>(
                             let mut used_fallback = false;
                             if !own_ptr.certifies_under(&tools)
                                 && allow_stale_fallback
-                                && let Some((loaded, from)) = open_fallback_base(cx, &mut store, root, check_scope, &whole_root, toolchain, &tools, Some(own_ptr.key), true, false, request_mem_of(request_mem_slot)?.shared(), frame)?
+                                && let Some((loaded, from)) = open_fallback_base(cx, &mut store, &opened.lent, root, check_scope, &whole_root, toolchain, &tools, Some(own_ptr.key), true, false, request_mem_of(request_mem_slot)?.shared(), frame)?
                                 && from != FallbackFrom::Toolchain
                             {
                                 pointer = Some(loaded.pointer);
@@ -3411,7 +3423,7 @@ fn checking<'f, 's: 'f>(
                                     }
                                     Err(why) => {
                                         if allow_stale_fallback
-                                            && let Some((loaded, from)) = open_fallback_base(cx, &mut store, root, check_scope, &whole_root, toolchain, &tools, Some(own_ptr.key), false, true, request_mem_of(request_mem_slot)?.shared(), frame)?
+                                            && let Some((loaded, from)) = open_fallback_base(cx, &mut store, &opened.lent, root, check_scope, &whole_root, toolchain, &tools, Some(own_ptr.key), false, true, request_mem_of(request_mem_slot)?.shared(), frame)?
                                         {
                                             pointer = Some(loaded.pointer);
                                             last_lines = Some(loaded.lines);
@@ -3550,7 +3562,9 @@ fn checking<'f, 's: 'f>(
                 && facts.printed.names
                 && facts.printed.bodies_whole
                 && lines.blocks().next().is_none());
-        let own_certifies = base == crate::engine_ready_edit::StoredBase::Own;
+        let cert_reach_root = if own_whole { whole_root.as_str() } else { answer_root.as_str() };
+        let own_certifies = base == crate::engine_ready_edit::StoredBase::Own
+            && crate::engine_answer::reach_roots_live_without_root(&opened.lent, cert_reach_root, frame);
         let other_certifies = base == crate::engine_ready_edit::StoredBase::OtherCheckout
             && check_scope.is_whole()
             && !own_whole
@@ -3630,6 +3644,7 @@ fn checking<'f, 's: 'f>(
         && recovery == StoredRecovery::Normal
         && (own_scoped_moved || base != crate::engine_ready_edit::StoredBase::Own)
         && let Some(Ok(whole_ptr)) = crate::engine_answer::load_pointer(cx, &mut store, whole_root.as_str())?
+        && crate::engine_answer::reach_roots_live_without_root(&opened.lent, whole_root.as_str(), frame)
         && whole_ptr.certifies_under(&tools)
         && whole_ptr.facts.owed == 0
         && whole_ptr.facts.printed.replayable
@@ -3726,14 +3741,33 @@ fn checking<'f, 's: 'f>(
     let last_dir = if let Some(root_dir) = preopened_root.take() {
         Some(root_dir)
     } else if let Some(ptr) = &pointer {
-        match crate::engine_answer::open_root(cx, &mut store, ptr.root, request)? {
+        let current_root_name = if own_whole { whole_root.as_str() } else { answer_root.as_str() };
+        let opened_root = match crate::engine_answer::open_root(cx, &mut store, ptr.root, request)? {
+            Ok(root_dir) => match crate::engine_answer::verify_reach_roots(&opened.lent, current_root_name, &root_dir, true, request, frame)? {
+                Ok(()) => Ok(root_dir),
+                Err(why) => Err(why),
+            },
+            Err(why) => Err(why),
+        };
+        match opened_root {
             Ok(root_dir) => Some(root_dir),
+            Err(crate::engine_answer::Unreadable::Pages(missing @ blaze_engine::pages::PagesError::Missing { .. }))
+                if driver == crate::engine_ready_edit::Driver::Ready =>
+            {
+                return Err(crate::engine_answer::page_error(missing));
+            }
             Err(why) => {
-                // Own answer's root directory is unreadable (e.g. bumped directory format or
-                // missing root record): fall back to another worktree's compatible base and
-                // re-sweep its leaves instead of rebuilding every task from `no answer`.
+                // Own answer's root directory or CAS reach roots are unreadable (e.g. bumped
+                // directory format, missing root record, or partially evicted reach shard): fall
+                // back to another worktree's compatible intact base and re-sweep its leaves
+                // instead of rebuilding every task from `no answer`.
+                let include_tool_base = !matches!(
+                    why,
+                    crate::engine_answer::Unreadable::Pages(blaze_engine::pages::PagesError::Missing { .. })
+                        | crate::engine_answer::Unreadable::MissingReach { .. }
+                );
                 let fallback = if !other_checkout && allow_stale_fallback {
-                    open_fallback_base(cx, &mut store, root, check_scope, &whole_root, toolchain, &tools, Some(ptr.key), false, true, request, frame)?
+                    open_fallback_base(cx, &mut store, &opened.lent, root, check_scope, &whole_root, toolchain, &tools, Some(ptr.key), false, include_tool_base, request, frame)?
                 } else {
                     None
                 };
