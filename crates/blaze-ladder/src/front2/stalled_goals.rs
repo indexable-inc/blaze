@@ -749,4 +749,123 @@ fn main() {
             "expected E0277 Send diagnostic for non-Send future, got: {shown}"
         );
     }
+
+    /// An impl's where-clause `T::Future: Send` where `T = ServiceFn<closure>` returns an async
+    /// block (`reqwest::connect::connect_local_transport` / `hyper_rustls::HttpsConnector`) must
+    /// normalize `T::Future` when classifying stalled auto-trait clauses so the exact witness
+    /// interior decides `Send` (clean when `Send`, E0277 when holding `Rc` across `.await`)
+    /// rather than failing with E0283.
+    #[test]
+    fn check_body_decides_projected_future_send_clause_in_impl_where_bound() {
+        use crate::front2::keys::checker_of;
+        use crate::front2::program::lazy::LazyProgram;
+        use crate::seam::FrontEnd;
+
+        const COMMON: &str = r#"
+use std::future::Future;
+use std::pin::Pin;
+use std::rc::Rc;
+
+struct Uri;
+struct Io;
+trait Service<Request> {
+    type Response;
+    type Error;
+    type Future: Future<Output = Result<Self::Response, Self::Error>>;
+    fn call(&mut self, req: Request) -> Self::Future;
+}
+struct ServiceFn<T> { f: T }
+fn service_fn<T>(f: T) -> ServiceFn<T> { ServiceFn { f } }
+impl<T, F, Request, R, E> Service<Request> for ServiceFn<T>
+where
+    T: FnMut(Request) -> F,
+    F: Future<Output = Result<R, E>>,
+{
+    type Response = R;
+    type Error = E;
+    type Future = F;
+    fn call(&mut self, req: Request) -> Self::Future { (self.f)(req) }
+}
+struct HttpsConnector<T>(T);
+impl<T> Service<Uri> for HttpsConnector<T>
+where
+    T: Service<Uri>,
+    T::Response: Send + Unpin + 'static,
+    T::Future: Send + 'static,
+    T::Error: Send + 'static,
+{
+    type Response = T::Response;
+    type Error = T::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<T::Response, T::Error>> + Send>>;
+    fn call(&mut self, dst: Uri) -> Self::Future {
+        let f = self.0.call(dst);
+        Box::pin(f)
+    }
+}
+"#;
+        let send_ok = format!(
+            "{COMMON}\n\
+            async fn connect(dst: Uri) -> Result<Io, ()> {{\n\
+                let svc = service_fn(move |_| {{\n\
+                    let fut = core::future::ready(Ok::<Io, ()>(Io));\n\
+                    async move {{\n\
+                        let io = fut.await?;\n\
+                        Ok::<_, ()>(io)\n\
+                    }}\n\
+                }});\n\
+                let mut http = HttpsConnector(svc);\n\
+                http.call(dst).await\n\
+            }}\n\
+            fn main() {{ let _ = connect(Uri); }}\n"
+        );
+        let not_send = format!(
+            "{COMMON}\n\
+            async fn connect(dst: Uri) -> Result<Io, ()> {{\n\
+                let svc = service_fn(move |_| {{\n\
+                    let fut = core::future::ready(Ok::<Io, ()>(Io));\n\
+                    async move {{\n\
+                        let local = Rc::new(1u8);\n\
+                        let io = fut.await?;\n\
+                        drop(local);\n\
+                        Ok::<_, ()>(io)\n\
+                    }}\n\
+                }});\n\
+                let mut http = HttpsConnector(svc);\n\
+                http.call(dst).await\n\
+            }}\n\
+            fn main() {{ let _ = connect(Uri); }}\n"
+        );
+
+        let alloc = blaze_own::testing::heap().alloc();
+        let tc = fixture_toolchain();
+        let check_connect = |name: &'static str, source: &str| {
+            let dir = format!("/{name}/");
+            let root = format!("/{name}/src/main.rs");
+            let files = [(root.clone(), source.to_owned())];
+            let user = UserCrate {
+                name, dir: &dir, root: &root, files: &files,
+                edition: edition::PackageEdition::of_manifest("2024").expect("Rust 2024"), panic: blaze_build::Panic::Unwind,
+            };
+            let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("fixture frame");
+            let erased = blaze_own::Erased::new(&frame);
+            let inputs = Inputs::new(&user, &tc).expect("fixture crate");
+            let crates = inputs.crates();
+            let names = inputs.resolve(&crates, erased.bump()).expect("fixture names");
+            let sources = [SourceFile { path: "src/main.rs", text: source }];
+            let connect_key = names
+                .items(0)
+                .find_map(|(item, _, _)| (names.item_text(item).and_then(|t| t.name) == Some("connect")).then_some(checker_of(item)))
+                .expect("fixture `connect`");
+            let mut lazy = LazyProgram::new(&names, &frame, &sources, Some(connect_key), alloc).expect("lazy program");
+            lazy.check_one(connect_key).map(|_| ())
+        };
+
+        check_connect("proj_future_ok", &send_ok).expect("projected Send future in HttpsConnector<ServiceFn<closure>> must check clean");
+        let err = check_connect("proj_future_err", &not_send).expect_err("projected !Send future holding Rc across await must fail");
+        let shown = format!("{err:?}");
+        assert!(
+            shown.contains("E0277") && shown.contains("Send"),
+            "expected E0277 Send diagnostic for projected !Send future, got: {shown}"
+        );
+    }
 }

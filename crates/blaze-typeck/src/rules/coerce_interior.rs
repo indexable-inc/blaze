@@ -76,6 +76,11 @@ impl crate::stalled::Stalled {
             {
                 import_list(cx, src, types, args, &[], 0)?
             }
+            Some(Because::Unmet { leaf: Some(UnmetGoal::Trait { trait_, args }), .. })
+                if trait_ == self.trait_ && types.list(args)?.first() == Some(&self.ty) =>
+            {
+                import_list(cx, src, types, args, &[], 0)?
+            }
             Some(Because::False(_) | Because::Error(_) | Because::Generic(_)) => {
                 // Only unary auto goals keep a where-const reason in the stalled row.
                 let ty = import(cx, src, types, self.ty, &[], 0)?;
