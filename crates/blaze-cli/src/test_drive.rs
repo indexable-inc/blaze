@@ -1749,8 +1749,15 @@ const MOST_MAKERS: usize = 4;
 /// Soft frame budget per code worker: once a worker's `Frame` reaches this usage between makes,
 /// the worker drops its [`SuiteMakers`], resets and trims its `Frame` back to
 /// [`WORKER_FRAME_KEEP`], and rebuilds cleanly so multi-suite and heavy-suite test runs never
-/// exhaust `FRAME_RESERVE` (4 GiB) or accumulate unbounded RSS.
-const WORKER_FRAME_RESET_AT: usize = 512 << 20;
+/// exhaust `FRAME_RESERVE` (4 GiB) or accumulate unbounded RSS. Set to 2 GiB (half of
+/// `FRAME_RESERVE`) so large single-suite workspaces (e.g. `tempo-e2e` at ~550+ MiB of loaded
+/// crate trees and heads) stay warm across makes instead of resetting after every function.
+const WORKER_FRAME_RESET_AT: usize = 2 << 30;
+
+/// Hard frame ceiling per code worker (still 1 GiB below `FRAME_RESERVE`) for the adaptive
+/// cold-baseline bump: if a single cold make already fills past [`WORKER_FRAME_RESET_AT`], the
+/// worker keeps warm headroom up to this ceiling rather than thrashing on every make.
+const WORKER_FRAME_HARD_RESET_AT: usize = 3 << 30;
 
 /// Lower frame budget applied once [`Makers`] has evicted a suite at [`MOST_MAKERS`]: if the
 /// worker's `Frame` holds at least this much memory from evicted suites, reclaim it between
@@ -2366,6 +2373,7 @@ pub(crate) struct SuiteMakers<'w> {
     names: AVec<'static, Option<NamesRecords<'w>>>,
     makers: Makers<TestMaker<'w>>,
     reset_needed: bool,
+    makes: usize,
     reset_at: usize,
     evict_reset_at: usize,
 }
@@ -2393,6 +2401,7 @@ impl<'w> SuiteMakers<'w> {
             names,
             makers: Makers::new(heap.alloc(), MakersPlant::None),
             reset_needed: false,
+            makes: 0,
             reset_at: WORKER_FRAME_RESET_AT,
             evict_reset_at: WORKER_FRAME_EVICT_RESET_AT,
         }
@@ -2427,7 +2436,15 @@ impl KeptMakers for SuiteMakers<'_> {
             Ok(maker)
         })?;
         maker.prepare_local(job.enclosers.locals(), job.enclosers.enclosers());
-        job.order.make(maker, &job.proof, job.name.as_slice(), entry)
+        let out = job.order.make(maker, &job.proof, job.name.as_slice(), entry);
+        self.makes = self.makes.saturating_add(1);
+        if self.makes == 1 {
+            let used = self.frame.used();
+            if used >= self.reset_at && used < WORKER_FRAME_HARD_RESET_AT {
+                self.reset_at = used.saturating_add(256 << 20).min(WORKER_FRAME_HARD_RESET_AT);
+            }
+        }
+        out
     }
 
     fn forget(&mut self, suite: SuiteId) {
