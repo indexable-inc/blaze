@@ -379,8 +379,8 @@ pub fn encode_flat_tree_json(stream: &TokenStream<'_>, span_offset: u32) -> Stri
             TokenKind::Punct { char: ch, spacing } => {
                 let idx = (puncts.len() / 3) as u32;
                 let sp = match spacing {
-                    Spacing::Alone => 0,
-                    Spacing::Joint | Spacing::JointHidden => 1,
+                    Spacing::Alone | Spacing::JointHidden => 0,
+                    Spacing::Joint => 1,
                 };
                 puncts.extend_from_slice(&[span, ch as u32, sp]);
                 stack.last_mut().unwrap().2.push(Node::Leaf((idx << 2) | 2));

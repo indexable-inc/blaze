@@ -935,6 +935,9 @@ pub(crate) fn lex_placed<'a>(
             let spacing = if joint { Spacing::Joint } else { Spacing::Alone };
             let char = token.chars().next().ok_or(refused)?;
             out.punct(char, spacing, ctx)?;
+            if !joint {
+                last = Some((out.len() - 1, offset));
+            }
         } else if kind.is_any_identifier() || kind == UNDERSCORE {
             joined_to(&mut out, &mut last, start);
             let (raw, name) = match token.strip_prefix("r#") {
@@ -993,12 +996,13 @@ fn place_new(places: &mut Option<&mut AVec<'_, (u32, u32)>>, tokens: usize, star
     Ok(())
 }
 
-/// Whether a punctuation token is joint with a next token of `kind`: one that is punctuation
-/// alone, or a lifetime (its `'`), as rustc's lexer glues operators.
+/// Whether a punctuation token is joint (`Spacing::Joint`) with a next token of `kind`: one that
+/// is punctuation alone, as rustc's lexer glues operators. Lifetimes are not punctuation in rustc
+/// (`&'a` gives `&` `Spacing::JointHidden`, not `Spacing::Joint`).
 fn glues_after(kind: parser::SyntaxKind) -> bool {
     use parser::SyntaxKind::{
-        AMP, AT, BANG, CARET, COLON, COMMA, DOLLAR, DOT, EQ, L_ANGLE, LIFETIME_IDENT, MINUS,
-        PERCENT, PIPE, PLUS, POUND, QUESTION, R_ANGLE, SEMICOLON, SLASH, STAR, TILDE,
+        AMP, AT, BANG, CARET, COLON, COMMA, DOLLAR, DOT, EQ, L_ANGLE, MINUS, PERCENT, PIPE, PLUS,
+        POUND, QUESTION, R_ANGLE, SEMICOLON, SLASH, STAR, TILDE,
     };
     matches!(
         kind,
@@ -1022,7 +1026,6 @@ fn glues_after(kind: parser::SyntaxKind) -> bool {
             | SLASH
             | PERCENT
             | CARET
-            | LIFETIME_IDENT
     )
 }
 
@@ -1213,11 +1216,11 @@ pub fn lex_marked<'a>(
     Ok(out)
 }
 
-/// The last identifier or literal pushed, and where its text ends: it is joint with the next
-/// token if that one starts there.
+/// The last identifier, literal, or non-glued punctuation pushed, and where its text ends: it is
+/// joint (`Spacing::JointHidden`) with the next token if that one starts there.
 type Pending = Option<(usize, usize)>;
 
-/// Marks the pending identifier or literal joint when the next token starts where it ends.
+/// Marks the pending token `Spacing::JointHidden` when the next token starts where it ends.
 fn joined_to(out: &mut TokenStream<'_>, last: &mut Pending, next: usize) {
     if let Some((at, end)) = last.take()
         && end == next

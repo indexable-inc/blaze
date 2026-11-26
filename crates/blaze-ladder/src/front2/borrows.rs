@@ -4809,6 +4809,132 @@ fn main() {}
         assert!(!elision_types.is_clean(), "def_elision_rejected must fail E0106: {elision_text}");
         assert!(elision_text.contains("E0106"), "def_elision_rejected must report E0106: {elision_text}");
     }
+
+    #[test]
+    fn closure_default_arg_regions_soundness() {
+        const SRC: &str = r#"
+struct Names<'n>(&'n u8);
+trait NamesSource<'n> {}
+impl<'n> NamesSource<'n> for &'n Names<'n> {}
+
+struct Records<'r, 'n, S = &'n Names<'n>> {
+    r: &'r u8,
+    idx: &'r mut Names<'n>,
+    s: S,
+}
+
+fn refused<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>) -> u8 {
+    *r.r
+}
+
+fn equate_inv<'a>(_a: &mut &'a u8, _b: &mut &'a u8) {}
+fn require_static(_x: &'static u8) {}
+
+// POSITIVE: `|r: &Records<'_, '_>|` ties `'n` and defaulted `S = &'n Names<'n>` via shared
+// `WrittenRegion::Elided`, so calling `refused<'n, S: NamesSource<'n>>(r)` checks cleanly.
+fn closure_records_refused_ok() {
+    let refuse = |r: &Records<'_, '_>| refused(r);
+    let a = 1u8;
+    let b = 2u8;
+    let n = Names(&b);
+    let mut n2 = Names(&b);
+    let rec = Records { r: &a, idx: &mut n2, s: &n };
+    let _ = refuse(&rec);
+}
+
+// POSITIVE: body never names `Names` directly — only via `Records`'s defaulted `S`.
+fn closure_records_no_names_mentioned_ok(r: &Records<'_, '_>) -> u8 {
+    let refuse = |x: &Records<'_, '_>| refused(x);
+    refuse(r)
+}
+
+// NEGATIVE 1: explicitly writing distinct `'_` lifetimes for `'n` and `S = &'_ Names<'_>`
+// leaves them independent late regions, so calling `refused` must still be refused `NestedOutlives`.
+fn closure_records_distinct_elided_rejected() {
+    let refuse = |r: &Records<'_, '_, &'_ Names<'_>>| refused(r);
+    let a = 1u8;
+    let b = 2u8;
+    let n = Names(&b);
+    let mut n2 = Names(&b);
+    let rec = Records { r: &a, idx: &mut n2, s: &n };
+    let _ = refuse(&rec);
+}
+
+// NEGATIVE 2: equating two genuinely independent late-bound closure parameters must not pass.
+fn closure_independent_late_equated_rejected() {
+    let f = |a: &mut &u8, b: &mut &u8| equate_inv(a, b);
+    let x = 1u8;
+    let y = 2u8;
+    let mut rx = &x;
+    let mut ry = &y;
+    f(&mut rx, &mut ry);
+}
+
+// NEGATIVE 3: requiring a closure's defaulted `'n` reference to outlive `'static` must be rejected.
+fn closure_records_return_static_rejected() {
+    let _f = |r: &Records<'_, '_>| require_static(r.s.0);
+}
+
+fn main() {}
+"#;
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let home = std::env::var("HOME").expect("HOME is set");
+        let tc = Toolchain::open(&mut DirShelf::new(std::format!("{home}/.blaze/v2/toolchain"))).expect("installed toolchain");
+        let files = [("/clrec/src/main.rs".to_string(), SRC.to_string())];
+        let edition = edition::PackageEdition::of_manifest("2024").expect("Rust 2024");
+        let user = UserCrate { name: "clrec", dir: "/clrec/", root: "/clrec/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("checker frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let inputs = Inputs::new(&user, &tc).expect("fixture inputs");
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, erased.bump()).expect("fixture names");
+        let sources = [SourceFile { path: "src/main.rs", text: SRC }];
+        let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("front2");
+        let bodies = world.bodies(alloc);
+        let body = |name: &str| {
+            bodies
+                .iter()
+                .find_map(|&(body, _)| {
+                    let BodyRef::Free(key) = body else { return None };
+                    (names.item_text(key).and_then(|item| item.name) == Some(name)).then_some(body)
+                })
+                .unwrap_or_else(|| panic!("missing fixture body {name}"))
+        };
+
+        // POSITIVE tests must type-check and borrow-check cleanly.
+        for name in ["closure_records_refused_ok", "closure_records_no_names_mentioned_ok"] {
+            let (types, borrows) = world.check_borrows(body(name), alloc);
+            assert!(types.is_clean(), "{name} types: {types:?}");
+            assert!(borrows.is_clean(), "{name} borrows: {borrows:?}");
+        }
+
+        // NEGATIVE 1-2: genuinely independent late lifetimes must still fail `NestedOutlives(Late -> Late)`.
+        for name in ["closure_records_distinct_elided_rejected", "closure_independent_late_equated_rejected"] {
+            let (types, bad) = world.check_borrows(body(name), alloc);
+            assert!(types.is_clean(), "{name} types: {types:?}");
+            assert!(
+                matches!(
+                    bad.refused,
+                    Some(super::BorrowRefused::NestedOutlives {
+                        from: Some(blaze_flow_lower::External::Late),
+                        into: Some(blaze_flow_lower::External::Late),
+                        ..
+                    })
+                ),
+                "{name} must refuse Late -> Late: {bad:?}"
+            );
+        }
+
+        // NEGATIVE 3: returning a late-bound defaulted lifetime as `'static` must produce a borrow finding.
+        let (types, bad_ret) = world.check_borrows(body("closure_records_return_static_rejected"), alloc);
+        assert!(types.is_clean(), "closure_records_return_static_rejected types: {types:?}");
+        assert!(bad_ret.refused.is_none(), "closure_records_return_static_rejected must not refuse: {bad_ret:?}");
+        assert!(
+            !bad_ret.findings.is_empty(),
+            "closure_records_return_static_rejected must reject returning `'n` as `'static`: {bad_ret:?}"
+        );
+    }
 }
 
 /// `NestedOutlives { from: Capture | Param, into: Late }`: NLL closure region propagation through
