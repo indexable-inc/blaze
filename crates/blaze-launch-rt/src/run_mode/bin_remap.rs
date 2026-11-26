@@ -62,6 +62,11 @@ struct ScratchSlot {
 
 struct RemapTable {
     entries: AVec<'static, Entry>,
+    /// Parent directories derived from `entries` (`/target/debug/bin` and
+    /// `/target/debug/bin/<package>`) mapped to NUL-terminated host directories so `chdir`,
+    /// `opendir`, `stat`, and `posix_spawn_file_actions_addchdir_np` work seamlessly on parent
+    /// paths derived from `env!("CARGO_BIN_EXE_*")`.
+    dir_entries: AVec<'static, Entry>,
     /// Common host root prefix corresponding to `/target/debug/bin` (without trailing slash),
     /// derived from `entries` when all stubs share `<host_root>/<package>/<bin>`.
     host_root: AVec<'static, u8>,
@@ -142,6 +147,43 @@ fn alloc_scratch_slots() -> Result<[ScratchSlot; SCRATCH_SLOTS], BinRemapError> 
     }))
 }
 
+/// Derives deduplicated parent directory entries (`/target/debug/bin` and
+/// `/target/debug/bin/<package>`) from `entries` and `host_root`.
+fn derive_dir_entries(entries: &[Entry], host_root: &[u8], alloc: Alloc<'static>) -> AVec<'static, Entry> {
+    let mut dirs = Vec::new_in(alloc);
+    if !host_root.is_empty() {
+        let mut g = Vec::with_capacity_in(GUEST_ROOT.len(), alloc);
+        g.extend_from_slice(GUEST_ROOT);
+        let mut h = Vec::with_capacity_in(host_root.len() + 1, alloc);
+        h.extend_from_slice(host_root);
+        h.push(0);
+        dirs.push(Entry { guest: g, host: h });
+    }
+    for entry in entries.iter() {
+        let Some(slash_g) = entry.guest.iter().rposition(|&b| b == b'/') else { continue };
+        let Some(guest_dir) = entry.guest.get(..slash_g) else { continue };
+        if guest_dir.len() <= GUEST_ROOT.len() {
+            continue;
+        }
+        if dirs.iter().any(|d: &Entry| d.guest.as_slice() == guest_dir) {
+            continue;
+        }
+        let host_no_nul = entry.host.get(..entry.host.len().saturating_sub(1)).unwrap_or(&[]);
+        let Some(slash_h) = host_no_nul.iter().rposition(|&b| b == b'/') else { continue };
+        let Some(host_dir) = host_no_nul.get(..slash_h) else { continue };
+        if host_dir.is_empty() {
+            continue;
+        }
+        let mut g = Vec::with_capacity_in(guest_dir.len(), alloc);
+        g.extend_from_slice(guest_dir);
+        let mut h = Vec::with_capacity_in(host_dir.len() + 1, alloc);
+        h.extend_from_slice(host_dir);
+        h.push(0);
+        dirs.push(Entry { guest: g, host: h });
+    }
+    dirs
+}
+
 /// Parses `raw` (`<guest>\t<host>\n` lines), reserves the demand-paged async-signal-safe scratch
 /// pool, and installs the process-wide immutable remap table.
 /// Returns `Ok(true)` if at least one mapping was installed, `Ok(false)` if `raw` was empty.
@@ -151,8 +193,9 @@ pub fn install(raw: &[u8], alloc: Alloc<'static>) -> Result<bool, BinRemapError>
         return Ok(false);
     }
     let host_root = derive_host_root(entries.as_slice(), alloc);
+    let dir_entries = derive_dir_entries(entries.as_slice(), host_root.as_slice(), alloc);
     let slots = alloc_scratch_slots()?;
-    let table: ABox<'static, RemapTable> = Box::new_in(RemapTable { entries, host_root, slots }, alloc);
+    let table: ABox<'static, RemapTable> = Box::new_in(RemapTable { entries, dir_entries, host_root, slots }, alloc);
     let (ptr, alloc) = Box::into_raw_with_allocator(table);
     if MAP
         .compare_exchange(ptr::null_mut(), ptr, Ordering::Release, Ordering::Relaxed)
@@ -345,13 +388,16 @@ fn measure_rewrite(input: &[u8], entries: &[Entry]) -> Result<MeasureResult, ()>
         let Some(hit) = find_subslice(input, GUEST_PREFIX, pos) else {
             break;
         };
+        let prev_ok = hit == 0 || input.get(hit - 1).is_none_or(|&b| !is_path_cont(b));
         let mut matched: Option<&Entry> = None;
-        for entry in entries.iter() {
-            let g = entry.guest.as_slice();
-            if input.get(hit..hit + g.len()) == Some(g) {
-                let next_ok = input.get(hit + g.len()).is_none_or(|&b| !is_path_cont(b));
-                if next_ok && matched.is_none_or(|m| g.len() > m.guest.len()) {
-                    matched = Some(entry);
+        if prev_ok {
+            for entry in entries.iter() {
+                let g = entry.guest.as_slice();
+                if input.get(hit..hit + g.len()) == Some(g) {
+                    let next_ok = input.get(hit + g.len()).is_none_or(|&b| !is_path_cont(b));
+                    if next_ok && matched.is_none_or(|m| g.len() > m.guest.len()) {
+                        matched = Some(entry);
+                    }
                 }
             }
         }
@@ -412,13 +458,16 @@ fn rewrite_bytes(
         let Some(hit) = find_subslice(input, GUEST_PREFIX, pos) else {
             break;
         };
+        let prev_ok = hit == 0 || input.get(hit - 1).is_none_or(|&b| !is_path_cont(b));
         let mut matched: Option<&Entry> = None;
-        for entry in entries.iter() {
-            let g = entry.guest.as_slice();
-            if input.get(hit..hit + g.len()) == Some(g) {
-                let next_ok = input.get(hit + g.len()).is_none_or(|&b| !is_path_cont(b));
-                if next_ok && matched.is_none_or(|m| g.len() > m.guest.len()) {
-                    matched = Some(entry);
+        if prev_ok {
+            for entry in entries.iter() {
+                let g = entry.guest.as_slice();
+                if input.get(hit..hit + g.len()) == Some(g) {
+                    let next_ok = input.get(hit + g.len()).is_none_or(|&b| !is_path_cont(b));
+                    if next_ok && matched.is_none_or(|m| g.len() > m.guest.len()) {
+                        matched = Some(entry);
+                    }
                 }
             }
         }
@@ -765,8 +814,9 @@ fn set_errno(val: c_int) {
     }
 }
 
-/// Maps `path` to its host launcher stub C string when it matches an installed guest binary path;
-/// otherwise returns `path` unchanged. Lock-free, zero-allocation, and async-signal-safe.
+/// Maps `path` to its host launcher stub (or stub parent directory `/target/debug/bin[/<pkg>]`)
+/// C string when it matches an installed guest path; otherwise returns `path` unchanged.
+/// Lock-free, zero-allocation, and async-signal-safe.
 #[inline]
 pub(crate) unsafe fn remap_cstr(path: *const c_char) -> *const c_char {
     if path.is_null() {
@@ -782,15 +832,30 @@ pub(crate) unsafe fn remap_cstr(path: *const c_char) -> *const c_char {
         return path;
     }
     // SAFETY: `ptr` was published once and never freed for the life of the process.
-    let entries = unsafe { (*ptr).entries.as_slice() };
+    let table = unsafe { &*ptr };
     // SAFETY: caller passes a valid NUL-terminated C string pointer.
     let bytes = unsafe { CStr::from_ptr(path) }.to_bytes();
-    if !bytes.starts_with(GUEST_PREFIX) {
+    if !bytes.starts_with(GUEST_ROOT) {
         return path;
     }
-    for entry in entries.iter() {
-        if entry.guest.as_slice() == bytes {
-            return entry.host.as_ptr().cast::<c_char>();
+    if bytes.starts_with(GUEST_PREFIX) {
+        for entry in table.entries.as_slice().iter() {
+            if entry.guest.as_slice() == bytes {
+                return entry.host.as_ptr().cast::<c_char>();
+            }
+        }
+    }
+    let mut trimmed = bytes;
+    while trimmed.len() > 1 && trimmed.last().copied() == Some(b'/') {
+        if let Some(shorter) = trimmed.get(..trimmed.len() - 1) {
+            trimmed = shorter;
+        } else {
+            break;
+        }
+    }
+    for dir in table.dir_entries.as_slice().iter() {
+        if dir.guest.as_slice() == trimmed {
+            return dir.host.as_ptr().cast::<c_char>();
         }
     }
     path
@@ -1039,6 +1104,46 @@ pub(crate) extern "C" fn remap_posix_spawnp(
     }
 }
 
+pub(crate) extern "C" fn remap_posix_spawn_file_actions_addopen(
+    file_actions: *mut libc::posix_spawn_file_actions_t,
+    fildes: c_int,
+    path: *const c_char,
+    oflag: c_int,
+    mode: libc::mode_t,
+) -> c_int {
+    // SAFETY: `remap_cstr` returns either `path` or a `'static` NUL-terminated C string.
+    unsafe {
+        libc::posix_spawn_file_actions_addopen(file_actions, fildes, remap_cstr(path), oflag, mode)
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn posix_spawn_file_actions_addchdir_np(
+        file_actions: *mut libc::posix_spawn_file_actions_t,
+        path: *const c_char,
+    ) -> c_int;
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) extern "C" fn remap_posix_spawn_file_actions_addchdir_np(
+    file_actions: *mut libc::posix_spawn_file_actions_t,
+    path: *const c_char,
+) -> c_int {
+    // SAFETY: `remap_cstr` returns either `path` or a `'static` NUL-terminated directory C string.
+    unsafe { posix_spawn_file_actions_addchdir_np(file_actions, remap_cstr(path)) }
+}
+
+pub(crate) extern "C" fn remap_chdir(path: *const c_char) -> c_int {
+    // SAFETY: `remap_cstr` returns either `path` or a `'static` NUL-terminated directory C string.
+    unsafe { libc::chdir(remap_cstr(path)) }
+}
+
+pub(crate) extern "C" fn remap_opendir(path: *const c_char) -> *mut libc::DIR {
+    // SAFETY: `remap_cstr` returns either `path` or a `'static` NUL-terminated directory C string.
+    unsafe { libc::opendir(remap_cstr(path)) }
+}
+
 pub(crate) extern "C" fn remap_system(command: *const c_char) -> c_int {
     let mut buf = MallocBuf::EMPTY;
     let cmd = match unsafe { remap_cmd_cstr_malloc(command, &mut buf) } {
@@ -1211,8 +1316,8 @@ mod tests {
 
     use super::{
         BinRemapError, MallocBuf, RewriteResult, SCRATCH_SLOTS, SCRATCH_SLOT_BYTES, SlotGuard,
-        alloc_scratch_slots, derive_host_root, parse_entries, remap_cmd_cstr_malloc_with,
-        remap_cstr_list_with, rewrite_bytes, rewrite_search_path,
+        alloc_scratch_slots, derive_dir_entries, derive_host_root, parse_entries,
+        remap_cmd_cstr_malloc_with, remap_cstr_list_with, rewrite_bytes, rewrite_search_path,
     };
 
     #[test]
@@ -1272,6 +1377,35 @@ mod tests {
             rewrite_bytes(b"/target/debug/bin/app/cli2", entries.as_slice(), &mut scratch, &mut cursor),
             Ok(RewriteResult::Unchanged)
         ));
+        // Leading boundary must be enforced: path suffixes must NOT be rewritten.
+        assert!(matches!(
+            rewrite_bytes(b"prefix/target/debug/bin/app/cli", entries.as_slice(), &mut scratch, &mut cursor),
+            Ok(RewriteResult::Unchanged)
+        ));
+        assert!(matches!(
+            rewrite_bytes(b"./target/debug/bin/app/cli", entries.as_slice(), &mut scratch, &mut cursor),
+            Ok(RewriteResult::Unchanged)
+        ));
+        // Valid leading delimiters (`=`, space) still rewrite only the delimited occurrence.
+        let Ok(RewriteResult::Rewritten { start, end }) = rewrite_bytes(
+            b"prefix/target/debug/bin/app/cli BIN=/target/debug/bin/app/cli",
+            entries.as_slice(),
+            &mut scratch,
+            &mut cursor,
+        ) else {
+            panic!("expected delimited occurrence to rewrite");
+        };
+        assert_eq!(
+            &scratch[start..end - 1],
+            b"prefix/target/debug/bin/app/cli BIN=/tmp/bzb-0123-r0-0/app/cli"
+        );
+
+        let dirs = derive_dir_entries(entries.as_slice(), host_root.as_slice(), alloc);
+        assert_eq!(dirs.len(), 2);
+        assert_eq!(dirs[0].guest.as_slice(), b"/target/debug/bin");
+        assert_eq!(dirs[0].host.as_slice(), b"/tmp/bzb-0123-r0-0\0");
+        assert_eq!(dirs[1].guest.as_slice(), b"/target/debug/bin/app");
+        assert_eq!(dirs[1].host.as_slice(), b"/tmp/bzb-0123-r0-0/app\0");
 
         let mut sp_buf = [0u8; 256];
         let sp_len = rewrite_search_path(

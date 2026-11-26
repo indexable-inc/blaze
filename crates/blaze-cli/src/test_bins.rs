@@ -1677,15 +1677,16 @@ fn resign_macho_after_patch(
     }
     let text_len = text_filesize.ok_or("launcher Mach-O has no __TEXT segment")?;
     let (linkedit_off, linkedit_fileoff) = linkedit.ok_or("launcher Mach-O has no __LINKEDIT segment")?;
-    bytes.truncate(sig_off);
-    blaze_export::sign::sign(bytes, "blaze-launcher", text_len, true);
-    let new_sig_len = bytes.len().checked_sub(sig_off).ok_or("signature length underflow")?;
-    let new_sig_u32 = u32::try_from(new_sig_len).map_err(|_| "new signature size exceeds u32")?;
-    let new_linkedit_filesize = u64::try_from(bytes.len())
-        .map_err(|_| "file size exceeds u64")?
+    let sig_off_u64 = u64::try_from(sig_off).map_err(|_| "sig_off exceeds u64")?;
+    let new_sig_len_u64 = blaze_export::sign::len("blaze-launcher", sig_off_u64);
+    let new_sig_u32 = u32::try_from(new_sig_len_u64).map_err(|_| "new signature size exceeds u32")?;
+    let new_file_len = sig_off_u64.checked_add(new_sig_len_u64).ok_or("new file size overflow")?;
+    let new_linkedit_filesize = new_file_len
         .checked_sub(linkedit_fileoff)
         .ok_or("__LINKEDIT fileoff exceeds file size")?;
     let new_linkedit_vmsize = new_linkedit_filesize.next_multiple_of(ARM64_PAGE);
+    // Update LC_CODE_SIGNATURE and __LINKEDIT sizes BEFORE calling `sign` so page 0's SHA-256
+    // hash covers the final load-command bytes.
     if let Some(dst) = bytes.get_mut(sig_cmd_off + 12..sig_cmd_off + 16) {
         dst.copy_from_slice(&new_sig_u32.to_le_bytes());
     }
@@ -1695,6 +1696,8 @@ fn resign_macho_after_patch(
     if let Some(dst) = bytes.get_mut(linkedit_off + 48..linkedit_off + 56) {
         dst.copy_from_slice(&new_linkedit_filesize.to_le_bytes());
     }
+    bytes.truncate(sig_off);
+    blaze_export::sign::sign(bytes, "blaze-launcher", text_len, true);
     Ok(())
 }
 
@@ -2710,9 +2713,16 @@ mod dst_tests {
         resign_macho_after_patch(&mut macho, slot_off, STUB_SLOT_SIZE).expect("fast resign");
         verify_all_pages(macho.as_slice());
 
-        // 2. General path: simulate a 2-blob (e.g. CMS-signed) signature, patch again, and verify
-        // it is cleanly replaced with a valid canonical ad-hoc signature.
+        // 2. General path: simulate a larger 2-blob (e.g. CMS-signed) signature (+256 bytes so
+        // LC_CODE_SIGNATURE.datasize and __LINKEDIT sizes must change BEFORE page 0 is hashed!),
+        // patch again, and verify every page hash (including page 0) matches the final image.
+        let cms_sig_len = init_sig_len + 256;
+        macho.resize(sig_off + cms_sig_len, 0xCC);
         macho[sig_off + 8..sig_off + 12].copy_from_slice(&2u32.to_be_bytes());
+        macho[sig_cmd + 12..sig_cmd + 16].copy_from_slice(&(cms_sig_len as u32).to_le_bytes());
+        macho[linkedit_cmd + 48..linkedit_cmd + 56].copy_from_slice(&(cms_sig_len as u64).to_le_bytes());
+        macho[linkedit_cmd + 32..linkedit_cmd + 40]
+            .copy_from_slice(&(cms_sig_len as u64).next_multiple_of(16 * 1024).to_le_bytes());
         patch_stub_slot(macho.as_mut_slice(), slot_off, b"mode=run\nowner=9:11\n").expect("patch general");
         resign_macho_after_patch(&mut macho, slot_off, STUB_SLOT_SIZE).expect("general resign");
         verify_all_pages(macho.as_slice());

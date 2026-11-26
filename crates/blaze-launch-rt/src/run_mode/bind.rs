@@ -162,6 +162,15 @@ impl<B: Bind> Bind for LauncherOwn<B> {
                 "execle" => Some(addr(bin_remap::remap_execle as *const ())),
                 "posix_spawn" => Some(addr(bin_remap::remap_posix_spawn as *const ())),
                 "posix_spawnp" => Some(addr(bin_remap::remap_posix_spawnp as *const ())),
+                "posix_spawn_file_actions_addopen" => {
+                    Some(addr(bin_remap::remap_posix_spawn_file_actions_addopen as *const ()))
+                }
+                #[cfg(target_os = "macos")]
+                "posix_spawn_file_actions_addchdir_np" => {
+                    Some(addr(bin_remap::remap_posix_spawn_file_actions_addchdir_np as *const ()))
+                }
+                "chdir" => Some(addr(bin_remap::remap_chdir as *const ())),
+                "opendir" => Some(addr(bin_remap::remap_opendir as *const ())),
                 "system" => Some(addr(bin_remap::remap_system as *const ())),
                 "popen" => Some(addr(bin_remap::remap_popen as *const ())),
                 "stat" => Some(addr(bin_remap::remap_stat as *const ())),
