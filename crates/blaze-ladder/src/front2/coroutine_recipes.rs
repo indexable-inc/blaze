@@ -37,7 +37,7 @@ pub fn recipes_of<'n, S: NamesSource<'n>>(
     rows: &mut Vec<RecipeRow, Global>,
     alloc: Alloc<'_>,
 ) -> Result<(), tc::CheckError> {
-    if !body.typeck.exprs.iter().any(|e| matches!(e, tc::Expr::AsyncBlock { .. })) {
+    if !body.typeck.exprs.iter().any(|e| matches!(e, tc::Expr::AsyncBlock { .. } | tc::Expr::Closure { is_async: true, .. })) {
         return Ok(());
     }
     let owner = body.typeck.owner;

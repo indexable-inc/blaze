@@ -337,6 +337,9 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         if which < parts.kind {
             return Err(BuildError::UnsupportedType { expr: closure, what: "a closure called through a trait stronger than its kind" });
         }
+        if matches!(self.expr(closure)?, Expr::Closure { is_async: true, .. }) {
+            return self.run_async_closure(closure, g, parts, which);
+        }
         if which > parts.kind {
             return self.run_entry(closure, g, parts, which);
         }
@@ -453,6 +456,128 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             }
         }
         self.walk_root()
+    }
+
+    /// Calls an `async` closure (`Expr::Closure { is_async: true, .. }`): constructs and returns
+    /// its coroutine state (`PNode::Coroutine { owner, ordinal: CLOSURE_BASE + k, args }`) with
+    /// the closure's captures and call arguments packed into the coroutine's unpolled `env`
+    /// prefix and its tag set to `UNRESUMED`.
+    ///
+    /// - `FnTrait::FnOnce`: receives the closure environment BY VALUE (never delegating through
+    ///   `run_entry` -> `&env`, which would drop the captures before the returned future is
+    ///   polled!) and moves each capture into the coroutine state.
+    /// - `FnTrait::Fn` / `FnTrait::FnMut`: receives `&env` / `&mut env` and copies the capture
+    ///   pointers when every capture is held by reference; refuses by-value captures called by
+    ///   reference (`CallRefFuture`).
+    fn run_async_closure(&mut self, closure: ExprId, g: PTy, parts: Parts, which: FnTrait) -> Result<(), BuildError> {
+        let err = |error| Self::ty_err(closure, error);
+        let (tuple, output) = self.args_tuple(closure, parts.sig)?;
+        let PNode::Tuple(l) = self.ground_node(tuple).map_err(err)? else {
+            return Err(malformed("a closure's arguments not a tuple"));
+        };
+        let mut inputs: Vec<PTy, A> = Vec::new_in(self.alloc);
+        inputs.extend_from_slice(self.ground.view().list(l).map_err(|_| malformed("a list past the ground table"))?);
+        if inputs.len() != self.body.params.len() {
+            return Err(malformed("a closure whose signature and parameters differ in number"));
+        }
+        let mut fields: Vec<EnvField, A> = Vec::new_in(self.alloc);
+        for f in self.checked.env_fields_by::<crate::layout::BuildEnv>(closure) {
+            fields.push(f);
+        }
+        if which != FnTrait::FnOnce && fields.iter().any(|f| f.how == CaptureKind::ByValue) {
+            return Err(BuildError::Unsupported {
+                expr: closure,
+                what: "an async move closure with by-value captures called by reference (CallRefFuture)",
+            });
+        }
+        let of = crate::coroutine_of(self.ground.view(), output).ok_or(malformed("an async closure whose output is not a coroutine"))?;
+        let shape = self.state_shape(closure, of)?;
+        let env_repr = match which {
+            FnTrait::Fn | FnTrait::FnMut => Repr::Ptr,
+            FnTrait::FnOnce => self.repr(g).map_err(err)?,
+        };
+        let mut reprs = Vec::with_capacity_in(inputs.len() + 1, self.alloc);
+        let mut passes = Vec::with_capacity_in(inputs.len() + 1, self.alloc);
+        reprs.push(env_repr);
+        passes.push(match which {
+            FnTrait::Fn | FnTrait::FnMut => self.rust_pass(Repr::Ptr)?,
+            FnTrait::FnOnce => self.pass(g, env_repr, Abi::Rust, None)?,
+        });
+        for &gi in inputs.iter() {
+            let repr = self.repr(gi).map_err(err)?;
+            reprs.push(repr);
+            passes.push(self.pass(gi, repr, Abi::Rust, None)?);
+        }
+        self.ret = self.repr(output).map_err(err)?;
+        let Repr::Agg(ret_l) = self.ret else {
+            return Err(malformed("an async closure's coroutine state of no size"));
+        };
+        self.ret_pass = self.pass(output, self.ret, Abi::Rust, None)?;
+        let (params, rets) = self.sig_of(&passes, self.ret_pass);
+        let own = self.b.sig(Conv::C, Variadic::No, &params, &rets);
+        self.b.set_signature(own);
+        let entry = self.create();
+        self.reached[entry.index()] = true;
+        self.begin(entry);
+        let mut values = Vec::with_capacity_in(params.len(), self.alloc);
+        for p in params.iter() {
+            values.push(self.b.param(p.ty));
+        }
+        let mut next = values.iter().copied();
+        if let Pass::Ref | Pass::Memory { .. } = self.ret_pass {
+            self.sret = Some(next.next().ok_or(malformed("a result pointer without its value"))?);
+        }
+        self.scope_marks.push(0);
+        // The closure environment: a pointer for `Fn`/`FnMut`, or by value for `FnOnce` (spilled
+        // to a temp when passed in scalar/pair registers so capture offsets can be read uniformly).
+        let env = match (which, self.take_passed(env_repr, passes[0], &mut next)?) {
+            (_, V::Unsized(..)) => return Err(malformed("a closure's environment as an unsized place")),
+            (_, V::None) => None,
+            (_, V::Place(p, off)) => Some((p, off)),
+            (FnTrait::FnOnce, v) => {
+                let tmp = self.temp(env_repr);
+                self.store(v, env_repr, tmp)?;
+                Some(tmp)
+            }
+            (_, V::Scalar(p)) => Some((p, 0)),
+        };
+        let at = self.temp(self.ret);
+        if !fields.is_empty() || !inputs.is_empty() {
+            let co_parts = self.coroutine_parts(output).map_err(err)?;
+            let le = self.layout(co_parts.env).map_err(err)?;
+            self.env_holds(closure, co_parts.env, fields.len() + inputs.len())?;
+            let base = self.field_offset(ret_l, 0)?;
+            let PNode::Tuple(el) = self.ground_node(co_parts.env).map_err(err)? else {
+                return Err(malformed("a coroutine environment that is not a tuple"));
+            };
+            let mut co_env_tys: Vec<PTy, A> = Vec::with_capacity_in(fields.len() + inputs.len(), self.alloc);
+            co_env_tys.extend_from_slice(self.ground.view().list(el).map_err(|_| malformed("a list past the ground table"))?);
+            if !fields.is_empty() {
+                let mut offs = Vec::new_in(self.alloc);
+                self.capture_offsets(closure, g, fields.len(), &mut offs)?;
+                if let Some((env_base, env_off)) = env {
+                    for j in 0..fields.len() {
+                        let cap_repr = self.repr(co_env_tys[j]).map_err(err)?;
+                        let src = (env_base, env_off + offs[j] as i32);
+                        let dst = (at.0, at.1 + (base + self.field_offset(le, j)?) as i32);
+                        let v = self.load(cap_repr, src);
+                        self.store(v, cap_repr, dst)?;
+                    }
+                }
+            }
+            for k in 0..inputs.len() {
+                let arg_v = self.take_passed(reprs[k + 1], passes[k + 1], &mut next)?;
+                let dst = (at.0, at.1 + (base + self.field_offset(le, fields.len() + k)?) as i32);
+                self.store(arg_v, reprs[k + 1], dst)?;
+            }
+        }
+        let tag = self.b.iconst(shape.tag_ty, u128::from(blaze_lir::coroutine::UNRESUMED));
+        self.b.store(Flags::NONE, tag, at.0, at.1 + shape.tag_offset as i32, MemAttrs::aligned(0));
+        self.ret_value(V::Place(at.0, at.1))?;
+        if let Some(error) = self.b.error() {
+            return Err(BuildError::Lir(error.clone()));
+        }
+        Ok(())
     }
 
     /// The thin ENTRY of closure `g` as trait method `which`, weaker than its kind (codegen.md,

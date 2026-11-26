@@ -784,7 +784,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
     /// builder refuses the async block naming `Adts::async_items`. Rows their fields name are
     /// made by `adt_rows` after this.
     fn async_rows(&mut self, made: &crate::front2::body::Body<'_>) -> Result<(), LazyRefusal> {
-        if !made.typeck.exprs.iter().any(|e| matches!(e, tc::Expr::AsyncBlock { .. })) {
+        if !made.typeck.exprs.iter().any(|e| matches!(e, tc::Expr::AsyncBlock { .. } | tc::Expr::Closure { is_async: true, .. })) {
             return Ok(());
         }
         for name in ["Poll", "pin"] {

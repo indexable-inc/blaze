@@ -46,8 +46,21 @@ use super::*;
 /// kept, and tests/coroutine_id_agree.rs asserts the two agree.
 pub fn coroutines_in<'b>(body: &'b BodyView<'_>) -> impl Iterator<Item = (u32, ExprId)> + 'b {
     // An `ExprId` is a `u32`, so every index of `exprs` fits one.
-    let ids = body.exprs.iter().enumerate().filter(|(_, x)| matches!(x, Expr::AsyncBlock { .. })).map(|(i, _)| ExprId(i as u32));
-    (0u32..).zip(ids)
+    let mut async_n = 0u32;
+    let mut closure_n = 0u32;
+    body.exprs.iter().enumerate().filter_map(move |(i, x)| match x {
+        Expr::AsyncBlock { .. } => {
+            let o = async_n;
+            async_n += 1;
+            Some((o, ExprId(i as u32)))
+        }
+        Expr::Closure { is_async, .. } => {
+            let o = closure_n;
+            closure_n += 1;
+            is_async.then_some((blaze_typeck::coroutine_id::CLOSURE_BASE + o, ExprId(i as u32)))
+        }
+        _ => None,
+    })
 }
 
 /// A coroutine's identity, read from its ground type: what names its state, its `Future::poll`
@@ -137,6 +150,46 @@ pub fn coroutine_facts(
         params.push(out.intern(PNode::Param(i)).map_err(full)?);
     }
     let from = checked.types.view();
+    if matches!(body.exprs.get(e.ix()), Some(Expr::Closure { is_async: true, .. })) {
+        let row = checked
+            .closures
+            .column::<0>()
+            .iter()
+            .position(|&c| c == e)
+            .ok_or(BuildError::Malformed { what: "an async closure without a closure row" })?;
+        let sig = *checked
+            .closures
+            .column::<2>()
+            .get(row)
+            .ok_or(BuildError::Malformed { what: "an async closure without a signature" })?;
+        let Ok(PNode::FnPtr(sig_l, _)) = from.node(sig) else {
+            return Err(BuildError::Malformed { what: "an async closure whose signature is not a fn pointer" });
+        };
+        let all = from.list(sig_l).map_err(|_| BuildError::Malformed { what: "an async closure signature list past the table" })?;
+        let (&ret, inputs) = all.split_last().ok_or(BuildError::Malformed { what: "an async closure signature with no output" })?;
+        let out_ty = match from.node(ret) {
+            Ok(PNode::Future(_, out, _)) => out,
+            _ => ret,
+        };
+        let output = crate::copy_written(from, out_ty, &params, body, out, scratch)?;
+        let cap_env = crate::layout::environment(body, checked, e, &params, out, scratch)?;
+        let env = if inputs.is_empty() {
+            cap_env
+        } else {
+            let Ok(PNode::Tuple(cap_list)) = out.view().node(cap_env) else {
+                return Err(BuildError::Malformed { what: "a closure environment that is not a tuple" });
+            };
+            let cap_elems = out.view().list(cap_list).map_err(|_| BuildError::Malformed { what: "a capture list past the table" })?;
+            let mut fields: Vec<PTy, Alloc<'_>> = Vec::with_capacity_in(cap_elems.len() + inputs.len(), scratch);
+            fields.extend_from_slice(cap_elems);
+            for &inp in inputs {
+                fields.push(crate::copy_written(from, inp, &params, body, out, scratch)?);
+            }
+            let list = out.intern_list(&fields).map_err(full)?;
+            out.intern(PNode::Tuple(list)).map_err(full)?
+        };
+        return Ok((env, output));
+    }
     let t = *checked.expr_ty.get(e.ix()).ok_or(BuildError::Malformed { what: "an async block without a type" })?;
     let Ok(PNode::Future(_, output, _)) = from.node(t) else {
         return Err(BuildError::Malformed { what: "an async block whose type is not a future" });
@@ -241,7 +294,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
 
     /// The state of coroutine `of` as the pass laid it out, asked at `e`. A state not made yet
     /// is the missing record of its owner: that body is built and split first.
-    fn state_shape(&self, e: ExprId, of: CoroutineOf) -> Result<StateShape, BuildError> {
+    pub(super) fn state_shape(&self, e: ExprId, of: CoroutineOf) -> Result<StateShape, BuildError> {
         let view = self.ground.view();
         let args = view.list(of.owner_args).map_err(|_| malformed("a list past the ground table"))?;
         match self.adts.facts().coroutine_state(of.owner, of.ordinal, args, view) {
@@ -458,8 +511,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// parts, the library's items, and `Poll<Output>` as the result (`self.ret`), which
     /// crosses as every Rust result does.
     fn co_entry(&mut self, block: ExprId) -> Result<(PTy, CoParts, crate::AsyncItems, Option<(u32, LayoutId)>), BuildError> {
-        let t = self.expr_ty(block)?;
-        let g = self.ground_ty(t).map_err(co_err)?;
+        let g = self.own_coroutine_ty(block).map_err(co_err)?;
         let parts = self.coroutine_parts(g).map_err(co_err)?;
         let items = self.async_items(Some(block))?;
         let polled = self.poll_ty(items, parts.output)?;
@@ -522,9 +574,10 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         for f in self.checked.env_fields_by::<crate::layout::BuildEnv>(block) {
             fields.push(f);
         }
-        if !fields.is_empty() {
+        let nparams = self.body.params.len();
+        if !fields.is_empty() || nparams > 0 {
             let le = self.layout(parts.env).map_err(co_err)?;
-            self.env_holds(block, parts.env, fields.len())?;
+            self.env_holds(block, parts.env, fields.len() + nparams)?;
             for j in 0..fields.len() {
                 let f = fields[j];
                 let at = (state, self.field_offset(le, j)? as i32);
@@ -546,7 +599,25 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                     }
                 }
             }
-            self.settle_env_places(block)?;
+            if !fields.is_empty() {
+                self.settle_env_places(block)?;
+            }
+            if nparams > 0 {
+                let PNode::Tuple(env_list) = self.ground_node(parts.env).map_err(co_err)? else {
+                    return Err(malformed("a coroutine environment that is not a tuple"));
+                };
+                let mut env_tys: Vec<PTy, A> = Vec::with_capacity_in(fields.len() + nparams, self.alloc);
+                env_tys.extend_from_slice(self.ground.view().list(env_list).map_err(|_| malformed("a list past the ground table"))?);
+                for k in 0..nparams {
+                    let p = self.body.params[k];
+                    let field_idx = fields.len() + k;
+                    let param_ty = env_tys[field_idx];
+                    let prepr = self.repr(param_ty).map_err(co_err)?;
+                    let at = (state, self.field_offset(le, field_idx)? as i32);
+                    let v = self.load(prepr, at);
+                    self.bind_param(p, v, param_ty)?;
+                }
+            }
         }
         self.walk_root()?;
         // No edge of the body leads here: the state's drop does, when the tag is `Unresumed`.
@@ -935,12 +1006,15 @@ pub(crate) fn build<A: Allocator + Copy>(
     alloc: A,
 ) -> Result<crate::BuiltCoroutine<A>, BuildError> {
     let block = coroutines_in(body).find(|c| c.0 == ordinal).map(|c| c.1).ok_or(malformed("a coroutine ordinal past its owner body's async blocks"))?;
-    let Some(Expr::AsyncBlock { body: root, .. }) = body.exprs.get(block.ix()).copied() else {
-        return Err(malformed("a coroutine body asked of an expression that is not an async block"));
+    let (root, params) = match body.exprs.get(block.ix()).copied() {
+        Some(Expr::AsyncBlock { body: root, .. }) => (root, &[][..]),
+        Some(Expr::Closure { is_async: true, params, body: root, .. }) => {
+            let ps = body.pat_lists.get(params.range()).ok_or(malformed("an async closure's parameter list past the body"))?;
+            (root, ps)
+        }
+        _ => return Err(malformed("a coroutine body asked of an expression that is not an async block or async closure")),
     };
-    // The block's body is the root; it has no parameters of its own (its upvars are bound
-    // from the state).
-    let view = BodyView { params: &[], root, ..*body };
+    let view = BodyView { params, root, ..*body };
     let lir = |error| match error {
         blaze_lir::BuildError::Verify(v) => BuildError::Verify(v),
         other => BuildError::Lir(other),

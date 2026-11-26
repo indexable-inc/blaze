@@ -39,6 +39,29 @@ fn both_ordinal_rules_agree_on_a_body_with_three_blocks() {
     assert_eq!(builder.iter().map(|&(_, e)| e).collect::<Vec<_>>(), std::vec![inner, outer, last]);
     for &(ordinal, e) in &builder {
         assert_eq!(blaze_typeck::coroutine_id::async_ordinal(&body, e), Some(ordinal), "block {e:?}");
+        assert_eq!(blaze_typeck::coroutine_id::coroutine_ordinal(&body, e), Some(ordinal), "block {e:?}");
     }
     assert_eq!(blaze_typeck::coroutine_id::async_ordinal(&body, plain), None, "a plain block has no ordinal");
+    assert_eq!(blaze_typeck::coroutine_id::coroutine_ordinal(&body, plain), None, "a plain block has no coroutine ordinal");
+}
+
+#[test]
+fn both_ordinal_rules_agree_on_async_closures_and_blocks() {
+    let mut b = Bb::new();
+    let one = b.int(None);
+    let sync_cl = b.closure(&[], one);
+    let two = b.int(None);
+    let blk = b.async_block(two, blaze_typeck::Capture::Move);
+    let three = b.int(None);
+    let async_cl = b.async_closure(&[], three);
+    let s1 = b.semi(sync_cl);
+    let s2 = b.semi(blk);
+    let root = b.block(&[s1, s2], Some(async_cl));
+    let body = b.view(ItemKey(0x0c0f_0002), root);
+    let builder: Vec<(u32, ExprId)> = crate::coroutines_in(&body).collect();
+    assert_eq!(builder, std::vec![(0, blk), (blaze_typeck::coroutine_id::CLOSURE_BASE + 1, async_cl)]);
+    for &(ordinal, e) in &builder {
+        assert_eq!(blaze_typeck::coroutine_id::coroutine_ordinal(&body, e), Some(ordinal), "expr {e:?}");
+    }
+    assert_eq!(blaze_typeck::coroutine_id::coroutine_ordinal(&body, sync_cl), None);
 }
