@@ -460,6 +460,12 @@ pub struct BorrowLangs {
     /// `DiscriminantKind::Discriminant` and `Pointee::Metadata`.
     pub discriminant_kind: Option<tc::ItemKey>,
     pub pointee: Option<tc::ItemKey>,
+    /// `core::marker::Tuple`, used by `inst_needs_drop` when verifying `FnMut` blanket impls.
+    pub tuple_trait: Option<tc::ItemKey>,
+    /// `core::any::TryAsDynCompatible` (`#[lang = "try_as_dyn"]`). Note: NOT in `relates_nothing`
+    /// because `dyn Trait + 'b: TryAsDynCompatible<'a>` requires `'b == 'a` for soundness of
+    /// `core::any::try_as_dyn`.
+    pub try_as_dyn: Option<tc::ItemKey>,
 }
 
 impl BorrowLangs {
@@ -480,6 +486,8 @@ impl BorrowLangs {
             future: lang("future_trait"),
             discriminant_kind,
             pointee,
+            tuple_trait: lang("tuple_trait"),
+            try_as_dyn: lang("try_as_dyn"),
         }
     }
 }
@@ -507,6 +515,9 @@ pub struct BorrowFacts<'a> {
     /// arguments' drop flags are in `drop_need` (borrow_fields.rs `drop_facts_of`; `Facts::drop_args`).
     drop_args: AVec<'a, (u128, u32, u32)>,
     drop_need: AVec<'a, bool>,
+    /// Instantiated body `PTy`s (sorted by `PTy::0`) whose structural drop glue was resolved by
+    /// `borrow_fields::InstDropEval` (normalizing `PNode::Alias` fields), for `Facts::inst_needs_drop`.
+    inst_drop: AVec<'a, (u32, bool)>,
     /// Per ADT whose strict-drop summary was read (RFC 1327 `#[may_dangle]`), sorted by checker
     /// key: where its arguments' strict flags are in `drop_strict_need` (`Facts::drop_strict`).
     drop_strict: AVec<'a, (u128, u32, u32)>,
@@ -595,6 +606,7 @@ pub struct BorrowFacts<'a> {
     into_future_trait: Option<tc::ItemKey>,
     discriminant_kind: Option<tc::ItemKey>,
     pointee: Option<tc::ItemKey>,
+    try_as_dyn: Option<tc::ItemKey>,
     /// Unique `Deref` impl per ADT, sorted by ADT key (`Facts::deref_impl`).
     deref_impls: AVec<'a, (u128, tc::ItemKey)>,
     /// `(trait_key, assoc_name, assoc_item)` sorted by `(trait_key, assoc_name)` (`Facts::assoc_item`).
@@ -652,6 +664,7 @@ impl<'a> BorrowFacts<'a> {
             copy_need: AVec::new_in(alloc),
             drop_args: AVec::new_in(alloc),
             drop_need: AVec::new_in(alloc),
+            inst_drop: AVec::new_in(alloc),
             drop_strict: AVec::new_in(alloc),
             drop_strict_need: AVec::new_in(alloc),
             drop_lifetimes: AVec::new_in(alloc),
@@ -684,6 +697,7 @@ impl<'a> BorrowFacts<'a> {
             into_future_trait: None,
             discriminant_kind: None,
             pointee: None,
+            try_as_dyn: None,
             deref_impls: AVec::new_in(alloc),
             assoc_items: AVec::new_in(alloc),
             rpitit_opaques: AVec::new_in(alloc),
@@ -716,6 +730,11 @@ impl<'a> BorrowFacts<'a> {
     /// Each ADT whose row was not made, and why, by checker key.
     pub fn unmade(&self) -> &[(u128, AdtUnmade)] {
         &self.unmade
+    }
+
+    /// Whether `trait_` is `core::any::TryAsDynCompatible` (`#[lang = "try_as_dyn"]`).
+    pub fn is_try_as_dyn_trait(&self, trait_: tc::ItemKey) -> bool {
+        Some(trait_) == self.try_as_dyn
     }
 
     fn variant(&self, adt: tc::ItemKey, variant: u32) -> Option<(u32, u32)> {
@@ -797,6 +816,10 @@ impl Facts for ReadBy<'_, '_> {
         let end = start.checked_add(usize::try_from(len).ok()?)?;
         self.facts.drop_need.get(start..end)
     }
+    fn inst_needs_drop(&self, ty: tc::PTy) -> Option<bool> {
+        let at = self.facts.inst_drop.binary_search_by_key(&ty.0, |&(k, _)| k).ok()?;
+        self.facts.inst_drop.get(at).map(|&(_, v)| v)
+    }
     fn drop_strict(&self, adt: tc::ItemKey) -> Option<&[bool]> {
         let at = self.facts.drop_strict.binary_search_by_key(&adt.0, |&(k, _, _)| k).ok()?;
         let &(_, start, len) = self.facts.drop_strict.get(at)?;
@@ -840,6 +863,9 @@ impl Facts for ReadBy<'_, '_> {
     }
     fn is_auto_trait(&self, trait_: tc::ItemKey) -> bool {
         self.facts.auto_traits.binary_search(&trait_.0).is_ok()
+    }
+    fn is_try_as_dyn_trait(&self, trait_: tc::ItemKey) -> bool {
+        self.facts.is_try_as_dyn_trait(trait_)
     }
     fn is_fn_trait(&self, trait_: tc::ItemKey) -> bool {
         self.facts.fn_traits.contains(&Some(trait_))
@@ -911,6 +937,38 @@ impl Facts for ReadBy<'_, '_> {
 /// reference to a type parameter or to a type with no reference at its head, a type with no
 /// reference at its head, or not read (a projection, an opaque type or a trait object, which may
 /// stand for a reference; two references deep).
+/// Collects a trait's sorted direct `Self` supertraits and `Self: 'r` outlives bounds (excluding
+/// `Region::Late`), keeping both `copy_supertrait_read` sites identical (rule 21).
+fn trait_self_supers<'a>(
+    def: &super::heads::TraitExtra,
+    tys: tc::PTys<'_>,
+    direct: &mut AVec<'a, u128>,
+    self_outlives: &mut AVec<'a, tc::regions::Region>,
+) {
+    direct.clear();
+    self_outlives.clear();
+    for sc in def.supertraits.iter() {
+        match *sc {
+            tc::PClause::Trait { trait_: sup, args }
+                if tys.list(args).ok().and_then(|l| l.first().copied()).is_some_and(|first| matches!(tys.node(first), Ok(tc::PNode::Param(0)))) =>
+            {
+                direct.push(sup.0);
+            }
+            tc::PClause::TypeOutlives { ty, region }
+                if matches!(tys.node(ty), Ok(tc::PNode::Param(0)))
+                    && !matches!(region, tc::regions::Region::Late { .. }) =>
+            {
+                self_outlives.push(region);
+            }
+            _ => {}
+        }
+    }
+    direct.sort_unstable();
+    direct.dedup();
+    self_outlives.sort_unstable();
+    self_outlives.dedup();
+}
+
 /// Structural equality of two erased `PTy`s residing in different `PTys` tables (bounded,
 /// zero-allocation, used to match owner `where` clauses against body `PNode::Alias` types).
 fn pty_eq_across(ta: tc::PTys<'_>, a: tc::PTy, tb: tc::PTys<'_>, b: tc::PTy) -> bool {
@@ -1475,6 +1533,7 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
     g.into_future_trait = super::langs::find(r.index, crate::resolve::Paths { names: r.names }, tc::LangItem::IntoFuture).ok().flatten().map(checker_of);
     g.discriminant_kind = langs.discriminant_kind;
     g.pointee = langs.pointee;
+    g.try_as_dyn = langs.try_as_dyn;
     // A `const` or `static` item's body (module-level, local in a fn/macro, associated, or
     // anonymous) is a constant initializer: its extending borrows' temporaries live for `'static`
     // (the Reference, "Temporary lifetime extension").
@@ -1486,44 +1545,82 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                 | super::by_origin::KeyKind::Anon { .. }
         )
     );
-    // The owner's `T: Copy` and transitive supertrait `T: 'static` clauses (own and inherited),
+    // The owner's `T: Copy` and transitive supertrait `T: 'r` clauses (own and inherited),
     // including transitive supertraits (`T: Tr` where `trait Tr: Copy` or `trait Tr: 'static`,
-    // e.g. `Planted<P>: Copy`, `Relation: 'static`, `Prefab: 'static`). Each inspected trait's
-    // direct `Self` supertraits and `Self: 'static` flag are filed as a `BorrowHead` read row (rule 21).
-    let mut param_static: AVec<'a, u32> = AVec::new_in(alloc);
+    // e.g. `Planted<P>: Copy`, `Relation: 'static`, `Prefab: 'static`, or parameterized
+    // `L: LoadItems<'a>` where `trait LoadItems<'a>: 'a` implies `L: 'a`). Each inspected
+    // trait's direct `Self` supertraits and `Self: 'r` outlives bounds are filed as a
+    // `BorrowHead` read row (rule 21).
+    let mut param_outlives: AVec<'a, (u32, tc::regions::Region)> = AVec::new_in(alloc);
     {
-        let mut param_traits: AVec<'a, (u32, tc::ItemKey)> = AVec::new_in(alloc);
-        if let Some(p) = r.store.preds.get(&owner) {
-            let tys = r.store.tys.view();
-            for c in p.clauses.iter() {
-                if let tc::PClause::Trait { trait_, args } = *c
-                    && let Ok(list) = tys.list(args)
-                    && let Some(&first) = list.first()
-                    && let Ok(tc::PNode::Param(i)) = tys.node(first)
-                {
-                    if Some(trait_) == langs.copy {
-                        g.param_copy.push(i);
-                    } else {
-                        param_traits.push((i, trait_));
+        let mut lt_pool: AVec<'a, Option<tc::regions::Region>> = AVec::new_in(alloc);
+        let mut param_traits: AVec<'a, (u32, tc::ItemKey, usize, usize)> = AVec::new_in(alloc);
+        {
+            let owner_regions = r.store.regions.reader(r.store.work_alloc());
+            let owner_views = owner_regions.clauses(owner).ok();
+            let mut read_owner_clauses = false;
+            if let Some(head) = r.store.fns.get(&owner)
+                && let super::types::SelfTy::Trait(lib) = head.self_
+            {
+                let tk = checker_of(lib);
+                let lt_start = lt_pool.len();
+                if let Ok(params) = owner_regions.lifetime_params(tk) {
+                    for i in 0..params.count() {
+                        lt_pool.push(Some(tc::regions::Region::Param(i)));
+                    }
+                }
+                param_traits.push((0, tk, lt_start, lt_pool.len() - lt_start));
+            }
+            if let Some(p) = r.store.preds.get(&owner) {
+                let tys = r.store.tys.view();
+                for (nth, c) in p.clauses.iter().enumerate() {
+                    if let tc::PClause::Trait { trait_, args } = *c
+                        && let Ok(list) = tys.list(args)
+                        && let Some(&first) = list.first()
+                        && let Ok(tc::PNode::Param(i)) = tys.node(first)
+                    {
+                        if Some(trait_) == langs.copy {
+                            g.param_copy.push(i);
+                        } else {
+                            let lt_start = lt_pool.len();
+                            if let Some(views) = owner_views
+                                && let Ok(nth_u32) = u32::try_from(nth)
+                                && let Some(cv) = views.iter().find(|v| v.nth == nth_u32)
+                            {
+                                read_owner_clauses = true;
+                                for &reg in cv.col.own() {
+                                    lt_pool.push(match reg {
+                                        tc::regions::Region::Static | tc::regions::Region::Param(_) => Some(reg),
+                                        tc::regions::Region::Late { .. } => None,
+                                    });
+                                }
+                            }
+                            param_traits.push((i, trait_, lt_start, lt_pool.len() - lt_start));
+                        }
                     }
                 }
             }
+            if read_owner_clauses {
+                g.reads.push(clauses_read(owner.0, &owner_regions));
+            }
         }
         if !param_traits.is_empty() {
-            let mut visited: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
-            let mut stack: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+            let mut visited: AVec<'a, (tc::ItemKey, usize, usize)> = AVec::new_in(alloc);
+            let mut stack: AVec<'a, (tc::ItemKey, usize, usize)> = AVec::new_in(alloc);
             let mut direct: AVec<'a, u128> = AVec::new_in(alloc);
+            let mut self_outlives: AVec<'a, tc::regions::Region> = AVec::new_in(alloc);
             let mut recorded: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
-            for &(param, start_trait) in param_traits.iter() {
+            let mut clauses_recorded: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+            for &(param, start_trait, start_lo, start_len) in param_traits.iter() {
                 let mut found_copy = g.param_copy.scan_for(&param).is_some();
-                let mut found_static = param_static.scan_for(&param).is_some();
+                let mut found_static = param_outlives.iter().any(|&(p, reg)| p == param && reg == tc::regions::Region::Static);
                 if found_copy && found_static {
                     continue;
                 }
                 visited.clear();
                 stack.clear();
-                stack.push(start_trait);
-                while let Some(t) = stack.pop() {
+                stack.push((start_trait, start_lo, start_len));
+                while let Some((t, t_lo, t_len)) = stack.pop() {
                     if Some(t) == langs.copy {
                         found_copy = true;
                         if found_static {
@@ -1531,48 +1628,88 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                         }
                         continue;
                     }
-                    if visited.scan_for(&t).is_some() || visited.len() >= 64 {
+                    let t_lts_match = |lo: usize, len: usize| lt_pool.get(lo..lo + len) == lt_pool.get(t_lo..t_lo + t_len);
+                    if visited.iter().any(|&(vk, vlo, vlen)| vk == t && t_lts_match(vlo, vlen)) || visited.len() >= 64 {
                         continue;
                     }
-                    visited.push(t);
+                    visited.push((t, t_lo, t_len));
                     if !r.store.trait_defs.contains_key(&t)
                         && let Some(lib) = r.keys.library_in(r.names, t)
                     {
                         ensure_one(r, Want::Members(lib));
                     }
-                    direct.clear();
-                    let mut self_static = false;
                     if let Some(def) = r.store.trait_defs.get(&t) {
                         let tys = r.store.tys.view();
-                        for sc in def.supertraits.iter() {
-                            match *sc {
-                                tc::PClause::Trait { trait_: sup, args }
-                                    if tys.list(args).ok().and_then(|l| l.first().copied()).is_some_and(|first| matches!(tys.node(first), Ok(tc::PNode::Param(0)))) =>
-                                {
-                                    direct.push(sup.0);
-                                }
-                                tc::PClause::TypeOutlives { ty, region: tc::regions::Region::Static }
-                                    if matches!(tys.node(ty), Ok(tc::PNode::Param(0))) =>
-                                {
-                                    self_static = true;
-                                }
-                                _ => {}
-                            }
-                        }
-                        direct.sort_unstable();
-                        direct.dedup();
+                        trait_self_supers(def, tys, &mut direct, &mut self_outlives);
                         if recorded.scan_for(&t).is_none() {
                             recorded.push(t);
-                            g.reads.push(copy_supertrait_read(t.0, Some((&direct, self_static))));
+                            g.reads.push(copy_supertrait_read(t.0, Some((&direct, &self_outlives))));
                         }
-                        if self_static {
-                            found_static = true;
+                        for &reg in self_outlives.iter() {
+                            match reg {
+                                tc::regions::Region::Static => {
+                                    found_static = true;
+                                    param_outlives.push((param, tc::regions::Region::Static));
+                                }
+                                tc::regions::Region::Param(j) => {
+                                    if let Ok(ji) = usize::try_from(j)
+                                        && let Some(Some(mapped)) = lt_pool.get(t_lo..t_lo + t_len).and_then(|s| s.get(ji)).copied()
+                                    {
+                                        if mapped == tc::regions::Region::Static {
+                                            found_static = true;
+                                        }
+                                        param_outlives.push((param, mapped));
+                                    }
+                                }
+                                tc::regions::Region::Late { .. } => {}
+                            }
                         }
                         if found_copy && found_static {
                             break;
                         }
+                        let t_regions = r.store.regions.reader(r.store.work_alloc());
+                        let t_views = if !direct.is_empty() && t_len > 0 {
+                            if clauses_recorded.scan_for(&t).is_none() {
+                                clauses_recorded.push(t);
+                                g.reads.push(clauses_read(t.0, &t_regions));
+                            }
+                            t_regions.clauses(t).ok()
+                        } else {
+                            None
+                        };
                         for &sup in direct.iter() {
-                            stack.push(tc::ItemKey(sup));
+                            let sup_key = tc::ItemKey(sup);
+                            let mut pushed_any = false;
+                            if let Some(views) = t_views {
+                                for cv in views {
+                                    if let Ok(tc::PNode::ExTrait(ct, args)) = tys.node(cv.col.ty())
+                                        && ct == sup_key
+                                        && tys
+                                            .list(args)
+                                            .ok()
+                                            .and_then(|l| l.first().copied())
+                                            .is_some_and(|first| matches!(tys.node(first), Ok(tc::PNode::Param(0))))
+                                    {
+                                        let next_lo = lt_pool.len();
+                                        let own_slice = cv.col.own();
+                                        for &reg in own_slice {
+                                            let mapped = match reg {
+                                                tc::regions::Region::Static => Some(tc::regions::Region::Static),
+                                                tc::regions::Region::Param(k) => usize::try_from(k)
+                                                    .ok()
+                                                    .and_then(|ki| lt_pool.get(t_lo..t_lo + t_len)?.get(ki).copied().flatten()),
+                                                tc::regions::Region::Late { .. } => None,
+                                            };
+                                            lt_pool.push(mapped);
+                                        }
+                                        stack.push((sup_key, next_lo, lt_pool.len() - next_lo));
+                                        pushed_any = true;
+                                    }
+                                }
+                            }
+                            if !pushed_any {
+                                stack.push((sup_key, 0, 0));
+                            }
                         }
                     } else if recorded.scan_for(&t).is_none() {
                         recorded.push(t);
@@ -1582,15 +1719,12 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                 if found_copy {
                     g.param_copy.push(param);
                 }
-                if found_static {
-                    param_static.push(param);
-                }
             }
         }
         g.param_copy.sort_unstable();
         g.param_copy.dedup();
-        param_static.sort_unstable();
-        param_static.dedup();
+        param_outlives.sort_unstable();
+        param_outlives.dedup();
     }
     // Ensure callees, FnDef value items, selected impls, and supertrait heads BEFORE collecting
     // ADTs so every ADT named inside a signature, selected impl header/assoc value, or supertrait
@@ -1915,6 +2049,7 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
         let mut visited: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
         let mut stack: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
         let mut direct: AVec<'a, u128> = AVec::new_in(alloc);
+        let mut self_outlives: AVec<'a, tc::regions::Region> = AVec::new_in(alloc);
         let mut recorded: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
         let mut assoc_copy_cache: AVec<'a, (u128, bool)> = AVec::new_in(alloc);
         let mut reaches_copy = |r: &mut Records<'_, 'n, S>, start: tc::ItemKey, reads: &mut AVec<'a, Read>| -> bool {
@@ -1934,30 +2069,12 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                 {
                     ensure_one(r, Want::Members(lib));
                 }
-                direct.clear();
-                let mut self_static = false;
                 if let Some(def) = r.store.trait_defs.get(&t) {
                     let tys = r.store.tys.view();
-                    for sc in def.supertraits.iter() {
-                        match *sc {
-                            tc::PClause::Trait { trait_: sup, args }
-                                if tys.list(args).ok().and_then(|l| l.first().copied()).is_some_and(|first| matches!(tys.node(first), Ok(tc::PNode::Param(0)))) =>
-                            {
-                                direct.push(sup.0);
-                            }
-                            tc::PClause::TypeOutlives { ty, region: tc::regions::Region::Static }
-                                if matches!(tys.node(ty), Ok(tc::PNode::Param(0))) =>
-                            {
-                                self_static = true;
-                            }
-                            _ => {}
-                        }
-                    }
-                    direct.sort_unstable();
-                    direct.dedup();
+                    trait_self_supers(def, tys, &mut direct, &mut self_outlives);
                     if recorded.scan_for(&t).is_none() {
                         recorded.push(t);
-                        reads.push(copy_supertrait_read(t.0, Some((&direct, self_static))));
+                        reads.push(copy_supertrait_read(t.0, Some((&direct, &self_outlives))));
                     }
                     for &sup in direct.iter() {
                         stack.push(tc::ItemKey(sup));
@@ -2489,6 +2606,30 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             g.field_regions.insert(key, RegionFields { first_variant: variants_from, variant_count, first_field: fields_from, regions });
         }
     }
+    // Evaluate instantiated structural drop glue for concrete body `PNode::Adt` types whose
+    // uninstantiated ADT summary had `needs_drop && !drop_impl` (e.g. `Flatten<...>`,
+    // `Split<'_, &str>`, `SplitWhitespace<'_>` whose fields hold `PNode::Alias`).
+    {
+        let body_tys = c.types.view();
+        let mut eval: Option<fields::InstDropEval<'a>> = None;
+        for (idx, node) in body_tys.nodes().enumerate() {
+            let tc::PNode::Adt(k, _) = *node else { continue };
+            let Ok(at) = g.adts.binary_search_by_key(&k.0, |&(ak, _)| ak) else { continue };
+            let af = g.adts[at].1;
+            if !af.needs_drop || af.drop_impl {
+                continue;
+            }
+            let Ok(pty_id) = u32::try_from(idx) else { continue };
+            let ev = eval.get_or_insert_with(|| fields::InstDropEval::new_in(alloc));
+            if let Some(needs) = ev.eval_body_ty(r, langs, body_tys, tc::PTy(pty_id)) {
+                g.inst_drop.push((pty_id, needs));
+            }
+        }
+        if let Some(ev) = eval {
+            ev.push_reads(&mut g.reads);
+        }
+        g.inst_drop.sort_unstable_by_key(|&(k, _)| k);
+    }
     let target_name = tc::Name::of("Target");
     let prev_selected_len = selected.len();
     for &(_, imp) in g.deref_impls.iter() {
@@ -2591,8 +2732,8 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             let key = tc::ItemKey(k);
             let head = r.store.fns.get(&key);
             let clauses = r.store.preds.get(&key).map(|p| &p.clauses[..]);
-            let extra_static: &[u32] = if k == owner.0 { &param_static } else { &[] };
-            g.calls.gather(k, head, clauses, r.store.tys.view(), &regions, future, extra_static, alloc);
+            let extra_outlives: &[(u32, tc::regions::Region)] = if k == owner.0 { &param_outlives } else { &[] };
+            g.calls.gather(k, head, clauses, r.store.tys.view(), &regions, future, extra_outlives, alloc);
             g.ties.gather(k, head, clauses, r.store.tys.view(), &regions);
         }
         // Each trait object's principal: whether it declares a lifetime decides how an unsized
@@ -5096,5 +5237,410 @@ fn main() {}
             bad_fn_mut.findings.iter().any(|d| d.code == "E0521"),
             "fn_mut_by_value_escape_bad must be E0521: {bad_fn_mut:?}",
         );
+    }
+}
+
+/// Regression and soundness tests for Wave 5 `front2` fixes:
+/// 1. Instantiated `PNode::Alias` structural drop-glue evaluator (`inst_needs_drop`):
+///    - `Split<'_, &str>`, `SplitWhitespace<'_>`, and `Flatten<Take<slice::Iter<'_, Option<&T>>>>`
+///      prove `needs_drop == false`.
+///    - Negative soundness controls: `Flatten<vec::IntoIter<Vec<DropGuard>>>`, `Flatten<option::IntoIter<DropGuard<'_>>>`,
+///      custom `Drop` searcher, and generic `P` MUST still require drop and reject conflicting mutations.
+/// 2. `FieldRegionsUnaligned` on ADT fields holding `PNode::Alias` (`run_parent.rs::lowering_counts` shape).
+/// 3. Parameterized supertrait outlives propagation (`L: LoadItems<'a>` where `trait LoadItems<'a>: 'a`,
+///    `items_record.rs::{read, record}` shape), plus negative controls without `: 'a` or requiring `'static`.
+/// 4. Default trait object lifetimes in zero-lifetime type aliases (`type ArcAlias<T> = Arc<T>;
+///    ArcAlias<dyn Store>`, `h3/config.rs::client` shape), plus negative controls proving `'static`
+///    and refusing lifetime-parameterized aliases.
+#[cfg(test)]
+mod wave5_front2_soundness_tests {
+    use crate::crates::{DirShelf, Inputs, Toolchain, UserCrate};
+    use crate::front2::project::{BodyRef, ProjectWorld};
+    use crate::refusal::SourceFile;
+
+    const SOURCE: &str = r#"
+#![feature(try_as_dyn, type_info)]
+extern crate alloc;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::any::TypeId;
+use core::marker::PhantomData;
+
+// --- 1. Instantiated PNode::Alias structural drop-glue (`inst_needs_drop`) ---
+
+pub fn split_str_no_drop_ok(inbox: &mut Vec<u8>) -> usize {
+    let head = core::str::from_utf8(&inbox[..]).unwrap_or("");
+    let mut lines = head.split("\r\n");
+    let first_len = lines.next().unwrap_or("").len();
+    // `lines` is still in scope until end of function; mutating `inbox` is valid ONLY because
+    // `Split<'_, &str>` has no drop glue (`<&str as Pattern>::Searcher<'_> = StrSearcher`).
+    inbox.push(0);
+    first_len
+}
+
+pub fn split_whitespace_no_drop_ok(inbox: &mut Vec<u8>) -> usize {
+    let head = core::str::from_utf8(&inbox[..]).unwrap_or("");
+    let mut parts = head.split_whitespace();
+    let first_len = parts.next().unwrap_or("").len();
+    // `parts` (`SplitWhitespace<'_>`) has no drop glue.
+    inbox.push(0);
+    first_len
+}
+
+pub fn flatten_take_option_ref_no_drop_ok(items: &mut [Option<&u32>; 4], count: usize) {
+    let target = 7u32;
+    if !items.iter().take(count).flatten().any(|&&x| x == target) {
+        if let Some(slot) = items.get_mut(count) {
+            *slot = None;
+        }
+    }
+}
+
+pub struct DropGuard<'a> {
+    slot: &'a mut u32,
+}
+
+impl Drop for DropGuard<'_> {
+    fn drop(&mut self) {
+        *self.slot += 1;
+    }
+}
+
+// NEGATIVE 1: `Flatten<option::IntoIter<DropGuard<'_>>>` drops `DropGuard<'_>` at scope exit,
+// so mutating `*x` while `flat` is still in scope MUST be rejected.
+pub fn flatten_dropping_inner_bad(x: &mut u32) {
+    let flat = Some(Some(DropGuard { slot: x })).into_iter().flatten();
+    *x = 99;
+    let _ = &flat;
+}
+
+// NEGATIVE 2: `Flatten<vec::IntoIter<Vec<DropGuard<'_>>>>` drops `Vec` and `DropGuard<'_>` at
+// scope exit, so mutating `*x` before `flat` drops MUST be rejected.
+pub fn flatten_vec_drop_bad(x: &mut u32) {
+    let mut inner = Vec::new();
+    inner.push(DropGuard { slot: x });
+    let mut outer = Vec::new();
+    outer.push(inner);
+    let _flat = outer.into_iter().flatten();
+    *x = 42;
+}
+
+pub trait MyPat<'a> {
+    type Searcher;
+    fn make(self, x: &'a mut u32) -> Self::Searcher;
+}
+
+pub struct MySplit<'a, P: MyPat<'a>> {
+    searcher: P::Searcher,
+}
+
+fn make_my_split<'a, P: MyPat<'a>>(searcher: P::Searcher) -> MySplit<'a, P> {
+    MySplit { searcher }
+}
+
+pub struct NoDropPat;
+impl<'a> MyPat<'a> for NoDropPat {
+    type Searcher = &'a u32;
+    fn make(self, x: &'a mut u32) -> &'a u32 {
+        &*x
+    }
+}
+
+pub struct DropPat;
+impl<'a> MyPat<'a> for DropPat {
+    type Searcher = DropGuard<'a>;
+    fn make(self, x: &'a mut u32) -> DropGuard<'a> {
+        DropGuard { slot: x }
+    }
+}
+
+pub fn custom_pat_no_drop_ok(x: &mut u32) {
+    let _s = make_my_split::<'_, NoDropPat>(&*x);
+    *x = 1;
+}
+
+// NEGATIVE 3: `MySplit<DropPat>` normalizes `Searcher` to `DropGuard<'a>` which implements `Drop`,
+// so mutating `*x` while `_s` is in scope MUST be rejected.
+pub fn custom_pat_drop_bad(x: &mut u32) {
+    let _s = make_my_split::<'_, DropPat>(DropGuard { slot: x });
+    *x = 1;
+}
+
+// NEGATIVE 4: generic `P: MyPat<'a>` cannot prove `needs_drop == false`, so borrowing `x` into
+// `MySplit<P>` and mutating `*x` before `_s` drops MUST be rejected.
+pub fn custom_pat_generic_bad<P: for<'a> MyPat<'a>>(x: &mut u32, p: P) {
+    let _s = make_my_split::<'_, P>(p.make(x));
+    *x = 1;
+}
+
+// --- 2. FieldRegionsUnaligned for PNode::Alias fields (`run_parent.rs::lowering_counts`) ---
+
+pub trait Front {
+    type Maker;
+}
+
+pub struct RunMaker<'h> {
+    pub data: &'h u8,
+}
+
+impl<'h> RunMaker<'h> {
+    pub fn count(&self) -> u8 {
+        *self.data
+    }
+}
+
+pub struct Heavy<M> {
+    pub maker: M,
+}
+
+pub struct Started<'a, M> {
+    pub heavy: Option<Heavy<M>>,
+    pub _marker: PhantomData<&'a ()>,
+}
+
+pub struct Lazy<'a, F: Front> {
+    pub started: Option<Started<'a, F::Maker>>,
+}
+
+impl<'a, F: Front> Lazy<'a, F> {
+    pub fn lowering_counts_ok<'h>(&self) -> u8
+    where
+        F: Front<Maker = RunMaker<'h>>,
+    {
+        self.started
+            .as_ref()
+            .and_then(|s| s.heavy.as_ref())
+            .map_or(0, |heavy| heavy.maker.count())
+    }
+
+    // NEGATIVE: returning `'h` as `'static` through `heavy.maker.data` MUST be rejected.
+    pub fn lowering_counts_bad_static<'h>(&self) -> Option<&'static u8>
+    where
+        F: Front<Maker = RunMaker<'h>>,
+    {
+        self.started
+            .as_ref()
+            .and_then(|s| s.heavy.as_ref())
+            .map(|heavy| heavy.maker.data)
+    }
+}
+
+// --- 3. Parameterized supertrait outlives (`items_record.rs::{read, record}`) ---
+
+pub trait LoadItems<'a>: 'a {
+    fn file(&self) -> Option<&'a str>;
+}
+
+pub trait SubLoadItems<'a>: LoadItems<'a> {}
+
+pub trait UnboundedLoad<'a> {
+    fn file(&self) -> Option<&'a str>;
+}
+
+fn take_a<'a, F: Fn() -> Option<&'a str> + 'a>(f: F) -> Option<&'a str> {
+    f()
+}
+
+fn take_static<F: Fn() -> usize + 'static>(f: F) -> usize {
+    f()
+}
+
+pub struct RecordItems<'a, L> {
+    load: Arc<L>,
+    _marker: PhantomData<&'a ()>,
+}
+
+impl<'a, L: LoadItems<'a>> RecordItems<'a, L> {
+    pub fn record_ok(&self) -> Option<&'a str> {
+        let load = Arc::clone(&self.load);
+        take_a(move || load.file())
+    }
+
+    // NEGATIVE: `L: LoadItems<'a>` implies `L: 'a`, NOT `L: 'static`.
+    pub fn record_bad_static(&self) -> usize {
+        let load = Arc::clone(&self.load);
+        take_static(move || load.file().map_or(0, |s| s.len()))
+    }
+}
+
+impl<'a, L: SubLoadItems<'a>> RecordItems<'a, L> {
+    pub fn record_transitive_ok(&self) -> Option<&'a str> {
+        let load = Arc::clone(&self.load);
+        take_a(move || load.file())
+    }
+}
+
+impl<'a, L: UnboundedLoad<'a>> RecordItems<'a, L> {
+    // NEGATIVE: `UnboundedLoad<'a>` has NO `: 'a` supertrait, so `L: 'a` MUST NOT be accepted.
+    pub fn record_unbounded_bad(&self) -> Option<&'a str> {
+        let load = Arc::clone(&self.load);
+        take_a(move || load.file())
+    }
+}
+
+// --- 4. Default trait object lifetimes in zero-lifetime type aliases (`h3/config.rs::client`) ---
+
+pub trait SessionStore: Send + Sync {}
+pub struct OwnedStore;
+impl SessionStore for OwnedStore {}
+pub struct BorrowedStore<'a>(pub &'a u8);
+impl SessionStore for BorrowedStore<'_> {}
+
+pub type ArcAlias<T> = Arc<T>;
+pub type RefAlias<'a, T> = &'a T;
+
+pub fn store_via_alias(_store: ArcAlias<dyn SessionStore>) {}
+
+pub fn alias_object_default_ok() {
+    let s: Arc<OwnedStore> = Arc::new(OwnedStore);
+    store_via_alias(s as Arc<dyn SessionStore>);
+}
+
+// NEGATIVE 1: `ArcAlias<dyn SessionStore>` defaults to `dyn SessionStore + 'static`, so passing
+// a short-lived `Arc<dyn SessionStore + 'a>` into it MUST be rejected with an outlives error.
+pub fn alias_object_default_short_bad<'a>(s: Arc<dyn SessionStore + 'a>) {
+    store_via_alias(s);
+}
+
+// NEGATIVE 2: a type alias declaring a lifetime parameter (`RefAlias<'a, T>`) does NOT blindly
+// default `dyn SessionStore` to `'static`.
+pub fn alias_with_lifetime_refused<'a>(_r: RefAlias<'a, dyn SessionStore>) {}
+
+// --- 5. `dyn T: TryAsDynCompatible<'a>` (`blaze-text/src/debug.rs::{form, reflect_of}`) ---
+
+pub trait DynForm {
+    fn tag(&self) -> u8;
+}
+
+pub fn trait_info_of_dyn_ok(id: TypeId) -> bool {
+    id.trait_info_of::<dyn DynForm>().is_some()
+}
+
+pub fn try_as_dyn_same_lt_ok<'a, T: 'a>(x: &'a T) -> Option<&'a (dyn DynForm + 'a)> {
+    core::any::try_as_dyn::<T, dyn DynForm + 'a>(x)
+}
+
+// NEGATIVE: `dyn DynForm + 'static: TryAsDynCompatible<'a>` must require `'a == 'static`, so
+// turning `&'a u8` into `&'a (dyn DynForm + 'static)` MUST be rejected.
+pub fn try_as_dyn_short_as_static_bad<'a>(x: &'a &'a u8) -> Option<&'a (dyn DynForm + 'static)> {
+    core::any::try_as_dyn::<&'a u8, dyn DynForm + 'static>(x)
+}
+
+fn main() {}
+"#;
+
+    #[test]
+    fn wave5_front2_blockers_and_soundness() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let home = std::env::var("HOME").expect("HOME is set");
+        let tc = Toolchain::open(&mut DirShelf::new(std::format!("{home}/.blaze/v2/toolchain"))).expect("installed toolchain");
+        let files = [("/w5sound/src/main.rs".to_string(), SOURCE.to_string())];
+        let edition = edition::PackageEdition::of_manifest("2024").expect("Rust 2024");
+        let user = UserCrate { name: "w5sound", dir: "/w5sound/", root: "/w5sound/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("checker frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let inputs = Inputs::new(&user, &tc).expect("fixture inputs");
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, erased.bump()).expect("fixture names");
+        let sources = [SourceFile { path: "src/main.rs", text: SOURCE }];
+        let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("front2");
+        let bodies = world.bodies(alloc);
+        let free = |name: &str| {
+            bodies
+                .iter()
+                .find_map(|&(body, _)| {
+                    let BodyRef::Free(key) = body else { return None };
+                    (names.item_text(key).and_then(|item| item.name) == Some(name)).then_some(body)
+                })
+                .unwrap_or_else(|| panic!("missing fixture body {name}"))
+        };
+        let member = |method: &str| {
+            bodies
+                .iter()
+                .find_map(|&(body, _)| {
+                    let BodyRef::Member { name, .. } = body else { return None };
+                    (name == method).then_some(body)
+                })
+                .unwrap_or_else(|| panic!("missing fixture method {method}"))
+        };
+
+        // 1. inst_needs_drop positives
+        for name in [
+            "split_str_no_drop_ok",
+            "split_whitespace_no_drop_ok",
+            "flatten_take_option_ref_no_drop_ok",
+            "custom_pat_no_drop_ok",
+        ] {
+            let (types, borrows) = world.check_borrows(free(name), alloc);
+            assert!(types.is_clean(), "{name} types: {types:?}");
+            assert!(borrows.is_clean(), "{name} borrows: {borrows:?}");
+        }
+
+        // 1. inst_needs_drop negatives (MUST reject!)
+        for name in [
+            "flatten_dropping_inner_bad",
+            "flatten_vec_drop_bad",
+            "custom_pat_drop_bad",
+            "custom_pat_generic_bad",
+        ] {
+            let (types, borrows) = world.check_borrows(free(name), alloc);
+            assert!(types.is_clean(), "{name} types: {types:?}");
+            assert!(borrows.refused.is_none(), "{name} refused: {borrows:?}");
+            assert!(!borrows.findings.is_empty(), "{name} must report a borrow error: {borrows:?}");
+        }
+
+        // 2. FieldRegionsUnaligned on PNode::Alias field
+        {
+            let (types, borrows) = world.check_borrows(member("lowering_counts_ok"), alloc);
+            assert!(types.is_clean(), "lowering_counts_ok types: {types:?}");
+            assert!(borrows.is_clean(), "lowering_counts_ok borrows: {borrows:?}");
+
+            let (types, bad) = world.check_borrows(member("lowering_counts_bad_static"), alloc);
+            assert!(types.is_clean(), "lowering_counts_bad_static types: {types:?}");
+            assert!(!bad.is_clean(), "lowering_counts_bad_static must be rejected: {bad:?}");
+        }
+
+        // 3. Parameterized supertrait outlives (`LoadItems<'a>: 'a`)
+        for name in ["record_ok", "record_transitive_ok"] {
+            let (types, borrows) = world.check_borrows(member(name), alloc);
+            assert!(types.is_clean(), "{name} types: {types:?}");
+            assert!(borrows.is_clean(), "{name} borrows: {borrows:?}");
+        }
+        for name in ["record_bad_static", "record_unbounded_bad"] {
+            let (types, bad) = world.check_borrows(member(name), alloc);
+            assert!(types.is_clean(), "{name} types: {types:?}");
+            assert!(!bad.is_clean(), "{name} must NOT be accepted: {bad:?}");
+        }
+
+        // 4. Default trait object lifetimes in zero-lifetime type aliases (`ArcAlias<dyn SessionStore>`)
+        {
+            let (types, borrows) = world.check_borrows(free("alias_object_default_ok"), alloc);
+            assert!(types.is_clean(), "alias_object_default_ok types: {types:?}");
+            assert!(borrows.is_clean(), "alias_object_default_ok borrows: {borrows:?}");
+
+            let (types, bad) = world.check_borrows(free("alias_object_default_short_bad"), alloc);
+            assert!(types.is_clean(), "alias_object_default_short_bad types: {types:?}");
+            assert!(bad.refused.is_none(), "alias_object_default_short_bad refused: {bad:?}");
+            assert!(!bad.findings.is_empty(), "alias_object_default_short_bad must reject short borrow: {bad:?}");
+
+            let (types, refused) = world.check_borrows(free("alias_with_lifetime_refused"), alloc);
+            assert!(types.is_clean(), "alias_with_lifetime_refused types: {types:?}");
+            assert!(!refused.is_clean(), "alias_with_lifetime_refused must NOT silently default to 'static: {refused:?}");
+        }
+
+        // 5. `dyn T: TryAsDynCompatible<'a>` (`blaze-text/src/debug.rs`)
+        {
+            for name in ["trait_info_of_dyn_ok", "try_as_dyn_same_lt_ok"] {
+                let (types, borrows) = world.check_borrows(free(name), alloc);
+                assert!(types.is_clean(), "{name} types: {types:?}");
+                assert!(borrows.is_clean(), "{name} borrows: {borrows:?}");
+            }
+
+            let (types, bad) = world.check_borrows(free("try_as_dyn_short_as_static_bad"), alloc);
+            assert!(types.is_clean(), "try_as_dyn_short_as_static_bad types: {types:?}");
+            assert!(bad.refused.is_none(), "try_as_dyn_short_as_static_bad refused: {bad:?}");
+            assert!(!bad.findings.is_empty(), "try_as_dyn_short_as_static_bad must be rejected: {bad:?}");
+        }
     }
 }

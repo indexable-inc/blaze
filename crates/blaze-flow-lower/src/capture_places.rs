@@ -198,21 +198,25 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
                     if ty.wrap.is_some() {
                         return self.refuse(Form::Malformed, e);
                     }
+                    let mut is_union = false;
                     let drop_type = match self.node(ty.ty, e)? {
                         PNode::Tuple(_) | PNode::Record(..) if variant == 0 => false,
                         PNode::Adt(k, _) => {
                             let facts = self.adt_facts(k, e)?;
-                            if facts.union {
-                                return self.refuse(Form::Union, e);
-                            }
                             if facts.is_enum || variant != 0 {
                                 return self.refuse(Form::CapturePlace, e);
                             }
+                            is_union = facts.union;
                             facts.drop_impl
                         }
                         _ => return self.refuse(Form::Malformed, e),
                     };
-                    self.project(at, ty, Proj::Field(field), child, drop_type, e)?
+                    let proj = if is_union {
+                        Proj::Subslice { from: field, to: field, from_end: false }
+                    } else {
+                        Proj::Field(field)
+                    };
+                    self.project(at, ty, proj, child, drop_type, e)?
                 }
                 CaptureProj::Index => return self.refuse(Form::Malformed, e),
             };

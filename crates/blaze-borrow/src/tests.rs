@@ -2762,3 +2762,416 @@ fn builtin_fn_trait_peels_mut_ref_closure_and_enforces_regions() {
     assert!(reach(&rec2, 0).contains(&STATIC_NODE), "`F: 'static` must still constrain outer `&'0 mut` ref to 'static");
     assert!(reach(&rec2, 1).contains(&STATIC_NODE), "`F: 'static` must still constrain inner closure slot '1 to 'static");
 }
+
+/// Wave 5 Cluster A (`blaze-typeck` `import`, `import_list`, `import_witness_goal`,
+/// `import_instance_future`): when an associated type declares `type Error: From<CheckError>` and
+/// a `?` / `FromResidual` call proves `<S as ClosureSource>::Error: From<<S as ClosureSource>::Error>`,
+/// `match_trait_clause` MUST NOT falsely match `CheckError` against the rigid non-inert alias
+/// `<S as ClosureSource>::Error` under `allow_alias = true` (which previously aborted with
+/// `Unselected(GenericSelf(Param))` before reaching blanket `impl<T> From<T> for T`).
+///
+/// Also verifies:
+/// - `S::Error: From<CheckError>` still proves via `assoc_clauses`;
+/// - multiple clauses `T: From<ErrA>` + `T: From<ErrB>` against `T: From<X::Assoc>` (where
+///   `X::Assoc -> ErrB`) pick `From<ErrB>` via `d >= 0` normalization instead of committing to `ErrA`;
+/// - NEGATIVE CONTROL 1 (rule 4 / rule 23): without blanket `impl<T> From<T> for T`,
+///   `S::Error: From<S::Error>` is refused `Unselected` (never falsely satisfied by `From<CheckError>`);
+/// - NEGATIVE CONTROL 2 (rule 4 / rule 23): a clause `T: Tr<S::Error>` MUST NOT match a non-inert
+///   goal `T: Tr<&'a u8>`.
+#[test]
+fn assoc_from_bound_does_not_shadow_reflexive_from_impl() {
+    use blaze_typeck::region_facts::{ClauseView, ColView};
+
+    const T_SRC: ItemKey = ItemKey(0x9040);
+    const T_FROM: ItemKey = ItemKey(0x9041);
+    const T_WRAP: ItemKey = ItemKey(0x9042);
+    const K_CHECK_ERR: ItemKey = ItemKey(0x9043);
+    const K_OTHER_ERR: ItemKey = ItemKey(0x9044);
+    const K_PROVIDER: ItemKey = ItemKey(0x9045);
+    const IMP_FROM_REFL: ItemKey = ItemKey(0x9046);
+    const IMP_WRAP: ItemKey = ItemKey(0x9047);
+    const F_CONVERT: ItemKey = ItemKey(0x9048);
+    const ERROR: Name = Name::of("Error");
+    const ASSOC: Name = Name::of("Assoc");
+
+    let mut t = Tys::new();
+    let u8_ = t.u8();
+    let r_u8 = t.r(u8_);
+    let p0 = t.param(0);
+    let p1 = t.param(1);
+    let check_err = t.adt(K_CHECK_ERR, &[]);
+    let other_err = t.adt(K_OTHER_ERR, &[]);
+    let provider = t.adt(K_PROVIDER, &[]);
+    let s_err = t.alias(T_SRC, ERROR, &[p0]);
+    let prov_assoc = t.alias(T_WRAP, ASSOC, &[provider]);
+
+    // Assoc item bound: `<Self as ClosureSource>::Error: From<CheckError>`
+    let assoc_from_check = t.extrait(T_FROM, &[s_err, check_err]);
+    // Callee clause: `F: From<E>` (with `F = Param(0)`, `E = Param(1)`)
+    let call_from = t.extrait(T_FROM, &[p0, p1]);
+    // Blanket `impl<T> From<T> for T`: header `ExTrait(From, [Param(0), Param(0)])`
+    let from_refl_header = t.extrait(T_FROM, &[p0, p0]);
+    // `impl Wrap for Provider { type Assoc = CheckError; }`
+    let wrap_header = t.extrait(T_WRAP, &[provider]);
+    // Additional owner clauses for multi-clause normalization & non-inert negative control
+    let owner_from_other = t.extrait(T_FROM, &[p0, other_err]);
+    let owner_from_check = t.extrait(T_FROM, &[p0, check_err]);
+    let owner_from_s_err = t.extrait(T_FROM, &[p0, s_err]);
+
+    let facts = Facts::default()
+        .adt(K_CHECK_ERR, 0, &[])
+        .adt(K_OTHER_ERR, 0, &[])
+        .adt(K_PROVIDER, 0, &[])
+        .trait_(T_SRC, 0)
+        .trait_(T_FROM, 0)
+        .trait_(T_WRAP, 0)
+        .alias(T_SRC, ERROR, 0)
+        .alias(T_WRAP, ASSOC, 0);
+    let cols = Columns::new(t.t.view(), &facts, &facts);
+
+    let assoc_col = blaze_typeck::regions::RegionCol::lay(t.t.view(), assoc_from_check, &facts, NONE, alloc()).expect("assoc bound laid");
+    let assoc_cv = [ClauseView { nth: 0, binders: 0, col: ColView::of(&assoc_col), outlives: None }];
+
+    struct Sel<'s> {
+        assoc_cv: &'s [ClauseView<'s>],
+        from_refl: Option<ImplHead<'s>>,
+        wrap_head: ImplHead<'s>,
+        wrap_val: ImplValue<'s>,
+    }
+    impl Selected for Sel<'_> {
+        fn select(&self, ask: Ask) -> Selection<'_> {
+            if ask.trait_ == T_FROM && ask.name.is_none() {
+                match self.from_refl {
+                    Some(head) => Selection::Impl { head, value: None },
+                    None => Selection::Not(NotSelected::GenericSelf(crate::inst::SelfHead::Alias)),
+                }
+            } else if ask.trait_ == T_SRC && ask.name == Some(ERROR) {
+                Selection::Not(NotSelected::GenericSelf(crate::inst::SelfHead::Param))
+            } else if ask.trait_ == T_WRAP && ask.name == Some(ASSOC) {
+                Selection::Impl { head: self.wrap_head, value: Some(self.wrap_val) }
+            } else {
+                Selection::Not(NotSelected::Unanswered)
+            }
+        }
+        fn assoc_clauses(&self, trait_: ItemKey, name: Name) -> Option<(u32, &[ClauseView<'_>])> {
+            (trait_ == T_SRC && name == ERROR).then_some((0, self.assoc_cv))
+        }
+    }
+
+    let from_head = ImplHead { imp: IMP_FROM_REFL, lifetimes: 0, types: 1, trait_ref: ty(from_refl_header, NONE) };
+    let wrap_head = ImplHead { imp: IMP_WRAP, lifetimes: 0, types: 0, trait_ref: ty(wrap_header, NONE) };
+    let wrap_val = ImplValue { value: ty(check_err, NONE), gat_lifetimes: 0 };
+
+    let p = params(0, &[]);
+    let inputs = [ty(p1, NONE)];
+    let clauses = [ClauseIn::TraitOf { trait_ref: ty(call_from, NONE), binders: 0 }];
+    let sig = Sig { item: F_CONVERT, params: ParamsView::of(&p), inputs: &inputs, output: ty(p0, NONE), clauses: &clauses };
+
+    // Positive 1: `S::Error: From<S::Error>` skips non-matching `From<CheckError>` assoc bound and
+    // proves via reflexive `impl<T> From<T> for T`.
+    let sel_with_refl = Sel { assoc_cv: &assoc_cv, from_refl: Some(from_head), wrap_head, wrap_val };
+    let types_self = [arg(s_err, 0, 0), arg(s_err, 0, 0)];
+    let (res, _) = run(
+        &cols, &sel_with_refl, &Own::default(), 0,
+        Callee::Fn(sig), GenericArgs { lifetimes: SlotRange::EMPTY, types: &types_self },
+        &[arg(s_err, 0, 0)], arg(s_err, 0, 0),
+    );
+    assert_eq!(res, Ok(()), "S::Error: From<S::Error> must reach reflexive From impl: {res:?}");
+
+    // Negative control 1: WITHOUT reflexive `impl<T> From<T> for T`, `S::Error: From<S::Error>`
+    // MUST be refused `Unselected` on `T_FROM` (never falsely proved by `From<CheckError>`, and
+    // never aborting with `T_SRC` `GenericSelf(Param)`!).
+    let sel_no_refl = Sel { assoc_cv: &assoc_cv, from_refl: None, wrap_head, wrap_val };
+    let (res_no_refl, _) = run(
+        &cols, &sel_no_refl, &Own::default(), 0,
+        Callee::Fn(sig), GenericArgs { lifetimes: SlotRange::EMPTY, types: &types_self },
+        &[arg(s_err, 0, 0)], arg(s_err, 0, 0),
+    );
+    assert!(
+        matches!(res_no_refl, Err(Refused::Unselected { trait_: T_FROM, .. })),
+        "CONTROL: S::Error: From<S::Error> without From impl must fail on T_FROM, got: {res_no_refl:?}",
+    );
+
+    // Positive 2: `S::Error: From<CheckError>` still proves directly via `assoc_clauses` even
+    // without any `From` impl.
+    let types_check = [arg(s_err, 0, 0), arg(check_err, 0, 0)];
+    let (res_check, _) = run(
+        &cols, &sel_no_refl, &Own::default(), 0,
+        Callee::Fn(sig), GenericArgs { lifetimes: SlotRange::EMPTY, types: &types_check },
+        &[arg(check_err, 0, 0)], arg(s_err, 0, 0),
+    );
+    assert_eq!(res_check, Ok(()), "S::Error: From<CheckError> must still prove via assoc_clauses: {res_check:?}");
+
+    // Positive 3: two caller clauses `P0: From<OtherErr>` + `P0: From<CheckError>` against goal
+    // `P0: From<<Provider as Wrap>::Assoc>` (where `Provider::Assoc = CheckError`) must select the
+    // second clause via top-level alias normalization instead of committing to `OtherErr` and failing `Shape`.
+    let c_other = blaze_typeck::regions::RegionCol::lay(t.t.view(), owner_from_other, &facts, NONE, alloc()).expect("laid");
+    let c_check = blaze_typeck::regions::RegionCol::lay(t.t.view(), owner_from_check, &facts, NONE, alloc()).expect("laid");
+    let c_s_err = blaze_typeck::regions::RegionCol::lay(t.t.view(), owner_from_s_err, &facts, NONE, alloc()).expect("laid");
+    struct ClauseOwn<'s> {
+        clauses: &'s [ClauseView<'s>],
+    }
+    impl Owner for ClauseOwn<'_> {
+        fn item(&self) -> ItemKey { OWNER }
+        fn universal(&self, _: Region) -> Option<Origin> { None }
+        fn param(&self, _: u32) -> Option<Origin> { None }
+        fn bound(&self, _: u32, _: ItemKey) -> Option<Typed<'_>> { None }
+        fn clauses(&self) -> &[ClauseView<'_>] { self.clauses }
+        fn body_params(&self, _: PTy) -> Option<&[u32]> { None }
+    }
+    let multi_cv = [
+        ClauseView { nth: 0, binders: 0, col: ColView::of(&c_other), outlives: None },
+        ClauseView { nth: 1, binders: 0, col: ColView::of(&c_check), outlives: None },
+    ];
+    let multi_own = ClauseOwn { clauses: &multi_cv };
+    let types_alias_arg = [arg(p0, 0, 0), arg(prov_assoc, 0, 0)];
+    let (res_multi, _) = run(
+        &cols, &sel_no_refl, &multi_own, 0,
+        Callee::Fn(sig), GenericArgs { lifetimes: SlotRange::EMPTY, types: &types_alias_arg },
+        &[arg(prov_assoc, 0, 0)], arg(p0, 0, 0),
+    );
+    assert_eq!(res_multi, Ok(()), "normalizable alias trait arg must pick matching second clause: {res_multi:?}");
+
+    // Negative control 2: caller clause `P0: From<S::Error>` MUST NOT match non-inert goal
+    // `P0: From<&'0 u8>`.
+    let bad_cv = [ClauseView { nth: 0, binders: 0, col: ColView::of(&c_s_err), outlives: None }];
+    let bad_own = ClauseOwn { clauses: &bad_cv };
+    let types_ref_arg = [arg(p0, 0, 0), arg(r_u8, 0, 1)];
+    let (res_ref, _) = run(
+        &cols, &sel_no_refl, &bad_own, 1,
+        Callee::Fn(sig), GenericArgs { lifetimes: SlotRange::EMPTY, types: &types_ref_arg },
+        &[arg(r_u8, 0, 1)], arg(p0, 0, 0),
+    );
+    assert!(
+        matches!(res_ref, Err(Refused::Unselected { trait_: T_FROM, .. })),
+        "CONTROL: P0: From<S::Error> must not match non-inert P0: From<&'0 u8>, got: {res_ref:?}",
+    );
+}
+
+/// Wave 5 Cluster C (`blaze-text/src/debug.rs` `form`, `reflect_of`): builtin
+/// `core::any::TryAsDynCompatible<'a>` (`#[lang = "try_as_dyn"]`, `#[rustc_deny_explicit_impl]`)
+/// ties `'a` invariantly to the trait object's lifetime `'o` on `dyn Trait + 'o`.
+///
+/// - Positive 1 (`TypeId::trait_info_of::<dyn DebugForm>()`): late-bound `'a` ties to `'o` cleanly.
+/// - Positive 2 (`try_as_dyn<'a, &'t u8, dyn DebugForm + 'u>`): enforces `'t: 'a == 'u` -> `'t: 'u`.
+/// - Negative soundness control 1: `try_as_dyn<'a, &'local u8, dyn DebugForm + 'static>` MUST
+///   constrain `'local: 'static`.
+/// - Negative soundness control 2: non-`Dynamic` subject `u32: TryAsDynCompatible<'a>` MUST be
+///   refused `Unselected`.
+#[test]
+fn try_as_dyn_compatible_ties_object_lifetime_invariantly() {
+    const T_TRY_AS_DYN: ItemKey = ItemKey(0x9050);
+    const T_DEBUG_FORM: ItemKey = ItemKey(0x9051);
+    const F_TRAIT_INFO: ItemKey = ItemKey(0x9052);
+    const F_TRY_AS_DYN: ItemKey = ItemKey(0x9053);
+
+    let mut t = Tys::new();
+    let unit = t.unit();
+    let u8_ = t.u8();
+    let r_u8 = t.r(u8_);
+    let p0 = t.param(0);
+    let p1 = t.param(1);
+    let ex_debug = t.extrait(T_DEBUG_FORM, &[]);
+    let dyn_debug = t.dynamic(&[ex_debug]);
+    let try_clause_p0 = t.extrait(T_TRY_AS_DYN, &[p0]);
+    let try_clause_p1 = t.extrait(T_TRY_AS_DYN, &[p1]);
+
+    let facts = Facts::default()
+        .trait_(T_TRY_AS_DYN, 1)
+        .trait_(T_DEBUG_FORM, 0);
+    let cols = Columns::new(t.t.view(), &facts, &facts);
+
+    struct TryDynSel;
+    impl Selected for TryDynSel {
+        fn select(&self, _: Ask) -> Selection<'_> {
+            Selection::Not(NotSelected::GenericSelf(crate::inst::SelfHead::Object))
+        }
+        fn is_try_as_dyn_trait(&self, trait_: ItemKey) -> bool {
+            trait_ == T_TRY_AS_DYN
+        }
+    }
+
+    // Positive 1: `fn trait_info_of<'a, T: TryAsDynCompatible<'a> + ?Sized>() -> ()`
+    // Called with `T = dyn DebugForm + '0` (`'a` late-bound).
+    let p_late = params(1, &[0]);
+    let clauses_info = [ClauseIn::TraitOf { trait_ref: ty(try_clause_p0, P0), binders: 0 }];
+    let sig_info = Sig { item: F_TRAIT_INFO, params: ParamsView::of(&p_late), inputs: &[], output: ty(unit, NONE), clauses: &clauses_info };
+    let (res_info, rec_info) = run(
+        &cols, &TryDynSel, &Own::default(), 1,
+        Callee::Fn(sig_info), GenericArgs { lifetimes: SlotRange::EMPTY, types: &[arg(dyn_debug, 0, 1)] },
+        &[], arg(unit, 0, 0),
+    );
+    assert_eq!(res_info, Ok(()), "trait_info_of::<dyn DebugForm>() must prove TryAsDynCompatible: {res_info:?}");
+    // Fresh late-bound origin (100) must be tied invariantly to slot 0 (`'o`).
+    assert!(reach(&rec_info, 100).contains(&0) && reach(&rec_info, 0).contains(&100), "must tie 'a == 'o: {:?}", rec_info.subsets);
+
+    // Positive 2: `fn try_as_dyn<'a, T: 'a, U: TryAsDynCompatible<'a>>(_: T) -> ()`
+    // Called with `T = &'0 u8`, `U = dyn DebugForm + '1` -> must constrain `'0: '1`.
+    let clauses_try = [
+        ClauseIn::TypeOutlives { subject: ty(p0, NONE), region: Region::Param(0) },
+        ClauseIn::TraitOf { trait_ref: ty(try_clause_p1, P0), binders: 0 },
+    ];
+    let inputs_try = [ty(p0, NONE)];
+    let sig_try = Sig { item: F_TRY_AS_DYN, params: ParamsView::of(&p_late), inputs: &inputs_try, output: ty(unit, NONE), clauses: &clauses_try };
+    let (res_try, rec_try) = run(
+        &cols, &TryDynSel, &Own::default(), 2,
+        Callee::Fn(sig_try), GenericArgs { lifetimes: SlotRange::EMPTY, types: &[arg(r_u8, 0, 1), arg(dyn_debug, 1, 1)] },
+        &[arg(r_u8, 0, 1)], arg(unit, 0, 0),
+    );
+    assert_eq!(res_try, Ok(()), "try_as_dyn with dyn DebugForm + '1 must succeed: {res_try:?}");
+    assert!(reach(&rec_try, 0).contains(&1), "T: 'a + U: TryAsDynCompatible<'a> must enforce '0: '1: {:?}", rec_try.subsets);
+    assert!(!reach(&rec_try, 1).contains(&0), "T: 'a is one-way, must not force '1: '0: {:?}", rec_try.subsets);
+
+    // Negative soundness control 1: `try_as_dyn<'a, &'0 u8, dyn DebugForm + 'static>` MUST
+    // constrain `'0: 'static` via `'0: 'a == 'u: 'static`.
+    let p_early = params(1, &[]);
+    let mut rec_static = Rec { subsets: SVec::new(), statics: SVec::new(), placeholders: SVec::new(), next: 100 };
+    let clauses_static_dyn = [
+        ClauseIn::TypeOutlives { subject: ty(p0, NONE), region: Region::Param(0) },
+        ClauseIn::TraitOf { trait_ref: ty(try_clause_p1, &[Region::Param(0)]), binders: 0 },
+        ClauseIn::TypeOutlives { subject: ty(p1, NONE), region: Region::Static },
+    ];
+    let sig_static_dyn = Sig { item: F_TRY_AS_DYN, params: ParamsView::of(&p_early), inputs: &inputs_try, output: ty(unit, NONE), clauses: &clauses_static_dyn };
+    let origins = [Origin(0), Origin(1), Origin(2)];
+    let res_static = {
+        let mut cx = Cx { types: &cols, sig_types: &cols, selected: &TryDynSel, owner: &Own::default(), origins: &origins, out: &mut rec_static };
+        call(
+            &mut cx,
+            Callee::Fn(sig_static_dyn),
+            GenericArgs { lifetimes: range(1, 1), types: &[arg(r_u8, 0, 1), arg(dyn_debug, 2, 1)] },
+            &[arg(r_u8, 0, 1)],
+            arg(unit, 0, 0),
+            alloc(),
+        )
+    };
+    assert_eq!(res_static, Ok(()));
+    assert!(
+        reach(&rec_static, 0).contains(&STATIC_NODE),
+        "CONTROL: &'local u8 -> dyn DebugForm + 'static MUST constrain 'local: 'static: subsets={:?}, statics={:?}",
+        rec_static.subsets,
+        rec_static.statics,
+    );
+
+    // Negative soundness control 2: non-`Dynamic` subject `u8: TryAsDynCompatible<'a>` MUST be
+    // refused `Unselected`.
+    let (res_bad, _) = run(
+        &cols, &TryDynSel, &Own::default(), 0,
+        Callee::Fn(sig_info), GenericArgs { lifetimes: SlotRange::EMPTY, types: &[arg(u8_, 0, 0)] },
+        &[], arg(unit, 0, 0),
+    );
+    assert!(
+        matches!(res_bad, Err(Refused::Unselected { trait_: T_TRY_AS_DYN, .. })),
+        "CONTROL: non-Dynamic subject u8 must be refused Unselected for TryAsDynCompatible: {res_bad:?}",
+    );
+}
+
+/// Wave 5 Cluster B soundness (`wasmtime::Memory::data_and_store_mut` / `From<&'a mut T> for
+/// StoreContextMut<'a, T::Data>` with `Caller<'b, Host>` carrying lifetime `'b`):
+/// - Positive: when `AsContext::Data` is selected for `Caller<'b, Host>`, `'a` ties invariantly
+///   AND `AsContext`'s impl where-clause (`where 'b: 'static`) IS enforced on `'b`!
+/// - Negative soundness control: when `AsContext::Data` is `Unanswered` (not recorded by typeck),
+///   `blaze-borrow` MUST refuse `Unselected(Unanswered)` rather than unsoundly skipping the alias
+///   (which would miss `'b: 'static`).
+#[test]
+fn impl_header_alias_enforces_assoc_impl_where_clauses() {
+    use blaze_typeck::region_facts::Outlives;
+
+    const T_FROM: ItemKey = ItemKey(0x9060);
+    const T_ASCX: ItemKey = ItemKey(0x9061);
+    const K_STORE: ItemKey = ItemKey(0x9062);
+    const K_CALLER: ItemKey = ItemKey(0x9063);
+    const K_HOST: ItemKey = ItemKey(0x9064);
+    const IMP_FROM: ItemKey = ItemKey(0x9065);
+    const IMP_ASCX: ItemKey = ItemKey(0x9066);
+    const F_CONVERT: ItemKey = ItemKey(0x9067);
+    const DATA: Name = Name::of("Data");
+
+    let mut t = Tys::new();
+    let p0 = t.param(0);
+    let p1 = t.param(1);
+    let host = t.adt(K_HOST, &[]);
+    let caller = t.adt(K_CALLER, &[host]);
+    let mut_p0 = t.rm(p0);
+    let mut_caller = t.rm(caller);
+    let p0_data = t.alias(T_ASCX, DATA, &[p0]);
+    let store_data = t.adt(K_STORE, &[p0_data]);
+    let store_host = t.adt(K_STORE, &[host]);
+    let from_header = t.extrait(T_FROM, &[store_data, mut_p0]);
+    let ascx_header = t.extrait(T_ASCX, &[caller]);
+    let call_clause = t.extrait(T_FROM, &[p0, p1]);
+
+    // `Caller<'b, T>` has 1 lifetime (`'b`) and 1 type parameter (`T`).
+    let facts = Facts::default()
+        .adt(K_STORE, 1, &[Variance::In, Variance::In])
+        .adt(K_CALLER, 1, &[Variance::In, Variance::In])
+        .adt(K_HOST, 0, &[])
+        .trait_(T_FROM, 0)
+        .trait_(T_ASCX, 0)
+        .alias(T_ASCX, DATA, 0);
+    let cols = Columns::new(t.t.view(), &facts, &facts);
+
+    let ascx_outlives = [Outlives::Region { long: Region::Param(0), short: Region::Static }];
+    struct WasmSel<'a> {
+        from_head: ImplHead<'a>,
+        ascx: Option<(ImplHead<'a>, ImplValue<'a>)>,
+        ascx_where: crate::inst::ImplWhere<'a>,
+    }
+    impl Selected for WasmSel<'_> {
+        fn select(&self, ask: Ask) -> Selection<'_> {
+            if ask.trait_ == T_FROM && ask.name.is_none() {
+                Selection::Impl { head: self.from_head, value: None }
+            } else if ask.trait_ == T_ASCX && ask.name == Some(DATA) {
+                match self.ascx {
+                    Some((head, value)) => Selection::Impl { head, value: Some(value) },
+                    None => Selection::Not(NotSelected::Unanswered),
+                }
+            } else {
+                Selection::Not(NotSelected::Unanswered)
+            }
+        }
+        fn impl_where(&self, imp: ItemKey) -> Result<crate::inst::ImplWhere<'_>, NotSelected> {
+            if imp == IMP_ASCX { Ok(self.ascx_where) } else { Ok(crate::inst::ImplWhere::NONE) }
+        }
+    }
+
+    let from_head = ImplHead { imp: IMP_FROM, lifetimes: 1, types: 1, trait_ref: ty(from_header, P00) };
+    let ascx_head = ImplHead { imp: IMP_ASCX, lifetimes: 1, types: 0, trait_ref: ty(ascx_header, P0) };
+    let ascx_val = ImplValue { value: ty(host, NONE), gat_lifetimes: 0 };
+    let ascx_where = crate::inst::ImplWhere { params: &[], outlives: &ascx_outlives, views: &[] };
+
+    let p = params(0, &[]);
+    let inputs = [ty(p1, NONE)];
+    let clauses = [ClauseIn::TraitOf { trait_ref: ty(call_clause, NONE), binders: 0 }];
+    let sig = Sig { item: F_CONVERT, params: ParamsView::of(&p), inputs: &inputs, output: ty(p0, NONE), clauses: &clauses };
+
+    // Slots: 0 = `'a` on `&'0 mut Caller<'1, Host>`, 1 = `'b` on `Caller<'1, Host>`, 2 = `'s` on `StoreContextMut<'2, Host>`.
+    let types = [arg(store_host, 2, 1), arg(mut_caller, 0, 2)];
+    let sel_with = WasmSel { from_head, ascx: Some((ascx_head, ascx_val)), ascx_where };
+    let (res, rec) = run(
+        &cols, &sel_with, &Own::default(), 3,
+        Callee::Fn(sig), GenericArgs { lifetimes: SlotRange::EMPTY, types: &types },
+        &[arg(mut_caller, 0, 2)], arg(store_host, 2, 1),
+    );
+    assert_eq!(res, Ok(()), "Caller<'b, Host> with AsContext selected must succeed: {res:?}");
+    assert!(reach(&rec, 0).contains(&2) && reach(&rec, 2).contains(&0), "'0 and '2 must tie invariantly: {:?}", rec.subsets);
+    assert!(
+        reach(&rec, 1).contains(&STATIC_NODE),
+        "AsContext impl where-clause `'b: 'static` MUST be enforced on slot 1: subsets={:?}, statics={:?}",
+        rec.subsets,
+        rec.statics,
+    );
+
+    // Negative soundness control: when `AsContext::Data` is `Unanswered`, MUST refuse `Unselected`
+    // rather than unsoundly skipping normalization and dropping `'b: 'static`.
+    let sel_missing = WasmSel { from_head, ascx: None, ascx_where };
+    let (res_missing, _) = run(
+        &cols, &sel_missing, &Own::default(), 3,
+        Callee::Fn(sig), GenericArgs { lifetimes: SlotRange::EMPTY, types: &types },
+        &[arg(mut_caller, 0, 2)], arg(store_host, 2, 1),
+    );
+    assert_eq!(
+        res_missing,
+        Err(Refused::Unselected { item: F_CONVERT, node: p0_data, trait_: T_ASCX, name: Some(DATA), why: NotSelected::Unanswered }),
+        "CONTROL: missing AsContext::Data row must refuse Unanswered, never unsoundly skip",
+    );
+}

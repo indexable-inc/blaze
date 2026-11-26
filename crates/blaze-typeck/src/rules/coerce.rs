@@ -429,10 +429,6 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
             }
         }
         let Some(i) = found else { return Ok(None) };
-        if i == 1 && ma == Mutbl::Not && mb == Mutbl::Not {
-            // `&*x` of a `&T` to `&T` is no adjustment at all.
-            return Ok(Some(()));
-        }
         for s in steps.iter().take(i + 1).skip(1) {
             let kind = AdjustKind::Deref { overloaded: if s.overloaded { Some(Mutbl::Not) } else { None } };
             self.adj_scratch.push((kind, s.ty));

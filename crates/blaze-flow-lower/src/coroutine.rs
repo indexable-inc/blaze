@@ -541,20 +541,31 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
         let upvar_origins = self.origs.len();
         self.new_local_with(TyD::of(out), true, Some(Local(0)), block)?;
         let all = self.origs.len();
-        // The output's positions: no position of the future value holds them (`npos` of
-        // `PNode::Future` counts the captures only), so a requirement naming one cannot be
-        // stated at the block expression ([`crate::requirement`] gives `None`: refused by name).
-        for o in upvar_origins..all {
-            externals.push((self.origs[o], External::Sig));
-        }
-        if (all - upvar_origins) as u64 * upvar_origins as u64 > u64::from(MOST_POSITIONS) {
-            return self.refuse(Form::Bound, block);
-        }
-        if block == self.body.root && self.body.coroutine.is_some() {
+        let is_async_fn_root = block == self.body.root && self.body.coroutine.is_some();
+        if is_async_fn_root {
+            for o in upvar_origins..all {
+                externals.push((self.origs[o], External::Sig));
+            }
             // An `async fn`'s root block: its captures are the fn's parameters and its value
             // the written return type, both the signature's (`async_fn_root`).
             self.async_fn_root(&rows, block)?;
+        } else if <R::Grain as crate::grain::Grain>::SLOTS {
+            // Under the slot grain, an async block's `PNode::Future` carries its output slots
+            // right after its captures (like a closure's `SigSlot::Owner` slots), so any
+            // capture-to-output relation the body actually needs is emitted as a `Requirement`
+            // (`Need::Capture -> Need::Sig`) rather than assuming every capture outlives every
+            // output slot (which falsely required `'b: 'static` when an `async move` captures
+            // `&'b R` alongside `&'static Heap` and returns `Output<'static>`).
+            for (k, o) in (upvar_origins..all).enumerate() {
+                externals.push((self.origs[o], External::SigOwner(k as u32)));
+            }
         } else {
+            for o in upvar_origins..all {
+                externals.push((self.origs[o], External::Sig));
+            }
+            if (all - upvar_origins) as u64 * upvar_origins as u64 > u64::from(MOST_POSITIONS) {
+                return self.refuse(Form::Bound, block);
+            }
             for u in 0..upvar_origins {
                 for o in upvar_origins..all {
                     self.b.known(self.origs[u], self.origs[o]);
@@ -741,10 +752,27 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
             self.unify(&[fp, rp]);
             return Ok(());
         }
-        if held == operand && matches!(self.node(held, e)?, PNode::Future(..)) {
+        if held == operand
+            && let PNode::Future(_, out_ty, _) = self.node(held, e)?
+        {
+            let (fi, ri) = (self.info(fp), self.info(rp));
+            if <R::Grain as crate::grain::Grain>::SLOTS && fi.exact && ri.exact && ri.len <= fi.len {
+                let nout = ri.len;
+                let out_start = fi.start + (fi.len - nout);
+                if nout > 0 {
+                    self.with_variances(TyD::of(out_ty), e, |this, vs| {
+                        if vs.len() as u32 != nout {
+                            return this.refuse(Form::Malformed, e);
+                        }
+                        this.relate_by(out_start, ri.start, vs);
+                        Ok(())
+                    })?;
+                }
+                return Ok(());
+            }
             // The block's body proved each capture outlives each position of its value; equal
             // both ways (and the captures to each other) is stricter: noted.
-            let (f, r) = (self.info(fp).len, self.info(rp).len);
+            let (f, r) = (fi.len, ri.len);
             if r > 0 && f + r > 2 {
                 self.coarse_step(Form::Unified { why: crate::Unified::AsyncBlockOutput }, e);
             }

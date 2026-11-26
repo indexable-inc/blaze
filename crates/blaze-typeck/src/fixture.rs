@@ -489,6 +489,47 @@ impl Fx {
         (key, keys)
     }
 
+    /// An enum supporting unit, tuple, and struct variants (`(name, ctor_kind, &[(field_name, ty)])`).
+    pub fn enum_full(&mut self, name: &str, generics: u32, variants: &[(&str, CtorKind, &[(&str, PTy)])]) -> (ItemKey, Vec<ItemKey>) {
+        let key = self.key(name);
+        let params: Vec<PTy> = (0..generics).map(|i| self.param(i)).collect();
+        let self_ty = self.adt(key, &params);
+        let mut vs = Vec::new();
+        let mut fields = Vec::new();
+        let mut keys = Vec::new();
+        for (i, &(vname, ctor, fs)) in variants.iter().enumerate() {
+            let vkey = self.key(&format!("{name}::{vname}"));
+            let start = fields.len() as u32;
+            for &(fname, ty) in fs {
+                fields.push(Field { name: Name::of(fname), ty });
+            }
+            vs.push(Variant { key: vkey, name: Name::of(vname), ctor, fields: List { start, len: fs.len() as u32 } });
+            if ctor == CtorKind::Tuple {
+                let mut clauses = Vec::new();
+                self.implied_sized(0, generics, &mut clauses);
+                self.fns.push(FnRow {
+                    key: vkey,
+                    name: Name::of(vname),
+                    container: None,
+                    parent: 0,
+                    own: generics,
+                    anon: 0,
+                    self_param: false,
+                    header: FnPtrHeader::RUST,
+                    inputs: fs.iter().map(|&(_, t)| t).collect(),
+                    output: self_ty,
+                    clauses,
+                });
+            }
+            let def = Def::Ctor { adt: key, variant: i as u32, kind: ctor };
+            self.paths.push((std::vec![Name::of(name), Name::of(vname)], def));
+            keys.push(vkey);
+        }
+        self.adts.push(AdtRow { key, kind: AdtKind::Enum, generics, variants: vs, fields });
+        self.paths.push((std::vec![Name::of(name)], Def::Adt(key)));
+        (key, keys)
+    }
+
     /// `use path::name;`: `name` alone resolves to `def`.
     pub fn use_path(&mut self, name: &str, def: Def) {
         self.paths.push((std::vec![Name::of(name)], def));
@@ -1111,6 +1152,7 @@ pub struct Bb {
     method_name_ranges: Vec<(ExprId, Range)>,
     params: Vec<PatId>,
     arms: Vec<Arm>,
+    field_inits: Vec<crate::body::FieldInit>,
     fmt_uses: Vec<FmtUse>,
     coroutine: Option<CoroutineKind>,
     /// `BodyView::call_arg_ints`, ascending (each pushed as its literal is made).
@@ -1151,6 +1193,7 @@ impl Bb {
             method_name_ranges: Vec::new(),
             params: Vec::new(),
             arms: Vec::new(),
+            field_inits: Vec::new(),
             fmt_uses: Vec::new(),
             coroutine: None,
             call_arg_ints: Vec::new(),
@@ -1212,6 +1255,16 @@ impl Bb {
     /// A parameter of the owner, bound by `name`.
     pub fn param(&mut self, name: &str) -> PatId {
         let p = self.bind(name);
+        self.params.push(p);
+        p
+    }
+
+    /// A mutable parameter of the owner, bound by `mut name`.
+    pub fn param_mut(&mut self, name: &str) -> PatId {
+        let at = self.pats.len() as u32;
+        self.pats.push(Pat::Bind { ann: BindAnn { by_ref: None, mutable: true }, name: Name::of(name), sub: None, ty: None });
+        self.pat_ranges.push(Range { start: 1000 + at, end: 1001 + at });
+        let p = PatId(at);
         self.params.push(p);
         p
     }
@@ -1427,6 +1480,30 @@ impl Bb {
         self.e(Expr::Ref { mutbl, operand })
     }
 
+    pub fn array(&mut self, elems: &[ExprId]) -> ExprId {
+        let elems = self.exprs_list(elems);
+        self.e(Expr::Array { elems })
+    }
+
+    pub fn struct_lit(&mut self, segments: &[&str], fields: &[(&str, ExprId)], base: Option<ExprId>) -> ExprId {
+        let start = self.segments.len() as u32;
+        for s in segments {
+            self.segments.push(Segment { name: Name::of(s), generic_args: List::EMPTY, has_args: false });
+        }
+        let path = PathIdx(self.paths.len() as u32);
+        self.paths.push(BodyPath { scope: ScopeId(0), segments: List { start, len: segments.len() as u32 }, lang: None, anchor: None });
+        let fstart = self.field_inits.len() as u32;
+        for &(name, expr) in fields {
+            self.field_inits.push(crate::body::FieldInit { name: Name::of(name), expr });
+        }
+        let flist = List { start: fstart, len: fields.len() as u32 };
+        let base = match base {
+            Some(e) => crate::body::StructBase::Expr(e),
+            None => crate::body::StructBase::None,
+        };
+        self.e(Expr::Struct { path, fields: flist, base })
+    }
+
     /// `|params| body`, parameters unannotated.
     pub fn closure(&mut self, params: &[PatId], body: ExprId) -> ExprId {
         let start = self.pat_lists.len() as u32;
@@ -1472,7 +1549,7 @@ impl Bb {
             pat_lists: &self.pat_lists,
             stmt_lists: &self.stmt_lists,
             arms: &self.arms,
-            field_inits: &[],
+            field_inits: &self.field_inits,
             field_pats: &[],
             paths: &self.paths,
             segments: &self.segments,

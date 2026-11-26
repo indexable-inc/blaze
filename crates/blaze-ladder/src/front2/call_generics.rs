@@ -114,13 +114,13 @@ impl<'a> CallBoundsTable<'a> {
         tys: tc::PTys<'_>,
         regions: &dyn RegionFacts,
         future: Option<blaze_id::ItemKey>,
-        extra_static: &[u32],
+        extra_outlives: &[(u32, Region)],
         alloc: Alloc<'a>,
     ) {
         let made = match (head, clauses) {
             (None, _) => Err(CallBoundsRefusal::NoHead),
             (_, None) => Err(CallBoundsRefusal::NoClauses),
-            (Some(h), Some(c)) => make(tc::ItemKey(k), &h.bounds, c, tys, regions, future, extra_static, alloc),
+            (Some(h), Some(c)) => make(tc::ItemKey(k), &h.bounds, c, tys, regions, future, extra_outlives, alloc),
         };
         self.reads.push(call_bounds_read(k, made.as_ref().map_err(|e| *e)));
         if let Ok(buf) = made
@@ -162,7 +162,7 @@ fn make<'a>(
     tys: tc::PTys<'_>,
     regions: &dyn RegionFacts,
     future: Option<blaze_id::ItemKey>,
-    extra_static: &[u32],
+    extra_outlives: &[(u32, Region)],
     alloc: Alloc<'a>,
 ) -> Result<CallBoundsBuf<'a>, CallBoundsRefusal> {
     let future = future.map(super::keys::checker_of);
@@ -186,10 +186,11 @@ fn make<'a>(
             None => unread_below = u32::MAX,
         }
     }
-    // Transitive supertrait `Self: 'static` bounds on the owner's type parameters
-    // (`R: Relation` where `trait Relation: 'static`).
-    for &p in extra_static {
-        outlives.push((OutlivesType::Param(p), Region::Static));
+    // Transitive supertrait `Self: 'r` bounds on the owner's type parameters
+    // (`R: Relation` where `trait Relation: 'static`, or `L: LoadItems<'a>` where
+    // `trait LoadItems<'a>: 'a`).
+    for &(p, reg) in extra_outlives {
+        outlives.push((OutlivesType::Param(p), reg));
     }
     outlives.sort_unstable();
     outlives.dedup();
