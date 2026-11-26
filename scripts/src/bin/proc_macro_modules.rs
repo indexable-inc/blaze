@@ -1034,7 +1034,7 @@ fn member_manifest(original: &str, source: &Path, path: &Path, features: &[Strin
                 }
                 continue;
             }
-            ("package", "readme" | "license-file" | "include" | "exclude" | "workspace")
+            ("package", "readme" | "license-file" | "include" | "exclude" | "workspace" | "default-run")
             | ("package", "autobins" | "autoexamples" | "autotests" | "autobenches" | "autolib") => {
                 dropping = opens;
                 continue;
@@ -1457,6 +1457,25 @@ fn macros_of(expanded: &str, name: &str) -> Result<Vec<Macro>, Failure> {
     Ok(out)
 }
 
+/// External (registry/git) proc-macro crates are compiled as members of the synthetic workspace,
+/// so Cargo omits the `--cap-lints allow` flag it normally passes to non-workspace dependencies.
+/// Restoring `--cap-lints allow` for external origins matches Cargo's dependency compilation
+/// (e.g. `ts-rs-macros 11.1.0`'s `#![macro_use]` under nightly) while leaving path crates uncapped.
+fn should_cap_lints(origin: &Origin) -> bool {
+    matches!(origin, Origin::Registry { .. } | Origin::Git { .. })
+}
+
+fn push_cap_lints_if_missing(args: &mut Vec<OsString>) {
+    let already = args.iter().any(|arg| {
+        let s = arg.to_string_lossy();
+        s == "--cap-lints" || s.starts_with("--cap-lints=")
+    });
+    if !already {
+        args.push("--cap-lints".into());
+        args.push("allow".into());
+    }
+}
+
 /// The builder's run as cargo's `RUSTC_WRAPPER`, for every rustc cargo starts: the macro crate
 /// named by `BLAZE_PM_WRAP` gets the `proc-macro` crate type back and the shim linked in;
 /// everything else runs as cargo asked.
@@ -1467,6 +1486,7 @@ fn wrap(args: Vec<OsString>, macro_crate: &str) -> ! {
     let named = text.windows(2).any(|pair| pair[0] == "--crate-name" && pair[1] == macro_crate);
     let lib = text.windows(2).any(|pair| pair[0] == "--crate-type" && pair[1] == "cdylib");
     let target = text.iter().any(|it| it == "--target" || it.starts_with("--target="));
+    let cap_lints_pkg = std::env::var_os("BLAZE_PM_CAP_LINTS").filter(|v| !v.is_empty());
     let mut command = toolchain_command(rustc);
     let shim = text.windows(2).any(|pair| pair[0] == "--crate-name" && pair[1] == "blaze_pm_shim");
     if shim && target {
@@ -1476,6 +1496,12 @@ fn wrap(args: Vec<OsString>, macro_crate: &str) -> ! {
         blaze_script::exit(status);
     }
     if !(named && lib && target) {
+        let is_macro_build_script = cap_lints_pkg.is_some()
+            && text.windows(2).any(|pair| pair[0] == "--crate-name" && pair[1] == "build_script_build")
+            && std::env::var_os("CARGO_PKG_NAME") == cap_lints_pkg;
+        if is_macro_build_script {
+            push_cap_lints_if_missing(&mut rest);
+        }
         let status = command.args(&rest).status().map(|it| it.code().unwrap_or(1)).unwrap_or(1);
         blaze_script::exit(status);
     }
@@ -1523,6 +1549,9 @@ fn wrap(args: Vec<OsString>, macro_crate: &str) -> ! {
         "-Clink-arg=--export=blaze_proc_macro_expand".to_owned(),
     ] {
         rest.push(arg.into());
+    }
+    if cap_lints_pkg.is_some() {
+        push_cap_lints_if_missing(&mut rest);
     }
     let status = command.args(&rest).status().map(|it| it.code().unwrap_or(1)).unwrap_or(1);
     if status != 0 {
@@ -1863,6 +1892,9 @@ impl Plan<'_> {
         env.push(("RUSTC_WRAPPER".to_owned(), self.me.clone()));
         env.push(("BLAZE_PM_WRAP".to_owned(), lib.clone().into()));
         env.push(("BLAZE_PM_MANIFEST_DIR".to_owned(), source.clone().into_os_string()));
+        // Set explicitly (empty for path crates) so an inherited env var never leaks across builds.
+        let cap_lints = if should_cap_lints(origin) { OsString::from(&wanted.name) } else { OsString::new() };
+        env.push(("BLAZE_PM_CAP_LINTS".to_owned(), cap_lints));
         // Where the wrapper notes the module it made: its own folder is the toolchain's choice.
         let note = self.work.join("target").join(format!("{lib}.blaze-module"));
         let _ = std::fs::remove_file(&note);
@@ -2424,5 +2456,42 @@ version = "1"
             Ok(count) => assert_eq!(count, 2),
             Err(failure) => panic!("the lock's own versions were refused: {failure}"),
         }
+    }
+
+    #[test]
+    fn member_manifest_strips_default_run_when_autobins_is_disabled() {
+        let manifest = r#"[package]
+name = "schemafy"
+version = "0.5.2"
+default-run = "main"
+
+[lib]
+proc-macro = true
+"#;
+        let made = generated_member(manifest, &[]);
+        assert!(!made.contains("default-run"), "{made}");
+        assert!(made.contains("autobins = false"), "{made}");
+    }
+
+    #[test]
+    fn cap_lints_enabled_only_for_registry_and_git_origins() {
+        assert!(should_cap_lints(&Origin::Registry { checksum: "deadbeef".to_owned() }));
+        assert!(should_cap_lints(&Origin::Git {
+            commit: "0123456789abcdef".to_owned(),
+            path: ".".to_owned(),
+            dir: PathBuf::from("/tmp/git-macro"),
+            manifest: String::new(),
+        }));
+        assert!(!should_cap_lints(&Origin::Path {
+            dir: PathBuf::from("/tmp/local-macro"),
+            files: String::new(),
+            manifest: String::new(),
+        }));
+
+        let mut args: Vec<OsString> = vec!["--crate-name".into(), "ts_rs_macros".into()];
+        push_cap_lints_if_missing(&mut args);
+        assert_eq!(args, vec![OsString::from("--crate-name"), "ts_rs_macros".into(), "--cap-lints".into(), "allow".into()]);
+        push_cap_lints_if_missing(&mut args);
+        assert_eq!(args.len(), 4, "must not duplicate --cap-lints");
     }
 }
