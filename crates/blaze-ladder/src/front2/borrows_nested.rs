@@ -23,7 +23,7 @@
 use blaze_flow::{Flow, Origin};
 use blaze_flow_lower::{
     AdtFacts, CallBounds, CalleeFacts, ClosureFlow, External, Facts, FieldRegion, Need, ParamOrigin, Refusal, Requirement, Shape, lower, lower_async,
-    lower_async_fn, lower_closure, lower_closure_external,
+    lower_async_fn, lower_closure, lower_closure_as_fn_once, lower_closure_external,
 };
 use blaze_own::{AVec, Alloc};
 use blaze_typeck as tc;
@@ -175,6 +175,20 @@ pub fn closure_flow_of<'a>(
     alloc: Alloc<'a>,
 ) -> Result<ClosureFlow<Alloc<'a>>, Refusal> {
     lower_closure_external(view, done, closure, facts, alloc)
+}
+
+/// [`closure_flow_of`] lowered as `FnOnce::call_once(self)` when [`classify_closure_env_use`]
+/// proves the enclosing consumer only ever invokes the closure once (e.g. `scope.may_overlap`
+/// taking `impl FnOnce(&Cx) -> Result<T, E> + Send`), so `ByValue` captures like `bufs_chunk:
+/// &mut [u8]` are owned locals instead of borrowed through `External::Env`.
+pub fn closure_flow_of_as_fn_once<'a>(
+    view: &tc::BodyView<'_>,
+    done: &tc::Checked<'_>,
+    closure: tc::ExprId,
+    facts: &NestedFacts<'_, '_>,
+    alloc: Alloc<'a>,
+) -> Result<ClosureFlow<Alloc<'a>>, Refusal> {
+    lower_closure_as_fn_once(view, done, closure, facts, alloc)
 }
 
 impl Facts for NestedFacts<'_, '_> {

@@ -29,7 +29,8 @@ use super::borrow_reads::{AdtAnswer, HeadAnswer, adt_read, assoc_copy_read, clau
 use super::check::{Records, answer_impls, eval_len};
 use super::reads::Read;
 use super::borrows_nested::{
-    FlowOf, NestedFacts, Requirements, classify_closure_env_use, closure_flow_of, env_escapes_closure, flow_of, nested_inner_first, nested_range,
+    ClosureEnvUse, FlowOf, NestedFacts, Requirements, classify_closure_env_use, closure_flow_of, closure_flow_of_as_fn_once, env_escapes_closure, flow_of,
+    nested_inner_first, nested_range,
     next_nested, prepare_closure_env, propagate_nested_requirement,
 };
 use super::stalled_goals::{AsyncInteriors, Decision, Stalls, decide_stalled_goals};
@@ -3449,11 +3450,23 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(
     // and apart from the borrow lowerings below (stalled_goals.rs `witness_all`).
     interiors.witness_all(&view, done, &NestedFacts::with_requirements(lowering, &requirements), alloc);
     for &of in nested_inner_first(&view, alloc).iter() {
+        let closure_usage = if plant != FactsPlant::NoClosureRequirements
+            && let FlowOf::Closure(closure) = of
+        {
+            Some(classify_closure_env_use(closure, &view, done, r.store, &langs, &lowering, alloc))
+        } else {
+            None
+        };
         let lowered = {
             let nested = NestedFacts::with_requirements(lowering, &requirements);
             match of {
                 FlowOf::Closure(closure) => {
-                    closure_flow_of(&view, done, closure, &nested, alloc).map(|cf| (cf.lowered.flow, cf.lowered.params, cf.externals, cf.lowered.coarse))
+                    let cf = if closure_usage == Some(ClosureEnvUse::FnOnceOnly) {
+                        closure_flow_of_as_fn_once(&view, done, closure, &nested, alloc)
+                    } else {
+                        closure_flow_of(&view, done, closure, &nested, alloc)
+                    };
+                    cf.map(|cf| (cf.lowered.flow, cf.lowered.params, cf.externals, cf.lowered.coarse))
                 }
                 FlowOf::AsyncBlock(block) => {
                     blaze_flow_lower::lower_async(&view, done, block, &nested, alloc).map(|la| (la.flow, AVec::new_in(alloc), la.externals, la.coarse))
@@ -3477,10 +3490,10 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(
         }
         needs.clear();
         let mut forbid_env_escape: AVec<'a, blaze_flow::Origin> = AVec::new_in(alloc);
-        if plant != FactsPlant::NoClosureRequirements
+        if let Some(usage) = closure_usage
+            && usage != ClosureEnvUse::FnOnceOnly
             && let FlowOf::Closure(closure) = of
         {
-            let usage = classify_closure_env_use(closure, &view, done, r.store, &langs, &lowering, alloc);
             prepare_closure_env(closure, done, usage, &mut externals, &mut forbid_env_escape, alloc);
         }
         // The control (FactsPlant::NoClosureRequirements): no externals, so no requirement is
@@ -4305,13 +4318,14 @@ fn main() {}
         );
 
         // NEGATIVE 4: `ByValue` capture in a `move` `FnOnce` closure cannot return a reference
-        // to the closure-owned variable.
+        // to the closure-owned variable (lowered as `FnOnce::call_once(self)`, so returning `&x`
+        // is rustc's exact E0515 dangling local reference error).
         let (types, by_val) = world.check_borrows(body("fnonce_by_value_escape_rejected"), alloc);
         assert!(types.is_clean(), "by_val types: {types:?}");
         assert!(by_val.refused.is_none(), "by_val refused: {by_val:?}");
         assert!(
-            by_val.findings.iter().any(|d| d.code == "E0521"),
-            "by_val escape must be rejected as E0521: {by_val:?}"
+            by_val.findings.iter().any(|d| d.code == "E0515"),
+            "by_val escape must be rejected as E0515: {by_val:?}"
         );
     }
 }
@@ -4887,5 +4901,200 @@ fn main() {}
         let (types, bad_static) = world.check_borrows(member("bad_static_self"), alloc);
         assert!(types.is_clean(), "bad_static_self types: {types:?}");
         assert!(!bad_static.is_clean(), "bad_static_self must be rejected: {bad_static:?}");
+    }
+}
+
+/// Regression and soundness tests for:
+/// 1. Blanket impls whose associated type projects through an impl parameter's lifetime-carrying
+///    bound (`impl<'de, A: ?Sized + SeqAccess<'de>> SeqAccess<'de> for &mut A { type Error =
+///    A::Error; }`, `crates/blaze-protocol/src/cbor/de.rs::deserialize_any` shape): `heads.rs`
+///    lays `impl_assoc` with `impl_given` (`param_bounds`) so the impl's `HeadRegions` are filed
+///    instead of refusing with `HeadUnread`.
+/// 2. `FnOnce`-only consumers of `move` closures with `ByValue` `&mut` captures
+///    (`crates/blaze-cli/src/store/take.rs:826` `scope.may_overlap` shape): `borrows.rs` classifies
+///    closure env usage BEFORE lowering and lowers `FnOnceOnly` closures via
+///    `lower_closure_as_fn_once`, while rejecting returning a reference to the owned capture local
+///    and rejecting `FnMut` escapes (E0521).
+#[cfg(test)]
+mod wave4_front2_soundness_tests {
+    use crate::crates::{DirShelf, Inputs, Toolchain, UserCrate};
+    use crate::front2::project::{BodyRef, ProjectWorld};
+    use crate::refusal::SourceFile;
+
+    const SOURCE: &str = r#"
+// --- 1. Blanket impl assoc type projecting through lifetime-carrying param bound (cbor/de.rs) ---
+pub trait SeqAccess<'de> {
+    type Error;
+    fn next_element(&mut self) -> Result<Option<&'de [u8]>, Self::Error>;
+}
+
+impl<'de, A> SeqAccess<'de> for &mut A
+where
+    A: ?Sized + SeqAccess<'de>,
+{
+    type Error = A::Error;
+    fn next_element(&mut self) -> Result<Option<&'de [u8]>, Self::Error> {
+        (**self).next_element()
+    }
+}
+
+pub struct Items<'a, 'de> {
+    pub bytes: &'a &'de [u8],
+}
+
+impl<'de> SeqAccess<'de> for Items<'_, 'de> {
+    type Error = u32;
+    fn next_element(&mut self) -> Result<Option<&'de [u8]>, u32> {
+        Ok(Some(*self.bytes))
+    }
+}
+
+pub trait Visitor<'de> {
+    type Value;
+    fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error>;
+}
+
+pub fn cbor_visit_seq_ok<'de, V: Visitor<'de>>(bytes: &'de [u8], visitor: V) -> Result<V::Value, u32> {
+    let mut items = Items { bytes: &bytes };
+    visitor.visit_seq(&mut items)
+}
+
+pub struct BorrowVisitor;
+impl<'de> Visitor<'de> for BorrowVisitor {
+    type Value = Option<&'de [u8]>;
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        seq.next_element()
+    }
+}
+
+// NEGATIVE: `'de` flows through `&mut Items<'_, 'de>`'s `SeqAccess<'de>` impl and must NOT unify with `'static`.
+pub fn cbor_visit_seq_bad_static<'de>(bytes: &'de [u8]) -> Result<Option<&'static [u8]>, u32> {
+    let mut items = Items { bytes: &bytes };
+    BorrowVisitor.visit_seq(&mut items)
+}
+
+// --- 2. FnOnceOnly + ByValue `&mut` capture (`store/take.rs:826` `may_overlap` shape) ---
+pub struct Cx;
+pub struct Scope<'a>(core::marker::PhantomData<&'a ()>);
+impl<'a> Scope<'a> {
+    pub fn may_overlap<T: Send, E>(
+        &self,
+        _name: &'static str,
+        task: impl FnOnce(&Cx) -> Result<T, E> + Send,
+    ) -> Result<T, E> {
+        let cx = Cx;
+        task(&cx)
+    }
+
+    pub fn repeat_mut<T, E>(
+        &self,
+        mut task: impl FnMut(&Cx) -> Result<T, E>,
+    ) -> Result<T, E> {
+        let cx = Cx;
+        task(&cx)
+    }
+}
+
+fn fetch_chunk<'b>(_cx: &Cx, bufs_chunk: &'b mut [u8]) -> &'b mut [u8] {
+    bufs_chunk
+}
+
+pub fn may_overlap_by_value_mut_ok<'b>(scope: &Scope<'_>, bufs_chunk: &'b mut [u8]) -> &'b mut [u8] {
+    let res = scope.may_overlap("take-lan-segz", move |worker_cx| -> Result<_, core::convert::Infallible> {
+        Ok(fetch_chunk(worker_cx, bufs_chunk))
+    });
+    match res {
+        Ok(s) => s,
+        Err(e) => match e {},
+    }
+}
+
+// NEGATIVE 1: returning a reference to the owned `bufs_chunk` capture local itself (not reborrowing
+// through `&'b mut [u8]`) MUST still be rejected under `lower_closure_as_fn_once`.
+pub fn may_overlap_by_value_local_ref_bad<'b>(scope: &Scope<'_>, bufs_chunk: &'b mut [u8]) -> &'b [u8] {
+    let mut owned = [1u8; 4];
+    let _ = bufs_chunk;
+    let res = scope.may_overlap("bad-local", move |_worker_cx| -> Result<&'b [u8], core::convert::Infallible> {
+        owned[0] = 2;
+        Ok(&owned[..])
+    });
+    match res {
+        Ok(s) => s,
+        Err(e) => match e {},
+    }
+}
+
+// NEGATIVE 2: under an `FnMut` consumer, escaping a reborrow of a `ByValue` `&mut` capture MUST
+// still be rejected with E0521 (cannot reborrow `bufs_chunk` across multiple `FnMut` calls).
+pub fn fn_mut_by_value_escape_bad<'b>(scope: &Scope<'_>, bufs_chunk: &'b mut [u8]) -> &'b mut [u8] {
+    let res = scope.repeat_mut(move |worker_cx| -> Result<_, core::convert::Infallible> {
+        Ok(fetch_chunk(worker_cx, bufs_chunk))
+    });
+    match res {
+        Ok(s) => s,
+        Err(e) => match e {},
+    }
+}
+
+fn main() {}
+"#;
+
+    #[test]
+    fn impl_assoc_param_bounds_and_fn_once_by_value_soundness() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let home = std::env::var("HOME").expect("HOME is set");
+        let tc = Toolchain::open(&mut DirShelf::new(std::format!("{home}/.blaze/v2/toolchain"))).expect("installed toolchain");
+        let files = [("/w4sound/src/main.rs".to_string(), SOURCE.to_string())];
+        let edition = edition::PackageEdition::of_manifest("2024").expect("Rust 2024");
+        let user = UserCrate { name: "w4sound", dir: "/w4sound/", root: "/w4sound/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("checker frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let inputs = Inputs::new(&user, &tc).expect("fixture inputs");
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, erased.bump()).expect("fixture names");
+        let sources = [SourceFile { path: "src/main.rs", text: SOURCE }];
+        let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("front2");
+        let bodies = world.bodies(alloc);
+        let body = |name: &str| {
+            bodies
+                .iter()
+                .find_map(|&(body, _)| {
+                    let BodyRef::Free(key) = body else { return None };
+                    (names.item_text(key).and_then(|item| item.name) == Some(name)).then_some(body)
+                })
+                .unwrap_or_else(|| panic!("missing fixture body {name}"))
+        };
+
+        // POSITIVE 1: `visitor.visit_seq(&mut items)` selects blanket `&mut A: SeqAccess<'de>` cleanly.
+        let (types, borrows) = world.check_borrows(body("cbor_visit_seq_ok"), alloc);
+        assert!(types.is_clean(), "cbor_visit_seq_ok types: {types:?}");
+        assert!(borrows.is_clean(), "cbor_visit_seq_ok borrows: {borrows:?}");
+
+        // NEGATIVE 1: `'de` through `&mut A: SeqAccess<'de>` must not outlive `'static`.
+        let (types, bad_static) = world.check_borrows(body("cbor_visit_seq_bad_static"), alloc);
+        assert!(types.is_clean(), "cbor_visit_seq_bad_static types: {types:?}");
+        assert!(bad_static.refused.is_none(), "cbor_visit_seq_bad_static refused: {bad_static:?}");
+        assert!(!bad_static.findings.is_empty(), "cbor_visit_seq_bad_static must be rejected: {bad_static:?}");
+
+        // POSITIVE 2: `scope.may_overlap(..., move |cx| Ok(fetch_chunk(cx, bufs_chunk)))` passes clean.
+        let (types, borrows) = world.check_borrows(body("may_overlap_by_value_mut_ok"), alloc);
+        assert!(types.is_clean(), "may_overlap_by_value_mut_ok types: {types:?}");
+        assert!(borrows.is_clean(), "may_overlap_by_value_mut_ok borrows: {borrows:?}");
+
+        // NEGATIVE 2: returning a borrow of an owned `move`-captured local MUST still be rejected.
+        let (types, bad_local) = world.check_borrows(body("may_overlap_by_value_local_ref_bad"), alloc);
+        assert!(types.is_clean(), "may_overlap_by_value_local_ref_bad types: {types:?}");
+        assert!(bad_local.refused.is_none(), "may_overlap_by_value_local_ref_bad refused: {bad_local:?}");
+        assert!(!bad_local.findings.is_empty(), "may_overlap_by_value_local_ref_bad must be rejected: {bad_local:?}");
+
+        // NEGATIVE 3: under `FnMut`, escaping a reborrow of a `ByValue` `&mut` capture stays E0521.
+        let (types, bad_fn_mut) = world.check_borrows(body("fn_mut_by_value_escape_bad"), alloc);
+        assert!(types.is_clean(), "fn_mut_by_value_escape_bad types: {types:?}");
+        assert!(bad_fn_mut.refused.is_none(), "fn_mut_by_value_escape_bad refused: {bad_fn_mut:?}");
+        assert!(
+            bad_fn_mut.findings.iter().any(|d| d.code == "E0521"),
+            "fn_mut_by_value_escape_bad must be E0521: {bad_fn_mut:?}",
+        );
     }
 }

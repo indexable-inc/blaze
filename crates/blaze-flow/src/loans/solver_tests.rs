@@ -2,7 +2,7 @@ use std::alloc::Global;
 
 use blaze_own::Inline;
 
-use crate::flow::{BorrowKind, Bound, Flow, FlowBuilder, Loan, Operand, Place, Point, Span, Stmt};
+use crate::flow::{BorrowKind, Bound, Flow, FlowBuilder, Loan, Local, Operand, Place, Point, Span, Stmt};
 use crate::record::Plant;
 
 use super::solver::{LIMIT, Meter, solve};
@@ -229,4 +229,99 @@ fn candidates_keep_an_unloaned_placeholder_bridge_and_drop_an_unobservable_loan(
         BorrowFinding::Invalidated { at: Point::start(write), loan: Loan(0), span: SPAN, returned: false },
         BorrowFinding::UnprovenOutlives { at: Point::mid(end), from: a, into: z, span: SPAN },
     ]);
+}
+
+/// Models a huge function like `engine_bodies`: 20,000 statements across 200 blocks, 2 known
+/// signature placeholders (`'a: 'b`), 2,000 short-lived borrows on a single hot local (`store`),
+/// plus 1 cross-block reborrow conflict forcing Tier 2. Verifies Tier 2 completes far below the
+/// 33.5M step budget instead of hitting `Bound::TierTwo`.
+#[test]
+fn huge_multi_placeholder_hot_local_body_stays_far_below_tier_two_budget() {
+    const N_BLOCKS: usize = 200;
+    const BORROWS_PER_BLOCK: usize = 10;
+    const N_BORROWS: u32 = (N_BLOCKS * BORROWS_PER_BLOCK) as u32;
+    const N_LOCALS: u32 = 4 + N_BORROWS + 28;
+
+    let mut b = FlowBuilder::new_in(N_LOCALS, 2, Global);
+    let ph_a = b.origin(true);
+    let ph_b = b.origin(true);
+    b.known(ph_a, ph_b);
+    b.mentions(0, ph_b);
+
+    let cross_ref = Local(3);
+    let o_cross = b.origin(false);
+    b.mentions(cross_ref.0, o_cross);
+
+    let mut bbs = std::vec::Vec::with_capacity(N_BLOCKS);
+    for _ in 0..N_BLOCKS {
+        bbs.push(b.block());
+    }
+
+    let mut conflict_stmt = Stmt(0);
+    let mut conflict_loan = Loan(0);
+    let mut borrow_idx = 0u32;
+    for bi in 0..N_BLOCKS {
+        b.start(bbs[bi]);
+        if bi == 0 {
+            conflict_loan = b.borrow(Place(cross_ref.0), BorrowKind::Shared, Place(2), o_cross, SPAN);
+            b.subset(ph_a, o_cross);
+            b.subset(o_cross, ph_b);
+        }
+        // 10 short-lived `&mut store` borrows per block on hot local `Place(1)` = 2,000 borrows
+        // (each into its own MIR temporary local, as Rust MIR lowering emits).
+        for _ in 0..BORROWS_PER_BLOCK {
+            let tmp = 4 + borrow_idx;
+            borrow_idx += 1;
+            let o_tmp = b.origin(false);
+            b.mentions(tmp, o_tmp);
+            b.stmt(crate::flow::StmtKind::StorageLive(Local(tmp)), SPAN);
+            b.borrow(Place(tmp), BorrowKind::Mut, Place(1), o_tmp, SPAN);
+            b.call(&[Operand::Move(Place(tmp))], Place(0), SPAN);
+            b.stmt(crate::flow::StmtKind::StorageDead(Local(tmp)), SPAN);
+        }
+        // Pad with straight-line statements to ~100 stmts/block (~20,000 stmts total).
+        for p in 0..55u32 {
+            let dst = 4 + N_BORROWS + (p % 28);
+            b.assign(Place(dst), Operand::Const, SPAN);
+        }
+        if bi == 100 {
+            // Mutate `Place(2)` while `cross_ref` is still live across 150 blocks!
+            conflict_stmt = b.assign(Place(2), Operand::Const, SPAN);
+        }
+        if bi == 150 {
+            b.call(&[Operand::Copy(Place(cross_ref.0))], Place(0), SPAN);
+        }
+        if bi + 1 == N_BLOCKS {
+            b.ret(SPAN);
+        } else {
+            b.goto(bbs[bi + 1], SPAN);
+        }
+    }
+
+    let flow = b.finish().expect("huge body builds");
+    assert!(flow.stmts.len() >= 19_000);
+    assert_eq!(flow.loans.len(), N_BLOCKS * BORROWS_PER_BLOCK + 1);
+    let f = facts(&flow, Global).expect("facts converge");
+    assert_eq!(tier_one(&flow, &f, Plant::None, Global), Ok(TierOne::Refused));
+
+    // Must complete in well under 2,000,000 steps (< 6% of `LIMIT = 33,554,432`).
+    let mut meter = Meter::new(2_000_000);
+    let found = solve("blaze::engine_bodies_sim", &flow, &f, Plant::None, Global, &mut meter)
+        .expect("huge body stays far below Tier Two budget");
+    assert_eq!(
+        found.as_slice(),
+        &[BorrowFinding::Invalidated {
+            at: Point::start(conflict_stmt),
+            loan: conflict_loan,
+            span: SPAN,
+            returned: true,
+        }]
+    );
+    std::println!(
+        "engine_bodies_sim: stmts={} loans={} origins={} steps={} / {LIMIT}",
+        flow.stmts.len(),
+        flow.loans.len(),
+        flow.origins,
+        meter.used(),
+    );
 }

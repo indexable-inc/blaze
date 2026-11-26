@@ -469,3 +469,530 @@ fn rigid_param_alias_clause_does_not_shadow_ground_impl() {
         "TWIN: equated `C::Spec = &u8` with `C::Spec: SubMarker` may shadow `&u8: Marker`: {equated_rows:?}"
     );
 }
+
+/// 2a: `E: From<E>` under caller bound `E: From<ShapeError<A>>` must NOT be shadowed by
+/// `E: From<ShapeError<A>>` (`ShapeError<A>` cannot equal rigid `Param(E)`), so it selects the
+/// reflexive blanket `impl<T> From<T> for T`. Twins:
+/// - `E: From<ShapeError<A>>` DOES match the caller clause and selects `Selected::ParamEnv`;
+/// - under two bounds `E: From<ShapeError<A>> + From<ShapeError<B>>`, `E: From<ShapeError<B>>`
+///   uniquely selects the second clause (and `E: From<E>` still selects `impl<T> From<T> for T`).
+#[test]
+fn from_self_not_shadowed_by_other_from_bound() {
+    let mut fx = Fx::new();
+    let sized = fx.tr("Sized", 1, Vec::new(), &[]);
+    fx.lang(LangItem::Sized, sized);
+    let (p0, p1, p2) = (fx.param(0), fx.param(1), fx.param(2));
+
+    let from_tr = fx.tr("From", 2, Vec::new(), &[]);
+    let impl_from_self = fx.imp("impl<T> From<T> for T", 1, p0, Some((from_tr, &[p0])), &[], Vec::new());
+
+    let shape_err = fx.strukt("ShapeError", 1, &[]);
+    let shape_a = fx.adt(shape_err, &[p0]);
+    let shape_b = fx.adt(shape_err, &[p1]);
+
+    // fn convert<U, V: From<U>>(u: U) -> V
+    let v_from_u = fx.bound(from_tr, &[p1, p0]);
+    fx.func("convert", 2, &[p0], p1, std::vec![v_from_u]);
+
+    // Caller 1: fn caller_self<A, E: From<ShapeError<A>>>(e: E) -> E { convert(e) }
+    let e_from_sa = fx.bound(from_tr, &[p1, shape_a]);
+    let caller_self = fx.func("caller_self", 2, &[p1], p1, std::vec![e_from_sa]);
+
+    // Caller 2 (twin): fn caller_match<A, E: From<ShapeError<A>>>(se: ShapeError<A>) -> E { convert(se) }
+    let caller_match = fx.func("caller_match", 2, &[shape_a], p1, std::vec![e_from_sa]);
+
+    // Caller 3 (multi-clause): fn caller_two<A, B, E: From<ShapeError<A>> + From<ShapeError<B>>>(se: ShapeError<B>) -> E
+    let e2_from_sa = fx.bound(from_tr, &[p2, shape_a]);
+    let e2_from_sb = fx.bound(from_tr, &[p2, shape_b]);
+    let caller_two_b = fx.func("caller_two_b", 3, &[shape_b], p2, std::vec![e2_from_sa, e2_from_sb]);
+    let caller_two_self = fx.func("caller_two_self", 3, &[p2], p2, std::vec![e2_from_sa, e2_from_sb]);
+    fx.finish();
+
+    let run = |owner: ItemKey| {
+        let mut b = Bb::new();
+        let x = b.param("x");
+        let f = b.path(&["convert"]);
+        let lx = b.local(x);
+        let call = b.call(f, &[lx]);
+        let root = b.block(&[], Some(call));
+        let c = check_body(&fx, &b, owner, root, Plant::None, InferPlant::None);
+        assert_eq!(c.diags.len(), 0, "{:?}", c.diags);
+        c.call_selections(call).to_vec()
+    };
+
+    let self_rows = run(caller_self);
+    assert_eq!(self_rows.len(), 1, "{self_rows:?}");
+    assert!(
+        matches!(self_rows[0].selected, Selected::Impl { imp, .. } if imp == impl_from_self),
+        "`E: From<E>` under `E: From<ShapeError<A>>` must select `impl<T> From<T> for T`: {self_rows:?}"
+    );
+
+    let match_rows = run(caller_match);
+    assert_eq!(match_rows.len(), 1, "{match_rows:?}");
+    assert_eq!(
+        match_rows[0].selected,
+        Selected::ParamEnv { clause: 0 },
+        "TWIN: `E: From<ShapeError<A>>` must select caller clause 0: {match_rows:?}"
+    );
+
+    let two_b_rows = run(caller_two_b);
+    assert_eq!(two_b_rows.len(), 1, "{two_b_rows:?}");
+    assert_eq!(
+        two_b_rows[0].selected,
+        Selected::ParamEnv { clause: 1 },
+        "TWIN: `E: From<ShapeError<B>>` under two `From` bounds must uniquely select clause 1: {two_b_rows:?}"
+    );
+
+    let two_self_rows = run(caller_two_self);
+    assert_eq!(two_self_rows.len(), 1, "{two_self_rows:?}");
+    assert!(
+        matches!(two_self_rows[0].selected, Selected::Impl { imp, .. } if imp == impl_from_self),
+        "`E: From<E>` under two `From` bounds must select `impl<T> From<T> for T`: {two_self_rows:?}"
+    );
+}
+
+/// 2b: `FlatMap<Range, Closure>: Clone` under caller bounds `I: IntoIterator<Item = u8>` and
+/// `I::IntoIter: Clone` (and also `Wrap<I::IntoIter>: Clone` vs `Wrap<&u8>: Clone`) must NOT be
+/// shadowed by the rigid parameter alias `I::IntoIter`; twin with `I::IntoIter = FlatMap<..>`
+/// stays `Selected::Generic`.
+#[test]
+fn rigid_param_alias_does_not_block_concrete_or_nested_clone_impl() {
+    let mut fx = Fx::new();
+    let sized = fx.tr("Sized", 1, Vec::new(), &[]);
+    fx.lang(LangItem::Sized, sized);
+    let copy = fx.tr("Copy", 1, Vec::new(), &[]);
+    fx.lang(LangItem::Copy, copy);
+    let clone = fx.tr("Clone", 1, Vec::new(), &[]);
+    fx.lang(LangItem::Clone, clone);
+
+    let (p0, p1) = (fx.param(0), fx.param(1));
+    let u8_ = fx.u8();
+    let unit = fx.unit();
+    let ru8 = fx.r(Mutbl::Not, u8_);
+    let ref_p0 = fx.r(Mutbl::Not, p0);
+
+    fx.imp("impl Copy for u8", 0, u8_, Some((copy, &[])), &[], Vec::new());
+    fx.imp("impl Clone for u8", 0, u8_, Some((clone, &[])), &[], Vec::new());
+    fx.imp("impl<T> Clone for &T", 1, ref_p0, Some((clone, &[])), &[], Vec::new());
+    fx.imp("impl<T> Copy for &T", 1, ref_p0, Some((copy, &[])), &[], Vec::new());
+
+    let into_iter = fx.tr("IntoIterator", 1, Vec::new(), &["Item", "IntoIter"]);
+    let range = fx.strukt("Range", 0, &[]);
+    let range_ty = fx.adt(range, &[]);
+    fx.imp("impl Clone for Range", 0, range_ty, Some((clone, &[])), &[], Vec::new());
+
+    let flat_map = fx.strukt("FlatMap", 2, &[]);
+    let flat_map_p = fx.adt(flat_map, &[p0, p1]);
+    let p0_clone = fx.bound(clone, &[p0]);
+    let p1_clone = fx.bound(clone, &[p1]);
+    let impl_clone_fm = fx.imp(
+        "impl<I: Clone, F: Clone> Clone for FlatMap<I, F>",
+        2,
+        flat_map_p,
+        Some((clone, &[])),
+        &[],
+        std::vec![p0_clone, p1_clone],
+    );
+    fx.imp(
+        "impl<I, F> IntoIterator for FlatMap<I, F>",
+        2,
+        flat_map_p,
+        Some((into_iter, &[])),
+        &[("Item", u8_), ("IntoIter", flat_map_p)],
+        Vec::new(),
+    );
+    fx.func("mk_fm", 2, &[p0, p1], flat_map_p, Vec::new());
+
+    let wrap = fx.strukt("Wrap", 1, &[]);
+    let wrap_p0 = fx.adt(wrap, &[p0]);
+    let impl_clone_wrap = fx.imp(
+        "impl<T: Clone> Clone for Wrap<T>",
+        1,
+        wrap_p0,
+        Some((clone, &[])),
+        &[],
+        std::vec![p0_clone],
+    );
+
+    // fn rebuild<X: IntoIterator>(x: X) where X::IntoIter: Clone
+    let x_ii = fx.bound(into_iter, &[p0]);
+    let x_into = fx.alias(into_iter, "IntoIter", &[p0]);
+    let x_into_clone = fx.bound(clone, &[x_into]);
+    fx.func("rebuild", 1, &[p0], unit, std::vec![x_ii, x_into_clone]);
+    fx.func("need_clone", 1, &[p0], unit, std::vec![p0_clone]);
+
+    // Caller 1: fn rebuild_graph<I, S>(r: Range, s: &S) where I: IntoIterator<Item = u8>, I::IntoIter: Clone
+    let i_ii = fx.bound(into_iter, &[p0]);
+    let i_item_u8 = fx.proj(into_iter, &[p0], "Item", u8_);
+    let i_into = fx.alias(into_iter, "IntoIter", &[p0]);
+    let i_into_clone = fx.bound(clone, &[i_into]);
+    let ref_s = fx.r(Mutbl::Not, p1);
+    let rebuild_graph = fx.func("rebuild_graph", 2, &[range_ty, ref_s], unit, std::vec![i_ii, i_item_u8, i_into_clone]);
+
+    // Caller 2: nested rigid alias `where Wrap<I::IntoIter>: Clone` vs `Wrap<&u8>: Clone`
+    let wrap_i_into = fx.adt(wrap, &[i_into]);
+    let wrap_i_into_clone = fx.bound(clone, &[wrap_i_into]);
+    let wrap_ru8 = fx.adt(wrap, &[ru8]);
+    let nested_caller = fx.func(
+        "nested_caller",
+        1,
+        &[wrap_ru8],
+        unit,
+        std::vec![i_ii, wrap_i_into_clone],
+    );
+    // Caller 3 (twin): `where I: IntoIterator<IntoIter = &u8>, Wrap<I::IntoIter>: Clone`
+    // Equating `I::IntoIter` makes the alias non-rigid, so `Wrap<&u8>: Clone` stays conservative.
+    let i_into_eq_ru8 = fx.proj(into_iter, &[p0], "IntoIter", ru8);
+    let nested_equated = fx.func(
+        "nested_equated",
+        1,
+        &[wrap_ru8],
+        unit,
+        std::vec![i_ii, i_into_eq_ru8, wrap_i_into_clone],
+    );
+    fx.finish();
+
+    // Positive 1: `rebuild(mk_fm(r, move || s))` where `Closure` captures `&S` (Param(1)).
+    {
+        let mut b = Bb::new();
+        let r = b.param("r");
+        let s = b.param("s");
+        let ls = b.local(s);
+        let cbody = b.block(&[], Some(ls));
+        let cl = b.move_closure(&[], cbody);
+        let mk_fm = b.path(&["mk_fm"]);
+        let lr = b.local(r);
+        let fm = b.call(mk_fm, &[lr, cl]);
+        let rebuild = b.path(&["rebuild"]);
+        let call = b.call(rebuild, &[fm]);
+        let root = b.block(&[], Some(call));
+        let c = check_body(&fx, &b, rebuild_graph, root, Plant::None, InferPlant::None);
+        assert_eq!(c.diags.len(), 0, "{:?}", c.diags);
+        let rows = c.call_selections(call);
+        assert!(
+            rows.iter().any(|r| r.trait_ == clone && matches!(r.selected, Selected::Impl { imp, .. } if imp == impl_clone_fm)),
+            "`FlatMap<Range, Closure>: Clone` must select `impl Clone for FlatMap`: {rows:?}"
+        );
+    }
+
+    // Positive 2 + Negative twin: nested rigid alias `Wrap<I::IntoIter>: Clone` vs `Wrap<&u8>: Clone`.
+    let run_wrap = |owner: ItemKey| {
+        let mut b = Bb::new();
+        let w = b.param("w");
+        let f = b.path(&["need_clone"]);
+        let lw = b.local(w);
+        let call = b.call(f, &[lw]);
+        let root = b.block(&[], Some(call));
+        let c = check_body(&fx, &b, owner, root, Plant::None, InferPlant::None);
+        assert_eq!(c.diags.len(), 0, "{:?}", c.diags);
+        c.call_selections(call).to_vec()
+    };
+    let nested_rows = run_wrap(nested_caller);
+    assert!(
+        nested_rows.iter().any(|r| r.trait_ == clone && matches!(r.selected, Selected::Impl { imp, .. } if imp == impl_clone_wrap)),
+        "nested rigid alias `Wrap<I::IntoIter>: Clone` must not block `Wrap<&u8>: Clone`: {nested_rows:?}"
+    );
+    let eq_rows = run_wrap(nested_equated);
+    assert_eq!(
+        eq_rows[0].selected,
+        Selected::Generic,
+        "TWIN: equated `I::IntoIter = &u8` allows `Wrap<I::IntoIter>: Clone` to shadow `Wrap<&u8>: Clone`: {eq_rows:?}"
+    );
+}
+
+/// 2c: `<Opaque as Iterator>::Item: IntoIterator` (where `fn mk() -> impl ExactSizeIterator<Item = Res<&u8>>`)
+/// normalizes `<Opaque as Iterator>::Item` through the opaque's bounds to `Res<&u8>` and records
+/// `impl<T> IntoIterator for Res<T>`. Twin: without the `Item = ...` bound on the opaque, no fake
+/// impl is selected.
+#[test]
+fn opaque_alias_projection_normalizes_for_bound_row() {
+    let mut fx = Fx::new();
+    let sized = fx.tr("Sized", 1, Vec::new(), &[]);
+    fx.lang(LangItem::Sized, sized);
+    let p0 = fx.param(0);
+    let unit = fx.unit();
+    let u8_ = fx.u8();
+    let ru8 = fx.r(Mutbl::Not, u8_);
+
+    let iter_tr = fx.tr("Iterator", 1, Vec::new(), &["Item"]);
+    let iter_sup = fx.bound(iter_tr, &[p0]);
+    let exact_tr = fx.tr("ExactSizeIterator", 1, std::vec![iter_sup], &[]);
+    let into_iter = fx.tr("IntoIterator", 1, Vec::new(), &["Item", "IntoIter"]);
+
+    let res = fx.strukt("Res", 1, &[]);
+    let res_p0 = fx.adt(res, &[p0]);
+    let res_ru8 = fx.adt(res, &[ru8]);
+    let impl_into_res = fx.imp(
+        "impl<T> IntoIterator for Res<T>",
+        1,
+        res_p0,
+        Some((into_iter, &[])),
+        &[("Item", p0), ("IntoIter", res_p0)],
+        Vec::new(),
+    );
+
+    // Opaque 1: `impl ExactSizeIterator<Item = Res<&u8>>`
+    let op_eq = fx.opaque_key("mk_eq::{opaque#0}");
+    let op_eq_ty = fx.ty(crate::portable::PNode::Opaque(op_eq, crate::ids::List::EMPTY));
+    let op_eq_exact = fx.bound(exact_tr, &[op_eq_ty]);
+    let op_eq_item = fx.proj(iter_tr, &[op_eq_ty], "Item", res_ru8);
+    let op_eq_sized = fx.bound(sized, &[op_eq_ty]);
+    fx.set_opaque_bounds(op_eq, std::vec![op_eq_exact, op_eq_item, op_eq_sized]);
+    fx.func("mk_eq", 0, &[], op_eq_ty, Vec::new());
+
+    // Opaque 2 (negative twin): `impl ExactSizeIterator` (no `Item = ...`, item itself only bounded by `IntoIterator`)
+    let op_none = fx.opaque_key("mk_none::{opaque#0}");
+    let op_none_ty = fx.ty(crate::portable::PNode::Opaque(op_none, crate::ids::List::EMPTY));
+    let op_none_item = fx.alias(iter_tr, "Item", &[op_none_ty]);
+    let op_none_exact = fx.bound(exact_tr, &[op_none_ty]);
+    let op_none_ii = fx.bound(into_iter, &[op_none_item]);
+    let op_none_sized = fx.bound(sized, &[op_none_ty]);
+    fx.set_opaque_bounds(op_none, std::vec![op_none_exact, op_none_ii, op_none_sized]);
+    fx.func("mk_none", 0, &[], op_none_ty, Vec::new());
+
+    // fn flatten<I: Iterator>(i: I) where I::Item: IntoIterator
+    let i_iter = fx.bound(iter_tr, &[p0]);
+    let i_item = fx.alias(iter_tr, "Item", &[p0]);
+    let i_item_ii = fx.bound(into_iter, &[i_item]);
+    fx.func("flatten", 1, &[p0], unit, std::vec![i_iter, i_item_ii]);
+
+    let user_eq = fx.func("user_eq", 0, &[], unit, Vec::new());
+    let user_none = fx.func("user_none", 0, &[], unit, Vec::new());
+    fx.finish();
+
+    let run = |owner: ItemKey, mk_name: &str| {
+        let mut b = Bb::new();
+        let mk = b.path(&[mk_name]);
+        let got = b.call(mk, &[]);
+        let fl = b.path(&["flatten"]);
+        let call = b.call(fl, &[got]);
+        let root = b.block(&[], Some(call));
+        let c = check_body(&fx, &b, owner, root, Plant::None, InferPlant::None);
+        assert_eq!(c.diags.len(), 0, "{:?}", c.diags);
+        c.call_selections(call).to_vec()
+    };
+
+    let eq_rows = run(user_eq, "mk_eq");
+    assert!(
+        eq_rows.iter().any(|r| r.trait_ == into_iter && r.name.is_none() && matches!(r.selected, Selected::Impl { imp, .. } if imp == impl_into_res)),
+        "`<Opaque as Iterator>::Item: IntoIterator` must normalize to `Res<&u8>` and select `impl IntoIterator for Res`: {eq_rows:?}"
+    );
+
+    let none_rows = run(user_none, "mk_none");
+    assert!(
+        !none_rows.iter().any(|r| r.trait_ == into_iter && matches!(r.selected, Selected::Impl { .. })),
+        "TWIN: opaque without `Item = ...` must not fabricate an `Impl` row: {none_rows:?}"
+    );
+}
+
+/// 2d: Passing a trait method as a `FnDef` value (`apply(k, MyIter::next)`) must record the trait
+/// selection (`Keys<&u8>: MyIter -> Selected::Impl`) at the `Expr::Path`. Negative control: calling
+/// `MyIter::next(k)` directly records the selection at `Expr::Call` and does not duplicate it on
+/// the `Expr::Path` callee.
+#[test]
+fn trait_method_path_value_records_selection_without_duplicating_direct_call() {
+    let mut fx = Fx::new();
+    let sized = fx.tr("Sized", 1, Vec::new(), &[]);
+    fx.lang(LangItem::Sized, sized);
+    let (p0, p1) = (fx.param(0), fx.param(1));
+    let u8_ = fx.u8();
+    let ru8 = fx.r(Mutbl::Not, u8_);
+
+    let rust_call = crate::ids::FnPtrHeader { abi: crate::ids::Abi::RustCall, safety: crate::ids::Safety::Safe, c_variadic: false };
+    let fn_once = fx.tr("FnOnce", 2, Vec::new(), &["Output"]);
+    fx.lang(LangItem::FnOnce, fn_once);
+    let out = fx.alias(fn_once, "Output", &[p0, p1]);
+    let call_once = fx.trait_fn(fn_once, "call_once", true, &[p0, p1], out);
+    fx.set_header(call_once, rust_call);
+
+    let my_iter = fx.tr("MyIter", 1, Vec::new(), &["Item"]);
+    let mut_self = fx.r(Mutbl::Mut, p0);
+    let self_item = fx.alias(my_iter, "Item", &[p0]);
+    fx.trait_fn(my_iter, "next", true, &[mut_self], self_item);
+    fx.use_trait(my_iter);
+
+    let keys = fx.strukt("Keys", 1, &[]);
+    let keys_p0 = fx.adt(keys, &[p0]);
+    let impl_keys_iter = fx.imp(
+        "impl<T> MyIter for Keys<T>",
+        1,
+        keys_p0,
+        Some((my_iter, &[])),
+        &[("Item", p0)],
+        Vec::new(),
+    );
+
+    // fn apply<T, F: FnOnce(&mut Keys<T>) -> T>(k: &mut Keys<T>, f: F) -> T
+    let mut_keys_p0 = fx.r(Mutbl::Mut, keys_p0);
+    let arg_tup = fx.tuple(&[mut_keys_p0]);
+    let f_fn_once = fx.bound(fn_once, &[p1, arg_tup]);
+    let f_out = fx.proj(fn_once, &[p1, arg_tup], "Output", p0);
+    fx.func("apply", 2, &[mut_keys_p0, p1], p0, std::vec![f_fn_once, f_out]);
+
+    let keys_ru8 = fx.adt(keys, &[ru8]);
+    let mut_keys_ru8 = fx.r(Mutbl::Mut, keys_ru8);
+    let caller_val = fx.func("caller_val", 0, &[mut_keys_ru8], ru8, Vec::new());
+    let caller_direct = fx.func("caller_direct", 0, &[mut_keys_ru8], ru8, Vec::new());
+    fx.finish();
+
+    // Positive: `apply(k, MyIter::next)` -> selection recorded at `MyIter::next` (`Expr::Path`).
+    {
+        let mut b = Bb::new();
+        let k = b.param("k");
+        let lk = b.local(k);
+        let next_path = b.path(&["MyIter", "next"]);
+        let apply = b.path(&["apply"]);
+        let call = b.call(apply, &[lk, next_path]);
+        let root = b.block(&[], Some(call));
+        let c = check_body(&fx, &b, caller_val, root, Plant::None, InferPlant::None);
+        assert_eq!(c.diags.len(), 0, "{:?}", c.diags);
+        let path_rows = c.call_selections(next_path);
+        assert!(
+            path_rows.iter().any(|r| r.trait_ == my_iter && matches!(r.selected, Selected::Impl { imp, .. } if imp == impl_keys_iter)),
+            "passing `MyIter::next` as a value must record `Keys<&u8>: MyIter` at the path expr: {path_rows:?}"
+        );
+    }
+
+    // Negative control: direct `MyIter::next(k)` records on `call`, NOT duplicated on `next_path`.
+    {
+        let mut b = Bb::new();
+        let k = b.param("k");
+        let lk = b.local(k);
+        let next_path = b.path(&["MyIter", "next"]);
+        let call = b.call(next_path, &[lk]);
+        let root = b.block(&[], Some(call));
+        let c = check_body(&fx, &b, caller_direct, root, Plant::None, InferPlant::None);
+        assert_eq!(c.diags.len(), 0, "{:?}", c.diags);
+        assert!(
+            c.call_selections(next_path).is_empty(),
+            "direct call callee path must not duplicate rows already on `Expr::Call`: {:?}",
+            c.call_selections(next_path)
+        );
+        let call_rows = c.call_selections(call);
+        assert!(
+            call_rows.iter().any(|r| r.trait_ == my_iter && matches!(r.selected, Selected::Impl { imp, .. } if imp == impl_keys_iter)),
+            "direct call must still record `Keys<&u8>: MyIter` on `Expr::Call`: {call_rows:?}"
+        );
+    }
+}
+
+/// 3: `AdjustKind::Unsize` coercions (`&T -> &dyn Trait<..>`, `MyBox<T> -> MyBox<dyn Trait>`,
+/// `&P -> &dyn Trait`) record the exact selected impl (or `ParamEnv` clause) and object projections
+/// at the coerced expression; negative control `&[u8; 4] -> &[u8]` records no trait row.
+#[test]
+fn unsize_to_dyn_records_trait_and_projection_selection() {
+    let mut fx = Fx::new();
+    let sized = fx.tr("Sized", 1, Vec::new(), &[]);
+    fx.lang(LangItem::Sized, sized);
+    let unsize = fx.tr("Unsize", 2, Vec::new(), &[]);
+    fx.lang(LangItem::Unsize, unsize);
+    let coerce_unsized = fx.tr("CoerceUnsized", 2, Vec::new(), &[]);
+    fx.lang(LangItem::CoerceUnsized, coerce_unsized);
+
+    let (p0, p1) = (fx.param(0), fx.param(1));
+    let u8_ = fx.u8();
+    let ru8 = fx.r(Mutbl::Not, u8_);
+
+    let dyn_tr = fx.tr("DynTr", 1, Vec::new(), &["Out"]);
+    let my_s = fx.strukt("MyS", 0, &[]);
+    let my_s_ty = fx.adt(my_s, &[]);
+    let impl_dyn_s = fx.imp(
+        "impl DynTr for MyS",
+        0,
+        my_s_ty,
+        Some((dyn_tr, &[])),
+        &[("Out", ru8)],
+        Vec::new(),
+    );
+
+    let my_box = fx.strukt("MyBox", 1, &[("ptr", p0)]);
+    let box_p0 = fx.adt(my_box, &[p0]);
+    let box_p1 = fx.adt(my_box, &[p1]);
+    let p0_unsize_p1 = fx.bound(unsize, &[p0, p1]);
+    let box_coerce = fx.imp(
+        "impl<T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<MyBox<U>> for MyBox<T>",
+        2,
+        box_p0,
+        Some((coerce_unsized, &[box_p1])),
+        &[],
+        std::vec![p0_unsize_p1],
+    );
+    fx.unsized_param(box_coerce, 0);
+    fx.unsized_param(box_coerce, 1);
+
+    let ex_tr = fx.ty(crate::portable::PNode::ExTrait(dyn_tr, crate::ids::List::EMPTY));
+    let ex_out = fx.ty(crate::portable::PNode::ExProj {
+        trait_: dyn_tr,
+        name: crate::ids::Name::of("Out"),
+        args: crate::ids::List::EMPTY,
+        term: ru8,
+    });
+    let dyn_obj = fx.t.dynamic(&[ex_tr, ex_out]).expect("dynamic");
+    let ref_dyn = fx.r(Mutbl::Not, dyn_obj);
+    let ref_s = fx.r(Mutbl::Not, my_s_ty);
+    let box_s = fx.adt(my_box, &[my_s_ty]);
+    let box_dyn = fx.adt(my_box, &[dyn_obj]);
+    let ref_p0 = fx.r(Mutbl::Not, p0);
+
+    let four = fx.t.usize_value(4).expect("usize");
+    let arr4 = fx.ty(crate::portable::PNode::Array(u8_, four));
+    let slice_u8 = fx.ty(crate::portable::PNode::Slice(u8_));
+    let ref_arr4 = fx.r(Mutbl::Not, arr4);
+    let ref_slice = fx.r(Mutbl::Not, slice_u8);
+
+    let coerce_ref = fx.func("coerce_ref", 0, &[ref_s], ref_dyn, Vec::new());
+    let coerce_box = fx.func("coerce_box", 0, &[box_s], box_dyn, Vec::new());
+    let p0_dyn = fx.bound(dyn_tr, &[p0]);
+    let p0_dyn_out = fx.proj(dyn_tr, &[p0], "Out", ru8);
+    let coerce_param = fx.func(
+        "coerce_param",
+        1,
+        &[ref_p0],
+        ref_dyn,
+        std::vec![p0_dyn, p0_dyn_out],
+    );
+    let coerce_slice = fx.func("coerce_slice", 0, &[ref_arr4], ref_slice, Vec::new());
+    fx.finish();
+
+    let run = |owner: ItemKey| {
+        let mut b = Bb::new();
+        let x = b.param("x");
+        let lx = b.local(x);
+        let root = b.block(&[], Some(lx));
+        let c = check_body(&fx, &b, owner, root, Plant::None, InferPlant::None);
+        assert_eq!(c.diags.len(), 0, "{:?}", c.diags);
+        c.call_selections(lx).to_vec()
+    };
+
+    // Positive 1: `&MyS -> &dyn DynTr<Out = &u8>` records both `DynTr` bound and `Out` projection.
+    let ref_rows = run(coerce_ref);
+    assert!(
+        ref_rows.iter().any(|r| r.trait_ == dyn_tr && r.name.is_none() && matches!(r.selected, Selected::Impl { imp, .. } if imp == impl_dyn_s)),
+        "`&MyS -> &dyn DynTr` must record `MyS: DynTr` impl selection: {ref_rows:?}"
+    );
+    assert!(
+        ref_rows.iter().any(|r| r.trait_ == dyn_tr && r.name == Some(crate::ids::Name::of("Out")) && matches!(r.selected, Selected::Impl { imp, .. } if imp == impl_dyn_s)),
+        "`&MyS -> &dyn DynTr<Out = &u8>` must record `Out` projection selection: {ref_rows:?}"
+    );
+
+    // Positive 2: `MyBox<MyS> -> MyBox<dyn DynTr<Out = &u8>>` records `MyS: DynTr` impl selection.
+    let box_rows = run(coerce_box);
+    assert!(
+        box_rows.iter().any(|r| r.trait_ == dyn_tr && r.name.is_none() && matches!(r.selected, Selected::Impl { imp, .. } if imp == impl_dyn_s)),
+        "`MyBox<MyS> -> MyBox<dyn DynTr>` must record `MyS: DynTr` impl selection: {box_rows:?}"
+    );
+
+    // Positive 3: `&T -> &dyn DynTr<Out = &u8>` records `Selected::ParamEnv`.
+    let param_rows = run(coerce_param);
+    assert!(
+        param_rows.iter().any(|r| r.trait_ == dyn_tr && r.name.is_none() && matches!(r.selected, Selected::ParamEnv { clause: 0 })),
+        "`&T -> &dyn DynTr` must record `ParamEnv` selection: {param_rows:?}"
+    );
+
+    // Negative control: `&[u8; 4] -> &[u8]` unsizing is array-to-slice, NOT dyn: no trait row.
+    let slice_rows = run(coerce_slice);
+    assert!(
+        slice_rows.is_empty(),
+        "array-to-slice unsizing must record no trait selection row: {slice_rows:?}"
+    );
+}

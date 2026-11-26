@@ -1775,23 +1775,65 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
         let mut given_self: Option<blaze_own::Vec<blaze_typeck::regions::Region, Alloc<'static>>> = None;
         let mut given_impl_trait: Option<blaze_own::Vec<blaze_typeck::regions::Region, Alloc<'static>>> = None;
         given_param_bounds.clear();
-        if let Some(cr) = container.and_then(|c| store.container_regions.get(&c)) {
-            if matches!(self_, SelfTy::Ty(..)) {
-                if let Some(sr) = cr.self_regions.as_deref() {
-                    let mut v = blaze_own::Vec::with_capacity_in(sr.len(), alloc);
-                    v.extend_from_slice(sr);
+        if let Some(c) = container {
+            if let Some(cr) = store.container_regions.get(&c) {
+                if matches!(self_, SelfTy::Ty(..)) {
+                    if let Some(sr) = cr.self_regions.as_deref() {
+                        let mut v = blaze_own::Vec::with_capacity_in(sr.len(), alloc);
+                        v.extend_from_slice(sr);
+                        given_self = Some(v);
+                    }
+                    if let Some(tr) = cr.trait_regions.as_deref() {
+                        let mut v = blaze_own::Vec::with_capacity_in(tr.len(), alloc);
+                        v.extend_from_slice(tr);
+                        given_impl_trait = Some(v);
+                    }
+                }
+                if let Some(filed) = store.regions.made(c) {
+                    let arity = HeadsArity { heads: &store.maps, opaques: &[], names };
+                    super::heads::extract_elaborated_param_bounds(
+                        store.tys.view(),
+                        &store.regions,
+                        &arity,
+                        &filed.regions().clauses,
+                        &mut given_param_bounds,
+                        alloc,
+                    );
+                } else {
+                    for pb in &cr.param_bounds {
+                        let mut regs = blaze_own::Vec::with_capacity_in(pb.regions.len(), alloc);
+                        regs.extend_from_slice(&pb.regions);
+                        given_param_bounds.push(ContainerParamBound { param: pb.param, trait_: pb.trait_, regions: regs });
+                    }
+                }
+            } else if let Some(filed) = store.regions.made(c) {
+                // Frozen `Head::Impl` / `Head::Trait` records carry `life: None` (lifetime parts
+                // are made on demand), so `Store::file_heads` skips `restore_container` and leaves
+                // `store.container_regions` empty even though `store.regions.made(c)` holds the
+                // impl's `impl_header` columns (`Self` and impl-trait) and clauses.
+                let h = filed.regions();
+                if let SelfTy::Ty(self_ty, _) = self_
+                    && let Some((self_col, trait_col)) = h.impl_header.as_ref()
+                    && self_col.ty() == self_ty
+                {
+                    let mut v = blaze_own::Vec::with_capacity_in(self_col.as_slice().len(), alloc);
+                    v.extend_from_slice(self_col.as_slice());
                     given_self = Some(v);
+                    if let Some(tc) = trait_col.as_ref() {
+                        let mut tv = blaze_own::Vec::with_capacity_in(tc.as_slice().len(), alloc);
+                        tv.extend_from_slice(tc.as_slice());
+                        given_impl_trait = Some(tv);
+                    }
                 }
-                if let Some(tr) = cr.trait_regions.as_deref() {
-                    let mut v = blaze_own::Vec::with_capacity_in(tr.len(), alloc);
-                    v.extend_from_slice(tr);
-                    given_impl_trait = Some(v);
-                }
-            }
-            for pb in &cr.param_bounds {
-                let mut regs = blaze_own::Vec::with_capacity_in(pb.regions.len(), alloc);
-                regs.extend_from_slice(&pb.regions);
-                given_param_bounds.push(ContainerParamBound { param: pb.param, trait_: pb.trait_, regions: regs });
+                let arity = HeadsArity { heads: &store.maps, opaques: &[], names };
+                super::heads::extract_elaborated_param_bounds(
+                    store.tys.view(),
+                    &store.regions,
+                    &arity,
+                    &h.clauses,
+                    &mut given_param_bounds,
+                    alloc,
+                );
             }
         }
         if let Some(filed) = store.regions.made(regions_owner) {
@@ -2497,6 +2539,126 @@ pub fn use_dyn<'a>() {
             &[
                 (0, step(root, 0), 0, WrittenRegion::Named),
                 (1, step(root, 0), 0, WrittenRegion::Static),
+            ]
+        );
+    }
+
+    /// Frozen `Head::Impl` records (seeded `blaze check` via `tables/task.rs`) carry `life: None`
+    /// so `Store::file_heads` skips `restore_container`, leaving `store.container_regions` empty
+    /// even though `store.regions.made(c)` holds the impl's `impl_header` and clauses. `lower_at`
+    /// must still supply `SelfGiven` from `store.regions.made(c)` so `|m: &Self|` in multi-lifetime
+    /// impls (`blaze-consteval/src/machine.rs:1996` and `blaze-native/src/layout.rs:1204`) marks
+    /// `Self`'s lifetimes `WrittenRegion::Named` while keeping the outer `&` elided (late).
+    #[test]
+    fn front2_closure_param_regions_frozen_impl_without_container_regions() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let src = r#"#![no_core]
+pub trait Pool<'a> {
+    type Cx;
+}
+pub struct Lay<'p, 'a> {
+    pub p: &'p u8,
+    pub a: &'a u8,
+}
+impl<'p, 'a> Lay<'p, 'a> {
+    pub fn apply(&mut self) {
+        let _ = |me: &Self| { let _ = me; };
+    }
+}
+pub struct Machine<'w, 'l, 'g, 't, 'wk, 'a, W: Pool<'a>> {
+    pub w: &'w W,
+    pub l: &'l u8,
+    pub g: &'g u8,
+    pub t: &'t u8,
+    pub wk: &'wk u8,
+    pub a: &'a u8,
+}
+impl<'w, 'l, 'g, 't, 'wk, 'a, W: Pool<'a>> Machine<'w, 'l, 'g, 't, 'wk, 'a, W> {
+    pub fn intrinsic(&mut self) {
+        let _ = |m: &Self, cx: &W::Cx| { let _ = (m, cx); };
+    }
+}
+"#;
+        let run_frozen = |method_name: &str| {
+            let frame = Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
+            let erased = blaze_own::Erased::new(&frame);
+            let bump = erased.bump();
+            let store_heap = blaze_own::testing::heap();
+            let store_alloc = store_heap.alloc();
+            let input = CrateInput {
+                name: "frozen_self_test",
+                key: CrateItemKey(ContentId::of("closure_param_regions_frozen_self_test", b"frozen_self_test")),
+                root: "/fnptr/src/lib.rs",
+                shown_from: "/fnptr/",
+                edition: Edition::E2024,
+                implicit: Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2024), proc_macro: false, entry: false },
+                features: &[],
+                deps: &[],
+                cfg: &[],
+                script: None,
+            };
+            let names = resolve_crates(&[input], Sysroot::default(), &OneFile(src), &Serial, bump).expect("resolve");
+            let front_frame = Frame::new(blaze_mem::tag::Tag::Infer).expect("front frame");
+            let files = [SourceFile { path: "src/lib.rs", text: src }];
+            let mut front = Front2::new(&names, &front_frame, &files, store_alloc).expect("front2");
+            let prepared = Prepares::new_in(bump);
+            let mut store = Store::new(front.index.lang("sized"), front.frame, store_alloc);
+            let mut target = None;
+            for (item, _, _) in names.items(0) {
+                if matches!(super::NamesSource::detail_of(&names, item), Some(blaze_surface::ItemDetail::Impl)) {
+                    store.ensure(&names, &mut front.keys, super::Want::Impl(item)).expect("impl head");
+                    let ck = super::checker_of(item);
+                    let found_mk = store.impls.get(&ck).and_then(|head| {
+                        head.fns
+                            .iter()
+                            .find_map(|&(nm, mk)| (nm == blaze_typeck::Name::of(method_name)).then_some(mk))
+                    });
+                    if let Some(mk) = found_mk {
+                        store.ensure(&names, &mut front.keys, super::Want::MemberFn(item, mk)).expect("member head");
+                        // Simulate a seeded store where `Head::Impl` was restored with
+                        // `life: None`: `store.container_regions` has no row for `ck`,
+                        // while `store.regions.made(ck)` still holds `impl_header` + clauses.
+                        store.container_regions.remove(&ck);
+                        assert!(store.container_regions.get(&ck).is_none());
+                        assert!(store.regions.made(ck).is_some());
+                        target = Some(mk);
+                    }
+                }
+            }
+            let key = target.expect("target member");
+            let body = lower_member(&names, &prepared, &mut front.keys, &mut store, key).expect("lower_member");
+            let mut out = blaze_own::Vec::new_in(alloc);
+            for r in body.typeck.closure_param_regions.iter() {
+                out.push((r.param, r.path, r.own, r.kind));
+            }
+            out
+        };
+
+        let step = |p: u64, c: u32| ClosureParamRegion::push_step(p, c).expect("step");
+        let root = ClosureParamRegion::ROOT;
+
+        // `Lay<'p, 'a>`: outer `&` stays elided (no `(0, root, ...)`), while `'p` and `'a` are `Named`.
+        assert_eq!(
+            &run_frozen("apply")[..],
+            &[
+                (0, step(root, 0), 0, WrittenRegion::Named),
+                (0, step(root, 0), 1, WrittenRegion::Named),
+            ]
+        );
+
+        // `Machine<'w, 'l, 'g, 't, 'wk, 'a, W: Pool<'a>>`: all 6 `Self` lifetimes AND `W::Cx`'s
+        // container-bound `'a` are `Named`, while both outer `&` stay elided (per-call late).
+        assert_eq!(
+            &run_frozen("intrinsic")[..],
+            &[
+                (0, step(root, 0), 0, WrittenRegion::Named),
+                (0, step(root, 0), 1, WrittenRegion::Named),
+                (0, step(root, 0), 2, WrittenRegion::Named),
+                (0, step(root, 0), 3, WrittenRegion::Named),
+                (0, step(root, 0), 4, WrittenRegion::Named),
+                (0, step(root, 0), 5, WrittenRegion::Named),
+                (1, step(root, 0), 0, WrittenRegion::Named),
             ]
         );
     }
