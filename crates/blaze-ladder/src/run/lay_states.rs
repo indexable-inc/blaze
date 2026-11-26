@@ -72,6 +72,9 @@ fn build_error<P: FrontEnd>(program: &P, function: Named, error: BuildError, ran
     {
         return RunError::Projection { function, why };
     }
+    if let BuildError::CoroutineRecipe { owner, .. } = error {
+        return RunError::ItemRefused { function, error, item: owner, path: program.item_named(owner) };
+    }
     RunError::Build { function, error, range }
 }
 
