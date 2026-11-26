@@ -84,29 +84,30 @@ pub(super) fn source_key(out: &Out<'_, '_>, origin: TokenOrigin) -> (u8, u32) {
     }
 }
 
-/// An identifier or literal is written `Alone`, and made joint with the next token where its
-/// source had them joint ([`joint`]).
+/// A token's `JointHidden` is cleared to `Alone` when written, and restored only when the next
+/// token written comes right after it in the same call-input stream ([`joint`]). A punctuation's
+/// `Joint` (glued to another punctuation, e.g. `::`, `..=`) is preserved.
 pub(super) fn written(kind: TokenKind) -> TokenKind {
     match kind {
         TokenKind::Ident { .. } | TokenKind::Literal { .. } => kind.with_spacing(Spacing::Alone),
+        TokenKind::Punct { char, spacing: Spacing::JointHidden } => {
+            TokenKind::Punct { char, spacing: Spacing::Alone }
+        }
         _ => kind,
     }
 }
 
-/// Whether a written identifier or literal from `a` is joint with the token from `b` written
-/// after it: both of one stream, `b` right after `a` there, `a` not `Alone` in it, and both of
-/// one edition. A fragment's last token, joint with the `,` after it in the call (`[u8, u16]`),
-/// is not joint with the `as` the template writes after it (`$Src as`).
+/// Whether a written token from `a` is `JointHidden` with the token from `b` written after it:
+/// both from the call's input (`Input` or `AttrArgs`), `b` right after `a` there, `a` not `Alone`
+/// in it, and both of one edition. Tokens from a macro definition's RHS template (`Def` / `Params`)
+/// never carry `JointHidden`, matching rustc's `mbe/quoted.rs` (which keeps only `Spacing::Joint`
+/// on glued punctuation). A fragment's last token, joint with the `,` after it in the call
+/// (`[u8, u16]`), is not joint with the `as` the template writes after it (`$Src as`).
 pub(super) fn joint(out: &Out<'_, '_>, a: TokenOrigin, b: TokenOrigin) -> bool {
     let (stream, i, j) = match (a, b) {
         (TokenOrigin::Input(i), TokenOrigin::Input(j)) => (out.call.input(), i, j),
         (TokenOrigin::AttrArgs(i), TokenOrigin::AttrArgs(j)) => match out.call.attr_args() {
             Some(args) => (args, i, j),
-            None => return false,
-        },
-        (TokenOrigin::Def(i), TokenOrigin::Def(j)) => (out.def.body(), i, j),
-        (TokenOrigin::Params(i), TokenOrigin::Params(j)) => match out.def.params() {
-            Some(params) => (params, i, j),
             None => return false,
         },
         _ => return false,
@@ -177,12 +178,19 @@ pub(super) fn copy_frags(
             let kind = written(view.kind(at));
             out.push_whole_ctx(kind, view.whole(at), origin, ctx)?;
             prev = match kind {
-                TokenKind::Ident { .. } | TokenKind::Literal { .. } => Some(origin),
+                TokenKind::Ident { .. }
+                | TokenKind::Literal { .. }
+                | TokenKind::Punct { spacing: Spacing::Alone, .. } => Some(origin),
                 _ => None,
             };
         }
         if alone {
             set_last_alone(out);
+            if let Some(last) = out.exp.tokens.tokens().last()
+                && matches!(last.kind, TokenKind::Punct { spacing: Spacing::Alone, .. })
+            {
+                prev = Some(*out.exp.origins.last().expect("one origin per token"));
+            }
         }
     }
     Ok(())

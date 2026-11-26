@@ -94,7 +94,7 @@ impl<'f> Scratch<'f> {
         self.last = 0;
         // The token now last was joined to one let go of: it is last, so `Alone`.
         if let Some(last) = mark.tokens.checked_sub(1)
-            && matches!(out.exp.tokens.tokens()[last].kind, TokenKind::Ident { .. } | TokenKind::Literal { .. })
+            && out.exp.tokens.tokens()[last].kind.spacing() == Spacing::JointHidden
         {
             out.exp.tokens.set_spacing(last, Spacing::Alone);
         }
@@ -879,14 +879,19 @@ fn unsuffixed(kind: TokenKind, text: &str) -> &str {
     }
 }
 
-/// Before a token from `next` is written: the last token written, an identifier or literal, is
-/// made joint with it (`JointHidden`) where [`copy::joint`] says the source had them joint, else
-/// `Alone`. Decided at each write, so a token written again after a truncation
-/// ([`Scratch::truncate`]) decides it again.
+/// Before a token from `next` is written: the last token written (if not a delimiter or a
+/// `Spacing::Joint` punctuation) is made `JointHidden` where [`copy::joint`] says the call's
+/// input had them joint, else `Alone`. Decided at each write, so a token written again after a
+/// truncation ([`Scratch::truncate`]) decides it again.
 fn join_prev(out: &mut Out<'_, '_>, next: TokenOrigin) {
     let Some(prev) = out.exp.tokens.len().checked_sub(1) else { return };
     let kind = out.exp.tokens.tokens()[prev].kind;
-    if !matches!(kind, TokenKind::Ident { .. } | TokenKind::Literal { .. }) {
+    if matches!(
+        kind,
+        TokenKind::Open(_)
+            | TokenKind::Close(_)
+            | TokenKind::Punct { spacing: Spacing::Joint, .. }
+    ) {
         return;
     }
     let a = out.exp.origins[prev];

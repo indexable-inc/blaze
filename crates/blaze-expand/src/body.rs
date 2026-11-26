@@ -231,6 +231,12 @@ pub fn glued_in_text(written: TokenKind, next: TokenKind) -> bool {
     if let (TokenKind::Literal { kind: LitKind::Integer, suffix_len: 0, .. }, TokenKind::Punct { char: '.', .. }) = (written, next) {
         return false;
     }
+    if matches!(
+        (written, next),
+        (TokenKind::Punct { spacing: crate::tokens::Spacing::JointHidden, .. }, TokenKind::Punct { .. })
+    ) {
+        return false;
+    }
     !matches!(written.spacing(), crate::tokens::Spacing::Alone)
 }
 
