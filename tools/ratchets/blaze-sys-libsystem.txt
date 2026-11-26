@@ -27,9 +27,14 @@ getentropy  # posix::io::getentropy: the seed of Io::rng and the maps' hasher (m
 getloadavg  # posix::proc::load_average (posix/proc/sched.rs)
 getpeereid  # posix::net::peer_ids: a Unix socket peer's uid and gid (posix/net/c.rs)
 getsockname  # posix::net::getsockname (posix/net/c.rs)
+host_page_size  # macos_proc::vm_mem_info: Mach host VM page size
+host_processor_info  # macos_proc::cpu_core_ticks: per-core Mach CPU load counters
+host_statistics64  # macos_proc::vm_mem_info: 64-bit Mach VM memory statistics
 killpg  # seatbelt: a hermetic run's process group killed whole (D177)
 listen  # posix::net::listen (posix/net/c.rs)
 localtime_r  # posix::io::localtime (posix/io/time.rs)
+mach_host_self  # macos_proc: Mach host port for CPU ticks and VM memory stats
+mach_port_deallocate  # macos_proc: release Mach host port send right
 mach_port_mod_refs  # the sampler: drop the thread port's send right (macos_sample.rs)
 mach_task_self_  # the task port, a data symbol (macos_sample.rs; posix/thread/mach.rs)
 mmap  # posix::io::mmap (posix/io/mem.rs)
@@ -47,7 +52,9 @@ posix_spawnattr_init  # posix::proc::SpawnAttr::new (posix/proc/exec.rs)
 posix_spawnattr_setflags  # posix::proc::SpawnAttr: POSIX_SPAWN_* flags (posix/proc/exec.rs)
 posix_spawnattr_setsigdefault  # posix::proc::SpawnAttr: signals reset in the child (posix/proc/exec.rs)
 posix_spawnattr_setsigmask  # posix::proc::SpawnAttr: the child's signal mask (posix/proc/exec.rs)
+proc_listallpids  # macos_proc: enumerate all active process IDs via libproc
 proc_pidinfo  # posix::thread::proc_task_info: a process's task info (posix/thread/mach.rs)
+proc_pidpath  # macos_proc::proc_exe_path: resolve process executable path via libproc
 pthread_get_stackaddr_np  # this thread's stack top: the sampler and posix::thread::this_thread_stack
 pthread_get_stacksize_np  # this thread's stack size: the sampler and posix::thread::this_thread_stack
 pthread_key_create  # posix::thread::key_create (posix/thread/pthread.rs)
@@ -73,11 +80,13 @@ sigprocmask  # posix::signal::set_mask (posix/signal.rs)
 socket  # posix::net::socket (posix/net/c.rs)
 socketpair  # posix::net::socketpair (posix/net/c.rs)
 sysconf  # posix::thread::page_size and clock_ticks_per_second (posix/thread/host.rs)
+sysctl  # macos_proc::proc_args2: read KERN_PROCARGS2 process arguments
 task_info  # posix::thread::task_basic_info_self (posix/thread/mach.rs)
 thread_get_state  # the sampler: a suspended thread's registers (macos_sample.rs)
 thread_info  # posix::thread::thread_basic_info_of (posix/thread/mach.rs)
 thread_resume  # the sampler: resume the sampled thread (macos_sample.rs)
 thread_suspend  # the sampler: stop the sampled thread (macos_sample.rs)
 uname  # posix::thread::system_name (posix/thread/host.rs)
+vm_deallocate  # macos_proc::cpu_core_ticks: free Mach VM buffer returned by host_processor_info
 waitpid  # posix::proc::wait_pid (posix/proc/wait.rs)
 write  # posix::io::write (posix/io/fd.rs)

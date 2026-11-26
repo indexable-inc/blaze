@@ -1,6 +1,6 @@
 ---
 name: runtime-code
-description: "How code inside blaze is written: no fallbacks, the one standard data structure per need (locks, maps, queues, channels, waits), sans-IO cores, named and bounded waits, hangs turned into typed failures by the watchdog, errors that name the thing, panics that fail one job, nothing thread-bound across a fiber wait. Allocation by lifetime, what is persisted and why no state lives between requests are the `memory-and-data` skill. Load before writing or reviewing Rust in blaze's crates, especially the scheduler, the request loop, a build's helper process, the store or anything concurrent."
+description: "How code inside blaze is written: no fallbacks, the one standard data structure per need (locks, maps, queues, channels, waits), sans-IO cores, all OS syscalls and kernel FFI in blaze-sys, named and bounded waits, hangs turned into typed failures by the watchdog, errors that name the thing, panics that fail one job, nothing thread-bound across a fiber wait. Allocation by lifetime, what is persisted and why no state lives between requests are the `memory-and-data` skill. Load before writing or reviewing Rust in blaze's crates, especially OS/syscall FFI, the scheduler, the request loop, a build's helper process, the store or anything concurrent."
 ---
 
 # Writing blaze's runtime code
@@ -239,5 +239,24 @@ anonymous stateful tuple like `(Option<T>, bool)` or `Option<(A, B, C)>`
 Flat>`, `Leaf`, `Budget`).
 
 See [docs/v2/plan/design/auto-perf.md](../../../docs/v2/plan/design/auto-perf.md).
+
+## syscalls-in-blaze-sys (rule 87)
+
+`crates/blaze-sys` is the one home for all OS syscalls, Mach/libproc/sysctl/POSIX/Windows kernel
+FFI, and raw kernel struct layouts (`one-concept-one-home`; Linux via raw syscalls with no libc,
+macOS via `libSystem`, Windows via `ntdll`/`kernel32`). Every operation in `blaze-sys` is
+`#![no_std]`, zero-alloc, and typed per operation (`#[blaze::noalloc]`, `#[blaze::nopanic]`,
+returning `Result<T, Errno>`), never a raw passthrough or implicit retry. App, runtime, and driver
+crates MUST NOT declare inline `extern "C"` kernel/libc/libproc/sysctl/Mach/POSIX/Windows bindings
+or duplicate raw OS struct layouts (`#[repr(C)]` `kinfo_proc`, `proc_taskinfo`, `rusage`, `stat`,
+`kevent`, etc.); when a driver needs a syscall or kernel query that `blaze-sys` does not yet expose,
+add the typed operation to `crates/blaze-sys` first (`build-the-missing-piece`). On macOS, any new
+`libSystem` import must also be recorded with its reason in `tools/ratchets/blaze-sys-libsystem.txt`
+(checked by `scripts/src/bin/sys_imports.rs`; private symbols also follow `macos-private-apis`).
+Higher-level OS framework bindings that are not kernel syscalls
+(UI/GPU/AppKit/Metal/IOKit/CoreGraphics) stay in their thin macOS host driver crate rather than
+`blaze-sys`.
+
+See [docs/v2/plan/design/sys.md](../../../docs/v2/plan/design/sys.md).
 
 <!-- End of the generated rules. Hand-written notes follow. -->

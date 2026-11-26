@@ -40,7 +40,7 @@ const skills = {
 	"runtime-code": {
 		title: "Writing blaze's runtime code",
 		description:
-			"How code inside blaze is written: no fallbacks, the one standard data structure per need (locks, maps, queues, channels, waits), sans-IO cores, named and bounded waits, hangs turned into typed failures by the watchdog, errors that name the thing, panics that fail one job, nothing thread-bound across a fiber wait. Allocation by lifetime, what is persisted and why no state lives between requests are the `memory-and-data` skill. Load before writing or reviewing Rust in blaze's crates, especially the scheduler, the request loop, a build's helper process, the store or anything concurrent.",
+			"How code inside blaze is written: no fallbacks, the one standard data structure per need (locks, maps, queues, channels, waits), sans-IO cores, all OS syscalls and kernel FFI in blaze-sys, named and bounded waits, hangs turned into typed failures by the watchdog, errors that name the thing, panics that fail one job, nothing thread-bound across a fiber wait. Allocation by lifetime, what is persisted and why no state lives between requests are the `memory-and-data` skill. Load before writing or reviewing Rust in blaze's crates, especially OS/syscall FFI, the scheduler, the request loop, a build's helper process, the store or anything concurrent.",
 	},
 	"perf-and-tracing": {
 		title: "Performance and tracing",
@@ -826,6 +826,14 @@ export const rules = [
 		link: "docs/v2/plan/design/auto-perf.md",
 		alsoIn: ["memory-and-data"],
 	},
+	{
+		id: "syscalls-in-blaze-sys",
+		skill: "runtime-code",
+		line: "Every OS syscall, Mach/libproc/sysctl/POSIX FFI, and kernel struct lives in blaze-sys, never inline.",
+		info: "`crates/blaze-sys` is the one home for all OS syscalls, Mach/libproc/sysctl/POSIX/Windows kernel FFI, and raw kernel struct layouts (`one-concept-one-home`; Linux via raw syscalls with no libc, macOS via `libSystem`, Windows via `ntdll`/`kernel32`). Every operation in `blaze-sys` is `#![no_std]`, zero-alloc, and typed per operation (`#[blaze::noalloc]`, `#[blaze::nopanic]`, returning `Result<T, Errno>`), never a raw passthrough or implicit retry. App, runtime, and driver crates MUST NOT declare inline `extern \"C\"` kernel/libc/libproc/sysctl/Mach/POSIX/Windows bindings or duplicate raw OS struct layouts (`#[repr(C)]` `kinfo_proc`, `proc_taskinfo`, `rusage`, `stat`, `kevent`, etc.); when a driver needs a syscall or kernel query that `blaze-sys` does not yet expose, add the typed operation to `crates/blaze-sys` first (`build-the-missing-piece`). On macOS, any new `libSystem` import must also be recorded with its reason in `tools/ratchets/blaze-sys-libsystem.txt` (checked by `scripts/src/bin/sys_imports.rs`; private symbols also follow `macos-private-apis`). Higher-level OS framework bindings that are not kernel syscalls (UI/GPU/AppKit/Metal/IOKit/CoreGraphics) stay in their thin macOS host driver crate rather than `blaze-sys`.",
+		reason: "2026-11-25: inline `extern \"C\"` libproc/sysctl/Mach declarations and duplicated raw kernel struct layouts crept into shell/driver crates instead of going through `crates/blaze-sys` (`docs/v2/plan/design/sys.md`). Centralizing all OS syscalls and kernel ABI layouts in `blaze-sys` keeps `#![no_std]`/zero-alloc guarantees, symbol ratchets, and struct layout verification in one place.",
+		link: "docs/v2/plan/design/sys.md",
+	},
 ] as const satisfies readonly Rule[];
 
 /**
@@ -840,7 +848,7 @@ For Codex code review on pull requests. They add to the harnesses and a maintain
 - **Correctness.** Flag a change that can make a program run incorrectly by Rust's semantics, or stop one the pinned nightly accepts from building (layout, ABI, drop order, overflow, const eval, trait resolution, MIR passes, borrowck, linking), unless rustc is wrong there, the change says so and a test shows it. Refusing a rustc soundness hole by name is correct; an opt-in extension changes no program that does not use it.
 - **Fallbacks.** Flag a fallback or a retry: another route taken quietly when blaze can't do something (rustc or cargo, a whole rebuild for a refused patch, a slower backend, an older record, a second try). Safe path: an error naming what and where.
 - **Keys.** Flag a key that misses an input of its value (the text, what a name resolves to, cfg, features, target, toolchain, a type's layout, a late input such as \`env!\`) or holds anything of the machine (a path, a host name, a time, an address).
-- **Unsafe.** Flag unsafe code (the loader, the patcher, the launcher) resting on an assumption no comment states.
+- **Unsafe.** Flag unsafe code (loader, patcher, launcher) whose assumption no comment states.
 - **Durability and concurrency.** Flag a change to concurrent, durable, crash-recovering, billing or deleting code (atomics, locks, a sync, the generation flip, compaction) without a DST that crashes, fails syncs and interleaves it, with an oracle and a planted bug (\`dst-not-review\`); reasoning is a lead, not a substitute.
 - **Sandbox.** Flag user code (build scripts, proc macros, sandboxed tests) run outside the sandbox by default, or a wider sandbox (writes outside \`OUT_DIR\`, network, new syscalls or paths) not through a documented opt-out.
 - **Trust.** Flag bytes trusted unverified: a fetched record mapped before its signed statement, digest and size limits are checked; a shared namespace written by anything but a trusted builder (CI, the remote workers); private code, read lists or names leaving their namespace; a path escaping its directory; a socket other users can reach; network CBOR decoded without limits.

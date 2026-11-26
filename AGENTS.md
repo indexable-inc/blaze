@@ -100,6 +100,7 @@ covers. Numbers are stable ids, not an order. Edit tools/agents/rules.ts, run it
 - **44. deadline-waits**: Every kernel wait goes through `blaze_core::wait` with a deadline; a fiber parks on the scheduler.
 - **45. macos-private-apis**: On macOS use a private API where it is better; comment which and why; test its symbol exists.
 - **75. nothing-ambient**: Pass in and name the allocator, clock, environment, randomness, hash seed and IO; no hidden default.
+- **87. syscalls-in-blaze-sys**: Every OS syscall, Mach/libproc/sysctl/POSIX FFI, and kernel struct lives in blaze-sys, never inline.
 
 ### Testing and proof (skill `testing`)
 - **23. test-the-cause**: Test a causal claim by removing the cause and watching the effect go.
@@ -183,8 +184,7 @@ For Codex code review on pull requests. They add to the harnesses and a maintain
 - **Keys.** Flag a key that misses an input of its value (the text, what a name resolves to, cfg,
   features, target, toolchain, a type's layout, a late input such as `env!`) or holds anything of
   the machine (a path, a host name, a time, an address).
-- **Unsafe.** Flag unsafe code (the loader, the patcher, the launcher) resting on an assumption no
-  comment states.
+- **Unsafe.** Flag unsafe code (loader, patcher, launcher) whose assumption no comment states.
 - **Durability and concurrency.** Flag a change to concurrent, durable, crash-recovering, billing or
   deleting code (atomics, locks, a sync, the generation flip, compaction) without a DST that
   crashes, fails syncs and interleaves it, with an oracle and a planted bug (`dst-not-review`);
