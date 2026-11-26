@@ -89,7 +89,7 @@ fn name_of(program: &str) -> &str {
 /// Normalizes a path under `out_dir`, collapsing `.` and repeated `/` separators and rejecting
 /// `..` traversal or trailing directory slashes, so `-o /out/./flag_check /out/./flag_check.c`
 /// resolves to the exact same `OUT_DIR`-relative key (`flag_check.c`) as the sandbox filesystem.
-fn normalize_under_out_dir<'a>(path: &str, out_dir: &str, alloc: Alloc<'a>) -> Option<AString<'a>> {
+pub fn normalize_under_out_dir<'a>(path: &str, out_dir: &str, alloc: Alloc<'a>) -> Option<AString<'a>> {
     let trimmed_out = out_dir.trim_end_matches('/');
     if trimmed_out.is_empty() {
         return None;

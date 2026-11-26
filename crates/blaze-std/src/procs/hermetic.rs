@@ -832,6 +832,7 @@ pub struct HermeticSpec<'a> {
     streams: HermeticStreams,
     level: Level,
     report: ReportSpec<'a>,
+    #[cfg(target_os = "linux")]
     arg0: Option<&'a str>,
     #[cfg(target_os = "linux")]
     verified_exec: Option<&'a VerifiedExec>,
@@ -952,20 +953,24 @@ impl<'a> HermeticSpec<'a> {
             streams: opts.streams,
             level: opts.level,
             report: opts.report,
+            #[cfg(target_os = "linux")]
             arg0: None,
             #[cfg(target_os = "linux")]
             verified_exec: None,
         })
     }
 
-    /// Overrides the child's `argv[0]` while keeping the executed binary bound to `program` (or
-    /// `verified_exec`). Used so driver aliases (`cc`, `c++`, `gcc`) emit diagnostics under the
-    /// requested driver spelling without rewriting captured output streams.
+    /// Overrides the child's `argv[0]` on Linux (where `Landlock` launches the target directly via
+    /// `execve` / `execveat` without a wrapper binary) while keeping the executed binary bound to
+    /// `program` (or `verified_exec`). Used so driver aliases (`cc`, `c++`, `gcc`) emit diagnostics
+    /// under the requested driver spelling without rewriting captured output streams.
+    #[cfg(target_os = "linux")]
     pub fn with_arg0(mut self, arg0: &'a str) -> Self {
         self.arg0 = Some(arg0);
         self
     }
 
+    #[cfg(target_os = "linux")]
     pub fn arg0(&self) -> Option<&'a str> {
         self.arg0
     }

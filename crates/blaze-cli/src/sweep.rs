@@ -50,8 +50,9 @@ struct FactFiles<'a> {
     /// `cc-probe` leaf row is followed).
     home_path: Option<&'a str>,
     /// Lazy active SDK identity digest (`facts::sdk_id_digest`): resolved at most once when a
-    /// `cc-probe` leaf row is actually followed (zero overhead on pure-Rust workspaces).
-    sdk_digest: Option<&'a dyn Fn() -> [u8; 32]>,
+    /// `cc-probe` leaf row is actually followed (zero overhead on pure-Rust workspaces). Real
+    /// SDK resolution failures propagate as `Err(CliError)` instead of substituting an empty SDK.
+    sdk_digest: Option<&'a dyn Fn() -> Result<[u8; 32], CliError>>,
     cached_sdk: Option<[u8; 32]>,
     #[cfg(target_os = "linux")]
     root_reader: Option<bstd::procs::hermetic::RootReader>,
@@ -152,16 +153,16 @@ fn read_c_probe_reply_with(
 }
 
 impl<'a> FactFiles<'a> {
-    fn active_sdk_digest(&mut self) -> [u8; 32] {
+    fn active_sdk_digest(&mut self) -> Result<[u8; 32], CliError> {
         if let Some(cached) = self.cached_sdk {
-            return cached;
+            return Ok(cached);
         }
         let digest = match self.sdk_digest {
-            Some(resolve) => resolve(),
+            Some(resolve) => resolve()?,
             None => blaze_build_script::facts::sdk_id_digest(""),
         };
         self.cached_sdk = Some(digest);
-        digest
+        Ok(digest)
     }
 
     fn active_answerer_id(&mut self, alloc: blaze_own::Alloc<'_>) -> Result<ContentId, CliError> {
@@ -213,7 +214,7 @@ impl<'a> FactFiles<'a> {
             && let Some(parsed) = blaze_build_script::facts::parse_cc_probe_subject(subject)
             && let Some(key_hex) = subject.rsplit('\n').next()
         {
-            let active_sdk = self.active_sdk_digest();
+            let active_sdk = self.active_sdk_digest()?;
             let active_answerer = self.active_answerer_id(alloc)?;
             return read_c_probe_reply(self.home, parsed, key_hex, &active_answerer, &active_sdk, alloc);
         }
@@ -1253,7 +1254,7 @@ impl<S: Stamps> Follow<S> {
         last: &Leaves<'_>,
         marked: Option<&[bool]>,
         served: Option<&mut crate::engine_script_reads::CheckoutSweep<'_, '_>>,
-        sdk_digest: Option<&dyn Fn() -> [u8; 32]>,
+        sdk_digest: Option<&dyn Fn() -> Result<[u8; 32], CliError>>,
         frame: &'f Frame,
     ) -> Result<(Followed<'f>, u32), CliError> {
         self.follow_served_by_with_sdk::<Batched>(cx, root, home, home_path, last, marked, served, sdk_digest, frame)
@@ -1288,7 +1289,7 @@ impl<S: Stamps> Follow<S> {
         last: &Leaves<'_>,
         marked: Option<&[bool]>,
         mut served: Option<&mut crate::engine_script_reads::CheckoutSweep<'_, '_>>,
-        sdk_digest: Option<&dyn Fn() -> [u8; 32]>,
+        sdk_digest: Option<&dyn Fn() -> Result<[u8; 32], CliError>>,
         frame: &'f Frame,
     ) -> Result<(Followed<'f>, u32), CliError> {
         let cx = cx.span("sweep: stat each path the last answer read, and read only what its stamp does not prove");
@@ -2106,6 +2107,18 @@ mod tests {
             assert_eq!(id_of(&path_a), dig_a, "probe A stands");
             assert_eq!(id_of(&path_b), dig_b, "probe B stands");
             assert_eq!(id_of(&path_stale), crate::engine_script_reads::NONE, "stale clang pin must invalidate");
+
+            // SDK resolution errors must propagate through sweep rather than substituting the
+            // empty SDK digest and falsely accepting stale no-SDK probe records.
+            let failing_sdk = || Err(CliError::Text { what: "simulated SDK resolution I/O failure" });
+            let err = Follow { stamps: &model, plant: Plant::None }
+                .follow_served_with_sdk(&cx, &root, Some(&home), None, &last, None, None, Some(&failing_sdk), frame)
+                .err()
+                .expect("SDK resolution failure must propagate during c-probe sweep");
+            assert!(
+                std::format!("{err}").contains("simulated SDK resolution I/O failure"),
+                "unexpected SDK sweep error: {err}"
+            );
         }
 
         // Replace ONLY probe A's sealed file with a different answer; probe B stays valid.

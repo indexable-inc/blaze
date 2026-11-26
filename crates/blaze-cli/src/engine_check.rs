@@ -621,7 +621,7 @@ impl<'f> LazySdk<'f> {
         self.resolve_raw(cx, blaze_home, wall_ns).0
     }
 
-    fn sdk_digest(&self, cx: &Cx, blaze_home: Option<&Dir<ReadWrite>>, wall_ns: u64) -> [u8; 32] {
+    fn sdk_digest(&self, cx: &Cx, blaze_home: Option<&Dir<ReadWrite>>, wall_ns: u64) -> Result<[u8; 32], CliError> {
         match self.resolve_on_demand(cx, blaze_home, wall_ns) {
             Ok(sdk) => {
                 let mut hex = [0u8; blaze_apple_sdk::SdkId::KEY_LEN * 2];
@@ -635,9 +635,14 @@ impl<'f> LazySdk<'f> {
                         *slot = if lo < 10 { b'0' + lo } else { b'a' + (lo - 10) };
                     }
                 }
-                blaze_build_script::facts::sdk_id_digest(core::str::from_utf8(&hex).unwrap_or(""))
+                Ok(blaze_build_script::facts::sdk_id_digest(core::str::from_utf8(&hex).unwrap_or("")))
             }
-            Err(_) => blaze_build_script::facts::sdk_id_digest(""),
+            Err(blaze_apple_sdk::SdkRefused::Neither { xcrun: blaze_apple_sdk::XcrunFailed::NotMacos }) => {
+                Ok(blaze_build_script::facts::sdk_id_digest(""))
+            }
+            Err(_) => Err(CliError::Text {
+                what: "cannot resolve active SDK identity while following a saved c-probe read",
+            }),
         }
     }
 }
@@ -3499,7 +3504,7 @@ fn checking<'f, 's: 'f>(
         };
         let sdk_digest_fn = || match lazy_sdk {
             Some(lazy) => lazy.sdk_digest(cx, Some(opened.home.dir()), phases.clock().wall().as_ns()),
-            None => blaze_build_script::facts::sdk_id_digest(""),
+            None => Ok(blaze_build_script::facts::sdk_id_digest("")),
         };
         let follow = sweep::Follow { stamps: FromMeta::now(phases.clock()), plant: sweep::Plant::None };
         let follow_began = phases.clock().now();
@@ -3633,7 +3638,7 @@ fn checking<'f, 's: 'f>(
         let whole_marked = whole_journal.marked(&whole_ptr.leaves, frame);
         let sdk_digest_fn = || match lazy_sdk {
             Some(lazy) => lazy.sdk_digest(cx, Some(opened.home.dir()), phases.clock().wall().as_ns()),
-            None => blaze_build_script::facts::sdk_id_digest(""),
+            None => Ok(blaze_build_script::facts::sdk_id_digest("")),
         };
         let follow = sweep::Follow { stamps: FromMeta::now(phases.clock()), plant: sweep::Plant::None };
         let follow_began = phases.clock().now();
@@ -3739,7 +3744,7 @@ fn checking<'f, 's: 'f>(
                     if let Some(new_ptr) = &pointer {
                         let sdk_digest_fn = || match lazy_sdk {
                             Some(lazy) => lazy.sdk_digest(cx, Some(opened.home.dir()), phases.clock().wall().as_ns()),
-                            None => blaze_build_script::facts::sdk_id_digest(""),
+                            None => Ok(blaze_build_script::facts::sdk_id_digest("")),
                         };
                         let follow = sweep::Follow { stamps: FromMeta::now(phases.clock()), plant: sweep::Plant::None };
                         let follow_began = phases.clock().now();

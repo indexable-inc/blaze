@@ -605,15 +605,11 @@ impl ScriptSandbox {
         {
             let mut held_bytes = |name: &str| out.get(name).and_then(|held| held.as_deref());
 
-            // Oversized probe inputs (exceeding `MAX_PROBE_INPUT_BYTES`) execute via the real
-            // compiler executor in build mode; in `CMode::Deferred` they fail explicitly rather
-            // than deferring to a fabricated exit-0 reply (rule 3).
-            if crate::probe_clang::has_oversized_probe_input(&arg_refs, script.out_dir(), &mut held_bytes) {
-                if self.script.c_mode != CMode::Deferred && self.script.spawner.is_some() {
-                    return self.spawn_executor(program, args, spawned);
-                }
+            // Oversized probe inputs (exceeding `MAX_PROBE_INPUT_BYTES`) fail explicitly with the
+            // named bound error in every `CMode` (rule 3: never silently switch executors or defer).
+            if crate::probe_clang::has_oversized_probe_input(&arg_refs, script.out_dir(), &mut held_bytes, alloc) {
                 return Err(self.refuse(Refusal::Spawn(refused(format!(
-                    "compiler probe input exceeds {} bytes (cannot defer a result-affecting probe, rule 3)",
+                    "compiler probe input exceeds {} bytes (rule 3)",
                     crate::probe_clang::MAX_PROBE_INPUT_BYTES
                 )))));
             }
@@ -639,13 +635,6 @@ impl ScriptSandbox {
                     let cache = crate::probe_clang::CacheAdapter(&*c_probes.records);
                     let resolved = match c_tasks_probe::resolve(&*c_probes.answerer, &cache, &clang, &probe, held_digest, &mut held_bytes, alloc) {
                         Ok(resolved) => resolved,
-                        Err(why)
-                            if crate::probe_clang::is_stream_overflow_error(why.as_str())
-                                && self.script.c_mode != CMode::Deferred
-                                && self.script.spawner.is_some() =>
-                        {
-                            return self.spawn_executor(program, args, spawned);
-                        }
                         Err(why) => return Err(self.refuse(Refusal::Spawn(refused(why.as_str().to_owned())))),
                     };
                     let subject = facts::cc_probe_subject(&resolved.answerer_id, &clang, &c_probes.sdk_digest, &resolved.key, alloc);

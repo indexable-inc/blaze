@@ -88,19 +88,21 @@ pub(crate) const MAX_PROBE_INPUT_BYTES: usize = 64 << 10;
 #[cfg(any(target_os = "linux", test))]
 pub(crate) const STREAM_OVERFLOW_PREFIX: &str = "c-probe stream limit exceeded:";
 
-/// Returns whether any `OUT_DIR` input file referenced by `args` exceeds `MAX_PROBE_INPUT_BYTES`.
+/// Returns whether any `OUT_DIR` input file referenced by `args` (after `normalize_under_out_dir`
+/// normalization so spellings like `/out/./flag_check.c` match the `OUT_DIR` map key) exceeds
+/// `MAX_PROBE_INPUT_BYTES`.
 #[cfg(any(target_os = "linux", test))]
-pub(crate) fn has_oversized_probe_input<'b>(
+pub(crate) fn has_oversized_probe_input<'a, 'b>(
     args: &[&str],
     out_dir: &str,
     input_bytes: &mut impl FnMut(&str) -> Option<&'b [u8]>,
+    alloc: Alloc<'a>,
 ) -> bool {
-    let prefix = out_dir.trim_end_matches('/');
     for &arg in args {
-        let Some(rest) = arg.strip_prefix(prefix).and_then(|r| r.strip_prefix('/')) else {
+        let Some(rel) = c_tasks_probe::normalize_under_out_dir(arg, out_dir, alloc) else {
             continue;
         };
-        if let Some(bytes) = input_bytes(rest)
+        if let Some(bytes) = input_bytes(rel.as_str())
             && bytes.len() > MAX_PROBE_INPUT_BYTES
         {
             return true;
@@ -110,7 +112,7 @@ pub(crate) fn has_oversized_probe_input<'b>(
 }
 
 /// Returns whether a probe answerer error indicates stream-capture overflow (`Stop::Stream`).
-#[cfg(any(target_os = "linux", test))]
+#[cfg(test)]
 pub(crate) fn is_stream_overflow_error(msg: &str) -> bool {
     msg.starts_with(STREAM_OVERFLOW_PREFIX)
 }
@@ -1990,14 +1992,17 @@ mod tests {
                 && overflow_plus_cleanup.as_str().contains("remove_dir EIO"),
             "combined error must preserve both overflow and cleanup causes: {overflow_plus_cleanup}"
         );
-        // Oversized probe inputs (> 64 KiB) and stream-overflow errors route back to the ordinary
-        // compiler path instead of aborting the build script.
+        // Oversized probe inputs (> 64 KiB) are caught even through non-canonical OUT_DIR spellings
+        // like `/out/./...` or `/out/.//...` so no probe bypasses the bounded input cap.
         let huge = std::vec![b'a'; super::MAX_PROBE_INPUT_BYTES + 1];
         let small = b"int main(void) { return 0; }";
         let mut get_huge = |rel: &str| (rel == "1detect_compiler_family.c").then_some(huge.as_slice());
         let mut get_small = |rel: &str| (rel == "1detect_compiler_family.c").then_some(small.as_slice());
-        assert!(super::has_oversized_probe_input(&["-E", "/out/1detect_compiler_family.c"], "/out", &mut get_huge));
-        assert!(!super::has_oversized_probe_input(&["-E", "/out/1detect_compiler_family.c"], "/out", &mut get_small));
+        assert!(super::has_oversized_probe_input(&["-E", "/out/1detect_compiler_family.c"], "/out", &mut get_huge, alloc));
+        assert!(super::has_oversized_probe_input(&["-E", "/out/./1detect_compiler_family.c"], "/out", &mut get_huge, alloc));
+        assert!(super::has_oversized_probe_input(&["-E", "/out/.//1detect_compiler_family.c"], "/out", &mut get_huge, alloc));
+        assert!(!super::has_oversized_probe_input(&["-E", "/out/1detect_compiler_family.c"], "/out", &mut get_small, alloc));
+        assert!(!super::has_oversized_probe_input(&["-E", "/out/./1detect_compiler_family.c"], "/out", &mut get_small, alloc));
         assert!(super::is_stream_overflow_error("c-probe stream limit exceeded: Stdout exceeded 1048576 bytes"));
         assert!(!super::is_stream_overflow_error("c-probe hermetic run failed"));
         assert_eq!(
