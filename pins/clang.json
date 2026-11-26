@@ -15,11 +15,17 @@
       "name": "LLVM-23.1.4-Linux-ARM64.tar.xz",
       "size": 1829686400,
       "sha256": "9b27cf263d711aa6ebfd4045ab241d947bd09b3cd19ffa5728f48a80c9eb3a91"
+    },
+    "x86_64-unknown-linux-gnu": {
+      "name": "LLVM-23.1.4-Linux-X64.tar.xz",
+      "size": 2017061664,
+      "sha256": "25d814fda50d5fb0084b42be09605d8b1595d49d5e2e03a3345d7e112ff6f9f3"
     }
   },
   "sysroots": {
     "aarch64-apple-darwin": "macos-sdk",
-    "aarch64-unknown-linux-gnu": null
+    "aarch64-unknown-linux-gnu": null,
+    "x86_64-unknown-linux-gnu": null
   },
   "shelf_programs_comment": "shelf-pins: each program placed on a host's shelf, pinned one by one beside the archive's digest: per program row, `member` is its path in the archive and `sha256` the member's own SHA-256; its place on the shelf is the member without the archive's top folder (one of blaze_build_script::toolchain::SHELF_MEMBERS). The step that places a program checks the extracted member against its row and refuses it by name when no row pins it or the digest differs (blaze_build_script::shelf_pins::place_member). A host tool's `shelf` names one of these rows. `names` is sorted and each row's last field.",
   "shelf_programs": {
@@ -62,6 +68,25 @@
       "llvm-nm": {
         "member": "LLVM-23.1.4-Linux-ARM64/bin/llvm-nm",
         "sha256": "83fcdd39d3222647b73a7d5c746e9568c0ffc56b4d9aecb97fa8227f50f2a22e"
+      },
+      "names": "clang-23 lld llvm-ar llvm-nm"
+    },
+    "x86_64-unknown-linux-gnu": {
+      "clang-23": {
+        "member": "LLVM-23.1.4-Linux-X64/bin/clang-23",
+        "sha256": "c336d48383874cffaab0dc4c5c359456d871f21380b746520dde5c7f4c125a67"
+      },
+      "lld": {
+        "member": "LLVM-23.1.4-Linux-X64/bin/lld",
+        "sha256": "0f8d53acaf6ff4990506a26739c12fb90315fdcc0430ec4c305ca75115774d4b"
+      },
+      "llvm-ar": {
+        "member": "LLVM-23.1.4-Linux-X64/bin/llvm-ar",
+        "sha256": "b4a89f7b23b7b8bc552a2250fc7a76557391d79dce97ab8b454ac405cd6b6a5a"
+      },
+      "llvm-nm": {
+        "member": "LLVM-23.1.4-Linux-X64/bin/llvm-nm",
+        "sha256": "fdf8ea7903fc2597095525148d9850109fa5c742974528969a6fdbae268424d2"
       },
       "names": "clang-23 lld llvm-ar llvm-nm"
     }
@@ -116,6 +141,9 @@
       "names": "hostname make nm perl sh uname"
     },
     "aarch64-unknown-linux-gnu": {
+      "names": ""
+    },
+    "x86_64-unknown-linux-gnu": {
       "names": ""
     }
   }

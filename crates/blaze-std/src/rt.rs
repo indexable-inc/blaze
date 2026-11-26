@@ -1117,40 +1117,76 @@ pub(crate) fn panicking() -> bool {
 }
 
 /// Retires an abandoned native `Io` (whose worker thread is still blocked in an uninterruptible
-/// kernel read after cancellation/deadline) onto its own bounded detached reaper thread so:
-/// 1. Caller stack-drop never hangs in `Threads::drop`,
-/// 2. Each retired driver is reclaimed independently as soon as its own syscall returns (one
-///    permanently wedged mount can never block cleanup of later retired drivers), and
-/// 3. Concurrent reaper threads are capped (`MAX_REAPERS = 64`) rather than unbounded.
+/// kernel read after cancellation/deadline) through [`crate::procs::hermetic::ReaperCore`]:
+/// 1. Caller stack-drop NEVER drops synchronously (not even at the 64-worker cap or on transient
+///    `thread::spawn` failure — overflowed items queue in `pending` and drain as soon as any
+///    reaper finishes),
+/// 2. Up to `MAX_REAPERS = 64` independent reaper threads run concurrently so one permanently
+///    wedged mount never blocks cleanup of later retired drivers, and
+/// 3. Worker count is strictly bounded by `MAX_REAPERS`.
 #[cfg(target_os = "linux")]
 pub(crate) fn retire_stalled_io(io: crate::io::Io, root: crate::fs::Dir<crate::fs::ReadOnly>) {
-    use core::sync::atomic::{AtomicUsize, Ordering};
+    use self::std::sync::{Mutex, OnceLock};
+    use crate::procs::hermetic::{ReaperCore, ReaperPlant, RetireAction};
+    type Retired = (crate::io::Io, crate::fs::Dir<crate::fs::ReadOnly>);
     const MAX_REAPERS: usize = 64;
-    static ACTIVE_REAPERS: AtomicUsize = AtomicUsize::new(0);
+    static POOL: OnceLock<Mutex<ReaperCore<Retired>>> = OnceLock::new();
 
-    struct ActiveGuard;
-    impl Drop for ActiveGuard {
-        fn drop(&mut self) {
-            ACTIVE_REAPERS.fetch_sub(1, Ordering::AcqRel);
+    let pool = POOL.get_or_init(|| Mutex::new(ReaperCore::new(MAX_REAPERS, ReaperPlant::None)));
+    let mut to_spawn = {
+        let mut guard = match pool.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match guard.retire((io, root)) {
+            RetireAction::Spawn(item) => Some(item),
+            RetireAction::Queued => None,
+            RetireAction::SyncDrop(item) => {
+                // Unreachable under `ReaperPlant::None`; keep off caller regardless.
+                guard.on_spawn_failed(item);
+                None
+            }
         }
-    }
-
-    let prev = ACTIVE_REAPERS.fetch_add(1, Ordering::AcqRel);
-    if prev < MAX_REAPERS {
+    };
+    while let Some(first) = to_spawn {
+        let first_slot = blaze_own::Arc::new_in(Mutex::new(Some(first)), blaze_own::SharedAlloc::global());
+        let worker_slot = blaze_own::Share::share(&first_slot);
         let spawned = self::std::thread::Builder::new()
             .name(self::std::string::String::from("bstd-io-reaper"))
             .spawn(move || {
-                let _guard = ActiveGuard;
-                drop(root);
-                drop(io);
+                let mut current = match worker_slot.lock() {
+                    Ok(mut g) => g.take(),
+                    Err(poisoned) => poisoned.into_inner().take(),
+                };
+                while let Some((retired_io, retired_root)) = current {
+                    drop(retired_root);
+                    drop(retired_io);
+                    let mut guard = match pool.lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    current = guard.next_after_drop();
+                }
             });
         if spawned.is_err() {
-            ACTIVE_REAPERS.fetch_sub(1, Ordering::AcqRel);
+            let returned = match first_slot.lock() {
+                Ok(mut g) => g.take(),
+                Err(poisoned) => poisoned.into_inner().take(),
+            };
+            if let Some(item) = returned {
+                let mut guard = match pool.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.on_spawn_failed(item);
+            }
+            break;
         }
-    } else {
-        ACTIVE_REAPERS.fetch_sub(1, Ordering::AcqRel);
-        drop(root);
-        drop(io);
+        let mut guard = match pool.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        to_spawn = guard.take_spawnable();
     }
 }
 

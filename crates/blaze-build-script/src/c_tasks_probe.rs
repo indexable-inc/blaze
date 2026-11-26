@@ -84,14 +84,88 @@ fn name_of(program: &str) -> &str {
     program.rsplit('/').next().unwrap_or(program)
 }
 
-/// Include/header search flags that indicate a real preprocessing job rather than a compiler
-/// family detection probe (`cc -E <OUT_DIR>/...detect_compiler_family.c`).
-fn under_out_dir<'a>(path: &'a str, out_dir: &str) -> Option<&'a str> {
-    let rel = path.strip_prefix(out_dir)?.strip_prefix('/')?;
-    if rel.is_empty() || rel.ends_with('/') || rel.split('/').any(|seg| seg == "..") {
+/// Normalizes a path under `out_dir`, collapsing `.` and repeated `/` separators and rejecting
+/// `..` traversal or trailing directory slashes, so `-o /out/./flag_check /out/./flag_check.c`
+/// resolves to the exact same `OUT_DIR`-relative key (`flag_check.c`) as the sandbox filesystem.
+fn normalize_under_out_dir<'a>(path: &str, out_dir: &str, alloc: Alloc<'a>) -> Option<AString<'a>> {
+    let trimmed_out = out_dir.trim_end_matches('/');
+    if trimmed_out.is_empty() {
         return None;
     }
-    Some(rel)
+    let rel = path.strip_prefix(trimmed_out)?.strip_prefix('/')?;
+    if rel.is_empty() || rel.ends_with('/') {
+        return None;
+    }
+    let mut normalized = String::new_in(alloc);
+    for seg in rel.split('/') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if seg == ".." {
+            return None;
+        }
+        if !normalized.is_empty() {
+            normalized.push('/');
+        }
+        normalized.push_str(seg);
+    }
+    if normalized.is_empty() {
+        return None;
+    }
+    Some(normalized)
+}
+
+/// Whether `path` lies under `out_dir` after collapsing `.` and repeated `/` separators (with no
+/// `..` traversal or trailing slash).
+fn is_under_out_dir(path: &str, out_dir: &str) -> bool {
+    let trimmed_out = out_dir.trim_end_matches('/');
+    if trimmed_out.is_empty() {
+        return false;
+    }
+    let Some(rel) = path.strip_prefix(trimmed_out).and_then(|r| r.strip_prefix('/')) else {
+        return false;
+    };
+    if rel.is_empty() || rel.ends_with('/') {
+        return false;
+    }
+    let mut saw_part = false;
+    for seg in rel.split('/') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if seg == ".." {
+            return false;
+        }
+        saw_part = true;
+    }
+    saw_part
+}
+
+/// Whether `src` is the exact `<dir>/flag_check.<c-ext>` companion to `out_path` (`<dir>/flag_check`)
+/// after collapsing `.` and repeated `/` separators in both paths.
+fn is_flag_check_companion(out_path: &str, src: &str) -> bool {
+    let Some(base) = src
+        .strip_suffix(".c")
+        .or_else(|| src.strip_suffix(".cpp"))
+        .or_else(|| src.strip_suffix(".cc"))
+        .or_else(|| src.strip_suffix(".cxx"))
+        .or_else(|| src.strip_suffix(".m"))
+        .or_else(|| src.strip_suffix(".mm"))
+    else {
+        return false;
+    };
+    if out_path.starts_with('/') != base.starts_with('/') {
+        return false;
+    }
+    let mut a = out_path.split('/').filter(|s| !s.is_empty() && *s != ".");
+    let mut b = base.split('/').filter(|s| !s.is_empty() && *s != ".");
+    loop {
+        match (a.next(), b.next()) {
+            (None, None) => return true,
+            (Some(x), Some(y)) if x == y && x != ".." => {}
+            _ => return false,
+        }
+    }
 }
 
 /// Implementation identity of compiler-probe classification, canonicalization, and input
@@ -226,6 +300,13 @@ fn is_extra_output_flag(arg: &str) -> bool {
             | "--split-dwarf"
             | "-split-dwarf-file"
             | "-split-dwarf-output"
+            | "-fno-integrated-as"
+            | "-no-integrated-as"
+            | "-fno-integrated-cc1"
+            | "-no-integrated-cc1"
+            | "-fno-integrated-cpp"
+            | "-no-integrated-cpp"
+            | "-fuse-ld"
             | "--output"
             | "-Xpreprocessor"
             | "-Xclang"
@@ -242,6 +323,7 @@ fn is_extra_output_flag(arg: &str) -> bool {
         || arg.starts_with("--split-dwarf=")
         || arg.starts_with("-split-dwarf-file=")
         || arg.starts_with("-split-dwarf-output=")
+        || arg.starts_with("-fuse-ld=")
         || arg.starts_with("-dependency-file=")
         || arg.starts_with("--dependency-file=")
         || arg.starts_with("-serialize-diagnostics=")
@@ -316,10 +398,7 @@ fn is_flag_check_probe(args: &[&str]) -> bool {
         if arg.starts_with('-') {
             continue;
         }
-        let is_companion = arg
-            .strip_prefix(out_path)
-            .is_some_and(|ext| matches!(ext, ".c" | ".cpp" | ".cc" | ".cxx" | ".m" | ".mm"));
-        if !is_companion {
+        if !is_flag_check_companion(out_path, arg) {
             return false;
         }
         saw_flag_src = true;
@@ -735,12 +814,23 @@ fn flag_takes_value(arg: &str) -> bool {
     )
 }
 
-/// Whether `arg` (and optional `next`) requests host CPU auto-detection, profile feedback input,
-/// or nondeterministic compiler timing/stat reports not determined at `Level::Inputs`
-/// (`-march=native`, `-mcpu=native`, `-mtune=native`, `--target=native`, `-Xarch_host`,
-/// `-fprofile-use*`, `-fprofile-instr-use*`, `-fprofile-sample-use*`,
-/// `-fprofile-remapping-file*`, `-fauto-profile*`, `-ftime-report*`, `-ftime-trace*`,
-/// `-fproc-stat-report*`, `-print-stats`, `--print-stats`, `-time-passes`, `-stats`).
+/// Environment variables that alter Clang's stderr/stdout/file output or dynamic-linker search
+/// outside [`CLANG_ENV`] (e.g. `CC_PRINT_OPTIONS`, `CC_PRINT_OPTIONS_FILE`, `CC_PRINT_HEADERS`,
+/// `CC_LOG_DIAGNOSTICS`, `CCC_ADD_ARGS`, `FORCE_CLANG_DIAGNOSTICS_COLOR`, `LLVM_PROFILE_FILE`,
+/// `GCOV_PREFIX*`, `LD_*`, `DYLD_*`).
+fn is_unmodeled_clang_control_env(name: &str) -> bool {
+    matches!(name, "FORCE_CLANG_DIAGNOSTICS_COLOR" | "LLVM_PROFILE_FILE" | "GCOV_PREFIX" | "GCOV_PREFIX_STRIP")
+        || name.starts_with("CC_PRINT_")
+        || name.starts_with("CC_LOG_")
+        || (name.starts_with("CCC_") && name != "CCC_OVERRIDE_OPTIONS")
+        || name.starts_with("CLANG_")
+        || name.starts_with("LD_")
+        || name.starts_with("DYLD_")
+}
+
+/// Whether `arg` (and optional `next`) requests host CPU auto-detection, ambient toolchain
+/// discovery (`-v`, `-###`, `--verbose`, `-print-*`, `--print-*`, `-dump*`), profile feedback
+/// input, or nondeterministic compiler timing/stat reports not determined at `Level::Inputs`.
 /// Deterministic instrumentation-generation flags such as `-fprofile-instr-generate` and
 /// `-fprofile-arcs` are allowed in flag-support probes.
 fn is_host_dependent_flag(arg: &str, next: Option<&str>) -> bool {
@@ -750,11 +840,19 @@ fn is_host_dependent_flag(arg: &str, next: Option<&str>) -> bool {
             | "-mcpu=native"
             | "-mtune=native"
             | "--target=native"
+            | "-v"
+            | "-###"
+            | "--verbose"
+            | "-dumpmachine"
+            | "-dumpversion"
+            | "-dumpfullversion"
             | "-print-stats"
             | "--print-stats"
             | "-time-passes"
             | "-stats"
-    ) || arg.starts_with("-Xarch_host")
+    ) || arg.starts_with("-print-")
+        || arg.starts_with("--print-")
+        || arg.starts_with("-Xarch_host")
         || arg.starts_with("-fprofile-use")
         || arg.starts_with("-fprofile-instr-use")
         || arg.starts_with("-fprofile-sample-use")
@@ -1048,7 +1146,10 @@ pub fn canonicalize<'b, 's>(
         .iter()
         .any(|(k, v)| is_path_steering_env(k.as_str()) && !v.as_str().is_empty());
     let mut has_arg_package_input = false;
-    let mut has_host_dep_arg = false;
+    let mut has_host_dep_arg = spawn
+        .env
+        .iter()
+        .any(|(k, v)| is_unmodeled_clang_control_env(k) && !v.is_empty());
     let mut prev_flag: Option<&str> = None;
     for (idx, &arg) in spawn.args.iter().enumerate() {
         let next = spawn.args.get(idx + 1).copied();
@@ -1068,6 +1169,9 @@ pub fn canonicalize<'b, 's>(
                     has_arg_package_input = true;
                     break;
                 }
+                // Separate `-D 'ROOT="/literal"'` has passed macro-token checks; preserve path
+                // literals just like attached `-DROOT="/literal"` below.
+                continue;
             }
             // Reject nested response files (e.g. `-Xassembler @args.rsp`) and assembler language
             // selection (`-x assembler`). Only `-o` may carry an `OUT_DIR` path; any other flag
@@ -1078,7 +1182,7 @@ pub fn canonicalize<'b, 's>(
                 break;
             }
             if prev == "-o" {
-                if arg != "/dev/null" && under_out_dir(arg, spawn.out_dir).is_none() {
+                if arg != "/dev/null" && !is_under_out_dir(arg, spawn.out_dir) {
                     has_arg_package_input = true;
                     break;
                 }
@@ -1114,7 +1218,7 @@ pub fn canonicalize<'b, 's>(
             prev_flag = Some(arg);
             continue;
         }
-        if !arg.starts_with('-') && arg != "/dev/null" && under_out_dir(arg, spawn.out_dir).is_none() {
+        if !arg.starts_with('-') && arg != "/dev/null" && !is_under_out_dir(arg, spawn.out_dir) {
             // Relative source path (`probe.c`) or absolute path outside `OUT_DIR`.
             has_arg_package_input = true;
             break;
@@ -1499,11 +1603,12 @@ fn asked<'b, 's>(clang: &str, spawn: &Spawn<'s>, file: &mut impl FnMut(&str) -> 
     let mut input_rels: AVec<'b, (AString<'b>, AString<'b>)> = Vec::new_in(alloc);
     let (mut inputs, mut outputs) = (0u32, 0u32);
     for arg in spawn.args.iter().copied() {
-        let Some(rel) = under_out_dir(arg, spawn.out_dir) else {
+        let Some(rel_owned) = normalize_under_out_dir(arg, spawn.out_dir, alloc) else {
             args.push(spelled_roots(arg, &roots, alloc));
             exec_args.push(spelled_segments(arg, &roots, alloc));
             continue;
         };
+        let rel = rel_owned.as_str();
         // One path, one placeholder, however often it is named.
         if let Some((spelled, _)) = paths.iter().find(|(_, actual)| *actual == arg) {
             args.push(own(spelled.as_str()));
@@ -1586,20 +1691,23 @@ fn same_key(a: &Row<'_>, b: &Row<'_>) -> bool {
         && same_set(&a.files, &b.files)
 }
 
-/// Whether `next` is a real path or option boundary immediately after a substituted root directory
-/// (never treating filename characters like `+`, `@`, or non-ASCII UTF-8 bytes as delimiters).
-fn is_root_end_boundary(next: Option<u8>) -> bool {
+/// Whether `next` is a real path or quoting boundary immediately after a substituted root directory
+/// (never treating valid Unix filename punctuation such as `+`, `:`, `;`, `,`, `=`, `@`, or
+/// non-ASCII UTF-8 bytes as delimiters).
+fn is_root_end_boundary(next: Option<u8>, allow_eq: bool) -> bool {
     match next {
         None => true,
+        Some(b'=') => allow_eq,
         Some(b) => matches!(
             b,
-            b'/' | b':' | b';' | b',' | b'=' | b' ' | b'\t' | b'\r' | b'\n' | b'"' | b'\'' | b')' | b']' | b'}' | b'>'
+            b'/' | b' ' | b'\t' | b'\r' | b'\n' | b'"' | b'\'' | b')' | b']' | b'}' | b'>'
         ),
     }
 }
 
 /// `text` split structurally into literal spans and real guest-folder placeholders.
 fn spelled_segments<'b>(text: &str, roots: &[(&str, &str)], alloc: Alloc<'b>) -> AVec<'b, Segment<'b>> {
+    let allow_eq = is_prefix_map_flag(text);
     let mut out: AVec<'b, Segment<'b>> = Vec::new_in(alloc);
     let mut lit = String::new_in(alloc);
     let bytes = text.as_bytes();
@@ -1611,7 +1719,7 @@ fn spelled_segments<'b>(text: &str, roots: &[(&str, &str)], alloc: Alloc<'b>) ->
         for (root, spelling) in roots.iter().copied() {
             if !root.is_empty()
                 && rest.starts_with(root)
-                && is_root_end_boundary(bytes.get(at + root.len()).copied())
+                && is_root_end_boundary(bytes.get(at + root.len()).copied(), allow_eq)
             {
                 if !lit.is_empty() {
                     out.push(Segment::Literal(lit));
@@ -1643,12 +1751,16 @@ fn spelled_segments<'b>(text: &str, roots: &[(&str, &str)], alloc: Alloc<'b>) ->
 
 /// `text` with each root (a guest folder) spelled as its placeholder where it stands whole.
 fn spelled_roots<'b>(text: &str, roots: &[(&str, &str)], alloc: Alloc<'b>) -> AString<'b> {
+    let allow_eq = is_prefix_map_flag(text);
     let mut out = String::new_in(alloc);
     let bytes = text.as_bytes();
     let mut at = 0;
     'scan: while at < text.len() {
         for (root, spelling) in roots.iter().copied() {
-            if !root.is_empty() && text[at..].starts_with(root) && is_root_end_boundary(bytes.get(at + root.len()).copied()) {
+            if !root.is_empty()
+                && text[at..].starts_with(root)
+                && is_root_end_boundary(bytes.get(at + root.len()).copied(), allow_eq)
+            {
                 out.push_str(spelling);
                 at += root.len();
                 continue 'scan;

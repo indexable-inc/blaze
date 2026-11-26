@@ -1670,8 +1670,10 @@ mod tests {
         let (tmp_io, tmp_dir) = crate::record::native_world(&std::env::temp_dir()).expect("tmp world");
         let tmp_fs = tmp_io.fs().expect("tmp fs");
         let tmp_cx = tmp_io.cx(super::Duration::from_secs(5), bstd::mem::TASK_FRAME).expect("tmp cx");
-        let unsupported = open_command_c_probes(&tmp_cx, &tmp_fs, &empty_home.to_string_lossy(), "x86_64-unknown-linux-gnu", None, alloc);
+        let unsupported = open_command_c_probes(&tmp_cx, &tmp_fs, &empty_home.to_string_lossy(), "riscv64-unknown-linux-gnu", None, alloc);
         assert!(matches!(unsupported, CProbeSetting::Unavailable(_)), "unsupported host must return Unavailable");
+        let x64_ready = open_command_c_probes(&tmp_cx, &tmp_fs, &empty_home.to_string_lossy(), "x86_64-unknown-linux-gnu", None, alloc);
+        assert!(matches!(x64_ready, CProbeSetting::Ready(_)), "x86_64-unknown-linux-gnu must be Ready");
         std::fs::create_dir_all(&empty_home).expect("create empty home");
         let missing = open_command_c_probes(&tmp_cx, &tmp_fs, &empty_home.to_string_lossy(), "aarch64-unknown-linux-gnu", None, alloc);
         let CProbeSetting::Ready(missing_probes) = missing else {
@@ -1847,88 +1849,98 @@ mod tests {
         #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         let (target_flags, other_flags) = (0x0003u32, 0x0000u32);
 
-        let hwcap_ext_0 = (1u64 << 62) | 0u64;
-        let entries: &[(u32, u64, &[u8], &[u8])] = &[
-            (target_flags, hwcap_ext_0, b"libz.so.1", b"/opt/custom/glibc-hwcaps/x86-64-v3/libz.so.1"),
-            (target_flags, 0, b"libz.so.1", b"/opt/custom/libz.so.1"),
-            (target_flags, 0, b"libz.so.1", b"/usr/lib/fallback/libz.so.1"),
-            (other_flags, 0, b"libz.so.1", b"/usr/lib/wrong-arch/libz.so.1"),
-        ];
-        let str_base = 48 + entries.len() * 24;
-        let mut strings = std::vec::Vec::new();
-        let mut offsets = std::vec::Vec::new();
-        for &(flags, hwcap, key, val) in entries {
-            let k_off = str_base + strings.len();
-            strings.extend_from_slice(key);
-            strings.push(0);
-            let v_off = str_base + strings.len();
-            strings.extend_from_slice(val);
-            strings.push(0);
-            offsets.push((flags, hwcap, k_off as u32, v_off as u32));
-        }
-        let v3_str_off = (str_base + strings.len()) as u32;
-        strings.extend_from_slice(b"x86-64-v3\0");
+        let build_cache = |compat_prefix: bool| -> std::vec::Vec<u8> {
+            let mut buf = std::vec::Vec::new();
+            if compat_prefix {
+                buf.extend_from_slice(b"ld.so-1.7.0\0");
+                buf.extend_from_slice(&1u32.to_le_bytes());
+                buf.extend_from_slice(&[0u8; 12]);
+                while buf.len() % 8 != 0 {
+                    buf.push(0);
+                }
+            }
+            let base_off = buf.len();
+            // Ordered v2-first (matching real glibc `ldconfig`), followed by v3, v4, and baselines.
+            let entries: &[(u32, u64, &[u8], &[u8])] = &[
+                (target_flags, (1u64 << 62) | 0, b"libz.so.1", b"/opt/custom/glibc-hwcaps/x86-64-v2/libz.so.1"),
+                (target_flags, (1u64 << 62) | 1, b"libz.so.1", b"/opt/custom/glibc-hwcaps/x86-64-v3/libz.so.1"),
+                (target_flags, (1u64 << 62) | 2, b"libz.so.1", b"/opt/custom/glibc-hwcaps/x86-64-v4/libz.so.1"),
+                (target_flags, 0, b"libz.so.1", b"/opt/custom/libz.so.1"),
+                (target_flags, 0, b"libz.so.1", b"/usr/lib/fallback/libz.so.1"),
+                (other_flags, 0, b"libz.so.1", b"/usr/lib/wrong-arch/libz.so.1"),
+            ];
+            let str_base = 48 + entries.len() * 24;
+            let mut strings = std::vec::Vec::new();
+            let mut offsets = std::vec::Vec::new();
+            for &(flags, hwcap, key, val) in entries {
+                let k_off = str_base + strings.len();
+                strings.extend_from_slice(key);
+                strings.push(0);
+                let v_off = str_base + strings.len();
+                strings.extend_from_slice(val);
+                strings.push(0);
+                offsets.push((flags, hwcap, k_off as u32, v_off as u32));
+            }
+            let mut subdir_offs = [0u32; 3];
+            for (slot, name) in subdir_offs.iter_mut().zip([b"x86-64-v2\0".as_slice(), b"x86-64-v3\0", b"x86-64-v4\0"]) {
+                *slot = (str_base + strings.len()) as u32;
+                strings.extend_from_slice(name);
+            }
+            buf.extend_from_slice(b"glibc-ld.so.cache1.1");
+            buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&(strings.len() as u32).to_le_bytes());
+            buf.resize(base_off + 48, 0);
+            for (flags, hwcap, k_off, v_off) in offsets {
+                buf.extend_from_slice(&flags.to_le_bytes());
+                buf.extend_from_slice(&k_off.to_le_bytes());
+                buf.extend_from_slice(&v_off.to_le_bytes());
+                buf.extend_from_slice(&0u32.to_le_bytes());
+                buf.extend_from_slice(&hwcap.to_le_bytes());
+            }
+            buf.extend_from_slice(&strings);
+            while buf.len() % 4 != 0 {
+                buf.push(0);
+            }
+            // Per glibc `elf/dl-cache.h`, `extension_offset` and section `offset` are file-relative
+            // (starting from byte 0 even in compat caches).
+            let ext_off = buf.len() as u32;
+            buf[base_off + 32..base_off + 36].copy_from_slice(&ext_off.to_le_bytes());
+            let data_off = ext_off + 8 + 16;
+            buf.extend_from_slice(&0xeaa4_2174u32.to_le_bytes());
+            buf.extend_from_slice(&1u32.to_le_bytes());
+            buf.extend_from_slice(&1u32.to_le_bytes());
+            buf.extend_from_slice(&0u32.to_le_bytes());
+            buf.extend_from_slice(&data_off.to_le_bytes());
+            buf.extend_from_slice(&12u32.to_le_bytes());
+            for off in subdir_offs {
+                buf.extend_from_slice(&off.to_le_bytes());
+            }
+            buf
+        };
 
-        let mut new_only = std::vec::Vec::new();
-        new_only.extend_from_slice(b"glibc-ld.so.cache1.1");
-        new_only.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-        new_only.extend_from_slice(&(strings.len() as u32).to_le_bytes());
-        new_only.resize(48, 0);
-        for (flags, hwcap, k_off, v_off) in offsets {
-            new_only.extend_from_slice(&flags.to_le_bytes());
-            new_only.extend_from_slice(&k_off.to_le_bytes());
-            new_only.extend_from_slice(&v_off.to_le_bytes());
-            new_only.extend_from_slice(&0u32.to_le_bytes());
-            new_only.extend_from_slice(&hwcap.to_le_bytes());
-        }
-        new_only.extend_from_slice(&strings);
-        while new_only.len() % 4 != 0 {
-            new_only.push(0);
-        }
-        let ext_off = new_only.len() as u32;
-        new_only[32..36].copy_from_slice(&ext_off.to_le_bytes());
-        let data_off = ext_off + 8 + 16;
-        new_only.extend_from_slice(&0xeaa4_2174u32.to_le_bytes());
-        new_only.extend_from_slice(&1u32.to_le_bytes());
-        new_only.extend_from_slice(&1u32.to_le_bytes());
-        new_only.extend_from_slice(&0u32.to_le_bytes());
-        new_only.extend_from_slice(&data_off.to_le_bytes());
-        new_only.extend_from_slice(&4u32.to_le_bytes());
-        new_only.extend_from_slice(&v3_str_off.to_le_bytes());
-
-        let mut compat = std::vec::Vec::new();
-        compat.extend_from_slice(b"ld.so-1.7.0\0");
-        compat.extend_from_slice(&1u32.to_le_bytes());
-        compat.extend_from_slice(&[0u8; 12]);
-        while compat.len() % 8 != 0 {
-            compat.push(0);
-        }
-        compat.extend_from_slice(&new_only);
-
-        let caps_v3 = bstd::procs::hermetic::HostLdCaps { at_hwcap: 0, x86_64_level: 3 };
-        let caps_base = bstd::procs::hermetic::HostLdCaps { at_hwcap: 0, x86_64_level: 1 };
+        let new_only = build_cache(false);
+        let compat = build_cache(true);
         for buf in [&new_only, &compat] {
-            // Host with x86-64-v3 selects ONLY the active hwcaps entry (never grants fallback alternatives).
-            let mut found_v3: std::vec::Vec<std::vec::Vec<u8>> = std::vec::Vec::new();
-            let ok_v3 = bstd::procs::hermetic::parse_ld_so_cache_match(buf, b"libz.so.1", &caps_v3, |path| {
-                found_v3.push(path.to_vec());
-                Ok(true)
-            })
-            .expect("v3 cache parse");
-            assert!(ok_v3);
-            assert_eq!(found_v3, std::vec![b"/opt/custom/glibc-hwcaps/x86-64-v3/libz.so.1".to_vec()]);
+            // Even when rows are ordered v2 -> v3 -> v4, ranking picks the highest supported ISA.
+            for (level, want) in [
+                (4u8, b"/opt/custom/glibc-hwcaps/x86-64-v4/libz.so.1".as_slice()),
+                (3u8, b"/opt/custom/glibc-hwcaps/x86-64-v3/libz.so.1".as_slice()),
+                (2u8, b"/opt/custom/glibc-hwcaps/x86-64-v2/libz.so.1".as_slice()),
+                (1u8, b"/opt/custom/libz.so.1".as_slice()),
+            ] {
+                let caps = bstd::procs::hermetic::HostLdCaps { at_hwcap: 0, x86_64_level: level };
+                let mut found: std::vec::Vec<std::vec::Vec<u8>> = std::vec::Vec::new();
+                let ok = bstd::procs::hermetic::parse_ld_so_cache_match(buf, b"libz.so.1", &caps, |path| {
+                    found.push(path.to_vec());
+                    Ok(true)
+                })
+                .expect("ranked cache parse");
+                assert!(ok);
+                assert_eq!(found, std::vec![want.to_vec()]);
+            }
 
-            // Baseline host skips x86-64-v3 and selects ONLY the first baseline entry (`/opt/custom`).
-            let mut found_base: std::vec::Vec<std::vec::Vec<u8>> = std::vec::Vec::new();
-            let ok_base = bstd::procs::hermetic::parse_ld_so_cache_match(buf, b"libz.so.1", &caps_base, |path| {
-                found_base.push(path.to_vec());
-                Ok(true)
-            })
-            .expect("base cache parse");
-            assert!(ok_base);
-            assert_eq!(found_base, std::vec![b"/opt/custom/libz.so.1".to_vec()]);
-
-            // Missing first entry falls through to the next eligible baseline entry.
+            // Missing highest-priority entry falls through in ranked order.
+            let caps_base = bstd::procs::hermetic::HostLdCaps { at_hwcap: 0, x86_64_level: 1 };
             let mut tried: std::vec::Vec<std::vec::Vec<u8>> = std::vec::Vec::new();
             let ok_fall = bstd::procs::hermetic::parse_ld_so_cache_match(buf, b"libz.so.1", &caps_base, |path| {
                 tried.push(path.to_vec());
@@ -1941,9 +1953,191 @@ mod tests {
                 std::vec![b"/opt/custom/libz.so.1".to_vec(), b"/usr/lib/fallback/libz.so.1".to_vec()]
             );
         }
-        let err = bstd::procs::hermetic::parse_ld_so_cache_match(b"not-an-ld-cache", b"libz.so.1", &caps_base, |_| Ok(true))
-            .expect_err("corrupt ld.so.cache must fail loudly");
+        let err = bstd::procs::hermetic::parse_ld_so_cache_match(
+            b"not-an-ld-cache",
+            b"libz.so.1",
+            &bstd::procs::hermetic::HostLdCaps { at_hwcap: 0, x86_64_level: 1 },
+            |_| Ok(true),
+        )
+        .expect_err("corrupt ld.so.cache must fail loudly");
         assert!(matches!(err, bstd::procs::hermetic::Fault::Host { code: 22, .. }));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn run_reaper_core_dst(plant: bstd::procs::hermetic::ReaperPlant) -> Result<(), &'static str> {
+        use bstd::procs::hermetic::{ReaperCore, RetireAction};
+        const MAX_WORKERS: usize = 64;
+        const ITEMS: usize = 110;
+        for seed in 0..300u64 {
+            let mut rng = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(1);
+            let mut next_u64 = || -> u64 {
+                rng = rng.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                let mut z = rng;
+                z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                z ^ (z >> 31)
+            };
+            let mut core: ReaperCore<(usize, bool)> = ReaperCore::new(MAX_WORKERS, plant);
+            // Active simulated workers: `(item_id, permanently_wedged)`.
+            let mut workers = blaze_own::Vec::new_in(blaze_own::SharedAlloc::global());
+            let mut reaped = 0usize;
+            let mut stuck_total = 0usize;
+            let mut retired = 0usize;
+            // Phase 1: Initial burst past the 64/65 cap boundary BEFORE workers complete so
+            // overflow queueing (`MAX_WORKERS + 12` concurrent retirements) and transient spawn
+            // failures are guaranteed to execute on every seed.
+            let mut spawn_item = |core: &mut ReaperCore<(usize, bool)>,
+                                  workers: &mut blaze_own::Vec<(usize, bool), blaze_own::SharedAlloc<'static>>,
+                                  item: (usize, bool),
+                                  fail_spawn: bool|
+             -> Result<(), &'static str> {
+                match core.retire(item) {
+                    RetireAction::Spawn(first) => {
+                        if fail_spawn {
+                            core.on_spawn_failed(first);
+                        } else {
+                            workers.push(first);
+                            while let Some(extra) = core.take_spawnable() {
+                                workers.push(extra);
+                            }
+                        }
+                    }
+                    RetireAction::Queued => {}
+                    RetireAction::SyncDrop(_) => {
+                        return Err("reaper oracle: caller synchronously dropped overflowed driver");
+                    }
+                }
+                if core.active() > MAX_WORKERS {
+                    return Err("reaper oracle: active reaper workers exceeded cap");
+                }
+                Ok(())
+            };
+            for step in 0..400u32 {
+                // Burst the first 76 items without completing workers to force 64 -> 65 overflow.
+                let in_burst = retired < MAX_WORKERS + 12;
+                let retire_now = in_burst || (retired < ITEMS && next_u64() % 3 != 0);
+                if retire_now {
+                    let wedged = retired == 0 || (stuck_total < 8 && next_u64() % 17 == 0);
+                    if wedged {
+                        stuck_total += 1;
+                    }
+                    let id = retired;
+                    retired += 1;
+                    // Inject deterministic transient thread-spawn failures (~12%) once past the
+                    // first 2 workers, never on the final recovery burst.
+                    let fail_spawn = retired > 2 && retired + 4 < ITEMS && next_u64() % 8 == 0;
+                    spawn_item(&mut core, &mut workers, (id, wedged), fail_spawn)?;
+                }
+                if in_burst {
+                    continue;
+                }
+                // Let a random non-wedged active worker complete its drop and loop for pending work.
+                let mut ready_idx = None;
+                let wlen = workers.len();
+                if wlen > 0 {
+                    let start = usize::try_from(next_u64()).unwrap_or(0) % wlen;
+                    for off in 0..wlen {
+                        let idx = (start + off) % wlen;
+                        if let Some(&(_, wedged)) = workers.get(idx)
+                            && !wedged
+                        {
+                            ready_idx = Some(idx);
+                            break;
+                        }
+                    }
+                }
+                if let Some(idx) = ready_idx {
+                    reaped += 1;
+                    match core.next_after_drop() {
+                        Some(next_item) => {
+                            if let Some(slot) = workers.get_mut(idx) {
+                                *slot = next_item;
+                            }
+                        }
+                        None => {
+                            let _ = workers.remove_swap(idx);
+                        }
+                    }
+                }
+                let _ = step;
+            }
+            // Recover any items queued during earlier transient spawn failures once OS thread
+            // spawn succeeds again (`take_spawnable`).
+            while let Some(item) = core.take_spawnable() {
+                workers.push(item);
+            }
+            // Drain all remaining non-wedged workers and verify every non-wedged item was reaped
+            // even while permanently wedged mounts remain blocked in their own workers.
+            loop {
+                let mut found = None;
+                for i in 0..workers.len() {
+                    if let Some(&(_, wedged)) = workers.get(i)
+                        && !wedged
+                    {
+                        found = Some(i);
+                        break;
+                    }
+                }
+                let Some(idx) = found else {
+                    break;
+                };
+                reaped += 1;
+                match core.next_after_drop() {
+                    Some(next_item) => {
+                        if let Some(slot) = workers.get_mut(idx) {
+                            *slot = next_item;
+                        }
+                    }
+                    None => {
+                        let _ = workers.remove_swap(idx);
+                    }
+                }
+            }
+            if reaped != retired - stuck_total {
+                return Err("reaper oracle: non-wedged retired drivers were blocked from cleanup");
+            }
+            if core.pending_len() != 0 {
+                return Err("reaper oracle: pending queue failed to drain despite free workers");
+            }
+            if core.active() != stuck_total {
+                return Err("reaper oracle: active worker count diverged from wedged mount count");
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reaper_core_dst_survives_overflow_spawn_failures_and_wedged_mounts() {
+        run_reaper_core_dst(bstd::procs::hermetic::ReaperPlant::None)
+            .expect("ReaperCore DST must reap all non-wedged drivers without blocking caller");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reaper_core_dst_catches_planted_sync_drop_on_overflow() {
+        let err = run_reaper_core_dst(bstd::procs::hermetic::ReaperPlant::SyncDropOnOverflow)
+            .expect_err("planted SyncDropOnOverflow must be caught");
+        assert!(err.contains("synchronously dropped"), "unexpected error: {err}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reaper_core_dst_catches_planted_single_fifo() {
+        let err = run_reaper_core_dst(bstd::procs::hermetic::ReaperPlant::SingleFifo)
+            .expect_err("planted SingleFifo must be caught");
+        assert!(err.contains("blocked from cleanup"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn x86_64_linux_clang_pin_and_shelf_program_are_present() {
+        let pin = super::toolchain::clang_pin(super::CLANG_JSON, "x86_64-unknown-linux-gnu")
+            .expect("x86_64-unknown-linux-gnu must be pinned in pins/clang.json");
+        assert_eq!(pin.name, "LLVM-23.1.4-Linux-X64.tar.xz");
+        assert_eq!(pin.size, 2_017_061_664);
+        let prog = super::shelf_pins::shelf_program(super::CLANG_JSON, "x86_64-unknown-linux-gnu", "clang-23")
+            .expect("x86_64-unknown-linux-gnu clang-23 shelf_program must be pinned");
+        assert_eq!(prog.shelf_path, "bin/clang-23");
     }
 
     #[test]

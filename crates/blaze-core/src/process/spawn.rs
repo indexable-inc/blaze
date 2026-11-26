@@ -469,36 +469,32 @@ fn clone(plan: &Plan, fds: [RawFd; 3], ask: &ChildAsk<'_>) -> io::Result<Cloned>
 /// until this returns; the child's frames go there while the calling thread waits.
 #[cfg(target_os = "linux")]
 unsafe fn clone_on(stack: *mut u8, plan: &Plan, fds: [RawFd; 3], ask: &ChildAsk<'_>) -> io::Result<Cloned> {
-    const EXEC_ARGS_CAP: usize = 1024;
-    let mut argv_buf = [blaze_sys::linux::Arg::END; EXEC_ARGS_CAP];
-    let mut envp_buf = [blaze_sys::linux::Arg::END; EXEC_ARGS_CAP];
+    let mut argv_vec = blaze_own::Vec::new_in(blaze_own::SharedAlloc::global());
+    let mut envp_vec = blaze_own::Vec::new_in(blaze_own::SharedAlloc::global());
     let exec_args = if ask.confine.and_then(|c| c.exec_fd).is_some() {
-        if plan.argv.len() > EXEC_ARGS_CAP || plan.envp.len() > EXEC_ARGS_CAP {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "execveat argv/envp exceeds cap"));
+        argv_vec.reserve(plan.argv.len());
+        for &p in &plan.argv {
+            let arg = if p.is_null() {
+                blaze_sys::linux::Arg::END
+            } else {
+                // SAFETY: `Plan` keeps every NUL-terminated argument string live until `clone_on` returns.
+                blaze_sys::linux::Arg::new(unsafe { CStr::from_ptr(p) })
+            };
+            argv_vec.push(arg);
         }
-        for (i, &p) in plan.argv.iter().enumerate() {
-            if let Some(slot) = argv_buf.get_mut(i) {
-                *slot = if p.is_null() {
-                    blaze_sys::linux::Arg::END
-                } else {
-                    // SAFETY: `Plan` keeps every NUL-terminated argument string live until `clone_on` returns.
-                    blaze_sys::linux::Arg::new(unsafe { CStr::from_ptr(p) })
-                };
-            }
+        envp_vec.reserve(plan.envp.len());
+        for &p in &plan.envp {
+            let arg = if p.is_null() {
+                blaze_sys::linux::Arg::END
+            } else {
+                // SAFETY: `Plan` keeps every NUL-terminated env string live until `clone_on` returns.
+                blaze_sys::linux::Arg::new(unsafe { CStr::from_ptr(p) })
+            };
+            envp_vec.push(arg);
         }
-        for (i, &p) in plan.envp.iter().enumerate() {
-            if let Some(slot) = envp_buf.get_mut(i) {
-                *slot = if p.is_null() {
-                    blaze_sys::linux::Arg::END
-                } else {
-                    // SAFETY: `Plan` keeps every NUL-terminated env string live until `clone_on` returns.
-                    blaze_sys::linux::Arg::new(unsafe { CStr::from_ptr(p) })
-                };
-            }
-        }
-        let argv = blaze_sys::linux::Args::new(argv_buf.get(..plan.argv.len()).unwrap_or(&[]))
+        let argv = blaze_sys::linux::Args::new(argv_vec.as_slice())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid execveat argv"))?;
-        let envp = blaze_sys::linux::Args::new(envp_buf.get(..plan.envp.len()).unwrap_or(&[]))
+        let envp = blaze_sys::linux::Args::new(envp_vec.as_slice())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid execveat envp"))?;
         Some((argv, envp))
     } else {

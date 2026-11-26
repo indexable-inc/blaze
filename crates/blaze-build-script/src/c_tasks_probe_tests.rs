@@ -609,17 +609,58 @@ fn header_search_and_package_paths_are_not_deferred_or_cached_unkeyed() {
     assert!(!is_probe("cc", &["-c", "-Xclang", "-dependency-file", "-Xclang", "/out/deps.d", "-o", "/out/flag_check", "/out/flag_check.c"]));
     assert!(!is_probe("cc", &["-c", "-g", "-gsplit-dwarf", "-o", "/out/flag_check", "/out/flag_check.c"]));
     assert!(!is_probe("cc", &["-c", "-g", "-gsplit-dwarf=split", "-o", "/out/flag_check", "/out/flag_check.c"]));
+    assert!(!is_probe("cc", &["-c", "-fno-integrated-as", "-o", "/out/flag_check", "/out/flag_check.c"]));
+    assert!(!is_probe("cc", &["-c", "-no-integrated-as", "-o", "/out/flag_check", "/out/flag_check.c"]));
+    assert!(!is_probe("cc", &["-c", "-fno-integrated-cc1", "-o", "/out/flag_check", "/out/flag_check.c"]));
+    assert!(!is_probe("cc", &["-c", "-no-integrated-cc1", "-o", "/out/flag_check", "/out/flag_check.c"]));
 
-    // Root substitution must only occur at real path/option boundaries: `+` or non-ASCII suffixes
-    // after `OUT_DIR` are distinct literals and must NOT be rewritten to `$OUT_DIR`.
+    // Ambient toolchain discovery flags (`-v`, `-###`, `-print-search-dirs`, `-print-file-name=...`)
+    // and Clang output-control environment variables (`CC_PRINT_OPTIONS`, `CC_PRINT_OPTIONS_FILE`)
+    // are refused as HostDependent before caching.
+    for disc in ["-v", "-###", "--verbose", "-print-search-dirs", "-print-file-name=libc.a"] {
+        let d_args = flag_args(disc);
+        let sp_d = Spawn { program: "cc", args: &d_args, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "macos-sdk 15.0", stdin: &[] };
+        assert_eq!(
+            canonicalize(blaze_ids::ContentId([1; 32]), &CLANG_PIN, &sp_d, files, alloc).err().expect("discovery flag").why,
+            ProbeWhy::HostDependent
+        );
+    }
+    for (env_k, env_v) in [("CC_PRINT_OPTIONS", "1"), ("CC_PRINT_OPTIONS_FILE", "/out/opts.log"), ("CC_LOG_DIAGNOSTICS", "1")] {
+        let bad_env = [("SDKROOT", SDK), (env_k, env_v)];
+        let sp_e = Spawn { program: "cc", args: &ok_args, env: &bad_env, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "macos-sdk 15.0", stdin: &[] };
+        assert_eq!(
+            canonicalize(blaze_ids::ContentId([1; 32]), &CLANG_PIN, &sp_e, files, alloc).err().expect("control env").why,
+            ProbeWhy::HostDependent
+        );
+    }
+
+    // Separate `-D 'ROOT="/literal"'` preserves path literals just like attached `-DROOT="/literal"`.
+    let sep_def = ["-c", "-D", "ROOT=\"/literal\"", "-o", "/target/debug/build/zstd-sys-1/out/flag_check", "/target/debug/build/zstd-sys-1/out/flag_check.c"];
+    let sp_sep = Spawn { program: "cc", args: &sep_def, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "macos-sdk 15.0", stdin: &[] };
+    assert!(canonicalize(blaze_ids::ContentId([1; 32]), &CLANG_PIN, &sp_sep, files, alloc).is_ok(), "separate -D path literal must be allowed");
+
+    // `OUT_DIR` paths with `.` and repeated `//` normalize before lookup and key construction.
+    let dot_args = ["-c", "-Wall", "-o", "/target/debug/build/zstd-sys-1/out/./flag_check", "/target/debug/build/zstd-sys-1/out/.//flag_check.c"];
+    assert!(is_probe("cc", &dot_args));
+    let sp_dot = Spawn { program: "cc", args: &dot_args, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "macos-sdk 15.0", stdin: &[] };
+    let canon_dot = canonicalize(blaze_ids::ContentId([1; 32]), &CLANG_PIN, &sp_dot, files, alloc).expect("normalized OUT_DIR probe");
+    assert_eq!(canon_dot.row.files.len(), 1, "normalized ./flag_check.c must resolve the OUT_DIR input digest");
+    assert_eq!(canon_dot.input_rels[0].1.as_str(), "flag_check.c");
+
+    // Root substitution must only occur at real path/quoting boundaries: filename punctuation
+    // (`+`, `:`, `;`, `,`, `=`, non-ASCII) after `OUT_DIR` must NOT be rewritten to `$OUT_DIR`.
     for literal_def in [
         "-DROOT=\"/target/debug/build/zstd-sys-1/out+suffix\"",
+        "-DROOT=\"/target/debug/build/zstd-sys-1/out:suffix\"",
+        "-DROOT=\"/target/debug/build/zstd-sys-1/out;suffix\"",
+        "-DROOT=\"/target/debug/build/zstd-sys-1/out,suffix\"",
+        "-DROOT=\"/target/debug/build/zstd-sys-1/out=suffix\"",
         "-DROOT=\"/target/debug/build/zstd-sys-1/outé\"",
     ] {
         let def_args = flag_args(literal_def);
         let sp_def = Spawn { program: "cc", args: &def_args, env: ENV, out_dir: OUT, sdk: SDK, mount: "/package", sdk_id: "macos-sdk 15.0", stdin: &[] };
         let canon = canonicalize(blaze_ids::ContentId([1; 32]), &CLANG_PIN, &sp_def, files, alloc)
-            .expect("literal macro def with +/non-ASCII suffix");
+            .expect("literal macro def with punctuation/non-ASCII suffix");
         assert!(
             canon.row.args.iter().any(|a| a.as_str() == literal_def),
             "expected `{literal_def}` to stay literal without $OUT_DIR substitution, got {:?}",

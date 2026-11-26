@@ -512,6 +512,107 @@ mod tests;
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod process_tests;
 
+/// Sans-IO coordinator for bounded independent reaper workers (`rt::retire_stalled_io`):
+/// guarantees that retiring an abandoned driver NEVER drops synchronously on the caller (even
+/// past the `max_workers` cap or on transient `thread::spawn` failure), while bounding active
+/// reaper threads and allowing up to `max_workers` independent stalled mounts to drain without
+/// head-of-line blocking each other.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReaperPlant {
+    None,
+    /// Control 1: drops overflowed items synchronously on the caller when at cap.
+    SyncDropOnOverflow,
+    /// Control 2: collapses concurrency to a single FIFO worker.
+    SingleFifo,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(PartialEq, Eq, Debug)]
+pub enum RetireAction<T> {
+    Spawn(T),
+    Queued,
+    SyncDrop(T),
+}
+
+#[cfg(target_os = "linux")]
+pub struct ReaperCore<T> {
+    max_workers: usize,
+    active: usize,
+    pending: blaze_own::VecDeque<T, blaze_own::SharedAlloc<'static>>,
+    plant: ReaperPlant,
+}
+
+#[cfg(target_os = "linux")]
+impl<T> ReaperCore<T> {
+    pub fn new(max_workers: usize, plant: ReaperPlant) -> Self {
+        Self {
+            max_workers: max_workers.max(1),
+            active: 0,
+            pending: blaze_own::VecDeque::new_in(blaze_own::SharedAlloc::global()),
+            plant,
+        }
+    }
+
+    fn effective_cap(&self) -> usize {
+        match self.plant {
+            ReaperPlant::SingleFifo => 1,
+            ReaperPlant::None | ReaperPlant::SyncDropOnOverflow => self.max_workers,
+        }
+    }
+
+    pub fn active(&self) -> usize {
+        self.active
+    }
+
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    pub fn retire(&mut self, item: T) -> RetireAction<T> {
+        let cap = self.effective_cap();
+        if self.active < cap {
+            self.active += 1;
+            if let Some(older) = self.pending.pop_front() {
+                self.pending.push_back(item);
+                return RetireAction::Spawn(older);
+            }
+            return RetireAction::Spawn(item);
+        }
+        if self.plant == ReaperPlant::SyncDropOnOverflow {
+            return RetireAction::SyncDrop(item);
+        }
+        self.pending.push_back(item);
+        RetireAction::Queued
+    }
+
+    pub fn on_spawn_failed(&mut self, item: T) {
+        self.active = self.active.saturating_sub(1);
+        self.pending.push_back(item);
+    }
+
+    /// Pops another queued item to spawn a reaper worker for whenever `active < cap` (used to
+    /// recover items queued during an earlier transient `thread::spawn` failure).
+    pub fn take_spawnable(&mut self) -> Option<T> {
+        let cap = self.effective_cap();
+        if self.active < cap
+            && let Some(item) = self.pending.pop_front()
+        {
+            self.active += 1;
+            return Some(item);
+        }
+        None
+    }
+
+    pub fn next_after_drop(&mut self) -> Option<T> {
+        if let Some(next) = self.pending.pop_front() {
+            return Some(next);
+        }
+        self.active = self.active.saturating_sub(1);
+        None
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub use landlock::{HostLdCaps, feed_nix_runtime_closure, feed_nix_runtime_closure_with, parse_ld_so_cache_match};
 pub use execution::{Absent, BlazeLauncher, EXECUTION_BACKENDS, ExecutionBackend, HypervisorSandbox};
