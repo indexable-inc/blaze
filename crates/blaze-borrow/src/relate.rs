@@ -1072,8 +1072,15 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                     if matches!(na, PNode::Alias { .. }) || matches!(nb, PNode::Alias { .. }) {
                         let mut ba = MOST_WALK_STEPS;
                         let mut bb = MOST_WALK_STEPS;
-                        if self.inert_norm(a, 0, &mut ba)? && self.inert_norm(b, 0, &mut bb)? {
+                        if self.inert(a, 0, &mut ba)? && self.inert(b, 0, &mut bb)? {
                             continue;
+                        }
+                        if self.fits(a)? == SlotCount::ZERO && self.fits(b)? == SlotCount::ZERO {
+                            let mut ba = MOST_WALK_STEPS;
+                            let mut bb = MOST_WALK_STEPS;
+                            if self.inert_norm(a, 0, &mut ba)? && self.inert_norm(b, 0, &mut bb)? {
+                                continue;
+                            }
                         }
                     }
                     if let PNode::Alias { trait_, name, .. } = na {
@@ -1284,13 +1291,13 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         if kids.len() > 0 {
             let (raw_sub, mut rem) = self.kid(s, &kids, args_rest, 0)?;
             if let Resolved::Side(raw_sub) = self.resolve(raw_sub)? {
-                if let Some(val) = self.try_normalize_non_impl(s, kids.len(), raw_sub, trait_, name)? {
-                    return Ok(val);
-                }
                 let (subject, changed) = self.try_normalize_subject_flag(raw_sub, depth);
                 norm_subject = Some(subject);
+                if let Some(val) = self.try_normalize_non_impl(s, kids.len(), subject, trait_, name)? {
+                    return Ok(val);
+                }
                 if (changed || subject.ty != raw_sub.ty)
-                    && let Some(val) = self.try_normalize_non_impl(s, kids.len(), subject, trait_, name)?
+                    && let Some(val) = self.try_normalize_non_impl(s, kids.len(), raw_sub, trait_, name)?
                 {
                     return Ok(val);
                 }
@@ -2697,6 +2704,14 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
     /// EvmTypesHost>::Tx>` -> `Recovered<TempoTxEnv>`) while checking whether a type carries zero
     /// lifetimes and zero caller type parameters.
     fn inert_norm(&mut self, s: Side<'c>, depth: u32, budget: &mut u32) -> Result<bool, Refused> {
+        let mut fast_b = *budget;
+        if self.inert(s, depth, &mut fast_b)? {
+            *budget = fast_b;
+            return Ok(true);
+        }
+        if self.fits(s)? != SlotCount::ZERO {
+            return Ok(false);
+        }
         const MAX_FRAMES: usize = 257;
         #[derive(Clone, Copy)]
         struct InertFrame<'c> {
@@ -2705,43 +2720,67 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             next_k: u32,
             depth: u32,
         }
+        let env_mark = self.envs.len();
+        let saved_budget = self.budget;
+        let seen_mark = self.impl_seen.len();
         let mut stack: [Option<InertFrame<'c>>; MAX_FRAMES] = [None; MAX_FRAMES];
         let mut sp: usize = 0;
         let mut enter = Some((s, depth));
-        loop {
+        let res = loop {
             if let Some((cur, d)) = enter.take() {
                 if d > MOST_WALK_DEPTH || *budget == 0 {
-                    return Err(self.malformed(cur.ty, Bad::StepBound));
+                    break Ok(false);
                 }
                 *budget -= 1;
-                let cur = match self.resolve(cur)? {
-                    Resolved::Side(s) => s,
-                    Resolved::Unbound { .. } => return Ok(false),
+                let cur = match self.resolve(cur) {
+                    Ok(Resolved::Side(s)) => s,
+                    Ok(Resolved::Unbound { .. }) => break Ok(false),
+                    Err(e) => break Err(e),
                 };
-                let cur = if matches!(self.node(cur)?, PNode::Alias { .. }) {
+                match self.fits(cur) {
+                    Ok(n) if n == SlotCount::ZERO => {}
+                    Ok(_) => break Ok(false),
+                    Err(e) => break Err(e),
+                }
+                let node = match self.node(cur) {
+                    Ok(n) => n,
+                    Err(e) => break Err(e),
+                };
+                let cur = if matches!(node, PNode::Alias { .. }) {
+                    let mut kb = *budget;
+                    if self.inert(cur, d, &mut kb).unwrap_or(false) {
+                        *budget = kb;
+                        continue;
+                    }
                     self.try_normalize_subject(cur, d)
                 } else {
                     cur
                 };
-                if self.fits(cur)? != SlotCount::ZERO {
-                    return Ok(false);
+                match self.fits(cur) {
+                    Ok(n) if n == SlotCount::ZERO => {}
+                    Ok(_) => break Ok(false),
+                    Err(e) => break Err(e),
                 }
-                match self.node(cur)? {
-                    PNode::Param(_) | PNode::Infer | PNode::Error => return Ok(false),
-                    PNode::Closure { .. } | PNode::Future(..) | PNode::Coroutine { .. } => {
-                        let Slots::Caller(_) = cur.slots else { return Ok(false) };
+                match self.node(cur) {
+                    Ok(PNode::Param(_) | PNode::Infer | PNode::Error) => break Ok(false),
+                    Ok(PNode::Closure { .. } | PNode::Future(..) | PNode::Coroutine { .. }) => {
+                        let Slots::Caller(_) = cur.slots else { break Ok(false) };
                         let owner: &'c dyn Owner = self.owner;
                         if !matches!(owner.body_params(cur.ty), Some(p) if p.is_empty()) {
-                            return Ok(false);
+                            break Ok(false);
                         }
                         continue;
                     }
-                    _ => {}
+                    Ok(_) => {}
+                    Err(e) => break Err(e),
                 }
-                let kids = self.kids_of(cur)?;
+                let kids = match self.kids_of(cur) {
+                    Ok(k) => k,
+                    Err(e) => break Err(e),
+                };
                 if kids.len() > 0 {
                     let Some(slot) = stack.get_mut(sp) else {
-                        return Err(self.malformed(cur.ty, Bad::StepBound));
+                        break Ok(false);
                     };
                     *slot = Some(InertFrame { s: cur, rest: cur.slots, next_k: 0, depth: d });
                     sp += 1;
@@ -2749,15 +2788,21 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 continue;
             }
             let Some(top_idx) = sp.checked_sub(1) else {
-                return Ok(true);
+                break Ok(true);
             };
             let Some(Some(mut frame)) = stack.get(top_idx).copied() else {
-                return Err(self.malformed(s.ty, Bad::StepBound));
+                break Ok(false);
             };
-            let kids = self.kids_of(frame.s)?;
+            let kids = match self.kids_of(frame.s) {
+                Ok(k) => k,
+                Err(e) => break Err(e),
+            };
             if frame.next_k < kids.len() {
                 let k = frame.next_k;
-                let (c, r) = self.kid(frame.s, &kids, frame.rest, k)?;
+                let (c, r) = match self.kid(frame.s, &kids, frame.rest, k) {
+                    Ok(cr) => cr,
+                    Err(e) => break Err(e),
+                };
                 frame.rest = r;
                 frame.next_k = k + 1;
                 if let Some(slot) = stack.get_mut(top_idx) {
@@ -2767,7 +2812,11 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             } else {
                 sp = top_idx;
             }
-        }
+        };
+        self.impl_seen.truncate(seen_mark);
+        self.truncate_envs(env_mark);
+        self.budget = saved_budget.saturating_sub(1);
+        res
     }
 
     fn inert(&self, s: Side<'c>, depth: u32, budget: &mut u32) -> Result<bool, Refused> {
@@ -2996,12 +3045,9 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             Resolved::Side(s) => s,
             Resolved::Unbound { param, .. } => return Err(self.malformed(subject.ty, Bad::Unconstrained { index: param })),
         };
+        let (subject, sub_changed) = self.try_normalize_subject_flag(raw_subject, 0);
         self.bound_len = 0;
         self.hr_len = 0;
-        if let Some(norm) = self.try_normalize_non_impl(proj, last, raw_subject, trait_, name)? {
-            return self.walk(norm, term, Variance::In, 1);
-        }
-        let (subject, sub_changed) = self.try_normalize_subject_flag(raw_subject, 0);
         // Builtin `FnOnce::Output` on `FnDef`, `FnPtr`, or caller `Closure`.
         if self.selected.is_fn_trait(trait_) && last == 2 {
             let (_, mut prest) = proj.slots.split(own).ok_or(self.malformed(proj.ty, Bad::StepBound))?;
@@ -3012,8 +3058,11 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 return Ok(());
             }
         }
+        if let Some(norm) = self.try_normalize_non_impl(proj, last, subject, trait_, name)? {
+            return self.walk(norm, term, Variance::In, 1);
+        }
         if (sub_changed || subject.ty != raw_subject.ty)
-            && let Some(norm) = self.try_normalize_non_impl(proj, last, subject, trait_, name)?
+            && let Some(norm) = self.try_normalize_non_impl(proj, last, raw_subject, trait_, name)?
         {
             return self.walk(norm, term, Variance::In, 1);
         }
@@ -3428,8 +3477,15 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             && matches!(self.node(c0), Ok(PNode::Alias { .. }))
             && self.fits(c0).is_ok()
         {
+            let env_mark = self.envs.len();
+            let saved_budget = self.budget;
+            let seen_mark = self.impl_seen.len();
             let (c_norm, changed) = self.try_normalize_subject_flag(c0, 0);
-            if changed && self.erased_sides(c_norm, subject) {
+            let matched = changed && self.erased_sides(c_norm, subject);
+            self.impl_seen.truncate(seen_mark);
+            self.truncate_envs(env_mark);
+            self.budget = saved_budget.saturating_sub(1);
+            if matched {
                 return true;
             }
         }
@@ -3837,6 +3893,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             // is also an ancestor whose trait bounds constrain `cur` even after `blaze-typeck`
             // normalized `<X as Tr>::Assoc` to `cur` in body types.
             if !self.in_erased_norm
+                && matches!(self.node(cur), Ok(PNode::Alias { .. } | PNode::Param(_)))
                 && let Some(oenv) = self.envs.owner_env()
             {
                 let owner: &'c dyn Owner = self.owner;
