@@ -58,10 +58,26 @@ const EXPORT_FRAME_RESERVE: usize = 2 << 30;
 const BUILD_SHAPE: &str = "blaze build: the code of a program 1";
 
 /// Computes the checkout-independent program root shape for `blaze build` (`RootName::program`).
-/// Includes `(package, bin, root)` so two unrelated projects with `src/main.rs` stay disjoint
-/// while two worktrees of the same binary share one root (rules 25, 30, 36).
-fn build_program_shape(picked: &run_package::Program<'_>) -> blaze_ids::ContentId {
+/// Distinct from `engine_start.rs`'s `RUN_SHAPE`, and includes `(workspace, program_crate,
+/// package, bin, root)` without any checkout path so two unrelated workspaces with the same
+/// package/bin/root stay disjoint while two worktrees of the same repository share one root
+/// (rules 25, 30, 36).
+fn build_program_shape(
+    picked: &run_package::Program<'_>,
+    workspace: Option<blaze_ids::ContentId>,
+    program_crate: blaze_id::CrateItemKey,
+) -> blaze_ids::ContentId {
     let mut h = blaze_ids::Hasher::new(BUILD_SHAPE);
+    match workspace {
+        Some(id) => {
+            h.update(&[1]);
+            h.id(&id);
+        }
+        None => {
+            h.update(&[0]);
+        }
+    }
+    h.id(&program_crate.0);
     h.part(picked.package.as_bytes());
     h.part(picked.bin.as_bytes());
     h.part(picked.root.as_bytes());
@@ -130,6 +146,8 @@ pub enum ExportCliError {
     Materialize { symbol: [u8; 32], shown: AString<'static> },
     /// `blaze_export::export` refused the program.
     Export(ExportError),
+    /// Persisting the closing program or toolchain store root failed (Rule 3: never silently drop roots).
+    KeepRoots { class: &'static str, shown: AString<'static> },
     /// Invalid output path supplied via `-o` / `--output`.
     BadOutputPath { path: AString<'static>, why: OutputPathIssue },
     /// Opening the output folder failed.
@@ -178,6 +196,7 @@ impl fmt::Display for ExportCliError {
             ExportCliError::Position { symbol, shown } => write!(f, "blaze build: resolving source position in {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
             ExportCliError::Materialize { symbol, shown } => write!(f, "blaze build: materializing position-free record {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
             ExportCliError::Export(error) => write!(f, "blaze build: {error}"),
+            ExportCliError::KeepRoots { class, shown } => write!(f, "blaze build: keeping {class} root failed: {} (engine_export.rs)", shown.as_str()),
             ExportCliError::BadOutputPath { path, why } => write!(f, "blaze build: invalid output path `{}`: {why} (engine_export.rs)", path.as_str()),
             ExportCliError::OutputHome(error) => write!(f, "blaze build: output directory: {error} (engine_export.rs)"),
             ExportCliError::OutputPath(error) => write!(f, "blaze build: output path: {error} (engine_export.rs)"),
@@ -648,7 +667,8 @@ fn export_program<'f>(
     let ids_ns = phases.since(began_ids);
     let ids_line = ids.line(&asked, ids_ns);
     let cert = crate::engine_start::body_ids_cert(standing.root, standing.scope);
-    let build_shape = build_program_shape(picked);
+    let workspace_id = crate::engine_start::workspace_anchor_id(list, alloc);
+    let build_shape = build_program_shape(picked, workspace_id, list.key(at));
     let ids_table = blaze_cas::Key(crate::run_ids::table_key(cert, standing.toolchain, &standing.tools).0);
     let today = crate::start_list::Today {
         certificate: crate::start_list::Certificate::of_answer(&standing),
@@ -1095,20 +1115,33 @@ fn export_program<'f>(
     let mut exe_bytes: AVec<'_, u8> = Vec::new_in(alloc);
     let exported = blaze_export::export(&program_in, platform, &mut exe_bytes, alloc).map_err(|error| box_err(ExportCliError::Export(error), heap))?;
 
-    // Release immutable borrows of `codes` before persisting program and toolchain roots.
+    // Release immutable borrows of `codes` before restoring any concurrently swept entries and
+    // persisting closing program + toolchain roots (Rule 3: refuse instead of silently dropping).
     drop(functions);
     drop(data);
     drop(seen_data);
+    codes.ensure_persisted().map_err(|why| {
+        box_err(
+            ExportCliError::KeepRoots { class: "program code entries", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+            heap,
+        )
+    })?;
     let walked = codes.reached();
     let toolchain_made = codes.toolchain_made();
     drop(codes);
     let kept_roots = keep_export_roots(lent, &today, builder.toolchain, &walked, &toolchain_made);
-    if let Err(why) = kept_roots.program {
-        standing.err.line(cx, format_args!("blaze build: warning: program code was not kept: {why}")).map_err(CliError::Out)?;
-    }
-    if let Err(why) = kept_roots.toolchain {
-        standing.err.line(cx, format_args!("blaze build: warning: toolchain code was not kept: {why}")).map_err(CliError::Out)?;
-    }
+    kept_roots.program.map_err(|why| {
+        box_err(
+            ExportCliError::KeepRoots { class: "program code", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+            heap,
+        )
+    })?;
+    kept_roots.toolchain.map_err(|why| {
+        box_err(
+            ExportCliError::KeepRoots { class: "toolchain code", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+            heap,
+        )
+    })?;
 
     write_executable(cx, fs, output_path, exe_bytes.as_slice(), heap)?;
     Ok(ExportSummary {
@@ -1475,10 +1508,10 @@ mod tests {
     }
 
     #[test]
-    fn build_program_shape_is_disjoint_from_run_and_across_packages() {
+    fn build_program_shape_is_disjoint_from_run_and_across_workspaces() {
         let app_a = run_package::Program {
-            package: "app-a",
-            bin: "app-a",
+            package: "app",
+            bin: "app",
             manifest: "Cargo.toml",
             root: "src/main.rs",
             edition: "2024",
@@ -1490,10 +1523,33 @@ mod tests {
             root: "src/main.rs",
             edition: "2024",
         };
+        let ws_1 = Some(blaze_ids::ContentId::of("ws test", b"workspace-1"));
+        let ws_2 = Some(blaze_ids::ContentId::of("ws test", b"workspace-2"));
+        let crate_1 = blaze_id::CrateItemKey(blaze_ids::ContentId::of("crate test", b"crate-1"));
+        let crate_2 = blaze_id::CrateItemKey(blaze_ids::ContentId::of("crate test", b"crate-2"));
+
         let run_shape = blaze_ids::ContentId::of("blaze run: the start list of a program 1", app_a.root.as_bytes());
-        assert_ne!(build_program_shape(&app_a), run_shape, "blaze build root must not overwrite blaze run root");
-        assert_ne!(build_program_shape(&app_a), build_program_shape(&app_b), "distinct packages with src/main.rs must not collide");
-        assert_eq!(build_program_shape(&app_a), build_program_shape(&app_a), "same program across worktrees shares one root");
+        assert_ne!(build_program_shape(&app_a, ws_1, crate_1), run_shape, "blaze build root must not overwrite blaze run root");
+        assert_ne!(
+            build_program_shape(&app_a, ws_1, crate_1),
+            build_program_shape(&app_a, ws_2, crate_1),
+            "unrelated workspaces with identical package/bin/root must not clobber each other"
+        );
+        assert_ne!(
+            build_program_shape(&app_a, ws_1, crate_1),
+            build_program_shape(&app_a, ws_1, crate_2),
+            "unrelated single-crate projects with different crate identity must not collide"
+        );
+        assert_ne!(
+            build_program_shape(&app_a, ws_1, crate_1),
+            build_program_shape(&app_b, ws_1, crate_1),
+            "distinct packages with src/main.rs must not collide"
+        );
+        assert_eq!(
+            build_program_shape(&app_a, ws_1, crate_1),
+            build_program_shape(&app_a, ws_1, crate_1),
+            "same program across worktrees shares one root"
+        );
     }
 
     #[test]
@@ -1528,10 +1584,12 @@ mod tests {
                 root: "crates/tieline-registryd/src/main.rs",
                 edition: "2024",
             };
+            let ws_id = Some(ContentId::of("export gc test ws", b"tieline"));
+            let crate_key = blaze_id::CrateItemKey(ContentId::of("export gc test crate", b"tieline-registryd"));
             let ids_table = CasKey(ContentId::of("export gc test run_ids", b"table"));
             let today = crate::start_list::Today {
                 certificate: crate::start_list::Certificate::for_tests([0x42; 32]),
-                name: crate::start_list::ListName::of(&build_program_shape(&picked)),
+                name: crate::start_list::ListName::of(&build_program_shape(&picked, ws_id, crate_key)),
                 tables: [ids_table, ids_table],
             };
 
@@ -1603,5 +1661,17 @@ mod tests {
         assert_eq!(ctrl_prog, 0, "control without keep_program must sweep all unrooted program code entries");
         assert_eq!(ctrl_tool, 4, "control still keeps toolchain entries");
         assert!(!ctrl_ids, "control without keep_program must sweep the unrooted RunIds table");
+    }
+
+    #[test]
+    fn keep_roots_error_formats_class_and_cause() {
+        let heap = blaze_own::testing::heap();
+        let err = ExportCliError::KeepRoots {
+            class: "program code",
+            shown: owned_str("disk full", heap.alloc()),
+        };
+        let msg = std::format!("{err}");
+        assert!(msg.contains("keeping program code root failed"), "{msg}");
+        assert!(msg.contains("disk full"), "{msg}");
     }
 }

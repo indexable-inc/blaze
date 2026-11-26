@@ -398,7 +398,7 @@ fn body_ids_last_ptr(
 
 /// Deterministic, checkout-path-free workspace identity derived from member `(name, /0/... root)`
 /// entries in `list`, shared across worktrees of the same repository (rules 25, 36).
-fn workspace_anchor_id(list: &blaze_world::crate_list::CrateList<'_>, alloc: Alloc<'_>) -> Option<ContentId> {
+pub(crate) fn workspace_anchor_id(list: &blaze_world::crate_list::CrateList<'_>, alloc: Alloc<'_>) -> Option<ContentId> {
     use blaze_world::crate_list::CrateGraph as _;
 
     let mut members: blaze_own::AVec<'_, (&str, &str)> = blaze_own::Vec::new_in(alloc);

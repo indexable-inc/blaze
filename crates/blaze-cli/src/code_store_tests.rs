@@ -255,112 +255,301 @@ fn a_key_without_an_input_is_caught_by_the_two_values_refusal() {
     std::println!("code store planted: WithoutOverflow caught by TwoValues; WithoutTier caught by TwoValues; unplanted both stand");
 }
 
-/// Regression for mid-build `ExportCliError::MissingEntry` under concurrent `blaze gc --background`:
-/// 1. After a check-phase `after_answer(..., 0)` (which releases the check lease), `rearm_lease()`
-///    re-enables lease acquisition so a mid-walk `HomeCodeStore` commit acquires a fresh lease and
-///    survives concurrent GC compaction (control without `rearm_lease()` leaves 0 leases and gets swept).
-/// 2. Pre-existing unrooted entries read during the walk (`entry_of` hit OR `Put::Same`) stay
-///    readable from `HomeCodeStore` even after concurrent GC sweeps their old segment and a later
-///    mid-walk commit adopts the newer manifest without that segment.
+/// Deterministic simulation test (Rule 43) for the lease-rearm, manifest-adoption, swept-record
+/// restoration, and concurrent GC protocol across 24 randomized seeds with sync failures,
+/// process crashes, power cuts, a full fresh-open oracle, and 3 planted-bug controls (Rule 23).
 #[test]
-fn concurrent_gc_during_mid_walk_commit_never_drops_stepped_entries() {
-    use blaze_cas::plain::Liveness;
+fn dst_lease_rearm_manifest_adoption_and_gc_protocol() {
+    use core::time::Duration;
+    use blaze_cas::plain::{GRACE_NS, LEASE_NS, Liveness, ROOT_LIFE_NS};
     use blaze_ladder::code_records::entry_of;
-    use bstd::io::{Io, Limits, SimWorld};
-    use bstd::mem::TASK_FRAME;
-    use bstd::test::BUDGET;
-    use crate::store::Home;
+    use crate::start_list::{Certificate, ListName, Today};
+    use crate::store::roots::{keep_program, keep_toolchain};
 
-    let io = Io::simulated(SimWorld::new(91, Limits::USUAL));
-    let cx = io.cx(BUDGET, TASK_FRAME).expect("root cx");
-    let fs = io.need_fs().expect("fs");
-    let heap = blaze_own::testing::heap();
-    let home = Home::of(&cx, &fs, Some("/h")).expect("home");
-    let open_reached = |nonce: u64| {
-        home.open_store_with_liveness(&StoreSettings::default(), Facts { boot: Some(1), nonce }, Liveness::Reached, heap.alloc())
-            .expect("open store")
-    };
-    let big_entry = |seed: u8| -> std::vec::Vec<u8> {
-        (0..8192).map(|i| seed.wrapping_mul(37).wrapping_add((i & 0xff) as u8)).collect()
-    };
-    let key_of = |name: &str| CodeKey(ContentId::of("concurrent gc code test", name.as_bytes()));
+    #[derive(Clone)]
+    struct SharedSim(std::rc::Rc<core::cell::RefCell<Sim>>);
 
-    let hit_bytes = big_entry(1);
-    let same_bytes = big_entry(2);
-    let new_bytes = big_entry(3);
-    let new2_bytes = big_entry(4);
-    let hit_ptr = key_of("hit_ptr");
-    let hit_content = key_of("hit_content");
-    let same_content = key_of("same_content");
-    let new_ptr = key_of("new_ptr");
-    let new_content = key_of("new_content");
-    let new2_content = key_of("new2_content");
+    impl blaze_core::Driver for SharedSim {
+        fn submit(&mut self, effects: &mut std::vec::Vec<blaze_core::Effect>) {
+            self.0.borrow_mut().submit(effects);
+        }
+        fn poll(&mut self, out: &mut std::vec::Vec<blaze_core::Completion>, until: blaze_core::wait::Deadline) -> usize {
+            self.0.borrow_mut().poll(out, until)
+        }
+        fn in_flight(&self) -> usize {
+            self.0.borrow().in_flight()
+        }
+        fn now(&self) -> Duration {
+            self.0.borrow().now()
+        }
+        fn wall_ns(&self) -> u64 {
+            self.0.borrow().wall_ns()
+        }
+        fn boot(&self) -> Result<blaze_core::Boot, blaze_core::NoBoot> {
+            self.0.borrow().boot()
+        }
+    }
 
-    // 1. Seed an unrooted segment S1 (simulating a prior unrooted build or evicted root).
-    {
-        let seed = open_reached(1);
-        let mut codes = HomeCodeStore::new(&seed);
-        codes.put(CodeClass::Program, hit_content, &hit_bytes).expect("seed hit");
-        codes.point(CodeClass::Program, hit_ptr, hit_content).expect("seed hit ptr");
-        codes.put(CodeClass::Program, same_content, &same_bytes).expect("seed same");
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum ProtocolPlant {
+        None,
+        SkipRearmLease,
+        SkipEnsurePersisted,
+        SkipLentEntries,
+    }
+
+    fn next_u64(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    let run_protocol_schedule = |seed: u64, plant: ProtocolPlant| -> Result<(), std::string::String> {
+        let mut rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let sim = std::rc::Rc::new(core::cell::RefCell::new(Sim::new(seed, Faults::default())));
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut next_nonce = 10u64;
+        let mut boot_id = 1u64;
+
+        let open_reached = |sim: &std::rc::Rc<core::cell::RefCell<Sim>>, nonce: u64, boot: u64, durable: bool| -> Result<Lent<SharedSim, StoreAlloc>, std::string::String> {
+            let mut settings = StoreSettings::default();
+            settings.durable = durable;
+            let mut cfg = config(FileName::new("store").expect("dir"), &settings, Facts { boot: Some(boot), nonce }, alloc);
+            cfg.liveness = Liveness::Reached;
+            open(SharedSim(std::rc::Rc::clone(sim)), cfg, alloc).map_err(|e| std::format!("open failed: {e}"))
+        };
+        let big_entry = |id: u32| -> std::vec::Vec<u8> {
+            (0..4096).map(|i| (id as usize).wrapping_mul(67).wrapping_add(i).wrapping_mul(13) as u8).collect()
+        };
+        let ptr_key = |id: u32| CodeKey(ContentId::of("dst lease gc ptr", &id.to_le_bytes()));
+        let content_key = |id: u32| CodeKey(ContentId::of("dst lease gc content", &id.to_le_bytes()));
+        let base_key = CasKey(ContentId::of("dst lease gc base", &seed.to_le_bytes()));
+        let ids_table = CasKey(ContentId::of("dst lease gc ids", &seed.to_le_bytes()));
+
+        // Even seeds run durable mode (testing `fail_syncs` + full `sim.crash()` power cut + reboot);
+        // odd seeds run non-durable mode (testing `processes_died()` crash + segment sealing).
+        let durable = (seed % 2) == 0;
+        {
+            next_nonce += 1;
+            let s = open_reached(&sim, next_nonce, boot_id, durable)?;
+            s.put(&base_key, Namespace::LOCAL, ReservedTag::Drive.tag(), b"baseline-durable").map_err(|e| std::format!("seed base: {e}"))?;
+            s.root_for("ans.base", &[base_key], ROOT_LIFE_NS).map_err(|e| std::format!("root base: {e}"))?;
+            after_answer(&root_cx(), &s, 0).map_err(|e| std::format!("commit base: {e}"))?;
+        }
+        {
+            next_nonce += 1;
+            let s = open_reached(&sim, next_nonce, boot_id, durable)?;
+            let mut codes = HomeCodeStore::new(&s);
+            for id in 0..4u32 {
+                let bytes = big_entry(id);
+                codes.put(CodeClass::Program, content_key(id), &bytes).map_err(|e| std::format!("seed put {id}: {e}"))?;
+                codes.point(CodeClass::Program, ptr_key(id), content_key(id)).map_err(|e| std::format!("seed point {id}: {e}"))?;
+            }
+            drop(codes);
+            after_answer(&root_cx(), &s, 0).map_err(|e| std::format!("commit unrooted seed: {e}"))?;
+        }
+
+        // Process `build` opens, runs a check-phase commit (`finish_store_for_check`), and rearms its lease.
+        next_nonce += 1;
+        let lent_build = open_reached(&sim, next_nonce, boot_id, durable)?;
+        let check_key = CasKey(ContentId::of("dst check rec", &seed.to_le_bytes()));
+        lent_build.put(&check_key, Namespace::LOCAL, ReservedTag::Drive.tag(), b"checked-ok").map_err(|e| std::format!("put check: {e}"))?;
+        lent_build.root_for("ans.check", &[check_key], ROOT_LIFE_NS).map_err(|e| std::format!("root check: {e}"))?;
+        after_answer(&root_cx(), &lent_build, 0).map_err(|e| std::format!("check-phase after_answer: {e}"))?;
+        if plant != ProtocolPlant::SkipRearmLease {
+            lent_build.rearm_lease();
+        }
+        // `export_program` builds/puts `RunIds` AFTER `finish_store_for_check` rearmed the lease.
+        lent_build.put(&ids_table, Namespace::LOCAL, ReservedTag::Drive.tag(), b"run-ids-bytes").map_err(|e| std::format!("put ids: {e}"))?;
+
+        let mut codes = HomeCodeStore::new(&lent_build);
+        if plant == ProtocolPlant::SkipLentEntries {
+            codes.disable_lent_entries_for_test();
+        }
+
+        let mut stepped: std::vec::Vec<(u32, bool)> = std::vec::Vec::new();
+        let mut next_new_id = 10u32;
+        let mut gc_runs = 0u32;
+        let mut mid_commits = 0u32;
+
+        // Step initial pre-existing entries (0,1 via `pointed`+`get`, 2,3 via `Put::Same`) before GC sweeps S1.
+        for id in 0..2u32 {
+            let under = codes.pointed(ptr_key(id)).map_err(|e| std::format!("pointed {id}: {e}"))?.ok_or_else(|| std::format!("seed ptr {id} missing"))?;
+            if under != content_key(id) {
+                return Err(std::format!("seed ptr {id} pointed to wrong key"));
+            }
+            let got = codes.get(under).map_err(|e| std::format!("get {id}: {e}"))?.ok_or_else(|| std::format!("seed content {id} missing"))?;
+            if got != big_entry(id).as_slice() {
+                return Err(std::format!("seed content {id} mismatch"));
+            }
+            stepped.push((id, true));
+        }
+        for id in 2..4u32 {
+            let bytes = big_entry(id);
+            codes.put(CodeClass::Program, content_key(id), &bytes).map_err(|e| std::format!("put same {id}: {e}"))?;
+            codes.point(CodeClass::Program, ptr_key(id), content_key(id)).map_err(|e| std::format!("point same {id}: {e}"))?;
+            stepped.push((id, true));
+        }
+
+        // Randomized interleaving loop: PutNew (program & toolchain), MidCommit, ConcurrentGc.
+        for step in 0..10u32 {
+            let choice = next_u64(&mut rng) % 10;
+            let force_commit = step == 3 && mid_commits == 0;
+            let force_gc = step == 5 && gc_runs == 0;
+            let force_second_commit = step == 8 && mid_commits < 2;
+            if force_gc || (!force_commit && !force_second_commit && choice < 3) {
+                next_nonce += 1;
+                let lent_gc = open_reached(&sim, next_nonce, boot_id, durable)?;
+                let _ = lent_gc.compact_foreground(32).map_err(|e| std::format!("concurrent gc step {step}: {e}"))?;
+                gc_runs += 1;
+            } else if force_commit || force_second_commit || choice < 6 {
+                let id = next_new_id;
+                next_new_id += 1;
+                let class = if (id % 3) == 0 { CodeClass::Toolchain } else { CodeClass::Program };
+                let bytes = big_entry(id);
+                codes.put(class, content_key(id), &bytes).map_err(|e| std::format!("put new {id}: {e}"))?;
+                codes.point(class, ptr_key(id), content_key(id)).map_err(|e| std::format!("point new {id}: {e}"))?;
+                stepped.push((id, true));
+                lent_build.commit().map_err(|e| std::format!("mid-walk commit step {step}: {e}"))?;
+                mid_commits += 1;
+                if lent_build.leases_len() == 0 {
+                    return Err(std::format!("seed {seed} step {step}: mid-walk commit acquired 0 leases (unprotected against concurrent GC)"));
+                }
+            } else {
+                let id = next_new_id;
+                next_new_id += 1;
+                let class = if (id % 3) == 0 { CodeClass::Toolchain } else { CodeClass::Program };
+                let bytes = big_entry(id);
+                codes.put(class, content_key(id), &bytes).map_err(|e| std::format!("put new {id}: {e}"))?;
+                codes.point(class, ptr_key(id), content_key(id)).map_err(|e| std::format!("point new {id}: {e}"))?;
+                stepped.push((id, true));
+            }
+        }
+
+        // Ensure at least one concurrent GC followed by a mid-walk commit happened so S1 is dropped from manifest.
+        {
+            next_nonce += 1;
+            let lent_gc = open_reached(&sim, next_nonce, boot_id, durable)?;
+            let _ = lent_gc.compact_foreground(32).map_err(|e| std::format!("post-loop gc: {e}"))?;
+        }
+        {
+            let id = next_new_id;
+            next_new_id += 1;
+            let bytes = big_entry(id);
+            codes.put(CodeClass::Program, content_key(id), &bytes).map_err(|e| std::format!("put tail {id}: {e}"))?;
+            codes.point(CodeClass::Program, ptr_key(id), content_key(id)).map_err(|e| std::format!("point tail {id}: {e}"))?;
+            stepped.push((id, true));
+            lent_build.commit().map_err(|e| std::format!("tail mid-walk commit: {e}"))?;
+        }
+
+        // Oracle Check A (in-build post-walk assembly): every stepped content key MUST be readable via `entry_of`.
+        for &(id, _) in &stepped {
+            let got = entry_of(&codes, content_key(id)).map_err(|e| std::format!("post-walk entry_of {id}: {e}"))?;
+            if got != Some(big_entry(id).as_slice()) {
+                return Err(std::format!("seed {seed}: post-walk MissingEntry for stepped id {id}"));
+            }
+        }
+
+        // Restore any swept entries/pointers and root everything under `keep_program` + `keep_toolchain`.
+        if plant != ProtocolPlant::SkipEnsurePersisted {
+            let _ = codes.ensure_persisted().map_err(|e| std::format!("ensure_persisted: {e}"))?;
+        }
+        let walked = codes.reached();
+        let tool_made = codes.toolchain_made();
         drop(codes);
-        after_answer(&cx, &seed, 0).expect("commit seed");
+
+        let shape = ContentId::of("dst export build shape", &seed.to_le_bytes());
+        let today = Today {
+            certificate: Certificate::for_tests([0x5a; 32]),
+            name: ListName::of(&shape),
+            tables: [ids_table, ids_table],
+        };
+        let (_prog_root, _) = keep_program(&lent_build, &today, None, &walked).map_err(|e| std::format!("keep_program: {e}"))?;
+        let _ = keep_toolchain(&lent_build, blaze_toolchain::PINNED, &tool_made, &[]).map_err(|e| std::format!("keep_toolchain: {e}"))?;
+        after_answer(&root_cx(), &lent_build, 0).map_err(|e| std::format!("closing after_answer: {e}"))?;
+        drop(lent_build);
+
+        // Inject a failed sync on durable seeds + power cut (new boot), or process death on non-durable seeds.
+        if durable {
+            sim.borrow_mut().fail_syncs(FileName::new("store").expect("dir"));
+            next_nonce += 1;
+            let failing = open_reached(&sim, next_nonce, boot_id, true)?;
+            let doomed = CasKey(ContentId::of("dst doomed sync", &seed.to_le_bytes()));
+            failing.put(&doomed, Namespace::LOCAL, ReservedTag::Code.tag(), b"sync-will-fail").map_err(|e| std::format!("put doomed: {e}"))?;
+            if failing.commit().is_ok() {
+                return Err(std::format!("seed {seed}: expected durable commit under fail_syncs to fail"));
+            }
+            drop(failing);
+            sim.borrow_mut().crash();
+            boot_id += 1;
+        } else {
+            next_nonce += 1;
+            let sealer = open_reached(&sim, next_nonce, boot_id, false)?;
+            let _ = sealer.seal_foreground().map_err(|e| std::format!("seal: {e}"))?;
+            drop(sealer);
+            sim.borrow_mut().processes_died();
+        }
+
+        // Post-recovery GC compaction past LEASE_NS + GRACE_NS.
+        sim.borrow_mut().advance(Duration::from_nanos(LEASE_NS.max(GRACE_NS)) + Duration::from_secs(60));
+        next_nonce += 1;
+        {
+            let post_gc = open_reached(&sim, next_nonce, boot_id, durable)?;
+            let _ = post_gc.compact_foreground(32).map_err(|e| std::format!("post-recovery gc: {e}"))?;
+        }
+
+        // Oracle Check B (freshly opened store after GC + crash/sync-fault recovery):
+        // EVERY reached pointer and content record + baseline + RunIds table must be live & exact,
+        // with 0 leftover leases.
+        next_nonce += 1;
+        let verify = open_reached(&sim, next_nonce, boot_id, durable)?;
+        if verify.leases_len() != 0 {
+            return Err(std::format!("seed {seed}: leaked {} lease(s) after closing commit", verify.leases_len()));
+        }
+        if verify.get(&base_key).map_err(|e| std::format!("verify base: {e}"))?.map(|l| l.bytes) != Some(&b"baseline-durable"[..]) {
+            return Err(std::format!("seed {seed}: durable baseline missing after crash/sync-fault"));
+        }
+        if verify.get(&ids_table).map_err(|e| std::format!("verify ids: {e}"))?.map(|l| l.bytes) != Some(&b"run-ids-bytes"[..]) {
+            return Err(std::format!("seed {seed}: RunIds table missing after post-commit GC"));
+        }
+        let verify_codes = HomeCodeStore::new(&verify);
+        for &(id, expect_ptr) in &stepped {
+            if expect_ptr {
+                let target = verify_codes
+                    .pointed(ptr_key(id))
+                    .map_err(|e| std::format!("fresh pointed {id}: {e}"))?
+                    .ok_or_else(|| std::format!("seed {seed}: fresh store missing pointer for id {id} (hole in closing root)"))?;
+                if target != content_key(id) {
+                    return Err(std::format!("seed {seed}: fresh store wrong pointer target for id {id}"));
+                }
+            }
+            let got = entry_of(&verify_codes, ptr_key(id)).map_err(|e| std::format!("fresh entry_of {id}: {e}"))?;
+            if got != Some(big_entry(id).as_slice()) {
+                return Err(std::format!("seed {seed}: fresh store missing/corrupt content for id {id}"));
+            }
+        }
+        Ok(())
+    };
+
+    for seed in 1..=24u64 {
+        run_protocol_schedule(seed, ProtocolPlant::None)
+            .unwrap_or_else(|why| panic!("DST invariant violated on seed {seed}: {why}"));
     }
 
-    // 2. Process `build` runs a check-phase commit (`finish_store_for_check`) and rearms its lease.
-    let lent_build = open_reached(2);
-    let check_key = CasKey(ContentId::of("concurrent gc check record", b"r1"));
-    lent_build.put(&check_key, Namespace::LOCAL, ReservedTag::Drive.tag(), b"checked").expect("put check");
-    lent_build.root_for("ans.check", &[check_key], blaze_cas::plain::ROOT_LIFE_NS).expect("root check");
-    after_answer(&cx, &lent_build, 0).expect("check-phase commit");
-    lent_build.rearm_lease();
+    // Planted-bug controls (Rules 23, 43): each disabled mechanism MUST be caught by the oracle.
+    let caught_rearm = run_protocol_schedule(2, ProtocolPlant::SkipRearmLease);
+    assert!(caught_rearm.is_err(), "control failed: oracle did not catch missing rearm_lease");
 
-    // Walk steps: read `hit_ptr` (cache hit on S1), hit `Put::Same` on `same_content` (on S1),
-    // and compile `new_content` + mid-walk commit (must acquire a live lease!).
-    let mut codes = HomeCodeStore::new(&lent_build);
-    let walked_hit_under = codes.pointed(hit_ptr).expect("pointed hit").expect("hit target");
-    assert_eq!(walked_hit_under, hit_content);
-    assert_eq!(codes.get(walked_hit_under).expect("get hit"), Some(hit_bytes.as_slice()));
-    codes.put(CodeClass::Program, same_content, &same_bytes).expect("put same");
-    codes.put(CodeClass::Program, new_content, &new_bytes).expect("put new");
-    codes.point(CodeClass::Program, new_ptr, new_content).expect("point new");
-    lent_build.commit().expect("mid-walk commit");
-    assert_eq!(lent_build.leases_len(), 1, "rearmed build must acquire a live lease on mid-walk commit");
+    let caught_restore = run_protocol_schedule(2, ProtocolPlant::SkipEnsurePersisted);
+    assert!(caught_restore.is_err(), "control failed: oracle did not catch missing ensure_persisted (holed root)");
 
-    // 3. Concurrent `blaze gc` compacts the store while `lent_build` is still open mid-walk.
-    // Unrooted S1 (generation <= opened_generation) is swept; leased `new_content` MUST survive!
-    {
-        let lent_gc = open_reached(3);
-        let _ = lent_gc.compact_foreground(32).expect("concurrent gc");
-        assert!(lent_gc.get(&CasKey(hit_content.0)).expect("gc check hit").is_none(), "gc must have swept unrooted S1");
-        assert!(lent_gc.get(&CasKey(new_content.0)).expect("gc check new").is_some(), "gc must preserve leased mid-walk segment");
-    }
+    let caught_cache = run_protocol_schedule(2, ProtocolPlant::SkipLentEntries);
+    assert!(caught_cache.is_err(), "control failed: oracle did not catch missing lent_entries (MissingEntry)");
 
-    // 4. `build` performs another mid-walk commit, adopting GC's manifest (which dropped S1).
-    codes.put(CodeClass::Program, new2_content, &new2_bytes).expect("put new2");
-    lent_build.commit().expect("second mid-walk commit");
-
-    // 5. Post-walk assembly (`engine_export.rs` `entry_of(&codes, key)`) must find EVERY entry!
-    assert_eq!(entry_of(&codes, hit_content).expect("post-walk hit"), Some(hit_bytes.as_slice()));
-    assert_eq!(entry_of(&codes, same_content).expect("post-walk same"), Some(same_bytes.as_slice()));
-    assert_eq!(entry_of(&codes, new_content).expect("post-walk new"), Some(new_bytes.as_slice()));
-    assert_eq!(entry_of(&codes, new2_content).expect("post-walk new2"), Some(new2_bytes.as_slice()));
-    drop(codes);
-    after_answer(&cx, &lent_build, 0).expect("closing commit");
-
-    // 6. Control (rule 23): without `rearm_lease()`, `after_answer(..., 0)` leaves `released = true`,
-    // so a subsequent mid-walk commit acquires 0 leases and concurrent GC sweeps its segment.
-    let lent_unarmed = open_reached(4);
-    let check_key2 = CasKey(ContentId::of("concurrent gc check record", b"r2"));
-    lent_unarmed.put(&check_key2, Namespace::LOCAL, ReservedTag::Drive.tag(), b"checked2").expect("put check2");
-    lent_unarmed.root_for("ans.check2", &[check_key2], blaze_cas::plain::ROOT_LIFE_NS).expect("root check2");
-    after_answer(&cx, &lent_unarmed, 0).expect("check-phase commit without rearm");
-    let unarmed_key = key_of("unarmed_content");
-    let unarmed_bytes = big_entry(5);
-    lent_unarmed.put(&CasKey(unarmed_key.0), Namespace::LOCAL, ReservedTag::Code.tag(), &unarmed_bytes).expect("put unarmed");
-    lent_unarmed.commit().expect("unarmed mid-walk commit");
-    assert_eq!(lent_unarmed.leases_len(), 0, "control: without rearm_lease, released stays true and acquires no lease");
-    let lent_gc2 = open_reached(5);
-    let _ = lent_gc2.compact_foreground(32).expect("gc sweeps unleased segment");
-    assert!(lent_gc2.get(&CasKey(unarmed_key.0)).expect("gc check unarmed").is_none(), "control: unleased mid-walk segment was swept by concurrent GC");
+    std::println!(
+        "dst lease+gc protocol: 24/24 seeds passed (crashes + sync failures + concurrent GC); all 3 planted controls caught"
+    );
 }
