@@ -20,7 +20,7 @@ blaze-body-flow	24
 blaze-body-lower	22
 blaze-borrow	20
 blaze-bstd-convert	9
-blaze-build	736
+blaze-build	729
 blaze-build-script	109
 blaze-c	4
 blaze-cad	101
@@ -34,7 +34,7 @@ blaze-cast	40
 blaze-cc	17
 blaze-cert	14
 blaze-check	108
-blaze-cli	605
+blaze-cli	603
 blaze-code	139
 blaze-columns	2
 blaze-comptime-sys	150
@@ -50,7 +50,7 @@ blaze-ed25519	5
 blaze-emit	551
 blaze-engine	89
 blaze-expand	284
-blaze-export	411
+blaze-export	404
 blaze-facts	12
 blaze-fetch	185
 blaze-file-items	94
@@ -79,7 +79,7 @@ blaze-launch-rt	455
 blaze-launcher	5
 blaze-lint	185
 blaze-lint-defs	21
-blaze-lir	1374
+blaze-lir	1353
 blaze-lower	301
 blaze-malloc	48
 blaze-manifest	6

@@ -24,7 +24,7 @@ All four V3 architectural pillars are built, wired end-to-end, and verified on A
    - **`msched.rs`**: Pre-RA and post-RA scheduler with `WINDOW_MAX = 128` (`u128` bitmasks), exact loop-carried recurrence height from CFG backedges, Apple M5 / Graviton 5 issue pipes, two-level SSA register-pressure spill-prevention guard (`threshold = 18`, `critical = 21`), and bounded Beam-4 optimal hot-loop scheduling.
    - **`mra.rs`**: SSA register allocator with 28-GPR leaf pool (`X29`+`X30`), `ParallelCopy`/phi coalescing, hot-vs-cold eviction tiering, remat cost gating (keeping multi-inst constants out of hot loops), and cycle-safe `ParallelCopy` lowering.
    - **`mfmt.rs`**: Clean textual `MFunc` printer and instruction-mix summary for fast codegen inspection alongside local Mach-O `N_SECT` function symbols (`blaze-export`).
-   - **Legacy deletion**: `crates/blaze-emit/src/sota/mach_a64.rs` (`-9,523` lines) deleted cleanly.
+   - **Legacy deletion**: the legacy u32-disassembling `mach_a64` pass (`-9,523` lines) was deleted cleanly.
 
 4. **Whole-Program Ephemeral Zero-ABI & PGO (`export_lto.rs` + `abi.rs` + `ifconv.rs` + `sota/mod.rs`)**:
    - **Incremental-cache invariant (Rules 21, 60)**: Portable `CodeStore` records remain strictly item-grain with standard C ABI. Whole-program `InternalFast` (15 GPR / 16 FP args, guarded by `can_use_internal_fast_a64(..., InternalFastRole::{Caller, Callee})` with zero silent C-ABI fallback), `ColdPreserveAll` (`nounwind` cold callees), `ScratchOrder`, bottom-up Tarjan SCC IPRA, and 2-tier hot/cold emission run strictly inside `blaze export`'s ephemeral scratch frame.

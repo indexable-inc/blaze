@@ -98,6 +98,65 @@ fn u32_of(v: usize) -> Option<u32> {
     u32::try_from(v).ok()
 }
 
+#[inline]
+fn at<T: Copy>(s: &[T], i: usize, def: T) -> T {
+    s.get(i).copied().unwrap_or(def)
+}
+
+#[inline]
+fn set<T>(s: &mut [T], i: usize, v: T) {
+    if let Some(slot) = s.get_mut(i) {
+        *slot = v;
+    }
+}
+
+#[inline]
+fn op_at(func: &MFunc<'_>, idx: usize) -> MOp {
+    func.ops.get(idx).copied().unwrap_or(MOp::Nop)
+}
+
+#[inline]
+fn flags_at(func: &MFunc<'_>, idx: usize) -> MInstFlags {
+    func.flags.get(idx).copied().unwrap_or(MInstFlags::NONE)
+}
+
+#[inline]
+fn vflag_def_at(func: &MFunc<'_>, idx: usize) -> u32 {
+    func.vflag_def.get(idx).copied().unwrap_or(NO_VFLAG)
+}
+
+#[inline]
+fn vflag_use_at(func: &MFunc<'_>, idx: usize) -> u32 {
+    func.vflag_use.get(idx).copied().unwrap_or(NO_VFLAG)
+}
+
+#[inline]
+fn note_at(func: &MFunc<'_>, idx: usize) -> u32 {
+    func.note_idx.get(idx).copied().unwrap_or(NO_NOTE)
+}
+
+#[inline]
+fn block_range(func: &MFunc<'_>, blk: MBlock) -> (usize, usize) {
+    let Some(&(start_u, end_u)) = func.block_insts.get(to_idx(blk.0)) else {
+        return (0, 0);
+    };
+    (to_idx(start_u), to_idx(end_u).min(func.ops.len()))
+}
+
+#[inline]
+fn copy_inst_slot(func: &mut MFunc<'_>, dst: usize, src: usize) {
+    let op = op_at(func, src);
+    let fl = flags_at(func, src);
+    let vd = vflag_def_at(func, src);
+    let vu = vflag_use_at(func, src);
+    let nt = note_at(func, src);
+    set(&mut func.ops, dst, op);
+    set(&mut func.flags, dst, fl);
+    set(&mut func.vflag_def, dst, vd);
+    set(&mut func.vflag_use, dst, vu);
+    set(&mut func.note_idx, dst, nt);
+}
+
 // -----------------------------------------------------------------------------
 // Public statistics & entry point
 // -----------------------------------------------------------------------------
@@ -202,10 +261,10 @@ fn is_protected(func: &MFunc<'_>, idx: usize) -> bool {
 #[inline]
 fn mark_deleted(func: &mut MFunc<'_>, idx: usize) {
     if idx < func.ops.len() {
-        func.ops[idx] = MOp::Nop;
-        func.flags[idx] = MInstFlags::NONE;
-        func.vflag_def[idx] = NO_VFLAG;
-        func.vflag_use[idx] = NO_VFLAG;
+        set(&mut func.ops, idx, MOp::Nop);
+        set(&mut func.flags, idx, MInstFlags::NONE);
+        set(&mut func.vflag_def, idx, NO_VFLAG);
+        set(&mut func.vflag_use, idx, NO_VFLAG);
     }
 }
 
@@ -360,8 +419,8 @@ fn inst_defines_reg(func: &MFunc<'_>, idx: usize, reg: MReg) -> bool {
         MOp::ParallelCopy { start, len } => {
             let s = to_idx(start);
             let e = s.saturating_add(usize::from(len)).min(func.copy_pairs.len());
-            if s < e {
-                for &(dst, _) in &func.copy_pairs[s..e] {
+            if let Some(pairs) = func.copy_pairs.get(s..e) {
+                for &(dst, _) in pairs {
                     if dst == reg {
                         return true;
                     }
@@ -465,8 +524,8 @@ fn inst_uses_reg(func: &MFunc<'_>, idx: usize, reg: MReg) -> bool {
         MOp::ParallelCopy { start, len } => {
             let s = to_idx(start);
             let e = s.saturating_add(usize::from(len)).min(func.copy_pairs.len());
-            if s < e {
-                for &(_, src) in &func.copy_pairs[s..e] {
+            if let Some(pairs) = func.copy_pairs.get(s..e) {
+                for &(_, src) in pairs {
                     if src == reg {
                         return true;
                     }
@@ -629,8 +688,8 @@ fn visit_op_vreg_uses(op: &MOp, copy_pairs: &[(MReg, MReg)], mut f: impl FnMut(u
         MOp::ParallelCopy { start, len } => {
             let s = to_idx(start);
             let e = s.saturating_add(usize::from(len)).min(copy_pairs.len());
-            if s < e {
-                for &(_, src) in &copy_pairs[s..e] {
+            if let Some(pairs) = copy_pairs.get(s..e) {
+                for &(_, src) in pairs {
                     reg(src);
                 }
             }
@@ -731,8 +790,8 @@ fn visit_op_vreg_defs(op: &MOp, copy_pairs: &[(MReg, MReg)], mut f: impl FnMut(u
         MOp::ParallelCopy { start, len } => {
             let s = to_idx(start);
             let e = s.saturating_add(usize::from(len)).min(copy_pairs.len());
-            if s < e {
-                for &(dst, _) in &copy_pairs[s..e] {
+            if let Some(pairs) = copy_pairs.get(s..e) {
+                for &(dst, _) in pairs {
                     reg(dst);
                 }
             }
@@ -921,8 +980,8 @@ fn remap_op_vreg_uses(op: &mut MOp, copy_pairs: &mut [(MReg, MReg)], remap: &[u3
         MOp::ParallelCopy { start, len } => {
             let s = to_idx(*start);
             let e = s.saturating_add(usize::from(*len)).min(copy_pairs.len());
-            if s < e {
-                for (_, src) in &mut copy_pairs[s..e] {
+            if let Some(pairs) = copy_pairs.get_mut(s..e) {
+                for (_, src) in pairs {
                     map_slot(src);
                 }
             }
@@ -1023,8 +1082,8 @@ fn op_uses_reg_only_low32(op: &MOp, copy_pairs: &[(MReg, MReg)], reg: MReg) -> b
         MOp::ParallelCopy { start, len } => {
             let s = to_idx(start);
             let e = s.saturating_add(usize::from(len)).min(copy_pairs.len());
-            if s < e {
-                for &(_, src) in &copy_pairs[s..e] {
+            if let Some(pairs) = copy_pairs.get(s..e) {
+                for &(_, src) in pairs {
                     if src == reg {
                         return false;
                     }
@@ -1078,7 +1137,8 @@ fn is_reg_dead_after(
         return vreg_uses.get(to_idx(v.0)).copied().unwrap_or(1) == 0;
     }
     for k in (after_idx + 1)..block_end {
-        if matches!(func.ops[k], MOp::Nop) {
+        let op_k = op_at(func, k);
+        if matches!(op_k, MOp::Nop) {
             continue;
         }
         if inst_uses_reg(func, k, reg) {
@@ -1087,7 +1147,7 @@ fn is_reg_dead_after(
         if inst_defines_reg(func, k, reg) {
             return true;
         }
-        if matches!(func.ops[k], MOp::Ret) {
+        if matches!(op_k, MOp::Ret) {
             if !func.is_ssa
                 && let MReg::P(PReg::Gpr(r)) = reg
                 && r < 30
@@ -1097,7 +1157,7 @@ fn is_reg_dead_after(
             }
             return false;
         }
-        if is_control_or_call(&func.ops[k]) {
+        if is_control_or_call(&op_k) {
             return false;
         }
     }
@@ -1543,12 +1603,12 @@ fn flags_consumers_satisfy(
 ) -> bool {
     let mut saw_consumer = false;
     for k in (flag_writer_idx + 1)..block_end {
-        let op = &func.ops[k];
-        if matches!(*op, MOp::Nop) {
+        let op = op_at(func, k);
+        if matches!(op, MOp::Nop) {
             continue;
         }
         if op.reads_flags() {
-            let ok = match *op {
+            let ok = match op {
                 MOp::BCond { cond, .. }
                 | MOp::Csel { cond, .. }
                 | MOp::Csinc { cond, .. }
@@ -1567,10 +1627,10 @@ fn flags_consumers_satisfy(
             // Flags overwritten before escaping the block: all consumers verified above.
             return saw_consumer;
         }
-        if matches!(*op, MOp::Br { .. } | MOp::Brk { .. } | MOp::Udf | MOp::RawWord { .. }) {
+        if matches!(op, MOp::Br { .. } | MOp::Brk { .. } | MOp::Udf | MOp::RawWord { .. }) {
             return false;
         }
-        if matches!(*op, MOp::Ret) {
+        if matches!(op, MOp::Ret) {
             // If no consumer existed before `Ret`, flags might be a `BlazeResult` carry return.
             return saw_consumer;
         }
@@ -1679,28 +1739,27 @@ fn cse_global_multi_inst_mov_imm<'a>(
     for (ord_pos, &blk) in func.block_order.iter().enumerate() {
         let bi = to_idx(blk.0);
         if bi < num_blocks {
-            block_pos[bi] = u32_of(ord_pos).unwrap_or(u32::MAX);
+            set(&mut block_pos, bi, u32_of(ord_pos).unwrap_or(u32::MAX));
         }
     }
     for ord_pos in 0..n_order {
-        let blk = func.block_order[ord_pos];
-        let (start_u, end_u) = func.block_insts[to_idx(blk.0)];
-        let start = to_idx(start_u);
-        let end = to_idx(end_u).min(func.ops.len());
+        let Some(&blk) = func.block_order.get(ord_pos) else {
+            continue;
+        };
+        let (start, end) = block_range(func, blk);
         for i in start..end {
-            if let Some(target) = func.ops[i].branch_target() {
+            if let Some(target) = op_at(func, i).branch_target() {
                 if target == entry_blk {
                     // Entry block has a predecessor / back-edge: skip hoisting.
                     return;
                 }
                 let ti = to_idx(target.0);
                 if ti < num_blocks {
-                    let t_pos = block_pos[ti];
+                    let t_pos = at(&block_pos, ti, u32::MAX);
                     if t_pos != u32::MAX && to_idx(t_pos) <= ord_pos {
                         for k in to_idx(t_pos)..=ord_pos {
-                            let lb = to_idx(func.block_order[k].0);
-                            if lb < num_blocks {
-                                in_loop[lb] = true;
+                            if let Some(&loop_blk) = func.block_order.get(k) {
+                                set(&mut in_loop, to_idx(loop_blk.0), true);
                             }
                         }
                     }
@@ -1715,17 +1774,17 @@ fn cse_global_multi_inst_mov_imm<'a>(
     // Count multi-instruction `MovImm` candidates in deterministic encounter order (no HashMap).
     let mut table = [GlobalImmEntry::EMPTY; GLOBAL_IMM_TABLE_CAP];
     for ord_pos in 0..n_order {
-        let blk = func.block_order[ord_pos];
+        let Some(&blk) = func.block_order.get(ord_pos) else {
+            continue;
+        };
         let bi = to_idx(blk.0);
-        let blk_in_loop = in_loop.get(bi).copied().unwrap_or(false);
-        let (start_u, end_u) = func.block_insts[bi];
-        let start = to_idx(start_u);
-        let end = to_idx(end_u).min(func.ops.len());
+        let blk_in_loop = at(&in_loop, bi, false);
+        let (start, end) = block_range(func, blk);
         for i in start..end {
             if is_protected(func, i) {
                 continue;
             }
-            let MOp::MovImm { dst: MReg::V(v), imm, wide } = func.ops[i] else {
+            let MOp::MovImm { dst: MReg::V(v), imm, wide } = op_at(func, i) else {
                 continue;
             };
             let vi = to_idx(v.0);
@@ -1778,7 +1837,7 @@ fn cse_global_multi_inst_mov_imm<'a>(
         let mut best_idx: Option<usize> = None;
         let mut best_score: u32 = 0;
         for (idx, slot) in table.iter().enumerate() {
-            if !slot.valid || picked[idx] {
+            if !slot.valid || at(&picked, idx, true) {
                 continue;
             }
             let eligible = slot.count >= 2 || (slot.in_loop && slot.cost >= 3);
@@ -1794,8 +1853,8 @@ fn cse_global_multi_inst_mov_imm<'a>(
         let Some(chosen) = best_idx else {
             break;
         };
-        picked[chosen] = true;
-        selected_slots[n_selected] = chosen;
+        set(&mut picked, chosen, true);
+        set(&mut selected_slots, n_selected, chosen);
         n_selected += 1;
     }
     if n_selected == 0 || u32_of(func.ops.len().saturating_add(n_selected)).is_none() {
@@ -1805,12 +1864,14 @@ fn cse_global_multi_inst_mov_imm<'a>(
     // Find a flag-free, terminator-free insertion point in `entry_blk` right after any leading
     // entry parameter captures (`ParallelCopy` from `PReg`s, ABI `PReg` `Mov`s, pinned `[SP, #off]`
     // stack-arg loads). None of these write flags or read any `VReg`.
-    let (e_start_u, e_end_u) = func.block_insts[entry_idx];
+    let Some(&(e_start_u, e_end_u)) = func.block_insts.get(entry_idx) else {
+        return;
+    };
     let e_start = to_idx(e_start_u);
     let e_end = to_idx(e_end_u).min(func.ops.len());
     let mut insert_pos = e_start;
     while insert_pos < e_end {
-        let op = func.ops[insert_pos];
+        let op = op_at(func, insert_pos);
         if op.writes_flags() || op.is_conditional_branch() || op.is_unconditional_terminator() {
             break;
         }
@@ -1820,8 +1881,8 @@ fn cse_global_multi_inst_mov_imm<'a>(
                 let s = to_idx(start);
                 let e = s.saturating_add(usize::from(len)).min(func.copy_pairs.len());
                 let mut all_phys_src = true;
-                if s < e {
-                    for &(_, src) in &func.copy_pairs[s..e] {
+                if let Some(pairs) = func.copy_pairs.get(s..e) {
+                    for &(_, src) in pairs {
                         if src.is_virtual() {
                             all_phys_src = false;
                             break;
@@ -1835,7 +1896,7 @@ fn cse_global_multi_inst_mov_imm<'a>(
             | MOp::FpAlu { op: FpAluOp::Mov, rn: MReg::P(_), .. }
             | MOp::VecAlu { op: VecAluOp::Mov, rn: MReg::P(_), .. } => true,
             MOp::Ldr { addr: AddrMode::BaseOff { base: MReg::P(PReg::Sp), .. }, .. } => {
-                func.flags[insert_pos].contains(MInstFlags::PINNED)
+                flags_at(func, insert_pos).contains(MInstFlags::PINNED)
             }
             _ => false,
         };
@@ -1849,10 +1910,11 @@ fn cse_global_multi_inst_mov_imm<'a>(
     let orig_vreg_len = func.vreg_class.len();
     let mut selected_info = [(0u64, false, VReg(0)); MAX_HOISTED_IMMS];
     for s_idx in 0..n_selected {
-        let slot = table[selected_slots[s_idx]];
+        let slot_idx = at(&selected_slots, s_idx, 0);
+        let slot = at(&table, slot_idx, GlobalImmEntry::EMPTY);
         let cls = if slot.wide { VRegClass::Gpr64 } else { VRegClass::Gpr32 };
         let hoisted_v = func.alloc_vreg(cls);
-        selected_info[s_idx] = (slot.imm, slot.wide, hoisted_v);
+        set(&mut selected_info, s_idx, (slot.imm, slot.wide, hoisted_v));
     }
 
     // Record `old_v -> hoisted_v` remap and delete all matching original `MovImm` instructions.
@@ -1861,15 +1923,15 @@ fn cse_global_multi_inst_mov_imm<'a>(
         remap.push(u32::MAX);
     }
     for ord_pos in 0..n_order {
-        let blk = func.block_order[ord_pos];
-        let (start_u, end_u) = func.block_insts[to_idx(blk.0)];
-        let start = to_idx(start_u);
-        let end = to_idx(end_u).min(func.ops.len());
+        let Some(&blk) = func.block_order.get(ord_pos) else {
+            continue;
+        };
+        let (start, end) = block_range(func, blk);
         for i in start..end {
             if is_protected(func, i) {
                 continue;
             }
-            let MOp::MovImm { dst: MReg::V(v), imm, wide } = func.ops[i] else {
+            let MOp::MovImm { dst: MReg::V(v), imm, wide } = op_at(func, i) else {
                 continue;
             };
             let vi = to_idx(v.0);
@@ -1881,9 +1943,9 @@ fn cse_global_multi_inst_mov_imm<'a>(
                 continue;
             }
             let imm_norm = if wide { imm } else { imm & 0xffff_ffff };
-            for &(s_imm, s_wide, hoisted_v) in &selected_info[..n_selected] {
+            for &(s_imm, s_wide, hoisted_v) in selected_info.iter().take(n_selected) {
                 if s_imm == imm_norm && s_wide == wide {
-                    remap[vi] = hoisted_v.0;
+                    set(&mut remap, vi, hoisted_v.0);
                     mark_deleted(func, i);
                     stats.peepholes = stats.peepholes.saturating_add(1);
                     break;
@@ -1903,20 +1965,15 @@ fn cse_global_multi_inst_mov_imm<'a>(
         func.note_idx.push(NO_NOTE);
     }
     for idx in (insert_pos..old_len).rev() {
-        let dst_idx = idx + n_selected;
-        func.ops[dst_idx] = func.ops[idx];
-        func.flags[dst_idx] = func.flags[idx];
-        func.vflag_def[dst_idx] = func.vflag_def[idx];
-        func.vflag_use[dst_idx] = func.vflag_use[idx];
-        func.note_idx[dst_idx] = func.note_idx[idx];
+        copy_inst_slot(func, idx + n_selected, idx);
     }
-    for (offset, &(s_imm, s_wide, hoisted_v)) in selected_info[..n_selected].iter().enumerate() {
+    for (offset, &(s_imm, s_wide, hoisted_v)) in selected_info.iter().take(n_selected).enumerate() {
         let pos = insert_pos + offset;
-        func.ops[pos] = MOp::MovImm { dst: MReg::V(hoisted_v), imm: s_imm, wide: s_wide };
-        func.flags[pos] = MInstFlags::REMATERIALIZABLE;
-        func.vflag_def[pos] = NO_VFLAG;
-        func.vflag_use[pos] = NO_VFLAG;
-        func.note_idx[pos] = NO_NOTE;
+        set(&mut func.ops, pos, MOp::MovImm { dst: MReg::V(hoisted_v), imm: s_imm, wide: s_wide });
+        set(&mut func.flags, pos, MInstFlags::REMATERIALIZABLE);
+        set(&mut func.vflag_def, pos, NO_VFLAG);
+        set(&mut func.vflag_use, pos, NO_VFLAG);
+        set(&mut func.note_idx, pos, NO_NOTE);
     }
 
     let k_u32 = u32_of(n_selected).unwrap_or(0);
@@ -1930,8 +1987,8 @@ fn cse_global_multi_inst_mov_imm<'a>(
     }
 
     // Rewrite every use of the replaced duplicate `VReg`s across the entire function.
-    for i in 0..func.ops.len() {
-        remap_op_vreg_uses(&mut func.ops[i], &mut func.copy_pairs, &remap);
+    for op in func.ops.iter_mut() {
+        remap_op_vreg_uses(op, &mut func.copy_pairs, &remap);
     }
 }
 
@@ -1953,7 +2010,7 @@ fn mopt_dead_narrow32_mov_ssa<'a>(func: &mut MFunc<'a>, alloc: Alloc<'a>, stats:
         only_low32_ok.push(true);
     }
     for j in 0..func.ops.len() {
-        let op = func.ops[j];
+        let op = op_at(func, j);
         if matches!(op, MOp::Nop) {
             continue;
         }
@@ -1980,7 +2037,7 @@ fn mopt_dead_narrow32_mov_ssa<'a>(func: &mut MFunc<'a>, alloc: Alloc<'a>, stats:
         if is_protected(func, i) {
             continue;
         }
-        let MOp::Mov { dst: MReg::V(d), src: MReg::V(s), wide: false } = func.ops[i] else {
+        let MOp::Mov { dst: MReg::V(d), src: MReg::V(s), wide: false } = op_at(func, i) else {
             continue;
         };
         if d == s {
@@ -2014,7 +2071,7 @@ fn mopt_dead_narrow32_mov_ssa<'a>(func: &mut MFunc<'a>, alloc: Alloc<'a>, stats:
         if !safe_chain || hops >= MAX_THREAD_HOPS {
             continue;
         }
-        remap[di] = s.0;
+        set(&mut remap, di, s.0);
         mark_deleted(func, i);
         stats.movs_eliminated = stats.movs_eliminated.saturating_add(1);
         elided_any = true;
@@ -2022,8 +2079,8 @@ fn mopt_dead_narrow32_mov_ssa<'a>(func: &mut MFunc<'a>, alloc: Alloc<'a>, stats:
 
     // 3. Rewrite all uses across the function in one O(N) sweep.
     if elided_any {
-        for i in 0..func.ops.len() {
-            remap_op_vreg_uses(&mut func.ops[i], &mut func.copy_pairs, &remap);
+        for op in func.ops.iter_mut() {
+            remap_op_vreg_uses(op, &mut func.copy_pairs, &remap);
         }
     }
 }
@@ -2132,10 +2189,10 @@ fn mopt_peepholes_and_cse<'a>(func: &mut MFunc<'a>, alloc: Alloc<'a>, stats: &mu
     let n_order = func.block_order.len();
 
     for bi in 0..n_order {
-        let blk = func.block_order[bi];
-        let (start_u, end_u) = func.block_insts[to_idx(blk.0)];
-        let start = to_idx(start_u);
-        let end = to_idx(end_u).min(func.ops.len());
+        let Some(&blk) = func.block_order.get(bi) else {
+            continue;
+        };
+        let (start, end) = block_range(func, blk);
         if start >= end {
             continue;
         }
@@ -2146,7 +2203,8 @@ fn mopt_peepholes_and_cse<'a>(func: &mut MFunc<'a>, alloc: Alloc<'a>, stats: &mu
             if is_protected(func, i) {
                 continue;
             }
-            let is_self_mov = match func.ops[i] {
+            let op_i = op_at(func, i);
+            let is_self_mov = match op_i {
                 MOp::Mov { dst, src, wide: true } => dst == src,
                 MOp::MovSp { dst, src } => dst == src,
                 MOp::FpAlu { op: FpAluOp::Mov, dst, rn, .. } => dst == rn,
@@ -2154,7 +2212,7 @@ fn mopt_peepholes_and_cse<'a>(func: &mut MFunc<'a>, alloc: Alloc<'a>, stats: &mu
                 _ => false,
             };
             if is_self_mov {
-                dec_op_vreg_uses(&func.ops[i], &func.copy_pairs, &mut vreg_uses);
+                dec_op_vreg_uses(&op_i, &func.copy_pairs, &mut vreg_uses);
                 mark_deleted(func, i);
                 stats.movs_eliminated = stats.movs_eliminated.saturating_add(1);
             }
@@ -2222,7 +2280,7 @@ fn peephole_dead_narrow32_mov_post_ra(
             continue;
         }
         let MOp::Mov { dst: MReg::P(PReg::Gpr(r)), src: MReg::P(PReg::Gpr(r2)), wide: false } =
-            func.ops[i]
+            op_at(func, i)
         else {
             continue;
         };
@@ -2233,7 +2291,7 @@ fn peephole_dead_narrow32_mov_post_ra(
         let mut definitely_dead_or_overwritten = false;
 
         for k in (i + 1)..end {
-            let op_k = func.ops[k];
+            let op_k = op_at(func, k);
             if matches!(op_k, MOp::Nop) {
                 continue;
             }
@@ -2276,10 +2334,10 @@ fn mopt_post_load_forward_cleanup<'a>(
     let mut zero_hi = ZeroUpper32::new(func, alloc);
     let n_order = func.block_order.len();
     for bi in 0..n_order {
-        let blk = func.block_order[bi];
-        let (start_u, end_u) = func.block_insts[to_idx(blk.0)];
-        let start = to_idx(start_u);
-        let end = to_idx(end_u).min(func.ops.len());
+        let Some(&blk) = func.block_order.get(bi) else {
+            continue;
+        };
+        let (start, end) = block_range(func, blk);
         if start >= end {
             continue;
         }
@@ -2310,7 +2368,7 @@ fn peephole_known_zero_upper32(
     let u32_max = u64::from(u32::MAX);
 
     for i in start..end {
-        let op = func.ops[i];
+        let op = op_at(func, i);
         if matches!(op, MOp::Nop) {
             continue;
         }
@@ -2323,7 +2381,7 @@ fn peephole_known_zero_upper32(
                     stats.movs_eliminated = stats.movs_eliminated.saturating_add(1);
                     continue;
                 }
-                func.ops[i] = MOp::Mov { dst, src, wide: true };
+                set(&mut func.ops, i, MOp::Mov { dst, src, wide: true });
                 stats.peepholes = stats.peepholes.saturating_add(1);
             }
             state.set_zero_hi(dst);
@@ -2510,8 +2568,8 @@ fn peephole_known_zero_upper32(
             MOp::ParallelCopy { start: copy_start, len } => {
                 let s = to_idx(copy_start);
                 let e = s.saturating_add(usize::from(len)).min(func.copy_pairs.len());
-                if s < e {
-                    for &(dst, _) in &func.copy_pairs[s..e] {
+                if let Some(pairs) = func.copy_pairs.get(s..e) {
+                    for &(dst, _) in pairs {
                         state.clear_zero_hi(dst);
                     }
                 }
@@ -2554,7 +2612,7 @@ fn peephole_mov_imm_cse(
     let mut next_evict: usize = 0;
 
     for i in start..end {
-        let op = func.ops[i];
+        let op = op_at(func, i);
         if matches!(op, MOp::Nop) {
             continue;
         }
@@ -2582,8 +2640,8 @@ fn peephole_mov_imm_cse(
                 }
                 let new_op = MOp::Mov { dst, src: existing, wide: true };
                 dec_op_vreg_uses(&op, &func.copy_pairs, vreg_uses);
-                func.ops[i] = new_op;
-                func.flags[i] = MInstFlags::NONE;
+                set(&mut func.ops, i, new_op);
+                set(&mut func.flags, i, MInstFlags::NONE);
                 inc_op_vreg_uses(&new_op, &func.copy_pairs, vreg_uses);
                 stats.peepholes = stats.peepholes.saturating_add(1);
             }
@@ -2604,8 +2662,11 @@ fn peephole_mov_imm_cse(
                     }
                 }
                 if !inserted {
-                    table[next_evict % IMM_CSE_SLOTS] =
-                        ImmCseSlot { valid: true, reg: dst, imm: imm_norm, wide };
+                    set(
+                        &mut table,
+                        next_evict % IMM_CSE_SLOTS,
+                        ImmCseSlot { valid: true, reg: dst, imm: imm_norm, wide },
+                    );
                     next_evict = next_evict.wrapping_add(1);
                 }
             }
@@ -2642,7 +2703,8 @@ fn peephole_local_copy_prop(
     stats: &mut MOptStats,
 ) {
     for i in start..end {
-        let (dst, src, kind) = match func.ops[i] {
+        let op_i = op_at(func, i);
+        let (dst, src, kind) = match op_i {
             MOp::Mov { dst, src, wide: true } if dst != src && is_trackable_reg(dst) => {
                 (dst, src, CopyKind::Wide)
             }
@@ -2665,25 +2727,26 @@ fn peephole_local_copy_prop(
         let scan_end = end.min(i.saturating_add(PEEPHOLE_WINDOW));
 
         for j in (i + 1)..scan_end {
-            if matches!(func.ops[j], MOp::Nop) {
+            let op_j = op_at(func, j);
+            if matches!(op_j, MOp::Nop) {
                 continue;
             }
-            let stop_after_rewrite = is_control_or_call(&func.ops[j]);
-            let uses_dst = match func.ops[j] {
+            let stop_after_rewrite = is_control_or_call(&op_j);
+            let uses_dst = match op_j {
                 MOp::Bl | MOp::Ret | MOp::RawWord { .. } if dst.is_virtual() => false,
                 _ => inst_uses_reg(func, j, dst),
             };
 
             if uses_dst {
                 if !is_protected(func, j) {
-                    let mut candidate = func.ops[j];
+                    let mut candidate = op_j;
                     let res = match kind {
                         CopyKind::Wide => rewrite_gpr_uses_in_op(&mut candidate, dst, src),
                         CopyKind::Narrow32 => rewrite_narrow32_uses_in_op(&mut candidate, dst, src),
                     };
                     if res.rewrote_any {
-                        dec_op_vreg_uses(&func.ops[j], &func.copy_pairs, vreg_uses);
-                        func.ops[j] = candidate;
+                        dec_op_vreg_uses(&op_j, &func.copy_pairs, vreg_uses);
+                        set(&mut func.ops, j, candidate);
                         inc_op_vreg_uses(&candidate, &func.copy_pairs, vreg_uses);
                         stats.peepholes = stats.peepholes.saturating_add(1);
                     }
@@ -2716,7 +2779,7 @@ fn peephole_local_copy_prop(
                 dst_redefined || is_reg_dead_after(func, end, i, dst, vreg_uses)
             };
             if dead {
-                dec_op_vreg_uses(&func.ops[i], &func.copy_pairs, vreg_uses);
+                dec_op_vreg_uses(&op_i, &func.copy_pairs, vreg_uses);
                 mark_deleted(func, i);
                 stats.movs_eliminated = stats.movs_eliminated.saturating_add(1);
             }
@@ -2740,7 +2803,7 @@ fn peephole_commute_sub1_csinc(
             continue;
         }
         let MOp::SubImm { dst: rd, rn, imm12: 1, shift12: false, wide, sets_flags: false } =
-            func.ops[i]
+            op_at(func, i)
         else {
             continue;
         };
@@ -2752,7 +2815,7 @@ fn peephole_commute_sub1_csinc(
         let mut found_j: Option<(usize, MReg, MCond)> = None;
         let scan_end = end.min(i.saturating_add(PEEPHOLE_WINDOW));
         for k in (i + 1)..scan_end {
-            let op_k = func.ops[k];
+            let op_k = op_at(func, k);
             if matches!(op_k, MOp::Nop) {
                 continue;
             }
@@ -2805,7 +2868,7 @@ fn peephole_commute_sub1_csinc(
         let mut cmp_to_delete: Option<usize> = None;
         let cmp_scan_end = end.min(j.saturating_add(PEEPHOLE_WINDOW));
         for c in (j + 1)..cmp_scan_end {
-            let op_c = func.ops[c];
+            let op_c = op_at(func, c);
             if matches!(op_c, MOp::Nop) {
                 continue;
             }
@@ -2838,8 +2901,8 @@ fn peephole_commute_sub1_csinc(
         // 3. Apply the sound commute:
         //    - `[i]` <- `Csinc { dst: rd, rn, rm: rn, cond, wide }` (inherits `vflag_use[j]`)
         //    - `[j]` <- `SubImm { dst: cinc_rd, rn: rd, imm12: 1, sets_flags: cmp_to_delete.is_some() }`
-        let old_i = func.ops[i];
-        let old_j = func.ops[j];
+        let old_i = op_at(func, i);
+        let old_j = op_at(func, j);
         dec_op_vreg_uses(&old_i, &func.copy_pairs, vreg_uses);
         dec_op_vreg_uses(&old_j, &func.copy_pairs, vreg_uses);
 
@@ -2853,23 +2916,25 @@ fn peephole_commute_sub1_csinc(
             sets_flags: cmp_to_delete.is_some(),
         };
 
-        func.ops[i] = new_i;
-        func.vflag_use[i] = func.vflag_use[j];
-        func.vflag_def[i] = NO_VFLAG;
+        let vf_use_j = vflag_use_at(func, j);
+        set(&mut func.ops, i, new_i);
+        set(&mut func.vflag_use, i, vf_use_j);
+        set(&mut func.vflag_def, i, NO_VFLAG);
 
-        func.ops[j] = new_j;
-        func.vflag_use[j] = NO_VFLAG;
+        set(&mut func.ops, j, new_j);
+        set(&mut func.vflag_use, j, NO_VFLAG);
 
         inc_op_vreg_uses(&new_i, &func.copy_pairs, vreg_uses);
         inc_op_vreg_uses(&new_j, &func.copy_pairs, vreg_uses);
 
         if let Some(c) = cmp_to_delete {
-            let cmp_vdef = func.vflag_def[c];
-            dec_op_vreg_uses(&func.ops[c], &func.copy_pairs, vreg_uses);
+            let cmp_vdef = vflag_def_at(func, c);
+            let op_c = op_at(func, c);
+            dec_op_vreg_uses(&op_c, &func.copy_pairs, vreg_uses);
             mark_deleted(func, c);
-            func.vflag_def[j] = cmp_vdef;
+            set(&mut func.vflag_def, j, cmp_vdef);
         } else {
-            func.vflag_def[j] = NO_VFLAG;
+            set(&mut func.vflag_def, j, NO_VFLAG);
         }
         stats.peepholes = stats.peepholes.saturating_add(1);
     }
@@ -2890,25 +2955,26 @@ fn peephole_sink_sub_into_cmp(
         if is_protected(func, i) {
             continue;
         }
-        let MOp::SubImm { dst, rn, imm12, shift12, wide, sets_flags: false } = func.ops[i] else {
+        let op_i = op_at(func, i);
+        let MOp::SubImm { dst, rn, imm12, shift12, wide, sets_flags: false } = op_i else {
             continue;
         };
         // CRITICAL: `dst != rn` prevents self-clobber miscompilation; `dst` must also be `GprOrZr`.
         if dst == rn || is_sp_or_xzr(dst) {
             continue;
         }
-        if func.vflag_def[i] != NO_VFLAG || func.vflag_use[i] != NO_VFLAG {
+        if vflag_def_at(func, i) != NO_VFLAG || vflag_use_at(func, i) != NO_VFLAG {
             continue;
         }
 
         let scan_end = end.min(i.saturating_add(PEEPHOLE_WINDOW));
         for j in (i + 1)..scan_end {
-            let op_j = func.ops[j];
+            let op_j = op_at(func, j);
             if matches!(op_j, MOp::Nop) {
                 continue;
             }
             if !is_protected(func, j)
-                && func.vflag_use[j] == NO_VFLAG
+                && vflag_use_at(func, j) == NO_VFLAG
                 && let MOp::CmpImm { rn: jrn, imm12: jimm, shift12: jsh, wide: jwide } = op_j
                 && jrn == rn
                 && jimm == imm12
@@ -2916,12 +2982,12 @@ fn peephole_sink_sub_into_cmp(
                 && jwide == wide
             {
                 // Delete `SubImm` at `i` and rewrite `CmpImm` at `j` in place, preserving `vflag_def[j]`.
-                dec_op_vreg_uses(&func.ops[i], &func.copy_pairs, vreg_uses);
-                dec_op_vreg_uses(&func.ops[j], &func.copy_pairs, vreg_uses);
+                dec_op_vreg_uses(&op_i, &func.copy_pairs, vreg_uses);
+                dec_op_vreg_uses(&op_j, &func.copy_pairs, vreg_uses);
                 mark_deleted(func, i);
 
                 let fused = MOp::SubImm { dst, rn, imm12, shift12, wide, sets_flags: true };
-                func.ops[j] = fused;
+                set(&mut func.ops, j, fused);
                 inc_op_vreg_uses(&fused, &func.copy_pairs, vreg_uses);
                 stats.peepholes = stats.peepholes.saturating_add(1);
                 break;
@@ -2929,7 +2995,7 @@ fn peephole_sink_sub_into_cmp(
 
             if is_control_or_call(&op_j)
                 || is_call_or_mem_barrier(func, j)
-                || func.flags[j].contains(MInstFlags::MAY_TRAP)
+                || flags_at(func, j).contains(MInstFlags::MAY_TRAP)
                 || matches!(op_j, MOp::RawWord { .. } | MOp::ParallelCopy { .. })
                 || inst_touches_reg(func, j, dst)
                 || inst_defines_reg(func, j, rn)
@@ -2952,10 +3018,11 @@ fn peephole_fuse_addsub_cmp_zero(
     stats: &mut MOptStats,
 ) {
     for i in start..end {
-        if is_protected(func, i) || func.vflag_def[i] != NO_VFLAG || func.vflag_use[i] != NO_VFLAG {
+        if is_protected(func, i) || vflag_def_at(func, i) != NO_VFLAG || vflag_use_at(func, i) != NO_VFLAG
+        {
             continue;
         }
-        let (prev_dst, wide) = match func.ops[i] {
+        let (prev_dst, wide) = match op_at(func, i) {
             MOp::AddImm { dst, wide, sets_flags: false, .. }
             | MOp::SubImm { dst, wide, sets_flags: false, .. }
             | MOp::AddReg { dst, wide, sets_flags: false, .. }
@@ -2969,7 +3036,7 @@ fn peephole_fuse_addsub_cmp_zero(
 
         let scan_end = end.min(i.saturating_add(PEEPHOLE_WINDOW));
         for j in (i + 1)..scan_end {
-            let op_j = func.ops[j];
+            let op_j = op_at(func, j);
             if matches!(op_j, MOp::Nop) {
                 continue;
             }
@@ -2979,18 +3046,20 @@ fn peephole_fuse_addsub_cmp_zero(
                 && cmp_wide == wide
             {
                 if flags_consumers_satisfy(func, j, end, cond_only_nz) {
-                    let cmp_vdef = func.vflag_def[j];
-                    match &mut func.ops[i] {
-                        MOp::AddImm { sets_flags, .. }
-                        | MOp::SubImm { sets_flags, .. }
-                        | MOp::AddReg { sets_flags, .. }
-                        | MOp::SubReg { sets_flags, .. } => {
-                            *sets_flags = true;
+                    let cmp_vdef = vflag_def_at(func, j);
+                    if let Some(op_i_mut) = func.ops.get_mut(i) {
+                        match op_i_mut {
+                            MOp::AddImm { sets_flags, .. }
+                            | MOp::SubImm { sets_flags, .. }
+                            | MOp::AddReg { sets_flags, .. }
+                            | MOp::SubReg { sets_flags, .. } => {
+                                *sets_flags = true;
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
-                    func.vflag_def[i] = cmp_vdef;
-                    dec_op_vreg_uses(&func.ops[j], &func.copy_pairs, vreg_uses);
+                    set(&mut func.vflag_def, i, cmp_vdef);
+                    dec_op_vreg_uses(&op_j, &func.copy_pairs, vreg_uses);
                     mark_deleted(func, j);
                     stats.peepholes = stats.peepholes.saturating_add(1);
                 }
@@ -3023,7 +3092,8 @@ fn peephole_fuse_lsr_ubfx(
         if is_protected(func, i) {
             continue;
         }
-        let MOp::Ubfm { dst: rd, rn, immr: sh, imms, wide } = func.ops[i] else {
+        let op_i = op_at(func, i);
+        let MOp::Ubfm { dst: rd, rn, immr: sh, imms, wide } = op_i else {
             continue;
         };
         let width: u8 = if wide { 64 } else { 32 };
@@ -3034,7 +3104,7 @@ fn peephole_fuse_lsr_ubfx(
 
         let scan_end = end.min(i.saturating_add(PEEPHOLE_WINDOW));
         for j in (i + 1)..scan_end {
-            let op_j = func.ops[j];
+            let op_j = op_at(func, j);
             if matches!(op_j, MOp::Nop) {
                 continue;
             }
@@ -3067,10 +3137,10 @@ fn peephole_fuse_lsr_ubfx(
                             imms: new_imms,
                             wide,
                         };
-                        dec_op_vreg_uses(&func.ops[i], &func.copy_pairs, vreg_uses);
-                        dec_op_vreg_uses(&func.ops[j], &func.copy_pairs, vreg_uses);
+                        dec_op_vreg_uses(&op_i, &func.copy_pairs, vreg_uses);
+                        dec_op_vreg_uses(&op_j, &func.copy_pairs, vreg_uses);
                         mark_deleted(func, i);
-                        func.ops[j] = fused;
+                        set(&mut func.ops, j, fused);
                         inc_op_vreg_uses(&fused, &func.copy_pairs, vreg_uses);
                         stats.peepholes = stats.peepholes.saturating_add(1);
                     }
@@ -3143,7 +3213,8 @@ fn peephole_fuse_shift_into_alu(
         if is_protected(func, i) {
             continue;
         }
-        let Some(sh) = decode_const_shift(func.ops[i]) else {
+        let op_i = op_at(func, i);
+        let Some(sh) = decode_const_shift(op_i) else {
             continue;
         };
         let tmp = sh.dst;
@@ -3154,7 +3225,7 @@ fn peephole_fuse_shift_into_alu(
 
         let scan_end = end.min(i.saturating_add(PEEPHOLE_WINDOW));
         for j in (i + 1)..scan_end {
-            let op_j = func.ops[j];
+            let op_j = op_at(func, j);
             if matches!(op_j, MOp::Nop) {
                 continue;
             }
@@ -3273,10 +3344,10 @@ fn peephole_fuse_shift_into_alu(
                             is_reg_dead_after(func, end, j, tmp, vreg_uses)
                         };
                     if tmp_dead {
-                        dec_op_vreg_uses(&func.ops[i], &func.copy_pairs, vreg_uses);
-                        dec_op_vreg_uses(&func.ops[j], &func.copy_pairs, vreg_uses);
+                        dec_op_vreg_uses(&op_i, &func.copy_pairs, vreg_uses);
+                        dec_op_vreg_uses(&op_j, &func.copy_pairs, vreg_uses);
                         mark_deleted(func, i);
-                        func.ops[j] = fused;
+                        set(&mut func.ops, j, fused);
                         inc_op_vreg_uses(&fused, &func.copy_pairs, vreg_uses);
                         stats.peepholes = stats.peepholes.saturating_add(1);
                     }
@@ -3313,9 +3384,11 @@ fn peephole_fuse_neg_add(
         return;
     }
     for i in start..end {
-        if is_protected(func, i) || func.vflag_def[i] != NO_VFLAG || func.vflag_use[i] != NO_VFLAG {
+        if is_protected(func, i) || vflag_def_at(func, i) != NO_VFLAG || vflag_use_at(func, i) != NO_VFLAG
+        {
             continue;
         }
+        let op_i = op_at(func, i);
         let MOp::SubReg {
             dst: MReg::V(t),
             rn: MReg::P(PReg::Xzr),
@@ -3323,7 +3396,7 @@ fn peephole_fuse_neg_add(
             shift,
             wide,
             sets_flags: false,
-        } = func.ops[i]
+        } = op_i
         else {
             continue;
         };
@@ -3337,7 +3410,7 @@ fn peephole_fuse_neg_add(
 
         let scan_end = end.min(i.saturating_add(PEEPHOLE_WINDOW));
         for j in (i + 1)..scan_end {
-            let op_j = func.ops[j];
+            let op_j = op_at(func, j);
             if matches!(op_j, MOp::Nop) {
                 continue;
             }
@@ -3365,10 +3438,10 @@ fn peephole_fuse_neg_add(
                             wide,
                             sets_flags,
                         };
-                        dec_op_vreg_uses(&func.ops[i], &func.copy_pairs, vreg_uses);
-                        dec_op_vreg_uses(&func.ops[j], &func.copy_pairs, vreg_uses);
+                        dec_op_vreg_uses(&op_i, &func.copy_pairs, vreg_uses);
+                        dec_op_vreg_uses(&op_j, &func.copy_pairs, vreg_uses);
                         mark_deleted(func, i);
-                        func.ops[j] = fused;
+                        set(&mut func.ops, j, fused);
                         inc_op_vreg_uses(&fused, &func.copy_pairs, vreg_uses);
                         stats.peepholes = stats.peepholes.saturating_add(1);
                     }
@@ -3405,34 +3478,35 @@ fn peephole_fuse_cset_add(
         return;
     }
     for i in start..end {
-        if is_protected(func, i) || func.vflag_def[i] != NO_VFLAG {
+        if is_protected(func, i) || vflag_def_at(func, i) != NO_VFLAG {
             continue;
         }
+        let op_i = op_at(func, i);
         let MOp::Csinc {
             dst: MReg::V(c),
             rn: MReg::P(PReg::Xzr),
             rm: MReg::P(PReg::Xzr),
             cond,
             wide: _,
-        } = func.ops[i]
+        } = op_i
         else {
             continue;
         };
         if vreg_uses.get(to_idx(c.0)).copied().unwrap_or(0) != 1 {
             continue;
         }
-        let vf = func.vflag_use[i];
+        let vf = vflag_use_at(func, i);
         let tmp = MReg::V(c);
 
         let scan_end = end.min(i.saturating_add(PEEPHOLE_WINDOW));
         for j in (i + 1)..scan_end {
-            let op_j = func.ops[j];
+            let op_j = op_at(func, j);
             if matches!(op_j, MOp::Nop) {
                 continue;
             }
             if !is_protected(func, j)
-                && func.vflag_def[j] == NO_VFLAG
-                && func.vflag_use[j] == NO_VFLAG
+                && vflag_def_at(func, j) == NO_VFLAG
+                && vflag_use_at(func, j) == NO_VFLAG
                 && let MOp::AddReg { dst, rn: a, rm: b, shift: None, wide: w2, sets_flags: false } =
                     op_j
                 && a != b
@@ -3446,11 +3520,11 @@ fn peephole_fuse_cset_add(
                 };
                 if let Some(other) = other_opt {
                     let fused = MOp::Csinc { dst, rn: other, rm: other, cond, wide: w2 };
-                    dec_op_vreg_uses(&func.ops[i], &func.copy_pairs, vreg_uses);
-                    dec_op_vreg_uses(&func.ops[j], &func.copy_pairs, vreg_uses);
+                    dec_op_vreg_uses(&op_i, &func.copy_pairs, vreg_uses);
+                    dec_op_vreg_uses(&op_j, &func.copy_pairs, vreg_uses);
                     mark_deleted(func, i);
-                    func.ops[j] = fused;
-                    func.vflag_use[j] = vf;
+                    set(&mut func.ops, j, fused);
+                    set(&mut func.vflag_use, j, vf);
                     inc_op_vreg_uses(&fused, &func.copy_pairs, vreg_uses);
                     stats.peepholes = stats.peepholes.saturating_add(1);
                     break;
@@ -3458,7 +3532,7 @@ fn peephole_fuse_cset_add(
             }
 
             if op_j.writes_flags()
-                || func.vflag_def[j] != NO_VFLAG
+                || vflag_def_at(func, j) != NO_VFLAG
                 || is_control_or_call(&op_j)
                 || is_call_or_mem_barrier(func, j)
                 || matches!(op_j, MOp::RawWord { .. } | MOp::ParallelCopy { .. })
@@ -3531,7 +3605,7 @@ fn record_load_slot(
             return;
         }
     }
-    table[*next_evict % LOAD_SLOTS] = entry;
+    set(table, *next_evict % LOAD_SLOTS, entry);
     *next_evict = next_evict.wrapping_add(1);
 }
 
@@ -3579,10 +3653,10 @@ fn invalidate_slots_for_reg_def(table: &mut [LoadSlot; LOAD_SLOTS], def_reg: MRe
 fn mopt_redundant_loads(func: &mut MFunc<'_>, stats: &mut MOptStats) {
     let n_order = func.block_order.len();
     for bi in 0..n_order {
-        let blk = func.block_order[bi];
-        let (start_u, end_u) = func.block_insts[to_idx(blk.0)];
-        let start = to_idx(start_u);
-        let end = to_idx(end_u).min(func.ops.len());
+        let Some(&blk) = func.block_order.get(bi) else {
+            continue;
+        };
+        let (start, end) = block_range(func, blk);
         if start >= end {
             continue;
         }
@@ -3591,7 +3665,7 @@ fn mopt_redundant_loads(func: &mut MFunc<'_>, stats: &mut MOptStats) {
         let mut next_evict: usize = 0;
 
         for i in start..end {
-            let op = func.ops[i];
+            let op = op_at(func, i);
             if matches!(op, MOp::Nop) {
                 continue;
             }
@@ -3692,8 +3766,8 @@ fn mopt_redundant_loads(func: &mut MFunc<'_>, stats: &mut MOptStats) {
                                 elem_size: 0,
                             },
                         };
-                        func.ops[i] = fwd_op;
-                        func.flags[i] = MInstFlags::NONE;
+                        set(&mut func.ops, i, fwd_op);
+                        set(&mut func.flags, i, MInstFlags::NONE);
                         stats.loads_forwarded = stats.loads_forwarded.saturating_add(1);
                         invalidate_slots_for_reg_def(&mut table, dst);
                         if dst != base && is_trackable_reg(dst) {
@@ -3858,7 +3932,7 @@ fn mopt_redundant_loads(func: &mut MFunc<'_>, stats: &mut MOptStats) {
                             {
                                 let mut dup = *slot;
                                 dup.val = dst;
-                                copied[n_copied] = dup;
+                                set(&mut copied, n_copied, dup);
                                 n_copied += 1;
                             }
                         }
@@ -3874,7 +3948,8 @@ fn mopt_redundant_loads(func: &mut MFunc<'_>, stats: &mut MOptStats) {
                     invalidate_all_slots(&mut table);
                 }
                 _ => {
-                    if func.flags[i].contains(MInstFlags::MEM_WRITE) || is_control_or_call(&op) {
+                    if flags_at(func, i).contains(MInstFlags::MEM_WRITE) || is_control_or_call(&op)
+                    {
                         invalidate_all_slots(&mut table);
                     } else {
                         for slot in &mut table {
@@ -3930,11 +4005,12 @@ fn inst_may_alias_mem(
     if is_volatile_inst(func, k) || is_call_or_mem_barrier(func, k) {
         return true;
     }
-    let op = func.ops[k];
+    let op = op_at(func, k);
     if matches!(op, MOp::RawWord { .. } | MOp::ParallelCopy { .. }) || is_control_or_call(&op) {
         return true;
     }
-    if func.flags[k].contains(MInstFlags::MAY_TRAP) {
+    let fl = flags_at(func, k);
+    if fl.contains(MInstFlags::MAY_TRAP) {
         return true;
     }
     match op {
@@ -3965,10 +4041,7 @@ fn inst_may_alias_mem(
                     ))
         }
         MOp::Ldr { .. } | MOp::Ldp { .. } => check_reads,
-        _ => {
-            func.flags[k].contains(MInstFlags::MEM_WRITE)
-                || (check_reads && func.flags[k].contains(MInstFlags::MEM_READ))
-        }
+        _ => fl.contains(MInstFlags::MEM_WRITE) || (check_reads && fl.contains(MInstFlags::MEM_READ)),
     }
 }
 
@@ -3990,10 +4063,10 @@ fn mopt_pair_ldp_stp_and_post_index<'a>(
 fn mopt_pair_ldp_stp(func: &mut MFunc<'_>, stats: &mut MOptStats) {
     let n_order = func.block_order.len();
     for bi in 0..n_order {
-        let blk = func.block_order[bi];
-        let (start_u, end_u) = func.block_insts[to_idx(blk.0)];
-        let start = to_idx(start_u);
-        let end = to_idx(end_u).min(func.ops.len());
+        let Some(&blk) = func.block_order.get(bi) else {
+            continue;
+        };
+        let (start, end) = block_range(func, blk);
         if start >= end {
             continue;
         }
@@ -4002,7 +4075,7 @@ fn mopt_pair_ldp_stp(func: &mut MFunc<'_>, stats: &mut MOptStats) {
             if is_protected(func, i) || is_volatile_inst(func, i) {
                 continue;
             }
-            match func.ops[i] {
+            match op_at(func, i) {
                 MOp::Ldr {
                     dst: dst_i,
                     addr: AddrMode::BaseOff { base, off: off_i },
@@ -4012,7 +4085,7 @@ fn mopt_pair_ldp_stp(func: &mut MFunc<'_>, stats: &mut MOptStats) {
                     let elem = i32::try_from(size.byte_size()).unwrap_or(8);
                     let scan_end = end.min(i.saturating_add(PAIR_WINDOW));
                     for j in (i + 1)..scan_end {
-                        let op_j = func.ops[j];
+                        let op_j = op_at(func, j);
                         if matches!(op_j, MOp::Nop) {
                             continue;
                         }
@@ -4042,7 +4115,7 @@ fn mopt_pair_ldp_stp(func: &mut MFunc<'_>, stats: &mut MOptStats) {
                                 let mut can_hoist_j = true;
                                 let mut can_sink_i = true;
                                 for k in (i + 1)..j {
-                                    if matches!(func.ops[k], MOp::Nop) {
+                                    if matches!(op_at(func, k), MOp::Nop) {
                                         continue;
                                     }
                                     if inst_defines_reg(func, k, base) {
@@ -4086,15 +4159,15 @@ fn mopt_pair_ldp_stp(func: &mut MFunc<'_>, stats: &mut MOptStats) {
                                     pre_idx: false,
                                 };
                                 if can_hoist_j {
-                                    func.ops[i] = ldp;
-                                    func.flags[i] = MInstFlags::MEM_READ;
+                                    set(&mut func.ops, i, ldp);
+                                    set(&mut func.flags, i, MInstFlags::MEM_READ);
                                     mark_deleted(func, j);
                                     stats.pairs_formed = stats.pairs_formed.saturating_add(1);
                                     break;
                                 } else if can_sink_i {
                                     mark_deleted(func, i);
-                                    func.ops[j] = ldp;
-                                    func.flags[j] = MInstFlags::MEM_READ;
+                                    set(&mut func.ops, j, ldp);
+                                    set(&mut func.flags, j, MInstFlags::MEM_READ);
                                     stats.pairs_formed = stats.pairs_formed.saturating_add(1);
                                     break;
                                 }
@@ -4117,7 +4190,7 @@ fn mopt_pair_ldp_stp(func: &mut MFunc<'_>, stats: &mut MOptStats) {
                     let elem = i32::try_from(size.byte_size()).unwrap_or(8);
                     let scan_end = end.min(i.saturating_add(PAIR_WINDOW));
                     for j in (i + 1)..scan_end {
-                        let op_j = func.ops[j];
+                        let op_j = op_at(func, j);
                         if matches!(op_j, MOp::Nop) {
                             continue;
                         }
@@ -4144,7 +4217,7 @@ fn mopt_pair_ldp_stp(func: &mut MFunc<'_>, stats: &mut MOptStats) {
                                 let mut can_sink_i = true;
                                 let mut can_hoist_j = true;
                                 for k in (i + 1)..j {
-                                    if matches!(func.ops[k], MOp::Nop) {
+                                    if matches!(op_at(func, k), MOp::Nop) {
                                         continue;
                                     }
                                     if inst_defines_reg(func, k, base) {
@@ -4189,13 +4262,13 @@ fn mopt_pair_ldp_stp(func: &mut MFunc<'_>, stats: &mut MOptStats) {
                                 };
                                 if can_sink_i {
                                     mark_deleted(func, i);
-                                    func.ops[j] = stp;
-                                    func.flags[j] = MInstFlags::MEM_WRITE;
+                                    set(&mut func.ops, j, stp);
+                                    set(&mut func.flags, j, MInstFlags::MEM_WRITE);
                                     stats.pairs_formed = stats.pairs_formed.saturating_add(1);
                                     break;
                                 } else if can_hoist_j {
-                                    func.ops[i] = stp;
-                                    func.flags[i] = MInstFlags::MEM_WRITE;
+                                    set(&mut func.ops, i, stp);
+                                    set(&mut func.flags, i, MInstFlags::MEM_WRITE);
                                     mark_deleted(func, j);
                                     stats.pairs_formed = stats.pairs_formed.saturating_add(1);
                                     break;
@@ -4220,10 +4293,10 @@ fn mopt_pair_ldp_stp(func: &mut MFunc<'_>, stats: &mut MOptStats) {
 fn mopt_fuse_post_index(func: &mut MFunc<'_>, stats: &mut MOptStats) {
     let n_order = func.block_order.len();
     for bi in 0..n_order {
-        let blk = func.block_order[bi];
-        let (start_u, end_u) = func.block_insts[to_idx(blk.0)];
-        let start = to_idx(start_u);
-        let end = to_idx(end_u).min(func.ops.len());
+        let Some(&blk) = func.block_order.get(bi) else {
+            continue;
+        };
+        let (start, end) = block_range(func, blk);
         if start >= end {
             continue;
         }
@@ -4232,7 +4305,7 @@ fn mopt_fuse_post_index(func: &mut MFunc<'_>, stats: &mut MOptStats) {
             if is_protected(func, i) || is_volatile_inst(func, i) {
                 continue;
             }
-            let (base, size, is_pair) = match func.ops[i] {
+            let (base, size, is_pair) = match op_at(func, i) {
                 MOp::Ldr { dst, addr: AddrMode::BaseOff { base, off: 0 }, size, .. }
                     if is_pairable_size(size)
                         && base != MReg::SP
@@ -4286,7 +4359,7 @@ fn mopt_fuse_post_index(func: &mut MFunc<'_>, stats: &mut MOptStats) {
 
             let scan_end = end.min(i.saturating_add(POST_IDX_WINDOW));
             for j in (i + 1)..scan_end {
-                let op_j = func.ops[j];
+                let op_j = op_at(func, j);
                 if matches!(op_j, MOp::Nop) {
                     continue;
                 }
@@ -4321,15 +4394,18 @@ fn mopt_fuse_post_index(func: &mut MFunc<'_>, stats: &mut MOptStats) {
                         };
 
                         if let Some(step_i16) = legal_step {
-                            match &mut func.ops[i] {
-                                MOp::Ldr { addr, .. } | MOp::Str { addr, .. } => {
-                                    *addr = AddrMode::PostIdx { base, off: step_i16 };
+                            if let Some(op_i_mut) = func.ops.get_mut(i) {
+                                match op_i_mut {
+                                    MOp::Ldr { addr, .. } | MOp::Str { addr, .. } => {
+                                        *addr = AddrMode::PostIdx { base, off: step_i16 };
+                                    }
+                                    MOp::Ldp { off, post_idx, .. }
+                                    | MOp::Stp { off, post_idx, .. } => {
+                                        *off = step_i16;
+                                        *post_idx = true;
+                                    }
+                                    _ => {}
                                 }
-                                MOp::Ldp { off, post_idx, .. } | MOp::Stp { off, post_idx, .. } => {
-                                    *off = step_i16;
-                                    *post_idx = true;
-                                }
-                                _ => {}
                             }
                             mark_deleted(func, j);
                             stats.post_idx_formed = stats.post_idx_formed.saturating_add(1);
@@ -4343,7 +4419,7 @@ fn mopt_fuse_post_index(func: &mut MFunc<'_>, stats: &mut MOptStats) {
                 if inst_touches_reg(func, j, base)
                     || is_control_or_call(&op_j)
                     || is_call_or_mem_barrier(func, j)
-                    || func.flags[j].contains(MInstFlags::MAY_TRAP)
+                    || flags_at(func, j).contains(MInstFlags::MAY_TRAP)
                     || matches!(op_j, MOp::RawWord { .. } | MOp::ParallelCopy { .. })
                 {
                     break;
@@ -4372,8 +4448,8 @@ fn pass_through_target(
 
     let mut active_idx: Option<usize> = None;
     for i in start..end {
-        if matches!(func.ops[i], MOp::Nop) {
-            if func.note_idx[i] != NO_NOTE || func.flags[i].contains(MInstFlags::PINNED) {
+        if matches!(op_at(func, i), MOp::Nop) {
+            if note_at(func, i) != NO_NOTE || flags_at(func, i).contains(MInstFlags::PINNED) {
                 return None;
             }
             continue;
@@ -4389,7 +4465,7 @@ fn pass_through_target(
             if is_protected(func, idx) {
                 return None;
             }
-            if let MOp::B { target } = func.ops[idx] {
+            if let MOp::B { target } = op_at(func, idx) {
                 Some(target)
             } else {
                 None
@@ -4483,7 +4559,7 @@ fn block_ends_with_uncond_term(func: &MFunc<'_>, blk: MBlock) -> bool {
     let start = to_idx(start_u);
     let end = to_idx(end_u).min(func.ops.len());
     for i in (start..end).rev() {
-        let op = func.ops[i];
+        let op = op_at(func, i);
         if matches!(op, MOp::Nop) {
             continue;
         }
@@ -4504,7 +4580,7 @@ fn is_short_pure_fallthrough_block(func: &MFunc<'_>, blk: MBlock) -> bool {
     let end = to_idx(end_u).min(func.ops.len());
     let mut non_nop_count: usize = 0;
     for i in start..end {
-        let op = func.ops[i];
+        let op = op_at(func, i);
         if matches!(op, MOp::Nop) {
             continue;
         }
@@ -4533,8 +4609,8 @@ fn is_empty_or_unprotected_trampoline(func: &MFunc<'_>, blk: MBlock) -> bool {
     let end = to_idx(end_u).min(func.ops.len());
     let mut non_nop_idx: Option<usize> = None;
     for i in start..end {
-        if matches!(func.ops[i], MOp::Nop) {
-            if func.note_idx[i] != NO_NOTE || func.flags[i].contains(MInstFlags::PINNED) {
+        if matches!(op_at(func, i), MOp::Nop) {
+            if note_at(func, i) != NO_NOTE || flags_at(func, i).contains(MInstFlags::PINNED) {
                 return false;
             }
             continue;
@@ -4546,7 +4622,7 @@ fn is_empty_or_unprotected_trampoline(func: &MFunc<'_>, blk: MBlock) -> bool {
     }
     match non_nop_idx {
         None => true,
-        Some(idx) => !is_protected(func, idx) && matches!(func.ops[idx], MOp::B { .. }),
+        Some(idx) => !is_protected(func, idx) && matches!(op_at(func, idx), MOp::B { .. }),
     }
 }
 
@@ -4564,15 +4640,17 @@ fn refresh_order_maps(
         *slot = u32::MAX;
     }
     for pair in func.block_order.windows(2) {
-        let b = to_idx(pair[0].0);
-        if b < num_blocks {
-            next_in_order[b] = pair[1].0;
+        if let &[a, b_next] = pair {
+            let b = to_idx(a.0);
+            if b < num_blocks {
+                set(next_in_order, b, b_next.0);
+            }
         }
     }
     for (pos, &blk) in func.block_order.iter().enumerate() {
         let b = to_idx(blk.0);
         if b < num_blocks {
-            block_ord_pos[b] = u32_of(pos).unwrap_or(u32::MAX);
+            set(block_ord_pos, b, u32_of(pos).unwrap_or(u32::MAX));
         }
     }
 }
@@ -4587,21 +4665,21 @@ fn mopt_branch_fold_fallthrough(
     let mut changed = false;
     let n_order = func.block_order.len();
     for bi in 0..n_order {
-        let blk = func.block_order[bi];
+        let Some(&blk) = func.block_order.get(bi) else {
+            continue;
+        };
         let next_id = next_in_order.get(to_idx(blk.0)).copied().unwrap_or(u32::MAX);
         if next_id == u32::MAX {
             // Last block in `block_order` MUST keep its unconditional terminator (`mverify`).
             continue;
         }
         let next_blk = MBlock(next_id);
-        let (start_u, end_u) = func.block_insts[to_idx(blk.0)];
-        let start = to_idx(start_u);
-        let end = to_idx(end_u).min(func.ops.len());
+        let (start, end) = block_range(func, blk);
 
         let mut last_idx: Option<usize> = None;
         let mut prev_idx: Option<usize> = None;
         for i in (start..end).rev() {
-            if matches!(func.ops[i], MOp::Nop) {
+            if matches!(op_at(func, i), MOp::Nop) {
                 continue;
             }
             if last_idx.is_none() {
@@ -4615,10 +4693,11 @@ fn mopt_branch_fold_fallthrough(
         let Some(last) = last_idx else {
             continue;
         };
+        let op_last = op_at(func, last);
 
         // Case 1: Trailing `B { target: uncond_target }`.
         if !is_protected(func, last)
-            && let MOp::B { target: uncond_target } = func.ops[last]
+            && let MOp::B { target: uncond_target } = op_last
         {
             if fallthrough_reaches(func, next_in_order, next_blk, uncond_target, blk) {
                 // Redundant fallthrough `B`!
@@ -4629,8 +4708,8 @@ fn mopt_branch_fold_fallthrough(
                 // If the preceding conditional branch ALSO reaches fallthrough, delete it too.
                 if let Some(prev) = prev_idx
                     && !is_protected(func, prev)
-                    && func.ops[prev].is_conditional_branch()
-                    && let Some(prev_target) = func.ops[prev].branch_target()
+                    && op_at(func, prev).is_conditional_branch()
+                    && let Some(prev_target) = op_at(func, prev).branch_target()
                     && fallthrough_reaches(func, next_in_order, next_blk, prev_target, blk)
                 {
                     mark_deleted(func, prev);
@@ -4643,8 +4722,8 @@ fn mopt_branch_fold_fallthrough(
             // both paths reach `uncond_target` so the conditional branch is dead.
             if let Some(prev) = prev_idx
                 && !is_protected(func, prev)
-                && func.ops[prev].is_conditional_branch()
-                && func.ops[prev].branch_target() == Some(uncond_target)
+                && op_at(func, prev).is_conditional_branch()
+                && op_at(func, prev).branch_target() == Some(uncond_target)
             {
                 mark_deleted(func, prev);
                 stats.branches_folded = stats.branches_folded.saturating_add(1);
@@ -4663,12 +4742,12 @@ fn mopt_branch_fold_fallthrough(
             //    `cond_target` (1 taken branch + macro-op fusion per iter!).
             if let Some(prev) = prev_idx
                 && !is_protected(func, prev)
-                && func.ops[prev].is_conditional_branch()
-                && let Some(cond_target) = func.ops[prev].branch_target()
+                && op_at(func, prev).is_conditional_branch()
+                && let Some(cond_target) = op_at(func, prev).branch_target()
             {
                 if fallthrough_reaches(func, next_in_order, next_blk, cond_target, blk) {
-                    if let Some(inv_op) = invert_cond_branch(func.ops[prev], uncond_target) {
-                        func.ops[prev] = inv_op;
+                    if let Some(inv_op) = invert_cond_branch(op_at(func, prev), uncond_target) {
+                        set(&mut func.ops, prev, inv_op);
                         mark_deleted(func, last);
                         stats.branches_folded = stats.branches_folded.saturating_add(1);
                         changed = true;
@@ -4683,10 +4762,10 @@ fn mopt_branch_fold_fallthrough(
                     if uncond_pos <= ord_pos
                         && (cond_pos > ord_pos || uncond_pos == ord_pos)
                         && cond_pos != u32::MAX
-                        && let Some(inv_op) = invert_cond_branch(func.ops[prev], uncond_target)
+                        && let Some(inv_op) = invert_cond_branch(op_at(func, prev), uncond_target)
                     {
-                        func.ops[prev] = inv_op;
-                        func.ops[last] = MOp::B { target: cond_target };
+                        set(&mut func.ops, prev, inv_op);
+                        set(&mut func.ops, last, MOp::B { target: cond_target });
                         stats.branches_folded = stats.branches_folded.saturating_add(1);
                         changed = true;
                     }
@@ -4697,8 +4776,8 @@ fn mopt_branch_fold_fallthrough(
 
         // Case 2: Trailing conditional branch reaching fallthrough (both paths reach the same block).
         if !is_protected(func, last)
-            && func.ops[last].is_conditional_branch()
-            && let Some(cond_target) = func.ops[last].branch_target()
+            && op_last.is_conditional_branch()
+            && let Some(cond_target) = op_last.branch_target()
             && fallthrough_reaches(func, next_in_order, next_blk, cond_target, blk)
         {
             mark_deleted(func, last);
@@ -4734,18 +4813,20 @@ fn mopt_branch_opt<'a>(func: &mut MFunc<'a>, alloc: Alloc<'a>, stats: &mut MOptS
 
     // 4a. Thread branches targeting empty pass-through blocks (bounded hops <= 16).
     for bi in 0..n_order {
-        let blk = func.block_order[bi];
-        let (start_u, end_u) = func.block_insts[to_idx(blk.0)];
-        let start = to_idx(start_u);
-        let end = to_idx(end_u).min(func.ops.len());
+        let Some(&blk) = func.block_order.get(bi) else {
+            continue;
+        };
+        let (start, end) = block_range(func, blk);
         for i in start..end {
             if is_protected(func, i) {
                 continue;
             }
-            if let Some(target) = func.ops[i].branch_target() {
+            if let Some(target) = op_at(func, i).branch_target() {
                 let threaded = thread_branch_target(func, &next_in_order, target);
                 if threaded != target {
-                    set_branch_target(&mut func.ops[i], threaded);
+                    if let Some(op_mut) = func.ops.get_mut(i) {
+                        set_branch_target(op_mut, threaded);
+                    }
                     stats.branches_folded = stats.branches_folded.saturating_add(1);
                     cfg_changed = true;
                 }
@@ -4793,9 +4874,9 @@ fn mopt_branch_opt<'a>(func: &mut MFunc<'a>, alloc: Alloc<'a>, stats: &mut MOptS
             let b = to_idx(blk.0);
             if b < num_blocks
                 && (ord_pos == 0 || !is_empty_or_unprotected_trampoline(func, blk))
-                && !keep[b]
+                && !at(&keep, b, true)
             {
-                keep[b] = true;
+                set(&mut keep, b, true);
                 worklist.push(blk);
             }
         }
@@ -4803,8 +4884,8 @@ fn mopt_branch_opt<'a>(func: &mut MFunc<'a>, alloc: Alloc<'a>, stats: &mut MOptS
         while let Some(cur) = worklist.pop() {
             for &succ in func.block_succs(cur) {
                 let s = to_idx(succ.0);
-                if s < num_blocks && !keep[s] {
-                    keep[s] = true;
+                if s < num_blocks && !at(&keep, s, true) {
+                    set(&mut keep, s, true);
                     worklist.push(succ);
                 }
             }
@@ -4813,17 +4894,19 @@ fn mopt_branch_opt<'a>(func: &mut MFunc<'a>, alloc: Alloc<'a>, stats: &mut MOptS
         let mut write_pos: usize = 0;
         let orig_len = func.block_order.len();
         for read_pos in 0..orig_len {
-            let blk = func.block_order[read_pos];
+            let Some(&blk) = func.block_order.get(read_pos) else {
+                continue;
+            };
             let b = to_idx(blk.0);
             if read_pos == 0 || keep.get(b).copied().unwrap_or(true) {
-                func.block_order[write_pos] = blk;
+                set(&mut func.block_order, write_pos, blk);
                 write_pos += 1;
             } else {
                 let mut deleted_b = false;
-                let (s_u, e_u) = func.block_insts[b];
-                for i in to_idx(s_u)..to_idx(e_u).min(func.ops.len()) {
+                let (s_i, e_i) = block_range(func, blk);
+                for i in s_i..e_i {
                     if !is_protected(func, i) {
-                        if matches!(func.ops[i], MOp::B { .. }) {
+                        if matches!(op_at(func, i), MOp::B { .. }) {
                             deleted_b = true;
                         }
                         mark_deleted(func, i);
@@ -4864,18 +4947,20 @@ fn mopt_branch_opt<'a>(func: &mut MFunc<'a>, alloc: Alloc<'a>, stats: &mut MOptS
             let mut did_move = false;
             let n_ord = func.block_order.len();
             for s_pos in 1..n_ord {
-                let blk_s = func.block_order[s_pos];
-                let prev_s = func.block_order[s_pos - 1];
+                let Some(&blk_s) = func.block_order.get(s_pos) else {
+                    continue;
+                };
+                let Some(&prev_s) = func.block_order.get(s_pos - 1) else {
+                    continue;
+                };
                 if !block_ends_with_uncond_term(func, prev_s) {
                     continue;
                 }
-                let (start_u, end_u) = func.block_insts[to_idx(blk_s.0)];
-                let start = to_idx(start_u);
-                let end = to_idx(end_u).min(func.ops.len());
+                let (start, end) = block_range(func, blk_s);
                 let mut non_nop_count: usize = 0;
                 let mut last_idx: Option<usize> = None;
                 for i in start..end {
-                    if !matches!(func.ops[i], MOp::Nop) {
+                    if !matches!(op_at(func, i), MOp::Nop) {
                         non_nop_count += 1;
                         last_idx = Some(i);
                     }
@@ -4889,7 +4974,7 @@ fn mopt_branch_opt<'a>(func: &mut MFunc<'a>, alloc: Alloc<'a>, stats: &mut MOptS
                 if is_protected(func, last) {
                     continue;
                 }
-                let MOp::B { target: blk_t } = func.ops[last] else {
+                let MOp::B { target: blk_t } = op_at(func, last) else {
                     continue;
                 };
                 if blk_t == blk_s || blk_t == entry_blk {
@@ -4903,7 +4988,9 @@ fn mopt_branch_opt<'a>(func: &mut MFunc<'a>, alloc: Alloc<'a>, stats: &mut MOptS
                 if t_pos >= n_ord || s_pos + 1 == t_pos {
                     continue;
                 }
-                let blk_p = func.block_order[t_pos - 1];
+                let Some(&blk_p) = func.block_order.get(t_pos - 1) else {
+                    continue;
+                };
                 if !allow_secondary {
                     if !block_ends_with_uncond_term(func, blk_p) {
                         continue;
@@ -4913,16 +5000,20 @@ fn mopt_branch_opt<'a>(func: &mut MFunc<'a>, alloc: Alloc<'a>, stats: &mut MOptS
                     if s_pos > t_pos {
                         let mut k = s_pos;
                         while k > t_pos {
-                            func.block_order[k] = func.block_order[k - 1];
+                            if let Some(prev_blk) = func.block_order.get(k - 1).copied() {
+                                set(&mut func.block_order, k, prev_blk);
+                            }
                             k -= 1;
                         }
-                        func.block_order[t_pos] = blk_s;
+                        set(&mut func.block_order, t_pos, blk_s);
                     } else {
                         let dst_pos = t_pos - 1;
                         for k in s_pos..dst_pos {
-                            func.block_order[k] = func.block_order[k + 1];
+                            if let Some(next_blk) = func.block_order.get(k + 1).copied() {
+                                set(&mut func.block_order, k, next_blk);
+                            }
                         }
-                        func.block_order[dst_pos] = blk_s;
+                        set(&mut func.block_order, dst_pos, blk_s);
                     }
 
                     // Immediately delete `blk_s`'s trailing `B blk_t` so `blk_s` falls through into `blk_t`
@@ -4948,7 +5039,9 @@ fn mopt_branch_opt<'a>(func: &mut MFunc<'a>, alloc: Alloc<'a>, stats: &mut MOptS
                 {
                     continue;
                 }
-                let blk_pp = func.block_order[t_pos - 2];
+                let Some(&blk_pp) = func.block_order.get(t_pos - 2) else {
+                    continue;
+                };
                 if !block_ends_with_uncond_term(func, blk_pp) {
                     continue;
                 }
@@ -4959,10 +5052,12 @@ fn mopt_branch_opt<'a>(func: &mut MFunc<'a>, alloc: Alloc<'a>, stats: &mut MOptS
                 let dst_pos = t_pos - 1;
                 let mut k = s_pos;
                 while k > dst_pos {
-                    func.block_order[k] = func.block_order[k - 1];
+                    if let Some(prev_blk) = func.block_order.get(k - 1).copied() {
+                        set(&mut func.block_order, k, prev_blk);
+                    }
                     k -= 1;
                 }
-                func.block_order[dst_pos] = blk_s;
+                set(&mut func.block_order, dst_pos, blk_s);
 
                 refresh_order_maps(func, &mut next_in_order, &mut block_ord_pos);
                 relocations += 1;
@@ -5015,10 +5110,10 @@ fn mopt_fuse_addsub_cbz_post_ra(func: &mut MFunc<'_>, stats: &mut MOptStats) {
 
     let n_order = func.block_order.len();
     for bi in 0..n_order {
-        let blk = func.block_order[bi];
-        let (start_u, end_u) = func.block_insts[to_idx(blk.0)];
-        let start = to_idx(start_u);
-        let end = to_idx(end_u).min(func.ops.len());
+        let Some(&blk) = func.block_order.get(bi) else {
+            continue;
+        };
+        let (start, end) = block_range(func, blk);
         if end.saturating_sub(start) < 2 {
             continue;
         }
@@ -5027,15 +5122,15 @@ fn mopt_fuse_addsub_cbz_post_ra(func: &mut MFunc<'_>, stats: &mut MOptStats) {
             let next = i + 1;
             if is_protected(func, i)
                 || is_protected(func, next)
-                || func.vflag_def[i] != NO_VFLAG
-                || func.vflag_use[i] != NO_VFLAG
-                || func.vflag_def[next] != NO_VFLAG
-                || func.vflag_use[next] != NO_VFLAG
+                || vflag_def_at(func, i) != NO_VFLAG
+                || vflag_use_at(func, i) != NO_VFLAG
+                || vflag_def_at(func, next) != NO_VFLAG
+                || vflag_use_at(func, next) != NO_VFLAG
             {
                 continue;
             }
 
-            let (dst, wide) = match func.ops[i] {
+            let (dst, wide) = match op_at(func, i) {
                 MOp::SubImm { dst, rn, wide, sets_flags: false, .. }
                 | MOp::AddImm { dst, rn, wide, sets_flags: false, .. }
                 | MOp::SubReg { dst, rn, wide, sets_flags: false, .. }
@@ -5047,7 +5142,7 @@ fn mopt_fuse_addsub_cbz_post_ra(func: &mut MFunc<'_>, stats: &mut MOptStats) {
                 _ => continue,
             };
 
-            let (cond, target) = match func.ops[next] {
+            let (cond, target) = match op_at(func, next) {
                 MOp::Cbz { rt, target, wide: w2 } if rt == dst && w2 == wide => (MCond::Eq, target),
                 MOp::Cbnz { rt, target, wide: w2 } if rt == dst && w2 == wide => {
                     (MCond::Ne, target)
@@ -5061,11 +5156,11 @@ fn mopt_fuse_addsub_cbz_post_ra(func: &mut MFunc<'_>, stats: &mut MOptStats) {
             let mut flag_live_after = false;
             let mut saw_ret_after = false;
             for k in (next + 1)..end {
-                let op_k = func.ops[k];
+                let op_k = op_at(func, k);
                 if matches!(op_k, MOp::Nop) {
                     continue;
                 }
-                if func.vflag_use[k] != NO_VFLAG || op_k.reads_flags() {
+                if vflag_use_at(func, k) != NO_VFLAG || op_k.reads_flags() {
                     flag_live_after = true;
                     break;
                 }
@@ -5082,7 +5177,7 @@ fn mopt_fuse_addsub_cbz_post_ra(func: &mut MFunc<'_>, stats: &mut MOptStats) {
             if saw_ret_after {
                 let mut unconsumed_flag_before = false;
                 for k in start..i {
-                    let op_k = func.ops[k];
+                    let op_k = op_at(func, k);
                     if matches!(op_k, MOp::Nop) {
                         continue;
                     }
@@ -5107,18 +5202,20 @@ fn mopt_fuse_addsub_cbz_post_ra(func: &mut MFunc<'_>, stats: &mut MOptStats) {
                 None => NO_VFLAG,
             };
 
-            match &mut func.ops[i] {
-                MOp::SubImm { sets_flags, .. }
-                | MOp::AddImm { sets_flags, .. }
-                | MOp::SubReg { sets_flags, .. }
-                | MOp::AddReg { sets_flags, .. } => {
-                    *sets_flags = true;
+            if let Some(op_i_mut) = func.ops.get_mut(i) {
+                match op_i_mut {
+                    MOp::SubImm { sets_flags, .. }
+                    | MOp::AddImm { sets_flags, .. }
+                    | MOp::SubReg { sets_flags, .. }
+                    | MOp::AddReg { sets_flags, .. } => {
+                        *sets_flags = true;
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
-            func.vflag_def[i] = vf;
-            func.ops[next] = MOp::BCond { cond, target };
-            func.vflag_use[next] = vf;
+            set(&mut func.vflag_def, i, vf);
+            set(&mut func.ops, next, MOp::BCond { cond, target });
+            set(&mut func.vflag_use, next, vf);
             stats.peepholes = stats.peepholes.saturating_add(1);
         }
     }
@@ -5135,9 +5232,9 @@ fn compact_nops<'a>(func: &mut MFunc<'a>, alloc: Alloc<'a>) {
     let old_len = func.ops.len();
     let mut has_removable_nop = false;
     for i in 0..old_len {
-        if matches!(func.ops[i], MOp::Nop)
-            && func.note_idx[i] == NO_NOTE
-            && !func.flags[i].contains(MInstFlags::PINNED)
+        if matches!(op_at(func, i), MOp::Nop)
+            && note_at(func, i) == NO_NOTE
+            && !flags_at(func, i).contains(MInstFlags::PINNED)
         {
             has_removable_nop = true;
             break;
@@ -5151,16 +5248,12 @@ fn compact_nops<'a>(func: &mut MFunc<'a>, alloc: Alloc<'a>) {
     let mut dst: usize = 0;
     for src in 0..old_len {
         old_to_new.push(u32_of(dst).unwrap_or(u32::MAX));
-        let keep = !matches!(func.ops[src], MOp::Nop)
-            || func.note_idx[src] != NO_NOTE
-            || func.flags[src].contains(MInstFlags::PINNED);
+        let keep = !matches!(op_at(func, src), MOp::Nop)
+            || note_at(func, src) != NO_NOTE
+            || flags_at(func, src).contains(MInstFlags::PINNED);
         if keep {
             if dst != src {
-                func.ops[dst] = func.ops[src];
-                func.flags[dst] = func.flags[src];
-                func.vflag_def[dst] = func.vflag_def[src];
-                func.vflag_use[dst] = func.vflag_use[src];
-                func.note_idx[dst] = func.note_idx[src];
+                copy_inst_slot(func, dst, src);
             }
             dst += 1;
         }
@@ -5176,11 +5269,11 @@ fn compact_nops<'a>(func: &mut MFunc<'a>, alloc: Alloc<'a>) {
     for (s, e) in func.block_insts.iter_mut() {
         let si = to_idx(*s);
         let ei = to_idx(*e);
-        if si <= old_len {
-            *s = old_to_new[si];
+        if let Some(&new_s) = old_to_new.get(si) {
+            *s = new_s;
         }
-        if ei <= old_len {
-            *e = old_to_new[ei];
+        if let Some(&new_e) = old_to_new.get(ei) {
+            *e = new_e;
         }
     }
 }

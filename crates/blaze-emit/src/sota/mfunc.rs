@@ -1191,9 +1191,11 @@ impl<'a> MFunc<'a> {
             fallthrough.push(u32::MAX);
         }
         for pair in self.block_order.windows(2) {
-            let b = to_idx(pair[0].0);
-            if b < num_blocks {
-                fallthrough[b] = pair[1].0;
+            if let [cur, next] = *pair {
+                let b = to_idx(cur.0);
+                if let Some(slot) = fallthrough.get_mut(b) {
+                    *slot = next.0;
+                }
             }
         }
 
@@ -1206,19 +1208,25 @@ impl<'a> MFunc<'a> {
         self.block_succs_off.reserve(num_blocks + 1);
         for b in 0..num_blocks {
             self.block_succs_off.push(u32_of(self.block_succs_data.len()).unwrap_or(u32::MAX));
-            let (start, end) = self.block_insts[b];
+            let (start, end) = self.block_insts.get(b).copied().unwrap_or((0, 0));
             let s = to_idx(start);
             let e = to_idx(end).min(self.ops.len());
             let mut has_uncond = false;
             let succ_start = self.block_succs_data.len();
 
-            if s < e {
-                for op in &self.ops[s..e] {
+            if s < e
+                && let Some(ops_slice) = self.ops.get(s..e)
+            {
+                for op in ops_slice {
                     if let Some(target) = op.branch_target() {
                         let t_idx = to_idx(target.0);
-                        if t_idx < num_blocks && !self.block_succs_data[succ_start..].contains(&target) {
+                        if t_idx < num_blocks
+                            && !self.block_succs_data.get(succ_start..).unwrap_or(&[]).contains(&target)
+                        {
                             self.block_succs_data.push(target);
-                            pred_counts[t_idx] = pred_counts[t_idx].saturating_add(1);
+                            if let Some(c) = pred_counts.get_mut(t_idx) {
+                                *c = c.saturating_add(1);
+                            }
                         }
                     }
                     if op.is_unconditional_terminator() {
@@ -1227,13 +1235,17 @@ impl<'a> MFunc<'a> {
                 }
             }
             if !has_uncond {
-                let ft = fallthrough[b];
+                let ft = fallthrough.get(b).copied().unwrap_or(u32::MAX);
                 if ft != u32::MAX {
                     let ft_blk = MBlock(ft);
                     let ft_idx = to_idx(ft);
-                    if ft_idx < num_blocks && !self.block_succs_data[succ_start..].contains(&ft_blk) {
+                    if ft_idx < num_blocks
+                        && !self.block_succs_data.get(succ_start..).unwrap_or(&[]).contains(&ft_blk)
+                    {
                         self.block_succs_data.push(ft_blk);
-                        pred_counts[ft_idx] = pred_counts[ft_idx].saturating_add(1);
+                        if let Some(c) = pred_counts.get_mut(ft_idx) {
+                            *c = c.saturating_add(1);
+                        }
                     }
                 }
             }
@@ -1258,14 +1270,16 @@ impl<'a> MFunc<'a> {
         }
         for b in 0..num_blocks {
             let b_id = MBlock(u32_of(b).unwrap_or(u32::MAX));
-            let ss = to_idx(self.block_succs_off[b]);
-            let se = to_idx(self.block_succs_off[b + 1]);
-            for &succ_blk in &self.block_succs_data[ss..se] {
+            let ss = to_idx(self.block_succs_off.get(b).copied().unwrap_or(0));
+            let se = to_idx(self.block_succs_off.get(b + 1).copied().unwrap_or(0));
+            for &succ_blk in self.block_succs_data.get(ss..se).unwrap_or(&[]) {
                 let succ = to_idx(succ_blk.0);
-                let dst = to_idx(cursor[succ]);
-                if dst < self.block_preds_data.len() {
-                    self.block_preds_data[dst] = b_id;
-                    cursor[succ] = cursor[succ].saturating_add(1);
+                if let Some(cur) = cursor.get_mut(succ) {
+                    let dst = to_idx(*cur);
+                    if let Some(slot) = self.block_preds_data.get_mut(dst) {
+                        *slot = b_id;
+                        *cur = cur.saturating_add(1);
+                    }
                 }
             }
         }
@@ -1395,10 +1409,12 @@ pub fn mverify(func: &MFunc<'_>) -> Result<(), MVerifyError> {
                 let rel = idx - base;
                 let word = rel >> 6;
                 let bit = 1u64 << (rel & 63);
-                if (seen[word] & bit) != 0 {
-                    return Err(MVerifyError::DuplicateBlockInOrder { block: blk });
+                if let Some(slot) = seen.get_mut(word) {
+                    if (*slot & bit) != 0 {
+                        return Err(MVerifyError::DuplicateBlockInOrder { block: blk });
+                    }
+                    *slot |= bit;
                 }
-                seen[word] |= bit;
             }
         }
         base = limit;
@@ -1415,13 +1431,13 @@ pub fn mverify(func: &MFunc<'_>) -> Result<(), MVerifyError> {
         let mut steps: usize = 0;
         while cur != NO_NOTE {
             let ci = to_idx(cur);
-            if ci >= n_notes || steps >= n_notes {
+            let Some(note) = func.notes.get(ci).filter(|_| steps < n_notes) else {
                 return Err(MVerifyError::InvalidNoteChain {
                     inst: MInst(u32_of(i).unwrap_or(u32::MAX)),
                     note: cur,
                 });
-            }
-            cur = func.notes[ci].next;
+            };
+            cur = note.next;
             steps += 1;
         }
     }
@@ -1429,7 +1445,9 @@ pub fn mverify(func: &MFunc<'_>) -> Result<(), MVerifyError> {
     // 6. Validate each block in `block_order`: terminators, operands, and single-live-VFlag.
     let last_order_pos = func.block_order.len() - 1;
     for (order_pos, &blk) in func.block_order.iter().enumerate() {
-        let (start, end) = func.block_insts[to_idx(blk.0)];
+        let Some(&(start, end)) = func.block_insts.get(to_idx(blk.0)) else {
+            return Err(MVerifyError::BlockOutOfBounds { block: blk });
+        };
         let s = to_idx(start);
         let e = to_idx(end);
 
@@ -1439,7 +1457,9 @@ pub fn mverify(func: &MFunc<'_>) -> Result<(), MVerifyError> {
 
         for i in s..e {
             let inst = MInst(u32_of(i).unwrap_or(u32::MAX));
-            let op = &func.ops[i];
+            let Some(op) = func.ops.get(i) else {
+                return Err(MVerifyError::InvalidBlockRange { block: blk, start, end });
+            };
 
             // Terminator placement checks.
             if seen_uncond_term {
@@ -1464,13 +1484,13 @@ pub fn mverify(func: &MFunc<'_>) -> Result<(), MVerifyError> {
             verify_op(func, inst, op)?;
 
             // Virtual flag single-live-NZCV check: uses BEFORE defs (e.g. `Ccmp` reads then writes).
-            let vuse = func.vflag_use[i];
+            let vuse = func.vflag_use.get(i).copied().unwrap_or(NO_VFLAG);
             if vuse != NO_VFLAG {
                 if !op.reads_flags() {
                     return Err(MVerifyError::VFlagUseOnNonFlagReader { inst, vflag: vuse });
                 }
                 if active_vflag != Some(vuse) {
-                    let was_defined_earlier = func.vflag_def[s..i].contains(&vuse);
+                    let was_defined_earlier = func.vflag_def.get(s..i).unwrap_or(&[]).contains(&vuse);
                     if was_defined_earlier {
                         return Err(MVerifyError::OverlappingLiveVFlags {
                             block: blk,
@@ -1487,7 +1507,7 @@ pub fn mverify(func: &MFunc<'_>) -> Result<(), MVerifyError> {
                 }
             }
 
-            let vdef = func.vflag_def[i];
+            let vdef = func.vflag_def.get(i).copied().unwrap_or(NO_VFLAG);
             if vdef != NO_VFLAG {
                 if !op.writes_flags() {
                     return Err(MVerifyError::VFlagDefOnNonFlagWriter { inst, vflag: vdef });
@@ -1511,22 +1531,25 @@ fn verify_csr(off: &[u32], data: &[MBlock], n_blocks: usize) -> Result<(), MVeri
     if off.is_empty() && data.is_empty() {
         return Ok(());
     }
-    if off.len() != n_blocks + 1 || to_idx(off[n_blocks]) != data.len() {
+    if off.len() != n_blocks + 1 || off.get(n_blocks).copied().map(to_idx) != Some(data.len()) {
         return Err(MVerifyError::InvalidCfgCsr { block: MBlock(0) });
     }
     for b in 0..n_blocks {
-        if off[b] > off[b + 1] {
-            return Err(MVerifyError::InvalidCfgCsr {
-                block: MBlock(u32_of(b).unwrap_or(u32::MAX)),
-            });
+        let block = MBlock(u32_of(b).unwrap_or(u32::MAX));
+        let (Some(&start_u), Some(&end_u)) = (off.get(b), off.get(b + 1)) else {
+            return Err(MVerifyError::InvalidCfgCsr { block });
+        };
+        if start_u > end_u {
+            return Err(MVerifyError::InvalidCfgCsr { block });
         }
-        let s = to_idx(off[b]);
-        let e = to_idx(off[b + 1]);
-        for &target in &data[s..e] {
+        let s = to_idx(start_u);
+        let e = to_idx(end_u);
+        let Some(targets) = data.get(s..e) else {
+            return Err(MVerifyError::InvalidCfgCsr { block });
+        };
+        for &target in targets {
             if to_idx(target.0) >= n_blocks {
-                return Err(MVerifyError::InvalidCfgCsr {
-                    block: MBlock(u32_of(b).unwrap_or(u32::MAX)),
-                });
+                return Err(MVerifyError::InvalidCfgCsr { block });
             }
         }
     }
@@ -1880,10 +1903,10 @@ fn verify_op(func: &MFunc<'_>, inst: MInst, op: &MOp) -> Result<(), MVerifyError
             }
             let s = to_idx(start);
             let e = s.saturating_add(usize::from(len));
-            if e > func.copy_pairs.len() {
+            let Some(pairs) = func.copy_pairs.get(s..e) else {
                 return Err(MVerifyError::InvalidParallelCopyRange { inst });
-            }
-            for &(dst, src) in &func.copy_pairs[s..e] {
+            };
+            for &(dst, src) in pairs {
                 verify_copy_reg(func, inst, dst)?;
                 verify_copy_reg(func, inst, src)?;
             }
@@ -2221,8 +2244,10 @@ fn block_ends_with_uncond_term(func: &MFunc<'_>, blk: MBlock) -> bool {
     };
     let start = to_idx(start_u);
     let end = to_idx(end_u).min(func.ops.len());
-    for i in (start..end).rev() {
-        let op = func.ops[i];
+    let Some(ops) = func.ops.get(start..end) else {
+        return false;
+    };
+    for &op in ops.iter().rev() {
         if matches!(op, MOp::Nop) {
             continue;
         }
@@ -2243,17 +2268,20 @@ fn should_align16_block(func: &MFunc<'_>, is_backedge_target: &[bool], ord_pos: 
     if ord_pos == 0 {
         return false;
     }
-    let blk = func.block_order[ord_pos];
+    let Some(&blk) = func.block_order.get(ord_pos) else {
+        return false;
+    };
     let b = to_idx(blk.0);
     if is_backedge_target.get(b).copied().unwrap_or(false) {
         return true;
     }
-    if !func.block_align16[b] {
+    if !func.block_align16.get(b).copied().unwrap_or(false) {
         return false;
     }
-    for prev_pos in (0..ord_pos).rev() {
-        let prev_blk = func.block_order[prev_pos];
-        let (start_u, end_u) = func.block_insts[to_idx(prev_blk.0)];
+    for &prev_blk in func.block_order.get(..ord_pos).unwrap_or(&[]).iter().rev() {
+        let Some(&(start_u, end_u)) = func.block_insts.get(to_idx(prev_blk.0)) else {
+            continue;
+        };
         if start_u < end_u {
             return block_ends_with_uncond_term(func, prev_blk);
         }
@@ -2289,15 +2317,17 @@ pub fn mencode<'a>(func: &MFunc<'a>, alloc: Alloc<'a>) -> Result<EncodedMFunc<'a
     }
     for (ord_pos, &blk) in func.block_order.iter().enumerate() {
         let b = to_idx(blk.0);
-        if b < n_blocks {
-            block_ord_pos[b] = u32_of(ord_pos).unwrap_or(u32::MAX);
+        if let Some(slot) = block_ord_pos.get_mut(b) {
+            *slot = u32_of(ord_pos).unwrap_or(u32::MAX);
         }
     }
     for (ord_pos, &blk) in func.block_order.iter().enumerate() {
         let b = to_idx(blk.0);
-        let (start, end) = func.block_insts[b];
-        for i in to_idx(start)..to_idx(end) {
-            let target = match func.ops[i] {
+        let Some(&(start, end)) = func.block_insts.get(b) else {
+            continue;
+        };
+        for &op in func.ops.get(to_idx(start)..to_idx(end)).unwrap_or(&[]) {
+            let target = match op {
                 MOp::B { target }
                 | MOp::BCond { target, .. }
                 | MOp::Cbz { target, .. }
@@ -2308,8 +2338,12 @@ pub fn mencode<'a>(func: &MFunc<'a>, alloc: Alloc<'a>) -> Result<EncodedMFunc<'a
             };
             if let Some(t) = target {
                 let tb = to_idx(t.0);
-                if tb < n_blocks && usize::try_from(block_ord_pos[tb]).unwrap_or(usize::MAX) <= ord_pos {
-                    is_backedge_target[tb] = true;
+                if block_ord_pos
+                    .get(tb)
+                    .is_some_and(|&pos| usize::try_from(pos).unwrap_or(usize::MAX) <= ord_pos)
+                    && let Some(flag) = is_backedge_target.get_mut(tb)
+                {
+                    *flag = true;
                 }
             }
         }
@@ -2326,11 +2360,21 @@ pub fn mencode<'a>(func: &MFunc<'a>, alloc: Alloc<'a>) -> Result<EncodedMFunc<'a
                 let pad = (4 - (cursor & 3)) & 3;
                 cursor = cursor.checked_add(pad).ok_or(MEncodeError::CodeTooLarge)?;
             }
-            block_word_off[b] = cursor;
-            let (start, end) = func.block_insts[b];
+            if let Some(slot) = block_word_off.get_mut(b) {
+                *slot = cursor;
+            }
+            let Some(&(start, end)) = func.block_insts.get(b) else {
+                continue;
+            };
             for i in to_idx(start)..to_idx(end) {
-                inst_word_off[i] = cursor;
-                let count = inst_word_count(&func.ops[i], relaxed[i], MInst(u32_of(i).unwrap_or(u32::MAX)))?;
+                if let Some(slot) = inst_word_off.get_mut(i) {
+                    *slot = cursor;
+                }
+                let Some(op) = func.ops.get(i) else {
+                    continue;
+                };
+                let is_relaxed = relaxed.get(i).copied().unwrap_or(false);
+                let count = inst_word_count(op, is_relaxed, MInst(u32_of(i).unwrap_or(u32::MAX)))?;
                 cursor = cursor.checked_add(count).ok_or(MEncodeError::CodeTooLarge)?;
             }
         }
@@ -2338,28 +2382,37 @@ pub fn mencode<'a>(func: &MFunc<'a>, alloc: Alloc<'a>) -> Result<EncodedMFunc<'a
 
         let mut changed = false;
         for &blk in func.block_order.iter() {
-            let (start, end) = func.block_insts[to_idx(blk.0)];
+            let Some(&(start, end)) = func.block_insts.get(to_idx(blk.0)) else {
+                continue;
+            };
             for i in to_idx(start)..to_idx(end) {
-                if relaxed[i] {
+                if relaxed.get(i).copied().unwrap_or(false) {
                     continue;
                 }
-                let needs_relax = match func.ops[i] {
+                let Some(&op) = func.ops.get(i) else {
+                    continue;
+                };
+                let inst_off = inst_word_off.get(i).copied().unwrap_or(0);
+                let needs_relax = match op {
                     MOp::Tbz { target, .. } | MOp::Tbnz { target, .. } => {
-                        let delta = i64::from(block_word_off[to_idx(target.0)]) - i64::from(inst_word_off[i]);
+                        let target_off = block_word_off.get(to_idx(target.0)).copied().unwrap_or(0);
+                        let delta = i64::from(target_off) - i64::from(inst_off);
                         !(IMM14_MIN_WORDS..=IMM14_MAX_WORDS).contains(&delta)
                     }
                     MOp::BCond { cond, target } if !matches!(cond, MCond::Al | MCond::Nv) => {
-                        let delta = i64::from(block_word_off[to_idx(target.0)]) - i64::from(inst_word_off[i]);
+                        let target_off = block_word_off.get(to_idx(target.0)).copied().unwrap_or(0);
+                        let delta = i64::from(target_off) - i64::from(inst_off);
                         !(IMM19_MIN_WORDS..=IMM19_MAX_WORDS).contains(&delta)
                     }
                     MOp::Cbz { target, .. } | MOp::Cbnz { target, .. } => {
-                        let delta = i64::from(block_word_off[to_idx(target.0)]) - i64::from(inst_word_off[i]);
+                        let target_off = block_word_off.get(to_idx(target.0)).copied().unwrap_or(0);
+                        let delta = i64::from(target_off) - i64::from(inst_off);
                         !(IMM19_MIN_WORDS..=IMM19_MAX_WORDS).contains(&delta)
                     }
                     _ => false,
                 };
-                if needs_relax {
-                    relaxed[i] = true;
+                if needs_relax && let Some(slot) = relaxed.get_mut(i) {
+                    *slot = true;
                     changed = true;
                 }
             }
@@ -2395,12 +2448,16 @@ pub fn mencode<'a>(func: &MFunc<'a>, alloc: Alloc<'a>) -> Result<EncodedMFunc<'a
             }
         }
 
-        let (start, end) = func.block_insts[b];
+        let Some(&(start, end)) = func.block_insts.get(b) else {
+            continue;
+        };
         for i in to_idx(start)..to_idx(end) {
             let inst = MInst(u32_of(i).unwrap_or(u32::MAX));
             let word_idx = u32_of(words.len()).ok_or(MEncodeError::CodeTooLarge)?;
             let byte_off = word_idx.checked_mul(4).ok_or(MEncodeError::CodeTooLarge)?;
-            let op = &func.ops[i];
+            let Some(op) = func.ops.get(i) else {
+                continue;
+            };
 
             // Record exact metadata from attached notes (preserving attachment order isn't required;
             // each instruction's byte offset is exact!).
@@ -2408,9 +2465,11 @@ pub fn mencode<'a>(func: &MFunc<'a>, alloc: Alloc<'a>) -> Result<EncodedMFunc<'a
             if let MOp::AdrTable { table_id, .. } = *op {
                 table_adr_word_idxs.push(TableAdrAt { table_id, word_idx });
             }
-            let mut cur_note = func.note_idx[i];
+            let mut cur_note = func.note_idx.get(i).copied().unwrap_or(NO_NOTE);
             while cur_note != NO_NOTE {
-                let note = func.notes[to_idx(cur_note)];
+                let Some(&note) = func.notes.get(to_idx(cur_note)) else {
+                    break;
+                };
                 match note.kind {
                     MNoteKind::Reloc { kind, target, addend } => {
                         reloc_byte_offs.push(RelocAt {
@@ -2436,10 +2495,11 @@ pub fn mencode<'a>(func: &MFunc<'a>, alloc: Alloc<'a>) -> Result<EncodedMFunc<'a
                 cur_note = note.next;
             }
 
-            if relaxed[i] {
+            let is_relaxed = relaxed.get(i).copied().unwrap_or(false);
+            if is_relaxed {
                 relaxed_branches = relaxed_branches.saturating_add(1);
             }
-            encode_inst(op, inst, word_idx, relaxed[i], &block_word_off, &mut words)?;
+            encode_inst(op, inst, word_idx, is_relaxed, &block_word_off, &mut words)?;
         }
     }
 
@@ -2564,13 +2624,16 @@ fn encode_mov_imm_words(rd: u32, imm: u64, wide: bool) -> ([u32; 4], u32) {
         for (hw, &c) in chunks.iter().enumerate() {
             if c != 0xffff {
                 let hw32 = u32_of(hw).unwrap_or(0);
-                out[len] = if first {
+                let word = if first {
                     first = false;
                     enc::movn(rd, (!c) & 0xffff, hw32)
                 } else {
                     enc::movk(rd, c, hw32)
                 };
-                len += 1;
+                if let Some(slot) = out.get_mut(len) {
+                    *slot = word;
+                    len += 1;
+                }
             }
         }
     } else {
@@ -2578,13 +2641,16 @@ fn encode_mov_imm_words(rd: u32, imm: u64, wide: bool) -> ([u32; 4], u32) {
         for (hw, &c) in chunks.iter().enumerate() {
             if c != 0 {
                 let hw32 = u32_of(hw).unwrap_or(0);
-                out[len] = if first {
+                let word = if first {
                     first = false;
                     enc::movz(rd, c, hw32)
                 } else {
                     enc::movk(rd, c, hw32)
                 };
-                len += 1;
+                if let Some(slot) = out.get_mut(len) {
+                    *slot = word;
+                    len += 1;
+                }
             }
         }
     }
@@ -2614,7 +2680,10 @@ fn branch_delta_i32(
     min_words: i64,
     max_words: i64,
 ) -> Result<i32, MEncodeError> {
-    let target_word = block_word_off[to_idx(target.0)];
+    let target_word = block_word_off
+        .get(to_idx(target.0))
+        .copied()
+        .ok_or(MEncodeError::InvalidOperand { inst })?;
     let delta = i64::from(target_word) - i64::from(from_word);
     if !(min_words..=max_words).contains(&delta) {
         return Err(MEncodeError::BranchOutOfRange {
@@ -3082,7 +3151,7 @@ fn encode_inst(
         MOp::MovImm { dst, imm, wide } => {
             let rd = req_gpr_or_zr(inst, dst)?;
             let (buf, count) = encode_mov_imm_words(rd, imm, wide);
-            for &w in &buf[..to_idx(count)] {
+            for &w in buf.get(..to_idx(count)).unwrap_or(&[]) {
                 out.push(w);
             }
         }

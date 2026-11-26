@@ -110,6 +110,41 @@ fn vec_filled<'a, T: Copy>(len: usize, val: T, alloc: Alloc<'a>) -> Vec<T, Alloc
     v
 }
 
+#[inline]
+fn at<T: Copy>(s: &[T], i: usize, def: T) -> T {
+    s.get(i).copied().unwrap_or(def)
+}
+
+#[inline]
+fn set<T>(s: &mut [T], i: usize, val: T) {
+    if let Some(slot) = s.get_mut(i) {
+        *slot = val;
+    }
+}
+
+#[inline]
+fn bitor_at<T: core::ops::BitOrAssign>(s: &mut [T], i: usize, bits: T) {
+    if let Some(slot) = s.get_mut(i) {
+        *slot |= bits;
+    }
+}
+
+#[inline]
+fn add_at_u8(s: &mut [u8], i: usize, delta: u8) {
+    if let Some(slot) = s.get_mut(i) {
+        *slot = slot.saturating_add(delta);
+    }
+}
+
+#[inline]
+fn max_at_u16(s: &mut [u16], i: usize, val: u16) {
+    if let Some(slot) = s.get_mut(i)
+        && val > *slot
+    {
+        *slot = val;
+    }
+}
+
 // -----------------------------------------------------------------------------
 // 1. Data-Driven `TargetModel`
 // -----------------------------------------------------------------------------
@@ -351,13 +386,13 @@ impl InstInfo {
             MReg::P(PReg::Gpr(_) | PReg::V(_) | PReg::Xzr) => {}
             MReg::V(v) => {
                 let len = usize::from(self.vreg_def_len);
-                for &existing in &self.vreg_defs[..len] {
+                for &existing in self.vreg_defs.get(..len).unwrap_or(&[]) {
                     if existing == v.0 {
                         return;
                     }
                 }
-                if len < self.vreg_defs.len() {
-                    self.vreg_defs[len] = v.0;
+                if let Some(slot) = self.vreg_defs.get_mut(len) {
+                    *slot = v.0;
                     self.vreg_def_len = self.vreg_def_len.saturating_add(1);
                 }
             }
@@ -382,17 +417,27 @@ impl InstInfo {
             MReg::P(PReg::Gpr(_) | PReg::V(_) | PReg::Xzr) => {}
             MReg::V(v) => {
                 let len = usize::from(self.vreg_use_len);
-                for &existing in &self.vreg_uses[..len] {
+                for &existing in self.vreg_uses.get(..len).unwrap_or(&[]) {
                     if existing == v.0 {
                         return;
                     }
                 }
-                if len < self.vreg_uses.len() {
-                    self.vreg_uses[len] = v.0;
+                if let Some(slot) = self.vreg_uses.get_mut(len) {
+                    *slot = v.0;
                     self.vreg_use_len = self.vreg_use_len.saturating_add(1);
                 }
             }
         }
+    }
+
+    #[inline]
+    fn vreg_defs_slice(&self) -> &[u32] {
+        self.vreg_defs.get(..usize::from(self.vreg_def_len)).unwrap_or(&[])
+    }
+
+    #[inline]
+    fn vreg_uses_slice(&self) -> &[u32] {
+        self.vreg_uses.get(..usize::from(self.vreg_use_len)).unwrap_or(&[])
     }
 
     #[inline]
@@ -427,11 +472,11 @@ fn vreg_slices_intersect(a: &[u32], b: &[u32]) -> bool {
 
 /// Classifies one instruction's register operands, memory effect, execution pipe, and latency.
 fn classify_inst(func: &MFunc<'_>, idx: usize, target: TargetModel) -> InstInfo {
-    let op = func.ops[idx];
-    let flags = func.flags[idx];
+    let op = at(&func.ops, idx, MOp::Nop);
+    let flags = at(&func.flags, idx, MInstFlags::NONE);
     let mut info = InstInfo::EMPTY;
-    info.writes_flags = op.writes_flags() || func.vflag_def[idx] != NO_VFLAG;
-    info.reads_flags = op.reads_flags() || func.vflag_use[idx] != NO_VFLAG;
+    info.writes_flags = op.writes_flags() || at(&func.vflag_def, idx, NO_VFLAG) != NO_VFLAG;
+    info.reads_flags = op.reads_flags() || at(&func.vflag_use, idx, NO_VFLAG) != NO_VFLAG;
     info.may_trap = flags.contains(MInstFlags::MAY_TRAP);
 
     let load_lat = target.load_latency.max(1);
@@ -660,7 +705,7 @@ fn classify_inst(func: &MFunc<'_>, idx: usize, target: TargetModel) -> InstInfo 
 
 /// Returns `true` if instruction `idx` must act as a scheduling barrier (never reordered across).
 fn is_sched_barrier(func: &MFunc<'_>, idx: usize) -> bool {
-    let flags = func.flags[idx];
+    let flags = at(&func.flags, idx, MInstFlags::NONE);
     if flags.contains(MInstFlags::PINNED)
         || flags.contains(MInstFlags::VOLATILE)
         || flags.contains(MInstFlags::MEM_BARRIER)
@@ -669,7 +714,9 @@ fn is_sched_barrier(func: &MFunc<'_>, idx: usize) -> bool {
     {
         return true;
     }
-    let op = &func.ops[idx];
+    let Some(op) = func.ops.get(idx) else {
+        return true;
+    };
     if op.is_unconditional_terminator() || op.is_conditional_branch() {
         return true;
     }
@@ -685,7 +732,7 @@ fn is_sched_barrier(func: &MFunc<'_>, idx: usize) -> bool {
 
     // Check side-band notes for volatile or jump-table anchor constraints.
     let n_notes = func.notes.len();
-    let mut cur = func.note_idx[idx];
+    let mut cur = at(&func.note_idx, idx, NO_NOTE);
     let mut steps = 0usize;
     while cur != NO_NOTE && steps < n_notes {
         let Some(note) = func.notes.get(to_idx(cur)) else {
@@ -902,8 +949,7 @@ fn for_each_block_succ(
     let range = func.block_inst_range(block);
     let end = range.end.min(func.ops.len());
     let mut has_uncond = false;
-    for i in range.start..end {
-        let op = &func.ops[i];
+    for op in func.ops.get(range.start..end).unwrap_or(&[]) {
         if let Some(target) = op.branch_target() {
             f(target);
         }
@@ -914,9 +960,9 @@ fn for_each_block_succ(
     if !has_uncond {
         let b_idx = to_idx(block.0);
         if let Some(&pos) = order_pos.get(b_idx)
-            && pos < func.block_order.len().saturating_sub(1)
+            && let Some(&next_blk) = pos.checked_add(1).and_then(|next| func.block_order.get(next))
         {
-            f(func.block_order[pos + 1]);
+            f(next_blk);
         }
     }
 }
@@ -945,11 +991,12 @@ fn compute_block_use_def(
     let mut u_fp = 0u32;
 
     for i in range.start..end {
-        if let MOp::ParallelCopy { start, len } = func.ops[i] {
+        if let Some(&MOp::ParallelCopy { start, len }) = func.ops.get(i) {
             let cs = to_idx(start);
             let ce = cs.saturating_add(usize::from(len)).min(func.copy_pairs.len());
+            let copy_slice = func.copy_pairs.get(cs..ce).unwrap_or(&[]);
             // Simultaneous parallel copy: check all `src` uses before recording any `dst` defs.
-            for &(_, src) in &func.copy_pairs[cs..ce] {
+            for &(_, src) in copy_slice {
                 match src {
                     MReg::P(PReg::Gpr(r)) if r <= 30 => {
                         let bit = 1u32 << r;
@@ -966,21 +1013,21 @@ fn compute_block_use_def(
                     MReg::V(v) => {
                         let w = to_idx(v.0 >> 6);
                         let bit = 1u64 << (v.0 & 63);
-                        if w < num_vwords && (def_v[vbase + w] & bit) == 0 {
-                            up_v[vbase + w] |= bit;
+                        if w < num_vwords && (at(def_v, vbase + w, 0u64) & bit) == 0 {
+                            bitor_at(up_v, vbase + w, bit);
                         }
                     }
                     MReg::P(PReg::Gpr(_) | PReg::V(_) | PReg::Sp | PReg::Xzr | PReg::Nzcv) => {}
                 }
             }
-            for &(dst, _) in &func.copy_pairs[cs..ce] {
+            for &(dst, _) in copy_slice {
                 match dst {
                     MReg::P(PReg::Gpr(r)) if r <= 30 => d_gpr |= 1u32 << r,
                     MReg::P(PReg::V(r)) if r <= 31 => d_fp |= 1u32 << r,
                     MReg::V(v) => {
                         let w = to_idx(v.0 >> 6);
                         if w < num_vwords {
-                            def_v[vbase + w] |= 1u64 << (v.0 & 63);
+                            bitor_at(def_v, vbase + w, 1u64 << (v.0 & 63));
                         }
                     }
                     MReg::P(PReg::Gpr(_) | PReg::V(_) | PReg::Sp | PReg::Xzr | PReg::Nzcv) => {}
@@ -995,28 +1042,28 @@ fn compute_block_use_def(
         let uf = info.phys_fp_uses;
         u_gpr |= ug & !d_gpr;
         u_fp |= uf & !d_fp;
-        for &v in &info.vreg_uses[..usize::from(info.vreg_use_len)] {
+        for &v in info.vreg_uses_slice() {
             let w = to_idx(v >> 6);
             let bit = 1u64 << (v & 63);
-            if w < num_vwords && (def_v[vbase + w] & bit) == 0 {
-                up_v[vbase + w] |= bit;
+            if w < num_vwords && (at(def_v, vbase + w, 0u64) & bit) == 0 {
+                bitor_at(up_v, vbase + w, bit);
             }
         }
 
         d_gpr |= info.phys_gpr_defs & 0x7fff_ffff;
         d_fp |= info.phys_fp_defs;
-        for &v in &info.vreg_defs[..usize::from(info.vreg_def_len)] {
+        for &v in info.vreg_defs_slice() {
             let w = to_idx(v >> 6);
             if w < num_vwords {
-                def_v[vbase + w] |= 1u64 << (v & 63);
+                bitor_at(def_v, vbase + w, 1u64 << (v & 63));
             }
         }
     }
 
-    up_gpr[slot] = u_gpr;
-    up_fp[slot] = u_fp;
-    def_gpr[slot] = d_gpr;
-    def_fp[slot] = d_fp;
+    set(up_gpr, slot, u_gpr);
+    set(up_fp, slot, u_fp);
+    set(def_gpr, slot, d_gpr);
+    set(def_fp, slot, d_fp);
 }
 
 /// Result of natural-loop & loop-carried recurrence analysis over an [`MFunc`].
@@ -1047,8 +1094,8 @@ fn analyze_loop_recurrences<'a>(
     let mut order_pos = vec_filled(n_blocks, usize::MAX, alloc);
     for (pos, &blk) in func.block_order.iter().enumerate() {
         let b = to_idx(blk.0);
-        if b < n_blocks && order_pos[b] == usize::MAX {
-            order_pos[b] = pos;
+        if b < n_blocks && at(&order_pos, b, usize::MAX) == usize::MAX {
+            set(&mut order_pos, b, pos);
         }
     }
 
@@ -1062,16 +1109,16 @@ fn analyze_loop_recurrences<'a>(
         if b >= n_blocks {
             continue;
         }
-        let b_pos = order_pos[b];
+        let b_pos = at(&order_pos, b, usize::MAX);
         if b_pos == usize::MAX {
             continue;
         }
         for_each_block_succ(func, blk, &order_pos, |succ| {
             let h = to_idx(succ.0);
-            if h < n_blocks && order_pos[h] <= b_pos {
+            if h < n_blocks && at(&order_pos, h, usize::MAX) <= b_pos {
                 backedges.push((b, h));
-                if !is_header[h] {
-                    is_header[h] = true;
+                if !at(&is_header, h, false) {
+                    set(&mut is_header, h, true);
                     headers.push(h);
                 }
             }
@@ -1095,12 +1142,12 @@ fn analyze_loop_recurrences<'a>(
     let mut copy_kill_dsts: Vec<MReg, Alloc<'a>> = Vec::new_in(alloc);
 
     for &h in headers.iter() {
-        let h_pos = order_pos[h];
+        let h_pos = at(&order_pos, h, usize::MAX);
         loop_blocks.clear();
         worklist.clear();
 
         // 2. Collect natural loop body blocks for header `h`.
-        block_to_slot[h] = 0;
+        set(&mut block_to_slot, h, 0usize);
         loop_blocks.push(h);
 
         let mut max_latch_pos = h_pos;
@@ -1108,12 +1155,13 @@ fn analyze_loop_recurrences<'a>(
             if bh != h {
                 continue;
             }
-            if order_pos[b] > max_latch_pos {
-                max_latch_pos = order_pos[b];
+            let b_ord = at(&order_pos, b, 0usize);
+            if b_ord > max_latch_pos {
+                max_latch_pos = b_ord;
             }
-            if block_to_slot[b] == usize::MAX {
+            if at(&block_to_slot, b, usize::MAX) == usize::MAX {
                 let slot = loop_blocks.len();
-                block_to_slot[b] = slot;
+                set(&mut block_to_slot, b, slot);
                 loop_blocks.push(b);
                 worklist.push(b);
             }
@@ -1123,9 +1171,12 @@ fn analyze_loop_recurrences<'a>(
             while let Some(cur) = worklist.pop() {
                 for &pred in func.block_preds(MBlock(u32_of(cur))) {
                     let p = to_idx(pred.0);
-                    if p < n_blocks && order_pos[p] >= h_pos && block_to_slot[p] == usize::MAX {
+                    if p < n_blocks
+                        && at(&order_pos, p, usize::MAX) >= h_pos
+                        && at(&block_to_slot, p, usize::MAX) == usize::MAX
+                    {
                         let slot = loop_blocks.len();
-                        block_to_slot[p] = slot;
+                        set(&mut block_to_slot, p, slot);
                         loop_blocks.push(p);
                         worklist.push(p);
                     }
@@ -1134,11 +1185,11 @@ fn analyze_loop_recurrences<'a>(
         } else {
             // Fallback when `block_preds` CSR wasn't populated: include `block_order[h_pos..=max_latch_pos]`.
             let end_pos = max_latch_pos.min(func.block_order.len().saturating_sub(1));
-            for &blk in &func.block_order[h_pos..=end_pos] {
+            for &blk in func.block_order.get(h_pos..=end_pos).unwrap_or(&[]) {
                 let p = to_idx(blk.0);
-                if p < n_blocks && block_to_slot[p] == usize::MAX {
+                if p < n_blocks && at(&block_to_slot, p, usize::MAX) == usize::MAX {
                     let slot = loop_blocks.len();
-                    block_to_slot[p] = slot;
+                    set(&mut block_to_slot, p, slot);
                     loop_blocks.push(p);
                 }
             }
@@ -1146,7 +1197,7 @@ fn analyze_loop_recurrences<'a>(
 
         for &b_idx in loop_blocks.iter() {
             if b_idx < n_blocks {
-                in_loop_block[b_idx] = true;
+                set(&mut in_loop_block, b_idx, true);
             }
         }
 
@@ -1189,7 +1240,7 @@ fn analyze_loop_recurrences<'a>(
             for _ in 0..MAX_LOOP_LIVENESS_ITERS {
                 let mut changed = false;
                 for slot in (0..k_len).rev() {
-                    let b_idx = loop_blocks[slot];
+                    let b_idx = at(&loop_blocks, slot, 0usize);
                     let vbase = slot * num_vwords;
                     let mut out_gpr = 0u32;
                     let mut out_fp = 0u32;
@@ -1197,29 +1248,33 @@ fn analyze_loop_recurrences<'a>(
                     for_each_block_succ(func, MBlock(u32_of(b_idx)), &order_pos, |succ| {
                         let s = to_idx(succ.0);
                         if s < n_blocks {
-                            let s_slot = block_to_slot[s];
+                            let s_slot = at(&block_to_slot, s, usize::MAX);
                             if s_slot != usize::MAX {
-                                out_gpr |= live_in_gpr[s_slot];
-                                out_fp |= live_in_fp[s_slot];
+                                out_gpr |= at(&live_in_gpr, s_slot, 0u32);
+                                out_fp |= at(&live_in_fp, s_slot, 0u32);
                                 let svbase = s_slot * num_vwords;
                                 for w in 0..num_vwords {
-                                    let add = live_in_v[svbase + w] & !def_v[vbase + w];
-                                    let prev = live_in_v[vbase + w];
-                                    let next = prev | add;
-                                    if next != prev {
-                                        live_in_v[vbase + w] = next;
-                                        changed = true;
+                                    let add = at(&live_in_v, svbase + w, 0u64)
+                                        & !at(&def_v, vbase + w, 0u64);
+                                    if let Some(cell) = live_in_v.get_mut(vbase + w) {
+                                        let next = *cell | add;
+                                        if next != *cell {
+                                            *cell = next;
+                                            changed = true;
+                                        }
                                     }
                                 }
                             }
                         }
                     });
 
-                    let new_g = live_in_gpr[slot] | (out_gpr & !def_gpr[slot]);
-                    let new_f = live_in_fp[slot] | (out_fp & !def_fp[slot]);
-                    if new_g != live_in_gpr[slot] || new_f != live_in_fp[slot] {
-                        live_in_gpr[slot] = new_g;
-                        live_in_fp[slot] = new_f;
+                    let prev_g = at(&live_in_gpr, slot, 0u32);
+                    let prev_f = at(&live_in_fp, slot, 0u32);
+                    let new_g = prev_g | (out_gpr & !at(&def_gpr, slot, 0u32));
+                    let new_f = prev_f | (out_fp & !at(&def_fp, slot, 0u32));
+                    if new_g != prev_g || new_f != prev_f {
+                        set(&mut live_in_gpr, slot, new_g);
+                        set(&mut live_in_fp, slot, new_f);
                         changed = true;
                     }
                 }
@@ -1232,6 +1287,8 @@ fn analyze_loop_recurrences<'a>(
         // 4. For each block in the loop body, mark instructions defining loop-carried registers
         //    (live-in to header `h` AND live into an in-loop successor) without further in-block
         //    non-terminator/non-branch-cmp consumers (including values fed into a latch `ParallelCopy`).
+        let hdr_live_gpr = at(&live_in_gpr, 0, 0u32);
+        let hdr_live_fp = at(&live_in_fp, 0, 0u32);
         for &b_idx in loop_blocks.iter() {
             needed.clear();
             consumed_later.clear();
@@ -1240,13 +1297,17 @@ fn analyze_loop_recurrences<'a>(
             for_each_block_succ(func, MBlock(u32_of(b_idx)), &order_pos, |succ| {
                 let s = to_idx(succ.0);
                 if s < n_blocks {
-                    let s_slot = block_to_slot[s];
+                    let s_slot = at(&block_to_slot, s, usize::MAX);
                     if s_slot != usize::MAX {
-                        needed.gpr |= live_in_gpr[s_slot] & live_in_gpr[0];
-                        needed.fp |= live_in_fp[s_slot] & live_in_fp[0];
+                        needed.gpr |= at(&live_in_gpr, s_slot, 0u32) & hdr_live_gpr;
+                        needed.fp |= at(&live_in_fp, s_slot, 0u32) & hdr_live_fp;
                         let svbase = s_slot * num_vwords;
                         for w in 0..num_vwords {
-                            needed.vwords[w] |= live_in_v[svbase + w] & live_in_v[w];
+                            bitor_at(
+                                &mut needed.vwords,
+                                w,
+                                at(&live_in_v, svbase + w, 0u64) & at(&live_in_v, w, 0u64),
+                            );
                         }
                     }
                 }
@@ -1261,11 +1322,13 @@ fn analyze_loop_recurrences<'a>(
             // Identify trailing flag-setting compare feeding a conditional branch (e.g. `cmp i, n; b.lt loop`)
             // so a loop IV update feeding only that branch-compare still receives the recurrence boost.
             let mut branch_cmp_idx = usize::MAX;
-            if end >= range.start + 2 && is_flag_cond_branch(&func.ops[end - 1]) {
+            if end >= range.start + 2 && func.ops.get(end - 1).is_some_and(is_flag_cond_branch) {
                 let mut scan = end - 1;
                 while scan > range.start {
                     scan -= 1;
-                    let op = &func.ops[scan];
+                    let Some(op) = func.ops.get(scan) else {
+                        break;
+                    };
                     if op.writes_flags() {
                         if matches!(
                             *op,
@@ -1283,13 +1346,15 @@ fn analyze_loop_recurrences<'a>(
             }
 
             for i in (range.start..end).rev() {
-                let op = &func.ops[i];
+                let Some(op) = func.ops.get(i) else {
+                    continue;
+                };
                 if let MOp::ParallelCopy { start, len } = *op {
                     let cs = to_idx(start);
                     let ce = cs.saturating_add(usize::from(len)).min(func.copy_pairs.len());
                     copy_add_srcs.clear();
                     copy_kill_dsts.clear();
-                    for &(dst, src) in &func.copy_pairs[cs..ce] {
+                    for &(dst, src) in func.copy_pairs.get(cs..ce).unwrap_or(&[]) {
                         if needed.contains_mreg(dst) && !consumed_later.contains_mreg(dst) {
                             copy_add_srcs.push(src);
                         }
@@ -1309,13 +1374,13 @@ fn analyze_loop_recurrences<'a>(
                 }
 
                 let info = classify_inst(func, i, target);
-                let vdefs = &info.vreg_defs[..usize::from(info.vreg_def_len)];
-                let vuses = &info.vreg_uses[..usize::from(info.vreg_use_len)];
+                let vdefs = info.vreg_defs_slice();
+                let vuses = info.vreg_uses_slice();
 
                 if !is_sched_barrier(func, i)
                     && needed.hits_unexcluded(&consumed_later, info.phys_gpr_defs, info.phys_fp_defs, vdefs)
                 {
-                    is_recurrence[i] = true;
+                    set(&mut is_recurrence, i, true);
                 }
 
                 // Kill defined registers from `needed` (earlier defs of the same reg are overwritten).
@@ -1330,7 +1395,7 @@ fn analyze_loop_recurrences<'a>(
 
         // Clear `block_to_slot` entries for next header.
         for &b_idx in loop_blocks.iter() {
-            block_to_slot[b_idx] = usize::MAX;
+            set(&mut block_to_slot, b_idx, usize::MAX);
         }
     }
 
@@ -1376,9 +1441,9 @@ impl<'a> SsaLiveness<'a> {
             let w = vi >> 6;
             let bit = 1u64 << (vi & 63);
             if cls.is_gpr() {
-                gpr_mask[w] |= bit;
+                bitor_at(&mut gpr_mask, w, bit);
             } else if cls.is_fp_or_vec() {
-                fp_mask[w] |= bit;
+                bitor_at(&mut fp_mask, w, bit);
             }
         }
 
@@ -1390,8 +1455,8 @@ impl<'a> SsaLiveness<'a> {
             let mut order_pos = vec_filled(n_blocks, usize::MAX, alloc);
             for (pos, &blk) in func.block_order.iter().enumerate() {
                 let b = to_idx(blk.0);
-                if b < n_blocks && order_pos[b] == usize::MAX {
-                    order_pos[b] = pos;
+                if b < n_blocks && at(&order_pos, b, usize::MAX) == usize::MAX {
+                    set(&mut order_pos, b, pos);
                 }
             }
 
@@ -1435,16 +1500,17 @@ impl<'a> SsaLiveness<'a> {
                         if s < n_blocks {
                             let svbase = s * num_vwords;
                             for w in 0..num_vwords {
-                                let out_prev = live_out_v[vbase + w];
-                                let out_next = out_prev | live_in_v[svbase + w];
+                                let succ_in = at(&live_in_v, svbase + w, 0u64);
+                                let out_prev = at(&live_out_v, vbase + w, 0u64);
+                                let out_next = out_prev | succ_in;
                                 if out_next != out_prev {
-                                    live_out_v[vbase + w] = out_next;
+                                    set(&mut live_out_v, vbase + w, out_next);
                                     changed = true;
                                 }
-                                let in_prev = live_in_v[vbase + w];
-                                let in_next = in_prev | (out_next & !def_v[vbase + w]);
+                                let in_prev = at(&live_in_v, vbase + w, 0u64);
+                                let in_next = in_prev | (out_next & !at(&def_v, vbase + w, 0u64));
                                 if in_next != in_prev {
-                                    live_in_v[vbase + w] = in_next;
+                                    set(&mut live_in_v, vbase + w, in_next);
                                     changed = true;
                                 }
                             }
@@ -1498,8 +1564,10 @@ impl<'a> SsaLiveness<'a> {
     fn init_block(&mut self, b_idx: usize) {
         let base = b_idx.saturating_mul(self.num_vwords);
         let end = base.saturating_add(self.num_vwords);
-        if end <= self.block_live_out_v.len() {
-            self.cur_live_v.copy_from_slice(&self.block_live_out_v[base..end]);
+        if let Some(src) = self.block_live_out_v.get(base..end)
+            && src.len() == self.cur_live_v.len()
+        {
+            self.cur_live_v.copy_from_slice(src);
         } else {
             for w in self.cur_live_v.iter_mut() {
                 *w = 0;
@@ -1509,15 +1577,16 @@ impl<'a> SsaLiveness<'a> {
 
     /// Steps `cur_live_v` backward across a single instruction `func.ops[idx]`.
     fn step_backward_inst(&mut self, func: &MFunc<'_>, idx: usize, target: TargetModel) {
-        if let MOp::ParallelCopy { start, len } = func.ops[idx] {
+        if let Some(&MOp::ParallelCopy { start, len }) = func.ops.get(idx) {
             let cs = to_idx(start);
             let ce = cs.saturating_add(usize::from(len)).min(func.copy_pairs.len());
-            for &(dst, _) in &func.copy_pairs[cs..ce] {
+            let copy_slice = func.copy_pairs.get(cs..ce).unwrap_or(&[]);
+            for &(dst, _) in copy_slice {
                 if let MReg::V(v) = dst {
                     self.cur_live_remove(v.0);
                 }
             }
-            for &(_, src) in &func.copy_pairs[cs..ce] {
+            for &(_, src) in copy_slice {
                 if let MReg::V(v) = src {
                     self.cur_live_insert(v.0);
                 }
@@ -1525,10 +1594,10 @@ impl<'a> SsaLiveness<'a> {
             return;
         }
         let info = classify_inst(func, idx, target);
-        for &v in &info.vreg_defs[..usize::from(info.vreg_def_len)] {
+        for &v in info.vreg_defs_slice() {
             self.cur_live_remove(v);
         }
-        for &v in &info.vreg_uses[..usize::from(info.vreg_use_len)] {
+        for &v in info.vreg_uses_slice() {
             self.cur_live_insert(v);
         }
     }
@@ -1539,9 +1608,9 @@ impl<'a> SsaLiveness<'a> {
         let mut gpr = 0u32;
         let mut fp = 0u32;
         for w in 0..self.num_vwords {
-            let live = self.cur_live_v[w];
-            gpr = gpr.saturating_add((live & self.gpr_mask[w]).count_ones());
-            fp = fp.saturating_add((live & self.fp_mask[w]).count_ones());
+            let live = at(&self.cur_live_v, w, 0u64);
+            gpr = gpr.saturating_add((live & at(&self.gpr_mask, w, 0u64)).count_ones());
+            fp = fp.saturating_add((live & at(&self.fp_mask, w, 0u64)).count_ones());
         }
         (
             u16::try_from(gpr).unwrap_or(u16::MAX),
@@ -1552,59 +1621,59 @@ impl<'a> SsaLiveness<'a> {
     /// Prepares per-window `rem_uses` and `vreg_live`, advances `cur_live_v` backward across
     /// `info[0..len]` to become `live_in` at `w_start`, and returns `(init_gpr_live, init_fp_live)`.
     fn enter_window(&mut self, info: &[InstInfo], len: usize) -> (u16, u16) {
+        let window = info.get(..len).unwrap_or(&[]);
+
         // 1. Count intra-window remaining uses for every VReg used in the window.
-        for ci in &info[..len] {
-            for &v in &ci.vreg_uses[..usize::from(ci.vreg_use_len)] {
-                let vi = to_idx(v);
-                if vi < self.num_vregs {
-                    self.rem_uses[vi] = self.rem_uses[vi].saturating_add(1);
+        for ci in window {
+            for &v in ci.vreg_uses_slice() {
+                if let Some(slot) = self.rem_uses.get_mut(to_idx(v)) {
+                    *slot = slot.saturating_add(1);
                 }
             }
         }
 
         // 2. Add a +1 sentinel to `rem_uses[v]` for any window VReg still live after `w_end`
         //    so no intra-window consumer treats a live-out VReg as killed.
-        for ci in &info[..len] {
-            for &v in &ci.vreg_uses[..usize::from(ci.vreg_use_len)] {
+        for ci in window {
+            for &v in ci.vreg_uses_slice() {
                 let vi = to_idx(v);
-                if vi < self.num_vregs && !self.vreg_live[vi] && self.cur_live_contains(v) {
-                    self.vreg_live[vi] = true;
-                    self.rem_uses[vi] = self.rem_uses[vi].saturating_add(1);
+                if vi < self.num_vregs && !at(&self.vreg_live, vi, true) && self.cur_live_contains(v) {
+                    set(&mut self.vreg_live, vi, true);
+                    if let Some(slot) = self.rem_uses.get_mut(vi) {
+                        *slot = slot.saturating_add(1);
+                    }
                 }
             }
-            for &v in &ci.vreg_defs[..usize::from(ci.vreg_def_len)] {
+            for &v in ci.vreg_defs_slice() {
                 let vi = to_idx(v);
-                if vi < self.num_vregs && !self.vreg_live[vi] && self.cur_live_contains(v) {
-                    self.vreg_live[vi] = true;
-                    self.rem_uses[vi] = self.rem_uses[vi].saturating_add(1);
+                if vi < self.num_vregs && !at(&self.vreg_live, vi, true) && self.cur_live_contains(v) {
+                    set(&mut self.vreg_live, vi, true);
+                    if let Some(slot) = self.rem_uses.get_mut(vi) {
+                        *slot = slot.saturating_add(1);
+                    }
                 }
             }
         }
 
         // 3. Step `cur_live_v` backward across `[w_start..w_end]` to produce exact `live_in` at `w_start`.
-        for a in (0..len).rev() {
-            let ci = &info[a];
-            for &v in &ci.vreg_defs[..usize::from(ci.vreg_def_len)] {
+        for ci in window.iter().rev() {
+            for &v in ci.vreg_defs_slice() {
                 self.cur_live_remove(v);
             }
-            for &v in &ci.vreg_uses[..usize::from(ci.vreg_use_len)] {
+            for &v in ci.vreg_uses_slice() {
                 self.cur_live_insert(v);
             }
         }
 
         // 4. Populate `vreg_live` at `w_start` for every VReg appearing in the window.
-        for ci in &info[..len] {
-            for &v in &ci.vreg_uses[..usize::from(ci.vreg_use_len)] {
-                let vi = to_idx(v);
-                if vi < self.num_vregs {
-                    self.vreg_live[vi] = self.cur_live_contains(v);
-                }
+        for ci in window {
+            for &v in ci.vreg_uses_slice() {
+                let live = self.cur_live_contains(v);
+                set(&mut self.vreg_live, to_idx(v), live);
             }
-            for &v in &ci.vreg_defs[..usize::from(ci.vreg_def_len)] {
-                let vi = to_idx(v);
-                if vi < self.num_vregs {
-                    self.vreg_live[vi] = self.cur_live_contains(v);
-                }
+            for &v in ci.vreg_defs_slice() {
+                let live = self.cur_live_contains(v);
+                set(&mut self.vreg_live, to_idx(v), live);
             }
         }
 
@@ -1613,20 +1682,17 @@ impl<'a> SsaLiveness<'a> {
 
     /// Cleans all per-window `rem_uses` and `vreg_live` entries touched by `info[0..len]` in `O(len)`.
     fn cleanup_window(&mut self, info: &[InstInfo], len: usize) {
-        for ci in &info[..len] {
-            for &v in &ci.vreg_uses[..usize::from(ci.vreg_use_len)] {
+        let window = info.get(..len).unwrap_or(&[]);
+        for ci in window {
+            for &v in ci.vreg_uses_slice() {
                 let vi = to_idx(v);
-                if vi < self.num_vregs {
-                    self.rem_uses[vi] = 0;
-                    self.vreg_live[vi] = false;
-                }
+                set(&mut self.rem_uses, vi, 0u16);
+                set(&mut self.vreg_live, vi, false);
             }
-            for &v in &ci.vreg_defs[..usize::from(ci.vreg_def_len)] {
+            for &v in ci.vreg_defs_slice() {
                 let vi = to_idx(v);
-                if vi < self.num_vregs {
-                    self.rem_uses[vi] = 0;
-                    self.vreg_live[vi] = false;
-                }
+                set(&mut self.rem_uses, vi, 0u16);
+                set(&mut self.vreg_live, vi, false);
             }
         }
     }
@@ -1671,10 +1737,13 @@ struct ScheduleCost {
 
 #[inline]
 fn fuses_adrp_with_prev(ctx: &WindowCtx<'_>, prev_op_idx: u8, u: usize) -> bool {
-    !ctx.is_ssa
-        && ctx.target.macro_fuse_adrp_add
-        && prev_op_idx != NO_LOCAL_OP
-        && is_adrp_fusion_pair(&ctx.ops[usize::from(prev_op_idx)], &ctx.ops[u])
+    if ctx.is_ssa || !ctx.target.macro_fuse_adrp_add || prev_op_idx == NO_LOCAL_OP {
+        return false;
+    }
+    let (Some(prev_op), Some(cur_op)) = (ctx.ops.get(usize::from(prev_op_idx)), ctx.ops.get(u)) else {
+        return false;
+    };
+    is_adrp_fusion_pair(prev_op, cur_op)
 }
 
 #[inline]
@@ -1706,58 +1775,62 @@ fn simulate_schedule_cost(ctx: &WindowCtx<'_>, order: &[usize]) -> ScheduleCost 
 
     for (step, &u) in order.iter().enumerate().take(ctx.len) {
         let fused_adrp = fuses_adrp_with_prev(ctx, prev_op_idx, u);
-        let eff_ready = effective_ready_at(ctx, prev_op_idx, u, ready_at[u], cycle);
-        let p_idx = ctx.info[u].pipe.index();
+        let eff_ready = effective_ready_at(ctx, prev_op_idx, u, at(&ready_at, u, 0u16), cycle);
+        let u_info = at(ctx.info, u, InstInfo::EMPTY);
+        let p_idx = u_info.pipe.index();
         let extra_decode: u8 = if fused_adrp { 0 } else { 1 };
-        let extra_pipe: u8 =
-            if fused_adrp && matches!(ctx.ops[u], MOp::AddLo12 { .. }) { 0 } else { 1 };
+        let extra_pipe: u8 = if fused_adrp && matches!(ctx.ops.get(u), Some(MOp::AddLo12 { .. })) {
+            0
+        } else {
+            1
+        };
 
         if eff_ready > cycle {
             cycle = eff_ready;
             pipe_used = [0; 4];
             issued_in_cycle = 0;
         } else if issued_in_cycle.saturating_add(extra_decode) > ctx.issue_width
-            || pipe_used[p_idx].saturating_add(extra_pipe) > ctx.pipe_caps[p_idx]
+            || at(&pipe_used, p_idx, 0u8).saturating_add(extra_pipe) > at(&ctx.pipe_caps, p_idx, 1u8)
         {
             cycle = cycle.saturating_add(1);
             pipe_used = [0; 4];
             issued_in_cycle = 0;
         }
 
-        pipe_used[p_idx] = pipe_used[p_idx].saturating_add(extra_pipe);
+        add_at_u8(&mut pipe_used, p_idx, extra_pipe);
         issued_in_cycle = issued_in_cycle.saturating_add(extra_decode);
         if fused_adrp {
             fused_pairs = fused_pairs.saturating_add(1);
         }
 
-        let u_lat = u16::from(ctx.info[u].lat);
+        let u_lat = u16::from(u_info.lat);
         let done_c = cycle.saturating_add(u_lat);
         if done_c > max_completion {
             max_completion = done_c;
         }
-        if ctx.rec_height[u] > 0 && done_c > max_rec_done {
+        if at(ctx.rec_height, u, 0u16) > 0 && done_c > max_rec_done {
             max_rec_done = done_c;
         }
 
         if step + 1 == ctx.len && ctx.target.macro_fuse_cmp_br {
-            let tail_fused = (ctx.followed_by_flag_branch && is_cmp_br_fusible(&ctx.ops[u]))
-                || (!ctx.is_ssa
-                    && ctx.followed_by_cbz_rt.is_some_and(|rt| is_cbz_fusible(&ctx.ops[u], rt)));
+            let tail_fused = ctx.ops.get(u).is_some_and(|op| {
+                (ctx.followed_by_flag_branch && is_cmp_br_fusible(op))
+                    || (!ctx.is_ssa
+                        && ctx.followed_by_cbz_rt.is_some_and(|rt| is_cbz_fusible(op, rt)))
+            });
             if tail_fused {
                 fused_pairs = fused_pairs.saturating_add(1);
             }
         }
 
-        let mut smask = ctx.succs[u];
-        let raw_mask = ctx.is_raw[u];
+        let mut smask = at(ctx.succs, u, 0u128);
+        let raw_mask = at(ctx.is_raw, u, 0u128);
         while smask != 0 {
             let b = to_idx(smask.trailing_zeros());
             smask &= smask - 1;
             let edge_w = if ((raw_mask >> b) & 1) != 0 { u_lat } else { 0 };
             let avail = cycle.saturating_add(edge_w);
-            if avail > ready_at[b] {
-                ready_at[b] = avail;
-            }
+            max_at_u16(&mut ready_at, b, avail);
         }
         prev_op_idx = u8_of(u);
     }
@@ -1843,7 +1916,7 @@ fn select_beam_candidates(
             let u = to_idx(scan.trailing_zeros());
             scan &= scan - 1;
             if fuses_adrp_with_prev(ctx, state.prev_op_idx, u) {
-                out[0] = u8_of(u);
+                set(&mut out, 0, u8_of(u));
                 return (out, 1);
             }
         }
@@ -1856,7 +1929,7 @@ fn select_beam_candidates(
         while scan != 0 && count < MAX_BEAM_BRANCH {
             let u = to_idx(scan.trailing_zeros());
             scan &= scan - 1;
-            out[count] = u8_of(u);
+            set(&mut out, count, u8_of(u));
             count += 1;
         }
         return (out, count);
@@ -1876,13 +1949,13 @@ fn select_beam_candidates(
         while scan != 0 {
             let u = to_idx(scan.trailing_zeros());
             scan &= scan - 1;
-            let ra = state.ready_at[u];
+            let ra = at(&state.ready_at, u, 0u16);
             if ra < min_ready {
                 min_ready = ra;
             }
             if ra <= eff_cycle {
-                let p = ctx.info[u].pipe.index();
-                if eff_pipe_used[p] < ctx.pipe_caps[p] {
+                let p = at(ctx.info, u, InstInfo::EMPTY).pipe.index();
+                if at(&eff_pipe_used, p, 0u8) < at(&ctx.pipe_caps, p, 1u8) {
                     has_ready_free = true;
                 }
             }
@@ -1908,16 +1981,18 @@ fn select_beam_candidates(
         while scan != 0 {
             let u = to_idx(scan.trailing_zeros());
             scan &= scan - 1;
-            let p = ctx.info[u].pipe.index();
-            let used = eff_pipe_used[p];
-            let cap = ctx.pipe_caps[p];
+            let u_info = at(ctx.info, u, InstInfo::EMPTY);
+            let p = u_info.pipe.index();
+            let used = at(&eff_pipe_used, p, 0u8);
+            let cap = at(&ctx.pipe_caps, p, 1u8);
+            let ra = at(&state.ready_at, u, 0u16);
             let key = (
-                state.ready_at[u] <= eff_cycle,
+                ra <= eff_cycle,
                 used < cap,
-                ctx.height[u],
+                at(ctx.height, u, 0u16),
                 cap.saturating_sub(used),
-                matches!(ctx.info[u].mem, MemKind::Load),
-                u16::MAX.saturating_sub(state.ready_at[u]),
+                matches!(u_info.mem, MemKind::Load),
+                u16::MAX.saturating_sub(ra),
                 usize::MAX - u,
             );
             if best_u == usize::MAX || key > best_key {
@@ -1926,10 +2001,10 @@ fn select_beam_candidates(
             }
         }
         if best_u != usize::MAX {
-            out[count] = u8_of(best_u);
+            set(&mut out, count, u8_of(best_u));
             count += 1;
             picked |= 1u128 << best_u;
-            first_pipe = ctx.info[best_u].pipe.index();
+            first_pipe = at(ctx.info, best_u, InstInfo::EMPTY).pipe.index();
         }
     }
 
@@ -1941,12 +2016,13 @@ fn select_beam_candidates(
         while scan != 0 {
             let u = to_idx(scan.trailing_zeros());
             scan &= scan - 1;
-            let p = ctx.info[u].pipe.index();
+            let p = at(ctx.info, u, InstInfo::EMPTY).pipe.index();
+            let ra = at(&state.ready_at, u, 0u16);
             let key = (
-                state.ready_at[u] <= eff_cycle,
-                eff_pipe_used[p] < ctx.pipe_caps[p],
-                ctx.pure_height[u],
-                u16::MAX.saturating_sub(state.ready_at[u]),
+                ra <= eff_cycle,
+                at(&eff_pipe_used, p, 0u8) < at(&ctx.pipe_caps, p, 1u8),
+                at(ctx.pure_height, u, 0u16),
+                u16::MAX.saturating_sub(ra),
                 usize::MAX - u,
             );
             if best_u == usize::MAX || key > best_key {
@@ -1955,7 +2031,7 @@ fn select_beam_candidates(
             }
         }
         if best_u != usize::MAX && count < MAX_BEAM_BRANCH {
-            out[count] = u8_of(best_u);
+            set(&mut out, count, u8_of(best_u));
             count += 1;
             picked |= 1u128 << best_u;
         }
@@ -1970,21 +2046,22 @@ fn select_beam_candidates(
             let u = to_idx(scan.trailing_zeros());
             scan &= scan - 1;
             let mut unlock_h = 0u16;
-            let mut smask = ctx.succs[u];
+            let mut smask = at(ctx.succs, u, 0u128);
             while smask != 0 {
                 let b = to_idx(smask.trailing_zeros());
                 smask &= smask - 1;
-                if state.pred_rem[b] == 1 && ctx.height[b] > unlock_h {
-                    unlock_h = ctx.height[b];
+                let bh = at(ctx.height, b, 0u16);
+                if at(&state.pred_rem, b, 0u8) == 1 && bh > unlock_h {
+                    unlock_h = bh;
                 }
             }
-            let p = ctx.info[u].pipe.index();
+            let p = at(ctx.info, u, InstInfo::EMPTY).pipe.index();
             let key = (
-                state.ready_at[u] <= eff_cycle,
-                eff_pipe_used[p] < ctx.pipe_caps[p],
+                at(&state.ready_at, u, 0u16) <= eff_cycle,
+                at(&eff_pipe_used, p, 0u8) < at(&ctx.pipe_caps, p, 1u8),
                 unlock_h,
-                ctx.rec_height[u],
-                ctx.pure_height[u],
+                at(ctx.rec_height, u, 0u16),
+                at(ctx.pure_height, u, 0u16),
                 usize::MAX - u,
             );
             if best_u == usize::MAX || key > best_key {
@@ -1993,7 +2070,7 @@ fn select_beam_candidates(
             }
         }
         if best_u != usize::MAX && count < MAX_BEAM_BRANCH {
-            out[count] = u8_of(best_u);
+            set(&mut out, count, u8_of(best_u));
             count += 1;
             picked |= 1u128 << best_u;
         }
@@ -2007,15 +2084,15 @@ fn select_beam_candidates(
         while scan != 0 {
             let u = to_idx(scan.trailing_zeros());
             scan &= scan - 1;
-            let p = ctx.info[u].pipe.index();
-            let used = eff_pipe_used[p];
-            let cap = ctx.pipe_caps[p];
+            let p = at(ctx.info, u, InstInfo::EMPTY).pipe.index();
+            let used = at(&eff_pipe_used, p, 0u8);
+            let cap = at(&ctx.pipe_caps, p, 1u8);
             let key = (
-                state.ready_at[u] <= eff_cycle,
+                at(&state.ready_at, u, 0u16) <= eff_cycle,
                 used < cap,
                 p != first_pipe,
                 cap.saturating_sub(used),
-                ctx.height[u],
+                at(ctx.height, u, 0u16),
                 usize::MAX - u,
             );
             if best_u == usize::MAX || key > best_key {
@@ -2024,7 +2101,7 @@ fn select_beam_candidates(
             }
         }
         if best_u != usize::MAX && count < MAX_BEAM_BRANCH {
-            out[count] = u8_of(best_u);
+            set(&mut out, count, u8_of(best_u));
             count += 1;
         }
     }
@@ -2036,68 +2113,78 @@ fn select_beam_candidates(
 /// per-pipe dispatch and macro-op fusion timing model as [`simulate_schedule_cost`].
 fn advance_beam_state(ctx: &WindowCtx<'_>, mut state: BeamState, u: usize, step: usize) -> BeamState {
     let fused_adrp = fuses_adrp_with_prev(ctx, state.prev_op_idx, u);
-    let eff_ready = effective_ready_at(ctx, state.prev_op_idx, u, state.ready_at[u], state.cycle);
-    let p_idx = ctx.info[u].pipe.index();
+    let eff_ready =
+        effective_ready_at(ctx, state.prev_op_idx, u, at(&state.ready_at, u, 0u16), state.cycle);
+    let u_info = at(ctx.info, u, InstInfo::EMPTY);
+    let p_idx = u_info.pipe.index();
     let extra_decode: u8 = if fused_adrp { 0 } else { 1 };
-    let extra_pipe: u8 =
-        if fused_adrp && matches!(ctx.ops[u], MOp::AddLo12 { .. }) { 0 } else { 1 };
+    let extra_pipe: u8 = if fused_adrp && matches!(ctx.ops.get(u), Some(MOp::AddLo12 { .. })) {
+        0
+    } else {
+        1
+    };
 
     if eff_ready > state.cycle {
         state.cycle = eff_ready;
         state.pipe_used = [0; 4];
         state.issued_in_cycle = 0;
     } else if state.issued_in_cycle.saturating_add(extra_decode) > ctx.issue_width
-        || state.pipe_used[p_idx].saturating_add(extra_pipe) > ctx.pipe_caps[p_idx]
+        || at(&state.pipe_used, p_idx, 0u8).saturating_add(extra_pipe)
+            > at(&ctx.pipe_caps, p_idx, 1u8)
     {
         state.cycle = state.cycle.saturating_add(1);
         state.pipe_used = [0; 4];
         state.issued_in_cycle = 0;
     }
 
-    state.pipe_used[p_idx] = state.pipe_used[p_idx].saturating_add(extra_pipe);
+    add_at_u8(&mut state.pipe_used, p_idx, extra_pipe);
     state.issued_in_cycle = state.issued_in_cycle.saturating_add(extra_decode);
-    state.rem_pipe_ops[p_idx] = state.rem_pipe_ops[p_idx].saturating_sub(1);
+    if let Some(slot) = state.rem_pipe_ops.get_mut(p_idx) {
+        *slot = slot.saturating_sub(1);
+    }
     if fused_adrp {
         state.fused_pairs = state.fused_pairs.saturating_add(1);
     }
 
-    let u_lat = u16::from(ctx.info[u].lat);
+    let u_lat = u16::from(u_info.lat);
     let done_c = state.cycle.saturating_add(u_lat);
     if done_c > state.max_completion {
         state.max_completion = done_c;
     }
-    if ctx.rec_height[u] > 0 && done_c > state.max_rec_done {
+    if at(ctx.rec_height, u, 0u16) > 0 && done_c > state.max_rec_done {
         state.max_rec_done = done_c;
     }
 
     if step + 1 == ctx.len && ctx.target.macro_fuse_cmp_br {
-        let tail_fused = (ctx.followed_by_flag_branch && is_cmp_br_fusible(&ctx.ops[u]))
-            || (!ctx.is_ssa
-                && ctx.followed_by_cbz_rt.is_some_and(|rt| is_cbz_fusible(&ctx.ops[u], rt)));
+        let tail_fused = ctx.ops.get(u).is_some_and(|op| {
+            (ctx.followed_by_flag_branch && is_cmp_br_fusible(op))
+                || (!ctx.is_ssa
+                    && ctx.followed_by_cbz_rt.is_some_and(|rt| is_cbz_fusible(op, rt)))
+        });
         if tail_fused {
             state.fused_pairs = state.fused_pairs.saturating_add(1);
         }
     }
 
-    state.order[step] = u8_of(u);
+    set(&mut state.order, step, u8_of(u));
     let u_bit = 1u128 << u;
     state.ready &= !u_bit;
     state.scheduled |= u_bit;
     state.prev_op_idx = u8_of(u);
 
-    let mut smask = ctx.succs[u];
-    let raw_mask = ctx.is_raw[u];
+    let mut smask = at(ctx.succs, u, 0u128);
+    let raw_mask = at(ctx.is_raw, u, 0u128);
     while smask != 0 {
         let b = to_idx(smask.trailing_zeros());
         smask &= smask - 1;
         let edge_w = if ((raw_mask >> b) & 1) != 0 { u_lat } else { 0 };
         let avail = state.cycle.saturating_add(edge_w);
-        if avail > state.ready_at[b] {
-            state.ready_at[b] = avail;
-        }
-        state.pred_rem[b] = state.pred_rem[b].saturating_sub(1);
-        if state.pred_rem[b] == 0 {
-            state.ready |= 1u128 << b;
+        max_at_u16(&mut state.ready_at, b, avail);
+        if let Some(slot) = state.pred_rem.get_mut(b) {
+            *slot = slot.saturating_sub(1);
+            if *slot == 0 {
+                state.ready |= 1u128 << b;
+            }
         }
     }
 
@@ -2115,20 +2202,24 @@ fn compute_beam_rank(ctx: &WindowCtx<'_>, state: &BeamState, last_u: usize) -> B
     while scan != 0 {
         let r = to_idx(scan.trailing_zeros());
         scan &= scan - 1;
-        let eff_r = effective_ready_at(ctx, state.prev_op_idx, r, state.ready_at[r], state.cycle);
+        let eff_r =
+            effective_ready_at(ctx, state.prev_op_idx, r, at(&state.ready_at, r, 0u16), state.cycle);
         let mut e = if eff_r > state.cycle { eff_r } else { state.cycle };
         if e == state.cycle && !fuses_adrp_with_prev(ctx, state.prev_op_idx, r) {
-            let p = ctx.info[r].pipe.index();
-            if state.issued_in_cycle >= ctx.issue_width || state.pipe_used[p] >= ctx.pipe_caps[p] {
+            let p = at(ctx.info, r, InstInfo::EMPTY).pipe.index();
+            if state.issued_in_cycle >= ctx.issue_width
+                || at(&state.pipe_used, p, 0u8) >= at(&ctx.pipe_caps, p, 1u8)
+            {
                 e = e.saturating_add(1);
             }
         }
-        let ms_lb = e.saturating_add(ctx.pure_height[r]);
+        let ms_lb = e.saturating_add(at(ctx.pure_height, r, 0u16));
         if ms_lb > est_ms {
             est_ms = ms_lb;
         }
-        if ctx.pure_rec_height[r] > 0 {
-            let rc_lb = e.saturating_add(ctx.pure_rec_height[r]);
+        let prh = at(ctx.pure_rec_height, r, 0u16);
+        if prh > 0 {
+            let rc_lb = e.saturating_add(prh);
             if rc_lb > est_rec {
                 est_rec = rc_lb;
             }
@@ -2138,12 +2229,12 @@ fn compute_beam_rank(ctx: &WindowCtx<'_>, state: &BeamState, last_u: usize) -> B
     // 2. Per-pipe remaining throughput lower bound.
     let cycle_rem = ctx.issue_width.saturating_sub(state.issued_in_cycle);
     for p in 0..4 {
-        let rem = state.rem_pipe_ops[p];
+        let rem = at(&state.rem_pipe_ops, p, 0u8);
         if rem == 0 {
             continue;
         }
-        let cap = ctx.pipe_caps[p];
-        let pipe_rem = cap.saturating_sub(state.pipe_used[p]);
+        let cap = at(&ctx.pipe_caps, p, 1u8);
+        let pipe_rem = cap.saturating_sub(at(&state.pipe_used, p, 0u8));
         let avail_now = if cycle_rem < pipe_rem { cycle_rem } else { pipe_rem };
         let pipe_lb = if rem <= avail_now {
             state.cycle.saturating_add(1)
@@ -2178,16 +2269,17 @@ fn beam_search_window(
     }
     let mut init = BeamState::EMPTY;
     for u in 0..ctx.len {
-        init.pred_rem[u] = init_pred_rem[u];
-        if init_pred_rem[u] == 0 {
+        let pr = at(init_pred_rem, u, 0u8);
+        set(&mut init.pred_rem, u, pr);
+        if pr == 0 {
             init.ready |= 1u128 << u;
         }
-        let p = ctx.info[u].pipe.index();
-        init.rem_pipe_ops[p] = init.rem_pipe_ops[p].saturating_add(1);
+        let p = at(ctx.info, u, InstInfo::EMPTY).pipe.index();
+        add_at_u8(&mut init.rem_pipe_ops, p, 1);
     }
 
     let mut beam = [BeamState::EMPTY; MAX_BEAM_STATES];
-    beam[0] = init;
+    set(&mut beam, 0, init);
     let mut beam_len = 1usize;
 
     for step in 0..ctx.len {
@@ -2195,44 +2287,45 @@ fn beam_search_window(
         let mut next_rank = [BeamRank::MAX; MAX_BEAM_STATES];
         let mut next_len = 0usize;
 
-        for bi in 0..beam_len {
-            let state = beam[bi];
+        for &state in beam.get(..beam_len).unwrap_or(&[]) {
             if state.ready == 0 {
                 continue;
             }
             let (cands, cand_len) = select_beam_candidates(ctx, &state);
-            for &cand_u in &cands[..cand_len] {
+            for &cand_u in cands.get(..cand_len).unwrap_or(&[]) {
                 let u = usize::from(cand_u);
                 let cand_state = advance_beam_state(ctx, state, u, step);
                 let cand_rank = compute_beam_rank(ctx, &cand_state, u);
 
                 // Deduplicate identical `scheduled` subsets so all 4 beam slots stay distinct.
                 let mut dup_idx = usize::MAX;
-                for k in 0..next_len {
-                    if next_beam[k].scheduled == cand_state.scheduled {
+                for (k, nb) in next_beam.iter().enumerate().take(next_len) {
+                    if nb.scheduled == cand_state.scheduled {
                         dup_idx = k;
                         break;
                     }
                 }
                 if dup_idx != usize::MAX {
-                    if cand_rank < next_rank[dup_idx] {
-                        next_beam[dup_idx] = cand_state;
-                        next_rank[dup_idx] = cand_rank;
+                    if cand_rank < at(&next_rank, dup_idx, BeamRank::MAX) {
+                        set(&mut next_beam, dup_idx, cand_state);
+                        set(&mut next_rank, dup_idx, cand_rank);
                     }
                 } else if next_len < MAX_BEAM_STATES {
-                    next_beam[next_len] = cand_state;
-                    next_rank[next_len] = cand_rank;
+                    set(&mut next_beam, next_len, cand_state);
+                    set(&mut next_rank, next_len, cand_rank);
                     next_len += 1;
                 } else {
                     let mut worst_k = 0usize;
-                    for k in 1..MAX_BEAM_STATES {
-                        if next_rank[k] > next_rank[worst_k] {
+                    let mut worst_r = at(&next_rank, 0, BeamRank::MAX);
+                    for (k, &rk) in next_rank.iter().enumerate().skip(1) {
+                        if rk > worst_r {
                             worst_k = k;
+                            worst_r = rk;
                         }
                     }
-                    if cand_rank < next_rank[worst_k] {
-                        next_beam[worst_k] = cand_state;
-                        next_rank[worst_k] = cand_rank;
+                    if cand_rank < worst_r {
+                        set(&mut next_beam, worst_k, cand_state);
+                        set(&mut next_rank, worst_k, cand_rank);
                     }
                 }
             }
@@ -2245,7 +2338,7 @@ fn beam_search_window(
         // Deterministic insertion sort over `<= 4` beam slots by `BeamRank`.
         for i in 1..next_len {
             let mut j = i;
-            while j > 0 && next_rank[j] < next_rank[j - 1] {
+            while j > 0 && at(&next_rank, j, BeamRank::MAX) < at(&next_rank, j - 1, BeamRank::MAX) {
                 next_rank.swap(j, j - 1);
                 next_beam.swap(j, j - 1);
                 j -= 1;
@@ -2261,10 +2354,10 @@ fn beam_search_window(
 
     for state in beam.iter().take(beam_len) {
         let mut ord = [0usize; WINDOW_MAX];
-        for i in 0..ctx.len {
-            ord[i] = usize::from(state.order[i]);
+        for (i, &op_u8) in state.order.iter().enumerate().take(ctx.len) {
+            set(&mut ord, i, usize::from(op_u8));
         }
-        let cost = simulate_schedule_cost(ctx, &ord[..ctx.len]);
+        let cost = simulate_schedule_cost(ctx, ord.get(..ctx.len).unwrap_or(&[]));
         if best_cost.is_none_or(|bc| cost < bc) {
             best_cost = Some(cost);
             best_order = ord;
@@ -2305,12 +2398,12 @@ fn schedule_window(
     for a in 0..len {
         let ga = w_start + a;
         let ci = classify_inst(func, ga, target);
-        info[a] = ci;
+        set(&mut info, a, ci);
         if ci.writes_flags {
             last_flag_writer = Some(a);
         }
-        if is_recurrence.get(ga).copied().unwrap_or(false) {
-            rec_boost[a] = RECURRENCE_HEIGHT_BOOST;
+        if at(is_recurrence, ga, false) {
+            set(&mut rec_boost, a, RECURRENCE_HEIGHT_BOOST);
             has_any_recurrence = true;
         }
     }
@@ -2321,14 +2414,14 @@ fn schedule_window(
     let mut pred_rem = [0u8; WINDOW_MAX];
 
     for a in 0..len {
-        let ia = info[a];
-        let a_vdefs = &ia.vreg_defs[..usize::from(ia.vreg_def_len)];
-        let a_vuses = &ia.vreg_uses[..usize::from(ia.vreg_use_len)];
+        let ia = at(&info, a, InstInfo::EMPTY);
+        let a_vdefs = ia.vreg_defs_slice();
+        let a_vuses = ia.vreg_uses_slice();
 
         for b in (a + 1)..len {
-            let ib = info[b];
-            let b_vdefs = &ib.vreg_defs[..usize::from(ib.vreg_def_len)];
-            let b_vuses = &ib.vreg_uses[..usize::from(ib.vreg_use_len)];
+            let ib = at(&info, b, InstInfo::EMPTY);
+            let b_vdefs = ib.vreg_defs_slice();
+            let b_vuses = ib.vreg_uses_slice();
 
             // Exact RAW / WAR / WAW across physical GPRs, physical FPs, VRegs, and NZCV/VFlags.
             // Serializing all flag writers (`WAW`) and bracketing flag readers (`RAW` + `WAR`)
@@ -2359,11 +2452,11 @@ fn schedule_window(
 
             if raw || war || waw || mem_dep || trap_dep {
                 let b_bit = 1u128 << b;
-                succs[a] |= b_bit;
+                bitor_at(&mut succs, a, b_bit);
                 if raw {
-                    is_raw[a] |= b_bit;
+                    bitor_at(&mut is_raw, a, b_bit);
                 }
-                pred_rem[b] = pred_rem[b].saturating_add(1);
+                add_at_u8(&mut pred_rem, b, 1);
             }
         }
     }
@@ -2376,36 +2469,42 @@ fn schedule_window(
     let mut pure_rec_height = [0u16; WINDOW_MAX];
     let mut rec_height = [0u16; WINDOW_MAX];
     for a in (0..len).rev() {
-        let a_lat = u16::from(info[a].lat);
+        let a_lat = u16::from(at(&info, a, InstInfo::EMPTY).lat);
+        let rb = at(&rec_boost, a, 0u16);
         let mut h = a_lat;
         let mut ph = a_lat;
-        let mut prh = if rec_boost[a] > 0 { a_lat } else { 0 };
-        let mut mask = succs[a];
-        let raw_mask = is_raw[a];
+        let mut prh = if rb > 0 { a_lat } else { 0 };
+        let mut mask = at(&succs, a, 0u128);
+        let raw_mask = at(&is_raw, a, 0u128);
         while mask != 0 {
             let b = to_idx(mask.trailing_zeros());
             mask &= mask - 1;
             let is_raw_edge = ((raw_mask >> b) & 1) != 0;
             let edge_w = if is_raw_edge { a_lat } else { 0 };
-            let cand = edge_w.saturating_add(height[b]);
+            let cand = edge_w.saturating_add(at(&height, b, 0u16));
             if cand > h {
                 h = cand;
             }
-            let p_cand = edge_w.saturating_add(pure_height[b]);
+            let p_cand = edge_w.saturating_add(at(&pure_height, b, 0u16));
             if p_cand > ph {
                 ph = p_cand;
             }
-            if is_raw_edge && pure_rec_height[b] > 0 {
-                let r_cand = a_lat.saturating_add(pure_rec_height[b]);
+            let b_prh = at(&pure_rec_height, b, 0u16);
+            if is_raw_edge && b_prh > 0 {
+                let r_cand = a_lat.saturating_add(b_prh);
                 if r_cand > prh {
                     prh = r_cand;
                 }
             }
         }
-        height[a] = h.saturating_add(rec_boost[a]);
-        pure_height[a] = ph;
-        pure_rec_height[a] = prh;
-        rec_height[a] = if prh > 0 { prh.saturating_add(RECURRENCE_HEIGHT_BOOST) } else { 0 };
+        set(&mut height, a, h.saturating_add(rb));
+        set(&mut pure_height, a, ph);
+        set(&mut pure_rec_height, a, prh);
+        set(
+            &mut rec_height,
+            a,
+            if prh > 0 { prh.saturating_add(RECURRENCE_HEIGHT_BOOST) } else { 0 },
+        );
     }
 
     // 3a. Post-RA `Adrp` + (`AddLo12` | `Ldr { BaseOff }`) Fusion Lock: for adjacent pairs
@@ -2415,13 +2514,16 @@ fn schedule_window(
     if !func.is_ssa && target.macro_fuse_adrp_add {
         for a in 0..len.saturating_sub(1) {
             let b = a + 1;
-            if is_adrp_fusion_pair(&func.ops[w_start + a], &func.ops[w_start + b]) {
+            if let (Some(op_a), Some(op_b)) = (func.ops.get(w_start + a), func.ops.get(w_start + b))
+                && is_adrp_fusion_pair(op_a, op_b)
+            {
                 let a_bit = 1u128 << a;
                 let b_bit = 1u128 << b;
                 for p in 0..a {
-                    if (succs[p] & b_bit) != 0 && (succs[p] & a_bit) == 0 {
-                        succs[p] |= a_bit;
-                        pred_rem[a] = pred_rem[a].saturating_add(1);
+                    let sp = at(&succs, p, 0u128);
+                    if (sp & b_bit) != 0 && (sp & a_bit) == 0 {
+                        bitor_at(&mut succs, p, a_bit);
+                        add_at_u8(&mut pred_rem, a, 1);
                     }
                 }
             }
@@ -2434,17 +2536,17 @@ fn schedule_window(
     if target.macro_fuse_cmp_br
         && followed_by_flag_branch
         && let Some(f) = last_flag_writer
-        && is_cmp_br_fusible(&func.ops[w_start + f])
-        && succs[f] == 0
+        && func.ops.get(w_start + f).is_some_and(is_cmp_br_fusible)
+        && at(&succs, f, 0u128) == 0
     {
         let f_bit = 1u128 << f;
         for u in 0..len {
             if u == f {
                 continue;
             }
-            if (succs[u] & f_bit) == 0 {
-                succs[u] |= f_bit;
-                pred_rem[f] = pred_rem[f].saturating_add(1);
+            if (at(&succs, u, 0u128) & f_bit) == 0 {
+                bitor_at(&mut succs, u, f_bit);
+                add_at_u8(&mut pred_rem, f, 1);
             }
         }
     } else if !func.is_ssa
@@ -2452,12 +2554,14 @@ fn schedule_window(
         && let Some(rt) = followed_by_cbz_rt
     {
         let last = len - 1;
-        if is_cbz_fusible(&func.ops[w_start + last], rt) && succs[last] == 0 {
+        if func.ops.get(w_start + last).is_some_and(|op| is_cbz_fusible(op, rt))
+            && at(&succs, last, 0u128) == 0
+        {
             let last_bit = 1u128 << last;
             for u in 0..last {
-                if (succs[u] & last_bit) == 0 {
-                    succs[u] |= last_bit;
-                    pred_rem[last] = pred_rem[last].saturating_add(1);
+                if (at(&succs, u, 0u128) & last_bit) == 0 {
+                    bitor_at(&mut succs, u, last_bit);
+                    add_at_u8(&mut pred_rem, last, 1);
                 }
             }
         }
@@ -2475,7 +2579,7 @@ fn schedule_window(
     let init_pred_rem = pred_rem;
 
     let ctx = WindowCtx {
-        ops: &func.ops[w_start..w_end],
+        ops: func.ops.get(w_start..w_end).unwrap_or(&[]),
         info: &info,
         succs: &succs,
         is_raw: &is_raw,
@@ -2549,13 +2653,13 @@ fn schedule_window(
             while scan != 0 {
                 let u = to_idx(scan.trailing_zeros());
                 scan &= scan - 1;
-                let ra = effective_ready_at(&ctx, prev_op_idx, u, ready_at[u], cycle);
+                let ra = effective_ready_at(&ctx, prev_op_idx, u, at(&ready_at, u, 0u16), cycle);
                 if ra < min_ready {
                     min_ready = ra;
                 }
                 if ra <= cycle {
-                    let p_idx = info[u].pipe.index();
-                    if pipe_used[p_idx] < pipe_caps[p_idx] {
+                    let p_idx = at(&info, u, InstInfo::EMPTY).pipe.index();
+                    if at(&pipe_used, p_idx, 0u8) < at(&pipe_caps, p_idx, 1u8) {
                         has_ready_free_pipe = true;
                     }
                 }
@@ -2599,16 +2703,19 @@ fn schedule_window(
             while cand_mask != 0 {
                 let u = to_idx(cand_mask.trailing_zeros());
                 cand_mask &= cand_mask - 1;
+                let u_info = at(&info, u, InstInfo::EMPTY);
 
                 let mut gpr_kills: i16 = 0;
                 let mut fp_kills: i16 = 0;
                 let mut gpr_defs: i16 = 0;
                 let mut fp_defs: i16 = 0;
                 if let Some(ssa) = ssa_live.as_deref() {
-                    for &v in &info[u].vreg_uses[..usize::from(info[u].vreg_use_len)] {
+                    for &v in u_info.vreg_uses_slice() {
                         let vi = to_idx(v);
-                        if vi < ssa.num_vregs && ssa.rem_uses[vi] == 1 {
-                            let cls = func.vreg_class[vi];
+                        if vi < ssa.num_vregs
+                            && at(&ssa.rem_uses, vi, 0u16) == 1
+                            && let Some(&cls) = func.vreg_class.get(vi)
+                        {
                             if cls.is_gpr() {
                                 gpr_kills = gpr_kills.saturating_add(1);
                             } else if cls.is_fp_or_vec() {
@@ -2616,10 +2723,11 @@ fn schedule_window(
                             }
                         }
                     }
-                    for &v in &info[u].vreg_defs[..usize::from(info[u].vreg_def_len)] {
+                    for &v in u_info.vreg_defs_slice() {
                         let vi = to_idx(v);
-                        if vi < ssa.num_vregs {
-                            let cls = func.vreg_class[vi];
+                        if vi < ssa.num_vregs
+                            && let Some(&cls) = func.vreg_class.get(vi)
+                        {
                             if cls.is_gpr() {
                                 gpr_defs = gpr_defs.saturating_add(1);
                             } else if cls.is_fp_or_vec() {
@@ -2637,18 +2745,19 @@ fn schedule_window(
                     (false, false) => 0,
                 };
 
-                let rec_tie = i16::try_from(rec_height[u]).unwrap_or(i16::MAX);
+                let u_rec_h = at(&rec_height, u, 0u16);
+                let rec_tie = i16::try_from(u_rec_h).unwrap_or(i16::MAX);
                 let (pressure_tier, tier_tie) = if critical_pressure {
                     if active_delta < 0 {
                         (3u8, active_delta.saturating_neg())
                     } else if active_delta == 0 {
                         (2u8, rec_tie)
-                    } else if rec_height[u] > 0 {
+                    } else if u_rec_h > 0 {
                         (1u8, rec_tie)
                     } else {
                         (0u8, active_delta.saturating_neg())
                     }
-                } else if rec_height[u] > 0 {
+                } else if u_rec_h > 0 {
                     (3u8, rec_tie)
                 } else if active_delta < 0 {
                     (2u8, active_delta.saturating_neg())
@@ -2658,23 +2767,24 @@ fn schedule_window(
                     (0u8, active_delta.saturating_neg())
                 };
 
-                let is_ready_now = ready_at[u] <= cycle;
-                let p_idx = info[u].pipe.index();
-                let used = pipe_used[p_idx];
-                let cap = pipe_caps[p_idx];
+                let u_ra = at(&ready_at, u, 0u16);
+                let is_ready_now = u_ra <= cycle;
+                let p_idx = u_info.pipe.index();
+                let used = at(&pipe_used, p_idx, 0u8);
+                let cap = at(&pipe_caps, p_idx, 1u8);
                 let pipe_free = used < cap;
                 let pipe_avail = cap.saturating_sub(used);
-                let load_first = matches!(info[u].mem, MemKind::Load);
-                let earliest_ready = u16::MAX.saturating_sub(ready_at[u]);
+                let load_first = matches!(u_info.mem, MemKind::Load);
+                let earliest_ready = u16::MAX.saturating_sub(u_ra);
                 let orig_tie = usize::MAX - u;
 
                 let key = (
                     pressure_tier,
                     tier_tie,
-                    rec_height[u],
+                    u_rec_h,
                     is_ready_now,
                     pipe_free,
-                    height[u],
+                    at(&height, u, 0u16),
                     pipe_avail,
                     load_first,
                     earliest_ready,
@@ -2694,23 +2804,24 @@ fn schedule_window(
             while cand_mask != 0 {
                 let u = to_idx(cand_mask.trailing_zeros());
                 cand_mask &= cand_mask - 1;
+                let u_info = at(&info, u, InstInfo::EMPTY);
 
                 let adrp_fuse = fuses_adrp_with_prev(&ctx, prev_op_idx, u);
-                let eff_ra = effective_ready_at(&ctx, prev_op_idx, u, ready_at[u], cycle);
+                let eff_ra = effective_ready_at(&ctx, prev_op_idx, u, at(&ready_at, u, 0u16), cycle);
                 let is_ready_now = eff_ra <= cycle;
-                let p_idx = info[u].pipe.index();
-                let used = pipe_used[p_idx];
-                let cap = pipe_caps[p_idx];
+                let p_idx = u_info.pipe.index();
+                let used = at(&pipe_used, p_idx, 0u8);
+                let cap = at(&pipe_caps, p_idx, 1u8);
                 let pipe_free = used < cap;
                 let pipe_avail = cap.saturating_sub(used);
-                let load_first = matches!(info[u].mem, MemKind::Load);
+                let load_first = matches!(u_info.mem, MemKind::Load);
                 let earliest_ready = u16::MAX.saturating_sub(eff_ra);
                 let orig_tie = usize::MAX - u;
                 let key = (
                     adrp_fuse,
                     is_ready_now,
                     pipe_free,
-                    height[u],
+                    at(&height, u, 0u16),
                     pipe_avail,
                     load_first,
                     earliest_ready,
@@ -2723,76 +2834,87 @@ fn schedule_window(
             }
         }
 
-        order[step] = best_u;
+        set(&mut order, step, best_u);
         ready &= !(1u128 << best_u);
 
+        let best_info = at(&info, best_u, InstInfo::EMPTY);
         let fused_adrp = fuses_adrp_with_prev(&ctx, prev_op_idx, best_u);
-        let eff_ra = effective_ready_at(&ctx, prev_op_idx, best_u, ready_at[best_u], cycle);
-        let p_idx = info[best_u].pipe.index();
+        let eff_ra = effective_ready_at(&ctx, prev_op_idx, best_u, at(&ready_at, best_u, 0u16), cycle);
+        let p_idx = best_info.pipe.index();
         let extra_decode: u8 = if fused_adrp { 0 } else { 1 };
         let extra_pipe: u8 =
-            if fused_adrp && matches!(ctx.ops[best_u], MOp::AddLo12 { .. }) { 0 } else { 1 };
+            if fused_adrp && matches!(ctx.ops.get(best_u), Some(MOp::AddLo12 { .. })) { 0 } else { 1 };
 
         if eff_ra > cycle {
             cycle = eff_ra;
             pipe_used = [0; 4];
             issued_in_cycle = 0;
         } else if issued_in_cycle.saturating_add(extra_decode) > issue_width
-            || pipe_used[p_idx].saturating_add(extra_pipe) > pipe_caps[p_idx]
+            || at(&pipe_used, p_idx, 0u8).saturating_add(extra_pipe) > at(&pipe_caps, p_idx, 1u8)
         {
             cycle = cycle.saturating_add(1);
             pipe_used = [0; 4];
             issued_in_cycle = 0;
         }
-        pipe_used[p_idx] = pipe_used[p_idx].saturating_add(extra_pipe);
+        add_at_u8(&mut pipe_used, p_idx, extra_pipe);
         issued_in_cycle = issued_in_cycle.saturating_add(extra_decode);
         prev_op_idx = u8_of(best_u);
 
         // Update SSA live GPR/FP VReg counts after scheduling `best_u`.
         if let Some(ssa) = ssa_live.as_deref_mut() {
-            for &v in &info[best_u].vreg_uses[..usize::from(info[best_u].vreg_use_len)] {
+            for &v in best_info.vreg_uses_slice() {
                 let vi = to_idx(v);
                 if vi < ssa.num_vregs {
-                    ssa.rem_uses[vi] = ssa.rem_uses[vi].saturating_sub(1);
-                    if ssa.rem_uses[vi] == 0 && ssa.vreg_live[vi] {
-                        ssa.vreg_live[vi] = false;
-                        let cls = func.vreg_class[vi];
-                        if cls.is_gpr() {
-                            cur_gpr_live = cur_gpr_live.saturating_sub(1);
-                        } else if cls.is_fp_or_vec() {
-                            cur_fp_live = cur_fp_live.saturating_sub(1);
+                    let new_rem = if let Some(slot) = ssa.rem_uses.get_mut(vi) {
+                        *slot = slot.saturating_sub(1);
+                        *slot
+                    } else {
+                        u16::MAX
+                    };
+                    if new_rem == 0 && at(&ssa.vreg_live, vi, false) {
+                        set(&mut ssa.vreg_live, vi, false);
+                        if let Some(&cls) = func.vreg_class.get(vi) {
+                            if cls.is_gpr() {
+                                cur_gpr_live = cur_gpr_live.saturating_sub(1);
+                            } else if cls.is_fp_or_vec() {
+                                cur_fp_live = cur_fp_live.saturating_sub(1);
+                            }
                         }
                     }
                 }
             }
-            for &v in &info[best_u].vreg_defs[..usize::from(info[best_u].vreg_def_len)] {
+            for &v in best_info.vreg_defs_slice() {
                 let vi = to_idx(v);
-                if vi < ssa.num_vregs && ssa.rem_uses[vi] > 0 && !ssa.vreg_live[vi] {
-                    ssa.vreg_live[vi] = true;
-                    let cls = func.vreg_class[vi];
-                    if cls.is_gpr() {
-                        cur_gpr_live = cur_gpr_live.saturating_add(1);
-                    } else if cls.is_fp_or_vec() {
-                        cur_fp_live = cur_fp_live.saturating_add(1);
+                if vi < ssa.num_vregs
+                    && at(&ssa.rem_uses, vi, 0u16) > 0
+                    && !at(&ssa.vreg_live, vi, true)
+                {
+                    set(&mut ssa.vreg_live, vi, true);
+                    if let Some(&cls) = func.vreg_class.get(vi) {
+                        if cls.is_gpr() {
+                            cur_gpr_live = cur_gpr_live.saturating_add(1);
+                        } else if cls.is_fp_or_vec() {
+                            cur_fp_live = cur_fp_live.saturating_add(1);
+                        }
                     }
                 }
             }
         }
 
-        let u_lat = u16::from(info[best_u].lat);
-        let mut smask = succs[best_u];
-        let raw_mask = is_raw[best_u];
+        let u_lat = u16::from(best_info.lat);
+        let mut smask = at(&succs, best_u, 0u128);
+        let raw_mask = at(&is_raw, best_u, 0u128);
         while smask != 0 {
             let b = to_idx(smask.trailing_zeros());
             smask &= smask - 1;
             let edge_w = if ((raw_mask >> b) & 1) != 0 { u_lat } else { 0 };
             let avail = cycle.saturating_add(edge_w);
-            if avail > ready_at[b] {
-                ready_at[b] = avail;
-            }
-            pred_rem[b] = pred_rem[b].saturating_sub(1);
-            if pred_rem[b] == 0 {
-                ready |= 1u128 << b;
+            max_at_u16(&mut ready_at, b, avail);
+            if let Some(slot) = pred_rem.get_mut(b) {
+                *slot = slot.saturating_sub(1);
+                if *slot == 0 {
+                    ready |= 1u128 << b;
+                }
             }
         }
     }
@@ -2809,7 +2931,7 @@ fn schedule_window(
         && (in_loop || has_any_recurrence)
         && (BEAM_MIN_LEN..=BEAM_MAX_LEN).contains(&len)
     {
-        let greedy_cost = simulate_schedule_cost(&ctx, &order[..len]);
+        let greedy_cost = simulate_schedule_cost(&ctx, order.get(..len).unwrap_or(&[]));
         if let Some((beam_order, beam_cost)) = beam_search_window(&ctx, &init_pred_rem)
             && beam_cost < greedy_cost
         {
@@ -2838,21 +2960,21 @@ fn schedule_window(
 
     for i in 0..len {
         let g = w_start + i;
-        saved_ops[i] = func.ops[g];
-        saved_flags[i] = func.flags[g];
-        saved_vflag_def[i] = func.vflag_def[g];
-        saved_vflag_use[i] = func.vflag_use[g];
-        saved_note_idx[i] = func.note_idx[g];
+        set(&mut saved_ops, i, at(&func.ops, g, MOp::Nop));
+        set(&mut saved_flags, i, at(&func.flags, g, MInstFlags::NONE));
+        set(&mut saved_vflag_def, i, at(&func.vflag_def, g, NO_VFLAG));
+        set(&mut saved_vflag_use, i, at(&func.vflag_use, g, NO_VFLAG));
+        set(&mut saved_note_idx, i, at(&func.note_idx, g, NO_NOTE));
     }
 
     for step in 0..len {
-        let orig = order[step];
+        let orig = at(&order, step, step);
         let dst = w_start + step;
-        func.ops[dst] = saved_ops[orig];
-        func.flags[dst] = saved_flags[orig];
-        func.vflag_def[dst] = saved_vflag_def[orig];
-        func.vflag_use[dst] = saved_vflag_use[orig];
-        func.note_idx[dst] = saved_note_idx[orig];
+        set(&mut func.ops, dst, at(&saved_ops, orig, MOp::Nop));
+        set(&mut func.flags, dst, at(&saved_flags, orig, MInstFlags::NONE));
+        set(&mut func.vflag_def, dst, at(&saved_vflag_def, orig, NO_VFLAG));
+        set(&mut func.vflag_use, dst, at(&saved_vflag_use, orig, NO_VFLAG));
+        set(&mut func.note_idx, dst, at(&saved_note_idx, orig, NO_NOTE));
     }
 
     stats.insts_reordered = stats.insts_reordered.saturating_add(moved);
@@ -2903,12 +3025,14 @@ pub fn schedule_mfunc<'a>(
     let mut visited_block = vec_filled(n_blocks, false, alloc);
     let num_ord = func.block_order.len();
     for ord_idx in 0..num_ord {
-        let blk = func.block_order[ord_idx];
+        let Some(&blk) = func.block_order.get(ord_idx) else {
+            continue;
+        };
         let b = to_idx(blk.0);
-        if b >= n_blocks || visited_block[b] {
+        if b >= n_blocks || at(&visited_block, b, true) {
             continue;
         }
-        visited_block[b] = true;
+        set(&mut visited_block, b, true);
 
         let range = func.block_inst_range(blk);
         let b_start = range.start.min(n_ops);
@@ -2946,9 +3070,10 @@ pub fn schedule_mfunc<'a>(
                 continue;
             }
 
-            let followed_by_flag_branch = r_end < b_end && is_flag_cond_branch(&func.ops[r_end]);
+            let followed_by_flag_branch =
+                r_end < b_end && func.ops.get(r_end).is_some_and(is_flag_cond_branch);
             let followed_by_cbz_rt =
-                if r_end < b_end { cbz_tested_reg(&func.ops[r_end]) } else { None };
+                if r_end < b_end { func.ops.get(r_end).and_then(cbz_tested_reg) } else { None };
 
             // Sub-partition giant barrier-free regions into forward-aligned `<= WINDOW_MAX` windows.
             let num_windows = r_len.div_ceil(WINDOW_MAX);

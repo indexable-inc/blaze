@@ -144,6 +144,32 @@ fn block_eff_weight(weights: &[u32], blk: MBlock) -> u64 {
 }
 
 #[inline]
+fn slice_at<T: Copy>(s: &[T], i: usize, def: T) -> T {
+    s.get(i).copied().unwrap_or(def)
+}
+
+#[inline]
+fn slice_set<T>(s: &mut [T], i: usize, v: T) {
+    if let Some(slot) = s.get_mut(i) {
+        *slot = v;
+    }
+}
+
+#[inline]
+fn subslice<T>(s: &[T], start: usize, end: usize) -> &[T] {
+    s.get(start..end).unwrap_or(&[])
+}
+
+#[inline]
+fn swap_remove_fast<T>(v: &mut Vec<T, Alloc<'_>>, idx: usize) {
+    if let Some(last_val) = v.pop()
+        && let Some(slot) = v.get_mut(idx)
+    {
+        *slot = last_val;
+    }
+}
+
+#[inline]
 fn lookup_call_clobbers(table: &[(u32, CallClobbers)], orig_inst: u32) -> CallClobbers {
     for &(idx, clob) in table {
         if idx == orig_inst {
@@ -278,7 +304,7 @@ impl RegPools {
                 if r <= 15 {
                     let bit = 1u32 << u32::from(r);
                     if (seen & bit) == 0 {
-                        gpr_scratch[len] = r;
+                        slice_set(&mut gpr_scratch, len, r);
                         len += 1;
                         seen |= bit;
                     }
@@ -288,7 +314,7 @@ impl RegPools {
         for &r in &DEFAULT_GPR_SCRATCH {
             let bit = 1u32 << u32::from(r);
             if (seen & bit) == 0 && len < 16 {
-                gpr_scratch[len] = r;
+                slice_set(&mut gpr_scratch, len, r);
                 len += 1;
                 seen |= bit;
             }
@@ -296,16 +322,16 @@ impl RegPools {
 
         let mut gpr_callee = [0u8; 12];
         for (i, &r) in CALLEE_SAVED_GPRS.iter().enumerate() {
-            gpr_callee[i] = r;
+            slice_set(&mut gpr_callee, i, r);
         }
         let mut gpr_callee_len = CALLEE_SAVED_GPRS.len();
         if opts.allow_x29_leaf && !has_calls {
             if !explicitly_uses_fp {
-                gpr_callee[gpr_callee_len] = 29;
+                slice_set(&mut gpr_callee, gpr_callee_len, 29);
                 gpr_callee_len += 1;
             }
             if !explicitly_uses_lr {
-                gpr_callee[gpr_callee_len] = 30;
+                slice_set(&mut gpr_callee, gpr_callee_len, 30);
                 gpr_callee_len += 1;
             }
         }
@@ -326,7 +352,7 @@ impl RegPools {
                 if hw <= 15 {
                     return true;
                 }
-                for &r in &self.gpr_callee[..self.gpr_callee_len] {
+                for &r in subslice(&self.gpr_callee, 0, self.gpr_callee_len) {
                     if r == hw {
                         return true;
                     }
@@ -348,7 +374,7 @@ impl RegPools {
     #[inline]
     fn callee_slice(&self, bank: RegBank) -> &[u8] {
         match bank {
-            RegBank::Gpr => &self.gpr_callee[..self.gpr_callee_len],
+            RegBank::Gpr => subslice(&self.gpr_callee, 0, self.gpr_callee_len),
             RegBank::Fp => &self.fp_callee,
         }
     }
@@ -626,7 +652,7 @@ fn insert_pending_res(pending_res: &mut Vec<PendingRes, Alloc<'_>>, entry: Pendi
         }
     }
     if let Some(i) = min_idx {
-        pending_res[i] = entry;
+        slice_set(pending_res, i, entry);
     }
 }
 
@@ -804,7 +830,7 @@ fn visit_op_uses(op: &MOp, copy_pairs: &[(MReg, MReg)], mut f: impl FnMut(MReg))
         MOp::ParallelCopy { start, len } => {
             let s = to_idx(start);
             let e = s.saturating_add(usize::from(len)).min(copy_pairs.len());
-            for &(_, src) in &copy_pairs[s..e] {
+            for &(_, src) in subslice(copy_pairs, s, e) {
                 f(src);
             }
         }
@@ -892,7 +918,7 @@ fn visit_op_defs(op: &MOp, copy_pairs: &[(MReg, MReg)], mut f: impl FnMut(MReg))
         MOp::ParallelCopy { start, len } => {
             let s = to_idx(start);
             let e = s.saturating_add(usize::from(len)).min(copy_pairs.len());
-            for &(dst, _) in &copy_pairs[s..e] {
+            for &(dst, _) in subslice(copy_pairs, s, e) {
                 f(dst);
             }
         }
@@ -1272,76 +1298,92 @@ fn range_list_add(
     }
 
     let h = to_idx(*head);
-    if e.saturating_add(1) < nodes[h].start {
+    let Some(mut h_node) = nodes.get(h).copied() else {
+        return;
+    };
+    if e.saturating_add(1) < h_node.start {
         let idx = u32_of(nodes.len()).unwrap_or(NONE_U32);
         nodes.push(RangeNode { start: s, end: e, next: *head });
         *head = idx;
         return;
     }
 
-    if s <= nodes[h].end.saturating_add(1) {
-        if s < nodes[h].start {
-            nodes[h].start = s;
+    if s <= h_node.end.saturating_add(1) {
+        if s < h_node.start {
+            h_node.start = s;
         }
-        if e > nodes[h].end {
-            nodes[h].end = e;
+        if e > h_node.end {
+            h_node.end = e;
         }
         // Absorb any subsequent nodes now overlapping/adjacent to `head`.
-        let mut next = nodes[h].next;
+        let mut next = h_node.next;
         while next != NONE_U32 {
-            let ni = to_idx(next);
-            if nodes[h].end.saturating_add(1) >= nodes[ni].start {
-                if nodes[ni].end > nodes[h].end {
-                    nodes[h].end = nodes[ni].end;
+            let Some(n_node) = nodes.get(to_idx(next)).copied() else {
+                break;
+            };
+            if h_node.end.saturating_add(1) >= n_node.start {
+                if n_node.end > h_node.end {
+                    h_node.end = n_node.end;
                 }
-                next = nodes[ni].next;
-                nodes[h].next = next;
+                next = n_node.next;
+                h_node.next = next;
             } else {
                 break;
             }
         }
+        slice_set(nodes, h, h_node);
         return;
     }
 
     // Rare out-of-order insert: walk until sorted insertion position.
     let mut prev = h;
-    let mut cur = nodes[h].next;
+    let mut cur = h_node.next;
     while cur != NONE_U32 {
         let ci = to_idx(cur);
-        if e.saturating_add(1) < nodes[ci].start {
+        let Some(mut c_node) = nodes.get(ci).copied() else {
+            break;
+        };
+        if e.saturating_add(1) < c_node.start {
             let idx = u32_of(nodes.len()).unwrap_or(NONE_U32);
             nodes.push(RangeNode { start: s, end: e, next: cur });
-            nodes[prev].next = idx;
+            if let Some(p_node) = nodes.get_mut(prev) {
+                p_node.next = idx;
+            }
             return;
         }
-        if s <= nodes[ci].end.saturating_add(1) {
-            if s < nodes[ci].start {
-                nodes[ci].start = s;
+        if s <= c_node.end.saturating_add(1) {
+            if s < c_node.start {
+                c_node.start = s;
             }
-            if e > nodes[ci].end {
-                nodes[ci].end = e;
+            if e > c_node.end {
+                c_node.end = e;
             }
-            let mut next = nodes[ci].next;
+            let mut next = c_node.next;
             while next != NONE_U32 {
-                let ni = to_idx(next);
-                if nodes[ci].end.saturating_add(1) >= nodes[ni].start {
-                    if nodes[ni].end > nodes[ci].end {
-                        nodes[ci].end = nodes[ni].end;
+                let Some(n_node) = nodes.get(to_idx(next)).copied() else {
+                    break;
+                };
+                if c_node.end.saturating_add(1) >= n_node.start {
+                    if n_node.end > c_node.end {
+                        c_node.end = n_node.end;
                     }
-                    next = nodes[ni].next;
-                    nodes[ci].next = next;
+                    next = n_node.next;
+                    c_node.next = next;
                 } else {
                     break;
                 }
             }
+            slice_set(nodes, ci, c_node);
             return;
         }
         prev = ci;
-        cur = nodes[ci].next;
+        cur = c_node.next;
     }
     let idx = u32_of(nodes.len()).unwrap_or(NONE_U32);
     nodes.push(RangeNode { start: s, end: e, next: NONE_U32 });
-    nodes[prev].next = idx;
+    if let Some(p_node) = nodes.get_mut(prev) {
+        p_node.next = idx;
+    }
 }
 
 /// Shortens the front of `*head` to `def_pt` when covered by `block_start`, or inserts `[def_pt, def_pt]`
@@ -1352,13 +1394,14 @@ fn range_list_shorten_def(
     block_start: u32,
     def_pt: u32,
 ) {
-    if *head != NONE_U32 {
-        let h = to_idx(*head);
-        if nodes[h].start == block_start && def_pt <= nodes[h].end {
-            nodes[h].start = def_pt;
+    if *head != NONE_U32
+        && let Some(h_node) = nodes.get_mut(to_idx(*head))
+    {
+        if h_node.start == block_start && def_pt <= h_node.end {
+            h_node.start = def_pt;
             return;
         }
-        if nodes[h].start <= def_pt && def_pt <= nodes[h].end {
+        if h_node.start <= def_pt && def_pt <= h_node.end {
             return;
         }
     }
@@ -1370,9 +1413,7 @@ fn range_list_shorten_def(
 fn ranges_overlap(a: &[(u32, u32)], b: &[(u32, u32)]) -> bool {
     let mut i = 0usize;
     let mut j = 0usize;
-    while i < a.len() && j < b.len() {
-        let (a_s, a_e) = a[i];
-        let (b_s, b_e) = b[j];
+    while let (Some(&(a_s, a_e)), Some(&(b_s, b_e))) = (a.get(i), b.get(j)) {
         if a_e < b_s {
             i += 1;
         } else if b_e < a_s {
@@ -1382,6 +1423,13 @@ fn ranges_overlap(a: &[(u32, u32)], b: &[(u32, u32)]) -> bool {
         }
     }
     false
+}
+
+#[inline]
+fn meta_ranges<'a>(vreg_ranges: &'a [(u32, u32)], meta: VRegMeta) -> &'a [(u32, u32)] {
+    let s = to_idx(meta.range_start_idx);
+    let e = to_idx(meta.range_start_idx.saturating_add(meta.range_len));
+    subslice(vreg_ranges, s, e)
 }
 
 /// Spill-slot bump allocator (16-byte aligned base, 8B scalar / 16B `Vec128` slots).
@@ -1505,10 +1553,10 @@ impl<'a> RewriteOut<'a> {
             let Some(&note) = self.notes.get(ci) else {
                 break;
             };
-            let next_head = self.note_idx[new_idx];
+            let next_head = slice_at(&self.note_idx, new_idx, NO_NOTE);
             let new_note_idx = u32_of(self.notes.len()).unwrap_or(NO_NOTE);
             self.notes.push(MNote { kind: note.kind, next: next_head });
-            self.note_idx[new_idx] = new_note_idx;
+            slice_set(&mut self.note_idx, new_idx, new_note_idx);
             cur = note.next;
             steps += 1;
         }
@@ -1883,11 +1931,11 @@ fn lower_parallel_copy(
         }
 
         if let Some(idx) = ready_idx {
-            let (dst, src) = pending[idx];
+            let Some(&(dst, src)) = pending.get(idx) else {
+                break;
+            };
             // Swap-remove without calling `Vec::remove`.
-            let last = pending.len() - 1;
-            pending[idx] = pending[last];
-            pending.pop();
+            swap_remove_fast(&mut pending, idx);
             out.emit_copy_loc(
                 dst,
                 src,
@@ -1901,7 +1949,9 @@ fn lower_parallel_copy(
         }
 
         // Phase B: All remaining moves form disjoint cycles. Break the first cycle with scratch.
-        let d0 = pending[0].0;
+        let Some(&(d0, _)) = pending.first() else {
+            break;
+        };
         let cycle_loc = if d0.is_fp_bank() {
             CopyLoc::Reg(fp_cycle_reg)
         } else {
@@ -1938,7 +1988,7 @@ struct ScratchBinding {
 
 #[inline]
 fn find_binding(bindings: &[ScratchBinding], len: usize, v: u32) -> Option<PReg> {
-    for b in &bindings[..len] {
+    for b in subslice(bindings, 0, len) {
         if b.vreg == v {
             return Some(b.scratch);
         }
@@ -1996,26 +2046,26 @@ fn rewrite_single_inst(
                 let is_fp = vreg_meta.get(vi).is_some_and(|m| m.bank == RegBank::Fp);
                 if is_fp {
                     let mut dup = false;
-                    for &existing in &fp_use_vregs[..fp_use_len] {
+                    for &existing in subslice(&fp_use_vregs, 0, fp_use_len) {
                         if existing == v.0 {
                             dup = true;
                             break;
                         }
                     }
                     if !dup && fp_use_len < 4 {
-                        fp_use_vregs[fp_use_len] = v.0;
+                        slice_set(&mut fp_use_vregs, fp_use_len, v.0);
                         fp_use_len += 1;
                     }
                 } else {
                     let mut dup = false;
-                    for &existing in &gpr_use_vregs[..gpr_use_len] {
+                    for &existing in subslice(&gpr_use_vregs, 0, gpr_use_len) {
                         if existing == v.0 {
                             dup = true;
                             break;
                         }
                     }
                     if !dup && gpr_use_len < 4 {
-                        gpr_use_vregs[gpr_use_len] = v.0;
+                        slice_set(&mut gpr_use_vregs, gpr_use_len, v.0);
                         gpr_use_len += 1;
                     }
                 }
@@ -2049,13 +2099,13 @@ fn rewrite_single_inst(
     let mut use_binds = [ScratchBinding { vreg: NONE_U32, scratch: PReg::X16 }; 4];
     let mut use_bind_len = 0usize;
 
-    for (&v_id, &sc) in gpr_use_vregs[..gpr_use_len].iter().zip(gpr_scratches.iter()) {
-        use_binds[use_bind_len] = ScratchBinding { vreg: v_id, scratch: sc };
+    for (&v_id, &sc) in subslice(&gpr_use_vregs, 0, gpr_use_len).iter().zip(gpr_scratches.iter()) {
+        slice_set(&mut use_binds, use_bind_len, ScratchBinding { vreg: v_id, scratch: sc });
         use_bind_len += 1;
         materialize_vreg_into(v_id, sc, sc, alloc_loc, orig_ops, orig_note_idx, out)?;
     }
-    for (&v_id, &sc) in fp_use_vregs[..fp_use_len].iter().zip(fp_scratches.iter()) {
-        use_binds[use_bind_len] = ScratchBinding { vreg: v_id, scratch: sc };
+    for (&v_id, &sc) in subslice(&fp_use_vregs, 0, fp_use_len).iter().zip(fp_scratches.iter()) {
+        slice_set(&mut use_binds, use_bind_len, ScratchBinding { vreg: v_id, scratch: sc });
         use_bind_len += 1;
         materialize_vreg_into(v_id, sc, PReg::X16, alloc_loc, orig_ops, orig_note_idx, out)?;
     }
@@ -2125,7 +2175,7 @@ fn rewrite_single_inst(
                                 rmw_gpr_sc = Some(sc);
                             }
                             if post_store_len < 3 {
-                                post_stores[post_store_len] = (sc, off, size);
+                                slice_set(&mut post_stores, post_store_len, (sc, off, size));
                                 post_store_len += 1;
                             }
                             MReg::P(sc)
@@ -2134,14 +2184,14 @@ fn rewrite_single_inst(
                                 return MReg::P(sc);
                             }
                             let sc = if size.is_fp_or_vec() {
-                                let mut cand = fp_scratches[next_fp_def_sc.min(1)];
+                                let mut cand = slice_at(&fp_scratches, next_fp_def_sc.min(1), PReg::V(30));
                                 next_fp_def_sc += 1;
                                 if rmw_fp_sc == Some(cand) {
                                     cand = if cand == PReg::V(30) { PReg::V(31) } else { PReg::V(30) };
                                 }
                                 cand
                             } else {
-                                let mut cand = gpr_scratches[next_gpr_def_sc.min(1)];
+                                let mut cand = slice_at(&gpr_scratches, next_gpr_def_sc.min(1), PReg::X16);
                                 next_gpr_def_sc += 1;
                                 if rmw_gpr_sc == Some(cand) {
                                     cand = if cand == PReg::X16 { PReg::X17 } else { PReg::X16 };
@@ -2149,11 +2199,11 @@ fn rewrite_single_inst(
                                 cand
                             };
                             if def_bind_len < 4 {
-                                def_binds[def_bind_len] = ScratchBinding { vreg: v.0, scratch: sc };
+                                slice_set(&mut def_binds, def_bind_len, ScratchBinding { vreg: v.0, scratch: sc });
                                 def_bind_len += 1;
                             }
                             if post_store_len < 3 {
-                                post_stores[post_store_len] = (sc, off, size);
+                                slice_set(&mut post_stores, post_store_len, (sc, off, size));
                                 post_store_len += 1;
                             }
                             MReg::P(sc)
@@ -2184,7 +2234,7 @@ fn rewrite_single_inst(
     }
 
     // Emit post-instruction spill stores.
-    for &(sc, off, size) in &post_stores[..post_store_len] {
+    for &(sc, off, size) in subslice(&post_stores, 0, post_store_len) {
         let addr_sc = if sc == PReg::X16 { PReg::X17 } else { PReg::X16 };
         out.emit_spill_store(sc, off, size, addr_sc)?;
     }
@@ -2405,16 +2455,18 @@ pub fn allocate_mfunc<'a>(
 
     for (ord_pos, &blk) in func.block_order.iter().enumerate() {
         let b = to_idx(blk.0);
-        block_ord_pos[b] = u32_of(ord_pos).unwrap_or(NONE_U32);
+        slice_set(&mut block_ord_pos, b, u32_of(ord_pos).unwrap_or(NONE_U32));
         let lin_s = u32_of(lin_to_orig.len()).ok_or(MRaError::FunctionTooLarge)?;
-        let (orig_s, orig_e) = func.block_insts[b];
+        let (orig_s, orig_e) = slice_at(&func.block_insts, b, (0, 0));
         for orig in to_idx(orig_s)..to_idx(orig_e) {
             let lin_p = u32_of(lin_to_orig.len()).ok_or(MRaError::FunctionTooLarge)?;
             let orig_u32 = u32_of(orig).ok_or(MRaError::FunctionTooLarge)?;
             lin_to_orig.push(orig_u32);
 
-            let op = &func.ops[orig];
-            let fl = func.flags[orig];
+            let Some(op) = func.ops.get(orig) else {
+                continue;
+            };
+            let fl = slice_at(&func.flags, orig, MInstFlags::NONE);
             if is_call_op(op, fl) {
                 has_calls = true;
                 let clob = lookup_call_clobbers(opts.call_clobbers, orig_u32);
@@ -2436,19 +2488,19 @@ pub fn allocate_mfunc<'a>(
             }
         }
         let lin_e = u32_of(lin_to_orig.len()).ok_or(MRaError::FunctionTooLarge)?;
-        block_lin_range[b] = (lin_s, lin_e);
+        slice_set(&mut block_lin_range, b, (lin_s, lin_e));
     }
 
     for &blk in func.block_order.iter() {
         let b = to_idx(blk.0);
-        let pos = block_ord_pos[b];
+        let pos = slice_at(&block_ord_pos, b, NONE_U32);
         if pos == NONE_U32 {
             continue;
         }
         for &succ in func.block_succs(blk) {
-            let sp = block_ord_pos[to_idx(succ.0)];
+            let sp = slice_at(&block_ord_pos, to_idx(succ.0), NONE_U32);
             if sp != NONE_U32 && sp <= pos {
-                block_has_backedge[b] = true;
+                slice_set(&mut block_has_backedge, b, true);
                 break;
             }
         }
@@ -2478,23 +2530,26 @@ pub fn allocate_mfunc<'a>(
 
     for &blk in func.block_order.iter() {
         let b = to_idx(blk.0);
-        let (ls, le) = block_lin_range[b];
+        let (ls, le) = slice_at(&block_lin_range, b, (0, 0));
         let mut phys_gen: u64 = 0;
         let mut kill: u64 = 0;
         for p in to_idx(ls)..to_idx(le) {
-            let orig = to_idx(lin_to_orig[p]);
-            let op = &func.ops[orig];
-            let fl = func.flags[orig];
+            let orig_u32 = slice_at(&lin_to_orig, p, 0);
+            let orig = to_idx(orig_u32);
+            let Some(op) = func.ops.get(orig) else {
+                continue;
+            };
+            let fl = slice_at(&func.flags, orig, MInstFlags::NONE);
             let (_, pdefs) = explicit_phys_masks(op, &func.copy_pairs);
             phys_gen |= pdefs;
             if is_call_op(op, fl) {
-                let clob = lookup_call_clobbers(opts.call_clobbers, lin_to_orig[p]).clobbered.0;
+                let clob = lookup_call_clobbers(opts.call_clobbers, orig_u32).clobbered.0;
                 phys_gen &= !clob;
                 kill |= clob;
             }
         }
-        block_phys_gen[b] = phys_gen;
-        block_phys_kill[b] = kill;
+        slice_set(&mut block_phys_gen, b, phys_gen);
+        slice_set(&mut block_phys_kill, b, kill);
     }
 
     // Bounded forward dataflow for `phys_def_reach` (tells `Bl`/`Blr`/`Ret` which arg/ret regs are written).
@@ -2505,12 +2560,15 @@ pub fn allocate_mfunc<'a>(
             let b = to_idx(blk.0);
             let mut in_mask: u64 = 0;
             for &pred in func.block_preds(blk) {
-                in_mask |= phys_reach_out[to_idx(pred.0)];
+                in_mask |= slice_at(&phys_reach_out, to_idx(pred.0), 0);
             }
-            let out_mask = block_phys_gen[b] | (in_mask & !block_phys_kill[b]);
-            if in_mask != phys_reach_in[b] || out_mask != phys_reach_out[b] {
-                phys_reach_in[b] = in_mask;
-                phys_reach_out[b] = out_mask;
+            let out_mask =
+                slice_at(&block_phys_gen, b, 0) | (in_mask & !slice_at(&block_phys_kill, b, 0));
+            if in_mask != slice_at(&phys_reach_in, b, 0)
+                || out_mask != slice_at(&phys_reach_out, b, 0)
+            {
+                slice_set(&mut phys_reach_in, b, in_mask);
+                slice_set(&mut phys_reach_out, b, out_mask);
                 changed = true;
             }
         }
@@ -2531,18 +2589,21 @@ pub fn allocate_mfunc<'a>(
     let ret_allowed_mask = (u64::from(func.ret_live_gprs) & 0xff) | (0xffu64 << 32);
     for &blk in func.block_order.iter() {
         let b = to_idx(blk.0);
-        let (ls, le) = block_lin_range[b];
-        let mut reach = phys_reach_in[b];
+        let (ls, le) = slice_at(&block_lin_range, b, (0, 0));
+        let mut reach = slice_at(&phys_reach_in, b, 0);
         for p in to_idx(ls)..to_idx(le) {
-            let orig = to_idx(lin_to_orig[p]);
-            let op = &func.ops[orig];
-            let fl = func.flags[orig];
+            let orig_u32 = slice_at(&lin_to_orig, p, 0);
+            let orig = to_idx(orig_u32);
+            let Some(op) = func.ops.get(orig) else {
+                continue;
+            };
+            let fl = slice_at(&func.flags, orig, MInstFlags::NONE);
             if is_call_op(op, fl) {
-                inst_impl_phys_uses[p] = reach & CALL_ARG_PHYS_MASK;
-                let clob = lookup_call_clobbers(opts.call_clobbers, lin_to_orig[p]).clobbered.0;
+                slice_set(&mut inst_impl_phys_uses, p, reach & CALL_ARG_PHYS_MASK);
+                let clob = lookup_call_clobbers(opts.call_clobbers, orig_u32).clobbered.0;
                 reach &= !clob;
             } else if matches!(*op, MOp::Ret) {
-                inst_impl_phys_uses[p] = reach & RET_VAL_PHYS_MASK & ret_allowed_mask;
+                slice_set(&mut inst_impl_phys_uses, p, reach & RET_VAL_PHYS_MASK & ret_allowed_mask);
             }
             let (_, pdefs) = explicit_phys_masks(op, &func.copy_pairs);
             reach |= pdefs;
@@ -2577,13 +2638,16 @@ pub fn allocate_mfunc<'a>(
     for &blk in func.block_order.iter() {
         let b = to_idx(blk.0);
         let base = b * words_per_block;
-        let (ls, le) = block_lin_range[b];
+        let (ls, le) = slice_at(&block_lin_range, b, (0, 0));
         let mut pu_acc: u64 = 0;
         let mut pd_acc: u64 = 0;
         for p in to_idx(ls)..to_idx(le) {
-            let orig = to_idx(lin_to_orig[p]);
-            let op = &func.ops[orig];
-            let fl = func.flags[orig];
+            let orig_u32 = slice_at(&lin_to_orig, p, 0);
+            let orig = to_idx(orig_u32);
+            let Some(op) = func.ops.get(orig) else {
+                continue;
+            };
+            let fl = slice_at(&func.flags, orig, MInstFlags::NONE);
             visit_op_uses(op, &func.copy_pairs, |r| {
                 if let MReg::V(v) = r
                     && !bitset_test(&v_def, base, v.0)
@@ -2592,10 +2656,10 @@ pub fn allocate_mfunc<'a>(
                 }
             });
             let (op_pu, mut op_pd) = explicit_phys_masks(op, &func.copy_pairs);
-            let total_pu = op_pu | inst_impl_phys_uses[p];
+            let total_pu = op_pu | slice_at(&inst_impl_phys_uses, p, 0);
             pu_acc |= total_pu & !pd_acc;
             if is_call_op(op, fl) {
-                op_pd |= lookup_call_clobbers(opts.call_clobbers, lin_to_orig[p]).clobbered.0;
+                op_pd |= lookup_call_clobbers(opts.call_clobbers, orig_u32).clobbered.0;
                 op_pd |= 1u64 << 30; // `bl`/`blr` writes `LR` (`X30`).
             }
             pd_acc |= op_pd;
@@ -2605,18 +2669,15 @@ pub fn allocate_mfunc<'a>(
                 }
             });
         }
-        p_use[b] = pu_acc;
-        p_def[b] = pd_acc;
+        slice_set(&mut p_use, b, pu_acc);
+        slice_set(&mut p_def, b, pd_acc);
     }
 
     // Bounded backward liveness fixed point (`<= 32` iterations, reverse `block_order`).
     let mut live_converged = false;
     for _ in 0..MAX_DATAFLOW_ITERS {
         let mut changed = false;
-        let mut ord = func.block_order.len();
-        while ord > 0 {
-            ord -= 1;
-            let blk = func.block_order[ord];
+        for &blk in func.block_order.iter().rev() {
             let b = to_idx(blk.0);
             let base = b * words_per_block;
             let succs = func.block_succs(blk);
@@ -2624,12 +2685,12 @@ pub fn allocate_mfunc<'a>(
             // Physical register liveness (`u64`).
             let mut new_po: u64 = 0;
             for &succ in succs {
-                new_po |= p_live_in[to_idx(succ.0)];
+                new_po |= slice_at(&p_live_in, to_idx(succ.0), 0);
             }
-            let new_pi = p_use[b] | (new_po & !p_def[b]);
-            if new_po != p_live_out[b] || new_pi != p_live_in[b] {
-                p_live_out[b] = new_po;
-                p_live_in[b] = new_pi;
+            let new_pi = slice_at(&p_use, b, 0) | (new_po & !slice_at(&p_def, b, 0));
+            if new_po != slice_at(&p_live_out, b, 0) || new_pi != slice_at(&p_live_in, b, 0) {
+                slice_set(&mut p_live_out, b, new_po);
+                slice_set(&mut p_live_in, b, new_pi);
                 changed = true;
             }
 
@@ -2638,12 +2699,15 @@ pub fn allocate_mfunc<'a>(
                 let mut new_out: u64 = 0;
                 for &succ in succs {
                     let s_base = to_idx(succ.0) * words_per_block;
-                    new_out |= v_live_in[s_base + w];
+                    new_out |= slice_at(&v_live_in, s_base + w, 0);
                 }
-                let new_in = v_use[base + w] | (new_out & !v_def[base + w]);
-                if new_out != v_live_out[base + w] || new_in != v_live_in[base + w] {
-                    v_live_out[base + w] = new_out;
-                    v_live_in[base + w] = new_in;
+                let idx = base + w;
+                let new_in = slice_at(&v_use, idx, 0) | (new_out & !slice_at(&v_def, idx, 0));
+                if new_out != slice_at(&v_live_out, idx, 0)
+                    || new_in != slice_at(&v_live_in, idx, 0)
+                {
+                    slice_set(&mut v_live_out, idx, new_out);
+                    slice_set(&mut v_live_in, idx, new_in);
                     changed = true;
                 }
             }
@@ -2689,12 +2753,9 @@ pub fn allocate_mfunc<'a>(
     };
 
     // Single reverse pass over `block_order` constructs exact multi-range intervals with holes.
-    let mut ord = func.block_order.len();
-    while ord > 0 {
-        ord -= 1;
-        let blk = func.block_order[ord];
+    for &blk in func.block_order.iter().rev() {
         let b = to_idx(blk.0);
-        let (ls, le) = block_lin_range[b];
+        let (ls, le) = slice_at(&block_lin_range, b, (0, 0));
         if ls >= le {
             continue;
         }
@@ -2702,38 +2763,35 @@ pub fn allocate_mfunc<'a>(
         let blk_end_pt = (le - 1).saturating_mul(2).saturating_add(1);
         let raw_w = block_raw_weight(opts.block_weights, blk);
         let eff_w = block_eff_weight(opts.block_weights, blk);
-        let is_backedge = block_has_backedge[b];
+        let is_backedge = slice_at(&block_has_backedge, b, false);
         let base = b * words_per_block;
 
         // Add full-block span `[blk_start_pt, blk_end_pt]` for every `VReg` in `v_live_out[b]`.
         for w in 0..words_per_block {
-            let mut bits = v_live_out[base + w];
+            let mut bits = slice_at(&v_live_out, base + w, 0);
             while bits != 0 {
                 let tz = bits.trailing_zeros();
                 bits &= bits - 1;
                 let v_idx = (w << 6) + to_idx(tz);
-                if v_idx < n_vregs {
-                    range_list_add(
-                        &mut vreg_range_heads[v_idx],
-                        &mut vreg_range_nodes,
-                        blk_start_pt,
-                        blk_end_pt,
-                    );
+                if let Some(head) = vreg_range_heads.get_mut(v_idx) {
+                    range_list_add(head, &mut vreg_range_nodes, blk_start_pt, blk_end_pt);
                 }
             }
         }
 
         // Track exact physical register occupancy backward through `blk`.
-        let mut p_live = p_live_out[b];
+        let mut p_live = slice_at(&p_live_out, b, 0);
 
         let mut p = to_idx(le);
         while p > to_idx(ls) {
             p -= 1;
             let p_u32 = u32_of(p).unwrap_or(0);
-            let orig_u32 = lin_to_orig[p];
+            let orig_u32 = slice_at(&lin_to_orig, p, 0);
             let orig = to_idx(orig_u32);
-            let op = &func.ops[orig];
-            let fl = func.flags[orig];
+            let Some(op) = func.ops.get(orig) else {
+                continue;
+            };
+            let fl = slice_at(&func.flags, orig, MInstFlags::NONE);
             let use_pt = p_u32.saturating_mul(2);
             let def_pt = use_pt.saturating_add(1);
 
@@ -2749,28 +2807,28 @@ pub fn allocate_mfunc<'a>(
             while m != 0 {
                 let r = to_idx(m.trailing_zeros());
                 m &= m - 1;
-                range_list_add(&mut phys_range_heads[r], &mut phys_range_nodes, def_pt, def_pt);
+                if let Some(head) = phys_range_heads.get_mut(r) {
+                    range_list_add(head, &mut phys_range_nodes, def_pt, def_pt);
+                }
             }
-            p_live = (p_live & !(op_pd | call_clob)) | op_pu | inst_impl_phys_uses[p];
+            p_live = (p_live & !(op_pd | call_clob)) | op_pu | slice_at(&inst_impl_phys_uses, p, 0);
             let mut m2 = p_live;
             while m2 != 0 {
                 let r = to_idx(m2.trailing_zeros());
                 m2 &= m2 - 1;
-                range_list_add(&mut phys_range_heads[r], &mut phys_range_nodes, use_pt, use_pt);
+                if let Some(head) = phys_range_heads.get_mut(r) {
+                    range_list_add(head, &mut phys_range_nodes, use_pt, use_pt);
+                }
             }
 
             // 2. Virtual defs FIRST (backward order: shorten active range to `def_pt`).
             visit_op_defs(op, &func.copy_pairs, |r| {
                 if let MReg::V(v) = r {
                     let vi = to_idx(v.0);
-                    if vi < n_vregs {
-                        range_list_shorten_def(
-                            &mut vreg_range_heads[vi],
-                            &mut vreg_range_nodes,
-                            blk_start_pt,
-                            def_pt,
-                        );
-                        let meta = &mut vreg_meta[vi];
+                    if let Some(head) = vreg_range_heads.get_mut(vi) {
+                        range_list_shorten_def(head, &mut vreg_range_nodes, blk_start_pt, def_pt);
+                    }
+                    if let Some(meta) = vreg_meta.get_mut(vi) {
                         meta.def_count = meta.def_count.saturating_add(1);
                         meta.def_inst = orig_u32;
                         meta.def_lin = p_u32;
@@ -2787,14 +2845,10 @@ pub fn allocate_mfunc<'a>(
             visit_op_uses(op, &func.copy_pairs, |r| {
                 if let MReg::V(v) = r {
                     let vi = to_idx(v.0);
-                    if vi < n_vregs {
-                        range_list_add(
-                            &mut vreg_range_heads[vi],
-                            &mut vreg_range_nodes,
-                            blk_start_pt,
-                            use_pt,
-                        );
-                        let meta = &mut vreg_meta[vi];
+                    if let Some(head) = vreg_range_heads.get_mut(vi) {
+                        range_list_add(head, &mut vreg_range_nodes, blk_start_pt, use_pt);
+                    }
+                    if let Some(meta) = vreg_meta.get_mut(vi) {
                         meta.use_count = meta.use_count.saturating_add(1);
                         meta.weight = meta.weight.saturating_add(eff_w);
                         if raw_w >= HOT_BLOCK_WEIGHT_MIN {
@@ -2822,20 +2876,21 @@ pub fn allocate_mfunc<'a>(
     // Soft coalescing hint for single-use narrow-masked entry parameters (`raw -> and/ubfm -> dst`)
     // so sub-32-bit entry args (`u8`/`u16`) stay in their incoming ABI register instead of
     // dirtying a scratch register.
-    for vi in 0..n_vregs {
-        let meta = vreg_meta[vi];
+    for (vi, &meta) in vreg_meta.iter().enumerate() {
         if meta.def_count == 1 && meta.def_inst != NONE_U32 && meta.def_block != NONE_U32 {
             let di = to_idx(meta.def_inst);
-            if let MOp::LogicalImm { dst: MReg::V(vd), rn: MReg::V(vs), .. }
-            | MOp::Ubfm { dst: MReg::V(vd), rn: MReg::V(vs), .. } = func.ops[di]
+            if let Some(
+                &MOp::LogicalImm { dst: MReg::V(vd), rn: MReg::V(vs), .. }
+                | &MOp::Ubfm { dst: MReg::V(vd), rn: MReg::V(vs), .. },
+            ) = func.ops.get(di)
                 && to_idx(vd.0) == vi
                 && vd != vs
             {
                 let si = to_idx(vs.0);
-                if si < n_vregs
-                    && vreg_meta[si].use_count == 1
-                    && vreg_meta[si].fixed_hint_reg != NO_REG
-                    && vreg_meta[si].bank == meta.bank
+                if let Some(&smeta) = vreg_meta.get(si)
+                    && smeta.use_count == 1
+                    && smeta.fixed_hint_reg != NO_REG
+                    && smeta.bank == meta.bank
                 {
                     let w = block_eff_weight(opts.block_weights, MBlock(meta.def_block));
                     raw_copy_edges.push((vd.0, vs.0, w));
@@ -2847,69 +2902,76 @@ pub fn allocate_mfunc<'a>(
     // Compact `phys_range_heads` into CSR `phys_spans`.
     let mut phys_span_off = [0u32; 65];
     let mut phys_spans: Vec<(u32, u32), Alloc<'a>> = Vec::with_capacity_in(phys_range_nodes.len(), alloc);
-    for r in 0..64 {
-        phys_span_off[r] = u32_of(phys_spans.len()).ok_or(MRaError::FunctionTooLarge)?;
-        let mut cur = phys_range_heads[r];
+    for (r, &head) in phys_range_heads.iter().enumerate() {
+        slice_set(&mut phys_span_off, r, u32_of(phys_spans.len()).ok_or(MRaError::FunctionTooLarge)?);
+        let mut cur = head;
         let mut steps = 0usize;
         while cur != NONE_U32 && steps <= phys_range_nodes.len() {
-            let node = phys_range_nodes[to_idx(cur)];
+            let Some(&node) = phys_range_nodes.get(to_idx(cur)) else {
+                break;
+            };
             phys_spans.push((node.start, node.end));
             cur = node.next;
             steps += 1;
         }
     }
-    phys_span_off[64] = u32_of(phys_spans.len()).ok_or(MRaError::FunctionTooLarge)?;
+    slice_set(&mut phys_span_off, 64, u32_of(phys_spans.len()).ok_or(MRaError::FunctionTooLarge)?);
 
     // Compact `vreg_range_heads` into contiguous CSR `vreg_ranges` and populate `first_start`/`last_end`/
     // `live_len`/`forbidden_phys` (exact physical spans + crossed `call_sites`), `is_remat`, and `is_cold_split`.
     let mut vreg_ranges: Vec<(u32, u32), Alloc<'a>> = Vec::with_capacity_in(vreg_range_nodes.len(), alloc);
     for vi in 0..n_vregs {
         let start_idx = u32_of(vreg_ranges.len()).ok_or(MRaError::FunctionTooLarge)?;
-        let mut cur = vreg_range_heads[vi];
+        let mut cur = slice_at(&vreg_range_heads, vi, NONE_U32);
         let mut steps = 0usize;
         while cur != NONE_U32 && steps <= vreg_range_nodes.len() {
-            let node = vreg_range_nodes[to_idx(cur)];
+            let Some(&node) = vreg_range_nodes.get(to_idx(cur)) else {
+                break;
+            };
             vreg_ranges.push((node.start, node.end));
             cur = node.next;
             steps += 1;
         }
         let end_idx = u32_of(vreg_ranges.len()).ok_or(MRaError::FunctionTooLarge)?;
         let len = end_idx.saturating_sub(start_idx);
-        vreg_meta[vi].range_start_idx = start_idx;
-        vreg_meta[vi].range_len = len;
-        if vreg_meta[vi].use_count > 0 && vreg_meta[vi].def_count == 0 {
+        let Some(meta) = vreg_meta.get_mut(vi) else {
+            continue;
+        };
+        meta.range_start_idx = start_idx;
+        meta.range_len = len;
+        if meta.use_count > 0 && meta.def_count == 0 {
             return Err(MRaError::UndefinedVReg { vreg: VReg(u32_of(vi).unwrap_or(0)) });
         }
         if len == 0 {
             continue;
         }
-        if vreg_meta[vi].class.is_flags() {
+        if meta.class.is_flags() {
             return Err(MRaError::UnsupportedVRegClass {
                 vreg: VReg(u32_of(vi).unwrap_or(0)),
-                class: vreg_meta[vi].class,
+                class: meta.class,
             });
         }
-        let slice = &vreg_ranges[to_idx(start_idx)..to_idx(end_idx)];
-        let first_s = slice[0].0;
-        let last_e = slice[slice.len() - 1].1;
+        let slice = subslice(&vreg_ranges, to_idx(start_idx), to_idx(end_idx));
+        let first_s = slice.first().map_or(NONE_U32, |r| r.0);
+        let last_e = slice.last().map_or(0, |r| r.1);
         let mut live_len: u64 = 0;
         for &(rs, re) in slice {
             live_len = live_len.saturating_add(u64::from(re.saturating_sub(rs)).saturating_add(1));
         }
-        vreg_meta[vi].first_start = first_s;
-        vreg_meta[vi].last_end = last_e;
-        vreg_meta[vi].live_len = live_len.max(1);
+        meta.first_start = first_s;
+        meta.last_end = last_e;
+        meta.live_len = live_len.max(1);
 
         // 1. Exact physical-register interference (only check touched regs in `v`'s bank).
         let mut forbid = RegSet::EMPTY;
-        let (r_lo, r_hi) = match vreg_meta[vi].bank {
+        let (r_lo, r_hi) = match meta.bank {
             RegBank::Gpr => (0usize, 31usize),
             RegBank::Fp => (32usize, 64usize),
         };
         for r in r_lo..r_hi {
-            let ps = to_idx(phys_span_off[r]);
-            let pe = to_idx(phys_span_off[r + 1]);
-            if ps < pe && ranges_overlap(slice, &phys_spans[ps..pe]) {
+            let ps = to_idx(slice_at(&phys_span_off, r, 0));
+            let pe = to_idx(slice_at(&phys_span_off, r + 1, 0));
+            if ps < pe && ranges_overlap(slice, subslice(&phys_spans, ps, pe)) {
                 forbid = forbid.with(Reg(u8::try_from(r).unwrap_or(0)));
             }
         }
@@ -2921,28 +2983,33 @@ pub fn allocate_mfunc<'a>(
         if !call_sites.is_empty() {
             for &(rs, re) in slice {
                 let mut pos = call_sites.partition_point(|c| c.def_pt <= rs);
-                while pos < call_sites.len() && call_sites[pos].def_pt <= re {
-                    forbid = forbid.union(call_sites[pos].clobbers.clobbered);
+                while let Some(&cs) = call_sites.get(pos) {
+                    if cs.def_pt > re {
+                        break;
+                    }
+                    forbid = forbid.union(cs.clobbers.clobbered);
                     pos += 1;
                 }
             }
         }
-        vreg_meta[vi].forbidden_phys = forbid;
+        meta.forbidden_phys = forbid;
 
         // 3. Rematerializability check.
-        if vreg_meta[vi].def_count == 1 && vreg_meta[vi].def_inst != NONE_U32 {
-            let di = to_idx(vreg_meta[vi].def_inst);
+        if meta.def_count == 1 && meta.def_inst != NONE_U32 {
+            let di = to_idx(meta.def_inst);
             let v = VReg(u32_of(vi).unwrap_or(0));
-            if is_rematerializable_def(
-                &func.ops[di],
-                func.flags[di],
-                v,
-                vreg_meta[vi].def_lin,
-                last_e,
-                vreg_meta[vi].used_in_hot,
-                &sp_mod_lins,
-            ) {
-                vreg_meta[vi].is_remat = true;
+            if let Some(def_op) = func.ops.get(di)
+                && is_rematerializable_def(
+                    def_op,
+                    slice_at(&func.flags, di, MInstFlags::NONE),
+                    v,
+                    meta.def_lin,
+                    last_e,
+                    meta.used_in_hot,
+                    &sp_mod_lins,
+                )
+            {
+                meta.is_remat = true;
             }
         }
     }
@@ -2959,8 +3026,7 @@ pub fn allocate_mfunc<'a>(
     let mut stats = MRaStats::default();
 
     if has_hot_cold_weights {
-        for vi in 0..n_vregs {
-            let meta = vreg_meta[vi];
+        for (vi, meta) in vreg_meta.iter_mut().enumerate() {
             if meta.range_len == 0
                 || meta.def_count != 1
                 || meta.use_count == 0
@@ -2988,14 +3054,14 @@ pub fn allocate_mfunc<'a>(
                 }
             }
             if crosses_hot_block {
-                vreg_meta[vi].is_cold_split = true;
+                meta.is_cold_split = true;
                 stats.vregs_cold_split = stats.vregs_cold_split.saturating_add(1);
                 if meta.is_remat {
-                    alloc_loc[vi] = AllocLoc::Remat { def_inst: meta.def_inst };
+                    slice_set(&mut alloc_loc, vi, AllocLoc::Remat { def_inst: meta.def_inst });
                 } else {
                     let size = meta.spill_mem_size();
                     let off = spills.alloc_slot(size)?;
-                    alloc_loc[vi] = AllocLoc::Spill { off, size };
+                    slice_set(&mut alloc_loc, vi, AllocLoc::Spill { off, size });
                 }
             }
         }
@@ -3008,14 +3074,17 @@ pub fn allocate_mfunc<'a>(
     // partners per `VReg` sorted by descending weight).
     let mut write_e = 0usize;
     for read_e in 0..raw_copy_edges.len() {
-        let (u, v, w) = raw_copy_edges[read_e];
+        let Some(&(u, v, w)) = raw_copy_edges.get(read_e) else {
+            break;
+        };
         let ui = to_idx(u);
         let vi = to_idx(v);
-        if ui >= n_vregs || vi >= n_vregs || ui == vi || w == 0 {
+        if ui == vi || w == 0 {
             continue;
         }
-        let um = vreg_meta[ui];
-        let vm = vreg_meta[vi];
+        let (Some(&um), Some(&vm)) = (vreg_meta.get(ui), vreg_meta.get(vi)) else {
+            continue;
+        };
         if um.range_len == 0
             || vm.range_len == 0
             || um.is_cold_split
@@ -3024,12 +3093,10 @@ pub fn allocate_mfunc<'a>(
         {
             continue;
         }
-        let ur = &vreg_ranges
-            [to_idx(um.range_start_idx)..to_idx(um.range_start_idx + um.range_len)];
-        let vr = &vreg_ranges
-            [to_idx(vm.range_start_idx)..to_idx(vm.range_start_idx + vm.range_len)];
+        let ur = meta_ranges(&vreg_ranges, um);
+        let vr = meta_ranges(&vreg_ranges, vm);
         if !ranges_overlap(ur, vr) {
-            raw_copy_edges[write_e] = (u, v, w);
+            slice_set(&mut raw_copy_edges, write_e, (u, v, w));
             write_e += 1;
         }
     }
@@ -3047,19 +3114,23 @@ pub fn allocate_mfunc<'a>(
     for &(u, v, _) in raw_copy_edges.iter() {
         let ui = to_idx(u);
         let vi = to_idx(v);
-        copy_edge_off[ui] = copy_edge_off[ui].saturating_add(1);
-        copy_edge_off[vi] = copy_edge_off[vi].saturating_add(1);
+        if let Some(slot) = copy_edge_off.get_mut(ui) {
+            *slot = slot.saturating_add(1);
+        }
+        if let Some(slot) = copy_edge_off.get_mut(vi) {
+            *slot = slot.saturating_add(1);
+        }
     }
     let mut dir_edge_total: u32 = 0;
     for vi in 0..n_vregs {
-        let deg = copy_edge_off[vi];
-        copy_edge_off[vi] = dir_edge_total;
-        copy_cursor[vi] = dir_edge_total;
+        let deg = slice_at(&copy_edge_off, vi, 0);
+        slice_set(&mut copy_edge_off, vi, dir_edge_total);
+        slice_set(&mut copy_cursor, vi, dir_edge_total);
         dir_edge_total = dir_edge_total
             .checked_add(deg)
             .ok_or(MRaError::FunctionTooLarge)?;
     }
-    copy_edge_off[n_vregs] = dir_edge_total;
+    slice_set(&mut copy_edge_off, n_vregs, dir_edge_total);
 
     let mut copy_edges: Vec<(u32, u64), Alloc<'a>> =
         Vec::with_capacity_in(to_idx(dir_edge_total), alloc);
@@ -3069,65 +3140,70 @@ pub fn allocate_mfunc<'a>(
     for &(u, v, w) in raw_copy_edges.iter() {
         let ui = to_idx(u);
         let vi = to_idx(v);
-        let upos = to_idx(copy_cursor[ui]);
-        if upos < copy_edges.len() {
-            copy_edges[upos] = (v, w);
-            copy_cursor[ui] = copy_cursor[ui].saturating_add(1);
+        let upos = to_idx(slice_at(&copy_cursor, ui, u32::MAX));
+        if let Some(slot) = copy_edges.get_mut(upos) {
+            *slot = (v, w);
+            if let Some(cur) = copy_cursor.get_mut(ui) {
+                *cur = cur.saturating_add(1);
+            }
         }
-        let vpos = to_idx(copy_cursor[vi]);
-        if vpos < copy_edges.len() {
-            copy_edges[vpos] = (u, w);
-            copy_cursor[vi] = copy_cursor[vi].saturating_add(1);
+        let vpos = to_idx(slice_at(&copy_cursor, vi, u32::MAX));
+        if let Some(slot) = copy_edges.get_mut(vpos) {
+            *slot = (u, w);
+            if let Some(cur) = copy_cursor.get_mut(vi) {
+                *cur = cur.saturating_add(1);
+            }
         }
     }
     for vi in 0..n_vregs {
-        let s = to_idx(copy_edge_off[vi]);
-        let e = to_idx(copy_edge_off[vi + 1]);
+        let s = to_idx(slice_at(&copy_edge_off, vi, 0));
+        let e = to_idx(slice_at(&copy_edge_off, vi + 1, 0));
         let mut out_len = 0usize;
         for k in s..e {
-            let (partner, w) = copy_edges[k];
+            let (partner, w) = slice_at(&copy_edges, k, (NONE_U32, 0));
             if partner == NONE_U32 || w == 0 {
                 continue;
             }
             let mut found: Option<usize> = None;
             for m in 0..out_len {
-                if copy_edges[s + m].0 == partner {
+                if slice_at(&copy_edges, s + m, (NONE_U32, 0)).0 == partner {
                     found = Some(m);
                     break;
                 }
             }
             let mut pos = if let Some(m) = found {
-                copy_edges[s + m].1 = copy_edges[s + m].1.saturating_add(w);
+                if let Some(slot) = copy_edges.get_mut(s + m) {
+                    slot.1 = slot.1.saturating_add(w);
+                }
                 m
             } else if out_len < MAX_COPY_EDGES_PER_VREG {
                 let p = out_len;
-                copy_edges[s + p] = (partner, w);
+                slice_set(&mut copy_edges, s + p, (partner, w));
                 out_len += 1;
                 p
             } else {
                 let last = out_len - 1;
-                if w > copy_edges[s + last].1
-                    || (w == copy_edges[s + last].1 && partner < copy_edges[s + last].0)
-                {
-                    copy_edges[s + last] = (partner, w);
+                let last_e = slice_at(&copy_edges, s + last, (NONE_U32, 0));
+                if w > last_e.1 || (w == last_e.1 && partner < last_e.0) {
+                    slice_set(&mut copy_edges, s + last, (partner, w));
                     last
                 } else {
                     continue;
                 }
             };
             while pos > 0 {
-                let cur_e = copy_edges[s + pos];
-                let prev_e = copy_edges[s + pos - 1];
+                let cur_e = slice_at(&copy_edges, s + pos, (NONE_U32, 0));
+                let prev_e = slice_at(&copy_edges, s + pos - 1, (NONE_U32, 0));
                 if cur_e.1 > prev_e.1 || (cur_e.1 == prev_e.1 && cur_e.0 < prev_e.0) {
-                    copy_edges[s + pos] = prev_e;
-                    copy_edges[s + pos - 1] = cur_e;
+                    slice_set(&mut copy_edges, s + pos, prev_e);
+                    slice_set(&mut copy_edges, s + pos - 1, cur_e);
                     pos -= 1;
                 } else {
                     break;
                 }
             }
         }
-        copy_edge_len[vi] = u16::try_from(out_len).unwrap_or(0);
+        slice_set(&mut copy_edge_len, vi, u16::try_from(out_len).unwrap_or(0));
     }
 
     // Bounded multi-hop fixed-hint propagation along non-overlapping copy edges (`<= 4` hops)
@@ -3136,18 +3212,22 @@ pub fn allocate_mfunc<'a>(
     for _ in 0..MAX_HINT_PROP_ITERS {
         let mut changed = false;
         for vi in 0..n_vregs {
-            let meta = vreg_meta[vi];
+            let Some(&meta) = vreg_meta.get(vi) else {
+                continue;
+            };
             if meta.range_len == 0 || meta.is_cold_split {
                 continue;
             }
-            let es = to_idx(copy_edge_off[vi]);
-            let elen = usize::from(copy_edge_len[vi]);
+            let es = to_idx(slice_at(&copy_edge_off, vi, 0));
+            let elen = usize::from(slice_at(&copy_edge_len, vi, 0));
             let bank_bit_base: u8 = match meta.bank {
                 RegBank::Gpr => 0,
                 RegBank::Fp => 32,
             };
-            for &(partner, edge_w) in &copy_edges[es..es + elen] {
-                let pm = vreg_meta[to_idx(partner)];
+            for &(partner, edge_w) in subslice(&copy_edges, es, es.saturating_add(elen)) {
+                let Some(&pm) = vreg_meta.get(to_idx(partner)) else {
+                    continue;
+                };
                 let cands = [
                     (pm.fixed_hint_reg, pm.fixed_hint_weight),
                     (pm.fixed_hint2_reg, pm.fixed_hint2_weight),
@@ -3161,7 +3241,9 @@ pub fn allocate_mfunc<'a>(
                         continue;
                     }
                     let prop_w = pw.min(edge_w).max(1);
-                    if vreg_meta[vi].propagate_fixed_hint(hw, prop_w) {
+                    if let Some(vm) = vreg_meta.get_mut(vi)
+                        && vm.propagate_fixed_hint(hw, prop_w)
+                    {
                         changed = true;
                     }
                 }
@@ -3181,7 +3263,9 @@ pub fn allocate_mfunc<'a>(
     for meta in vreg_meta.iter() {
         if meta.range_len > 0 && !meta.is_cold_split {
             let b = to_idx(meta.first_start).min(max_half_pt - 1);
-            bucket_counts[b] = bucket_counts[b].saturating_add(1);
+            if let Some(slot) = bucket_counts.get_mut(b) {
+                *slot = slot.saturating_add(1);
+            }
             active_vreg_count += 1;
         }
     }
@@ -3198,11 +3282,11 @@ pub fn allocate_mfunc<'a>(
     for (vi, meta) in vreg_meta.iter().enumerate() {
         if meta.range_len > 0 && !meta.is_cold_split {
             let b = to_idx(meta.first_start).min(max_half_pt - 1);
-            let pos = to_idx(bucket_counts[b]);
-            bucket_counts[b] = bucket_counts[b].saturating_add(1);
-            if pos < sorted_vregs.len() {
-                sorted_vregs[pos] = u32_of(vi).unwrap_or(0);
+            let pos = to_idx(slice_at(&bucket_counts, b, u32::MAX));
+            if let Some(slot) = bucket_counts.get_mut(b) {
+                *slot = slot.saturating_add(1);
             }
+            slice_set(&mut sorted_vregs, pos, u32_of(vi).unwrap_or(0));
         }
     }
 
@@ -3211,30 +3295,35 @@ pub fn allocate_mfunc<'a>(
     // claim their target physical register first.
     let mut g_start = 0usize;
     while g_start < sorted_vregs.len() {
-        let fs = vreg_meta[to_idx(sorted_vregs[g_start])].first_start;
+        let Some(v_first) = sorted_vregs.get(g_start).copied() else {
+            break;
+        };
+        let fs = vreg_meta.get(to_idx(v_first)).map_or(NONE_U32, |m| m.first_start);
         let mut g_end = g_start + 1;
-        while g_end < sorted_vregs.len()
-            && vreg_meta[to_idx(sorted_vregs[g_end])].first_start == fs
-        {
-            g_end += 1;
+        while let Some(&v_cur) = sorted_vregs.get(g_end) {
+            if vreg_meta.get(to_idx(v_cur)).is_some_and(|m| m.first_start == fs) {
+                g_end += 1;
+            } else {
+                break;
+            }
         }
         let g_len = g_end - g_start;
         if (2..=64).contains(&g_len) {
             for i in (g_start + 1)..g_end {
-                let key = sorted_vregs[i];
-                let key_w = vreg_meta[to_idx(key)].fixed_hint_weight;
+                let key = slice_at(&sorted_vregs, i, 0);
+                let key_w = vreg_meta.get(to_idx(key)).map_or(0, |m| m.fixed_hint_weight);
                 let mut j = i;
                 while j > g_start {
-                    let prev = sorted_vregs[j - 1];
-                    let prev_w = vreg_meta[to_idx(prev)].fixed_hint_weight;
+                    let prev = slice_at(&sorted_vregs, j - 1, 0);
+                    let prev_w = vreg_meta.get(to_idx(prev)).map_or(0, |m| m.fixed_hint_weight);
                     if key_w > prev_w || (key_w == prev_w && key < prev) {
-                        sorted_vregs[j] = prev;
+                        slice_set(&mut sorted_vregs, j, prev);
                         j -= 1;
                     } else {
                         break;
                     }
                 }
-                sorted_vregs[j] = key;
+                slice_set(&mut sorted_vregs, j, key);
             }
         }
         g_start = g_end;
@@ -3245,28 +3334,30 @@ pub fn allocate_mfunc<'a>(
     // physical registers wanted by upcoming fixed-`PReg` defs/uses (e.g. `X0..X8` / `V0..V7`).
     let mut fixed_want_counts = [0u32; 64];
     for &v_u32 in sorted_vregs.iter() {
-        let meta = vreg_meta[to_idx(v_u32)];
+        let Some(&meta) = vreg_meta.get(to_idx(v_u32)) else {
+            continue;
+        };
         if meta.fixed_hint_reg != NO_REG && meta.fixed_hint_weight > 0 {
             let base: u8 = match meta.bank {
                 RegBank::Gpr => 0,
                 RegBank::Fp => 32,
             };
             let bit = usize::from(base.saturating_add(meta.fixed_hint_reg));
-            if bit < 64 {
-                fixed_want_counts[bit] = fixed_want_counts[bit].saturating_add(1);
+            if let Some(slot) = fixed_want_counts.get_mut(bit) {
+                *slot = slot.saturating_add(1);
             }
         }
     }
     let mut fixed_want_off = [0u32; 65];
     let mut fixed_want_total: u32 = 0;
-    for r in 0..64 {
-        fixed_want_off[r] = fixed_want_total;
-        fixed_want_total = fixed_want_total.saturating_add(fixed_want_counts[r]);
+    for (r, &cnt) in fixed_want_counts.iter().enumerate() {
+        slice_set(&mut fixed_want_off, r, fixed_want_total);
+        fixed_want_total = fixed_want_total.saturating_add(cnt);
     }
-    fixed_want_off[64] = fixed_want_total;
+    slice_set(&mut fixed_want_off, 64, fixed_want_total);
     let mut fixed_want_cursor = [0u32; 64];
-    for r in 0..64 {
-        fixed_want_cursor[r] = fixed_want_off[r];
+    for (cur, &off) in fixed_want_cursor.iter_mut().zip(fixed_want_off.iter()) {
+        *cur = off;
     }
     let mut fixed_want_vregs: Vec<(u32, u64), Alloc<'a>> =
         Vec::with_capacity_in(to_idx(fixed_want_total), alloc);
@@ -3274,24 +3365,26 @@ pub fn allocate_mfunc<'a>(
         fixed_want_vregs.push((NONE_U32, 0));
     }
     for &v_u32 in sorted_vregs.iter() {
-        let meta = vreg_meta[to_idx(v_u32)];
+        let Some(&meta) = vreg_meta.get(to_idx(v_u32)) else {
+            continue;
+        };
         if meta.fixed_hint_reg != NO_REG && meta.fixed_hint_weight > 0 {
             let base: u8 = match meta.bank {
                 RegBank::Gpr => 0,
                 RegBank::Fp => 32,
             };
             let bit = usize::from(base.saturating_add(meta.fixed_hint_reg));
-            if bit < 64 {
-                let pos = to_idx(fixed_want_cursor[bit]);
-                if pos < fixed_want_vregs.len() {
-                    fixed_want_vregs[pos] = (v_u32, meta.fixed_hint_weight);
-                    fixed_want_cursor[bit] = fixed_want_cursor[bit].saturating_add(1);
+            if let Some(cur) = fixed_want_cursor.get_mut(bit) {
+                let pos = to_idx(*cur);
+                if let Some(slot) = fixed_want_vregs.get_mut(pos) {
+                    *slot = (v_u32, meta.fixed_hint_weight);
+                    *cur = cur.saturating_add(1);
                 }
             }
         }
     }
-    for r in 0..64 {
-        fixed_want_cursor[r] = fixed_want_off[r];
+    for (cur, &off) in fixed_want_cursor.iter_mut().zip(fixed_want_off.iter()) {
+        *cur = off;
     }
 
     // Track non-expired intervals currently assigned to each physical register (`0..64`),
@@ -3303,19 +3396,20 @@ pub fn allocate_mfunc<'a>(
 
     for &v_u32 in sorted_vregs.iter() {
         let vi = to_idx(v_u32);
-        let meta = vreg_meta[vi];
+        let Some(&meta) = vreg_meta.get(vi) else {
+            continue;
+        };
         let cur_start = meta.first_start;
-        let cur_ranges = &vreg_ranges
-            [to_idx(meta.range_start_idx)..to_idx(meta.range_start_idx + meta.range_len)];
+        let cur_ranges = meta_ranges(&vreg_ranges, meta);
 
         // Expire finished intervals (swap-with-last, zero `Vec::remove`).
         let mut idx = 0usize;
         while idx < active_list.len() {
-            let av = active_list[idx].0;
-            if vreg_meta[to_idx(av)].last_end < cur_start {
-                let last = active_list.len() - 1;
-                active_list[idx] = active_list[last];
-                active_list.pop();
+            let Some((av, _)) = active_list.get(idx).copied() else {
+                break;
+            };
+            if vreg_meta.get(to_idx(av)).is_some_and(|m| m.last_end < cur_start) {
+                swap_remove_fast(&mut active_list, idx);
             } else {
                 idx += 1;
             }
@@ -3324,18 +3418,20 @@ pub fn allocate_mfunc<'a>(
         // Expire resolved, evicted, or finished coalescing reservations (swap-with-last).
         let mut ridx = 0usize;
         while ridx < pending_res.len() {
-            let r = pending_res[ridx];
+            let Some(r) = pending_res.get(ridx).copied() else {
+                break;
+            };
             let expected_preg = match r.bank {
                 RegBank::Gpr => PReg::Gpr(r.hw),
                 RegBank::Fp => PReg::V(r.hw),
             };
-            let still_valid = alloc_loc[to_idx(r.vreg)] == AllocLoc::Unassigned
-                && alloc_loc[to_idx(r.from_vreg)] == AllocLoc::Reg(expected_preg)
-                && vreg_meta[to_idx(r.vreg)].last_end >= cur_start;
+            let still_valid = slice_at(&alloc_loc, to_idx(r.vreg), AllocLoc::Unassigned)
+                == AllocLoc::Unassigned
+                && slice_at(&alloc_loc, to_idx(r.from_vreg), AllocLoc::Unassigned)
+                    == AllocLoc::Reg(expected_preg)
+                && vreg_meta.get(to_idx(r.vreg)).is_some_and(|m| m.last_end >= cur_start);
             if !still_valid {
-                let last = pending_res.len() - 1;
-                pending_res[ridx] = pending_res[last];
-                pending_res.pop();
+                swap_remove_fast(&mut pending_res, ridx);
             } else {
                 ridx += 1;
             }
@@ -3355,10 +3451,11 @@ pub fn allocate_mfunc<'a>(
                 return false;
             }
             for &(av, a_hw) in active {
-                if a_hw == hw && vreg_meta[to_idx(av)].bank == meta.bank {
-                    let am = vreg_meta[to_idx(av)];
-                    let ar = &vreg_ranges
-                        [to_idx(am.range_start_idx)..to_idx(am.range_start_idx + am.range_len)];
+                if a_hw == hw
+                    && let Some(&am) = vreg_meta.get(to_idx(av))
+                    && am.bank == meta.bank
+                {
+                    let ar = meta_ranges(&vreg_ranges, am);
                     if ranges_overlap(cur_ranges, ar) {
                         return false;
                     }
@@ -3367,9 +3464,9 @@ pub fn allocate_mfunc<'a>(
             true
         };
 
-        let es = to_idx(copy_edge_off[vi]);
-        let elen = usize::from(copy_edge_len[vi]);
-        let v_edges = &copy_edges[es..es + elen];
+        let es = to_idx(slice_at(&copy_edge_off, vi, 0));
+        let elen = usize::from(slice_at(&copy_edge_len, vi, 0));
+        let v_edges = subslice(&copy_edges, es, es.saturating_add(elen));
 
         // Cost of choosing `hw` when unallocated coalescing partners of `vi` forbid `hw` (e.g.
         // a back-edge value crossing a call forbids caller-saved regs).
@@ -3377,8 +3474,9 @@ pub fn allocate_mfunc<'a>(
             let full_bit = bank_bit_base.saturating_add(hw);
             let mut cost: u64 = 0;
             for &(partner, ew) in v_edges {
-                if alloc_loc[to_idx(partner)] == AllocLoc::Unassigned
-                    && vreg_meta[to_idx(partner)].forbidden_phys.contains(Reg(full_bit))
+                let pi = to_idx(partner);
+                if slice_at(&alloc_loc, pi, AllocLoc::Unassigned) == AllocLoc::Unassigned
+                    && vreg_meta.get(pi).is_some_and(|m| m.forbidden_phys.contains(Reg(full_bit)))
                 {
                     cost = cost.saturating_add(ew);
                 }
@@ -3399,14 +3497,16 @@ pub fn allocate_mfunc<'a>(
             if hw == NO_REG || w == 0 {
                 return;
             }
-            for slot in &mut hint_cands[..hint_len] {
-                if slot.0 == hw {
-                    slot.1 = slot.1.saturating_add(w);
-                    return;
+            if let Some(slots) = hint_cands.get_mut(..hint_len) {
+                for slot in slots {
+                    if slot.0 == hw {
+                        slot.1 = slot.1.saturating_add(w);
+                        return;
+                    }
                 }
             }
             if hint_len < hint_cands.len() {
-                hint_cands[hint_len] = (hw, w);
+                slice_set(&mut hint_cands, hint_len, (hw, w));
                 hint_len += 1;
             }
         };
@@ -3429,21 +3529,21 @@ pub fn allocate_mfunc<'a>(
         }
 
         for i in 1..hint_len {
-            let key = hint_cands[i];
+            let key = slice_at(&hint_cands, i, (NO_REG, 0));
             let mut j = i;
             while j > 0 {
-                let prev = hint_cands[j - 1];
+                let prev = slice_at(&hint_cands, j - 1, (NO_REG, 0));
                 if key.1 > prev.1 || (key.1 == prev.1 && key.0 < prev.0) {
-                    hint_cands[j] = prev;
+                    slice_set(&mut hint_cands, j, prev);
                     j -= 1;
                 } else {
                     break;
                 }
             }
-            hint_cands[j] = key;
+            slice_set(&mut hint_cands, j, key);
         }
 
-        for &(hw, hw_weight) in &hint_cands[..hint_len] {
+        for &(hw, hw_weight) in subslice(&hint_cands, 0, hint_len) {
             if is_reg_free(hw, &active_list) && partner_forbid_cost(hw) < hw_weight {
                 chosen_hw = Some(hw);
                 coalesced = true;
@@ -3460,11 +3560,11 @@ pub fn allocate_mfunc<'a>(
                     if res.hw == hw
                         && res.bank == meta.bank
                         && res.vreg != v_u32
-                        && alloc_loc[to_idx(res.vreg)] == AllocLoc::Unassigned
+                        && slice_at(&alloc_loc, to_idx(res.vreg), AllocLoc::Unassigned)
+                            == AllocLoc::Unassigned
+                        && let Some(&rm) = vreg_meta.get(to_idx(res.vreg))
                     {
-                        let rm = vreg_meta[to_idx(res.vreg)];
-                        let rr = &vreg_ranges
-                            [to_idx(rm.range_start_idx)..to_idx(rm.range_start_idx + rm.range_len)];
+                        let rr = meta_ranges(&vreg_ranges, rm);
                         if ranges_overlap(cur_ranges, rr) {
                             cost = cost.saturating_add(res.weight);
                         }
@@ -3472,34 +3572,38 @@ pub fn allocate_mfunc<'a>(
                 }
                 let full_bit = usize::from(bank_bit_base.saturating_add(hw));
                 if full_bit < 64 {
-                    let end = to_idx(fixed_want_off[full_bit + 1]);
-                    let mut c = to_idx(cursors[full_bit]);
+                    let end_u32 = slice_at(&fixed_want_off, full_bit + 1, 0);
+                    let end = to_idx(end_u32);
+                    let mut c = to_idx(slice_at(cursors, full_bit, end_u32));
                     while c < end {
-                        let u = fixed_want_vregs[c].0;
+                        let u = slice_at(&fixed_want_vregs, c, (NONE_U32, 0)).0;
                         if u == NONE_U32
-                            || alloc_loc[to_idx(u)] != AllocLoc::Unassigned
-                            || vreg_meta[to_idx(u)].last_end < cur_start
+                            || slice_at(&alloc_loc, to_idx(u), AllocLoc::Unassigned)
+                                != AllocLoc::Unassigned
+                            || vreg_meta.get(to_idx(u)).is_some_and(|m| m.last_end < cur_start)
                         {
                             c += 1;
                         } else {
                             break;
                         }
                     }
-                    cursors[full_bit] = u32_of(c).unwrap_or(fixed_want_off[full_bit + 1]);
+                    slice_set(cursors, full_bit, u32_of(c).unwrap_or(end_u32));
                     let scan_lim = end.min(c.saturating_add(MAX_FIXED_WANT_SCAN));
-                    for &(u, fw) in &fixed_want_vregs[c..scan_lim] {
+                    for &(u, fw) in subslice(&fixed_want_vregs, c, scan_lim) {
                         if u == NONE_U32
                             || u == v_u32
-                            || alloc_loc[to_idx(u)] != AllocLoc::Unassigned
+                            || slice_at(&alloc_loc, to_idx(u), AllocLoc::Unassigned)
+                                != AllocLoc::Unassigned
                         {
                             continue;
                         }
-                        let um = vreg_meta[to_idx(u)];
+                        let Some(&um) = vreg_meta.get(to_idx(u)) else {
+                            continue;
+                        };
                         if um.first_start > meta.last_end {
                             break;
                         }
-                        let ur = &vreg_ranges
-                            [to_idx(um.range_start_idx)..to_idx(um.range_start_idx + um.range_len)];
+                        let ur = meta_ranges(&vreg_ranges, um);
                         if ranges_overlap(cur_ranges, ur) {
                             cost = cost.saturating_add(fw);
                         }
@@ -3555,7 +3659,7 @@ pub fn allocate_mfunc<'a>(
                 RegBank::Gpr => PReg::Gpr(hw),
                 RegBank::Fp => PReg::V(hw),
             };
-            alloc_loc[vi] = AllocLoc::Reg(preg);
+            slice_set(&mut alloc_loc, vi, AllocLoc::Reg(preg));
             active_list.push((v_u32, hw));
             let is_callee_hw = match meta.bank {
                 RegBank::Gpr => (19..=30).contains(&hw),
@@ -3569,10 +3673,12 @@ pub fn allocate_mfunc<'a>(
             }
             for &(partner, ew) in v_edges {
                 let pi = to_idx(partner);
-                if alloc_loc[pi] == AllocLoc::Unassigned {
+                if slice_at(&alloc_loc, pi, AllocLoc::Unassigned) == AllocLoc::Unassigned {
                     let full_bit = bank_bit_base.saturating_add(hw);
                     if pools.is_allocatable(meta.bank, hw)
-                        && !vreg_meta[pi].forbidden_phys.contains(Reg(full_bit))
+                        && vreg_meta
+                            .get(pi)
+                            .is_some_and(|m| !m.forbidden_phys.contains(Reg(full_bit)))
                     {
                         insert_pending_res(
                             &mut pending_res,
@@ -3626,10 +3732,11 @@ pub fn allocate_mfunc<'a>(
                 let mut max_e: u32 = 0;
                 let mut overlaps_any = false;
                 for &(av, a_hw) in active_list.iter() {
-                    if a_hw == hw && vreg_meta[to_idx(av)].bank == meta.bank {
-                        let am = vreg_meta[to_idx(av)];
-                        let ar = &vreg_ranges
-                            [to_idx(am.range_start_idx)..to_idx(am.range_start_idx + am.range_len)];
+                    if a_hw == hw
+                        && let Some(&am) = vreg_meta.get(to_idx(av))
+                        && am.bank == meta.bank
+                    {
+                        let ar = meta_ranges(&vreg_ranges, am);
                         if ranges_overlap(cur_ranges, ar) {
                             overlaps_any = true;
                             let d = am.spill_density();
@@ -3672,22 +3779,27 @@ pub fn allocate_mfunc<'a>(
             // Evict every overlapping interval on `evict_hw` -> `Remat` or `Spill`.
             let mut j = 0usize;
             while j < active_list.len() {
-                let (av, a_hw) = active_list[j];
-                let am = vreg_meta[to_idx(av)];
-                if a_hw == evict_hw && am.bank == meta.bank {
-                    let ar = &vreg_ranges
-                        [to_idx(am.range_start_idx)..to_idx(am.range_start_idx + am.range_len)];
+                let Some((av, a_hw)) = active_list.get(j).copied() else {
+                    break;
+                };
+                if a_hw == evict_hw
+                    && let Some(&am) = vreg_meta.get(to_idx(av))
+                    && am.bank == meta.bank
+                {
+                    let ar = meta_ranges(&vreg_ranges, am);
                     if ranges_overlap(cur_ranges, ar) {
                         if am.is_remat {
-                            alloc_loc[to_idx(av)] = AllocLoc::Remat { def_inst: am.def_inst };
+                            slice_set(
+                                &mut alloc_loc,
+                                to_idx(av),
+                                AllocLoc::Remat { def_inst: am.def_inst },
+                            );
                         } else {
                             let sz = am.spill_mem_size();
                             let off = spills.alloc_slot(sz)?;
-                            alloc_loc[to_idx(av)] = AllocLoc::Spill { off, size: sz };
+                            slice_set(&mut alloc_loc, to_idx(av), AllocLoc::Spill { off, size: sz });
                         }
-                        let last = active_list.len() - 1;
-                        active_list[j] = active_list[last];
-                        active_list.pop();
+                        swap_remove_fast(&mut active_list, j);
                         continue;
                     }
                 }
@@ -3697,7 +3809,7 @@ pub fn allocate_mfunc<'a>(
                 RegBank::Gpr => PReg::Gpr(evict_hw),
                 RegBank::Fp => PReg::V(evict_hw),
             };
-            alloc_loc[vi] = AllocLoc::Reg(preg);
+            slice_set(&mut alloc_loc, vi, AllocLoc::Reg(preg));
             active_list.push((v_u32, evict_hw));
             let is_callee_hw = match meta.bank {
                 RegBank::Gpr => (19..=30).contains(&evict_hw),
@@ -3711,10 +3823,12 @@ pub fn allocate_mfunc<'a>(
             }
             for &(partner, ew) in v_edges {
                 let pi = to_idx(partner);
-                if alloc_loc[pi] == AllocLoc::Unassigned {
+                if slice_at(&alloc_loc, pi, AllocLoc::Unassigned) == AllocLoc::Unassigned {
                     let full_bit = bank_bit_base.saturating_add(evict_hw);
                     if pools.is_allocatable(meta.bank, evict_hw)
-                        && !vreg_meta[pi].forbidden_phys.contains(Reg(full_bit))
+                        && vreg_meta
+                            .get(pi)
+                            .is_some_and(|m| !m.forbidden_phys.contains(Reg(full_bit)))
                     {
                         insert_pending_res(
                             &mut pending_res,
@@ -3730,17 +3844,17 @@ pub fn allocate_mfunc<'a>(
                 }
             }
         } else if meta.is_remat {
-            alloc_loc[vi] = AllocLoc::Remat { def_inst: meta.def_inst };
+            slice_set(&mut alloc_loc, vi, AllocLoc::Remat { def_inst: meta.def_inst });
         } else {
             let sz = meta.spill_mem_size();
             let off = spills.alloc_slot(sz)?;
-            alloc_loc[vi] = AllocLoc::Spill { off, size: sz };
+            slice_set(&mut alloc_loc, vi, AllocLoc::Spill { off, size: sz });
         }
     }
 
     // Tally final per-`VReg` allocation stats accurately (after any retroactive evictions).
     for (vi, &loc) in alloc_loc.iter().enumerate() {
-        if vreg_meta[vi].range_len == 0 {
+        if !vreg_meta.get(vi).is_some_and(|m| m.range_len > 0) {
             continue;
         }
         match loc {
@@ -3775,14 +3889,16 @@ pub fn allocate_mfunc<'a>(
     for &blk in func.block_order.iter() {
         let b = to_idx(blk.0);
         let new_s = u32_of(out.ops.len()).ok_or(MRaError::FunctionTooLarge)?;
-        let (orig_s, orig_e) = func.block_insts[b];
+        let (orig_s, orig_e) = slice_at(&func.block_insts, b, (0, 0));
 
         for orig in to_idx(orig_s)..to_idx(orig_e) {
-            let op = func.ops[orig];
-            let fl = func.flags[orig];
-            let vdef = func.vflag_def[orig];
-            let vuse = func.vflag_use[orig];
-            let note = func.note_idx[orig];
+            let Some(&op) = func.ops.get(orig) else {
+                continue;
+            };
+            let fl = slice_at(&func.flags, orig, MInstFlags::NONE);
+            let vdef = slice_at(&func.vflag_def, orig, NO_VFLAG);
+            let vuse = slice_at(&func.vflag_use, orig, NO_VFLAG);
+            let note = slice_at(&func.note_idx, orig, NO_NOTE);
 
             if is_call_op(&op, fl) {
                 let orig_u32 = u32_of(orig).unwrap_or(0);
@@ -3798,7 +3914,7 @@ pub fn allocate_mfunc<'a>(
                 let inst = MInst(u32_of(orig).unwrap_or(NONE_U32));
                 lower_parallel_copy(
                     inst,
-                    &func.copy_pairs[ps..pe],
+                    subslice(&func.copy_pairs, ps, pe),
                     &alloc_loc,
                     &vreg_meta,
                     &func.ops,
@@ -3825,7 +3941,7 @@ pub fn allocate_mfunc<'a>(
         }
 
         let new_e = u32_of(out.ops.len()).ok_or(MRaError::FunctionTooLarge)?;
-        new_block_insts[b] = (new_s, new_e);
+        slice_set(&mut new_block_insts, b, (new_s, new_e));
     }
 
     // Soundness invariant (Rule 53): every spill slot loaded anywhere in the function MUST have
@@ -3857,9 +3973,11 @@ pub fn allocate_mfunc<'a>(
     let mut touched_gprs: u32 = 0;
     let mut touched_fps: u32 = 0;
     for &blk in func.block_order.iter() {
-        let (s, e) = func.block_insts[to_idx(blk.0)];
+        let (s, e) = slice_at(&func.block_insts, to_idx(blk.0), (0, 0));
         for i in to_idx(s)..to_idx(e) {
-            let op = &func.ops[i];
+            let Some(op) = func.ops.get(i) else {
+                continue;
+            };
             if let MOp::RawWord { defs_gpr, defs_fp, .. } = *op {
                 touched_gprs |= defs_gpr;
                 touched_fps |= defs_fp;
@@ -3915,19 +4033,18 @@ fn collect_copy_hints(
         (MReg::V(vd), MReg::V(vs)) if vd != vs => {
             let di = to_idx(vd.0);
             let si = to_idx(vs.0);
-            if di < vreg_meta.len()
-                && si < vreg_meta.len()
-                && vreg_meta[di].bank == vreg_meta[si].bank
+            if let (Some(&dm), Some(&sm)) = (vreg_meta.get(di), vreg_meta.get(si))
+                && dm.bank == sm.bank
             {
                 raw_copy_edges.push((vd.0, vs.0, v_w));
             }
         }
         (MReg::V(v), MReg::P(p)) | (MReg::P(p), MReg::V(v)) => {
             let vi = to_idx(v.0);
-            if vi < vreg_meta.len() {
-                match (vreg_meta[vi].bank, p) {
+            if let Some(meta) = vreg_meta.get_mut(vi) {
+                match (meta.bank, p) {
                     (RegBank::Gpr, PReg::Gpr(hw)) | (RegBank::Fp, PReg::V(hw)) => {
-                        vreg_meta[vi].add_fixed_hint(hw, p_w);
+                        meta.add_fixed_hint(hw, p_w);
                     }
                     _ => {}
                 }
@@ -3948,7 +4065,7 @@ fn collect_copy_hints(
             let s = to_idx(start);
             let e = s.saturating_add(usize::from(len)).min(copy_pairs.len());
             let pw = eff_w.saturating_mul(if is_backedge { 8 } else { 4 });
-            for &(dst, src) in &copy_pairs[s..e] {
+            for &(dst, src) in subslice(copy_pairs, s, e) {
                 record_pair(dst, src, pw, pw);
             }
         }

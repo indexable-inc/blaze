@@ -629,8 +629,10 @@ pub fn write_native<'a>(
         name_index.dedup_by_key(|entry| entry.0);
         local_syms.reserve(laid.placed.len().min(name_index.len()));
         for p in laid.placed.iter() {
-            if let Ok(idx) = name_index.binary_search_by_key(&p.symbol, |&(sym, _)| sym) {
-                local_syms.push((name_index[idx].1, BASE + p.at));
+            if let Ok(idx) = name_index.binary_search_by_key(&p.symbol, |&(sym, _)| sym)
+                && let Some(&(_, name)) = name_index.get(idx)
+            {
+                local_syms.push((name, BASE + p.at));
             }
         }
     }

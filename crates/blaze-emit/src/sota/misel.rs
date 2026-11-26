@@ -140,6 +140,37 @@ fn vec_filled<'a, T: Copy>(len: usize, val: T, alloc: Alloc<'a>) -> Vec<T, Alloc
     v
 }
 
+#[inline]
+fn at<T: Copy>(s: &[T], i: usize, def: T) -> T {
+    s.get(i).copied().unwrap_or(def)
+}
+
+#[inline]
+fn set<T>(s: &mut [T], i: usize, v: T) {
+    if let Some(slot) = s.get_mut(i) {
+        *slot = v;
+    }
+}
+
+#[inline]
+fn sat_inc_u32(s: &mut [u32], i: usize, by: u32) {
+    if let Some(slot) = s.get_mut(i) {
+        *slot = slot.saturating_add(by);
+    }
+}
+
+#[inline]
+fn sat_dec_u32(s: &mut [u32], i: usize, by: u32) {
+    if let Some(slot) = s.get_mut(i) {
+        *slot = slot.saturating_sub(by);
+    }
+}
+
+#[inline]
+fn ty_at(view: &View<'_>, i: usize) -> Ty {
+    view.tys.get(i).copied().map_or(Ty::NONE, Ty)
+}
+
 // -----------------------------------------------------------------------------
 // Public Options, Statistics & Entry Point (Rules 83, 85)
 // -----------------------------------------------------------------------------
@@ -556,8 +587,9 @@ impl AbiWalk {
                 8
             };
             let idx = usize::from(self.next_gpr);
-            if idx < cap {
-                let r = super::abi::INTERNAL_FAST_GPR_ARGS[idx];
+            if idx < cap
+                && let Some(&r) = super::abi::INTERNAL_FAST_GPR_ARGS.get(idx)
+            {
                 self.next_gpr += 1;
                 Some(AbiLoc::Gpr(r))
             } else {
@@ -571,8 +603,9 @@ impl AbiWalk {
                 8
             };
             let idx = usize::from(self.next_fp);
-            if idx < cap {
-                let v = super::abi::INTERNAL_FAST_FP_ARGS[idx];
+            if idx < cap
+                && let Some(&v) = super::abi::INTERNAL_FAST_FP_ARGS.get(idx)
+            {
                 self.next_fp += 1;
                 Some(AbiLoc::Fp(v))
             } else {
@@ -706,7 +739,7 @@ pub(crate) fn check_misel_subset(
             BlockKind::Cleanup | BlockKind::Catch | BlockKind::Terminate => {
                 has_landing_blocks = true;
                 let params = view.params(blk);
-                if params.len() != 1 || Ty(view.tys[params.start]) != Ty::PTR {
+                if params.len() != 1 || ty_at(view, params.start) != Ty::PTR {
                     return Err(refuse(None, "unwind landing block without single ptr param"));
                 }
             }
@@ -724,7 +757,7 @@ pub(crate) fn check_misel_subset(
 
     for inst in 0..view.len() {
         let op = view.op(inst);
-        let res_ty = Ty(view.tys[inst]);
+        let res_ty = ty_at(view, inst);
         let mut o = view.operands(inst);
 
         match op {
@@ -1415,7 +1448,7 @@ fn load_store_off_size(view: &View<'_>, inst: usize) -> Option<(i32, MemSize)> {
     let mut o = view.operands(inst);
     let (off, mem_ty) = if op == Op::Load {
         let _ptr = o.value();
-        (o.offset(), Ty(view.tys[inst]))
+        (o.offset(), ty_at(view, inst))
     } else if op == Op::Store {
         let val = o.value();
         let _ptr = o.value();
@@ -1495,7 +1528,7 @@ fn peel_shift_mask_step(
     if idx >= view.len() {
         return None;
     }
-    let dst_bits = int_bits(Ty(view.tys[idx]));
+    let dst_bits = int_bits(ty_at(view, idx));
     if dst_bits < 8 {
         return None;
     }
@@ -1583,7 +1616,7 @@ fn peel_bool_cond_step(
             }
         }
         Op::Xor => {
-            if Ty(view.tys[idx]) != Ty::I1 {
+            if ty_at(view, idx) != Ty::I1 {
                 return None;
             }
             let mut o = view.operands(idx);
@@ -2121,7 +2154,7 @@ impl<'a, 'v> Selector<'a, 'v> {
         if !matches!(op, Op::Call | Op::CallIndirect | Op::Invoke | Op::InvokeIndirect) {
             return None;
         }
-        let res_ty = Ty(self.view.tys[call_inst]);
+        let res_ty = ty_at(self.view, call_inst);
         let members = self.view.members(res_ty);
         if members.len() < 2 || field >= members.len() {
             return None;
@@ -2710,7 +2743,7 @@ impl<'a, 'v> Selector<'a, 'v> {
     /// Emits a `Select` instruction, handling constant shortcuts, materialized `I1` zero-cost
     /// aliasing, `Csinc`/`Csinv`/`Csneg` fusion, and contiguous sibling `VFlag` reuse.
     fn lower_select(&mut self, inst: usize, cond_val: Value, t_val: Value, f_val: Value) {
-        let res_ty = Ty(self.view.tys[inst]);
+        let res_ty = ty_at(self.view, inst);
 
         // Identical arms: `Select(c, x, x)` -> alias `x`!
         if t_val == f_val {
@@ -2786,12 +2819,12 @@ impl<'a, 'v> Selector<'a, 'v> {
 
         if cond_is_materialized && is_scalar_int_or_ptr(res_ty) {
             if t_const == Some(1) && f_const == Some(0) {
-                let cv = MReg::V(VReg(self.val_vreg[cond_val.index()]));
+                let cv = MReg::V(VReg(at(&self.val_vreg, cond_val.index(), NONE_U32)));
                 self.bind_alias_vreg(inst, cv, res_ty);
                 return;
             }
             if t_const == Some(0) && f_const == Some(1) {
-                let cv = MReg::V(VReg(self.val_vreg[cond_val.index()]));
+                let cv = MReg::V(VReg(at(&self.val_vreg, cond_val.index(), NONE_U32)));
                 let dst = self.alloc_res_vreg(inst, res_ty);
                 self.push_op(
                     MOp::LogicalImm {
@@ -3023,8 +3056,8 @@ impl<'a, 'v> Selector<'a, 'v> {
         else_tgt: blaze_lir::op::Target<'_>,
         next_lir_blk: Option<usize>,
     ) {
-        let then_orig = self.mblock_of_lir[then_tgt.block.index()];
-        let else_orig = self.mblock_of_lir[else_tgt.block.index()];
+        let then_orig = at(&self.mblock_of_lir, then_tgt.block.index(), MBlock(0));
+        let else_orig = at(&self.mblock_of_lir, else_tgt.block.index(), MBlock(0));
 
         let mut then_pairs: Vec<(MReg, MReg), Alloc<'a>> = Vec::new_in(self.alloc);
         let mut else_pairs: Vec<(MReg, MReg), Alloc<'a>> = Vec::new_in(self.alloc);
@@ -3325,14 +3358,14 @@ impl<'a, 'v> Selector<'a, 'v> {
         next_lir_blk: Option<usize>,
         scratch_pairs: &mut Vec<(MReg, MReg), Alloc<'a>>,
     ) -> Result<(), TierError> {
-        if self.skip_inst[inst] {
+        if at(&self.skip_inst, inst, false) {
             return Ok(());
         }
 
         let op = self.view.op(inst);
-        let res_ty = Ty(self.view.tys[inst]);
+        let res_ty = ty_at(self.view, inst);
         let flags = self.view.flags(inst);
-        let pat = self.pattern[inst];
+        let pat = at(&self.pattern, inst, SelPattern::None);
         let mut o = self.view.operands(inst);
 
         match op {
@@ -3362,7 +3395,7 @@ impl<'a, 'v> Selector<'a, 'v> {
 
             Op::SlotAddr => {
                 let slot = o.slot();
-                let off = self.slot_off[slot.index()];
+                let off = at(&self.slot_off, slot.index(), 0);
                 let dst = self.alloc_res_vreg(inst, Ty::PTR);
                 self.emit_sp_plus_off(MReg::V(dst), off);
             }
@@ -3629,7 +3662,7 @@ impl<'a, 'v> Selector<'a, 'v> {
             }
 
             Op::DataAddr => {
-                if self.use_count[inst] == 0 {
+                if at(&self.use_count, inst, 0) == 0 {
                     return Ok(());
                 }
                 let ref_id = o.reference();
@@ -3665,7 +3698,7 @@ impl<'a, 'v> Selector<'a, 'v> {
             }
 
             Op::FuncAddr => {
-                if self.use_count[inst] == 0 {
+                if at(&self.use_count, inst, 0) == 0 {
                     return Ok(());
                 }
                 let ref_id = o.reference();
@@ -3692,7 +3725,7 @@ impl<'a, 'v> Selector<'a, 'v> {
             }
 
             Op::Icmp => {
-                if self.cmp_all_fused[inst] {
+                if at(&self.cmp_all_fused, inst, false) {
                     return Ok(());
                 }
                 let ic = o.int_cond();
@@ -3726,7 +3759,7 @@ impl<'a, 'v> Selector<'a, 'v> {
             }
 
             Op::Fcmp => {
-                if self.cmp_all_fused[inst] {
+                if at(&self.cmp_all_fused, inst, false) {
                     return Ok(());
                 }
                 let fc = o.float_cond();
@@ -4246,7 +4279,7 @@ impl<'a, 'v> Selector<'a, 'v> {
 
             Op::Jump => {
                 let tgt = o.target();
-                let dst_mblk = self.mblock_of_lir[tgt.block.index()];
+                let dst_mblk = at(&self.mblock_of_lir, tgt.block.index(), MBlock(0));
                 self.build_edge_copy_pairs(tgt.block, tgt.args, scratch_pairs);
                 if !scratch_pairs.is_empty() {
                     self.mfunc.push_parallel_copy(scratch_pairs, MInstFlags::NONE);
@@ -6245,7 +6278,7 @@ impl<'a, 'v> Selector<'a, 'v> {
         args: blaze_lir::op::Values<'_>,
         scratch_pairs: &mut Vec<(MReg, MReg), Alloc<'a>>,
     ) -> MBlock {
-        let orig = self.mblock_of_lir[target_lir_blk.index()];
+        let orig = at(&self.mblock_of_lir, target_lir_blk.index(), MBlock(0));
         self.build_edge_copy_pairs(target_lir_blk, args, scratch_pairs);
         if scratch_pairs.is_empty() {
             return orig;
@@ -6337,7 +6370,7 @@ impl<'a, 'v> Selector<'a, 'v> {
                     break;
                 }
             }
-            let dst_mblk = self.mblock_of_lir[chosen.block.index()];
+            let dst_mblk = at(&self.mblock_of_lir, chosen.block.index(), MBlock(0));
             self.build_edge_copy_pairs(chosen.block, chosen.args, scratch_pairs);
             if !scratch_pairs.is_empty() {
                 self.mfunc.push_parallel_copy(scratch_pairs, MInstFlags::NONE);
@@ -6360,7 +6393,7 @@ impl<'a, 'v> Selector<'a, 'v> {
         }
 
         if resolved.is_empty() {
-            let def_mblk = self.mblock_of_lir[default_tgt.block.index()];
+            let def_mblk = at(&self.mblock_of_lir, default_tgt.block.index(), MBlock(0));
             self.build_edge_copy_pairs(default_tgt.block, default_tgt.args, scratch_pairs);
             if !scratch_pairs.is_empty() {
                 self.mfunc.push_parallel_copy(scratch_pairs, MInstFlags::NONE);
@@ -6381,7 +6414,9 @@ impl<'a, 'v> Selector<'a, 'v> {
         loop {
             if cur_hi - cur_lo <= 4 {
                 for k in cur_lo..cur_hi {
-                    let (cv, ctgt) = resolved[k];
+                    let Some(&(cv, ctgt)) = resolved.get(k) else {
+                        continue;
+                    };
                     let is_last = k + 1 == cur_hi;
                     let fall_blk = if is_last {
                         def_mblk
@@ -6398,7 +6433,7 @@ impl<'a, 'v> Selector<'a, 'v> {
                 }
             } else {
                 let mid = cur_lo + (cur_hi - cur_lo) / 2;
-                let pivot = resolved[mid].0;
+                let pivot = resolved.get(mid).map_or(0, |&(v, _)| v);
                 let lo_blk = self.new_mblock(false, self.cur_weight);
                 let hi_blk = self.new_mblock(false, self.cur_weight);
                 let vf = self.emit_switch_cmp(scrut_reg, wide, pivot);
@@ -6615,7 +6650,7 @@ impl<'a, 'v> Selector<'a, 'v> {
                             },
                             MInstFlags::MEM_READ,
                         );
-                        pieces[n_pieces] = (off, MemSize::Q128, tmp);
+                        set(&mut pieces, n_pieces, (off, MemSize::Q128, tmp));
                         n_pieces += 1;
                         off += 16;
                         rem -= 16;
@@ -6637,13 +6672,13 @@ impl<'a, 'v> Selector<'a, 'v> {
                                 },
                                 MInstFlags::MEM_READ,
                             );
-                            pieces[n_pieces] = (off, sz, tmp);
+                            set(&mut pieces, n_pieces, (off, sz, tmp));
                             n_pieces += 1;
                             off += i32::try_from(bytes).unwrap_or(0);
                             rem -= bytes;
                         }
                     }
-                    for &(poff, sz, tmp) in &pieces[..n_pieces] {
+                    for &(poff, sz, tmp) in pieces.iter().take(n_pieces) {
                         self.push_op(
                             MOp::Str {
                                 src: MReg::V(tmp),
@@ -6862,7 +6897,7 @@ impl<'a, 'v> Selector<'a, 'v> {
                     return Err(refuse(Some(inst), "invoke unwind target is not a landing block"));
                 }
             };
-            let unwind_mblk = self.mblock_of_lir[unwind_blk.index()];
+            let unwind_mblk = at(&self.mblock_of_lir, unwind_blk.index(), MBlock(0));
             self.attach_unwind_row(call_mi, Some((unwind_mblk, action)))?;
         } else if self.has_landing_blocks
             && !self.is_cleanup_block.get(to_idx(self.cur_lir_blk)).copied().unwrap_or(false)
@@ -6896,7 +6931,7 @@ impl<'a, 'v> Selector<'a, 'v> {
                         let raw_v = self.mfunc.alloc_vreg(VRegClass::Gpr32);
                         scratch_pairs.push((MReg::V(raw_v), MReg::gpr(gpr_r)));
                         if n_narrow < post_narrow.len() {
-                            post_narrow[n_narrow] = (dst_v, raw_v, bits);
+                            set(&mut post_narrow, n_narrow, (dst_v, raw_v, bits));
                             n_narrow += 1;
                         }
                     }
@@ -6906,7 +6941,7 @@ impl<'a, 'v> Selector<'a, 'v> {
             if !scratch_pairs.is_empty() {
                 self.mfunc.push_parallel_copy(scratch_pairs, MInstFlags::NONE);
             }
-            for &(dst_v, raw_v, bits) in &post_narrow[..n_narrow] {
+            for &(dst_v, raw_v, bits) in post_narrow.iter().take(n_narrow) {
                 if bits == 32 {
                     self.push_op(
                         MOp::Mov { dst: MReg::V(dst_v), src: MReg::V(raw_v), wide: false },
@@ -6945,7 +6980,7 @@ impl<'a, 'v> Selector<'a, 'v> {
 
         // 6. Terminate `Op::Invoke` / `Op::InvokeIndirect` with branch to its normal successor.
         if let Some((normal_blk, _)) = invoke {
-            let normal_mblk = self.mblock_of_lir[normal_blk.index()];
+            let normal_mblk = at(&self.mblock_of_lir, normal_blk.index(), MBlock(0));
             self.push_op(MOp::B { target: normal_mblk }, MInstFlags::TERMINATOR);
         }
         Ok(())
@@ -7167,7 +7202,7 @@ fn match_patterns(
     let mut bool_peel_child = vec_filled(n, NONE_U32, alloc);
     let mut fused_cmp_uses = vec_filled(n, 0u32, alloc);
     for inst in 0..n {
-        let b = inst_block[inst];
+        let b = at(inst_block, inst, 0);
         let cond_opt = match view.op(inst) {
             Op::Br => Some(view.operands(inst).value()),
             Op::Select => {
@@ -7183,7 +7218,7 @@ fn match_patterns(
             continue;
         };
         let ci = c.index();
-        if inst_block[ci] != b {
+        if inst_block.get(ci) != Some(&b) {
             continue;
         }
         let mut cur = ci;
@@ -7194,30 +7229,30 @@ fn match_patterns(
                 break;
             };
             if let Some(mid) = mid_opt {
-                bool_peel_child[cur] = u32_of(mid).unwrap_or(NONE_U32);
-                bool_peel_child[mid] = u32_of(next).unwrap_or(NONE_U32);
+                set(&mut bool_peel_child, cur, u32_of(mid).unwrap_or(NONE_U32));
+                set(&mut bool_peel_child, mid, u32_of(next).unwrap_or(NONE_U32));
             } else {
-                bool_peel_child[cur] = u32_of(next).unwrap_or(NONE_U32);
+                set(&mut bool_peel_child, cur, u32_of(next).unwrap_or(NONE_U32));
             }
             cur = next;
         }
         if cur != ci {
-            use_count[ci] = use_count[ci].saturating_sub(1);
-            use_count[cur] = use_count[cur].saturating_add(1);
+            sat_dec_u32(use_count, ci, 1);
+            sat_inc_u32(use_count, cur, 1);
         }
-        if inst_block[cur] == b {
-            fused_cmp_uses[cur] = fused_cmp_uses[cur].saturating_add(1);
+        if inst_block.get(cur) == Some(&b) {
+            sat_inc_u32(&mut fused_cmp_uses, cur, 1);
         }
     }
     for _ in 0..8 {
         let mut changed = false;
         for u in 0..n {
-            let child = bool_peel_child[u];
-            if child != NONE_U32 && !skip_inst[u] && use_count[u] == 0 {
-                skip_inst[u] = true;
+            let child = at(&bool_peel_child, u, NONE_U32);
+            if child != NONE_U32 && !at(skip_inst, u, true) && at(use_count, u, 0) == 0 {
+                set(skip_inst, u, true);
                 let ci = to_idx(child);
                 if ci < n {
-                    use_count[ci] = use_count[ci].saturating_sub(1);
+                    sat_dec_u32(use_count, ci, 1);
                 }
                 changed = true;
             }
@@ -7227,7 +7262,7 @@ fn match_patterns(
         }
     }
     for inst in 0..n {
-        if skip_inst[inst] {
+        if at(skip_inst, inst, false) {
             continue;
         }
         let op = view.op(inst);
@@ -7236,8 +7271,9 @@ fn match_patterns(
             Op::Fcmp => float_cond_to_mcond(view.operands(inst).float_cond()).is_some(),
             _ => false,
         };
-        if is_fusible_cmp && use_count[inst] > 0 && fused_cmp_uses[inst] == use_count[inst] {
-            cmp_all_fused[inst] = true;
+        let uc = at(use_count, inst, 0);
+        if is_fusible_cmp && uc > 0 && at(&fused_cmp_uses, inst, 0) == uc {
+            set(cmp_all_fused, inst, true);
         }
     }
 
@@ -7246,14 +7282,14 @@ fn match_patterns(
     // as `skip_inst` BEFORE Pass B1/B2 so dead `and #0x3f` / `and #0x1f` are never emitted.
     let mut shift_peel_child = vec_filled(n, NONE_U32, alloc);
     for inst in 0..n {
-        if skip_inst[inst] {
+        if at(skip_inst, inst, false) {
             continue;
         }
         let op = view.op(inst);
         if !matches!(op, Op::Shl | Op::Lshr | Op::Ashr | Op::Rotl | Op::Rotr) {
             continue;
         }
-        let bits = int_bits(Ty(view.tys[inst]));
+        let bits = int_bits(ty_at(view, inst));
         if bits < 8 {
             continue;
         }
@@ -7261,7 +7297,7 @@ fn match_patterns(
         let _lhs = o.value();
         let rhs = o.value();
         let ri = rhs.index();
-        if const_u64[ri].is_some() {
+        if at(const_u64, ri, None).is_some() {
             continue;
         }
         let req_mask = u64::from(bits - 1);
@@ -7270,23 +7306,23 @@ fn match_patterns(
             let Some(next) = peel_shift_mask_step(view, const_u64, cur, req_mask) else {
                 break;
             };
-            shift_peel_child[cur] = u32_of(next).unwrap_or(NONE_U32);
+            set(&mut shift_peel_child, cur, u32_of(next).unwrap_or(NONE_U32));
             cur = next;
         }
         if cur != ri {
-            use_count[ri] = use_count[ri].saturating_sub(1);
-            use_count[cur] = use_count[cur].saturating_add(1);
+            sat_dec_u32(use_count, ri, 1);
+            sat_inc_u32(use_count, cur, 1);
         }
     }
     for _ in 0..4 {
         let mut changed = false;
         for u in 0..n {
-            let child = shift_peel_child[u];
-            if child != NONE_U32 && !skip_inst[u] && use_count[u] == 0 {
-                skip_inst[u] = true;
+            let child = at(&shift_peel_child, u, NONE_U32);
+            if child != NONE_U32 && !at(skip_inst, u, true) && at(use_count, u, 0) == 0 {
+                set(skip_inst, u, true);
                 let ci = to_idx(child);
                 if ci < n {
-                    use_count[ci] = use_count[ci].saturating_sub(1);
+                    sat_dec_u32(use_count, ci, 1);
                 }
                 changed = true;
             }
@@ -7307,15 +7343,15 @@ fn match_patterns(
     let mut ptr_uses = vec_filled(n, [NONE_U32; MAX_ADDR_FOLD_USES], alloc);
 
     for inst in 0..n {
-        if skip_inst[inst] {
+        if at(skip_inst, inst, false) {
             continue;
         }
         let op = view.op(inst);
         if !matches!(op, Op::Load | Op::Store) {
             continue;
         }
-        let b = inst_block[inst];
-        let res_ty = Ty(view.tys[inst]);
+        let b = at(inst_block, inst, 0);
+        let res_ty = ty_at(view, inst);
         let mut o = view.operands(inst);
         let (ptr, off, mem_ty) = if op == Op::Load {
             (o.value(), o.offset(), res_ty)
@@ -7328,28 +7364,35 @@ fn match_patterns(
             continue;
         };
         let pi = ptr.index();
-        if pi >= n || skip_inst[pi] {
+        if pi >= n || at(skip_inst, pi, true) {
             continue;
         }
         match view.op(pi) {
             Op::SlotAddr => {
                 let slot = view.operands(pi).slot();
-                let total = i64::from(slot_off[slot.index()]) + i64::from(off);
+                let total = i64::from(at(slot_off, slot.index(), 0)) + i64::from(off);
                 if let Some(sp_off) = fits_base_off_checked(total, size) {
-                    pattern[inst] = SelPattern::MemSp { off: sp_off };
-                    slot_folded[pi] = slot_folded[pi].saturating_add(1);
+                    set(pattern, inst, SelPattern::MemSp { off: sp_off });
+                    sat_inc_u32(&mut slot_folded, pi, 1);
                 }
             }
             Op::PtrAdd => {
-                if inst_block[pi] == b
-                    && pattern[pi] == SelPattern::None
-                    && use_count[pi] >= 1
-                    && use_count[pi] <= MAX_ADDR_FOLD_USES_U32
+                let pi_uc = at(use_count, pi, 0);
+                if inst_block.get(pi) == Some(&b)
+                    && at(pattern, pi, SelPattern::None) == SelPattern::None
+                    && pi_uc >= 1
+                    && pi_uc <= MAX_ADDR_FOLD_USES_U32
                 {
-                    let slot = usize::from(ptr_use_len[pi]);
+                    let slot = usize::from(at(&ptr_use_len, pi, 0));
                     if slot < MAX_ADDR_FOLD_USES {
-                        ptr_uses[pi][slot] = u32_of(inst).unwrap_or(NONE_U32);
-                        ptr_use_len[pi] = ptr_use_len[pi].saturating_add(1);
+                        if let Some(row) = ptr_uses.get_mut(pi)
+                            && let Some(cell) = row.get_mut(slot)
+                        {
+                            *cell = u32_of(inst).unwrap_or(NONE_U32);
+                        }
+                        if let Some(len_slot) = ptr_use_len.get_mut(pi) {
+                            *len_slot = len_slot.saturating_add(1);
+                        }
                     }
                 }
             }
@@ -7358,42 +7401,45 @@ fn match_patterns(
     }
 
     for pi in 0..n {
-        if !skip_inst[pi]
+        let uc = at(use_count, pi, 0);
+        if !at(skip_inst, pi, true)
             && view.op(pi) == Op::SlotAddr
-            && use_count[pi] > 0
-            && slot_folded[pi] == use_count[pi]
+            && uc > 0
+            && at(&slot_folded, pi, 0) == uc
         {
-            skip_inst[pi] = true;
+            set(skip_inst, pi, true);
         }
     }
 
     for pi in 0..n {
-        let k = usize::from(ptr_use_len[pi]);
-        let k_u32 = u32::from(ptr_use_len[pi]);
+        let k_u8 = at(&ptr_use_len, pi, 0);
+        let k = usize::from(k_u8);
+        let k_u32 = u32::from(k_u8);
         if k == 0
-            || skip_inst[pi]
-            || pattern[pi] != SelPattern::None
-            || k_u32 != use_count[pi]
+            || at(skip_inst, pi, true)
+            || at(pattern, pi, SelPattern::None) != SelPattern::None
+            || k_u32 != at(use_count, pi, 0)
         {
             continue;
         }
-        let b = inst_block[pi];
+        let b = at(inst_block, pi, 0);
+        let ptr_row = at(&ptr_uses, pi, [NONE_U32; MAX_ADDR_FOLD_USES]);
         let mut po = view.operands(pi);
         let base = po.value();
         let by = po.value();
         let by_bits = int_bits(view.ty(by));
 
-        if let Some(c) = const_u64[by.index()] {
+        if let Some(c) = at(const_u64, by.index(), None) {
             let delta = sign_extend_u64(c, by_bits);
             let mut comb_offs = [0i32; MAX_ADDR_FOLD_USES];
             let mut all_fit = true;
             for j in 0..k {
-                let u = to_idx(ptr_uses[pi][j]);
+                let u = to_idx(at(&ptr_row, j, NONE_U32));
                 if let Some((off, size)) = load_store_off_size(view, u)
                     && let Some(total) = delta.checked_add(i64::from(off))
                     && let Some(comb_off) = fits_base_off_checked(total, size)
                 {
-                    comb_offs[j] = comb_off;
+                    set(&mut comb_offs, j, comb_off);
                 } else {
                     all_fit = false;
                     break;
@@ -7401,22 +7447,26 @@ fn match_patterns(
             }
             if all_fit {
                 for j in 0..k {
-                    let u = to_idx(ptr_uses[pi][j]);
-                    pattern[u] = SelPattern::MemBaseOff { base: base.0, off: comb_offs[j] };
+                    let u = to_idx(at(&ptr_row, j, NONE_U32));
+                    set(
+                        pattern,
+                        u,
+                        SelPattern::MemBaseOff { base: base.0, off: at(&comb_offs, j, 0) },
+                    );
                 }
-                skip_inst[pi] = true;
-                use_count[base.index()] = use_count[base.index()].saturating_add(k_u32 - 1);
-                use_count[by.index()] = use_count[by.index()].saturating_sub(1);
+                set(skip_inst, pi, true);
+                sat_inc_u32(use_count, base.index(), k_u32 - 1);
+                sat_dec_u32(use_count, by.index(), 1);
             }
         } else if by_bits == 64 {
             let mut all_zero_off = true;
             let mut sizes = [MemSize::B8; MAX_ADDR_FOLD_USES];
             for j in 0..k {
-                let u = to_idx(ptr_uses[pi][j]);
+                let u = to_idx(at(&ptr_row, j, NONE_U32));
                 if let Some((off, size)) = load_store_off_size(view, u)
                     && off == 0
                 {
-                    sizes[j] = size;
+                    set(&mut sizes, j, size);
                 } else {
                     all_zero_off = false;
                     break;
@@ -7428,19 +7478,25 @@ fn match_patterns(
 
             let bi = by.index();
             let mut folded_scale: Option<(Value, u8, Value)> = None;
-            if bi < n && !skip_inst[bi] && inst_block[bi] == b && use_count[bi] >= 1 {
+            if bi < n
+                && !at(skip_inst, bi, true)
+                && inst_block.get(bi) == Some(&b)
+                && at(use_count, bi, 0) >= 1
+            {
                 match view.op(bi) {
                     Op::Shl => {
                         let mut so = view.operands(bi);
                         let idx = so.value();
                         let sh_v = so.value();
                         if idx.index() < n
-                            && (const_u64[idx.index()].is_some() || !skip_inst[idx.index()])
-                            && let Some(kv) = const_u64[sh_v.index()]
+                            && (at(const_u64, idx.index(), None).is_some()
+                                || !at(skip_inst, idx.index(), true))
+                            && let Some(kv) = at(const_u64, sh_v.index(), None)
                         {
                             let sh = trunc_u8(kv & 63);
-                            let all_compat = sizes[..k]
+                            let all_compat = sizes
                                 .iter()
+                                .take(k)
                                 .all(|sz| sh == 0 || sh == sz.scale_shift());
                             if all_compat {
                                 folded_scale = Some((idx, sh, sh_v));
@@ -7451,12 +7507,12 @@ fn match_patterns(
                         let mut mo = view.operands(bi);
                         let a = mo.value();
                         let bv = mo.value();
-                        let scale_cand = if let Some(cv) = const_u64[bv.index()]
-                            && const_u64[a.index()].is_none()
+                        let scale_cand = if let Some(cv) = at(const_u64, bv.index(), None)
+                            && at(const_u64, a.index(), None).is_none()
                         {
                             Some((a, cv, bv))
-                        } else if let Some(cv) = const_u64[a.index()]
-                            && const_u64[bv.index()].is_none()
+                        } else if let Some(cv) = at(const_u64, a.index(), None)
+                            && at(const_u64, bv.index(), None).is_none()
                         {
                             Some((bv, cv, a))
                         } else {
@@ -7464,14 +7520,15 @@ fn match_patterns(
                         };
                         if let Some((idx, cv, c_val)) = scale_cand
                             && idx.index() < n
-                            && !skip_inst[idx.index()]
+                            && !at(skip_inst, idx.index(), true)
                             && cv != 0
                             && (cv & (cv - 1)) == 0
                             && cv <= 16
                         {
                             let sh = u8_of(cv.trailing_zeros()).unwrap_or(0);
-                            let all_compat = sizes[..k]
+                            let all_compat = sizes
                                 .iter()
+                                .take(k)
                                 .all(|sz| sh == 0 || sh == sz.scale_shift());
                             if all_compat {
                                 folded_scale = Some((idx, sh, c_val));
@@ -7484,35 +7541,43 @@ fn match_patterns(
 
             if let Some((idx, sh, c_val)) = folded_scale {
                 for j in 0..k {
-                    let u = to_idx(ptr_uses[pi][j]);
-                    pattern[u] = SelPattern::MemScaledIdx {
-                        base: base.0,
-                        idx: idx.0,
-                        shift: sh,
-                    };
+                    let u = to_idx(at(&ptr_row, j, NONE_U32));
+                    set(
+                        pattern,
+                        u,
+                        SelPattern::MemScaledIdx {
+                            base: base.0,
+                            idx: idx.0,
+                            shift: sh,
+                        },
+                    );
                 }
-                skip_inst[pi] = true;
-                use_count[base.index()] = use_count[base.index()].saturating_add(k_u32 - 1);
-                use_count[bi] = use_count[bi].saturating_sub(1);
-                if use_count[bi] == 0 {
-                    skip_inst[bi] = true;
-                    use_count[idx.index()] = use_count[idx.index()].saturating_add(k_u32 - 1);
-                    use_count[c_val.index()] = use_count[c_val.index()].saturating_sub(1);
+                set(skip_inst, pi, true);
+                sat_inc_u32(use_count, base.index(), k_u32 - 1);
+                sat_dec_u32(use_count, bi, 1);
+                if at(use_count, bi, 0) == 0 {
+                    set(skip_inst, bi, true);
+                    sat_inc_u32(use_count, idx.index(), k_u32 - 1);
+                    sat_dec_u32(use_count, c_val.index(), 1);
                 } else {
-                    use_count[idx.index()] = use_count[idx.index()].saturating_add(k_u32);
+                    sat_inc_u32(use_count, idx.index(), k_u32);
                 }
             } else {
                 for j in 0..k {
-                    let u = to_idx(ptr_uses[pi][j]);
-                    pattern[u] = SelPattern::MemScaledIdx {
-                        base: base.0,
-                        idx: by.0,
-                        shift: 0,
-                    };
+                    let u = to_idx(at(&ptr_row, j, NONE_U32));
+                    set(
+                        pattern,
+                        u,
+                        SelPattern::MemScaledIdx {
+                            base: base.0,
+                            idx: by.0,
+                            shift: 0,
+                        },
+                    );
                 }
-                skip_inst[pi] = true;
-                use_count[base.index()] = use_count[base.index()].saturating_add(k_u32 - 1);
-                use_count[by.index()] = use_count[by.index()].saturating_add(k_u32 - 1);
+                set(skip_inst, pi, true);
+                sat_inc_u32(use_count, base.index(), k_u32 - 1);
+                sat_inc_u32(use_count, by.index(), k_u32 - 1);
             }
         }
     }
@@ -7522,17 +7587,20 @@ fn match_patterns(
 
     // Helper closure: true iff producer `p` is single-use, same-block, and not already skipped.
     let can_fold = |p: usize, cur_b: u32, skip: &[bool]| -> bool {
-        p < n && use_count[p] == 1 && inst_block[p] == cur_b && !skip[p]
+        p < n
+            && use_count.get(p) == Some(&1)
+            && inst_block.get(p) == Some(&cur_b)
+            && skip.get(p) == Some(&false)
     };
 
     // Pass B2: Match ALU & standalone `PtrAdd` fusions in forward order.
     for inst in 0..n {
-        if skip_inst[inst] {
+        if at(skip_inst, inst, false) {
             continue;
         }
-        let b = inst_block[inst];
+        let b = at(inst_block, inst, 0);
         let op = view.op(inst);
-        let res_ty = Ty(view.tys[inst]);
+        let res_ty = ty_at(view, inst);
         let bits = int_bits(res_ty);
 
         match op {
@@ -7549,8 +7617,8 @@ fn match_patterns(
                         let mut mo = view.operands(mi);
                         let ma = mo.value();
                         let mb = mo.value();
-                        pattern[inst] = SelPattern::Madd { a: ma.0, b: mb.0, acc: acc.0 };
-                        skip_inst[mi] = true;
+                        set(pattern, inst, SelPattern::Madd { a: ma.0, b: mb.0, acc: acc.0 });
+                        set(skip_inst, mi, true);
                         matched = true;
                         break;
                     }
@@ -7563,8 +7631,8 @@ fn match_patterns(
                     if let Some((src, sh)) =
                         match_shifted_operand(view, s_cand, bits, b, const_u64, use_count, inst_block, skip_inst)
                     {
-                        pattern[inst] = SelPattern::ShiftedBin { lhs: other.0, rhs: src.0, shift: sh };
-                        skip_inst[s_cand.index()] = true;
+                        set(pattern, inst, SelPattern::ShiftedBin { lhs: other.0, rhs: src.0, shift: sh });
+                        set(skip_inst, s_cand.index(), true);
                         matched = true;
                         break;
                     }
@@ -7575,14 +7643,14 @@ fn match_patterns(
                 // 3. `Add(a, Zext/Sext(b))` (64-bit, commutative) -> `AddExt`!
                 if bits == 64 {
                     for (e_cand, other) in [(rhs, lhs), (lhs, rhs)] {
-                        if const_u64[other.index()].is_some() {
+                        if at(const_u64, other.index(), None).is_some() {
                             continue;
                         }
                         if let Some((src, ext)) =
                             match_ext_operand(view, e_cand, b, use_count, inst_block, skip_inst)
                         {
-                            pattern[inst] = SelPattern::ExtAddSub { lhs: other.0, rhs: src.0, ext };
-                            skip_inst[e_cand.index()] = true;
+                            set(pattern, inst, SelPattern::ExtAddSub { lhs: other.0, rhs: src.0, ext });
+                            set(skip_inst, e_cand.index(), true);
                             break;
                         }
                     }
@@ -7599,26 +7667,26 @@ fn match_patterns(
                     let mut mo = view.operands(ri);
                     let ma = mo.value();
                     let mb = mo.value();
-                    pattern[inst] = SelPattern::Msub { a: ma.0, b: mb.0, acc: lhs.0 };
-                    skip_inst[ri] = true;
+                    set(pattern, inst, SelPattern::Msub { a: ma.0, b: mb.0, acc: lhs.0 });
+                    set(skip_inst, ri, true);
                     continue;
                 }
                 // 2. `Sub(a, Shl/Lshr/Ashr(b, k))` -> shifted `SubReg`!
                 if let Some((src, sh)) =
                     match_shifted_operand(view, rhs, bits, b, const_u64, use_count, inst_block, skip_inst)
                 {
-                    pattern[inst] = SelPattern::ShiftedBin { lhs: lhs.0, rhs: src.0, shift: sh };
-                    skip_inst[ri] = true;
+                    set(pattern, inst, SelPattern::ShiftedBin { lhs: lhs.0, rhs: src.0, shift: sh });
+                    set(skip_inst, ri, true);
                     continue;
                 }
                 // 3. `Sub(a, Zext/Sext(b))` (64-bit) -> `SubExt`!
                 if bits == 64
-                    && const_u64[lhs.index()].is_none()
+                    && at(const_u64, lhs.index(), None).is_none()
                     && let Some((src, ext)) =
                         match_ext_operand(view, rhs, b, use_count, inst_block, skip_inst)
                 {
-                    pattern[inst] = SelPattern::ExtAddSub { lhs: lhs.0, rhs: src.0, ext };
-                    skip_inst[ri] = true;
+                    set(pattern, inst, SelPattern::ExtAddSub { lhs: lhs.0, rhs: src.0, ext });
+                    set(skip_inst, ri, true);
                 }
             }
 
@@ -7630,8 +7698,8 @@ fn match_patterns(
                     && let Some((src, sh)) =
                         match_shifted_operand(view, by, 64, b, const_u64, use_count, inst_block, skip_inst)
                 {
-                    pattern[inst] = SelPattern::ShiftedBin { lhs: ptr.0, rhs: src.0, shift: sh };
-                    skip_inst[by.index()] = true;
+                    set(pattern, inst, SelPattern::ShiftedBin { lhs: ptr.0, rhs: src.0, shift: sh });
+                    set(skip_inst, by.index(), true);
                 }
             }
 
@@ -7647,7 +7715,7 @@ fn match_patterns(
                         let si = sh_cand.index();
                         if view.op(si) == Op::Lshr
                             && can_fold(si, b, skip_inst)
-                            && let Some(mask_c) = const_u64[mask_cand.index()]
+                            && let Some(mask_c) = at(const_u64, mask_cand.index(), None)
                         {
                             let m = mask_c & bit_mask(bits);
                             if m != 0 && (m & (m.wrapping_add(1))) == 0 {
@@ -7655,15 +7723,19 @@ fn match_patterns(
                                 let mut so = view.operands(si);
                                 let x = so.value();
                                 let sh_v = so.value();
-                                if let Some(s_c) = const_u64[sh_v.index()] {
+                                if let Some(s_c) = at(const_u64, sh_v.index(), None) {
                                     let s = trunc_u32(s_c) & (bits - 1);
                                     if s + w <= bits {
-                                        pattern[inst] = SelPattern::Ubfx {
-                                            x: x.0,
-                                            immr: u8_of(s).unwrap_or(0),
-                                            imms: u8_of(s + w - 1).unwrap_or(0),
-                                        };
-                                        skip_inst[si] = true;
+                                        set(
+                                            pattern,
+                                            inst,
+                                            SelPattern::Ubfx {
+                                                x: x.0,
+                                                immr: u8_of(s).unwrap_or(0),
+                                                imms: u8_of(s + w - 1).unwrap_or(0),
+                                            },
+                                        );
+                                        set(skip_inst, si, true);
                                         matched_ubfx = true;
                                         break;
                                     }
@@ -7682,8 +7754,8 @@ fn match_patterns(
                     let ni = n_cand.index();
                     if view.op(ni) == Op::Not && can_fold(ni, b, skip_inst) {
                         let inner = view.operands(ni).value();
-                        pattern[inst] = SelPattern::LogicalNot { lhs: other.0, rhs: inner.0 };
-                        skip_inst[ni] = true;
+                        set(pattern, inst, SelPattern::LogicalNot { lhs: other.0, rhs: inner.0 });
+                        set(skip_inst, ni, true);
                         matched_not = true;
                         break;
                     }
@@ -7697,8 +7769,8 @@ fn match_patterns(
                     if let Some((src, sh)) =
                         match_shifted_operand(view, s_cand, bits, b, const_u64, use_count, inst_block, skip_inst)
                     {
-                        pattern[inst] = SelPattern::ShiftedBin { lhs: other.0, rhs: src.0, shift: sh };
-                        skip_inst[s_cand.index()] = true;
+                        set(pattern, inst, SelPattern::ShiftedBin { lhs: other.0, rhs: src.0, shift: sh });
+                        set(skip_inst, s_cand.index(), true);
                         break;
                     }
                 }
@@ -7712,10 +7784,10 @@ fn match_patterns(
     // (`Tbz`/`Tbnz` for single-bit masks, `TstImm` + `BCond`/`Csel` for general logical bitmasks)
     // and mark the dead `And` skipped so neither `and` nor an extra temp register is emitted!
     for inst in 0..n {
-        if skip_inst[inst] || view.op(inst) != Op::Icmp {
+        if at(skip_inst, inst, false) || view.op(inst) != Op::Icmp {
             continue;
         }
-        let b = inst_block[inst];
+        let b = at(inst_block, inst, 0);
         let mut o = view.operands(inst);
         let ic = o.int_cond();
         if !matches!(ic, IntCond::Eq | IntCond::Ne) {
@@ -7723,10 +7795,10 @@ fn match_patterns(
         }
         let mut a = o.value();
         let mut bv = o.value();
-        if const_u64[a.index()].is_some() && const_u64[bv.index()].is_none() {
+        if at(const_u64, a.index(), None).is_some() && at(const_u64, bv.index(), None).is_none() {
             core::mem::swap(&mut a, &mut bv);
         }
-        if const_u64[bv.index()] != Some(0) {
+        if at(const_u64, bv.index(), None) != Some(0) {
             continue;
         }
         let ai = a.index();
@@ -7734,30 +7806,30 @@ fn match_patterns(
         if op_bits < 8
             || ai >= n
             || view.op(ai) != Op::And
-            || inst_block[ai] != b
-            || use_count[ai] != 1
-            || skip_inst[ai]
-            || pattern[ai] != SelPattern::None
+            || inst_block.get(ai) != Some(&b)
+            || use_count.get(ai) != Some(&1)
+            || at(skip_inst, ai, true)
+            || at(pattern, ai, SelPattern::None) != SelPattern::None
         {
             continue;
         }
         let mut ao = view.operands(ai);
         let mut x = ao.value();
         let mut y = ao.value();
-        if const_u64[x.index()].is_some() && const_u64[y.index()].is_none() {
+        if at(const_u64, x.index(), None).is_some() && at(const_u64, y.index(), None).is_none() {
             core::mem::swap(&mut x, &mut y);
         }
-        if const_u64[x.index()].is_some() || skip_inst[x.index()] {
+        if at(const_u64, x.index(), None).is_some() || at(skip_inst, x.index(), true) {
             continue;
         }
-        let Some(mask_c) = const_u64[y.index()] else {
+        let Some(mask_c) = at(const_u64, y.index(), None) else {
             continue;
         };
         let m = mask_c & bit_mask(op_bits);
         let cmp_w = if op_bits == 64 { 64 } else { 32 };
         if enc::logical_imm(m, cmp_w).is_some() {
-            pattern[inst] = SelPattern::IcmpTstImm { x: x.0, mask_val: y.0 };
-            skip_inst[ai] = true;
+            set(pattern, inst, SelPattern::IcmpTstImm { x: x.0, mask_val: y.0 });
+            set(skip_inst, ai, true);
         }
     }
 }
@@ -7773,7 +7845,11 @@ fn match_shifted_operand(
     skip_inst: &[bool],
 ) -> Option<(Value, MShift)> {
     let ci = cand.index();
-    if ci >= view.len() || use_count[ci] != 1 || inst_block[ci] != cur_b || skip_inst[ci] {
+    if ci >= view.len()
+        || use_count.get(ci) != Some(&1)
+        || inst_block.get(ci) != Some(&cur_b)
+        || skip_inst.get(ci) != Some(&false)
+    {
         return None;
     }
     let sop = view.op(ci);
@@ -7783,7 +7859,7 @@ fn match_shifted_operand(
     let mut o = view.operands(ci);
     let src = o.value();
     let amt_v = o.value();
-    let k = const_u64[amt_v.index()]?;
+    let k = at(const_u64, amt_v.index(), None)?;
     let amt = u8_of(trunc_u32(k) & (bits - 1))?;
     let shift = match sop {
         Op::Shl => MShift::Lsl(amt),
@@ -7802,7 +7878,11 @@ fn match_ext_operand(
     skip_inst: &[bool],
 ) -> Option<(Value, MExt)> {
     let ci = cand.index();
-    if ci >= view.len() || use_count[ci] != 1 || inst_block[ci] != cur_b || skip_inst[ci] {
+    if ci >= view.len()
+        || use_count.get(ci) != Some(&1)
+        || inst_block.get(ci) != Some(&cur_b)
+        || skip_inst.get(ci) != Some(&false)
+    {
         return None;
     }
     match view.op(ci) {
@@ -7909,7 +7989,7 @@ fn select_mfunc_ssa<'a>(
     for b in 0..n_blocks {
         let b_u32 = u32_of(b).unwrap_or(0);
         for inst in view.block(Block(b_u32)) {
-            inst_block[inst] = b_u32;
+            set(&mut inst_block, inst, b_u32);
         }
     }
 
@@ -7918,7 +7998,7 @@ fn select_mfunc_ssa<'a>(
     let mut skip_inst = vec_filled(n_insts, false, alloc);
     for inst in 0..n_insts {
         let op = view.op(inst);
-        let ty = Ty(view.tys[inst]);
+        let ty = ty_at(view, inst);
         let mut o = view.operands(inst);
         match op {
             Op::Iconst => {
@@ -7929,31 +8009,31 @@ fn select_mfunc_ssa<'a>(
                 } else {
                     u64::from(raw) & bit_mask(bits)
                 };
-                const_u64[inst] = Some(val);
-                skip_inst[inst] = true;
+                set(&mut const_u64, inst, Some(val));
+                set(&mut skip_inst, inst, true);
             }
             Op::IconstWide => {
                 let words = o.constant();
                 let val = u64::from(words[0]) | (u64::from(words[1]) << 32);
-                const_u64[inst] = Some(val);
-                skip_inst[inst] = true;
+                set(&mut const_u64, inst, Some(val));
+                set(&mut skip_inst, inst, true);
             }
             Op::Null => {
-                const_u64[inst] = Some(0);
-                skip_inst[inst] = true;
+                set(&mut const_u64, inst, Some(0));
+                set(&mut skip_inst, inst, true);
             }
             Op::Fconst => {
-                const_fp_bits[inst] = Some(u64::from(o.imm()));
-                skip_inst[inst] = true;
+                set(&mut const_fp_bits, inst, Some(u64::from(o.imm())));
+                set(&mut skip_inst, inst, true);
             }
             Op::FconstWide => {
                 let words = o.constant();
                 let bits = u64::from(words[0]) | (u64::from(words[1]) << 32);
-                const_fp_bits[inst] = Some(bits);
-                skip_inst[inst] = true;
+                set(&mut const_fp_bits, inst, Some(bits));
+                set(&mut skip_inst, inst, true);
             }
             Op::Uninit => {
-                skip_inst[inst] = true;
+                set(&mut skip_inst, inst, true);
             }
             _ => {}
         }
@@ -8012,7 +8092,7 @@ fn select_mfunc_ssa<'a>(
             has_landing_blocks = true;
         }
         if matches!(kind, BlockKind::Cleanup | BlockKind::Terminate) {
-            is_cleanup_block[b] = true;
+            set(&mut is_cleanup_block, b, true);
             cleanup_work.push(blk);
         }
     }
@@ -8021,8 +8101,8 @@ fn select_mfunc_ssa<'a>(
         let mut o = view.operands(term);
         let mut push_next = |next: Block| {
             let nb = next.index();
-            if nb < n_blocks && !is_cleanup_block[nb] {
-                is_cleanup_block[nb] = true;
+            if nb < n_blocks && !at(&is_cleanup_block, nb, true) {
+                set(&mut is_cleanup_block, nb, true);
                 cleanup_work.push(next);
             }
         };
@@ -8058,7 +8138,7 @@ fn select_mfunc_ssa<'a>(
     let mut next_unreach: u32 = 0;
     for i in 0..view.len() {
         if view.op(i) == Op::Unreachable {
-            unreach_ord[i] = next_unreach;
+            set(&mut unreach_ord, i, next_unreach);
             next_unreach = next_unreach.saturating_add(1);
         }
     }
@@ -8113,7 +8193,7 @@ fn select_mfunc_ssa<'a>(
         // Pre-allocate one SSA `VReg` per LIR `Op::Param`.
         let b_u32 = u32_of(b).unwrap_or(0);
         for p_inst in view.params(Block(b_u32)) {
-            let ty = Ty(view.tys[p_inst]);
+            let ty = ty_at(view, p_inst);
             let _ = sel.alloc_res_vreg(p_inst, ty);
         }
     }
@@ -8122,9 +8202,11 @@ fn select_mfunc_ssa<'a>(
     let mut scratch_pairs: Vec<(MReg, MReg), Alloc<'a>> = Vec::new_in(alloc);
     let n_ord = layout.order.len();
     for ord_idx in 0..n_ord {
-        let lir_b = layout.order[ord_idx];
+        let Some(&lir_b) = layout.order.get(ord_idx) else {
+            continue;
+        };
         let next_lir = layout.order.get(ord_idx + 1).copied();
-        let entry_mblk = sel.mblock_of_lir[lir_b];
+        let entry_mblk = at(&sel.mblock_of_lir, lir_b, MBlock(0));
         sel.cur_blk = entry_mblk;
         sel.cur_lir_blk = u32_of(lir_b).unwrap_or(0);
         sel.cur_weight = mra_weight_for_lir_block(layout, lir_b);
@@ -8143,10 +8225,10 @@ fn select_mfunc_ssa<'a>(
                 let Some(loc) = walk.next_param(p_rec) else {
                     return Err(refuse(Some(p_inst), "entry param placement overflow"));
                 };
-                if sel.use_count[p_inst] == 0 {
+                if at(&sel.use_count, p_inst, 0) == 0 {
                     continue;
                 }
-                let dst_v = VReg(sel.val_vreg[p_inst]);
+                let dst_v = VReg(at(&sel.val_vreg, p_inst, NONE_U32));
                 match loc {
                     AbiLoc::Gpr(r) => {
                         let bits = int_bits(ty);
@@ -8219,8 +8301,8 @@ fn select_mfunc_ssa<'a>(
             let params = view.params(Block(b_u32));
             if params.len() == 1 {
                 let p_inst = params.start;
-                if sel.use_count[p_inst] > 0 {
-                    let dst_v = VReg(sel.val_vreg[p_inst]);
+                if at(&sel.use_count, p_inst, 0) > 0 {
+                    let dst_v = VReg(at(&sel.val_vreg, p_inst, NONE_U32));
                     sel.mfunc.push_parallel_copy(&[(MReg::V(dst_v), MReg::gpr(0))], MInstFlags::NONE);
                 }
             }
@@ -8238,8 +8320,12 @@ fn select_mfunc_ssa<'a>(
             // folds away or empties the landing pad target.
             let lp_range = sel.mfunc.block_inst_range(entry_mblk);
             for mi in lp_range {
-                if !matches!(sel.mfunc.ops[mi], MOp::ParallelCopy { .. }) {
-                    sel.mfunc.flags[mi] = sel.mfunc.flags[mi].union(MInstFlags::PINNED);
+                if let Some(&op) = sel.mfunc.ops.get(mi)
+                    && !matches!(op, MOp::ParallelCopy { .. })
+                {
+                    if let Some(fl) = sel.mfunc.flags.get_mut(mi) {
+                        *fl = fl.union(MInstFlags::PINNED);
+                    }
                     break;
                 }
             }
@@ -8249,7 +8335,9 @@ fn select_mfunc_ssa<'a>(
     // 6. Emit deferred non-fallthrough `Br` edge-split blocks at the tail.
     let n_splits = sel.deferred_splits.len();
     for si in 0..n_splits {
-        let sp = sel.deferred_splits[si];
+        let Some(&sp) = sel.deferred_splits.get(si) else {
+            continue;
+        };
         sel.mfunc.begin_block(sp.split_blk);
         let ps = to_idx(sp.copy_start);
         let pe = ps.saturating_add(usize::from(sp.copy_len)).min(sel.deferred_pairs.len());
@@ -8257,8 +8345,9 @@ fn select_mfunc_ssa<'a>(
             let start = u32_of(sel.mfunc.copy_pairs.len()).unwrap_or(u32::MAX);
             let len = u16::try_from(pe - ps).unwrap_or(u16::MAX);
             for k in ps..ps + usize::from(len) {
-                let pair = sel.deferred_pairs[k];
-                sel.mfunc.copy_pairs.push(pair);
+                if let Some(&pair) = sel.deferred_pairs.get(k) {
+                    sel.mfunc.copy_pairs.push(pair);
+                }
             }
             sel.mfunc.push_inst(MOp::ParallelCopy { start, len }, MInstFlags::NONE);
         }
@@ -8380,8 +8469,8 @@ fn add_unwind_cfg_edges<'a>(
         for &s in func.block_succs(MBlock(b_u32)) {
             let si = to_idx(s.0);
             if si < n_blocks {
-                succ_counts[b] = succ_counts[b].saturating_add(1);
-                pred_counts[si] = pred_counts[si].saturating_add(1);
+                sat_inc_u32(&mut succ_counts, b, 1);
+                sat_inc_u32(&mut pred_counts, si, 1);
             }
         }
     }
@@ -8389,8 +8478,8 @@ fn add_unwind_cfg_edges<'a>(
         let bi = to_idx(src);
         let di = to_idx(dst);
         if bi < n_blocks && di < n_blocks {
-            succ_counts[bi] = succ_counts[bi].saturating_add(1);
-            pred_counts[di] = pred_counts[di].saturating_add(1);
+            sat_inc_u32(&mut succ_counts, bi, 1);
+            sat_inc_u32(&mut pred_counts, di, 1);
         }
     }
 
@@ -8401,8 +8490,8 @@ fn add_unwind_cfg_edges<'a>(
     for b in 0..n_blocks {
         succ_off.push(s_total);
         pred_off.push(p_total);
-        s_total = s_total.saturating_add(succ_counts[b]);
-        p_total = p_total.saturating_add(pred_counts[b]);
+        s_total = s_total.saturating_add(at(&succ_counts, b, 0));
+        p_total = p_total.saturating_add(at(&pred_counts, b, 0));
     }
     succ_off.push(s_total);
     pred_off.push(p_total);
@@ -8410,8 +8499,8 @@ fn add_unwind_cfg_edges<'a>(
     let mut succ_cur = vec_filled(n_blocks, 0u32, alloc);
     let mut pred_cur = vec_filled(n_blocks, 0u32, alloc);
     for b in 0..n_blocks {
-        succ_cur[b] = succ_off[b];
-        pred_cur[b] = pred_off[b];
+        set(&mut succ_cur, b, at(&succ_off, b, 0));
+        set(&mut pred_cur, b, at(&pred_off, b, 0));
     }
 
     let mut succ_data = vec_filled(to_idx(s_total), MBlock(0), alloc);
@@ -8425,15 +8514,15 @@ fn add_unwind_cfg_edges<'a>(
         for &dst_blk in func.block_succs(src_blk) {
             let di = to_idx(dst_blk.0);
             if di < n_blocks {
-                let sp = to_idx(succ_cur[b]);
+                let sp = to_idx(at(&succ_cur, b, 0));
                 if sp < succ_data.len() {
-                    succ_data[sp] = dst_blk;
-                    succ_cur[b] = succ_cur[b].saturating_add(1);
+                    set(&mut succ_data, sp, dst_blk);
+                    sat_inc_u32(&mut succ_cur, b, 1);
                 }
-                let pp = to_idx(pred_cur[di]);
+                let pp = to_idx(at(&pred_cur, di, 0));
                 if pp < pred_data.len() {
-                    pred_data[pp] = src_blk;
-                    pred_cur[di] = pred_cur[di].saturating_add(1);
+                    set(&mut pred_data, pp, src_blk);
+                    sat_inc_u32(&mut pred_cur, di, 1);
                 }
             }
         }
@@ -8442,15 +8531,15 @@ fn add_unwind_cfg_edges<'a>(
         let bi = to_idx(src);
         let di = to_idx(dst);
         if bi < n_blocks && di < n_blocks {
-            let sp = to_idx(succ_cur[bi]);
+            let sp = to_idx(at(&succ_cur, bi, 0));
             if sp < succ_data.len() {
-                succ_data[sp] = MBlock(dst);
-                succ_cur[bi] = succ_cur[bi].saturating_add(1);
+                set(&mut succ_data, sp, MBlock(dst));
+                sat_inc_u32(&mut succ_cur, bi, 1);
             }
-            let pp = to_idx(pred_cur[di]);
+            let pp = to_idx(at(&pred_cur, di, 0));
             if pp < pred_data.len() {
-                pred_data[pp] = MBlock(src);
-                pred_cur[di] = pred_cur[di].saturating_add(1);
+                set(&mut pred_data, pp, MBlock(src));
+                sat_inc_u32(&mut pred_cur, di, 1);
             }
         }
     }
@@ -8476,8 +8565,8 @@ fn bind_call_clobbers<'a>(
     for &blk in func.block_order.iter() {
         let range = func.block_inst_range(blk);
         for i in range {
-            let is_call = func.flags[i].contains(MInstFlags::CALL)
-                || matches!(func.ops[i], MOp::Bl | MOp::Blr { .. });
+            let is_call = func.flags.get(i).is_some_and(|fl| fl.contains(MInstFlags::CALL))
+                || func.ops.get(i).is_some_and(|op| matches!(op, MOp::Bl | MOp::Blr { .. }));
             if is_call {
                 let mut clob = call_clobbers_seq
                     .get(seq_idx)
@@ -8851,19 +8940,15 @@ fn insert_prologue_epilogue<'a>(
     };
 
     let mut gi = 0usize;
-    while gi + 1 < gprs_to_save.len() {
-        save_entries.push(SaveEntry::GprPair {
-            r0: gprs_to_save[gi],
-            r1: gprs_to_save[gi + 1],
-            off: cursor,
-        });
+    while let (Some(&r0), Some(&r1)) = (gprs_to_save.get(gi), gprs_to_save.get(gi + 1)) {
+        save_entries.push(SaveEntry::GprPair { r0, r1, off: cursor });
         cursor = cursor
             .checked_add(16)
             .ok_or(TierError::TooLarge { tier: TIER, what: "stack frame" })?;
         gi += 2;
     }
-    if gi < gprs_to_save.len() {
-        save_entries.push(SaveEntry::GprSingle { r: gprs_to_save[gi], off: cursor });
+    if let Some(&r) = gprs_to_save.get(gi) {
+        save_entries.push(SaveEntry::GprSingle { r, off: cursor });
         cursor = cursor
             .checked_add(8)
             .ok_or(TierError::TooLarge { tier: TIER, what: "stack frame" })?;
@@ -8875,24 +8960,15 @@ fn insert_prologue_epilogue<'a>(
         cursor = align_up_u32(cursor, fp_align)
             .ok_or(TierError::TooLarge { tier: TIER, what: "stack frame" })?;
         let mut fi = 0usize;
-        while fi + 1 < fps_to_save.len() {
-            save_entries.push(SaveEntry::FpPair {
-                v0: fps_to_save[fi],
-                v1: fps_to_save[fi + 1],
-                off: cursor,
-                size: fp_save_size,
-            });
+        while let (Some(&v0), Some(&v1)) = (fps_to_save.get(fi), fps_to_save.get(fi + 1)) {
+            save_entries.push(SaveEntry::FpPair { v0, v1, off: cursor, size: fp_save_size });
             cursor = cursor
                 .checked_add(fp_align.saturating_mul(2))
                 .ok_or(TierError::TooLarge { tier: TIER, what: "stack frame" })?;
             fi += 2;
         }
-        if fi < fps_to_save.len() {
-            save_entries.push(SaveEntry::FpSingle {
-                v: fps_to_save[fi],
-                off: cursor,
-                size: fp_save_size,
-            });
+        if let Some(&v) = fps_to_save.get(fi) {
+            save_entries.push(SaveEntry::FpSingle { v, off: cursor, size: fp_save_size });
             cursor = cursor
                 .checked_add(fp_align)
                 .ok_or(TierError::TooLarge { tier: TIER, what: "stack frame" })?;
@@ -8954,19 +9030,15 @@ fn insert_prologue_epilogue<'a>(
                 }
             }
             let mut gi = 0usize;
-            while gi + 1 < extra_gprs.len() {
-                cold_save_entries.push(SaveEntry::GprPair {
-                    r0: extra_gprs[gi],
-                    r1: extra_gprs[gi + 1],
-                    off: cold_cursor,
-                });
+            while let (Some(&r0), Some(&r1)) = (extra_gprs.get(gi), extra_gprs.get(gi + 1)) {
+                cold_save_entries.push(SaveEntry::GprPair { r0, r1, off: cold_cursor });
                 cold_cursor = cold_cursor
                     .checked_add(16)
                     .ok_or(TierError::TooLarge { tier: TIER, what: "stack frame" })?;
                 gi += 2;
             }
-            if gi < extra_gprs.len() {
-                cold_save_entries.push(SaveEntry::GprSingle { r: extra_gprs[gi], off: cold_cursor });
+            if let Some(&r) = extra_gprs.get(gi) {
+                cold_save_entries.push(SaveEntry::GprSingle { r, off: cold_cursor });
                 cold_cursor = cold_cursor
                     .checked_add(8)
                     .ok_or(TierError::TooLarge { tier: TIER, what: "stack frame" })?;
@@ -8975,9 +9047,7 @@ fn insert_prologue_epilogue<'a>(
                 cold_cursor = align_up_u32(cold_cursor, 16)
                     .ok_or(TierError::TooLarge { tier: TIER, what: "stack frame" })?;
                 let mut fi = 0usize;
-                while fi + 1 < fps_to_save.len() {
-                    let v0 = fps_to_save[fi];
-                    let v1 = fps_to_save[fi + 1];
+                while let (Some(&v0), Some(&v1)) = (fps_to_save.get(fi), fps_to_save.get(fi + 1)) {
                     canonical_saved_fp_mask |= (1u32 << u32::from(v0)) | (1u32 << u32::from(v1));
                     cold_save_entries.push(SaveEntry::FpPair {
                         v0,
@@ -8990,8 +9060,7 @@ fn insert_prologue_epilogue<'a>(
                         .ok_or(TierError::TooLarge { tier: TIER, what: "stack frame" })?;
                     fi += 2;
                 }
-                if fi < fps_to_save.len() {
-                    let v = fps_to_save[fi];
+                if let Some(&v) = fps_to_save.get(fi) {
                     canonical_saved_fp_mask |= 1u32 << u32::from(v);
                     cold_save_entries.push(SaveEntry::FpSingle {
                         v,
@@ -9110,15 +9179,17 @@ fn insert_prologue_epilogue<'a>(
 
             let range = func.block_inst_range(blk);
             for i in range {
-                let op = func.ops[i];
-                let fl = func.flags[i];
-                let vdef = func.vflag_def[i];
-                let vuse = func.vflag_use[i];
-                let note = func.note_idx[i];
+                let Some(&op) = func.ops.get(i) else {
+                    continue;
+                };
+                let fl = at(&func.flags, i, MInstFlags::NONE);
+                let vdef = at(&func.vflag_def, i, NO_VFLAG);
+                let vuse = at(&func.vflag_use, i, NO_VFLAG);
+                let note = at(&func.note_idx, i, NO_NOTE);
 
                 if ord_pos == 0
-                    && patched_stack_params < incoming_stack_params.len()
                     && fl.contains(MInstFlags::PINNED)
+                    && let Some(&param) = incoming_stack_params.get(patched_stack_params)
                     && let MOp::Ldr {
                         dst,
                         addr: AddrMode::BaseOff { base: MReg::P(PReg::Sp), off: 0 },
@@ -9126,7 +9197,6 @@ fn insert_prologue_epilogue<'a>(
                         signed: false,
                     } = op
                 {
-                    let param = incoming_stack_params[patched_stack_params];
                     if param.size == size {
                         let abs_off = total_drop
                             .checked_add(param.caller_off)
@@ -9284,16 +9354,18 @@ fn insert_prologue_epilogue<'a>(
 
         let range = func.block_inst_range(blk);
         for i in range {
-            let op = func.ops[i];
-            let fl = func.flags[i];
-            let vdef = func.vflag_def[i];
-            let vuse = func.vflag_use[i];
-            let note = func.note_idx[i];
+            let Some(&op) = func.ops.get(i) else {
+                continue;
+            };
+            let fl = at(&func.flags, i, MInstFlags::NONE);
+            let vdef = at(&func.vflag_def, i, NO_VFLAG);
+            let vuse = at(&func.vflag_use, i, NO_VFLAG);
+            let note = at(&func.note_idx, i, NO_NOTE);
 
             // Patch incoming stacked-parameter placeholder loads in entry block.
             if ord_pos == 0
-                && patched_stack_params < incoming_stack_params.len()
                 && fl.contains(MInstFlags::PINNED)
+                && let Some(&param) = incoming_stack_params.get(patched_stack_params)
                 && let MOp::Ldr {
                     dst,
                     addr: AddrMode::BaseOff { base: MReg::P(PReg::Sp), off: 0 },
@@ -9301,7 +9373,6 @@ fn insert_prologue_epilogue<'a>(
                     signed: false,
                 } = op
             {
-                let param = incoming_stack_params[patched_stack_params];
                 if param.size == size {
                     let abs_off = frame_size
                         .checked_add(param.caller_off)
