@@ -2342,7 +2342,7 @@ impl MakeFail {
             MakeFail::Tables(error) => CheckFail::Tables { owner, error },
             MakeFail::Question(error) => CheckFail::ImplQuestion { owner, error },
             MakeFail::Const(key, error) => CheckFail::Const { owner, key, shown: lib_shown(r, key), error: Box::new_in(error, Global) },
-            MakeFail::Hidden(error) => super::opaque_auto::gap(owner, error),
+            MakeFail::Hidden(error) => super::opaque_auto::into_check_fail(r, owner, error),
         }
     }
 }
