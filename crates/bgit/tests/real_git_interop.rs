@@ -441,3 +441,73 @@ fn bgit_worktree_auto_merges_tracked_updates_on_fs_and_auto_deletes_on_merge() {
 
     let _ = fs::remove_dir_all(&base);
 }
+
+#[test]
+fn plain_git_merge_auto_updates_tracking_worktree_and_deletes_merged_worktree_without_sync_or_watch() {
+    let base = std::env::temp_dir().join(format!("bgit-githook-test-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    let repo = base.join("repo");
+    let wt_a = base.join("wt-a");
+    let wt_b = base.join("wt-b");
+    let wt_c = base.join("wt-c");
+    fs::create_dir_all(&repo).unwrap();
+
+    run_git(&repo, &["init", "-b", "main"]);
+    fs::write(repo.join("shared.txt"), "line1\nline2\nline3\nline4\nline5\n").unwrap();
+    run_git(&repo, &["add", "."]);
+    run_git(&repo, &["commit", "-m", "initial"]);
+
+    run_git(&repo, &["checkout", "-b", "feat-a"]);
+    fs::write(repo.join("shared.txt"), "line1\nline2\nline3\nline4\nline5_via_git_merge\n").unwrap();
+    fs::write(repo.join("from_a.txt"), "merged via plain git!\n").unwrap();
+    run_git(&repo, &["add", "."]);
+    run_git(&repo, &["commit", "-m", "feat-a commit"]);
+
+    run_git(&repo, &["checkout", "-b", "feat-c", "main"]);
+    fs::write(repo.join("only_c.txt"), "divergent commit on feat-c\n").unwrap();
+    run_git(&repo, &["add", "."]);
+    run_git(&repo, &["commit", "-m", "feat-c commit"]);
+
+    run_git(&repo, &["checkout", "main"]);
+    run_bgit(&["infect", repo.to_str().unwrap()]);
+    run_bgit(&["worktree", "add", repo.to_str().unwrap(), wt_a.to_str().unwrap(), "feat-a", "--track", "main"]);
+    run_bgit(&["worktree", "add", repo.to_str().unwrap(), wt_b.to_str().unwrap(), "feat-b", "--track", "main"]);
+    run_bgit(&["worktree", "add", repo.to_str().unwrap(), wt_c.to_str().unwrap(), "feat-c", "--track", "main"]);
+
+    // Make live uncommitted edits on line 1 of `shared.txt` in BOTH `wt-b` (FF case) and `wt-c` (divergent 3-way AutoMerge case).
+    fs::write(wt_b.join("shared.txt"), "line1_local_in_wt_b\nline2\nline3\nline4\nline5\n").unwrap();
+    fs::write(wt_c.join("shared.txt"), "line1_local_in_wt_c\nline2\nline3\nline4\nline5\n").unwrap();
+
+    // Run PLAIN `git merge feat-a` — ZERO `bgit wt sync`, ZERO `bgit wt watch`!
+    run_git(&repo, &["merge", "feat-a"]);
+
+    // 1. `wt-a` (fast-forward merged into main) must be auto-deleted!
+    assert!(!wt_a.exists(), "plain `git merge feat-a` must auto-delete merged worktree wt-a");
+    // 2. `wt-b` (tracking main, no commits yet) must fast-forward & 3-way merge live edit!
+    assert!(wt_b.exists(), "active worktree wt-b must remain");
+    assert_eq!(fs::read_to_string(wt_b.join("from_a.txt")).unwrap(), "merged via plain git!\n");
+    assert_eq!(
+        fs::read_to_string(wt_b.join("shared.txt")).unwrap(),
+        "line1_local_in_wt_b\nline2\nline3\nline4\nline5_via_git_merge\n",
+        "plain `git merge` hook must auto-merge main into wt-b's live filesystem!"
+    );
+    // 3. `wt-c` (divergent branch tracking main) must 3-way AutoMerge AND mirror valid objects to `.git`!
+    assert!(wt_c.exists(), "divergent worktree wt-c must remain");
+    assert_eq!(fs::read_to_string(wt_c.join("only_c.txt")).unwrap(), "divergent commit on feat-c\n");
+    assert_eq!(fs::read_to_string(wt_c.join("from_a.txt")).unwrap(), "merged via plain git!\n");
+    assert_eq!(
+        fs::read_to_string(wt_c.join("shared.txt")).unwrap(),
+        "line1_local_in_wt_c\nline2\nline3\nline4\nline5_via_git_merge\n",
+        "plain `git merge` hook must 3-way AutoMerge main into divergent wt-c's live filesystem!"
+    );
+    // Verify `.git` itself is 100% consistent (auto-merge commit + objects mirrored cleanly)!
+    let parents = run_git(&repo, &["rev-list", "--parents", "-n", "1", "feat-c"]);
+    assert_eq!(
+        parents.split_whitespace().count(),
+        3,
+        "feat-c in .git must point to a real 2-parent auto-merge commit: {parents}"
+    );
+    run_git(&repo, &["fsck", "--full"]);
+
+    let _ = fs::remove_dir_all(&base);
+}

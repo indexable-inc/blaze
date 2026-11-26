@@ -311,8 +311,16 @@ where
         return Ok(WorktreeSyncDecision::MissingTrackedBranch);
     };
 
-    // Same commit -> nothing to merge (unless worktree's on-disk `head_commit` lags behind its own branch).
+    // Same commit: either untouched (`branch_oid == base_commit`) or fast-forward merged into
+    // `track_branch` (`branch_oid != base_commit`, meaning this branch made commits that `track_branch`
+    // has now fast-forwarded onto!).
     if branch_oid == track_oid {
+        if record.auto_delete_on_merge
+            && record.branch.as_str() != record.track_branch.as_str()
+            && branch_oid != record.base_commit
+        {
+            return Ok(WorktreeSyncDecision::MergedIntoTracked { branch_oid, track_oid });
+        }
         if record.head_commit != branch_oid {
             let new_tree = commit_tree_oid(store, branch_oid, alloc)?;
             return Ok(WorktreeSyncDecision::FastForward {
