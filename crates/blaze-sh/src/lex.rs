@@ -257,15 +257,15 @@ fn lookup_unit(raw: &str) -> Option<UnitKind> {
         b"tib" => Some(UnitKind::Size(1_024 * 1_024 * 1_024 * 1_024)),
         b"pib" => Some(UnitKind::Size(1_024 * 1_024 * 1_024 * 1_024 * 1_024)),
 
-        // Durations (nanoseconds)
+        // Durations (nanoseconds, Nushell-compatible units)
         b"ns" => Some(UnitKind::Duration(1)),
         b"us" => Some(UnitKind::Duration(1_000)),
         b"ms" => Some(UnitKind::Duration(1_000_000)),
-        b"s" | b"sec" => Some(UnitKind::Duration(1_000_000_000)),
-        b"min" => Some(UnitKind::Duration(60 * 1_000_000_000)),
-        b"h" | b"hr" => Some(UnitKind::Duration(3_600 * 1_000_000_000)),
-        b"d" | b"day" => Some(UnitKind::Duration(86_400 * 1_000_000_000)),
-        b"wk" => Some(UnitKind::Duration(7 * 86_400 * 1_000_000_000)),
+        b"s" | b"sec" | b"secs" => Some(UnitKind::Duration(1_000_000_000)),
+        b"m" | b"min" | b"mins" => Some(UnitKind::Duration(60 * 1_000_000_000)),
+        b"h" | b"hr" | b"hrs" => Some(UnitKind::Duration(3_600 * 1_000_000_000)),
+        b"d" | b"day" | b"days" => Some(UnitKind::Duration(86_400 * 1_000_000_000)),
+        b"wk" | b"wks" => Some(UnitKind::Duration(7 * 86_400 * 1_000_000_000)),
         _ => None,
     }
 }

@@ -29,7 +29,8 @@ use crate::tiling::{PaneId, SplitAxis, SplitHandle, SplitId, TabId};
 use crate::view::{
     ActiveDrag, ActivePopover, CellMetrics, CursorTrail, DragPayload, HitAction, HitRect,
     HoverKind, OutputNav, OutputVisualMode, Scene, TextFace, TextSelection, compute_text_selection,
-    extract_visual_lines, format_duration_ms, format_value_cell_at, is_expandable_cell,
+    extract_visual_lines, format_duration_ms, format_duration_ns, format_value_cell_at,
+    is_expandable_cell,
     output_nav_geometry, truncate_chars, truncate_middle, wrap_lines,
 };
 
@@ -167,31 +168,111 @@ fn build_scene_inner(input: &LayoutInput<'_>, draw_top_bar: bool) -> Scene {
         }
     }
 
-    // 3c. Vim scrollback/output browsing cursor (`h`/`j`/`k`/`l`, `v`/`V`, `y` over previous outputs).
+    // 3c. Vim scrollback/output browsing (`h`/`j`/`k`/`l`, `v`/`V`, `y` over previous outputs).
+    // Even in Normal mode, prefer a clean item/word selection highlight over a harsh inverted
+    // single-character block cursor so structured outputs (`ls`, tables) stay crisp & readable!
     if let Some(nav) = input.output_nav {
         let vlines = extract_visual_lines(&scene.text_runs, m, feed_top, feed_bottom);
         let (cur_rect, vis_rects, _) = output_nav_geometry(&vlines, m, nav);
         for [rx0, ry0, rx1, ry1] in vis_rects {
-            scene.over_round_rect(rx0, ry0, rx1, ry1, 2.0, [0.35, 0.56, 0.88, 0.30], feed_clip);
+            scene.over_round_rect(rx0, ry0, rx1, ry1, 2.5, [0.35, 0.56, 0.88, 0.30], feed_clip);
         }
         if let Some([cx0, cy0, cx1, cy1]) = cur_rect {
-            scene.over_round_rect(
-                cx0 - 0.5,
-                cy0 - 0.5,
-                cx1 + 0.5,
-                cy1 + 0.5,
-                1.5,
-                [0.92, 0.92, 0.90, 0.82],
-                feed_clip,
-            );
-            // Re-render the character under the Vim block cursor in dark ink for crisp legibility.
-            let li = nav.line.min(vlines.len().saturating_sub(1));
-            if let Some(row) = vlines.get(li)
-                && let Some((_, ch)) = row.chars.get(nav.col.min(row.chars.len().saturating_sub(1)))
-            {
-                let mut buf = [0u8; 4];
-                let s = ch.encode_utf8(&mut buf);
-                scene.overlay_text_run(cx0, cy0, s, theme::BG_CANVAS, true, false, feed_clip);
+            if nav.visual.is_none() {
+                let mid_x = (cx0 + cx1) * 0.5;
+                let mid_y = (cy0 + cy1) * 0.5;
+                // Prefer highlighting the entire structured item (e.g. `blaze.lock` in `ls` grid
+                // or a table cell) as a sleek selection pill rather than a 1-char block cursor!
+                let structured_rect = scene
+                    .hover_regions
+                    .iter()
+                    .rev()
+                    .find(|reg| {
+                        reg.rect.contains(mid_x, mid_y)
+                            && matches!(
+                                reg.kind,
+                                HoverKind::FileEntry { .. }
+                                    | HoverKind::FilePreview { .. }
+                                    | HoverKind::DirPreview { .. }
+                                    | HoverKind::Tooltip { .. }
+                            )
+                    })
+                    .map(|reg| reg.rect);
+
+                if let Some(sr) = structured_rect {
+                    scene.overlay_round_rect(
+                        sr.x0 - 2.0,
+                        sr.y0 - 1.0,
+                        sr.x1 + 2.0,
+                        sr.y1 + 1.0,
+                        5.0,
+                        [0.34, 0.56, 0.90, 0.20],
+                        1.0,
+                        [0.48, 0.72, 1.0, 0.62],
+                        feed_clip,
+                    );
+                } else {
+                    // On plain text lines, highlight the active word/token as a calm selection
+                    // with a subtle bottom accent under the exact character position.
+                    let li = nav.line.min(vlines.len().saturating_sub(1));
+                    let mut sel_x0 = cx0;
+                    let mut sel_x1 = cx1;
+                    if let Some(row) = vlines.get(li)
+                        && !row.chars.is_empty()
+                    {
+                        let ci = nav.col.min(row.chars.len() - 1);
+                        let is_word = |ch: char| !ch.is_whitespace();
+                        if is_word(row.chars[ci].1) {
+                            let mut s = ci;
+                            while s > 0
+                                && is_word(row.chars[s - 1].1)
+                                && (row.chars[s].0 - row.chars[s - 1].0) <= m.cw * 1.6
+                            {
+                                s -= 1;
+                            }
+                            let mut e = ci;
+                            while e + 1 < row.chars.len()
+                                && is_word(row.chars[e + 1].1)
+                                && (row.chars[e + 1].0 - row.chars[e].0) <= m.cw * 1.6
+                            {
+                                e += 1;
+                            }
+                            sel_x0 = row.chars[s].0;
+                            sel_x1 = row.chars[e].0 + m.cw;
+                        }
+                    }
+                    scene.overlay_round_rect(
+                        sel_x0 - 2.0,
+                        cy0 - 1.0,
+                        sel_x1 + 2.0,
+                        cy1 + 1.0,
+                        3.5,
+                        [0.34, 0.56, 0.90, 0.22],
+                        1.0,
+                        [0.48, 0.72, 1.0, 0.45],
+                        feed_clip,
+                    );
+                    scene.over_round_rect(
+                        cx0,
+                        cy1 - 1.0,
+                        cx1,
+                        cy1 + 0.75,
+                        0.75,
+                        [0.64, 0.82, 1.0, 0.85],
+                        feed_clip,
+                    );
+                }
+            } else {
+                // Visual selection active: subtle outline on the head character without stark inversion.
+                scene.over_round_rect(
+                    cx0,
+                    cy1 - 1.0,
+                    cx1,
+                    cy1 + 0.75,
+                    0.75,
+                    [0.72, 0.86, 1.0, 0.90],
+                    feed_clip,
+                );
             }
         }
         let mode_lbl = match nav.visual {
@@ -1150,9 +1231,25 @@ fn layout_block(
         scene.over_circle(rx - w - 9.0, cur_y + m.ch * 0.5, 3.0, theme::FIRE, clip_id);
         rx -= w + 20.0;
     } else {
-        let dur_lbl = format_duration_ms(block.duration_ms);
-        let dur_w = dur_lbl.len() as f32 * m.cw;
-        scene.text(rx - dur_w, cur_y, dur_lbl, theme::INK_4, false, false, clip_id);
+        let eff_ns = if block.duration_ns > 0 {
+            block.duration_ns
+        } else {
+            block.duration_ms.saturating_mul(1_000_000)
+        };
+        let dur_lbl = format_duration_ns(eff_ns);
+        let dur_w = dur_lbl.chars().count() as f32 * m.cw;
+        let dx0 = rx - dur_w;
+        scene.text(dx0, cur_y, &dur_lbl, theme::INK_4, false, false, clip_id);
+        let mut ns_commas = String::new();
+        let _ = blaze_sh::format_u64_commas(eff_ns, &mut ns_commas);
+        scene.push_hover_clipped(
+            HitRect::new(dx0 - 3.0, cur_y - 2.0, rx + 3.0, cur_y + m.ch + 2.0),
+            clip_id,
+            HoverKind::Tooltip {
+                title: format!("{ns_commas} ns"),
+                subtitle: Some(format!("command wall time ({dur_lbl})")),
+            },
+        );
         rx -= dur_w + 12.0;
 
         if let BlockBody::Terminal { pid: Some(p), .. } = &block.body {
@@ -1455,6 +1552,7 @@ fn layout_value(
                 .max(m.ch)
             })
         }
+        Value::Output(out) => layout_command_output(scene, out, x0, y0, width, m, clip_id),
         scalar => layout_scalar(scene, scalar, x0, y0, width, m, clip_id, now_ns),
     }
 }
@@ -1795,7 +1893,16 @@ fn layout_file_grid(
                     None => (1.0, if item.is_dir { theme::INK_1 } else { theme::INK_2 }, None, false),
                 };
                 scene.svg_icon_alpha(cx, iy, icon_s, item.icon, icon_alpha, clip_id);
-                scene.text(cx + icon_s + icon_gap, ty, txt, col, false, false, clip_id);
+                draw_shaded_filename(
+                    scene,
+                    cx + icon_s + icon_gap,
+                    ty,
+                    &txt,
+                    item.is_dir,
+                    col,
+                    m,
+                    clip_id,
+                );
                 let mut end_x = cx + icon_s + icon_gap + txt_w;
                 if let Some((tag, tag_col)) = badge {
                     let bx = end_x + (m.cw * 0.45).max(3.5);
@@ -2571,7 +2678,16 @@ fn layout_table(
                                     scene.round_rect(bx0, by0, bx0 + chip_w, by1, 4.0, theme::BG_CHIP, 0.0, [0.0; 4], clip_id);
                                 }
                                 scene.svg_icon_alpha(rx, iy, icon_s, icon_name, icon_alpha, clip_id);
-                                scene.text(rx + icon_pad, ty, txt, name_col, false, false, clip_id);
+                                draw_shaded_filename(
+                                    scene,
+                                    rx + icon_pad,
+                                    ty,
+                                    &txt,
+                                    is_dir,
+                                    name_col,
+                                    m,
+                                    clip_id,
+                                );
                                 if let Some((tag, tag_col)) = badge {
                                     let gx = (bx0 + chip_w + 6.0).min(rx + content_w - m.cw);
                                     scene.ui_small(gx, ty + 1.0, tag, tag_col, true, false, clip_id);
@@ -3136,6 +3252,251 @@ fn layout_table(
     }
 
     cur_y - y0
+}
+
+/// Draw a filename with subtle semantic shading between the stem and `.{ext}` (or trailing `/`):
+/// - Primary source/manifest files (`Cargo.toml`, `main.rs`, `README.md`): crisp stem + softer `.ext`
+/// - Secondary lock/backup/log files (`Cargo.lock`, `blaze.lock`, `*.bak`, `*.tmp`, `*.log`): gently
+///   calmer stem + muted `.ext` so primary files naturally pop during visual scanning
+/// - Directories (`src/`): crisp folder name + softly muted trailing `/`
+#[allow(clippy::too_many_arguments)]
+fn draw_shaded_filename(
+    scene: &mut Scene,
+    x: f32,
+    y: f32,
+    name: &str,
+    is_dir: bool,
+    base_col: [f32; 4],
+    m: CellMetrics,
+    clip_id: u32,
+) {
+    let scale_alpha = |c: [f32; 4], factor: f32| [c[0], c[1], c[2], (c[3] * factor).clamp(0.15, 1.0)];
+
+    if is_dir {
+        if let Some(stem) = name.strip_suffix('/')
+            && !stem.is_empty()
+        {
+            scene.text(x, y, stem, base_col, false, false, clip_id);
+            let sx = x + stem.chars().count() as f32 * m.cw;
+            scene.text(sx, y, "/", scale_alpha(base_col, 0.50), false, false, clip_id);
+            return;
+        }
+        scene.text(x, y, name, base_col, false, false, clip_id);
+        return;
+    }
+
+    // Separate optional parent path prefix (`crates/…/foo.rs`) from the leaf filename.
+    let (dir_prefix, leaf) = match name.rfind('/') {
+        Some(idx) => (&name[..=idx], &name[idx + 1..]),
+        None => ("", name),
+    };
+
+    let mut cur_x = x;
+    if !dir_prefix.is_empty() {
+        scene.text(cur_x, y, dir_prefix, scale_alpha(base_col, 0.62), false, false, clip_id);
+        cur_x += dir_prefix.chars().count() as f32 * m.cw;
+    }
+
+    // Split leaf into `(stem, ext)` without mis-splitting dotfiles like `.gitignore` or `.env`.
+    let ext_dot = leaf
+        .rfind('.')
+        .filter(|&i| i > 0 && i + 1 < leaf.len());
+    let Some(dot_idx) = ext_dot else {
+        scene.text(cur_x, y, leaf, base_col, false, false, clip_id);
+        return;
+    };
+
+    let ext = &leaf[dot_idx..]; // includes leading `.`
+    let ext_lower = ext.to_ascii_lowercase();
+    let is_secondary = matches!(
+        ext_lower.as_str(),
+        ".lock" | ".bak" | ".orig" | ".tmp" | ".log" | ".swp" | ".pyc" | ".o" | ".d" | ".map"
+    );
+
+    // For compound backups like `Cargo.toml.rust-2024.bak`, dim from the secondary suffix onward!
+    let split_idx = if is_secondary && ext_lower == ".bak" {
+        leaf[..dot_idx].rfind('.').filter(|&i| i > 0).unwrap_or(dot_idx)
+    } else {
+        dot_idx
+    };
+
+    let stem = &leaf[..split_idx];
+    let suffix = &leaf[split_idx..];
+
+    let stem_col = if is_secondary {
+        scale_alpha(base_col, 0.80)
+    } else {
+        base_col
+    };
+    let ext_col = if is_secondary {
+        scale_alpha(base_col, 0.50)
+    } else {
+        scale_alpha(base_col, 0.64)
+    };
+
+    scene.text(cur_x, y, stem, stem_col, false, false, clip_id);
+    let ex = cur_x + stem.chars().count() as f32 * m.cw;
+    scene.text(ex, y, suffix, ext_col, false, false, clip_id);
+}
+
+/// Render a structured external-command [`blaze_sh::CommandOutput`] with true time-interleaved
+/// `stdout` and `stderr` streams, subtle coral gutter rail on `stderr` lines, exact per-line
+/// arrival timestamp hover tooltips, and a right-aligned `output` / `exit N` pill.
+#[allow(clippy::too_many_arguments)]
+fn layout_command_output(
+    scene: &mut Scene,
+    out: &blaze_sh::CommandOutput<'_>,
+    x0: f32,
+    y0: f32,
+    width: f32,
+    m: CellMetrics,
+    clip_id: u32,
+) -> f32 {
+    let has_stderr = out.stderr_len() > 0;
+    let has_stdout = out.stdout_len() > 0;
+    let pill_lbl = if out.exit_code != 0 {
+        format!("output · exit {}", out.exit_code)
+    } else if has_stdout && has_stderr {
+        "output · 2 streams".to_owned()
+    } else {
+        "output".to_owned()
+    };
+    let pill_w = pill_lbl.chars().count() as f32 * m.cw + 14.0;
+    let bx0 = x0 + width - pill_w;
+    let pill_border = if out.exit_code != 0 { theme::DANGER } else { theme::LINE };
+    let pill_fg = if out.exit_code != 0 { theme::DANGER } else { theme::INK_3 };
+    scene.round_rect(
+        bx0,
+        y0 - 1.0,
+        x0 + width,
+        y0 + m.ch + 1.0,
+        (m.ch + 2.0) * 0.5,
+        [0.0; 4],
+        1.0,
+        pill_border,
+        clip_id,
+    );
+    scene.text(bx0 + 7.0, y0, &pill_lbl, pill_fg, false, false, clip_id);
+    let dur_s = format_duration_ns(out.duration.0.max(0) as u64);
+    let out_b = crate::dust_driver::format_bytes_compact(out.stdout_len() as u64);
+    let err_b = crate::dust_driver::format_bytes_compact(out.stderr_len() as u64);
+    scene.push_hover_clipped(
+        HitRect::new(bx0, y0 - 2.0, x0 + width, y0 + m.ch + 2.0),
+        clip_id,
+        HoverKind::Tooltip {
+            title: format!("exit {} · {dur_s} · {out_b} stdout · {err_b} stderr", out.exit_code),
+            subtitle: Some("fields: .stdout · .stderr · .exit_code · .duration · .events".to_owned()),
+        },
+    );
+
+    // Flatten time-ordered chunks into display lines tagged with `(arrival_ns, stream)`.
+    let mut lines: Vec<(i64, blaze_sh::OutputStream, String)> = Vec::new();
+    for ch in out.chunks.iter() {
+        let text = String::from_utf8_lossy(ch.bytes.as_ref());
+        let cleaned = strip_ansi_simple(&text);
+        for seg in cleaned.split('\n') {
+            let s = seg.trim_end_matches('\r');
+            if s.is_empty() && lines.last().is_some_and(|l| l.2.is_empty()) {
+                continue;
+            }
+            lines.push((ch.at.0, ch.stream, s.to_owned()));
+        }
+    }
+    while lines.last().is_some_and(|l| l.2.is_empty()) {
+        lines.pop();
+    }
+
+    if lines.is_empty() {
+        scene.text(x0, y0, "(no output)", theme::INK_4, false, true, clip_id);
+        return m.ch;
+    }
+
+    let text_w_first = (bx0 - x0 - 12.0).max(m.cw * 16.0);
+    let full_cols = ((width - 10.0) / m.cw).floor().max(16.0) as usize;
+    let first_cols = ((text_w_first - 10.0) / m.cw).floor().max(16.0) as usize;
+    let step_y = m.ch + 2.0;
+    let mut cur_y = y0;
+    let mut row_idx = 0usize;
+    let max_display_lines = 400usize;
+
+    for (at_ns, stream, raw_line) in lines.iter().take(max_display_lines) {
+        let is_err = *stream == blaze_sh::OutputStream::Stderr;
+        let cols = if row_idx == 0 { first_cols } else { full_cols };
+        let wrapped = wrap_lines(raw_line, cols);
+        let line_x = if is_err { x0 + 8.0 } else { x0 };
+        let line_col = if is_err {
+            theme::rgb(0xec, 0x9b, 0x82)
+        } else {
+            theme::INK_1
+        };
+        let block_y0 = cur_y;
+        for wline in &wrapped {
+            scene.text(line_x, cur_y, wline, line_col, false, false, clip_id);
+            cur_y += step_y;
+            row_idx += 1;
+        }
+        if is_err {
+            scene.over_round_rect(
+                x0,
+                block_y0 + 1.0,
+                x0 + 2.2,
+                (cur_y - 2.0).max(block_y0 + m.ch - 1.0),
+                1.0,
+                theme::rgba(0xe8, 0x6a, 0x45, 0.78),
+                clip_id,
+            );
+        }
+        let at_lbl = format_duration_ns((*at_ns).max(0) as u64);
+        let max_line_x1 = if row_idx <= wrapped.len() { bx0 - 8.0 } else { x0 + width };
+        scene.push_hover_clipped(
+            HitRect::new(x0, block_y0, max_line_x1.max(x0 + 40.0), cur_y),
+            clip_id,
+            HoverKind::Tooltip {
+                title: format!("+{at_lbl} · {}", stream.as_str()),
+                subtitle: None,
+            },
+        );
+    }
+    if lines.len() > max_display_lines {
+        scene.text(
+            x0,
+            cur_y,
+            format!("… {} more lines (inspect via `.events` or `.stdout`)", lines.len() - max_display_lines),
+            theme::INK_4,
+            false,
+            true,
+            clip_id,
+        );
+        cur_y += step_y;
+    }
+
+    (cur_y - y0).max(m.ch)
+}
+
+/// Strip ANSI CSI escape sequences cleanly for structured `Value::Output` line display.
+fn strip_ansi_simple(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            i += 2;
+            while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                i += 1;
+            }
+            if i < bytes.len() {
+                i += 1;
+            }
+            continue;
+        }
+        if let Some(ch) = s[i..].chars().next() {
+            out.push(ch);
+            i += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    out
 }
 
 /// Draw a circular Retina GitHub user avatar (when cached on disk) or an instant deterministic

@@ -197,6 +197,10 @@ impl FakeHost {
                 }
             }
             Request::Now => Answer::Now(self.now),
+            Request::Sleep { duration } => {
+                self.now.utc_ns = self.now.utc_ns.saturating_add(duration.0);
+                Answer::Ok
+            }
             Request::SysInfo => Answer::Sys(SysSnapshot {
                 host: AString::from_str_in("blaze-mac", a),
                 os: AString::from_str_in("macos", a),
@@ -235,8 +239,10 @@ impl FakeHost {
                 }
                 Answer::External(ExternalResult {
                     exit_code: 0,
+                    duration_ns: 1_250_000,
                     stdout: out,
                     stderr: AVec::new_in(a),
+                    chunks: AVec::new_in(a),
                     interactive: matches!(mode, crate::ExternalMode::Interactive),
                 })
             }
@@ -526,4 +532,50 @@ fn hostile_input_never_panics_and_stays_bounded() {
         }
         Ok(())
     });
+}
+
+#[test]
+fn sleep_builtin_and_nushell_duration_units() {
+    let mut host = FakeHost::new();
+    let st = base_state();
+    let before = host.now.utc_ns;
+    let out = host.run("sleep 15sec", st.fork());
+    assert_eq!(out.value, Value::Nothing);
+    assert_eq!(host.now.utc_ns - before, 15_000_000_000);
+
+    let out2 = host.run("sleep 250ms", st.fork());
+    assert_eq!(out2.value, Value::Nothing);
+    assert_eq!(host.now.utc_ns - before, 15_250_000_000);
+
+    // Format durations cleanly without spaces (`15sec`, `500ms`).
+    assert_eq!(
+        host.run("15sec", st.fork()).value.to_display_string(alloc()).as_str(),
+        "15sec"
+    );
+    assert_eq!(
+        host.run("2m + 30secs", st.fork()).value,
+        Value::Duration(Nanos(150_000_000_000))
+    );
+}
+
+#[test]
+fn external_command_returns_structured_timed_output() {
+    let mut host = FakeHost::new();
+    let st = base_state();
+    let res = host.run("(\"hello\" | upper).stdout", st.fork());
+    assert_eq!(res.value, Value::string("HELLO", alloc()));
+    let code = host.run("(\"hello\" | upper).exit_code", st.fork());
+    assert_eq!(code.value, Value::Int(0));
+    let events = host.run("(\"hello\" | upper).events", st.fork());
+    match events.value {
+        Value::Table(t) => {
+            assert_eq!(t.nrows(), 1);
+            assert_eq!(t.col_index("at"), Some(0));
+            assert_eq!(t.col_index("stream"), Some(1));
+            assert_eq!(t.col_index("text"), Some(2));
+        }
+        other => panic!("expected events table, got {other:?}"),
+    }
+    let piped = host.run("\"hi\" | upper | str downcase", st.fork());
+    assert_eq!(piped.value, Value::string("hi", alloc()));
 }

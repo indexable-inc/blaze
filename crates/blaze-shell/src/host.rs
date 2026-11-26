@@ -12,12 +12,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use blaze_own::{AString, AVec, Alloc};
+use blaze_own::{AString, AVec, Alloc, Rc};
 use blaze_sh::machine::Machine;
 use blaze_sh::{
     Answer, Bytes, DateTime, DirEntry, EngineState, ErrorKind, EvalOutcome, ExternalMode,
-    ExternalResult, FileKind, FsOp, ProcEntry, Request, ShellError, Span, Step, StreamChunk,
-    SysSnapshot,
+    ExternalResult, FileKind, FsOp, Nanos, OutputChunk, OutputStream, ProcEntry, Request,
+    ShellError, Span, Step, StreamChunk, SysSnapshot,
 };
 
 use crate::rust_cell;
@@ -240,6 +240,17 @@ fn handle_request(
             Answer::FoundPath(found)
         }
         Request::Now => Answer::Now(now_datetime()),
+        Request::Sleep { duration } => {
+            let total_ns = duration.0.max(0) as u64;
+            let max_ns = 3_600_000_000_000u64; // 1hr hard upper bound per sleep call
+            let capped = total_ns.min(max_ns);
+            let deadline = Instant::now() + Duration::from_nanos(capped);
+            while Instant::now() < deadline {
+                let rem = deadline.saturating_duration_since(Instant::now());
+                thread::sleep(rem.min(Duration::from_millis(25)));
+            }
+            Answer::Ok
+        }
         Request::SysInfo => Answer::Sys(collect_sys_snapshot(alloc)),
         Request::ProcessList => match collect_process_list(alloc) {
             Ok(procs) => Answer::Processes(procs),
@@ -259,8 +270,10 @@ fn handle_request(
                 *interactive_spawn = Some(spawn);
                 Answer::External(ExternalResult {
                     exit_code: 0,
+                    duration_ns: 0,
                     stdout: AVec::new_in(alloc),
                     stderr: AVec::new_in(alloc),
+                    chunks: AVec::new_in(alloc),
                     interactive: true,
                 })
             } else {
@@ -920,6 +933,7 @@ fn run_external_captured(
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
+    let started = Instant::now();
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to run `{program}`: {e}"))?;
@@ -936,20 +950,48 @@ fn run_external_captured(
         });
     }
 
-    let out_reader = child.stdout.take().map(|p| {
+    // Stream stdout & stderr concurrently into one timestamped event channel so exact arrival
+    // interleaving is preserved for both `Value::Output` display and `.events` pipelines!
+    let (ev_tx, ev_rx) = std::sync::mpsc::channel::<(i64, OutputStream, Vec<u8>)>();
+    let out_reader = child.stdout.take().map(|mut p| {
+        let tx = ev_tx.clone();
         thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = p.take(16 << 20).read_to_end(&mut buf);
-            buf
+            let mut total = 0usize;
+            let mut buf = [0u8; 8192];
+            while total < (16 << 20) {
+                match p.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        total += n;
+                        let at_ns = started.elapsed().as_nanos().min(i64::MAX as u128) as i64;
+                        let _ = tx.send((at_ns, OutputStream::Stdout, buf[..n].to_vec()));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
         })
     });
-    let err_reader = child.stderr.take().map(|p| {
+    let err_reader = child.stderr.take().map(|mut p| {
+        let tx = ev_tx.clone();
         thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = p.take(4 << 20).read_to_end(&mut buf);
-            buf
+            let mut total = 0usize;
+            let mut buf = [0u8; 8192];
+            while total < (4 << 20) {
+                match p.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        total += n;
+                        let at_ns = started.elapsed().as_nanos().min(i64::MAX as u128) as i64;
+                        let _ = tx.send((at_ns, OutputStream::Stderr, buf[..n].to_vec()));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
         })
     });
+    drop(ev_tx);
 
     let deadline = Instant::now() + EXTERNAL_CAPTURE_TIMEOUT;
     let status = loop {
@@ -967,18 +1009,38 @@ fn run_external_captured(
         }
     };
 
-    let raw_out = out_reader.and_then(|h| h.join().ok()).unwrap_or_default();
-    let raw_err = err_reader.and_then(|h| h.join().ok()).unwrap_or_default();
+    if let Some(h) = out_reader {
+        let _ = h.join();
+    }
+    if let Some(h) = err_reader {
+        let _ = h.join();
+    }
+    let duration_ns = started.elapsed().as_nanos().min(i64::MAX as u128) as i64;
 
-    let mut stdout = AVec::with_capacity_in(raw_out.len(), alloc);
-    stdout.extend_from_slice(&raw_out);
-    let mut stderr = AVec::with_capacity_in(raw_err.len(), alloc);
-    stderr.extend_from_slice(&raw_err);
+    let mut events: Vec<(i64, OutputStream, Vec<u8>)> = ev_rx.into_iter().collect();
+    events.sort_by_key(|(at, _, _)| *at);
+
+    let mut stdout = AVec::new_in(alloc);
+    let mut stderr = AVec::new_in(alloc);
+    let mut chunks = AVec::with_capacity_in(events.len(), alloc);
+    for (at_ns, stream, data) in events {
+        match stream {
+            OutputStream::Stdout => stdout.extend_from_slice(&data),
+            OutputStream::Stderr => stderr.extend_from_slice(&data),
+        }
+        chunks.push(OutputChunk {
+            at: Nanos(at_ns),
+            stream,
+            bytes: Rc::from_slice_in(&data, alloc),
+        });
+    }
 
     Ok(ExternalResult {
         exit_code: status.code().unwrap_or(1),
+        duration_ns,
         stdout,
         stderr,
+        chunks,
         interactive: false,
     })
 }

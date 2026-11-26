@@ -1563,6 +1563,26 @@ pub fn format_duration_ms(ms: u64) -> String {
     }
 }
 
+/// Format exact elapsed nanoseconds concisely (`420ns`, `142µs`, `2.4ms`, `37ms`, `1.4s`, `2m 14s`).
+pub fn format_duration_ns(ns: u64) -> String {
+    if ns < 1_000 {
+        format!("{ns}ns")
+    } else if ns < 1_000_000 {
+        let us = ns / 1_000;
+        format!("{us}µs")
+    } else if ns < 10_000_000 {
+        let ms = ns / 1_000_000;
+        let tenths = (ns % 1_000_000) / 100_000;
+        if tenths == 0 {
+            format!("{ms}ms")
+        } else {
+            format!("{ms}.{tenths}ms")
+        }
+    } else {
+        format_duration_ms(ns / 1_000_000)
+    }
+}
+
 /// Middle-truncate `s` (e.g. long paths `crates/blaze-shell/src/layout.rs` -> `crates/…/layout.rs`)
 /// so the filename at the end stays readable inside narrow tiled panes!
 pub fn truncate_middle(s: &str, max_chars: usize) -> String {

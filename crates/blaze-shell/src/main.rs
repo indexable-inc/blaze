@@ -347,6 +347,11 @@ mod macos_app {
         String(String),
         Path(String, PathKind),
         Binary(Vec<u8>),
+        Output {
+            exit_code: i32,
+            duration: Nanos,
+            chunks: Vec<(i64, blaze_sh::OutputStream, Vec<u8>)>,
+        },
         List(Vec<SendValue>),
         Record(Vec<(String, SendValue)>),
         Table {
@@ -377,6 +382,15 @@ mod macos_app {
                 Value::String(s) => Self::String(s.as_ref().to_owned()),
                 Value::Path { path, kind } => Self::Path(path.as_ref().to_owned(), *kind),
                 Value::Binary(b) => Self::Binary(b.as_ref().to_vec()),
+                Value::Output(o) => Self::Output {
+                    exit_code: o.exit_code,
+                    duration: o.duration,
+                    chunks: o
+                        .chunks
+                        .iter()
+                        .map(|ch| (ch.at.0, ch.stream, ch.bytes.as_ref().to_vec()))
+                        .collect(),
+                },
                 Value::List(xs) => Self::List(xs.iter().map(Self::from_value).collect()),
                 Value::Record(rec) => Self::Record(
                     rec.iter()
@@ -434,6 +448,20 @@ mod macos_app {
                 Self::String(s) => Value::string(&s, alloc),
                 Self::Path(p, kind) => Value::path(&p, kind, alloc),
                 Self::Binary(b) => Value::binary(&b, alloc),
+                Self::Output { exit_code, duration, chunks } => {
+                    let mut pvec = blaze_sh::PVec::new(alloc);
+                    for (at_ns, stream, bytes) in chunks {
+                        pvec.push(blaze_sh::OutputChunk {
+                            at: Nanos(at_ns),
+                            stream,
+                            bytes: blaze_own::Rc::from_slice_in(&bytes, alloc),
+                        });
+                    }
+                    Value::Output(blaze_own::Rc::new_in(
+                        blaze_sh::CommandOutput { exit_code, duration, chunks: pvec },
+                        alloc,
+                    ))
+                }
                 Self::List(xs) => {
                     let mut out = blaze_sh::PVec::new(alloc);
                     for x in xs {
@@ -481,6 +509,7 @@ mod macos_app {
         cwd: String,
         branch: Option<String>,
         duration_ms: u64,
+        duration_ns: u64,
         exit_code: i32,
         streamed_lines: Vec<String>,
         rust_meta: Option<RustCellMeta>,
@@ -531,6 +560,7 @@ mod macos_app {
             .next()
             .unwrap_or("");
         if first.is_empty()
+            || first == "sleep"
             || first.starts_with('^')
             || first.starts_with("./")
             || first.starts_with('/')
@@ -903,11 +933,13 @@ mod macos_app {
             // 4. Native `blaze-git` rich structured overrides (`git status`, `git branch`, `git stash list`)!
             let t_git = Instant::now();
             if let Some(git_val) = try_native_git_command(trimmed, &prompt_snap.cwd) {
-                let duration_ms = t_git.elapsed().as_millis() as u64;
+                let elapsed = t_git.elapsed();
+                let duration_ms = elapsed.as_millis() as u64;
+                let duration_ns = elapsed.as_nanos().min(u64::MAX as u128) as u64;
                 let mut state_after = state_before.fork();
                 self.bind_output_refs(&mut state_after, &git_val);
                 let body = BlockBody::Value(git_val);
-                self.store.record_block(
+                let bid = self.store.record_block(
                     trimmed.to_owned(),
                     prompt_snap.clone(),
                     state_before,
@@ -917,6 +949,9 @@ mod macos_app {
                     0,
                     body,
                 );
+                if let Some(blk) = self.store.block_mut(bid) {
+                    blk.duration_ns = duration_ns;
+                }
                 self.store.set_active_state(state_after);
                 self.editor.record_history_entry(HistoryEntry {
                     command: trimmed.to_owned(),
@@ -991,7 +1026,9 @@ mod macos_app {
                         // so they publish their OS PID immediately, never hijack the prompt, and update their
                         // single block in-place when complete!
                         let res = run_command_line_with_pid(&src_owned, st, false, Some(&pid_slot));
-                        let duration_ms = t0.elapsed().as_millis() as u64;
+                        let elapsed = t0.elapsed();
+                        let duration_ms = elapsed.as_millis() as u64;
+                        let duration_ns = elapsed.as_nanos().min(u64::MAX as u128) as u64;
                         let new_rust_cell = if res.outcome.state.rust_cells.len() > prior_count {
                             res.outcome.state.rust_cells.last().map(|c| c.code.as_ref().to_owned())
                         } else {
@@ -1005,6 +1042,7 @@ mod macos_app {
                             cwd,
                             branch,
                             duration_ms,
+                            duration_ns,
                             exit_code: res.outcome.exit_code,
                             streamed_lines: res.streamed_lines,
                             rust_meta: res.rust_meta,
@@ -1018,7 +1056,9 @@ mod macos_app {
 
             let t0 = Instant::now();
             let res = run_command_line(trimmed, state_before.fork(), true);
-            let duration_ms = t0.elapsed().as_millis() as u64;
+            let elapsed = t0.elapsed();
+            let duration_ms = elapsed.as_millis() as u64;
+            let duration_ns = elapsed.as_nanos().min(u64::MAX as u128) as u64;
 
             if let Some(spawn) = res.interactive_spawn {
                 self.spawn_pty_block(
@@ -1051,6 +1091,9 @@ mod macos_app {
                 exit_code,
                 body,
             );
+            if let Some(blk) = self.store.block_mut(block_id) {
+                blk.duration_ns = duration_ns;
+            }
             self.store.set_active_state(state_after);
             let new_cwd = self.store.active_state().cwd.as_ref().to_owned();
             if new_cwd != prompt_snap.cwd {
@@ -1123,6 +1166,7 @@ mod macos_app {
                 self.store.set_active_state(active.fork());
                 if let Some(blk) = self.store.block_mut(done.block_id) {
                     blk.duration_ms = done.duration_ms;
+                    blk.duration_ns = done.duration_ns;
                     blk.exit_code = exit_code;
                     blk.state_after = active;
                     blk.body = body;
@@ -4251,11 +4295,14 @@ mod macos_app {
                                     if p.anchor.contains(x, y) {
                                         return true;
                                     }
+                                    // Read-only tooltips and file/folder previews never use a sticky bridge:
+                                    // moving off the anchor immediately switches or dismisses!
                                     if matches!(
                                         p.kind,
                                         HoverKind::FilePreview { .. }
                                             | HoverKind::DirPreview { .. }
                                             | HoverKind::FileEntry { .. }
+                                            | HoverKind::Tooltip { .. }
                                     ) {
                                         return false;
                                     }
@@ -4263,12 +4310,19 @@ mod macos_app {
                                         if pr.contains(x, y) {
                                             return true;
                                         }
-                                        let bx0 = p.anchor.x0.min(pr.x0) - 4.0;
-                                        let bx1 = p.anchor.x1.max(pr.x1) + 4.0;
-                                        let by0 = p.anchor.y0.min(pr.y0);
-                                        let by1 = p.anchor.y1.max(pr.y1);
-                                        if HitRect::new(bx0, by0, bx1, by1).contains(x, y) {
-                                            return true;
+                                        // Narrow vertical travel bridge strictly between `p.anchor` and `pr`
+                                        // (never swallowing adjacent sibling pills like `[R]` or `/src`!).
+                                        let gap_x0 = p.anchor.x0 - 2.0;
+                                        let gap_x1 = p.anchor.x1 + 2.0;
+                                        let gap_y0 = p.anchor.y1.min(pr.y1);
+                                        let gap_y1 = p.anchor.y0.max(pr.y0);
+                                        if x >= gap_x0 && x <= gap_x1 && y >= gap_y0 && y <= gap_y1 {
+                                            let over_other_anchor = composite_scene
+                                                .hover_at(x, y)
+                                                .is_some_and(|r| r.rect != p.anchor);
+                                            if !over_other_anchor {
+                                                return true;
+                                            }
                                         }
                                     }
                                     false
@@ -4286,7 +4340,7 @@ mod macos_app {
                                     && dragging_split.is_none()
                                     && let Some(reg) = composite_scene.hover_at(x, y)
                                 {
-                                    if active_popover.as_ref().is_none_or(|cur| !cur.pinned && cur.anchor != reg.rect) {
+                                    if active_popover.as_ref().is_none_or(|cur| cur.anchor != reg.rect) {
                                         let hydrated_kind = match &reg.kind {
                                             HoverKind::FileEntry { full_path, name, icon, .. } => {
                                                 load_hover_preview(
@@ -4333,6 +4387,9 @@ mod macos_app {
                                 );
                                 apply_cursor(&mut cur_cursor, next);
                                 continue;
+                            } else if active_popover.as_ref().is_some_and(|p| !p.pinned) {
+                                active_popover = None;
+                                dirty = true;
                             }
                             if active_popover.as_ref().is_some_and(|p| !p.pinned) {
                                 active_popover = None;

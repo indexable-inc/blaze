@@ -4,6 +4,7 @@
 //! incrementally to Metal.
 
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::ptr::NonNull;
 
 use blaze_ui::shaders::GlyphInst;
@@ -12,6 +13,22 @@ use objc2_core_graphics::{CGBitmapContextCreate, CGColorSpace, CGContext};
 use objc2_core_text::{CTFont, CTFontOrientation, CTFontUIFontType};
 
 use crate::view::{CellMetrics, TextFace, TextRun};
+
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+struct LigatureKey {
+    style: u8,
+    len: u8,
+    bytes: [u8; 4],
+}
+
+#[inline]
+fn is_ligature_op(b: u8) -> bool {
+    matches!(
+        b,
+        b'-' | b'>' | b'<' | b'=' | b'!' | b'|' | b':' | b'&' | b'.' | b'/' | b'*' | b'~' | b'+'
+            | b'?' | b'#' | b'^'
+    )
+}
 
 pub const ATLAS: usize = 2048;
 
@@ -68,6 +85,8 @@ pub struct Fonts {
     /// Ratio `chrome_px / (points * scale * 0.94)`.
     chrome_ratio: f32,
     slots: HashMap<Key, Option<Slot>>,
+    /// CoreText-shaped OpenType programming ligature slots (`->`, `-->`, `=>`, `!=`, `|>`, etc.).
+    ligatures: HashMap<LigatureKey, Option<Slot>>,
     next_x: usize,
     next_y: usize,
     row_h: usize,
@@ -157,19 +176,53 @@ impl Fonts {
         let px = points * scale;
         let mono = [
             pick_font(
-                &["BerkeleyMono-Regular", "JetBrainsMono-Regular", "SFMono-Regular", "Menlo-Regular"],
+                &[
+                    "BerkeleyMono-Regular",
+                    "FiraCodeNFM-Reg",
+                    "FiraCode-Regular",
+                    "Lilex-Regular",
+                    "JetBrainsMono-Regular",
+                    "Iosevka",
+                    "SFMono-Regular",
+                    "Menlo-Regular",
+                ],
                 px,
             ),
             pick_font(
-                &["BerkeleyMono-Bold", "JetBrainsMono-Bold", "SFMono-Bold", "Menlo-Bold"],
+                &[
+                    "BerkeleyMono-Bold",
+                    "FiraCodeNFM-Bold",
+                    "FiraCode-Bold",
+                    "Lilex-Bold",
+                    "JetBrainsMono-Bold",
+                    "Iosevka-Bold",
+                    "SFMono-Bold",
+                    "Menlo-Bold",
+                ],
                 px,
             ),
             pick_font(
-                &["BerkeleyMono-Oblique", "JetBrainsMono-Italic", "SFMono-RegularItalic", "Menlo-Italic"],
+                &[
+                    "BerkeleyMono-Oblique",
+                    "FiraCodeNFM-Reg",
+                    "Lilex-Regular",
+                    "JetBrainsMono-Italic",
+                    "Iosevka-Italic",
+                    "SFMono-RegularItalic",
+                    "Menlo-Italic",
+                ],
                 px,
             ),
             pick_font(
-                &["BerkeleyMono-Bold-Oblique", "JetBrainsMono-BoldItalic", "SFMono-BoldItalic", "Menlo-BoldItalic"],
+                &[
+                    "BerkeleyMono-Bold-Oblique",
+                    "FiraCodeNFM-Bold",
+                    "Lilex-Bold",
+                    "JetBrainsMono-BoldItalic",
+                    "Iosevka-BoldItalic",
+                    "SFMono-BoldItalic",
+                    "Menlo-BoldItalic",
+                ],
                 px,
             ),
         ];
@@ -230,6 +283,7 @@ impl Fonts {
             ui_bold_adv_px,
             chrome_ratio,
             slots: HashMap::new(),
+            ligatures: HashMap::new(),
             next_x: 0,
             next_y: 0,
             row_h: 0,
@@ -253,6 +307,65 @@ impl Fonts {
             ui_bold_adv,
             chrome_ratio: self.chrome_ratio,
         }
+    }
+
+    /// Look up or CoreText-shape a 2..=4 char ASCII operator ligature (`->`, `-->`, `=>`, `!=`,
+    /// `|>`, etc.). Returns `None` if the active mono font does not substitute a ligature glyph.
+    fn ligature_slot(&mut self, style: u8, seq: &[u8]) -> Option<Slot> {
+        if seq.len() < 2 || seq.len() > 4 {
+            return None;
+        }
+        let mut arr = [0u8; 4];
+        arr[..seq.len()].copy_from_slice(seq);
+        let key = LigatureKey { style, len: seq.len() as u8, bytes: arr };
+        if let Some(&cached) = self.ligatures.get(&key) {
+            return cached;
+        }
+        let rastered = self.raster_ligature(style, seq);
+        self.ligatures.insert(key, rastered);
+        rastered
+    }
+
+    fn raster_ligature(&mut self, style: u8, seq: &[u8]) -> Option<Slot> {
+        let text = core::str::from_utf8(seq).ok()?;
+        let font = self.mono[(style as usize) & 3].clone();
+
+        let mut plain_gids = [0u16; 4];
+        for (idx, &b) in seq.iter().enumerate() {
+            plain_gids[idx] = glyph_of(&font, b as char)?;
+        }
+
+        let w = self.metrics.cell_w * seq.len();
+        let h = self.metrics.cell_h;
+        let buf = crate::image_atlas::shape_and_raster_ligature_alpha(
+            CFRetained::as_ptr(&font).as_ptr().cast::<c_void>(),
+            text,
+            &plain_gids[..seq.len()],
+            w,
+            h,
+            self.metrics.baseline,
+        )?;
+
+        if self.next_x + w > ATLAS {
+            self.next_x = 0;
+            self.next_y += self.row_h.max(h) + 1;
+            self.row_h = 0;
+        }
+        if self.next_y + h > ATLAS {
+            return None;
+        }
+        self.row_h = self.row_h.max(h);
+        let slot = Slot {
+            x: self.next_x,
+            y: self.next_y,
+            w,
+            h,
+            advance: w as f32,
+            x_off: 0.0,
+        };
+        self.next_x += w + 1;
+        self.pending.push((slot, buf));
+        Some(slot)
     }
 
     /// Look up or rasterize `ch` in the given face & style; `None` for whitespace or a full atlas.
@@ -296,6 +409,87 @@ impl Fonts {
                 ),
             };
             let y = run.y + y_nudge;
+
+            if run.face == TextFace::Mono {
+                let style = (u8::from(run.bold)) | (u8::from(run.italic) << 1);
+                let bytes = run.text.as_bytes();
+                let mut i = 0usize;
+                while i < bytes.len() {
+                    let b = bytes[i];
+                    if b == b' ' || b == b'\t' {
+                        x += space_adv;
+                        i += 1;
+                        continue;
+                    }
+                    if b < 0x20 {
+                        i += 1;
+                        continue;
+                    }
+                    // Shape multi-char ASCII operator sequences (`->`, `-->`, `=>`, `!=`, `|>`,
+                    // `<=`, `>=`, `::`, `==`, etc.) via CoreText OpenType `calt`/`liga`!
+                    if is_ligature_op(b) {
+                        let mut end = i + 1;
+                        while end < bytes.len() && end - i < 4 && is_ligature_op(bytes[end]) {
+                            end += 1;
+                        }
+                        if end - i >= 2 {
+                            let mut matched = None;
+                            for cand_len in (2..=(end - i)).rev() {
+                                if let Some(s) = self.ligature_slot(style, &bytes[i..i + cand_len]) {
+                                    matched = Some((cand_len, s));
+                                    break;
+                                }
+                            }
+                            if let Some((cand_len, s)) = matched {
+                                let gw = s.w as f32 * inv_scale;
+                                let gh = s.h as f32 * inv_scale;
+                                let draw_x = x + s.x_off * inv_scale;
+                                glyphs.push(GlyphInst {
+                                    rect: [draw_x, y, draw_x + gw, y + gh],
+                                    uv: [
+                                        s.x as f32 * inv_atlas,
+                                        s.y as f32 * inv_atlas,
+                                        (s.x + s.w) as f32 * inv_atlas,
+                                        (s.y + s.h) as f32 * inv_atlas,
+                                    ],
+                                    color: run.color,
+                                    clip_info: [run.clip_id, 0, 0, 0],
+                                });
+                                x += s.advance * inv_scale;
+                                i += cand_len;
+                                continue;
+                            }
+                        }
+                    }
+
+                    let Some(ch) = run.text[i..].chars().next() else {
+                        break;
+                    };
+                    i += ch.len_utf8();
+                    let wide = is_wide_char(ch);
+                    let key = Key { ch, face: TextFace::Mono, bold: run.bold, italic: run.italic, wide };
+                    if let Some(s) = self.slot(key) {
+                        let gw = s.w as f32 * inv_scale;
+                        let gh = s.h as f32 * inv_scale;
+                        let draw_x = x + s.x_off * inv_scale;
+                        glyphs.push(GlyphInst {
+                            rect: [draw_x, y, draw_x + gw, y + gh],
+                            uv: [
+                                s.x as f32 * inv_atlas,
+                                s.y as f32 * inv_atlas,
+                                (s.x + s.w) as f32 * inv_atlas,
+                                (s.y + s.h) as f32 * inv_atlas,
+                            ],
+                            color: run.color,
+                            clip_info: [run.clip_id, 0, 0, 0],
+                        });
+                        x += s.advance * inv_scale;
+                    } else {
+                        x += if wide { cw * 2.0 } else { cw };
+                    }
+                }
+                continue;
+            }
 
             for ch in run.text.chars() {
                 if ch == ' ' || ch == '\t' {
