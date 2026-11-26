@@ -188,7 +188,15 @@ fn message(sink: &mut impl Sink, text: &str, edition: u8, item: &Item, attrs: &[
         | ItemDetail::Static { body_holds_items } => {
             sink.part(&[u8::from(body_holds_items)]);
             // `BodySrc::of`: a body that holds items is scanned for the modules its blocks make.
-            whole |= body_holds_items && crate::nested::may_write_block(item.range.of(text));
+            // When the body's only block-writing constructs are bare, unqualified std expression
+            // macros (`nested::STD_EXPR_MACROS`), digest only the written-block and call shape so
+            // edits inside `#[test]` / library bodies keep `Outline::surface()` stable; shadowed
+            // macro definitions are guarded in `engine_names.rs` (`has_shadowed_expr_macro`).
+            if body_holds_items {
+                whole |= crate::nested::digest_body_blocks(item.range.of(text), &mut |bytes| {
+                    sink.part(bytes);
+                });
+            }
         }
         ItemDetail::Struct | ItemDetail::Variant { discriminant: _ } => {
             sink.part(&form(text, item));
@@ -404,6 +412,43 @@ mod tests {
             crate::outline(struct_before, Edition::E2024, alloc).surface(),
             crate::outline(struct_after, Edition::E2024, alloc).surface(),
             "#[test] on non-fn item must hash the whole item into Outline::surface()"
+        );
+    }
+
+    #[test]
+    fn std_expr_macros_in_fn_body_edits_do_not_move_surface() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let before = "#[test]\nfn test_19_9() {\n    let x = 1;\n    assert_eq!(x, 1);\n    assert!(x != 2);\n    let s = format!(\"v={}\", x);\n    let v = vec![1, 2];\n    println!(\"{} {:?}\", s, v);\n}\n";
+        let after = "#[test]\nfn test_19_9() {\n    let x = 42;\n    assert_eq!(x, 42);\n    assert!(x != 99);\n    let s = format!(\"val={} {}\", x, x + 1);\n    let v = vec![10, 20, 30];\n    println!(\"out={} {:?}\", s, v);\n}\n";
+        let o_before = crate::outline(before, Edition::E2024, alloc);
+        let o_after = crate::outline(after, Edition::E2024, alloc);
+        assert_eq!(o_before.surface(), o_after.surface(), "editing expressions inside bare std expr macros in #[test] fn must not move Outline::surface()");
+
+        // Path-qualified `std::assert_eq!` MUST hash whole and move surface.
+        let qual_before = "#[test]\nfn q() { std::assert_eq!(1, 1); }\n";
+        let qual_after = "#[test]\nfn q() { std::assert_eq!(1, 2); }\n";
+        assert_ne!(
+            crate::outline(qual_before, Edition::E2024, alloc).surface(),
+            crate::outline(qual_after, Edition::E2024, alloc).surface(),
+            "path-qualified std::assert_eq! must hash whole into Outline::surface()"
+        );
+
+        // Non-std macro MUST hash whole and move surface.
+        let custom_before = "fn c() { my_macro!(1); }\n";
+        let custom_after = "fn c() { my_macro!(2); }\n";
+        assert_ne!(
+            crate::outline(custom_before, Edition::E2024, alloc).surface(),
+            crate::outline(custom_after, Edition::E2024, alloc).surface(),
+            "unknown macro call must hash whole into Outline::surface()"
+        );
+
+        // Item inside macro arg MUST hash whole and move surface.
+        let arg_item_before = "fn a() { assert_eq!({ struct S; 1 }, 1); }\n";
+        let arg_item_after = "fn a() { assert_eq!({ struct S; 2 }, 1); }\n";
+        assert_ne!(
+            crate::outline(arg_item_before, Edition::E2024, alloc).surface(),
+            crate::outline(arg_item_after, Edition::E2024, alloc).surface(),
+            "nested item inside std macro arg must hash whole into Outline::surface()"
         );
     }
 }

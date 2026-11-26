@@ -2295,6 +2295,7 @@ fn check_for_fields_generic_bodies<'n, S: NamesSource<'n>>(
         let Some(orig_head) = r.store.fns.get(&owner) else {
             return Ok(());
         };
+        let head_alloc = r.store.tys.alloc();
         let lib = orig_head.lib;
         let mut head = FnHead {
             lib,
@@ -2309,16 +2310,16 @@ fn check_for_fields_generic_bodies<'n, S: NamesSource<'n>>(
             header: orig_head.header,
             c_variadic: orig_head.c_variadic,
             qualifiers: orig_head.qualifiers,
-            legacy_const_generics: Default::default(),
-            inputs: Default::default(),
+            legacy_const_generics: OwnVec::with_capacity_in(orig_head.legacy_const_generics.len(), head_alloc),
+            inputs: OwnVec::with_capacity_in(orig_head.inputs.len(), head_alloc),
             output: orig_head.output,
             has_body: true,
             module: orig_head.module,
-            params: Default::default(),
-            consts: Default::default(),
-            bounds: Default::default(),
+            params: OwnVec::with_capacity_in(orig_head.params.len() + synth_fields.len(), head_alloc),
+            consts: OwnVec::with_capacity_in(orig_head.consts.len(), head_alloc),
+            bounds: OwnVec::with_capacity_in(orig_head.bounds.len(), head_alloc),
             self_: orig_head.self_,
-            self_assoc: Default::default(),
+            self_assoc: OwnVec::with_capacity_in(orig_head.self_assoc.len(), head_alloc),
         };
         head.legacy_const_generics.extend_from_slice(&orig_head.legacy_const_generics);
         head.inputs.extend_from_slice(&orig_head.inputs);
@@ -2876,16 +2877,16 @@ fn install_spec_head<'n, S: NamesSource<'n>>(
         header,
         c_variadic,
         qualifiers,
-        legacy_const_generics: Default::default(),
-        inputs: Default::default(),
+        legacy_const_generics: OwnVec::new_in(alloc),
+        inputs: OwnVec::with_capacity_in(raw_inputs.len(), alloc),
         output: raw_output,
         has_body: true,
         module,
-        params: Default::default(),
-        consts: Default::default(),
-        bounds: Default::default(),
+        params: OwnVec::new_in(alloc),
+        consts: OwnVec::new_in(alloc),
+        bounds: OwnVec::new_in(alloc),
         self_: SelfTy::None,
-        self_assoc: Default::default(),
+        self_assoc: OwnVec::new_in(alloc),
     };
     for &inp in raw_inputs.iter() {
         let sub = r.store.tys.subst(inp, concrete_args).map_err(|error| CheckFail::Check {

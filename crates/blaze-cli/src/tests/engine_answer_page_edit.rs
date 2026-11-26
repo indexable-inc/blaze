@@ -63,7 +63,7 @@ fn editing_one_of_fifty_thousand_rows_reads_only_its_file_and_row_pages() {
         let phase = if i == ROWS - 1 {
             reads.push((observed, blaze_drive::key::ABSENT));
             by_cell.push(0);
-            cold.answer.readers.entry(observed).or_insert_with(|| blaze_own::BTreeSet::new_in(alloc)).insert(name);
+            cold.answer.readers.insert(observed, name);
             Phase::new(Stage::Units, 1)
         } else {
             phase

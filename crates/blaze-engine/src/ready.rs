@@ -601,9 +601,10 @@ pub struct Ready<'a, S: Scope, L = Answer<'a>, R = Paired<'a>, P = NoPlant> {
     dormant: SSet<'a, Name>,
     /// Rows proved final (R1), for the rest of the request.
     finals: SSet<'a, Name>,
-    /// The lowest stage holding a live, held or dormant task, for `epoch`.
-    lowest: Cell<Option<(u64, Option<Stage>)>>,
-    /// Counts every change of what the lowest stage is computed from.
+    /// Bitmasks `(live_or_held, all_unsettled)` of stages with unsettled tasks (`1u8 << s.index()`),
+    /// cached for `epoch`.
+    unsettled: Cell<Option<(u64, u8, u8)>>,
+    /// Counts every change of what the unsettled stage bitmasks are computed from.
     epoch: u64,
     /// The open tick's tasks in name order; those from `next` on have no worker yet.
     queue: SVec<'a, Name>,
@@ -654,7 +655,7 @@ impl<'a, S: Scope, L: LastAnswer, R: ReaderIndex<'a>, P: Planted<ReadyPlant>> Re
             held: BTreeSet::new_in(alloc),
             dormant: BTreeSet::new_in(alloc),
             finals: BTreeSet::new_in(alloc),
-            lowest: Cell::new(None),
+            unsettled: Cell::new(None),
             epoch: 0,
             queue: Vec::new_in(alloc),
             next: 0,
@@ -681,7 +682,7 @@ impl<'a, S: Scope, L: LastAnswer, R: ReaderIndex<'a>, P: Planted<ReadyPlant>> Re
             held: &self.held,
             to_grow: &self.to_grow,
             finals: &self.finals,
-            lowest: self.lowest_unsettled(),
+            unsettled: self.unsettled_masks().1,
             reads_early: self.reads_early(),
         }
     }
@@ -1032,37 +1033,47 @@ impl<'a, S: Scope, L: LastAnswer, R: ReaderIndex<'a>, P: Planted<ReadyPlant>> Re
         }
     }
 
-    /// Whether a grower may still grow a task at or before `stage` (R4): one owes its growth, or
-    /// anything is live or held up to the growers' stage (a task there may merge a grower or make
-    /// one a candidate). Deciding a task of `stage` would pass the phase the growth lands in
-    /// (engine.rs invariant 11, `GrownLate`).
+    /// Whether a grower may still grow a task at `stage` or a stage preceding it (R4): one owes
+    /// its growth, or anything is live or held in or before the growers' stage (a task there may
+    /// merge a grower or make one a candidate). Deciding a task of `stage` would pass the phase
+    /// the growth lands in (engine.rs invariant 11, `GrownLate`).
     fn gated(&self, stage: Stage) -> bool {
         let Some(upto) = self.kinds.grower_stage(stage) else { return false };
         let kinds = self.kinds;
-        self.to_grow.iter().any(|name| kinds.grows_by(name.kind, stage))
-            || self.tasks.values().any(|entry| entry.live() && entry.stage <= upto)
-            || self.held.iter().any(|name| kinds.of(name.kind).is_some_and(|facts| facts.stage <= upto))
+        let (live_or_held, _) = self.unsettled_masks();
+        let upto_mask = crate::kinds::preceding_stages_mask(upto) | (1u8 << upto.index());
+        self.to_grow.iter().any(|name| kinds.grows_by(name.kind, stage)) || (live_or_held & upto_mask) != 0
     }
 
-    /// The lowest stage holding a live, held or dormant task, asked once a change of state.
-    fn lowest_unsettled(&self) -> Option<Stage> {
-        if let Some((epoch, low)) = self.lowest.get()
+    /// Bitmasks `(live_or_held, all_unsettled)` of stages holding live/held and live/held/dormant
+    /// tasks, recomputed at most once per `epoch` change.
+    fn unsettled_masks(&self) -> (u8, u8) {
+        if let Some((epoch, live_or_held, all)) = self.unsettled.get()
             && epoch == self.epoch
         {
-            return low;
+            return (live_or_held, all);
         }
         let kinds = self.kinds;
-        let stage_of = |name: &Name| kinds.of(name.kind).map(|facts| facts.stage);
-        let low = self
-            .tasks
-            .values()
-            .filter(|entry| entry.live())
-            .map(|entry| entry.stage)
-            .chain(self.held.iter().filter_map(stage_of))
-            .chain(self.dormant.iter().filter_map(stage_of))
-            .min();
-        self.lowest.set(Some((self.epoch, low)));
-        low
+        let stage_bit = |stage: Stage| 1u8 << stage.index();
+        let mut live_or_held = 0u8;
+        for entry in self.tasks.values() {
+            if entry.live() {
+                live_or_held |= stage_bit(entry.stage);
+            }
+        }
+        for name in self.held.iter() {
+            if let Some(facts) = kinds.of(name.kind) {
+                live_or_held |= stage_bit(facts.stage);
+            }
+        }
+        let mut all = live_or_held;
+        for name in self.dormant.iter() {
+            if let Some(facts) = kinds.of(name.kind) {
+                all |= stage_bit(facts.stage);
+            }
+        }
+        self.unsettled.set(Some((self.epoch, live_or_held, all)));
+        (live_or_held, all)
     }
 
     /// Control (a)'s planted bug: a live row's cells are answered as final.
@@ -1278,8 +1289,8 @@ pub struct Facts<'r, 'a, S: Scope, L = Answer<'a>, R = Paired<'a>> {
     held: &'r SSet<'a, Name>,
     to_grow: &'r SSet<'a, Name>,
     finals: &'r SSet<'a, Name>,
-    /// The lowest stage holding a live, held or dormant task.
-    lowest: Option<Stage>,
+    /// Bitmask of stages holding a live, held or dormant task (`1u8 << stage.index()`).
+    unsettled: u8,
     reads_early: bool,
 }
 
@@ -1299,8 +1310,8 @@ impl<'r, 'a, S: Scope, L: LastAnswer, R: ReaderIndex<'a>> Facts<'r, 'a, S, L, R>
             };
         };
         let stage = facts.stage;
-        // Across stages (K4): nothing unsettled before this stage, no growth owed into it.
-        if self.lowest.is_some_and(|low| low < stage) {
+        // Across stages (K4): nothing unsettled in a stage preceding `stage`, no growth owed into it.
+        if (self.unsettled & crate::kinds::preceding_stages_mask(stage)) != 0 {
             return Ok(false);
         }
         let kinds = self.kinds;

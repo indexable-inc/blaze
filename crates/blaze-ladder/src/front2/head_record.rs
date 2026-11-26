@@ -2592,23 +2592,6 @@ fn decode_retaining_with<'n>(
     })
 }
 
-/// A decoded list that pre-sizes to the exact wire count before pushing elements.
-trait SizedList<T>: Default {
-    fn reserve_for(&mut self, n: usize);
-    fn push_one(&mut self, value: T);
-}
-
-impl<T> SizedList<T> for std::vec::Vec<T> {
-    fn reserve_for(&mut self, n: usize) {
-        if n > 0 {
-            self.reserve_exact(n);
-        }
-    }
-    fn push_one(&mut self, value: T) {
-        self.push(value);
-    }
-}
-
 /// The reader: the bytes, where it is, and the record's terms as interned so far.
 struct In<'r, 't, 'a, 's> {
     bytes: &'r [u8],
@@ -2826,16 +2809,6 @@ impl<'r> In<'r, '_, '_, '_> {
     fn opt<T>(&mut self, what: &'static str, one: impl FnOnce(&mut Self) -> Result<T, E>) -> Result<Option<T>, E> {
         if self.flag(what)? { Ok(Some(one(self)?)) } else { Ok(None) }
     }
-    /// `n` entries into a pre-sized list of the head types' own kind (their allocator is theirs).
-    fn many<T, C: SizedList<T>>(&mut self, what: &'static str, mut one: impl FnMut(&mut Self) -> Result<T, E>) -> Result<C, E> {
-        let n = self.count(what)?;
-        let mut c = C::default();
-        c.reserve_for(n);
-        for _ in 0..n {
-            c.push_one(one(self)?);
-        }
-        Ok(c)
-    }
     /// `n` entries into a list in the reader's allocator.
     fn own<T>(&mut self, what: &'static str, mut one: impl FnMut(&mut Self) -> Result<T, E>) -> Result<Vec<T, Mem>, E> {
         let n = self.count(what)?;
@@ -3027,9 +3000,6 @@ impl<'r> In<'r, '_, '_, '_> {
         })
     }
 
-    fn named_tys<C: SizedList<(Name, PTy)>>(&mut self, what: &'static str) -> Result<C, E> {
-        self.many(what, |r| Ok((r.name(what)?, r.ty(what)?)))
-    }
     fn named_tys_own(&mut self, what: &'static str) -> Result<Vec<(Name, PTy), Mem>, E> {
         self.own(what, |r| Ok((r.name(what)?, r.ty(what)?)))
     }
@@ -3054,19 +3024,7 @@ impl<'r> In<'r, '_, '_, '_> {
             byte => Err(E::Byte { what: "a fn's `Self`", byte }),
         }
     }
-    /// `Out::scope`'s fields, into `FnHead`'s lists.
-    fn scope<P: SizedList<(Name, u32)>, C: SizedList<(u32, PTy)>, B: SizedList<ParamBound>>(&mut self) -> Result<(P, C, B, SelfTy), E> {
-        let params = self.many("a fn's parameters in scope", |r| Ok((r.name("a parameter's name")?, r.u32("a parameter's index")?)))?;
-        let consts = self.many("const parameters", |r| Ok((r.u32("a const parameter")?, r.ty("a const parameter's type")?)))?;
-        let bounds = self.many("a fn's parameter bounds", |r| {
-            let param = r.u32("a bound's parameter")?;
-            let trait_ = r.lib("a bound's trait")?;
-            Ok(ParamBound { param, trait_, args: r.list("a parameter bound's arguments")? })
-        })?;
-        let self_ = self.self_ty()?;
-        Ok((params, consts, bounds, self_))
-    }
-    /// `Out::scope`'s fields, into the reader's allocator (`MemberFrame`).
+    /// `Out::scope`'s fields, into the reader's allocator (`FnHead`, `MemberFrame`).
     fn scope_own(&mut self) -> Result<(Vec<(Name, u32), Mem>, Vec<(u32, PTy), Mem>, Vec<ParamBound, Mem>, SelfTy), E> {
         let params = self.own("a fn's parameters in scope", |r| Ok((r.name("a parameter's name")?, r.u32("a parameter's index")?)))?;
         let consts = self.own("const parameters", |r| Ok((r.u32("a const parameter")?, r.ty("a const parameter's type")?)))?;
@@ -3372,16 +3330,16 @@ impl<'r> In<'r, '_, '_, '_> {
         let declared = self.u32("a fn's declared generics")?;
         let self_param = self.flag("a fn's `self` parameter")?;
         let header = header_of(self.u8("a fn's header")?)?;
-        let inputs = self.many("a fn's inputs", |r| r.ty("a fn's input"))?;
+        let inputs = self.own("a fn's inputs", |r| r.ty("a fn's input"))?;
         let output = self.ty("a fn's output")?;
         let has_body = self.flag("a fn's body flag")?;
         let c_variadic = self.flag("a fn's C-variadic flag")?;
         let byte = self.u8("a fn's qualifiers")?;
         let qualifiers = super::heads::FnQualifiers::from_byte(byte).ok_or(E::Byte { what: "a fn's qualifiers", byte })?;
-        let legacy_const_generics = self.many("a fn's legacy const generic positions", |r| r.u32("a legacy const generic position"))?;
+        let legacy_const_generics = self.own("a fn's legacy const generic positions", |r| r.u32("a legacy const generic position"))?;
         let module = self.lib("a fn's module")?;
-        let (params, consts, bounds, self_) = self.scope()?;
-        let self_assoc = self.named_tys("a fn's `Self` associated types")?;
+        let (params, consts, bounds, self_) = self.scope_own()?;
+        let self_assoc = self.named_tys_own("a fn's `Self` associated types")?;
         Ok((
             key,
             FnHead {

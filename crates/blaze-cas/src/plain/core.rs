@@ -635,6 +635,58 @@ const MAPPING: &str = "mapping a segment its generation names";
 /// what `blaze clean --store` requires before it removes a directory.
 pub const CACHEDIR_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag created by blaze: its plain store.\n# For information about cache directory tags see https://bford.info/cachedir/\n";
 
+/// How strongly a commit orders and flushes segment, manifest log, and head writes to storage.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CommitDurability {
+    /// No barriers or syncs on foreground commits (rebuildable local cache; segments sealed
+    /// asynchronously by background GC or [`Plain::seal`]).
+    Unsynced,
+    /// Ordered barriers ([`Effect::Barrier`]: `F_BARRIERFSYNC` on macOS, `fdatasync` on Linux) on
+    /// each written segment and manifest log before the head slot write, with zero `F_FULLFSYNC`.
+    /// Guarantees a landed head slot never points at torn segment or manifest bytes.
+    Barrier,
+    /// Full power-cut durability after `commit()` returns: [`Effect::Barrier`] on each segment
+    /// and manifest log, one [`Effect::SyncDir`] (flushing directory entries and all prior
+    /// barriers in one hardware flush), then [`Effect::Sync`] on the head slot.
+    Full,
+}
+
+impl CommitDurability {
+    const fn orders_before_flip(self) -> bool {
+        !matches!(self, CommitDurability::Unsynced)
+    }
+
+    const fn flushes_flip(self) -> bool {
+        matches!(self, CommitDurability::Full)
+    }
+}
+
+/// Process liveness state reported by [`PidCheck`] for same-boot dead-PID lease reclamation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PidLiveness {
+    /// Process is known alive; lease MUST be kept until [`LEASE_NS`].
+    Alive,
+    /// Process is provably dead on this boot; lease may be reclaimed immediately.
+    Dead,
+    /// Liveness could not be determined; conservatively treated as alive until [`LEASE_NS`].
+    Unknown,
+}
+
+/// Injected process-liveness seam (rules 14, 75): no ambient `libc::kill` inside sans-IO core.
+pub trait PidCheck {
+    fn check_pid(&self, pid: u32) -> PidLiveness;
+}
+
+/// Conservative [`PidCheck`] that never reclaims leases early (always returns [`PidLiveness::Unknown`]).
+#[derive(Clone, Copy, Default, Debug)]
+pub struct NoPidCheck;
+
+impl PidCheck for NoPidCheck {
+    fn check_pid(&self, _pid: u32) -> PidLiveness {
+        PidLiveness::Unknown
+    }
+}
+
 /// What a store is opened on, its lists in the caller's allocator `A` (the store's own).
 pub struct PlainConfig<A: Allocator + Clone> {
     /// Its directory, under the driver's root.
@@ -1081,6 +1133,15 @@ pub(crate) enum Plant {
     /// only segments whose Bloom filter matches a key in the committing batch (phase_commit_tests
     /// DST control, rule 43).
     CommitMapsAll,
+    /// Planted bug: ignores dead-PID liveness checks during `reclaim_dead_leases`, reproducing
+    /// 30-minute lease pinning of retired segments by crashed processes (phase_commit_tests DST).
+    IgnoreDeadPid,
+    /// Planted bug: treats `PidLiveness::Alive` as `Dead`, proving the DST oracle catches live
+    /// process lease reaping (phase_commit_tests DST).
+    ReapLivePid,
+    /// Planted bug: ignores the same-boot check before probing a lease's PID, proving the DST
+    /// oracle catches cross-boot lease reaping (phase_commit_tests DST).
+    ReapOtherBootPid,
 }
 
 /// What one slice of the background pass did ([`Plain::scrub_next`]).
@@ -2139,6 +2200,13 @@ pub struct Plain<A: Allocator + Clone> {
     leased: bool,
     /// [`Plain::release_lease`] was asked: no later commit sets the lease again.
     released: bool,
+    /// Commit durability policy (initialized from `cfg.durable`; overridable via
+    /// [`Plain::set_commit_durability`]).
+    commit_durability: CommitDurability,
+    /// This process's OS PID (`0` when unknown/simulated), recorded in committed [`Lease`] rows.
+    pid: u32,
+    /// Lease holder nonces proven dead on this boot by [`Plain::reclaim_dead_leases`].
+    reclaimed_leases: blaze_own::Vec<u64, A>,
     /// The slice [`Plain::fold_slice`] wrote, for the next commit's flip; then, being flipped.
     folding: Option<Folded<A>>,
     /// The slice in flight is [`Plain::fold_slice`]'s: it parks in `folding`, not flipped.
@@ -2488,6 +2556,7 @@ impl<A: Allocator + Clone> Plain<A> {
             held,
             sealed: Vec::new_in(a()),
             committing: Vec::new_in(a()),
+            commit_durability: if cfg.durable { CommitDurability::Full } else { CommitDurability::Unsynced },
             cfg,
             #[cfg(test)]
             plant: Plant::None,
@@ -2545,6 +2614,8 @@ impl<A: Allocator + Clone> Plain<A> {
             now_ns: 0,
             leased: false,
             released: false,
+            pid: 0,
+            reclaimed_leases: blaze_own::Vec::new_in(a()),
             folding: None,
             fold_asked: false,
             touches: Vec::new_in(a()),
@@ -2564,6 +2635,86 @@ impl<A: Allocator + Clone> Plain<A> {
     /// What this process's commits did on the disk side of the put path, so far.
     pub fn put_path(&self) -> PutPath {
         self.put_path
+    }
+
+    /// Overrides the commit durability policy (`Unsynced`, `Barrier`, or `Full`).
+    pub fn set_commit_durability(&mut self, durability: CommitDurability) {
+        self.commit_durability = durability;
+    }
+
+    /// Current commit durability policy.
+    pub fn commit_durability(&self) -> CommitDurability {
+        self.commit_durability
+    }
+
+    /// Records this process's OS PID (`0` when unknown/simulated) for committed [`Lease`] rows.
+    pub fn set_pid(&mut self, pid: u32) {
+        self.pid = pid;
+    }
+
+    /// This process's recorded OS PID (`0` when unknown/simulated).
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// Probes same-boot leases named in the current manifest through the injected `check` seam
+    /// (rules 14, 75), marking any lease whose owning OS process is provably dead on this boot
+    /// for immediate reclamation by `plan_gc`, `needs_housekeeping`, `compact`, and the next flip.
+    ///
+    /// Never reclaims:
+    /// - this process's own lease (`lease.holder == self.cfg.nonce`),
+    /// - any lease with unknown PID (`lease.pid == 0`),
+    /// - any lease from another or unknown boot (`self.cfg.boot == 0 || lease.boot != self.cfg.boot`),
+    /// - any lease whose PID is [`PidLiveness::Alive`] or [`PidLiveness::Unknown`].
+    ///
+    /// Returns the number of newly reclaimed dead-PID leases.
+    pub fn reclaim_dead_leases(&mut self, check: &dyn PidCheck) -> u32 {
+        if self.plant() == Plant::IgnoreDeadPid || self.plant() == Plant::LeaseNeverExpires {
+            return 0;
+        }
+        let own_nonce = self.cfg.nonce;
+        let own_boot = self.cfg.boot;
+        let reap_live = self.plant() == Plant::ReapLivePid;
+        let reap_other_boot = self.plant() == Plant::ReapOtherBootPid;
+        let mut newly_reclaimed = 0u32;
+        for lease in &self.manifest.leases {
+            if lease.holder == own_nonce || self.reclaimed_leases.contains(&lease.holder) {
+                continue;
+            }
+            if lease.pid == 0 {
+                continue;
+            }
+            if !reap_other_boot && (own_boot == 0 || lease.boot == 0 || lease.boot != own_boot) {
+                continue;
+            }
+            let dead = match check.check_pid(lease.pid) {
+                PidLiveness::Dead => true,
+                PidLiveness::Alive => reap_live,
+                PidLiveness::Unknown => false,
+            };
+            if dead {
+                self.reclaimed_leases.push(lease.holder);
+                newly_reclaimed = newly_reclaimed.saturating_add(1);
+            }
+        }
+        if newly_reclaimed > 0 {
+            self.reach_cache = None;
+        }
+        newly_reclaimed
+    }
+
+    /// Single source of truth for whether `lease` is live at `now_ns` (rule 30).
+    fn lease_live(&self, lease: &Lease, now_ns: u64) -> bool {
+        if self.plant() == Plant::LeaseNeverExpires {
+            return true;
+        }
+        if lease.expires_ns <= now_ns {
+            return false;
+        }
+        if self.plant() != Plant::IgnoreDeadPid && self.reclaimed_leases.contains(&lease.holder) {
+            return false;
+        }
+        true
     }
 
     /// The allocator the caller handed this store: what it keeps, and what its lists are
@@ -3530,12 +3681,11 @@ impl<A: Allocator + Clone> Plain<A> {
     /// Whether any retired file is past `GRACE_NS`, unmarked as lost, and not held by any active
     /// lease opened before its grace window elapsed (matching the unlink rule in [`Plain::build`]).
     fn has_unlinkable_retired(&self, now_ns: u64) -> bool {
-        let lease_never_expires = self.plant() == Plant::LeaseNeverExpires;
         self.manifest.retired.iter().any(|it| {
             it.lost.is_none()
                 && it.since_ns.saturating_add(GRACE_NS) <= now_ns
                 && !self.manifest.leases.iter().any(|lease| {
-                    (lease.expires_ns > now_ns || lease_never_expires)
+                    self.lease_live(lease, now_ns)
                         && lease.opened_ns < it.since_ns.saturating_add(GRACE_NS)
                 })
         })
@@ -4589,14 +4739,15 @@ impl<A: Allocator + Clone> Plain<A> {
         self.phase = Phase::Renaming(Box::new(named), Box::new(why));
     }
 
-    /// A segment every byte of which is written under its name: synced, then flipped; or,
-    /// not durable, flipped (the planted controls hand some to the flip before their sync).
+    /// A segment every byte of which is written under its name: ordered by [`Effect::Barrier`]
+    /// (`F_BARRIERFSYNC` on macOS, `fdatasync` on Linux), then flipped; or, unsynced, flipped
+    /// (the planted controls hand some to the flip before their barrier).
     fn segment_done(&mut self, writing: Writing<A>, why: Why<A>, effects: &mut Vec<Effect>) {
-        // The planted controls: a segment handed to the flip before its sync (every
-        // segment's, or a merge's alone), or never synced.
+        // The planted controls: a segment handed to the flip before its barrier (every
+        // segment's, or a merge's alone), or never barriered.
         let merge_early = self.plant() == Plant::MergeFlipsBeforeSync && matches!(why, Why::Compact { .. });
         let planted = self.plant() == Plant::SkipDataSync || self.plant() == Plant::FlipBeforeSync || merge_early;
-        let writing = match Synced::not_durable(writing, self.cfg.durable) {
+        let writing = match Synced::not_durable(writing, self.commit_durability.orders_before_flip()) {
             Ok(synced) => synced,
             Err(writing) if planted => {
                 if self.plant() != Plant::SkipDataSync {
@@ -4605,8 +4756,8 @@ impl<A: Allocator + Clone> Plain<A> {
                 Synced::for_a_plant(writing)
             }
             Err(writing) => {
-                self.put_path.syncs += 1;
-                effects.push(Effect::Sync { file: writing.file.share(), tag: self.tag(SEG_SYNC, 0) });
+                self.put_path.barriers += 1;
+                effects.push(Effect::Barrier { file: writing.file.share(), tag: self.tag(SEG_SYNC, 0) });
                 self.phase = Phase::SyncingSegment(Box::new(writing), Box::new(why));
                 return;
             }
@@ -4829,11 +4980,13 @@ impl<A: Allocator + Clone> Plain<A> {
             if lease.holder == self.cfg.nonce {
                 continue;
             }
-            if !lease_never_expires {
-                if lease.expires_ns <= now_ns {
+            if !self.lease_live(lease, now_ns) {
+                if !lease_never_expires && lease.expires_ns <= now_ns {
                     valid_from_ns = valid_from_ns.max(lease.expires_ns);
-                    continue;
                 }
+                continue;
+            }
+            if !lease_never_expires {
                 valid_until_ns = valid_until_ns.min(lease.expires_ns);
             }
             min_other_lease_since = Some(match min_other_lease_since {
@@ -5115,7 +5268,6 @@ impl<A: Allocator + Clone> Plain<A> {
         };
         let expired_roots = u32::try_from(self.manifest.roots.iter().filter(|it| it.expires_ns != NEVER && it.expires_ns <= now_ns).count()).unwrap_or(u32::MAX);
         let lru_evict_roots = evict.as_ref().map_or(0, |it| u32::try_from(it.len()).unwrap_or(u32::MAX));
-        let lease_never_expires = self.plant() == Plant::LeaseNeverExpires;
         let retired_ready = u32::try_from(
             self.manifest
                 .retired
@@ -5124,7 +5276,7 @@ impl<A: Allocator + Clone> Plain<A> {
                     it.lost.is_none()
                         && it.since_ns.saturating_add(GRACE_NS) <= now_ns
                         && !self.manifest.leases.iter().any(|lease| {
-                            (lease.expires_ns > now_ns || lease_never_expires)
+                            self.lease_live(lease, now_ns)
                                 && lease.opened_ns < it.since_ns.saturating_add(GRACE_NS)
                         })
                 })
@@ -5338,7 +5490,7 @@ impl<A: Allocator + Clone> Plain<A> {
 
     /// A live lease keeps `seg` whole: it is of the lease's generation or newer.
     fn leased(&self, seg: &Segment, now_ns: u64) -> bool {
-        self.manifest.leases.iter().any(|it| seg.generation >= it.since && (it.expires_ns > now_ns || self.plant() == Plant::LeaseNeverExpires))
+        self.manifest.leases.iter().any(|it| seg.generation >= it.since && self.lease_live(it, now_ns))
     }
 
     /// Collects the top-level index keys directly listed by unexpired `TagReach::Indexes` roots
@@ -6261,6 +6413,17 @@ impl<A: Allocator + Clone> Plain<A> {
         // LRU-evict was concurrently renewed/updated or is now covered by an active lease).
         let own_nonce = self.cfg.nonce;
         let lease_never_expires = self.plant() == Plant::LeaseNeverExpires;
+        let ignore_dead_pid = self.plant() == Plant::IgnoreDeadPid;
+        let reclaimed = &self.reclaimed_leases;
+        let is_lease_live = |it: &Lease| -> bool {
+            if lease_never_expires {
+                return true;
+            }
+            if it.expires_ns <= now_ns {
+                return false;
+            }
+            ignore_dead_pid || !reclaimed.contains(&it.holder)
+        };
         let own_segments = &self.manifest.segments;
         let apply_slice = |m: &mut Manifest, seg: &mut Option<(Segment, FileName)>, candidates: &[u64], orphans: &[(u64, bool)], evict: Option<&EvictPlan<A>>, stats: &mut Sliced| -> bool {
             // As planned: named, here, of the same generation, and touched by no commit since
@@ -6274,7 +6437,7 @@ impl<A: Allocator + Clone> Plain<A> {
                 let min_lease = m
                     .leases
                     .iter()
-                    .filter(|it| it.holder != own_nonce && (it.expires_ns > now_ns || lease_never_expires))
+                    .filter(|it| it.holder != own_nonce && is_lease_live(it))
                     .map(|it| it.since)
                     .min();
                 plan.iter().any(|(name, exp_gen, exp_ns)| {
@@ -6326,7 +6489,7 @@ impl<A: Allocator + Clone> Plain<A> {
                     .iter()
                     .filter(|it| {
                         candidates.contains(&it.id)
-                            && m.leases.iter().any(|l| it.generation >= l.since && (l.expires_ns > now_ns || lease_never_expires))
+                            && m.leases.iter().any(|l| it.generation >= l.since && is_lease_live(l))
                     })
                     .map(|it| it.generation)
                     .max();
@@ -6471,7 +6634,14 @@ impl<A: Allocator + Clone> Plain<A> {
                                 let holder = self.cfg.nonce;
                                 let since = m.leases.iter().find(|it| it.holder == holder).map_or(*since, |it| it.since.min(*since));
                                 m.leases.retain(|it| it.holder != holder);
-                                m.leases.push(Lease { holder, since, opened_ns: *opened_ns, expires_ns: now_ns.saturating_add(LEASE_NS) });
+                                m.leases.push(Lease {
+                                    holder,
+                                    since,
+                                    opened_ns: *opened_ns,
+                                    expires_ns: now_ns.saturating_add(LEASE_NS),
+                                    boot: self.cfg.boot,
+                                    pid: self.pid,
+                                });
                             }
                             RootEdit::Release => m.leases.retain(|it| it.holder != self.cfg.nonce),
                         }
@@ -6524,12 +6694,13 @@ impl<A: Allocator + Clone> Plain<A> {
                 aborted = apply_slice(&mut m, seg, candidates, orphans, evict.as_ref(), stats);
             }
         }
-        // What expired by the clock this flip passes in goes: a root past its life, and a lease
-        // whose holder neither renewed nor let go of it (it died, or ran past [`LEASE_NS`]
-        // between two commits).
+        // What expired by the clock this flip passes in, or whose owning PID on this boot was
+        // proven dead by [`Plain::reclaim_dead_leases`], goes now.
         m.roots.retain(|it| it.expires_ns > now_ns);
         if self.plant() != Plant::LeaseNeverExpires {
-            m.leases.retain(|it| it.expires_ns > now_ns);
+            let reclaimed = &self.reclaimed_leases;
+            let ignore_dead = self.plant() == Plant::IgnoreDeadPid;
+            m.leases.retain(|it| it.expires_ns > now_ns && (ignore_dead || !reclaimed.contains(&it.holder)));
         }
         if refused.is_some() || carry {
             // Not flipped: the slice waits for the next commit (or the carry's flip), unchanged.
@@ -6761,6 +6932,7 @@ impl<A: Allocator + Clone> Plain<A> {
                 }
                 self.bloom.prune(&self.manifest.segments, &self.manifest.roots);
                 self.leased = self.manifest.leases.iter().any(|it| it.holder == self.cfg.nonce);
+                self.reclaimed_leases.retain(|holder| self.manifest.leases.iter().any(|it| it.holder == *holder));
                 refreshed = true;
             }
             self.sliced = Some(stats);
@@ -6832,11 +7004,12 @@ impl<A: Allocator + Clone> Plain<A> {
             self.bloom.note_written(replaced, len);
         }
         self.leased = self.manifest.leases.iter().any(|it| it.holder == self.cfg.nonce);
+        self.reclaimed_leases.retain(|holder| self.manifest.leases.iter().any(|it| it.holder == *holder));
         // The slot names the log this flip wrote its manifest to.
         self.log_lost = false;
-        if self.cfg.durable && (self.plant() == Plant::FlipBeforeSync || self.plant() == Plant::MergeFlipsBeforeSync) {
+        if self.commit_durability.orders_before_flip() && (self.plant() == Plant::FlipBeforeSync || self.plant() == Plant::MergeFlipsBeforeSync) {
             for (i, file) in std::mem::replace(&mut self.late_sync, Vec::new_in(self.alloc.clone())).into_iter().enumerate() {
-                effects.push(Effect::Sync { file, tag: self.tag(LATE_SYNC, i as u32) });
+                effects.push(Effect::Barrier { file, tag: self.tag(LATE_SYNC, u32::try_from(i).unwrap_or(u32::MAX)) });
             }
         }
         let left = flip.removals.len() as u32;
@@ -7513,9 +7686,9 @@ impl<A: Allocator + Clone> Plain<A> {
                     // and a Truncate to the length it has is no change).
                     effects.push(Effect::Truncate { file: self.head.share(), len: HEAD_LEN as u64, tag: self.tag(HEAD_MAKE, 1) });
                 } else if index == 1 {
-                    // Synced once in the store's life, before its first segment: so an empty or
-                    // short head never stands beside segments a power cut kept.
-                    effects.push(Effect::Sync { file: self.head.share(), tag: self.tag(HEAD_MAKE, 2) });
+                    // Ordered before `SyncDir` below, which flushes the barriered head bytes and
+                    // its directory entry together in one hardware sync instead of two.
+                    effects.push(Effect::Barrier { file: self.head.share(), tag: self.tag(HEAD_MAKE, 2) });
                 } else if index == 2 {
                     // And its name with it: a power cut never keeps a segment's name and loses
                     // the head's.
@@ -7748,8 +7921,11 @@ impl<A: Allocator + Clone> Plain<A> {
                 Ok(())
             }
             (SEG_SYNC, Phase::SyncingSegment(writing, _)) => {
-                if let Some(why) = fail("syncing a segment", &writing.file, &done) {
+                if let Some(why) = fail("ordering a segment", &writing.file, &done) {
                     return Err(why);
+                }
+                if !matches!(done, Done::Ordered | Done::Synced) {
+                    return Err(unexpected("ordering a segment"));
                 }
                 let Phase::SyncingSegment(writing, why) = std::mem::replace(&mut self.phase, Phase::Broken) else { unreachable!() };
                 self.segment_written(Synced::by_sync(*writing), *why, effects);
@@ -7807,22 +7983,27 @@ impl<A: Allocator + Clone> Plain<A> {
                 if let Some(why) = fail("writing a manifest", &flip.log, &done) {
                     return Err(why);
                 }
-                if self.cfg.durable {
-                    effects.push(Effect::Sync { file: flip.log.share(), tag: self.tag(LOG_SYNC, 0) });
+                if self.commit_durability.orders_before_flip() {
+                    self.put_path.barriers += 1;
+                    effects.push(Effect::Barrier { file: flip.log.share(), tag: self.tag(LOG_SYNC, 0) });
                 } else {
                     self.write_slot(effects);
                 }
                 Ok(())
             }
             (LOG_SYNC, Phase::Flipping(flip)) => {
-                if let Some(why) = fail("syncing a manifest log", &flip.log, &done) {
+                if let Some(why) = fail("ordering a manifest log", &flip.log, &done) {
                     return Err(why);
                 }
-                if self.plant() == Plant::SkipDirSync {
+                if !matches!(done, Done::Ordered | Done::Synced) {
+                    return Err(unexpected("ordering a manifest log"));
+                }
+                if !self.commit_durability.flushes_flip() || self.plant() == Plant::SkipDirSync {
                     self.write_slot(effects);
                 } else {
-                    // Durable: the names of the segments and the log made for this generation
-                    // are made durable before the slot that names them.
+                    // Full durability: the names of the segments and the log made for this
+                    // generation are made durable (flushing prior segment and log barriers in one
+                    // hardware sync) before the slot that names them.
                     effects.push(Effect::SyncDir { dir: self.cfg.dir.share().into(), tag: self.tag(DIR_SYNC, 0) });
                 }
                 Ok(())
@@ -7873,7 +8054,7 @@ impl<A: Allocator + Clone> Plain<A> {
                     }
                     _ => {}
                 }
-                if self.cfg.durable {
+                if self.commit_durability.flushes_flip() {
                     effects.push(Effect::Sync { file: self.head.share(), tag: self.tag(HEAD_SYNC, 0) });
                 } else {
                     self.unlock(effects);
@@ -8118,6 +8299,8 @@ fn hash_leases(leases: &[Lease]) -> ContentId {
         h.update(&lease.holder.to_le_bytes());
         h.update(&lease.since.to_le_bytes());
         h.update(&lease.expires_ns.to_le_bytes());
+        h.update(&lease.boot.to_le_bytes());
+        h.update(&lease.pid.to_le_bytes());
     }
     h.finish()
 }

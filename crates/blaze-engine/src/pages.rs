@@ -86,7 +86,7 @@ use blaze_drive::key::{Key, Kind, Name, content_key};
 use blaze_id::ContentId;
 use blaze_own::{BTreeMap, BTreeSet, SharedAlloc, Vec};
 
-use crate::engine::{Answer, Cause, CellId, Entered, Gen, Phase, Planned, Row, SMap, SSet, SVec, Stage};
+use crate::engine::{Answer, Cause, CellId, Entered, Gen, Phase, Planned, Readers, Row, SMap, SVec, Stage};
 
 mod bep6;
 mod view;
@@ -726,7 +726,7 @@ pub struct WholePageJob<'k, 'm> {
     files: &'k [(&'k Name, &'k SVec<'m, Name>)],
     causes: &'k [(&'k Name, &'k (Gen, Cause))],
     records: &'k [(&'k Name, &'k Key)],
-    readers: &'k [(&'k CellId, &'k SSet<'m, Name>)],
+    readers: &'k [(&'k CellId, &'k [Name])],
 }
 
 /// The serialized and content-hashed result of one [`WholePageJob`].
@@ -1438,13 +1438,14 @@ pub fn decode_at<'a, 'g>(root: &Root<'_>, mut get: impl FnMut(Key) -> Got<'g>, a
     let mut kept = Kept::new_in(alloc);
     kept.answer.serial = root.serial;
     kept.places.extend(root.places.iter().map(|(&file, &place)| (file, place)));
+    let mut reader_pairs: SVec<'a, (CellId, Name)> = Vec::new_in(alloc);
     if !root.is_radix() {
         for (index, &key) in root.pages.iter().enumerate() {
             if key == Key::default() { continue; }
             let index = u32::try_from(index).unwrap_or(u32::MAX);
             let sealed = get(key).ok_or(PagesError::Missing { page: index, key })?.map_err(|torn| torn.at(index))?;
             let page = VerifiedPage::open_whole(sealed, index, root.bits)?;
-            page.restore(&mut kept, alloc);
+            page.restore(&mut kept, &mut reader_pairs, alloc);
         }
     } else {
         for (shard_idx, &shard_key) in root.page_shards.iter().enumerate() {
@@ -1458,10 +1459,11 @@ pub fn decode_at<'a, 'g>(root: &Root<'_>, mut get: impl FnMut(Key) -> Got<'g>, a
                 let index = u32::try_from(base_index + slot).unwrap_or(u32::MAX);
                 let sealed = get(key).ok_or(PagesError::Missing { page: index, key })?.map_err(|torn| torn.at(index))?;
                 let page = VerifiedPage::open_whole(sealed, index, root.bits)?;
-                page.restore(&mut kept, alloc);
+                page.restore(&mut kept, &mut reader_pairs, alloc);
             }
         }
     }
+    kept.answer.readers = Readers::from_pairs(reader_pairs, alloc);
     Ok(kept)
 }
 
@@ -1525,6 +1527,7 @@ mod codex_regression_tests {
         let mut kept = Kept::new_in(alloc);
         kept.answer.serial = Gen(7);
         let phase = Phase::new(Stage::Bodies, 0);
+        let mut reader_pairs = Vec::new_in(alloc);
         for i in 0..96u32 {
             let file = Name::new(Kind::FileItems, ContentId::of("par file", &(i % 8).to_le_bytes()));
             let name = Name::new(Kind::BodyCheck, ContentId::of("par task", &i.to_le_bytes()));
@@ -1543,7 +1546,7 @@ mod codex_regression_tests {
                 let prev_id = CellId { of: prev, cell: prev_cell };
                 reads.push((prev_id, ContentId::of("par out", &(i - 1).to_le_bytes())));
                 by_cell.push(0u32);
-                kept.answer.readers.entry(prev_id).or_insert_with(|| BTreeSet::new_in(alloc)).insert(name);
+                reader_pairs.push((prev_id, name));
             }
             kept.answer.cells.insert(cid, (out, Gen(7)));
             kept.answer.by_file.entry(file).or_insert_with(|| Vec::new_in(alloc)).push(name);
@@ -1555,6 +1558,7 @@ mod codex_regression_tests {
             kept.causes.insert(name, (Gen(7), Cause::New));
             kept.records.insert(name, rec_key);
         }
+        kept.answer.readers = Readers::from_pairs(reader_pairs, alloc);
         for names in kept.answer.by_file.values_mut() {
             names.sort_unstable();
         }

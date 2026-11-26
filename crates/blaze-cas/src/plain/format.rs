@@ -27,9 +27,12 @@ use blaze_keyed::{
 /// row's flag 4, sealed ([`Segment::sealed`]), which format 3 refused as a row no commit
 /// writes; format 5 gives each root an expiry ([`Root::expires_ns`]) and adds the leases a
 /// running command holds ([`Lease`], counted in the header's last word, which format 4 kept
-/// zero), and a segment row's touch ([`Segment::touched`], a u64 at its end). A head or a manifest of another format is refused naming both; there is no
-/// migration: the store is rebuilt from what made it.
-pub const FORMAT: u32 = 5;
+/// zero), and a segment row's touch ([`Segment::touched`], a u64 at its end); format 6 extends
+/// each lease row from 32 to 48 bytes with the holder's machine boot (`boot: u64`) and OS
+/// process id (`pid: u32`, reserved `u32 = 0`) so same-boot GC can immediately reclaim leases
+/// of provably dead processes without waiting `LEASE_NS`. A head or a manifest of another format
+/// is refused naming both; there is no migration: the store is rebuilt from what made it.
+pub const FORMAT: u32 = 6;
 
 /// The format of a plain segment, which outlives any one store (a published segment is shared
 /// through a bucket): its own number, so a change to the store's own files never changes a
@@ -54,7 +57,7 @@ pub const SEGMENT_FORMAT: u32 = 3;
 pub const FORMS: [(u8, u32); 2] = [(b'f', FORMAT), (b's', SEGMENT_FORMAT)];
 
 /// The name of a store's folder of one set of [`FORMS`]: each form's letter and its number in
-/// decimal, in order: `f5s3` for this blaze. Why letters and numbers, not a digest of them: the
+/// decimal, in order: `f6s3` for this blaze. Why letters and numbers, not a digest of them: the
 /// name says to a person (and to the note that lists other folders) which forms a folder holds,
 /// a newer one sorts after an older one of the same width, and the forms are few (a digest would
 /// hide them for nothing: the name is no key, and nothing is shared by it).
@@ -1077,8 +1080,9 @@ pub(crate) const NEVER: u64 = u64::MAX;
 
 /// What a running command holds while its records are not yet named by a root: every segment
 /// of generation `since` or newer is kept whole, and no file retired after `opened_ns` (less
-/// the grace) is unlinked, until `expires_ns`. Set by the holder's commits, let go by its last;
-/// a process that dies holding one is let go of by the clock.
+/// the grace) is unlinked, until `expires_ns` (or until same-boot GC proves `pid` dead). Set by
+/// the holder's commits, let go by its last; a process that dies holding one is reclaimed on the
+/// same boot by PID liveness check, or otherwise let go of by the clock.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct Lease {
     /// The holder's [`super::core::PlainConfig::nonce`].
@@ -1088,6 +1092,10 @@ pub(crate) struct Lease {
     /// The wall clock at the holder's open.
     pub opened_ns: u64,
     pub expires_ns: u64,
+    /// The machine boot the holder opened in (`PlainConfig::boot`); `0` when unknown.
+    pub boot: u64,
+    /// The holder's OS process id (`Plain::pid`), or `0` when unknown/unprobed.
+    pub pid: u32,
 }
 
 /// What one generation holds: its segments (oldest first), its roots, its leases, its retired
@@ -1101,18 +1109,18 @@ pub(crate) struct Manifest {
     pub retired: Vec<Retired>,
 }
 
-/// One lease row: holder u64, since u64, opened ns u64, expires ns u64.
-const LEASE_ROW: usize = 32;
+/// One lease row: holder u64, since u64, opened ns u64, expires ns u64, boot u64, pid u32, zero u32.
+const LEASE_ROW: usize = 48;
 
 impl Manifest {
     /// Bytes 0..4 magic `BLPM`, 4..8 format, 8..16 generation, 16..20 segments `s`, 20..24
     /// retired `r`, 24..28 roots `t`, 28..32 leases `l`; then `s` x 88 (digest 32, length u64,
     /// index offset u64, entries u32, flags u32 (1 here, 2 published, 4 sealed), namespace u64,
     /// generation u64, boot u64, touched u64), `r` x 24 (id u64, 1 for a log u32, the mark u32
-    /// ([`LostMark::encode`]: zero for none, never set on a log), since ns u64), `l` x 32
-    /// ([`Lease`]: holder, since, opened ns, expires ns, each u64), and `t` roots, each 32 key,
-    /// 8 generation, 8 expiry ns, 2 name length, the name's UTF-8, zeros to a multiple of 8.
-    /// Little-endian.
+    /// ([`LostMark::encode`]: zero for none, never set on a log), since ns u64), `l` x 48
+    /// ([`Lease`]: holder, since, opened ns, expires ns, boot each u64; pid u32; zero u32), and
+    /// `t` roots, each 32 key, 8 generation, 8 expiry ns, 2 name length, the name's UTF-8, zeros
+    /// to a multiple of 8. Little-endian.
     ///
     /// Each segment row is written through [`Row::new`], the check [`Manifest::decode`] reads
     /// it through, in a store whose segments are at most `most` bytes: a row the open would
@@ -1143,6 +1151,9 @@ impl Manifest {
             out.extend_from_slice(&it.since.to_le_bytes());
             out.extend_from_slice(&it.opened_ns.to_le_bytes());
             out.extend_from_slice(&it.expires_ns.to_le_bytes());
+            out.extend_from_slice(&it.boot.to_le_bytes());
+            out.extend_from_slice(&it.pid.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
         }
         for root in &self.roots {
             out.extend_from_slice(&root.key.0);
@@ -1206,7 +1217,17 @@ impl Manifest {
         let mut leases = Vec::with_capacity_in(l, Global);
         for i in 0..l {
             let at = rows + LEASE_ROW * i;
-            let it = Lease { holder: u64_at(bytes, at), since: u64_at(bytes, at + 8), opened_ns: u64_at(bytes, at + 16), expires_ns: u64_at(bytes, at + 24) };
+            if u32_at(bytes, at + 44) != 0 {
+                return Err(bad("a lease row has non-zero reserved bits", at + 44));
+            }
+            let it = Lease {
+                holder: u64_at(bytes, at),
+                since: u64_at(bytes, at + 8),
+                opened_ns: u64_at(bytes, at + 16),
+                expires_ns: u64_at(bytes, at + 24),
+                boot: u64_at(bytes, at + 32),
+                pid: u32_at(bytes, at + 40),
+            };
             if it.since > generation || leases.iter().any(|other: &Lease| other.holder == it.holder) {
                 return Err(bad("a lease row is not one a flip writes (its generation newer than the manifest's, or a second lease of one holder)", at));
             }

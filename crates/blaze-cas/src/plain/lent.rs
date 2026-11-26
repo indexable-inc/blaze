@@ -29,7 +29,7 @@ use blaze_mem::Kept;
 use blaze_own::Arc;
 
 use super::arena::{Arena, ArenaView, RunEntry, Visibility};
-use super::core::{Batch, Committed, GcPlan, LentRecord, Named, POINTER_LEN, Probes, PutPath, Renewed, Report, Sliced};
+use super::core::{Batch, CommitDurability, Committed, GcPlan, LentRecord, Named, POINTER_LEN, PidCheck, Probes, PutPath, Renewed, Report, Sliced};
 use super::driven::{Driven, HeadIdentity};
 use super::format::record_crc;
 use crate::Key;
@@ -1215,6 +1215,22 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
     /// Number of active leases named by the current manifest, without allocating.
     pub fn leases_len(&self) -> usize {
         self.inner.borrow().store.core().leases_len()
+    }
+
+    /// Overrides the commit durability policy on the underlying plain store.
+    pub fn set_commit_durability(&self, durability: CommitDurability) {
+        self.inner.borrow_mut().store.set_commit_durability(durability);
+    }
+
+    /// Records this process's OS PID (`0` when unknown/simulated) for committed leases.
+    pub fn set_pid(&self, pid: u32) {
+        self.inner.borrow_mut().store.set_pid(pid);
+    }
+
+    /// Probes same-boot leases via `check` and marks provably dead-PID leases for immediate GC
+    /// reclamation ([`super::core::Plain::reclaim_dead_leases`]).
+    pub fn reclaim_dead_leases(&self, check: &dyn PidCheck) -> u32 {
+        self.inner.borrow_mut().store.reclaim_dead_leases(check)
     }
 
     /// Whether [`Lent::commit`] has any uncommitted puts, pending roots, open stamps, or a

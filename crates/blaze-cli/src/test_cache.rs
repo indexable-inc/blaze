@@ -90,8 +90,49 @@ pub(crate) struct SuiteDigests {
     pub(crate) closed_crates_digest: [u8; 32],
 }
 
+/// Precomputed workspace-wide index shared across all suites in one `blaze test` invocation so
+/// [`compute_suite_digests_with_ctx`] avoids O(suites × total_files) `root.places` scans and
+/// redundant `root.units` sorting while producing byte-for-byte identical [`SuiteDigests`].
+pub(crate) struct SuiteDigestContext<'a> {
+    settled_units: Option<AVec<'a, (blaze_drive::Name, Option<ContentId>)>>,
+    /// Sorted by `(unit_subject, file_name)` for O(log F) lookup of files owned by each workspace
+    /// crate's root unit.
+    places_by_unit: AVec<'a, ([u8; 32], blaze_drive::Name)>,
+}
+
+impl<'a> SuiteDigestContext<'a> {
+    pub(crate) fn new(
+        engine_root: Option<&blaze_engine::pages::Root<'_>>,
+        standing_errors: u32,
+        alloc: Alloc<'a>,
+    ) -> SuiteDigestContext<'a> {
+        let Some(root) = engine_root.filter(|root| {
+            standing_errors == 0 && root.owed_tasks.is_empty() && root.owed_cells.is_empty()
+        }) else {
+            return SuiteDigestContext { settled_units: None, places_by_unit: Vec::new_in(alloc) };
+        };
+        let mut unit_names: AVec<'_, blaze_drive::Name> = Vec::with_capacity_in(root.units.len(), alloc);
+        unit_names.extend_from_slice(root.units.as_slice());
+        unit_names.sort_unstable();
+        unit_names.dedup();
+        let mut settled_units: AVec<'a, (blaze_drive::Name, Option<ContentId>)> =
+            Vec::with_capacity_in(unit_names.len(), alloc);
+        for &u in unit_names.iter() {
+            settled_units.push((u, root.files.get(&u).copied().flatten()));
+        }
+        let mut places_by_unit: AVec<'a, ([u8; 32], blaze_drive::Name)> =
+            Vec::with_capacity_in(root.places.len(), alloc);
+        for (&file_name, place) in root.places.iter() {
+            places_by_unit.push((place.unit.subject.0, file_name));
+        }
+        places_by_unit.sort_unstable();
+        SuiteDigestContext { settled_units: Some(settled_units), places_by_unit }
+    }
+}
+
 /// Computes deterministic per-suite [`SuiteDigests`] over `unit`'s transitive crate dependency
 /// closure in `list` (rules 21, 25).
+#[cfg_attr(not(test), allow(dead_code, reason = "single-suite convenience wrapper over compute_suite_digests_with_ctx"))]
 #[expect(clippy::too_many_arguments, reason = "computes closed and full suite closure digests from engine standing state")]
 pub(crate) fn compute_suite_digests(
     unit: TestUnit<'_>,
@@ -102,6 +143,23 @@ pub(crate) fn compute_suite_digests(
     standing_root: ContentId,
     standing_errors: u32,
     engine_root: Option<&blaze_engine::pages::Root<'_>>,
+    alloc: Alloc<'_>,
+) -> SuiteDigests {
+    let ctx = SuiteDigestContext::new(engine_root, standing_errors, alloc);
+    compute_suite_digests_with_ctx(unit, builder, list, ids, tools_digest, standing_root, engine_root, &ctx, alloc)
+}
+
+/// Computes deterministic per-suite [`SuiteDigests`] reusing a precomputed [`SuiteDigestContext`].
+#[expect(clippy::too_many_arguments, reason = "computes closed and full suite closure digests from engine standing state")]
+pub(crate) fn compute_suite_digests_with_ctx(
+    unit: TestUnit<'_>,
+    builder: &Builder,
+    list: &blaze_world::crate_list::CrateList<'_>,
+    ids: &RunIds<'_>,
+    tools_digest: [u8; 32],
+    standing_root: ContentId,
+    engine_root: Option<&blaze_engine::pages::Root<'_>>,
+    ctx: &SuiteDigestContext<'_>,
     alloc: Alloc<'_>,
 ) -> SuiteDigests {
     use blaze_world::crate_list::CrateGraph as _;
@@ -163,17 +221,13 @@ pub(crate) fn compute_suite_digests(
     let mut suite_h = Hasher::new(SUITE_CERT_DOMAIN);
     suite_h.update(&closed_crates_digest);
     suite_h.id(&unit.key.0);
-    match engine_root {
-        Some(root) if standing_errors == 0 && root.owed_tasks.is_empty() && root.owed_cells.is_empty() => {
+    match (engine_root, ctx.settled_units.as_ref()) {
+        (Some(root), Some(settled_units)) => {
             suite_h.update(&[1]);
-            let mut unit_names: AVec<'_, blaze_drive::Name> = Vec::with_capacity_in(root.units.len(), alloc);
-            unit_names.extend_from_slice(root.units.as_slice());
-            unit_names.sort_unstable();
-            unit_names.dedup();
-            suite_h.update(&u64::try_from(unit_names.len()).unwrap_or(u64::MAX).to_le_bytes());
-            for &u in unit_names.iter() {
+            suite_h.update(&u64::try_from(settled_units.len()).unwrap_or(u64::MAX).to_le_bytes());
+            for &(u, digest) in settled_units.iter() {
                 suite_h.part(u.kind.name().as_bytes()).id(&u.subject);
-                match root.files.get(&u).copied().flatten() {
+                match digest {
                     Some(digest) => {
                         suite_h.update(&[1]);
                         suite_h.id(&digest);
@@ -184,8 +238,7 @@ pub(crate) fn compute_suite_digests(
                 }
             }
 
-            let mut root_files: Set<[u8; 32], BuildKeyHasher, Alloc<'_>> =
-                Set::new(blaze_hash::SetOpts { hasher: BuildKeyHasher::default(), alloc, capacity: None });
+            let mut root_subjects: AVec<'_, [u8; 32]> = Vec::new_in(alloc);
             let mut fstack: AVec<'_, blaze_drive::Name> = Vec::new_in(alloc);
             let mut seen_files: Set<[u8; 32], BuildKeyHasher, Alloc<'_>> =
                 Set::new(blaze_hash::SetOpts { hasher: BuildKeyHasher::default(), alloc, capacity: None });
@@ -212,7 +265,7 @@ pub(crate) fn compute_suite_digests(
                 suite_h.update(bodies);
                 if let Some(rel) = list.root(at).strip_prefix("/0/") {
                     let root_file = blaze_drive::Name::file(rel.as_bytes());
-                    root_files.insert(root_file.subject.0);
+                    root_subjects.push(root_file.subject.0);
                     if seen_files.insert(root_file.subject.0) {
                         fstack.push(root_file);
                     }
@@ -221,10 +274,20 @@ pub(crate) fn compute_suite_digests(
             suite_h.update(&member_count.to_le_bytes());
 
             // Also include any file whose `FilePlace::unit` belongs to a workspace crate in `closure`
-            // (covers macro-generated `mod` files in addition to `ids.edges`).
-            for (&file_name, place) in root.places.iter() {
-                if root_files.contains(&place.unit.subject.0) && seen_files.insert(file_name.subject.0) {
-                    fstack.push(file_name);
+            // (covers macro-generated `mod` files in addition to `ids.edges`) in O(log F + owned).
+            root_subjects.sort_unstable();
+            root_subjects.dedup();
+            for &subj in root_subjects.iter() {
+                let start = ctx.places_by_unit.partition_point(|&(u, _)| u < subj);
+                if let Some(tail) = ctx.places_by_unit.get(start..) {
+                    for &(u, file_name) in tail {
+                        if u != subj {
+                            break;
+                        }
+                        if seen_files.insert(file_name.subject.0) {
+                            fstack.push(file_name);
+                        }
+                    }
                 }
             }
             let mut files: AVec<'_, blaze_drive::Name> = Vec::new_in(alloc);

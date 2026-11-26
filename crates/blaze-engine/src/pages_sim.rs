@@ -285,6 +285,7 @@ fn answer(rows: &BTreeMap<u64, u64>, seed: u64, serial: u64) -> Kept<'static> {
     let mut kept = Kept::new_in(a);
     kept.answer.serial = Gen(serial);
     let names: StdVec<u64> = rows.keys().copied().collect();
+    let mut reader_pairs = Vec::new_in(a);
     for (&i, &version) in rows.iter() {
         let me = name(Kind::ModuleScope, seed, i);
         let file = name(Kind::FileItems, seed, i % 7);
@@ -299,7 +300,7 @@ fn answer(rows: &BTreeMap<u64, u64>, seed: u64, serial: u64) -> Kept<'static> {
         read_ids.dedup();
         for read in read_ids {
             reads.push((read, id(seed, version, 9)));
-            kept.answer.readers.entry(read).or_insert_with(|| blaze_own::BTreeSet::new_in(a)).insert(me);
+            reader_pairs.push((read, me));
         }
         let findings = u32::from(version % 5 == 0);
         if findings > 0 {
@@ -337,6 +338,7 @@ fn answer(rows: &BTreeMap<u64, u64>, seed: u64, serial: u64) -> Kept<'static> {
         };
         kept.causes.insert(me, (Gen(serial), cause));
     }
+    kept.answer.readers = crate::engine::Readers::from_pairs(reader_pairs, a);
     kept
 }
 
@@ -650,13 +652,14 @@ fn bep6_compact_page_density_and_sparse_causes() {
     let shared_cells: StdVec<(CellId, ContentId)> = (0..16u64)
         .map(|k| (CellId { of: name(Kind::CrateScope, 7, k / 4), cell: Cell([k as u8; 16]) }, id(7, k, 1)))
         .collect();
+    let mut ws_reader_pairs = Vec::with_capacity_in(400 * shared_cells.len(), a);
     for i in 0..400u64 {
         let me = name(Kind::BodyCheck, 7, i);
         let file = name(Kind::FileItems, 7, i % 4);
         let mut reads = Vec::with_capacity_in(shared_cells.len(), a);
         for &(cid, dig) in shared_cells.iter() {
             reads.push((cid, dig));
-            ws.answer.readers.entry(cid).or_insert_with(|| blaze_own::BTreeSet::new_in(a)).insert(me);
+            ws_reader_pairs.push((cid, me));
         }
         reads.sort_unstable_by_key(|(c, _)| *c);
         let by_cell = crate::engine::by_cell(me, &reads, a).expect("sorted reads");
@@ -681,6 +684,7 @@ fn bep6_compact_page_density_and_sparse_causes() {
         ws.records.insert(me, Key(id(7, i, 5)));
         ws.answer.by_file.entry(file).or_insert_with(|| Vec::new_in(a)).push(me);
     }
+    ws.answer.readers = crate::engine::Readers::from_pairs(ws_reader_pairs, a);
     for members in ws.answer.by_file.values_mut() {
         members.sort_unstable();
     }

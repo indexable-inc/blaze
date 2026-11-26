@@ -1060,6 +1060,31 @@ pub(crate) fn names_of<'n, 'm: 'n>(
     names_in(cx, root, crates, procs, seen, frame)
 }
 
+/// [`names_of`], opening every dependency crate past the owner on demand through `by_need`
+/// (`front_load::ScopeRecords`, rule 77) instead of eagerly reading and mapping every crate in
+/// the check scope upfront.
+#[expect(clippy::too_many_arguments, reason = "the StartProgram site's edge: each argument one thing it holds")]
+pub(crate) fn names_of_by_need<'n, 'm: 'n>(
+    cx: &'n Cx,
+    root: &'n Dir<ReadWrite>,
+    found: &'n Found<'_>,
+    owner: Owner,
+    store: &mut dyn Store<'m>,
+    kept: &mut Kept,
+    read: &mut EngineRecords<'m>,
+    by_need: &'n dyn crate::front_load::OpenByNeed,
+    env: &'n crate::fetch::FetchEnv<'_>,
+    dirs: &'n SyncPackDirs,
+    procs: crate::job_texts::Procs<'n>,
+    seen: &'n TreesSeen,
+    frame: &'n Frame,
+    heap: &'static blaze_own::Heap,
+) -> Result<NamesRecords<'n>, RunNamesError> {
+    let _cx = cx.span("run names: open the names records");
+    let crates = crates_of_by_need(cx, found, owner, store, kept, read, by_need, env, dirs, frame, heap)?;
+    names_in(cx, root, crates, procs, seen, frame)
+}
+
 /// The [`RunCrates`] of `found` ([`names_of`]'s first half, on the command thread): what every
 /// names records of the program are made of, each code worker's too (test_drive.rs `CodePool`).
 #[expect(clippy::too_many_arguments, reason = "the StartProgram site's edge: each argument one thing it holds")]
@@ -1080,6 +1105,33 @@ pub(crate) fn crates_of<'n, 'm: 'n>(
         Found::Stood(rows, snapshot) => {
             let program = program_of(cx, rows, owner, store, kept, read, heap, frame)?;
             read_crates(cx, &program, snapshot, store, kept, read, env, dirs, frame, heap)
+        }
+    }
+}
+
+/// [`crates_of`] opening only the owner crate upfront and deferring every other crate in the
+/// check scope (`core`, `alloc`, `std`, deps) to `by_need` (`front_load::ScopeRecords`, shared
+/// across all suites and `CodePool` workers so each touched crate, module bitmap, and pack
+/// `FileItems` is opened at most once per command; rules 74 and 77).
+#[expect(clippy::too_many_arguments, reason = "the StartProgram site's edge: each argument one thing it holds")]
+pub(crate) fn crates_of_by_need<'n, 'm: 'n>(
+    cx: &Cx,
+    found: &'n Found<'_>,
+    owner: Owner,
+    store: &mut dyn Store<'m>,
+    kept: &mut Kept,
+    read: &mut EngineRecords<'m>,
+    by_need: &'n dyn crate::front_load::OpenByNeed,
+    env: &'n crate::fetch::FetchEnv<'_>,
+    dirs: &'n SyncPackDirs,
+    frame: &'n Frame,
+    heap: &'static blaze_own::Heap,
+) -> Result<RunCrates<'n>, RunNamesError> {
+    match found {
+        Found::Walked(program, snapshot) => read_crates_by_need(cx, program, snapshot, store, kept, read, by_need, env, dirs, frame, heap),
+        Found::Stood(rows, snapshot) => {
+            let program = program_of(cx, rows, owner, store, kept, read, heap, frame)?;
+            read_crates_by_need(cx, &program, snapshot, store, kept, read, by_need, env, dirs, frame, heap)
         }
     }
 }
@@ -1191,23 +1243,35 @@ impl<'n> crate::job_texts::EnvsByNeed<'n> for RunEnvs<'n> {
     }
 }
 
+/// How [`RunCrates`] holds the program's crates: either every crate opened upfront (`Opened`), or
+/// only the owner opened upfront with dependencies opened lazily by need (`ByNeed`) through a
+/// command-wide [`crate::front_load::ScopeRecords`].
+#[derive(Clone, Copy)]
+enum RunScope<'n> {
+    Opened(&'n [Crate<'n>]),
+    ByNeed(ByNeedScope<'n>),
+}
+
 /// What every names records of one program are made of, read ONCE on the command thread
-/// ([`read_crates`]: each crate's records read in place through the store's mapping): the crate
-/// list, the crates, each crate's list row and build-script row, the lang crates, the list's
-/// corrected texts and where its trees are opened from. All borrowed and read only, so it is
-/// `Sync`: the command's code workers (test_drive.rs `CodePool`, D194) each make their own names
-/// records of it ([`names_in`]), and the command thread makes its own the same way ([`names_of`]).
+/// ([`read_crates`] / [`read_crates_by_need`]: each crate's records read in place through the
+/// store's mapping): the crate list, the crates, each crate's list row and build-script row, the
+/// lang crates, the list's corrected texts and where its trees are opened from. All borrowed and
+/// read only, so it is `Sync`: the command's code workers (test_drive.rs `CodePool`, D194) each
+/// make their own names records of it ([`names_in`]), and the command thread makes its own the
+/// same way ([`names_of`]).
 ///
 /// WHAT IS SHARED, AND WHAT IS NOT (D194 piece 2): shared read only are the crates' records
-/// (views of the store's mapping), the list, the snapshot, the corrected texts, the command-wide
-/// lazy pack cache ([`SyncLazyTrees`]), the command-scoped pack directories ([`SyncPackDirs`]),
-/// and the packs' home; per maker of names records ([`names_in`], one a worker a suite) are its
-/// open/refusal counter ([`TreesSeen`]), the environments made by need ([`RunEnvs`]: `OnceCell`),
-/// and the records' own memo (`Records`, the `Log`, the job texts), all in that maker's frame.
+/// (views of the store's mapping, or opened lazily on demand through `ScopeRecords` with shared
+/// `VerifiedModules` and `FileItems` caches), the list, the snapshot, the corrected texts, the
+/// command-wide lazy pack cache ([`SyncLazyTrees`]), the command-scoped pack directories
+/// ([`SyncPackDirs`]), and the packs' home; per maker of names records ([`names_in`], one a worker
+/// a suite) are its open/refusal counter ([`TreesSeen`]), the environments made by need
+/// ([`RunEnvs`]: `OnceCell`), and the records' own memo (`Records`, the `Log`, the job texts), all
+/// in that maker's frame.
 #[derive(Clone, Copy)]
 pub(crate) struct RunCrates<'n> {
     list: &'n CrateList<'static>,
-    crates: &'n [Crate<'n>],
+    crates: RunScope<'n>,
     /// Reader crate `k`'s row of `list` (the owner at 0).
     rows: &'n [usize],
     /// [`Program::scripts`], sorted by row.
@@ -1265,7 +1329,67 @@ pub(crate) fn read_crates<'n, 'm: 'n>(
     scripts.extend_from_slice(&program.scripts);
     let mut lang: Vec<usize, &'n Frame> = Vec::with_capacity_in(program.lang.len(), frame);
     lang.extend_from_slice(&program.lang);
-    Ok(RunCrates { list, crates: crates.into_bump_slice(), rows: rows.into_bump_slice(), scripts: scripts.into_bump_slice(), lang: lang.into_bump_slice(), corrected, packs, dirs, snapshot, from: PackHome::of(env), heap })
+    Ok(RunCrates { list, crates: RunScope::Opened(crates.into_bump_slice()), rows: rows.into_bump_slice(), scripts: scripts.into_bump_slice(), lang: lang.into_bump_slice(), corrected, packs, dirs, snapshot, from: PackHome::of(env), heap })
+}
+
+/// Like [`read_crates`], opening only the owner crate upfront (typically already cached in `read`
+/// from `program_of` / `tests_of`) and deferring all dependency/toolchain crates to `by_need`.
+#[expect(clippy::too_many_arguments, reason = "the StartProgram site's edge: each argument one thing it holds")]
+pub(crate) fn read_crates_by_need<'n, 'm: 'n>(
+    cx: &Cx,
+    program: &Program,
+    snapshot: &'n StoreSnapshot,
+    store: &mut dyn Store<'m>,
+    kept: &mut Kept,
+    read: &mut EngineRecords<'m>,
+    by_need: &'n dyn crate::front_load::OpenByNeed,
+    env: &'n crate::fetch::FetchEnv<'_>,
+    dirs: &'n SyncPackDirs,
+    frame: &'n Frame,
+    heap: &'static blaze_own::Heap,
+) -> Result<RunCrates<'n>, RunNamesError> {
+    let list: &'n CrateList<'static> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(program.list, frame));
+    let scope = match program.crates.split_first() {
+        Some((&(own_at, own_input), rest_rows)) => {
+            let own_name = CrateGraph::name(list, own_at);
+            let own_records: CrateRecords<'m> = read
+                .records(cx, store, &own_input, list.key(own_at), heap.alloc())
+                .map_err(|error| unread(own_name, error))?;
+            let own = Crate { records: own_records, name: own_name, package: list.shown_from(own_at), world_at: own_at };
+            let mut rest: Vec<crate::front_load::Unopened, &'n Frame> = Vec::with_capacity_in(rest_rows.len(), frame);
+            for &(at, input) in rest_rows {
+                rest.push(crate::front_load::Unopened {
+                    input,
+                    key: list.key(at),
+                    world_at: at,
+                    name: CrateGraph::name(list, at),
+                    package: list.shown_from(at),
+                });
+            }
+            RunScope::ByNeed(ByNeedScope { own, rest: rest.into_bump_slice(), records: by_need })
+        }
+        None => RunScope::Opened(&[]),
+    };
+    let (packs, corrected) = kept.lazy_trees(env, program.graph.out, program.list).map_err(|why| RunNamesError::Trees { why })?;
+    let mut rows: Vec<usize, &'n Frame> = Vec::with_capacity_in(program.crates.len(), frame);
+    rows.extend(program.crates.iter().map(|(at, _)| *at));
+    let mut scripts: Vec<(usize, Input), &'n Frame> = Vec::with_capacity_in(program.scripts.len(), frame);
+    scripts.extend_from_slice(&program.scripts);
+    let mut lang: Vec<usize, &'n Frame> = Vec::with_capacity_in(program.lang.len(), frame);
+    lang.extend_from_slice(&program.lang);
+    Ok(RunCrates {
+        list,
+        crates: scope,
+        rows: rows.into_bump_slice(),
+        scripts: scripts.into_bump_slice(),
+        lang: lang.into_bump_slice(),
+        corrected,
+        packs,
+        dirs,
+        snapshot,
+        from: PackHome::of(env),
+        heap,
+    })
 }
 
 /// The names records over `crates`, in `frame`, on the calling thread (`cx`'s): the list's trees
@@ -1290,8 +1414,12 @@ pub(crate) fn names_in<'n>(
     let envs: &'n RunEnvs<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(RunEnvs::new(list, rows, scripts, snapshot, from.home, frame), frame));
     let envs = Envs { owner: None, rest: Some(envs) };
     let trees = (trees, None);
-    let made = names_records_envs(cx, root, ScopeCrates::Opened(opened), trees, corrected, procs, std::vec::Vec::new_in(Global), envs, Some(snapshot), None, frame, heap.alloc()).map_err(|error| match error {
-        NamesError::Items { at, why } => RunNamesError::Items { crate_name: opened.get(at).map_or("?", |one| CrateGraph::name(list, one.world_at)), why },
+    let scope = match opened {
+        RunScope::Opened(crates) => ScopeCrates::Opened(crates),
+        RunScope::ByNeed(scope) => ScopeCrates::ByNeed(scope),
+    };
+    let made = names_records_envs(cx, root, scope, trees, corrected, procs, std::vec::Vec::new_in(Global), envs, Some(snapshot), None, frame, heap.alloc()).map_err(|error| match error {
+        NamesError::Items { at, why } => RunNamesError::Items { crate_name: rows.get(at).map_or("?", |&world_at| CrateGraph::name(list, world_at)), why },
     })?;
     Ok(NamesRecords { records: made.records, frame, lang_crates: lang, body_sources: Some(made.sources) })
 }
