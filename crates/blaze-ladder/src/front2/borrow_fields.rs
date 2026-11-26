@@ -30,7 +30,10 @@ use blaze_typeck as tc;
 use blaze_typeck::region_facts::RegionFacts;
 use blaze_typeck::regions::{Arity, Region, RegionError, Unknown, region_arity};
 
-use crate::front2::borrow_reads::{drop_adt_read, inst_drop_adt_read, inst_drop_impl_read, inst_drop_trait_read};
+use crate::front2::borrow_reads::{
+    drop_adt_read, field_alias_blanket_read, field_alias_super_read, inst_drop_adt_read, inst_drop_impl_read,
+    inst_drop_trait_read,
+};
 use crate::front2::buckets::shape_of;
 use crate::front2::check::{Records, answer_impls};
 use crate::front2::heads::{Store, Want};
@@ -208,13 +211,13 @@ fn field_row<'a, F: Arity + ?Sized>(tys: tc::PTys<'_>, root: tc::PTy, arity: &F,
         }
         let node = tys.node(t).map_err(table)?;
         // Nodes whose positions no `FieldRegion` names, before the counter is asked of them.
-        // A projection (`PNode::Alias`) can normalize at a use site (e.g. `where F: Front<Maker =
-        // RunMaker<'h>>`) to a different slot count than the unnormalized declared field type,
-        // which would trigger `FieldRegionsUnaligned` in `blaze-flow-lower` (Facts::field_regions).
+        // `PNode::Alias` IS laid in pre-order (matching `RegionSlots` for unnormalized aliases
+        // such as `Hit::root: &'b K::Root` and `Lazy::started: Option<Started<'a, F::Start, ...>>`),
+        // while `FieldAliasGuard` in `borrows.rs` suppresses any field whose alias may normalize
+        // in a specific body (preventing both `FieldRegionsUnaligned` and unsound slot remapping).
         if matches!(
             node,
-            tc::PNode::Alias { .. }
-                | tc::PNode::Opaque(..)
+            tc::PNode::Opaque(..)
                 | tc::PNode::Closure { .. }
                 | tc::PNode::Future(..)
                 | tc::PNode::Coroutine { .. }
@@ -1379,10 +1382,10 @@ fn hash_pty_for_drop(tys: tc::PTys<'_>, root: tc::PTy, h: &mut tc::StableHasher,
 }
 
 /// Bounds for instantiated structural drop-glue evaluation ([`InstDropEval`], rule 18).
-const MOST_INST_DROP_STEPS: u32 = 4096;
+const MOST_INST_DROP_STEPS: u32 = 16384;
 const MOST_INST_DROP_DEPTH: u32 = 32;
 const MOST_INST_NORM_DEPTH: u32 = 16;
-const MOST_INST_DROP_CANDIDATES: usize = 64;
+const MOST_INST_DROP_CANDIDATES: usize = 2048;
 
 #[derive(Clone, Copy)]
 struct InstAdtInfo {
@@ -2006,7 +2009,15 @@ impl<'a> InstDropEval<'a> {
         let Some(shape) = shape_of(self.tys.view(), self_ty) else {
             return ImplMatch::Unknown;
         };
-        let Some(impls) = answer_impls(r, trait_, shape) else {
+        let (impls, has_gap) = if let Some(v) = answer_impls(r, trait_, shape) {
+            (v, false)
+        } else if let Some(got) = r.buckets.as_ref().and_then(|b| b.impls_of(trait_, shape))
+            && !got.is_empty()
+        {
+            let mut v = blaze_own::Vec::with_capacity_in(got.len(), r.store.work_alloc());
+            v.extend_from_slice(got);
+            (v, true)
+        } else {
             return ImplMatch::Unknown;
         };
         // Record Rule 21 digest for this `(trait_, shape) -> impls` query.
@@ -2014,7 +2025,8 @@ impl<'a> InstDropEval<'a> {
             let mut sh = tc::StableHasher::new("blaze-ladder front2 inst drop shape v1");
             hash_shape(&mut sh, shape);
             let shape_digest = sh.finish();
-            let mut ih = tc::StableHasher::new("blaze-ladder front2 inst drop impls v1");
+            let mut ih = tc::StableHasher::new("blaze-ladder front2 inst drop impls v2");
+            ih.tag(u8::from(has_gap));
             ih.u32(u32::try_from(impls.len()).unwrap_or(u32::MAX));
             for &imp in impls.iter() {
                 ih.u128(imp.0);
@@ -2111,11 +2123,28 @@ impl<'a> InstDropEval<'a> {
             }
         }
         self.active_goals.pop();
-        match (matched, saw_unknown) {
+        match (matched, saw_unknown || has_gap) {
             (Some((imp, subst, trait_arg_count)), false) => ImplMatch::Selected { imp, subst, trait_arg_count },
+            // By Rust coherence (E0119) + RFC 1210, a positive impl with no `default` items cannot
+            // be overlapped or specialized by another impl, so an unrelated candidate gap or
+            // unknown clause in a large bucket (e.g. `IntoIterator for &T`) cannot override it.
+            // Conversely, `ImplMatch::None` still requires `!saw_unknown && !has_gap`.
+            (Some((imp, subst, trait_arg_count)), true) if self.impl_has_no_default(r, imp) => {
+                ImplMatch::Selected { imp, subst, trait_arg_count }
+            }
             (None, false) => ImplMatch::None,
             _ => ImplMatch::Unknown,
         }
+    }
+
+    fn impl_has_no_default<'n, S: NamesSource<'n>>(&self, r: &Records<'_, 'n, S>, imp: tc::ItemKey) -> bool {
+        let Some(lib) = r.keys.library_in(r.names, imp) else {
+            return false;
+        };
+        let Some(item) = r.names.text_of(lib) else {
+            return false;
+        };
+        !item.text.contains("default")
     }
 
     fn check_impl_clauses<'n, S: NamesSource<'n>>(
@@ -2374,6 +2403,385 @@ impl<'a> InstDropEval<'a> {
                 self.is_known_sized(r, last_field, depth + 1, budget)
             }
             _ => None,
+        }
+    }
+}
+
+/// Quick, allocation-free check for whether any declared field type of an ADT contains a
+/// `PNode::Alias` node (or exceeds the small stack bound, in which case `true` triggers the full
+/// [`FieldAliasGuard`] walk).
+pub(super) fn adt_has_alias_field(tys: tc::PTys<'_>, fields: &[tc::Field]) -> bool {
+    let mut stack = [tc::PTy(0); 64];
+    for f in fields {
+        let mut sp = 1usize;
+        stack[0] = f.ty;
+        let mut steps = 0u32;
+        while sp > 0 {
+            steps += 1;
+            if steps > 512 {
+                return true;
+            }
+            sp -= 1;
+            let ty = stack[sp];
+            let Ok(node) = tys.node(ty) else { return true };
+            match node {
+                tc::PNode::Alias { .. } => return true,
+                tc::PNode::Ref(_, i)
+                | tc::PNode::Ptr(_, i)
+                | tc::PNode::Slice(i)
+                | tc::PNode::Array(i, _)
+                | tc::PNode::Pat(i, _) => {
+                    if sp >= stack.len() {
+                        return true;
+                    }
+                    stack[sp] = i;
+                    sp += 1;
+                }
+                tc::PNode::Tuple(l)
+                | tc::PNode::Record(_, l)
+                | tc::PNode::Union(l)
+                | tc::PNode::FnPtr(l, _)
+                | tc::PNode::Adt(_, l)
+                | tc::PNode::Dynamic(l)
+                | tc::PNode::FnDef(_, l)
+                | tc::PNode::Opaque(_, l)
+                | tc::PNode::ExTrait(_, l) => {
+                    let Ok(es) = tys.list(l) else { return true };
+                    if sp + es.len() > stack.len() {
+                        return true;
+                    }
+                    for &e in es {
+                        stack[sp] = e;
+                        sp += 1;
+                    }
+                }
+                tc::PNode::ExProj { args, term, .. } => {
+                    let Ok(es) = tys.list(args) else { return true };
+                    if sp + es.len() + 1 > stack.len() {
+                        return true;
+                    }
+                    stack[sp] = term;
+                    sp += 1;
+                    for &e in es {
+                        stack[sp] = e;
+                        sp += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
+/// Per-body soundness guard for ADT fields whose declared type contains `PNode::Alias`.
+///
+/// An unnormalized `PNode::Alias` in `RegionSlots` has slots `[own_lifetimes..., arg_slots...]`
+/// in pre-order, matching [`field_row`] exactly (clearing `Hit::root: &'b K::Root` and
+/// `Lazy::started: Option<Started<'a, F::Start, F::Ids, F::Maker>>` across generic methods).
+/// However, if an alias normalizes in a specific body (via a concrete instantiation such as
+/// `Foo<Pair<'a, 'b>>` whose impl swaps lifetimes, via a blanket impl, or via an owner/ADT/supertrait
+/// `PClause::Projection` such as `where F: Front<Maker = RunMaker<'h>>`), the unnormalized
+/// `FieldRegion` row can either misalign (`FieldRegionsUnaligned`) or unsoundly misattribute
+/// lifetimes. This guard suppresses `Facts::field_regions` to `None` ONLY for fields whose
+/// `PNode::Alias` is not provably unnormalized in the body, while leaving sibling fields and
+/// provably unnormalized alias fields intact.
+pub(super) struct FieldAliasGuard<'a> {
+    owner_projs: Option<(AVec<'a, (tc::ItemKey, tc::Name)>, bool)>,
+    blanket_cache: AVec<'a, (tc::ItemKey, bool)>,
+    read_blankets: AVec<'a, (u128, u64)>,
+    read_supers: AVec<'a, (u128, u64)>,
+    alloc: Alloc<'a>,
+}
+
+impl<'a> FieldAliasGuard<'a> {
+    pub(super) fn new_in(alloc: Alloc<'a>) -> FieldAliasGuard<'a> {
+        FieldAliasGuard {
+            owner_projs: None,
+            blanket_cache: AVec::new_in(alloc),
+            read_blankets: AVec::new_in(alloc),
+            read_supers: AVec::new_in(alloc),
+            alloc,
+        }
+    }
+
+    pub(super) fn push_reads(&self, reads: &mut AVec<'a, Read>) {
+        for &(tr, digest) in self.read_blankets.iter() {
+            reads.push(field_alias_blanket_read(tr, digest));
+        }
+        for &(tr, digest) in self.read_supers.iter() {
+            reads.push(field_alias_super_read(tr, digest));
+        }
+    }
+
+    fn collect_projs_from<'n, S: NamesSource<'n>>(
+        &mut self,
+        r: &mut Records<'_, 'n, S>,
+        item: tc::ItemKey,
+        out: &mut AVec<'a, (tc::ItemKey, tc::Name)>,
+    ) -> bool {
+        let mut queue: AVec<'a, tc::ItemKey> = AVec::new_in(self.alloc);
+        let mut visited: AVec<'a, tc::ItemKey> = AVec::new_in(self.alloc);
+        if let Some(preds) = r.store.preds.get(&item) {
+            for c in preds.clauses.iter() {
+                match *c {
+                    tc::PClause::Projection { trait_, name, .. } => {
+                        if !out.iter().any(|&(t, n)| t == trait_ && n == name) {
+                            out.push((trait_, name));
+                        }
+                    }
+                    tc::PClause::Trait { trait_, .. } => {
+                        if queue.scan_for(&trait_).is_none() {
+                            queue.push(trait_);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut cursor = 0usize;
+        while let Some(&tr) = queue.get(cursor) {
+            cursor += 1;
+            if visited.scan_for(&tr).is_some() {
+                continue;
+            }
+            if visited.len() >= 64 {
+                return false;
+            }
+            visited.push(tr);
+            if !r.store.trait_defs.contains_key(&tr)
+                && let Some(lib) = r.keys.library_in(r.names, tr)
+            {
+                super::ensure_one(r, Want::Members(lib));
+            }
+            let Some(def) = r.store.trait_defs.get(&tr) else {
+                if !self.read_supers.iter().any(|&(k, _)| k == tr.0) {
+                    let mut h = tc::StableHasher::new("blaze-ladder front2 field alias super v1");
+                    h.tag(0);
+                    self.read_supers.push((tr.0, h.finish()));
+                }
+                return false;
+            };
+            let mut h = tc::StableHasher::new("blaze-ladder front2 field alias super v1");
+            h.tag(1);
+            h.u32(u32::try_from(def.supertraits.len()).unwrap_or(u32::MAX));
+            for sc in def.supertraits.iter() {
+                match *sc {
+                    tc::PClause::Projection { trait_: pt, name: pn, .. } => {
+                        h.tag(1);
+                        h.u128(pt.0);
+                        h.u64(pn.0);
+                        if !out.iter().any(|&(t, n)| t == pt && n == pn) {
+                            out.push((pt, pn));
+                        }
+                    }
+                    tc::PClause::Trait { trait_: st, .. } => {
+                        h.tag(2);
+                        h.u128(st.0);
+                        if queue.scan_for(&st).is_none() {
+                            queue.push(st);
+                        }
+                    }
+                    _ => h.tag(0),
+                }
+            }
+            if !self.read_supers.iter().any(|&(k, _)| k == tr.0) {
+                self.read_supers.push((tr.0, h.finish()));
+            }
+        }
+        true
+    }
+
+    fn trait_has_no_blanket<'n, S: NamesSource<'n>>(
+        &mut self,
+        r: &mut Records<'_, 'n, S>,
+        trait_: tc::ItemKey,
+    ) -> bool {
+        if let Some(&(_, no_blanket)) = self.blanket_cache.iter().find(|&&(k, _)| k == trait_) {
+            return no_blanket;
+        }
+        let ans = answer_impls(r, trait_, tc::Shape::Param);
+        let no_blanket = ans.as_ref().is_some_and(|v| v.is_empty());
+        if !self.read_blankets.iter().any(|&(k, _)| k == trait_.0) {
+            let mut h = tc::StableHasher::new("blaze-ladder front2 field alias blanket v1");
+            match &ans {
+                None => h.tag(0),
+                Some(v) => {
+                    h.tag(1);
+                    h.u32(u32::try_from(v.len()).unwrap_or(u32::MAX));
+                    for &imp in v.iter() {
+                        h.u128(imp.0);
+                    }
+                }
+            }
+            self.read_blankets.push((trait_.0, h.finish()));
+        }
+        self.blanket_cache.push((trait_, no_blanket));
+        no_blanket
+    }
+
+    /// Appends the field indices of `adt` whose `PNode::Alias` is not provably unnormalized in
+    /// `body_tys` onto `out`, returning `Some((start, len))` when any field was suppressed.
+    pub(super) fn check_adt<'n, S: NamesSource<'n>>(
+        &mut self,
+        r: &mut Records<'_, 'n, S>,
+        owner: tc::ItemKey,
+        body_tys: tc::PTys<'_>,
+        adt: tc::ItemKey,
+        out: &mut AVec<'a, u32>,
+    ) -> Option<(u32, u32)> {
+        if self.owner_projs.is_none() {
+            let mut projs: AVec<'a, (tc::ItemKey, tc::Name)> = AVec::new_in(self.alloc);
+            let complete = self.collect_projs_from(r, owner, &mut projs);
+            self.owner_projs = Some((projs, complete));
+        }
+        let mut adt_projs: AVec<'a, (tc::ItemKey, tc::Name)> = AVec::new_in(self.alloc);
+        let adt_complete = self.collect_projs_from(r, adt, &mut adt_projs);
+
+        // Snapshot every instantiation `PNode::Adt(adt, inst_list)` appearing in `body_tys`.
+        let mut insts: AVec<'a, tc::List> = AVec::new_in(self.alloc);
+        for node in body_tys.nodes() {
+            if let tc::PNode::Adt(k, args) = *node
+                && k == adt
+            {
+                insts.push(args);
+            }
+        }
+
+        // Snapshot each field's `PNode::Alias` occurrences from `r.store.tys` before querying
+        // `answer_impls` (which borrows `r` mutably).
+        struct FieldAliases {
+            field_idx: u32,
+            start: usize,
+            len: usize,
+            incomplete: bool,
+        }
+        let mut field_entries: AVec<'a, FieldAliases> = AVec::new_in(self.alloc);
+        let mut aliases: AVec<'a, (tc::ItemKey, tc::Name, Option<u32>)> = AVec::new_in(self.alloc);
+        {
+            let Some(row) = BodyHeadFacts::new(&*r.store, r.names).adt(adt) else {
+                return None;
+            };
+            let stys = r.store.tys.view();
+            let mut stack: AVec<'a, tc::PTy> = AVec::new_in(self.alloc);
+            for (fi, f) in row.fields.iter().enumerate() {
+                let Ok(fi_u32) = u32::try_from(fi) else { continue };
+                let a_start = aliases.len();
+                stack.clear();
+                stack.push(f.ty);
+                let mut steps = 0u32;
+                let mut incomplete = false;
+                while let Some(ty) = stack.pop() {
+                    steps += 1;
+                    if steps > MOST_NODES {
+                        incomplete = true;
+                        break;
+                    }
+                    let Ok(node) = stys.node(ty) else {
+                        incomplete = true;
+                        break;
+                    };
+                    match node {
+                        tc::PNode::Alias { trait_, name, args } => {
+                            let Ok(es) = stys.list(args) else {
+                                incomplete = true;
+                                break;
+                            };
+                            let self_param = es.first().and_then(|&first| match stys.node(first) {
+                                Ok(tc::PNode::Param(p)) => Some(p),
+                                _ => None,
+                            });
+                            aliases.push((trait_, name, self_param));
+                            stack.extend_from_slice(es);
+                        }
+                        tc::PNode::Ref(_, i)
+                        | tc::PNode::Ptr(_, i)
+                        | tc::PNode::Slice(i)
+                        | tc::PNode::Array(i, _)
+                        | tc::PNode::Pat(i, _) => stack.push(i),
+                        tc::PNode::Tuple(l)
+                        | tc::PNode::Record(_, l)
+                        | tc::PNode::Union(l)
+                        | tc::PNode::FnPtr(l, _)
+                        | tc::PNode::Adt(_, l)
+                        | tc::PNode::Dynamic(l)
+                        | tc::PNode::FnDef(_, l)
+                        | tc::PNode::Opaque(_, l)
+                        | tc::PNode::ExTrait(_, l) => match stys.list(l) {
+                            Ok(es) => stack.extend_from_slice(es),
+                            Err(_) => {
+                                incomplete = true;
+                                break;
+                            }
+                        },
+                        tc::PNode::ExProj { args, term, .. } => {
+                            stack.push(term);
+                            match stys.list(args) {
+                                Ok(es) => stack.extend_from_slice(es),
+                                Err(_) => {
+                                    incomplete = true;
+                                    break;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let a_len = aliases.len() - a_start;
+                if a_len > 0 || incomplete {
+                    field_entries.push(FieldAliases { field_idx: fi_u32, start: a_start, len: a_len, incomplete });
+                }
+            }
+        }
+        if field_entries.is_empty() {
+            return None;
+        }
+
+        let start = out.len();
+        let owner_complete = self.owner_projs.as_ref().is_some_and(|&(_, c)| c);
+        for fe in field_entries.iter() {
+            let mut safe = !fe.incomplete && owner_complete && adt_complete && !insts.is_empty();
+            if safe {
+                for &(trait_, name, self_param) in &aliases[fe.start..fe.start + fe.len] {
+                    let Some(p) = self_param else {
+                        safe = false;
+                        break;
+                    };
+                    let Ok(pi) = usize::try_from(p) else {
+                        safe = false;
+                        break;
+                    };
+                    let all_param = insts.iter().all(|&inst_list| {
+                        body_tys
+                            .list(inst_list)
+                            .ok()
+                            .and_then(|es| es.get(pi).copied())
+                            .is_some_and(|arg| matches!(body_tys.node(arg), Ok(tc::PNode::Param(_))))
+                    });
+                    if !all_param {
+                        safe = false;
+                        break;
+                    }
+                    let has_owner_proj = self
+                        .owner_projs
+                        .as_ref()
+                        .is_some_and(|(ps, _)| ps.iter().any(|&(t, n)| t == trait_ && n == name));
+                    let has_adt_proj = adt_projs.iter().any(|&(t, n)| t == trait_ && n == name);
+                    if has_owner_proj || has_adt_proj || !self.trait_has_no_blanket(r, trait_) {
+                        safe = false;
+                        break;
+                    }
+                }
+            }
+            if !safe {
+                out.push(fe.field_idx);
+            }
+        }
+        let added = out.len() - start;
+        if added == 0 {
+            None
+        } else {
+            Some((u32::try_from(start).ok()?, u32::try_from(added).ok()?))
         }
     }
 }
@@ -2755,8 +3163,8 @@ mod field_row_tests {
         fn opaque_captures(&self, _: tc::ItemKey) -> tc::regions::Count {
             tc::regions::Count::NotKnown
         }
-        fn alias_lifetimes(&self, _: tc::ItemKey, _: tc::Name) -> tc::regions::Count {
-            tc::regions::Count::NotKnown
+        fn alias_lifetimes(&self, trait_: tc::ItemKey, _: tc::Name) -> tc::regions::Count {
+            if trait_ == TR { tc::regions::Count::Known(1) } else { tc::regions::Count::NotKnown }
         }
         fn trait_lifetimes(&self, trait_: tc::ItemKey) -> tc::regions::Count {
             if trait_ == TR { tc::regions::Count::Known(1) } else { tc::regions::Count::NotKnown }
@@ -2831,15 +3239,15 @@ mod field_row_tests {
         assert_eq!(row(&t, p, &[], 0), Ok(std::vec![FieldRegion::Arg(0)]));
     }
 
-    /// A field whose declared type holds a projection (`PNode::Alias`) has no `FieldRegion` row
-    /// (`Unlaid::Unnamed`), because normalizing that projection at a use site can introduce
-    /// lifetimes absent from the unnormalized declaration (`FieldRegionsUnaligned`).
+    /// A field whose declared type holds a projection (`PNode::Alias`) lays its own lifetime
+    /// slots followed by its arguments in pre-order (matching `RegionSlots` for unnormalized
+    /// aliases); per-body normalization is guarded by [`FieldAliasGuard`].
     #[test]
-    fn alias_field_is_unnamed() {
+    fn alias_field_lays_own_and_arg_slots() {
         let mut t = PortableTys::new_in(a());
         let p = t.intern(PNode::Param(0)).unwrap();
         let args = t.intern_list(&[p]).unwrap();
         let alias = t.intern(PNode::Alias { trait_: TR, name: tc::Name::of("Maker"), args }).unwrap();
-        assert_eq!(row(&t, alias, &[Region::Param(0)], 1), Err(Unlaid::Unnamed));
+        assert_eq!(row(&t, alias, &[Region::Param(0)], 1), Ok(std::vec![FieldRegion::Lifetime(0), FieldRegion::Arg(0)]));
     }
 }

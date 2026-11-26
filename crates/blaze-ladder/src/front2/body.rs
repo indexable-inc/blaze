@@ -770,6 +770,11 @@ impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
             super::types::SlotKind::Named(..) | super::types::SlotKind::Given(blaze_typeck::regions::Region::Param(_)) => {
                 Some(blaze_typeck::WrittenRegion::Named)
             }
+            super::types::SlotKind::Elided(id)
+                if slots.iter().filter(|s| matches!(s.kind, super::types::SlotKind::Elided(k) if k == id)).count() > 1 =>
+            {
+                Some(blaze_typeck::WrittenRegion::Elided(id))
+            }
             _ => None,
         };
         while let Some(top) = sp.checked_sub(1) {
@@ -2533,12 +2538,15 @@ pub fn use_dyn<'a>() {
         );
 
         // `|a: &(dyn Tr + 'a), b: &(dyn Tr + 'static), c: &dyn Tr|`:
-        // explicit `'a` / `'static` object bounds emit `Named` / `Static`; default stays elided.
+        // explicit `'a` / `'static` object bounds emit `Named` / `Static`; `&dyn Tr` ties the
+        // outer `&` and default trait object lifetime together via shared `Elided(0)`.
         assert_eq!(
             &lower_regions(src, "use_dyn", alloc)[..],
             &[
                 (0, step(root, 0), 0, WrittenRegion::Named),
                 (1, step(root, 0), 0, WrittenRegion::Static),
+                (2, root, 0, WrittenRegion::Elided(0)),
+                (2, step(root, 0), 0, WrittenRegion::Elided(0)),
             ]
         );
     }
