@@ -1260,17 +1260,23 @@ pub(crate) fn retire_stalled_io(io: crate::io::Io, root: crate::fs::Dir<crate::f
     state.wake.notify_one();
 }
 
-/// Opened kernel directory descriptor (`O_DIRECTORY | O_CLOEXEC`) plus its `(dev, ino)` identity
-/// and original path cached once when a native Unix world opens, so off-thread advisory locks
-/// resolve strictly beneath the opened root without traversing symbolic links AND verify the
-/// driver's root pathname still resolves to the exact same directory inode (refusing split-brain
-/// locks if the root directory was renamed or replaced after opening).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) struct NativeRootDir {
+struct OpenedRootDir {
     fd: blaze_sys::posix::io::OwnedFd,
-    cpath: blaze_own::Vec<u8, blaze_own::SharedAlloc<'static>>,
     dev: u64,
     ino: u64,
+}
+
+/// Opened kernel directory descriptor (`O_DIRECTORY | O_CLOEXEC`) plus its `(dev, ino)` identity
+/// and original path cached when a native Unix world opens (or lazily on first lock if the root
+/// folder did not yet exist when the world was constructed, matching `blaze-core` lazy folder
+/// creation on fresh `$HOME` setups). Once pinned, off-thread advisory locks and locked I/O
+/// resolve strictly beneath the opened descriptor without traversing symbolic links AND verify the
+/// driver's root pathname still resolves to the exact same directory inode.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) struct NativeRootDir {
+    cpath: blaze_own::Vec<u8, blaze_own::SharedAlloc<'static>>,
+    opened: self::std::sync::Mutex<Option<blaze_own::Arc<OpenedRootDir, blaze_own::SharedAlloc<'static>>>>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1307,19 +1313,32 @@ impl NativeRootDir {
         buf.push(0);
         let cstr = core::ffi::CStr::from_bytes_with_nul(buf.as_slice()).map_err(|_| blaze_sys::Errno::Inval)?;
         let flags = blaze_sys::posix::io::OpenFlags::DIRECTORY | blaze_sys::posix::io::OpenFlags::CLOSE_ON_EXEC;
-        let fd = blaze_sys::posix::io::openat(blaze_sys::posix::io::CWD, blaze_sys::Path::new(cstr), flags, 0)?;
-        let (dev, ino) = fd_dev_ino(fd.fd())?;
-        Ok(Self { fd, cpath: buf, dev, ino })
+        let opened = match blaze_sys::posix::io::openat(blaze_sys::posix::io::CWD, blaze_sys::Path::new(cstr), flags, 0) {
+            Ok(fd) => {
+                let (dev, ino) = fd_dev_ino(fd.fd())?;
+                Some(blaze_own::Arc::new_in(OpenedRootDir { fd, dev, ino }, blaze_own::SharedAlloc::global()))
+            }
+            // Match `blaze_core::native_in`: a native world may be opened over a not-yet-created
+            // directory (e.g. `~/.blaze/v2/proc-macro/expansions` on a fresh `$HOME`) and lazily
+            // created on first write; pin the directory descriptor on first lock instead.
+            Err(blaze_sys::Errno::NoEnt) => None,
+            Err(errno) => return Err(errno),
+        };
+        Ok(Self { cpath: buf, opened: self::std::sync::Mutex::new(opened) })
     }
 
-    fn fd(&self) -> blaze_sys::Fd {
-        self.fd.fd()
+    fn require_opened(&self) -> Result<blaze_own::Arc<OpenedRootDir, blaze_own::SharedAlloc<'static>>, blaze_own::String<blaze_own::SharedAlloc<'static>>> {
+        let guard = match self.opened.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        guard
+            .as_ref()
+            .map(blaze_own::Share::share)
+            .ok_or_else(|| blaze_own::String::from_str_in("native root directory has not been opened", blaze_own::SharedAlloc::global()))
     }
 
-    /// Verifies that the native world's root pathname (used by `blaze-core` file I/O) still
-    /// resolves to the exact same directory inode `(dev, ino)` as `self.fd`, refusing split-brain
-    /// locks if the root directory was renamed or replaced after opening.
-    fn verify_root_unchanged(&self) -> Result<(), blaze_own::String<blaze_own::SharedAlloc<'static>>> {
+    fn verify_unchanged_against(&self, expected: &OpenedRootDir) -> Result<(), blaze_own::String<blaze_own::SharedAlloc<'static>>> {
         let Ok(cstr) = core::ffi::CStr::from_bytes_with_nul(self.cpath.as_slice()) else {
             return Err(blaze_own::String::from_str_in(
                 "invalid native root path",
@@ -1331,13 +1350,59 @@ impl NativeRootDir {
             .map_err(|e| lock_err_errno("openat (verify native root unchanged)", e))?;
         let (cur_dev, cur_ino) = fd_dev_ino(cur.fd())
             .map_err(|e| lock_err_errno("fstat (verify native root unchanged)", e))?;
-        if cur_dev != self.dev || cur_ino != self.ino {
+        if cur_dev != expected.dev || cur_ino != expected.ino {
             return Err(blaze_own::String::from_str_in(
                 "native world root directory was replaced since opening; refusing split-brain lock",
                 blaze_own::SharedAlloc::global(),
             ));
         }
         Ok(())
+    }
+
+    /// Returns the pinned [`OpenedRootDir`] (opening and pinning `self.cpath` once if it did not
+    /// exist when the world was constructed) and verifies `self.cpath` still resolves to that
+    /// exact directory inode `(dev, ino)`.
+    fn opened_and_verified(&self) -> Result<blaze_own::Arc<OpenedRootDir, blaze_own::SharedAlloc<'static>>, blaze_own::String<blaze_own::SharedAlloc<'static>>> {
+        let existing = {
+            let guard = match self.opened.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            guard.as_ref().map(blaze_own::Share::share)
+        };
+        if let Some(opened) = existing {
+            self.verify_unchanged_against(&opened)?;
+            return Ok(opened);
+        }
+        let Ok(cstr) = core::ffi::CStr::from_bytes_with_nul(self.cpath.as_slice()) else {
+            return Err(blaze_own::String::from_str_in(
+                "invalid native root path",
+                blaze_own::SharedAlloc::global(),
+            ));
+        };
+        let flags = blaze_sys::posix::io::OpenFlags::DIRECTORY | blaze_sys::posix::io::OpenFlags::CLOSE_ON_EXEC;
+        let fd = blaze_sys::posix::io::openat(blaze_sys::posix::io::CWD, blaze_sys::Path::new(cstr), flags, 0)
+            .map_err(|e| lock_err_errno("openat (open native root dir)", e))?;
+        let (dev, ino) = fd_dev_ino(fd.fd())
+            .map_err(|e| lock_err_errno("fstat (open native root dir)", e))?;
+        let candidate = blaze_own::Arc::new_in(OpenedRootDir { fd, dev, ino }, blaze_own::SharedAlloc::global());
+        let mut guard = match self.opened.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if let Some(winner) = guard.as_ref() {
+            let winner_arc = blaze_own::Share::share(winner);
+            drop(guard);
+            if winner_arc.dev != dev || winner_arc.ino != ino {
+                return Err(blaze_own::String::from_str_in(
+                    "native world root directory was replaced since opening; refusing split-brain lock",
+                    blaze_own::SharedAlloc::global(),
+                ));
+            }
+            return Ok(winner_arc);
+        }
+        *guard = Some(blaze_own::Share::share(&candidate));
+        Ok(candidate)
     }
 }
 
@@ -2055,8 +2120,8 @@ fn open_and_try_lock_beneath(
     root_dir: &NativeRootDir,
     rel: &str,
 ) -> Result<Option<blaze_sys::posix::io::OwnedFd>, blaze_own::String<blaze_own::SharedAlloc<'static>>> {
-    root_dir.verify_root_unchanged()?;
-    let root_fd = root_dir.fd();
+    let opened = root_dir.opened_and_verified()?;
+    let root_fd = opened.fd.fd();
     let mut parts = rel.split('/').peekable();
     let mut owned_dir: Option<blaze_sys::posix::io::OwnedFd> = None;
     let mut leaf: Option<&str> = None;
@@ -2076,7 +2141,7 @@ fn open_and_try_lock_beneath(
     let fd = open_leaf_beneath_no_symlink(cur, leaf_name)?;
     match blaze_sys::posix::io::flock(fd.fd(), blaze_sys::posix::io::FlockOp::ExclusiveNonBlock) {
         Ok(()) => {
-            if let Err(err) = root_dir.verify_root_unchanged() {
+            if let Err(err) = root_dir.verify_unchanged_against(&opened) {
                 let _ = blaze_sys::posix::io::flock(fd.fd(), blaze_sys::posix::io::FlockOp::Unlock);
                 drop(fd);
                 return Err(err);
@@ -2593,7 +2658,8 @@ fn read_bounded_under_lock_sync(
     if cancelled.load(Ordering::Acquire) {
         return Err(blaze_own::String::from_str_in("locked read cancelled", blaze_own::SharedAlloc::global()));
     }
-    let root_fd = root_dir.fd();
+    let opened = root_dir.require_opened()?;
+    let root_fd = opened.fd.fd();
     let mut parts = rel.split('/').peekable();
     let mut owned_dir: Option<blaze_sys::posix::io::OwnedFd> = None;
     let mut leaf: Option<&str> = None;
@@ -2732,7 +2798,8 @@ fn publish_under_lock_sync(
     if cancelled.load(Ordering::Acquire) {
         return Err(blaze_own::String::from_str_in("locked publish cancelled", blaze_own::SharedAlloc::global()));
     }
-    let root_fd = root_dir.fd();
+    let opened = root_dir.require_opened()?;
+    let root_fd = opened.fd.fd();
     let mut parts = rel.split('/').peekable();
     let mut owned_dir: Option<blaze_sys::posix::io::OwnedFd> = None;
     let mut leaf: Option<&str> = None;
