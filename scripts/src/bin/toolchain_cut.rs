@@ -157,14 +157,26 @@ fn layout(files: &Files<'_>, start: &str, alloc: Alloc<'static>) -> Result<Units
     Err(format!("{start}: no layout after 64 passes"))
 }
 
-/// A target's cfgs as rustc printed them for the pinned nightly, from the recorded answers: as
+/// A target's cfgs from the recorded answers (`pins/answers/rustc.json`, plus blaze's own
+/// targets in `pins/answers/own_targets.json` such as `wasm64-blaze-wasip1`): as
 /// blaze-unit-graph takes them, and as the record holds them ((name, value), sorted, each once).
 fn target_desc(tree: &Path, triple: &str, alloc: Alloc<'static>) -> (TargetDesc<'static>, Vec<(String, Option<String>)>) {
-    let path = tree.join(blaze_pins::ANSWERS_PATH);
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| fail(&format!("{}: {e}", path.display())));
-    let data: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|e| fail(&format!("{}: {e}", path.display())));
-    let Some(target) =data.get("targets").and_then(|t| t.get(triple)) else {
-        fail(&format!("{}: no recorded answers for the target `{triple}`", path.display()))
+    let mut found = None;
+    for rel in [blaze_pins::ANSWERS_PATH, blaze_pins::OWN_TARGETS_PATH] {
+        let path = tree.join(rel);
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| fail(&format!("{}: {e}", path.display())));
+        let data: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|e| fail(&format!("{}: {e}", path.display())));
+        if let Some(target) = data.get("targets").and_then(|t| t.get(triple)) {
+            found = Some((path, target.clone()));
+            break;
+        }
+    }
+    let Some((path, target)) = found else {
+        fail(&format!(
+            "{} / {}: no recorded answers for the target `{triple}`",
+            tree.join(blaze_pins::ANSWERS_PATH).display(),
+            tree.join(blaze_pins::OWN_TARGETS_PATH).display(),
+        ))
     };
     let strs = |key: &str| -> Vec<String> {
         target.get(key).and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect()).unwrap_or_default()
@@ -194,16 +206,22 @@ fn target_desc(tree: &Path, triple: &str, alloc: Alloc<'static>) -> (TargetDesc<
     (TargetDesc::new(triple, cfg, alloc), atoms)
 }
 
-/// The targets the pinned nightly's answers are recorded for: the keys of `rustc.json`'s
-/// `targets` (the same file `target_desc` reads a target's cfgs from).
+/// The targets whose answers are recorded in `rustc.json` and `own_targets.json` (the same files
+/// `target_desc` reads a target's cfgs from).
 fn recorded_targets(tree: &Path) -> Vec<String> {
-    let path = tree.join(blaze_pins::ANSWERS_PATH);
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| fail(&format!("{}: {e}", path.display())));
-    let data: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|e| fail(&format!("{}: {e}", path.display())));
-    let Some(targets) =data.get("targets").and_then(|t| t.as_object()) else {
-        fail(&format!("{}: no `targets` object", path.display()))
-    };
-    targets.keys().cloned().collect()
+    let mut out = Vec::new();
+    for rel in [blaze_pins::ANSWERS_PATH, blaze_pins::OWN_TARGETS_PATH] {
+        let path = tree.join(rel);
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| fail(&format!("{}: {e}", path.display())));
+        let data: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|e| fail(&format!("{}: {e}", path.display())));
+        let Some(targets) = data.get("targets").and_then(|t| t.as_object()) else {
+            fail(&format!("{}: no `targets` object", path.display()))
+        };
+        out.extend(targets.keys().cloned());
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Which tree a crate is from.
