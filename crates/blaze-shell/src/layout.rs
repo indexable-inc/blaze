@@ -379,7 +379,17 @@ fn build_scene_inner(input: &LayoutInput<'_>, draw_top_bar: bool) -> Scene {
     if let Some(rs) = &input.editor.reverse_search {
         layout_reverse_search_overlay(&mut scene, rs, vw, vh, m, input.now_ns);
     } else if !input.editor.completions.is_empty() {
-        layout_completion_popup(&mut scene, input.editor, col_x0, prompt_y0, prompt_y1, vh, col_x1, m);
+        layout_completion_popup(
+            &mut scene,
+            input.editor,
+            col_x0,
+            prompt_y0,
+            prompt_y1,
+            vh,
+            col_x1,
+            m,
+            input.now_ns,
+        );
     } else if let Some(pop) = input.active_popover {
         layout_active_popover(&mut scene, pop, vw, vh, m, input.mouse_pos);
     }
@@ -6166,6 +6176,7 @@ fn layout_completion_popup(
     vh: f32,
     x1: f32,
     m: CellMetrics,
+    now_ns: i64,
 ) {
     let total = editor.completions.len();
     if total == 0 {
@@ -6179,7 +6190,47 @@ fn layout_completion_popup(
     let row_h = m.ch + 8.0;
     let doc_h = m.ch + 12.0;
     let popup_h = show as f32 * row_h + doc_h + 10.0;
-    let popup_w = (x1 - x0).min(560.0);
+
+    // Precompute live filesystem recency (`mtime_ns` + recursive `blaze-dust` `max_mtime_ns`)
+    // and progressive byte sizes for visible rows so autocomplete shares `ls`'s exact heatmap
+    // coloring and tier-colored proportional size bars!
+    struct RowFsVisual {
+        bytes: Option<u64>,
+        bytes_done: bool,
+        bytes_capped: bool,
+        mtime_ns: Option<i64>,
+    }
+    let mut row_vis: Vec<RowFsVisual> = Vec::with_capacity(show);
+    let mut max_bytes: u64 = 0;
+    let mut any_size_bar = false;
+    for offset in 0..show {
+        let item = &editor.completions[win_start + offset];
+        let mut bytes = item.fs_meta.as_ref().and_then(|f| f.size_bytes);
+        let mut bytes_done = true;
+        let mut bytes_capped = false;
+        let mut mtime_ns = item.fs_meta.as_ref().and_then(|f| f.mtime_ns);
+        if item.kind == CompletionKind::Dir
+            && let Some(fs) = item.fs_meta.as_ref()
+            && let Some(prog) = crate::dust_driver::request_dir_size(std::path::Path::new(&fs.path))
+        {
+            if prog.bytes > 0 {
+                bytes = Some(prog.bytes);
+                bytes_done = prog.done;
+                bytes_capped = prog.capped;
+            }
+            if prog.max_mtime_ns > 0 {
+                mtime_ns = Some(mtime_ns.unwrap_or(0).max(prog.max_mtime_ns));
+            }
+        }
+        if let Some(b) = bytes
+            && b > 0
+        {
+            max_bytes = max_bytes.max(b);
+            any_size_bar = true;
+        }
+        row_vis.push(RowFsVisual { bytes, bytes_done, bytes_capped, mtime_ns });
+    }
+    let popup_w = (x1 - x0).min(if any_size_bar { 620.0 } else { 560.0 });
 
     // Anchor horizontally near the active cursor token (clamped inside `[x0, x1 - popup_w]`).
     let (_, ccol) = editor.cursor_line_col();
@@ -6357,8 +6408,30 @@ fn layout_completion_popup(
             scene.overlay_text_run(gx, ty, glyph, fg_col, true, false, 0);
         }
 
-        // Right-aligned type / expansion / value-hint detail in crisp SF Pro (`UiSmall`).
-        let detail_txt = truncate_chars(&item.detail, 34);
+        // Right-aligned type / expansion / live folder-size detail + proportional tier-colored size bar.
+        let vis = &row_vis[offset];
+        let dynamic_detail: Option<String> = if item.kind == CompletionKind::Dir
+            && let Some(b) = vis.bytes
+            && b > 0
+        {
+            let compact = crate::dust_driver::format_bytes_compact(b);
+            let sz_s = if !vis.bytes_done {
+                format!("~{compact}")
+            } else if vis.bytes_capped {
+                format!("{compact}+")
+            } else {
+                compact
+            };
+            if item.detail == "dir" || item.detail == "git dir" {
+                Some(sz_s)
+            } else {
+                Some(format!("{sz_s} · {}", item.detail))
+            }
+        } else {
+            None
+        };
+        let detail_src = dynamic_detail.as_deref().unwrap_or(&item.detail);
+        let detail_txt = truncate_chars(detail_src, 34);
         let detail_w = m.measure(&detail_txt, TextFace::UiSmall);
         let detail_x = px1 - 12.0 - sb_pad - detail_w;
         scene.overlay_ui_small(
@@ -6371,15 +6444,106 @@ fn layout_completion_popup(
             0,
         );
 
-        // Label with IntelliJ-style vivid blue matched-character highlighting (`#589DF6`).
+        // Proportional tier-colored size bar (matches `ls`: Bytes slate, KiB blue, MiB amber, GiB orange).
+        const COMP_SIZE_BAR_W: f32 = 44.0;
+        let mut right_edge_for_label = detail_x - 12.0;
+        if any_size_bar {
+            let bar_x0 = detail_x - 10.0 - COMP_SIZE_BAR_W;
+            right_edge_for_label = bar_x0 - 10.0;
+            if let Some(b) = vis.bytes
+                && b > 0
+                && max_bytes > 0
+            {
+                let frac = blaze_dust::bar_fraction(b, max_bytes);
+                let by0 = ty + m.ch * 0.5 - 2.0;
+                let by1 = by0 + 4.0;
+                scene.overlay_round_rect(
+                    bar_x0,
+                    by0,
+                    bar_x0 + COMP_SIZE_BAR_W,
+                    by1,
+                    2.0,
+                    theme::BG_TRACK,
+                    0.0,
+                    [0.0; 4],
+                    0,
+                );
+                let fill_w = (COMP_SIZE_BAR_W * frac).max(3.0);
+                let fill_col = if !vis.bytes_done {
+                    theme::rgba(0xe5, 0xb5, 0x67, 0.50)
+                } else {
+                    match blaze_dust::size_tier(b) {
+                        blaze_dust::SizeTier::Bytes => theme::rgba(0x88, 0x90, 0x9e, 0.55),
+                        blaze_dust::SizeTier::KiB => theme::rgb(0x58, 0x9d, 0xf6),
+                        blaze_dust::SizeTier::MiB => theme::rgb(0xe5, 0xb5, 0x67),
+                        blaze_dust::SizeTier::GiB => theme::rgb(0xe8, 0x6a, 0x45),
+                    }
+                };
+                scene.overlay_round_rect(
+                    bar_x0,
+                    by0,
+                    bar_x0 + fill_w,
+                    by1,
+                    2.0,
+                    fill_col,
+                    0.0,
+                    [0.0; 4],
+                    0,
+                );
+            }
+        }
+
+        // Recency heatmap tint (matches `ls` `theme::recency_heat_color(age_secs)`).
+        let heat_info: Option<([f32; 4], f32)> = vis.mtime_ns.and_then(|mt| {
+            if mt <= 0 || now_ns <= 0 {
+                return None;
+            }
+            let age_secs = now_ns.saturating_sub(mt).max(0) as u64 / 1_000_000_000;
+            if age_secs < 600 {
+                Some((theme::recency_heat_color(age_secs), 0.45))
+            } else if age_secs < 7_200 {
+                Some((theme::recency_heat_color(age_secs), 0.30))
+            } else if age_secs < 86_400 {
+                Some((theme::recency_heat_color(age_secs), 0.16))
+            } else {
+                None
+            }
+        });
+        if let Some((heat_col, _)) = heat_info {
+            let dot_x = right_edge_for_label + 2.0;
+            let dot_y = ty + m.ch * 0.5;
+            scene.overlay_round_rect(
+                dot_x - 2.2,
+                dot_y - 2.2,
+                dot_x + 2.2,
+                dot_y + 2.2,
+                2.2,
+                heat_col,
+                0.0,
+                [0.0; 4],
+                0,
+            );
+            right_edge_for_label -= 8.0;
+        }
+
+        // Label with IntelliJ-style vivid blue matched-character highlighting (`#589DF6`)
+        // blended with `ls`-matching recency heat warmth when recently modified.
         let label_x = ix + icon_s + 9.0;
-        let max_label_ch = ((detail_x - 14.0 - label_x) / m.cw).floor().max(6.0) as usize;
+        let max_label_ch = ((right_edge_for_label - label_x) / m.cw).floor().max(6.0) as usize;
         let label_txt = truncate_chars(&item.label, max_label_ch);
-        let base_col = match item.kind {
+        let mut base_col = match item.kind {
             CompletionKind::Keyword if !is_sel => theme::rgb(0xd8, 0xa8, 0x8c),
             _ if is_sel => theme::INK_1,
             _ => theme::INK_2,
         };
+        if let Some((heat, blend)) = heat_info {
+            base_col = [
+                base_col[0] + (heat[0] - base_col[0]) * blend,
+                base_col[1] + (heat[1] - base_col[1]) * blend,
+                base_col[2] + (heat[2] - base_col[2]) * blend,
+                base_col[3],
+            ];
+        }
 
         if item.match_indices.is_empty() {
             scene.overlay_text_run(label_x, ty, &label_txt, base_col, is_sel, false, 0);

@@ -220,6 +220,15 @@ pub fn is_known_command_prefix(
     false
 }
 
+/// Filesystem metadata attached to path/directory completion candidates for `ls`-matching
+/// recency heatmap coloring and proportional tier-colored size bars.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletionFsMeta {
+    pub path: String,
+    pub mtime_ns: Option<i64>,
+    pub size_bytes: Option<u64>,
+}
+
 /// One candidate shown in the IntelliJ-style floating completion popup.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompletionItem {
@@ -234,6 +243,8 @@ pub struct CompletionItem {
     pub icon: Option<&'static str>,
     /// Optional local cached Retina circular avatar PNG/JPEG path (e.g. GitHub org/owner avatar).
     pub avatar_path: Option<String>,
+    /// Optional filesystem path, mtime, and byte size for recency heatmap + size bar rendering.
+    pub fs_meta: Option<CompletionFsMeta>,
     /// Character indices inside `label` matching the typed query (highlighted IntelliJ-style).
     pub match_indices: Vec<usize>,
 }
@@ -1948,6 +1959,45 @@ impl Editor {
 
         if self.completions.len() == 1 && self.completions[0].kind != CompletionKind::Hint {
             self.apply_selected_completion();
+            return;
+        }
+
+        // First-Tab longest-common-prefix completion (classic Fish/Zsh/Nushell ergonomics):
+        // e.g. `cd /Vo<Tab>` with `Volumes/` + 20 zoxide `/Volumes/...` descendants immediately
+        // completes `/Volumes/` so the user can keep typing `Proj<Tab>` -> `/Volumes/Projects/`.
+        let lcp = longest_common_prefix(&self.completions);
+        if lcp.len() > prefix.len()
+            && lcp
+                .get(..prefix.len())
+                .is_some_and(|p| p.eq_ignore_ascii_case(&prefix))
+        {
+            let is_exact_candidate = self
+                .completions
+                .iter()
+                .any(|it| it.kind != CompletionKind::Hint && it.insert == lcp);
+            self.push_undo(EditOp::Other);
+            self.clamp_cursor();
+            let start = clamp_char_boundary(&self.text, self.completion_replace_start).min(self.cursor);
+            self.text.replace_range(start..self.cursor, &lcp);
+            self.cursor = start + lcp.len();
+            self.selection_anchor = None;
+            self.ghost = None;
+            if is_exact_candidate {
+                self.dismiss_completions();
+            } else {
+                let new_before = &self.text[..self.cursor];
+                let new_tok_start = token_start_offset(new_before);
+                let new_prefix = new_before[new_tok_start..].to_owned();
+                let narrowed = self.compute_completions(state, recent_cols, new_tok_start, &new_prefix);
+                if narrowed.is_empty() {
+                    self.dismiss_completions();
+                } else {
+                    self.completion_replace_start = new_tok_start;
+                    self.completions = narrowed;
+                    self.completion_selected = 0;
+                    self.completion_scroll = 0;
+                }
+            }
         }
     }
 
@@ -2067,6 +2117,7 @@ impl Editor {
                             kind: CompletionKind::Variable,
                             icon: None,
                             avatar_path: None,
+                            fs_meta: None,
                             match_indices: idxs,
                         },
                     ));
@@ -2088,6 +2139,7 @@ impl Editor {
                             kind: CompletionKind::Variable,
                             icon: None,
                             avatar_path: None,
+                            fs_meta: None,
                             match_indices: idxs,
                         },
                     ));
@@ -2121,6 +2173,7 @@ impl Editor {
                                 kind: CompletionKind::Flag,
                                 icon: None,
                                 avatar_path: None,
+                                fs_meta: None,
                                 match_indices: idxs,
                             },
                         ));
@@ -2151,6 +2204,7 @@ impl Editor {
                                 kind: CompletionKind::Flag,
                                 icon: None,
                                 avatar_path: None,
+                                fs_meta: None,
                                 match_indices: idxs,
                             },
                         ));
@@ -2210,6 +2264,7 @@ impl Editor {
                                 kind: CompletionKind::Flag,
                                 icon: None,
                                 avatar_path: None,
+                                fs_meta: None,
                                 match_indices: idxs,
                             },
                         ));
@@ -2241,6 +2296,7 @@ impl Editor {
                                 kind: CompletionKind::Flag,
                                 icon: None,
                                 avatar_path: None,
+                                fs_meta: None,
                                 match_indices: idxs,
                             },
                         ));
@@ -2262,6 +2318,7 @@ impl Editor {
                                 kind: CompletionKind::Abbrev,
                                 icon: None,
                                 avatar_path: None,
+                                fs_meta: None,
                                 match_indices: idxs,
                             },
                         ));
@@ -2280,6 +2337,7 @@ impl Editor {
                             kind: CompletionKind::Builtin,
                             icon: None,
                             avatar_path: None,
+                            fs_meta: None,
                             match_indices: idxs,
                         },
                     ));
@@ -2297,6 +2355,7 @@ impl Editor {
                             kind: CompletionKind::Def,
                             icon: None,
                             avatar_path: None,
+                            fs_meta: None,
                             match_indices: idxs,
                         },
                     ));
@@ -2314,6 +2373,7 @@ impl Editor {
                             kind: CompletionKind::Keyword,
                             icon: if kw == "rust" { Some("rust_dark") } else { None },
                             avatar_path: None,
+                            fs_meta: None,
                             match_indices: idxs,
                         },
                     ));
@@ -2336,6 +2396,7 @@ impl Editor {
                                     kind: CompletionKind::External,
                                     icon: None,
                                     avatar_path: None,
+                                    fs_meta: None,
                                     match_indices: idxs,
                                 },
                             ));
@@ -2390,6 +2451,7 @@ impl Editor {
                                 kind: CompletionKind::External,
                                 icon: Some("shell_dark"),
                                 avatar_path: None,
+                                fs_meta: None,
                                 match_indices: idxs,
                             },
                         ));
@@ -2412,6 +2474,7 @@ impl Editor {
                                     kind: CompletionKind::Builtin,
                                     icon: None,
                                     avatar_path: None,
+                                    fs_meta: None,
                                     match_indices: idxs,
                                 },
                             ));
@@ -2435,6 +2498,7 @@ impl Editor {
                                     kind: CompletionKind::Keyword,
                                     icon: None,
                                     avatar_path: None,
+                                    fs_meta: None,
                                     match_indices: idxs,
                                 },
                             ));
@@ -2460,6 +2524,7 @@ impl Editor {
                                 kind: CompletionKind::Subcommand,
                                 icon: Some("rust_dark"),
                                 avatar_path: None,
+                                fs_meta: None,
                                 match_indices: idxs,
                             },
                         ));
@@ -2497,6 +2562,7 @@ impl Editor {
                                     kind: CompletionKind::Subcommand,
                                     icon: None,
                                     avatar_path: None,
+                                    fs_meta: None,
                                     match_indices: idxs,
                                 },
                             ));
@@ -2524,6 +2590,7 @@ impl Editor {
                                     kind: CompletionKind::Subcommand,
                                     icon: None,
                                     avatar_path: None,
+                                    fs_meta: None,
                                     match_indices: idxs,
                                 },
                             ));
@@ -2547,6 +2614,7 @@ impl Editor {
                                 kind: CompletionKind::Column,
                                 icon: None,
                                 avatar_path: None,
+                                fs_meta: None,
                                 match_indices: idxs,
                             },
                         ));
@@ -2585,6 +2653,7 @@ impl Editor {
                                 kind: CompletionKind::Hint,
                                 icon: None,
                                 avatar_path: None,
+                                fs_meta: None,
                                 match_indices: Vec::new(),
                             },
                         ));
@@ -2600,6 +2669,7 @@ impl Editor {
                                 kind: CompletionKind::Hint,
                                 icon: None,
                                 avatar_path: None,
+                                fs_meta: None,
                                 match_indices: Vec::new(),
                             },
                         ));
@@ -2616,6 +2686,7 @@ impl Editor {
                                     kind: CompletionKind::Hint,
                                     icon: None,
                                     avatar_path: None,
+                                    fs_meta: None,
                                     match_indices: Vec::new(),
                                 },
                             ));
@@ -2648,6 +2719,7 @@ impl Editor {
                                         kind,
                                         icon,
                                         avatar_path: sug.avatar_path,
+                                        fs_meta: None,
                                         match_indices,
                                     },
                                 ));
@@ -2665,14 +2737,47 @@ impl Editor {
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_nanos() as i64)
                         .unwrap_or(0);
+                    let anchored_prefix: Option<String> = if prefix.starts_with('/') {
+                        Some(prefix.to_owned())
+                    } else if let Some(rest) = prefix.strip_prefix("~/") {
+                        Some(format!("{}/{rest}", home.trim_end_matches('/')))
+                    } else if prefix == "~" && !home.is_empty() {
+                        Some(home.to_owned())
+                    } else {
+                        None
+                    };
                     for zm in self.zoxide.query(prefix, &self.local_host, now_ns, 20) {
+                        if let Some(anchor) = anchored_prefix.as_deref()
+                            && (!zm.is_local
+                                || !zm
+                                    .path
+                                    .get(..anchor.len())
+                                    .is_some_and(|p| p.eq_ignore_ascii_case(anchor)))
+                        {
+                            continue;
+                        }
                         let short = crate::prompt::abbreviate_home(&zm.path, home);
-                        let (label, insert, detail, doc) = if zm.is_local {
+                        let (label, insert, detail, doc, fs_meta) = if zm.is_local {
+                            let dir_insert = if zm.path == "/" {
+                                "/".to_owned()
+                            } else {
+                                format!("{}/", zm.path.trim_end_matches('/'))
+                            };
+                            let mtime_ns = fs::metadata(&zm.path)
+                                .ok()
+                                .and_then(|m| m.modified().ok())
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|d| d.as_nanos().min(i64::MAX as u128) as i64);
                             (
                                 short.clone(),
-                                shell_quote_if_needed(&zm.path),
+                                shell_quote_if_needed(&dir_insert),
                                 format!("z · {:.0}", zm.score),
                                 format!("zoxide ({}) · {}", zm.host, zm.path),
+                                Some(CompletionFsMeta {
+                                    path: zm.path.clone(),
+                                    mtime_ns,
+                                    size_bytes: None,
+                                }),
                             )
                         } else {
                             (
@@ -2680,6 +2785,7 @@ impl Editor {
                                 shell_quote_if_needed(&format!("{}:{}", zm.host, zm.path)),
                                 format!("host · {}", zm.host),
                                 format!("remote zoxide on {} · {}", zm.host, zm.path),
+                                None,
                             )
                         };
                         let match_indices = fuzzy_match_score(&label, prefix)
@@ -2695,6 +2801,7 @@ impl Editor {
                                 kind: CompletionKind::Dir,
                                 icon: Some("folder_macos"),
                                 avatar_path: None,
+                                fs_meta,
                                 match_indices,
                             },
                         ));
@@ -2707,11 +2814,16 @@ impl Editor {
         // Highest match score first, then alphabetical by label.
         scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.label.cmp(&b.1.label)));
 
-        // Deduplicate by label (keeping highest-ranked entry).
+        // Deduplicate by label AND (for filesystem/dir entries) by normalized insert target so
+        // `Projects/` and zoxide `/Volumes/Projects/` never appear twice for the same folder.
         let mut seen_labels: HashSet<String> = HashSet::new();
+        let mut seen_inserts: HashSet<String> = HashSet::new();
         let mut items: Vec<CompletionItem> = Vec::new();
         for (_, item) in scored {
-            if seen_labels.insert(item.label.clone()) {
+            let dup_insert = matches!(item.kind, CompletionKind::Dir | CompletionKind::File)
+                && !item.insert.is_empty()
+                && !seen_inserts.insert(item.insert.clone());
+            if !dup_insert && seen_labels.insert(item.label.clone()) {
                 items.push(item);
                 if items.len() >= 64 {
                     break;
@@ -2758,6 +2870,32 @@ impl Editor {
         self.ghost = None;
         true
     }
+}
+
+/// Longest exact character prefix shared by every actionable (non-`Hint`) completion's `insert`.
+fn longest_common_prefix(items: &[CompletionItem]) -> String {
+    let mut iter = items
+        .iter()
+        .filter(|it| it.kind != CompletionKind::Hint && !it.insert.is_empty());
+    let Some(first) = iter.next() else {
+        return String::new();
+    };
+    let mut prefix: Vec<char> = first.insert.chars().collect();
+    for item in iter {
+        let mut common = 0usize;
+        for (a, b) in prefix.iter().zip(item.insert.chars()) {
+            if *a == b {
+                common += 1;
+            } else {
+                break;
+            }
+        }
+        prefix.truncate(common);
+        if prefix.is_empty() {
+            break;
+        }
+    }
+    prefix.into_iter().collect()
 }
 
 /// Fuzzy + prefix subsequence matcher returning `(score, matched_char_indices)`.
@@ -3268,6 +3406,13 @@ fn collect_path_completions(
             continue;
         };
         let meta = entry.metadata().ok();
+        let mtime_ns = meta
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos().min(i64::MAX as u128) as i64);
+        let size_bytes = if is_dir { None } else { meta.as_ref().map(|m| m.len()) };
+        let full_fs_path = entry.path().to_string_lossy().into_owned();
         let kind_str = if is_dir { Some("dir") } else { Some("file") };
         let icon = Some(icon_name_for_file(&name, kind_str));
         let label = if is_dir { format!("{name}/") } else { name.clone() };
@@ -3279,9 +3424,9 @@ fn collect_path_completions(
         let insert = shell_quote_if_needed(&raw_insert);
         let detail = if is_dir {
             "dir".to_owned()
-        } else if let Some(m) = meta {
+        } else if let Some(sz) = size_bytes {
             crate::view::format_value_cell(&blaze_sh::Value::Size(Bytes(
-                m.len().min(i64::MAX as u64) as i64,
+                sz.min(i64::MAX as u64) as i64,
             )))
         } else {
             "file".to_owned()
@@ -3303,6 +3448,11 @@ fn collect_path_completions(
                 kind: if is_dir { CompletionKind::Dir } else { CompletionKind::File },
                 icon,
                 avatar_path: None,
+                fs_meta: Some(CompletionFsMeta {
+                    path: full_fs_path,
+                    mtime_ns,
+                    size_bytes,
+                }),
                 match_indices: idxs,
             },
         ));
@@ -3372,12 +3522,32 @@ fn collect_path_completions(
                     kind: if is_dir { CompletionKind::Dir } else { CompletionKind::File },
                     icon,
                     avatar_path: None,
+                    fs_meta: None,
                     match_indices: idxs,
                 },
             ));
         }
         sub_hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.label.cmp(&b.1.label)));
         sub_hits.truncate(20);
+        for (_, item) in &mut sub_hits {
+            let full = search_dir.join(item.label.trim_end_matches('/'));
+            let meta = fs::metadata(&full).ok();
+            let mtime_ns = meta
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos().min(i64::MAX as u128) as i64);
+            let size_bytes = if item.kind == CompletionKind::Dir {
+                None
+            } else {
+                meta.as_ref().map(|m| m.len())
+            };
+            item.fs_meta = Some(CompletionFsMeta {
+                path: full.to_string_lossy().into_owned(),
+                mtime_ns,
+                size_bytes,
+            });
+        }
         out.extend(sub_hits);
     }
 }
@@ -3582,5 +3752,59 @@ mod tests {
 
         assert!(ed.undo());
         assert_eq!(ed.text, "hello cruel world");
+    }
+
+    #[test]
+    fn tab_completion_auto_completes_common_dir_prefix_and_populates_fs_meta() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("blaze-tab-lcp-{}-{nanos}", std::process::id()));
+        let vol = root.join("Volumes");
+        let proj = vol.join("Projects");
+        let blaze_a = proj.join("blaze");
+        let blaze_b = proj.join("blaze-shell-1124");
+        let sample_file = proj.join("notes.txt");
+        fs::create_dir_all(&blaze_a).unwrap();
+        fs::create_dir_all(&blaze_b).unwrap();
+        fs::write(&sample_file, "hello world").unwrap();
+
+        let state = EngineState::new(&root.to_string_lossy(), &[], blaze_own::Alloc::global());
+        let mut ed = Editor::new();
+        // Seed zoxide with multiple descendants under `<root>/Volumes/Projects/...` + an unrelated path.
+        let now = nanos as i64;
+        ed.zoxide.record_visit(&ed.local_host, &proj.to_string_lossy(), now);
+        ed.zoxide.record_visit(&ed.local_host, &blaze_a.to_string_lossy(), now);
+        ed.zoxide.record_visit(&ed.local_host, &blaze_b.to_string_lossy(), now);
+        ed.zoxide.record_visit(&ed.local_host, "/Users/other/voice", now);
+
+        // 1. `cd <root>/Vo<Tab>` immediately auto-completes `<root>/Volumes/` and dismisses popup!
+        ed.set_text_initial(format!("cd {}/Vo", root.to_string_lossy()));
+        ed.trigger_completion(&state);
+        assert_eq!(ed.text, format!("cd {}/", vol.to_string_lossy()));
+        assert!(ed.completions.is_empty(), "exact dir LCP should dismiss popup so user can keep typing");
+
+        // 2. Keep typing `Proj` + `<Tab>` -> immediately completes `<root>/Volumes/Projects/`!
+        ed.insert_typed("Proj");
+        ed.trigger_completion(&state);
+        assert_eq!(ed.text, format!("cd {}/", proj.to_string_lossy()));
+        assert!(ed.completions.is_empty());
+
+        // 3. Typing ambiguous `bl` + `<Tab>` extends to `blaze` and opens narrowed 2-item popup!
+        ed.insert_typed("bl");
+        ed.trigger_completion(&state);
+        assert_eq!(ed.text, format!("cd {}/blaze", proj.to_string_lossy()));
+        assert_eq!(ed.completions.len(), 2);
+        assert!(ed.completions.iter().all(|c| c.fs_meta.is_some()));
+
+        // 4. File completions carry mtime_ns and exact size_bytes for heatmap + size bars.
+        let mut file_hits = Vec::new();
+        collect_path_completions(&proj.to_string_lossy(), "not", false, &mut file_hits);
+        let note = file_hits.iter().find(|(_, it)| it.label == "notes.txt").expect("notes.txt found");
+        let meta = note.1.fs_meta.as_ref().expect("fs_meta populated");
+        assert_eq!(meta.size_bytes, Some(11));
+        assert!(meta.mtime_ns.is_some());
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

@@ -4416,6 +4416,10 @@ mod macos_app {
                                             popup_engaged = !shell.editor.completions.is_empty();
                                             if shift && popup_engaged {
                                                 shell.editor.move_up();
+                                            } else if !popup_engaged {
+                                                // Auto-completed uniquely or by common prefix (e.g. `/Vo` -> `/Volumes/`):
+                                                // refresh inline Fish ghost immediately for the next segment!
+                                                shell.refresh_editor_assist(false);
                                             }
                                         }
                                     }
@@ -4428,22 +4432,24 @@ mod macos_app {
                                         }
                                     }
                                     Key::Backspace => {
+                                        let keep_open = !shell.editor.completions.is_empty();
                                         if alt {
                                             shell.editor.kill_word_back();
                                         } else {
                                             shell.editor.backspace();
                                         }
                                         popup_engaged = false;
-                                        shell.refresh_editor_assist(false);
+                                        shell.refresh_editor_assist(keep_open);
                                     }
                                     Key::Delete => {
+                                        let keep_open = !shell.editor.completions.is_empty();
                                         if alt {
                                             shell.editor.kill_word_forward();
                                         } else {
                                             shell.editor.delete_forward();
                                         }
                                         popup_engaged = false;
-                                        shell.refresh_editor_assist(false);
+                                        shell.refresh_editor_assist(keep_open);
                                     }
                                     Key::ArrowLeft => {
                                         if alt {
@@ -4508,6 +4514,7 @@ mod macos_app {
                                     }
                                     _ => {
                                         if !text.is_empty() {
+                                            let keep_open = !shell.editor.completions.is_empty() && text != " ";
                                             if text == " " {
                                                 // Fish/Nushell inline abbreviation expansion on Space!
                                                 shell.editor.try_expand_abbreviation();
@@ -4515,8 +4522,9 @@ mod macos_app {
                                             shell.editor.insert_typed(&text);
                                             popup_engaged = false;
                                             shell.auto_scroll_bottom = true;
-                                            // Keep Fish ghost autosuggestions live, never auto-pop noisy menu!
-                                            shell.refresh_editor_assist(false);
+                                            // Keep Fish ghost autosuggestions live; if the popup is
+                                            // already open, narrow it live as the user keeps typing!
+                                            shell.refresh_editor_assist(keep_open);
                                         }
                                     }
                                 }
