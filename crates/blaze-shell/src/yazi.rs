@@ -1945,13 +1945,113 @@ fn span_face_bold(style: MdStyle, force_bold: bool, prose_face: TextFace) -> (Te
     }
 }
 
-struct WrappedRun {
+/// Pre-shaped inline token cached across frames so live window resizes reflow paragraphs using
+/// pure float addition (`cur_w + tok.width > max_w`) with zero string scanning or glyph measuring!
+#[derive(Clone)]
+struct ShapedToken {
     text: String,
     style: MdStyle,
     href: Option<String>,
     width: f32,
     pad_l: f32,
     pad_r: f32,
+    is_ws: bool,
+    is_chip: bool,
+}
+
+type ShapeCacheKey = (usize, usize, u8, bool, u32, u32, u32);
+
+fn shape_md_spans(
+    spans: &[MdSpan<'_>],
+    force_bold: bool,
+    prose_face: TextFace,
+    m: CellMetrics,
+) -> Vec<ShapedToken> {
+    let mut out = Vec::with_capacity(spans.len() * 4);
+    for sp in spans {
+        let is_chip = matches!(sp.style, MdStyle::Code | MdStyle::Kbd);
+        let (face, bold) = span_face_bold(sp.style, force_bold, prose_face);
+        let sp_href = sp.href.as_ref().map(|h| h.as_str().to_owned());
+        if is_chip {
+            let sw = m.measure_styled(sp.text.as_str(), face, bold);
+            out.push(ShapedToken {
+                text: sp.text.as_str().to_owned(),
+                style: sp.style,
+                href: sp_href,
+                width: sw,
+                pad_l: 3.5,
+                pad_r: 3.5,
+                is_ws: false,
+                is_chip: true,
+            });
+            continue;
+        }
+        let s = sp.text.as_str();
+        let bytes = s.as_bytes();
+        let mut pos = 0usize;
+        while pos < bytes.len() {
+            let start = pos;
+            let is_ws = bytes[pos].is_ascii_whitespace();
+            while pos < bytes.len() && bytes[pos].is_ascii_whitespace() == is_ws {
+                pos += 1;
+            }
+            let piece = &s[start..pos];
+            let pw = m.measure_styled(piece, face, bold);
+            out.push(ShapedToken {
+                text: piece.to_owned(),
+                style: sp.style,
+                href: sp_href.clone(),
+                width: pw,
+                pad_l: 0.0,
+                pad_r: 0.0,
+                is_ws,
+                is_chip: false,
+            });
+        }
+    }
+    out
+}
+
+fn with_shaped_md_spans<R>(
+    spans: &[MdSpan<'_>],
+    force_bold: bool,
+    prose_face: TextFace,
+    m: CellMetrics,
+    f: impl FnOnce(&[ShapedToken]) -> R,
+) -> R {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    thread_local! {
+        static CACHE: RefCell<HashMap<ShapeCacheKey, Vec<ShapedToken>>> = RefCell::new(HashMap::new());
+    }
+    let face_id = match prose_face {
+        TextFace::Mono => 0u8,
+        TextFace::Ui => 1,
+        TextFace::UiSmall => 2,
+        TextFace::Heading => 3,
+        TextFace::Chrome => 4,
+    };
+    let first_len = spans.first().map_or(0, |s| s.text.len()) as u32;
+    let key: ShapeCacheKey = (
+        spans.as_ptr() as usize,
+        spans.len(),
+        face_id,
+        force_bold,
+        m.cw.to_bits(),
+        m.ui_adv[b'n' as usize - 32].to_bits(),
+        first_len,
+    );
+    CACHE.with(|cell| {
+        let mut map = cell.borrow_mut();
+        if map.len() > 2048 {
+            map.clear();
+        }
+        let tokens = map
+            .entry(key)
+            .or_insert_with(|| shape_md_spans(spans, force_bold, prose_face, m));
+        f(tokens.as_slice())
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1975,120 +2075,128 @@ fn render_md_spans_wrapped(
         return line_h;
     }
 
-    // Break spans into word/whitespace pieces and pack them cleanly into wrapped lines.
-    let mut lines: Vec<Vec<WrappedRun>> = vec![Vec::new()];
-    let mut cur_w = 0.0f32;
+    with_shaped_md_spans(spans, force_bold, prose_face, m, |tokens| {
+        // Pure float-addition line breaking: compute `(start_idx, end_idx, line_w)` with zero
+        // string copies and zero glyph-metric work during live window resizes!
+        let mut line_ranges: Vec<(usize, usize, f32)> = Vec::with_capacity(4);
+        let mut line_start = 0usize;
+        let mut line_end = 0usize;
+        let mut cur_w = 0.0f32;
 
-    for sp in spans {
-        let is_chip = matches!(sp.style, MdStyle::Code | MdStyle::Kbd);
-        let (face, bold) = span_face_bold(sp.style, force_bold, prose_face);
-        let sp_href = sp.href.as_ref().map(|h| h.as_str());
-        if is_chip {
-            let sw = m.measure_styled(sp.text.as_str(), face, bold);
-            let pad_l = 3.5;
-            let pad_r = 3.5;
-            let total = sw + pad_l + pad_r;
-            if cur_w > 0.0 && cur_w + total > max_w {
-                lines.push(Vec::new());
-                cur_w = 0.0;
+        for (i, tok) in tokens.iter().enumerate() {
+            if tok.is_ws && cur_w == 0.0 {
+                line_start = i + 1;
+                line_end = i + 1;
+                continue;
             }
-            lines.last_mut().unwrap().push(WrappedRun {
-                text: sp.text.as_str().to_owned(),
-                style: sp.style,
-                href: sp_href.map(str::to_owned),
-                width: sw,
-                pad_l,
-                pad_r,
-            });
-            cur_w += total;
-            continue;
-        }
-
-        // Tokenize prose spans into words + preserving spaces so inline links/bold never glue together.
-        let s = sp.text.as_str();
-        let mut pos = 0usize;
-        let bytes = s.as_bytes();
-        while pos < bytes.len() {
-            let start = pos;
-            let is_ws = bytes[pos].is_ascii_whitespace();
-            while pos < bytes.len() && bytes[pos].is_ascii_whitespace() == is_ws {
-                pos += 1;
-            }
-            let piece = &s[start..pos];
-            if is_ws && cur_w == 0.0 {
-                continue; // Drop leading spaces on freshly wrapped lines.
-            }
-            let pw = m.measure_styled(piece, face, bold);
-            if !is_ws && cur_w > 0.0 && cur_w + pw > max_w {
-                // Trim trailing whitespace on the line being closed.
-                if let Some(last_line) = lines.last_mut()
-                    && let Some(last_run) = last_line.last()
-                    && last_run.text.trim().is_empty()
-                {
-                    last_line.pop();
+            let total = tok.pad_l + tok.width + tok.pad_r;
+            if !tok.is_ws && cur_w > 0.0 && cur_w + total > max_w {
+                let mut end = line_end;
+                let mut lw = cur_w;
+                while end > line_start && tokens[end - 1].is_ws {
+                    end -= 1;
+                    lw -= tokens[end].width;
                 }
-                lines.push(Vec::new());
-                cur_w = 0.0;
-            }
-            let cur_line = lines.last_mut().unwrap();
-            if let Some(prev) = cur_line.last_mut()
-                && prev.style == sp.style
-                && prev.href.as_deref() == sp_href
-                && prev.pad_l == 0.0
-                && prev.pad_r == 0.0
-            {
-                prev.text.push_str(piece);
-                prev.width += pw;
+                line_ranges.push((line_start, end, lw.max(0.0)));
+                line_start = i;
+                line_end = i + 1;
+                cur_w = total;
             } else {
-                cur_line.push(WrappedRun {
-                    text: piece.to_owned(),
-                    style: sp.style,
-                    href: sp_href.map(str::to_owned),
-                    width: pw,
-                    pad_l: 0.0,
-                    pad_r: 0.0,
-                });
+                line_end = i + 1;
+                cur_w += total;
             }
-            cur_w += pw;
         }
-    }
+        if line_end > line_start {
+            let mut end = line_end;
+            let mut lw = cur_w;
+            while end > line_start && tokens[end - 1].is_ws {
+                end -= 1;
+                lw -= tokens[end].width;
+            }
+            if end > line_start {
+                line_ranges.push((line_start, end, lw.max(0.0)));
+            }
+        }
 
-    let mut y = y0;
-    let mut drawn = 0usize;
-    for line in &lines {
-        if y + m.ch > max_y {
-            break;
+        let mut y = y0;
+        let mut drawn = 0usize;
+        let mut coalesced = String::new();
+        for &(s_idx, e_idx, line_w) in &line_ranges {
+            if y + m.ch > max_y {
+                break;
+            }
+            // Skip drawing offscreen lines scrolled above the viewport (pure height accounting!).
+            if y + line_h >= -12.0 {
+                let mut cx = match align {
+                    TextAlign::Left => x0,
+                    TextAlign::Center => x0 + ((max_w - line_w) * 0.5).max(0.0),
+                    TextAlign::Right => x0 + (max_w - line_w).max(0.0),
+                };
+                let mut ti = s_idx;
+                while ti < e_idx {
+                    let tok = &tokens[ti];
+                    if tok.is_chip {
+                        cx += tok.pad_l;
+                        draw_styled_md_run(
+                            scene,
+                            &tok.text,
+                            tok.style,
+                            tok.href.as_deref(),
+                            base_dir,
+                            tok.width,
+                            cx,
+                            y,
+                            base_col,
+                            force_bold,
+                            prose_face,
+                            m,
+                            clip,
+                        );
+                        cx += tok.width + tok.pad_r;
+                        ti += 1;
+                    } else {
+                        // Coalesce adjacent same-style prose tokens on visible lines into 1 TextRun.
+                        coalesced.clear();
+                        coalesced.push_str(&tok.text);
+                        let mut run_w = tok.width;
+                        let style = tok.style;
+                        let href = tok.href.as_deref();
+                        ti += 1;
+                        while ti < e_idx {
+                            let nxt = &tokens[ti];
+                            if !nxt.is_chip && nxt.style == style && nxt.href.as_deref() == href {
+                                coalesced.push_str(&nxt.text);
+                                run_w += nxt.width;
+                                ti += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        draw_styled_md_run(
+                            scene,
+                            &coalesced,
+                            style,
+                            href,
+                            base_dir,
+                            run_w,
+                            cx,
+                            y,
+                            base_col,
+                            force_bold,
+                            prose_face,
+                            m,
+                            clip,
+                        );
+                        cx += run_w;
+                    }
+                }
+            }
+            y += line_h;
+            drawn += 1;
         }
-        let line_w: f32 = line.iter().map(|r| r.pad_l + r.width + r.pad_r).sum();
-        let mut cx = match align {
-            TextAlign::Left => x0,
-            TextAlign::Center => x0 + ((max_w - line_w) * 0.5).max(0.0),
-            TextAlign::Right => x0 + (max_w - line_w).max(0.0),
-        };
-        for run in line {
-            cx += run.pad_l;
-            draw_styled_md_run(
-                scene,
-                &run.text,
-                run.style,
-                run.href.as_deref(),
-                base_dir,
-                run.width,
-                cx,
-                y,
-                base_col,
-                force_bold,
-                prose_face,
-                m,
-                clip,
-            );
-            cx += run.width + run.pad_r;
-        }
-        y += line_h;
-        drawn += 1;
-    }
 
-    (drawn.max(1) as f32) * line_h
+        (drawn.max(1) as f32) * line_h
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

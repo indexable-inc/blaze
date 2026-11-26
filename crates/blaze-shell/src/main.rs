@@ -61,6 +61,7 @@ fn headless_repl() {
 
 #[cfg(target_os = "macos")]
 mod macos_app {
+    use std::cell::RefCell;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::AtomicU32;
@@ -79,16 +80,21 @@ mod macos_app {
     };
     use blaze_vt::input::key::{Key, OptionAsAlt, Platform};
     use blaze_vt::terminal::{Effect, Opts as VtOpts, Terminal};
-    use objc2::rc::autoreleasepool;
-    use objc2::{MainThreadMarker, MainThreadOnly, sel};
+    use objc2::rc::{Retained, autoreleasepool};
+    use objc2::{MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
     use objc2_app_kit::{
-        NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSCursor, NSEventMask,
-        NSEventModifierFlags, NSEventType, NSMenu, NSMenuItem, NSPasteboard,
-        NSPasteboardTypeString, NSWindow, NSWindowStyleMask, NSWindowTitleVisibility,
+        NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSCursor, NSEvent,
+        NSEventMask, NSEventModifierFlags, NSEventType, NSMenu, NSMenuItem, NSPasteboard,
+        NSPasteboardTypeString, NSResponder, NSView, NSWindow, NSWindowStyleMask,
+        NSWindowTitleVisibility,
     };
-    use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSPoint, NSRect, NSSize, NSString};
+    use objc2_core_graphics::CGColor;
+    use objc2_foundation::{
+        NSDate, NSDefaultRunLoopMode, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
+        NSString,
+    };
     use objc2_metal::MTLCreateSystemDefaultDevice;
-    use objc2_quartz_core::CAMetalLayer;
+    use objc2_quartz_core::{CAMetalLayer, CATransaction, kCAGravityTopLeft};
 
     use blaze_shell::agent_hub::{
         AgentHub, AgentHubAction, AgentRecord, AgentStatus, layout_agent_hub_pane,
@@ -1927,6 +1933,227 @@ mod macos_app {
         app.setWindowsMenu(Some(&win_menu));
     }
 
+    enum ResizeEvent {
+        WillStartLiveResize,
+        FrameSize { size: NSSize, live: bool },
+        DidEndLiveResize,
+    }
+
+    thread_local! {
+        static RESIZE_HOOK: RefCell<Option<*mut dyn FnMut(ResizeEvent)>> = const { RefCell::new(None) };
+    }
+
+    fn dispatch_resize_event(ev: ResizeEvent) {
+        let ptr = RESIZE_HOOK.with(|c| c.borrow_mut().take());
+        if let Some(p) = ptr {
+            // SAFETY: `p` is installed on the main thread for the dynamic extent of an AppKit
+            // modal call via `with_resize_hook` and restored before returning; taking prevents
+            // re-entrant double-borrows if AppKit nests another layout call.
+            unsafe { (*p)(ev) };
+            RESIZE_HOOK.with(|c| *c.borrow_mut() = Some(p));
+        }
+    }
+
+    fn with_resize_hook<R>(f: &mut dyn FnMut(ResizeEvent), body: impl FnOnce() -> R) -> R {
+        struct Reset(Option<*mut dyn FnMut(ResizeEvent)>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                RESIZE_HOOK.with(|c| *c.borrow_mut() = self.0);
+            }
+        }
+        // SAFETY: `f` outlives `body()` and `Reset::drop` unconditionally clears the thread-local
+        // hook before `f` can be invalidated (even across panics).
+        let raw: *mut dyn FnMut(ResizeEvent) = unsafe { std::mem::transmute(f) };
+        let prev = RESIZE_HOOK.with(|c| c.borrow_mut().replace(raw));
+        let _guard = Reset(prev);
+        body()
+    }
+
+    define_class!(
+        // SAFETY: `NSView` subclass with empty ivars on the main thread only; forwards to super.
+        #[unsafe(super(NSView, NSResponder, NSObject))]
+        #[thread_kind = MainThreadOnly]
+        #[name = "BlazeMetalView"]
+        struct BlazeMetalView;
+
+        unsafe impl NSObjectProtocol for BlazeMetalView {}
+
+        impl BlazeMetalView {
+            #[unsafe(method(setFrameSize:))]
+            fn set_frame_size(&self, size: NSSize) {
+                // SAFETY: forwarding the same selector to `NSView`'s superclass implementation.
+                let _: () = unsafe { msg_send![super(self), setFrameSize: size] };
+                dispatch_resize_event(ResizeEvent::FrameSize { size, live: self.inLiveResize() });
+            }
+
+            #[unsafe(method(viewWillStartLiveResize))]
+            fn will_start_live_resize(&self) {
+                // SAFETY: forwarding to superclass.
+                let _: () = unsafe { msg_send![super(self), viewWillStartLiveResize] };
+                dispatch_resize_event(ResizeEvent::WillStartLiveResize);
+            }
+
+            #[unsafe(method(viewDidEndLiveResize))]
+            fn did_end_live_resize(&self) {
+                // SAFETY: forwarding to superclass.
+                let _: () = unsafe { msg_send![super(self), viewDidEndLiveResize] };
+                dispatch_resize_event(ResizeEvent::DidEndLiveResize);
+            }
+        }
+    );
+
+    impl BlazeMetalView {
+        fn new(mtm: MainThreadMarker, frame: NSRect) -> Retained<Self> {
+            let this = Self::alloc(mtm).set_ivars(());
+            // SAFETY: calling `NSView`'s designated initializer `initWithFrame:` on main thread.
+            unsafe { msg_send![super(this), initWithFrame: frame] }
+        }
+    }
+
+    /// Synchronized Metal live-resize & external-resize handler (exact `den-native` protocol):
+    /// updates `CAMetalLayer`'s drawable size with implicit animations disabled, reflows the full
+    /// scene in place using pre-shaped text runs and path-keyed GPU images, and presents inside
+    /// the active CoreAnimation transaction (`presentsWithTransaction`) so window borders and text
+    /// move atomically with zero stretching, black gaps, or lag.
+    #[allow(clippy::too_many_arguments)]
+    fn handle_resize_event(
+        ev: ResizeEvent,
+        window: &NSWindow,
+        layer: &CAMetalLayer,
+        renderer: &Renderer,
+        wm: &TileManager,
+        panes: &mut std::collections::HashMap<PaneId, ShellApp>,
+        fonts: &mut Fonts,
+        icon_atlas: &mut IconAtlas,
+        image_atlas: &mut ImageAtlas,
+        size: &mut NSSize,
+        scale: &mut f64,
+        font_points: f64,
+        anim_epoch: Instant,
+        has_animated_images: &mut bool,
+        tile_layout: &mut TileLayout,
+        composite_scene: &mut Scene,
+        pty_sizes_dirty: &mut bool,
+        dirty: &mut bool,
+        last_pty_sync: &mut Instant,
+    ) {
+        match ev {
+            ResizeEvent::WillStartLiveResize => {
+                layer.setPresentsWithTransaction(true);
+            }
+            ResizeEvent::DidEndLiveResize => {
+                layer.setPresentsWithTransaction(false);
+                *pty_sizes_dirty = true;
+                *dirty = true;
+            }
+            ResizeEvent::FrameSize { size: new_size, live } => {
+                if new_size.width < 40.0 || new_size.height < 40.0 || !window.isVisible() {
+                    return;
+                }
+                let new_scale = window.backingScaleFactor().max(1.0);
+                if (new_scale - *scale).abs() > f64::EPSILON {
+                    *scale = new_scale;
+                    *fonts = Fonts::new(font_points, *scale);
+                    *icon_atlas = IconAtlas::new(*scale * (font_points / FONT_POINTS));
+                    image_atlas.set_scale(*scale);
+                }
+                *size = new_size;
+                let px_w = (size.width * *scale).round().max(1.0);
+                let px_h = (size.height * *scale).round().max(1.0);
+                CATransaction::begin();
+                CATransaction::setDisableActions(true);
+                layer.setContentsScale(*scale);
+                layer.setDrawableSize(NSSize::new(px_w, px_h));
+                CATransaction::commit();
+
+                if !live {
+                    layer.setPresentsWithTransaction(true);
+                }
+
+                let metrics = fonts.cell_metrics(*scale);
+                let cursor_vis = window.isKeyWindow();
+                let zoom_pct = ((font_points / FONT_POINTS) * 100.0).round() as u16;
+                let (mut scene, next_tl) = build_window_scene(
+                    wm,
+                    panes,
+                    size.width as f32,
+                    size.height as f32,
+                    metrics,
+                    cursor_vis,
+                    now_ns(),
+                    zoom_pct,
+                    true,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+                *tile_layout = next_tl;
+
+                if !live || last_pty_sync.elapsed().as_millis() >= 50 {
+                    sync_pty_sizes(panes, tile_layout, fonts, *scale);
+                    *last_pty_sync = Instant::now();
+                    *pty_sizes_dirty = false;
+                } else {
+                    *pty_sizes_dirty = true;
+                }
+
+                let vh = size.height as f32;
+                let glyphs = fonts.rasterize_runs(&scene.text_runs, *scale, vh);
+                let overlay_glyphs = fonts.rasterize_runs(&scene.overlay_text, *scale, vh);
+                for (slot, bytes) in fonts.pending.drain(..) {
+                    renderer.upload(slot, &bytes);
+                }
+                let icons = icon_atlas.rasterize_quads(&scene.icon_quads);
+                let overlay_icons = icon_atlas.rasterize_quads(&scene.overlay_icons);
+                for (slot, rgba) in icon_atlas.pending.drain(..) {
+                    renderer.upload_icon(slot, &rgba);
+                }
+                let anim_ms = anim_epoch.elapsed().as_millis() as u64;
+                let (images, any_anim) = image_atlas.rasterize_quads(&scene.image_quads, anim_ms, vh);
+                *has_animated_images = any_anim;
+                image_atlas.drain_pending_into(|slot, rgba| renderer.upload_image(slot, rgba));
+
+                let vp = ViewportUniform {
+                    size: [size.width as f32, size.height as f32],
+                    dpr: *scale as f32,
+                    time: 0.0,
+                };
+                let frame = FrameDraw {
+                    vp,
+                    clear: scene.clear_color,
+                    clips: &scene.clips,
+                    rects: &scene.rects,
+                    glyphs: &glyphs,
+                    icons: &icons,
+                    images: &images,
+                    over_rects: &scene.over_rects,
+                    overlay_rects: &scene.overlay_rects,
+                    overlay_icons: &overlay_icons,
+                    overlay_glyphs: &overlay_glyphs,
+                };
+                renderer.draw(layer, &frame);
+                if !live {
+                    CATransaction::flush();
+                    layer.setPresentsWithTransaction(false);
+                }
+                scene.rects.clear();
+                scene.icon_quads.clear();
+                scene.image_quads.clear();
+                scene.over_rects.clear();
+                scene.overlay_rects.clear();
+                scene.overlay_icons.clear();
+                scene.overlay_text.clear();
+                *composite_scene = scene;
+                *dirty = false;
+            }
+        }
+    }
+
     pub fn run() {
         let cli = parse_cli();
 
@@ -1988,13 +2215,28 @@ mod macos_app {
             use objc2_app_kit::NSAppearanceCustomization as _;
             window.setAppearance(Some(&app_dark));
         }
-        let view = window.contentView().expect("window contentView");
+        let view = BlazeMetalView::new(mtm, NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(init_w, init_h)));
+        window.setContentView(Some(&view));
 
         let renderer = Renderer::new(MTLCreateSystemDefaultDevice().expect("no Metal GPU device"));
         let layer = CAMetalLayer::new();
         layer.setDevice(Some(renderer.device()));
         layer.setPixelFormat(PIXEL_FORMAT);
         layer.setFramebufferOnly(true);
+        // Disable implicit CoreAnimation stretch/fade actions and anchor contents top-left
+        // (matching `den-native`) so window resizes never stretch old frames or flash white.
+        CATransaction::begin();
+        CATransaction::setDisableActions(true);
+        // SAFETY: `kCAGravityTopLeft` is a valid QuartzCore static NSString constant.
+        layer.setContentsGravity(unsafe { kCAGravityTopLeft });
+        let ground = CGColor::new_srgb(
+            0x10 as f64 / 255.0,
+            0x10 as f64 / 255.0,
+            0x11 as f64 / 255.0,
+            1.0,
+        );
+        layer.setBackgroundColor(Some(&ground));
+        CATransaction::commit();
         view.setLayer(Some(&layer));
         view.setWantsLayer(true);
 
@@ -2110,9 +2352,7 @@ mod macos_app {
                 renderer.upload_icon(slot, &rgba);
             }
             let (images, _) = image_atlas.rasterize_quads(&scene.image_quads, 0, vh);
-            for (slot, rgba) in image_atlas.pending.drain(..) {
-                renderer.upload_image(slot, &rgba);
-            }
+            image_atlas.drain_pending_into(|slot, rgba| renderer.upload_image(slot, rgba));
             let vp = ViewportUniform {
                 size: [size.width as f32, size.height as f32],
                 dpr: scale as f32,
@@ -2167,6 +2407,7 @@ mod macos_app {
         let mut last_mouse: Option<(f32, f32)> = None;
         let mut last_hovered_link: Option<String> = None;
         let mut was_hidden = false;
+        let mut last_pty_sync = Instant::now();
 
         loop {
             let mut quit = false;
@@ -2174,12 +2415,51 @@ mod macos_app {
                 // SAFETY: `NSDefaultRunLoopMode` is a valid Foundation static string.
                 let mode = unsafe { NSDefaultRunLoopMode };
                 let until = NSDate::dateWithTimeIntervalSinceNow(if dirty { 0.0 } else { 0.008 });
-                while let Some(ev) = app.nextEventMatchingMask_untilDate_inMode_dequeue(
-                    NSEventMask::Any,
-                    Some(&until),
-                    mode,
-                    true,
-                ) {
+                let mut events: Vec<Retained<NSEvent>> = Vec::with_capacity(8);
+                {
+                    let mut on_resize = |rev: ResizeEvent| {
+                        handle_resize_event(
+                            rev,
+                            &window,
+                            &layer,
+                            &renderer,
+                            &wm,
+                            &mut panes,
+                            &mut fonts,
+                            &mut icon_atlas,
+                            &mut image_atlas,
+                            &mut size,
+                            &mut scale,
+                            font_points,
+                            anim_epoch,
+                            &mut has_animated_images,
+                            &mut tile_layout,
+                            &mut composite_scene,
+                            &mut pty_sizes_dirty,
+                            &mut dirty,
+                            &mut last_pty_sync,
+                        );
+                    };
+                    with_resize_hook(&mut on_resize, || {
+                        if let Some(first) = app.nextEventMatchingMask_untilDate_inMode_dequeue(
+                            NSEventMask::Any,
+                            Some(&until),
+                            mode,
+                            true,
+                        ) {
+                            events.push(first);
+                            while let Some(more) = app.nextEventMatchingMask_untilDate_inMode_dequeue(
+                                NSEventMask::Any,
+                                None,
+                                mode,
+                                true,
+                            ) {
+                                events.push(more);
+                            }
+                        }
+                    });
+                }
+                for ev in events {
                     match ev.r#type() {
                         NSEventType::KeyDown if window.isKeyWindow() => {
                             let flags = ev.modifierFlags();
@@ -4173,9 +4453,59 @@ mod macos_app {
                         }
                         _ => {}
                     }
-                    app.sendEvent(&ev);
+                    let mut on_resize = |rev: ResizeEvent| {
+                        handle_resize_event(
+                            rev,
+                            &window,
+                            &layer,
+                            &renderer,
+                            &wm,
+                            &mut panes,
+                            &mut fonts,
+                            &mut icon_atlas,
+                            &mut image_atlas,
+                            &mut size,
+                            &mut scale,
+                            font_points,
+                            anim_epoch,
+                            &mut has_animated_images,
+                            &mut tile_layout,
+                            &mut composite_scene,
+                            &mut pty_sizes_dirty,
+                            &mut dirty,
+                            &mut last_pty_sync,
+                        );
+                    };
+                    with_resize_hook(&mut on_resize, || {
+                        app.sendEvent(&ev);
+                    });
                 }
-                app.updateWindows();
+                let mut on_resize = |rev: ResizeEvent| {
+                    handle_resize_event(
+                        rev,
+                        &window,
+                        &layer,
+                        &renderer,
+                        &wm,
+                        &mut panes,
+                        &mut fonts,
+                        &mut icon_atlas,
+                        &mut image_atlas,
+                        &mut size,
+                        &mut scale,
+                        font_points,
+                        anim_epoch,
+                        &mut has_animated_images,
+                        &mut tile_layout,
+                        &mut composite_scene,
+                        &mut pty_sizes_dirty,
+                        &mut dirty,
+                        &mut last_pty_sync,
+                    );
+                };
+                with_resize_hook(&mut on_resize, || {
+                    app.updateWindows();
+                });
             });
 
             // Distinguish user-closed window from `Cmd+H` (app hidden) or `Cmd+M` (minimized to Dock)
@@ -4313,7 +4643,11 @@ mod macos_app {
                 last_running_tick = Instant::now();
                 dirty = true;
             }
-            if has_animated_images && !is_hidden_or_min && last_anim_tick.elapsed().as_millis() >= 33 {
+            if has_animated_images
+                && !is_hidden_or_min
+                && last_anim_tick.elapsed().as_millis() >= 15
+                && image_atlas.has_ready_animation_frame(anim_epoch.elapsed().as_millis() as u64)
+            {
                 last_anim_tick = Instant::now();
                 dirty = true;
             }
@@ -4421,9 +4755,7 @@ mod macos_app {
                 let anim_ms = anim_epoch.elapsed().as_millis() as u64;
                 let (images, any_anim) = image_atlas.rasterize_quads(&scene.image_quads, anim_ms, vh);
                 has_animated_images = any_anim;
-                for (slot, rgba) in image_atlas.pending.drain(..) {
-                    renderer.upload_image(slot, &rgba);
-                }
+                image_atlas.drain_pending_into(|slot, rgba| renderer.upload_image(slot, rgba));
                 let vp = ViewportUniform {
                     size: [size.width as f32, size.height as f32],
                     dpr: scale as f32,

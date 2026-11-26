@@ -68,6 +68,9 @@ fn probe_image_size_uncached(path: &Path) -> Option<(u32, u32)> {
         let text = std::str::from_utf8(&bytes).ok()?;
         return parse_svg_dims(text);
     }
+    if let Some(seq) = crate::avif_dav1d::parse_avif_sequence(&bytes) {
+        return Some((seq.width, seq.height));
+    }
     decode_cg_image_dims(&bytes)
 }
 
@@ -375,7 +378,7 @@ unsafe fn read_frame_delay_ms(src: *const mac_imageio::OpaqueCGImageSource, idx:
     if dict.is_null() {
         return 83;
     }
-    let containers = ["{WebP}", "{GIF}", "{HEICS}", "{PNG}"];
+    let containers = ["{AVIS}", "{WebP}", "{GIF}", "{HEICS}", "{PNG}"];
     let delay_keys = ["UnclampedDelayTime", "DelayTime"];
     let mut result_ms: Option<u64> = None;
 
@@ -402,7 +405,7 @@ unsafe fn read_frame_delay_ms(src: *const mac_imageio::OpaqueCGImageSource, idx:
             let mut secs = 0.0f64;
             let ok = unsafe { CFNumberGetValue(num.cast(), CF_F64, (&mut secs as *mut f64).cast()) };
             if ok != 0 && secs > 0.005 && secs.is_finite() {
-                result_ms = Some((secs * 1000.0).round().clamp(20.0, 5000.0) as u64);
+                result_ms = Some((secs * 1000.0).round().clamp(12.0, 5000.0) as u64);
                 break 'outer;
             }
         }
@@ -1022,13 +1025,15 @@ unsafe fn trace_svg_path(
 
 #[cfg(target_os = "macos")]
 enum AnimBackend {
+    /// Stateful 60fps AVIF sequence (`avis`) decoded sequentially via macOS WebCore `dav1d`
+    /// on a dedicated background thread with recycled zero-allocation RGBA8 buffers!
+    AvifDav1d(crate::avif_dav1d::AvifStreamer),
     /// Compact animations (e.g. 32-frame Blaze fire WebP): lazily decoded once into RAM cache.
     Cached {
         src: *mut mac_imageio::OpaqueCGImageSource,
         frames: Vec<Option<Vec<u8>>>,
     },
-    /// Large multi-hundred-frame animations (e.g. 2.7 MB Game of Life `docs/demo.avif`):
-    /// decoded asynchronously on a dedicated worker thread so scrolling stays locked 60/120fps.
+    /// Fallback background streamer for large non-AVIF multi-frame animations (e.g. huge GIFs).
     Streamed {
         req_tx: std::sync::mpsc::SyncSender<usize>,
         frame_rx: std::sync::mpsc::Receiver<(usize, Vec<u8>)>,
@@ -1083,14 +1088,18 @@ struct AtlasEntry {
 
 /// Shelf-packed GPU RGBA8 image atlas supporting static & live animated (`webp`, `avif`, `gif`,
 /// `png`, `jpg`, `svg`) Markdown/HTML images.
+///
+/// Keyed strictly by file path (not pixel size!) so live window resizes NEVER re-read files,
+/// re-decode images, or restart animation workers — Metal's bilinear sampler scales quads at 120fps.
 #[cfg(target_os = "macos")]
 pub struct ImageAtlas {
     scale: f64,
-    entries: HashMap<(String, usize, usize), Option<AtlasEntry>>,
+    entries: HashMap<String, Option<AtlasEntry>>,
     next_x: usize,
     next_y: usize,
     row_h: usize,
     pub pending: Vec<(ImageSlot, Vec<u8>)>,
+    pending_recycle: Vec<(String, ImageSlot, Vec<u8>)>,
 }
 
 #[cfg(target_os = "macos")]
@@ -1103,6 +1112,7 @@ impl ImageAtlas {
             next_y: 0,
             row_h: 0,
             pending: Vec::new(),
+            pending_recycle: Vec::new(),
         }
     }
 
@@ -1115,7 +1125,55 @@ impl ImageAtlas {
             self.next_y = 0;
             self.row_h = 0;
             self.pending.clear();
+            self.pending_recycle.clear();
         }
+    }
+
+    /// Upload all pending frames via `upload` and recycle streamed RGBA8 buffers back to their
+    /// background decoders (zero per-frame heap allocation!).
+    pub fn drain_pending_into(&mut self, mut upload: impl FnMut(ImageSlot, &[u8])) {
+        for (slot, bytes) in self.pending.drain(..) {
+            upload(slot, &bytes);
+        }
+        for (path, slot, bytes) in self.pending_recycle.drain(..) {
+            upload(slot, &bytes);
+            if let Some(Some(entry)) = self.entries.get(&path)
+                && let Some(anim) = entry.anim.as_ref()
+                && let AnimBackend::AvifDav1d(ref streamer) = anim.backend
+            {
+                streamer.recycle(bytes);
+            }
+        }
+    }
+
+    /// Fast O(N_loaded) check whether ANY loaded animated image actually has a new frame ready
+    /// to present at `now_ms` (avoids needless full-scene redraws between animation frames!).
+    pub fn has_ready_animation_frame(&self, now_ms: u64) -> bool {
+        for entry in self.entries.values().flatten() {
+            let Some(anim) = entry.anim.as_ref() else {
+                continue;
+            };
+            match &anim.backend {
+                AnimBackend::AvifDav1d(streamer) => {
+                    if streamer.has_ready_frame() {
+                        return true;
+                    }
+                }
+                AnimBackend::Cached { .. } | AnimBackend::Streamed { .. } => {
+                    if anim.total_ms > 0 && !anim.frame_ends_ms.is_empty() {
+                        let t = now_ms % anim.total_ms;
+                        let frame_idx = anim
+                            .frame_ends_ms
+                            .partition_point(|&end| end <= t)
+                            .min(anim.frame_ends_ms.len() - 1);
+                        if frame_idx != anim.last_frame {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
     }
 
     fn alloc_slot(&mut self, w_px: usize, h_px: usize) -> Option<ImageSlot> {
@@ -1140,26 +1198,55 @@ impl ImageAtlas {
         Some(slot)
     }
 
-    fn ensure_entry(&mut self, path: &str, w_px: usize, h_px: usize, now_ms: u64) -> Option<(ImageSlot, bool)> {
-        let key = (path.to_owned(), w_px, h_px);
-        if !self.entries.contains_key(&key) {
-            let loaded = self.load_new_entry(Path::new(path), w_px, h_px);
-            self.entries.insert(key.clone(), loaded);
+    fn choose_decode_dims(&self, path: &Path, req_w: usize, req_h: usize, max_w: usize, max_h: usize) -> (usize, usize) {
+        if let Some((nw, nh)) = probe_image_size(path)
+            && nw > 0
+            && nh > 0
+        {
+            let (mut w, mut h) = (nw as f64, nh as f64);
+            // SVGs scale cleanly to crisp Retina resolution.
+            if is_svg_path(path) {
+                w = (w * self.scale).min(max_w as f64);
+                h = (h * self.scale).min(max_h as f64);
+            }
+            if w > max_w as f64 {
+                h *= max_w as f64 / w;
+                w = max_w as f64;
+            }
+            if h > max_h as f64 {
+                w *= max_h as f64 / h;
+                h = max_h as f64;
+            }
+            return (w.round().clamp(1.0, max_w as f64) as usize, h.round().clamp(1.0, max_h as f64) as usize);
         }
-        let entry = self.entries.get_mut(&key)?.as_mut()?;
+        (req_w.clamp(1, max_w), req_h.clamp(1, max_h))
+    }
+
+    fn ensure_entry(&mut self, path: &str, w_px: usize, h_px: usize, now_ms: u64) -> Option<(ImageSlot, bool)> {
+        if !self.entries.contains_key(path) {
+            let loaded = self.load_new_entry(Path::new(path), w_px, h_px);
+            self.entries.insert(path.to_owned(), loaded);
+        }
+        let entry = self.entries.get_mut(path)?.as_mut()?;
         let slot = entry.slot;
         let mut is_animated = false;
 
         if let Some(anim) = entry.anim.as_mut() {
             is_animated = true;
-            if anim.total_ms > 0 && !anim.frame_ends_ms.is_empty() {
-                let t = now_ms % anim.total_ms;
-                let frame_idx = anim
-                    .frame_ends_ms
-                    .partition_point(|&end| end <= t)
-                    .min(anim.frame_ends_ms.len() - 1);
-                match &mut anim.backend {
-                    AnimBackend::Cached { src, frames } => {
+            match &mut anim.backend {
+                AnimBackend::AvifDav1d(streamer) => {
+                    if let Some((got_idx, bytes)) = streamer.poll_visible() {
+                        self.pending_recycle.push((path.to_owned(), slot, bytes));
+                        anim.last_frame = got_idx;
+                    }
+                }
+                AnimBackend::Cached { src, frames } => {
+                    if anim.total_ms > 0 && !anim.frame_ends_ms.is_empty() {
+                        let t = now_ms % anim.total_ms;
+                        let frame_idx = anim
+                            .frame_ends_ms
+                            .partition_point(|&end| end <= t)
+                            .min(anim.frame_ends_ms.len() - 1);
                         if frame_idx != anim.last_frame {
                             let rgba = if let Some(cached) = frames[frame_idx].as_ref() {
                                 Some(cached.clone())
@@ -1176,8 +1263,14 @@ impl ImageAtlas {
                             }
                         }
                     }
-                    AnimBackend::Streamed { req_tx, frame_rx, in_flight } => {
-                        // Drain any completed decoded frames non-blockingly and upload the newest.
+                }
+                AnimBackend::Streamed { req_tx, frame_rx, in_flight } => {
+                    if anim.total_ms > 0 && !anim.frame_ends_ms.is_empty() {
+                        let t = now_ms % anim.total_ms;
+                        let frame_idx = anim
+                            .frame_ends_ms
+                            .partition_point(|&end| end <= t)
+                            .min(anim.frame_ends_ms.len() - 1);
                         let mut newest: Option<(usize, Vec<u8>)> = None;
                         while let Ok(done) = frame_rx.try_recv() {
                             if *in_flight == Some(done.0) {
@@ -1201,19 +1294,56 @@ impl ImageAtlas {
         Some((slot, is_animated))
     }
 
-    fn load_new_entry(&mut self, path: &Path, w_px: usize, h_px: usize) -> Option<AtlasEntry> {
+    fn load_new_entry(&mut self, path: &Path, req_w: usize, req_h: usize) -> Option<AtlasEntry> {
         if is_svg_path(path) {
-            let rgba = decode_svg_rgba(path, w_px, h_px)?;
-            let slot = self.alloc_slot(w_px, h_px)?;
+            let (dw, dh) = self.choose_decode_dims(path, req_w, req_h, 1600, 1100);
+            let rgba = decode_svg_rgba(path, dw, dh)?;
+            let slot = self.alloc_slot(dw, dh)?;
             self.pending.push((slot, rgba));
             return Some(AtlasEntry { slot, anim: None });
         }
 
-        use mac_imageio::*;
         let bytes = std::fs::read(path).ok()?;
         if bytes.is_empty() || bytes.len() > 32 * 1024 * 1024 {
             return None;
         }
+
+        // Fast-path: multi-frame AVIF image sequences (`avis`) decoded sequentially at 60fps via
+        // macOS WebCore's built-in `dav1d` (~1.2 ms/frame vs ImageIO's O(N^2) 140-400 ms/frame!).
+        if let Some(seq) = crate::avif_dav1d::parse_avif_sequence(&bytes) {
+            let (mut dw, mut dh) = (seq.width as f64, seq.height as f64);
+            let max_w = 1280.0f64;
+            let max_h = 720.0f64;
+            if dw > max_w {
+                dh *= max_w / dw;
+                dw = max_w;
+            }
+            if dh > max_h {
+                dw *= max_h / dh;
+                dh = max_h;
+            }
+            let w_px = dw.round().clamp(1.0, max_w) as usize;
+            let h_px = dh.round().clamp(1.0, max_h) as usize;
+            if let Some((first_rgba, streamer)) =
+                crate::avif_dav1d::AvifStreamer::start(bytes.clone(), seq, w_px, h_px)
+                && let Some(slot) = self.alloc_slot(w_px, h_px)
+            {
+                self.pending.push((slot, first_rgba));
+                return Some(AtlasEntry {
+                    slot,
+                    anim: Some(AnimatedSource {
+                        frame_ends_ms: Vec::new(),
+                        total_ms: 0,
+                        last_frame: 0,
+                        backend: AnimBackend::AvifDav1d(streamer),
+                    }),
+                });
+            }
+        }
+
+        let (w_px, h_px) = self.choose_decode_dims(path, req_w, req_h, 1440, 960);
+
+        use mac_imageio::*;
         // SAFETY: `bytes` lives through `CFDataCreate`; ownership of `src` is either moved into
         // `AnimatedSource` (which frees it on Drop) or released before returning.
         unsafe {
@@ -1249,7 +1379,7 @@ impl ImageAtlas {
                 return Some(AtlasEntry { slot, anim: None });
             }
 
-            // Multi-frame animation (`header-dark.webp`, `docs/demo.avif`, animated GIFs!).
+            // Multi-frame WebP/GIF animation (`header-dark.webp`, animated GIFs).
             let capped = count.min(600);
             let mut frame_ends_ms = Vec::with_capacity(capped);
             let mut total_ms = 0u64;
@@ -1257,7 +1387,7 @@ impl ImageAtlas {
                 total_ms = total_ms.saturating_add(read_frame_delay_ms(src, i));
                 frame_ends_ms.push(total_ms);
             }
-            let cache_enabled = capped <= 48 && w_px * h_px <= 800 * 500;
+            let cache_enabled = capped <= 48 && w_px * h_px <= 1024 * 600;
             let backend = if cache_enabled {
                 let mut frames = vec![None; capped];
                 if !frames.is_empty() {
@@ -1275,7 +1405,6 @@ impl ImageAtlas {
                     .spawn(move || {
                         let guard = owned_src;
                         while let Ok(mut target_idx) = req_rx.recv() {
-                            // Coalesce queued requests to always decode the latest target frame.
                             while let Ok(newer) = req_rx.try_recv() {
                                 target_idx = newer;
                             }

@@ -13,7 +13,7 @@ use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
     MTLBlendFactor, MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandEncoder,
-    MTLCommandQueue, MTLDevice, MTLLibrary, MTLLoadAction, MTLOrigin, MTLPixelFormat,
+    MTLCommandQueue, MTLDevice, MTLDrawable, MTLLibrary, MTLLoadAction, MTLOrigin, MTLPixelFormat,
     MTLPrimitiveType, MTLRenderCommandEncoder, MTLRenderPassDescriptor,
     MTLRenderPipelineDescriptor, MTLRenderPipelineState, MTLResourceOptions,
     MTLSamplerDescriptor, MTLSamplerMinMagFilter, MTLSamplerState, MTLSize, MTLStoreAction,
@@ -327,8 +327,17 @@ impl Renderer {
         };
         self.encode_frame(&enc, frame);
         enc.endEncoding();
-        cb.presentDrawable(ProtocolObject::from_ref(&*drawable));
-        cb.commit();
+        if layer.presentsWithTransaction() {
+            // Apple Metal / `den-native` synchronized resize protocol: commit, wait until
+            // scheduled, and present inside the active CoreAnimation transaction so the window
+            // border and reflowed pixels move atomically with zero stretching or black gaps.
+            cb.commit();
+            cb.waitUntilScheduled();
+            drawable.present();
+        } else {
+            cb.presentDrawable(ProtocolObject::from_ref(&*drawable));
+            cb.commit();
+        }
     }
 
     /// Render a frame directly into an offscreen CPU-readable Metal texture and write a PNG to
