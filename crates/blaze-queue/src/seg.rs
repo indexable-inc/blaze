@@ -14,7 +14,8 @@
 
 #[allow(blaze::std_use, reason = "the deprecated `SegQueue::new` and `Default` alone (the crate's doc)")]
 use alloc::alloc::Global;
-use core::{alloc::Allocator, cell::UnsafeCell, fmt, marker::PhantomData, mem::MaybeUninit, ptr};
+use core::alloc::Allocator;
+use core::{cell::UnsafeCell, fmt, marker::PhantomData, mem::MaybeUninit, ptr};
 
 use blaze_own::{
     Box,

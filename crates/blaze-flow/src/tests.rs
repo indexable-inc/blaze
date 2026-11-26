@@ -1239,22 +1239,39 @@ fn large_flow_stress_and_equivalence() {
     assert!(rec.borrows.is_empty(), "expected no borrow findings, got {:?}", &rec.borrows[..rec.borrows.len().min(5)]);
     assert_eq!(rec.proof.map(|p| p.tier()), Some(1), "clean large flow should be accepted by tier one");
 
-    // Verify drop_kind & drop_may_run match brute-force `is_prefix` check on all 200 drops.
+    // Verify drop_kind & drop_may_run match brute-force `is_prefix` check stepped from block entry on all 200 drops.
     let st = inits(&flow, Plant::None, Global).expect("inits converges");
+    assert_eq!(st.reached.len(), flow.blocks.len());
+    let w = st.init.words();
+    let mut cur_init = std::vec![0u64; w];
+    let mut cur_uninit = std::vec![0u64; w];
     for &(s, p) in &drop_stmts {
+        let b = flow.stmt_block[s.index()].index();
+        let range = flow.blocks[b];
+        cur_init.copy_from_slice(st.init.row(b));
+        cur_uninit.copy_from_slice(st.uninit.row(b));
+        if st.reached[b] {
+            for t in range.start..s.0 {
+                crate::moves::transfer(&flow, Stmt(t), &mut cur_init, &mut cur_uninit);
+            }
+        }
         let got_kind = drop_kind(&flow, &st, s, p);
         let got_may_run = st.drop_may_run(&flow, s, p);
-        let brute_may_run = st.reached[s.index()]
-            && (0..flow.places.len()).any(|q| flow.is_prefix(p, Place(q as u32)) && st.init.get(s.index(), q));
+        let brute_may_run = st.reached[b]
+            && (0..flow.places.len()).any(|q| flow.is_prefix(p, Place(q as u32)) && crate::bits::test(&cur_init, q));
         let brute_part_moved = (0..flow.places.len()).any(|q| {
             let q = Place(q as u32);
-            q != p && flow.is_prefix(p, q) && st.uninit.get(s.index(), q.index())
+            q != p && flow.is_prefix(p, q) && crate::bits::test(&cur_uninit, q.index())
         });
-        let brute_kind = match (st.init.get(s.index(), p.index()), st.uninit.get(s.index(), p.index())) {
-            (false, _) => DropKind::Nothing,
-            (true, true) => DropKind::Flag,
-            (true, false) if brute_part_moved => DropKind::Open,
-            (true, false) => DropKind::Static,
+        let brute_kind = if !st.reached[b] {
+            DropKind::Nothing
+        } else {
+            match (crate::bits::test(&cur_init, p.index()), crate::bits::test(&cur_uninit, p.index())) {
+                (false, _) => DropKind::Nothing,
+                (true, true) => DropKind::Flag,
+                (true, false) if brute_part_moved => DropKind::Open,
+                (true, false) => DropKind::Static,
+            }
         };
         assert_eq!(got_may_run, brute_may_run);
         assert_eq!(got_kind, brute_kind);
@@ -1414,4 +1431,407 @@ fn conditional_move_does_not_leak_drop_liveness_across_join() {
         bad_findings.iter().any(|f| matches!(*f, BorrowFinding::Invalidated { .. })),
         "CONTROL: without moving guard in else branch, join Drop(guard) must conflict with &mut x; got {bad_findings:?}"
     );
+}
+
+/// Statement-level reference solver for move dataflows (`stmts × places`), used as an oracle to
+/// prove exact equivalence of the basic-block-grain implementation.
+fn stmt_level_inits_oracle(
+    flow: &Flow<Global>,
+    plant: Plant,
+) -> (crate::bits::Bits<Global>, crate::bits::Bits<Global>, Vec<bool>) {
+    let (n, m) = (flow.stmts.len(), flow.places.len());
+    let mut init = crate::bits::Bits::new_in(n, m, Global);
+    let mut uninit = crate::bits::Bits::new_in(n, m, Global);
+    let mut reached = std::vec![false; n];
+    if n == 0 {
+        return (init, uninit, reached);
+    }
+    let e = flow.entry().index();
+    reached[e] = true;
+    for q in 0..m {
+        let l = flow.places[q].local.0;
+        if l >= 1 && l <= flow.args {
+            init.set(e, q);
+        } else {
+            uninit.set(e, q);
+        }
+    }
+    let w = init.words();
+    let mut si = std::vec![0u64; w];
+    let mut su = std::vec![0u64; w];
+    loop {
+        let mut changed = false;
+        for s in 0..n {
+            if !reached[s] {
+                continue;
+            }
+            si.copy_from_slice(init.row(s));
+            su.copy_from_slice(uninit.row(s));
+            crate::moves::transfer(flow, Stmt(s as u32), &mut si, &mut su);
+            flow.for_each_succ(Stmt(s as u32), |t| {
+                let ti = t.index();
+                if !reached[ti] {
+                    reached[ti] = true;
+                    init.row_mut(ti).copy_from_slice(&si);
+                    uninit.row_mut(ti).copy_from_slice(&su);
+                    changed = true;
+                } else if plant == Plant::MovesIntersect {
+                    changed |= crate::bits::intersect_into(init.row_mut(ti), &si)
+                        | crate::bits::intersect_into(uninit.row_mut(ti), &su);
+                } else {
+                    changed |= crate::bits::union_into(init.row_mut(ti), &si)
+                        | crate::bits::union_into(uninit.row_mut(ti), &su);
+                }
+            });
+        }
+        if !changed {
+            break;
+        }
+    }
+    (init, uninit, reached)
+}
+
+/// Statement-level reference move checker over `stmt_level_inits_oracle`.
+fn stmt_level_check_moves_oracle(
+    flow: &Flow<Global>,
+    plant: Plant,
+) -> Vec<crate::MoveFinding> {
+    let (init, uninit, reached) = stmt_level_inits_oracle(flow, plant);
+    let _ = init;
+    let w = uninit.words();
+    let mut seen = std::vec![0u64; w];
+    let mut out = Vec::new();
+    for s in 0..flow.stmts.len() {
+        if !reached[s] {
+            continue;
+        }
+        let stmt = Stmt(s as u32);
+        let (at, span) = (Point::start(stmt), flow.stmt(stmt).span);
+        let urow = uninit.row(s);
+        if plant == Plant::OperandsAtEntry {
+            seen.fill(0);
+        } else {
+            seen.copy_from_slice(urow);
+        }
+        let mut found = |place: Place, kind: MoveFindingKind| {
+            out.push(crate::MoveFinding { at, place, kind, span });
+        };
+        let mut operand = |o: Operand, found: &mut dyn FnMut(Place, MoveFindingKind)| match o {
+            Operand::Copy(p) | Operand::Move(p) => {
+                if crate::moves::maybe_uninit(flow, urow, p)
+                    || crate::moves::maybe_uninit(flow, &seen, p)
+                {
+                    found(p, MoveFindingKind::UseOfMoved);
+                }
+                if let (Operand::Move(_), Some(why)) = (o, move_out(flow, p)) {
+                    found(p, MoveFindingKind::MoveOut(why));
+                }
+                if matches!(o, Operand::Move(_)) && plant != Plant::OperandsAtEntry {
+                    for q in 0..flow.places.len() {
+                        if flow.is_prefix(p, Place(q as u32)) {
+                            crate::bits::put(&mut seen, q, true);
+                        }
+                    }
+                }
+            }
+            Operand::Const => {}
+        };
+        let dest = match flow.stmt(stmt).kind {
+            StmtKind::Assign { dest, value } => {
+                crate::moves::for_each_operand(flow, value, |o| operand(o, &mut found));
+                if let crate::Value::Borrow { place, .. } = value
+                    && crate::moves::maybe_uninit(flow, urow, place)
+                {
+                    found(place, MoveFindingKind::UseOfMoved);
+                }
+                Some(dest)
+            }
+            StmtKind::Call { args, dest } => {
+                for o in flow.ops(args) {
+                    operand(*o, &mut found);
+                }
+                Some(dest)
+            }
+            StmtKind::Switch { on, .. } => {
+                if crate::moves::maybe_uninit(flow, urow, on) {
+                    found(on, MoveFindingKind::UseOfMoved);
+                }
+                None
+            }
+            StmtKind::Return => {
+                if crate::moves::maybe_uninit(flow, urow, Place(0)) {
+                    found(Place(0), MoveFindingKind::UseOfMoved);
+                }
+                None
+            }
+            _ => None,
+        };
+        if let Some(dest) = dest {
+            let (mut cur, mut through, mut part) = (dest, false, false);
+            while let Some(parent) = flow.place(cur).parent {
+                through |= matches!(flow.place(cur).proj, Some(Proj::Deref | Proj::DerefBox));
+                cur = parent;
+                if crate::bits::test(urow, cur.index()) {
+                    if through {
+                        found(cur, MoveFindingKind::UseOfMoved);
+                    } else {
+                        part = true;
+                    }
+                }
+            }
+            if part {
+                found(dest, MoveFindingKind::AssignToMovedPart);
+            }
+        }
+    }
+    out
+}
+
+/// Basic-block-grain `inits`, `check_moves_planted`, `drop_kind`, and `drop_may_run` must match
+/// the statement-level reference oracle identically across loops, branches, partial moves,
+/// re-initialization, `StorageLive`/`StorageDead`, unreachable blocks, out-of-order blocks, and
+/// planted controls (`Plant::MovesIntersect`, `Plant::OperandsAtEntry`).
+#[test]
+fn block_grain_moves_equals_statement_level_oracle() {
+    // Locals: _0 ret, _1 arg a (pair), _2 arg b (struct with nested fields), _3 tmp, _4 cond, _5 box_p
+    let mut b = FlowBuilder::new_in(6, 2, Global);
+    let a = Place(1);
+    let a0 = b.project(a, Proj::Field(0));
+    let a1 = b.project(a, Proj::Field(1));
+    let p_b = Place(2);
+    let b0 = b.project(p_b, Proj::Field(0));
+    let b0_0 = b.project(b0, Proj::Field(0));
+    let b1 = b.project(p_b, Proj::Field(1));
+    let tmp = Place(3);
+    let cond = Place(4);
+    let box_p = Place(5);
+    let box_d = b.project(box_p, Proj::DerefBox);
+
+    let bb_entry = b.block();
+    let bb_loop_hdr = b.block();
+    let bb_then = b.block();
+    let bb_else = b.block();
+    let bb_join = b.block();
+    let bb_dead = b.block(); // unreachable block
+    let bb_exit = b.block();
+
+    b.start(bb_entry);
+    b.stmt(StmtKind::StorageLive(Local(3)), S);
+    b.stmt(StmtKind::StorageLive(Local(4)), S);
+    b.assign(cond, Operand::Const, S);
+    b.assign(box_p, Operand::Const, S);
+    // Partial move out of `a.0`, then self-reinit of `b0_0` via `b0_0 = move b0_0`.
+    b.assign(tmp, Operand::Move(a0), S);
+    b.assign(b0_0, Operand::Move(b0_0), S);
+    b.goto(bb_loop_hdr, S);
+
+    // Intentionally start `bb_else` BEFORE `bb_then` to exercise out-of-order block ids vs stmt order.
+    b.start(bb_else);
+    b.assign(tmp, Operand::Move(b1), S);
+    // Double-move in one aggregate (exercises `Plant::OperandsAtEntry` difference!).
+    b.aggregate(tmp, &[Operand::Move(a1), Operand::Move(a1)], S);
+    // Move through box, then write through moved box (UseOfMoved).
+    b.assign(tmp, Operand::Move(box_p), S);
+    b.assign(box_d, Operand::Const, S);
+    b.goto(bb_join, S);
+
+    b.start(bb_loop_hdr);
+    b.switch(cond, &[bb_then, bb_else], S);
+
+    b.start(bb_then);
+    // Re-initialize `a.0` and drop `b0`, then StorageDead/StorageLive on `_3`.
+    b.assign(a0, Operand::Const, S);
+    b.stmt(StmtKind::Drop(b0), S);
+    b.stmt(StmtKind::StorageDead(Local(3)), S);
+    b.stmt(StmtKind::StorageLive(Local(3)), S);
+    // Use of uninitialized `_3` after StorageLive.
+    b.assign(Place(0), Operand::Copy(tmp), S);
+    b.goto(bb_join, S);
+
+    b.start(bb_join);
+    // `a` is Static on `then` and Open/moved on `else` -> Flag/Open checks + back-edge to loop header!
+    b.stmt(StmtKind::Drop(a), S);
+    b.stmt(StmtKind::Drop(p_b), S);
+    // Re-init `a` on all paths before possible loop back-edge or exit.
+    b.assign(a, Operand::Const, S);
+    b.switch(cond, &[bb_loop_hdr, bb_exit], S);
+
+    // Unreachable block with writes & drops: must stay unreached / DropKind::Nothing / no findings.
+    b.start(bb_dead);
+    b.assign(a, Operand::Const, S);
+    b.assign(tmp, Operand::Move(a), S);
+    b.assign(Place(0), Operand::Copy(a), S);
+    b.stmt(StmtKind::Drop(a), S);
+    b.ret(S);
+
+    b.start(bb_exit);
+    b.assign(Place(0), Operand::Move(p_b), S);
+    b.ret(S);
+
+    let flow = finish(b);
+
+    for plant in [Plant::None, Plant::MovesIntersect, Plant::OperandsAtEntry] {
+        let got_moves = check_moves_planted(&flow, plant, Global).expect("block-grain moves converges");
+        let exp_moves = stmt_level_check_moves_oracle(&flow, plant);
+        assert_eq!(
+            got_moves.as_slice(),
+            exp_moves.as_slice(),
+            "check_moves_planted mismatch under {plant:?}"
+        );
+
+        let st = inits(&flow, plant, Global).expect("block-grain inits converges");
+        let (o_init, o_uninit, o_reached) = stmt_level_inits_oracle(&flow, plant);
+        assert_eq!(st.reached.len(), flow.blocks.len());
+
+        // Verify `drop_kind` and `drop_may_run` match the statement-level oracle at EVERY statement × place!
+        for s_idx in 0..flow.stmts.len() {
+            let s = Stmt(s_idx as u32);
+            let b_idx = flow.stmt_block[s_idx].index();
+            assert_eq!(st.reached[b_idx], o_reached[s_idx], "reached mismatch at s{s_idx} under {plant:?}");
+            for p_idx in 0..flow.places.len() {
+                let p = Place(p_idx as u32);
+                let exp_may_run = o_reached[s_idx]
+                    && (0..flow.places.len()).any(|q| flow.is_prefix(p, Place(q as u32)) && o_init.get(s_idx, q));
+                let exp_part_moved = (0..flow.places.len()).any(|q| {
+                    let qp = Place(q as u32);
+                    qp != p && flow.is_prefix(p, qp) && o_uninit.get(s_idx, q)
+                });
+                let exp_kind = match (o_init.get(s_idx, p_idx), o_uninit.get(s_idx, p_idx)) {
+                    (false, _) => DropKind::Nothing,
+                    (true, true) => DropKind::Flag,
+                    (true, false) if exp_part_moved => DropKind::Open,
+                    (true, false) => DropKind::Static,
+                };
+                assert_eq!(
+                    st.drop_may_run(&flow, s, p),
+                    exp_may_run,
+                    "drop_may_run mismatch at s{s_idx} p{p_idx} under {plant:?}"
+                );
+                assert_eq!(
+                    drop_kind(&flow, &st, s, p),
+                    exp_kind,
+                    "drop_kind mismatch at s{s_idx} p{p_idx} under {plant:?}"
+                );
+            }
+        }
+    }
+
+    // Sanity-check that the planted controls actually differ from `Plant::None` on this fixture.
+    let clean = check_moves_planted(&flow, Plant::None, Global).expect("clean");
+    let intersect = check_moves_planted(&flow, Plant::MovesIntersect, Global).expect("intersect");
+    let at_entry = check_moves_planted(&flow, Plant::OperandsAtEntry, Global).expect("at_entry");
+    assert_ne!(clean.as_slice(), intersect.as_slice(), "fixture must distinguish MovesIntersect");
+    assert_ne!(clean.as_slice(), at_entry.as_slice(), "fixture must distinguish OperandsAtEntry");
+}
+
+/// Large synthetic flow (20,000 statements in 200 blocks with 1,000 places) must complete cleanly
+/// inside a small bounded bump frame (`< 16 MiB` total — and `< 2 MiB` for the analysis itself!)
+/// without OOM.
+#[test]
+fn large_synthetic_flow_fits_in_small_bounded_bump_frame() {
+    // Run on a worker thread with a 24 MiB stack so `Inline<8 MiB>` lives safely on-stack in debug builds.
+    let handle = std::thread::Builder::new()
+        .name("blaze-flow-bounded-bump".into())
+        .stack_size(24 * 1024 * 1024)
+        .spawn(|| {
+            const BUDGET: usize = 8 * 1024 * 1024; // 8 MiB (< 16 MiB)
+            let arena = blaze_own::Inline::<BUDGET>::new();
+            let alloc = &arena;
+
+            // 500 locals + 500 field projections = 1,000 places; 200 blocks × 100 stmts = 20,000 stmts.
+            const N_LOCALS: u32 = 500;
+            const N_BLOCKS: usize = 200;
+            const STMTS_PER_BLOCK: usize = 100;
+
+            let mut b = FlowBuilder::new_in(N_LOCALS, 1, alloc);
+            let mut fields = blaze_own::Vec::with_capacity_in(N_LOCALS as usize, alloc);
+            for l in 0..N_LOCALS {
+                let f = b.project(Place(l), Proj::Field(0));
+                fields.push(f);
+            }
+
+            let mut bbs = blaze_own::Vec::with_capacity_in(N_BLOCKS, alloc);
+            for _ in 0..N_BLOCKS {
+                bbs.push(b.block());
+            }
+
+            let mut check_drops = blaze_own::Vec::new_in(alloc);
+            for bi in 0..N_BLOCKS {
+                b.start(bbs[bi]);
+                // 99 body statements + 1 terminator = 100 statements per block.
+                let slot = 2 + (bi as u32 % (N_LOCALS - 2));
+                let p = Place(slot);
+                let pf = fields[slot as usize];
+                b.stmt(StmtKind::StorageLive(Local(slot)), S);
+                b.assign(p, Operand::Const, S);
+                for k in 0..95usize {
+                    let t_local = 2 + (((bi * 7 + k) as u32) % (N_LOCALS - 2));
+                    let tp = Place(t_local);
+                    b.assign(tp, Operand::Const, S);
+                }
+                // Partial move of `pf`, then drop `p` (should be `DropKind::Open`), then StorageDead.
+                b.assign(Place(0), Operand::Move(pf), S);
+                let d = b.stmt(StmtKind::Drop(p), S);
+                if bi % 20 == 0 {
+                    check_drops.push((d, p));
+                }
+                // Terminator: last block returns; block 50 adds a loop back-edge to block 45.
+                if bi + 1 == N_BLOCKS {
+                    b.ret(S);
+                } else if bi == 50 {
+                    b.switch(Place(1), &[bbs[45], bbs[51]], S);
+                } else {
+                    b.goto(bbs[bi + 1], S);
+                }
+            }
+
+            let flow = b.finish().expect("synthetic flow builds");
+            assert_eq!(flow.places.len(), 1_000);
+            assert_eq!(flow.blocks.len(), 200);
+            assert_eq!(flow.stmts.len(), N_BLOCKS * STMTS_PER_BLOCK);
+
+            let after_build = arena.used();
+            let st = inits(&flow, Plant::None, alloc).expect("inits converges within bounded bump");
+            let after_inits = arena.used();
+            let inits_bytes = after_inits - after_build;
+
+            assert_eq!(st.reached.len(), flow.blocks.len());
+            for &(d, p) in check_drops.iter() {
+                assert_eq!(drop_kind(&flow, &st, d, p), DropKind::Open);
+                assert!(st.drop_may_run(&flow, d, p));
+            }
+
+            let moves = check_moves(&flow, alloc).expect("check_moves converges within bounded bump");
+            assert!(moves.is_empty(), "expected clean synthetic flow, got {} findings", moves.len());
+            let after_moves = arena.used();
+
+            let rec = check_body(&flow, alloc).expect("full check converges within bounded bump");
+            assert!(rec.moves.is_empty());
+            assert!(rec.borrows.is_empty());
+            assert_eq!(rec.proof.map(|p| p.tier()), Some(1));
+            let total_used = arena.used();
+
+            std::println!(
+                "bounded_bump: stmts={} blocks={} places={} inits_bytes={} moves_delta={} total_used={} / {}",
+                flow.stmts.len(),
+                flow.blocks.len(),
+                flow.places.len(),
+                inits_bytes,
+                after_moves - after_inits,
+                total_used,
+                BUDGET,
+            );
+            // Statement-level `inits` alone would have needed 2 * 20_000 * 128 B = 5.12 MiB just for the two bitsets;
+            // basic-block grain needs ~2 * 200 * 128 B = 51.2 KiB + compact CSR (~160 KiB total).
+            assert!(
+                inits_bytes < 512 * 1024,
+                "expected block-grain inits to use < 512 KiB, used {inits_bytes} bytes"
+            );
+            assert!(
+                total_used < BUDGET,
+                "total bump usage {total_used} exceeded budget {BUDGET}"
+            );
+        })
+        .expect("spawn bounded bump test thread");
+    handle.join().expect("bounded bump test panicked");
 }

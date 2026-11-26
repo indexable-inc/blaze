@@ -9,7 +9,10 @@
 #![feature(register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
 #![blaze::sans_io]
-#![deny(blaze::sans_io_core, blaze::std_use, blaze::implicit_allocator, blaze::process_static)]
+// Not yet `blaze::std_use`: `extern crate alloc` and `UnknownBlazeEdition`/`BlazeEdition::from_manifest`
+// stay until their callers (`blaze-manifest`, `blaze-new`, and re-exports in `parser`/`syntax`)
+// port to `BlazeEdition::of_manifest`.
+#![deny(blaze::sans_io_core, blaze::implicit_allocator, blaze::process_static)]
 #![forbid(unsafe_code)]
 
 // Only [`UnknownBlazeEdition`]'s `String`, deprecated: it goes with its last caller

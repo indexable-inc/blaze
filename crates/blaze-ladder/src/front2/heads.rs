@@ -1498,7 +1498,7 @@ fn extract_container_param_bounds<A: core::alloc::Allocator>(
 /// Elaborates supertrait bounds for each `Param(p): Trait<...>` clause in `clauses` using
 /// supertrait clause columns filed in `regions_store`, pushing both direct bounds and
 /// transitive supertrait bounds into `out`.
-fn extract_elaborated_param_bounds<A: core::alloc::Allocator>(
+pub(super) fn extract_elaborated_param_bounds<A: core::alloc::Allocator>(
     tys: tc::PTys<'_>,
     regions_store: &super::head_record::RegionTable,
     arity: &dyn tc::regions::Arity,

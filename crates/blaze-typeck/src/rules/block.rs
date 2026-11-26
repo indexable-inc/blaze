@@ -44,8 +44,13 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
                 return Ok(Flow::Wait);
             }
             if let Some(tail) = tail {
+                let expect = if self.breaks.last().is_some_and(|c| c.may_break) {
+                    self.adjust_for_branches(f.expect)
+                } else {
+                    f.expect
+                };
                 self.resume(f, 2)?;
-                self.push_expr(tail, f.expect, Then::CoerceMany(f.a))?;
+                self.push_expr(tail, expect, Then::CoerceMany(f.a))?;
                 return Ok(Flow::Wait);
             }
             if !self.diverges {

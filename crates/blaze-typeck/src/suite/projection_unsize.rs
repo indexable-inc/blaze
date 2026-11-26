@@ -107,3 +107,63 @@ fn control_without_the_bound_the_projection_is_refused() {
     let (c, _) = check(&fx);
     assert!(c.diags.iter().any(|d| d.code == DiagCode::Mismatch), "no E0308 without the bound: {:?}", c.diags);
 }
+
+/// Indexing a container whose `Index::Output` is `[u8; 32]` or `[u8; 16]` (as `AVec<[u8; 32]>` in
+/// `blaze-answer/src/segment.rs:178,196` and `blaze-expand/src/kept_set.rs:688`) yields an
+/// unnormalized projection variable `?v`, so `&h[i]` has type `&?v`. `coerce_unsized` must
+/// structurally resolve `pointee_a` before matching `(Array, Slice)` so `&[u8; N]` unsizes to
+/// `&[u8]`. Control: `Output = [u16; 32]` still fails with E0308 `Mismatch`.
+#[test]
+fn an_indexed_array_projection_unsizes_to_a_slice() {
+    let mut fx = Fx::new();
+    let idx_tr = fx.tr("Index", 2, Vec::new(), &["Output"]);
+    fx.lang(LangItem::Index, idx_tr);
+    let u8_ = fx.u8();
+    let u16_ = fx.u16();
+    let usize_ = fx.usize();
+    let arr32 = fx.array(u8_, 32);
+    let arr16 = fx.array(u8_, 16);
+    let arr_u16 = fx.array(u16_, 32);
+    let slice_u8 = fx.ty(PNode::Slice(u8_));
+    let r_slice_u8 = fx.r(Mutbl::Not, slice_u8);
+    let h32_k = fx.strukt("Holder32", 0, &[]);
+    let h16_k = fx.strukt("Holder16", 0, &[]);
+    let h_bad_k = fx.strukt("HolderU16", 0, &[]);
+    let (h32, h16, h_bad) = (fx.adt(h32_k, &[]), fx.adt(h16_k, &[]), fx.adt(h_bad_k, &[]));
+    fx.imp("impl Index<usize> for Holder32", 0, h32, Some((idx_tr, &[usize_])), &[("Output", arr32)], Vec::new());
+    fx.imp("impl Index<usize> for Holder16", 0, h16, Some((idx_tr, &[usize_])), &[("Output", arr16)], Vec::new());
+    fx.imp("impl Index<usize> for HolderU16", 0, h_bad, Some((idx_tr, &[usize_])), &[("Output", arr_u16)], Vec::new());
+    fx.func("take_bytes", 0, &[r_slice_u8], u8_, Vec::new());
+    let f32 = fx.func("f32", 0, &[h32, usize_], u8_, Vec::new());
+    let f16 = fx.func("f16", 0, &[h16, usize_], u8_, Vec::new());
+    let f_bad = fx.func("f_bad", 0, &[h_bad, usize_], u8_, Vec::new());
+    fx.finish();
+
+    let run = |owner| {
+        let mut b = Bb::new();
+        let h = b.param("h");
+        let i = b.param("i");
+        let lh = b.local(h);
+        let li = b.local(i);
+        let indexed = b.e(Expr::Index { base: lh, index: li });
+        let arg = b.borrow(Mutbl::Not, indexed);
+        let take = b.path(&["take_bytes"]);
+        let call = b.call(take, &[arg]);
+        let root = b.block(&[], Some(call));
+        (check_body(&fx, &b, owner, root, Plant::None, InferPlant::None), arg)
+    };
+
+    for (label, owner) in [("Holder32", f32), ("Holder16", f16)] {
+        let (c, arg) = run(owner);
+        assert!(c.diags.is_empty(), "{label}: {:?}", c.diags);
+        let got = adjusts(&fx, &c, arg);
+        assert!(got.ends_with("unsize -> &[u8]"), "{label} adjustments `{got}`");
+    }
+
+    let (c_bad, _) = run(f_bad);
+    assert!(
+        c_bad.diags.iter().any(|d| d.code == DiagCode::Mismatch),
+        "CONTROL: &[u16; 32] must not coerce to &[u8]: {:?}",
+        c_bad.diags
+    );
+}

@@ -2321,11 +2321,58 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
 
     // ---- ambient ------------------------------------------------------------------------
 
+    /// True when token `i` immediately follows `<segment>::` (a path segment, never `use ::`).
+    #[inline]
+    fn prefixed_by_segment(&self, i: usize) -> bool {
+        self.colons_before(i)
+            && matches!(
+                self.back(i, 3),
+                Some(p) if (p.k == K::Ident && self.str_of(p) != "use") || p.k == K::Raw
+            )
+    }
+
+    /// True when token `i` sits at the start of an entry inside a grouped `use` tree whose
+    /// enclosing `{` follows `<segment>::` (e.g. `use core::{alloc::Allocator, fmt};` or
+    /// `use core::{fmt::{self, Display}, alloc::{Allocator, Layout}};`), so `i` is a nested path
+    /// segment rather than a root crate. `use {alloc::vec::Vec};` and `use ::{alloc::vec::Vec};`
+    /// have no path segment before `{` and return `false`.
+    fn in_prefixed_use_group(&self, i: usize) -> bool {
+        if !matches!(self.back(i, 1), Some(p) if p.k == K::P(b'{') || p.k == K::P(b',')) {
+            return false;
+        }
+        let mut depth = 0usize;
+        let mut j = i;
+        // Bounded: each turn steps `j` back by one token toward 0.
+        while j > 0 {
+            j -= 1;
+            let tok = self.toks[j];
+            match tok.k {
+                K::P(b'}') => depth += 1,
+                K::P(b'{') => {
+                    if depth > 0 {
+                        depth -= 1;
+                    } else {
+                        if self.prefixed_by_segment(j) {
+                            return true;
+                        }
+                        if !matches!(self.back(j, 1), Some(p) if p.k == K::P(b'{') || p.k == K::P(b',')) {
+                            return false;
+                        }
+                    }
+                }
+                K::Ident | K::Raw | K::P(b':' | b',' | b'*') => {}
+                _ if depth > 0 => {}
+                _ => return false,
+            }
+        }
+        false
+    }
+
     /// ambient.rs: `std` or `alloc` as a path's first segment, followed by `::` or after the
     /// word `use` or `crate`.
     fn ambient_head(&mut self, i: usize, t: Tok, word_id: u8) {
         let field = self.method(i);
-        let segment_before = self.colons_before(i) && self.word(self.back(i, 3)).is_some();
+        let segment_before = self.prefixed_by_segment(i) || self.in_prefixed_use_group(i);
         if field || segment_before {
             return;
         }
@@ -4883,4 +4930,45 @@ fn unquote_string_literal(lit: &str) -> Option<&str> {
 fn is_sandbox_exec_program(inner: &str) -> bool {
     let base = inner.strip_prefix("/usr/bin/").unwrap_or(inner);
     base.len() == 12 && base.starts_with("sandbox-") && base.ends_with("exec")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::vec::Vec as StdVec;
+
+    use crate::{Findings, Rule, RuleSet, Scope, TestBits, Unit, lint};
+
+    fn ambient_kinds(text: &str) -> StdVec<&'static str> {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut out = Findings::new_in(alloc);
+        let unit = Unit { text, holes: &[], scope: Scope::file(TestBits::NONE, false, false) };
+        let rules = RuleSet::only(&[Rule::Ambient]);
+        lint(&rules, &unit, alloc, &mut out).expect("lint");
+        out.list.iter().map(|f| f.template.kind()).collect()
+    }
+
+    #[test]
+    fn ambient_head_grouped_use_trees() {
+        // Prefixed grouped use trees: `alloc`/`std` is a nested path segment, not a root crate.
+        for clean in [
+            "use core::{alloc::Allocator, fmt};",
+            "use core::{fmt, alloc::{Allocator, Layout}};",
+            "use core::{fmt::{self, Display}, alloc::Allocator};",
+            "use core::{{alloc::Allocator}};",
+            "use ::core::{alloc::Allocator, fmt};",
+            "use crate::{std::foo, alloc::bar};",
+        ] {
+            assert_eq!(ambient_kinds(clean), StdVec::<&str>::new(), "false positive on {clean:?}");
+        }
+
+        // Unprefixed grouped use trees and direct root imports: MUST still be flagged.
+        assert_eq!(ambient_kinds("use {alloc::vec::Vec};"), ["alloc"]);
+        assert_eq!(ambient_kinds("use {core::fmt, alloc::vec::Vec};"), ["alloc"]);
+        assert_eq!(ambient_kinds("use ::{alloc::vec::Vec};"), ["alloc"]);
+        assert_eq!(ambient_kinds("use alloc::vec::Vec;"), ["alloc"]);
+        assert_eq!(ambient_kinds("use ::alloc::vec::Vec;"), ["alloc"]);
+        assert_eq!(ambient_kinds("use {core::{alloc::Allocator}, alloc::vec::Vec};"), ["alloc"]);
+        assert_eq!(ambient_kinds("use std::{alloc::Allocator, fmt};"), ["std"]);
+        assert_eq!(ambient_kinds("fn f() { std::mem::take(x); }"), ["std"]);
+    }
 }

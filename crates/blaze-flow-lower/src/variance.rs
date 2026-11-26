@@ -81,7 +81,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
             }
             return Ok(());
         }
-        let mut todo: Vec<Step, A> = Vec::new_in(self.alloc);
+        let mut todo: crate::SmallStack<Step, 16, A> = crate::SmallStack::new_in(self.alloc);
         match t.wrap {
             Some(m) => {
                 todo.push(Step::Ty(t.ty, under_ref(m)));
@@ -244,7 +244,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
         let facts: &'b F = self.facts;
         let arity = FactsArity { facts };
         let types = BodyTypes::new(Columns::new(self.tys, &arity, &arity), &bodies);
-        let mut todo: Vec<Step, A> = Vec::new_in(self.alloc);
+        let mut todo: crate::SmallStack<Step, 16, A> = crate::SmallStack::new_in(self.alloc);
         match t.wrap {
             Some(m) => {
                 todo.push(Step::Ty(t.ty, under_ref(m)));

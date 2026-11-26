@@ -717,12 +717,12 @@ fn format_const_value<B: Allocator>(tys: PTys<'_>, ty: PTy, bits: u128, out: &mu
 }
 
 /// Precomputed line start byte offsets for fast 1-based `(line, col)` lookup.
-struct LineIndex<A: Allocator> {
-    starts: OwnVec<usize, A>,
+pub(super) struct LineIndex<A: Allocator> {
+    pub(super) starts: OwnVec<usize, A>,
 }
 
 impl<A: Allocator + Copy> LineIndex<A> {
-    fn new(source: &str, alloc: A) -> Self {
+    pub(super) fn new(source: &str, alloc: A) -> Self {
         let mut starts = OwnVec::new_in(alloc);
         starts.push(0);
         for (i, b) in source.as_bytes().iter().enumerate() {
@@ -734,7 +734,7 @@ impl<A: Allocator + Copy> LineIndex<A> {
     }
 
     /// Returns 1-based `(line, col)` where `col` counts UTF-8 scalar values on the line.
-    fn line_col(&self, source: &str, byte_offset: usize) -> (u32, u32) {
+    pub(super) fn line_col(&self, source: &str, byte_offset: usize) -> (u32, u32) {
         let clamped = clamp_char_boundary(source, byte_offset);
         let idx = self.starts.partition_point(|&s| s <= clamped).saturating_sub(1);
         let line_start = self.starts.get(idx).copied().unwrap_or(0);
@@ -743,10 +743,31 @@ impl<A: Allocator + Copy> LineIndex<A> {
         let col = u32::try_from(col_chars + 1).unwrap_or(u32::MAX);
         (line, col)
     }
+
+    pub(super) fn line_count(&self, source: &str) -> u32 {
+        let mut n = self.starts.len();
+        if n > 1 && source.ends_with('\n') {
+            n -= 1;
+        }
+        u32::try_from(n.max(1)).unwrap_or(u32::MAX)
+    }
+
+    pub(super) fn line_bounds(&self, source: &str, line_1based: u32) -> Option<(usize, usize)> {
+        let idx = usize::try_from(line_1based.checked_sub(1)?).ok()?;
+        let &start = self.starts.get(idx)?;
+        let mut end = self.starts.get(idx + 1).copied().unwrap_or(source.len());
+        if end > start && source.as_bytes().get(end - 1) == Some(&b'\n') {
+            end -= 1;
+        }
+        if end > start && source.as_bytes().get(end - 1) == Some(&b'\r') {
+            end -= 1;
+        }
+        Some((start, end))
+    }
 }
 
 /// Snaps `offset` down to the nearest valid UTF-8 char boundary in `s`.
-fn clamp_char_boundary(s: &str, offset: usize) -> usize {
+pub(super) fn clamp_char_boundary(s: &str, offset: usize) -> usize {
     let mut at = offset.min(s.len());
     while at > 0 && !s.is_char_boundary(at) {
         at -= 1;
@@ -1700,7 +1721,7 @@ impl<'n> FnCandidate<'n> {
     }
 }
 
-const fn to_surface_edition(ed: RustEdition) -> SurfaceEdition {
+pub(super) const fn to_surface_edition(ed: RustEdition) -> SurfaceEdition {
     match ed {
         RustEdition::Edition2015 => SurfaceEdition::E2015,
         RustEdition::Edition2018 => SurfaceEdition::E2018,
@@ -1763,6 +1784,15 @@ fn short_impl_target(header: &str) -> &str {
 /// Inspects a single Blaze or Rust source file and returns structured inlay hints for every
 /// matching function or method.
 ///
+/// Detailed result of [`inspect_source_detailed`] preserving partial-check stats.
+pub(super) struct DetailedInspect<A: Allocator> {
+    pub(super) output: InspectOutput<A>,
+    pub(super) skipped: u32,
+    pub(super) first_failure: Option<OwnString<Alloc<'static>>>,
+}
+
+/// Inspects `source` and extracts inlay hints for every matching function item.
+///
 /// Uses `front2` directly with zero filesystem I/O. Pass `store_alloc` (e.g. `heap.alloc()`) for
 /// `Store`'s internal tables and `alloc` for the returned [`InspectOutput`].
 pub fn inspect_source<A: Allocator + Copy>(
@@ -1773,6 +1803,25 @@ pub fn inspect_source<A: Allocator + Copy>(
     store_alloc: Alloc<'static>,
     alloc: A,
 ) -> Result<InspectOutput<A>, InspectError> {
+    let detailed = inspect_source_detailed(source, edition, filter_item, opts, store_alloc, alloc)?;
+    if detailed.output.items.is_empty()
+        && let Some(message) = detailed.first_failure
+    {
+        return Err(InspectError::CheckFailed { message });
+    }
+    Ok(detailed.output)
+}
+
+/// Runs [`inspect_source`] while returning both checked items and explicit failure counts so
+/// callers that render full-file views never hide partial typeck skips.
+pub(super) fn inspect_source_detailed<A: Allocator + Copy>(
+    source: &str,
+    edition: PackageEdition,
+    filter_item: Option<&str>,
+    opts: InspectOpts,
+    store_alloc: Alloc<'static>,
+    alloc: A,
+) -> Result<DetailedInspect<A>, InspectError> {
     let names_frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).map_err(InspectError::Frame)?;
     let names_erased = blaze_own::Erased::new(&names_frame);
     let bump = names_erased.bump();
@@ -1878,6 +1927,7 @@ pub fn inspect_source<A: Allocator + Copy>(
 
     let mut items: OwnVec<InspectedItem<A>, A> = OwnVec::new_in(alloc);
     let mut matched_any = false;
+    let mut skipped: u32 = 0;
     let mut first_failure: Option<OwnString<Alloc<'static>>> = None;
 
     for cand in candidates.iter() {
@@ -1905,6 +1955,7 @@ pub fn inspect_source<A: Allocator + Copy>(
                         })
                     }
                     Err(e) => {
+                        skipped = skipped.saturating_add(1);
                         if first_failure.is_none() {
                             let mut msg = OwnString::new_in(store_alloc);
                             let _ = write!(msg, "key error: {e}");
@@ -1920,6 +1971,7 @@ pub fn inspect_source<A: Allocator + Copy>(
             Ok(b) => b,
             Err(LowerStepError::Body(BodyError::NoBody(_))) => continue,
             Err(e) => {
+                skipped = skipped.saturating_add(1);
                 if first_failure.is_none() {
                     let mut msg = OwnString::new_in(store_alloc);
                     let _ = write!(msg, "lowering failed: {e}");
@@ -1941,7 +1993,10 @@ pub fn inspect_source<A: Allocator + Copy>(
             };
             let res = if body.typeck.inline_fors.is_empty() {
                 let view = body.lowered.view();
-                let Ok(spell) = Spelling::of(&view) else { continue };
+                let Ok(spell) = Spelling::of(&view) else {
+                    skipped = skipped.saturating_add(1);
+                    continue;
+                };
                 let scope = body.scope(&spell);
                 check_body(&mut records, &body, &scope)
             } else {
@@ -1950,6 +2005,7 @@ pub fn inspect_source<A: Allocator + Copy>(
             match res {
                 Ok(done) => done,
                 Err(err) => {
+                    skipped = skipped.saturating_add(1);
                     if first_failure.is_none() {
                         let mut msg = OwnString::new_in(store_alloc);
                         let _ = write!(msg, "{err}");
@@ -2039,15 +2095,14 @@ pub fn inspect_source<A: Allocator + Copy>(
     if filter_item.is_some() && !matched_any {
         return Err(InspectError::ItemNotFound);
     }
-    if items.is_empty()
-        && let Some(message) = first_failure
-    {
-        return Err(InspectError::CheckFailed { message });
-    }
 
-    Ok(InspectOutput {
-        source: OwnString::from_str_in(source, alloc),
-        items,
+    Ok(DetailedInspect {
+        output: InspectOutput {
+            source: OwnString::from_str_in(source, alloc),
+            items,
+        },
+        skipped,
+        first_failure,
     })
 }
 
@@ -2174,7 +2229,7 @@ pub fn render_annotated<A: Allocator + Copy>(output: &InspectOutput<A>, alloc: A
     out
 }
 
-fn write_inline_hint<A: Allocator>(hint: &Hint<A>, source: &str, at: usize, out: &mut OwnString<A>) {
+pub(super) fn write_inline_hint<A: Allocator>(hint: &Hint<A>, source: &str, at: usize, out: &mut OwnString<A>) {
     let prev_byte = at.checked_sub(1).and_then(|p| source.as_bytes().get(p).copied());
     let next_byte = source.as_bytes().get(at).copied();
     match hint.kind {
@@ -2205,7 +2260,7 @@ fn write_inline_hint<A: Allocator>(hint: &Hint<A>, source: &str, at: usize, out:
     }
 }
 
-fn decimal_digits(mut n: u32) -> usize {
+pub(super) fn decimal_digits(mut n: u32) -> usize {
     let mut d = 1usize;
     while n >= 10 {
         n /= 10;
@@ -2267,7 +2322,7 @@ pub fn render_json<A: Allocator + Copy>(output: &InspectOutput<A>, alloc: A) -> 
     out
 }
 
-fn write_json_str<A: Allocator>(s: &str, out: &mut OwnString<A>) {
+pub(super) fn write_json_str<A: Allocator>(s: &str, out: &mut OwnString<A>) {
     out.push('"');
     for ch in s.chars() {
         match ch {

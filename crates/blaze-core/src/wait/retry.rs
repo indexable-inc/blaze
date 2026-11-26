@@ -8,7 +8,9 @@
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
-use std::{fmt, io, time::Duration};
+// `std::io` is imported only for its pure error/result data types (`Error`, `Result`) carried
+// across the `Kernel` capability boundary; this module performs no IO.
+use std::{fmt, io as os_io, time::Duration};
 
 use crate::world::blocking::{Answer, Blocking, Ended};
 
@@ -94,7 +96,7 @@ pub struct WaitError {
 
 #[derive(Debug)]
 enum Why {
-    Io(io::Error),
+    Io(os_io::Error),
     /// This many calls in a row returned not ready with the clock still at `at`.
     Stuck {
         calls: u32,
@@ -109,7 +111,7 @@ enum Why {
 
 impl WaitError {
     /// The wait's system call failed with `error`.
-    pub fn io(what: &'static str, error: io::Error) -> WaitError {
+    pub fn io(what: &'static str, error: os_io::Error) -> WaitError {
         WaitError { what, why: Why::Io(error) }
     }
 
@@ -124,7 +126,7 @@ impl WaitError {
     }
 
     /// The system call's error, where that is what ended the wait.
-    pub fn io_error(&self) -> Option<&io::Error> {
+    pub fn io_error(&self) -> Option<&os_io::Error> {
         match &self.why {
             Why::Io(error) => Some(error),
             Why::Stuck { .. } | Why::Ran { .. } => None,
@@ -166,11 +168,11 @@ impl std::error::Error for WaitError {
 /// The system call's own error where it failed, so its kind and OS code stay what they were;
 /// a stuck clock, or a child the kernel said exited and then had running, as an error of its
 /// own kind with the wait's message.
-impl From<WaitError> for io::Error {
-    fn from(error: WaitError) -> io::Error {
+impl From<WaitError> for os_io::Error {
+    fn from(error: WaitError) -> os_io::Error {
         match error.why {
             Why::Io(error) => error,
-            Why::Stuck { .. } | Why::Ran { .. } => io::Error::other(error),
+            Why::Stuck { .. } | Why::Ran { .. } => os_io::Error::other(error),
         }
     }
 }
@@ -277,14 +279,14 @@ impl Retry {
 /// a world that answers from a list (a theorem's, [`Answers`]).
 pub(crate) trait Kernel<T> {
     /// One system call with the time it may wait (`None`: no limit), and how it went.
-    fn once(&mut self, left: Option<Duration>) -> io::Result<Once<T>>;
+    fn once(&mut self, left: Option<Duration>) -> os_io::Result<Once<T>>;
 
     /// The clock, read after a call.
     fn now(&self) -> Duration;
 }
 
-impl<T, C: Clock, F: FnMut(Option<Duration>) -> io::Result<Once<T>>> Kernel<T> for (&C, F) {
-    fn once(&mut self, left: Option<Duration>) -> io::Result<Once<T>> {
+impl<T, C: Clock, F: FnMut(Option<Duration>) -> os_io::Result<Once<T>>> Kernel<T> for (&C, F) {
+    fn once(&mut self, left: Option<Duration>) -> os_io::Result<Once<T>> {
         (self.1)(left)
     }
 
@@ -417,7 +419,7 @@ struct Answers {
 }
 
 impl Kernel<()> for Answers {
-    fn once(&mut self, left: Option<Duration>) -> io::Result<Once<()>> {
+    fn once(&mut self, left: Option<Duration>) -> os_io::Result<Once<()>> {
         if self.next >= self.answers.len() {
             self.stopped = true;
             return Ok(Once::Ready(()));

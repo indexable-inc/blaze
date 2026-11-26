@@ -49,7 +49,9 @@
 #![register_tool(blaze)]
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
-#![deny(blaze::std_use)]
+// Not yet `blaze::std_use`: `extern crate alloc`, `Kept`/`KEPT`, `image::Image`, and the wire/
+// record/frame/place tables stay on `alloc` until callers in `blaze-launch-rt` and `blaze-cli`
+// port to explicit allocators.
 #![deny(unsafe_code)]
 
 extern crate alloc;

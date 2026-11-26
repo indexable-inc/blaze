@@ -40,6 +40,8 @@ mod assoc_item_bounds;
 mod async_closures;
 mod async_fmt;
 mod await_impl;
+mod borrow_unsized_tail;
+mod cast_branch_expect;
 mod checked_record;
 mod closure_identity;
 mod closures;
