@@ -285,7 +285,7 @@ pub struct Envs<'c, A: Allocator> {
 
 /// The most environments one call makes (rule 18; deeply chained iterator adaptors and
 /// Reth node-builder trait stacks open many nested impl/supertrait environments).
-pub const MOST_ENVS: usize = 32768;
+pub const MOST_ENVS: usize = 65536;
 
 impl<'c, A: Allocator + Copy> Envs<'c, A> {
     pub fn new_in(alloc: A) -> Envs<'c, A> {
