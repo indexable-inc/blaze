@@ -227,6 +227,7 @@ pub enum HitAction {
     ToggleTableView(BlockId),
     ToggleHiddenCols(BlockId),
     SortTableColumn { block: BlockId, col: usize },
+    ResizeTableColumn { block: BlockId, col: usize, col_x0: i32 },
     ToggleExpandCell { block: BlockId, row: usize, col: usize },
     SelectCompletion(usize),
     SelectHistory(usize),

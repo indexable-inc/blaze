@@ -2068,7 +2068,32 @@ fn layout_table(
                     .and_then(Value::as_str)
                     .is_some_and(blaze_sniff::is_dir_label);
                 if !is_icon_only_bool {
-                    let mut txt = format_value_cell_at(cell, Some(now_ns));
+                    let mut txt = if disp == ColDisplay::FileSize
+                        && row_is_dir
+                        && let Some(prog) = all_row_dust.get(r).copied().flatten()
+                    {
+                        if !prog.done && prog.bytes == 0 {
+                            "…".to_owned()
+                        } else {
+                            let base = crate::dust_driver::format_bytes_compact(prog.bytes);
+                            if !prog.done { format!("~{base}") } else { base }
+                        }
+                    } else if disp == ColDisplay::HumanTime
+                        && row_is_dir
+                        && let Value::Date(dt) = cell
+                        && let Some(prog) = all_row_dust.get(r).copied().flatten()
+                        && prog.max_mtime_ns > dt.utc_ns
+                    {
+                        format_value_cell_at(
+                            &Value::Date(blaze_sh::DateTime {
+                                utc_ns: prog.max_mtime_ns,
+                                offset_secs: dt.offset_secs,
+                            }),
+                            Some(now_ns),
+                        )
+                    } else {
+                        format_value_cell_at(cell, Some(now_ns))
+                    };
                     if disp == ColDisplay::FileEntry && row_is_dir && !txt.ends_with('/') {
                         txt.push('/');
                     }
@@ -2091,6 +2116,12 @@ fn layout_table(
                 }
             }
         }
+        let has_dust_dirs = all_row_dust.iter().any(Option::is_some);
+        // Reserve full IEC size + bar width up front (including while `blaze-dust` is scanning)
+        // so `20.0 KiB` / `~999.9 MiB` never clips and columns never jump when scans complete.
+        if disp == ColDisplay::FileSize && (max_num > 0.0 || dust_max_bytes > 0 || has_dust_dirs) {
+            max_c = max_c.max(10);
+        }
         col_chars.push(max_c.min(40));
         col_right_align.push(
             matches!(disp, ColDisplay::FileSize | ColDisplay::Percent | ColDisplay::HumanTime)
@@ -2102,7 +2133,9 @@ fn layout_table(
             match disp {
                 ColDisplay::FileEntry | ColDisplay::Crate | ColDisplay::Process => icon_pad + 10.0,
                 ColDisplay::Status => 14.0,
-                ColDisplay::FileSize if max_num > 0.0 || dust_max_bytes > 0 => SIZE_BAR_W + 10.0,
+                ColDisplay::FileSize if max_num > 0.0 || dust_max_bytes > 0 || has_dust_dirs => {
+                    SIZE_BAR_W + 10.0
+                }
                 ColDisplay::Percent if max_num > 0.0 => SIZE_BAR_W + 10.0,
                 _ => 0.0,
             }
@@ -2111,12 +2144,16 @@ fn layout_table(
         col_max_num.push(max_num);
     }
 
-    // Priority-based responsive column widths: hidden columns take 0px; visible columns preserve
-    // intrinsic widths for short fixed columns (`size`, `modified`, `readonly`) & flex paths!
+    // Priority-based responsive column widths: hidden columns take 0px; user-dragged overrides win;
+    // otherwise preserve intrinsic widths for short fixed columns (`size`, `modified`) & flex paths!
     let mut col_widths: Vec<f32> = (0..ncols)
         .map(|c| {
             if !col_visible[c] {
                 0.0
+            } else if let Some(&(_, custom_w)) =
+                block.col_width_overrides.iter().find(|&&(oc, _)| oc == c)
+            {
+                custom_w
             } else {
                 col_chars[c] as f32 * m.cw + col_extra_px[c] + col_gap
             }
@@ -2232,7 +2269,8 @@ fn layout_table(
             scene.ui_small(tx, y0, hdr, hdr_col, active_sort.is_some(), false, clip_id);
         }
         if depth <= 1 {
-            let hdr_hit = HitRect::new(cx - 4.0, y0 - 2.0, cx + content_w + 4.0, y0 + m.ch + 4.0);
+            let resize_x = cx + cw - col_gap * 0.5;
+            let hdr_hit = HitRect::new(cx - 4.0, y0 - 2.0, (resize_x - 5.0).max(cx + 8.0), y0 + m.ch + 4.0);
             scene.push_hit_clipped(
                 hdr_hit,
                 clip_id,
@@ -2246,19 +2284,35 @@ fn layout_table(
                     subtitle: Some(match active_sort {
                         Some(true) => "currently descending · click for ascending".to_owned(),
                         Some(false) => "currently ascending · click for descending".to_owned(),
-                        None => "click to sort rows".to_owned(),
+                        None => "click to sort · drag right edge to resize".to_owned(),
                     }),
+                },
+            );
+            // Subtle vertical column resize grip + 10px EW-resize drag hit handle!
+            scene.line(resize_x, y0 + 2.0, resize_x, y0 + m.ch - 1.0, 1.0, theme::LINE_FAINT, clip_id);
+            let resize_hit = HitRect::new(resize_x - 5.0, y0 - 2.0, resize_x + 5.0, y0 + m.ch + 4.0);
+            scene.push_hit_clipped(
+                resize_hit,
+                clip_id,
+                HitAction::ResizeTableColumn {
+                    block: block.id,
+                    col: c,
+                    col_x0: cx.round() as i32,
                 },
             );
         }
         cx += cw;
     }
 
-    // Sleek clickable pill to reveal or re-hide default-hidden columns (e.g. `+1 col` -> `type`).
+    // Sleek clickable pill to reveal or re-hide default-hidden columns (e.g. `+2 cols` -> `type, readonly`).
     if has_hidden_toggle {
         let n_hid = hidden_col_names.len();
         let pill_lbl = if block.show_hidden_cols {
-            format!("−{}", hidden_col_names[0])
+            if n_hid == 1 {
+                format!("−{}", hidden_col_names[0])
+            } else {
+                format!("−{n_hid} cols")
+            }
         } else if n_hid == 1 {
             format!("+{}", hidden_col_names[0])
         } else {
@@ -2652,24 +2706,12 @@ fn layout_table(
                                                     scene.round_rect(bx0, by0, bx0 + fill_w, by1, 2.0, fill_col, 0.0, [0.0; 4], clip_id);
                                                 }
                                             }
-                                            scene.push_hover_clipped(
+                                            push_exact_size_hover(
+                                                scene,
                                                 HitRect::new(rx, cur_y, rx + content_w, cur_y + row_h),
+                                                prog.bytes,
+                                                Some(prog),
                                                 clip_id,
-                                                HoverKind::Tooltip {
-                                                    title: format!(
-                                                        "{} {}",
-                                                        crate::dust_driver::format_bytes_compact(prog.bytes),
-                                                        if prog.done {
-                                                            if prog.capped { "(partial · limit reached)" } else { "on disk" }
-                                                        } else {
-                                                            "(scanning…)"
-                                                        }
-                                                    ),
-                                                    subtitle: Some(format!(
-                                                        "{} files · {} subdirs",
-                                                        prog.files, prog.dirs
-                                                    )),
-                                                },
                                             );
                                         }
                                     } else {
@@ -2683,18 +2725,27 @@ fn layout_table(
                                     let tx = rx + text_area_w - txt.chars().count() as f32 * m.cw;
                                     scene.text(tx, ty, txt, theme::INK_2, false, false, clip_id);
 
-                                    if bar_on && let Value::Size(Bytes(b)) = cell && *b > 0 {
+                                    if let Value::Size(Bytes(b)) = cell && *b >= 0 {
                                         let bytes_u64 = *b as u64;
-                                        let frac = blaze_dust::bar_fraction(bytes_u64, max_bytes_u64);
-                                        if frac >= 0.02 {
-                                            let bx0 = rx + text_area_w + 10.0;
-                                            let by0 = ty + m.ch * 0.5 - 2.0;
-                                            let by1 = by0 + 4.0;
-                                            scene.round_rect(bx0, by0, bx0 + SIZE_BAR_W, by1, 2.0, theme::BG_TRACK, 0.0, [0.0; 4], clip_id);
-                                            let fill_w = (SIZE_BAR_W * frac).max(3.0);
-                                            let fill_col = tier_bar_color(bytes_u64, false);
-                                            scene.round_rect(bx0, by0, bx0 + fill_w, by1, 2.0, fill_col, 0.0, [0.0; 4], clip_id);
+                                        if bar_on && bytes_u64 > 0 {
+                                            let frac = blaze_dust::bar_fraction(bytes_u64, max_bytes_u64);
+                                            if frac >= 0.02 {
+                                                let bx0 = rx + text_area_w + 10.0;
+                                                let by0 = ty + m.ch * 0.5 - 2.0;
+                                                let by1 = by0 + 4.0;
+                                                scene.round_rect(bx0, by0, bx0 + SIZE_BAR_W, by1, 2.0, theme::BG_TRACK, 0.0, [0.0; 4], clip_id);
+                                                let fill_w = (SIZE_BAR_W * frac).max(3.0);
+                                                let fill_col = tier_bar_color(bytes_u64, false);
+                                                scene.round_rect(bx0, by0, bx0 + fill_w, by1, 2.0, fill_col, 0.0, [0.0; 4], clip_id);
+                                            }
                                         }
+                                        push_exact_size_hover(
+                                            scene,
+                                            HitRect::new(rx, cur_y, rx + content_w, cur_y + row_h),
+                                            bytes_u64,
+                                            None,
+                                            clip_id,
+                                        );
                                     }
                                 }
                             }
@@ -2710,25 +2761,37 @@ fn layout_table(
                                 } else {
                                     0
                                 };
-                                let (raw, txt_col) = if let Value::Date(dt) = cell {
+                                let (raw, txt_col, hover_dt) = if let Value::Date(dt) = cell {
                                     let eff_ns = dt.utc_ns.max(dust_mtime);
-                                    let eff_val = Value::Date(blaze_sh::DateTime {
+                                    let eff_dt = blaze_sh::DateTime {
                                         utc_ns: eff_ns,
                                         offset_secs: dt.offset_secs,
-                                    });
+                                    };
+                                    let eff_val = Value::Date(eff_dt);
                                     let age_secs =
                                         (now_ns.saturating_sub(eff_ns)).max(0) as u64 / 1_000_000_000;
                                     (
                                         format_value_cell_at(&eff_val, Some(now_ns)),
                                         theme::recency_heat_color(age_secs),
+                                        Some((eff_dt, row_is_dir && dust_mtime > dt.utc_ns)),
                                     )
                                 } else {
-                                    (format_value_cell_at(cell, Some(now_ns)), theme::INK_3)
+                                    (format_value_cell_at(cell, Some(now_ns)), theme::INK_3, None)
                                 };
                                 let max_ch = (content_w / m.cw).floor().max(2.0) as usize;
                                 let txt = truncate_chars(&raw, max_ch);
                                 let tx = rx + content_w - txt.chars().count() as f32 * m.cw;
                                 scene.text(tx, ty, txt, txt_col, false, false, clip_id);
+                                if let Some((eff_dt, is_recursive)) = hover_dt {
+                                    push_exact_date_hover(
+                                        scene,
+                                        HitRect::new(rx, cur_y, rx + content_w, cur_y + row_h),
+                                        eff_dt,
+                                        now_ns,
+                                        is_recursive,
+                                        clip_id,
+                                    );
+                                }
                             }
                             _ => {
                                 let raw = format_value_cell_at(cell, Some(now_ns));
@@ -2746,7 +2809,18 @@ fn layout_table(
                                 } else {
                                     rx
                                 };
-                                scene.text(tx, ty, txt, color, false, false, clip_id);
+                                scene.text(tx, ty, &txt, color, false, false, clip_id);
+                                let cell_rect = HitRect::new(rx, cur_y, rx + content_w, cur_y + row_h);
+                                if !push_exact_value_hover(scene, cell_rect, cell, now_ns, clip_id) && txt != raw {
+                                    scene.push_hover_clipped(
+                                        cell_rect,
+                                        clip_id,
+                                        HoverKind::Tooltip {
+                                            title: raw,
+                                            subtitle: None,
+                                        },
+                                    );
+                                }
                             }
                         }
                     }
@@ -2851,6 +2925,157 @@ fn layout_table(
     cur_y - y0
 }
 
+/// Reusable exact-value hover tooltip for byte sizes (both individual files and recursive
+/// `blaze-dust` folder totals). Shows exact comma-grouped bytes + IEC summary / entry counts.
+fn push_exact_size_hover(
+    scene: &mut Scene,
+    rect: HitRect,
+    bytes: u64,
+    dust: Option<blaze_dust::DustProgress>,
+    clip_id: u32,
+) {
+    let mut b_str = String::new();
+    let _ = blaze_sh::format_u64_commas(bytes, &mut b_str);
+    let unit = if bytes == 1 { "byte" } else { "bytes" };
+    let title = if dust.is_some() {
+        format!("{b_str} {unit} on disk")
+    } else {
+        format!("{b_str} {unit}")
+    };
+    let subtitle = if let Some(prog) = dust {
+        let mut files_s = String::new();
+        let mut dirs_s = String::new();
+        let _ = blaze_sh::format_u64_commas(prog.files, &mut files_s);
+        let _ = blaze_sh::format_u64_commas(prog.dirs, &mut dirs_s);
+        let compact = crate::dust_driver::format_bytes_compact(bytes);
+        let prefix = if !prog.done { "~" } else { "" };
+        let suffix = if !prog.done {
+            " · scanning…"
+        } else if prog.capped {
+            " (capped)"
+        } else {
+            ""
+        };
+        Some(format!(
+            "{prefix}{compact} · {files_s} {} · {dirs_s} {}{suffix}",
+            if prog.files == 1 { "file" } else { "files" },
+            if prog.dirs == 1 { "subdir" } else { "subdirs" },
+        ))
+    } else if bytes >= 1024 {
+        Some(format!("{} (exact IEC binary)", crate::dust_driver::format_bytes_compact(bytes)))
+    } else {
+        None
+    };
+    scene.push_hover_clipped(rect, clip_id, HoverKind::Tooltip { title, subtitle });
+}
+
+/// Reusable exact-value hover tooltip for timestamps (`Value::Date`, including recursive folder
+/// mtimes from `blaze-dust`). Shows full ISO 8601 timestamp + exact elapsed time.
+fn push_exact_date_hover(
+    scene: &mut Scene,
+    rect: HitRect,
+    dt: blaze_sh::DateTime,
+    now_ns: i64,
+    is_recursive_folder: bool,
+    clip_id: u32,
+) {
+    let mut iso = String::new();
+    let _ = blaze_sh::format_date(dt, &mut iso);
+    let diff_secs = (now_ns.saturating_sub(dt.utc_ns)) / 1_000_000_000;
+    let mut elapsed = String::new();
+    if diff_secs >= 0 {
+        let _ = blaze_sh::format_exact_elapsed(diff_secs as u64, &mut elapsed);
+    } else {
+        let _ = std::fmt::Write::write_fmt(&mut elapsed, format_args!("in {}s", diff_secs.unsigned_abs()));
+    }
+    let subtitle = if is_recursive_folder {
+        format!("{elapsed} · latest edit inside folder")
+    } else {
+        elapsed
+    };
+    scene.push_hover_clipped(
+        rect,
+        clip_id,
+        HoverKind::Tooltip {
+            title: iso,
+            subtitle: Some(subtitle),
+        },
+    );
+}
+
+/// General reusable exact-value hover dispatcher for any formatted `blaze_sh::Value` across
+/// tables, records, and lists (`Size`, `Date`, `Duration`, large `Int`, `Float`).
+/// Returns `true` if a structured exact tooltip was attached.
+fn push_exact_value_hover(
+    scene: &mut Scene,
+    rect: HitRect,
+    val: &Value<'_>,
+    now_ns: i64,
+    clip_id: u32,
+) -> bool {
+    match val {
+        Value::Size(Bytes(b)) if *b >= 0 => {
+            push_exact_size_hover(scene, rect, *b as u64, None, clip_id);
+            true
+        }
+        Value::Date(dt) => {
+            push_exact_date_hover(scene, rect, *dt, now_ns, false, clip_id);
+            true
+        }
+        Value::Duration(blaze_sh::Nanos(ns)) => {
+            let neg = if *ns < 0 { "-" } else { "" };
+            let abs = ns.unsigned_abs();
+            let mut ns_str = String::new();
+            let _ = blaze_sh::format_u64_commas(abs, &mut ns_str);
+            let sub = if abs >= 1_000_000_000 {
+                Some(format!("{neg}{:.6} s", abs as f64 / 1e9))
+            } else if abs >= 1_000_000 {
+                Some(format!("{neg}{:.3} ms", abs as f64 / 1e6))
+            } else if abs >= 1_000 {
+                Some(format!("{neg}{:.3} µs", abs as f64 / 1e3))
+            } else {
+                None
+            };
+            scene.push_hover_clipped(
+                rect,
+                clip_id,
+                HoverKind::Tooltip {
+                    title: format!("{neg}{ns_str} ns"),
+                    subtitle: sub,
+                },
+            );
+            true
+        }
+        Value::Int(n) if n.unsigned_abs() >= 10_000 => {
+            let neg = if *n < 0 { "-" } else { "" };
+            let mut s = String::new();
+            let _ = blaze_sh::format_u64_commas(n.unsigned_abs(), &mut s);
+            scene.push_hover_clipped(
+                rect,
+                clip_id,
+                HoverKind::Tooltip {
+                    title: format!("{neg}{s}"),
+                    subtitle: Some(format!("0x{:x}", n.unsigned_abs())),
+                },
+            );
+            true
+        }
+        Value::Float(f) if f.is_finite() => {
+            let exact = format!("{f}");
+            scene.push_hover_clipped(
+                rect,
+                clip_id,
+                HoverKind::Tooltip {
+                    title: exact,
+                    subtitle: Some(format!("{f:.6e}")),
+                },
+            );
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Editorial borderless record with semantic SDF icons per known key + live memory bar.
 #[allow(clippy::too_many_arguments)]
 fn layout_record(
@@ -2948,7 +3173,15 @@ fn layout_record(
                 }
             }
             let text_h = lines.len() as f32 * (m.ch + 2.0) + TABLE_ROW_PAD_Y * 2.0 - 2.0;
-            cur_y += text_h.max(row_h);
+            let row_advance = text_h.max(row_h);
+            push_exact_value_hover(
+                scene,
+                HitRect::new(val_x, start_y, val_x + val_w, start_y + row_advance),
+                v,
+                now_ns,
+                clip_id,
+            );
+            cur_y += row_advance;
         }
     }
     cur_y - y0
@@ -2985,8 +3218,20 @@ fn layout_list(
     for i in 0..show {
         scene.text(x0, cur_y + TABLE_ROW_PAD_Y, i.to_string(), theme::INK_4, false, false, clip_id);
         if let Some(val) = items.get(i) {
-            let txt = truncate_chars(&format_value_cell_at(val, Some(now_ns)), max_val_cols);
-            scene.text(val_x, cur_y + TABLE_ROW_PAD_Y, txt, theme::value_color(val), false, false, clip_id);
+            let raw = format_value_cell_at(val, Some(now_ns));
+            let txt = truncate_chars(&raw, max_val_cols);
+            scene.text(val_x, cur_y + TABLE_ROW_PAD_Y, &txt, theme::value_color(val), false, false, clip_id);
+            let cell_rect = HitRect::new(val_x, cur_y, x0 + width, cur_y + row_h);
+            if !push_exact_value_hover(scene, cell_rect, val, now_ns, clip_id) && txt != raw {
+                scene.push_hover_clipped(
+                    cell_rect,
+                    clip_id,
+                    HoverKind::Tooltip {
+                        title: raw,
+                        subtitle: None,
+                    },
+                );
+            }
         }
         cur_y += row_h;
     }

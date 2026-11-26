@@ -925,6 +925,52 @@ impl PartialEq for Value<'_> {
     }
 }
 
+/// Format `n` with ASCII thousands separators (`94,208`, `46,032,896`) with zero allocation.
+pub fn format_u64_commas(n: u64, out: &mut impl fmt::Write) -> fmt::Result {
+    let mut buf = [0u8; 27];
+    let mut len = 0usize;
+    let mut x = n;
+    let mut group = 0usize;
+    loop {
+        if group == 3 {
+            buf[len] = b',';
+            len += 1;
+            group = 0;
+        }
+        buf[len] = b'0' + (x % 10) as u8;
+        len += 1;
+        group += 1;
+        x /= 10;
+        if x == 0 {
+            break;
+        }
+    }
+    for i in (0..len).rev() {
+        out.write_char(buf[i] as char)?;
+    }
+    Ok(())
+}
+
+/// Format an exact elapsed duration in seconds (`1h 11m 04s ago`, `13d 04h 22m ago`, `42s ago`).
+pub fn format_exact_elapsed(age_secs: u64, out: &mut impl fmt::Write) -> fmt::Result {
+    if age_secs < 60 {
+        return write!(out, "{age_secs}s ago");
+    }
+    let mins = age_secs / 60;
+    let secs = age_secs % 60;
+    if mins < 60 {
+        return write!(out, "{mins}m {secs:02}s ago");
+    }
+    let hrs = mins / 60;
+    let rem_m = mins % 60;
+    if hrs < 24 {
+        return write!(out, "{hrs}h {rem_m:02}m {secs:02}s ago");
+    }
+    let days = hrs / 24;
+    let rem_h = hrs % 24;
+    write!(out, "{days}d {rem_h:02}h {rem_m:02}m ago")
+}
+
 /// Human-friendly IEC binary byte-size formatting (`512 B`, `14.2 KiB`, `3.1 MiB`, `1.4 GiB`).
 pub fn format_size(Bytes(b): Bytes, out: &mut impl fmt::Write) -> fmt::Result {
     let neg = b < 0;

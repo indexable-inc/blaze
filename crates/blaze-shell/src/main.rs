@@ -301,7 +301,9 @@ mod macos_app {
         }
         if let Some(act) = scene.hit_test(x, y) {
             return match act {
-                HitAction::ResizeAgentSidebar => CursorKind::ResizeEW,
+                HitAction::ResizeAgentSidebar | HitAction::ResizeTableColumn { .. } => {
+                    CursorKind::ResizeEW
+                }
                 _ => CursorKind::Pointer,
             };
         }
@@ -2412,6 +2414,7 @@ mod macos_app {
         let mut tile_layout = TileLayout::default();
         let mut dragging_split: Option<SplitHandle> = None;
         let mut dragging_agent_sidebar = false;
+        let mut dragging_table_col: Option<(BlockId, usize, f32)> = None;
         let mut last_cli_spec_rev = blaze_shell::cli_spec_driver::spec_revision();
         let mut last_dust_rev = blaze_shell::dust_driver::dust_revision();
         let mut command_palette: Option<CommandPalette> = None;
@@ -3963,6 +3966,11 @@ mod macos_app {
                                             active_popover = None;
                                             dirty = true;
                                         }
+                                        HitAction::ResizeTableColumn { block, col, col_x0 } => {
+                                            dragging_table_col = Some((block, col, col_x0 as f32));
+                                            active_popover = None;
+                                            apply_cursor(&mut cur_cursor, CursorKind::ResizeEW);
+                                        }
                                         HitAction::ToggleExpandCell { block, row, col } => {
                                             shell.store.toggle_expand_cell(block, row, col);
                                             dirty = true;
@@ -4363,6 +4371,16 @@ mod macos_app {
                                 );
                                 continue;
                             }
+                            if let Some((block_id, col, col_x0)) = dragging_table_col {
+                                let new_w = x - col_x0 + 11.0;
+                                if let Some(shell) = panes.get_mut(&wm.focused_pane())
+                                    && shell.store.set_table_col_width(block_id, col, new_w)
+                                {
+                                    dirty = true;
+                                }
+                                apply_cursor(&mut cur_cursor, CursorKind::ResizeEW);
+                                continue;
+                            }
                             if dragging_agent_sidebar {
                                 let pane_rect = tile_layout
                                     .panes
@@ -4426,6 +4444,10 @@ mod macos_app {
                             let x = pt.x as f32;
                             let y = (size.height - pt.y) as f32;
                             last_mouse = Some((x, y));
+                            if dragging_table_col.take().is_some() {
+                                apply_cursor(&mut cur_cursor, CursorKind::Arrow);
+                                continue;
+                            }
                             if dragging_agent_sidebar {
                                 dragging_agent_sidebar = false;
                                 apply_cursor(&mut cur_cursor, CursorKind::Arrow);

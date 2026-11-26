@@ -80,6 +80,8 @@ pub struct Block {
     pub table_scroll_x: f32,
     /// Optional interactive UI sort override `(col_idx, descending)` toggled by clicking table headers.
     pub table_sort: Option<(usize, bool)>,
+    /// User-dragged custom widths `(col_idx, width_px)` for interactive column resizing.
+    pub col_width_overrides: Vec<(usize, f32)>,
     /// `(row, col)` table cells currently expanded inline (for nested lists/records/tables).
     pub expanded_cells: Vec<(usize, usize)>,
     pub body: BlockBody,
@@ -219,6 +221,7 @@ impl BlockStore {
             table_scroll_y: 0.0,
             table_scroll_x: 0.0,
             table_sort: None,
+            col_width_overrides: Vec::new(),
             expanded_cells: Vec::new(),
             body,
         };
@@ -246,6 +249,24 @@ impl BlockStore {
     pub fn toggle_hidden_cols(&mut self, id: BlockId) -> bool {
         if let Some(blk) = self.block_mut(id) {
             blk.show_hidden_cols = !blk.show_hidden_cols;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Set or update an interactive dragged width (clamped `48..=680` px) for column `col`.
+    pub fn set_table_col_width(&mut self, id: BlockId, col: usize, width_px: f32) -> bool {
+        let clamped = width_px.clamp(48.0, 680.0);
+        if let Some(blk) = self.block_mut(id) {
+            if let Some((_, w)) = blk.col_width_overrides.iter_mut().find(|(c, _)| *c == col) {
+                if (*w - clamped).abs() < 0.5 {
+                    return false;
+                }
+                *w = clamped;
+            } else {
+                blk.col_width_overrides.push((col, clamped));
+            }
             true
         } else {
             false
