@@ -247,7 +247,6 @@ pub struct HermeticClangProbe {
     work_rel: SharedStr,
     work_root: SharedStr,
     deadline: Duration,
-    resolved_id: bstd::sync::Flight<(), ContentId, OwnArc<str, SharedAlloc<'static>>, SharedAlloc<'static>>,
     verify_flight: bstd::sync::Flight<(), VerifiedClang, OwnArc<str, SharedAlloc<'static>>, SharedAlloc<'static>>,
 }
 
@@ -372,11 +371,6 @@ impl HermeticClangProbe {
             work_rel: OwnString::from_str_in(work_rel, SharedAlloc::global()),
             work_root: work_str,
             deadline: PROBE_DEADLINE,
-            resolved_id: bstd::sync::Flight::with_capacity_in(
-                "c-probe.clang.strategy_id",
-                NonZeroUsize::MIN,
-                SharedAlloc::global(),
-            ),
             verify_flight: bstd::sync::Flight::with_capacity_in(
                 "c-probe.clang.verify",
                 NonZeroUsize::MIN,
@@ -427,11 +421,6 @@ impl HermeticClangProbe {
             work_rel: OwnString::from_str_in(work_rel, SharedAlloc::global()),
             work_root: work_str,
             deadline: PROBE_DEADLINE,
-            resolved_id: bstd::sync::Flight::with_capacity_in(
-                "c-probe.clang.strategy_id",
-                NonZeroUsize::MIN,
-                SharedAlloc::global(),
-            ),
             verify_flight: bstd::sync::Flight::with_capacity_in(
                 "c-probe.clang.verify",
                 NonZeroUsize::MIN,
@@ -847,23 +836,13 @@ fn resolve_source_date_epoch<'a>(
 
 impl ProbeAnswerer for HermeticClangProbe {
     fn id<'a>(&self, alloc: Alloc<'a>) -> Result<ContentId, AString<'a>> {
+        // Recompute the live runtime-closure identity on every lookup so a mid-command
+        // `/run/current-system` switch invalidates cache hits as well as misses.
         let cx = self
             .io
             .cx(self.deadline, bstd::mem::TASK_FRAME)
             .map_err(|_| own_str("c-probe strategy id context stopped", alloc))?;
-        let shared = SharedAlloc::global();
-        self.resolved_id
-            .ask(&cx, (), |vcx| {
-                Self::strategy_id_for_clang(vcx, self.clang_path.as_str(), alloc)
-                    .map_err(|e| OwnArc::from_str_in(e.as_str(), shared))
-            })
-            .map_err(|err| match err {
-                bstd::sync::FlightError::Failed { error, .. } => own_str(error.as_ref(), alloc),
-                bstd::sync::FlightError::Stopped(stopped) => {
-                    own_fmt(format_args!("c-probe strategy id timed out: {stopped}"), alloc)
-                }
-                other => own_fmt(format_args!("c-probe strategy id failed: {other}"), alloc),
-            })
+        Self::strategy_id_for_clang(&cx, self.clang_path.as_str(), alloc)
     }
 
     fn answer<'a, 'b>(
@@ -1631,11 +1610,6 @@ mod tests {
             work_rel: OwnString::new_in(super::SharedAlloc::global()),
             work_root: OwnString::from_str_in(&std::env::temp_dir().to_string_lossy(), super::SharedAlloc::global()),
             deadline: super::Duration::from_millis(25),
-            resolved_id: bstd::sync::Flight::with_capacity_in(
-                "c-probe.clang.strategy_id.test",
-                super::NonZeroUsize::MIN,
-                super::SharedAlloc::global(),
-            ),
             verify_flight: bstd::sync::Flight::with_capacity_in(
                 "c-probe.clang.verify.test",
                 super::NonZeroUsize::MIN,
@@ -1726,5 +1700,63 @@ mod tests {
         guard1.cleanup(&col_cx, alloc).expect("explicit cleanup succeeds");
         let _ = col_dir.remove_dir(&col_cx, &rel2, bstd::fs::Durable::No);
         let _ = std::fs::remove_dir_all(&col_root);
+    }
+
+    #[test]
+    fn fact_now_with_probes_propagates_answerer_id_errors() {
+        use blaze_ids::ContentId;
+        use blaze_own::{AString, Alloc};
+        let alloc = blaze_own::testing::heap().alloc();
+        struct FailingAnswerer;
+        impl ProbeAnswerer for FailingAnswerer {
+            fn id<'a>(&self, alloc: Alloc<'a>) -> Result<ContentId, AString<'a>> {
+                Err(super::own_str("simulated nix runtime closure timeout", alloc))
+            }
+            fn answer<'a, 'b>(
+                &self,
+                _probe: &c_tasks_probe::CanonicalProbe<'_, '_>,
+                _input_bytes: &mut dyn FnMut(&str) -> Option<&'b [u8]>,
+                alloc: Alloc<'a>,
+            ) -> Result<c_tasks_probe::ProbeAnswer<'a>, AString<'a>> {
+                Err(super::own_str("unused", alloc))
+            }
+        }
+        struct EmptyStore;
+        impl super::CProbeStore for EmptyStore {
+            fn get<'a>(&self, _key: &c_tasks_probe::ProbeKey, _alloc: Alloc<'a>) -> Result<Option<blaze_own::AVec<'a, u8>>, super::CProbeStoreError> {
+                Ok(None)
+            }
+            fn put(&self, _key: &c_tasks_probe::ProbeKey, _bytes: &[u8]) -> Result<(), super::CProbeStoreError> {
+                Ok(())
+            }
+        }
+        let shared = super::SharedAlloc::global();
+        let probes = super::CScriptProbes {
+            answerer: super::OwnArc::new_in(FailingAnswerer, shared),
+            records: super::OwnArc::new_in(EmptyStore, shared),
+            sdk_id: super::OwnArc::from_str_in("", shared),
+            sdk_digest: [0u8; 32],
+            clang_sha256: [1u8; 32],
+        };
+        let key = c_tasks_probe::ProbeKey(ContentId::of("test", b"k"));
+        let subj = blaze_build_script::facts::cc_probe_subject(
+            &ContentId::of("test", b"a"),
+            &[1u8; 32],
+            &[0u8; 32],
+            &key,
+            alloc,
+        );
+        let err = crate::fact_pins::fact_now_with_probes(subj.as_str(), None, Some(&probes), alloc)
+            .expect_err("identity failure must propagate as Err, never downgrade to Answer(None)");
+        assert!(err.as_str().contains("simulated nix runtime closure timeout"), "unexpected error: {err}");
+        let match_err = crate::spawn_route::fact_reply_matches_with_probes(
+            subj.as_str(),
+            Some(ContentId::of("test", b"reply")),
+            None,
+            Some(&probes),
+            alloc,
+        )
+        .expect_err("fact_reply_matches_with_probes must also propagate identity failures");
+        assert!(match_err.as_str().contains("simulated nix runtime closure timeout"), "unexpected error: {match_err}");
     }
 }

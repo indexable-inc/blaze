@@ -388,18 +388,20 @@ pub fn is_fact_reply(subject: &str, alloc: Alloc<'_>) -> bool {
 }
 
 /// Checks the observed digest of a derived fact's reply against what the pins (and optional C
-/// probe cache) answer now.
-pub fn fact_reply_matches_with_probes(
+/// probe cache) answer now. Propagates host/deadline failures from computing the live C-probe
+/// runtime closure identity instead of turning them into a cache miss.
+pub fn fact_reply_matches_with_probes<'a>(
     subject: &str,
     observed: Option<ContentId>,
     pins: Option<&FactPins>,
     c_probes: Option<&crate::probe_clang::CScriptProbes>,
-    alloc: Alloc<'_>,
-) -> bool {
+    alloc: Alloc<'a>,
+) -> Result<bool, blaze_own::AString<'a>> {
     if observed.is_none() || !is_fact_reply(subject, alloc) {
-        return false;
+        return Ok(false);
     }
-    crate::fact_pins::fact_now_with_probes(subject, pins, c_probes, alloc) == crate::fact_pins::FactNow::Answer(observed)
+    Ok(crate::fact_pins::fact_now_with_probes(subject, pins, c_probes, alloc)?
+        == crate::fact_pins::FactNow::Answer(observed))
 }
 
 /// Checks the observed digest of a derived fact's reply against what the pins answer now
@@ -407,7 +409,10 @@ pub fn fact_reply_matches_with_probes(
 /// `sw_vers`, the pinned clang's version text). A native caller also has to identify the image
 /// that ran.
 pub fn fact_reply_matches(subject: &str, observed: Option<ContentId>, pins: Option<&FactPins>, alloc: Alloc<'_>) -> bool {
-    fact_reply_matches_with_probes(subject, observed, pins, None, alloc)
+    if observed.is_none() || !is_fact_reply(subject, alloc) {
+        return false;
+    }
+    crate::fact_pins::fact_now(subject, pins, alloc) == crate::fact_pins::FactNow::Answer(observed)
 }
 
 /// A file's digest in a spawn request (`present`).

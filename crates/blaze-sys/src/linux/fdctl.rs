@@ -269,6 +269,40 @@ flag_set! {
         CLOSE_ON_EXEC = 0x0001;
         /// `MFD_ALLOW_SEALING`. replaces libc::MFD_ALLOW_SEALING.
         ALLOW_SEALING = 0x0002;
+        /// `MFD_NOEXEC_SEAL` (Linux 6.3): non-executable memfd with `F_SEAL_EXEC`.
+        NOEXEC_SEAL = 0x0008;
+        /// `MFD_EXEC` (Linux 6.3): explicitly request an executable memfd even under
+        /// `vm.memfd_noexec = 1`.
+        EXEC = 0x0010;
+    }
+}
+
+/// Whether this Linux kernel and PID namespace accept [`MemfdFlags::EXEC`] (Linux 6.3+,
+/// `vm.memfd_noexec`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MemfdExec {
+    /// Kernel accepts `MFD_EXEC` and the namespace permits executable memfds
+    /// (`vm.memfd_noexec = 0` or `1`).
+    Supported,
+    /// Kernel predates Linux 6.3 (`EINVAL` on `MFD_EXEC`): executable memfds are created
+    /// with `MFD_CLOEXEC | MFD_ALLOW_SEALING` without `MFD_EXEC`.
+    LegacyKernel,
+    /// PID namespace enforces `vm.memfd_noexec = 2` (or seccomp denies `MFD_EXEC`): executable
+    /// memfds are forbidden here (`EPERM` / `EACCES`).
+    Denied(Errno),
+}
+
+/// Probes whether this kernel and PID namespace support executable memfds via `MFD_EXEC`
+/// (harmless one-shot `memfd_create(..., MFD_CLOEXEC | MFD_EXEC)` closed immediately).
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn probe_memfd_exec() -> Result<MemfdExec, Errno> {
+    let flags = MemfdFlags::CLOSE_ON_EXEC.with(MemfdFlags::EXEC);
+    match memfd_create(Path::new(c"blaze-memfd-exec-probe"), flags) {
+        Ok(_fd) => Ok(MemfdExec::Supported),
+        Err(Errno::Inval) => Ok(MemfdExec::LegacyKernel),
+        Err(errno @ (Errno::Perm | Errno::Acces)) => Ok(MemfdExec::Denied(errno)),
+        Err(errno) => Err(errno),
     }
 }
 

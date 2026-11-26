@@ -177,27 +177,45 @@ pub enum FactNow {
 /// `subject` ([`facts::subject`]'s form: the program's word, then one argument per line, or a
 /// missing program's `absent-program\n<host>\n<name>`, or a compiler probe's
 /// `cc-probe\n<answerer>\n<clang>\n<key>`) answered now with `pins` and optional active
-/// [`crate::probe_clang::CScriptProbes`].
-pub fn fact_now_with_probes(
+/// [`crate::probe_clang::CScriptProbes`]. Fallible because computing a live C-probe runtime
+/// closure identity can fail on host filesystem/deadline errors and must propagate rather than
+/// downgrading into cache invalidation.
+pub fn fact_now_with_probes<'a>(
     subject: &str,
     pins: Option<&FactPins>,
     c_probes: Option<&crate::probe_clang::CScriptProbes>,
-    alloc: Alloc<'_>,
-) -> FactNow {
+    alloc: Alloc<'a>,
+) -> Result<FactNow, blaze_own::AString<'a>> {
     // A program found missing (spawn_route.rs `ABSENT_HEAD`, D192): a fact of the pinned base
     // tool set's names and blaze's answered list, not of these pins, so answered with none.
+    if let Some(now) = crate::spawn_route::absent_now(subject, alloc) {
+        return Ok(FactNow::Answer(now));
+    }
+    if facts::parse_cc_probe_subject(subject).is_some() {
+        let Some(probes) = c_probes else {
+            return Ok(FactNow::NoPins);
+        };
+        let active_answerer = probes.answerer.id(alloc)?;
+        let now = crate::probe_clang::c_probe_reply_now(
+            subject,
+            &active_answerer,
+            &probes.clang_sha256,
+            &probes.sdk_digest,
+            Some(&*probes.records),
+            alloc,
+        )
+        .flatten();
+        return Ok(FactNow::Answer(now));
+    }
+    Ok(fact_now_pinned(subject, pins, alloc))
+}
+
+fn fact_now_pinned(subject: &str, pins: Option<&FactPins>, alloc: Alloc<'_>) -> FactNow {
     if let Some(now) = crate::spawn_route::absent_now(subject, alloc) {
         return FactNow::Answer(now);
     }
     if facts::parse_cc_probe_subject(subject).is_some() {
-        let Some(probes) = c_probes else {
-            return FactNow::NoPins;
-        };
-        let Ok(active_answerer) = probes.answerer.id(alloc) else {
-            return FactNow::Answer(None);
-        };
-        let now = crate::probe_clang::c_probe_reply_now(subject, &active_answerer, &probes.clang_sha256, &probes.sdk_digest, Some(&*probes.records), alloc).flatten();
-        return FactNow::Answer(now);
+        return FactNow::NoPins;
     }
     let mut lines = subject.split('\n');
     let head = lines.next().unwrap_or("");
@@ -228,7 +246,7 @@ pub fn fact_now_with_probes(
 /// `subject` answered now with `pins` (no C probe store: `cc-probe` subjects return
 /// [`FactNow::NoPins`]).
 pub fn fact_now(subject: &str, pins: Option<&FactPins>, alloc: Alloc<'_>) -> FactNow {
-    fact_now_with_probes(subject, pins, None, alloc)
+    fact_now_pinned(subject, pins, alloc)
 }
 
 /// What the read `subject` is now for a record's lookup: a fact answered with `pins`

@@ -110,7 +110,7 @@ pub use crate::linux::fdctl::{FallocateFlags, fallocate};
 /// libc::F_SEAL_WRITE (`Seals`). Linux: [`crate::linux::fdctl`].
 /// replaces libc::F_ADD_SEALS (with fcntl: blaze_sys::posix::io::add_seals(fd, Seals); Linux only)
 #[cfg(target_os = "linux")]
-pub use crate::linux::fdctl::{MemfdFlags, Seals, add_seals, memfd_create};
+pub use crate::linux::fdctl::{MemfdExec, MemfdFlags, Seals, add_seals, memfd_create, probe_memfd_exec};
 /// `fcntl`'s command numbers, for the comparison test with libc's.
 #[cfg(all(test, target_os = "linux"))]
 pub(in crate::posix::io) use crate::linux::fdctl::{

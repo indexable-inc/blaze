@@ -1154,7 +1154,14 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut crate::engi
                     reads.push((read.name(), read.answer));
                 }
             }
-            Err(no_cell) => *unkept = Some(no_cell),
+            Err(AdmitError::Unkept(no_cell)) => *unkept = Some(no_cell),
+            Err(AdmitError::FactFailed(why)) => {
+                return failed(
+                    "a build script fact validation failed",
+                    format_args!("the build script of {package} failed to validate a compiler probe fact: {why}"),
+                    failed_hole,
+                );
+            }
         },
         // No cells planned: a hole.
         CheckoutReads::Hole => {
@@ -1215,6 +1222,11 @@ fn rebase_read_subject<'a>(prefix: &str, subject: &str, alloc: Alloc<'a>) -> Opt
     None
 }
 
+pub(crate) enum AdmitError<'a> {
+    Unkept(crate::engine_script_reads::NoCell),
+    FactFailed(blaze_own::AString<'a>),
+}
+
 pub(crate) fn admit_reads(
     observed: &[blaze_proc_macro::script_sandbox::Read],
     ran_as: RanAs,
@@ -1225,11 +1237,17 @@ pub(crate) fn admit_reads(
     cells: &mut crate::engine_script_reads::ReadList,
     alloc: Alloc<'_>,
 ) -> Result<(), crate::engine_script_reads::NoCell> {
-    admit_reads_with_probes(observed, ran_as, setting, None, checkout_prefix, plant, status, cells, alloc)
+    match admit_reads_with_probes(observed, ran_as, setting, None, checkout_prefix, plant, status, cells, alloc) {
+        Ok(()) => Ok(()),
+        Err(AdmitError::Unkept(no_cell)) => Err(no_cell),
+        Err(AdmitError::FactFailed(why)) => Err(crate::engine_script_reads::NoCell::Unobserved {
+            subject: crate::engine_script_reads::Subject::from_str_in(why.as_str(), *cells.allocator()),
+        }),
+    }
 }
 
 #[expect(clippy::too_many_arguments, reason = "build-script read admission: each input one capability or mode")]
-pub(crate) fn admit_reads_with_probes(
+pub(crate) fn admit_reads_with_probes<'a>(
     observed: &[blaze_proc_macro::script_sandbox::Read],
     ran_as: RanAs,
     setting: &SpawnSetting,
@@ -1238,36 +1256,36 @@ pub(crate) fn admit_reads_with_probes(
     plant: crate::engine_script_reads::ReadsPlant,
     status: Option<crate::engine_script_reads::StatusView>,
     cells: &mut crate::engine_script_reads::ReadList,
-    alloc: Alloc<'_>,
-) -> Result<(), crate::engine_script_reads::NoCell> {
+    alloc: Alloc<'a>,
+) -> Result<(), AdmitError<'a>> {
     use crate::engine_script_reads::{self as reads, NoCell, READS_CAP, Subject};
 
     let result_alloc = *cells.allocator();
     if let Some(extra) = observed.get(READS_CAP) {
         let subject = extra.subject.strip_prefix("read-limit:").unwrap_or(&extra.subject);
-        return Err(NoCell::TooMany { reads: READS_CAP + 1, subject: Subject::from_str_in(subject, result_alloc) });
+        return Err(AdmitError::Unkept(NoCell::TooMany { reads: READS_CAP + 1, subject: Subject::from_str_in(subject, result_alloc) }));
     }
     let image_subject = blaze_proc_macro::native_facts::IMAGE_SUBJECT;
     let image = observed.iter().find(|read| read.subject == image_subject).and_then(|read| read.digest);
     if ran_as == RanAs::Native && image.is_none() {
         let missing = observed.iter().find(|read| read.subject.starts_with("pkg-config\n")).map_or(image_subject, |read| read.subject.as_str());
-        return Err(NoCell::Unobserved { subject: Subject::from_str_in(missing, result_alloc) });
+        return Err(AdmitError::Unkept(NoCell::Unobserved { subject: Subject::from_str_in(missing, result_alloc) }));
     }
     let mut receipts = blaze_own::BTreeMap::new_in(alloc);
     let mut file = |path: Subject, answer| cells.push(reads::CheckoutRead { kind: reads::ReadKind::File, path, answer });
     for read in observed {
         let subject = read.subject.as_str();
-        let rejected = || NoCell::Unobserved { subject: Subject::from_str_in(subject, result_alloc) };
+        let rejected = || AdmitError::Unkept(NoCell::Unobserved { subject: Subject::from_str_in(subject, result_alloc) });
         if ran_as == RanAs::Wasm && let Some((grant, key)) = blaze_build_script::host_tools::spawn_receipt(subject) {
             let pair = receipts.entry(key).or_insert([None; 2]);
             let digest = read.digest.ok_or_else(rejected)?;
             if pair[usize::from(grant)].replace(digest).is_some_and(|was| was != digest) {
-                return Err(NoCell::Conflicting { subject: Subject::from_str_in(subject, result_alloc) });
+                return Err(AdmitError::Unkept(NoCell::Conflicting { subject: Subject::from_str_in(subject, result_alloc) }));
             }
         } else if subject == image_subject && ran_as == RanAs::Native {
             let digest = read.digest.ok_or_else(rejected)?;
             if image != Some(digest) {
-                return Err(NoCell::Conflicting { subject: Subject::from_str_in(subject, result_alloc) });
+                return Err(AdmitError::Unkept(NoCell::Conflicting { subject: Subject::from_str_in(subject, result_alloc) }));
             }
             file(Subject::from_str_in(crate::sweep::SHIM_FILE, result_alloc), digest);
             file(Subject::from_str_in(crate::sweep::PINS_FILE, result_alloc), blaze_proc_macro::native_facts::pins_digest(setting.pins.as_ref(), alloc));
@@ -1276,7 +1294,15 @@ pub(crate) fn admit_reads_with_probes(
             // of the pins or cached c-probe record, so it is a keyed read of a reply file the next
             // command answers again.
             let digest = read.digest.ok_or_else(rejected)?;
-            if !blaze_proc_macro::spawn_route::fact_reply_matches_with_probes(subject, Some(digest), setting.pins.as_ref(), c_probes, alloc) {
+            let matched = blaze_proc_macro::spawn_route::fact_reply_matches_with_probes(
+                subject,
+                Some(digest),
+                setting.pins.as_ref(),
+                c_probes,
+                alloc,
+            )
+            .map_err(AdmitError::FactFailed)?;
+            if !matched {
                 return Err(rejected());
             }
             let mut path = Subject::from_str_in(crate::sweep::REPLY_FILES, result_alloc);
@@ -1293,7 +1319,7 @@ pub(crate) fn admit_reads_with_probes(
             if reply.is_none() || grant.is_none() || *grant != context {
                 let mut subject = Subject::from_str_in("spawn:", result_alloc);
                 subject.push_str(key);
-                return Err(NoCell::Unobserved { subject });
+                return Err(AdmitError::Unkept(NoCell::Unobserved { subject }));
             }
         }
         file(Subject::from_str_in(crate::sweep::EXECUTOR_FILE, result_alloc), context.expect("validated every grant"));
@@ -1304,16 +1330,16 @@ pub(crate) fn admit_reads_with_probes(
         (!executor && !blaze_proc_macro::spawn_route::is_fact_reply(subject, alloc) && !(subject == image_subject && ran_as == RanAs::Native)).then_some((subject, read.digest))
     });
     match checkout_prefix {
-        Some("") => reads::collect_reads(tree_reads, plant, status, cells),
+        Some("") => reads::collect_reads(tree_reads, plant, status, cells).map_err(AdmitError::Unkept),
         Some(prefix) => {
             let mut rebased: AVec<'_, (blaze_own::AString<'_>, Option<ContentId>)> = AVec::new_in(alloc);
             for (subject, digest) in tree_reads {
                 let text = rebase_read_subject(prefix, subject, alloc).unwrap_or_else(|| blaze_own::AString::from_str_in(subject, alloc));
                 rebased.push((text, digest));
             }
-            reads::collect_reads(rebased.iter().map(|(s, d)| (s.as_str(), *d)), plant, status, cells)
+            reads::collect_reads(rebased.iter().map(|(s, d)| (s.as_str(), *d)), plant, status, cells).map_err(AdmitError::Unkept)
         }
-        None => reads::pinned_reads(tree_reads, result_alloc),
+        None => reads::pinned_reads(tree_reads, result_alloc).map_err(AdmitError::Unkept),
     }
 }
 

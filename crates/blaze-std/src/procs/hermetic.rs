@@ -100,16 +100,50 @@ pub struct VerifiedExec {
 }
 
 #[cfg(target_os = "linux")]
+pub(super) fn cx_next_slice(cx: &Cx) -> Option<Duration> {
+    if cx.cancelled() {
+        return None;
+    }
+    let deadline = cx.deadline();
+    if deadline.finite().is_some() {
+        let now = cx.io().now();
+        if deadline.passed(now) {
+            return None;
+        }
+        let left = deadline.left(now);
+        if left.is_zero() {
+            return None;
+        }
+        Some(left.min(Duration::from_millis(5)))
+    } else {
+        Some(Duration::from_millis(5))
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn cx_stopped(cx: &Cx) -> crate::Stopped {
+    if cx.cancelled() {
+        crate::Stopped::Cancelled { span: cx.name() }
+    } else {
+        crate::Stopped::Deadline { span: cx.name(), at: cx.deadline().get() }
+    }
+}
+
+#[cfg(target_os = "linux")]
 impl VerifiedExec {
-    /// Opens `path` read-only (`O_CLOEXEC`), checks `cx` before every 64 KiB chunk, copies the
-    /// exact bytes into an anonymous `memfd` while streaming those same bytes into `on_chunk`,
-    /// and permanently seals the `memfd` (`SEAL | SHRINK | GROW | WRITE`) before returning.
+    /// Opens `path` read-only (`O_CLOEXEC`), streams the exact bytes through a cancellable,
+    /// deadline-bounded `io_uring` reader (`DeadlineReader`) into an executable `memfd` (selecting
+    /// `MFD_EXEC` via `probe_memfd_exec`, or refusing explicitly under `vm.memfd_noexec=2`) while
+    /// feeding those same bytes into `on_chunk`, and permanently seals the `memfd`
+    /// (`SEAL | SHRINK | GROW | WRITE`) before returning.
     pub fn open_and_seal(
         cx: &Cx,
         path: &str,
         mut on_chunk: impl FnMut(&[u8]),
     ) -> Result<VerifiedExec, VerifiedExecError> {
-        cx.check().map_err(VerifiedExecError::Stopped)?;
+        if cx_next_slice(cx).is_none() {
+            return Err(VerifiedExecError::Stopped(cx_stopped(cx)));
+        }
         let bytes = path.as_bytes();
         if bytes.is_empty() || bytes.contains(&0) || bytes.len() >= 4096 {
             return Err(VerifiedExecError::BadPath);
@@ -120,6 +154,16 @@ impl VerifiedExec {
         }
         let Ok(cstr) = core::ffi::CStr::from_bytes_until_nul(buf.get(..=bytes.len()).unwrap_or(&[0])) else {
             return Err(VerifiedExecError::BadPath);
+        };
+        let memfd_flags = match blaze_sys::posix::io::probe_memfd_exec()
+            .map_err(|errno| VerifiedExecError::Os { call: "memfd_create (probe MFD_EXEC)", errno })?
+        {
+            blaze_sys::posix::io::MemfdExec::Supported => blaze_sys::posix::io::MemfdFlags::CLOSE_ON_EXEC
+                .with(blaze_sys::posix::io::MemfdFlags::ALLOW_SEALING)
+                .with(blaze_sys::posix::io::MemfdFlags::EXEC),
+            blaze_sys::posix::io::MemfdExec::LegacyKernel => blaze_sys::posix::io::MemfdFlags::CLOSE_ON_EXEC
+                .with(blaze_sys::posix::io::MemfdFlags::ALLOW_SEALING),
+            blaze_sys::posix::io::MemfdExec::Denied(errno) => return Err(VerifiedExecError::ExecMemfdDenied(errno)),
         };
         let src_fd = blaze_sys::linux::openat(
             blaze_sys::linux::CWD,
@@ -138,28 +182,43 @@ impl VerifiedExec {
         if st.mode & blaze_sys::linux::Statx::TYPE_MASK != blaze_sys::linux::Statx::REGULAR {
             return Err(VerifiedExecError::NotRegular);
         }
-        let memfd = blaze_sys::posix::io::memfd_create(
+        let memfd = match blaze_sys::posix::io::memfd_create(
             blaze_sys::Path::new(c"blaze-verified-exec"),
-            blaze_sys::posix::io::MemfdFlags::CLOSE_ON_EXEC
-                .with(blaze_sys::posix::io::MemfdFlags::ALLOW_SEALING),
-        )
-        .map_err(|errno| VerifiedExecError::Os { call: "memfd_create", errno })?;
-        let mut chunk_buf = [0u8; 64 << 10];
+            memfd_flags,
+        ) {
+            Ok(fd) => fd,
+            Err(errno @ (blaze_sys::Errno::Perm | blaze_sys::Errno::Acces)) => {
+                return Err(VerifiedExecError::ExecMemfdDenied(errno));
+            }
+            Err(errno) => return Err(VerifiedExecError::Os { call: "memfd_create", errno }),
+        };
+        let mut reader = blaze_sys::linux::DeadlineReader::new()
+            .map_err(|errno| VerifiedExecError::Os { call: "io_uring_setup (verified exec)", errno })?;
         let mut offset = 0u64;
         loop {
-            cx.check().map_err(VerifiedExecError::Stopped)?;
-            let n = blaze_sys::linux::pread(src_fd.fd(), &mut chunk_buf, offset)
-                .map_err(|errno| VerifiedExecError::Os { call: "pread", errno })?;
-            if n == 0 {
+            let chunk = match reader.pread_until(
+                src_fd.fd(),
+                offset,
+                blaze_sys::linux::READ_BUF_LEN,
+                || cx_next_slice(cx),
+            ) {
+                Ok(chunk) => chunk,
+                Err(blaze_sys::linux::ReadUntilError::Stopped) => {
+                    return Err(VerifiedExecError::Stopped(cx_stopped(cx)));
+                }
+                Err(blaze_sys::linux::ReadUntilError::Os(errno)) => {
+                    return Err(VerifiedExecError::Os { call: "io_uring read (verified exec)", errno });
+                }
+            };
+            if chunk.is_empty() {
                 break;
             }
-            let Some(chunk) = chunk_buf.get(..n) else {
-                break;
-            };
             on_chunk(chunk);
             let mut written = 0usize;
             while written < chunk.len() {
-                cx.check().map_err(VerifiedExecError::Stopped)?;
+                if cx_next_slice(cx).is_none() {
+                    return Err(VerifiedExecError::Stopped(cx_stopped(cx)));
+                }
                 let Some(rem) = chunk.get(written..) else {
                     break;
                 };
@@ -170,7 +229,7 @@ impl VerifiedExec {
                 }
                 written += w;
             }
-            let step = u64::try_from(n).map_err(|_| VerifiedExecError::BadPath)?;
+            let step = u64::try_from(chunk.len()).map_err(|_| VerifiedExecError::BadPath)?;
             offset = offset.checked_add(step).ok_or(VerifiedExecError::BadPath)?;
         }
         let seals = blaze_sys::posix::io::Seals::WRITE
@@ -193,22 +252,32 @@ impl VerifiedExec {
         self.stamp
     }
 
-    /// Streams the sealed snapshot in bounded 64 KiB chunks into `on_chunk`, checking `cx` before
-    /// every chunk (used by tests to verify immutability of the sealed `memfd`).
+    /// Streams the sealed snapshot in bounded 64 KiB chunks through `DeadlineReader` into
+    /// `on_chunk` (used by tests to verify immutability of the sealed `memfd`).
     pub fn stream_chunks(&self, cx: &Cx, mut on_chunk: impl FnMut(&[u8])) -> Result<(), VerifiedExecError> {
-        let mut buf = [0u8; 64 << 10];
+        let mut reader = blaze_sys::linux::DeadlineReader::new()
+            .map_err(|errno| VerifiedExecError::Os { call: "io_uring_setup (verified exec)", errno })?;
         let mut offset = 0u64;
         loop {
-            cx.check().map_err(VerifiedExecError::Stopped)?;
-            let n = blaze_sys::linux::pread(self.fd.fd(), &mut buf, offset)
-                .map_err(|errno| VerifiedExecError::Os { call: "pread", errno })?;
-            if n == 0 {
+            let chunk = match reader.pread_until(
+                self.fd.fd(),
+                offset,
+                blaze_sys::linux::READ_BUF_LEN,
+                || cx_next_slice(cx),
+            ) {
+                Ok(chunk) => chunk,
+                Err(blaze_sys::linux::ReadUntilError::Stopped) => {
+                    return Err(VerifiedExecError::Stopped(cx_stopped(cx)));
+                }
+                Err(blaze_sys::linux::ReadUntilError::Os(errno)) => {
+                    return Err(VerifiedExecError::Os { call: "io_uring read (verified exec)", errno });
+                }
+            };
+            if chunk.is_empty() {
                 break;
             }
-            if let Some(chunk) = buf.get(..n) {
-                on_chunk(chunk);
-            }
-            let step = u64::try_from(n).map_err(|_| VerifiedExecError::BadPath)?;
+            on_chunk(chunk);
+            let step = u64::try_from(chunk.len()).map_err(|_| VerifiedExecError::BadPath)?;
             offset = offset.checked_add(step).ok_or(VerifiedExecError::BadPath)?;
         }
         Ok(())
@@ -232,6 +301,7 @@ impl VerifiedExec {
 pub enum VerifiedExecError {
     BadPath,
     NotRegular,
+    ExecMemfdDenied(blaze_sys::Errno),
     Stopped(crate::Stopped),
     Os { call: &'static str, errno: blaze_sys::Errno },
 }
@@ -242,6 +312,11 @@ impl core::fmt::Display for VerifiedExecError {
         match self {
             VerifiedExecError::BadPath => f.write_str("invalid executable path"),
             VerifiedExecError::NotRegular => f.write_str("executable path is not a regular file"),
+            VerifiedExecError::ExecMemfdDenied(errno) => write!(
+                f,
+                "kernel/namespace forbids executable memfd (vm.memfd_noexec=2 or seccomp, errno {})",
+                errno.raw()
+            ),
             VerifiedExecError::Stopped(s) => write!(f, "stopped: {s}"),
             VerifiedExecError::Os { call, errno } => write!(f, "{call} failed (errno {})", errno.raw()),
         }
@@ -378,7 +453,7 @@ pub struct HermeticSpec<'a> {
     level: Level,
     report: ReportSpec<'a>,
     #[cfg(target_os = "linux")]
-    verified_exec_fd: Option<blaze_sys::Fd>,
+    verified_exec: Option<&'a VerifiedExec>,
 }
 
 /// The fields of a [`HermeticSpec`], every one required.
@@ -496,22 +571,22 @@ impl<'a> HermeticSpec<'a> {
             level: opts.level,
             report: opts.report,
             #[cfg(target_os = "linux")]
-            verified_exec_fd: None,
+            verified_exec: None,
         })
     }
 
-    /// Binds this spec to a pre-opened, pre-verified executable inode on Linux so Landlock and
+    /// Binds this spec to a pre-opened, pre-verified executable snapshot on Linux so Landlock and
     /// `execveat(..., AT_EMPTY_PATH)` act on that exact descriptor without reopening `program`
-    /// by path.
+    /// by path. The borrow lifetime `'a` statically guarantees `exec` outlives this spec.
     #[cfg(target_os = "linux")]
-    pub fn with_verified_exec(mut self, exec: &VerifiedExec) -> Self {
-        self.verified_exec_fd = Some(exec.fd());
+    pub fn with_verified_exec(mut self, exec: &'a VerifiedExec) -> Self {
+        self.verified_exec = Some(exec);
         self
     }
 
     #[cfg(target_os = "linux")]
     pub(super) fn verified_exec_fd(&self) -> Option<blaze_sys::Fd> {
-        self.verified_exec_fd
+        self.verified_exec.map(VerifiedExec::fd)
     }
 
     pub fn program(&self) -> Program<'a> {

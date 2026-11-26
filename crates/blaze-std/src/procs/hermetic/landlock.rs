@@ -208,9 +208,54 @@ pub fn feed_nix_runtime_closure(cx: &Cx, program_path: &str, feed: &mut dyn FnMu
 
 fn check_nix_cx(cx: Option<&Cx>) -> Result<(), Fault> {
     if let Some(cx) = cx {
-        cx.check().map_err(|_| Fault::Host { call: "nix runtime closure (deadline/stopped)", code: 110 })?;
+        if super::cx_next_slice(cx).is_none() {
+            return Err(Fault::Host { call: "nix runtime closure (deadline/stopped)", code: 110 });
+        }
     }
     Ok(())
+}
+
+fn read_nix_at(
+    reader: &mut Option<blaze_sys::linux::DeadlineReader>,
+    cx: Option<&Cx>,
+    fd: Fd,
+    out: &mut [u8],
+    offset: u64,
+    call: &'static str,
+) -> Result<usize, Fault> {
+    if let (Some(r), Some(cx)) = (reader.as_mut(), cx) {
+        let mut filled = 0usize;
+        while filled < out.len() {
+            let want = out.len() - filled;
+            let step_off = u64::try_from(filled)
+                .ok()
+                .and_then(|d| offset.checked_add(d))
+                .ok_or(Fault::Host { call, code: 75 })?;
+            let chunk = match r.pread_until(fd, step_off, want, || super::cx_next_slice(cx)) {
+                Ok(chunk) => chunk,
+                Err(blaze_sys::linux::ReadUntilError::Stopped) => {
+                    return Err(Fault::Host { call: "nix runtime closure (deadline/stopped)", code: 110 });
+                }
+                Err(blaze_sys::linux::ReadUntilError::Os(errno)) => {
+                    return Err(Fault::Host { call, code: errno.raw() });
+                }
+            };
+            if chunk.is_empty() {
+                break;
+            }
+            let take = chunk.len().min(want);
+            if let (Some(dst), Some(src)) = (out.get_mut(filled..filled + take), chunk.get(..take)) {
+                dst.copy_from_slice(src);
+            }
+            filled += take;
+            if chunk.len() < want && chunk.len() < blaze_sys::linux::READ_BUF_LEN {
+                break;
+            }
+        }
+        Ok(filled)
+    } else {
+        pread(fd, out, offset).map_err(|errno| Fault::Host { call, code: errno.raw() })
+    }
 }
 
 /// Ordered inherited `DT_RPATH` pool-index chain (current/newest ancestor first, oldest last),
@@ -277,6 +322,13 @@ fn walk_nix_elf_closure(
     const NIX_LD_SO: &CStr = c"/run/current-system/sw/share/nix-ld/lib/ld.so";
 
     check_nix_cx(cx)?;
+    let mut reader = match cx {
+        Some(_) => Some(
+            blaze_sys::linux::DeadlineReader::new()
+                .map_err(|errno| Fault::Host { call: "io_uring_setup (nix runtime closure)", code: errno.raw() })?,
+        ),
+        None => None,
+    };
 
     let opened_prog = match verified_exec_fd {
         Some(_) => None,
@@ -294,7 +346,7 @@ fn walk_nix_elf_closure(
         (None, Some(owned)) => owned.fd(),
         (None, None) => return Ok(false),
     };
-    let Some(hdr) = parse_elf64_meta(prog_fd)? else {
+    let Some(hdr) = parse_elf64_meta(&mut reader, cx, prog_fd)? else {
         return Ok(false);
     };
     if hdr.interp_len == 0 {
@@ -304,8 +356,7 @@ fn walk_nix_elf_closure(
     let Some(interp_slice) = interp_buf.get_mut(..hdr.interp_len) else {
         return Ok(false);
     };
-    let n = pread(prog_fd, interp_slice, hdr.interp_off)
-        .map_err(|errno| Fault::Host { call: "pread (nix ELF PT_INTERP)", code: errno.raw() })?;
+    let n = read_nix_at(&mut reader, cx, prog_fd, interp_slice, hdr.interp_off, "pread (nix ELF PT_INTERP)")?;
     let Some(interp_bytes) = interp_buf.get(..n) else {
         return Ok(false);
     };
@@ -320,9 +371,15 @@ fn walk_nix_elf_closure(
         return Ok(false);
     };
     // Only engage on NixOS where the ELF interpreter symlinks into `/nix/store/`.
+    // Propagate filesystem/permission errors on `readlinkat` rather than treating them as
+    // non-NixOS (only `EINVAL`, a regular non-symlink interpreter file, means non-symlink).
     let mut link_buf = [0u8; 512];
-    let Ok(target) = readlinkat(CWD, blaze_sys::Path::new(interp_cstr), &mut link_buf) else {
-        return Ok(false);
+    let target = match readlinkat(CWD, blaze_sys::Path::new(interp_cstr), &mut link_buf) {
+        Ok(target) => target,
+        Err(blaze_sys::Errno::Inval) => return Ok(false),
+        Err(errno) => {
+            return Err(Fault::Host { call: "readlinkat (nix ELF PT_INTERP)", code: errno.raw() });
+        }
     };
     if !target.starts_with(b"/nix/store/") {
         return Ok(false);
@@ -348,9 +405,9 @@ fn walk_nix_elf_closure(
         }
     }
     if let Some(f) = feed.as_deref_mut() {
-        feed_nix_file_by_path(cx, interp_cstr, f)?;
+        feed_nix_file_by_path(&mut reader, cx, interp_cstr, f)?;
         if is_nix_ld {
-            feed_nix_file_by_path(cx, NIX_LD_SO, f)?;
+            feed_nix_file_by_path(&mut reader, cx, NIX_LD_SO, f)?;
         }
     }
 
@@ -414,7 +471,7 @@ fn walk_nix_elf_closure(
             (_, _, Some(owned)) => owned.fd(),
             _ => continue,
         };
-        let Some(meta) = parse_elf64_meta(elf_fd)? else {
+        let Some(meta) = parse_elf64_meta(&mut reader, cx, elf_fd)? else {
             continue;
         };
         if meta.dyn_len == 0 {
@@ -424,8 +481,7 @@ fn walk_nix_elf_closure(
         let Some(dyn_slice) = dyn_buf.get_mut(..meta.dyn_len) else {
             return Err(Fault::Host { call: "landlock (NixOS ELF PT_DYNAMIC exceeds cap)", code: 7 });
         };
-        let dyn_read = pread(elf_fd, dyn_slice, meta.dyn_off)
-            .map_err(|errno| Fault::Host { call: "pread (nix ELF PT_DYNAMIC)", code: errno.raw() })?;
+        let dyn_read = read_nix_at(&mut reader, cx, elf_fd, dyn_slice, meta.dyn_off, "pread (nix ELF PT_DYNAMIC)")?;
         let mut strtab_vaddr = None;
         let mut runpath_off = None;
         let mut rpath_off = None;
@@ -474,8 +530,7 @@ fn walk_nix_elf_closure(
         let child_chain = if let Some(rp_off) = runpath_off {
             if let Some(at) = strtab_file_off.checked_add(rp_off) {
                 let mut rp_buf = [0u8; 2048];
-                let n = pread(elf_fd, &mut rp_buf, at)
-                    .map_err(|errno| Fault::Host { call: "pread (nix ELF DT_RUNPATH)", code: errno.raw() })?;
+                let n = read_nix_at(&mut reader, cx, elf_fd, &mut rp_buf, at, "pread (nix ELF DT_RUNPATH)")?;
                 let raw = rp_buf.get(..n).unwrap_or(&[]);
                 let Some(end) = raw.iter().position(|&b| b == 0) else {
                     return Err(Fault::Host { call: "landlock (NixOS ELF RUNPATH exceeds buffer cap)", code: 7 });
@@ -502,8 +557,7 @@ fn walk_nix_elf_closure(
                 && let Some(at) = strtab_file_off.checked_add(rp_off)
             {
                 let mut rp_buf = [0u8; 2048];
-                let n = pread(elf_fd, &mut rp_buf, at)
-                    .map_err(|errno| Fault::Host { call: "pread (nix ELF DT_RPATH)", code: errno.raw() })?;
+                let n = read_nix_at(&mut reader, cx, elf_fd, &mut rp_buf, at, "pread (nix ELF DT_RPATH)")?;
                 let raw = rp_buf.get(..n).unwrap_or(&[]);
                 let Some(end) = raw.iter().position(|&b| b == 0) else {
                     return Err(Fault::Host { call: "landlock (NixOS ELF RPATH exceeds buffer cap)", code: 7 });
@@ -543,8 +597,7 @@ fn walk_nix_elf_closure(
             let Some(at) = strtab_file_off.checked_add(str_off) else {
                 continue;
             };
-            let n = pread(elf_fd, &mut name_buf, at)
-                .map_err(|errno| Fault::Host { call: "pread (nix ELF DT_NEEDED)", code: errno.raw() })?;
+            let n = read_nix_at(&mut reader, cx, elf_fd, &mut name_buf, at, "pread (nix ELF DT_NEEDED)")?;
             let raw = name_buf.get(..n).unwrap_or(&[]);
             let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
             let soname = raw.get(..end).unwrap_or(&[]);
@@ -567,6 +620,7 @@ fn walk_nix_elf_closure(
                     });
                 }
                 if !try_grant_and_enqueue_lib(
+                    &mut reader,
                     cx,
                     ruleset,
                     b"",
@@ -585,6 +639,7 @@ fn walk_nix_elf_closure(
                 }
             } else {
                 enqueue_nix_soname(
+                    &mut reader,
                     cx,
                     ruleset,
                     soname,
@@ -621,10 +676,13 @@ impl Elf64Meta {
     }
 }
 
-fn parse_elf64_meta(fd: Fd) -> Result<Option<Elf64Meta>, Fault> {
+fn parse_elf64_meta(
+    reader: &mut Option<blaze_sys::linux::DeadlineReader>,
+    cx: Option<&Cx>,
+    fd: Fd,
+) -> Result<Option<Elf64Meta>, Fault> {
     let mut ehdr = [0u8; 64];
-    let ehdr_n = pread(fd, &mut ehdr, 0)
-        .map_err(|errno| Fault::Host { call: "pread (nix ELF header)", code: errno.raw() })?;
+    let ehdr_n = read_nix_at(reader, cx, fd, &mut ehdr, 0, "pread (nix ELF header)")?;
     if ehdr_n < 64 {
         return Ok(None);
     }
@@ -660,8 +718,7 @@ fn parse_elf64_meta(fd: Fd) -> Result<Option<Elf64Meta>, Fault> {
         let Some(ph_slice) = ph_buf.get_mut(..56) else {
             return Ok(None);
         };
-        let ph_n = pread(fd, ph_slice, off)
-            .map_err(|errno| Fault::Host { call: "pread (nix ELF program header)", code: errno.raw() })?;
+        let ph_n = read_nix_at(reader, cx, fd, ph_slice, off, "pread (nix ELF program header)")?;
         if ph_n < 56 {
             break;
         }
@@ -867,6 +924,7 @@ fn enqueue_nix_canonical_slice<const N: usize>(
 }
 
 fn enqueue_nix_soname<const N: usize>(
+    reader: &mut Option<blaze_sys::linux::DeadlineReader>,
     cx: Option<&Cx>,
     ruleset: Option<Fd>,
     soname: &[u8],
@@ -881,20 +939,21 @@ fn enqueue_nix_soname<const N: usize>(
 ) -> Result<(), Fault> {
     for (dir_buf, dir_len) in search_dirs {
         let dir = dir_buf.get(..*dir_len).unwrap_or(&[]);
-        if try_grant_and_enqueue_lib(cx, ruleset, dir, soname, child_chain, nix_ld_dir, plan, queue, q_len, feed)? {
+        if try_grant_and_enqueue_lib(reader, cx, ruleset, dir, soname, child_chain, nix_ld_dir, plan, queue, q_len, feed)? {
             return Ok(());
         }
     }
-    if try_grant_and_enqueue_lib(cx, ruleset, nix_ld_dir, soname, child_chain, nix_ld_dir, plan, queue, q_len, feed)? {
+    if try_grant_and_enqueue_lib(reader, cx, ruleset, nix_ld_dir, soname, child_chain, nix_ld_dir, plan, queue, q_len, feed)? {
         return Ok(());
     }
     if let Some(dir) = glibc_dir {
-        let _ = try_grant_and_enqueue_lib(cx, ruleset, dir, soname, child_chain, nix_ld_dir, plan, queue, q_len, feed)?;
+        let _ = try_grant_and_enqueue_lib(reader, cx, ruleset, dir, soname, child_chain, nix_ld_dir, plan, queue, q_len, feed)?;
     }
     Ok(())
 }
 
 fn try_grant_and_enqueue_lib<const N: usize>(
+    reader: &mut Option<blaze_sys::linux::DeadlineReader>,
     cx: Option<&Cx>,
     ruleset: Option<Fd>,
     dir_prefix: &[u8],
@@ -955,41 +1014,76 @@ fn try_grant_and_enqueue_lib<const N: usize>(
         .get(..*q_len)
         .is_some_and(|used| used.iter().any(|(b, l, _)| *l == res_slice.len() && b.get(..*l) == Some(res_slice)));
     if first_seen_path && let Some(f) = feed.as_deref_mut() {
-        feed_nix_fd(cx, res_slice, fd.fd(), f)?;
+        feed_nix_fd(reader, cx, res_slice, fd.fd(), f)?;
     }
     enqueue_nix_canonical_slice(res_slice, child_chain, queue, q_len)?;
     Ok(true)
 }
 
-fn feed_nix_file_by_path(cx: Option<&Cx>, path: &CStr, feed: &mut dyn FnMut(&[u8])) -> Result<(), Fault> {
+fn feed_nix_file_by_path(
+    reader: &mut Option<blaze_sys::linux::DeadlineReader>,
+    cx: Option<&Cx>,
+    path: &CStr,
+    feed: &mut dyn FnMut(&[u8]),
+) -> Result<(), Fault> {
     check_nix_cx(cx)?;
     let fd = openat(CWD, blaze_sys::Path::new(path), OpenFlags::CLOSE_ON_EXEC, 0)
         .map_err(|errno| Fault::Host { call: "openat (nix runtime loader)", code: errno.raw() })?;
     let mut resolved = [0u8; 320];
     let res_len = readlink_fd_path(fd.fd(), &mut resolved)?;
-    feed_nix_fd(cx, resolved.get(..res_len).unwrap_or(&[]), fd.fd(), feed)
+    feed_nix_fd(reader, cx, resolved.get(..res_len).unwrap_or(&[]), fd.fd(), feed)
 }
 
-fn feed_nix_fd(cx: Option<&Cx>, canonical_path: &[u8], fd: Fd, feed: &mut dyn FnMut(&[u8])) -> Result<(), Fault> {
+fn feed_nix_fd(
+    reader: &mut Option<blaze_sys::linux::DeadlineReader>,
+    cx: Option<&Cx>,
+    canonical_path: &[u8],
+    fd: Fd,
+    feed: &mut dyn FnMut(&[u8]),
+) -> Result<(), Fault> {
     let path_len = u32::try_from(canonical_path.len()).unwrap_or(u32::MAX);
     feed(&path_len.to_le_bytes());
     feed(canonical_path);
-    let mut buf = [0u8; 64 << 10];
     let mut offset = 0u64;
-    loop {
-        check_nix_cx(cx)?;
-        let n = pread(fd, &mut buf, offset)
-            .map_err(|errno| Fault::Host { call: "pread (nix runtime closure hash)", code: errno.raw() })?;
-        if n == 0 {
-            break;
-        }
-        if let Some(chunk) = buf.get(..n) {
+    if let (Some(r), Some(cx)) = (reader.as_mut(), cx) {
+        loop {
+            let chunk = match r.pread_until(fd, offset, blaze_sys::linux::READ_BUF_LEN, || super::cx_next_slice(cx)) {
+                Ok(chunk) => chunk,
+                Err(blaze_sys::linux::ReadUntilError::Stopped) => {
+                    return Err(Fault::Host { call: "nix runtime closure (deadline/stopped)", code: 110 });
+                }
+                Err(blaze_sys::linux::ReadUntilError::Os(errno)) => {
+                    return Err(Fault::Host { call: "io_uring read (nix runtime closure hash)", code: errno.raw() });
+                }
+            };
+            if chunk.is_empty() {
+                break;
+            }
             feed(chunk);
+            let step = u64::try_from(chunk.len())
+                .map_err(|_| Fault::Host { call: "pread (nix runtime closure overflow)", code: 75 })?;
+            offset = offset
+                .checked_add(step)
+                .ok_or(Fault::Host { call: "pread (nix runtime closure overflow)", code: 75 })?;
         }
-        let step = u64::try_from(n).map_err(|_| Fault::Host { call: "pread (nix runtime closure overflow)", code: 75 })?;
-        offset = offset
-            .checked_add(step)
-            .ok_or(Fault::Host { call: "pread (nix runtime closure overflow)", code: 75 })?;
+    } else {
+        let mut buf = [0u8; 64 << 10];
+        loop {
+            check_nix_cx(cx)?;
+            let n = pread(fd, &mut buf, offset)
+                .map_err(|errno| Fault::Host { call: "pread (nix runtime closure hash)", code: errno.raw() })?;
+            if n == 0 {
+                break;
+            }
+            if let Some(chunk) = buf.get(..n) {
+                feed(chunk);
+            }
+            let step = u64::try_from(n)
+                .map_err(|_| Fault::Host { call: "pread (nix runtime closure overflow)", code: 75 })?;
+            offset = offset
+                .checked_add(step)
+                .ok_or(Fault::Host { call: "pread (nix runtime closure overflow)", code: 75 })?;
+        }
     }
     feed(&offset.to_le_bytes());
     Ok(())
